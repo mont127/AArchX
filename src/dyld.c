@@ -23,17 +23,24 @@
  *     table whose symbol name is resolved with ocerz_cache_resolve and stored
  *     with its addend). The 12-bit next field strides the chain by 4 bytes.
  *  4. Build the entry frame: a guest stack with argc/argv/envp/apple and the
- *     C string data, a tiny exit trampoline pushed as main's return address
- *     (so `ret` from main becomes exit(status)), and the System V argument
- *     registers rdi=argc, rsi=argv, rdx=envp, rcx=apple. cpu.rip is set to
- *     main (text_vmaddr + LC_MAIN.entryoff + slide) and ocerz_vm_run drives it.
+ *     C string data, plus a tiny raw-_exit trampoline used as main's return
+ *     address on the freestanding path.
+ *  5. Bring up libSystem and run the program the way dyld's start does. When
+ *     the executable links a dylib (any LC_LOAD_DYLIB, the normal case) Ocerz
+ *     runs libSystem.B.dylib's single __init_offsets orchestrator first — this
+ *     boots libpthread (main-thread TSD at gs_base, the kernel commpage),
+ *     libmalloc, libc, and libobjc, the last of which drives the objc<->dyld
+ *     map_images handshake through the dyld-API shim (see dyldapi.c). Then it
+ *     calls main(argc,argv,envp,apple) and, on a normal return, libc exit(rv)
+ *     so atexit handlers run and stdio is flushed (a bare _exit would lose
+ *     buffered printf output). A freestanding executable with no dylibs skips
+ *     init and uses the raw _exit trampoline. OCERZ_INIT forces init on,
+ *     OCERZ_NOINIT forces it off.
  *
- * Deliberately not done yet (the honest edge): initializers (libSystem's
- * +load/__mod_init_func) are NOT run, TLV is not set up, and re-exported /
- * cache-export-table imports are not resolved. This is enough to launch a
- * program and reach main; functions whose correctness depends on libSystem
- * initialization will expose the next round of work, which is the point of
- * getting here.
+ * Still TODO at the honest edge: the loaded-image set handed to objc is the
+ * libSystem closure (libobjc + /usr/lib/system objc dylibs), not a computed
+ * dependency closure, so executables that link higher frameworks need that
+ * generalised; TLV and re-exported cache-export-table imports are not set up.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
