@@ -1,0 +1,928 @@
+/*
+ * src/interp.c
+ *
+ * The core single-step interpreter: the reference implementation of x86_64
+ * instruction semantics that the JIT tier must match bit for bit. This file
+ * owns the integer/general-purpose half of the ISA — moves, the ALU, shifts
+ * and rotates, stack and control flow, atomics, the flag-setting unit
+ * mnemonics and SYSCALL. The string/bit/x87 group lives in interp_ext.c and
+ * the SSE group in interp_sse.c; interp.c is the entry point and forwards any
+ * op it does not own to those units before reporting it as unimplemented.
+ *
+ * ocerz_interp_step() fetches the bytes at cpu->rip through the guest_base
+ * mapping, decodes exactly one instruction (giving the decoder the full 15
+ * byte architectural window), advances cpu->rip by the encoded length BEFORE
+ * executing so that branch handlers see the architectural next-rip and simply
+ * overwrite it, then dispatches on insn.op. Operands are touched only through
+ * the interp_common.h helpers (which encode the 32-bit-write zero-extension
+ * rule, high-byte access, effective-address formation and stack motion) and
+ * flags only through the flags.c helpers, so the semantics live in exactly
+ * one place.
+ *
+ * Design notes / deviations that are easy to get wrong and are handled here:
+ *  - LEA computes base + index*scale + disp with the address-size truncation
+ *    but NEVER adds a segment base, even if a segment override prefix was
+ *    present; it is computed inline rather than through ocerz_ea for that
+ *    reason. The destination still obeys the normal register-write rules.
+ *  - CMOVcc always writes its destination (so the 32-bit form zero-extends
+ *    even when the condition is false); the condition is evaluated after the
+ *    source is read.
+ *  - Shifts mask the count to 5 bits (6 for 64-bit operands) and early-out on
+ *    a masked count of zero, leaving both the destination and the flags
+ *    untouched, which is the architectural no-op. SHL/SHR/SAR delegate flag
+ *    computation to flags.c; ROL/ROR/RCL/RCR update CF on every nonzero count
+ *    and OF only when the masked count is exactly 1, and suppress all flag
+ *    updates only when the masked count is zero.
+ *  - SHLD/SHRD form a width*2 concatenation and shift it, which yields the
+ *    architectural double-shift even for the undefined count>width region;
+ *    the CF/SF/ZF/PF results come from flags_shl/flags_shr on the destination.
+ *  - NEG is evaluated as 0 - src so CF, OF and AF fall out of the subtract
+ *    helper (CF = src != 0, OF = src == INT_MIN).
+ *  - DIV/IDIV trap divide-by-zero and quotient overflow as fatal with a
+ *    diagnostic; the 8-bit forms take AX and write AL/AH, the wider forms use
+ *    rDX:rAX and __int128 for the 64-bit quotient.
+ *  - POPF only loads the user-writable arithmetic and control bits (CF PF AF
+ *    ZF SF TF DF OF) and keeps IF and the fixed bit set; SAHF/LAHF move the
+ *    low arithmetic byte to and from AH with the architectural fixed bits.
+ *  - SYSCALL publishes the return rip in RCX and the masked flags in R11
+ *    exactly as the hardware does before delegating to the syscall layer.
+ *
+ * ocerz_unimpl() (declared in interp_common.h) prints the uniform
+ * unimplemented-instruction diagnostic — op name, the failing rip, its raw
+ * bytes and a reason — and returns OCERZ_STEP_FATAL; vm.c dumps CPU state
+ * afterwards. The decode-failure and trap paths print their own bytes the
+ * same way.
+ */
+#include "ocerz/interp.h"
+#include "ocerz/interp_common.h"
+#include "ocerz/vm.h"
+#include "ocerz/syscall.h"
+#include "ocerz/dyldapi.h"
+
+static void dump_raw_bytes(FILE *out, uint64_t rip, unsigned len)
+{
+    const uint8_t *p = (const uint8_t *)ocerz_g2h(rip);
+    if (len == 0 || len > 15)
+        len = 15;
+    for (unsigned i = 0; i < len; i++)
+        fprintf(out, "%02x ", p[i]);
+}
+
+int ocerz_unimpl(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn, const char *why)
+{
+    (void)vm;
+    (void)cpu;
+    fprintf(stderr, "ocerz: fatal: unimplemented instruction %s at rip=%#llx (%s)\n  bytes: ",
+            ocerz_op_name(insn->op), (unsigned long long)insn->rip, why ? why : "");
+    dump_raw_bytes(stderr, insn->rip, insn->len);
+    fprintf(stderr, "\n");
+    return OCERZ_STEP_FATAL;
+}
+
+static int trap_fatal(const X86Insn *insn, const char *msg)
+{
+    fprintf(stderr, "ocerz: fatal: %s at rip=%#llx\n  bytes: ",
+            msg, (unsigned long long)insn->rip);
+    dump_raw_bytes(stderr, insn->rip, insn->len);
+    fprintf(stderr, "\n");
+    return OCERZ_STEP_FATAL;
+}
+
+static uint64_t lea_addr(const OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op)
+{
+    uint64_t a = (uint64_t)op->disp;
+    if (op->riprel)
+        return a;
+    if (op->base != OCERZ_REG_NONE)
+        a += cpu->gpr[op->base];
+    if (op->index != OCERZ_REG_NONE)
+        a += cpu->gpr[op->index] << op->scale;
+    if (insn->addrsize == 4)
+        a = (uint32_t)a;
+    return a;
+}
+
+static uint64_t read_acc(const OcerzCPU *cpu, int size)
+{
+    return ocerz_read_gpr(cpu, OCERZ_RAX, size, 0);
+}
+
+static void write_acc(OcerzCPU *cpu, int size, uint64_t v)
+{
+    ocerz_write_gpr(cpu, OCERZ_RAX, size, 0, v);
+}
+
+static int op_arith(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    int size = insn->ops[0].size;
+    uint64_t a = ocerz_read_op(cpu, insn, &insn->ops[0]);
+    uint64_t b = ocerz_read_op(cpu, insn, &insn->ops[1]);
+    int cin = (cpu->rflags & OCERZ_CF) ? 1 : 0;
+    uint64_t res;
+    (void)vm;
+    switch (insn->op) {
+    case OCERZ_OP_ADD:
+        res = a + b;
+        ocerz_flags_add(cpu, size, a, b, 0, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_ADC:
+        res = a + b + (uint64_t)cin;
+        ocerz_flags_add(cpu, size, a, b, cin, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_SUB:
+        res = a - b;
+        ocerz_flags_sub(cpu, size, a, b, 0, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_SBB:
+        res = a - b - (uint64_t)cin;
+        ocerz_flags_sub(cpu, size, a, b, cin, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_AND:
+        res = a & b;
+        ocerz_flags_logic(cpu, size, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_OR:
+        res = a | b;
+        ocerz_flags_logic(cpu, size, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_XOR:
+        res = a ^ b;
+        ocerz_flags_logic(cpu, size, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_CMP:
+        res = a - b;
+        ocerz_flags_sub(cpu, size, a, b, 0, res);
+        break;
+    case OCERZ_OP_TEST:
+        res = a & b;
+        ocerz_flags_logic(cpu, size, res);
+        break;
+    default:
+        return ocerz_unimpl(vm, cpu, insn, "arith");
+    }
+    return OCERZ_STEP_OK;
+}
+
+static int op_incdecnegnot(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    int size = insn->ops[0].size;
+    uint64_t a = ocerz_read_op(cpu, insn, &insn->ops[0]);
+    uint64_t res;
+    (void)vm;
+    switch (insn->op) {
+    case OCERZ_OP_INC:
+        res = a + 1;
+        ocerz_flags_inc(cpu, size, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_DEC:
+        res = a - 1;
+        ocerz_flags_dec(cpu, size, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_NEG:
+        res = (uint64_t)0 - a;
+        ocerz_flags_sub(cpu, size, 0, a, 0, res);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    case OCERZ_OP_NOT:
+        res = ~a;
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        break;
+    default:
+        return ocerz_unimpl(vm, cpu, insn, "incdec");
+    }
+    return OCERZ_STEP_OK;
+}
+
+static int op_mul(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    int size = insn->ops[0].size;
+    (void)vm;
+    if (insn->op == OCERZ_OP_MUL) {
+        uint64_t src = ocerz_read_op(cpu, insn, &insn->ops[0]);
+        uint64_t acc = read_acc(cpu, size);
+        if (size == 8) {
+            __uint128_t p = (__uint128_t)acc * (__uint128_t)src;
+            uint64_t lo = (uint64_t)p;
+            uint64_t hi = (uint64_t)(p >> 64);
+            cpu->gpr[OCERZ_RAX] = lo;
+            cpu->gpr[OCERZ_RDX] = hi;
+            ocerz_flags_mul(cpu, size, lo, hi);
+        } else {
+            uint64_t p = ocerz_trunc(acc, size) * ocerz_trunc(src, size);
+            uint64_t lo = ocerz_trunc(p, size);
+            uint64_t hi = ocerz_trunc(p >> (size * 8), size);
+            if (size == 1) {
+                ocerz_write_gpr(cpu, OCERZ_RAX, 2, 0, p & 0xffff);
+            } else {
+                write_acc(cpu, size, lo);
+                ocerz_write_gpr(cpu, OCERZ_RDX, size, 0, hi);
+            }
+            ocerz_flags_mul(cpu, size, lo, hi);
+        }
+        return OCERZ_STEP_OK;
+    }
+
+    if (insn->nops == 1) {
+        int64_t src = ocerz_sext(ocerz_read_op(cpu, insn, &insn->ops[0]), size);
+        int64_t acc = ocerz_sext(read_acc(cpu, size), size);
+        if (size == 8) {
+            __int128_t p = (__int128_t)acc * (__int128_t)src;
+            uint64_t lo = (uint64_t)p;
+            uint64_t hi = (uint64_t)(p >> 64);
+            cpu->gpr[OCERZ_RAX] = lo;
+            cpu->gpr[OCERZ_RDX] = hi;
+            ocerz_flags_imul(cpu, size, lo, hi);
+        } else {
+            int64_t p = acc * src;
+            uint64_t lo = ocerz_trunc((uint64_t)p, size);
+            uint64_t hi = ocerz_trunc((uint64_t)p >> (size * 8), size);
+            if (size == 1) {
+                ocerz_write_gpr(cpu, OCERZ_RAX, 2, 0, (uint64_t)p & 0xffff);
+            } else {
+                write_acc(cpu, size, lo);
+                ocerz_write_gpr(cpu, OCERZ_RDX, size, 0, hi);
+            }
+            ocerz_flags_imul(cpu, size, lo, hi);
+        }
+        return OCERZ_STEP_OK;
+    }
+
+    int64_t a, b;
+    if (insn->nops == 3) {
+        a = ocerz_sext(ocerz_read_op(cpu, insn, &insn->ops[1]), insn->ops[1].size);
+        b = ocerz_sext(ocerz_read_op(cpu, insn, &insn->ops[2]), insn->ops[2].size);
+    } else {
+        a = ocerz_sext(ocerz_read_op(cpu, insn, &insn->ops[0]), size);
+        b = ocerz_sext(ocerz_read_op(cpu, insn, &insn->ops[1]), size);
+    }
+    if (size == 8) {
+        __int128_t p = (__int128_t)a * (__int128_t)b;
+        uint64_t lo = (uint64_t)p;
+        uint64_t hi = (uint64_t)(p >> 64);
+        ocerz_flags_imul(cpu, size, lo, hi);
+        ocerz_write_op(cpu, insn, &insn->ops[0], lo);
+    } else {
+        int64_t p = a * b;
+        uint64_t lo = ocerz_trunc((uint64_t)p, size);
+        uint64_t hi = ocerz_trunc((uint64_t)p >> (size * 8), size);
+        ocerz_flags_imul(cpu, size, lo, hi);
+        ocerz_write_op(cpu, insn, &insn->ops[0], lo);
+    }
+    return OCERZ_STEP_OK;
+}
+
+static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    int size = insn->ops[0].size;
+    uint64_t divisor = ocerz_read_op(cpu, insn, &insn->ops[0]);
+    (void)vm;
+    if (ocerz_trunc(divisor, size) == 0)
+        return trap_fatal(insn, "integer divide by zero");
+
+    if (insn->op == OCERZ_OP_DIV) {
+        if (size == 1) {
+            uint64_t num = ocerz_read_gpr(cpu, OCERZ_RAX, 2, 0);
+            uint64_t d = divisor & 0xff;
+            uint64_t q = num / d;
+            uint64_t r = num % d;
+            if (q > 0xff)
+                return trap_fatal(insn, "divide quotient overflow");
+            ocerz_write_gpr(cpu, OCERZ_RAX, 1, 0, q);
+            ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, r);
+        } else if (size == 8) {
+            __uint128_t num = ((__uint128_t)cpu->gpr[OCERZ_RDX] << 64) | cpu->gpr[OCERZ_RAX];
+            __uint128_t d = divisor;
+            __uint128_t q = num / d;
+            __uint128_t r = num % d;
+            if (q > (__uint128_t)~(uint64_t)0)
+                return trap_fatal(insn, "divide quotient overflow");
+            cpu->gpr[OCERZ_RAX] = (uint64_t)q;
+            cpu->gpr[OCERZ_RDX] = (uint64_t)r;
+        } else {
+            uint64_t lo = read_acc(cpu, size);
+            uint64_t hi = ocerz_read_gpr(cpu, OCERZ_RDX, size, 0);
+            uint64_t num = (hi << (size * 8)) | lo;
+            uint64_t d = ocerz_trunc(divisor, size);
+            uint64_t q = num / d;
+            uint64_t r = num % d;
+            if (q > ocerz_mask(size))
+                return trap_fatal(insn, "divide quotient overflow");
+            write_acc(cpu, size, q);
+            ocerz_write_gpr(cpu, OCERZ_RDX, size, 0, r);
+        }
+        return OCERZ_STEP_OK;
+    }
+
+    if (size == 1) {
+        int64_t num = ocerz_sext(ocerz_read_gpr(cpu, OCERZ_RAX, 2, 0), 2);
+        int64_t d = ocerz_sext(divisor, 1);
+        int64_t q = num / d;
+        int64_t r = num % d;
+        if (q < -128 || q > 127)
+            return trap_fatal(insn, "divide quotient overflow");
+        ocerz_write_gpr(cpu, OCERZ_RAX, 1, 0, (uint64_t)q);
+        ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, (uint64_t)r);
+    } else if (size == 8) {
+        __int128_t num = ((__int128_t)(int64_t)cpu->gpr[OCERZ_RDX] << 64) | cpu->gpr[OCERZ_RAX];
+        __int128_t d = (int64_t)divisor;
+        __int128_t q = num / d;
+        __int128_t r = num % d;
+        if (q < -(__int128_t)1 - (__int128_t)((__uint128_t)~(uint64_t)0 >> 1) || q > (__int128_t)((__uint128_t)~(uint64_t)0 >> 1))
+            return trap_fatal(insn, "divide quotient overflow");
+        cpu->gpr[OCERZ_RAX] = (uint64_t)q;
+        cpu->gpr[OCERZ_RDX] = (uint64_t)r;
+    } else {
+        uint64_t lo = read_acc(cpu, size);
+        uint64_t hi = ocerz_read_gpr(cpu, OCERZ_RDX, size, 0);
+        int64_t num = ocerz_sext((hi << (size * 8)) | lo, size * 2);
+        int64_t d = ocerz_sext(divisor, size);
+        int64_t q = num / d;
+        int64_t r = num % d;
+        int64_t qmin = -(int64_t)1 - (int64_t)(ocerz_mask(size) >> 1);
+        int64_t qmax = (int64_t)(ocerz_mask(size) >> 1);
+        if (q < qmin || q > qmax)
+            return trap_fatal(insn, "divide quotient overflow");
+        write_acc(cpu, size, (uint64_t)q);
+        ocerz_write_gpr(cpu, OCERZ_RDX, size, 0, (uint64_t)r);
+    }
+    return OCERZ_STEP_OK;
+}
+
+static int op_shift(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    int size = insn->ops[0].size;
+    int bits = size * 8;
+    unsigned mask = (size == 8) ? 63u : 31u;
+    uint64_t val = ocerz_read_op(cpu, insn, &insn->ops[0]);
+    unsigned cnt = (unsigned)(ocerz_read_op(cpu, insn, &insn->ops[1]) & mask);
+    uint64_t res;
+    (void)vm;
+    if (cnt == 0)
+        return OCERZ_STEP_OK;
+    switch (insn->op) {
+    case OCERZ_OP_SHL:
+        res = ocerz_trunc(val << cnt, size);
+        ocerz_flags_shl(cpu, size, val, cnt, res);
+        break;
+    case OCERZ_OP_SHR:
+        res = ocerz_trunc(val, size) >> cnt;
+        ocerz_flags_shr(cpu, size, val, cnt, res);
+        break;
+    case OCERZ_OP_SAR:
+        res = ocerz_trunc((uint64_t)(ocerz_sext(val, size) >> cnt), size);
+        ocerz_flags_sar(cpu, size, val, cnt, res);
+        break;
+    default:
+        return ocerz_unimpl(vm, cpu, insn, "shift");
+    }
+    (void)bits;
+    ocerz_write_op(cpu, insn, &insn->ops[0], res);
+    return OCERZ_STEP_OK;
+}
+
+static int op_rotate(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    int size = insn->ops[0].size;
+    int bits = size * 8;
+    unsigned mask = (size == 8) ? 63u : 31u;
+    uint64_t val = ocerz_trunc(ocerz_read_op(cpu, insn, &insn->ops[0]), size);
+    unsigned masked = (unsigned)(ocerz_read_op(cpu, insn, &insn->ops[1]) & mask);
+    int cin = (cpu->rflags & OCERZ_CF) ? 1 : 0;
+    (void)vm;
+
+    if (insn->op == OCERZ_OP_ROL || insn->op == OCERZ_OP_ROR) {
+        unsigned rc = masked % (unsigned)bits;
+        if (masked == 0)
+            return OCERZ_STEP_OK;
+        uint64_t res;
+        if (rc == 0)
+            res = val;
+        else if (insn->op == OCERZ_OP_ROL)
+            res = ocerz_trunc((val << rc) | (val >> (bits - rc)), size);
+        else
+            res = ocerz_trunc((val >> rc) | (val << (bits - rc)), size);
+        int cf, of = 0;
+        if (insn->op == OCERZ_OP_ROL)
+            cf = (int)(res & 1);
+        else
+            cf = ocerz_msb(res, size);
+        if (masked == 1) {
+            if (insn->op == OCERZ_OP_ROL)
+                of = cf ^ ocerz_msb(res, size);
+            else
+                of = ocerz_msb(res, size) ^ (int)((res >> (bits - 2)) & 1);
+        }
+        ocerz_flag_assign(cpu, OCERZ_CF, cf);
+        if (masked == 1)
+            ocerz_flag_assign(cpu, OCERZ_OF, of);
+        ocerz_write_op(cpu, insn, &insn->ops[0], res);
+        return OCERZ_STEP_OK;
+    }
+
+    if (masked == 0)
+        return OCERZ_STEP_OK;
+    uint64_t res = val;
+    int carry = cin;
+    for (unsigned i = 0; i < masked; i++) {
+        if (insn->op == OCERZ_OP_RCL) {
+            int top = ocerz_msb(res, size);
+            res = ocerz_trunc((res << 1) | (uint64_t)carry, size);
+            carry = top;
+        } else {
+            int bot = (int)(res & 1);
+            res = ocerz_trunc((res >> 1) | ((uint64_t)carry << (bits - 1)), size);
+            carry = bot;
+        }
+    }
+    int of = 0;
+    if (masked == 1) {
+        if (insn->op == OCERZ_OP_RCL)
+            of = carry ^ ocerz_msb(res, size);
+        else
+            of = ocerz_msb(res, size) ^ (int)((res >> (bits - 2)) & 1);
+    }
+    ocerz_flag_assign(cpu, OCERZ_CF, carry);
+    if (masked == 1)
+        ocerz_flag_assign(cpu, OCERZ_OF, of);
+    ocerz_write_op(cpu, insn, &insn->ops[0], res);
+    return OCERZ_STEP_OK;
+}
+
+static int op_shiftd(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    int size = insn->ops[0].size;
+    int bits = size * 8;
+    unsigned mask = (size == 8) ? 63u : 31u;
+    uint64_t dst = ocerz_trunc(ocerz_read_op(cpu, insn, &insn->ops[0]), size);
+    uint64_t src = ocerz_trunc(ocerz_read_op(cpu, insn, &insn->ops[1]), size);
+    unsigned cnt = (unsigned)(ocerz_read_op(cpu, insn, &insn->ops[2]) & mask);
+    (void)vm;
+    if (cnt == 0)
+        return OCERZ_STEP_OK;
+    uint64_t res;
+    if (insn->op == OCERZ_OP_SHLD) {
+        __uint128_t big = ((__uint128_t)dst << bits) | src;
+        big <<= cnt;
+        res = ocerz_trunc((uint64_t)(big >> bits), size);
+        ocerz_flags_shl(cpu, size, dst, cnt, res);
+    } else {
+        __uint128_t big = ((__uint128_t)src << bits) | dst;
+        big >>= cnt;
+        res = ocerz_trunc((uint64_t)big, size);
+        ocerz_flags_shr(cpu, size, dst, cnt, res);
+    }
+    ocerz_write_op(cpu, insn, &insn->ops[0], res);
+    return OCERZ_STEP_OK;
+}
+
+static int op_mov_family(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    (void)vm;
+    switch (insn->op) {
+    case OCERZ_OP_MOV: {
+        uint64_t v = ocerz_read_op(cpu, insn, &insn->ops[1]);
+        ocerz_write_op(cpu, insn, &insn->ops[0], v);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_MOVZX: {
+        uint64_t v = ocerz_trunc(ocerz_read_op(cpu, insn, &insn->ops[1]), insn->ops[1].size);
+        ocerz_write_op(cpu, insn, &insn->ops[0], v);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_MOVSX:
+    case OCERZ_OP_MOVSXD: {
+        uint64_t v = (uint64_t)ocerz_sext(ocerz_read_op(cpu, insn, &insn->ops[1]), insn->ops[1].size);
+        ocerz_write_op(cpu, insn, &insn->ops[0], v);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_LEA: {
+        uint64_t a = lea_addr(cpu, insn, &insn->ops[1]);
+        ocerz_write_op(cpu, insn, &insn->ops[0], a);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_XCHG: {
+        uint64_t a = ocerz_read_op(cpu, insn, &insn->ops[0]);
+        uint64_t b = ocerz_read_op(cpu, insn, &insn->ops[1]);
+        ocerz_write_op(cpu, insn, &insn->ops[0], b);
+        ocerz_write_op(cpu, insn, &insn->ops[1], a);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_BSWAP: {
+        int size = insn->ops[0].size;
+        uint64_t v = ocerz_read_op(cpu, insn, &insn->ops[0]);
+        uint64_t r = (size == 8) ? __builtin_bswap64(v) : __builtin_bswap32((uint32_t)v);
+        ocerz_write_op(cpu, insn, &insn->ops[0], r);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_CMOVCC: {
+        uint64_t src = ocerz_read_op(cpu, insn, &insn->ops[1]);
+        int take = ocerz_cc_eval(cpu, insn->cc);
+        uint64_t dst = ocerz_read_op(cpu, insn, &insn->ops[0]);
+        ocerz_write_op(cpu, insn, &insn->ops[0], take ? src : dst);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_SETCC: {
+        int take = ocerz_cc_eval(cpu, insn->cc);
+        ocerz_write_op(cpu, insn, &insn->ops[0], take ? 1u : 0u);
+        return OCERZ_STEP_OK;
+    }
+    default:
+        return ocerz_unimpl(vm, cpu, insn, "mov-family");
+    }
+}
+
+static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    (void)vm;
+    switch (insn->op) {
+    case OCERZ_OP_PUSH: {
+        int size = insn->opsize;
+        uint64_t v = ocerz_read_op(cpu, insn, &insn->ops[0]);
+        ocerz_push(cpu, size, v);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_POP: {
+        int size = insn->opsize;
+        uint64_t v = ocerz_pop(cpu, size);
+        ocerz_write_op(cpu, insn, &insn->ops[0], v);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_PUSHF:
+        ocerz_push(cpu, 8, cpu->rflags);
+        return OCERZ_STEP_OK;
+    case OCERZ_OP_POPF: {
+        uint64_t v = ocerz_pop(cpu, 8);
+        uint64_t writable = OCERZ_CF | OCERZ_PF | OCERZ_AF | OCERZ_ZF | OCERZ_SF |
+                            OCERZ_TF | OCERZ_DF | OCERZ_OF;
+        cpu->rflags = (v & writable) | OCERZ_FLAG_FIXED1 | OCERZ_IF;
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_LAHF: {
+        uint64_t ah = (cpu->rflags & (OCERZ_CF | OCERZ_PF | OCERZ_AF | OCERZ_ZF | OCERZ_SF))
+                      | OCERZ_FLAG_FIXED1;
+        ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, ah);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_SAHF: {
+        uint64_t ah = ocerz_read_gpr(cpu, OCERZ_RAX, 1, 1);
+        uint64_t m = OCERZ_CF | OCERZ_PF | OCERZ_AF | OCERZ_ZF | OCERZ_SF;
+        cpu->rflags = (cpu->rflags & ~m) | (ah & m);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_LEAVE: {
+        cpu->gpr[OCERZ_RSP] = cpu->gpr[OCERZ_RBP];
+        cpu->gpr[OCERZ_RBP] = ocerz_pop(cpu, 8);
+        return OCERZ_STEP_OK;
+    }
+    default:
+        return ocerz_unimpl(vm, cpu, insn, "stack");
+    }
+}
+
+static int op_cbw_cwd(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    (void)vm;
+    if (insn->op == OCERZ_OP_CBW) {
+        if (insn->opsize == 2) {
+            int64_t v = ocerz_sext(ocerz_read_gpr(cpu, OCERZ_RAX, 1, 0), 1);
+            ocerz_write_gpr(cpu, OCERZ_RAX, 2, 0, (uint64_t)v);
+        } else if (insn->opsize == 4) {
+            int64_t v = ocerz_sext(ocerz_read_gpr(cpu, OCERZ_RAX, 2, 0), 2);
+            ocerz_write_gpr(cpu, OCERZ_RAX, 4, 0, (uint64_t)v);
+        } else {
+            int64_t v = ocerz_sext(ocerz_read_gpr(cpu, OCERZ_RAX, 4, 0), 4);
+            cpu->gpr[OCERZ_RAX] = (uint64_t)v;
+        }
+        return OCERZ_STEP_OK;
+    }
+    if (insn->opsize == 2) {
+        int v = ocerz_msb(ocerz_read_gpr(cpu, OCERZ_RAX, 2, 0), 2);
+        ocerz_write_gpr(cpu, OCERZ_RDX, 2, 0, v ? 0xffff : 0);
+    } else if (insn->opsize == 4) {
+        int v = ocerz_msb(ocerz_read_gpr(cpu, OCERZ_RAX, 4, 0), 4);
+        ocerz_write_gpr(cpu, OCERZ_RDX, 4, 0, v ? 0xffffffffu : 0);
+    } else {
+        int v = ocerz_msb(cpu->gpr[OCERZ_RAX], 8);
+        cpu->gpr[OCERZ_RDX] = v ? ~(uint64_t)0 : 0;
+    }
+    return OCERZ_STEP_OK;
+}
+
+static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    (void)vm;
+    switch (insn->op) {
+    case OCERZ_OP_JMP: {
+        if (insn->ops[0].kind == OCERZ_OPK_IMM)
+            cpu->rip = insn->ops[0].imm;
+        else
+            cpu->rip = ocerz_read_op(cpu, insn, &insn->ops[0]);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_JCC:
+        if (ocerz_cc_eval(cpu, insn->cc))
+            cpu->rip = insn->ops[0].imm;
+        return OCERZ_STEP_OK;
+    case OCERZ_OP_JRCXZ: {
+        uint64_t c = (insn->addrsize == 4) ? (uint32_t)cpu->gpr[OCERZ_RCX] : cpu->gpr[OCERZ_RCX];
+        if (c == 0)
+            cpu->rip = insn->ops[0].imm;
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_LOOP:
+    case OCERZ_OP_LOOPE:
+    case OCERZ_OP_LOOPNE: {
+        uint64_t c;
+        if (insn->addrsize == 4) {
+            c = (uint32_t)cpu->gpr[OCERZ_RCX] - 1;
+            ocerz_write_gpr(cpu, OCERZ_RCX, 4, 0, c);
+            c = (uint32_t)c;
+        } else {
+            c = cpu->gpr[OCERZ_RCX] - 1;
+            cpu->gpr[OCERZ_RCX] = c;
+        }
+        int zf = (cpu->rflags & OCERZ_ZF) ? 1 : 0;
+        int branch = (c != 0);
+        if (insn->op == OCERZ_OP_LOOPE)
+            branch = branch && zf;
+        else if (insn->op == OCERZ_OP_LOOPNE)
+            branch = branch && !zf;
+        if (branch)
+            cpu->rip = insn->ops[0].imm;
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_CALL: {
+        uint64_t target;
+        if (insn->ops[0].kind == OCERZ_OPK_IMM)
+            target = insn->ops[0].imm;
+        else
+            target = ocerz_read_op(cpu, insn, &insn->ops[0]);
+        ocerz_push(cpu, 8, cpu->rip);
+        cpu->rip = target;
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_RET: {
+        uint64_t ret = ocerz_pop(cpu, 8);
+        if (insn->nops == 1)
+            cpu->gpr[OCERZ_RSP] += ocerz_trunc(insn->ops[0].imm, 2);
+        cpu->rip = ret;
+        return OCERZ_STEP_OK;
+    }
+    default:
+        return ocerz_unimpl(vm, cpu, insn, "branch");
+    }
+}
+
+static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    (void)vm;
+    switch (insn->op) {
+    case OCERZ_OP_XADD: {
+        int size = insn->ops[0].size;
+        uint64_t dst = ocerz_read_op(cpu, insn, &insn->ops[0]);
+        uint64_t src = ocerz_read_op(cpu, insn, &insn->ops[1]);
+        uint64_t sum = dst + src;
+        ocerz_flags_add(cpu, size, dst, src, 0, sum);
+        ocerz_write_op(cpu, insn, &insn->ops[1], dst);
+        ocerz_write_op(cpu, insn, &insn->ops[0], sum);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_CMPXCHG: {
+        int size = insn->ops[0].size;
+        uint64_t acc = read_acc(cpu, size);
+        uint64_t d = ocerz_read_op(cpu, insn, &insn->ops[0]);
+        ocerz_flags_sub(cpu, size, acc, d, 0, acc - d);
+        if (ocerz_trunc(acc, size) == ocerz_trunc(d, size)) {
+            uint64_t src = ocerz_read_op(cpu, insn, &insn->ops[1]);
+            ocerz_write_op(cpu, insn, &insn->ops[0], src);
+        } else {
+            write_acc(cpu, size, d);
+        }
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_CMPXCHGXB: {
+        uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
+        if (insn->opsize == 8) {
+            uint64_t mem = ocerz_ld(addr, 8);
+            uint64_t expected = ((uint64_t)(uint32_t)cpu->gpr[OCERZ_RDX] << 32) |
+                                (uint32_t)cpu->gpr[OCERZ_RAX];
+            if (mem == expected) {
+                uint64_t store = ((uint64_t)(uint32_t)cpu->gpr[OCERZ_RCX] << 32) |
+                                 (uint32_t)cpu->gpr[OCERZ_RBX];
+                ocerz_st(addr, 8, store);
+                ocerz_flag_assign(cpu, OCERZ_ZF, 1);
+            } else {
+                ocerz_write_gpr(cpu, OCERZ_RAX, 4, 0, (uint32_t)mem);
+                ocerz_write_gpr(cpu, OCERZ_RDX, 4, 0, (uint32_t)(mem >> 32));
+                ocerz_flag_assign(cpu, OCERZ_ZF, 0);
+            }
+        } else {
+            Ocerz128 mem = ocerz_ld128(addr);
+            if (mem.lo == cpu->gpr[OCERZ_RAX] && mem.hi == cpu->gpr[OCERZ_RDX]) {
+                Ocerz128 store = { cpu->gpr[OCERZ_RBX], cpu->gpr[OCERZ_RCX] };
+                ocerz_st128(addr, store);
+                ocerz_flag_assign(cpu, OCERZ_ZF, 1);
+            } else {
+                cpu->gpr[OCERZ_RAX] = mem.lo;
+                cpu->gpr[OCERZ_RDX] = mem.hi;
+                ocerz_flag_assign(cpu, OCERZ_ZF, 0);
+            }
+        }
+        return OCERZ_STEP_OK;
+    }
+    default:
+        return ocerz_unimpl(vm, cpu, insn, "atomic");
+    }
+}
+
+static int op_flagctl(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    (void)vm;
+    switch (insn->op) {
+    case OCERZ_OP_CLC:
+        ocerz_flag_assign(cpu, OCERZ_CF, 0);
+        return OCERZ_STEP_OK;
+    case OCERZ_OP_STC:
+        ocerz_flag_assign(cpu, OCERZ_CF, 1);
+        return OCERZ_STEP_OK;
+    case OCERZ_OP_CMC:
+        cpu->rflags ^= OCERZ_CF;
+        return OCERZ_STEP_OK;
+    case OCERZ_OP_CLD:
+        ocerz_flag_assign(cpu, OCERZ_DF, 0);
+        return OCERZ_STEP_OK;
+    case OCERZ_OP_STD:
+        ocerz_flag_assign(cpu, OCERZ_DF, 1);
+        return OCERZ_STEP_OK;
+    default:
+        return ocerz_unimpl(vm, cpu, insn, "flagctl");
+    }
+}
+
+int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
+        return ocerz_dyldapi_dispatch(vm, cpu);
+
+    X86Insn insn;
+    const uint8_t *code = (const uint8_t *)ocerz_g2h(cpu->rip);
+    int rc = ocerz_decode(code, 15, cpu->rip, &insn);
+    if (rc != OCERZ_OK) {
+        fprintf(stderr, "ocerz: fatal: decode failed (%d) at rip=%#llx\n  bytes: ",
+                rc, (unsigned long long)cpu->rip);
+        dump_raw_bytes(stderr, cpu->rip, 15);
+        fprintf(stderr, "\n");
+        return OCERZ_STEP_FATAL;
+    }
+
+    vm->insn_count++;
+
+    if (vm->trace) {
+        char buf[128];
+        ocerz_format_insn(&insn, buf, sizeof buf);
+        fprintf(stderr, "ocerz: %#llx: %s\n", (unsigned long long)cpu->rip, buf);
+    }
+
+    cpu->rip += insn.len;
+    return ocerz_interp_exec(vm, cpu, &insn);
+}
+
+int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
+{
+    const X86Insn insn = *insnp;
+    int rc;
+
+    switch (insn.op) {
+    case OCERZ_OP_MOV:
+    case OCERZ_OP_MOVZX:
+    case OCERZ_OP_MOVSX:
+    case OCERZ_OP_MOVSXD:
+    case OCERZ_OP_LEA:
+    case OCERZ_OP_XCHG:
+    case OCERZ_OP_BSWAP:
+    case OCERZ_OP_CMOVCC:
+    case OCERZ_OP_SETCC:
+        return op_mov_family(vm, cpu, &insn);
+
+    case OCERZ_OP_PUSH:
+    case OCERZ_OP_POP:
+    case OCERZ_OP_PUSHF:
+    case OCERZ_OP_POPF:
+    case OCERZ_OP_LAHF:
+    case OCERZ_OP_SAHF:
+    case OCERZ_OP_LEAVE:
+        return op_stack(vm, cpu, &insn);
+
+    case OCERZ_OP_CBW:
+    case OCERZ_OP_CWD:
+        return op_cbw_cwd(vm, cpu, &insn);
+
+    case OCERZ_OP_ADD:
+    case OCERZ_OP_ADC:
+    case OCERZ_OP_SUB:
+    case OCERZ_OP_SBB:
+    case OCERZ_OP_AND:
+    case OCERZ_OP_OR:
+    case OCERZ_OP_XOR:
+    case OCERZ_OP_CMP:
+    case OCERZ_OP_TEST:
+        return op_arith(vm, cpu, &insn);
+
+    case OCERZ_OP_INC:
+    case OCERZ_OP_DEC:
+    case OCERZ_OP_NEG:
+    case OCERZ_OP_NOT:
+        return op_incdecnegnot(vm, cpu, &insn);
+
+    case OCERZ_OP_MUL:
+    case OCERZ_OP_IMUL:
+        return op_mul(vm, cpu, &insn);
+
+    case OCERZ_OP_DIV:
+    case OCERZ_OP_IDIV:
+        return op_div(vm, cpu, &insn);
+
+    case OCERZ_OP_SHL:
+    case OCERZ_OP_SHR:
+    case OCERZ_OP_SAR:
+        return op_shift(vm, cpu, &insn);
+
+    case OCERZ_OP_ROL:
+    case OCERZ_OP_ROR:
+    case OCERZ_OP_RCL:
+    case OCERZ_OP_RCR:
+        return op_rotate(vm, cpu, &insn);
+
+    case OCERZ_OP_SHLD:
+    case OCERZ_OP_SHRD:
+        return op_shiftd(vm, cpu, &insn);
+
+    case OCERZ_OP_JMP:
+    case OCERZ_OP_JCC:
+    case OCERZ_OP_JRCXZ:
+    case OCERZ_OP_LOOP:
+    case OCERZ_OP_LOOPE:
+    case OCERZ_OP_LOOPNE:
+    case OCERZ_OP_CALL:
+    case OCERZ_OP_RET:
+        return op_branch(vm, cpu, &insn);
+
+    case OCERZ_OP_XADD:
+    case OCERZ_OP_CMPXCHG:
+    case OCERZ_OP_CMPXCHGXB:
+        return op_atomic(vm, cpu, &insn);
+
+    case OCERZ_OP_CLC:
+    case OCERZ_OP_STC:
+    case OCERZ_OP_CMC:
+    case OCERZ_OP_CLD:
+    case OCERZ_OP_STD:
+        return op_flagctl(vm, cpu, &insn);
+
+    case OCERZ_OP_NOP:
+    case OCERZ_OP_PAUSE:
+    case OCERZ_OP_PREFETCH:
+    case OCERZ_OP_CLFLUSH:
+        return OCERZ_STEP_OK;
+
+    case OCERZ_OP_MFENCE:
+    case OCERZ_OP_LFENCE:
+    case OCERZ_OP_SFENCE:
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        return OCERZ_STEP_OK;
+
+    case OCERZ_OP_INT3:
+    case OCERZ_OP_INT:
+        return trap_fatal(&insn, "guest breakpoint/interrupt");
+
+    case OCERZ_OP_UD2:
+        return trap_fatal(&insn, "guest UD2 (undefined instruction)");
+
+    case OCERZ_OP_HLT:
+        return trap_fatal(&insn, "guest HLT");
+
+    case OCERZ_OP_SYSCALL:
+        cpu->gpr[OCERZ_RCX] = cpu->rip;
+        cpu->gpr[OCERZ_R11] = cpu->rflags & 0x3c7fd7ull;
+        return ocerz_handle_syscall(vm, cpu);
+
+    default:
+        break;
+    }
+
+    rc = ocerz_interp_ext(vm, cpu, &insn);
+    if (rc == OCERZ_EUNSUP && insn.op >= OCERZ_OP_SSE_FIRST)
+        rc = ocerz_interp_sse(vm, cpu, &insn);
+    if (rc == OCERZ_EUNSUP)
+        return ocerz_unimpl(vm, cpu, &insn, "no handler");
+    return rc;
+}

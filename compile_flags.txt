@@ -1,0 +1,4 @@
+-Iinclude
+-std=c11
+-arch
+arm64
