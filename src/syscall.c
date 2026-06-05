@@ -66,7 +66,7 @@
 #include <errno.h>
 #include <string.h>
 
-#define OCERZ_BSD_MAX 512
+#define OCERZ_BSD_MAX 600
 
 #define OCERZ_ENOMEM_V 12
 #define OCERZ_ENOTSUP_V 45
@@ -162,6 +162,20 @@ static int sys_unsupported(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     (void)cpu;
     (void)a;
     return OCERZ_STEP_FATAL;
+}
+
+static int sys_abort_payload(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    OCERZ_LOG("guest abort_with_payload: reason_namespace=%llu reason_code=%llu\n",
+              (unsigned long long)a[0], (unsigned long long)a[1]);
+    for (int k = 0; k < 5; k++) {
+        uint64_t v = ocerz_ld(0x300002000ull + (uint64_t)k * 8, 8);
+        fprintf(stderr, "  selref[%d] = %#llx %s\n", k, (unsigned long long)v,
+                v >= 0x7ff800000000ull ? "CACHE" : "ARENA(raw)");
+    }
+    (void)cpu;
+    ocerz_vm_request_exit(vm, 134);
+    return OCERZ_STEP_EXIT;
 }
 
 static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
@@ -479,6 +493,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [274] = { "sysctlbyname",6, 0x1d, 0, NULL },
     [381] = { "__mac_syscall", 3, 0x05, 0, NULL },
     [483] = { "csrctl", 3, 0x02, 0, NULL },
+    [521] = { "abort_with_payload", 6, 0x04, 0, sys_abort_payload },
     [286] = { "gettid",      2, 0x03, 0, NULL },
     [294] = { "shared_region_check_np", 1, 0x01, 0, sys_shared_region_check_np },
     [327] = { "issetugid",   0, 0x00, 0, NULL },
@@ -525,6 +540,16 @@ static void strace_bsd(OcerzVM *vm, const ocerz_bsd_entry *e, int num,
         fprintf(stderr, ") = -1 %s\n", errno_name((int)cpu->gpr[OCERZ_RAX]));
     else
         fprintf(stderr, ") = %#llx\n", (unsigned long long)cpu->gpr[OCERZ_RAX]);
+    if (e && e->name && (strcmp(e->name, "open") == 0 || strcmp(e->name, "access") == 0)) {
+        char pbuf[128];
+        for (int i = 0; i < 127; i++) {
+            char c = (char)ocerz_ld(orig[0] + (uint64_t)i, 1);
+            pbuf[i] = c;
+            if (!c) break;
+            pbuf[i + 1] = 0;
+        }
+        fprintf(stderr, "ocerz:    path[%#llx] = \"%s\"\n", (unsigned long long)orig[0], pbuf);
+    }
     (void)num;
 }
 
@@ -604,7 +629,9 @@ static const char *mach_trap_name(int num)
     case 36: return "semaphore_wait_trap";
     case 37: return "semaphore_wait_signal_trap";
     case 38: return "semaphore_timedwait_trap";
+    case 43: return "mach_generate_activity_id";
     case 47: return "mach_msg2_trap";
+    case 50: return "thread_get_special_reply_port";
     case 59: return "swtch_pri";
     case 60: return "swtch";
     case 89: return "mach_timebase_info_trap";
@@ -689,6 +716,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 36:
     case 37:
     case 38:
+    case 50:
     case 59:
     case 60:
     case 70: {
@@ -698,6 +726,12 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 31: {
         if (a[0] != 0)
             a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
+    case 43: {
+        if (a[2] != 0)
+            a[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }

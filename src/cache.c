@@ -21,20 +21,24 @@
  * Slide rebasing. The cache ships its __DATA/__DATA_CONST pointers chained for
  * ASLR; even at slide 0 they must be unchained before cache code can read
  * them. For each slide-bearing mapping a dyld_cache_slide_info2 {version=2,
- * page_size, page_starts_offset/count, delta_mask, value_mask (= cache base),
- * value_add} is parsed; for every page whose page_starts entry has neither
- * high attribute bit set (NO_REBASE is 0x4000 and EXTRA is 0x8000 in v2 — not
- * the 0xFFFF used by v1/v3) the page-local chain is walked from byte offset
- * page_start * 4 (the page_starts entry is in 4-BYTE UNITS, not bytes — the
+ * page_size, page_starts_offset/count, page_extras_offset/count, delta_mask,
+ * value_add} is parsed. A page_starts entry of exactly 0x4000 (NO_REBASE)
+ * means the page has no pointers. An entry with bit 0x8000 (EXTRA) set is an
+ * index into the page_extras u16 array: the page holds MULTIPLE chains, one
+ * per extras entry, consumed until an entry with its own 0x8000 (END) bit;
+ * each entry's low 14 bits are that chain's start. A plain entry is itself the
+ * single chain start. Chain starts are in 4-BYTE UNITS, not bytes — the
  * single most load-bearing detail here: with *1 every page whose chain does
  * not begin at offset 0 is mis-walked, which silently leaves most __DATA /
- * __DATA_CONST pointers in chained form and corrupts cache state downstream).
+ * __DATA_CONST pointers in chained form and corrupts cache state downstream.
  * Each 8-byte slot is rewritten to (raw & ~delta_mask) plus the cache base
  * when non-zero, stepping to the next slot by (raw & delta_mask) >>
  * (ctz(delta_mask) - 2) bytes until the delta is zero or the page boundary is
  * reached (v2 chains never cross a page, so the walk is bounded to the page).
- * Verified to validate ~99.6% of all chains; the residual handful are
- * page_extras-style multi-chain pages, confined harmlessly by the page bound.
+ * Skipping the EXTRA pages (an earlier revision did) leaves those pages' raw
+ * chained values visible to guest code; CoreFoundation's malloc-type-callback
+ * table lives on such a page, and reading zeros there sent every typed malloc
+ * into an infinite proxy-zone redispatch loop during __CFInitialize.
  * file is missing. The main file's header also carries the image table at
  * imagesOffset/imagesCount (modern layout: u32 at 0x1C0/0x1C4); each
  * dyld_cache_image_info is {address(u64), modTime(u64), inode(u64),
@@ -55,8 +59,14 @@
  * normal export) the ULEB address offset and return mach_header + offset;
  * otherwise skip the terminal info, read the child count, and follow the
  * child whose edge string prefixes the remaining symbol. Re-export terminals
- * (EXPORT_SYMBOL_FLAGS_REEXPORT) are treated as not-found here, so the search
- * continues to the dylib that exports the symbol for real.
+ * (EXPORT_SYMBOL_FLAGS_REEXPORT) carry a dependent-library ordinal and an
+ * optional renamed import; resolve_in_dylib follows them — it maps the ordinal
+ * to that dylib's Nth LC_LOAD_DYLIB install name, finds that image in the
+ * cache, and recurses on the imported name. This is required because e.g.
+ * _memset exists only as a re-export in libsystem_c (ordinal 6 ->
+ * libsystem_platform, renamed __platform_memset); the real symbol lives in
+ * libsystem_platform, whose export trie is described by an old-style
+ * LC_DYLD_INFO_ONLY (export_off at +40, not the bind/lazy offsets).
  */
 #include "ocerz/cache.h"
 
@@ -64,6 +74,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <mach-o/loader.h>
+#include <string.h>
 
 #define CACHE_DIR "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/"
 #define CACHE_STEM "dyld_shared_cache_x86_64"
@@ -111,38 +122,58 @@ static uint64_t subcache_f2a(const uint8_t *hdr, uint32_t rec_off, uint32_t rec_
     return 0;
 }
 
+static void rebase_chain_v2(uint64_t page_base, uint64_t page_end, uint16_t start4,
+                            uint64_t cache_base, uint64_t delta_mask, int delta_shift)
+{
+    uint64_t value_mask = ~delta_mask;
+    uint64_t cur = page_base + (uint64_t)start4 * 4;
+    for (;;) {
+        if (cur < page_base || cur + 8 > page_end)
+            break;
+        uint8_t *loc = (uint8_t *)(uintptr_t)cur;
+        uint64_t raw;
+        memcpy(&raw, loc, 8);
+        uint64_t value = raw & value_mask;
+        if (value != 0)
+            value += cache_base;
+        uint64_t delta = (raw & delta_mask) >> delta_shift;
+        memcpy(loc, &value, 8);
+        if (delta == 0)
+            break;
+        cur += delta;
+    }
+}
+
 static void rebase_slide_v2(uint64_t map_addr, uint64_t map_size, uint64_t cache_base, const uint8_t *si)
 {
     uint32_t page_size = rd32(si + 4);
     uint32_t ps_off = rd32(si + 8);
     uint32_t ps_cnt = rd32(si + 12);
+    uint32_t pe_off = rd32(si + 16);
+    uint32_t pe_cnt = rd32(si + 20);
     uint64_t delta_mask = rd64(si + 24);
-    uint64_t value_mask = ~delta_mask;
     int delta_shift = __builtin_ctzll(delta_mask) - 2;
     const uint8_t *page_starts = si + ps_off;
+    const uint8_t *page_extras = si + pe_off;
     for (uint32_t pg = 0; pg < ps_cnt; pg++) {
         uint16_t start = (uint16_t)(page_starts[pg * 2] | (page_starts[pg * 2 + 1] << 8));
-        if (start & 0xc000)
+        if (start == 0x4000)
             continue;
         uint64_t page_base = map_addr + (uint64_t)pg * page_size;
         if (page_base + page_size > map_addr + map_size)
             break;
-        uint64_t cur = page_base + (uint64_t)start * 4;
         uint64_t page_end = page_base + page_size;
-        for (;;) {
-            if (cur < page_base || cur + 8 > page_end)
-                break;
-            uint8_t *loc = (uint8_t *)(uintptr_t)cur;
-            uint64_t raw;
-            memcpy(&raw, loc, 8);
-            uint64_t value = raw & value_mask;
-            if (value != 0)
-                value += cache_base;
-            uint64_t delta = (raw & delta_mask) >> delta_shift;
-            memcpy(loc, &value, 8);
-            if (delta == 0)
-                break;
-            cur += delta;
+        if (start & 0x8000) {
+            for (uint32_t idx = start & 0x3fff; idx < pe_cnt; idx++) {
+                uint16_t e = (uint16_t)(page_extras[idx * 2] | (page_extras[idx * 2 + 1] << 8));
+                rebase_chain_v2(page_base, page_end, e & 0x3fff,
+                                cache_base, delta_mask, delta_shift);
+                if (e & 0x8000)
+                    break;
+            }
+        } else {
+            rebase_chain_v2(page_base, page_end, start,
+                            cache_base, delta_mask, delta_shift);
         }
     }
 }
@@ -279,8 +310,8 @@ static int dylib_export_region(uint64_t mh_addr, const uint8_t **trie_start,
             exp_off = rd32(lc + 8);
             exp_size = rd32(lc + 12);
         } else if ((cmd == LC_DYLD_INFO || cmd == LC_DYLD_INFO_ONLY) && exp_off == 0) {
-            exp_off = rd32(lc + 32);
-            exp_size = rd32(lc + 36);
+            exp_off = rd32(lc + 40);
+            exp_size = rd32(lc + 44);
         }
         lc += csize;
     }
@@ -292,8 +323,11 @@ static int dylib_export_region(uint64_t mh_addr, const uint8_t **trie_start,
     return 0;
 }
 
-static uint64_t trie_lookup(const uint8_t *start, const uint8_t *end, const char *sym)
+static uint64_t trie_lookup(const uint8_t *start, const uint8_t *end, const char *sym,
+                            int *is_reexport, uint64_t *reexport_ord,
+                            const char **reexport_name)
 {
+    *is_reexport = 0;
     const uint8_t *p = start;
     const char *s = sym;
     while (p < end) {
@@ -303,10 +337,13 @@ static uint64_t trie_lookup(const uint8_t *start, const uint8_t *end, const char
                 return 0;
             const uint8_t *tp = p;
             uint64_t flags = uleb(&tp, end);
-            if (flags & EXPORT_FLAGS_REEXPORT)
-                return 0;
-            uint64_t off = uleb(&tp, end);
-            return off;
+            if (flags & EXPORT_FLAGS_REEXPORT) {
+                *is_reexport = 1;
+                *reexport_ord = uleb(&tp, end);
+                *reexport_name = (const char *)tp;
+                return 1;
+            }
+            return uleb(&tp, end);
         }
         p += term;
         if (p >= end)
@@ -330,6 +367,60 @@ static uint64_t trie_lookup(const uint8_t *start, const uint8_t *end, const char
     return 0;
 }
 
+static uint64_t cache_image_by_path(OcerzCache *c, const char *path)
+{
+    for (uint32_t i = 0; i < c->images_cnt; i++) {
+        const char *p = NULL;
+        uint64_t mh = ocerz_cache_image_addr(c, i, &p);
+        if (mh && p && strcmp(p, path) == 0)
+            return mh;
+    }
+    return 0;
+}
+
+static const char *dylib_ordinal_name(uint64_t mh, uint64_t ord)
+{
+    const uint8_t *m = (const uint8_t *)(uintptr_t)mh;
+    uint32_t ncmds = rd32(m + 16);
+    const uint8_t *lc = m + sizeof(struct mach_header_64);
+    uint64_t n = 0;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+            if (++n == ord)
+                return (const char *)(lc + rd32(lc + 8));
+        }
+        lc += rd32(lc + 4);
+    }
+    return NULL;
+}
+
+static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, int depth)
+{
+    if (depth > 16)
+        return 0;
+    const uint8_t *ts, *te;
+    if (dylib_export_region(mh, &ts, &te) != 0)
+        return 0;
+    int reexp = 0;
+    uint64_t ord = 0;
+    const char *imp = NULL;
+    uint64_t off = trie_lookup(ts, te, sym, &reexp, &ord, &imp);
+    if (off == 0)
+        return 0;
+    if (!reexp)
+        return mh + off;
+    const char *want = (imp && imp[0]) ? imp : sym;
+    const char *tgt = dylib_ordinal_name(mh, ord);
+    if (!tgt)
+        return 0;
+    uint64_t tmh = cache_image_by_path(c, tgt);
+    if (!tmh)
+        return 0;
+    return resolve_in_dylib(c, tmh, want, depth + 1);
+}
+
 uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol)
 {
     if (!c->mapped)
@@ -338,12 +429,9 @@ uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol)
         uint64_t mh = ocerz_cache_image_addr(c, i, NULL);
         if (mh == 0 || rd32((const uint8_t *)(uintptr_t)mh) != MH_MAGIC_64)
             continue;
-        const uint8_t *ts, *te;
-        if (dylib_export_region(mh, &ts, &te) != 0)
-            continue;
-        uint64_t off = trie_lookup(ts, te, symbol);
-        if (off != 0)
-            return mh + off;
+        uint64_t r = resolve_in_dylib(c, mh, symbol, 0);
+        if (r != 0)
+            return r;
     }
     return 0;
 }

@@ -37,10 +37,14 @@
  *     init and uses the raw _exit trampoline. OCERZ_INIT forces init on,
  *     OCERZ_NOINIT forces it off.
  *
- * Still TODO at the honest edge: the loaded-image set handed to objc is the
- * libSystem closure (libobjc + /usr/lib/system objc dylibs), not a computed
- * dependency closure, so executables that link higher frameworks need that
- * generalised; TLV and re-exported cache-export-table imports are not set up.
+ * libc/Objective-C executables run: imports resolve through ocerz_cache_resolve
+ * (which now follows re-export terminals, e.g. _memset -> libsystem_platform
+ * __platform_memset, see cache.c), the dependency closure of objc images is
+ * mapped (see dyldapi.c), and exit() flushes stdio. Still TODO at the honest
+ * edge: TLV is not set up, and a Foundation app reaches main but objc's
+ * preoptimized method dispatch (relative method lists / shared-cache selector
+ * uniquing) is not yet faithful, so a send like +[NSString stringWithFormat:]
+ * is not found — that is the next frontier, not loading or linking.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -417,6 +421,230 @@ static uint64_t find_dylib_init(OcerzCache *cache, const char *substr)
     return 0;
 }
 
+static uint64_t dep_find(OcerzCache *cache, const char *path)
+{
+    for (uint32_t i = 0; i < cache->images_cnt; i++) {
+        const char *p = NULL;
+        uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
+        if (mh && p && strcmp(p, path) == 0)
+            return mh;
+    }
+    return 0;
+}
+
+static int64_t image_slide_d(uint64_t mh)
+{
+    uint32_t ncmds = rd32((const uint8_t *)(uintptr_t)mh + 16);
+    const uint8_t *lc = (const uint8_t *)(uintptr_t)mh + sizeof(struct mach_header_64);
+    for (uint32_t n = 0; n < ncmds; n++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *s = (const void *)lc;
+            if (s->fileoff == 0 && s->vmaddr)
+                return (int64_t)mh - (int64_t)s->vmaddr;
+        }
+        lc += l->cmdsize;
+    }
+    return 0;
+}
+
+struct seg_ent { uint64_t lo, hi, mh; };
+#define SEG_MAX 32768
+static struct seg_ent g_segs[SEG_MAX];
+static int g_segs_n;
+static int seg_cmp(const void *a, const void *b)
+{
+    const struct seg_ent *x = a, *y = b;
+    return x->lo < y->lo ? -1 : x->lo > y->lo ? 1 : 0;
+}
+static void build_segs(OcerzCache *cache)
+{
+    g_segs_n = 0;
+    for (uint32_t i = 0; i < cache->images_cnt; i++) {
+        const char *p;
+        uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
+        if (!mh || rd32((const uint8_t *)(uintptr_t)mh) != MH_MAGIC_64)
+            continue;
+        int64_t slide = image_slide_d(mh);
+        uint32_t ncmds = rd32((const uint8_t *)(uintptr_t)mh + 16);
+        const uint8_t *lc = (const uint8_t *)(uintptr_t)mh + sizeof(struct mach_header_64);
+        for (uint32_t n = 0; n < ncmds; n++) {
+            const struct load_command *l = (const void *)lc;
+            if (l->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *s = (const void *)lc;
+                if (s->vmsize && g_segs_n < SEG_MAX) {
+                    g_segs[g_segs_n].lo = s->vmaddr + slide;
+                    g_segs[g_segs_n].hi = s->vmaddr + slide + s->vmsize;
+                    g_segs[g_segs_n].mh = mh;
+                    g_segs_n++;
+                }
+            }
+            lc += l->cmdsize;
+        }
+    }
+    qsort(g_segs, g_segs_n, sizeof(struct seg_ent), seg_cmp);
+}
+static uint64_t seg_owner(uint64_t addr)
+{
+    int lo = 0, hi = g_segs_n - 1, best = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_segs[mid].lo <= addr) { best = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    if (best >= 0 && addr < g_segs[best].hi)
+        return g_segs[best].mh;
+    return 0;
+}
+
+#define EAGER_MAX 4096
+static uint64_t g_eager[EAGER_MAX];
+static int g_eager_n;
+static int eager_has(uint64_t mh)
+{
+    for (int i = 0; i < g_eager_n; i++)
+        if (g_eager[i] == mh) return 1;
+    return 0;
+}
+static void eager_add(uint64_t mh)
+{
+    if (mh && !eager_has(mh) && g_eager_n < EAGER_MAX)
+        g_eager[g_eager_n++] = mh;
+}
+static void scan_uses(uint64_t mh)
+{
+    int64_t slide = image_slide_d(mh);
+    uint32_t ncmds = rd32((const uint8_t *)(uintptr_t)mh + 16);
+    const uint8_t *lc = (const uint8_t *)(uintptr_t)mh + sizeof(struct mach_header_64);
+    for (uint32_t n = 0; n < ncmds; n++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *s = (const void *)lc;
+            const struct section_64 *sc = (const void *)(s + 1);
+            for (uint32_t j = 0; j < s->nsects; j++) {
+                uint32_t type = sc[j].flags & 0xff;
+                int isptr = type == 6 || type == 7 ||
+                            strncmp(sc[j].sectname, "__got", 16) == 0 ||
+                            strncmp(sc[j].sectname, "__la_symbol_ptr", 16) == 0 ||
+                            strncmp(sc[j].sectname, "__auth_got", 16) == 0 ||
+                            strncmp(sc[j].sectname, "__objc_classrefs", 16) == 0 ||
+                            strncmp(sc[j].sectname, "__objc_superrefs", 16) == 0 ||
+                            strncmp(sc[j].sectname, "__objc_protorefs", 16) == 0 ||
+                            strncmp(sc[j].sectname, "__objc_nlclslist", 16) == 0 ||
+                            strncmp(sc[j].sectname, "__objc_catlist", 16) == 0 ||
+                            strncmp(sc[j].sectname, "__cfstring", 16) == 0 ||
+                            strncmp(sc[j].sectname, "__objc_classlist", 16) == 0;
+                if (isptr) {
+                    uint64_t a = sc[j].addr + slide, e = a + sc[j].size;
+                    for (uint64_t pp = a; pp + 8 <= e; pp += 8) {
+                        uint64_t v = rd64((const uint8_t *)(uintptr_t)pp);
+                        uint64_t o = seg_owner(v);
+                        if (o && o != mh) eager_add(o);
+                    }
+                }
+            }
+        }
+        lc += l->cmdsize;
+    }
+}
+static void compute_eager_set(OcerzCache *cache, uint64_t main_mh)
+{
+    build_segs(cache);
+    g_eager_n = 0;
+    eager_add(main_mh);
+    for (uint32_t i = 0; i < cache->images_cnt; i++) {
+        const char *p;
+        uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
+        if (mh && p && (strstr(p, "/usr/lib/system/") ||
+                        strcmp(p, "/usr/lib/libSystem.B.dylib") == 0))
+            eager_add(mh);
+    }
+    int root_n = g_eager_n;
+    for (int i = 0; i < g_eager_n; i++)
+        scan_uses(g_eager[i]);
+    if (getenv("OCERZ_INITLOG"))
+        fprintf(stderr, "dynamic: eager init set: root=%d eager=%d (of closure)\n", root_n, g_eager_n);
+}
+
+static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64_t stack_top)
+{
+    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t j = 0; j < ncmds; j++) {
+        if (rd32(lc) == LC_SEGMENT_64) {
+            uint32_t ns = rd32(lc + 64);
+            const uint8_t *sec = lc + 72;
+            for (uint32_t s = 0; s < ns; s++) {
+                uint8_t ty = rd32(sec + 64) & 0xff;
+                uint64_t sa = rd64(sec + 32), ssz = rd64(sec + 40);
+                if (ty == 0x16) {
+                    for (uint64_t o = 0; o + 4 <= ssz; o += 4) {
+                        uint64_t fn = mh + rd32((const uint8_t *)(uintptr_t)(sa + o));
+                        if (getenv("OCERZ_INITLOG"))
+                            fprintf(stderr, "INIT mh=%#llx fn=%#llx\n",
+                                    (unsigned long long)mh, (unsigned long long)fn);
+                        ocerz_vm_call(vm, fn, ia, 5, stack_top);
+                        if (vm->exited)
+                            return;
+                    }
+                } else if (ty == 0x09) {
+                    for (uint64_t o = 0; o + 8 <= ssz; o += 8) {
+                        uint64_t fn = rd64((const uint8_t *)(uintptr_t)(sa + o));
+                        if (fn) {
+                            if (getenv("OCERZ_INITLOG"))
+                                fprintf(stderr, "INIT mh=%#llx fn=%#llx\n",
+                                        (unsigned long long)mh, (unsigned long long)fn);
+                            ocerz_vm_call(vm, fn, ia, 5, stack_top);
+                        }
+                        if (vm->exited)
+                            return;
+                    }
+                }
+                sec += 80;
+            }
+        }
+        lc += rd32(lc + 4);
+    }
+}
+
+#define INIT_VISITED_MAX 4096
+static uint64_t g_init_visited[INIT_VISITED_MAX];
+static int g_init_visited_n;
+
+static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
+                           const uint64_t *ia, uint64_t stack_top, uint64_t skip_mh)
+{
+    if (vm->exited || !mh)
+        return;
+    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    if (rd32(h) != MH_MAGIC_64)
+        return;
+    for (int i = 0; i < g_init_visited_n; i++)
+        if (g_init_visited[i] == mh)
+            return;
+    if (g_init_visited_n < INIT_VISITED_MAX)
+        g_init_visited[g_init_visited_n++] = mh;
+
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t j = 0; j < ncmds; j++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+            uint32_t noff = rd32(lc + 8);
+            if (noff < rd32(lc + 4))
+                run_init_phase(vm, cache, dep_find(cache, (const char *)(lc + noff)),
+                               ia, stack_top, skip_mh);
+        }
+        lc += rd32(lc + 4);
+    }
+    if (vm->exited)
+        return;
+    if (mh != skip_mh && (g_eager_n == 0 || eager_has(mh)))
+        run_image_inits(vm, mh, ia, stack_top);
+}
+
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
 {
     if (ocerz_mem_init_identity(DYN_ARENA_SIZE) != OCERZ_OK)
@@ -492,12 +720,23 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     if (ocerz_dyldapi_setup(&cache) != OCERZ_OK)
         OCERZ_LOG("dynamic: dyld API shim not installed\n");
 
+    uint64_t environ_addr = ocerz_cache_resolve(&cache, "_environ");
+    if (environ_addr) {
+        ocerz_st(environ_addr, 8, fr.envp_arr);
+        OCERZ_LOG("dynamic: environ=%#llx set to %#llx\n",
+                  (unsigned long long)environ_addr, (unsigned long long)fr.envp_arr);
+    }
+
+    extern uint64_t g_main_path;
+    if (fr.argv_arr)
+        g_main_path = ocerz_ld(fr.argv_arr, 8);
+
     int ran_init = 0;
     int want_init = !getenv("OCERZ_NOINIT") && (img.links_dylib || getenv("OCERZ_INIT"));
     if (want_init) {
+        uint64_t ia[5] = { fr.argc, fr.argv_arr, fr.envp_arr, fr.apple_arr, fr.progvars };
         uint64_t init = find_dylib_init(&cache, "libSystem.B.dylib");
         if (init) {
-            uint64_t ia[5] = { fr.argc, fr.argv_arr, fr.envp_arr, fr.apple_arr, fr.progvars };
             OCERZ_LOG("dynamic: running libSystem_initializer at %#llx\n", (unsigned long long)init);
             ocerz_vm_call(vm, init, ia, 5, fr.stack_top);
             if (vm->exited)
@@ -506,6 +745,17 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
             ran_init = 1;
         } else {
             OCERZ_LOG("dynamic: no libSystem initializer found\n");
+        }
+        if (ran_init && getenv("OCERZ_INITPHASE")) {
+            uint64_t libsys = dep_find(&cache, "/usr/lib/libSystem.B.dylib");
+            compute_eager_set(&cache, img.load_base);
+            OCERZ_LOG("dynamic: eager init set = %d images (of closure)\n", g_eager_n);
+            g_init_visited_n = 0;
+            OCERZ_LOG("dynamic: running dependency-ordered initializer phase\n");
+            run_init_phase(vm, &cache, img.load_base, ia, fr.stack_top, libsys);
+            if (vm->exited)
+                return vm->exit_code;
+            OCERZ_LOG("dynamic: initializer phase complete\n");
         }
     }
 
