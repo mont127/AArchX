@@ -34,6 +34,11 @@
  *
  * The sized load/store helpers use memcpy so unaligned guest accesses are
  * always safe regardless of host alignment checking.
+ *
+ * ocerz_watch_addr is a software store-watchpoint (set from OCERZ_WATCH in
+ * vm.c): when nonzero, any ocerz_st/ocerz_st128 whose range covers it calls
+ * ocerz_watch_hit, which logs value/rip/icount. The hot-path cost is one
+ * always-false compare against a zero global.
  */
 #ifndef OCERZ_MEM_H
 #define OCERZ_MEM_H
@@ -77,8 +82,13 @@ static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
     return v;
 }
 
+extern uint64_t ocerz_watch_addr;
+void ocerz_watch_hit(uint64_t gaddr, int size, uint64_t lo, uint64_t hi);
+
 static inline void ocerz_st(uint64_t gaddr, int size, uint64_t v)
 {
+    if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
+        ocerz_watch_hit(gaddr, size, v, 0);
     memcpy(ocerz_g2h(gaddr), &v, (size_t)size);
 }
 
@@ -91,6 +101,8 @@ static inline Ocerz128 ocerz_ld128(uint64_t gaddr)
 
 static inline void ocerz_st128(uint64_t gaddr, Ocerz128 v)
 {
+    if (ocerz_watch_addr && ocerz_watch_addr - gaddr < 16)
+        ocerz_watch_hit(gaddr, 16, v.lo, v.hi);
     memcpy(ocerz_g2h(gaddr), &v, 16);
 }
 

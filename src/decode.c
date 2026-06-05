@@ -2431,6 +2431,11 @@ static int decode_0f38(DecState *s)
     case 0x3f: op = OCERZ_OP_PMAXUD; break;
     case 0x40: op = OCERZ_OP_PMULLD; break;
     case 0x2b: op = OCERZ_OP_PACKUSDW; break;
+    case 0xdb: op = OCERZ_OP_AESIMC; break;
+    case 0xdc: op = OCERZ_OP_AESENC; break;
+    case 0xdd: op = OCERZ_OP_AESENCLAST; break;
+    case 0xde: op = OCERZ_OP_AESDEC; break;
+    case 0xdf: op = OCERZ_OP_AESDECLAST; break;
     default: return OCERZ_EUNDEF;
     }
     return decode_sse_rr(s, op, 16, 1);
@@ -2540,6 +2545,10 @@ static int decode_0f3a(DecState *s)
     }
     case 0x21:
         return decode_sse_rri(s, OCERZ_OP_INSERTPS, 4, 1);
+    case 0x44:
+        return decode_pint_imm(s, OCERZ_OP_PCLMULQDQ);
+    case 0xdf:
+        return decode_pint_imm(s, OCERZ_OP_AESKEYGENASSIST);
     case 0x22: {
         ModRM m;
         int gsize = s->rex_w ? 8 : 4;
@@ -3248,6 +3257,13 @@ static void init_op_names(void)
     op_names[OCERZ_OP_BLENDVPS] = "blendvps";
     op_names[OCERZ_OP_BLENDVPD] = "blendvpd";
     op_names[OCERZ_OP_PBLENDVB] = "pblendvb";
+    op_names[OCERZ_OP_AESENC] = "aesenc";
+    op_names[OCERZ_OP_AESENCLAST] = "aesenclast";
+    op_names[OCERZ_OP_AESDEC] = "aesdec";
+    op_names[OCERZ_OP_AESDECLAST] = "aesdeclast";
+    op_names[OCERZ_OP_AESIMC] = "aesimc";
+    op_names[OCERZ_OP_AESKEYGENASSIST] = "aeskeygenassist";
+    op_names[OCERZ_OP_PCLMULQDQ] = "pclmulqdq";
 }
 
 const char *ocerz_op_name(unsigned op)
