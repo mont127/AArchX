@@ -40,14 +40,30 @@
  *    guest MAP_FIXED never reaches the host except through ocerz_map_fixed.
  *  - shared_region_check_np: returns ENOSYS (78) so dyld runs cache-less; a
  *    future phase maps the x86_64 shared cache and answers for real.
- *  - bsdthread_register: returns 0; the real kernel returns pthread feature
- *    flags. Harmless until the threads phase, which must revisit it.
- *  - sigaction/sigprocmask/sigaltstack: handler addresses are recorded in
- *    static storage keyed by signal (for future signal delivery), success is
- *    faked, and any old-state pointer is written back zeroed. No host signal
- *    state is touched, because a host signal would arrive on an arm64 stack
- *    with arm64 register state the guest cannot interpret.
- *  - thread/fork/exec/spawn syscalls: STEP_FATAL, not yet supported.
+ *  - bsdthread_register: returns the pthread feature-flag word the kernel
+ *    would; sigaction/sigprocmask/sigaltstack record the handler addresses in
+ *    static storage keyed by signal and fake success (no host signal state is
+ *    touched — an arm64 signal frame is meaningless to the guest).
+ *  - GUEST THREADS ARE REAL HOST THREADS. bsdthread_create(360) carves a guest
+ *    thread onto a fresh host pthread that owns its own heap OcerzCPU and runs
+ *    its own ocerz_vm_run_cpu loop over the SHARED guest arena. It enters the
+ *    cache's _thread_start with the kernel's register convention (rdi=pthread
+ *    self, rsi=a fresh mach port, rdx=func, rcx=arg, r8=stack, r9=flags|bit28)
+ *    — bit 28 tells libpthread "the kernel set the TSD base", which Ocerz did
+ *    by pointing the new CPU's gs_base at pthread+0xe0. bsdthread_terminate(361)
+ *    flips the CPU's `terminated` flag (ending its loop) and signals the join
+ *    semaphore. Thread join/condvars/mutexes synchronise through the real host
+ *    kernel: __ulock_wait/wait2/wake (515/516/544) and the Mach semaphore traps
+ *    are host-forwarded, so two real host threads block and wake each other
+ *    natively over the shared lock words. __pthread_kill(328) delivers a signal
+ *    to the calling thread by running its recorded handler via a nested
+ *    ocerz_vm_call (saving and restoring the interrupted CPU). The JIT block
+ *    cache and the bump allocator take a mutex (jit.c/mem.c); the current CPU
+ *    is a per-thread TLS pointer so the crash handler reports the faulting
+ *    thread. The GCD workqueue (workq_kernreturn REQTHREADS spawning a
+ *    start_wqthread worker) is implemented but gated behind OCERZ_WORKQ until
+ *    its wqthread QoS/priority entry ABI is finished; default builds stub it.
+ *    fork/exec/posix_spawn remain STEP_FATAL.
  *  - mach_vm_*: arena allocator, ANYWHERE semantics, KERN_SUCCESS/3.
  * thread_fast_set_cthread_self returns 0x60 (the historical %gs selector);
  * the exact value the guest expects is uncertain but unused, documented here.
@@ -65,6 +81,9 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <mach/mach.h>
 
 #define OCERZ_BSD_MAX 600
 
@@ -279,6 +298,154 @@ static int sys_bsdthread_register(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
     (void)a;
+    ret_ok(cpu, 0x4000005f);
+    return OCERZ_STEP_OK;
+}
+
+static int sys_workq_stub(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    (void)a;
+    ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
+#define OCERZ_THREAD_START 0x7ff802e6f820ull
+
+struct ocerz_worker {
+    OcerzVM *vm;
+    OcerzCPU cpu;
+};
+
+static void *ocerz_worker_entry(void *p)
+{
+    struct ocerz_worker *w = (struct ocerz_worker *)p;
+    ocerz_vm_run_cpu(w->vm, &w->cpu);
+    free(w);
+    return NULL;
+}
+
+static int ocerz_spawn_worker(OcerzVM *vm, const OcerzCPU *tmpl)
+{
+    struct ocerz_worker *w = (struct ocerz_worker *)calloc(1, sizeof *w);
+    if (!w)
+        return -1;
+    w->vm = vm;
+    w->cpu = *tmpl;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16ull * 1024 * 1024);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    int rc = pthread_create(&th, &attr, ocerz_worker_entry, w);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        free(w);
+        return -1;
+    }
+    return 0;
+}
+
+#define OCERZ_START_WQTHREAD 0x7ff802e6f80cull
+#define OCERZ_PTHREAD_COOKIE 0x7ff8436bd750ull
+
+static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    if (!getenv("OCERZ_WORKQ")) {
+        ret_ok(cpu, 0);
+        return OCERZ_STEP_OK;
+    }
+    uint64_t op = a[0];
+    if (op == 0x4) {
+        cpu->terminated = 1;
+        ret_ok(cpu, 0);
+        return OCERZ_STEP_OK;
+    }
+    if (op == 0x20) {
+        int reqcount = (int)a[2];
+        if (reqcount < 1)
+            reqcount = 1;
+        uint64_t prio = a[3];
+        uint64_t cookie = ocerz_ld(OCERZ_PTHREAD_COOKIE, 8);
+        for (int i = 0; i < reqcount && i < 8; i++) {
+            uint64_t region = ocerz_map_anywhere(0x200000, PROT_READ | PROT_WRITE);
+            if (region == 0)
+                break;
+            uint64_t pth = region + 0x1f0000;
+            mach_port_t port = MACH_PORT_NULL;
+            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+            ocerz_st(pth, 8, pth ^ cookie);
+            ocerz_st(pth + 0xe0, 8, pth);
+            ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)port);
+            OcerzCPU t = *cpu;
+            t.terminated = 0;
+            t.rip = OCERZ_START_WQTHREAD;
+            t.gpr[OCERZ_RSP] = pth;
+            t.gpr[OCERZ_RDI] = pth;
+            t.gpr[OCERZ_RSI] = port;
+            t.gpr[OCERZ_RDX] = pth;
+            t.gpr[OCERZ_RCX] = 0;
+            t.gpr[OCERZ_R8] = 0x210000 | 0x8000 | (prio & 0xffff);
+            t.gpr[OCERZ_R9] = 0;
+            t.gs_base = pth + 0xe0;
+            ocerz_spawn_worker(vm, &t);
+        }
+        ret_ok(cpu, 0);
+        return OCERZ_STEP_OK;
+    }
+    ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
+static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    uint64_t func = a[0], funarg = a[1], stack = a[2], pth = a[3], flags = a[4];
+    (void)func;
+    (void)funarg;
+    struct ocerz_worker *w = (struct ocerz_worker *)calloc(1, sizeof *w);
+    if (!w) {
+        ret_err(cpu, OCERZ_ENOMEM_V);
+        return OCERZ_STEP_OK;
+    }
+    w->vm = vm;
+    w->cpu = *cpu;
+    w->cpu.terminated = 0;
+    w->cpu.rip = OCERZ_THREAD_START;
+    w->cpu.gpr[OCERZ_RSP] = stack;
+    mach_port_t port = MACH_PORT_NULL;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+    w->cpu.gpr[OCERZ_RDI] = pth;
+    w->cpu.gpr[OCERZ_RSI] = port;
+    w->cpu.gpr[OCERZ_RDX] = func;
+    w->cpu.gpr[OCERZ_RCX] = funarg;
+    w->cpu.gpr[OCERZ_R8] = stack;
+    w->cpu.gpr[OCERZ_R9] = flags | 0x10000000ull;
+    w->cpu.gs_base = pth + 0xe0;
+    ocerz_st(pth + 0xe0, 8, pth);
+    ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)port);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16ull * 1024 * 1024);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    int rc = pthread_create(&th, &attr, ocerz_worker_entry, w);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        free(w);
+        ret_err(cpu, OCERZ_ENOMEM_V);
+        return OCERZ_STEP_OK;
+    }
+    ret_ok(cpu, pth);
+    return OCERZ_STEP_OK;
+}
+
+static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    if (a[3] != 0)
+        semaphore_signal((semaphore_t)a[3]);
+    cpu->terminated = 1;
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
 }
@@ -294,6 +461,24 @@ static int sys_sigaction(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     if (act != 0 && sig >= 0 && sig < OCERZ_NSIG) {
         uint64_t handler = ocerz_ld(act, 8);
         guest_sig_handlers[sig] = handler;
+    }
+    ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
+static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    uint64_t signo = a[1];
+    if (signo > 0 && signo < OCERZ_NSIG) {
+        uint64_t h = guest_sig_handlers[signo];
+        if (h > 1) {
+            OcerzCPU saved = *cpu;
+            uint64_t args[1] = { signo };
+            ocerz_vm_call(vm, h, args, 1, saved.gpr[OCERZ_RSP]);
+            if (vm->exited)
+                return OCERZ_STEP_OK;
+            *cpu = saved;
+        }
     }
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
@@ -480,7 +665,14 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [216] = { "open_dprotected_np", 5, 0x01, 0, NULL },
     [220] = { "getattrlist", 5, 0x07, 0, NULL },
     [228] = { "fgetattrlist", 5, 0x06, 0, NULL },
-    [240] = { "getxattr",    6, 0x03, 0, NULL },
+    [234] = { "getxattr",    6, 0x07, 0, NULL },
+    [235] = { "fgetxattr",   6, 0x06, 0, NULL },
+    [236] = { "setxattr",    6, 0x07, 0, NULL },
+    [237] = { "fsetxattr",   6, 0x06, 0, NULL },
+    [238] = { "removexattr", 3, 0x03, 0, NULL },
+    [239] = { "fremovexattr",3, 0x02, 0, NULL },
+    [240] = { "listxattr",   4, 0x03, 0, NULL },
+    [241] = { "flistxattr",  4, 0x02, 0, NULL },
     [244] = { "posix_spawn", 5, 0x00, 0, sys_unsupported },
     [266] = { "shm_open",    3, 0x01, 0, NULL },
     [267] = { "shm_unlink",  1, 0x01, 0, NULL },
@@ -504,19 +696,41 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [344] = { "getdirentries64", 4, 0x0a, 0, NULL },
     [345] = { "statfs64",    2, 0x03, 0, NULL },
     [346] = { "fstatfs64",   2, 0x02, 0, NULL },
-    [360] = { "bsdthread_create", 5, 0x00, 0, sys_unsupported },
+    [347] = { "getfsstat64", 3, 0x01, 0, NULL },
+    [360] = { "bsdthread_create", 5, 0x00, 0, sys_bsdthread_create },
+    [361] = { "bsdthread_terminate", 4, 0x00, 0, sys_bsdthread_terminate },
     [362] = { "kqueue",      0, 0x00, 0, NULL },
     [363] = { "kevent",      6, 0x2a, 0, NULL },
     [366] = { "bsdthread_register", 7, 0x00, 0, sys_bsdthread_register },
-    [367] = { "workq_open",  0, 0x00, 0, sys_unsupported },
-    [368] = { "workq_kernreturn", 4, 0x00, 0, sys_unsupported },
+    [367] = { "workq_open",  0, 0x00, 0, sys_workq_stub },
+    [368] = { "workq_kernreturn", 4, 0x00, 0, sys_workq_kernreturn },
     [372] = { "thread_selfid", 0, 0x00, 0, NULL },
+    [328] = { "__pthread_kill", 2, 0x00, 0, sys_pthread_kill },
+    [331] = { "__disable_threadsignal", 1, 0x00, 0, sys_workq_stub },
+    [334] = { "__semwait_signal", 6, 0x00, 0, sys_workq_stub },
+    [374] = { "kevent_qos",  8, 0x00, 0, sys_workq_stub },
+    [375] = { "kevent_id",   6, 0x00, 0, sys_workq_stub },
+    [406] = { "fcntl_nocancel", 3, 0x00, 0, sys_fcntl },
+    [409] = { "connect_nocancel", 3, 0x02, 0, NULL },
+    [478] = { "bsdthread_ctl", 4, 0x00, 0, sys_workq_stub },
+    [515] = { "ulock_wait",  4, 0x02, 0, NULL },
+    [516] = { "ulock_wake",  3, 0x02, 0, NULL },
+    [544] = { "ulock_wait2", 5, 0x02, 0, NULL },
     [396] = { "read_nocancel",  3, 0x02, 0, NULL },
     [397] = { "write_nocancel", 3, 0x02, 0, NULL },
     [398] = { "open_nocancel",  3, 0x01, 0, NULL },
     [399] = { "close_nocancel", 1, 0x00, 0, NULL },
+    [401] = { "recvmsg_nocancel", 3, 0x02, 0, NULL },
+    [402] = { "sendmsg_nocancel", 3, 0x02, 0, NULL },
+    [403] = { "recvfrom_nocancel", 6, 0x32, 0, NULL },
+    [404] = { "accept_nocancel", 3, 0x02, 0, NULL },
+    [407] = { "select_nocancel", 5, 0x1e, 0, NULL },
+    [413] = { "sendto_nocancel", 6, 0x12, 0, NULL },
     [414] = { "pread_nocancel", 4, 0x02, 0, NULL },
     [415] = { "pwrite_nocancel",4, 0x02, 0, NULL },
+    [417] = { "poll_nocancel", 3, 0x02, 0, NULL },
+    [420] = { "sem_wait_nocancel", 1, 0x00, 0, sys_workq_stub },
+    [423] = { "__semwait_signal_nocancel", 6, 0x00, 0, sys_workq_stub },
     [463] = { "openat",      4, 0x02, 0, NULL },
     [470] = { "fstatat64",   4, 0x06, 0, NULL },
     [472] = { "unlinkat",    3, 0x02, 0, NULL },
@@ -632,9 +846,12 @@ static const char *mach_trap_name(int num)
     case 43: return "mach_generate_activity_id";
     case 47: return "mach_msg2_trap";
     case 50: return "thread_get_special_reply_port";
+    case 77: return "_kernelrpc_mach_port_request_notification_trap";
     case 59: return "swtch_pri";
     case 60: return "swtch";
     case 89: return "mach_timebase_info_trap";
+    case 90: return "mach_wait_until_trap";
+    case 91: return "mk_timer_create_trap";
     default: return NULL;
     }
 }
@@ -749,9 +966,21 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             ocerz_st(reply_buf + 0x20, 4, OCERZ_MACH_KERN_SUCCESS);
         break;
     }
+    case 77: {
+        a[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
+        if (a[6] != 0)
+            a[6] = (uint64_t)(uintptr_t)ocerz_g2h(a[6]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
     case 89: {
         if (a[0] != 0)
             a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
+    case 90:   /* mach_wait_until_trap(deadline) */
+    case 91: { /* mk_timer_create_trap() */
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }

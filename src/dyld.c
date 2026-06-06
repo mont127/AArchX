@@ -229,6 +229,84 @@ static int map_segments(DynImage *img)
     return OCERZ_OK;
 }
 
+static uint64_t self_uleb(const uint8_t **pp, const uint8_t *end)
+{
+    uint64_t r = 0;
+    int sh = 0;
+    while (*pp < end) {
+        uint8_t b = *(*pp)++;
+        r |= (uint64_t)(b & 0x7f) << sh;
+        if (!(b & 0x80))
+            break;
+        sh += 7;
+    }
+    return r;
+}
+
+static uint64_t image_export_trie(DynImage *img, uint32_t *size_out)
+{
+    const uint8_t *mh = img->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == 0x80000033) {
+            *size_out = rd32(lc + 12);
+            return rd32(lc + 8);
+        }
+        if (cmd == 0x22 || cmd == 0x80000022) {
+            *size_out = rd32(lc + 0x2c);
+            return rd32(lc + 0x28);
+        }
+        lc += rd32(lc + 4);
+    }
+    *size_out = 0;
+    return 0;
+}
+
+static uint64_t ocerz_image_self_resolve(DynImage *img, const char *sym)
+{
+    uint32_t tsize = 0;
+    uint64_t toff = image_export_trie(img, &tsize);
+    if (!toff || !tsize)
+        return 0;
+    const uint8_t *start = img->slice + toff;
+    const uint8_t *end = start + tsize;
+    const uint8_t *p = start;
+    const char *s = sym;
+    while (p < end) {
+        uint64_t term = self_uleb(&p, end);
+        if (*s == '\0') {
+            if (term == 0)
+                return 0;
+            const uint8_t *tp = p;
+            uint64_t flags = self_uleb(&tp, end);
+            if (flags & 0x08)
+                return 0;
+            return img->load_base + self_uleb(&tp, end);
+        }
+        p += term;
+        if (p >= end)
+            return 0;
+        uint8_t children = *p++;
+        const uint8_t *next = NULL;
+        for (uint8_t i = 0; i < children; i++) {
+            const char *edge = (const char *)p;
+            size_t elen = strlen(edge);
+            p += elen + 1;
+            uint64_t child_off = self_uleb(&p, end);
+            if (next == NULL && strncmp(s, edge, elen) == 0) {
+                s += elen;
+                next = start + child_off;
+            }
+        }
+        if (next == NULL)
+            return 0;
+        p = next;
+    }
+    return 0;
+}
+
 static int apply_fixups(DynImage *img, OcerzCache *cache)
 {
     if (img->cf_off == 0)
@@ -271,9 +349,13 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
                     if (ordinal < imports_cnt) {
                         uint32_t imp = rd32(cf + imports_off + ordinal * 4);
                         uint32_t noff = imp >> 9;
+                        int libord = (int8_t)(imp & 0xff);
+                        int weakimp = (imp >> 8) & 1;
                         const char *name = (const char *)(cf + symbols_off + noff);
                         value = ocerz_cache_resolve(cache, name);
-                        if (value == 0)
+                        if (value == 0 && libord == -3)
+                            value = ocerz_image_self_resolve(img, name);
+                        if (value == 0 && !weakimp)
                             OCERZ_FATAL("unresolved import: %s\n", name);
                     }
                     ocerz_st(addr, 8, value + addend);
@@ -645,6 +727,39 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
         run_image_inits(vm, mh, ia, stack_top);
 }
 
+static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t stack_top,
+                           uint64_t skip_mh)
+{
+    if (vm->exited || !mh)
+        return;
+    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    if (rd32(h) != MH_MAGIC_64)
+        return;
+    for (int i = 0; i < g_init_visited_n; i++)
+        if (g_init_visited[i] == mh)
+            return;
+    if (g_init_visited_n < INIT_VISITED_MAX)
+        g_init_visited[g_init_visited_n++] = mh;
+
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t j = 0; j < ncmds; j++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+            uint32_t noff = rd32(lc + 8);
+            if (noff < rd32(lc + 4))
+                run_load_phase(vm, cache, dep_find(cache, (const char *)(lc + noff)),
+                               stack_top, skip_mh);
+        }
+        lc += rd32(lc + 4);
+    }
+    if (vm->exited)
+        return;
+    if (mh != skip_mh && (g_eager_n == 0 || eager_has(mh)))
+        ocerz_dyldapi_run_image_loads(vm, mh, stack_top);
+}
+
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
 {
     if (ocerz_mem_init_identity(DYN_ARENA_SIZE) != OCERZ_OK)
@@ -750,6 +865,10 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
             uint64_t libsys = dep_find(&cache, "/usr/lib/libSystem.B.dylib");
             compute_eager_set(&cache, img.load_base);
             OCERZ_LOG("dynamic: eager init set = %d images (of closure)\n", g_eager_n);
+            g_init_visited_n = 0;
+            run_load_phase(vm, &cache, img.load_base, fr.stack_top, libsys);
+            if (vm->exited)
+                return vm->exit_code;
             g_init_visited_n = 0;
             OCERZ_LOG("dynamic: running dependency-ordered initializer phase\n");
             run_init_phase(vm, &cache, img.load_base, ia, fr.stack_top, libsys);

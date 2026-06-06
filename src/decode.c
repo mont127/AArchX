@@ -1737,6 +1737,18 @@ static int decode_0f(DecState *s, uint8_t op2)
         return decode_arith_sse(s, OCERZ_OP_DIVPS, OCERZ_OP_DIVPD, OCERZ_OP_DIVSS, OCERZ_OP_DIVSD);
     case 0x5f:
         return decode_arith_sse(s, OCERZ_OP_MAXPS, OCERZ_OP_MAXPD, OCERZ_OP_MAXSS, OCERZ_OP_MAXSD);
+    case 0x7c:
+        if (mand == MAND_66)
+            return decode_sse_rr(s, OCERZ_OP_HADDPD, 16, 1);
+        if (mand == MAND_F2)
+            return decode_sse_rr(s, OCERZ_OP_HADDPS, 16, 1);
+        return OCERZ_EUNDEF;
+    case 0x7d:
+        if (mand == MAND_66)
+            return decode_sse_rr(s, OCERZ_OP_HSUBPD, 16, 1);
+        if (mand == MAND_F2)
+            return decode_sse_rr(s, OCERZ_OP_HSUBPS, 16, 1);
+        return OCERZ_EUNDEF;
     case 0x5a: {
         int op;
         int isize, osize;
@@ -3072,6 +3084,10 @@ static void init_op_names(void)
     op_names[OCERZ_OP_ADDPD] = "addpd";
     op_names[OCERZ_OP_ADDSS] = "addss";
     op_names[OCERZ_OP_ADDSD] = "addsd";
+    op_names[OCERZ_OP_HADDPS] = "haddps";
+    op_names[OCERZ_OP_HADDPD] = "haddpd";
+    op_names[OCERZ_OP_HSUBPS] = "hsubps";
+    op_names[OCERZ_OP_HSUBPD] = "hsubpd";
     op_names[OCERZ_OP_SUBPS] = "subps";
     op_names[OCERZ_OP_SUBPD] = "subpd";
     op_names[OCERZ_OP_SUBSS] = "subss";
