@@ -305,16 +305,19 @@ uint64_t ocerz_jit_blocks(const OcerzJit *jit)
     return jit ? jit->blocks_translated : 0;
 }
 
+static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
+
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
         return OCERZ_EUNSUP;
     OcerzJit *jit = vm->jit;
+    pthread_mutex_lock(&jit_lock);
     JitBlock *b = cache_lookup(jit, cpu->rip);
-    if (!b) {
+    if (!b)
         b = translate(jit, cpu->rip);
-        if (!b)
-            return OCERZ_EUNSUP;
-    }
+    pthread_mutex_unlock(&jit_lock);
+    if (!b)
+        return OCERZ_EUNSUP;
     return b->code(vm, cpu);
 }

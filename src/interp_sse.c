@@ -486,6 +486,26 @@ static int do_fp_arith(OcerzCPU *cpu, const X86Insn *insn)
     vec r = a;
     switch (insn->op) {
     case OP(OCERZ_OP_ADDPS): for (int i = 0; i < 4; i++) r.f[i] = fixnan_f(a.f[i], b.f[i], a.f[i] + b.f[i]); break;
+    case OP(OCERZ_OP_HADDPS):
+        r.f[0] = fixnan_f(a.f[0], a.f[1], a.f[0] + a.f[1]);
+        r.f[1] = fixnan_f(a.f[2], a.f[3], a.f[2] + a.f[3]);
+        r.f[2] = fixnan_f(b.f[0], b.f[1], b.f[0] + b.f[1]);
+        r.f[3] = fixnan_f(b.f[2], b.f[3], b.f[2] + b.f[3]);
+        break;
+    case OP(OCERZ_OP_HSUBPS):
+        r.f[0] = fixnan_f(a.f[0], a.f[1], a.f[0] - a.f[1]);
+        r.f[1] = fixnan_f(a.f[2], a.f[3], a.f[2] - a.f[3]);
+        r.f[2] = fixnan_f(b.f[0], b.f[1], b.f[0] - b.f[1]);
+        r.f[3] = fixnan_f(b.f[2], b.f[3], b.f[2] - b.f[3]);
+        break;
+    case OP(OCERZ_OP_HADDPD):
+        r.d[0] = fixnan_d(a.d[0], a.d[1], a.d[0] + a.d[1]);
+        r.d[1] = fixnan_d(b.d[0], b.d[1], b.d[0] + b.d[1]);
+        break;
+    case OP(OCERZ_OP_HSUBPD):
+        r.d[0] = fixnan_d(a.d[0], a.d[1], a.d[0] - a.d[1]);
+        r.d[1] = fixnan_d(b.d[0], b.d[1], b.d[0] - b.d[1]);
+        break;
     case OP(OCERZ_OP_SUBPS): for (int i = 0; i < 4; i++) r.f[i] = fixnan_f(a.f[i], b.f[i], a.f[i] - b.f[i]); break;
     case OP(OCERZ_OP_MULPS): for (int i = 0; i < 4; i++) r.f[i] = fixnan_f(a.f[i], b.f[i], a.f[i] * b.f[i]); break;
     case OP(OCERZ_OP_DIVPS): for (int i = 0; i < 4; i++) r.f[i] = fixnan_f(a.f[i], b.f[i], a.f[i] / b.f[i]); break;
@@ -1255,11 +1275,18 @@ static int do_pmovx(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
+    int srcw;
+    switch (insn->op) {
+    case OP(OCERZ_OP_PMOVZXBQ): case OP(OCERZ_OP_PMOVSXBQ): srcw = 2; break;
+    case OP(OCERZ_OP_PMOVZXBD): case OP(OCERZ_OP_PMOVSXBD):
+    case OP(OCERZ_OP_PMOVZXWQ): case OP(OCERZ_OP_PMOVSXWQ): srcw = 4; break;
+    default: srcw = 8; break;
+    }
     vec b;
     if (s->kind == OCERZ_OPK_XMM) {
         b = vec_of(cpu->xmm[s->reg]);
     } else {
-        b.q.lo = ocerz_ld(ocerz_ea(cpu, insn, s), 8);
+        b.q.lo = ocerz_ld(ocerz_ea(cpu, insn, s), srcw);
         b.q.hi = 0;
     }
     vec r;
@@ -1534,6 +1561,7 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
 
     case OP(OCERZ_OP_ADDPS): case OP(OCERZ_OP_ADDPD): case OP(OCERZ_OP_ADDSS): case OP(OCERZ_OP_ADDSD):
+    case OP(OCERZ_OP_HADDPS): case OP(OCERZ_OP_HADDPD): case OP(OCERZ_OP_HSUBPS): case OP(OCERZ_OP_HSUBPD):
     case OP(OCERZ_OP_SUBPS): case OP(OCERZ_OP_SUBPD): case OP(OCERZ_OP_SUBSS): case OP(OCERZ_OP_SUBSD):
     case OP(OCERZ_OP_MULPS): case OP(OCERZ_OP_MULPD): case OP(OCERZ_OP_MULSS): case OP(OCERZ_OP_MULSD):
     case OP(OCERZ_OP_DIVPS): case OP(OCERZ_OP_DIVPD): case OP(OCERZ_OP_DIVSS): case OP(OCERZ_OP_DIVSD):

@@ -40,5 +40,6 @@ struct OcerzCache;
 
 int ocerz_dyldapi_setup(struct OcerzCache *cache);
 int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu);
+void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t stack_top);
 
 #endif

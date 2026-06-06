@@ -34,8 +34,11 @@
 
 #include <sys/mman.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 #define OCERZ_HOST_PAGE 0x4000ull
+
+static pthread_mutex_t bump_lock = PTHREAD_MUTEX_INITIALIZER;
 
 uint64_t ocerz_guest_base;
 uint64_t ocerz_arena_lo;
@@ -140,10 +143,14 @@ int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot)
 uint64_t ocerz_map_anywhere(uint64_t len, int prot)
 {
     uint64_t glen = round_up(len);
+    pthread_mutex_lock(&bump_lock);
     uint64_t gaddr = bump_next;
-    if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi)
+    if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
+        pthread_mutex_unlock(&bump_lock);
         return 0;
+    }
     bump_next = gaddr + glen + OCERZ_HOST_PAGE;
+    pthread_mutex_unlock(&bump_lock);
     if (ocerz_map_fixed(gaddr, glen, prot) != OCERZ_OK)
         return 0;
     return gaddr;
@@ -154,10 +161,14 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
     if (align < OCERZ_HOST_PAGE)
         align = OCERZ_HOST_PAGE;
     uint64_t glen = round_up(len);
+    pthread_mutex_lock(&bump_lock);
     uint64_t gaddr = (bump_next + (align - 1)) & ~(align - 1);
-    if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi)
+    if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
+        pthread_mutex_unlock(&bump_lock);
         return 0;
+    }
     bump_next = gaddr + glen + OCERZ_HOST_PAGE;
+    pthread_mutex_unlock(&bump_lock);
     if (ocerz_map_fixed(gaddr, glen, prot) != OCERZ_OK)
         return 0;
     return gaddr;

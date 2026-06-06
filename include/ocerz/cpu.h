@@ -91,6 +91,7 @@ typedef struct OcerzCPU {
     uint8_t ftop;
     double fpr[8];
     struct OcerzVM *vm;
+    int terminated;
 } OcerzCPU;
 
 void ocerz_cpu_reset(OcerzCPU *cpu);

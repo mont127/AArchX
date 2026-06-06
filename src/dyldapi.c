@@ -506,6 +506,112 @@ static int api_for_each_objc_class(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+static int in_cache(uint64_t a)
+{
+    return a >= g_cache_start && a < g_cache_start + g_cache_size;
+}
+
+static uint64_t load_in_plain_list(uint64_t ml)
+{
+    if (!in_cache(ml))
+        return 0;
+    uint32_t ef = (uint32_t)ocerz_ld(ml, 4);
+    uint32_t count = (uint32_t)ocerz_ld(ml + 4, 4);
+    uint32_t entsize = ef & 0xfffcu;
+    int rel = (ef & 0x80000000u) != 0;
+    if (count == 0 || count > 65536 || entsize == 0 || entsize > 64)
+        return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t ent = ml + 8 + (uint64_t)i * entsize;
+        uint64_t nameptr, imp;
+        if (rel) {
+            int32_t noff = (int32_t)(uint32_t)ocerz_ld(ent, 4);
+            int32_t ioff = (int32_t)(uint32_t)ocerz_ld(ent + 8, 4);
+            nameptr = g_sel_pool + (int64_t)noff;
+            imp = ent + 8 + (int64_t)ioff;
+        } else {
+            nameptr = ocerz_ld(ent, 8);
+            imp = ocerz_ld(ent + 16, 8);
+        }
+        if (nameptr && strcmp((const char *)ocerz_g2h(nameptr), "load") == 0)
+            return imp;
+    }
+    return 0;
+}
+
+static uint64_t load_in_method_list(uint64_t raw)
+{
+    if (!raw)
+        return 0;
+    uint64_t ptr = raw & ~0x7ull;
+    if (!in_cache(ptr))
+        return 0;
+    if (raw & 1) {
+        uint32_t count = (uint32_t)ocerz_ld(ptr + 4, 4);
+        if (count > 4096)
+            return 0;
+        for (uint32_t i = 0; i < count; i++) {
+            uint64_t ent = ptr + 8 + (uint64_t)i * 8;
+            int64_t off = (int64_t)ocerz_ld(ent, 8) >> 16;
+            uint64_t imp = load_in_plain_list((uint64_t)((int64_t)ent + off));
+            if (imp)
+                return imp;
+        }
+        return 0;
+    }
+    return load_in_plain_list(ptr);
+}
+
+static uint64_t metaclass_load_imp(uint64_t cls)
+{
+    if (!in_cache(cls))
+        return 0;
+    uint64_t meta = ocerz_ld(cls, 8) & 0x00007ffffffffff8ull;
+    if (!in_cache(meta))
+        return 0;
+    uint64_t data = ocerz_ld(meta + 0x20, 8) & ~0x7ull;
+    if (!in_cache(data))
+        return 0;
+    return load_in_method_list(ocerz_ld(data + 0x20, 8));
+}
+
+void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t stack_top)
+{
+    if (!g_sel_pool)
+        return;
+    const char *imgpath = g_cache ? cache_path_for_mh(g_cache, mh) : NULL;
+    OCERZ_LOG("loadphase: image %s (mh=%#llx)\n", imgpath ? imgpath : "?", (unsigned long long)mh);
+    uint64_t size = 0;
+    uint64_t nl = find_section_sz(mh, "__objc_nlclslist", &size);
+    for (uint32_t i = 0; nl && i < (uint32_t)(size / 8); i++) {
+        uint64_t cls = ocerz_ld(nl + (uint64_t)i * 8, 8) & ~0x1ull;
+        uint64_t imp = metaclass_load_imp(cls);
+        if (imp) {
+            uint64_t a[2] = { cls, 0 };
+            ocerz_vm_call(vm, imp, a, 2, stack_top);
+            if (vm->exited)
+                return;
+        }
+    }
+    uint64_t csize = 0;
+    uint64_t ncl = find_section_sz(mh, "__objc_nlcatlist", &csize);
+    for (uint32_t i = 0; ncl && i < (uint32_t)(csize / 8); i++) {
+        uint64_t cat = ocerz_ld(ncl + (uint64_t)i * 8, 8) & ~0x1ull;
+        if (!in_cache(cat))
+            continue;
+        uint64_t imp = load_in_method_list(ocerz_ld(cat + 0x18, 8));
+        if (imp) {
+            uint64_t cls = ocerz_ld(cat + 0x08, 8);
+            uint64_t a[2] = { cls, 0 };
+            OCERZ_LOG("loadphase:   +load category imp=%#llx cls=%#llx\n",
+                      (unsigned long long)imp, (unsigned long long)cls);
+            ocerz_vm_call(vm, imp, a, 2, stack_top);
+            if (vm->exited)
+                return;
+        }
+    }
+}
+
 int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t off = cpu->rip - OCERZ_DYLDAPI_LO;
@@ -538,6 +644,28 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         else if (idx < (uint32_t)g_closure_n)
             name = (uint64_t)(uintptr_t)cache_path_for_mh(g_cache, g_closure_mh[idx]);
         api_return(cpu, name);
+        return OCERZ_STEP_OK;
+    }
+    case 0x50: {
+        uint64_t buf = cpu->gpr[OCERZ_RSI];
+        uint64_t szp = cpu->gpr[OCERZ_RDX];
+        if (!g_main_path) {
+            api_return(cpu, (uint64_t)-1);
+            return OCERZ_STEP_OK;
+        }
+        const char *host = (const char *)ocerz_g2h(g_main_path);
+        uint32_t need = (uint32_t)strlen(host) + 1;
+        uint32_t have = szp ? (uint32_t)ocerz_ld(szp, 4) : 0;
+        if (buf && have >= need) {
+            memcpy(ocerz_g2h(buf), host, need);
+            if (szp)
+                ocerz_st(szp, 4, need);
+            api_return(cpu, 0);
+        } else {
+            if (szp)
+                ocerz_st(szp, 4, need);
+            api_return(cpu, (uint64_t)-1);
+        }
         return OCERZ_STEP_OK;
     }
     case 0x160:
@@ -588,7 +716,21 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x358:
         return api_objc_register_callbacks(vm, cpu);
     case 0x378: {
+        /* _dyld_lookup_section_info(mach_header*, info_out, kind): returns the
+         * named __TEXT/__DATA section's {addr in rax, size in rdx}. Kinds 0..5
+         * are the Swift metadata sections, 6..17 the objc sections, in the
+         * order of dyld's _dyld_section_location_kind enum. The Swift runtime's
+         * conformance scanner walks every loaded image (including shared-cache
+         * dylibs) asking for kind 1 (__swift5_proto, the protocol-conformance
+         * records); without it `String: Hashable` is never found and generic
+         * metadata such as _DictionaryStorage<String,Data> instantiates to NULL.
+         * The objc kinds keep their pre-existing behaviour of reporting nothing
+         * for shared-cache images so objc takes its preoptimized path instead of
+         * re-walking the Mach-O. */
         static const char *const kindsect[] = {
+            [0] = "__swift5_protos", [1] = "__swift5_proto",
+            [2] = "__swift5_types",  [3] = "__swift5_replace",
+            [4] = "__swift5_replac2", [5] = "__swift5_acfuncs",
             [6] = "__objc_imageinfo", [7] = "__objc_selrefs",
             [8] = "__objc_msgrefs",   [9] = "__objc_classrefs",
             [10] = "__objc_superrefs", [11] = "__objc_protorefs",
@@ -599,13 +741,10 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         uint64_t mh = cpu->gpr[OCERZ_RSI];
         uint64_t kind = cpu->gpr[OCERZ_RCX];
         uint64_t addr = 0, size = 0;
-        if (mh && mh < g_cache_start && kind < (sizeof kindsect / sizeof kindsect[0]) &&
-            kindsect[kind])
+        int is_swift_kind = kind <= 5;
+        if (mh && (is_swift_kind || mh < g_cache_start) &&
+            kind < (sizeof kindsect / sizeof kindsect[0]) && kindsect[kind])
             addr = find_section_sz(mh, kindsect[kind], &size);
-        if (mh && mh < g_cache_start)
-            OCERZ_LOG("dyldapi: slot378 mh=%#llx kind=%llu -> addr=%#llx size=%#llx\n",
-                      (unsigned long long)mh, (unsigned long long)kind,
-                      (unsigned long long)addr, (unsigned long long)size);
         cpu->gpr[OCERZ_RDX] = size;
         api_return(cpu, addr);
         return OCERZ_STEP_OK;
@@ -636,9 +775,11 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         api_return(cpu, g_headeropt_ro);
         return OCERZ_STEP_OK;
     default:
-        OCERZ_LOG("dyldapi: unimplemented vtable slot +%#llx (this=%#llx a0=%#llx a1=%#llx)\n",
+        OCERZ_LOG("dyldapi: unimplemented vtable slot +%#llx (this=%#llx a0=%#llx a1=%#llx a2=%#llx caller=%#llx)\n",
                   (unsigned long long)off, (unsigned long long)cpu->gpr[OCERZ_RDI],
-                  (unsigned long long)cpu->gpr[OCERZ_RSI], (unsigned long long)cpu->gpr[OCERZ_RDX]);
+                  (unsigned long long)cpu->gpr[OCERZ_RSI], (unsigned long long)cpu->gpr[OCERZ_RDX],
+                  (unsigned long long)cpu->gpr[OCERZ_RCX],
+                  (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
         api_return(cpu, 0);
         return OCERZ_STEP_OK;
     }
