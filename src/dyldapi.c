@@ -72,6 +72,20 @@
  * block is invoked once per hit via nested ocerz_vm_call, isLoaded read from
  * the headerInfoRW entry's bit0 (objc itself marks images loaded there during
  * map_images), and a tiny guest scratch holds the stop flag.
+ *
+ * C++ exception unwinding (slot 0x170 = _dyld_find_unwind_sections(addr,
+ * dyld_unwind_sections* out)). libunwind/libc++abi call this once per frame to
+ * locate that frame's image and its compact-unwind (__TEXT,__unwind_info) and
+ * DWARF CFI (__TEXT,__eh_frame) sections. The libdyld trampoline swaps the args
+ * before dispatch, so the handler sees rsi=addr(pc), rdx=out-struct pointer.
+ * Returning 0 with the struct empty makes libunwind believe no frame has unwind
+ * info, so a throw never reaches its catch: it spins its no-info fallback (the
+ * objc terminate handler rethrows back into __cxa_throw forever), exhausting the
+ * stack until __chkstk_darwin reads off the bottom into the guard page (a SIGBUS
+ * masquerading as a libunwind/pthread fault). image_for_pc() resolves the pc to
+ * its image (closure first, then any shared-cache image so dylibs on the unwind
+ * path resolve too) and find_section_sz() reads the real (slid) section ranges
+ * into the 5-field out-struct {mh, eh_frame ptr/len, unwind_info ptr/len}.
  */
 #include "ocerz/dyldapi.h"
 #include "ocerz/vm.h"
@@ -170,6 +184,40 @@ static uint64_t cache_find_path(struct OcerzCache *cache, const char *path)
         if (mh && p && strcmp(p, path) == 0)
             return mh;
     }
+    return 0;
+}
+
+static int image_covers(uint64_t mh, uint64_t addr)
+{
+    const struct mach_header_64 *h = (const void *)(uintptr_t)mh;
+    if (!mh || h->magic != MH_MAGIC_64)
+        return 0;
+    uint64_t slide = image_slide(mh);
+    const uint8_t *lc = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *s = (const void *)lc;
+            uint64_t lo = s->vmaddr + slide;
+            if (s->vmsize && addr >= lo && addr < lo + s->vmsize)
+                return 1;
+        }
+        lc += l->cmdsize;
+    }
+    return 0;
+}
+
+static uint64_t image_for_pc(uint64_t pc)
+{
+    for (int i = 0; i < g_closure_n; i++)
+        if (image_covers(g_closure_mh[i], pc))
+            return g_closure_mh[i];
+    if (g_cache)
+        for (uint32_t i = 0; i < g_cache->images_cnt; i++) {
+            uint64_t mh = ocerz_cache_image_addr(g_cache, i, NULL);
+            if (mh && image_covers(mh, pc))
+                return mh;
+        }
     return 0;
 }
 
@@ -699,6 +747,23 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
             }
         }
         api_return(cpu, path);
+        return OCERZ_STEP_OK;
+    }
+    case 0x170: {
+        uint64_t pc = cpu->gpr[OCERZ_RSI];
+        uint64_t info = cpu->gpr[OCERZ_RDX];
+        uint64_t mh = image_for_pc(pc);
+        if (mh && info) {
+            uint64_t eh_sz = 0, cu_sz = 0;
+            uint64_t eh = find_section_sz(mh, "__eh_frame", &eh_sz);
+            uint64_t cu = find_section_sz(mh, "__unwind_info", &cu_sz);
+            ocerz_st(info + 0x00, 8, mh);
+            ocerz_st(info + 0x08, 8, eh);
+            ocerz_st(info + 0x10, 8, eh ? eh_sz : 0);
+            ocerz_st(info + 0x18, 8, cu);
+            ocerz_st(info + 0x20, 8, cu ? cu_sz : 0);
+        }
+        api_return(cpu, mh ? 1 : 0);
         return OCERZ_STEP_OK;
     }
     case 0x2f0:
