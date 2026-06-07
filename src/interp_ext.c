@@ -43,6 +43,11 @@
  *  - The system/misc cluster: CPUID with a fixed feature surface, RDTSC/
  *    RDTSCP via mach_absolute_time() scaled to nanoseconds, XGETBV,
  *    LDMXCSR/STMXCSR, FXSAVE/FXRSTOR, EMMS and FWAIT.
+ *  - SGDT/SIDT write a zero descriptor-table base and put the current guest
+ *    thread's cpu_number in the limit field's low 12 bits. libdispatch's
+ *    per-CPU continuation magazine reads (limit & 0xfff) via SIDT to pick a
+ *    cache; a constant there would make every real host worker thread share one
+ *    magazine and race, so each guest thread carries a distinct cpu_number.
  *
  *  - The whole x87 subset (OCERZ_OP_X87_FIRST..OCERZ_OP_SSE_FIRST) modeled in
  *    double precision over cpu->fpr[8] with ftop/fcw/fsw, per cpu.h.
@@ -239,6 +244,28 @@ static int ext_bit(OcerzCPU *cpu, const X86Insn *insn)
         bit = (uint64_t)sbit & 7;
     }
 
+    if (op != OCERZ_OP_BT && insn->lock) {
+        uint8_t *hp = (uint8_t *)ocerz_g2h(ea);
+        uint8_t cur = __atomic_load_n(hp, __ATOMIC_SEQ_CST);
+        for (;;) {
+            uint8_t nv = cur;
+            if (op == OCERZ_OP_BTS)
+                nv |= (uint8_t)(1u << bit);
+            else if (op == OCERZ_OP_BTR)
+                nv &= (uint8_t)~(1u << bit);
+            else
+                nv ^= (uint8_t)(1u << bit);
+            if (__atomic_compare_exchange_n(hp, &cur, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                testbit = (int)((cur >> bit) & 1);
+                break;
+            }
+        }
+        ocerz_flag_assign(cpu, OCERZ_CF, testbit);
+        if (ocerz_watch_addr && ocerz_watch_addr - ea < 1)
+            ocerz_watch_hit(ea, 1, __atomic_load_n(hp, __ATOMIC_SEQ_CST), 0);
+        return OCERZ_STEP_OK;
+    }
+
     uint8_t byte = (uint8_t)ocerz_ld(ea, 1);
     testbit = (int)((byte >> bit) & 1);
     ocerz_flag_assign(cpu, OCERZ_CF, testbit);
@@ -425,7 +452,7 @@ static int ext_misc(OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_SGDT:
     case OCERZ_OP_SIDT: {
         uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
-        ocerz_st(ea + 0, 2, 1);
+        ocerz_st(ea + 0, 2, (uint64_t)(uint16_t)(cpu->cpu_number & 0xfff));
         ocerz_st(ea + 2, 8, 0);
         return OCERZ_STEP_OK;
     }

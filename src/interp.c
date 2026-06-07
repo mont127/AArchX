@@ -46,6 +46,15 @@
  *    low arithmetic byte to and from AH with the architectural fixed bits.
  *  - SYSCALL publishes the return rip in RCX and the masked flags in R11
  *    exactly as the hardware does before delegating to the syscall layer.
+ *  - Atomics on memory operands use real host C11 __atomic ops with
+ *    SEQ_CST ordering: XCHG to memory (always implicitly locked), XADD,
+ *    CMPXCHG and CMPXCHG8B/16B, and any LOCK-prefixed ADD/SUB/AND/OR/XOR/
+ *    ADC/SBB/INC/DEC/NEG/NOT (via a load+compute+CAS-retry loop). Because real
+ *    guest threads run as real host threads over the shared arena, a plain
+ *    non-atomic read-modify-write would tear the lock-free MPSC queues GCD and
+ *    libpthread run between threads; the host atomic is the faithful x86 lock.
+ *    Bit-test-and-set/reset/complement on memory take the same atomic byte CAS
+ *    path when LOCK-prefixed (in interp_ext.c).
  *
  * ocerz_unimpl() (declared in interp_common.h) prints the uniform
  * unimplemented-instruction diagnostic — op name, the failing rip, its raw
@@ -58,6 +67,7 @@
 #include "ocerz/vm.h"
 #include "ocerz/syscall.h"
 #include "ocerz/dyldapi.h"
+#include <stdlib.h>
 
 static void dump_raw_bytes(FILE *out, uint64_t rip, unsigned len)
 {
@@ -112,14 +122,93 @@ static void write_acc(OcerzCPU *cpu, int size, uint64_t v)
     ocerz_write_gpr(cpu, OCERZ_RAX, size, 0, v);
 }
 
+static uint64_t ocerz_atomic_xchg(uint64_t gaddr, int size, uint64_t v)
+{
+    void *p = ocerz_g2h(gaddr);
+    uint64_t old;
+    switch (size) {
+    case 1: { uint8_t  x = (uint8_t)v;  old = __atomic_exchange_n((uint8_t  *)p, x, __ATOMIC_SEQ_CST); break; }
+    case 2: { uint16_t x = (uint16_t)v; old = __atomic_exchange_n((uint16_t *)p, x, __ATOMIC_SEQ_CST); break; }
+    case 4: { uint32_t x = (uint32_t)v; old = __atomic_exchange_n((uint32_t *)p, x, __ATOMIC_SEQ_CST); break; }
+    default:{ uint64_t x = v;           old = __atomic_exchange_n((uint64_t *)p, x, __ATOMIC_SEQ_CST); break; }
+    }
+    if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
+        ocerz_watch_hit(gaddr, size, v, 0);
+    return old;
+}
+
+static uint64_t ocerz_atomic_fetch_add(uint64_t gaddr, int size, uint64_t v)
+{
+    void *p = ocerz_g2h(gaddr);
+    uint64_t old;
+    switch (size) {
+    case 1: old = __atomic_fetch_add((uint8_t  *)p, (uint8_t)v,  __ATOMIC_SEQ_CST); break;
+    case 2: old = __atomic_fetch_add((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST); break;
+    case 4: old = __atomic_fetch_add((uint32_t *)p, (uint32_t)v, __ATOMIC_SEQ_CST); break;
+    default:old = __atomic_fetch_add((uint64_t *)p, v,           __ATOMIC_SEQ_CST); break;
+    }
+    if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
+        ocerz_watch_hit(gaddr, size, ocerz_trunc(old + v, size), 0);
+    return old;
+}
+
+static int ocerz_atomic_cmpxchg(uint64_t gaddr, int size, uint64_t *expected, uint64_t desired)
+{
+    void *p = ocerz_g2h(gaddr);
+    int ok;
+    switch (size) {
+    case 1: { uint8_t  e = (uint8_t)*expected;  ok = __atomic_compare_exchange_n((uint8_t  *)p, &e, (uint8_t)desired,  0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; break; }
+    case 2: { uint16_t e = (uint16_t)*expected; ok = __atomic_compare_exchange_n((uint16_t *)p, &e, (uint16_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; break; }
+    case 4: { uint32_t e = (uint32_t)*expected; ok = __atomic_compare_exchange_n((uint32_t *)p, &e, (uint32_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; break; }
+    default:{ uint64_t e = *expected;           ok = __atomic_compare_exchange_n((uint64_t *)p, &e, desired,           0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; break; }
+    }
+    if (ok && ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
+        ocerz_watch_hit(gaddr, size, desired, 0);
+    return ok;
+}
+
+static uint64_t ocerz_atomic_load(uint64_t gaddr, int size)
+{
+    void *p = ocerz_g2h(gaddr);
+    switch (size) {
+    case 1:  return __atomic_load_n((uint8_t  *)p, __ATOMIC_SEQ_CST);
+    case 2:  return __atomic_load_n((uint16_t *)p, __ATOMIC_SEQ_CST);
+    case 4:  return __atomic_load_n((uint32_t *)p, __ATOMIC_SEQ_CST);
+    default: return __atomic_load_n((uint64_t *)p, __ATOMIC_SEQ_CST);
+    }
+}
+
 static int op_arith(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
     int size = insn->ops[0].size;
+    (void)vm;
+    if (insn->lock && insn->ops[0].kind == OCERZ_OPK_MEM) {
+        uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
+        uint64_t b = ocerz_read_op(cpu, insn, &insn->ops[1]);
+        for (;;) {
+            uint64_t a = ocerz_atomic_load(addr, size);
+            int cin = (cpu->rflags & OCERZ_CF) ? 1 : 0;
+            uint64_t res;
+            switch (insn->op) {
+            case OCERZ_OP_ADD: res = a + b; ocerz_flags_add(cpu, size, a, b, 0, res); break;
+            case OCERZ_OP_ADC: res = a + b + (uint64_t)cin; ocerz_flags_add(cpu, size, a, b, cin, res); break;
+            case OCERZ_OP_SUB: res = a - b; ocerz_flags_sub(cpu, size, a, b, 0, res); break;
+            case OCERZ_OP_SBB: res = a - b - (uint64_t)cin; ocerz_flags_sub(cpu, size, a, b, cin, res); break;
+            case OCERZ_OP_AND: res = a & b; ocerz_flags_logic(cpu, size, res); break;
+            case OCERZ_OP_OR:  res = a | b; ocerz_flags_logic(cpu, size, res); break;
+            case OCERZ_OP_XOR: res = a ^ b; ocerz_flags_logic(cpu, size, res); break;
+            default: return ocerz_unimpl(vm, cpu, insn, "locked-arith");
+            }
+            uint64_t seen = a;
+            if (ocerz_atomic_cmpxchg(addr, size, &seen, res))
+                break;
+        }
+        return OCERZ_STEP_OK;
+    }
     uint64_t a = ocerz_read_op(cpu, insn, &insn->ops[0]);
     uint64_t b = ocerz_read_op(cpu, insn, &insn->ops[1]);
     int cin = (cpu->rflags & OCERZ_CF) ? 1 : 0;
     uint64_t res;
-    (void)vm;
     switch (insn->op) {
     case OCERZ_OP_ADD:
         res = a + b;
@@ -173,9 +262,27 @@ static int op_arith(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 static int op_incdecnegnot(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
     int size = insn->ops[0].size;
+    (void)vm;
+    if (insn->lock && insn->ops[0].kind == OCERZ_OPK_MEM) {
+        uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
+        for (;;) {
+            uint64_t a = ocerz_atomic_load(addr, size);
+            uint64_t res;
+            switch (insn->op) {
+            case OCERZ_OP_INC: res = a + 1; ocerz_flags_inc(cpu, size, res); break;
+            case OCERZ_OP_DEC: res = a - 1; ocerz_flags_dec(cpu, size, res); break;
+            case OCERZ_OP_NEG: res = (uint64_t)0 - a; ocerz_flags_sub(cpu, size, 0, a, 0, res); break;
+            case OCERZ_OP_NOT: res = ~a; break;
+            default: return ocerz_unimpl(vm, cpu, insn, "locked-incdec");
+            }
+            uint64_t seen = a;
+            if (ocerz_atomic_cmpxchg(addr, size, &seen, res))
+                break;
+        }
+        return OCERZ_STEP_OK;
+    }
     uint64_t a = ocerz_read_op(cpu, insn, &insn->ops[0]);
     uint64_t res;
-    (void)vm;
     switch (insn->op) {
     case OCERZ_OP_INC:
         res = a + 1;
@@ -510,6 +617,20 @@ static int op_mov_family(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_XCHG: {
+        if (insn->ops[0].kind == OCERZ_OPK_MEM) {
+            uint64_t b = ocerz_read_op(cpu, insn, &insn->ops[1]);
+            uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
+            uint64_t a = ocerz_atomic_xchg(addr, insn->ops[0].size, b);
+            ocerz_write_op(cpu, insn, &insn->ops[1], a);
+            return OCERZ_STEP_OK;
+        }
+        if (insn->ops[1].kind == OCERZ_OPK_MEM) {
+            uint64_t a = ocerz_read_op(cpu, insn, &insn->ops[0]);
+            uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[1]);
+            uint64_t b = ocerz_atomic_xchg(addr, insn->ops[1].size, a);
+            ocerz_write_op(cpu, insn, &insn->ops[0], b);
+            return OCERZ_STEP_OK;
+        }
         uint64_t a = ocerz_read_op(cpu, insn, &insn->ops[0]);
         uint64_t b = ocerz_read_op(cpu, insn, &insn->ops[1]);
         ocerz_write_op(cpu, insn, &insn->ops[0], b);
@@ -685,11 +806,20 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
     (void)vm;
+    int mem = (insn->ops[0].kind == OCERZ_OPK_MEM);
     switch (insn->op) {
     case OCERZ_OP_XADD: {
         int size = insn->ops[0].size;
-        uint64_t dst = ocerz_read_op(cpu, insn, &insn->ops[0]);
         uint64_t src = ocerz_read_op(cpu, insn, &insn->ops[1]);
+        if (mem) {
+            uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
+            uint64_t dst = ocerz_atomic_fetch_add(addr, size, src);
+            uint64_t sum = dst + src;
+            ocerz_flags_add(cpu, size, dst, src, 0, sum);
+            ocerz_write_op(cpu, insn, &insn->ops[1], dst);
+            return OCERZ_STEP_OK;
+        }
+        uint64_t dst = ocerz_read_op(cpu, insn, &insn->ops[0]);
         uint64_t sum = dst + src;
         ocerz_flags_add(cpu, size, dst, src, 0, sum);
         ocerz_write_op(cpu, insn, &insn->ops[1], dst);
@@ -699,6 +829,16 @@ static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_CMPXCHG: {
         int size = insn->ops[0].size;
         uint64_t acc = read_acc(cpu, size);
+        if (mem) {
+            uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
+            uint64_t src = ocerz_read_op(cpu, insn, &insn->ops[1]);
+            uint64_t seen = acc;
+            int ok = ocerz_atomic_cmpxchg(addr, size, &seen, src);
+            ocerz_flags_sub(cpu, size, acc, seen, 0, acc - seen);
+            if (!ok)
+                write_acc(cpu, size, seen);
+            return OCERZ_STEP_OK;
+        }
         uint64_t d = ocerz_read_op(cpu, insn, &insn->ops[0]);
         ocerz_flags_sub(cpu, size, acc, d, 0, acc - d);
         if (ocerz_trunc(acc, size) == ocerz_trunc(d, size)) {
@@ -712,28 +852,32 @@ static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_CMPXCHGXB: {
         uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
         if (insn->opsize == 8) {
-            uint64_t mem = ocerz_ld(addr, 8);
             uint64_t expected = ((uint64_t)(uint32_t)cpu->gpr[OCERZ_RDX] << 32) |
                                 (uint32_t)cpu->gpr[OCERZ_RAX];
-            if (mem == expected) {
-                uint64_t store = ((uint64_t)(uint32_t)cpu->gpr[OCERZ_RCX] << 32) |
-                                 (uint32_t)cpu->gpr[OCERZ_RBX];
-                ocerz_st(addr, 8, store);
+            uint64_t store = ((uint64_t)(uint32_t)cpu->gpr[OCERZ_RCX] << 32) |
+                             (uint32_t)cpu->gpr[OCERZ_RBX];
+            uint64_t seen = expected;
+            int ok = ocerz_atomic_cmpxchg(addr, 8, &seen, store);
+            if (ok) {
                 ocerz_flag_assign(cpu, OCERZ_ZF, 1);
             } else {
-                ocerz_write_gpr(cpu, OCERZ_RAX, 4, 0, (uint32_t)mem);
-                ocerz_write_gpr(cpu, OCERZ_RDX, 4, 0, (uint32_t)(mem >> 32));
+                ocerz_write_gpr(cpu, OCERZ_RAX, 4, 0, (uint32_t)seen);
+                ocerz_write_gpr(cpu, OCERZ_RDX, 4, 0, (uint32_t)(seen >> 32));
                 ocerz_flag_assign(cpu, OCERZ_ZF, 0);
             }
         } else {
-            Ocerz128 mem = ocerz_ld128(addr);
-            if (mem.lo == cpu->gpr[OCERZ_RAX] && mem.hi == cpu->gpr[OCERZ_RDX]) {
-                Ocerz128 store = { cpu->gpr[OCERZ_RBX], cpu->gpr[OCERZ_RCX] };
-                ocerz_st128(addr, store);
+            __uint128_t expected = ((__uint128_t)cpu->gpr[OCERZ_RDX] << 64) | cpu->gpr[OCERZ_RAX];
+            __uint128_t store = ((__uint128_t)cpu->gpr[OCERZ_RCX] << 64) | cpu->gpr[OCERZ_RBX];
+            __uint128_t e = expected;
+            int ok = __atomic_compare_exchange_n((__uint128_t *)ocerz_g2h(addr), &e, store,
+                                                 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            if (ok) {
+                if (ocerz_watch_addr && ocerz_watch_addr - addr < 16)
+                    ocerz_watch_hit(addr, 16, (uint64_t)store, (uint64_t)(store >> 64));
                 ocerz_flag_assign(cpu, OCERZ_ZF, 1);
             } else {
-                cpu->gpr[OCERZ_RAX] = mem.lo;
-                cpu->gpr[OCERZ_RDX] = mem.hi;
+                cpu->gpr[OCERZ_RAX] = (uint64_t)e;
+                cpu->gpr[OCERZ_RDX] = (uint64_t)(e >> 64);
                 ocerz_flag_assign(cpu, OCERZ_ZF, 0);
             }
         }

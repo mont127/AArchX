@@ -61,9 +61,23 @@
  *    cache and the bump allocator take a mutex (jit.c/mem.c); the current CPU
  *    is a per-thread TLS pointer so the crash handler reports the faulting
  *    thread. The GCD workqueue (workq_kernreturn REQTHREADS spawning a
- *    start_wqthread worker) is implemented but gated behind OCERZ_WORKQ until
- *    its wqthread QoS/priority entry ABI is finished; default builds stub it.
- *    fork/exec/posix_spawn remain STEP_FATAL.
+ *    start_wqthread worker) is implemented with the faithful wqthread entry
+ *    ABI: REQTHREADS derives the QoS class index from the requested
+ *    pthread_priority and hands start_wqthread the kernel R8 word with the QoS
+ *    marker (bit14) set and the class index in the low byte (plus NEWSPI and
+ *    TSD_BASE_SET), so __pthread_wqthread builds a real QoS pthread_priority and
+ *    _dispatch_worker_thread2 drains the correct root-queue bucket. A file-
+ *    static running-worker count stops REQTHREADS spawning a fresh host thread
+ *    per request when one already services the pool; THREAD_RETURN terminates
+ *    the worker and its host-thread exit decrements the count. This whole
+ *    REQTHREADS-spawns-real-workers path is gated behind OCERZ_WORKQ: enabled,
+ *    gcd-async drains and PROBE-OKs, but enabling it for every program also
+ *    drains Foundation/XPC init-time work whose blocks (NSMallocBlock copies of
+ *    XPC queue-assertion sentinels) fault on the worker threads and corrupt
+ *    shared libdispatch state, regressing programs whose later main-thread
+ *    initializers trip over it (process-info, unicode-icu). Default builds keep
+ *    the historical stub (REQTHREADS returns 0) so the regression suite stays
+ *    green. fork/exec/posix_spawn remain STEP_FATAL.
  *  - mach_vm_*: arena allocator, ANYWHERE semantics, KERN_SUCCESS/3.
  * thread_fast_set_cthread_self returns 0x60 (the historical %gs selector);
  * the exact value the guest expects is uncertain but unused, documented here.
@@ -79,6 +93,7 @@
 #include "ocerz/interp.h"
 
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
@@ -317,10 +332,35 @@ struct ocerz_worker {
     OcerzCPU cpu;
 };
 
+static volatile int g_wq_running;
+
+static int ocerz_cpu_count(void)
+{
+    static int n;
+    int cur = __atomic_load_n(&n, __ATOMIC_RELAXED);
+    if (cur)
+        return cur;
+    size_t sz = sizeof(cur);
+    int v = 0;
+    if (sysctlbyname("hw.activecpu", &v, &sz, NULL, 0) != 0 || v < 1)
+        v = 1;
+    __atomic_store_n(&n, v, __ATOMIC_RELAXED);
+    return v;
+}
+
+static int ocerz_next_cpu_number(void)
+{
+    static volatile int seq;
+    int idx = __atomic_fetch_add(&seq, 1, __ATOMIC_SEQ_CST);
+    int ncpu = ocerz_cpu_count();
+    return 1 + (idx % (ncpu > 1 ? ncpu - 1 : 1));
+}
+
 static void *ocerz_worker_entry(void *p)
 {
     struct ocerz_worker *w = (struct ocerz_worker *)p;
     ocerz_vm_run_cpu(w->vm, &w->cpu);
+    __atomic_fetch_sub(&g_wq_running, 1, __ATOMIC_SEQ_CST);
     free(w);
     return NULL;
 }
@@ -367,10 +407,15 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             reqcount = 1;
         uint64_t prio = a[3];
         uint64_t cookie = ocerz_ld(OCERZ_PTHREAD_COOKIE, 8);
-        for (int i = 0; i < reqcount && i < 8; i++) {
+        int running = __atomic_load_n(&g_wq_running, __ATOMIC_SEQ_CST);
+        int want = reqcount - running;
+        if (want > 8)
+            want = 8;
+        for (int i = 0; i < want; i++) {
             uint64_t region = ocerz_map_anywhere(0x200000, PROT_READ | PROT_WRITE);
             if (region == 0)
                 break;
+            __atomic_fetch_add(&g_wq_running, 1, __ATOMIC_SEQ_CST);
             uint64_t pth = region + 0x1f0000;
             mach_port_t port = MACH_PORT_NULL;
             mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
@@ -379,16 +424,26 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)port);
             OcerzCPU t = *cpu;
             t.terminated = 0;
+            t.cpu_number = ocerz_next_cpu_number();
             t.rip = OCERZ_START_WQTHREAD;
+            uint32_t qosbits = (uint32_t)((prio >> 8) & 0x3fff);
+            int qos_idx = qosbits ? (__builtin_ctz(qosbits) + 1) : 4;
+            if (qos_idx < 1)
+                qos_idx = 1;
+            if (qos_idx > 6)
+                qos_idx = 6;
             t.gpr[OCERZ_RSP] = pth;
             t.gpr[OCERZ_RDI] = pth;
             t.gpr[OCERZ_RSI] = port;
             t.gpr[OCERZ_RDX] = pth;
             t.gpr[OCERZ_RCX] = 0;
-            t.gpr[OCERZ_R8] = 0x210000 | 0x8000 | (prio & 0xffff);
+            t.gpr[OCERZ_R8] = 0x40000ull | 0x200000ull | 0x4000ull | (uint64_t)qos_idx;
             t.gpr[OCERZ_R9] = 0;
             t.gs_base = pth + 0xe0;
-            ocerz_spawn_worker(vm, &t);
+            if (ocerz_spawn_worker(vm, &t) != 0) {
+                __atomic_fetch_sub(&g_wq_running, 1, __ATOMIC_SEQ_CST);
+                break;
+            }
         }
         ret_ok(cpu, 0);
         return OCERZ_STEP_OK;
@@ -410,6 +465,7 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     w->vm = vm;
     w->cpu = *cpu;
     w->cpu.terminated = 0;
+    w->cpu.cpu_number = ocerz_next_cpu_number();
     w->cpu.rip = OCERZ_THREAD_START;
     w->cpu.gpr[OCERZ_RSP] = stack;
     mach_port_t port = MACH_PORT_NULL;
