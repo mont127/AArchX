@@ -77,6 +77,36 @@
  * dependency order (step 5), and exit() flushes stdio. Foundation/Swift apps
  * (e.g. NSString bridging through libswiftCore) run end-to-end. Still TODO at
  * the honest edge: TLV is not set up.
+ *
+ * Non-cache disk dylibs. Some executables link a dylib that is a real file on
+ * disk rather than a member of the shared cache — e.g. /usr/bin/perl links
+ * .../CORE/libperl.dylib by absolute path. DynImage is therefore the element
+ * of a small global registry (g_dimgs), the main exe being a transient entry-0
+ * and every disk dylib a registered entry. Before the main exe's fixups,
+ * load_disk_deps walks its LC_LOAD_DYLIB list and, for each install name NOT
+ * resolvable in the cache, load_disk_dylib opens the file, selects the x86_64
+ * slice, maps its segments into an ocerz_map_anywhere region (map_segments with
+ * is_main=0 chooses load_base from that region; the main exe keeps its byte-
+ * identical ocerz_arena_lo path), recurses into THAT image's own non-cache deps
+ * deps-first, then applies its fixups. Both fixup engines resolve imports
+ * through resolve_import: a positive two-level library ordinal maps to the
+ * loader image's Nth LC_LOAD_DYLIB install name and, when that names a loaded
+ * disk image, resolves in its export trie first; otherwise the existing cache
+ * resolve runs, with a flat sweep of the disk images as a final fallback (so a
+ * binary whose every dep is a cache path takes the unchanged cache path — zero
+ * regression). Each disk image's mach_header is registered in the dyld-API
+ * closure (ocerz_dyldapi_register_image) so image lists / unwind / objc see it
+ * and its path, and the init/load phases descend into it via dep_mh (cache OR
+ * disk) so its initializers run deps-first; it joins the eager set as a direct
+ * dep. The image's file buffer (owned_buf) is kept alive for the whole run
+ * because its export trie is read at resolve time. The slide-from-segment
+ * helpers (image_slide_d here, image_slide/find_section_sz in dyldapi.c) key
+ * off the first fileoff==0 segment with non-zero filesize, which is the header-
+ * bearing __TEXT for BOTH a cache image, the main exe (skipping __PAGEZERO) and
+ * a disk dylib whose __TEXT sits at vmaddr 0. Honest edge: @rpath/@loader_path
+ * install names are not expanded (perl uses absolute paths); the runtime
+ * dlopen of a disk MH_BUNDLE (perl's XS .bundle modules) is not yet wired, so
+ * `perl -e ...` runs but a script that loads XS modules does not.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -186,6 +216,8 @@ int ocerz_peek_dynamic(const char *path)
 
 typedef struct DynImage {
     const uint8_t *slice;
+    uint8_t *owned_buf;
+    char path[1024];
     uint64_t slide;
     uint64_t load_base;
     uint64_t main_entry;
@@ -206,7 +238,19 @@ typedef struct DynImage {
     int links_dylib;
 } DynImage;
 
-static int map_segments(DynImage *img)
+#define DYN_DIMG_MAX 64
+static DynImage g_dimgs[DYN_DIMG_MAX];
+static int g_dimgs_n;
+
+static DynImage *dimg_find_by_path(const char *path)
+{
+    for (int i = 0; i < g_dimgs_n; i++)
+        if (g_dimgs[i].path[0] && strcmp(g_dimgs[i].path, path) == 0)
+            return &g_dimgs[i];
+    return NULL;
+}
+
+static int map_segments(DynImage *img, int is_main)
 {
     const uint8_t *mh = img->slice;
     uint32_t ncmds = rd32(mh + 16);
@@ -216,7 +260,7 @@ static int map_segments(DynImage *img)
     int have_text = 0;
     for (uint32_t i = 0; i < ncmds; i++) {
         uint32_t cmd = rd32(lc);
-        if (cmd == LC_SEGMENT_64 && rd64(lc + 40) == 0 && rd64(lc + 24) != 0) {
+        if (cmd == LC_SEGMENT_64 && rd64(lc + 40) == 0 && rd64(lc + 48) != 0) {
             text_vmaddr = rd64(lc + 24);
             have_text = 1;
             break;
@@ -225,8 +269,6 @@ static int map_segments(DynImage *img)
     }
     if (!have_text)
         return OCERZ_EFORMAT;
-    img->load_base = ocerz_arena_lo;
-    img->slide = img->load_base - text_vmaddr;
 
     uint64_t vmlo = ~0ull, vmhi = 0;
     lc = mh + sizeof(struct mach_header_64);
@@ -247,8 +289,19 @@ static int map_segments(DynImage *img)
     }
     if (vmhi <= vmlo)
         return OCERZ_EFORMAT;
-    if (ocerz_map_fixed(vmlo + img->slide, vmhi - vmlo, PROT_READ | PROT_WRITE) != OCERZ_OK)
-        return OCERZ_ENOMEM;
+
+    if (is_main) {
+        img->load_base = ocerz_arena_lo;
+        img->slide = img->load_base - text_vmaddr;
+        if (ocerz_map_fixed(vmlo + img->slide, vmhi - vmlo, PROT_READ | PROT_WRITE) != OCERZ_OK)
+            return OCERZ_ENOMEM;
+    } else {
+        uint64_t region = ocerz_map_anywhere(vmhi - vmlo, PROT_READ | PROT_WRITE);
+        if (region == 0)
+            return OCERZ_ENOMEM;
+        img->slide = region - vmlo;
+        img->load_base = text_vmaddr + img->slide;
+    }
 
     lc = mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < ncmds; i++) {
@@ -365,6 +418,59 @@ static uint64_t ocerz_image_self_resolve(DynImage *img, const char *sym)
     return 0;
 }
 
+static const char *dimg_ordinal_name(DynImage *img, int ord)
+{
+    if (ord <= 0)
+        return NULL;
+    const uint8_t *mh = img->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    int n = 0;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+            if (++n == ord)
+                return (const char *)(lc + rd32(lc + 8));
+        }
+        lc += rd32(lc + 4);
+    }
+    return NULL;
+}
+
+static uint64_t disk_flat_resolve(const char *name)
+{
+    for (int i = 0; i < g_dimgs_n; i++) {
+        uint64_t v = ocerz_image_self_resolve(&g_dimgs[i], name);
+        if (v)
+            return v;
+    }
+    return 0;
+}
+
+static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
+                               int libord, int weak)
+{
+    uint64_t value = 0;
+    if (libord > 0) {
+        const char *tgt = dimg_ordinal_name(img, libord);
+        if (tgt) {
+            DynImage *dep = dimg_find_by_path(tgt);
+            if (dep)
+                value = ocerz_image_self_resolve(dep, name);
+        }
+    }
+    if (value == 0)
+        value = ocerz_cache_resolve(cache, name);
+    if (value == 0 && (libord == -3 || libord == 0 || libord == -2))
+        value = ocerz_image_self_resolve(img, name);
+    if (value == 0)
+        value = disk_flat_resolve(name);
+    if (value == 0 && !weak)
+        OCERZ_FATAL("unresolved import: %s\n", name);
+    return value;
+}
+
 static int apply_fixups(DynImage *img, OcerzCache *cache)
 {
     if (img->cf_off == 0)
@@ -410,11 +516,7 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
                         int libord = (int8_t)(imp & 0xff);
                         int weakimp = (imp >> 8) & 1;
                         const char *name = (const char *)(cf + symbols_off + noff);
-                        value = ocerz_cache_resolve(cache, name);
-                        if (value == 0 && libord == -3)
-                            value = ocerz_image_self_resolve(img, name);
-                        if (value == 0 && !weakimp)
-                            OCERZ_FATAL("unresolved import: %s\n", name);
+                        value = resolve_import(cache, img, name, libord, weakimp);
                     }
                     ocerz_st(addr, 8, value + addend);
                 } else {
@@ -455,12 +557,7 @@ static int64_t self_sleb(const uint8_t **pp, const uint8_t *end)
 static uint64_t classic_resolve(DynImage *img, OcerzCache *cache, const char *name,
                                 int libord, int weak)
 {
-    uint64_t value = ocerz_cache_resolve(cache, name);
-    if (value == 0 && (libord == -2 || libord == 0))
-        value = ocerz_image_self_resolve(img, name);
-    if (value == 0 && !weak)
-        OCERZ_FATAL("unresolved import: %s\n", name);
-    return value;
+    return resolve_import(cache, img, name, libord, weak);
 }
 
 static void classic_rebase(DynImage *img)
@@ -704,10 +801,12 @@ static int build_frame(const char *path, int argc, char **argv, char **envp, Dyn
     ocerz_st(apple_arr + (uint64_t)applec * 8, 8, 0);
 
     uint64_t cells = (apple_arr - 8 * 8) & ~0xfull;
+    const char *slash = strrchr(argv[0], '/');
+    uint64_t leaf = argv_g[0] + (slash ? (uint64_t)(slash - argv[0] + 1) : 0);
     ocerz_st(cells + 0, 4, (uint64_t)argc);
     ocerz_st(cells + 8, 8, argv_arr);
     ocerz_st(cells + 16, 8, envp_arr);
-    ocerz_st(cells + 24, 8, argv_g[0]);
+    ocerz_st(cells + 24, 8, leaf);
 
     uint64_t pv = cells - 48;
     ocerz_st(pv + 0, 8, ocerz_arena_lo);
@@ -767,6 +866,15 @@ static uint64_t dep_find(OcerzCache *cache, const char *path)
     return 0;
 }
 
+static uint64_t dep_mh(OcerzCache *cache, const char *path)
+{
+    uint64_t mh = dep_find(cache, path);
+    if (mh)
+        return mh;
+    DynImage *d = dimg_find_by_path(path);
+    return d ? d->load_base : 0;
+}
+
 static int64_t image_slide_d(uint64_t mh)
 {
     uint32_t ncmds = rd32((const uint8_t *)(uintptr_t)mh + 16);
@@ -775,7 +883,7 @@ static int64_t image_slide_d(uint64_t mh)
         const struct load_command *l = (const void *)lc;
         if (l->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *s = (const void *)lc;
-            if (s->fileoff == 0 && s->vmaddr)
+            if (s->fileoff == 0 && s->filesize != 0)
                 return (int64_t)mh - (int64_t)s->vmaddr;
         }
         lc += l->cmdsize;
@@ -895,7 +1003,7 @@ static void eager_add_direct_deps(OcerzCache *cache, uint64_t mh)
             cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4))
-                eager_add(dep_find(cache, (const char *)(lc + noff)));
+                eager_add(dep_mh(cache, (const char *)(lc + noff)));
         }
         lc += rd32(lc + 4);
     }
@@ -924,6 +1032,7 @@ static void compute_eager_set(OcerzCache *cache, uint64_t main_mh)
 static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64_t stack_top)
 {
     const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    int64_t slide = image_slide_d(mh);
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
     for (uint32_t j = 0; j < ncmds; j++) {
@@ -932,7 +1041,7 @@ static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64
             const uint8_t *sec = lc + 72;
             for (uint32_t s = 0; s < ns; s++) {
                 uint8_t ty = rd32(sec + 64) & 0xff;
-                uint64_t sa = rd64(sec + 32), ssz = rd64(sec + 40);
+                uint64_t sa = (uint64_t)((int64_t)rd64(sec + 32) + slide), ssz = rd64(sec + 40);
                 if (ty == 0x16) {
                     for (uint64_t o = 0; o + 4 <= ssz; o += 4) {
                         uint64_t fn = mh + rd32((const uint8_t *)(uintptr_t)(sa + o));
@@ -989,7 +1098,7 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
             cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4))
-                run_init_phase(vm, cache, dep_find(cache, (const char *)(lc + noff)),
+                run_init_phase(vm, cache, dep_mh(cache, (const char *)(lc + noff)),
                                ia, stack_top, skip_mh);
         }
         lc += rd32(lc + 4);
@@ -1022,7 +1131,7 @@ static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t
             cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4))
-                run_load_phase(vm, cache, dep_find(cache, (const char *)(lc + noff)),
+                run_load_phase(vm, cache, dep_mh(cache, (const char *)(lc + noff)),
                                stack_top, skip_mh);
         }
         lc += rd32(lc + 4);
@@ -1031,6 +1140,81 @@ static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t
         return;
     if (mh != skip_mh && (g_eager_n == 0 || eager_has(mh)))
         ocerz_dyldapi_run_image_loads(vm, mh, stack_top);
+}
+
+static void load_disk_deps(OcerzCache *cache, DynImage *loader);
+
+static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_path, DynImage *loader)
+{
+    (void)loader;
+    if (!install_path || install_path[0] == '@')
+        return NULL;
+    if (dep_find(cache, install_path) != 0)
+        return NULL;
+    DynImage *existing = dimg_find_by_path(install_path);
+    if (existing)
+        return existing;
+    if (g_dimgs_n >= DYN_DIMG_MAX) {
+        OCERZ_FATAL("too many disk dylibs to load (limit %d)\n", DYN_DIMG_MAX);
+        return NULL;
+    }
+
+    size_t flen = 0;
+    uint8_t *buf = read_file(install_path, &flen);
+    if (!buf) {
+        OCERZ_FATAL("Library not loaded: %s (no such file)\n", install_path);
+        return NULL;
+    }
+    const uint8_t *slice = select_slice(buf, flen);
+    if (!slice) {
+        OCERZ_FATAL("incompatible architecture: %s has no x86_64 slice\n", install_path);
+        free(buf);
+        return NULL;
+    }
+
+    DynImage *d = &g_dimgs[g_dimgs_n++];
+    memset(d, 0, sizeof *d);
+    d->slice = slice;
+    d->owned_buf = buf;
+    snprintf(d->path, sizeof d->path, "%s", install_path);
+
+    if (map_segments(d, 0) != OCERZ_OK) {
+        OCERZ_FATAL("cannot map segments of %s\n", install_path);
+        g_dimgs_n--;
+        free(buf);
+        return NULL;
+    }
+
+    load_disk_deps(cache, d);
+
+    if (apply_fixups(d, cache) != OCERZ_OK) {
+        OCERZ_FATAL("cannot apply fixups of %s\n", install_path);
+        return NULL;
+    }
+    if (d->cf_off == 0)
+        apply_classic_fixups(d, cache);
+
+    ocerz_dyldapi_register_image(d->load_base, d->path);
+    OCERZ_LOG("dynamic: loaded disk dylib %s at load_base=%#llx slide=%#llx\n",
+              install_path, (unsigned long long)d->load_base, (unsigned long long)d->slide);
+    return d;
+}
+
+static void load_disk_deps(OcerzCache *cache, DynImage *loader)
+{
+    const uint8_t *mh = loader->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+            uint32_t noff = rd32(lc + 8);
+            if (noff < rd32(lc + 4))
+                load_disk_dylib(cache, (const char *)(lc + noff), loader);
+        }
+        lc += rd32(lc + 4);
+    }
 }
 
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
@@ -1060,7 +1244,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     DynImage img;
     memset(&img, 0, sizeof img);
     img.slice = slice;
-    int r = map_segments(&img);
+    int r = map_segments(&img, 1);
     if (r != OCERZ_OK) {
         OCERZ_FATAL("cannot map segments of %s\n", path);
         free(buf);
@@ -1076,6 +1260,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         free(buf);
         return OCERZ_EFORMAT;
     }
+
+    load_disk_deps(&cache, &img);
 
     r = apply_fixups(&img, &cache);
     if (r != OCERZ_OK) {

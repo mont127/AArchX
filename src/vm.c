@@ -56,7 +56,15 @@
  * executing garbage. The crash handler guards against re-entry (its own
  * guest-stack backtrace scan can fault on a corrupt sp, which previously
  * recursed the signal forever) and writes the fault summary before
- * attempting that scan.
+ * attempting that scan. For that guard to actually fire the handler is
+ * installed with SA_NODEFER so a fault taken WHILE the handler runs (the
+ * bt-scan's ocerz_ld off the just-overflowed, now-unmapped guest stack page)
+ * is delivered as a nested signal instead of being masked and retried forever
+ * by the kernel — without SA_NODEFER the re-fault spins the thread and the
+ * process hangs instead of dying. It is also installed SA_ONSTACK on a
+ * dedicated sigaltstack so it can still run when the guest/host stack itself is
+ * the unmapped region. The handler always terminates the process (_exit(139),
+ * or _exit(139) via the depth guard on the nested fault).
  */
 #include "ocerz/vm.h"
 #include "ocerz/interp.h"
@@ -194,10 +202,20 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     const char *w = getenv("OCERZ_WATCH");
     if (w)
         ocerz_watch_addr = strtoull(w, NULL, 0);
+    static stack_t altss;
+    if (!altss.ss_sp) {
+        altss.ss_size = SIGSTKSZ < 0x10000 ? 0x10000 : (size_t)SIGSTKSZ;
+        altss.ss_sp = mmap(NULL, altss.ss_size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (altss.ss_sp != MAP_FAILED)
+            sigaltstack(&altss, NULL);
+        else
+            altss.ss_sp = NULL;
+    }
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = crash_handler;
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER | (altss.ss_sp ? SA_ONSTACK : 0);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
     g_vm = vm;
