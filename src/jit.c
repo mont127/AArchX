@@ -307,6 +307,16 @@ uint64_t ocerz_jit_blocks(const OcerzJit *jit)
 
 static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
 
+void ocerz_jit_prefork(void)
+{
+    pthread_mutex_lock(&jit_lock);
+}
+
+void ocerz_jit_postfork(void)
+{
+    pthread_mutex_unlock(&jit_lock);
+}
+
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))

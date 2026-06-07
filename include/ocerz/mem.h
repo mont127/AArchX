@@ -30,7 +30,12 @@
  * mach_vm_map() for an 8MB-aligned region and then recovers the region
  * header by masking any interior pointer down to that boundary.
  * ocerz_unmap() returns pages to PROT_NONE instead of unmapping so the
- * arena reservation stays intact.
+ * arena reservation stays intact. ocerz_map_claim_fixed() serves guest
+ * VM_FLAGS_FIXED allocations: it grants the exact requested range only when
+ * the range provably overlaps nothing (at or above the bump waterline) and
+ * advances the waterline past it; otherwise it fails so the syscall layer can
+ * report the honest KERN_NO_SPACE of an occupied range instead of silently
+ * relocating an allocation the guest addressed by exact position.
  *
  * The sized load/store helpers use memcpy so unaligned guest accesses are
  * always safe regardless of host alignment checking.
@@ -70,6 +75,9 @@ static inline uint64_t ocerz_h2g(const void *haddr)
 int ocerz_mem_init(uint64_t lo, uint64_t hi);
 int ocerz_mem_init_identity(uint64_t size);
 int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot);
+int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot);
+void ocerz_mem_prefork(void);
+void ocerz_mem_postfork(void);
 uint64_t ocerz_map_anywhere(uint64_t len, int prot);
 uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align);
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot);

@@ -409,10 +409,10 @@ static void test_sigaction(void)
     CHECK(ocerz_ld(goact + 8, 8) == 0);
 }
 
-static void test_unsupported_fork(void)
+static void test_unsupported_execve(void)
 {
     OcerzCPU *cpu = &vm.cpu;
-    set_args(cpu, bsd(2), 0, 0, 0, 0, 0, 0);
+    set_args(cpu, bsd(59), 0, 0, 0, 0, 0, 0);
     int r = ocerz_handle_syscall(&vm, cpu);
     CHECK(r == OCERZ_STEP_FATAL);
 }
@@ -480,7 +480,7 @@ int main(void)
     test_mach_vm_allocate();
     test_mach_timebase();
     test_mach_unknown();
-    test_unsupported_fork();
+    test_unsupported_execve();
     test_unknown_bsd();
     test_unknown_class();
     test_exit();

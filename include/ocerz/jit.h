@@ -27,6 +27,10 @@
  * and chose not to translate — the caller then interprets. Blocks return
  * the next guest rip in the CPU state; direct-branch chaining patches block
  * exits to jump straight to successor blocks inside the code cache.
+ *
+ * ocerz_jit_prefork()/ocerz_jit_postfork() bracket a guest fork(): the
+ * translation mutex is taken across the host fork so the child never inherits
+ * a lock held by a worker thread that does not exist in the child.
  */
 #ifndef OCERZ_JIT_H
 #define OCERZ_JIT_H
@@ -41,5 +45,7 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm);
 void ocerz_jit_destroy(OcerzJit *jit);
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu);
 uint64_t ocerz_jit_blocks(const OcerzJit *jit);
+void ocerz_jit_prefork(void);
+void ocerz_jit_postfork(void);
 
 #endif

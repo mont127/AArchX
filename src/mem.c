@@ -29,6 +29,16 @@
  * allocations so runaway guest writes fault instead of bleeding into the
  * next allocation. ocerz_unmap() re-reserves PROT_NONE rather than
  * unmapping, keeping the arena contiguous forever.
+ *
+ * ocerz_map_claim_fixed() backs a guest VM_FLAGS_FIXED allocation: the kernel
+ * contract is memory at EXACTLY the requested address or an error, never a
+ * silent relocation (libmalloc extends large blocks in place this way and
+ * trusts a success without re-reading the address). A range is granted only
+ * when it provably collides with nothing — entirely at or above the bump
+ * waterline and inside the arena — and the waterline then jumps past it; any
+ * range below the waterline may overlap a live allocation, so the caller gets
+ * the same KERN_NO_SPACE a real kernel gives for an occupied range, and the
+ * guest allocator takes its normal allocate-new fallback.
  */
 #include "ocerz/mem.h"
 
@@ -172,6 +182,30 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
     if (ocerz_map_fixed(gaddr, glen, prot) != OCERZ_OK)
         return 0;
     return gaddr;
+}
+
+void ocerz_mem_prefork(void)
+{
+    pthread_mutex_lock(&bump_lock);
+}
+
+void ocerz_mem_postfork(void)
+{
+    pthread_mutex_unlock(&bump_lock);
+}
+
+int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot)
+{
+    uint64_t lo = gaddr & ~(OCERZ_HOST_PAGE - 1);
+    uint64_t hi = round_up(gaddr + len);
+    pthread_mutex_lock(&bump_lock);
+    if (lo < bump_next || hi + OCERZ_HOST_PAGE > ocerz_arena_hi) {
+        pthread_mutex_unlock(&bump_lock);
+        return OCERZ_ENOMEM;
+    }
+    bump_next = hi + OCERZ_HOST_PAGE;
+    pthread_mutex_unlock(&bump_lock);
+    return ocerz_map_fixed(lo, hi - lo, prot);
 }
 
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
