@@ -73,6 +73,19 @@
  * the headerInfoRW entry's bit0 (objc itself marks images loaded there during
  * map_images), and a tiny guest scratch holds the stop flag.
  *
+ * Preoptimized class count (slot 0x308 = _dyld_objc_class_count). libobjc sizes
+ * the safety bound of its subclass-tree integrity walk
+ * (foreach_realized_class_and_subclass) as
+ * ((_dyld_objc_class_count() + realizedClassCount) << 4) | 0xf. Returning 0
+ * here collapses the bound to 0xf=15, so a legitimate Swift-overlay class
+ * subtree (e.g. __SwiftNativeNSArrayBase, dragged in by libswiftCore's
+ * array-bridge lazy init under localizedCaseInsensitiveCompare:) with more than
+ * 15 nodes exhausts the budget and objc false-fatals "Memory corruption in
+ * class list." The class data is correct (objc realizes it normally); only the
+ * bound is wrong. Ocerz answers with the cache's preoptimized class count = the
+ * ClassHashTable `occupied` field at g_clsopt+8 (186065 on this cache), matching
+ * real dyld, so the bound is ~2.97M and the walk completes.
+ *
  * C++ exception unwinding (slot 0x170 = _dyld_find_unwind_sections(addr,
  * dyld_unwind_sections* out)). libunwind/libc++abi call this once per frame to
  * locate that frame's image and its compact-unwind (__TEXT,__unwind_info) and
@@ -812,6 +825,13 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
             addr = find_section_sz(mh, kindsect[kind], &size);
         cpu->gpr[OCERZ_RDX] = size;
         api_return(cpu, addr);
+        return OCERZ_STEP_OK;
+    }
+    case 0x308: {
+        uint32_t occupied = 0;
+        if (g_clsopt)
+            memcpy(&occupied, (const void *)(uintptr_t)(g_clsopt + 8), 4);
+        api_return(cpu, occupied);
         return OCERZ_STEP_OK;
     }
     case 0x3a8:
