@@ -315,6 +315,29 @@ static void test_bits(OcerzVM *vm)
     check(ocerz_interp_ext(vm, c, &btneg) == OCERZ_STEP_OK);
     check((c->rflags & OCERZ_CF) != 0);
 
+    ocerz_st(base + 48, 4, 0x50000000u);
+    setup(vm);
+    X86Insn btgi = mk(OCERZ_OP_BT, 4);
+    btgi.nops = 2;
+    btgi.ops[0] = mem_abs(base + 48, 4);
+    btgi.ops[1] = imm_op(0x1c, 1);
+    check(ocerz_interp_ext(vm, c, &btgi) == OCERZ_STEP_OK);
+    check((c->rflags & OCERZ_CF) != 0);
+
+    setup(vm);
+    btgi.ops[1] = imm_op(0x18, 1);
+    check(ocerz_interp_ext(vm, c, &btgi) == OCERZ_STEP_OK);
+    check((c->rflags & OCERZ_CF) == 0);
+
+    setup(vm);
+    X86Insn btri = mk(OCERZ_OP_BTR, 4);
+    btri.nops = 2;
+    btri.ops[0] = mem_abs(base + 48, 4);
+    btri.ops[1] = imm_op(0x1e, 1);
+    check(ocerz_interp_ext(vm, c, &btri) == OCERZ_STEP_OK);
+    check((c->rflags & OCERZ_CF) != 0);
+    check(ocerz_ld(base + 48, 4) == 0x10000000u);
+
     setup(vm);
     c->gpr[OCERZ_RAX] = 0x100;
     X86Insn btc = mk(OCERZ_OP_BTC, 8);

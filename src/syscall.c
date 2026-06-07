@@ -69,15 +69,20 @@
  *    _dispatch_worker_thread2 drains the correct root-queue bucket. A file-
  *    static running-worker count stops REQTHREADS spawning a fresh host thread
  *    per request when one already services the pool; THREAD_RETURN terminates
- *    the worker and its host-thread exit decrements the count. This whole
- *    REQTHREADS-spawns-real-workers path is gated behind OCERZ_WORKQ: enabled,
- *    gcd-async drains and PROBE-OKs, but enabling it for every program also
- *    drains Foundation/XPC init-time work whose blocks (NSMallocBlock copies of
- *    XPC queue-assertion sentinels) fault on the worker threads and corrupt
- *    shared libdispatch state, regressing programs whose later main-thread
- *    initializers trip over it (process-info, unicode-icu). Default builds keep
- *    the historical stub (REQTHREADS returns 0) so the regression suite stays
- *    green. fork/exec/posix_spawn remain STEP_FATAL.
+ *    the worker and its host-thread exit decrements the count (the real kernel
+ *    parks and reuses the thread; fresh-per-request is equivalent for
+ *    dispatch_async). The workqueue is ON by default — the two failures that
+ *    once forced a gate are fixed: the immediate-form BT bug that made
+ *    _Block_copy heap-copy libdispatch's global sentinel destructor blocks
+ *    (interp_ext.c), and the thread identity below. Every spawned guest thread
+ *    (bsdthread_create and wqthread alike) receives the REAL host thread's mach
+ *    port as its kport, set by the worker entry on its own thread: libpthread
+ *    stores that port in TSD, libdispatch publishes it as the unfair-lock owner
+ *    in __ulock_wait lock words, and the host kernel — which arbitrates those
+ *    waits for us — must be able to resolve the owner to a live thread, or it
+ *    reports the "Owner in ulock is unknown" client crash. A minted receive
+ *    right names no thread; mach_thread_self of the worker does.
+ *    fork/exec/posix_spawn remain STEP_FATAL.
  *  - mach_vm_*: arena allocator, ANYWHERE semantics, KERN_SUCCESS/3.
  * thread_fast_set_cthread_self returns 0x60 (the historical %gs selector);
  * the exact value the guest expects is uncertain but unused, documented here.
@@ -359,7 +364,11 @@ static int ocerz_next_cpu_number(void)
 static void *ocerz_worker_entry(void *p)
 {
     struct ocerz_worker *w = (struct ocerz_worker *)p;
+    mach_port_t kp = mach_thread_self();
+    w->cpu.gpr[OCERZ_RSI] = kp;
+    ocerz_st(w->cpu.gpr[OCERZ_RDI] + 0xf8, 4, (uint64_t)(uint32_t)kp);
     ocerz_vm_run_cpu(w->vm, &w->cpu);
+    mach_port_deallocate(mach_task_self(), kp);
     __atomic_fetch_sub(&g_wq_running, 1, __ATOMIC_SEQ_CST);
     free(w);
     return NULL;
@@ -391,10 +400,6 @@ static int ocerz_spawn_worker(OcerzVM *vm, const OcerzCPU *tmpl)
 
 static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    if (!getenv("OCERZ_WORKQ")) {
-        ret_ok(cpu, 0);
-        return OCERZ_STEP_OK;
-    }
     uint64_t op = a[0];
     if (op == 0x4) {
         cpu->terminated = 1;
@@ -417,11 +422,8 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 break;
             __atomic_fetch_add(&g_wq_running, 1, __ATOMIC_SEQ_CST);
             uint64_t pth = region + 0x1f0000;
-            mach_port_t port = MACH_PORT_NULL;
-            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
             ocerz_st(pth, 8, pth ^ cookie);
             ocerz_st(pth + 0xe0, 8, pth);
-            ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)port);
             OcerzCPU t = *cpu;
             t.terminated = 0;
             t.cpu_number = ocerz_next_cpu_number();
@@ -434,7 +436,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 qos_idx = 6;
             t.gpr[OCERZ_RSP] = pth;
             t.gpr[OCERZ_RDI] = pth;
-            t.gpr[OCERZ_RSI] = port;
+            t.gpr[OCERZ_RSI] = 0;
             t.gpr[OCERZ_RDX] = pth;
             t.gpr[OCERZ_RCX] = 0;
             t.gpr[OCERZ_R8] = 0x40000ull | 0x200000ull | 0x4000ull | (uint64_t)qos_idx;
@@ -468,17 +470,14 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     w->cpu.cpu_number = ocerz_next_cpu_number();
     w->cpu.rip = OCERZ_THREAD_START;
     w->cpu.gpr[OCERZ_RSP] = stack;
-    mach_port_t port = MACH_PORT_NULL;
-    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
     w->cpu.gpr[OCERZ_RDI] = pth;
-    w->cpu.gpr[OCERZ_RSI] = port;
+    w->cpu.gpr[OCERZ_RSI] = 0;
     w->cpu.gpr[OCERZ_RDX] = func;
     w->cpu.gpr[OCERZ_RCX] = funarg;
     w->cpu.gpr[OCERZ_R8] = stack;
     w->cpu.gpr[OCERZ_R9] = flags | 0x10000000ull;
     w->cpu.gs_base = pth + 0xe0;
     ocerz_st(pth + 0xe0, 8, pth);
-    ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)port);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
