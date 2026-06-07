@@ -13,15 +13,33 @@
  *     real segment (the fileoff==0 __TEXT) lands at LOAD_BASE. Map every
  *     LC_SEGMENT_64 (skipping __PAGEZERO) at vmaddr+slide, pread its file
  *     bytes, and apply its protections (guest exec dropped to read).
- *  3. Apply LC_DYLD_CHAINED_FIXUPS. The fixups metadata (header, starts,
- *     imports, symbol strings) is read straight from the file image; the
- *     chains themselves are walked in the now-mapped segments. For the
- *     DYLD_CHAINED_PTR_64 / _64_OFFSET formats each chain slot is either a
- *     rebase (an internal pointer: load_base + target for _OFFSET, or
- *     vmaddr + slide for the plain _64 form, OR'd with any high8 byte) or a
- *     bind (an import: the 24-bit ordinal selects an entry in the imports
- *     table whose symbol name is resolved with ocerz_cache_resolve and stored
- *     with its addend). The 12-bit next field strides the chain by 4 bytes.
+ *  3. Apply fixups. Modern binaries carry LC_DYLD_CHAINED_FIXUPS: the fixups
+ *     metadata (header, starts, imports, symbol strings) is read straight from
+ *     the file image and the chains themselves are walked in the now-mapped
+ *     segments. For the DYLD_CHAINED_PTR_64 / _64_OFFSET formats each chain slot
+ *     is either a rebase (an internal pointer: load_base + target for _OFFSET,
+ *     or vmaddr + slide for the plain _64 form, OR'd with any high8 byte) or a
+ *     bind (an import: the 24-bit ordinal selects an entry in the imports table
+ *     whose symbol name is resolved with ocerz_cache_resolve and stored with its
+ *     addend). The 12-bit next field strides the chain by 4 bytes.
+ *
+ *     Classic binaries (the BSD coreutils — /bin/ls, /bin/cp, /usr/bin/du, ...)
+ *     instead carry LC_DYLD_INFO[_ONLY] opcode streams and __la_symbol_ptr lazy
+ *     stubs, NO chained fixups. apply_classic_fixups interprets those streams
+ *     exactly as dyld would: classic_rebase walks the REBASE opcodes and adds
+ *     the slide to every internal pointer (SET_SEGMENT_AND_OFFSET resolves a
+ *     segment index to seg_vmaddr[index]+slide); classic_bind_stream walks the
+ *     BIND opcodes (SET_DYLIB_ORDINAL / SET_SYMBOL_TRAILING_FLAGS giving the
+ *     name and weak bit / SET_ADDEND_SLEB / SET_SEGMENT_AND_OFFSET / ADD_ADDR /
+ *     DO_BIND[_ADD_ADDR/_IMM_SCALED/_ULEB_TIMES_SKIPPING]) resolving each symbol
+ *     through ocerz_cache_resolve and storing value+addend. The lazy_bind stream
+ *     is bound EAGERLY at load (faithful: lazy binding is deferred eager binding,
+ *     and dyld itself binds eagerly under bind-at-launch). Eagerly binding the
+ *     lazy stream overwrites each __la_symbol_ptr slot — which on disk holds a
+ *     preferred-base (unslid) pointer into __stub_helper — with the real symbol
+ *     address, so the first `jmp *la_symbol_ptr[n]` lands on the resolved target
+ *     instead of an unmapped unslid address, and no dyld_stub_binder dance is
+ *     needed. Without this the BSD coreutils SIGSEGV on their first lazy call.
  *  4. Build the entry frame: a guest stack with argc/argv/envp/apple and the
  *     C string data, plus a tiny raw-_exit trampoline used as main's return
  *     address on the freestanding path.
@@ -164,6 +182,8 @@ int ocerz_peek_dynamic(const char *path)
     return dynamic;
 }
 
+#define DYN_SEG_MAX 16
+
 typedef struct DynImage {
     const uint8_t *slice;
     uint64_t slide;
@@ -171,6 +191,17 @@ typedef struct DynImage {
     uint64_t main_entry;
     uint32_t cf_off;
     uint32_t cf_size;
+    uint32_t rebase_off;
+    uint32_t rebase_size;
+    uint32_t bind_off;
+    uint32_t bind_size;
+    uint32_t weak_bind_off;
+    uint32_t weak_bind_size;
+    uint32_t lazy_bind_off;
+    uint32_t lazy_bind_size;
+    int has_dyld_info;
+    uint64_t seg_vmaddr[DYN_SEG_MAX];
+    int seg_count;
     int is_pie;
     int links_dylib;
 } DynImage;
@@ -228,6 +259,9 @@ static int map_segments(DynImage *img)
             uint64_t fileoff = rd64(lc + 40);
             uint64_t filesize = rd64(lc + 48);
             uint32_t initprot = rd32(lc + 56);
+            if (img->seg_count < DYN_SEG_MAX)
+                img->seg_vmaddr[img->seg_count] = vmaddr;
+            img->seg_count++;
             if (!(vmaddr == 0 && initprot == 0) && filesize)
                 memcpy(ocerz_g2h(vmaddr + img->slide), img->slice + fileoff, (size_t)filesize);
         } else if (cmd == 0x80000028) {
@@ -235,6 +269,16 @@ static int map_segments(DynImage *img)
         } else if (cmd == 0x80000034) {
             img->cf_off = rd32(lc + 8);
             img->cf_size = rd32(lc + 12);
+        } else if (cmd == 0x22 || cmd == 0x80000022) {
+            img->has_dyld_info = 1;
+            img->rebase_off = rd32(lc + 8);
+            img->rebase_size = rd32(lc + 12);
+            img->bind_off = rd32(lc + 0x10);
+            img->bind_size = rd32(lc + 0x14);
+            img->weak_bind_off = rd32(lc + 0x18);
+            img->weak_bind_size = rd32(lc + 0x1c);
+            img->lazy_bind_off = rd32(lc + 0x20);
+            img->lazy_bind_size = rd32(lc + 0x24);
         } else if (cmd == 0x0c || cmd == 0x8000001f || cmd == 0x80000018) {
             img->links_dylib = 1;
         }
@@ -388,6 +432,201 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
             }
         }
     }
+    return OCERZ_OK;
+}
+
+static int64_t self_sleb(const uint8_t **pp, const uint8_t *end)
+{
+    int64_t r = 0;
+    int sh = 0;
+    uint8_t b = 0;
+    while (*pp < end) {
+        b = *(*pp)++;
+        r |= (int64_t)(b & 0x7f) << sh;
+        sh += 7;
+        if (!(b & 0x80))
+            break;
+    }
+    if (sh < 64 && (b & 0x40))
+        r |= -(int64_t)1 << sh;
+    return r;
+}
+
+static uint64_t classic_resolve(DynImage *img, OcerzCache *cache, const char *name,
+                                int libord, int weak)
+{
+    uint64_t value = ocerz_cache_resolve(cache, name);
+    if (value == 0 && (libord == -2 || libord == 0))
+        value = ocerz_image_self_resolve(img, name);
+    if (value == 0 && !weak)
+        OCERZ_FATAL("unresolved import: %s\n", name);
+    return value;
+}
+
+static void classic_rebase(DynImage *img)
+{
+    if (img->rebase_size == 0)
+        return;
+    const uint8_t *p = img->slice + img->rebase_off;
+    const uint8_t *end = p + img->rebase_size;
+    uint64_t addr = 0;
+    int done = 0;
+    while (p < end && !done) {
+        uint8_t op = *p & 0xf0;
+        uint8_t imm = *p & 0x0f;
+        p++;
+        switch (op) {
+        case 0x00:
+            done = 1;
+            break;
+        case 0x10:
+            break;
+        case 0x20: {
+            uint64_t off = self_uleb(&p, end);
+            if (imm < (uint8_t)img->seg_count)
+                addr = img->seg_vmaddr[imm] + img->slide + off;
+            break;
+        }
+        case 0x30:
+            addr += self_uleb(&p, end);
+            break;
+        case 0x40:
+            addr += (uint64_t)imm * 8;
+            break;
+        case 0x50:
+            for (uint8_t i = 0; i < imm; i++) {
+                ocerz_st(addr, 8, ocerz_ld(addr, 8) + img->slide);
+                addr += 8;
+            }
+            break;
+        case 0x60: {
+            uint64_t cnt = self_uleb(&p, end);
+            for (uint64_t i = 0; i < cnt; i++) {
+                ocerz_st(addr, 8, ocerz_ld(addr, 8) + img->slide);
+                addr += 8;
+            }
+            break;
+        }
+        case 0x70:
+            ocerz_st(addr, 8, ocerz_ld(addr, 8) + img->slide);
+            addr += 8 + self_uleb(&p, end);
+            break;
+        case 0x80: {
+            uint64_t cnt = self_uleb(&p, end);
+            uint64_t skip = self_uleb(&p, end);
+            for (uint64_t i = 0; i < cnt; i++) {
+                ocerz_st(addr, 8, ocerz_ld(addr, 8) + img->slide);
+                addr += 8 + skip;
+            }
+            break;
+        }
+        default:
+            done = 1;
+            break;
+        }
+    }
+}
+
+static void classic_bind_stream(DynImage *img, OcerzCache *cache,
+                                const uint8_t *p, const uint8_t *end, int is_lazy)
+{
+    uint64_t addr = 0;
+    const char *name = "";
+    int64_t addend = 0;
+    int libord = 0;
+    int weak = 0;
+    int done = 0;
+    while (p < end && !done) {
+        uint8_t op = *p & 0xf0;
+        uint8_t imm = *p & 0x0f;
+        p++;
+        switch (op) {
+        case 0x00:
+            if (is_lazy) {
+                addr = 0;
+                addend = 0;
+                weak = 0;
+            } else {
+                done = 1;
+            }
+            break;
+        case 0x10:
+            libord = imm;
+            break;
+        case 0x20:
+            libord = (int)self_uleb(&p, end);
+            break;
+        case 0x30:
+            libord = imm ? (int)(int8_t)(0xf0 | imm) : 0;
+            break;
+        case 0x40:
+            weak = (imm & 0x1) != 0;
+            name = (const char *)p;
+            p += strlen((const char *)p) + 1;
+            break;
+        case 0x50:
+            break;
+        case 0x60:
+            addend = self_sleb(&p, end);
+            break;
+        case 0x70: {
+            uint64_t off = self_uleb(&p, end);
+            if (imm < (uint8_t)img->seg_count)
+                addr = img->seg_vmaddr[imm] + img->slide + off;
+            break;
+        }
+        case 0x80:
+            addr += self_uleb(&p, end);
+            break;
+        case 0x90: {
+            uint64_t v = classic_resolve(img, cache, name, libord, weak);
+            ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
+            addr += 8;
+            break;
+        }
+        case 0xa0: {
+            uint64_t v = classic_resolve(img, cache, name, libord, weak);
+            ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
+            addr += 8 + self_uleb(&p, end);
+            break;
+        }
+        case 0xb0: {
+            uint64_t v = classic_resolve(img, cache, name, libord, weak);
+            ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
+            addr += 8 + (uint64_t)imm * 8;
+            break;
+        }
+        case 0xc0: {
+            uint64_t cnt = self_uleb(&p, end);
+            uint64_t skip = self_uleb(&p, end);
+            for (uint64_t i = 0; i < cnt; i++) {
+                uint64_t v = classic_resolve(img, cache, name, libord, weak);
+                ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
+                addr += 8 + skip;
+            }
+            break;
+        }
+        default:
+            done = 1;
+            break;
+        }
+    }
+}
+
+static int apply_classic_fixups(DynImage *img, OcerzCache *cache)
+{
+    if (!img->has_dyld_info)
+        return OCERZ_OK;
+    classic_rebase(img);
+    if (img->bind_size)
+        classic_bind_stream(img, cache, img->slice + img->bind_off,
+                            img->slice + img->bind_off + img->bind_size, 0);
+    if (img->weak_bind_size)
+        classic_bind_stream(img, cache, img->slice + img->weak_bind_off,
+                            img->slice + img->weak_bind_off + img->weak_bind_size, 0);
+    if (img->lazy_bind_size)
+        classic_bind_stream(img, cache, img->slice + img->lazy_bind_off,
+                            img->slice + img->lazy_bind_off + img->lazy_bind_size, 1);
     return OCERZ_OK;
 }
 
@@ -842,6 +1081,13 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     if (r != OCERZ_OK) {
         free(buf);
         return r;
+    }
+    if (img.cf_off == 0) {
+        r = apply_classic_fixups(&img, &cache);
+        if (r != OCERZ_OK) {
+            free(buf);
+            return r;
+        }
     }
 
     DynFrame fr;

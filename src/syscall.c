@@ -96,7 +96,15 @@
  *    takes the JIT and bump-allocator mutexes across the fork so the child
  *    never inherits a lock owned by a thread it does not have; the host libc
  *    fork runs Apple's own malloc atfork machinery for the same reason.
- *    execve remains STEP_FATAL.
+ *    execve(59) replaces the process image the kernel way: it host-execve's this
+ *    ocerz binary onto the guest target (self + "-path" + guest_path + guest argv),
+ *    so the re-entered emulator loads the new image in a fresh address space while
+ *    the caller's pid, fds (with their real FD_CLOEXEC bits, since guest fds are
+ *    host fds) and parent linkage are preserved exactly as exec requires. The
+ *    guest path (a[0]) drives loading and the guest argv (a[1], whose argv[0] may
+ *    differ from the path) is forwarded verbatim; a leading "#!" line is parsed
+ *    and the interpreter re-exec'd with the script appended, mirroring XNU's
+ *    script-exec. On any failure execve returns the host errno to the guest.
  *  - mach_vm_*: arena allocator. ANYWHERE requests bump-allocate; FIXED
  *    requests (flags bit0 clear) honor the kernel contract — memory at
  *    exactly the caller's address via ocerz_map_claim_fixed, or an honest
@@ -123,6 +131,7 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -511,6 +520,88 @@ static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+static int shebang_split(const char *path, char *line, size_t cap,
+                         const char **interp, const char **arg)
+{
+    *interp = NULL;
+    *arg = NULL;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    ssize_t n = read(fd, line, cap - 1);
+    close(fd);
+    if (n < 2 || line[0] != '#' || line[1] != '!')
+        return 0;
+    line[n] = '\0';
+    char *nl = strchr(line, '\n');
+    if (nl)
+        *nl = '\0';
+    char *p = line + 2;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (!*p)
+        return 0;
+    *interp = p;
+    while (*p && *p != ' ' && *p != '\t')
+        p++;
+    if (*p) {
+        *p++ = '\0';
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p)
+            *arg = p;
+    }
+    return 1;
+}
+
+static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    const char *self = ocerz_self_path();
+    if (!self || !a[0] || !a[1]) {
+        ret_err(cpu, EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    const char *gpath = (const char *)ocerz_g2h(a[0]);
+
+    char *hargv[260];
+    int n = 0;
+    hargv[n++] = (char *)(uintptr_t)self;
+    hargv[n++] = (char *)"-path";
+
+    static char shline[1024];
+    const char *interp = NULL, *iarg = NULL;
+    if (shebang_split(gpath, shline, sizeof shline, &interp, &iarg)) {
+        hargv[n++] = (char *)interp;
+        hargv[n++] = (char *)interp;
+        if (iarg)
+            hargv[n++] = (char *)iarg;
+        hargv[n++] = (char *)gpath;
+        uint64_t gv;
+        for (uint64_t p = a[1] + 8; n < 258 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
+            hargv[n++] = (char *)ocerz_g2h(gv);
+    } else {
+        hargv[n++] = (char *)gpath;
+        uint64_t gv;
+        for (uint64_t p = a[1]; n < 258 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
+            hargv[n++] = (char *)ocerz_g2h(gv);
+    }
+    hargv[n] = NULL;
+
+    char *henv[514];
+    int m = 0;
+    if (a[2]) {
+        uint64_t gv;
+        for (uint64_t p = a[2]; m < 512 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
+            henv[m++] = (char *)ocerz_g2h(gv);
+    }
+    henv[m] = NULL;
+
+    execve(self, hargv, a[2] ? henv : NULL);
+    ret_err(cpu, (uint64_t)errno);
+    return OCERZ_STEP_OK;
+}
+
 #define OCERZ_START_WQTHREAD 0x7ff802e6f80cull
 #define OCERZ_PTHREAD_COOKIE 0x7ff8436bd750ull
 
@@ -785,17 +876,24 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [46]  = { "sigaction",   3, 0x06, 0, sys_sigaction },
     [47]  = { "getgid",      0, 0x00, 0, NULL },
     [48]  = { "sigprocmask", 3, 0x06, 0, sys_sigprocmask },
+    [49]  = { "getlogin",    2, 0x01, 0, NULL },
+    [50]  = { "setlogin",    1, 0x01, 0, NULL },
     [52]  = { "sigpending",  1, 0x01, 0, sys_sigpending },
     [53]  = { "sigaltstack", 2, 0x03, 0, sys_sigaltstack },
     [54]  = { "ioctl",       3, 0x04, 0, sys_ioctl },
     [57]  = { "symlink",     2, 0x03, 0, NULL },
     [58]  = { "readlink",    3, 0x03, 0, NULL },
-    [59]  = { "execve",      3, 0x00, 0, sys_unsupported },
+    [59]  = { "execve",      3, 0x00, 0, sys_execve },
     [60]  = { "umask",       1, 0x00, 0, NULL },
     [65]  = { "msync",       3, 0x01, 0, NULL },
     [73]  = { "munmap",      2, 0x00, 0, sys_munmap },
     [74]  = { "mprotect",    3, 0x00, 0, sys_mprotect },
     [75]  = { "madvise",     3, 0x00, 0, sys_madvise },
+    [79]  = { "getgroups",   2, 0x02, 0, NULL },
+    [80]  = { "setgroups",   2, 0x02, 0, NULL },
+    [81]  = { "getpgrp",     0, 0x00, 0, NULL },
+    [82]  = { "setpgid",     2, 0x00, 0, NULL },
+    [89]  = { "getdtablesize", 0, 0x00, 0, NULL },
     [90]  = { "dup2",        2, 0x00, 0, NULL },
     [92]  = { "fcntl",       3, 0x00, 0, sys_fcntl },
     [93]  = { "select",      5, 0x1e, 0, NULL },
@@ -812,7 +910,10 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [118] = { "getsockopt",  5, 0x18, 0, NULL },
     [120] = { "readv",       3, 0x00, 0, sys_readv },
     [121] = { "writev",      3, 0x00, 0, sys_writev },
+    [123] = { "fchown",      3, 0x00, 0, NULL },
+    [124] = { "fchmod",      2, 0x00, 0, NULL },
     [128] = { "rename",      2, 0x03, 0, NULL },
+    [139] = { "futimes",     2, 0x02, 0, NULL },
     [133] = { "sendto",      6, 0x12, 0, NULL },
     [134] = { "shutdown",    2, 0x00, 0, NULL },
     [135] = { "socketpair",  4, 0x08, 0, NULL },
@@ -826,6 +927,8 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [154] = { "pwrite",      4, 0x02, 0, NULL },
     [169] = { "csops",       4, 0x04, 0, NULL },
     [170] = { "csops_audittoken", 5, 0x14, 0, NULL },
+    [191] = { "pathconf",    2, 0x01, 0, NULL },
+    [192] = { "fpathconf",   2, 0x00, 0, NULL },
     [194] = { "getrlimit",   2, 0x02, 0, NULL },
     [195] = { "setrlimit",   2, 0x02, 0, NULL },
     [197] = { "mmap",        6, 0x00, 0, sys_mmap },
@@ -836,6 +939,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [216] = { "open_dprotected_np", 5, 0x01, 0, NULL },
     [220] = { "getattrlist", 5, 0x07, 0, NULL },
     [228] = { "fgetattrlist", 5, 0x06, 0, NULL },
+    [229] = { "fsetattrlist", 5, 0x06, 0, NULL },
     [234] = { "getxattr",    6, 0x07, 0, NULL },
     [235] = { "fgetxattr",   6, 0x06, 0, NULL },
     [236] = { "setxattr",    6, 0x07, 0, NULL },
@@ -856,7 +960,9 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [274] = { "sysctlbyname",6, 0x1d, 0, NULL },
     [381] = { "__mac_syscall", 3, 0x05, 0, NULL },
     [483] = { "csrctl", 3, 0x02, 0, NULL },
+    [524] = { "setattrlistat", 6, 0x0e, 0, NULL },
     [521] = { "abort_with_payload", 6, 0x04, 0, sys_abort_payload },
+    [283] = { "fchmod_extended", 5, 0x10, 0, NULL },
     [286] = { "gettid",      2, 0x03, 0, NULL },
     [294] = { "shared_region_check_np", 1, 0x01, 0, sys_shared_region_check_np },
     [327] = { "issetugid",   0, 0x00, 0, NULL },
@@ -864,6 +970,9 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [338] = { "stat64",      2, 0x03, 0, NULL },
     [339] = { "fstat64",     2, 0x02, 0, NULL },
     [340] = { "lstat64",     2, 0x03, 0, NULL },
+    [341] = { "stat64_extended",  4, 0x0f, 0, NULL },
+    [342] = { "lstat64_extended", 4, 0x0f, 0, NULL },
+    [343] = { "fstat64_extended", 4, 0x0e, 0, NULL },
     [344] = { "getdirentries64", 4, 0x0a, 0, NULL },
     [345] = { "statfs64",    2, 0x03, 0, NULL },
     [346] = { "fstatfs64",   2, 0x02, 0, NULL },
@@ -902,7 +1011,9 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [417] = { "poll_nocancel", 3, 0x02, 0, NULL },
     [420] = { "sem_wait_nocancel", 1, 0x00, 0, sys_workq_stub },
     [423] = { "__semwait_signal_nocancel", 6, 0x00, 0, sys_workq_stub },
+    [461] = { "getattrlistbulk", 5, 0x06, 0, NULL },
     [463] = { "openat",      4, 0x02, 0, NULL },
+    [464] = { "openat_nocancel", 4, 0x02, 0, NULL },
     [470] = { "fstatat64",   4, 0x06, 0, NULL },
     [472] = { "unlinkat",    3, 0x02, 0, NULL },
     [473] = { "readlinkat",  4, 0x06, 0, NULL },
