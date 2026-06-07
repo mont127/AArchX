@@ -3,7 +3,7 @@
 > [!WARNING]
 > This project is experimental and was vibecoded. Use at your own risk.
 
-**A from-scratch x86_64 → arm64 userspace binary translator for macOS — zero Rosetta involvement.**
+**A from-scratch x86_64 → arm64 userspace binary translator for macOS - zero Rosetta involvement.**
 
 Ocerz loads static `LC_UNIXTHREAD` x86_64 Mach-O binaries and runs them directly on Apple Silicon. It does its own loading, decoding, flag emulation, JIT translation, and syscall forwarding to the native arm64 kernel. Rosetta 2 is never invoked.
 
