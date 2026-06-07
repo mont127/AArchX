@@ -29,6 +29,21 @@
  * The platform is reported as PLATFORM_MACOS (1). Image/dlopen/TLV services
  * are added here as programs reach them.
  *
+ * dlopen/dlsym/dlclose/dlerror (slots 0x68/0x80/0x70/0x78). The libdyld dl*
+ * wrappers tail-call these vtable slots after shuffling args down by one, so the
+ * handlers see dlopen(path=rsi, mode=rdx), dlsym(handle=rsi, symbol=rdx),
+ * dlclose(handle=rsi), dlerror() respectively. They marshal the guest pointers
+ * through ocerz_g2h and call the loader seam in dyld.c (ocerz_dlopen / ocerz_
+ * dlsym / ocerz_dlclose / ocerz_dlerror), which owns the disk-image registry and
+ * fixup engines. dlopen runs AFTER main on the guest's live stack, and loading a
+ * new image runs its initializers via a nested ocerz_vm_call (on a fresh scratch
+ * stack chosen inside dyld.c) — that call clobbers the whole guest CPU, so the
+ * dlopen handler snapshots *cpu before the seam call and restores it afterwards,
+ * then api_returns the handle to the original caller. dlclose returns 0 without
+ * unmapping (disk images and their export-trie buffers stay alive). dlerror
+ * returns the guest pointer to the last error string or 0 (perl's XSLoader
+ * tolerates 0, falling back to its own "Unknown dlopen error").
+ *
  * The objc<->dyld handshake. libobjc's _objc_init registers callbacks through
  * slot 0x358 (_dyld_objc_register_callbacks) passing a version-4 struct
  * {version@0, mapped@8, init@0x10, unmapped@0x18, patches@0x20}. Real dyld
@@ -112,6 +127,7 @@
 #include "ocerz/mem.h"
 #include "ocerz/cache.h"
 #include "ocerz/interp.h"
+#include "ocerz/dyld.h"
 
 #include <sys/mman.h>
 #include <string.h>
@@ -739,6 +755,33 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         return OCERZ_STEP_OK;
     case 0x210:
         api_return(cpu, 1);
+        return OCERZ_STEP_OK;
+    case 0x68: {
+        uint64_t pathg = cpu->gpr[OCERZ_RSI];
+        uint64_t mode = cpu->gpr[OCERZ_RDX];
+        const char *host = pathg ? (const char *)ocerz_g2h(pathg) : NULL;
+        OcerzCPU saved = *cpu;
+        uint64_t h = ocerz_dlopen(vm, host, (int)mode);
+        *cpu = saved;
+        if (vm->exited)
+            return OCERZ_STEP_OK;
+        api_return(cpu, h);
+        return OCERZ_STEP_OK;
+    }
+    case 0x80: {
+        uint64_t handle = cpu->gpr[OCERZ_RSI];
+        uint64_t symg = cpu->gpr[OCERZ_RDX];
+        uint64_t addr = 0;
+        if (symg)
+            addr = ocerz_dlsym(handle, (const char *)ocerz_g2h(symg));
+        api_return(cpu, addr);
+        return OCERZ_STEP_OK;
+    }
+    case 0x70:
+        api_return(cpu, (uint64_t)ocerz_dlclose(cpu->gpr[OCERZ_RSI]));
+        return OCERZ_STEP_OK;
+    case 0x78:
+        api_return(cpu, ocerz_dlerror());
         return OCERZ_STEP_OK;
     case 0x10:
         api_return(cpu, (uint64_t)g_closure_n);
