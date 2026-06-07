@@ -20,7 +20,11 @@
  *
  * Options: -v bumps verbosity (repeatable; at -v -v every instruction is
  * traced), -trace forces instruction tracing, -strace logs guest syscalls,
- * -no-jit pins execution to the interpreter tier.
+ * -no-jit pins execution to the interpreter tier. -path FILE overrides the
+ * file loaded as the executable while the trailing `program` token is still
+ * used as guest argv[0]; this decouples the two the way a real execve(path,
+ * argv, envp) does (argv[0] may differ from path), and is how sys_execve
+ * re-enters ocerz onto a guest target that asked for a custom argv[0].
  */
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
@@ -32,7 +36,7 @@ extern char **environ;
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [--] program [args...]\n");
+    fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]\n");
 }
 
 int main(int argc, char **argv)
@@ -40,6 +44,7 @@ int main(int argc, char **argv)
     int trace = 0;
     int strace = 0;
     int nojit = 0;
+    const char *load_path = NULL;
     int i = 1;
     for (; i < argc; i++) {
         if (argv[i][0] != '-')
@@ -55,6 +60,8 @@ int main(int argc, char **argv)
             strace = 1;
         } else if (strcmp(argv[i], "-no-jit") == 0) {
             nojit = 1;
+        } else if (strcmp(argv[i], "-path") == 0 && i + 1 < argc) {
+            load_path = argv[++i];
         } else {
             usage();
             return 64;
@@ -64,6 +71,8 @@ int main(int argc, char **argv)
         usage();
         return 64;
     }
+    if (!load_path)
+        load_path = argv[i];
 
     if (ocerz_verbose >= 2)
         trace = 1;
@@ -74,19 +83,19 @@ int main(int argc, char **argv)
     vm.strace = strace;
     vm.jit_enabled = !nojit;
 
-    int dynamic = ocerz_peek_dynamic(argv[i]);
+    int dynamic = ocerz_peek_dynamic(load_path);
     if (dynamic < 0) {
-        OCERZ_FATAL("cannot read %s\n", argv[i]);
+        OCERZ_FATAL("cannot read %s\n", load_path);
         return 65;
     }
     if (dynamic)
-        return ocerz_dyld_run(&vm, argv[i], argc - i, argv + i, environ);
+        return ocerz_dyld_run(&vm, load_path, argc - i, argv + i, environ);
 
     if (ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK)
         return 70;
 
-    if (ocerz_load_image(argv[i], &vm.image) != OCERZ_OK) {
-        OCERZ_FATAL("cannot load %s\n", argv[i]);
+    if (ocerz_load_image(load_path, &vm.image) != OCERZ_OK) {
+        OCERZ_FATAL("cannot load %s\n", load_path);
         return 65;
     }
 

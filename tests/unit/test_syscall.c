@@ -21,9 +21,11 @@
  * Coverage: pipe (dual return), write/read round-trip through the pipe,
  * open/fstat64/close on /dev/null, anonymous mmap + g2h read/write + munmap,
  * MAP_FIXED at a chosen arena address, gettimeofday plausibility, getpid
- * matching the host, exit setting vm->exited/exit_code, an unknown BSD number
- * returning STEP_FATAL, machdep gs_base, and a Mach task_self_trap matching
- * mach_task_self(). Assertions count well past the required thirty.
+ * matching the host, exit setting vm->exited/exit_code, execve with a NULL
+ * path returning the kernel's EINVAL (CF set, rax=22) now that execve is a real
+ * handler rather than a fatal stub, an unknown BSD number returning STEP_FATAL,
+ * machdep gs_base, and a Mach task_self_trap matching mach_task_self().
+ * Assertions count well past the required thirty.
  *
  * A scratch guest region is carved once with ocerz_map_anywhere and reused as
  * register-spill stack and I/O buffer space; gpr[RSP] is parked there so any
@@ -409,12 +411,14 @@ static void test_sigaction(void)
     CHECK(ocerz_ld(goact + 8, 8) == 0);
 }
 
-static void test_unsupported_execve(void)
+static void test_execve_bad_args(void)
 {
     OcerzCPU *cpu = &vm.cpu;
     set_args(cpu, bsd(59), 0, 0, 0, 0, 0, 0);
     int r = ocerz_handle_syscall(&vm, cpu);
-    CHECK(r == OCERZ_STEP_FATAL);
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 1);
+    CHECK(cpu->gpr[OCERZ_RAX] == 22);
 }
 
 static void test_unknown_bsd(void)
@@ -480,7 +484,7 @@ int main(void)
     test_mach_vm_allocate();
     test_mach_timebase();
     test_mach_unknown();
-    test_unsupported_execve();
+    test_execve_bad_args();
     test_unknown_bsd();
     test_unknown_class();
     test_exit();
