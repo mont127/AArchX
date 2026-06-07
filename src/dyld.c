@@ -104,9 +104,33 @@
  * off the first fileoff==0 segment with non-zero filesize, which is the header-
  * bearing __TEXT for BOTH a cache image, the main exe (skipping __PAGEZERO) and
  * a disk dylib whose __TEXT sits at vmaddr 0. Honest edge: @rpath/@loader_path
- * install names are not expanded (perl uses absolute paths); the runtime
- * dlopen of a disk MH_BUNDLE (perl's XS .bundle modules) is not yet wired, so
- * `perl -e ...` runs but a script that loads XS modules does not.
+ * install names are not expanded (perl uses absolute paths).
+ *
+ * Runtime dlopen/dlsym. After main starts, a program (perl's XSLoader) calls
+ * dlopen()/dlsym() to bring up MH_BUNDLE plug-ins — perl's XS .bundle modules.
+ * Those land in the dyld-API shim's vtable slots (dyldapi.c +0x68 dlopen, +0x80
+ * dlsym, +0x70 dlclose, +0x78 dlerror), which marshal the System V args and
+ * call the loader seam exported here: ocerz_dlopen / ocerz_dlsym / ocerz_dlclose
+ * / ocerz_dlerror. ocerz_dlopen dedups the path against the cache and g_dimgs;
+ * an unloaded disk path is brought up by dlopen_load_image, the non-fatal twin
+ * of load_disk_dylib (read_file -> select_slice(x86_64) -> map_segments(is_main=
+ * 0) -> load_disk_deps -> apply_fixups||apply_classic_fixups -> ocerz_dyldapi_
+ * register_image), then its initializers (and any newly-loaded deps', deps-
+ * first) run INLINE on the live guest via run_init_phase — the guest is mid-
+ * execution, NOT in the pre-main init phase, so ocerz_dlopen runs the inits on
+ * their own scratch stack (a fresh ocerz_map_anywhere region) so perl's live
+ * frames are untouched, and the dispatch handler in dyldapi.c snapshots and
+ * restores the full guest CPU around the call. Failures are non-fatal: a
+ * missing/bad bundle records a dlerror string and returns a NULL handle, exactly
+ * as real dlopen does, so the guest (XSLoader) reports its own error instead of
+ * Ocerz dying. The handle IS the image's mach_header guest address (load_base);
+ * a re-dlopen of a loaded path returns the same handle. ocerz_dlsym prepends '_'
+ * to the caller's symbol (dlsym strips the underscore the Mach-O name carries),
+ * searches the handle image's export trie (ocerz_image_self_resolve) then its
+ * LC_SYMTAB nlist table (N_SECT|N_EXT defined symbols), and honors the special
+ * RTLD_DEFAULT/RTLD_SELF/RTLD_MAIN_ONLY/RTLD_NEXT handles with a flat search of
+ * every disk image plus the cache. perl's boot_<Module> XS entry is found in the
+ * bundle's export trie, so `use Fcntl` and shasum's Digest::SHA load run.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -241,6 +265,12 @@ typedef struct DynImage {
 #define DYN_DIMG_MAX 64
 static DynImage g_dimgs[DYN_DIMG_MAX];
 static int g_dimgs_n;
+
+static OcerzCache *g_run_cache;
+static struct OcerzVM *g_run_vm;
+static uint64_t g_run_init_args[5];
+static int g_run_init_ready;
+static uint64_t g_dlerror_g;
 
 static DynImage *dimg_find_by_path(const char *path)
 {
@@ -1217,6 +1247,211 @@ static void load_disk_deps(OcerzCache *cache, DynImage *loader)
     }
 }
 
+static void dlerror_set(const char *fmt, const char *arg)
+{
+    char host[1280];
+    snprintf(host, sizeof host, fmt, arg ? arg : "");
+    uint64_t need = (uint64_t)strlen(host) + 1;
+    if (g_dlerror_g == 0)
+        g_dlerror_g = ocerz_map_anywhere(2048, PROT_READ | PROT_WRITE);
+    if (g_dlerror_g) {
+        if (need > 2048)
+            need = 2048;
+        memcpy(ocerz_g2h(g_dlerror_g), host, (size_t)need);
+        ((char *)ocerz_g2h(g_dlerror_g))[need - 1] = '\0';
+    }
+}
+
+static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
+{
+    if (dep_find(cache, install_path) != 0)
+        return NULL;
+    DynImage *existing = dimg_find_by_path(install_path);
+    if (existing)
+        return existing;
+    if (g_dimgs_n >= DYN_DIMG_MAX) {
+        dlerror_set("dlopen(%s): image registry full", install_path);
+        return NULL;
+    }
+    size_t flen = 0;
+    uint8_t *buf = read_file(install_path, &flen);
+    if (!buf) {
+        dlerror_set("dlopen(%s): image not found", install_path);
+        return NULL;
+    }
+    const uint8_t *slice = select_slice(buf, flen);
+    if (!slice) {
+        dlerror_set("dlopen(%s): no compatible x86_64 slice", install_path);
+        free(buf);
+        return NULL;
+    }
+    DynImage *d = &g_dimgs[g_dimgs_n++];
+    memset(d, 0, sizeof *d);
+    d->slice = slice;
+    d->owned_buf = buf;
+    snprintf(d->path, sizeof d->path, "%s", install_path);
+    if (map_segments(d, 0) != OCERZ_OK) {
+        dlerror_set("dlopen(%s): cannot map segments", install_path);
+        g_dimgs_n--;
+        free(buf);
+        return NULL;
+    }
+    load_disk_deps(cache, d);
+    if (apply_fixups(d, cache) != OCERZ_OK) {
+        dlerror_set("dlopen(%s): cannot apply fixups", install_path);
+        return NULL;
+    }
+    if (d->cf_off == 0)
+        apply_classic_fixups(d, cache);
+    ocerz_dyldapi_register_image(d->load_base, d->path);
+    OCERZ_LOG("dynamic: dlopen loaded %s at load_base=%#llx slide=%#llx\n",
+              install_path, (unsigned long long)d->load_base, (unsigned long long)d->slide);
+    return d;
+}
+
+uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
+{
+    if (!g_run_cache) {
+        dlerror_set("dlopen: runtime loader not initialized", NULL);
+        return 0;
+    }
+    if (!hostpath) {
+        if (g_dlerror_g)
+            ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+        return ocerz_arena_lo;
+    }
+    DynImage *already = dimg_find_by_path(hostpath);
+    if (already) {
+        if (g_dlerror_g)
+            ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+        return already->load_base;
+    }
+    uint64_t cmh = dep_find(g_run_cache, hostpath);
+    if (cmh) {
+        if (g_dlerror_g)
+            ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+        return cmh;
+    }
+    if (mode & 0x10) {
+        dlerror_set("dlopen(%s): not already loaded (RTLD_NOLOAD)", hostpath);
+        return 0;
+    }
+    int before = g_dimgs_n;
+    DynImage *d = dlopen_load_image(g_run_cache, hostpath);
+    if (!d)
+        return 0;
+    if (g_run_init_ready && g_run_vm && !vm->exited && g_dimgs_n > before) {
+        uint64_t istk = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
+        if (istk) {
+            uint64_t itop = istk + DYN_STACK_SIZE - 64;
+            for (int i = g_dimgs_n - 1; i >= before; i--) {
+                run_image_inits(g_run_vm, g_dimgs[i].load_base, g_run_init_args, itop);
+                if (vm->exited)
+                    break;
+            }
+        }
+    }
+    if (g_dlerror_g)
+        ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+    return d->load_base;
+}
+
+static uint64_t image_symtab_resolve(DynImage *img, const char *sym)
+{
+    const uint8_t *mh = img->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (rd32(lc) == LC_SYMTAB) {
+            symoff = rd32(lc + 8);
+            nsyms = rd32(lc + 12);
+            stroff = rd32(lc + 16);
+            strsize = rd32(lc + 20);
+            break;
+        }
+        lc += rd32(lc + 4);
+    }
+    if (!symoff || !nsyms || !stroff)
+        return 0;
+    const uint8_t *nl = mh + symoff;
+    const char *strs = (const char *)(mh + stroff);
+    for (uint32_t i = 0; i < nsyms; i++) {
+        const uint8_t *e = nl + (uint64_t)i * 16;
+        uint32_t strx = rd32(e);
+        uint8_t ntype = e[4];
+        if (strx == 0 || strx >= strsize)
+            continue;
+        if ((ntype & 0x0e) != 0x0e || !(ntype & 0x01))
+            continue;
+        if (strcmp(strs + strx, sym) == 0)
+            return rd64(e + 8) + img->slide;
+    }
+    return 0;
+}
+
+uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
+{
+    if (!sym || !sym[0])
+        return 0;
+    char buf[1024];
+    buf[0] = '_';
+    snprintf(buf + 1, sizeof buf - 1, "%s", sym);
+
+    int64_t sh = (int64_t)handle;
+    if (sh == -2 || sh == -3) {
+        uint64_t v = disk_flat_resolve(buf);
+        if (v)
+            return v;
+        if (g_run_cache)
+            v = ocerz_cache_resolve(g_run_cache, buf);
+        return v;
+    }
+    if (sh == -5) {
+        DynImage *m = g_dimgs_n > 0 ? &g_dimgs[0] : NULL;
+        return m ? ocerz_image_self_resolve(m, buf) : 0;
+    }
+    if (sh == -1) {
+        uint64_t v = disk_flat_resolve(buf);
+        if (v)
+            return v;
+        if (g_run_cache)
+            v = ocerz_cache_resolve(g_run_cache, buf);
+        return v;
+    }
+
+    for (int i = 0; i < g_dimgs_n; i++) {
+        if (g_dimgs[i].load_base == handle) {
+            uint64_t v = ocerz_image_self_resolve(&g_dimgs[i], buf);
+            if (!v)
+                v = image_symtab_resolve(&g_dimgs[i], buf);
+            return v;
+        }
+    }
+    if (g_run_cache) {
+        uint64_t v = ocerz_cache_resolve(g_run_cache, buf);
+        if (v)
+            return v;
+    }
+    return disk_flat_resolve(buf);
+}
+
+int ocerz_dlclose(uint64_t handle)
+{
+    (void)handle;
+    return 0;
+}
+
+uint64_t ocerz_dlerror(void)
+{
+    if (!g_dlerror_g)
+        return 0;
+    char *s = (char *)ocerz_g2h(g_dlerror_g);
+    if (s[0] == '\0')
+        return 0;
+    return g_dlerror_g;
+}
+
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
 {
     if (ocerz_mem_init_identity(DYN_ARENA_SIZE) != OCERZ_OK)
@@ -1227,6 +1462,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         OCERZ_FATAL("cannot map shared cache for dynamic loading\n");
         return OCERZ_EIO;
     }
+    g_run_cache = &cache;
+    g_run_vm = vm;
 
     size_t flen = 0;
     uint8_t *buf = read_file(path, &flen);
@@ -1316,6 +1553,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     int want_init = !getenv("OCERZ_NOINIT") && (img.links_dylib || getenv("OCERZ_INIT"));
     if (want_init) {
         uint64_t ia[5] = { fr.argc, fr.argv_arr, fr.envp_arr, fr.apple_arr, fr.progvars };
+        for (int i = 0; i < 5; i++)
+            g_run_init_args[i] = ia[i];
         uint64_t init = find_dylib_init(&cache, "libSystem.B.dylib");
         if (init) {
             OCERZ_LOG("dynamic: running libSystem_initializer at %#llx\n", (unsigned long long)init);
@@ -1342,6 +1581,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                 return vm->exit_code;
             OCERZ_LOG("dynamic: initializer phase complete\n");
         }
+        if (ran_init)
+            g_run_init_ready = 1;
     }
 
     OCERZ_LOG("dynamic: load_base=%#llx slide=%#llx main=%#llx\n",
