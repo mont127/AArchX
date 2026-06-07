@@ -30,21 +30,35 @@
  *     runs libSystem.B.dylib's single __init_offsets orchestrator first — this
  *     boots libpthread (main-thread TSD at gs_base, the kernel commpage),
  *     libmalloc, libc, and libobjc, the last of which drives the objc<->dyld
- *     map_images handshake through the dyld-API shim (see dyldapi.c). Then it
- *     calls main(argc,argv,envp,apple) and, on a normal return, libc exit(rv)
- *     so atexit handlers run and stdio is flushed (a bare _exit would lose
- *     buffered printf output). A freestanding executable with no dylibs skips
- *     init and uses the raw _exit trampoline. OCERZ_INIT forces init on,
- *     OCERZ_NOINIT forces it off.
+ *     map_images handshake through the dyld-API shim (see dyldapi.c). Then,
+ *     under OCERZ_INITPHASE, Ocerz runs the +load phase and the image
+ *     initializers in dependency order, the way dyld4 does. Which images get
+ *     their +load/initializers run is the "eager set". dyld runs them for the
+ *     whole dependency closure; Ocerz computes a sound approximation: it seeds
+ *     the set with the main executable's DIRECT LC_LOAD_DYLIB dependencies
+ *     (every dylib dyld is guaranteed to bring up — these always have their
+ *     initializers run) plus the libSystem/usr-lib-system roots, then expands
+ *     by following data pointers (scan_uses) to the transitive dependencies the
+ *     program actually references. Seeding the direct deps is what fixes a
+ *     binary that reaches Foundation only indirectly — e.g. a pure-Swift main
+ *     whose bridge to Foundation runs through libswiftCore and has no
+ *     __objc_classrefs of its own: Foundation is still a direct LC_LOAD_DYLIB,
+ *     so its initializer now runs and caches NSString's concrete class, and
+ *     +[NSString allocWithZone:] hands back a real __NSPlaceholderString instead
+ *     of class_createInstance'ing a bare abstract NSString. Then it calls
+ *     main(argc,argv,envp,apple) and, on a normal return, libc exit(rv) so
+ *     atexit handlers run and stdio is flushed (a bare _exit would lose buffered
+ *     printf output). A freestanding executable with no dylibs skips init and
+ *     uses the raw _exit trampoline. OCERZ_INIT forces init on, OCERZ_NOINIT
+ *     forces it off.
  *
  * libc/Objective-C executables run: imports resolve through ocerz_cache_resolve
  * (which now follows re-export terminals, e.g. _memset -> libsystem_platform
  * __platform_memset, see cache.c), the dependency closure of objc images is
- * mapped (see dyldapi.c), and exit() flushes stdio. Still TODO at the honest
- * edge: TLV is not set up, and a Foundation app reaches main but objc's
- * preoptimized method dispatch (relative method lists / shared-cache selector
- * uniquing) is not yet faithful, so a send like +[NSString stringWithFormat:]
- * is not found — that is the next frontier, not loading or linking.
+ * mapped (see dyldapi.c), the cache images' +load/initializers run in
+ * dependency order (step 5), and exit() flushes stdio. Foundation/Swift apps
+ * (e.g. NSString bridging through libswiftCore) run end-to-end. Still TODO at
+ * the honest edge: TLV is not set up.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -629,11 +643,31 @@ static void scan_uses(uint64_t mh)
         lc += l->cmdsize;
     }
 }
+static void eager_add_direct_deps(OcerzCache *cache, uint64_t mh)
+{
+    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    if (rd32(h) != MH_MAGIC_64)
+        return;
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t j = 0; j < ncmds; j++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+            uint32_t noff = rd32(lc + 8);
+            if (noff < rd32(lc + 4))
+                eager_add(dep_find(cache, (const char *)(lc + noff)));
+        }
+        lc += rd32(lc + 4);
+    }
+}
+
 static void compute_eager_set(OcerzCache *cache, uint64_t main_mh)
 {
     build_segs(cache);
     g_eager_n = 0;
     eager_add(main_mh);
+    eager_add_direct_deps(cache, main_mh);
     for (uint32_t i = 0; i < cache->images_cnt; i++) {
         const char *p;
         uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
