@@ -43,8 +43,15 @@
  * LC_LOAD_DYLIB / weak / reexport / upward / lazy dependencies transitively,
  * resolving each install path to its cache image, so a binary that links
  * Foundation gets CoreFoundation/Foundation processed and a plain libc binary
- * gets only the libSystem closure — both correct. Of that closure only images
- * carrying __objc_imageinfo are handed to objc. map_images_nolock then asks
+ * gets only the libSystem closure — both correct. Non-cache disk dylibs (loaded
+ * by the mini-dyld, see dyld.c) register through ocerz_dyldapi_register_image,
+ * which records {mach_header, guest-copy of the install path} and appends the
+ * header to the closure (compute_closure re-appends them after its cache BFS),
+ * so disk images appear in image lists (slots 0x10/0x18/0x20/0x28), resolve
+ * their path (cache_path_for_mh consults the disk table first), drive objc
+ * map_images when they carry __objc_imageinfo, and resolve unwind sections
+ * (slot 0x170). Of that closure only images carrying __objc_imageinfo are
+ * handed to objc. map_images_nolock then asks
  * dyld for the
  * shared-cache objc-optimization roots, which Ocerz derives from libobjc's
  * __TEXT,__objc_opt_ro (an objc_opt_t v16 whose i32 fields at +0x0c/+0x18 give
@@ -130,6 +137,49 @@ uint64_t g_main_path;
 static uint64_t g_closure_mh[DYLDAPI_CLOSURE_MAX];
 static int g_closure_n;
 
+#define DYLDAPI_DISK_MAX 64
+static uint64_t g_disk_mh[DYLDAPI_DISK_MAX];
+static uint64_t g_disk_path[DYLDAPI_DISK_MAX];
+static int g_disk_n;
+
+void ocerz_dyldapi_register_image(uint64_t mh, const char *path)
+{
+    uint64_t gpath = 0;
+    if (path && path[0]) {
+        uint64_t need = (uint64_t)strlen(path) + 1;
+        gpath = ocerz_map_anywhere(need, PROT_READ | PROT_WRITE);
+        if (gpath)
+            memcpy(ocerz_g2h(gpath), path, need);
+    }
+    for (int i = 0; i < g_disk_n; i++)
+        if (g_disk_mh[i] == mh)
+            return;
+    if (g_disk_n < DYLDAPI_DISK_MAX) {
+        g_disk_mh[g_disk_n] = mh;
+        g_disk_path[g_disk_n] = gpath;
+        g_disk_n++;
+    }
+    for (int i = 0; i < g_closure_n; i++)
+        if (g_closure_mh[i] == mh)
+            return;
+    if (g_closure_n < DYLDAPI_CLOSURE_MAX)
+        g_closure_mh[g_closure_n++] = mh;
+}
+
+static uint64_t disk_gpath_for_mh(uint64_t mh)
+{
+    for (int i = 0; i < g_disk_n; i++)
+        if (g_disk_mh[i] == mh)
+            return g_disk_path[i];
+    return 0;
+}
+
+static const char *disk_path_for_mh(uint64_t mh)
+{
+    uint64_t g = disk_gpath_for_mh(mh);
+    return g ? (const char *)ocerz_g2h(g) : NULL;
+}
+
 static uint64_t find_section_sz(uint64_t mh, const char *sect, uint64_t *size_out)
 {
     const struct mach_header_64 *h = (const void *)(uintptr_t)mh;
@@ -142,7 +192,7 @@ static uint64_t find_section_sz(uint64_t mh, const char *sect, uint64_t *size_ou
         const struct load_command *l = (const void *)q;
         if (l->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *s = (const void *)q;
-            if (s->fileoff == 0 && s->vmaddr != 0) {
+            if (s->fileoff == 0 && s->filesize != 0) {
                 slide = mh - s->vmaddr;
                 break;
             }
@@ -181,7 +231,7 @@ static uint64_t image_slide(uint64_t mh)
         const struct load_command *l = (const void *)lc;
         if (l->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *s = (const void *)lc;
-            if (s->fileoff == 0 && s->vmaddr != 0)
+            if (s->fileoff == 0 && s->filesize != 0)
                 return mh - s->vmaddr;
         }
         lc += l->cmdsize;
@@ -236,6 +286,9 @@ static uint64_t image_for_pc(uint64_t pc)
 
 static const char *cache_path_for_mh(struct OcerzCache *cache, uint64_t mh)
 {
+    const char *dp = disk_path_for_mh(mh);
+    if (dp)
+        return dp;
     for (uint32_t i = 0; i < cache->images_cnt; i++) {
         const char *p = NULL;
         if (ocerz_cache_image_addr(cache, i, &p) == mh)
@@ -283,6 +336,9 @@ static void compute_closure(struct OcerzCache *cache, uint64_t main_mh)
             lc += l->cmdsize;
         }
     }
+    for (int i = 0; i < g_disk_n; i++)
+        if (!closure_seen(g_disk_mh[i]) && g_closure_n < DYLDAPI_CLOSURE_MAX)
+            g_closure_mh[g_closure_n++] = g_disk_mh[i];
 }
 
 int ocerz_dyldapi_setup(struct OcerzCache *cache)
