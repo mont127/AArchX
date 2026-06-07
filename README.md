@@ -31,7 +31,7 @@ Measured JIT speedup on `fib(30)`: **0.52s → 0.18s (~2.9×)**, 22.9M guest ins
 ## Quickstart
 
 ```sh
-git clone <repo-url> && cd Ocerz-main
+git clone https://github.com/mont127/Ocerz && cd Ocerz-main
 make check                              # build + run all unit and e2e tests
 ./ocerz tests/guest/bin/hello           # run a guest binary (JIT by default)
 ```
