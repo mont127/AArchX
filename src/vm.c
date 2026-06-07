@@ -135,6 +135,33 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     p = str_into(p, "\n");
     write(2, buf, (size_t)(p - buf));
     if (c) {
+        static const char *const rn[] = { "rax", "rcx", "rdx", "rbx",
+                                          "rsi", "rdi", "rbp", "r8" };
+        static const int ri[] = { OCERZ_RAX, OCERZ_RCX, OCERZ_RDX, OCERZ_RBX,
+                                  OCERZ_RSI, OCERZ_RDI, OCERZ_RBP, OCERZ_R8 };
+        p = buf;
+        p = str_into(p, "  regs:");
+        for (int i = 0; i < 8; i++) {
+            p = str_into(p, " ");
+            p = str_into(p, rn[i]);
+            p = str_into(p, "=");
+            p = hex_into(p, c->gpr[ri[i]]);
+        }
+        p = str_into(p, "\n");
+        write(2, buf, (size_t)(p - buf));
+        uint64_t fp = c->gpr[OCERZ_RBP];
+        p = buf;
+        p = str_into(p, "  rbp-chain:");
+        for (int d = 0; d < 9 && fp >= 0x300000000ull; d++) {
+            p = str_into(p, " ");
+            p = hex_into(p, ocerz_ld(fp + 8, 8));
+            uint64_t nf = ocerz_ld(fp, 8);
+            if (nf <= fp)
+                break;
+            fp = nf;
+        }
+        p = str_into(p, "\n");
+        write(2, buf, (size_t)(p - buf));
         uint64_t sp = c->gpr[OCERZ_RSP];
         int shown = 0;
         p = buf;

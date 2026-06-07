@@ -82,8 +82,30 @@
  *    waits for us — must be able to resolve the owner to a live thread, or it
  *    reports the "Owner in ulock is unknown" client crash. A minted receive
  *    right names no thread; mach_thread_self of the worker does.
- *    fork/exec/posix_spawn remain STEP_FATAL.
- *  - mach_vm_*: arena allocator, ANYWHERE semantics, KERN_SUCCESS/3.
+ *  - Process creation, the Rosetta model: every guest process is a real host
+ *    process, and an x86_64 child re-enters the emulator. posix_spawn(244)
+ *    host-spawns this ocerz binary (_NSGetExecutablePath) on the guest's
+ *    target path, forwarding guest argv[1..] and envp verbatim (the spawn-
+ *    attrs/file-actions descriptor is not yet honored); the host child pid is
+ *    written back and host-forwarded wait4 reaps it with real status bits.
+ *    fork(2) host-forks the emulator itself: the guest arena clones
+ *    copy-on-write at the exact instruction, the calling thread alone
+ *    survives (POSIX), the guest's own atfork handlers re-fetch task/thread
+ *    ports through the forwarded Mach traps, and the Darwin dual return is
+ *    rax=pid,rdx=0 in the parent and rax=0,rdx=1 in the child. pthread_atfork
+ *    takes the JIT and bump-allocator mutexes across the fork so the child
+ *    never inherits a lock owned by a thread it does not have; the host libc
+ *    fork runs Apple's own malloc atfork machinery for the same reason.
+ *    execve remains STEP_FATAL.
+ *  - mach_vm_*: arena allocator. ANYWHERE requests bump-allocate; FIXED
+ *    requests (flags bit0 clear) honor the kernel contract — memory at
+ *    exactly the caller's address via ocerz_map_claim_fixed, or an honest
+ *    KERN_NO_SPACE when the range may be occupied. libmalloc grows large
+ *    blocks in place with FIXED allocations at the block's end and trusts a
+ *    success without re-reading the address, so a silently-relocated "success"
+ *    hands the guest a pointer to unmapped memory (NSMutableData's 10MB grow
+ *    used to SIGBUS exactly this way); the NO_SPACE failure instead routes
+ *    libmalloc to its normal allocate-new-and-copy fallback.
  * thread_fast_set_cthread_self returns 0x60 (the historical %gs selector);
  * the exact value the guest expects is uncertain but unused, documented here.
  *
@@ -94,6 +116,7 @@
 #include "ocerz/syscall.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
+#include "ocerz/jit.h"
 #include "ocerz/sys_raw.h"
 #include "ocerz/interp.h"
 
@@ -102,8 +125,11 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <spawn.h>
 #include <pthread.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
 
 #define OCERZ_BSD_MAX 600
 
@@ -395,6 +421,96 @@ static int ocerz_spawn_worker(OcerzVM *vm, const OcerzCPU *tmpl)
     return 0;
 }
 
+static void ocerz_fork_prepare(void)
+{
+    ocerz_jit_prefork();
+    ocerz_mem_prefork();
+}
+
+static void ocerz_fork_parent(void)
+{
+    ocerz_mem_postfork();
+    ocerz_jit_postfork();
+}
+
+static void ocerz_fork_child(void)
+{
+    ocerz_mem_postfork();
+    ocerz_jit_postfork();
+    __atomic_store_n(&g_wq_running, 0, __ATOMIC_SEQ_CST);
+}
+
+static int sys_fork(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    (void)a;
+    static int registered;
+    if (!registered) {
+        registered = 1;
+        pthread_atfork(ocerz_fork_prepare, ocerz_fork_parent, ocerz_fork_child);
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        ret_err(cpu, (uint64_t)errno);
+        return OCERZ_STEP_OK;
+    }
+    if (pid == 0) {
+        ret_ok2(cpu, 0, 1);
+        return OCERZ_STEP_OK;
+    }
+    ret_ok2(cpu, (uint64_t)pid, 0);
+    return OCERZ_STEP_OK;
+}
+
+static const char *ocerz_self_path(void)
+{
+    static char buf[1024];
+    if (!buf[0]) {
+        uint32_t sz = sizeof buf;
+        if (_NSGetExecutablePath(buf, &sz) != 0)
+            buf[0] = 0;
+    }
+    return buf[0] ? buf : NULL;
+}
+
+static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    const char *self = ocerz_self_path();
+    if (!self || !a[1]) {
+        ret_err(cpu, EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    char *hargv[260];
+    int n = 0;
+    hargv[n++] = (char *)(uintptr_t)self;
+    hargv[n++] = (char *)ocerz_g2h(a[1]);
+    if (a[3]) {
+        uint64_t gv;
+        for (uint64_t p = a[3] + 8; n < 258 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
+            hargv[n++] = (char *)ocerz_g2h(gv);
+    }
+    hargv[n] = NULL;
+    char *henv[514];
+    int m = 0;
+    if (a[4]) {
+        uint64_t gv;
+        for (uint64_t p = a[4]; m < 512 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
+            henv[m++] = (char *)ocerz_g2h(gv);
+    }
+    henv[m] = NULL;
+    pid_t hpid = 0;
+    int rc = posix_spawn(&hpid, self, NULL, NULL, hargv, a[4] ? henv : NULL);
+    if (rc != 0) {
+        ret_err(cpu, (uint64_t)rc);
+        return OCERZ_STEP_OK;
+    }
+    if (a[0])
+        ocerz_st(a[0], 4, (uint64_t)(uint32_t)hpid);
+    ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
 #define OCERZ_START_WQTHREAD 0x7ff802e6f80cull
 #define OCERZ_PTHREAD_COOKIE 0x7ff8436bd750ull
 
@@ -635,7 +751,7 @@ static int sys_fcntl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 
 static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [1]   = { "exit",        1, 0x00, 0, sys_exit },
-    [2]   = { "fork",        0, 0x00, 0, sys_unsupported },
+    [2]   = { "fork",        0, 0x00, 0, sys_fork },
     [3]   = { "read",        3, 0x02, 0, NULL },
     [4]   = { "write",       3, 0x02, 0, NULL },
     [5]   = { "open",        3, 0x01, 0, NULL },
@@ -728,7 +844,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [239] = { "fremovexattr",3, 0x02, 0, NULL },
     [240] = { "listxattr",   4, 0x03, 0, NULL },
     [241] = { "flistxattr",  4, 0x02, 0, NULL },
-    [244] = { "posix_spawn", 5, 0x00, 0, sys_unsupported },
+    [244] = { "posix_spawn", 5, 0x00, 0, sys_posix_spawn },
     [266] = { "shm_open",    3, 0x01, 0, NULL },
     [267] = { "shm_unlink",  1, 0x01, 0, NULL },
     [268] = { "sem_open",    4, 0x01, 0, NULL },
@@ -924,6 +1040,17 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     switch (num) {
     case 10: {
         uint64_t size = a[2];
+        uint64_t flags = a[3];
+        if (!(flags & 1)) {
+            uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
+            if (want == 0 ||
+                ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK) {
+                mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
+                break;
+            }
+            mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
+            break;
+        }
         uint64_t gaddr = ocerz_map_anywhere(size, PROT_READ | PROT_WRITE);
         if (gaddr == 0) {
             mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
@@ -947,6 +1074,17 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 15: {
         uint64_t size = a[2];
         uint64_t mask = a[3];
+        uint64_t flags = a[4];
+        if (!(flags & 1)) {
+            uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
+            if (want == 0 ||
+                ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK) {
+                mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
+                break;
+            }
+            mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
+            break;
+        }
         uint64_t gaddr = mask ? ocerz_map_anywhere_aligned(size, PROT_READ | PROT_WRITE, mask + 1)
                               : ocerz_map_anywhere(size, PROT_READ | PROT_WRITE);
         if (gaddr == 0) {
