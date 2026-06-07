@@ -28,7 +28,12 @@
  *    bit index is masked to the operand width. For a MEMORY destination with
  *    a REGISTER bit offset the FULL signed bit offset addresses memory beyond
  *    the operand: byte address = ea + (sext(bitoff) >> 3) (arithmetic shift),
- *    bit = bitoff & 7. An IMMEDIATE bit offset always masks to the width.
+ *    bit = bitoff & 7. An IMMEDIATE bit offset masks to the width and is then
+ *    folded into byte addressing the same way (ea += bit >> 3, bit &= 7) so
+ *    indices above 7 test the right byte of the operand — _Block_copy's
+ *    BLOCK_IS_GLOBAL probe is `bt dword [blk+8], 0x1c`, and reading only the
+ *    lowest byte made every global-block check fail, heap-copying libdispatch's
+ *    sentinel destructor blocks and breaking their pointer-identity contract.
  *    CF receives the tested bit; BTS/BTR/BTC write back the modified
  *    addressed unit (one byte for the memory path, the operand width for the
  *    register path). Other flags are left unchanged, as the architecture
@@ -238,6 +243,8 @@ static int ext_bit(OcerzCPU *cpu, const X86Insn *insn)
     uint64_t bit;
     if (off->kind == OCERZ_OPK_IMM) {
         bit = ocerz_read_op(cpu, insn, off) & (size * 8 - 1);
+        ea = ea + (bit >> 3);
+        bit = bit & 7;
     } else {
         int64_t sbit = ocerz_sext(ocerz_read_op(cpu, insn, off), off->size);
         ea = ea + (uint64_t)(sbit >> 3);
