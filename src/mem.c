@@ -12,23 +12,47 @@
  * that, we ask for the reservation hintless and set guest_base = host_base -
  * arena_lo so that the guest's canonical low address maps exactly onto the
  * first reserved host page. Everything the guest ever maps lives inside this
- * reservation, which is why the fixed-placement paths below can use MAP_FIXED
- * safely: they only ever replace pages Ocerz already owns.
+ * one reservation.
  *
- * Apple Silicon enforces 16KB page granularity, so all ranges are rounded
- * outward to 16KB. Callers that need several sub-16KB-aligned pieces inside
- * one region (the Mach-O loader with its 4KB-aligned segments) must map the
- * union once and then apply protections, because a second anonymous
- * MAP_FIXED into the same host page would zero its neighbor's bytes.
+ * Apple Silicon enforces 16KB page granularity while x86_64 guests assume 4KB,
+ * so two guest allocations less than 16KB apart can share a single host page.
+ * The arena is reserved up front as ONE PROT_NONE MAP_ANON region; pages are
+ * committed and uncommitted purely with mprotect(), never with a second
+ * MAP_FIXED mmap. This is the crux of thread safety: mprotect() changes a
+ * page's protection atomically WITHOUT a tear-down/re-map window, so a worker
+ * thread reading a live stack page never sees the transient SIGBUS that a
+ * concurrent MAP_FIXED unmap->remap on a neighboring 4KB region would cause.
+ * mprotect() on a still-zero-filled reserved page also does not zero the
+ * page's bytes, so committing one sub-page allocation never destroys a live
+ * neighbor that happens to share the same 16KB host page.
+ *
+ * A single map_lock serializes every commit, uncommit, protect, and bump
+ * reservation, and a commit bitmap tracks which 16KB host pages have been
+ * faulted in. A page that is already committed is only re-protected, never
+ * re-zeroed, except on an explicit guest MAP_FIXED re-map of an occupied
+ * address, where the guest legitimately expects fresh zero memory and
+ * commit_range() memsets exactly that range. Because the reservation is
+ * MAP_ANON PROT_NONE, the first mprotect-to-RW of a never-touched page yields
+ * a kernel-zeroed page, so the loaders' union-map-then-protect pattern and
+ * guest mmap(NULL) both still see zeroed fresh memory.
+ *
+ * Commit (map_fixed) rounds OUTWARD to 16KB so a sub-page guest map fully
+ * covers its bytes, which is safe because a shared page is only ever
+ * (re-)protected. Uncommit (unmap) rounds INWARD: only host pages wholly
+ * contained in the freed range are returned to PROT_NONE, so a partially-freed
+ * 16KB page whose other half is a live neighbor (the libpthread post-spawn
+ * stack-slack deallocate) is left committed and the neighbor survives. This
+ * matches a faithful 16KB kernel, which likewise cannot release a page it does
+ * not wholly own.
  *
  * Guest PROT_EXEC is translated to host PROT_READ: guest code is never
  * executed natively, it is only read by the decoder and JIT translator.
  *
- * The bump allocator for ocerz_map_anywhere() starts at guest 0x300000000,
- * far above any sane executable image, and leaves a 16KB guard gap between
- * allocations so runaway guest writes fault instead of bleeding into the
- * next allocation. ocerz_unmap() re-reserves PROT_NONE rather than
- * unmapping, keeping the arena contiguous forever.
+ * The bump allocator for ocerz_map_anywhere() starts high above any sane
+ * executable image and leaves a 16KB guard gap between allocations so runaway
+ * guest writes fault instead of bleeding into the next allocation; the commit
+ * happens under map_lock together with the bump advance so reservation and
+ * page state stay consistent across threads.
  *
  * ocerz_map_claim_fixed() backs a guest VM_FLAGS_FIXED allocation: the kernel
  * contract is memory at EXACTLY the requested address or an error, never a
@@ -44,11 +68,12 @@
 
 #include <sys/mman.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 
 #define OCERZ_HOST_PAGE 0x4000ull
 
-static pthread_mutex_t bump_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t map_lock = PTHREAD_MUTEX_INITIALIZER;
 
 uint64_t ocerz_guest_base;
 uint64_t ocerz_arena_lo;
@@ -56,6 +81,7 @@ uint64_t ocerz_arena_hi;
 uint8_t *ocerz_commpage;
 
 static uint64_t bump_next;
+static uint8_t *commit_bm;
 
 void ocerz_commpage_init(void)
 {
@@ -99,6 +125,54 @@ static int host_prot(int prot)
     return p;
 }
 
+static size_t pg_index(uint64_t gaddr)
+{
+    return (size_t)((round_down(gaddr) - ocerz_arena_lo) / OCERZ_HOST_PAGE);
+}
+
+static int bit_test(size_t i)
+{
+    return commit_bm && (commit_bm[i >> 3] & (uint8_t)(1u << (i & 7)));
+}
+
+static void bit_set(size_t i)
+{
+    if (commit_bm)
+        commit_bm[i >> 3] |= (uint8_t)(1u << (i & 7));
+}
+
+static void bit_clr(size_t i)
+{
+    if (commit_bm)
+        commit_bm[i >> 3] &= (uint8_t)~(1u << (i & 7));
+}
+
+static void commit_bm_alloc(void)
+{
+    free(commit_bm);
+    uint64_t npages = (ocerz_arena_hi - ocerz_arena_lo) / OCERZ_HOST_PAGE;
+    commit_bm = (uint8_t *)calloc(1, (size_t)((npages + 7) / 8));
+}
+
+static int commit_range(uint64_t lo, uint64_t hi, int hprot, int zero_overlap)
+{
+    for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
+        size_t i = pg_index(p);
+        void *hp = ocerz_g2h(p);
+        if (bit_test(i)) {
+            if (zero_overlap)
+                memset(hp, 0, (size_t)OCERZ_HOST_PAGE);
+            if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, hprot) != 0)
+                return OCERZ_ENOMEM;
+        } else {
+            if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, hprot) != 0)
+                return OCERZ_ENOMEM;
+            bit_set(i);
+        }
+    }
+    return OCERZ_OK;
+}
+
 int ocerz_mem_init(uint64_t lo, uint64_t hi)
 {
     size_t len = (size_t)(hi - lo);
@@ -112,6 +186,7 @@ int ocerz_mem_init(uint64_t lo, uint64_t hi)
     ocerz_arena_lo = lo;
     ocerz_arena_hi = hi;
     bump_next = lo + (len / 4);
+    commit_bm_alloc();
     OCERZ_LOG("guest arena [%#llx, %#llx) -> host %#llx, guest_base %#llx\n",
               (unsigned long long)lo, (unsigned long long)hi,
               (unsigned long long)host_base,
@@ -131,39 +206,42 @@ int ocerz_mem_init_identity(uint64_t size)
     ocerz_arena_lo = lo;
     ocerz_arena_hi = lo + size;
     bump_next = lo + size / 2;
+    commit_bm_alloc();
     OCERZ_LOG("identity guest arena [%#llx, %#llx), bump %#llx, guest_base 0\n",
               (unsigned long long)lo, (unsigned long long)ocerz_arena_hi, (unsigned long long)bump_next);
     return OCERZ_OK;
 }
 
-int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot)
+static int map_fixed_locked(uint64_t gaddr, uint64_t len, int prot, int zero_overlap)
 {
     uint64_t lo = round_down(gaddr);
     uint64_t hi = round_up(gaddr + len);
     if (lo < ocerz_arena_lo || hi > ocerz_arena_hi)
         return OCERZ_ENOMEM;
-    void *want = ocerz_g2h(lo);
-    void *p = mmap(want, (size_t)(hi - lo), host_prot(prot),
-                   MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-    if (p == MAP_FAILED)
-        return OCERZ_ENOMEM;
-    return OCERZ_OK;
+    return commit_range(lo, hi, host_prot(prot), zero_overlap);
+}
+
+int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot)
+{
+    pthread_mutex_lock(&map_lock);
+    int rc = map_fixed_locked(gaddr, len, prot, 1);
+    pthread_mutex_unlock(&map_lock);
+    return rc;
 }
 
 uint64_t ocerz_map_anywhere(uint64_t len, int prot)
 {
     uint64_t glen = round_up(len);
-    pthread_mutex_lock(&bump_lock);
+    pthread_mutex_lock(&map_lock);
     uint64_t gaddr = bump_next;
     if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
-        pthread_mutex_unlock(&bump_lock);
+        pthread_mutex_unlock(&map_lock);
         return 0;
     }
     bump_next = gaddr + glen + OCERZ_HOST_PAGE;
-    pthread_mutex_unlock(&bump_lock);
-    if (ocerz_map_fixed(gaddr, glen, prot) != OCERZ_OK)
-        return 0;
-    return gaddr;
+    int rc = map_fixed_locked(gaddr, glen, prot, 0);
+    pthread_mutex_unlock(&map_lock);
+    return rc == OCERZ_OK ? gaddr : 0;
 }
 
 uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
@@ -171,61 +249,78 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
     if (align < OCERZ_HOST_PAGE)
         align = OCERZ_HOST_PAGE;
     uint64_t glen = round_up(len);
-    pthread_mutex_lock(&bump_lock);
+    pthread_mutex_lock(&map_lock);
     uint64_t gaddr = (bump_next + (align - 1)) & ~(align - 1);
     if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
-        pthread_mutex_unlock(&bump_lock);
+        pthread_mutex_unlock(&map_lock);
         return 0;
     }
     bump_next = gaddr + glen + OCERZ_HOST_PAGE;
-    pthread_mutex_unlock(&bump_lock);
-    if (ocerz_map_fixed(gaddr, glen, prot) != OCERZ_OK)
-        return 0;
-    return gaddr;
+    int rc = map_fixed_locked(gaddr, glen, prot, 0);
+    pthread_mutex_unlock(&map_lock);
+    return rc == OCERZ_OK ? gaddr : 0;
 }
 
 void ocerz_mem_prefork(void)
 {
-    pthread_mutex_lock(&bump_lock);
+    pthread_mutex_lock(&map_lock);
 }
 
 void ocerz_mem_postfork(void)
 {
-    pthread_mutex_unlock(&bump_lock);
+    pthread_mutex_unlock(&map_lock);
 }
 
 int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot)
 {
     uint64_t lo = gaddr & ~(OCERZ_HOST_PAGE - 1);
     uint64_t hi = round_up(gaddr + len);
-    pthread_mutex_lock(&bump_lock);
+    pthread_mutex_lock(&map_lock);
     if (lo < bump_next || hi + OCERZ_HOST_PAGE > ocerz_arena_hi) {
-        pthread_mutex_unlock(&bump_lock);
+        pthread_mutex_unlock(&map_lock);
         return OCERZ_ENOMEM;
     }
     bump_next = hi + OCERZ_HOST_PAGE;
-    pthread_mutex_unlock(&bump_lock);
-    return ocerz_map_fixed(lo, hi - lo, prot);
+    int rc = map_fixed_locked(lo, hi - lo, prot, 0);
+    pthread_mutex_unlock(&map_lock);
+    return rc;
 }
 
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
 {
     uint64_t lo = round_down(gaddr);
     uint64_t hi = round_up(gaddr + len);
-    if (mprotect(ocerz_g2h(lo), (size_t)(hi - lo), host_prot(prot)) != 0)
+    if (lo < ocerz_arena_lo || hi > ocerz_arena_hi)
         return OCERZ_ENOMEM;
-    return OCERZ_OK;
+    pthread_mutex_lock(&map_lock);
+    int rc = commit_range(lo, hi, host_prot(prot), 0);
+    pthread_mutex_unlock(&map_lock);
+    return rc;
 }
 
 int ocerz_unmap(uint64_t gaddr, uint64_t len)
 {
-    uint64_t lo = round_down(gaddr);
-    uint64_t hi = round_up(gaddr + len);
-    if (lo < ocerz_arena_lo || hi > ocerz_arena_hi)
+    if (gaddr < ocerz_arena_lo || gaddr + len > ocerz_arena_hi)
         return OCERZ_ENOMEM;
-    void *p = mmap(ocerz_g2h(lo), (size_t)(hi - lo), PROT_NONE,
-                   MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-    if (p == MAP_FAILED)
-        return OCERZ_ENOMEM;
-    return OCERZ_OK;
+    uint64_t lo = round_up(gaddr);
+    uint64_t hi = round_down(gaddr + len);
+    if (lo >= hi)
+        return OCERZ_OK;
+    pthread_mutex_lock(&map_lock);
+    int rc = OCERZ_OK;
+    for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
+        void *hp = ocerz_g2h(p);
+        if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) != 0) {
+            rc = OCERZ_ENOMEM;
+            break;
+        }
+        memset(hp, 0, (size_t)OCERZ_HOST_PAGE);
+        if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_NONE) != 0) {
+            rc = OCERZ_ENOMEM;
+            break;
+        }
+        bit_clr(pg_index(p));
+    }
+    pthread_mutex_unlock(&map_lock);
+    return rc;
 }
