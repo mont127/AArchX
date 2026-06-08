@@ -986,6 +986,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [368] = { "workq_kernreturn", 4, 0x00, 0, sys_workq_kernreturn },
     [372] = { "thread_selfid", 0, 0x00, 0, NULL },
     [328] = { "__pthread_kill", 2, 0x00, 0, sys_pthread_kill },
+    [329] = { "__pthread_sigmask", 3, 0x06, 0, sys_sigprocmask },
     [331] = { "__disable_threadsignal", 1, 0x00, 0, sys_workq_stub },
     [334] = { "__semwait_signal", 6, 0x00, 0, sys_workq_stub },
     [374] = { "kevent_qos",  8, 0x00, 0, sys_workq_stub },
