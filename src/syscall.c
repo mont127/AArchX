@@ -365,6 +365,10 @@ static int sys_workq_stub(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+#define OCERZ_KEVENT_QOS_S 0x40
+
+static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]);
+
 #define OCERZ_THREAD_START 0x7ff802e6f820ull
 
 struct ocerz_worker {
@@ -656,6 +660,91 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
         ret_ok(cpu, 0);
         return OCERZ_STEP_OK;
+    }
+    ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
+/* WQ_FLAG_THREAD_* word handed to _pthread_wqthread. Decoded directly from the
+ * cache's _pthread_wqthread: bit14(0x4000)=QoS-class-in-low-byte, bit18(0x40000)
+ * =NEWSPI, bit21(0x200000)=OUTSIDEQOS, bit19(0x80000)=WORKLOOP worker (the
+ * branch that calls _dispatch_workloop_worker_thread draining the kqueue events
+ * handed in via RCX/R9). The plain REQTHREADS worker omits bit19 and so drains
+ * only the userspace root concurrent queue. */
+#define OCERZ_WQ_FLAG_BASE   (0x40000ull | 0x200000ull | 0x4000ull)
+#define OCERZ_WQ_FLAG_WORKLOOP 0x80000ull
+
+/* Spawn one workqueue worker entering _pthread_wqthread in WORKLOOP mode with a
+ * fired-event list copied from the guest changelist (EV_ADD/EV_ENABLE cleared),
+ * so _dispatch_workloop_worker_thread drains the workloop the guest just woke
+ * and runs the enqueued block -- the path AppKit's NSApplication bring-up needs
+ * and that the plain REQTHREADS pool never services. The events live above the
+ * worker's pthread struct (pth+0x8000, inside the region's top slack, clear of
+ * the down-growing stack at pth). */
+static int ocerz_spawn_workloop_worker(OcerzVM *vm, const OcerzCPU *cpu,
+                                       uint64_t prio, uint64_t changelist, int nchanges)
+{
+    if (nchanges > 16)
+        nchanges = 16;
+    uint64_t cookie = ocerz_ld(OCERZ_PTHREAD_COOKIE, 8);
+    uint64_t region = ocerz_map_anywhere(0x200000, PROT_READ | PROT_WRITE);
+    if (region == 0)
+        return -1;
+    uint64_t pth = region + 0x1f0000;
+    uint64_t evbuf = pth + 0x8000;
+    for (int i = 0; i < nchanges; i++) {
+        uint64_t src = changelist + (uint64_t)i * OCERZ_KEVENT_QOS_S;
+        uint64_t dst = evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S;
+        for (uint64_t off = 0; off < OCERZ_KEVENT_QOS_S; off += 8)
+            ocerz_st(dst + off, 8, ocerz_ld(src + off, 8));
+        uint16_t fl = (uint16_t)ocerz_ld(dst + 0x0a, 2);
+        fl &= (uint16_t) ~(uint16_t)(0x0001u | 0x0004u);
+        ocerz_st(dst + 0x0a, 2, fl);
+    }
+    __atomic_fetch_add(&g_wq_running, 1, __ATOMIC_SEQ_CST);
+    ocerz_st(pth, 8, pth ^ cookie);
+    ocerz_st(pth + 0xe0, 8, pth);
+    OcerzCPU t = *cpu;
+    t.terminated = 0;
+    t.cpu_number = ocerz_next_cpu_number();
+    t.rip = OCERZ_START_WQTHREAD;
+    uint32_t qosbits = (uint32_t)((prio >> 8) & 0x3fff);
+    int qos_idx = qosbits ? (__builtin_ctz(qosbits) + 1) : 4;
+    if (qos_idx < 1)
+        qos_idx = 1;
+    if (qos_idx > 6)
+        qos_idx = 6;
+    t.gpr[OCERZ_RSP] = pth;
+    t.gpr[OCERZ_RDI] = pth;
+    t.gpr[OCERZ_RSI] = 0;
+    t.gpr[OCERZ_RDX] = pth;
+    t.gpr[OCERZ_RCX] = evbuf;
+    t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | OCERZ_WQ_FLAG_WORKLOOP | (uint64_t)qos_idx;
+    t.gpr[OCERZ_R9] = (uint64_t)nchanges;
+    t.gs_base = pth + 0xe0;
+    if (ocerz_spawn_worker(vm, &t) != 0) {
+        __atomic_fetch_sub(&g_wq_running, 1, __ATOMIC_SEQ_CST);
+        return -1;
+    }
+    return 0;
+}
+
+/* kevent_id(uint64_t id, changelist, nchanges, eventlist, nevents, flags): the
+ * dispatch-workloop channel. The guest commits a workloop wakeup here expecting
+ * the kernel to bring up a servicing thread; ocerz brings one up explicitly (a
+ * WORKLOOP worker). Only one workqueue worker is summoned at a time (the running
+ * count gate) so a worker re-arming its own workloop does not fork the pool, and
+ * non-commit calls just acknowledge. Returns 0 (non-blocking) like the kernel's
+ * commit path. Gated behind OCERZ_KEVENT_WORKER while the GUI path is brought up;
+ * default is the historical no-op stub so make check is unchanged. */
+static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    if (getenv("OCERZ_KEVENT_WORKER")) {
+        uint64_t changelist = a[1];
+        int nchanges = (int)a[2];
+        if (nchanges > 0 && changelist != 0 &&
+            __atomic_load_n(&g_wq_running, __ATOMIC_SEQ_CST) == 0)
+            ocerz_spawn_workloop_worker(vm, cpu, 0, changelist, nchanges);
     }
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
@@ -997,7 +1086,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [331] = { "__disable_threadsignal", 1, 0x00, 0, sys_workq_stub },
     [334] = { "__semwait_signal", 6, 0x00, 0, sys_workq_stub },
     [374] = { "kevent_qos",  8, 0x00, 0, sys_workq_stub },
-    [375] = { "kevent_id",   6, 0x00, 0, sys_workq_stub },
+    [375] = { "kevent_id",   6, 0x00, 0, sys_kevent_id },
     [406] = { "fcntl_nocancel", 3, 0x00, 0, sys_fcntl },
     [409] = { "connect_nocancel", 3, 0x02, 0, NULL },
     [478] = { "bsdthread_ctl", 4, 0x00, 0, sys_workq_stub },
