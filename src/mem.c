@@ -31,7 +31,9 @@
  * faulted in. A page that is already committed is only re-protected, never
  * re-zeroed, except on an explicit guest MAP_FIXED re-map of an occupied
  * address, where the guest legitimately expects fresh zero memory and
- * commit_range() memsets exactly that range. Because the reservation is
+ * commit_range() makes the page writable (the shared neighbor may currently be
+ * a read-only code segment) before it memsets, then sets the requested prot.
+ * Because the reservation is
  * MAP_ANON PROT_NONE, the first mprotect-to-RW of a never-touched page yields
  * a kernel-zeroed page, so the loaders' union-map-then-protect pattern and
  * guest mmap(NULL) both still see zeroed fresh memory.
@@ -160,8 +162,11 @@ static int commit_range(uint64_t lo, uint64_t hi, int hprot, int zero_overlap)
         size_t i = pg_index(p);
         void *hp = ocerz_g2h(p);
         if (bit_test(i)) {
-            if (zero_overlap)
+            if (zero_overlap) {
+                if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) != 0)
+                    return OCERZ_ENOMEM;
                 memset(hp, 0, (size_t)OCERZ_HOST_PAGE);
+            }
             if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, hprot) != 0)
                 return OCERZ_ENOMEM;
         } else {
