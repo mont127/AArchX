@@ -178,7 +178,15 @@
  * dlsym, +0x70 dlclose, +0x78 dlerror), which marshal the System V args and
  * call the loader seam exported here: ocerz_dlopen / ocerz_dlsym / ocerz_dlclose
  * / ocerz_dlerror. ocerz_dlopen dedups the path against the cache and g_dimgs;
- * an unloaded disk path is brought up by dlopen_load_image, the non-fatal twin
+ * if the verbatim path misses, canon_dylib_path canonicalizes it the way dyld
+ * does before a second lookup: it readlink-chases leaf symlinks and realpaths the
+ * parent dir, tolerating a leaf that has no on-disk file. This is what lets a
+ * runtime dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+ * (a symlink to Versions/A/CoreGraphics, which exists only inside the shared cache
+ * with no disk Mach-O) resolve to the cache image instead of "image not found" --
+ * AppKit's BoardServices scene init dlopens CoreGraphics by that symlink path and
+ * raises (then unwinds) an NSException when it comes back NULL.
+ * An unloaded disk path is brought up by dlopen_load_image, the non-fatal twin
  * of load_disk_dylib (read_file -> select_slice(x86_64) -> map_segments(is_main=
  * 0) -> load_disk_deps -> apply_fixups||apply_classic_fixups -> ocerz_dyldapi_
  * register_image), then its initializers (and any newly-loaded deps', deps-
@@ -207,6 +215,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <mach/mach.h>
 #include <mach-o/loader.h>
@@ -1619,6 +1628,46 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     return d;
 }
 
+static int canon_dylib_path(const char *path, char *out, size_t outsz)
+{
+    char cur[PATH_MAX];
+    if (snprintf(cur, sizeof cur, "%s", path) >= (int)sizeof cur)
+        return 0;
+    for (int iter = 0; iter < 32; iter++) {
+        char link[PATH_MAX];
+        ssize_t n = readlink(cur, link, sizeof link - 1);
+        if (n < 0)
+            break;
+        link[n] = 0;
+        char next[PATH_MAX];
+        if (link[0] == '/') {
+            if (snprintf(next, sizeof next, "%s", link) >= (int)sizeof next)
+                return 0;
+        } else {
+            const char *slash = strrchr(cur, '/');
+            size_t dlen = slash ? (size_t)(slash - cur) + 1 : 0;
+            if (snprintf(next, sizeof next, "%.*s%s", (int)dlen, cur, link) >= (int)sizeof next)
+                return 0;
+        }
+        memcpy(cur, next, sizeof cur);
+    }
+    const char *slash = strrchr(cur, '/');
+    if (slash) {
+        char dir[PATH_MAX], rdir[PATH_MAX];
+        size_t dlen = (size_t)(slash - cur);
+        if (dlen == 0)
+            dlen = 1;
+        if (dlen < sizeof dir) {
+            memcpy(dir, cur, dlen);
+            dir[dlen] = 0;
+            if (realpath(dir, rdir) &&
+                snprintf(out, outsz, "%s/%s", rdir, slash + 1) < (int)outsz)
+                return 1;
+        }
+    }
+    return snprintf(out, outsz, "%s", cur) < (int)outsz;
+}
+
 uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
 {
     if (!g_run_cache) {
@@ -1642,12 +1691,30 @@ uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
             ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
         return cmh;
     }
+    char canon[PATH_MAX];
+    const char *loadpath = hostpath;
+    if (canon_dylib_path(hostpath, canon, sizeof canon) &&
+        strcmp(canon, hostpath) != 0) {
+        already = dimg_find_by_path(canon);
+        if (already) {
+            if (g_dlerror_g)
+                ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+            return already->load_base;
+        }
+        cmh = dep_find(g_run_cache, canon);
+        if (cmh) {
+            if (g_dlerror_g)
+                ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+            return cmh;
+        }
+        loadpath = canon;
+    }
     if (mode & 0x10) {
         dlerror_set("dlopen(%s): not already loaded (RTLD_NOLOAD)", hostpath);
         return 0;
     }
     int before = g_dimgs_n;
-    DynImage *d = dlopen_load_image(g_run_cache, hostpath);
+    DynImage *d = dlopen_load_image(g_run_cache, loadpath);
     if (!d)
         return 0;
     if (g_run_init_ready && g_run_vm && !vm->exited && g_dimgs_n > before) {
