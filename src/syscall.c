@@ -927,6 +927,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [154] = { "pwrite",      4, 0x02, 0, NULL },
     [169] = { "csops",       4, 0x04, 0, NULL },
     [170] = { "csops_audittoken", 5, 0x14, 0, NULL },
+    [180] = { "kdebug_trace", 5, 0x00, 0, NULL },
     [191] = { "pathconf",    2, 0x01, 0, NULL },
     [192] = { "fpathconf",   2, 0x00, 0, NULL },
     [194] = { "getrlimit",   2, 0x02, 0, NULL },
@@ -977,6 +978,12 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [345] = { "statfs64",    2, 0x03, 0, NULL },
     [346] = { "fstatfs64",   2, 0x02, 0, NULL },
     [347] = { "getfsstat64", 3, 0x01, 0, NULL },
+    [350] = { "audit",        2, 0x01, 0, NULL },
+    [351] = { "auditon",      3, 0x02, 0, NULL },
+    [353] = { "getauid",      1, 0x01, 0, NULL },
+    [357] = { "getaudit_addr", 2, 0x01, 0, NULL },
+    [358] = { "setaudit_addr", 2, 0x01, 0, NULL },
+    [359] = { "auditctl",     1, 0x01, 0, NULL },
     [360] = { "bsdthread_create", 5, 0x00, 0, sys_bsdthread_create },
     [361] = { "bsdthread_terminate", 4, 0x00, 0, sys_bsdthread_terminate },
     [362] = { "kqueue",      0, 0x00, 0, NULL },
@@ -1012,6 +1019,8 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [417] = { "poll_nocancel", 3, 0x02, 0, NULL },
     [420] = { "sem_wait_nocancel", 1, 0x00, 0, sys_workq_stub },
     [423] = { "__semwait_signal_nocancel", 6, 0x00, 0, sys_workq_stub },
+    [427] = { "fsgetpath",   4, 0x05, 0, NULL },
+    [428] = { "audit_session_self", 0, 0x00, 0, NULL },
     [461] = { "getattrlistbulk", 5, 0x06, 0, NULL },
     [463] = { "openat",      4, 0x02, 0, NULL },
     [464] = { "openat_nocancel", 4, 0x02, 0, NULL },
@@ -1052,12 +1061,28 @@ static void strace_bsd(OcerzVM *vm, const ocerz_bsd_entry *e, int num,
 
 static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
 {
+    if (num == 0) {
+        int real = (int)(cpu->gpr[OCERZ_RDI] & 0xffffff);
+        uint64_t r9_save = cpu->gpr[OCERZ_R9];
+        cpu->gpr[OCERZ_RDI] = cpu->gpr[OCERZ_RSI];
+        cpu->gpr[OCERZ_RSI] = cpu->gpr[OCERZ_RDX];
+        cpu->gpr[OCERZ_RDX] = cpu->gpr[OCERZ_R10];
+        cpu->gpr[OCERZ_R10] = cpu->gpr[OCERZ_R8];
+        cpu->gpr[OCERZ_R8] = r9_save;
+        cpu->gpr[OCERZ_R9] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
+        return dispatch_bsd(vm, cpu, real);
+    }
+
     const ocerz_bsd_entry *e = NULL;
     if (num >= 0 && num < OCERZ_BSD_MAX && bsd_table[num].name)
         e = &bsd_table[num];
 
     if (!e) {
-        OCERZ_FATAL("unknown BSD syscall: class=2 num=%d (no table entry)\n", num);
+        OCERZ_FATAL("unknown BSD syscall: class=2 num=%d (no table entry) rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx ret=%#llx\n", num,
+                    (unsigned long long)cpu->rip, (unsigned long long)cpu->gpr[OCERZ_RDI],
+                    (unsigned long long)cpu->gpr[OCERZ_RSI], (unsigned long long)cpu->gpr[OCERZ_RDX],
+                    (unsigned long long)cpu->gpr[OCERZ_R10],
+                    (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
         return OCERZ_STEP_FATAL;
     }
 
@@ -1127,14 +1152,22 @@ static const char *mach_trap_name(int num)
     case 37: return "semaphore_wait_signal_trap";
     case 38: return "semaphore_timedwait_trap";
     case 43: return "mach_generate_activity_id";
+    case 44: return "task_name_for_pid";
+    case 45: return "task_for_pid";
+    case 46: return "pid_for_task";
     case 47: return "mach_msg2_trap";
     case 50: return "thread_get_special_reply_port";
+    case 76: return "_kernelrpc_mach_port_type_trap";
     case 77: return "_kernelrpc_mach_port_request_notification_trap";
     case 59: return "swtch_pri";
     case 60: return "swtch";
     case 89: return "mach_timebase_info_trap";
     case 90: return "mach_wait_until_trap";
     case 91: return "mk_timer_create_trap";
+    case 92: return "mk_timer_destroy_trap";
+    case 93: return "mk_timer_arm_trap";
+    case 94: return "mk_timer_cancel_trap";
+    case 95: return "mk_timer_arm_leeway_trap";
     default: return NULL;
     }
 }
@@ -1257,6 +1290,19 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }
+    case 44:   /* task_name_for_pid(target_tport, pid, tn*) */
+    case 45: { /* task_for_pid(target_tport, pid, t*) */
+        if (a[2] != 0)
+            a[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
+    case 46: { /* pid_for_task(t, pid*) */
+        if (a[1] != 0)
+            a[1] = (uint64_t)(uintptr_t)ocerz_g2h(a[1]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
     case 47: {
         uint32_t msgh_id = (uint32_t)(a[4] >> 32);
         uint64_t reply_buf = a[0];
@@ -1269,6 +1315,12 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             (uint32_t)ocerz_ld(reply_buf + 4, 4) == 0x24 &&
             (uint32_t)ocerz_ld(reply_buf + 0x20, 4) == OCERZ_MACH_KERN_NOT_SUPPORTED)
             ocerz_st(reply_buf + 0x20, 4, OCERZ_MACH_KERN_SUCCESS);
+        break;
+    }
+    case 76: { /* _kernelrpc_mach_port_type_trap(task, name, ptype*) */
+        if (a[2] != 0)
+            a[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }
     case 77: {
@@ -1285,13 +1337,25 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         break;
     }
     case 90:   /* mach_wait_until_trap(deadline) */
-    case 91: { /* mk_timer_create_trap() */
+    case 91:   /* mk_timer_create_trap() */
+    case 92:   /* mk_timer_destroy_trap(name) */
+    case 93:   /* mk_timer_arm_trap(name, expire_time) */
+    case 95: { /* mk_timer_arm_leeway_trap(name, flags, expire_time, leeway) */
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
+    case 94: { /* mk_timer_cancel_trap(name, result_time*) */
+        if (a[1] != 0)
+            a[1] = (uint64_t)(uintptr_t)ocerz_g2h(a[1]);
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }
     default: {
         const char *nm = mach_trap_name(num);
-        OCERZ_FATAL("unknown Mach trap: class=1 num=%d name=%s\n", num, nm ? nm : "?");
+        OCERZ_FATAL("unknown Mach trap: class=1 num=%d name=%s rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx ret=%#llx\n", num, nm ? nm : "?",
+                    (unsigned long long)cpu->rip, (unsigned long long)a[0], (unsigned long long)a[1],
+                    (unsigned long long)a[2], (unsigned long long)a[3],
+                    (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
         return OCERZ_STEP_FATAL;
     }
     }
