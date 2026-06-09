@@ -1049,6 +1049,16 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
         return trap_fatal(&insn, "guest breakpoint/interrupt");
 
     case OCERZ_OP_UD2:
+        /* start_wqthread's tail guard (OCERZ_START_WQTHREAD + 0xf): a workqueue
+         * worker reaches it only when _pthread_wqthread returned because its
+         * drain function ran to completion instead of parking via workq_kern-
+         * return THREAD_RETURN. The real kernel parks the thread there; Ocerz
+         * ends the worker's host thread cleanly instead of faulting. Only
+         * wqthread workers execute this address -- the main thread never does. */
+        if (insn.rip == 0x7ff802e6f81bull) {
+            cpu->terminated = 1;
+            return OCERZ_STEP_OK;
+        }
         return trap_fatal(&insn, "guest UD2 (undefined instruction)");
 
     case OCERZ_OP_HLT:
