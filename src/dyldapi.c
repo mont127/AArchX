@@ -878,6 +878,9 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         api_return(cpu, mh ? 1 : 0);
         return OCERZ_STEP_OK;
     }
+    case 0x1b0:
+        api_return(cpu, image_for_pc(cpu->gpr[OCERZ_RSI]));
+        return OCERZ_STEP_OK;
     case 0x2f0:
         api_return(cpu, ocerz_arena_lo);
         return OCERZ_STEP_OK;
