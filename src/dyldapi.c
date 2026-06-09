@@ -32,7 +32,12 @@
  * dlopen/dlsym/dlclose/dlerror (slots 0x68/0x80/0x70/0x78). The libdyld dl*
  * wrappers tail-call these vtable slots after shuffling args down by one, so the
  * handlers see dlopen(path=rsi, mode=rdx), dlsym(handle=rsi, symbol=rdx),
- * dlclose(handle=rsi), dlerror() respectively. They marshal the guest pointers
+ * dlclose(handle=rsi), dlerror() respectively. Slot 0x2e0 is the caller-aware
+ * dlopen entry (the public dlopen() forwards path=rsi, mode=rdx, caller=rcx); it
+ * shares the 0x68 handler since the loader seam ignores the caller address.
+ * SoftLinking.framework (used by CoreFoundation/SkyLight soft-links) calls dlopen
+ * through 0x2e0, so without it a soft-link dlopen returned 0 and SoftLinking ran
+ * strlen() on a NULL dlerror() string. They marshal the guest pointers
  * through ocerz_g2h and call the loader seam in dyld.c (ocerz_dlopen / ocerz_
  * dlsym / ocerz_dlclose / ocerz_dlerror), which owns the disk-image registry and
  * fixup engines. dlopen runs AFTER main on the guest's live stack, and loading a
@@ -756,7 +761,8 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x210:
         api_return(cpu, 1);
         return OCERZ_STEP_OK;
-    case 0x68: {
+    case 0x68:
+    case 0x2e0: {
         uint64_t pathg = cpu->gpr[OCERZ_RSI];
         uint64_t mode = cpu->gpr[OCERZ_RDX];
         const char *host = pathg ? (const char *)ocerz_g2h(pathg) : NULL;
