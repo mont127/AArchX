@@ -100,9 +100,15 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len);
 
 static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
 {
-    uint64_t v = 0;
-    memcpy(&v, ocerz_g2h(gaddr), (size_t)size);
-    return v;
+    const void *p = ocerz_g2h(gaddr);
+    uint16_t v2; uint32_t v4; uint64_t v8;
+    switch (size) {
+    case 1: return *(const uint8_t *)p;
+    case 2: __builtin_memcpy(&v2, p, 2); return v2;
+    case 4: __builtin_memcpy(&v4, p, 4); return v4;
+    case 8: __builtin_memcpy(&v8, p, 8); return v8;
+    default: { uint64_t v = 0; __builtin_memcpy(&v, p, (size_t)size); return v; }
+    }
 }
 
 extern uint64_t ocerz_watch_addr;
@@ -112,7 +118,14 @@ static inline void ocerz_st(uint64_t gaddr, int size, uint64_t v)
 {
     if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
         ocerz_watch_hit(gaddr, size, v, 0);
-    memcpy(ocerz_g2h(gaddr), &v, (size_t)size);
+    void *p = ocerz_g2h(gaddr);
+    switch (size) {
+    case 1: *(uint8_t *)p = (uint8_t)v; break;
+    case 2: { uint16_t t = (uint16_t)v; __builtin_memcpy(p, &t, 2); break; }
+    case 4: { uint32_t t = (uint32_t)v; __builtin_memcpy(p, &t, 4); break; }
+    case 8: __builtin_memcpy(p, &v, 8); break;
+    default: __builtin_memcpy(p, &v, (size_t)size); break;
+    }
 }
 
 static inline Ocerz128 ocerz_ld128(uint64_t gaddr)
