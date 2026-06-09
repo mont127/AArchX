@@ -110,6 +110,38 @@ static void b_ldrsw(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scra
 static void b_ldsb(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 1, 1, 0, 0); a64_ldrsb(b, 1, 0, 0, 0); a64_ret(b); }
 static void b_ldrh(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 2, 1, 0, 2); a64_ldr(b, 2, 0, 0, 2); a64_ret(b); }
 
+/* The flag-emission building blocks the JIT relies on. cset after subs/adds
+ * must map arm64 NZCV exactly the way the x86-flag translation depends on:
+ * SUB borrow is carry-CLEAR (A64_CC), ADD carry is carry-SET (A64_CS), signed
+ * overflow is A64_VS, and the sign/zero come from MI/EQ. */
+static void b_cset_cc_subborrow(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_CC); a64_ret(b); }
+static void b_cset_cs_addcarry(A64Buf *b) { a64_adds_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_CS); a64_ret(b); }
+static void b_cset_vs_sub(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_VS); a64_ret(b); }
+static void b_cset_vs_add(A64Buf *b) { a64_adds_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_VS); a64_ret(b); }
+static void b_cset_mi(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_MI); a64_ret(b); }
+
+/* The x86 parity fold: reduce the low byte of x0 to its even-parity bit at
+ * position 2, exactly as emit_pf does (XOR-fold, then (~b)&1 via bic against a
+ * materialized 1). Returns the PF bit value (0 or 4). */
+static void b_parity_fold(A64Buf *b)
+{
+    a64_uxtb(b, 13, 0);
+    a64_lsr_imm(b, 0, 14, 13, 4); a64_eor_reg(b, 0, 13, 13, 14, 0);
+    a64_lsr_imm(b, 0, 14, 13, 2); a64_eor_reg(b, 0, 13, 13, 14, 0);
+    a64_lsr_imm(b, 0, 14, 13, 1); a64_eor_reg(b, 0, 13, 13, 14, 0);
+    a64_mov_imm64(b, 14, 1);
+    a64_bic_reg(b, 0, 13, 14, 13, 0);
+    a64_lsl_imm(b, 0, 13, 13, 2);
+    a64_mov_reg(b, 1, 0, 13);
+    a64_ret(b);
+}
+
+/* Sized stores at scaled offsets, the load/store shape the inlined ALU path
+ * uses against the register file (str of a full 8-byte slot after a 32-bit
+ * zero-extending op). */
+static void b_str8_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_ldr(b, 8, 0, 2, 8 * 5); a64_ret(b); }
+static void b_str4_zx(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_mov_imm64(b, 1, 0); a64_str(b, 8, 1, 2, 0); a64_add_reg(b, 0, 1, 0, A64_ZR, 0); a64_str(b, 8, 1, 2, 0); a64_ldr(b, 8, 0, 2, 0); a64_ret(b); }
+
 static void b_branch(A64Buf *b)
 {
     a64_subs_reg(b, 1, A64_ZR, 0, 1, 0);
@@ -182,6 +214,24 @@ int main(void)
     CHECK(run2(b_branch, 1, 1) == 111, "bcond not taken (EQ)");
     CHECK(run2(b_cbz, 0, 0) == 2, "cbz taken");
     CHECK(run2(b_cbz, 5, 0) == 1, "cbz not taken");
+
+    /* x86-flag translation building blocks used by the JIT inlined ALU. */
+    CHECK(run2(b_cset_cc_subborrow, 0, 1) == 1, "sub borrow -> A64_CC (x86 CF)");
+    CHECK(run2(b_cset_cc_subborrow, 5, 3) == 0, "sub no-borrow -> A64_CC clear");
+    CHECK(run2(b_cset_cs_addcarry, 0xffffffffffffffffull, 1) == 1, "add carry -> A64_CS (x86 CF)");
+    CHECK(run2(b_cset_cs_addcarry, 1, 1) == 0, "add no-carry -> A64_CS clear");
+    CHECK(run2(b_cset_vs_sub, 0x8000000000000000ull, 1) == 1, "sub signed overflow -> A64_VS");
+    CHECK(run2(b_cset_vs_sub, 5, 3) == 0, "sub no overflow -> A64_VS clear");
+    CHECK(run2(b_cset_vs_add, 0x7fffffffffffffffull, 1) == 1, "add signed overflow -> A64_VS");
+    CHECK(run2(b_cset_mi, 1, 5) == 1, "sub negative result -> A64_MI (x86 SF)");
+    CHECK(run2(b_cset_mi, 5, 1) == 0, "sub positive result -> A64_MI clear");
+    CHECK(run2(b_parity_fold, 0x00, 0) == 4, "parity of 0x00 (even) -> PF set");
+    CHECK(run2(b_parity_fold, 0x01, 0) == 0, "parity of 0x01 (odd) -> PF clear");
+    CHECK(run2(b_parity_fold, 0xff, 0) == 4, "parity of 0xff (even) -> PF set");
+    CHECK(run2(b_parity_fold, 0x07, 0) == 0, "parity of 0x07 (odd) -> PF clear");
+    CHECK(run2(b_parity_fold, 0x1234, 0) == 0, "parity reads low byte only (0x34 odd)");
+    CHECK(run2(b_str8_off, 0, 0xdeadbeefcafef00dull) == 0xdeadbeefcafef00dull, "str/ldr 8 scaled offset");
+    CHECK(run2(b_str4_zx, 0xffffffffull, 0) == 0xffffffffull, "w-op zero-extends, full slot stored");
 
     if (failures == 0)
         printf("test_a64emit: all encodings validated\n");
