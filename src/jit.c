@@ -521,7 +521,12 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
  * like any other) and skip the native body via the returned skip label, which
  * the caller patches to just past its native access. addr_reg holds gaddr and
  * must survive; the guard uses JTT/JTU as scratch. Returns the cursor of the
- * forward branch that the caller patches to the post-access label. */
+ * forward branch that the caller patches to the post-access label. When the
+ * low shadow window is active (ocerz_low_base != 0; only fixed-address guests
+ * like the Wine loader enable it), addresses below OCERZ_LOW_LIMIT also take
+ * the slow call: their host backing is not at gaddr + guest_base, and
+ * ocerz_g2h on the slow path applies the shadow offset. Blocks translated
+ * without the window keep the exact pre-existing emission. */
 static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
                                      int addr_reg, uint32_t **exit_sites, int *n_exits)
 {
@@ -531,10 +536,21 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
     a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
     uint32_t *over = a64_label(b);
     a64_bcond(b, A64_CS, 0);              /* gaddr-LO >= window -> skip slowcall */
+    uint32_t *slow = a64_label(b);
     emit_slowcall(b, insn, exit_sites, n_exits);
     uint32_t *skip = a64_label(b);
     a64_b(b, 0);                          /* past the native body */
-    a64_patch_bcond(over, a64_label(b));  /* CS target = native body start */
+    a64_patch_bcond(over, a64_label(b));  /* CS target = low check / native body */
+    if (ocerz_low_base) {
+        a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT);
+        a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
+        uint32_t *cur = a64_label(b);
+        a64_bcond(b, A64_CC, (int32_t)(slow - cur));
+        a64_mov_imm64(b, JTU, OCERZ_TOP_LO);
+        a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
+        cur = a64_label(b);
+        a64_bcond(b, A64_CS, (int32_t)(slow - cur));
+    }
     return skip;
 }
 

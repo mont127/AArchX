@@ -208,7 +208,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = str_into(p, " guest_rip=");
         p = hex_into(p, c->rip);
         p = str_into(p, " guest_addr=");
-        p = hex_into(p, (uint64_t)(uintptr_t)si->si_addr - ocerz_guest_base);
+        p = hex_into(p, ocerz_h2g(si->si_addr));
         p = str_into(p, " icount=");
         p = hex_into(p, g_vm ? g_vm->insn_count : 0);
     }
@@ -230,7 +230,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = str_into(p, "\n");
         write(2, buf, (size_t)(p - buf));
         {
-            int comm = ocerz_addr_committed((uint64_t)(uintptr_t)si->si_addr - ocerz_guest_base);
+            int comm = ocerz_addr_committed(ocerz_h2g(si->si_addr));
             const char *cs = comm == 1 ? "  fault-page: COMMITTED"
                            : comm == 0 ? "  fault-page: UNCOMMITTED"
                                        : "  fault-page: outside-arena";
@@ -256,6 +256,25 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
         p = str_into(p, "\n");
         write(2, buf, (size_t)(p - buf));
+        const char *pk = getenv("OCERZ_PEEK");
+        if (pk) {
+            p = buf;
+            p = str_into(p, "  peek:");
+            while (*pk) {
+                uint64_t a = strtoull(pk, (char **)&pk, 0);
+                if (*pk == ',')
+                    pk++;
+                p = str_into(p, " [");
+                p = hex_into(p, a);
+                p = str_into(p, "]=");
+                if (ocerz_addr_committed(a) != 0)
+                    p = hex_into(p, ocerz_ld(a, 8));
+                else
+                    p = str_into(p, "uncommitted");
+            }
+            p = str_into(p, "\n");
+            write(2, buf, (size_t)(p - buf));
+        }
         uint64_t sp = c->gpr[OCERZ_RSP];
         int shown = 0;
         p = buf;

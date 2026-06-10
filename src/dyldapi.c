@@ -139,6 +139,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 
 #define DYLDAPI_VTABLE_SIZE 0x2000
 
@@ -187,7 +188,7 @@ static void parse_build_version(uint64_t mh, uint32_t *plat, uint32_t *minos, ui
     *plat = 0;
     *minos = 0;
     *sdk = 0;
-    const struct mach_header_64 *h = (const void *)(uintptr_t)mh;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
     if (!mh || h->magic != MH_MAGIC_64)
         return;
     const uint8_t *lc = (const uint8_t *)(h + 1);
@@ -269,7 +270,7 @@ static const char *disk_path_for_mh(uint64_t mh)
 
 static uint64_t find_section_sz(uint64_t mh, const char *sect, uint64_t *size_out)
 {
-    const struct mach_header_64 *h = (const void *)(uintptr_t)mh;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
     if (!mh || h->magic != MH_MAGIC_64)
         return 0;
     const uint8_t *lc = (const uint8_t *)(h + 1);
@@ -310,7 +311,7 @@ static uint64_t find_section_any(uint64_t mh, const char *sect)
 
 static uint64_t image_slide(uint64_t mh)
 {
-    const struct mach_header_64 *h = (const void *)(uintptr_t)mh;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
     if (!mh || h->magic != MH_MAGIC_64)
         return 0;
     const uint8_t *lc = (const uint8_t *)(h + 1);
@@ -339,7 +340,7 @@ static uint64_t cache_find_path(struct OcerzCache *cache, const char *path)
 
 static int image_covers(uint64_t mh, uint64_t addr)
 {
-    const struct mach_header_64 *h = (const void *)(uintptr_t)mh;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
     if (!mh || h->magic != MH_MAGIC_64)
         return 0;
     uint64_t slide = image_slide(mh);
@@ -369,6 +370,83 @@ static uint64_t image_for_pc(uint64_t pc)
                 return mh;
         }
     return 0;
+}
+
+/* dladdr's dli_sname/dli_saddr: the defined symbol with the greatest value not
+ * past addr. The symbol table lives in __LINKEDIT (symoff/stroff are file
+ * offsets, converted to load addresses through that segment's fileoff/vmaddr +
+ * slide). Cache dylibs keep only a stripped local table in their split
+ * linkedit, so the bounds check below simply yields no symbol there — dladdr is
+ * still valid with dli_sname == NULL, matching its contract when nothing
+ * matches. Leading '_' is dropped to report the C name as dyld does. */
+static void image_nearest_symbol(uint64_t mh, uint64_t addr,
+                                 uint64_t *sname_out, uint64_t *saddr_out)
+{
+    *sname_out = 0;
+    *saddr_out = 0;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
+    if (!mh || h->magic != MH_MAGIC_64)
+        return;
+    uint64_t slide = image_slide(mh);
+    uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
+    uint64_t le_vmaddr = 0, le_fileoff = 0, le_filesize = 0;
+    int have_le = 0, have_sym = 0;
+    const uint8_t *lc = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_SYMTAB) {
+            const struct symtab_command *s = (const void *)lc;
+            symoff = s->symoff;
+            nsyms = s->nsyms;
+            stroff = s->stroff;
+            strsize = s->strsize;
+            have_sym = 1;
+        } else if (l->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *s = (const void *)lc;
+            if (strcmp(s->segname, "__LINKEDIT") == 0) {
+                le_vmaddr = s->vmaddr;
+                le_fileoff = s->fileoff;
+                le_filesize = s->filesize;
+                have_le = 1;
+            }
+        }
+        lc += l->cmdsize;
+    }
+    if (!have_sym || !have_le || !nsyms)
+        return;
+    if (symoff < le_fileoff || stroff < le_fileoff ||
+        symoff + (uint64_t)nsyms * sizeof(struct nlist_64) > le_fileoff + le_filesize ||
+        (uint64_t)stroff + strsize > le_fileoff + le_filesize)
+        return;
+    uint64_t symtab = le_vmaddr + slide + (symoff - le_fileoff);
+    uint64_t strtab = le_vmaddr + slide + (stroff - le_fileoff);
+    uint64_t best_val = 0, best_strx = 0;
+    int found = 0;
+    for (uint32_t i = 0; i < nsyms; i++) {
+        const struct nlist_64 *n =
+            (const struct nlist_64 *)ocerz_g2h(symtab + (uint64_t)i * sizeof(struct nlist_64));
+        if (n->n_type & N_STAB)
+            continue;
+        if ((n->n_type & N_TYPE) != N_SECT)
+            continue;
+        if (n->n_un.n_strx == 0 || (uint32_t)n->n_un.n_strx >= strsize)
+            continue;
+        uint64_t val = n->n_value + slide;
+        if (val > addr)
+            continue;
+        if (!found || val > best_val) {
+            best_val = val;
+            best_strx = n->n_un.n_strx;
+            found = 1;
+        }
+    }
+    if (!found)
+        return;
+    uint64_t namep = strtab + best_strx;
+    if (*(const char *)ocerz_g2h(namep) == '_')
+        namep += 1;
+    *saddr_out = best_val;
+    *sname_out = namep;
 }
 
 static const char *cache_path_for_mh(struct OcerzCache *cache, uint64_t mh)
@@ -403,7 +481,7 @@ static void compute_closure(struct OcerzCache *cache, uint64_t main_mh)
         uint64_t mh = queue[--qn];
         if (closure_seen(mh))
             continue;
-        const struct mach_header_64 *h = (const void *)(uintptr_t)mh;
+        const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
         if (h->magic != MH_MAGIC_64)
             continue;
         g_closure_mh[g_closure_n++] = mh;
@@ -455,7 +533,7 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache)
     g_cache_start = cache->base;
     g_cache_size = 0x40000000000ull;
 
-    compute_closure(cache, ocerz_arena_lo);
+    compute_closure(cache, ocerz_main_mh);
 
     uint64_t objc_mh = 0;
     for (uint32_t i = 0; i < cache->images_cnt; i++) {
@@ -482,7 +560,7 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache)
         g_sel_pool = sel_off ? opt + sel_off : 0;
     }
 
-    parse_build_version(ocerz_arena_lo, &g_main_bv_platform, &g_main_bv_minos, &g_main_bv_sdk);
+    parse_build_version(ocerz_main_mh, &g_main_bv_platform, &g_main_bv_minos, &g_main_bv_sdk);
 
     g_block_scratch = ocerz_map_anywhere(0x40, PROT_READ | PROT_WRITE);
 
@@ -1216,7 +1294,7 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         uint64_t path = 0;
         for (int i = 0; i < g_closure_n; i++) {
             uint64_t mh = g_closure_mh[i];
-            const struct mach_header_64 *h = (const void *)(uintptr_t)mh;
+            const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
             if (h->magic != MH_MAGIC_64)
                 continue;
             uint64_t slide = image_slide(mh);
@@ -1233,8 +1311,8 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
                 lc += l->cmdsize;
             }
             if (hit) {
-                path = mh == ocerz_arena_lo ? g_main_path
-                                            : (uint64_t)(uintptr_t)cache_path_for_mh(g_cache, mh);
+                path = mh == ocerz_main_mh ? g_main_path
+                                           : (uint64_t)(uintptr_t)cache_path_for_mh(g_cache, mh);
                 break;
             }
         }
@@ -1268,8 +1346,28 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x1b0:
         api_return(cpu, image_for_pc(cpu->gpr[OCERZ_RSI]));
         return OCERZ_STEP_OK;
+    case 0x60: {
+        uint64_t addr = cpu->gpr[OCERZ_RSI];
+        uint64_t info = cpu->gpr[OCERZ_RDX];
+        uint64_t mh = image_for_pc(addr);
+        if (!mh || !info) {
+            api_return(cpu, 0);
+            return OCERZ_STEP_OK;
+        }
+        uint64_t fname = mh == ocerz_main_mh
+                             ? g_main_path
+                             : (uint64_t)(uintptr_t)cache_path_for_mh(g_cache, mh);
+        uint64_t sname = 0, saddr = 0;
+        image_nearest_symbol(mh, addr, &sname, &saddr);
+        ocerz_st(info + 0x00, 8, fname);
+        ocerz_st(info + 0x08, 8, mh);
+        ocerz_st(info + 0x10, 8, sname);
+        ocerz_st(info + 0x18, 8, saddr);
+        api_return(cpu, 1);
+        return OCERZ_STEP_OK;
+    }
     case 0x2f0:
-        api_return(cpu, ocerz_arena_lo);
+        api_return(cpu, ocerz_main_mh);
         return OCERZ_STEP_OK;
     case 0x1f8: {
         uint64_t size_out = cpu->gpr[OCERZ_RSI];

@@ -59,6 +59,26 @@
  * vm.c): when nonzero, any ocerz_st/ocerz_st128 whose range covers it calls
  * ocerz_watch_hit, which logs value/rip/icount. The hot-path cost is one
  * always-false compare against a zero global.
+ *
+ * The low shadow window: fixed-address guests (the Wine x86_64-unix loader is
+ * non-PIE with zero rebase records — its WINE_RESERVE segment claims guest
+ * [0x1000, 0x200000000) and its __TEXT must sit at exactly 0x200000000) need
+ * guest addresses an arm64 host process can never own: the kernel SIGKILLs any
+ * arm64 binary whose __PAGEZERO is under 4GB, and the host's own arm64e shared
+ * cache occupies the band around 0x200000000. So guest VA below
+ * OCERZ_LOW_LIMIT is backed by a separate 12GB host reservation at
+ * ocerz_low_base (probed at startup from a fixed candidate list, inherited by
+ * child emulators through the OCERZ_LOWBASE environment variable so every
+ * cooperating ocerz process shares one offset): g2h(G) = G + ocerz_low_base for
+ * G < OCERZ_LOW_LIMIT, the plain affine mapping above it. The branch costs one
+ * always-false compare for programs that never enable the window
+ * (ocerz_low_base stays 0). ocerz_mem_init_low_shadow() reserves the block
+ * lazily — only loaders that meet a fixed-address image call it.
+ * ocerz_mem_register_range() reserves an additional identity-mapped guest
+ * range outside the arena (the Wine loader's WINE_TOP_DOWN at 0x7ff000000000
+ * is host-mappable as-is) so guest MAP_FIXED inside it is accepted. Commit
+ * bookkeeping is region-based: the arena, the low window, and each registered
+ * range carry their own commit bitmap.
  */
 #ifndef OCERZ_MEM_H
 #define OCERZ_MEM_H
@@ -68,15 +88,26 @@
 extern uint64_t ocerz_guest_base;
 extern uint64_t ocerz_arena_lo;
 extern uint64_t ocerz_arena_hi;
+extern uint64_t ocerz_low_base;
+extern uint64_t ocerz_top_base;
 extern uint8_t *ocerz_commpage;
 
 #define OCERZ_COMMPAGE_LO 0x00007fffffe00000ull
 #define OCERZ_COMMPAGE_HI 0x00007fffffe04000ull
+#define OCERZ_LOW_LIMIT   0x0000000300000000ull
+#define OCERZ_TOP_LO      0x00007ffffe000000ull
+#define OCERZ_TOP_HI      0x00007fffffe00000ull
 
 static inline void *ocerz_g2h(uint64_t gaddr)
 {
     if (ocerz_commpage && gaddr >= OCERZ_COMMPAGE_LO && gaddr < OCERZ_COMMPAGE_HI)
         return ocerz_commpage + (gaddr - OCERZ_COMMPAGE_LO);
+    if (ocerz_low_base) {
+        if (gaddr < OCERZ_LOW_LIMIT)
+            return (void *)(uintptr_t)(gaddr + ocerz_low_base);
+        if (gaddr - OCERZ_TOP_LO < OCERZ_TOP_HI - OCERZ_TOP_LO)
+            return (void *)(uintptr_t)(gaddr - OCERZ_TOP_LO + ocerz_top_base);
+    }
     return (void *)(uintptr_t)(gaddr + ocerz_guest_base);
 }
 
@@ -84,13 +115,24 @@ void ocerz_commpage_init(void);
 
 static inline uint64_t ocerz_h2g(const void *haddr)
 {
-    return (uint64_t)(uintptr_t)haddr - ocerz_guest_base;
+    uint64_t h = (uint64_t)(uintptr_t)haddr;
+    if (ocerz_low_base) {
+        if (h - ocerz_low_base < OCERZ_LOW_LIMIT)
+            return h - ocerz_low_base;
+        if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
+            return h - ocerz_top_base + OCERZ_TOP_LO;
+    }
+    return h - ocerz_guest_base;
 }
 
 int ocerz_mem_init(uint64_t lo, uint64_t hi);
 int ocerz_mem_init_identity(uint64_t size);
+int ocerz_mem_init_low_shadow(void);
+int ocerz_mem_register_range(uint64_t glo, uint64_t ghi);
 int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot);
+int ocerz_map_claim_region(uint64_t gaddr, uint64_t len, int prot);
+uint64_t ocerz_map_donate(uint64_t len);
 void ocerz_mem_prefork(void);
 void ocerz_mem_postfork(void);
 uint64_t ocerz_map_anywhere(uint64_t len, int prot);
