@@ -93,6 +93,7 @@ typedef struct OcerzCPU {
     struct OcerzVM *vm;
     int terminated;
     int cpu_number;
+    uint64_t wq_workloop_id;
 } OcerzCPU;
 
 void ocerz_cpu_reset(OcerzCPU *cpu);

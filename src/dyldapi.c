@@ -136,6 +136,8 @@
 
 #include <sys/mman.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <mach-o/loader.h>
 
 #define DYLDAPI_VTABLE_SIZE 0x2000
@@ -148,6 +150,7 @@ static uint64_t g_headeropt_rw;
 static uint64_t g_headeropt_ro;
 static uint64_t g_sel_pool;
 static uint64_t g_clsopt;
+static uint64_t g_protoopt;
 static uint64_t g_block_scratch;
 static uint64_t g_objc_make_mutable;
 static uint64_t g_cache_start;
@@ -157,6 +160,69 @@ uint64_t g_main_path;
 #define DYLDAPI_NOOP_OFF 0x2000
 static uint64_t g_closure_mh[DYLDAPI_CLOSURE_MAX];
 static int g_closure_n;
+
+/* The objc-runtime _dyld_objc_notify_mapped callback, captured when the guest
+ * objc registers it at boot (api_objc_register_callbacks). It is driven once
+ * over the boot closure there; ocerz_dyldapi_objc_map_one re-drives it for ONE
+ * image so a framework dlopen'd AFTER boot (e.g. AppKit soft-linking
+ * ViewBridge.framework for NSServiceViewController) gets its objc classes
+ * realized and its header-info "loaded" bit set -- exactly as dyld's
+ * notifyObjCMapped does on every dlopen. Without this a lazily-loaded cache
+ * framework's classes are found in the preopt table but reported isLoaded=0,
+ * so NSClassFromString returns nil and AppKit asserts. */
+static uint64_t g_objc_mapped_cb;
+static uint64_t g_objc_dlopen_mapped[DYLDAPI_CLOSURE_MAX];
+static int g_objc_dlopen_mapped_n;
+
+/* The main program's LC_BUILD_VERSION triple, parsed once at setup. The
+ * dyld_build_version_t availability APIs (_dyld_program_sdk_at_least and
+ * friends) compare against these; answering them with a blanket "false" (the
+ * old unimplemented-slot default) told every @available check in CF/Foundation/
+ * AppKit that the program was built against an ancient SDK and flipped the
+ * frameworks into legacy-compat behavior process-wide. */
+static uint32_t g_main_bv_platform, g_main_bv_minos, g_main_bv_sdk;
+
+static void parse_build_version(uint64_t mh, uint32_t *plat, uint32_t *minos, uint32_t *sdk)
+{
+    *plat = 0;
+    *minos = 0;
+    *sdk = 0;
+    const struct mach_header_64 *h = (const void *)(uintptr_t)mh;
+    if (!mh || h->magic != MH_MAGIC_64)
+        return;
+    const uint8_t *lc = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_BUILD_VERSION) {
+            memcpy(plat, lc + 8, 4);
+            memcpy(minos, lc + 12, 4);
+            memcpy(sdk, lc + 16, 4);
+            return;
+        }
+        if (l->cmd == LC_VERSION_MIN_MACOSX) {
+            *plat = 1;
+            memcpy(minos, lc + 8, 4);
+            memcpy(sdk, lc + 12, 4);
+            return;
+        }
+        lc += l->cmdsize;
+    }
+}
+
+/* dyld_build_version_t arrives packed in one register: low 32 = platform, high
+ * 32 = packed version (X<<16|Y<<8|Z). platform 0xffffffff is a dated "version
+ * set"; a binary built with the current SDK satisfies every shipped set, so
+ * answer true rather than decode dyld's date table. */
+static uint64_t build_version_at_least(uint32_t plat, uint32_t have, uint64_t q)
+{
+    uint32_t qplat = (uint32_t)q;
+    uint32_t qver = (uint32_t)(q >> 32);
+    if (qplat == 0xffffffffu)
+        return 1;
+    if (qplat != plat)
+        return 0;
+    return have >= qver;
+}
 
 #define DYLDAPI_DISK_MAX 64
 static uint64_t g_disk_mh[DYLDAPI_DISK_MAX];
@@ -402,17 +468,21 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache)
     }
     uint64_t opt = objc_mh ? find_section_any(objc_mh, "__objc_opt_ro") : 0;
     if (opt) {
-        int32_t ro_off = 0, rw_off = 0, cls_off = 0;
+        int32_t ro_off = 0, rw_off = 0, cls_off = 0, proto_off = 0;
         int64_t sel_off = 0;
         memcpy(&ro_off, (const void *)(uintptr_t)(opt + 0x0c), 4);
         memcpy(&rw_off, (const void *)(uintptr_t)(opt + 0x18), 4);
         memcpy(&cls_off, (const void *)(uintptr_t)(opt + 0x20), 4);
+        memcpy(&proto_off, (const void *)(uintptr_t)(opt + 0x24), 4);
         memcpy(&sel_off, (const void *)(uintptr_t)(opt + 0x28), 8);
         g_headeropt_ro = ro_off ? opt + (int64_t)ro_off : 0;
         g_headeropt_rw = rw_off ? opt + (int64_t)rw_off : 0;
         g_clsopt = cls_off ? opt + (int64_t)cls_off : 0;
+        g_protoopt = proto_off ? opt + (int64_t)proto_off : 0;
         g_sel_pool = sel_off ? opt + sel_off : 0;
     }
+
+    parse_build_version(ocerz_arena_lo, &g_main_bv_platform, &g_main_bv_minos, &g_main_bv_sdk);
 
     g_block_scratch = ocerz_map_anywhere(0x40, PROT_READ | PROT_WRITE);
 
@@ -444,6 +514,7 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
         api_return(cpu, 0);
         return OCERZ_STEP_OK;
     }
+    g_objc_mapped_cb = mapped;
 
     uint64_t mhs[DYLDAPI_CLOSURE_MAX], paths[DYLDAPI_CLOSURE_MAX], iis[DYLDAPI_CLOSURE_MAX];
     int n = 0;
@@ -490,6 +561,100 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
     cpu->gpr[OCERZ_RSP] = ret_rsp;
     cpu->gpr[OCERZ_RAX] = 0;
     return OCERZ_STEP_OK;
+}
+
+static int objc_image_already_loaded(uint64_t mh)
+{
+    for (int i = 0; i < g_closure_n; i++)
+        if (g_closure_mh[i] == mh)
+            return 1;
+    for (int i = 0; i < g_objc_dlopen_mapped_n; i++)
+        if (g_objc_dlopen_mapped[i] == mh)
+            return 1;
+    return 0;
+}
+
+/* Drive libobjc's map_images for a batch of images in one call (the boot path
+ * does this for the whole launch closure; this is the same call, factored). */
+static void objc_drive_map_images(struct OcerzVM *vm, const uint64_t *mhs, int n)
+{
+    if (!g_objc_mapped_cb || n <= 0)
+        return;
+    uint64_t infos = ocerz_map_anywhere((uint64_t)n * 0x20, PROT_READ | PROT_WRITE);
+    uint64_t istk = ocerz_map_anywhere(0x100000, PROT_READ | PROT_WRITE);
+    if (!infos || !istk)
+        return;
+    for (int k = 0; k < n; k++) {
+        uint64_t e = infos + (uint64_t)k * 0x20;
+        const char *path = cache_path_for_mh(g_cache, mhs[k]);
+        ocerz_st(e + 0x00, 8, mhs[k]);
+        ocerz_st(e + 0x08, 8, find_section_any(mhs[k], "__objc_imageinfo"));
+        ocerz_st(e + 0x10, 8, path ? ocerz_h2g(path) : 0);
+        ocerz_st(e + 0x18, 8, 0);
+    }
+    if (getenv("OCERZ_DLOPENLOG"))
+        for (int k = 0; k < n; k++)
+            fprintf(stderr, "ocerz: MAPIMG %s\n",
+                    cache_path_for_mh(g_cache, mhs[k]) ? cache_path_for_mh(g_cache, mhs[k]) : "?");
+    OCERZ_LOG("dyldapi: objc map_images (dlopen) %d image(s), first %s\n",
+              n, cache_path_for_mh(g_cache, mhs[0]) ? cache_path_for_mh(g_cache, mhs[0]) : "?");
+    uint64_t args[3] = { (uint64_t)n, infos, g_objc_make_mutable };
+    ocerz_vm_call(vm, g_objc_mapped_cb, args, 3, istk + 0x100000 - 64);
+}
+
+/* When a cache framework is dlopen'd after boot, dyld brings up its WHOLE
+ * not-yet-loaded dependency sub-closure and drives objc map_images over all of
+ * them together -- so categories a private dependency vends (e.g. AppIntents'
+ * +[NSXPCConnection ln_applicationServiceWithError:]) get attached, not just
+ * the leaf framework's own classes. Reproduce that: BFS the LC_LOAD_DYLIB tree
+ * from mh, collect every objc-bearing cache image not already loaded, and
+ * map_images the batch once. An already-loaded image's subtree is itself
+ * already loaded, so it is not re-walked. */
+void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
+{
+    if (!g_objc_mapped_cb || !mh || !g_cache || objc_image_already_loaded(mh))
+        return;
+    uint64_t queue[DYLDAPI_CLOSURE_MAX], visited[DYLDAPI_CLOSURE_MAX], batch[DYLDAPI_CLOSURE_MAX];
+    int qn = 0, vn = 0, bn = 0;
+    queue[qn++] = mh;
+    while (qn > 0 && bn < DYLDAPI_CLOSURE_MAX) {
+        uint64_t cur = queue[--qn];
+        int seen = 0;
+        for (int i = 0; i < vn; i++)
+            if (visited[i] == cur) { seen = 1; break; }
+        if (seen)
+            continue;
+        if (vn < DYLDAPI_CLOSURE_MAX)
+            visited[vn++] = cur;
+        if (objc_image_already_loaded(cur))
+            continue;
+        const struct mach_header_64 *h = (const void *)(uintptr_t)cur;
+        if (h->magic != MH_MAGIC_64)
+            continue;
+        if (find_section_any(cur, "__objc_imageinfo") && bn < DYLDAPI_CLOSURE_MAX)
+            batch[bn++] = cur;
+        const uint8_t *lc = (const uint8_t *)(h + 1);
+        for (uint32_t i = 0; i < h->ncmds; i++) {
+            const struct load_command *l = (const void *)lc;
+            if (l->cmd == LC_LOAD_DYLIB || l->cmd == LC_LOAD_WEAK_DYLIB ||
+                l->cmd == LC_REEXPORT_DYLIB || l->cmd == LC_LOAD_UPWARD_DYLIB) {
+                uint32_t noff;
+                memcpy(&noff, lc + 8, 4);
+                if (noff < l->cmdsize) {
+                    uint64_t dep = cache_find_path(g_cache, (const char *)lc + noff);
+                    if (dep && qn < DYLDAPI_CLOSURE_MAX)
+                        queue[qn++] = dep;
+                }
+            }
+            lc += l->cmdsize;
+        }
+    }
+    if (bn == 0)
+        return;
+    for (int k = 0; k < bn; k++)
+        if (g_objc_dlopen_mapped_n < (int)(sizeof g_objc_dlopen_mapped / sizeof g_objc_dlopen_mapped[0]))
+            g_objc_dlopen_mapped[g_objc_dlopen_mapped_n++] = batch[k];
+    objc_drive_map_images(vm, batch, bn);
 }
 
 #define CLSHASH_MIX(a, b, c) \
@@ -547,11 +712,16 @@ static uint64_t clshash_lookup8(const uint8_t *k, size_t length, uint64_t level)
 
 #define CLSOPT_MAX_HITS 16
 
-static int clsopt_lookup(const char *key, uint64_t *out, int max)
+/* Perfect-hash lookup over a shared-cache objc_stringhash_t table (the layout
+ * both the class table and the protocol table use: header, salt, scramble[256],
+ * tab[mask+1], checkbytes[capacity], string offsets, 64-bit object words, then
+ * a duplicates array). Returns the raw object words; the caller decodes them
+ * ((value<<1|dup-flag) with the owning dylib's header index in the top bits). */
+static int stringhash_find_raw(uint64_t table, const char *key, uint64_t *od_out, uint64_t *dups_out)
 {
-    if (!g_clsopt || !key || !key[0])
+    if (!table || !key || !key[0])
         return 0;
-    const uint8_t *t = (const uint8_t *)(uintptr_t)g_clsopt;
+    const uint8_t *t = (const uint8_t *)(uintptr_t)table;
     uint32_t capacity, shift, mask;
     uint64_t salt;
     memcpy(&capacity, t + 4, 4);
@@ -579,8 +749,16 @@ static int clsopt_lookup(const char *key, uint64_t *out, int max)
     memcpy(&so, t + off_stroffs + (uint64_t)h * 4, 4);
     if (so == 0 || strcmp((const char *)t + so, key) != 0)
         return 0;
-    uint64_t od;
-    memcpy(&od, t + off_obj + (uint64_t)h * 8, 8);
+    memcpy(od_out, t + off_obj + (uint64_t)h * 8, 8);
+    *dups_out = table + off_dups;
+    return 1;
+}
+
+static int stringhash_lookup(uint64_t table, const char *key, uint64_t *out, int max)
+{
+    uint64_t od = 0, dups = 0;
+    if (!stringhash_find_raw(table, key, &od, &dups))
+        return 0;
     if (!(od & 1)) {
         out[0] = od;
         return 1;
@@ -590,11 +768,100 @@ static int clsopt_lookup(const char *key, uint64_t *out, int max)
     int n = 0;
     for (uint32_t i = 0; i < dcnt && n < max; i++) {
         uint64_t d;
-        memcpy(&d, t + off_dups + (didx + i) * 8, 8);
+        memcpy(&d, (const void *)(uintptr_t)(dups + (didx + i) * 8), 8);
         if (!(d & 1))
             out[n++] = d;
     }
     return n;
+}
+
+static int clsopt_lookup(const char *key, uint64_t *out, int max)
+{
+    return stringhash_lookup(g_clsopt, key, out, max);
+}
+
+/* _dyld_get_objc_selector must return the cache's CANONICAL pointer for a
+ * selector name so it pointer-equals the (relative) selector references baked
+ * into cache method lists; otherwise sel_registerName mints a fresh selector
+ * and protocol/method lookups by SEL silently miss (the NSXPCInterface protocol
+ * method-signature path, e.g. -[...WMXPCServerInterface retrieveStagesWithReply:]).
+ * The selector string pool at relativeMethodSelectorBase holds every canonical
+ * selector once; a linear scan with a fixed cap missed selectors stored past
+ * the cap, so build a one-shot open-addressing string->pointer index over the
+ * whole pool and look up O(1). */
+static const char **g_selidx;
+static uint32_t g_selidx_cap;
+
+static uint64_t fnv1a(const char *s, size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static void selpool_build(void)
+{
+    if (g_selidx || !g_sel_pool)
+        return;
+    const char *base = (const char *)(uintptr_t)g_sel_pool;
+    const char *cap_end = base + 0x10000000;
+    uint64_t count = 0;
+    int zeros = 0;
+    const char *p = base, *pool_end = base;
+    while (p < cap_end) {
+        if (*p == 0) {
+            if (++zeros > 256)
+                break;
+            p++;
+            continue;
+        }
+        zeros = 0;
+        count++;
+        p += strlen(p) + 1;
+        pool_end = p;
+    }
+    uint32_t cap = 1;
+    while ((uint64_t)cap < count * 2 + 16)
+        cap <<= 1;
+    g_selidx = (const char **)calloc(cap, sizeof(const char *));
+    if (!g_selidx)
+        return;
+    g_selidx_cap = cap;
+    p = base;
+    zeros = 0;
+    while (p < pool_end) {
+        if (*p == 0) {
+            p++;
+            continue;
+        }
+        size_t l = strlen(p);
+        uint32_t h = (uint32_t)(fnv1a(p, l) & (cap - 1));
+        while (g_selidx[h])
+            h = (h + 1) & (cap - 1);
+        g_selidx[h] = p;
+        p += l + 1;
+    }
+}
+
+static uint64_t selpool_canonical(const char *want)
+{
+    if (!g_sel_pool || !want || !want[0])
+        return 0;
+    if (!g_selidx)
+        selpool_build();
+    if (!g_selidx)
+        return 0;
+    size_t wl = strlen(want);
+    uint32_t h = (uint32_t)(fnv1a(want, wl) & (g_selidx_cap - 1));
+    while (g_selidx[h]) {
+        if (strcmp(g_selidx[h], want) == 0)
+            return (uint64_t)(uintptr_t)g_selidx[h];
+        h = (h + 1) & (g_selidx_cap - 1);
+    }
+    return 0;
 }
 
 static uint64_t objc_index_loaded(uint32_t idx)
@@ -632,6 +899,59 @@ static int api_for_each_objc_class(struct OcerzVM *vm, OcerzCPU *cpu)
         uint64_t cls = g_cache_start + ((hits[i] >> 1) & ((1ull << 47) - 1));
         uint64_t loaded = objc_index_loaded((uint32_t)(hits[i] >> 48));
         uint64_t args[4] = { block, cls, loaded, g_block_scratch };
+        ocerz_vm_call(vm, invoke, args, 4, ret_rsp);
+        if (vm->exited)
+            return OCERZ_STEP_OK;
+        if (ocerz_ld(g_block_scratch, 1) & 1)
+            break;
+    }
+    cpu->rip = caller_ret;
+    cpu->gpr[OCERZ_RSP] = ret_rsp;
+    cpu->gpr[OCERZ_RAX] = 0;
+    return OCERZ_STEP_OK;
+}
+
+/* _dyld_for_each_objc_protocol: the protocol analog of for_each_objc_class
+ * (libobjc's getPreoptimizedProtocol drives NSProtocolFromString,
+ * protocol_getMethodDescription, NSXPCInterface...). Same stringhash table
+ * shape, but the duplicate runs are huge (NSObject appears in thousands of
+ * images), so iterate the run inline invoking the block per entry instead of
+ * collecting into a fixed array; libobjc's block stops at the first entry
+ * whose image is loaded. */
+static int api_for_each_objc_protocol(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t name = cpu->gpr[OCERZ_RSI];
+    uint64_t block = cpu->gpr[OCERZ_RDX];
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    uint64_t caller_ret = ocerz_ld(rsp, 8);
+    uint64_t ret_rsp = rsp + 8;
+    uint64_t invoke = block ? ocerz_ld(block + 0x10, 8) : 0;
+    uint64_t od = 0, dups = 0;
+    int found = 0;
+    if (name && invoke && g_block_scratch)
+        found = stringhash_find_raw(g_protoopt, (const char *)ocerz_g2h(name), &od, &dups);
+    OCERZ_LOG("dyldapi: for_each_objc_protocol \"%s\" -> %s\n",
+              name ? (const char *)ocerz_g2h(name) : "(null)", found ? "hit" : "miss");
+    if (!found) {
+        api_return(cpu, 0);
+        return OCERZ_STEP_OK;
+    }
+    ocerz_st(g_block_scratch, 8, 0);
+    uint64_t run_base = 0, run_cnt = 1;
+    if (od & 1) {
+        run_base = dups + ((od >> 1) & ((1ull << 47) - 1)) * 8;
+        run_cnt = od >> 48;
+    }
+    for (uint64_t i = 0; i < run_cnt; i++) {
+        uint64_t d = od;
+        if (od & 1) {
+            memcpy(&d, (const void *)(uintptr_t)(run_base + i * 8), 8);
+            if (d & 1)
+                continue;
+        }
+        uint64_t proto = g_cache_start + ((d >> 1) & ((1ull << 47) - 1));
+        uint64_t loaded = objc_index_loaded((uint32_t)(d >> 48));
+        uint64_t args[4] = { block, proto, loaded, g_block_scratch };
         ocerz_vm_call(vm, invoke, args, 4, ret_rsp);
         if (vm->exited)
             return OCERZ_STEP_OK;
@@ -761,11 +1081,65 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x210:
         api_return(cpu, 1);
         return OCERZ_STEP_OK;
+    case 0x238:
+        api_return(cpu, build_version_at_least(g_main_bv_platform, g_main_bv_sdk,
+                                               cpu->gpr[OCERZ_RSI]));
+        return OCERZ_STEP_OK;
+    case 0x240:
+        api_return(cpu, build_version_at_least(g_main_bv_platform, g_main_bv_minos,
+                                               cpu->gpr[OCERZ_RSI]));
+        return OCERZ_STEP_OK;
+    case 0x228:
+    case 0x230: {
+        uint32_t plat, minos, sdk;
+        parse_build_version(cpu->gpr[OCERZ_RSI], &plat, &minos, &sdk);
+        api_return(cpu, build_version_at_least(plat, off == 0x228 ? sdk : minos,
+                                               cpu->gpr[OCERZ_RDX]));
+        return OCERZ_STEP_OK;
+    }
+    case 0x198:
+    case 0x1a0:
+    case 0x328:
+    case 0x360:
+    case 0x3c8:
+    case 0x3d0:
+        api_return(cpu, 0);
+        return OCERZ_STEP_OK;
+    case 0x1e8: {
+        uint64_t addr = cpu->gpr[OCERZ_RSI];
+        uint64_t len = cpu->gpr[OCERZ_RDX];
+        api_return(cpu, in_cache(addr) && in_cache(addr + len));
+        return OCERZ_STEP_OK;
+    }
+    case 0x318:
+    case 0x320:
+    case 0x368:
+    case 0x370:
+        cpu->gpr[OCERZ_RDX] = 0;
+        api_return(cpu, 2);
+        return OCERZ_STEP_OK;
+    case 0x2b0:
+        return api_for_each_objc_protocol(vm, cpu);
+    case 0x2d8:
+        api_return(cpu, cpu->gpr[OCERZ_RSI] && g_cache &&
+                        cache_find_path(g_cache, (const char *)ocerz_g2h(cpu->gpr[OCERZ_RSI])) != 0);
+        return OCERZ_STEP_OK;
     case 0x68:
     case 0x2e0: {
         uint64_t pathg = cpu->gpr[OCERZ_RSI];
         uint64_t mode = cpu->gpr[OCERZ_RDX];
         const char *host = pathg ? (const char *)ocerz_g2h(pathg) : NULL;
+        if (host && getenv("OCERZ_DLBT") && strstr(host, getenv("OCERZ_DLBT"))) {
+            fprintf(stderr, "ocerz: DLBT dlopen(\"%s\") caller-chain:", host);
+            uint64_t fp = cpu->gpr[OCERZ_RBP];
+            for (int d = 0; d < 14 && fp >= 0x300000000ull; d++) {
+                fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+                uint64_t nf = ocerz_ld(fp, 8);
+                if (nf <= fp) break;
+                fp = nf;
+            }
+            fprintf(stderr, "\n");
+        }
         OcerzCPU saved = *cpu;
         uint64_t h = ocerz_dlopen(vm, host, (int)mode);
         *cpu = saved;
@@ -880,6 +1254,13 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
             ocerz_st(info + 0x10, 8, eh ? eh_sz : 0);
             ocerz_st(info + 0x18, 8, cu);
             ocerz_st(info + 0x20, 8, cu ? cu_sz : 0);
+            if (getenv("OCERZ_UNWLOG"))
+                fprintf(stderr, "ocerz: UNWLOG pc=%#llx mh=%#llx eh=%#llx eh_sz=%#llx cu=%#llx cu_sz=%#llx\n",
+                        (unsigned long long)pc, (unsigned long long)mh,
+                        (unsigned long long)eh, (unsigned long long)eh_sz,
+                        (unsigned long long)cu, (unsigned long long)cu_sz);
+        } else if (getenv("OCERZ_UNWLOG")) {
+            fprintf(stderr, "ocerz: UNWLOG pc=%#llx mh=0 (no image)\n", (unsigned long long)pc);
         }
         api_return(cpu, mh ? 1 : 0);
         return OCERZ_STEP_OK;
@@ -947,20 +1328,9 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         return OCERZ_STEP_OK;
     case 0x2a0: {
         uint64_t name = cpu->gpr[OCERZ_RSI];
-        uint64_t result = 0;
-        if (name && g_sel_pool) {
-            const char *want = (const char *)ocerz_g2h(name);
-            const char *p = (const char *)(uintptr_t)g_sel_pool;
-            const char *end = p + 0x400000;
-            while (p < end) {
-                size_t l = strlen(p);
-                if (l && strcmp(p, want) == 0) {
-                    result = (uint64_t)(uintptr_t)p;
-                    break;
-                }
-                p += l + 1;
-            }
-        }
+        uint64_t result = name ? selpool_canonical((const char *)ocerz_g2h(name)) : 0;
+        if (!result && name && getenv("OCERZ_SELLOG"))
+            fprintf(stderr, "ocerz: SELMISS \"%s\"\n", (const char *)ocerz_g2h(name));
         api_return(cpu, result);
         return OCERZ_STEP_OK;
     }

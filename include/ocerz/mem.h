@@ -97,6 +97,7 @@ uint64_t ocerz_map_anywhere(uint64_t len, int prot);
 uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align);
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_unmap(uint64_t gaddr, uint64_t len);
+int ocerz_addr_committed(uint64_t gaddr);
 
 static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
 {
@@ -112,11 +113,14 @@ static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
 }
 
 extern uint64_t ocerz_watch_addr;
+extern uint64_t ocerz_watch_val;
 void ocerz_watch_hit(uint64_t gaddr, int size, uint64_t lo, uint64_t hi);
 
 static inline void ocerz_st(uint64_t gaddr, int size, uint64_t v)
 {
     if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
+        ocerz_watch_hit(gaddr, size, v, 0);
+    if (ocerz_watch_val && v == ocerz_watch_val)
         ocerz_watch_hit(gaddr, size, v, 0);
     void *p = ocerz_g2h(gaddr);
     switch (size) {
@@ -138,6 +142,8 @@ static inline Ocerz128 ocerz_ld128(uint64_t gaddr)
 static inline void ocerz_st128(uint64_t gaddr, Ocerz128 v)
 {
     if (ocerz_watch_addr && ocerz_watch_addr - gaddr < 16)
+        ocerz_watch_hit(gaddr, 16, v.lo, v.hi);
+    if (ocerz_watch_val && (v.lo == ocerz_watch_val || v.hi == ocerz_watch_val))
         ocerz_watch_hit(gaddr, 16, v.lo, v.hi);
     memcpy(ocerz_g2h(gaddr), &v, 16);
 }

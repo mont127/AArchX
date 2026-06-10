@@ -226,6 +226,16 @@ static void mach_ret(OcerzCPU *cpu, uint64_t kr)
 
 static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
+    if (getenv("OCERZ_EXITLOG")) {
+        fprintf(stderr, "ocerz: EXITLOG code=%d rip=%#llx ret-chain:",
+                (int)a[0], (unsigned long long)cpu->rip);
+        uint64_t fp = cpu->gpr[OCERZ_RBP];
+        for (int d = 0; d < 8 && fp >= ocerz_arena_lo && fp < ocerz_arena_hi; d++) {
+            fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+            fp = ocerz_ld(fp, 8);
+        }
+        fprintf(stderr, "\n");
+    }
     ocerz_vm_request_exit(vm, (int)(uint32_t)a[0] & 0xff);
     return OCERZ_STEP_EXIT;
 }
@@ -378,6 +388,52 @@ struct ocerz_worker {
 
 static volatile int g_wq_running;
 
+/* Active-workloop registry. A dispatch workloop is serviced by AT MOST one
+ * Ocerz worker at a time: wl_try_acquire claims a workloop id on a commit and
+ * the worker releases it when it exits. This is what lets a worker re-arm its
+ * own workloop (kevent_id with the same id) WITHOUT forking a second worker,
+ * while still letting a DIFFERENT workloop's wakeup summon its own worker --
+ * the single global running-count gate dropped those cross-workloop wakeups and
+ * left queues released-while-enqueued. */
+static uint64_t g_active_wl[128];
+static pthread_mutex_t g_wl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int wl_try_acquire(uint64_t id)
+{
+    if (id == 0)
+        return 0;
+    pthread_mutex_lock(&g_wl_lock);
+    int slot = -1;
+    for (int i = 0; i < 128; i++) {
+        if (g_active_wl[i] == id) {
+            pthread_mutex_unlock(&g_wl_lock);
+            return 0;
+        }
+        if (g_active_wl[i] == 0 && slot < 0)
+            slot = i;
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_wl_lock);
+        return 0;
+    }
+    g_active_wl[slot] = id;
+    pthread_mutex_unlock(&g_wl_lock);
+    return 1;
+}
+
+static void wl_release(uint64_t id)
+{
+    if (id == 0)
+        return;
+    pthread_mutex_lock(&g_wl_lock);
+    for (int i = 0; i < 128; i++)
+        if (g_active_wl[i] == id) {
+            g_active_wl[i] = 0;
+            break;
+        }
+    pthread_mutex_unlock(&g_wl_lock);
+}
+
 static int ocerz_cpu_count(void)
 {
     static int n;
@@ -408,6 +464,7 @@ static void *ocerz_worker_entry(void *p)
     ocerz_st(w->cpu.gpr[OCERZ_RDI] + 0xf8, 4, (uint64_t)(uint32_t)kp);
     ocerz_vm_run_cpu(w->vm, &w->cpu);
     mach_port_deallocate(mach_task_self(), kp);
+    wl_release(w->cpu.wq_workloop_id);
     __atomic_fetch_sub(&g_wq_running, 1, __ATOMIC_SEQ_CST);
     free(w);
     return NULL;
@@ -645,7 +702,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 qos_idx = 1;
             if (qos_idx > 6)
                 qos_idx = 6;
-            t.gpr[OCERZ_RSP] = pth;
+            t.gpr[OCERZ_RSP] = pth - 0x100;
             t.gpr[OCERZ_RDI] = pth;
             t.gpr[OCERZ_RSI] = 0;
             t.gpr[OCERZ_RDX] = pth;
@@ -674,33 +731,57 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 #define OCERZ_WQ_FLAG_BASE   (0x40000ull | 0x200000ull | 0x4000ull)
 #define OCERZ_WQ_FLAG_WORKLOOP 0x80000ull
 
-/* Spawn one workqueue worker entering _pthread_wqthread in WORKLOOP mode with a
- * fired-event list copied from the guest changelist (EV_ADD/EV_ENABLE cleared),
- * so _dispatch_workloop_worker_thread drains the workloop the guest just woke
- * and runs the enqueued block -- the path AppKit's NSApplication bring-up needs
- * and that the plain REQTHREADS pool never services. The events live above the
- * worker's pthread struct (pth+0x8000, inside the region's top slack, clear of
+#define OCERZ_EVFILT_WORKLOOP (-17)
+
+/* Spawn one workqueue worker entering _pthread_wqthread in WORKLOOP mode to
+ * service the workloop the guest just woke. The kernel hands such a worker ONLY
+ * the EVFILT_WORKLOOP thread-request event -- never the workloop's source
+ * registrations -- so the worker drains the workloop's enqueued blocks without
+ * trying to receive from a mach-port source that has no message (echoing the
+ * EVFILT_MACHPORT registrations made _dispatch trip "Unexpected error from mach
+ * recv"). We therefore copy only the EVFILT_WORKLOOP (-17) changelist entries
+ * into the worker's event list (EV_ADD/EV_ENABLE cleared to fired form), take
+ * the QoS from the first of them, and skip the spawn entirely when the commit
+ * carries no thread request (a pure source registration). The events live above
+ * the worker's pthread struct (pth+0x8000, in the region's top slack, clear of
  * the down-growing stack at pth). */
 static int ocerz_spawn_workloop_worker(OcerzVM *vm, const OcerzCPU *cpu,
-                                       uint64_t prio, uint64_t changelist, int nchanges)
+                                       uint64_t workloop_id, uint64_t changelist, int nchanges)
 {
     if (nchanges > 16)
         nchanges = 16;
+    int has_wl = 0;
+    for (int i = 0; i < nchanges; i++)
+        if ((int16_t)ocerz_ld(changelist + (uint64_t)i * OCERZ_KEVENT_QOS_S + 8, 2)
+            == OCERZ_EVFILT_WORKLOOP) {
+            has_wl = 1;
+            break;
+        }
+    if (!has_wl)
+        return -1;
     uint64_t cookie = ocerz_ld(OCERZ_PTHREAD_COOKIE, 8);
     uint64_t region = ocerz_map_anywhere(0x200000, PROT_READ | PROT_WRITE);
     if (region == 0)
         return -1;
     uint64_t pth = region + 0x1f0000;
     uint64_t evbuf = pth + 0x8000;
+    int nev = 0;
+    uint64_t prio = 0;
     for (int i = 0; i < nchanges; i++) {
         uint64_t src = changelist + (uint64_t)i * OCERZ_KEVENT_QOS_S;
-        uint64_t dst = evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S;
+        if ((int16_t)ocerz_ld(src + 8, 2) != OCERZ_EVFILT_WORKLOOP)
+            continue;
+        uint64_t dst = evbuf + (uint64_t)nev * OCERZ_KEVENT_QOS_S;
         for (uint64_t off = 0; off < OCERZ_KEVENT_QOS_S; off += 8)
             ocerz_st(dst + off, 8, ocerz_ld(src + off, 8));
         uint16_t fl = (uint16_t)ocerz_ld(dst + 0x0a, 2);
         fl &= (uint16_t) ~(uint16_t)(0x0001u | 0x0004u);
         ocerz_st(dst + 0x0a, 2, fl);
+        if (nev == 0)
+            prio = (uint32_t)ocerz_ld(src + 0x0c, 4);
+        nev++;
     }
+    int nchanges_out = nev;
     __atomic_fetch_add(&g_wq_running, 1, __ATOMIC_SEQ_CST);
     ocerz_st(pth, 8, pth ^ cookie);
     ocerz_st(pth + 0xe0, 8, pth);
@@ -708,25 +789,139 @@ static int ocerz_spawn_workloop_worker(OcerzVM *vm, const OcerzCPU *cpu,
     t.terminated = 0;
     t.cpu_number = ocerz_next_cpu_number();
     t.rip = OCERZ_START_WQTHREAD;
+    for (int r = 0; r < 16; r++)
+        t.gpr[r] = 0;
     uint32_t qosbits = (uint32_t)((prio >> 8) & 0x3fff);
     int qos_idx = qosbits ? (__builtin_ctz(qosbits) + 1) : 4;
     if (qos_idx < 1)
         qos_idx = 1;
     if (qos_idx > 6)
         qos_idx = 6;
-    t.gpr[OCERZ_RSP] = pth;
+    t.gpr[OCERZ_RSP] = pth - 0x100;
     t.gpr[OCERZ_RDI] = pth;
     t.gpr[OCERZ_RSI] = 0;
     t.gpr[OCERZ_RDX] = pth;
     t.gpr[OCERZ_RCX] = evbuf;
     t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | OCERZ_WQ_FLAG_WORKLOOP | (uint64_t)qos_idx;
-    t.gpr[OCERZ_R9] = (uint64_t)nchanges;
+    t.gpr[OCERZ_R9] = (uint64_t)nchanges_out;
     t.gs_base = pth + 0xe0;
+    t.wq_workloop_id = workloop_id;
     if (ocerz_spawn_worker(vm, &t) != 0) {
         __atomic_fetch_sub(&g_wq_running, 1, __ATOMIC_SEQ_CST);
         return -1;
     }
     return 0;
+}
+
+/* FAITHFUL workqueue path (OCERZ_HOSTWQ): instead of ocerz emulating the
+ * kernel's thread-request and hand-building events, register OUR OWN host
+ * (arm64) workqueue worker callbacks with the REAL kernel and forward the
+ * guest's kevent ops to it. The kernel then decides when to bring up a worker,
+ * delivers a FAITHFUL kevent it owns, and manages the workloop's serial drain
+ * ownership -- everything the synthetic worker got subtly wrong. Each kernel-
+ * spawned host worker thread enters one of these callbacks, which bridges into
+ * the guest emulator at the guest's start_wqthread with the real event. Phase 1
+ * here only logs, to confirm the kernel actually calls back. */
+typedef unsigned long ocerz_pthread_priority_t;
+extern int _pthread_workqueue_init_with_workloop(
+    void (*queue_func)(ocerz_pthread_priority_t),
+    void (*kevent_func)(void **events, int *nevents),
+    void (*workloop_func)(uint64_t *workloop_id, void **events, int *nevents),
+    int offset, int flags);
+
+static OcerzVM *g_hostwq_vm;
+
+/* Bridge a kernel-spawned host worker thread into the guest: build a guest
+ * worker context, copy the kernel-delivered kevent array into guest memory, and
+ * run the guest emulator inline from the guest's start_wqthread. The guest's
+ * _pthread_wqthread -> _dispatch_*_worker_thread then drains FAITHFULLY off the
+ * kernel's own event. When the guest worker finishes (its start_wqthread ud2,
+ * handled as a clean terminate in interp.c), ocerz_vm_run_cpu returns and we
+ * return to libpthread, which parks/recycles this host thread -- so serial-
+ * ownership and park-and-reuse are the real kernel's job, not ours. */
+static __thread uint64_t g_hostwq_tl_region;
+
+static void ocerz_hostwq_bridge(uint64_t extra_r8, const void *hev, int nev)
+{
+    OcerzVM *vm = g_hostwq_vm;
+    if (!vm || nev <= 0 || !hev)
+        return;
+    if (nev > 16)
+        nev = 16;
+    uint64_t cookie = ocerz_ld(OCERZ_PTHREAD_COOKIE, 8);
+    /* One guest worker region per HOST workqueue thread, reused across the many
+     * callbacks the kernel routes through this recycled thread -- allocating a
+     * fresh 2MB region per callback would bump-exhaust the arena within a few
+     * thousand wakeups and then silently fail to bring up workers. */
+    uint64_t region = g_hostwq_tl_region;
+    if (region == 0) {
+        region = ocerz_map_anywhere(0x200000, PROT_READ | PROT_WRITE);
+        if (region == 0)
+            return;
+        g_hostwq_tl_region = region;
+    }
+    uint64_t pth = region + 0x1f0000;
+    uint64_t evbuf = pth + 0x8000;
+    for (int i = 0; i < nev; i++)
+        memcpy(ocerz_g2h(evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S),
+               (const char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S, OCERZ_KEVENT_QOS_S);
+    mach_port_t kp = mach_thread_self();
+    ocerz_st(pth, 8, pth ^ cookie);
+    ocerz_st(pth + 0xe0, 8, pth);
+    ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)kp);
+    OcerzCPU t;
+    memset(&t, 0, sizeof t);
+    t.vm = vm;
+    t.mxcsr = 0x1f80;
+    t.fcw = 0x037f;
+    t.cpu_number = ocerz_next_cpu_number();
+    t.rip = OCERZ_START_WQTHREAD;
+    t.gpr[OCERZ_RSP] = pth - 0x100;
+    t.gpr[OCERZ_RDI] = pth;
+    t.gpr[OCERZ_RSI] = kp;
+    t.gpr[OCERZ_RDX] = pth;
+    t.gpr[OCERZ_RCX] = evbuf;
+    t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | extra_r8 | 4u;
+    t.gpr[OCERZ_R9] = (uint64_t)nev;
+    t.gs_base = pth + 0xe0;
+    ocerz_vm_run_cpu(vm, &t);
+    mach_port_deallocate(mach_task_self(), kp);
+}
+
+static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
+{
+    (void)pri;
+}
+
+static void ocerz_hostwq_kevent_cb(void **events, int *nevents)
+{
+    ocerz_hostwq_bridge(0, events ? *events : NULL, nevents ? *nevents : 0);
+    if (nevents)
+        *nevents = 0;
+}
+
+static void ocerz_hostwq_workloop_cb(uint64_t *workloop_id, void **events, int *nevents)
+{
+    (void)workloop_id;
+    ocerz_hostwq_bridge(OCERZ_WQ_FLAG_WORKLOOP, events ? *events : NULL, nevents ? *nevents : 0);
+    if (nevents)
+        *nevents = 0;
+}
+
+static void ocerz_hostwq_register(OcerzVM *vm)
+{
+    static int done;
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&m);
+    if (!done) {
+        done = 1;
+        g_hostwq_vm = vm;
+        int rc = _pthread_workqueue_init_with_workloop(
+            ocerz_hostwq_queue_cb, ocerz_hostwq_kevent_cb, ocerz_hostwq_workloop_cb, 0, 0);
+        if (getenv("OCERZ_HOSTWQ_LOG"))
+            fprintf(stderr, "ocerz: HOSTWQ registered rc=%d\n", rc);
+    }
+    pthread_mutex_unlock(&m);
 }
 
 /* kevent_id(uint64_t id, changelist, nchanges, eventlist, nevents, flags): the
@@ -739,12 +934,39 @@ static int ocerz_spawn_workloop_worker(OcerzVM *vm, const OcerzCPU *cpu,
  * default is the historical no-op stub so make check is unchanged. */
 static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
+    if (getenv("OCERZ_HOSTWQ")) {
+        ocerz_hostwq_register(vm);
+        /* kevent_id is an 8-arg syscall: id, changelist, nchanges, eventlist,
+         * nevents, data_out, data_available, flags. Only 6 args reach registers;
+         * data_available (a[6]) and flags (a[7], carrying KEVENT_FLAG_WORKLOOP)
+         * sit on the guest stack. Forward all 8, translating the four pointer
+         * args (changelist, eventlist, data_out, data_available). */
+        uint64_t fa[8];
+        memcpy(fa, a, sizeof fa);
+        fa[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
+        fa[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
+        if (fa[1]) fa[1] = (uint64_t)(uintptr_t)ocerz_g2h(fa[1]);
+        if (fa[3]) fa[3] = (uint64_t)(uintptr_t)ocerz_g2h(fa[3]);
+        if (fa[5]) fa[5] = (uint64_t)(uintptr_t)ocerz_g2h(fa[5]);
+        if (fa[6]) fa[6] = (uint64_t)(uintptr_t)ocerz_g2h(fa[6]);
+        uint64_t ret2 = 0;
+        int err = 0;
+        uint64_t r = ocerz_host_syscall(375, fa, &ret2, &err);
+        if (err)
+            ret_err(cpu, r);
+        else
+            ret_ok(cpu, r);
+        return OCERZ_STEP_OK;
+    }
     if (getenv("OCERZ_KEVENT_WORKER")) {
         uint64_t changelist = a[1];
         int nchanges = (int)a[2];
         if (nchanges > 0 && changelist != 0 &&
-            __atomic_load_n(&g_wq_running, __ATOMIC_SEQ_CST) == 0)
-            ocerz_spawn_workloop_worker(vm, cpu, 0, changelist, nchanges);
+            __atomic_load_n(&g_wq_running, __ATOMIC_SEQ_CST) == 0 &&
+            wl_try_acquire(a[0])) {
+            if (ocerz_spawn_workloop_worker(vm, cpu, a[0], changelist, nchanges) != 0)
+                wl_release(a[0]);
+        }
     }
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
@@ -791,9 +1013,33 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+/* The kernel's half of the pthread-join handshake. A joiner sleeps in
+ * __ulock_wait(UL_COMPARE_AND_WAIT, &pth->join_word, kport) -- the u32 at
+ * pthread+0x34 holding the exiting thread's kernel port -- and XNU's
+ * bsdthread_terminate clears that word and wakes the waiter once the thread is
+ * truly dead (uthread_joiner_wake). Without this, pthread_join either hangs or,
+ * worse, the exiting thread's pre-terminate courtesy wake lets the joiner's
+ * compare-wait return while the word still holds the kport, and libpthread's
+ * retry logic misreads the state (mtstress: main "joined" early and exited
+ * before its final output). The dead-thread sentinel is UINT32_MAX, not 0: _pthread_join's
+ * already-exited fast path is `cmp dword [pth+0x34], -1` (an exiting thread
+ * with NO registered joiner stores -1 itself from userspace, which is why only
+ * the joiner-registered-first case broke). Store -1 and wake as the kernel
+ * does; the wake op mirrors the waiter's (UL_COMPARE_AND_WAIT | ULF_NO_ERRNO). */
+#define OCERZ_PTH_JOIN_WORD 0x34
+
 static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
+    uint64_t pth = cpu->gs_base - 0xe0;
+    uint64_t jw = pth + OCERZ_PTH_JOIN_WORD;
+    if (pth > ocerz_arena_lo && pth < ocerz_arena_hi &&
+        (uint32_t)ocerz_ld(jw, 4) == (uint32_t)a[2]) {
+        ocerz_st(jw, 4, 0xffffffffull);
+        uint64_t wa[8] = { 0x1000002ull, (uint64_t)(uintptr_t)ocerz_g2h(jw), 0, 0, 0, 0, 0, 0 };
+        int err = 0;
+        ocerz_host_syscall(516, wa, NULL, &err);
+    }
     if (a[3] != 0)
         semaphore_signal((semaphore_t)a[3]);
     cpu->terminated = 1;
@@ -1093,6 +1339,19 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [515] = { "ulock_wait",  4, 0x02, 0, NULL },
     [516] = { "ulock_wake",  3, 0x02, 0, NULL },
     [544] = { "ulock_wait2", 5, 0x02, 0, NULL },
+    [301] = { "psynch_mutexwait", 5, 0x01, 0, NULL },
+    [302] = { "psynch_mutexdrop", 5, 0x01, 0, NULL },
+    [303] = { "psynch_cvbroad",   7, 0x11, 0, NULL },
+    [304] = { "psynch_cvsignal",  7, 0x11, 0, NULL },
+    [305] = { "psynch_cvwait",    8, 0x09, 0, NULL },
+    [306] = { "psynch_rw_longrdlock", 5, 0x01, 0, NULL },
+    [307] = { "psynch_rw_yieldwrlock", 5, 0x01, 0, NULL },
+    [309] = { "psynch_rw_upgrade", 5, 0x01, 0, NULL },
+    [310] = { "psynch_rw_rdlock",  5, 0x01, 0, NULL },
+    [311] = { "psynch_rw_wrlock",  5, 0x01, 0, NULL },
+    [312] = { "psynch_rw_unlock",  5, 0x01, 0, NULL },
+    [313] = { "psynch_rw_unlock2", 5, 0x01, 0, NULL },
+    [529] = { "psynch_cvclrprepost", 7, 0x01, 0, NULL },
     [396] = { "read_nocancel",  3, 0x02, 0, NULL },
     [397] = { "write_nocancel", 3, 0x02, 0, NULL },
     [398] = { "open_nocancel",  3, 0x01, 0, NULL },
@@ -1125,7 +1384,7 @@ static void strace_bsd(OcerzVM *vm, const ocerz_bsd_entry *e, int num,
 {
     if (!vm->strace)
         return;
-    fprintf(stderr, "ocerz: syscall %s(", e && e->name ? e->name : "?");
+    fprintf(stderr, "ocerz: [t%d] syscall %s(", cpu->cpu_number, e && e->name ? e->name : "?");
     int n = e ? e->nargs : 6;
     if (n > 6)
         n = 6;
@@ -1436,6 +1695,13 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 94: { /* mk_timer_cancel_trap(name, result_time*) */
         if (a[1] != 0)
             a[1] = (uint64_t)(uintptr_t)ocerz_g2h(a[1]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
+    case 41: { /* _kernelrpc_mach_port_guard_trap(task, name, guard*, strict);
+                * the guard cookie/struct (a[2]) is a guest pointer. */
+        if (a[2] != 0)
+            a[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }

@@ -156,16 +156,18 @@ static void commit_bm_alloc(void)
     commit_bm = (uint8_t *)calloc(1, (size_t)((npages + 7) / 8));
 }
 
-static int commit_range(uint64_t lo, uint64_t hi, int hprot, int zero_overlap)
+static int commit_range(uint64_t lo, uint64_t hi, int hprot, uint64_t zlo, uint64_t zhi)
 {
     for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
         size_t i = pg_index(p);
         void *hp = ocerz_g2h(p);
         if (bit_test(i)) {
-            if (zero_overlap) {
+            uint64_t mlo = p > zlo ? p : zlo;
+            uint64_t mhi = p + OCERZ_HOST_PAGE < zhi ? p + OCERZ_HOST_PAGE : zhi;
+            if (mlo < mhi) {
                 if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) != 0)
                     return OCERZ_ENOMEM;
-                memset(hp, 0, (size_t)OCERZ_HOST_PAGE);
+                memset(ocerz_g2h(mlo), 0, (size_t)(mhi - mlo));
             }
             if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, hprot) != 0)
                 return OCERZ_ENOMEM;
@@ -223,7 +225,9 @@ static int map_fixed_locked(uint64_t gaddr, uint64_t len, int prot, int zero_ove
     uint64_t hi = round_up(gaddr + len);
     if (lo < ocerz_arena_lo || hi > ocerz_arena_hi)
         return OCERZ_ENOMEM;
-    return commit_range(lo, hi, host_prot(prot), zero_overlap);
+    return commit_range(lo, hi, host_prot(prot),
+                        zero_overlap ? gaddr : 0,
+                        zero_overlap ? gaddr + len : 0);
 }
 
 int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot)
@@ -293,12 +297,20 @@ int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot)
 
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
 {
-    uint64_t lo = round_down(gaddr);
-    uint64_t hi = round_up(gaddr + len);
+    uint64_t lo, hi;
+    if (host_prot(prot) == PROT_NONE) {
+        lo = round_up(gaddr);
+        hi = round_down(gaddr + len);
+        if (lo >= hi)
+            return OCERZ_OK;
+    } else {
+        lo = round_down(gaddr);
+        hi = round_up(gaddr + len);
+    }
     if (lo < ocerz_arena_lo || hi > ocerz_arena_hi)
         return OCERZ_ENOMEM;
     pthread_mutex_lock(&map_lock);
-    int rc = commit_range(lo, hi, host_prot(prot), 0);
+    int rc = commit_range(lo, hi, host_prot(prot), 0, 0);
     pthread_mutex_unlock(&map_lock);
     return rc;
 }
@@ -328,4 +340,11 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len)
     }
     pthread_mutex_unlock(&map_lock);
     return rc;
+}
+
+int ocerz_addr_committed(uint64_t gaddr)
+{
+    if (gaddr < ocerz_arena_lo || gaddr >= ocerz_arena_hi)
+        return -1;
+    return bit_test(pg_index(gaddr)) ? 1 : 0;
 }
