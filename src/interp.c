@@ -89,6 +89,20 @@ int ocerz_unimpl(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn, const c
     return OCERZ_STEP_FATAL;
 }
 
+int ocerz_cftrap_on;
+
+void ocerz_cftrap(const OcerzCPU *cpu, uint64_t src, uint64_t target, const char *kind)
+{
+    fprintf(stderr, "ocerz: CFTRAP %s cpu=%d src=%#llx target=%#llx "
+            "rax=%#llx rcx=%#llx rdx=%#llx rsi=%#llx rdi=%#llx r10=%#llx r11=%#llx [rsp]=%#llx\n",
+            kind, cpu->cpu_number, (unsigned long long)src, (unsigned long long)target,
+            (unsigned long long)cpu->gpr[OCERZ_RAX], (unsigned long long)cpu->gpr[OCERZ_RCX],
+            (unsigned long long)cpu->gpr[OCERZ_RDX], (unsigned long long)cpu->gpr[OCERZ_RSI],
+            (unsigned long long)cpu->gpr[OCERZ_RDI], (unsigned long long)cpu->gpr[OCERZ_R10],
+            (unsigned long long)cpu->gpr[OCERZ_R11],
+            (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
+}
+
 static int trap_fatal(const X86Insn *insn, const char *msg)
 {
     fprintf(stderr, "ocerz: fatal: %s at rip=%#llx\n  bytes: ",
@@ -745,8 +759,11 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_JMP: {
         if (insn->ops[0].kind == OCERZ_OPK_IMM)
             cpu->rip = insn->ops[0].imm;
-        else
+        else {
             cpu->rip = ocerz_read_op(cpu, insn, &insn->ops[0]);
+            if (ocerz_cftrap_on && cpu->rip - 0x7ff840000000ull < 0x10000000ull)
+                ocerz_cftrap(cpu, insn->rip, cpu->rip, "jmp");
+        }
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_JCC:
@@ -785,8 +802,11 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         uint64_t target;
         if (insn->ops[0].kind == OCERZ_OPK_IMM)
             target = insn->ops[0].imm;
-        else
+        else {
             target = ocerz_read_op(cpu, insn, &insn->ops[0]);
+            if (ocerz_cftrap_on && target - 0x7ff840000000ull < 0x10000000ull)
+                ocerz_cftrap(cpu, insn->rip, target, "call");
+        }
         ocerz_push(cpu, 8, cpu->rip);
         cpu->rip = target;
         return OCERZ_STEP_OK;
@@ -866,6 +886,9 @@ static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
                 ocerz_flag_assign(cpu, OCERZ_ZF, 0);
             }
         } else {
+            if ((addr & 15) && getenv("OCERZ_CASLOG"))
+                fprintf(stderr, "ocerz: CMPXCHG16B MISALIGNED addr=%#llx rip=%#llx\n",
+                        (unsigned long long)addr, (unsigned long long)insn->rip);
             __uint128_t expected = ((__uint128_t)cpu->gpr[OCERZ_RDX] << 64) | cpu->gpr[OCERZ_RAX];
             __uint128_t store = ((__uint128_t)cpu->gpr[OCERZ_RCX] << 64) | cpu->gpr[OCERZ_RBX];
             __uint128_t e = expected;
@@ -924,7 +947,10 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
         fprintf(stderr, "ocerz: fatal: decode failed (%d) at rip=%#llx\n  bytes: ",
                 rc, (unsigned long long)cpu->rip);
         dump_raw_bytes(stderr, cpu->rip, 15);
-        fprintf(stderr, "\n");
+        fprintf(stderr, "\n  [rsp]=%#llx [rsp+8]=%#llx rbp-ret=%#llx\n",
+                (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8),
+                (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8),
+                (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RBP] + 8, 8));
         return OCERZ_STEP_FATAL;
     }
 

@@ -80,17 +80,80 @@
 
 static OcerzVM *g_vm;
 static __thread OcerzCPU *g_cur_cpu;
+static int g_crash_stack;
 
 uint64_t ocerz_watch_addr;
+uint64_t ocerz_watch_val;
+uint64_t ocerz_exc_trap;
+uint64_t ocerz_bt_lo, ocerz_bt_hi;
+static int ocerz_bt_done;
+
+void ocerz_bt_report(const OcerzCPU *c)
+{
+    if (ocerz_bt_done)
+        return;
+    ocerz_bt_done = 1;
+    fprintf(stderr, "ocerz: BTTRAP rip=%#llx chain:", (unsigned long long)c->rip);
+    uint64_t fp = c->gpr[OCERZ_RBP];
+    for (int d = 0; d < 18 && fp >= 0x300000000ull; d++) {
+        fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+        uint64_t nf = ocerz_ld(fp, 8);
+        if (nf <= fp) break;
+        fp = nf;
+    }
+    fprintf(stderr, "\n");
+}
+
+static void exc_dump_cfstr(const char *tag, uint64_t s)
+{
+    if (s < 0x100000000ull) {
+        fprintf(stderr, " %s=<%#llx>", tag, (unsigned long long)s);
+        return;
+    }
+    uint64_t cstr = ocerz_ld(s + 0x10, 8);
+    uint64_t len = ocerz_ld(s + 0x18, 8);
+    if (cstr >= 0x100000000ull && len > 0 && len < 4096) {
+        fprintf(stderr, " %s=\"", tag);
+        for (uint64_t i = 0; i < len; i++) {
+            int ch = (int)ocerz_ld(cstr + i, 1);
+            fputc(ch >= 32 && ch < 127 ? ch : '?', stderr);
+        }
+        fputc('"', stderr);
+    } else {
+        fprintf(stderr, " %s=inline\"", tag);
+        for (uint64_t i = 0x10; i < 0x140; i++) {
+            int ch = (int)ocerz_ld(s + i, 1);
+            if (ch == 0) break;
+            fputc(ch >= 32 && ch < 127 ? ch : '?', stderr);
+        }
+        fputc('"', stderr);
+    }
+}
+
+void ocerz_exc_report(const OcerzCPU *c)
+{
+    uint64_t exc = c->gpr[OCERZ_RDI];
+    fprintf(stderr, "ocerz: EXCTRAP exc=%#llx isa=%#llx",
+            (unsigned long long)exc, (unsigned long long)ocerz_ld(exc, 8));
+    exc_dump_cfstr("name", ocerz_ld(exc + 0x08, 8));
+    exc_dump_cfstr("reason", ocerz_ld(exc + 0x10, 8));
+    fputc('\n', stderr);
+}
 
 void ocerz_watch_hit(uint64_t gaddr, int size, uint64_t lo, uint64_t hi)
 {
     OcerzCPU *c = g_cur_cpu ? g_cur_cpu : (g_vm ? &g_vm->cpu : NULL);
-    fprintf(stderr, "ocerz: WATCH st [%#llx] size=%d val=%#llx:%#llx rip=%#llx icount=%llu\n",
+    fprintf(stderr, "ocerz: WATCH st [%#llx] size=%d val=%#llx:%#llx rip=%#llx icount=%llu"
+            " rdi=%#llx rsi=%#llx rax=%#llx rbx=%#llx r14=%#llx\n",
             (unsigned long long)gaddr, size,
             (unsigned long long)hi, (unsigned long long)lo,
             c ? (unsigned long long)c->rip : 0,
-            g_vm ? (unsigned long long)g_vm->insn_count : 0);
+            g_vm ? (unsigned long long)g_vm->insn_count : 0,
+            c ? (unsigned long long)c->gpr[OCERZ_RDI] : 0,
+            c ? (unsigned long long)c->gpr[OCERZ_RSI] : 0,
+            c ? (unsigned long long)c->gpr[OCERZ_RAX] : 0,
+            c ? (unsigned long long)c->gpr[OCERZ_RBX] : 0,
+            c ? (unsigned long long)c->gpr[OCERZ_R14] : 0);
 }
 
 static char *hex_into(char *p, uint64_t v)
@@ -118,7 +181,6 @@ static char *str_into(char *p, const char *s)
 
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
-    (void)ctx;
     static volatile int depth;
     char buf[256];
     char *p = buf;
@@ -131,6 +193,16 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     p = str_into(p, sig == SIGBUS ? "SIGBUS" : "SIGSEGV");
     p = str_into(p, " host_addr=");
     p = hex_into(p, (uint64_t)(uintptr_t)si->si_addr);
+    if (ctx) {
+        const ucontext_t *uc = (const ucontext_t *)ctx;
+        uint64_t hpc = uc->uc_mcontext->__ss.__pc;
+        p = str_into(p, " host_pc=");
+        p = hex_into(p, hpc);
+        p = str_into(p, " host_insn=");
+        p = hex_into(p, *(const uint32_t *)(uintptr_t)hpc);
+        p = str_into(p, " host_lr=");
+        p = hex_into(p, uc->uc_mcontext->__ss.__lr);
+    }
     OcerzCPU *c = g_cur_cpu ? g_cur_cpu : (g_vm ? &g_vm->cpu : NULL);
     if (c) {
         p = str_into(p, " guest_rip=");
@@ -157,6 +229,20 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
         p = str_into(p, "\n");
         write(2, buf, (size_t)(p - buf));
+        {
+            int comm = ocerz_addr_committed((uint64_t)(uintptr_t)si->si_addr - ocerz_guest_base);
+            const char *cs = comm == 1 ? "  fault-page: COMMITTED"
+                           : comm == 0 ? "  fault-page: UNCOMMITTED"
+                                       : "  fault-page: outside-arena";
+            p = buf;
+            p = str_into(p, cs);
+            p = str_into(p, sig == SIGBUS
+                ? (si->si_code == 1 ? " si_code=ADRALN\n"
+                 : si->si_code == 2 ? " si_code=ADRERR\n"
+                 : si->si_code == 3 ? " si_code=OBJERR\n" : " si_code=?\n")
+                : "\n");
+            write(2, buf, (size_t)(p - buf));
+        }
         uint64_t fp = c->gpr[OCERZ_RBP];
         p = buf;
         p = str_into(p, "  rbp-chain:");
@@ -184,6 +270,54 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
         p = str_into(p, "\n");
         write(2, buf, (size_t)(p - buf));
+        if (g_crash_stack) {
+            static const char *const an[] = { "r9", "r10", "r11", "r12",
+                                              "r13", "r14", "r15", "rsp" };
+            static const int ai[] = { OCERZ_R9, OCERZ_R10, OCERZ_R11, OCERZ_R12,
+                                      OCERZ_R13, OCERZ_R14, OCERZ_R15, OCERZ_RSP };
+            p = buf;
+            p = str_into(p, "  regs2:");
+            for (int i = 0; i < 8; i++) {
+                p = str_into(p, " ");
+                p = str_into(p, an[i]);
+                p = str_into(p, "=");
+                p = hex_into(p, c->gpr[ai[i]]);
+            }
+            p = str_into(p, "\n");
+            write(2, buf, (size_t)(p - buf));
+            uint64_t rbp = c->gpr[OCERZ_RBP];
+            for (int row = 0; row < 14; row++) {
+                uint64_t base = rbp - 0x80 + (uint64_t)row * 0x10;
+                p = buf;
+                p = str_into(p, "  [rbp");
+                p = str_into(p, base >= rbp ? "+" : "-");
+                p = hex_into(p, base >= rbp ? base - rbp : rbp - base);
+                p = str_into(p, "]:");
+                for (int col = 0; col < 2; col++) {
+                    p = str_into(p, " ");
+                    p = hex_into(p, ocerz_ld(base + (uint64_t)col * 8, 8));
+                }
+                p = str_into(p, "\n");
+                write(2, buf, (size_t)(p - buf));
+            }
+            {
+                uint64_t a = c->gpr[OCERZ_R14];
+                if (a >= 0x100000000ull) {
+                    for (int row = 0; row < 8; row++) {
+                        p = buf;
+                        p = str_into(p, "  *r14+");
+                        p = hex_into(p, (uint64_t)row * 0x20);
+                        p = str_into(p, ":");
+                        for (int col = 0; col < 4; col++) {
+                            p = str_into(p, " ");
+                            p = hex_into(p, ocerz_ld(a + (uint64_t)(row * 4 + col) * 8, 8));
+                        }
+                        p = str_into(p, "\n");
+                        write(2, buf, (size_t)(p - buf));
+                    }
+                }
+            }
+        }
     }
     _exit(139);
 }
@@ -199,9 +333,24 @@ int ocerz_vm_init(OcerzVM *vm)
 
 void ocerz_vm_install_handlers(OcerzVM *vm)
 {
+    extern int ocerz_cftrap_on;
+    ocerz_cftrap_on = getenv("OCERZ_CFTRAP") != NULL;
+    g_crash_stack = getenv("OCERZ_CRASH_STACK") != NULL;
     const char *w = getenv("OCERZ_WATCH");
     if (w)
         ocerz_watch_addr = strtoull(w, NULL, 0);
+    const char *wv = getenv("OCERZ_STVAL");
+    if (wv)
+        ocerz_watch_val = strtoull(wv, NULL, 0);
+    const char *et = getenv("OCERZ_EXCTRAP");
+    if (et)
+        ocerz_exc_trap = strtoull(et, NULL, 0);
+    const char *bl = getenv("OCERZ_BT_LO");
+    const char *bh = getenv("OCERZ_BT_HI");
+    if (bl && bh) {
+        ocerz_bt_lo = strtoull(bl, NULL, 0);
+        ocerz_bt_hi = strtoull(bh, NULL, 0);
+    }
     static stack_t altss;
     if (!altss.ss_sp) {
         altss.ss_size = SIGSTKSZ < 0x10000 ? 0x10000 : (size_t)SIGSTKSZ;
@@ -223,6 +372,16 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
         vm->jit = ocerz_jit_create(vm);
 }
 
+/* ocerz_vm_call runs the guest function on a CALL-LOCAL OcerzCPU seeded from
+ * the calling thread's current guest context (g_cur_cpu when set -- a worker or
+ * a nested call -- else the main cpu template). It must NOT step vm->cpu
+ * directly: guest callbacks are invoked from WORKER threads too (the dyldapi
+ * objc callouts fire tens of thousands of times under load), and a worker
+ * resetting/stepping the main thread's live register file while main runs or
+ * sleeps in a blocked syscall derails both threads -- and since every call
+ * shares one sentinel rip, main's loop would also return early the moment a
+ * worker's nested call finished. The local cpu inherits the caller's gs_base
+ * (thread identity/TSD/errno) and runs on the caller-provided guest stack. */
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top)
 {
     static const int ar[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
@@ -239,12 +398,16 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
         }
         OCERZ_LOG("vm: call sentinel page at %#llx\n", (unsigned long long)sentinel);
     }
+    OcerzCPU *prev_cpu = g_cur_cpu;
+    OcerzCPU local = prev_cpu ? *prev_cpu : vm->cpu;
+    local.terminated = 0;
     for (int i = 0; i < nargs && i < 6; i++)
-        vm->cpu.gpr[ar[i]] = args[i];
+        local.gpr[ar[i]] = args[i];
     uint64_t sp = (stack_top & ~0xfull) - 8;
     ocerz_st(sp, 8, sentinel);
-    vm->cpu.gpr[OCERZ_RSP] = sp;
-    vm->cpu.rip = func;
+    local.gpr[OCERZ_RSP] = sp;
+    local.rip = func;
+    g_cur_cpu = &local;
     const char *icap_s = getenv("OCERZ_ICAP");
     unsigned long long icap = icap_s ? strtoull(icap_s, NULL, 0) : 0;
     static uint64_t riptrap[16];
@@ -261,29 +424,33 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     const char *prof_s = getenv("OCERZ_PROFILE");
     unsigned long long prof = prof_s ? strtoull(prof_s, NULL, 0) : 0;
     unsigned long long prof_next = prof ? vm->insn_count + prof : 0;
-    while (vm->cpu.rip != sentinel && !vm->exited) {
+    while (local.rip != sentinel && !vm->exited) {
         int r;
+        if (ocerz_exc_trap && local.rip == ocerz_exc_trap)
+            ocerz_exc_report(&local);
+        if (ocerz_bt_lo && local.rip >= ocerz_bt_lo && local.rip < ocerz_bt_hi)
+            ocerz_bt_report(&local);
         if (prof && vm->insn_count >= prof_next) {
             prof_next = vm->insn_count + prof;
             fprintf(stderr, "ocerz: PROFILE icount=%llu rip=%#llx\n",
-                    (unsigned long long)vm->insn_count, (unsigned long long)vm->cpu.rip);
+                    (unsigned long long)vm->insn_count, (unsigned long long)local.rip);
         }
         for (int t = 0; t < riptrap_n; t++) {
-            if (vm->cpu.rip == riptrap[t] && riptrap_hit[t] < 40) {
+            if (local.rip == riptrap[t] && riptrap_hit[t] < 40) {
                 riptrap_hit[t]++;
                 fprintf(stderr, "ocerz: RIPLOG hit %#llx (#%d) icount=%llu rdi=%#llx rsi=%#llx rdx=%#llx rbx=%#llx r14=%#llx\n",
                         (unsigned long long)riptrap[t], riptrap_hit[t],
                         (unsigned long long)vm->insn_count,
-                        (unsigned long long)vm->cpu.gpr[OCERZ_RDI],
-                        (unsigned long long)vm->cpu.gpr[OCERZ_RSI],
-                        (unsigned long long)vm->cpu.gpr[OCERZ_RDX],
-                        (unsigned long long)vm->cpu.gpr[OCERZ_RBX],
-                        (unsigned long long)vm->cpu.gpr[OCERZ_R14]);
+                        (unsigned long long)local.gpr[OCERZ_RDI],
+                        (unsigned long long)local.gpr[OCERZ_RSI],
+                        (unsigned long long)local.gpr[OCERZ_RDX],
+                        (unsigned long long)local.gpr[OCERZ_RBX],
+                        (unsigned long long)local.gpr[OCERZ_R14]);
             }
         }
         if (icap && vm->insn_count > icap) {
-            ocerz_cpu_dump(&vm->cpu, stderr);
-            uint64_t fp = vm->cpu.gpr[OCERZ_RBP];
+            ocerz_cpu_dump(&local, stderr);
+            uint64_t fp = local.gpr[OCERZ_RBP];
             fprintf(stderr, "ocerz: rbp-chain:");
             for (int d = 0; d < 200 && fp >= 0x300000000ull; d++) {
                 uint64_t ret = ocerz_ld(fp + 8, 8);
@@ -297,23 +464,44 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
                     (unsigned long long)vm->insn_count, (unsigned long long)func);
             _exit(126);
         }
-        if (vm->jit_enabled && vm->jit) {
-            r = ocerz_jit_step(vm, &vm->cpu);
+        static uint64_t mtrace_lo, mtrace_hi;
+        static int mtrace_init;
+        if (!mtrace_init) {
+            mtrace_init = 1;
+            const char *ml = getenv("OCERZ_TRACE_MAIN_LO");
+            const char *mh = getenv("OCERZ_TRACE_MAIN_HI");
+            if (ml && mh) {
+                mtrace_lo = strtoull(ml, NULL, 0);
+                mtrace_hi = strtoull(mh, NULL, 0);
+            }
+        }
+        if (mtrace_lo && local.rip >= mtrace_lo && local.rip < mtrace_hi) {
+            fprintf(stderr, "MT %#llx rax=%#llx rdi=%#llx rsi=%#llx rsp=%#llx [rsp]=%#llx\n",
+                    (unsigned long long)local.rip,
+                    (unsigned long long)local.gpr[OCERZ_RAX],
+                    (unsigned long long)local.gpr[OCERZ_RDI],
+                    (unsigned long long)local.gpr[OCERZ_RSI],
+                    (unsigned long long)local.gpr[OCERZ_RSP],
+                    (unsigned long long)ocerz_ld(local.gpr[OCERZ_RSP], 8));
+            r = ocerz_interp_step(vm, &local);
+        } else if (vm->jit_enabled && vm->jit) {
+            r = ocerz_jit_step(vm, &local);
             if (r == OCERZ_EUNSUP)
-                r = ocerz_interp_step(vm, &vm->cpu);
+                r = ocerz_interp_step(vm, &local);
         } else {
-            r = ocerz_interp_step(vm, &vm->cpu);
+            r = ocerz_interp_step(vm, &local);
         }
         if (r == OCERZ_STEP_EXIT)
             break;
         if (r == OCERZ_STEP_FATAL) {
-            ocerz_cpu_dump(&vm->cpu, stderr);
+            ocerz_cpu_dump(&local, stderr);
             OCERZ_FATAL("initializer call to %#llx aborted after %llu instructions\n",
                         (unsigned long long)func, (unsigned long long)vm->insn_count);
             _exit(125);
         }
     }
-    return vm->cpu.gpr[OCERZ_RAX];
+    g_cur_cpu = prev_cpu;
+    return local.gpr[OCERZ_RAX];
 }
 
 void ocerz_vm_request_exit(OcerzVM *vm, int code)
@@ -331,6 +519,10 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     uint64_t trace_hi = thi ? strtoull(thi, NULL, 0) : 0;
     while (!vm->exited && !cpu->terminated) {
         int r;
+        if (ocerz_exc_trap && cpu->rip == ocerz_exc_trap)
+            ocerz_exc_report(cpu);
+        if (ocerz_bt_lo && cpu->rip >= ocerz_bt_lo && cpu->rip < ocerz_bt_hi)
+            ocerz_bt_report(cpu);
         if (trace_lo && cpu->rip >= trace_lo && cpu->rip < trace_hi) {
             fprintf(stderr, "WT %#llx rax=%#llx rdi=%#llx rsi=%#llx r8=%#llx r12=%#llx\n",
                     (unsigned long long)cpu->rip, (unsigned long long)cpu->gpr[OCERZ_RAX],

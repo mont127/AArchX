@@ -1,4 +1,5 @@
 /*
+#include <stdio.h>
  * src/dyld.c
  *
  * Ocerz's mini-dyld implementation (dyld.h): load, link and launch a
@@ -216,6 +217,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <mach/mach.h>
 #include <mach-o/loader.h>
@@ -1668,7 +1670,33 @@ static int canon_dylib_path(const char *path, char *out, size_t outsz)
     return snprintf(out, outsz, "%s", cur) < (int)outsz;
 }
 
-uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
+/* The disk-image loader (g_dimgs registry, the arena bump base, the per-image
+ * slide/fixup application) is single-writer state with no internal locking, but
+ * a guest dlopen now arrives concurrently from the main thread AND any libdispatch
+ * workloop worker once GUI bring-up is live. Two unserialized loads race on
+ * g_dimgs_n and on each other's in-progress slide, which corrupts a freshly
+ * mapped image's rebased pointers (every slot filled with base+offset off a torn
+ * base) -- objc/CF then dispatch through that image's vtable into garbage. A
+ * single RECURSIVE lock serializes all of dlopen/dlsym/dlclose; recursive because
+ * an image initializer run inside dlopen may itself dlopen on the same thread. */
+static pthread_mutex_t g_load_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+
+/* A dlopen that resolves to a shared-cache dylib returns the cache mach_header
+ * directly (its pages are already mapped and fixed up), but dyld still notifies
+ * objc so the image's classes are realized and flagged loaded. Reproduce that
+ * notify here: drive objc map_images for the cache image (idempotent; only
+ * fires for an image not already mapped at boot) before handing the header
+ * back, so a soft-linked framework's classes resolve via NSClassFromString. */
+static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
+{
+    if (g_dlerror_g)
+        ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+    if (g_run_init_ready && g_run_vm && !vm->exited)
+        ocerz_dyldapi_objc_map_one(g_run_vm, cmh);
+    return cmh;
+}
+
+static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int mode)
 {
     if (!g_run_cache) {
         dlerror_set("dlopen: runtime loader not initialized", NULL);
@@ -1686,11 +1714,8 @@ uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
         return already->load_base;
     }
     uint64_t cmh = dep_find(g_run_cache, hostpath);
-    if (cmh) {
-        if (g_dlerror_g)
-            ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
-        return cmh;
-    }
+    if (cmh)
+        return cache_dlopen_hit(vm, cmh);
     char canon[PATH_MAX];
     const char *loadpath = hostpath;
     if (canon_dylib_path(hostpath, canon, sizeof canon) &&
@@ -1702,11 +1727,8 @@ uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
             return already->load_base;
         }
         cmh = dep_find(g_run_cache, canon);
-        if (cmh) {
-            if (g_dlerror_g)
-                ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
-            return cmh;
-        }
+        if (cmh)
+            return cache_dlopen_hit(vm, cmh);
         loadpath = canon;
     }
     if (mode & 0x10) {
@@ -1736,6 +1758,16 @@ uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
     if (g_dlerror_g)
         ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
     return d->load_base;
+}
+
+uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
+{
+    if (getenv("OCERZ_DLOPENLOG"))
+        fprintf(stderr, "ocerz: DLOPEN \"%s\" mode=%#x\n", hostpath ? hostpath : "(null)", mode);
+    pthread_mutex_lock(&g_load_lock);
+    uint64_t r = ocerz_dlopen_inner(vm, hostpath, mode);
+    pthread_mutex_unlock(&g_load_lock);
+    return r;
 }
 
 static uint64_t image_symtab_resolve(DynImage *img, const char *sym)
