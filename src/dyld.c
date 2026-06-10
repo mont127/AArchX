@@ -345,6 +345,8 @@ static DynImage g_dimgs[DYN_DIMG_MAX];
 static int g_dimgs_n;
 static char g_main_hostpath[1024];
 
+uint64_t ocerz_main_mh;
+
 static OcerzCache *g_run_cache;
 static struct OcerzVM *g_run_vm;
 static uint64_t g_run_init_args[5];
@@ -407,7 +409,35 @@ static int map_segments(DynImage *img, int is_main)
     if (vmhi <= vmlo)
         return OCERZ_EFORMAT;
 
-    if (is_main) {
+    if (is_main && !img->is_pie) {
+        img->load_base = text_vmaddr;
+        img->slide = 0;
+        lc = mh + sizeof(struct mach_header_64);
+        for (uint32_t i = 0; i < ncmds; i++) {
+            uint32_t cmd = rd32(lc);
+            if (cmd == LC_SEGMENT_64) {
+                uint64_t vmaddr = rd64(lc + 24);
+                uint64_t vmsize = rd64(lc + 32);
+                uint64_t filesize = rd64(lc + 48);
+                uint32_t initprot = rd32(lc + 56);
+                if (!(vmaddr == 0 && initprot == 0) && vmsize) {
+                    if (vmaddr < OCERZ_LOW_LIMIT) {
+                        if (vmaddr + vmsize > OCERZ_LOW_LIMIT)
+                            return OCERZ_ENOMEM;
+                        if (ocerz_mem_init_low_shadow() != OCERZ_OK)
+                            return OCERZ_ENOMEM;
+                    } else if (!(vmaddr >= ocerz_arena_lo && vmaddr + vmsize <= ocerz_arena_hi)) {
+                        if (ocerz_mem_register_range(vmaddr, vmaddr + vmsize) != OCERZ_OK)
+                            return OCERZ_ENOMEM;
+                    }
+                    if (filesize &&
+                        ocerz_map_fixed(vmaddr, vmsize, PROT_READ | PROT_WRITE) != OCERZ_OK)
+                        return OCERZ_ENOMEM;
+                }
+            }
+            lc += rd32(lc + 4);
+        }
+    } else if (is_main) {
         img->load_base = ocerz_arena_lo;
         img->slide = img->load_base - text_vmaddr;
         if (ocerz_map_fixed(vmlo + img->slide, vmhi - vmlo, PROT_READ | PROT_WRITE) != OCERZ_OK)
@@ -419,6 +449,8 @@ static int map_segments(DynImage *img, int is_main)
         img->slide = region - vmlo;
         img->load_base = text_vmaddr + img->slide;
     }
+    if (is_main)
+        ocerz_main_mh = img->load_base;
 
     lc = mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < ncmds; i++) {
@@ -928,7 +960,7 @@ static int build_frame(const char *path, int argc, char **argv, char **envp, Dyn
     ocerz_st(cells + 24, 8, leaf);
 
     uint64_t pv = cells - 48;
-    ocerz_st(pv + 0, 8, ocerz_arena_lo);
+    ocerz_st(pv + 0, 8, ocerz_main_mh ? ocerz_main_mh : ocerz_arena_lo);
     ocerz_st(pv + 8, 8, cells + 0);
     ocerz_st(pv + 16, 8, cells + 8);
     ocerz_st(pv + 24, 8, cells + 16);
@@ -949,7 +981,7 @@ static uint64_t find_dylib_init(OcerzCache *cache, const char *substr)
         uint64_t mh = ocerz_cache_image_addr(cache, i, &path);
         if (!path || !strstr(path, substr) || rd32((const uint8_t *)(uintptr_t)mh) != MH_MAGIC_64)
             continue;
-        const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+        const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
         uint32_t ncmds = rd32(h + 16);
         const uint8_t *lc = h + sizeof(struct mach_header_64);
         for (uint32_t j = 0; j < ncmds; j++) {
@@ -998,8 +1030,9 @@ static uint64_t dep_mh(OcerzCache *cache, const char *path)
 
 static int64_t image_slide_d(uint64_t mh)
 {
-    uint32_t ncmds = rd32((const uint8_t *)(uintptr_t)mh + 16);
-    const uint8_t *lc = (const uint8_t *)(uintptr_t)mh + sizeof(struct mach_header_64);
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
     for (uint32_t n = 0; n < ncmds; n++) {
         const struct load_command *l = (const void *)lc;
         if (l->cmd == LC_SEGMENT_64) {
@@ -1078,8 +1111,9 @@ static void eager_add(uint64_t mh)
 static void scan_uses(uint64_t mh)
 {
     int64_t slide = image_slide_d(mh);
-    uint32_t ncmds = rd32((const uint8_t *)(uintptr_t)mh + 16);
-    const uint8_t *lc = (const uint8_t *)(uintptr_t)mh + sizeof(struct mach_header_64);
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
     for (uint32_t n = 0; n < ncmds; n++) {
         const struct load_command *l = (const void *)lc;
         if (l->cmd == LC_SEGMENT_64) {
@@ -1101,7 +1135,7 @@ static void scan_uses(uint64_t mh)
                 if (isptr) {
                     uint64_t a = sc[j].addr + slide, e = a + sc[j].size;
                     for (uint64_t pp = a; pp + 8 <= e; pp += 8) {
-                        uint64_t v = rd64((const uint8_t *)(uintptr_t)pp);
+                        uint64_t v = rd64((const uint8_t *)ocerz_g2h(pp));
                         uint64_t o = seg_owner(v);
                         if (o && o != mh) eager_add(o);
                     }
@@ -1113,7 +1147,7 @@ static void scan_uses(uint64_t mh)
 }
 static void eager_add_direct_deps(OcerzCache *cache, uint64_t mh)
 {
-    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
     if (rd32(h) != MH_MAGIC_64)
         return;
     uint32_t ncmds = rd32(h + 16);
@@ -1167,7 +1201,7 @@ static void ocerz_tlv_register_image(OcerzVM *vm, OcerzCache *cache, uint64_t mh
 {
     if (!mh || tlv_is_registered(mh))
         return;
-    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
     if (rd32(h) != MH_MAGIC_64)
         return;
     int64_t slide = image_slide_d(mh);
@@ -1267,7 +1301,7 @@ static void ocerz_tlv_register_closure(OcerzVM *vm, OcerzCache *cache, uint64_t 
 
 static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64_t stack_top)
 {
-    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
     int64_t slide = image_slide_d(mh);
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
@@ -1310,21 +1344,40 @@ static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64
 
 #define INIT_VISITED_MAX 4096
 static uint64_t g_init_visited[INIT_VISITED_MAX];
+static uint32_t g_init_gen[INIT_VISITED_MAX];
+static uint8_t g_init_done[INIT_VISITED_MAX];
 static int g_init_visited_n;
+static uint32_t g_init_cur_gen;
+static int g_init_force;
+static uint64_t g_libsys_mh;
+
+static int init_mark(uint64_t mh)
+{
+    for (int i = 0; i < g_init_visited_n; i++)
+        if (g_init_visited[i] == mh)
+            return i;
+    if (g_init_visited_n >= INIT_VISITED_MAX)
+        return -1;
+    int i = g_init_visited_n++;
+    g_init_visited[i] = mh;
+    g_init_gen[i] = 0;
+    g_init_done[i] = 0;
+    return i;
+}
 
 static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
                            const uint64_t *ia, uint64_t stack_top, uint64_t skip_mh)
 {
     if (vm->exited || !mh)
         return;
-    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
     if (rd32(h) != MH_MAGIC_64)
         return;
-    for (int i = 0; i < g_init_visited_n; i++)
-        if (g_init_visited[i] == mh)
-            return;
-    if (g_init_visited_n < INIT_VISITED_MAX)
-        g_init_visited[g_init_visited_n++] = mh;
+    int idx = init_mark(mh);
+    if (idx >= 0 && (g_init_done[idx] || g_init_gen[idx] == g_init_cur_gen))
+        return;
+    if (idx >= 0)
+        g_init_gen[idx] = g_init_cur_gen;
 
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
@@ -1341,8 +1394,11 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
     }
     if (vm->exited)
         return;
-    if (mh != skip_mh && (g_eager_n == 0 || eager_has(mh)))
+    if (mh != skip_mh && (g_init_force || g_eager_n == 0 || eager_has(mh))) {
         run_image_inits(vm, mh, ia, stack_top);
+        if (idx >= 0)
+            g_init_done[idx] = 1;
+    }
 }
 
 static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t stack_top,
@@ -1350,14 +1406,14 @@ static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t
 {
     if (vm->exited || !mh)
         return;
-    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
     if (rd32(h) != MH_MAGIC_64)
         return;
-    for (int i = 0; i < g_init_visited_n; i++)
-        if (g_init_visited[i] == mh)
-            return;
-    if (g_init_visited_n < INIT_VISITED_MAX)
-        g_init_visited[g_init_visited_n++] = mh;
+    int idx = init_mark(mh);
+    if (idx >= 0 && g_init_gen[idx] == g_init_cur_gen)
+        return;
+    if (idx >= 0)
+        g_init_gen[idx] = g_init_cur_gen;
 
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
@@ -1691,8 +1747,23 @@ static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
 {
     if (g_dlerror_g)
         ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
-    if (g_run_init_ready && g_run_vm && !vm->exited)
+    if (g_run_init_ready && g_run_vm && !vm->exited) {
         ocerz_dyldapi_objc_map_one(g_run_vm, cmh);
+        int seen = 0;
+        for (int i = 0; i < g_init_visited_n; i++)
+            if (g_init_visited[i] == cmh && g_init_done[i])
+                seen = 1;
+        if (!seen && !vm->exited && getenv("OCERZ_DLINIT")) {
+            uint64_t istk = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
+            if (istk) {
+                g_init_cur_gen++;
+                g_init_force = 1;
+                run_init_phase(g_run_vm, g_run_cache, cmh, g_run_init_args,
+                               istk + DYN_STACK_SIZE - 64, g_libsys_mh);
+                g_init_force = 0;
+            }
+        }
+    }
     return cmh;
 }
 
@@ -1705,7 +1776,7 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
     if (!hostpath) {
         if (g_dlerror_g)
             ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
-        return ocerz_arena_lo;
+        return ocerz_main_mh ? ocerz_main_mh : ocerz_arena_lo;
     }
     DynImage *already = dimg_find_by_path(hostpath);
     if (already) {
@@ -1748,10 +1819,22 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
                 if (vm->exited)
                     break;
             }
-            for (int i = g_dimgs_n - 1; i >= before && !vm->exited; i--) {
-                run_image_inits(g_run_vm, g_dimgs[i].load_base, g_run_init_args, itop);
-                if (vm->exited)
-                    break;
+            if (getenv("OCERZ_DLINIT")) {
+                g_init_cur_gen++;
+                g_init_force = 1;
+                for (int i = g_dimgs_n - 1; i >= before && !vm->exited; i--) {
+                    run_init_phase(g_run_vm, g_run_cache, g_dimgs[i].load_base,
+                                   g_run_init_args, itop, g_libsys_mh);
+                    if (vm->exited)
+                        break;
+                }
+                g_init_force = 0;
+            } else {
+                for (int i = g_dimgs_n - 1; i >= before && !vm->exited; i--) {
+                    run_image_inits(g_run_vm, g_dimgs[i].load_base, g_run_init_args, itop);
+                    if (vm->exited)
+                        break;
+                }
             }
         }
     }
@@ -1904,11 +1987,6 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         free(buf);
         return r;
     }
-    if (!img.is_pie) {
-        OCERZ_FATAL("%s is not PIE; dynamic loading needs a slidable image\n", path);
-        free(buf);
-        return OCERZ_EFORMAT;
-    }
     if (img.main_entry == 0) {
         OCERZ_FATAL("%s has no LC_MAIN entry\n", path);
         free(buf);
@@ -1987,16 +2065,17 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         }
         if (ran_init && getenv("OCERZ_INITPHASE")) {
             uint64_t libsys = dep_find(&cache, "/usr/lib/libSystem.B.dylib");
+            g_libsys_mh = libsys;
             compute_eager_set(&cache, img.load_base);
             OCERZ_LOG("dynamic: eager init set = %d images (of closure)\n", g_eager_n);
             ocerz_tlv_register_closure(vm, &cache, img.load_base, fr.stack_top);
             if (vm->exited)
                 return vm->exit_code;
-            g_init_visited_n = 0;
+            g_init_cur_gen++;
             run_load_phase(vm, &cache, img.load_base, fr.stack_top, libsys);
             if (vm->exited)
                 return vm->exit_code;
-            g_init_visited_n = 0;
+            g_init_cur_gen++;
             OCERZ_LOG("dynamic: running dependency-ordered initializer phase\n");
             run_init_phase(vm, &cache, img.load_base, ia, fr.stack_top, libsys);
             if (vm->exited)

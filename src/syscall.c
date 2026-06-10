@@ -138,6 +138,7 @@
 #include <spawn.h>
 #include <pthread.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 
 #define OCERZ_BSD_MAX 600
@@ -277,11 +278,18 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 
     if (anon) {
         if (fixed) {
-            if (addr < ocerz_arena_lo || addr + len > ocerz_arena_hi) {
-                ret_err(cpu, OCERZ_ENOMEM_V);
-                return OCERZ_STEP_OK;
+            int rc;
+            if ((prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0) {
+                rc = ocerz_unmap(addr, len);
+                if (rc != OCERZ_OK)
+                    rc = ocerz_mem_register_range(addr, addr + len);
+            } else {
+                rc = ocerz_map_fixed(addr, len, prot);
+                if (rc != OCERZ_OK &&
+                    ocerz_mem_register_range(addr, addr + len) == OCERZ_OK)
+                    rc = ocerz_map_fixed(addr, len, prot);
             }
-            if (ocerz_map_fixed(addr, len, prot) != OCERZ_OK) {
+            if (rc != OCERZ_OK) {
                 ret_err(cpu, OCERZ_ENOMEM_V);
                 return OCERZ_STEP_OK;
             }
@@ -298,11 +306,11 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
 
     if (fixed) {
-        if (addr < ocerz_arena_lo || addr + len > ocerz_arena_hi) {
-            ret_err(cpu, OCERZ_ENOMEM_V);
-            return OCERZ_STEP_OK;
-        }
-        if (ocerz_map_fixed(addr, len, PROT_READ | PROT_WRITE) != OCERZ_OK) {
+        int rc = ocerz_map_fixed(addr, len, PROT_READ | PROT_WRITE);
+        if (rc != OCERZ_OK &&
+            ocerz_mem_register_range(addr, addr + len) == OCERZ_OK)
+            rc = ocerz_map_fixed(addr, len, PROT_READ | PROT_WRITE);
+        if (rc != OCERZ_OK) {
             ret_err(cpu, OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
@@ -543,6 +551,32 @@ static const char *ocerz_self_path(void)
     return buf[0] ? buf : NULL;
 }
 
+static int env_inject_lowbase(char **henv, int m, int cap)
+{
+    static char lowbase_kv[40];
+    static char topbase_kv[40];
+    if (!ocerz_low_base)
+        return m;
+    int have_low = 0, have_top = 0;
+    for (int i = 0; i < m; i++) {
+        if (strncmp(henv[i], "OCERZ_LOWBASE=", 14) == 0)
+            have_low = 1;
+        if (strncmp(henv[i], "OCERZ_TOPBASE=", 14) == 0)
+            have_top = 1;
+    }
+    if (!have_low && m < cap) {
+        snprintf(lowbase_kv, sizeof lowbase_kv, "OCERZ_LOWBASE=%#llx",
+                 (unsigned long long)ocerz_low_base);
+        henv[m++] = lowbase_kv;
+    }
+    if (!have_top && m < cap) {
+        snprintf(topbase_kv, sizeof topbase_kv, "OCERZ_TOPBASE=%#llx",
+                 (unsigned long long)ocerz_top_base);
+        henv[m++] = topbase_kv;
+    }
+    return m;
+}
+
 static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
@@ -567,6 +601,7 @@ static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         uint64_t gv;
         for (uint64_t p = a[4]; m < 512 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
             henv[m++] = (char *)ocerz_g2h(gv);
+        m = env_inject_lowbase(henv, m, 512);
     }
     henv[m] = NULL;
     pid_t hpid = 0;
@@ -655,9 +690,16 @@ static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         uint64_t gv;
         for (uint64_t p = a[2]; m < 512 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
             henv[m++] = (char *)ocerz_g2h(gv);
+        m = env_inject_lowbase(henv, m, 512);
     }
     henv[m] = NULL;
 
+    if (getenv("OCERZ_EXECLOG")) {
+        fprintf(stderr, "ocerz: EXECLOG ->");
+        for (int k = 0; k < n; k++)
+            fprintf(stderr, " %s", hargv[k] ? hargv[k] : "(null)");
+        fprintf(stderr, "\n");
+    }
     execve(self, hargv, a[2] ? henv : NULL);
     ret_err(cpu, (uint64_t)errno);
     return OCERZ_STEP_OK;
@@ -1520,6 +1562,43 @@ static const char *mach_trap_name(int num)
     }
 }
 
+static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf)
+{
+    uint64_t haddr = ocerz_ld(reply_buf + 0x24, 8);
+    if (haddr == 0 || (haddr >= ocerz_arena_lo && haddr < ocerz_arena_hi))
+        return;
+    mach_vm_address_t raddr = haddr;
+    mach_vm_size_t rsize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t objname = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &raddr, &rsize, VM_REGION_BASIC_INFO_64,
+                       (vm_region_info_t)&info, &cnt, &objname) != KERN_SUCCESS)
+        return;
+    if (objname != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), objname);
+    if (raddr > haddr)
+        return;
+    uint64_t size = (uint64_t)rsize - (haddr - (uint64_t)raddr);
+    uint64_t gaddr = ocerz_map_donate(size);
+    if (gaddr == 0)
+        return;
+    mach_vm_address_t dst = gaddr;
+    vm_prot_t curp = 0, maxp = 0;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &dst, size, 0,
+                                     VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                     mach_task_self(), haddr, FALSE,
+                                     &curp, &maxp, VM_INHERIT_DEFAULT);
+    if (kr != KERN_SUCCESS || dst != gaddr)
+        return;
+    mach_vm_deallocate(mach_task_self(), haddr, size);
+    ocerz_st(reply_buf + 0x24, 8, gaddr);
+    if (vm->strace)
+        fprintf(stderr, "ocerz: mig_vm relocate host=%#llx size=%#llx -> guest=%#llx\n",
+                (unsigned long long)haddr, (unsigned long long)size,
+                (unsigned long long)gaddr);
+}
+
 static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 {
     uint64_t a[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -1537,7 +1616,14 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (!(flags & 1)) {
             uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
             if (want == 0 ||
-                ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK) {
+                (ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
+                 ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
+                 (ocerz_mem_register_range(want, want + size) != OCERZ_OK ||
+                  ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK))) {
+                if (vm->strace)
+                    fprintf(stderr, "ocerz: mach_vm_allocate FIXED denied want=%#llx size=%#llx flags=%#llx\n",
+                            (unsigned long long)want, (unsigned long long)size,
+                            (unsigned long long)flags);
                 mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
                 break;
             }
@@ -1571,7 +1657,14 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (!(flags & 1)) {
             uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
             if (want == 0 ||
-                ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK) {
+                (ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
+                 ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
+                 (ocerz_mem_register_range(want, want + size) != OCERZ_OK ||
+                  ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK))) {
+                if (vm->strace)
+                    fprintf(stderr, "ocerz: mach_vm_map FIXED denied want=%#llx size=%#llx mask=%#llx flags=%#llx\n",
+                            (unsigned long long)want, (unsigned long long)size,
+                            (unsigned long long)mask, (unsigned long long)flags);
                 mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
                 break;
             }
@@ -1659,6 +1752,17 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         a[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
         a[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        if (vm->strace && reply_buf != 0)
+            fprintf(stderr, "ocerz: mach_msg2 id=%u reply_id=%u bits=%#x size=%#x\n",
+                    msgh_id, (uint32_t)ocerz_ld(reply_buf + 0x14, 4),
+                    (uint32_t)ocerz_ld(reply_buf, 4),
+                    (uint32_t)ocerz_ld(reply_buf + 4, 4));
+        if (reply_buf != 0) {
+            uint32_t rid = (uint32_t)ocerz_ld(reply_buf + 0x14, 4);
+            if ((rid == 4900 || rid == 4911 || rid == 4913) &&
+                (uint32_t)ocerz_ld(reply_buf + 0x20, 4) == OCERZ_MACH_KERN_SUCCESS)
+                mig_vm_reply_relocate(vm, reply_buf);
+        }
         if (msgh_id == 8000 && reply_buf != 0 &&
             (uint32_t)ocerz_ld(reply_buf + 4, 4) == 0x24 &&
             (uint32_t)ocerz_ld(reply_buf + 0x20, 4) == OCERZ_MACH_KERN_NOT_SUPPORTED)
