@@ -35,9 +35,17 @@
 #ifndef OCERZ_JIT_H
 #define OCERZ_JIT_H
 
+#include <setjmp.h>
+
 #include "ocerz/cpu.h"
 
 struct OcerzVM;
+
+/* Active (non-NULL) only while the block translator is reading guest code to
+ * decode an instruction; the host fault handler unwinds to it instead of
+ * delivering a guest signal, so a fault during translation never escapes
+ * through the held translation lock. See translate() in jit.c. */
+extern __thread sigjmp_buf *ocerz_jit_decode_recover;
 
 typedef struct OcerzJit OcerzJit;
 

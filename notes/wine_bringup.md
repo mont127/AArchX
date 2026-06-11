@@ -308,3 +308,381 @@ and has value far beyond Wine (any program using signals).
 - Audit transcripts: /tmp/a5_vmmap.txt, /tmp/a5_pstree.txt, /tmp/a5_lsof.txt
   (native run), /tmp/shadow_probe.c, /tmp/ocerz_pz_test.c (kernel A/B tests);
   workflow wf_c8a882d2-4c9 (2026-06-10).
+
+---
+
+## 7. Phase-1 DONE + the two real walls past it (2026-06-11, committed as aed9c16)
+
+Phase 0/1 (the split address space) is implemented, committed (`aed9c16 phase 0/1`),
+and make-check-green. The Wine x86_64-unix loader now MAPS at slide 0 and RUNS;
+ntdll.so loads and reaches deep framework initialization. Two walls remain, both
+ROOT-CAUSED (3-agent RCA workflow wf_53d7e202-ce4 + empirical tracing). Neither is a
+memory-architecture problem — both are init-ordering / threading-identity correctness.
+
+### Wall A — the malloc-proxy SIGBUS during ntdll dependency init (CF init ordering)
+- Symptom: infinite recursion `_malloc_type_zone_malloc_outlined ↔
+  _malloc_zone_malloc_instrumented_or_legacy`, rdi=`kCFAllocatorSystemDefault`
+  (0x7ff840095a00), stack-overflow SIGBUS at icount ~0x2dc000.
+- MECHANISM (verified by disassembly): on modern macOS a CFAllocatorRef IS a
+  malloc_zone_t. `__CFInitialize` (CF's single `__init_offsets` entry, runtime
+  0x7ff802eb4556 = CF_base 0x7ff802eb3000 + 0x1556) populates kCFAllocatorSystemDefault's
+  zone vtable. BEFORE it runs, the zone's `malloc` slot (offset 0x18) is the
+  self-referential stub, so `malloc_zone_malloc(kCFAllocatorSystemDefault,…)` →
+  slot 0x18 → dispatcher → slot 0x18 → … forever. (The plain default zone =
+  libsystem_malloc `virtual_default_zone` proxy works fine — it redispatches to the
+  real nanov2 zone in malloc_zones[0], which `__malloc_init` installed via
+  libSystem_initializer at boot. Verified: `malloc_zone_malloc(default,64)` returns
+  a valid nano pointer under ocerz. So the bug is specifically CF's un-initialized
+  allocator, NOT a broken default zone.)
+- WHY CF doesn't init first: ntdll links CoreFoundation DIRECTLY, so dyld (and ocerz's
+  post-order `run_init_phase`) should init CF before ntdll/its dependents. `__CFInitialize`
+  is never reached because ocerz's init walk has the wrong discipline (see fix).
+- THE FIX (per dyld4 RuntimeState::recursiveInitialization): a proper 3-state
+  per-image init discipline — `inited` (permanent) and `beingInited` (cycle guard)
+  kept SEPARATE from any cheap closure-build "visited" flag. recursiveInit(img):
+  if inited return; if beingInited return; set beingInited; recurse hard+reexport
+  deps NOW, **defer UPWARD edges (LC_LOAD_UPWARD_DYLIB 0x80000022) — dyld does NOT
+  follow them for init ordering** (that's their entire purpose: breaking init
+  cycles); run init sections unless already run; set inited; clear beingInited.
+  Do NOT blanket-mark cache images "done" at boot without running their inits — that
+  pre-mark is what lets a later ntdll→CF edge skip CF. `__CFInitialize` is internally
+  idempotent (`__CFInitialized`/`__CFInitializing` guards), so err toward running the
+  full un-initialized closure. IMPLEMENT ITERATIVELY (explicit work-stack), NOT via
+  deep C recursion: the experimental `OCERZ_DLINIT` force-init recurses thousands of
+  frames deep and corrupts the host C stack — that produced PHANTOM dependency edges
+  (the in-run INITEDGE trace showed CF→Foundation/CoreServicesInternal edges that the
+  authoritative `lcdump` proves do NOT exist; CF's real 6 deps are libobjc REEXPORT,
+  liboah WEAK, libfakelink, libicucore, libSystem, SoftLinking). `OCERZ_DLINIT` is the
+  WRONG mechanism and is gated OFF by default; the rewrite replaces it.
+
+### Wall B — SkyLight initializer dispatch_once UD2 (gs_base/TSD identity collision)
+- Symptom (the OTHER variant, when CF is forced first): SkyLight ctor
+  `__GLOBAL__sub_I_PKGMenuBarContext.mm` (0x7ff8095b0ba6) → libdispatch UD2 at
+  0x7ff802ce9487.
+- MECHANISM (corrected by disassembly): that UD2 is `__dispatch_once_wait.cold.1`
+  "BUG IN CLIENT OF LIBDISPATCH: trying to lock recursively" — NOT
+  `_dispatch_assert_queue_fail` (a different fn at 0x7ff802ce9841). The SkyLight ctor
+  body is trivial (CGColor globals); the abort is one level down in CoreGraphics's
+  lazy `dispatch_once` color-space init. `dispatch_once` reads the owning-thread
+  identity from `%gs:0x18` (pthread/dispatch thread-self TSD slot); when the gate's
+  stored owner == current `%gs:0x18`, it declares (false) recursion and ud2s.
+- ROOT CAUSE: framework initializers run on a context whose `gs_base` was INHERITED
+  from a caller/HOSTWQ worker (vm.c documents nested `ocerz_vm_call` inheriting the
+  caller's gs_base for thread identity/TSD/errno). Two different guest contexts then
+  read the SAME `%gs:0x18` → dispatch_once sees gate.owner == self → false recursion.
+  This is the SAME `%gs.base`/TSD identity family as the project's known Rosetta
+  whitelist fixups, surfacing during initializer execution.
+- THE FIX: run dyld initializers on a single consistent guest thread that owns a
+  fully-formed pthread + correct unique TSD base (route initializer execution onto the
+  guest main thread that already parks in CFRunLoop under HOSTWQ), so `%gs:0x18`
+  returns a per-thread unique/stable/non-zero identity. Confirm in a future run by
+  logging gate.owner vs `%gs:0x18 & ~3` right before the ud2.
+
+### Not a regression: the GUI test under host load
+- The Cocoa window test (`~/ocerztests/win`) started failing 5/5 at STEP2 with a guest
+  under-read SIGBUS (access 0x10 below a 16 MB CF buffer, into the bump-allocator guard
+  gap; guest_rip 0x7ff802e803af, a CF/libdispatch memmove path). It fails identically on
+  the CLEAN committed `aed9c16` (make-check still green), so it is NOT a code regression.
+  Cause: the machine rebooted and ran at load average 8+ (Roblox at 93% CPU + post-reboot
+  Spotlight `mdworker` storm); the host contention changes HOSTWQ async-worker timing and
+  surfaces a latent guard-gap-sensitive guest under-read. Re-verify the GUI when host load
+  is low before treating it as a real bug. (If it persists at low load, the latent fix is
+  to not leave 16 KB unmapped guard gaps between bump allocations, or to map the arena
+  readable — both reduce faithfulness, so prefer understanding the actual under-read first.)
+
+### 2026-06-11 UPDATE — BOTH WALLS DESTROYED; now at the wineserver IPC layer
+
+Wall A and Wall B are both gone at normal host load. `init_closure` (src/dyld.c) is the
+fix: collect the not-yet-initialized hard-dependency closure (DFS, `g_init_being` cycle
+guard, **UPWARD edges excluded**), then run initializers in **ascending cache address**
+— the dyld cache lays foundational dylibs out first, so address order reproduces its
+baked initializer order and breaks the real `CF↔libobjc↔libswiftCore↔Foundation` cycle
+the way native does (CF's `__CFInitialize` runs before its dependents). Wired into the
+disk-dlopen path; cache-dlopen stays map-only unless `OCERZ_CACHEINIT` (preserves the
+proven GUI path). libSystem umbrella pre-marked done (`init_mark_done_closure`, bounded
+to `/usr/lib/system/`). Wall B (the SkyLight/CoreGraphics `dispatch_once` "lock
+recursively" UD2) turned out to be a **host-load timing artifact** — isolated to
+`/tmp/cgtest`, it only reproduces under load avg 8-11, passes 8/8 at normal load and
+under `-no-jit`. Added BSD `poll` (syscall 230). Result: **wine runs 258M instructions**
+and reaches **`recvmsg` (BSD 27)** — the wineserver socket handshake. The two walls in
+sections 7.A/7.B are closed; the entry point below is the live frontier.
+
+### 2026-06-11 UPDATE #2 — wineserver IPC works; wineboot.exe runs
+
+`recvmsg`/`sendmsg` (#27/#28/#401/#402) now deep-translate the guest msghdr (every
+interior pointer via `ocerz_g2h`; SCM_RIGHTS fds pass untranslated since guest fd ==
+host fd) — the wineserver socket handshake completes and wine `posix_spawn`s
+`wineboot.exe --init`. Fixed the child-process shadow reservation (one contiguous
+host block, top base derived from low base, only `OCERZ_LOWBASE` inherited). Added
+segment-register MOV decode (`0x8c` → constant CS=0x2b/SS=0x23/else 0; `0x8e` → nop).
+**wineboot's Windows PE code now executes under ocerz** and stops at `iretq`
+(`0x48 0xcf`) — Wine's NtContinue/context-return. That's the live frontier: decode
+`iretq` + sweep the PE-side instruction/syscall gaps, in the NT exception-return path.
+
+### 2026-06-11 UPDATE #3 — Phase 3 (guest signals) started
+
+Prereqs landed: `iret`/`iretq` (0xcf) decode+emulate, syscalls `poll`(230) and
+`getattrlistat`(476). wineboot now runs multi-threaded to ~2.25M instructions and
+stops at threads **executing at rip=0** — genuine faults that on native dispatch to
+Wine's SIGSEGV handler. ocerz has no guest signal delivery yet (it crash-dumps), so
+that delivery IS Phase 3. Full plan + the exact probed Darwin x86_64 signal-frame ABI
+(ucontext 56B, mcontext64 712B with __ss GPRs at +16.., rip@+144, faultvaddr@+8;
+siginfo addr@+24) is in the auto-memory `ocerz-project-state.md` (latest entry) and the
+groundwork workflow `wf_60d9837f-6e5`. Core = sys_sigaction full record + per-thread
+sigaltstack + crash_handler frame-build/redirect via a run-loop sigsetjmp/siglongjmp +
+sys_sigreturn(184); the only subtlety is JIT-block faults needing rip-sync (the rip=0
+fetch-fault case is already cpu-synced).
+
+### 2026-06-11 UPDATE #4 — Phase 3 DONE: rip=0 walls deliver to Wine's handler
+
+Guest signal delivery is implemented and validated end-to-end, against the real kernel
+AND in situ under wine. The rip=0 walls are gone: wineboot threads that execute at
+rip=0 now receive a Darwin SIGSEGV delivered to Wine's own `_sigtramp` and run continues.
+
+- **Frame ABI correction:** the live mcontext is **AVX64, uc_mcsize=1032** (not the older
+  712 probe); ucontext is **768B** (mcontext ptr @+48), siginfo **104B**. Verified by
+  disassembling this host's `libsystem_platform` `_sigtramp`: the kernel enters it with
+  **handler in RDI** (the note's earlier "rax=handler" was wrong — first insn is
+  `mov rax,rdi`), `edx`=signo, `rcx`=siginfo*, `r8`=ucontext*, `r9`=token; it calls
+  `handler(edi=signo, rsi=siginfo, rdx=uctx)` then `__sigreturn(rdi=uctx, esi=0x1e,
+  rdx=token)`. `ocerz_signal_deliver` builds `[siginfo][ucontext][mcontext]` top-down on
+  the altstack-or-rsp, maps OcerzCPU.gpr→__ss (Darwin order), sets RDI=handler/RDX=signo/
+  RCX=si/R8=R9=uc/RSP=si-8/rip=tramp, blocks the sig, and returns 1. `sys_sigreturn`(184)
+  restores __ss GPRs + rip/rflags + xmm/mxcsr + mask, does NOT touch gs_base/fs_base.
+- **Recovery:** `g_sig_recover` (thread-local `sigjmp_buf*`) set via `sigsetjmp` at the top
+  of both run loops (`ocerz_vm_run_cpu`, `ocerz_vm_call`), saved/restored for nesting.
+  `crash_handler` builds the frame then `siglongjmp`s back; the loop resumes at the tramp.
+- **Faithful host↔guest signal mapping:** a translated guest memory fault is delivered as
+  guest **SIGSEGV** regardless of whether the arm64 host raised SIGSEGV or **SIGBUS**
+  (the host SIGBUS/ADRALN on the shadow window is an artifact; x86_64 Darwin = SIGSEGV).
+  si_code = SEGV_ACCERR if the page is committed else SEGV_MAPERR.
+- **Host-bug guard (critical):** delivery only fires when the faulting host address is in a
+  guest window (`ocerz_host_in_guest_space()` in mem.h: low-shadow / top / commpage /
+  affine `[guest_base, guest_base+arena_hi)`). An ocerz host-code bug (wild/NULL host
+  pointer) lands outside and still surfaces as a real crash — it is NOT masked as a guest
+  signal. A re-entry guard in `ocerz_signal_deliver` (sig already blocked → return 0) keeps
+  a handler that re-faults from looping.
+- **Test:** `tests/guest/signal_test.c` — freestanding, installs SIGSEGV via raw
+  `__sigaction`(46) with its own `_sigtramp`-ABI trampoline, null-stores, handler rewrites
+  the saved rip, sigreturns to a recovery routine. Output is **byte-identical** running
+  natively under Rosetta and under ocerz (interp + jit). Wired into make check (13/13,
+  14/14 diff, 2/2 dyn green). Diagnostic: `OCERZ_SIGTRACE=1` logs each delivery.
+- **In situ:** `OCERZ_SIGTRACE=1 … WINEARCH=wow64 … ./ocerz "$W/bin/wine" notepad` shows
+  `SIG deliver addr=0x0 rip=0x0 ->tramp=0x7ff802e7d3a0` for **two** wineboot threads
+  (icount ~0x195e95 and ~0x21c6d3); after both, the process advances and **blocks in
+  `__psynch_mutexwait`** (0% CPU, healthy IPC wait) — the new frontier, past rip=0.
+- **Next walls (not Phase 3):** (a) the one-time `selpool_canonical`/`selpool_build`
+  selector-pool scan (dyldapi.c) is slow under load — finite but eats ~10-30s before
+  wineboot reaches the threads; (b) the post-rip=0 `__psynch_mutexwait` blocked state
+  (pthread/IPC) is where wineboot now parks.
+
+### 2026-06-11 UPDATE #5 — Phase 4 START: jit_lock deadlock fixed, K1 (thread_info gs_base) done, nested faults deliverable
+
+The `__psynch_mutexwait` "park" was NOT a healthy IPC wait — it was an **ocerz-internal
+`jit_lock` deadlock** exposed by multi-threaded wineboot. Chain (lldb-confirmed: 2 threads,
+neither holding the lock, worker blocked on it = orphaned): a worker's `ocerz_jit_step` ->
+`translate()` decodes guest code (`ocerz_decode(g2h(pc))`) **while holding `jit_lock`**; when
+a thread jumps to rip=0 that decode faults, and the Phase-3 `crash_handler` `siglongjmp`'d
+OUT of `translate()` **skipping `pthread_mutex_unlock(&jit_lock)`** -> deadlock.
+- **FIX (decode-probe):** `ocerz_jit_decode_recover` (`__thread sigjmp_buf*`, jit.h/jit.c)
+  wraps translate()'s decode loop; `crash_handler` (vm.c) checks it FIRST and `siglongjmp`s
+  INTO translate (which ends the block and lets jit_step unlock normally) instead of
+  delivering. A real at-rip fault -> 0-insn block -> EUNSUP -> interpreter re-faults with NO
+  lock held -> real signal delivered. Regression test `tests/guest/signal_jump0.c` (jumps to
+  rip=0) is byte-identical native/interp/jit. Workflow `wf_a21c4720-ead` confirmed the ONLY
+  other same-class lock is `g_load_lock` (dyld.c) — SAFE-BY-INVARIANT (guest code under it
+  always runs via ocerz_vm_call's own sigsetjmp); map_lock/g_wl_lock/hostwq mutex are SAFE.
+
+Past the deadlock, wineboot's two rip=0 threads deliver to Wine's `_sigtramp` (Phase 3 ✓),
+then Wine's handler faulted again. **Workflow re-attribution (3/5 auditors initially wrong):
+because the interp advances cpu->rip BEFORE the memory access, the crash rip 0x7ff802e6f4d6
+is the insn AFTER the faulting one — the real fault is `mov r8,gs:[-8]` at +0x4cd, so fault
+addr = gs_base-8.** Live-confirmed: `SIG nohandler addr=...0d8 gs=...0e0 [==gs-8] comm(gs)=0`.
+- **ROOT CAUSE = Phase 4 K1.** Wine's SEGV handler calls `thread_info(THREAD_IDENTIFIER_INFO)`
+  to get the thread's unix cthread_self; ocerz forwarded it raw so the host kernel returned
+  the **HOST arm64** thread handle (~0x16e......, in the host pthread band). Wine installs it
+  via `thread_fast_set_cthread_self`; `%gs:-8` then maps to an uncommitted low-shadow page.
+  Confirmed with an `OCERZ_MACHLEAK` reply-scan: `reply_id=3712 off=0x30 host_val=0x16e9870e0`
+  then `machdep set gs=0x16e9870e0`.
+- **K1 FIX (src/syscall.c, mach_msg2 reply path):** reply id **3712** = thread_info reply;
+  `thread_handle` at +0x30, `dispatch_qaddr` at +0x38. When +0x30 holds an uncommitted
+  host-range value, overwrite it with `cpu->gs_base` (the guest cthread_self set at
+  bsdthread_create = pth+0xe0, arena, committed) and carry the qaddr delta. Live: `K1
+  thread_info handle 0x16c2fb0e0 -> gs_base 0x3900fd0e0 (comm=1)` — the gs:-8 wall is GONE.
+- **Signal-mask fix (faithful synchronous semantics):** the Phase-3 re-entry guard `if (sig
+  masked) return 0` is correct for ASYNC signals but WRONG for a synchronous CPU fault (XNU
+  force-delivers; Wine deliberately takes nested SEGVs). Removed it; deliveries from
+  crash_handler (the only caller, always synchronous) now bypass the mask. Loop protection is
+  now a **consecutive-same-fault** counter in crash_handler (`sig_last_fault`/`sig_repeat`,
+  cap `OCERZ_SIG_MAX_REPEAT`=16) — robust to Wine's NtContinue returns (which don't sigreturn,
+  so a depth-counter would leak). Also added SA_NODEFER honoring (only auto-block the sig when
+  NOT SA_NODEFER) and DARWIN_SA_RESETHAND/SA_NODEFER defines.
+
+**NEW WALL (Phase 4 next) — diagnosed deeper, it is a BAD-POINTER cascade, NOT a missing
+page.** Past K1 + nested delivery, Wine's handler faults at `0x7ffd0000` (unix rip
+`0x381a37f1c`, insn `mov rdi,[rax+0x320]` so **rax=0x7ffcfce0**), repeatedly → loops+dies.
+Traced (OCERZ_MEMTRACE) the sub-2GB layout: Wine **reserves [0x7ff60000,0x7ffe0000)** (one
+`mmap-anon prot=0` at 0x7ff60000 len 0x80000) and commits ONLY the TEB `[0x7ffd8000,0x7ffe0000)`
++ KUSER_SHARED_DATA 0x7ffe0000 + dispatcher 0x7ffe1000. So **rax=0x7ffcfce0 points into
+reserved-but-uncommitted memory** — on native that faults too, i.e. rax is a GARBAGE pointer,
+not a page ocerz forgot to commit. Origin: the rip=0 thread's guest stack shows `[rsp]=0`
+(return address 0) with 0xb(=SIGSEGV)/0x1 below → it **RET'd to a 0 sentinel = the classic
+"thread entry function returned" teardown** (rip=0 is LEGIT thread-exit, matching the Phase-3
+note). Wine's SEGV handler then processes the exit and computes the bad rax (likely a TEB/PEB
+field set up wrong by ocerz, OR a signal-frame field we deliver that Wine reads beyond what
+signal_test exercises). REFUTED: the PEB is fine — TEB@0x7ffd8000, PEB@[gs+0x60]=0x7ffdc000, COMMITTED; rax=0x7ffcfce0
+is NOT the PEB. It is a different per-thread struct in the reserved band (TEB-0x8320; likely
+the WoW64 32-bit TEB / WOW64_CPURESERVED CPU area, which Wine places below the 64-bit TEB).
+NEXT: (1) disassemble the unix handler at 0x381a37f1c (ntdll.so) to see where rax is loaded —
+is it [64bitTEB+WowTebOffset] / a WoW64 field, and is that pointer wrong or is the page just
+uncommitted? (2) verify every mcontext/ucontext field Wine's handler reads for a rip=0 exit
+(FP/AVX/__es), since signal_test only checks handler-runs+sigreturn; (3) if rax IS a real
+WoW64 32-bit TEB Wine allocated, find why its commit (somewhere in [0x7ff60000,0x7ffd8000))
+never reaches ocerz (no commit there in the memtrace — Wine may set up the 32-bit TEB via a
+path ocerz mistranslates). Also still pending: K2 (thread_get/
+set_state x86_DEBUG_STATE accept-ignore / decide proc_translated=1 stance — wineserver's
+is_rosetta() skips debug regs), K3 (remote mach_vm R/W low_delta + deep MIG body/descriptor
+translation — mach_msg2 only translates the top-level buffer today), K4 (bootstrap/task-port,
+forwarded-unverified). Diagnostics added (all env-gated, off by default): `OCERZ_SIGTRACE`
+now logs gs_base+commit-status at each delivery, machdep-3 gs sets, and bsdthread_create pth;
+`OCERZ_MACHLEAK=1` scans mach_msg2 replies for host-address leaks into the guest. Workflow
+audit: `wf_a21c4720-ead`.
+
+### 2026-06-11 UPDATE #6 — the bad-rax wall was a SIGALTSTACK bug; fixed, Wine now handles guard-page faults
+
+The `0x7ffd0000` cascade was NOT a bad pointer / missing commit — it was an **sigaltstack
+delivery bug**. Disassembly of the unix handler at `0x381a37f1c` showed `mov r14,rsp; and
+r14,~0xffff; mov rax,[r14]; mov rdi,[rax+0x320]` — Wine recovers its **thread data pointer
+from the 64KB-aligned base of the stack the handler runs on** (`rax = *(rsp & ~0xFFFF)`). That
+ONLY works on the unix sigaltstack (whose 64KB base holds the thread ptr); ocerz was
+delivering nested faults on the **32-bit WoW64 stack** instead. Why: Wine registers SIGSEGV
+with `SA_ONSTACK` and a sigaltstack (`altsp=0x100000858 altsz=0xf7a8`); ocerz used it for the
+first delivery (`sig_on_stack=0`) but a pure sticky `sig_on_stack` flag kept nested faults OFF
+the altstack even after Wine's handler switched rsp onto the 32-bit stack. **FIX (src/syscall.c
+`ocerz_signal_deliver`):** also switch to the altstack when the current rsp has LEFT the
+altstack bounds — `use_alt = SA_ONSTACK && altsp && (!sig_on_stack || !(rsp-altsp < altsz))`
+(Linux `on_sig_stack(sp)` semantics; the sticky-flag-only form is what Darwin docs imply but
+it breaks Wine's `*(rsp&~0xffff)` recovery when the handler leaves the altstack). make-check
+green; signal_test/signal_jump0 unaffected (they never switch stacks). **RESULT:** the thread
+now correctly recovers its data (`threadptr[base]=0x7ffd8000` committed) and Wine's handler
+runs **8 guard-page faults at `0x7ff4d130`** (committed page, ACCERR — Win32 PAGE_GUARD stack
+growth; each delivery advances ~0x444 insns, with a clean `set gs=cthread(0x3900fd0e0) …
+handler … set gs=TEB(0x7ffd8000)` swap dance around each) then BREAKS OUT to new code — real
+forward progress, not a spin. **NEW WALL:** ~35 insns after the 8th handler swaps `%gs` back
+to the TEB, code at `0x7fed374c` does `gs:[-8]` while `gs=0x7ffd8000` (TEB) → reads
+`0x7ffd7ff8` (TEB-8, uncommitted) → fault, then a deeper crash in libsystem (`0x7ff802e3b6c4`,
+guest_addr `0x800732c0bfff`). This is a distinct **WoW64 %gs-timing** issue: macOS-side code
+(needs `%gs`=cthread) runs while `%gs`=TEB on the return-to-Windows path, BEFORE the next
+swap. NEXT: identify what `0x7fed374c` is (the WoW64 syscall-dispatch / sigreturn return path?)
+and whether ocerz mishandles a `%gs` reset the kernel would do, or whether `0x7ff4d130`'s
+repeated ACCERR (a COMMITTED RW page faulting) is itself an ocerz protection-bitmap desync
+that should be fixed first. Note: `0x7ff4d130` faulting despite `comm=1` is suspicious — verify
+ocerz's host mprotect matches the committed bitmap for that page.
+
+### 2026-06-11 UPDATE #7 — page-fault err code added; cascade ROOT = NtContinue to Rip=0
+
+Two follow-ups past the altstack fix:
+- **Page-fault error code (faithful fix, kept):** `ocerz_signal_deliver` left mcontext
+  `__es.err` (mc+4) = 0, so Wine saw every fault as a not-present READ. Now `crash_handler`
+  recovers the real access type from the **host arm64 ESR** (`uc_mcontext->__es.__esr`):
+  instruction-abort EC (0x20/0x21) ⇒ fetch (err bit 4); data-abort WnR (ISS bit 6) ⇒ write
+  (err bit 1); committed page (SEGV_ACCERR) ⇒ present (err bit 0); user (bit 2) always. Passed
+  as a new `err` arg to `ocerz_signal_deliver` → mc+4. make-check green. (Didn't change THIS
+  cascade — Wine isn't gating the rip=0 path on err — but it's correct and needed for
+  write/guard-page faults generally.)
+- **Cascade ROOT-CAUSED:** a per-block rip-history ring (g_riphist, vm.c) showed the block that
+  branches to rip=0 is `0x381a33b6d` = Wine's **`__wine_syscall_dispatcher` / NtContinue return
+  path**: `mov rsp,[rcx+0x88]; mov rcx,[rcx+0x70]; push r11; popfq; push rcx; ret` — it restores
+  a guest context whose **saved Rip = [rcx+0x70] = 0** and `ret`s to 0. So Wine **NtContinue's a
+  context with Rip=0**; the rip=0 fault, the 8 guard-page faults (0x7ff4d130, real PAGE_GUARD
+  stack growth — progress), the gs:[-8] fault and the libsystem crash are ALL downstream. The
+  24-deep history into it: unix ntdll (0x381a3f7xx/0x381a6c8xx) ↔ libsystem_pthread
+  (0x7ff802e6f899, 0x7ff802e733xx) → dispatcher → 0. Restored ctx had rdi=0x381a37ef0 (inside
+  the 0x381a37exx thread-recovery fn), rdx=0xb. **Why the context Rip is 0 is the next root**
+  (likely a thread-start Windows entry, or a context built wrong). The intertwined sibling wall
+  is the WoW64 %gs timing: ~35 insns after the 8th guard-handler swaps `%gs` back to the TEB
+  (machdep-3), code at 0x7fed374c does `gs:[-8]` with gs=TEB → TEB-8 (uncommitted) → fault.
+  NEXT: watchpoint where the NtContinue context's rip field ([frame+0x70]) is written 0 (or trace
+  thread-start), and resolve whether ocerz mis-sequences a %gs swap vs. 0x7fed374c needing
+  gs=cthread. (Note: signal_test only validates handler-runs + sigreturn; it does NOT exercise
+  these WoW64 / NtContinue paths.)
+
+### 2026-06-11 UPDATE #8 — genuine MAP_SHARED (wineserver shared memory) fixed; rip=0 traced to a zeroed NtContinue context
+
+The rip=0 root (UPDATE #7) was traced further with a per-block rip ring + store-watchpoints:
+the dispatcher restores a Wine syscall_frame at guest 0x10fb00 that is all-zero; its rip is
+memmove'd (libsystem_platform _platform_memmove) from a source context at 0x10010f850 whose
+rip is in turn set by unix-ntdll at 0x381a5a646 (`mov rax,[r15+0x98]; mov [r14+0xf0],rax` =
+context_from_server-style copy) — and [r15+0x98]=0. So a new WoW64 worker thread (a real
+bsdthread_create thread, pth=0x3900fd000) completes unix init then NtContinue's to a Windows
+entry of 0: **the thread's start Rip was never written**.
+
+**FIX LANDED (critical correctness, kept, make-check green): genuine MAP_SHARED.** A 3-agent
+workflow (wf_5a1836af-903) found sys_mmap reduced EVERY file-backed mapping — including the
+wineserver MAP_SHARED tmpmap blocks (KUSER_SHARED_DATA @0x7ffe0000, the session block
+0x381a1c000 len 0x144000, per-thread blocks) — to a ONE-SHOT PRIVATE pread snapshot, so a
+client never sees writes the server makes after the snapshot. New `ocerz_map_shared_file`
+(src/mem.c) overlays the fd `MAP_SHARED|MAP_FIXED` onto the reserved region (host g2h(gaddr))
+and marks the bitmap committed; sys_mmap uses it for `flags & MAP_SHARED` (pread fallback for
+MAP_PRIVATE / failure). Verified: all 11 shared blocks now map shared-ok. This is fundamental
+to cross-process Wine. (It did NOT change the rip=0 cascade — the thread entry doesn't flow
+through these blocks — but it's necessary regardless.)
+
+**ALSO: page-fault err code (UPDATE #7) confirmed kept.** Did not change rip=0 either.
+
+**rip=0 STILL OPEN — two ranked leads from the workflow:** (1) thread-create agent: the
+bsdthread_create register/_thread_start/TSD path is CORRECT (args not dropped, r9 bit28 set,
+gs_base=pth+0xe0 seeded), but **mach_msg(31)/mach_msg2(47) translate ONLY the top-level buffer
+a[0] — NO MIG body/descriptor walk** (complex messages msgh_bits&0x80000000 carrying
+port/OOL/descriptor data pass untranslated); if the new-thread context or its entry arrives via
+a complex Mach message, it lands wrong/zeroed. (2) wow64-model agent: gs/TEB identity — verify
+the new thread reads its entry from the right thread-data and that the two rip=0 threads don't
+collide on TEB=0x7ffd8000. NEXT: dump r15 + the source struct at 0x381a5a646 to find what feeds
+[r15+0x98]; check whether create_thread's context comes via the unix socket (recvmsg, already
+deep-translated) or a complex Mach message (untranslated); implement MIG complex-body
+translation if so. Diagnostics added (env-gated): OCERZ_CTXTRAP=<rip> dumps the syscall_frame
+at rcx; OCERZ_MEMTRACE now logs FILEMAP/SHAREDMAP; a per-block rip-history ring (g_riphist).
+
+### 2026-06-11 UPDATE #9 — sig_* thread-inheritance bug fixed; MIG-body partly ruled out for rip=0
+
+Workflow wf_5a1836af-903 synthesis ranked 3 causes; acted on them:
+- **FIXED (confirmed bug, kept): per-thread signal state was inherited by new threads.**
+  sys_bsdthread_create (`w->cpu = *cpu`) and the two workq/workloop worker spawns
+  (syscall.c ~792, ~885) copied the creator's OcerzCPU and reset only registers — leaking
+  sig_altstack_sp/size, sig_mask, sig_on_stack, sig_last_fault, sig_repeat. A new worker would
+  then build signal frames on the PARENT's altstack and gate delivery by the parent's mask
+  (corruption + mis-delivery). All three spawn sites now zero the sig_* fields (the HOSTWQ
+  bridge already memset'd its template). make-check green. (Didn't change the rip=0 cascade in
+  this run — the altstacks happened to be compatible — but it's a real correctness bug.)
+- **MIG complex-body translation: real gap, but partly RULED OUT as the rip=0 cause.** Added
+  OCERZ_MIGTRACE: 66 complex (msgh_bits&0x80000000) mach_msg2 replies arrive, but they are
+  predominantly PORT descriptors (d0 'addr' = a small port name, needs no translation); only a
+  few carry real OOL addresses (e.g. reply_id=1021 d0.addr=0x38091e830) and none obviously
+  carry a thread context/entry. So mach_msg2 still needs a descriptor-body walk for K3/K4
+  faithfulness, but the new-thread entry is NOT arriving via an untranslated Mach descriptor.
+- **MAP_SHARED fallback caveat (from synthesis): ocerz_map_shared_file's failure path falls
+  back to the private pread snapshot; verified all 11 server-shared blocks report shared-ok, so
+  the fallback is not firing here.**
+
+NET this session on the rip=0: the entry is set up LOCALLY at thread creation (not via the
+server reply or a Mach descriptor), so the live lead is the gs/TEB-identity / thread-params
+question — signal_start_thread reads the new thread's Windows entry from a thread-data /
+params structure and writes 0. NEXT: identify signal_start_thread's read of the entry (which
+thread-data field / how it's addressed) — likely via a -no-jit scoped trace (OCERZ_TRACE_LO/HI
+around the unix-ntdll thread-start fns 0x381a5a6xx) so rips are exact, then watch the producer
+of [r15+0x98]. Also worth: confirm the two rip=0 threads don't share TEB=0x7ffd8000.
+
+### Phase-2 entry point (next session, low host load)
+1. Rewrite the dlopen/boot initializer ordering: iterative 3-state (inited/beingInited)
+   + skip upward edges + don't pre-mark cache images done. Exit: ntdll's CF/CoreServices/
+   IOKit closure initializes in dyld order, `__CFInitialize` runs, the malloc-proxy loop
+   is gone. Keep make-check green + GUI 6/6 (verify at low load).
+2. gs_base/TSD uniqueness for initializer execution (route inits onto the owning guest
+   thread). Exit: the SkyLight/CoreGraphics dispatch_once abort clears.
+3. Then the server/signal era (Phase 2/3 of section 4): sendmsg/SCM_RIGHTS, posix_spawn
+   args-desc, guest signal delivery, wineserver bring-up.
+- Diagnostics added this session (all env-gated, in src/dyld.c + src/vm.c):
+  OCERZ_INITTRACE (per-image init enter/skip with done/gen), OCERZ_INITEDGE
+  (parent→dep edges), OCERZ_CFDUMP=<mh> (dump an image's LC_LOAD* as the loader sees
+  them), OCERZ_PEEK=<a,a,…> (crash-time guest qword dump), OCERZ_DLINIT (the gated,
+  to-be-replaced force-init experiment). RCA workflow: wf_53d7e202-ce4.

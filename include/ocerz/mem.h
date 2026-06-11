@@ -125,11 +125,38 @@ static inline uint64_t ocerz_h2g(const void *haddr)
     return h - ocerz_guest_base;
 }
 
+/* True when a host address lies inside one of the windows ocerz maps for guest
+ * memory: the low-shadow block, the top block, the commpage, or the affine
+ * arena. Because the emulator only ever touches guest memory through ocerz_g2h,
+ * a genuine guest memory fault always lands in one of these; a fault outside
+ * them is an ocerz host-code bug (a wild/NULL host pointer) and must surface as
+ * a real crash, not be delivered to the guest as a signal. The affine window is
+ * tested from guest 0 (not arena_lo) so a guest access to the null guard page
+ * below the arena still counts as a guest fault; ocerz's own image and heap sit
+ * below guest_base, so h - guest_base wraps and excludes them. */
+static inline int ocerz_host_in_guest_space(const void *haddr)
+{
+    uint64_t h = (uint64_t)(uintptr_t)haddr;
+    if (ocerz_commpage) {
+        uint64_t c = (uint64_t)(uintptr_t)ocerz_commpage;
+        if (h - c < OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO)
+            return 1;
+    }
+    if (ocerz_low_base) {
+        if (h - ocerz_low_base < OCERZ_LOW_LIMIT)
+            return 1;
+        if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
+            return 1;
+    }
+    return h - ocerz_guest_base < ocerz_arena_hi;
+}
+
 int ocerz_mem_init(uint64_t lo, uint64_t hi);
 int ocerz_mem_init_identity(uint64_t size);
 int ocerz_mem_init_low_shadow(void);
 int ocerz_mem_register_range(uint64_t glo, uint64_t ghi);
 int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot);
+int ocerz_map_shared_file(uint64_t gaddr, uint64_t len, int prot, int fd, uint64_t off);
 int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_map_claim_region(uint64_t gaddr, uint64_t len, int prot);
 uint64_t ocerz_map_donate(uint64_t len);
