@@ -110,6 +110,7 @@
 
 #include <sys/mman.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <libkern/OSCacheControl.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -825,17 +826,29 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     X86Insn scratch[JIT_MAX_BLOCK_INSNS];
     int n = 0;
     uint64_t pc = rip;
-    for (; n < JIT_MAX_BLOCK_INSNS; ) {
-        const uint8_t *code = (const uint8_t *)ocerz_g2h(pc);
-        int rc = ocerz_decode(code, 15, pc, &scratch[n]);
-        if (rc != OCERZ_OK)
-            break;
-        unsigned op = scratch[n].op;
-        uint8_t len = scratch[n].len;
-        n++;
-        if (is_terminator(op))
-            break;
-        pc += len;
+    {
+        volatile int vn = 0;
+        volatile uint64_t vpc = rip;
+        sigjmp_buf db;
+        sigjmp_buf *prev_dr = ocerz_jit_decode_recover;
+        if (sigsetjmp(db, 1) == 0) {
+            ocerz_jit_decode_recover = &db;
+            for (; vn < JIT_MAX_BLOCK_INSNS; ) {
+                const uint8_t *code = (const uint8_t *)ocerz_g2h(vpc);
+                int rc = ocerz_decode(code, 15, vpc, &scratch[vn]);
+                if (rc != OCERZ_OK)
+                    break;
+                unsigned op = scratch[vn].op;
+                uint8_t len = scratch[vn].len;
+                vn++;
+                if (is_terminator(op))
+                    break;
+                vpc += len;
+            }
+        }
+        ocerz_jit_decode_recover = prev_dr;
+        n = vn;
+        pc = vpc;
     }
     if (n == 0)
         return NULL;
@@ -958,6 +971,9 @@ uint64_t ocerz_jit_blocks(const OcerzJit *jit)
 }
 
 static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Storage for the translate()-time decode recovery point declared in jit.h. */
+__thread sigjmp_buf *ocerz_jit_decode_recover;
 
 void ocerz_jit_prefork(void)
 {

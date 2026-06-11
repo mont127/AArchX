@@ -183,6 +183,7 @@ enum OcerzOp {
     OCERZ_OP_LOOPNE,
     OCERZ_OP_CALL,
     OCERZ_OP_RET,
+    OCERZ_OP_IRET,
     OCERZ_OP_LEAVE,
     OCERZ_OP_INT3,
     OCERZ_OP_INT,

@@ -94,6 +94,16 @@ typedef struct OcerzCPU {
     int terminated;
     int cpu_number;
     uint64_t wq_workloop_id;
+    /* Per-thread signal state for guest signal delivery (see syscall.c): the
+     * registered sigaltstack and the current blocked mask, plus a flag that is
+     * set while the thread is running on its altstack so a nested signal does
+     * not re-switch to it. */
+    uint64_t sig_altstack_sp;
+    uint64_t sig_altstack_size;
+    uint64_t sig_mask;
+    int sig_on_stack;
+    uint64_t sig_last_fault;
+    int sig_repeat;
 } OcerzCPU;
 
 void ocerz_cpu_reset(OcerzCPU *cpu);

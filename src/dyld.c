@@ -1342,13 +1342,15 @@ static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64
     }
 }
 
-#define INIT_VISITED_MAX 4096
+#define INIT_VISITED_MAX 8192
 static uint64_t g_init_visited[INIT_VISITED_MAX];
 static uint32_t g_init_gen[INIT_VISITED_MAX];
 static uint8_t g_init_done[INIT_VISITED_MAX];
+static uint8_t g_init_being[INIT_VISITED_MAX];
 static int g_init_visited_n;
 static uint32_t g_init_cur_gen;
 static int g_init_force;
+static int g_init_collect_depth;
 static uint64_t g_libsys_mh;
 
 static int init_mark(uint64_t mh)
@@ -1362,7 +1364,146 @@ static int init_mark(uint64_t mh)
     g_init_visited[i] = mh;
     g_init_gen[i] = 0;
     g_init_done[i] = 0;
+    g_init_being[i] = 0;
     return i;
+}
+
+static int init_is_done(uint64_t mh)
+{
+    for (int i = 0; i < g_init_visited_n; i++)
+        if (g_init_visited[i] == mh)
+            return g_init_done[i];
+    return 0;
+}
+
+/* Mark the libSystem umbrella as already-initialized WITHOUT running anything.
+ * The boot libSystem_initializer hand-runs the umbrella's internal inits
+ * (__libkernel_init, __pthread_init, __malloc_init, libdispatch_init, ...) for
+ * the sub-libraries it reexports, so their per-image initializers have
+ * effectively run; re-running them via init_closure would double-initialize
+ * pthread/malloc (fatal). The recursion is BOUNDED to the umbrella by following
+ * only deps whose install name is under /usr/lib/system/ (plus the libSystem.B
+ * root) — that is exactly the set libSystem_initializer covers. Following the
+ * full transitive closure would wrongly mark high-level frameworks done:
+ * CoreFoundation, IOKit and CoreServices are reachable from the umbrella but are
+ * NOT initialized by libSystem_initializer, and pre-marking them done is what
+ * stops init_closure from running __CFInitialize before CF's dependents. */
+static int is_umbrella_path(const char *p)
+{
+    return p && strncmp(p, "/usr/lib/system/", 16) == 0;
+}
+
+static void init_mark_done_closure(OcerzCache *cache, uint64_t mh)
+{
+    if (!mh)
+        return;
+    int idx = init_mark(mh);
+    if (idx < 0 || g_init_done[idx] || g_init_being[idx])
+        return;
+    g_init_being[idx] = 1;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+    if (rd32(h) == MH_MAGIC_64) {
+        uint32_t ncmds = rd32(h + 16);
+        const uint8_t *lc = h + sizeof(struct mach_header_64);
+        for (uint32_t j = 0; j < ncmds; j++) {
+            uint32_t cmd = rd32(lc);
+            if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+                cmd == LC_REEXPORT_DYLIB) {
+                uint32_t noff = rd32(lc + 8);
+                const char *dpath = (const char *)(lc + noff);
+                if (noff < rd32(lc + 4) && is_umbrella_path(dpath))
+                    init_mark_done_closure(cache, dep_mh(cache, dpath));
+            }
+            lc += rd32(lc + 4);
+        }
+    }
+    g_init_being[idx] = 0;
+    g_init_done[idx] = 1;
+}
+
+/* Collect the not-yet-initialized hard-dependency closure of `mh` into list[]
+ * (depth-first, g_init_being as this-pass visited marker; UPWARD links are NOT
+ * followed — that is their purpose). No initializer runs here. */
+static void init_collect(OcerzCache *cache, uint64_t mh, uint64_t *list, int *n, int cap)
+{
+    if (!mh)
+        return;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+    if (rd32(h) != MH_MAGIC_64)
+        return;
+    int idx = init_mark(mh);
+    if (idx < 0 || g_init_done[idx] || g_init_being[idx])
+        return;
+    g_init_being[idx] = 1;
+    if (*n < cap)
+        list[(*n)++] = mh;
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t j = 0; j < ncmds; j++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+            cmd == LC_REEXPORT_DYLIB) {
+            uint32_t noff = rd32(lc + 8);
+            if (noff < rd32(lc + 4))
+                init_collect(cache, dep_mh(cache, (const char *)(lc + noff)), list, n, cap);
+        }
+        lc += rd32(lc + 4);
+    }
+}
+
+static int init_addr_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* Run the not-yet-initialized hard-dependency closure of `mh` in dependency
+ * order. The closure is collected, then initializers run in ASCENDING cache
+ * address: the dyld shared cache lays foundational dylibs out before the
+ * frameworks that build on them, so address order reproduces the cache's baked
+ * initializer order and — unlike a naive DFS post-order — breaks the genuine
+ * CoreFoundation<->libobjc<->libswiftCore<->Foundation initialization cycle the
+ * way native does, running CoreFoundation's __CFInitialize (which arms
+ * kCFAllocatorSystemDefault's malloc-zone vtable) before the AppKit/SkyLight
+ * frameworks that allocate through CF. UPWARD links are excluded from the
+ * closure. libSystem's umbrella is already marked done (init_mark_done_closure),
+ * so it is skipped. The collect list is on the stack so a nested dlopen from an
+ * initializer (which re-enters init_closure) gets its own buffer. */
+#define INIT_CLOSURE_CAP 4096
+static void init_closure(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
+                         const uint64_t *ia, uint64_t stack_top)
+{
+    if (vm->exited || !mh)
+        return;
+    static uint64_t list[INIT_CLOSURE_CAP];
+    uint64_t *l = list;
+    int reentrant = (g_init_collect_depth > 0);
+    if (reentrant)
+        l = (uint64_t *)malloc(sizeof(uint64_t) * INIT_CLOSURE_CAP);
+    if (!l)
+        return;
+    g_init_collect_depth++;
+    int n = 0;
+    init_collect(cache, mh, l, &n, INIT_CLOSURE_CAP);
+    for (int i = 0; i < n; i++) {
+        int idx = init_mark(l[i]);
+        if (idx >= 0)
+            g_init_being[idx] = 0;
+    }
+    qsort(l, (size_t)n, sizeof l[0], init_addr_cmp);
+    for (int i = 0; i < n && !vm->exited; i++) {
+        uint64_t m = l[i];
+        int idx = init_mark(m);
+        if (idx < 0 || g_init_done[idx])
+            continue;
+        if (getenv("OCERZ_INITTRACE"))
+            fprintf(stderr, "INITCLOSURE run mh=%#llx\n", (unsigned long long)m);
+        run_image_inits(vm, m, ia, stack_top);
+        g_init_done[idx] = 1;
+    }
+    g_init_collect_depth--;
+    if (reentrant)
+        free(l);
 }
 
 static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
@@ -1374,21 +1515,49 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
     if (rd32(h) != MH_MAGIC_64)
         return;
     int idx = init_mark(mh);
-    if (idx >= 0 && (g_init_done[idx] || g_init_gen[idx] == g_init_cur_gen))
+    if (idx >= 0 && (g_init_done[idx] || g_init_gen[idx] == g_init_cur_gen)) {
+        if (getenv("OCERZ_INITTRACE"))
+            fprintf(stderr, "INITTRACE skip mh=%#llx done=%d gen=%u cur=%u\n",
+                    (unsigned long long)mh, g_init_done[idx], g_init_gen[idx], g_init_cur_gen);
         return;
+    }
     if (idx >= 0)
         g_init_gen[idx] = g_init_cur_gen;
+    if (getenv("OCERZ_INITTRACE"))
+        fprintf(stderr, "INITTRACE enter mh=%#llx force=%d\n",
+                (unsigned long long)mh, g_init_force);
 
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
+    const char *cfdump = getenv("OCERZ_CFDUMP");
+    if (cfdump && mh == strtoull(cfdump, NULL, 0)) {
+        fprintf(stderr, "CFDUMP mh=%#llx ncmds=%u (h=%p)\n",
+                (unsigned long long)mh, ncmds, (const void *)h);
+        const uint8_t *p = lc;
+        for (uint32_t j = 0; j < ncmds; j++) {
+            uint32_t c = rd32(p), sz = rd32(p + 4);
+            if (c == 0xc || c == 0x8000001f || c == 0x80000018 || c == 0x80000022)
+                fprintf(stderr, "  CFDUMP [%u] cmd=%#x sz=%u name=%s\n",
+                        j, c, sz, (const char *)(p + rd32(p + 8)));
+            p += sz;
+        }
+    }
     for (uint32_t j = 0; j < ncmds; j++) {
         uint32_t cmd = rd32(lc);
         if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
             cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
             uint32_t noff = rd32(lc + 8);
-            if (noff < rd32(lc + 4))
-                run_init_phase(vm, cache, dep_mh(cache, (const char *)(lc + noff)),
-                               ia, stack_top, skip_mh);
+            if (noff < rd32(lc + 4)) {
+                uint64_t dmh = dep_mh(cache, (const char *)(lc + noff));
+                if (getenv("OCERZ_INITEDGE"))
+                    fprintf(stderr, "INITEDGE %#llx -> %#llx \"%s\"\n",
+                            (unsigned long long)mh, (unsigned long long)dmh,
+                            (const char *)(lc + noff));
+                if (!dmh && getenv("OCERZ_INITTRACE"))
+                    fprintf(stderr, "INITTRACE dep-unresolved mh=%#llx dep=\"%s\"\n",
+                            (unsigned long long)mh, (const char *)(lc + noff));
+                run_init_phase(vm, cache, dmh, ia, stack_top, skip_mh);
+            }
         }
         lc += rd32(lc + 4);
     }
@@ -1749,19 +1918,11 @@ static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
         ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
     if (g_run_init_ready && g_run_vm && !vm->exited) {
         ocerz_dyldapi_objc_map_one(g_run_vm, cmh);
-        int seen = 0;
-        for (int i = 0; i < g_init_visited_n; i++)
-            if (g_init_visited[i] == cmh && g_init_done[i])
-                seen = 1;
-        if (!seen && !vm->exited && getenv("OCERZ_DLINIT")) {
+        if (!init_is_done(cmh) && !vm->exited && getenv("OCERZ_CACHEINIT")) {
             uint64_t istk = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
-            if (istk) {
-                g_init_cur_gen++;
-                g_init_force = 1;
-                run_init_phase(g_run_vm, g_run_cache, cmh, g_run_init_args,
-                               istk + DYN_STACK_SIZE - 64, g_libsys_mh);
-                g_init_force = 0;
-            }
+            if (istk)
+                init_closure(g_run_vm, g_run_cache, cmh, g_run_init_args,
+                             istk + DYN_STACK_SIZE - 64);
         }
     }
     return cmh;
@@ -1819,23 +1980,7 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
                 if (vm->exited)
                     break;
             }
-            if (getenv("OCERZ_DLINIT")) {
-                g_init_cur_gen++;
-                g_init_force = 1;
-                for (int i = g_dimgs_n - 1; i >= before && !vm->exited; i--) {
-                    run_init_phase(g_run_vm, g_run_cache, g_dimgs[i].load_base,
-                                   g_run_init_args, itop, g_libsys_mh);
-                    if (vm->exited)
-                        break;
-                }
-                g_init_force = 0;
-            } else {
-                for (int i = g_dimgs_n - 1; i >= before && !vm->exited; i--) {
-                    run_image_inits(g_run_vm, g_dimgs[i].load_base, g_run_init_args, itop);
-                    if (vm->exited)
-                        break;
-                }
-            }
+            init_closure(g_run_vm, g_run_cache, d->load_base, g_run_init_args, itop);
         }
     }
     if (g_dlerror_g)
@@ -2066,6 +2211,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         if (ran_init && getenv("OCERZ_INITPHASE")) {
             uint64_t libsys = dep_find(&cache, "/usr/lib/libSystem.B.dylib");
             g_libsys_mh = libsys;
+            init_mark_done_closure(&cache, libsys);
             compute_eager_set(&cache, img.load_base);
             OCERZ_LOG("dynamic: eager init set = %d images (of closure)\n", g_eager_n);
             ocerz_tlv_register_closure(vm, &cache, img.load_base, fr.stack_top);

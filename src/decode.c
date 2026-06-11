@@ -994,6 +994,37 @@ static int decode_one_byte(DecState *s, uint8_t op)
         }
         return OCERZ_OK;
     }
+    case 0x8c: {
+        /* MOV r/m16, Sreg — store a segment SELECTOR. x86_64 has no real
+         * segmentation; the selectors are fixed constants in macOS user mode
+         * (CS=0x2b, SS=0x23, the rest 0), which Wine reads to fill a Windows
+         * CONTEXT. Emit the constant as a 16-bit immediate MOV into r/m. */
+        static const uint16_t seg_sel[8] = {
+            0x00, 0x2b, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00,
+        };
+        ModRM m;
+        e = decode_modrm(s, &m, 2);
+        if (e)
+            return e;
+        set_op(s, OCERZ_OP_MOV);
+        s->out->opsize = 2;
+        s->out->nops = 2;
+        place_rm(s, &m, &s->out->ops[0], 2, 1);
+        set_imm(&s->out->ops[1], seg_sel[m.reg & 7], 2);
+        return OCERZ_OK;
+    }
+    case 0x8e: {
+        /* MOV Sreg, r/m16 — loading a selector is a no-op in 64-bit user mode
+         * (FS/GS bases are set via the machdep TLS syscall, not the selector;
+         * the rest are inert). Consume the ModRM and do nothing. */
+        ModRM m;
+        e = decode_modrm(s, &m, 2);
+        if (e)
+            return e;
+        set_op(s, OCERZ_OP_NOP);
+        s->out->nops = 0;
+        return OCERZ_OK;
+    }
     case 0x8d: {
         ModRM m;
         int size = opsize_default(s);
@@ -1242,6 +1273,15 @@ static int decode_one_byte(DecState *s, uint8_t op)
     case 0xc3:
         set_op(s, OCERZ_OP_RET);
         s->out->opsize = 8;
+        s->out->nops = 0;
+        return OCERZ_OK;
+    case 0xcf:
+        /* IRETD/IRETQ: pop the interrupt frame (RIP, CS, RFLAGS, RSP, SS),
+         * element size = operand size (8 with REX.W = IRETQ, else 4). Wine's
+         * NtContinue / syscall-dispatcher build a fake iret frame and use this
+         * to restore a full register context. */
+        set_op(s, OCERZ_OP_IRET);
+        s->out->opsize = (uint8_t)opsize_default(s);
         s->out->nops = 0;
         return OCERZ_OK;
     case 0xc6:
@@ -2955,6 +2995,7 @@ static void init_op_names(void)
     op_names[OCERZ_OP_LOOPNE] = "loopne";
     op_names[OCERZ_OP_CALL] = "call";
     op_names[OCERZ_OP_RET] = "ret";
+    op_names[OCERZ_OP_IRET] = "iret";
     op_names[OCERZ_OP_LEAVE] = "leave";
     op_names[OCERZ_OP_INT3] = "int3";
     op_names[OCERZ_OP_INT] = "int";

@@ -137,6 +137,8 @@
 #include <unistd.h>
 #include <spawn.h>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <signal.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
@@ -174,7 +176,23 @@ typedef struct ocerz_bsd_entry {
     ocerz_bsd_fn intercept;
 } ocerz_bsd_entry;
 
-static uint64_t guest_sig_handlers[OCERZ_NSIG];
+/* Per-signal registered disposition (process-wide). The Darwin __sigaction the
+ * guest passes is {handler@0, sa_tramp@8, sa_mask@16(u32), sa_flags@20(int)};
+ * delivering a signal needs all four — the trampoline is the return address the
+ * guest's _sigtramp expects, sa_flags carries SA_SIGINFO/SA_ONSTACK, sa_mask is
+ * added to the blocked set for the handler's duration. */
+typedef struct {
+    uint64_t handler;
+    uint64_t tramp;
+    uint64_t mask;
+    uint32_t flags;
+} GuestSigact;
+static GuestSigact guest_sigact[OCERZ_NSIG];
+
+#define DARWIN_SA_ONSTACK 0x0001u
+#define DARWIN_SA_RESETHAND 0x0004u
+#define DARWIN_SA_NODEFER 0x0010u
+#define DARWIN_SA_SIGINFO 0x0040u
 
 static const char *errno_name(int e)
 {
@@ -263,6 +281,17 @@ static int sys_abort_payload(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_EXIT;
 }
 
+static void memtrace(const char *op, uint64_t a, uint64_t l, int prot, int flags)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("OCERZ_MEMTRACE") != NULL ? 1 : 0;
+    if (on && a >= 0x7ff00000ull && a < 0x80000000ull)
+        fprintf(stderr, "ocerz: MEM %s addr=%#llx len=%#llx prot=%#x flags=%#x comm=%d\n",
+                op, (unsigned long long)a, (unsigned long long)l, prot, flags,
+                ocerz_addr_committed(a));
+}
+
 static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
@@ -276,6 +305,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int fixed = (flags & MAP_FIXED) != 0;
     uint64_t gaddr;
 
+    memtrace(anon ? "mmap-anon" : "mmap-file", addr, len, prot, flags);
     if (anon) {
         if (fixed) {
             int rc;
@@ -323,6 +353,30 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
     }
 
+    if (getenv("OCERZ_MEMTRACE")) {
+        char path[256];
+        path[0] = 0;
+        fcntl(fd, F_GETPATH, path);
+        fprintf(stderr, "ocerz: FILEMAP gaddr=%#llx len=%#llx prot=%#x SHARED=%d fd=%d off=%#llx path=%s\n",
+                (unsigned long long)gaddr, (unsigned long long)len, prot,
+                (flags & MAP_SHARED) ? 1 : 0, fd, (unsigned long long)pos, path);
+    }
+    /* A MAP_SHARED file mapping (the wineserver tmpmap blocks: KUSER_SHARED_DATA,
+     * the session and per-thread blocks) must be GENUINELY shared so writes by
+     * the server process are visible to clients. Overlay the fd MAP_SHARED onto
+     * the reserved region; only fall back to a private pread snapshot if that
+     * fails (or for MAP_PRIVATE file mappings, which want a copy). */
+    if (flags & MAP_SHARED) {
+        int src = ocerz_map_shared_file(gaddr, len, prot, fd, pos);
+        if (getenv("OCERZ_MEMTRACE"))
+            fprintf(stderr, "ocerz: SHAREDMAP gaddr=%#llx len=%#llx -> %s\n",
+                    (unsigned long long)gaddr, (unsigned long long)len,
+                    src == OCERZ_OK ? "shared-ok" : "FAILED(fallback-pread)");
+        if (src == OCERZ_OK) {
+            ret_ok(cpu, gaddr);
+            return OCERZ_STEP_OK;
+        }
+    }
     {
         uint64_t pa[8] = { (uint64_t)fd, (uint64_t)(uintptr_t)ocerz_g2h(gaddr), len, pos, 0, 0, 0, 0 };
         int err = 0;
@@ -346,6 +400,7 @@ static int sys_munmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 static int sys_mprotect(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
+    memtrace("mprotect", a[0], a[1], (int)a[2], 0);
     ocerz_protect(a[0], a[1], (int)a[2]);
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
@@ -752,6 +807,12 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             t.gpr[OCERZ_R8] = 0x40000ull | 0x200000ull | 0x4000ull | (uint64_t)qos_idx;
             t.gpr[OCERZ_R9] = 0;
             t.gs_base = pth + 0xe0;
+            t.sig_altstack_sp = 0;
+            t.sig_altstack_size = 0;
+            t.sig_mask = 0;
+            t.sig_on_stack = 0;
+            t.sig_last_fault = 0;
+            t.sig_repeat = 0;
             if (ocerz_spawn_worker(vm, &t) != 0) {
                 __atomic_fetch_sub(&g_wq_running, 1, __ATOMIC_SEQ_CST);
                 break;
@@ -848,6 +909,12 @@ static int ocerz_spawn_workloop_worker(OcerzVM *vm, const OcerzCPU *cpu,
     t.gpr[OCERZ_R9] = (uint64_t)nchanges_out;
     t.gs_base = pth + 0xe0;
     t.wq_workloop_id = workloop_id;
+    t.sig_altstack_sp = 0;
+    t.sig_altstack_size = 0;
+    t.sig_mask = 0;
+    t.sig_on_stack = 0;
+    t.sig_last_fault = 0;
+    t.sig_repeat = 0;
     if (ocerz_spawn_worker(vm, &t) != 0) {
         __atomic_fetch_sub(&g_wq_running, 1, __ATOMIC_SEQ_CST);
         return -1;
@@ -1037,6 +1104,21 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     w->cpu.gpr[OCERZ_R8] = stack;
     w->cpu.gpr[OCERZ_R9] = flags | 0x10000000ull;
     w->cpu.gs_base = pth + 0xe0;
+    /* A new thread starts with NO sigaltstack, an empty blocked mask, and is not
+     * on any altstack -- these are per-thread and must NOT be inherited from the
+     * creating thread (w->cpu = *cpu copies them), or the new thread would build
+     * signal frames on the parent's altstack and gate delivery by the parent's
+     * mask, corrupting the parent and mis-delivering its own faults. */
+    w->cpu.sig_altstack_sp = 0;
+    w->cpu.sig_altstack_size = 0;
+    w->cpu.sig_mask = 0;
+    w->cpu.sig_on_stack = 0;
+    w->cpu.sig_last_fault = 0;
+    w->cpu.sig_repeat = 0;
+    if (getenv("OCERZ_SIGTRACE"))
+        fprintf(stderr, "ocerz: bsdthread_create pth=%#llx comm(pth)=%d stack=%#llx icount=%#llx\n",
+                (unsigned long long)pth, ocerz_addr_committed(pth),
+                (unsigned long long)stack, (unsigned long long)vm->insn_count);
     ocerz_st(pth + 0xe0, 8, pth);
 
     pthread_attr_t attr;
@@ -1095,11 +1177,17 @@ static int sys_sigaction(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int sig = (int)a[0];
     uint64_t act = a[1];
     uint64_t oact = a[2];
-    if (oact != 0)
-        memset(ocerz_g2h(oact), 0, 16);
+    if (oact != 0 && sig >= 0 && sig < OCERZ_NSIG) {
+        ocerz_st(oact + 0, 8, guest_sigact[sig].handler);
+        ocerz_st(oact + 8, 8, guest_sigact[sig].tramp);
+        ocerz_st(oact + 16, 4, (uint32_t)guest_sigact[sig].mask);
+        ocerz_st(oact + 20, 4, guest_sigact[sig].flags);
+    }
     if (act != 0 && sig >= 0 && sig < OCERZ_NSIG) {
-        uint64_t handler = ocerz_ld(act, 8);
-        guest_sig_handlers[sig] = handler;
+        guest_sigact[sig].handler = ocerz_ld(act, 8);
+        guest_sigact[sig].tramp = ocerz_ld(act + 8, 8);
+        guest_sigact[sig].mask = (uint32_t)ocerz_ld(act + 16, 4);
+        guest_sigact[sig].flags = (uint32_t)ocerz_ld(act + 20, 4);
     }
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
@@ -1109,7 +1197,7 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t signo = a[1];
     if (signo > 0 && signo < OCERZ_NSIG) {
-        uint64_t h = guest_sig_handlers[signo];
+        uint64_t h = guest_sigact[signo].handler;
         if (h > 1) {
             OcerzCPU saved = *cpu;
             uint64_t args[1] = { signo };
@@ -1126,9 +1214,20 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 static int sys_sigprocmask(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
+    int how = (int)a[0];
+    uint64_t set = a[1];
     uint64_t oset = a[2];
     if (oset != 0)
-        memset(ocerz_g2h(oset), 0, 4);
+        ocerz_st(oset, 4, (uint32_t)cpu->sig_mask);
+    if (set != 0) {
+        uint32_t v = (uint32_t)ocerz_ld(set, 4);
+        if (how == 1)            /* SIG_BLOCK */
+            cpu->sig_mask |= v;
+        else if (how == 2)       /* SIG_UNBLOCK */
+            cpu->sig_mask &= ~(uint64_t)v;
+        else                     /* SIG_SETMASK */
+            cpu->sig_mask = v;
+    }
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
 }
@@ -1136,10 +1235,181 @@ static int sys_sigprocmask(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
+    uint64_t ss = a[0];
     uint64_t oss = a[1];
-    if (oss != 0)
-        memset(ocerz_g2h(oss), 0, 24);
+    if (oss != 0) {
+        ocerz_st(oss + 0, 8, cpu->sig_altstack_sp);
+        ocerz_st(oss + 8, 8, cpu->sig_altstack_size);
+        ocerz_st(oss + 16, 4, cpu->sig_on_stack ? 0x0001u : 0u);
+    }
+    if (ss != 0) {
+        uint32_t flags = (uint32_t)ocerz_ld(ss + 16, 4);
+        if (flags & 0x0004u) {   /* SS_DISABLE */
+            cpu->sig_altstack_sp = 0;
+            cpu->sig_altstack_size = 0;
+        } else {
+            cpu->sig_altstack_sp = ocerz_ld(ss + 0, 8);
+            cpu->sig_altstack_size = ocerz_ld(ss + 8, 8);
+        }
+    }
     ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
+/* Build the Darwin x86_64 signal frame for `cpu` and redirect it to the guest's
+ * registered _sigtramp, exactly as the macOS kernel would when delivering `sig`.
+ * Returns 1 if delivered (caller unwinds the host fault and resumes the guest at
+ * the trampoline), 0 if no handler is registered (caller keeps its default
+ * crash path). The frame is [siginfo][ucontext][mcontext(AVX,1032B)] laid out
+ * top-down on the sigaltstack (when SA_ONSTACK) or the current guest stack; the
+ * trampoline is entered with the kernel ABI rax=handler, edx=signum,
+ * rcx=&siginfo, r8=&ucontext, r9=sigreturn-token, and on the handler's return it
+ * calls __sigreturn (BSD 184) which restores OcerzCPU from mcontext.__ss. Offsets
+ * are the probed Darwin layout (mcontext __es@0/__ss@16; __ss order
+ * rax,rbx,rcx,rdx,rdi,rsi,rbp,rsp,r8..r15,rip@144,rflags@152). gs_base/fs_base are
+ * NOT carried through the frame, so the handler keeps the faulting thread's TLS. */
+#define OCERZ_MCTX_SIZE 1032u
+#define OCERZ_UCTX_SIZE 768u
+#define OCERZ_SIGINFO_SIZE 104u
+
+int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_code,
+                         uint32_t err)
+{
+    if (sig <= 0 || sig >= OCERZ_NSIG)
+        return 0;
+    GuestSigact *sa = &guest_sigact[sig];
+    if (sa->handler <= 1 || sa->tramp == 0)
+        return 0;
+    /* These deliveries are SYNCHRONOUS CPU faults (the host SIGSEGV/SIGBUS
+     * handler is the only caller). On Darwin a synchronous fault cannot be held
+     * pending by the thread's signal mask against the faulting instruction, so
+     * the mask does NOT suppress delivery -- which is what lets Wine's SIGSEGV
+     * handler service the nested faults it deliberately takes (guard pages,
+     * commit-on-demand). A handler that keeps faulting on the SAME unfixable
+     * address is caught by the consecutive-repeat guard in crash_handler, not
+     * here. */
+
+    /* Use the registered sigaltstack when SA_ONSTACK is set and either we are
+     * not already on it OR the current SP has LEFT its bounds. The second clause
+     * is what a pure sticky "on_stack" flag misses: Wine's handler switches rsp
+     * onto the 32-bit WoW64 stack mid-handler, and a nested fault must then be
+     * re-delivered onto the unix altstack -- Wine recovers its thread data via
+     * *(rsp & ~0xFFFF) at the altstack's 64KB-aligned base, which only holds the
+     * thread pointer on the altstack. Matches Linux on_sig_stack(sp) semantics. */
+    uint64_t asp = cpu->sig_altstack_sp, asz = cpu->sig_altstack_size;
+    int sp_on_alt = asp && (cpu->gpr[OCERZ_RSP] - asp < asz);
+    int use_alt = (sa->flags & DARWIN_SA_ONSTACK) && asp &&
+                  (!cpu->sig_on_stack || !sp_on_alt);
+    if (getenv("OCERZ_SIGTRACE"))
+        fprintf(stderr,
+                "ocerz:   altstk sig=%d flags=%#x ONSTACK=%d altsp=%#llx altsz=%#llx on_stack=%d sp_on_alt=%d -> use_alt=%d\n",
+                sig, sa->flags, (sa->flags & DARWIN_SA_ONSTACK) ? 1 : 0,
+                (unsigned long long)cpu->sig_altstack_sp,
+                (unsigned long long)cpu->sig_altstack_size, cpu->sig_on_stack,
+                sp_on_alt, use_alt);
+    uint64_t top = use_alt ? (cpu->sig_altstack_sp + cpu->sig_altstack_size)
+                           : cpu->gpr[OCERZ_RSP];
+    uint64_t mc = (top - OCERZ_MCTX_SIZE) & ~15ull;
+    uint64_t uc = (mc - OCERZ_UCTX_SIZE) & ~15ull;
+    uint64_t si = (uc - OCERZ_SIGINFO_SIZE) & ~15ull;
+    uint64_t newsp = si - 8;
+
+    memset(ocerz_g2h(mc), 0, OCERZ_MCTX_SIZE);
+    memset(ocerz_g2h(uc), 0, OCERZ_UCTX_SIZE);
+    memset(ocerz_g2h(si), 0, OCERZ_SIGINFO_SIZE);
+
+    int trapno = (sig == SIGSEGV || sig == SIGBUS) ? 14 : (sig == SIGILL ? 6 : 0);
+    ocerz_st(mc + 0, 4, (uint32_t)trapno);
+    ocerz_st(mc + 4, 4, err);
+    ocerz_st(mc + 8, 8, fault_addr);
+    ocerz_st(mc + 16, 8, cpu->gpr[OCERZ_RAX]);
+    ocerz_st(mc + 24, 8, cpu->gpr[OCERZ_RBX]);
+    ocerz_st(mc + 32, 8, cpu->gpr[OCERZ_RCX]);
+    ocerz_st(mc + 40, 8, cpu->gpr[OCERZ_RDX]);
+    ocerz_st(mc + 48, 8, cpu->gpr[OCERZ_RDI]);
+    ocerz_st(mc + 56, 8, cpu->gpr[OCERZ_RSI]);
+    ocerz_st(mc + 64, 8, cpu->gpr[OCERZ_RBP]);
+    ocerz_st(mc + 72, 8, cpu->gpr[OCERZ_RSP]);
+    ocerz_st(mc + 80, 8, cpu->gpr[OCERZ_R8]);
+    ocerz_st(mc + 88, 8, cpu->gpr[OCERZ_R9]);
+    ocerz_st(mc + 96, 8, cpu->gpr[OCERZ_R10]);
+    ocerz_st(mc + 104, 8, cpu->gpr[OCERZ_R11]);
+    ocerz_st(mc + 112, 8, cpu->gpr[OCERZ_R12]);
+    ocerz_st(mc + 120, 8, cpu->gpr[OCERZ_R13]);
+    ocerz_st(mc + 128, 8, cpu->gpr[OCERZ_R14]);
+    ocerz_st(mc + 136, 8, cpu->gpr[OCERZ_R15]);
+    ocerz_st(mc + 144, 8, cpu->rip);
+    ocerz_st(mc + 152, 8, cpu->rflags);
+    ocerz_st(mc + 160, 8, 0x2b);
+    ocerz_st(mc + 216, 4, cpu->mxcsr);
+    for (int i = 0; i < 16; i++)
+        ocerz_st128(mc + 352 + (uint64_t)i * 16, cpu->xmm[i]);
+
+    uint64_t old_mask = cpu->sig_mask;
+    ocerz_st(uc + 0, 4, (use_alt || cpu->sig_on_stack) ? 1u : 0u);
+    ocerz_st(uc + 4, 4, (uint32_t)old_mask);
+    ocerz_st(uc + 8, 8, cpu->sig_altstack_sp);
+    ocerz_st(uc + 16, 8, cpu->sig_altstack_size);
+    ocerz_st(uc + 24, 4, cpu->sig_on_stack ? 1u : 0u);
+    ocerz_st(uc + 40, 8, OCERZ_MCTX_SIZE);
+    ocerz_st(uc + 48, 8, mc);
+
+    ocerz_st(si + 0, 4, (uint32_t)sig);
+    ocerz_st(si + 8, 4, (uint32_t)si_code);
+    ocerz_st(si + 24, 8, fault_addr);
+
+    cpu->gpr[OCERZ_RDI] = sa->handler;
+    cpu->gpr[OCERZ_RDX] = (uint32_t)sig;
+    cpu->gpr[OCERZ_RCX] = si;
+    cpu->gpr[OCERZ_R8] = uc;
+    cpu->gpr[OCERZ_R9] = uc;
+    cpu->gpr[OCERZ_RSP] = newsp;
+    cpu->rip = sa->tramp;
+    if (use_alt)
+        cpu->sig_on_stack = 1;
+    cpu->sig_mask = old_mask | sa->mask;
+    if (!(sa->flags & DARWIN_SA_NODEFER) && sig > 0)
+        cpu->sig_mask |= 1ull << (sig - 1);
+    return 1;
+}
+
+static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    uint64_t uc = a[0];
+    if (!uc) {
+        ret_err(cpu, EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    uint64_t mc = ocerz_ld(uc + 48, 8);
+    if (!mc) {
+        ret_err(cpu, EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    cpu->gpr[OCERZ_RAX] = ocerz_ld(mc + 16, 8);
+    cpu->gpr[OCERZ_RBX] = ocerz_ld(mc + 24, 8);
+    cpu->gpr[OCERZ_RCX] = ocerz_ld(mc + 32, 8);
+    cpu->gpr[OCERZ_RDX] = ocerz_ld(mc + 40, 8);
+    cpu->gpr[OCERZ_RDI] = ocerz_ld(mc + 48, 8);
+    cpu->gpr[OCERZ_RSI] = ocerz_ld(mc + 56, 8);
+    cpu->gpr[OCERZ_RBP] = ocerz_ld(mc + 64, 8);
+    cpu->gpr[OCERZ_RSP] = ocerz_ld(mc + 72, 8);
+    cpu->gpr[OCERZ_R8] = ocerz_ld(mc + 80, 8);
+    cpu->gpr[OCERZ_R9] = ocerz_ld(mc + 88, 8);
+    cpu->gpr[OCERZ_R10] = ocerz_ld(mc + 96, 8);
+    cpu->gpr[OCERZ_R11] = ocerz_ld(mc + 104, 8);
+    cpu->gpr[OCERZ_R12] = ocerz_ld(mc + 112, 8);
+    cpu->gpr[OCERZ_R13] = ocerz_ld(mc + 120, 8);
+    cpu->gpr[OCERZ_R14] = ocerz_ld(mc + 128, 8);
+    cpu->gpr[OCERZ_R15] = ocerz_ld(mc + 136, 8);
+    cpu->rip = ocerz_ld(mc + 144, 8);
+    cpu->rflags = ocerz_ld(mc + 152, 8) | 0x2;
+    for (int i = 0; i < 16; i++)
+        cpu->xmm[i] = ocerz_ld128(mc + 352 + (uint64_t)i * 16);
+    cpu->mxcsr = (uint32_t)ocerz_ld(mc + 216, 4);
+    cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
+    if (!(uint32_t)ocerz_ld(uc + 0, 4))
+        cpu->sig_on_stack = 0;
     return OCERZ_STEP_OK;
 }
 
@@ -1197,6 +1467,92 @@ static int sys_writev(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return sys_iov(vm, cpu, a, 121);
 }
 
+/* recvmsg(27)/sendmsg(28) and their _nocancel forms (401/402). A guest msghdr
+ * has interior pointers (msg_name, the msg_iov array and every iov_base, and
+ * msg_control) that can live in low guest memory under the wine low-shadow
+ * window, so each must go through ocerz_g2h — the old shallow ptr_mask
+ * translation (which only moved the msghdr pointer itself) corrupts them. The
+ * x86_64 and arm64 macOS struct msghdr/iovec/cmsghdr layouts are byte-identical
+ * (msghdr 48: name@0 namelen@8 iov@16 iovlen@24 control@32 controllen@40
+ * flags@44; iovec 16: base@0 len@8), so a host struct msghdr whose pointers are
+ * the g2h images of the guest's lets the host syscall read/write directly into
+ * guest memory. SCM_RIGHTS file descriptors in the control buffer need no
+ * translation: guest fds ARE host fds in ocerz. recvmsg writes msg_namelen /
+ * msg_controllen / msg_flags back, so those are copied out to the guest msghdr
+ * afterward. */
+static int sys_msg(OcerzCPU *cpu, uint64_t a[8], int num, int is_send)
+{
+    uint64_t gmsg = a[1];
+    if (!gmsg) {
+        ret_err(cpu, EFAULT);
+        return OCERZ_STEP_OK;
+    }
+    int iovlen = (int)(int32_t)ocerz_ld(gmsg + 24, 4);
+    if (iovlen < 0)
+        iovlen = 0;
+    if (iovlen > OCERZ_IOV_MAX)
+        iovlen = OCERZ_IOV_MAX;
+    uint64_t giov = ocerz_ld(gmsg + 16, 8);
+    struct ocerz_iovec iovs[OCERZ_IOV_MAX];
+    for (int i = 0; i < iovlen; i++) {
+        uint64_t base = ocerz_ld(giov + (uint64_t)i * 16, 8);
+        uint64_t len = ocerz_ld(giov + (uint64_t)i * 16 + 8, 8);
+        iovs[i].iov_base = base ? (uint64_t)(uintptr_t)ocerz_g2h(base) : 0;
+        iovs[i].iov_len = len;
+    }
+    uint64_t gname = ocerz_ld(gmsg + 0, 8);
+    uint64_t gctrl = ocerz_ld(gmsg + 32, 8);
+    struct msghdr h;
+    memset(&h, 0, sizeof h);
+    h.msg_name = gname ? ocerz_g2h(gname) : NULL;
+    h.msg_namelen = (socklen_t)ocerz_ld(gmsg + 8, 4);
+    h.msg_iov = (struct iovec *)iovs;
+    h.msg_iovlen = iovlen;
+    h.msg_control = gctrl ? ocerz_g2h(gctrl) : NULL;
+    h.msg_controllen = (socklen_t)ocerz_ld(gmsg + 40, 4);
+    h.msg_flags = (int)(int32_t)ocerz_ld(gmsg + 44, 4);
+
+    uint64_t fa[8] = { a[0], (uint64_t)(uintptr_t)&h, a[2], 0, 0, 0, 0, 0 };
+    int err = 0;
+    uint64_t ret2 = 0;
+    uint64_t r = ocerz_host_syscall(num, fa, &ret2, &err);
+    if (err) {
+        ret_err(cpu, r);
+        return OCERZ_STEP_OK;
+    }
+    if (!is_send) {
+        ocerz_st(gmsg + 8, 4, h.msg_namelen);
+        ocerz_st(gmsg + 40, 4, h.msg_controllen);
+        ocerz_st(gmsg + 44, 4, (uint32_t)h.msg_flags);
+    }
+    ret_ok(cpu, r);
+    return OCERZ_STEP_OK;
+}
+
+static int sys_recvmsg(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    return sys_msg(cpu, a, 27, 0);
+}
+
+static int sys_sendmsg(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    return sys_msg(cpu, a, 28, 1);
+}
+
+static int sys_recvmsg_nocancel(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    return sys_msg(cpu, a, 401, 0);
+}
+
+static int sys_sendmsg_nocancel(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    return sys_msg(cpu, a, 402, 1);
+}
+
 static int sys_ioctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
@@ -1235,8 +1591,8 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [24]  = { "getuid",      0, 0x00, 0, NULL },
     [25]  = { "geteuid",     0, 0x00, 0, NULL },
     [26]  = { "ptrace",      4, 0x00, 0, sys_unsupported },
-    [27]  = { "recvmsg",     3, 0x00, 0, sys_unsupported },
-    [28]  = { "sendmsg",     3, 0x00, 0, sys_unsupported },
+    [27]  = { "recvmsg",     3, 0x00, 0, sys_recvmsg },
+    [28]  = { "sendmsg",     3, 0x00, 0, sys_sendmsg },
     [29]  = { "recvfrom",    6, 0x32, 0, NULL },
     [30]  = { "accept",      3, 0x06, 0, NULL },
     [31]  = { "getpeername", 3, 0x06, 0, NULL },
@@ -1257,6 +1613,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [50]  = { "setlogin",    1, 0x01, 0, NULL },
     [52]  = { "sigpending",  1, 0x01, 0, sys_sigpending },
     [53]  = { "sigaltstack", 2, 0x03, 0, sys_sigaltstack },
+    [184] = { "sigreturn",   2, 0x00, 0, sys_sigreturn },
     [54]  = { "ioctl",       3, 0x04, 0, sys_ioctl },
     [57]  = { "symlink",     2, 0x03, 0, NULL },
     [58]  = { "readlink",    3, 0x03, 0, NULL },
@@ -1318,7 +1675,9 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [220] = { "getattrlist", 5, 0x07, 0, NULL },
     [228] = { "fgetattrlist", 5, 0x06, 0, NULL },
     [229] = { "fsetattrlist", 5, 0x06, 0, NULL },
+    [230] = { "poll",        3, 0x01, 0, NULL },
     [234] = { "getxattr",    6, 0x07, 0, NULL },
+    [476] = { "getattrlistat", 6, 0x0e, 0, NULL },
     [235] = { "fgetxattr",   6, 0x06, 0, NULL },
     [236] = { "setxattr",    6, 0x07, 0, NULL },
     [237] = { "fsetxattr",   6, 0x06, 0, NULL },
@@ -1398,8 +1757,8 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [397] = { "write_nocancel", 3, 0x02, 0, NULL },
     [398] = { "open_nocancel",  3, 0x01, 0, NULL },
     [399] = { "close_nocancel", 1, 0x00, 0, NULL },
-    [401] = { "recvmsg_nocancel", 3, 0x02, 0, NULL },
-    [402] = { "sendmsg_nocancel", 3, 0x02, 0, NULL },
+    [401] = { "recvmsg_nocancel", 3, 0x00, 0, sys_recvmsg_nocancel },
+    [402] = { "sendmsg_nocancel", 3, 0x00, 0, sys_sendmsg_nocancel },
     [403] = { "recvfrom_nocancel", 6, 0x32, 0, NULL },
     [404] = { "accept_nocancel", 3, 0x02, 0, NULL },
     [407] = { "select_nocancel", 5, 0x1e, 0, NULL },
@@ -1615,6 +1974,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         uint64_t flags = a[3];
         if (!(flags & 1)) {
             uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
+            memtrace("vm_alloc", want, size, 0, (int)flags);
             if (want == 0 ||
                 (ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
                  ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
@@ -1641,11 +2001,13 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         break;
     }
     case 12: {
+        memtrace("vm_dealloc", a[1], a[2], 0, 0);
         ocerz_unmap(a[1], a[2]);
         mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
         break;
     }
     case 14: {
+        memtrace("vm_protect", a[1], a[2], (int)a[4], 0);
         ocerz_protect(a[1], a[2], (int)a[4]);
         mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
         break;
@@ -1656,6 +2018,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         uint64_t flags = a[4];
         if (!(flags & 1)) {
             uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
+            memtrace("vm_map", want, size, 0, (int)flags);
             if (want == 0 ||
                 (ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
                  ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
@@ -1757,11 +2120,64 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                     msgh_id, (uint32_t)ocerz_ld(reply_buf + 0x14, 4),
                     (uint32_t)ocerz_ld(reply_buf, 4),
                     (uint32_t)ocerz_ld(reply_buf + 4, 4));
+        static int migtrace = -1;
+        if (migtrace < 0) migtrace = getenv("OCERZ_MIGTRACE") != NULL ? 1 : 0;
+        if (reply_buf != 0 && migtrace &&
+            ((uint32_t)ocerz_ld(reply_buf, 4) & 0x80000000u)) {
+            uint32_t dcnt = (uint32_t)ocerz_ld(reply_buf + 0x18, 4);
+            fprintf(stderr,
+                    "ocerz: MIGCOMPLEX reply_id=%u bits=%#x size=%#x desc_count=%u d0.addr=%#llx d0.type=%#x icount=%#llx\n",
+                    (uint32_t)ocerz_ld(reply_buf + 0x14, 4),
+                    (uint32_t)ocerz_ld(reply_buf, 4),
+                    (uint32_t)ocerz_ld(reply_buf + 4, 4), dcnt,
+                    (unsigned long long)ocerz_ld(reply_buf + 0x1c, 8),
+                    (uint32_t)ocerz_ld(reply_buf + 0x1c + 0xc, 4),
+                    (unsigned long long)vm->insn_count);
+        }
+        static int machleak = -1;
+        if (machleak < 0) machleak = getenv("OCERZ_MACHLEAK") != NULL ? 1 : 0;
+        if (reply_buf != 0 && machleak) {
+            for (uint64_t off = 0x18; off <= 0x80; off += 8) {
+                uint64_t v = ocerz_ld(reply_buf + off, 8);
+                if (v >= 0x140000000ull && v < OCERZ_LOW_LIMIT &&
+                    ocerz_addr_committed(v) == 0)
+                    fprintf(stderr,
+                            "ocerz: MACHLEAK reply_id=%u off=%#llx host_val=%#llx icount=%#llx\n",
+                            (uint32_t)ocerz_ld(reply_buf + 0x14, 4),
+                            (unsigned long long)off, (unsigned long long)v,
+                            (unsigned long long)vm->insn_count);
+            }
+        }
         if (reply_buf != 0) {
             uint32_t rid = (uint32_t)ocerz_ld(reply_buf + 0x14, 4);
             if ((rid == 4900 || rid == 4911 || rid == 4913) &&
                 (uint32_t)ocerz_ld(reply_buf + 0x20, 4) == OCERZ_MACH_KERN_SUCCESS)
                 mig_vm_reply_relocate(vm, reply_buf);
+            /* Phase 4 K1: thread_info(THREAD_IDENTIFIER_INFO) reply (id 3712)
+             * carries thread_handle (the thread's cthread_self / %gs base) at
+             * +0x30 and the dispatch-queue address at +0x38. The host kernel
+             * fills them with the HOST arm64 thread's values; Wine installs
+             * thread_handle into %gs via thread_fast_set_cthread_self and then
+             * faults reading the guest-mapped shadow page (%gs:-8). Substitute
+             * the GUEST thread's cthread_self (cpu->gs_base, set at thread
+             * creation) and carry the dispatch-qaddr delta. Gated on the kernel
+             * actually having leaked an uncommitted host-range handle so other
+             * thread_info flavors reusing id 3712 are left untouched. */
+            if (rid == 3712) {
+                uint64_t h = ocerz_ld(reply_buf + 0x30, 8);
+                if (h >= 0x140000000ull && h < OCERZ_LOW_LIMIT &&
+                    ocerz_addr_committed(h) == 0) {
+                    uint64_t qa = ocerz_ld(reply_buf + 0x38, 8);
+                    ocerz_st(reply_buf + 0x30, 8, cpu->gs_base);
+                    ocerz_st(reply_buf + 0x38, 8, cpu->gs_base + (qa - h));
+                    if (getenv("OCERZ_SIGTRACE"))
+                        fprintf(stderr,
+                                "ocerz: K1 thread_info handle %#llx -> gs_base %#llx (comm=%d)\n",
+                                (unsigned long long)h,
+                                (unsigned long long)cpu->gs_base,
+                                ocerz_addr_committed(cpu->gs_base));
+                }
+            }
         }
         if (msgh_id == 8000 && reply_buf != 0 &&
             (uint32_t)ocerz_ld(reply_buf + 4, 4) == 0x24 &&
@@ -1832,9 +2248,13 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
     if (num == 3) {
         cpu->gs_base = cpu->gpr[OCERZ_RDI];
         ret_ok(cpu, 0x60);
-        if (vm->strace)
-            fprintf(stderr, "ocerz: machdep thread_fast_set_cthread_self(%#llx) = 0x60\n",
-                    (unsigned long long)cpu->gs_base);
+        if (vm->strace || getenv("OCERZ_SIGTRACE"))
+            fprintf(stderr,
+                    "ocerz: machdep set_cthread_self gs=%#llx comm(gs)=%d comm(gs-8)=%d icount=%#llx\n",
+                    (unsigned long long)cpu->gs_base,
+                    ocerz_addr_committed(cpu->gs_base),
+                    ocerz_addr_committed(cpu->gs_base - 8),
+                    (unsigned long long)vm->insn_count);
         return OCERZ_STEP_OK;
     }
     OCERZ_FATAL("unknown machine-dependent syscall: class=3 num=%d\n", num);

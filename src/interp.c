@@ -818,6 +818,17 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         cpu->rip = ret;
         return OCERZ_STEP_OK;
     }
+    case OCERZ_OP_IRET: {
+        int sz = insn->opsize ? insn->opsize : 8;
+        uint64_t sp = cpu->gpr[OCERZ_RSP];
+        uint64_t rip = ocerz_ld(sp, sz);
+        uint64_t flags = ocerz_ld(sp + (uint64_t)sz * 2, sz);
+        uint64_t newsp = ocerz_ld(sp + (uint64_t)sz * 3, sz);
+        cpu->rip = rip;
+        cpu->rflags = flags | 0x2;
+        cpu->gpr[OCERZ_RSP] = newsp;
+        return OCERZ_STEP_OK;
+    }
     default:
         return ocerz_unimpl(vm, cpu, insn, "branch");
     }
@@ -1044,6 +1055,7 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
     case OCERZ_OP_LOOPNE:
     case OCERZ_OP_CALL:
     case OCERZ_OP_RET:
+    case OCERZ_OP_IRET:
         return op_branch(vm, cpu, &insn);
 
     case OCERZ_OP_XADD:
@@ -1084,6 +1096,28 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
         if (insn.rip == 0x7ff802e6f81bull) {
             cpu->terminated = 1;
             return OCERZ_STEP_OK;
+        }
+        if (getenv("OCERZ_UD2DUMP")) {
+            uint64_t gs = cpu->gs_base;
+            uint64_t gate = cpu->gpr[OCERZ_RDX];
+            fprintf(stderr, "ocerz: UD2DUMP rip=%#llx gs_base=%#llx gs+0x18=%#llx "
+                    "gate=%#llx gate[0]=%#llx rdi=%#llx rsi=%#llx r14=%#llx\n",
+                    (unsigned long long)insn.rip, (unsigned long long)gs,
+                    (unsigned long long)ocerz_ld(gs + 0x18, 8),
+                    (unsigned long long)gate,
+                    (unsigned long long)(gate ? ocerz_ld(gate, 8) : 0),
+                    (unsigned long long)cpu->gpr[OCERZ_RDI],
+                    (unsigned long long)cpu->gpr[OCERZ_RSI],
+                    (unsigned long long)cpu->gpr[OCERZ_R14]);
+            uint64_t fp = cpu->gpr[OCERZ_RBP];
+            fprintf(stderr, "ocerz: UD2DUMP bt:");
+            for (int d = 0; d < 16 && fp >= 0x300000000ull; d++) {
+                fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+                uint64_t nf = ocerz_ld(fp, 8);
+                if (nf <= fp) break;
+                fp = nf;
+            }
+            fprintf(stderr, "\n");
         }
         return trap_fatal(&insn, "guest UD2 (undefined instruction)");
 

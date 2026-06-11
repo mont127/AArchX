@@ -286,9 +286,20 @@ static uint64_t reserve_host_fixed(uint64_t base, uint64_t size)
 
 int ocerz_mem_init_low_shadow(void)
 {
+    /* The low shadow window and the WINE_TOP_DOWN strip are reserved as ONE
+     * contiguous host block (low window first, then the top strip): only the
+     * block base (OCERZ_LOWBASE) has to be inherited by child emulators, and the
+     * top base is derived as base + LOW_LIMIT. An earlier design reserved the
+     * top strip with mmap(NULL), which lands at an arbitrary low host address
+     * that is reliably free in the first process but collides in a re-exec'd
+     * child (wineserver/services) — the child then died reserving the inherited
+     * top base. A single fixed high block at a probed candidate is free in every
+     * cooperating process. */
     static const uint64_t candidates[] = {
         0x8000000000ull, 0x10000000000ull, 0x500000000ull, 0x600000000000ull,
     };
+    uint64_t topsz = OCERZ_TOP_HI - OCERZ_TOP_LO;
+    uint64_t blocksz = OCERZ_LOW_LIMIT + topsz;
     pthread_mutex_lock(&map_lock);
     if (ocerz_low_base) {
         pthread_mutex_unlock(&map_lock);
@@ -298,7 +309,7 @@ int ocerz_mem_init_low_shadow(void)
     const char *env = getenv("OCERZ_LOWBASE");
     if (env && env[0]) {
         uint64_t want = strtoull(env, NULL, 0);
-        base = reserve_host_fixed(want, OCERZ_LOW_LIMIT);
+        base = reserve_host_fixed(want, blocksz);
         if (base != want) {
             pthread_mutex_unlock(&map_lock);
             OCERZ_FATAL("cannot reserve inherited low-shadow base %#llx\n",
@@ -307,51 +318,28 @@ int ocerz_mem_init_low_shadow(void)
         }
     } else {
         for (size_t k = 0; k < sizeof candidates / sizeof candidates[0] && !base; k++)
-            base = reserve_host_fixed(candidates[k], OCERZ_LOW_LIMIT);
+            base = reserve_host_fixed(candidates[k], blocksz);
         if (!base) {
             pthread_mutex_unlock(&map_lock);
-            OCERZ_FATAL("no host base accepts the %#llx-byte low-shadow window\n",
-                        (unsigned long long)OCERZ_LOW_LIMIT);
+            OCERZ_FATAL("no host base accepts the %#llx-byte shadow block\n",
+                        (unsigned long long)blocksz);
             return OCERZ_ENOMEM;
         }
         char buf[24];
         snprintf(buf, sizeof buf, "%#llx", (unsigned long long)base);
         setenv("OCERZ_LOWBASE", buf, 1);
     }
-    uint64_t top = 0;
-    const char *tenv = getenv("OCERZ_TOPBASE");
-    if (tenv && tenv[0]) {
-        uint64_t want = strtoull(tenv, NULL, 0);
-        top = reserve_host_fixed(want, OCERZ_TOP_HI - OCERZ_TOP_LO);
-        if (top != want) {
-            pthread_mutex_unlock(&map_lock);
-            OCERZ_FATAL("cannot reserve inherited top-shadow base %#llx\n",
-                        (unsigned long long)want);
-            return OCERZ_ENOMEM;
-        }
-    } else {
-        void *tp = mmap(NULL, (size_t)(OCERZ_TOP_HI - OCERZ_TOP_LO), PROT_NONE,
-                        MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (tp == MAP_FAILED) {
-            pthread_mutex_unlock(&map_lock);
-            return OCERZ_ENOMEM;
-        }
-        top = (uint64_t)(uintptr_t)tp;
-        char tbuf[24];
-        snprintf(tbuf, sizeof tbuf, "%#llx", (unsigned long long)top);
-        setenv("OCERZ_TOPBASE", tbuf, 1);
-    }
     if (!region_add(0, OCERZ_LOW_LIMIT) || !region_add(OCERZ_TOP_LO, OCERZ_TOP_HI)) {
         pthread_mutex_unlock(&map_lock);
         return OCERZ_ENOMEM;
     }
-    ocerz_top_base = top;
+    ocerz_top_base = base + OCERZ_LOW_LIMIT;
     ocerz_low_base = base;
     pthread_mutex_unlock(&map_lock);
     OCERZ_LOG("low shadow window guest [0, %#llx) -> host %#llx; top strip [%#llx, %#llx) -> host %#llx\n",
               (unsigned long long)OCERZ_LOW_LIMIT, (unsigned long long)base,
               (unsigned long long)OCERZ_TOP_LO, (unsigned long long)OCERZ_TOP_HI,
-              (unsigned long long)top);
+              (unsigned long long)ocerz_top_base);
     return OCERZ_OK;
 }
 
@@ -394,6 +382,37 @@ int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot)
     int rc = map_fixed_locked(gaddr, len, prot, 1);
     pthread_mutex_unlock(&map_lock);
     return rc;
+}
+
+/* Map a file fd as genuinely shared memory at a guest address that has already
+ * been reserved (ocerz_map_fixed / register_range / map_anywhere). The wineserver
+ * coordinates with its clients through MAP_SHARED tmpmap files (KUSER_SHARED_DATA,
+ * the session block, per-thread blocks); a private pread snapshot makes the
+ * client miss every write the server makes after the snapshot (e.g. a new
+ * thread's start context). MAP_FIXED overlays the shared file onto the region's
+ * PROT_NONE reservation so writes from any cooperating ocerz process are seen by
+ * all of them. The covered pages are marked committed in the bitmap. */
+int ocerz_map_shared_file(uint64_t gaddr, uint64_t len, int prot, int fd, uint64_t off)
+{
+    uint64_t lo = round_down(gaddr);
+    uint64_t hi = round_up(gaddr + len);
+    pthread_mutex_lock(&map_lock);
+    MemRegion *r = region_for_range(lo, hi);
+    if (!r) {
+        pthread_mutex_unlock(&map_lock);
+        return OCERZ_ENOMEM;
+    }
+    void *want = ocerz_g2h(lo);
+    void *got = mmap(want, (size_t)(hi - lo), host_prot(prot),
+                     MAP_SHARED | MAP_FIXED, fd, (off_t)off);
+    if (got == MAP_FAILED || got != want) {
+        pthread_mutex_unlock(&map_lock);
+        return OCERZ_ENOMEM;
+    }
+    for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE)
+        bit_set(r, pg_index(r, p));
+    pthread_mutex_unlock(&map_lock);
+    return OCERZ_OK;
 }
 
 uint64_t ocerz_map_anywhere(uint64_t len, int prot)

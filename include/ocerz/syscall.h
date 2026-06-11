@@ -44,4 +44,11 @@ struct OcerzVM;
 
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu);
 
+/* Build a Darwin signal frame for `cpu` and redirect it to the guest's
+ * registered handler/_sigtramp for `sig`; returns 1 if a handler was registered
+ * (the fault was converted to a guest signal), 0 otherwise. Called from the host
+ * SIGSEGV/SIGBUS crash handler. */
+int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_code,
+                         uint32_t err);
+
 #endif
