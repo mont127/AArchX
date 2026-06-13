@@ -1305,6 +1305,28 @@ static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64
     int64_t slide = image_slide_d(mh);
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
+    const char *iscan = getenv("OCERZ_INITSCAN");
+    int do_scan = iscan && (iscan[0] == '*' || strtoull(iscan, NULL, 0) == mh);
+    if (do_scan) {
+        for (uint32_t j = 0; j < ncmds; j++) {
+            uint32_t cmd = rd32(lc);
+            if (cmd == LC_SEGMENT_64) {
+                uint32_t ns = rd32(lc + 64);
+                const uint8_t *sec = lc + 72;
+                for (uint32_t s = 0; s < ns; s++) {
+                    uint32_t fl = rd32(sec + 64);
+                    fprintf(stderr, "INITSCAN mh=%#llx seg=%.16s sect=%.16s type=%#x addr=%#llx sz=%#llx\n",
+                            (unsigned long long)mh, (const char *)(sec + 16), (const char *)sec,
+                            fl & 0xff, (unsigned long long)rd64(sec + 32), (unsigned long long)rd64(sec + 40));
+                    sec += 80;
+                }
+            } else {
+                fprintf(stderr, "INITSCAN mh=%#llx LC cmd=%#x\n", (unsigned long long)mh, cmd);
+            }
+            lc += rd32(lc + 4);
+        }
+        lc = h + sizeof(struct mach_header_64);
+    }
     for (uint32_t j = 0; j < ncmds; j++) {
         if (rd32(lc) == LC_SEGMENT_64) {
             uint32_t ns = rd32(lc + 64);
@@ -1710,6 +1732,7 @@ static int expand_install_name(DynImage *loader, const char *name,
 }
 
 static void load_disk_deps(OcerzCache *cache, DynImage *loader, const RpathList *rpaths);
+static int canon_dylib_path(const char *path, char *out, size_t outsz);
 
 static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, DynImage *loader,
                                  const RpathList *rpaths)
@@ -1721,6 +1744,18 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         return NULL;
     if (dep_find(cache, resolved) != 0)
         return NULL;
+    /* Canonicalize the resolved path (realpath: collapse //, resolve ./.., follow
+     * symlinks) before the dedup lookup, exactly as ocerz_dlopen_inner does for a
+     * top-level dlopen. An @rpath dep expands to rpath + "/" + stem, and an rpath
+     * entry that already ends in '/' yields a DOUBLED slash (e.g. x86_64-unix//
+     * ntdll.so); a raw strcmp then misses the same file already loaded under its
+     * clean path, so ntdll.so loads a SECOND time. The duplicate's per-thread
+     * pthread keys are never created by an initializer, so a getter reads key 0
+     * and pthread_getspecific returns a TSD cookie (garbage), which msvcrt derefs
+     * during its init -> c0000005. dyld dedups loaded images by realpath too. */
+    char canon[1024];
+    if (canon_dylib_path(resolved, canon, sizeof canon))
+        snprintf(resolved, sizeof resolved, "%s", canon);
     DynImage *existing = dimg_find_by_path(resolved);
     if (existing)
         return existing;
@@ -1768,6 +1803,9 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         apply_classic_fixups(d, cache);
 
     ocerz_dyldapi_register_image(d->load_base, d->path);
+    if (getenv("OCERZ_DLPATH"))
+        fprintf(stderr, "ocerz: DLPATH disk-dep load_base=%#llx install=%s path=%s\n",
+                (unsigned long long)d->load_base, d->install_name, resolved);
     OCERZ_LOG("dynamic: loaded disk dylib %s at load_base=%#llx slide=%#llx\n",
               resolved, (unsigned long long)d->load_base, (unsigned long long)d->slide);
     return d;
@@ -1850,6 +1888,9 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     if (d->cf_off == 0)
         apply_classic_fixups(d, cache);
     ocerz_dyldapi_register_image(d->load_base, d->path);
+    if (getenv("OCERZ_DLPATH"))
+        fprintf(stderr, "ocerz: DLPATH dlopen load_base=%#llx install=%s path=%s\n",
+                (unsigned long long)d->load_base, d->install_name, install_path);
     OCERZ_LOG("dynamic: dlopen loaded %s at load_base=%#llx slide=%#llx\n",
               install_path, (unsigned long long)d->load_base, (unsigned long long)d->slide);
     return d;

@@ -138,6 +138,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
@@ -866,9 +867,19 @@ static int clsopt_lookup(const char *key, uint64_t *out, int max)
  * The selector string pool at relativeMethodSelectorBase holds every canonical
  * selector once; a linear scan with a fixed cap missed selectors stored past
  * the cap, so build a one-shot open-addressing string->pointer index over the
- * whole pool and look up O(1). */
+ * whole pool and look up O(1).
+ *
+ * Building is serialized by g_selidx_lock and double-checked: a real process
+ * resolves selectors from several guest threads at once (the first ObjC use in a
+ * re-exec'd Wine child races worker threads), and without the lock each entrant
+ * sees g_selidx still NULL, builds its own table, and stomps the half-built
+ * shared one — readers then walk a torn table and the open-addressing probe
+ * never terminates (a 100% CPU hang). g_selidx is published last, after the
+ * table is fully populated, so a thread that observes it non-NULL sees a
+ * complete index. The probe bound is belt-and-suspenders against a full table. */
 static const char **g_selidx;
 static uint32_t g_selidx_cap;
+static pthread_mutex_t g_selidx_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t fnv1a(const char *s, size_t n)
 {
@@ -884,6 +895,11 @@ static void selpool_build(void)
 {
     if (g_selidx || !g_sel_pool)
         return;
+    pthread_mutex_lock(&g_selidx_lock);
+    if (g_selidx || !g_sel_pool) {
+        pthread_mutex_unlock(&g_selidx_lock);
+        return;
+    }
     const char *base = (const char *)(uintptr_t)g_sel_pool;
     const char *cap_end = base + 0x10000000;
     uint64_t count = 0;
@@ -904,12 +920,12 @@ static void selpool_build(void)
     uint32_t cap = 1;
     while ((uint64_t)cap < count * 2 + 16)
         cap <<= 1;
-    g_selidx = (const char **)calloc(cap, sizeof(const char *));
-    if (!g_selidx)
+    const char **idx = (const char **)calloc(cap, sizeof(const char *));
+    if (!idx) {
+        pthread_mutex_unlock(&g_selidx_lock);
         return;
-    g_selidx_cap = cap;
+    }
     p = base;
-    zeros = 0;
     while (p < pool_end) {
         if (*p == 0) {
             p++;
@@ -917,11 +933,15 @@ static void selpool_build(void)
         }
         size_t l = strlen(p);
         uint32_t h = (uint32_t)(fnv1a(p, l) & (cap - 1));
-        while (g_selidx[h])
+        uint32_t probes = 0;
+        while (idx[h] && ++probes < cap)
             h = (h + 1) & (cap - 1);
-        g_selidx[h] = p;
+        idx[h] = p;
         p += l + 1;
     }
+    g_selidx_cap = cap;
+    g_selidx = idx;
+    pthread_mutex_unlock(&g_selidx_lock);
 }
 
 static uint64_t selpool_canonical(const char *want)

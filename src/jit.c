@@ -163,6 +163,7 @@ static int is_terminator(unsigned op)
     case OCERZ_OP_LOOPNE:
     case OCERZ_OP_CALL:
     case OCERZ_OP_RET:
+    case OCERZ_OP_IRET:
     case OCERZ_OP_SYSCALL:
     case OCERZ_OP_INT3:
     case OCERZ_OP_INT:

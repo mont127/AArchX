@@ -118,16 +118,19 @@ static void ctx_trap_report(const OcerzCPU *c)
         return;
     hits++;
     uint64_t f = c->gpr[OCERZ_RCX];
+    uint64_t s = c->gpr[OCERZ_RSI];   /* context_from_server: rsi = server context_t */
     fprintf(stderr,
-            "ocerz: CTXTRAP pid=%d rip=%#llx frame=%#llx f.rip=%#llx f.rsp=%#llx "
-            "f.rax=%#llx f.rcx=%#llx f.rdx=%#llx f.rdi=%#llx gs=%#llx icount=%#llx\n",
-            getpid(), (unsigned long long)c->rip, (unsigned long long)f,
+            "ocerz: CTXTRAP pid=%d rip=%#llx rdi=%#llx rsi(ctx_t)=%#llx "
+            "ctx.machine=%#x ctx.flags=%#x ctl.rip=%#llx ctl.rsp=%#llx "
+            "| f(rcx)=%#llx f.rip=%#llx f.rsp=%#llx gs=%#llx icount=%#llx\n",
+            getpid(), (unsigned long long)c->rip,
+            (unsigned long long)c->gpr[OCERZ_RDI], (unsigned long long)s,
+            (uint32_t)ocerz_ld(s + 0x00, 4), (uint32_t)ocerz_ld(s + 0x04, 4),
+            (unsigned long long)ocerz_ld(s + 0x08, 8),
+            (unsigned long long)ocerz_ld(s + 0x10, 8),
+            (unsigned long long)f,
             (unsigned long long)ocerz_ld(f + 0x70, 8),
             (unsigned long long)ocerz_ld(f + 0x88, 8),
-            (unsigned long long)ocerz_ld(f + 0x00, 8),
-            (unsigned long long)ocerz_ld(f + 0x10, 8),
-            (unsigned long long)ocerz_ld(f + 0x18, 8),
-            (unsigned long long)ocerz_ld(f + 0x28, 8),
             (unsigned long long)c->gs_base,
             (unsigned long long)(g_vm ? g_vm->insn_count : 0));
 }
@@ -390,6 +393,31 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = str_into(p, "\n");
         write(2, buf, (size_t)(p - buf));
         {
+            p = buf;
+            p = str_into(p, "  gs_base=");
+            p = hex_into(p, c->gs_base);
+            p = str_into(p, " fs_base=");
+            p = hex_into(p, c->fs_base);
+            p = str_into(p, " insn@rip-24=");
+            for (int i = -24; i < 16; i++) {
+                uint64_t b = ocerz_ld(c->rip + (uint64_t)(int64_t)i, 1);
+                *p++ = ' ';
+                if (i == 0) *p++ = '[';
+                *p++ = "0123456789abcdef"[(b >> 4) & 0xf];
+                *p++ = "0123456789abcdef"[b & 0xf];
+            }
+            *p++ = '\n';
+            write(2, buf, (size_t)(p - buf));
+            p = buf;
+            p = str_into(p, "  blockhist:");
+            for (int i = 1; i <= 16; i++) {
+                p = str_into(p, " ");
+                p = hex_into(p, g_riphist[(g_riphist_n - (unsigned)i) & 31]);
+            }
+            *p++ = '\n';
+            write(2, buf, (size_t)(p - buf));
+        }
+        {
             int comm = ocerz_addr_committed(ocerz_h2g(si->si_addr));
             const char *cs = comm == 1 ? "  fault-page: COMMITTED"
                            : comm == 0 ? "  fault-page: UNCOMMITTED"
@@ -397,10 +425,30 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             p = buf;
             p = str_into(p, cs);
             p = str_into(p, sig == SIGBUS
-                ? (si->si_code == 1 ? " si_code=ADRALN\n"
-                 : si->si_code == 2 ? " si_code=ADRERR\n"
-                 : si->si_code == 3 ? " si_code=OBJERR\n" : " si_code=?\n")
-                : "\n");
+                ? (si->si_code == 1 ? " si_code=ADRALN"
+                 : si->si_code == 2 ? " si_code=ADRERR"
+                 : si->si_code == 3 ? " si_code=OBJERR" : " si_code=?")
+                : "");
+            uint64_t rbase = 0, rsize = 0;
+            unsigned hp = ocerz_host_region_prot(ocerz_h2g(si->si_addr), &rbase, &rsize);
+            p = str_into(p, " host_prot=");
+            p = hex_into(p, hp);
+            p = str_into(p, " region=[");
+            p = hex_into(p, rbase);
+            p = str_into(p, ",");
+            p = hex_into(p, rbase + rsize);
+            p = str_into(p, ")\n");
+            write(2, buf, (size_t)(p - buf));
+            uint64_t ripbase = 0, ripsize = 0;
+            unsigned riphp = ocerz_host_region_prot(c->rip, &ripbase, &ripsize);
+            p = buf;
+            p = str_into(p, "  rip-region=[");
+            p = hex_into(p, ripbase);
+            p = str_into(p, ",");
+            p = hex_into(p, ripbase + ripsize);
+            p = str_into(p, ") prot=");
+            p = hex_into(p, riphp);
+            p = str_into(p, "\n");
             write(2, buf, (size_t)(p - buf));
         }
         uint64_t fp = c->gpr[OCERZ_RBP];
@@ -433,6 +481,20 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     p = str_into(p, "uncommitted");
             }
             p = str_into(p, "\n");
+            write(2, buf, (size_t)(p - buf));
+        }
+        const char *sd = getenv("OCERZ_STRDUMP");
+        if (sd) {
+            uint64_t a = strtoull(sd, NULL, 0);
+            p = buf;
+            p = str_into(p, "  strdump@");
+            p = hex_into(p, a);
+            p = str_into(p, "=");
+            for (int i = 0; i < 200 && p < buf + 250; i++) {
+                uint64_t b = ocerz_ld(a + (uint64_t)i, 1);
+                *p++ = (b >= 32 && b < 127) ? (char)b : '.';
+            }
+            *p++ = '\n';
             write(2, buf, (size_t)(p - buf));
         }
         uint64_t sp = c->gpr[OCERZ_RSP];

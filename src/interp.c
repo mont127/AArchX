@@ -1083,6 +1083,16 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
         return OCERZ_STEP_OK;
 
     case OCERZ_OP_INT3:
+        /* A guest int3 is a breakpoint, not a fatal: on macOS it raises SIGTRAP
+         * (trap number TRAP_x86_BPTFLT), which Wine's trap_handler turns into an
+         * EXCEPTION_BREAKPOINT and dispatches (KiUserExceptionDispatcher, debugger
+         * traps, the DbgBreakPoint guards Wine plants on error paths). cpu->rip is
+         * already past the int3, matching the kernel's saved rip; ocerz_signal_-
+         * deliver tags the frame with trapno 3 so Wine backs ExceptionAddress over
+         * the int3. Only a genuinely unhandled trap (no SIGTRAP handler) is fatal. */
+        if (ocerz_signal_deliver(cpu, OCERZ_SIGTRAP, cpu->rip, 0, 0))
+            return OCERZ_STEP_OK;
+        return trap_fatal(&insn, "guest breakpoint/interrupt");
     case OCERZ_OP_INT:
         return trap_fatal(&insn, "guest breakpoint/interrupt");
 

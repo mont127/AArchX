@@ -167,6 +167,7 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align);
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_unmap(uint64_t gaddr, uint64_t len);
 int ocerz_addr_committed(uint64_t gaddr);
+unsigned ocerz_host_region_prot(uint64_t gaddr, uint64_t *base, uint64_t *size);
 
 static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
 {
