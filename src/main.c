@@ -81,7 +81,7 @@ int main(int argc, char **argv)
     ocerz_vm_init(&vm);
     vm.trace = trace;
     vm.strace = strace;
-    vm.jit_enabled = !nojit;
+    vm.jit_enabled = !nojit && getenv("OCERZ_NOJIT") == NULL;
 
     int dynamic = ocerz_peek_dynamic(load_path);
     if (dynamic < 0) {

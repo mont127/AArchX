@@ -672,6 +672,39 @@ thread-data field / how it's addressed) — likely via a -no-jit scoped trace (O
 around the unix-ntdll thread-start fns 0x381a5a6xx) so rips are exact, then watch the producer
 of [r15+0x98]. Also worth: confirm the two rip=0 threads don't share TEB=0x7ffd8000.
 
+### 2026-06-11 UPDATE #10 — rip=0 FULLY ROOT-CAUSED: pLdrInitializeThunk=0 (PE-ntdll export dir gate)
+
+The whole rip=0 cascade is now traced to ONE bug. ntdll.so has symbols; the chain (all
+disasm-verified + live-watch-confirmed):
+- A new worker thread's entry = its syscall_frame.rip, set by `_init_syscall_frame` (ntdll.so
+  vmaddr 0x3b430) from the global `_pLdrInitializeThunk`. That global (and its siblings
+  pKiUser*Dispatcher / pRtlUserThreadStart, a contiguous block at vmaddr 0xa8830..0xa8868) is
+  **0** — store-watchpoints on _pLdrInitializeThunk (0x381aac850) AND _pKiUserExceptionDispatcher
+  (0x381aac830) show ZERO writes the whole run. So new threads jump to 0 (downstream: the SEGV
+  cascade — guard faults, gs:[-8], libsystem crash).
+- The SETTER is `___wine_main` (vmaddr 0x1d4a0). It maps the **PE ntdll.dll builtin** via
+  `_virtual_map_builtin_module(machine=0x8664)` (-> r15=[rbp-0x68]), `_virtual_relocate_module`
+  (if it fails, jne 0x1f6ac = skip), then reads the mapped PE: e_lfanew@[r15+0x3c], opt-header
+  magic@[PE+0x18] (must be 0x20b PE32+ or 0x10b PE32, else jne 0x1f68d = skip), and the
+  **EXPORT directory** (DataDirectory[0] at PE+0x88 for PE32+): if RVA==0 (je 0x1f68d) or
+  size==0 (je 0x1f68d) it SKIPS the entire kcb-resolution block (vmaddr 0x1e0a4..0x1e84f). The
+  block binary-searches that export table for "LdrInitializeThunk" etc. and stores the resolved
+  address. Because the watch saw NEITHER the resolved-store NOR the store-0 fallback, control
+  never enters the block => the **export directory of the mapped PE ntdll.dll reads as 0 (or its
+  magic is wrong) in the wineboot child**.
+- The MAIN wine process sets these fine (its threads work); only the wineboot RE-EXEC child
+  fails. So **ocerz maps the PE ntdll.dll builtin without a usable export directory in the
+  re-exec'd wineboot child.** (context_from_server delivers a VALID rip, so the wineserver/IPC
+  is NOT involved — it is purely this local PE-ntdll mapping.)
+- NEXT (fix locus): ocerz's handling of `virtual_map_builtin_module`'s mapping of the PE
+  ntdll.dll in the wineboot child — verify the export-directory section is mapped/readable
+  (likely a file-mapping / section-protection / re-exec-state gap, possibly related to the
+  MAP_SHARED/file-mmap path or the PE section layout). Workflow wf_df838b7d-31f is pinning the
+  exact ocerz gap + fix. Diagnostics added (env-gated): OCERZ_NOJIT (force interp, propagates to
+  children), OCERZ_CTXTRAP now also dumps rsi/server-context_t flags+ctl.rip. Method to inspect
+  ntdll.so: per-function capstone disasm from nm -n symbols (linear disasm desyncs); runtime =
+  vmaddr + 0x381a04000.
+
 ### Phase-2 entry point (next session, low host load)
 1. Rewrite the dlopen/boot initializer ordering: iterative 3-state (inited/beingInited)
    + skip upward edges + don't pre-mark cache images done. Exit: ntdll's CF/CoreServices/
@@ -686,3 +719,271 @@ of [r15+0x98]. Also worth: confirm the two rip=0 threads don't share TEB=0x7ffd8
   (parent→dep edges), OCERZ_CFDUMP=<mh> (dump an image's LC_LOAD* as the loader sees
   them), OCERZ_PEEK=<a,a,…> (crash-time guest qword dump), OCERZ_DLINIT (the gated,
   to-be-replaced force-init experiment). RCA workflow: wf_53d7e202-ce4.
+
+### UPDATE #11 (2026-06-12): the "hang" was selpool build slowness, NOT rip=0/threads; real wall = gs_base=0 worker crash
+
+The multi-turn "wineboot/notepad hangs" was mis-diagnosed. Running `bin/wine notepad` with
+WINEDEBUG UNSET (prior runs used WINEDEBUG=-all, which suppressed the one informative line) and
+sampling the host process showed the reliable behavior is NOT a thread deadlock and NOT rip=0:
+
+- **Reliable hang = `selpool_canonical`/`selpool_build` (src/dyldapi.c) burning 95% CPU.** Wine
+  uses ObjC (winemac.drv), so every Wine process calls `_dyld_get_objc_selector`, which builds a
+  one-shot open-addressing index over the dyld shared-cache selector pool. base=0x7ff8225a3a40,
+  pool_end≈+0x3817f79 (58MB), count≈2,563,796, cap=8,388,608 (64MB table). **Each build takes
+  ~11.3s**; the wineboot re-exec chain spawns ~4 processes that EACH rebuild it → ~45s of pure
+  selpool overhead. Earlier "hangs" were the loop being killed mid-build. satur=0 (no probe
+  saturation) — the table is NOT corrupted; it is just a slow 2M-entry build, made worse by 4
+  concurrent builds saturating memory bandwidth. After all 4 builds finish the process tree
+  EXITS (procs=0) — it never hung indefinitely.
+  - Two false leads ruled out by instrumentation: (a) host/guest aliasing (the 64MB calloc lands
+    outside the guest arena; moving it into the arena via ocerz_map_anywhere did NOT help);
+    (b) a build data-race (adding a lock did NOT change the timing). The cost is inherent to
+    indexing ~2M selectors per process.
+  - Over-scan confirmed: real selectors run to ≈ +0x2a11f79 ("…PXModelDeliveryProgr…"); by
+    +0x3114f70 the bytes are binary garbage ("…^… eL…"). The 256-consecutive-zeros pool-end
+    heuristic over-runs the real pool by ~10MB, but even a correctly-bounded pool is ~2M
+    selectors, so bounding alone won't fix the 11s.
+
+- **FIX LANDED (src/dyldapi.c selpool_build): correctness, not perf.** Added a `g_selidx_lock`
+  pthread mutex + double-checked init, build into a local `idx` and publish `g_selidx` LAST
+  (so a thread that sees it non-NULL sees a complete table), and a probe bound
+  (`++probes < cap`) so a full/torn table can never infinite-loop. Reverted to host calloc.
+  make check green (14/14 guest ×2, 15/15 diff, 2/2 dyn). NOTE: the ~11s build is still slow;
+  the real fix is to query the shared cache's precomputed objc_selopt perfect hash (zero build),
+  or correctly bound the pool — deferred as a perf task.
+
+- **REAL Phase-4 wall (after selpool): worker threads crash with gs_base=0.** Deterministic,
+  two worker threads (Wine TIDs 002c, 0024) in separate re-exec processes:
+  `guest crash: SIGSEGV host_addr=0xfffffffffffffff8 guest_rip=0x7ff802e6f4d6
+   guest_addr=0xfffffffffffffff8 icount≈0xb69a3 / 0x13dbeb`, preceded by Wine's
+  `err:virtual:alloc_pages_vprot ... Cannot allocate memory for vprot table, size 00100000`,
+  ending in `nested fault inside crash handler` (the SECOND worker faulting while the first holds
+  the process-global `depth`; the dump itself is complete — not a dump bug).
+  - New crash-dump diagnostics (src/vm.c, kept): `gs_base=`/`fs_base=` + `insn@rip=` bytes.
+    Output: **gs_base=0x0 fs_base=0x0**, insn@rip = `8b 4b 0c 41 89 c9 41 83 e1 0c 74 36 4c 8b 17`
+    = `mov ecx,[rbx+0xc]; mov r9d,ecx; and r9d,0xc; je …; mov r10,[rdi]` (rbx/rdi point into
+    ntdll.so data 0x381aac2c0/d8; guest_rip/regs are a JIT block-boundary sync point, not the
+    exact faulting insn). The fault host_addr=-8 with gs_base=0 ⇒ a gs-relative (gs:[-8]) or
+    base-0 access with the segment base never established.
+  - **This SUPERSEDES the "rip=0 / pLdrInitializeThunk=0" theory (UPDATE #10):** the workers DO
+    get a valid rip and run real PE code; they fault on gs because cpu->gs_base==0.
+  - How Wine sets the x86_64 gs base on macOS (Wine src dlls/ntdll/unix/signal_x86_64.c):
+    `_thread_set_tsd_base(teb)` = machdep syscall `eax=0x3000003` (trap 3), arg in RDI. ocerz
+    DOES intercept this (src/syscall.c:~2249 sets cpu->gs_base = RDI), and new threads already
+    get cpu->gs_base = pth+0xe0 (bsdthread_create/workq). So gs_base==0 means the crashing
+    worker's OcerzCPU went through NONE of these (nor the main-thread init at dyld.c:2173) —
+    a thread-creation path that never establishes gs_base, OR a g_cur_cpu/per-thread-CPU
+    mismatch so the running host thread is using a zeroed CPU. THAT is the next thing to trace.
+  - NEXT: log thread creation (which path makes the 002c/0024 worker), confirm whether its
+    OcerzCPU.gs_base is set at creation and whether _thread_set_tsd_base(eax=0x3000003) runs on
+    it before the first gs access; verify g_cur_cpu identity on worker entry. Repro:
+    `OCERZ_INITPHASE=1 OCERZ_HOSTWQ=1 WINEARCH=wow64 WINEPREFIX=$HOME/.wine ./ocerz \
+     "<Wine Devel.app>/Contents/Resources/wine/bin/wine" notepad` (WINEDEBUG unset; wait ~45s
+    through the selpool builds to reach the crash). Crash diagnostics already in src/vm.c.
+
+### UPDATE #12 (2026-06-12): JIT BUG FOUND + FIXED — IRETQ was not a block terminator (the gs_base=0 wall is GONE)
+
+The deterministic worker crash with gs_base=0 (UPDATE #11) was a JIT correctness bug, not a thread/Mach
+semantics gap. Root-cause chain (all live-verified):
+- gs_base went 0x3900fd0e0 (worker entry) -> swapped TEB(0x7ffd8000)/cthread(0x3900fd0e0) ~17x via machdep
+  trap 3 -> then 0 at the crash. NO code path writes gs_base=0 (only creation=pth+0xe0 and machdep=RDI,
+  always logged non-zero); the host cpu struct address is unreachable by any guest g2h address. So gs=0 was
+  memory corruption of the running OcerzCPU.
+- A per-instruction gs tracer armed after each machdep (OCERZ_GSTRACE, since removed) showed: under the
+  INTERPRETER gs NEVER goes 0 and the run reaches a DIFFERENT (earlier) wall. So the corruption is JIT-ONLY.
+- The corrupting code is Wine's __wine_syscall_dispatcher context-restore epilogue at ntdll.so 0x381a33b2b:
+  `fxrstor64 [rcx+0xc0]` -> a run of GPR restores `mov r15,[rcx+0x68]`... -> `pushfq` ->
+  `and qword [rsp],0xffffbfff` (clear NT) -> `popfq` -> **`48 cf` = IRETQ** (returns to the WoW64 code at
+  0x7ff08460). The interpreter handles it correctly (re-fetches at the iret target).
+- THE BUG (src/jit.c is_terminator): **OCERZ_OP_IRET was NOT in the terminator list.** So translate() decoded
+  PAST the iretq (treating the bytes after it as instructions) and the emit loop ran them: the interp slow-call
+  for iretq set cpu->rip to the real target, but the JIT block then kept executing the bogus post-iretq
+  emitted instructions, corrupting the CPU (gs_base read 0) and diverging control flow (JIT jumped into the
+  shared cache 0x7ff8..., interp stayed in WoW64 0x7ff0...).
+- **FIX: add `case OCERZ_OP_IRET:` to is_terminator() (src/jit.c ~165).** One line. The JIT block now ends at
+  iretq, emits it as a slow-call (interp restores the iret frame), and returns to the run loop which dispatches
+  at the new rip -- exactly like RET/SYSCALL. make check GREEN (14/14 guest x2, 15/15 diff, 2/2 dyn). The
+  notepad run no longer produces ANY gs_base=0 crash; the JIT now matches the interpreter.
+- KEPT (clean, useful): crash dump now prints `gs_base=`/`fs_base=` + `insn@rip=` bytes (src/vm.c).
+- NEW WALL (was masked by the IRET bug; pre-existing, the UPDATE #7 "8 guard-page faults" region):
+  `SIGBUS guest_addr=0x7ff4d130 guest_rip=0x7ff0ddff gs_base=0x7ffd8000 (TEB)`, insn@rip =
+  `48 c1 e0 04 80 bc 01 01 20 00 00 00 74 26` = `shl rax,4; cmp byte [rcx+rax+0x2001],0; je ...`. This is WoW64
+  32-bit code at 0x7ff0ddff touching 0x7ff4d130 (an uncommitted/guard page in the low-shadow window -> host
+  SIGBUS). gs is now CORRECT (TEB), so this is a genuine Win32 PAGE_GUARD / stack-growth or 32-bit-address
+  commit issue, NOT a segment-base problem. NEXT: trace what 0x7ff4d130 is (a WoW64 32-bit stack guard page
+  that needs commit-on-demand growth, or a missing reservation) and whether ocerz must deliver this as a guest
+  fault Wine grows, or commit it. Repro unchanged (WINEDEBUG unset, ~45s through selpool builds).
+
+### UPDATE #13 (2026-06-12): two more JIT/memory bugs fixed — Wine now initializes Windows DLLs (5x deeper)
+
+After the IRET fix (#12), three further walls were root-caused and fixed; make check stays green
+(14/14 guest x2, 15/15 diff, 2/2 dyn) at every step. Wine progressed from icount ~0xb7000 to ~0x39e000
+and now reaches `wineboot.exe` loading + initializing system DLLs (msvcrt.dll etc.).
+
+1. **vprot-table ENOMEM (bump-pool waste).** Wine's page-guard handling kept looping at 0x7ff4d130
+   because `alloc_pages_vprot` (a guest mmap(NULL,0x100000)) returned ENOMEM. Root cause: a guest
+   `mach_vm_allocate(FIXED)` at 0x3fff40000 (Wine reserving a high address that falls in ocerz's
+   identity arena) made `ocerz_map_claim_fixed` JUMP bump_next to near arena_hi, stranding ~1.7GB of
+   the 2GB pool. FIX (src/mem.c): record such above-the-waterline FIXED claims as "reserved islands"
+   instead of jumping bump_next; `ocerz_map_anywhere` fills the gap below contiguously and steps over
+   islands (bump_skip_islands); islands are dropped on unmap. The pool is no longer stranded; vprot
+   ENOMEM gone.
+
+2. **16KB-vs-4KB protection-rounding bug (THE wall after vprot).** Wine maps ntdll.dll's read-only
+   sections then protects them PAGE_READONLY. A RO section start (e.g. 0x3fffde000) is 4KB-aligned but
+   not 16KB-aligned; `ocerz_protect` rounded restrictive protections OUTWARD to 16KB, dragging the
+   adjacent writable BSS (0x3fffdd130, RVA 0x9d130) read-only -> the guest's own write to its BSS
+   SIGBUS'd in a loop (host_prot=0x701: cur=READ). FIX (src/mem.c ocerz_protect): round a PERMISSIVE
+   (writable) change OUTWARD but a RESTRICTIVE (RO/RX/NONE) change INWARD, so a 16KB host page shared
+   by a RW 4KB guest page and a RO 4KB guest page keeps the union (RW wins) and the guest's writable
+   data keeps working. (PROT_NONE already rounded inward; this generalizes it.) Diagnostic kept:
+   `ocerz_host_region_prot` + the crash dump's `host_prot=`/`region=` fields (src/vm.c, src/mem.c).
+
+NEW WALL (icount ~0x39ea2e): `wineboot.exe` initializes DLLs and `msvcrt.dll failed to initialize,
+aborting` (status c0000005 = STATUS_ACCESS_VIOLATION); `run_wineboot boot event wait timed out`.
+The crash is a guest 32-bit load (`ldr w0,[x1]`) of a WILD pointer 0xa3f1c2b745e9ef24 at
+guest_rip=0x3a0110d54 (arena PE region). NEXT: disassemble 0x3a0110d54, find which register holds the
+garbage pointer and why it's uninitialized (a relocation/global/earlier-init that didn't land), i.e.
+why msvcrt's DLL init dereferences garbage. Repro: `OCERZ_INITPHASE=1 OCERZ_HOSTWQ=1 WINEARCH=wow64
+WINEPREFIX=$HOME/.wine ./ocerz "<Wine Devel.app>/.../bin/wine" notepad` (WINEDEBUG unset).
+
+### UPDATE #14 (2026-06-12): msvcrt wall root-caused — runtime CoreFoundation dylib's pthread per-thread-data getter returns garbage
+
+The "msvcrt.dll failed to initialize (c0000005)" crash at guest_rip=0x3a0110d54 was traced fully:
+- The block is `push rbp; mov rbp,rsp; sub rsp,0x40; call 0x3a0188c76; cmp dword [rax+0x180c],0`.
+  rax is the RETURN of the call; the call is an import thunk (`jmp [rip+0x4d44c]`) -> a small fn
+  `mov rdi,[global 0x3a031c930]; call pthread_getspecific-thunk; test rax,rax`. So it's a per-thread
+  -data getter: `pthread_getspecific([global])`. The libsystem fn is libsystem_pthread (base
+  0x7ff802e6e000) +0x1899 = `mov rax, gs:[rdi*8 + disp32]` (= pthread_getspecific).
+- The global key at 0x3a031c930 reads 0 (UNINITIALIZED). getspecific then returns a cookie-class
+  garbage (0xa3f1c2b7...; cf cthread+0x38 = 0xa3f1c2b4..., a pthread guard cookie) instead of NULL,
+  so the caller's NULL-check passes and `cmp [garbage+0x180c]` faults. gs is correct (cthread); this
+  is NOT a gs/segment bug (gs:[0x30] under cthread reads 0 cleanly).
+- The faulting code lives in a Mach-O DYLIB at host region [0x3a0004000,0x3a0270000) (~2.5MB,
+  RO-exec, prot=0x703) loaded INTO THE ARENA. Its LC_LOAD_DYLIBs: /usr/lib/libSystem.B.dylib,
+  .../CoreFoundation, and `@loader_path/../../...`. It is NOT a PE (those are at 0x3fe-0x3ff), NOT
+  ntdll.so (0x381a04000, 571KB), and crucially **does not appear in ANY ocerz load log** (not the
+  closure `loadphase` list, not the `dlopen loaded` line) even under -v. So ocerz's dlopen/closure
+  paths did not load it the tracked way, and `OCERZ_DLINIT=1` (g_init_force, which runs all
+  sub-closure inits) does NOT fix it.
+- CONCLUSION: this dylib's INITIALIZER (which would `pthread_key_create` and store the key in the
+  global) never ran. Its key stays 0 -> getspecific reads a wrong/cookie slot -> garbage -> msvcrt
+  init aborts -> `run_wineboot boot event wait timed out`. This is the project's central dyld
+  init-ordering / eager-set problem (run_init_phase visits the closure + g_dimgs, gated by the eager
+  set unless g_init_force; this dylib is reached by neither because its load is untracked).
+  NEXT: find HOW this CF-linked dylib enters the arena (it is a runtime use at icount ~0x39ea00; trace
+  the mmap/dlopen that creates [0x3a0004000,...)), then run its initializer at the right time without
+  regressing the GUI/SkyLight path. Diagnostics kept (vm.c): insn@rip-24, blockhist, host_prot/region,
+  rip-region, OCERZ_STRDUMP, ocerz_host_region_prot. Repro unchanged (WINEDEBUG unset).
+
+### UPDATE #14b (2026-06-12): msvcrt wall narrowed to "run_image_inits runs ZERO inits for the runtime dylib"
+
+Pushed the msvcrt/pthread-key wall much further (no fix yet). Traced the load + init of the
+faulting dylib precisely:
+- A C backtrace on the large arena alloc (OCERZ_MAPBT, since removed) showed the dylib enters at
+  host [0x3a0004000,0x3a0270000) via: ocerz_map_anywhere <- map_segments <- ocerz_dlopen <-
+  ocerz_dyldapi_dispatch <- ocerz_vm_run_cpu <- ocerz_worker_entry. So the GUEST dlopen()s it via the
+  dyld4 API, ON A WORKER THREAD, and ocerz_dlopen loads it.
+- The runtime dlopens (OCERZ_DLOPENLOG) are: ColorSync.framework/ColorSync, QuartzCore.framework/
+  QuartzCore, ntdll.so, win32u.so. ColorSync/QuartzCore are CACHE-ONLY (no disk file), so the disk
+  dylib at 0x3a0004000 is a non-cache DEP of theirs (links libSystem + CoreFoundation +
+  @loader_path/../..; uses __cfstring; ~2.5MB). Two such dylibs load contiguously: 0x3a0004000 and
+  0x3a0274000. The faulting getter (pthread_getspecific of the key global 0x3a031c930=0) lives in the
+  SECOND (0x3a0274000); the first calls it via an import thunk.
+- CRUCIAL: ocerz_dlopen_inner DOES run inits (init_closure -> run_image_inits) and INITCLOSURE TRACE
+  shows `INITCLOSURE run mh=0x3a0004000` AND `mh=0x3a0274000` both execute -- but OCERZ_INITLOG shows
+  ZERO `INIT mh=0x3a0...` lines, i.e. run_image_inits found NO initializer to run for either dylib.
+  Their sections are __text/__stubs/__stub_helper (__TEXT) and __got/__const/__cfstring (__DATA_CONST)
+  -- NO __mod_init_func (S_MOD_INIT_FUNC_POINTERS, type 0x09) and NO __init_offsets
+  (S_INIT_FUNC_OFFSETS, type 0x16), which are the only two run_image_inits handles.
+- So the dylib's pthread_key_create constructor never runs (run_image_inits has nothing to run),
+  the key stays 0, pthread_getspecific(0) returns a cookie, msvcrt derefs it -> c0000005.
+  OPEN QUESTION for the fix: where is this dylib's key actually created? Either (a) it has a
+  constructor in an init format ocerz's run_image_inits doesn't recognize (e.g. LC_ROUTINES, or
+  __mod_init_func in a segment/section whose type field reads wrong, or chained-fixup __mod_init_func
+  pointers that apply_fixups left 0 so the `if(fn)` skip drops them), or (b) the key is created lazily
+  via a CF/pthread_once path that didn't fire, or (c) by a dependency whose own init didn't run. NEXT:
+  dump the dylib's FULL section list + every LC_* for 0x3a0274000 (peek the whole header), confirm
+  presence/type/contents of any init/mod_init section, and check apply_fixups left its init pointers
+  non-zero. The fix is then either in run_image_inits (handle the missing init format) or apply_fixups
+  (relocate the init pointers). This is the project's dyld init-ordering area; tread carefully to not
+  regress the GUI/SkyLight init path. make-check stays green; all this turn's real fixes intact.
+
+### UPDATE #15 (2026-06-13): ★★★ WINEBOOT RUNS END-TO-END TO THE GUI LAYER — zero ocerz faults. 6 walls destroyed this session.
+
+`bin/wine notepad` (WINEDEBUG unset) now runs wineboot + 4 Wine processes (wineboot 0024,
+services 002c, rpcss 003c, explorer 004c) all the way through DLL init, the prefix setup, process
+spawning, and into WINDOW CREATION. ZERO ocerz fatals/crashes. make check GREEN throughout
+(14/14 guest x2, 15/15 diff, 2/2 dyn). The only remaining errors are Wine driver/environment level,
+NOT emulator bugs: `no driver could be loaded`/`graphics driver is missing` (winemac.drv display
+driver = Phase 5), `Failed to load libMoltenVK.dylib`, `Wine cannot find the FreeType font library`,
+`getaddrinfo Failed to resolve host` (offline). ocerz is now faithfully executing Wine; the GUI
+needs the macOS display driver, which is the next subsystem.
+
+Six walls destroyed this session, each root-caused and fixed faithfully:
+
+1. **ntdll.so DOUBLE-LOAD (path canonicalization).** The msvcrt pthread-key garbage (UPDATE #14)
+   was ntdll.so loaded TWICE: boot at 0x381a04000 (path .../x86_64-unix/ntdll.so) and a duplicate
+   via win32u.so's `@rpath/ntdll.so` dep that expanded to `.../x86_64-unix//ntdll.so` (DOUBLED slash
+   from an rpath entry ending in '/'). A raw strcmp in dimg_find_by_path missed the dedup -> 2nd
+   ntdll, whose per-thread pthread key (global at +0xa8930) was never created by an initializer ->
+   pthread_getspecific(key 0) returned a TSD cookie -> msvcrt deref'd garbage. FIX (src/dyld.c
+   load_disk_dylib): canonicalize the resolved dep path via canon_dylib_path (realpath collapses //,
+   resolves .., follows symlinks) before dimg_find_by_path, exactly as ocerz_dlopen_inner already
+   does for top-level dlopens. dyld dedups loaded images by realpath too. Confirmed: only one ntdll
+   now; msvcrt initializes.
+
+2. **MAP_SHARED file-overlay teardown (the heap-over-manifest RO collision).** After #1, msvcrt
+   init crashed writing 0x110010: Wine SxS-maps a manifest MAP_SHARED PROT_READ (from a read-only
+   fd) at 0x110000, parses it, unmaps it, then reuses the address for a HEAP. ocerz_unmap and
+   commit_range manage pages with mprotect, but a MAP_SHARED read-only file overlay can't be
+   mprotect'd writable (EACCES) nor restored to anonymous reservation -> the page stays the read-only
+   file mapping -> the heap's `heap->ffeeffee=0xffeeffee` write SIGBUSes. FIX (src/mem.c): new
+   host_make_writable() falls back to `mmap(MAP_ANON|MAP_PRIVATE|MAP_FIXED)` when mprotect can't make
+   a page writable, replacing the file overlay with a fresh zero anonymous page (correct MAP_FIXED-
+   remap/unmap semantics; a file overlay always covers a whole host page so no anon neighbor is lost).
+   Used in commit_range (writable commit + zero-overlap memset) and ocerz_unmap (free path). Wine now
+   reaches `wineboot.exe` loading + initializing msvcrt etc.; icount ~0.75M -> ~3.8M.
+
+3. **necp/guarded network syscalls (libsystem_info DNS/host-info setup).** wineboot's libsystem_info
+   does getaddrinfo/host-info via necp, hitting unimplemented BSD syscalls. Added to bsd_table
+   (src/syscall.c, all host-forwarded with correct ptr_masks): 501 necp_open (1 arg), 444
+   change_fdguard_np (6, ptr_mask 0x2a), 502 necp_client_action (6, ptr_mask 0x14), 442
+   guarded_close_np (2, 0x02). Forwarding to the real kernel is faithful (the host decides necp
+   availability).
+
+4. **PE-syscall dispatch via SIGSYS (the WoW64 NT-syscall mechanism).** Wine's PE ntdll NtXxx stubs
+   do `syscall` with a raw Windows syscall number (no macOS class bits -> class 0). On macOS 14+ the
+   kernel raises SIGSYS for the "invalid" syscall, and Wine's registered sigsys_handler reads the
+   saved rip/rax and routes into __wine_syscall_dispatcher_prolog_end. ocerz fataled on class-0
+   syscalls; FIX (src/syscall.c ocerz_handle_syscall default case): deliver SIGSYS to the guest via
+   ocerz_signal_deliver (cpu->rip is already past the syscall = the kernel's saved rip; the handler
+   computes frame->rip=rip+0xb, frame->rcx=rip). Faithful: ocerz does exactly what the kernel does and
+   Wine's real handler runs. (PE stubs alternately `call [0x7ffe1000]` when user_shared_data flag
+   0x7ffe0308&1 is set; that direct path needs no SIGSYS.)
+
+5. **int3 -> SIGTRAP (not fatal).** A guest int3 (DbgBreakPoint guards, KiUserExceptionDispatcher)
+   is a breakpoint, not a fatal. macOS raises SIGTRAP (trap TRAP_x86_BPTFLT=3) which Wine's
+   trap_handler turns into EXCEPTION_BREAKPOINT. FIX (src/interp.c OCERZ_OP_INT3 + src/syscall.c
+   trapno): deliver SIGTRAP with trapno 3 so Wine backs ExceptionAddress over the int3; cpu->rip is
+   already past it (matching the kernel's saved rip). Only a genuinely unhandled trap (no SIGTRAP
+   handler) stays fatal.
+
+6. **★ gs/fs BASE saved+restored across signal delivery (THE big one — the 0x320 crash).** After
+   #4/#5 the spawned children deterministically SIGBUS'd at __wine_syscall_dispatcher's return
+   (`mov rdi,[r13+0x320]`, r13=0). Root cause: macOS 14+ SAVES the fs/gs base in the signal state and
+   RESTORES it on sigreturn; Wine RELIES on this -- init_handler sets gs to the pthread base (cthread)
+   for the unix handler's own TLS, expecting the original TEB base back when the interrupted code
+   resumes. ocerz explicitly did NOT carry gs_base through the frame, so after a handler gs stayed
+   cthread; a syscall reaching the dispatcher then ran `mov %gs:0x30,%r13` with gs=cthread, read
+   cthread:0x30=0, and `[r13+0x320]` (the pthread_teb field at amd64_thread_data+0x320) derefed near
+   NULL. FIX: ocerz_signal_deliver stashes cpu->gs_base/fs_base in the ucontext (uc+56/uc+64, past
+   the 56-byte Darwin ucontext so it nests per-frame) and sys_sigreturn restores them. make check
+   green; the 0x320 crash is GONE and wineboot runs to the GUI layer. This was the deepest fix --
+   the macOS-14 gsbase-across-signal contract that the whole WoW64 syscall/exception machinery is
+   built on.
+
+Diagnostics kept (env-gated): OCERZ_DLPATH (disk-dylib path+base), OCERZ_INITSCAN (per-image section
+dump), ocerz_host_region_prot host_prot/region + rip-region in the crash dump (src/vm.c). NEXT WALL
+= Phase 5: the winemac.drv display driver (window creation) + FreeType, so GUI apps can actually
+draw. ocerz emulation itself is clean through Wine boot.

@@ -1266,8 +1266,9 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
  * rcx=&siginfo, r8=&ucontext, r9=sigreturn-token, and on the handler's return it
  * calls __sigreturn (BSD 184) which restores OcerzCPU from mcontext.__ss. Offsets
  * are the probed Darwin layout (mcontext __es@0/__ss@16; __ss order
- * rax,rbx,rcx,rdx,rdi,rsi,rbp,rsp,r8..r15,rip@144,rflags@152). gs_base/fs_base are
- * NOT carried through the frame, so the handler keeps the faulting thread's TLS. */
+ * rax,rbx,rcx,rdx,rdi,rsi,rbp,rsp,r8..r15,rip@144,rflags@152). The fs/gs base are
+ * stashed in the ucontext (uc+56/uc+64) and restored on sigreturn, matching the
+ * macOS-14 kernel that saves/restores the segment base across a signal. */
 #define OCERZ_MCTX_SIZE 1032u
 #define OCERZ_UCTX_SIZE 768u
 #define OCERZ_SIGINFO_SIZE 104u
@@ -1318,7 +1319,9 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     memset(ocerz_g2h(uc), 0, OCERZ_UCTX_SIZE);
     memset(ocerz_g2h(si), 0, OCERZ_SIGINFO_SIZE);
 
-    int trapno = (sig == SIGSEGV || sig == SIGBUS) ? 14 : (sig == SIGILL ? 6 : 0);
+    int trapno = (sig == SIGSEGV || sig == SIGBUS) ? 14
+               : (sig == SIGILL ? 6
+               : (sig == OCERZ_SIGTRAP ? 3 : 0));
     ocerz_st(mc + 0, 4, (uint32_t)trapno);
     ocerz_st(mc + 4, 4, err);
     ocerz_st(mc + 8, 8, fault_addr);
@@ -1353,6 +1356,18 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     ocerz_st(uc + 24, 4, cpu->sig_on_stack ? 1u : 0u);
     ocerz_st(uc + 40, 8, OCERZ_MCTX_SIZE);
     ocerz_st(uc + 48, 8, mc);
+    /* Carry the segment bases across the handler. On macOS 14+ the kernel saves
+     * the fs/gs base in the signal state and restores it on sigreturn; Wine's
+     * handlers RELY on this -- init_handler sets gs to the pthread base (cthread)
+     * for the unix handler's own TLS, expecting the original (TEB) base to come
+     * back when the interrupted code resumes. Without restoring it, a handler
+     * that resumes into __wine_syscall_dispatcher (the SIGSYS path, or a syscall
+     * issued from within a handler) runs `mov %gs:0x30,%r13` with gs=cthread,
+     * reads cthread:0x30 = 0, and the dispatcher's later [r13+0x320] derefs near
+     * NULL. Stored past the 56-byte Darwin ucontext where nothing else lives, so
+     * it nests per-frame; sys_sigreturn restores it. */
+    ocerz_st(uc + 56, 8, cpu->gs_base);
+    ocerz_st(uc + 64, 8, cpu->fs_base);
 
     ocerz_st(si + 0, 4, (uint32_t)sig);
     ocerz_st(si + 8, 4, (uint32_t)si_code);
@@ -1408,6 +1423,12 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         cpu->xmm[i] = ocerz_ld128(mc + 352 + (uint64_t)i * 16);
     cpu->mxcsr = (uint32_t)ocerz_ld(mc + 216, 4);
     cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
+    /* Restore the fs/gs base saved at delivery (see ocerz_signal_deliver): the
+     * macOS-14 kernel restores the segment base on sigreturn, undoing the handler's
+     * init_handler swap to the pthread base so the interrupted code resumes with
+     * its original TEB base. */
+    cpu->gs_base = ocerz_ld(uc + 56, 8);
+    cpu->fs_base = ocerz_ld(uc + 64, 8);
     if (!(uint32_t)ocerz_ld(uc + 0, 4))
         cpu->sig_on_stack = 0;
     return OCERZ_STEP_OK;
@@ -1697,6 +1718,10 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [274] = { "sysctlbyname",6, 0x1d, 0, NULL },
     [381] = { "__mac_syscall", 3, 0x05, 0, NULL },
     [483] = { "csrctl", 3, 0x02, 0, NULL },
+    [442] = { "guarded_close_np", 2, 0x02, 0, NULL },
+    [444] = { "change_fdguard_np", 6, 0x2a, 0, NULL },
+    [501] = { "necp_open", 1, 0x00, 0, NULL },
+    [502] = { "necp_client_action", 6, 0x14, 0, NULL },
     [524] = { "setattrlistat", 6, 0x0e, 0, NULL },
     [521] = { "abort_with_payload", 6, 0x04, 0, sys_abort_payload },
     [283] = { "fchmod_extended", 5, 0x10, 0, NULL },
@@ -2275,8 +2300,19 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
     case 3:
         return dispatch_machdep(vm, cpu, num);
     default:
-        OCERZ_FATAL("unknown syscall class=%d num=%d (rax=%#llx)\n",
-                    class, num, (unsigned long long)rax);
+        /* A SYSCALL_CLASS_NONE (class 0) syscall is not a real macOS syscall: on
+         * macOS 14+ the kernel raises SIGSYS for it, and Wine's WoW64 PE ntdll
+         * deliberately relies on that — its NtXxx stubs do `syscall` with a raw
+         * Windows syscall number (no macOS class bits), and Wine's registered
+         * SIGSYS handler reads the saved rip/rax and routes into
+         * __wine_syscall_dispatcher. We emulate the kernel faithfully: deliver
+         * SIGSYS to the guest with the saved rip already past the syscall (the
+         * handler computes frame->rip = rip+0xb and frame->rcx = rip). If no
+         * SIGSYS handler is registered it is a genuine bad syscall -> fatal. */
+        if (ocerz_signal_deliver(cpu, OCERZ_SIGSYS, 0, 0, 0))
+            return OCERZ_STEP_OK;
+        OCERZ_FATAL("unknown syscall class=%d num=%d (rax=%#llx) rip=%#llx\n",
+                    class, num, (unsigned long long)rax, (unsigned long long)cpu->rip);
         return OCERZ_STEP_FATAL;
     }
 }

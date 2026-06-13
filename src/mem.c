@@ -84,6 +84,7 @@
 #include "ocerz/mem.h"
 
 #include <sys/mman.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -103,6 +104,37 @@ uint64_t ocerz_top_base;
 uint8_t *ocerz_commpage;
 
 static uint64_t bump_next;
+
+/* Reserved islands: ranges inside the bump pool that a guest claimed FIXED at an
+ * address ABOVE the bump waterline (e.g. Wine reserves a specific high address that
+ * happens to fall in ocerz's identity arena, or libmalloc grows a block in place).
+ * Recording the claim as an island -- instead of jumping bump_next past it -- keeps
+ * bump_next low so ocerz_map_anywhere fills the (potentially huge) gap below the
+ * island contiguously and only steps over the island once it reaches it. Jumping
+ * bump_next would strand every byte between the waterline and the claim (observed:
+ * a single 0x3fff40000 claim near arena_hi stranded ~1.7GB, then the vprot-table
+ * mmap that Wine needs to service its own page-guard faults failed with ENOMEM). */
+#define MEM_ISLAND_MAX 64
+static struct { uint64_t lo, hi; } islands[MEM_ISLAND_MAX];
+static int island_n;
+
+static uint64_t bump_skip_islands(uint64_t start, uint64_t glen, uint64_t align)
+{
+    for (int guard = 0; guard <= island_n; guard++) {
+        uint64_t end = start + glen;
+        int hit = 0;
+        for (int i = 0; i < island_n; i++) {
+            if (start < islands[i].hi && end > islands[i].lo) {
+                start = (islands[i].hi + (align - 1)) & ~(align - 1);
+                hit = 1;
+                break;
+            }
+        }
+        if (!hit)
+            break;
+    }
+    return start;
+}
 
 typedef struct {
     uint64_t glo;
@@ -200,27 +232,41 @@ static MemRegion *region_add(uint64_t glo, uint64_t ghi)
     return &regions[region_n++];
 }
 
+/* Make a host page anonymous-writable. A guest MAP_SHARED mapping of a read-only
+ * fd (an SxS manifest the guest mapped then unmapped, a wineserver tmpmap) cannot
+ * be mprotect'd writable nor turned back into reservation by mprotect; when
+ * mprotect fails, replace the page with a fresh zero-filled anonymous page, which
+ * drops the file overlay. A file overlay always covers a whole host page
+ * (ocerz_map_shared_file rounds to host pages), so the replace never clobbers a
+ * live anonymous 4KB neighbor sharing the same 16KB host page. Returns 0 on ok. */
+static int host_make_writable(void *hp)
+{
+    if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) == 0)
+        return 0;
+    return mmap(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE,
+                MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == hp ? 0 : -1;
+}
+
 static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
                         uint64_t zlo, uint64_t zhi)
 {
     for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
         size_t i = pg_index(r, p);
         void *hp = ocerz_g2h(p);
-        if (bit_test(r, i)) {
-            uint64_t mlo = p > zlo ? p : zlo;
-            uint64_t mhi = p + OCERZ_HOST_PAGE < zhi ? p + OCERZ_HOST_PAGE : zhi;
-            if (mlo < mhi) {
-                if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) != 0)
-                    return OCERZ_ENOMEM;
-                memset(ocerz_g2h(mlo), 0, (size_t)(mhi - mlo));
-            }
-            if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, hprot) != 0)
+        int committed = bit_test(r, i) ? 1 : 0;
+        uint64_t mlo = p > zlo ? p : zlo;
+        uint64_t mhi = p + OCERZ_HOST_PAGE < zhi ? p + OCERZ_HOST_PAGE : zhi;
+        if (committed && mlo < mhi) {
+            if (host_make_writable(hp) != 0)
                 return OCERZ_ENOMEM;
-        } else {
-            if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, hprot) != 0)
-                return OCERZ_ENOMEM;
-            bit_set(r, i);
+            memset(ocerz_g2h(mlo), 0, (size_t)(mhi - mlo));
         }
+        if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, hprot) != 0 &&
+            mmap(hp, (size_t)OCERZ_HOST_PAGE, hprot,
+                 MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != hp)
+            return OCERZ_ENOMEM;
+        if (!committed)
+            bit_set(r, i);
     }
     return OCERZ_OK;
 }
@@ -419,7 +465,7 @@ uint64_t ocerz_map_anywhere(uint64_t len, int prot)
 {
     uint64_t glen = round_up(len);
     pthread_mutex_lock(&map_lock);
-    uint64_t gaddr = bump_next;
+    uint64_t gaddr = bump_skip_islands(bump_next, glen, OCERZ_HOST_PAGE);
     if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
         pthread_mutex_unlock(&map_lock);
         return 0;
@@ -437,6 +483,7 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
     uint64_t glen = round_up(len);
     pthread_mutex_lock(&map_lock);
     uint64_t gaddr = (bump_next + (align - 1)) & ~(align - 1);
+    gaddr = bump_skip_islands(gaddr, glen, align);
     if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
         pthread_mutex_unlock(&map_lock);
         return 0;
@@ -466,7 +513,21 @@ int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot)
         pthread_mutex_unlock(&map_lock);
         return OCERZ_ENOMEM;
     }
-    bump_next = hi + OCERZ_HOST_PAGE;
+    for (int i = 0; i < island_n; i++) {
+        if (lo < islands[i].hi && hi > islands[i].lo) {
+            pthread_mutex_unlock(&map_lock);
+            return OCERZ_ENOMEM;
+        }
+    }
+    if (lo == bump_next) {
+        bump_next = hi + OCERZ_HOST_PAGE;
+    } else if (island_n < MEM_ISLAND_MAX) {
+        islands[island_n].lo = lo;
+        islands[island_n].hi = hi + OCERZ_HOST_PAGE;
+        island_n++;
+    } else {
+        bump_next = hi + OCERZ_HOST_PAGE;
+    }
     int rc = map_fixed_locked(lo, hi - lo, prot, 0);
     pthread_mutex_unlock(&map_lock);
     return rc;
@@ -511,17 +572,30 @@ int ocerz_map_claim_region(uint64_t gaddr, uint64_t len, int prot)
     return rc;
 }
 
+/* Apply a guest protection change to the host pages. A 16KB host page can back
+ * up to four 4KB guest pages with DIFFERENT guest protections, so a protection
+ * change is rounded by direction: a PERMISSIVE change (writable) rounds OUTWARD
+ * and a RESTRICTIVE change (read-only / exec-only / none) rounds INWARD. Only the
+ * 16KB host pages WHOLLY covered by the restricted guest range lose write access;
+ * a host page the range only partly covers is shared with a more-permissive 4KB
+ * neighbor and keeps its current protection. The net per-host-page protection is
+ * thus the union (most permissive) of its 4KB guests, which is what keeps a PE's
+ * writable BSS/data working when it abuts a read-only section inside one 16KB
+ * page (Wine protects ntdll's read-only sections to PAGE_READONLY after load; an
+ * outward round would strand the adjacent BSS read-only and fault the guest's own
+ * writes). The leaked write access on a partly-restricted page is unfaithful only
+ * to a guest that deliberately writes read-only memory to test the fault. */
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
 {
     uint64_t lo, hi;
-    if (host_prot(prot) == PROT_NONE) {
+    if (host_prot(prot) == (PROT_READ | PROT_WRITE)) {
+        lo = round_down(gaddr);
+        hi = round_up(gaddr + len);
+    } else {
         lo = round_up(gaddr);
         hi = round_down(gaddr + len);
         if (lo >= hi)
             return OCERZ_OK;
-    } else {
-        lo = round_down(gaddr);
-        hi = round_up(gaddr + len);
     }
     pthread_mutex_lock(&map_lock);
     const MemRegion *r = region_for_range(lo, hi);
@@ -547,16 +621,28 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len)
         if (!bit_test(r, pg_index(r, p)))
             continue;
         void *hp = ocerz_g2h(p);
-        if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) != 0) {
-            rc = OCERZ_ENOMEM;
-            break;
-        }
-        memset(hp, 0, (size_t)OCERZ_HOST_PAGE);
-        if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_NONE) != 0) {
+        if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) == 0) {
+            memset(hp, 0, (size_t)OCERZ_HOST_PAGE);
+            if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_NONE) != 0) {
+                rc = OCERZ_ENOMEM;
+                break;
+            }
+        } else if (mmap(hp, (size_t)OCERZ_HOST_PAGE, PROT_NONE,
+                        MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != hp) {
+            /* A read-only file overlay (e.g. an unmapped SxS manifest) that
+             * mprotect cannot restore: replace it with a fresh anonymous PROT_NONE
+             * reservation page so a later writable re-commit of this address (a
+             * heap reusing the freed slot) succeeds instead of faulting RO. */
             rc = OCERZ_ENOMEM;
             break;
         }
         bit_clr(r, pg_index(r, p));
+    }
+    for (int i = 0; i < island_n; i++) {
+        if (lo <= islands[i].lo && hi >= islands[i].hi) {
+            islands[i] = islands[--island_n];
+            i--;
+        }
     }
     pthread_mutex_unlock(&map_lock);
     return rc;
@@ -568,4 +654,25 @@ int ocerz_addr_committed(uint64_t gaddr)
     if (!r)
         return -1;
     return bit_test(r, pg_index(r, gaddr)) ? 1 : 0;
+}
+
+/* Diagnostic: the live host VM protection of the page backing a guest address,
+ * as the kernel sees it (cur in bits 0-7, max in bits 8-15, region base/size in
+ * the out-params). Returns ~0u if no region maps the address. Used by the crash
+ * dump to tell a real protection fault from a bitmap/host mismatch. */
+unsigned ocerz_host_region_prot(uint64_t gaddr, uint64_t *base, uint64_t *size)
+{
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)ocerz_g2h(gaddr);
+    mach_vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz,
+                                      VM_REGION_BASIC_INFO_64,
+                                      (vm_region_info_t)&info, &cnt, &obj);
+    if (kr != KERN_SUCCESS)
+        return ~0u;
+    if (base) *base = (uint64_t)a;
+    if (size) *size = (uint64_t)sz;
+    return (unsigned)(info.protection & 0xff) | ((unsigned)(info.max_protection & 0xff) << 8);
 }
