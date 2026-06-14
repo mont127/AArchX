@@ -138,6 +138,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -151,6 +152,7 @@ static struct OcerzCache *g_cache;
 static uint64_t g_headeropt_rw;
 static uint64_t g_headeropt_ro;
 static uint64_t g_sel_pool;
+static uint64_t g_selopt;
 static uint64_t g_clsopt;
 static uint64_t g_protoopt;
 static uint64_t g_block_scratch;
@@ -547,13 +549,15 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache)
     }
     uint64_t opt = objc_mh ? find_section_any(objc_mh, "__objc_opt_ro") : 0;
     if (opt) {
-        int32_t ro_off = 0, rw_off = 0, cls_off = 0, proto_off = 0;
+        int32_t selopt_off = 0, ro_off = 0, rw_off = 0, cls_off = 0, proto_off = 0;
         int64_t sel_off = 0;
+        memcpy(&selopt_off, (const void *)(uintptr_t)(opt + 0x08), 4);
         memcpy(&ro_off, (const void *)(uintptr_t)(opt + 0x0c), 4);
         memcpy(&rw_off, (const void *)(uintptr_t)(opt + 0x18), 4);
         memcpy(&cls_off, (const void *)(uintptr_t)(opt + 0x20), 4);
         memcpy(&proto_off, (const void *)(uintptr_t)(opt + 0x24), 4);
         memcpy(&sel_off, (const void *)(uintptr_t)(opt + 0x28), 8);
+        g_selopt = selopt_off ? opt + (int64_t)selopt_off : 0;
         g_headeropt_ro = ro_off ? opt + (int64_t)ro_off : 0;
         g_headeropt_rw = rw_off ? opt + (int64_t)rw_off : 0;
         g_clsopt = cls_off ? opt + (int64_t)cls_off : 0;
@@ -636,6 +640,16 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
     uint64_t args[3] = { (uint64_t)n, infos, g_objc_make_mutable };
     ocerz_vm_call(vm, mapped, args, 3, ret_rsp);
 
+    /* Record the images whose objc classes were just registered, so a later
+     * dlopen of a NON-boot disk dylib (winemac.drv) is NOT mistaken for already
+     * registered. ocerz_dyldapi_register_image appends every disk image to the
+     * image-list closure (g_closure_mh) for the dyld image/unwind APIs, but that
+     * closure is not the objc-registration set: only the images driven through
+     * map_images here (and later through objc_map_one) have realized classes. */
+    for (int k = 0; k < n; k++)
+        if (g_objc_dlopen_mapped_n < (int)(sizeof g_objc_dlopen_mapped / sizeof g_objc_dlopen_mapped[0]))
+            g_objc_dlopen_mapped[g_objc_dlopen_mapped_n++] = mhs[k];
+
     cpu->rip = caller_ret;
     cpu->gpr[OCERZ_RSP] = ret_rsp;
     cpu->gpr[OCERZ_RAX] = 0;
@@ -644,9 +658,6 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
 
 static int objc_image_already_loaded(uint64_t mh)
 {
-    for (int i = 0; i < g_closure_n; i++)
-        if (g_closure_mh[i] == mh)
-            return 1;
     for (int i = 0; i < g_objc_dlopen_mapped_n; i++)
         if (g_objc_dlopen_mapped[i] == mh)
             return 1;
@@ -691,6 +702,10 @@ static void objc_drive_map_images(struct OcerzVM *vm, const uint64_t *mhs, int n
  * already loaded, so it is not re-walked. */
 void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
 {
+    if (getenv("OCERZ_OBJCLOG"))
+        fprintf(stderr, "ocerz: OBJCMAP1 mh=%#llx cb=%d cache=%d already=%d\n",
+                (unsigned long long)mh, g_objc_mapped_cb ? 1 : 0, g_cache ? 1 : 0,
+                mh ? objc_image_already_loaded(mh) : -1);
     if (!g_objc_mapped_cb || !mh || !g_cache || objc_image_already_loaded(mh))
         return;
     uint64_t queue[DYLDAPI_CLOSURE_MAX], visited[DYLDAPI_CLOSURE_MAX], batch[DYLDAPI_CLOSURE_MAX];
@@ -726,6 +741,16 @@ void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
                 }
             }
             lc += l->cmdsize;
+        }
+    }
+    if (getenv("OCERZ_OBJCLOG")) {
+        fprintf(stderr, "ocerz: OBJCMAP mh=%#llx batch=%d path=%s\n",
+                (unsigned long long)mh, bn,
+                cache_path_for_mh(g_cache, mh) ? cache_path_for_mh(g_cache, mh) : "?");
+        for (int k = 0; k < bn; k++) {
+            const char *p = cache_path_for_mh(g_cache, batch[k]);
+            fprintf(stderr, "ocerz:   batch[%d] mh=%#llx %s\n", k,
+                    (unsigned long long)batch[k], p ? p : "?");
         }
     }
     if (bn == 0)
@@ -944,9 +969,77 @@ static void selpool_build(void)
     pthread_mutex_unlock(&g_selidx_lock);
 }
 
+/* Fast _dyld_get_objc_selector: look the name up in the shared cache's
+ * precomputed objc selector hash (objc_selopt_t at objc_opt_t+0x08). It is the
+ * same perfect-hash format the class table uses (stringhash_find_raw), but the
+ * selector table ends at the string-offset array -- no object-word/duplicate
+ * arrays -- and the canonical selector pointer IS the hashed string itself,
+ * table + offsets[h]. O(1), needs no build. This replaces the ~11s open-
+ * addressing index over the 2.5M-entry relativeMethodSelectorBase pool, which
+ * was blowing past winemac.drv's 5s Cocoa-startup deadline. The returned pointer
+ * is the cache's canonical selector (deduped into one pool), so it pointer-equals
+ * the selectors baked into the cache's relative method lists, which is what the
+ * caller needs. A name absent from the cache returns 0 (objc then mints its own). */
+static uint64_t selopt_canonical(const char *want)
+{
+    if (!g_selopt || !want || !want[0])
+        return 0;
+    const uint8_t *t = (const uint8_t *)(uintptr_t)g_selopt;
+    uint32_t capacity, shift, mask;
+    uint64_t salt;
+    memcpy(&capacity, t + 4, 4);
+    memcpy(&shift, t + 12, 4);
+    memcpy(&mask, t + 16, 4);
+    memcpy(&salt, t + 24, 8);
+    if (capacity == 0 || capacity > 0x1000000)
+        return 0;
+    size_t kl = strlen(want);
+    uint64_t val = clshash_lookup8((const uint8_t *)want, kl, salt);
+    uint64_t off_tab = 0x420;
+    uint64_t off_check = off_tab + (uint64_t)mask + 1;
+    uint64_t off_stroffs = off_check + capacity;
+    uint32_t scr;
+    memcpy(&scr, t + 0x20 + (uint64_t)t[off_tab + (val & mask)] * 4, 4);
+    uint32_t h = (uint32_t)(shift >= 64 ? 0 : (val >> shift)) ^ scr;
+    if (h >= capacity)
+        return 0;
+    uint8_t cb = (uint8_t)(((want[0] & 0x7) << 5) | ((uint8_t)kl & 0x1f));
+    if (t[off_check + h] != cb)
+        return 0;
+    int32_t so;
+    memcpy(&so, t + off_stroffs + (uint64_t)h * 4, 4);
+    if (so == 0)
+        return 0;
+    uint64_t canon = g_selopt + (uint64_t)(int64_t)so;
+    if (strcmp((const char *)(uintptr_t)canon, want) != 0)
+        return 0;
+    return canon;
+}
+
 static uint64_t selpool_canonical(const char *want)
 {
-    if (!g_sel_pool || !want || !want[0])
+    if (!want || !want[0])
+        return 0;
+    if (g_selopt) {
+        uint64_t r = selopt_canonical(want);
+        if (getenv("OCERZ_SELVERIFY") && g_sel_pool) {
+            if (!g_selidx) selpool_build();
+            uint64_t b = 0;
+            if (g_selidx) {
+                size_t wl = strlen(want);
+                uint32_t hh = (uint32_t)(fnv1a(want, wl) & (g_selidx_cap - 1));
+                while (g_selidx[hh]) {
+                    if (strcmp(g_selidx[hh], want) == 0) { b = (uint64_t)(uintptr_t)g_selidx[hh]; break; }
+                    hh = (hh + 1) & (g_selidx_cap - 1);
+                }
+            }
+            if (b != r)
+                fprintf(stderr, "ocerz: SELVERIFY MISMATCH \"%s\" selopt=%#llx build=%#llx\n",
+                        want, (unsigned long long)r, (unsigned long long)b);
+        }
+        return r;
+    }
+    if (!g_sel_pool)
         return 0;
     if (!g_selidx)
         selpool_build();
@@ -960,6 +1053,19 @@ static uint64_t selpool_canonical(const char *want)
         h = (h + 1) & (g_selidx_cap - 1);
     }
     return 0;
+}
+
+/* Public: the shared cache's canonical selector pointer for a name string (host
+ * pointer), or 0 if the cache has no such selector. The mini-dyld uses this to
+ * canonicalize an arena dylib's __objc_selrefs at load -- modern objc, on a
+ * shared-cache launch, assumes dyld already uniqued every selector reference and
+ * skips its own per-image selref fixup, so a selref left pointing at the image's
+ * local __objc_methname string is a DISTINCT pointer from the cache's canonical
+ * selector and fails objc_msgSend's pointer-equality method match (the
+ * "selector ... does not match selector known to Objective C runtime" abort). */
+uint64_t ocerz_dyldapi_canonical_selector(const char *name)
+{
+    return selpool_canonical(name);
 }
 
 static uint64_t objc_index_loaded(uint32_t idx)
@@ -996,6 +1102,10 @@ static int api_for_each_objc_class(struct OcerzVM *vm, OcerzCPU *cpu)
     for (int i = 0; i < n; i++) {
         uint64_t cls = g_cache_start + ((hits[i] >> 1) & ((1ull << 47) - 1));
         uint64_t loaded = objc_index_loaded((uint32_t)(hits[i] >> 48));
+        if (getenv("OCERZ_CLSLOG") && name && strstr((const char *)ocerz_g2h(name), "NSString"))
+            fprintf(stderr, "ocerz: CLSLOOKUP[%d] \"%s\" cls=%#llx imgidx=%u loaded=%llu\n",
+                    (int)getpid(), (const char *)ocerz_g2h(name), (unsigned long long)cls,
+                    (unsigned)(hits[i] >> 48), (unsigned long long)loaded);
         uint64_t args[4] = { block, cls, loaded, g_block_scratch };
         ocerz_vm_call(vm, invoke, args, 4, ret_rsp);
         if (vm->exited)
@@ -1129,6 +1239,116 @@ static uint64_t metaclass_load_imp(uint64_t cls)
     if (!in_cache(data))
         return 0;
     return load_in_method_list(ocerz_ld(data + 0x20, 8));
+}
+
+static int meth_list_has(uint64_t ml, const char *want)
+{
+    if (!in_cache(ml))
+        return 0;
+    uint32_t ef = (uint32_t)ocerz_ld(ml, 4);
+    uint32_t count = (uint32_t)ocerz_ld(ml + 4, 4);
+    uint32_t entsize = ef & 0xfffcu;
+    int rel = (ef & 0x80000000u) != 0;
+    if (count == 0 || count > 65536 || entsize == 0 || entsize > 64)
+        return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t ent = ml + 8 + (uint64_t)i * entsize;
+        uint64_t nameptr;
+        if (rel) {
+            int32_t noff = (int32_t)(uint32_t)ocerz_ld(ent, 4);
+            nameptr = g_sel_pool + (int64_t)noff;
+        } else {
+            nameptr = ocerz_ld(ent, 8);
+        }
+        if (nameptr && strcmp((const char *)ocerz_g2h(nameptr), want) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void meth_list_print_substr(uint64_t ml, const char *substr)
+{
+    if (!in_cache(ml))
+        return;
+    uint32_t ef = (uint32_t)ocerz_ld(ml, 4);
+    uint32_t count = (uint32_t)ocerz_ld(ml + 4, 4);
+    uint32_t entsize = ef & 0xfffcu;
+    int rel = (ef & 0x80000000u) != 0;
+    if (count == 0 || count > 65536 || entsize == 0 || entsize > 64)
+        return;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t ent = ml + 8 + (uint64_t)i * entsize;
+        uint64_t nameptr = rel ? g_sel_pool + (int64_t)(int32_t)(uint32_t)ocerz_ld(ent, 4)
+                               : ocerz_ld(ent, 8);
+        if (!nameptr) continue;
+        const char *nm = (const char *)ocerz_g2h(nameptr);
+        if (strstr(nm, substr)) {
+            uint64_t imp = rel ? (uint64_t)((int64_t)(ent + 8) + (int64_t)(int32_t)(uint32_t)ocerz_ld(ent + 8, 4))
+                               : ocerz_ld(ent + 16, 8);
+            fprintf(stderr, "ocerz:       method \"%s\" imp=%#llx\n", nm, (unsigned long long)imp);
+        }
+    }
+}
+
+/* OCERZ_METHDUMP diagnostic: for class `cls`, walk its METACLASS's static
+ * baseMethods (a shared-cache relative-list-list of per-image sub-lists) and
+ * report, for each sub-list, its image index, that image's objc "loaded" bit
+ * (objc excludes a sub-list whose image is not loaded when it realizes the
+ * class), and whether the sub-list defines `sel`. Pins down whether a cluster
+ * override (e.g. +allocWithZone:) is being dropped because its image is unloaded
+ * at realize time. */
+void ocerz_dyldapi_dump_method(uint64_t cls, const char *sel)
+{
+    if (!in_cache(cls) || !g_sel_pool) {
+        fprintf(stderr, "ocerz: METHDUMP cls=%#llx not-in-cache or no selpool\n",
+                (unsigned long long)cls);
+        return;
+    }
+    uint64_t meta = ocerz_ld(cls, 8) & 0x00007ffffffffff8ull;
+    uint64_t data = ocerz_ld(meta + 0x20, 8) & ~0x7ull;
+    uint64_t ro = data;
+    uint32_t dflags = (uint32_t)ocerz_ld(data, 4);
+    int realized = (dflags & 0x80000000u) != 0;
+    if (realized) {
+        uint64_t roe = ocerz_ld(data + 0x08, 8);
+        ro = (roe & 1) ? ocerz_ld((roe & ~1ull), 8) : roe;
+    }
+    uint64_t raw = ocerz_ld(ro + 0x20, 8);
+    fprintf(stderr, "ocerz: METHDUMP cls=%#llx meta=%#llx realized=%d ro=%#llx baseMethods=%#llx sel=%s\n",
+            (unsigned long long)cls, (unsigned long long)meta, realized,
+            (unsigned long long)ro, (unsigned long long)raw, sel);
+    uint64_t ptr = raw & ~0x7ull;
+    if (!in_cache(ptr)) {
+        fprintf(stderr, "ocerz:   baseMethods not in cache\n");
+        return;
+    }
+    if (raw & 1) {
+        uint32_t count = (uint32_t)ocerz_ld(ptr + 4, 4);
+        if (count > 4096) count = 4096;
+        for (uint32_t i = 0; i < count; i++) {
+            uint64_t ent = ptr + 8 + (uint64_t)i * 8;
+            uint64_t rawent = ocerz_ld(ent, 8);
+            int64_t off = (int64_t)rawent >> 16;
+            uint32_t imgidx = (uint32_t)(rawent & 0xffff);
+            uint64_t sublist = (uint64_t)((int64_t)ent + off);
+            uint64_t loaded = objc_index_loaded(imgidx);
+            int has = meth_list_has(sublist, sel);
+            fprintf(stderr, "ocerz:   sub[%u] list=%#llx imgidx=%u loaded=%llu has(%s)=%d%s\n",
+                    i, (unsigned long long)sublist, imgidx, (unsigned long long)loaded,
+                    sel, has, (has && !loaded) ? "  <== DROPPED (has sel but image unloaded)" : "");
+            meth_list_print_substr(sublist, "allocWithZone:");
+        }
+    } else {
+        fprintf(stderr, "ocerz:   single list has(%s)=%d\n", sel, meth_list_has(ptr, sel));
+    }
+    /* +[NSString allocWithZone:] (Foundation IMP 0x7ff8040b450a) returns the
+     * placeholder only when (self == *0x7ff8436dad48); that global is a runtime-
+     * fixed-up NSString class reference (0 in the static cache, == NSString in an
+     * isolated ocerz run). Read it here to see if the Wine process fixed it up. */
+    uint64_t g = 0x7ff8436dad48ull;
+    fprintf(stderr, "ocerz:   ALLOCGLOBAL[%#llx]=%#llx  cls=%#llx  match=%d\n",
+            (unsigned long long)g, (unsigned long long)ocerz_ld(g, 8),
+            (unsigned long long)cls, ocerz_ld(g, 8) == cls);
 }
 
 void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t stack_top)

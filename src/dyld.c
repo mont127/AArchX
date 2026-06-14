@@ -228,6 +228,7 @@
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static void wr64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
 static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 
 static uint8_t *read_file(const char *path, size_t *len_out)
@@ -367,6 +368,37 @@ static DynImage *dimg_find_by_install_name(const char *iname)
         if (g_dimgs[i].install_name[0] && strcmp(g_dimgs[i].install_name, iname) == 0)
             return &g_dimgs[i];
     return NULL;
+}
+
+void ocerz_dyld_dump_images(void)
+{
+    fprintf(stderr, "ocerz: IMGMAP[%d] n=%d arena_lo=%#llx\n",
+            (int)getpid(), g_dimgs_n, (unsigned long long)ocerz_arena_lo);
+    for (int i = 0; i < g_dimgs_n; i++) {
+        DynImage *im = &g_dimgs[i];
+        uint64_t lo = im->load_base, hi = lo;
+        for (int s = 0; s < im->seg_count; s++) {
+            uint64_t v = im->seg_vmaddr[s] + im->slide;
+            if (v > hi) hi = v;
+        }
+        fprintf(stderr, "ocerz:   img[%d] base=%#llx slide=%#llx segs=%d hi~=%#llx %s\n",
+                i, (unsigned long long)lo, (unsigned long long)im->slide,
+                im->seg_count, (unsigned long long)hi,
+                im->install_name[0] ? im->install_name : im->path);
+    }
+}
+
+const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out)
+{
+    DynImage *best = NULL;
+    for (int i = 0; i < g_dimgs_n; i++) {
+        if (g_dimgs[i].load_base <= addr &&
+            (!best || g_dimgs[i].load_base > best->load_base))
+            best = &g_dimgs[i];
+    }
+    if (!best) return NULL;
+    if (base_out) *base_out = best->load_base;
+    return best->install_name[0] ? best->install_name : best->path;
 }
 
 static int map_segments(DynImage *img, int is_main)
@@ -1299,6 +1331,50 @@ static void ocerz_tlv_register_closure(OcerzVM *vm, OcerzCache *cache, uint64_t 
             ocerz_tlv_register_image(vm, cache, g_dimgs[i].load_base, stack_top);
 }
 
+static const char *image_id_name(uint64_t mh)
+{
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+    if (rd32(h) != MH_MAGIC_64)
+        return NULL;
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (rd32(lc) == LC_ID_DYLIB) {
+            uint32_t noff = rd32(lc + 8);
+            if (noff < rd32(lc + 4))
+                return (const char *)(lc + noff);
+        }
+        lc += rd32(lc + 4);
+    }
+    return NULL;
+}
+
+/* A cache framework dlopen'd post-boot must run its initializers (real dyld
+ * does), but ocerz cannot run the WindowServer/display stack's initializers
+ * (SkyLight et al. assert a libdispatch main-queue context the emulator does not
+ * establish), and running the whole soft-linked GUI closure is both slow and
+ * destabilising. The objc-runtime/Foundation CORE is the part the alloc fix
+ * actually needs (a Foundation initializer sets the NSString class global that
+ * +[NSString allocWithZone:] reads) and the part ocerz runs reliably. So on the
+ * DLOPEN path (g_init_dlopen_restricted) we run only that core; once Foundation
+ * has initialized (by any path -- run_image_inits sets g_foundation_inited, so a
+ * boot-linked Foundation as in a plain Cocoa program counts), the dlopen path
+ * stops driving initializers entirely. The boot closure is never restricted. */
+static int g_init_dlopen_restricted;
+static int g_foundation_inited;
+static int image_is_objc_core(uint64_t mh)
+{
+    const char *id = image_id_name(mh);
+    return id && (strstr(id, "/Foundation.framework/") ||
+                  strstr(id, "/CoreFoundation.framework/") ||
+                  strstr(id, "/libobjc.A.dylib"));
+}
+static int image_is_foundation(uint64_t mh)
+{
+    const char *id = image_id_name(mh);
+    return id && strstr(id, "/Foundation.framework/") != NULL;
+}
+
 static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64_t stack_top)
 {
     const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
@@ -1362,12 +1438,18 @@ static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64
         }
         lc += rd32(lc + 4);
     }
+    if (image_is_foundation(mh)) {
+        if (!g_foundation_inited && getenv("OCERZ_INITTRACE"))
+            fprintf(stderr, "ocerz: FOUNDATION-INITED mh=%#llx\n", (unsigned long long)mh);
+        g_foundation_inited = 1;
+    }
 }
 
 #define INIT_VISITED_MAX 8192
 static uint64_t g_init_visited[INIT_VISITED_MAX];
 static uint32_t g_init_gen[INIT_VISITED_MAX];
 static uint8_t g_init_done[INIT_VISITED_MAX];
+static uint8_t g_load_done[INIT_VISITED_MAX];
 static uint8_t g_init_being[INIT_VISITED_MAX];
 static int g_init_visited_n;
 static uint32_t g_init_cur_gen;
@@ -1492,6 +1574,7 @@ static int init_addr_cmp(const void *a, const void *b)
  * so it is skipped. The collect list is on the stack so a nested dlopen from an
  * initializer (which re-enters init_closure) gets its own buffer. */
 #define INIT_CLOSURE_CAP 4096
+/* The install name (LC_ID_DYLIB) of an image, or NULL. */
 static void init_closure(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
                          const uint64_t *ia, uint64_t stack_top)
 {
@@ -1518,9 +1601,17 @@ static void init_closure(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
         int idx = init_mark(m);
         if (idx < 0 || g_init_done[idx])
             continue;
+        if (g_init_dlopen_restricted && !image_is_objc_core(m)) {
+            if (getenv("OCERZ_INITTRACE"))
+                fprintf(stderr, "INITCLOSURE skip-restricted mh=%#llx\n", (unsigned long long)m);
+            continue;
+        }
         if (getenv("OCERZ_INITTRACE"))
             fprintf(stderr, "INITCLOSURE run mh=%#llx\n", (unsigned long long)m);
+        int prev_tol = ocerz_init_tolerant;
+        ocerz_init_tolerant = 1;
         run_image_inits(vm, m, ia, stack_top);
+        ocerz_init_tolerant = prev_tol;
         g_init_done[idx] = 1;
     }
     g_init_collect_depth--;
@@ -1601,7 +1692,7 @@ static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t
     if (rd32(h) != MH_MAGIC_64)
         return;
     int idx = init_mark(mh);
-    if (idx >= 0 && g_init_gen[idx] == g_init_cur_gen)
+    if (idx >= 0 && (g_load_done[idx] || g_init_gen[idx] == g_init_cur_gen))
         return;
     if (idx >= 0)
         g_init_gen[idx] = g_init_cur_gen;
@@ -1621,8 +1712,11 @@ static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t
     }
     if (vm->exited)
         return;
-    if (mh != skip_mh && (g_eager_n == 0 || eager_has(mh)))
+    if (mh != skip_mh && (g_init_force || g_eager_n == 0 || eager_has(mh))) {
         ocerz_dyldapi_run_image_loads(vm, mh, stack_top);
+        if (idx >= 0)
+            g_load_done[idx] = 1;
+    }
 }
 
 #define RPATH_MAX 64
@@ -1734,6 +1828,53 @@ static int expand_install_name(DynImage *loader, const char *name,
 static void load_disk_deps(OcerzCache *cache, DynImage *loader, const RpathList *rpaths);
 static int canon_dylib_path(const char *path, char *out, size_t outsz);
 
+/* Canonicalize this arena dylib's objc selector references to the shared cache's
+ * canonical selector pointers. After apply_fixups each __objc_selrefs entry points
+ * at the image's own __objc_methname string. Modern objc, on a shared-cache
+ * launch, trusts dyld to have uniqued every selector reference and runs no
+ * per-image selref fixup (it only does so for images NOT optimized by dyld, which
+ * it assumes are all in the cache), so a cache selector left as the image-local
+ * string is a DISTINCT pointer from the cache canonical and fails objc_msgSend's
+ * pointer-identity method match -- e.g. winemac.drv's macdrv_start_cocoa_app
+ * sending +[NSThread detachNewThreadSelector:toTarget:withObject:] aborts with
+ * "selector ... does not match selector known to Objective C runtime". Rewriting
+ * each known selref to the cache canonical is exactly what dyld's objc selector
+ * optimizer does for disk images. A name the cache lacks (a selector private to
+ * this image) is left as its local string, itself a stable unique pointer. Needs
+ * the cache objc selopt (parsed at boot objc registration); selrefs in a dylib
+ * mapped before that are skipped -- such early dylibs are cache images anyway. */
+static void canonicalize_objc_selrefs(DynImage *img)
+{
+    int64_t slide = img->slide;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(img->load_base);
+    if (rd32(h) != MH_MAGIC_64)
+        return;
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t n = 0; n < ncmds; n++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *s = (const void *)lc;
+            const struct section_64 *sc = (const void *)(s + 1);
+            for (uint32_t j = 0; j < s->nsects; j++) {
+                if (strncmp(sc[j].sectname, "__objc_selrefs", 16) != 0)
+                    continue;
+                uint64_t a = sc[j].addr + slide, e = a + sc[j].size;
+                for (uint64_t pp = a; pp + 8 <= e; pp += 8) {
+                    uint64_t name = rd64((const uint8_t *)ocerz_g2h(pp));
+                    if (!name)
+                        continue;
+                    uint64_t canon =
+                        ocerz_dyldapi_canonical_selector((const char *)ocerz_g2h(name));
+                    if (canon && canon != name)
+                        wr64((uint8_t *)ocerz_g2h(pp), canon);
+                }
+            }
+        }
+        lc += l->cmdsize;
+    }
+}
+
 static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, DynImage *loader,
                                  const RpathList *rpaths)
 {
@@ -1803,6 +1944,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         apply_classic_fixups(d, cache);
 
     ocerz_dyldapi_register_image(d->load_base, d->path);
+    canonicalize_objc_selrefs(d);
     if (getenv("OCERZ_DLPATH"))
         fprintf(stderr, "ocerz: DLPATH disk-dep load_base=%#llx install=%s path=%s\n",
                 (unsigned long long)d->load_base, d->install_name, resolved);
@@ -1832,6 +1974,8 @@ static void dlerror_set(const char *fmt, const char *arg)
 {
     char host[1280];
     snprintf(host, sizeof host, fmt, arg ? arg : "");
+    if (getenv("OCERZ_DLPATH"))
+        fprintf(stderr, "ocerz: DLERR %s\n", host);
     uint64_t need = (uint64_t)strlen(host) + 1;
     if (g_dlerror_g == 0)
         g_dlerror_g = ocerz_map_anywhere(2048, PROT_READ | PROT_WRITE);
@@ -1888,6 +2032,7 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     if (d->cf_off == 0)
         apply_classic_fixups(d, cache);
     ocerz_dyldapi_register_image(d->load_base, d->path);
+    canonicalize_objc_selrefs(d);
     if (getenv("OCERZ_DLPATH"))
         fprintf(stderr, "ocerz: DLPATH dlopen load_base=%#llx install=%s path=%s\n",
                 (unsigned long long)d->load_base, d->install_name, install_path);
@@ -1953,20 +2098,100 @@ static pthread_mutex_t g_load_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
  * notify here: drive objc map_images for the cache image (idempotent; only
  * fires for an image not already mapped at boot) before handing the header
  * back, so a soft-linked framework's classes resolve via NSClassFromString. */
+/* A dlopen resolving to a shared-cache dylib must, like real dyld, RUN that
+ * image's initializers (and its not-yet-initialized dependency closure) before
+ * returning -- not only register its objc classes. A cache framework pulled in
+ * post-boot (Foundation/CoreFoundation/AppKit, dlopen'd when winemac.drv brings
+ * up Cocoa) is NOT in the main executable's boot closure, so its mod_init_funcs
+ * never ran at startup; skipping them here leaves Foundation half-initialized.
+ * Concretely, +[NSString allocWithZone:] returns the __NSPlaceholderString
+ * singleton only when (self == a Foundation global that a Foundation initializer
+ * sets to [NSString class]); with that initializer skipped the global stays 0,
+ * so +alloc falls through to the default and yields a plain NSString instance,
+ * which then does-not-recognize initWithBytes:length:encoding: -- the Cocoa-
+ * thread abort that fails winemac.drv. init_is_done() keeps each image's
+ * initializers running exactly once (no double-init with the boot closure). */
 static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
 {
     if (g_dlerror_g)
         ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
     if (g_run_init_ready && g_run_vm && !vm->exited) {
+        uint64_t istk = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
+        uint64_t sp = istk ? istk + DYN_STACK_SIZE - 64 : 0;
         ocerz_dyldapi_objc_map_one(g_run_vm, cmh);
-        if (!init_is_done(cmh) && !vm->exited && getenv("OCERZ_CACHEINIT")) {
-            uint64_t istk = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
-            if (istk)
-                init_closure(g_run_vm, g_run_cache, cmh, g_run_init_args,
-                             istk + DYN_STACK_SIZE - 64);
+        /* dyld brings up a dlopen'd image in three steps -- map (objc register),
+         * then +load, then C/C++ initializers. ocerz only ran the +load phase at
+         * boot for the main executable's closure; a framework pulled in later
+         * (Foundation/AppKit when winemac.drv brings up Cocoa) never had its
+         * +load methods run, so Foundation's +load (__NSInitializeProcess, which
+         * caches the NSString class into the global that gates +[NSString
+         * allocWithZone:] returning __NSPlaceholderString) never ran and the
+         * global stayed 0 -- the alloc cascade that aborts the Cocoa thread.
+         * Run the +load phase here for the newly-loaded sub-closure (g_load_done
+         * keeps each image's +load running exactly once, so already-loaded boot
+         * images are skipped; g_init_force bypasses the boot eager filter). */
+        if (sp && !vm->exited) {
+            g_init_cur_gen++;
+            int pf = g_init_force;
+            g_init_force = 1;
+            run_load_phase(g_run_vm, g_run_cache, cmh, sp, 0);
+            g_init_force = pf;
+        }
+        if (sp && !g_foundation_inited && !init_is_done(cmh) && !vm->exited) {
+            int prev = g_init_dlopen_restricted;
+            g_init_dlopen_restricted = 1;
+            init_closure(g_run_vm, g_run_cache, cmh, g_run_init_args, sp);
+            g_init_dlopen_restricted = prev;
         }
     }
     return cmh;
+}
+
+/* Try "<dir>/<name>" for each colon-separated dir in `list`; first that exists wins. */
+static int try_soname_in_pathlist(const char *list, const char *name, char *out, size_t n)
+{
+    if (!list || !list[0])
+        return 0;
+    for (const char *p = list; *p;) {
+        const char *colon = strchr(p, ':');
+        size_t len = colon ? (size_t)(colon - p) : strlen(p);
+        if (len > 0 && len < 900) {
+            char cand[1024];
+            snprintf(cand, sizeof cand, "%.*s/%s", (int)len, p, name);
+            if (access(cand, F_OK) == 0) {
+                snprintf(out, n, "%s", cand);
+                return 1;
+            }
+        }
+        p += len;
+        if (*p == ':')
+            p++;
+    }
+    return 0;
+}
+
+/* Resolve a BARE dlopen soname (no slash, no @prefix) the way the macOS dynamic
+ * linker does: search DYLD_LIBRARY_PATH, then DYLD_FALLBACK_LIBRARY_PATH (or its
+ * default $HOME/lib:/usr/local/lib:/usr/lib). ocerz's loader otherwise passes a
+ * bare name through verbatim, so Wine's runtime dlopen("libfreetype.6.dylib") /
+ * dlopen("libMoltenVK.dylib") never finds the homebrew x86_64 lib under
+ * /usr/local/lib -- "Wine cannot find the FreeType font library". */
+static int resolve_bare_soname(const char *name, char *out, size_t n)
+{
+    if (!name || strchr(name, '/') || name[0] == '@')
+        return 0;
+    if (try_soname_in_pathlist(getenv("DYLD_LIBRARY_PATH"), name, out, n))
+        return 1;
+    const char *fb = getenv("DYLD_FALLBACK_LIBRARY_PATH");
+    if (fb && fb[0])
+        return try_soname_in_pathlist(fb, name, out, n);
+    const char *home = getenv("HOME");
+    char def[1024];
+    if (home && home[0])
+        snprintf(def, sizeof def, "%s/lib:/usr/local/lib:/usr/lib", home);
+    else
+        snprintf(def, sizeof def, "/usr/local/lib:/usr/lib");
+    return try_soname_in_pathlist(def, name, out, n);
 }
 
 static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int mode)
@@ -2004,6 +2229,23 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
             return cache_dlopen_hit(vm, cmh);
         loadpath = canon;
     }
+    /* A bare soname that did not resolve to an existing path above: search the
+     * macOS dylib fallback paths (DYLD_FALLBACK_LIBRARY_PATH / /usr/local/lib) so
+     * Wine's runtime dlopen of libfreetype/libMoltenVK finds the homebrew lib. */
+    char sopath[PATH_MAX];
+    if (!strchr(loadpath, '/') && loadpath[0] != '@' && access(loadpath, F_OK) != 0 &&
+        resolve_bare_soname(loadpath, sopath, sizeof sopath)) {
+        already = dimg_find_by_path(sopath);
+        if (already) {
+            if (g_dlerror_g)
+                ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+            return already->load_base;
+        }
+        cmh = dep_find(g_run_cache, sopath);
+        if (cmh)
+            return cache_dlopen_hit(vm, cmh);
+        loadpath = sopath;
+    }
     if (mode & 0x10) {
         dlerror_set("dlopen(%s): not already loaded (RTLD_NOLOAD)", hostpath);
         return 0;
@@ -2018,6 +2260,31 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
             uint64_t itop = istk + DYN_STACK_SIZE - 64;
             for (int i = g_dimgs_n - 1; i >= before; i--) {
                 ocerz_tlv_register_image(g_run_vm, g_run_cache, g_dimgs[i].load_base, itop);
+                if (vm->exited)
+                    break;
+            }
+            /* Register the new disk images' objc classes with the guest runtime
+             * before their initializers run, exactly as dyld notifies objc on
+             * load. The cache-dlopen path does this via cache_dlopen_hit; a disk
+             * dylib (e.g. winemac.drv) otherwise has its own classes left
+             * unregistered, so objc reports "Attempt to use unknown class" the
+             * moment guest code instantiates a winemac-defined class (a WineApp/
+             * window subclass of a cache class). Deps-first (reverse) so a
+             * subclass's superclass image maps first; objc_map_one is idempotent
+             * and skips images with no __objc_imageinfo. */
+            for (int i = g_dimgs_n - 1; i >= before; i--) {
+                /* Skip objc registration for GPU/hardware driver extensions
+                 * (e.g. AGXMetalG14X.bundle): ocerz cannot run their display
+                 * path, and registering their classes/categories makes the live
+                 * objc runtime route Metal/CoreAnimation through them and then
+                 * fault in libdispatch (a wrong-queue assertion) at window draw
+                 * -- breaking a plain Cocoa window where leaving the driver objc
+                 * unregistered lets AppKit fall back. Wine's own dylibs
+                 * (winemac.drv etc.) are never under /Extensions/, so they still
+                 * register and their classes resolve. */
+                if (strstr(g_dimgs[i].path, "/System/Library/Extensions/"))
+                    continue;
+                ocerz_dyldapi_objc_map_one(g_run_vm, g_dimgs[i].load_base);
                 if (vm->exited)
                     break;
             }

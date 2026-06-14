@@ -127,6 +127,7 @@
 #include "ocerz/jit.h"
 #include "ocerz/sys_raw.h"
 #include "ocerz/interp.h"
+#include "ocerz/dyld.h"
 
 #include <sys/mman.h>
 #include <sys/sysctl.h>
@@ -441,6 +442,7 @@ static int sys_workq_stub(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 #define OCERZ_KEVENT_QOS_S 0x40
 
 static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]);
+static void ocerz_hostwq_register(OcerzVM *vm);
 
 #define OCERZ_THREAD_START 0x7ff802e6f820ull
 
@@ -522,6 +524,10 @@ static int ocerz_next_cpu_number(void)
 static void *ocerz_worker_entry(void *p)
 {
     struct ocerz_worker *w = (struct ocerz_worker *)p;
+    /* Park until the main thread finishes loader-init (preloader release), so a
+     * worker never commits its 32-bit stack / returns to PE before that -- the
+     * thread-init sequencing real macOS+Wine has. See ocerz_init_gate_*. */
+    ocerz_init_gate_wait();
     mach_port_t kp = mach_thread_self();
     w->cpu.gpr[OCERZ_RSI] = kp;
     ocerz_st(w->cpu.gpr[OCERZ_RDI] + 0xf8, 4, (uint64_t)(uint32_t)kp);
@@ -571,6 +577,11 @@ static void ocerz_fork_child(void)
     ocerz_mem_postfork();
     ocerz_jit_postfork();
     __atomic_store_n(&g_wq_running, 0, __ATOMIC_SEQ_CST);
+    /* A forked child inherits the parent's already-set-up address space, so its
+     * workers must not park on the init gate. A child that goes on to execve a new
+     * Wine process re-runs ocerz_mem_init -> ocerz_init_gate_arm and re-arms after
+     * this, so re-exec'd Wine children still gate correctly. */
+    ocerz_init_gate_release();
 }
 
 static int sys_fork(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
@@ -772,6 +783,21 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         return OCERZ_STEP_OK;
     }
     if (op == 0x20) {
+        /* Under HOSTWQ_ASYNC, hand root-queue worker requests to the REAL kernel
+         * (which then drives ocerz_hostwq_queue_cb) instead of spawning a
+         * synthetic worker, so all worker management -- workloop (kevent_id),
+         * event (kevent), and async (here) -- goes through one kernel-owned pool
+         * with correct QoS/lifecycle, the same as a native process. */
+        if (getenv("OCERZ_HOSTWQ") && getenv("OCERZ_HOSTWQ_ASYNC")) {
+            ocerz_hostwq_register(vm);
+            uint64_t fa[8];
+            memcpy(fa, a, sizeof fa);
+            uint64_t r2 = 0;
+            int err = 0;
+            ocerz_host_syscall(368, fa, &r2, &err);
+            ret_ok(cpu, 0);
+            return OCERZ_STEP_OK;
+        }
         int reqcount = (int)a[2];
         if (reqcount < 1)
             reqcount = 1;
@@ -950,6 +976,75 @@ static OcerzVM *g_hostwq_vm;
  * ownership and park-and-reuse are the real kernel's job, not ours. */
 static __thread uint64_t g_hostwq_tl_region;
 
+/* Bridge ONE kernel-delivered Mach message into guest memory (UPDATE #23, Bug A).
+ * An EVFILT_MACHPORT receive event the host kernel hands a host workqueue worker carries
+ * ext0 = a message buffer the kernel allocated IN OCERZ'S HOST address space; guest
+ * libdispatch reads ext0 as a GUEST address -> unmapped -> SIGSEGV (-> the gs:0x320 fatal
+ * loop, since Wine's segv_handler can't run on a no-TEB worker). The macOS kernel would
+ * have placed the message in the process's own AS; ocerz must do the same. Copy the message
+ * into a fresh guest mapping and return its guest address. ocerz + host share one Mach port
+ * namespace, so port NAMES inside need no translation; but a COMPLEX message's OOL / OOL-ports
+ * descriptors point at OOL data the kernel placed in the HOST AS -- relocate each into guest
+ * memory and patch the descriptor so the guest can read it. The guest later
+ * vm_deallocate()s the copy (verified: gbuf addresses recycle), exactly as on real macOS. */
+static uint64_t ocerz_bridge_mach_msg(uint64_t hbuf, uint64_t sz)
+{
+    if (!hbuf || !sz || sz > 0x100000)
+        return 0;
+    uint64_t gbuf = ocerz_map_anywhere((sz + 0x3fffull) & ~0x3fffull, PROT_READ | PROT_WRITE);
+    if (!gbuf)
+        return 0;
+    unsigned char *g = (unsigned char *)ocerz_g2h(gbuf);
+    memcpy(g, (const void *)(uintptr_t)hbuf, (size_t)sz);
+    uint32_t bits;
+    memcpy(&bits, g, 4);
+    if (bits & 0x80000000u) { /* MACH_MSGH_BITS_COMPLEX */
+        uint32_t dcnt;
+        memcpy(&dcnt, g + 0x18, 4);
+        uint64_t off = 0x1c;
+        for (uint32_t d = 0; d < dcnt && off + 12 <= sz; d++) {
+            uint8_t type = g[off + 11];
+            if (type == 0) { off += 12; continue; }      /* PORT: name only (shared namespace) */
+            if (type == 4) { off += 16; continue; }      /* GUARDED_PORT: name+guard, no OOL data */
+            if (type == 1 || type == 2 || type == 3) {   /* OOL / OOL_PORTS / OOL_VOLATILE */
+                if (off + 16 > sz)
+                    break;
+                uint64_t ool_addr;
+                uint32_t ool_n;
+                memcpy(&ool_addr, g + off, 8);
+                memcpy(&ool_n, g + off + 12, 4);
+                /* type 2 = OOL_PORTS: the +12 field is a COUNT of port names (4 bytes each). */
+                uint64_t bytes = (type == 2) ? (uint64_t)ool_n * 4u : ool_n;
+                if (ool_addr && bytes && bytes <= 0x1000000) {
+                    uint64_t ogb = ocerz_map_anywhere((bytes + 0x3fffull) & ~0x3fffull,
+                                                      PROT_READ | PROT_WRITE);
+                    if (ogb) {
+                        memcpy(ocerz_g2h(ogb), (const void *)(uintptr_t)ool_addr, (size_t)bytes);
+                        memcpy(g + off, &ogb, 8); /* patch descriptor addr -> guest copy */
+                    } else {
+                        /* reloc alloc failed: deliver an EMPTY OOL (addr=0,size=0) rather than
+                         * leave a host pointer the guest would fault on. */
+                        uint64_t z = 0;
+                        uint32_t z4 = 0;
+                        memcpy(g + off, &z, 8);
+                        memcpy(g + off + 12, &z4, 4);
+                    }
+                }
+                off += 16;
+                continue;
+            }
+            break; /* type > 4: unknown stride, cannot safely continue */
+        }
+    }
+    /* FOLLOW-UP (deferred per adversarial review): the kernel's host message buffer (hbuf) and
+     * any host OOL backings are NOT vm_deallocate'd here -> a slow host-AS leak (~msg-size per
+     * received Mach message). Freeing them (memory only, never mach_msg_destroy -- port names
+     * persist in the shared namespace and the guest copy references them) is the correct
+     * ownership, but is held back until it can be validated at the deep dispatch phase without
+     * destabilizing the verified-working bridge. */
+    return gbuf;
+}
+
 static void ocerz_hostwq_bridge(uint64_t extra_r8, const void *hev, int nev)
 {
     OcerzVM *vm = g_hostwq_vm;
@@ -974,6 +1069,41 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, const void *hev, int nev)
     for (int i = 0; i < nev; i++)
         memcpy(ocerz_g2h(evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S),
                (const char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S, OCERZ_KEVENT_QOS_S);
+    if (getenv("OCERZ_WSIG"))
+        for (int i = 0; i < nev; i++) {
+            const unsigned char *e = (const unsigned char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S;
+            uint64_t ident, udata, data, ext0, ext1; int16_t filt; uint16_t fl;
+            memcpy(&ident, e + 0x00, 8); memcpy(&filt, e + 0x08, 2);
+            memcpy(&fl, e + 0x0a, 2); memcpy(&udata, e + 0x10, 8);
+            memcpy(&data, e + 0x20, 8); memcpy(&ext0, e + 0x28, 8); memcpy(&ext1, e + 0x30, 8);
+            fprintf(stderr,
+                    "ocerz: HOSTWQ-EV[%d] filt=%d flags=%#x ident=%#llx udata=%#llx data=%#llx ext0=%#llx ext1=%#llx\n",
+                    i, filt, fl, (unsigned long long)ident, (unsigned long long)udata,
+                    (unsigned long long)data, (unsigned long long)ext0, (unsigned long long)ext1);
+        }
+    /* MACH-MESSAGE BRIDGE (Bug A, UPDATE #23, default-on -- set OCERZ_NO_MACHBRIDGE to A/B):
+     * an EVFILT_MACHPORT event carries ext0 = a host-allocated Mach message buffer the guest
+     * cannot read; copy it (and any OOL descriptor data) into guest memory and rewrite ext0,
+     * exactly as the macOS kernel would have delivered it in-process. Without this, the worker
+     * faults on the unmapped buffer and (being a no-Wine-TEB thread) loops in segv_handler ->
+     * the gs:0x320 fatal crash. */
+    if (!getenv("OCERZ_NO_MACHBRIDGE"))
+        for (int i = 0; i < nev; i++) {
+            uint64_t dst = evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S;
+            if ((int16_t)ocerz_ld(dst + 0x08, 2) != -8) continue; /* EVFILT_MACHPORT */
+            uint64_t hbuf = ocerz_ld(dst + 0x28, 8);              /* ext0 = host kernel buf */
+            uint64_t sz = ocerz_ld(dst + 0x30, 8);               /* ext1 = buffer size */
+            uint64_t gbuf = ocerz_bridge_mach_msg(hbuf, sz);
+            if (gbuf)
+                ocerz_st(dst + 0x28, 8, gbuf);                    /* ext0 -> guest copy */
+            else if (hbuf)
+                ocerz_st(dst + 0x28, 8, 0);                       /* bridge failed: never leave a host ptr */
+            if (gbuf && getenv("OCERZ_WSIG"))
+                fprintf(stderr, "ocerz: MACHBRIDGE ev[%d] hbuf=%#llx sz=%#llx -> gbuf=%#llx%s\n",
+                        i, (unsigned long long)hbuf, (unsigned long long)sz,
+                        (unsigned long long)gbuf,
+                        (*(volatile uint32_t *)(uintptr_t)hbuf & 0x80000000u) ? " COMPLEX" : "");
+        }
     mach_port_t kp = mach_thread_self();
     ocerz_st(pth, 8, pth ^ cookie);
     ocerz_st(pth + 0xe0, 8, pth);
@@ -993,13 +1123,67 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, const void *hev, int nev)
     t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | extra_r8 | 4u;
     t.gpr[OCERZ_R9] = (uint64_t)nev;
     t.gs_base = pth + 0xe0;
+    if (getenv("OCERZ_GSTRACE"))
+        fprintf(stderr, "ocerz: HOSTWQ worker enter region=%#llx pth=%#llx gs=%#llx rsp=%#llx nev=%d\n",
+                (unsigned long long)region, (unsigned long long)pth,
+                (unsigned long long)t.gs_base, (unsigned long long)t.gpr[OCERZ_RSP], nev);
+    ocerz_init_gate_wait();
     ocerz_vm_run_cpu(vm, &t);
     mach_port_deallocate(mach_task_self(), kp);
 }
 
+/* The kernel's ASYNC (non-event) workqueue callback: it brings a worker up to
+ * drain a root/global dispatch queue (a plain dispatch_async, or a dispatch
+ * source whose handler targets a global queue rather than the main queue). The
+ * historical stub did nothing, so under HOSTWQ those root-queue handlers never
+ * ran -- a readable EVFILT_READ source whose handler lives on a global queue
+ * (Cocoa brings up several) stayed un-drained and re-fired forever. Bridge it
+ * exactly like the kevent path but with NO events: set up one guest worker
+ * region per host workqueue thread and enter the guest's start_wqthread as an
+ * async (NEWSPI, QoS-tagged, non-workloop) worker; _pthread_wqthread ->
+ * _dispatch_worker_thread2 then drains the matching QoS root-queue bucket. */
 static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
 {
-    (void)pri;
+    OcerzVM *vm = g_hostwq_vm;
+    if (!vm)
+        return;
+    uint64_t cookie = ocerz_ld(OCERZ_PTHREAD_COOKIE, 8);
+    uint64_t region = g_hostwq_tl_region;
+    if (region == 0) {
+        region = ocerz_map_anywhere(0x200000, PROT_READ | PROT_WRITE);
+        if (region == 0)
+            return;
+        g_hostwq_tl_region = region;
+    }
+    uint64_t pth = region + 0x1f0000;
+    mach_port_t kp = mach_thread_self();
+    ocerz_st(pth, 8, pth ^ cookie);
+    ocerz_st(pth + 0xe0, 8, pth);
+    ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)kp);
+    uint32_t qosbits = (uint32_t)(((uint64_t)pri >> 8) & 0x3fff);
+    int qos_idx = qosbits ? (__builtin_ctz(qosbits) + 1) : 4;
+    if (qos_idx < 1)
+        qos_idx = 1;
+    if (qos_idx > 6)
+        qos_idx = 6;
+    OcerzCPU t;
+    memset(&t, 0, sizeof t);
+    t.vm = vm;
+    t.mxcsr = 0x1f80;
+    t.fcw = 0x037f;
+    t.cpu_number = ocerz_next_cpu_number();
+    t.rip = OCERZ_START_WQTHREAD;
+    t.gpr[OCERZ_RSP] = pth - 0x100;
+    t.gpr[OCERZ_RDI] = pth;
+    t.gpr[OCERZ_RSI] = kp;
+    t.gpr[OCERZ_RDX] = pth;
+    t.gpr[OCERZ_RCX] = 0;
+    t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | (uint64_t)qos_idx;
+    t.gpr[OCERZ_R9] = 0;
+    t.gs_base = pth + 0xe0;
+    ocerz_init_gate_wait();
+    ocerz_vm_run_cpu(vm, &t);
+    mach_port_deallocate(mach_task_self(), kp);
 }
 
 static void ocerz_hostwq_kevent_cb(void **events, int *nevents)
@@ -1054,6 +1238,23 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         memcpy(fa, a, sizeof fa);
         fa[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
         fa[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
+        if (getenv("OCERZ_WSIG") && a[1] && (int)a[2] > 0) {
+            int nc = (int)a[2]; if (nc > 8) nc = 8;
+            for (int i = 0; i < nc; i++) {
+                uint64_t k = a[1] + (uint64_t)i * OCERZ_KEVENT_QOS_S;
+                int16_t filt = (int16_t)ocerz_ld(k + 0x08, 2);
+                if (filt != -8) continue; /* EVFILT_MACHPORT only */
+                fprintf(stderr,
+                        "ocerz: KEVREG[%d] filt=%d flags=%#llx fflags=%#llx ident=%#llx udata=%#llx ext0=%#llx ext1=%#llx (ext0 g=%d)\n",
+                        i, filt, (unsigned long long)ocerz_ld(k + 0x0a, 2),
+                        (unsigned long long)ocerz_ld(k + 0x18, 4),
+                        (unsigned long long)ocerz_ld(k + 0x00, 8),
+                        (unsigned long long)ocerz_ld(k + 0x10, 8),
+                        (unsigned long long)ocerz_ld(k + 0x28, 8),
+                        (unsigned long long)ocerz_ld(k + 0x30, 8),
+                        ocerz_addr_committed(ocerz_ld(k + 0x28, 8)));
+            }
+        }
         if (fa[1]) fa[1] = (uint64_t)(uintptr_t)ocerz_g2h(fa[1]);
         if (fa[3]) fa[3] = (uint64_t)(uintptr_t)ocerz_g2h(fa[3]);
         if (fa[5]) fa[5] = (uint64_t)(uintptr_t)ocerz_g2h(fa[5]);
@@ -1061,6 +1262,26 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         uint64_t ret2 = 0;
         int err = 0;
         uint64_t r = ocerz_host_syscall(375, fa, &ret2, &err);
+        /* SYNCHRONOUS receive: a worker draining its workloop calls kevent_id with
+         * nevents>0, and the kernel returns EVFILT_MACHPORT events whose ext0 is a
+         * host-allocated message buffer the guest cannot read -- the same gs:0x320 fault
+         * as the callback path. Bridge each MACHPORT event in the returned eventlist
+         * (a[3], the guest buffer the kernel just filled). */
+        if (!err && (int64_t)r > 0 && a[3]) {
+            int got = (int)r;
+            if (got > 64) got = 64;
+            for (int i = 0; i < got; i++) {
+                uint64_t ev = a[3] + (uint64_t)i * OCERZ_KEVENT_QOS_S;
+                if ((int16_t)ocerz_ld(ev + 0x08, 2) != -8) continue; /* EVFILT_MACHPORT */
+                uint64_t hb = ocerz_ld(ev + 0x28, 8);
+                uint64_t s = ocerz_ld(ev + 0x30, 8);
+                uint64_t gb = ocerz_bridge_mach_msg(hb, s);
+                if (gb)
+                    ocerz_st(ev + 0x28, 8, gb);
+                else if (hb)
+                    ocerz_st(ev + 0x28, 8, 0);
+            }
+        }
         if (err)
             ret_err(cpu, r);
         else
@@ -1196,18 +1417,33 @@ static int sys_sigaction(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t signo = a[1];
-    if (signo > 0 && signo < OCERZ_NSIG) {
-        uint64_t h = guest_sigact[signo].handler;
-        if (h > 1) {
-            OcerzCPU saved = *cpu;
-            uint64_t args[1] = { signo };
-            ocerz_vm_call(vm, h, args, 1, saved.gpr[OCERZ_RSP]);
-            if (vm->exited)
-                return OCERZ_STEP_OK;
-            *cpu = saved;
-        }
+    /* Decisive wall-2 probe: log every __pthread_kill(target_port, signo). The
+     * wineserver kicks a CLIENT thread (in another process) into re-selecting for a
+     * system-APC / context capture via __pthread_kill(client_thread_port, SIGUSR1);
+     * ocerz currently ignores a[0] and runs the handler same-thread, dropping the
+     * cross-thread kick. If this fires from the wineserver with signo=30 (SIGUSR1)
+     * during the hang, that dropped signal is the deadlock. */
+    if (getenv("OCERZ_PTKILL")) {
+        uint64_t selfport = ocerz_host_mach_trap(27, a); /* mach_thread_self */
+        fprintf(stderr, "ocerz: PTKILL[%d] target=%#llx signo=%llu self=%#llx cross=%d handler=%#llx\n",
+                (int)getpid(), (unsigned long long)a[0], (unsigned long long)signo,
+                (unsigned long long)selfport, (a[0] && a[0] != selfport) ? 1 : 0,
+                (unsigned long long)(signo < OCERZ_NSIG ? guest_sigact[signo].handler : 0));
     }
-    ret_ok(cpu, 0);
+    (void)vm; (void)signo;
+    /* Faithful __pthread_kill: forward to the host kernel so it delivers signo to the
+     * THREAD named by a[0] -- including cross-process (the wineserver kicking a client
+     * thread via a port from mach_port_extract_right, server/mach.c:377). The target's
+     * blocking forwarded host syscall (read(wait_fd)/kevent) returns EINTR and its
+     * async_sig_handler records the signo; the guest handler then runs at that thread's
+     * syscall-return boundary (ocerz_handle_syscall). This replaces the old same-thread
+     * synthesis that DROPPED every cross-thread kick -> the wineboot service deadlock. */
+    int err = 0;
+    uint64_t r = ocerz_host_syscall(328, a, NULL, &err);
+    if (err)
+        ret_err(cpu, r);
+    else
+        ret_ok(cpu, r);
     return OCERZ_STEP_OK;
 }
 
@@ -1273,6 +1509,11 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 #define OCERZ_UCTX_SIZE 768u
 #define OCERZ_SIGINFO_SIZE 104u
 
+/* OCERZ_WSIG diagnostic: which path delivers a guest signal to a NO-TEB worker
+ * (sig_altstack_sp==0 && gs is not a Wine TEB). Set by the 3 callers; read+cleared
+ * in ocerz_signal_deliver so the vm.c fault caller (which never sets it) reads 0. */
+__thread int g_ocerz_deliver_src; /* 0=fault/other, 1=async(#21), 2=class0 SIGSYS */
+
 int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_code,
                          uint32_t err)
 {
@@ -1281,6 +1522,18 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     GuestSigact *sa = &guest_sigact[sig];
     if (sa->handler <= 1 || sa->tramp == 0)
         return 0;
+    {
+        int src = g_ocerz_deliver_src;
+        g_ocerz_deliver_src = 0;
+        if (getenv("OCERZ_WSIG") && cpu->sig_altstack_sp == 0 &&
+            !ocerz_gs_is_teb_band(cpu->gs_base))
+            fprintf(stderr,
+                    "ocerz: WSIG sig=%d src=%d faddr=%#llx code=%d gs=%#llx rsp=%#llx rip=%#llx handler=%#llx wteb=%#llx\n",
+                    sig, src, (unsigned long long)fault_addr, si_code,
+                    (unsigned long long)cpu->gs_base,
+                    (unsigned long long)cpu->gpr[OCERZ_RSP], (unsigned long long)cpu->rip,
+                    (unsigned long long)sa->handler, (unsigned long long)cpu->wine_teb_base);
+    }
     /* These deliveries are SYNCHRONOUS CPU faults (the host SIGSEGV/SIGBUS
      * handler is the only caller). On Darwin a synchronous fault cannot be held
      * pending by the thread's signal mask against the faulting instruction, so
@@ -1368,6 +1621,9 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
      * it nests per-frame; sys_sigreturn restores it. */
     ocerz_st(uc + 56, 8, cpu->gs_base);
     ocerz_st(uc + 64, 8, cpu->fs_base);
+    if (getenv("OCERZ_GSTRACE") && cpu->gs_base < 0x100000)
+        fprintf(stderr, "ocerz: GS deliver-save sig=%d gs=%#llx (SMALL) rip=%#llx\n",
+                sig, (unsigned long long)cpu->gs_base, (unsigned long long)cpu->rip);
 
     ocerz_st(si + 0, 4, (uint32_t)sig);
     ocerz_st(si + 8, 4, (uint32_t)si_code);
@@ -1429,6 +1685,12 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
      * its original TEB base. */
     cpu->gs_base = ocerz_ld(uc + 56, 8);
     cpu->fs_base = ocerz_ld(uc + 64, 8);
+    if (ocerz_gs_is_teb_band(cpu->gs_base))
+        cpu->wine_teb_base = cpu->gs_base;
+    if (getenv("OCERZ_GSTRACE") && cpu->gs_base < 0x100000)
+        fprintf(stderr, "ocerz: GS sigreturn-restore gs=%#llx (SMALL) uc=%#llx rip=%#llx\n",
+                (unsigned long long)cpu->gs_base, (unsigned long long)uc,
+                (unsigned long long)cpu->rip);
     if (!(uint32_t)ocerz_ld(uc + 0, 4))
         cpu->sig_on_stack = 0;
     return OCERZ_STEP_OK;
@@ -1676,6 +1938,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [137] = { "rmdir",       1, 0x01, 0, NULL },
     [138] = { "utimes",      2, 0x03, 0, NULL },
     [140] = { "adjtime",     2, 0x03, 0, NULL },
+    [142] = { "gethostuuid", 2, 0x03, 0, NULL },
     [147] = { "setsid",      0, 0x00, 0, NULL },
     [151] = { "getpgid",     1, 0x00, 0, NULL },
     [153] = { "pread",       4, 0x02, 0, NULL },
@@ -1893,7 +2156,58 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
 
     int err = 0;
     uint64_t ret2 = 0;
+    /* Log an INFINITE-timeout kevent WAIT before it blocks (orig[5]==NULL timeout,
+     * nchanges==0, nevents>0): a wait that never returns (the EVFILT_USER lost-wakeup
+     * hang) leaves no post-syscall KEV line, so this is the only way to see the kq the
+     * stuck waiter is parked on. Excludes the 16ms libdispatch pollers (timeout!=NULL). */
+    if ((num == 363 || num == 369) && getenv("OCERZ_KEVLOG") &&
+        orig[2] == 0 && orig[4] == 1)
+        fprintf(stderr, "ocerz: KEVWAIT-ENTER[%d] num=%d kq=%lld(=fd %d) nev=%lld timeout=%#llx caller=%#llx\n",
+                (int)getpid(), num, (long long)orig[0], (int)orig[0], (long long)orig[4],
+                (unsigned long long)orig[5], (unsigned long long)cpu->rip);
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
+    if ((num == 362 || num == 363 || num == 369) && getenv("OCERZ_KEVLOG")) {
+        static int kev_dumped = 0;
+        if (!kev_dumped) { kev_dumped = 1; ocerz_dyld_dump_images(); }
+        uint64_t rh[8]; unsigned rn = ocerz_vm_riphist(rh, 8);
+        uint64_t cbase = 0; const char *cmod = NULL;
+        for (unsigned i = 0; i < rn; i++) {
+            const char *m = ocerz_dyld_name_for_addr(rh[i], &cbase);
+            if (m) { cmod = m; break; }
+        }
+        int64_t ts0 = -1, ts1 = -1;
+        if (num != 362 && orig[5]) { ts0 = (int64_t)ocerz_ld(orig[5], 8); ts1 = (int64_t)ocerz_ld(orig[5] + 8, 8); }
+        (void)cmod; (void)cbase;
+        static int kev_poll_seen = 0;
+        if (num != 362 && orig[2] == 0 && orig[4] > 0) kev_poll_seen++;
+        if (kev_poll_seen == 400 && num != 362) {
+            uint64_t rh32[32]; unsigned rn32 = ocerz_vm_riphist(rh32, 32);
+            fprintf(stderr, "ocerz: KEVSTACK[%d] kq=%lld late-poll frames:", (int)getpid(), (long long)orig[0]);
+            for (unsigned i = 0; i < rn32; i++) fprintf(stderr, " %#llx", (unsigned long long)rh32[i]);
+            fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "ocerz: KEV[%d] %s kq=%lld nchanges=%lld nevents=%lld timeout=%lld.%09lld ret=%lld err=%d caller=%#llx\n",
+                (int)getpid(), e->name, (long long)orig[0], (long long)orig[2], (long long)orig[4],
+                (long long)ts0, (long long)ts1, (long long)r, err,
+                (unsigned long long)(rn ? rh[0] : 0));
+        if (num != 362 && orig[1] && orig[2]) {
+            for (uint64_t i = 0; i < orig[2] && i < 4; i++) {
+                uint64_t ke = orig[1] + i * 32;
+                fprintf(stderr, "ocerz:   change ident=%#llx filter=%d flags=%#x fflags=%#x\n",
+                        (unsigned long long)ocerz_ld(ke, 8), (int)(int16_t)ocerz_ld(ke + 8, 2),
+                        (unsigned)(uint16_t)ocerz_ld(ke + 10, 2), (unsigned)(uint32_t)ocerz_ld(ke + 12, 4));
+            }
+        }
+        if (num != 362 && orig[3] && !err && (int64_t)r > 0) {
+            for (int64_t i = 0; i < (int64_t)r && i < 2; i++) {
+                uint64_t ke = orig[3] + (uint64_t)i * 32;
+                fprintf(stderr, "ocerz:   EVENT ident=%#llx filter=%d flags=%#x fflags=%#x data=%#llx\n",
+                        (unsigned long long)ocerz_ld(ke, 8), (int)(int16_t)ocerz_ld(ke + 8, 2),
+                        (unsigned)(uint16_t)ocerz_ld(ke + 10, 2), (unsigned)(uint32_t)ocerz_ld(ke + 12, 4),
+                        (unsigned long long)ocerz_ld(ke + 16, 8));
+            }
+        }
+    }
     if (err) {
         ret_err(cpu, r);
     } else if (e->dual_ret) {
@@ -1909,6 +2223,7 @@ static const char *mach_trap_name(int num)
 {
     switch (num) {
     case 10: return "_kernelrpc_mach_vm_allocate_trap";
+    case 11: return "_kernelrpc_mach_vm_purgable_control_trap";
     case 12: return "_kernelrpc_mach_vm_deallocate_trap";
     case 14: return "_kernelrpc_mach_vm_protect_trap";
     case 15: return "_kernelrpc_mach_vm_map_trap";
@@ -2022,6 +2337,16 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
         if (a[1] != 0)
             ocerz_st(a[1], 8, gaddr);
+        mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
+        break;
+    }
+    case 11: { /* _kernelrpc_mach_vm_purgable_control_trap(task, address, control, int *state) */
+        /* ocerz manages the guest AS itself and never purges it, so guest purgeable memory
+         * is always effectively NONVOLATILE. Report success and write NONVOLATILE (0) to the
+         * state out-param (the new current state for GET, the previous state for SET) so the
+         * guest never believes its purgeable data was discarded (EMPTY). */
+        if (a[3] != 0)
+            ocerz_st(a[3], 4, 0 /* VM_PURGABLE_NONVOLATILE */);
         mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
         break;
     }
@@ -2139,6 +2464,14 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
         a[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
         a[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
+        /* Log the message header BEFORE the (possibly blocking) trap, so a mach_msg2
+         * that never returns (the boot keystone deadlock) still shows its dest port /
+         * id / options. msgh_bits@0, remote_port@8, local_port@0xc, msgh_id@0x14. */
+        if (reply_buf != 0 && getenv("OCERZ_MACHMSG"))
+            fprintf(stderr, "ocerz: MACHMSG-ENTER[%d] opts=%#llx rcv_name=%#llx bits=%#x rport=%#x lport=%#x id=%u\n",
+                    (int)getpid(), (unsigned long long)a[1], (unsigned long long)a[4],
+                    (uint32_t)ocerz_ld(reply_buf, 4), (uint32_t)ocerz_ld(reply_buf + 8, 4),
+                    (uint32_t)ocerz_ld(reply_buf + 0xc, 4), (uint32_t)ocerz_ld(reply_buf + 0x14, 4));
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         if (vm->strace && reply_buf != 0)
             fprintf(stderr, "ocerz: mach_msg2 id=%u reply_id=%u bits=%#x size=%#x\n",
@@ -2271,8 +2604,43 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
 {
     if (num == 3) {
-        cpu->gs_base = cpu->gpr[OCERZ_RDI];
+        uint64_t newgs = cpu->gpr[OCERZ_RDI];
+        /* _thread_set_tsd_base with an obviously-invalid base (< 0x100000) while
+         * the thread already has a valid gs: this is Wine's __wine_syscall_
+         * dispatcher gs-restore reading pthread_teb from a Wine TEB that does not
+         * exist (an ocerz workqueue/libdispatch worker running Wine code with no
+         * Wine TEB -- the gs:0x320 crash). A real macOS thread in the dispatcher
+         * always has a valid TEB; here the only sane base is the thread's own
+         * pthread/cthread base (its current gs), so keep it instead of faulting. */
+        if (newgs < 0x100000 && cpu->gs_base >= 0x100000) {
+            if (getenv("OCERZ_GSTRACE"))
+                fprintf(stderr, "ocerz: GS machdep KEEP gs=%#llx (rejected junk %#llx) rip=%#llx\n",
+                        (unsigned long long)cpu->gs_base, (unsigned long long)newgs,
+                        (unsigned long long)cpu->rip);
+            ret_ok(cpu, 0x60);
+            return OCERZ_STEP_OK;
+        }
+        cpu->gs_base = newgs;
+        if (ocerz_gs_is_teb_band(newgs))
+            cpu->wine_teb_base = newgs;
         ret_ok(cpu, 0x60);
+        if (getenv("OCERZ_GSTRACE"))
+            fprintf(stderr, "ocerz: GS machdep gs=%#llx rip=%#llx icount=%#llx%s\n",
+                    (unsigned long long)cpu->gs_base, (unsigned long long)cpu->rip,
+                    (unsigned long long)vm->insn_count,
+                    cpu->gs_base < 0x100000 ? "  <<< SMALL/INVALID" : "");
+        if (getenv("OCERZ_GSTRACE") && cpu->gs_base < 0x100000) {
+            uint64_t r14 = cpu->gpr[OCERZ_R14];
+            uint64_t td = ocerz_ld(r14, 8);
+            fprintf(stderr, "ocerz:   GSBAD caller-ret=%#llx rdi=%#llx r14=%#llx rsp=%#llx [r14]=td=%#llx td_commit=%d [td+0x320]=%#llx [td-0]=%#llx [td+8]=%#llx\n",
+                    (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8),
+                    (unsigned long long)cpu->gpr[OCERZ_RDI], (unsigned long long)r14,
+                    (unsigned long long)cpu->gpr[OCERZ_RSP], (unsigned long long)td,
+                    ocerz_addr_committed(td),
+                    (unsigned long long)(td ? ocerz_ld(td + 0x320, 8) : 0),
+                    (unsigned long long)(td ? ocerz_ld(td, 8) : 0),
+                    (unsigned long long)(td ? ocerz_ld(td + 8, 8) : 0));
+        }
         if (vm->strace || getenv("OCERZ_SIGTRACE"))
             fprintf(stderr,
                     "ocerz: machdep set_cthread_self gs=%#llx comm(gs)=%d comm(gs-8)=%d icount=%#llx\n",
@@ -2286,19 +2654,27 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
     return OCERZ_STEP_FATAL;
 }
 
+/* Defined in vm.c: atomically take+clear this thread's pending async guest signal
+ * mask (set by async_sig_handler when a host SIGUSR1/SIGQUIT cross-thread kick lands). */
+extern uint32_t ocerz_take_pending_async_sig(void);
+
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t rax = cpu->gpr[OCERZ_RAX];
     int class = (int)((rax >> 24) & 0xff);
     int num = (int)(rax & 0xffffff);
 
+    int rc;
     switch (class) {
     case 1:
-        return dispatch_mach(vm, cpu, num);
+        rc = dispatch_mach(vm, cpu, num);
+        break;
     case 2:
-        return dispatch_bsd(vm, cpu, num);
+        rc = dispatch_bsd(vm, cpu, num);
+        break;
     case 3:
-        return dispatch_machdep(vm, cpu, num);
+        rc = dispatch_machdep(vm, cpu, num);
+        break;
     default:
         /* A SYSCALL_CLASS_NONE (class 0) syscall is not a real macOS syscall: on
          * macOS 14+ the kernel raises SIGSYS for it, and Wine's WoW64 PE ntdll
@@ -2309,10 +2685,40 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
          * SIGSYS to the guest with the saved rip already past the syscall (the
          * handler computes frame->rip = rip+0xb and frame->rcx = rip). If no
          * SIGSYS handler is registered it is a genuine bad syscall -> fatal. */
+        /* WoW64 PE class-0 syscalls always run with gs=TEB; __wine_syscall_
+         * dispatcher resolves the thread's syscall_frame/TEB from gs. If gs is the
+         * unix cthread base here (Wine's own signal handler swapped it via machdep
+         * and ocerz never swapped back), the dispatcher reads cthread-relative junk
+         * (rip 0x3fff66748 -> [0x8ffff8] uncommitted). Re-establish the gs=TEB
+         * invariant the macOS-14 kernel guarantees, using the TEB this thread ran. */
+        if (!ocerz_gs_is_teb_band(cpu->gs_base) && cpu->wine_teb_base &&
+            ocerz_addr_committed(cpu->wine_teb_base)) {
+            if (getenv("OCERZ_GSTRACE"))
+                fprintf(stderr, "ocerz: SIGSYS gs %#llx -> TEB %#llx rip=%#llx\n",
+                        (unsigned long long)cpu->gs_base,
+                        (unsigned long long)cpu->wine_teb_base, (unsigned long long)cpu->rip);
+            cpu->gs_base = cpu->wine_teb_base;
+        }
+        g_ocerz_deliver_src = 2;
         if (ocerz_signal_deliver(cpu, OCERZ_SIGSYS, 0, 0, 0))
             return OCERZ_STEP_OK;
         OCERZ_FATAL("unknown syscall class=%d num=%d (rax=%#llx) rip=%#llx\n",
                     class, num, (unsigned long long)rax, (unsigned long long)cpu->rip);
         return OCERZ_STEP_FATAL;
     }
+    /* Async guest signal delivery at the syscall-return boundary: a wineserver
+     * cross-thread kick (SIGUSR1/SIGQUIT, forwarded to the host kernel by
+     * sys_pthread_kill) EINTRs this thread's blocking forwarded syscall (read(wait_fd),
+     * kevent, ...) and sets a pending bit in async_sig_handler; build the guest signal
+     * frame so the handler runs before the guest resumes -- the macOS contract the
+     * wineserver relies on for system-APC / suspend / context delivery. */
+    if (rc == OCERZ_STEP_OK) {
+        uint32_t pend = ocerz_take_pending_async_sig();
+        for (int s = 1; pend && s < 32; s++)
+            if (pend & (1u << s)) {
+                g_ocerz_deliver_src = 1;
+                ocerz_signal_deliver(cpu, s, 0, 0, 0);
+            }
+    }
+    return rc;
 }
