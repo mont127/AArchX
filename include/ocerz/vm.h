@@ -55,5 +55,7 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu);
 void ocerz_vm_request_exit(OcerzVM *vm, int code);
 void ocerz_vm_install_handlers(OcerzVM *vm);
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top);
+unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
+extern int ocerz_init_tolerant;
 
 #endif

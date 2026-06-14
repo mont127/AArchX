@@ -96,6 +96,48 @@
 
 static pthread_mutex_t map_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Thread-init start gate. Real macOS+Wine does not run a newly-created thread's
+ * guest user code -- which would commit its 32-bit WoW64 stack or return into PE
+ * -- until the main thread finishes loader-init, whose tail is the release of the
+ * preloader low-space reservation (a guest munmap of [0x1000,0x200000000)). ocerz
+ * workers (synthetic workq + the kernel HOSTWQ callbacks) otherwise run the
+ * instant they are spawned, so a worker can commit a low 32-bit stack and another
+ * unmap the old preloader stack BEFORE the main thread releases the reservation,
+ * decommitting a live page another thread reads (the 0x8ffff8 fault). The gate
+ * parks every worker until that release fires. Armed only for Wine (WINEARCH set),
+ * so a native program that spawns libdispatch workers but never releases a
+ * preloader reservation never waits and cannot hang. */
+static pthread_mutex_t g_initgate_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_initgate_cv = PTHREAD_COND_INITIALIZER;
+static volatile int g_init_released = 1;
+
+void ocerz_init_gate_arm(void)
+{
+    pthread_mutex_lock(&g_initgate_m);
+    g_init_released = getenv("WINEARCH") ? 0 : 1;
+    pthread_mutex_unlock(&g_initgate_m);
+}
+
+void ocerz_init_gate_release(void)
+{
+    pthread_mutex_lock(&g_initgate_m);
+    if (!g_init_released) {
+        g_init_released = 1;
+        pthread_cond_broadcast(&g_initgate_cv);
+        if (getenv("OCERZ_THRLOG"))
+            fprintf(stderr, "ocerz: INITGATE released pid=%d\n", (int)getpid());
+    }
+    pthread_mutex_unlock(&g_initgate_m);
+}
+
+void ocerz_init_gate_wait(void)
+{
+    pthread_mutex_lock(&g_initgate_m);
+    while (!g_init_released)
+        pthread_cond_wait(&g_initgate_cv, &g_initgate_m);
+    pthread_mutex_unlock(&g_initgate_m);
+}
+
 uint64_t ocerz_guest_base;
 uint64_t ocerz_arena_lo;
 uint64_t ocerz_arena_hi;
@@ -247,6 +289,74 @@ static int host_make_writable(void *hp)
                 MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == hp ? 0 : -1;
 }
 
+/* OCERZ_MEMLOG=<hexaddr>: trace every public map op whose 16KB host page covers
+ * that probe address, with the post-op committed state and the calling thread, to
+ * catch a decommit/restrictive-protect that clobbers a live 4KB neighbor sharing
+ * the probe's 16KB host page. */
+/* Defined in vm.c: the calling guest thread's current rip (0 if none). Used only
+ * by the MEMLOG diagnostic to name the Wine function behind a low-range unmap. */
+extern uint64_t ocerz_current_guest_rip(void);
+extern uint64_t ocerz_current_guest_rsp(void);
+/* Defined in dyld.c: the loaded image (Wine .so / shared-cache dylib) covering an
+ * address, plus its load base, so MEMLOG can name the rip's image+offset. */
+extern const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out);
+
+static void memlog(const char *op, uint64_t gaddr, uint64_t len, int prot)
+{
+    static int init;
+    static uint64_t probe, lowlog;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("OCERZ_MEMLOG");
+        probe = e ? strtoull(e, NULL, 0) : 0;
+        const char *l = getenv("OCERZ_LOWLOG");
+        lowlog = l ? strtoull(l, NULL, 0) : 0;  /* ceiling: log all low ops < this */
+    }
+    if (!probe && !lowlog)
+        return;
+    uint64_t lo = round_down(gaddr);
+    uint64_t hi = round_up(gaddr + len);
+    uint64_t ppg = round_down(probe);
+    int hit_probe = probe && ppg >= lo && ppg < hi;
+    int hit_low   = lowlog && lo < lowlog && hi > 0x100000ull;
+    if (!hit_probe && !hit_low)
+        return;
+    uint64_t rip = ocerz_current_guest_rip(), ibase = 0;
+    const char *iname = rip ? ocerz_dyld_name_for_addr(rip, &ibase) : NULL;
+    /* The shared-cache dylibs are not in the DynImage list, so a cache rip resolves
+     * to the highest Wine .so with a nonsense offset; show <shared-cache> instead. */
+    int sane = iname && (rip - ibase) < 0x8000000ull;
+    uint64_t cmp = hit_probe ? probe : gaddr;  /* lowlog-only: report the op's own addr */
+    fprintf(stderr, "ocerz: MEMLOG[%d/%04lx] %-7s gaddr=%#llx len=%#llx prot=%d rip=%#llx (%s+%#llx) -> probe(%#llx)committed=%d\n",
+            (int)getpid(), (unsigned long)((uintptr_t)pthread_self() >> 8) & 0xffff,
+            op, (unsigned long long)gaddr, (unsigned long long)len, prot,
+            (unsigned long long)rip,
+            sane ? iname : "<shared-cache>", (unsigned long long)(sane ? rip - ibase : 0),
+            (unsigned long long)cmp, ocerz_addr_committed(cmp));
+    /* For the residual-race unmap (a shared-cache libsystem syscall rip), walk the
+     * guest stack for the Wine-side caller(s) -- return addresses in a Wine .so (which
+     * IS in the DynImage list, so the offset is sane) name the function that asked for
+     * this low-range free. The immediate caller is the lowest-offset Wine-.so hit. */
+    if (op[0] == 'u' && !sane) {
+        uint64_t sp = ocerz_current_guest_rsp();
+        int shown = 0;
+        for (int i = 0; sp && i < 160 && shown < 6; i++) {
+            uint64_t a = sp + (uint64_t)i * 8;
+            if (!ocerz_addr_committed(a)) break;
+            uint64_t v = *(uint64_t *)ocerz_g2h(a);
+            if (v < 0x300000000ull) continue;
+            uint64_t b = 0; const char *n = ocerz_dyld_name_for_addr(v, &b);
+            if (n && (v - b) < 0x8000000ull) {
+                const char *bn = strrchr(n, '/');
+                fprintf(stderr, "ocerz:   stk[+%#x]=%#llx (%s+%#llx)\n",
+                        (unsigned)(i * 8), (unsigned long long)v,
+                        bn ? bn + 1 : n, (unsigned long long)(v - b));
+                shown++;
+            }
+        }
+    }
+}
+
 static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
                         uint64_t zlo, uint64_t zhi)
 {
@@ -290,6 +400,7 @@ int ocerz_mem_init(uint64_t lo, uint64_t hi)
               (unsigned long long)lo, (unsigned long long)hi,
               (unsigned long long)host_base,
               (unsigned long long)ocerz_guest_base);
+    ocerz_init_gate_arm();
     return OCERZ_OK;
 }
 
@@ -314,6 +425,7 @@ int ocerz_mem_init_identity(uint64_t size)
         return OCERZ_ENOMEM;
     OCERZ_LOG("identity guest arena [%#llx, %#llx), bump %#llx, guest_base 0\n",
               (unsigned long long)lo, (unsigned long long)ocerz_arena_hi, (unsigned long long)bump_next);
+    ocerz_init_gate_arm();
     return OCERZ_OK;
 }
 
@@ -427,6 +539,7 @@ int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot)
     pthread_mutex_lock(&map_lock);
     int rc = map_fixed_locked(gaddr, len, prot, 1);
     pthread_mutex_unlock(&map_lock);
+    memlog(prot == 0 ? "reserve" : "commit", gaddr, len, prot);
     return rc;
 }
 
@@ -458,6 +571,7 @@ int ocerz_map_shared_file(uint64_t gaddr, uint64_t len, int prot, int fd, uint64
     for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE)
         bit_set(r, pg_index(r, p));
     pthread_mutex_unlock(&map_lock);
+    memlog("shared", gaddr, len, prot);
     return OCERZ_OK;
 }
 
@@ -601,6 +715,8 @@ int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
     const MemRegion *r = region_for_range(lo, hi);
     int rc = r ? commit_range(r, lo, hi, host_prot(prot), 0, 0) : OCERZ_ENOMEM;
     pthread_mutex_unlock(&map_lock);
+    memlog(host_prot(prot) == (PROT_READ | PROT_WRITE) ? "prot-rw" : "prot-ro",
+           gaddr, len, prot);
     return rc;
 }
 
@@ -621,18 +737,18 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len)
         if (!bit_test(r, pg_index(r, p)))
             continue;
         void *hp = ocerz_g2h(p);
-        if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) == 0) {
-            memset(hp, 0, (size_t)OCERZ_HOST_PAGE);
-            if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_NONE) != 0) {
-                rc = OCERZ_ENOMEM;
-                break;
-            }
-        } else if (mmap(hp, (size_t)OCERZ_HOST_PAGE, PROT_NONE,
-                        MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != hp) {
-            /* A read-only file overlay (e.g. an unmapped SxS manifest) that
-             * mprotect cannot restore: replace it with a fresh anonymous PROT_NONE
-             * reservation page so a later writable re-commit of this address (a
-             * heap reusing the freed slot) succeeds instead of faulting RO. */
+        /* Replace the committed host page with a FRESH private PROT_NONE reservation,
+         * exactly as the macOS kernel does for munmap followed by an anonymous re-map.
+         * This discards the old physical page (so the next commit reads zero, the
+         * zero-fill-on-demand Wine's heap/loader rely on) AND -- crucially -- converts
+         * a MAP_SHARED wineserver/file overlay back to PRIVATE. A plain mprotect+memset
+         * zeroes the bytes but leaves a read-write shared page SHARED, so when the heap
+         * later reuses the freed low address its metadata (e.g. a SUBHEAP data_size) is
+         * silently shared with another process whose wineserver writes corrupt it --
+         * the source of the 0x8FFFF8 "walk past commit_end on a garbage data_size" fault.
+         * It also subsumes the old read-only-file-overlay (SxS manifest) fallback. */
+        if (mmap(hp, (size_t)OCERZ_HOST_PAGE, PROT_NONE,
+                 MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != hp) {
             rc = OCERZ_ENOMEM;
             break;
         }
@@ -645,6 +761,13 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len)
         }
     }
     pthread_mutex_unlock(&map_lock);
+    memlog("unmap", gaddr, len, 0);
+    /* The main thread's preloader-reservation release (a guest munmap covering the
+     * whole low 32-bit space from ~0 up past 4GB) is the end of loader-init: let
+     * the parked workers run now (they ran their guest code mid-air before this,
+     * racing the release -> the 0x8ffff8 decommit). See ocerz_init_gate_*. */
+    if (gaddr <= 0x10000ull && gaddr + len >= 0x100000000ull)
+        ocerz_init_gate_release();
     return rc;
 }
 

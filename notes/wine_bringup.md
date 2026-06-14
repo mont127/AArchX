@@ -987,3 +987,998 @@ Diagnostics kept (env-gated): OCERZ_DLPATH (disk-dylib path+base), OCERZ_INITSCA
 dump), ocerz_host_region_prot host_prot/region + rip-region in the crash dump (src/vm.c). NEXT WALL
 = Phase 5: the winemac.drv display driver (window creation) + FreeType, so GUI apps can actually
 draw. ocerz emulation itself is clean through Wine boot.
+
+### UPDATE #16 (2026-06-13): Phase 5 started — winemac.drv display-driver wall PRECISELY located (the Cocoa-app startup spins in libobjc, exceeding macdrv's 5s deadline)
+
+Goal: load winemac.drv so GUI apps can create windows. Traced the "no driver could be loaded" /
+"graphics driver is missing" failure end to end (make check stays green; new diagnostics are env-gated).
+
+- winemac.drv (PE) loads + relocates fine; winemac.so (the Cocoa unix lib, links AppKit/Carbon/Metal/
+  QuartzCore/Security/...) ALSO loads fine (DLPATH: load_base 0x3a0a88000). So __wine_init_unix_call
+  succeeds. The failure is winemac.drv's DllMain process_attach -> MACDRV_CALL(init) = macdrv_init.
+- macdrv_init's first check is `SessionGetInfo(callerSecuritySession, ...)` -> sessionHasGraphicAccess.
+  NOT the failure: a native x86_64 SessionGetInfo returns attrs=0x6030 graphic=1 both in the launch
+  shell AND through ocerz, AND in a re-exec'd ocerz CHILD (verified with a guest posix_spawn ->
+  sesstest harness). So the spawned GUI process keeps graphic access.
+- The failure is `macdrv_start_cocoa_app` TIMING OUT (winemac.drv PROCESS_ATTACH->DETACH gap = 6.1s,
+  i.e. its hard-coded 5s limit + overhead). It posts a CFRunLoopSource (perform=run_cocoa_app) to
+  CFRunLoopGetMain() from the Wine-logic thread and waits <=5s for COCOA_APP_RUNNING. apple_main_thread
+  (ntdll loader.c:2086) parks the process main thread in CFRunLoopRun(); the same-thread source
+  (apple_create_wine_thread) DOES fire (Wine runs), so the run loop works -- the failing case is the
+  CROSS-THREAD wakeup, or run_cocoa_app firing but not completing in 5s.
+- run_cocoa_app DOES fire: during the 5s wait the GUI process pegs 100% CPU (RNs), so the main thread
+  is actively emulating Cocoa setup, not blocked. A SIGUSR1 guest-rip dump (new OCERZ_RIPDUMP) shows
+  the hot thread (gs=cthread) spinning in a tight libobjc loop at **0x7ff802a17117** (repeated 17x in
+  the rip history; neighbors 0x7ff802a1713a/3f; outer frames 0x7ff802a43541/562, 0x7ff802a469d4,
+  0x7ff802a5bd3b) that repeatedly reaches **0xdda002a0** -- a low-shadow-window address that is
+  UNCOMMITTED (a byte read of it faults). Main-thread host sample: ~45% in the SIGSYS PE-syscall path
+  (ocerz_handle_syscall) + ~49% in framework dlopen (ocerz_dyldapi_dispatch -> ocerz_dlopen).
+- CONCLUSION: winemac.drv fails because the Cocoa app startup (run_cocoa_app) spins in a libobjc loop
+  (0x7ff802a17117) touching an uncommitted 0xdda002a0, never reaching COCOA_APP_RUNNING inside macdrv's
+  5s window. This is the objc/Cocoa-under-ocerz frontier (cf. the earlier objc class-realization /
+  selector / selpool notes). NEXT: disassemble libobjc 0x7ff802a17117 (identify the objc op -- method
+  cache scan? class realize? selector loop?), find why it lands on uncommitted 0xdda002a0 (a garbage
+  IMP/isa, a fault-retry loop, or an objc structure ocerz set up wrong), and either fix the objc state
+  or commit/repair 0xdda002a0. Repro: `WINEDEBUG=+macdrv,+module OCERZ_RIPDUMP=1 OCERZ_INITPHASE=1
+  OCERZ_HOSTWQ=1 WINEARCH=wow64 WINEPREFIX=$HOME/.wine ./ocerz "<Wine Devel.app>/.../bin/wine" notepad`,
+  then `kill -USR1 <hottest ocerz pid>` during the winemac.drv attach. Kept gated diagnostics:
+  OCERZ_RIPDUMP (SIGUSR1 guest-rip+history+bytes), OCERZ_DLPATH now also prints DLERR (dlopen failures).
+
+### UPDATE #17 (2026-06-13): selector lookup made O(1) (kills the 11s selpool build); winemac.drv wall moved to a kevent busy-poll
+
+Two findings while attacking the winemac.drv 5s-Cocoa-timeout wall (UPDATE #16):
+
+1. **FIXED (real win, kept): _dyld_get_objc_selector is now O(1) via the cache's objc_selopt perfect
+   hash, not the ~11s build.** dyld4 vtable slot 0x2a0 = _dyld_get_objc_selector = selpool_canonical,
+   which on first call built a 2.5M-entry open-addressing index over relativeMethodSelectorBase
+   (~11s; the deferred UPDATE #11 perf debt). The shared cache already ships a precomputed selector
+   hash: objc_opt_t+0x08 (alongside the class hash at +0x20 ocerz already uses). ocerz now reads it
+   (g_selopt) and selpool_canonical does a perfect-hash lookup (selopt_canonical, the same objc_-
+   stringhash_t format as the class table's stringhash_find_raw, but the selector table ends at the
+   string-offset array and the canonical selector IS table+offsets[h]). The slow build is now only a
+   fallback for a cache without selopt. VERIFIED: OCERZ_SELVERIFY cross-checks selopt vs the build per
+   lookup -> ZERO mismatches on an objc program; objc2/objctest pass; make check green; selpool_build
+   no longer runs at all (OCERZ_SELLOG shows 0 builds). This permanently removes the 11s build.
+
+2. **winemac.drv STILL fails (gap unchanged at ~5.95s), so selpool was NOT the bottleneck.** With the
+   selector lookup now instant, macdrv_start_cocoa_app still times out at its 5s limit. SIGUSR1 guest-
+   rip dumps (OCERZ_RIPDUMP) of the hottest wine proc now consistently (3/3) land in libsystem_kernel
+   at 0x7ff802e347ce -- the instruction right after a `syscall` for BSD 363 = **kevent** (the prior
+   stub is 362 = kqueue). Regs: kevent(kq=9, changelist=NULL, nchanges=0, eventlist=..., nevents=128,
+   timeout=ptr); caller is a tight loop in arena code at 0x300011xxx (the re-exec'd wine loader / main
+   exe, NOT the Cocoa cache code). The thread is at 100% CPU (host kevent returns immediately, so the
+   timeout is small/zero), i.e. a BUSY-POLL: a wine thread spins polling kqueue 9 for an event ocerz
+   never delivers (a registered fd/Mach-port/timer filter that isn't bridged to the host kqueue, or a
+   wineserver reply that's stuck). NOTE the kevent loop is in ARENA code, not the Cocoa setup -- so it
+   may be a different thread/process than the GUI main thread doing run_cocoa_app; the leading theory
+   is that this busy-poll steals CPU (contention) so the GUI process's Cocoa startup misses its 5s
+   deadline. NEXT: identify what filter is registered on kq=9 (instrument the kqueue(362)/kevent(363)
+   forward to log the registered filters + returns) and why its event never fires under ocerz -- this
+   is the kevent/event-delivery / wineserver-coordination layer. Kept gated diag: OCERZ_RIPDUMP
+   (SIGUSR1 rip+hist+regs+bytes), OCERZ_SELVERIFY (selopt vs build), OCERZ_DLPATH->DLERR. Repro as
+   UPDATE #16 + `kill -USR1 <hottest ocerz pid>`.
+
+### UPDATE #17b (2026-06-13): winemac kevent spin pinned to libdispatch event-source dispatch (not drained)
+
+Refined the UPDATE #17 kevent busy-poll. The hot kevent(kq=9, timeout=0.016s) returns 1 event ~96% of
+the time (11k calls in ~5s). OCERZ_KEVLOG dumping the RETURNED events shows the firing events are
+EVFILT_READ (filter=-1) on ~21 DISTINCT fds (0x41/0x3b/0x4a/0x38/...), each consistently data=0x40
+(64 bytes readable), flags=0x5 (EV_ADD|EV_ENABLE, NOT EV_CLEAR -> LEVEL-triggered). The registered
+filters are 49 EVFILT_READ + 48 EVFILT_WRITE + 6 EVFILT_USER (ident=0x1 = the dispatch manager's
+self-wakeup). So this is libdispatch's event manager (dispatch_mgr) on kq=9: it gets a READ source
+ready (64 bytes), should dispatch the source handler to a workqueue worker that drains the fd, but the
+fd is NEVER drained (strace shows 0 read/recvmsg on these fds), so the level-triggered source re-fires
+every 16ms forever -> ~2300 events/s burns 100% CPU and the GUI process's Cocoa startup misses
+macdrv's 5s deadline. ROOT: libdispatch event-source dispatch isn't completing under ocerz -- the
+kqueue event reaches the dispatch_mgr but the source handler (which would read the 64 bytes) never runs
+on a worker. This is the libdispatch-event-source <-> OCERZ_HOSTWQ workqueue coordination layer (the
+manager polls + delegates; the delegation/handler-run is what's broken). NEXT: trace how a ready
+EVFILT_READ source is supposed to dispatch its handler (dispatch_mgr -> _dispatch_source_invoke ->
+workqueue worker) and find where ocerz drops it -- likely the same HOSTWQ bridge that the wineboot
+phase relied on, but for event SOURCES (read/write) rather than async blocks. Diagnostics kept (gated):
+OCERZ_KEVLOG (kevent calls + registered filters + returned events). make check green.
+
+### UPDATE #18 (2026-06-13): Phase 5 winemac.drv — THREE objc bring-up walls destroyed (selector canon, disk-dylib class registration, objc-registration boundary)
+
+The UPDATE #17/#17b kevent spin was a RED HERRING for the GUI: it is wineboot's ntdll kqueue reactor
+(symbol region near server_select/sock_read in lib/wine/x86_64-unix/ntdll.so, loaded low at the per-
+process arena base) waiting, not the cause of the winemac timeout. The actual Phase-5 wall is
+winemac.drv (lib/wine/x86_64-unix/winemac.so) failing to load its graphics driver. Three distinct objc
+bugs, each masking the next, were found and fixed. ALL faithful to real dyld/objc behaviour; make check
+green throughout (14/14 guest x2, 15 differential, 2 dynamic, all unit suites incl. test_syscall 96/0).
+
+NOTE on repro: the heap-commit c0000005 reading 0x8ffff8 (an uncommitted page inside a heap view the
+guest committed RW, 0x700000-0x8fffff) only fires on a FRESH prefix during wineboot --init and is
+flaky; it is a real ocerz commit/16KB-host-page-aliasing bug worth tracking later, but it is NOT the
+GUI blocker. Once $HOME/.wine is initialized, notepad reaches winemac.drv directly.
+
+WALL 1 (FIXED) — selector not uniqued. macdrv_start_cocoa_app sends
+  +[NSThread detachNewThreadSelector:toTarget:withObject:]
+and aborts: "selector (0x3a0acf686) ... does not match selector known to Objective C runtime
+(0x7ff8225f6052)". 0x3a0acf686 is winemac.so's OWN __objc_methname string (a __TEXT,__objc_methname
+entry); the cache canonical is 0x7ff8225f6052. _dyld_get_objc_selector (dyldapi slot 0x2a0) DID return
+the canonical when queried, but the winemac.so selref at __objc_selrefs (winemac+0x53a28) stayed at the
+local string pointer -- modern objc, on a shared-cache launch, trusts dyld to have uniqued every selref
+and runs NO per-image selref fixup, so a selref left at the image-local string is a distinct pointer
+from the cache canonical and fails objc_msgSend's pointer-identity match. FIX: ocerz's mini-dyld now
+canonicalizes each arena dylib's __objc_selrefs to the cache canonical at load (dyld.c
+canonicalize_objc_selrefs, called after apply_fixups in both load_disk_dylib and dlopen_load_image;
+uses new public ocerz_dyldapi_canonical_selector -> selpool_canonical). A name absent from the cache is
+left as its local string (a stable unique pointer). This is exactly what dyld's objc selector optimizer
+does for disk images.
+
+WALL 2 (FIXED) — disk dylib classes never registered with objc. Past wall 1, objc:
+"Attempt to use unknown class 0x3a0add788" (winemac.so __objc_data class-object region). The cache
+dlopen path (cache_dlopen_hit) calls ocerz_dyldapi_objc_map_one to drive objc map_images, but the DISK
+dylib path (ocerz_dlopen_inner) never did -- so winemac.so's own classes (WineApplication/window
+subclasses) were never realized. Early Cocoa steps used cache classes (worked after wall 1); the first
+winemac-defined class faulted. FIX: ocerz_dlopen_inner now calls objc_map_one for each newly loaded
+disk image (deps-first) BEFORE running its initializers, mirroring dyld's notify-objc-then-init order.
+
+WALL 3 (FIXED) — objc-registration boundary. objc_map_one STILL skipped winemac.so: it returned early
+with already=1. objc_image_already_loaded checked g_closure_mh (the dyld image-list closure), but
+ocerz_dyldapi_register_image appends EVERY disk image to g_closure_mh for the image/unwind APIs --
+which is NOT the objc-registration set. Only the boot closure was actually handed to objc map_images;
+post-boot disk images sit in g_closure_mh unregistered. FIX: api_objc_register_callbacks now records
+the boot-driven images into g_objc_dlopen_mapped, and objc_image_already_loaded checks ONLY
+g_objc_dlopen_mapped (the true objc-registered set), not g_closure_mh. winemac.so now registers
+(OBJCMAP ... winemac.so batch=5).
+
+RESULT: winemac.drv loads, canonicalizes its selectors, registers its classes, and SPAWNS the Cocoa
+thread (detachNewThreadSelector now works). The crash moved deep into the Cocoa thread startup.
+
+NEXT WALL (open) — Cocoa-thread Foundation. The spawned NSThread crashes in:
+  __NSThread__start__ -> -[NSThread name] -> +[NSString stringWithUTF8String:] ->
+  -[NSString initWithBytes:length:encoding:]: unrecognized selector sent to instance 0x60000000c000
+i.e. basic NSString creation fails ON THE COCOA THREAD (works on the main thread), then libc++abi
+terminate -> the abort path null-derefs in Wine's ntdll ([rax+0x320] with rax=0, the recurring SIGBUS
+at guest_rip 0x381a37f23 / guest_addr 0x320). Thread-specific -> suspect the new thread's objc/runtime
+state (TSD/gs_base/autorelease) or selector identity on a non-main guest thread. winemac.so categories
+(WineExtensions, WineShapeMaskExtensions) target graphics classes, not NSString, so they are not the
+cause. Diagnostics kept (all env-gated): OCERZ_OBJCLOG (objc_map_one path + batch), OCERZ_SELLOG
+(SELMISS), OCERZ_MEMLOG=<addr> (per-op commit trace for a probe host page), commitmap in the SIGTRACE
+fault dump, OCERZ_KEVLOG (kevent + caller module via ocerz_dyld_dump_images/name_for_addr +
+ocerz_vm_riphist).
+
+### UPDATE #19 (2026-06-13): Phase 5 NEXT WALL precisely localized — Cocoa-thread [NSString alloc] returns a HEAP NSString, not the placeholder (cache method-list lookup miss for +allocWithZone:, Wine-context-only). DIAGNOSED, NOT YET FIXED. make-check GREEN throughout.
+
+After WALL 1-3 (UPDATE #18) winemac.drv spawns its Cocoa thread; that thread aborts in
+__NSThread__start__ -> -[NSThread name] -> +[NSString stringWithUTF8String:] ->
+-[NSString initWithBytes:length:encoding:]: unrecognized selector sent to instance 0x60000000c000.
+Exhaustively root-caused (new env-gated diag OCERZ_SELTRAP=<rip> dumps recv/isa/sel/gs at a guest rip;
+pointed at objc __forwarding_prep_0___ = 0x7ff802f0f070):
+
+PROVEN NOT the cause (each ruled out with a live isolated test that PASSES under ocerz):
+- selector canonicalization: SELTRAP shows sel=0x7ff8225a3f25 = the UNIQUE cache canonical for
+  "initWithBytes:length:encoding:" (selopt perfect-hash confirms; only 1 copy in the pool). NOT WALL-1's
+  canonicalize_objc_selrefs.
+- class identity: receiver isa=0x7ff8436d08a0 IS ocerz's real NSString ([NSString class] in an isolated
+  ocerz run returns exactly 0x7ff8436d08a0). The workflow's "AOSAccounts NSString" was a whichlib
+  segment-range artifact (the cache COALESCES objc class data across dylib ranges).
+- static method lists / thread / NSApplication-on-thread / dlopen+category / winemac.so-objc-shape mimic:
+  ALL reproduced in isolation and ALL PASS (string creation returns the __NSPlaceholderString placeholder).
+  So it is NOT static cache data, NOT a spawned-thread issue, NOT objc registration of a category dylib.
+
+THE ACTUAL MECHANISM (objc x86_64): +[NSString stringWithUTF8String:] (0x7ff8040cc9df) allocates via an
+objc alloc fast-path (libobjc 0x7ff802a20e8a, same shape as objc_alloc 0x7ff802a1f9fe):
+  rax = metaclass = [cls] & 0x7ffffffffff8 ; test byte[rax+0x1f],0x40 (FAST_CACHE_HAS_DEFAULT_AWZ, the
+  0x4000 bit of cache_t._flags at metaclass+0x1e) ; jne fast-createInstance ELSE msgSend(cls,allocWithZone:).
+WATCHED NSString's metaclass (0x7ff8436d08f0) _flags at 0x7ff8436d090e in the live Wine run: the AWZ bit
+0x4000 is NEVER set (values 0x1/0x2001/0x2031/0xa031) -- so the alloc CORRECTLY falls through to
+objc_msgSend(NSString, allocWithZone:). The bug is therefore ONE LEVEL DEEPER: in the Wine context the
++[NSString allocWithZone:] dispatch resolves to NSObject's DEFAULT allocWithZone: (class_createInstance)
+instead of NSString's cluster override that returns the __NSPlaceholderString singleton -> it returns a
+HEAP NSString-isa object (0x60000000c000, a nano-zone alloc, NOT the placeholder at 0x7ff8436d0080 that an
+isolated ocerz run returns) -> -[NSString initWithBytes:length:encoding:] is then sent to a plain NSString
+instance, which (confirmed on BOTH native and ocerz: instancesRespondToSelector==0) does NOT implement it
+-> unrecognized selector -> NSException -> libc++abi terminate -> the recurring null-deref SIGBUS in Wine's
+ntdll abort path (guest_rip 0x381a37f23, [rax+0x320] rax=0).
+
+So the root is a CACHE METHOD-LIST LOOKUP MISS for +allocWithZone: on NSString's metaclass that happens
+ONLY in the live Wine process (not in any isolated harness). NSString's metaclass IS realized early
+(_flags 0x2031 at icount ~314380) and its cache fills during the call, yet the lookup misses the cluster
+override -- i.e. NSString's metaclass baseMethodList (a cache RELATIVE-LIST-LIST: header {entsize=8,
+count=0x1a0} of relative pointers to sub-lists) is incompletely searched/attached in the Wine context, so
+allocWithZone: resolves to the inherited NSObject default. winemac.so registration is the only Wine-unique
+trigger but mimicking its objc shape (RR-overriding class + graphics-class categories) does NOT reproduce,
+so the trigger is the live Wine load/realize ORDERING, not winemac.so's objc structure per se.
+
+NEXT (fix-critical): instrument objc class realization / relative-list-list attachment for NSString's
+metaclass in the Wine context -- find why +allocWithZone: is not in the searched method table there (a
+missed relative-list-list sub-list, a re-realization that drops methods, or a realize-ordering where
+NSString is consulted before the cluster methods attach). Trap +[NSString allocWithZone:]'s IMP in the
+Wine run vs isolation to confirm which IMP wins. Kept env-gated diag: OCERZ_SELTRAP, OCERZ_WATCH/WATCHBT
+(store watch + bt), OCERZ_OBJCLOG (now also logs objc_map_one batch contents). make-check green
+(14/14 guest x2, 15 diff, 2 dyn, all unit incl test_syscall 96/0).
+
+### UPDATE #20 (2026-06-13): Phase-5 alloc wall pushed deeper — loaded-bit hypothesis RULED OUT; frontier = which +allocWithZone: IMP wins. Still unfixed; make-check GREEN.
+
+Continued from UPDATE #19. New env-gated diag OCERZ_METHDUMP (in dyldapi.c ocerz_dyldapi_dump_method, fired from vm.c sel_trap_report): for the SELTRAP receiver's class, walks the metaclass's static baseMethods relative-list-list and reports each sub-list's image index + objc loaded bit + whether it defines a selector + the method IMP.
+
+FINDINGS (live Wine run, the failing -[NSString initWithBytes:length:encoding:] forward):
+1. The crash receiver 0x60000000c000 is a HEAP NSString instance (nano-zone), NOT the __NSPlaceholderString
+   placeholder (which an isolated ocerz run returns at 0x7ff8436d0080). So +[NSString stringWithUTF8String:]'s
+   internal alloc returned a plain NSString instead of the placeholder.
+2. The objc alloc fast-path it uses (libobjc 0x7ff802a20e8a) tests FAST_CACHE_HAS_DEFAULT_AWZ (bit 0x4000 of
+   the NSString metaclass cache_t._flags @ metaclass(0x7ff8436d08f0)+0x1e). OCERZ_WATCH on that word in the
+   live Wine run: the AWZ bit is NEVER set (flags only ever 0x1/0x2001/0x2031/0xa031), so the fast-path
+   CORRECTLY falls through to objc_msgSend(NSString, allocWithZone:). So the bug is in the allocWithZone:
+   resolution/execution, not the AWZ flag.
+3. ★ LOADED-BIT HYPOTHESIS RULED OUT: NSString's metaclass baseMethods IS a cache relative-list-list
+   ({entsize=8,count=0x1a0} of per-image sub-lists), and one sub-list (imgidx=21, **loaded=1**) DOES define
+   allocWithZone: (nameptr 0x7ff8225a3acc = the canonical selector; IMP 0x7ff8040b450a = Foundation+0xa50a).
+   So allocWithZone: is present AND its image is loaded -> objc realization should include it. The earlier
+   "a sub-list is dropped because its image is unloaded" theory is dead.
+4. That IMP (Foundation+0xa50a) disassembles to: `cmp rdi(self), [rip->global 0x7ff843adad48]; je ->return
+   placeholder(lea); else -> xor esi,esi; jmp default-alloc`. BUT in an ISOLATED ocerz run where
+   [NSString alloc] CORRECTLY returns the placeholder, that global 0x7ff843adad48 reads 0 (== in the static
+   cache too) and self=NSString!=0 -> the cmp would FAIL -> else branch -> heap. Yet isolation returns the
+   placeholder. CONCLUSION: 0x7ff8040b450a is NOT the operative +allocWithZone:. There must be MULTIPLE
+   allocWithZone: definitions across the relative-list-list sub-lists and a DIFFERENT one wins; the Wine
+   context likely resolves to a different (wrong) one than isolation.
+
+FRONTIER / NEXT: dump EVERY allocWithZone: definition across ALL sub-lists (with IMP + imgidx + loaded) in a
+reproducing Wine run, and trap each candidate IMP to see which objc actually invokes in Wine vs isolation
+(and what it returns). The reproduction is FLAKY (needs to reach winemac.drv within the run window; ~1/3-1/8
+runs). DIAGNOSTIC CAVEAT: the helper meth_list_has() in dyldapi.c gives FALSE NEGATIVES (reported
+has(allocWithZone:)=0 for the sub-list that demonstrably contains it via the strstr printer) -- trust
+meth_list_print_substr, not meth_list_has, until that discrepancy is understood.
+
+Kept env-gated diag (all inert when unset; make-check GREEN 14/14 guest x2, 15 diff, 2 dyn, unit incl
+test_syscall 96/0): OCERZ_SELTRAP, OCERZ_METHDUMP, OCERZ_WATCH/WATCHBT, OCERZ_OBJCLOG (with batch contents).
+Cache tools: /tmp/{clsname,methwalk,resolv,cdump,whichlib}.
+
+================================================================================
+UPDATE #21 (2026-06-13): PHASE-5 "unrecognized selector"/NSString CASCADE WALL DESTROYED
+  (supersedes the #19/#20 diagnosis — the alloc miss was a missing +LOAD phase)
+================================================================================
+ROOT CAUSE (definitive, via WATCH/WATCHBT + capstone disasm of the cache):
+- +[NSString allocWithZone:] returns the __NSPlaceholderString singleton only when
+  (self == *<global at cache 0x7ff8436dad48>). That global is set by Foundation's
+  __NSInitializeProcess, which is a Foundation +LOAD method (reads NSZombieEnabled
+  etc. via getenv, then calls a helper at Foundation+0x...3fc that caches several
+  class pointers via objc_getClass -- NSString -> the global). Foundation has 0
+  mod_init_funcs (INITLOG count 0); the setup runs ONLY via +load.
+- ocerz runs the objc +LOAD phase (run_load_phase -> ocerz_dyldapi_run_image_loads,
+  which walks __objc_nlclslist/__objc_nlcatlist and calls each +load IMP) ONLY at
+  BOOT, for the main executable's dependency closure (dyld.c ~line 2455).
+- win.m links Foundation -> Foundation is in the boot closure -> its +load runs ->
+  global set -> alloc returns the placeholder -> works.
+- The Wine loader does NOT link Foundation; winemac.drv dlopens Cocoa/Foundation
+  POST-boot. cache_dlopen_hit ran map_images (objc register) + restricted mod_init,
+  but NEVER the +load phase -> __NSInitializeProcess never ran -> global stayed 0 ->
+  +[NSString alloc] returns a plain NSString -> -[NSString initWithBytes:length:
+  encoding:] unrecognized -> Cocoa-thread NSException abort -> macdrv "no driver".
+  (Proven: OCERZ_WATCH on the global fires in win.m, NEVER in Wine; the writer's
+  function is never entered in Wine even under NOJIT.)
+
+FIX (src/dyld.c):
+1. cache_dlopen_hit now runs dyld's full dlopen sequence for the newly-loaded cache
+   sub-closure: map_images (objc_map_one) -> +LOAD phase (run_load_phase) -> C/C++
+   initializers (restricted init_closure). The +load phase is the missing piece.
+2. run_load_phase gained a PERMANENT per-image done marker g_load_done[] (it
+   previously deduped only per-generation), so each image's +load runs exactly once
+   -- boot images are skipped on the later dlopen, only the genuinely new images
+   (Foundation/AppKit/...) run. g_init_force was added to its run gate (mirroring
+   run_init_phase) so the dlopen call bypasses the boot eager-init filter.
+3. WALL-2 win.m crash regression (introduced earlier this session by registering
+   disk-dylib objc): the loop now SKIPS images whose path contains
+   "/System/Library/Extensions/" (GPU/hardware driver bundles, e.g.
+   AGXMetalG14X.bundle) -- registering their classes/categories routed Metal/
+   CoreAnimation through a driver ocerz can't run and faulted libdispatch. Wine's
+   own dylibs are never under /Extensions/, so they still register.
+
+VERIFIED: Wine objcerr=0 across 4/4 runs (cascade gone); make-check GREEN (sse 246/0,
+syscall 96/0, guest 14/14 x2, diff 15, dyn 2); win.m 0 crashes, ~3-4/5 PROBE-OK
+(baseline). Cleaned up all the throwaway debug toggles (OCERZ_FULLINIT, OCERZ_LOADIMG,
+OCERZ_CBDUMP, WINEMAC-LOAD/global-read traces, WATCHHEX, RIPLOG caller-chain dump).
+
+NEW WALL (older, now revealed past the cascade): macdrv_start_cocoa_app TIMES OUT
+("err:macdrv:macdrv_init Failed to start Cocoa app main loop") = the UPDATE #16/#17
+libdispatch event-source <-> OCERZ_HOSTWQ workqueue wall (Cocoa main-loop startup
+spins, never signals COCOA_APP_RUNNING in 5s). Plus the gs:0x320 SIGBUS in the WoW64
+dispatcher (guest_rip=0x381a37f23, guest_addr=0x320) in ~half the runs -- a separate
+known thread-gs issue, now reachable because the cascade no longer aborts first.
+NOTE #14's "0x7ff843adad48 reads 0 in isolation yet placeholder returned" puzzle is
+resolved by #18: in isolation the +load DID run (boot closure) and set the REAL
+global 0x7ff8436dad48 (not the 0x...adad48 typo'd in #14); the placeholder path keys
+on 0x7ff8436dad48.
+
+================================================================================
+UPDATE #22 (2026-06-13): NEXT WALL (post-cascade) PRECISELY LOCALIZED — gs:0x320 crash
+  = libdispatch/HOSTWQ worker running the WoW64 dispatcher with no Wine thread setup
+================================================================================
+With the #21 +load fix, Wine advances past the NSString cascade into winemac.drv's
+Cocoa bring-up. notepad x6: gs:0x320 SIGBUS 4/6, macdrv "Failed to start Cocoa app
+main loop" 2/6, window-created 0/6. The two are facets of ONE wall (the Cocoa app's
+libdispatch machinery under ocerz+Wine = UPDATE #11 thread-gs ∩ #16/#17 libdispatch).
+
+ROOT (gs:0x320, traced via new OCERZ_GSTRACE + capstone):
+- Crash: SIGBUS guest_addr=0x320, guest_rip=0x381a37f23 (WoW64 __wine_syscall_dispatcher),
+  reached via the SIGSYS path (PE ntdll class-0 syscall). The faulting insn is the
+  dispatcher's gs-restore: it computes r14 = rsp & ~0xffff (the thread's 64KB-aligned
+  stack/signal-stack base), rax = [r14] (Wine's amd64_thread_data ptr stored at the
+  base), then rdi = [rax + 0x320] (amd64_thread_data+0x320 = the saved pthread/cthread
+  base) and calls libsystem _thread_set_tsd_base(rdi) (mov eax,0x3000003; syscall) to
+  restore gs. For the crashing thread [rax+0x320] reads a CONSTANT garbage 0x16 (same
+  every run; the thread's pthread struct address varies, so 0x16 is NOT derived from it
+  -- it's an uninitialized slot). So the dispatcher sets gs_base=0x16 -> the next
+  gs-relative access faults. (In #11 the same slot read 0; now 0x16 -- same wall.)
+- The crashing thread's stack (r14=0x380900000) matches NO bsdthread_create (7 logged,
+  none near it) -> it is an ocerz HOSTWQ/libdispatch worker (spawned for the Cocoa app's
+  dispatch machinery), NOT a Wine-created thread. Wine's per-thread WoW64 setup
+  (storing amd64_thread_data at the stack base and the real pthread base at +0x320,
+  done by signal_init_thread on Wine threads) never ran for it, so when guest code on
+  that worker reaches the WoW64 dispatcher (a Cocoa->Wine callback making a Win32
+  syscall), the gs-restore reads the uninitialized 0x16.
+
+So the wall is: the Cocoa app's libdispatch workers (bridged by OCERZ_HOSTWQ) end up
+running Wine PE code that hits __wine_syscall_dispatcher, which relies on per-thread
+Wine state that only Wine-created threads have. macdrv-timeout is the same machinery
+spinning instead of crashing (the #17 event-source/workqueue drain issue).
+
+NEXT (fix-critical, deep): determine the exact Cocoa->Wine call path that runs Wine PE
+code on a HOSTWQ worker; either (a) ensure such workers get Wine's per-thread WoW64
+init (amd64_thread_data + the +0x320 pthread base) before they can reach the
+dispatcher, or (b) route those Win32 calls so they don't execute the dispatcher's
+stack-relative thread lookup on a non-Wine stack. Tied to the #16/#17 libdispatch
+event-source<->workqueue drain. New gated diag (inert unset, make-check GREEN): 
+OCERZ_GSTRACE (logs machdep/sigreturn/deliver gs writes; flags gs_base < 0x100000 and
+dumps the dispatcher caller on a bad write). Repro: WINEDEBUG=+macdrv OCERZ_INITPHASE=1
+OCERZ_HOSTWQ=1 WINEARCH=wow64 WINEPREFIX=$HOME/.wine ./ocerz "<Wine>/bin/wine" notepad.
+
+--------------------------------------------------------------------------------
+UPDATE #23 (2026-06-13): #22 gs:0x320 ROOT CAUSE COMPLETED — foreign (Cocoa/libdispatch)
+  thread runs Wine PE code; the WoW64 dispatcher's rsp&~0xffff lookup has no cpu-area
+--------------------------------------------------------------------------------
+Refines #22 (which said "HOSTWQ worker"; the truth is more precise). Watching the
+exact +0x320 slot (OCERZ_WATCH=0x380900340, the slot the dispatcher reads) shows it is
+NOT a stable Wine amd64_thread_data field at all -- it is written repeatedly by
+LIBSYSTEM code (rip 0x7ff802efbadd / 0x7ff802c8db49, rdi=0x6000xxxx nano-zone heap)
+with heap values 0x10, 0x16, 0x6c23649f. So the 64KB region the dispatcher lands on
+(rsp & ~0xffff = 0x380900000) is a LIBSYSTEM/libdispatch HEAP/scratch region, and
+[base]=td=0x380900020, [td+0x320]=0x16 are just coincidental heap bytes -- NOT a Wine
+thread structure. (td "looked valid"/committed because it's live heap; [td+8] was a
+heap-stored code ptr, not a thread field.)
+
+COMPLETE ROOT: a FOREIGN thread -- one running libsystem/Cocoa/libdispatch code on a
+libsystem-allocated stack with NO Wine TEB/cpu-area -- executes Wine PE code (a
+Cocoa->Wine callback), does a Win32 syscall (class-0 -> SIGSYS), and enters
+__wine_syscall_dispatcher. The dispatcher's gs-restore finds the thread's cpu-area via
+rsp&~0xffff, but on a foreign stack that points into libsystem heap, so it reads garbage
+0x16 as the saved pthread base and sets gs=0x16 -> the next gs access faults
+(guest_addr=0x320). The macdrv-timeout runs are the same machinery spinning instead.
+
+So the wall is the FOREIGN-THREAD -> WINE-PE entry: Wine PE code must only run on a
+thread with a Wine TEB/cpu-area (so the dispatcher's stack lookup resolves). On real
+Wine+macOS this holds because macdrv marshals Cocoa events to the Win32 side rather than
+running PE code inline on Cocoa/dispatch threads (or Wine sets up a TEB at the unixlib
+boundary). Under ocerz, a dispatch/Cocoa thread reaches PE code without that setup.
+
+FIX DIRECTIONS (deep, design-level): (a) detect the foreign-thread->PE entry and give
+the thread a Wine TEB/cpu-area (or borrow the owning Wine thread's) before it can reach
+the dispatcher; (b) ensure the Cocoa->Wine path marshals to a real Wine thread instead
+of running PE inline; tied to the #16/#17 libdispatch event-source<->workqueue bridge,
+since OCERZ_HOSTWQ is what brings these foreign workers into the guest. NEXT concrete
+step: trace the exact call edge where a thread with gs!=TEB first executes PE code
+(0x381xxxxxx range) and what spawned it, to choose (a) vs (b). make-check GREEN
+(syscall 96/0 after `make clean`), win.m 0 crashes. Gated diag OCERZ_GSTRACE retained.
+
+  #23 ADDENDUM (direction-b probe): the foreign thread DOES have a sigaltstack, but it
+  is a LIBSYSTEM region (not a Wine signal stack with thread_data at its base). And at
+  the Win32-syscall instant the +0x320 slot is NOT yet 0x16 -- the 0x16 is written
+  shortly after, by CONCURRENT libsystem code mutating that shared heap (WIN32SYS
+  syscall-time prediction never fires). Confirms the dispatcher lands on live shared
+  libsystem heap, not thread_data. UNIFYING INSIGHT for the fix: this is the #16/#17
+  libdispatch wall -- a block/event that should run on the MAIN thread (a Wine thread)
+  is instead run on a libdispatch WORKER (foreign thread); winemac.so's handler there
+  calls a Wine PE callback -> Win32 syscall on a non-Wine thread -> dispatcher crash.
+  So the macdrv-timeout (block never runs -> COCOA_APP_RUNNING never signals) and the
+  gs:0x320 crash (block runs on the wrong thread) are the SAME root: libdispatch
+  main-queue/event-source ownership under ocerz. THE fix target = make main-queue work
+  run on the guest main thread (the #16/#17 OCERZ_HOSTWQ event-source<->workqueue
+  bridge), which resolves both. Removed the dead WIN32SYS probe; kept OCERZ_GSTRACE.
+
+================================================================================
+UPDATE #24 (2026-06-13): REAL FIX landed — HOSTWQ async-worker bridge (queue_cb), the
+  macdrv Cocoa-main-loop TIMEOUT is GONE; sole GUI blocker is now the gs:0x320 crash
+================================================================================
+THE GAP: with HOSTWQ, ocerz_hostwq_queue_cb (the kernel's ASYNC / non-event workqueue
+callback) was a NO-OP, and sys_workq_kernreturn always spawned SYNTHETIC workers even
+under HOSTWQ -- a split worker model. So dispatch SOURCE handlers whose target is a
+GLOBAL/root queue (Cocoa brings up several EVFILT_READ sources) never got a draining
+worker -> the fd stayed readable -> the dispatch event-manager re-fired every 16ms at
+100% CPU -> macdrv_start_cocoa_app missed its 5s deadline ("Failed to start Cocoa app
+main loop"). [The #17 dispatch_mgr spin.]
+THE FIX (src/syscall.c): (1) ocerz_hostwq_queue_cb now BRIDGES like the kevent path but
+with NO events -- one guest worker region per host wq thread, enter start_wqthread as an
+async (NEWSPI, QoS-tagged, non-workloop) worker so _dispatch_worker_thread2 drains the
+matching QoS root-queue bucket. (2) Under OCERZ_HOSTWQ_ASYNC, sys_workq_kernreturn
+REQTHREADS (op 0x20) forwards to the REAL kernel __workq_kernreturn(368) instead of
+spawning synthetic, so workloop(kevent_id) + event(kevent) + async(here) all go through
+ONE kernel-owned pool with correct QoS/lifecycle, like a native process.
+RESULT (Wine notepad x6, OCERZ_HOSTWQ_ASYNC=1): macdrv timeout 2/6 -> 0/6 (GONE). The
+runs now progress (faster, no dispatch spin) to the SAME gs:0x320 foreign-PE crash,
+which is the SOLE remaining GUI blocker. VERIFIED SAFE: make-check GREEN (96/0 etc.);
+win.m 0 crashes; wineboot crash count IDENTICAL with/without async (2 per run, completes
+either way) -- so no regression, the fix is gated and clean.
+NEW FINDING: the gs:0x320 crash is GENERAL, not GUI-specific -- wineboot (no Cocoa/
+winemac) ALSO hits it 2x/run (guest_rip 0x381a37f23, guest_addr 0x320) but SURVIVES
+because the crashed thread/process is not its critical path. For the GUI the crashed
+process IS the one that creates the window, so it blocks. So the foreign-thread->PE /
+WoW64-dispatcher-on-a-non-Wine-stack crash (UPDATE #22/#23) is the project-wide next
+wall, surfaced everywhere a libdispatch/workqueue worker reaches PE code.
+NEXT: the gs:0x320 crash (foreign worker runs the WoW64 dispatcher with no Wine cpu-area
+on its stack). Gate OCERZ_HOSTWQ_ASYNC stays experimental until the crash is fixed and
+the full GUI path can be validated. Gated diag OCERZ_GSTRACE retained.
+
+================================================================================
+UPDATE #25 (2026-06-14): gs:0x320 crash — Wine dispatcher CONTRACT decoded + TWO
+  variants established by ground truth (4-agent workflow + first-hand Wine-source read)
+================================================================================
+WINE CONTRACT (wine-11.6 source = the active 11.8 binary's layout; dlls/ntdll/unix/
+signal_x86_64.c): __wine_syscall_dispatcher requires gs = the thread's Wine TEB at its
+gs-state lookup. get_current_teb() = (TEB*)(rsp & ~signal_stack_mask) -- the TEB sits at
+the base of a 64KB block and the per-thread signal stack lives INSIDE that block, so the
+SIGSYS handler (registered SA_ONSTACK, signal_init_process:2787) resolves the TEB from
+rsp. TEB+0x320 = amd64_thread_data.pthread_teb (C_ASSERT:515) = the saved macOS gs base,
+set once at thread init from mac_thread_gsbase() (2848). sigsys_handler (2566): runs
+init_handler (sets gs=pthread_teb for the handler's own TLS), stamps the syscall_frame,
+then redirects RIP_sig to __wine_syscall_dispatcher_prolog_end and RELIES on the macOS-14
+kernel restoring gs=TEB on sigreturn (the gs the PE code held at the class-0 syscall).
+So: the dispatcher only works when entered with gs=TEB, on a thread whose 64KB stack base
+holds the TEB. A foreign thread (no Wine TEB, libsystem sigaltstack) has neither.
+
+TWO VARIANTS (same root "dispatcher entered with gs != the thread's Wine TEB", different
+thread/edge), proven via a per-thread gs-history ring + stack-scan diag (added then
+REVERTED this turn -- see below):
+ - VARIANT 1 (DOMINANT in this repo; notepad 4-5/6, wineboot 2/run): a foreign WORKER
+   thread (synthetic workq / start_wqthread; altsp=0 = NOT a Wine thread, no
+   signal_init_thread) runs a PE callback via a libsystem_pthread->PE edge (stack scan:
+   cache 0x7ff802xxxxx frames calling PE 0x381909xxx -> __wine_syscall_dispatcher) with
+   gs = the worker's cthread (pth+0xe0), NOT via SIGSYS (gshist shows NO sigdeliv -- a
+   DIRECT __wine_unix_call). The dispatcher's gs-restore reads [rsp&~0xffff]->[+0x320] =
+   garbage (libsystem heap) = 0x16 -> gs=0x16 -> SIGBUS guest_addr=0x320 rip=0x381a37f23.
+ - VARIANT 2 (the workflow's slow-worktree observation; rip=0x3fff66748, the 64-bit unix
+   dispatcher): a genuine bsdthread (Wine thread WITH a TEB) takes a class-0 SIGSYS while
+   gs is the cthread (Wine's init_handler swapped it); ocerz delivers SIGSYS without
+   restoring gs=TEB -> the dispatcher reads gs:0x30 = cthread -> bad. gshist for this
+   shows the normal TEB(0x7ffd8000)<->cthread(0x3900fd0e0) swap. THIS repo never hit it
+   fatally (the SIGSYS path always had gs=TEB here -- fix C never fired in 5 runs).
+
+FIX DESIGN (from the workflow, faithfulness-gated; owner rejects pokes):
+ - Fix C (variant 2): at the class-0 SIGSYS edge, if gs is the cthread but the thread has
+   a known last-TEB (tracked per-cpu when machdep/sigreturn install a TEB-band gs,
+   predicate 0x10000<=gs<0x380000000), restore gs=TEB so the dispatcher enters as the
+   macOS-14 kernel would. IMPLEMENTED this turn, then REVERTED: it is INERT in this repo
+   (variant 2 doesn't reproduce; it never fired) and unverifiable here. Faithful and
+   ready to re-land when variant 2 can be reproduced.
+ - Fix B (variant 1, the real blocker here): the foreign worker must not run Wine PE code
+   (real Wine marshals Cocoa->Win32 to a Wine thread and never runs PE on a libsystem
+   workqueue worker). This is the open #16/#17 libdispatch-ownership / foreign-thread-PE
+   work and is the dominant gs:0x320 crash. Identifying the exact PE callback + routing
+   it to a Wine thread (or not bringing up the worker) is the next concrete step.
+
+REVERTED diagnostics: a per-cpu gs-history ring (cpu.h + pushes + crash dump) and fix C
+were added to nail the above, then fully reverted -- the crash dump's gshist line and the
+GSBAD stack-scan did their job (establishing variant 1 vs 2) and the tree is back to the
+verified #21-#24 state (make-check GREEN). KEPT: OCERZ_GSTRACE (machdep/sigreturn/deliver
+gs-write trace + GSBAD).
+ENVIRONMENT NOTE: win.m (the native Cocoa GUI regression test) is currently flaky --
+crashes ~3-4/5 at guest_rip=0x7ff802e803af (libsystem_pthread accessing an uncommitted
+arena addr) -- AND IT CRASHES IDENTICALLY ON THE COMMITTED HEAD 36935c6 (3/4). So this is
+a machine/environment state issue (it passed earlier in the session), NOT the session's
+uncommitted work. A fresh machine state / reboot is the likely remedy; re-verify win.m
+before treating any win.m crash as a code regression.
+
+================================================================================
+UPDATE #26 (2026-06-14): gs:0x320 variant-1 crash localized to the EXACT instruction
+  (ntdll.so unix→PE dispatcher return on a worker with no Wine TEB). Fix still open.
+================================================================================
+The user chose to pursue the Wine GUI crash (gs:0x320 variant 1). Localized it to the
+instruction level with a non-perturbing per-thread probe (OCERZ_PEENTRY: first time a
+WORKER thread runs a 0x381xxxxxx rip with a non-TEB gs; one cheap compare/step so the
+timing-race still fires -- unlike the single-stepping OCERZ_TRACE window, which masks it).
+
+FINDINGS:
+- The crashing thread is a workqueue/libdispatch WORKER: gs=0x3900fd0e0 (cthread =
+  pth+0xe0), rsp=pth-0x48, altsp=0 (NO Wine sigaltstack -> signal_init_thread never ran
+  -> NOT a fully set-up Wine thread). It runs SUBSTANTIAL Wine ntdll.so UNIX-side code
+  (PEENTRY at icount ~0xde000, crash at ~0x98d9xx -- ~9M instructions later) CORRECTLY
+  with gs=cthread (unix code uses the cthread base), then crashes at the unix->PE return.
+- Pinned the module: byte-searched ntdll.so for the exact crash insn
+  `mov rax,[r14]; mov rdi,[rax+0x320]` = 49 8b 06 48 8b b8 20 03 00 00 -> file/RVA 0x3336d;
+  the crash rip 0x381a37f23 is the `call _thread_set_tsd_base` 10 bytes later, so
+  ntdll.so LOAD BASE = 0x381a04bac. The dispatcher gs-restore is ntdll.so RVA ~0x33f23;
+  the worker's first non-TEB PE rip (0x381a23ea0) is RVA 0x1f2f4 -- an internal bsearch
+  loop (get_load_order/config-lookup style) between ___wine_main and
+  _set_load_order_app_name, i.e. Wine init/loader code.
+- So __wine_syscall_dispatcher's gs-RESTORE epilogue (the unix->PE return:
+  rax=[rsp&~0xffff] = the Wine TEB stored at the signal-stack base; rdi=[TEB+0x320] =
+  pthread_teb; _thread_set_tsd_base(rdi)) reads GARBAGE because this worker has NO Wine
+  TEB block at rsp&~0xffff -> rdi=0x16 -> gs=0x16 -> SIGBUS guest_addr=0x320.
+
+ROOT (restated, now instruction-precise): an ocerz workqueue/libdispatch worker runs
+Wine ntdll.so code that returns to the PE side via the syscall dispatcher, but the worker
+is not a Wine thread (no TEB, no Wine signal stack), so the dispatcher's gs-restore -- the
+macOS-14 unix->PE return that recovers the TEB from the signal-stack base -- reads junk.
+On real macOS a libdispatch worker never runs Wine PE/ntdll-return code (Wine marshals to
+a Wine thread); ocerz lets it.
+
+FIX (B, still OPEN, deep): the worker must not run Wine code that returns through the
+dispatcher, OR must be given a Wine TEB/signal-stack before it can. This is the
+#16/#17/#24 libdispatch-ownership / foreign-thread-setup work. Reverted this turn's
+probes (OCERZ_PEENTRY, the WT-trace rsp addition); tree is back to the verified #21-#24
+state, make-check GREEN. NOTE: win.m is currently flaky with a SEPARATE memmove-over-read
+crash (a guest memmove reads past a page-aligned source into an unmapped arena gap; on
+HEAD too) -- not this; see prior note.
+
+================================================================================
+UPDATE #27 (2026-06-14): gs:0x320 crash MOSTLY FIXED via a bounded gs-recovery; Wine
+  now advances past it to the macdrv Cocoa-main-loop wall. make-check GREEN.
+================================================================================
+Built on #26's instruction-precise root cause (an ocerz workqueue/libdispatch worker
+runs Wine ntdll.so code with no Wine TEB; __wine_syscall_dispatcher's gs-restore reads
+pthread_teb from a non-existent TEB -> junk -> SIGBUS guest_addr=0x320). The fully
+faithful fix is upstream (don't run Wine code on a non-Wine worker / marshal) -- deep,
+still open. As a BOUNDED, safe bridge:
+
+FIX (src/syscall.c dispatch_machdep, DEFAULT-on): _thread_set_tsd_base with an
+obviously-invalid base (newgs < 0x100000) WHILE the thread already has a valid gs
+(>= 0x100000) is, by construction, only the dispatcher's gs-restore installing the junk
+it computed from a missing TEB -- a legit thread NEVER sets a sub-0x100000 gs base. So
+keep the thread's current (valid) pthread/cthread base instead of installing junk and
+faulting. This lets the mis-routed worker finish its Wine work with its real pthread
+base (it already ran ~1.65M PE instructions fine with that gs).
+
+RESULT (notepad x6): gs:0x320 crashes ~4-5/6 -> 2/6; the runs now ADVANCE past gs:0x320
+to the macdrv Cocoa-main-loop wall ("Failed to start Cocoa app main loop" 5x = the
+#16/#17/#24 libdispatch-ownership wall) instead of crashing. make-check GREEN (sse 246/0,
+syscall 96/0, 54/0, guest 14/14 x2, diff 15, dyn 2); win.m not worsened (2/3 PROBE-OK,
+0 crashes -- its memmove-over-read crash is separate/flaky). The trigger NEVER fires for
+a legit thread (gs bases are always large), so it is safe process-wide.
+
+RESIDUAL (2/6): the rarer sub-case where the dispatcher's `mov rax,[r14]` yields rax=0
+(stack base has no TEB ptr) so the *read* `mov rdi,[rax+0x320]` faults BEFORE the machdep
+-- gs-keep (which acts at the machdep) cannot catch it. Eliminating it needs either the
+upstream marshaling fix or a fault-handler recovery (a bigger intervention).
+NEXT WALL (now reliably reached): macdrv_start_cocoa_app's Cocoa main-loop timeout =
+the #16/#17/#24 libdispatch event-source/main-queue ownership work.
+NOTE: gs-keep is a bounded RECOVERY for an ocerz divergence (a real macOS process never
+runs Wine code on a libdispatch worker), not faithful to the macOS kernel (which would
+install the junk and fault). Kept default because it is safe + unblocks GUI progress;
+gate/revert if strict faithfulness on the default path is required.
+
+================================================================================
+UPDATE #28 (2026-06-14): ★★ gs:0x320 CRASH FIXED (0/6 default, was ~4-5/6). make-check
+  GREEN, win.m 4/4 PROBE-OK. Two complementary fixes; Wine now advances past it.
+================================================================================
+The crash (an ocerz workqueue/libdispatch worker, OR a Wine thread whose gs was swapped
+to the unix cthread by its own signal handler, running __wine_syscall_dispatcher whose
+gs-restore resolves the TEB/pthread_teb from a gs that is NOT the thread's Wine TEB) is
+eliminated by TWO fixes (both DEFAULT-on, src/syscall.c + include/ocerz/cpu.h):
+
+1. FIX C (the faithful one, dispatch via the class-0 SIGSYS edge): track per-cpu
+   `wine_teb_base` = the last TEB-band gs the thread installed (predicate
+   0x10000 <= gs < 0x380000000, i.e. a low WoW64 TEB ~0x7ffd8000, NOT the arena cthread
+   ~0x3900fd0e0). At the class-0 SIGSYS edge, if gs is currently the cthread/arena base
+   but wine_teb_base is set+committed, restore gs=wine_teb_base BEFORE delivering SIGSYS,
+   so __wine_syscall_dispatcher runs with gs=TEB exactly as the macOS-14 kernel would
+   (it restores the segment base across a signal). This is the workflow's recommended
+   faithful fix and prevents the crash AT THE SOURCE (gs=TEB before the dispatcher).
+2. GS-KEEP (bounded recovery, machdep edge): if _thread_set_tsd_base is handed an
+   obviously-invalid base (< 0x100000) WHILE the thread already has a valid gs, keep the
+   valid base instead of installing junk. Covers the DIRECT-call dispatcher path (no
+   SIGSYS) where a non-Wine worker has no TEB at all -- it keeps its real pthread base.
+
+RESULT: gs:0x320 crashes default 0/6 (gs-keep alone was 2/6 residual; fix C closes it by
+keeping gs=TEB so the dispatcher never reads junk). make-check GREEN (sse 246/0, syscall
+96/0, 54/0, guest 14/14 x2, diff 15, dyn 2). win.m 4/4 PROBE-OK 0 crashes. The fix-C
+predicate NEVER fires for a healthy thread (legit syscalls already have gs=TEB) and the
+restore only swaps cthread->the-thread's-own-TEB, so it is safe process-wide.
+
+NEXT WALLS (now reliably reached, past gs:0x320):
+- Default (no async): macdrv_start_cocoa_app Cocoa-main-loop timeout (#16/#17/#24).
+- With OCERZ_HOSTWQ_ASYNC=1 (advances past the timeout): a flaky WoW64 32-bit fault --
+  the 64-bit unix dispatcher at 0x3fff66748 reads [0x8ffff8] uncommitted (gs=0x7ffd8000,
+  the 32-bit/WoW64 TEB, vs the 64-bit TEB it needs) = the #12 Win32-32bit-commit family;
+  AND a no-window murky state (procs at 13-24% CPU, no NSWindow per Quartz) where
+  wineboot's "boot event wait timed out" (a service stalls). These are the Wine-GUI /
+  WoW64 next layer, NOT the gs:0x320 crash, which is fixed.
+
+  #28 ADDENDUM (the next wall, characterized): with gs:0x320 fixed, the GUI's remaining
+  blockers are: (a) DEFAULT (no async) -> macdrv Cocoa-main-loop timeout (#16/#17/#24);
+  (b) OCERZ_HOSTWQ_ASYNC=1 clears that timeout but exposes a flaky WoW64 fault: the
+  64-bit unix dispatcher (0x3fff66748) reads [0x8ffff8] which is uncommitted. OCERZ_MEMLOG
+  (PID-tagged) shows WHY: in ONE process, thread b2f0 COMMITS a 32-bit stack
+  [0x800000,0x944000) (probe 0x8ffff8 committed=1), but thread d75e then UNMAPS the whole
+  low reservation [0x1000,0x200000000) (Wine's preloader-reservation release),
+  uncommitting it (probe=0) -> the later read faults. So it is a RACE: an ASYNC-spawned
+  worker commits its stack BEFORE the main thread finishes releasing the preloader
+  reservation; on real macOS workers do not run until after that release, so no race. The
+  uncommit-on-release is faithful (real munmap unmaps everything) -- the divergence is the
+  ASYNC worker running too early. So OCERZ_HOSTWQ_ASYNC must stay GATED (it advances past
+  the macdrv timeout but trades it for this preloader race + a no-window murky state where
+  wineboot "boot event wait timed out" because the crashed process fails). NET: gs:0x320
+  is FIXED on the default path; the GUI window needs the libdispatch main-queue/source
+  ownership done WITHOUT spawning workers before the preloader release -- the unified
+  #16/#17/#24 + worker-ordering problem.
+
+========================================================================
+UPDATE #18 2026-06-14 -- THE INIT GATE (thread-start sequencing), make-check GREEN.
+========================================================================
+Implemented the unified-fix part A the #28 workflow recommended: a thread-start gate
+so an ASYNC-spawned worker never runs guest code before the main thread finishes
+loader-init. Faithful: it keys ONLY on the guest's own preloader-reservation munmap,
+no timer/icount/usleep.
+
+  src/mem.c   g_initgate_{m,cv}, g_init_released, ocerz_init_gate_{arm,release,wait}().
+              - arm() in ocerz_mem_init / ocerz_mem_init_identity: parks workers iff
+                getenv("WINEARCH") (a Wine process); native test progs (win.m, make
+                check) never set it, so g_init_released stays 1 and they never wait
+                -> structurally inert, make-check stays green.
+              - release() at the END of ocerz_unmap when the unmap is the preloader
+                release (gaddr<=0x10000 && gaddr+len>=0x100000000) = the guest's own
+                [0x1000,0x200000000) munmap. NOT a timer.
+  src/syscall.c  wait() at the top of ocerz_worker_entry + both HOSTWQ run points
+                (ocerz_hostwq_bridge, ocerz_hostwq_queue_cb), before ocerz_vm_run_cpu.
+                ocerz_fork_child calls release() (a forked child inherits the parent's
+                set-up space; a re-exec'd child re-runs mem_init -> re-arms after).
+  include/ocerz/mem.h  the 3 prototypes.
+  Diagnostics kept (gated behind OCERZ_MEMLOG, off by default): MEMLOG now prints the
+  guest rip + image (src/vm.c ocerz_current_guest_rip, src/mem.c via
+  ocerz_dyld_name_for_addr; shared-cache rips show <shared-cache> since cache dylibs
+  are not in the DynImage list).
+
+VERIFIED: OCERZ_THRLOG shows "INITGATE released pid=N" fires once per process, right
+after that PID's [0x1000,8GB] preloader unmap. make check fully green (clean build;
+the 2 test_syscall fails were the known stale-build pattern, gone after make clean).
+
+RESULT: the gate ELIMINATES the preloader-vs-worker variant of the 0x8ffff8 crash
+(a worker committing its stack before [0x1000,8GB] decommits it). But a RESIDUAL
+0x8ffff8 remains, and it is a DIFFERENT race -- root-caused this session:
+
+  The faulting unmap is [0x700000,0x900000) (a 2MB 32-bit stack), guest rip a
+  DETERMINISTIC 0x7ff802e306a2 -- and the SAME rip also issues the [0x800000,0x944000)
+  stack COMMIT. Same rip for both munmap and mmap => it is a generic libsystem
+  syscall() return point (shared cache, NOT Wine ntdll.so @0x381a..., NOT the
+  preloader). So two threads' 32-bit stacks OVERLAP ([0x800000,0x900000)): one thread
+  munmaps [0x700000,0x900000) while another has [0x800000,0x944000) live -> uncommit ->
+  read 0x8ffff8 faults. This is a 32-bit-stack REUSE-after-free serialization race
+  (thread A frees its low stack while thread B has reused the overlapping range),
+  AFTER the gate release, so the start-gate does not cover it. The faithful fix needs
+  the Wine-side CALLER (one frame up from the libsystem syscall wrapper, on the guest
+  stack, in ntdll.so) to confirm whether ocerz mis-tracks the 32-bit reserve or breaks
+  the alloc/free ordering Wine relies on. NEXT: dump guest rsp + walk the stack at the
+  [0x700000] unmap for the ntdll.so return addr, byte-search it like #15.
+
+ROOT CAUSE of the residual, PINNED this session via the guest-stack walk at the unmap
+(OCERZ_MEMLOG now dumps Wine-.so return addrs; ntdll.so base ~0x381a04000): the
+deterministic ntdll.so frame is virtual_alloc_teb(+0x7bb), the THREAD-CREATION TEB
+allocator (dlls/ntdll/unix/virtual.c:4076), alongside virtual_set_large_address_space
++ server_call_unlocked (all thread-init/virtual-memory). virtual_alloc_teb reserves a
+TEB block of `32 * block_size`, block_size = signal_stack_mask+1 = 0x10000 (64KB) =>
+32*0x10000 = 0x200000 = EXACTLY the [0x700000,0x900000) 2MB region, at the low WoW64
+`user_space_wow_limit`. So [0x700000,0x900000) IS a Wine TEB block, and the other
+thread's [0x800000,0x944000) OVERLAPS it on [0x800000,0x900000). Tearing the TEB block
+down (munmap) decommits the overlap -> 0x8ffff8 read faults. virtual_alloc_teb does it
+all under `virtual_mutex` (server_enter/leave_uninterrupted_section), so on real macOS
+the per-process TEB-block bookkeeping (teb_block/teb_block_pos) is serialized and a TEB
+block never overlaps a live stack. ROOT (OPEN): ocerz's low-WoW64 placement/tracking
+lets a TEB block and another low allocation overlap -- likely a wrong
+`user_space_wow_limit`, or the TEB-block MEM_RESERVE not being honored by the next low
+allocation, or the guest virtual_mutex not serializing the two virtual_alloc_teb calls.
+NEXT: instrument the low MEM_RESERVE/commit placement + user_space_wow_limit -- a
+distinct WoW64-allocator investigation, NOT the libdispatch/start-gate work. (Caveat:
+the stack walk scans all committed qwords so it includes stale frames; virtual_alloc_teb
+is corroborated by the exact 32*64KB=2MB match, not frame order alone.)
+
+A VISIBLE WINDOW is still gated behind THREE distinct walls (the gate cleared a
+fourth):
+  1. the residual 32-bit-stack reuse race above (flaky-to-frequent; crashes explorer
+     -> "no driver could be loaded" / "explorer process failed to start").
+  2. macdrv "no driver could be loaded" PERSISTS even with OCERZ_HOSTWQ_ASYNC=1 -- the
+     #16/#17 Cocoa/libdispatch event-source-draining wall is NOT cleared by ASYNC
+     alone (and the residual crash may be masking it; fix wall 1 first to retest).
+  3. FreeType: "Wine cannot find the FreeType font library" persists even with
+     DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib (x86_64 libfreetype.6.dylib EXISTS
+     there). ocerz's GUEST dlopen loads x86_64 dylibs itself and does NOT honor the
+     host DYLD_FALLBACK_LIBRARY_PATH -- the guest dlopen search path needs to include
+     /usr/local/lib (or Wine's freetype loader needs the full path).
+  The gate is the keeper (default-on for WINEARCH, green). ASYNC stays an env opt-in.
+
+========================================================================
+UPDATE #19 2026-06-14 -- ★★★ WALL 1 (the 0x8FFFF8 crash) DESTROYED. One-line faithful
+fix in ocerz_unmap. make-check GREEN, 0x8FFFF8 0/10 (was ~every run), no regressions.
+========================================================================
+ROOT CAUSE (found by disasm + OCERZ_SIGTRACE/MEMLOG/WATCH + two ultracode workflows whose
+first answers were wrong and got corrected by empirical evidence):
+- The fault is a GENUINE Wine heap out-of-bounds read that ocerz faithfully forwards: the
+  64-bit PE ntdll.dll insert_free_block (heap.c:869) + inlined next_block (heap.c:436)
+  walks a subheap's free block and reads the next block at the subheap RESERVE end
+  (0x8FFFF8 = 0x900000-8), which is uncommitted. It only reaches that read because
+  next_block's bound = subheap+data_size+0x38 (commit_end) is defeated by a CORRUPT
+  subheap->data_size at [subheap+0x18]=[0x700018]: dumped 0x1dcfc0d01dcfc0d (garbage,
+  VARIES per run). With the correct data_size=0xffc0, commit_end=0x710000, next+8=0x900000
+  > commit_end => next_block returns NULL => NO fault. So the bug is a CORRUPT data_size,
+  not a missed MEM_COMMIT and not a gs/#28 bug (gs=0x7ffd8000 is the correct committed TEB).
+- WHO corrupts data_size: NOT a guest store (OCERZ_WATCH=0x700018 caught only Wine's two
+  correct 0xffc0 writes, rip 0x3fff6b6c0; the faulting PID's last store before the fault
+  was 0xffc0, then garbage with NO store between). The corruptor is a STALE MAP_SHARED
+  page: OCERZ_MEMLOG shows [0x700000,0x701000) was a `shared` (MAP_SHARED wineserver/file
+  overlay) before the heap reused the low address. ocerz_unmap decommitted it via
+  mprotect(RW)+memset(0)+mprotect(NONE) -- which on a READ-WRITE shared page SUCCEEDS
+  without converting it to private, so the page STAYS MAP_SHARED. When the heap re-commits
+  [0x700000] and writes its SUBHEAP header there, data_size at [0x700018] is silently
+  shared with another process whose wineserver writes stomp it (explaining: stale/varying
+  garbage, no guest store, and that the later-written [0x700030] user_value + [0x700038]
+  free block -- past the contended region -- survive correct). The low-shadow is PRIVATE
+  per process (mach_vm_allocate), so the corruptor is another process writing the same
+  wineserver SHARED file, not a shared arena.
+THE FIX (src/mem.c ocerz_unmap, faithful, ~one statement): replace the per-page
+mprotect(RW)+memset+mprotect(NONE) (and its RO-overlay fallback) with an UNCONDITIONAL
+`mmap(hp, OCERZ_HOST_PAGE, PROT_NONE, MAP_ANON|MAP_PRIVATE|MAP_FIXED, -1, 0)` for every
+committed host page. This is exactly what the macOS kernel does for munmap-then-anon-remap:
+the old physical page (incl. a MAP_SHARED overlay) is DISCARDED and replaced by a fresh
+PRIVATE zero-fill-on-demand reservation, so a later heap commit of the reused address is
+PRIVATE (no cross-process stomp) and reads zero (the zero Wine's create_subheap/
+block_init_free assume). It SUBSUMES the old #15 RO-file-overlay fallback. No timer/poke.
+VERIFIED: 0x8FFFF8 0/10 (ASYNC) and 0/3 (default path), gs:0x320 0/4, ocerz-fatal 0/4,
+winedbg 0/3, make-check FULLY GREEN. Wine now runs PAST wall 1 (no crash, process stays
+alive) into wineboot SERVICE STARTUP (services.exe/PlugPlay), where the remaining walls are
+the SEPARATE, pre-existing ones: FreeType-not-found (guest dlopen doesn't honor host
+DYLD_FALLBACK_LIBRARY_PATH) + the winemac.drv/macdrv Cocoa display driver (#16/#17). KEPT
+gated diag (off by default): OCERZ_SIGTRACE now also dumps GPRs + mem[rsi/r12/r11]; MEMLOG
+prints guest rip+image + a Wine-.so stack walk + OCERZ_LOWLOG range mode; OCERZ_WATCH logs
+pid (src/vm.c, src/mem.c). notes/wine_bringup.md UPDATE #19.
+
+========================================================================
+UPDATE #20 2026-06-14 -- NEXT WALL root-caused (not yet fixed): wineboot service
+startup deadlocks on a LOST EVFILT_USER kqueue ALERT. make-check GREEN; wall 1 (#19)
+stays fixed.
+========================================================================
+With wall 1 fixed, Wine no longer crashes in boot and runs FURTHER -- to wineboot
+service startup -- then HANGS (idle 0% CPU, no crash, no ocerz fatal; "run_wineboot boot
+event wait timed out"; service PlugPlay "failed to start"). Reproduces on BOTH the default
+and OCERZ_HOSTWQ_ASYNC paths -> not async-specific, not the #18 gate (all PIDs released the
+gate), not gs/#28, not the #19 unmap fix.
+EXACT STALL: winedevice.exe (hosting the MountMgr driver) calls
+wine_enumerate_root_devices(MountMgr) (ntoskrnl pnp.c:1501) -> SetupDiGetClassDevsW(ROOT,
+DIGCF_ALLCLASSES) -> loads setupapi.dll -> blocks. macOS `sample`: the stuck thread sits
+in Wine's NtWaitForAlertByThreadId (ntdll sync.c); other threads in mach_msg; idle
+workqueue thread.
+ROOT CAUSE (decisive, via OCERZ_KEVLOG which logs every kevent + its EVFILT changes/events,
+plus a new KEVWAIT-ENTER pre-syscall log for blocking waits): Wine's per-thread thread-id
+alert on macOS is a kqueue with an EVFILT_USER filter (sync.c get_tid_alert_entry: kqueue()
++ kevent EV_ADD|EV_CLEAR ident=1; NtAlertThreadByThreadId = kevent NOTE_TRIGGER;
+NtWaitForAlertByThreadId = kevent wait). In the stuck process the alert kq=12 gets the
+EV_ADD registration + FIVE NOTE_TRIGGER wakeups (fflags=0x1000000, ret=0 each) and the
+waiter blocks in kevent(kq=12,...) -- BUT **ZERO EVFILT_USER events are ever delivered**
+(0/5). So NtWaitForAlertByThreadId never wakes on the alert; it only ever returns via its
+TIMEOUT and re-checks, which makes ALL Wine thread-alert sync (SRW/condvars/loader/the PnP
+start handshake) fall back to slow timeout polling -> the boot can't finish within the 30s
+service-start timeout -> deadlock-by-slowness.
+ocerz forwards kevent(363)/kqueue(362) DIRECTLY to the host kernel (NULL handler, the
+changelist/eventlist/timeout pointers g2h-translated); ocerz_host_syscall does NOT retry on
+EINTR (single svc), so the simple EINTR+EV_CLEAR theory is OUT. Yet a directly-forwarded,
+process-shared host kqueue still loses the cross-thread NOTE_TRIGGER -> EVFILT_USER
+delivery. NEXT (the fix): find why the host kqueue's EVFILT_USER trigger is not seen by the
+concurrent kevent waiter under ocerz's execution model -- candidates: the kqueue fd is not
+truly shared across the guest's threads (per-thread fd remap), the blocking kevent runs in
+a context (Rosetta/ocerz thread) where the kernel doesn't deliver, an EV_CLEAR/ordering
+race in how ocerz issues the two kevents, or fd-reuse (two kqueue() both returned fd 12).
+KEPT gated diag (off by default): OCERZ_KEVLOG now also prints KEVWAIT-ENTER (kq + num +
+timeout for blocking infinite/nev==1 kevent waits, so a wait that never returns still shows
+its kq). notes/wine_bringup.md UPDATE #20.
+
+========================================================================
+UPDATE #21 2026-06-14 -- ★★★ WALL 2 DESTROYED: the wineboot service-startup deadlock.
+ocerz sys_pthread_kill ignored the TARGET thread; the wineserver's cross-thread
+SIGUSR1 kick was dropped. Fixed faithfully. make-check GREEN, no regressions; the
+boot now runs PAST service startup to explorer/window-creation.
+========================================================================
+ROOT CAUSE (workflow w4pmwev0s, 4 understand + synth + 3 adversarial verify; CONFIRMED
+empirically by a new OCERZ_PTKILL probe): ocerz's sys_pthread_kill (src/syscall.c)
+implemented __pthread_kill(mach_port_t target_thread, int signo) by IGNORING a[0]=target
+and synthesising the signal on the CALLING thread (ran guest_sigact[signo].handler via
+ocerz_vm_call, then *cpu=saved). The real macOS __pthread_kill delivers an async signal to
+the NAMED thread (interrupting its current syscall). Wine's wineserver relies on exactly
+this: send_thread_signal (server/mach.c:364-391) does mach_port_extract_right(client_task,
+unix_tid) + __pthread_kill(client_thread_port, SIGUSR1) to kick a CLIENT thread into
+re-selecting for a SYSTEM APC / context capture / suspend (queue_apc thread.c:1463-1466,
+stop_thread/get_thread_context thread.c:2227). Under ocerz that SIGUSR1 ran on the wrong
+thread and VANISHED. During MountMgr root-device enumeration (winedevice ZwLoadDriver ->
+wine_enumerate_root_devices -> SetupDiGetClassDevsW), the wineserver needed to deliver such
+a kick to the winedevice service-control dispatcher thread; it was lost; that thread sat in
+read(wait_fd)/kevent forever; the lock it held stalled the enumeration thread (seen in
+NtWaitForAlertByThreadId); the whole boot hard-deadlocked (0% CPU). PROBE PROOF: with
+OCERZ_PTKILL, during the hang the wineserver calls __pthread_kill(target!=self, signo=30
+[SIGUSR1]) and signo=3 [SIGQUIT] -- the exact cross-thread kicks -- which ocerz dropped.
+(The standalone kqueue EVFILT_USER alert works in isolation; the wineserver processes
+requests fine; so it was NOT a lost kqueue wakeup, NOT a SIGSYS/EINTR/EV_CLEAR race, NOT a
+Wine lock-ordering bug -- it was the dropped cross-thread signal.)
+THE FIX (faithful, mirrors the macOS __pthread_kill contract; no timer/poke):
+  - src/syscall.c sys_pthread_kill: FORWARD the real __pthread_kill(a[0], a[1]) to the host
+    kernel (ocerz_host_syscall(328,a)), so the kernel delivers signo to the thread named by
+    the port -- incl. cross-process (the extracted client thread port). Replaces the
+    same-thread synthesis.
+  - src/vm.c: a per-thread g_pending_async_mask + async_sig_handler installed for SIGUSR1
+    (when OCERZ_RIPDUMP is off) and SIGQUIT, with NO SA_RESTART so the target's blocked
+    forwarded syscall returns EINTR; the handler only records the signo (async-safe).
+    ocerz_take_pending_async_sig() takes+clears the mask.
+  - src/syscall.c ocerz_handle_syscall: after a class-1/2/3 dispatch returns OCERZ_STEP_OK,
+    deliver any pending async signal via ocerz_signal_deliver -- the guest handler (Wine's
+    usr1_handler) runs at the syscall-return boundary, re-enters select, picks up the system
+    APC, and the boot proceeds. This is the macOS "async signal delivered at the next user
+    boundary" contract.
+RESULT: 3/3 runs the boot RELIABLY progresses past PlugPlay/MountMgr to explorer/window-
+creation (was: PlugPlay "failed to start", never reached explorer, 0% hard-freeze). PlugPlay
+no longer fails. make-check GREEN; 0x8FFFF8 (#19) 0, gs:0x320 (#28) 0, ocerz-fatal 0.
+NEXT WALLS (separate, pre-existing): (1) explorer "no driver could be loaded" = the
+winemac.drv/macdrv Cocoa display-driver wall (#16/#17) + FreeType; (2) a ~15-30s busy phase
+(workflow fix #2: commit_range holds the single global map_lock across an O(pages) mprotect
+loop, serialising all threads' loader/enumeration commits) trips wineboot's 30s boot-event
+timeout -- throughput, not a deadlock. KEPT gated diag: OCERZ_PTKILL, OCERZ_MACHMSG (+the
+KEVWAIT-ENTER in OCERZ_KEVLOG). notes/wine_bringup.md UPDATE #21.
+
+========================================================================
+UPDATE #22 2026-06-14 -- FreeType "no driver" wall FIXED (bare-soname dlopen search);
+make-check GREEN. The boot now loads FreeType + winemac.drv and reaches the GUI, which
+EXPOSES the next layer: the gs:0x320 dispatcher residual + a vprot-table OOM.
+========================================================================
+FREETYPE FIX (src/dyld.c): ocerz's guest dlopen passed a BARE soname (no slash, no @)
+through VERBATIM, so Wine's runtime dlopen("libfreetype.6.dylib")/dlopen("libMoltenVK.dylib")
+never searched the macOS dylib fallback paths and failed ("Wine cannot find the FreeType
+font library", x5). Added resolve_bare_soname() + try_soname_in_pathlist(): for a bare
+soname, search DYLD_LIBRARY_PATH then DYLD_FALLBACK_LIBRARY_PATH (or its macOS default
+$HOME/lib:/usr/local/lib:/usr/lib), wired into ocerz_dlopen_inner before dlopen_load_image
+(re-dedups against the resolved path). The x86_64 homebrew libfreetype.6.dylib is at
+/usr/local/lib, now found WITHOUT even setting DYLD_FALLBACK (the default covers it).
+RESULT: "Wine cannot find the FreeType font library" 0 (was 5+); "no driver could be loaded"
+0 (was present) -- FreeType was the cascade that failed win32u's font init -> the graphics
+driver load. winemac.drv (PE) maps; FreeType resolves. make-check GREEN.
+NEXT LAYER (exposed by the new progress; the actual blockers to a window now):
+ (1) gs:0x320 DISPATCHER RESIDUAL (the #26/#27/#28 foreign-worker family): a thread enters
+     __wine_syscall_dispatcher via the guest signal trampoline (0x7ff802e7d3a0) and its
+     gs-restore epilogue (guest_rip=0x381a37f23 = ntdll.so `mov rax,[r14]; mov rdi,[rax+
+     0x320]`) reads [r14]=0 -> rax=0 -> deref [0x320] faults; gs=cthread (0x3a1aa40e0, NOT a
+     TEB). It LOOPS (blockhist: dispatcher<->trampoline x4) until ocerz's consecutive-fault
+     guard makes it fatal. This is the rarer rax=0 sub-case #27 flagged (faults BEFORE the
+     machdep/SIGSYS gs-fix edge, so #28's fix-C/gs-keep can't catch it). NOTE the #21 async
+     signal delivery now reaches more threads -- if a thread that lacks a saved Wine TEB at
+     [r14] is signalled and runs Wine's handler -> the dispatcher, it hits this. NEXT:
+     determine whether [r14]=0 is a foreign worker (no TEB at all) or a real Wine thread
+     whose TEB slot the async-delivered signal frame didn't populate; the faithful fix is
+     the #16/#17 marshaling (don't run the dispatcher on a no-TEB thread) OR ensure the
+     signal-delivery frame carries the thread's TEB at [r14].
+ (2) vprot-table OOM: "alloc_pages_vprot anon mmap error Cannot allocate memory for vprot
+     table, size 00100000" -- Wine fails to mmap the 1MB per-process 32-bit vprot table.
+     Either arena exhaustion from the homebrew FreeType dep chain, or a consequence of the
+     gs:0x320-crashed thread leaving the arena inconsistent. Characterize which.
+ALSO STILL OPEN (UPDATE #21 next-walls): the ~15-30s busy phase (a guest libsystem loop
+iterating the 8GB low reservation -- rdx=0x200000000 -- doing many mmap/mprotect; trips the
+30s boot-event timeout). notes/wine_bringup.md UPDATE #22.
+
+========================================================================
+UPDATE #23 2026-06-14 -- ★★★ gs:0x320 ROOT CAUSE FOUND (empirically, overturns #22(1) and
+the entire #26/#27/#28 "dispatcher gs-restore" theory). gs:0x320 was always the AMPLIFIER,
+not the disease. Real disease: the HOSTWQ EVFILT_MACHPORT event bridge. Fix in progress.
+========================================================================
+Method: chose option (a) (tackle the gs:0x320 core). Empirics-first (we mis-diagnosed twice
+before). Added cheap env-gated diag (OCERZ_WSIG): logs every guest-signal delivery to a
+NO-TEB worker (sig_altstack_sp==0 && gs not TEB-band), with source tag (g_ocerz_deliver_src:
+0=fault,1=#21-async,2=class0-SIGSYS), faddr, code, handler; plus OCERZ_WSIG dumps the events
+ocerz_hostwq_bridge hands a worker. Symbolicated cache addrs via the cache .map file
+(/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64.map;
+unslid base 0x7ff800000000) and disassembled libdispatch via a tiny x86_64 dladdr helper
+(/tmp/dispdis.c -> dli_fbase+RVA).
+
+THE FULL CAUSAL CHAIN (every link confirmed from a live notepad run):
+ 1. ocerz brings up a HOSTWQ workqueue WORKER (gs=cthread pth+0xe0, NO Wine TEB, altsp=0).
+ 2. The worker drains an EVFILT_MACHPORT event (filt=-8) the host kernel handed it:
+      HOSTWQ-EV[0] filt=-8 flags=0x185 ident=0x250b udata=0x600001705d40
+                   data=0 ext0=0x17019ab00 ext1=0x78
+    ext0 = the Mach receive-message buffer ptr, ext1=0x78 = its size.
+ 3. Guest libdispatch runs `_dispatch_kevent_mach_msg_recv` (cache rip=0x7ff802cdacc4 =
+    libdispatch __TEXT+0x21cc4; faulting insn `mov r12d,[rdx+4]` = read msgh_size at hdr+4,
+    rdx = ext0 = 0x17019ab00) and faults: WSIG sig=11 src=0 faddr=0x17019ab04 (=ext0+4)
+    code=1 (SEGV_MAPERR, UNMAPPED IN GUEST). i.e. the Mach msg buffer ext0 is NOT a guest-
+    readable address -> deref garbage.
+ 4. ocerz delivers SIGSEGV to Wine's segv_handler (guest sa->handler=0x381a37ef0). The
+    handler's init_handler()->get_current_teb() does `mov r14,rsp; and r14,~0xffff; mov
+    rax,[r14]; mov rdi,[rax+0x320]` -- but the worker's stack base is not a 64KB Wine TEB
+    block, so [r14]=0 -> rax=0 -> deref [0x320] FAULTS AGAIN. ocerz re-delivers SIGSEGV ->
+    re-faults, rsp dropping ~0xd80 per iter (eating stack) until the consecutive-fault guard
+    fires -> the "guest crash SIGBUS guest_addr=0x320" we'd been chasing.
+
+SO: the gs:0x320 crash is NOT the WoW64 syscall dispatcher, NOT the #21 async wineserver
+kick (src=0 = a genuine fault, NOT src=1), NOT a missing TEB at a dispatcher [r14] slot. It
+is Wine's segv_handler being UNABLE TO RUN on a no-Wine-TEB libdispatch worker, recursively
+re-faulting on a PRIOR fault. The prior fault is the real bug:
+
+ROOT (Bug A, the disease): under OCERZ_HOSTWQ, sys_kevent_id forwards the guest's kevent_id
+to the host kernel (syscall 375) translating only the TOP-LEVEL pointer args (changelist,
+eventlist, data_out, data_available) -- it NEVER translates the per-kevent ext[] fields. For
+an EVFILT_MACHPORT MACH_RCV source, ext[0]=receive-buffer ptr / ext[1]=size; the kernel does
+the Mach receive and returns ext[0] = a buffer address that is NOT mapped in the guest.
+ocerz_hostwq_bridge memcpy's the kevent verbatim (OCERZ_KEVENT_QOS_S=0x40) into the guest
+worker, so guest libdispatch reads the unmapped ext0 -> fault. (NOTE udata=0x600001705d40 is
+a 0x6000.. nano-malloc addr -- ambiguous host/guest since the guest libmalloc nano-zone maps
+at the same fixed base; the DECISIVE fact is code=1: ext0 is unmapped in the guest regardless
+of origin.) This is the #16/#17/#24 "libdispatch ownership / HOSTWQ event bridge" wall,
+localized to EVFILT_MACHPORT message-buffer handling.
+
+MECHANISM REFINED (more diag): the EVFILT_MACHPORT source is registered with ext0=0/ext1=0
+(KEVREG filt=-8 flags=0x385 fflags=0x7000a0e ext0=0 ext1=0) -- the guest does NOT provide a
+receive buffer; fflags requests a KERNEL-ALLOCATED receive. On delivery the kernel returns
+ext0=0x170aaab00 ext1=0x78 = a buffer the host kernel allocated IN OCERZ'S HOST ADDRESS SPACE
+(the workqueue worker is a host thread). The guest reads ext0 as a GUEST addr -> unmapped.
+Also confirmed: ocerz + host SHARE ONE MACH PORT NAMESPACE (dispatch_mach case 47 passes
+msgh_remote/local port NAMES through untranslated, translating only the buffer ptr a[0]=g2h
+and specific vm-reply OOL relocations via mig_vm_reply_relocate). So port names inside the
+received message need NO translation.
+FIX DIRECTION (faithful, owner rejects bandaids):
+ - Bug A: it is NOT a registration ext[] translation (ext0=0 at reg). It is DELIVERY-side
+   Mach-message bridging in ocerz_hostwq_bridge (and ocerz_spawn_workloop_worker, which also
+   copies events): for each EVFILT_MACHPORT event with ext0!=0, the kernel-received message
+   lives at host VA ext0 (size from msgh_size/ext1, host-readable). Copy it into GUEST memory
+   and rewrite the guest kevent ext0 -> the guest copy, so guest libdispatch's
+   _dispatch_kevent_mach_msg_recv reads the message in the guest AS. Open lifecycle/correctness
+   points to resolve BEFORE coding (corruption risk): (i) WHO frees the buffer -- does guest
+   libdispatch vm_deallocate(ext0,ext1) after processing? If yes the guest copy must be a real
+   guest vm_allocate'd region it can free (NOT carved from the reused worker region, or its
+   free unmaps part of the region); and ocerz must free the HOST kernel buffer (vm_deallocate
+   the memory only, NOT mach_msg_destroy -- shared namespace, the rights must persist). (ii)
+   COMPLEX messages (MACH_MSGH_BITS_COMPLEX bit in msgh_bits) carry OOL/descriptor host
+   addresses needing relocation like mig_vm_reply_relocate. (iii) a per-worker recv-buffer
+   pool to avoid arena bump-exhaustion. Being designed + adversarially verified before coding.
+
+   RESOLUTION (same day) -- ★★★ FIXED + VERIFIED, make-check GREEN, notepad now builds its GUI.
+   Implemented ocerz_bridge_mach_msg() (src/syscall.c) called from ocerz_hostwq_bridge
+   (DEFAULT-ON; OCERZ_NO_MACHBRIDGE to A/B): copy the kernel's host-allocated message (ext0,
+   sz=ext1) into a fresh guest mapping and rewrite ext0; for COMPLEX messages walk descriptors
+   and relocate OOL/OOL_PORTS/OOL_VOLATILE (types 1/2/3) into guest memory (PORT type 0 = name
+   only, shared namespace, no reloc). A/B (clean slate): NO bridge -> machport_ev=3 gs320=3
+   wfault=3; WITH bridge -> machport_ev=10 gs320=0 wfault=0. Observed COMPLEX msgs carry only
+   PORT descriptors (decoded type+11=0x00, names 0x2a03/0x2213) so verbatim is faithful; OOL
+   reloc is completeness (NOT exercised here -> code-review-only). Lifecycle VERIFIED: gbuf
+   addresses RECYCLE -> guest vm_deallocate()s the copy (kernel allocs, app frees, like macOS).
+   Two next-walls the bridge exposed also fixed: BSD 142 gethostuuid (host-forward ptr_flags
+   0x03) and Mach trap 11 mach_vm_purgable_control (ocerz never purges -> SUCCESS + NONVOLATILE).
+   ★ RESULT: `bin/wine notepad` runs PAST gs:0x320 to notepad's OWN GUI -- creates the Edit
+   control (1028x727 text area: hwnd 0x20052 visible (0,0)-(1028,727)), status bar, IME windows.
+   ZERO ocerz fatals (only the pre-existing non-fatal init-skip UD2). make-check GREEN.
+   NEW WALLS reached (separate): (1) err:ole:start_rpcss "Failed to start RpcSs service" then
+   tree exits; (2) winemac.drv on-screen NSWindow stage (no macdrv trace yet -- the NSWindow for
+   main window 0x1004a is the next frontier; the bridge should now let macdrv_start_cocoa_app's
+   main loop run, undoing the #16/#17 timeout). OPEN ROBUSTNESS (code-review follow-ups, not
+   blocking): OOL-reloc path untested; the host kernel buffer (+ relocated host OOL) is not
+   vm_deallocate'd after copy -> small leak; the synthetic ocerz_spawn_workloop_worker path
+   (OCERZ_KEVENT_WORKER) has the same latent un-bridged-Mach bug. KEPT diag: OCERZ_WSIG.
+
+   ADVERSARIAL VERIFICATION (workflow, 5 agents / 4 lenses) + ROBUSTNESS HARDENING applied:
+   the panel CONFIRMED the core fix correct (ABI/stride, nev>1 ordering, gethostuuid ptr_mask,
+   purgable_control NONVOLATILE all verified). REAL gaps found -> FIXED (make-check GREEN; deep
+   re-run: machport_ev=10 bridge=10 COMPLEX=5 gs320=0 wfault=0, notepad Edit 1028x727 still
+   created): (1) ★ the SYNCHRONOUS kevent_id(#375) drain path (a worker re-draining its workloop
+   gets MACHPORT events back with host ext0) was UN-bridged = same crash in another reachable
+   path -> now bridges the returned eventlist in sys_kevent_id; (2) GUARDED_PORT (desc type 4)
+   aborted the descriptor walk (could leave a later OOL un-relocated) -> now advances 16 and
+   continues; (3) fail-unsafe: on map_anywhere failure the call site now nulls ext0 (never leaves
+   a host pointer), and an OOL reloc failure delivers an EMPTY OOL. OVERRODE the panel's #1
+   ("monotonic arena leak -> use a pooled slab"): its premise is refuted by live evidence (gbuf
+   addresses RECYCLE = the guest vm_deallocate's the copy), and its proposed slab-in-worker-region
+   would CORRUPT that region (the guest frees the buffer) -- the current per-message map_anywhere
+   is correct. DEFERRED (verifier-classified follow-up): freeing the host kernel buffer + OOL
+   backings (slow host-AS leak) -- held until validatable at the deep phase without destabilizing;
+   and bridging plain kevent(#363) + the synthetic ocerz_spawn_workloop_worker path.
+ - Bug B (latent amplifier): Wine's segv_handler cannot run on a no-Wine-TEB worker (any
+   fault on such a worker becomes a fatal gs:0x320 loop, not just this one). Real macOS Wine
+   doesn't hit this (no PROT_NONE arena -> no commit faults; no mistranslated buffers). Decide
+   whether to also faithfully harden ocerz's fault path for no-TEB workers.
+DIAGNOSTICS KEPT (env-gated, cheap): OCERZ_WSIG (worker-signal + HOSTWQ-EV dump),
+g_ocerz_deliver_src source tags. Tree builds; make-check to be re-verified after the fix.
+KEY ANCHORS: ntdll.so load base 0x381a04bac; segv_handler/init_handler @ ntdll.so vmaddr
+~0x33344-0x33377 (nm mislabels it _signal_init_process due to missing asm syms);
+libdispatch _dispatch_kevent_mach_msg_recv @ __TEXT+0x21caf (fault +0x21cc1); guest _sigtramp
+= libsystem_platform __TEXT+0x33a0 = 0x7ff802e7d3a0. notes/wine_bringup.md UPDATE #23.

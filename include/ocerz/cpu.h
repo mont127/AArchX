@@ -104,7 +104,22 @@ typedef struct OcerzCPU {
     int sig_on_stack;
     uint64_t sig_last_fault;
     int sig_repeat;
+    /* The last TEB-band gs base this thread installed (what WoW64 PE code runs
+     * with). A WoW64 PE class-0 syscall is always issued with gs=TEB; if a class-0
+     * SIGSYS is taken while gs is the unix cthread base (Wine's own signal handler
+     * swapped it via machdep), ocerz restores gs to this so __wine_syscall_
+     * dispatcher resolves the TEB the macOS-14 kernel would have, instead of
+     * reading cthread-relative junk (the 0x3fff66748 / [0x8ffff8] crash). */
+    uint64_t wine_teb_base;
 } OcerzCPU;
+
+/* A gs base is "TEB-band" (a Wine TEB, what PE code runs with, ~0x7ffd8000) when
+ * it is neither the arena-resident unix cthread base (> 0x380000000) nor a tiny
+ * garbage value. */
+static inline int ocerz_gs_is_teb_band(uint64_t gs)
+{
+    return gs >= 0x10000ull && gs < 0x380000000ull;
+}
 
 void ocerz_cpu_reset(OcerzCPU *cpu);
 void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out);

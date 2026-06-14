@@ -169,6 +169,13 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len);
 int ocerz_addr_committed(uint64_t gaddr);
 unsigned ocerz_host_region_prot(uint64_t gaddr, uint64_t *base, uint64_t *size);
 
+/* Thread-init start gate (see src/mem.c): arm at process start (parks workers iff
+ * WINEARCH is set = a Wine process), release on the guest's preloader-reservation
+ * munmap, wait at the top of every worker before it runs guest code. */
+void ocerz_init_gate_arm(void);
+void ocerz_init_gate_release(void);
+void ocerz_init_gate_wait(void);
+
 static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
 {
     const void *p = ocerz_g2h(gaddr);

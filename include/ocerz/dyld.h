@@ -47,4 +47,7 @@ uint64_t ocerz_dlsym(uint64_t handle, const char *sym);
 int ocerz_dlclose(uint64_t handle);
 uint64_t ocerz_dlerror(void);
 
+void ocerz_dyld_dump_images(void);
+const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out);
+
 #endif

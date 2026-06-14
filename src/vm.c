@@ -71,6 +71,7 @@
 #include "ocerz/jit.h"
 #include "ocerz/mem.h"
 #include "ocerz/syscall.h"
+#include "ocerz/dyldapi.h"
 
 #include <signal.h>
 #include <setjmp.h>
@@ -82,6 +83,21 @@
 
 static OcerzVM *g_vm;
 static __thread OcerzCPU *g_cur_cpu;
+
+/* Pending ASYNCHRONOUS guest signals for THIS thread (a bitmask of signo, 1..31).
+ * The macOS kernel delivers __pthread_kill(thread_port, signo) to a named thread
+ * asynchronously, interrupting its current syscall. ocerz reproduces that: the host
+ * async_sig_handler (installed for the signals Wine sends cross-thread, e.g. the
+ * wineserver's SIGUSR1 system-APC/suspend kick) sets the bit and returns -- EINTRing
+ * the target out of its blocking forwarded host syscall -- and the syscall-return
+ * boundary in ocerz_handle_syscall builds the guest signal frame via
+ * ocerz_signal_deliver. See sys_pthread_kill. */
+static __thread volatile uint32_t g_pending_async_mask;
+
+uint32_t ocerz_take_pending_async_sig(void)
+{
+    return __atomic_exchange_n(&g_pending_async_mask, 0u, __ATOMIC_SEQ_CST);
+}
 /* When a guest CPU fault is converted to a guest signal, the host SIGSEGV/SIGBUS
  * handler redirects g_cur_cpu to the guest handler and unwinds the interrupted
  * interpreter/JIT back to the nearest run-loop step via this per-thread jump
@@ -96,6 +112,15 @@ static __thread sigjmp_buf *g_sig_recover;
 static __thread uint64_t g_riphist[32];
 static __thread unsigned g_riphist_n;
 static int g_crash_stack;
+
+unsigned ocerz_vm_riphist(uint64_t *out, unsigned max)
+{
+    unsigned n = g_riphist_n < 32 ? g_riphist_n : 32;
+    if (n > max) n = max;
+    for (unsigned i = 0; i < n; i++)
+        out[i] = g_riphist[(g_riphist_n - 1 - i) & 31];
+    return n;
+}
 /* OCERZ_SIGTRACE: when set, crash_handler writes one async-signal-safe line per
  * converted guest signal (fault address, the handler/trampoline it redirects to,
  * the faulting guest rip and icount). Read once at handler-install time so the
@@ -105,6 +130,21 @@ static int g_sigtrace;
 uint64_t ocerz_watch_addr;
 uint64_t ocerz_watch_val;
 uint64_t ocerz_exc_trap;
+/* When >0, a guest CPU fault inside an ocerz_vm_call (a library initializer)
+ * is logged and SKIPPED -- the call returns -- instead of aborting the process.
+ * Set around shared-cache image initializers (run_image_inits), which must run
+ * on dlopen so a post-boot framework (Foundation) is fully initialized, but a
+ * few of which (SkyLight's, which asserts a libdispatch queue context ocerz
+ * cannot provide -> ud2) cannot run under emulation and are best-effort skipped
+ * exactly as the old all-initializers-skipped behavior did, minus the ones we
+ * actually need. */
+int ocerz_init_tolerant;
+/* OCERZ_SELTRAP=<rip>: when a run-loop step begins at this guest rip (point it at
+ * objc's __forwarding_prep_0___ / a doesNotRecognizeSelector site), dump the
+ * objc_msgSend receiver (rdi) + its isa, the selector pointer (rsi) and its name
+ * string, and the thread gs_base -- to tell a non-canonical selector pointer from
+ * a corrupt receiver isa behind an "unrecognized selector" abort. */
+static uint64_t ocerz_sel_trap;
 /* OCERZ_CTXTRAP=<rip>: when a run-loop step begins at this guest rip, dump the
  * Wine syscall_frame pointed to by rcx (rax@0, rcx@0x10, rdx@0x18, rdi@0x28,
  * rip@0x70, rsp@0x88) — used to inspect the context that NtContinue/dispatcher-
@@ -189,11 +229,45 @@ void ocerz_exc_report(const OcerzCPU *c)
     fputc('\n', stderr);
 }
 
+static void sel_trap_report(const OcerzCPU *c)
+{
+    uint64_t recv = c->gpr[OCERZ_RDI];
+    uint64_t sel = c->gpr[OCERZ_RSI];
+    uint64_t isa = recv ? (ocerz_ld(recv, 8) & 0x00007ffffffffff8ull) : 0;
+    char nm[80];
+    int i = 0;
+    for (; i < 79 && sel; i++) {
+        uint8_t b = (uint8_t)ocerz_ld(sel + (uint64_t)i, 1);
+        nm[i] = (char)b;
+        if (!b)
+            break;
+    }
+    nm[i] = 0;
+    fprintf(stderr,
+            "ocerz: SELTRAP rip=%#llx recv=%#llx isa=%#llx sel=%#llx \"%s\" gs=%#llx icount=%llu\n",
+            (unsigned long long)c->rip, (unsigned long long)recv, (unsigned long long)isa,
+            (unsigned long long)sel, nm, (unsigned long long)c->gs_base,
+            g_vm ? (unsigned long long)g_vm->insn_count : 0);
+    if (isa && getenv("OCERZ_METHDUMP"))
+        ocerz_dyldapi_dump_method(isa, "allocWithZone:");
+}
+
+uint64_t ocerz_current_guest_rip(void)
+{
+    return g_cur_cpu ? g_cur_cpu->rip : 0;
+}
+
+uint64_t ocerz_current_guest_rsp(void)
+{
+    return g_cur_cpu ? g_cur_cpu->gpr[OCERZ_RSP] : 0;
+}
+
 void ocerz_watch_hit(uint64_t gaddr, int size, uint64_t lo, uint64_t hi)
 {
     OcerzCPU *c = g_cur_cpu ? g_cur_cpu : (g_vm ? &g_vm->cpu : NULL);
-    fprintf(stderr, "ocerz: WATCH st [%#llx] size=%d val=%#llx:%#llx rip=%#llx icount=%llu"
+    fprintf(stderr, "ocerz: WATCH[pid=%d] st [%#llx] size=%d val=%#llx:%#llx rip=%#llx icount=%llu"
             " rdi=%#llx rsi=%#llx rax=%#llx rbx=%#llx r14=%#llx\n",
+            (int)getpid(),
             (unsigned long long)gaddr, size,
             (unsigned long long)hi, (unsigned long long)lo,
             c ? (unsigned long long)c->rip : 0,
@@ -238,6 +312,81 @@ static char *str_into(char *p, const char *s)
     while (*s)
         *p++ = *s++;
     return p;
+}
+
+/* Host handler for an async guest signal directed at this thread (the wineserver's
+ * cross-thread SIGUSR1/SIGQUIT kick, forwarded by sys_pthread_kill -> the host
+ * kernel -> here). Async-signal-safe: just record the signo; returning EINTRs the
+ * interrupted blocking host syscall, and the guest handler runs at the next
+ * syscall-return boundary (ocerz_handle_syscall). */
+static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
+{
+    (void)si; (void)ctx;
+    if (sig > 0 && sig < 32)
+        __atomic_or_fetch(&g_pending_async_mask, 1u << sig, __ATOMIC_SEQ_CST);
+}
+
+/* OCERZ_RIPDUMP: SIGUSR1 dumps the handling thread's current guest rip and its
+ * recent rip history, async-signal-safe, so a spinning guest loop (CFRunLoop /
+ * SkyLight / dispatch) can be located by `kill -USR1` without stopping it. */
+static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
+{
+    (void)sig; (void)si; (void)ctx;
+    if (!g_cur_cpu)
+        return;
+    char b[640];
+    char *p = b;
+    p = str_into(p, "ocerz: RIPDUMP rip=");
+    p = hex_into(p, g_cur_cpu->rip);
+    p = str_into(p, " gs=");
+    p = hex_into(p, g_cur_cpu->gs_base);
+    p = str_into(p, " hist:");
+    for (int i = 1; i <= 12; i++) {
+        p = str_into(p, " ");
+        p = hex_into(p, g_riphist[(g_riphist_n - (unsigned)i) & 31]);
+    }
+    *p++ = '\n';
+    write(2, b, (size_t)(p - b));
+    p = b;
+    static const char *const rn[] = { "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                      "r8","r9","r10","r11","r12","r13","r14","r15" };
+    p = str_into(p, "ocerz:   regs");
+    for (int i = 0; i < 16; i++) {
+        p = str_into(p, " ");
+        p = str_into(p, rn[i]);
+        p = str_into(p, "=");
+        p = hex_into(p, g_cur_cpu->gpr[i]);
+    }
+    *p++ = '\n';
+    write(2, b, (size_t)(p - b));
+    /* Dump instruction bytes at each distinct recent guest rip so a spinning
+     * loop can be disassembled offline. */
+    for (int i = 0; i < 24; i++) {
+        uint64_t r = g_riphist[(g_riphist_n - 1 - (unsigned)i) & 31];
+        if (!r) continue;
+        int dup = 0;
+        for (int j = 0; j < i; j++)
+            if (g_riphist[(g_riphist_n - 1 - (unsigned)j) & 31] == r) { dup = 1; break; }
+        if (dup) continue;
+        char x[160];
+        char *q = x;
+        q = str_into(q, "ocerz:   @");
+        q = hex_into(q, r);
+        if (ocerz_addr_committed(r) != 1) {
+            q = str_into(q, " (uncommitted)\n");
+            write(2, x, (size_t)(q - x));
+            continue;
+        }
+        q = str_into(q, " =");
+        for (int k = 0; k < 16; k++) {
+            uint64_t by = ocerz_ld(r + (uint64_t)k, 1);
+            *q++ = ' ';
+            *q++ = "0123456789abcdef"[(by >> 4) & 0xf];
+            *q++ = "0123456789abcdef"[by & 0xf];
+        }
+        *q++ = '\n';
+        write(2, x, (size_t)(q - x));
+    }
 }
 
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
@@ -298,7 +447,9 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (g_sigtrace) {
             char tb[256];
             char *t = tb;
-            t = str_into(t, delivered ? "ocerz: SIG deliver addr=" : "ocerz: SIG nohandler addr=");
+            t = str_into(t, delivered ? "ocerz: SIG[" : "ocerz: SIGNH[");
+            t = hex_into(t, (uint64_t)getpid());
+            t = str_into(t, "] deliver addr=");
             t = hex_into(t, gaddr);
             t = str_into(t, " rip=");
             t = hex_into(t, fault_rip);
@@ -339,6 +490,62 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 }
                 x = str_into(x, "\n");
                 write(2, xb, (size_t)(x - xb));
+            }
+            {
+                /* GPR snapshot: for the heap-walk fault the next-chunk pointer in
+                 * rax/r8 and the size in rcx/rdx tell us why the walk left the
+                 * committed range. */
+                char gb[256];
+                char *g = gb;
+                static const char *nm[] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                           "r8","r9","r10","r11","r12","r13","r14","r15"};
+                g = str_into(g, "ocerz:   gpr");
+                for (int i = 0; i < 16; i++) {
+                    g = str_into(g, " ");
+                    g = str_into(g, nm[i]);
+                    g = str_into(g, "=");
+                    g = hex_into(g, g_cur_cpu->gpr[i]);
+                }
+                g = str_into(g, "\n");
+                write(2, gb, (size_t)(g - gb));
+            }
+            {
+                /* Dump committed guest qwords at rsi and r12 (the heap base / first
+                 * chunk for the RtlCreateHeap fault) to read the heap's size fields. */
+                static const int regs[] = {OCERZ_RSI, OCERZ_R12, OCERZ_R11};
+                static const char *rn[] = {"rsi","r12","r11"};
+                for (int k = 0; k < 3; k++) {
+                    uint64_t b = g_cur_cpu->gpr[regs[k]];
+                    char mb[256]; char *m = mb;
+                    m = str_into(m, "ocerz:   mem["); m = str_into(m, rn[k]);
+                    m = str_into(m, "="); m = hex_into(m, b); m = str_into(m, "]:");
+                    for (int q = 0; q < 8; q++) {
+                        uint64_t a = b + (uint64_t)q * 8;
+                        m = str_into(m, " ");
+                        if (ocerz_addr_committed(a) == 1) m = hex_into(m, ocerz_ld(a, 8));
+                        else m = str_into(m, "<unc>");
+                    }
+                    m = str_into(m, "\n");
+                    write(2, mb, (size_t)(m - mb));
+                }
+            }
+            if (code == 1) {
+                char cb[400];
+                char *c = cb;
+                c = str_into(c, "ocerz:   commitmap ");
+                uint64_t pg = gaddr & ~0xfffull;
+                uint64_t scanlo = pg - 0x10000;
+                c = hex_into(c, scanlo);
+                c = str_into(c, "..: ");
+                for (int i = 0; i < 36; i++) {
+                    uint64_t a = scanlo + (uint64_t)i * 0x1000;
+                    int cm = ocerz_addr_committed(a);
+                    *c++ = (a == pg) ? '[' : ' ';
+                    *c++ = cm == 1 ? 'C' : (cm == 0 ? '.' : '?');
+                    *c++ = (a == pg) ? ']' : ' ';
+                }
+                c = str_into(c, "\n");
+                write(2, cb, (size_t)(c - cb));
             }
         }
         depth = 0;
@@ -587,6 +794,9 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     const char *et = getenv("OCERZ_EXCTRAP");
     if (et)
         ocerz_exc_trap = strtoull(et, NULL, 0);
+    const char *st = getenv("OCERZ_SELTRAP");
+    if (st)
+        ocerz_sel_trap = strtoull(st, NULL, 0);
     const char *ct = getenv("OCERZ_CTXTRAP");
     if (ct)
         ocerz_ctx_trap = strtoull(ct, NULL, 0);
@@ -612,6 +822,26 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     sa.sa_flags = SA_SIGINFO | SA_NODEFER | (altss.ss_sp ? SA_ONSTACK : 0);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    /* Install the async-signal handler for the signals the wineserver sends
+     * cross-thread (SIGUSR1 = the system-APC/suspend kick; SIGQUIT = thread stop).
+     * NO SA_RESTART so the target's blocked forwarded syscall returns EINTR and the
+     * guest handler is delivered at the syscall boundary. OCERZ_RIPDUMP repurposes
+     * SIGUSR1 for the debug rip dump, so only take SIGUSR1 for async delivery when
+     * RIPDUMP is off. */
+    struct sigaction as;
+    memset(&as, 0, sizeof as);
+    as.sa_sigaction = async_sig_handler;
+    as.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGQUIT, &as, NULL);
+    if (getenv("OCERZ_RIPDUMP")) {
+        struct sigaction su;
+        memset(&su, 0, sizeof su);
+        su.sa_sigaction = ripdump_handler;
+        su.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigaction(SIGUSR1, &su, NULL);
+    } else {
+        sigaction(SIGUSR1, &as, NULL);
+    }
     g_vm = vm;
     if (vm->jit_enabled && !vm->jit)
         vm->jit = ocerz_jit_create(vm);
@@ -679,6 +909,8 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
         int r;
         if (ocerz_exc_trap && local.rip == ocerz_exc_trap)
             ocerz_exc_report(&local);
+        if (ocerz_sel_trap && local.rip == ocerz_sel_trap)
+            sel_trap_report(&local);
         if (ocerz_ctx_trap && local.rip == ocerz_ctx_trap)
             ctx_trap_report(&local);
         if (ocerz_bt_lo && local.rip >= ocerz_bt_lo && local.rip < ocerz_bt_hi)
@@ -747,6 +979,12 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
         if (r == OCERZ_STEP_EXIT)
             break;
         if (r == OCERZ_STEP_FATAL) {
+            if (ocerz_init_tolerant) {
+                fprintf(stderr,
+                        "ocerz: init-skip: initializer %#llx faulted at rip=%#llx (skipped, process continues)\n",
+                        (unsigned long long)func, (unsigned long long)local.rip);
+                break;
+            }
             ocerz_cpu_dump(&local, stderr);
             OCERZ_FATAL("initializer call to %#llx aborted after %llu instructions\n",
                         (unsigned long long)func, (unsigned long long)vm->insn_count);
@@ -780,6 +1018,8 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
         int r;
         if (ocerz_exc_trap && cpu->rip == ocerz_exc_trap)
             ocerz_exc_report(cpu);
+        if (ocerz_sel_trap && cpu->rip == ocerz_sel_trap)
+            sel_trap_report(cpu);
         if (ocerz_ctx_trap && cpu->rip == ocerz_ctx_trap)
             ctx_trap_report(cpu);
         if (ocerz_bt_lo && cpu->rip >= ocerz_bt_lo && cpu->rip < ocerz_bt_hi)
