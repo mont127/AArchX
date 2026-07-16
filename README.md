@@ -1,7 +1,6 @@
 # Ocerz
 
-> [!WARNING]
-> This project is experimental and was vibecoded. Use at your own risk.
+
 
 **A from-scratch x86_64 → arm64 userspace binary translator for macOS - zero Rosetta involvement.**
 
@@ -81,5 +80,6 @@ Plain `Makefile`: `clang -arch arm64 -std=c11 -O2 -Wall -Wextra`. Guest tests ar
 [Apache-2.0](LICENSE).
 
 ---
-
+> [!WARNING]
+> This project is experimental and was vibecoded. Use at your own risk.
 
