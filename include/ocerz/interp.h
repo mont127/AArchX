@@ -40,7 +40,26 @@ enum OcerzStep {
 struct OcerzVM;
 
 int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu);
-int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn);
+/* NOTE THE `restrict`, AND WHAT IT PROMISES. It says: for the whole call, the
+ * decoded instruction is not reachable through vm, cpu, or guest memory, so no
+ * handler's write can change it. That lets the dispatcher read insn->op
+ * directly instead of copying all 96 bytes to the stack first (three ldp/stp
+ * q-register pairs, a 336-byte frame, and a store->load forwarding stall on the
+ * dispatch index) on EVERY interpreted instruction.
+ *
+ * It is legal only because of where the X86Insn lives, and there are exactly
+ * two legal caller classes:
+ *   - ocerz_interp_step's own host stack slot (src/interp.c), and
+ *   - a JIT block's malloc'd blk->insns array (src/jit.c).
+ * Both are ocerz HOST memory. Handlers only ever write through cpu, vm, or
+ * ocerz_g2h's guest windows, and ocerz_host_in_guest_space (mem.h) is the
+ * invariant that keeps those windows disjoint from the host heap and stack.
+ * Self-modifying guest code rewrites guest BYTES, not the host-side decoded
+ * X86Insn, so it cannot alias either.
+ *
+ * A NEW CALLER THAT PASSES AN X86Insn LIVING IN GUEST MEMORY WOULD SILENTLY
+ * BREAK THIS, and the compiler will not warn. Don't. */
+int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restrict insn);
 int ocerz_interp_ext(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn);
 int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn);
 

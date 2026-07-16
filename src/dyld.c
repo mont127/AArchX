@@ -564,8 +564,12 @@ static uint64_t image_export_trie(DynImage *img, uint32_t *size_out)
     return 0;
 }
 
-static uint64_t ocerz_image_self_resolve(DynImage *img, const char *sym)
+static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int *found)
 {
+    int dummy = 0;
+    if (!found)
+        found = &dummy;
+    *found = 0;
     uint32_t tsize = 0;
     uint64_t toff = image_export_trie(img, &tsize);
     if (!toff || !tsize)
@@ -583,6 +587,11 @@ static uint64_t ocerz_image_self_resolve(DynImage *img, const char *sym)
             uint64_t flags = self_uleb(&tp, end);
             if (flags & 0x08)
                 return 0;
+            *found = 1;
+            /* KIND_ABSOLUTE (flags&3 == 2): the trie value is literal and is never slid
+             * by load_base (libobjc's __objc_empty_vtable is absolute 0). */
+            if ((flags & 0x03) == 0x02)
+                return self_uleb(&tp, end);
             return img->load_base + self_uleb(&tp, end);
         }
         p += term;
@@ -607,6 +616,11 @@ static uint64_t ocerz_image_self_resolve(DynImage *img, const char *sym)
     return 0;
 }
 
+static uint64_t ocerz_image_self_resolve(DynImage *img, const char *sym)
+{
+    return ocerz_image_self_resolve_ex(img, sym, NULL);
+}
+
 static const char *dimg_ordinal_name(DynImage *img, int ord)
 {
     if (ord <= 0)
@@ -627,20 +641,36 @@ static const char *dimg_ordinal_name(DynImage *img, int ord)
     return NULL;
 }
 
-static uint64_t disk_flat_resolve(const char *name)
+static uint64_t disk_flat_resolve_ex(const char *name, int *found)
 {
     for (int i = 0; i < g_dimgs_n; i++) {
-        uint64_t v = ocerz_image_self_resolve(&g_dimgs[i], name);
-        if (v)
+        int f = 0;
+        uint64_t v = ocerz_image_self_resolve_ex(&g_dimgs[i], name, &f);
+        if (f) {
+            *found = 1;
             return v;
+        }
     }
     return 0;
+}
+
+static uint64_t disk_flat_resolve(const char *name)
+{
+    int f = 0;
+    return disk_flat_resolve_ex(name, &f);
 }
 
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
                                int libord, int weak)
 {
+    /* Track FOUND separately from the value. An ABSOLUTE export legitimately resolves to
+     * 0 -- libobjc exports __objc_empty_vtable that way, and every pre-ObjC2.1 class
+     * structure binds it into class+0x18. Keying "keep searching"/"unresolved" off
+     * value==0 rejected it, leaving those fields holding their raw on-disk fixup
+     * encoding: a corrupt method cache and superclass chain (libswiftCore then spins
+     * forever walking superclasses in swift_conformsToProtocol). */
     uint64_t value = 0;
+    int found = 0;
     if (libord > 0) {
         const char *tgt = dimg_ordinal_name(img, libord);
         if (tgt) {
@@ -648,16 +678,16 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
             if (!dep)
                 dep = dimg_find_by_path(tgt);
             if (dep)
-                value = ocerz_image_self_resolve(dep, name);
+                value = ocerz_image_self_resolve_ex(dep, name, &found);
         }
     }
-    if (value == 0)
-        value = ocerz_cache_resolve(cache, name);
-    if (value == 0 && (libord == -3 || libord == 0 || libord == -2))
-        value = ocerz_image_self_resolve(img, name);
-    if (value == 0)
-        value = disk_flat_resolve(name);
-    if (value == 0 && !weak)
+    if (!found)
+        value = ocerz_cache_resolve_ex(cache, name, &found);
+    if (!found && (libord == -3 || libord == 0 || libord == -2))
+        value = ocerz_image_self_resolve_ex(img, name, &found);
+    if (!found)
+        value = disk_flat_resolve_ex(name, &found);
+    if (!found && !weak)
         OCERZ_FATAL("unresolved import: %s\n", name);
     return value;
 }

@@ -689,9 +689,20 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_POP: {
+        /* Fault-atomic: rsp is committed only AFTER the destination write lands.
+         * ocerz_pop() would increment rsp first, which is safe when only the LOAD
+         * can fault, but `pop qword [mem]` (8F /0) can fault in the STORE -- and the
+         * rip-rewind hands the same instruction back to the guest to retry, so a
+         * pre-incremented rsp made the retry read the NEXT slot and increment again
+         * (rsp ends +16, wrong value stored). Real hardware aborts the pop with rsp
+         * untouched; tests/guest/popmem_test.c pins that against native x86.
+         * `pop rsp` must end with rsp = the popped value, so skip the increment when
+         * the destination IS rsp (x86 discards the increment in that form). */
         int size = insn->opsize;
-        uint64_t v = ocerz_pop(cpu, size);
+        uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RSP], size);
         ocerz_write_op(cpu, insn, &insn->ops[0], v);
+        if (!(insn->ops[0].kind == OCERZ_OPK_REG && insn->ops[0].reg == OCERZ_RSP))
+            cpu->gpr[OCERZ_RSP] += (uint64_t)size;
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_PUSHF:
@@ -717,8 +728,13 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_LEAVE: {
-        cpu->gpr[OCERZ_RSP] = cpu->gpr[OCERZ_RBP];
-        cpu->gpr[OCERZ_RBP] = ocerz_pop(cpu, 8);
+        /* Fault-atomic, same reason as POP above: the old code committed rsp = rbp
+         * BEFORE the pop that can fault, so a rewound retry re-ran LEAVE with rsp
+         * already clobbered. Load first; commit rsp/rbp only once the load lands.
+         * LEAVE == `mov rsp, rbp; pop rbp`, so rsp ends at rbp_old + 8. */
+        uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RBP], 8);
+        cpu->gpr[OCERZ_RSP] = cpu->gpr[OCERZ_RBP] + 8;
+        cpu->gpr[OCERZ_RBP] = v;
         return OCERZ_STEP_OK;
     }
     default:
@@ -999,16 +1015,19 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
         fprintf(stderr, "ocerz: %#llx: %s\n", (unsigned long long)cpu->rip, buf);
     }
 
+    /* rip advances to the NEXT instruction before executing (x86 semantics need
+     * that mid-instruction), so record the faulting address separately -- see
+     * OcerzCPU::cur_rip. */
+    cpu->cur_rip = cpu->rip;
     cpu->rip += insn.len;
     return ocerz_interp_exec(vm, cpu, &insn);
 }
 
-int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
+int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restrict insnp)
 {
-    const X86Insn insn = *insnp;
     int rc;
 
-    switch (insn.op) {
+    switch (insnp->op) {
     case OCERZ_OP_MOV:
     case OCERZ_OP_MOVZX:
     case OCERZ_OP_MOVSX:
@@ -1018,7 +1037,7 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
     case OCERZ_OP_BSWAP:
     case OCERZ_OP_CMOVCC:
     case OCERZ_OP_SETCC:
-        return op_mov_family(vm, cpu, &insn);
+        return op_mov_family(vm, cpu, insnp);
 
     case OCERZ_OP_PUSH:
     case OCERZ_OP_POP:
@@ -1027,11 +1046,11 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
     case OCERZ_OP_LAHF:
     case OCERZ_OP_SAHF:
     case OCERZ_OP_LEAVE:
-        return op_stack(vm, cpu, &insn);
+        return op_stack(vm, cpu, insnp);
 
     case OCERZ_OP_CBW:
     case OCERZ_OP_CWD:
-        return op_cbw_cwd(vm, cpu, &insn);
+        return op_cbw_cwd(vm, cpu, insnp);
 
     case OCERZ_OP_ADD:
     case OCERZ_OP_ADC:
@@ -1042,36 +1061,36 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
     case OCERZ_OP_XOR:
     case OCERZ_OP_CMP:
     case OCERZ_OP_TEST:
-        return op_arith(vm, cpu, &insn);
+        return op_arith(vm, cpu, insnp);
 
     case OCERZ_OP_INC:
     case OCERZ_OP_DEC:
     case OCERZ_OP_NEG:
     case OCERZ_OP_NOT:
-        return op_incdecnegnot(vm, cpu, &insn);
+        return op_incdecnegnot(vm, cpu, insnp);
 
     case OCERZ_OP_MUL:
     case OCERZ_OP_IMUL:
-        return op_mul(vm, cpu, &insn);
+        return op_mul(vm, cpu, insnp);
 
     case OCERZ_OP_DIV:
     case OCERZ_OP_IDIV:
-        return op_div(vm, cpu, &insn);
+        return op_div(vm, cpu, insnp);
 
     case OCERZ_OP_SHL:
     case OCERZ_OP_SHR:
     case OCERZ_OP_SAR:
-        return op_shift(vm, cpu, &insn);
+        return op_shift(vm, cpu, insnp);
 
     case OCERZ_OP_ROL:
     case OCERZ_OP_ROR:
     case OCERZ_OP_RCL:
     case OCERZ_OP_RCR:
-        return op_rotate(vm, cpu, &insn);
+        return op_rotate(vm, cpu, insnp);
 
     case OCERZ_OP_SHLD:
     case OCERZ_OP_SHRD:
-        return op_shiftd(vm, cpu, &insn);
+        return op_shiftd(vm, cpu, insnp);
 
     case OCERZ_OP_JMP:
     case OCERZ_OP_JCC:
@@ -1082,19 +1101,19 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
     case OCERZ_OP_CALL:
     case OCERZ_OP_RET:
     case OCERZ_OP_IRET:
-        return op_branch(vm, cpu, &insn);
+        return op_branch(vm, cpu, insnp);
 
     case OCERZ_OP_XADD:
     case OCERZ_OP_CMPXCHG:
     case OCERZ_OP_CMPXCHGXB:
-        return op_atomic(vm, cpu, &insn);
+        return op_atomic(vm, cpu, insnp);
 
     case OCERZ_OP_CLC:
     case OCERZ_OP_STC:
     case OCERZ_OP_CMC:
     case OCERZ_OP_CLD:
     case OCERZ_OP_STD:
-        return op_flagctl(vm, cpu, &insn);
+        return op_flagctl(vm, cpu, insnp);
 
     case OCERZ_OP_NOP:
     case OCERZ_OP_PAUSE:
@@ -1118,9 +1137,9 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
          * the int3. Only a genuinely unhandled trap (no SIGTRAP handler) is fatal. */
         if (ocerz_signal_deliver(cpu, OCERZ_SIGTRAP, cpu->rip, 0, 0))
             return OCERZ_STEP_OK;
-        return trap_fatal(&insn, "guest breakpoint/interrupt");
+        return trap_fatal(insnp, "guest breakpoint/interrupt");
     case OCERZ_OP_INT:
-        return trap_fatal(&insn, "guest breakpoint/interrupt");
+        return trap_fatal(insnp, "guest breakpoint/interrupt");
 
     case OCERZ_OP_UD2:
         /* start_wqthread's tail guard (OCERZ_START_WQTHREAD + 0xf): a workqueue
@@ -1129,7 +1148,7 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
          * return THREAD_RETURN. The real kernel parks the thread there; Ocerz
          * ends the worker's host thread cleanly instead of faulting. Only
          * wqthread workers execute this address -- the main thread never does. */
-        if (insn.rip == 0x7ff802e6f81bull) {
+        if (insnp->rip == 0x7ff802e6f81bull) {
             cpu->terminated = 1;
             return OCERZ_STEP_OK;
         }
@@ -1138,7 +1157,7 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
             uint64_t gate = cpu->gpr[OCERZ_RDX];
             fprintf(stderr, "ocerz: UD2DUMP rip=%#llx gs_base=%#llx gs+0x18=%#llx "
                     "gate=%#llx gate[0]=%#llx rdi=%#llx rsi=%#llx r14=%#llx\n",
-                    (unsigned long long)insn.rip, (unsigned long long)gs,
+                    (unsigned long long)insnp->rip, (unsigned long long)gs,
                     (unsigned long long)ocerz_ld(gs + 0x18, 8),
                     (unsigned long long)gate,
                     (unsigned long long)(gate ? ocerz_ld(gate, 8) : 0),
@@ -1155,10 +1174,10 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
             }
             fprintf(stderr, "\n");
         }
-        return trap_fatal(&insn, "guest UD2 (undefined instruction)");
+        return trap_fatal(insnp, "guest UD2 (undefined instruction)");
 
     case OCERZ_OP_HLT:
-        return trap_fatal(&insn, "guest HLT");
+        return trap_fatal(insnp, "guest HLT");
 
     case OCERZ_OP_SYSCALL:
         cpu->gpr[OCERZ_RCX] = cpu->rip;
@@ -1169,10 +1188,10 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insnp)
         break;
     }
 
-    rc = ocerz_interp_ext(vm, cpu, &insn);
-    if (rc == OCERZ_EUNSUP && insn.op >= OCERZ_OP_SSE_FIRST)
-        rc = ocerz_interp_sse(vm, cpu, &insn);
+    rc = ocerz_interp_ext(vm, cpu, insnp);
+    if (rc == OCERZ_EUNSUP && insnp->op >= OCERZ_OP_SSE_FIRST)
+        rc = ocerz_interp_sse(vm, cpu, insnp);
     if (rc == OCERZ_EUNSUP)
-        return ocerz_unimpl(vm, cpu, &insn, "no handler");
+        return ocerz_unimpl(vm, cpu, insnp, "no handler");
     return rc;
 }

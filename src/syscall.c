@@ -2438,6 +2438,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [229] = { "fsetattrlist", 5, 0x06, 0, NULL },
     [230] = { "poll",        3, 0x01, 0, NULL },
     [234] = { "getxattr",    6, 0x07, 0, NULL },
+    [466] = { "faccessat",   4, 0x02, 0, NULL },
     [476] = { "getattrlistat", 6, 0x0e, 0, NULL },
     [235] = { "fgetxattr",   6, 0x06, 0, NULL },
     [236] = { "setxattr",    6, 0x07, 0, NULL },
@@ -2458,7 +2459,9 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [274] = { "sysctlbyname",6, 0x1d, 0, sys_sysctlbyname },
     [381] = { "__mac_syscall", 3, 0x05, 0, NULL },
     [483] = { "csrctl", 3, 0x02, 0, NULL },
+    [441] = { "guarded_open_np", 5, 0x03, 0, NULL },
     [442] = { "guarded_close_np", 2, 0x02, 0, NULL },
+    [443] = { "guarded_kqueue_np", 2, 0x01, 0, NULL },
     [444] = { "change_fdguard_np", 6, 0x2a, 0, NULL },
     [501] = { "necp_open", 1, 0x00, 0, NULL },
     [502] = { "necp_client_action", 6, 0x14, 0, NULL },
@@ -2467,6 +2470,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [283] = { "fchmod_extended", 5, 0x10, 0, NULL },
     [286] = { "gettid",      2, 0x03, 0, NULL },
     [294] = { "shared_region_check_np", 1, 0x01, 0, sys_shared_region_check_np },
+    [322] = { "iopolicysys", 2, 0x02, 0, NULL },
     [327] = { "issetugid",   0, 0x00, 0, NULL },
     [336] = { "proc_info",   6, 0x10, 0, NULL },
     [338] = { "stat64",      2, 0x03, 0, NULL },
@@ -2607,6 +2611,24 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         e = &bsd_table[num];
 
     if (!e) {
+        /* Probe (OCERZ_SYSPROBE): report a missing entry and hand the guest ENOSYS
+         * instead of aborting, so one pass enumerates every syscall a target needs
+         * rather than one fatal per rebuild. Each number reports once. This is a
+         * table-building diagnostic, NOT a substitute for real entries -- ENOSYS is
+         * a lie to the guest, and callers that cannot cope with it fail downstream
+         * in ways that look like unrelated bugs. Never enable it for a real run. */
+        if (getenv("OCERZ_SYSPROBE")) {
+            static uint8_t probed[OCERZ_BSD_MAX];
+            if (num >= 0 && num < OCERZ_BSD_MAX && !probed[num]) {
+                probed[num] = 1;
+                fprintf(stderr, "ocerz: SYSPROBE missing class=2 num=%d rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx\n",
+                        num, (unsigned long long)cpu->rip,
+                        (unsigned long long)cpu->gpr[OCERZ_RDI], (unsigned long long)cpu->gpr[OCERZ_RSI],
+                        (unsigned long long)cpu->gpr[OCERZ_RDX], (unsigned long long)cpu->gpr[OCERZ_R10]);
+            }
+            ret_err(cpu, ENOSYS);
+            return OCERZ_STEP_OK;
+        }
         OCERZ_FATAL("unknown BSD syscall: class=2 num=%d (no table entry) rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx ret=%#llx\n", num,
                     (unsigned long long)cpu->rip, (unsigned long long)cpu->gpr[OCERZ_RDI],
                     (unsigned long long)cpu->gpr[OCERZ_RSI], (unsigned long long)cpu->gpr[OCERZ_RDX],
@@ -2736,6 +2758,7 @@ static const char *mach_trap_name(int num)
     case 18: return "_kernelrpc_mach_port_deallocate_trap";
     case 19: return "_kernelrpc_mach_port_mod_refs_trap";
     case 26: return "mach_reply_port";
+    case 40: return "_kernelrpc_mach_port_get_attributes_trap";
     case 27: return "thread_self_trap";
     case 28: return "task_self_trap";
     case 29: return "host_self_trap";
@@ -3010,6 +3033,19 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }
+    case 40: {
+        /* _kernelrpc_mach_port_get_attributes_trap(target, name, flavor,
+         * port_info_out, port_info_outCnt): the kernel writes the info array and
+         * its count back through args 3 and 4, so both are guest buffers that need
+         * translating. target/name are port names in the shared namespace and pass
+         * through untranslated like every other _kernelrpc port trap. */
+        if (a[3] != 0)
+            a[3] = (uint64_t)(uintptr_t)ocerz_g2h(a[3]);
+        if (a[4] != 0)
+            a[4] = (uint64_t)(uintptr_t)ocerz_g2h(a[4]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
     case 18:
     case 19:
     case 20:
@@ -3150,25 +3186,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
          * fatal "Malformed Mach message" and os_crashes. Dump the outgoing message structure. */
         if (reply_buf != 0 && (r47 & 0xfffff000ull) == 0x10000000ull)
             ocerz_log_mach_send_err(47, r47, a, reply_buf);
-        if (vm->strace && reply_buf != 0)
-            fprintf(stderr, "ocerz: mach_msg2 id=%u reply_id=%u bits=%#x size=%#x\n",
-                    msgh_id, (uint32_t)ocerz_ld(reply_buf + 0x14, 4),
-                    (uint32_t)ocerz_ld(reply_buf, 4),
-                    (uint32_t)ocerz_ld(reply_buf + 4, 4));
-        static int migtrace = -1;
-        if (migtrace < 0) migtrace = getenv("OCERZ_MIGTRACE") != NULL ? 1 : 0;
-        if (reply_buf != 0 && migtrace &&
-            ((uint32_t)ocerz_ld(reply_buf, 4) & 0x80000000u)) {
-            uint32_t dcnt = (uint32_t)ocerz_ld(reply_buf + 0x18, 4);
-            fprintf(stderr,
-                    "ocerz: MIGCOMPLEX reply_id=%u bits=%#x size=%#x desc_count=%u d0.addr=%#llx d0.type=%#x icount=%#llx\n",
-                    (uint32_t)ocerz_ld(reply_buf + 0x14, 4),
-                    (uint32_t)ocerz_ld(reply_buf, 4),
-                    (uint32_t)ocerz_ld(reply_buf + 4, 4), dcnt,
-                    (unsigned long long)ocerz_ld(reply_buf + 0x1c, 8),
-                    (uint32_t)ocerz_ld(reply_buf + 0x1c + 0xc, 4),
-                    (unsigned long long)vm->insn_count);
-        }
         static int machleak = -1;
         if (machleak < 0) machleak = getenv("OCERZ_MACHLEAK") != NULL ? 1 : 0;
         if (reply_buf != 0 && machleak) {

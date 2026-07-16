@@ -80,6 +80,13 @@
 #define CACHE_STEM "dyld_shared_cache_x86_64"
 #define CACHE_MAX_SUBCACHES 16
 #define EXPORT_FLAGS_REEXPORT 0x08
+/* Export trie symbol KIND (low 2 bits of the terminal flags). An ABSOLUTE export's
+ * trie value is the symbol's literal address and must NOT be slid by the image base:
+ * libobjc exports __objc_empty_vtable as absolute 0, and pre-ObjC2.1 class structures
+ * bind it into class+0x18. Resolving it to (mh + 0) -- or rejecting it because the
+ * value is 0 -- corrupts every such class. */
+#define EXPORT_FLAGS_KIND_MASK 0x03
+#define EXPORT_FLAGS_KIND_ABSOLUTE 0x02
 
 static uint32_t rd32(const uint8_t *p)
 {
@@ -325,9 +332,11 @@ static int dylib_export_region(uint64_t mh_addr, const uint8_t **trie_start,
 
 static uint64_t trie_lookup(const uint8_t *start, const uint8_t *end, const char *sym,
                             int *is_reexport, uint64_t *reexport_ord,
-                            const char **reexport_name)
+                            const char **reexport_name, int *found, uint64_t *flags_out)
 {
     *is_reexport = 0;
+    *found = 0;
+    *flags_out = 0;
     const uint8_t *p = start;
     const char *s = sym;
     while (p < end) {
@@ -337,6 +346,8 @@ static uint64_t trie_lookup(const uint8_t *start, const uint8_t *end, const char
                 return 0;
             const uint8_t *tp = p;
             uint64_t flags = uleb(&tp, end);
+            *flags_out = flags;
+            *found = 1;
             if (flags & EXPORT_FLAGS_REEXPORT) {
                 *is_reexport = 1;
                 *reexport_ord = uleb(&tp, end);
@@ -396,7 +407,8 @@ static const char *dylib_ordinal_name(uint64_t mh, uint64_t ord)
     return NULL;
 }
 
-static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, int depth)
+static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, int depth,
+                                 int *found)
 {
     if (depth > 16)
         return 0;
@@ -406,11 +418,18 @@ static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, in
     int reexp = 0;
     uint64_t ord = 0;
     const char *imp = NULL;
-    uint64_t off = trie_lookup(ts, te, sym, &reexp, &ord, &imp);
-    if (off == 0)
+    int lfound = 0;
+    uint64_t lflags = 0;
+    uint64_t off = trie_lookup(ts, te, sym, &reexp, &ord, &imp, &lfound, &lflags);
+    if (!lfound)
         return 0;
-    if (!reexp)
+    if (!reexp) {
+        *found = 1;
+        /* ABSOLUTE: value is literal, not image-relative (see EXPORT_FLAGS_KIND_ABSOLUTE). */
+        if ((lflags & EXPORT_FLAGS_KIND_MASK) == EXPORT_FLAGS_KIND_ABSOLUTE)
+            return off;
         return mh + off;
+    }
     const char *want = (imp && imp[0]) ? imp : sym;
     const char *tgt = dylib_ordinal_name(mh, ord);
     if (!tgt)
@@ -418,20 +437,32 @@ static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, in
     uint64_t tmh = cache_image_by_path(c, tgt);
     if (!tmh)
         return 0;
-    return resolve_in_dylib(c, tmh, want, depth + 1);
+    return resolve_in_dylib(c, tmh, want, depth + 1, found);
 }
 
-uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol)
+uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found)
 {
+    int dummy = 0;
+    if (!found)
+        found = &dummy;
+    *found = 0;
     if (!c->mapped)
         return 0;
     for (uint32_t i = 0; i < c->images_cnt; i++) {
         uint64_t mh = ocerz_cache_image_addr(c, i, NULL);
         if (mh == 0 || rd32((const uint8_t *)(uintptr_t)mh) != MH_MAGIC_64)
             continue;
-        uint64_t r = resolve_in_dylib(c, mh, symbol, 0);
-        if (r != 0)
+        int f = 0;
+        uint64_t r = resolve_in_dylib(c, mh, symbol, 0, &f);
+        if (f) {
+            *found = 1;
             return r;
+        }
     }
     return 0;
+}
+
+uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol)
+{
+    return ocerz_cache_resolve_ex(c, symbol, NULL);
 }

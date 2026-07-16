@@ -88,7 +88,7 @@ run_with_timeout() {
     return $?
 }
 
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0)
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test)
 
 expected_exit() {
     case "$1" in

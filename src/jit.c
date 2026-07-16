@@ -34,8 +34,18 @@
  * decoded insn carries its own guest rip, so ocerz_jit_exec_one sets
  * cpu->rip = insn->rip + insn->len before dispatching. Inlined instructions
  * therefore never need to touch cpu->rip — the next slow-path call restores
- * the architectural value, and inlined ops (register moves) never read it.
+ * the architectural value, and inlined ops never read it.
  * This is what makes inlining safe without a full register/flag model.
+ *
+ * There is ONE consequence of that, and it is not a detail: an inlined
+ * instruction that FAULTS cannot report its own rip, because it never wrote
+ * one. cpu->rip (and cpu->cur_rip) still name some earlier slow instruction.
+ * The fault handler therefore recovers the exact faulting rip from a per-block
+ * host-pc -> guest-rip side table (blk->insn_off; see ocerz_jit_fault_rip),
+ * which costs zero instructions on the hot path and is only ever walked from a
+ * cold trap. Emitting a rip store before every inlined memory access would have
+ * been the alternative, and would have taxed exactly the path this tier exists
+ * to keep empty.
  *
  * The one place rip is NOT restored by a slow call is a block that ends by
  * running off the JIT_MAX_BLOCK_INSNS length cap instead of on a terminator:
@@ -53,8 +63,18 @@
  *   - NOP/PAUSE/PREFETCH/CLFLUSH: emit nothing.
  *   - MOV reg<-reg and reg<-imm at operand size 4 or 8, high-byte-free: a
  *     ldr/str (size 4 loads through a w-register so the 64-bit slot is
- *     zero-extended exactly as x86 requires) or a movimm+str. Every other
- *     MOV form (memory, 8/16-bit, segment) falls to the slow path.
+ *     zero-extended exactly as x86 requires) or a movimm+str.
+ *   - MOV with ONE MEMORY OPERAND at size 4/8 (emit_mov_mem), and the ALU ops
+ *     with a memory SOURCE (emit_arith_mem): the address is computed natively,
+ *     range-guarded against the commpage/low-shadow/top windows at runtime
+ *     (emit_commpage_guard reproduces all four ocerz_g2h arms), and the access
+ *     is a TSO-ordered load/store. Memory-DESTINATION read-modify-write
+ *     arithmetic, locked ops, 8/16-bit and segment-override forms stay slow.
+ *   - PUSH/POP at opsize 8 with a plain GPR/imm operand (emit_push_pop) and
+ *     MOVSXD (emit_movsxd). Both set no flags. Measured as 60.5% and 8.3% of
+ *     the slow path respectively in a real Cocoa app -- the largest wins
+ *     available, and the cheapest to make bit-exact precisely because no flag
+ *     is involved.
  *   - LEA reg<-mem (4/8-bit dest, no segment): the effective address is
  *     materialized with movimm/ldr/add against the register file and stored,
  *     32-bit dests truncated by a w-move; no flags.
@@ -87,6 +107,16 @@
  * JIT is correct by construction and the differential test (every guest
  * binary under -no-jit vs JIT) holds it to that.
  *
+ * On what is NOT inlined, and why, from MEASUREMENT rather than intuition (a
+ * real Cocoa app, 3.5e9 slow-path executions, exact counters): CALL+RET are
+ * 11.4% of the slow path and remain the largest un-inlined item. ALL SSE
+ * combined is ~1.2% of the slow path (~0.7% of on-CPU) — inlining it would buy
+ * under a percent for a 128-bit register-file rewrite, so it is deliberately
+ * left alone. Memory-destination RMW arithmetic is <=1%. TEST is 5.4% of the
+ * slow path but 0% of it is in an inlineable shape: it is all `test al,al` /
+ * `test byte [x],imm`, i.e. it needs genuine 8/16-bit flag emission, not a
+ * relaxed guard. Do not "optimize" these on vibes; re-measure first.
+ *
  * The win over the pure interpreter is the eliminated per-execution decode
  * (the largest interpreter cost) and the collapsed dispatch: a hot loop
  * pays one hash lookup and one native call-chain per iteration instead of a
@@ -117,8 +147,45 @@
 #include <stddef.h>
 #include <stdlib.h>
 
-#define JIT_CODE_BYTES (64u << 20)
-#define JIT_HASH_BITS 16
+/* RESERVED, not committed: MAP_ANON pages take physical backing only on first
+ * write, so RSS still tracks bytes actually emitted — the reservation costs
+ * address space, not memory. This mirrors JSC's FixedVMPool and V8's code
+ * range, and is why they reserve rather than grow: one auditable placement.
+ * 64MB was sized for test programs. Measured on Mousecape: 340 B/block (the
+ * honest cost of x86 flag emulation), filling 64MB with 197,156 blocks in the
+ * FIRST 8s of a 170s startup. 1GB holds ~3.1M blocks, ~16x that working set. */
+#define JIT_CODE_BYTES_DEFAULT (1024ull << 20)
+
+/* OCERZ_JIT_CODE_MB sizes the reservation. OCERZ_JIT_CODE_KB is the finer-grain
+ * TEST knob and wins when both are set: the guest test programs emit far less
+ * than 1MB of code, so OCERZ_JIT_CODE_MB=1 never fills the arena and cannot
+ * exercise the interpreter tier — only a KB-scale arena forces demotion and
+ * turns the differential suite into a compiled-tier vs demoted-tier equivalence
+ * test. Rounded up to a page; the mapping must be at least one page. */
+static size_t jit_code_bytes(void)
+{
+    const char *kb = getenv("OCERZ_JIT_CODE_KB");
+    if (kb) {
+        unsigned long v = strtoul(kb, NULL, 0);
+        if (v) {
+            size_t pg = (size_t)getpagesize();
+            size_t bytes = ((size_t)v << 10 | 0) + pg - 1;
+            return bytes - (bytes % pg);
+        }
+    }
+    const char *e = getenv("OCERZ_JIT_CODE_MB");
+    unsigned long mb = e ? strtoul(e, NULL, 0) : 0;
+    return mb ? ((size_t)mb << 20) : (size_t)JIT_CODE_BYTES_DEFAULT;
+}
+
+/* 2^20 buckets. Measured on Mousecape at the window: 315,557 live blocks in the
+ * old 65,536 buckets = load factor 4.82, so each of ~1.47B cache_lookup calls
+ * pointer-chased ~4.8 chained nodes -- and cache_lookup is the whole of the
+ * dispatcher's hot path. 2^20 drops the load factor to ~0.30 (~1 probe). The
+ * cost is 8MB of calloc'd bucket array, lazily faulted, i.e. address space and
+ * only the touched pages. Blocks are never freed, so the table never rehashes;
+ * this is purely chain length, not behaviour. */
+#define JIT_HASH_BITS 20
 #define JIT_HASH_SIZE (1u << JIT_HASH_BITS)
 #define JIT_HASH_MASK (JIT_HASH_SIZE - 1)
 #define JIT_MAX_BLOCK_INSNS 256
@@ -131,6 +198,25 @@ typedef struct JitBlock {
     X86Insn *insns;
     int n_insns;
     struct JitBlock *hnext;
+    /* OCERZ_PERFSTAT (TEMPORARY): incremented by the block's own prologue (a
+     * plain non-atomic ldr/add/str -- a lost update under contention costs a
+     * count, never correctness) and by jit_interp_block for the demoted tier.
+     * n_inlined/n_slow are the block's STATIC composition, so exec_count scales
+     * them into executed-instruction counts. */
+    uint64_t exec_count;
+    int n_inlined;
+    int n_slow;
+    /* Host-pc -> guest-rip side table, n_insns entries, ASCENDING (emission is
+     * sequential, so it is sorted by construction). insn_off[i] is the offset in
+     * INSTRUCTION WORDS from `code` at which insn i's emitted code begins, so a
+     * host pc inside the block resolves to the guest instruction that owns it by
+     * binary search. Exists so a fault in INLINED code (which never writes
+     * cpu->rip) still reports the exact faulting rip. 4 bytes per guest insn --
+     * ~40 B/block, ~12MB at Mousecape's 315k blocks -- and zero instructions on
+     * the hot path, which is the entire point. NULL for a demoted block (no
+     * code: every insn is a slow call and sets cur_rip itself). */
+    uint32_t *insn_off;
+    uint32_t code_words;        /* length of the emitted code, in words */
 } JitBlock;
 
 struct OcerzJit {
@@ -138,19 +224,96 @@ struct OcerzJit {
     uint32_t *code_base;
     uint32_t *code_cur;
     uint32_t *code_end;
+    size_t code_bytes;
+    int code_full;              /* one-shot log latch */
     JitBlock *buckets[JIT_HASH_SIZE];
     uint64_t blocks_translated;
+    /* Compiled blocks in CODE-ADDRESS order, for the fault handler's host-pc ->
+     * block lookup. Append-only and sorted by construction: code is bump-
+     * allocated, so each successive compiled block starts above the last, and
+     * blocks are never freed. Appended under jit_lock (single writer);
+     * ci_n is published with a release store so a concurrent faulting thread
+     * either does not see an entry or sees it fully initialized. */
+    JitBlock **ci;
+    size_t ci_cap;
+    size_t ci_n;
 };
 
+/* ---- OCERZ_PERFSTAT: TEMPORARY measurement instrumentation (log-only, gated) ----
+ * Question: of the guest instructions actually EXECUTED, what fraction goes
+ * through ocerz_jit_exec_one (the interpreter slow path) rather than inlined
+ * native code, and WHICH OcerzOps are they? ps_ops is exact -- every slow-path
+ * execution passes through here, so the histogram is a direct count, not a
+ * sample. Inlined executions are derived from per-block exec_count * n_inlined.
+ * All counters are relaxed atomics touched only when the env var is set. */
+int ocerz_perfstat = -1;
+static _Atomic unsigned long long ps_ops[OCERZ_OP_COUNT];
+static _Atomic unsigned long long ps_slow_insns;
+static _Atomic unsigned long long ps_steps, ps_hits, ps_misses;
+/* [0]=push [1]=pop [2]=test [3]=movsxd [4]=call [5]=ret; column 0 = easy shape. */
+static _Atomic unsigned long long ps_shape[6][2];
+static const char *ps_shape_name[6] = { "push", "pop", "test", "movsxd", "call", "ret" };
+static uint64_t ps_t0;
+
+/* OUTLINED, and that is the whole point. Formatting needs a char buf[128], and
+ * an inline buf[128] forces a ~208-byte frame, three stp/ldp pairs and a stack-
+ * protector canary onto ocerz_jit_exec_one -- the hottest function in the
+ * emulator, entered once per slow-path instruction (3.5 BILLION times in a
+ * 151s Mousecape startup) for a branch that is not taken unless -trace is on.
+ * Moving the body out of line leaves exec_one a leaf-shaped function that can
+ * tail-call ocerz_interp_exec with no frame at all. noinline is load-bearing:
+ * without it the compiler is free to pull buf[128] back in and silently restore
+ * the frame. cold keeps it off the hot icache path. */
+static __attribute__((noinline, cold, preserve_most)) void jit_trace_one(const X86Insn *insn)
+{
+    char buf[128];
+    ocerz_format_insn(insn, buf, sizeof buf);
+    fprintf(stderr, "ocerz: %#llx: %s\n", (unsigned long long)insn->rip, buf);
+}
+
+/* Likewise outlined: the shape/histogram counters are ~20 instructions and a
+ * pile of constants that exist only under OCERZ_PERFSTAT. Inline, they bloat
+ * exec_one's frame and icache footprint on every one of those 3.5B calls. */
+static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(const X86Insn *insn)
+{
+    ps_slow_insns++;
+    unsigned o = insn->op;
+    if (o < OCERZ_OP_COUNT)
+        ps_ops[o]++;
+    /* Shape breakdown for the ops the histogram says dominate: an op only
+     * pays off to inline in the FORMS it actually appears in, so count how
+     * many are the easy shape (opsize 8, plain GPR/imm operand, no segment
+     * override) versus the awkward remainder. */
+    if (o == OCERZ_OP_PUSH || o == OCERZ_OP_POP) {
+        ps_shape[o == OCERZ_OP_PUSH ? 0 : 1][
+            (insn->opsize == 8 && insn->seg == OCERZ_SEG_NONE &&
+             (insn->ops[0].kind == OCERZ_OPK_REG ? !insn->ops[0].high8
+              : insn->ops[0].kind == OCERZ_OPK_IMM)) ? 0 : 1]++;
+    } else if (o == OCERZ_OP_TEST || o == OCERZ_OP_MOVSXD) {
+        ps_shape[o == OCERZ_OP_TEST ? 2 : 3][
+            ((insn->ops[0].size == 4 || insn->ops[0].size == 8) &&
+             insn->ops[0].kind == OCERZ_OPK_REG && !insn->ops[0].high8) ? 0 : 1]++;
+    } else if (o == OCERZ_OP_CALL || o == OCERZ_OP_RET) {
+        ps_shape[o == OCERZ_OP_CALL ? 4 : 5][
+            (o == OCERZ_OP_CALL && insn->ops[0].kind == OCERZ_OPK_IMM) ? 0 : 1]++;
+    }
+}
+
+/* THE hot function: entered once per slow-path guest instruction. Everything
+ * here that is not on the always-executed path is outlined above, so this
+ * compiles to a handful of instructions ending in a tail call. The observable
+ * order is unchanged and deliberate: insn_count++, then rip = insn->rip+len
+ * (which is what makes the fall-through/return address correct for CALL and for
+ * a fault taken inside the handler), then the trace hook, then dispatch. */
 int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
+    if (__builtin_expect(ocerz_perfstat > 0, 0))
+        jit_perfstat_one(insn);
     vm->insn_count++;
+    cpu->cur_rip = insn->rip;
     cpu->rip = insn->rip + insn->len;
-    if (vm->trace) {
-        char buf[128];
-        ocerz_format_insn(insn, buf, sizeof buf);
-        fprintf(stderr, "ocerz: %#llx: %s\n", (unsigned long long)insn->rip, buf);
-    }
+    if (__builtin_expect(vm->trace != 0, 0))
+        jit_trace_one(insn);
     return ocerz_interp_exec(vm, cpu, insn);
 }
 
@@ -489,9 +652,17 @@ static int emit_shift(A64Buf *b, const X86Insn *insn)
  * instruction slow call when it falls in the commpage range, and otherwise
  * performs the flat host access. Segment-override (FS/GS) memory and address-
  * size-32 truncation paths stay on the slow path. */
+/* ocerz_st honors TWO store watchpoints -- ocerz_watch_addr (OCERZ_WATCH, by
+ * address) and ocerz_watch_val (OCERZ_STVAL, by stored VALUE) -- and a native
+ * inlined store goes through neither. Both must therefore disable native stores,
+ * or the diagnostic silently misses exactly the stores the JIT inlined, which is
+ * worst precisely when it is needed: the value-watch exists to hunt down who
+ * writes a poison value, and "it was an inlined mov/push" is the answer it would
+ * never give. Checked at translate time; both are set from the environment
+ * before any block is translated, so this is a whole-run decision. */
 static int mem_native_store_ok(void)
 {
-    return ocerz_watch_addr == 0;
+    return ocerz_watch_addr == 0 && ocerz_watch_val == 0;
 }
 
 /* Compute the guest effective address of a base+index*scale+disp memory
@@ -672,6 +843,180 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
     return 0;
 }
 
+/* PUSH/POP at operand size 8 with a plain GPR or immediate operand and no
+ * segment override. MEASURED as the single biggest slow-path cost in a real
+ * Cocoa app: push+pop are 60.5% of all interpreted instructions and 26.9% of
+ * ALL executed guest instructions (function prologue/epilogue traffic), and
+ * 100.0% of them are this shape (493,513,020 easy vs 24,924 other).
+ *
+ * The reason this is the LOW-RISK big win: PUSH AND POP SET NO FLAGS. None of
+ * emit_pf / emit_zf_sf / emit_commit_flags is reachable, so the whole flags.c
+ * bit-exactness surface -- the thing that makes every other op painful to inline
+ * -- simply does not exist here. The semantics are two lines of interp_common.h.
+ *
+ * Everything below is the proven machinery emit_mov_mem already uses: the same
+ * emit_commpage_guard (which reproduces all four ocerz_g2h arms), the same
+ * +guest_base, and the same emit_guest_{load,store}_ordered including its
+ * aligned-STLR / misaligned-DMB+STR split -- the x86 stack is NOT architecturally
+ * 8-byte aligned, so that split is load-bearing, not a pessimization to remove.
+ *
+ * THREE ORDERING TRAPS, each one transposed line from silent corruption, and
+ * each traced to the interpreter reference rather than assumed:
+ *
+ *  1. PUSH reads its operand BEFORE rsp moves (ocerz_read_op runs before
+ *     ocerz_push in interp.c), so `push rsp` pushes the OLD rsp. The value is
+ *     loaded first here for exactly that reason.
+ *
+ *  2. The guard's slow call RE-EXECUTES THE WHOLE INSTRUCTION through the
+ *     interpreter. So nothing architectural may be mutated before the guard:
+ *     this computes the address into JTA and touches no state, or a commpage-
+ *     ranged push would decrement rsp here AND again in the interpreter.
+ *
+ *  3. The memory access must land BEFORE rsp is committed (push) and the
+ *     destination write must land LAST (pop). A faulting access aborts the
+ *     instruction, and a delivered fault now rewinds rip to retry it, so a
+ *     prematurely committed rsp would be applied twice. For `pop rsp` the
+ *     destination store must also win over the rsp increment -- so new_rsp is
+ *     stored first and the popped value second, unconditionally, in that order,
+ *     which collapses to the correct rsp=v for the pop-rsp case and is a
+ *     redundant-but-harmless second store otherwise. This mirrors ocerz_push /
+ *     ocerz_pop exactly. */
+/* A/B kill switch. Read once (translate() runs under jit_lock, and the value is
+ * a whole-run decision), it makes "is a fault caused by inlined push/pop?" a
+ * one-run experiment on the SAME binary instead of a rebuild-and-hope. Costs a
+ * predictable never-taken branch at translate time only. */
+static int stack_inline_enabled(void)
+{
+    static int en = -1;
+    if (en < 0)
+        en = getenv("OCERZ_NO_INLINE_STACK") ? 0 : 1;
+    return en;
+}
+
+static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *o = &insn->ops[0];
+    uint64_t gbase = ocerz_guest_base;
+
+    if (!stack_inline_enabled())
+        return 0;
+    if (insn->opsize != 8 || insn->seg != OCERZ_SEG_NONE)
+        return 0;
+
+    if (insn->op == OCERZ_OP_PUSH) {
+        if (!mem_native_store_ok())
+            return 0;
+        /* Operand size must be 8 so the value is the full 64-bit slot: that is
+         * what ocerz_read_op yields for both arms (read_gpr at size 8, and
+         * trunc(imm,8) on an immediate the decoder already sign-extended). Any
+         * other width falls through to the interpreter rather than guessing. */
+        if (o->kind == OCERZ_OPK_REG) {
+            if (o->high8 || o->size != 8)
+                return 0;
+        } else if (o->kind == OCERZ_OPK_IMM) {
+            if (o->size != 8)
+                return 0;
+        } else {
+            return 0;
+        }
+
+        /* (1) value first -- `push rsp` must push the OLD rsp. */
+        if (o->kind == OCERZ_OPK_REG)
+            a64_ldr(b, 8, JT1, 20, GPR_OFF(o->reg));
+        else
+            a64_mov_imm64(b, JT1, o->imm);
+
+        /* (2) address only; no architectural state touched before the guard. */
+        a64_ldr(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
+        a64_sub_imm(b, 1, JTA, JT0, 8);
+
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        a64_mov_imm64(b, JTU, gbase);
+        a64_add_reg(b, 1, JTA, JTA, JTU, 0);
+        /* (3) store, THEN commit rsp: a fault here leaves rsp untouched so the
+         * retry pushes to the same address. JT0 survives the helper (it uses
+         * rv=JT1, ra=JTA, scratch=JTU). */
+        emit_guest_store_ordered(b, 8, JT1, JTA, JTU);
+        a64_sub_imm(b, 1, JT0, JT0, 8);
+        a64_str(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
+        a64_patch_b(skip, a64_label(b));
+        return 1;
+    }
+
+    if (insn->op == OCERZ_OP_POP) {
+        if (o->kind != OCERZ_OPK_REG || o->high8 || o->size != 8)
+            return 0;
+
+        /* (2) address only; the load is what may fault. */
+        a64_ldr(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
+        a64_mov_reg(b, 1, JTA, JT0);
+
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        a64_mov_imm64(b, JTU, gbase);
+        a64_add_reg(b, 1, JTA, JTA, JTU, 0);
+        emit_guest_load_ordered(b, 8, JT1, JTA, JTU);
+        /* (3) rsp increment first, popped value LAST: `pop rsp` must end with
+         * rsp = the popped value, exactly as ocerz_pop + ocerz_write_op do. */
+        a64_add_imm(b, 1, JT0, JT0, 8);
+        a64_str(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
+        a64_str(b, 8, JT1, 20, GPR_OFF(o->reg));
+        a64_patch_b(skip, a64_label(b));
+        return 1;
+    }
+    return 0;
+}
+
+/* MOVSXD reg64 <- reg32/mem32: sign-extend 32 to 64. 8.26% of the slow path in
+ * a real app (125,934,088 executions) and the cheapest real win available --
+ * the entire semantics are one line of interp.c (sext of the source) and it
+ * SETS NO FLAGS, so like push/pop there is no flags.c bit-exactness surface.
+ *
+ * Both source forms are inlined. The measured "100% easy" shape counter only
+ * classified the DESTINATION, so the source can legitimately be memory; the
+ * memory arm reuses emit_mem_ea + emit_commpage_guard + emit_guest_load_ordered
+ * exactly as emit_mov_mem does, and touches no state before the guard (whose
+ * slow call re-executes the whole instruction).
+ *
+ * MOVSX (the 8/16-bit-source sibling) shares the interpreter case but is a
+ * different width problem and stays on the slow path. */
+static int emit_movsxd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0];
+    const X86Operand *s = &insn->ops[1];
+
+    /* Destination must be a plain 64-bit GPR: then ocerz_write_op is just
+     * gpr[reg] = v, with no sub-register merge to reproduce. */
+    if (d->kind != OCERZ_OPK_REG || d->high8 || d->size != 8)
+        return 0;
+    if (s->size != 4)
+        return 0;
+
+    if (s->kind == OCERZ_OPK_REG) {
+        if (s->high8)
+            return 0;
+        /* w-load zero-extends the low 32 (matching ocerz_read_gpr at size 4),
+         * then sxtw sign-extends them -- the composition is the interpreter's
+         * ocerz_sext(read_op(src, 4), 4). */
+        a64_ldr(b, 4, JT0, 20, GPR_OFF(s->reg));
+        a64_sxtw(b, JT0, JT0);
+        a64_str(b, 8, JT0, 20, GPR_OFF(d->reg));
+        return 1;
+    }
+    if (s->kind == OCERZ_OPK_MEM) {
+        if (!emit_mem_ea(b, insn, s, JTA))
+            return 0;
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        a64_mov_imm64(b, JTU, ocerz_guest_base);
+        a64_add_reg(b, 1, JTA, JTA, JTU, 0);
+        emit_guest_load_ordered(b, 4, JT1, JTA, JTU);
+        a64_sxtw(b, JT1, JT1);
+        a64_str(b, 8, JT1, 20, GPR_OFF(d->reg));
+        a64_patch_b(skip, a64_label(b));
+        return 1;
+    }
+    return 0;
+}
+
 /* ALU with a register destination and a MEMORY source (ADD/SUB/CMP/AND/OR/XOR/
  * TEST reg, mem) at size 4/8. The memory value is loaded natively (commpage-
  * guarded) into the b-operand register, then the identical NZCV+fixup flag
@@ -830,6 +1175,11 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
         return emit_shift(b, insn);
     case OCERZ_OP_LEA:
         return emit_lea(b, insn);
+    case OCERZ_OP_PUSH:
+    case OCERZ_OP_POP:
+        return emit_push_pop(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_MOVSXD:
+        return emit_movsxd(b, insn, exit_sites, n_exits);
     default:
         return 0;
     }
@@ -901,6 +1251,98 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     (*n_exits)++;
 }
 
+/* ---- OCERZ_JITSTAT: TEMPORARY measurement instrumentation (log-only, gated) ----
+ * Answers: is translate() hot because failures are never cached (each retry
+ * re-decodes under the global jit_lock), or because the app legitimately runs a
+ * huge amount of one-shot code? Counters are relaxed atomics and only touched
+ * when the env var is set; behaviour is unchanged either way. */
+int ocerz_jitstat = -1;
+static _Atomic unsigned long long js_steps, js_hits, js_misses;
+static _Atomic unsigned long long js_xlat, js_xlat_ok, js_xlat_fail;
+static _Atomic unsigned long long js_fail_decode0, js_fail_overflow, js_fail_alloc;
+static _Atomic unsigned long long js_decoded_insns; /* decode work on the miss path */
+static uint64_t js_t0;
+
+/* Per-rip failure table (single-writer: only ever touched under jit_lock). */
+#define JS_FTAB (1u << 20)
+typedef struct { uint64_t rip; unsigned long long n; unsigned char bytes[8];
+                 unsigned reason; int nins; } JsFail;
+static JsFail js_ftab[JS_FTAB];
+static unsigned js_ftab_used, js_ftab_full;
+
+/* reason codes */
+enum { JSR_DECODE0 = 1, JSR_OVERFLOW = 2, JSR_ALLOC = 3 };
+
+static void js_note_fail(uint64_t rip, unsigned reason, int nins)
+{
+    /* Wide hash: hash_rip() only yields JIT_HASH_BITS, too few for this table.
+     * Probe is bounded (a full 1M-slot scan per miss would dwarf what we measure). */
+    uint64_t x = rip;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 29;
+    unsigned h = (unsigned)(x & (JS_FTAB - 1));
+    for (unsigned i = 0; i < 8; i++) {
+        unsigned k = (h + i) & (JS_FTAB - 1);
+        if (js_ftab[k].n && js_ftab[k].rip == rip) { js_ftab[k].n++; return; }
+        if (!js_ftab[k].n) {
+            js_ftab[k].rip = rip; js_ftab[k].n = 1;
+            js_ftab[k].reason = reason; js_ftab[k].nins = nins;
+            const uint8_t *c = (const uint8_t *)ocerz_g2h(rip);
+            sigjmp_buf bb, *prev = ocerz_jit_decode_recover;
+            if (sigsetjmp(bb, 1) == 0) {
+                ocerz_jit_decode_recover = &bb;
+                memcpy(js_ftab[k].bytes, c, 8);
+            }
+            ocerz_jit_decode_recover = prev;
+            js_ftab_used++;
+            return;
+        }
+    }
+    js_ftab_full++;
+}
+
+static int js_cmp(const void *a, const void *b)
+{
+    unsigned long long x = ((const JsFail *)a)->n;
+    unsigned long long y = ((const JsFail *)b)->n;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void js_report(OcerzJit *jit, const char *tag, int with_ftab)
+{
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    double sec = (double)(now - js_t0) / 1e9;
+    unsigned long long st = js_steps, hi = js_hits, mi = js_misses;
+    unsigned long long xf = js_xlat_fail, xo = js_xlat_ok;
+    size_t used = (size_t)((uint8_t *)jit->code_cur - (uint8_t *)jit->code_base);
+    fprintf(stderr,
+        "ocerz: JITSTAT[%d] %s t=%.1fs steps=%llu hits=%llu (%.4f%%) misses=%llu (%.0f lock/s)\n"
+        "ocerz: JITSTAT[%d]   translate: calls=%llu ok=%llu fail=%llu (decode0=%llu overflow=%llu alloc=%llu)\n"
+        "ocerz: JITSTAT[%d]   decoded_insns_on_miss=%llu  code_used=%zu/%zu bytes (%.1f%%) EXHAUSTED=%d  failtab_used=%u full=%u\n",
+        (int)getpid(), tag, sec, st, hi, st ? 100.0 * (double)hi / (double)st : 0.0,
+        mi, sec > 0 ? (double)mi / sec : 0.0,
+        (int)getpid(), (unsigned long long)js_xlat, xo, xf,
+        (unsigned long long)js_fail_decode0, (unsigned long long)js_fail_overflow,
+        (unsigned long long)js_fail_alloc,
+        (int)getpid(), (unsigned long long)js_decoded_insns, used, jit->code_bytes,
+        100.0 * (double)used / (double)jit->code_bytes,
+        (unsigned)(jit->code_end - jit->code_cur) < 4096u, js_ftab_used, js_ftab_full);
+
+    if (!with_ftab)
+        return;
+    /* qsort over JS_FTAB is expensive; only on the slow (60s) cadence. */
+    static JsFail snap[JS_FTAB];
+    memcpy(snap, js_ftab, sizeof snap);
+    qsort(snap, JS_FTAB, sizeof snap[0], js_cmp);
+    for (int i = 0; i < 25 && snap[i].n; i++)
+        fprintf(stderr, "ocerz: JITSTAT[%d]   FAILRIP #%2d %#18llx retries=%-10llu reason=%s nins=%d bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+            (int)getpid(), i, (unsigned long long)snap[i].rip, snap[i].n,
+            snap[i].reason == JSR_DECODE0 ? "decode-fail" :
+            snap[i].reason == JSR_OVERFLOW ? "code-overflow" : "alloc-fail",
+            snap[i].nins,
+            snap[i].bytes[0], snap[i].bytes[1], snap[i].bytes[2], snap[i].bytes[3],
+            snap[i].bytes[4], snap[i].bytes[5], snap[i].bytes[6], snap[i].bytes[7]);
+}
+
 static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 {
     /* OCERZ_JITMEASURE (Stage-0 verify-first for the persistent JIT cache): time each successful
@@ -939,15 +1381,22 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         n = vn;
         pc = vpc;
     }
-    if (n == 0)
+    if (ocerz_jitstat > 0)
+        js_decoded_insns += (unsigned)n;
+    if (n == 0) {
+        if (ocerz_jitstat > 0) { js_xlat_fail++; js_fail_decode0++; js_note_fail(rip, JSR_DECODE0, 0); }
         return NULL;
+    }
 
     JitBlock *blk = (JitBlock *)calloc(1, sizeof *blk);
-    if (!blk)
+    if (!blk) {
+        if (ocerz_jitstat > 0) { js_xlat_fail++; js_fail_alloc++; js_note_fail(rip, JSR_ALLOC, n); }
         return NULL;
+    }
     blk->insns = (X86Insn *)malloc((size_t)n * sizeof(X86Insn));
     if (!blk->insns) {
         free(blk);
+        if (ocerz_jitstat > 0) { js_xlat_fail++; js_fail_alloc++; js_note_fail(rip, JSR_ALLOC, n); }
         return NULL;
     }
     memcpy(blk->insns, scratch, (size_t)n * sizeof(X86Insn));
@@ -955,7 +1404,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     blk->guest_rip = rip;
 
     pthread_jit_write_protect_np(0);
-    A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0 };
+    A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
     uint32_t *entry = b.p;
 
     a64_stp_pre(&b, 29, 30, 31, -16);
@@ -963,18 +1412,41 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     a64_mov_reg(&b, 1, 19, 0);
     a64_mov_reg(&b, 1, 20, 1);
 
+    /* OCERZ_PERFSTAT (TEMPORARY): per-block execution counter, incremented in
+     * the prologue so every entry is counted exactly once regardless of which
+     * exit the block takes. Scratch JT0/JT1 are dead here. */
+    if (ocerz_perfstat > 0) {
+        a64_mov_imm64(&b, JT0, (uint64_t)(uintptr_t)&blk->exec_count);
+        a64_ldr(&b, 8, JT1, JT0, 0);
+        a64_add_imm(&b, 1, JT1, JT1, 1);
+        a64_str(&b, 8, JT1, JT0, 0);
+    }
+
     uint32_t *exit_sites[JIT_MAX_BLOCK_INSNS];
     uint32_t *epi_sites[JIT_MAX_BLOCK_INSNS];
     int n_exits = 0;
     int n_epi = 0;
+    /* Allocation failure here is not fatal: insn_off is a DIAGNOSTIC precision
+     * aid, so a block without it still executes correctly and merely falls back
+     * to cur_rip on a fault, exactly as before this table existed. */
+    blk->insn_off = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
+        if (blk->insn_off)
+            blk->insn_off[i] = (uint32_t)(b.p - entry);
         if (i == n - 1 && insn->op == OCERZ_OP_JCC) {
-            if (emit_jcc(&b, insn, epi_sites, &n_epi))
+            if (emit_jcc(&b, insn, epi_sites, &n_epi)) {
+                blk->n_inlined++;
                 continue;
+            }
         }
-        if (!try_inline(&b, insn, exit_sites, &n_exits))
+        if (!try_inline(&b, insn, exit_sites, &n_exits)) {
             emit_slowcall(&b, insn, exit_sites, &n_exits);
+            blk->n_slow++;
+        } else {
+            blk->n_inlined++;
+        }
     }
 
     /* A block that runs off the JIT_MAX_BLOCK_INSNS limit ends on a non-
@@ -996,25 +1468,76 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     a64_ldp_post(&b, 29, 30, 31, 16);
     a64_ret(&b);
 
-    for (int i = 0; i < n_exits; i++)
-        a64_patch_cbz(exit_sites[i], exit_label);
-    for (int i = 0; i < n_epi; i++)
-        a64_patch_b(epi_sites[i], exit_label);
+    /* On overflow a64_emit32 clamps at b->p == b->end, so a64_label() can have
+     * handed out b->end itself; patching would store one word PAST the MAP_JIT
+     * mapping. The block is not going to run as code — never patch it. */
+    if (!b.overflow) {
+        for (int i = 0; i < n_exits; i++)
+            a64_patch_cbz(exit_sites[i], exit_label);
+        for (int i = 0; i < n_epi; i++)
+            a64_patch_b(epi_sites[i], exit_label);
+    }
 
     pthread_jit_write_protect_np(1);
 
     if (b.overflow) {
-        free(blk->insns);
-        free(blk);
-        return NULL;
+        /* The code arena is full. That is a fact about the ARENA, not about this
+         * block: the decode above SUCCEEDED and blk->insns is a complete, valid
+         * block. The compile is an optimization; the decode is not. Keep the
+         * block with code == NULL and cache it — ocerz_jit_step dispatches it to
+         * the interpreter tier, from the cache, with no lock and no re-decode.
+         * Standard tiered-JIT demotion: when the compile can't happen you keep
+         * the decoded entry and run it a tier down.
+         *
+         * Discarding it is what made exhaustion catastrophic rather than merely
+         * slow: the failure was never cached, so every later execution of this
+         * rip re-took the global jit_lock and redid decode+malloc+emit+free; and
+         * vm.c's one-instruction EUNSUP fallback then re-entered at rip+len and
+         * re-decoded the tail at EVERY instruction boundary.
+         *
+         * code_cur is deliberately NOT advanced and the icache NOT invalidated:
+         * nothing was committed. */
+        if (!jit->code_full) {
+            jit->code_full = 1;
+            OCERZ_LOG("JIT code arena full (%zu MB, %llu blocks); further blocks run interpreted\n",
+                      jit->code_bytes >> 20,
+                      (unsigned long long)jit->blocks_translated);
+        }
+        if (ocerz_jitstat > 0) { js_fail_overflow++; js_note_fail(rip, JSR_OVERFLOW, n); }
+        /* Demoted to the interpreter tier: every instruction is a slow path,
+         * whatever the (discarded) compile would have inlined. */
+        blk->n_slow = n;
+        blk->n_inlined = 0;
+        blk->code = NULL;
+        cache_insert(jit, blk);
+        return blk;
     }
 
     sys_icache_invalidate(entry, (size_t)((b.p - entry) * 4));
     jit->code_cur = b.p;
     blk->code = (JitBlockFn)entry;
+    blk->code_words = (uint32_t)(b.p - entry);
+
+    /* Register in the code-address index (see OcerzJit::ci). Runs under
+     * jit_lock. On grow failure the index simply stops accepting new blocks:
+     * fault-rip precision degrades for later blocks, execution does not. */
+    if (jit->ci_n == jit->ci_cap) {
+        size_t ncap = jit->ci_cap ? jit->ci_cap * 2 : 4096;
+        JitBlock **nci = (JitBlock **)realloc(jit->ci, ncap * sizeof *nci);
+        if (nci) {
+            jit->ci = nci;
+            jit->ci_cap = ncap;
+        }
+    }
+    if (jit->ci_n < jit->ci_cap) {
+        jit->ci[jit->ci_n] = blk;
+        __atomic_store_n(&jit->ci_n, jit->ci_n + 1, __ATOMIC_RELEASE);
+    }
 
     cache_insert(jit, blk);
     jit->blocks_translated++;
+    if (ocerz_jitstat > 0)
+        js_xlat_ok++;
     if (g_jitmeasure) {
         /* translate() runs under jit_lock, so plain statics are race-free here. */
         static unsigned long long g_xlat_ns, g_xlat_sc_ns;
@@ -1034,13 +1557,83 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     return blk;
 }
 
+/* Exact guest rip for a host pc inside emitted JIT code.
+ *
+ * Called ONLY from the host fault handler, i.e. a cold path that has already
+ * lost a page fault, so the two binary searches are free relative to the trap.
+ * That is what buys the hot path its zero instructions: the alternative is a
+ * cpu->rip store before every inlined memory access.
+ *
+ * Returns 1 and writes *out_rip on success; 0 when the pc is not in a compiled
+ * block (an ocerz host-code fault, or a block predating the index), leaving the
+ * caller on its cur_rip fallback.
+ *
+ * Lock-free by construction: entries are append-only in ascending code order,
+ * blocks are never freed, and ci_n is read with an acquire load matching
+ * translate()'s release store, so every entry below the observed count is fully
+ * published. Safe to run in a signal handler -- no locks, no allocation. */
+int ocerz_jit_pc_in_arena(const struct OcerzVM *vm, const void *host_pc)
+{
+    const OcerzJit *jit = vm ? vm->jit : NULL;
+    if (!jit)
+        return 0;
+    const uint32_t *pc = (const uint32_t *)host_pc;
+    return pc >= jit->code_base && pc < jit->code_end;
+}
+
+int ocerz_jit_fault_rip(const struct OcerzVM *vm, const void *host_pc, uint64_t *out_rip)
+{
+    const OcerzJit *jit = vm ? vm->jit : NULL;
+    if (!jit || !jit->ci)
+        return 0;
+    const uint32_t *pc = (const uint32_t *)host_pc;
+    if (pc < jit->code_base || pc >= jit->code_end)
+        return 0;
+
+    size_t n = __atomic_load_n(&jit->ci_n, __ATOMIC_ACQUIRE);
+    if (!n)
+        return 0;
+
+    /* Last block whose code starts at or below pc. */
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if ((const uint32_t *)jit->ci[mid]->code <= pc)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo == 0)
+        return 0;
+    const JitBlock *b = jit->ci[lo - 1];
+    const uint32_t *base = (const uint32_t *)b->code;
+    if (!base || !b->insn_off || pc >= base + b->code_words)
+        return 0;   /* in the arena but past this block: inter-block padding */
+
+    /* Last instruction whose emitted code starts at or below pc. */
+    uint32_t off = (uint32_t)(pc - base);
+    int ilo = 0, ihi = b->n_insns;
+    while (ilo < ihi) {
+        int mid = ilo + (ihi - ilo) / 2;
+        if (b->insn_off[mid] <= off)
+            ilo = mid + 1;
+        else
+            ihi = mid;
+    }
+    if (ilo == 0)
+        return 0;   /* in the prologue, before any guest instruction */
+    *out_rip = b->insns[ilo - 1].rip;
+    return 1;
+}
+
 OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
 {
     OcerzJit *jit = (OcerzJit *)calloc(1, sizeof *jit);
     if (!jit)
         return NULL;
     jit->vm = vm;
-    void *p = mmap(NULL, JIT_CODE_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC,
+    size_t bytes = jit_code_bytes();
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     if (p == MAP_FAILED) {
         OCERZ_LOG("JIT unavailable (MAP_JIT failed); using interpreter\n");
@@ -1049,14 +1642,21 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
     }
     jit->code_base = (uint32_t *)p;
     jit->code_cur = (uint32_t *)p;
-    jit->code_end = (uint32_t *)((uint8_t *)p + JIT_CODE_BYTES);
+    jit->code_end = (uint32_t *)((uint8_t *)p + bytes);
+    jit->code_bytes = bytes;
+    OCERZ_LOG("JIT code arena %zu MB reserved at [%p,%p)\n",
+              bytes >> 20, p, (void *)((uint8_t *)p + bytes));
     return jit;
 }
+
+static void ps_report(OcerzJit *jit);
 
 void ocerz_jit_destroy(OcerzJit *jit)
 {
     if (!jit)
         return;
+    if (ocerz_perfstat > 0)
+        ps_report(jit);   /* final numbers for short runs (guest microbenches) */
     for (unsigned i = 0; i < JIT_HASH_SIZE; i++) {
         JitBlock *b = jit->buckets[i];
         while (b) {
@@ -1066,7 +1666,7 @@ void ocerz_jit_destroy(OcerzJit *jit)
             b = next;
         }
     }
-    munmap(jit->code_base, JIT_CODE_BYTES);
+    munmap(jit->code_base, jit->code_bytes);
     free(jit);
 }
 
@@ -1090,20 +1690,176 @@ void ocerz_jit_postfork(void)
     pthread_mutex_unlock(&jit_lock);
 }
 
+/* Interpreter tier for a cached-but-uncompiled block (arena full). Mirrors the
+ * compiled block exactly rather than approximating it: the compiled form calls
+ * ocerz_jit_exec_one per instruction via emit_slowcall and branches to its
+ * epilogue on the first non-OK return (the cbnz x0 at each exit site); this runs
+ * the same ocerz_jit_exec_one over the same blk->insns and returns on the first
+ * non-OK the same way. Fall-through rip needs no fixup: ocerz_jit_exec_one always
+ * stores insn->rip + insn->len, which is exactly what the compiled block's
+ * explicit rip store reconstructs for inlined instructions. */
+static int jit_interp_block(struct OcerzVM *vm, OcerzCPU *cpu, JitBlock *b)
+{
+    if (ocerz_perfstat > 0)
+        b->exec_count++;   /* mirrors the compiled prologue's counter */
+    for (int i = 0; i < b->n_insns; i++) {
+        int r = ocerz_jit_exec_one(vm, cpu, &b->insns[i]);
+        if (r != OCERZ_STEP_OK)
+            return r;
+    }
+    return OCERZ_STEP_OK;
+}
+
+/* OCERZ_PERFSTAT report. Walks the block cache (never freed, so the walk is
+ * safe against concurrent inserts: hnext is set before publish) to sum executed
+ * instructions by tier, then prints the slow-path op histogram sorted by count.
+ * Called from the miss path under jit_lock, time-gated. */
+typedef struct { unsigned op; unsigned long long n; } PsOpRow;
+
+static int ps_cmp(const void *a, const void *bb)
+{
+    unsigned long long x = ((const PsOpRow *)a)->n, y = ((const PsOpRow *)bb)->n;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void ps_report(OcerzJit *jit)
+{
+    double sec = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - ps_t0) / 1e9;
+    if (sec <= 0)
+        sec = 1e-9;
+    unsigned long long blk_exec = 0, ins_inl = 0, ins_slow_static = 0, nblocks = 0, ncompiled = 0;
+    unsigned long long static_insns = 0;
+    for (unsigned i = 0; i < JIT_HASH_SIZE; i++)
+        for (JitBlock *b = __atomic_load_n(&jit->buckets[i], __ATOMIC_ACQUIRE); b; b = b->hnext) {
+            nblocks++;
+            if (b->code)
+                ncompiled++;
+            static_insns += (unsigned)b->n_insns;
+            unsigned long long e = b->exec_count;
+            blk_exec += e;
+            ins_inl += e * (unsigned)b->n_inlined;
+            ins_slow_static += e * (unsigned)b->n_slow;
+        }
+    unsigned long long slow = ps_slow_insns;
+    unsigned long long total = ins_inl + slow;
+    unsigned long long st = ps_steps, hi = ps_hits, mi = ps_misses;
+
+    fprintf(stderr,
+        "ocerz: PERFSTAT[%d] t=%.1fs blocks=%llu (compiled=%llu) static_insns/blk=%.2f\n"
+        "ocerz: PERFSTAT[%d]   EXECUTED insns: total=%llu  slow(exec_one)=%llu (%.2f%%)  inlined=%llu (%.2f%%)\n"
+        "ocerz: PERFSTAT[%d]   slow_static_est=%llu (guard-slowcalls = %lld)\n"
+        "ocerz: PERFSTAT[%d]   block_execs=%llu (%.0f/s)  jit_step/cache_lookup=%llu (%.0f/s) hits=%llu misses=%llu\n"
+        "ocerz: PERFSTAT[%d]   avg EXECUTED insns per block = %.2f   insns/s = %.0f\n",
+        (int)getpid(), sec, nblocks, ncompiled,
+        nblocks ? (double)static_insns / (double)nblocks : 0.0,
+        (int)getpid(), total, slow, total ? 100.0 * (double)slow / (double)total : 0.0,
+        ins_inl, total ? 100.0 * (double)ins_inl / (double)total : 0.0,
+        (int)getpid(), ins_slow_static, (long long)slow - (long long)ins_slow_static,
+        (int)getpid(), blk_exec, (double)blk_exec / sec, st, (double)st / sec, hi, mi,
+        (int)getpid(), blk_exec ? (double)total / (double)blk_exec : 0.0,
+        (double)total / sec);
+
+    PsOpRow rows[OCERZ_OP_COUNT];
+    for (unsigned i = 0; i < OCERZ_OP_COUNT; i++) {
+        rows[i].op = i;
+        rows[i].n = ps_ops[i];
+    }
+    qsort(rows, OCERZ_OP_COUNT, sizeof rows[0], ps_cmp);
+    unsigned long long cum = 0;
+    for (int i = 0; i < 24 && rows[i].n; i++) {
+        cum += rows[i].n;
+        fprintf(stderr, "ocerz: PERFSTAT[%d]   SLOWOP #%2d %-12s %14llu  %5.2f%% of slow  cum %5.2f%%  (%.2f%% of ALL)\n",
+                (int)getpid(), i + 1, ocerz_op_name(rows[i].op), rows[i].n,
+                slow ? 100.0 * (double)rows[i].n / (double)slow : 0.0,
+                slow ? 100.0 * (double)cum / (double)slow : 0.0,
+                total ? 100.0 * (double)rows[i].n / (double)total : 0.0);
+    }
+    for (int i = 0; i < 6; i++) {
+        unsigned long long easy = ps_shape[i][0], hard = ps_shape[i][1], s = easy + hard;
+        if (s)
+            fprintf(stderr, "ocerz: PERFSTAT[%d]   SHAPE %-7s easy=%llu (%.1f%%) other=%llu (%.1f%%)\n",
+                    (int)getpid(), ps_shape_name[i], easy, 100.0 * (double)easy / (double)s,
+                    hard, 100.0 * (double)hard / (double)s);
+    }
+}
+
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
         return OCERZ_EUNSUP;
     OcerzJit *jit = vm->jit;
+    if (ocerz_jitstat < 0) {
+        pthread_mutex_lock(&jit_lock);
+        if (ocerz_jitstat < 0) {
+            js_t0 = ps_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            ocerz_perfstat = getenv("OCERZ_PERFSTAT") ? 1 : 0;
+            ocerz_jitstat = getenv("OCERZ_JITSTAT") ? 1 : 0;
+        }
+        pthread_mutex_unlock(&jit_lock);
+    }
+    if (ocerz_jitstat > 0)
+        js_steps++;
+    if (ocerz_perfstat > 0) {
+        /* Report from the STEP path, not the miss path: once the app reaches its
+         * window, misses stop but execution does not, and the steady-state
+         * numbers are exactly the ones under study. Gated on a cheap mask of the
+         * value we just fetched, then on wall time; the cache walk needs no lock
+         * (blocks are never freed and hnext is set before publish). */
+        unsigned long long s = ++ps_steps;
+        if ((s & 0xfffff) == 0) {
+            static _Atomic uint64_t ps_next;
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            uint64_t exp = ps_next;
+            if (now >= exp && __c11_atomic_compare_exchange_strong(
+                    &ps_next, &exp, now + 15000000000ull,
+                    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                ps_report(jit);
+        }
+    }
     JitBlock *b = cache_lookup(jit, cpu->rip);
     if (!b) {
         pthread_mutex_lock(&jit_lock);
+        if (ocerz_perfstat > 0)
+            ps_misses++;
+        if (ocerz_jitstat > 0) {
+            js_misses++;
+            /* Periodic report from the miss path: it is the path under study, and
+             * we already hold jit_lock so the fail table is stable. Time-gated
+             * (10s summary / 60s with the fail table) so the reporting itself --
+             * especially the qsort -- cannot distort what it measures. */
+            if ((js_misses & 0x3ff) == 0) {
+                static uint64_t next_s, next_f;
+                uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                if (now >= next_f) {
+                    next_f = now + 60000000000ull; next_s = now + 10000000000ull;
+                    js_report(jit, "FULL", 1);
+                } else if (now >= next_s) {
+                    next_s = now + 10000000000ull;
+                    js_report(jit, "tick", 0);
+                }
+            }
+        }
         b = cache_lookup(jit, cpu->rip);
-        if (!b)
+        if (!b) {
+            if (ocerz_jitstat > 0) js_xlat++;
             b = translate(jit, cpu->rip);
+        }
         pthread_mutex_unlock(&jit_lock);
+    } else {
+        if (ocerz_jitstat > 0)
+            js_hits++;
+        if (ocerz_perfstat > 0)
+            ps_hits++;
     }
+    /* !b is a decode failure ONLY now (translate no longer returns NULL for a
+     * full arena). Left as EUNSUP deliberately — do NOT poison-cache it. The
+     * decode runs under a sigsetjmp recovery, so n==0 can mean the page is
+     * merely uncommitted; under commit-on-demand and dyld page-in it may be
+     * mapped a millisecond later, and caching that would permanently deny JIT
+     * to code that becomes valid. */
     if (!b)
         return OCERZ_EUNSUP;
+    if (!b->code)
+        return jit_interp_block(vm, cpu, b);
     return b->code(vm, cpu);
 }

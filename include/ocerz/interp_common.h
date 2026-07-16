@@ -133,10 +133,34 @@ static inline void ocerz_write_op128(OcerzCPU *cpu, const X86Insn *insn, const X
         ocerz_st(ocerz_ea(cpu, insn, op), op->size, v.lo);
 }
 
+/* NOTE THE ORDER: the store happens BEFORE rsp is committed.
+ *
+ * On the non-faulting path this is indistinguishable from decrementing rsp
+ * first -- the address stored to is identical. It matters only when the store
+ * FAULTS, and then it is the difference between correct and silently wrong.
+ *
+ * A faulting x86 instruction is ABORTED: it has no architectural effect, so rsp
+ * must be unchanged when the handler sees the fault, and re-executing the push
+ * on return must push to the SAME address. Committing rsp first left it already
+ * decremented, so the canonical fix-and-retry idiom -- which is exactly how a
+ * guest grows a thread stack when a push hits the guard page -- would decrement
+ * rsp a SECOND time on the retry, permanently shifting the stack and silently
+ * leaving an 8-byte hole. (Reachable only now that a delivered fault rewinds rip
+ * to the faulting instruction so the push is genuinely retried; see
+ * OcerzCPU::cur_rip and crash_handler in src/vm.c.)
+ *
+ * ocerz_pop below loads before it increments, which makes the LOAD fault-safe --
+ * but that is NOT sufficient on its own: a caller whose destination can also fault
+ * (`pop qword [mem]`) must not let rsp commit before that store lands. op_stack's
+ * POP/LEAVE therefore do the load themselves and commit rsp last; do not "simplify"
+ * them back into ocerz_pop. The JIT's inlined push/pop reproduce this order exactly
+ * (reg destinations only, so they cannot fault after the load) -- see emit_push_pop
+ * in src/jit.c. */
 static inline void ocerz_push(OcerzCPU *cpu, int size, uint64_t v)
 {
-    cpu->gpr[OCERZ_RSP] -= (uint64_t)size;
-    ocerz_st(cpu->gpr[OCERZ_RSP], size, v);
+    uint64_t sp = cpu->gpr[OCERZ_RSP] - (uint64_t)size;
+    ocerz_st(sp, size, v);
+    cpu->gpr[OCERZ_RSP] = sp;
 }
 
 static inline uint64_t ocerz_pop(OcerzCPU *cpu, int size)

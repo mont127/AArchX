@@ -412,7 +412,34 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     if (depth == 0 && g_cur_cpu && g_sig_recover &&
         ocerz_host_in_guest_space(si->si_addr)) {
         depth = 1;
-        uint64_t fault_rip = g_cur_cpu->rip;
+        /* The rip a real x86 kernel reports is the FAULTING instruction, but
+         * cpu->rip has already advanced to the next one (see OcerzCPU::cur_rip).
+         * cur_rip carries the faulting address for slow-path instructions; for
+         * an INLINED jit instruction nothing wrote it, so recover the exact rip
+         * from the block's side table via the host pc. Falls back to cur_rip
+         * when the pc is not in a compiled block. */
+        uint64_t fault_rip = g_cur_cpu->cur_rip;
+        int rip_exact = 1;
+        {
+            const void *hpc = ctx ? (const void *)(uintptr_t)
+                ((const ucontext_t *)ctx)->uc_mcontext->__ss.__pc : NULL;
+            struct OcerzVM *fvm = g_cur_cpu->vm;
+            if (hpc && fvm && ocerz_jit_pc_in_arena(fvm, hpc)) {
+                /* Faulted in emitted code: only the side table knows the rip,
+                 * because an inlined instruction never wrote cur_rip (which
+                 * therefore still names some earlier slow instruction). If the
+                 * table cannot answer, we do NOT know the faulting rip and must
+                 * not pretend we do. */
+                uint64_t jrip;
+                if (ocerz_jit_fault_rip(fvm, hpc, &jrip))
+                    fault_rip = jrip;
+                else
+                    rip_exact = 0;
+            }
+            /* Faulted outside the arena => we are inside ocerz's own C, i.e. the
+             * interpreter slow path, which always sets cur_rip before executing.
+             * cur_rip is authoritative there. */
+        }
         uint64_t gs = g_cur_cpu->gs_base;
         uint64_t gaddr = ocerz_h2g(si->si_addr);
         int code = ocerz_addr_committed(gaddr) == 1 ? 2 : 1;
@@ -481,6 +508,32 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             g_cur_cpu->terminated = 1;
             depth = 0;
             siglongjmp(*g_sig_recover, 1);
+        }
+        /* REWIND rip TO THE FAULTING INSTRUCTION BEFORE DELIVERING.
+         *
+         * A faulting instruction is ABORTED: it does not complete, so the
+         * architectural rip a real x86 kernel reports in the signal frame is the
+         * faulting instruction itself, not the one after it. Both ocerz tiers
+         * advance rip to the next instruction before executing (see
+         * OcerzCPU::cur_rip), so without this the frame named the WRONG
+         * instruction and, worse, sigreturn resumed PAST the faulting access --
+         * silently SKIPPING it. That breaks the standard fix-and-retry idiom
+         * every commit-on-demand guest relies on (Wine grows a thread stack from
+         * the guard-page fault and returns, expecting the store to be retried);
+         * the store would simply be dropped and the write lost.
+         *
+         * Only rewind when the faulting rip is exactly known. If a fault landed
+         * in emitted code that has no side table, cur_rip names some earlier
+         * instruction, and rewinding to THAT would re-execute good instructions
+         * -- strictly worse than the old behaviour. In that case leave rip alone.
+         *
+         * The crash-dump path below is unaffected: it only reads fault_rip. */
+        {
+            static int rewind_off = -1;
+            if (rewind_off < 0)
+                rewind_off = getenv("OCERZ_NO_RIP_REWIND") ? 1 : 0;
+            if (rip_exact && !rewind_off)
+                g_cur_cpu->rip = fault_rip;
         }
         int delivered = looping ? 0
                        : ocerz_signal_deliver(g_cur_cpu, SIGSEGV, gaddr, code, err);
