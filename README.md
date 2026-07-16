@@ -2,7 +2,7 @@
   <img width="220" alt="Ocerz" src="https://github.com/user-attachments/assets/55e627cc-4b41-4841-88cb-34e54a7de94d" />
 </p>
 
-<h1 align="center">Ocerz</h1>
+<h1 align="center"><em>Ocerz</em></h1>
 
 <p align="center">
   <b>A from-scratch x86_64 → arm64 userspace binary translator for macOS.</b><br>
