@@ -86,7 +86,7 @@ Plain `Makefile`: `clang -arch arm64 -std=c11 -O2 -Wall -Wextra`. Guest tests ar
 
 ## License
 
-[Apache-2.0](LICENSE).
+[LGPL-2.1](LICENSE).
 
 ---
 > [!WARNING]
