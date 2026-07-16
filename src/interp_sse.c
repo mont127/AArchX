@@ -506,6 +506,16 @@ static int do_fp_arith(OcerzCPU *cpu, const X86Insn *insn)
         r.d[0] = fixnan_d(a.d[0], a.d[1], a.d[0] - a.d[1]);
         r.d[1] = fixnan_d(b.d[0], b.d[1], b.d[0] - b.d[1]);
         break;
+    case OP(OCERZ_OP_ADDSUBPS): /* even lanes subtract, odd lanes add */
+        r.f[0] = fixnan_f(a.f[0], b.f[0], a.f[0] - b.f[0]);
+        r.f[1] = fixnan_f(a.f[1], b.f[1], a.f[1] + b.f[1]);
+        r.f[2] = fixnan_f(a.f[2], b.f[2], a.f[2] - b.f[2]);
+        r.f[3] = fixnan_f(a.f[3], b.f[3], a.f[3] + b.f[3]);
+        break;
+    case OP(OCERZ_OP_ADDSUBPD):
+        r.d[0] = fixnan_d(a.d[0], b.d[0], a.d[0] - b.d[0]);
+        r.d[1] = fixnan_d(a.d[1], b.d[1], a.d[1] + b.d[1]);
+        break;
     case OP(OCERZ_OP_SUBPS): for (int i = 0; i < 4; i++) r.f[i] = fixnan_f(a.f[i], b.f[i], a.f[i] - b.f[i]); break;
     case OP(OCERZ_OP_MULPS): for (int i = 0; i < 4; i++) r.f[i] = fixnan_f(a.f[i], b.f[i], a.f[i] * b.f[i]); break;
     case OP(OCERZ_OP_DIVPS): for (int i = 0; i < 4; i++) r.f[i] = fixnan_f(a.f[i], b.f[i], a.f[i] / b.f[i]); break;
@@ -1562,6 +1572,7 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 
     case OP(OCERZ_OP_ADDPS): case OP(OCERZ_OP_ADDPD): case OP(OCERZ_OP_ADDSS): case OP(OCERZ_OP_ADDSD):
     case OP(OCERZ_OP_HADDPS): case OP(OCERZ_OP_HADDPD): case OP(OCERZ_OP_HSUBPS): case OP(OCERZ_OP_HSUBPD):
+    case OP(OCERZ_OP_ADDSUBPS): case OP(OCERZ_OP_ADDSUBPD):
     case OP(OCERZ_OP_SUBPS): case OP(OCERZ_OP_SUBPD): case OP(OCERZ_OP_SUBSS): case OP(OCERZ_OP_SUBSD):
     case OP(OCERZ_OP_MULPS): case OP(OCERZ_OP_MULPD): case OP(OCERZ_OP_MULSS): case OP(OCERZ_OP_MULSD):
     case OP(OCERZ_OP_DIVPS): case OP(OCERZ_OP_DIVPD): case OP(OCERZ_OP_DIVSS): case OP(OCERZ_OP_DIVSD):

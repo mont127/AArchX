@@ -381,6 +381,31 @@ static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
     return OCERZ_OK;
 }
 
+/* Signal-safe commit-on-demand of the single guest page containing gaddr (to RW), WITHOUT
+ * map_lock -- callable from the SIGSEGV/SIGBUS handler when ocerz's OWN signal-frame build
+ * writes onto a reserved-but-uncommitted stack page (a no-altstack thread builds the frame
+ * on its rsp). mprotect/mmap/bit_set are async-signal-safe; the only race is a concurrent
+ * unmap of a page this thread is actively faulting on, which does not occur for a live
+ * stack. Returns 1 if the page is now committed (caller re-runs the faulting write), 0 if
+ * gaddr is not a reserved arena page (genuinely bad -> caller must not retry). */
+int ocerz_commit_fault_page(uint64_t gaddr)
+{
+    uint64_t p = gaddr & ~((uint64_t)OCERZ_HOST_PAGE - 1);
+    MemRegion *r = region_for_range(p, p + OCERZ_HOST_PAGE);
+    if (!r)
+        return 0;
+    size_t i = pg_index(r, p);
+    if (bit_test(r, i))
+        return 1; /* already committed (lost a race -- fine) */
+    void *hp = ocerz_g2h(p);
+    if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) != 0 &&
+        mmap(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE,
+             MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != hp)
+        return 0;
+    bit_set(r, i);
+    return 1;
+}
+
 int ocerz_mem_init(uint64_t lo, uint64_t hi)
 {
     size_t len = (size_t)(hi - lo);
@@ -406,7 +431,12 @@ int ocerz_mem_init(uint64_t lo, uint64_t hi)
 
 int ocerz_mem_init_identity(uint64_t size)
 {
-    void *p = mmap(NULL, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    /* Hint the arena at OCERZ_LOW_LIMIT so a LARGER arena still lands at the same low base
+     * (0x300000000) the 4GB arena got from mmap(NULL); without the hint the kernel places an
+     * 8GB+ reservation tens of GB high, which shifts every arena address and was observed to
+     * coincide with a deterministic unmapped-fetch crash. Advisory (no MAP_FIXED) so it falls
+     * back to the kernel's choice if that range is taken. */
+    void *p = mmap((void *)OCERZ_LOW_LIMIT, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) {
         OCERZ_FATAL("could not reserve a %#llx-byte identity arena\n", (unsigned long long)size);
         return OCERZ_ENOMEM;
@@ -420,7 +450,14 @@ int ocerz_mem_init_identity(uint64_t size)
     ocerz_guest_base = 0;
     ocerz_arena_lo = lo;
     ocerz_arena_hi = lo + size;
-    bump_next = lo + size / 2;
+    /* Give ocerz_map_anywhere() the upper 3/4 of the arena (was 1/2): Wine legitimately
+     * reserves ~2GB of arena address space, which exhausted a 2GB bump pool and failed the
+     * 1MB vprot-table mmap ("no driver could be loaded"). The lower 1/4 still holds guest
+     * FIXED claims; any FIXED claim above bump_next is recorded as an island, so shrinking
+     * the FIXED region only costs island bookkeeping, not correctness. (A bigger arena that
+     * lands tens of GB high instead shifts addresses and triggers an unmapped-fetch crash, so
+     * keep the arena at its low 4GB base and just widen the bump split.) */
+    bump_next = lo + size / 4;
     if (!region_add(lo, lo + size))
         return OCERZ_ENOMEM;
     OCERZ_LOG("identity guest arena [%#llx, %#llx), bump %#llx, guest_base 0\n",
@@ -581,6 +618,16 @@ uint64_t ocerz_map_anywhere(uint64_t len, int prot)
     pthread_mutex_lock(&map_lock);
     uint64_t gaddr = bump_skip_islands(bump_next, glen, OCERZ_HOST_PAGE);
     if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
+        if (getenv("OCERZ_OOMLOG")) {
+            uint64_t isl = 0;
+            for (int i = 0; i < island_n; i++) isl += islands[i].hi - islands[i].lo;
+            fprintf(stderr,
+                    "ocerz: MAPOOM[%d] len=%#llx bump_next=%#llx arena=[%#llx,%#llx) free_above_bump=%#llx islands=%d isl_bytes=%#llx skipped_to=%#llx\n",
+                    (int)getpid(), (unsigned long long)len, (unsigned long long)bump_next,
+                    (unsigned long long)ocerz_arena_lo, (unsigned long long)ocerz_arena_hi,
+                    (unsigned long long)(ocerz_arena_hi - bump_next), island_n,
+                    (unsigned long long)isl, (unsigned long long)gaddr);
+        }
         pthread_mutex_unlock(&map_lock);
         return 0;
     }

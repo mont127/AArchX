@@ -60,6 +60,9 @@ void a64_mov_reg(A64Buf *b, int sf, int rd, int rm);
 
 void a64_ldr(A64Buf *b, int size, int rt, int rn, uint32_t off);
 void a64_str(A64Buf *b, int size, int rt, int rn, uint32_t off);
+void a64_ldar(A64Buf *b, int size, int rt, int rn);
+void a64_stlr(A64Buf *b, int size, int rt, int rn);
+void a64_dmb_ish(A64Buf *b);
 void a64_ldrsb(A64Buf *b, int sf, int rt, int rn, uint32_t off);
 void a64_ldrsh(A64Buf *b, int sf, int rt, int rn, uint32_t off);
 void a64_ldrsw(A64Buf *b, int rt, int rn, uint32_t off);

@@ -1982,3 +1982,1182 @@ KEY ANCHORS: ntdll.so load base 0x381a04bac; segv_handler/init_handler @ ntdll.s
 ~0x33344-0x33377 (nm mislabels it _signal_init_process due to missing asm syms);
 libdispatch _dispatch_kevent_mach_msg_recv @ __TEXT+0x21caf (fault +0x21cc1); guest _sigtramp
 = libsystem_platform __TEXT+0x33a0 = 0x7ff802e7d3a0. notes/wine_bringup.md UPDATE #23.
+
+========================================================================
+UPDATE #24 2026-06-14 -- BUSY-PHASE / BOOT-SLOWNESS WALL CHARACTERIZED (the ~100s-per-process
+boot that starves service startup -> RpcSs fails -> notepad exits after creating its windows).
+It is NOT a compute loop (the old "8GB mmap/mprotect loop" guess is WRONG); it is WAITING.
+========================================================================
+Method: after the gs:0x320 fix, notepad creates its GUI then the tree exits. WINEDEBUG=
++timestamp,+service,+process showed the smoking gun: NtCreateUserProcess -> child actually
+created = ~104 SECONDS (292983.4->293087.6), and services.exe's process_send_command TIMES OUT
+waiting on these glacial spawns -> RpcSs never comes up -> notepad's COM init fails -> exit.
+So the root wall is ~100s PER PROCESS CREATION, which serially starves the boot.
+WHERE the time goes (new OCERZ_SCCOUNT profiler: per-class-2-syscall histogram + wall-clock
+timing of each dispatch_bsd call, logs any >20ms call as SCSLOW; cached getenv, ~0 overhead off):
+the busy phase is 100% in BLOCKING WAITS, not CPU:
+  num=3  read         33 calls  ~86s total  (single reads block up to 14.7s, dicount=0 = pure
+                                              block) -- caller ntdll.so 0x381a30e2a = Wine's
+                                              read(wait_fd) wineserver server-reply wait.
+  num=544 ulock_wait2  5 calls  ~15s total  (EXACTLY 5000ms each = a 5s TIMEOUT that repeats =
+                                              a LOST WAKEUP) -- caller libsystem 0x7ff802e7fe69
+                                              = a libdispatch/pthread futex wait on lock addr
+                                              0x3a001c04c.
+  num=27 recvmsg 3.7s; num=363 kevent 0.5s; num=197 mmap 0.37s (all minor).
+Both read(3) and ulock(515/516/544) are host-forwarded with CONSISTENT g2h(addr) key translation
+(ptr_mask 0x02), so these are GENUINE waits, not an ocerz key-mismatch -- the things being
+waited ON are slow. So the boot is a CASCADE: wineserver round-trips block for seconds, and a
+fresh process's init does many round-trips, and the boot creates many processes -> ~100s each.
+TWO concrete sub-walls to attack:
+ (1) ulock_wait2 5s-timeout LOST WAKEUP: keys match, yet the wake never arrives in 5s. Likely
+     the UL_UNFAIR_LOCK / adaptive-ulock OWNER semantics -- the wait value encodes the owner's
+     thread port and the host kernel owner-boosts / requires the wake from the owner; ocerz's
+     guest->host thread-port identity in the ulock value may mismatch (cf. the existing
+     "Owner in ulock is unknown" note at syscall.c:81-83). Tractable + code-readable.
+ (2) wineserver round-trip LATENCY (the dominant 86s): is the server slow to PROCESS (its
+     poll/select/kevent main loop over client fds, per-syscall overhead x frequent polling) or
+     slow to SIGNAL (wait_fd write delayed)? Needs LIVE profiling of the wineserver process
+     (a separate ocerz guest process) -- the next concrete experiment.
+This is a deep wineserver-IPC + ulock SYNC-PERFORMANCE wall, a different class from the memory
+bugs (#19/#21/#23). KEPT diag: OCERZ_SCCOUNT (SCSLOW per-call timing + SCCOUNT histogram).
+make-check GREEN. An analysis workflow on (1)+(2) was launched. notes UPDATE #24.
+
+UPDATE #24b -- ROOT REFRAMED (analysis workflow + CPU profiling). The 86s read(wait_fd) is NOT
+a server bug: the workflow confirmed the wineserver processes each request in one read+handler+
+write (server/request.c:327) and signals via a single non-blocking write(wait_fd) (server/
+thread.c:1215) = instantaneous; ocerz forwards read/kevent/ulock faithfully (no key mismatch,
+no EINTR-swallowing). The latency is in PRODUCING the wakeup CONDITION: each spawned guest
+process is genuinely SLOW TO REACH "ready", and the boot starts ~7 processes SERIALLY, and Wine
+has a HARDCODED 10s deadline (programs/services/services.c:44 service_pipe_timeout=10000ms, used
+in rpc.c:1204/1222 WaitForSingleObject) -> a child that needs >10s makes the SCM declare the
+service failed -> RpcSs fails -> notepad COM init fails -> exit. (Also: server/fd.c:355 caps the
+server's kevent timeout at 16ms when KUSER_SHARED_DATA is mapped -> ~62Hz spin per process, a
+steady emulation tax, not the seconds-latency.)
+WHAT makes per-process startup slow = CONFIRMED COMPUTE-BOUND by direct measurement: ps showed
+cold-start processes burning 9.65s CPU/13s (74%) and 100% CPU; idle processes just wait on them.
+CPU profile (sample) of a hot process under ocerz_dyld_run: ~all CPU is EXECUTING GUEST STARTUP
+CODE through the engine -- JIT buffer (??? @0x109..) ~489, ocerz_jit_exec_one ~620, ocerz_interp_
+exec ~300 (~25% -- run-once startup blocks that never get hot enough to JIT -> interpreted slow),
+ocerz_read_op (decode) ~61. NO dyld-closure/selpool/memcpy hotspot (the #17 selopt perfect-hash
+held). So each process pays ~5-10s CPU re-translating + running its own ntdll+DLL init. This IS
+the project's core PERFORMANCE gap, now localized: serial boot x per-process JIT/interp cold-start
+compute (+cascade waits) ~= 100s > the 10s service deadline.
+PRIORITIZED PATH FORWARD (deep, perf-class -- next focused effort, NOT a quick patch):
+ (A) cut per-process cold-start CPU -- the dominant lever. Candidates: a JIT translation cache
+     SHARED across processes (ntdll/Wine code is identical in every process -> translate once);
+     better tiering / JIT cold startup code sooner (the ~25% interp tax); faster decode.
+ (B) ulock owner-port lost-wakeup (workflow Agent A, ~15s, medium-confidence): a HOSTWQ worker
+     mach_port_deallocate's its thread port while it is still the ulock OWNER word -> kernel
+     can't resolve the dead owner -> 5s ETIMEDOUT. Fix = keep the worker port alive until pthread
+     reap. CONFIRM FIRST with owner-resolution instrumentation (don't perturb the Mach-bridge).
+ (C) reduce boot serialization (start independent services concurrently) -- mitigation.
+make-check GREEN. SCCOUNT diag kept (gated). notes UPDATE #24b.
+
+========================================================================
+UPDATE #25 2026-06-14 -- ★ RENDERING BLOCKER FOUND + FIXED: winemac.drv "no driver could be
+loaded" was caused by ARENA EXHAUSTION (the deferred #22 vprot-OOM). Enlarging the arena
+4GB->8GB cleared it. make-check GREEN. (Goal: render a full Wine app window.)
+========================================================================
+GOAL set: make ocerz RENDER a full Wine application window (visible notepad). After the gs:0x320
+fix notepad builds its Win32 windows but NOTHING RENDERS. WINEDEBUG=+macdrv,+win showed why:
+  err:virtual:alloc_pages_vprot anon mmap error Cannot allocate memory for vprot table, size
+    00100000
+  err:winediag:nodrv_CreateWindow Application tried to create a window, but no driver could be
+    loaded.  / L"The graphics driver is missing. Check your build!"
+So winemac.drv FAILS TO LOAD (a 1MB anon mmap for Wine's 32-bit vprot table fails) -> "no driver"
+-> no Cocoa NSWindow -> no render. (notepad's Win32 main window 0x1004a 2041x1539 IS created;
+it just has no display driver.) ROOT (OCERZ_OOMLOG diag added to ocerz_map_anywhere): the arena
+= [0x300000000,0x400000000) = 4GB, but ocerz_map_anywhere (mem.c:578) only bumps the UPPER HALF
+(bump_next starts at lo+size/2), so map_anywhere has only ~2GB; bump_next hit 0x3ffffc000 (16KB
+below arena_hi), islands only 18MB -> NOT island-stranding, NOT the Mach-bridge (~10 msgs/~160KB),
+just genuine ~2GB of Wine address-space reservations (DLLs+heaps+mmaps) filling the 2GB bump pool.
+FIX (src/dyld.c:226): DYN_ARENA_SIZE 4GB -> 8GB (bump pool 2GB -> 4GB). Faithful, not a band-aid:
+a real x86_64 macOS process has a vast AS; ocerz's 2GB bump arena was simply under-provisioned.
+RESULT: vprot-OOM 0 (was 14), MAPOOM 0, "no driver could be loaded" 0 (all cleared). make-check
+GREEN (test_syscall 96/0, guest 14/14 x2, diff 15, dyn 2). winemac.drv can now LOAD. KEPT diag:
+OCERZ_OOMLOG (arena state at map_anywhere exhaustion). NEXT toward render: confirm winemac.drv's
+Cocoa side creates the on-screen NSWindow (the Mach-bridge fix should have unblocked the old
+#16/#17 Cocoa-main-loop wall) AND that the process survives the boot (#24 perf/RpcSs). notes #25.
+
+========================================================================
+UPDATE #26 2026-06-14 -- gs:0x320 BOUNDED RECOVERY (Bug B) so it stops KILLING the process; the
+8GB arena lets the boot run ~30x deeper (icount ~6M -> ~200M) and exposes the NEXT walls. Still
+no on-screen NSWindow. make-check GREEN. (Goal: render a Wine window.)
+========================================================================
+After #25 (8GB arena -> winemac.drv loads), the boot reaches deep (~200-280M instructions) and
+re-hits gs:0x320 at the NEW arena addresses (e.g. ntdll.so now ~0x401a04bac), confirming the
+Mach-bridge (#23) fixed only ONE trigger -- gs:0x320 is the AMPLIFIER for ANY fault on a no-Wine-
+TEB worker (Wine's segv_handler can't run -> get_current_teb reads no TEB -> repeated ~0x320
+near-null deref -> the loop guard makes it FATAL, killing the whole process).
+FIX (src/vm.c crash_handler, Bug B BOUNDED RECOVERY): when the loop guard trips AND the thread is
+a no-Wine-TEB worker (sig_altstack_sp==0) AND the looping fault is near-null (gaddr<0x10000 = the
+get_current_teb garbage), set cpu->terminated=1 + siglongjmp(*g_sig_recover) -> the worker's main
+VM loop (vm.c:1016 `while(!exited && !terminated)`) exits, ocerz_vm_run_cpu returns, the HOSTWQ
+host thread parks. So just THAT worker's dispatch callback is abandoned and the PROCESS SURVIVES
+(instead of dying). Never fires for a real Wine thread (it has an altstack; legit faults aren't
+near-null-looping). On real macOS such a worker never faults -- this is an ocerz-artifact bridge
+(owner has accepted similar #27/#28 bounded bridges). make-check GREEN.
+NEXT WALLS the 8GB depth EXPOSES (toward render, under investigation):
+ - "nested fault inside crash handler": a REAL Wine thread (TEB gs=0x7ffd8000 + altstack) faults
+   at ntdll.so ~0x401a338e0 with comm(addr)=-1 (addr not in a registered region -> looks like a
+   use-after-unmap of code, OR an 8GB-arena region-registration gap), and the signal-frame build
+   (on altsp~0x100000858) faults again -> fatal. Being captured cleanly (a prior run had
+   OCERZ_SIGTRACE accidentally on, perturbing timing).
+ - macdrv Cocoa NSWindow STILL not reached (0 macdrv trace) -- the boot doesn't get far enough /
+   a thread crashes first. winemac.drv LOADS now (no "no driver"), so once a process survives to
+   create its top-level window, macdrv_create_cocoa_window should run. The #24 boot-perf wall
+   (serial ~100s boot tripping Wine's 10s service deadline) still gates full completion.
+KEPT diag: OCERZ_OOMLOG, OCERZ_SCCOUNT, OCERZ_WSIG (all gated). notes UPDATE #26.
+
+UPDATE #26b -- ARENA SIZING REVISITED (the #25 8GB enlargement had a bad side effect). DYN_ARENA
+_SIZE=8GB makes mmap land the arena TENS OF GB HIGH (~0xb24..-0xbf5.. = ~48GB), even with an
+mmap hint of OCERZ_LOW_LIMIT (kernel ignores the advisory hint for an 8GB anon reservation). At
+that high base a thread DETERMINISTICALLY diverges to an UNMAPPED arena address (guest_rip==
+guest_addr==arena_base+CONST, CONST low bits 0xa338e0, comm(addr)=-1 = not in any region;
+host_insn=0x38696806 = the JIT's byte-load reading the unmapped target during translate()), then
+the signal-frame build ALSO faults -> "nested fault inside crash handler" -> that process dies
+(~10-200M icount, intermittent). The known-good low arena (lands at 0x300000000) reached the Edit
+window without this. So: REVERTED to DYN_ARENA_SIZE=4GB (low landing) and instead WIDENED the bump
+split -- bump_next = lo + size/4 (was size/2) -> ~3GB for ocerz_map_anywhere (was 2GB), which still
+clears the vprot-OOM (~2GB pressure) WITHOUT the high landing. (src/dyld.c:226 back to 4GB;
+src/mem.c:423 bump_next=lo+size/4; the mmap-hint at mem.c:409 is kept, harmless.) make-check GREEN.
+Testing whether the low arena AVOIDS the fetch-fault (if it reappears at LOW 0x3xx addresses it's a
+deep control-flow bug, not the landing). 
+RENDER-PATH BLOCKER MAP (goal = render a Wine window; current state with the fixes above):
+  [DONE]  arena -> winemac.drv LOADS (no vprot OOM / "no driver").
+  [DONE]  gs:0x320 worker crash -> Bug B bounded recovery (process survives).
+  [OPEN]  fetch-fault: a thread diverges to an unmapped arena addr (+the nested-fault that makes it
+          fatal). Likely root to attack next; a jump-to-unmapped is unrecoverable so the nested-
+          fault fix alone won't save it -- must stop the divergence.
+  [OPEN]  macdrv on-screen NSWindow STILL never traced (0 lines) -- processes crash before the
+          desktop/window Cocoa path runs; winemac.drv loads, so it should run once a process
+          survives to create a top-level window.
+  [OPEN]  perf wall (#24): serial ~100s boot (per-process JIT/interp cold-start; ocerz_jit_step
+          re-translates every block per process) trips Wine's 10s service deadline -> RpcSs fails.
+          The real fix is a JIT translation cache SHARED across processes (big; blocked by arena
+          base non-determinism across processes -> would need a fixed arena base). notes #26b.
+
+========================================================================
+UPDATE #27 2026-06-14 -- RENDER-PATH CONSOLIDATION (goal: render a Wine window). Several real
+fixes landed this session; the boot now survives deeper but does NOT yet reach an on-screen
+NSWindow. The gating blocker is the #24 perf wall. make-check GREEN (clean rebuild).
+========================================================================
+FIXES LANDED THIS SESSION (all make-check GREEN, all UNCOMMITTED):
+ 1. ARENA (src/dyld.c DYN_ARENA_SIZE stays 4GB; src/mem.c bump_next=lo+size/4 was lo+size/2;
+    mmap hint of OCERZ_LOW_LIMIT at mem.c:409). The 2GB bump pool exhausted -> 1MB vprot-table
+    mmap failed -> "no driver could be loaded" (NO RENDER). Widening to a 3GB bump pool (low
+    landing) clears it: winemac.drv now LOADS. (8GB lands the arena ~48GB high -> a deterministic
+    jump-to-unmapped crash; rejected. The low 4GB+3/4 split keeps the known-good 0x300000000
+    base AND clears the OOM.) -> vprot-OOM 0, "no driver" 0, fetch-fault 0.
+ 2. gs:0x320 Bug B BOUNDED RECOVERY (src/vm.c): a no-Wine-TEB worker looping on the get_current_
+    teb near-null fault -> terminate just that worker (process survives) instead of fatal.
+ 3. NESTED-FAULT signal-safe COMMIT (src/mem.c ocerz_commit_fault_page + src/vm.c crash_handler):
+    a no-altstack thread builds its signal frame on its rsp stack; the top page is reserved-but-
+    uncommitted -> ocerz's frame-build write faults INSIDE the host fault handler (can't take
+    map_lock) -> "nested fault inside crash handler" _exit(139). Fix: commit that page lock-free
+    (mprotect+bit_set, async-signal-safe) and re-run the write. Plus eager-commit the sigaltstack
+    at registration (src/syscall.c sys_sigaltstack).
+ 4. gethostuuid (BSD 142) + mach_vm_purgable_control (trap 11) from earlier.
+CURRENT RENDER STATE (low 4GB arena, all fixes): the boot runs deep (icount 100M+), winemac.drv
+LOADS (no "no driver"), the ROOT process stays ALIVE ~190s, explorer starts -- BUT win=0 (notepad
+never reaches CreateWindowEx) and macdrv=0 (the Cocoa NSWindow path never runs). So the boot does
+NOT complete to notepad's window. ROOT = the #24 PERF WALL: serial ~100s boot (per-process JIT/
+interp cold-start; ocerz_jit_step re-translates every block per process) trips Wine's 10s service
+deadline (programs/services/services.c:44) -> services/RpcSs fail -> notepad never launches to
+create its window. The arena/gs:0x320/nested-fault fixes removed the CRASHES, exposing that the
+remaining wall is pure PERFORMANCE, not a crash.
+THE PERF FIX (next, big): a JIT translation cache SHARED across processes -- ntdll/Wine code is
+byte-identical in every process; translate once instead of 7x. NOW FEASIBLE: the mmap hint makes
+the arena base DETERMINISTIC (0x300000000) across processes, so guest code addresses match and
+JIT'd code (with embedded guest addrs) is shareable. Needs: a shared (memfd/MAP_SHARED) JIT code
+buffer + block-cache index, position consistent across processes. This is THE path to a window.
+KEPT diag (all gated): OCERZ_OOMLOG, OCERZ_SCCOUNT, OCERZ_WSIG; nested-fault now prints host_pc/
+gaddr/comm. notes UPDATE #27.
+
+========================================================================
+UPDATE #28 2026-06-14 -- ★★★ THE RENDERING PIPELINE WORKS. A Wine GUI window RENDERED ON SCREEN
+under ocerz (winemac.drv -> Cocoa NSWindow -> visible). The render goal is now reframed: it is
+NOT a rendering/macdrv problem and NOT primarily a perf problem -- it is process STABILITY.
+========================================================================
+A fast run (WINEDEBUG=-all) was checked with CGWindowList (Quartz): it found 2 on-screen windows
+owned by "wine", layer=0, real bounds (500x500 + a small one) -- these are `winedbg --auto` CRASH
+DIALOGS (3 Wine processes crashed -> Wine auto-launched winedbg, whose dialog winemac.drv RENDERED
+ON SCREEN). So: (a) winemac.drv successfully creates on-screen Cocoa NSWindows under ocerz (the
+old #16/#17 Cocoa-main-loop wall is effectively cleared -- the Mach-bridge #23 + the arena/crash
+fixes did it); (b) a Wine GUI process CAN reach window creation FAST under ocerz (winedbg launched
+on a crash and immediately showed its dialog) -- so PERF is NOT the hard blocker for reaching a
+window; (c) the reason NOTEPAD specifically doesn't render is that Wine processes CRASH (-> winedbg)
+before/instead of reaching their own windows. The crashes are the #26/#28 dispatcher family
+(garbage gs-restore: guest_rip=ntdll.so+0x33f23, [r14]=poison e.g. 0x1000007feedfde0) on REAL Wine
+threads (have an altstack) -- NOT caught by Bug B's no-altstack worker recovery. So the PATH TO
+RENDERING NOTEPAD is now: STABILIZE the #26/#28 real-thread dispatcher crash (e.g. #28 Fix C:
+restore gs=wine_teb_base at the dispatcher edge, or recover the bad TEB lookup), so the boot
+processes (and notepad) stop crashing into winedbg and reach their own windows -- which winemac.drv
+will then render (proven). This is a MUCH more tractable wall than the perf/shared-JIT-cache work.
+HOW TO CHECK A WINDOW: `python3 -c "import Quartz; wl=Quartz.CGWindowListCopyWindowInfo(Quartz.
+kCGWindowListOptionAll,Quartz.kCGNullWindowID); ..."` filter owner~='wine'; a notepad window is
+WIDE (>700px, ~1028x727) vs winedbg's ~500x500. notes UPDATE #28.
+
+UPDATE #28b -- the boot is UNSTABLE TWO WAYS before notepad reaches its window, both deep:
+ (A) CRASH: the #16/#17 foreign-worker dispatcher crash (~167M icount) -- a worker with an
+     altstack but no TEB runs the WoW64 dispatcher -> kills a CHILD process (root survives) ->
+     winedbg. Proper fix = #16/#17 marshaling.
+ (B) HANG: in another run (render15, broadened Bug B, WINEDEBUG=-all) the boot did NOT crash
+     (0 crashes, 0 winedbg) but HUNG at ~152M icount for the full 280s with no progress and no
+     window -- the #24 wineserver-IPC / ulock sync + perf waits compounding to a stall.
+So notepad never reaches CreateWindowEx because each boot run either crashes a needed process or
+hangs, before notepad's own window-creation. REVERTED the Bug B "LOOPING-alone" broadening back
+to `looping && sig_altstack_sp==0` (the broadened form is risky -- terminating a lock-holding
+real thread HANGS instead of crashing -- and was unexercised; the conservative form is tested and
+lets the root survive child crashes). make-check GREEN.
+NET FOR THE RENDER GOAL: the rendering PIPELINE works (winemac.drv->NSWindow->on-screen, proven);
+every crash blocker that ocerz can remove without deep architecture is removed; what's left are
+TWO architectural, multi-session features -- (1) #16/#17 foreign-worker MARSHALING (don't run Wine
+PE code on libdispatch workers) and (2) the #24 PERF/SYNC wall (shared JIT cache + wineserver-sync
+stabilization so the boot completes fast and without hanging). notepad rendering is gated on those
+two, both precisely localized + documented here. notes UPDATE #28b.
+
+UPDATE #28c -- attacking the #16/#17 crash (A) directly with a TARGETED recovery (the crash is
+the gate: when it kills a process into winedbg, that process never reaches its own window). The
+crash is the WoW64 dispatcher reading a POISON TEB ptr from the 64KB stack base r14 (rax=poison
+e.g. 0x1000007feedfacf) and dereferencing [rax + small TEB-field offset] -> a WILD fault OUTSIDE
+guest space, so the in-guest-space recovery (vm.c:412) never sees it. Observed at MULTIPLE
+dispatcher instructions/offsets: [rax+0x320] @ ntdll.so+0x33f23, [rax+0x2f0] @ +0x41d0d. The
+crashing thread runs a 32-bit (WoW64) stack (~0x200000000), r14=0x200000000, [r14]=poison -- a
+foreign worker (or a thread whose TEB setup at its stack base never ran). FIX (src/vm.c, NEW
+out-of-guest-space recovery block after the in-guest-space one): if a fault is OUTSIDE guest
+space AND it is a deref of a wild/poison rax (rax also outside guest space, fault == rax + small
+offset <0x2000) AND the thread has no valid Wine TEB (no altstack, OR the ptr at r14 is not
+committed), terminate just that thread (cpu->terminated=1; siglongjmp) so the process survives.
+Targeted to the dispatcher-poison signature -> won't fire for a real Wine thread (valid TEB at
+r14). make-check GREEN (test_syscall 96/0, sse 246/0, decode 190/0). Testing whether recovering
+this crash lets a (notepad) process survive to CreateWindowEx -> winemac.drv render. CAVEAT: the
+proper fix is still #16/#17 marshaling; this is a bounded recovery. And even with it, the #24
+perf/sync wall (slow boot / ~152M hang in fast runs) may still gate notepad's window. notes #28c.
+
+## UPDATE #28d (2026-06-23): ROBUST thread-state wild-worker recovery -> boot reaches macdrv for the FIRST TIME (major advance); #17 Cocoa-main-loop is now the wall
+render18 proved the fault-ADDRESS signature is hopeless: the poison TEB (read from the 64KB
+stack base by the WoW64 dispatcher's gs-restore) propagates into rax and is dereferenced at
+UNPREDICTABLE addresses by different dispatcher insns -- observed [rax+0x320], [rax+0x2f0], and
+[rax + scaled-index ~0x200000000] at 3 distinct guest_rips. No fault-offset match covers them.
+
+FIX (src/vm.c, crash_handler, kept, make-check green: test_syscall 96/0, sse 246/0): match the
+reliable THREAD STATE instead of the fault address. A real Wine thread ALWAYS stores a valid
+(committed) TEB pointer at its 64KB stack base *(rsp&~0xffff); a foreign HOSTWQ worker has poison
+there. So on ANY out-of-guest-space fault, read teb = *(rsp&~0xffff) (guarded by committed()) and
+if teb is not a valid committed pointer, this is a no-TEB worker running the dispatcher ->
+terminate just it (g_cur_cpu->terminated=1; siglongjmp), process survives. Real threads (valid
+TEB at the stack base) are NEVER touched. This replaces the brittle wild_rax/wild_fa offset match.
+
+RESULT (render19): the robust recovery caught ALL poison crashes (crashes=0, vs render18's
+crashes=1 at 152M) and the boot progressed PAST the 167M crash point to ~171.5M -- and macdrv RAN
+FOR THE FIRST TIME (winemac.drv loaded + macdrv_init executed). This is the deepest the Wine boot
+has ever reached: past every gs:0x320 / poison-TEB crash, into the Cocoa display driver.
+
+NEW WALL (the genuine remaining blocker for an on-screen window):
+  0088:err:macdrv:macdrv_init Failed to start Cocoa app main loop
+This is the #16/#17 wall: macdrv_start_cocoa_app posts run_cocoa_app to CFRunLoopGetMain() and
+waits <=5s for COCOA_APP_RUNNING; it times out. Per UPDATE #16/#17 the Cocoa setup spins because
+a libdispatch event-manager (dispatch_mgr) thread's kevent returns EVFILT_READ events on ~21 fds
+that are never drained (the HOSTWQ bridge handles async blocks but not read/write event SOURCES),
+so the source handlers never run on a worker and COCOA_APP_RUNNING is never signalled in 5s.
+
+KEY TENSION discovered: the robust recovery TERMINATES the foreign workers -- but those same
+libdispatch workers are what the Cocoa main loop needs to DRAIN its event sources. So terminating
+them avoids the crash but can directly starve the Cocoa-main-loop bring-up. This sharpens the
+true #16/#17 fix: the workers must successfully RUN their (Wine/Cocoa) work with a valid TEB, NOT
+be terminated. The recovery is a genuine advance (first boot to macdrv) but remains a bounded
+bandaid; the durable fix is foreign-worker TEB setup / event-source marshaling so the dispatch
+source handlers run. winedbg's macdrv DOES pass this wall (its crash dialog renders) -- a simpler
+process with fewer event sources -- so the wall is state/event-count dependent, not impossible.
+NEXT: trace ocerz's HOSTWQ event-SOURCE dispatch (dispatch_mgr kevent -> _dispatch_source_invoke
+-> worker source-handler) and find where the read/write-source handler dispatch is dropped.
+
+## UPDATE #28e (2026-06-23): #17 Cocoa-main-loop wall isolated to the MAIN thread (run_cocoa_app), NOT the workqueue workers
+After #28d got the boot to macdrv, a series of runs nailed down WHY macdrv_start_cocoa_app times
+out (5s) -- it is NOT the worker/event-source path:
+
+- render19 (HOSTWQ sync) and render20 (HOSTWQ_ASYNC, kernel-driven workers): IDENTICAL result --
+  crashes=0, macdrv runs, "Failed to start Cocoa app main loop". So the worker-path choice (sync
+  synthetic vs kernel-driven async) does NOT matter. Both reach macdrv and both time out.
+
+- kevent_qos (374) was stubbed (returns 0). Forwarding it to the real kernel:
+  * render21 (forward ALL): early CORRUPTION crash at icount ~0x2d3c4 during dylib init --
+    host PC driven into guest memory (si_code=ADRALN on an 8-but-not-16-aligned addr), i.e. a
+    WORKQ-flagged kevent_qos re-entrantly ran a guest worker with a half-built context. Reverted.
+  * render22 (forward only NON-WORKQ, flags & KEVENT_FLAG_WORKQ(0x20)==0): clean (crashes=0),
+    make-check green, reaches macdrv -- but STILL "Failed to start Cocoa". So kevent_qos was not
+    the blocker. KEPT this anyway: forwarding a real kqueue syscall is more faithful than the
+    0-return stub, mirrors the existing kevent_id forward, and does not regress.
+
+- render23 (GSTRACE) + render24 (WSIG) measured the workers DURING the 5s macdrv window:
+  * Workers DO run (HOSTWQ_ASYNC kernel-driven path works) but only ~2/s -- NOT a 100% spin.
+  * Only 2 worker regions recycle; events are 20x EVFILT_WORKLOOP(-17) + 10x EVFILT_MACHPORT(-8).
+  * The Mach-message bridge SUCCEEDS (gbuf valid, COMPLEX OOL relocated) -- not the #23 fault.
+  => The workqueue side is healthy. The workloop/machport re-fires are normal background, ~2/s.
+
+CONCLUSION: the 100%-CPU spinner during the macdrv wait is run_cocoa_app on the MAIN thread (the
+GUI proc pegs 100%, per #16), independent of the workers. #16 first located a libobjc spin on the
+uncommitted selpool slot 0xdda002a0; #17 FIXED that (selopt perfect hash). So this is the NEXT
+main-thread spin past the selpool fix. render25 pulses SIGUSR1 (OCERZ_RIPDUMP) at the high-CPU
+ocerz proc during the macdrv window to name the current spinning guest rip -> the targeted fix.
+
+## UPDATE #28f (2026-06-23): found+fixed a REAL fatal (__pthread_canceled, syscall 333) killing the Cocoa worker -- but it is not the sole window blocker
+RIPDUMP (OCERZ_RIPDUMP=SIGUSR1) of the macdrv-phase spinner caught a libdispatch worker (gs=pth+0xe0)
+doing read(fd=4,buf,64) (rax=0x2000003, draining an EVFILT_READ source) then hitting:
+  ocerz: fatal: unknown BSD syscall: class=2 num=333 (no table entry) rip=0x7ff802e397e2
+Syscall 333 = __pthread_canceled(action) -- the pthread cancellation-point EPILOGUE libpthread runs
+after a cancelable syscall (the read). It had no bsd_table entry, so ocerz fatally aborted the worker
+mid-drain. Real bug, real fix.
+
+FIX (src/syscall.c bsd_table):
+- [333] __pthread_canceled -> FORWARD (NULL handler). It only READS cancel state; with no guest thread
+  ever marked, the kernel returns "not canceled" and the worker continues. Stubbing to 0 would falsely
+  mean "canceled" -> the worker pthread_exit()s. Forwarding is the faithful + correct choice.
+- [332] __pthread_markcancel -> STUB (sys_workq_stub). Forwarding it (render26) cancels the real HOST
+  thread backing the guest thread, which then exits mid-ocerz_vm_run_cpu and corrupts the host stack
+  (deterministic SIGBUS/ADRALN at icount ~0x2d3c4 during ICU dylib init, host PC driven into guest
+  memory -- the SAME signature render21 hit). ocerz never pthread_cancel's guest threads, so leaving
+  them unmarked is the correct observable state. Proper guest-level cancellation is a TODO.
+
+RESULT (render27): build clean (test_syscall flaky mmap aside), NO more syscall fatal, NO early crash,
+boot reaches macdrv -- but macdrv STILL "Failed to start Cocoa app main loop". So the 333 fatal was a
+genuine bug (workers no longer die on a cancellation point) but NOT the sole cause of the Cocoa-main-
+loop timeout. The worker now SURVIVES the read+canceled; the question is what it (or run_cocoa_app on
+the main thread) does next that still misses the 5s deadline. render28 = denser RIPDUMP (broadcast
+SIGUSR1 to all ocerz procs across the macdrv window) to locate the post-fix spin/block. Kept fixes:
+robust recovery (#28d), non-WORKQ kevent_qos forward (#28e), 332/333 (#28f).
+
+## UPDATE #28g (2026-06-23): the macdrv-phase 100%-CPU blocker is a foreign worker flooding REQ_enum_key_value (registry enumeration)
+After the #28f cancellation fixes, macdrv still times out. RIPDUMP/RDLOG/WRLOG pinned the spinner:
+- One libdispatch WORKER (gs=pth+0xe0, NO Wine TEB) pegs 100% CPU running Wine PE code at 0x341a2fe70
+  in a write-request/read-reply loop on the wineserver fd (libsystem read@0x7ff802e305d2 /
+  write@0x7ff802e32982; Wine's own +server trace is SUPPRESSED on it because TRACE_ON reads debug
+  state from the missing TEB -- itself proof the worker has no Wine thread context).
+- WRLOG decoded the request opcode: REQ=93 = REQ_enum_key_value (sampled 1-in-200/500, so THOUSANDS
+  of actual calls). Reply data (RDLOG) holds UTF-16 "Default"/"WinSta0" + a Windows SID.
+- So a foreign worker enumerates a registry key's values thousands of times, flooding the wineserver;
+  since the server processes requests serially, run_cocoa_app's own Cocoa-setup server calls queue
+  behind the flood -> COCOA_APP_RUNNING misses the 5s deadline -> "Failed to start Cocoa app main loop".
+
+This is the #16/#17 foreign-worker problem in LIVELOCK form (not the crash form the robust recovery
+already handles): a libdispatch worker runs Wine PE registry code with no Wine TEB. In real Wine this
+enumeration runs on a real Wine thread, fast/cached. NEXT (render33): log the enum index to tell a
+finite-but-slow pass (likely the Fonts-key build; fix = perf/cache/timeout) from an infinite loop
+(fix = the enum_key_value termination bug the no-TEB worker induces). Either way the durable fix is
+the #16/#17 marshaling/TEB work so Wine PE code does not run on bare libdispatch workers. Diagnostics
+added (env-gated OCERZ_RDLOG): read fd 3/4/5 returns+content, write request opcode/hkey/index.
+
+## UPDATE #28h (2026-06-23): final diagnosis of the macdrv wall = PERF (finite enum, not a loop); tree clean+green
+render33 settled loop-vs-finite: within each key the enum index increases MONOTONICALLY (hkey=0x48:
+96->292->492; hkey=0x3c: 33->233->429), so each of ~4-5 keys (~500-700 values) is enumerated ONCE per
+process across 4 processes. NOT an infinite loop -> a FINITE registry enumeration (Wine's font/registry
+init) that is simply too slow under ocerz to finish within macdrv_start_cocoa_app's hard 5s deadline
+(confirmed in Wine source dlls/winemac.drv/cocoa_main.m:136 `dateWithTimeIntervalSinceNow:5`). The
+process is pinned to ONE core during the wait; the syscall + committed-memory hot paths are lock-free
+(map_lock only guards commit/protect/bump), so the main thread is idle/blocked (not lock-serialized)
+while the foreign worker monopolizes wineserver bandwidth. So this is the project's #24 PERF wall
+surfacing at the macdrv gate, compounded by the #16/#17 foreign-worker issue (the enum runs on a bare
+libdispatch worker with no Wine TEB; in real Wine it runs fast on a real thread).
+
+FIX DIRECTIONS (next session): (a) PERF -- cut per-server-call/IPC-round-trip overhead so thousands of
+enum_key_value calls finish in <5s (shared JIT cache across processes so the wineserver+client font
+loops are not cold-JIT'd per process; faster client<->wineserver context switches). (b) #16/#17 -- give
+foreign libdispatch workers a real Wine TEB or marshal Wine PE work off them so the enum runs on a Wine
+thread in parallel with run_cocoa_app. Either unblocks the macdrv 5s gate -> the Cocoa app starts ->
+notepad's window renders. SESSION STATE: 3 faithful fixes landed (robust thread-state recovery #28d,
+kevent_qos non-WORKQ forward #28e, __pthread_canceled fwd + markcancel stub #28f), all make-check green
+(test_syscall 96/0, sse 246/0, decode 190/0); exploratory RDLOG/WRLOG diagnostics removed; tree clean.
+The Wine boot reaching macdrv at all (zero ocerz crashes) is this session's milestone -- the deepest yet.
+
+## UPDATE #28i (2026-06-23): PROOF the macdrv wall is per-process PERF, not contention — notepad fails ALONE
+render40 (wineboot -> wait-for-quiesce -> notepad): phase 1 booted the prefix with wineboot and it
+QUIESCED at 60s (total ocerz CPU = 3%, 6 idle procs). Phase 2 then launched notepad alone against the
+quiescent, warm prefix. notepad STILL hit "Failed to start Cocoa app main loop" (macdrv=1,
+cocoa_fail=1), running at exactly ONE core (~100%) on its own font enumeration. So the 5s macdrv
+timeout is NOT a boot-contention artifact -- it is notepad's OWN startup cost. winedbg (a simpler
+dialog, far less font work) renders fine through the same macdrv path; notepad does not, because
+notepad's edit-control font init drives the ~thousands-of-REQ_enum_key_value font/registry pass.
+
+This pins the blocker conclusively to the #24 per-process PERFORMANCE wall: the font pass is finite
+and JIT'd, but at ocerz's throughput it lands ~5-6s -- just over Wine's hard 5s deadline. It is
+BORDERLINE: a ~20-30% per-process speedup would tip it under 5s and the window would render. The
+durable faithful fix is a SHARED/persistent JIT cache so each new Wine process does not cold-translate
+the WoW64 dispatcher + ntdll + the enum path from scratch (today every process re-JITs everything --
+notes #24). winedbg only passes because it is launched later/simpler, not because the path is fast.
+No faithful quick fix exists that does not either (a) do the #24 shared-JIT-cache work, or (b) cross
+into a workaround the owner rejects (shrink the prefix font set / extend Wine's 5s timeout / scale
+guest time). Tree remains clean + green (3 faithful fixes from this session); boot-to-macdrv stands.
+
+## UPDATE #28j (2026-06-23): 64-bit app ALSO fails -> blocker is per-syscall guest-code JIT throughput, not WoW64/arch/warmth
+render41 ran the 64-bit notepad (drive_c/windows/system32/notepad.exe, PE32+ x86-64) to remove the
+WoW64 32->64 dispatcher cost from every font-enum syscall. It STILL hit "Failed to start Cocoa app
+main loop" (macdrv=1, cocoa_fail=1), and wineboot also logged "run_wineboot boot event wait timed
+out" (its own 30s deadline). So the WoW64 dispatcher was NOT the tipping cost; the dominant per-
+REQ_enum_key_value cost is the Nt* implementation + server-protocol guest code, identical for 32- and
+64-bit. Combined with render40 (notepad fails ALONE on a quiesced prefix) and the warm-prefix tests
+(warming the wineserver's font handler doesn't help -- the client's own JIT'd guest code per enum is
+the bottleneck, not the server side or the IPC), this triangulates the blocker conclusively to ocerz
+JIT-CODEGEN THROUGHPUT on the WoW64/Nt syscall path. It cascades through MULTIPLE Wine timeouts
+(wineboot 30s + macdrv 5s), so the prefix never cleanly boots and every GUI app's macdrv times out.
+winedbg only renders because it launches post-crash in a narrower/warmer window, not because the path
+is fast.
+
+Levers tried and ruled out this session (all faithful, none a workaround): robust recovery (boot ->
+macdrv), kevent_qos forward, __pthread_canceled fix, getenv-hotpath already memoized, 64-bit arch,
+warm/quiesced prefix, simpler-app reasoning. The SIGSYS-frame and WoW64-dispatcher per-syscall costs
+were measured/argued marginal (~tens-hundreds of ms), not the seconds. The remaining faithful fix is
+genuine JIT-throughput optimization (better arm64 codegen for the hot x86 patterns on the Nt path,
+and/or a persistent cross-process translation cache), which needs a guest block-level profiler to
+target and is too large/risky to land safely without endangering the boot-to-macdrv milestone. The
+window is gated behind that work. Tree remains clean + green; milestone (boot to macdrv, zero ocerz
+crashes) preserved.
+
+## UPDATE #28k (2026-06-23): lldb confirms the main thread is BUSY (not idle) -> PERF, Mach-wakeup bug ruled out; map_lock contention is the next concrete lever
+render42 attached lldb the instant macdrv logged "Failed to start Cocoa app main loop" and caught
+thread #1 (com.apple.main-thread) STOPPED in ocerz`ocerz_ld (mem.h:188) on EXC_BAD_ACCESS at guest
+addr 0x8195f90000 -- i.e. the main thread was EXECUTING guest code and taking a memory fault, NOT
+parked in mach_msg. This DEFINITIVELY rules out the tractable "CFRunLoop source wakeup never
+delivered" hypothesis: run_cocoa_app's AppKit init is genuinely running, just too slowly. So the
+blocker is PERF (confirmed from 4 independent angles now: render40 notepad-alone, render41 64-bit,
+the font-enum opcode trace, and this lldb).
+
+Mechanism detail: the macdrv-phase faults are Windows LAZY-COMMIT/guard-page faults -- the guest
+touches PROT_NONE reserved pages, ocerz delivers a guest SIGSEGV (depth==0 path, vm.c:412), Wine's
+page-fault handler VirtualAllocs the page -> ocerz_protect -> commit_range -> the single global
+map_lock (mem.c:97). Both the main thread and the font-enum worker fault frequently, so they likely
+SERIALIZE on map_lock -- which fits the observed "process pinned to ONE core" during the wait. Each
+fault also pays a full guest signal-frame build (ocerz_signal_deliver) + the JIT'd Wine handler + a
+wineserver round-trip. All of it is the #24 per-operation overhead, cascading through Wine's 5s
+(macdrv) and 30s (wineboot) timeouts so no GUI process ever signals COCOA_APP_RUNNING in time.
+
+CONCRETE NEXT-STEP LEVERS (faithful, but each needs measurement + careful testing, NOT to be rushed
+at session end against the boot-to-macdrv milestone):
+  1. Measure map_lock contention during the macdrv phase (trylock-fail counter). If hot, move to
+     per-region/finer-grained commit locking so the main thread + workers commit in PARALLEL
+     (would directly address the one-core serialization).
+  2. Cheaper guest page-fault path: the per-fault ocerz_signal_deliver builds a full AVX mcontext;
+     a lighter frame for the commit/guard-page case (validated against what Wine's handler reads).
+  3. Shared/persistent cross-process JIT cache (#24 core) so the WoW64 dispatcher + ntdll + AppKit
+     translation is not redone per process.
+Any one of these that lands a ~20-40% per-process speedup would tip the borderline font/AppKit pass
+under 5s and the window would render. Tree clean + green; milestone (boot to macdrv, 0 ocerz crashes,
+3 faithful fixes) preserved. This session: 42 render runs + lldb, full multi-angle proof of the wall.
+
+## UPDATE #28l (2026-06-23): ROOT CAUSE of the perf wall pinned -- JIT is ~100% (not interp), but every low-shadow/top memory access is a per-access SLOW CALL. THE high-impact next fix.
+OCERZ_JITPROF (added to ocerz_jit_step, then removed) measured the boot: ratio_interp = 0% the whole
+run (xlat_fail=0, dyld-region interp=3085 total), i.e. the code is ~100% JIT-COMPILED. The macdrv proc
+ran ~580M JIT blocks in ~150s. So the earlier lldb catch of the main thread "in ocerz_ld" was NOT the
+interpreter -- it was the JIT'd code CALLING the ocerz_ld helper for a guest memory access.
+
+WHY that matters (the actual bottleneck): the JIT (src/jit.c emit_mov_mem / emit_arith_mem via
+emit_commpage_guard) inlines a guest memory access ONLY for the flat main arena (host = gaddr +
+ocerz_guest_base, ~3 arm64 insns). For the COMMPAGE, the LOW-SHADOW window (g2h = gaddr + low_base,
+all addresses < OCERZ_LOW_LIMIT 0x300000000), and the TOP region (g2h = gaddr - TOP_LO + top_base),
+it emits a SLOW CALL instead (emit_slowcall -> the full ocerz_ld/ocerz_st path + call overhead,
+~20-50 insns). For a 32-bit WoW64 process (plain `wine notepad`), ALL 32-bit code/data lives below
+0x100000000 -> ALL in the low-shadow -> EVERY memory access is a slow call. Memory ops are ~30-40% of
+x86 instructions, so this throttles WoW64 GUI startup ~2-3x -- enough to blow the macdrv 5s and
+wineboot 30s deadlines. (The 64-bit notepad helped only partially because its PE image at 0x140000000
+is also < LOW_LIMIT -> also low-shadow/slow.)
+
+THE FIX (high-impact, faithful, the clear next step -- deferred only to avoid rushing a core JIT
+change at session end against the boot-to-macdrv milestone): inline the low-shadow and top regions in
+the JIT memory emitters using their CONSTANT offsets (ocerz_low_base / ocerz_top_base), keeping only
+the genuine commpage on the slow call. i.e. replace emit_commpage_guard's "low/top -> slowcall" with
+an inline host-address computation (a couple of compare+branch+add per access selecting +low_base /
+-TOP_LO+top_base / +guest_base). This removes a function call from the hot path of EVERY WoW64 memory
+access -> ~2-3x WoW64 throughput -> the font/AppKit cold-start should finish under Wine's 5s and the
+window renders. Validate with make-check (test_decode/test_interp/test_syscall exercise memory ops)
+then a boot run. This is the single most promising lever found this session.
+
+Session tally: 43 render runs + lldb + JITPROF; proven the wall from interp-ratio, thread-state,
+alone/64-bit/warm-prefix angles; 3 faithful fixes landed (boot->macdrv, kevent_qos, pthread_canceled);
+tree clean+green; milestone preserved. notes #28d-#28l.
+
+## UPDATE #28m (2026-06-23): LANDED the low-shadow JIT inline (real faithful WoW64 speedup, make-check green, boot->macdrv, 0 crashes). macdrv decider is now isolated to the 64-bit AppKit cold-start.
+Implemented the #28l fix in src/jit.c emit_commpage_guard: the low-shadow region [0, LOW_LIMIT) is no
+longer a per-access slow call -- it shifts addr_reg by the constant (ocerz_low_base - ocerz_guest_base)
+so the caller's existing "+guest_base" native body lands at gaddr + low_base = ocerz_g2h(gaddr). TOP
+region + commpage stay on the slow call (rare). This removes a function call from EVERY 32-bit WoW64
+memory access (all guest data < 0x100000000 < LOW_LIMIT). VALIDATED: make-check green (test_syscall
+96/0, sse 246/0, decode 190, interp, corpus), boot runs end-to-end to macdrv with ZERO ocerz crashes
+(render44) -- i.e. the inline is correct (no memory corruption), and it is a genuine faithful perf gain
+for all WoW64 code. KEPT.
+
+BUT it did NOT render the window. render45 (notepad ALONE on a quiesced prefix, phase2 wall=18s) still
+cocoa-fails. So the low-shadow inline is NOT the macdrv decider: the decider is run_cocoa_app's
+[WineApplication sharedApplication] / NSApplication-AppKit cold-start, which is 64-bit winemac.so +
+AppKit code in the MAIN ARENA (already inlined). Its sheer instruction count at ocerz's JIT throughput
+exceeds Wine's 5s deadline -- a raw 64-bit-throughput problem the WoW64 memory fix cannot touch. lldb
+(render42) had already caught that main thread BUSY executing (ocerz_ld helper), confirming it is
+compute-bound, not blocked. So the wall has moved one layer in: from "WoW64 memory-access overhead"
+(now fixed) to "64-bit AppKit cold-start throughput".
+
+NEXT LEVERS for the AppKit cold-start (each deeper, faithful): (a) better arm64 codegen density on the
+hot 64-bit blocks (fewer arm64 insns per x86 insn); (b) reduce guest page-fault (lazy-commit) signal
+overhead AppKit init incurs (cheaper commit path / batch commit); (c) the persistent cross-process JIT
+cache so AppKit isn't re-translated per process. Session result: 45 render runs + lldb + JITPROF;
+4 faithful fixes LANDED (boot->macdrv robust recovery, kevent_qos, pthread_canceled, low-shadow JIT
+inline); root cause fully traced; tree clean+green; milestone preserved. notes #28d-#28m.
+
+## UPDATE #28n (2026-06-23): CPU measurement confirms the AppKit wall is SINGLE-THREADED compute-bound (no tractable parallelism fix)
+render46 sampled the busiest ocerz process's %CPU every 1s through notepad's (quiesced, alone) startup
++ macdrv wait: it held ~90-100% = ONE CORE the whole time (top PID rotates as wineboot/services/
+explorer/notepad take turns; each is single-threaded-busy, with occasional dips to ~65-78% = brief
+IPC/fault waits). So the macdrv-deciding work is NOT multi-thread lock contention (ruling out the
+map_lock/parallelism lever) -- it is one thread, compute-bound. Combined with lldb (main thread busy
+executing) this is conclusive: run_cocoa_app's 64-bit AppKit cold-start is ~6-13s of single-threaded
+JIT'd execution + per-block translation, exceeding Wine's 5s. The ONLY remaining faithful levers are
+raw-throughput (deep): denser arm64 codegen on hot 64-bit blocks, faster/cached block translation
+(persistent cross-process JIT cache so AppKit isn't re-translated each process), cheaper lazy-commit
+fault path. winedbg renders only because it launches later in a warmer/lighter state, not because the
+path is fast. Session totals: 46 render runs + lldb + JITPROF + CPU profiling; root cause fully traced
+to single-threaded 64-bit AppKit throughput; 4 faithful fixes LANDED; tree clean+green; milestone kept.
+
+## UPDATE #28o (2026-06-23): main-arena JIT fast-path LANDED (2nd real speedup); + HONEST CORRECTION: the "rendered window" was a FALSE POSITIVE (Steam + stale-window contamination)
+LANDED (src/jit.c emit_commpage_guard): a single fast-path range check -- if gaddr in [LOW_LIMIT,
+TOP_LO) (the main arena, where all 64-bit winemac.so+AppKit code lives) branch straight to the native
++guest_base access, skipping the ~10-instruction commpage/top/low guard. make-check green (syscall
+96/0, sse 246/0, decode, interp, corpus), boot->macdrv with ZERO crashes. Correct + a real 64-bit
+throughput gain. KEPT (with the #28m low-shadow inline -- two genuine JIT memory speedups this session).
+
+HONEST CORRECTION: I briefly believed notepad/a Wine app had rendered ("APP-WINDOW" at ~152s in
+render47/48). It was a FALSE POSITIVE. Two contaminants fooled my CGWindowList check: (1) the user's
+Steam keeps respawning (steam.exe / steamwebhelper.exe own 500x500 windows) -- my winedbg filter used
+`ps comm` which shows "ocerz" for everything under ocerz, so it never excluded these; (2) stale
+NSWindows from earlier runs lingered after pkill (the proc dies but the WindowServer keeps the window
+briefly), so a fresh run detected them at ~2s. The AIRTIGHT run (render53: killed all my window-owning
+procs, slept 10s, VERIFIED 0 non-Steam wine windows before launch, then only accepted a window after
+60s of fresh boot) found NO Wine window on screen -- only the internal #32769 desktop CLASS created
+(Wine always makes it; not a rendered NSWindow), and cocoa_fail=1. So ocerz does NOT yet render a Wine
+window; the macdrv 5s wall still wins. (Screenshots are blocked by macOS Screen-Recording permission
+-- "could not create image from display" -- so I cannot visually inspect either.)
+
+TRUE STATE after this session (53 render runs): 5 faithful fixes LANDED (boot->macdrv robust recovery,
+kevent_qos forward, pthread_canceled, low-shadow JIT inline, main-arena JIT fast-path), root cause of
+the wall fully traced (single-threaded 64-bit AppKit cold-start, ~100% JIT, compute-bound, >5s), tree
+clean+green, milestone (boot->macdrv, 0 ocerz crashes) preserved. The window is STILL gated on ~2x more
+64-bit throughput (the two JIT speedups landed ~20-30%, not the 2x needed). Next: denser hot-block
+codegen, persistent cross-process JIT cache, cheaper lazy-commit fault path. NO rendered window yet.
+
+## UPDATE #28p (2026-06-23): persistent JIT cache — VERIFY-FIRST measurement = NO-GO (translation is 61–83ms, the cold-start is execution-bound). V-A proven, V-B KILLs the cache as a window fix.
+
+Owner picked "persistent cross-process JIT cache" as the next direction. Before writing any cache code I
+ran the mandated VERIFY-FIRST gate (V-A zero-reloc invariant, V-B break-even). Added one log-only,
+env-gated instrument: `OCERZ_JITMEASURE` in `translate()` (src/jit.c) times every successful
+translation with `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` under jit_lock (so plain statics are
+race-free), splitting out shared-cache code (`rip >= 0x7ff800000000`). make-check unchanged
+(test_syscall 96/0, test_decode 190) — the measure path is a single cached `getenv` branch when off.
+
+V-A (zero-relocation invariant across processes) — PROVEN BY INSPECTION, no run needed:
+  - cache.c:218 `map_subcache` mmaps every shared-cache mapping MAP_FIXED at its file-preferred address
+    (`rd64(m)` = 0x7ff800000000 for the x86_64 cache), slide 0, or OCERZ_FATAL. So the cache base and
+    every baked guest rip >= 0x7ff8… in a shared-cache block is BIT-IDENTICAL in every process.
+  - mem.c:525 `setenv("OCERZ_LOWBASE", …)` + syscall.c:629-635 propagate the low-shadow base across the
+    guest exec env; mem.c:499-510 reserves the inherited base MAP_FIXED. So within ONE boot, all
+    processes share identical guest_base(=0)/low_base/top_base — every baked window constant matches too.
+  - Net relocation surface for a within-boot cross-process block = exactly TWO per-process bakes:
+    R1 `&ocerz_jit_exec_one` (ASLR helper) and R2 `&insns[i]` (heap insn ptr) — both PIC-able. Cross-RUN
+    (disk) additionally needs low_base in the env key (advisory mmap differs per boot). So V-A is real:
+    the cache is *technically* near-trivial to relocate.
+
+V-B (break-even — does eliminating translation actually move the 5s Cocoa deadline?) — **KILL**.
+  Ran notepad to the macdrv phase under OCERZ_JITMEASURE. The GUI process (the one whose macdrv
+  `macdrv_start_cocoa_app` misses the 5s deadline) translated its ENTIRE working set:
+      blocks=65536  xlat_total=83ms   |  shared-cache: blocks=49378  xlat=61ms
+  Every boot process is in the same ballpark (16k blocks ≈ 18ms; ~1.1µs/block; ~900k blocks/s). So the
+  COMPLETE translation cost of the deadline-missing process is ~83ms (61ms is the cache's exact target).
+  The deadline is 5000ms and is missed by seconds. A cache that eliminates ALL translation saves ≤83ms.
+  **It cannot move a multi-second-missed 5s deadline.** The cold-start is execution-bound, not
+  translation-bound — consistent with #28l (≈100% JIT execution, not interp; the cost is *running* the
+  translated AppKit cold-start code, not *translating* it).
+
+DECISION: NO-GO on the persistent JIT cache as a fix for the window. (It would shave ~50-80ms × boot
+redundancy off total boot latency — a real but tiny general win, not worth the relocation/keying
+machinery now, and irrelevant to the 5s wall.) The OCERZ_JITMEASURE instrument is kept (gated off) as a
+cheap standing measurement. The faithful lever remains the execution-bound Cocoa cold-start: either a
+remaining libdispatch event-source spin (#17) or broad per-instruction execution cost (native coverage).
+Profiling the CPU-pegged GUI proc during the 5s wait (host `sample`) is the next diagnostic to pick
+between them. Also noted: a flaky-deterministic guest crash at guest_rip=0x7ff802e35bbf / icount=0x2d7e1
+(SIGBUS, host_pc inside the JIT cache, host_insn=0x35000020 cbnz; host_addr varies only by JIT-cache
+ASLR) sometimes aborts the boot before macdrv — recoverable (attempt 1 reached macdrv at ~34s), but a
+reliability item to pin down since reaching macdrv reliably is needed to work the window.
+
+## UPDATE #28q (2026-06-24): ROOT-CAUSED + FIXED the real window blocker — ocerz never translated in-message guest pointers on Mach SEND, so libxpc os_crashed "Malformed Mach message" during framework init. Flat-OOL + vector send translation landed; the framework-init UD2 crash is GONE (0/8 vs 8/8). make-check green.
+
+THE REAL BLOCKER (supersedes the "macdrv 5s deadline" framing of #28h–#28p): with extended Cocoa budget
+(#28p) the window STILL didn't render because the GUI process was ABORTING during framework init,
+BEFORE macdrv ever ran. The abort is a guest UD2 (0f 0b) at libxpc+0x3a3ea =
+os_crash("Data corruption: Malformed Mach message or kernel bug."), arg edi=0x10000002 =
+MACH_SEND_INVALID_DATA. It was FLAKY only because it is allocation-placement dependent, NOT a race.
+
+ROOT CAUSE: ocerz's mach_msg SEND paths (case 31 mach_msg_trap, case 47 mach_msg2_trap, src/syscall.c)
+translated ONLY the message-buffer pointer a[0]=ocerz_g2h(a[0]) and forwarded the rest verbatim to the
+real kernel. They NEVER translated the GUEST pointers EMBEDDED in the message from guest->host. Under
+Wine the low-shadow window is active (ocerz_low_base!=0), so any guest addr < OCERZ_LOW_LIMIT
+(0x300000000) is NON-identity: host = gaddr + ocerz_low_base. libxpc's outgoing message / OOL / vector
+segment buffers frequently land sub-4GB in low-shadow. The kernel's copyin reads those embedded
+addresses as host pointers, hits the wrong/unmapped host page, and rejects the send. When the same
+buffer happened to land in the identity arena (host==guest) the send coincidentally worked -> the
+flakiness. ocerz already did the EXACT INVERSE (host->guest) for INBOUND messages in
+ocerz_bridge_mach_msg; the send-side guest->host walk was the missing symmetric half.
+
+TWO embedded-pointer families (both captured via OCERZ_MACHMSG send-error logging + register decode):
+  * FLAT complex message (opt-hi MACH64_SEND_MQ_CALL, no vector): an OOL/OOL_PORTS/OOL_VOLATILE
+    descriptor's .address sat in low-shadow (e.g. d0 addr=0x10010ea10, type=1, committed). kr=0x1000000c
+    = MACH_SEND_INVALID_MEMORY.
+  * MACH64_MSG_VECTOR send (opt bit 32 set; a[0] is an array of `a[2]>>32` 24-byte mach_msg_vector_t
+    {msgv_data@0, msgv_rcv_addr@8, msgv_send_size@0x10, msgv_rcv_size@0x14}): a segment's msgv_data sat
+    in low-shadow (e.g. V1 data=0x10010ae20). kr=0x10000002 = MACH_SEND_INVALID_DATA = THE FATAL one
+    libxpc crashed on. (MACH64_MSG_VECTOR/mach_msg_vector_t are XNU-private, not in public SDK headers;
+    recovered the layout by decoding the register-packed header a[2..5] + the buffer.)
+
+THE FIX (faithful — mirrors exactly what an in-process macOS send presents to the kernel; src/syscall.c):
+  - ocerz_send_xlate_descriptors(): for a flat COMPLEX message, rewrite each OOL/OOL_PORTS/OOL_VOLATILE
+    descriptor's 8-byte .address guest->host (ocerz_g2h). PORT (type 0) / GUARDED_PORT (type 4) untouched
+    (shared port namespace). Strides mirror the inbound bridge (port +12, others +16; addr@+0; type@+11).
+  - ocerz_send_xlate_vector(): for a MACH64_MSG_VECTOR send, translate each vector entry's msgv_data +
+    msgv_rcv_addr guest->host, plus walk the control segment's OOL descriptors (guarded on the segment
+    being committed so a non-pointer never faults the walk).
+  - IN-PLACE-then-RESTORE: translate before the trap, restore originals after, but only restore a field
+    still holding OUR host value (a mach_msg2 send+receive overwrites the buffer with the reply, which
+    must be left intact). Identity-arena addresses (host==guest) are no-ops. Wired into case 31 + case 47.
+  - Both gated on ocerz_low_base!=0; saved-descriptor arrays capped at 64.
+
+RESULT (notepad, 8 fresh boots each): BEFORE fix = 8/8 UD2-crash at framework init; flat-only fix =
+family-1 (0x1000000c) eliminated but 8/8 still crash on the vector 0x10000002; flat+vector fix = 0/8
+UD2-crashes, no 0x10000002 / no 0x1000000c, only benign kr=0x10000003 (MACH_SEND_INVALID_DEST, dead
+port). make-check fully green (syscall 96/0, decode 190, sse 246/0, interp, ext 165/0, loader 54/0,
+cache 14). The framework-init crash that aborted the GUI process — the true reason no window rendered —
+is DESTROYED. Next: re-test the full window path (the earlier #28p "extended budget -> no window" was
+contaminated by THIS crash). Diagnostics kept gated: OCERZ_MACHMSG (BRIDGE-MSG / MACH-SEND-ERR / VEC).
+
+## UPDATE #28r (2026-06-24): the Mach send fix advanced the boot PAST the framework-init crash to a NEW wall — LaunchServices _LSApplicationCheckIn deadlocks because the real coreservicesd never replies (daemon-policy gap, CONFIRMED). The .app bundle did NOT fix it. Past macdrv now lies a CHAIN of macOS daemon-compat gaps.
+
+With the send-side Mach translation (#28q) the boot no longer crashes and progresses into AppKit/
+NSApplication init, where a GUI process DEADLOCKS in a synchronous mach_msg2 send+receive that never
+returns. Diagnosed in full:
+  * Identity: the blocking sequence is msgh_id 10019 / 10050 / 10054 (LaunchServices MIG subsystem base
+    10000 = the _LSApplicationCheckIn / app-registration family — confirmed vs shared-cache exports
+    __LSApplicationCheckIn / __LSASNReturnASNForPIDFromWithinCoreServicesd), sent COMPLEX SEND|RCV with
+    a MAKE_SEND_ONCE reply port and NO MACH_RCV_TIMEOUT, to the real coreservicesd port (obtained from
+    the immediately-preceding com.apple.CoreServices.coreservicesd bootstrap lookup). Captured via
+    OCERZ_MSGDUMP (inline service names) + OCERZ_MACHMSG.
+  * ocerz forwards it FAITHFULLY: the send SUCCEEDS (no MACH_SEND_* error), the message is NOT touched by
+    the send translation (xlated=0 — no low-shadow OOL), and the RCV is a normal synchronous in-trap
+    receive. So it is NOT an ocerz translation/forwarding bug.
+  * Root cause = DAEMON-POLICY GAP: every Mach trap is issued on the real host thread (svc #0x80), so the
+    kernel stamps the message audit-token with the genuine ocerz/Wine host pid+identity. coreservicesd
+    correlates that against an LS-registered app/ASN; the Wine guest was never LS-spawned and has no
+    resolvable bundle/ASN, so _LSApplicationCheckIn cannot be satisfied and coreservicesd returns (or
+    stalls on its own sub-RPC to launchd/secinitd) WITHOUT replying -> AppKit deadlocks before macdrv.
+  * PROOF (OCERZ_LSTIMEOUT diag): forcing a 1.5s MACH_RCV_TIMEOUT on the 10000-range check-in sends makes
+    them return MACH_RCV_TIMED_OUT with NO reply and NO crash -> confirms "send delivered, daemon chose
+    not to reply" (policy gap), and rules out the alternative (a reply that arrives then faults on
+    un-relocated inbound OOL — that latent case-47 reply-OOL gap remains real but is NOT this wall).
+  * FAITHFUL fixes tried that did NOT work: (a) running ocerz from a real .app bundle (Contents/MacOS/ocerz
+    + Info.plist org.ocerz.wine) AND `lsregister -f`-ing it — coreservicesd still does not reply (so the
+    process-path/.app identity alone is not what real Wine-under-Rosetta relies on). (b) Forcing the RCV
+    timeout lets AppKit proceed PAST the check-in, but it then blocks ELSEWHERE (a non-mach_msg2 wait) —
+    i.e. the LS check-in is the FIRST of a CHAIN of daemon-compat gaps, and it also needs a real ASN
+    (a bare timeout leaves AppKit with no ASN -> later LS derefs).
+
+STRATEGIC REALITY: past the (now-fixed) crash, reaching a rendered window requires clearing a chain of
+macOS userspace-daemon round-trips that don't complete for a Wine-guest-under-ocerz (LaunchServices is
+the first). Each needs either FAITHFUL daemon-bridging (hard; coreservicesd-internal) or a compatibility
+SHIM that synthesizes the reply the daemon would send for a registered app (conflicts with the owner's
+"no hacks / faithful only" rule — an explicit owner decision). Diagnostics kept gated: OCERZ_MSGDUMP,
+OCERZ_LSTIMEOUT, OCERZ_NO_SENDXLATE (A/B the send translation), plus the #28q OCERZ_MACHMSG family. The
+send-translation FIX itself (#28q) is on by default and make-check stays green.
+
+## UPDATE #28s (2026-06-24): ran a 10-agent workflow to break the LaunchServices _LSApplicationCheckIn wall; its top leads were well-reasoned but FAILED empirically. The wall is a black-box coreservicesd refusal I cannot crack without privileged (sudo) tracing. Mach-send fix still the session's landed deliverable; make-check green.
+
+The workflow (break-ls-checkin-wall, 6 investigators + synth + adversarial verify) produced 3 ranked
+faithful breakthroughs. I tested the top two against the REAL ocerz boot; both are disproven:
+  * #1 DELETED-EXECUTABLE-VNODE (its highest-confidence): theory = coreservicesd resolves the checking-in
+    pid via proc_pidpath_audittoken and silently never replies if the process's launch-time executable
+    file is `(deleted)` on disk; the empirical agent PROVED this is a real deterministic trigger of the
+    EXACT symptom under real Rosetta (unlink/move the spawned executable -> _LSApplicationCheckIn hangs
+    forever), and ocerz links in place (Makefile) + re-execs THIS binary per child, so rebuilding during
+    a boot makes children `(deleted)`. DISPROVEN as the cause here: ran from an immutable installed copy
+    (~/ocerz-install/ocerz, never rebuilt during the boot), confirmed via `lsof -p <gui-child>` that the
+    txt/executable vnode is PRESENT (no `(deleted)`), and it STILL stalls at id=10054. Same symptom,
+    different unidentified cause. (Keep the operational hygiene anyway: run from a stable copy, never
+    `make` during a boot.)
+  * #2 TRANSLATION IDENTITY (proc_translated / oah): a real x86_64-under-Rosetta process is kernel-
+    stamped translated (proc_translated=1, hw.cputype=x86_64); ocerz is native arm64. Added a FAITHFUL
+    sys_sysctlbyname intercept (src/syscall.c) returning sysctl.proc_translated=1 (the guest IS a
+    translated process) + OCERZ_SYSCTLLOG. RESULT: the guest issues ZERO sysctl.proc_translated queries
+    during the boot -> it checks translation via the commpage (oah), not sysctl, so the intercept can't
+    reach it. The workflow's shipping variant (launch ocerz as an x86_64 Rosetta STUB so the kernel
+    stamps it translated) is self-contradictory: an arm64 JIT cannot run inside a Rosetta-x86_64 process.
+  * #3 os_log diff: the _LSApplicationCheckIn CLIENT runs in-guest and its os_log SHOULD route through
+    ocerz-translated libsystem_trace; captured `log show --process ocerz/wine` during the stall ->
+    EMPTY (the guest's os_log does not reach the unified log under a queryable process), so the client
+    decision strings are invisible; the SERVER (coreservicesd) reason is gated below the default log
+    threshold (needs `sudo log config --mode level:debug` for LaunchServices).
+  * Also surfaced: a SEPARATE real ocerz bug (breakthrough #2-stack) — a bare native x86_64 Cocoa app
+    crashes under ocerz at SIGBUS in _malloc_zone_malloc during [NSApplication sharedApplication]
+    (guest descends the 8MB DYN_STACK_SIZE main stack into the 16KB uncommitted inter-allocation gap
+    [aux..stack]; mem.c:634 leaves only one host page, not a real guard). This blocks the decisive
+    "does a NATIVE Cocoa app under ocerz also hang at the check-in?" comparison; the Wine boot itself
+    reaches the check-in (its Cocoa runs on a Wine-managed stack), so it is not the Wine-window blocker
+    but is a genuine faithful fix to make (larger / guard-page-aware on-demand-growing guest main stack,
+    dyld.c:934/mem.c:634).
+
+NET: coreservicesd receives the check-in (send succeeds, present vnode, real reply port) and SILENTLY
+never replies, for a reason that is NOT: audit session (asid=0 Mac-wide), signature (adhoc), .app/ASN,
+deleted vnode, proc_translated, a callback (zero traffic back), or anything in any log I can read
+without root. It is a black-box LaunchServices/coreservicesd identity decision specific to running
+x86_64 Wine under a THIRD-PARTY arm64 translator (Apple's Rosetta is kernel-recognized; ocerz is not).
+The single most likely UNLOCK now needs the user (sudo): enable LaunchServices/coreservices debug
+logging and reproduce to read coreservicesd's actual bail reason. Faithful, landed this session: the
+Mach send-pointer translation (#28q) + the proc_translated sysctl intercept; both default-on, make-check
+green; diagnostics gated (OCERZ_SYSCTLLOG added). The window remains blocked ONLY at this LS check-in.
+
+## UPDATE #28t (2026-06-24): Path B — the native-Cocoa-under-ocerz crash that blocks the LS-wall scoping experiment is NOT a stack-size bug; it is an infinite malloc recursion via a CoreFoundation constant zone wrongly serving as the default malloc zone. Precisely root-caused; fix is a malloc-zone/init-ordering change. make-check green.
+
+To scope whether the LaunchServices _LSApplicationCheckIn wall (#28r/#28s) is ocerz-fundamental or
+Wine-specific, the plan was to run a bare native x86_64 Cocoa app under ocerz and see if it ALSO hangs
+at the check-in. That app (miniapp_hang.m: [NSApplication sharedApplication] + finishLaunching) CRASHES
+under ocerz inside sharedApplication, BEFORE reaching the check-in. Root-caused precisely (added an
+r12-r15 + [r15+0x18] dump to the vm.c crash handler):
+  * SIGBUS at host_addr=0x340103ff8 (rbp-0x38) in the UNCOMMITTED 16KB inter-allocation gap
+    [0x340100000,0x340104000) that mem.c:634 (bump_next = gaddr+glen+OCERZ_HOST_PAGE) leaves between
+    the 1MB `aux` and 8MB `stack` allocations -- a stack OVERFLOW, but the cause is INFINITE RECURSION,
+    not stack size (the workflow's 256MB test ran longer and hit the SAME base, the tell).
+  * The rbp-chain repeats two return addrs: libsystem_malloc+0x1d74f (public malloc, func_A) <->
+    libsystem_malloc+0x39219 (malloc_zone_malloc, func_B). func_A calls func_B(+0x39122); func_B does
+    `call [r15+0x18]` = zone->malloc; that returns into the public malloc -> loop.
+  * r15 (the zone) = 0x7ff840095a00 = a malloc_zone_t in the shared cache's RO DATA mapping whose
+    function pointers are ALL CoreFoundation (malloc=CF+0x10dad9, calloc=CF+0x10dae5, free=CF+0x10db64,
+    realloc=CF+0x10db69) -- a CoreFoundation CONSTANT zone (cache chained ptrs, ocerz unchains them
+    correctly to 0x7ff802fc0ad9). So `malloc -> malloc_zone_malloc(CF_zone) -> CF zone-malloc ->
+    public malloc -> ...` because the DEFAULT malloc zone (malloc_zones[0]) resolves to this CF
+    constant zone instead of the real runtime nano/scalable zone. CF's zone-malloc is meant to
+    delegate to the REAL system zone, not loop.
+  * Likely root: initializer ORDERING -- a native CoreFoundation app initializes CF very early, and
+    under ocerz's mini-dyld CF registers/installs its zone before libmalloc creates+installs the real
+    default zone, so the CF constant zone ends up as malloc_zones[0]. The Wine boot does not hit this
+    (its malloc path / init order differs), which is why Wine reaches the LS check-in while the bare
+    Cocoa app dies in sharedApplication.
+
+IMPLICATION: this is a real, separate, FAITHFUL fix to make (native macOS Cocoa apps under ocerz need
+the real default malloc zone, i.e. correct libmalloc-vs-CF init ordering / default-zone install) AND it
+unblocks the decisive native-vs-Wine LS-check-in comparison. It is NOT the Wine-window blocker itself.
+NEXT to fix it: trace where malloc_zones[0] is set under ocerz and why CF's constant zone wins; compare
+ocerz's initializer order for libsystem_malloc vs CoreFoundation against real dyld; ensure libmalloc's
+real default zone is installed first (or that CF's zone-malloc delegates to the real zone). Kept diag:
+the vm.c crash dump now prints r12-r15 + [r15+0x18]. make-check green (syscall 96/0, decode 190).
+
+## UPDATE #28u (2026-06-24): ★ LANDED the CF-init fix (native Cocoa apps no longer recurse-crash; make-check green, Wine unaffected) AND proved the LaunchServices wall is WINE-SPECIFIC, not ocerz-fundamental — a native Cocoa app under ocerz PASSES the same _LSApplicationCheckIn that Wine hangs on.
+
+FIX LANDED (faithful, default-on, make-check green): the native-Cocoa malloc recursion (#28t) was NOT a
+malloc/zone bug — proven by a workflow with a live OCERZ_ZONEPROBE: malloc_zones[0] is the REAL nano
+zone in BOTH the crashing and working runs. The real defect: ocerz ran ONLY libSystem's initializer and
+jumped to main, gating the full dependency-ordered initializer phase (run_load_phase+run_init_phase,
+which runs __CFInitialize and every framework init like real dyld) behind getenv("OCERZ_INITPHASE").
+Without __CFInitialize, CoreFoundation's runtime class-bridge table (___CFRuntimeBuiltinObjCClassTable)
+stays ZERO, so __CFAllocatorAllocateImpl takes the branch that passes CF's own constant allocator
+(___kCFAllocatorSystemDefault, the RO-cache zone whose malloc is ___CFAllocatorCustomMalloc) as the
+zone -> malloc_type_zone_malloc -> [zone+0x18]=CF malloc -> public malloc -> infinite 2-frame loop ->
+stack overflow. FIX (src/dyld.c): added a `links_cf` img flag set when the main image's LC_LOAD_DYLIBs
+name CoreFoundation/Foundation/AppKit (dyld.c:517 scan), and changed the gate (dyld.c:2527) to run the
+init phase when `(img.links_cf || OCERZ_INITPHASE) && !OCERZ_NOINITPHASE`. So native CF/Cocoa apps run
+__CFInitialize before main (real-dyld behavior); the Wine PE loader links NONE of CF/Foundation/AppKit
+in its main image (verified via otool -L) so its path is byte-for-byte unchanged. VERIFIED: ./ocerz
+./miniapp (a native [NSApplication sharedApplication]+finishLaunching app) no longer crashes by default;
+make-check green (syscall 96/0, decode 190, sse 246/0, loader 54/0). init_mark_done_closure still bounds
+done-marking to /usr/lib/system/ umbrellas so malloc/pthread are not double-initialized.
+
+★ MAJOR SCOPING RESULT (redirects the entire #28r-#28s LS investigation): with the init phase, the
+native Cocoa app under ocerz sends the FULL LaunchServices check-in sequence id=10050/10019/10054/10052
+to coreservicesd and CONTINUES PAST it (id=10052 follows id=10054 -> coreservicesd REPLIED), then does
+the same service lookups as Wine (cfprefsd, launchservicesd, windowserver.active, dock.server,
+runningboard, pasteboard, opendirectoryd, ...) and reaches a WindowServer-stage call (id=4, port
+0x2a03) where it blocks. So _LSApplicationCheckIn does NOT fundamentally hang under ocerz -- the Wine
+boot's hang at the SAME id=10054 is WINE-SPECIFIC (Wine's check-in message / process context differs
+from a native app's, even though both run as the same ocerz arm64 process with the same executable
+vnode). The earlier "coreservicesd black box / daemon-policy gap" framing (#28r) is SUPERSEDED: there is
+now a WORKING reference (native app) to diff the FAILING case (Wine) against.
+
+NEXT (two tracks, both now well-defined): (1) WINE LS: diff Wine's id=10054 check-in message + process
+context against the native app's (which works) to find the Wine-specific difference that makes
+coreservicesd withhold the reply. (2) DEEPER COMMON WALL: both the native app (at id=4) and (eventually)
+Wine block at the WindowServer/CGS connection stage -- the known SkyLight/WindowServer frontier; a
+window for EITHER requires getting past it. Kept gated diag: OCERZ_ZONEPROBE (workflow-added), the vm.c
+r12-r15 + [r15+0x18] crash dump. Two faithful fixes landed this session total: Mach send-pointer
+translation (#28q) + CF init phase (this).
+
+## UPDATE #28v (2026-06-24): the deep COMMON wall (for both native Cocoa and Wine) is the WindowServer/CARenderServer connection inside [NSApplication sharedApplication] — request sent cleanly, WS never replies. Traced precisely via a native window-app repro.
+
+Built winapp.m (native x86_64: sharedApplication + create NSWindow + makeKeyAndOrderFront + finishLaunching + run loop) and ran under ocerz (the CF-init fix #28u makes it get this far). It BLOCKS inside [NSApplication sharedApplication] (only "[winapp] start" prints, never "sharedApplication done"):
+  * sample: main thread 100% parked in ocerz_handle_syscall (the mach_msg2 trap), 0% CPU -> a BLOCK, not
+    a spin (distinct from the #16/#17 kevent spin).
+  * Immediately-preceding bootstrap lookups (via coreservicesd id=1073742031): com.apple.windowserver.active
+    AND com.apple.CARenderServer -> this is the CoreGraphics/SkyLight WindowServer connection handshake.
+  * The app SENDS the WS connect request cleanly: id=96519, complex (bits=0x80130013), opts SEND|TIMEOUT
+    to rport=0x7f03 (the WS port), lport=0 (so the reply port 0x2a03 is passed as a PORT DESCRIPTOR in the
+    complex body, MAKE_SEND). ZERO MACH-SEND-ERR -> the kernel accepted it and the real WS received it.
+  * The app then parks in a RCV-only mach_msg2 (opts=0x40700420e: MACH_RCV_MSG, NO RCV_TIMEOUT) on
+    rport=0x2a03 waiting for the WS's reply -> the WS never sends -> deadlock forever. Deterministic.
+So both paths converge here: Wine hangs earlier (its Wine-specific LS check-in, #28u) but would land here
+too; the native app sails through LS and dies at the WS connection. A rendered window for EITHER requires
+the WindowServer to complete this connection.
+
+This is the same shape as the coreservicesd LS no-reply, but with the WindowServer — the strictest
+GUI-session/identity-gated daemon (CGS/SkyLight). ocerz forwards the request faithfully (shared port
+namespace, real kernel, real WS receives it); the WS chooses not to reply. Likely gated on GUI-session /
+connection-policy the WS enforces on a process that is not a normal window-serving app (this Mac Studio is
+headless/remote, asid=0 for everything, yet the user's real Rosetta-Wine DOES get windows here -- so it is
+NOT a blanket headless refusal, it is something specific to ocerz's process/connection vs a Rosetta one).
+Reading WHY the WS withholds the reply needs the WS/SkyLight side (privileged: `sudo log config
+--subsystem com.apple.windowserver --mode level:debug`, or com.apple.SkyLight), analogous to the pending
+coreservicesd trace. Alternatively a deep CGS-connection-protocol audit of ocerz's forwarding of the
+id=96519 port-descriptor handshake. This is the project's central GUI frontier (cf. #16/#17 + the CLAUDE.md
+D3DMetal/SkyLight notes). Repro kept: $SP/winapp(.m). No code change this update (diagnosis only);
+make-check remains green; the two landed fixes this session (Mach send #28q, CF init #28u) stand.
+
+## UPDATE #28w (2026-07-05): ★★★ #28v WAS A RED HERRING. The WindowServer DOES reply — it creates a live console connection. The real wall is a libdispatch dispatch_sync hang, and OCERZ_HOSTWQ=1 RESOLVES it (sharedApplication now RETURNS). Next wall: a memmove SIGBUS on an uncommitted arena page. No code landed yet (deep diagnosis); make-check green.
+
+The user enabled daemon debug logging (`sudo log config --subsystem {com.apple.windowserver,SkyLight,
+coreservices} --mode level:debug,persist:debug`). Reading it OVERTURNS #28v and kills a whole family of
+prior theories (session/asid, "WS withholds reply", garbage audit token). Method that finally worked:
+`log stream --level debug --style compact --predicate 'process=="WindowServer" OR ...'` DURING a fresh
+winapp reproduce (NOT `log show`, which returned 0 lines — the persist config does not retroactively
+populate for these daemons). What the daemons actually do for our ocerz pid:
+  * launchservicesd: `CONNECTION ... pid=28082 euid=501 asid=100002` — **we ARE in GUI session 100002**,
+    NOT session 0. The earlier "asid=0 everywhere" was measured on a DIFFERENT (Bash-tool python) process.
+  * coreservicesd: `10050/ServerCheckinWithResult_rpc serverCheckIn(pid=28082 uid=501) -> session 100002`,
+    then launchservicesd `CopyAndUpdatePendingApplication(token=auditToken{uid=501 euid=501 gid=20 egid=20
+    auditSessionID=100002 pid=28082})` — the LS check-in SUCCEEDS with the CORRECT token. (The `success=false`
+    replies I feared were negative results of `registerCheckOnPidInformation` probing OTHER pids, not our
+    check-in. The one-off garbage `auditToken{pid=1...}` on the raw XPC connection is a launchservicesd
+    logging artifact, not a real identity we present — the check-in and TCC both see us correctly.)
+  * tccd: `AUTHREQ_RESULT authValue=2` (GRANTED) for kTCCServiceListenEvent, target_token{pid:28082,
+    auid:501,euid:501} — correct token, TCC allows us.
+  * WindowServer: `[SkyLight:packages] resumed connection 277ad3` + `[ConnectionDebug] New conn 0x277ad3,
+    PID 28082 in session 257 on console` — **the WS CREATES A LIVE CONSOLE CONNECTION for us**, and keeps
+    it alive until we're killed (`Closing conn 0x277ad3` only on kill). So #28v's "WS never replies" is
+    WRONG. The `_CGXPackagesSetWindowConstraints: Invalid window` errors are background noise (they fire
+    before our app even starts). The GUI plumbing (session, TCC, LS, WS connection) all WORKS.
+
+So where does winapp actually hang? Symbolicated the blocked backtrace (helper $SP/sym.c: reads
+sharedCacheBaseAddress+slide from TASK_DYLD_INFO in a native x86_64 process, maps ocerz's UNSLID 0x7ff8...
+cache addresses to slid addresses, dladdr's them). The main thread is NOT in mach_msg — it is in a
+LIBDISPATCH SYNC WAIT:
+    __ulock_wait                       [libsystem_kernel]   (futex)
+    _dlock_wait                        [libdispatch]
+    _dispatch_thread_event_wait_slow   [libdispatch]
+    __DISPATCH_WAIT_FOR_QUEUE__        [libdispatch]        <- dispatch_sync on a contended serial queue
+    _dispatch_lane_push_waiter         [libdispatch]        <- main thread parked itself as a waiter
+The main thread does `dispatch_sync` onto a serial queue currently OWNED by a worker; it waits for the
+worker to drain the queue and signal its _dispatch_thread_event (ulock). The worker never runs/finishes
+-> hang forever. The `mach_msg2 RCV on 0x2a03` I mis-identified in #28v was a DIFFERENT thread; the actual
+wall is the SAME libdispatch worker/workqueue frontier as UPDATE #17 (the winemac.drv dispatch_mgr spin).
+
+★ KEY RESULT: `OCERZ_HOSTWQ=1` RESOLVES the dispatch_sync hang. With it, winapp prints
+"[winapp] sharedApplication done" — sharedApplication RETURNS (default synthetic workqueue: it hangs
+before that marker). So the default synthetic worker pool cannot drain a dispatch_sync-contended serial
+queue, but routing the workqueue to the REAL kernel (HOSTWQ) can. Strong signal: HOSTWQ (or fixing the
+synthetic path to spawn/hand-off a worker on dispatch_sync contention) is the correct direction, and is
+the thing that stands between ocerz and a rendered Cocoa window. (HOSTWQ_ASYNC=1 behaves the same here.)
+
+NEXT WALL under HOSTWQ (the new frontier): the main thread then SIGBUSes in `_platform_memmove$VARIANT$
+Rosetta` — a ~17MB (rdx=0x1063fe0) backward copy (dst=src+count+0x20, dst>src) whose source read faults
+at a 16KB-page-aligned address minus 0x10 (0x3676c7ff0 = rsi(0x3676c8000)-0x10; deterministic across runs,
+always ...c7ff0; icount ~0xab97329). Host insn 0xf94001ea = `LDR X10,[X15]` -> a READ. Proven this is NOT
+a memmove over-read: a synthetic x86_64 test ($SP/mm2.c) that memmoves ~17MB with the page immediately
+below a page-aligned src set PROT_NONE does NOT fault under native Rosetta OR under ocerz, for the crash
+config AND overlapping/backward configs. So memmove$Rosetta reads exactly its source; the guest's source
+buffer legitimately extends down to ...c7ff0, and ocerz has NOT backed that page — a read of an
+uncommitted/unbacked guest ARENA page returns SIGBUS instead of demand-zero. ocerz's crash_handler
+(src/vm.c) only commits-on-demand at depth>0 (nested frame-build); a depth-0 read fault on an uncommitted
+arena page is delivered as a guest signal (native app: no handler -> fatal). The fix is almost certainly
+in the arena commit path: an uncommitted-but-reserved page should be committed demand-zero on READ (MAP_ANON
+semantics), not faulted. STILL TO CONFIRM: the exact host mapping/prot of the source page (lldb batch-mode
+signal handling fought ocerz's own SIGBUS handler; retry via a live vmmap/region query or an in-handler
+region dump). This memmove is the messenger; the bug is the arena backing of that page.
+
+Method/tooling kept for reuse: $SP/winapp(.m) native Cocoa repro (setActivationPolicy:Regular + NSWindow +
+makeKeyAndOrderFront; under NATIVE Rosetta it shows a real 480x352 on-screen window = clean A/B reference);
+$SP/wlist(.m) CGWindowList on-screen detector (owner pid+bounds); $SP/sym(.c) cache symbolicator;
+$SP/mm2(.c) memmove$Rosetta over-read probe. OCERZ_HOSTWQ=1 is the config that gets furthest. Two landed
+fixes from the prior session (Mach send #28q, CF init #28u) still stand; make-check green.
+
+## UPDATE #28x (2026-07-05): ★ LANDED a real fix — multi-region shared-mapping relocation. The CSStore SIGBUS (#28w) is GONE; winapp under OCERZ_HOSTWQ now runs clean through "[winapp] WINDOW UP" and REGISTERS an NSWindow with the WindowServer. make-check green (15/15 diff + 2/2 dyn). Two smaller walls remain before a VISIBLE window.
+
+Root cause of the #28w SIGBUS, nailed by instrumenting mig_vm_reply_relocate (syscall.c): the LaunchServices
+CSStore database (~17MB, delivered as "lsinfopage=SharedMemory") is mapped into the guest via a MIG
+mach_vm_map (reply ids 4900/4911/4913). ocerz relocates the kernel-placed mapping into the arena, but it
+sized the mapping with a SINGLE mach_vm_region call -> it only saw the FIRST vm region. The kernel had
+SPLIT the object into multiple CONTIGUOUS regions (observed: 0x1060000 RW + a contiguous 0x20000 ANONYMOUS
+COW region), so ocerz relocated only 0x1060000 of it. CSStore::VM::AllocateCopy then memmove'd the full
+0x1063fe0 -> read 0x3fe0 past the truncated copy into the unmapped 16KB map_donate gap -> SIGBUS in
+_platform_memmove$VARIANT$Rosetta. (Backtrace: _NSXPCSerializationDecodeInvocationArgumentArray ->
+-[NSXPCDecoder _decodeObjectOfClasses:atObject:] -> -[_CSStore initWithCoder:] ->
+CSStore::Store::CreateWithXPCObject/CreateWithBytes/_Create -> VM::AllocateCopy.) FIX (landed, syscall.c
+mig_vm_reply_relocate): after the first mach_vm_region, WALK FORWARD coalescing every region CONTIGUOUS with
+it (na == running_end) into one span until a real GAP, then donate+remap+deallocate the whole span. NB the
+tail region is ANONYMOUS (no memory object), so an early has_obj-gated version still truncated — the guard
+had to be dropped; a freshly-mapped object sits in free space so a gap (not an unrelated mapping) bounds
+the walk. Also fixed a crash-handler NESTED-FAULT (vm.c: the `[r15+0x18]` speculative dump faulted for r15~0
+and _exit(139)'d before the fault-page/host_prot/region diagnostic printed) by guarding that load on
+ocerz_addr_committed -- this is how the "fault-page: UNCOMMITTED region=[..16KB..] host_prot=0x700(NONE)"
+diagnostic became readable and pinned the gap. Diagnostics kept (OCERZ_MACHMSG): BRIDGE-OOL (per-OOL
+descriptor type/addr/bytes + >16MB skip flag) and MIGRELOC (haddr/raddr/first_rsize/coalesced_size/nregions).
+
+STATE NOW: winapp+HOSTWQ prints start -> sharedApplication done -> window created, ordering front ->
+WINDOW UP, no ocerz fault, and CGWindowList(kCGWindowListOptionAll) shows owner=winapp EXISTS. REMAINING
+before a visible window: (1) the NSWindow is onscreen=0 bounds=0x0 -- created/registered but not realized/
+sized (surface/CA-commit or activation not completing under ocerz); (2) shortly after WINDOW UP the process
+dies with `ocerz: fatal: initializer call to 0x3000007b0 aborted after ~6.08e8 instructions` -- a dyld
+initializer ocerz runs faults (0x3000007b0 is just above OCERZ_LOW_LIMIT; likely a deferred framework init
+from the #28u init-phase, or a bogus init function pointer). These are the next two targets. OCERZ_HOSTWQ is
+still an env opt-in; making it (or an equivalent synthetic-workqueue dispatch_sync hand-off) the DEFAULT is
+the standing decision once the path is proven to a visible window. $SP/wall(.m) = CGWindowList incl.
+offscreen/alpha detector.
+
+## UPDATE #28y (2026-07-05): the two post-WINDOW-UP walls both resolve to the CoreAnimation/Metal window-backing path — the GPU-rendering frontier. winapp+HOSTWQ steady state: creates an NSWindow (WS-registered, console session), but it stays onscreen=0 bounds=0x0, and ~608M instructions in an initializer aborts. No new fix (deep GPU territory); #28x fix + make-check green stand.
+
+Characterized the remaining two walls precisely:
+* THE 0x0/OFFSCREEN WINDOW: CGWindowList(kCGWindowListOptionAll) shows owner=winapp EXISTS but onscreen=0,
+  bounds=0x0, alpha=1.0 — the window is registered with the WindowServer but its backing SURFACE never
+  realizes (no CA/IOSurface committed -> WS has no size/shape). Under NATIVE Rosetta the identical binary
+  shows 480x352. So a CGS/SkyLight window-shape or CoreAnimation surface-commit message is not landing.
+* THE INITIALIZER ABORT (intermittent — HOSTWQ uses real kernel threads, so it is a RACE; ~608M insns,
+  deterministic icount, timing-variable wall-clock): a guest UD2 at rip=0x7ff802b68adf = `_xpc_api_misuse
+  +0x4e` [libxpc]. Caller neighborhood = `_xpc_bundle_variant_create_subpath.cold.1` [libxpc]; nearby
+  cstrings "…_matching_key", "…integer_value_allowed", "…to match against during iteration" -> the misuse
+  is an XPC DICTIONARY value that is nil/wrong-type during bundle-variant iteration. Reason prefix string
+  (rax) = "API Misuse"; register fragments spell " OS_xpc_" / ": nil, r". This fires while loading
+  `AGXMetalG14X.bundle` (the Apple-silicon GPU Metal driver, dlopen'd for the window's CA/Metal layer
+  backing — DLPATH confirms it loads it, plus libobjc-trampolines). So an XPC object ocerz produced during
+  the Metal driver's bundle load is nil where libxpc requires non-nil.
+BOTH walls are the CA/Metal/GPU-driver rendering layer — the same class as the whole project's D3DMetal /
+SkyLight history (CLAUDE.md). Getting a VISIBLE surface requires the CoreAnimation render-server
+(com.apple.CARenderServer) + IOSurface + Metal path to work under ocerz, which is a multi-layer frontier,
+not a single bug. Concrete next leads: (a) capture the WS SkyLight log for our window's create/shape to see
+whether the WS receives 0x0 (ocerz CGS-message/OOL truncation, cf #28x) or a real size with no surface
+(CA/IOSurface path); (b) trace the AGXMetalG14X bundle-load XPC dictionary that comes back nil (likely an
+ocerz XPC/bundle-metadata or CFPreferences gap) — fixing it would also stop the intermittent abort.
+Symbolication helpers: $SP/sym(.c), $SP/rdstr(.c) reads a cstring at a cache addr via TASK_DYLD_INFO slide.
+
+## UPDATE #28z (2026-07-05): the intermittent post-WINDOW-UP abort is TRACED to libxpc's `_initial_images` global holding a NIL value — an ocerz image-list-presentation gap (cache-dylib enumeration), likely a POPULATION RACE under HOSTWQ. Added a guest-frame-pointer backtrace to the init-abort path; make-check green (96/0 syscall, 14/14 guest, 15/0 diff, 2/0 dyn).
+
+Full guest call chain at the abort (new OCERZ initabort-bt fp-walk in vm.c, symbolicated):
+  +[NSTextInputContext initialize]  [AppKit]   <- ObjC +initialize during window text-input setup
+  +[NSRemoteView initializeOnAppKitThread] -> _ensureAuxServiceAwareOfHostApp -> auxiliaryProxyFor  [ViewBridge]
+  +[NSXPCSharedListener connectToService:…] -> _endpointForListenerNamed:…  [ViewBridge]
+  xpc_connection_resume -> _xpc_connection_init -> _xpc_uncork_domain -> _xpc_uncork_pid_domain_locked
+  _xpc_init_pid_domain (+0x9c)  -> loads GLOBAL `_initial_images` (movq _initial_images,%rsi)
+  _xpc_init_pid_domain_process_initial_images -> xpc_dictionary_apply -> _xpc_api_misuse (UD2)  [libxpc]
+So NSTextInputContext's +initialize (part of window setup) opens a ViewBridge NSXPC connection; resuming it
+runs _xpc_init_pid_domain, which xpc_dictionary_apply's over the libxpc GLOBAL `_initial_images` dict, and a
+VALUE in it is nil ("API Misuse" + reg fragments " OS_xpc_"/": nil, r"). `_initial_images` is populated at
+libxpc init from the process's INITIAL image set. KEY: OCERZ_IMGLOG shows ocerz_dyldapi_register_image is
+called 0 times here — the initial images are all SHARED-CACHE dylibs, presented via ocerz's dyld4 APIs
+object, NOT the disk-image path. So the nil is in ocerz's cache-image enumeration/notification to libxpc's
+add-image handler (`_dyld_register_func_for_add_image`-style), and the fact that the abort is INTERMITTENT
+(HOSTWQ = real kernel threads) strongly implies a RACE: real dyld serializes image loads + add-image
+callbacks under the dyld lock; ocerz under HOSTWQ apparently notifies/loads images concurrently, so libxpc
+iterates a half-populated `_initial_images` (transient nil value). This is the same class as the whole
+Cocoa-under-ocerz concurrency story (#17). NEXT: find how ocerz drives libxpc's add-image callback for cache
+dylibs and whether it is serialized vs the enumeration (dyldapi.c dyld4 APIs object); and separately the 0x0
+CA surface (WS runs CreateApplication for winapp but no SetWindowShape with real dims lands -> the CA
+transaction that sets shape/content never commits, same CA/render-server layer). Both are the CA/Metal/dyld
+concurrency frontier the user chose to chase; this update pins the abort's exact mechanism. Diagnostics kept
+(gated): OCERZ_IMGLOG (image registrations), plus the always-on initabort-bt fp backtrace on any init abort.
+DECISIVE TEST (new OCERZ_INITTOL diagnostic forces init-tolerance = skip a faulting initializer): skipping
+the XPC-misuse init does NOT realize the window — it stays onscreen=0 bounds=0x0 and the app still dies
+downstream (a second fault). So the abort is NOT the window blocker; the 0x0 CA SURFACE is a separate,
+DEEPER issue (the CoreAnimation layer tree / render-server surface never commits, independent of the
+libxpc _initial_images abort). Both live in the CA/render-server + dyld-concurrency layer. Bottom line for
+the session: window CREATION works and a real memory bug is fixed (#28x), but a VISIBLE surface needs the
+CA/CARenderServer/IOSurface path under ocerz — a multi-part frontier, not one bug. OCERZ_HOSTWQ=1 is the
+config that reaches all of this.
+
+## UPDATE #28ab (2026-07-05): ★★★★★ A FULL COCOA WINDOW NOW RENDERS ON SCREEN AND PERSISTS under ocerz — CGWindowList reports onscreen=1 bounds=490x384, WINDOW UP reached, process survives. THREE real bugs fixed this grind (all make-check green: 96/0 syscall, 14/14 guest, 15/0 differential, 2/2 dynamic). This is the milestone the whole project was aiming at.
+
+The "0x0 surface / crash cascade" of #28y/#28z/#28aa was NOT one deep frontier — it was three concrete,
+independent bugs that the earlier walls had masked. Fixed in order (each exposed the next):
+
+1) libdyld __progname was NULL (src/dyld.c). ROOT-CAUSED via an in-guest SIGSEGV catcher ($SP/catch2.c):
+   xmlReadMemory("<r><x:e/></r>") crashed under ocerz but not Rosetta, in libxml2's dispatch_once quirk
+   `__startElementNSNeedsUndeclaredPrefixQuirk` -> strcmp(rdi, "Microsoft Document Connection") with rdi=NULL.
+   Walking the caller's GOT decode showed rdi = *(libdyld.dylib::__progname) = 0. getprogname() worked
+   (that reads libsystem_c's copy, set via the ProgramVars/leaf path in build_frame) but libdyld exports its
+   OWN __progname which real dyld sets at launch and ocerz had left NULL. AppKit asset init (SVG via CoreSVG)
+   reads it -> deref NULL -> deterministic SIGSEGV a few seconds after the window drew. FIX: right after the
+   existing `_environ` write in dyld.c, `ocerz_cache_resolve(&cache,"___progname")` and store the argv[0]
+   basename (mirrors the ProgramVars leaf real dyld also writes to libdyld's __progname).
+
+2) Missing SSE3 ADDSUBPS/ADDSUBPD (0F D0, mand F2/66) — src/decode.c + interp_sse.c + decode.h. With #1
+   fixed the app ran further into framework vector math and ocerz's decoder hit `decode failed (-1)` on
+   `f2 0f d0 f8` = addsubps xmm7,xmm0. Added the opcode (even lanes subtract a-b, odd lanes add a+b),
+   decode case mirroring HADDP (0F 7C), interp impl, and the dispatch group; verified interp==jit correct
+   ($SP/asub.c: 9 22 27 44 / 95 206, matches native).
+
+3) ★THE KEYSTONE — iokit_user_client_trap (Mach trap 100) unhandled (src/syscall.c). With #1+#2 fixed the
+   CoreAnimation commit reached the IOSurface path and ocerz fataled "unknown Mach trap: class=1 num=100".
+   Backtrace: CA::Context::commit_transaction -> CA::Layer::prepare_commit/prepare_contents ->
+   CA::Render::copy_image -> __csiCompressImageProviderCopyIOSurfaceWithOptions [CoreUI] -> IOSurfaceClientLock
+   [IOSurface] -> iokit_user_client_trap [IOKit]. The window's IOSurface-backed layer/asset content cannot be
+   committed to the render server without it. FIX: forward trap 100 to the host (a[0]=connection is a real
+   host port via the shared namespace; p1..p6 are scalars the user-client trap method interprets; p5/p6 read
+   from the stack like mach_msg2). With that, CA::Context::commit_transaction completes and the surface goes
+   on screen.
+
+RESULT (winapp2: setActivationPolicy:Regular + titled NSWindow + layer-backed content + forced
+[w display]/[CATransaction flush] + run loop; OCERZ_HOSTWQ=1): ~4/6 runs reach WINDOW UP with
+onscreen=1 bounds=490x384 and the process persists. (screencapture returns "could not create image from
+display" — headless/remote Mac, no physical framebuffer to grab — but CGWindowList onscreen=1 + real bounds
+is definitive, and the owner visually confirmed an earlier window.) REMAINING (intermittent, ~2/6 runs, the
+HOSTWQ real-thread concurrency frontier, NOT a rendering bug): a dispatch_sync hang at "start", and an
+occasional early death — both timing/race, the same libdispatch concurrency class as #17/#28z. The window
+RENDERS; making it 100% deterministic is the next polish. Wine's winemac.drv drives the same Cocoa/CA/IOSurface
+path, so this de-risks the actual Wine goal enormously. Repro/tools kept in $SP: winapp2/wall/sym/catch2/asub.
+make-check green throughout.
+
+RELIABILITY (measured): OCERZ_HOSTWQ=1 alone ~4/6 reach onscreen=1; OCERZ_HOSTWQ=1 + OCERZ_HOSTWQ_ASYNC=1 ~6/8
+(75%). The ~25% failures are TWO intermittent races (NOT rendering, NOT the 3 fixed bugs), both the Mach/XPC/
+libdispatch-under-HOSTWQ concurrency frontier (#17/#28z class):
+  (a) dispatch_sync hang at "start" (main thread parks; a HOSTWQ worker doesn't reliably drain the contended
+      serial queue in time).
+  (b) SIGSEGV in XPC message DESERIALIZATION: xpc_receive_mach_msg -> _xpc_dictionary_create_from_received_
+      message -> _xpc_dictionary_deserialize_apply -> _xpc_data_deserialize -> _xpc_data_get_wire_value+0x94,
+      reading a bad guest low-shadow addr (varies: 0x10088c000, 0x1053f0000) — a mis-relocated/racing OOL wire
+      pointer in a received XPC message (ties to ocerz_bridge_mach_msg inbound OOL; possibly the >16MB-OOL
+      skip that leaves a stale host pointer, or a HOSTWQ receive race). These are the next targets for making
+      the window 100% deterministic (needed for Wine's winemac.drv 5s Cocoa-startup timeout). NB: making
+      OCERZ_HOSTWQ the DEFAULT is deferred — the synthetic workqueue is what wineboot uses; flipping the
+      default must be regression-tested against the Wine boot path first.
+
+## UPDATE #28aa (2026-07-05): ★★★ A WINDOW VISIBLY RENDERED ON SCREEN under ocerz (user confirmed by eye). The CoreAnimation surface path WORKS. It renders then the process dies ~seconds later on a libxml2 NULL-global deref during AppKit asset init. make-check green.
+
+How the window rendered: $SP/winapp2.m / winapp3.m force the CA surface synchronously — after makeKeyAndOrderFront:
+setActivationPolicy:Regular + activateIgnoringOtherApps + [w display] + [CATransaction flush]/[commit], and
+[CATransaction flush] every run-loop cycle. Under OCERZ_HOSTWQ=1 (+OCERZ_INITTOL=1) the user SAW the window
+appear and close. So ocerz's CA/render-server/IOSurface path can produce a real on-screen surface — the #28y
+"0x0 window" was the LAZY commit not firing; forcing it works. (CGWindowList still reports 0x0 for the app
+placeholder, but the visible surface is real.) This is the biggest milestone: ocerz renders a Cocoa window.
+WHY IT DOESN'T PERSIST: deterministic SIGSEGV, guest_addr=0x0, rip=_platform_strcmp+0x55, in a libxml2
+dispatch_once quirk `__startElementNSNeedsUndeclaredPrefixQuirk` (parsing an SVG asset via CoreSVG during
+AppKit init; backtrace CoreSVG SVGReader -> xmlParseElement -> ... -> strcmp). The quirk does
+`rax=<cache global>; rdi=*rax; strcmp(rdi, "Microsoft Document Connection")` and rdi (the name) is NULL under
+ocerz. RULED OUT: it is NOT __progname/argv0/NSProcessInfo.processName (all valid under ocerz, verified by
+$SP/pnprobe). It is a specific cache DATA global (unslid ~0x7ff830c99938, in a higher subcache) whose target
+is NULL under ocerz but populated natively — likely a cross-dylib symbol-binding gap OR a value real dyld
+populates that ocerz's mini-dyld doesn't. RELATED SMELL: ocerz's _dyld_image_count returns 595 (the WHOLE
+shared cache) vs Rosetta's 45 (actually-linked) — ocerz over-reports every cache dylib as loaded (nullscan:
+595 images, 0 NULL names, so not the direct cause, but the same over-eager cache-image model may feed the
+libxpc _initial_images nil of #28z). Rosetta does NOT hit this quirk in 40s -> under ocerz the app takes a
+different (fallback) asset path, likely downstream of the ViewBridge/XPC image-list issue. NEXT to make the
+window PERSIST: identify the NULL cache global (disassemble the quirk in a process with libxml2 mapped; read
+*global), and/or fix the 595-vs-45 image-count model + the _initial_images nil. Repro: $SP/winapp2, winapp3
+(borderless), pnprobe, nullscan, nameprobe. Diagnostic knob OCERZ_INITTOL (force init-tolerance).
+
+## UPDATE #28ac (2026-07-05): TSO ordering fix LANDED (correct, make-check green) — but it is NOT the binding wall. Two big results this session (via ultracode multi-agent workflows): (1) ★ the GHOST WINDOW IS NOT A GPU/SURFACE PROBLEM — the IOSurface CPU backing is PROVABLY coherent cross-process; (2) ★ the real binding wall (convergent from independent agents) is the libdispatch event-source↔HOSTWQ dispatch gap (#17) + a secondary inbound-OOL crash. No GPU/Metal work is needed for CPU-drawn windows.
+
+TSO FIX (landed, make-check 96/0 + 14/14 + differential interp==jit 15/0 + 2/0, RCsc superset of x86 TSO):
+diagnosed root cause = ocerz translated PLAIN guest loads/stores to UNORDERED arm64 ldr/str in both tiers (only
+atomics/fences were ordered). Fix: guest loads->load-acquire, stores->store-release. Files: include/ocerz/mem.h
+(ocerz_ld/ocerz_st -> __atomic_load_n/store_n ACQUIRE/RELEASE for naturally-aligned 1/2/4/8, else memcpy +
+__atomic_thread_fence; ocerz_ld128/st128 -> two 8-byte ACQ/REL atomics when aligned, else fenced memcpy);
+src/a64emit.c + include/ocerz/a64emit.h (new a64_ldar/a64_stlr/a64_dmb_ish, encodings LDAR x/w/h/b =
+c8/88/48/08 dffc00, STLR = ...9ffc00, DMB ISH = d5033bbf, byte-verified vs clang); src/jit.c (new
+emit_guest_load_ordered/emit_guest_store_ordered wired into emit_mov_mem + emit_arith_mem — the guest EA already
+lands in base reg JTA at offset 0, so the base-only [Xn] ldar/stlr form fits). KEY WRINKLE: LDAR/STLR
+ALIGNMENT-FAULT on unaligned addresses (x86 allows unaligned), so the JIT emits a runtime split: movz scratch,
+#(size-1); ands xzr,JTA,scratch; b.eq aligned; [unaligned: DMB ISH + plain str / plain ldr + DMB ISH]; aligned:
+stlr/ldar (scratch = JTU, dead after holding gbase). Also landed the confirmed latent adc/sbb bug: interp.c
+op_arith hoisted `int cin = CF` OUT of the locked-RMW retry loop. PERF FOLLOW-UP: the per-access alignment check
+adds ~3 insns+branch on the hottest path; optimize later via Apple-Silicon hardware-TSO mode (Rosetta's trick,
+privileged) or a SIGBUS-based unaligned fallback. MEASURED IMPACT: the fix is correct + removes a real latent
+hazard but gave NO measurable app-level reliability gain (winapp2 ~50% window-register, Calculator 0/6 and
+Stickies 0/3 never launch) — the binding walls are elsewhere. It is a necessary prerequisite, kept.
+
+★ GHOST WINDOW = NOT GPU / NOT SURFACE MEMORY (proven, huge de-risk). Cross-process experiment ($SP/xsurf.m): a
+writer running UNDER ocerz created IOSurface id=34, locked (via forwarded iokit_user_client_trap trap-100,
+conn=0x1303 index=2=lock/3=unlock), wrote a pattern into the mapped base; a SEPARATE NATIVE process (the
+WindowServer's mechanism) IOSurfaceLookup'd the same global id, got an INDEPENDENT mapping at a different address,
+and read back the identical bytes -> COHERENT. Mechanism: the dynamic loader path is IDENTITY-mapped (guest_base=0,
+ocerz_g2h(G)=G; src/mem.c:432, src/dyld.c:2415), so the guest touches the REAL host IOSurface pages directly; and
+mig_vm_reply_relocate (syscall.c:2573) uses mach_vm_remap(copy=FALSE, syscall.c:2626) which ALIASES, never copies.
+So a guest's drawn pixels land in the real kernel IOSurface any IOSurfaceLookup (WindowServer's, by id or send-right
+in the shared Mach namespace) will composite. The window is blank ONLY because the guest's CoreAnimation
+content-render+commit never COMPLETES (it spins or faults before drawing); attachment is strictly downstream and
+not defective. The prior mach_vm_map/0x10d164000 IOSurface-relocation theory (#28aa) is a DEAD END for pixels.
+
+★ THE BINDING WALL (convergent, both the impact-measurement agent AND the ghost agent independently): the
+libdispatch event-source <-> OCERZ_HOSTWQ workqueue dispatch gap = the #16/#17 frontier. An event source (kevent
+EVFILT_READ on ~21 fds/Mach ports, LEVEL-triggered, data!=0) re-fires forever because its handler never runs on a
+worker to drain it -> __ulock_wait / libdispatch lock LIVELOCK @96% CPU -> CoreAnimation's display/commit runloop
+sources never drain -> the app never reaches drawRect/commit. This blocks Calculator (0/6, main-thread samples in
+libxpc +0x1859a / __ulock_wait / libswiftCore), Stickies (0/3), and ~half of winapp2. ORTHOGONAL to memory ordering
+(TSO fix can't touch it). This is THE thing to fix for real apps to draw.
+
+SECONDARY (intermittent XPC crashes): the inbound-OOL gap in the SYNCHRONOUS mach_msg2 handler (syscall.c case 47,
+~2774-2955). It relocates only the mach_vm reply scalars (ids 4900/4911/4913) + the 3712 thread handle, but NEVER
+relocates inbound OOL descriptors of RECEIVED complex replies. So a synchronous XPC/MIG reply carrying OOL leaves
+raw host pointers in the guest buffer; under identity g2h these work only while the host mapping is alive, and
+libxpc faults where it has been freed (host 0x102bec000, on the AppKit->LaunchServices->libxpc checkin path;
+fault-page host_prot=0). FIX DIRECTION: add an inbound-OOL relocate on case-47 complex replies mirroring
+ocerz_bridge_mach_msg (syscall.c:1034, which today copies OOL only on the HOSTWQ kevent path) but SHARING (identity
+g2h) rather than memcpy-copying; OR stop relocating+deallocating kernel mappings the guest can already reach.
+
+NEXT TARGET: fix the #17 libdispatch event-source dispatch gap (-> apps draw -> the already-coherent surface
+attaches -> PIXELS) + the inbound-OOL crash. Repro/tools in $SP: xsurf.m/iosurf.m (surface coherency), win.m
+(full Cocoa app), winapp2/wall/sym. Two workflows ran (wf_e35841d7 diagnosis recovered from transcripts;
+wf_9bc948e1 TSO impl+verify+ghost). make-check green throughout.
+
+## UPDATE #28ad (2026-07-05): OOL fix LANDED (case-47 inbound-OOL relocate, validated firing) + the binding wall (#17 dispatch gap) PRECISELY diagnosed — but NOT closed. The real bug is a WRONG WORKQUEUE FLAG CONSTANT + missing workloop-worker drain plumbing. The flag fix alone crashes; the remaining work is mapped exactly.
+
+LANDED — OOL fix (src/syscall.c, make-check green incl differential 15/0): new static ocerz_reply_relocate_ool()
+called from the case-47 mach_msg2 handler (guarded: a[1]&0x2 RCV, flat-not-vector, r47==0 success, rcv_size from
+a[6]). Mirrors ocerz_bridge_mach_msg's OOL descriptor loop — walks a RECEIVED COMPLEX reply body, memcpys each
+OOL/OOL_PORTS/OOL_VOLATILE descriptor's kernel-owned host buffer into a fresh guest arena buffer, patches the
+descriptor. Before this, case 47 relocated only the mach_vm reply scalars (ids 4900/4911/4913) + the 3712 handle,
+so received OOL kept raw below-arena host VAs (e.g. 0x102bec000/0x101018000/0x101038000) that ocerz never tracked
+(region_for_range NULL, so the guest's own vm_deallocate no-ops) -> libxpc UAF-faults on the AppKit->LaunchServices
+check-in. VALIDATED LIVE: during Calculator boot it fired on real host OOL (0x101018000/116KB, 0x101038000/1.4KB)
+and relocated them; the arena copy is freed by the guest's own vm_deallocate exactly like a native receiver.
+LIMITATION: FLAT complex replies only; MACH64_MSG_VECTOR receives skipped (follow-up). Crash-rate reduction NOT
+measurable (intermittent + environmental noise).
+
+★ BINDING WALL PRECISELY DIAGNOSED (the #16/#17 libdispatch dispatch gap) — the true bug: ocerz's workqueue FLAG
+CONSTANT is WRONG. Ground truth from disassembling _pthread_wqthread on THIS machine (scratchpad/wqdecode.c, in-C
+TBNZ decode via dlsym — lldb is SIP/attach-blocked here): guest R8 flag bits route the worker — bit22 (0x400000) =
+WORKLOOP -> _dispatch_workloop_worker_thread (3-arg, vtable+0x8, kernreturn op 0x100); bit19 (0x80000) = KEVENT ->
+_dispatch_kevent_worker_thread (2-arg, +0x30, op 0x40); neither -> _dispatch_worker_thread2 (1-arg, +0x20, op 0x4);
+bit14 (0x4000) = QoS. BUT src/syscall.c:905 defines OCERZ_WQ_FLAG_WORKLOOP = 0x80000 — that is objectively the
+KEVENT bit; the true WORKLOOP bit 0x400000 is NEVER set. So dispatch WORKLOOP workers (which own the CoreAnimation/
+CFRunLoop read/machport sources) were routed to _dispatch_kevent_worker_thread and the kernel-supplied workloop_id
+(at keventlist-8, confirmed) was DROPPED -> the workloop's sources never drain -> its thread-request is never
+satisfied -> the MAIN thread re-commits it forever -> ocerz spawns a FRESH inline worker per re-fire -> unbounded
+worker churn thrashes a GLOBAL objc os_unfair_lock (cache __DATA 0x7ff8436ac940) whose emulated critical section
+is enormous -> the MAIN thread (mach port 0x103) STARVES in __ulock_wait2 on that lock, never wins, RIPDUMP pins it
+at libsystem_kernel 0x7ff802e31336 for 12+s -> Cocoa startup never reaches CoreAnimation display/commit -> BLANK
+WINDOW. Confirmed via new env-gated diagnostics left in syscall.c: OCERZ_KEVID (kevent_id workloop commits),
+OCERZ_ULOCKLOG (ulock_wait2/wake targets), OCERZ_WQHIST (per-worker rip-history at exit).
+
+WHY THE FLAG FIX ALONE CRASHES (10/10 guest_rip=0x0, REVERTED): routing workloop workers to the TRUE
+_dispatch_workloop_worker_thread drain null-calls, because ocerz spawns FRESH inline workers (fresh OcerzCPU +
+synthetic pthread + fresh mach port) per re-fire, lacking the persistent workqueue-thread context/TSD the workloop
+drain dereferences (a continuation IMP comes back null). EXACT REMAINING WORK to close it (3 items, mapped by the
+agent): (1) make the guest dispatch workloop object resolvable from the kernel-delivered workloop_id (forwarded
+through the host kernel; verify id->dispatch_workloop_t and that its state permits an inline-worker drain);
+(2) sys_workq_kernreturn op 0x40/0x100 must cleanly TERMINATE/park the inline worker (currently a ret_ok(0) stub);
+(3) copy the guest worker's OUTGOING evbuf re-arm changelist+count back into the host events/*nevents so EV_DISPATCH
+sources re-arm (both callbacks force *nevents=0). Fix loci: src/syscall.c ocerz_hostwq_bridge (~1271),
+ocerz_hostwq_workloop_cb (~1419), ocerz_hostwq_kevent_cb, sys_workq_kernreturn (~824), the flag defines (~904-905),
+ocerz_spawn_workloop_worker (~978). This is the deepest HOSTWQ frontier; the fresh-inline-worker model may need to
+become a persistent-worker/TSD model. Ground-truth (bit constants, keventlist-8 id, ops 0x4/0x40/0x100, vtable
+0x8/0x20/0x30) reproducible via scratchpad/wqdecode.c. NB the ghost surface is NOT the blocker (surface coherency
+proven #28ac) — closing this dispatch gap is what makes apps DRAW.
+
+MACHINE: agents' native x86_64 symbolication (dladdr) WEDGES Rosetta into unkillable U-state procs while ocerz
+spins -> environmental noise (flaky winapp2 rate, transient test_mmap_fixed_outside flake — the pristine baseline
+flakes identically, proven not-our-code). A REBOOT clears the wedged procs for reliable measurement. Prefer the
+region-map/wqdecode symbolication (compute dylib base statically) over live dladdr while ocerz runs.

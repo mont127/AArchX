@@ -339,6 +339,7 @@ typedef struct DynImage {
     int seg_count;
     int is_pie;
     int links_dylib;
+    int links_cf;
 } DynImage;
 
 #define DYN_DIMG_MAX 64
@@ -515,6 +516,13 @@ static int map_segments(DynImage *img, int is_main)
             img->lazy_bind_size = rd32(lc + 0x24);
         } else if (cmd == 0x0c || cmd == 0x8000001f || cmd == 0x80000018) {
             img->links_dylib = 1;
+            uint32_t noff = rd32(lc + 8);
+            const char *dp = (const char *)(lc + noff);
+            if (noff < rd32(lc + 4) &&
+                (strstr(dp, "/CoreFoundation.framework/") ||
+                 strstr(dp, "/Foundation.framework/") ||
+                 strstr(dp, "/AppKit.framework/")))
+                img->links_cf = 1;
         }
         lc += csize;
     }
@@ -2495,6 +2503,29 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                   (unsigned long long)environ_addr, (unsigned long long)fr.envp_arr);
     }
 
+    /* libdyld.dylib exports its OWN `__progname` (distinct from libsystem_c's, which the
+     * ProgramVars/leaf path above sets so getprogname() works). Real dyld sets libdyld's copy
+     * directly at launch; ocerz replaces dyld and had left it NULL. Cache code that reads it —
+     * e.g. libxml2's per-process compat quirks do `strcmp(__progname, "...")` during XML/SVG
+     * parsing — then dereferences NULL and SIGSEGVs (deterministic; killed Cocoa apps a few
+     * seconds after their window rendered). Point it at the argv[0] basename, as dyld does. */
+    uint64_t progname_addr = ocerz_cache_resolve(&cache, "___progname");
+    if (!progname_addr)
+        progname_addr = ocerz_cache_resolve(&cache, "__progname");
+    if (progname_addr && fr.argv_arr) {
+        uint64_t argv0 = ocerz_ld(fr.argv_arr, 8);
+        uint64_t leaf = argv0, a = argv0;
+        for (int i = 0; argv0 && i < 4096; i++, a++) {
+            uint8_t c = (uint8_t)ocerz_ld(a, 1);
+            if (c == 0) break;
+            if (c == '/') leaf = a + 1;
+        }
+        if (argv0)
+            ocerz_st(progname_addr, 8, leaf);
+        OCERZ_LOG("dynamic: libdyld __progname=%#llx set to %#llx\n",
+                  (unsigned long long)progname_addr, (unsigned long long)leaf);
+    }
+
     extern uint64_t g_main_path;
     if (fr.argv_arr)
         g_main_path = ocerz_ld(fr.argv_arr, 8);
@@ -2516,7 +2547,15 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         } else {
             OCERZ_LOG("dynamic: no libSystem initializer found\n");
         }
-        if (ran_init && getenv("OCERZ_INITPHASE")) {
+        /* Run the full dependency-ordered initializer phase (which runs __CFInitialize and every
+         * framework initializer in dependency order, exactly as real dyld does -- only libSystem
+         * was run above) for native executables that LINK CoreFoundation/Foundation/AppKit. Without
+         * __CFInitialize, CF's runtime class-bridge table stays zero and CFAllocatorAllocate
+         * recurses into the public malloc -> stack overflow. The Wine PE loader does not link CF in
+         * its main image, so its path is byte-for-byte unchanged. Forceable via OCERZ_INITPHASE,
+         * disableable via OCERZ_NOINITPHASE. (malloc/pthread are already bootstrapped by the
+         * libSystem initializer above and init_mark_done_closure prevents double-init.) */
+        if (ran_init && (img.links_cf || getenv("OCERZ_INITPHASE")) && !getenv("OCERZ_NOINITPHASE")) {
             uint64_t libsys = dep_find(&cache, "/usr/lib/libSystem.B.dylib");
             g_libsys_mh = libsys;
             init_mark_done_closure(&cache, libsys);
@@ -2543,6 +2582,46 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     OCERZ_LOG("dynamic: load_base=%#llx slide=%#llx main=%#llx\n",
               (unsigned long long)img.load_base, (unsigned long long)img.slide,
               (unsigned long long)img.main_entry);
+
+    if (getenv("OCERZ_ZONEPROBE")) {
+        uint64_t g_malloc_zones = 0x7ff8436b4758ULL;
+        uint64_t g_malloc_num_zones = 0x7ff8436b49f0ULL;
+        uint64_t g_default_zone = 0x7ff84388c178ULL;
+        uint64_t g_initial_nano = 0x7ff8436b47a0ULL;
+        uint64_t g_initial_scalable = 0x7ff8436b47a8ULL;
+        uint64_t nz = ocerz_ld(g_malloc_num_zones, 4);
+        uint64_t mzp = ocerz_ld(g_malloc_zones, 8);
+        uint64_t dz = ocerz_ld(g_default_zone, 8);
+        uint64_t z0 = mzp ? ocerz_ld(mzp, 8) : 0;
+        fprintf(stderr, "ZONEPROBE num_zones=%llu malloc_zones=%#llx zones[0]=%#llx default_zone=%#llx initial_nano=%#llx initial_scalable=%#llx\n",
+                (unsigned long long)nz, (unsigned long long)mzp, (unsigned long long)z0,
+                (unsigned long long)dz, (unsigned long long)g_initial_nano, (unsigned long long)g_initial_scalable);
+        /* dump first few zones and their malloc fn ptr + zone_name ptr (zone+0x38) */
+        for (uint64_t i = 0; i < nz && i < 6; i++) {
+            uint64_t z = ocerz_ld(mzp + i * 8, 8);
+            uint64_t zmalloc = z ? ocerz_ld(z + 0x18, 8) : 0;
+            uint64_t znameptr = z ? ocerz_ld(z + 0x20, 8) : 0;
+            char nm[64] = {0};
+            if (znameptr) for (int k = 0; k < 63; k++) { uint64_t c = ocerz_ld(znameptr + k, 1); if (!c) break; nm[k] = (char)c; }
+            fprintf(stderr, "ZONEPROBE  zones[%llu]=%#llx malloc=%#llx name@+0x20=%#llx name=\"%s\"\n",
+                    (unsigned long long)i, (unsigned long long)z, (unsigned long long)zmalloc,
+                    (unsigned long long)znameptr, nm);
+        }
+        /* CF system-default allocator-as-zone struct dump (runtime, unchained) */
+        uint64_t cfz = 0x7ff840095a00ULL;
+        uint64_t cmpg = 0x7ff8436c2b20ULL; /* global compared at __CFAllocatorAllocateImpl+0x3c */
+        fprintf(stderr, "ZONEPROBE CFzone@%#llx: isa/[0]=%#llx [+0x18 malloc]=%#llx [+0x68 ver]=%#llx [+0xd0]=%#llx [+0xb0]=%#llx\n",
+                (unsigned long long)cfz, (unsigned long long)ocerz_ld(cfz, 8),
+                (unsigned long long)ocerz_ld(cfz + 0x18, 8), (unsigned long long)ocerz_ld(cfz + 0x68, 8),
+                (unsigned long long)ocerz_ld(cfz + 0xd0, 8), (unsigned long long)ocerz_ld(cfz + 0xb0, 8));
+        fprintf(stderr, "ZONEPROBE cmpglobal@%#llx=%#llx  (CFzone[0]==cmpglobal? %d)\n",
+                (unsigned long long)cmpg, (unsigned long long)ocerz_ld(cmpg, 8),
+                ocerz_ld(cfz, 8) == ocerz_ld(cmpg, 8));
+        /* Also dump kCFAllocatorSystemDefault wrapper at _kCFAllocatorSystemDefault */
+        uint64_t cfa = 0x7ff8400964a8ULL;
+        fprintf(stderr, "ZONEPROBE kCFAllocatorSystemDefault@%#llx -> %#llx\n",
+                (unsigned long long)cfa, (unsigned long long)ocerz_ld(cfa, 8));
+    }
 
     if (ran_init) {
         uint64_t margs[4] = { fr.argc, fr.argv_arr, fr.envp_arr, fr.apple_arr };

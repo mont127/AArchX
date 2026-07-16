@@ -235,6 +235,9 @@ static int g_disk_n;
 
 void ocerz_dyldapi_register_image(uint64_t mh, const char *path)
 {
+    if (getenv("OCERZ_IMGLOG"))
+        fprintf(stderr, "ocerz: IMGREG mh=%#llx path=%s\n",
+                (unsigned long long)mh, (path && path[0]) ? path : "<NULL>");
     uint64_t gpath = 0;
     if (path && path[0]) {
         uint64_t need = (uint64_t)strlen(path) + 1;

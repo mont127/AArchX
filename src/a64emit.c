@@ -127,6 +127,32 @@ void a64_str(A64Buf *b, int size, int rt, int rn, uint32_t off)
     a64_emit32(b, 0x39000000u | (sz << 30) | (imm12 << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
+/* Load-Acquire / Store-Release (LDAR/STLR): the ordered forms of LDR/STR the
+ * JIT uses for GUEST memory so plain x86 accesses keep Total Store Order. These
+ * are the base-register-only [Xn] encodings (no immediate offset): the Rs and
+ * Rt2 fields are fixed to 0b11111 and size selects the width in bits 31-30, so
+ * the body mirrors a64_ldr/a64_str minus the scaled imm12. */
+void a64_ldar(A64Buf *b, int size, int rt, int rn)
+{
+    uint32_t sz = ldst_size_bits(size);
+    a64_emit32(b, 0x08dffc00u | (sz << 30) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
+void a64_stlr(A64Buf *b, int size, int rt, int rn)
+{
+    uint32_t sz = ldst_size_bits(size);
+    a64_emit32(b, 0x089ffc00u | (sz << 30) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
+/* DMB ISH: inner-shareable full data barrier. Provided as the offset-handling
+ * fallback for any guest access the ldar/stlr [Xn] form cannot express; the
+ * current JIT materializes every guest address into a base register with no
+ * displacement, so it uses ldar/stlr directly and never needs this. */
+void a64_dmb_ish(A64Buf *b)
+{
+    a64_emit32(b, 0xd5033bbfu);
+}
+
 void a64_ldrsb(A64Buf *b, int sf, int rt, int rn, uint32_t off)
 {
     uint32_t opc = sf ? 2u : 3u;

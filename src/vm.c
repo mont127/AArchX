@@ -442,6 +442,46 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             g_cur_cpu->sig_repeat = 0;
         }
         int looping = ++g_cur_cpu->sig_repeat > OCERZ_SIG_MAX_REPEAT;
+        /* Bug B bounded recovery (gs:0x320): a HOSTWQ/libdispatch WORKER has no Wine TEB and no
+         * Wine sigaltstack (sig_altstack_sp==0), so when it faults, Wine's segv_handler can't
+         * run -- get_current_teb() reads no TEB and the deref faults on [r14]=0 (near-null
+         * ~0x320) OR [r14]=garbage; either way the handler makes no progress and re-faults. On
+         * real macOS such a worker never faults; under ocerz it does, and the loop would kill
+         * the whole process. Instead TERMINATE just this worker (abandon the dispatch callback;
+         * the host thread parks) so the process survives. Gated on a no-altstack thread that is
+         * LOOPING -- a real Wine thread has an altstack, and a legit fault doesn't loop on the
+         * same address (it gets fixed). A foreign worker that ACQUIRED an altstack but still has
+         * no TEB at its 64KB stack base (the deterministic ~167M dispatcher crash) is caught by
+         * the second clause: the dispatcher's TEB lookup *(rsp&~0xffff) reads an INVALID
+         * (uncommitted/poison) pointer, whereas a real Wine thread always has a VALID committed
+         * TEB pointer there -- so this targets the altstack-foreign-worker variant WITHOUT
+         * terminating a real Wine thread (avoids the hang risk of a blanket LOOPING-alone gate).
+         * The fully-proper fix is still #16/#17 marshaling (don't run Wine PE code on workers). */
+        int no_wine_teb = g_cur_cpu->sig_altstack_sp == 0;
+        if (!no_wine_teb) {
+            uint64_t sb = g_cur_cpu->gpr[OCERZ_RSP] & ~0xffffull;
+            if (ocerz_addr_committed(sb) == 1 && ocerz_addr_committed(ocerz_ld(sb, 8)) != 1)
+                no_wine_teb = 1;
+        }
+        if (looping && no_wine_teb) {
+            if (g_sigtrace) {
+                char wb[160];
+                char *w = wb;
+                w = str_into(w, "ocerz: gs0x320 WORKER-TERMINATE pid=");
+                w = hex_into(w, (uint64_t)getpid());
+                w = str_into(w, " gaddr=");
+                w = hex_into(w, gaddr);
+                w = str_into(w, " gs=");
+                w = hex_into(w, gs);
+                w = str_into(w, " icount=");
+                w = hex_into(w, g_vm ? g_vm->insn_count : 0);
+                w = str_into(w, "\n");
+                write(2, wb, (size_t)(w - wb));
+            }
+            g_cur_cpu->terminated = 1;
+            depth = 0;
+            siglongjmp(*g_sig_recover, 1);
+        }
         int delivered = looping ? 0
                        : ocerz_signal_deliver(g_cur_cpu, SIGSEGV, gaddr, code, err);
         if (g_sigtrace) {
@@ -552,10 +592,68 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (delivered)
             siglongjmp(*g_sig_recover, 1);
     }
+    /* Out-of-guest-space recovery for the #16/#17 foreign-worker DISPATCHER crash (kills boot
+     * processes -> winedbg, before they reach their own window). A thread with no Wine TEB runs
+     * the WoW64 dispatcher; its gs-restore reads a POISON TEB pointer from its 64KB stack base
+     * and then that poison propagates and faults at UNPREDICTABLE addresses outside guest space
+     * (observed [rax+0x320], [rax+0x2f0], and [rax + scaled-index] at 3 different dispatcher
+     * insns) -- so matching the FAULT address is hopeless. Instead match the reliable THREAD
+     * STATE: a real Wine thread always stores a VALID (committed) TEB pointer at its stack base
+     * *(rsp&~0xffff); a foreign worker has poison there. So on any out-of-guest-space fault, if
+     * this thread's stack base holds no valid TEB pointer, it is a foreign worker running the
+     * dispatcher -- terminate just it (process survives) instead of dying. Real threads (valid
+     * TEB at the stack base) are never touched. The fully-proper fix is #16/#17 marshaling. */
+    if (g_cur_cpu && g_sig_recover && depth == 0 &&
+        !ocerz_host_in_guest_space(si->si_addr)) {
+        int no_teb = g_cur_cpu->sig_altstack_sp == 0;
+        if (!no_teb) {
+            uint64_t sb = g_cur_cpu->gpr[OCERZ_RSP] & ~0xffffull;
+            uint64_t teb = ocerz_addr_committed(sb) == 1 ? ocerz_ld(sb, 8) : 0;
+            if (ocerz_addr_committed(teb) != 1)
+                no_teb = 1;
+        }
+        if (no_teb) {
+            if (g_sigtrace) {
+                char tb[96];
+                char *t = tb;
+                t = str_into(t, "ocerz: gs0x320 WILD-WORKER-TERMINATE pid=");
+                t = hex_into(t, (uint64_t)getpid());
+                t = str_into(t, " addr=");
+                t = hex_into(t, (uint64_t)(uintptr_t)si->si_addr);
+                t = str_into(t, "\n");
+                write(2, tb, (size_t)(t - tb));
+            }
+            g_cur_cpu->terminated = 1;
+            siglongjmp(*g_sig_recover, 1);
+        }
+    }
     char buf[256];
     char *p = buf;
+    /* Commit-on-demand during the frame build (a nested fault, depth>0): the recovery block
+     * above is writing the signal frame onto a reserved-but-uncommitted page (a no-altstack
+     * thread builds the frame on its rsp stack). map_lock is unsafe in this nested signal
+     * context, so commit the page lock-free and RETURN to re-run the faulting write, instead
+     * of dying with _exit(139). Only for a reserved arena page; a genuinely bad address falls
+     * through to the fatal path below. */
+    if (depth > 0 && ocerz_host_in_guest_space(si->si_addr)) {
+        uint64_t fg = ocerz_h2g(si->si_addr);
+        if (ocerz_addr_committed(fg) == 0 && ocerz_commit_fault_page(fg))
+            return;
+    }
     if (depth++) {
-        p = str_into(p, "ocerz: nested fault inside crash handler\n");
+        p = str_into(p, "ocerz: nested fault inside crash handler host_addr=");
+        p = hex_into(p, (uint64_t)(uintptr_t)si->si_addr);
+        if (ctx) {
+            const ucontext_t *uc = (const ucontext_t *)ctx;
+            p = str_into(p, " host_pc=");
+            p = hex_into(p, uc->uc_mcontext->__ss.__pc);
+        }
+        p = str_into(p, " gaddr=");
+        p = hex_into(p, ocerz_host_in_guest_space(si->si_addr) ? ocerz_h2g(si->si_addr) : 0);
+        p = str_into(p, " comm=");
+        p = hex_into(p, (uint64_t)(int64_t)(ocerz_host_in_guest_space(si->si_addr)
+                                            ? ocerz_addr_committed(ocerz_h2g(si->si_addr)) : -2));
+        p = str_into(p, "\n");
         write(2, buf, (size_t)(p - buf));
         _exit(139);
     }
@@ -613,6 +711,20 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 *p++ = "0123456789abcdef"[(b >> 4) & 0xf];
                 *p++ = "0123456789abcdef"[b & 0xf];
             }
+            *p++ = '\n';
+            write(2, buf, (size_t)(p - buf));
+            p = buf;
+            p = str_into(p, "  r12=");
+            p = hex_into(p, c->gpr[OCERZ_R12]);
+            p = str_into(p, " r13=");
+            p = hex_into(p, c->gpr[OCERZ_R13]);
+            p = str_into(p, " r14=");
+            p = hex_into(p, c->gpr[OCERZ_R14]);
+            p = str_into(p, " r15=");
+            p = hex_into(p, c->gpr[OCERZ_R15]);
+            p = str_into(p, " [r15+0x18]=");
+            p = hex_into(p, ocerz_addr_committed(c->gpr[OCERZ_R15] + 0x18) == 1
+                              ? ocerz_ld(c->gpr[OCERZ_R15] + 0x18, 8) : 0);
             *p++ = '\n';
             write(2, buf, (size_t)(p - buf));
             p = buf;
@@ -979,11 +1091,27 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
         if (r == OCERZ_STEP_EXIT)
             break;
         if (r == OCERZ_STEP_FATAL) {
-            if (ocerz_init_tolerant) {
+            static int forcetol = -1;
+            if (forcetol < 0) forcetol = getenv("OCERZ_INITTOL") ? 1 : 0;
+            if (ocerz_init_tolerant || forcetol) {
                 fprintf(stderr,
                         "ocerz: init-skip: initializer %#llx faulted at rip=%#llx (skipped, process continues)\n",
                         (unsigned long long)func, (unsigned long long)local.rip);
                 break;
+            }
+            /* Walk the guest frame-pointer chain so the FATAL shows the full call chain into the
+             * abort (e.g. which framework init -> which libxpc call hit _xpc_api_misuse). */
+            {
+                fprintf(stderr, "ocerz: initabort-bt rip=%#llx", (unsigned long long)local.rip);
+                uint64_t fp = local.gpr[OCERZ_RBP];
+                for (int d = 0; d < 24 && fp >= 0x10000; d++) {
+                    uint64_t ra = ocerz_addr_committed(fp + 8) == 1 ? ocerz_ld(fp + 8, 8) : 0;
+                    fprintf(stderr, " %#llx", (unsigned long long)ra);
+                    uint64_t nf = ocerz_addr_committed(fp) == 1 ? ocerz_ld(fp, 8) : 0;
+                    if (nf <= fp) break;
+                    fp = nf;
+                }
+                fprintf(stderr, "\n");
             }
             ocerz_cpu_dump(&local, stderr);
             OCERZ_FATAL("initializer call to %#llx aborted after %llu instructions\n",

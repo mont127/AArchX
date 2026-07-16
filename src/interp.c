@@ -199,9 +199,12 @@ static int op_arith(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     if (insn->lock && insn->ops[0].kind == OCERZ_OPK_MEM) {
         uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
         uint64_t b = ocerz_read_op(cpu, insn, &insn->ops[1]);
+        /* Capture the incoming carry ONCE, before the CAS retry loop: the flag
+         * helpers below overwrite CF, so re-reading it inside the loop would
+         * feed a retry the wrong ADC/SBB carry-in. */
+        int cin = (cpu->rflags & OCERZ_CF) ? 1 : 0;
         for (;;) {
             uint64_t a = ocerz_atomic_load(addr, size);
-            int cin = (cpu->rflags & OCERZ_CF) ? 1 : 0;
             uint64_t res;
             switch (insn->op) {
             case OCERZ_OP_ADD: res = a + b; ocerz_flags_add(cpu, size, a, b, 0, res); break;
@@ -897,9 +900,32 @@ static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
                 ocerz_flag_assign(cpu, OCERZ_ZF, 0);
             }
         } else {
-            if ((addr & 15) && getenv("OCERZ_CASLOG"))
+            if ((addr & 15) && getenv("OCERZ_CASLOG")) {
                 fprintf(stderr, "ocerz: CMPXCHG16B MISALIGNED addr=%#llx rip=%#llx\n",
                         (unsigned long long)addr, (unsigned long long)insn->rip);
+                static int once16 = 0;
+                if (!once16) {
+                    once16 = 1;
+#define ULL(x) (unsigned long long)(x)
+                    fprintf(stderr, "ocerz: CAS16DUMP rax=%#llx rdx=%#llx rbx=%#llx rcx=%#llx r9=%#llx r10=%#llx r11=%#llx rsi=%#llx rsp=%#llx rbp=%#llx\n",
+                        ULL(cpu->gpr[OCERZ_RAX]), ULL(cpu->gpr[OCERZ_RDX]), ULL(cpu->gpr[OCERZ_RBX]), ULL(cpu->gpr[OCERZ_RCX]),
+                        ULL(cpu->gpr[OCERZ_R9]), ULL(cpu->gpr[OCERZ_R10]), ULL(cpu->gpr[OCERZ_R11]), ULL(cpu->gpr[OCERZ_RSI]),
+                        ULL(cpu->gpr[OCERZ_RSP]), ULL(cpu->gpr[OCERZ_RBP]));
+                    uint64_t base = addr & ~15ull;
+                    for (int i = 0; i <= 4; i++) { uint64_t a = base + (uint64_t)i * 8;
+                        if (ocerz_addr_committed(a) == 1) fprintf(stderr, "  mem[%#llx]=%#llx\n", ULL(a), ULL(ocerz_ld(a, 8)));
+                        else fprintf(stderr, "  mem[%#llx]=<unc>\n", ULL(a)); }
+                    uint64_t fp = cpu->gpr[OCERZ_RBP];
+                    fprintf(stderr, "  bt:");
+                    for (int d = 0; d < 16 && fp > 0x300000000ull; d++) {
+                        if (ocerz_addr_committed(fp + 8) != 1) break;
+                        fprintf(stderr, " %#llx", ULL(ocerz_ld(fp + 8, 8)));
+                        if (ocerz_addr_committed(fp) != 1) break;
+                        uint64_t nf = ocerz_ld(fp, 8); if (nf <= fp) break; fp = nf; }
+                    fprintf(stderr, "\n");
+#undef ULL
+                }
+            }
             __uint128_t expected = ((__uint128_t)cpu->gpr[OCERZ_RDX] << 64) | cpu->gpr[OCERZ_RAX];
             __uint128_t store = ((__uint128_t)cpu->gpr[OCERZ_RCX] << 64) | cpu->gpr[OCERZ_RBX];
             __uint128_t e = expected;
