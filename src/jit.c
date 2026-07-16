@@ -110,6 +110,8 @@
 
 #include <sys/mman.h>
 #include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 #include <setjmp.h>
 #include <libkern/OSCacheControl.h>
 #include <stddef.h>
@@ -532,6 +534,21 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
 static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
                                      int addr_reg, uint32_t **exit_sites, int *n_exits)
 {
+    /* FAST PATH (only with the low-shadow window active): a guest address in the plain main arena
+     * [LOW_LIMIT, TOP_LO) is neither commpage, low-shadow, nor top -- it just needs +guest_base. The
+     * common case for 64-bit code (winemac.so + AppKit, where run_cocoa_app's cold-start lives) hits
+     * this. Skip the whole commpage/top/low guard with ONE unsigned range check instead of ~10
+     * instructions of not-taken compares per access -- a large speedup for the 64-bit AppKit cold
+     * start that gates macdrv. Patched to the native body at the end. */
+    uint32_t *to_native = NULL;
+    if (ocerz_low_base) {
+        a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT);
+        a64_sub_reg(b, 1, JTT, addr_reg, JTU, 0);          /* JTT = gaddr - LOW_LIMIT */
+        a64_mov_imm64(b, JTU, OCERZ_TOP_LO - OCERZ_LOW_LIMIT);
+        a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
+        to_native = a64_label(b);
+        a64_bcond(b, A64_CC, 0);   /* (gaddr-LOW_LIMIT) < (TOP_LO-LOW_LIMIT) -> main arena -> native */
+    }
     a64_mov_imm64(b, JTU, OCERZ_COMMPAGE_LO);
     a64_sub_reg(b, 1, JTT, addr_reg, JTU, 0);
     a64_mov_imm64(b, JTU, OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO);
@@ -544,16 +561,68 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
     a64_b(b, 0);                          /* past the native body */
     a64_patch_bcond(over, a64_label(b));  /* CS target = low check / native body */
     if (ocerz_low_base) {
-        a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT);
-        a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
-        uint32_t *cur = a64_label(b);
-        a64_bcond(b, A64_CC, (int32_t)(slow - cur));
+        /* TOP region [TOP_LO, ...) keeps the slow call (rare, near the top of userspace). */
         a64_mov_imm64(b, JTU, OCERZ_TOP_LO);
         a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
-        cur = a64_label(b);
-        a64_bcond(b, A64_CS, (int32_t)(slow - cur));
+        uint32_t *cur = a64_label(b);
+        a64_bcond(b, A64_CS, (int32_t)(slow - cur));   /* gaddr >= TOP_LO -> slow */
+        /* LOW-SHADOW [0, LOW_LIMIT) is now INLINED instead of a per-access slow call: shift
+         * addr_reg by the constant (low_base - guest_base) so the caller's native body (+guest_base)
+         * lands at gaddr + low_base = ocerz_g2h(gaddr). This removes the function call from EVERY
+         * 32-bit WoW64 memory access (all guest data lives below LOW_LIMIT) -- the dominant JIT
+         * memory cost. Main arena (LOW_LIMIT <= gaddr < TOP_LO) falls through unadjusted. */
+        a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT);
+        a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
+        uint32_t *ge_low = a64_label(b);
+        a64_bcond(b, A64_CS, 0);                       /* gaddr >= LOW_LIMIT (main) -> skip adjust */
+        a64_mov_imm64(b, JTU, ocerz_low_base - ocerz_guest_base);
+        a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0); /* low-shadow: addr += (low_base-guest_base) */
+        a64_patch_bcond(ge_low, a64_label(b));         /* main + low-shadow converge -> native body */
     }
+    if (to_native)
+        a64_patch_bcond(to_native, a64_label(b));      /* main-arena fast path -> native body */
     return skip;
+}
+
+/* Ordered GUEST memory access (x86-64 Total Store Order for plain loads/stores).
+ * ra holds the FULL host address with no displacement; rv is the value register
+ * (source for a store, destination for a load); scratch is a dead temp.
+ *
+ * LDAR/STLR give the acquire/release ordering x86 requires, but unlike LDR/STR
+ * (and unlike x86) they ALIGNMENT-FAULT on an unaligned address. Guest code may
+ * legally do a misaligned access, so these emit a runtime split: naturally
+ * aligned (the common case) takes the cheap LDAR/STLR; misaligned falls back to
+ * a plain LDR/STR fenced with DMB ISH, which tolerates the misalignment while
+ * still ordering the access. size is always 4 or 8 at these call sites, so the
+ * alignment mask (size-1) is 3 or 7. */
+static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int scratch)
+{
+    a64_mov_imm64(b, scratch, (uint64_t)(size - 1));
+    a64_ands_reg(b, 1, A64_ZR, ra, scratch, 0);     /* Z=1 iff (ra & (size-1))==0 */
+    uint32_t *to_aligned = a64_label(b);
+    a64_bcond(b, A64_EQ, 0);                          /* aligned -> STLR */
+    a64_dmb_ish(b);                                   /* release order before the store */
+    a64_str(b, size, rv, ra, 0);
+    uint32_t *to_done = a64_label(b);
+    a64_b(b, 0);
+    a64_patch_bcond(to_aligned, a64_label(b));
+    a64_stlr(b, size, rv, ra);
+    a64_patch_b(to_done, a64_label(b));
+}
+
+static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scratch)
+{
+    a64_mov_imm64(b, scratch, (uint64_t)(size - 1));
+    a64_ands_reg(b, 1, A64_ZR, ra, scratch, 0);
+    uint32_t *to_aligned = a64_label(b);
+    a64_bcond(b, A64_EQ, 0);                          /* aligned -> LDAR */
+    a64_ldr(b, size, rd, ra, 0);
+    a64_dmb_ish(b);                                   /* acquire order after the load */
+    uint32_t *to_done = a64_label(b);
+    a64_b(b, 0);
+    a64_patch_bcond(to_aligned, a64_label(b));
+    a64_ldar(b, size, rd, ra);
+    a64_patch_b(to_done, a64_label(b));
 }
 
 /* MOV with one memory operand at size 4/8 (the other a plain GPR), no high8,
@@ -577,7 +646,10 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         a64_ldr(b, s->size == 8 ? 8 : 4, JT1, 20, GPR_OFF(s->reg));
         a64_mov_imm64(b, JTU, gbase);
         a64_add_reg(b, 1, JTA, JTA, JTU, 0);
-        a64_str(b, s->size, JT1, JTA, 0);
+        /* GUEST store (JTA = full host address, no displacement), store-release
+         * ordered so plain x86 stores keep Total Store Order. JTU is dead here
+         * (held gbase) and serves as the helper's alignment-check scratch. */
+        emit_guest_store_ordered(b, s->size, JT1, JTA, JTU);
         a64_patch_b(skip, a64_label(b));
         return 1;
     }
@@ -589,7 +661,10 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         a64_mov_imm64(b, JTU, gbase);
         a64_add_reg(b, 1, JTA, JTA, JTU, 0);
-        a64_ldr(b, d->size, JT1, JTA, 0);
+        /* GUEST load (JTA = full host address, no displacement), load-acquire
+         * ordered so plain x86 loads keep Total Store Order. JTU is dead here
+         * (held gbase) and serves as the helper's alignment-check scratch. */
+        emit_guest_load_ordered(b, d->size, JT1, JTA, JTU);
         a64_str(b, 8, JT1, 20, GPR_OFF(d->reg));
         a64_patch_b(skip, a64_label(b));
         return 1;
@@ -617,7 +692,11 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
     a64_mov_imm64(b, JTU, ocerz_guest_base);
     a64_add_reg(b, 1, JTA, JTA, JTU, 0);
-    a64_ldr(b, sf ? 8 : 4, JT1, JTA, 0);
+    /* GUEST load (JTA = full host address, no displacement), load-acquire
+     * ordered so plain x86 loads keep Total Store Order. JTU is dead here (held
+     * gbase) and serves as the helper's alignment-check scratch. The following
+     * ldr reads the destination GPR from the register file, not guest memory. */
+    emit_guest_load_ordered(b, sf ? 8 : 4, JT1, JTA, JTU);
     a64_ldr(b, sf ? 8 : 4, JT0, 20, GPR_OFF(d->reg));
 
     unsigned op = insn->op;
@@ -824,6 +903,15 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
 static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 {
+    /* OCERZ_JITMEASURE (Stage-0 verify-first for the persistent JIT cache): time each successful
+     * translation and split out shared-cache code (rip>=0x7ff800000000, the AppKit/libobjc/etc that
+     * dominates Cocoa cold-start and is the cache's relocation-free target). If the shared-cache
+     * translate-ms is a large fraction of a process's wall time, caching it pays; if tiny, the
+     * cold-start is execution/IPC-bound and the cache is the wrong lever. Log-only, gated. */
+    static int g_jitmeasure = -1;
+    if (g_jitmeasure < 0)
+        g_jitmeasure = getenv("OCERZ_JITMEASURE") ? 1 : 0;
+    uint64_t xlat_t0 = g_jitmeasure ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     X86Insn scratch[JIT_MAX_BLOCK_INSNS];
     int n = 0;
     uint64_t pc = rip;
@@ -927,6 +1015,22 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 
     cache_insert(jit, blk);
     jit->blocks_translated++;
+    if (g_jitmeasure) {
+        /* translate() runs under jit_lock, so plain statics are race-free here. */
+        static unsigned long long g_xlat_ns, g_xlat_sc_ns;
+        static unsigned g_xlat_n, g_xlat_sc_n;
+        unsigned long long ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - xlat_t0;
+        g_xlat_n++;
+        g_xlat_ns += ns;
+        if (rip >= 0x7ff800000000ull) {
+            g_xlat_sc_n++;
+            g_xlat_sc_ns += ns;
+        }
+        if ((g_xlat_n & 0x3fff) == 0)
+            fprintf(stderr, "ocerz: XLAT[%d] blocks=%u xlat_total=%llums | shared-cache: blocks=%u xlat=%llums\n",
+                    (int)getpid(), g_xlat_n, g_xlat_ns / 1000000ull,
+                    g_xlat_sc_n, g_xlat_sc_ns / 1000000ull);
+    }
     return blk;
 }
 

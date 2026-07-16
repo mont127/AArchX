@@ -36,7 +36,8 @@
 
 set -u
 
-OCERZ="/Users/teoballesteros/ocerz/Ocerz-main/ocerz"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OCERZ="$REPO_ROOT/ocerz"
 GUEST_DIR="tests/guest"
 BIN_DIR="$GUEST_DIR/bin"
 EXPECT_DIR="$GUEST_DIR/expect"

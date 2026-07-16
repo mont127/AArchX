@@ -1789,6 +1789,12 @@ static int decode_0f(DecState *s, uint8_t op2)
         if (mand == MAND_F2)
             return decode_sse_rr(s, OCERZ_OP_HSUBPS, 16, 1);
         return OCERZ_EUNDEF;
+    case 0xd0: /* SSE3 ADDSUBPD (66) / ADDSUBPS (F2): subtract even lanes, add odd lanes */
+        if (mand == MAND_66)
+            return decode_sse_rr(s, OCERZ_OP_ADDSUBPD, 16, 1);
+        if (mand == MAND_F2)
+            return decode_sse_rr(s, OCERZ_OP_ADDSUBPS, 16, 1);
+        return OCERZ_EUNDEF;
     case 0x5a: {
         int op;
         int isize, osize;

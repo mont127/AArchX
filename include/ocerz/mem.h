@@ -167,6 +167,7 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align);
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_unmap(uint64_t gaddr, uint64_t len);
 int ocerz_addr_committed(uint64_t gaddr);
+int ocerz_commit_fault_page(uint64_t gaddr);
 unsigned ocerz_host_region_prot(uint64_t gaddr, uint64_t *base, uint64_t *size);
 
 /* Thread-init start gate (see src/mem.c): arm at process start (parks workers iff
@@ -176,23 +177,50 @@ void ocerz_init_gate_arm(void);
 void ocerz_init_gate_release(void);
 void ocerz_init_gate_wait(void);
 
+/* Guest loads are load-ACQUIRE so ocerz preserves x86-64 Total Store Order for
+ * plain (non-atomic) accesses: x86 guarantees load->load and load->store
+ * ordering, which arm64's unordered ldr does not. A naturally-aligned access
+ * uses __atomic_load_n(ACQUIRE) (lock-free ldar/ldapr on arm64); the unaligned
+ * or odd-size fallback keeps the plain load and adds an acquire fence after it.
+ * Ordering, not 16-byte atomicity, is what x86 promises, so this is a faithful
+ * (RCsc/RCpc) superset of TSO. Single-threaded results are unchanged. */
 static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
 {
     const void *p = ocerz_g2h(gaddr);
-    uint16_t v2; uint32_t v4; uint64_t v8;
     switch (size) {
-    case 1: return *(const uint8_t *)p;
-    case 2: __builtin_memcpy(&v2, p, 2); return v2;
-    case 4: __builtin_memcpy(&v4, p, 4); return v4;
-    case 8: __builtin_memcpy(&v8, p, 8); return v8;
-    default: { uint64_t v = 0; __builtin_memcpy(&v, p, (size_t)size); return v; }
+    case 1:
+        return __atomic_load_n((const uint8_t *)p, __ATOMIC_ACQUIRE);
+    case 2:
+        if (((uintptr_t)p & 1) == 0)
+            return __atomic_load_n((const uint16_t *)p, __ATOMIC_ACQUIRE);
+        break;
+    case 4:
+        if (((uintptr_t)p & 3) == 0)
+            return __atomic_load_n((const uint32_t *)p, __ATOMIC_ACQUIRE);
+        break;
+    case 8:
+        if (((uintptr_t)p & 7) == 0)
+            return __atomic_load_n((const uint64_t *)p, __ATOMIC_ACQUIRE);
+        break;
+    default:
+        break;
     }
+    uint64_t v = 0;
+    __builtin_memcpy(&v, p, (size_t)size);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return v;
 }
 
 extern uint64_t ocerz_watch_addr;
 extern uint64_t ocerz_watch_val;
 void ocerz_watch_hit(uint64_t gaddr, int size, uint64_t lo, uint64_t hi);
 
+/* Guest stores are store-RELEASE, the mirror of ocerz_ld: x86 guarantees
+ * store->store (and load->store) ordering that arm64's unordered str does not.
+ * A naturally-aligned access uses __atomic_store_n(RELEASE) (lock-free stlr);
+ * the unaligned or odd-size fallback emits a release fence before a plain store.
+ * On little-endian arm64 the low `size` bytes of v are the value, matching the
+ * old sized memcpy exactly. Single-threaded results are unchanged. */
 static inline void ocerz_st(uint64_t gaddr, int size, uint64_t v)
 {
     if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
@@ -201,18 +229,50 @@ static inline void ocerz_st(uint64_t gaddr, int size, uint64_t v)
         ocerz_watch_hit(gaddr, size, v, 0);
     void *p = ocerz_g2h(gaddr);
     switch (size) {
-    case 1: *(uint8_t *)p = (uint8_t)v; break;
-    case 2: { uint16_t t = (uint16_t)v; __builtin_memcpy(p, &t, 2); break; }
-    case 4: { uint32_t t = (uint32_t)v; __builtin_memcpy(p, &t, 4); break; }
-    case 8: __builtin_memcpy(p, &v, 8); break;
-    default: __builtin_memcpy(p, &v, (size_t)size); break;
+    case 1:
+        __atomic_store_n((uint8_t *)p, (uint8_t)v, __ATOMIC_RELEASE);
+        return;
+    case 2:
+        if (((uintptr_t)p & 1) == 0) {
+            __atomic_store_n((uint16_t *)p, (uint16_t)v, __ATOMIC_RELEASE);
+            return;
+        }
+        break;
+    case 4:
+        if (((uintptr_t)p & 3) == 0) {
+            __atomic_store_n((uint32_t *)p, (uint32_t)v, __ATOMIC_RELEASE);
+            return;
+        }
+        break;
+    case 8:
+        if (((uintptr_t)p & 7) == 0) {
+            __atomic_store_n((uint64_t *)p, v, __ATOMIC_RELEASE);
+            return;
+        }
+        break;
+    default:
+        break;
     }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __builtin_memcpy(p, &v, (size_t)size);
 }
 
+/* 128-bit guest access carries the same acquire/release ordering. x86 gives no
+ * 16-byte atomicity for SSE loads/stores anyway, so an 8-byte-aligned access is
+ * faithfully split into two ordered 8-byte halves (each half stays naturally
+ * aligned); a less-aligned access keeps the memcpy and adds a fence. The lo/hi
+ * split matches the little-endian struct layout the memcpy produced. */
 static inline Ocerz128 ocerz_ld128(uint64_t gaddr)
 {
+    const void *p = ocerz_g2h(gaddr);
     Ocerz128 v;
-    memcpy(&v, ocerz_g2h(gaddr), 16);
+    if (((uintptr_t)p & 7) == 0) {
+        v.lo = __atomic_load_n((const uint64_t *)p, __ATOMIC_ACQUIRE);
+        v.hi = __atomic_load_n((const uint64_t *)p + 1, __ATOMIC_ACQUIRE);
+    } else {
+        __builtin_memcpy(&v, p, 16);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    }
     return v;
 }
 
@@ -222,7 +282,14 @@ static inline void ocerz_st128(uint64_t gaddr, Ocerz128 v)
         ocerz_watch_hit(gaddr, 16, v.lo, v.hi);
     if (ocerz_watch_val && (v.lo == ocerz_watch_val || v.hi == ocerz_watch_val))
         ocerz_watch_hit(gaddr, 16, v.lo, v.hi);
-    memcpy(ocerz_g2h(gaddr), &v, 16);
+    void *p = ocerz_g2h(gaddr);
+    if (((uintptr_t)p & 7) == 0) {
+        __atomic_store_n((uint64_t *)p, v.lo, __ATOMIC_RELEASE);
+        __atomic_store_n((uint64_t *)p + 1, v.hi, __ATOMIC_RELEASE);
+    } else {
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        __builtin_memcpy(p, &v, 16);
+    }
 }
 
 #endif
