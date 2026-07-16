@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A from-scratch x86_64 → arm64 userspace binary translator for macOS.</b><br>
-  <sub>Zero Rosetta involvement.</sub>
+  <sub>Zero Rosetta translaion involvement.</sub>
 </p>
 
 
