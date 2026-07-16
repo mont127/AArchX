@@ -129,6 +129,7 @@
 #include "ocerz/interp.h"
 #include "ocerz/dyld.h"
 
+#include <stddef.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <errno.h>
@@ -496,10 +497,73 @@ static int sys_sysctlbyname(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
-#define OCERZ_KEVENT_QOS_S 0x40
+/* struct kevent_qos_s -- the ABI of every kevent list ocerz bridges. The kernel's
+ * definition is PRIVATE (the public <sys/event.h> only forward-declares it), so this
+ * is declared explicitly here and pinned by _Static_assert. It is 72 (0x48) bytes,
+ * NOT 64: ocerz used to hard-code 0x40, which mis-addressed every list entry from
+ * index 1 onward by 8 bytes per index and under-copied every single event by 8.
+ *
+ * The size is NOT taken on faith from a header, nor from a hand-rolled sizeof (that
+ * proof would be circular -- it would only measure our own declaration). It is read
+ * out of the shipping consumer, libdispatch's _dispatch_event_loop_merge, which
+ * states the stride twice with two independent constants:
+ *     leaq (,%r13,8),%rax ; leaq (%rax,%rax,8),%rdx   -> alloca(n * 8 * 9) = n * 72
+ *     ...
+ *     callq _dispatch_kevent_drain ; addq $0x48,%rbx  -> iteration stride = 0x48
+ * The field offsets below were already correct in ocerz; only the stride was wrong,
+ * which is exactly why this survived so long -- every single-event access was fine.
+ * The asserts are what keep a future edit honest. */
+struct ocerz_kevent_qos_s {
+    uint64_t ident;
+    int16_t  filter;
+    uint16_t flags;
+    uint32_t qos;
+    uint64_t udata;
+    uint32_t fflags;
+    uint32_t xflags;
+    int64_t  data;
+    uint64_t ext[4];
+};
+
+_Static_assert(sizeof(struct ocerz_kevent_qos_s) == 72, "kevent_qos_s must be 72 bytes");
+_Static_assert(offsetof(struct ocerz_kevent_qos_s, ident)  == 0x00, "kevent ident offset");
+_Static_assert(offsetof(struct ocerz_kevent_qos_s, filter) == 0x08, "kevent filter offset");
+_Static_assert(offsetof(struct ocerz_kevent_qos_s, flags)  == 0x0a, "kevent flags offset");
+_Static_assert(offsetof(struct ocerz_kevent_qos_s, qos)    == 0x0c, "kevent qos offset");
+_Static_assert(offsetof(struct ocerz_kevent_qos_s, udata)  == 0x10, "kevent udata offset");
+_Static_assert(offsetof(struct ocerz_kevent_qos_s, fflags) == 0x18, "kevent fflags offset");
+_Static_assert(offsetof(struct ocerz_kevent_qos_s, xflags) == 0x1c, "kevent xflags offset");
+_Static_assert(offsetof(struct ocerz_kevent_qos_s, data)   == 0x20, "kevent data offset");
+_Static_assert(offsetof(struct ocerz_kevent_qos_s, ext)    == 0x28, "kevent ext offset");
+
+#define OCERZ_KEVENT_QOS_S ((uint64_t)sizeof(struct ocerz_kevent_qos_s))
+
+/* WQ_KEVENT_LIST_LEN -- the number of kevent_qos_s entries in the buffer the kernel
+ * hands a workqueue thread's callback, and therefore the real capacity of the re-arm
+ * changelist that callback may return. This bounds BOTH directions of the bridge: how
+ * many delivered events are copied in, and how many guest re-arms are copied back. */
+#define OCERZ_WQ_KEVENT_LIST_LEN 16
 
 static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]);
 static void ocerz_hostwq_register(OcerzVM *vm);
+
+/* OCERZ_DQDUMP (diagnostic only, gated): a dispatch workloop id IS the guest
+ * dispatch_workloop_t pointer, so the object's dq_state -- whose LOW 32 bits are
+ * libdispatch's drain-owner lock (the servicing thread's mach port) -- is readable
+ * straight out of guest memory. Dumping the object header at each arm / worker
+ * entry / worker exit shows whether a workloop that is never drained is sitting
+ * with a STALE non-zero owner (a worker that died mid-drain) or a zero owner. */
+static void wl_dqdump(const char *tag, uint64_t id, unsigned cpun, unsigned kp)
+{
+    if (!id)
+        return;
+    fprintf(stderr, "ocerz: DQ %-6s id=%#llx cpu#%u kport=%#x |", tag,
+            (unsigned long long)id, cpun, kp);
+    for (uint64_t off = 0; off <= 0x48; off += 8)
+        fprintf(stderr, " +%02llx=%016llx", (unsigned long long)off,
+                (unsigned long long)ocerz_ld(id + off, 8));
+    fprintf(stderr, "\n");
+}
 
 /* Per-host-worker-thread re-arm handoff for HOSTWQ inline workers. When the host
  * kernel calls one of the workqueue callbacks it hands &events/&nevents (in-out):
@@ -874,17 +938,63 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             /* nkevents == -1 is libpthread's "terminate this thread" convention, not a
              * changelist; re-arm nothing. */
             if (n < 0) n = 0;
-            /* Cap at the delivered count. This IS a real under-report: a workloop drain
-             * can emit more re-arm entries than it received (MEASURED n=2..3 off a
-             * 1-event delivery), so some EV_DISPATCH sources are left un-armed. But
-             * returning the guest's full changelist -- by staging it and re-pointing
-             * *evp, which is ABI-legal and what libdispatch itself does -- was MEASURED
-             * to explode worker churn ~14000x (WQ-ENTER 97 -> 1.4M in 20s), because the
-             * re-armed level-triggered sources immediately re-fire against host kq state
-             * the guest drain does not actually satisfy. Until that mismatch is
-             * understood, the cap is load-bearing as a brake. Do not "fix" it without
-             * re-measuring WQ-ENTER. */
-            if (n > g_hostwq_tl_evcap) n = g_hostwq_tl_evcap;
+            /* The outgoing re-arm changelist is bounded by the KERNEL BUFFER's capacity,
+             * NOT by how many events were delivered. The delivered count is not a
+             * capacity and never was -- capping on it was a number ocerz invented, and
+             * it silently discarded real re-arms.
+             *
+             * The contract, read out of the shipping libdispatch (_dispatch_event_loop_merge):
+             *     movw $0xe, 0x32(%r15)     ; r15 = gs:0xe8 = the deferred-items struct
+             * ddi_maxevents is set to 14 UNCONDITIONALLY, before the drain loop and with no
+             * reference to the delivered count. So libdispatch is entitled to return up to
+             * 14 re-arm entries off a 1-event delivery -- MEASURED here as n=2..3, and the
+             * dropped entry was routinely the EVFILT_WORKLOOP (-17) re-arm itself, which is
+             * exactly how a workloop got armed 141 times and never drained: the guest DID
+             * drain and asked to re-arm, and ocerz threw the request away.
+             *
+             * 16 is the kernel's WQ_KEVENT_LIST_LEN, the real capacity of the buffer the
+             * kernel hands the callback (ocerz already independently assumes it via its own
+             * `if (nev > 16) nev = 16` in the bridge). Cap at 16, not at 14: 14 is an
+             * implementation constant of THIS libdispatch build, whereas 16 is the buffer
+             * contract. The guest evbuf is 0x8000 bytes and 14 * 0x48 = 0xA20, so neither
+             * side is short of space -- there was never a reason to truncate.
+             *
+             * The prior "returning the full changelist exploded worker churn ~14000x
+             * (WQ-ENTER 97 -> 1.4M)" measurement was real, but its cause was the stride bug
+             * above, not a semantic mismatch: with OCERZ_KEVENT_QOS_S = 0x40 every entry
+             * from index 1 on was read 8 bytes short of where the guest wrote it, so the
+             * kernel was handed garbage kevents, errored them, and re-fired immediately. The
+             * cap was a brake bolted onto a broken constant. It is only safe to lift AFTER
+             * the stride is correct -- that dependency is real. */
+            if (getenv("OCERZ_KRLOG")) {
+                fprintf(stderr, "ocerz: KRET cpu#%u op=%#llx n=%d evcap=%d%s |",
+                        cpu->cpu_number, (unsigned long long)op, n, g_hostwq_tl_evcap,
+                        n > g_hostwq_tl_evcap ? "  **TRUNCATED**" : "");
+                for (int i = 0; i < n && i < 8; i++) {
+                    uint64_t k = a[1] + (uint64_t)i * OCERZ_KEVENT_QOS_S;
+                    fprintf(stderr, " [%d]{id=%#llx filt=%d fl=%#llx fflags=%#llx}%s", i,
+                            (unsigned long long)ocerz_ld(k + 0x00, 8),
+                            (int)(int16_t)ocerz_ld(k + 0x08, 2),
+                            (unsigned long long)ocerz_ld(k + 0x0a, 2),
+                            (unsigned long long)ocerz_ld(k + 0x18, 4),
+                            i >= g_hostwq_tl_evcap ? "<<DROPPED" : "");
+                }
+                fprintf(stderr, "\n");
+            }
+            /* Safety clamp only. Per the contract above (libdispatch caps itself at
+             * ddi_maxevents=14 < the kernel buffer's 16) this can NEVER fire, so it is loud
+             * rather than silent: if it ever does, the model here is wrong -- most likely a
+             * future libdispatch raised maxevents past WQ_KEVENT_LIST_LEN -- and truncating
+             * would resume silently dropping real re-arms. Do not downgrade this to a quiet
+             * min(). */
+            if (n > g_hostwq_tl_evcap) {
+                fprintf(stderr,
+                        "ocerz: BUG: workq_kernreturn re-arm list n=%d exceeds kernel buffer "
+                        "capacity %d (op=%#llx) -- libdispatch's ddi_maxevents contract is "
+                        "broken on this OS build; re-arms are being DROPPED\n",
+                        n, g_hostwq_tl_evcap, (unsigned long long)op);
+                n = g_hostwq_tl_evcap;
+            }
             void *hbuf = *evp;
             if (hbuf && a[1]) {
                 for (int i = 0; i < n; i++)
@@ -1374,8 +1484,8 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
     OcerzVM *vm = g_hostwq_vm;
     if (!vm || nev <= 0 || !hev)
         return;
-    if (nev > 16)
-        nev = 16;
+    if (nev > OCERZ_WQ_KEVENT_LIST_LEN)
+        nev = OCERZ_WQ_KEVENT_LIST_LEN;
     uint64_t cookie = ocerz_ld(OCERZ_PTHREAD_COOKIE, 8);
     /* One guest worker region per HOST workqueue thread, reused across the many
      * callbacks the kernel routes through this recycled thread -- allocating a
@@ -1469,9 +1579,35 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
     if (getenv("OCERZ_ULOCKLOG"))
         fprintf(stderr, "ocerz: WQ-ENTER cpu#%u kport=%#x nev=%d flt0=%d ident0=%#llx\n",
                 t.cpu_number, (unsigned)kp, nev, flt0, (unsigned long long)ident0);
-    ocerz_vm_run_cpu(vm, &t);
+    int dqdump = getenv("OCERZ_DQDUMP") != NULL;
+    if (dqdump)
+        wl_dqdump("ENTER", workloop_id, t.cpu_number, (unsigned)kp);
+    int wrc = ocerz_vm_run_cpu(vm, &t);
+    if (dqdump)
+        wl_dqdump(wrc == 125 ? "FATAL" : "EXIT", workloop_id, t.cpu_number, (unsigned)kp);
+    /* A HOSTWQ worker that dies via STEP_FATAL (rc 125) unwinds straight back into
+     * libpthread, leaving the guest's libdispatch per-thread state behind IN A REUSED
+     * region. Dump that state (cost: only on an already-fatal path) -- it is what the
+     * NEXT worker on this host thread inherits: gs:0xd8 = the adopted wlh, gs:0xe8 =
+     * _dispatch_deferred_items (a pointer into THIS worker's now-dead guest stack),
+     * gs:0x18 = _dispatch_tid_self. */
+    if (wrc == 125) {
+        uint64_t gs = t.gs_base;
+        uint64_t ddi = ocerz_ld(gs + 0xe8, 8) & ~2ull;
+        uint64_t sdq = ddi ? ocerz_ld(ddi + 8, 8) : 0;
+        fprintf(stderr,
+                "ocerz: WQ-FATAL cpu#%u kport=%#x wlid=%#llx rsp_base=%#llx | "
+                "wlh(gs:0xd8)=%#llx ddi(gs:0xe8)=%#llx tid(gs:0x18)=%#llx "
+                "stashed_dq=%#llx dq_state=%#llx\n",
+                t.cpu_number, (unsigned)kp, (unsigned long long)workloop_id,
+                (unsigned long long)(pth - 0x100),
+                (unsigned long long)ocerz_ld(gs + 0xd8, 8),
+                (unsigned long long)ddi, (unsigned long long)ocerz_ld(gs + 0x18, 8),
+                (unsigned long long)sdq,
+                (unsigned long long)(sdq ? ocerz_ld(sdq + 0x38, 8) : 0));
+    }
     if (getenv("OCERZ_ULOCKLOG"))
-        fprintf(stderr, "ocerz: WQ-EXIT  cpu#%u kport=%#x\n", t.cpu_number, (unsigned)kp);
+        fprintf(stderr, "ocerz: WQ-EXIT  cpu#%u kport=%#x rc=%d\n", t.cpu_number, (unsigned)kp, wrc);
     if (getenv("OCERZ_WQHIST")) {
         uint64_t rh[16]; unsigned rn = ocerz_vm_riphist(rh, 16);
         fprintf(stderr, "ocerz: WQ-HIST cpu#%u flt0=%d ident0=%#llx rip=%#llx hist:",
@@ -1545,7 +1681,11 @@ static void ocerz_hostwq_kevent_cb(void **events, int *nevents)
      * op-0x40 workq_kernreturn can copy its outgoing changelist back into *events. */
     g_hostwq_tl_events  = events;
     g_hostwq_tl_nevents = nevents;
-    g_hostwq_tl_evcap   = nevents ? *nevents : 0;
+    /* The re-arm copy-back is bounded by the kernel buffer's capacity
+     * (WQ_KEVENT_LIST_LEN), NOT by the delivered count *nevents -- see the contract
+     * derivation in sys_workq_kernreturn. libdispatch may legitimately return up to
+     * ddi_maxevents=14 re-arms off a single delivered event. */
+    g_hostwq_tl_evcap   = OCERZ_WQ_KEVENT_LIST_LEN;
     ocerz_hostwq_bridge(OCERZ_WQ_FLAG_KEVENT, 0,
                         events ? *events : NULL, nevents ? *nevents : 0);
     /* If the worker completed via op-0x40 the copyback already set *nevents and cleared
@@ -1580,7 +1720,11 @@ static void ocerz_hostwq_workloop_cb(uint64_t *workloop_id, void **events, int *
                 (unsigned long long)(workloop_id ? *workloop_id : 0));
     g_hostwq_tl_events  = events;
     g_hostwq_tl_nevents = nevents;
-    g_hostwq_tl_evcap   = nevents ? *nevents : 0;
+    /* The re-arm copy-back is bounded by the kernel buffer's capacity
+     * (WQ_KEVENT_LIST_LEN), NOT by the delivered count *nevents -- see the contract
+     * derivation in sys_workq_kernreturn. libdispatch may legitimately return up to
+     * ddi_maxevents=14 re-arms off a single delivered event. */
+    g_hostwq_tl_evcap   = OCERZ_WQ_KEVENT_LIST_LEN;
     ocerz_hostwq_bridge(r8, workloop_id ? *workloop_id : 0,
                         events ? *events : NULL, nevents ? *nevents : 0);
     if (g_hostwq_tl_nevents) {
@@ -1668,6 +1812,8 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                     (int)getpid(), cpu->cpu_number, (unsigned long long)a[0],
                     (long long)a[2], (long long)a[4], (unsigned long long)fa[7],
                     (unsigned long long)chg0id, chg0f, chg0fl, (long long)r, err);
+        if (getenv("OCERZ_DQDUMP") && chg0f == -17)
+            wl_dqdump("ARM", a[0], cpu->cpu_number, 0);
         /* SYNCHRONOUS receive: a worker draining its workloop calls kevent_id with
          * nevents>0, and the kernel returns EVFILT_MACHPORT events whose ext0 is a
          * host-allocated message buffer the guest cannot read -- the same gs:0x320 fault
