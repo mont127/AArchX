@@ -46,6 +46,10 @@ typedef struct OcerzCache {
 
 int ocerz_cache_map(OcerzCache *c);
 uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol);
+/* As ocerz_cache_resolve, but reports whether the symbol was FOUND separately from
+ * its value, so a legitimately-zero export (an ABSOLUTE symbol such as libobjc's
+ * __objc_empty_vtable) is not mistaken for "not found". */
+uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found);
 uint64_t ocerz_cache_image_addr(OcerzCache *c, uint32_t i, const char **path_out);
 
 #endif

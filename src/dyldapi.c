@@ -56,8 +56,8 @@
  * already-loaded objc images, which is what drives objc's _read_images /
  * preopt_init / class realization; without it objc later dereferences a NULL
  * shared-cache selector table. Ocerz replicates this: it builds an array of
- * 32-byte _dyld_objc_notify_mapped_info entries {mach_header@0, objcImageInfo@8,
- * path@0x10, sectionLocations@0x18} for every loaded objc image and calls
+ * 32-byte _dyld_objc_notify_mapped_info entries {mach_header@0, path@8,
+ * sectionLocations@0x10, objcImageInfo@0x18} for every loaded objc image and calls
  * `mapped` via a nested ocerz_vm_call. The "loaded" set is the real dependency
  * closure of the main executable: compute_closure() BFS-walks the executable's
  * LC_LOAD_DYLIB / weak / reexport / upward / lazy dependencies transitively,
@@ -175,6 +175,21 @@ static int g_closure_n;
  * framework's classes are found in the preopt table but reported isLoaded=0,
  * so NSClassFromString returns nil and AppKit asserts. */
 static uint64_t g_objc_mapped_cb;
+/* libobjc's `init` callback (load_images) from the version-4 _dyld_objc_register_callbacks
+ * struct at +0x10. Real dyld invokes it per image as that image is initialized; objc uses
+ * the FIRST call to run loadAllCategories() (every category present at startup is deferred
+ * until then) and each call to run that image's +load methods. Never invoking it left every
+ * +load unrun and every startup category unattached -- e.g. Platypus's NSColor(Inverted)
+ * category, whose missing -inverted threw an unrecognized-selector NSException out of
+ * nib loading. Takes ONE arg: a pointer to that image's _dyld_objc_notify_mapped_info. */
+static uint64_t g_objc_init_cb;
+/* Reused one-image _dyld_objc_notify_mapped_info handed to that callback. */
+/* sectionLocations is an OPAQUE dyld handle: ocerz is the dyld here, and its
+ * _dyld_lookup_section_info (slot 0x378) derives every section from the mach_header,
+ * so ocerz's handle for an image IS its mach_header. It must be non-NULL -- libobjc
+ * treats a null handle as "no sections" and silently finds no catlist, so every
+ * category stays unattached. */
+static uint64_t g_objc_init_info;
 static uint64_t g_objc_dlopen_mapped[DYLDAPI_CLOSURE_MAX];
 static int g_objc_dlopen_mapped_n;
 
@@ -592,15 +607,68 @@ static void api_return(OcerzCPU *cpu, uint64_t result)
     cpu->gpr[OCERZ_RAX] = result;
 }
 
+/* _dyld_register_for_bulk_image_loads(func) -- vtable slot 0x290, callback in rsi
+ * (the libdyld trampoline shifts args down by one). Real dyld records the callback
+ * and SYNCHRONOUSLY invokes it once with every image already loaded, then again for
+ * each later batch; the immediate call is the contract callers depend on.
+ *
+ * libxpc registers _xpc_dyld_image_callback here from _xpc_collect_images and builds
+ * its "initial images" dictionary inside that callback. Returning 0 without invoking
+ * it (the unimplemented-slot default) left libxpc's global NULL, and _xpc_init_pid_domain
+ * later passed that NULL to xpc_dictionary_apply -> _xpc_api_misuse abort -- which is
+ * the ViewBridge/NSRemoteView path AppKit takes from +[NSTextInputContext initialize],
+ * so every Cocoa app died before it could put a window on screen.
+ *
+ * Signature: func(unsigned count, const struct mach_header *mhs[], const char *paths[]).
+ * The image set is the same launch closure the image-list slots report. Subsequent
+ * batch loads (dlopen) are not yet re-notified -- see notes/wine_bringup.md. */
+static int api_register_for_bulk_image_loads(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t func = cpu->gpr[OCERZ_RSI];
+    int n = g_closure_n > DYLDAPI_CLOSURE_MAX ? DYLDAPI_CLOSURE_MAX : g_closure_n;
+    if (!func || n <= 0) {
+        api_return(cpu, 0);
+        return OCERZ_STEP_OK;
+    }
+    uint64_t mhs = ocerz_map_anywhere((uint64_t)n * 8, PROT_READ | PROT_WRITE);
+    uint64_t paths = ocerz_map_anywhere((uint64_t)n * 8, PROT_READ | PROT_WRITE);
+    if (!mhs || !paths) {
+        api_return(cpu, 0);
+        return OCERZ_STEP_OK;
+    }
+    for (int k = 0; k < n; k++) {
+        const char *path = cache_path_for_mh(g_cache, g_closure_mh[k]);
+        ocerz_st(mhs + (uint64_t)k * 8, 8, g_closure_mh[k]);
+        ocerz_st(paths + (uint64_t)k * 8, 8, path ? ocerz_h2g(path) : 0);
+    }
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    uint64_t caller_ret = ocerz_ld(rsp, 8);
+    uint64_t ret_rsp = rsp + 8;
+    OCERZ_LOG("dyldapi: bulk_image_loads driving %d image(s) to cb=%#llx\n",
+              n, (unsigned long long)func);
+    uint64_t args[3] = { (uint64_t)n, mhs, paths };
+    ocerz_vm_call(vm, func, args, 3, ret_rsp);
+    cpu->rip = caller_ret;
+    cpu->gpr[OCERZ_RSP] = ret_rsp;
+    cpu->gpr[OCERZ_RAX] = 0;
+    return OCERZ_STEP_OK;
+}
+
 static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t cb = cpu->gpr[OCERZ_RSI];
     uint64_t mapped = cb ? ocerz_ld(cb + 0x08, 8) : 0;
+    if (cb && getenv("OCERZ_OBJCCB"))
+        fprintf(stderr, "ocerz: OBJCCB struct@%#llx version=%llu mapped=%#llx init=%#llx unmapped=%#llx patches=%#llx\n",
+                (unsigned long long)cb, (unsigned long long)ocerz_ld(cb, 8),
+                (unsigned long long)ocerz_ld(cb + 0x08, 8), (unsigned long long)ocerz_ld(cb + 0x10, 8),
+                (unsigned long long)ocerz_ld(cb + 0x18, 8), (unsigned long long)ocerz_ld(cb + 0x20, 8));
     if (!mapped || !g_cache) {
         api_return(cpu, 0);
         return OCERZ_STEP_OK;
     }
     g_objc_mapped_cb = mapped;
+    g_objc_init_cb = cb ? ocerz_ld(cb + 0x10, 8) : 0;
 
     uint64_t mhs[DYLDAPI_CLOSURE_MAX], paths[DYLDAPI_CLOSURE_MAX], iis[DYLDAPI_CLOSURE_MAX];
     int n = 0;
@@ -628,9 +696,9 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
     for (int k = 0; k < n; k++) {
         uint64_t e = infos + (uint64_t)k * 0x20;
         ocerz_st(e + 0x00, 8, mhs[k]);
-        ocerz_st(e + 0x08, 8, iis[k]);
-        ocerz_st(e + 0x10, 8, paths[k]);
-        ocerz_st(e + 0x18, 8, 0);
+        ocerz_st(e + 0x08, 8, paths[k]);
+        ocerz_st(e + 0x10, 8, mhs[k]);   /* sectionLocations: ocerz's opaque handle = the mh */
+        ocerz_st(e + 0x18, 8, iis[k]);
     }
 
     uint64_t rsp = cpu->gpr[OCERZ_RSP];
@@ -681,9 +749,9 @@ static void objc_drive_map_images(struct OcerzVM *vm, const uint64_t *mhs, int n
         uint64_t e = infos + (uint64_t)k * 0x20;
         const char *path = cache_path_for_mh(g_cache, mhs[k]);
         ocerz_st(e + 0x00, 8, mhs[k]);
-        ocerz_st(e + 0x08, 8, find_section_any(mhs[k], "__objc_imageinfo"));
-        ocerz_st(e + 0x10, 8, path ? ocerz_h2g(path) : 0);
-        ocerz_st(e + 0x18, 8, 0);
+        ocerz_st(e + 0x08, 8, path ? ocerz_h2g(path) : 0);
+        ocerz_st(e + 0x10, 8, mhs[k]);   /* sectionLocations: ocerz's opaque handle = the mh */
+        ocerz_st(e + 0x18, 8, find_section_any(mhs[k], "__objc_imageinfo"));
     }
     if (getenv("OCERZ_DLOPENLOG"))
         for (int k = 0; k < n; k++)
@@ -1360,6 +1428,30 @@ void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t sta
         return;
     const char *imgpath = g_cache ? cache_path_for_mh(g_cache, mh) : NULL;
     OCERZ_LOG("loadphase: image %s (mh=%#llx)\n", imgpath ? imgpath : "?", (unsigned long long)mh);
+    /* Hand the image to libobjc's own `init` (load_images) callback, which is exactly what
+     * dyld does as each image is initialized, rather than hand-rolling the +load scan below.
+     * objc uses its FIRST load_images call to run loadAllCategories(): EVERY category present
+     * at startup is deferred until then, and objc gates that on didCallDyldNotifyRegister, so
+     * the call must come after _dyld_objc_register_callbacks has returned -- which the load
+     * phase satisfies and the register handler itself does not. Driving +load by hand skipped
+     * that trigger entirely, so no startup category ever attached (Platypus's NSColor(Inverted)
+     * -inverted threw unrecognized-selector out of nib loading) and objc never saw its own
+     * +load bookkeeping. objc also orders and locks +load itself. */
+    if (g_objc_init_cb) {
+        if (!g_objc_init_info) {
+            g_objc_init_info = ocerz_map_anywhere(0x20, PROT_READ | PROT_WRITE);
+            if (!g_objc_init_info)
+                goto handrolled;
+        }
+        ocerz_st(g_objc_init_info + 0x00, 8, mh);
+        ocerz_st(g_objc_init_info + 0x08, 8, imgpath ? ocerz_h2g(imgpath) : 0);
+        ocerz_st(g_objc_init_info + 0x10, 8, mh);   /* sectionLocations handle (see above) */
+        ocerz_st(g_objc_init_info + 0x18, 8, find_section_any(mh, "__objc_imageinfo"));
+        uint64_t ia[1] = { g_objc_init_info };
+        ocerz_vm_call(vm, g_objc_init_cb, ia, 1, stack_top);
+        return;
+    }
+handrolled:;
     uint64_t size = 0;
     uint64_t nl = find_section_sz(mh, "__objc_nlclslist", &size);
     for (uint32_t i = 0; nl && i < (uint32_t)(size / 8); i++) {
@@ -1439,6 +1531,8 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         cpu->gpr[OCERZ_RDX] = 0;
         api_return(cpu, 2);
         return OCERZ_STEP_OK;
+    case 0x290:
+        return api_register_for_bulk_image_loads(vm, cpu);
     case 0x2b0:
         return api_for_each_objc_protocol(vm, cpu);
     case 0x2d8:
@@ -1642,17 +1736,43 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
             [6] = "__objc_imageinfo", [7] = "__objc_selrefs",
             [8] = "__objc_msgrefs",   [9] = "__objc_classrefs",
             [10] = "__objc_superrefs", [11] = "__objc_protorefs",
+            /* dyld's enum has an entry (__objc_stublist) between nlclslist and catlist
+             * that this table lacked, so every kind from 14 up was shifted by one:
+             * objc asking for category_list(15) was answered with __objc_catlist2
+             * (absent) and NO category was ever discovered, while protolist(18),
+             * fork_ok(19) and rawisa(20) fell off the end of the table entirely.
+             * Mapping verified against the REAL dyld: calling its own
+             * _dyld_lookup_section_info for each kind and matching the returned
+             * address to the image's sections gives 6=imageinfo, 12=classlist,
+             * 13=nlclslist, 15=catlist, 17=nlcatlist. */
             [12] = "__objc_classlist", [13] = "__objc_nlclslist",
-            [14] = "__objc_catlist",   [15] = "__objc_catlist2",
-            [16] = "__objc_nlcatlist", [17] = "__objc_protolist",
+            [14] = "__objc_stublist",  [15] = "__objc_catlist",
+            [16] = "__objc_catlist2",  [17] = "__objc_nlcatlist",
+            [18] = "__objc_protolist", [19] = "__objc_fork_ok",
+            [20] = "__objc_rawisa",
         };
         uint64_t mh = cpu->gpr[OCERZ_RSI];
         uint64_t kind = cpu->gpr[OCERZ_RCX];
         uint64_t addr = 0, size = 0;
+        /* Shared-cache images must NOT report the class/category DISCOVERY sections
+         * (classlist/catlist/...): objc has preoptimized data for them, and answering
+         * from the Mach-O too makes it register every cache class twice ("Class X is
+         * implemented in both ..."). But the +load MARKER sections must be reported for
+         * every image: libobjc's load_images returns early unless hasLoadMethods() sees
+         * a non-lazy class/category list, and load_images is the ONLY caller of
+         * loadAllCategoriesIfNeeded -- so hiding them from the cache meant Foundation's
+         * +load never ran and NO category anywhere ever attached. Swift kinds are
+         * reported for every image (the conformance scanner walks the cache). */
         int is_swift_kind = kind <= 5;
-        if (mh && (is_swift_kind || mh < g_cache_start) &&
+        int is_load_marker = (kind == 13 || kind == 17);   /* nlclslist / nlcatlist */
+        if (mh && (is_swift_kind || is_load_marker || mh < g_cache_start) &&
             kind < (sizeof kindsect / sizeof kindsect[0]) && kindsect[kind])
             addr = find_section_sz(mh, kindsect[kind], &size);
+        if (getenv("OCERZ_SECLOG"))
+            fprintf(stderr, "ocerz: SECINFO mh=%#llx kind=%llu (%s) -> addr=%#llx size=%#llx\n",
+                    (unsigned long long)mh, (unsigned long long)kind,
+                    (kind < (sizeof kindsect / sizeof kindsect[0]) && kindsect[kind]) ? kindsect[kind] : "?",
+                    (unsigned long long)addr, (unsigned long long)size);
         cpu->gpr[OCERZ_RDX] = size;
         api_return(cpu, addr);
         return OCERZ_STEP_OK;

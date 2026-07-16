@@ -47,6 +47,14 @@ typedef struct A64Buf {
     uint32_t *p;
     uint32_t *end;
     int overflow;
+    /* Patch sink for labels taken from a full buffer. a64_emit32 clamps at
+     * p == end without advancing, so once the buffer is full every subsequent
+     * a64_label() would hand out `end` itself — an address one word PAST the
+     * mapping — and the a64_patch_* helpers write through the site they are
+     * given. a64_label() returns &sink instead, so patches from a dead block
+     * land here rather than off the end of the MAP_JIT region. The block is
+     * discarded (or demoted to the interpreter), so the value is never read. */
+    uint32_t sink;
 } A64Buf;
 
 void a64_emit32(A64Buf *b, uint32_t w);

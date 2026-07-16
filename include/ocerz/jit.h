@@ -25,8 +25,14 @@
  * counter crosses the hot threshold) the block for cpu->rip and runs it,
  * returning an OcerzStep code, or returns OCERZ_EUNSUP when it has no block
  * and chose not to translate — the caller then interprets. Blocks return
- * the next guest rip in the CPU state; direct-branch chaining patches block
- * exits to jump straight to successor blocks inside the code cache.
+ * the next guest rip in the CPU state.
+ *
+ * BLOCK CHAINING IS NOT IMPLEMENTED. Every block exit returns to the
+ * dispatcher and pays a hash lookup; measured at 1.470e9 exits with 1.00006
+ * lookups per exit in a real app, i.e. literally none are chained. This comment
+ * previously claimed chaining existed — it never did. It remains the largest
+ * single structural optimization still on the table (~20% of on-CPU), and the
+ * interfaces here do not change when it lands.
  *
  * ocerz_jit_prefork()/ocerz_jit_postfork() bracket a guest fork(): the
  * translation mutex is taken across the host fork so the child never inherits
@@ -55,5 +61,19 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu);
 uint64_t ocerz_jit_blocks(const OcerzJit *jit);
 void ocerz_jit_prefork(void);
 void ocerz_jit_postfork(void);
+
+/* Exact guest rip for a host pc inside emitted JIT code, for the fault handler.
+ * Inlined instructions never write cpu->rip (that store is what the JIT exists
+ * to avoid), so a fault in inlined code cannot read the faulting rip out of the
+ * CPU; this recovers it from the block's host-pc -> guest-rip side table.
+ * Returns 1 and sets *out_rip on success, 0 if host_pc is not in a compiled
+ * block. Lock-free and allocation-free: safe from a signal handler. */
+int ocerz_jit_fault_rip(const struct OcerzVM *vm, const void *host_pc, uint64_t *out_rip);
+
+/* True when host_pc lies inside the emitted-code arena. Distinguishes "the
+ * fault came from JIT'd code" from "the fault came from ocerz's own C code
+ * (i.e. the interpreter slow path)", which is what tells the fault handler
+ * whether cpu->cur_rip is authoritative. */
+int ocerz_jit_pc_in_arena(const struct OcerzVM *vm, const void *host_pc);
 
 #endif

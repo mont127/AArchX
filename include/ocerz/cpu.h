@@ -80,6 +80,21 @@ enum {
 typedef struct OcerzCPU {
     uint64_t gpr[16];
     uint64_t rip;
+    /* The rip of the instruction CURRENTLY EXECUTING, which is NOT what `rip`
+     * holds. Both tiers advance rip to the NEXT instruction before executing
+     * (interp: `cpu->rip += insn.len`; jit: exec_one's `cpu->rip = insn->rip +
+     * insn->len`), because that is the value x86 semantics need mid-instruction
+     * -- CALL pushes it as the return address. So on a fault, `rip` names the
+     * instruction AFTER the faulting one, while a real x86 kernel reports the
+     * faulting instruction itself in the signal frame.
+     *
+     * cur_rip carries that faulting address. It is written on the slow path
+     * only (one store, adjacent to the rip store, same cache line). INLINED JIT
+     * instructions deliberately do NOT write it -- that would put a store on
+     * exactly the path the JIT exists to keep empty; for those, the fault
+     * handler recovers the exact rip from the block's host-pc -> guest-rip side
+     * table instead (ocerz_jit_fault_rip). See crash_handler in src/vm.c. */
+    uint64_t cur_rip;
     uint64_t rflags;
     uint64_t fs_base;
     uint64_t gs_base;

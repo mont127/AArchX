@@ -3208,3 +3208,135 @@ IOSurface memory is coherent (#28ac), the dispatch/workloop path works, the main
 no window ever acquires geometry or a surface. NEXT: find why an NSWindow never gets real bounds/shape committed to
 the WindowServer (earlier WS logs showed CreateApplication + SetNotifications but NEVER a window-shape message),
 i.e. investigate the CGS/SkyLight window-create + shape path itself rather than dispatch or IOSurface.
+
+---
+
+## UPDATE #29 (2026-07-16) — REAL macOS APPS: the objc `+load`/category wall destroyed
+
+Target this session: make a **real** macOS application (not a synthetic test) create a window
+under ocerz. Test apps: `/Applications/Mousecape.app` (x86_64-only Cocoa) and
+`/Applications/Platypus.app`. `make check` green throughout (differential interp==jit 15/0).
+
+### Test-target methodology (important, cost me a false start)
+* `/System/Applications/*` apps (Calculator, TextEdit) are **launch-constrained**: exec'ing them
+  directly from a shell gets `EXC_CRASH (SIGKILL Code Signature Invalid) / Namespace CODESIGNING,
+  Code 4, Launch Constraint Violation` **natively, with no translator involved** (rip=<unavailable>,
+  all regs 0, zero frames). They are NOT valid ocerz targets. The old note "Calculator under ocerz:
+  0 windows, no crash" was measuring this, not ocerz. Use non-system apps under /Applications.
+* `CGWindowListCreateImage` / `screencapture -l<id>` return **no image** for windows that are
+  definitely real and rendered, when the caller lacks Screen Recording permission. A native
+  Rosetta control returns `no-img` identically. **`no-img` is NOT evidence of a ghost window** --
+  the earlier "the window is a ghost" conclusion was unsound.
+* `OBJC_PRINT_*` env vars apply to **ocerz's own host arm64 process** too, and both share a pid.
+  `./ocerz` with NO guest prints "IMAGES: processing 6 newly-mapped images" + "performing initial
+  category attach". That 6-image batch is HOST noise; the guest's batch is the 426-image one.
+  Always baseline with `./ocerz` (no guest) before reading objc output.
+
+### Bugs found and FIXED (all faithful; each verified by measurement)
+1. **BSD syscalls missing** (`src/syscall.c` bsd_table): `[441] guarded_open_np` (5 args,
+   ptr_mask 0x03), `[443] guarded_kqueue_np`, `[322] iopolicysys` (2, 0x02),
+   `[466] faccessat` (4, 0x02). Identified from `$(xcrun --show-sdk-path)/usr/include/sys/syscall.h`
+   and confirmed against the observed registers (441: rdx=0x1f = the standard GUARD_CLOSE|DUP|
+   SOCKET_IPC|FILEPORT|WRITE set; 466: rdi=0xfffffffe = AT_FDCWD). guarded_open_np alone took
+   Mousecape from 49M to 1.96B instructions.
+2. **Mach trap 40 = `_kernelrpc_mach_port_get_attributes_trap`** (`dispatch_mach` case 40):
+   args 3/4 are guest out-buffers and need g2h; ports pass through. Identity proven against the
+   LIVE shared cache: the symbol is at unslid 0x7ff802e2faf0 and the faulting rip 0x7ff802e2fafa
+   is +0xa (a 12-byte stub; next symbol at 0x7ff802e2fafc), corroborated by ret=0x7ff802e31c2a
+   landing inside `mach_port_get_attributes`+0x22.
+3. **★ ABSOLUTE export symbols** (`src/cache.c`, `include/ocerz/cache.h`, `src/dyld.c`).
+   libobjc exports `__objc_empty_vtable` as `[absolute]` with value **0**
+   (`dyld_info -exports /usr/lib/libobjc.A.dylib`). An ABSOLUTE export's trie value is literal and
+   must NOT be slid by the image base. ocerz (a) always added the image base and (b) used
+   `value == 0` as its "not found" sentinel through the whole resolve chain, so it could never
+   represent "found, value 0" -> `OCERZ_FATAL("unresolved import: __objc_empty_vtable")` x114.
+   Old ObjC class structures bind that symbol into **class+0x18** (the modern runtime's cache_t
+   mask/occupied word), so 56 of Mousecape's class objects carried their raw on-disk fixup
+   encoding -> corrupt method cache + superclass chain -> **libswiftCore spun forever at 200% CPU**
+   in `swift_conformsToProtocolMaybeInstantiateSuperclasses` -> `getMatchingType` ->
+   `getSuperclassForMaybeIncompleteMetadata` (a superclass walk that never terminates).
+   FIX: parse `EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE` (flags&3==2), return the value unslid, and thread
+   a real `found` flag through `trie_lookup` / `resolve_in_dylib` / `ocerz_cache_resolve_ex` /
+   `ocerz_image_self_resolve_ex` / `disk_flat_resolve_ex` / `resolve_import`. 114 -> 0 errors.
+4. **`_dyld_register_for_bulk_image_loads` (vtable slot 0x290)** was unimplemented -> returned 0,
+   dropping the registration. libxpc registers `_xpc_dyld_image_callback` there from
+   `_xpc_collect_images` and builds its "initial images" dictionary INSIDE that callback; the
+   dropped registration left libxpc's global (0x7ff8436b33e8, __DATA_DIRTY+0xb38) NULL, and
+   `_xpc_init_pid_domain` later handed that NULL to `xpc_dictionary_apply` -> `_xpc_api_misuse`
+   abort, on the ViewBridge/NSRemoteView path AppKit takes from `+[NSTextInputContext initialize]`.
+   Slot number read from the libdyld trampoline (`mov rax,[rax+0x290]`); callback arrives in rsi.
+   Real dyld invokes it synchronously with every already-loaded image. Proven by the runtime:
+   `unimplemented vtable slot +0x290 (a0=0x7ff802b2e114=_xpc_dyld_image_callback,
+   caller=_xpc_collect_images+0x26)`.
+5. **★★ THE BIG ONE — objc `+load` and ALL categories never ran** (`src/dyldapi.c`). Three
+   compounding bugs:
+   a. `ocerz_dyldapi_run_image_loads` **hand-rolled the +load scan** (walking __objc_nlclslist /
+      __objc_nlcatlist and calling each IMP itself), completely bypassing libobjc's `init`
+      (load_images) callback. ocerz captured only `mapped` (cb+0x08) and never `init` (cb+0x10).
+      `load_images` is the ONLY caller of `loadAllCategoriesIfNeeded`, and objc defers EVERY
+      category present at startup until then -- so no category anywhere ever attached.
+      FIX: capture `g_objc_init_cb` and drive `load_images(info)` from the load phase (which is
+      also correctly AFTER `_dyld_objc_register_callbacks` returns -- objc gates the attach on
+      `didCallDyldNotifyRegister`, verified live: didInitialAttachCategories=0,
+      didCallDyldNotifyRegister=1 at that point).
+   b. **`_dyld_section_location_kind` enum was shifted.** ocerz's table went classlist[12] ->
+      nlclslist[13] -> catlist[14], missing dyld's `__objc_stublist` entry at **14**, so every kind
+      from 14 up was off by one (asking for catlist(15) returned "__objc_catlist2", absent) and
+      kinds 18/19/20 (protolist/fork_ok/rawisa -- which libobjc really requests) fell off the end.
+      Mapping derived from the REAL dyld, not guessed: called its own `_dyld_lookup_section_info`
+      for each kind and matched the returned address to the image's sections ->
+      **6=imageinfo, 12=classlist, 13=nlclslist, 15=catlist, 17=nlcatlist** (see `$SP/enum.m`).
+   c. **`_dyld_objc_notify_mapped_info` layout was wrong**: it is
+      `{mh@0, path@0x08, sectionLocations@0x10, objcImageInfo@0x18}`, not
+      `{mh, objcImageInfo, path, sectionLocations}`. Proven from `load_images`'s own prologue:
+      it consumes `[rbx+8]` as a `%s` for "IMAGES: calling +load methods in %s" and passes
+      `[rbx+0x10]` as the sectionInfo arg. Also: `sectionLocations` must be **non-NULL** --
+      libobjc treats a null handle as "no sections". ocerz IS the dyld, so the handle is opaque
+      and ocerz's own slot 0x378 derives sections from the mach_header; ocerz's handle for an
+      image is therefore its **mach_header**.
+   d. **Slot 0x378 hid objc sections from shared-cache images.** That is correct for the class/
+      category DISCOVERY kinds (objc has preoptimized data; answering from the Mach-O too makes it
+      register every cache class twice -- measured: "Class QLTBitmapImage is implemented in both
+      ... and ..."), but the **+load MARKER kinds (nlclslist=13, nlcatlist=17) must be reported for
+      every image**: `load_images` early-returns unless `hasLoadMethods()` sees one, so hiding them
+      from the cache meant Foundation's +load never ran and nothing ever triggered the category
+      attach. FIX: report swift kinds + the two +load markers for all images; keep discovery kinds
+      cache-hidden. Verified: +load RAN, categories ATTACHED, **0 duplicate-class warnings**.
+
+### Verified results
+* `+load` now runs (it never did before: NATIVE "+load RAN" vs OCERZ silence -> now identical).
+* Categories now attach: `class_getInstanceMethod(NSString, ocerzCatProbe)` NULL -> non-NULL;
+  both cache-class and local-class categories (repro: `$SP/cat3.m`, `$SP/cat4.m`).
+* **Platypus**: the `-[_NSTaggedPointerColor inverted]` unrecognized-selector NSException out of
+  `NSApplicationMain` -> `loadNibNamed:` (its own `NSColor(Inverted)` category, 56 category binds
+  in `__DATA,__objc_const`) is GONE; it now loads its nib and registers windows.
+* **Mousecape**: runs end-to-end with ZERO ocerz faults, loads BOTH nibs
+  (`Base.lproj/MainMenu.nib`, `Base.lproj/Library.nib`), reads its Info.plist (NSBundle resolves),
+  emits real AppKit NSLog diagnostics, registers windows with the WindowServer under its own name,
+  and parks its main thread in `mach_msg2_trap` (a healthy idle Cocoa run loop, not a deadlock).
+  Before the category fix it reached **4 windows at 3840x30 -- byte-identical geometry to the
+  native Rosetta control's 4 menu-bar windows** -- and idled at 0% CPU.
+
+### Remaining wall (next)
+The app's own main window (native: `on=True 711x339`) still does not acquire geometry / go
+onscreen; the menu-bar windows do. Non-fatal `NSXPCSharedListener 'ClientCallsAuxiliary':
+Connection invalid` (ViewBridge auxiliary) is logged and survived. Next: find why the main
+NSWindow is never ordered front / never gets its shape committed (does the app's delegate
+`applicationDidFinishLaunching:` fire? is the launch AppleEvent / LaunchServices check-in
+needed?), now that objc categories/+load are no longer masking it.
+
+### Kept diagnostics (all env-gated)
+`OCERZ_SYSPROBE` (enumerate every missing BSD syscall in ONE run, returns ENOSYS -- a
+table-building probe, NEVER for a real run), `OCERZ_SECLOG` (_dyld_lookup_section_info kind ->
+section), `OCERZ_OBJCCB` (the objc callback struct), `OCERZ_CATPROBE` (objc's
+didInitialAttachCategories / didCallDyldNotifyRegister gate), `OCERZ_VECPROBE`.
+
+### Refuted this session (do not re-attempt)
+* "Inbound OOL relocate skips MACH64_MSG_VECTOR is the wall" -- **measured zero vector receives**.
+* "Tagged pointers are mis-decoded" -- tagged class name matches native exactly
+  (`NSConstantIntegerNumber`); it was categories.
+* "The executable isn't handed to objc" -- it IS (`loading image for .../Platypus (has class
+  properties)`); compute_closure seeds with main_mh.
+* "(B) category on a local class works, so catlist is read" -- FALSE POSITIVE: clang merged that
+  category into the class at compile time (`__objc_catlist` had only ONE entry). No category
+  attached at all.

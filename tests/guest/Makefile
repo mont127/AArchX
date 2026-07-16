@@ -33,7 +33,7 @@ ARCH := -arch x86_64
 CFLAGS := $(ARCH) -nostdlib -static -fno-stack-protector -O2 -Wl,-e,_start
 COMMON := crt0.s libmini.c
 
-TESTS := hello exit42 args alu branches strings fib sse mmap_test fileio memstress flags longblock signal_test signal_jump0
+TESTS := hello exit42 args alu branches strings fib sse mmap_test fileio memstress flags longblock signal_test signal_jump0 rip_test stack_test popmem_test
 BINS := $(addprefix bin/,$(TESTS))
 
 all: $(BINS)

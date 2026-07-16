@@ -37,6 +37,12 @@ void a64_emit32(A64Buf *b, uint32_t w)
 
 uint32_t *a64_label(A64Buf *b)
 {
+    /* Never hand out an address the patch helpers cannot legally store to.
+     * Tested against `end` rather than `overflow` on purpose: a buffer that is
+     * exactly full still has overflow == 0 (the flag is only raised by the NEXT
+     * a64_emit32), yet b->p already equals b->end and is not writable. */
+    if (b->p >= b->end)
+        return &b->sink;
     return b->p;
 }
 
