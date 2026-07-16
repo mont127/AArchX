@@ -1,5 +1,7 @@
-<img width="1024" height="1024" alt="OcerzO" src="https://github.com/user-attachments/assets/55e627cc-4b41-4841-88cb-34e54a7de94d" />
 # Ocerz
+
+<img width="1024" height="1024" alt="OcerzO" src="https://github.com/user-attachments/assets/55e627cc-4b41-4841-88cb-34e54a7de94d" />
+
 
 
 
