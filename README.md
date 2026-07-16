@@ -1,12 +1,12 @@
 <p align="center">
-  <img width="1536" height="1024" alt="Ozlogo" src="https://github.com/user-attachments/assets/9a5cd4c8-9cf1-45cd-b4e1-7865adca40b3" />
+  <img width="460" alt="Ocerz" src="https://github.com/user-attachments/assets/9a5cd4c8-9cf1-45cd-b4e1-7865adca40b3" />
 </p>
 
 <h1 align="center"><em>Ocerz</em></h1>
 
 <p align="center">
   <b>A from-scratch x86_64 → arm64 userspace binary translator for macOS.</b><br>
-  Zero Rosetta involvement.
+  <sub>Zero Rosetta involvement.</sub>
 </p>
 
 <p align="center">
@@ -57,9 +57,9 @@ make check                                                 # build + run every t
 | sse | 246 |
 | syscall | 96 |
 
-End-to-end: **14 / 14** guest binaries in interpreter mode, **14 / 14** in JIT mode, **15 / 15** in the JIT-vs-interpreter differential, and **2 / 2** dynamic-linking tests.
+End-to-end: **17 / 17** guest binaries in interpreter mode, **17 / 17** in JIT mode, **18 / 18** in the JIT-vs-interpreter differential, and **2 / 2** dynamic-linking tests.
 
-JIT speedup on `fib(30)`: **0.60s → 0.13s (~4.6×)**.
+JIT speedup on `fib(30)`: **0.59s → 0.08s (~7.5×)**.
 
 ### Real applications
 
@@ -69,7 +69,7 @@ To be precise about what that means: Ocerz does not reimplement any framework. E
 
 `Mousecape.app` reaches **window creation on the live WindowServer**: its main window comes up at **711×342** against a native Rosetta control's **711×339**, alongside AppKit's four menu-bar windows at pixel-identical geometry.
 
-This is early — the window is not yet interactive. See [What does NOT work yet](#what-does-not-work-yet).
+This is early. The window comes up on roughly half of launches; the other half hang before it appears. See [What does NOT work yet](#what-does-not-work-yet).
 
 > **Ocerz is more faithful than Rosetta for the test binaries.** The freestanding (`-nostdlib`, raw-syscall) guest tests actually *drop output lines* under Rosetta 2 — SSE printed 21 of 52 lines, even with vectorization off. Ocerz's output matches independent real-libc oracles (arm64-native and x86_64+printf) byte-for-byte. Goldens were regenerated from those oracles.
 
@@ -100,7 +100,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 **Eager flags.** Flags are evaluated eagerly into `cpu->rflags`; `flags.c` is the bit-for-bit reference the JIT must match — ADC/SBB folded via carry-in relations, INC/DEC preserving CF, deterministic values for architecturally-undefined flags, and x86 NaN semantics (negative QNaN indefinite, propagation rules).
 
-**The JIT.** A block is the straight-line run from an entry rip to the first control-flow or system instruction. Each block is decoded once; cheap ops are inlined as arm64 and everything else calls back into the shared interpreter dispatch, so the JIT and interpreter can never disagree on semantics. One 64MB `MAP_JIT` region with `pthread_jit_write_protect_np` and per-block icache invalidation; a 65536-bucket cache keyed by guest rip with a lock-free lookup on the hot path. Aligned guest loads/stores are emitted as `ldar`/`stlr`, so x86's TSO ordering survives arm64's weak memory model.
+**The JIT.** A block is the straight-line run from an entry rip to the first control-flow or system instruction. Each block is decoded once; cheap ops are inlined as arm64 and everything else calls back into the shared interpreter dispatch, so the JIT and interpreter can never disagree on semantics. A 1GB `MAP_JIT` reservation (address space, not RSS) with `pthread_jit_write_protect_np` and per-block icache invalidation; a 2^20-bucket cache keyed by guest rip with a lock-free lookup on the hot path. Stack traffic (`push`/`pop`) is inlined natively -- it is ~27% of everything a real app executes. If the arena ever fills, a block is demoted to the interpreter tier rather than retried forever. Aligned guest loads/stores are emitted as `ldar`/`stlr`, so x86's TSO ordering survives arm64's weak memory model.
 
 **The mini-dyld.** Maps the real `dyld_shared_cache_x86_64` at slide 0 and implements the dyld runtime API surface that libdyld's trampolines dispatch through — `dlopen`/`dlsym`, image lists, TLV, unwind, `_dyld_register_for_bulk_image_loads` — plus the objc↔dyld handshake (`_dyld_objc_register_callbacks`, `map_images`/`load_images`, and the shared cache's selector and class perfect-hash tables).
 
@@ -112,7 +112,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 An honest shortlist:
 
-- **Real apps are slow, and their windows are not interactive.** A real Cocoa app takes minutes to reach its window, then pegs the CPU. Profiling shows ~44% of steady-state runtime inside `translate()`: a block that fails to translate is never remembered, so every later execution of that rip re-takes the global `jit_lock` and re-decodes it. Under investigation.
+- **A real app hangs on roughly half of launches.** When it works, `Mousecape.app` reaches its window in ~19s and settles to 0% CPU. When it does not, the process parks at 0% CPU with no window and macOS reports *"Application not responding"* — the main thread never services the run loop. Measured over 24 consecutive launches: 13 OK, 8 hung, 3 died (45.8% failure). It is a **lost-wakeup race in the libdispatch workloop bridge**: one workloop gets armed (`EVFILT_WORKLOOP`, `EV_ADD|EV_ENABLE`) over 140 times and is never drained, and everything then parks. Being actively worked on; this is the single blocker to a usable app.
 - **Wine** — bring-up is in progress (see `notes/wine_bringup.md`); `wineboot` runs end-to-end into the GUI layer.
 - **Post-boot image loads** — categories and `+load` run for the launch closure, but later batch loads (post-boot `dlopen`) are not yet re-notified through `_dyld_register_for_bulk_image_loads`.
 
