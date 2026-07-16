@@ -11,7 +11,7 @@
 
 
 > [!WARNING]
-> This project is in BETA do not expect much of it in its current state .
+> This project is in BETA do not expect much of it in its current state. (ROSSETA IS STILL NEEDED)
 
 
 <p align="center">
