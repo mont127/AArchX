@@ -8,7 +8,8 @@
   <b>A from-scratch x86_64 → arm64 userspace binary translator for macOS.</b><br>
   <sub>Zero Rosetta involvement.</sub>
 </p>
-
+> [!WARNING]
+> This project is in BETA do not expect much of it in its current state .
 <p align="center">
   <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-lightgrey.svg">
