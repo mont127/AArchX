@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="220" alt="Ocerz" src="https://github.com/user-attachments/assets/55e627cc-4b41-4841-88cb-34e54a7de94d" />
+  <img width="1536" height="1024" alt="Ozlogo" src="https://github.com/user-attachments/assets/9a5cd4c8-9cf1-45cd-b4e1-7865adca40b3" />
 </p>
 
 <h1 align="center"><em>Ocerz</em></h1>
