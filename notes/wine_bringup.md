@@ -3161,3 +3161,50 @@ MACHINE: agents' native x86_64 symbolication (dladdr) WEDGES Rosetta into unkill
 spins -> environmental noise (flaky winapp2 rate, transient test_mmap_fixed_outside flake — the pristine baseline
 flakes identically, proven not-our-code). A REBOOT clears the wedged procs for reliable measurement. Prefer the
 region-map/wqdecode symbolication (compute dylib base statically) over live dladdr while ocerz runs.
+
+## UPDATE #28ae (2026-07-16): ★ THE #16/#17 DISPATCH GAP IS CLOSED AND VERIFIED — root was a KERNEL-FEATURE-ADVERTISEMENT bug, not a worker-context defect. + guest pthread-list corruption FIXED. ★★ BUT THE CENTRAL THEORY IS WRONG: with the dispatch gap closed, APPS STILL DO NOT DRAW (windows remain onscreen=no/0x0, byte-identical to baseline). The dispatch gap was NOT the drawing blocker.
+
+DISPATCH GAP — ROOT (conf 0.95, A/B proven both directions, then reverted): the guest_rip=0x0 null-call is NOT
+inside _dispatch_workloop_worker_thread. _pthread_wqthread's bit22 (0x400000 WORKLOOP) branch loads libpthread's
+__libdispatch_workloopfunction from cache __DATA 0x7ff8436bd638 and `call rax`; that slot was 0. WHY: ocerz's
+sys_bsdthread_register (syscall.c:427) returned the pthread feature word 0x4000005f, which lacks bit7 =
+PTHREAD_FEATURE_WORKLOOP (0x80). Guest libdispatch's __dispatch_root_queues_init_once tests bit7; with it clear it
+takes the KEVENT-ONLY model and passes workloop_func=NULL to _pthread_workqueue_init_with_workloop, and libpthread
+stores that NULL. So ocerz simultaneously told the guest "no workloop support" AND delivered bit22 workloop workers
+— the two halves of the workqueue contract disagreed. The 10/10 rip=0 that made the flag fix look "insufficient"
+(#28ad) was just the other half of the same contract bug. FIX (already in tree, verified live): feat |= 0x80 gated
+on OCERZ_HOSTWQ (so make check, which runs without HOSTWQ, still sees byte-identical 0x4000005f) + WORKLOOP=0x400000
+/ KEVENT=0x80000 + workloop_id at evbuf-8 + op 0x40/0x100 terminate. Host slot values confirmed:
+0x7ff8436bd638=_dispatch_workloop_worker_thread, 0x7ff8436bd660=_dispatch_kevent_worker_thread,
+0x7ff8436beed0=_dispatch_worker_thread2.
+★ THE "FRESH INLINE WORKER LACKS PERSISTENT TSD -> NEEDS ARCHITECTURAL REWRITE" THEORY IS FALSIFIED. With bit7
+advertised, ocerz's existing fresh inline workers (fresh OcerzCPU + synthetic pthread + fresh mach port per
+callback) run the REAL workloop drain with NO fault: 215/215 workloop callbacks, r8=0x480000, WQ-ENTER/WQ-EXIT 1:1,
+workers park via workq_kernreturn op 0x100, 0 guest_rip=0 across 12 runs. libdispatch establishes its own per-thread
+state; the 5 things it needs (synthetic pthread + cookie-obfuscated self, gs_base=pth+0xe0, a REAL kernel thread
+port at pth+0xf8, evbuf at pth+0x8000 with workloop_id at evbuf-8, R8 flags) are what the bridge already supplies.
+The workloop_id needs NO translation — the kernel hands back the guest's own dispatch_workloop_t heap pointer.
+MAIN-THREAD STARVATION GONE: RIPDUMP shows ZERO samples at the old starvation site 0x7ff802e31336; ULOCKLOG shows
+main now WAKING the objc lock 0x7ff8436ac940 instead of waiting on it (inverted).
+
+LANDED THIS PASS — guest pthread-list corruption (syscall.c): every workqueue callback re-ran
+_pthread_wqthread_setup on an already-linked node -> _pthread_count grew unbounded (2,29,57,82,110,138,167 over 151
+callbacks) with observed selfcycle (self->next == self). Fixed via WQ_FLAG_THREAD_REUSE + cookie handling ->
+2,7,12,17,33 over 101 callbacks (per-callback re-registration eliminated). Residual growth = a per-HOST-thread
+registration leak (not yet fixed). make check green.
+REFUTED BY MEASUREMENT (do not re-attempt): (a) "the bridge's nev<=0 early return drops zero-event workloop
+wakeups" — FALSE: nev is NEVER 0 (215/215 callbacks carry nev=1,2,16); the early return never fires. (b) the
+evcap/re-arm-truncation "fix" — implementing it was measured as a 14000x REGRESSION; rejected.
+
+★★ THE CRUCIAL CORRECTION — THE DISPATCH GAP WAS NOT THE DRAWING BLOCKER. With it closed and verified, apps STILL
+DO NOT DRAW: winapp2 registers 5 windows, ALL onscreen=no with 0x0 bounds — BYTE-IDENTICAL to the pre-fix baseline
+(arm64 CGWindowListCopyWindowInfo check). '[winapp2] WINDOW UP' printing does NOT imply an onscreen window (it only
+means the app's own code ran past [w display]/[CATransaction flush]). ONSCREEN NSWindow: 0/12. winapp2 WINDOW-UP
+rate 7/12 vs 5/12 baseline = NOT significant at n=12 (one noisy ~50% distribution; the older "50-75%" and "2/6"
+figures are the same distribution). Calculator: 0 windows registered, no crash, no GUI, unchanged — it is NOT gated
+by the dispatch path at all. CONCLUSION: the #28ac/#28ad claim that the dispatch gap is "the ONE binding wall for
+apps to draw" is WRONG. Drawing is blocked by something else, still unidentified. What we now know for certain:
+IOSurface memory is coherent (#28ac), the dispatch/workloop path works, the main thread is no longer starved — yet
+no window ever acquires geometry or a surface. NEXT: find why an NSWindow never gets real bounds/shape committed to
+the WindowServer (earlier WS logs showed CreateApplication + SetNotifications but NEVER a window-shape message),
+i.e. investigate the CGS/SkyLight window-create + shape path itself rather than dispatch or IOSurface.
