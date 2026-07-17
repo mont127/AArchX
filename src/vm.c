@@ -69,6 +69,7 @@
 #include "ocerz/vm.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"
+#include "ocerz/flags.h"
 #include "ocerz/mem.h"
 #include "ocerz/syscall.h"
 #include "ocerz/dyldapi.h"
@@ -461,6 +462,13 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     if (depth == 0 && g_cur_cpu && g_sig_recover &&
         ocerz_host_in_guest_space(si->si_addr)) {
         depth = 1;
+        /* DEFERRED FLAGS: a fault taken in inlined JIT code may leave the six
+         * arithmetic flags deferred in cpu->cc_op/cc_src/cc_dst rather than live
+         * in cpu->rflags. The guest signal frame is marshaled from cpu->rflags
+         * (ocerz_signal_deliver) and a guest handler may PUSHF, so reconstruct
+         * rflags now, before anything below reads it. Idempotent -- a no-op when
+         * nothing is deferred -- so it is safe to call unconditionally here. */
+        ocerz_flags_materialize(g_cur_cpu);
         /* The rip a real x86 kernel reports is the FAULTING instruction, but
          * cpu->rip has already advanced to the next one (see OcerzCPU::cur_rip).
          * cur_rip carries the faulting address for slow-path instructions; for
@@ -474,6 +482,14 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 ((const ucontext_t *)ctx)->uc_mcontext->__ss.__pc : NULL;
             struct OcerzVM *fvm = g_cur_cpu->vm;
             if (hpc && fvm && ocerz_jit_pc_in_arena(fvm, hpc)) {
+                /* REGISTER PINNING FAULT SEAM: a hot subset of the guest GPRs is
+                 * live in the host callee-saved regs x21..x28 at this in-arena
+                 * fault, not in cpu->gpr[] (which still holds their block-entry
+                 * values). Write them back from the host mcontext BEFORE the
+                 * frame marshal (ocerz_signal_deliver) or any gpr dump reads
+                 * them. No-op for a block that pins nothing. */
+                ocerz_jit_fault_recover_regs(fvm, hpc,
+                    ((const ucontext_t *)ctx)->uc_mcontext->__ss.__x, g_cur_cpu);
                 /* Faulted in emitted code: only the side table knows the rip,
                  * because an inlined instruction never wrote cur_rip (which
                  * therefore still names some earlier slow instruction). If the

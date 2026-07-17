@@ -76,4 +76,16 @@ int ocerz_jit_fault_rip(const struct OcerzVM *vm, const void *host_pc, uint64_t 
  * whether cpu->cur_rip is authoritative. */
 int ocerz_jit_pc_in_arena(const struct OcerzVM *vm, const void *host_pc);
 
+/* FAULT SEAM for register pinning. A fault in emitted JIT code may leave a hot
+ * subset of the guest GPRs live in the host callee-saved registers x21..x28
+ * rather than in cpu->gpr[]. Given the faulting host pc and a pointer to the
+ * host mcontext register array (&uc->uc_mcontext->__ss.__x[0], a uint64_t[29]),
+ * this writes each pinned guest reg back into cpu->gpr[] so a delivered guest
+ * signal frame and any register dump observe the true values. Must be called
+ * only when host_pc is in the arena (ocerz_jit_pc_in_arena); a no-op for a
+ * block that pins nothing. Lock-free and allocation-free: safe from a signal
+ * handler. */
+void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
+                                  const uint64_t *host_x, OcerzCPU *cpu);
+
 #endif

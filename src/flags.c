@@ -180,6 +180,64 @@ void ocerz_flags_imul(OcerzCPU *cpu, int size, uint64_t lo, uint64_t hi)
     put_arith(cpu, f);
 }
 
+/* Reconstruct rflags from the deferred flag record. Every arm forwards to the
+ * eager helper above with EXACTLY the operands the interpreter would have
+ * passed, so the result is bit-identical to eager evaluation by construction --
+ * res is recomputed here rather than stored (only two operand slots survive):
+ *   ADD/SUB : res = a (+/-) b (+/-) cin        (helpers re-mask internally)
+ *   LOGIC   : res carried directly in cc_dst
+ *   INC/DEC : cc_dst=res, and the preserved CF is carried in cc_src (the eager
+ *             helper reads it back out of rflags, so it is seeded here first)
+ *   SHL/SHR/SAR : cc_src=val, cc_dst=cnt; res recomputed at width
+ *   MUL/IMUL: cc_src=low half, cc_dst=high half */
+void ocerz_flags_materialize(OcerzCPU *cpu)
+{
+    uint32_t op = cpu->cc_op;
+    if (op == OCERZ_CC_NONE)
+        return;
+    unsigned kind = op & 0xff;
+    int size = (int)((op >> 8) & 0xff);
+    int cin = (int)((op >> 16) & 1);
+    uint64_t s = cpu->cc_src;
+    uint64_t d = cpu->cc_dst;
+    unsigned cnt = (unsigned)d;
+    switch (kind) {
+    case OCERZ_CC_ADD:
+        ocerz_flags_add(cpu, size, s, d, cin, s + d + (uint64_t)cin);
+        break;
+    case OCERZ_CC_SUB:
+        ocerz_flags_sub(cpu, size, s, d, cin, s - d - (uint64_t)cin);
+        break;
+    case OCERZ_CC_LOGIC:
+        ocerz_flags_logic(cpu, size, d);
+        break;
+    case OCERZ_CC_INC:
+        ocerz_flag_assign(cpu, OCERZ_CF, (int)(s & 1));
+        ocerz_flags_inc(cpu, size, d);
+        break;
+    case OCERZ_CC_DEC:
+        ocerz_flag_assign(cpu, OCERZ_CF, (int)(s & 1));
+        ocerz_flags_dec(cpu, size, d);
+        break;
+    case OCERZ_CC_SHL:
+        ocerz_flags_shl(cpu, size, s, cnt, s << cnt);
+        break;
+    case OCERZ_CC_SHR:
+        ocerz_flags_shr(cpu, size, s, cnt, (s & ocerz_mask(size)) >> cnt);
+        break;
+    case OCERZ_CC_SAR:
+        ocerz_flags_sar(cpu, size, s, cnt, (uint64_t)(ocerz_sext(s, size) >> cnt));
+        break;
+    case OCERZ_CC_MUL:
+        ocerz_flags_mul(cpu, size, s, d);
+        break;
+    case OCERZ_CC_IMUL:
+        ocerz_flags_imul(cpu, size, s, d);
+        break;
+    }
+    cpu->cc_op = OCERZ_CC_NONE;
+}
+
 int ocerz_cc_eval(const OcerzCPU *cpu, unsigned cc)
 {
     uint64_t f = cpu->rflags;
