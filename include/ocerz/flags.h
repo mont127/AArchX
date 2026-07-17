@@ -90,4 +90,36 @@ void ocerz_flags_mul(OcerzCPU *cpu, int size, uint64_t lo, uint64_t hi);
 void ocerz_flags_imul(OcerzCPU *cpu, int size, uint64_t lo, uint64_t hi);
 int ocerz_cc_eval(const OcerzCPU *cpu, unsigned cc);
 
+/* ---- DEFERRED FLAGS ----------------------------------------------------
+ * cc_op encodes a pending flag-producing operation whose RFLAGS have not yet
+ * been computed. kind lives in bits[7:0], operand size (bytes) in bits[15:8],
+ * and an ADC/SBB carry-in bit in bit 16. OCERZ_CC_NONE (0) means rflags is
+ * already live. The reconstruction operands live in cpu->cc_src/cc_dst; their
+ * meaning is per-kind (documented in ocerz_flags_materialize). */
+enum {
+    OCERZ_CC_NONE = 0,
+    OCERZ_CC_ADD,    /* cc_src=a, cc_dst=b        (res = a + b + cin) */
+    OCERZ_CC_SUB,    /* cc_src=a, cc_dst=b        (res = a - b - cin) */
+    OCERZ_CC_LOGIC,  /* cc_dst=res                (AND/OR/XOR/TEST)   */
+    OCERZ_CC_INC,    /* cc_dst=res, cc_src=CF-in  (CF preserved)      */
+    OCERZ_CC_DEC,    /* cc_dst=res, cc_src=CF-in  (CF preserved)      */
+    OCERZ_CC_SHL,    /* cc_src=val, cc_dst=cnt                        */
+    OCERZ_CC_SHR,    /* cc_src=val, cc_dst=cnt                        */
+    OCERZ_CC_SAR,    /* cc_src=val, cc_dst=cnt                        */
+    OCERZ_CC_MUL,    /* cc_src=lo,  cc_dst=hi                         */
+    OCERZ_CC_IMUL,   /* cc_src=lo,  cc_dst=hi                         */
+};
+
+static inline uint32_t ocerz_cc_pack(unsigned kind, int size, int cin)
+{
+    return (uint32_t)kind | ((uint32_t)size << 8) | ((uint32_t)(cin & 1) << 16);
+}
+
+/* Reconstruct cpu->rflags from a deferred flag record and clear it (cc_op set
+ * to OCERZ_CC_NONE). Idempotent: a no-op when nothing is deferred, so a second
+ * call is free and it is always safe to call unconditionally. Bit-identical to
+ * the eager helpers above -- it calls them -- which is what the differential
+ * (interp vs JIT PUSHF) proves. */
+void ocerz_flags_materialize(OcerzCPU *cpu);
+
 #endif

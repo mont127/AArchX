@@ -102,6 +102,19 @@ typedef struct OcerzCPU {
      * table instead (ocerz_jit_fault_rip). See crash_handler in src/vm.c. */
     uint64_t cur_rip;
     uint64_t rflags;
+    /* Deferred-flag (lazy RFLAGS) state. When cc_op == OCERZ_CC_NONE the six
+     * arithmetic flags are architecturally LIVE in rflags; otherwise they are
+     * DEFERRED and reconstructed on demand by ocerz_flags_materialize() from
+     * cc_src/cc_dst per the operation packed in cc_op (kind + operand size +
+     * ADC/SBB carry-in; see flags.h). The JIT stores this record instead of
+     * computing flags on the hot path and materializes at each consumer (Jcc,
+     * every slow-path call, block exit) and the fault seam, so the interpreter
+     * and everything outside emitted JIT code never observes a non-NONE cc_op:
+     * rflags stays the single reference the whole emulator diffs against.
+     * cpu_reset()/calloc leave cc_op == 0 == OCERZ_CC_NONE. */
+    uint64_t cc_src;
+    uint64_t cc_dst;
+    uint32_t cc_op;
     uint64_t fs_base;
     uint64_t gs_base;
     Ocerz128 xmm[16];
