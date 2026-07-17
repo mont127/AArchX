@@ -536,7 +536,25 @@ _Static_assert(offsetof(struct ocerz_kevent_qos_s, xflags) == 0x1c, "kevent xfla
 _Static_assert(offsetof(struct ocerz_kevent_qos_s, data)   == 0x20, "kevent data offset");
 _Static_assert(offsetof(struct ocerz_kevent_qos_s, ext)    == 0x28, "kevent ext offset");
 
-#define OCERZ_KEVENT_QOS_S ((uint64_t)sizeof(struct ocerz_kevent_qos_s))
+/* THE STRIDE IS 0x40 HERE ON PURPOSE. DO NOT "FIX" IT TO sizeof() WITHOUT READING THIS.
+ *
+ * The REAL kevent_qos_s is 0x48 (72) bytes -- the struct above is accurate, and the
+ * shipping libdispatch iterates its event list with `addq $0x48,%rbx`. So 0x48 is the
+ * architecturally correct stride and 0x40 is, in isolation, wrong: it drops ext[2]/ext[3]
+ * (EVFILT_WORKLOOP's EV_EXTIDX_WL_MASK/VALUE) and mis-addresses entry i by 8*i.
+ *
+ * And yet flipping this constant to sizeof() ALONE is a hard REGRESSION, measured over
+ * 8 runs of a real Cocoa app each way (AX-probe responsiveness, the gate macOS itself uses):
+ *     stride 0x40 -> RESPONSIVE 6/8, window 3/8
+ *     stride 0x48 -> RESPONSIVE 0/8, window 0/8   (never launches at all)
+ * So some OTHER place in the workqueue bridge is co-dependent on 64-byte entries -- a buffer
+ * capacity, an offset, the synthesized worker region layout (evbuf = pth + 0x8000), or the
+ * re-arm append in sys_workq_kernreturn (evbuf + nev * STRIDE). Making this one correct while
+ * its partner stays wrong turns a CONSISTENT error into an INCONSISTENT one, which is worse.
+ *
+ * The fix is to find that co-dependency and change BOTH together, then re-measure with the
+ * same A/B. Until then this stays 0x40, matching what actually runs. */
+#define OCERZ_KEVENT_QOS_S ((uint64_t)0x40)
 
 /* WQ_KEVENT_LIST_LEN -- the number of kevent_qos_s entries in the buffer the kernel
  * hands a workqueue thread's callback, and therefore the real capacity of the re-arm
