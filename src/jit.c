@@ -283,6 +283,12 @@ int ocerz_perfstat = -1;
 static int g_flaglive_log;
 /* OCERZ_NO_LAZYFLAGS: force eager flag emission (see the liveness pass). */
 static int g_no_lazyflags;
+/* OCERZ_NO_RAS: kill switch for the STEP 1 return-address-stack predictor. When
+ * set the JIT emits neither the CALL-side RAS push nor the RET-side fast return,
+ * so CALL/RET behave exactly as the committed inlined form (return STEP_OK to
+ * ocerz_jit_step's hash dispatch). Read once at jit init; translate() runs under
+ * jit_lock and this is a whole-run decision, mirroring g_no_lazyflags. */
+static int g_no_ras;
 static _Atomic unsigned long long ps_ops[OCERZ_OP_COUNT];
 static _Atomic unsigned long long ps_slow_insns;
 static _Atomic unsigned long long ps_steps, ps_hits, ps_misses;
@@ -416,6 +422,11 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 #define RF_OFF ((uint32_t)offsetof(OcerzCPU, rflags))
 #define RIP_OFF ((uint32_t)offsetof(OcerzCPU, rip))
 #define GPR_OFF(r) ((uint32_t)((unsigned)(r) * 8))
+/* RAS (STEP 1 return predictor). RAS_TOP_OFF is the u32 depth; RAS_OFF is the
+ * base of the ras[] array. Element i lives at RAS_OFF + i*16, with .guest_rip at
+ * +0 and .host_entry at +8 (see struct OcerzCPU). */
+#define RAS_TOP_OFF ((uint32_t)offsetof(OcerzCPU, ras_top))
+#define RAS_OFF ((uint32_t)offsetof(OcerzCPU, ras))
 
 /* Scratch registers, all caller-saved and dead between inlined instructions
  * (any following slow call reloads its operands from the register file): t0
@@ -1600,6 +1611,28 @@ static int callret_inline_enabled(void)
     return en;
 }
 
+/* RAS push (STEP 1), called from the CALL-side inlined code AFTER the guest push
+ * has committed. Records the return address and the host entry of the block that
+ * begins there so the matching RET can branch straight to it. cache_lookup is
+ * the same lockless bucket walk ocerz_jit_step's hit path uses (blocks are never
+ * freed and hnext is published before the head swap), so reading it from a
+ * running guest thread is safe. A demoted block has code==NULL; we store NULL,
+ * and the RET side treats NULL as "no prediction" and falls through to dispatch.
+ * On a full stack we simply drop the push (RET then mispredicts and dispatches):
+ * a pure-hint structure never needs to be exact. Not inlined into the emitted
+ * stream because it is the COLD arm of a round-trip-bound instruction; keeping it
+ * a plain C call keeps the emitter simple and the CALL path is not issue-bound. */
+void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
+{
+    uint32_t t = cpu->ras_top;
+    if (t >= OCERZ_RAS_SIZE)
+        return;
+    JitBlock *blk = cache_lookup(vm->jit, retaddr);
+    cpu->ras[t].guest_rip = retaddr;
+    cpu->ras[t].host_entry = (blk && blk->code) ? (void *)blk->code : NULL;
+    cpu->ras_top = t + 1;
+}
+
 static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                          int *n_exits, uint32_t **epi_sites, int *n_epi)
 {
@@ -1643,6 +1676,19 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         a64_mov_imm64(b, JT0, target);
         a64_str(b, 8, JT0, 20, RIP_OFF);
         a64_patch_b(skip, a64_label(b));   /* PAST the rip store -- see above */
+
+        /* STEP 1 RAS push. Reached by BOTH the native body and the commpage slow
+         * path (which converge here); on either, cpu is fully updated and retaddr
+         * is the same compile-time constant, so the record is correct. x19/x20 are
+         * callee-saved and survive the C call; the scratch temps and x0 are dead
+         * (the shared tail reloads x0 with STEP_OK below). */
+        if (!g_no_ras) {
+            a64_mov_reg(b, 1, 0, 19);              /* x0 = vm */
+            a64_mov_reg(b, 1, 1, 20);              /* x1 = cpu */
+            a64_mov_imm64(b, 2, retaddr);          /* x2 = retaddr */
+            a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_ras_push);
+            a64_blr(b, 16);
+        }
     } else if (insn->op == OCERZ_OP_RET) {
         if (insn->nops != 0)               /* `ret imm16` also moves rsp */
             return 0;
@@ -1662,6 +1708,49 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         a64_str(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
         a64_str(b, 8, JT1, 20, RIP_OFF);
         a64_patch_b(skip, a64_label(b));   /* PAST the rip store -- see above */
+
+        /* STEP 1 RAS fast return. Both the native body and the commpage slow path
+         * converge here with cpu->rip already holding the popped return address
+         * (the native path stored JT1->rip; the slow path's interpreter set it),
+         * so the prediction is checked against cpu->rip, never against JT1 (which
+         * is not the popped value on the slow path). On an exact match to the top
+         * RAS entry with a non-NULL host entry, tear down THIS block's frame and
+         * tail-call the predicted block: it runs as a fresh entry (its prologue
+         * saves the just-restored fp/lr) and returns its own STEP straight to
+         * ocerz_jit_step's caller, skipping the dispatch. Any miss/empty/NULL
+         * branches to `ras_miss` and falls through to the shared STEP_OK tail
+         * exactly as before. Pure hint: on a mismatch the dispatcher is correct.
+         *
+         * This tail-call is a bounded chain, not an unpolled self-loop: every RET
+         * pops one RAS entry and RAS is only pushed by CALL, so a run of returns
+         * drains RAS and reverts to dispatch (which re-checks the stop flags). It
+         * therefore needs no back-edge interrupt poll of its own -- the driving
+         * loop's Jcc still returns to the run-loop header each iteration. */
+        if (!g_no_ras) {
+            uint32_t *ras_miss[3];
+            int nrm = 0;
+            a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);        /* w: ras_top */
+            ras_miss[nrm] = a64_label(b); a64_cbz(b, 0, JT2, 0); nrm++;   /* empty */
+            a64_sub_imm(b, 0, JT2, JT2, 1);             /* w: top-1 (also new top) */
+            a64_lsl_imm(b, 1, JTA, JT2, 4);             /* (top-1) * 16 (element stride) */
+            a64_add_reg(b, 1, JTA, JTA, 20, 0);         /* JTA = cpu + (top-1)*16 */
+            a64_ldr(b, 8, JTF, JTA, RAS_OFF);           /* cpu->ras[top-1].guest_rip */
+            a64_ldr(b, 8, JT0, JTA, RAS_OFF + 8);       /* cpu->ras[top-1].host_entry */
+            a64_ldr(b, 8, JTU, 20, RIP_OFF);            /* popped return addr */
+            a64_sub_reg(b, 1, JTT, JTF, JTU, 0);        /* 0 iff predicted == popped */
+            ras_miss[nrm] = a64_label(b); a64_cbnz(b, 1, JTT, 0); nrm++;  /* mispredict */
+            ras_miss[nrm] = a64_label(b); a64_cbz(b, 1, JT0, 0); nrm++;   /* NULL entry */
+            /* Matched: commit the pop, then tail-call the predicted block. */
+            a64_str(b, 4, JT2, 20, RAS_TOP_OFF);        /* ras_top = top-1 */
+            a64_mov_reg(b, 1, 0, 19);                   /* x0 = vm */
+            a64_mov_reg(b, 1, 1, 20);                   /* x1 = cpu */
+            a64_ldp_post(b, 19, 20, 31, 16);            /* undo prologue (frame) */
+            a64_ldp_post(b, 29, 30, 31, 16);
+            a64_br(b, JT0);                             /* JT0 survives both ldp */
+            uint32_t *miss = a64_label(b);
+            for (int i = 0; i < nrm; i++)
+                a64_patch_cbz(ras_miss[i], miss);
+        }
     } else {
         return 0;
     }
@@ -2373,6 +2462,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             ocerz_jitstat = getenv("OCERZ_JITSTAT") ? 1 : 0;
             g_flaglive_log = getenv("OCERZ_FLAGLIVE") ? 1 : 0;
             g_no_lazyflags = getenv("OCERZ_NO_LAZYFLAGS") ? 1 : 0;
+            g_no_ras = getenv("OCERZ_NO_RAS") ? 1 : 0;
         }
         pthread_mutex_unlock(&jit_lock);
     }

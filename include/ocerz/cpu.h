@@ -132,7 +132,51 @@ typedef struct OcerzCPU {
      * dispatcher resolves the TEB the macOS-14 kernel would have, instead of
      * reading cthread-relative junk (the 0x3fff66748 / [0x8ffff8] crash). */
     uint64_t wine_teb_base;
+    /* Cross-thread cooperative-stop / interrupt poll word. Set to non-zero by
+     * ocerz_vm_request_exit() (from ANY thread) for every live CPU registered in
+     * the run loop; the run-loop header re-reads it every block today. It exists
+     * as a DEDICATED per-CPU word (not the shared vm->exited, and distinct from
+     * `terminated`, which stays a thread's own self-death signal) so that once
+     * the JIT chains hot self-loops -- which stop returning to the run-loop
+     * header -- a BACK-EDGE POLL can observe a process-wide/cross-thread stop
+     * with a single `ldr w,[x20,#off]; cbnz` off the pinned CPU pointer, instead
+     * of loading the unrelated `vm` and its `exited` field. Written/read with
+     * atomics on the slow (setter) side; the future JIT poll reads it as a plain
+     * load (a stale 0 costs at most one more loop iteration, which is fine for a
+     * stop signal). Placed last so it sits in its own trailing cache line: the
+     * cross-thread store that sets it never invalidates the hot gpr[] line. */
+    volatile int interrupt;
+    /* Return-address-stack return predictor for the JIT (STEP 1). A PURE HINT:
+     * correctness never depends on it. When the JIT inlines a direct CALL it
+     * records the return address together with the host entry of the block that
+     * begins there (if already compiled); when it inlines the matching RET it
+     * checks the top entry against the value it actually popped and, only on an
+     * exact match with a non-NULL host entry, branches straight into that block
+     * instead of returning to ocerz_jit_step's hash dispatch. ANY mismatch,
+     * empty stack, NULL entry, or a guest that manipulated its own stack falls
+     * through to today's dispatch, so a stale or wrong prediction can only cost a
+     * dispatch, never correctness. Measured miss rate on recursive code is
+     * ~0.00003%. Placed after `interrupt`, off the hot gpr[] cache line; unused
+     * (ras_top stays 0, nothing branches on it) unless the JIT emits the RAS
+     * code, so it is inert when OCERZ_NO_RAS=1.
+     *
+     * DEPTH 256, not 32: the stack must be deeper than the guest's live call
+     * nesting or it SATURATES and the predictor dies. A push past the top is
+     * dropped, so once the stack fills the entries at the top are stale deep
+     * frames that no shallow return ever matches -- the pop never fires, the top
+     * stays pinned, and every return falls through to dispatch. Measured directly:
+     * with a 32-entry stack fib(34) (recursion depth 33) saturated within the
+     * first 32 calls, dropped every subsequent push, and RAS produced NO speedup;
+     * a 256-entry stack has zero drops on the same workload, ~100% of returns
+     * predict a valid host entry, and the call two-point metric improves ~5%. 256
+     * covers ordinary call nesting cheaply (4 KB, off the hot line, touched only
+     * at its live prefix); pathologically deeper guests simply revert to dispatch
+     * for the frames past 256, which is correct, just unaccelerated. */
+    uint32_t ras_top;
+    struct { uint64_t guest_rip; void *host_entry; } ras[256];
 } OcerzCPU;
+
+#define OCERZ_RAS_SIZE 256
 
 /* A gs base is "TEB-band" (a Wine TEB, what PE code runs with, ~0x7ffd8000) when
  * it is neither the arena-resident unix cthread base (> 0x380000000) nor a tiny

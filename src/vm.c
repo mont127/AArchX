@@ -78,11 +78,60 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <sched.h>
 
 #define OCERZ_CALL_SENTINEL 0x00000000deadca11ull
 
 static OcerzVM *g_vm;
 static __thread OcerzCPU *g_cur_cpu;
+
+/* ---- Cross-thread interrupt registry --------------------------------------
+ *
+ * Every guest thread's top-level OcerzCPU registers here for the lifetime of its
+ * ocerz_vm_run_cpu loop (the main CPU and every bsdthread/workqueue worker). A
+ * guest thread stops itself synchronously today -- it sets its OWN cpu->terminated
+ * inside a syscall (bsdthread_terminate, workq THREAD_RETURN) or vm->exited via
+ * exit(2), and its run-loop header notices at the next block boundary. There is
+ * NO path by which one thread asynchronously stops another that is busy in a
+ * compute loop: the existing cross-thread kick (async_sig_handler / SIGUSR1) only
+ * takes effect at a forwarded-syscall return boundary, so a pure ALU/mem/br
+ * self-loop with no syscalls is unreachable by it.
+ *
+ * That is exactly the loop the JIT is about to CHAIN. A chained self-loop
+ * (jcc -> its own rip) never returns to the run-loop header, so it would never
+ * re-check vm->exited/terminated and would HANG the process on any cross-thread
+ * exit. The safety net is a BACK-EDGE POLL of one per-CPU word (cpu->interrupt);
+ * for that single word to be correct for a PROCESS-WIDE exit, whoever requests
+ * the exit must set it on every live CPU. This registry is that broadcast list,
+ * and ocerz_vm_request_exit is the one writer. */
+#define OCERZ_MAX_CPUS 512
+static OcerzCPU *g_cpus[OCERZ_MAX_CPUS];
+static int g_cpus_n;
+static pthread_mutex_t g_cpus_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ocerz_cpu_register(OcerzCPU *cpu)
+{
+    pthread_mutex_lock(&g_cpus_lock);
+    if (g_cpus_n < OCERZ_MAX_CPUS)
+        g_cpus[g_cpus_n++] = cpu;
+    /* Overflow (more than 512 live guest threads) is not fatal: an unregistered
+     * CPU simply misses the broadcast and falls back to the run-loop header's own
+     * vm->exited check, which chaining will still honor via its dispatcher exit. */
+    pthread_mutex_unlock(&g_cpus_lock);
+}
+
+static void ocerz_cpu_unregister(OcerzCPU *cpu)
+{
+    pthread_mutex_lock(&g_cpus_lock);
+    for (int i = 0; i < g_cpus_n; i++) {
+        if (g_cpus[i] == cpu) {
+            g_cpus[i] = g_cpus[--g_cpus_n];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_cpus_lock);
+}
 
 /* Pending ASYNCHRONOUS guest signals for THIS thread (a bitmask of signo, 1..31).
  * The macOS kernel delivers __pthread_kill(thread_port, signo) to a named thread
@@ -1202,8 +1251,18 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
 
 void ocerz_vm_request_exit(OcerzVM *vm, int code)
 {
-    vm->exited = 1;
     vm->exit_code = code;
+    __atomic_store_n(&vm->exited, 1, __ATOMIC_SEQ_CST);
+    /* Broadcast the stop to every live guest thread's back-edge poll word. A
+     * thread spinning in a (future) JIT-chained self-loop observes only this
+     * per-CPU word, never the shared vm->exited, so set it on all of them under
+     * the registry lock. The lock is also the store barrier that publishes
+     * exit_code + exited to the woken threads. Callable from any thread (a guest
+     * thread's exit(2), or a cross-thread stop requester). */
+    pthread_mutex_lock(&g_cpus_lock);
+    for (int i = 0; i < g_cpus_n; i++)
+        __atomic_store_n(&g_cpus[i]->interrupt, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&g_cpus_lock);
 }
 
 int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
@@ -1217,7 +1276,12 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     g_sig_recover = &jb;
     sigsetjmp(jb, 1);
     g_cur_cpu = cpu;
-    while (!vm->exited && !cpu->terminated) {
+    ocerz_cpu_register(cpu);
+    /* cpu->interrupt is the dedicated cross-thread stop poll (see the registry
+     * comment). It is redundant with vm->exited today -- the header re-checks
+     * both every block -- but it is the ONE per-CPU word a future chained
+     * self-loop's back-edge poll will read, so it is authoritative here too. */
+    while (!vm->exited && !cpu->terminated && !cpu->interrupt) {
         g_riphist[g_riphist_n++ & 31] = cpu->rip;
         int r;
         if (ocerz_exc_trap && cpu->rip == ocerz_exc_trap)
@@ -1263,16 +1327,47 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
             fprintf(stderr, "\nocerz: %llu instructions executed\n",
                     (unsigned long long)vm->insn_count);
             g_sig_recover = prev_recover;
+            ocerz_cpu_unregister(cpu);
             return 125;
         }
     }
     g_sig_recover = prev_recover;
+    ocerz_cpu_unregister(cpu);
     return vm->exit_code;
+}
+
+/* Test-only cross-thread stop hook (off unless OCERZ_TEST_ASYNC_STOP_ICOUNT is
+ * set). Spawned as a genuinely SEPARATE host thread so it exercises the exact
+ * async path the JIT chaining safety net must survive: it waits until the guest
+ * has run past startup (a deterministic instruction-count threshold, so any
+ * pre-spin stdout is already emitted), then calls ocerz_vm_request_exit from a
+ * thread that is NOT the one running the guest loop. A guest sitting in a tight
+ * self-loop must then be stopped ONLY through the interrupt poll / broadcast --
+ * there is no syscall boundary for the older async-signal kick to use. This is
+ * how tests/guest/interrupt_test proves the poll is load-bearing. */
+static void *ocerz_test_async_stop(void *p)
+{
+    OcerzVM *vm = (OcerzVM *)p;
+    const char *icn = getenv("OCERZ_TEST_ASYNC_STOP_ICOUNT");
+    uint64_t thresh = icn ? strtoull(icn, NULL, 0) : 500000;
+    while (!__atomic_load_n(&vm->exited, __ATOMIC_RELAXED) &&
+           __atomic_load_n(&vm->insn_count, __ATOMIC_RELAXED) < thresh)
+        sched_yield();
+    ocerz_vm_request_exit(vm, 0);
+    return NULL;
 }
 
 int ocerz_vm_run(OcerzVM *vm)
 {
     ocerz_vm_install_handlers(vm);
+    if (getenv("OCERZ_TEST_ASYNC_STOP_ICOUNT")) {
+        pthread_t th;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        pthread_create(&th, &at, ocerz_test_async_stop, vm);
+        pthread_attr_destroy(&at);
+    }
     int rc = ocerz_vm_run_cpu(vm, &vm->cpu);
     OCERZ_LOG("guest exited with code %d after %llu instructions\n",
               vm->exit_code, (unsigned long long)vm->insn_count);
