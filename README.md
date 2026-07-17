@@ -39,7 +39,7 @@ make check                                                 # build + run every t
 
 ## Highlights
 
-- **Its own everything.** Loader, decoder, interpreter, JIT, dynamic linker, syscall layer. No Rosetta, no QEMU, no LLVM.
+- **Its own everything.**(PLANNED) Loader, decoder, interpreter, JIT, dynamic linker, syscall layer. No Rosetta, no QEMU, no LLVM.
 - **Bit-exact flags.** `flags.c` is an eager, bit-for-bit x86 reference the JIT must match — including architecturally-undefined flags, ADC/SBB carry-in relations, and x86 NaN semantics. A differential suite proves interpreter ≡ JIT.
 - **A real dyld.** Maps the live shared cache at slide 0, walks export tries (re-exports, absolute symbols), applies chained fixups, runs initializers in dependency order, and performs the full objc↔dyld handshake.
 - **Runs real apps.** Real Cocoa apps reach window creation on the live WindowServer.
