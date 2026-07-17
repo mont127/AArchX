@@ -110,6 +110,27 @@ static void b_ldrsw(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scra
 static void b_ldsb(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 1, 1, 0, 0); a64_ldrsb(b, 1, 0, 0, 0); a64_ret(b); }
 static void b_ldrh(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 2, 1, 0, 2); a64_ldr(b, 2, 0, 0, 2); a64_ret(b); }
 
+/* The sign-extending loads at a NONZERO offset. This is not redundant with
+ * b_ldrsw/b_ldsb above, and the difference is the whole point: at offset 0 the
+ * unsigned-offset encoding and the LDUR/pre/post-index encoding both degenerate
+ * to [base + 0] and behave identically, so an offset-0 test passes under either
+ * one. a64_ldrsb/ldrsh/ldrsw were originally emitted against the LDUR base
+ * (0x38/0x78/0xb8, bit 24 clear) while scaling the offset as the unsigned-offset
+ * form requires — a real bug that these offset-0 cases could not see, and that
+ * stayed latent only because the three helpers had no callers until
+ * src/jit.c:emit_imul. Every call site passes GPR_OFF(reg) = reg*8, i.e. a
+ * nonzero scaled offset, so that is what is pinned here.
+ *
+ * Each case stores a known value through a KNOWN-GOOD encoder (a64_str, covered
+ * by b_str8_off) at scratch[5] and then reads it back with the sign-extending
+ * load at the SAME byte offset. A wrong offset field reads a different slot —
+ * scratch[] is pre-poisoned so a stray slot cannot coincidentally hold the
+ * expected value — and a writeback-mode misencode would corrupt the base
+ * register and change the address of the load itself. */
+static void b_ldrsw_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 4, 1, 2, 8 * 5); a64_ldrsw(b, 0, 2, 8 * 5); a64_ret(b); }
+static void b_ldrsb_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 1, 1, 2, 8 * 5); a64_ldrsb(b, 1, 0, 2, 8 * 5); a64_ret(b); }
+static void b_ldrsh_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 2, 1, 2, 8 * 5); a64_ldrsh(b, 1, 0, 2, 8 * 5); a64_ret(b); }
+
 /* The flag-emission building blocks the JIT relies on. cset after subs/adds
  * must map arm64 NZCV exactly the way the x86-flag translation depends on:
  * SUB borrow is carry-CLEAR (A64_CC), ADD carry is carry-SET (A64_CS), signed
@@ -141,6 +162,100 @@ static void b_parity_fold(A64Buf *b)
  * zero-extending op). */
 static void b_str8_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_ldr(b, 8, 0, 2, 8 * 5); a64_ret(b); }
 static void b_str4_zx(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_mov_imm64(b, 1, 0); a64_str(b, 8, 1, 2, 0); a64_add_reg(b, 0, 1, 0, A64_ZR, 0); a64_str(b, 8, 1, 2, 0); a64_ldr(b, 8, 0, 2, 0); a64_ret(b); }
+
+/* ---- Emitters the optimization plan (chaining, RAS, regalloc) relies on and
+ * that had no executed caller before: a64_try_patch_b (range-checked B patch),
+ * a64_br to high temp regs, stp/ldp at an immediate offset off a non-sp base
+ * (x20 = cpu), and w-form arithmetic writing the callee-saved x21-x28 file. Any
+ * of these silently mis-encoded would corrupt live state in the JIT, so each is
+ * emitted and EXECUTED here exactly as the plan will call it. */
+
+static int g_last_ok;
+
+/* In-range B patch via the range-checked helper: the B is patched to skip the
+ * 111 block and fall into the 222 block. Records the helper's return in
+ * g_last_ok so the caller can assert it reported success. */
+static void b_bpatch(A64Buf *b)
+{
+    uint32_t *j = a64_label(b);
+    a64_b(b, 0);
+    a64_mov_imm64(b, 0, 111);
+    a64_ret(b);
+    uint32_t *tgt = a64_label(b);
+    g_last_ok = a64_try_patch_b(j, tgt);
+    a64_mov_imm64(b, 0, 222);
+    a64_ret(b);
+}
+
+/* br to a register: the entry moves the caller's x0 into the register under
+ * test and brs to it; the target is a stub laid out right after in the same
+ * buffer that returns 222, whose absolute address the runner passes in x0. A
+ * wrong Rn field jumps somewhere other than the stub. Pins br x16 (the JIT's
+ * slow-call target) and br x9 (a general temp). Returns 0 on failure. */
+static uint64_t run_br(int reg)
+{
+    A64Buf b = emit_begin();
+    uint32_t *entry = a64_label(&b);
+    a64_mov_reg(&b, 1, reg, 0);   /* xReg = x0 (the stub address) */
+    a64_br(&b, reg);
+    uint32_t *stub = a64_label(&b);
+    a64_mov_imm64(&b, 0, 222);
+    a64_ret(&b);
+    emit_end(&b);
+    fn2 f = (fn2)(void *)entry;
+    return f((uint64_t)(uintptr_t)stub, 0);
+}
+
+/* stp/ldp at an immediate offset off x20 (the cpu base register the JIT pins):
+ * store x0,x1 into g_scratch[2],[3] via x20+16, read them back into x2,x3, and
+ * return x2+x3. x20/x21 are callee-saved so they are preserved around the use. */
+static void b_stp_ldp_off_x20(A64Buf *b)
+{
+    a64_stp_pre(b, 20, 21, 31, -16);
+    a64_mov_imm64(b, 20, (uint64_t)(uintptr_t)g_scratch);
+    a64_stp_off(b, 0, 1, 20, 16);
+    a64_ldp_off(b, 2, 3, 20, 16);
+    a64_ldp_post(b, 20, 21, 31, 16);
+    a64_add_reg(b, 1, 0, 2, 3, 0);
+    a64_ret(b);
+}
+
+/* 32-bit add writing a high callee-saved register (x21): w21 = w0 + w1 must
+ * zero the upper half of x21, then x0 = x21. a=0xffffffff, b=2 wraps to 1. */
+static void b_wform_x21(A64Buf *b)
+{
+    a64_stp_pre(b, 21, 22, 31, -16);
+    a64_add_reg(b, 0, 21, 0, 1, 0);
+    a64_mov_reg(b, 1, 0, 21);
+    a64_ldp_post(b, 21, 22, 31, 16);
+    a64_ret(b);
+}
+
+/* Return-value/field checks for a64_try_patch_b at the exact +-(2^25-1) word
+ * boundary and one word beyond, with no execution (a 128MB branch cannot be
+ * laid out here). A rejected patch must leave the word untouched. */
+static void test_try_patch_b_range(void)
+{
+    uint32_t w;
+    uint32_t *at = &w;
+    const ptrdiff_t MAXP = (1 << 25) - 1;
+
+    w = 0x14000000u;
+    CHECK(a64_try_patch_b(at, at + MAXP) == 1, "try_patch_b +(2^25-1) accepted");
+    CHECK((w & 0x03ffffffu) == (uint32_t)MAXP, "try_patch_b +(2^25-1) field");
+
+    w = 0x14000000u;
+    CHECK(a64_try_patch_b(at, at + (MAXP + 1)) == 0, "try_patch_b +2^25 rejected");
+    CHECK(w == 0x14000000u, "try_patch_b +2^25 leaves word untouched");
+
+    w = 0x14000000u;
+    CHECK(a64_try_patch_b(at, at - (1 << 25)) == 1, "try_patch_b -2^25 accepted");
+    CHECK((w & 0x03ffffffu) == ((uint32_t)(-(1 << 25)) & 0x03ffffffu), "try_patch_b -2^25 field");
+
+    w = 0x14000000u;
+    CHECK(a64_try_patch_b(at, at - (1 << 25) - 1) == 0, "try_patch_b -(2^25+1) rejected");
+    CHECK(w == 0x14000000u, "try_patch_b -(2^25+1) leaves word untouched");
+}
 
 static void b_branch(A64Buf *b)
 {
@@ -209,6 +324,15 @@ int main(void)
     CHECK(run2(b_adcs, 7, 0) == 8, "adcs with carry");
     CHECK(run2(b_ldrsw, 0, 0xfffffff0ull) == (uint64_t)(int64_t)(int32_t)0xfffffff0, "ldrsw");
     CHECK(run2(b_ldsb, 0, 0x80) == (uint64_t)-128, "ldrsb");
+    /* The sign-extending loads at a NONZERO offset — the encoding the JIT
+     * actually uses (GPR_OFF(reg) = reg*8) and the one the offset-0 cases just
+     * above are blind to. See the b_ldrs*_off builders. Poison every slot first
+     * so a load from the WRONG slot cannot accidentally return the right value. */
+    for (int i = 0; i < 16; i++)
+        g_scratch[i] = 0x5a5a5a5a5a5a5a5aull;
+    CHECK(run2(b_ldrsw_off, 0, 0xfffffff0ull) == (uint64_t)(int64_t)(int32_t)0xfffffff0, "ldrsw nonzero offset");
+    CHECK(run2(b_ldrsb_off, 0, 0x80) == (uint64_t)-128, "ldrsb nonzero offset");
+    CHECK(run2(b_ldrsh_off, 0, 0x8000) == (uint64_t)-32768, "ldrsh nonzero offset");
     CHECK(run2(b_ldrh, 0, 0xbeef) == 0xbeef, "ldrh scaled offset");
     CHECK(run2(b_branch, 1, 2) == 222, "bcond taken (NE)");
     CHECK(run2(b_branch, 1, 1) == 111, "bcond not taken (EQ)");
@@ -232,6 +356,16 @@ int main(void)
     CHECK(run2(b_parity_fold, 0x1234, 0) == 0, "parity reads low byte only (0x34 odd)");
     CHECK(run2(b_str8_off, 0, 0xdeadbeefcafef00dull) == 0xdeadbeefcafef00dull, "str/ldr 8 scaled offset");
     CHECK(run2(b_str4_zx, 0xffffffffull, 0) == 0xffffffffull, "w-op zero-extends, full slot stored");
+
+    /* Plan-required emitters: range-checked B patch, br to high regs, stp/ldp
+     * off x20, and w-form arithmetic on the callee-saved x21-x28 file. */
+    CHECK(run2(b_bpatch, 0, 0) == 222, "a64_try_patch_b in-range patch executes");
+    CHECK(g_last_ok == 1, "a64_try_patch_b in-range reported success");
+    test_try_patch_b_range();
+    CHECK(run_br(16) == 222, "a64_br x16");
+    CHECK(run_br(9) == 222, "a64_br x9");
+    CHECK(run2(b_stp_ldp_off_x20, 5, 7) == 12, "stp/ldp off x20");
+    CHECK(run2(b_wform_x21, 0xffffffffull, 2) == 1, "w-form add writes x21, zero-extends");
 
     if (failures == 0)
         printf("test_a64emit: all encodings validated\n");

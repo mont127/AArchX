@@ -159,21 +159,32 @@ void a64_dmb_ish(A64Buf *b)
     a64_emit32(b, 0xd5033bbfu);
 }
 
+/* Sign-extending loads, UNSIGNED-OFFSET form (LDRSB/LDRSH/LDRSW immediate).
+ *
+ * These three scale `off` by the access size, which is only meaningful for the
+ * unsigned-offset encoding — bit 24 SET. They were originally written against
+ * the 0x38/0x78/0xb8 base (bit 24 CLEAR), which is the LDUR/pre-index/post-index
+ * family: there the scaled offset lands in imm9 at bits[20:12] and bits[11:10]
+ * become the addressing MODE, so `a64_ldrsw(rt, rn, 0x60)` assembled as
+ * `ldursw rt,[rn,#6]` — the wrong slot entirely, and for other offsets the mode
+ * bits could have selected a WRITE-BACK form that mutates the base register
+ * (x20 = cpu at every call site here). All three had zero callers until
+ * emit_imul, so the defect had never been reachable. */
 void a64_ldrsb(A64Buf *b, int sf, int rt, int rn, uint32_t off)
 {
     uint32_t opc = sf ? 2u : 3u;
-    a64_emit32(b, 0x38000000u | (opc << 22) | (off << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+    a64_emit32(b, 0x39000000u | (opc << 22) | (off << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
 void a64_ldrsh(A64Buf *b, int sf, int rt, int rn, uint32_t off)
 {
     uint32_t opc = sf ? 2u : 3u;
-    a64_emit32(b, 0x78000000u | (opc << 22) | ((off / 2) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+    a64_emit32(b, 0x79000000u | (opc << 22) | ((off / 2) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
 void a64_ldrsw(A64Buf *b, int rt, int rn, uint32_t off)
 {
-    a64_emit32(b, 0xb8800000u | ((off / 4) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+    a64_emit32(b, 0xb9800000u | ((off / 4) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
 static void addsub_imm(A64Buf *b, uint32_t base, int sf, int rd, int rn, uint32_t imm12)
@@ -326,6 +337,18 @@ void a64_patch_b(uint32_t *at, uint32_t *target)
 {
     int32_t off = (int32_t)(target - at);
     *at = (*at & 0xfc000000u) | ((uint32_t)off & 0x03ffffffu);
+}
+
+int a64_try_patch_b(uint32_t *at, uint32_t *target)
+{
+    /* imm26 is a signed word offset; B reaches [-(2^25), 2^25-1] words. Reject
+     * anything that would not round-trip through the 26-bit field so we never
+     * silently truncate a far target into a bogus in-range branch. */
+    ptrdiff_t off = target - at;
+    if (off < -(ptrdiff_t)(1 << 25) || off > (ptrdiff_t)((1 << 25) - 1))
+        return 0;
+    *at = (*at & 0xfc000000u) | ((uint32_t)(int32_t)off & 0x03ffffffu);
+    return 1;
 }
 
 void a64_patch_bcond(uint32_t *at, uint32_t *target)
