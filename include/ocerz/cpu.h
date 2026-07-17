@@ -7,9 +7,15 @@
  * 4=RSP 5=RBP 6=RSI 7=RDI 8..15=R8..R15. OCERZ_REG_NONE (0xff) marks an
  * absent base/index register in decoded memory operands.
  *
- * rflags is kept EAGERLY: every flag-writing instruction updates the live
- * bits immediately through the helpers in flags.h, so rflags can always be
- * read or pushed without lazy materialization. Bit layout follows the
+ * rflags is architecturally current at every point that can OBSERVE it. In the
+ * INTERPRETER that is every instruction boundary: each flag-writing instruction
+ * updates the live bits immediately through the helpers in flags.h. The JIT
+ * tier skips flag writes it proves dead (see src/flags_live.c), so between two
+ * inlined arithmetic ops a bit may briefly hold a stale value -- but never at
+ * any point that can read it: a block boundary, a slow-path call, a Jcc, or a
+ * faulting instruction all force every flag live. Anything reading rflags from
+ * outside the JIT's emitted code (PUSHF, a signal mcontext, ocerz_cpu_dump)
+ * therefore still sees architecturally correct values. Bit layout follows the
  * architecture: CF bit0, fixed-1 bit1, PF bit2, AF bit4, ZF bit6, SF bit7,
  * TF bit8, IF bit9, DF bit10, OF bit11. User code on macOS always runs with
  * IF set; ocerz_cpu_reset() initializes rflags to 0x202.

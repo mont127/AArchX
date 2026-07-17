@@ -83,15 +83,45 @@
  *     SHL/SHR/SAR. The arm64 op runs in a w- or x-register (a w-op zero-
  *     extends, matching x86's 32-bit upper-clear), the result is stored to
  *     the slot for non-comparison forms, and the six x86 arithmetic flags
- *     are computed natively into cpu->rflags. Because rflags is kept eager,
- *     a mixed block of inlined and slow-path instructions stays coherent:
- *     the slow path reads and writes the same live bits.
- *   - The Jcc terminator: it reads cpu->rflags (always current), reproduces
+ *     are computed natively into cpu->rflags -- but ONLY the ones a backward
+ *     liveness pass proves something downstream reads (see LAZY FLAGS below).
+ *     A mixed block of inlined and slow-path instructions stays coherent
+ *     because every slow-path op is modelled as reading all six flags, so a
+ *     flag is never dead across one.
+ *   - The Jcc terminator: it reads cpu->rflags (current for every flag it can
+ *     read, since a block's last instruction is forced live-out=all), reproduces
  *     ocerz_cc_eval's predicate tree, csel's cpu->rip between the two
  *     compile-time-constant target rips (taken = ops[0].imm, fallthrough =
  *     rip+len), and returns STEP_OK so the dispatcher re-enters at the new
  *     rip. A native terminator must set the return value to STEP_OK itself,
  *     since no preceding slow call is guaranteed to have left it there.
+ *
+ * LAZY FLAGS. The emitters above compute only the flags a backward liveness
+ * pass (in translate(), over the def/use table in src/flags_live.c) proves
+ * something downstream actually reads. Inside a block each arithmetic op's
+ * flags are almost always killed by the next one: on the alu benchmark's hot
+ * 26-instruction block, 101 of 107 flag writes (94.4%) are dead, and dropping
+ * them takes that block from 644 emitted arm64 words to 142 (24.8 -> 5.5 per
+ * guest instruction).
+ *
+ * Soundness rests on three rules, all conservative in the same direction:
+ *   - a block's LAST instruction is forced live-out = all six (no cross-block
+ *     analysis exists, and a successor/handler/interpreter may read anything);
+ *   - every op not in the whitelist reads all six and kills none, so an
+ *     unmodelled instruction degrades to the old eager behaviour, never to a
+ *     wrong answer;
+ *   - anything that can FAULT reads all six, because a signal handler is
+ *     unpredicted control flow that can observe rflags in its mcontext.
+ * OCERZ_NO_LAZYFLAGS=1 restores eager emission for A/B measurement.
+ *
+ * MEASURED, and worth knowing before optimizing further: that 4.5x reduction in
+ * emitted words bought only 1.45x of wall clock on alu (3.32s -> 2.30s, same
+ * binary, env-switched). Emitted-instruction count is therefore NOT the currency
+ * it looks like -- IPC fell from ~4.85 to ~1.55, i.e. the eager flag code was
+ * independent work that filled issue slots, and removing it exposed the guest's
+ * own serial dependency chain through the MEMORY-BACKED register file as the
+ * real critical path. The next real lever is keeping guest GPRs in host
+ * registers (shortening that chain), not emitting fewer instructions.
  *
  * Native flag emission matches src/flags.c bit for bit (the differential
  * gate over PUSHF-captured rflags enforces this). The translator computes
@@ -135,6 +165,7 @@
 #include "ocerz/decode.h"
 #include "ocerz/interp.h"
 #include "ocerz/flags.h"
+#include "ocerz/flags_live.h"
 #include "ocerz/a64emit.h"
 #include "ocerz/dyldapi.h"
 
@@ -247,6 +278,11 @@ struct OcerzJit {
  * sample. Inlined executions are derived from per-block exec_count * n_inlined.
  * All counters are relaxed atomics touched only when the env var is set. */
 int ocerz_perfstat = -1;
+/* OCERZ_FLAGLIVE: dump per-block flag-liveness effectiveness at translate time.
+ * Set once at jit init, read only from the cold translate path. */
+static int g_flaglive_log;
+/* OCERZ_NO_LAZYFLAGS: force eager flag emission (see the liveness pass). */
+static int g_no_lazyflags;
 static _Atomic unsigned long long ps_ops[OCERZ_OP_COUNT];
 static _Atomic unsigned long long ps_slow_insns;
 static _Atomic unsigned long long ps_steps, ps_hits, ps_misses;
@@ -294,8 +330,19 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
             ((insn->ops[0].size == 4 || insn->ops[0].size == 8) &&
              insn->ops[0].kind == OCERZ_OPK_REG && !insn->ops[0].high8) ? 0 : 1]++;
     } else if (o == OCERZ_OP_CALL || o == OCERZ_OP_RET) {
-        ps_shape[o == OCERZ_OP_CALL ? 4 : 5][
-            (o == OCERZ_OP_CALL && insn->ops[0].kind == OCERZ_OPK_IMM) ? 0 : 1]++;
+        /* The easy shape differs per op, and conflating them is how RET came to
+         * read "never inlineable": the old condition was
+         *   (o == OCERZ_OP_CALL && ops[0].kind == IMM)
+         * which is ALWAYS false on the RET arm, so every RET landed in column 1.
+         * CALL is easy when it is the direct/imm form (an indirect call needs a
+         * computed target). RET is easy when it is the plain near form, i.e.
+         * nops == 0; `ret imm16` (nops == 1) also adjusts RSP and is the
+         * awkward remainder. Note RET has NO operands in the easy form, so the
+         * old code also read ops[0] on a zero-operand insn. */
+        if (o == OCERZ_OP_CALL)
+            ps_shape[4][insn->ops[0].kind == OCERZ_OPK_IMM ? 0 : 1]++;
+        else
+            ps_shape[5][insn->nops == 0 ? 0 : 1]++;
     }
 }
 
@@ -396,15 +443,21 @@ static void emit_pf(A64Buf *b, int res)
 }
 
 /* ZF/SF: read from the arm64 NZCV the sized op just produced. ZF<-Z (EQ),
- * SF<-N (MI), placed at their x86 bit positions, OR'd into the accumulator. */
-static void emit_zf_sf(A64Buf *b)
+ * SF<-N (MI), placed at their x86 bit positions, OR'd into the accumulator.
+ * Each half is emitted only when `m` asks for it (see the liveness pass in
+ * translate); m==0 emits nothing and leaves NZCV untouched. */
+static void emit_zf_sf(A64Buf *b, uint64_t m)
 {
-    a64_cset(b, JTT, A64_EQ);
-    a64_lsl_imm(b, 0, JTT, JTT, 6);
-    a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-    a64_cset(b, JTT, A64_MI);
-    a64_lsl_imm(b, 0, JTT, JTT, 7);
-    a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+    if (m & OCERZ_ZF) {
+        a64_cset(b, JTT, A64_EQ);
+        a64_lsl_imm(b, 0, JTT, JTT, 6);
+        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+    }
+    if (m & OCERZ_SF) {
+        a64_cset(b, JTT, A64_MI);
+        a64_lsl_imm(b, 0, JTT, JTT, 7);
+        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+    }
 }
 
 /* Fold the accumulated arithmetic flags (in tF) into cpu->rflags, preserving
@@ -447,7 +500,7 @@ static int emit_load_operand(A64Buf *b, const X86Operand *op, int sf, int dst)
  * w-regs for size 4 (zero-extending the upper half exactly as a 32-bit x86
  * write does) and the full 8-byte slot is stored for the writing forms. Flags
  * are then computed into cpu->rflags to match flags.c bit for bit. */
-static int emit_arith(A64Buf *b, const X86Insn *insn)
+static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
@@ -479,44 +532,51 @@ static int emit_arith(A64Buf *b, const X86Insn *insn)
     case OCERZ_OP_XOR: a64_eor_reg(b, sf, JT2, JT0, JT1, 0); break;
     default: return 0;
     }
-    if (is_logic && op != OCERZ_OP_AND && op != OCERZ_OP_TEST) {
-        /* orr/eor do not set NZCV; recompute Z/N with a flag-setting compare
-         * against zero so emit_zf_sf reads valid NZCV. */
-        a64_subs_imm(b, sf, A64_ZR, JT2, 0);
+    /* Only the flags the liveness pass proved someone reads. For a logic op the
+     * bits CF/OF/AF are architecturally CLEARED, and they get that for free:
+     * they are simply never OR'd into the zeroed accumulator, and the commit
+     * below clears exactly the bits in `need`. */
+    if (need & (OCERZ_ZF | OCERZ_SF)) {
+        if (is_logic && op != OCERZ_OP_AND && op != OCERZ_OP_TEST) {
+            /* orr/eor do not set NZCV; recompute Z/N with a flag-setting compare
+             * against zero so emit_zf_sf reads valid NZCV. Needed only when a
+             * flag that actually comes from NZCV is live. */
+            a64_subs_imm(b, sf, A64_ZR, JT2, 0);
+        }
     }
 
     if (writes)
         a64_str(b, 8, JT2, 20, GPR_OFF(d->reg));
 
+    if (need == 0)
+        return 1;   /* every flag this op writes is dead: emit no flag code */
+
     a64_mov_imm64(b, JTF, 0);
-    emit_zf_sf(b);
-    emit_pf(b, JT2);
-    if (is_add) {
-        a64_cset(b, JTT, A64_CS);
-        a64_lsl_imm(b, 0, JTT, JTT, 0);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-        a64_cset(b, JTT, A64_VS);
-        a64_lsl_imm(b, 0, JTT, JTT, 11);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-        a64_eor_reg(b, 1, JTT, JT0, JT1, 0);
-        a64_eor_reg(b, 1, JTT, JTT, JT2, 0);
-        a64_ubfx(b, 1, JTT, JTT, 4, 1);
-        a64_lsl_imm(b, 0, JTT, JTT, 4);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-    } else if (is_sub) {
-        a64_cset(b, JTT, A64_CC);
-        a64_lsl_imm(b, 0, JTT, JTT, 0);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-        a64_cset(b, JTT, A64_VS);
-        a64_lsl_imm(b, 0, JTT, JTT, 11);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-        a64_eor_reg(b, 1, JTT, JT0, JT1, 0);
-        a64_eor_reg(b, 1, JTT, JTT, JT2, 0);
-        a64_ubfx(b, 1, JTT, JTT, 4, 1);
-        a64_lsl_imm(b, 0, JTT, JTT, 4);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+    emit_zf_sf(b, need);
+    if (need & OCERZ_PF)
+        emit_pf(b, JT2);
+    if (is_add || is_sub) {
+        /* CF: arm64 C for ADD, !C (carry-clear) for SUB/CMP — the x86 borrow
+         * inversion. OF: arm64 V either way. AF: bit 4 of a^b^res. */
+        if (need & OCERZ_CF) {
+            a64_cset(b, JTT, is_add ? A64_CS : A64_CC);
+            a64_lsl_imm(b, 0, JTT, JTT, 0);
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+        }
+        if (need & OCERZ_OF) {
+            a64_cset(b, JTT, A64_VS);
+            a64_lsl_imm(b, 0, JTT, JTT, 11);
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+        }
+        if (need & OCERZ_AF) {
+            a64_eor_reg(b, 1, JTT, JT0, JT1, 0);
+            a64_eor_reg(b, 1, JTT, JTT, JT2, 0);
+            a64_ubfx(b, 1, JTT, JTT, 4, 1);
+            a64_lsl_imm(b, 0, JTT, JTT, 4);
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+        }
     }
-    emit_commit_flags(b, JIT_ARITH_FLAGS);
+    emit_commit_flags(b, need);
     return 1;
 }
 
@@ -524,13 +584,18 @@ static int emit_arith(A64Buf *b, const X86Insn *insn)
  * positional (INC overflows into the signed minimum, DEC out of it leaving the
  * maximum); AF is the bit-3 half-carry, here (res&0xf)==0 for INC and ==0xf for
  * DEC. ZF/SF/PF follow the result. */
-static int emit_incdec(A64Buf *b, const X86Insn *insn)
+static int emit_incdec(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
         return 0;
     int sf = d->size == 8;
     int is_inc = insn->op == OCERZ_OP_INC;
+
+    /* CF is PRESERVED by INC/DEC, so it is never in this op's def set and the
+     * liveness pass never asks for it here. Assert the invariant rather than
+     * silently emitting a CF this op has no business writing. */
+    need &= JIT_ARITH_FLAGS & ~(uint64_t)OCERZ_CF;
 
     a64_ldr(b, sf ? 8 : 4, JT0, 20, GPR_OFF(d->reg));
     if (is_inc)
@@ -539,30 +604,40 @@ static int emit_incdec(A64Buf *b, const X86Insn *insn)
         a64_subs_imm(b, sf, JT2, JT0, 1);
     a64_str(b, 8, JT2, 20, GPR_OFF(d->reg));
 
+    if (need == 0)
+        return 1;
+
     a64_mov_imm64(b, JTF, 0);
-    emit_zf_sf(b);
-    emit_pf(b, JT2);
+    emit_zf_sf(b, need);
+    if (need & OCERZ_PF)
+        emit_pf(b, JT2);
 
-    uint64_t of_const = is_inc ? ((uint64_t)1 << (d->size * 8 - 1))
-                               : (ocerz_mask(d->size) >> 1);
-    a64_mov_imm64(b, JTU, of_const);
-    a64_subs_reg(b, 1, A64_ZR, JT2, JTU, 0);
-    a64_cset(b, JTT, A64_EQ);
-    a64_lsl_imm(b, 0, JTT, JTT, 11);
-    a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-
-    a64_ubfx(b, 1, JTT, JT2, 0, 4);
-    if (is_inc) {
-        a64_subs_imm(b, 1, A64_ZR, JTT, 0);
+    if (need & OCERZ_OF) {
+        /* OF is positional: INC overflows exactly INTO the signed minimum, DEC
+         * exactly OUT of it, leaving the maximum. */
+        uint64_t of_const = is_inc ? ((uint64_t)1 << (d->size * 8 - 1))
+                                   : (ocerz_mask(d->size) >> 1);
+        a64_mov_imm64(b, JTU, of_const);
+        a64_subs_reg(b, 1, A64_ZR, JT2, JTU, 0);
         a64_cset(b, JTT, A64_EQ);
-    } else {
-        a64_subs_imm(b, 1, A64_ZR, JTT, 0xf);
-        a64_cset(b, JTT, A64_EQ);
+        a64_lsl_imm(b, 0, JTT, JTT, 11);
+        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
     }
-    a64_lsl_imm(b, 0, JTT, JTT, 4);
-    a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
 
-    emit_commit_flags(b, JIT_ARITH_FLAGS & ~(uint64_t)OCERZ_CF);
+    if (need & OCERZ_AF) {
+        a64_ubfx(b, 1, JTT, JT2, 0, 4);
+        if (is_inc) {
+            a64_subs_imm(b, 1, A64_ZR, JTT, 0);
+            a64_cset(b, JTT, A64_EQ);
+        } else {
+            a64_subs_imm(b, 1, A64_ZR, JTT, 0xf);
+            a64_cset(b, JTT, A64_EQ);
+        }
+        a64_lsl_imm(b, 0, JTT, JTT, 4);
+        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+    }
+
+    emit_commit_flags(b, need);
     return 1;
 }
 
@@ -573,7 +648,7 @@ static int emit_incdec(A64Buf *b, const X86Insn *insn)
  * flags.c (SHL: CF^SF, SHR: original MSB, SAR: 0). ZF/SF/PF follow the
  * result. CL-count and shift forms with memory or 8/16-bit operands fall to
  * the slow path. */
-static int emit_shift(A64Buf *b, const X86Insn *insn)
+static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
@@ -598,43 +673,197 @@ static int emit_shift(A64Buf *b, const X86Insn *insn)
     }
     a64_str(b, 8, JT2, 20, GPR_OFF(d->reg));
 
-    a64_subs_imm(b, sf, A64_ZR, JT2, 0);
+    /* SHL's OF is CF^SF read back OUT OF THE ACCUMULATOR (bits 0 and 7), so a
+     * live OF forces CF and SF to be materialized into JTF even when the
+     * liveness pass proved both dead. `emit` is therefore a SUPERSET of `need`.
+     *
+     * That is safe precisely because every bit in `emit` is computed to its
+     * correct architectural value — writing back a correct flag nobody asked
+     * for costs an instruction, never correctness. The commit mask below is
+     * `emit`, not `need`, for exactly that reason: JTF holds `emit`'s bits, and
+     * committing a narrower mask would leave OR'd-in bits unmerged while
+     * committing a wider one would clear bits that were never computed. */
+    uint64_t emit = need;
+    if (op == OCERZ_OP_SHL && (need & OCERZ_OF))
+        emit |= OCERZ_CF | OCERZ_SF;
+
+    if (emit == 0)
+        return 1;
+
+    if (emit & (OCERZ_ZF | OCERZ_SF))
+        a64_subs_imm(b, sf, A64_ZR, JT2, 0);
     a64_mov_imm64(b, JTF, 0);
-    emit_zf_sf(b);
-    emit_pf(b, JT2);
+    emit_zf_sf(b, emit);
+    if (emit & OCERZ_PF)
+        emit_pf(b, JT2);
 
     if (op == OCERZ_OP_SHL) {
-        int cf_bit = bits - (int)cnt;
-        if (cf_bit >= 0 && cf_bit < bits) {
+        if (emit & OCERZ_CF) {
+            int cf_bit = bits - (int)cnt;
+            if (cf_bit >= 0 && cf_bit < bits) {
+                a64_ubfx(b, sf, JTT, JT0, cf_bit, 1);
+                a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+            }
+        }
+        if (emit & OCERZ_OF) {
+            a64_ubfx(b, 1, JTT, JTF, 0, 1);
+            a64_ubfx(b, 1, JTU, JTF, 7, 1);
+            a64_eor_reg(b, 1, JTT, JTT, JTU, 0);
+            a64_lsl_imm(b, 0, JTT, JTT, 11);
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+        }
+    } else if (op == OCERZ_OP_SHR) {
+        if (emit & OCERZ_CF) {
+            int cf_bit = (int)cnt - 1;
             a64_ubfx(b, sf, JTT, JT0, cf_bit, 1);
             a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
         }
-        a64_ubfx(b, 1, JTT, JTF, 0, 1);
-        a64_ubfx(b, 1, JTU, JTF, 7, 1);
-        a64_eor_reg(b, 1, JTT, JTT, JTU, 0);
-        a64_lsl_imm(b, 0, JTT, JTT, 11);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-    } else if (op == OCERZ_OP_SHR) {
-        int cf_bit = (int)cnt - 1;
-        a64_ubfx(b, sf, JTT, JT0, cf_bit, 1);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-        a64_ubfx(b, sf, JTT, JT0, bits - 1, 1);
-        a64_lsl_imm(b, 0, JTT, JTT, 11);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-    } else {
-        int shift = (int)cnt - 1;
-        if (shift > 63)
-            shift = 63;
-        if (sf)
-            a64_asr_imm(b, 1, JTT, JT0, shift);
-        else {
-            a64_sxtw(b, JTT, JT0);
-            a64_asr_imm(b, 1, JTT, JTT, shift);
+        if (emit & OCERZ_OF) {
+            a64_ubfx(b, sf, JTT, JT0, bits - 1, 1);
+            a64_lsl_imm(b, 0, JTT, JTT, 11);
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
         }
-        a64_ubfx(b, 1, JTT, JTT, 0, 1);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+    } else {
+        /* SAR: CF is the last bit shifted out; OF is architecturally 0 and gets
+         * that from the zeroed accumulator plus the commit's clear. */
+        if (emit & OCERZ_CF) {
+            int shift = (int)cnt - 1;
+            if (shift > 63)
+                shift = 63;
+            if (sf)
+                a64_asr_imm(b, 1, JTT, JT0, shift);
+            else {
+                a64_sxtw(b, JTT, JT0);
+                a64_asr_imm(b, 1, JTT, JTT, shift);
+            }
+            a64_ubfx(b, 1, JTT, JTT, 0, 1);
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+        }
     }
-    emit_commit_flags(b, JIT_ARITH_FLAGS);
+    emit_commit_flags(b, emit);
+    return 1;
+}
+
+static int g_no_inline_imul = -1;
+
+static int imul_inline_enabled(void)
+{
+    if (g_no_inline_imul < 0) {
+        const char *e = getenv("OCERZ_NO_INLINE_IMUL");
+        g_no_inline_imul = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return !g_no_inline_imul;
+}
+
+/* Sign-extend an inlineable IMUL source into `dst`, exactly as the interpreter
+ * does with ocerz_sext(ocerz_read_op(...), op->size). Returns 0 for an operand
+ * shape this emitter does not handle. */
+static int emit_imul_src(A64Buf *b, const X86Operand *op, int dst)
+{
+    if (op->kind == OCERZ_OPK_REG) {
+        if (op->high8)
+            return 0;
+        if (op->size == 8)
+            a64_ldr(b, 8, dst, 20, GPR_OFF(op->reg));
+        else if (op->size == 4)
+            a64_ldrsw(b, dst, 20, GPR_OFF(op->reg));
+        else
+            return 0;
+        return 1;
+    }
+    if (op->kind == OCERZ_OPK_IMM) {
+        a64_mov_imm64(b, dst, (uint64_t)ocerz_sext(op->imm, op->size));
+        return 1;
+    }
+    return 0;
+}
+
+/* Two- and three-operand IMUL reg <- reg|imm at size 4/8 (the one-operand
+ * rdx:rax form and every memory form stay on the slow path).
+ *
+ * Both sources are SIGN-EXTENDED first, mirroring op_mul in src/interp.c. At
+ * size 4 the two sext'd int32s multiply exactly into one 64-bit register, so a
+ * single x-form MUL is the whole product; at size 8 the wide product needs
+ * MUL + SMULH.
+ *
+ * flags.c:ocerz_flags_imul sets CF=OF iff the high half is not the sign
+ * extension of the low half, and put_arith rewrites all six arithmetic bits —
+ * so AF is architecturally 0 here (ocerz pins the undefined bit), and it gets
+ * that for free: nothing is ever OR'd into the zeroed accumulator and the
+ * commit clears exactly the bits in `need`. ZF/SF/PF follow the low half.
+ *
+ * The CF/OF test collapses to one compare per size:
+ *   size 8: hi != (lo asr 63)
+ *   size 4: p  != sxtw(p)      (identical predicate, since p IS the wide half)
+ */
+static int emit_imul(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    if (!imul_inline_enabled())
+        return 0;
+    if (insn->op != OCERZ_OP_IMUL || insn->nops < 2 || insn->nops > 3)
+        return 0;
+
+    const X86Operand *d = &insn->ops[0];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
+        return 0;
+    int sf = d->size == 8;
+
+    const X86Operand *s1 = (insn->nops == 3) ? &insn->ops[1] : &insn->ops[0];
+    const X86Operand *s2 = (insn->nops == 3) ? &insn->ops[2] : &insn->ops[1];
+
+    /* The sources must be exactly the destination's width. A narrower REG
+     * source would need a different sext width than emit_imul_src derives from
+     * op->size; an IMM is already carried sign-extended by the decoder, so it
+     * is accepted at any size. */
+    if (s1->kind != OCERZ_OPK_IMM && s1->size != d->size)
+        return 0;
+    if (s2->kind != OCERZ_OPK_IMM && s2->size != d->size)
+        return 0;
+
+    if (!emit_imul_src(b, s1, JT0))
+        return 0;
+    if (!emit_imul_src(b, s2, JT1))
+        return 0;
+
+    a64_mul(b, 1, JT2, JT0, JT1);
+    if (sf && (need & (OCERZ_CF | OCERZ_OF)))
+        a64_smulh(b, JTA, JT0, JT1);
+
+    /* Commit the destination before touching JTT/JTU: emit_pf and emit_zf_sf
+     * both clobber them. A size-4 write zero-extends, matching ocerz_write_op. */
+    if (sf) {
+        a64_str(b, 8, JT2, 20, GPR_OFF(d->reg));
+    } else {
+        a64_mov_reg(b, 0, JTT, JT2);        /* uxtw: keep the low 32 bits */
+        a64_str(b, 8, JTT, 20, GPR_OFF(d->reg));
+    }
+
+    if (need == 0)
+        return 1;
+
+    if (need & (OCERZ_ZF | OCERZ_SF))
+        a64_subs_imm(b, sf, A64_ZR, JT2, 0);
+    a64_mov_imm64(b, JTF, 0);
+    emit_zf_sf(b, need);
+    if (need & OCERZ_PF)
+        emit_pf(b, JT2);
+    if (need & (OCERZ_CF | OCERZ_OF)) {
+        if (sf) {
+            a64_asr_imm(b, 1, JTU, JT2, 63);
+            a64_subs_reg(b, 1, A64_ZR, JTA, JTU, 0);
+        } else {
+            a64_sxtw(b, JTU, JT2);
+            a64_subs_reg(b, 1, A64_ZR, JT2, JTU, 0);
+        }
+        a64_cset(b, JTT, A64_NE);
+        if (need & OCERZ_CF)
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+        if (need & OCERZ_OF) {
+            a64_lsl_imm(b, 0, JTU, JTT, 11);
+            a64_orr_reg(b, 1, JTF, JTF, JTU, 0);
+        }
+    }
+    emit_commit_flags(b, need);
     return 1;
 }
 
@@ -665,21 +894,53 @@ static int mem_native_store_ok(void)
     return ocerz_watch_addr == 0 && ocerz_watch_val == 0;
 }
 
+/* STEP 1 (guest_base fold): the amount of the host displacement folded into
+ * memory-address computation at emit time. host = gaddr + ocerz_guest_base for
+ * the plain affine map, so materializing (disp + fold) instead of disp and
+ * shifting the commpage guard's compare constants by the same fold lets every
+ * inlined access skip its separate `mov JTU,gbase; add` -- 2 words and a
+ * dependent add off the ordered-access chain.
+ *
+ * CRITICAL: this is done ONLY when the low-shadow window is inactive
+ * (ocerz_low_base == 0, i.e. every non-Wine guest). When ocerz_low_base != 0,
+ * addresses below OCERZ_LOW_LIMIT map to gaddr+low_base (NOT gaddr+guest_base),
+ * so folding guest_base into the affine address would be wrong for that arm;
+ * we return 0 here and the guard/callers keep the byte-for-byte pre-existing
+ * gaddr-convention emission. Wine is therefore provably unchanged. */
+static inline uint64_t ea_fold(void)
+{
+    return ocerz_low_base ? 0 : ocerz_guest_base;
+}
+
+/* Add a 64-bit constant to reg via JTU (a dead scratch at every call site here,
+ * re-initialized by the ordered-access helper that follows). Emits nothing when
+ * c == 0, which is how the fold collapses the post-guard +gbase add away. */
+static void emit_add_const(A64Buf *b, int reg, uint64_t c)
+{
+    if (c) {
+        a64_mov_imm64(b, JTU, c);
+        a64_add_reg(b, 1, reg, reg, JTU, 0);
+    }
+}
+
 /* Compute the guest effective address of a base+index*scale+disp memory
  * operand into addr_reg. Returns 0 (not inlineable) for segment overrides,
  * 32-bit address size, and RIP-relative forms with no register inputs are
- * accepted (the absolute disp is materialized directly). */
+ * accepted (the absolute disp is materialized directly). When the fold is
+ * active (ea_fold() != 0) addr_reg ends holding gaddr + guest_base (a host
+ * address); otherwise it holds gaddr exactly as before. */
 static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int addr_reg)
 {
+    uint64_t fold = ea_fold();
     if (insn->seg != OCERZ_SEG_NONE)
         return 0;
     if (op->riprel) {
-        a64_mov_imm64(b, addr_reg, (uint64_t)op->disp);
+        a64_mov_imm64(b, addr_reg, (uint64_t)op->disp + fold);
         return 1;
     }
     if (insn->addrsize == 4)
         return 0;
-    a64_mov_imm64(b, addr_reg, (uint64_t)op->disp);
+    a64_mov_imm64(b, addr_reg, (uint64_t)op->disp + fold);
     if (op->base != OCERZ_REG_NONE) {
         a64_ldr(b, 8, JT0, 20, GPR_OFF(op->base));
         a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
@@ -711,6 +972,12 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
      * this. Skip the whole commpage/top/low guard with ONE unsigned range check instead of ~10
      * instructions of not-taken compares per access -- a large speedup for the 64-bit AppKit cold
      * start that gates macdrv. Patched to the native body at the end. */
+    /* STEP 1: when the fold is active, addr_reg holds gaddr + guest_base, so the
+     * range constants shift by the same fold (window SIZES are unchanged). When
+     * inactive (fold == 0, ocerz_low_base != 0) every constant is identical to
+     * before, so the whole ocerz_low_base branch below is byte-for-byte as it
+     * was. The two are never active together: fold != 0 iff ocerz_low_base == 0. */
+    uint64_t fold = ea_fold();
     uint32_t *to_native = NULL;
     if (ocerz_low_base) {
         a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT);
@@ -720,7 +987,7 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         to_native = a64_label(b);
         a64_bcond(b, A64_CC, 0);   /* (gaddr-LOW_LIMIT) < (TOP_LO-LOW_LIMIT) -> main arena -> native */
     }
-    a64_mov_imm64(b, JTU, OCERZ_COMMPAGE_LO);
+    a64_mov_imm64(b, JTU, OCERZ_COMMPAGE_LO + fold);
     a64_sub_reg(b, 1, JTT, addr_reg, JTU, 0);
     a64_mov_imm64(b, JTU, OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO);
     a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
@@ -815,8 +1082,7 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
             return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         a64_ldr(b, s->size == 8 ? 8 : 4, JT1, 20, GPR_OFF(s->reg));
-        a64_mov_imm64(b, JTU, gbase);
-        a64_add_reg(b, 1, JTA, JTA, JTU, 0);
+        emit_add_const(b, JTA, gbase - ea_fold());   /* 0 when folded into the EA */
         /* GUEST store (JTA = full host address, no displacement), store-release
          * ordered so plain x86 stores keep Total Store Order. JTU is dead here
          * (held gbase) and serves as the helper's alignment-check scratch. */
@@ -830,11 +1096,10 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         if (!emit_mem_ea(b, insn, s, JTA))
             return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-        a64_mov_imm64(b, JTU, gbase);
-        a64_add_reg(b, 1, JTA, JTA, JTU, 0);
+        emit_add_const(b, JTA, gbase - ea_fold());   /* 0 when folded into the EA */
         /* GUEST load (JTA = full host address, no displacement), load-acquire
          * ordered so plain x86 loads keep Total Store Order. JTU is dead here
-         * (held gbase) and serves as the helper's alignment-check scratch. */
+         * and serves as the helper's alignment-check scratch. */
         emit_guest_load_ordered(b, d->size, JT1, JTA, JTU);
         a64_str(b, 8, JT1, 20, GPR_OFF(d->reg));
         a64_patch_b(skip, a64_label(b));
@@ -926,13 +1191,15 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         else
             a64_mov_imm64(b, JT1, o->imm);
 
-        /* (2) address only; no architectural state touched before the guard. */
+        /* (2) address only; no architectural state touched before the guard.
+         * JTA is a dead temp, so folding guest_base into it before the guard
+         * (host convention) moves no architectural state. */
         a64_ldr(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
         a64_sub_imm(b, 1, JTA, JT0, 8);
+        emit_add_const(b, JTA, ea_fold());
 
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-        a64_mov_imm64(b, JTU, gbase);
-        a64_add_reg(b, 1, JTA, JTA, JTU, 0);
+        emit_add_const(b, JTA, gbase - ea_fold());
         /* (3) store, THEN commit rsp: a fault here leaves rsp untouched so the
          * retry pushes to the same address. JT0 survives the helper (it uses
          * rv=JT1, ra=JTA, scratch=JTU). */
@@ -950,10 +1217,10 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         /* (2) address only; the load is what may fault. */
         a64_ldr(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
         a64_mov_reg(b, 1, JTA, JT0);
+        emit_add_const(b, JTA, ea_fold());
 
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-        a64_mov_imm64(b, JTU, gbase);
-        a64_add_reg(b, 1, JTA, JTA, JTU, 0);
+        emit_add_const(b, JTA, gbase - ea_fold());
         emit_guest_load_ordered(b, 8, JT1, JTA, JTU);
         /* (3) rsp increment first, popped value LAST: `pop rsp` must end with
          * rsp = the popped value, exactly as ocerz_pop + ocerz_write_op do. */
@@ -1006,8 +1273,7 @@ static int emit_movsxd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, in
         if (!emit_mem_ea(b, insn, s, JTA))
             return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-        a64_mov_imm64(b, JTU, ocerz_guest_base);
-        a64_add_reg(b, 1, JTA, JTA, JTU, 0);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());   /* 0 when folded */
         emit_guest_load_ordered(b, 4, JT1, JTA, JTU);
         a64_sxtw(b, JT1, JT1);
         a64_str(b, 8, JT1, 20, GPR_OFF(d->reg));
@@ -1022,7 +1288,8 @@ static int emit_movsxd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, in
  * guarded) into the b-operand register, then the identical NZCV+fixup flag
  * computation as the register form runs. Memory-DESTINATION arithmetic (read-
  * modify-write, locked or not) stays on the slow path. */
-static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
+                          uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
@@ -1035,11 +1302,10 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (!emit_mem_ea(b, insn, s, JTA))
         return 0;
     uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-    a64_mov_imm64(b, JTU, ocerz_guest_base);
-    a64_add_reg(b, 1, JTA, JTA, JTU, 0);
+    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());   /* 0 when folded */
     /* GUEST load (JTA = full host address, no displacement), load-acquire
-     * ordered so plain x86 loads keep Total Store Order. JTU is dead here (held
-     * gbase) and serves as the helper's alignment-check scratch. The following
+     * ordered so plain x86 loads keep Total Store Order. JTU is dead here
+     * and serves as the helper's alignment-check scratch. The following
      * ldr reads the destination GPR from the register file, not guest memory. */
     emit_guest_load_ordered(b, sf ? 8 : 4, JT1, JTA, JTU);
     a64_ldr(b, sf ? 8 : 4, JT0, 20, GPR_OFF(d->reg));
@@ -1068,22 +1334,34 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (writes)
         a64_str(b, 8, JT2, 20, GPR_OFF(d->reg));
 
-    a64_mov_imm64(b, JTF, 0);
-    emit_zf_sf(b);
-    emit_pf(b, JT2);
-    if (is_add || is_sub) {
-        a64_cset(b, JTT, is_add ? A64_CS : A64_CC);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-        a64_cset(b, JTT, A64_VS);
-        a64_lsl_imm(b, 0, JTT, JTT, 11);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
-        a64_eor_reg(b, 1, JTT, JT0, JT1, 0);
-        a64_eor_reg(b, 1, JTT, JTT, JT2, 0);
-        a64_ubfx(b, 1, JTT, JTT, 4, 1);
-        a64_lsl_imm(b, 0, JTT, JTT, 4);
-        a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+    if (need != 0) {
+        a64_mov_imm64(b, JTF, 0);
+        emit_zf_sf(b, need);
+        if (need & OCERZ_PF)
+            emit_pf(b, JT2);
+        if (is_add || is_sub) {
+            if (need & OCERZ_CF) {
+                a64_cset(b, JTT, is_add ? A64_CS : A64_CC);
+                a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+            }
+            if (need & OCERZ_OF) {
+                a64_cset(b, JTT, A64_VS);
+                a64_lsl_imm(b, 0, JTT, JTT, 11);
+                a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+            }
+            if (need & OCERZ_AF) {
+                a64_eor_reg(b, 1, JTT, JT0, JT1, 0);
+                a64_eor_reg(b, 1, JTT, JTT, JT2, 0);
+                a64_ubfx(b, 1, JTT, JTT, 4, 1);
+                a64_lsl_imm(b, 0, JTT, JTT, 4);
+                a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+            }
+        }
+        emit_commit_flags(b, need);
     }
-    emit_commit_flags(b, JIT_ARITH_FLAGS);
+    /* The commpage-guard skip label must be patched on EVERY path, including
+     * need==0: the guard's forward branch targets the instruction after this
+     * whole sequence, and skipping the patch would leave it dangling. */
     a64_patch_b(skip, a64_label(b));
     return 1;
 }
@@ -1123,7 +1401,14 @@ static int emit_lea(A64Buf *b, const X86Insn *insn)
     return 1;
 }
 
-static int try_inline(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+/* `need` is the set of flags this instruction WRITES that something downstream
+ * actually READS — computed by the backward liveness pass in translate() and
+ * always a subset of the op's def mask (see include/ocerz/flags_live.h). The
+ * emitters below compute exactly those and skip the rest; need==0 means every
+ * flag this op would have written is dead and no flag code is emitted at all.
+ * Ops that set no flags ignore it. */
+static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
+                      uint32_t **exit_sites, int *n_exits)
 {
     if (insn->op == OCERZ_OP_NOP || insn->op == OCERZ_OP_PAUSE ||
         insn->op == OCERZ_OP_PREFETCH || insn->op == OCERZ_OP_CLFLUSH)
@@ -1164,15 +1449,21 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
     case OCERZ_OP_XOR:
     case OCERZ_OP_TEST:
         if (insn->ops[1].kind == OCERZ_OPK_MEM)
-            return emit_arith_mem(b, insn, exit_sites, n_exits);
-        return emit_arith(b, insn);
+            return emit_arith_mem(b, insn, need, exit_sites, n_exits);
+        return emit_arith(b, insn, need);
     case OCERZ_OP_INC:
     case OCERZ_OP_DEC:
-        return emit_incdec(b, insn);
+        return emit_incdec(b, insn, need);
     case OCERZ_OP_SHL:
     case OCERZ_OP_SHR:
     case OCERZ_OP_SAR:
-        return emit_shift(b, insn);
+        return emit_shift(b, insn, need);
+    case OCERZ_OP_IMUL:
+        if (insn->ops[0].kind == OCERZ_OPK_MEM ||
+            (insn->nops > 1 && insn->ops[1].kind == OCERZ_OPK_MEM) ||
+            (insn->nops > 2 && insn->ops[2].kind == OCERZ_OPK_MEM))
+            return 0;
+        return emit_imul(b, insn, need);
     case OCERZ_OP_LEA:
         return emit_lea(b, insn);
     case OCERZ_OP_PUSH:
@@ -1185,8 +1476,10 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
     }
 }
 
-/* Native Jcc terminator. cpu->rflags is always architecturally current (eager
- * flags), so the condition is evaluated by reproducing ocerz_cc_eval's exact
+/* Native Jcc terminator. cpu->rflags is architecturally current for every flag
+ * a Jcc can read: the liveness pass forces the block's last instruction to have
+ * all six flags live-out, so whichever producer precedes this Jcc materialized
+ * them. The condition is evaluated by reproducing ocerz_cc_eval's exact
  * predicate tree against the live flag bits, never against arm64 NZCV (the
  * flag producer may have been a slow call). cpu->rip is then set to one of two
  * compile-time constants — the taken target ops[0].imm or the fallthrough
@@ -1234,6 +1527,151 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     a64_mov_imm64(b, 0, OCERZ_STEP_OK);
 
     epilogue_sites[*n_epi] = a64_label(b);
+    a64_b(b, 0);
+    (*n_epi)++;
+    return 1;
+}
+
+/* Native CALL(imm)/RET terminators.
+ *
+ * WHY THESE AND WHY NOW. call is by far the worst workload (a two-point
+ * fib(34)/fib(36) regression, which cancels the ~0.024s process-startup term
+ * that makes the 0.039s wall clock unusable as a ratio, puts it at ~29.9x
+ * against Rosetta -- the naive wall-clock ratio reads 12.4x and is wrong).
+ * CALL and RET are 100% of its slow path, split exactly 50/50, and BOTH are in
+ * the easy shape 100% of the time. (The shape counter used to report RET as 0%
+ * easy; that was a classifier bug -- its condition tested `op == CALL` on the
+ * RET arm, so it was false by construction and every RET landed in the awkward
+ * column. See jit_perfstat_one.)
+ *
+ * WHAT MAKES THEM CHEAP TO INLINE. Both reduce to machinery that already
+ * exists and is already differentially proven:
+ *   CALL imm = push(rip+len) ; rip = imm      -- BOTH are compile-time
+ *              constants, so this is emit_push_pop's PUSH-imm arm followed by
+ *              emit_jcc's rip/STEP_OK/exit tail.
+ *   RET      = rip = pop()                    -- emit_push_pop's POP arm with
+ *              cpu->rip as the destination instead of a GPR.
+ * The stack access reuses emit_commpage_guard and emit_guest_{load,store}_
+ * ordered verbatim, so all three of emit_push_pop's documented ordering traps
+ * are handled by construction rather than re-derived here.
+ *
+ * THE RETURN ADDRESS IS NOT cpu->rip. The interpreter does
+ * `ocerz_push(cpu, 8, cpu->rip)`, which reads correctly ONLY because
+ * ocerz_jit_exec_one sets `cpu->rip = insn->rip + insn->len` before dispatching.
+ * There is no exec_one on this path, so the return address is materialized here
+ * as the constant insn->rip + insn->len. Reading RIP_OFF instead would push
+ * whatever the previous instruction left there.
+ *
+ * SIZE IS ALWAYS 8, exactly as the interpreter has it: op_branch calls
+ * ocerz_push(cpu, 8, ...) and ocerz_pop(cpu, 8) unconditionally, ignoring
+ * insn->opsize. This does the same rather than inventing a width check the
+ * reference does not have.
+ *
+ * THE COMMPAGE `skip` MUST LAND PAST THE RIP STORE. The guard's slow path
+ * RE-EXECUTES THE WHOLE INSTRUCTION through the interpreter, which for these
+ * two ops includes setting cpu->rip to the target. If skip landed before the
+ * native rip store, that store would then overwrite the interpreter's correct
+ * target with this block's constant -- right for CALL by luck, catastrophically
+ * wrong for RET. Both arms therefore patch skip to a label AFTER the rip store,
+ * where the two paths converge on the shared STEP_OK/exit tail.
+ *
+ * NOT INLINED, deliberately: indirect CALL (the target is computed, and
+ * ocerz_cftrap must still see it -- note the interpreter's cftrap hook is on
+ * the non-IMM arm only, so inlining the imm form cannot blind it), and
+ * `ret imm16` (nops==1), which additionally adjusts rsp.
+ *
+ * EXPECT THE INLINED FORM TO BE BIGGER than the slow call it replaces (~10
+ * words becomes ~37). That is not a regression: call is round-trip-bound, not
+ * issue-bound, and the win is deleting the interpreter round trip, not words.
+ *
+ * Blocks still TERMINATE here -- this is inlining, not chaining. is_terminator
+ * is untouched on purpose: decoding past a `call` would read the callee's
+ * fall-through bytes, which is the exact class of bug the missing
+ * OCERZ_OP_IRET terminator was. */
+/* A/B kill switch, mirroring OCERZ_NO_INLINE_STACK. That switch is what made
+ * the 19.7 cyc/slow-call figure trustworthy (same binary, no build or machine
+ * drift), and its successor has to be measurable the same way. Read once;
+ * translate() runs under jit_lock and this is a whole-run decision. */
+static int callret_inline_enabled(void)
+{
+    static int en = -1;
+    if (en < 0)
+        en = getenv("OCERZ_NO_INLINE_CALLRET") ? 0 : 1;
+    return en;
+}
+
+static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
+                         int *n_exits, uint32_t **epi_sites, int *n_epi)
+{
+    uint64_t gbase = ocerz_guest_base;
+
+    if (!callret_inline_enabled())
+        return 0;
+    /* A segment override on an implicit-SS stack op is not something the
+     * interpreter honors either (ocerz_push/ocerz_pop go straight to
+     * ocerz_st/ocerz_ld with no segment base); refuse it rather than rely on
+     * that. Mirrors emit_push_pop. */
+    if (insn->seg != OCERZ_SEG_NONE)
+        return 0;
+
+    if (insn->op == OCERZ_OP_CALL) {
+        if (insn->ops[0].kind != OCERZ_OPK_IMM)
+            return 0;
+        if (!mem_native_store_ok())
+            return 0;
+
+        uint64_t retaddr = insn->rip + insn->len;
+        uint64_t target = insn->ops[0].imm;
+
+        /* (1) value first: the return address, as a constant (see above). */
+        a64_mov_imm64(b, JT1, retaddr);
+        /* (2) address only -- no architectural state may move before the guard,
+         * or a commpage-ranged call would decrement rsp here AND again in the
+         * interpreter's re-execution. */
+        a64_ldr(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
+        a64_sub_imm(b, 1, JTA, JT0, 8);
+        emit_add_const(b, JTA, ea_fold());
+
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, gbase - ea_fold());
+        /* (3) store, THEN commit rsp: a fault here must leave rsp untouched so
+         * the retry pushes to the same address. */
+        emit_guest_store_ordered(b, 8, JT1, JTA, JTU);
+        a64_sub_imm(b, 1, JT0, JT0, 8);
+        a64_str(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
+        /* rip = target, only after the push has committed. */
+        a64_mov_imm64(b, JT0, target);
+        a64_str(b, 8, JT0, 20, RIP_OFF);
+        a64_patch_b(skip, a64_label(b));   /* PAST the rip store -- see above */
+    } else if (insn->op == OCERZ_OP_RET) {
+        if (insn->nops != 0)               /* `ret imm16` also moves rsp */
+            return 0;
+
+        /* (2) address only; the load is the faulting point. */
+        a64_ldr(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
+        a64_mov_reg(b, 1, JTA, JT0);
+        emit_add_const(b, JTA, ea_fold());
+
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, gbase - ea_fold());
+        emit_guest_load_ordered(b, 8, JT1, JTA, JTU);
+        /* rsp += 8, then rip = the popped value: ocerz_pop's increment followed
+         * by `cpu->rip = ret`. Distinct locations, and the faulting load is
+         * already behind us, so this order is the interpreter's exactly. */
+        a64_add_imm(b, 1, JT0, JT0, 8);
+        a64_str(b, 8, JT0, 20, GPR_OFF(OCERZ_RSP));
+        a64_str(b, 8, JT1, 20, RIP_OFF);
+        a64_patch_b(skip, a64_label(b));   /* PAST the rip store -- see above */
+    } else {
+        return 0;
+    }
+
+    /* Shared tail, identical to emit_jcc's: STEP_OK in x0, then route to the
+     * block's single epilogue. Reached by BOTH the native body and the guard's
+     * slow path (whose own x0 is already STEP_OK; re-loading it is harmless and
+     * keeps the two paths textually convergent). */
+    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+    epi_sites[*n_epi] = a64_label(b);
     a64_b(b, 0);
     (*n_epi)++;
     return 1;
@@ -1422,6 +1860,67 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         a64_str(&b, 8, JT1, JT0, 0);
     }
 
+    /* ---- BACKWARD FLAG LIVENESS ------------------------------------------
+     * fl_need[i] = the flags insn i writes that something downstream reads, i.e.
+     * def[i] & live_out[i]. The emitter computes exactly those.
+     *
+     * live_out of the LAST instruction is ALL SIX, unconditionally. That single
+     * rule is what makes this pass sound without any cross-block analysis: a
+     * successor block, a signal handler, or the interpreter may read any flag on
+     * entry, and this translator has no idea which. It is also why the win is
+     * real anyway — inside a block, each arithmetic op's flags are almost always
+     * killed by the next one, and only the block's last producer survives.
+     *
+     * A block that runs off the length cap falls through to a successor exactly
+     * like one ending on a terminator, so it needs the same live-out=ALL; the
+     * rule is applied to the last instruction either way and needs no special
+     * case.
+     *
+     * Standard dataflow: live_in = (live_out & ~def) | use. Every entry in the
+     * def/use table is conservative in the safe direction (see
+     * include/ocerz/flags_live.h), so an unmodelled op degrades to today's eager
+     * behaviour rather than to a wrong answer. */
+    uint64_t fl_need[JIT_MAX_BLOCK_INSNS];
+    {
+        uint64_t live_out = OCERZ_FL_ALL;
+        for (int i = n - 1; i >= 0; i--) {
+            uint64_t def, use;
+            ocerz_flags_defuse(&blk->insns[i], &def, &use);
+            fl_need[i] = def & live_out;
+            live_out = (live_out & ~def) | use;
+            /* OCERZ_NO_LAZYFLAGS: kill switch. Emit every flag the op defines,
+             * i.e. exactly the eager behaviour this pass replaced. Keeps the
+             * old codegen one env var away for A/B measurement and for bisecting
+             * any suspected flag bug against the pass itself. */
+            if (g_no_lazyflags)
+                fl_need[i] = def;
+        }
+    }
+
+    /* OCERZ_FLAGLIVE: per-block dump of what the pass proved dead. This is the
+     * cross-check that the def/use table is actually doing what it claims — a
+     * table that quietly proves nothing would be invisible in the test suite and
+     * would merely make the JIT eager again. Log-only, gated. */
+    if (g_flaglive_log) {
+        int wrote = 0, killed = 0;
+        for (int i = 0; i < n; i++) {
+            uint64_t def, use;
+            ocerz_flags_defuse(&blk->insns[i], &def, &use);
+            for (int f = 0; f < 6; f++) {
+                uint64_t bit = (uint64_t)1 << (int[]){0, 2, 4, 6, 7, 11}[f];
+                if (def & bit) {
+                    wrote++;
+                    if (!(fl_need[i] & bit))
+                        killed++;
+                }
+            }
+        }
+        if (wrote)
+            fprintf(stderr, "ocerz: FLAGLIVE rip=%#llx insns=%d flagwrites=%d dead=%d (%.1f%%)\n",
+                    (unsigned long long)rip, n, wrote, killed,
+                    100.0 * (double)killed / (double)wrote);
+    }
+
     uint32_t *exit_sites[JIT_MAX_BLOCK_INSNS];
     uint32_t *epi_sites[JIT_MAX_BLOCK_INSNS];
     int n_exits = 0;
@@ -1441,7 +1940,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 continue;
             }
         }
-        if (!try_inline(&b, insn, exit_sites, &n_exits)) {
+        /* CALL(imm)/RET native terminators. Like emit_jcc these set cpu->rip
+         * themselves and route straight to the epilogue, so they are only valid
+         * in the terminator slot -- which is the only place they can appear,
+         * since is_terminator() ends a block on both. */
+        if (i == n - 1 && (insn->op == OCERZ_OP_CALL || insn->op == OCERZ_OP_RET)) {
+            if (emit_call_ret(&b, insn, exit_sites, &n_exits, epi_sites, &n_epi)) {
+                blk->n_inlined++;
+                continue;
+            }
+        }
+        if (!try_inline(&b, insn, fl_need[i], exit_sites, &n_exits)) {
             emit_slowcall(&b, insn, exit_sites, &n_exits);
             blk->n_slow++;
         } else {
@@ -1467,6 +1976,14 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     a64_ldp_post(&b, 19, 20, 31, 16);
     a64_ldp_post(&b, 29, 30, 31, 16);
     a64_ret(&b);
+
+    /* The number that decides whether the "time is proportional to emitted
+     * words" model actually holds. Reported next to the guest insn count so the
+     * emitted-per-guest ratio is directly readable. */
+    if (g_flaglive_log)
+        fprintf(stderr, "ocerz: FLAGLIVE rip=%#llx EMITTED words=%d guest=%d per_guest=%.2f\n",
+                (unsigned long long)rip, (int)(b.p - entry), n,
+                (double)(b.p - entry) / (double)n);
 
     /* On overflow a64_emit32 clamps at b->p == b->end, so a64_label() can have
      * handed out b->end itself; patching would store one word PAST the MAP_JIT
@@ -1517,6 +2034,44 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     jit->code_cur = b.p;
     blk->code = (JitBlockFn)entry;
     blk->code_words = (uint32_t)(b.p - entry);
+
+    /* OCERZ_JITDIS=<file> (MEASUREMENT ONLY, gated, off by default): dump the
+     * emitted arm64 for every compiled block, split at the per-guest-instruction
+     * boundaries insn_off already records, with the prologue and the shared
+     * epilogue attributed separately. This lets emitted-words-per-guest-insn and
+     * the flag/register-traffic share be COUNTED from the code that actually
+     * runs, instead of estimated by reading the emitter. Runs under jit_lock at
+     * translate time only; it emits no code and costs a compiled block nothing
+     * when the env var is unset. */
+    {
+        static int g_jitdis = -1;
+        static FILE *g_jf;
+        if (g_jitdis < 0) {
+            const char *p = getenv("OCERZ_JITDIS");
+            g_jitdis = p ? 1 : 0;
+            if (p)
+                g_jf = fopen(p, "w");
+        }
+        if (g_jitdis > 0 && g_jf && blk->insn_off) {
+            char tb[128];
+            uint32_t epi = (uint32_t)(exit_label - entry);
+            fprintf(g_jf, "BLOCK rip=%#llx words=%u n_insns=%d inlined=%d slow=%d"
+                          " prologue_words=%u epilogue_words=%u\n",
+                    (unsigned long long)rip, blk->code_words, n,
+                    blk->n_inlined, blk->n_slow, blk->insn_off[0],
+                    blk->code_words - epi);
+            for (int i = 0; i < n; i++) {
+                uint32_t s = blk->insn_off[i];
+                uint32_t e = (i + 1 < n) ? blk->insn_off[i + 1] : epi;
+                ocerz_format_insn(&blk->insns[i], tb, sizeof tb);
+                fprintf(g_jf, "  INSN %d off=%u words=%u  %s\n", i, s,
+                        e > s ? e - s : 0, tb);
+                for (uint32_t w = s; w < e; w++)
+                    fprintf(g_jf, "    %08x\n", entry[w]);
+            }
+            fflush(g_jf);
+        }
+    }
 
     /* Register in the code-address index (see OcerzJit::ci). Runs under
      * jit_lock. On grow failure the index simply stops accepting new blocks:
@@ -1729,17 +2284,34 @@ static void ps_report(OcerzJit *jit)
         sec = 1e-9;
     unsigned long long blk_exec = 0, ins_inl = 0, ins_slow_static = 0, nblocks = 0, ncompiled = 0;
     unsigned long long static_insns = 0;
-    for (unsigned i = 0; i < JIT_HASH_SIZE; i++)
+    /* Hash-chain geometry. cache_lookup walks from the bucket head and
+     * cache_insert pushes at the head, so a block sitting at 1-based position p
+     * costs p pointer-chases on every lookup that finds it. Weighting p by the
+     * block's exec_count therefore yields the ACTUAL mean probes per lookup the
+     * dispatcher pays -- unlike the raw load factor, which weights a cold block
+     * the same as one entered a hundred million times. */
+    unsigned long long nonempty = 0, maxchain = 0;
+    unsigned long long probe_w = 0;   /* sum over blocks of position * exec_count */
+    for (unsigned i = 0; i < JIT_HASH_SIZE; i++) {
+        unsigned long long pos = 0;
         for (JitBlock *b = __atomic_load_n(&jit->buckets[i], __ATOMIC_ACQUIRE); b; b = b->hnext) {
             nblocks++;
+            pos++;
             if (b->code)
                 ncompiled++;
             static_insns += (unsigned)b->n_insns;
             unsigned long long e = b->exec_count;
             blk_exec += e;
+            probe_w += pos * e;
             ins_inl += e * (unsigned)b->n_inlined;
             ins_slow_static += e * (unsigned)b->n_slow;
         }
+        if (pos) {
+            nonempty++;
+            if (pos > maxchain)
+                maxchain = pos;
+        }
+    }
     unsigned long long slow = ps_slow_insns;
     unsigned long long total = ins_inl + slow;
     unsigned long long st = ps_steps, hi = ps_hits, mi = ps_misses;
@@ -1749,7 +2321,9 @@ static void ps_report(OcerzJit *jit)
         "ocerz: PERFSTAT[%d]   EXECUTED insns: total=%llu  slow(exec_one)=%llu (%.2f%%)  inlined=%llu (%.2f%%)\n"
         "ocerz: PERFSTAT[%d]   slow_static_est=%llu (guard-slowcalls = %lld)\n"
         "ocerz: PERFSTAT[%d]   block_execs=%llu (%.0f/s)  jit_step/cache_lookup=%llu (%.0f/s) hits=%llu misses=%llu\n"
-        "ocerz: PERFSTAT[%d]   avg EXECUTED insns per block = %.2f   insns/s = %.0f\n",
+        "ocerz: PERFSTAT[%d]   avg EXECUTED insns per block = %.2f   insns/s = %.0f\n"
+        "ocerz: PERFSTAT[%d]   HASH bits=%d buckets=%u nonempty=%llu load=%.3f maxchain=%llu"
+        " mean_probes/lookup(exec-weighted)=%.3f\n",
         (int)getpid(), sec, nblocks, ncompiled,
         nblocks ? (double)static_insns / (double)nblocks : 0.0,
         (int)getpid(), total, slow, total ? 100.0 * (double)slow / (double)total : 0.0,
@@ -1757,7 +2331,10 @@ static void ps_report(OcerzJit *jit)
         (int)getpid(), ins_slow_static, (long long)slow - (long long)ins_slow_static,
         (int)getpid(), blk_exec, (double)blk_exec / sec, st, (double)st / sec, hi, mi,
         (int)getpid(), blk_exec ? (double)total / (double)blk_exec : 0.0,
-        (double)total / sec);
+        (double)total / sec,
+        (int)getpid(), JIT_HASH_BITS, (unsigned)JIT_HASH_SIZE, nonempty,
+        (double)nblocks / (double)JIT_HASH_SIZE, maxchain,
+        blk_exec ? (double)probe_w / (double)blk_exec : 0.0);
 
     PsOpRow rows[OCERZ_OP_COUNT];
     for (unsigned i = 0; i < OCERZ_OP_COUNT; i++) {
@@ -1794,6 +2371,8 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             js_t0 = ps_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             ocerz_perfstat = getenv("OCERZ_PERFSTAT") ? 1 : 0;
             ocerz_jitstat = getenv("OCERZ_JITSTAT") ? 1 : 0;
+            g_flaglive_log = getenv("OCERZ_FLAGLIVE") ? 1 : 0;
+            g_no_lazyflags = getenv("OCERZ_NO_LAZYFLAGS") ? 1 : 0;
         }
         pthread_mutex_unlock(&jit_lock);
     }
@@ -1816,6 +2395,29 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
                 ps_report(jit);
         }
     }
+    /* THIS PATH IS EXTRAORDINARILY SENSITIVE. DO NOT ADD ANYTHING HERE,
+     * INCLUDING DIAGNOSTICS, WITHOUT MEASURING alu.
+     *
+     * An OCERZ_DISPATCH_TAX=<n> probe briefly lived here to measure the
+     * dispatcher's marginal cost (n extra cache_lookups per dispatch, slope =
+     * cost per lookup). Default-off, gated on `__builtin_expect(tax > 0, 0)`
+     * against a global fixed before the loop -- i.e. one load and one
+     * never-taken, perfectly-predicted branch. It cost alu 13.8%
+     * (2.275s -> 2.589s, ~10.8 cyc per block, variance +/-0.01s so this is not
+     * drift). alu's hot block is a self-loop that dispatches 100M times, and
+     * that is enough for a single extra load+branch in ocerz_jit_step to be
+     * plainly visible. The probe was reverted for exactly this reason.
+     *
+     * WHAT IT MEASURED, before it was removed (fib, two-point, same binary,
+     * tax = 0/1/2/4):
+     *   +14.5 cyc for the FIRST extra lookup (serialized against the real one)
+     *    +6.8 cyc/lookup least-squares slope (redundant same-rip L1 hits, fully
+     *         pipelined -- a lower bound, not the cost of a real lookup)
+     * So a real dispatch lookup is ~12-15 cyc, which independently confirms the
+     * 7.3 cyc/lookup harness figure and the 12-18 cyc bracket. This matters for
+     * sizing chaining: the round-trip model was refuted for the SLOW-CALL term
+     * (19.7 predicted vs 6.25 measured by the OCERZ_NO_INLINE_CALLRET A/B), but
+     * the DISPATCH term it is sized on survives direct measurement. */
     JitBlock *b = cache_lookup(jit, cpu->rip);
     if (!b) {
         pthread_mutex_lock(&jit_lock);

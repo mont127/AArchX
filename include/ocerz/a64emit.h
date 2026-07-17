@@ -126,6 +126,13 @@ void a64_bcond(A64Buf *b, int cond, int32_t off_words);
 void a64_cbz(A64Buf *b, int sf, int rt, int32_t off_words);
 void a64_cbnz(A64Buf *b, int sf, int rt, int32_t off_words);
 void a64_patch_b(uint32_t *at, uint32_t *target);
+/* Range-checked B patch: returns 1 and patches if target is within the +-128MB
+ * (+-(2^25-1) words) reach of an unconditional B at `at`; returns 0 and patches
+ * NOTHING if out of range. Unlike a64_patch_b, which masks off & 0x03ffffff with
+ * no range check and would silently encode a branch to an arbitrary arena
+ * address, this is safe to use for cross-block chaining where the target may be
+ * anywhere in the (1GB, 8x the B reach) arena. */
+int a64_try_patch_b(uint32_t *at, uint32_t *target);
 void a64_patch_bcond(uint32_t *at, uint32_t *target);
 void a64_patch_cbz(uint32_t *at, uint32_t *target);
 void a64_ret(A64Buf *b);

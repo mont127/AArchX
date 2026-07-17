@@ -1,12 +1,20 @@
 /*
  * include/ocerz/flags.h
  *
- * Eager RFLAGS computation helpers. Ocerz keeps cpu->rflags architecturally
- * current at every instruction boundary: each flag-writing instruction calls
- * exactly one of these helpers, which rewrite the six arithmetic flag bits
- * (CF PF AF ZF SF OF) while preserving control bits (DF TF IF and the fixed
- * bit 1). This trades a little interpreter speed for zero lazy-flag bugs;
- * the JIT tier recovers the speed by mapping flags onto NZCV natively.
+ * RFLAGS computation helpers, and THE semantic reference for x86 flags in this
+ * emulator. The INTERPRETER keeps cpu->rflags architecturally current at every
+ * instruction boundary: each flag-writing instruction calls exactly one of these
+ * helpers, which rewrite the six arithmetic flag bits (CF PF AF ZF SF OF) while
+ * preserving control bits (DF TF IF and the fixed bit 1). This trades a little
+ * interpreter speed for zero lazy-flag bugs, and makes the interpreter the
+ * reference the JIT is differentially held to.
+ *
+ * The JIT tier maps these onto arm64 NZCV natively AND omits the writes a
+ * liveness pass proves dead (src/flags_live.c, include/ocerz/flags_live.h) --
+ * but it must still match what these helpers would have produced at every
+ * observable point. That equivalence is what tests/guest/flags.c (PUSHF per op)
+ * and tests/guest/flags_live.c (cross-block consumers, and a handler reading
+ * rflags out of a fault's mcontext) enforce through the differential.
  *
  * All helpers take the operation width in BYTES (1,2,4,8) and operate on
  * values already masked or maskable to that width; they mask internally, so

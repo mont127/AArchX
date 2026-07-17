@@ -88,7 +88,27 @@ run_with_timeout() {
     return $?
 }
 
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test)
+# fault_regs is the register-file-at-fault gate: it takes a SIGSEGV mid-block
+# with every data GPR live and prints them from the ucontext. Its golden was
+# generated from the NATIVE x86_64 run, so it holds ocerz to real hardware, not
+# just to itself. See tests/guest/fault_regs.c.
+# imul_flags gates src/jit.c:emit_imul (the inlined IMUL). It is listed here,
+# unlike flags/flags_live/flags_carry, because it deliberately SPLITS its output
+# so that a golden can exist at all: its "arch=" checksum folds in only CF and OF
+# — the sole flags x86 defines after IMUL/MUL — and that line's golden was
+# generated from the NATIVE x86_64 run, holding ocerz to real hardware. Its
+# "pinned=" checksum folds in all six, including the architecturally UNDEFINED
+# SF/ZF/AF/PF that src/flags.c deliberately pins to values native silicon does
+# not reproduce; that line is ocerz's own convention and is what
+# tests/run_diff_test.sh (interpreter vs JIT) enforces. See tests/guest/imul_flags.c.
+# fault_resume is the RESUME-AND-RE-EXECUTE gate: its handler fixes the fault by
+# editing a GPR in the mcontext and returns WITHOUT advancing rip, so the
+# faulting instruction runs a second time and must succeed with exactly the
+# hardware result and flags. Golden generated from the NATIVE x86_64 run. It
+# uniquely exercises crash_handler's rip rewind, sys_sigreturn's GPR write-back,
+# and lazy-flag materialization at a faulting flag producer. See
+# tests/guest/fault_resume.c.
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume callret_fault imul_flags)
 
 expected_exit() {
     case "$1" in

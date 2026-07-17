@@ -1064,6 +1064,33 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     const char *prof_s = getenv("OCERZ_PROFILE");
     unsigned long long prof = prof_s ? strtoull(prof_s, NULL, 0) : 0;
     unsigned long long prof_next = prof ? vm->insn_count + prof : 0;
+
+    /* OCERZ_TRACE_MAIN_LO/HI, hoisted out of the step loop (it used to re-check
+     * a lazy-init static on every guest instruction). */
+    static uint64_t mtrace_lo, mtrace_hi;
+    static int mtrace_init;
+    if (!mtrace_init) {
+        mtrace_init = 1;
+        const char *ml = getenv("OCERZ_TRACE_MAIN_LO");
+        const char *mh = getenv("OCERZ_TRACE_MAIN_HI");
+        if (ml && mh) {
+            mtrace_lo = strtoull(ml, NULL, 0);
+            mtrace_hi = strtoull(mh, NULL, 0);
+        }
+    }
+
+    /* Every diagnostic below is off unless its env var was set, but the loop
+     * still paid ~10 loads+compares per guest instruction to discover that.
+     * Collapse them to ONE predicate tested once per step: each arm re-tests
+     * its own condition inside, so behaviour is identical when any is armed and
+     * the cost is a single not-taken branch when none is (the overwhelmingly
+     * common case, including every benchmark and every real run).
+     * NOTE: this is computed once per ocerz_vm_call and every input is either an
+     * env-var-derived value fixed before the loop or a startup-set global, so it
+     * cannot go stale underneath the loop. Anything added here must keep that
+     * property or it must be tested outside the gate. */
+    const int any_diag = (ocerz_exc_trap || ocerz_sel_trap || ocerz_ctx_trap ||
+                          ocerz_bt_lo || prof || riptrap_n > 0 || icap || mtrace_lo);
     sigjmp_buf jb;
     sigjmp_buf *prev_recover = g_sig_recover;
     g_sig_recover = &jb;
@@ -1072,6 +1099,8 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     while (local.rip != sentinel && !vm->exited) {
         g_riphist[g_riphist_n++ & 31] = local.rip;
         int r;
+        int mtrace_hit = 0;
+        if (__builtin_expect(any_diag, 0)) {
         if (ocerz_exc_trap && local.rip == ocerz_exc_trap)
             ocerz_exc_report(&local);
         if (ocerz_sel_trap && local.rip == ocerz_sel_trap)
@@ -1114,17 +1143,6 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
                     (unsigned long long)vm->insn_count, (unsigned long long)func);
             _exit(126);
         }
-        static uint64_t mtrace_lo, mtrace_hi;
-        static int mtrace_init;
-        if (!mtrace_init) {
-            mtrace_init = 1;
-            const char *ml = getenv("OCERZ_TRACE_MAIN_LO");
-            const char *mh = getenv("OCERZ_TRACE_MAIN_HI");
-            if (ml && mh) {
-                mtrace_lo = strtoull(ml, NULL, 0);
-                mtrace_hi = strtoull(mh, NULL, 0);
-            }
-        }
         if (mtrace_lo && local.rip >= mtrace_lo && local.rip < mtrace_hi) {
             fprintf(stderr, "MT %#llx rax=%#llx rdi=%#llx rsi=%#llx rsp=%#llx [rsp]=%#llx\n",
                     (unsigned long long)local.rip,
@@ -1133,6 +1151,11 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
                     (unsigned long long)local.gpr[OCERZ_RSI],
                     (unsigned long long)local.gpr[OCERZ_RSP],
                     (unsigned long long)ocerz_ld(local.gpr[OCERZ_RSP], 8));
+            mtrace_hit = 1;
+        }
+        } /* any_diag */
+
+        if (mtrace_hit) {
             r = ocerz_interp_step(vm, &local);
         } else if (vm->jit_enabled && vm->jit) {
             r = ocerz_jit_step(vm, &local);
