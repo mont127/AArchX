@@ -108,7 +108,14 @@ run_with_timeout() {
 # uniquely exercises crash_handler's rip rewind, sys_sigreturn's GPR write-back,
 # and lazy-flag materialization at a faulting flag producer. See
 # tests/guest/fault_resume.c.
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume callret_fault imul_flags)
+# interrupt_test is the JIT-chaining cross-thread-exit safety gate: it spins
+# forever in a syscall-free self-loop that only an asynchronous cross-thread stop
+# can break. It is launched with OCERZ_TEST_ASYNC_STOP_ICOUNT set (see test_env),
+# which makes Ocerz spawn a separate host thread that requests exit once the
+# guest is past startup; the run loop's cpu->interrupt poll must observe that and
+# exit 0. Without the poll (or its broadcast) it would run until the runner's
+# timeout -- a FAIL -- which is exactly the hang chaining would otherwise hide.
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume callret_fault imul_flags interrupt_test ras_stress)
 
 expected_exit() {
     case "$1" in
@@ -120,6 +127,17 @@ expected_exit() {
 test_args() {
     case "$1" in
         args) echo "one two three" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Per-test environment. Emits a single NAME=VALUE token (no spaces) or empty.
+# interrupt_test needs the cross-thread async-stop hook armed; the threshold is
+# well past a static test's startup so its "start" line is always emitted first,
+# keeping the golden deterministic.
+test_env() {
+    case "$1" in
+        interrupt_test) echo "OCERZ_TEST_ASYNC_STOP_ICOUNT=500000" ;;
         *) echo "" ;;
     esac
 }
@@ -145,8 +163,15 @@ for name in "${NAMES[@]}"; do
     fi
 
     extra="$(test_args "$name")"
+    tenv="$(test_env "$name")"
+    if [ -n "$tenv" ]; then
+        export "$tenv"
+    fi
     run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$bin" $extra
     rc=$?
+    if [ -n "$tenv" ]; then
+        unset "${tenv%%=*}"
+    fi
 
     want_rc="$(expected_exit "$name")"
     ok=1
