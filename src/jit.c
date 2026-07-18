@@ -264,7 +264,26 @@ typedef struct JitBlock {
     uint8_t host_holds[8];
     int8_t guest_in_host[16];
     uint8_t n_pinned;
+    /* ---- BLOCK CHAINING (Increment 1: direct-edge) ---------------------
+     * A chainable STATIC successor edge. patch_b points at a single B word
+     * living inside this block's emitted code (the chain-tail's activation
+     * branch) that INITIALLY targets an in-block fallback (which restores
+     * STEP_OK and returns to the dispatcher). When the successor at
+     * target_rip is compiled, that one word is rewritten to branch directly
+     * into the successor's host entry, removing the dispatcher round-trip.
+     * kind is EDGE_XBLOCK for Increment 1 (a different-block edge chained at
+     * the post-teardown seam; the source's epilogue has already flushed pins
+     * to cpu->gpr[] and balanced the frame, so any source/target pin-map pair
+     * is correct). Populated only for a compiled block; n_edges==0 otherwise. */
+    struct {
+        uint64_t target_rip;
+        uint32_t *patch_b;      /* the one activation B word, in [code,code+code_words) */
+        uint8_t kind;
+    } edges[2];
+    uint8_t n_edges;
 } JitBlock;
+
+enum { EDGE_XBLOCK = 0, EDGE_SELFLOOP = 1 };
 
 struct OcerzJit {
     struct OcerzVM *vm;
@@ -312,6 +331,27 @@ static int g_no_ras;
  * for measurement. Read once at jit init; translate() runs under jit_lock and
  * this is a whole-run decision, mirroring g_no_lazyflags/g_no_ras. */
 static int g_no_regflags;
+/* OCERZ_NO_CHAIN: A/B kill switch for block chaining (Increment 1). When set,
+ * translate() emits no chain tails and activates no edges, so every block exit
+ * returns through the dispatcher exactly as the pre-chaining (committed) code
+ * did. Read once at jit init; whole-run decision, mirroring g_no_ras. */
+static int g_no_chain;
+/* Per-block chain context (single-writer under jit_lock, like g_pin). A CALL(imm)
+ * terminator records its direct-target rip here and the address of its terminal
+ * STEP_OK epilogue branch; translate() then redirects that branch into an
+ * emitted chain tail and records the resulting edge. g_chain_target==0 means the
+ * block has no chainable terminator. */
+static uint64_t g_chain_target;
+static uint32_t *g_chain_epi;   /* the CALL's terminal `b` word (initially -> exit_label) */
+/* Self-loop chaining context (Increment 2), same single-writer discipline. Set by
+ * translate() before the per-instruction loop: g_self_rip is the block's entry rip
+ * and g_body_entry is the host label immediately AFTER the prologue (frame save +
+ * pinned-reg fill). emit_jcc chains a Jcc whose taken target == g_self_rip straight
+ * back to g_body_entry (past the prologue), so the pinned guest GPRs stay resident
+ * in x21..x28 across the loop instead of being spilled/reloaded every iteration.
+ * g_body_entry==NULL disables self-loop chaining for the block. */
+static uint64_t g_self_rip;
+static uint32_t *g_body_entry;
 /* Per-block pin map, published by translate() for the emit helpers below. Only
  * ever set/read under jit_lock (single-writer translate), so plain statics are
  * race-free. g_pin==NULL means no register is pinned for the block being
@@ -461,6 +501,9 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
 #define RF_OFF ((uint32_t)offsetof(OcerzCPU, rflags))
 #define RIP_OFF ((uint32_t)offsetof(OcerzCPU, rip))
+/* Cross-thread cooperative-stop poll word (see OcerzCPU::interrupt). Read by the
+ * chained self-loop back-edge; a set value routes the loop to the dispatcher. */
+#define INT_OFF ((uint32_t)offsetof(OcerzCPU, interrupt))
 #define GPR_OFF(r) ((uint32_t)((unsigned)(r) * 8))
 /* Deferred-flag record (see include/ocerz/flags.h, struct OcerzCPU). */
 #define CC_SRC_OFF ((uint32_t)offsetof(OcerzCPU, cc_src))
@@ -1898,8 +1941,41 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     else
         a64_csel(b, 1, JT0, JT2, JT1, A64_NE);   /* take!=0 -> target */
     a64_str(b, 8, JT0, 20, RIP_OFF);
-    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
 
+    /* SELF-LOOP CHAINING (Increment 2). When this Jcc's taken target is the
+     * block's own entry rip, the loop back-edge can branch DIRECTLY to
+     * body-entry (g_body_entry, the label past the prologue) keeping the pinned
+     * guest GPRs resident in x21..x28, instead of returning through the shared
+     * epilogue to the dispatcher and reloading them next iteration. JT0 (the
+     * resolved rip) is compared to the entry rip: on a match the back-edge is
+     * taken, otherwise the loop exits normally. A chained self-loop never returns
+     * to ocerz_vm_run_cpu's header, so the back-edge MUST poll cpu->interrupt (the
+     * committed cross-thread stop word) and fall through to the dispatcher exit
+     * when it is set -- otherwise a process-wide/cross-thread stop could never
+     * break the loop (tests/guest/interrupt_test + ras_stress are the gate). The
+     * poll is one L1 load + a predicted-not-taken cbnz off the pinned cpu pointer.
+     * body-entry is in this same block, always within B range. */
+    if (!g_no_chain && g_body_entry && taken == g_self_rip) {
+        a64_mov_imm64(b, JT1, g_self_rip);
+        a64_subs_reg(b, 1, A64_ZR, JT0, JT1, 0);    /* resolved rip == entry ? */
+        uint32_t *not_loop = a64_label(b);
+        a64_bcond(b, A64_NE, 0);                     /* not looping back -> exit */
+        a64_ldr(b, 4, JT1, 20, INT_OFF);             /* w = cpu->interrupt */
+        uint32_t *intr = a64_label(b);
+        a64_cbnz(b, 0, JT1, 0);                      /* stop requested -> exit */
+        uint32_t *here = a64_label(b);
+        a64_b(b, (int32_t)(g_body_entry - here));    /* chain back to body-entry */
+        uint32_t *exit_tail = a64_label(b);
+        a64_patch_bcond(not_loop, exit_tail);
+        a64_patch_cbz(intr, exit_tail);
+        a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+        epilogue_sites[*n_epi] = a64_label(b);
+        a64_b(b, 0);
+        (*n_epi)++;
+        return 1;
+    }
+
+    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
     epilogue_sites[*n_epi] = a64_label(b);
     a64_b(b, 0);
     (*n_epi)++;
@@ -2024,6 +2100,12 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         uint64_t retaddr = insn->rip + insn->len;
         uint64_t target = insn->ops[0].imm;
 
+        /* CHAINING (Increment 1): this direct CALL's successor rip is the
+         * compile-time constant `target`. Record it so translate() can chain the
+         * terminal STEP_OK exit straight into the callee, skipping the dispatcher
+         * round-trip. RAS still handles the matching RET. */
+        g_chain_target = target;
+
         /* (1) value first: the return address, as a constant (see above). */
         a64_mov_imm64(b, JT1, retaddr);
         /* (2) address only -- no architectural state may move before the guard,
@@ -2139,6 +2221,10 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
      * keeps the two paths textually convergent). */
     a64_mov_imm64(b, 0, OCERZ_STEP_OK);
     epi_sites[*n_epi] = a64_label(b);
+    /* Capture the terminal STEP_OK branch so translate() can redirect it into a
+     * chain tail. Only meaningful when g_chain_target != 0 (set by the CALL arm
+     * above); the RET arm leaves g_chain_target 0, so this is ignored for RET. */
+    g_chain_epi = epi_sites[*n_epi];
     a64_b(b, 0);
     (*n_epi)++;
     return 1;
@@ -2261,6 +2347,103 @@ static void js_report(OcerzJit *jit, const char *tag, int with_ftab)
             snap[i].bytes[4], snap[i].bytes[5], snap[i].bytes[6], snap[i].bytes[7]);
 }
 
+/* ---- BLOCK CHAINING: activation + pending table -------------------------
+ * All of this runs ONLY on the cold translate/miss path, under jit_lock (single
+ * writer). Executors never write code.
+ *
+ * chain_activate rewrites the one activation B word `patch_b` (inside an already-
+ * committed source block) to branch to `dst` (a compiled target's host entry).
+ * a64_try_patch_b rejects an out-of-B-range target WITHOUT writing (arena is 1GB
+ * > B's +-128MB reach), in which case the edge is simply left unchained -- the
+ * fallback path is a correct STEP_OK return to the dispatcher, so a far edge
+ * costs a missed optimization, never correctness. The store is a single aligned
+ * 32-bit write (single-copy-atomic on arm64): a guest thread concurrently
+ * executing the source block fetches either the old word (-> fallback ->
+ * dispatcher, correct) or the new word (-> dst, correct), never a torn
+ * instruction. W^X toggle is per-thread, so making the patcher's view writable
+ * does not disturb another thread's executable view. */
+static void chain_activate(uint32_t *patch_b, void *dst)
+{
+    if (!patch_b || !dst)
+        return;
+    pthread_jit_write_protect_np(0);
+    a64_try_patch_b(patch_b, (uint32_t *)dst);   /* leaves it at fallback if out of range */
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(patch_b, 4);
+}
+
+/* Pending edges whose target rip was not yet compiled when the source block was
+ * translated. Keyed by target_rip in a fixed chained hash; entries are malloc'd
+ * and freed on drain. Touched only under jit_lock, so no atomics are needed. */
+typedef struct PendingChain {
+    uint64_t target_rip;
+    uint32_t *patch_b;
+    struct PendingChain *next;
+} PendingChain;
+#define PEND_BITS 12
+#define PEND_SIZE (1u << PEND_BITS)
+#define PEND_MASK (PEND_SIZE - 1)
+static PendingChain *g_pending[PEND_SIZE];
+
+static void pending_add(uint64_t target_rip, uint32_t *patch_b)
+{
+    PendingChain *e = (PendingChain *)malloc(sizeof *e);
+    if (!e)
+        return;   /* out of memory: the edge just stays unchained, still correct */
+    unsigned h = (unsigned)(hash_rip(target_rip) & PEND_MASK);
+    e->target_rip = target_rip;
+    e->patch_b = patch_b;
+    e->next = g_pending[h];
+    g_pending[h] = e;
+}
+
+/* A block at `rip` just became compiled: activate every source edge that was
+ * waiting on it. Removes the drained entries. */
+static void pending_drain(uint64_t rip, void *code)
+{
+    unsigned h = (unsigned)(hash_rip(rip) & PEND_MASK);
+    PendingChain **pp = &g_pending[h];
+    while (*pp) {
+        PendingChain *e = *pp;
+        if (e->target_rip == rip) {
+            chain_activate(e->patch_b, code);
+            *pp = e->next;
+            free(e);
+        } else {
+            pp = &e->next;
+        }
+    }
+}
+
+/* Emit the XBLOCK chain tail for a chainable CALL(imm) terminator and return the
+ * activation B word. The terminal STEP_OK exit is redirected here (by the caller)
+ * INSTEAD of the shared exit_label. This mirrors the committed RAS RET tail-call
+ * teardown exactly, minus the RAS lookup: flush pins to cpu->gpr[], reload x0=vm
+ * / x1=cpu for the target's prologue, restore the pinned callee-saved regs, tear
+ * the frame down, then the single activation branch:
+ *     [patch_b]: b fallback        (chained -> b target_entry)
+ *     fallback:  mov x0,#STEP_OK ; ret
+ * Unchained (or far/out-of-range), patch_b targets `fallback`, which restores
+ * STEP_OK (the tail clobbered x0 with vm) and returns to the dispatcher -- a
+ * correct, semantically-identical exit. Net frame delta across a chained edge is
+ * zero (source teardown here + target's own prologue build-up). */
+static uint32_t *emit_chain_tail(A64Buf *b)
+{
+    emit_spill_pinned(b);
+    a64_mov_reg(b, 1, 0, 19);              /* x0 = vm  (before ldp restores x19) */
+    a64_mov_reg(b, 1, 1, 20);              /* x1 = cpu */
+    emit_pin_epilogue_restore(b);          /* restore x21-x28 */
+    a64_ldp_post(b, 19, 20, 31, 16);       /* undo prologue (frame) */
+    a64_ldp_post(b, 29, 30, 31, 16);
+    uint32_t *patch_b = a64_label(b);
+    a64_b(b, 0);                           /* the single activation word */
+    uint32_t *fallback = a64_label(b);
+    a64_patch_b(patch_b, fallback);        /* initial (unchained) target: adjacent, in range */
+    a64_mov_imm64(b, 0, OCERZ_STEP_OK);    /* restore STEP_OK clobbered by x0=vm above */
+    a64_ret(b);
+    return patch_b;
+}
+
 static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 {
     /* OCERZ_JITMEASURE (Stage-0 verify-first for the persistent JIT cache): time each successful
@@ -2337,6 +2520,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_pin_hold = NULL;
     g_n_pinned = 0;
     g_defer = 0;
+    blk->n_edges = 0;
+    g_chain_target = 0;
+    g_chain_epi = NULL;
+    g_self_rip = rip;
+    g_body_entry = NULL;   /* set once the prologue has been emitted (below) */
     /* SIZE GATE (loop/large-block heuristic). The prologue/epilogue load+spill
      * of the pinned regs is a FIXED per-block-execution cost (~2*np words in,
      * ~2*np out) that a self-loop re-pays every iteration, so it only wins when
@@ -2419,6 +2607,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         a64_add_imm(&b, 1, JT1, JT1, 1);
         a64_str(&b, 8, JT1, JT0, 0);
     }
+
+    /* BODY-ENTRY (Increment 2 self-loop chaining): the label past the prologue.
+     * A Jcc self-loop back-edge branches here directly, so x19=vm / x20=cpu (both
+     * callee-saved, never clobbered by a block body) and the pinned guest regs in
+     * x21..x28 stay live across the loop -- no per-iteration frame rebuild or
+     * pinned-reg reload. Captured only when chaining is on; NULL otherwise leaves
+     * emit_jcc on the dispatcher-return path. Published for emit_jcc via the
+     * single-writer static, like g_pin. */
+    if (!g_no_chain)
+        g_body_entry = a64_label(&b);
 
     /* ---- BACKWARD FLAG LIVENESS ------------------------------------------
      * fl_need[i] = the flags insn i writes that something downstream reads, i.e.
@@ -2552,6 +2750,20 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     a64_ldp_post(&b, 29, 30, 31, 16);
     a64_ret(&b);
 
+    /* CHAINING (Increment 1): for a chainable CALL(imm) terminator, emit the
+     * XBLOCK chain tail AFTER the shared epilogue (so it lives inside this
+     * block's [code,code+code_words) span for the fault seam) and remember the
+     * activation word. The terminal STEP_OK branch is redirected into it below,
+     * once the shared epi patch loop has run. Only the terminal branch is
+     * redirected; the slow-call non-OK cbnz exits keep pointing at exit_label
+     * (a genuine error must still return to the dispatcher, not chain). */
+    uint32_t *chain_tail_lbl = NULL;
+    uint32_t *chain_patch_b = NULL;
+    if (!g_no_chain && g_chain_target) {
+        chain_tail_lbl = a64_label(&b);
+        chain_patch_b = emit_chain_tail(&b);
+    }
+
     /* The number that decides whether the "time is proportional to emitted
      * words" model actually holds. Reported next to the guest insn count so the
      * emitted-per-guest ratio is directly readable. */
@@ -2568,6 +2780,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             a64_patch_cbz(exit_sites[i], exit_label);
         for (int i = 0; i < n_epi; i++)
             a64_patch_b(epi_sites[i], exit_label);
+        /* Override the CALL's terminal STEP_OK branch (one of the epi_sites just
+         * patched to exit_label) to land in the chain tail instead. Done after
+         * the loop so it wins. Unchanged when there is no chainable terminator. */
+        if (chain_tail_lbl && g_chain_epi)
+            a64_patch_b(g_chain_epi, chain_tail_lbl);
     }
 
     pthread_jit_write_protect_np(1);
@@ -2614,6 +2831,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     jit->code_cur = b.p;
     blk->code = (JitBlockFn)entry;
     blk->code_words = (uint32_t)(b.p - entry);
+
+    /* Record the outgoing chain edge (Increment 1: at most one, the CALL target).
+     * patch_b currently branches to the in-block fallback (unchained STEP_OK
+     * return); it is activated below once the target is known compiled. */
+    if (chain_patch_b) {
+        blk->edges[0].target_rip = g_chain_target;
+        blk->edges[0].patch_b = chain_patch_b;
+        blk->edges[0].kind = EDGE_XBLOCK;
+        blk->n_edges = 1;
+    }
 
     /* OCERZ_JITDIS=<file> (MEASUREMENT ONLY, gated, off by default): dump the
      * emitted arm64 for every compiled block, split at the per-guest-instruction
@@ -2670,6 +2897,27 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     }
 
     cache_insert(jit, blk);
+
+    /* CHAINING activation (Increment 1). The block is now published in the cache
+     * and the ci[] index, so both directions are safe:
+     *  (a) resolve this block's OUTGOING edge -- if the target is already a
+     *      compiled block, activate now; otherwise park it in the pending table
+     *      keyed by target rip.
+     *  (b) drain INCOMING edges -- any earlier block that chained to this rip and
+     *      found it uncompiled parked a pending edge; activate them now.
+     * Both run under jit_lock (single writer). chain_activate brackets its own
+     * W^X toggle and icache flush. */
+    if (!g_no_chain) {
+        for (int i = 0; i < blk->n_edges; i++) {
+            JitBlock *t = cache_lookup(jit, blk->edges[i].target_rip);
+            if (t && t->code)
+                chain_activate(blk->edges[i].patch_b, (void *)t->code);
+            else
+                pending_add(blk->edges[i].target_rip, blk->edges[i].patch_b);
+        }
+        pending_drain(blk->guest_rip, (void *)blk->code);
+    }
+
     jit->blocks_translated++;
     if (ocerz_jitstat > 0)
         js_xlat_ok++;
@@ -2984,6 +3232,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             g_no_lazyflags = getenv("OCERZ_NO_LAZYFLAGS") ? 1 : 0;
             g_no_ras = getenv("OCERZ_NO_RAS") ? 1 : 0;
             g_no_regflags = getenv("OCERZ_NO_REGFLAGS") ? 1 : 0;
+            g_no_chain = getenv("OCERZ_NO_CHAIN") ? 1 : 0;
         }
         pthread_mutex_unlock(&jit_lock);
     }
