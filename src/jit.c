@@ -177,6 +177,7 @@
 #include <libkern/OSCacheControl.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <assert.h>
 
 /* RESERVED, not committed: MAP_ANON pages take physical backing only on first
  * write, so RSS still tracks bytes actually emitted — the reservation costs
@@ -336,6 +337,13 @@ static int g_no_regflags;
  * returns through the dispatcher exactly as the pre-chaining (committed) code
  * did. Read once at jit init; whole-run decision, mirroring g_no_ras. */
 static int g_no_chain;
+/* OCERZ_NO_JCCLINK: A/B kill switch for JUST the general two-way Jcc block linking
+ * (this lever), leaving the committed self-loop and CALL-imm chaining active. When
+ * set, a non-self-loop Jcc falls back to the committed csel + shared dispatcher
+ * exit and records no Jcc arm edges, so the SAME binary isolates exactly this
+ * lever's contribution against the pre-lever codegen. Read once at jit init;
+ * whole-run decision, mirroring g_no_chain. */
+static int g_no_jcclink;
 /* Per-block chain context (single-writer under jit_lock, like g_pin). A CALL(imm)
  * terminator records its direct-target rip here and the address of its terminal
  * STEP_OK epilogue branch; translate() then redirects that branch into an
@@ -352,6 +360,21 @@ static uint32_t *g_chain_epi;   /* the CALL's terminal `b` word (initially -> ex
  * g_body_entry==NULL disables self-loop chaining for the block. */
 static uint64_t g_self_rip;
 static uint32_t *g_body_entry;
+/* GENERAL TWO-WAY Jcc LINKING context (single-writer under jit_lock, like
+ * g_chain_target). A Jcc block whose self-loop fast path did NOT fire records up
+ * to two outgoing edges here -- the taken and fall-through arms, each with its own
+ * chain-tail activation word -- which translate()'s finalize publishes into
+ * blk->edges[]. A block terminates on EXACTLY ONE terminator, so g_n_jcc_edges>0
+ * and g_chain_target!=0 are mutually exclusive (CALL-XOR-Jcc); finalize asserts
+ * it. g_n_jcc_edges==0 means the Jcc left both arms at their in-tail fallback (an
+ * unchained dispatcher exit) -- always correct. */
+static struct { uint64_t target_rip; uint32_t *patch_b; } g_jcc_edge[2];
+static int g_n_jcc_edges;
+/* The jit being translated, published for emit_jcc's back-edge classifier (STEP
+ * 2): an arm whose target is ALREADY a compiled block (cache_lookup ->code) is a
+ * back-edge and must emit the interrupt poll before its chain tail. Set by
+ * translate() before the per-instruction loop; single-writer under jit_lock. */
+static OcerzJit *g_xlat_jit;
 /* Per-block pin map, published by translate() for the emit helpers below. Only
  * ever set/read under jit_lock (single-writer translate), so plain statics are
  * race-free. g_pin==NULL means no register is pinned for the block being
@@ -1890,6 +1913,20 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     }
 }
 
+static uint32_t *emit_chain_tail(A64Buf *b, int poll);   /* defined below; used by emit_jcc's two-way arms */
+
+/* STEP 2 back-edge classifier: is `rip` already a COMPILED block? A compiled
+ * predecessor means an edge to it runs backward in compilation order -- a loop
+ * back-edge that must poll cpu->interrupt. Single-writer under jit_lock
+ * (translate), so the cache read is race-free. */
+static int jcc_target_compiled(uint64_t rip)
+{
+    if (!g_xlat_jit)
+        return 0;
+    JitBlock *t = cache_lookup(g_xlat_jit, rip);
+    return t && t->code;
+}
+
 /* Native Jcc terminator. cpu->rflags is architecturally current for every flag
  * a Jcc can read: the liveness pass forces the block's last instruction to have
  * all six flags live-out, so whichever producer precedes this Jcc materialized
@@ -1972,6 +2009,56 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         epilogue_sites[*n_epi] = a64_label(b);
         a64_b(b, 0);
         (*n_epi)++;
+        return 1;
+    }
+
+    /* GENERAL TWO-WAY Jcc LINKING (STEP 1 forward + STEP 2 back-edge). The
+     * self-loop fast path did not fire. Instead of the single csel + shared
+     * dispatcher exit, split into a taken arm and a fall-through arm, each ending
+     * in an inline chain tail (the same flush-pins-to-gpr[] / rebuild-frame
+     * teardown the CALL edge uses, net frame delta zero so any source/target
+     * pin-map pair is correct -- BOTH arms route through the gpr[] seam to the
+     * target's HOST ENTRY; the body-entry shortcut is FORBIDDEN for a cross-block
+     * edge). Both arms are linked.
+     *
+     * INTERRUPT POLL classifier (soundness). An arm whose target could close a
+     * control cycle must poll cpu->interrupt on its back-edge, or a fully-linked
+     * loop can never be broken by a cross-thread/process stop (link_spin is the
+     * gate). The sound, CFG-free criterion is "the target is ALREADY a compiled
+     * block" (cache_lookup ->code): a loop header is compiled before its back-edge
+     * block, so the back-edge arm sees it compiled and polls, and every cycle thus
+     * carries >=1 poll (the pure-address heuristic target<=entry is UNSOUND for br,
+     * whose back-edge points at a HIGHER addr, so it is used only as an extra
+     * over-poll, never as the sole test). Biasing to OVER-poll is safe: a needless
+     * poll on a forward re-merge costs one predicted-not-taken cbnz; a MISSED poll
+     * is an unbreakable loop. Forward arms (target not yet compiled, above entry)
+     * poll=0, preserving the STEP-1 forward-diamond throughput.
+     *
+     * The subs above (JTF-0) still holds NZCV (csel/str do not touch it), so the
+     * arm split reuses it; each arm stores its own compile-time rip constant,
+     * overwriting the csel result, so every exit (chained, fallback, or poll)
+     * carries the correct rip. */
+    if (!g_no_chain && !g_no_jcclink) {
+        int poll_fall  = (fall  <= g_self_rip) || jcc_target_compiled(fall);
+        int poll_taken = (taken <= g_self_rip) || jcc_target_compiled(taken);
+        int taken_eq = (cc & 1);   /* taken when JTF==0 (EQ), else JTF!=0 (NE) */
+        uint32_t *to_taken = a64_label(b);
+        a64_bcond(b, taken_eq ? A64_EQ : A64_NE, 0);   /* -> taken arm */
+        /* FALL arm */
+        a64_mov_imm64(b, JT0, fall);
+        a64_str(b, 8, JT0, 20, RIP_OFF);
+        uint32_t *pb_fall = emit_chain_tail(b, poll_fall);
+        /* TAKEN arm */
+        uint32_t *ltaken = a64_label(b);
+        a64_patch_bcond(to_taken, ltaken);
+        a64_mov_imm64(b, JT0, taken);
+        a64_str(b, 8, JT0, 20, RIP_OFF);
+        uint32_t *pb_taken = emit_chain_tail(b, poll_taken);
+        g_jcc_edge[0].target_rip = fall;
+        g_jcc_edge[0].patch_b = pb_fall;
+        g_jcc_edge[1].target_rip = taken;
+        g_jcc_edge[1].patch_b = pb_taken;
+        g_n_jcc_edges = 2;
         return 1;
     }
 
@@ -2426,19 +2513,47 @@ static void pending_drain(uint64_t rip, void *code)
  * Unchained (or far/out-of-range), patch_b targets `fallback`, which restores
  * STEP_OK (the tail clobbered x0 with vm) and returns to the dispatcher -- a
  * correct, semantically-identical exit. Net frame delta across a chained edge is
- * zero (source teardown here + target's own prologue build-up). */
-static uint32_t *emit_chain_tail(A64Buf *b)
+ * zero (source teardown here + target's own prologue build-up).
+ *
+ * BACK-EDGE INTERRUPT POLL (STEP 2). When `poll` is set (a chained arm whose
+ * target could close a control cycle, i.e. is already compiled or points back at
+ * or below this block's entry), emit the PROVEN self-loop poll at the very TOP of
+ * the tail -- BEFORE any register is clobbered, while x20 still holds cpu -- so a
+ * cross-thread/process stop that sets cpu->interrupt is observed and routed to the
+ * unchained fallback (STEP_OK -> dispatcher) instead of taking the chained branch.
+ * Without it a fully-linked loop would never re-enter the dispatcher and could
+ * never be broken (tests/guest/link_spin is the gate). The caller stores this
+ * arm's rip constant BEFORE calling, so the fallback exit carries the correct rip.
+ * The poll is one L1 load + a predicted-not-taken cbnz; forward arms pass poll=0
+ * so the STEP-1 forward-diamond win is unaffected. */
+static uint32_t *emit_chain_tail(A64Buf *b, int poll)
 {
+    uint32_t *intr = NULL;
+    /* Read cpu->interrupt into JT1 BEFORE the teardown, while x20 still holds cpu.
+     * JT1 (x10) is caller-saved scratch that the teardown below never touches
+     * (spill/restore use x21-x28 + x20; the ldp pairs restore only x19/x20/x29/x30),
+     * so the flag survives to the post-teardown cbnz. Reading here and branching
+     * AFTER teardown is essential: the frame restore (ldp) MUST run on every exit,
+     * so the interrupt exit cannot short-circuit past it -- it can only choose the
+     * unchained fallback over the chained branch. */
+    if (poll)
+        a64_ldr(b, 4, JT1, 20, INT_OFF);   /* JT1 = cpu->interrupt (x20 still = cpu) */
     emit_spill_pinned(b);
     a64_mov_reg(b, 1, 0, 19);              /* x0 = vm  (before ldp restores x19) */
     a64_mov_reg(b, 1, 1, 20);              /* x1 = cpu */
     emit_pin_epilogue_restore(b);          /* restore x21-x28 */
     a64_ldp_post(b, 19, 20, 31, 16);       /* undo prologue (frame) */
     a64_ldp_post(b, 29, 30, 31, 16);
+    if (poll) {
+        intr = a64_label(b);
+        a64_cbnz(b, 0, JT1, 0);            /* stop requested -> fallback (skip chained b) */
+    }
     uint32_t *patch_b = a64_label(b);
     a64_b(b, 0);                           /* the single activation word */
     uint32_t *fallback = a64_label(b);
     a64_patch_b(patch_b, fallback);        /* initial (unchained) target: adjacent, in range */
+    if (poll)
+        a64_patch_cbz(intr, fallback);     /* interrupt -> unchained dispatcher exit (frame already torn down) */
     a64_mov_imm64(b, 0, OCERZ_STEP_OK);    /* restore STEP_OK clobbered by x0=vm above */
     a64_ret(b);
     return patch_b;
@@ -2523,6 +2638,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     blk->n_edges = 0;
     g_chain_target = 0;
     g_chain_epi = NULL;
+    g_n_jcc_edges = 0;
+    g_xlat_jit = jit;
     g_self_rip = rip;
     g_body_entry = NULL;   /* set once the prologue has been emitted (below) */
     /* SIZE GATE (loop/large-block heuristic). The prologue/epilogue load+spill
@@ -2761,7 +2878,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     uint32_t *chain_patch_b = NULL;
     if (!g_no_chain && g_chain_target) {
         chain_tail_lbl = a64_label(&b);
-        chain_patch_b = emit_chain_tail(&b);
+        chain_patch_b = emit_chain_tail(&b, 0);   /* CALL-imm target is the callee entry (forward); no poll */
     }
 
     /* The number that decides whether the "time is proportional to emitted
@@ -2832,14 +2949,25 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     blk->code = (JitBlockFn)entry;
     blk->code_words = (uint32_t)(b.p - entry);
 
-    /* Record the outgoing chain edge (Increment 1: at most one, the CALL target).
-     * patch_b currently branches to the in-block fallback (unchained STEP_OK
-     * return); it is activated below once the target is known compiled. */
+    /* Record the outgoing chain edges. patch_b currently branches to an in-block
+     * fallback (unchained STEP_OK return); activated below once the target is
+     * known compiled. A block terminates on EXACTLY ONE terminator, so it has
+     * EITHER a CALL edge (chain_patch_b, at most one) OR up to two Jcc arm edges
+     * (g_jcc_edge) -- never both. Assert that CALL-XOR-Jcc invariant. */
+    assert(!(chain_patch_b && g_n_jcc_edges) &&
+           "block cannot have both a CALL chain edge and Jcc arm edges");
     if (chain_patch_b) {
         blk->edges[0].target_rip = g_chain_target;
         blk->edges[0].patch_b = chain_patch_b;
         blk->edges[0].kind = EDGE_XBLOCK;
         blk->n_edges = 1;
+    } else if (g_n_jcc_edges) {
+        for (int i = 0; i < g_n_jcc_edges; i++) {
+            blk->edges[i].target_rip = g_jcc_edge[i].target_rip;
+            blk->edges[i].patch_b = g_jcc_edge[i].patch_b;
+            blk->edges[i].kind = EDGE_XBLOCK;
+        }
+        blk->n_edges = (uint8_t)g_n_jcc_edges;
     }
 
     /* OCERZ_JITDIS=<file> (MEASUREMENT ONLY, gated, off by default): dump the
@@ -3233,6 +3361,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             g_no_ras = getenv("OCERZ_NO_RAS") ? 1 : 0;
             g_no_regflags = getenv("OCERZ_NO_REGFLAGS") ? 1 : 0;
             g_no_chain = getenv("OCERZ_NO_CHAIN") ? 1 : 0;
+            g_no_jcclink = getenv("OCERZ_NO_JCCLINK") ? 1 : 0;
         }
         pthread_mutex_unlock(&jit_lock);
     }

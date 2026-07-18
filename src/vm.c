@@ -81,6 +81,8 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <sched.h>
+#include <errno.h>
+#include <time.h>
 
 #define OCERZ_CALL_SENTINEL 0x00000000deadca11ull
 
@@ -1373,15 +1375,52 @@ static void *ocerz_test_async_stop(void *p)
     return NULL;
 }
 
+/* Wall-clock cross-thread stop hook (off unless OCERZ_TEST_ASYNC_STOP_MS is set).
+ * The ICOUNT variant above cannot arm a FULLY-LINKED loop: once every back-edge
+ * of a hot loop chains block-to-block, the loop never re-enters the dispatcher's
+ * per-block insn_count bump, so insn_count FREEZES and the count threshold is
+ * never crossed. This variant instead waits a fixed wall interval (independent of
+ * guest progress) and then requests exit, so it can break a loop that emits no
+ * dispatch at all -- exactly what the general-link interruptibility gate needs.
+ * It exercises the identical cross-thread request_exit -> cpu->interrupt broadcast
+ * path; only the trigger differs. nanosleep is EINTR-retried so a stray signal
+ * cannot shorten the interval. */
+static void *ocerz_test_async_stop_ms(void *p)
+{
+    OcerzVM *vm = (OcerzVM *)p;
+    const char *msn = getenv("OCERZ_TEST_ASYNC_STOP_MS");
+    long ms = msn ? strtol(msn, NULL, 0) : 200;
+    if (ms < 0)
+        ms = 0;
+    struct timespec req;
+    req.tv_sec = ms / 1000;
+    req.tv_nsec = (ms % 1000) * 1000000L;
+    struct timespec rem;
+    while (nanosleep(&req, &rem) != 0 && errno == EINTR)
+        req = rem;
+    ocerz_vm_request_exit(vm, 0);
+    return NULL;
+}
+
 int ocerz_vm_run(OcerzVM *vm)
 {
     ocerz_vm_install_handlers(vm);
+    /* Exactly ONE async-stop thread: the deterministic ICOUNT one when armed,
+     * else the wall-clock MS one. ICOUNT wins when both are set so existing
+     * gates (interrupt_test) keep their exact semantics. */
     if (getenv("OCERZ_TEST_ASYNC_STOP_ICOUNT")) {
         pthread_t th;
         pthread_attr_t at;
         pthread_attr_init(&at);
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
         pthread_create(&th, &at, ocerz_test_async_stop, vm);
+        pthread_attr_destroy(&at);
+    } else if (getenv("OCERZ_TEST_ASYNC_STOP_MS")) {
+        pthread_t th;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        pthread_create(&th, &at, ocerz_test_async_stop_ms, vm);
         pthread_attr_destroy(&at);
     }
     int rc = ocerz_vm_run_cpu(vm, &vm->cpu);
