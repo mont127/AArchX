@@ -125,7 +125,14 @@ run_with_timeout() {
 # deep in the loop; its golden is the NATIVE x86_64 run, so a dropped pin spill or
 # a body-entry shortcut on a cross-block edge misassigns the accumulators and
 # fails against real hardware. Bounded/self-terminating: needs no async-stop arming.
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link)
+# fault_xlive is the CROSS-SEAM flag-at-fault gate that the 31-binary PUSHF
+# differential CANNOT see: it faults immediately after a JMP-imm block seam and
+# reads the faulting rflags from the ucontext, so if XLIVE ever dropped a
+# producer flag its successor "does not read" the masked flags would diverge from
+# the NATIVE golden. Green at HEAD and under correct XLIVE (the fault barrier
+# keeps the producer eager); the STEP-2 mutation that kills the barrier makes it
+# FAIL, proving the barrier is load-bearing. Bounded/self-terminating.
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive)
 
 expected_exit() {
     case "$1" in

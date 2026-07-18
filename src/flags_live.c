@@ -140,8 +140,56 @@ void ocerz_flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use)
         }
         break;
 
+    /* ---- Conditional/unconditional branches: write no flag. ---------------
+     * These appear only as a block terminator. Their `use` is what XLIVE's
+     * cross-seam relaxation reads: a predecessor A that links to B may drop a
+     * flag that B (starting with one of these) never reads. Until STEP 2
+     * relaxes the terminator live_out=ALL seed at jit.c, these entries are
+     * INERT (live_out=ALL and def=0 leave the backward pass unchanged), so this
+     * table is safe to land first.
+     *
+     * JCC reads exactly its condition's flags. The mapping is emit_jcc's own
+     * `cc >> 1` table (src/jit.c): the low bit only inverts the sense, it reads
+     * the SAME flags. def stays 0 — a branch writes no arithmetic flag — so a
+     * superset use is the only correctness obligation, and this is the exact set
+     * (an exact use is still a valid superset). */
+    case OCERZ_OP_JCC:
+        d = 0;
+        switch (insn->cc >> 1) {
+        case 0: u = OCERZ_OF; break;                 /* O  */
+        case 1: u = OCERZ_CF; break;                 /* B  */
+        case 2: u = OCERZ_ZF; break;                 /* E  */
+        case 3: u = OCERZ_CF | OCERZ_ZF; break;      /* BE */
+        case 4: u = OCERZ_SF; break;                 /* S  */
+        case 5: u = OCERZ_PF; break;                 /* P  */
+        case 6: u = OCERZ_SF | OCERZ_OF; break;      /* L  */
+        default: u = OCERZ_ZF | OCERZ_SF | OCERZ_OF; break; /* LE */
+        }
+        break;
+
+    /* JMP (direct or indirect), JRCXZ and LOOP read NO flag: JMP is
+     * unconditional, JRCXZ/LOOP branch on rcx (a register, not rflags). def=0.
+     * An INDIRECT JMP through memory is still forced use=ALL by the fault
+     * barrier below, so this is only the no-flag claim for the register/imm
+     * forms; the memory-fault path stays conservative. */
+    case OCERZ_OP_JMP:
+    case OCERZ_OP_JRCXZ:
+    case OCERZ_OP_LOOP:
+        d = 0;
+        u = 0;
+        break;
+
+    /* LOOPE/LOOPNE branch on (rcx != 0) AND ZF, so they read exactly ZF. */
+    case OCERZ_OP_LOOPE:
+    case OCERZ_OP_LOOPNE:
+        d = 0;
+        u = OCERZ_ZF;
+        break;
+
     default:
-        /* def=0, use=ALL. See the header: this is the safe direction. */
+        /* def=0, use=ALL. See the header: this is the safe direction.
+         * CALL/RET/IRET/SYSCALL/INT/INT3/UD2 deliberately land here — they keep
+         * use=ALL so XLIVE never relaxes across a fault/dynamic barrier. */
         break;
     }
 

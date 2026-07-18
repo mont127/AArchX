@@ -282,6 +282,20 @@ typedef struct JitBlock {
         uint8_t kind;
     } edges[2];
     uint8_t n_edges;
+    /* ---- CROSS-BLOCK FLAG LIVENESS (xlive) -----------------------------
+     * The set of arithmetic flags (OCERZ_FL_* mask; up to OF at bit 11, so it
+     * needs 16 bits, not 8) that are LIVE ON ENTRY to this block: the flags a
+     * predecessor linking here must have materialized. Computed by an ALL-seeded
+     * backward liveness walk over this block's own instructions (i.e. live_in of
+     * the first instruction, assuming a conservative ALL live-out), so it is
+     * INDEPENDENT of this block's own successors and safe to publish for
+     * predecessors to consume. A predecessor A that ends in JMP/JCC to this block
+     * seeds its terminator live_out with this value instead of ALL, dropping the
+     * flags this block provably overwrites before reading. Written under jit_lock
+     * before cache_insert; read lock-free by later translations (a compiled
+     * block's entry_live is immutable once published, and translate() only reads
+     * it via cache_lookup ->code, which observes a fully-initialized block). */
+    uint16_t entry_live;
 } JitBlock;
 
 enum { EDGE_XBLOCK = 0, EDGE_SELFLOOP = 1 };
@@ -344,6 +358,18 @@ static int g_no_chain;
  * lever's contribution against the pre-lever codegen. Read once at jit init;
  * whole-run decision, mirroring g_no_chain. */
 static int g_no_jcclink;
+/* OCERZ_NO_XLIVE: A/B kill switch for CROSS-BLOCK FLAG LIVENESS (xlive). When
+ * xlive is on (the default), a block whose STATIC successor is already compiled
+ * seeds its backward flag-liveness pass with that successor's entry_live instead
+ * of ALL, so the block's LAST flag producer emits only the flags the successor
+ * (union its Jcc condition) actually reads before overwriting -- collapsing the
+ * eager flag tails at a linked seam. Sound only because a fault/dynamic barrier
+ * in the cross-seam window keeps use=ALL (flags_live.h): the terminator table
+ * leaves CALL/RET/IRET/SYSCALL/INT at use=ALL, and any memory-touching first op
+ * of the successor forces its entry_live to ALL. When set, the seam seed reverts
+ * to OCERZ_FL_ALL and codegen is byte-identical to the pre-xlive build. Read once
+ * at jit init; whole-run decision, mirroring g_no_jcclink. */
+static int g_no_xlive;
 /* Per-block chain context (single-writer under jit_lock, like g_pin). A CALL(imm)
  * terminator records its direct-target rip here and the address of its terminal
  * STEP_OK epilogue branch; translate() then redirects that branch into an
@@ -518,6 +544,22 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
     unsigned h = hash_rip(b->guest_rip);
     b->hnext = jit->buckets[h];
     __atomic_store_n(&jit->buckets[h], b, __ATOMIC_RELEASE);
+}
+
+/* XLIVE: the flags a STATICALLY-linked successor at `rip` needs live on entry.
+ *
+ * Returns that successor's published entry_live IFF it is already a fully
+ * compiled block (t->code != NULL); otherwise OCERZ_FL_ALL, the conservative
+ * seed. A cache miss, an in-flight/half-initialized block, or a demoted
+ * (code==NULL) block all fall back to ALL, so a predecessor never relaxes across
+ * an edge whose successor's flag needs it cannot see. Lock-free like
+ * cache_lookup (acquire-loaded bucket chain, never-freed blocks); a compiled
+ * block's entry_live is immutable once published, so reading it here is a plain
+ * load. Callers gate on !g_no_xlive. */
+static uint64_t xlive_succ_live(OcerzJit *jit, uint64_t rip)
+{
+    JitBlock *t = cache_lookup(jit, rip);
+    return (t && t->code) ? (uint64_t)t->entry_live : (uint64_t)OCERZ_FL_ALL;
 }
 
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
@@ -2735,34 +2777,93 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     if (!g_no_chain)
         g_body_entry = a64_label(&b);
 
+    /* ---- XLIVE SEAM SEED --------------------------------------------------
+     * The live_out of this block's LAST instruction. WITHOUT xlive this is ALL
+     * SIX, unconditionally -- the sound-without-cross-block-analysis rule: a
+     * successor, a signal handler, or the interpreter may read any flag on entry
+     * and this translator cannot know which. WITH xlive, when the terminator is a
+     * STATIC edge (JMP-imm, or JCC's two arms) whose target(s) are ALREADY
+     * compiled, we seed with the successor's published entry_live instead -- the
+     * exact flags that successor needs live on entry -- so the block's last flag
+     * producer can drop flags the successor provably overwrites before reading.
+     * The pass RE-ADDS the terminator's own use (e.g. a JCC's condition flags)
+     * when it processes the last instruction, so the producer keeps exactly
+     * (successor reads) UNION (branch condition).
+     *
+     * SOUNDNESS. This relaxation is safe ONLY because a fault/dynamic barrier in
+     * the cross-seam window forces the successor's entry_live back to ALL:
+     *   - CALL/RET/IRET/SYSCALL/INT/INT3/UD2 keep use=ALL in the terminator
+     *     table (flags_live.c), so they never reach the JMP/JCC arms below and
+     *     seam_seed stays ALL -- xlive never relaxes across a dynamic/fault edge.
+     *   - a successor whose first op TOUCHES MEMORY has entry_live=ALL (the
+     *     flags_live.h fault barrier), so a fault at that first op still sees a
+     *     fully-materialized rflags. tests/guest/fault_xlive.c is the executable
+     *     gate for this; the differential is the consumer-side gate.
+     * INVARIANT (documented next to JitBlock::entry_live and in flags_live.h):
+     * ocerz reads guest rflags off a non-consumer path ONLY at synchronous
+     * faults (every trapping op is a use=ALL barrier) and at SYSCALL/INT async
+     * (excluded from the table -> seam_seed=ALL). It does NOT preempt at
+     * arbitrary block boundaries. If preemptive block-boundary signal delivery is
+     * ever added, this relaxation would expose stale flags to a handler PUSHF and
+     * must be revisited.
+     *
+     * A block that fell off the length cap (last insn not a terminator) keeps
+     * ALL: its fall-through successor is not resolved here. */
+    uint64_t seam_seed = OCERZ_FL_ALL;
+    if (!g_no_xlive && is_terminator(blk->insns[n - 1].op)) {
+        const X86Insn *term = &blk->insns[n - 1];
+        switch (term->op) {
+        case OCERZ_OP_JMP:
+            /* Direct JMP: one static successor. Indirect JMP (reg/mem target)
+             * leaves seam_seed=ALL -- a dynamic edge, like RET. */
+            if (term->ops[0].kind == OCERZ_OPK_IMM)
+                seam_seed = xlive_succ_live(jit, term->ops[0].imm);
+            break;
+        case OCERZ_OP_JCC: {
+            /* Two static successors. UNION (not intersect): keep any flag EITHER
+             * arm may read. taken == ops[0].imm, fall == rip+len (emit_jcc's own
+             * geometry). */
+            uint64_t taken = xlive_succ_live(jit, term->ops[0].imm);
+            uint64_t fall  = xlive_succ_live(jit, term->rip + term->len);
+            seam_seed = taken | fall;
+            break;
+        }
+        default:
+            /* CALL/RET/IRET/SYSCALL/INT/INT3/UD2/JRCXZ/LOOP*: dynamic, fault, or
+             * rcx-branch terminators -- conservative ALL. */
+            break;
+        }
+    }
+
     /* ---- BACKWARD FLAG LIVENESS ------------------------------------------
-     * fl_need[i] = the flags insn i writes that something downstream reads, i.e.
-     * def[i] & live_out[i]. The emitter computes exactly those.
+     * fl_need[i] = def[i] & live_out[i]: the flags insn i writes that something
+     * downstream (this block, or -- via seam_seed -- a linked successor) reads.
+     * The emitter computes exactly those.
      *
-     * live_out of the LAST instruction is ALL SIX, unconditionally. That single
-     * rule is what makes this pass sound without any cross-block analysis: a
-     * successor block, a signal handler, or the interpreter may read any flag on
-     * entry, and this translator has no idea which. It is also why the win is
-     * real anyway — inside a block, each arithmetic op's flags are almost always
-     * killed by the next one, and only the block's last producer survives.
-     *
-     * A block that runs off the length cap falls through to a successor exactly
-     * like one ending on a terminator, so it needs the same live-out=ALL; the
-     * rule is applied to the last instruction either way and needs no special
-     * case.
+     * Two live-out chains run in lockstep over the same backward walk:
+     *   live_seam is seeded with seam_seed and drives fl_need (this block's
+     *     codegen); it collapses the seam producer when the successor is known.
+     *   live_all is seeded with ALL and yields entry_live at insn 0 -- the SAFE
+     *     superset a PREDECESSOR must supply, INDEPENDENT of this block's own
+     *     successors (a predecessor cannot assume anything about where this block
+     *     goes). Publishing live_all, not live_seam, is what keeps the recursion
+     *     non-circular and sound.
      *
      * Standard dataflow: live_in = (live_out & ~def) | use. Every entry in the
      * def/use table is conservative in the safe direction (see
-     * include/ocerz/flags_live.h), so an unmodelled op degrades to today's eager
+     * include/ocerz/flags_live.h), so an unmodelled op degrades to eager
      * behaviour rather than to a wrong answer. */
     uint64_t fl_need[JIT_MAX_BLOCK_INSNS];
+    uint64_t entry_all;
     {
-        uint64_t live_out = OCERZ_FL_ALL;
+        uint64_t live_seam = seam_seed;
+        uint64_t live_all = OCERZ_FL_ALL;
         for (int i = n - 1; i >= 0; i--) {
             uint64_t def, use;
             ocerz_flags_defuse(&blk->insns[i], &def, &use);
-            fl_need[i] = def & live_out;
-            live_out = (live_out & ~def) | use;
+            fl_need[i] = def & live_seam;
+            live_seam = (live_seam & ~def) | use;
+            live_all = (live_all & ~def) | use;
             /* OCERZ_NO_LAZYFLAGS: kill switch. Emit every flag the op defines,
              * i.e. exactly the eager behaviour this pass replaced. Keeps the
              * old codegen one env var away for A/B measurement and for bisecting
@@ -2770,7 +2871,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             if (g_no_lazyflags)
                 fl_need[i] = def;
         }
+        entry_all = live_all;
     }
+    /* Publish entry_live for predecessors BEFORE this block is cache_insert'd.
+     * Immutable once set; xlive_succ_live reads it lock-free only when code!=0. */
+    blk->entry_live = (uint16_t)entry_all;
 
     /* OCERZ_FLAGLIVE: per-block dump of what the pass proved dead. This is the
      * cross-check that the def/use table is actually doing what it claims — a
@@ -3362,6 +3467,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             g_no_regflags = getenv("OCERZ_NO_REGFLAGS") ? 1 : 0;
             g_no_chain = getenv("OCERZ_NO_CHAIN") ? 1 : 0;
             g_no_jcclink = getenv("OCERZ_NO_JCCLINK") ? 1 : 0;
+            g_no_xlive = getenv("OCERZ_NO_XLIVE") ? 1 : 0;
         }
         pthread_mutex_unlock(&jit_lock);
     }
