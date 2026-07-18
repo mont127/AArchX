@@ -115,7 +115,7 @@ run_with_timeout() {
 # guest is past startup; the run loop's cpu->interrupt poll must observe that and
 # exit 0. Without the poll (or its broadcast) it would run until the runner's
 # timeout -- a FAIL -- which is exactly the hang chaining would otherwise hide.
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume callret_fault imul_flags interrupt_test ras_stress)
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress)
 
 expected_exit() {
     case "$1" in
