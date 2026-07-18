@@ -115,7 +115,17 @@ run_with_timeout() {
 # guest is past startup; the run loop's cpu->interrupt poll must observe that and
 # exit 0. Without the poll (or its broadcast) it would run until the runner's
 # timeout -- a FAIL -- which is exactly the hang chaining would otherwise hide.
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress)
+# link_spin is the GENERAL two-way-Jcc-linking cross-thread-exit gate: a hot loop
+# whose body is a data-dependent if/else DIAMOND, so once every cross-block edge
+# chains, insn_count FREEZES and only a wall-clock async stop can break it. It is
+# launched with OCERZ_TEST_ASYNC_STOP_MS (see test_env), NOT the ICOUNT hook, for
+# exactly that reason. See tests/guest/link_spin.c.
+# fault_link is the cross-block-link FAULT-SEAM gate: a two-way loop across blocks
+# with DIFFERENT hot-register subsets that takes a branch-free NULL-store fault
+# deep in the loop; its golden is the NATIVE x86_64 run, so a dropped pin spill or
+# a body-entry shortcut on a cross-block edge misassigns the accumulators and
+# fails against real hardware. Bounded/self-terminating: needs no async-stop arming.
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link)
 
 expected_exit() {
     case "$1" in
@@ -138,6 +148,7 @@ test_args() {
 test_env() {
     case "$1" in
         interrupt_test) echo "OCERZ_TEST_ASYNC_STOP_ICOUNT=500000" ;;
+        link_spin) echo "OCERZ_TEST_ASYNC_STOP_MS=200" ;;
         *) echo "" ;;
     esac
 }
