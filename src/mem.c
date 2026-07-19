@@ -357,9 +357,35 @@ static void memlog(const char *op, uint64_t gaddr, uint64_t len, int prot)
     }
 }
 
+/* OCERZ_NO_BATCH_VM: force the pre-batch per-page mprotect/mmap behavior, for A/B.
+ * Default: range batching ON. */
+static int ocerz_no_batch_vm(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("OCERZ_NO_BATCH_VM") ? 1 : 0;
+    return v;
+}
+
 static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
                         uint64_t zlo, uint64_t zhi)
 {
+    /* FAST PATH: when there is no zero-overlap to memset (the common case --
+     * map_anywhere / ocerz_protect / claim_region all pass zlo>=zhi; only
+     * ocerz_map_fixed zeroes), commit the whole contiguous run with ONE range
+     * mprotect instead of one host syscall per 16KB page. [lo,hi) is a single
+     * region (region_for_range proved it) and g2h is affine within a region, so
+     * the host range [g2h(lo), g2h(lo)+(hi-lo)) is contiguous. Faithful: a range
+     * mprotect is identical to per-page mprotect -- pages stay zero-fill-on-demand,
+     * and the commit bitmap + 16KB-neighbor-union model are unchanged. On failure
+     * (e.g. a read-only file-overlay page in the run) fall through to the per-page
+     * loop, which keeps the mprotect-or-mmap fallback intact. */
+    if (!ocerz_no_batch_vm() && zlo >= zhi && hi > lo &&
+        mprotect(ocerz_g2h(lo), (size_t)(hi - lo), hprot) == 0) {
+        for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE)
+            bit_set(r, pg_index(r, p));
+        return OCERZ_OK;
+    }
     for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
         size_t i = pg_index(r, p);
         void *hp = ocerz_g2h(p);

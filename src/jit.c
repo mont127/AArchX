@@ -1348,8 +1348,23 @@ static void emit_add_const(A64Buf *b, int reg, uint64_t c)
 static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int addr_reg)
 {
     uint64_t fold = ea_fold();
-    if (insn->seg != OCERZ_SEG_NONE)
-        return 0;
+    int seg = insn->seg;
+    if (seg != OCERZ_SEG_NONE) {
+        /* Phase 2: inline FS/GS segment overrides (pthread TSD, libdispatch per-thread
+         * queues, errno -- pervasive in libsystem/libpthread/libdispatch startup) by
+         * adding the runtime per-thread segment base (cpu->fs_base/gs_base, a guest-arena
+         * address) as one more term below. The downstream emit_commpage_guard then sees
+         * the true guest linear address and the +guest_base fold + ordered-access path are
+         * inherited unchanged. CONSERVATIVE: only when the low-shadow window is INACTIVE
+         * (native apps; ocerz_low_base==0, fold active) -- Wine's low_base gs/fs is not
+         * covered by the differential gate, so it keeps the slow path. riprel+seg and
+         * addrsize==4+seg are also not handled here and stay slow. */
+        static int no_seg = -1;
+        if (no_seg < 0)
+            no_seg = getenv("OCERZ_NO_INLINE_SEG") ? 1 : 0;
+        if (no_seg || op->riprel || insn->addrsize == 4 || ocerz_low_base != 0)
+            return 0;
+    }
     if (op->riprel) {
         a64_mov_imm64(b, addr_reg, (uint64_t)op->disp + fold);
         return 1;
@@ -1364,6 +1379,13 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     if (op->index != OCERZ_REG_NONE) {
         emit_gpr_rd(b, 1, JT0, op->index);
         a64_add_reg(b, 1, addr_reg, addr_reg, JT0, op->scale & 3);
+    }
+    if (seg == OCERZ_SEG_FS) {
+        a64_ldr(b, 8, JT0, 20, (uint32_t)offsetof(OcerzCPU, fs_base));
+        a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
+    } else if (seg == OCERZ_SEG_GS) {
+        a64_ldr(b, 8, JT0, 20, (uint32_t)offsetof(OcerzCPU, gs_base));
+        a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
     }
     return 1;
 }
@@ -1517,6 +1539,60 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
          * ordered so plain x86 loads keep Total Store Order. JTU is dead here
          * and serves as the helper's alignment-check scratch. */
         emit_guest_load_ordered(b, d->size, JT1, JTA, JTU);
+        emit_gpr_wr(b, JT1, d->reg);
+        a64_patch_b(skip, a64_label(b));
+        return 1;
+    }
+    return 0;
+}
+
+/* MOVZX/MOVSX: zero/sign-extend an 8- or 16-bit source (register low byte/word, or
+ * memory) into a 4/8-bit GPR destination. Reuses emit_mov_mem's machinery for the
+ * memory source (EA + commpage guard + ordered SIZED load, which already zero-extends
+ * the byte/word). No flags, so none of the flags.c surface is reached. Kept slow for a
+ * 2-bit dest, an AH/BH/CH/DH source (needs a bit-extract), or a non-reg/mem source.
+ * MOVSXD keeps its own emitter. Measured ~13% of the interpreter slow path
+ * (movzx 11% + movsx 2% -- the #3 and #8 slow ops in a real Mousecape startup). */
+static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
+                     uint32_t **exit_sites, int *n_exits)
+{
+    static int no_sub = -1;
+    if (no_sub < 0)
+        no_sub = getenv("OCERZ_NO_INLINE_SUBWORD") ? 1 : 0;
+    if (no_sub)
+        return 0;
+    const X86Operand *d = &insn->ops[0];
+    const X86Operand *s = &insn->ops[1];
+    uint64_t gbase = ocerz_guest_base;
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
+        return 0;
+    if (s->size != 1 && s->size != 2)
+        return 0;
+    int sf = (d->size == 8);   /* extend width: dest 8 -> 64-bit, dest 4 -> 32-bit (w-op clears upper 32) */
+    if (s->kind == OCERZ_OPK_REG) {
+        if (s->high8)
+            return 0;
+        emit_gpr_rd(b, 1, JT1, s->reg);            /* full slot; low byte/word is the source */
+        if (is_signed) {
+            if (s->size == 1) a64_sxtb(b, sf, JT1, JT1);
+            else              a64_sxth(b, sf, JT1, JT1);
+        } else {
+            if (s->size == 1) a64_uxtb(b, JT1, JT1);
+            else              a64_uxth(b, JT1, JT1);
+        }
+        emit_gpr_wr(b, JT1, d->reg);
+        return 1;
+    }
+    if (s->kind == OCERZ_OPK_MEM) {
+        if (!emit_mem_ea(b, insn, s, JTA))
+            return 0;
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, gbase - ea_fold());
+        emit_guest_load_ordered(b, s->size, JT1, JTA, JTU);   /* zero-extends the byte/word */
+        if (is_signed) {
+            if (s->size == 1) a64_sxtb(b, sf, JT1, JT1);
+            else              a64_sxth(b, sf, JT1, JT1);
+        }
         emit_gpr_wr(b, JT1, d->reg);
         a64_patch_b(skip, a64_label(b));
         return 1;
@@ -1948,6 +2024,9 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_PUSH:
     case OCERZ_OP_POP:
         return emit_push_pop(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_MOVZX:
+    case OCERZ_OP_MOVSX:
+        return emit_movx(b, insn, insn->op == OCERZ_OP_MOVSX, exit_sites, n_exits);
     case OCERZ_OP_MOVSXD:
         return emit_movsxd(b, insn, exit_sites, n_exits);
     default:
