@@ -562,6 +562,29 @@ _Static_assert(offsetof(struct ocerz_kevent_qos_s, ext)    == 0x28, "kevent ext 
  * many delivered events are copied in, and how many guest re-arms are copied back. */
 #define OCERZ_WQ_KEVENT_LIST_LEN 16
 
+/* OCERZ_KEVENT_QOS_REARM -- the stride for the RE-ARM relay in sys_workq_kernreturn,
+ * and it MUST be the true 0x48, not the delivery-side 0x40 above. Here is the isolated
+ * co-dependency the delivery-side comment asked to find:
+ *
+ * The re-arm relay reads the GUEST's outgoing changelist. That changelist is written by
+ * the shipping libpthread/libdispatch (_dispatch_event_loop_merge), which always uses the
+ * real 0x48-byte kevent_qos_s, and it is copied into the host kernel's 0x48-native events
+ * buffer. BOTH ends of that copy are genuine kernel structs, so 0x40 there is unambiguously
+ * wrong: it reads every entry past index 0 eight bytes short. The re-arm list is measured
+ * n=2..3, and the EVFILT_WORKLOOP (-17) re-arm is routinely NOT entry 0 -- so ~half the time
+ * (whenever it landed at index >=1) ocerz handed the kernel a garbage workloop re-arm, the
+ * workloop was mis-armed and never drained, and the app parked at 0% CPU with no window:
+ * the "Application not responding" lost-wakeup. Its dependence on the re-arm entry's ordering
+ * is exactly why the hang was ~50% and not deterministic.
+ *
+ * Why this can be 0x48 while the delivery stride above stays 0x40: the delivery path is
+ * nev==1-dominated (a workloop wakeup delivers a single EVFILT_WORKLOOP event), so its stride
+ * never multiplies a nonzero index -- flipping the delivery macro to 0x48 was a regression
+ * because it also perturbed the nev==1 evbuf layout the guest reads, not because 0x40 was ever
+ * right for the re-arm. These are two different buffers with two different owners; they take
+ * two different strides. */
+#define OCERZ_KEVENT_QOS_REARM ((uint64_t)0x48)
+
 static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]);
 static void ocerz_hostwq_register(OcerzVM *vm);
 
@@ -940,6 +963,13 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         return OCERZ_STEP_OK;
     }
     if (op == 0x40 || op == 0x100) {
+        /* Re-arm stride: the true 0x48 (see OCERZ_KEVENT_QOS_REARM). OCERZ_REARM40 is a
+         * TEST-ONLY escape hatch that forces the old broken 0x40 so the fix can be A/B'd
+         * against its regression from a single binary; unset in every real launch. */
+        static int rearm40 = -1;
+        if (rearm40 < 0)
+            rearm40 = getenv("OCERZ_REARM40") != NULL;
+        const uint64_t rstride = rearm40 ? OCERZ_KEVENT_QOS_S : OCERZ_KEVENT_QOS_REARM;
         /* KEVENT (0x40) / WORKLOOP (0x100) worker completion: the guest
          * _pthread_wqthread issues this after its drain, passing its OUTGOING
          * re-arm changelist (a[1]=keventlist, a[2]=nkevents). For a HOSTWQ inline
@@ -989,12 +1019,14 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                         cpu->cpu_number, (unsigned long long)op, n, g_hostwq_tl_evcap,
                         n > g_hostwq_tl_evcap ? "  **TRUNCATED**" : "");
                 for (int i = 0; i < n && i < 8; i++) {
-                    uint64_t k = a[1] + (uint64_t)i * OCERZ_KEVENT_QOS_S;
-                    fprintf(stderr, " [%d]{id=%#llx filt=%d fl=%#llx fflags=%#llx}%s", i,
-                            (unsigned long long)ocerz_ld(k + 0x00, 8),
+                    uint64_t k = a[1] + (uint64_t)i * rstride;
+                    uint64_t wl = ocerz_ld(k + 0x00, 8);
+                    fprintf(stderr, " [%d]{id=%#llx filt=%d fl=%#llx fflags=%#llx dqs+38=%#llx}%s", i,
+                            (unsigned long long)wl,
                             (int)(int16_t)ocerz_ld(k + 0x08, 2),
                             (unsigned long long)ocerz_ld(k + 0x0a, 2),
                             (unsigned long long)ocerz_ld(k + 0x18, 4),
+                            (unsigned long long)(wl ? ocerz_ld(wl + 0x38, 8) : 0),  /* workloop dq_state: low 32b = drain-lock owner tid */
                             i >= g_hostwq_tl_evcap ? "<<DROPPED" : "");
                 }
                 fprintf(stderr, "\n");
@@ -1016,9 +1048,9 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             void *hbuf = *evp;
             if (hbuf && a[1]) {
                 for (int i = 0; i < n; i++)
-                    memcpy((char *)hbuf + (size_t)i * OCERZ_KEVENT_QOS_S,
-                           ocerz_g2h(a[1] + (uint64_t)i * OCERZ_KEVENT_QOS_S),
-                           OCERZ_KEVENT_QOS_S);
+                    memcpy((char *)hbuf + (size_t)i * rstride,
+                           ocerz_g2h(a[1] + (uint64_t)i * rstride),
+                           rstride);
             } else {
                 n = 0;
             }
@@ -1248,6 +1280,23 @@ static OcerzVM *g_hostwq_vm;
  * return to libpthread, which parks/recycles this host thread -- so serial-
  * ownership and park-and-reuse are the real kernel's job, not ours. */
 static __thread uint64_t g_hostwq_tl_region;
+/* Set when the previous worker recycled onto THIS host thread died via STEP_FATAL
+ * (wrc==125) mid-drain: it left libdispatch's per-drain TSD dangling in the reused
+ * region (gs:0xe8 _dispatch_deferred_items into the now-dead guest stack, gs:0xd8
+ * adopted wlh). A real macOS wqthread cannot be in this state -- a genuine mid-drain
+ * abort is process-fatal, so a recycled WQ_FLAG_REUSE thread ALWAYS re-enters with
+ * those == 0. The next worker on this host thread consumes the flag and restores that
+ * empty sentinel (see ocerz_hostwq_bridge / ocerz_hostwq_queue_cb). */
+static __thread int g_hostwq_tl_fatal;
+/* A/B toggle for the pthread stack-bounds write (pth+0xb0/pth+0xb8). Default ON
+ * (bounds written, fixes the malloc_vreport backtrace-overrun seed); OCERZ_NO_STACKBOUNDS=1
+ * skips them to test whether writing those fields regresses worker responsiveness. */
+static int ocerz_no_stackbounds(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("OCERZ_NO_STACKBOUNDS") ? 1 : 0;
+    return v;
+}
 
 /* Bridge ONE kernel-delivered Mach message into guest memory (UPDATE #23, Bug A).
  * An EVFILT_MACHPORT receive event the host kernel hands a host workqueue worker carries
@@ -1565,12 +1614,44 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
      * ran to completion on this reused struct. Deriving REUSE from the guest this way --
      * rather than from a host-side "have I entered before" flag -- stays correct even if
      * an earlier entry faulted before setup linked the node. */
+    /* Restore the empty per-drain TSD sentinel a completed native drain leaves, IF a
+     * prior worker on this recycled host thread died wrc==125 mid-drain (flag below). It
+     * left gs:0xe8 (_dispatch_deferred_items) dangling into its now-dead guest stack and
+     * gs:0xd8 (adopted wlh) stale; libdispatch's entry guard `mov rdi,gs:0xe8; and rdi,~2;
+     * jne` then dereferences that dangling ddi, writes through it (0x7ff802cda45d..cd791c
+     * append a 72-byte kevent), smashes the next worker's stack canary -> __stack_chk_fail
+     * -> abort -> UD2 -> a fresh dangling ddi -> self-sustaining cascade. gs_base=pth+0xe0
+     * so gs:0xe8=pth+0x1c8, gs:0xd8=pth+0x1b8. Gated on the fatal flag ONLY: a clean exit
+     * already self-clears both (native invariant), so an every-entry reset would be a no-op
+     * there and would also MASK a real clean-path leak if one ever arose. */
+    if (g_hostwq_tl_fatal) {
+        ocerz_st(pth + 0x1c8, 8, 0);   /* gs:0xe8 _dispatch_deferred_items */
+        ocerz_st(pth + 0x1b8, 8, 0);   /* gs:0xd8 adopted wlh */
+        g_hostwq_tl_fatal = 0;
+    }
     int registered = ocerz_ld(pth + 0xd8, 8) != 0;
     if (!registered) {
         ocerz_st(pth, 8, pth ^ cookie);
         ocerz_st(pth + 0xe0, 8, pth);
     }
     ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)kp);
+    /* Populate the guest pthread stack bounds. libpthread's backtrace walker
+     * thread_stack_pcs -- reached when libmalloc's diagnostic reporter malloc_vreport
+     * captures a backtrace (e.g. free() emitting a NON-fatal "free(%p): ..." warning
+     * during a workloop drain) -- bounds and terminates its frame-pointer walk with
+     * pthread_get_stackaddr_np (reads pth+0xb0, the high base) and stacksize = pth+0xb0
+     * minus pth+0xb8 (the low bottom). ocerz's synthetic worker left both 0, so the
+     * bounds were [0,0], the walk could not terminate at the real ~10 frames and ran to
+     * its 50-entry cap through this REUSED region's stale frame links -- overrunning
+     * malloc_vreport's on-stack 50-slot backtrace buffer by one, whose buffer[50] Apple
+     * packs to land EXACTLY on its stack canary at [rbp-0x30] (0x1c0-0x30 = 50*8). The
+     * full-8-byte code-pointer write smashed the canary -> __stack_chk_fail -> abort on
+     * the worker (STEP_FATAL). The worker C stack is RSP=pth-0x100 growing DOWN into
+     * [region, pth-0x100), so the base is pth-0x100 and the bottom is region. */
+    if (!ocerz_no_stackbounds()) {
+        ocerz_st(pth + 0xb0, 8, pth - 0x100);   /* stackaddr: stack base (high) */
+        ocerz_st(pth + 0xb8, 8, region);        /* stackbottom: stack low */
+    }
     OcerzCPU t;
     memset(&t, 0, sizeof t);
     t.vm = vm;
@@ -1610,6 +1691,10 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
      * _dispatch_deferred_items (a pointer into THIS worker's now-dead guest stack),
      * gs:0x18 = _dispatch_tid_self. */
     if (wrc == 125) {
+        /* Died mid-drain: flag this host thread so the NEXT worker recycled onto it
+         * scrubs the dangling libdispatch per-drain TSD (gs:0xe8/gs:0xd8) before
+         * libdispatch reads it. Functional; the fprintf below is only diagnostic. */
+        g_hostwq_tl_fatal = 1;
         uint64_t gs = t.gs_base;
         uint64_t ddi = ocerz_ld(gs + 0xe8, 8) & ~2ull;
         uint64_t sdq = ddi ? ocerz_ld(ddi + 8, 8) : 0;
@@ -1626,8 +1711,8 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
     }
     if (getenv("OCERZ_ULOCKLOG"))
         fprintf(stderr, "ocerz: WQ-EXIT  cpu#%u kport=%#x rc=%d\n", t.cpu_number, (unsigned)kp, wrc);
-    if (getenv("OCERZ_WQHIST")) {
-        uint64_t rh[16]; unsigned rn = ocerz_vm_riphist(rh, 16);
+    if (getenv("OCERZ_WQHIST") && wrc == 125) {
+        uint64_t rh[32]; unsigned rn = ocerz_vm_riphist(rh, 32);
         fprintf(stderr, "ocerz: WQ-HIST cpu#%u flt0=%d ident0=%#llx rip=%#llx hist:",
                 t.cpu_number, flt0, (unsigned long long)ident0,
                 (unsigned long long)t.rip);
@@ -1662,10 +1747,24 @@ static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
         g_hostwq_tl_region = region;
     }
     uint64_t pth = region + 0x1f0000;
+    /* Mirror of the bridge scrub: if a prior worker on this recycled host thread died
+     * mid-drain, restore the empty per-drain TSD sentinel before libdispatch reads it. */
+    if (g_hostwq_tl_fatal) {
+        ocerz_st(pth + 0x1c8, 8, 0);   /* gs:0xe8 _dispatch_deferred_items */
+        ocerz_st(pth + 0x1b8, 8, 0);   /* gs:0xd8 adopted wlh */
+        g_hostwq_tl_fatal = 0;
+    }
     mach_port_t kp = mach_thread_self();
     ocerz_st(pth, 8, pth ^ cookie);
     ocerz_st(pth + 0xe0, 8, pth);
     ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)kp);
+    /* Stack bounds for thread_stack_pcs -- see the detailed note in ocerz_hostwq_bridge.
+     * Without these libpthread's backtrace walker overruns malloc_vreport's buffer into
+     * its canary. The async worker shares the same RSP=pth-0x100 stack layout. */
+    if (!ocerz_no_stackbounds()) {
+        ocerz_st(pth + 0xb0, 8, pth - 0x100);   /* stackaddr: stack base (high) */
+        ocerz_st(pth + 0xb8, 8, region);        /* stackbottom: stack low */
+    }
     uint32_t qosbits = (uint32_t)(((uint64_t)pri >> 8) & 0x3fff);
     int qos_idx = qosbits ? (__builtin_ctz(qosbits) + 1) : 4;
     if (qos_idx < 1)
@@ -1688,7 +1787,8 @@ static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
     t.gpr[OCERZ_R9] = 0;
     t.gs_base = pth + 0xe0;
     ocerz_init_gate_wait();
-    ocerz_vm_run_cpu(vm, &t);
+    if (ocerz_vm_run_cpu(vm, &t) == 125)
+        g_hostwq_tl_fatal = 1;   /* async worker also died mid-drain; scrub on next entry */
     mach_port_deallocate(mach_task_self(), kp);
 }
 
@@ -1895,7 +1995,30 @@ static int sys_kevent_qos(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
      * register/wait on this kqueue's sources, which is exactly what libdispatch's CFRunLoop manager
      * needs to service the Cocoa app's event sources. */
     uint64_t kq_flags = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
-    if (getenv("OCERZ_HOSTWQ") && !(kq_flags & 0x20ull)) {
+    if (getenv("OCERZ_MGRPROBE") && (kq_flags & 0x20ull)) {
+        /* WORKQ manager-request channel probe: dump the changelist thread-request so we can
+         * see the EVENT_MANAGER priority (kevent qos field / a[2]=nchanges, a[1]=changelist). */
+        int nch = (int)a[2]; uint64_t cl = a[1];
+        fprintf(stderr, "ocerz: KQWORKQ[%d] flags=%#llx nchg=%d nev=%lld",
+                (int)getpid(), (unsigned long long)kq_flags, nch, (long long)a[4]);
+        for (int i = 0; i < nch && i < 4 && cl; i++) {
+            uint64_t k = cl + (uint64_t)i * OCERZ_KEVENT_QOS_S;
+            fprintf(stderr, " [%d]{id=%#llx filt=%d fl=%#llx qos=%#llx fflags=%#llx}", i,
+                    (unsigned long long)ocerz_ld(k + 0x00, 8), (int)(int16_t)ocerz_ld(k + 0x08, 2),
+                    (unsigned long long)(uint16_t)ocerz_ld(k + 0x0a, 2),
+                    (unsigned long long)(uint32_t)ocerz_ld(k + 0x0c, 4),
+                    (unsigned long long)(uint32_t)ocerz_ld(k + 0x18, 4));
+        }
+        fprintf(stderr, "\n");
+    }
+    /* OCERZ_FWD_WORKQ: also forward the KEVENT_FLAG_WORKQ manager channel to the host kernel.
+     * The guest dispatch MANAGER polls the process kqueue via kevent_qos(WORKQ, qos=EVENT_MANAGER,
+     * nev>0); stubbing it returns 0 events so the manager can never drain _dispatch_mgr_q and the
+     * ENQUEUED_ON_MGR workloops livelock (re-arming NOTE_WL_THREAD_REQUEST forever) and the main
+     * thread's wakeup is never posted. Forwarding lets the manager see real kqueue events. */
+    static int fwd_workq = -1;
+    if (fwd_workq < 0) fwd_workq = getenv("OCERZ_NO_FWD_WORKQ") ? 0 : 1;  /* default ON: run the manager */
+    if (getenv("OCERZ_HOSTWQ") && (!(kq_flags & 0x20ull) || fwd_workq)) {
         ocerz_hostwq_register(vm);
         uint64_t fa[8];
         memcpy(fa, a, sizeof fa);
@@ -2629,6 +2752,10 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [444] = { "change_fdguard_np", 6, 0x2a, 0, NULL },
     [501] = { "necp_open", 1, 0x00, 0, NULL },
     [502] = { "necp_client_action", 6, 0x14, 0, NULL },
+    /* persona(op, flags, kinfo*, id*, idlen*): identity query (op 4 = PERSONA_OP_INFO).
+     * Forwarded to the host kernel -- the guest IS the host process, so the host's persona
+     * state is the faithful answer. Args 2/3/4 are pointers (mask 0x1c). Was a fatal gap. */
+    [494] = { "persona", 5, 0x1c, 0, NULL },
     [524] = { "setattrlistat", 6, 0x0e, 0, NULL },
     [521] = { "abort_with_payload", 6, 0x04, 0, sys_abort_payload },
     [283] = { "fchmod_extended", 5, 0x10, 0, NULL },
