@@ -997,7 +997,14 @@ static int build_frame(const char *path, int argc, char **argv, char **envp, Dyn
              (unsigned long long)(stack + DYN_STACK_SIZE), (unsigned long long)DYN_STACK_SIZE,
              (unsigned long long)0x4000, (unsigned long long)0x4000);
     apple_g[0] = put_str(&sp, apple0);
-    apple_g[1] = put_str(&sp, "stack_guard=0x6f6365727a5f6773");
+    /* The low byte (LSB) MUST be 0x00, matching the real macOS/dyld stack canary: it is the
+     * "terminator canary" defense -- a string write whose NUL terminator lands exactly on the
+     * canary's first byte leaves a zero-LSB canary intact. libsystem_malloc (and others) rely on
+     * this during startup string/zone setup; with a non-zero LSB (was 0x...73) that otherwise-
+     * harmless terminator flips 0x73->0x00 and trips __stack_chk_fail -> abort() on a workqueue
+     * worker mid-drain -> STEP_FATAL. Keep the rest of the value fixed/recognizable; only the LSB
+     * is load-bearing. */
+    apple_g[1] = put_str(&sp, "stack_guard=0x6f6365727a5f6700");
     apple_g[2] = put_str(&sp, "ptr_munge=0xa3f1c2b4d5e60718");
     apple_g[3] = put_str(&sp, "malloc_entropy=0x91827364a5b6c7d8,0x1f2e3d4c5b6a7988");
     apple_g[4] = put_str(&sp, stkbuf);
