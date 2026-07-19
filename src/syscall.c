@@ -954,6 +954,14 @@ static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
  * worker sets WQ_FLAG_THREAD_REUSE and libpthread skips setup entirely. */
 #define OCERZ_PTHREAD_COOKIE 0x7ff8436bd690ull
 
+/* Cached env-flag test. getenv() is an environ-lock + linear scan; on the hottest
+ * syscall paths -- mach_msg2 (one per WindowServer message) and the workloop-return
+ * relay (measured at ~3M calls during a dispatch spin) -- an uncached getenv per call
+ * is pure CPU plus cross-thread environ-lock contention (__findenv_locked showed up in
+ * live profiles). Every OCERZ_* diagnostic flag is set once at launch and never
+ * mutated, so the first lookup is cached. Each expansion site gets its own static. */
+#define OCERZ_ENV_ON(name) (__extension__({ static int _env_c = -1; if (_env_c < 0) _env_c = getenv(name) ? 1 : 0; _env_c; }))
+
 static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t op = a[0];
@@ -1014,7 +1022,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
              * kernel was handed garbage kevents, errored them, and re-fired immediately. The
              * cap was a brake bolted onto a broken constant. It is only safe to lift AFTER
              * the stride is correct -- that dependency is real. */
-            if (getenv("OCERZ_KRLOG")) {
+            if (OCERZ_ENV_ON("OCERZ_KRLOG")) {
                 fprintf(stderr, "ocerz: KRET cpu#%u op=%#llx n=%d evcap=%d%s |",
                         cpu->cpu_number, (unsigned long long)op, n, g_hostwq_tl_evcap,
                         n > g_hostwq_tl_evcap ? "  **TRUNCATED**" : "");
@@ -1068,7 +1076,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
          * synthetic worker, so all worker management -- workloop (kevent_id),
          * event (kevent), and async (here) -- goes through one kernel-owned pool
          * with correct QoS/lifecycle, the same as a native process. */
-        if (getenv("OCERZ_HOSTWQ") && getenv("OCERZ_HOSTWQ_ASYNC")) {
+        if (OCERZ_ENV_ON("OCERZ_HOSTWQ") && OCERZ_ENV_ON("OCERZ_HOSTWQ_ASYNC")) {
             ocerz_hostwq_register(vm);
             uint64_t fa[8];
             memcpy(fa, a, sizeof fa);
@@ -1569,9 +1577,23 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
     uint64_t evbuf = pth + 0x8000;
     ocerz_st(evbuf - 8, 8, workloop_id);   /* &workloop_id = keventlist-8; read by the guest
                                             * _dispatch_workloop_worker_thread (0 for kevent/async) */
-    for (int i = 0; i < nev; i++)
+    /* Copy each delivered kevent. The REAL kevent_qos_s is 0x48; the delivery stride
+     * OCERZ_KEVENT_QOS_S (0x40) drops the last 8 bytes = ext[3] = EV_EXTIDX_WL_VALUE,
+     * the EVFILT_WORKLOOP state-advertisement value the guest worker compares against
+     * the workloop's dq_state to decide "drained vs stale". Dropping it makes that
+     * compare read a STALE ext[3] -> the kernel keeps echoing EV_ERROR data=ESTALE(0x46)
+     * and the workloop re-arms forever (measured: one wlid re-dispatched 2M+ times,
+     * ~7s of startup burned on this spin). A single workloop wakeup is delivered nev==1,
+     * so copy the FULL 0x48 for the single-event case -- this restores ext[3] WITHOUT
+     * changing the 0x40 stride that the multi-event evbuf layout and the re-arm append
+     * co-depend on (flipping the stride globally is the known 0/8-launch regression). For
+     * nev==1 there is no next entry, so the extra 8 bytes land in unused evbuf space. */
+    int no_ext3 = OCERZ_ENV_ON("OCERZ_NO_EXT3WL");   /* A/B escape hatch for the fix below */
+    for (int i = 0; i < nev; i++) {
+        uint64_t csz = (nev == 1 && !no_ext3) ? (uint64_t)0x48 : OCERZ_KEVENT_QOS_S;
         memcpy(ocerz_g2h(evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S),
-               (const char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S, OCERZ_KEVENT_QOS_S);
+               (const char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S, csz);
+    }
     if (getenv("OCERZ_WSIG"))
         for (int i = 0; i < nev; i++) {
             const unsigned char *e = (const unsigned char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S;
@@ -1843,6 +1865,29 @@ static void ocerz_hostwq_workloop_cb(uint64_t *workloop_id, void **events, int *
      * derivation in sys_workq_kernreturn. libdispatch may legitimately return up to
      * ddi_maxevents=14 re-arms off a single delivered event. */
     g_hostwq_tl_evcap   = OCERZ_WQ_KEVENT_LIST_LEN;
+    /* OCERZ_SPINLOG: spin detector. The workloop re-arm spin re-dispatches workloop
+     * workers at ~hundreds-of-thousands/s; normal activity is ~25/s. Log every 5000th
+     * dispatch (rare when idle, frequent during a spin) with the workloop id, its live
+     * dq_state, and the first delivered event -- to see WHICH source keeps firing without
+     * its drain clearing DIRTY. Diagnostic-only, gated. */
+    if (OCERZ_ENV_ON("OCERZ_SPINLOG")) {
+        static _Atomic unsigned long long g_disp;
+        unsigned long long d = ++g_disp;
+        if ((d % 5000ull) == 0) {
+            uint64_t wlid = workloop_id ? *workloop_id : 0;
+            int ne = nevents ? *nevents : 0;
+            const unsigned char *ev = events ? (const unsigned char *)*events : NULL;
+            int16_t f0 = 0; uint64_t id0 = 0, dt0 = 0; uint32_t ff0 = 0;
+            if (ev && ne > 0) {
+                memcpy(&id0, ev + 0x00, 8); memcpy(&f0, ev + 0x08, 2);
+                memcpy(&ff0, ev + 0x0c, 4); memcpy(&dt0, ev + 0x20, 8);
+            }
+            fprintf(stderr, "ocerz: SPINLOG disp=%llu wlid=%#llx dq=%#llx nev=%d ev0{filt=%d fflags=%#x id=%#llx data=%#llx}\n",
+                    d, (unsigned long long)wlid,
+                    (unsigned long long)(wlid ? ocerz_ld(wlid + 0x38, 8) : 0), ne,
+                    f0, ff0, (unsigned long long)id0, (unsigned long long)dt0);
+        }
+    }
     ocerz_hostwq_bridge(r8, workloop_id ? *workloop_id : 0,
                         events ? *events : NULL, nevents ? *nevents : 0);
     if (g_hostwq_tl_nevents) {
@@ -3175,6 +3220,9 @@ static void ocerz_reply_relocate_ool(uint64_t reply_buf, uint32_t recv_size)
         return;
     static int rlog = -1;
     if (rlog < 0) rlog = getenv("OCERZ_MACHMSG") ? 1 : 0;
+    static int ooltrace = -1;
+    if (ooltrace < 0) ooltrace = getenv("OCERZ_OOLTRACE") ? 1 : 0;
+    uint32_t reply_id = (uint32_t)ocerz_ld(reply_buf + 0x14, 4);
     uint64_t off = 0x1c;
     for (uint32_t d = 0; d < dcnt; d++) {
         if (off + 12 > sz)
@@ -3195,12 +3243,19 @@ static void ocerz_reply_relocate_ool(uint64_t reply_buf, uint32_t recv_size)
                 fprintf(stderr, "ocerz: REPLY-OOL type=%u ool_addr=%#llx bytes=%#llx host=%d%s\n",
                         type, (unsigned long long)ool_addr, (unsigned long long)bytes, host_owned,
                         bytes > 0x1000000 ? "  **OVER-16MB-LEFT-RAW**" : "");
+            if (ooltrace && host_owned && bytes > 0x1000000)
+                fprintf(stderr, "ocerz: OOLTRACE-RAW16 id=%u type=%u ool_addr=%#llx bytes=%#llx LEFT-RAW\n",
+                        reply_id, type, (unsigned long long)ool_addr, (unsigned long long)bytes);
             if (host_owned && bytes && bytes <= 0x1000000) {
                 uint64_t gb = ocerz_map_anywhere((bytes + 0x3fffull) & ~0x3fffull,
                                                  PROT_READ | PROT_WRITE);
                 if (gb) {
                     memcpy(ocerz_g2h(gb), (const void *)(uintptr_t)ool_addr, (size_t)bytes);
                     ocerz_st(reply_buf + off, 8, gb);       /* desc.addr -> guest copy */
+                    if (ooltrace)
+                        fprintf(stderr, "ocerz: OOLTRACE-COPY id=%u type=%u gb=%#llx..%#llx bytes=%#llx\n",
+                                reply_id, type, (unsigned long long)gb,
+                                (unsigned long long)(gb + bytes), (unsigned long long)bytes);
                 } else {
                     ocerz_st(reply_buf + off, 8, 0);        /* alloc failed: deliver an EMPTY */
                     ocerz_st(reply_buf + off + 12, 4, 0);   /* OOL, never a raw host pointer */
@@ -3209,6 +3264,9 @@ static void ocerz_reply_relocate_ool(uint64_t reply_buf, uint32_t recv_size)
             off += 16;
             continue;
         }
+        if (ooltrace)
+            fprintf(stderr, "ocerz: OOLTRACE-BREAK id=%u off=%#llx type=%u (remaining desc left raw)\n",
+                    reply_id, (unsigned long long)off, (uint8_t)ocerz_ld(reply_buf + off + 11, 1));
         break;                                          /* unknown stride: stop */
     }
 }
@@ -3439,12 +3497,12 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         /* Log the message header BEFORE the (possibly blocking) trap, so a mach_msg2
          * that never returns (the boot keystone deadlock) still shows its dest port /
          * id / options. msgh_bits@0, remote_port@8, local_port@0xc, msgh_id@0x14. */
-        if (reply_buf != 0 && getenv("OCERZ_MACHMSG"))
+        if (reply_buf != 0 && OCERZ_ENV_ON("OCERZ_MACHMSG"))
             fprintf(stderr, "ocerz: MACHMSG-ENTER[%d] opts=%#llx voucher|id=%#llx bits=%#x rport=%#x lport=%#x id=%u xlated=%d\n",
                     (int)getpid(), (unsigned long long)a[1], (unsigned long long)a[4],
                     (uint32_t)ocerz_ld(reply_buf, 4), (uint32_t)ocerz_ld(reply_buf + 8, 4),
                     (uint32_t)ocerz_ld(reply_buf + 0xc, 4), (uint32_t)ocerz_ld(reply_buf + 0x14, 4), nsv47);
-        if (reply_buf != 0 && getenv("OCERZ_VMMAPPROBE") &&
+        if (reply_buf != 0 && OCERZ_ENV_ON("OCERZ_VMMAPPROBE") &&
             (uint32_t)ocerz_ld(reply_buf + 0x14, 4) == 4811) {
             fprintf(stderr, "ocerz: VMMAPREQ id=4811 dcnt=%u portname=%#x raw18:",
                     (uint32_t)ocerz_ld(reply_buf + 0x18, 4), (uint32_t)ocerz_ld(reply_buf + 0x1c, 4));
@@ -3454,7 +3512,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
         /* OCERZ_MSGDUMP: print the message body as ASCII when it carries a recognizable service name
          * (bootstrap look-ups inline the name), to identify which daemon a stalling MIG call targets. */
-        if (reply_buf != 0 && getenv("OCERZ_MSGDUMP")) {
+        if (reply_buf != 0 && OCERZ_ENV_ON("OCERZ_MSGDUMP")) {
             char asc[321]; int ai = 0;
             for (int k = 0x18; k < 0x158 && ai < 320; k++) {
                 uint8_t c = (uint8_t)ocerz_ld(reply_buf + (uint64_t)k, 1);
