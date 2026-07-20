@@ -950,6 +950,127 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
+/* CMP/TEST at operand size 1 or 2, register r/m, register-or-immediate source.
+ *
+ * WHY THESE AND WHY NOW. `test` is 43.9% of the interpreter slow path after the
+ * direct-jmp work, and its shape counter reads easy=0.0% -- i.e. essentially ALL of
+ * it is these narrow forms (`test al,al`, `cmp al,imm`), which every existing
+ * emitter rejects on `size != 4 && size != 8`. CMP and TEST are the SAFE subset of
+ * the narrow forms because they WRITE NO REGISTER: the x86 partial-register merge
+ * problem (upper 56/48 bits of the guest slot preserved) simply does not arise, so
+ * only the flags have to be right. The WRITING narrow forms (SUB/AND/ADD/OR/XOR at
+ * size 1/2) are deliberately NOT widened here -- they need bfi merge semantics and
+ * are a separate change.
+ *
+ * DEFERRED path: nothing special. ocerz_flags_sub/ocerz_flags_logic mask a, b and
+ * res by `size` themselves (src/flags.c), and ocerz_cc_pack already carries size, so
+ * the record built with d->size reproduces the narrow flags bit-exactly.
+ *
+ * EAGER path: NZCV has to be produced AT THE X86 WIDTH. Shift BOTH operands up so
+ * the byte/word sits at the top of a w-register (s = 32 - 8*size) and use a 32-bit
+ * SUBS/ANDS. Both operands have their low s bits zero, so (a<<s)-(b<<s) == (a-b)<<s
+ * exactly -- no borrow enters from below -- giving N = bit(8*size-1) of a-b = x86 SF,
+ * Z = ((a-b) mod 2^(8*size) == 0) = x86 ZF, C = !borrow of the narrow compare (x86 CF
+ * is its inverse, which is exactly why the wide path already csets CC for SUB), and
+ * V = signed overflow about the true x86 sign bit = x86 OF. Merely zero-extending
+ * would get Z and C right BY ACCIDENT and N and V WRONG: a=0x80,b=0x00 gives x86
+ * SF=1 but 32-bit N=0; a=0x80,b=0x01 gives x86 OF=1 but V=0, because zero-extended
+ * bytes can never overflow 32-bit signed. PF and AF are positional, so they are
+ * computed from the UNSHIFTED masked values. ANDS sets C=0/V=0, which is precisely
+ * x86 TEST forcing CF=0/OF=0; AF is architecturally undefined there and the wide
+ * logic path leaves it clear too, so emit_commit_flags's clear-mask reproduces it. */
+static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    static int no_narrow = -1;
+    if (no_narrow < 0)
+        no_narrow = getenv("OCERZ_NO_INLINE_NARROW") ? 1 : 0;
+    if (no_narrow)
+        return 0;
+    unsigned op = insn->op;
+    if (op != OCERZ_OP_CMP && op != OCERZ_OP_TEST)
+        return 0;
+    const X86Operand *d = &insn->ops[0];
+    const X86Operand *s = &insn->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 1 && d->size != 2))
+        return 0;
+    if (s->kind == OCERZ_OPK_REG) {
+        if (s->high8 || s->size != d->size)
+            return 0;
+    } else if (s->kind != OCERZ_OPK_IMM) {
+        return 0;
+    }
+    /* Decide BEFORE emitting anything (no dead prefix on a fallback). */
+    if (!g_defer && need == 0)
+        return 1;                       /* every flag written here is dead */
+
+    int is_sub = (op == OCERZ_OP_CMP);
+    int size = d->size;
+    uint64_t mask = (size == 1) ? 0xffull : 0xffffull;
+    int sh = 32 - 8 * size;
+
+    /* Operands MASKED to the width, unshifted: a in JT0, b in JT1. */
+    emit_gpr_rd(b, 1, JT0, d->reg);
+    if (size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0);
+    if (s->kind == OCERZ_OPK_REG) {
+        emit_gpr_rd(b, 1, JT1, s->reg);
+        if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
+    } else {
+        /* read_imm8s sign-extends to 64 bits, so MASK before use. */
+        a64_mov_imm64(b, JT1, (uint64_t)s->imm & mask);
+    }
+
+    if (g_defer) {
+        if (is_sub) {
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, JT1);
+        } else {
+            a64_and_reg(b, 1, JT2, JT0, JT1, 0);
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2);
+        }
+        return 1;
+    }
+
+    /* Shifted pair -> NZCV at the x86 width (JTA/JTU die right after). */
+    a64_lsl_imm(b, 0, JTA, JT0, sh);
+    a64_lsl_imm(b, 0, JTU, JT1, sh);
+    if (is_sub)
+        a64_subs_reg(b, 0, A64_ZR, JTA, JTU, 0);
+    else
+        a64_ands_reg(b, 0, A64_ZR, JTA, JTU, 0);
+
+    /* Unshifted narrow result, for the POSITIONAL flags (PF, AF). Non-flag-setting
+     * forms, so the NZCV just produced survives to the csets below. */
+    if (is_sub)
+        a64_sub_reg(b, 1, JT2, JT0, JT1, 0);
+    else
+        a64_and_reg(b, 1, JT2, JT0, JT1, 0);
+
+    a64_mov_imm64(b, JTF, 0);
+    emit_zf_sf(b, need);                /* cset EQ / cset MI off the shifted NZCV */
+    if (need & OCERZ_PF)
+        emit_pf(b, JT2);                /* low byte of the UNSHIFTED result */
+    if (is_sub) {
+        if (need & OCERZ_CF) {
+            a64_cset(b, JTT, A64_CC);   /* x86 CF is a BORROW = !ARM C */
+            a64_lsl_imm(b, 0, JTT, JTT, 0);
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+        }
+        if (need & OCERZ_OF) {
+            a64_cset(b, JTT, A64_VS);
+            a64_lsl_imm(b, 0, JTT, JTT, 11);
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+        }
+        if (need & OCERZ_AF) {
+            a64_eor_reg(b, 1, JTT, JT0, JT1, 0);
+            a64_eor_reg(b, 1, JTT, JTT, JT2, 0);
+            a64_ubfx(b, 1, JTT, JTT, 4, 1);
+            a64_lsl_imm(b, 0, JTT, JTT, 4);
+            a64_orr_reg(b, 1, JTF, JTF, JTT, 0);
+        }
+    }
+    emit_commit_flags(b, need);
+    return 1;
+}
+
 /* INC/DEC reg at size 4/8. CF is preserved (the clear-mask excludes it). OF is
  * positional (INC overflows into the signed minimum, DEC out of it leaving the
  * maximum); AF is the bit-3 half-carry, here (res&0xf)==0 for INC and ==0xf for
@@ -2031,6 +2152,10 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_OR:
     case OCERZ_OP_XOR:
     case OCERZ_OP_TEST:
+        /* Narrow (8/16-bit) CMP/TEST first: they write no register, so they are the
+         * safe subset of the sub-word forms and they dominate the slow path. */
+        if (emit_cmp_test_narrow(b, insn, need))
+            return 1;
         if (insn->ops[1].kind == OCERZ_OPK_MEM)
             return emit_arith_mem(b, insn, need, exit_sites, n_exits);
         return emit_arith(b, insn, need);
