@@ -2389,10 +2389,11 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
          * therefore needs no back-edge interrupt poll of its own -- the driving
          * loop's Jcc still returns to the run-loop header each iteration. */
         if (!g_no_ras) {
-            uint32_t *ras_miss[3];
-            int nrm = 0;
+            uint32_t *ras_empty;                        /* stack empty: nothing to pop */
+            uint32_t *ras_stale[2];                     /* mispredict / unusable: pop it */
+            int nst = 0;
             a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);        /* w: ras_top */
-            ras_miss[nrm] = a64_label(b); a64_cbz(b, 0, JT2, 0); nrm++;   /* empty */
+            ras_empty = a64_label(b); a64_cbz(b, 0, JT2, 0);              /* empty */
             a64_sub_imm(b, 0, JT2, JT2, 1);             /* w: top-1 (also new top) */
             a64_lsl_imm(b, 1, JTA, JT2, 4);             /* (top-1) * 16 (element stride) */
             a64_add_reg(b, 1, JTA, JTA, 20, 0);         /* JTA = cpu + (top-1)*16 */
@@ -2400,8 +2401,8 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             a64_ldr(b, 8, JT0, JTA, RAS_OFF + 8);       /* cpu->ras[top-1].host_entry */
             a64_ldr(b, 8, JTU, 20, RIP_OFF);            /* popped return addr */
             a64_sub_reg(b, 1, JTT, JTF, JTU, 0);        /* 0 iff predicted == popped */
-            ras_miss[nrm] = a64_label(b); a64_cbnz(b, 1, JTT, 0); nrm++;  /* mispredict */
-            ras_miss[nrm] = a64_label(b); a64_cbz(b, 1, JT0, 0); nrm++;   /* NULL entry */
+            ras_stale[nst] = a64_label(b); a64_cbnz(b, 1, JTT, 0); nst++;  /* mispredict */
+            ras_stale[nst] = a64_label(b); a64_cbz(b, 1, JT0, 0); nst++;   /* NULL entry */
             /* Matched: commit the pop, then tail-call the predicted block. */
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);        /* ras_top = top-1 */
             /* Tail-call to the predicted block: spill pinned guest regs so the
@@ -2415,9 +2416,20 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             a64_ldp_post(b, 19, 20, 31, 16);            /* undo prologue (frame) */
             a64_ldp_post(b, 29, 30, 31, 16);
             a64_br(b, JT0);                             /* JT0 survives both ldp */
+            /* STALE-ENTRY MISS. An x86 RET consumes its return address whether or not
+             * the prediction matched, so a mispredicted or unusable top entry must be
+             * POPPED here too. Leaving it (the old behavior) let a single stale entry
+             * poison every subsequent return -- a permanently sticky mispredict, which
+             * one dropped push (RAS full) was enough to trigger. JT2 still holds top-1:
+             * the matched path between the branch and here never executes. The RAS is
+             * only a predictor -- a miss still falls through to the dispatcher -- so
+             * popping can change prediction quality, never correctness. */
+            uint32_t *miss_pop = a64_label(b);
+            a64_str(b, 4, JT2, 20, RAS_TOP_OFF);        /* ras_top = top-1 */
             uint32_t *miss = a64_label(b);
-            for (int i = 0; i < nrm; i++)
-                a64_patch_cbz(ras_miss[i], miss);
+            a64_patch_cbz(ras_empty, miss);
+            for (int i = 0; i < nst; i++)
+                a64_patch_cbz(ras_stale[i], miss_pop);
         }
     } else {
         return 0;
@@ -2570,10 +2582,47 @@ static void js_report(OcerzJit *jit, const char *tag, int with_ftab)
  * dispatcher, correct) or the new word (-> dst, correct), never a torn
  * instruction. W^X toggle is per-thread, so making the patcher's view writable
  * does not disturb another thread's executable view. */
+/* Committing a block can light up MANY edges at once: its own outgoing edges plus
+ * every pending incoming edge that was parked waiting for this rip. Toggling W^X
+ * per 4-byte patch cost two permission switches and an i-cache call for EVERY one
+ * of them. chain_batch_begin/end open ONE writable window around the whole set and
+ * defer i-cache maintenance to a single pass. Safe because a concurrent executor
+ * fetches either the old word (-> fallback -> dispatcher, correct) or the new one,
+ * never a torn instruction, so invalidation TIMING is a performance property, not a
+ * correctness one. All of it runs under jit_lock (single writer). */
+#define CHAIN_BATCH_MAX 64
+static uint32_t *g_chain_patched[CHAIN_BATCH_MAX];
+static int g_chain_npatched;
+static int g_chain_batching;
+
+static void chain_batch_begin(void)
+{
+    g_chain_npatched = 0;
+    g_chain_batching = 1;
+    pthread_jit_write_protect_np(0);
+}
+
+static void chain_batch_end(void)
+{
+    pthread_jit_write_protect_np(1);
+    for (int i = 0; i < g_chain_npatched; i++)
+        sys_icache_invalidate(g_chain_patched[i], 4);
+    g_chain_npatched = 0;
+    g_chain_batching = 0;
+}
+
 static void chain_activate(uint32_t *patch_b, void *dst)
 {
     if (!patch_b || !dst)
         return;
+    if (g_chain_batching) {
+        a64_try_patch_b(patch_b, (uint32_t *)dst);   /* window already writable */
+        if (g_chain_npatched < CHAIN_BATCH_MAX)
+            g_chain_patched[g_chain_npatched++] = patch_b;
+        else
+            sys_icache_invalidate(patch_b, 4);       /* batch full: flush this one now */
+        return;
+    }
     pthread_jit_write_protect_np(0);
     a64_try_patch_b(patch_b, (uint32_t *)dst);   /* leaves it at fallback if out of range */
     pthread_jit_write_protect_np(1);
@@ -2821,6 +2870,13 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             g_pin = blk->guest_in_host;
             g_pin_hold = blk->host_holds;
             g_n_pinned = np;
+        } else {
+            /* Nothing actually got pinned (every candidate was RSP, or the block
+             * touches no GPR operand at all). Deferring flags is only justified as
+             * the PAIR of register pinning -- on its own it pays the materialize
+             * round-trip at every consumer and buys no register residency. Drop
+             * back to eager flags for this block, exactly like a sub-threshold one. */
+            g_defer = 0;
         }
     }
 
@@ -3220,6 +3276,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
      * Both run under jit_lock (single writer). chain_activate brackets its own
      * W^X toggle and icache flush. */
     if (!g_no_chain) {
+        chain_batch_begin();
         for (int i = 0; i < blk->n_edges; i++) {
             JitBlock *t = cache_lookup(jit, blk->edges[i].target_rip);
             if (t && t->code)
@@ -3228,6 +3285,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 pending_add(blk->edges[i].target_rip, blk->edges[i].patch_b);
         }
         pending_drain(blk->guest_rip, (void *)blk->code);
+        chain_batch_end();
     }
 
     jit->blocks_translated++;
@@ -3385,11 +3443,24 @@ void ocerz_jit_destroy(OcerzJit *jit)
         JitBlock *b = jit->buckets[i];
         while (b) {
             JitBlock *next = b->hnext;
+            free(b->insn_off);          /* host-pc -> guest-rip side table */
             free(b->insns);
             free(b);
             b = next;
         }
     }
+    /* Chain records for targets that were never compiled are file-scope and would
+     * otherwise outlive the JIT entirely. */
+    for (unsigned i = 0; i < PEND_SIZE; i++) {
+        PendingChain *e = g_pending[i];
+        while (e) {
+            PendingChain *nx = e->next;
+            free(e);
+            e = nx;
+        }
+        g_pending[i] = NULL;
+    }
+    free(jit->ci);                      /* code-address index */
     munmap(jit->code_base, jit->code_bytes);
     free(jit);
 }
