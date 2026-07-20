@@ -422,8 +422,15 @@ static _Atomic unsigned long long ps_ops[OCERZ_OP_COUNT];
 static _Atomic unsigned long long ps_slow_insns;
 static _Atomic unsigned long long ps_steps, ps_hits, ps_misses;
 /* [0]=push [1]=pop [2]=test [3]=movsxd [4]=call [5]=ret; column 0 = easy shape. */
-static _Atomic unsigned long long ps_shape[6][2];
-static const char *ps_shape_name[6] = { "push", "pop", "test", "movsxd", "call", "ret" };
+static _Atomic unsigned long long ps_shape[9][2];
+static const char *ps_shape_name[9] = { "push", "pop", "test", "movsxd", "call", "ret",
+                                        "jmp", "jmpind", "jmpmem" };
+/* Chain-edge activation outcome. a64_try_patch_b REJECTS a target outside B's
+ * +/-128MB reach and writes nothing, and pending_drain frees the record either way,
+ * so a far edge is silently unchained for the life of the process. The arena is 1GB
+ * -- 8x B's reach -- so this can quietly erode every chaining optimization as the
+ * code region grows. chain_activate discarded the return value, making it invisible. */
+static _Atomic unsigned long long ps_chain_ok, ps_chain_far;
 static uint64_t ps_t0;
 
 /* OUTLINED, and that is the whole point. Formatting needs a char buf[128], and
@@ -478,6 +485,27 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
             ps_shape[4][insn->ops[0].kind == OCERZ_OPK_IMM ? 0 : 1]++;
         else
             ps_shape[5][insn->nops == 0 ? 0 : 1]++;
+    } else if (o == OCERZ_OP_JMP) {
+        /* jmp is 23% of the slow path but that total is undifferentiated, and the
+         * payoff differs ~3x by shape: a DIRECT jmp (decode folds rip+len+rel into
+         * ops[0].imm) has a compile-time successor and can be fully CHAINED into the
+         * target block, killing the C call, the interpreter switch, the epilogue AND
+         * the dispatcher lookup. An INDIRECT jmp can only lose the call + switch --
+         * the target is dynamic, so the dispatcher stays. Row 6 = direct vs indirect;
+         * row 7 splits the indirect side reg vs mem (its columns sum to row 6 col 1);
+         * row 8 asks, for the indirect-MEM form only, whether it is a shape emit_mem_ea
+         * can actually lower (no segment override, addrsize != 4) -- a PLT/auth stub
+         * `jmp qword [rip+disp]` is riprel/seg-none/addrsize-8 and lands in column 0.
+         * jmp is nops==1 on every decode path (there is no far form), so ops[0] is
+         * always valid -- unlike the zero-operand RET the comment above records. */
+        int direct = (insn->ops[0].kind == OCERZ_OPK_IMM);
+        ps_shape[6][direct ? 0 : 1]++;
+        if (!direct) {
+            int isreg = (insn->ops[0].kind == OCERZ_OPK_REG);
+            ps_shape[7][isreg ? 0 : 1]++;
+            if (!isreg)
+                ps_shape[8][(insn->seg == OCERZ_SEG_NONE && insn->addrsize != 4) ? 0 : 1]++;
+        }
     }
 }
 
@@ -2190,6 +2218,96 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     return 1;
 }
 
+/* Native DIRECT JMP terminator.
+ *
+ * WHY. jmp had no emitter at all: it was a terminator with no try_inline case, so
+ * every one went emit_slowcall -> ocerz_jit_exec_one -> ocerz_interp_exec -> block
+ * epilogue -> ocerz_jit_step -> cache_lookup. MEASURED on a real Mousecape startup:
+ * jmp is 27.3% of the interpreter slow path, and 92.1% of those are the DIRECT
+ * (rel8/rel32) form -- so this single emitter covers ~25% of ALL slow-path
+ * executions. decode folds rip+len+rel into ops[0].imm, so the successor is a
+ * compile-time constant: exactly the shape emit_jcc's taken arm already chains, and
+ * chain activation was measured at 0.00% out-of-B-range (0 of 188,777), so the tail
+ * really does get patched rather than silently falling back.
+ *
+ * INDIRECT jmp (7.9%: `jmp r64` / `jmp qword [rip+X]` PLT-auth stubs) is NOT handled
+ * here -- its target is dynamic, so it cannot be chained and would still need the
+ * dispatcher; it keeps the slow path for now.
+ *
+ * ORDER IS LOAD-BEARING, mirroring emit_jcc:
+ *   1. emit_materialize FIRST and unconditionally. This is a block exit, and
+ *      g_defer is a PER-BLOCK decision -- a successor translated with g_defer==0,
+ *      and the interpreter always, read cpu->rflags directly, so a live cc_* record
+ *      must not cross the seam. (JMP itself defs/uses no flag, which licenses xlive
+ *      to relax the producer, NOT to skip the collapse.)
+ *   2. The target constant is materialized AFTER it: ocerz_flags_materialize
+ *      clobbers x0-x18, i.e. every JT* temp.
+ *   3. The rip store precedes emit_chain_tail, because both of the tail's
+ *      non-chained exits (fallback and the interrupt arm) return to the dispatcher,
+ *      which reads cpu->rip. */
+static int jmp_inline_enabled(void)
+{
+    static int en = -1;
+    if (en < 0)
+        en = getenv("OCERZ_NO_INLINE_JMP") ? 0 : 1;
+    return en;
+}
+
+static int emit_jmp(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, int *n_epi)
+{
+    if (insn->op != OCERZ_OP_JMP || !jmp_inline_enabled())
+        return 0;
+    if (insn->ops[0].kind != OCERZ_OPK_IMM)
+        return 0;                       /* indirect: dynamic target, keep slow path */
+    uint64_t target = insn->ops[0].imm;
+
+    emit_materialize(b);                /* block-exit flag collapse (see note 1) */
+
+    /* SELF-LOOP: branch straight back past the prologue, keeping pinned guest GPRs
+     * resident. Unconditional, so unlike emit_jcc's self-loop arm no rip comparison
+     * is needed -- but the cpu->interrupt poll is MANDATORY: a fully linked `jmp .`
+     * with no poll can never be stopped by a cross-thread/process stop (link_spin). */
+    if (!g_no_chain && g_body_entry && target == g_self_rip) {
+        a64_mov_imm64(b, JT0, target);
+        a64_str(b, 8, JT0, 20, RIP_OFF);
+        a64_ldr(b, 4, JT1, 20, INT_OFF);             /* w = cpu->interrupt */
+        uint32_t *intr = a64_label(b);
+        a64_cbnz(b, 0, JT1, 0);                      /* stop requested -> exit */
+        uint32_t *here = a64_label(b);
+        a64_b(b, (int32_t)(g_body_entry - here));    /* back-edge past the prologue */
+        a64_patch_cbz(intr, a64_label(b));
+        a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+        epilogue_sites[*n_epi] = a64_label(b);
+        a64_b(b, 0);
+        (*n_epi)++;
+        return 1;
+    }
+
+    a64_mov_imm64(b, JT0, target);
+    a64_str(b, 8, JT0, 20, RIP_OFF);
+
+    /* CROSS-BLOCK: one chain tail, byte-for-byte emit_jcc's taken arm. Poll
+     * classifier is emit_jcc's too -- an ALREADY-COMPILED target may close a control
+     * cycle, so that arm must poll; over-polling costs one predicted-not-taken cbnz,
+     * a missed poll is an unbreakable loop. */
+    if (!g_no_chain) {
+        int poll = (target <= g_self_rip) || jcc_target_compiled(target);
+        uint32_t *pb = emit_chain_tail(b, poll);
+        g_jcc_edge[0].target_rip = target;
+        g_jcc_edge[0].patch_b = pb;
+        g_n_jcc_edges = 1;
+        return 1;
+    }
+
+    /* Chaining disabled: plain STEP_OK to the dispatcher. Still removes the
+     * interpreter round trip, just not the cache_lookup. */
+    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+    epilogue_sites[*n_epi] = a64_label(b);
+    a64_b(b, 0);
+    (*n_epi)++;
+    return 1;
+}
+
 /* Native CALL(imm)/RET terminators.
  *
  * WHY THESE AND WHY NOW. call is by far the worst workload (a two-point
@@ -2615,18 +2733,25 @@ static void chain_activate(uint32_t *patch_b, void *dst)
 {
     if (!patch_b || !dst)
         return;
+    int ok;
     if (g_chain_batching) {
-        a64_try_patch_b(patch_b, (uint32_t *)dst);   /* window already writable */
+        ok = a64_try_patch_b(patch_b, (uint32_t *)dst);   /* window already writable */
         if (g_chain_npatched < CHAIN_BATCH_MAX)
             g_chain_patched[g_chain_npatched++] = patch_b;
         else
-            sys_icache_invalidate(patch_b, 4);       /* batch full: flush this one now */
-        return;
+            sys_icache_invalidate(patch_b, 4);            /* batch full: flush this one now */
+    } else {
+        pthread_jit_write_protect_np(0);
+        ok = a64_try_patch_b(patch_b, (uint32_t *)dst);   /* stays at fallback if out of range */
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(patch_b, 4);
     }
-    pthread_jit_write_protect_np(0);
-    a64_try_patch_b(patch_b, (uint32_t *)dst);   /* leaves it at fallback if out of range */
-    pthread_jit_write_protect_np(1);
-    sys_icache_invalidate(patch_b, 4);
+    if (ocerz_perfstat > 0) {
+        if (ok)
+            ps_chain_ok++;
+        else
+            ps_chain_far++;   /* target beyond B reach: edge silently left unchained */
+    }
 }
 
 /* Pending edges whose target rip was not yet compiled when the source block was
@@ -3051,6 +3176,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             blk->insn_off[i] = (uint32_t)(b.p - entry);
         if (i == n - 1 && insn->op == OCERZ_OP_JCC) {
             if (emit_jcc(&b, insn, epi_sites, &n_epi)) {
+                blk->n_inlined++;
+                continue;
+            }
+        }
+        /* Direct JMP: like emit_jcc it sets cpu->rip itself and ends in a chain
+         * tail, so it is only valid in the terminator slot -- which is the only
+         * place it can appear, since is_terminator() ends a block on JMP. */
+        if (i == n - 1 && insn->op == OCERZ_OP_JMP) {
+            if (emit_jmp(&b, insn, epi_sites, &n_epi)) {
                 blk->n_inlined++;
                 continue;
             }
@@ -3591,7 +3725,14 @@ static void ps_report(OcerzJit *jit)
                 slow ? 100.0 * (double)cum / (double)slow : 0.0,
                 total ? 100.0 * (double)rows[i].n / (double)total : 0.0);
     }
-    for (int i = 0; i < 6; i++) {
+    {
+        unsigned long long cok = ps_chain_ok, cfar = ps_chain_far, ctot = cok + cfar;
+        if (ctot)
+            fprintf(stderr,
+                    "ocerz: PERFSTAT[%d]   CHAIN activated=%llu out_of_range=%llu (%.2f%% dropped)\n",
+                    (int)getpid(), cok, cfar, 100.0 * (double)cfar / (double)ctot);
+    }
+    for (int i = 0; i < (int)(sizeof ps_shape / sizeof ps_shape[0]); i++) {
         unsigned long long easy = ps_shape[i][0], hard = ps_shape[i][1], s = easy + hard;
         if (s)
             fprintf(stderr, "ocerz: PERFSTAT[%d]   SHAPE %-7s easy=%llu (%.1f%%) other=%llu (%.1f%%)\n",
