@@ -1711,7 +1711,17 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
      * so gs:0xe8=pth+0x1c8, gs:0xd8=pth+0x1b8. Gated on the fatal flag ONLY: a clean exit
      * already self-clears both (native invariant), so an every-entry reset would be a no-op
      * there and would also MASK a real clean-path leak if one ever arose. */
-    if (g_hostwq_tl_fatal) {
+    /* ...and unconditionally, not only after a fatal. The gated-on-fatal version rested on
+     * "a clean exit already self-clears both (native invariant)", but that invariant does not
+     * hold for a synthesized worker, and the cost of it not holding is concrete: at teardown
+     * libdispatch walks a list freeing every untagged node (0x7ff802cd8306: test dil,1 / je
+     * skip / mov r14,[rdi+8] / call free), and a stale gs:0xe8 left by the previous drain
+     * still points at THIS region's stack -- ocerz reuses one region per host thread, so the
+     * address is live-looking rather than obviously dead. free() then gets rsp_base-0xc0 and
+     * libmalloc aborts the worker with "*** error for object %p: pointer being freed was not
+     * allocated" (traced: the reporter's first vararg is exactly the ddi from WQ-FATAL).
+     * Clearing per-drain state at entry is what a fresh kernel worker thread would present. */
+    if (g_hostwq_tl_fatal || !getenv("OCERZ_NO_DDIRESET")) {
         ocerz_st(pth + 0x1c8, 8, 0);   /* gs:0xe8 _dispatch_deferred_items */
         ocerz_st(pth + 0x1b8, 8, 0);   /* gs:0xd8 adopted wlh */
         g_hostwq_tl_fatal = 0;

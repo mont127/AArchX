@@ -16,6 +16,9 @@
  * diagnose any divergence without drowning the terminal.
  */
 #include "ocerz/cpu.h"
+#include "ocerz/mem.h"
+
+#include <stdlib.h>
 
 void ocerz_cpu_reset(OcerzCPU *cpu)
 {
@@ -37,6 +40,67 @@ void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out)
         fprintf(out, "%-4s=%016llx  %-4s=%016llx\n",
                 names[i], (unsigned long long)cpu->gpr[i],
                 names[i + 1], (unsigned long long)cpu->gpr[i + 1]);
+    /* Any register left pointing at a printable C string is very often the crash REASON.
+     * The shared cache's abort paths stage their message through a register immediately
+     * before aborting -- libdispatch loads its reason into rcx for the crash-log slot, and
+     * libmalloc's reporter keeps the formatted "%s(%d,%p) malloc: ..." text in rbx across
+     * the same store -- so a bare UD2 dump can be turned into the library's own diagnosis
+     * for free. Bounded, and re-checks commitment at every page boundary so scanning a
+     * non-string register can never fault the dumper itself. */
+    for (int i = 0; i < 16; i++) {
+        uint64_t v = cpu->gpr[i];
+        char s[192];
+        int n = 0;
+        if (v == 0 || ocerz_addr_committed(v) != 1)
+            continue;
+        for (; n < (int)sizeof s - 1; n++) {
+            uint64_t a = v + (uint64_t)n;
+            unsigned char c;
+            if ((a & 0xfffu) == 0 && ocerz_addr_committed(a) != 1)
+                break;
+            c = (unsigned char)ocerz_ld(a, 1);
+            if (c == 0)
+                break;
+            if (c < 0x20 || c > 0x7e) {
+                n = -1;
+                break;
+            }
+            s[n] = (char)c;
+        }
+        if (n >= 8) {
+            s[n] = 0;
+            fprintf(out, "%-4s->\"%s\"\n", names[i], s);
+        }
+    }
+    /* OCERZ_MSGPTR=<addr>: print the C string that <addr> POINTS TO, one indirection more
+     * than OCERZ_STRDUMP. An aborting library publishes its reason by storing the message
+     * pointer into a crash-log global (CRSetCrashLogMessage) and only then calling abort, so
+     * by the time the UD2 lands the register that carried the text has been reused by the
+     * intervening frames -- but the global still holds it. */
+    {
+        const char *mp = getenv("OCERZ_MSGPTR");
+        if (mp) {
+            uint64_t slot = strtoull(mp, NULL, 0);
+            uint64_t p = (slot && ocerz_addr_committed(slot) == 1) ? ocerz_ld(slot, 8) : 0;
+            fprintf(out, "msgptr@%#llx -> %#llx", (unsigned long long)slot,
+                    (unsigned long long)p);
+            if (p && ocerz_addr_committed(p) == 1) {
+                fputs(" \"", out);
+                for (int k = 0; k < 200; k++) {
+                    uint64_t a = p + (uint64_t)k;
+                    unsigned char c;
+                    if ((a & 0xfffu) == 0 && ocerz_addr_committed(a) != 1)
+                        break;
+                    c = (unsigned char)ocerz_ld(a, 1);
+                    if (c == 0)
+                        break;
+                    fputc((c >= 0x20 && c < 0x7f) ? (int)c : '.', out);
+                }
+                fputc('"', out);
+            }
+            fputc('\n', out);
+        }
+    }
     fprintf(out, "rip =%016llx  rflags=%08llx [%c%c%c%c%c%c%c]\n",
             (unsigned long long)cpu->rip,
             (unsigned long long)cpu->rflags,
