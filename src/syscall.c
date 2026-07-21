@@ -536,25 +536,45 @@ _Static_assert(offsetof(struct ocerz_kevent_qos_s, xflags) == 0x1c, "kevent xfla
 _Static_assert(offsetof(struct ocerz_kevent_qos_s, data)   == 0x20, "kevent data offset");
 _Static_assert(offsetof(struct ocerz_kevent_qos_s, ext)    == 0x28, "kevent ext offset");
 
-/* THE STRIDE IS 0x40 HERE ON PURPOSE. DO NOT "FIX" IT TO sizeof() WITHOUT READING THIS.
+/* THE STRIDE IS THE TRUE 0x48. An earlier revision pinned it to 0x40; that was wrong, and
+ * the note that justified it is superseded -- read this before touching it either way.
  *
- * The REAL kevent_qos_s is 0x48 (72) bytes -- the struct above is accurate, and the
- * shipping libdispatch iterates its event list with `addq $0x48,%rbx`. So 0x48 is the
- * architecturally correct stride and 0x40 is, in isolation, wrong: it drops ext[2]/ext[3]
- * (EVFILT_WORKLOOP's EV_EXTIDX_WL_MASK/VALUE) and mis-addresses entry i by 8*i.
+ * kevent_qos_s is 0x48 (72) bytes: the struct above is accurate and static-asserted, and the
+ * shipping libdispatch iterates its event list with `addq $0x48,%rbx`. At 0x40 the bridge
+ * drops ext[3] and mis-addresses entry i by 8*i, in BOTH directions -- it read the kernel's
+ * array (which is always 0x48) and wrote the guest's at 64-byte spacing.
  *
- * And yet flipping this constant to sizeof() ALONE is a hard REGRESSION, measured over
- * 8 runs of a real Cocoa app each way (AX-probe responsiveness, the gate macOS itself uses):
- *     stride 0x40 -> RESPONSIVE 6/8, window 3/8
- *     stride 0x48 -> RESPONSIVE 0/8, window 0/8   (never launches at all)
- * So some OTHER place in the workqueue bridge is co-dependent on 64-byte entries -- a buffer
- * capacity, an offset, the synthesized worker region layout (evbuf = pth + 0x8000), or the
- * re-arm append in sys_workq_kernreturn (evbuf + nev * STRIDE). Making this one correct while
- * its partner stays wrong turns a CONSISTENT error into an INCONSISTENT one, which is worse.
+ * That was measured directly rather than argued: printing each delivered event's filter read
+ * at both strides, a 2-event delivery gives
+ *     i=0: 0x48 -> -8 (EVFILT_MACHPORT)   0x40 -> -8      (identical, offset 0)
+ *     i=1: 0x48 -> -8 (EVFILT_MACHPORT)   0x40 -> 9987    (garbage)
+ * so at 0x40 every entry past the first is shifted 8 bytes. The visible consequences, both
+ * intermittent because nev>1 is rare: the MACHBRIDGE loop below reads that garbage filter,
+ * does not recognise EVFILT_MACHPORT, and so leaves ext[0] pointing at the HOST message
+ * buffer (SIGSEGV on an outside-arena address); and libdispatch reads a shifted neighbour
+ * field as its aux header, getting a non-NULL pointer to zeroes and taking its
+ * "BUG IN LIBDISPATCH: Invalid msg aux data size" abort.
  *
- * The fix is to find that co-dependency and change BOTH together, then re-measure with the
- * same A/B. Until then this stays 0x40, matching what actually runs. */
-#define OCERZ_KEVENT_QOS_S ((uint64_t)0x40)
+ * The superseded note recorded 0x48 as a hard regression -- "RESPONSIVE 0/8, window 0/8,
+ * never launches" -- and concluded some other site was co-dependent on 64-byte entries.
+ * Re-measured here with a window probe validated against known-good apps before being
+ * trusted: the stride change BY ITSELF is 3/3 launches with windows. Whatever that
+ * co-dependency was, it is not in the current tree.
+ *
+ * The trap that note was pointing at is real, though, just misattributed. A first attempt at
+ * this fix changed the stride AND started relocating ext2/ext3 in the MACHBRIDGE loop below,
+ * and that pair IS a 0/6 regression -- at 0x40 the aux fields were being read at the wrong
+ * offsets and the relocation mostly no-oped, so correcting the stride is what armed it. The
+ * two changes look like one change and are not. See the MACHBRIDGE comment.
+ * OCERZ_STRIDE40 restores the old value so the A/B can be re-run from one binary. */
+static uint64_t ocerz_kev_stride(void)
+{
+    static int s40 = -1;
+    if (s40 < 0)
+        s40 = getenv("OCERZ_STRIDE40") != NULL ? 1 : 0;
+    return s40 ? (uint64_t)0x40 : (uint64_t)0x48;
+}
+#define OCERZ_KEVENT_QOS_S (ocerz_kev_stride())
 
 /* WQ_KEVENT_LIST_LEN -- the number of kevent_qos_s entries in the buffer the kernel
  * hands a workqueue thread's callback, and therefore the real capacity of the re-arm
@@ -1508,7 +1528,7 @@ static void ocerz_send_restore_descriptors(uint64_t gmsg, const struct ocerz_ool
  * guest->host (the low-shadow segment pointer is what fails the copyin with MACH_SEND_INVALID_DATA).
  * Also translate OOL descriptors inside the first (control) segment, which carries the header+body.
  * Offsets in saved[] are relative to gvec so ocerz_send_restore_descriptors restores them. */
-static int ocerz_send_xlate_vector(uint64_t gvec, uint32_t count,
+static int ocerz_send_xlate_vector(uint64_t gvec, uint32_t count, int sending, int receiving,
                                    struct ocerz_ool_save *saved, int max_saved)
 {
     if (g_sendxlate_off < 0)
@@ -1526,7 +1546,12 @@ static int ocerz_send_xlate_vector(uint64_t gvec, uint32_t count,
             fprintf(stderr, "ocerz: VEC[%u] data=%#llx rcv_addr=%#llx ssize=%#x rsize=%#x\n", i,
                     (unsigned long long)ocerz_ld(e, 8), (unsigned long long)ocerz_ld(e + 8, 8),
                     (uint32_t)ocerz_ld(e + 0x10, 4), (uint32_t)ocerz_ld(e + 0x14, 4));
-        for (int f = 0; f < 16; f += 8) {        /* msgv_data and msgv_rcv_addr */
+        /* msgv_data is read by the send half, msgv_rcv_addr written by the receive half.
+         * Translate each only for the direction that actually uses it, so a field left
+         * uninitialised by the caller for the unused direction is never rewritten. */
+        for (int f = 0; f < 16; f += 8) {
+            if (f == 0 ? !sending : !receiving)
+                continue;
             uint64_t ga = ocerz_ld(e + f, 8);
             if (ga == 0)
                 continue;
@@ -1542,7 +1567,7 @@ static int ocerz_send_xlate_vector(uint64_t gvec, uint32_t count,
     /* OOL descriptors in the control segment (header+body live there for a vector send). Walk on the
      * segment's ORIGINAL guest pointer; record restores relative to gvec by adding (seg0 - gvec).
      * Guard on the segment being committed so a non-pointer/garbage msgv_data never faults the walk. */
-    if (seg0 != 0 && ocerz_addr_committed(seg0) == 1) {
+    if (sending && seg0 != 0 && ocerz_addr_committed(seg0) == 1) {
         struct ocerz_ool_save segsv[32];
         int segn = ocerz_send_xlate_descriptors(seg0, seg0_size, segsv, 32);
         for (int j = 0; j < segn && n < max_saved; j++) {
@@ -1588,12 +1613,23 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
      * changing the 0x40 stride that the multi-event evbuf layout and the re-arm append
      * co-depend on (flipping the stride globally is the known 0/8-launch regression). For
      * nev==1 there is no next entry, so the extra 8 bytes land in unused evbuf space. */
-    int no_ext3 = OCERZ_ENV_ON("OCERZ_NO_EXT3WL");   /* A/B escape hatch for the fix below */
-    for (int i = 0; i < nev; i++) {
-        uint64_t csz = (nev == 1 && !no_ext3) ? (uint64_t)0x48 : OCERZ_KEVENT_QOS_S;
-        memcpy(ocerz_g2h(evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S),
-               (const char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S, csz);
+    if (nev > 1 && OCERZ_ENV_ON("OCERZ_NEVLOG")) {
+        fprintf(stderr, "ocerz: HOSTWQ-NEV nev=%d filters=", nev);
+        for (int i = 0; i < nev; i++)
+            fprintf(stderr, "%s%d", i ? "," : "",
+                    (int)(int16_t)ocerz_ld(evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S + 8, 2));
+        fprintf(stderr, "\n");
     }
+    /* Whole entries, both sides at the true stride. ext[3] in particular must survive: for
+     * EVFILT_WORKLOOP it is EV_EXTIDX_WL_VALUE, the state the guest worker compares against
+     * the workloop's dq_state to decide "drained vs stale" -- truncating it made the kernel
+     * echo EV_ERROR data=ESTALE forever and the workloop re-arm spin (one wlid re-dispatched
+     * 2M+ times, ~7s of startup). That used to need a nev==1 special case to paper over the
+     * short stride; at 0x48 it is simply the normal copy. */
+    for (int i = 0; i < nev; i++)
+        memcpy(ocerz_g2h(evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S),
+               (const char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S,
+               (size_t)OCERZ_KEVENT_QOS_S);
     if (getenv("OCERZ_WSIG"))
         for (int i = 0; i < nev; i++) {
             const unsigned char *e = (const unsigned char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S;
@@ -1623,6 +1659,15 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
                 ocerz_st(dst + 0x28, 8, gbuf);                    /* ext0 -> guest copy */
             else if (hbuf)
                 ocerz_st(dst + 0x28, 8, 0);                       /* bridge failed: never leave a host ptr */
+            /* ext2/ext3 are deliberately left ALONE. They look like they should get the same
+             * treatment as ext0 -- an auxiliary buffer pointer plus size -- and treating them
+             * that way (copy in, rewrite the pointer, clear both if that fails) is a hard
+             * regression: 0/6 launches, every run dying at guest_rip=0x7ff802e312a6 on
+             * guest_addr=0x8ff000008ff, one 32-bit port name repeated twice, i.e. downstream
+             * code reading a field pair this bridge had rewritten out from under it. Whatever
+             * the kernel means by these two words for an EVFILT_MACHPORT delivery, it is not
+             * "a host allocation to relocate". Measured against the same build with only this
+             * block disabled: 3/3 launches with windows. */
             if (gbuf && getenv("OCERZ_WSIG"))
                 fprintf(stderr, "ocerz: MACHBRIDGE ev[%d] hbuf=%#llx sz=%#llx -> gbuf=%#llx%s\n",
                         i, (unsigned long long)hbuf, (unsigned long long)sz,
@@ -3461,20 +3506,35 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 47: {
         uint32_t msgh_id = (uint32_t)(a[4] >> 32);
         uint64_t reply_buf = a[0];
+        /* a[6] (rcv_size_and_priority) and a[7] (timeout) are the 7th/8th trap args and arrive on
+         * the guest stack. Load them BEFORE the send-side translation: for a vector message the
+         * RECEIVE entry count lives in a[6] and the translation below needs it. */
+        a[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
+        a[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
         /* SEND-side OOL translation (faithful inverse of the inbound bridge). Skip MACH64_MSG_VECTOR
          * sends (opt bit 32): their a[0] is a vector array, not a flat message. send_size = a[2]>>32. */
         struct ocerz_ool_save sv47[64];
         int nsv47 = 0;
         if (reply_buf != 0 && ocerz_low_base) {
-            if (a[1] & 0x100000000ull)   /* MACH64_MSG_VECTOR: a[0] is a vector array, count = a[2]>>32 */
-                nsv47 = ocerz_send_xlate_vector(reply_buf, (uint32_t)(a[2] >> 32), sv47, 64);
-            else
+            if (a[1] & 0x100000000ull) {
+                /* MACH64_MSG_VECTOR: a[0] is an array of mach_msg_vector_t, and for a vector
+                 * message the two "sizes" are ENTRY COUNTS, not bytes -- send count in a[2]>>32,
+                 * receive count in the low half of a[6]. Both directions index the SAME array, and
+                 * they differ precisely when the message carries auxiliary data: a send of 1 entry
+                 * (data) paired with a receive of 2 (data + aux) used to translate entry[0] only,
+                 * leaving the aux entry's msgv_rcv_addr as a guest pointer. The kernel then never
+                 * wrote the aux header into the guest's buffer, so libdispatch read a stale
+                 * msgdh_size and killed the worker with "BUG IN LIBDISPATCH: Invalid msg aux data
+                 * size". Cover the union of both directions. */
+                uint32_t sc = (a[1] & 0x1) ? (uint32_t)(a[2] >> 32) : 0;
+                uint32_t rc = (a[1] & 0x2) ? (uint32_t)(a[6] & 0xffffffffu) : 0;
+                nsv47 = ocerz_send_xlate_vector(reply_buf, sc > rc ? sc : rc,
+                                                (a[1] & 0x1) != 0, (a[1] & 0x2) != 0, sv47, 64);
+            } else
                 nsv47 = ocerz_send_xlate_descriptors(reply_buf, (uint32_t)(a[2] >> 32), sv47, 64);
         }
         if (a[0] != 0)
             a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
-        a[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
-        a[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
         /* OCERZ_LSTIMEOUT (diagnostic): the LaunchServices _LSApplicationCheckIn family (msgh_id
          * 10000-range, SEND|RCV, no app-set RCV_TIMEOUT) deadlocks because the real coreservicesd
          * never replies to a non-LS-registered Wine guest. Force a bounded RCV timeout: if the trap
@@ -3538,9 +3598,16 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         static int machleak = -1;
         if (machleak < 0) machleak = getenv("OCERZ_MACHLEAK") != NULL ? 1 : 0;
         if (reply_buf != 0 && machleak) {
-            for (uint64_t off = 0x18; off <= 0x80; off += 8) {
+            /* Floor lowered from 0x140000000 to the 4GB executable base, and the scan
+             * widened past the first eight words. The observed LaunchServices leak
+             * dereferences ~0x104e00000 -- BELOW the old floor and past off 0x80 -- so
+             * this scanner was blind to precisely the case that crashes. Screening on
+             * ocerz_addr_committed still separates a leaked HOST pointer (never
+             * committed in the guest arena) from a legitimate guest pointer in the
+             * same numeric range, which is what the old floor was crudely approximating. */
+            for (uint64_t off = 0x18; off <= 0x158; off += 8) {
                 uint64_t v = ocerz_ld(reply_buf + off, 8);
-                if (v >= 0x140000000ull && v < OCERZ_LOW_LIMIT &&
+                if (v >= 0x100000000ull && v < OCERZ_LOW_LIMIT &&
                     ocerz_addr_committed(v) == 0)
                     fprintf(stderr,
                             "ocerz: MACHLEAK reply_id=%u off=%#llx host_val=%#llx icount=%#llx\n",
