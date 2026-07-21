@@ -1706,8 +1706,13 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
      * left gs:0xe8 (_dispatch_deferred_items) dangling into its now-dead guest stack and
      * gs:0xd8 (adopted wlh) stale; libdispatch's entry guard `mov rdi,gs:0xe8; and rdi,~2;
      * jne` then dereferences that dangling ddi, writes through it (0x7ff802cda45d..cd791c
-     * append a 72-byte kevent), smashes the next worker's stack canary -> __stack_chk_fail
-     * -> abort -> UD2 -> a fresh dangling ddi -> self-sustaining cascade. gs_base=pth+0xe0
+     * append a 72-byte kevent) -> abort -> UD2 -> a fresh dangling ddi -> self-sustaining
+     * cascade. (The abort was previously described here as smashing the next worker's stack
+     * canary via __stack_chk_fail. That was wrong, and it sent one investigation looking for
+     * a buffer overrun that does not exist: tracing the aborting call shows libmalloc's
+     * reporter invoked with the abort flag and the format "*** error for object %p: pointer
+     * being freed was not allocated", i.e. an invalid free of the stale ddi, not an overrun.
+     * The reset below is now unconditional for that reason.) gs_base=pth+0xe0
      * so gs:0xe8=pth+0x1c8, gs:0xd8=pth+0x1b8. Gated on the fatal flag ONLY: a clean exit
      * already self-clears both (native invariant), so an every-entry reset would be a no-op
      * there and would also MASK a real clean-path leak if one ever arose. */
