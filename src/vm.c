@@ -281,6 +281,32 @@ void ocerz_exc_report(const OcerzCPU *c)
     fputc('\n', stderr);
 }
 
+/* OCERZ_ARGTRAP=<rip>: dump the SysV argument registers on entry to a block starting at
+ * <rip>, plus the first two words behind any that point at committed guest memory. The
+ * generic counterpart to EXCTRAP/SELTRAP, for a function whose ABI is not known in advance:
+ * a function entry is frequently the last place an argument still exists, because the
+ * callee's own prologue overwrites the caller-saved registers that carried it. */
+uint64_t ocerz_arg_trap;
+
+static void arg_trap_report(const OcerzCPU *c)
+{
+    static const struct { const char *n; int r; } A[] = {
+        { "rdi", OCERZ_RDI }, { "rsi", OCERZ_RSI }, { "rdx", OCERZ_RDX },
+        { "rcx", OCERZ_RCX }, { "r8",  OCERZ_R8  }, { "r9",  OCERZ_R9  },
+    };
+    fprintf(stderr, "ocerz: ARGTRAP rip=%#llx", (unsigned long long)c->rip);
+    for (unsigned i = 0; i < sizeof A / sizeof A[0]; i++) {
+        uint64_t v = c->gpr[A[i].r];
+        fprintf(stderr, " %s=%#llx", A[i].n, (unsigned long long)v);
+        if (v && ocerz_addr_committed(v) == 1)
+            fprintf(stderr, "->{%#llx,%#llx}", (unsigned long long)ocerz_ld(v, 8),
+                    (unsigned long long)ocerz_ld(v + 8, 8));
+        else if (v)
+            fprintf(stderr, "->UNCOMMITTED");
+    }
+    fprintf(stderr, "\n");
+}
+
 static void sel_trap_report(const OcerzCPU *c)
 {
     uint64_t recv = c->gpr[OCERZ_RDI];
@@ -1029,6 +1055,9 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     const char *st = getenv("OCERZ_SELTRAP");
     if (st)
         ocerz_sel_trap = strtoull(st, NULL, 0);
+    const char *gt = getenv("OCERZ_ARGTRAP");
+    if (gt)
+        ocerz_arg_trap = strtoull(gt, NULL, 0);
     const char *ct = getenv("OCERZ_CTXTRAP");
     if (ct)
         ocerz_ctx_trap = strtoull(ct, NULL, 0);
@@ -1156,7 +1185,7 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
      * env-var-derived value fixed before the loop or a startup-set global, so it
      * cannot go stale underneath the loop. Anything added here must keep that
      * property or it must be tested outside the gate. */
-    const int any_diag = (ocerz_exc_trap || ocerz_sel_trap || ocerz_ctx_trap ||
+    const int any_diag = (ocerz_exc_trap || ocerz_sel_trap || ocerz_arg_trap || ocerz_ctx_trap ||
                           ocerz_bt_lo || prof || riptrap_n > 0 || icap || mtrace_lo);
     sigjmp_buf jb;
     sigjmp_buf *prev_recover = g_sig_recover;
@@ -1170,6 +1199,8 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
         if (__builtin_expect(any_diag, 0)) {
         if (ocerz_exc_trap && local.rip == ocerz_exc_trap)
             ocerz_exc_report(&local);
+        if (ocerz_arg_trap && local.rip == ocerz_arg_trap)
+            arg_trap_report(&local);
         if (ocerz_sel_trap && local.rip == ocerz_sel_trap)
             sel_trap_report(&local);
         if (ocerz_ctx_trap && local.rip == ocerz_ctx_trap)
@@ -1304,6 +1335,8 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
         int r;
         if (ocerz_exc_trap && cpu->rip == ocerz_exc_trap)
             ocerz_exc_report(cpu);
+        if (ocerz_arg_trap && cpu->rip == ocerz_arg_trap)
+            arg_trap_report(cpu);
         if (ocerz_sel_trap && cpu->rip == ocerz_sel_trap)
             sel_trap_report(cpu);
         if (ocerz_ctx_trap && cpu->rip == ocerz_ctx_trap)
