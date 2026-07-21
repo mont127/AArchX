@@ -997,7 +997,10 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         static int rearm40 = -1;
         if (rearm40 < 0)
             rearm40 = getenv("OCERZ_REARM40") != NULL;
-        const uint64_t rstride = rearm40 ? OCERZ_KEVENT_QOS_S : OCERZ_KEVENT_QOS_REARM;
+        /* The forced value is the LITERAL 0x40, not OCERZ_KEVENT_QOS_S: that used to be a
+         * 0x40 #define, but it is now the true 0x48, which silently turned this A/B hatch
+         * into a no-op -- both arms were measuring the same thing. */
+        const uint64_t rstride = rearm40 ? (uint64_t)0x40 : OCERZ_KEVENT_QOS_REARM;
         /* KEVENT (0x40) / WORKLOOP (0x100) worker completion: the guest
          * _pthread_wqthread issues this after its drain, passing its OUTGOING
          * re-arm changelist (a[1]=keventlist, a[2]=nkevents). For a HOSTWQ inline
@@ -1351,10 +1354,16 @@ static uint64_t ocerz_bridge_mach_msg(uint64_t hbuf, uint64_t sz)
      * that length, bound it, and carry the aux across at the same relative offset. */
     uint64_t total = sz;
     if (!getenv("OCERZ_NO_AUXTAIL")) {          /* A/B hatch for the paragraph above */
-        uint32_t auxsz = 0;
-        memcpy(&auxsz, (const void *)(uintptr_t)(hbuf + sz), 4);
-        if (auxsz >= 8 && auxsz <= 0x4000)
-            total = sz + auxsz;
+        /* Validate this really is a mach_msg_aux_header_t before believing its length. The
+         * probe reads the first word ABOVE the message, and for the top-most message in the
+         * kernel's kevent data buffer that word is the adjacent kevent list -- where a mach
+         * port name (0x2ff, say) sails through a bare "8 <= n <= 0x4000" test and drags an
+         * arbitrary slab of host bytes into the guest copy. A real header is 8-byte aligned
+         * and has a zero reserved word, which a port name pair is not. */
+        uint32_t aux[2] = { 0, 0 };
+        memcpy(aux, (const void *)(uintptr_t)(hbuf + sz), sizeof aux);
+        if (aux[0] >= 8 && aux[0] <= 0x4000 && (aux[0] & 7u) == 0 && aux[1] == 0)
+            total = sz + aux[0];
     }
     uint64_t gbuf = ocerz_map_anywhere((total + 0x3fffull) & ~0x3fffull, PROT_READ | PROT_WRITE);
     if (!gbuf)
@@ -1849,9 +1858,11 @@ static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
         g_hostwq_tl_region = region;
     }
     uint64_t pth = region + 0x1f0000;
-    /* Mirror of the bridge scrub: if a prior worker on this recycled host thread died
-     * mid-drain, restore the empty per-drain TSD sentinel before libdispatch reads it. */
-    if (g_hostwq_tl_fatal) {
+    /* Mirror of the bridge scrub, and unconditional for the same reason it is there: the two
+     * entry points SHARE one region and one pth per host thread (g_hostwq_tl_region), so a
+     * stale gs:0xe8 left by either of them is read back by the other. Scrubbing only on the
+     * bridge side leaves exactly half the hole open. */
+    if (g_hostwq_tl_fatal || !getenv("OCERZ_NO_DDIRESET")) {
         ocerz_st(pth + 0x1c8, 8, 0);   /* gs:0xe8 _dispatch_deferred_items */
         ocerz_st(pth + 0x1b8, 8, 0);   /* gs:0xd8 adopted wlh */
         g_hostwq_tl_fatal = 0;
