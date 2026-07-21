@@ -1341,11 +1341,26 @@ static uint64_t ocerz_bridge_mach_msg(uint64_t hbuf, uint64_t sz)
 {
     if (!hbuf || !sz || sz > 0x100000)
         return 0;
-    uint64_t gbuf = ocerz_map_anywhere((sz + 0x3fffull) & ~0x3fffull, PROT_READ | PROT_WRITE);
+    /* A message delivered this way can be followed by AUXILIARY data in the same buffer, and
+     * the guest addresses it as msg + msg_size -- ext1 is the size of the MESSAGE, not of what
+     * the kernel wrote. Copying ext1 bytes therefore stops exactly at the first byte of the
+     * aux, and the guest reads the fresh zero page behind the copy instead: libdispatch sees
+     * msgdh_size == 0 and takes its "BUG IN LIBDISPATCH: Invalid msg aux data size" abort,
+     * killing the worker. Observed directly -- aux at msg+0x23c against a copy of 0x23c bytes.
+     * The aux is self-describing (first word = total aux length, header included), so read
+     * that length, bound it, and carry the aux across at the same relative offset. */
+    uint64_t total = sz;
+    if (!getenv("OCERZ_NO_AUXTAIL")) {          /* A/B hatch for the paragraph above */
+        uint32_t auxsz = 0;
+        memcpy(&auxsz, (const void *)(uintptr_t)(hbuf + sz), 4);
+        if (auxsz >= 8 && auxsz <= 0x4000)
+            total = sz + auxsz;
+    }
+    uint64_t gbuf = ocerz_map_anywhere((total + 0x3fffull) & ~0x3fffull, PROT_READ | PROT_WRITE);
     if (!gbuf)
         return 0;
     unsigned char *g = (unsigned char *)ocerz_g2h(gbuf);
-    memcpy(g, (const void *)(uintptr_t)hbuf, (size_t)sz);
+    memcpy(g, (const void *)(uintptr_t)hbuf, (size_t)total);
     static int g_mm_log = -1;
     if (g_mm_log < 0) g_mm_log = getenv("OCERZ_MACHMSG") ? 1 : 0;
     int mm_ool = 0, mm_oolfail = 0, mm_unhandled = 0;
@@ -1659,15 +1674,20 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
                 ocerz_st(dst + 0x28, 8, gbuf);                    /* ext0 -> guest copy */
             else if (hbuf)
                 ocerz_st(dst + 0x28, 8, 0);                       /* bridge failed: never leave a host ptr */
-            /* ext2/ext3 are deliberately left ALONE. They look like they should get the same
-             * treatment as ext0 -- an auxiliary buffer pointer plus size -- and treating them
-             * that way (copy in, rewrite the pointer, clear both if that fails) is a hard
-             * regression: 0/6 launches, every run dying at guest_rip=0x7ff802e312a6 on
-             * guest_addr=0x8ff000008ff, one 32-bit port name repeated twice, i.e. downstream
-             * code reading a field pair this bridge had rewritten out from under it. Whatever
-             * the kernel means by these two words for an EVFILT_MACHPORT delivery, it is not
-             * "a host allocation to relocate". Measured against the same build with only this
-             * block disabled: 3/3 launches with windows. */
+            /* ext2/ext3 carry auxiliary data belonging to a DIRECT-RECEIVED message, so they
+             * are host allocations for the same reason ext0 is -- but they only mean that on
+             * an event that actually delivered a message. Relocating them on every
+             * EVFILT_MACHPORT event regardless is a hard regression: 0/6 launches, every run
+             * dying at guest_rip=0x7ff802e312a6 on guest_addr=0x8ff000008ff (one 32-bit port
+             * name repeated twice, i.e. downstream code reading a field pair this bridge had
+             * rewritten out from under it).
+             *
+             * Narrowing it to events that really did deliver a message does not help either
+             * (0/5 launches), because the premise is wrong: logging the fields shows ext2 =
+             * 0x2ff000002ff with ext3 = 0, i.e. a 32-bit mach port name stored TWICE in one
+             * word -- the same shape as the 0x8ff000008ff the guest then faults on. These are
+             * packed 32-bit values the guest consumes directly, not an address and a length,
+             * so there is nothing here to relocate and zeroing them destroys live data. */
             if (gbuf && getenv("OCERZ_WSIG"))
                 fprintf(stderr, "ocerz: MACHBRIDGE ev[%d] hbuf=%#llx sz=%#llx -> gbuf=%#llx%s\n",
                         i, (unsigned long long)hbuf, (unsigned long long)sz,
