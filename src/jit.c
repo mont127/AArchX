@@ -2534,6 +2534,9 @@ void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
     cpu->ras_top = t + 1;
 }
 
+static void **ras_slot_alloc(void);                     /* RAS host_entry slot arena (defined below) */
+static void pending_add_ras(uint64_t target_rip, void **ras_slot);
+
 static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                          int *n_exits, uint32_t **epi_sites, int *n_epi)
 {
@@ -2595,11 +2598,44 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
          * callee-saved and survive the C call; the scratch temps and x0 are dead
          * (the shared tail reloads x0 with STEP_OK below). */
         if (!g_no_ras) {
-            a64_mov_reg(b, 1, 0, 19);              /* x0 = vm */
-            a64_mov_reg(b, 1, 1, 20);              /* x1 = cpu */
-            a64_mov_imm64(b, 2, retaddr);          /* x2 = retaddr */
-            a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_ras_push);
-            a64_blr(b, 16);
+            /* STEP-1 RAS push, INLINED. The old form was a C call to ocerz_ras_push,
+             * whose body did cache_lookup(retaddr) -- a hash probe on EVERY executed
+             * CALL (866M of them on fib). retaddr is a compile-time constant, so its
+             * host entry can be resolved ONCE at translate time into a per-site slot
+             * (filled now if the return block is already compiled, else by the block's
+             * finalize via pending_add_ras), and the push becomes a plain load of that
+             * slot. This is pure cpu-struct bookkeeping -- no guest memory, no fault, no
+             * flags -- so a wrong/stale host_entry only costs a RET mispredict that
+             * falls back to the dispatcher, never correctness (RET re-validates
+             * guest_rip). When the slot arena is full it keeps the C-call form. */
+            void **slot = ras_slot_alloc();
+            if (slot) {
+                JitBlock *rb = cache_lookup(g_xlat_jit, retaddr);
+                if (rb && rb->code)
+                    *slot = (void *)rb->code;              /* already compiled: fill now */
+                else
+                    pending_add_ras(retaddr, slot);        /* else fill at its finalize */
+                a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);       /* w: ras_top */
+                a64_subs_imm(b, 0, A64_ZR, JT2, OCERZ_RAS_SIZE);  /* cmp top, 256 */
+                uint32_t *full = a64_label(b);
+                a64_bcond(b, A64_CS, 0);                    /* top >= 256 (unsigned) -> skip */
+                a64_mov_imm64(b, JT1, retaddr);             /* guest_rip constant */
+                a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)slot);
+                a64_ldr(b, 8, JT0, JTA, 0);                 /* host_entry = *slot (starts NULL) */
+                a64_lsl_imm(b, 1, JTA, JT2, 4);             /* top * 16 (element stride) */
+                a64_add_reg(b, 1, JTA, JTA, 20, 0);         /* JTA = cpu + top*16 */
+                a64_str(b, 8, JT1, JTA, RAS_OFF);           /* ras[top].guest_rip = retaddr */
+                a64_str(b, 8, JT0, JTA, RAS_OFF + 8);       /* ras[top].host_entry = *slot */
+                a64_add_imm(b, 0, JT2, JT2, 1);
+                a64_str(b, 4, JT2, 20, RAS_TOP_OFF);        /* ras_top = top + 1 */
+                a64_patch_bcond(full, a64_label(b));
+            } else {
+                a64_mov_reg(b, 1, 0, 19);              /* x0 = vm */
+                a64_mov_reg(b, 1, 1, 20);              /* x1 = cpu */
+                a64_mov_imm64(b, 2, retaddr);          /* x2 = retaddr */
+                a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_ras_push);
+                a64_blr(b, 16);
+            }
         }
     } else if (insn->op == OCERZ_OP_RET) {
         if (insn->nops != 0)               /* `ret imm16` also moves rsp */
@@ -2895,7 +2931,8 @@ static void chain_activate(uint32_t *patch_b, void *dst)
  * and freed on drain. Touched only under jit_lock, so no atomics are needed. */
 typedef struct PendingChain {
     uint64_t target_rip;
-    uint32_t *patch_b;
+    uint32_t *patch_b;        /* branch edge: the B word to patch (NULL for a RAS-slot edge) */
+    void **ras_slot;          /* RAS edge: the host_entry slot to fill (NULL for a branch edge) */
     struct PendingChain *next;
 } PendingChain;
 #define PEND_BITS 12
@@ -2911,6 +2948,48 @@ static void pending_add(uint64_t target_rip, uint32_t *patch_b)
     unsigned h = (unsigned)(hash_rip(target_rip) & PEND_MASK);
     e->target_rip = target_rip;
     e->patch_b = patch_b;
+    e->ras_slot = NULL;
+    e->next = g_pending[h];
+    g_pending[h] = e;
+}
+
+/* RAS host_entry slots. Each direct-CALL site owns one stable 64-bit word holding the
+ * compiled host entry of its return address, or NULL while that block is not yet compiled
+ * (NULL == "no prediction" -- exactly the state an uncompiled retaddr produced under the old
+ * cache_lookup-per-push). The slot is written once, when the return block finalizes
+ * (pending_drain), so the hot push is a lookup-free load instead of a C call + hash probe.
+ * Slots live in a plain RW arena that is NEVER the code arena -- so filling one needs no W^X
+ * toggle -- and the arena never moves, so a slot address baked into emitted code stays valid
+ * for the life of the process. Allocated under jit_lock (translate() single-writer). */
+#define RAS_SLOT_CAP (1u << 18)      /* 256k call sites (2MB); falls back to the C push when full */
+static void **g_ras_slots;
+static unsigned g_ras_slot_n;
+
+static void **ras_slot_alloc(void)
+{
+    if (!g_ras_slots) {
+        void *p = mmap(NULL, (size_t)RAS_SLOT_CAP * sizeof(void *),
+                       PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (p == MAP_FAILED)
+            return NULL;
+        g_ras_slots = (void **)p;
+    }
+    if (g_ras_slot_n >= RAS_SLOT_CAP)
+        return NULL;
+    void **s = &g_ras_slots[g_ras_slot_n++];
+    *s = NULL;
+    return s;
+}
+
+static void pending_add_ras(uint64_t target_rip, void **ras_slot)
+{
+    PendingChain *e = (PendingChain *)malloc(sizeof *e);
+    if (!e)
+        return;   /* OOM: slot stays NULL, the RET just dispatches -- still correct */
+    unsigned h = (unsigned)(hash_rip(target_rip) & PEND_MASK);
+    e->target_rip = target_rip;
+    e->patch_b = NULL;
+    e->ras_slot = ras_slot;
     e->next = g_pending[h];
     g_pending[h] = e;
 }
@@ -2924,7 +3003,14 @@ static void pending_drain(uint64_t rip, void *code)
     while (*pp) {
         PendingChain *e = *pp;
         if (e->target_rip == rip) {
-            chain_activate(e->patch_b, code);
+            if (e->ras_slot)
+                /* Release so the code write behind `code` is visible to the reader that
+                 * observes the slot; the emitted push reads it with a plain (atomic,
+                 * aligned) load -- a stale NULL there just costs a dispatch, never
+                 * correctness, so no acquire is needed on the read side. */
+                __atomic_store_n(e->ras_slot, code, __ATOMIC_RELEASE);
+            else
+                chain_activate(e->patch_b, code);
             *pp = e->next;
             free(e);
         } else {
