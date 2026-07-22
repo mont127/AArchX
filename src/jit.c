@@ -2244,14 +2244,25 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         break;
     }
 
-    a64_mov_imm64(b, JT1, fall);
-    a64_mov_imm64(b, JT2, taken);
+    /* The predicate is in JTF; NZCV from this subs is what every downstream path
+     * branches on, so it is always emitted. The csel-to-JT0 and the RIP store that
+     * follow are needed ONLY by the self-loop path (which compares JT0 to the entry
+     * rip) and the non-linked fallback (whose dispatcher exit reads cpu->rip). The
+     * general two-way linked path uses neither -- each of its arms re-materialises
+     * its own rip constant and re-stores RIP -- so for it the two movs, the csel and
+     * this store are dead. Emit them only when the two-way path will NOT be taken. */
     a64_subs_imm(b, 1, A64_ZR, JTF, 0);
-    if (cc & 1)
-        a64_csel(b, 1, JT0, JT2, JT1, A64_EQ);   /* inverted: take==0 -> target */
-    else
-        a64_csel(b, 1, JT0, JT2, JT1, A64_NE);   /* take!=0 -> target */
-    a64_str(b, 8, JT0, 20, RIP_OFF);
+    int self_loop = !g_no_chain && g_body_entry && taken == g_self_rip;
+    int two_way = !self_loop && !g_no_chain && !g_no_jcclink;
+    if (!two_way) {
+        a64_mov_imm64(b, JT1, fall);
+        a64_mov_imm64(b, JT2, taken);
+        if (cc & 1)
+            a64_csel(b, 1, JT0, JT2, JT1, A64_EQ);   /* inverted: take==0 -> target */
+        else
+            a64_csel(b, 1, JT0, JT2, JT1, A64_NE);   /* take!=0 -> target */
+        a64_str(b, 8, JT0, 20, RIP_OFF);
+    }
 
     /* SELF-LOOP CHAINING (Increment 2). When this Jcc's taken target is the
      * block's own entry rip, the loop back-edge can branch DIRECTLY to
@@ -2266,7 +2277,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
      * break the loop (tests/guest/interrupt_test + ras_stress are the gate). The
      * poll is one L1 load + a predicted-not-taken cbnz off the pinned cpu pointer.
      * body-entry is in this same block, always within B range. */
-    if (!g_no_chain && g_body_entry && taken == g_self_rip) {
+    if (self_loop) {
         a64_mov_imm64(b, JT1, g_self_rip);
         a64_subs_reg(b, 1, A64_ZR, JT0, JT1, 0);    /* resolved rip == entry ? */
         uint32_t *not_loop = a64_label(b);
@@ -2312,7 +2323,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
      * arm split reuses it; each arm stores its own compile-time rip constant,
      * overwriting the csel result, so every exit (chained, fallback, or poll)
      * carries the correct rip. */
-    if (!g_no_chain && !g_no_jcclink) {
+    if (two_way) {
         int poll_fall  = (fall  <= g_self_rip) || jcc_target_compiled(fall);
         int poll_taken = (taken <= g_self_rip) || jcc_target_compiled(taken);
         int taken_eq = (cc & 1);   /* taken when JTF==0 (EQ), else JTF!=0 (NE) */
