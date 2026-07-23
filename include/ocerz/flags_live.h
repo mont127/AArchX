@@ -62,4 +62,9 @@
  * conservative def=0 / use=OCERZ_FL_ALL. */
 void ocerz_flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use);
 
+/* Same architectural def/use answer without the synthetic synchronous-fault
+ * use=ALL barrier. The JIT may use this only when it has installed an exact
+ * cold fault-reconstruction recipe for that specific inlined memory access. */
+void ocerz_flags_defuse_nofault(const X86Insn *insn, uint64_t *def, uint64_t *use);
+
 #endif /* OCERZ_FLAGS_LIVE_H */

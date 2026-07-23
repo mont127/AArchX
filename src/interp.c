@@ -990,6 +990,9 @@ static int op_flagctl(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 
 int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    /* A JIT edge may carry an exact deferred arithmetic-flag record. The
+     * interpreter reads rflags directly, so collapse it at the tier boundary. */
+    ocerz_flags_materialize(cpu);
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
         return ocerz_dyldapi_dispatch(vm, cpu);
 

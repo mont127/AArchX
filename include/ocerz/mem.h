@@ -156,6 +156,7 @@ int ocerz_mem_init_identity(uint64_t size);
 int ocerz_mem_init_low_shadow(void);
 int ocerz_mem_register_range(uint64_t glo, uint64_t ghi);
 int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot);
+int ocerz_map_shared_anon(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_map_shared_file(uint64_t gaddr, uint64_t len, int prot, int fd, uint64_t off);
 int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_map_claim_region(uint64_t gaddr, uint64_t len, int prot);

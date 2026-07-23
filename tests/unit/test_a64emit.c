@@ -73,6 +73,7 @@ static void b_movimm(A64Buf *b) { a64_mov_imm64(b, 0, 0x123456789abcdef0ull); a6
 static void b_movimm2(A64Buf *b) { a64_mov_imm64(b, 0, 0xffffffffffff0000ull); a64_ret(b); }
 static void b_movimm3(A64Buf *b) { a64_mov_imm64(b, 0, 0x000000000000ffffull); a64_ret(b); }
 static void b_movimm4(A64Buf *b) { a64_mov_imm64(b, 0, 0xffffffffffffffffull); a64_ret(b); }
+static void b_movimm_logical(A64Buf *b) { a64_mov_imm64(b, 0, 0x1fffe); a64_ret(b); }
 static void b_add(A64Buf *b) { a64_add_reg(b, 1, 0, 0, 1, 0); a64_ret(b); }
 static void b_add32(A64Buf *b) { a64_add_reg(b, 0, 0, 0, 1, 0); a64_ret(b); }
 static void b_sub(A64Buf *b) { a64_sub_reg(b, 1, 0, 0, 1, 0); a64_ret(b); }
@@ -83,6 +84,11 @@ static void b_and(A64Buf *b) { a64_and_reg(b, 1, 0, 0, 1, 0); a64_ret(b); }
 static void b_eor(A64Buf *b) { a64_eor_reg(b, 1, 0, 0, 1, 0); a64_ret(b); }
 static void b_bic(A64Buf *b) { a64_bic_reg(b, 1, 0, 0, 1, 0); a64_ret(b); }
 static void b_orn(A64Buf *b) { a64_orn_reg(b, 1, 0, 0, 1, 0); a64_ret(b); }
+static void b_andimm(A64Buf *b) { a64_try_and_imm(b, 1, 0, 0, 0x1ffff); a64_ret(b); }
+static void b_andimm32(A64Buf *b) { a64_try_and_imm(b, 0, 0, 0, 0xff00ff00); a64_ret(b); }
+static void b_orrimm(A64Buf *b) { a64_try_orr_imm(b, 1, 0, 0, 0x8000000000000001ull); a64_ret(b); }
+static void b_eorimm(A64Buf *b) { a64_try_eor_imm(b, 1, 0, 0, 0xaaaaaaaaaaaaaaaaull); a64_ret(b); }
+static void b_andsimm_z(A64Buf *b) { a64_try_ands_imm(b, 1, 0, 0, 0xff); a64_cset(b, 0, A64_EQ); a64_ret(b); }
 static void b_lslv(A64Buf *b) { a64_lslv(b, 1, 0, 0, 1); a64_ret(b); }
 static void b_lsrv(A64Buf *b) { a64_lsrv(b, 1, 0, 0, 1); a64_ret(b); }
 static void b_asrv(A64Buf *b) { a64_asrv(b, 1, 0, 0, 1); a64_ret(b); }
@@ -109,6 +115,8 @@ static uint64_t g_scratch[16];
 static void b_ldrsw(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 4, 1, 0, 0); a64_ldrsw(b, 0, 0, 0); a64_ret(b); }
 static void b_ldsb(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 1, 1, 0, 0); a64_ldrsb(b, 1, 0, 0, 0); a64_ret(b); }
 static void b_ldrh(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 2, 1, 0, 2); a64_ldr(b, 2, 0, 0, 2); a64_ret(b); }
+static void b_ldr_regoff(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_mov_imm64(b, 3, 5); a64_ldr_regoff(b, 8, 0, 2, 3, 1); a64_ret(b); }
+static void b_str_regoff(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_mov_imm64(b, 3, 5); a64_str_regoff(b, 8, 0, 2, 3, 1); a64_ldr(b, 8, 0, 2, 8 * 5); a64_ret(b); }
 
 /* The sign-extending loads at a NONZERO offset. This is not redundant with
  * b_ldrsw/b_ldsb above, and the difference is the whole point: at offset 0 the
@@ -257,6 +265,122 @@ static void test_try_patch_b_range(void)
     CHECK(w == 0x14000000u, "try_patch_b -(2^25+1) leaves word untouched");
 }
 
+static uint64_t test_low_mask(unsigned bits)
+{
+    return bits == 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
+}
+
+static uint64_t test_ror_element(uint64_t v, unsigned rot, unsigned bits)
+{
+    uint64_t mask = test_low_mask(bits);
+    rot &= bits - 1;
+    if (rot == 0)
+        return v & mask;
+    return ((v >> rot) | (v << (bits - rot))) & mask;
+}
+
+static uint64_t decode_logical_imm_word(int sf, uint32_t word)
+{
+    uint32_t n = (word >> 22) & 1;
+    uint32_t immr = (word >> 16) & 0x3f;
+    uint32_t imms = (word >> 10) & 0x3f;
+    uint32_t marker = (n << 6) | ((~imms) & 0x3f);
+    unsigned len = 0;
+    for (unsigned bit = 1; bit <= 6; bit++) {
+        if (marker & (1u << bit))
+            len = bit;
+    }
+    unsigned esize = 1u << len;
+    unsigned levels = esize - 1;
+    uint64_t element = test_ror_element(test_low_mask((imms & levels) + 1),
+                                        immr & levels, esize);
+    uint64_t value = element;
+    unsigned width = sf ? 64u : 32u;
+    for (unsigned shift = esize; shift < width; shift <<= 1)
+        value |= value << shift;
+    return value & test_low_mask(width);
+}
+
+static void test_all_logical_immediates(void)
+{
+    uint32_t word;
+    int accepted = 1;
+    int decoded = 1;
+    unsigned cases = 0;
+
+    for (int sf = 0; sf <= 1; sf++) {
+        unsigned width = sf ? 64u : 32u;
+        for (unsigned esize = 2; esize <= width; esize <<= 1) {
+            for (unsigned ones = 1; ones < esize; ones++) {
+                for (unsigned rot = 0; rot < esize; rot++) {
+                    uint64_t element = test_ror_element(test_low_mask(ones),
+                                                        rot, esize);
+                    uint64_t value = element;
+                    for (unsigned shift = esize; shift < width; shift <<= 1)
+                        value |= value << shift;
+                    A64Buf b = { .start = &word, .p = &word, .end = &word + 1 };
+                    if (!a64_try_orr_imm(&b, sf, 0, A64_ZR, value)) {
+                        accepted = 0;
+                    } else if (decode_logical_imm_word(sf, word) != value) {
+                        decoded = 0;
+                    }
+                    cases++;
+                }
+            }
+        }
+    }
+    CHECK(cases == 6636, "logical immediate property case count");
+    CHECK(accepted, "all architectural logical immediates accepted");
+    CHECK(decoded, "all emitted logical immediate fields decode correctly");
+}
+
+static void test_logical_imm_encodings(void)
+{
+    uint32_t words[8] = {0};
+    A64Buf b = {
+        .start = words,
+        .p = words,
+        .end = words + sizeof(words) / sizeof(words[0]),
+    };
+
+    CHECK(a64_try_and_imm(&b, 1, 3, 4, 0x1ffff) == 1,
+          "and immediate accepted");
+    CHECK(words[0] == 0x92404083u, "and x3,x4,#0x1ffff encoding");
+    CHECK(a64_try_and_imm(&b, 0, 5, 6, 0xff00ff00) == 1,
+          "and w immediate accepted");
+    CHECK(words[1] == 0x12089cc5u, "and w5,w6,#0xff00ff00 encoding");
+    CHECK(a64_try_ands_imm(&b, 1, 7, 8, 0x8000000000000001ull) == 1,
+          "ands rotated immediate accepted");
+    CHECK(words[2] == 0xf2410507u,
+          "ands x7,x8,#0x8000000000000001 encoding");
+    CHECK(a64_try_orr_imm(&b, 1, 9, A64_ZR, 0x1fffe) == 1,
+          "orr immediate accepted");
+    CHECK(words[3] == 0xb27f3fe9u, "orr x9,xzr,#0x1fffe encoding");
+    CHECK(a64_try_eor_imm(&b, 1, 10, 11, 0xaaaaaaaaaaaaaaaaull) == 1,
+          "eor repeated immediate accepted");
+    CHECK(words[4] == 0xd201f16au,
+          "eor x10,x11,#0xaaaaaaaaaaaaaaaa encoding");
+
+    uint32_t *before = b.p;
+    CHECK(a64_try_orr_imm(&b, 1, 0, 0, 0) == 0,
+          "logical immediate rejects zero");
+    CHECK(a64_try_orr_imm(&b, 1, 0, 0, UINT64_MAX) == 0,
+          "logical immediate rejects all ones");
+    CHECK(a64_try_orr_imm(&b, 1, 0, 0, 0x0123456789abcdefull) == 0,
+          "logical immediate rejects irregular pattern");
+    CHECK(b.p == before, "rejected logical immediates emit nothing");
+
+    b.p = words;
+    a64_mov_imm64(&b, 0, 0x1fffe);
+    CHECK(b.p == words + 1, "mov logical immediate uses one word");
+    CHECK(words[0] == 0xb27f3fe0u, "mov logical immediate encoding");
+
+    b.p = words;
+    a64_mov_imm64(&b, 0, 0xffff);
+    CHECK(b.p == words + 1, "one-word movz stays one word");
+    CHECK(words[0] == 0xd29fffe0u, "one-word movz remains preferred");
+}
+
 static void b_branch(A64Buf *b)
 {
     a64_subs_reg(b, 1, A64_ZR, 0, 1, 0);
@@ -282,6 +406,30 @@ static void b_cbz(A64Buf *b)
     a64_ret(b);
 }
 
+static void b_tbz(A64Buf *b)
+{
+    uint32_t *j = a64_label(b);
+    a64_tbz(b, 0, 5, 0);
+    a64_mov_imm64(b, 0, 1);
+    a64_ret(b);
+    uint32_t *tgt = a64_label(b);
+    a64_patch_tbz(j, tgt);
+    a64_mov_imm64(b, 0, 2);
+    a64_ret(b);
+}
+
+static void b_tbnz(A64Buf *b)
+{
+    uint32_t *j = a64_label(b);
+    a64_tbnz(b, 0, 37, 0);
+    a64_mov_imm64(b, 0, 1);
+    a64_ret(b);
+    uint32_t *tgt = a64_label(b);
+    a64_patch_tbz(j, tgt);
+    a64_mov_imm64(b, 0, 2);
+    a64_ret(b);
+}
+
 int main(void)
 {
     jit_alloc();
@@ -290,6 +438,7 @@ int main(void)
     CHECK(run2(b_movimm2, 0, 0) == 0xffffffffffff0000ull, "mov_imm64 movn-friendly");
     CHECK(run2(b_movimm3, 0, 0) == 0x000000000000ffffull, "mov_imm64 single lane");
     CHECK(run2(b_movimm4, 0, 0) == 0xffffffffffffffffull, "mov_imm64 all ones");
+    CHECK(run2(b_movimm_logical, 0, 0) == 0x1fffe, "mov_imm64 logical immediate");
     CHECK(run2(b_add, 5, 7) == 12, "add64");
     CHECK(run2(b_add32, 0xffffffffull, 2) == 1, "add32 zero-extends");
     CHECK(run2(b_sub, 20, 8) == 12, "sub64");
@@ -300,6 +449,16 @@ int main(void)
     CHECK(run2(b_eor, 0xff, 0x0f) == 0xf0, "eor");
     CHECK(run2(b_bic, 0xff, 0x0f) == 0xf0, "bic");
     CHECK(run2(b_orn, 0x0f, 0x00) == 0xffffffffffffffffull, "orn");
+    CHECK(run2(b_andimm, 0x123456789abcdef0ull, 0) == 0xdef0,
+          "and logical immediate");
+    CHECK(run2(b_andimm32, 0xffffffffffffffffull, 0) == 0xff00ff00,
+          "and logical immediate w-form zero-extends");
+    CHECK(run2(b_orrimm, 0x20, 0) == 0x8000000000000021ull,
+          "orr rotated logical immediate");
+    CHECK(run2(b_eorimm, UINT64_MAX, 0) == 0x5555555555555555ull,
+          "eor repeated logical immediate");
+    CHECK(run2(b_andsimm_z, 0x100, 0) == 1, "ands immediate sets Z");
+    CHECK(run2(b_andsimm_z, 0x101, 0) == 0, "ands immediate clears Z");
     CHECK(run2(b_lslv, 1, 4) == 16, "lslv");
     CHECK(run2(b_lsrv, 0x100, 4) == 0x10, "lsrv");
     CHECK(run2(b_asrv, (uint64_t)-16, 2) == (uint64_t)-4, "asrv");
@@ -334,10 +493,18 @@ int main(void)
     CHECK(run2(b_ldrsb_off, 0, 0x80) == (uint64_t)-128, "ldrsb nonzero offset");
     CHECK(run2(b_ldrsh_off, 0, 0x8000) == (uint64_t)-32768, "ldrsh nonzero offset");
     CHECK(run2(b_ldrh, 0, 0xbeef) == 0xbeef, "ldrh scaled offset");
+    CHECK(run2(b_ldr_regoff, 0, 0x123456789abcdef0ull) == 0x123456789abcdef0ull,
+          "ldr register offset scaled");
+    CHECK(run2(b_str_regoff, 0xfeedfacecafebeefull, 0) == 0xfeedfacecafebeefull,
+          "str register offset scaled");
     CHECK(run2(b_branch, 1, 2) == 222, "bcond taken (NE)");
     CHECK(run2(b_branch, 1, 1) == 111, "bcond not taken (EQ)");
     CHECK(run2(b_cbz, 0, 0) == 2, "cbz taken");
     CHECK(run2(b_cbz, 5, 0) == 1, "cbz not taken");
+    CHECK(run2(b_tbz, 0, 0) == 2, "tbz bit clear taken");
+    CHECK(run2(b_tbz, 1ull << 5, 0) == 1, "tbz bit set not taken");
+    CHECK(run2(b_tbnz, 1ull << 37, 0) == 2, "tbnz high bit set taken");
+    CHECK(run2(b_tbnz, 0, 0) == 1, "tbnz high bit clear not taken");
 
     /* x86-flag translation building blocks used by the JIT inlined ALU. */
     CHECK(run2(b_cset_cc_subborrow, 0, 1) == 1, "sub borrow -> A64_CC (x86 CF)");
@@ -362,6 +529,8 @@ int main(void)
     CHECK(run2(b_bpatch, 0, 0) == 222, "a64_try_patch_b in-range patch executes");
     CHECK(g_last_ok == 1, "a64_try_patch_b in-range reported success");
     test_try_patch_b_range();
+    test_logical_imm_encodings();
+    test_all_logical_immediates();
     CHECK(run_br(16) == 222, "a64_br x16");
     CHECK(run_br(9) == 222, "a64_br x9");
     CHECK(run2(b_stp_ldp_off_x20, 5, 7) == 12, "stp/ldp off x20");

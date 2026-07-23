@@ -21,8 +21,8 @@
  * is known by reading the displacement from the already-emitted word.
  *
  * a64_mov_imm64 chooses the shortest constant materialization: a single
- * MOVZ or MOVN when three 16-bit lanes are 0x0000 or 0xffff respectively,
- * otherwise a MOVZ seed followed by MOVK for each remaining nonzero lane.
+ * logical-immediate ORR when that beats the MOV-wide sequence, otherwise a
+ * MOVZ/MOVN seed followed by the required MOVK instructions.
  */
 #include "ocerz/a64emit.h"
 
@@ -61,6 +61,87 @@ void a64_movn(A64Buf *b, int rd, uint16_t imm, int hw)
     a64_emit32(b, 0x92800000u | ((uint32_t)(hw & 3) << 21) | ((uint32_t)imm << 5) | (uint32_t)(rd & 31));
 }
 
+static uint64_t low_mask(unsigned bits)
+{
+    return bits == 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
+}
+
+static uint64_t ror_element(uint64_t v, unsigned rot, unsigned bits)
+{
+    uint64_t mask = low_mask(bits);
+    rot &= bits - 1;
+    if (rot == 0)
+        return v & mask;
+    return ((v >> rot) | (v << (bits - rot))) & mask;
+}
+
+/* Encode the ARM DecodeBitMasks representation used by logical immediates.
+ * A value is legal iff it is a nontrivial run of ones, rotated within a
+ * power-of-two element, then replicated across the operand width. */
+static int logical_imm_fields(int sf, uint64_t imm, uint32_t *fields)
+{
+    unsigned width = sf ? 64u : 32u;
+    uint64_t width_mask = low_mask(width);
+    imm &= width_mask;
+    if (imm == 0 || imm == width_mask)
+        return 0;
+
+    for (unsigned esize = 2; esize <= width; esize <<= 1) {
+        uint64_t emask = low_mask(esize);
+        uint64_t element = imm & emask;
+        uint64_t replicated = element;
+        for (unsigned shift = esize; shift < width; shift <<= 1)
+            replicated |= replicated << shift;
+        if ((replicated & width_mask) != imm)
+            continue;
+
+        unsigned ones = (unsigned)__builtin_popcountll(element);
+        if (ones == 0 || ones == esize)
+            continue;
+        uint64_t run = low_mask(ones);
+        for (unsigned rot = 0; rot < esize; rot++) {
+            if (ror_element(run, rot, esize) != element)
+                continue;
+            uint32_t n = esize == 64 ? 1u : 0u;
+            uint32_t imms = ((~(esize * 2u - 1u)) & 0x3fu) | (ones - 1u);
+            *fields = (n << 22) | ((rot & 0x3fu) << 16) | (imms << 10);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int try_logic_imm(A64Buf *b, uint32_t base, int sf, int rd, int rn,
+                         uint64_t imm)
+{
+    uint32_t fields;
+    if (!logical_imm_fields(sf, imm, &fields))
+        return 0;
+    a64_emit32(b, base | ((uint32_t)(sf != 0) << 31) | fields |
+                  ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
+    return 1;
+}
+
+int a64_try_and_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm)
+{
+    return try_logic_imm(b, 0x12000000u, sf, rd, rn, imm);
+}
+
+int a64_try_ands_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm)
+{
+    return try_logic_imm(b, 0x72000000u, sf, rd, rn, imm);
+}
+
+int a64_try_orr_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm)
+{
+    return try_logic_imm(b, 0x32000000u, sf, rd, rn, imm);
+}
+
+int a64_try_eor_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm)
+{
+    return try_logic_imm(b, 0x52000000u, sf, rd, rn, imm);
+}
+
 void a64_mov_imm64(A64Buf *b, int rd, uint64_t v)
 {
     uint16_t lane[4] = {
@@ -73,6 +154,11 @@ void a64_mov_imm64(A64Buf *b, int rd, uint64_t v)
         if (lane[i] == 0xffff)
             ones++;
     }
+    int wide_count = 4 - (zero > ones ? zero : ones);
+    if (wide_count == 0)
+        wide_count = 1;
+    if (wide_count > 1 && a64_try_orr_imm(b, 1, rd, A64_ZR, v))
+        return;
     if (ones > zero) {
         int seeded = 0;
         for (int i = 0; i < 4; i++) {
@@ -131,6 +217,36 @@ void a64_str(A64Buf *b, int size, int rt, int rn, uint32_t off)
     uint32_t sz = ldst_size_bits(size);
     uint32_t imm12 = off / (uint32_t)size;
     a64_emit32(b, 0x39000000u | (sz << 30) | (imm12 << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
+void a64_ldr_post64(A64Buf *b, int rt, int rn, int imm)
+{
+    a64_emit32(b, 0xf8400400u | (((uint32_t)imm & 0x1ffu) << 12) |
+                  ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
+void a64_str_pre64(A64Buf *b, int rt, int rn, int imm)
+{
+    a64_emit32(b, 0xf8000c00u | (((uint32_t)imm & 0x1ffu) << 12) |
+                  ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
+void a64_ldr_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled)
+{
+    uint32_t sz = size == 8 ? 3u : size == 4 ? 2u : size == 2 ? 1u : 0u;
+    a64_emit32(b, 0x38606800u | (sz << 30) |
+                  ((uint32_t)(rm & 31) << 16) |
+                  ((uint32_t)(scaled != 0) << 12) |
+                  ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
+void a64_str_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled)
+{
+    uint32_t sz = size == 8 ? 3u : size == 4 ? 2u : size == 2 ? 1u : 0u;
+    a64_emit32(b, 0x38206800u | (sz << 30) |
+                  ((uint32_t)(rm & 31) << 16) |
+                  ((uint32_t)(scaled != 0) << 12) |
+                  ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
 /* Load-Acquire / Store-Release (LDAR/STLR): the ordered forms of LDR/STR the
@@ -333,6 +449,22 @@ void a64_cbnz(A64Buf *b, int sf, int rt, int32_t off_words)
     a64_emit32(b, 0x35000000u | ((uint32_t)sf << 31) | (((uint32_t)off_words & 0x7ffff) << 5) | (uint32_t)(rt & 31));
 }
 
+void a64_tbz(A64Buf *b, int rt, int bit, int32_t off_words)
+{
+    a64_emit32(b, 0x36000000u | ((uint32_t)(bit & 0x20) << 26) |
+                  ((uint32_t)(bit & 31) << 19) |
+                  (((uint32_t)off_words & 0x3fff) << 5) |
+                  (uint32_t)(rt & 31));
+}
+
+void a64_tbnz(A64Buf *b, int rt, int bit, int32_t off_words)
+{
+    a64_emit32(b, 0x37000000u | ((uint32_t)(bit & 0x20) << 26) |
+                  ((uint32_t)(bit & 31) << 19) |
+                  (((uint32_t)off_words & 0x3fff) << 5) |
+                  (uint32_t)(rt & 31));
+}
+
 void a64_patch_b(uint32_t *at, uint32_t *target)
 {
     int32_t off = (int32_t)(target - at);
@@ -361,6 +493,12 @@ void a64_patch_cbz(uint32_t *at, uint32_t *target)
 {
     int32_t off = (int32_t)(target - at);
     *at = (*at & 0xff00001fu) | (((uint32_t)off & 0x7ffff) << 5);
+}
+
+void a64_patch_tbz(uint32_t *at, uint32_t *target)
+{
+    int32_t off = (int32_t)(target - at);
+    *at = (*at & 0xfff8001fu) | (((uint32_t)off & 0x3fff) << 5);
 }
 
 void a64_ret(A64Buf *b)

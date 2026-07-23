@@ -1558,6 +1558,8 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         OcerzCPU saved = *cpu;
         uint64_t h = ocerz_dlopen(vm, host, (int)mode);
         *cpu = saved;
+        if (vm->jit_ordered_required)
+            cpu->ras_top = 0;
         if (vm->exited)
             return OCERZ_STEP_OK;
         api_return(cpu, h);

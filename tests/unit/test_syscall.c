@@ -205,6 +205,25 @@ static void test_mmap_anon(void)
     CHECK(cpu->gpr[OCERZ_RAX] == 0);
 }
 
+static void test_mmap_shared_requires_ordered(void)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    vm.jit_plain_mem = 1;
+    vm.jit_ordered_required = 0;
+    set_args(cpu, bsd(197), 0, 0x4000, PROT_READ | PROT_WRITE,
+             MAP_ANON | MAP_SHARED, (uint64_t)-1, 0);
+    int r = ocerz_handle_syscall(&vm, cpu);
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    uint64_t gaddr = cpu->gpr[OCERZ_RAX];
+    CHECK(gaddr >= ocerz_arena_lo && gaddr < ocerz_arena_hi);
+    CHECK(vm.jit_ordered_required == 1);
+    CHECK(vm.jit_plain_mem == 0);
+
+    set_args(cpu, bsd(73), gaddr, 0x4000, 0, 0, 0, 0);
+    CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
+}
+
 static void test_mmap_fixed(void)
 {
     OcerzCPU *cpu = &vm.cpu;
@@ -470,6 +489,7 @@ int main(void)
     test_open_fstat_close();
     test_open_bad_path();
     test_mmap_anon();
+    test_mmap_shared_requires_ordered();
     test_mmap_fixed();
     test_mmap_fixed_outside();
     test_madvise();
