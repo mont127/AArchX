@@ -78,6 +78,20 @@ This is early. The window comes up on roughly half of launches; the other half h
 
 > **Ocerz is more faithful than Rosetta for the test binaries.** The freestanding (`-nostdlib`, raw-syscall) guest tests actually *drop output lines* under Rosetta 2 — SSE printed 21 of 52 lines, even with vectorization off. Ocerz's output matches independent real-libc oracles (arm64-native and x86_64+printf) byte-for-byte. Goldens were regenerated from those oracles.
 
+## Benchmarks
+
+The *same* unmodified x86_64 binary, timed under Ocerz and under Rosetta 2 on the same Apple Silicon machine — best of three, wall-clock, byte-identical output from both engines. Ocerz is now at rough parity with Rosetta 2 on compute-bound kernels:
+
+| Kernel | Rosetta 2 | Ocerz | vs Rosetta |
+| --- | --- | --- | --- |
+| `alu` — tight register-ALU loop | 0.49s | 0.49s | **parity** |
+| `br` — data-dependent branch loop | 0.88s | 0.31s | **2.8× faster** |
+| `fib(42)` — recursive call / return | 0.67s | 1.09s | 1.6× slower |
+
+Ocerz beats Rosetta on the branch kernel because two-way basic-block linking branches straight between compiled blocks with no dispatcher round-trip. The recursive-call kernel is the remaining gap, dominated by the call/return path. These are microbenchmarks — a real workload's mix sits between them.
+
+Blocks translate in a single-observer *plain-memory* tier (ordinary `ldr`/`str`) and permanently switch to x86-TSO ordered accesses (`ldar`/`stlr`) the moment guest memory can become visible to another thread or process. Reproduce with `tests/run_bench_compare.sh`.
+
 ## CLI
 
 ```
@@ -105,7 +119,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 **Eager flags.** Flags are evaluated eagerly into `cpu->rflags`; `flags.c` is the bit-for-bit reference the JIT must match — ADC/SBB folded via carry-in relations, INC/DEC preserving CF, deterministic values for architecturally-undefined flags, and x86 NaN semantics (negative QNaN indefinite, propagation rules).
 
-**The JIT.** A block is the straight-line run from an entry rip to the first control-flow or system instruction. Each block is decoded once; cheap ops are inlined as arm64 and everything else calls back into the shared interpreter dispatch, so the JIT and interpreter can never disagree on semantics. A 1GB `MAP_JIT` reservation (address space, not RSS) with `pthread_jit_write_protect_np` and per-block icache invalidation; a 2^20-bucket cache keyed by guest rip with a lock-free lookup on the hot path. Stack traffic (`push`/`pop`) is inlined natively -- it is ~27% of everything a real app executes. If the arena ever fills, a block is demoted to the interpreter tier rather than retried forever. Aligned guest loads/stores are emitted as `ldar`/`stlr`, so x86's TSO ordering survives arm64's weak memory model.
+**The JIT.** A block is the straight-line run from an entry rip to the first control-flow or system instruction. Each block is decoded once; cheap ops are inlined as arm64 and everything else calls back into the shared interpreter dispatch, so the JIT and interpreter can never disagree on semantics. A 1GB `MAP_JIT` reservation (address space, not RSS) with `pthread_jit_write_protect_np` and per-block icache invalidation; a 2^20-bucket cache keyed by guest rip with a lock-free lookup on the hot path. Stack traffic (`push`/`pop`) is inlined natively -- it is ~27% of everything a real app executes. If the arena ever fills, a block is demoted to the interpreter tier rather than retried forever. Aligned guest loads/stores use ordinary `ldr`/`str` while the process is provably single-observer and upgrade to `ldar`/`stlr` once guest memory can be shared with another thread or process, so x86's TSO ordering survives arm64's weak memory model without paying for barriers that single-threaded code cannot observe.
 
 **The mini-dyld.** Maps the real `dyld_shared_cache_x86_64` at slide 0 and implements the dyld runtime API surface that libdyld's trampolines dispatch through — `dlopen`/`dlsym`, image lists, TLV, unwind, `_dyld_register_for_bulk_image_loads` — plus the objc↔dyld handshake (`_dyld_objc_register_callbacks`, `map_images`/`load_images`, and the shared cache's selector and class perfect-hash tables).
 
