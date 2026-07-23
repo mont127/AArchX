@@ -116,6 +116,18 @@ static pthread_mutex_t g_cpus_lock = PTHREAD_MUTEX_INITIALIZER;
 static void ocerz_cpu_register(OcerzCPU *cpu)
 {
     pthread_mutex_lock(&g_cpus_lock);
+    for (int i = 0; i < g_cpus_n; i++)
+        if (g_cpus[i] == cpu) {           /* already registered: never double-insert */
+            /* Each hit here is a re-registration the OLD code would have turned into a
+             * dangling g_cpus[] entry -- the corruption mechanism, counted so it can be
+             * proven live (OCERZ_CPUREG_LOG) rather than argued. */
+            static _Atomic unsigned dups;
+            if (getenv("OCERZ_CPUREG_LOG"))
+                fprintf(stderr, "ocerz: CPUREG dup #%u cpu=%p (would have dangled)\n",
+                        ++dups, (void *)cpu);
+            pthread_mutex_unlock(&g_cpus_lock);
+            return;
+        }
     if (g_cpus_n < OCERZ_MAX_CPUS)
         g_cpus[g_cpus_n++] = cpu;
     /* Overflow (more than 512 live guest threads) is not fatal: an unregistered
@@ -130,7 +142,8 @@ static void ocerz_cpu_unregister(OcerzCPU *cpu)
     for (int i = 0; i < g_cpus_n; i++) {
         if (g_cpus[i] == cpu) {
             g_cpus[i] = g_cpus[--g_cpus_n];
-            break;
+            i--;                          /* remove ALL matches, not just the first, so no
+                                             stale duplicate can outlive the CPU */
         }
     }
     pthread_mutex_unlock(&g_cpus_lock);
@@ -1347,9 +1360,24 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     sigjmp_buf jb;
     sigjmp_buf *prev_recover = g_sig_recover;
     g_sig_recover = &jb;
-    sigsetjmp(jb, 1);
-    g_cur_cpu = cpu;
+    /* Register the CPU ONCE, ABOVE the recovery point. Every host SIGSEGV/SIGBUS a
+     * worker takes siglongjmp()s back to this sigsetjmp; with the register call BELOW
+     * it, each fault re-appended cpu to g_cpus[] with no dup check, and unregister
+     * removed only one, so worker teardown left dangling g_cpus[] entries into the
+     * freed struct ocerz_worker. ocerz_vm_purge_jit_ras then stored ras_top=0 through
+     * those dangling pointers into freed-and-reused malloc chunks -> corrupted heap
+     * metadata -> the crash INSIDE libsystem_malloc that hit multithreaded guest apps. */
     ocerz_cpu_register(cpu);
+    if (sigsetjmp(jb, 1) != 0 && getenv("OCERZ_CPUREG_LOG")) {
+        /* Non-zero return == a siglongjmp recovery from a worker fault. Under the OLD
+         * ordering (register BELOW this point) each of these re-ran ocerz_cpu_register
+         * and left a dangling g_cpus[] entry -- so this count is exactly how many the
+         * old code would have leaked this run. */
+        static _Atomic unsigned recov;
+        fprintf(stderr, "ocerz: CPUREG recovery #%u (old code would leak a dangling entry here)\n",
+                ++recov);
+    }
+    g_cur_cpu = cpu;
     /* cpu->interrupt is the dedicated cross-thread stop poll (see the registry
      * comment). It is redundant with vm->exited today -- the header re-checks
      * both every block -- but it is the ONE per-CPU word a future chained
