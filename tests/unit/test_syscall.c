@@ -43,6 +43,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 static int tests_run;
 static int tests_failed;
@@ -252,12 +253,23 @@ static void test_mmap_fixed_outside(void)
 {
     OcerzCPU *cpu = &vm.cpu;
     uint64_t bad = ocerz_arena_hi + 0x10000;
+    /* A FIXED anonymous mmap outside the arena is honoured iff ocerz can reserve that
+     * exact host address (identity-mapped mode grabs it via mach_vm_allocate(FIXED) in
+     * reserve_host_fixed). Whether `bad` is free depends on the process's memory layout,
+     * so this test used to flake -- pass when `bad` happened to be taken, fail when it
+     * was free. Pin the outcome by occupying `bad` on the host first, forcing the
+     * "cannot place this FIXED mapping" -> ENOMEM path every time. (If `bad` was already
+     * occupied the allocate simply fails and it stays occupied, which is equally fine.) */
+    mach_vm_address_t occ = bad;
+    kern_return_t okr = mach_vm_allocate(mach_task_self(), &occ, 0x4000, VM_FLAGS_FIXED);
     set_args(cpu, bsd(197), bad, 0x4000, PROT_READ | PROT_WRITE,
              MAP_ANON | MAP_PRIVATE | MAP_FIXED, (uint64_t)-1, 0);
     int r = ocerz_handle_syscall(&vm, cpu);
     CHECK(r == OCERZ_STEP_OK);
     CHECK(cf(cpu) == 1);
     CHECK(cpu->gpr[OCERZ_RAX] == 12);
+    if (okr == KERN_SUCCESS)
+        mach_vm_deallocate(mach_task_self(), occ, 0x4000);
 }
 
 static void test_madvise(void)
