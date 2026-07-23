@@ -95,7 +95,7 @@ int main(int argc, char **argv)
      * The JIT may use its single-CPU memory tier until a syscall explicitly
      * requests concurrency or shared memory, at which point it retires those
      * translations before admitting the new observer. */
-    vm.jit_plain_mem = 1;
+    vm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;   /* A/B: force TSO-ordered from the start */
 
     if (ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK)
         return 70;
