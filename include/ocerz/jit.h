@@ -62,6 +62,17 @@ uint64_t ocerz_jit_blocks(const OcerzJit *jit);
 void ocerz_jit_prefork(void);
 void ocerz_jit_postfork(void);
 
+/* Redirect every direct self-loop backedge to its cold dispatcher exit. Used
+ * by process exit so steady-state loops need no per-iteration stop poll. */
+void ocerz_jit_request_stop(struct OcerzVM *vm);
+
+/* Permanently leave the single-CPU plain-memory tier before guest memory can
+ * become visible to another CPU or process. Existing translations are retired
+ * (their code remains mapped for any in-flight fault lookup), chain/RAS targets
+ * are invalidated, and subsequent blocks use x86-TSO ordered accesses. Safe to
+ * call repeatedly; callers must invoke it before admitting the new observer. */
+void ocerz_jit_require_ordered(struct OcerzVM *vm);
+
 /* Exact guest rip for a host pc inside emitted JIT code, for the fault handler.
  * Inlined instructions never write cpu->rip (that store is what the JIT exists
  * to avoid), so a fault in inlined code cannot read the faulting rip out of the
@@ -87,5 +98,14 @@ int ocerz_jit_pc_in_arena(const struct OcerzVM *vm, const void *host_pc);
  * handler. */
 void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
                                   const uint64_t *host_x, OcerzCPU *cpu);
+
+/* FAULT SEAM for deferred flags. Some inlined memory accesses carry a cold
+ * reconstruction recipe instead of forcing the preceding flag producer to
+ * publish cc_src/cc_dst/cc_op on the hot path. After pinned GPR recovery, this
+ * installs that recipe's exact deferred record in cpu; the caller then invokes
+ * ocerz_flags_materialize() as usual. A no-op when the faulting instruction has
+ * no recipe. Lock-free and allocation-free: safe from a signal handler. */
+void ocerz_jit_fault_recover_flags(const struct OcerzVM *vm,
+                                   const void *host_pc, OcerzCPU *cpu);
 
 #endif

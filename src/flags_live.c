@@ -9,6 +9,7 @@
  * semantic reference for the whole emulator.
  */
 #include "ocerz/flags_live.h"
+#include <stdlib.h>
 
 /* Does any operand actually ACCESS memory? This is the fault barrier's trigger.
  *
@@ -32,7 +33,8 @@ static int insn_touches_memory(const X86Insn *insn)
     return 0;
 }
 
-void ocerz_flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use)
+static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
+                         int fault_barrier)
 {
     /* The conservative default, and what every unlisted op keeps: kill nothing,
      * read everything. This is exactly today's eager behaviour, so an op missing
@@ -200,9 +202,20 @@ void ocerz_flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use)
      * predecessor whose value a handler might observe first.
      *
      * Applied last so it cannot be missed by an early break above. */
-    if (insn_touches_memory(insn))
+    if (fault_barrier && insn_touches_memory(insn) &&
+        !getenv("OCERZ_NO_FAULT_FLAGS"))
         u = OCERZ_FL_ALL;
 
     *def = d;
     *use = u;
+}
+
+void ocerz_flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use)
+{
+    flags_defuse(insn, def, use, 1);
+}
+
+void ocerz_flags_defuse_nofault(const X86Insn *insn, uint64_t *def, uint64_t *use)
+{
+    flags_defuse(insn, def, use, 0);
 }

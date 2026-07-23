@@ -3,9 +3,12 @@
  *
  * A THROUGHPUT benchmark, not a correctness test. The existing guest tests all
  * finish inside process-startup noise (~0.03s under both Rosetta and Ocerz), so
- * they cannot measure translation speed at all. Each workload here runs long
- * enough (~1s+ native) that startup is a rounding error, and each isolates one
- * thing the translator must be good at:
+ * they cannot measure translation speed at all. The four kernels here isolate
+ * things the translator must be good at. `alu` and `br` are long enough for a
+ * direct wall-clock comparison. `call` and `mem` are intentionally retained as
+ * correctness and profiling kernels, but are too short under Rosetta for a
+ * trustworthy raw ratio; tests/run_bench_compare.sh times their longer
+ * two-point variants (fibn and memn) instead:
  *   call  - naive recursive fib: call/ret + stack traffic, tiny blocks
  *   alu   - a tight register ALU loop: the inlined fast path + eager flags
  *   mem   - a pointer-chasing / store loop: guest load/store + g2h

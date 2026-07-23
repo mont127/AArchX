@@ -23,7 +23,7 @@
  * replica before any timing is trusted.
  *
  * argv[1] parsed by hand (-nostdlib, no strtoull). Built into benchbin/, never
- * bin/ (same rule as bench/fibn: the runners glob bin/*).
+ * bin/ (same rule as bench/fibn: the runners glob every entry in bin/).
  */
 #include "gsys.h"
 

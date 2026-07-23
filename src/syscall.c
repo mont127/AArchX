@@ -297,7 +297,6 @@ static void memtrace(const char *op, uint64_t a, uint64_t l, int prot, int flags
 
 static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    (void)vm;
     uint64_t addr = a[0];
     uint64_t len = a[1];
     int prot = (int)a[2];
@@ -307,6 +306,9 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int anon = (flags & MAP_ANON) != 0 || fd < 0;
     int fixed = (flags & MAP_FIXED) != 0;
     uint64_t gaddr;
+
+    if (flags & MAP_SHARED)
+        ocerz_jit_require_ordered(vm);
 
     memtrace(anon ? "mmap-anon" : "mmap-file", addr, len, prot, flags);
     if (anon) {
@@ -326,11 +328,23 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 ret_err(cpu, OCERZ_ENOMEM_V);
                 return OCERZ_STEP_OK;
             }
+            if ((flags & MAP_SHARED) &&
+                ocerz_map_shared_anon(addr, len, prot) != OCERZ_OK) {
+                ocerz_unmap(addr, len);
+                ret_err(cpu, OCERZ_ENOMEM_V);
+                return OCERZ_STEP_OK;
+            }
             ret_ok(cpu, addr);
             return OCERZ_STEP_OK;
         }
         gaddr = ocerz_map_anywhere(len, prot);
         if (gaddr == 0) {
+            ret_err(cpu, OCERZ_ENOMEM_V);
+            return OCERZ_STEP_OK;
+        }
+        if ((flags & MAP_SHARED) &&
+            ocerz_map_shared_anon(gaddr, len, prot) != OCERZ_OK) {
+            ocerz_unmap(gaddr, len);
             ret_err(cpu, OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
@@ -734,11 +748,15 @@ static void *ocerz_worker_entry(void *p)
 
 static int ocerz_spawn_worker(OcerzVM *vm, const OcerzCPU *tmpl)
 {
+    ocerz_jit_require_ordered(vm);
     struct ocerz_worker *w = (struct ocerz_worker *)calloc(1, sizeof *w);
     if (!w)
         return -1;
     w->vm = vm;
     w->cpu = *tmpl;
+    /* A worker starts with an independent guest stack. Never inherit a host
+     * return prediction, especially one captured before JIT retirement. */
+    w->cpu.ras_top = 0;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 16ull * 1024 * 1024);
@@ -779,8 +797,8 @@ static void ocerz_fork_child(void)
 
 static int sys_fork(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    (void)vm;
     (void)a;
+    ocerz_jit_require_ordered(vm);
     static int registered;
     if (!registered) {
         registered = 1;
@@ -838,7 +856,6 @@ static int env_inject_lowbase(char **henv, int m, int cap)
 
 static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    (void)vm;
     const char *self = ocerz_self_path();
     if (!self || !a[1]) {
         ret_err(cpu, EINVAL);
@@ -864,6 +881,7 @@ static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     henv[m] = NULL;
     pid_t hpid = 0;
+    ocerz_jit_require_ordered(vm);
     int rc = posix_spawn(&hpid, self, NULL, NULL, hargv, a[4] ? henv : NULL);
     if (rc != 0) {
         ret_err(cpu, (uint64_t)rc);
@@ -1994,6 +2012,7 @@ static void ocerz_hostwq_register(OcerzVM *vm)
     static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&m);
     if (!done) {
+        ocerz_jit_require_ordered(vm);
         done = 1;
         g_hostwq_vm = vm;
         int rc = _pthread_workqueue_init_with_workloop(
@@ -2197,6 +2216,7 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     uint64_t func = a[0], funarg = a[1], stack = a[2], pth = a[3], flags = a[4];
     (void)func;
     (void)funarg;
+    ocerz_jit_require_ordered(vm);
     struct ocerz_worker *w = (struct ocerz_worker *)calloc(1, sizeof *w);
     if (!w) {
         ret_err(cpu, OCERZ_ENOMEM_V);
@@ -2204,6 +2224,7 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     w->vm = vm;
     w->cpu = *cpu;
+    w->cpu.ras_top = 0;
     w->cpu.terminated = 0;
     w->cpu.cpu_number = ocerz_next_cpu_number();
     w->cpu.rip = OCERZ_THREAD_START;
@@ -3270,6 +3291,7 @@ static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf)
         return;
     mach_vm_address_t dst = gaddr;
     vm_prot_t curp = 0, maxp = 0;
+    ocerz_jit_require_ordered(vm);
     kern_return_t kr = mach_vm_remap(mach_task_self(), &dst, size, 0,
                                      VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
                                      mach_task_self(), haddr, FALSE,

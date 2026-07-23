@@ -54,6 +54,7 @@ typedef unsigned int g_u32;
 
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
+#define MAP_SHARED 0x0001
 #define MAP_PRIVATE 0x0002
 #define MAP_ANON 0x1000
 #define MAP_FIXED 0x0010

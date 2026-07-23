@@ -614,7 +614,8 @@ int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot)
  * thread's start context). MAP_FIXED overlays the shared file onto the region's
  * PROT_NONE reservation so writes from any cooperating ocerz process are seen by
  * all of them. The covered pages are marked committed in the bitmap. */
-int ocerz_map_shared_file(uint64_t gaddr, uint64_t len, int prot, int fd, uint64_t off)
+static int map_shared_overlay(uint64_t gaddr, uint64_t len, int prot,
+                              int fd, uint64_t off, const char *op)
 {
     uint64_t lo = round_down(gaddr);
     uint64_t hi = round_up(gaddr + len);
@@ -625,8 +626,9 @@ int ocerz_map_shared_file(uint64_t gaddr, uint64_t len, int prot, int fd, uint64
         return OCERZ_ENOMEM;
     }
     void *want = ocerz_g2h(lo);
+    int flags = MAP_SHARED | MAP_FIXED | (fd < 0 ? MAP_ANON : 0);
     void *got = mmap(want, (size_t)(hi - lo), host_prot(prot),
-                     MAP_SHARED | MAP_FIXED, fd, (off_t)off);
+                     flags, fd, (off_t)off);
     if (got == MAP_FAILED || got != want) {
         pthread_mutex_unlock(&map_lock);
         return OCERZ_ENOMEM;
@@ -634,8 +636,18 @@ int ocerz_map_shared_file(uint64_t gaddr, uint64_t len, int prot, int fd, uint64
     for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE)
         bit_set(r, pg_index(r, p));
     pthread_mutex_unlock(&map_lock);
-    memlog("shared", gaddr, len, prot);
+    memlog(op, gaddr, len, prot);
     return OCERZ_OK;
+}
+
+int ocerz_map_shared_anon(uint64_t gaddr, uint64_t len, int prot)
+{
+    return map_shared_overlay(gaddr, len, prot, -1, 0, "shared-anon");
+}
+
+int ocerz_map_shared_file(uint64_t gaddr, uint64_t len, int prot, int fd, uint64_t off)
+{
+    return map_shared_overlay(gaddr, len, prot, fd, off, "shared-file");
 }
 
 uint64_t ocerz_map_anywhere(uint64_t len, int prot)

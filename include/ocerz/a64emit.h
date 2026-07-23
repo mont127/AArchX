@@ -23,7 +23,8 @@
  * supports forward branches: remember the cursor, emit a placeholder, then
  * patch once the target is known).
  *
- * a64_mov_imm64 emits the shortest MOVZ/MOVN+MOVK sequence for the value.
+ * a64_mov_imm64 emits the shortest MOVZ/MOVN+MOVK or logical-immediate
+ * sequence for the value.
  * Condition codes use the ARM numbering (A64_EQ..A64_LE); A64_INV(cc)
  * flips a condition's polarity (the encoding's low-bit toggle).
  */
@@ -66,8 +67,21 @@ void a64_movn(A64Buf *b, int rd, uint16_t imm, int hw);
 void a64_mov_imm64(A64Buf *b, int rd, uint64_t v);
 void a64_mov_reg(A64Buf *b, int sf, int rd, int rm);
 
+/* Logical immediates are rotated, replicated runs of one bits. These helpers
+ * return 1 after emitting one instruction when `imm` is representable, or 0
+ * without changing the buffer when it is not. For sf == 0 only the low 32 bits
+ * participate, matching the architectural W-register operation. */
+int a64_try_and_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm);
+int a64_try_ands_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm);
+int a64_try_orr_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm);
+int a64_try_eor_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm);
+
 void a64_ldr(A64Buf *b, int size, int rt, int rn, uint32_t off);
 void a64_str(A64Buf *b, int size, int rt, int rn, uint32_t off);
+void a64_ldr_post64(A64Buf *b, int rt, int rn, int imm);
+void a64_str_pre64(A64Buf *b, int rt, int rn, int imm);
+void a64_ldr_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
+void a64_str_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
 void a64_ldar(A64Buf *b, int size, int rt, int rn);
 void a64_stlr(A64Buf *b, int size, int rt, int rn);
 void a64_dmb_ish(A64Buf *b);
@@ -125,6 +139,8 @@ void a64_b(A64Buf *b, int32_t off_words);
 void a64_bcond(A64Buf *b, int cond, int32_t off_words);
 void a64_cbz(A64Buf *b, int sf, int rt, int32_t off_words);
 void a64_cbnz(A64Buf *b, int sf, int rt, int32_t off_words);
+void a64_tbz(A64Buf *b, int rt, int bit, int32_t off_words);
+void a64_tbnz(A64Buf *b, int rt, int bit, int32_t off_words);
 void a64_patch_b(uint32_t *at, uint32_t *target);
 /* Range-checked B patch: returns 1 and patches if target is within the +-128MB
  * (+-(2^25-1) words) reach of an unconditional B at `at`; returns 0 and patches
@@ -135,6 +151,7 @@ void a64_patch_b(uint32_t *at, uint32_t *target);
 int a64_try_patch_b(uint32_t *at, uint32_t *target);
 void a64_patch_bcond(uint32_t *at, uint32_t *target);
 void a64_patch_cbz(uint32_t *at, uint32_t *target);
+void a64_patch_tbz(uint32_t *at, uint32_t *target);
 void a64_ret(A64Buf *b);
 void a64_br(A64Buf *b, int rn);
 void a64_blr(A64Buf *b, int rn);

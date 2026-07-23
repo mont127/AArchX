@@ -91,6 +91,12 @@ int main(int argc, char **argv)
     if (dynamic)
         return ocerz_dyld_run(&vm, load_path, argc - i, argv + i, environ);
 
+    /* LC_UNIXTHREAD guests start with one virtual CPU and no shared mappings.
+     * The JIT may use its single-CPU memory tier until a syscall explicitly
+     * requests concurrency or shared memory, at which point it retires those
+     * translations before admitting the new observer. */
+    vm.jit_plain_mem = 1;
+
     if (ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK)
         return 70;
 

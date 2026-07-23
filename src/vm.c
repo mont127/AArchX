@@ -136,6 +136,24 @@ static void ocerz_cpu_unregister(OcerzCPU *cpu)
     pthread_mutex_unlock(&g_cpus_lock);
 }
 
+/* A JIT memory-mode transition retires every host entry cached in the return
+ * predictor. The transition is required before guest concurrency starts, but
+ * clear the complete registry as well as vm->cpu so nested/local run contexts
+ * cannot retain an entry into the retired generation. */
+void ocerz_vm_purge_jit_ras(OcerzVM *vm)
+{
+    if (!vm)
+        return;
+    __atomic_store_n(&vm->cpu.ras_top, 0, __ATOMIC_RELEASE);
+    if (g_cur_cpu && g_cur_cpu->vm == vm)
+        __atomic_store_n(&g_cur_cpu->ras_top, 0, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&g_cpus_lock);
+    for (int i = 0; i < g_cpus_n; i++)
+        if (g_cpus[i] && g_cpus[i]->vm == vm)
+            __atomic_store_n(&g_cpus[i]->ras_top, 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_cpus_lock);
+}
+
 /* Pending ASYNCHRONOUS guest signals for THIS thread (a bitmask of signo, 1..31).
  * The macOS kernel delivers __pthread_kill(thread_port, signo) to a named thread
  * asynchronously, interrupting its current syscall. ocerz reproduces that: the host
@@ -490,12 +508,23 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     if (depth == 0 && g_cur_cpu && g_sig_recover &&
         ocerz_host_in_guest_space(si->si_addr)) {
         depth = 1;
-        /* DEFERRED FLAGS: a fault taken in inlined JIT code may leave the six
-         * arithmetic flags deferred in cpu->cc_op/cc_src/cc_dst rather than live
-         * in cpu->rflags. The guest signal frame is marshaled from cpu->rflags
-         * (ocerz_signal_deliver) and a guest handler may PUSHF, so reconstruct
-         * rflags now, before anything below reads it. Idempotent -- a no-op when
-         * nothing is deferred -- so it is safe to call unconditionally here. */
+        const ucontext_t *uc = (const ucontext_t *)ctx;
+        const void *hpc = uc ? (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc : NULL;
+        struct OcerzVM *fvm = g_cur_cpu->vm;
+        int in_jit = hpc && fvm && ocerz_jit_pc_in_arena(fvm, hpc);
+        if (in_jit) {
+            /* REGISTER + FLAG FAULT SEAM. Cold flag recipes read current guest
+             * GPRs, so recover the pinned subset from the host mcontext first,
+             * then let the recipe install the exact deferred tuple visible at
+             * the faulting instruction. Both helpers are no-ops when their block
+             * carries no corresponding metadata. */
+            ocerz_jit_fault_recover_regs(fvm, hpc,
+                uc->uc_mcontext->__ss.__x, g_cur_cpu);
+            ocerz_jit_fault_recover_flags(fvm, hpc, g_cur_cpu);
+        }
+        /* The guest signal frame is marshaled from cpu->rflags and a guest
+         * handler may PUSHF. Materialize either the ordinary hot-path deferred
+         * record or the cold recipe installed immediately above. */
         ocerz_flags_materialize(g_cur_cpu);
         /* The rip a real x86 kernel reports is the FAULTING instruction, but
          * cpu->rip has already advanced to the next one (see OcerzCPU::cur_rip).
@@ -506,18 +535,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         uint64_t fault_rip = g_cur_cpu->cur_rip;
         int rip_exact = 1;
         {
-            const void *hpc = ctx ? (const void *)(uintptr_t)
-                ((const ucontext_t *)ctx)->uc_mcontext->__ss.__pc : NULL;
-            struct OcerzVM *fvm = g_cur_cpu->vm;
-            if (hpc && fvm && ocerz_jit_pc_in_arena(fvm, hpc)) {
-                /* REGISTER PINNING FAULT SEAM: a hot subset of the guest GPRs is
-                 * live in the host callee-saved regs x21..x28 at this in-arena
-                 * fault, not in cpu->gpr[] (which still holds their block-entry
-                 * values). Write them back from the host mcontext BEFORE the
-                 * frame marshal (ocerz_signal_deliver) or any gpr dump reads
-                 * them. No-op for a block that pins nothing. */
-                ocerz_jit_fault_recover_regs(fvm, hpc,
-                    ((const ucontext_t *)ctx)->uc_mcontext->__ss.__x, g_cur_cpu);
+            if (in_jit) {
                 /* Faulted in emitted code: only the side table knows the rip,
                  * because an inlined instruction never wrote cur_rip (which
                  * therefore still names some earlier slow instruction). If the
@@ -1294,6 +1312,8 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
         }
     }
     g_sig_recover = prev_recover;
+    if (prev_cpu && vm->jit_ordered_required)
+        __atomic_store_n(&prev_cpu->ras_top, 0, __ATOMIC_RELEASE);
     g_cur_cpu = prev_cpu;
     return local.gpr[OCERZ_RAX];
 }
@@ -1302,6 +1322,10 @@ void ocerz_vm_request_exit(OcerzVM *vm, int code)
 {
     vm->exit_code = code;
     __atomic_store_n(&vm->exited, 1, __ATOMIC_SEQ_CST);
+    /* Direct JIT self-loops use a single native backedge in steady state. Make
+     * those branches leave through their existing cold dispatcher exits before
+     * broadcasting the per-CPU fallback word. */
+    ocerz_jit_request_stop(vm);
     /* Broadcast the stop to every live guest thread's back-edge poll word. A
      * thread spinning in a (future) JIT-chained self-loop observes only this
      * per-CPU word, never the shared vm->exited, so set it on all of them under
