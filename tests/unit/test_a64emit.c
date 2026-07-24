@@ -74,11 +74,13 @@ static void b_movimm2(A64Buf *b) { a64_mov_imm64(b, 0, 0xffffffffffff0000ull); a
 static void b_movimm3(A64Buf *b) { a64_mov_imm64(b, 0, 0x000000000000ffffull); a64_ret(b); }
 static void b_movimm4(A64Buf *b) { a64_mov_imm64(b, 0, 0xffffffffffffffffull); a64_ret(b); }
 static void b_movimm_logical(A64Buf *b) { a64_mov_imm64(b, 0, 0x1fffe); a64_ret(b); }
-static void b_ldapr64(A64Buf *b) { a64_ldapr(b, 8, 0, 0); a64_ret(b); }
-static void b_ldapr32(A64Buf *b) { a64_ldapr(b, 4, 0, 0); a64_ret(b); }
-static void b_ldapr16(A64Buf *b) { a64_ldapr(b, 2, 0, 0); a64_ret(b); }
-static void b_ldapr8(A64Buf *b)  { a64_ldapr(b, 1, 0, 0); a64_ret(b); }
-static void b_ldar64(A64Buf *b)  { a64_ldar(b, 8, 0, 0); a64_ret(b); }
+/* Rt=x0, Rn=x1 -- DISTINCT on purpose. With Rt==Rn an encoder that swapped the two
+ * fields would still pass, because the one register is both address and destination. */
+static void b_ldapr64(A64Buf *b) { a64_ldapr(b, 8, 0, 1); a64_ret(b); }
+static void b_ldapr32(A64Buf *b) { a64_ldapr(b, 4, 0, 1); a64_ret(b); }
+static void b_ldapr16(A64Buf *b) { a64_ldapr(b, 2, 0, 1); a64_ret(b); }
+static void b_ldapr8(A64Buf *b)  { a64_ldapr(b, 1, 0, 1); a64_ret(b); }
+static void b_ldar64(A64Buf *b)  { a64_ldar(b, 8, 0, 1); a64_ret(b); }
 static void b_add(A64Buf *b) { a64_add_reg(b, 1, 0, 0, 1, 0); a64_ret(b); }
 static void b_add32(A64Buf *b) { a64_add_reg(b, 0, 0, 0, 1, 0); a64_ret(b); }
 static void b_sub(A64Buf *b) { a64_sub_reg(b, 1, 0, 0, 1, 0); a64_ret(b); }
@@ -443,16 +445,16 @@ static void test_ldapr(void)
     static uint64_t cell __attribute__((aligned(8)));
     cell = 0x1122334455667788ull;
     uint64_t a = (uint64_t)(uintptr_t)&cell;
-    CHECK(run2(b_ldapr64, a, 0) == 0x1122334455667788ull, "ldapr 64 got %#llx",
-          (unsigned long long)run2(b_ldapr64, a, 0));
-    CHECK(run2(b_ldapr32, a, 0) == 0x55667788ull, "ldapr 32 got %#llx",
-          (unsigned long long)run2(b_ldapr32, a, 0));
-    CHECK(run2(b_ldapr16, a, 0) == 0x7788ull, "ldapr 16 got %#llx",
-          (unsigned long long)run2(b_ldapr16, a, 0));
-    CHECK(run2(b_ldapr8, a, 0) == 0x88ull, "ldapr 8 got %#llx",
-          (unsigned long long)run2(b_ldapr8, a, 0));
+    CHECK(run2(b_ldapr64, 0, a) == 0x1122334455667788ull, "ldapr 64 got %#llx",
+          (unsigned long long)run2(b_ldapr64, 0, a));
+    CHECK(run2(b_ldapr32, 0, a) == 0x55667788ull, "ldapr 32 got %#llx",
+          (unsigned long long)run2(b_ldapr32, 0, a));
+    CHECK(run2(b_ldapr16, 0, a) == 0x7788ull, "ldapr 16 got %#llx",
+          (unsigned long long)run2(b_ldapr16, 0, a));
+    CHECK(run2(b_ldapr8, 0, a) == 0x88ull, "ldapr 8 got %#llx",
+          (unsigned long long)run2(b_ldapr8, 0, a));
     /* same architectural value as the stricter LDAR it replaces */
-    CHECK(run2(b_ldapr64, a, 0) == run2(b_ldar64, a, 0), "ldapr != ldar on an aligned cell");
+    CHECK(run2(b_ldapr64, 0, a) == run2(b_ldar64, 0, a), "ldapr != ldar on an aligned cell");
 }
 
 int main(void)
