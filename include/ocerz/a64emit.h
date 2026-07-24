@@ -84,6 +84,7 @@ void a64_ldr_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
 void a64_str_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
 void a64_ldar(A64Buf *b, int size, int rt, int rn);
 void a64_stlr(A64Buf *b, int size, int rt, int rn);
+void a64_ldapr(A64Buf *b, int size, int rt, int rn);   /* RCpc acquire: the x86-TSO load */
 void a64_dmb_ish(A64Buf *b);
 void a64_ldrsb(A64Buf *b, int sf, int rt, int rn, uint32_t off);
 void a64_ldrsh(A64Buf *b, int sf, int rt, int rn, uint32_t off);

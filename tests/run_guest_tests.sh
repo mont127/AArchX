@@ -132,7 +132,7 @@ run_with_timeout() {
 # the NATIVE golden. Green at HEAD and under correct XLIVE (the fault barrier
 # keeps the producer eager); the STEP-2 mutation that kills the barrier makes it
 # FAIL, proving the barrier is load-bearing. Bounded/self-terminating.
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order shared_order)
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order shared_order unaligned_order)
 
 expected_exit() {
     case "$1" in

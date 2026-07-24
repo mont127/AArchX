@@ -266,6 +266,27 @@ void a64_stlr(A64Buf *b, int size, int rt, int rn)
     a64_emit32(b, 0x089ffc00u | (sz << 30) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
+/* LDAPR: Load-Acquire RCpc (FEAT_LRCPC, present on every Apple Silicon part).
+ *
+ * This, not LDAR, is the right primitive for an x86 GUEST load. x86-TSO orders a
+ * load against every LATER access (load->load and load->store) and permits exactly
+ * one relaxation: a load may be reordered ahead of an EARLIER store. LDAPR provides
+ * precisely that -- RCpc acquire orders the load with all subsequent accesses while
+ * still allowing store->load reordering. LDAR is strictly STRONGER than x86: its
+ * RCsc semantics additionally order it against a preceding STLR, forbidding the one
+ * reordering x86 actually allows, and paying for a guarantee the guest cannot
+ * observe. Same [Xn] base-only form and same natural-alignment requirement as LDAR,
+ * so the caller's alignment split is unchanged.
+ *
+ * Encoding taken from the assembler, not from prose: `ldapr x0,[x1]` = 0xf8bfc020
+ * and `ldapr w2,[x3]` = 0xb8bfc062, giving base 0x38bfc000 with the usual size in
+ * bits 31-30. Executed, not merely read, by the a64emit test. */
+void a64_ldapr(A64Buf *b, int size, int rt, int rn)
+{
+    uint32_t sz = ldst_size_bits(size);
+    a64_emit32(b, 0x38bfc000u | (sz << 30) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
 /* DMB ISH: inner-shareable full data barrier. Provided as the offset-handling
  * fallback for any guest access the ldar/stlr [Xn] form cannot express; the
  * current JIT materializes every guest address into a base register with no
