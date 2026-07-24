@@ -265,6 +265,13 @@ typedef struct JitBlock {
      * the hot path, which is the entire point. NULL for a demoted block (no
      * code: every insn is a slow call and sets cur_rip itself). */
     uint32_t *insn_off;
+    /* Out-of-line unaligned arms. Relocating an arm to the end of the block moves its
+     * host pc past every insn_off entry, so a fault inside one would otherwise resolve
+     * to the block's LAST guest instruction. Each entry maps the arm's host-word range
+     * back to the guest instruction that emitted it, keeping the reported fault rip
+     * exact. NULL/0 when the block has no relocated arms (the common case). */
+    struct JitOslowMap { uint32_t lo, hi; int32_t idx; } *oslow;
+    int n_oslow;
     JitFaultFlagRecipe *fault_flags;
     uint32_t code_words;        /* length of the emitted code, in words */
     /* Direct self-loop backedges run as a single conditional branch. A process
@@ -372,6 +379,23 @@ static int g_no_lazyflags;
  * ocerz_jit_step's hash dispatch). Read once at jit init; translate() runs under
  * jit_lock and this is a whole-run decision, mirroring g_no_lazyflags. */
 static int g_no_ras;
+/* OCERZ_NO_LDAPR: fall back to LDAR for ordered guest loads, so the RCpc change is A/B-able. */
+static int g_no_ldapr;
+/* OCERZ_NO_OOLSLOW: keep the old inline layout, so the relocation is A/B-able. */
+static int g_no_oolslow;
+/* Ordered accesses whose rare unaligned arm is emitted after the block epilogue. The
+ * aligned arm then FALLS THROUGH instead of reaching its code via a taken branch --
+ * measured as 0.816s of the 0.828s alignment-check overhead on fib(42), i.e. the branch
+ * was essentially the whole cost while the ands itself was 0.014s. */
+typedef struct {
+    uint32_t *bne;      /* the b.ne to point at the arm */
+    uint32_t *back;     /* resume label: the instruction after the aligned access */
+    int size, rv, ra, store, idx;
+} OrderedSlowPend;
+#define OSLOW_MAX 64
+static OrderedSlowPend g_oslow[OSLOW_MAX];
+static int g_n_oslow;
+static int g_cur_insn_idx;
 /* OCERZ_NO_REGFLAGS: A/B kill switch for the whole phase-2 pair. When set it
  * disables BOTH register pinning AND deferred flags (the emitters fall back to
  * eager flag computation and the operand path never consults the pin map), so
@@ -2292,9 +2316,26 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
         a64_str(b, size, rv, ra, 0);
         return;
     }
+    /* A single byte is naturally aligned at every address, so STLRB can never take the
+     * alignment fault the split exists to avoid. Emitting the check for it cost the mask,
+     * the compare and both branches to prove a tautology -- and (size-1)==0 is not even a
+     * valid logical immediate, so it fell to the two-instruction mov+ands form. */
+    if (size == 1) {
+        a64_stlr(b, 1, rv, ra);
+        return;
+    }
     if (!a64_try_ands_imm(b, 1, A64_ZR, ra, (uint64_t)(size - 1))) {
         a64_mov_imm64(b, scratch, (uint64_t)(size - 1));
         a64_ands_reg(b, 1, A64_ZR, ra, scratch, 0);
+    }
+    if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
+        uint32_t *bne = a64_label(b);
+        a64_bcond(b, A64_NE, 0);      /* misaligned (rare) -> arm after the epilogue */
+        a64_stlr(b, size, rv, ra);    /* aligned: FALLS THROUGH, no taken branch */
+        g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, rv, ra, 1,
+                                                g_cur_insn_idx };
+        g_n_oslow++;
+        return;
     }
     uint32_t *to_aligned = a64_label(b);
     a64_bcond(b, A64_EQ, 0);                          /* aligned -> STLR */
@@ -2313,9 +2354,24 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
         a64_ldr(b, size, rd, ra, 0);
         return;
     }
+    if (size == 1) {                     /* always naturally aligned -- see the store side */
+        if (g_no_ldapr) a64_ldar(b, 1, rd, ra);
+        else            a64_ldapr(b, 1, rd, ra);
+        return;
+    }
     if (!a64_try_ands_imm(b, 1, A64_ZR, ra, (uint64_t)(size - 1))) {
         a64_mov_imm64(b, scratch, (uint64_t)(size - 1));
         a64_ands_reg(b, 1, A64_ZR, ra, scratch, 0);
+    }
+    if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
+        uint32_t *bne = a64_label(b);
+        a64_bcond(b, A64_NE, 0);      /* misaligned (rare) -> arm after the epilogue */
+        if (g_no_ldapr) a64_ldar(b, size, rd, ra);
+        else            a64_ldapr(b, size, rd, ra);
+        g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, rd, ra, 0,
+                                                g_cur_insn_idx };
+        g_n_oslow++;
+        return;
     }
     uint32_t *to_aligned = a64_label(b);
     a64_bcond(b, A64_EQ, 0);                          /* aligned -> LDAR */
@@ -2324,7 +2380,12 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
     uint32_t *to_done = a64_label(b);
     a64_b(b, 0);
     a64_patch_bcond(to_aligned, a64_label(b));
-    a64_ldar(b, size, rd, ra);
+    /* LDAPR, not LDAR: RCpc acquire is exactly x86-TSO's load -- it orders this load
+     * against every LATER access while still permitting the one reordering x86 allows,
+     * a load moving ahead of an earlier store. LDAR's RCsc semantics forbid that too,
+     * which is a guarantee the guest can never observe and a cost on every load. */
+    if (g_no_ldapr) a64_ldar(b, size, rd, ra);
+    else            a64_ldapr(b, size, rd, ra);
     a64_patch_b(to_done, a64_label(b));
 }
 
@@ -5094,6 +5155,39 @@ static int build_fault_flag_recipes(const X86Insn *insns, int n,
     return found;
 }
 
+/* Emit the relocated unaligned arms. Called AFTER the block epilogue's `ret`, so nothing
+ * can fall into them; each is reached only by its b.ne and returns with an unconditional
+ * branch to the instruction after the aligned access. Registers are untouched between the
+ * branch and the arm, so the operands are still live. */
+static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
+{
+    if (g_n_oslow <= 0)
+        return;
+    blk->oslow = (struct JitOslowMap *)malloc((size_t)g_n_oslow * sizeof *blk->oslow);
+    blk->n_oslow = 0;
+    for (int i = 0; i < g_n_oslow; i++) {
+        const OrderedSlowPend *o = &g_oslow[i];
+        uint32_t *lo = a64_label(b);
+        a64_patch_bcond(o->bne, lo);
+        if (o->store) {
+            a64_dmb_ish(b);                      /* release before the store */
+            a64_str(b, o->size, o->rv, o->ra, 0);
+        } else {
+            a64_ldr(b, o->size, o->rv, o->ra, 0);
+            a64_dmb_ish(b);                      /* acquire after the load */
+        }
+        uint32_t *here = a64_label(b);
+        a64_b(b, (int32_t)(o->back - here));
+        if (blk->oslow) {                        /* on OOM only the rip precision degrades */
+            blk->oslow[blk->n_oslow].lo = (uint32_t)(lo - entry);
+            blk->oslow[blk->n_oslow].hi = (uint32_t)(a64_label(b) - entry);
+            blk->oslow[blk->n_oslow].idx = o->idx;
+            blk->n_oslow++;
+        }
+    }
+    g_n_oslow = 0;
+}
+
 static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 {
     /* OCERZ_JITMEASURE (Stage-0 verify-first for the persistent JIT cache): time each successful
@@ -5178,6 +5272,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_chain_target = 0;
     g_chain_epi = NULL;
     g_n_jcc_edges = 0;
+    g_n_oslow = 0;         /* stale pending arms must never leak into another block */
     g_n_call_edges = 0;
     g_xlat_jit = jit;
     g_self_rip = rip;
@@ -5552,6 +5647,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
+        g_cur_insn_idx = i;
         if (blk->insn_off)
             blk->insn_off[i] = (uint32_t)(b.p - entry);
         if (i == n - 2) {
@@ -5701,6 +5797,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     a64_ldp_post(&b, 19, 20, 31, 16);
     a64_ldp_post(&b, 29, 30, 31, 16);
     a64_ret(&b);
+    emit_ordered_slow_arms(&b, blk, entry);
 
     /* CHAINING (Increment 1): for a chainable CALL(imm) terminator, emit the
      * XBLOCK chain tail AFTER the shared epilogue (so it lives inside this
@@ -6033,6 +6130,9 @@ static int fault_insn_index(const JitBlock *b, const uint32_t *pc)
         return -1;
     const uint32_t *base = (const uint32_t *)b->code;
     uint32_t off = (uint32_t)(pc - base);
+    for (int k = 0; k < b->n_oslow; k++)   /* relocated arm -> its OWNING guest insn */
+        if (off >= b->oslow[k].lo && off < b->oslow[k].hi)
+            return b->oslow[k].idx;
     int lo = 0, hi = b->n_insns;
     while (lo < hi) {
         int mid = lo + (hi - lo) / 2;
@@ -6178,6 +6278,7 @@ static void block_list_destroy(JitBlock *b)
     while (b) {
         JitBlock *next = b->hnext;
         free(b->insn_off);
+        free(b->oslow);
         free(b->fault_flags);
         free(b->insns);
         free(b);
@@ -6470,6 +6571,8 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             g_flaglive_log = getenv("OCERZ_FLAGLIVE") ? 1 : 0;
             g_no_lazyflags = getenv("OCERZ_NO_LAZYFLAGS") ? 1 : 0;
             g_no_ras = getenv("OCERZ_NO_RAS") ? 1 : 0;
+            g_no_ldapr = getenv("OCERZ_NO_LDAPR") ? 1 : 0;
+            g_no_oolslow = getenv("OCERZ_NO_OOLSLOW") ? 1 : 0;
             g_no_regflags = getenv("OCERZ_NO_REGFLAGS") ? 1 : 0;
             g_no_chain = getenv("OCERZ_NO_CHAIN") ? 1 : 0;
             g_no_jcclink = getenv("OCERZ_NO_JCCLINK") ? 1 : 0;
