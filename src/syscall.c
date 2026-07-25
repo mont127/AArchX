@@ -3961,8 +3961,138 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     return OCERZ_STEP_OK;
 }
 
+/* SYNTHETIC LDT (machdep 5 = i386_set_ldt, 6 = i386_get_ldt).
+ *
+ * Wine's WoW64 gets its 32-bit code selector and its per-thread 32-bit TEB from the LDT on
+ * macOS: dlls/ntdll/unix/signal_x86_64.c allocates a cs32 entry once and an fs32 entry per
+ * thread, both through i386_set_ldt. ocerz used to FATAL on this syscall, so Wine could
+ * never even describe 32-bit code, let alone enter it.
+ *
+ * The table is SYNTHETIC and is never forwarded to the host -- deliberately. Rosetta 2
+ * itself refuses the call ("rosetta error: i386_set_ldt(kLdtAutoAlloc) not supported"),
+ * which is precisely why 32-bit Windows software does not work under Wine on Apple silicon
+ * today. ocerz does not need the hardware LDT: it executes every guest instruction itself,
+ * so a selector only has to mean something to ocerz. Remembering base/limit/D-bit per index
+ * is enough to later resolve a segment load and a far branch.
+ *
+ * Descriptor layout is the standard Intel one packed into 8 bytes:
+ *   limit 0-15 | base 16-39 | access 40-47 | limit 48-51 | flags 52-55 | base 56-63  */
+#define OCERZ_LDT_MAX 512
+struct ocerz_ldt_entry {
+    uint64_t base;
+    uint32_t limit;
+    uint8_t  access;    /* type/DPL/present byte */
+    uint8_t  big;       /* D/B: 1 = 32-bit default operand+address size */
+    uint8_t  gran;      /* G: limit is in 4KB units */
+    uint8_t  present;
+};
+static struct ocerz_ldt_entry g_ldt[OCERZ_LDT_MAX];
+static int g_ldt_next = 1;                 /* index 0 is the null selector */
+static pthread_mutex_t g_ldt_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Base of an LDT selector, or 0. sel is a full selector value (index<<3 | TI | RPL). */
+uint64_t ocerz_ldt_base(uint32_t sel)
+{
+    uint32_t idx = sel >> 3;
+    if (!(sel & 4) || idx == 0 || idx >= OCERZ_LDT_MAX)   /* bit 2 set = LDT, clear = GDT */
+        return 0;
+    return g_ldt[idx].present ? g_ldt[idx].base : 0;
+}
+
+/* Is this selector a 32-bit (D=1) code/data selector? Used by the mode switch. */
+int ocerz_ldt_is_big(uint32_t sel)
+{
+    uint32_t idx = sel >> 3;
+    if (!(sel & 4) || idx == 0 || idx >= OCERZ_LDT_MAX)
+        return 0;
+    return g_ldt[idx].present && g_ldt[idx].big;
+}
+
+static void ocerz_ldt_unpack(uint64_t d, struct ocerz_ldt_entry *e)
+{
+    e->limit   = (uint32_t)((d & 0xffffu) | (((d >> 48) & 0xfu) << 16));
+    e->base    = (uint64_t)(((d >> 16) & 0xffffffu) | (((d >> 56) & 0xffu) << 24));
+    e->access  = (uint8_t)((d >> 40) & 0xff);
+    e->big     = (uint8_t)((d >> 54) & 1);        /* flags bit 2 = D/B */
+    e->gran    = (uint8_t)((d >> 55) & 1);
+    e->present = (uint8_t)((e->access >> 7) & 1);
+    /* limit is kept RAW; G is remembered separately so i386_get_ldt can hand back the
+     * exact descriptor the guest wrote. Scale only where an effective limit is needed. */
+}
+
+static uint64_t ocerz_ldt_pack(const struct ocerz_ldt_entry *e)
+{
+    uint64_t lim = e->limit, base = e->base;
+    return (lim & 0xffffu)
+         | ((base & 0xffffffu) << 16)
+         | ((uint64_t)e->access << 40)
+         | (((lim >> 16) & 0xfu) << 48)
+         | ((uint64_t)(e->big & 1) << 54)
+         | ((uint64_t)(e->gran & 1) << 55)
+         | (((base >> 24) & 0xffu) << 56);
+}
+
+static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
+{
+    /* The prototype is i386_set_ldt(int, const union ldt_entry *, int) -- 32-bit ints, so
+     * the register halves must be read as int32_t. Reading rdi as int64_t makes the
+     * LDT_AUTO_ALLOC sentinel (-1, passed zero-extended as 0xffffffff) look POSITIVE. */
+    int32_t start = (int32_t)cpu->gpr[OCERZ_RDI];
+    uint64_t descs = cpu->gpr[OCERZ_RSI];
+    int32_t count = (int32_t)cpu->gpr[OCERZ_RDX];
+    if (count < 0 || count > OCERZ_LDT_MAX || descs == 0) {
+        ret_err(cpu, EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    pthread_mutex_lock(&g_ldt_lock);
+    if (num == 5) {                                  /* i386_set_ldt */
+        int idx;
+        if (start < 0) {                             /* LDT_AUTO_ALLOC */
+            if (g_ldt_next + (int)count > OCERZ_LDT_MAX) {
+                pthread_mutex_unlock(&g_ldt_lock);
+                ret_err(cpu, ENOMEM);
+                return OCERZ_STEP_OK;
+            }
+            idx = g_ldt_next;
+            g_ldt_next += (int)count;
+        } else {
+            idx = (int)start;
+            if (idx <= 0 || idx + (int)count > OCERZ_LDT_MAX) {
+                pthread_mutex_unlock(&g_ldt_lock);
+                ret_err(cpu, EINVAL);
+                return OCERZ_STEP_OK;
+            }
+            if (idx + (int)count > g_ldt_next)
+                g_ldt_next = idx + (int)count;
+        }
+        for (int i = 0; i < count; i++)
+            ocerz_ldt_unpack(ocerz_ld(descs + (uint64_t)i * 8, 8), &g_ldt[idx + i]);
+        pthread_mutex_unlock(&g_ldt_lock);
+        if (getenv("OCERZ_LDTLOG"))
+            fprintf(stderr, "ocerz: LDT set idx=%d count=%lld base=%#llx big=%d access=%#x\n",
+                    idx, (long long)count, (unsigned long long)g_ldt[idx].base,
+                    g_ldt[idx].big, g_ldt[idx].access);
+        ret_ok(cpu, (uint64_t)(uint32_t)idx);        /* XNU returns the first index */
+        return OCERZ_STEP_OK;
+    }
+    /* i386_get_ldt */
+    int idx = (int)start;
+    if (idx < 0 || idx + (int)count > OCERZ_LDT_MAX) {
+        pthread_mutex_unlock(&g_ldt_lock);
+        ret_err(cpu, EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    for (int i = 0; i < count; i++)
+        ocerz_st(descs + (uint64_t)i * 8, 8, ocerz_ldt_pack(&g_ldt[idx + i]));
+    pthread_mutex_unlock(&g_ldt_lock);
+    ret_ok(cpu, (uint64_t)(uint32_t)count);
+    return OCERZ_STEP_OK;
+}
+
 static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
 {
+    if (num == 5 || num == 6)
+        return dispatch_machdep_ldt(cpu, num);
     if (num == 3) {
         uint64_t newgs = cpu->gpr[OCERZ_RDI];
         /* _thread_set_tsd_base with an obviously-invalid base (< 0x100000) while
