@@ -184,6 +184,16 @@ enum OcerzOp {
     OCERZ_OP_CALL,
     OCERZ_OP_RET,
     OCERZ_OP_IRET,
+    /* Far control transfers -- the entire WoW64 64<->32 mode switch (wow64cpu.dll uses
+     * FF /5 far JMP m16:32 and IRETQ to enter 32-bit code, and a far JMP back), plus
+     * MOV Sreg which installs the 32-bit TEB from an LDT selector. These MUST live with
+     * the other control-flow ops and BEFORE OCERZ_OP_SSE_FIRST: src/interp.c falls back to
+     * the SSE interpreter for any unhandled op numerically >= SSE_FIRST, so an op parked
+     * in that range is routed to the wrong tier instead of failing cleanly. */
+    OCERZ_OP_JMPF,
+    OCERZ_OP_CALLF,
+    OCERZ_OP_RETF,
+    OCERZ_OP_MOVSEG,
     OCERZ_OP_LEAVE,
     OCERZ_OP_INT3,
     OCERZ_OP_INT,
@@ -529,15 +539,6 @@ enum OcerzOp {
     OCERZ_OP_AESIMC,
     OCERZ_OP_AESKEYGENASSIST,
     OCERZ_OP_PCLMULQDQ,
-    /* Far control transfers. Not reachable from ordinary 64-bit code, but they are the
-     * entire WoW64 64<->32 mode switch: wow64cpu.dll uses FF /5 (far JMP m16:32) and IRETQ
-     * to enter 32-bit code, and a far JMP back. Previously OCERZ_EUNDEF. */
-    OCERZ_OP_JMPF,
-    OCERZ_OP_CALLF,
-    OCERZ_OP_RETF,
-    /* MOV Sreg, r/m16. Inert in flat 64-bit mode, but it is how WoW64 installs the 32-bit
-     * TEB (mov fs, word [r13+0x90]) from an LDT selector. */
-    OCERZ_OP_MOVSEG,
 
     OCERZ_OP_COUNT,
 };

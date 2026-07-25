@@ -873,8 +873,8 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         if (ocerz_ldt_is_big(sel))
             return ocerz_mode32_unsupported(vm, cpu, sel, off, "far jump/call");
         if (insn->op == OCERZ_OP_CALLF) {
-            ocerz_push(cpu, cpu->cs_sel, 8);            /* far call pushes CS:offset */
-            ocerz_push(cpu, insn->rip + insn->len, 8);
+            ocerz_push(cpu, 8, cpu->cs_sel);            /* far call pushes CS, then the */
+            ocerz_push(cpu, 8, insn->rip + insn->len);  /* return offset (size arg first) */
         }
         cpu->cs_sel = (uint16_t)sel;
         cpu->rip = off;
@@ -1191,6 +1191,10 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
     case OCERZ_OP_CALL:
     case OCERZ_OP_RET:
     case OCERZ_OP_IRET:
+    case OCERZ_OP_JMPF:
+    case OCERZ_OP_CALLF:
+    case OCERZ_OP_RETF:
+    case OCERZ_OP_MOVSEG:
         return op_branch(vm, cpu, insnp);
 
     case OCERZ_OP_XADD:
