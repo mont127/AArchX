@@ -54,4 +54,10 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_code,
                          uint32_t err);
 
+
+/* Synthetic LDT (src/syscall.c), populated by the guest through machdep i386_set_ldt.
+ * Wine's WoW64 describes its 32-bit code and per-thread 32-bit TEB with these. */
+uint64_t ocerz_ldt_base(uint32_t sel);
+int ocerz_ldt_is_big(uint32_t sel);
+
 #endif

@@ -69,6 +69,9 @@
 #include "ocerz/dyldapi.h"
 #include <stdlib.h>
 
+static int ocerz_mode32_unsupported(OcerzVM *vm, OcerzCPU *cpu, uint32_t sel,
+                                    uint64_t target, const char *how);
+
 static void dump_raw_bytes(FILE *out, uint64_t rip, unsigned len)
 {
     const uint8_t *p = (const uint8_t *)ocerz_g2h(rip);
@@ -837,12 +840,56 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         cpu->rip = ret;
         return OCERZ_STEP_OK;
     }
+    case OCERZ_OP_JMPF:
+    case OCERZ_OP_CALLF: {
+        /* Far transfer, m16:32 or m16:64: offset at [ea], selector at [ea + opsize].
+         * This is how wow64cpu.dll crosses between 64- and 32-bit code. A transfer to a
+         * 64-bit selector is an ordinary jump/call and is handled; a transfer to a 32-bit
+         * selector would need a 32-bit instruction decoder, which does not exist yet, so
+         * it stops loudly instead of running 64-bit-decoded bytes at a 32-bit address. */
+        int sz = insn->opsize ? insn->opsize : 4;
+        uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
+        uint64_t off = ocerz_ld(ea, sz);
+        uint32_t sel = (uint32_t)ocerz_ld(ea + (uint64_t)sz, 2);
+        if (ocerz_ldt_is_big(sel))
+            return ocerz_mode32_unsupported(vm, cpu, sel, off, "far jump/call");
+        if (insn->op == OCERZ_OP_CALLF) {
+            ocerz_push(cpu, cpu->cs_sel, 8);            /* far call pushes CS:offset */
+            ocerz_push(cpu, insn->rip + insn->len, 8);
+        }
+        cpu->cs_sel = (uint16_t)sel;
+        cpu->rip = off;
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_RETF: {
+        /* Far return: pop offset then selector, then optionally release imm16 bytes. */
+        int sz = insn->opsize ? insn->opsize : 8;
+        uint64_t off = ocerz_pop(cpu, 8);
+        uint32_t sel = (uint32_t)ocerz_pop(cpu, 8);
+        (void)sz;
+        if (insn->nops == 1)
+            cpu->gpr[OCERZ_RSP] += ocerz_trunc(insn->ops[0].imm, 2);
+        if (ocerz_ldt_is_big(sel))
+            return ocerz_mode32_unsupported(vm, cpu, sel, off, "far return");
+        cpu->cs_sel = (uint16_t)sel;
+        cpu->rip = off;
+        return OCERZ_STEP_OK;
+    }
     case OCERZ_OP_IRET: {
         int sz = insn->opsize ? insn->opsize : 8;
         uint64_t sp = cpu->gpr[OCERZ_RSP];
         uint64_t rip = ocerz_ld(sp, sz);
+        /* The CS slot sits between RIP and RFLAGS and used to be skipped entirely. Wine's
+         * NtContinue / syscall-dispatcher epilogue relies on IRETQ and always carries a
+         * 64-bit CS, so reading it is a no-op there; wow64cpu.dll's iretq is the one that
+         * carries a 32-bit CS, and that is the transition worth refusing loudly. */
+        uint32_t cs = (uint32_t)ocerz_ld(sp + (uint64_t)sz, sz);
         uint64_t flags = ocerz_ld(sp + (uint64_t)sz * 2, sz);
         uint64_t newsp = ocerz_ld(sp + (uint64_t)sz * 3, sz);
+        if (ocerz_ldt_is_big(cs))
+            return ocerz_mode32_unsupported(vm, cpu, cs, rip, "iret");
+        if (cs)
+            cpu->cs_sel = (uint16_t)cs;
         cpu->rip = rip;
         cpu->rflags = flags | 0x2;
         cpu->gpr[OCERZ_RSP] = newsp;
@@ -851,6 +898,27 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     default:
         return ocerz_unimpl(vm, cpu, insn, "branch");
     }
+}
+
+/* A far transfer named a 32-bit code selector. ocerz can describe 32-bit segments (the
+ * synthetic LDT) and now recognises every encoding of the WoW64 switch, but the decoder is
+ * still long-mode-only: continuing would decode 32-bit bytes with 64-bit defaults, which
+ * silently produces wrong instructions rather than an error. Stop, loudly, and say exactly
+ * what was attempted -- this is the boundary where 32-bit support will be added next. */
+static int ocerz_mode32_unsupported(OcerzVM *vm, OcerzCPU *cpu, uint32_t sel,
+                                    uint64_t target, const char *how)
+{
+    (void)vm;
+    cpu->mode32 = 1;
+    cpu->cs_sel = (uint16_t)sel;
+    fprintf(stderr,
+            "ocerz: fatal: 32-bit mode entry via %s -- cs=%#x (LDT index %u, base=%#llx) "
+            "target=%#llx rip=%#llx\n"
+            "ocerz: the WoW64 mode switch is recognised but 32-bit instruction decoding is "
+            "not implemented yet\n",
+            how, sel, sel >> 3, (unsigned long long)ocerz_ldt_base(sel),
+            (unsigned long long)target, (unsigned long long)cpu->rip);
+    return OCERZ_STEP_FATAL;
 }
 
 static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)

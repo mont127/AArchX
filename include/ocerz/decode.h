@@ -529,6 +529,12 @@ enum OcerzOp {
     OCERZ_OP_AESIMC,
     OCERZ_OP_AESKEYGENASSIST,
     OCERZ_OP_PCLMULQDQ,
+    /* Far control transfers. Not reachable from ordinary 64-bit code, but they are the
+     * entire WoW64 64<->32 mode switch: wow64cpu.dll uses FF /5 (far JMP m16:32) and IRETQ
+     * to enter 32-bit code, and a far JMP back. Previously OCERZ_EUNDEF. */
+    OCERZ_OP_JMPF,
+    OCERZ_OP_CALLF,
+    OCERZ_OP_RETF,
 
     OCERZ_OP_COUNT,
 };
