@@ -980,10 +980,20 @@ static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         ret_err(cpu, EINVAL);
         return OCERZ_STEP_OK;
     }
+    /* Same unfaithfulness sys_execve had: the process actually spawned is ocerz ITSELF
+     * (`self`), which always exists, so posix_spawn returned 0 for a target that cannot be
+     * loaded and the guest was told the spawn succeeded -- the failure surfaced only as the
+     * child fataling. The kernel reports it to the CALLER instead. Check first and return
+     * the errno posix_spawn would (it returns the error as its VALUE, not via errno). */
+    const char *gpath = (const char *)ocerz_g2h(a[1]);
+    if (access(gpath, X_OK) != 0) {
+        ret_err(cpu, (uint64_t)errno);
+        return OCERZ_STEP_OK;
+    }
     char *hargv[260];
     int n = 0;
     hargv[n++] = (char *)(uintptr_t)self;
-    hargv[n++] = (char *)ocerz_g2h(a[1]);
+    hargv[n++] = (char *)gpath;
     if (a[3]) {
         uint64_t gv;
         for (uint64_t p = a[3] + 8; n < 258 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
