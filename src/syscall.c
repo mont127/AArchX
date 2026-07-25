@@ -1056,6 +1056,20 @@ static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     const char *gpath = (const char *)ocerz_g2h(a[0]);
 
+    /* A failed execve must be reported to the CALLER, which keeps running -- that is what
+     * the kernel does. ocerz implements execve by host-exec'ing ITSELF with -path <target>,
+     * so an unloadable target used to be discovered only in the replacement process, after
+     * the caller was already gone; ocerz then died with "fatal: cannot read <target>".
+     * Wine depends on the real behaviour: it probes lib/wine/i386-unix/wine -- a 32-bit
+     * UNIX loader that cannot exist on macOS, which dropped 32-bit support in Catalina --
+     * and EXPECTS ENOENT so it can fall back to the 64-bit loader. Turning that expected
+     * failure into a fatal killed `wine <program>` outright. Check before replacing the
+     * process, and return the same errno the kernel would. */
+    if (access(gpath, X_OK) != 0) {
+        ret_err(cpu, errno);
+        return OCERZ_STEP_OK;
+    }
+
     char *hargv[260];
     int n = 0;
     hargv[n++] = (char *)(uintptr_t)self;
