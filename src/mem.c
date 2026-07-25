@@ -703,6 +703,44 @@ void ocerz_mem_postfork(void)
     pthread_mutex_unlock(&map_lock);
 }
 
+/* Honour a NON-FIXED mmap address HINT the way the kernel does: hand the guest the address
+ * it asked for when that range is genuinely free, and let the caller fall back to picking
+ * one otherwise. Unlike MAP_FIXED a hint must NEVER replace an existing mapping, so this
+ * accepts only BRAND-NEW host space: a hint landing inside a region ocerz already owns is
+ * refused rather than risk clobbering live guest memory, and reserve_host_fixed (a FIXED
+ * mach_vm_allocate) fails by itself if the host address is taken.
+ *
+ * Wine needs this. It locates its Windows address space by mmap'ing one page at descending
+ * hints -- 0x2000000000, 0x1000000000, 0x800000000, 0x400000000 ... -- and checking whether
+ * the address it got back is the one it asked for. ocerz ignored the hint entirely and
+ * answered every probe with arena memory, so Wine concluded no part of the address space
+ * was available. Hints below OCERZ_LOW_LIMIT are refused on purpose: those guest addresses
+ * live in the low-shadow window and are NOT host-identity, so reserving the host page of
+ * the same number would reserve the wrong memory. */
+int ocerz_map_hint(uint64_t gaddr, uint64_t len, int prot)
+{
+    uint64_t lo = gaddr & ~(OCERZ_HOST_PAGE - 1);
+    uint64_t hi = round_up(gaddr + len);
+    if (lo == 0 || hi <= lo || lo < OCERZ_LOW_LIMIT)
+        return OCERZ_ENOMEM;
+    pthread_mutex_lock(&map_lock);
+    if (region_for_range(lo, hi)) {          /* already ours -- do not clobber */
+        pthread_mutex_unlock(&map_lock);
+        return OCERZ_ENOMEM;
+    }
+    if (reserve_host_fixed(lo, hi - lo) != lo) {
+        pthread_mutex_unlock(&map_lock);
+        return OCERZ_ENOMEM;                 /* host address taken: hint not available */
+    }
+    if (!region_add(lo, hi)) {
+        pthread_mutex_unlock(&map_lock);
+        return OCERZ_ENOMEM;
+    }
+    int rc = map_fixed_locked(lo, hi - lo, prot, 0);
+    pthread_mutex_unlock(&map_lock);
+    return rc;
+}
+
 int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot)
 {
     uint64_t lo = gaddr & ~(OCERZ_HOST_PAGE - 1);
