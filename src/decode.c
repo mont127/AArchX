@@ -817,6 +817,24 @@ static int group45(DecState *s, uint8_t op)
         s->out->nops = 1;
         place_rm(s, &m, &s->out->ops[0], opsize_branch(s), 1);
         return OCERZ_OK;
+    case 3:
+    case 5: {
+        /* Far CALL (/3) and far JMP (/5), m16:32 or m16:64. The MEMORY form is the only
+         * legal one -- mod==3 is undefined -- and it is what wow64cpu.dll uses to enter
+         * 32-bit code (41 ff 2e = REX.B + FF /5 through [r14]).
+         *
+         * The operand is recorded as a plain MEM of the OFFSET width (4, or 8 under REX.W),
+         * not as a 6/10-byte pointer: the far-ness is carried by the opcode, so no other
+         * code path ever sees an operand with an unusual size it would mis-handle. The
+         * selector lives immediately after the offset, at ea + opsize. */
+        if (rm_is_reg(&m))
+            return OCERZ_EUNDEF;
+        set_op(s, idx == 3 ? OCERZ_OP_CALLF : OCERZ_OP_JMPF);
+        s->out->opsize = (uint8_t)size;
+        s->out->nops = 1;
+        place_rm(s, &m, &s->out->ops[0], size, 1);
+        return OCERZ_OK;
+    }
     default:
         return OCERZ_EUNDEF;
     }
@@ -1273,6 +1291,16 @@ static int decode_one_byte(DecState *s, uint8_t op)
     case 0xc3:
         set_op(s, OCERZ_OP_RET);
         s->out->opsize = 8;
+        s->out->nops = 0;
+        return OCERZ_OK;
+    case 0xca:                      /* RETF imm16: far return, then pop imm16 bytes */
+        set_op(s, OCERZ_OP_RETF);
+        s->out->opsize = (uint8_t)opsize_default(s);
+        s->out->nops = 1;
+        return read_imm16(s, &s->out->ops[0]);
+    case 0xcb:                      /* RETF */
+        set_op(s, OCERZ_OP_RETF);
+        s->out->opsize = (uint8_t)opsize_default(s);
         s->out->nops = 0;
         return OCERZ_OK;
     case 0xcf:
@@ -3002,6 +3030,9 @@ static void init_op_names(void)
     op_names[OCERZ_OP_CALL] = "call";
     op_names[OCERZ_OP_RET] = "ret";
     op_names[OCERZ_OP_IRET] = "iret";
+    op_names[OCERZ_OP_JMPF] = "jmpf";
+    op_names[OCERZ_OP_CALLF] = "callf";
+    op_names[OCERZ_OP_RETF] = "retf";
     op_names[OCERZ_OP_LEAVE] = "leave";
     op_names[OCERZ_OP_INT3] = "int3";
     op_names[OCERZ_OP_INT] = "int";

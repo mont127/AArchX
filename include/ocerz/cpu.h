@@ -117,6 +117,13 @@ typedef struct OcerzCPU {
     uint32_t cc_op;
     uint64_t fs_base;
     uint64_t gs_base;
+    /* WoW64 mode. 0 = 64-bit long mode (always, today); 1 would mean the guest has
+     * far-jumped into a 32-bit code segment. ocerz can RECOGNISE that transition but the
+     * decoder is still long-mode-only, so entering it is a hard, loud stop rather than a
+     * silent mis-execution of 64-bit-decoded bytes. cs_sel records the code selector a far
+     * transfer installed, so the diagnostic can name it. */
+    uint8_t mode32;
+    uint16_t cs_sel;
     Ocerz128 xmm[16];
     uint32_t mxcsr;
     uint16_t fcw;
