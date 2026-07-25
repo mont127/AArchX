@@ -1032,15 +1032,22 @@ static int decode_one_byte(DecState *s, uint8_t op)
         return OCERZ_OK;
     }
     case 0x8e: {
-        /* MOV Sreg, r/m16 — loading a selector is a no-op in 64-bit user mode
-         * (FS/GS bases are set via the machdep TLS syscall, not the selector;
-         * the rest are inert). Consume the ModRM and do nothing. */
+        /* MOV Sreg, r/m16. Still architecturally inert in flat 64-bit user mode -- FS/GS
+         * bases come from the machdep TLS syscall there, not from the selector -- but it is
+         * no longer discarded, because WoW64 installs the 32-bit TEB with exactly this
+         * instruction (41 8e a5 90 00 00 00 = mov fs, word [r13+0x90]) using an LDT
+         * selector. The interpreter applies a base ONLY when the selector really denotes an
+         * LDT segment that has one, so 64-bit code keeps the old no-op behaviour.
+         * ops[1] carries the destination segment (0=ES 1=CS 2=SS 3=DS 4=FS 5=GS). */
         ModRM m;
         e = decode_modrm(s, &m, 2);
         if (e)
             return e;
-        set_op(s, OCERZ_OP_NOP);
-        s->out->nops = 0;
+        set_op(s, OCERZ_OP_MOVSEG);
+        s->out->opsize = 2;
+        s->out->nops = 2;
+        place_rm(s, &m, &s->out->ops[0], 2, 1);
+        set_imm(&s->out->ops[1], (uint64_t)(m.reg & 7), 1);
         return OCERZ_OK;
     }
     case 0x8d: {
@@ -3033,6 +3040,7 @@ static void init_op_names(void)
     op_names[OCERZ_OP_JMPF] = "jmpf";
     op_names[OCERZ_OP_CALLF] = "callf";
     op_names[OCERZ_OP_RETF] = "retf";
+    op_names[OCERZ_OP_MOVSEG] = "mov_sreg";
     op_names[OCERZ_OP_LEAVE] = "leave";
     op_names[OCERZ_OP_INT3] = "int3";
     op_names[OCERZ_OP_INT] = "int";

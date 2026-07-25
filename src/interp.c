@@ -840,6 +840,25 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         cpu->rip = ret;
         return OCERZ_STEP_OK;
     }
+    case OCERZ_OP_MOVSEG: {
+        /* Applying a base is gated on the selector actually being an LDT entry with one.
+         * Ordinary 64-bit code loads GDT selectors (bit 2 clear), for which ocerz_ldt_base
+         * returns 0, so this stays the exact no-op it has always been -- that gate is what
+         * keeps Mousecape and Wine byte-identical. Only FS and GS can carry a base that
+         * matters to the guest; DS/ES/SS remain inert in the flat model. */
+        uint32_t sel = (uint32_t)ocerz_read_op(cpu, insn, &insn->ops[0]);
+        unsigned seg = (unsigned)insn->ops[1].imm;
+        uint64_t base = ocerz_ldt_base(sel);
+        if (base) {
+            if (seg == 4)
+                cpu->fs_base = base;
+            else if (seg == 5)
+                cpu->gs_base = base;
+        }
+        if (seg == 1)
+            cpu->cs_sel = (uint16_t)sel;
+        return OCERZ_STEP_OK;
+    }
     case OCERZ_OP_JMPF:
     case OCERZ_OP_CALLF: {
         /* Far transfer, m16:32 or m16:64: offset at [ea], selector at [ea + opsize].
