@@ -247,6 +247,20 @@ static const Case cases[] = {
     { .name = "far jmp register form is invalid (ff /5 mod=11)",
       .bytes = B(0xff, 0xee), .nbytes = 2, .avail = 8,
       .chk = CHK_RET, .ret = OCERZ_EUNDEF },
+    /* MOV Sreg, r/m16 -- inert in 64-bit but no longer discarded; ops[1] carries the
+     * destination segment (0=ES 1=CS 2=SS 3=DS 4=FS 5=GS). The third case is the exact
+     * instruction WoW64 uses to install the 32-bit TEB. */
+    { .name = "mov ds,eax (8e d8)", .bytes = B(0x8e, 0xd8), .nbytes = 2, .avail = 8,
+      .chk = CHK_RET | CHK_OP | CHK_LEN | CHK_NOPS | CHK_O1_IMM,
+      .ret = OCERZ_OK, .len = 2, .op = OCERZ_OP_MOVSEG, .nops = 2, .o1_imm = 3 },
+    { .name = "mov es,eax (8e c0)", .bytes = B(0x8e, 0xc0), .nbytes = 2, .avail = 8,
+      .chk = CHK_RET | CHK_OP | CHK_LEN | CHK_NOPS | CHK_O1_IMM,
+      .ret = OCERZ_OK, .len = 2, .op = OCERZ_OP_MOVSEG, .nops = 2, .o1_imm = 0 },
+    { .name = "mov fs,[r13+0x90] (the WoW64 32-bit TEB install)",
+      .bytes = B(0x41, 0x8e, 0xa5, 0x90, 0x00, 0x00, 0x00), .nbytes = 7, .avail = 8,
+      .chk = CHK_RET | CHK_OP | CHK_LEN | CHK_NOPS | CHK_O0_KIND | CHK_O1_IMM,
+      .ret = OCERZ_OK, .len = 7, .op = OCERZ_OP_MOVSEG, .nops = 2,
+      .o0_kind = OCERZ_OPK_MEM, .o1_imm = 4 },
     { .name = "retf", .bytes = B(0xcb), .nbytes = 1, .avail = 8,
       .chk = CHK_RET | CHK_OP | CHK_LEN | CHK_NOPS, .ret = OCERZ_OK, .len = 1,
       .op = OCERZ_OP_RETF, .nops = 0 },

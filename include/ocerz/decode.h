@@ -535,6 +535,9 @@ enum OcerzOp {
     OCERZ_OP_JMPF,
     OCERZ_OP_CALLF,
     OCERZ_OP_RETF,
+    /* MOV Sreg, r/m16. Inert in flat 64-bit mode, but it is how WoW64 installs the 32-bit
+     * TEB (mov fs, word [r13+0x90]) from an LDT selector. */
+    OCERZ_OP_MOVSEG,
 
     OCERZ_OP_COUNT,
 };
