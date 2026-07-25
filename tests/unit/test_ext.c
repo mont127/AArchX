@@ -116,7 +116,7 @@ static X86Insn mk(int op, int opsize)
 {
     X86Insn i;
     memset(&i, 0, sizeof i);
-    i.op = (uint8_t)op;
+    i.op = (uint16_t)op;   /* X86Insn.op is 16-bit; the enum passed 255 long ago */
     i.opsize = (uint8_t)opsize;
     i.addrsize = 8;
     i.rep = OCERZ_REP_NONE;
@@ -543,6 +543,55 @@ static void test_cpuid_rdtsc(OcerzVM *vm)
     check(c->gpr[OCERZ_RDX] == 0);
 }
 
+/* FXSAVE/FXRSTOR must cover XMM0-15 and MXCSR_MASK, not just the x87 state.
+ *
+ * This was untested, and the omission was not academic: Wine's __wine_syscall_dispatcher
+ * does not rely on the CPU preserving registers across a syscall -- it FXSAVEs and then
+ * reloads the Win64 non-volatile xmm6-xmm15 with movaps straight out of this memory image.
+ * With the XMM area never written, every PE Nt* syscall restored stack garbage (usually
+ * zero) into xmm6-15, ntdll's acl->actctx came back NULL, and wineboot died on it. Assert
+ * the whole image round-trips, since "preserves registers" and "writes the save area" are
+ * different properties and only the second one is what the guest actually asked for. */
+static void test_fxsave_xmm(OcerzVM *vm)
+{
+    OcerzCPU *c = &vm->cpu;
+    uint64_t m = g_scratch + 0x1000;      /* 16-byte aligned */
+
+    setup(vm);
+    for (int i = 0; i < 16; i++) {
+        c->xmm[i].lo = 0x1111111100000000ull + (uint64_t)i;
+        c->xmm[i].hi = 0x2222222200000000ull + (uint64_t)i;
+    }
+    c->mxcsr = 0x1f80;
+    for (uint64_t off = 0; off < 512; off += 8)
+        ocerz_st(m + off, 8, 0xAAAAAAAAAAAAAAAAull);   /* poison: prove it is written */
+
+    X86Insn fxs = mk(OCERZ_OP_FXSAVE, 8);
+    fxs.nops = 1;
+    fxs.ops[0] = mem_abs(m, 8);
+    check(ocerz_interp_ext(vm, c, &fxs) == OCERZ_STEP_OK);
+    for (int i = 0; i < 16; i++) {
+        check(ocerz_ld(m + 160 + (uint64_t)i * 16 + 0, 8) == c->xmm[i].lo);
+        check(ocerz_ld(m + 160 + (uint64_t)i * 16 + 8, 8) == c->xmm[i].hi);
+    }
+    check(ocerz_ld(m + 24, 4) == 0x1f80);              /* MXCSR      */
+    check(ocerz_ld(m + 28, 4) == 0x0000ffff);          /* MXCSR_MASK */
+
+    /* and the mirror: FXRSTOR must load them back */
+    for (int i = 0; i < 16; i++) {
+        c->xmm[i].lo = 0;
+        c->xmm[i].hi = 0;
+    }
+    X86Insn fxr = mk(OCERZ_OP_FXRSTOR, 8);
+    fxr.nops = 1;
+    fxr.ops[0] = mem_abs(m, 8);
+    check(ocerz_interp_ext(vm, c, &fxr) == OCERZ_STEP_OK);
+    for (int i = 0; i < 16; i++) {
+        check(c->xmm[i].lo == 0x1111111100000000ull + (uint64_t)i);
+        check(c->xmm[i].hi == 0x2222222200000000ull + (uint64_t)i);
+    }
+}
+
 static void test_x87(OcerzVM *vm)
 {
     OcerzCPU *c = &vm->cpu;
@@ -718,6 +767,7 @@ int main(void)
     test_scans(&vm);
     test_cpuid_rdtsc(&vm);
     test_x87(&vm);
+    test_fxsave_xmm(&vm);
 
     fprintf(stderr, "test_ext: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

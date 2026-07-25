@@ -422,12 +422,26 @@ static int ext_fxsave(OcerzCPU *cpu, const X86Insn *insn)
     ocerz_st(ea + 2, 2, cpu->fsw);
     ocerz_st(ea + 4, 1, cpu->ftw);
     ocerz_st(ea + 24, 4, cpu->mxcsr);
+    /* MXCSR_MASK. Wine copies the first 32 bytes of this image straight into
+     * CONTEXT.FltSave and reads MxCsr_Mask back out of it, so leaving it as whatever
+     * happened to be on the stack hands the guest a garbage mask. */
+    ocerz_st(ea + 28, 4, 0x0000ffffu);
     for (int i = 0; i < 8; i++) {
         uint64_t bits;
         memcpy(&bits, &cpu->fpr[i], 8);
         ocerz_st(ea + 32 + i * 16 + 0, 8, bits);
         ocerz_st(ea + 32 + i * 16 + 8, 8, 0);
     }
+    /* XMM0-15 at +0xa0, 16 bytes apiece. These were NEVER written, and the omission is
+     * not academic: Wine's __wine_syscall_dispatcher does not rely on the CPU preserving
+     * registers across a syscall -- it FXSAVEs and then reloads the Win64 non-volatile
+     * xmm6-xmm15 with movaps straight out of THIS image. With the area untouched, every
+     * PE Nt* syscall restored whatever was on the stack (usually zero) into xmm6-15.
+     * ntdll keeps acl->actctx in xmm6 across such a call, so it came back NULL and
+     * wineboot died dereferencing it. ocerz preserving xmm across its own syscall path
+     * (it does, and that was verified) is irrelevant here -- the guest never asked it to. */
+    for (int i = 0; i < 16; i++)
+        ocerz_st128(ea + 160 + (uint64_t)i * 16, cpu->xmm[i]);
     return OCERZ_STEP_OK;
 }
 
@@ -442,6 +456,8 @@ static int ext_fxrstor(OcerzCPU *cpu, const X86Insn *insn)
         uint64_t bits = ocerz_ld(ea + 32 + i * 16 + 0, 8);
         memcpy(&cpu->fpr[i], &bits, 8);
     }
+    for (int i = 0; i < 16; i++)              /* mirror of the XMM save above */
+        cpu->xmm[i] = ocerz_ld128(ea + 160 + (uint64_t)i * 16);
     return OCERZ_STEP_OK;
 }
 
