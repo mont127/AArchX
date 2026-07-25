@@ -249,6 +249,56 @@ static void test_mmap_fixed(void)
     CHECK(cpu->gpr[OCERZ_RAX] == 0);
 }
 
+/* i386_set_ldt / i386_get_ldt (machdep 5/6). Wine's WoW64 gets its 32-bit code selector
+ * and its per-thread 32-bit TEB from the LDT on macOS; ocerz keeps a SYNTHETIC table for
+ * them (Rosetta refuses the call outright, which is why 32-bit Windows software does not
+ * run under Wine on Apple silicon). The descriptor pack/unpack is the load-bearing part --
+ * base is split across bits 16-39 and 56-63 and the D/B and G flags sit in the middle --
+ * so this asserts an exact byte round-trip, not just "it returned something". */
+static uint64_t ldt_pack(uint64_t base, uint32_t limit, uint8_t access, int big, int gran)
+{
+    return (limit & 0xffffULL)
+         | ((base & 0xffffffULL) << 16)
+         | ((uint64_t)access << 40)
+         | (((uint64_t)(limit >> 16) & 0xfULL) << 48)
+         | ((uint64_t)(big & 1) << 54)
+         | ((uint64_t)(gran & 1) << 55)
+         | (((base >> 24) & 0xffULL) << 56);
+}
+
+static void test_i386_ldt(void)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    uint64_t gbuf = scratch + 4096;
+    uint64_t cs32 = ldt_pack(0, 0xfffff, 0x9b, 1, 1);          /* 32-bit code, G=1 */
+    uint64_t fs32 = ldt_pack(0x7ffdf000, 0xfff, 0x93, 1, 0);   /* 32-bit TEB data */
+    ocerz_st(gbuf, 8, cs32);
+    ocerz_st(gbuf + 8, 8, fs32);
+
+    /* -1 is LDT_AUTO_ALLOC and arrives zero-extended, so it must be read as an int32_t */
+    set_args(cpu, machdep(5), (uint64_t)(uint32_t)-1, gbuf, 2, 0, 0, 0);
+    int r = ocerz_handle_syscall(&vm, cpu);
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    uint64_t idx = cpu->gpr[OCERZ_RAX];
+    CHECK(idx >= 1);
+
+    ocerz_st(gbuf + 16, 8, 0);
+    ocerz_st(gbuf + 24, 8, 0);
+    set_args(cpu, machdep(6), idx, gbuf + 16, 2, 0, 0, 0);
+    r = ocerz_handle_syscall(&vm, cpu);
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    CHECK(ocerz_ld(gbuf + 16, 8) == cs32);   /* exact descriptor round-trip */
+    CHECK(ocerz_ld(gbuf + 24, 8) == fs32);
+
+    /* a bogus count must be refused, not silently accepted */
+    set_args(cpu, machdep(5), (uint64_t)(uint32_t)-1, gbuf, (uint64_t)(uint32_t)-1, 0, 0, 0);
+    r = ocerz_handle_syscall(&vm, cpu);
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 1);
+}
+
 static void test_mmap_fixed_outside(void)
 {
     OcerzCPU *cpu = &vm.cpu;
@@ -504,6 +554,7 @@ int main(void)
     test_mmap_shared_requires_ordered();
     test_mmap_fixed();
     test_mmap_fixed_outside();
+    test_i386_ldt();
     test_madvise();
     test_gettimeofday();
     test_getentropy();
