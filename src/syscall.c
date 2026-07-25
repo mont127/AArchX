@@ -1616,6 +1616,21 @@ static uint64_t ocerz_bridge_mach_msg(uint64_t hbuf, uint64_t sz)
 /* Log a forwarded mach_msg SEND the kernel rejected with a MACH_SEND_* error (gated on
  * OCERZ_MACHMSG). gmsg is the GUEST message buffer (pre-translation header), so descriptor
  * addresses are the guest-side values the kernel could not copyin. */
+/* Mach errors worth reporting. The old test was (r & 0xfffff000) == 0x10000000, which
+ * matches only the SEND class -- every RCV-class failure (0x10004xxx) was invisible,
+ * including MACH_RCV_INVALID_DATA and MACH_RCV_BODY_ERROR. A receive that fails is exactly
+ * how CoreFoundation's run loop dies, so this blindness is why such a failure could survive
+ * repeated investigation. MACH_RCV_TIMED_OUT and MACH_RCV_TOO_LARGE are normal control flow
+ * and stay quiet. */
+static int ocerz_mach_err_interesting(uint64_t r)
+{
+    if ((r & 0xfffff000ull) == 0x10000000ull)
+        return 1;                                   /* send class */
+    if ((r & 0xfffff000ull) == 0x10004000ull)       /* receive class */
+        return r != 0x10004003ull && r != 0x10004004ull;
+    return 0;
+}
+
 static void ocerz_log_mach_send_err(int trap, uint64_t kr, const uint64_t *a, uint64_t gmsg)
 {
     static int slog = -1;
@@ -3701,7 +3716,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, r31);
         if (nsv31)
             ocerz_send_restore_descriptors(gmsg31, sv31, nsv31);
-        if (gmsg31 != 0 && (r31 & 0xfffff000ull) == 0x10000000ull)
+        if (gmsg31 != 0 && ocerz_mach_err_interesting(r31))
             ocerz_log_mach_send_err(31, r31, a, gmsg31);
         break;
     }
@@ -3814,7 +3829,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         /* MACH_SEND_* failures (kr 0x1000000x; the 0x10004xxx range is benign RCV results)
          * on a message ocerz forwarded: libxpc treats MACH_SEND_INVALID_DATA (0x10000002) as
          * fatal "Malformed Mach message" and os_crashes. Dump the outgoing message structure. */
-        if (reply_buf != 0 && (r47 & 0xfffff000ull) == 0x10000000ull)
+        if (reply_buf != 0 && ocerz_mach_err_interesting(r47))
             ocerz_log_mach_send_err(47, r47, a, reply_buf);
         static int machleak = -1;
         if (machleak < 0) machleak = getenv("OCERZ_MACHLEAK") != NULL ? 1 : 0;
