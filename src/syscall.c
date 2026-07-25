@@ -468,6 +468,125 @@ static int sys_workq_stub(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+/* CPU-IDENTITY OVERRIDES.
+ *
+ * The guest is x86_64; the host is arm64. A blind forward hands the guest the HOST's
+ * identity -- hw.machine "arm64", hw.cputype CPU_TYPE_ARM64 -- which is simply false for
+ * the process asking, and guest software branches on it. Wine reads these to pick which
+ * loader to exec and, seeing arm64, went looking for lib/wine/i386-unix/wine (a 32-bit
+ * UNIX loader that cannot exist on this macOS), so `wine <program>` died instantly.
+ *
+ * The values below are not invented: they are what a translated x86_64 process actually
+ * observes under Rosetta 2 on this machine, measured and matched field for field. Note
+ * Rosetta overrides ONLY the identity fields -- hw.model, machdep.cpu.brand_string and the
+ * cpu counts still report the real Apple hardware -- so anything not listed here keeps
+ * forwarding, which is both simpler and more faithful than inventing a fake Intel machine.
+ *
+ * Resolved by NAME to a MIB once, rather than hardcoding numbers: hw.machine is the classic
+ * 6.1, but hw.cputype/cpusubtype/cpufamily sit at dynamically assigned oids (6.108-6.111
+ * here) that are not guaranteed across OS releases. */
+struct ocerz_sysctl_ovr {
+    const char *name;
+    int is_str;
+    const char *sval;
+    uint32_t ival;
+    int mib[8];
+    size_t miblen;
+    int resolved;
+};
+
+static struct ocerz_sysctl_ovr g_sysctl_ovr[] = {
+    { "hw.machine",             1, "x86_64", 0,           {0}, 0, 0 },
+    { "hw.cputype",             0, NULL,     7,           {0}, 0, 0 }, /* CPU_TYPE_X86 */
+    { "hw.cpusubtype",          0, NULL,     4,           {0}, 0, 0 },
+    { "hw.cpufamily",           0, NULL,     0x573B5EECu, {0}, 0, 0 }, /* Intel Westmere, as Rosetta reports */
+    { "sysctl.proc_translated", 0, NULL,     1,           {0}, 0, 0 }, /* ocerz IS the translator */
+};
+
+static void ocerz_sysctl_ovr_resolve(void)
+{
+    static int done;
+    if (done)
+        return;
+    done = 1;
+    for (unsigned i = 0; i < sizeof g_sysctl_ovr / sizeof g_sysctl_ovr[0]; i++) {
+        g_sysctl_ovr[i].miblen = 8;
+        if (sysctlnametomib(g_sysctl_ovr[i].name, g_sysctl_ovr[i].mib,
+                            &g_sysctl_ovr[i].miblen) == 0)
+            g_sysctl_ovr[i].resolved = 1;
+    }
+}
+
+/* Write one override into the guest's (oldp, oldlenp), following sysctl's contract:
+ * a NULL oldp is a size query, and a short buffer is ENOMEM with the needed size
+ * reported. Returns a STEP code, since the caller returns it directly. */
+static int ocerz_sysctl_ovr_emit(OcerzCPU *cpu, const struct ocerz_sysctl_ovr *o,
+                                 uint64_t oldp, uint64_t oldlenp)
+{
+    uint64_t need = o->is_str ? (uint64_t)strlen(o->sval) + 1 : 4;
+    if (oldp) {
+        uint64_t cap = oldlenp ? ocerz_ld(oldlenp, 8) : need;
+        if (cap < need) {
+            if (oldlenp)
+                ocerz_st(oldlenp, 8, need);
+            ret_err(cpu, OCERZ_ENOMEM_V);
+            return OCERZ_STEP_OK;
+        }
+        if (o->is_str)
+            for (uint64_t k = 0; k < need; k++)
+                ocerz_st(oldp + k, 1, (uint64_t)(uint8_t)o->sval[k]);
+        else
+            ocerz_st(oldp, 4, o->ival);
+    }
+    if (oldlenp)
+        ocerz_st(oldlenp, 8, need);
+    ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
+/* sysctl(name, namelen, oldp, oldlenp, newp, newlen) -- the NUMERIC-MIB form, which is the
+ * one that matters: libsystem's sysctlbyname() resolves the name to an oid and then calls
+ * THIS, so a name-keyed hook on syscall 274 alone never fires (verified: OCERZ_SYSCTLLOG
+ * showed zero 274 calls while the guest read hw.machine). Reads are matched against the
+ * resolved override MIBs; writes and everything else forward untouched. */
+static int sys_sysctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    uint64_t nlen = a[1];
+    static int sclog2 = -1;
+    if (sclog2 < 0) sclog2 = getenv("OCERZ_SYSCTLLOG") ? 1 : 0;
+    if (a[4] == 0 && nlen >= 2 && nlen <= 8) {   /* a read, plausible mib length */
+        int mib[8];
+        for (uint64_t i = 0; i < nlen; i++)
+            mib[i] = (int)(int32_t)ocerz_ld(a[0] + i * 4, 4);
+        ocerz_sysctl_ovr_resolve();
+        if (sclog2)
+            fprintf(stderr, "ocerz: sysctl mib=%d.%d nlen=%llu oldp=%#llx oldlenp=%#llx\n",
+                    mib[0], nlen>1?mib[1]:-1, (unsigned long long)nlen,
+                    (unsigned long long)a[2], (unsigned long long)a[3]);
+        for (unsigned i = 0; i < sizeof g_sysctl_ovr / sizeof g_sysctl_ovr[0]; i++) {
+            const struct ocerz_sysctl_ovr *o = &g_sysctl_ovr[i];
+            if (!o->resolved || o->miblen != nlen)
+                continue;
+            if (memcmp(mib, o->mib, (size_t)nlen * sizeof(int)) == 0)
+                return ocerz_sysctl_ovr_emit(cpu, o, a[2], a[3]);
+        }
+    }
+    uint64_t fa[8];
+    memcpy(fa, a, sizeof fa);
+    for (int i = 0; i < 8; i++)
+        if ((0x1du & (1u << i)) && fa[i] != 0)
+            fa[i] = (uint64_t)(uintptr_t)ocerz_g2h(fa[i]);
+    int err = 0;
+    uint64_t ret2 = 0;
+    uint64_t r = ocerz_host_syscall(202, fa, &ret2, &err);
+    if (err)
+        ret_err(cpu, r);
+    else
+        ret_ok(cpu, r);
+    return OCERZ_STEP_OK;
+}
+
 /* sysctlbyname(name, namelen, oldp, oldlenp, newp, newlen): a[0]=name(guest), a[1]=namelen,
  * a[2]=oldp(guest), a[3]=oldlenp(guest), a[4]=newp, a[5]=newlen. The x86_64 guest IS a translated
  * process (ocerz is its translator), so faithfully report sysctl.proc_translated=1 like Rosetta --
@@ -2875,7 +2994,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [199] = { "lseek",       3, 0x00, 0, NULL },
     [200] = { "truncate",    2, 0x01, 0, NULL },
     [201] = { "ftruncate",   2, 0x00, 0, NULL },
-    [202] = { "sysctl",      6, 0x1d, 0, NULL },
+    [202] = { "sysctl",      6, 0x1d, 0, sys_sysctl },
     [216] = { "open_dprotected_np", 5, 0x01, 0, NULL },
     [220] = { "getattrlist", 5, 0x07, 0, NULL },
     [228] = { "fgetattrlist", 5, 0x06, 0, NULL },

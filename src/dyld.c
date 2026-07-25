@@ -2592,10 +2592,22 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
          * its main image, so its path is byte-for-byte unchanged. Forceable via OCERZ_INITPHASE,
          * disableable via OCERZ_NOINITPHASE. (malloc/pthread are already bootstrapped by the
          * libSystem initializer above and init_mark_done_closure prevents double-init.) */
+        /* Mark the libSystem umbrella initialized the moment its initializer has run --
+         * INDEPENDENT of whether the main image links CoreFoundation. This used to live
+         * inside the links_cf branch below, so an image that does NOT link CF (the Wine
+         * loader is exactly that, as the comment above says) left libSystem unmarked. Any
+         * later dlopen whose closure includes libSystem then re-ran libSystem_initializer,
+         * which re-runs __pthread_init/__malloc_init -- the "double-initialize pthread/malloc
+         * (fatal)" case init_mark_done_closure exists to prevent. It aborted with
+         * "BUG IN LIBPTHREAD: host_info() failed", ocerz skipped the faulting initializer,
+         * and Wine then failed downstream. Whether CF is linked has no bearing on the fact
+         * that libSystem's initializer already ran, so the marking belongs here. */
+        if (ran_init) {
+            g_libsys_mh = dep_find(&cache, "/usr/lib/libSystem.B.dylib");
+            init_mark_done_closure(&cache, g_libsys_mh);
+        }
         if (ran_init && (img.links_cf || getenv("OCERZ_INITPHASE")) && !getenv("OCERZ_NOINITPHASE")) {
-            uint64_t libsys = dep_find(&cache, "/usr/lib/libSystem.B.dylib");
-            g_libsys_mh = libsys;
-            init_mark_done_closure(&cache, libsys);
+            uint64_t libsys = g_libsys_mh;   /* found and marked done just above */
             compute_eager_set(&cache, img.load_base);
             OCERZ_LOG("dynamic: eager init set = %d images (of closure)\n", g_eager_n);
             ocerz_tlv_register_closure(vm, &cache, img.load_base, fr.stack_top);
