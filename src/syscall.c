@@ -337,7 +337,17 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             ret_ok(cpu, addr);
             return OCERZ_STEP_OK;
         }
-        gaddr = ocerz_map_anywhere(len, prot);
+        /* A non-zero addr without MAP_FIXED is a HINT. The kernel grants it when the range
+         * is free, and callers use exactly that to probe the address space -- Wine locates
+         * its Windows address space this way. ocerz_map_hint grants it only when it can
+         * reserve brand-new host space there, so a hint can never displace live memory;
+         * anything else falls through to the allocator, which is what happened before. */
+        gaddr = 0;
+        if (addr != 0 && !getenv("OCERZ_NO_MMAP_HINT") &&
+            ocerz_map_hint(addr, len, prot) == OCERZ_OK)
+            gaddr = addr & ~0x3fffull;   /* page-aligned base the hint mapped at */
+        if (gaddr == 0)
+            gaddr = ocerz_map_anywhere(len, prot);
         if (gaddr == 0) {
             ret_err(cpu, OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
