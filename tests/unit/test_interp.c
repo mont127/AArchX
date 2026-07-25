@@ -722,6 +722,68 @@ int main(void)
     EXPECT_FLAG("test.zf", 0, ZF(&g_vm.cpu));
     EXPECT_FLAG("test.cf", 0, CF(&g_vm.cpu));
 
+    /* WoW64 mode-switch instructions, EXECUTED -- not merely decoded. This block exists
+     * because decoding is not enough: the four new ops were briefly wired only inside
+     * op_branch and never added to the top-level dispatch, so each fell through to the SSE
+     * fallback and reported "no handler". test_decode passed the whole time, because it
+     * decodes without executing. Stepping the interpreter is the only thing that proves the
+     * dispatch actually reaches the implementation. Selector 0x33 is a GDT selector (bit 2
+     * clear), i.e. not a 32-bit LDT segment, so every case below must behave as plain
+     * 64-bit control flow and must NOT set mode32. */
+    reset_cpu();
+    ocerz_st(DATA_BASE, 4, 0x12340000ull);
+    ocerz_st(DATA_BASE + 4, 2, 0x33);
+    g_vm.cpu.gpr[OCERZ_RAX] = DATA_BASE;
+    EMIT(0xff, 0x28);                                   /* jmp far ptr [rax] */
+    rc = step_at(CODE_BASE);
+    EXPECT_U64("jmpf.rc", OCERZ_STEP_OK, rc);
+    EXPECT_U64("jmpf.rip", 0x12340000ull, g_vm.cpu.rip);
+    EXPECT_U64("jmpf.mode32", 0, g_vm.cpu.mode32);
+
+    reset_cpu();
+    ocerz_st(DATA_BASE, 4, 0x5000ull);
+    ocerz_st(DATA_BASE + 4, 2, 0x33);
+    g_vm.cpu.gpr[OCERZ_RAX] = DATA_BASE;
+    g_vm.cpu.gpr[OCERZ_RSP] = DATA_BASE + 0x1000;
+    EMIT(0xff, 0x18);                                   /* call far ptr [rax] */
+    rc = step_at(CODE_BASE);
+    EXPECT_U64("callf.rc", OCERZ_STEP_OK, rc);
+    EXPECT_U64("callf.rip", 0x5000ull, g_vm.cpu.rip);
+    EXPECT_U64("callf.retaddr", CODE_BASE + 2, ocerz_ld(g_vm.cpu.gpr[OCERZ_RSP], 8));
+
+    reset_cpu();
+    g_vm.cpu.gpr[OCERZ_RSP] = DATA_BASE + 0x2000;
+    ocerz_st(DATA_BASE + 0x2000, 8, 0x9abc0000ull);     /* offset   */
+    ocerz_st(DATA_BASE + 0x2008, 8, 0x33);              /* selector */
+    EMIT(0xcb);                                         /* retf */
+    rc = step_at(CODE_BASE);
+    EXPECT_U64("retf.rc", OCERZ_STEP_OK, rc);
+    EXPECT_U64("retf.rip", 0x9abc0000ull, g_vm.cpu.rip);
+
+    /* IRETQ now consumes the CS slot between RIP and RFLAGS. A 64-bit CS must be a no-op --
+     * Wine's __wine_syscall_dispatcher epilogue depends on exactly that. */
+    reset_cpu();
+    g_vm.cpu.gpr[OCERZ_RSP] = DATA_BASE + 0x3000;
+    ocerz_st(DATA_BASE + 0x3000, 8, 0x777000ull);       /* RIP   */
+    ocerz_st(DATA_BASE + 0x3008, 8, 0x33);              /* CS    */
+    ocerz_st(DATA_BASE + 0x3010, 8, 0x202);             /* FLAGS */
+    ocerz_st(DATA_BASE + 0x3018, 8, DATA_BASE + 0x4000);/* RSP   */
+    EMIT(0x48, 0xcf);                                   /* iretq */
+    rc = step_at(CODE_BASE);
+    EXPECT_U64("iretq.rc", OCERZ_STEP_OK, rc);
+    EXPECT_U64("iretq.rip", 0x777000ull, g_vm.cpu.rip);
+    EXPECT_U64("iretq.rsp", DATA_BASE + 0x4000, g_vm.cpu.gpr[OCERZ_RSP]);
+    EXPECT_U64("iretq.mode32", 0, g_vm.cpu.mode32);
+
+    /* MOV Sreg with a GDT selector stays the no-op it has always been. */
+    reset_cpu();
+    g_vm.cpu.fs_base = 0xfeed0000ull;
+    g_vm.cpu.gpr[OCERZ_RAX] = 0x33;
+    EMIT(0x8e, 0xe0);                                   /* mov fs, eax */
+    rc = step_at(CODE_BASE);
+    EXPECT_U64("movseg.rc", OCERZ_STEP_OK, rc);
+    EXPECT_U64("movseg.fs_base_unchanged", 0xfeed0000ull, g_vm.cpu.fs_base);
+
     if (g_failures) {
         fprintf(stderr, "test_interp: %d assertion(s) failed\n", g_failures);
         return 1;
