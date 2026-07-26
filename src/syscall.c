@@ -2121,12 +2121,6 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     ocerz_st(uc + 40, 8, OCERZ_MCTX_SIZE);
     ocerz_st(uc + 48, 8, mc);
 
-    ocerz_st(uc + 56, 8, cpu->gs_base);
-    ocerz_st(uc + 64, 8, cpu->fs_base);
-    if (getenv("OCERZ_GSTRACE") && cpu->gs_base < 0x100000)
-        fprintf(stderr, "ocerz: GS deliver-save sig=%d gs=%#llx (SMALL) rip=%#llx\n",
-                sig, (unsigned long long)cpu->gs_base, (unsigned long long)cpu->rip);
-
     ocerz_st(si + 0, 4, (uint32_t)sig);
     ocerz_st(si + 8, 4, (uint32_t)si_code);
     ocerz_st(si + 24, 8, fault_addr);
@@ -2182,14 +2176,10 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     cpu->mxcsr = (uint32_t)ocerz_ld(mc + 216, 4);
     cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
 
-    cpu->gs_base = ocerz_ld(uc + 56, 8);
-    cpu->fs_base = ocerz_ld(uc + 64, 8);
-    if (ocerz_gs_is_teb_band(cpu->gs_base))
-        cpu->wine_teb_base = cpu->gs_base;
-    if (getenv("OCERZ_GSTRACE") && cpu->gs_base < 0x100000)
-        fprintf(stderr, "ocerz: GS sigreturn-restore gs=%#llx (SMALL) uc=%#llx rip=%#llx\n",
-                (unsigned long long)cpu->gs_base, (unsigned long long)uc,
-                (unsigned long long)cpu->rip);
+    if (getenv("OCERZ_GSTRACE"))
+        fprintf(stderr, "ocerz: GS sigreturn[%d] cpu#%u gs stays %#llx rip=%#llx\n",
+                (int)getpid(), cpu->cpu_number,
+                (unsigned long long)cpu->gs_base, (unsigned long long)cpu->rip);
     if (!(uint32_t)ocerz_ld(uc + 0, 4))
         cpu->sig_on_stack = 0;
     return OCERZ_STEP_OK;
@@ -3410,8 +3400,10 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
             cpu->wine_teb_base = newgs;
         ret_ok(cpu, 0x60);
         if (getenv("OCERZ_GSTRACE"))
-            fprintf(stderr, "ocerz: GS machdep gs=%#llx rip=%#llx icount=%#llx%s\n",
-                    (unsigned long long)cpu->gs_base, (unsigned long long)cpu->rip,
+            fprintf(stderr, "ocerz: GS machdep[%d] cpu#%u gs=%#llx teb=%#llx rip=%#llx icount=%#llx%s\n",
+                    (int)getpid(), cpu->cpu_number,
+                    (unsigned long long)cpu->gs_base,
+                    (unsigned long long)cpu->wine_teb_base, (unsigned long long)cpu->rip,
                     (unsigned long long)vm->insn_count,
                     cpu->gs_base < 0x100000 ? "  <<< SMALL/INVALID" : "");
         if (getenv("OCERZ_GSTRACE") && cpu->gs_base < 0x100000) {

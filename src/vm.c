@@ -603,7 +603,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         write(2, buf, (size_t)(p - buf));
         _exit(139);
     }
-    p = str_into(p, "ocerz: guest crash: ");
+    p = str_into(p, "ocerz: guest crash[");
+    p = hex_into(p, (uint64_t)(uint32_t)getpid());
+    p = str_into(p, "] cpu#");
+    p = hex_into(p, g_cur_cpu ? (uint64_t)g_cur_cpu->cpu_number : 0xffff);
+    p = str_into(p, " ");
     p = str_into(p, sig == SIGBUS ? "SIGBUS" : "SIGSEGV");
     p = str_into(p, " host_addr=");
     p = hex_into(p, (uint64_t)(uintptr_t)si->si_addr);
