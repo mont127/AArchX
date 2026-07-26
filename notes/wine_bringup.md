@@ -3340,3 +3340,71 @@ didInitialAttachCategories / didCallDyldNotifyRegister gate), `OCERZ_VECPROBE`.
 * "(B) category on a local class works, so catlist is read" -- FALSE POSITIVE: clang merged that
   category into the class at compile time (`__objc_catlist` had only ONE entry). No category
   attached at all.
+
+## UPDATE #30 -- libdispatch timers: two bugs fixed, handler dispatch still open
+
+Phase 5 (`CFRunLoopRunInMode(mode, 1.0, false)` never returns) turned out NOT to be an
+mk_timer problem. `mk_timer_create`/`arm` + an untimed `mach_msg` receive works under ocerz
+(210ms vs Rosetta's 206ms; probe in the scratchpad). CF delivers the `seconds` timeout of
+`CFRunLoopRunInMode` through a **libdispatch timer source**, whose handler calls
+`CFRunLoopWakeUp`. So the CFRunLoop hang, the winemac.drv 5s `macdrv_start_cocoa_app` timeout
+(#16/#17) and Mousecape's half-of-launches hang are all the same wall: libdispatch.
+
+### The repro (fast, deterministic, no GUI)
+A ~50-line dynamically-linked probe exercising each libdispatch primitive separately, one per
+process. Under Rosetta all pass. Under ocerz:
+
+| | default | `OCERZ_HOSTWQ=1` |
+| --- | --- | --- |
+| `dispatch_async` global queue | ok | ok |
+| `dispatch_async` x3 | ok | ok |
+| `dispatch_after` | hangs | hangs |
+| TIMER source | hangs | hangs |
+| READ source | hangs | ok |
+| serial queue async | hangs | ok |
+
+Without `OCERZ_HOSTWQ`, `sys_kevent_qos` is a no-op that returns success, so every event
+source silently dies. That alone explains read/serial in the default column.
+
+### Bug 1: the event-manager flag was never set (fixed)
+libdispatch handles timers on its **manager**. It wakes it with `EVFILT_USER ident=1
+fflags=NOTE_TRIGGER`, registered at qos `0x02000000` (`_PTHREAD_PRIORITY_EVENT_MANAGER_FLAG`).
+The host delivered that event correctly and `ocerz_hostwq_bridge` entered a guest worker with
+it, but never set `WQ_FLAG_THREAD_EVENT_MANAGER (0x100000)` in the `_pthread_wqthread` flags,
+so libdispatch saw the manager wakeup on an ordinary worker and **never programmed its timer
+heap at all**. Detect it the same way libdispatch does: read the host thread's pthread_priority
+out of TSD slot 4 (`ocerz_hostwq_is_manager`). Measured: EVFILT_TIMER registrations reaching
+the host kernel went 0 -> 631315. Verified the guest's own libpthread then stores `0x2000000`
+into guest TSD slot 4, so libdispatch does see the thread as the manager.
+
+### Bug 2: NOTE_MACHTIME deadlines were not converted (fixed)
+Once it programs a timer, libdispatch hands back `EVFILT_TIMER fflags=0x118`
+(`NOTE_ABSOLUTE|NOTE_LEEWAY|NOTE_MACHTIME`). NOTE_MACHTIME means `data` is in **mach absolute
+units**. The guest computes it in ns, because ocerz reports timebase 1/1 (so does Rosetta), but
+the host timebase is 125/3 -- so unconverted the kernel schedules it ~41.7x further out. A
+200ms timer was landing ~265 days late, i.e. the 0% CPU "never fires" symptom. `data` (+0x20)
+and, when NOTE_LEEWAY is set, `ext[1]` (+0x30) now go through `ocerz_guest_ns_to_host_ticks`
+on the way to the host. Measured after the fix: first arm is +197ms, and the kernel fires it
+on time. Same bug class as the earlier mach trap 90/93/95 fix, just on the kevent path.
+
+### Still open: expiry is delivered but the handler never runs
+With both fixes the timer arms correctly and the kernel delivers `EVFILT_TIMER data=1` back to
+the manager on time. The manager then calls `gettimeofday` once and re-arms **the identical
+deadline**, now in the past, so it fires again immediately -- 631315 re-arms in 4s, 100% CPU
+(it was 0% CPU before, so this is a different failure, not the old one). It never calls
+`WQOPS_QUEUE_REQTHREADS`, so it never asks for a worker to run the handler. With a repeating
+200ms interval timer the re-armed deadline still never advances, which means the timer heap is
+never updated: libdispatch is not running timer expiry at all, it is only re-programming an
+unchanged heap.
+
+Ruled out so far: the manager flag itself (set, and visible to the guest); the manager QoS bits
+(0 vs 4 makes no difference); the ddi reset at `pth+0x1c8`/`+0x1b8` (`OCERZ_NO_DDIRESET=1`
+changes nothing); the mach thread port changing between deliveries (stable at one port across
+543180 deliveries); `OCERZ_HOSTWQ_ASYNC`; and the guest clock (RDTSC returns real host ns and
+the commpage is global, so it cannot differ per thread; a 100ms sleep measures 110ms).
+
+### Kept diagnostics (env-gated)
+`OCERZ_REARMLOG` (every kevent the guest hands back to the host: filter, flags, fflags, data,
+udata), `OCERZ_ULOCKLOG` now also prints `WQ-MANAGER delivery` with the guest's TSD qos slot,
+`OCERZ_NO_MGRFLAG` (suppress bug 1's fix for A/B). Note `OCERZ_KRLOG` is unusable on timer
+events: it dereferences `ident` as a dispatch queue pointer, which faults for EVFILT_TIMER.
