@@ -3583,3 +3583,27 @@ symbolisable now, which they were not.
 Catch the fault with the slide in place and symbolise `host_pc` to name the ocerz function
 holding the wild pointer. Reproduce it deliberately under load (run the probe in a loop while a
 Wine boot runs) rather than on a quiet machine.
+
+## UPDATE #34 -- Wine now runs with zero ocerz fatals; two Wine-side failures remain
+
+Two consecutive `wine notepad` runs after UPDATE #32/#33: **0 ocerz fatals in both** (was a
+deterministic SIGBUS a few updates ago). No window yet. The run ends one of two ways:
+
+1. `err:macdrv:macdrv_init Failed to start Cocoa app main loop`.
+2. `err:seh:call_seh_handlers invalid frame` + `err:seh:NtRaiseException Exception frame is not
+   in stack limits => unable to dispatch exception`.
+
+(2) is the sharper lead, because the numbers say what is wrong. A sample:
+`invalid frame 00000081005EDEB0 (0000000000B22000-0000000000C20000)`. The thread's stack limits
+are a 32-bit-looking range (0xB22000-0xC20000, i.e. a WoW64 32-bit stack) but the exception
+registration frame is `0x81005EDEB0`, a 64-bit address. Wine compares the frame against
+`NtCurrentTeb()->Tib.StackBase/StackLimit` and rejects it, so it cannot dispatch the exception at
+all. So: guest code is raising an exception while running on a different stack than the one
+recorded in the TEB it is using -- the WoW64 32/64 stack pairing, not a generic SEH bug. That is
+the next thing to chase, and it is likely upstream of (1): if an exception cannot be dispatched
+during Cocoa startup, `run_cocoa_app` never completes and macdrv times out.
+
+The intermittent host-side fault from UPDATE #33 did NOT reproduce again: 36 consecutive clean
+AppKit-probe runs, including 16 while a full Wine boot ran concurrently. It was ~1 in 3 earlier
+in the same session. Unexplained -- a rebuild sits between the two samples, so treat it as
+perturbed rather than fixed, and do not assume it is gone.
