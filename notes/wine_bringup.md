@@ -3457,3 +3457,79 @@ gs_base=0x3619300e0 (a cthread base, not a TEB). **Verified pre-existing**: a bi
 `src/syscall.c` at fa16236 (before any of today's changes) crashes byte-identically, same
 guest_rip, same last Wine line. So this is the next wall, not a regression -- a thread running
 Wine code with gs pointing at the pthread base instead of the TEB, the same family as UPDATE #15.
+
+## UPDATE #32 -- the gs-base SIGBUS was ocerz's sigreturn; Wine now reaches winemac.drv
+
+The `mov rax,%gs:0x30` / `mov eax,[rax+0x48]` SIGBUS at `guest_rip=0x6fffffd7cae0` (UPDATE #31)
+is fixed. It was `RtlEnterCriticalSection` reading `NtCurrentTeb()->ClientId.UniqueThread`.
+
+### Method that found it
+Per-thread attribution. `OCERZ_GSTRACE` had no pid/cpu tag, and several Wine processes share
+stderr, so the trace looked like an interleaved mess. Adding `pid`+`cpu#` to the machdep line and
+to the crash dump isolated the guilty thread immediately, and its history was unambiguous:
+
+    machdep   gs=0x7ff70000                                  <- Wine installs the TEB
+    sigreturn gs 0x7ff70000 -> 0x3619300e0 rip=0x6fffffd77104 <- ocerz puts the cthread back
+
+Wine's syscall dispatcher sets the gs base to the TEB and returns to PE code via sigreturn.
+ocerz restored gs from `uc+56` -- past the end of the 56-byte Darwin ucontext (`uc+48` is the
+last field, `uc_mcontext`), i.e. an ocerz-private stash that only means anything in frames ocerz
+built. Wine hand-builds these frames, so the restore read stale data and reinstalled the pthread
+base; PE code then ran on it until something touched `%gs:0x30`.
+
+### The kernel's actual contract (measured, then confirmed in XNU source)
+A throwaway x86_64 probe (set gs base via machdep 0x3000003, raise a signal, change the base
+inside the handler, read `%gs:0` after) says: on the real kernel the base set in the handler
+**PERSISTS** across sigreturn, and the handler runs with the interrupted code's base. ocerz said
+"restored". That is the whole bug.
+
+But it is conditional. XNU `bsd/dev/i386/unix_signal.c` `sendsig`/`sigreturn` choose
+`x86_THREAD_FULL_STATE64` (which carries `gsbase`) only when `thread_task_has_ldt(thread)`, and
+`osfmk/i386/pcb.c` only calls `machine_thread_set_tsd_base` on the full-state path. Wine installs
+an LDT only for WoW64 (`ldt_alloc_entry`/`i386_set_ldt` in `signal_init_process`). **So: LDT task
+-> kernel saves and restores gsbase; no LDT -> it does neither.** The processes in this run
+install no LDT (`OCERZ_LDTLOG` is silent), so not touching it is correct here.
+
+KNOWN GAP: the LDT case is not implemented. If a WoW64 process does install an LDT, ocerz must
+save gsbase at delivery and restore it at sigreturn, and it must live at the real offset in an
+`x86_thread_full_state64` mcontext (ss64 + ds/es/ss/gsbase), not in a private slot -- Wine knows
+about that larger struct (`signal_x86_64.c`: "Once a custom LDT is installed (i.e. Wow64),
+mcontext will point to a larger '_full' struct which includes DS, ES, SS, and GSbase"). The
+private-slot approach is what broke here and must not come back.
+
+### Wine's gs contract, from wine-11.6 source (for future audits)
+gs base == the TEB itself while PE code runs; gs base == the pthread TSD base while unix code
+runs. Unix code never reads `%gs` (`NtCurrentTeb()` there is `pthread_getspecific(teb_key)`).
+`TEB+0x320` (`amd64_thread_data->pthread_teb`) is NOT a TEB -- it is the *saved pthread base*,
+which is why the asm always caches the TEB in `%r13` before switching gs away. Seven transition
+points, all via `_thread_set_tsd_base` (machdep 0x3000003): `init_handler` (TEB->pthread, every
+signal), `leave_handler` (conditional, from the *resume* rsp), syscall dispatcher entry/return,
+unix-call dispatcher entry/return, and `call_user_mode_callback` (the easy one to miss -- it is
+the only PE entry that is not a syscall return, and it jmps straight into PE code).
+`sigsys_handler` never calls `leave_handler`, which is exactly why the LDT gsbase restore matters
+for WoW64.
+
+### Result and what is left
+`wine notepad` now runs services and reaches `winemac.drv`, and a good run has **zero ocerz
+fatals** (was a deterministic SIGBUS during service startup). It is not stable yet:
+* `00c4:err:macdrv:macdrv_init Failed to start Cocoa app main loop` -- the 5s
+  `macdrv_start_cocoa_app` deadline. `OCERZ_SCCOUNT`'s SCSLOW shows `num=544` (`__ulock_wait`)
+  blocking exactly 5002ms, i.e. the deadline expiring, and `read(fd=6,...,16)` on the wineserver
+  socket taking 99-326ms and once 10002ms. One process pegs 100% CPU for the whole run in some
+  runs and is idle in others.
+* A run-to-run alternative failure: `err:seh:call_seh_handlers invalid frame` +
+  `NtRaiseException Exception frame is not in stack limits`, with one ocerz SIGSEGV at
+  `guest_rip=0x7ff802e30d64`, `guest_addr=0x107084000` -- a *host* address outside the guest
+  arena, blockhist entirely in the shared cache. That is the older sporadic outside-arena fault,
+  not the gs bug.
+* The bare `CFRunLoopSource` pattern `macdrv_start_cocoa_app` uses (post source to the main run
+  loop from another thread, wait on a condvar) works fine under ocerz, so the failure is inside
+  what winemac.drv's callback does, not the run-loop plumbing.
+
+NOT re-tested after this change: Mousecape. Removing the restore is faithful for non-LDT tasks,
+which Mousecape is, so it should be neutral or better -- but that is reasoning, not a measurement.
+
+### Diagnostics note
+`OCERZ_RIPDUMP` is unusable on Wine: it installs a host SIGUSR1 handler, and Wine uses SIGUSR1
+for thread suspend, so the run dies early. Use `OCERZ_SCCOUNT` (SCSLOW slow-syscall lines) or
+`OCERZ_PROFILE` instead. `OCERZ_GSTRACE` now prints pid+cpu#, as does the crash dump.
