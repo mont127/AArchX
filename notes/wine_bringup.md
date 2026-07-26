@@ -3408,3 +3408,52 @@ the commpage is global, so it cannot differ per thread; a 100ms sleep measures 1
 udata), `OCERZ_ULOCKLOG` now also prints `WQ-MANAGER delivery` with the guest's TSD qos slot,
 `OCERZ_NO_MGRFLAG` (suppress bug 1's fix for A/B). Note `OCERZ_KRLOG` is unusable on timer
 events: it dereferences `ident` as a dispatch queue pointer, which faults for EVFILT_TIMER.
+
+## UPDATE #31 -- libdispatch wall DESTROYED; CFRunLoopRunInMode returns
+
+The #30 "still open" item is fixed. Two more bugs, found by reading real libdispatch source
+(apple-oss-distributions/libdispatch-1542.100.32) instead of guessing:
+
+**Bug 3: gettimeofday's third out-param.** libdispatch does NOT use `mach_absolute_time()` to
+test timer expiry on macOS. `_dispatch_timers_run` reads now via `_dispatch_time_now_cached`
+-> `mach_get_times()`, which on a commpage miss falls back to `__gettimeofday_with_mach`, a
+**3-arg** gettimeofday whose third out-param the kernel fills with mach absolute time
+(`shims/time.h:221-238`, xnu `libsyscall/wrappers/mach_get_times.c:62-75`). ocerz declared
+syscall 116 with **2 args** and forwarded it, so the guest received raw host 24MHz ticks as
+"now" while its deadlines were in ns -- ~41.7x behind, permanently. `dr->dt_timer.target > now`
+was always true, so `_dispatch_timers_run` broke out before firing and `_dispatch_timers_program`
+re-armed the identical deadline (both use the *same cached* now, so the re-arm is byte-identical
+by construction -- which is exactly why the deadline never moved even for an interval timer).
+Fixed: 116 now takes 3 args, translates all three pointers, and converts the out-param with a
+new `ocerz_host_ticks_to_guest_ns`.
+
+The single `gettimeofday` per drain was itself the clue: on a healthy system that path does zero
+syscalls, because `__commpage_gettimeofday_internal` succeeds. ocerz's guest commpage
+NEWTIMEOFDAY_DATA slot is unpopulated, so the fallback runs every time. Populating it would be a
+worthwhile follow-up (it removes a syscall from every timer drain), but is not required.
+
+**Bug 4: workqueue overcommit was dropped.** With bug 3 fixed the timer fired and libdispatch
+called `WQOPS_QUEUE_REQTHREADS`, but the handler still never ran: the request carried priority
+`0x840008ff`, i.e. `_PTHREAD_PRIORITY_OVERCOMMIT_FLAG`, and ocerz spawned the worker without
+`WQ_FLAG_THREAD_OVERCOMMIT (0x10000)`. libdispatch keeps separate overcommit and non-overcommit
+root queues per QoS, so the worker drained the empty one and returned immediately. Plain
+`dispatch_async` never hit this because it requests `0x40008ff` (no overcommit) -- which is
+exactly why async worked all along while every source did not.
+
+### Result
+`tools/dispatch_probe.c` under `OCERZ_HOSTWQ=1`: async, after, timer, interval, read, serial --
+all six pass. `CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false)` returns TimedOut in
+**1019ms** (Rosetta: 1001ms); it previously never returned. `make check` green throughout.
+
+Note `OCERZ_HOSTWQ` is still opt-in, and without it `sys_kevent_qos` remains a no-op returning
+success, so every event source silently dies. Making it the default is the obvious next step but
+needs a Mousecape/Wine soak first.
+
+### Wine status after this
+`bin/wine notepad` reaches service startup (`ntoskrnl:ServiceMain` failing to load win32k.sys /
+dxgkrnl.sys / dxgmms1.sys) and then takes an ocerz SIGBUS at `guest_rip=0x6fffffd7cae0`,
+`mov rax,%gs:0x30` returning 0 followed by `mov eax,[rax+0x48]` -> guest_addr 0x48, with
+gs_base=0x3619300e0 (a cthread base, not a TEB). **Verified pre-existing**: a binary built from
+`src/syscall.c` at fa16236 (before any of today's changes) crashes byte-identically, same
+guest_rip, same last Wine line. So this is the next wall, not a regression -- a thread running
+Wine code with gs pointing at the pthread base instead of the TEB, the same family as UPDATE #15.
