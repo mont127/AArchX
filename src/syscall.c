@@ -505,6 +505,11 @@ static uint64_t ocerz_kev_stride(void)
 
 static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]);
 static void ocerz_hostwq_register(OcerzVM *vm);
+static void ocerz_kev_timer_to_host(void *hev, int nev);
+
+#define OCERZ_EVFILT_TIMER (-7)
+#define OCERZ_NOTE_LEEWAY   0x00000010u
+#define OCERZ_NOTE_MACHTIME 0x00000100u
 
 static void wl_dqdump(const char *tag, uint64_t id, unsigned cpun, unsigned kp)
 {
@@ -912,6 +917,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                     memcpy((char *)hbuf + (size_t)i * rstride,
                            ocerz_g2h(a[1] + (uint64_t)i * rstride),
                            rstride);
+                ocerz_kev_timer_to_host(hbuf, n);
             } else {
                 n = 0;
             }
@@ -993,6 +999,16 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 #define OCERZ_WQ_FLAG_KEVENT   0x80000ull
 
 #define OCERZ_WQ_FLAG_REUSE    0x20000ull
+#define OCERZ_WQ_FLAG_EVENT_MANAGER 0x100000ull
+
+#define OCERZ_PTHREAD_PRIORITY_EVENT_MANAGER 0x02000000u
+#define OCERZ_PTHREAD_TSD_SLOT_QOS ((pthread_key_t)4)
+
+static int ocerz_hostwq_is_manager(void)
+{
+    uintptr_t pri = (uintptr_t)pthread_getspecific(OCERZ_PTHREAD_TSD_SLOT_QOS);
+    return (pri & OCERZ_PTHREAD_PRIORITY_EVENT_MANAGER) != 0;
+}
 
 #define OCERZ_PTHREAD_WORKLOOP_SLOT 0x7ff8436bd638ull
 
@@ -1201,6 +1217,32 @@ static uint64_t ocerz_guest_ns_to_host_ticks(uint64_t ns)
     if (numer == denom || ns == 0)
         return ns;
     return (uint64_t)(((__uint128_t)ns * denom) / numer);
+}
+
+static void ocerz_kev_timer_to_host(void *hev, int nev)
+{
+    if (!hev || nev <= 0)
+        return;
+    for (int i = 0; i < nev; i++) {
+        unsigned char *e = (unsigned char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S;
+        int16_t filt;
+        uint32_t fflags;
+        memcpy(&filt, e + 0x08, 2);
+        if (filt != OCERZ_EVFILT_TIMER)
+            continue;
+        memcpy(&fflags, e + 0x18, 4);
+        if (!(fflags & OCERZ_NOTE_MACHTIME))
+            continue;
+        uint64_t v;
+        memcpy(&v, e + 0x20, 8);
+        v = ocerz_guest_ns_to_host_ticks(v);
+        memcpy(e + 0x20, &v, 8);
+        if (fflags & OCERZ_NOTE_LEEWAY) {
+            memcpy(&v, e + 0x30, 8);
+            v = ocerz_guest_ns_to_host_ticks(v);
+            memcpy(e + 0x30, &v, 8);
+        }
+    }
 }
 
 static void ocerz_log_mach_send_err(int trap, uint64_t kr, const uint64_t *a, uint64_t gmsg)
@@ -1429,8 +1471,12 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
     t.gpr[OCERZ_RSI] = kp;
     t.gpr[OCERZ_RDX] = pth;
     t.gpr[OCERZ_RCX] = evbuf;
-    t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | extra_r8 | 4u
+    uint64_t mgr = ocerz_hostwq_is_manager() && !getenv("OCERZ_NO_MGRFLAG")
+                 ? OCERZ_WQ_FLAG_EVENT_MANAGER : 0;
+    t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | extra_r8 | mgr | (mgr ? 0 : 4u)
                     | (registered ? OCERZ_WQ_FLAG_REUSE : 0);
+    if (mgr && getenv("OCERZ_ULOCKLOG"))
+        fprintf(stderr, "ocerz: WQ-MANAGER delivery nev=%d\n", nev);
     t.gpr[OCERZ_R9] = (uint64_t)nev;
     t.gs_base = pth + 0xe0;
     if (getenv("OCERZ_GSTRACE"))
@@ -1551,6 +1597,21 @@ static void ocerz_hostwq_kevent_cb(void **events, int *nevents)
         if (nevents) *nevents = 0;
         g_hostwq_tl_events = NULL;
         g_hostwq_tl_nevents = NULL;
+    }
+    if (getenv("OCERZ_REARMLOG") && nevents && *nevents > 0 && events && *events) {
+        for (int i = 0; i < *nevents; i++) {
+            const unsigned char *e = (const unsigned char *)*events
+                                   + (size_t)i * OCERZ_KEVENT_QOS_S;
+            uint64_t ident, udata; int16_t filt; uint16_t fl;
+            uint32_t fflags; int64_t data;
+            memcpy(&ident, e + 0x00, 8); memcpy(&filt, e + 0x08, 2);
+            memcpy(&fl, e + 0x0a, 2);    memcpy(&udata, e + 0x10, 8);
+            memcpy(&fflags, e + 0x18, 4); memcpy(&data, e + 0x20, 8);
+            fprintf(stderr,
+                    "ocerz: REARM[%d] filt=%d ident=%#llx flags=%#x fflags=%#x data=%lld udata=%#llx\n",
+                    i, filt, (unsigned long long)ident, fl, fflags,
+                    (long long)data, (unsigned long long)udata);
+        }
     }
 }
 
