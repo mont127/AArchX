@@ -3533,3 +3533,53 @@ which Mousecape is, so it should be neutral or better -- but that is reasoning, 
 `OCERZ_RIPDUMP` is unusable on Wine: it installs a host SIGUSR1 handler, and Wine uses SIGUSR1
 for thread suspend, so the run dies early. Use `OCERZ_SCCOUNT` (SCSLOW slow-syscall lines) or
 `OCERZ_PROFILE` instead. `OCERZ_GSTRACE` now prints pid+cpu#, as does the crash dump.
+
+## UPDATE #33 -- macdrv is NOT a speed problem; AppKit works; the blocker is an intermittent host fault
+
+Measured, so the 5s-deadline theory is dead. A standalone AppKit probe
+(`[NSApplication sharedApplication]` + `setActivationPolicy` + `finishLaunching`, timed with
+mach_absolute_time) gives:
+
+| | native (Rosetta) | ocerz `OCERZ_HOSTWQ=1` |
+| --- | --- | --- |
+| sharedApplication | 200 ms | 520-732 ms |
+| TOTAL | 205 ms | 548-764 ms |
+
+`macdrv_start_cocoa_app`'s budget is 5000 ms, so AppKit startup has ~7x headroom under ocerz.
+**AppKit comes up fine under ocerz** -- `sharedApplication` returns a real NSApplication. So
+"Failed to start Cocoa app main loop" is not translation being too slow, and it is not the
+run-loop plumbing either (the bare cross-thread CFRunLoopSource pattern macdrv uses works; see
+UPDATE #32).
+
+What actually happens is that the probe **intermittently faults**, and when winemac.drv's
+`run_cocoa_app` hits that, the Cocoa app never signals ready and macdrv sits out its full 5s.
+
+### The fault
+Same signature as the sporadic Wine one: SIGSEGV, `guest_addr == host_addr` (identity, outside
+the guest arena), guest in `mach_msg2_trap` or `workq_kernreturn`, and the faulting HOST
+instruction is a plain load through a bad pointer in ocerz's own code -- once
+`libsystem_malloc`'s `_malloc_zone_calloc + 36` (`ldr x0,[x8]`), once ocerz itself
+(`ldr x13,[x8]`) reading just below a mapped region.
+
+Narrowing so far:
+* **It is not a classic heap overflow.** An `-fsanitize=address` build reproduces the fault and
+  reports NO AddressSanitizer error.
+* **Guard Malloc masks it** (`DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib`): 6/6 clean, and
+  ~2x slower. Classic heisenbug.
+* **Rate is load/timing dependent.** ~1 in 3 while heavy Wine runs were going on concurrently;
+  20 consecutive clean runs on a quiet machine. Treat any short clean streak as meaningless.
+* The only host `calloc`s on this path are the worker structs in `ocerz_spawn_worker` /
+  `sys_bsdthread_create`; the RAS bound checks (C at `ocerz_ras_push`, and the JIT-inlined
+  emitter's `subs`/`b.cs` at src/jit.c) are both correct, so the RAS is not writing past
+  `struct ocerz_worker`. `g_cpus` register/unregister is lock-protected and dedup'd.
+
+### Tooling added
+`tools/dispatch_probe.c`-style approach applied again: a ~0.6s AppKit probe replaces 70s flaky
+Wine runs as the repro. The crash dump now prints `slide=` (the main image vmaddr slide), so
+`host_pc - slide` feeds straight into `atos -o ocerz -arch arm64` -- host-side faults are
+symbolisable now, which they were not.
+
+### Next
+Catch the fault with the slide in place and symbolise `host_pc` to name the ocerz function
+holding the wild pointer. Reproduce it deliberately under load (run the probe in a loop while a
+Wine boot runs) rather than on a quiet machine.
