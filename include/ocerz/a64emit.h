@@ -1,33 +1,4 @@
-/*
- * include/ocerz/a64emit.h
- *
- * A minimal arm64 (AArch64) instruction emitter: each function appends one
- * machine instruction to an A64Buf cursor. This is the JIT backend's only
- * way of producing code, so every encoding lives in exactly one place and
- * is exercised by tests/unit/test_a64emit.c, which executes emitted
- * sequences and checks their results (run-don't-read validation: an
- * encoding bug cannot hide from an executed branch, load, or flag check).
- *
- * Conventions: register numbers are 0..30 plus 31 meaning ZR or SP
- * depending on the instruction class (these helpers always mean XZR/WZR).
- * The sf parameter selects 64-bit (1) or 32-bit (0) operation width.
- * Sized loads and stores take the access size in bytes (1/2/4/8) and an
- * unsigned byte offset that must be a multiple of the size (the scaled-
- * immediate form); 32-bit and smaller loads zero-extend into the X
- * register, matching how the JIT exploits them for x86 sub-register reads.
- * Shifted-register ALU forms only expose LSL shifts, which is all the
- * translator needs. Bitfield helpers (ubfx/sbfx/bfi and the extend
- * aliases) wrap UBFM/SBFM/BFM with the architectural alias arithmetic so
- * call sites read like the assembler syntax. Branch offsets are given in
- * INSTRUCTION WORDS relative to the branch itself (the a64_label/patch pair
- * supports forward branches: remember the cursor, emit a placeholder, then
- * patch once the target is known).
- *
- * a64_mov_imm64 emits the shortest MOVZ/MOVN+MOVK or logical-immediate
- * sequence for the value.
- * Condition codes use the ARM numbering (A64_EQ..A64_LE); A64_INV(cc)
- * flips a condition's polarity (the encoding's low-bit toggle).
- */
+/* arm64 instruction emitter: each call appends one instruction to an A64Buf. */
 #ifndef OCERZ_A64EMIT_H
 #define OCERZ_A64EMIT_H
 
@@ -48,13 +19,7 @@ typedef struct A64Buf {
     uint32_t *p;
     uint32_t *end;
     int overflow;
-    /* Patch sink for labels taken from a full buffer. a64_emit32 clamps at
-     * p == end without advancing, so once the buffer is full every subsequent
-     * a64_label() would hand out `end` itself — an address one word PAST the
-     * mapping — and the a64_patch_* helpers write through the site they are
-     * given. a64_label() returns &sink instead, so patches from a dead block
-     * land here rather than off the end of the MAP_JIT region. The block is
-     * discarded (or demoted to the interpreter), so the value is never read. */
+
     uint32_t sink;
 } A64Buf;
 
@@ -67,10 +32,6 @@ void a64_movn(A64Buf *b, int rd, uint16_t imm, int hw);
 void a64_mov_imm64(A64Buf *b, int rd, uint64_t v);
 void a64_mov_reg(A64Buf *b, int sf, int rd, int rm);
 
-/* Logical immediates are rotated, replicated runs of one bits. These helpers
- * return 1 after emitting one instruction when `imm` is representable, or 0
- * without changing the buffer when it is not. For sf == 0 only the low 32 bits
- * participate, matching the architectural W-register operation. */
 int a64_try_and_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm);
 int a64_try_ands_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm);
 int a64_try_orr_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm);
@@ -84,7 +45,7 @@ void a64_ldr_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
 void a64_str_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
 void a64_ldar(A64Buf *b, int size, int rt, int rn);
 void a64_stlr(A64Buf *b, int size, int rt, int rn);
-void a64_ldapr(A64Buf *b, int size, int rt, int rn);   /* RCpc acquire: the x86-TSO load */
+void a64_ldapr(A64Buf *b, int size, int rt, int rn);
 void a64_dmb_ish(A64Buf *b);
 void a64_ldrsb(A64Buf *b, int sf, int rt, int rn, uint32_t off);
 void a64_ldrsh(A64Buf *b, int sf, int rt, int rn, uint32_t off);
@@ -143,12 +104,7 @@ void a64_cbnz(A64Buf *b, int sf, int rt, int32_t off_words);
 void a64_tbz(A64Buf *b, int rt, int bit, int32_t off_words);
 void a64_tbnz(A64Buf *b, int rt, int bit, int32_t off_words);
 void a64_patch_b(uint32_t *at, uint32_t *target);
-/* Range-checked B patch: returns 1 and patches if target is within the +-128MB
- * (+-(2^25-1) words) reach of an unconditional B at `at`; returns 0 and patches
- * NOTHING if out of range. Unlike a64_patch_b, which masks off & 0x03ffffff with
- * no range check and would silently encode a branch to an arbitrary arena
- * address, this is safe to use for cross-block chaining where the target may be
- * anywhere in the (1GB, 8x the B reach) arena. */
+
 int a64_try_patch_b(uint32_t *at, uint32_t *target);
 void a64_patch_bcond(uint32_t *at, uint32_t *target);
 void a64_patch_cbz(uint32_t *at, uint32_t *target);

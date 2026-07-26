@@ -1,20 +1,4 @@
-/*
- * tests/unit/test_cache.c
- *
- * Validates the shared-cache mapper and symbol resolver (src/cache.c) against
- * ground truth from the cache's own .map manifest. It maps the real x86_64
- * dyld shared cache, resolves a handful of libSystem symbols, and checks each
- * resolved address falls inside the dylib __TEXT range the .map file lists
- * (libsystem_c.dylib __TEXT 0x7FF802D04000..0x7FF802D8BA20 on the reference
- * machine) and that the bytes there look like a real x86_64 function (a
- * push %rbp / endbr64 / sub $imm,%rsp style prologue, not zero or garbage).
- *
- * The cache is OS-version specific, so this test is advisory: if the cache
- * cannot be mapped (different path, SIP, CI box) it prints SKIP and returns 0
- * rather than failing the suite. When the cache IS present it is a strong
- * end-to-end check that mapping, image enumeration, and export-trie walking
- * all agree with the system loader's own view.
- */
+/* Shared-cache mapper and symbol resolver against ground truth. */
 #include "ocerz/cache.h"
 
 #include <stdio.h>

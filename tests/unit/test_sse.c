@@ -1,37 +1,4 @@
-/*
- * tests/unit/test_sse.c
- *
- * Unit tests for the SSE interpreter tier (src/interp_sse.c). Every test
- * builds a decoded X86Insn by hand, seeds the CPU's XMM/GPR state, calls
- * ocerz_interp_sse() directly, and asserts the resulting lanes or flags.
- *
- * Harness note and deviation from the suggested pattern: the suggested
- * harness calls ocerz_interp_step() with hand-encoded instruction BYTES. That
- * path needs the x86 decoder (decode.c) and the interp.c dispatcher, neither
- * of which exists in the tree yet, so this unit cannot link them. Because the
- * task that owns interp_sse.c also owns its tests, and because interp_sse.c
- * consumes a decoded X86Insn (not raw bytes), the tests construct the X86Insn
- * directly — which is exactly the structure a working decoder would hand the
- * SSE tier — and exercise the same code under test bit for bit. A real guest
- * memory arena is still set up through ocerz_mem_init() so the few memory-
- * operand cases (MOVSS/MOVQ load, PEXTR-to-memory, MOVDDUP-from-memory) go
- * through the genuine ocerz_ld/ocerz_st paths. setup_memory() falls back to a
- * single mmap'd page plus a hand-computed ocerz_guest_base when the host
- * kernel will not honor ocerz_mem_init()'s non-MAP_FIXED placement hints
- * (observed on macOS builds that always relocate anonymous reservations);
- * the fallback yields an identical g2h mapping for the one scratch page the
- * tests touch.
- *
- * X86Insn.op is a uint16_t holding the full OcerzOp value, so the helper xi()
- * stores op untruncated and the dispatcher matches on the same value. The
- * below-SSE_FIRST probe uses FWAIT (165), a non-SSE op the SSE switch does not
- * handle, to confirm the dispatcher returns EUNSUP for anything outside its
- * range.
- *
- * Assertions use a tiny CHECK macro that increments a global counter and
- * prints the first failure with its expression; main() returns non-zero if
- * any check failed so `make unit` flags the regression.
- */
+/* Unit tests for the SSE interpreter tier. */
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/mem.h"

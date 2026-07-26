@@ -1,27 +1,4 @@
-/*
- * tests/guest/strings.c
- *
- * Memory-movement and string-instruction torture over a 64KB working set.
- * Two complementary goals:
- *
- *  1. Exercise the compiler/library memory primitives at scale: memset to
- *     seed a deterministic pattern, memcpy/memmove (including a forward and a
- *     deliberately overlapping move) across a 64KB buffer, and memcmp/strlen/
- *     strcmp on embedded NUL-terminated strings. A byte checksum is folded
- *     after each stage and printed, so a single wrong byte anywhere changes
- *     the output.
- *
- *  2. Guarantee that the x86 string instructions rep movsb, rep stosb and
- *     repne scasb actually appear in the guest image (the compiler would
- *     otherwise be free to never emit them). An explicit inline-asm block
- *     issues each one with df cleared: rep stosb fills a region, rep movsb
- *     copies it, repne scasb scans for a sentinel byte and the found index is
- *     folded into the checksum. The Makefile verifies via otool that "rep"
- *     string ops are present.
- *
- * All data is fixed and computed, so every checksum is deterministic and
- * machine-independent.
- */
+/* String and memory-movement instructions over a 64KB buffer. */
 #include "gsys.h"
 
 void *memcpy(void *dst, const void *src, g_u64 n);

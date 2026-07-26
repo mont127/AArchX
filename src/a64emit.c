@@ -1,29 +1,4 @@
-/*
- * src/a64emit.c
- *
- * The arm64 instruction emitter implementing a64emit.h: one function per
- * machine instruction, each appending a single 32-bit word to the buffer
- * cursor. Encodings follow the ARM Architecture Reference Manual field
- * layouts directly; the comments-free body keeps each encoder to its raw
- * bit assembly so that test_a64emit.c (which EXECUTES emitted code) is the
- * specification of correctness rather than prose.
- *
- * Field conventions used throughout: sf is bit 31 (1=64-bit). Data-
- * processing-immediate ADD/SUB carry a 12-bit unsigned immediate with an
- * optional 12-bit left shift (only the unshifted form is exposed). Load/
- * store use the unsigned-offset (scaled) encoding, with the size field in
- * bits 30-31 and the byte offset divided by the access size. Logical-
- * shifted-register forms always use shift type LSL (00) with the amount in
- * bits 10-15. The bitfield helpers compute UBFM/SBFM/BFM immr/imms from the
- * higher-level lsb/width arguments using the standard alias formulas. Branch
- * encoders take a signed word displacement and pack the two's-complement
- * imm field; the patch helpers recompute that field once a forward target
- * is known by reading the displacement from the already-emitted word.
- *
- * a64_mov_imm64 chooses the shortest constant materialization: a single
- * logical-immediate ORR when that beats the MOV-wide sequence, otherwise a
- * MOVZ/MOVN seed followed by the required MOVK instructions.
- */
+/* arm64 instruction emitter: one function per instruction, each appending a word to the buffer. */
 #include "ocerz/a64emit.h"
 
 void a64_emit32(A64Buf *b, uint32_t w)
@@ -37,10 +12,7 @@ void a64_emit32(A64Buf *b, uint32_t w)
 
 uint32_t *a64_label(A64Buf *b)
 {
-    /* Never hand out an address the patch helpers cannot legally store to.
-     * Tested against `end` rather than `overflow` on purpose: a buffer that is
-     * exactly full still has overflow == 0 (the flag is only raised by the NEXT
-     * a64_emit32), yet b->p already equals b->end and is not writable. */
+
     if (b->p >= b->end)
         return &b->sink;
     return b->p;
@@ -75,9 +47,6 @@ static uint64_t ror_element(uint64_t v, unsigned rot, unsigned bits)
     return ((v >> rot) | (v << (bits - rot))) & mask;
 }
 
-/* Encode the ARM DecodeBitMasks representation used by logical immediates.
- * A value is legal iff it is a nontrivial run of ones, rotated within a
- * power-of-two element, then replicated across the operand width. */
 static int logical_imm_fields(int sf, uint64_t imm, uint32_t *fields)
 {
     unsigned width = sf ? 64u : 32u;
@@ -249,11 +218,6 @@ void a64_str_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled)
                   ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
-/* Load-Acquire / Store-Release (LDAR/STLR): the ordered forms of LDR/STR the
- * JIT uses for GUEST memory so plain x86 accesses keep Total Store Order. These
- * are the base-register-only [Xn] encodings (no immediate offset): the Rs and
- * Rt2 fields are fixed to 0b11111 and size selects the width in bits 31-30, so
- * the body mirrors a64_ldr/a64_str minus the scaled imm12. */
 void a64_ldar(A64Buf *b, int size, int rt, int rn)
 {
     uint32_t sz = ldst_size_bits(size);
@@ -266,47 +230,17 @@ void a64_stlr(A64Buf *b, int size, int rt, int rn)
     a64_emit32(b, 0x089ffc00u | (sz << 30) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
-/* LDAPR: Load-Acquire RCpc (FEAT_LRCPC, present on every Apple Silicon part).
- *
- * This, not LDAR, is the right primitive for an x86 GUEST load. x86-TSO orders a
- * load against every LATER access (load->load and load->store) and permits exactly
- * one relaxation: a load may be reordered ahead of an EARLIER store. LDAPR provides
- * precisely that -- RCpc acquire orders the load with all subsequent accesses while
- * still allowing store->load reordering. LDAR is strictly STRONGER than x86: its
- * RCsc semantics additionally order it against a preceding STLR, forbidding the one
- * reordering x86 actually allows, and paying for a guarantee the guest cannot
- * observe. Same [Xn] base-only form and same natural-alignment requirement as LDAR,
- * so the caller's alignment split is unchanged.
- *
- * Encoding taken from the assembler, not from prose: `ldapr x0,[x1]` = 0xf8bfc020
- * and `ldapr w2,[x3]` = 0xb8bfc062, giving base 0x38bfc000 with the usual size in
- * bits 31-30. Executed, not merely read, by the a64emit test. */
 void a64_ldapr(A64Buf *b, int size, int rt, int rn)
 {
     uint32_t sz = ldst_size_bits(size);
     a64_emit32(b, 0x38bfc000u | (sz << 30) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
-/* DMB ISH: inner-shareable full data barrier. Provided as the offset-handling
- * fallback for any guest access the ldar/stlr [Xn] form cannot express; the
- * current JIT materializes every guest address into a base register with no
- * displacement, so it uses ldar/stlr directly and never needs this. */
 void a64_dmb_ish(A64Buf *b)
 {
     a64_emit32(b, 0xd5033bbfu);
 }
 
-/* Sign-extending loads, UNSIGNED-OFFSET form (LDRSB/LDRSH/LDRSW immediate).
- *
- * These three scale `off` by the access size, which is only meaningful for the
- * unsigned-offset encoding — bit 24 SET. They were originally written against
- * the 0x38/0x78/0xb8 base (bit 24 CLEAR), which is the LDUR/pre-index/post-index
- * family: there the scaled offset lands in imm9 at bits[20:12] and bits[11:10]
- * become the addressing MODE, so `a64_ldrsw(rt, rn, 0x60)` assembled as
- * `ldursw rt,[rn,#6]` — the wrong slot entirely, and for other offsets the mode
- * bits could have selected a WRITE-BACK form that mutates the base register
- * (x20 = cpu at every call site here). All three had zero callers until
- * emit_imul, so the defect had never been reachable. */
 void a64_ldrsb(A64Buf *b, int sf, int rt, int rn, uint32_t off)
 {
     uint32_t opc = sf ? 2u : 3u;
@@ -494,9 +428,7 @@ void a64_patch_b(uint32_t *at, uint32_t *target)
 
 int a64_try_patch_b(uint32_t *at, uint32_t *target)
 {
-    /* imm26 is a signed word offset; B reaches [-(2^25), 2^25-1] words. Reject
-     * anything that would not round-trip through the 26-bit field so we never
-     * silently truncate a far target into a bogus in-range branch. */
+
     ptrdiff_t off = target - at;
     if (off < -(ptrdiff_t)(1 << 25) || off > (ptrdiff_t)((1 << 25) - 1))
         return 0;

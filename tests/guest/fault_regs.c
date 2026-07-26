@@ -1,58 +1,4 @@
-/*
- * tests/guest/fault_regs.c
- *
- * Takes a SIGSEGV in the MIDDLE of a reuse-heavy block with every data GPR
- * live, and prints all of them (plus rflags, trapno and the fault address)
- * from the delivered ucontext. This is a GATE test, not a feature test.
- *
- * WHY IT EXISTS. The differential suite's proof that JIT == interp is a
- * comparison of program stdout at NORMAL EXIT (run_diff_test.sh), and the
- * flags tests capture rflags with PUSHF on the normal path. Neither can see
- * the register file that a FAULT observes. That is a real blind spot the
- * moment guest registers stop living in cpu->gpr: a translator that keeps
- * guest state in host registers must reconstruct cpu->gpr from the host
- * mcontext when a guest instruction faults, and if it reconstructs the wrong
- * values -- or silently skips the reconstruction -- every existing test still
- * passes. The corruption is only visible to code that actually READS the
- * registers at fault time, i.e. a signal handler. This test is that reader.
- *
- * So this exists BEFORE any register allocation does, and it must pass on the
- * unmodified build first: a gate that only starts passing after the change it
- * guards is not a gate, it is a rationalization.
- *
- * SHAPE. The faulting body is hand-written asm, not C, for two reasons. The
- * register assignment must be guaranteed rather than left to the compiler's
- * scheduler, and the block must be REUSE-HEAVY -- every register written and
- * re-read several times -- because that is precisely the shape a hot-subset
- * allocator will choose to pin. A fault in a block with no pinned registers
- * proves nothing about the reconstruction path.
- *
- * DETERMINISM. Only the 14 data registers, rflags, trapno and the fault
- * address are printed. rbp/rsp/rip are deliberately NOT printed: they are
- * addresses, they vary between the native run that generates the golden and
- * the emulated run that is checked against it, and a test whose golden is
- * machine-dependent is worse than no test. Every value printed here is a pure
- * function of the instruction stream.
- *
- * rflags is masked to the six architecturally-defined status flags
- * (CF PF AF ZF SF OF = 0x8d5). The final flag producer before the fault is the
- * `addq %rbx, %rcx` immediately preceding it -- the null-pointer materialization
- * is placed BEFORE that add on purpose, since `xorq %r11,%r11` would otherwise
- * be the last flag writer and the interesting flag state would be lost. `movq`
- * does not write flags, so the flags observed in the handler are exactly the
- * ones the add produced.
- *
- * Trampoline ABI and the ucontext/mcontext offsets are the same ones
- * signal_test.c documents and verifies against this host's _sigtramp.
- *
- * mcontext (__darwin_mcontext64) layout used below, offsets from mc:
- *    0 trapno(u16) 2 cpu(u16) 4 err(u32) 8 faultvaddr(u64)     <- exception state
- *   16 rax 24 rbx 32 rcx 40 rdx 48 rdi 56 rsi 64 rbp 72 rsp    <- thread state
- *   80 r8 88 r9 96 r10 104 r11 112 r12 120 r13 128 r14 136 r15
- *  144 rip 152 rflags
- * Note the x86_64 thread-state order is rax,rbx,rcx,rdx,RDI,RSI -- rdi comes
- * before rsi, which is not the encoding order and is easy to get backwards.
- */
+/* SIGSEGV mid-block with every data GPR live. */
 #include "gsys.h"
 
 #define SYS_sigaction 46
@@ -86,16 +32,6 @@ __asm__(
     "    syscall\n"
     "    ud2\n");
 
-/*
- * The faulting body. Thirteen registers get distinct constants, then two rounds
- * of a dependent add/xor/sub chain so each is written and re-read repeatedly --
- * a_r well above any sane pin threshold. rsp/rbp are never touched, so the
- * stack stays valid for the handler and for recover().
- *
- * Callee-saved registers are destroyed on purpose. Control never returns here:
- * the handler rewrites the saved rip so sigreturn lands in recover(), which
- * only writes a string and exits.
- */
 __asm__(
     ".text\n"
     ".globl _fault_body\n"
@@ -113,7 +49,7 @@ __asm__(
     "    movabsq $0x2222222222222222, %r13\n"
     "    movabsq $0x3333333333333333, %r14\n"
     "    movabsq $0x4444444444444444, %r15\n"
-    /* round 1 */
+
     "    addq %rbx, %rax\n"
     "    xorq %rax, %rcx\n"
     "    subq %rcx, %rdx\n"
@@ -126,7 +62,7 @@ __asm__(
     "    xorq %r12, %r13\n"
     "    subq %r13, %r14\n"
     "    addq %r14, %r15\n"
-    /* round 2: re-read everything written in round 1 */
+
     "    addq %r15, %rax\n"
     "    xorq %rax, %rbx\n"
     "    subq %rbx, %rdx\n"
@@ -138,11 +74,11 @@ __asm__(
     "    addq %r10, %r8\n"
     "    subq %r8, %r12\n"
     "    xorq %r12, %r14\n"
-    /* null pointer FIRST, so it is not the last flag writer */
+
     "    xorq %r11, %r11\n"
-    /* the flag state observed at the fault is exactly this add's */
+
     "    addq %rbx, %rcx\n"
-    /* FAULT: movq writes no flags, so nothing perturbs the state above */
+
     "    movq %rax, (%r11)\n"
     "    ud2\n");
 
@@ -155,7 +91,6 @@ static void recover(void)
     sys_exit(0);
 }
 
-/* g_puthex64 terminates its own line; do not add another. */
 static void p(const char *name, g_u64 v)
 {
     g_puts(name);
@@ -183,11 +118,9 @@ static void handler(int signo, void *siginfo, void *ucontext)
     p("r13 ", *(g_u64 *)(mc + 120));
     p("r14 ", *(g_u64 *)(mc + 128));
     p("r15 ", *(g_u64 *)(mc + 136));
-    /* CF PF AF ZF SF OF only: the rest of rflags carries bits whose value at a
-     * fault is not something this test should pretend to pin down. */
+
     p("rflags&8d5 ", *(g_u64 *)(mc + 152) & 0x8d5);
 
-    /* Resume in recover() rather than at the faulting store. */
     *(g_u64 *)(mc + 144) = (g_u64)(g_u64 *)&recover;
 }
 

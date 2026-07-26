@@ -1,22 +1,5 @@
 #!/usr/bin/env bash
-#
-# tests/run_bench_diff.sh
-#
-# The differential gate FOR THE BENCHMARK. tests/run_diff_test.sh deliberately
-# does not cover tests/guest/benchbin/bench (see tests/guest/Makefile: it would
-# add ~50s of interpreter time to every `make check`), but bench is precisely
-# the code the throughput work changes, so it needs its own interp-vs-jit check.
-#
-# Each workload is run under -no-jit and under the JIT and the outputs must be
-# byte-identical, exactly as run_diff_test.sh does for the correctness corpus.
-# This is the check that catches a missed flag materialization in the hot loops:
-# 'alu' and 'br' are dense flag producers and 'br' actually CONSUMES flags on a
-# data-dependent Jcc chain.
-#
-# Slow by construction (the interpreter runs the full workload: ~60s+ for alu).
-# Pass a workload list to narrow it, e.g.  bash tests/run_bench_diff.sh call mem
-#
-# Run from the repo root; exits non-zero on any divergence.
+# Interp-vs-JIT differential for the benchmark binary, which run_diff_test.sh skips for time.
 
 set -u
 cd "$(dirname "$0")/.."

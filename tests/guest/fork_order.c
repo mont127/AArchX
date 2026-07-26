@@ -1,10 +1,4 @@
-/*
- * Warm a memory-heavy loop while the static guest is still in the plain-memory
- * JIT tier, then fork. The syscall boundary must retire that generation before
- * the host fork admits a second process; both parent and child subsequently
- * execute freshly ordered translations. The child also verifies ordinary COW
- * behavior, and the parent checks its exact wait status.
- */
+/* Plain-to-ordered memory transition across fork. */
 #include "gsys.h"
 
 #define SYS_fork 2

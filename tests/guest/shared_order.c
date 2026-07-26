@@ -1,4 +1,4 @@
-/* End-to-end MAP_SHARED memory-mode transition after plain blocks are warm. */
+/* MAP_SHARED memory-mode transition after blocks are warm. */
 #include "gsys.h"
 
 #define SYS_fork 2

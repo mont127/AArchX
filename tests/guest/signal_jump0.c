@@ -1,20 +1,4 @@
-/*
- * tests/guest/signal_jump0.c
- *
- * Regression test for the JIT translate-under-lock fault path (the wineboot
- * rip=0 wall). Unlike signal_test, which faults on a null DATA store, this
- * program transfers control to address 0 — an instruction FETCH fault at rip=0.
- * Under the JIT that fault occurs inside the block translator while it holds the
- * translation lock; ocerz must unwind translation cleanly (releasing the lock)
- * and let the interpreter re-fault and deliver the guest SIGSEGV, rather than
- * orphaning the lock and deadlocking. The handler rewrites the saved instruction
- * pointer to a recovery routine and returns through __sigreturn, exactly like
- * signal_test; a clean exit 0 (no hang) proves the path works under both tiers.
- *
- * The trampoline mirrors the macOS x86_64 _sigtramp register contract (handler
- * in rdi, edx=signo, rcx=siginfo*, r8=ucontext*, r9=token); ucontext->uc_mcontext
- * sits at offset 48 and the saved rip within it at offset 144.
- */
+/* Regression test for the JIT translate-under-lock fault path. */
 #include "gsys.h"
 
 #define SYS_sigaction 46

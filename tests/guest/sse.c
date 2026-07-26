@@ -1,26 +1,4 @@
-/*
- * tests/guest/sse.c
- *
- * SSE/SSE2 scalar floating-point torture. With -nostdlib the codegen is
- * unchanged, so double and float arithmetic compiles to addsd/subsd/mulsd/
- * divsd, sqrtsd/sqrtss, cvt* conversions, and minsd/maxsd/comisd sequences —
- * exactly the SSE surface Ocerz must emulate bit-exactly. Because no float
- * printf exists in this freestanding world (and decimal formatting would be
- * nondeterministic across rounding anyway), EVERY value is reinterpreted to
- * its raw 64-bit (or zero-extended 32-bit) bit pattern and printed with
- * g_puthex64. Identical IEEE-754 operations on x86 and on the emulator must
- * produce identical bit patterns, which makes the golden a strict check.
- *
- * Coverage: running sum/product/quotient over a fixed double sequence; the
- * same in float; sqrt of several values via __builtin_sqrt/__builtin_sqrtf
- * (which clang lowers to inline sqrtsd/sqrtss, no libcall — verified by the
- * Makefile link succeeding with no undefined symbol); float<->int conversions
- * including truncation of negative values (cvttsd2si/cvttss2si) and signed
- * int->double; NaN detection via the self-inequality x!=x driving a branch;
- * and min/max patterns that clang compiles to minsd/maxsd. Each result is
- * emitted as bits, and a couple of special values (negative zero, infinity
- * from divide-by-zero, NaN from 0.0/0.0) are printed to pin down edge cases.
- */
+/* SSE and SSE2 scalar floating-point torture. */
 #include "gsys.h"
 
 static g_u64 dbits(double d)

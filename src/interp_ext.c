@@ -1,100 +1,4 @@
-/*
- * src/interp_ext.c
- *
- * The "extended" interpreter translation unit: every op that interp.c does
- * not handle directly and that is not an SSE op. ocerz_interp_ext() is the
- * entry point named in interp.h; for any op it does not own it returns
- * OCERZ_EUNSUP so interp.c can fall through to its own fatal diagnostic.
- * Every SSE op (>= OCERZ_OP_SSE_FIRST) is explicitly NOT ours and returns
- * OCERZ_EUNSUP — interp.c routes those to ocerz_interp_sse().
- *
- * The instruction has already had cpu->rip advanced by insn->len before we
- * are called (the RIP protocol in decode.h), so handlers see the
- * architectural next-rip; none of the ops here branch, so we never touch
- * cpu->rip.
- *
- * Op families implemented here:
- *
- *  - String ops MOVS/STOS/LODS/SCAS/CMPS. The full REP loop runs inside one
- *    call. Element width is insn->opsize and the direction comes from DF.
- *    The count register is RCX read/written as ecx when insn->addrsize==4,
- *    full 64-bit otherwise; RSI/RDI advance the same way. REP repeats
- *    unconditionally for MOVS/STOS/LODS; REPE/REPNE for SCAS/CMPS terminate
- *    on ZF mismatch with the rep kind. CMPS/SCAS compute flags via
- *    ocerz_flags_sub on the LAST executed iteration only (a no-iteration REP
- *    leaves flags untouched, which is architectural).
- *
- *  - Bit ops BT/BTS/BTR/BTC and bit scans. For a register destination the
- *    bit index is masked to the operand width. For a MEMORY destination with
- *    a REGISTER bit offset the FULL signed bit offset addresses memory beyond
- *    the operand: byte address = ea + (sext(bitoff) >> 3) (arithmetic shift),
- *    bit = bitoff & 7. An IMMEDIATE bit offset masks to the width and is then
- *    folded into byte addressing the same way (ea += bit >> 3, bit &= 7) so
- *    indices above 7 test the right byte of the operand — _Block_copy's
- *    BLOCK_IS_GLOBAL probe is `bt dword [blk+8], 0x1c`, and reading only the
- *    lowest byte made every global-block check fail, heap-copying libdispatch's
- *    sentinel destructor blocks and breaking their pointer-identity contract.
- *    CF receives the tested bit; BTS/BTR/BTC write back the modified
- *    addressed unit (one byte for the memory path, the operand width for the
- *    register path). Other flags are left unchanged, as the architecture
- *    specifies for these instructions.
- *
- *  - BSF/BSR with the AMD zero-source behavior: a zero source sets ZF=1 and
- *    leaves the destination UNCHANGED (real code relies on this); otherwise
- *    ZF=0 and the destination is the bit index. POPCNT clears CF/OF/AF/SF/PF
- *    and sets ZF from the popcount. TZCNT/LZCNT yield the operand width on a
- *    zero source, set CF = (source == 0) and ZF = (result == 0).
- *
- *  - The system/misc cluster: CPUID with a fixed feature surface, RDTSC/
- *    RDTSCP via mach_absolute_time() scaled to nanoseconds, XGETBV,
- *    LDMXCSR/STMXCSR, FXSAVE/FXRSTOR, EMMS and FWAIT.
- *  - SGDT/SIDT write a zero descriptor-table base and put the current guest
- *    thread's cpu_number in the limit field's low 12 bits. libdispatch's
- *    per-CPU continuation magazine reads (limit & 0xfff) via SIDT to pick a
- *    cache; a constant there would make every real host worker thread share one
- *    magazine and race, so each guest thread carries a distinct cpu_number.
- *
- *  - The whole x87 subset (OCERZ_OP_X87_FIRST..OCERZ_OP_SSE_FIRST) modeled in
- *    double precision over cpu->fpr[8] with ftop/fcw/fsw, per cpu.h.
- *
- * Deviations / simplifications, all deliberate:
- *
- *  - x87 is double precision, not 80-bit extended. FLD m80 decodes the real
- *    10-byte format into the nearest double (sign, 15-bit exponent biased by
- *    16383, explicit integer bit, 53-bit-rounded mantissa) and FSTP m80
- *    re-encodes a double into the 80-bit format, so an 80-bit value that fits
- *    in a double round-trips, but extended-only precision is lost.
- *
- *  - FXSAVE/FXRSTOR store fcw at +0, fsw at +2, an abridged ftw at +4, mxcsr
- *    at +24, and the eight ST registers as 16-byte slots from +32, each slot
- *    holding the raw IEEE-754 double bits of fpr[] in its low 8 bytes with
- *    the upper 8 bytes zeroed. This is NOT the architectural 80-bit slot
- *    layout; it is a self-consistent double-backed approximation that
- *    round-trips through our own FXRSTOR, matching the model in cpu.h.
- *
- *  - The tag word is maintained lazily exactly as cpu.h prescribes: ftw is
- *    set to 0xff after any push and to 0 by FNINIT/FNCLEX-of-empty; per
- *    register tags are not modeled beyond that.
- *
- *  - FIST/FISTP and FRNDINT round per the fcw RC field (bits 10..11) using a
- *    local fesetround()/rint()/restore so the process rounding mode is never
- *    left changed.
- *
- *  - mach_timebase_info is queried once and cached; RDTSC returns nanoseconds
- *    rather than a real cycle counter, which is monotonic and good enough for
- *    the timing the guest observes.
- *
- *  - x87 register-form arithmetic carries exactly one ST operand in ops[0],
- *    which the decode contract cannot use to distinguish the D8-map form
- *    FADD ST(0), ST(i) (destination ST(0)) from the DC-map form
- *    FADD ST(i), ST(0) (destination ST(i)). We resolve the ambiguity to the
- *    D8 form for the non-pop opcodes (destination ST(0), the form compilers
- *    overwhelmingly emit) and to the architectural FxxxP form for the pop
- *    opcodes (destination ST(i), source ST(0), pop after). A bare pop form
- *    with no operand is FxxxP ST(1), ST(0). Memory/integer forms always have
- *    destination ST(0). The reverse opcodes (FSUBR/FDIVR and their P/I
- *    variants) compute source-minus-destination, matching x86.
- */
+/* Interpreter ops that are neither core integer nor SSE. */
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/vm.h"
@@ -422,9 +326,7 @@ static int ext_fxsave(OcerzCPU *cpu, const X86Insn *insn)
     ocerz_st(ea + 2, 2, cpu->fsw);
     ocerz_st(ea + 4, 1, cpu->ftw);
     ocerz_st(ea + 24, 4, cpu->mxcsr);
-    /* MXCSR_MASK. Wine copies the first 32 bytes of this image straight into
-     * CONTEXT.FltSave and reads MxCsr_Mask back out of it, so leaving it as whatever
-     * happened to be on the stack hands the guest a garbage mask. */
+
     ocerz_st(ea + 28, 4, 0x0000ffffu);
     for (int i = 0; i < 8; i++) {
         uint64_t bits;
@@ -432,14 +334,7 @@ static int ext_fxsave(OcerzCPU *cpu, const X86Insn *insn)
         ocerz_st(ea + 32 + i * 16 + 0, 8, bits);
         ocerz_st(ea + 32 + i * 16 + 8, 8, 0);
     }
-    /* XMM0-15 at +0xa0, 16 bytes apiece. These were NEVER written, and the omission is
-     * not academic: Wine's __wine_syscall_dispatcher does not rely on the CPU preserving
-     * registers across a syscall -- it FXSAVEs and then reloads the Win64 non-volatile
-     * xmm6-xmm15 with movaps straight out of THIS image. With the area untouched, every
-     * PE Nt* syscall restored whatever was on the stack (usually zero) into xmm6-15.
-     * ntdll keeps acl->actctx in xmm6 across such a call, so it came back NULL and
-     * wineboot died dereferencing it. ocerz preserving xmm across its own syscall path
-     * (it does, and that was verified) is irrelevant here -- the guest never asked it to. */
+
     for (int i = 0; i < 16; i++)
         ocerz_st128(ea + 160 + (uint64_t)i * 16, cpu->xmm[i]);
     return OCERZ_STEP_OK;
@@ -456,7 +351,7 @@ static int ext_fxrstor(OcerzCPU *cpu, const X86Insn *insn)
         uint64_t bits = ocerz_ld(ea + 32 + i * 16 + 0, 8);
         memcpy(&cpu->fpr[i], &bits, 8);
     }
-    for (int i = 0; i < 16; i++)              /* mirror of the XMM save above */
+    for (int i = 0; i < 16; i++)
         cpu->xmm[i] = ocerz_ld128(ea + 160 + (uint64_t)i * 16);
     return OCERZ_STEP_OK;
 }

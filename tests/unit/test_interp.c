@@ -1,32 +1,4 @@
-/*
- * tests/unit/test_interp.c
- *
- * Standalone unit test for the core interpreter (src/interp.c). It exercises
- * the integer/general-purpose half of the ISA the way real guest code does:
- * it reserves a guest arena with ocerz_mem_init(), maps one scratch code page
- * and one scratch data page inside it with ocerz_map_fixed(), hand-assembles
- * short x86_64 machine-code sequences into the code page, points a zeroed
- * OcerzCPU (inside a zeroed OcerzVM from ocerz_vm_init, jit disabled) at them,
- * single-steps with ocerz_interp_step(), and asserts the resulting registers,
- * individual flag bits and memory against values cross-checked on real x86_64
- * hardware (via Rosetta-built oracles during development).
- *
- * Each case writes its own bytes at CODE_BASE, resets the relevant registers
- * and flags, sets cpu.rip = CODE_BASE, steps once (asserting STEP_OK), then
- * checks outcomes. Helpers EXPECT_U64/EXPECT_FLAG print the failing case name,
- * expected and actual values and return nonzero from main on the first
- * failure, so a regression names exactly what broke. Instruction encodings
- * are written by hand and annotated in the assembling helpers; the file holds
- * well over sixty assertions spanning 32-bit zero-extension, high-byte access,
- * ADC/SBB chains, INC preserving CF, shift counts of 0/1/large, SAR sign,
- * MUL/IMUL/DIV including the 8-bit and __int128 forms, CMOVcc still zero-
- * extending on a false condition, PUSH/POP, CALL/RET, Jcc taken and not taken,
- * XADD, CMPXCHG both outcomes, LOOP, SHLD/SHRD and the full rotate family.
- *
- * The harness links against the whole emulator object set (minus main) so the
- * real decoder and flag helpers are under test alongside the interpreter; it
- * is the differential reference that the JIT tier must later match.
- */
+/* Unit tests for the core interpreter. */
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/interp.h"
@@ -722,19 +694,11 @@ int main(void)
     EXPECT_FLAG("test.zf", 0, ZF(&g_vm.cpu));
     EXPECT_FLAG("test.cf", 0, CF(&g_vm.cpu));
 
-    /* WoW64 mode-switch instructions, EXECUTED -- not merely decoded. This block exists
-     * because decoding is not enough: the four new ops were briefly wired only inside
-     * op_branch and never added to the top-level dispatch, so each fell through to the SSE
-     * fallback and reported "no handler". test_decode passed the whole time, because it
-     * decodes without executing. Stepping the interpreter is the only thing that proves the
-     * dispatch actually reaches the implementation. Selector 0x33 is a GDT selector (bit 2
-     * clear), i.e. not a 32-bit LDT segment, so every case below must behave as plain
-     * 64-bit control flow and must NOT set mode32. */
     reset_cpu();
     ocerz_st(DATA_BASE, 4, 0x12340000ull);
     ocerz_st(DATA_BASE + 4, 2, 0x33);
     g_vm.cpu.gpr[OCERZ_RAX] = DATA_BASE;
-    EMIT(0xff, 0x28);                                   /* jmp far ptr [rax] */
+    EMIT(0xff, 0x28);
     rc = step_at(CODE_BASE);
     EXPECT_U64("jmpf.rc", OCERZ_STEP_OK, rc);
     EXPECT_U64("jmpf.rip", 0x12340000ull, g_vm.cpu.rip);
@@ -745,7 +709,7 @@ int main(void)
     ocerz_st(DATA_BASE + 4, 2, 0x33);
     g_vm.cpu.gpr[OCERZ_RAX] = DATA_BASE;
     g_vm.cpu.gpr[OCERZ_RSP] = DATA_BASE + 0x1000;
-    EMIT(0xff, 0x18);                                   /* call far ptr [rax] */
+    EMIT(0xff, 0x18);
     rc = step_at(CODE_BASE);
     EXPECT_U64("callf.rc", OCERZ_STEP_OK, rc);
     EXPECT_U64("callf.rip", 0x5000ull, g_vm.cpu.rip);
@@ -753,33 +717,30 @@ int main(void)
 
     reset_cpu();
     g_vm.cpu.gpr[OCERZ_RSP] = DATA_BASE + 0x2000;
-    ocerz_st(DATA_BASE + 0x2000, 8, 0x9abc0000ull);     /* offset   */
-    ocerz_st(DATA_BASE + 0x2008, 8, 0x33);              /* selector */
-    EMIT(0xcb);                                         /* retf */
+    ocerz_st(DATA_BASE + 0x2000, 8, 0x9abc0000ull);
+    ocerz_st(DATA_BASE + 0x2008, 8, 0x33);
+    EMIT(0xcb);
     rc = step_at(CODE_BASE);
     EXPECT_U64("retf.rc", OCERZ_STEP_OK, rc);
     EXPECT_U64("retf.rip", 0x9abc0000ull, g_vm.cpu.rip);
 
-    /* IRETQ now consumes the CS slot between RIP and RFLAGS. A 64-bit CS must be a no-op --
-     * Wine's __wine_syscall_dispatcher epilogue depends on exactly that. */
     reset_cpu();
     g_vm.cpu.gpr[OCERZ_RSP] = DATA_BASE + 0x3000;
-    ocerz_st(DATA_BASE + 0x3000, 8, 0x777000ull);       /* RIP   */
-    ocerz_st(DATA_BASE + 0x3008, 8, 0x33);              /* CS    */
-    ocerz_st(DATA_BASE + 0x3010, 8, 0x202);             /* FLAGS */
-    ocerz_st(DATA_BASE + 0x3018, 8, DATA_BASE + 0x4000);/* RSP   */
-    EMIT(0x48, 0xcf);                                   /* iretq */
+    ocerz_st(DATA_BASE + 0x3000, 8, 0x777000ull);
+    ocerz_st(DATA_BASE + 0x3008, 8, 0x33);
+    ocerz_st(DATA_BASE + 0x3010, 8, 0x202);
+    ocerz_st(DATA_BASE + 0x3018, 8, DATA_BASE + 0x4000);
+    EMIT(0x48, 0xcf);
     rc = step_at(CODE_BASE);
     EXPECT_U64("iretq.rc", OCERZ_STEP_OK, rc);
     EXPECT_U64("iretq.rip", 0x777000ull, g_vm.cpu.rip);
     EXPECT_U64("iretq.rsp", DATA_BASE + 0x4000, g_vm.cpu.gpr[OCERZ_RSP]);
     EXPECT_U64("iretq.mode32", 0, g_vm.cpu.mode32);
 
-    /* MOV Sreg with a GDT selector stays the no-op it has always been. */
     reset_cpu();
     g_vm.cpu.fs_base = 0xfeed0000ull;
     g_vm.cpu.gpr[OCERZ_RAX] = 0x33;
-    EMIT(0x8e, 0xe0);                                   /* mov fs, eax */
+    EMIT(0x8e, 0xe0);
     rc = step_at(CODE_BASE);
     EXPECT_U64("movseg.rc", OCERZ_STEP_OK, rc);
     EXPECT_U64("movseg.fs_base_unchanged", 0xfeed0000ull, g_vm.cpu.fs_base);

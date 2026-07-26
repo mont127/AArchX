@@ -1,19 +1,4 @@
-# Makefile
-#
-# Build system for Ocerz, the x86_64 -> arm64 dynamic binary translator.
-#
-# Targets:
-#   ocerz (default)  the emulator binary, built native arm64 with clang
-#   unit             builds and runs every C unit test in tests/unit/
-#                    (each .c links against all emulator objects minus main)
-#   guest            cross-compiles the x86_64 guest test programs in
-#                    tests/guest/ (they need no Rosetta to build OR run)
-#   check            ocerz + unit + guest, then the end-to-end runner that
-#                    executes each guest binary under ./ocerz and compares
-#                    output and exit codes against golden expectations
-#   clean            removes everything generated
-#
-# Dependency tracking uses clang -MMD so header edits rebuild correctly.
+# Build ocerz, the guest tests and the unit tests. `make check` runs the lot.
 
 CC := clang
 ARCHFLAGS := -arch arm64

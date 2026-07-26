@@ -1,20 +1,4 @@
-/*
- * tests/guest/memstress.c
- *
- * Large-working-set memory test: anonymously mmap 64MB, then touch it in 4KB
- * strides, writing a position-derived 64-bit index word at the start of each
- * 4KB page. This forces a wide span of distinct guest pages to be faulted in
- * and written, exercising Ocerz's arena mapping, the 16KB-vs-4KB page-rounding
- * behavior, and (under the JIT) a long-running store loop. After filling, a
- * sample of pages is read back and verified, and a single fold-in checksum of
- * the written words is printed as one decimal line, deterministic because the
- * pattern is purely a function of the page index. On any verification failure
- * it prints "memstress fail" and returns non-zero; otherwise it munmaps and
- * prints the checksum line.
- *
- * 64MB is comfortably inside Ocerz's default arena and small enough to map
- * and fill quickly under both native Rosetta and the interpreter tier.
- */
+/* Large working set: mmap 64MB and touch it in 4KB strides. */
 #include "gsys.h"
 
 #define TOTAL (64UL * 1024UL * 1024UL)

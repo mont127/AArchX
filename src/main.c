@@ -1,31 +1,4 @@
-/*
- * src/main.c
- *
- * Command-line entry point: ocerz [-v] [-trace] [-strace] [-no-jit] [--]
- * program [args...]
- *
- * Boot order matters and is fixed here: reserve the guest arena first
- * (before anything else can fragment the address space), then load the
- * x86_64 image into it, then build the exec-style guest stack with the
- * guest's argv (everything after the program path on Ocerz's own command
- * line) and the host environment passed through verbatim, then point the
- * virtual CPU at the entry point and hand control to the run loop. The
- * emulator's exit status is the guest's exit status, so Ocerz composes
- * with shell scripts and test harnesses exactly like the real program
- * would.
- *
- * Dynamic (LC_MAIN) executables are detected and rejected with a pointed
- * message naming the dyld-emulation phase that will lift the restriction;
- * static LC_UNIXTHREAD binaries run today.
- *
- * Options: -v bumps verbosity (repeatable; at -v -v every instruction is
- * traced), -trace forces instruction tracing, -strace logs guest syscalls,
- * -no-jit pins execution to the interpreter tier. -path FILE overrides the
- * file loaded as the executable while the trailing `program` token is still
- * used as guest argv[0]; this decouples the two the way a real execve(path,
- * argv, envp) does (argv[0] may differ from path), and is how sys_execve
- * re-enters ocerz onto a guest target that asked for a custom argv[0].
- */
+/* Command-line parsing and the entry point. */
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/dyld.h"
@@ -91,11 +64,7 @@ int main(int argc, char **argv)
     if (dynamic)
         return ocerz_dyld_run(&vm, load_path, argc - i, argv + i, environ);
 
-    /* LC_UNIXTHREAD guests start with one virtual CPU and no shared mappings.
-     * The JIT may use its single-CPU memory tier until a syscall explicitly
-     * requests concurrency or shared memory, at which point it retires those
-     * translations before admitting the new observer. */
-    vm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;   /* A/B: force TSO-ordered from the start */
+    vm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;
 
     if (ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK)
         return 70;

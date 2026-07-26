@@ -1,40 +1,4 @@
-/*
- * tests/unit/test_decode.c
- *
- * Self-contained unit test for the x86_64 decoder in src/decode.c. It drives
- * ocerz_decode() over a large static table of hand-encoded instructions whose
- * exact byte sequences were cross-checked against the LLVM assembler/objdump,
- * and asserts the decoded length, op, operand count, and a handful of
- * load-bearing operand fields per case.
- *
- * The table deliberately exercises the corners that are easy to get wrong:
- * the REX-dropped-by-a-later-legacy-prefix rule, AH versus SPL for 8-bit
- * encodings 4..7, RIP-relative resolution into an absolute disp, the SIB
- * base=101/mod=00 bare-disp32 form and the no-index SIB, the F2/F3-beats-66
- * mandatory-prefix precedence, MOVD versus MOVQX by REX.W, the multi-byte NOP
- * and ENDBR64 collapse to NOP, movzx into a 64-bit register, and a spread of
- * one-byte, 0F, 0F38, 0F3A and x87 opcodes so every coverage family has at
- * least one row. A few rows assert error returns (EUNDEF, ETRUNC, ETOOLONG).
- *
- * Each case carries an optional set of expectation fields; only the fields a
- * row sets are compared, using a small bitmask of CHK_* flags, so a row can
- * assert exactly what matters for the family it covers without over-fitting.
- * main() runs every row, prints any mismatch with the raw bytes and the
- * decoded-versus-expected values, and returns non-zero if any row failed.
- *
- * It links only against src/decode.c (pulled in by the unit harness) and the
- * standard C library; it needs no CPU, memory, or VM state because the decoder
- * is pure.
- *
- * One contract note: X86Insn.op is declared uint8_t in decode.h, but the
- * OcerzOp enum has 361 entries, so every op id at or above 256 (most of the
- * SSE/SSE2/SSE4 space) is stored truncated mod 256 in the struct. The decoder
- * writes the architectural enum value and the header field truncates it; the
- * op comparison here therefore checks insn.op against (uint8_t)expected so it
- * matches what actually lands in the struct. This is flagged as a gap for the
- * header owner to widen the field; until then high-numbered ops alias their
- * low-8-bit twins and cannot be told apart through this field.
- */
+/* Unit tests for the x86_64 decoder. */
 #include "ocerz/decode.h"
 #include "ocerz/cpu.h"
 
@@ -229,10 +193,7 @@ static const Case cases[] = {
       .chk = CHK_RET | CHK_OP | CHK_NOPS, .ret = OCERZ_OK, .op = OCERZ_OP_RET, .nops = 0 },
     { .name = "ret imm16", .bytes = B(0xc2, 0x08, 0x00), .nbytes = 3, .avail = 8,
       .chk = CHK_RET | CHK_OP | CHK_NOPS | CHK_O0_IMM, .ret = OCERZ_OK, .op = OCERZ_OP_RET, .nops = 1, .o0_imm = 8 },
-    /* WoW64 mode-switch encodings. These are the ENTIRE 64->32 transition in
-     * wow64cpu.dll, and every one of them decoded as OCERZ_EUNDEF before. Lengths are
-     * cross-checked against capstone; a wrong length desyncs the whole instruction stream,
-     * so CHK_LEN is the load-bearing assertion here. */
+
     { .name = "far jmp [r14] (41 ff 2e, the wow64cpu 64->32 edge)",
       .bytes = B(0x41, 0xff, 0x2e), .nbytes = 3, .avail = 8,
       .chk = CHK_RET | CHK_OP | CHK_LEN | CHK_NOPS | CHK_O0_KIND,
@@ -247,9 +208,7 @@ static const Case cases[] = {
     { .name = "far jmp register form is invalid (ff /5 mod=11)",
       .bytes = B(0xff, 0xee), .nbytes = 2, .avail = 8,
       .chk = CHK_RET, .ret = OCERZ_EUNDEF },
-    /* MOV Sreg, r/m16 -- inert in 64-bit but no longer discarded; ops[1] carries the
-     * destination segment (0=ES 1=CS 2=SS 3=DS 4=FS 5=GS). The third case is the exact
-     * instruction WoW64 uses to install the 32-bit TEB. */
+
     { .name = "mov ds,eax (8e d8)", .bytes = B(0x8e, 0xd8), .nbytes = 2, .avail = 8,
       .chk = CHK_RET | CHK_OP | CHK_LEN | CHK_NOPS | CHK_O1_IMM,
       .ret = OCERZ_OK, .len = 2, .op = OCERZ_OP_MOVSEG, .nops = 2, .o1_imm = 3 },

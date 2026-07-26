@@ -1,212 +1,4 @@
-/*
-#include <stdio.h>
- * src/dyld.c
- *
- * Ocerz's mini-dyld implementation (dyld.h): load, link and launch a
- * dynamically-linked x86_64 LC_MAIN executable against the shared cache,
- * doing the work Apple's dyld would, so no real dyld runs.
- *
- * Flow of ocerz_dyld_run:
- *  1. Identity memory mode (guest_base = 0) with a reserved low arena for the
- *     executable, stack and heap; the shared cache is mapped separately at its
- *     own absolute addresses by ocerz_cache_map.
- *  2. Read the executable, require MH_PIE, and choose a slide so its lowest
- *     real segment (the fileoff==0 __TEXT) lands at LOAD_BASE. Map every
- *     LC_SEGMENT_64 (skipping __PAGEZERO) at vmaddr+slide, pread its file
- *     bytes, and apply its protections (guest exec dropped to read).
- *  3. Apply fixups. Modern binaries carry LC_DYLD_CHAINED_FIXUPS: the fixups
- *     metadata (header, starts, imports, symbol strings) is read straight from
- *     the file image and the chains themselves are walked in the now-mapped
- *     segments. For the DYLD_CHAINED_PTR_64 / _64_OFFSET formats each chain slot
- *     is either a rebase (an internal pointer: load_base + target for _OFFSET,
- *     or vmaddr + slide for the plain _64 form, OR'd with any high8 byte) or a
- *     bind (an import: the 24-bit ordinal selects an entry in the imports table
- *     whose symbol name is resolved with ocerz_cache_resolve and stored with its
- *     addend). The 12-bit next field strides the chain by 4 bytes.
- *
- *     Classic binaries (the BSD coreutils — /bin/ls, /bin/cp, /usr/bin/du, ...)
- *     instead carry LC_DYLD_INFO[_ONLY] opcode streams and __la_symbol_ptr lazy
- *     stubs, NO chained fixups. apply_classic_fixups interprets those streams
- *     exactly as dyld would: classic_rebase walks the REBASE opcodes and adds
- *     the slide to every internal pointer (SET_SEGMENT_AND_OFFSET resolves a
- *     segment index to seg_vmaddr[index]+slide); classic_bind_stream walks the
- *     BIND opcodes (SET_DYLIB_ORDINAL / SET_SYMBOL_TRAILING_FLAGS giving the
- *     name and weak bit / SET_ADDEND_SLEB / SET_SEGMENT_AND_OFFSET / ADD_ADDR /
- *     DO_BIND[_ADD_ADDR/_IMM_SCALED/_ULEB_TIMES_SKIPPING]) resolving each symbol
- *     through ocerz_cache_resolve and storing value+addend. The lazy_bind stream
- *     is bound EAGERLY at load (faithful: lazy binding is deferred eager binding,
- *     and dyld itself binds eagerly under bind-at-launch). Eagerly binding the
- *     lazy stream overwrites each __la_symbol_ptr slot — which on disk holds a
- *     preferred-base (unslid) pointer into __stub_helper — with the real symbol
- *     address, so the first `jmp *la_symbol_ptr[n]` lands on the resolved target
- *     instead of an unmapped unslid address, and no dyld_stub_binder dance is
- *     needed. Without this the BSD coreutils SIGSEGV on their first lazy call.
- *  4. Build the entry frame: a guest stack with argc/argv/envp/apple and the
- *     C string data, plus a tiny raw-_exit trampoline used as main's return
- *     address on the freestanding path.
- *  5. Bring up libSystem and run the program the way dyld's start does. When
- *     the executable links a dylib (any LC_LOAD_DYLIB, the normal case) Ocerz
- *     runs libSystem.B.dylib's single __init_offsets orchestrator first — this
- *     boots libpthread (main-thread TSD at gs_base, the kernel commpage),
- *     libmalloc, libc, and libobjc, the last of which drives the objc<->dyld
- *     map_images handshake through the dyld-API shim (see dyldapi.c). Then,
- *     under OCERZ_INITPHASE, Ocerz runs the +load phase and the image
- *     initializers in dependency order, the way dyld4 does. Which images get
- *     their +load/initializers run is the "eager set". dyld runs them for the
- *     whole dependency closure; Ocerz computes a sound approximation: it seeds
- *     the set with the main executable's DIRECT LC_LOAD_DYLIB dependencies
- *     (every dylib dyld is guaranteed to bring up — these always have their
- *     initializers run) plus the libSystem/usr-lib-system roots, then expands
- *     by following data pointers (scan_uses) to the transitive dependencies the
- *     program actually references. Seeding the direct deps is what fixes a
- *     binary that reaches Foundation only indirectly — e.g. a pure-Swift main
- *     whose bridge to Foundation runs through libswiftCore and has no
- *     __objc_classrefs of its own: Foundation is still a direct LC_LOAD_DYLIB,
- *     so its initializer now runs and caches NSString's concrete class, and
- *     +[NSString allocWithZone:] hands back a real __NSPlaceholderString instead
- *     of class_createInstance'ing a bare abstract NSString. Then it calls
- *     main(argc,argv,envp,apple) and, on a normal return, libc exit(rv) so
- *     atexit handlers run and stdio is flushed (a bare _exit would lose buffered
- *     printf output). A freestanding executable with no dylibs skips init and
- *     uses the raw _exit trampoline. OCERZ_INIT forces init on, OCERZ_NOINIT
- *     forces it off.
- *
- * libc/Objective-C executables run: imports resolve through ocerz_cache_resolve
- * (which now follows re-export terminals, e.g. _memset -> libsystem_platform
- * __platform_memset, see cache.c), the dependency closure of objc images is
- * mapped (see dyldapi.c), the cache images' +load/initializers run in
- * dependency order (step 5), and exit() flushes stdio. Foundation/Swift apps
- * (e.g. NSString bridging through libswiftCore) run end-to-end.
- *
- * Thread-local variables (TLV). C/C++ thread_local / __thread storage works the
- * way real dyld makes it work, which Ocerz must drive itself because it is the
- * mini-dyld. A `thread_local X` access compiles to `lea rdi,[desc]; call *[desc]`
- * where desc is a 24-byte tlv_descriptor in the image's __thread_vars
- * (S_THREAD_LOCAL_VARIABLES, type 0x13). On disk that descriptor is
- * {thunk, key, offset}: the thunk is a chained/classic BIND to the libdyld
- * placeholder import __tlv_bootstrap, which is a 5-byte `jmp <fatal>` to dyld's
- * "thread locals not initialized" -> abort path. Real dyld never leaves it that
- * way: at image load it (a) calls pthread_key_create once per image to get a TSD
- * key, (b) writes that key into every descriptor, and (c) overwrites every
- * descriptor's thunk to the REAL worker tlv_get_addr, which is the body right
- * after the placeholder jmp (__tlv_bootstrap + 8). The worker's fast path is
- * `key=u32[desc+8]; base=gs:[key*8]; if base!=0 return base + u32[desc+0xc]`;
- * its slow path (base==0, the thread's first access) allocates a per-thread
- * block sized to the image's TLV template, memmoves the __thread_data initial
- * bytes (or calloc-zeroes a pure __thread_bss), pthread_setspecific(key, block),
- * and returns block + offset. The worker reads dyld's INTERNAL descriptor layout
- * — NOT the on-disk one — a repacked 24 bytes:
- *   {thunk@0(8), key@8(u32), offset@0xc(u32), template_self_rel@0x10(s32),
- *    block_size@0x14(u32)},
- * where template_self_rel reconstructs the template address as
- * (desc+0x10)+(s32)[desc+0x10]. ocerz_tlv_register_image performs dyld's job for
- * every loaded image that has a __thread_vars section: it locates the thread
- * template region (__thread_data 0x11 + __thread_bss 0x12), creates one real
- * guest pthread key by calling _pthread_key_create through ocerz_vm_call, then
- * rewrites each descriptor in place into the internal layout — thunk =
- * cache(__tlv_bootstrap)+8, the image's key, the descriptor's own (original)
- * offset, the self-relative pointer to the runtime (already-rebased) template,
- * and the block size. After that the first `call *[desc]` on a thread runs the
- * real worker: it sees gs:[key*8]==0 (a fresh TSD slot in THIS host thread's
- * gs_base), takes the guest slow path that mallocs+memmoves+setspecifics the
- * block, and returns the address of this thread's own copy; later accesses on
- * the same thread hit the fast path. Because every guest thread is a real host
- * pthread with its own gs_base TSD (syscall.c bsdthread_create), a second guest
- * thread's gs:[key*8] is independently 0 and it allocates its OWN block — true
- * per-thread storage with no extra work. Registration runs after the libSystem
- * initializer (so libpthread/pthread_key_create are up) and before the C++
- * static-init phase, for the main exe, every dependency with TLVs, and dlopen'd
- * images at their fixup time. The key dtor is left 0 (the per-thread block leaks
- * at thread exit — process-lifetime data, sound for correctness; real dyld
- * passes tlv_free, an upgrade for later).
- *
- * Non-cache disk dylibs. Some executables link a dylib that is a real file on
- * disk rather than a member of the shared cache — e.g. /usr/bin/perl links
- * .../CORE/libperl.dylib by absolute path. DynImage is therefore the element
- * of a small global registry (g_dimgs), the main exe being a transient entry-0
- * and every disk dylib a registered entry. Before the main exe's fixups,
- * load_disk_deps walks its LC_LOAD_DYLIB list and, for each install name NOT
- * resolvable in the cache, load_disk_dylib opens the file, selects the x86_64
- * slice, maps its segments into an ocerz_map_anywhere region (map_segments with
- * is_main=0 chooses load_base from that region; the main exe keeps its byte-
- * identical ocerz_arena_lo path), recurses into THAT image's own non-cache deps
- * deps-first, then applies its fixups. Both fixup engines resolve imports
- * through resolve_import: a positive two-level library ordinal maps to the
- * loader image's Nth LC_LOAD_DYLIB install name and, when that names a loaded
- * disk image, resolves in its export trie first; otherwise the existing cache
- * resolve runs, with a flat sweep of the disk images as a final fallback (so a
- * binary whose every dep is a cache path takes the unchanged cache path — zero
- * regression). Each disk image's mach_header is registered in the dyld-API
- * closure (ocerz_dyldapi_register_image) so image lists / unwind / objc see it
- * and its path, and the init/load phases descend into it via dep_mh (cache OR
- * disk) so its initializers run deps-first; it joins the eager set as a direct
- * dep. The image's file buffer (owned_buf) is kept alive for the whole run
- * because its export trie is read at resolve time. The slide-from-segment
- * helpers (image_slide_d here, image_slide/find_section_sz in dyldapi.c) key
- * off the first fileoff==0 segment with non-zero filesize, which is the header-
- * bearing __TEXT for BOTH a cache image, the main exe (skipping __PAGEZERO) and
- * a disk dylib whose __TEXT sits at vmaddr 0.
- *
- * @rpath/@loader_path/@executable_path expansion. Homebrew binaries and
- * relocatable bundles reference their dylibs by a relocatable install name
- * rather than an absolute path. expand_install_name reproduces dyld's @path
- * semantics: @executable_path/STEM resolves against dirname(main exe host path)
- * (g_main_hostpath); @loader_path/STEM against dirname of the REFERENCING image's
- * on-disk path (DynImage.path; the main exe's host path for its own direct deps);
- * @rpath/STEM iterates the accumulated rpath search list and takes the first
- * candidate that access(F_OK)'s. Non-@ names pass through verbatim, so the entire
- * existing absolute-path suite is byte-identical. The rpath search list is the
- * ordered concatenation of the LC_RPATH entries of the main executable and of
- * every dylib on the load chain that reached this image, inherited down the load
- * graph (RpathList threaded through load_disk_deps -> load_disk_dylib): at each
- * load collect_rpaths appends THIS image's own LC_RPATH (each entry itself
- * @loader_path/@executable_path-expanded relative to that image; an absolute
- * rpath entry passes through) after the inherited list. So cwebp's main-exe rpath
- * "@loader_path/../lib" (=> /usr/local/lib) resolves @rpath/libwebp.7.dylib, and
- * when libwebp later pulls @rpath/libsharpyuv.0.dylib the inherited list still
- * carries that entry so the leaf is found. Dedup keys on the RESOLVED on-disk
- * path so a lib reached via two install names loads once. dyld's two-level
- * namespace binding records the TARGET IMAGE, not a path string: DynImage stores
- * both the resolved path and the requesting install_name, and the ordinal->image
- * lookup (resolve_import) and the init/load-phase descent (dep_mh) match the
- * Nth-dependency install name (e.g. "@rpath/libwebp.7.dylib") against
- * install_name first, falling back to path — so an @rpath dep registered under
- * its resolved path still binds and runs its initializers deps-first.
- *
- * Runtime dlopen/dlsym. After main starts, a program (perl's XSLoader) calls
- * dlopen()/dlsym() to bring up MH_BUNDLE plug-ins — perl's XS .bundle modules.
- * Those land in the dyld-API shim's vtable slots (dyldapi.c +0x68 dlopen, +0x80
- * dlsym, +0x70 dlclose, +0x78 dlerror), which marshal the System V args and
- * call the loader seam exported here: ocerz_dlopen / ocerz_dlsym / ocerz_dlclose
- * / ocerz_dlerror. ocerz_dlopen dedups the path against the cache and g_dimgs;
- * if the verbatim path misses, canon_dylib_path canonicalizes it the way dyld
- * does before a second lookup: it readlink-chases leaf symlinks and realpaths the
- * parent dir, tolerating a leaf that has no on-disk file. This is what lets a
- * runtime dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
- * (a symlink to Versions/A/CoreGraphics, which exists only inside the shared cache
- * with no disk Mach-O) resolve to the cache image instead of "image not found" --
- * AppKit's BoardServices scene init dlopens CoreGraphics by that symlink path and
- * raises (then unwinds) an NSException when it comes back NULL.
- * An unloaded disk path is brought up by dlopen_load_image, the non-fatal twin
- * of load_disk_dylib (read_file -> select_slice(x86_64) -> map_segments(is_main=
- * 0) -> load_disk_deps -> apply_fixups||apply_classic_fixups -> ocerz_dyldapi_
- * register_image), then its initializers (and any newly-loaded deps', deps-
- * first) run INLINE on the live guest via run_init_phase — the guest is mid-
- * execution, NOT in the pre-main init phase, so ocerz_dlopen runs the inits on
- * their own scratch stack (a fresh ocerz_map_anywhere region) so perl's live
- * frames are untouched, and the dispatch handler in dyldapi.c snapshots and
- * restores the full guest CPU around the call. Failures are non-fatal: a
- * missing/bad bundle records a dlerror string and returns a NULL handle, exactly
- * as real dlopen does, so the guest (XSLoader) reports its own error instead of
- * Ocerz dying. The handle IS the image's mach_header guest address (load_base);
- * a re-dlopen of a loaded path returns the same handle. ocerz_dlsym prepends '_'
- * to the caller's symbol (dlsym strips the underscore the Mach-O name carries),
- * searches the handle image's export trie (ocerz_image_self_resolve) then its
- * LC_SYMTAB nlist table (N_SECT|N_EXT defined symbols), and honors the special
- * RTLD_DEFAULT/RTLD_SELF/RTLD_MAIN_ONLY/RTLD_NEXT handles with a flat search of
- * every disk image plus the cache. perl's boot_<Module> XS entry is found in the
- * bundle's export trie, so `use Fcntl` and shasum's Digest::SHA load run.
- */
+/* Mini-dyld: loads, links and launches a dynamic x86_64 executable against the shared cache. */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
@@ -588,8 +380,7 @@ static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int 
             if (flags & 0x08)
                 return 0;
             *found = 1;
-            /* KIND_ABSOLUTE (flags&3 == 2): the trie value is literal and is never slid
-             * by load_base (libobjc's __objc_empty_vtable is absolute 0). */
+
             if ((flags & 0x03) == 0x02)
                 return self_uleb(&tp, end);
             return img->load_base + self_uleb(&tp, end);
@@ -663,12 +454,7 @@ static uint64_t disk_flat_resolve(const char *name)
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
                                int libord, int weak)
 {
-    /* Track FOUND separately from the value. An ABSOLUTE export legitimately resolves to
-     * 0 -- libobjc exports __objc_empty_vtable that way, and every pre-ObjC2.1 class
-     * structure binds it into class+0x18. Keying "keep searching"/"unresolved" off
-     * value==0 rejected it, leaving those fields holding their raw on-disk fixup
-     * encoding: a corrupt method cache and superclass chain (libswiftCore then spins
-     * forever walking superclasses in swift_conformsToProtocol). */
+
     uint64_t value = 0;
     int found = 0;
     if (libord > 0) {
@@ -997,13 +783,7 @@ static int build_frame(const char *path, int argc, char **argv, char **envp, Dyn
              (unsigned long long)(stack + DYN_STACK_SIZE), (unsigned long long)DYN_STACK_SIZE,
              (unsigned long long)0x4000, (unsigned long long)0x4000);
     apple_g[0] = put_str(&sp, apple0);
-    /* The low byte (LSB) MUST be 0x00, matching the real macOS/dyld stack canary: it is the
-     * "terminator canary" defense -- a string write whose NUL terminator lands exactly on the
-     * canary's first byte leaves a zero-LSB canary intact. libsystem_malloc (and others) rely on
-     * this during startup string/zone setup; with a non-zero LSB (was 0x...73) that otherwise-
-     * harmless terminator flips 0x73->0x00 and trips __stack_chk_fail -> abort() on a workqueue
-     * worker mid-drain -> STEP_FATAL. Keep the rest of the value fixed/recognizable; only the LSB
-     * is load-bearing. */
+
     apple_g[1] = put_str(&sp, "stack_guard=0x6f6365727a5f6700");
     apple_g[2] = put_str(&sp, "ptr_munge=0xa3f1c2b4d5e60718");
     apple_g[3] = put_str(&sp, "malloc_entropy=0x91827364a5b6c7d8,0x1f2e3d4c5b6a7988");
@@ -1394,17 +1174,6 @@ static const char *image_id_name(uint64_t mh)
     return NULL;
 }
 
-/* A cache framework dlopen'd post-boot must run its initializers (real dyld
- * does), but ocerz cannot run the WindowServer/display stack's initializers
- * (SkyLight et al. assert a libdispatch main-queue context the emulator does not
- * establish), and running the whole soft-linked GUI closure is both slow and
- * destabilising. The objc-runtime/Foundation CORE is the part the alloc fix
- * actually needs (a Foundation initializer sets the NSString class global that
- * +[NSString allocWithZone:] reads) and the part ocerz runs reliably. So on the
- * DLOPEN path (g_init_dlopen_restricted) we run only that core; once Foundation
- * has initialized (by any path -- run_image_inits sets g_foundation_inited, so a
- * boot-linked Foundation as in a plain Cocoa program counts), the dlopen path
- * stops driving initializers entirely. The boot closure is never restricted. */
 static int g_init_dlopen_restricted;
 static int g_foundation_inited;
 static int image_is_objc_core(uint64_t mh)
@@ -1525,18 +1294,6 @@ static int init_is_done(uint64_t mh)
     return 0;
 }
 
-/* Mark the libSystem umbrella as already-initialized WITHOUT running anything.
- * The boot libSystem_initializer hand-runs the umbrella's internal inits
- * (__libkernel_init, __pthread_init, __malloc_init, libdispatch_init, ...) for
- * the sub-libraries it reexports, so their per-image initializers have
- * effectively run; re-running them via init_closure would double-initialize
- * pthread/malloc (fatal). The recursion is BOUNDED to the umbrella by following
- * only deps whose install name is under /usr/lib/system/ (plus the libSystem.B
- * root) — that is exactly the set libSystem_initializer covers. Following the
- * full transitive closure would wrongly mark high-level frameworks done:
- * CoreFoundation, IOKit and CoreServices are reachable from the umbrella but are
- * NOT initialized by libSystem_initializer, and pre-marking them done is what
- * stops init_closure from running __CFInitialize before CF's dependents. */
 static int is_umbrella_path(const char *p)
 {
     return p && strncmp(p, "/usr/lib/system/", 16) == 0;
@@ -1570,9 +1327,6 @@ static void init_mark_done_closure(OcerzCache *cache, uint64_t mh)
     g_init_done[idx] = 1;
 }
 
-/* Collect the not-yet-initialized hard-dependency closure of `mh` into list[]
- * (depth-first, g_init_being as this-pass visited marker; UPWARD links are NOT
- * followed — that is their purpose). No initializer runs here. */
 static void init_collect(OcerzCache *cache, uint64_t mh, uint64_t *list, int *n, int cap)
 {
     if (!mh)
@@ -1606,20 +1360,8 @@ static int init_addr_cmp(const void *a, const void *b)
     return x < y ? -1 : x > y ? 1 : 0;
 }
 
-/* Run the not-yet-initialized hard-dependency closure of `mh` in dependency
- * order. The closure is collected, then initializers run in ASCENDING cache
- * address: the dyld shared cache lays foundational dylibs out before the
- * frameworks that build on them, so address order reproduces the cache's baked
- * initializer order and — unlike a naive DFS post-order — breaks the genuine
- * CoreFoundation<->libobjc<->libswiftCore<->Foundation initialization cycle the
- * way native does, running CoreFoundation's __CFInitialize (which arms
- * kCFAllocatorSystemDefault's malloc-zone vtable) before the AppKit/SkyLight
- * frameworks that allocate through CF. UPWARD links are excluded from the
- * closure. libSystem's umbrella is already marked done (init_mark_done_closure),
- * so it is skipped. The collect list is on the stack so a nested dlopen from an
- * initializer (which re-enters init_closure) gets its own buffer. */
 #define INIT_CLOSURE_CAP 4096
-/* The install name (LC_ID_DYLIB) of an image, or NULL. */
+
 static void init_closure(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
                          const uint64_t *ia, uint64_t stack_top)
 {
@@ -1873,21 +1615,6 @@ static int expand_install_name(DynImage *loader, const char *name,
 static void load_disk_deps(OcerzCache *cache, DynImage *loader, const RpathList *rpaths);
 static int canon_dylib_path(const char *path, char *out, size_t outsz);
 
-/* Canonicalize this arena dylib's objc selector references to the shared cache's
- * canonical selector pointers. After apply_fixups each __objc_selrefs entry points
- * at the image's own __objc_methname string. Modern objc, on a shared-cache
- * launch, trusts dyld to have uniqued every selector reference and runs no
- * per-image selref fixup (it only does so for images NOT optimized by dyld, which
- * it assumes are all in the cache), so a cache selector left as the image-local
- * string is a DISTINCT pointer from the cache canonical and fails objc_msgSend's
- * pointer-identity method match -- e.g. winemac.drv's macdrv_start_cocoa_app
- * sending +[NSThread detachNewThreadSelector:toTarget:withObject:] aborts with
- * "selector ... does not match selector known to Objective C runtime". Rewriting
- * each known selref to the cache canonical is exactly what dyld's objc selector
- * optimizer does for disk images. A name the cache lacks (a selector private to
- * this image) is left as its local string, itself a stable unique pointer. Needs
- * the cache objc selopt (parsed at boot objc registration); selrefs in a dylib
- * mapped before that are skipped -- such early dylibs are cache images anyway. */
 static void canonicalize_objc_selrefs(DynImage *img)
 {
     int64_t slide = img->slide;
@@ -1930,15 +1657,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         return NULL;
     if (dep_find(cache, resolved) != 0)
         return NULL;
-    /* Canonicalize the resolved path (realpath: collapse //, resolve ./.., follow
-     * symlinks) before the dedup lookup, exactly as ocerz_dlopen_inner does for a
-     * top-level dlopen. An @rpath dep expands to rpath + "/" + stem, and an rpath
-     * entry that already ends in '/' yields a DOUBLED slash (e.g. x86_64-unix//
-     * ntdll.so); a raw strcmp then misses the same file already loaded under its
-     * clean path, so ntdll.so loads a SECOND time. The duplicate's per-thread
-     * pthread keys are never created by an initializer, so a getter reads key 0
-     * and pthread_getspecific returns a TSD cookie (garbage), which msvcrt derefs
-     * during its init -> c0000005. dyld dedups loaded images by realpath too. */
+
     char canon[1024];
     if (canon_dylib_path(resolved, canon, sizeof canon))
         snprintf(resolved, sizeof resolved, "%s", canon);
@@ -2126,36 +1845,8 @@ static int canon_dylib_path(const char *path, char *out, size_t outsz)
     return snprintf(out, outsz, "%s", cur) < (int)outsz;
 }
 
-/* The disk-image loader (g_dimgs registry, the arena bump base, the per-image
- * slide/fixup application) is single-writer state with no internal locking, but
- * a guest dlopen now arrives concurrently from the main thread AND any libdispatch
- * workloop worker once GUI bring-up is live. Two unserialized loads race on
- * g_dimgs_n and on each other's in-progress slide, which corrupts a freshly
- * mapped image's rebased pointers (every slot filled with base+offset off a torn
- * base) -- objc/CF then dispatch through that image's vtable into garbage. A
- * single RECURSIVE lock serializes all of dlopen/dlsym/dlclose; recursive because
- * an image initializer run inside dlopen may itself dlopen on the same thread. */
 static pthread_mutex_t g_load_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 
-/* A dlopen that resolves to a shared-cache dylib returns the cache mach_header
- * directly (its pages are already mapped and fixed up), but dyld still notifies
- * objc so the image's classes are realized and flagged loaded. Reproduce that
- * notify here: drive objc map_images for the cache image (idempotent; only
- * fires for an image not already mapped at boot) before handing the header
- * back, so a soft-linked framework's classes resolve via NSClassFromString. */
-/* A dlopen resolving to a shared-cache dylib must, like real dyld, RUN that
- * image's initializers (and its not-yet-initialized dependency closure) before
- * returning -- not only register its objc classes. A cache framework pulled in
- * post-boot (Foundation/CoreFoundation/AppKit, dlopen'd when winemac.drv brings
- * up Cocoa) is NOT in the main executable's boot closure, so its mod_init_funcs
- * never ran at startup; skipping them here leaves Foundation half-initialized.
- * Concretely, +[NSString allocWithZone:] returns the __NSPlaceholderString
- * singleton only when (self == a Foundation global that a Foundation initializer
- * sets to [NSString class]); with that initializer skipped the global stays 0,
- * so +alloc falls through to the default and yields a plain NSString instance,
- * which then does-not-recognize initWithBytes:length:encoding: -- the Cocoa-
- * thread abort that fails winemac.drv. init_is_done() keeps each image's
- * initializers running exactly once (no double-init with the boot closure). */
 static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
 {
     if (g_dlerror_g)
@@ -2164,17 +1855,7 @@ static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
         uint64_t istk = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
         uint64_t sp = istk ? istk + DYN_STACK_SIZE - 64 : 0;
         ocerz_dyldapi_objc_map_one(g_run_vm, cmh);
-        /* dyld brings up a dlopen'd image in three steps -- map (objc register),
-         * then +load, then C/C++ initializers. ocerz only ran the +load phase at
-         * boot for the main executable's closure; a framework pulled in later
-         * (Foundation/AppKit when winemac.drv brings up Cocoa) never had its
-         * +load methods run, so Foundation's +load (__NSInitializeProcess, which
-         * caches the NSString class into the global that gates +[NSString
-         * allocWithZone:] returning __NSPlaceholderString) never ran and the
-         * global stayed 0 -- the alloc cascade that aborts the Cocoa thread.
-         * Run the +load phase here for the newly-loaded sub-closure (g_load_done
-         * keeps each image's +load running exactly once, so already-loaded boot
-         * images are skipped; g_init_force bypasses the boot eager filter). */
+
         if (sp && !vm->exited) {
             g_init_cur_gen++;
             int pf = g_init_force;
@@ -2192,7 +1873,6 @@ static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
     return cmh;
 }
 
-/* Try "<dir>/<name>" for each colon-separated dir in `list`; first that exists wins. */
 static int try_soname_in_pathlist(const char *list, const char *name, char *out, size_t n)
 {
     if (!list || !list[0])
@@ -2215,12 +1895,6 @@ static int try_soname_in_pathlist(const char *list, const char *name, char *out,
     return 0;
 }
 
-/* Resolve a BARE dlopen soname (no slash, no @prefix) the way the macOS dynamic
- * linker does: search DYLD_LIBRARY_PATH, then DYLD_FALLBACK_LIBRARY_PATH (or its
- * default $HOME/lib:/usr/local/lib:/usr/lib). ocerz's loader otherwise passes a
- * bare name through verbatim, so Wine's runtime dlopen("libfreetype.6.dylib") /
- * dlopen("libMoltenVK.dylib") never finds the homebrew x86_64 lib under
- * /usr/local/lib -- "Wine cannot find the FreeType font library". */
 static int resolve_bare_soname(const char *name, char *out, size_t n)
 {
     if (!name || strchr(name, '/') || name[0] == '@')
@@ -2274,9 +1948,7 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
             return cache_dlopen_hit(vm, cmh);
         loadpath = canon;
     }
-    /* A bare soname that did not resolve to an existing path above: search the
-     * macOS dylib fallback paths (DYLD_FALLBACK_LIBRARY_PATH / /usr/local/lib) so
-     * Wine's runtime dlopen of libfreetype/libMoltenVK finds the homebrew lib. */
+
     char sopath[PATH_MAX];
     if (!strchr(loadpath, '/') && loadpath[0] != '@' && access(loadpath, F_OK) != 0 &&
         resolve_bare_soname(loadpath, sopath, sizeof sopath)) {
@@ -2308,25 +1980,9 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
                 if (vm->exited)
                     break;
             }
-            /* Register the new disk images' objc classes with the guest runtime
-             * before their initializers run, exactly as dyld notifies objc on
-             * load. The cache-dlopen path does this via cache_dlopen_hit; a disk
-             * dylib (e.g. winemac.drv) otherwise has its own classes left
-             * unregistered, so objc reports "Attempt to use unknown class" the
-             * moment guest code instantiates a winemac-defined class (a WineApp/
-             * window subclass of a cache class). Deps-first (reverse) so a
-             * subclass's superclass image maps first; objc_map_one is idempotent
-             * and skips images with no __objc_imageinfo. */
+
             for (int i = g_dimgs_n - 1; i >= before; i--) {
-                /* Skip objc registration for GPU/hardware driver extensions
-                 * (e.g. AGXMetalG14X.bundle): ocerz cannot run their display
-                 * path, and registering their classes/categories makes the live
-                 * objc runtime route Metal/CoreAnimation through them and then
-                 * fault in libdispatch (a wrong-queue assertion) at window draw
-                 * -- breaking a plain Cocoa window where leaving the driver objc
-                 * unregistered lets AppKit fall back. Wine's own dylibs
-                 * (winemac.drv etc.) are never under /Extensions/, so they still
-                 * register and their classes resolve. */
+
                 if (strstr(g_dimgs[i].path, "/System/Library/Extensions/"))
                     continue;
                 ocerz_dyldapi_objc_map_one(g_run_vm, g_dimgs[i].load_base);
@@ -2540,12 +2196,6 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                   (unsigned long long)environ_addr, (unsigned long long)fr.envp_arr);
     }
 
-    /* libdyld.dylib exports its OWN `__progname` (distinct from libsystem_c's, which the
-     * ProgramVars/leaf path above sets so getprogname() works). Real dyld sets libdyld's copy
-     * directly at launch; ocerz replaces dyld and had left it NULL. Cache code that reads it —
-     * e.g. libxml2's per-process compat quirks do `strcmp(__progname, "...")` during XML/SVG
-     * parsing — then dereferences NULL and SIGSEGVs (deterministic; killed Cocoa apps a few
-     * seconds after their window rendered). Point it at the argv[0] basename, as dyld does. */
     uint64_t progname_addr = ocerz_cache_resolve(&cache, "___progname");
     if (!progname_addr)
         progname_addr = ocerz_cache_resolve(&cache, "__progname");
@@ -2584,30 +2234,13 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         } else {
             OCERZ_LOG("dynamic: no libSystem initializer found\n");
         }
-        /* Run the full dependency-ordered initializer phase (which runs __CFInitialize and every
-         * framework initializer in dependency order, exactly as real dyld does -- only libSystem
-         * was run above) for native executables that LINK CoreFoundation/Foundation/AppKit. Without
-         * __CFInitialize, CF's runtime class-bridge table stays zero and CFAllocatorAllocate
-         * recurses into the public malloc -> stack overflow. The Wine PE loader does not link CF in
-         * its main image, so its path is byte-for-byte unchanged. Forceable via OCERZ_INITPHASE,
-         * disableable via OCERZ_NOINITPHASE. (malloc/pthread are already bootstrapped by the
-         * libSystem initializer above and init_mark_done_closure prevents double-init.) */
-        /* Mark the libSystem umbrella initialized the moment its initializer has run --
-         * INDEPENDENT of whether the main image links CoreFoundation. This used to live
-         * inside the links_cf branch below, so an image that does NOT link CF (the Wine
-         * loader is exactly that, as the comment above says) left libSystem unmarked. Any
-         * later dlopen whose closure includes libSystem then re-ran libSystem_initializer,
-         * which re-runs __pthread_init/__malloc_init -- the "double-initialize pthread/malloc
-         * (fatal)" case init_mark_done_closure exists to prevent. It aborted with
-         * "BUG IN LIBPTHREAD: host_info() failed", ocerz skipped the faulting initializer,
-         * and Wine then failed downstream. Whether CF is linked has no bearing on the fact
-         * that libSystem's initializer already ran, so the marking belongs here. */
+
         if (ran_init) {
             g_libsys_mh = dep_find(&cache, "/usr/lib/libSystem.B.dylib");
             init_mark_done_closure(&cache, g_libsys_mh);
         }
         if (ran_init && (img.links_cf || getenv("OCERZ_INITPHASE")) && !getenv("OCERZ_NOINITPHASE")) {
-            uint64_t libsys = g_libsys_mh;   /* found and marked done just above */
+            uint64_t libsys = g_libsys_mh;
             compute_eager_set(&cache, img.load_base);
             OCERZ_LOG("dynamic: eager init set = %d images (of closure)\n", g_eager_n);
             ocerz_tlv_register_closure(vm, &cache, img.load_base, fr.stack_top);
@@ -2645,7 +2278,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         fprintf(stderr, "ZONEPROBE num_zones=%llu malloc_zones=%#llx zones[0]=%#llx default_zone=%#llx initial_nano=%#llx initial_scalable=%#llx\n",
                 (unsigned long long)nz, (unsigned long long)mzp, (unsigned long long)z0,
                 (unsigned long long)dz, (unsigned long long)g_initial_nano, (unsigned long long)g_initial_scalable);
-        /* dump first few zones and their malloc fn ptr + zone_name ptr (zone+0x38) */
+
         for (uint64_t i = 0; i < nz && i < 6; i++) {
             uint64_t z = ocerz_ld(mzp + i * 8, 8);
             uint64_t zmalloc = z ? ocerz_ld(z + 0x18, 8) : 0;
@@ -2656,9 +2289,9 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                     (unsigned long long)i, (unsigned long long)z, (unsigned long long)zmalloc,
                     (unsigned long long)znameptr, nm);
         }
-        /* CF system-default allocator-as-zone struct dump (runtime, unchained) */
+
         uint64_t cfz = 0x7ff840095a00ULL;
-        uint64_t cmpg = 0x7ff8436c2b20ULL; /* global compared at __CFAllocatorAllocateImpl+0x3c */
+        uint64_t cmpg = 0x7ff8436c2b20ULL;
         fprintf(stderr, "ZONEPROBE CFzone@%#llx: isa/[0]=%#llx [+0x18 malloc]=%#llx [+0x68 ver]=%#llx [+0xd0]=%#llx [+0xb0]=%#llx\n",
                 (unsigned long long)cfz, (unsigned long long)ocerz_ld(cfz, 8),
                 (unsigned long long)ocerz_ld(cfz + 0x18, 8), (unsigned long long)ocerz_ld(cfz + 0x68, 8),
@@ -2666,7 +2299,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         fprintf(stderr, "ZONEPROBE cmpglobal@%#llx=%#llx  (CFzone[0]==cmpglobal? %d)\n",
                 (unsigned long long)cmpg, (unsigned long long)ocerz_ld(cmpg, 8),
                 ocerz_ld(cfz, 8) == ocerz_ld(cmpg, 8));
-        /* Also dump kCFAllocatorSystemDefault wrapper at _kCFAllocatorSystemDefault */
+
         uint64_t cfa = 0x7ff8400964a8ULL;
         fprintf(stderr, "ZONEPROBE kCFAllocatorSystemDefault@%#llx -> %#llx\n",
                 (unsigned long long)cfa, (unsigned long long)ocerz_ld(cfa, 8));

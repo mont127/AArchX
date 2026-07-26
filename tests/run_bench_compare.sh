@@ -1,35 +1,5 @@
 #!/bin/zsh
-#
-# tests/run_bench_compare.sh
-#
-# Repeatable Ocerz-vs-Rosetta throughput gate for the four benchmark kernels.
-# Directly launching an x86_64 benchmark binary on Apple Silicon uses Rosetta;
-# launching the same binary through ./ocerz measures Ocerz. Every timed pair
-# alternates engine order between repetitions to limit drift bias.
-#
-# `alu` and `br` are long enough to compare by median wall time. The raw `call`
-# and `mem` kernels are not: Rosetta finishes them inside process-startup noise.
-# Their primary metrics are paired two-point deltas, which cancel startup and
-# other work independent of the input size:
-#
-#   call: fibn(42) - fibn(38)
-#   mem:  memn(400000000) - memn(40000000)
-#
-# The reported ratio is always Ocerz time / Rosetta time. A workload passes only
-# when its ratio is STRICTLY LESS THAN --pass-ratio. The default is 1.0, meaning
-# Ocerz must actually beat Rosetta on every selected workload. Exit status is 0
-# when all selected workloads pass, 1 for a performance miss, and 2 for usage,
-# prerequisite, timing, or correctness failures.
-#
-# Usage (from any directory):
-#   tests/run_bench_compare.sh
-#   tests/run_bench_compare.sh --reps 7 --workloads alu,br
-#   tests/run_bench_compare.sh --pass-ratio 1.05
-#
-# The correctness preflight runs every selected command once under each engine,
-# checks byte-identical output and exit status, and doubles as the unmeasured
-# warmup. The default five measured repetitions therefore take roughly two
-# minutes on the current baseline.
+# Ocerz-vs-Rosetta throughput gate for the benchmark kernels; engine order alternates between reps.
 
 set -u
 zmodload zsh/datetime || {
