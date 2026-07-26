@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <errno.h>
 #include <time.h>
+#include <mach-o/dyld.h>
 
 #define OCERZ_CALL_SENTINEL 0x00000000deadca11ull
 
@@ -23,6 +24,7 @@ static OcerzVM *g_vm;
 static __thread OcerzCPU *g_cur_cpu;
 
 #define OCERZ_MAX_CPUS 512
+static uint64_t g_image_slide;
 static OcerzCPU *g_cpus[OCERZ_MAX_CPUS];
 static int g_cpus_n;
 static pthread_mutex_t g_cpus_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -620,6 +622,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = hex_into(p, *(const uint32_t *)(uintptr_t)hpc);
         p = str_into(p, " host_lr=");
         p = hex_into(p, uc->uc_mcontext->__ss.__lr);
+        p = str_into(p, " slide=");
+        p = hex_into(p, g_image_slide);
     }
     OcerzCPU *c = g_cur_cpu ? g_cur_cpu : (g_vm ? &g_vm->cpu : NULL);
     if (c) {
@@ -834,6 +838,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
 
 int ocerz_vm_init(OcerzVM *vm)
 {
+    g_image_slide = (uint64_t)_dyld_get_image_vmaddr_slide(0);
     memset(vm, 0, sizeof *vm);
     vm->cpu.vm = vm;
     ocerz_cpu_reset(&vm->cpu);
