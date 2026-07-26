@@ -3607,3 +3607,50 @@ The intermittent host-side fault from UPDATE #33 did NOT reproduce again: 36 con
 AppKit-probe runs, including 16 while a full Wine boot ran concurrently. It was ~1 in 3 earlier
 in the same session. Unexplained -- a rebuild sits between the two samples, so treat it as
 perturbed rather than fixed, and do not assume it is gone.
+
+## UPDATE #35 -- the SEH failure and the intermittent fault are ONE bug, and it is a real memory fault
+
+`WINEDEBUG=+seh,+tid` resolves the second failure mode from UPDATE #34. It is not an SEH bug:
+
+    trace:seh:dispatch_exception code=c0000005 (EXCEPTION_ACCESS_VIOLATION) addr=00007FF80682ACAC
+    trace:seh:dispatch_exception  info[0]=1            <- write
+    trace:seh:dispatch_exception  info[1]=0000000106FD8030   <- faulting address
+    trace:seh:dispatch_exception rip=00007ff80682acac rsp=00000081006ec070
+    trace:seh:dispatch_exception rdi=0000000106fd8000 r14=0000000106fd8000 rbx=rcx=1f5
+    err:seh:call_seh_handlers invalid frame 00000081006EC070 (0000000000C22000-0000000000D20000)
+
+`rip=0x7ff80682acac` symbolises to **CarbonCore +0x4cac** (x86_64 shared cache), so this is
+guest UNIX-side framework code writing through `rdi = 0x106fd8000` at +0x30 and faulting.
+`0x10xxxxxxx` is the same address family as the intermittent ocerz faults of UPDATE #33
+(`0x107610000`, `0x1053ec000`, and `_malloc_zone_calloc` faulting on `0x107610000`). **So
+UPDATE #33's "intermittent host fault" and UPDATE #34's SEH failure are the same underlying
+memory bug**, seen from two sides: sometimes ocerz faults on it directly, sometimes ocerz
+converts it into a guest c0000005 and Wine then cannot dispatch it.
+
+The dispatch failure is a genuine second-order problem worth remembering: the fault happens on
+the UNIX stack (`rsp=0x81006ec070`) while the TEB in use records a PE stack
+(`0xC22000-0xD20000`), so Wine's `call_seh_handlers` bounds check rejects the frame and gives
+up. `rbx=rcx=0x1f5` = 501 = the uid, which is a hint about which CarbonCore path this is.
+
+### Ruled out this pass (do not re-audit these)
+* `ocerz_unmap` rounds INWARD and refuses ranges with no registered region -- it cannot touch
+  ocerz's own memory.
+* `ocerz_protect` is likewise gated on `region_for_range`.
+* `ocerz_mem_register_range` -> `reserve_host_fixed` uses `mach_vm_allocate(VM_FLAGS_FIXED)`
+  WITHOUT `VM_FLAGS_OVERWRITE`, which fails with KERN_NO_SPACE on an occupied range rather than
+  replacing it. It rounds outward, but an outward-rounded collision fails the whole call. So the
+  "guest MAP_FIXED PROT_NONE clobbers ocerz's heap" theory is **wrong**.
+* RAS bounds (C and JIT-inlined) are correct; `g_cpus` register/unregister is locked and dedup'd.
+* Not a heap overflow: an ASan build reproduces the fault and reports no ASan error.
+
+### Live divergence found while reading (unfixed, probably harmless but wrong)
+`sys_munmap` returns success to the guest unconditionally, even when `ocerz_unmap` fails with
+ENOMEM because the range has no registered region. The guest believes memory is unmapped when
+it is not.
+
+### Where to pick this up
+The remaining question is narrow: what is the mapping at `0x106fd8000`, who created it, and what
+made it non-writable. `memtrace()` cannot see it -- it only logs `addr` in
+`[0x7ff00000,0x80000000)`; widen that window first. The crash dump now prints `slide=`, so
+`host_pc - slide | atos -o ocerz -arch arm64` names any ocerz-side faulting function.
+Reproduce with the ~0.6s AppKit probe rather than a 70s Wine boot.
