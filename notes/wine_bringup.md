@@ -3700,3 +3700,44 @@ Find who registers guest [0x108000000,0x110000000) and [0x1006f0000,0x108000000)
 CarbonCore writes is not committed. Run with `OCERZ_FAULTLOG=1` plus `-v` (which logs
 "registered identity guest range") and correlate. The question is now narrow and specific: which
 allocation path registers a low range without committing the page the guest then writes.
+
+## UPDATE #37 -- a confirmed Mach MIG reply leak, and the structural flaw behind it
+
+Two usable diagnostics now exist and both are committed: `OCERZ_MEMTRACE_ALL=1` lifts
+`memtrace()`'s hardcoded `[0x7ff00000,0x80000000)` window so low-memory mappings are visible at
+all, and `OCERZ_MACHLEAK`'s filter no longer drowns in false positives.
+
+### The MACHLEAK filter was useless as shipped
+It flagged any reply word in `[0x100000000, LOW_LIMIT)` with `committed==0`. Two systematic false
+positives swamped it: offset 0x18 of EVERY MIG reply is the NDR record, which reads as
+`0x100000000` as a u64, and many replies pack two 32-bit fields that read as `0x1000000xx`.
+Fixed by starting the scan at 0x20 (past header+NDR), requiring page alignment, and requiring
+`>= 0x100001000`. Hits on a Wine boot went 449 -> 21, and the remainder are readable.
+
+### Confirmed leak
+    MACHLEAK reply_id=4916 off=0x30 host_val=0x104e3c000
+    MACHLEAK reply_id=4916 off=0x30 host_val=0x1040a4000   (previous run)
+Reproducible across runs, same reply id, same offset, page-aligned, in exactly the address family
+of the CarbonCore faults. 4916 is the reply to the mach_vm subsystem request 4816
+(`mach_vm_region_recurse`). ocerz hands the guest a raw HOST address for it.
+
+### The structural flaw
+`mig_vm_reply_relocate` is called from ONE site gated on a hardcoded whitelist:
+    if ((rid == 4900 || rid == 4911 || rid == 4913) && reply KERN_SUCCESS)
+and the function itself only ever reads the address from ONE fixed offset, `reply_buf + 0x24`.
+So every other VM RPC that returns an address, and every reply whose address sits at a different
+offset, passes through untranslated. 4916 is one instance; the legacy `vm_map` subsystem at base
+3800 is another whole family that is not covered at all.
+
+### Honest status of the causal chain
+The 4916 leak is a REAL bug and worth fixing on its own. It is NOT yet proven to be the cause of
+the CarbonCore fault: in the runs captured, the leaked value (0x104e3c000) and the faulting
+address (0x10b8023e8, 0x106510030, ...) did not coincide. The faults remain consistent in shape --
+`rip=0x7ff80682acac` (CarbonCore +0x4cac), page-aligned base + 0x30, `committed=0` inside the low
+reservation. Do not claim 4916 fixes Wine until a run shows the leaked address and the faulted
+address matching.
+
+### Ruled out this pass
+No mmap/vm_allocate/vm_map/mprotect operation exists anywhere within 4MB of a faulting address
+(3526 MEM ops traced with `OCERZ_MEMTRACE_ALL`), so the guest never obtained that page through
+any traced mapping path. That is what pointed at the MIG reply path in the first place.
