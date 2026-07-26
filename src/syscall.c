@@ -142,6 +142,7 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <time.h>
@@ -470,6 +471,10 @@ static int sys_bsdthread_register(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+/* A no-op "succeeded" stub. Only for calls whose entire effect ocerz genuinely does not
+ * need. __semwait_signal was on this list and must never go back: it is macOS's core
+ * timed-wait primitive -- usleep/nanosleep/pthread_cond_timedwait all land on it -- so
+ * stubbing it made every sleep in the guest return instantly. */
 static int sys_workq_stub(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
@@ -1629,6 +1634,26 @@ static int ocerz_mach_err_interesting(uint64_t r)
     if ((r & 0xfffff000ull) == 0x10004000ull)       /* receive class */
         return r != 0x10004003ull && r != 0x10004004ull;
     return 0;
+}
+
+/* Guest nanoseconds -> host mach ticks. The guest clock is ns (see case 89); the host is
+ * Apple silicon ticks. Cached because it is on the timer path. A zero/!=OK timebase leaves
+ * the value alone rather than mangling it. */
+static uint64_t ocerz_guest_ns_to_host_ticks(uint64_t ns)
+{
+    static uint32_t numer, denom;
+    if (!denom) {
+        mach_timebase_info_data_t tb;
+        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0 || tb.denom == 0) {
+            numer = denom = 1;
+        } else {
+            numer = tb.numer;
+            denom = tb.denom;
+        }
+    }
+    if (numer == denom || ns == 0)
+        return ns;
+    return (uint64_t)(((__uint128_t)ns * denom) / numer);
 }
 
 static void ocerz_log_mach_send_err(int trap, uint64_t kr, const uint64_t *a, uint64_t gmsg)
@@ -3131,7 +3156,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
      * them unmarked is the correct observable state). Proper guest-level cancellation is a TODO. */
     [332] = { "__pthread_markcancel", 1, 0x00, 0, sys_workq_stub },
     [333] = { "__pthread_canceled", 1, 0x00, 0, NULL },
-    [334] = { "__semwait_signal", 6, 0x00, 0, sys_workq_stub },
+    [334] = { "__semwait_signal", 6, 0x00, 0, NULL },
     [374] = { "kevent_qos",  8, 0x00, 0, sys_kevent_qos },
     [375] = { "kevent_id",   6, 0x00, 0, sys_kevent_id },
     [406] = { "fcntl_nocancel", 3, 0x00, 0, sys_fcntl },
@@ -3167,7 +3192,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [415] = { "pwrite_nocancel",4, 0x02, 0, NULL },
     [417] = { "poll_nocancel", 3, 0x02, 0, NULL },
     [420] = { "sem_wait_nocancel", 1, 0x00, 0, sys_workq_stub },
-    [423] = { "__semwait_signal_nocancel", 6, 0x00, 0, sys_workq_stub },
+    [423] = { "__semwait_signal_nocancel", 6, 0x00, 0, NULL },
     [427] = { "fsgetpath",   4, 0x05, 0, NULL },
     [428] = { "audit_session_self", 0, 0x00, 0, NULL },
     [461] = { "getattrlistbulk", 5, 0x06, 0, NULL },
@@ -3790,6 +3815,10 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                 }
             }
         }
+        if (getenv("OCERZ_MSGTIMEOUT"))
+            fprintf(stderr, "ocerz: MSG2 opts=%#llx rcv_timeout_arg=%#llx a6=%#llx rsp=%#llx\n",
+                    (unsigned long long)a[1], (unsigned long long)a[7],
+                    (unsigned long long)a[6], (unsigned long long)cpu->gpr[OCERZ_RSP]);
         /* Log the message header BEFORE the (possibly blocking) trap, so a mach_msg2
          * that never returns (the boot keystone deadlock) still shows its dest port /
          * id / options. msgh_bits@0, remote_port@8, local_port@0xc, msgh_id@0x14. */
@@ -3913,9 +3942,27 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         break;
     }
     case 89: {
-        if (a[0] != 0)
-            a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
-        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        /* mach_timebase_info: report 1/1, NOT the host's.
+         *
+         * The guest reads mach_absolute_time in NANOSECONDS (measured: over the same busy
+         * loop the raw delta was 1.4836e10 against 14.836 s of real time). Apple silicon's
+         * own timebase is 125/3, because the HOST's mach_absolute_time counts 24 MHz ticks.
+         * Forwarding that to a guest whose clock is already in nanoseconds made every
+         * tick->ns conversion 41.67x too large, so every computed deadline landed ~42x too
+         * far in the future. CoreFoundation's run loop is the visible casualty:
+         * CFRunLoopRunInMode(mode, 1.0, false) never reached its deadline and blocked in
+         * mach_msg2 forever at 0% CPU, so winemac.drv's run_cocoa_app could never be
+         * serviced and Wine reported "Failed to start Cocoa app main loop".
+         *
+         * 1/1 is exactly what Rosetta 2 reports to a translated x86_64 process, and what a
+         * real Intel Mac reports, for the same reason: there, mach_absolute_time is already
+         * nanoseconds. Writing the struct directly rather than forwarding also keeps the
+         * two halves consistent by construction. */
+        if (a[0] != 0) {
+            ocerz_st(a[0] + 0, 4, 1);   /* numer */
+            ocerz_st(a[0] + 4, 4, 1);   /* denom */
+        }
+        mach_ret(cpu, 0);               /* KERN_SUCCESS */
         break;
     }
     case 90:   /* mach_wait_until_trap(deadline) */
@@ -3923,6 +3970,31 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 92:   /* mk_timer_destroy_trap(name) */
     case 93:   /* mk_timer_arm_trap(name, expire_time) */
     case 95: { /* mk_timer_arm_leeway_trap(name, flags, expire_time, leeway) */
+        /* ABSOLUTE DEADLINES CROSS A UNIT BOUNDARY and must be converted.
+         *
+         * The guest's mach_absolute_time is NANOSECONDS -- the same magnitude a real Intel
+         * Mac and Rosetta report (measured side by side: 5.4617e14 under both). The HOST is
+         * Apple silicon, where mach_absolute_time counts 24 MHz ticks and the timebase is
+         * 125/3. Forwarding a nanosecond deadline to a kernel that reads ticks multiplies it
+         * by 125/3 -- not a 42x-longer wait, but 42x the whole uptime: a deadline ~6 days out
+         * became ~263 days out, so the timer simply never fired.
+         *
+         * That is the whole of the Phase-5 wall. CoreFoundation's run loop arms an mk_timer
+         * and blocks in mach_msg2 with MACH_RCV_TIMEOUT deliberately NOT set, waiting for
+         * that timer's message; when the timer never fires the main thread parks forever at
+         * 0% CPU, run_cocoa_app is never serviced, and winemac.drv reports "Failed to start
+         * Cocoa app main loop" after its 5s deadline. Verified directly:
+         * mach_wait_until(now + 1s) returns in 1005 ms natively and never returned here. */
+        uint64_t d0 = a[0], d1 = a[1], d2 = a[2], d3 = a[3];
+        if (num == 90)
+            a[0] = ocerz_guest_ns_to_host_ticks(a[0]);
+        else if (num == 93)
+            a[1] = ocerz_guest_ns_to_host_ticks(a[1]);
+        else if (num == 95) {
+            a[2] = ocerz_guest_ns_to_host_ticks(a[2]);
+            a[3] = ocerz_guest_ns_to_host_ticks(a[3]);   /* leeway is a duration, same scale */
+        }
+        (void)d0; (void)d1; (void)d2; (void)d3;
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }
