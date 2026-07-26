@@ -3654,3 +3654,49 @@ made it non-writable. `memtrace()` cannot see it -- it only logs `addr` in
 `[0x7ff00000,0x80000000)`; widen that window first. The crash dump now prints `slide=`, so
 `host_pc - slide | atos -o ocerz -arch arm64` names any ocerz-side faulting function.
 Reproduce with the ~0.6s AppKit probe rather than a 70s Wine boot.
+
+## UPDATE #36 -- CORRECTION: it is not a host-pointer leak, it is an UNCOMMITTED guest page
+
+I was wrong in the reasoning that led to UPDATE #35's framing, and the new `OCERZ_FAULTLOG`
+diagnostic proves it. The theory was that `0x106fd8000` lived in ocerz's own host heap (ocerz's
+binary is at ~0x102000000-0x106000000 and a real ocerz malloc zone was seen at 0x107610000), so
+guest code must be holding a leaked host pointer. That is wrong.
+
+`OCERZ_LOW_LIMIT` is `0x300000000`. Every faulting address here is BELOW it, so it is a *guest*
+address backed by the 12GB low-shadow reservation at host 0x8000000000. The resemblance to
+ocerz's own heap addresses is a coincidence of both living in the low 4-8GB.
+
+What `OCERZ_FAULTLOG` prints on a failing Wine run:
+
+    FAULT-NONGUEST addr=0x1066c8030 committed=0x0 host_prot=0x700 region=0x81006f0000+0x7910000 rip=0x7ff80682acac
+    FAULT-NONGUEST addr=0x108af0030 committed=0x0 host_prot=0x700 region=0x8108000000+0x8000000 rip=0x7ff80682acac
+    FAULT-NONGUEST addr=0x108a48030 committed=0x0 host_prot=0x700 region=0x8108000000+0x8000000 rip=0x7ff80682acac
+
+`region=` is the HOST low-shadow backing (0x8000000000 + guest), so guest [0x1006f0000,0x108000000)
+and guest [0x108000000,0x110000000) are both REGISTERED guest regions. The address is inside a
+registered region and `committed=0`. So:
+
+**The bug is that CarbonCore writes to a page of a registered low-memory guest region that ocerz
+never committed.** Not a leaked pointer, not heap corruption -- a missing commit. Always
+page-aligned base + 0x30, always `rip` = CarbonCore +0x4cac.
+
+This also retroactively explains the ocerz-side crashes with `fault-page: UNCOMMITTED` and
+`host_prot=0x0`: those are the same uncommitted-page condition seen from the other side.
+
+Refuted along the way, with evidence:
+* Mach-message OOL leak: a failing Wine run bridged 14 messages with **zero** OOL descriptors and
+  zero hits on any un-relocated path (`OVER-16MB-SKIPPED`, `unknown desc type`, `MSGH_SIZE>RECV`,
+  `oolfail`). The un-relocated paths in `ocerz_bridge_mach_msg` are real latent bugs but are not
+  this one.
+* `mach_vm_allocate` (trap 10) and `mach_vm_map` (trap 15) both commit RW via
+  `ocerz_map_claim_*`/`ocerz_map_anywhere`, so neither leaves uncommitted pages.
+
+Separately noticed while reading, unfixed: trap 15 `_kernelrpc_mach_vm_map_trap` ignores the
+memory-object port entirely and hands back blank anonymous memory, so a guest mapping a shared
+memory object gets zeroes instead of the shared contents. Wrong, but not this bug.
+
+### Where to pick this up
+Find who registers guest [0x108000000,0x110000000) and [0x1006f0000,0x108000000) and why the page
+CarbonCore writes is not committed. Run with `OCERZ_FAULTLOG=1` plus `-v` (which logs
+"registered identity guest range") and correlate. The question is now narrow and specific: which
+allocation path registers a low range without committing the page the guest then writes.
