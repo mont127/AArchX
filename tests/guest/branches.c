@@ -1,24 +1,4 @@
-/*
- * tests/guest/branches.c
- *
- * Control-flow torture test exercising the four hard cases for a binary
- * translator's block boundaries and indirect dispatch:
- *
- *  - A dense 12-case switch over a volatile selector. At -O2 clang lowers a
- *    dense switch to a jump table and an indirect "jmpq *table(,%reg,8)";
- *    the Makefile/runner verify with otool -tv that such an indirect jmpq is
- *    actually present in bin/branches, forcing real jump-table emission.
- *  - Indirect calls through a volatile array of function pointers, so the
- *    call targets are not knowable at compile time and must go through an
- *    indirect "callq *%reg".
- *  - Nested loops accumulating a checksum, so simple forward/backward Jcc
- *    and loop-carried state are covered.
- *  - Recursion: Ackermann(2,3) and fib(25), which stress call/ret depth and
- *    return-value propagation.
- *
- * Every result is printed as a decimal number on its own line; all inputs are
- * fixed, so the output is deterministic and machine-independent.
- */
+/* Control-flow torture test. */
 #include "gsys.h"
 
 static g_u64 op_add(g_u64 a, g_u64 b) { return a + b; }

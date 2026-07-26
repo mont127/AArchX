@@ -1,72 +1,5 @@
 #!/usr/bin/env bash
-#
-# tools/gen_corpus.sh
-#
-# Decoder cross-validation corpus generator. Uses the host x86_64 toolchain
-# (clang's integrated assembler) as a ground-truth oracle for instruction
-# encoding and, above all, for instruction LENGTH -- the single most
-# dangerous decoder bug class, since a one-byte length desync derails every
-# subsequent instruction in a basic block.
-#
-# Design:
-#   1. A curated, in-script instruction list covers EVERY family the decoder
-#      enum in include/ocerz/decode.h claims to support: all ALU operand
-#      templates, every addressing-mode shape (direct reg, [reg], +disp8,
-#      +disp32, base+index*scale, index*scale+disp32, rip-relative, the r12 /
-#      r13 / rbp SIB-and-disp special cases), 8-bit high/low registers
-#      (ah/bh vs spl/sil), fs/gs overrides, 67h address-size, the full REX
-#      permutation set on representative ops, the movzx/movsx/movslq matrix,
-#      every shift/rotate form, the jcc/jmp/call/ret/loop family, string ops
-#      with rep/repe/repne, push/pop variants, a representative x87 set, the
-#      whole SSE/SSE2 list plus the SSSE3/SSE4.1 entries (pshufb, palignr,
-#      pmovzx/pmovsx, ptest, round*, pextr/pinsr, blend*), atomics (lock add,
-#      lock cmpxchg, xadd, cmpxchg8b/16b), and the misc group (cpuid, rdtsc,
-#      rdtscp, pause, nop variants incl. 66 0F 1F and endbr64, bswap,
-#      bsf/bsr/popcnt/tzcnt/lzcnt).
-#
-#      Each list entry is a single line "MNEMONIC ;; ASM" where MNEMONIC is
-#      the human label stored in the corpus and ASM is the exact AT&T source
-#      handed to the assembler. They are kept separate because otool's
-#      disassembly normalizes mnemonics (retq, callq, splits lock prefixes
-#      onto their own line) in ways that would make the stored text noisy;
-#      the source line is the honest description of what was assembled.
-#
-#   2. Every instruction is emitted on its own line preceded by a unique
-#      boundary label oc_NNNNNN. The file is assembled with
-#      `clang -arch x86_64 -c`. `nm` then yields each boundary label's byte
-#      offset inside __text, `otool -l` gives the section size (the final
-#      right boundary), and `otool -t` dumps the raw byte stream. For each
-#      label sorted by offset, the instruction's bytes are the half-open run
-#      [this_offset, next_offset). Boundaries come ONLY from oc_ labels;
-#      branch-target labels and _start are ignored, and labels colliding at
-#      the same offset cannot happen because every instruction emits bytes.
-#      The final instruction's right boundary is the .Lhome label offset (the
-#      branch landing pad that terminates __text), NOT the raw section size,
-#      so the trailing pad byte never leaks into the last instruction.
-#
-#      This label-offset method is disassembler-format independent: it never
-#      parses otool's textual byte column, so changes to otool's spacing or
-#      mnemonic spelling cannot break it. Branch displacement bytes may be
-#      left as 0x00 placeholders by the assembler when it emits a relocation
-#      for a forward/extern target; that is fine -- the encoding is still a
-#      structurally valid x86 instruction and its LENGTH (the thing under
-#      test) is independent of the displacement value.
-#
-#   3. The result is written as tests/corpus/corpus.inc, one X-macro line per
-#      instruction: X("mnemonic", LEN, 0xAA,0xBB,...). The output is sorted
-#      by byte offset so it is deterministic, and the whole script is
-#      idempotent: rerunning regenerates byte-identical output for the same
-#      toolchain. Any toolchain output that cannot be parsed (missing
-#      section, unparsable nm/otool lines, a length-zero instruction, a byte
-#      count that disagrees with the section size, fewer than the expected
-#      minimum of entries) aborts the script loudly with a nonzero exit.
-#
-# Requirements: a host able to run `clang -arch x86_64 -c`, plus `nm` and
-# `otool` (Apple cder/llvm tools). No Rosetta is needed: assembling x86_64 is
-# a pure cross-compile and never executes the bytes.
-#
-# Usage: tools/gen_corpus.sh [output.inc]
-# Default output: <repo>/tests/corpus/corpus.inc
+# Generates the decoder cross-validation corpus using the host x86_64 assembler as the length oracle.
 
 set -euo pipefail
 
@@ -85,9 +18,6 @@ command -v clang  >/dev/null 2>&1 || die "clang not found in PATH"
 command -v nm     >/dev/null 2>&1 || die "nm not found in PATH"
 command -v otool  >/dev/null 2>&1 || die "otool not found in PATH"
 
-# The curated list. Format per line: "MNEMONIC ;; ASM-SOURCE".
-# Branch targets use the local label .Lhome defined at the end of __text so
-# every reference is a well-formed backward/forward relative branch.
 read -r -d '' INSN_LIST <<'EOF' || true
 add r/m8 r8 ;; add %cl, (%rax)
 add r8 r/m8 ;; add (%rax), %cl
@@ -635,9 +565,6 @@ asm="$work/corpus.s"
 obj="$work/corpus.o"
 manifest="$work/manifest.txt"
 
-# Emit the assembly file. Each instruction gets a boundary label oc_NNNNNN.
-# The branch target .Lhome sits at the very end of __text. A parallel
-# manifest records "oc_NNNNNN<TAB>MNEMONIC" for later joining with offsets.
 {
     printf '.text\n'
     printf '.globl _start\n'
@@ -663,16 +590,12 @@ n_listed="$(wc -l <"$manifest" | tr -d ' ')"
 clang -arch x86_64 -c "$asm" -o "$obj" \
     || die "assembly failed (clang -arch x86_64 -c)"
 
-# Section size = the right boundary for the final instruction.
 sec_size_hex="$(otool -l "$obj" \
     | awk '/sectname __text/{f=1} f&&/^ *size /{print $2; exit}')"
 [ -n "$sec_size_hex" ] || die "could not read __text section size from otool -l"
 sec_size=$((sec_size_hex))
 [ "$sec_size" -gt 0 ] || die "__text section size parsed as zero"
 
-# Raw byte stream of __text as a flat list of hex bytes, one per line.
-# otool -t prints "ADDR b0 b1 ... bN" rows; drop the header lines and the
-# leading address column, keep only 2-hex-digit byte tokens.
 otool -t "$obj" \
     | awk 'NR>2 {for(i=2;i<=NF;i++) if($i ~ /^[0-9a-fA-F][0-9a-fA-F]$/) print $i}' \
     >"$work/bytes.txt"
@@ -680,9 +603,6 @@ n_bytes="$(wc -l <"$work/bytes.txt" | tr -d ' ')"
 [ "$n_bytes" -eq "$sec_size" ] \
     || die "byte stream length ($n_bytes) != section size ($sec_size)"
 
-# The .Lhome landing pad terminates the real instruction stream; its offset
-# is the right boundary of the final instruction. Everything from .Lhome to
-# the section end is the single padding nop we appended.
 home_off_hex="$(nm "$obj" | awk '$3 == ".Lhome" {print $1; exit}')"
 [ -n "$home_off_hex" ] || die "could not find .Lhome label offset via nm"
 home_off=$((16#$home_off_hex))
@@ -690,8 +610,6 @@ home_off=$((16#$home_off_hex))
 [ "$home_off" -lt "$sec_size" ] \
     || die ".Lhome offset ($home_off) not before section end ($sec_size)"
 
-# Boundary label -> offset, ONLY for oc_ labels, sorted by offset ascending.
-# nm prints "OFFSET t LABEL"; keep oc_ labels, emit "DEC_OFFSET LABEL".
 nm "$obj" \
     | awk '$3 ~ /^oc_[0-9]+$/ {print $1, $3}' \
     | while read -r offhex label; do
@@ -703,8 +621,6 @@ n_off="$(wc -l <"$work/offsets.txt" | tr -d ' ')"
 [ "$n_off" -eq "$n_listed" ] \
     || die "boundary label count ($n_off) != listed instructions ($n_listed)"
 
-# Build the .inc. For each label, the byte run is [off, next_off) where
-# next_off is the following label's offset, or the section size for the last.
 emit_inc() {
     printf '/*\n'
     printf ' * tests/corpus/corpus.inc\n'
@@ -723,8 +639,6 @@ emit_inc() {
     printf ' * Regenerate with: tools/gen_corpus.sh\n'
     printf ' */\n'
 
-    # Read offsets+labels into parallel arrays via awk, then walk. The final
-    # instruction's right boundary is the .Lhome offset, not the section size.
     awk -v sec="$home_off" \
         -v manifest="$manifest" -v bytes="$work/bytes.txt" '
     BEGIN {

@@ -22,11 +22,11 @@
 
 ---
 
-Ocerz runs x86_64 Mach-O binaries directly on Apple Silicon. It does its own loading, decoding, flag emulation, JIT translation, dynamic linking and syscall forwarding to the native arm64 kernel. **Rosetta 2 is never invoked.**
+Ocerz runs x86_64 Mach-O binaries directly on Apple Silicon. It does its own loading, decoding, flag emulation, JIT translation, dynamic linking and syscall forwarding to the native arm64 kernel. Rosetta 2 is never invoked.
 
-It started as a static-binary translator. It now brings up its **own dyld** — mapping the real `dyld_shared_cache_x86_64`, linking against the system frameworks, and driving the Objective-C runtime — which is enough to run **real, unmodified macOS applications**.
+It started as a static-binary translator. It now brings up its own dyld, mapping the real `dyld_shared_cache_x86_64`, linking against the system frameworks and driving the Objective-C runtime, which is enough to run unmodified macOS applications.
 
-Ocerz ships **no Apple code**. It reimplements no framework. It links the guest against the x86_64 frameworks already installed on your own Mac, read at runtime from the system cryptex — the same way any program `dlopen`s a system library. Nothing is bundled or redistributed.
+Ocerz ships no Apple code and reimplements no framework. It links the guest against the x86_64 frameworks already on your Mac, read at runtime from the system cryptex, the same way any program `dlopen`s a system library. Nothing is bundled or redistributed.
 
 > **Dependency:** that x86_64 framework cache is the one macOS ships as part of Rosetta support, so Rosetta must be *installed*. It is never *invoked* — Ocerz does not execute a single instruction through it.
 
@@ -39,12 +39,13 @@ make check                                                 # build + run every t
 
 ## Highlights
 
-- **Its own everything.**(PLANNED) Loader, decoder, interpreter, JIT, dynamic linker, syscall layer. No Rosetta, no QEMU, no LLVM.
-- **Bit-exact flags.** `flags.c` is an eager, bit-for-bit x86 reference the JIT must match — including architecturally-undefined flags, ADC/SBB carry-in relations, and x86 NaN semantics. A differential suite proves interpreter ≡ JIT.
-- **A real dyld.** Maps the live shared cache at slide 0, walks export tries (re-exports, absolute symbols), applies chained fixups, runs initializers in dependency order, and performs the full objc↔dyld handshake.
-- **Runs real apps.** Real Cocoa apps reach window creation on the live WindowServer.
-- **More faithful than Rosetta, in places.** See the note under [Status](#status).
-- **Encoders validated by execution.** Every arm64 encoding is proven by running it, not by reading it.
+- Own loader, decoder, interpreter, JIT, dynamic linker and syscall layer. No Rosetta, no QEMU, no LLVM.
+- `flags.c` is an eager bit-for-bit x86 flag reference, including the architecturally-undefined
+  bits, ADC/SBB carry-in and x86 NaN semantics. A differential suite checks interpreter against JIT.
+- The mini-dyld maps the live shared cache at slide 0, walks export tries, applies chained
+  fixups, runs initializers in dependency order and does the objc/dyld handshake.
+- Cocoa apps reach window creation against the real WindowServer.
+- arm64 encodings are validated by executing them, not by reading the manual.
 
 ## Status
 
@@ -70,9 +71,9 @@ JIT speedup on `fib(30)`: **0.59s → 0.08s (~7.5×)**.
 
 Ocerz runs real x86_64 Cocoa apps end-to-end with zero translator faults.
 
-To be precise about what that means: Ocerz does not reimplement any framework. Everything above the translator is **Apple's own real x86_64 code, executed under translation** straight out of the shared cache — libobjc (classes, categories, `+load`, protocols), Swift, libdispatch, XPC, Foundation, AppKit. The only piece Ocerz supplies in that stack is **dyld**: it maps the real `dyld_shared_cache_x86_64`, resolves and fixes up symbols, runs the initializers, and answers the dyld API calls those frameworks make. That is what makes the genuine AppKit run.
+Nothing above the translator is reimplemented. libobjc (classes, categories, `+load`, protocols), Swift, libdispatch, XPC, Foundation and AppKit are Apple's own x86_64 code out of the shared cache, executed under translation. The one piece Ocerz supplies is dyld: it maps the cache, resolves and fixes up symbols, runs the initializers and answers the dyld API calls those frameworks make.
 
-`Mousecape.app` reaches **window creation on the live WindowServer**: its main window comes up at **711×342** against a native Rosetta control's **711×339**, alongside AppKit's four menu-bar windows at pixel-identical geometry.
+`Mousecape.app` reaches window creation on the live WindowServer. Its main window comes up at 711×342 against a native Rosetta control's 711×339, alongside AppKit's four menu-bar windows at pixel-identical geometry.
 
 This is early. The window comes up on roughly half of launches; the other half hang before it appears. See [What does NOT work yet](#what-does-not-work-yet).
 
@@ -80,17 +81,20 @@ This is early. The window comes up on roughly half of launches; the other half h
 
 ## Benchmarks
 
-The *same* unmodified x86_64 binary, timed under Ocerz and under Rosetta 2 on the same Apple Silicon machine — best of three, wall-clock, byte-identical output from both engines. Ocerz is now at rough parity with Rosetta 2 on compute-bound kernels:
+Same x86_64 binary run under both engines, same machine, best of three:
 
-| Kernel | Rosetta 2 | Ocerz | vs Rosetta |
-| --- | --- | --- | --- |
-| `alu` — tight register-ALU loop | 0.49s | 0.49s | **parity** |
-| `br` — data-dependent branch loop | 0.88s | 0.31s | **2.8× faster** |
-| `fib(42)` — recursive call / return | 0.67s | 1.09s | 1.6× slower |
+| Kernel | Rosetta 2 | Ocerz |
+| --- | --- | --- |
+| `alu` (register ALU loop) | 0.49s | 0.49s |
+| `br` (data-dependent branches) | 0.88s | 0.31s |
+| `fib(42)` (call/return) | 0.67s | 1.09s |
 
-Ocerz beats Rosetta on the branch kernel because two-way basic-block linking branches straight between compiled blocks with no dispatcher round-trip. The recursive-call kernel is the remaining gap, dominated by the call/return path. These are microbenchmarks — a real workload's mix sits between them.
+Branch-heavy code wins from two-way block linking, which jumps straight between compiled
+blocks instead of returning to the dispatcher. Call/return is still the weak spot. Both
+engines produce byte-identical output. `tests/run_bench_compare.sh` reproduces it.
 
-Blocks translate in a single-observer *plain-memory* tier (ordinary `ldr`/`str`) and permanently switch to x86-TSO ordered accesses (`ldar`/`stlr`) the moment guest memory can become visible to another thread or process. Reproduce with `tests/run_bench_compare.sh`.
+Loads and stores are plain `ldr`/`str` while the process is single-observer, and switch to
+`ldar`/`stlr` for x86-TSO once guest memory can be seen by another thread or process.
 
 ## CLI
 
@@ -119,7 +123,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 **Eager flags.** Flags are evaluated eagerly into `cpu->rflags`; `flags.c` is the bit-for-bit reference the JIT must match — ADC/SBB folded via carry-in relations, INC/DEC preserving CF, deterministic values for architecturally-undefined flags, and x86 NaN semantics (negative QNaN indefinite, propagation rules).
 
-**The JIT.** A block is the straight-line run from an entry rip to the first control-flow or system instruction. Each block is decoded once; cheap ops are inlined as arm64 and everything else calls back into the shared interpreter dispatch, so the JIT and interpreter can never disagree on semantics. A 1GB `MAP_JIT` reservation (address space, not RSS) with `pthread_jit_write_protect_np` and per-block icache invalidation; a 2^20-bucket cache keyed by guest rip with a lock-free lookup on the hot path. Stack traffic (`push`/`pop`) is inlined natively -- it is ~27% of everything a real app executes. If the arena ever fills, a block is demoted to the interpreter tier rather than retried forever. Aligned guest loads/stores use ordinary `ldr`/`str` while the process is provably single-observer and upgrade to `ldar`/`stlr` once guest memory can be shared with another thread or process, so x86's TSO ordering survives arm64's weak memory model without paying for barriers that single-threaded code cannot observe.
+**The JIT.** A block is the straight-line run from an entry rip to the first control-flow or system instruction. Each block is decoded once; cheap ops are inlined as arm64 and everything else calls back into the shared interpreter dispatch, so the JIT and interpreter can never disagree on semantics. A 1GB `MAP_JIT` reservation (address space, not RSS) with `pthread_jit_write_protect_np` and per-block icache invalidation; a 2^20-bucket cache keyed by guest rip with a lock-free lookup on the hot path. Stack traffic (`push`/`pop`) is inlined natively, since it is ~27% of everything a real app executes. If the arena ever fills, a block is demoted to the interpreter tier rather than retried forever. Aligned guest loads/stores use ordinary `ldr`/`str` while the process is provably single-observer and upgrade to `ldar`/`stlr` once guest memory can be shared with another thread or process, so x86's TSO ordering survives arm64's weak memory model without paying for barriers that single-threaded code cannot observe.
 
 **The mini-dyld.** Maps the real `dyld_shared_cache_x86_64` at slide 0 and implements the dyld runtime API surface that libdyld's trampolines dispatch through — `dlopen`/`dlsym`, image lists, TLV, unwind, `_dyld_register_for_bulk_image_loads` — plus the objc↔dyld handshake (`_dyld_objc_register_callbacks`, `map_images`/`load_images`, and the shared cache's selector and class perfect-hash tables).
 
@@ -129,11 +133,9 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 ## What does NOT work yet
 
-An honest shortlist:
-
-- **A real app hangs on roughly half of launches.** When it works, `Mousecape.app` reaches its window in ~19s and settles to 0% CPU. When it does not, the process parks at 0% CPU with no window and macOS reports *"Application not responding"* — the main thread never services the run loop. Measured over 24 consecutive launches: 13 OK, 8 hung, 3 died (45.8% failure). It is a **lost-wakeup race in the libdispatch workloop bridge**: one workloop gets armed (`EVFILT_WORKLOOP`, `EV_ADD|EV_ENABLE`) over 140 times and is never drained, and everything then parks. Being actively worked on; this is the single blocker to a usable app.
-- **Wine** — bring-up is in progress (see `notes/wine_bringup.md`); `wineboot` runs end-to-end into the GUI layer.
-- **Post-boot image loads** — categories and `+load` run for the launch closure, but later batch loads (post-boot `dlopen`) are not yet re-notified through `_dyld_register_for_bulk_image_loads`.
+- A real app hangs on roughly half of launches. When it works, `Mousecape.app` reaches its window in ~19s and settles to 0% CPU. When it does not, the process parks at 0% CPU with no window and macOS reports "Application not responding": the main thread never services the run loop. Over 24 consecutive launches, 13 OK, 8 hung, 3 died. It is a lost-wakeup race in the libdispatch workloop bridge, where one workloop is armed (`EVFILT_WORKLOOP`, `EV_ADD|EV_ENABLE`) over 140 times, never drained, and everything parks. This is the single blocker to a usable app.
+- Wine bring-up is in progress (see `notes/wine_bringup.md`); `wineboot` runs end-to-end into the GUI layer.
+- Categories and `+load` run for the launch closure, but later batch loads (post-boot `dlopen`) are not yet re-notified through `_dyld_register_for_bulk_image_loads`.
 
 Other rough edges: x87 is 64-bit double, not 80-bit; `RSQRT`/`RCP` are exact rather than the ~12-bit approximations; MXCSR dynamic rounding is ignored (assumes round-to-nearest); the JIT block cache is never invalidated (no self-modifying-code support); guest `mprotect` is resolved onto 16KB host pages (permissive changes round outward, restrictive inward, so a shared page keeps the union); the stack guard is fixed rather than randomized; inbound OOL relocation covers flat Mach messages but not `MACH64_MSG_VECTOR` receives.
 

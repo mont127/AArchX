@@ -1,9 +1,4 @@
-/*
- * The single-CPU JIT may emit plain LDR/STR, but the first shared-memory or
- * concurrency operation must retire that generation before another observer
- * exists. Exercise the public transition directly so cache retirement, chain
- * invalidation, RAS purge, ordered retranslation, and idempotence stay covered.
- */
+/* The plain-to-ordered JIT retire on the first shared mapping. */
 #include "ocerz/cpu.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"
@@ -63,13 +58,10 @@ int main(void)
         return 2;
     }
 
-    /* A: mov %rax,(%rdi); call B. A native direct CALL owns an activatable
-     * cross-block edge, which lets this test cover its retirement too. */
     const uint8_t store[] = { 0x48, 0x89, 0x07 };
     memcpy(ocerz_g2h(A_RIP), store, sizeof store);
     emit_rel32(A_RIP + sizeof store, 0xe8, B_RIP);
 
-    /* B: add $1,%rax; jmp DONE. */
     const uint8_t add[] = { 0x48, 0x83, 0xc0, 0x01 };
     memcpy(ocerz_g2h(B_RIP), add, sizeof add);
     emit_rel32(B_RIP + sizeof add, 0xe9, DONE_RIP);
@@ -96,9 +88,6 @@ int main(void)
     CHECK(ocerz_jit_blocks(vm.jit) == 2, "plain generation blocks=%llu",
           (unsigned long long)ocerz_jit_blocks(vm.jit));
 
-    /* Re-enter the cached generation and verify its memory access. Whether the
-     * direct edge activates is deliberately not part of this mode-transition
-     * contract; CALL-region eligibility may conservatively leave it dispatched. */
     CHECK(step_at(&vm, A_RIP, 20) == OCERZ_STEP_OK,
           "cached plain A did not return STEP_OK");
     CHECK((vm.cpu.rip == B_RIP || vm.cpu.rip == DONE_RIP),
@@ -120,8 +109,6 @@ int main(void)
           "transition changed translation count=%llu",
           (unsigned long long)ocerz_jit_blocks(vm.jit));
 
-    /* The old buckets are empty: the same RIPs compile a fresh ordered
-     * generation. Each should translate once, then remain cached. */
     CHECK(step_at(&vm, A_RIP, 30) == OCERZ_STEP_OK,
           "ordered A did not return STEP_OK");
     CHECK(vm.cpu.rip == B_RIP, "ordered A rip=%#llx",

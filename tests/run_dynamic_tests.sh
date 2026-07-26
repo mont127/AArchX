@@ -1,24 +1,5 @@
 #!/usr/bin/env bash
-#
-# tests/run_dynamic_tests.sh
-#
-# End-to-end test of Ocerz's mini-dyld (the dynamic-loading path, src/dyld.c):
-# build small DYNAMICALLY-LINKED x86_64 Mach-O programs (LC_MAIN, linked
-# against libSystem) and run each under ./ocerz, checking stdout and exit
-# code. Unlike the static guest suite (raw-syscall, -nostdlib binaries), these
-# are normal dynamic executables that go through cache mapping, slide rebasing,
-# chained-fixup binding, and a jump into shared-cache code.
-#
-# Advisory: requires the x86_64 dyld shared cache to be mappable (it is on a
-# normal Apple Silicon macOS host but not on a CI box or under SIP variations)
-# and an x86_64-capable clang. If either is missing the script prints SKIP and
-# succeeds, so it can run from `make check` without being machine-specific.
-#
-# Coverage today reflects the dynamic-loading milestone: programs that do NOT
-# depend on libSystem's runtime initializers run fully (a no-libc program and
-# a raw-`syscall` writer). Programs that call into libc proper (printf) reach
-# and execute real cache code but stop at the libSystem-initializer wall; those
-# are listed as KNOWN-PENDING and not counted as failures.
+# End-to-end tests for the mini-dyld: real dynamically-linked Mach-O programs against the shared cache.
 
 set -u
 cd "$(dirname "$0")/.."

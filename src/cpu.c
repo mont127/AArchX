@@ -1,20 +1,4 @@
-/*
- * src/cpu.c
- *
- * CPU lifecycle helpers: architectural reset state and the diagnostic
- * register dump used by fatal-error paths and the -trace mode.
- *
- * Reset state mirrors what XNU hands a fresh x86_64 user thread: all GPRs
- * zero, rflags 0x202 (fixed bit 1 plus IF — user code always sees
- * interrupts enabled), x87 control word 0x037f (all exceptions masked,
- * 64-bit precision, round-to-nearest), MXCSR 0x1f80 (all SSE exceptions
- * masked, round-to-nearest), empty x87 stack (ftw 0, ftop 0), zeroed XMM
- * registers and segment bases.
- *
- * The dump prints every GPR, rip, rflags with decoded mnemonic letters,
- * segment bases, and the low halves of the XMM registers — enough to
- * diagnose any divergence without drowning the terminal.
- */
+/* CPU reset state, plus the register dump used by fatal paths and -trace. */
 #include "ocerz/cpu.h"
 #include "ocerz/mem.h"
 
@@ -40,13 +24,7 @@ void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out)
         fprintf(out, "%-4s=%016llx  %-4s=%016llx\n",
                 names[i], (unsigned long long)cpu->gpr[i],
                 names[i + 1], (unsigned long long)cpu->gpr[i + 1]);
-    /* Any register left pointing at a printable C string is very often the crash REASON.
-     * The shared cache's abort paths stage their message through a register immediately
-     * before aborting -- libdispatch loads its reason into rcx for the crash-log slot, and
-     * libmalloc's reporter keeps the formatted "%s(%d,%p) malloc: ..." text in rbx across
-     * the same store -- so a bare UD2 dump can be turned into the library's own diagnosis
-     * for free. Bounded, and re-checks commitment at every page boundary so scanning a
-     * non-string register can never fault the dumper itself. */
+
     for (int i = 0; i < 16; i++) {
         uint64_t v = cpu->gpr[i];
         char s[192];
@@ -72,11 +50,7 @@ void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out)
             fprintf(out, "%-4s->\"%s\"\n", names[i], s);
         }
     }
-    /* OCERZ_MSGPTR=<addr>: print the C string that <addr> POINTS TO, one indirection more
-     * than OCERZ_STRDUMP. An aborting library publishes its reason by storing the message
-     * pointer into a crash-log global (CRSetCrashLogMessage) and only then calling abort, so
-     * by the time the UD2 lands the register that carried the text has been reused by the
-     * intervening frames -- but the global still holds it. */
+
     {
         const char *mp = getenv("OCERZ_MSGPTR");
         if (mp) {

@@ -1,38 +1,8 @@
-/*
- * tests/guest/flags_deferred.c
- *
- * ADVERSARIAL flag-materialize gate. The committed flags.c differential test
- * captures RFLAGS but does it in tiny one-op call/ret helpers that fall UNDER
- * the OCERZ_PIN_MIN_INSNS (default 24) size gate, so they run the JIT's EAGER
- * flag path -- ocerz_flags_materialize() is never exercised through a captured
- * consumer there. alu.c builds big deferred blocks but folds only DATA into its
- * checksum (its produced flags are dead). So neither existing binary proves the
- * DEFERRED reconstruction is bit-exact against a PUSHF/SETcc consumer.
- *
- * This program closes that hole: each capture_* routine is a SINGLE straight-
- * line inline-asm block of >= 24 x86 instructions (no calls, no internal
- * branches) so the JIT translates it as one block, clears the size gate, DEFERS
- * every ADD/SUB/AND/OR/XOR/INC/DEC/SHL/SHR/SAR in it, and then materializes at
- * the interleaved PUSHF and SETcc consumers. The captured flags (masked to the
- * six arithmetic flags) are folded into a checksum. Any divergence between the
- * deferred JIT path and the interpreter reference changes the output, which the
- * interp-vs-jit differential flags.
- *
- * Corner cases stressed through the deferred path: shift CF/OF at count 1 and
- * larger counts; INC/DEC with CF live going in (INC/DEC preserve CF, which the
- * deferred record must snapshot); AF low-nibble carries; PF byte parity; the
- * architecturally-undefined-but-deterministic bits after logic and shifts; and
- * chains where a deferred producer is immediately followed by another producer
- * (so the record is overwritten, not materialized) before a final capture.
- */
+/* Adversarial gate for deferred flag materialization. */
 #include "gsys.h"
 
-#define AM 0x0cd5ULL   /* CF PF AF ZF SF OF */
+#define AM 0x0cd5ULL
 
-/* One big single-block sweep over 64-bit ADD/SUB/logic with PUSHF captures
- * interleaved so a deferred producer is immediately materialized by the next
- * PUSHF. r15 accumulates; everything is forced into fixed registers and the
- * block has no call/branch, so the JIT compiles it as one >= 24-insn block. */
 static g_u64 cap_block_a(g_u64 a, g_u64 b)
 {
     g_u64 out;
@@ -41,24 +11,24 @@ static g_u64 cap_block_a(g_u64 a, g_u64 b)
         "mov %1, %%rcx\n\t"
         "mov %2, %%rdx\n\t"
 
-        "add %%rdx, %%rcx\n\t"   /* deferred ADD */
+        "add %%rdx, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
 
-        "sub %%rdx, %%rcx\n\t"   /* deferred SUB */
+        "sub %%rdx, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
 
-        "and %%rdx, %%rcx\n\t"   /* deferred LOGIC (AND) */
+        "and %%rdx, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
 
-        "or %%rdx, %%rcx\n\t"    /* deferred LOGIC (OR) */
+        "or %%rdx, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
 
-        "xor %%rdx, %%rcx\n\t"   /* deferred LOGIC (XOR) */
+        "xor %%rdx, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
 
-        "add %%rbx, %%rcx\n\t"   /* deferred ADD, immediately overwritten... */
-        "sub %%rbx, %%rcx\n\t"   /* ...by deferred SUB before any capture */
-        "cmp %%rdx, %%rcx\n\t"   /* deferred CMP (no writeback) */
+        "add %%rbx, %%rcx\n\t"
+        "sub %%rbx, %%rcx\n\t"
+        "cmp %%rdx, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
 
         "mov %%r15, %0\n\t"
@@ -68,9 +38,6 @@ static g_u64 cap_block_a(g_u64 a, g_u64 b)
     return out;
 }
 
-/* INC/DEC with CF seeded live, in one block, captured after each -- the
- * deferred INC/DEC record must snapshot the incoming CF (which itself may be a
- * deferred predecessor's CF). SHL/SHR/SAR at count 1 and larger, captured. */
 static g_u64 cap_block_b(g_u64 a, g_u64 b, int seed_cf)
 {
     g_u64 out;
@@ -79,27 +46,27 @@ static g_u64 cap_block_b(g_u64 a, g_u64 b, int seed_cf)
         "mov %1, %%rcx\n\t"
         "mov %2, %%rdx\n\t"
 
-        "add %%rdx, %%rdx\n\t"    /* deferred ADD sets CF from seed value */
+        "add %%rdx, %%rdx\n\t"
         "test %3, %3\n\t"
         "jz 1f\n\t stc\n\t jmp 2f\n\t 1: clc\n\t 2:\n\t"
-        "inc %%rcx\n\t"           /* deferred INC (must preserve the CF just set) */
+        "inc %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
-        "dec %%rcx\n\t"           /* deferred DEC (preserve CF from INC's record) */
+        "dec %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
         "inc %%rcx\n\t"
-        "dec %%rcx\n\t"           /* INC then DEC, only last captured */
+        "dec %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
 
         "mov %%rdx, %%rcx\n\t"
-        "shl $1, %%rcx\n\t"       /* deferred SHL count 1 (OF defined) */
+        "shl $1, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
-        "shl $7, %%rcx\n\t"       /* deferred SHL count 7 */
+        "shl $7, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
-        "shr $1, %%rcx\n\t"       /* deferred SHR count 1 */
+        "shr $1, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
         "shr $9, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
-        "sar $1, %%rcx\n\t"       /* deferred SAR count 1 (OF=0) */
+        "sar $1, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
         "sar $13, %%rcx\n\t"
         "pushfq\n\t pop %%rax\n\t and $0x0cd5, %%rax\n\t xor %%rax, %%r15\n\t"
@@ -111,8 +78,6 @@ static g_u64 cap_block_b(g_u64 a, g_u64 b, int seed_cf)
     return out;
 }
 
-/* 32-bit deferred ops with SETcc consumers (SETcc reads flags via the slow
- * path, materializing the deferred record) in one straight-line block. */
 static g_u64 cap_block_c(g_u32 a, g_u32 b)
 {
     g_u64 out;
@@ -121,19 +86,19 @@ static g_u64 cap_block_c(g_u32 a, g_u32 b)
         "mov %k1, %%ecx\n\t"
         "mov %k2, %%edx\n\t"
 
-        "add %%edx, %%ecx\n\t"     /* deferred 32-bit ADD */
+        "add %%edx, %%ecx\n\t"
         "seto %%al\n\t movzbq %%al, %%rax\n\t xor %%rax, %%r15\n\t"
-        "sub %%edx, %%ecx\n\t"     /* deferred 32-bit SUB */
+        "sub %%edx, %%ecx\n\t"
         "setb %%al\n\t movzbq %%al, %%rax\n\t add %%rax, %%r15\n\t"
-        "and %%edx, %%ecx\n\t"     /* deferred 32-bit AND */
+        "and %%edx, %%ecx\n\t"
         "sets %%al\n\t movzbq %%al, %%rax\n\t xor %%rax, %%r15\n\t"
-        "shl $1, %%ecx\n\t"        /* deferred 32-bit SHL */
+        "shl $1, %%ecx\n\t"
         "setc %%al\n\t movzbq %%al, %%rax\n\t add %%rax, %%r15\n\t"
-        "sar $5, %%ecx\n\t"        /* deferred 32-bit SAR */
+        "sar $5, %%ecx\n\t"
         "sets %%al\n\t movzbq %%al, %%rax\n\t xor %%rax, %%r15\n\t"
-        "inc %%ecx\n\t"            /* deferred 32-bit INC */
+        "inc %%ecx\n\t"
         "sete %%al\n\t movzbq %%al, %%rax\n\t add %%rax, %%r15\n\t"
-        "cmp %%edx, %%ecx\n\t"     /* deferred 32-bit CMP */
+        "cmp %%edx, %%ecx\n\t"
         "setle %%al\n\t movzbq %%al, %%rax\n\t xor %%rax, %%r15\n\t"
         "setg %%al\n\t movzbq %%al, %%rax\n\t add %%rax, %%r15\n\t"
 

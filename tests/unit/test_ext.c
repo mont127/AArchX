@@ -1,38 +1,4 @@
-/*
- * tests/unit/test_ext.c
- *
- * Unit tests for ocerz_interp_ext(): string ops, bit ops, the bit scans,
- * CPUID/RDTSC, and the x87 subset. The harness mirrors the planned
- * test_interp.c pattern: reserve a guest arena with ocerz_mem_init(), map a
- * scratch page, reset a CPU, place hand-encoded instruction bytes (or set up
- * operands directly via a synthesized X86Insn), call the handler, and assert
- * on the resulting CPU/memory state.
- *
- * Because ocerz_decode() is owned by another translation unit and may not be
- * linkable in isolation, the tests build X86Insn structures by hand. This is
- * legitimate: ocerz_interp_ext() consumes a decoded X86Insn, and the decode
- * contract (decode.h) fully specifies every field, so a hand-built insn is
- * exactly what the decoder would have produced. The few real-encoding cases
- * (CPUID) need no decoder either because they take no operands.
- *
- * A tiny check() macro counts assertions and prints the first failure with
- * file/line; main() returns non-zero if any assertion failed so `make unit`
- * stops on error. We target well over forty assertions across the families
- * named in the task: rep movsb forward/backward, rep stosq, repne scasb
- * found/not-found, cmpsb flags, BT against a distant byte via a large signed
- * register bit offset, BSF/BSR zero-source destination preservation, POPCNT
- * flag clearing, CPUID leaf 0/1/brand reassembly, RDTSC monotonicity, and a
- * spread of x87 behavior including 80-bit FLD/FSTP round-trips, FILD/FISTP
- * rounding under FLDCW, and FCOMI flag patterns with NaN.
- *
- * The scratch region is set up WITHOUT relying on ocerz_mem_init(): that
- * routine demands the kernel grant one of a fixed list of multi-gigabyte
- * arena base addresses exactly, which some host machines refuse. Instead we
- * mmap a plain host buffer and choose ocerz_guest_base so the guest_base
- * affine map (g2h(g) = g + guest_base) lands a known guest address on that
- * buffer. The sized load/store helpers in mem.h only use that mapping, so
- * this is a faithful, host-independent way to exercise the handler.
- */
+/* Unit tests for the extended interpreter ops. */
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/vm.h"
@@ -41,7 +7,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/mman.h>
-
 
 static void x87_push_helper(OcerzCPU *c, double v);
 
@@ -116,7 +81,7 @@ static X86Insn mk(int op, int opsize)
 {
     X86Insn i;
     memset(&i, 0, sizeof i);
-    i.op = (uint16_t)op;   /* X86Insn.op is 16-bit; the enum passed 255 long ago */
+    i.op = (uint16_t)op;
     i.opsize = (uint8_t)opsize;
     i.addrsize = 8;
     i.rep = OCERZ_REP_NONE;
@@ -543,19 +508,10 @@ static void test_cpuid_rdtsc(OcerzVM *vm)
     check(c->gpr[OCERZ_RDX] == 0);
 }
 
-/* FXSAVE/FXRSTOR must cover XMM0-15 and MXCSR_MASK, not just the x87 state.
- *
- * This was untested, and the omission was not academic: Wine's __wine_syscall_dispatcher
- * does not rely on the CPU preserving registers across a syscall -- it FXSAVEs and then
- * reloads the Win64 non-volatile xmm6-xmm15 with movaps straight out of this memory image.
- * With the XMM area never written, every PE Nt* syscall restored stack garbage (usually
- * zero) into xmm6-15, ntdll's acl->actctx came back NULL, and wineboot died on it. Assert
- * the whole image round-trips, since "preserves registers" and "writes the save area" are
- * different properties and only the second one is what the guest actually asked for. */
 static void test_fxsave_xmm(OcerzVM *vm)
 {
     OcerzCPU *c = &vm->cpu;
-    uint64_t m = g_scratch + 0x1000;      /* 16-byte aligned */
+    uint64_t m = g_scratch + 0x1000;
 
     setup(vm);
     for (int i = 0; i < 16; i++) {
@@ -564,7 +520,7 @@ static void test_fxsave_xmm(OcerzVM *vm)
     }
     c->mxcsr = 0x1f80;
     for (uint64_t off = 0; off < 512; off += 8)
-        ocerz_st(m + off, 8, 0xAAAAAAAAAAAAAAAAull);   /* poison: prove it is written */
+        ocerz_st(m + off, 8, 0xAAAAAAAAAAAAAAAAull);
 
     X86Insn fxs = mk(OCERZ_OP_FXSAVE, 8);
     fxs.nops = 1;
@@ -574,10 +530,9 @@ static void test_fxsave_xmm(OcerzVM *vm)
         check(ocerz_ld(m + 160 + (uint64_t)i * 16 + 0, 8) == c->xmm[i].lo);
         check(ocerz_ld(m + 160 + (uint64_t)i * 16 + 8, 8) == c->xmm[i].hi);
     }
-    check(ocerz_ld(m + 24, 4) == 0x1f80);              /* MXCSR      */
-    check(ocerz_ld(m + 28, 4) == 0x0000ffff);          /* MXCSR_MASK */
+    check(ocerz_ld(m + 24, 4) == 0x1f80);
+    check(ocerz_ld(m + 28, 4) == 0x0000ffff);
 
-    /* and the mirror: FXRSTOR must load them back */
     for (int i = 0; i < 16; i++) {
         c->xmm[i].lo = 0;
         c->xmm[i].hi = 0;

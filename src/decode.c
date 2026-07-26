@@ -1,62 +1,4 @@
-/*
- * src/decode.c
- *
- * The complete x86_64 instruction decoder. It is PURE: it reads only the byte
- * buffer handed to it and never touches CPU or guest-memory state. The single
- * entry point ocerz_decode() turns the bytes at code[0] (architecturally
- * located at guest address `rip`) into one X86Insn per the contract in
- * include/ocerz/decode.h. ocerz_op_name() and ocerz_format_insn() are the
- * human-readable side, used only for tracing.
- *
- * Design overview
- * ---------------
- * A small DecState carries the live cursor (a byte pointer plus a remaining
- * count), the resolved prefix state, and the accumulating X86Insn. Every byte
- * read goes through fetch helpers that return OCERZ_ETRUNC the moment the
- * window is exhausted, so no path ever reads past `avail`. After a successful
- * decode the total length is recomputed from the cursor and checked against
- * the 15-byte architectural ceiling (OCERZ_ETOOLONG).
- *
- * Prefix loop. Legacy prefixes (66 67 F0 F2 F3 and the six segment bytes) may
- * appear in any order and any count. REX (40..4F) is captured only when it is
- * the LAST byte before the opcode, including immediately before a 0F escape; a
- * legacy prefix appearing after a REX byte discards that REX exactly as the
- * hardware does. The last-seen of F2/F3 wins for mandatory-prefix selection
- * and F2/F3 outrank 66 when both are present; 66 is only the operand-size
- * override when no F2/F3 is in effect for an SSE opcode.
- *
- * ModRM / SIB / displacement follow the standard 64-bit tables. mod=00 rm=101
- * is RIP-relative and is pre-resolved into an absolute address per the header
- * (disp = rip + insn_len + disp32, riprel=1). rm=100 always pulls a SIB byte;
- * index=100 without REX.X means no index; base=101 with mod=00 means a bare
- * disp32 with no base. REX.B extends rm/base and the embedded opcode register,
- * REX.X the index, REX.R the reg field; .scale stores the raw 2-bit SIB scale
- * (already the LOG2 the contract wants).
- *
- * Operand size defaults to 4, becomes 2 under 66, becomes 8 under REX.W (which
- * beats 66). The stack/branch family (PUSH/POP/CALL/RET/JMP/Jcc/LEAVE) defaults
- * to 8 in long mode, droppable to 2 by a 66 prefix. Address size is 8 unless a
- * 67 prefix makes it 4. Immediates are stored already sign-extended to 64 bits
- * except MOV r64,imm64 (B8+r with REX.W) and the moffs forms, which carry the
- * raw 8 bytes.
- *
- * 8-bit register encodings 4..7 with NO REX are the high-byte regs AH/CH/DH/BH
- * (reg = enc-4, high8=1); with any REX present they are SPL/BPL/SIL/DIL.
- *
- * Anything not on the explicit coverage list is rejected with OCERZ_EUNDEF.
- * Deliberately rejected families are listed in the final report: CLI/STI,
- * IN/OUT/INS/OUTS, far CALL/JMP/RET, ARPL, BOUND, AAA/AAS/AAD/AAM/DAA/DAS,
- * segment push/pop, LES/LDS, LGDT/LIDT/LMSW and the rest of 0F 00/01, all MMX
- * register forms (no-66 SSE2 integer twins), the entire VEX/EVEX space, RDRAND/
- * RDSEED, MOVNTPS/streaming-store variants not listed, and SSE3/SSSE3/SSE4
- * opcodes outside the enumerated set.
- *
- * Tables. The bulk of the work is opcode dispatch. To keep it auditable it is
- * written as explicit switch statements per map (one byte, 0F, 0F38, 0F3A, and
- * the eight x87 escapes) rather than data tables, because the per-opcode
- * operand shapes vary too much to compress cleanly and the switch form makes
- * the coverage list directly checkable against the code.
- */
+/* The x86_64 instruction decoder. */
 #include "ocerz/decode.h"
 #include "ocerz/cpu.h"
 #include "ocerz/flags.h"
@@ -819,14 +761,7 @@ static int group45(DecState *s, uint8_t op)
         return OCERZ_OK;
     case 3:
     case 5: {
-        /* Far CALL (/3) and far JMP (/5), m16:32 or m16:64. The MEMORY form is the only
-         * legal one -- mod==3 is undefined -- and it is what wow64cpu.dll uses to enter
-         * 32-bit code (41 ff 2e = REX.B + FF /5 through [r14]).
-         *
-         * The operand is recorded as a plain MEM of the OFFSET width (4, or 8 under REX.W),
-         * not as a 6/10-byte pointer: the far-ness is carried by the opcode, so no other
-         * code path ever sees an operand with an unusual size it would mis-handle. The
-         * selector lives immediately after the offset, at ea + opsize. */
+
         if (rm_is_reg(&m))
             return OCERZ_EUNDEF;
         set_op(s, idx == 3 ? OCERZ_OP_CALLF : OCERZ_OP_JMPF);
@@ -1013,10 +948,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
         return OCERZ_OK;
     }
     case 0x8c: {
-        /* MOV r/m16, Sreg — store a segment SELECTOR. x86_64 has no real
-         * segmentation; the selectors are fixed constants in macOS user mode
-         * (CS=0x2b, SS=0x23, the rest 0), which Wine reads to fill a Windows
-         * CONTEXT. Emit the constant as a 16-bit immediate MOV into r/m. */
+
         static const uint16_t seg_sel[8] = {
             0x00, 0x2b, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00,
         };
@@ -1032,13 +964,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
         return OCERZ_OK;
     }
     case 0x8e: {
-        /* MOV Sreg, r/m16. Still architecturally inert in flat 64-bit user mode -- FS/GS
-         * bases come from the machdep TLS syscall there, not from the selector -- but it is
-         * no longer discarded, because WoW64 installs the 32-bit TEB with exactly this
-         * instruction (41 8e a5 90 00 00 00 = mov fs, word [r13+0x90]) using an LDT
-         * selector. The interpreter applies a base ONLY when the selector really denotes an
-         * LDT segment that has one, so 64-bit code keeps the old no-op behaviour.
-         * ops[1] carries the destination segment (0=ES 1=CS 2=SS 3=DS 4=FS 5=GS). */
+
         ModRM m;
         e = decode_modrm(s, &m, 2);
         if (e)
@@ -1300,21 +1226,18 @@ static int decode_one_byte(DecState *s, uint8_t op)
         s->out->opsize = 8;
         s->out->nops = 0;
         return OCERZ_OK;
-    case 0xca:                      /* RETF imm16: far return, then pop imm16 bytes */
+    case 0xca:
         set_op(s, OCERZ_OP_RETF);
         s->out->opsize = (uint8_t)opsize_default(s);
         s->out->nops = 1;
         return read_imm16(s, &s->out->ops[0]);
-    case 0xcb:                      /* RETF */
+    case 0xcb:
         set_op(s, OCERZ_OP_RETF);
         s->out->opsize = (uint8_t)opsize_default(s);
         s->out->nops = 0;
         return OCERZ_OK;
     case 0xcf:
-        /* IRETD/IRETQ: pop the interrupt frame (RIP, CS, RFLAGS, RSP, SS),
-         * element size = operand size (8 with REX.W = IRETQ, else 4). Wine's
-         * NtContinue / syscall-dispatcher build a fake iret frame and use this
-         * to restore a full register context. */
+
         set_op(s, OCERZ_OP_IRET);
         s->out->opsize = (uint8_t)opsize_default(s);
         s->out->nops = 0;
@@ -1824,7 +1747,7 @@ static int decode_0f(DecState *s, uint8_t op2)
         if (mand == MAND_F2)
             return decode_sse_rr(s, OCERZ_OP_HSUBPS, 16, 1);
         return OCERZ_EUNDEF;
-    case 0xd0: /* SSE3 ADDSUBPD (66) / ADDSUBPS (F2): subtract even lanes, add odd lanes */
+    case 0xd0:
         if (mand == MAND_66)
             return decode_sse_rr(s, OCERZ_OP_ADDSUBPD, 16, 1);
         if (mand == MAND_F2)

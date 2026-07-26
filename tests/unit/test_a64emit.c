@@ -1,19 +1,4 @@
-/*
- * tests/unit/test_a64emit.c
- *
- * Run-don't-read validation of the arm64 emitter. Each test emits a short
- * sequence into a MAP_JIT buffer, publishes it (W^X toggle plus instruction
- * cache invalidation), then CALLS it as a native function and checks the
- * result. An encoding bug therefore cannot pass: a wrong opcode either
- * computes the wrong value, branches wrong, or faults. The harness builds
- * each function with a uniform prologue/epilogue (the emitter's stp/ldp
- * pair) only where a call is needed; most tests are leaf sequences ending
- * in RET that take up to two uint64 arguments in x0/x1 and return x0.
- *
- * jit_alloc grabs one MAP_JIT page; emit_begin/emit_end wrap the W^X
- * toggle and sys_icache_invalidate around emission. CHECK records failures
- * without aborting so one run reports every broken encoding at once.
- */
+/* Run-don't-read validation of the arm64 emitter. */
 #include "ocerz/a64emit.h"
 
 #include <sys/mman.h>
@@ -74,8 +59,7 @@ static void b_movimm2(A64Buf *b) { a64_mov_imm64(b, 0, 0xffffffffffff0000ull); a
 static void b_movimm3(A64Buf *b) { a64_mov_imm64(b, 0, 0x000000000000ffffull); a64_ret(b); }
 static void b_movimm4(A64Buf *b) { a64_mov_imm64(b, 0, 0xffffffffffffffffull); a64_ret(b); }
 static void b_movimm_logical(A64Buf *b) { a64_mov_imm64(b, 0, 0x1fffe); a64_ret(b); }
-/* Rt=x0, Rn=x1 -- DISTINCT on purpose. With Rt==Rn an encoder that swapped the two
- * fields would still pass, because the one register is both address and destination. */
+
 static void b_ldapr64(A64Buf *b) { a64_ldapr(b, 8, 0, 1); a64_ret(b); }
 static void b_ldapr32(A64Buf *b) { a64_ldapr(b, 4, 0, 1); a64_ret(b); }
 static void b_ldapr16(A64Buf *b) { a64_ldapr(b, 2, 0, 1); a64_ret(b); }
@@ -125,40 +109,16 @@ static void b_ldrh(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scrat
 static void b_ldr_regoff(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_mov_imm64(b, 3, 5); a64_ldr_regoff(b, 8, 0, 2, 3, 1); a64_ret(b); }
 static void b_str_regoff(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_mov_imm64(b, 3, 5); a64_str_regoff(b, 8, 0, 2, 3, 1); a64_ldr(b, 8, 0, 2, 8 * 5); a64_ret(b); }
 
-/* The sign-extending loads at a NONZERO offset. This is not redundant with
- * b_ldrsw/b_ldsb above, and the difference is the whole point: at offset 0 the
- * unsigned-offset encoding and the LDUR/pre/post-index encoding both degenerate
- * to [base + 0] and behave identically, so an offset-0 test passes under either
- * one. a64_ldrsb/ldrsh/ldrsw were originally emitted against the LDUR base
- * (0x38/0x78/0xb8, bit 24 clear) while scaling the offset as the unsigned-offset
- * form requires — a real bug that these offset-0 cases could not see, and that
- * stayed latent only because the three helpers had no callers until
- * src/jit.c:emit_imul. Every call site passes GPR_OFF(reg) = reg*8, i.e. a
- * nonzero scaled offset, so that is what is pinned here.
- *
- * Each case stores a known value through a KNOWN-GOOD encoder (a64_str, covered
- * by b_str8_off) at scratch[5] and then reads it back with the sign-extending
- * load at the SAME byte offset. A wrong offset field reads a different slot —
- * scratch[] is pre-poisoned so a stray slot cannot coincidentally hold the
- * expected value — and a writeback-mode misencode would corrupt the base
- * register and change the address of the load itself. */
 static void b_ldrsw_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 4, 1, 2, 8 * 5); a64_ldrsw(b, 0, 2, 8 * 5); a64_ret(b); }
 static void b_ldrsb_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 1, 1, 2, 8 * 5); a64_ldrsb(b, 1, 0, 2, 8 * 5); a64_ret(b); }
 static void b_ldrsh_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 2, 1, 2, 8 * 5); a64_ldrsh(b, 1, 0, 2, 8 * 5); a64_ret(b); }
 
-/* The flag-emission building blocks the JIT relies on. cset after subs/adds
- * must map arm64 NZCV exactly the way the x86-flag translation depends on:
- * SUB borrow is carry-CLEAR (A64_CC), ADD carry is carry-SET (A64_CS), signed
- * overflow is A64_VS, and the sign/zero come from MI/EQ. */
 static void b_cset_cc_subborrow(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_CC); a64_ret(b); }
 static void b_cset_cs_addcarry(A64Buf *b) { a64_adds_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_CS); a64_ret(b); }
 static void b_cset_vs_sub(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_VS); a64_ret(b); }
 static void b_cset_vs_add(A64Buf *b) { a64_adds_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_VS); a64_ret(b); }
 static void b_cset_mi(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_MI); a64_ret(b); }
 
-/* The x86 parity fold: reduce the low byte of x0 to its even-parity bit at
- * position 2, exactly as emit_pf does (XOR-fold, then (~b)&1 via bic against a
- * materialized 1). Returns the PF bit value (0 or 4). */
 static void b_parity_fold(A64Buf *b)
 {
     a64_uxtb(b, 13, 0);
@@ -172,24 +132,11 @@ static void b_parity_fold(A64Buf *b)
     a64_ret(b);
 }
 
-/* Sized stores at scaled offsets, the load/store shape the inlined ALU path
- * uses against the register file (str of a full 8-byte slot after a 32-bit
- * zero-extending op). */
 static void b_str8_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_ldr(b, 8, 0, 2, 8 * 5); a64_ret(b); }
 static void b_str4_zx(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_mov_imm64(b, 1, 0); a64_str(b, 8, 1, 2, 0); a64_add_reg(b, 0, 1, 0, A64_ZR, 0); a64_str(b, 8, 1, 2, 0); a64_ldr(b, 8, 0, 2, 0); a64_ret(b); }
 
-/* ---- Emitters the optimization plan (chaining, RAS, regalloc) relies on and
- * that had no executed caller before: a64_try_patch_b (range-checked B patch),
- * a64_br to high temp regs, stp/ldp at an immediate offset off a non-sp base
- * (x20 = cpu), and w-form arithmetic writing the callee-saved x21-x28 file. Any
- * of these silently mis-encoded would corrupt live state in the JIT, so each is
- * emitted and EXECUTED here exactly as the plan will call it. */
-
 static int g_last_ok;
 
-/* In-range B patch via the range-checked helper: the B is patched to skip the
- * 111 block and fall into the 222 block. Records the helper's return in
- * g_last_ok so the caller can assert it reported success. */
 static void b_bpatch(A64Buf *b)
 {
     uint32_t *j = a64_label(b);
@@ -202,16 +149,11 @@ static void b_bpatch(A64Buf *b)
     a64_ret(b);
 }
 
-/* br to a register: the entry moves the caller's x0 into the register under
- * test and brs to it; the target is a stub laid out right after in the same
- * buffer that returns 222, whose absolute address the runner passes in x0. A
- * wrong Rn field jumps somewhere other than the stub. Pins br x16 (the JIT's
- * slow-call target) and br x9 (a general temp). Returns 0 on failure. */
 static uint64_t run_br(int reg)
 {
     A64Buf b = emit_begin();
     uint32_t *entry = a64_label(&b);
-    a64_mov_reg(&b, 1, reg, 0);   /* xReg = x0 (the stub address) */
+    a64_mov_reg(&b, 1, reg, 0);
     a64_br(&b, reg);
     uint32_t *stub = a64_label(&b);
     a64_mov_imm64(&b, 0, 222);
@@ -221,9 +163,6 @@ static uint64_t run_br(int reg)
     return f((uint64_t)(uintptr_t)stub, 0);
 }
 
-/* stp/ldp at an immediate offset off x20 (the cpu base register the JIT pins):
- * store x0,x1 into g_scratch[2],[3] via x20+16, read them back into x2,x3, and
- * return x2+x3. x20/x21 are callee-saved so they are preserved around the use. */
 static void b_stp_ldp_off_x20(A64Buf *b)
 {
     a64_stp_pre(b, 20, 21, 31, -16);
@@ -235,8 +174,6 @@ static void b_stp_ldp_off_x20(A64Buf *b)
     a64_ret(b);
 }
 
-/* 32-bit add writing a high callee-saved register (x21): w21 = w0 + w1 must
- * zero the upper half of x21, then x0 = x21. a=0xffffffff, b=2 wraps to 1. */
 static void b_wform_x21(A64Buf *b)
 {
     a64_stp_pre(b, 21, 22, 31, -16);
@@ -246,9 +183,6 @@ static void b_wform_x21(A64Buf *b)
     a64_ret(b);
 }
 
-/* Return-value/field checks for a64_try_patch_b at the exact +-(2^25-1) word
- * boundary and one word beyond, with no execution (a 128MB branch cannot be
- * laid out here). A rejected patch must leave the word untouched. */
 static void test_try_patch_b_range(void)
 {
     uint32_t w;
@@ -437,9 +371,6 @@ static void b_tbnz(A64Buf *b)
     a64_ret(b);
 }
 
-/* LDAPR is the ordered GUEST load, so its encoding is proven by EXECUTING it at every
- * width and cross-checking against LDAR on the same aligned cell -- reading the manual is
- * exactly how a wrong size field or a swapped Rn/Rt slips through. */
 static void test_ldapr(void)
 {
     static uint64_t cell __attribute__((aligned(8)));
@@ -453,7 +384,7 @@ static void test_ldapr(void)
           (unsigned long long)run2(b_ldapr16, 0, a));
     CHECK(run2(b_ldapr8, 0, a) == 0x88ull, "ldapr 8 got %#llx",
           (unsigned long long)run2(b_ldapr8, 0, a));
-    /* same architectural value as the stricter LDAR it replaces */
+
     CHECK(run2(b_ldapr64, 0, a) == run2(b_ldar64, 0, a), "ldapr != ldar on an aligned cell");
 }
 
@@ -510,10 +441,7 @@ int main(void)
     CHECK(run2(b_adcs, 7, 0) == 8, "adcs with carry");
     CHECK(run2(b_ldrsw, 0, 0xfffffff0ull) == (uint64_t)(int64_t)(int32_t)0xfffffff0, "ldrsw");
     CHECK(run2(b_ldsb, 0, 0x80) == (uint64_t)-128, "ldrsb");
-    /* The sign-extending loads at a NONZERO offset — the encoding the JIT
-     * actually uses (GPR_OFF(reg) = reg*8) and the one the offset-0 cases just
-     * above are blind to. See the b_ldrs*_off builders. Poison every slot first
-     * so a load from the WRONG slot cannot accidentally return the right value. */
+
     for (int i = 0; i < 16; i++)
         g_scratch[i] = 0x5a5a5a5a5a5a5a5aull;
     CHECK(run2(b_ldrsw_off, 0, 0xfffffff0ull) == (uint64_t)(int64_t)(int32_t)0xfffffff0, "ldrsw nonzero offset");
@@ -533,7 +461,6 @@ int main(void)
     CHECK(run2(b_tbnz, 1ull << 37, 0) == 2, "tbnz high bit set taken");
     CHECK(run2(b_tbnz, 0, 0) == 1, "tbnz high bit clear not taken");
 
-    /* x86-flag translation building blocks used by the JIT inlined ALU. */
     CHECK(run2(b_cset_cc_subborrow, 0, 1) == 1, "sub borrow -> A64_CC (x86 CF)");
     CHECK(run2(b_cset_cc_subborrow, 5, 3) == 0, "sub no-borrow -> A64_CC clear");
     CHECK(run2(b_cset_cs_addcarry, 0xffffffffffffffffull, 1) == 1, "add carry -> A64_CS (x86 CF)");
@@ -551,8 +478,6 @@ int main(void)
     CHECK(run2(b_str8_off, 0, 0xdeadbeefcafef00dull) == 0xdeadbeefcafef00dull, "str/ldr 8 scaled offset");
     CHECK(run2(b_str4_zx, 0xffffffffull, 0) == 0xffffffffull, "w-op zero-extends, full slot stored");
 
-    /* Plan-required emitters: range-checked B patch, br to high regs, stp/ldp
-     * off x20, and w-form arithmetic on the callee-saved x21-x28 file. */
     CHECK(run2(b_bpatch, 0, 0) == 222, "a64_try_patch_b in-range patch executes");
     CHECK(g_last_ok == 1, "a64_try_patch_b in-range reported success");
     test_try_patch_b_range();

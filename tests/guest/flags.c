@@ -1,28 +1,4 @@
-/*
- * tests/guest/flags.c
- *
- * Flag-exact ALU torture test, written for the JIT tier-2 differential gate.
- * Unlike alu.c (which folds only DATA results into one checksum and so can
- * hide a flag-only divergence), this program captures the ACTUAL x86 RFLAGS
- * after each operation through a separate channel and folds that into the
- * checksum, so any single-flag (CF/OF/AF/PF/ZF/SF) mismatch between the
- * interpreter and the JIT changes the printed output.
- *
- * Each helper performs one ALU instruction on inline-asm operands forced
- * into registers, then immediately captures RFLAGS with PUSHF/POP, masking
- * to the six architectural arithmetic flags (CF PF AF ZF SF OF) so the
- * comparison is independent of the always-set fixed bit and the IF/DF state.
- * Operand pairs sweep the hard boundaries: zero, one, all-ones, the signed
- * min/max at each width, equal operands (ZF), off-by-one (CF/borrow),
- * signed-overflow pairs (OF), low-nibble carries (AF), and even/odd-parity
- * bytes (PF). ADC/SBB are driven with an explicit incoming carry; the shifts
- * cover immediate counts 1, the width, and the half-width; SETcc is swept
- * across all sixteen conditions after a representative CMP. The whole thing
- * runs as a tight loop of reg<-reg and reg<-imm operations followed by a
- * conditional branch on the captured flags, which is exactly the in-block
- * native ALU + Jcc path the JIT now emits, so the differential exercises it
- * directly.
- */
+/* Flag-exact ALU torture test. */
 #include "gsys.h"
 
 #define ARITH_MASK 0x0cd5ULL
@@ -301,9 +277,6 @@ static g_u64 setcc_sweep(g_u64 a, g_u64 b)
     return acc;
 }
 
-/* Memory-source ALU: the b-operand lives in memory, exercising the JIT's
- * reg<-mem inlined arithmetic and its commpage-guarded native load. The
- * operand is forced through a stack slot the compiler must reload. */
 static g_u64 cap_addm64(g_u64 a, g_u64 b)
 {
     volatile g_u64 m = b;

@@ -1,23 +1,4 @@
-/*
- * include/ocerz/sys_raw.h
- *
- * The single point where Ocerz itself enters the arm64 XNU kernel on behalf
- * of the guest, bypassing libSystem so the exact register-level syscall
- * contract is under our control.
- *
- * arm64 XNU convention: syscall number in x16 (positive BSD numbers,
- * NEGATED Mach trap numbers), up to eight arguments in x0..x7, entry via
- * svc #0x80. On return the carry flag (PSTATE.C) signals a BSD error, in
- * which case x0 holds errno; on success x0 (and for the few dual-return
- * syscalls also x1) hold the result. The cset instruction captures the
- * carry inside the same asm block so no compiler-inserted instruction can
- * clobber PSTATE between the svc and the test — this mirrors the
- * "b.cs cerror" sequence in Apple's Libsyscall stubs.
- *
- * ocerz_host_syscall() is used for BSD (x16 > 0) and machine-dependent
- * forwards; ocerz_host_mach_trap() negates the trap number and ignores the
- * carry, matching kern_return_t semantics.
- */
+/* Where Ocerz enters the arm64 kernel directly, bypassing libSystem. */
 #ifndef OCERZ_SYS_RAW_H
 #define OCERZ_SYS_RAW_H
 

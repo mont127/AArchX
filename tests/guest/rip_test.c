@@ -1,30 +1,4 @@
-/*
- * tests/guest/rip_test.c
- *
- * Guards the PRECISION of the guest rip delivered in a signal frame when the
- * faulting instruction is one the JIT INLINES as native arm64.
- *
- * Why this exists as a separate test from signal_test.c: signal_test faults on
- * `*p = 1`, a MOV mem<-IMMEDIATE, which emit_mov_mem does NOT inline (it only
- * covers mem<-REG). That store therefore takes the interpreter slow path, and
- * ocerz_jit_exec_one sets cpu->rip for every slow instruction, so the delivered
- * rip is exact by accident. It cannot see the bug this test targets.
- *
- * The bug: inlined instructions never write cpu->rip (jit.c justifies that on
- * "inlined ops never read it" -- true for a register move, FALSE for a faulting
- * memory access). So a fault inside inlined code used to report the rip of the
- * last SLOW instruction, silently mislocating every guest fault taken in
- * inlined code. That matters for real guests: Wine grows thread stacks from the
- * guard-page fault's rip, and a debugger/unwinder cannot work from a wrong one.
- *
- * The test forces the inlined shape with inline asm (`movq %reg, (%reg)` at
- * size 8, no segment override -- exactly emit_mov_mem's mem<-REG arm), labels
- * the faulting instruction, and has the handler compare the rip delivered in
- * the ucontext against that label. It prints "rip exact" only on an exact
- * match, so the golden output pins the precise value, not an approximation.
- *
- * Trampoline ABI and ucontext offsets are identical to signal_test.c.
- */
+/* Precision of the guest rip reported in a signal frame. */
 #include "gsys.h"
 
 #define SYS_sigaction 46
@@ -59,7 +33,7 @@ __asm__(
     "    ud2\n");
 
 extern void sig_tramp(void);
-/* The address of the faulting store, defined by the asm label below. */
+
 extern char fault_insn[];
 
 static void recover(void)
@@ -78,8 +52,6 @@ static void handler(int signo, void *siginfo, void *ucontext)
     else
         g_puts("rip WRONG\n");
 
-    /* Resume in recover() regardless, so the test's exit code reports the
-     * harness working and the STDOUT line reports the rip verdict. */
     *(g_u64 *)(mc + 144) = (g_u64)(g_u64 *)&recover;
 }
 
@@ -94,10 +66,6 @@ int main(int argc, char **argv, char **envp)
 
     g_puts("before fault\n");
 
-    /* MOV mem<-REG at operand size 8 with no segment override: precisely the
-     * form emit_mov_mem inlines to a native str. Written in asm so no compiler
-     * choice (folding the value to an immediate, widening, reordering) can move
-     * it off the inlined path and quietly stop testing anything. */
     volatile g_u64 *p = (volatile g_u64 *)0;
     g_u64 v = 0x1234;
     __asm__ __volatile__(

@@ -1,98 +1,4 @@
-/*
- * src/interp_sse.c
- *
- * The SSE/SSE2/SSE3/SSSE3/SSE4.1 interpreter tier: the reference semantics
- * for every decoded op at or above OCERZ_OP_SSE_FIRST. interp.c routes any
- * op it does not own here; ocerz_interp_sse() executes it and returns an
- * OcerzStep code, or OCERZ_EUNSUP for an op below OCERZ_OP_SSE_FIRST (which
- * is not ours and lets interp.c report it).
- *
- * Operand model. Every handler reads its 128-bit operands through the
- * interp_common.h helpers (ocerz_read_op128 / ocerz_write_op128), which
- * already encode the XMM-register vs memory distinction and the scalar-form
- * sub-128 sized load/store rule. ops[0] is the destination and, for the
- * three-input read-modify-write SSE forms, also the first source; ops[1] is
- * the second source. GPR-side reads/writes for MOVD, MOVQX, the CVT family,
- * PEXTR, PINSR and MOVMSK go through ocerz_read_op / ocerz_write_op so the
- * 32-bit-write upper-zero rule is honored automatically.
- *
- * Lane punning. A 128-bit value is reinterpreted across float/double/integer
- * lanes through a single union `vec` carrying every lane view plus the raw
- * Ocerz128. Clang permits this union type punning; nothing here relies on
- * pointer aliasing across distinct types, so the lane code stays strict-
- * aliasing safe. Loading a vec from an Ocerz128 and storing it back is a
- * plain struct copy of the {lo,hi} pair.
- *
- * Floating point. Scalar forms (SS/SD) touch only the low lane and leave the
- * upper bytes of the destination unchanged; packed forms (PS/PD) operate on
- * all lanes. x86 MIN/MAX return the SECOND operand whenever either input is
- * NaN or both are signed zeros, which is reproduced exactly by ordering the
- * ternary so a NaN comparison falls through to src: dst = (dst OP src) ? dst
- * : src for the strict comparison, i.e. MIN = (dst < src) ? dst : src and
- * MAX = (dst > src) ? dst : src. RSQRT/RCP are computed with exact float
- * math (1/sqrtf, 1/x); we do not model the ~12-bit approximation tables
- * because the differential tests compare against this file, not silicon.
- *
- * Compares. CMPPS/CMPSS/CMPPD/CMPSDX implement predicates 0..7 with quiet
- * NaN handling (EQ/LT/LE false on NaN, NEQ/NLT/NLE true on NaN, UNORD true
- * iff a NaN is present, ORD its negation), producing all-ones / all-zeros
- * lane masks. COMISS/COMISD/UCOMISS/UCOMISD set ZF/PF/CF for the unordered/
- * less/greater/equal quadrants and CLEAR OF/SF/AF. PCMPEQ/PCMPGT are lanewise
- * integer masks; GT is signed.
- *
- * Converts. Float->int uses round-to-nearest-even (lrintf/llrintf/lrint/
- * llrint, FE_TONEAREST assumed) for the non-T forms and truncation toward
- * zero for the CVTT forms; out-of-range or NaN inputs produce the x86
- * "integer indefinite" value (0x80000000 for a 32-bit result,
- * 0x8000000000000000 for 64-bit), with the range checks written explicitly
- * because the C library result for an out-of-range conversion is undefined.
- *
- * Integer SIMD covers the full add/sub (wrapping and saturating), multiply
- * (low/high/even-lane/madd), average, min/max, SAD, abs, pack, unpack,
- * shuffle (PSHUFD/PSHUFLW/PSHUFHW/PSHUFB/PALIGNR/SHUFPS/SHUFPD/UNPCK*),
- * shift (by imm or by the low 64 bits of an XMM, including whole-register
- * PSLLDQ/PSRLDQ byte shifts), insert/extract (PEXTR/PINSR/EXTRACTPS/
- * INSERTPS), blend, PTEST, the PMOVZX/PMOVSX widening family, and ROUND*.
- *
- * AES-NI and carry-less multiply. AESENC/AESENCLAST/AESDEC/AESDECLAST/AESIMC
- * and AESKEYGENASSIST implement one Rijndael round directly over GF(2^8): the
- * 128-bit register is the column-major AES state (byte i at row i%4, column
- * i/4), SubBytes uses the forward/inverse S-box tables, ShiftRows/InvShiftRows
- * are fixed byte permutations, and MixColumns/InvMixColumns apply the standard
- * 0x1b-reducing field matrices via xtime. AESENC is ShiftRows -> SubBytes ->
- * MixColumns -> XOR round key; the LAST forms drop MixColumns; the DEC forms
- * use the inverse steps; AESIMC is InvMixColumns alone; AESKEYGENASSIST applies
- * SubWord then a rotate-right-by-8 RotWord with the imm8 Rcon XORed into the
- * two odd dwords. PCLMULQDQ is the 64x64 carry-less product (no field
- * reduction) of the imm8-selected source qwords into a full 128-bit result.
- *
- * Op-field width. X86Insn.op is a uint8_t, but the OcerzOp enum runs to 361
- * values, so every op from OCERZ_OP_CVTPD2DQ (256) upward is stored modulo
- * 256 by any decoder filling that field. Within the SSE op range
- * (OCERZ_OP_SSE_FIRST..OCERZ_OP_BLENDPD = 166..360) every op dispatches by
- * its full enum value: X86Insn.op is a uint16_t, so no truncation occurs and
- * the case labels are the plain OcerzOp constants. ocerz_interp_sse is only
- * ever reached for an SSE op (interp.c routes base and x87 ops elsewhere);
- * any non-SSE op that arrives falls through the switch to OCERZ_EUNSUP. The
- * OP() macro is retained as an identity wrapper so the case-label sites read
- * uniformly.
- *
- * Documented deviations:
- *  - Alignment is NOT enforced for any move: MOVAPS/MOVDQA behave exactly
- *    like MOVUPS/MOVDQU. A real CPU would #GP a misaligned aligned-move; the
- *    memory helpers already memcpy so unaligned host access is safe, and the
- *    differential tests never depend on the #GP.
- *  - MXCSR rounding control is not consulted: round-to-nearest-even is
- *    assumed for non-truncating converts and for ROUND* with imm8 bit 2 set,
- *    matching the architectural reset MXCSR (0x1f80) the CPU boots with.
- *  - RSQRT/RCP are exact reciprocals, not the architectural approximations.
- *  - Generated NaNs follow x86 rules: ADD/SUB/MUL/DIV/SQRT canonicalize a
- *    freshly-invalid result (0/0, inf-inf, sqrt of a negative) to the x86
- *    default QNaN 0xFFF8000000000000 / 0xFFC00000, and propagate a NaN input
- *    quieted with its sign and payload preserved, matching real SSE rather
- *    than the host arm64 default (positive) QNaN. MIN/MAX keep their own
- *    "second operand on unordered" rule and so are not canonicalized.
- */
+/* The SSE through SSE4.1 interpreter tier. */
 #include "ocerz/interp_common.h"
 
 #include <math.h>
@@ -506,7 +412,7 @@ static int do_fp_arith(OcerzCPU *cpu, const X86Insn *insn)
         r.d[0] = fixnan_d(a.d[0], a.d[1], a.d[0] - a.d[1]);
         r.d[1] = fixnan_d(b.d[0], b.d[1], b.d[0] - b.d[1]);
         break;
-    case OP(OCERZ_OP_ADDSUBPS): /* even lanes subtract, odd lanes add */
+    case OP(OCERZ_OP_ADDSUBPS):
         r.f[0] = fixnan_f(a.f[0], b.f[0], a.f[0] - b.f[0]);
         r.f[1] = fixnan_f(a.f[1], b.f[1], a.f[1] + b.f[1]);
         r.f[2] = fixnan_f(a.f[2], b.f[2], a.f[2] - b.f[2]);

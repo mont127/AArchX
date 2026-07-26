@@ -1,20 +1,4 @@
-/*
- * tests/guest/bench.c
- *
- * A THROUGHPUT benchmark, not a correctness test. The existing guest tests all
- * finish inside process-startup noise (~0.03s under both Rosetta and Ocerz), so
- * they cannot measure translation speed at all. The four kernels here isolate
- * things the translator must be good at. `alu` and `br` are long enough for a
- * direct wall-clock comparison. `call` and `mem` are intentionally retained as
- * correctness and profiling kernels, but are too short under Rosetta for a
- * trustworthy raw ratio; tests/run_bench_compare.sh times their longer
- * two-point variants (fibn and memn) instead:
- *   call  - naive recursive fib: call/ret + stack traffic, tiny blocks
- *   alu   - a tight register ALU loop: the inlined fast path + eager flags
- *   mem   - a pointer-chasing / store loop: guest load/store + g2h
- *   br    - a data-dependent branch loop: Jcc + block dispatch
- * argv[1] selects the workload so one binary serves all of them.
- */
+/* Throughput benchmark, not a correctness test. */
 #include "gsys.h"
 
 static g_u64 fib(unsigned n)
@@ -29,22 +13,22 @@ int main(int argc, char **argv)
     const char *w = argc > 1 ? argv[1] : "call";
     g_u64 r = 0;
 
-    if (w[0] == 'c') {                    /* call: ~40x the old fib(30) */
+    if (w[0] == 'c') {
         r = fib(34);
-    } else if (w[0] == 'a') {             /* alu: tight register ALU */
+    } else if (w[0] == 'a') {
         g_u64 a = 1, b = 2, c = 3;
         for (g_u64 i = 0; i < 300000000ULL; i++) {
             a += i; b ^= a; c -= b; a |= (c >> 3); b &= 0xffffffffULL;
         }
         r = a ^ b ^ c;
-    } else if (w[0] == 'm') {             /* mem: store/load loop over 1MB */
+    } else if (w[0] == 'm') {
         static g_u64 buf[131072];
         for (g_u64 i = 0; i < 40000000ULL; i++) {
             g_u64 k = i & 131071;
             buf[k] = buf[(k * 7 + 1) & 131071] + i;
         }
         for (g_u64 i = 0; i < 131072; i++) r += buf[i];
-    } else {                              /* br: data-dependent branches */
+    } else {
         g_u64 x = 12345;
         for (g_u64 i = 0; i < 200000000ULL; i++) {
             x = x * 1103515245ULL + 12345ULL;

@@ -1,73 +1,4 @@
-/*
- * src/cache.c
- *
- * Manual mapper and symbol resolver for the x86_64 dyld shared cache,
- * implementing cache.h. This is the core of Ocerz's mini-dyld: it brings the
- * system dylibs into the address space exactly where they expect to live and
- * answers "what is the address of symbol X" without running Apple's dyld.
- *
- * Mapping. The cache is a main file plus .01..NN subcaches under the OS
- * cryptex (path built from CACHE_DIR + CACHE_STEM + suffix). Each subcache
- * begins with a dyld_cache_header whose mapping-and-slide records (56-byte
- * dyld_cache_mapping_and_slide_info at the offset/count u32 pair in header
- * field 0x138) describe {address, size, fileOffset, slideInfoFileOffset,
- * slideInfoFileSize, flags, maxProt, initProt}. Every mapping is mmap'd
- * MAP_FIXED|MAP_PRIVATE at its preferred address from the subcache fd at its
- * fileOffset; an executable mapping (initProt & VM_PROT_EXECUTE) is mapped
- * PROT_READ because Ocerz never runs cache code natively, and any mapping that
- * carries slide info is mapped writable so its chained pointers can be
- * rebased in place. The subcaches are iterated until a
- *
- * Slide rebasing. The cache ships its __DATA/__DATA_CONST pointers chained for
- * ASLR; even at slide 0 they must be unchained before cache code can read
- * them. For each slide-bearing mapping a dyld_cache_slide_info2 {version=2,
- * page_size, page_starts_offset/count, page_extras_offset/count, delta_mask,
- * value_add} is parsed. A page_starts entry of exactly 0x4000 (NO_REBASE)
- * means the page has no pointers. An entry with bit 0x8000 (EXTRA) set is an
- * index into the page_extras u16 array: the page holds MULTIPLE chains, one
- * per extras entry, consumed until an entry with its own 0x8000 (END) bit;
- * each entry's low 14 bits are that chain's start. A plain entry is itself the
- * single chain start. Chain starts are in 4-BYTE UNITS, not bytes — the
- * single most load-bearing detail here: with *1 every page whose chain does
- * not begin at offset 0 is mis-walked, which silently leaves most __DATA /
- * __DATA_CONST pointers in chained form and corrupts cache state downstream.
- * Each 8-byte slot is rewritten to (raw & ~delta_mask) plus the cache base
- * when non-zero, stepping to the next slot by (raw & delta_mask) >>
- * (ctz(delta_mask) - 2) bytes until the delta is zero or the page boundary is
- * reached (v2 chains never cross a page, so the walk is bounded to the page).
- * Skipping the EXTRA pages (an earlier revision did) leaves those pages' raw
- * chained values visible to guest code; CoreFoundation's malloc-type-callback
- * table lives on such a page, and reading zeros there sent every typed malloc
- * into an infinite proxy-zone redispatch loop during __CFInitialize.
- * file is missing. The main file's header also carries the image table at
- * imagesOffset/imagesCount (modern layout: u32 at 0x1C0/0x1C4); each
- * dyld_cache_image_info is {address(u64), modTime(u64), inode(u64),
- * pathFileOffset(u32), pad(u32)} = 32 bytes, and address is the dylib's
- * mach_header inside the mapped cache (read directly, identity-mapped). Path
- * strings live at base + pathFileOffset in the first mapping.
- *
- * Resolution. ocerz_cache_resolve walks every image's export trie. For one
- * dylib: scan its load commands for __LINKEDIT (LC_SEGMENT_64, giving vmaddr
- * and fileoff) and for the export data — LC_DYLD_EXPORTS_TRIE, else the
- * export_off/export_size of LC_DYLD_INFO[_ONLY]. The trie's mapped address is
- * linkedit_vmaddr + (export_off - linkedit_fileoff): this is correct even in
- * a split cache because export_off and linkedit_fileoff are file offsets in
- * the same internal space, so their difference is a pure byte offset added to
- * the real (identity-mapped) linkedit address. The trie is the standard dyld
- * format: at each node a ULEB128 terminal size; if the symbol is fully
- * consumed and the terminal size is non-zero, read ULEB flags then (for a
- * normal export) the ULEB address offset and return mach_header + offset;
- * otherwise skip the terminal info, read the child count, and follow the
- * child whose edge string prefixes the remaining symbol. Re-export terminals
- * (EXPORT_SYMBOL_FLAGS_REEXPORT) carry a dependent-library ordinal and an
- * optional renamed import; resolve_in_dylib follows them — it maps the ordinal
- * to that dylib's Nth LC_LOAD_DYLIB install name, finds that image in the
- * cache, and recurses on the imported name. This is required because e.g.
- * _memset exists only as a re-export in libsystem_c (ordinal 6 ->
- * libsystem_platform, renamed __platform_memset); the real symbol lives in
- * libsystem_platform, whose export trie is described by an old-style
- * LC_DYLD_INFO_ONLY (export_off at +40, not the bind/lazy offsets).
- */
+/* Maps the x86_64 dyld shared cache and resolves symbols out of it. */
 #include "ocerz/cache.h"
 
 #include <fcntl.h>
@@ -80,11 +11,7 @@
 #define CACHE_STEM "dyld_shared_cache_x86_64"
 #define CACHE_MAX_SUBCACHES 16
 #define EXPORT_FLAGS_REEXPORT 0x08
-/* Export trie symbol KIND (low 2 bits of the terminal flags). An ABSOLUTE export's
- * trie value is the symbol's literal address and must NOT be slid by the image base:
- * libobjc exports __objc_empty_vtable as absolute 0, and pre-ObjC2.1 class structures
- * bind it into class+0x18. Resolving it to (mh + 0) -- or rejecting it because the
- * value is 0 -- corrupts every such class. */
+
 #define EXPORT_FLAGS_KIND_MASK 0x03
 #define EXPORT_FLAGS_KIND_ABSOLUTE 0x02
 
@@ -425,7 +352,7 @@ static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, in
         return 0;
     if (!reexp) {
         *found = 1;
-        /* ABSOLUTE: value is literal, not image-relative (see EXPORT_FLAGS_KIND_ABSOLUTE). */
+
         if ((lflags & EXPORT_FLAGS_KIND_MASK) == EXPORT_FLAGS_KIND_ABSOLUTE)
             return off;
         return mh + off;

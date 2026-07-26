@@ -1,67 +1,4 @@
-/*
- * src/interp.c
- *
- * The core single-step interpreter: the reference implementation of x86_64
- * instruction semantics that the JIT tier must match bit for bit. This file
- * owns the integer/general-purpose half of the ISA — moves, the ALU, shifts
- * and rotates, stack and control flow, atomics, the flag-setting unit
- * mnemonics and SYSCALL. The string/bit/x87 group lives in interp_ext.c and
- * the SSE group in interp_sse.c; interp.c is the entry point and forwards any
- * op it does not own to those units before reporting it as unimplemented.
- *
- * ocerz_interp_step() fetches the bytes at cpu->rip through the guest_base
- * mapping, decodes exactly one instruction (giving the decoder the full 15
- * byte architectural window), advances cpu->rip by the encoded length BEFORE
- * executing so that branch handlers see the architectural next-rip and simply
- * overwrite it, then dispatches on insn.op. Operands are touched only through
- * the interp_common.h helpers (which encode the 32-bit-write zero-extension
- * rule, high-byte access, effective-address formation and stack motion) and
- * flags only through the flags.c helpers, so the semantics live in exactly
- * one place.
- *
- * Design notes / deviations that are easy to get wrong and are handled here:
- *  - LEA computes base + index*scale + disp with the address-size truncation
- *    but NEVER adds a segment base, even if a segment override prefix was
- *    present; it is computed inline rather than through ocerz_ea for that
- *    reason. The destination still obeys the normal register-write rules.
- *  - CMOVcc always writes its destination (so the 32-bit form zero-extends
- *    even when the condition is false); the condition is evaluated after the
- *    source is read.
- *  - Shifts mask the count to 5 bits (6 for 64-bit operands) and early-out on
- *    a masked count of zero, leaving both the destination and the flags
- *    untouched, which is the architectural no-op. SHL/SHR/SAR delegate flag
- *    computation to flags.c; ROL/ROR/RCL/RCR update CF on every nonzero count
- *    and OF only when the masked count is exactly 1, and suppress all flag
- *    updates only when the masked count is zero.
- *  - SHLD/SHRD form a width*2 concatenation and shift it, which yields the
- *    architectural double-shift even for the undefined count>width region;
- *    the CF/SF/ZF/PF results come from flags_shl/flags_shr on the destination.
- *  - NEG is evaluated as 0 - src so CF, OF and AF fall out of the subtract
- *    helper (CF = src != 0, OF = src == INT_MIN).
- *  - DIV/IDIV trap divide-by-zero and quotient overflow as fatal with a
- *    diagnostic; the 8-bit forms take AX and write AL/AH, the wider forms use
- *    rDX:rAX and __int128 for the 64-bit quotient.
- *  - POPF only loads the user-writable arithmetic and control bits (CF PF AF
- *    ZF SF TF DF OF) and keeps IF and the fixed bit set; SAHF/LAHF move the
- *    low arithmetic byte to and from AH with the architectural fixed bits.
- *  - SYSCALL publishes the return rip in RCX and the masked flags in R11
- *    exactly as the hardware does before delegating to the syscall layer.
- *  - Atomics on memory operands use real host C11 __atomic ops with
- *    SEQ_CST ordering: XCHG to memory (always implicitly locked), XADD,
- *    CMPXCHG and CMPXCHG8B/16B, and any LOCK-prefixed ADD/SUB/AND/OR/XOR/
- *    ADC/SBB/INC/DEC/NEG/NOT (via a load+compute+CAS-retry loop). Because real
- *    guest threads run as real host threads over the shared arena, a plain
- *    non-atomic read-modify-write would tear the lock-free MPSC queues GCD and
- *    libpthread run between threads; the host atomic is the faithful x86 lock.
- *    Bit-test-and-set/reset/complement on memory take the same atomic byte CAS
- *    path when LOCK-prefixed (in interp_ext.c).
- *
- * ocerz_unimpl() (declared in interp_common.h) prints the uniform
- * unimplemented-instruction diagnostic — op name, the failing rip, its raw
- * bytes and a reason — and returns OCERZ_STEP_FATAL; vm.c dumps CPU state
- * afterwards. The decode-failure and trap paths print their own bytes the
- * same way.
- */
+/* The core single-step interpreter: reference semantics for x86_64. */
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/vm.h"
@@ -202,9 +139,7 @@ static int op_arith(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     if (insn->lock && insn->ops[0].kind == OCERZ_OPK_MEM) {
         uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
         uint64_t b = ocerz_read_op(cpu, insn, &insn->ops[1]);
-        /* Capture the incoming carry ONCE, before the CAS retry loop: the flag
-         * helpers below overwrite CF, so re-reading it inside the loop would
-         * feed a retry the wrong ADC/SBB carry-in. */
+
         int cin = (cpu->rflags & OCERZ_CF) ? 1 : 0;
         for (;;) {
             uint64_t a = ocerz_atomic_load(addr, size);
@@ -692,15 +627,7 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_POP: {
-        /* Fault-atomic: rsp is committed only AFTER the destination write lands.
-         * ocerz_pop() would increment rsp first, which is safe when only the LOAD
-         * can fault, but `pop qword [mem]` (8F /0) can fault in the STORE -- and the
-         * rip-rewind hands the same instruction back to the guest to retry, so a
-         * pre-incremented rsp made the retry read the NEXT slot and increment again
-         * (rsp ends +16, wrong value stored). Real hardware aborts the pop with rsp
-         * untouched; tests/guest/popmem_test.c pins that against native x86.
-         * `pop rsp` must end with rsp = the popped value, so skip the increment when
-         * the destination IS rsp (x86 discards the increment in that form). */
+
         int size = insn->opsize;
         uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RSP], size);
         ocerz_write_op(cpu, insn, &insn->ops[0], v);
@@ -731,10 +658,7 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_LEAVE: {
-        /* Fault-atomic, same reason as POP above: the old code committed rsp = rbp
-         * BEFORE the pop that can fault, so a rewound retry re-ran LEAVE with rsp
-         * already clobbered. Load first; commit rsp/rbp only once the load lands.
-         * LEAVE == `mov rsp, rbp; pop rbp`, so rsp ends at rbp_old + 8. */
+
         uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RBP], 8);
         cpu->gpr[OCERZ_RSP] = cpu->gpr[OCERZ_RBP] + 8;
         cpu->gpr[OCERZ_RBP] = v;
@@ -841,11 +765,7 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_MOVSEG: {
-        /* Applying a base is gated on the selector actually being an LDT entry with one.
-         * Ordinary 64-bit code loads GDT selectors (bit 2 clear), for which ocerz_ldt_base
-         * returns 0, so this stays the exact no-op it has always been -- that gate is what
-         * keeps Mousecape and Wine byte-identical. Only FS and GS can carry a base that
-         * matters to the guest; DS/ES/SS remain inert in the flat model. */
+
         uint32_t sel = (uint32_t)ocerz_read_op(cpu, insn, &insn->ops[0]);
         unsigned seg = (unsigned)insn->ops[1].imm;
         uint64_t base = ocerz_ldt_base(sel);
@@ -861,11 +781,7 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
     case OCERZ_OP_JMPF:
     case OCERZ_OP_CALLF: {
-        /* Far transfer, m16:32 or m16:64: offset at [ea], selector at [ea + opsize].
-         * This is how wow64cpu.dll crosses between 64- and 32-bit code. A transfer to a
-         * 64-bit selector is an ordinary jump/call and is handled; a transfer to a 32-bit
-         * selector would need a 32-bit instruction decoder, which does not exist yet, so
-         * it stops loudly instead of running 64-bit-decoded bytes at a 32-bit address. */
+
         int sz = insn->opsize ? insn->opsize : 4;
         uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
         uint64_t off = ocerz_ld(ea, sz);
@@ -873,15 +789,15 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         if (ocerz_ldt_is_big(sel))
             return ocerz_mode32_unsupported(vm, cpu, sel, off, "far jump/call");
         if (insn->op == OCERZ_OP_CALLF) {
-            ocerz_push(cpu, 8, cpu->cs_sel);            /* far call pushes CS, then the */
-            ocerz_push(cpu, 8, insn->rip + insn->len);  /* return offset (size arg first) */
+            ocerz_push(cpu, 8, cpu->cs_sel);
+            ocerz_push(cpu, 8, insn->rip + insn->len);
         }
         cpu->cs_sel = (uint16_t)sel;
         cpu->rip = off;
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_RETF: {
-        /* Far return: pop offset then selector, then optionally release imm16 bytes. */
+
         int sz = insn->opsize ? insn->opsize : 8;
         uint64_t off = ocerz_pop(cpu, 8);
         uint32_t sel = (uint32_t)ocerz_pop(cpu, 8);
@@ -898,10 +814,7 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         int sz = insn->opsize ? insn->opsize : 8;
         uint64_t sp = cpu->gpr[OCERZ_RSP];
         uint64_t rip = ocerz_ld(sp, sz);
-        /* The CS slot sits between RIP and RFLAGS and used to be skipped entirely. Wine's
-         * NtContinue / syscall-dispatcher epilogue relies on IRETQ and always carries a
-         * 64-bit CS, so reading it is a no-op there; wow64cpu.dll's iretq is the one that
-         * carries a 32-bit CS, and that is the transition worth refusing loudly. */
+
         uint32_t cs = (uint32_t)ocerz_ld(sp + (uint64_t)sz, sz);
         uint64_t flags = ocerz_ld(sp + (uint64_t)sz * 2, sz);
         uint64_t newsp = ocerz_ld(sp + (uint64_t)sz * 3, sz);
@@ -919,11 +832,6 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
-/* A far transfer named a 32-bit code selector. ocerz can describe 32-bit segments (the
- * synthetic LDT) and now recognises every encoding of the WoW64 switch, but the decoder is
- * still long-mode-only: continuing would decode 32-bit bytes with 64-bit defaults, which
- * silently produces wrong instructions rather than an error. Stop, loudly, and say exactly
- * what was attempted -- this is the boundary where 32-bit support will be added next. */
 static int ocerz_mode32_unsupported(OcerzVM *vm, OcerzCPU *cpu, uint32_t sel,
                                     uint64_t target, const char *how)
 {
@@ -1077,8 +985,7 @@ static int op_flagctl(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 
 int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    /* A JIT edge may carry an exact deferred arithmetic-flag record. The
-     * interpreter reads rflags directly, so collapse it at the tier boundary. */
+
     ocerz_flags_materialize(cpu);
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
         return ocerz_dyldapi_dispatch(vm, cpu);
@@ -1105,9 +1012,6 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
         fprintf(stderr, "ocerz: %#llx: %s\n", (unsigned long long)cpu->rip, buf);
     }
 
-    /* rip advances to the NEXT instruction before executing (x86 semantics need
-     * that mid-instruction), so record the faulting address separately -- see
-     * OcerzCPU::cur_rip. */
     cpu->cur_rip = cpu->rip;
     cpu->rip += insn.len;
     return ocerz_interp_exec(vm, cpu, &insn);
@@ -1222,13 +1126,7 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
         return OCERZ_STEP_OK;
 
     case OCERZ_OP_INT3:
-        /* A guest int3 is a breakpoint, not a fatal: on macOS it raises SIGTRAP
-         * (trap number TRAP_x86_BPTFLT), which Wine's trap_handler turns into an
-         * EXCEPTION_BREAKPOINT and dispatches (KiUserExceptionDispatcher, debugger
-         * traps, the DbgBreakPoint guards Wine plants on error paths). cpu->rip is
-         * already past the int3, matching the kernel's saved rip; ocerz_signal_-
-         * deliver tags the frame with trapno 3 so Wine backs ExceptionAddress over
-         * the int3. Only a genuinely unhandled trap (no SIGTRAP handler) is fatal. */
+
         if (ocerz_signal_deliver(cpu, OCERZ_SIGTRAP, cpu->rip, 0, 0))
             return OCERZ_STEP_OK;
         return trap_fatal(insnp, "guest breakpoint/interrupt");
@@ -1236,12 +1134,7 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
         return trap_fatal(insnp, "guest breakpoint/interrupt");
 
     case OCERZ_OP_UD2:
-        /* start_wqthread's tail guard (OCERZ_START_WQTHREAD + 0xf): a workqueue
-         * worker reaches it only when _pthread_wqthread returned because its
-         * drain function ran to completion instead of parking via workq_kern-
-         * return THREAD_RETURN. The real kernel parks the thread there; Ocerz
-         * ends the worker's host thread cleanly instead of faulting. Only
-         * wqthread workers execute this address -- the main thread never does. */
+
         if (insnp->rip == 0x7ff802e6f81bull) {
             cpu->terminated = 1;
             return OCERZ_STEP_OK;

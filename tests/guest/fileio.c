@@ -1,16 +1,4 @@
-/*
- * tests/guest/fileio.c
- *
- * Round-trips a file through the BSD file syscalls that Ocerz forwards to the
- * native kernel after translating each pointer argument through guest_base:
- * open(O_CREAT|O_WRONLY|O_TRUNC), write a known 100-byte pattern, close;
- * reopen O_RDONLY, read the 100 bytes back, compare byte-for-byte, close, and
- * unlink. Prints exactly "fileio ok\n" on success and a "... fail" line on any
- * error (returning non-zero so the runner's exit-code check fires). The file
- * path /tmp/ocerz_guest_test.dat is fixed and the payload is computed, so the
- * stdout golden is just the one success line and is machine-independent; the
- * temp file is always removed so reruns are clean.
- */
+/* File I/O round trip: write a pattern, read it back, verify, unlink. */
 #include "gsys.h"
 
 #define PATH "/tmp/ocerz_guest_test.dat"

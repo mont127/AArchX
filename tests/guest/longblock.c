@@ -1,27 +1,4 @@
-/*
- * tests/guest/longblock.c
- *
- * Regression test for the JIT block-length-cap rip hazard. The JIT decodes a
- * basic block up to a fixed instruction cap (JIT_MAX_BLOCK_INSNS) and inlines
- * the hot ALU/MOV instructions directly, without writing cpu->rip per
- * instruction — the architectural rip is normally restored by the slow-path
- * call or the terminator that ends the block. A block that ends by running
- * OFF the cap instead of on a terminator has no such instruction at its tail,
- * so if its last (inlined) instruction does not set rip, the fall-through exit
- * resumes execution at a stale rip inside the block and silently corrupts
- * state. Real optimized crypto transforms (Digest::SHA/MD5) hit this with
- * their long unrolled rounds; this test reproduces the shape with no libc.
- *
- * The body is one enormous straight-line basic block: a dependent chain of
- * hundreds of 32-bit ADD/SUB/AND/OR/XOR/shift operations (exactly the inlined
- * fast paths) with no branch or call between them, so the translator must span
- * it across several capped blocks whose boundaries land on inlined ALU ops.
- * Two volatile seeds keep clang from folding the chain to a constant at -O2
- * while leaving the output fully deterministic (no time, pid, or pointer
- * value enters the computation), so the differential interp-vs-JIT check and
- * the checked-in golden both pin the result. A pre-fix JIT prints a different,
- * ASLR-dependent value (or loops); a correct JIT matches the interpreter.
- */
+/* Regression test for the block-length-cap rip hazard. */
 #include "gsys.h"
 
 #define STEP(k)                          \

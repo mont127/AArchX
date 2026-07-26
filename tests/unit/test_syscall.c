@@ -1,36 +1,4 @@
-/*
- * tests/unit/test_syscall.c
- *
- * Unit tests for the guest syscall boundary (src/syscall.c). The harness
- * brings up the same machinery the real run loop uses: ocerz_mem_init()
- * reserves the guest arena (so ocerz_g2h is valid and ocerz_map_anywhere /
- * ocerz_map_fixed work), then ocerz_vm_init() resets the CPU and links it to
- * the VM. Each test drives ocerz_handle_syscall() directly by writing the
- * syscall encoding into rax and the arguments into the architectural argument
- * registers (rdi rsi rdx r10 r8 r9), exactly as a guest SYSCALL instruction
- * would have left them — no instruction decoding is involved.
- *
- * The cardinal rule of the boundary is exercised throughout: every pointer
- * passed to a syscall is a GUEST address. Buffers are written into guest
- * memory via ocerz_g2h first, and the guest address (host address minus
- * guest_base) is what goes into the register. The handler is responsible for
- * translating it back before touching the host kernel; if it forwarded a
- * guest address blindly the kernel would fault or corrupt host state, so a
- * passing round-trip is itself proof the translation happened.
- *
- * Coverage: pipe (dual return), write/read round-trip through the pipe,
- * open/fstat64/close on /dev/null, anonymous mmap + g2h read/write + munmap,
- * MAP_FIXED at a chosen arena address, gettimeofday plausibility, getpid
- * matching the host, exit setting vm->exited/exit_code, execve with a NULL
- * path returning the kernel's EINVAL (CF set, rax=22) now that execve is a real
- * handler rather than a fatal stub, an unknown BSD number returning STEP_FATAL,
- * machdep gs_base, and a Mach task_self_trap matching mach_task_self().
- * Assertions count well past the required thirty.
- *
- * A scratch guest region is carved once with ocerz_map_anywhere and reused as
- * register-spill stack and I/O buffer space; gpr[RSP] is parked there so any
- * stack-resident extra arguments have a real backing page.
- */
+/* Unit tests for the guest syscall boundary. */
 #include "ocerz/vm.h"
 #include "ocerz/syscall.h"
 #include "ocerz/mem.h"
@@ -249,12 +217,6 @@ static void test_mmap_fixed(void)
     CHECK(cpu->gpr[OCERZ_RAX] == 0);
 }
 
-/* i386_set_ldt / i386_get_ldt (machdep 5/6). Wine's WoW64 gets its 32-bit code selector
- * and its per-thread 32-bit TEB from the LDT on macOS; ocerz keeps a SYNTHETIC table for
- * them (Rosetta refuses the call outright, which is why 32-bit Windows software does not
- * run under Wine on Apple silicon). The descriptor pack/unpack is the load-bearing part --
- * base is split across bits 16-39 and 56-63 and the D/B and G flags sit in the middle --
- * so this asserts an exact byte round-trip, not just "it returned something". */
 static uint64_t ldt_pack(uint64_t base, uint32_t limit, uint8_t access, int big, int gran)
 {
     return (limit & 0xffffULL)
@@ -270,12 +232,11 @@ static void test_i386_ldt(void)
 {
     OcerzCPU *cpu = &vm.cpu;
     uint64_t gbuf = scratch + 4096;
-    uint64_t cs32 = ldt_pack(0, 0xfffff, 0x9b, 1, 1);          /* 32-bit code, G=1 */
-    uint64_t fs32 = ldt_pack(0x7ffdf000, 0xfff, 0x93, 1, 0);   /* 32-bit TEB data */
+    uint64_t cs32 = ldt_pack(0, 0xfffff, 0x9b, 1, 1);
+    uint64_t fs32 = ldt_pack(0x7ffdf000, 0xfff, 0x93, 1, 0);
     ocerz_st(gbuf, 8, cs32);
     ocerz_st(gbuf + 8, 8, fs32);
 
-    /* -1 is LDT_AUTO_ALLOC and arrives zero-extended, so it must be read as an int32_t */
     set_args(cpu, machdep(5), (uint64_t)(uint32_t)-1, gbuf, 2, 0, 0, 0);
     int r = ocerz_handle_syscall(&vm, cpu);
     CHECK(r == OCERZ_STEP_OK);
@@ -289,10 +250,9 @@ static void test_i386_ldt(void)
     r = ocerz_handle_syscall(&vm, cpu);
     CHECK(r == OCERZ_STEP_OK);
     CHECK(cf(cpu) == 0);
-    CHECK(ocerz_ld(gbuf + 16, 8) == cs32);   /* exact descriptor round-trip */
+    CHECK(ocerz_ld(gbuf + 16, 8) == cs32);
     CHECK(ocerz_ld(gbuf + 24, 8) == fs32);
 
-    /* a bogus count must be refused, not silently accepted */
     set_args(cpu, machdep(5), (uint64_t)(uint32_t)-1, gbuf, (uint64_t)(uint32_t)-1, 0, 0, 0);
     r = ocerz_handle_syscall(&vm, cpu);
     CHECK(r == OCERZ_STEP_OK);
@@ -303,13 +263,7 @@ static void test_mmap_fixed_outside(void)
 {
     OcerzCPU *cpu = &vm.cpu;
     uint64_t bad = ocerz_arena_hi + 0x10000;
-    /* A FIXED anonymous mmap outside the arena is honoured iff ocerz can reserve that
-     * exact host address (identity-mapped mode grabs it via mach_vm_allocate(FIXED) in
-     * reserve_host_fixed). Whether `bad` is free depends on the process's memory layout,
-     * so this test used to flake -- pass when `bad` happened to be taken, fail when it
-     * was free. Pin the outcome by occupying `bad` on the host first, forcing the
-     * "cannot place this FIXED mapping" -> ENOMEM path every time. (If `bad` was already
-     * occupied the allocate simply fails and it stays occupied, which is equally fine.) */
+
     mach_vm_address_t occ = bad;
     kern_return_t okr = mach_vm_allocate(mach_task_self(), &occ, 0x4000, VM_FLAGS_FIXED);
     set_args(cpu, bsd(197), bad, 0x4000, PROT_READ | PROT_WRITE,

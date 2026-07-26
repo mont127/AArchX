@@ -1,37 +1,4 @@
-/*
- * src/flags.c
- *
- * Eager RFLAGS computation — the reference implementation of x86 flag
- * semantics for all of Ocerz (the JIT must match it bit for bit).
- *
- * Every helper rewrites only the six arithmetic flags (CF PF AF ZF SF OF)
- * and leaves control bits (DF IF TF, fixed bit 1) untouched. All inputs are
- * masked to the operation width internally. The carry-in variants fold ADC
- * and SBB into the add/sub helpers using the relations:
- *   add: carry-out  = res < a, or res == a when a carry-in was added
- *   sub: borrow-out = b > a,  or b == a when a borrow-in was subtracted
- * which hold in modular arithmetic at any width. Signed overflow uses the
- * classic XOR identities: for addition the operands agreed in sign and the
- * result disagrees (~(a^b) & (a^res)); for subtraction the operands
- * disagreed and the result took b's side ((a^b) & (a^res)). The adjust
- * flag is the half-carry out of bit 3: bit 4 of a^b^res. Parity covers the
- * low byte only and is set for an even bit count.
- *
- * INC/DEC preserve CF and compute OF positionally: INC overflows exactly
- * into the minimum signed value, DEC overflows exactly from it leaving the
- * maximum. Shift helpers implement the architectural carve-outs: callers
- * never invoke them with a zero count (count-0 shifts leave all flags
- * unchanged), CF is the last bit shifted out, OF is defined for count 1
- * only (SHL: CF^SF, SHR: original MSB, SAR: 0) but is computed for every
- * count to stay deterministic. MUL sets CF=OF when the high half is
- * nonzero; IMUL when the high half is not the sign-extension of the low
- * half. Architecturally-undefined flags after these (SF/ZF/PF, and AF
- * everywhere it is undefined) get fixed deterministic values so the
- * interpreter and JIT can be diffed bit-exactly.
- *
- * ocerz_cc_eval decodes the standard 4-bit condition table by pairing each
- * predicate with its negation through bit 0.
- */
+/* Eager RFLAGS computation. The bit-for-bit x86 flag reference the JIT must match. */
 #include "ocerz/flags.h"
 
 #define OCERZ_ARITH_FLAGS (OCERZ_CF | OCERZ_PF | OCERZ_AF | OCERZ_ZF | OCERZ_SF | OCERZ_OF)
@@ -180,16 +147,6 @@ void ocerz_flags_imul(OcerzCPU *cpu, int size, uint64_t lo, uint64_t hi)
     put_arith(cpu, f);
 }
 
-/* Reconstruct rflags from the deferred flag record. Every arm forwards to the
- * eager helper above with EXACTLY the operands the interpreter would have
- * passed, so the result is bit-identical to eager evaluation by construction --
- * res is recomputed here rather than stored (only two operand slots survive):
- *   ADD/SUB : res = a (+/-) b (+/-) cin        (helpers re-mask internally)
- *   LOGIC   : res carried directly in cc_dst
- *   INC/DEC : cc_dst=res, and the preserved CF is carried in cc_src (the eager
- *             helper reads it back out of rflags, so it is seeded here first)
- *   SHL/SHR/SAR : cc_src=val, cc_dst=cnt; res recomputed at width
- *   MUL/IMUL: cc_src=low half, cc_dst=high half */
 void ocerz_flags_materialize(OcerzCPU *cpu)
 {
     uint32_t op = cpu->cc_op;

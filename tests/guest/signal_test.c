@@ -1,27 +1,4 @@
-/*
- * tests/guest/signal_test.c
- *
- * Exercises Ocerz guest signal delivery end to end without libSystem. The
- * program installs a SIGSEGV handler through the raw __sigaction syscall
- * (number 46), supplying a private trampoline that reproduces the macOS x86_64
- * _sigtramp register contract, then deliberately stores through a null pointer
- * to raise SIGSEGV. The emulator's fault handler must convert that host fault
- * into a Darwin guest-signal delivery: build a signal frame, redirect the guest
- * to the trampoline, which calls the handler and then issues __sigreturn
- * (syscall 184). The handler rewrites the saved instruction pointer inside the
- * delivered ucontext so the sigreturn resumes in a recovery routine that prints
- * a deterministic line and exits 0. A clean exit proves ocerz_signal_deliver and
- * sys_sigreturn round-trip correctly; with no delivery the null store would
- * instead abort the whole emulator with status 139.
- *
- * Trampoline ABI (verified against this host's libsystem_platform _sigtramp):
- * entered with the handler in rdi, signal number in edx, siginfo pointer in rcx,
- * ucontext pointer in r8 and the sigreturn token in r9; it calls
- * handler(signo=edi, siginfo=rsi, ucontext=rdx) then __sigreturn(ucontext, 0x1e,
- * token). The push at entry restores the 16-byte call alignment the ABI expects.
- * The ucontext's uc_mcontext pointer sits at offset 48 and the saved rip within
- * that mcontext at offset 144, matching the frame ocerz_signal_deliver writes.
- */
+/* Guest signal delivery end to end, without libSystem. */
 #include "gsys.h"
 
 #define SYS_sigaction 46

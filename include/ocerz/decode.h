@@ -1,82 +1,4 @@
-/*
- * include/ocerz/decode.h
- *
- * The x86_64 instruction decoder contract: one decoded instruction (X86Insn)
- * is the single exchange format between the decoder, the interpreter, and
- * the JIT translator. The decoder is PURE: it reads only the byte buffer it
- * is given, never CPU or guest-memory state.
- *
- * ocerz_decode(code, avail, rip, out) decodes exactly one instruction whose
- * first byte is code[0] and which is architecturally located at guest
- * address `rip`. It returns OCERZ_OK and fills *out, or OCERZ_EUNDEF for an
- * opcode that does not exist / is rejected, OCERZ_ETRUNC if `avail` bytes
- * are not enough, OCERZ_ETOOLONG past 15 bytes. On success out->len is the
- * full encoded length including prefixes.
- *
- * Operand conventions (binding for every consumer):
- *  - ops[0] is the destination and usually also the first source. For pure
- *    comparisons (CMP, TEST, BT, COMISS/COMISD, UCOMISS/UCOMISD, PTEST) all
- *    operands are read-only. XCHG and XADD read and write both.
- *  - Every operand carries its own access size in bytes in .size (1,2,4,8,
- *    10 for x87 extended, 16 for full XMM). insn.opsize mirrors the primary
- *    operation width. Consumers must trust per-operand sizes, e.g. MOVZX has
- *    ops[0].size 2/4/8 and ops[1].size 1/2.
- *  - Memory operands: effective address = gpr[base] + (gpr[index] << scale)
- *    + disp, where .scale is the LOG2 of the x86 scale (0..3) and absent
- *    base/index are OCERZ_REG_NONE. RIP-relative operands are pre-resolved:
- *    .riprel=1, base=index=NONE, and .disp already holds the final absolute
- *    guest address (instruction-end rip + disp32). moffs forms (A0..A3)
- *    become plain MEM operands with base=index=NONE and disp=the 64-bit
- *    offset. Segment overrides live on insn.seg (only FS/GS have effect;
- *    CS/DS/ES/SS prefixes are consumed and ignored); the effective-address
- *    helper adds fs_base/gs_base AFTER the 32-bit address-size truncation
- *    that applies when insn.addrsize is 4.
- *  - 8-bit register operands encoded as 4..7 WITHOUT any REX prefix are the
- *    legacy high-byte registers AH/CH/DH/BH: the decoder stores .reg =
- *    encoded-4 (the underlying RAX/RCX/RDX/RBX index) and sets .high8=1,
- *    meaning bits 8..15 of that GPR. With any REX present they decode
- *    normally to SPL/BPL/SIL/DIL (.high8=0, reg 4..7).
- *  - Immediates are stored in .imm with the architectural sign-extension
- *    already applied as a 64-bit bit pattern (imm8/imm32 sign-extended in
- *    64-bit-operand contexts; only MOV reg64, imm64 carries 8 raw bytes).
- *  - Direct branches (JMP rel, Jcc, CALL rel, JRCXZ, LOOP*) have one IMM
- *    operand whose .imm is the ABSOLUTE target address. Indirect JMP/CALL
- *    have a REG or MEM operand. RET with a 0xC2 stack adjustment carries one
- *    IMM operand (the byte count); plain RET has nops=0.
- *  - Jcc/SETcc/CMOVcc/FCMOVcc store the 4-bit condition in insn.cc using the
- *    standard encoding listed in OcerzCC below.
- *  - Shift/rotate by CL has ops[1] = REG rcx size 1; by immediate has
- *    ops[1] = IMM. SHLD/SHRD have ops[2] as the count (IMM or REG cl).
- *  - String instructions (MOVS/STOS/LODS/SCAS/CMPS) have nops=0; the element
- *    width is insn.opsize and insn.rep distinguishes none/REP/REPNE.
- *  - PUSH/POP default to 8 bytes in long mode (2 with a 66 prefix). PUSHF/
- *    POPF are always 8.
- *  - IMUL appears with nops=1 (one r/m source, implicit RDX:RAX), nops=2
- *    (dst, src) and nops=3 (dst, src, imm). MUL/DIV/IDIV/NOT/NEG have
- *    nops=1. CBW/CWDE/CDQE share OCERZ_OP_CBW distinguished by opsize
- *    (2/4/8); CWD/CDQ/CQO likewise share OCERZ_OP_CWD.
- *  - CMPXCHG: ops[0]=r/m, ops[1]=reg, accumulator implicit. CMPXCHG8B/16B is
- *    OCERZ_OP_CMPXCHGXB with one MEM operand and opsize 8 or 16.
- *  - SSE register operands use kind OCERZ_OPK_XMM with .reg 0..15. Scalar
- *    SSE forms carry size 4 (ss) or 8 (sd); full-width forms carry 16.
- *    Variants that differ only in non-architectural ways are normalized:
- *    MOVAPD->MOVAPS, MOVUPD->MOVUPS, ANDPD->ANDPS (etc. for OR/XOR/ANDN),
- *    MOVNTDQ->MOVDQA, MOVNTPS->MOVAPS, LDDQU->MOVDQU, all PREFETCH* hints
- *    decode to OCERZ_OP_PREFETCH, multi-byte NOP 0F 1F and ENDBR64
- *    F3 0F 1E FA decode to OCERZ_OP_NOP. MOVD is the 32-bit GPR<->XMM move;
- *    MOVQX covers the 64-bit GPR<->XMM and XMM<->XMM/m64 low-quadword moves
- *    (0F 6E/7E with REX.W, F3 0F 7E, 66 0F D6).
- *  - x87 stack registers use kind OCERZ_OPK_ST with .reg = i for ST(i);
- *    memory forms are MEM with size 4/8/10 (real) or 2/4/8 (integer).
- *    FNSTSW AX has ops[0] = REG rax size 2.
- *  - insn.lock is set when a F0 prefix was present (only meaningful with a
- *    memory destination); insn.rep holds OCERZ_REP_NONE/REP/REPNE for string
- *    ops only, after mandatory-prefix resolution for the 0F maps.
- *
- * RIP protocol: the interpreter advances cpu->rip by insn.len BEFORE
- * executing the instruction, so handlers see the architectural next-rip and
- * branch handlers simply overwrite cpu->rip.
- */
+/* Decoder contract: X86Insn is the exchange format between decoder, interpreter and JIT. */
 #ifndef OCERZ_DECODE_H
 #define OCERZ_DECODE_H
 
@@ -184,12 +106,7 @@ enum OcerzOp {
     OCERZ_OP_CALL,
     OCERZ_OP_RET,
     OCERZ_OP_IRET,
-    /* Far control transfers -- the entire WoW64 64<->32 mode switch (wow64cpu.dll uses
-     * FF /5 far JMP m16:32 and IRETQ to enter 32-bit code, and a far JMP back), plus
-     * MOV Sreg which installs the 32-bit TEB from an LDT selector. These MUST live with
-     * the other control-flow ops and BEFORE OCERZ_OP_SSE_FIRST: src/interp.c falls back to
-     * the SSE interpreter for any unhandled op numerically >= SSE_FIRST, so an op parked
-     * in that range is routed to the wrong tier instead of failing cleanly. */
+
     OCERZ_OP_JMPF,
     OCERZ_OP_CALLF,
     OCERZ_OP_RETF,

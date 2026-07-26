@@ -1,29 +1,4 @@
-/*
- * tests/unit/test_loader.c
- *
- * Unit tests for the Mach-O loader (src/loader.c) and the exec-stack builder
- * (src/stack.c). Both are exercised against an image this test hand-builds at
- * runtime so the fixtures are self-contained and need no external binaries.
- *
- * build_thin_macho() writes a minimal but structurally valid thin x86_64
- * Mach-O executable into a temp file: a mach_header_64, one LC_SEGMENT_64 for
- * a fake __TEXT placed at guest 0x100000000 with fileoff 0 (so it maps the
- * header itself plus a small run of recognizable code bytes), and an
- * LC_UNIXTHREAD carrying an x86_THREAD_STATE64 whose rip points at the first
- * code byte. The exact same bytes are then wrapped in a hand-built fat
- * archive (fat_header + one big-endian fat_arch) to test the fat-slice path.
- *
- * The loader assertions check entry, mh_gaddr, the mapped [lo,hi) range, and
- * that the mapped guest bytes match the file (header magic and the code
- * pattern). The stack assertions walk guest memory from cpu->rsp and verify
- * argc, each argv string, the argv NULL terminator, each envp string, the
- * envp NULL terminator, that apple[0] begins with "executable_path=", and
- * that rsp is 16-byte aligned. Over 25 assertions run across both the thin
- * and fat cases.
- *
- * ocerz_mem_init() is called once; the arena is large and each load reuses
- * the canonical range, which is fine because a reload re-maps the same pages.
- */
+/* Unit tests for the Mach-O loader and the exec stack builder. */
 #include "ocerz/loader.h"
 #include "ocerz/mem.h"
 #include "ocerz/vm.h"
@@ -43,7 +18,6 @@
 #define X86_THREAD_STATE64 4
 #define X86_THREAD_STATE64_COUNT 42
 #define RIP_REG_INDEX 16
-
 
 static int g_checks;
 static int g_fails;

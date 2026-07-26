@@ -1,37 +1,4 @@
-/*
- * tests/guest/gsys.h
- *
- * Freestanding x86_64 macOS syscall wrappers and tiny output formatters for
- * the Ocerz guest test programs. No libc is linked (-nostdlib), so every
- * kernel interaction goes through raw "syscall" inline asm here, and every
- * line of output is formatted by hand into a stack buffer and written with
- * sys_write. Everything is static inline so each test program is fully
- * self-contained with no extra translation unit.
- *
- * macOS BSD syscall ABI (x86_64): the syscall number goes in rax with the
- * Unix class bit set (number | 0x2000000); arguments are passed in
- * rdi, rsi, rdx, r10, r8, r9 (note r10, NOT rcx, is the 4th argument — the
- * SysV C ABI hands the 4th argument in rcx, so the 4-and-more-argument
- * wrappers move it to r10 explicitly). The "syscall" instruction clobbers
- * rcx and r11 (the kernel returns rip in rcx and rflags in r11), so both are
- * listed as clobbers along with "memory". On return the carry flag signals a
- * BSD error and rax holds errno; we capture carry with setc into a byte so
- * error detection survives any compiler-inserted instruction after the asm.
- * On success rax holds the result (a second result lands in rdx for the few
- * dual-return calls, which these tests do not use).
- *
- * The syscall numbers below are the stable macOS BSD numbers (exit=1,
- * read=3, write=4, open=5, close=6, unlink=10, getpid=20, munmap=73,
- * gettimeofday=116, mmap=197), each OR'd with 0x2000000 by SYS().
- *
- * Formatting helpers build into a local char buffer and emit to fd 1:
- *   g_puts(s)       writes a NUL-terminated string
- *   g_putu64(n)     writes n as unsigned decimal
- *   g_puthex64(n)   writes n as "0x" + 16 lowercase hex digits (fixed width,
- *                   so float bit patterns line up and stay deterministic)
- * All output is deterministic and machine-independent in content, which is
- * what lets the golden files double as the cross-check against Ocerz.
- */
+/* Freestanding x86_64 syscall wrappers and output helpers for the guest tests. */
 #ifndef OCERZ_GUEST_GSYS_H
 #define OCERZ_GUEST_GSYS_H
 

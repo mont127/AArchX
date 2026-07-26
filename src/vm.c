@@ -1,71 +1,4 @@
-/*
- * src/vm.c
- *
- * The master run loop and crash containment.
- *
- * ocerz_vm_run() installs SIGSEGV/SIGBUS handlers, then executes the guest:
- * when the JIT tier is enabled and present it gets first claim on each
- * dispatch (returning OCERZ_EUNSUP hands control back for one interpreted
- * instruction, which is also how unimplemented instructions inside a hot
- * region make progress); otherwise the interpreter single-steps. The loop
- * ends when the guest calls exit (STEP_EXIT, exit code preserved) or when
- * emulation cannot continue (STEP_FATAL, exit code 125 after a CPU dump).
- *
- * The signal handler is async-signal-safe by construction (write(2) of a
- * preformatted buffer built with a tiny hex formatter, then _exit(139)).
- * It reports the guest rip at the time of the fault and the faulting host
- * address, the two numbers that make wild-pointer bugs in guest code (or
- * Ocerz itself) immediately diagnosable. g_vm makes the current VM visible
- * to the handler; Ocerz is single-guest-per-process so a global is
- * accurate.
- *
- * Two env-gated diagnostics live here because they need the VM state.
- * OCERZ_ICAP=<n> aborts an initializer-phase ocerz_vm_call once the global
- * instruction count exceeds n, dumping the CPU — bisecting n against a spin
- * locates the looping rip without a 100M-line trace. OCERZ_WATCH=<addr>
- * (checked in the ocerz_st/ocerz_st128 inlines, mem.h) reports every guest
- * store covering that address with value, rip, and icount via
- * ocerz_watch_hit — a software store-watchpoint that pinpoints which
- * instruction last set a corrupted global. OCERZ_RIPLOG=<addr[,addr...]>
- * logs the first few times an ocerz_vm_call loop iteration begins at one of
- * the listed guest rips (with icount and rdi/rsi) — an execution-tripwire for
- * confirming whether a specific IMP or init routine actually runs, complementary
- * to OCERZ_WATCH's store view (it sees block-entry rips, so JIT-chained
- * interiors can be missed). OCERZ_PROFILE=<n> prints the current rip every n
- * (interpreted) instructions — a coarse statistical profiler that tells a
- * confined busy-loop (rip clustered in one region) apart from slow forward
- * progress (rip sweeping many functions/dylibs); note only interpreted steps
- * advance the count, so JIT-resident regions are under-sampled. OCERZ_TRACE_LO/
- * OCERZ_TRACE_HI=<addr> bound a guest-rip window inside which ocerz_vm_run_cpu
- * single-steps (forcing the interpreter) and prints rip+key regs per
- * instruction — a SCOPED, per-thread trace. Because under OCERZ_INITPHASE the
- * main guest runs via ocerz_vm_call while spawned/worker threads run via
- * ocerz_vm_run_cpu, this window traces ONLY the worker threads, untangling the
- * libsystem_pthread code that the main thread also executes.
- *
- * The ocerz_vm_call return sentinel is a real mapped page (int3-filled,
- * readable, at 0x500000000 — outside both the guest arena and the shared
- * cache), not a bare magic constant. Guest code is entitled to READ the
- * bytes at its own return address: objc's autorelease-return optimization
- * (objc_autoreleaseReturnValue) does `mov rax,[rsp]; cmp dword [rax],
- * 0xe8c78948` to probe for the reclaim marker, so an unmapped fake return
- * address SIGSEGVs the first time a +load or initializer returns an
- * autoreleased object. With a mapped page the probe reads 0xcc bytes,
- * finds no marker, and correctly falls back to the plain autorelease path;
- * if anything ever actually jumps there the int3 traps loudly instead of
- * executing garbage. The crash handler guards against re-entry (its own
- * guest-stack backtrace scan can fault on a corrupt sp, which previously
- * recursed the signal forever) and writes the fault summary before
- * attempting that scan. For that guard to actually fire the handler is
- * installed with SA_NODEFER so a fault taken WHILE the handler runs (the
- * bt-scan's ocerz_ld off the just-overflowed, now-unmapped guest stack page)
- * is delivered as a nested signal instead of being masked and retried forever
- * by the kernel — without SA_NODEFER the re-fault spins the thread and the
- * process hangs instead of dying. It is also installed SA_ONSTACK on a
- * dedicated sigaltstack so it can still run when the guest/host stack itself is
- * the unmapped region. The handler always terminates the process (_exit(139),
- * or _exit(139) via the depth guard on the nested fault).
- */
+/* The master run loop and crash containment. */
 #include "ocerz/vm.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"
@@ -89,25 +22,6 @@
 static OcerzVM *g_vm;
 static __thread OcerzCPU *g_cur_cpu;
 
-/* ---- Cross-thread interrupt registry --------------------------------------
- *
- * Every guest thread's top-level OcerzCPU registers here for the lifetime of its
- * ocerz_vm_run_cpu loop (the main CPU and every bsdthread/workqueue worker). A
- * guest thread stops itself synchronously today -- it sets its OWN cpu->terminated
- * inside a syscall (bsdthread_terminate, workq THREAD_RETURN) or vm->exited via
- * exit(2), and its run-loop header notices at the next block boundary. There is
- * NO path by which one thread asynchronously stops another that is busy in a
- * compute loop: the existing cross-thread kick (async_sig_handler / SIGUSR1) only
- * takes effect at a forwarded-syscall return boundary, so a pure ALU/mem/br
- * self-loop with no syscalls is unreachable by it.
- *
- * That is exactly the loop the JIT is about to CHAIN. A chained self-loop
- * (jcc -> its own rip) never returns to the run-loop header, so it would never
- * re-check vm->exited/terminated and would HANG the process on any cross-thread
- * exit. The safety net is a BACK-EDGE POLL of one per-CPU word (cpu->interrupt);
- * for that single word to be correct for a PROCESS-WIDE exit, whoever requests
- * the exit must set it on every live CPU. This registry is that broadcast list,
- * and ocerz_vm_request_exit is the one writer. */
 #define OCERZ_MAX_CPUS 512
 static OcerzCPU *g_cpus[OCERZ_MAX_CPUS];
 static int g_cpus_n;
@@ -117,10 +31,8 @@ static void ocerz_cpu_register(OcerzCPU *cpu)
 {
     pthread_mutex_lock(&g_cpus_lock);
     for (int i = 0; i < g_cpus_n; i++)
-        if (g_cpus[i] == cpu) {           /* already registered: never double-insert */
-            /* Each hit here is a re-registration the OLD code would have turned into a
-             * dangling g_cpus[] entry -- the corruption mechanism, counted so it can be
-             * proven live (OCERZ_CPUREG_LOG) rather than argued. */
+        if (g_cpus[i] == cpu) {
+
             static _Atomic unsigned dups;
             if (getenv("OCERZ_CPUREG_LOG"))
                 fprintf(stderr, "ocerz: CPUREG dup #%u cpu=%p (would have dangled)\n",
@@ -130,9 +42,7 @@ static void ocerz_cpu_register(OcerzCPU *cpu)
         }
     if (g_cpus_n < OCERZ_MAX_CPUS)
         g_cpus[g_cpus_n++] = cpu;
-    /* Overflow (more than 512 live guest threads) is not fatal: an unregistered
-     * CPU simply misses the broadcast and falls back to the run-loop header's own
-     * vm->exited check, which chaining will still honor via its dispatcher exit. */
+
     pthread_mutex_unlock(&g_cpus_lock);
 }
 
@@ -142,17 +52,12 @@ static void ocerz_cpu_unregister(OcerzCPU *cpu)
     for (int i = 0; i < g_cpus_n; i++) {
         if (g_cpus[i] == cpu) {
             g_cpus[i] = g_cpus[--g_cpus_n];
-            i--;                          /* remove ALL matches, not just the first, so no
-                                             stale duplicate can outlive the CPU */
+            i--;
         }
     }
     pthread_mutex_unlock(&g_cpus_lock);
 }
 
-/* A JIT memory-mode transition retires every host entry cached in the return
- * predictor. The transition is required before guest concurrency starts, but
- * clear the complete registry as well as vm->cpu so nested/local run contexts
- * cannot retain an entry into the retired generation. */
 void ocerz_vm_purge_jit_ras(OcerzVM *vm)
 {
     if (!vm)
@@ -167,31 +72,17 @@ void ocerz_vm_purge_jit_ras(OcerzVM *vm)
     pthread_mutex_unlock(&g_cpus_lock);
 }
 
-/* Pending ASYNCHRONOUS guest signals for THIS thread (a bitmask of signo, 1..31).
- * The macOS kernel delivers __pthread_kill(thread_port, signo) to a named thread
- * asynchronously, interrupting its current syscall. ocerz reproduces that: the host
- * async_sig_handler (installed for the signals Wine sends cross-thread, e.g. the
- * wineserver's SIGUSR1 system-APC/suspend kick) sets the bit and returns -- EINTRing
- * the target out of its blocking forwarded host syscall -- and the syscall-return
- * boundary in ocerz_handle_syscall builds the guest signal frame via
- * ocerz_signal_deliver. See sys_pthread_kill. */
 static __thread volatile uint32_t g_pending_async_mask;
 
 uint32_t ocerz_take_pending_async_sig(void)
 {
     return __atomic_exchange_n(&g_pending_async_mask, 0u, __ATOMIC_SEQ_CST);
 }
-/* When a guest CPU fault is converted to a guest signal, the host SIGSEGV/SIGBUS
- * handler redirects g_cur_cpu to the guest handler and unwinds the interrupted
- * interpreter/JIT back to the nearest run-loop step via this per-thread jump
- * buffer (set at the top of ocerz_vm_run_cpu / ocerz_vm_call, saved/restored
- * across nesting). The loop then resumes from the redirected cpu->rip. */
+
 static __thread sigjmp_buf *g_sig_recover;
-/* Max consecutive deliveries of the SAME guest fault address before the handler
- * is declared stuck (the page is genuinely bad, not commit-on-demand). */
+
 #define OCERZ_SIG_MAX_REPEAT 16
-/* Ring of recent block-entry rips per thread, for reconstructing how a thread
- * reached a fault (e.g. a branch to rip=0). Updated at each run-loop step. */
+
 static __thread uint64_t g_riphist[32];
 static __thread unsigned g_riphist_n;
 static int g_crash_stack;
@@ -204,34 +95,17 @@ unsigned ocerz_vm_riphist(uint64_t *out, unsigned max)
         out[i] = g_riphist[(g_riphist_n - 1 - i) & 31];
     return n;
 }
-/* OCERZ_SIGTRACE: when set, crash_handler writes one async-signal-safe line per
- * converted guest signal (fault address, the handler/trampoline it redirects to,
- * the faulting guest rip and icount). Read once at handler-install time so the
- * signal handler never calls getenv. */
+
 static int g_sigtrace;
 
 uint64_t ocerz_watch_addr;
 uint64_t ocerz_watch_val;
 uint64_t ocerz_exc_trap;
-/* When >0, a guest CPU fault inside an ocerz_vm_call (a library initializer)
- * is logged and SKIPPED -- the call returns -- instead of aborting the process.
- * Set around shared-cache image initializers (run_image_inits), which must run
- * on dlopen so a post-boot framework (Foundation) is fully initialized, but a
- * few of which (SkyLight's, which asserts a libdispatch queue context ocerz
- * cannot provide -> ud2) cannot run under emulation and are best-effort skipped
- * exactly as the old all-initializers-skipped behavior did, minus the ones we
- * actually need. */
+
 int ocerz_init_tolerant;
-/* OCERZ_SELTRAP=<rip>: when a run-loop step begins at this guest rip (point it at
- * objc's __forwarding_prep_0___ / a doesNotRecognizeSelector site), dump the
- * objc_msgSend receiver (rdi) + its isa, the selector pointer (rsi) and its name
- * string, and the thread gs_base -- to tell a non-canonical selector pointer from
- * a corrupt receiver isa behind an "unrecognized selector" abort. */
+
 static uint64_t ocerz_sel_trap;
-/* OCERZ_CTXTRAP=<rip>: when a run-loop step begins at this guest rip, dump the
- * Wine syscall_frame pointed to by rcx (rax@0, rcx@0x10, rdx@0x18, rdi@0x28,
- * rip@0x70, rsp@0x88) — used to inspect the context that NtContinue/dispatcher-
- * return is about to restore (e.g. tracking down a frame with rip=0). */
+
 static uint64_t ocerz_ctx_trap;
 
 static void ctx_trap_report(const OcerzCPU *c)
@@ -241,7 +115,7 @@ static void ctx_trap_report(const OcerzCPU *c)
         return;
     hits++;
     uint64_t f = c->gpr[OCERZ_RCX];
-    uint64_t s = c->gpr[OCERZ_RSI];   /* context_from_server: rsi = server context_t */
+    uint64_t s = c->gpr[OCERZ_RSI];
     fprintf(stderr,
             "ocerz: CTXTRAP pid=%d rip=%#llx rdi=%#llx rsi(ctx_t)=%#llx "
             "ctx.machine=%#x ctx.flags=%#x ctl.rip=%#llx ctl.rsp=%#llx "
@@ -312,11 +186,6 @@ void ocerz_exc_report(const OcerzCPU *c)
     fputc('\n', stderr);
 }
 
-/* OCERZ_ARGTRAP=<rip>: dump the SysV argument registers on entry to a block starting at
- * <rip>, plus the first two words behind any that point at committed guest memory. The
- * generic counterpart to EXCTRAP/SELTRAP, for a function whose ABI is not known in advance:
- * a function entry is frequently the last place an argument still exists, because the
- * callee's own prologue overwrites the caller-saved registers that carried it. */
 uint64_t ocerz_arg_trap;
 
 static void arg_trap_report(const OcerzCPU *c)
@@ -423,11 +292,6 @@ static char *str_into(char *p, const char *s)
     return p;
 }
 
-/* Host handler for an async guest signal directed at this thread (the wineserver's
- * cross-thread SIGUSR1/SIGQUIT kick, forwarded by sys_pthread_kill -> the host
- * kernel -> here). Async-signal-safe: just record the signo; returning EINTRs the
- * interrupted blocking host syscall, and the guest handler runs at the next
- * syscall-return boundary (ocerz_handle_syscall). */
 static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)si; (void)ctx;
@@ -435,9 +299,6 @@ static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
         __atomic_or_fetch(&g_pending_async_mask, 1u << sig, __ATOMIC_SEQ_CST);
 }
 
-/* OCERZ_RIPDUMP: SIGUSR1 dumps the handling thread's current guest rip and its
- * recent rip history, async-signal-safe, so a spinning guest loop (CFRunLoop /
- * SkyLight / dispatch) can be located by `kill -USR1` without stopping it. */
 static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)sig; (void)si; (void)ctx;
@@ -468,8 +329,7 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
     }
     *p++ = '\n';
     write(2, b, (size_t)(p - b));
-    /* Dump instruction bytes at each distinct recent guest rip so a spinning
-     * loop can be disassembled offline. */
+
     for (int i = 0; i < 24; i++) {
         uint64_t r = g_riphist[(g_riphist_n - 1 - (unsigned)i) & 31];
         if (!r) continue;
@@ -501,23 +361,10 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
     static volatile int depth;
-    /* A fault inside the JIT block translator's guest-code read: unwind back
-     * into translate() (which ends the block and lets jit_step release the
-     * translation lock normally) rather than delivering a guest signal here,
-     * which would longjmp out through the held lock and deadlock. This must
-     * precede the delivery path. See ocerz_jit_decode_recover in jit.h. */
+
     if (ocerz_jit_decode_recover)
         siglongjmp(*ocerz_jit_decode_recover, 1);
-    /* A guest CPU fault: if the running guest thread has a handler registered,
-     * convert the fault to a Darwin guest-signal delivery and unwind back to the
-     * run loop, which resumes at the handler. A translated guest memory-access
-     * fault is normalized to guest SIGSEGV regardless of whether the arm64 host
-     * raised SIGSEGV or SIGBUS: on real x86_64 Darwin a bad access is SIGSEGV,
-     * and the host SIGBUS here is an artifact of how the shadow window is mapped.
-     * The si_code distinguishes a not-present page (SEGV_MAPERR) from a
-     * permission fault on a committed page (SEGV_ACCERR). depth guards the frame
-     * build itself so a fault while writing the frame falls through to the real
-     * crash dump rather than looping. */
+
     if (depth == 0 && g_cur_cpu && g_sig_recover &&
         ocerz_host_in_guest_space(si->si_addr)) {
         depth = 1;
@@ -526,53 +373,31 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         struct OcerzVM *fvm = g_cur_cpu->vm;
         int in_jit = hpc && fvm && ocerz_jit_pc_in_arena(fvm, hpc);
         if (in_jit) {
-            /* REGISTER + FLAG FAULT SEAM. Cold flag recipes read current guest
-             * GPRs, so recover the pinned subset from the host mcontext first,
-             * then let the recipe install the exact deferred tuple visible at
-             * the faulting instruction. Both helpers are no-ops when their block
-             * carries no corresponding metadata. */
+
             ocerz_jit_fault_recover_regs(fvm, hpc,
                 uc->uc_mcontext->__ss.__x, g_cur_cpu);
             ocerz_jit_fault_recover_flags(fvm, hpc, g_cur_cpu);
         }
-        /* The guest signal frame is marshaled from cpu->rflags and a guest
-         * handler may PUSHF. Materialize either the ordinary hot-path deferred
-         * record or the cold recipe installed immediately above. */
+
         ocerz_flags_materialize(g_cur_cpu);
-        /* The rip a real x86 kernel reports is the FAULTING instruction, but
-         * cpu->rip has already advanced to the next one (see OcerzCPU::cur_rip).
-         * cur_rip carries the faulting address for slow-path instructions; for
-         * an INLINED jit instruction nothing wrote it, so recover the exact rip
-         * from the block's side table via the host pc. Falls back to cur_rip
-         * when the pc is not in a compiled block. */
+
         uint64_t fault_rip = g_cur_cpu->cur_rip;
         int rip_exact = 1;
         {
             if (in_jit) {
-                /* Faulted in emitted code: only the side table knows the rip,
-                 * because an inlined instruction never wrote cur_rip (which
-                 * therefore still names some earlier slow instruction). If the
-                 * table cannot answer, we do NOT know the faulting rip and must
-                 * not pretend we do. */
+
                 uint64_t jrip;
                 if (ocerz_jit_fault_rip(fvm, hpc, &jrip))
                     fault_rip = jrip;
                 else
                     rip_exact = 0;
             }
-            /* Faulted outside the arena => we are inside ocerz's own C, i.e. the
-             * interpreter slow path, which always sets cur_rip before executing.
-             * cur_rip is authoritative there. */
+
         }
         uint64_t gs = g_cur_cpu->gs_base;
         uint64_t gaddr = ocerz_h2g(si->si_addr);
         int code = ocerz_addr_committed(gaddr) == 1 ? 2 : 1;
-        /* Build the x86 page-fault error code Wine reads from mcontext.__es to
-         * classify the fault (read/write/execute, present/not). Recover the true
-         * access type from the host arm64 ESR: instruction-abort exception class
-         * => instruction fetch; data-abort WnR bit => write. Without this Wine
-         * sees every fault as a not-present READ and mis-handles execute faults
-         * (a jump to 0) and write/guard-page faults (stack growth). */
+
         uint64_t esr = ctx ? ((const ucontext_t *)ctx)->uc_mcontext->__es.__esr : 0;
         uint32_t ec = (uint32_t)((esr >> 26) & 0x3f);
         int is_fetch = (ec == 0x20 || ec == 0x21);
@@ -581,33 +406,13 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (code == 2) err |= 0x1u;
         if (is_write) err |= 0x2u;
         if (is_fetch) err |= 0x10u;
-        /* A guest handler that keeps faulting on the SAME address makes no
-         * progress (the page is genuinely bad, not a commit-on-demand miss);
-         * after a bound, stop delivering and let the real crash dump show the
-         * stuck address instead of recursing the handler to a stack overflow. A
-         * fault at a DIFFERENT address resets the counter, so legitimately
-         * nested or sequential faults (incl. Wine's NtContinue returns, which do
-         * not sigreturn) are unaffected. */
+
         if (gaddr != g_cur_cpu->sig_last_fault) {
             g_cur_cpu->sig_last_fault = gaddr;
             g_cur_cpu->sig_repeat = 0;
         }
         int looping = ++g_cur_cpu->sig_repeat > OCERZ_SIG_MAX_REPEAT;
-        /* Bug B bounded recovery (gs:0x320): a HOSTWQ/libdispatch WORKER has no Wine TEB and no
-         * Wine sigaltstack (sig_altstack_sp==0), so when it faults, Wine's segv_handler can't
-         * run -- get_current_teb() reads no TEB and the deref faults on [r14]=0 (near-null
-         * ~0x320) OR [r14]=garbage; either way the handler makes no progress and re-faults. On
-         * real macOS such a worker never faults; under ocerz it does, and the loop would kill
-         * the whole process. Instead TERMINATE just this worker (abandon the dispatch callback;
-         * the host thread parks) so the process survives. Gated on a no-altstack thread that is
-         * LOOPING -- a real Wine thread has an altstack, and a legit fault doesn't loop on the
-         * same address (it gets fixed). A foreign worker that ACQUIRED an altstack but still has
-         * no TEB at its 64KB stack base (the deterministic ~167M dispatcher crash) is caught by
-         * the second clause: the dispatcher's TEB lookup *(rsp&~0xffff) reads an INVALID
-         * (uncommitted/poison) pointer, whereas a real Wine thread always has a VALID committed
-         * TEB pointer there -- so this targets the altstack-foreign-worker variant WITHOUT
-         * terminating a real Wine thread (avoids the hang risk of a blanket LOOPING-alone gate).
-         * The fully-proper fix is still #16/#17 marshaling (don't run Wine PE code on workers). */
+
         int no_wine_teb = g_cur_cpu->sig_altstack_sp == 0;
         if (!no_wine_teb) {
             uint64_t sb = g_cur_cpu->gpr[OCERZ_RSP] & ~0xffffull;
@@ -633,25 +438,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             depth = 0;
             siglongjmp(*g_sig_recover, 1);
         }
-        /* REWIND rip TO THE FAULTING INSTRUCTION BEFORE DELIVERING.
-         *
-         * A faulting instruction is ABORTED: it does not complete, so the
-         * architectural rip a real x86 kernel reports in the signal frame is the
-         * faulting instruction itself, not the one after it. Both ocerz tiers
-         * advance rip to the next instruction before executing (see
-         * OcerzCPU::cur_rip), so without this the frame named the WRONG
-         * instruction and, worse, sigreturn resumed PAST the faulting access --
-         * silently SKIPPING it. That breaks the standard fix-and-retry idiom
-         * every commit-on-demand guest relies on (Wine grows a thread stack from
-         * the guard-page fault and returns, expecting the store to be retried);
-         * the store would simply be dropped and the write lost.
-         *
-         * Only rewind when the faulting rip is exactly known. If a fault landed
-         * in emitted code that has no side table, cur_rip names some earlier
-         * instruction, and rewinding to THAT would re-execute good instructions
-         * -- strictly worse than the old behaviour. In that case leave rip alone.
-         *
-         * The crash-dump path below is unaffected: it only reads fault_rip. */
+
         {
             static int rewind_off = -1;
             if (rewind_off < 0)
@@ -709,9 +496,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 write(2, xb, (size_t)(x - xb));
             }
             {
-                /* GPR snapshot: for the heap-walk fault the next-chunk pointer in
-                 * rax/r8 and the size in rcx/rdx tell us why the walk left the
-                 * committed range. */
+
                 char gb[256];
                 char *g = gb;
                 static const char *nm[] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
@@ -727,8 +512,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 write(2, gb, (size_t)(g - gb));
             }
             {
-                /* Dump committed guest qwords at rsi and r12 (the heap base / first
-                 * chunk for the RtlCreateHeap fault) to read the heap's size fields. */
+
                 static const int regs[] = {OCERZ_RSI, OCERZ_R12, OCERZ_R11};
                 static const char *rn[] = {"rsi","r12","r11"};
                 for (int k = 0; k < 3; k++) {
@@ -769,17 +553,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (delivered)
             siglongjmp(*g_sig_recover, 1);
     }
-    /* Out-of-guest-space recovery for the #16/#17 foreign-worker DISPATCHER crash (kills boot
-     * processes -> winedbg, before they reach their own window). A thread with no Wine TEB runs
-     * the WoW64 dispatcher; its gs-restore reads a POISON TEB pointer from its 64KB stack base
-     * and then that poison propagates and faults at UNPREDICTABLE addresses outside guest space
-     * (observed [rax+0x320], [rax+0x2f0], and [rax + scaled-index] at 3 different dispatcher
-     * insns) -- so matching the FAULT address is hopeless. Instead match the reliable THREAD
-     * STATE: a real Wine thread always stores a VALID (committed) TEB pointer at its stack base
-     * *(rsp&~0xffff); a foreign worker has poison there. So on any out-of-guest-space fault, if
-     * this thread's stack base holds no valid TEB pointer, it is a foreign worker running the
-     * dispatcher -- terminate just it (process survives) instead of dying. Real threads (valid
-     * TEB at the stack base) are never touched. The fully-proper fix is #16/#17 marshaling. */
+
     if (g_cur_cpu && g_sig_recover && depth == 0 &&
         !ocerz_host_in_guest_space(si->si_addr)) {
         int no_teb = g_cur_cpu->sig_altstack_sp == 0;
@@ -806,12 +580,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     }
     char buf[256];
     char *p = buf;
-    /* Commit-on-demand during the frame build (a nested fault, depth>0): the recovery block
-     * above is writing the signal frame onto a reserved-but-uncommitted page (a no-altstack
-     * thread builds the frame on its rsp stack). map_lock is unsafe in this nested signal
-     * context, so commit the page lock-free and RETURN to re-run the faulting write, instead
-     * of dying with _exit(139). Only for a reserved arena page; a genuinely bad address falls
-     * through to the fatal path below. */
+
     if (depth > 0 && ocerz_host_in_guest_space(si->si_addr)) {
         uint64_t fg = ocerz_h2g(si->si_addr);
         if (ocerz_addr_committed(fg) == 0 && ocerz_commit_fault_page(fg))
@@ -1114,12 +883,7 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     sa.sa_flags = SA_SIGINFO | SA_NODEFER | (altss.ss_sp ? SA_ONSTACK : 0);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
-    /* Install the async-signal handler for the signals the wineserver sends
-     * cross-thread (SIGUSR1 = the system-APC/suspend kick; SIGQUIT = thread stop).
-     * NO SA_RESTART so the target's blocked forwarded syscall returns EINTR and the
-     * guest handler is delivered at the syscall boundary. OCERZ_RIPDUMP repurposes
-     * SIGUSR1 for the debug rip dump, so only take SIGUSR1 for async delivery when
-     * RIPDUMP is off. */
+
     struct sigaction as;
     memset(&as, 0, sizeof as);
     as.sa_sigaction = async_sig_handler;
@@ -1139,16 +903,6 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
         vm->jit = ocerz_jit_create(vm);
 }
 
-/* ocerz_vm_call runs the guest function on a CALL-LOCAL OcerzCPU seeded from
- * the calling thread's current guest context (g_cur_cpu when set -- a worker or
- * a nested call -- else the main cpu template). It must NOT step vm->cpu
- * directly: guest callbacks are invoked from WORKER threads too (the dyldapi
- * objc callouts fire tens of thousands of times under load), and a worker
- * resetting/stepping the main thread's live register file while main runs or
- * sleeps in a blocked syscall derails both threads -- and since every call
- * shares one sentinel rip, main's loop would also return early the moment a
- * worker's nested call finished. The local cpu inherits the caller's gs_base
- * (thread identity/TSD/errno) and runs on the caller-provided guest stack. */
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top)
 {
     static const int ar[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
@@ -1192,8 +946,6 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     unsigned long long prof = prof_s ? strtoull(prof_s, NULL, 0) : 0;
     unsigned long long prof_next = prof ? vm->insn_count + prof : 0;
 
-    /* OCERZ_TRACE_MAIN_LO/HI, hoisted out of the step loop (it used to re-check
-     * a lazy-init static on every guest instruction). */
     static uint64_t mtrace_lo, mtrace_hi;
     static int mtrace_init;
     if (!mtrace_init) {
@@ -1206,16 +958,6 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
         }
     }
 
-    /* Every diagnostic below is off unless its env var was set, but the loop
-     * still paid ~10 loads+compares per guest instruction to discover that.
-     * Collapse them to ONE predicate tested once per step: each arm re-tests
-     * its own condition inside, so behaviour is identical when any is armed and
-     * the cost is a single not-taken branch when none is (the overwhelmingly
-     * common case, including every benchmark and every real run).
-     * NOTE: this is computed once per ocerz_vm_call and every input is either an
-     * env-var-derived value fixed before the loop or a startup-set global, so it
-     * cannot go stale underneath the loop. Anything added here must keep that
-     * property or it must be tested outside the gate. */
     const int any_diag = (ocerz_exc_trap || ocerz_sel_trap || ocerz_arg_trap || ocerz_ctx_trap ||
                           ocerz_bt_lo || prof || riptrap_n > 0 || icap || mtrace_lo);
     sigjmp_buf jb;
@@ -1282,7 +1024,7 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
                     (unsigned long long)ocerz_ld(local.gpr[OCERZ_RSP], 8));
             mtrace_hit = 1;
         }
-        } /* any_diag */
+        }
 
         if (mtrace_hit) {
             r = ocerz_interp_step(vm, &local);
@@ -1304,8 +1046,7 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
                         (unsigned long long)func, (unsigned long long)local.rip);
                 break;
             }
-            /* Walk the guest frame-pointer chain so the FATAL shows the full call chain into the
-             * abort (e.g. which framework init -> which libxpc call hit _xpc_api_misuse). */
+
             {
                 fprintf(stderr, "ocerz: initabort-bt rip=%#llx", (unsigned long long)local.rip);
                 uint64_t fp = local.gpr[OCERZ_RBP];
@@ -1335,16 +1076,9 @@ void ocerz_vm_request_exit(OcerzVM *vm, int code)
 {
     vm->exit_code = code;
     __atomic_store_n(&vm->exited, 1, __ATOMIC_SEQ_CST);
-    /* Direct JIT self-loops use a single native backedge in steady state. Make
-     * those branches leave through their existing cold dispatcher exits before
-     * broadcasting the per-CPU fallback word. */
+
     ocerz_jit_request_stop(vm);
-    /* Broadcast the stop to every live guest thread's back-edge poll word. A
-     * thread spinning in a (future) JIT-chained self-loop observes only this
-     * per-CPU word, never the shared vm->exited, so set it on all of them under
-     * the registry lock. The lock is also the store barrier that publishes
-     * exit_code + exited to the woken threads. Callable from any thread (a guest
-     * thread's exit(2), or a cross-thread stop requester). */
+
     pthread_mutex_lock(&g_cpus_lock);
     for (int i = 0; i < g_cpus_n; i++)
         __atomic_store_n(&g_cpus[i]->interrupt, 1, __ATOMIC_SEQ_CST);
@@ -1360,28 +1094,16 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     sigjmp_buf jb;
     sigjmp_buf *prev_recover = g_sig_recover;
     g_sig_recover = &jb;
-    /* Register the CPU ONCE, ABOVE the recovery point. Every host SIGSEGV/SIGBUS a
-     * worker takes siglongjmp()s back to this sigsetjmp; with the register call BELOW
-     * it, each fault re-appended cpu to g_cpus[] with no dup check, and unregister
-     * removed only one, so worker teardown left dangling g_cpus[] entries into the
-     * freed struct ocerz_worker. ocerz_vm_purge_jit_ras then stored ras_top=0 through
-     * those dangling pointers into freed-and-reused malloc chunks -> corrupted heap
-     * metadata -> the crash INSIDE libsystem_malloc that hit multithreaded guest apps. */
+
     ocerz_cpu_register(cpu);
     if (sigsetjmp(jb, 1) != 0 && getenv("OCERZ_CPUREG_LOG")) {
-        /* Non-zero return == a siglongjmp recovery from a worker fault. Under the OLD
-         * ordering (register BELOW this point) each of these re-ran ocerz_cpu_register
-         * and left a dangling g_cpus[] entry -- so this count is exactly how many the
-         * old code would have leaked this run. */
+
         static _Atomic unsigned recov;
         fprintf(stderr, "ocerz: CPUREG recovery #%u (old code would leak a dangling entry here)\n",
                 ++recov);
     }
     g_cur_cpu = cpu;
-    /* cpu->interrupt is the dedicated cross-thread stop poll (see the registry
-     * comment). It is redundant with vm->exited today -- the header re-checks
-     * both every block -- but it is the ONE per-CPU word a future chained
-     * self-loop's back-edge poll will read, so it is authoritative here too. */
+
     while (!vm->exited && !cpu->terminated && !cpu->interrupt) {
         g_riphist[g_riphist_n++ & 31] = cpu->rip;
         int r;
@@ -1439,15 +1161,6 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     return vm->exit_code;
 }
 
-/* Test-only cross-thread stop hook (off unless OCERZ_TEST_ASYNC_STOP_ICOUNT is
- * set). Spawned as a genuinely SEPARATE host thread so it exercises the exact
- * async path the JIT chaining safety net must survive: it waits until the guest
- * has run past startup (a deterministic instruction-count threshold, so any
- * pre-spin stdout is already emitted), then calls ocerz_vm_request_exit from a
- * thread that is NOT the one running the guest loop. A guest sitting in a tight
- * self-loop must then be stopped ONLY through the interrupt poll / broadcast --
- * there is no syscall boundary for the older async-signal kick to use. This is
- * how tests/guest/interrupt_test proves the poll is load-bearing. */
 static void *ocerz_test_async_stop(void *p)
 {
     OcerzVM *vm = (OcerzVM *)p;
@@ -1460,16 +1173,6 @@ static void *ocerz_test_async_stop(void *p)
     return NULL;
 }
 
-/* Wall-clock cross-thread stop hook (off unless OCERZ_TEST_ASYNC_STOP_MS is set).
- * The ICOUNT variant above cannot arm a FULLY-LINKED loop: once every back-edge
- * of a hot loop chains block-to-block, the loop never re-enters the dispatcher's
- * per-block insn_count bump, so insn_count FREEZES and the count threshold is
- * never crossed. This variant instead waits a fixed wall interval (independent of
- * guest progress) and then requests exit, so it can break a loop that emits no
- * dispatch at all -- exactly what the general-link interruptibility gate needs.
- * It exercises the identical cross-thread request_exit -> cpu->interrupt broadcast
- * path; only the trigger differs. nanosleep is EINTR-retried so a stray signal
- * cannot shorten the interval. */
 static void *ocerz_test_async_stop_ms(void *p)
 {
     OcerzVM *vm = (OcerzVM *)p;
@@ -1490,9 +1193,7 @@ static void *ocerz_test_async_stop_ms(void *p)
 int ocerz_vm_run(OcerzVM *vm)
 {
     ocerz_vm_install_handlers(vm);
-    /* Exactly ONE async-stop thread: the deterministic ICOUNT one when armed,
-     * else the wall-clock MS one. ICOUNT wins when both are set so existing
-     * gates (interrupt_test) keep their exact semantics. */
+
     if (getenv("OCERZ_TEST_ASYNC_STOP_ICOUNT")) {
         pthread_t th;
         pthread_attr_t at;

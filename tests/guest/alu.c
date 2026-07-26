@@ -1,28 +1,4 @@
-/*
- * tests/guest/alu.c
- *
- * Integer-ALU torture test. Every operand is routed through a volatile local
- * so clang cannot constant-fold the work away at -O2: the values must be
- * produced by real x86 ADD/SUB/ADC/SBB/MUL/IMUL/DIV/IDIV/shift/rotate
- * instructions at run time, which is exactly the instruction coverage Ocerz's
- * interpreter and JIT must agree on. Each operation folds its result into a
- * running 64-bit checksum (mixed with a rotate so order matters and bit
- * positions are exercised), and the single line of output is that checksum in
- * fixed-width hex via g_puthex64. The expected value is whatever the native
- * Rosetta run produces; it is fully deterministic because there is no input,
- * no time, and no pointer value involved — only fixed arithmetic.
- *
- * Coverage: 64/32/16/8-bit add and subtract; multi-precision add/sub carry
- * chains built with __int128 so the compiler emits ADC/SBB; unsigned and
- * signed multiply including 32->64 widening and full 64x64; unsigned and
- * signed divide/modulo with positive and negative mixes (guarding the
- * INT64_MIN/-1 and divide-by-zero cases that the architecture traps);
- * variable-count shifts left/right/arithmetic from 0..65 (the >=64 cases mask
- * to test the x86 6-bit count semantics indirectly through C's own rules,
- * kept identical between native and Ocerz because both run the same x86
- * code); rotates expressed with the ((x<<n)|(x>>(64-n))) idiom; and a battery
- * of comparisons feeding branches so condition-code evaluation is exercised.
- */
+/* Integer ALU torture test. */
 #include "gsys.h"
 
 static g_u64 rotl64(g_u64 x, unsigned n)

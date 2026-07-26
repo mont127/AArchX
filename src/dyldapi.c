@@ -1,132 +1,4 @@
-/*
- * src/dyldapi.c
- *
- * The dyld runtime API shim (dyldapi.h): install a process-wide "dyld APIs"
- * object so the genuine libdyld.dylib trampolines work, and implement the
- * dyld services they invoke natively in Ocerz.
- *
- * Setup. The libdyld trampolines all begin `mov rdi,[apis]; mov rax,[rdi];
- * jmp [rax+slot]`, loading one global. ocerz_dyldapi_setup finds that global
- * robustly by resolving _dyld_get_active_platform and decoding its first
- * rip-relative load (`48 8b 3d <disp32>` after the `55 48 89 e5` prologue) to
- * recover the global's address, then builds two guest objects: a vtable of
- * 0x2000 bytes whose every 8-byte slot at offset OFF holds the native-thunk
- * address OCERZ_DYLDAPI_LO+OFF, and an APIs object whose first qword points at
- * that vtable. The object pointer is written into the libdyld global. From
- * then on any `jmp [vtable+OFF]` lands on a native-thunk address.
- *
- * Dispatch. The interpreter recognises an rip in [OCERZ_DYLDAPI_LO,
- * OCERZ_DYLDAPI_HI) and calls ocerz_dyldapi_dispatch, where the vtable byte
- * offset is rip-OCERZ_DYLDAPI_LO. Because the trampolines shift arguments down
- * by one (the object becomes `this`=rdi), a method sees this=rdi and its own
- * arguments in rsi/rdx/rcx/r8/r9. Each handler computes a result into rax and
- * returns to the guest by popping the caller's return address off the stack
- * (the trampoline tail-called us, so [rsp] is the original caller). Only the
- * slots a running program actually reaches are implemented; an unimplemented
- * slot logs its offset and returns 0, which is enough to surface the next slot
- * without derailing — slots that matter are then given real behaviour.
- *
- * The platform is reported as PLATFORM_MACOS (1). Image/dlopen/TLV services
- * are added here as programs reach them.
- *
- * dlopen/dlsym/dlclose/dlerror (slots 0x68/0x80/0x70/0x78). The libdyld dl*
- * wrappers tail-call these vtable slots after shuffling args down by one, so the
- * handlers see dlopen(path=rsi, mode=rdx), dlsym(handle=rsi, symbol=rdx),
- * dlclose(handle=rsi), dlerror() respectively. Slot 0x2e0 is the caller-aware
- * dlopen entry (the public dlopen() forwards path=rsi, mode=rdx, caller=rcx); it
- * shares the 0x68 handler since the loader seam ignores the caller address.
- * SoftLinking.framework (used by CoreFoundation/SkyLight soft-links) calls dlopen
- * through 0x2e0, so without it a soft-link dlopen returned 0 and SoftLinking ran
- * strlen() on a NULL dlerror() string. They marshal the guest pointers
- * through ocerz_g2h and call the loader seam in dyld.c (ocerz_dlopen / ocerz_
- * dlsym / ocerz_dlclose / ocerz_dlerror), which owns the disk-image registry and
- * fixup engines. dlopen runs AFTER main on the guest's live stack, and loading a
- * new image runs its initializers via a nested ocerz_vm_call (on a fresh scratch
- * stack chosen inside dyld.c) — that call clobbers the whole guest CPU, so the
- * dlopen handler snapshots *cpu before the seam call and restores it afterwards,
- * then api_returns the handle to the original caller. dlclose returns 0 without
- * unmapping (disk images and their export-trie buffers stay alive). dlerror
- * returns the guest pointer to the last error string or 0 (perl's XSLoader
- * tolerates 0, falling back to its own "Unknown dlopen error").
- *
- * The objc<->dyld handshake. libobjc's _objc_init registers callbacks through
- * slot 0x358 (_dyld_objc_register_callbacks) passing a version-4 struct
- * {version@0, mapped@8, init@0x10, unmapped@0x18, patches@0x20}. Real dyld
- * answers by synchronously invoking the `mapped` callback with the
- * already-loaded objc images, which is what drives objc's _read_images /
- * preopt_init / class realization; without it objc later dereferences a NULL
- * shared-cache selector table. Ocerz replicates this: it builds an array of
- * 32-byte _dyld_objc_notify_mapped_info entries {mach_header@0, path@8,
- * sectionLocations@0x10, objcImageInfo@0x18} for every loaded objc image and calls
- * `mapped` via a nested ocerz_vm_call. The "loaded" set is the real dependency
- * closure of the main executable: compute_closure() BFS-walks the executable's
- * LC_LOAD_DYLIB / weak / reexport / upward / lazy dependencies transitively,
- * resolving each install path to its cache image, so a binary that links
- * Foundation gets CoreFoundation/Foundation processed and a plain libc binary
- * gets only the libSystem closure — both correct. Non-cache disk dylibs (loaded
- * by the mini-dyld, see dyld.c) register through ocerz_dyldapi_register_image,
- * which records {mach_header, guest-copy of the install path} and appends the
- * header to the closure (compute_closure re-appends them after its cache BFS),
- * so disk images appear in image lists (slots 0x10/0x18/0x20/0x28), resolve
- * their path (cache_path_for_mh consults the disk table first), drive objc
- * map_images when they carry __objc_imageinfo, and resolve unwind sections
- * (slot 0x170). Of that closure only images carrying __objc_imageinfo are
- * handed to objc. map_images_nolock then asks
- * dyld for the
- * shared-cache objc-optimization roots, which Ocerz derives from libobjc's
- * __TEXT,__objc_opt_ro (an objc_opt_t v16 whose i32 fields at +0x0c/+0x18 give
- * the header-info RO/RW tables): slot 0x3a8 (header_opt_rw) and 0x3b0
- * (header_opt_ro) return those, slot 0x1f8 returns the shared-cache range, and
- * slot 0x378 (per-image section getter) returns 0 so objc walks the Mach-O.
- *
- * Class lookup by name (slot 0x2a8 = _dyld_for_each_objc_class). Modern objc
- * does NOT hash cache classes itself: getPreoptimizedClass delegates to dyld,
- * passing the class name and a block invoked as (block, classPtr, isLoaded,
- * stop*). Without this slot every objc_getClass of an unrealized cache class
- * misses and CoreFoundation's __CFInitialize bridge registration allocates a
- * hollow "future" class — whose isa then never matches the static class the
- * virtual-default-zone proxy carries, sending every typed malloc into the
- * infinite proxy redispatch. Ocerz answers from the cache's real table: the
- * objc_opt_t v16 i32 field at +0x20 (largeSharedCachesClassOffset) locates
- * dyld's objc::ClassHashTable {u32 version,capacity,occupied,shift,mask; u64
- * salt@+0x18; u32 scramble[256]@+0x20; u8 tab[mask+1]; u8 check[capacity];
- * i32 nameoffs[capacity] (table-relative); u64 objects[capacity]; u32 dupcnt;
- * u64 dups[]}. The perfect hash is Jenkins lookup8(name, salt) with index =
- * (val>>shift) ^ scramble[tab[val & mask]], validated by a checkbyte
- * (((name[0]&7)<<5)|len&0x1f) plus strcmp. Each object word packs {bit0
- * isDuplicate, bits1..47 offset-from-cache-base, bits48..63 headerInfoRW
- * dylib index}; duplicates point into the trailing dups run instead. The
- * block is invoked once per hit via nested ocerz_vm_call, isLoaded read from
- * the headerInfoRW entry's bit0 (objc itself marks images loaded there during
- * map_images), and a tiny guest scratch holds the stop flag.
- *
- * Preoptimized class count (slot 0x308 = _dyld_objc_class_count). libobjc sizes
- * the safety bound of its subclass-tree integrity walk
- * (foreach_realized_class_and_subclass) as
- * ((_dyld_objc_class_count() + realizedClassCount) << 4) | 0xf. Returning 0
- * here collapses the bound to 0xf=15, so a legitimate Swift-overlay class
- * subtree (e.g. __SwiftNativeNSArrayBase, dragged in by libswiftCore's
- * array-bridge lazy init under localizedCaseInsensitiveCompare:) with more than
- * 15 nodes exhausts the budget and objc false-fatals "Memory corruption in
- * class list." The class data is correct (objc realizes it normally); only the
- * bound is wrong. Ocerz answers with the cache's preoptimized class count = the
- * ClassHashTable `occupied` field at g_clsopt+8 (186065 on this cache), matching
- * real dyld, so the bound is ~2.97M and the walk completes.
- *
- * C++ exception unwinding (slot 0x170 = _dyld_find_unwind_sections(addr,
- * dyld_unwind_sections* out)). libunwind/libc++abi call this once per frame to
- * locate that frame's image and its compact-unwind (__TEXT,__unwind_info) and
- * DWARF CFI (__TEXT,__eh_frame) sections. The libdyld trampoline swaps the args
- * before dispatch, so the handler sees rsi=addr(pc), rdx=out-struct pointer.
- * Returning 0 with the struct empty makes libunwind believe no frame has unwind
- * info, so a throw never reaches its catch: it spins its no-info fallback (the
- * objc terminate handler rethrows back into __cxa_throw forever), exhausting the
- * stack until __chkstk_darwin reads off the bottom into the guard page (a SIGBUS
- * masquerading as a libunwind/pthread fault). image_for_pc() resolves the pc to
- * its image (closure first, then any shared-cache image so dylibs on the unwind
- * path resolve too) and find_section_sz() reads the real (slid) section ranges
- * into the 5-field out-struct {mh, eh_frame ptr/len, unwind_info ptr/len}.
- */
+/* The dyld API surface that libdyld's trampolines dispatch through. */
 #include "ocerz/dyldapi.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
@@ -165,40 +37,14 @@ uint64_t g_main_path;
 static uint64_t g_closure_mh[DYLDAPI_CLOSURE_MAX];
 static int g_closure_n;
 
-/* The objc-runtime _dyld_objc_notify_mapped callback, captured when the guest
- * objc registers it at boot (api_objc_register_callbacks). It is driven once
- * over the boot closure there; ocerz_dyldapi_objc_map_one re-drives it for ONE
- * image so a framework dlopen'd AFTER boot (e.g. AppKit soft-linking
- * ViewBridge.framework for NSServiceViewController) gets its objc classes
- * realized and its header-info "loaded" bit set -- exactly as dyld's
- * notifyObjCMapped does on every dlopen. Without this a lazily-loaded cache
- * framework's classes are found in the preopt table but reported isLoaded=0,
- * so NSClassFromString returns nil and AppKit asserts. */
 static uint64_t g_objc_mapped_cb;
-/* libobjc's `init` callback (load_images) from the version-4 _dyld_objc_register_callbacks
- * struct at +0x10. Real dyld invokes it per image as that image is initialized; objc uses
- * the FIRST call to run loadAllCategories() (every category present at startup is deferred
- * until then) and each call to run that image's +load methods. Never invoking it left every
- * +load unrun and every startup category unattached -- e.g. Platypus's NSColor(Inverted)
- * category, whose missing -inverted threw an unrecognized-selector NSException out of
- * nib loading. Takes ONE arg: a pointer to that image's _dyld_objc_notify_mapped_info. */
+
 static uint64_t g_objc_init_cb;
-/* Reused one-image _dyld_objc_notify_mapped_info handed to that callback. */
-/* sectionLocations is an OPAQUE dyld handle: ocerz is the dyld here, and its
- * _dyld_lookup_section_info (slot 0x378) derives every section from the mach_header,
- * so ocerz's handle for an image IS its mach_header. It must be non-NULL -- libobjc
- * treats a null handle as "no sections" and silently finds no catlist, so every
- * category stays unattached. */
+
 static uint64_t g_objc_init_info;
 static uint64_t g_objc_dlopen_mapped[DYLDAPI_CLOSURE_MAX];
 static int g_objc_dlopen_mapped_n;
 
-/* The main program's LC_BUILD_VERSION triple, parsed once at setup. The
- * dyld_build_version_t availability APIs (_dyld_program_sdk_at_least and
- * friends) compare against these; answering them with a blanket "false" (the
- * old unimplemented-slot default) told every @available check in CF/Foundation/
- * AppKit that the program was built against an ancient SDK and flipped the
- * frameworks into legacy-compat behavior process-wide. */
 static uint32_t g_main_bv_platform, g_main_bv_minos, g_main_bv_sdk;
 
 static void parse_build_version(uint64_t mh, uint32_t *plat, uint32_t *minos, uint32_t *sdk)
@@ -228,10 +74,6 @@ static void parse_build_version(uint64_t mh, uint32_t *plat, uint32_t *minos, ui
     }
 }
 
-/* dyld_build_version_t arrives packed in one register: low 32 = platform, high
- * 32 = packed version (X<<16|Y<<8|Z). platform 0xffffffff is a dated "version
- * set"; a binary built with the current SDK satisfies every shipped set, so
- * answer true rather than decode dyld's date table. */
 static uint64_t build_version_at_least(uint32_t plat, uint32_t have, uint64_t q)
 {
     uint32_t qplat = (uint32_t)q;
@@ -393,13 +235,6 @@ static uint64_t image_for_pc(uint64_t pc)
     return 0;
 }
 
-/* dladdr's dli_sname/dli_saddr: the defined symbol with the greatest value not
- * past addr. The symbol table lives in __LINKEDIT (symoff/stroff are file
- * offsets, converted to load addresses through that segment's fileoff/vmaddr +
- * slide). Cache dylibs keep only a stripped local table in their split
- * linkedit, so the bounds check below simply yields no symbol there — dladdr is
- * still valid with dli_sname == NULL, matching its contract when nothing
- * matches. Leading '_' is dropped to report the C name as dyld does. */
 static void image_nearest_symbol(uint64_t mh, uint64_t addr,
                                  uint64_t *sname_out, uint64_t *saddr_out)
 {
@@ -607,21 +442,6 @@ static void api_return(OcerzCPU *cpu, uint64_t result)
     cpu->gpr[OCERZ_RAX] = result;
 }
 
-/* _dyld_register_for_bulk_image_loads(func) -- vtable slot 0x290, callback in rsi
- * (the libdyld trampoline shifts args down by one). Real dyld records the callback
- * and SYNCHRONOUSLY invokes it once with every image already loaded, then again for
- * each later batch; the immediate call is the contract callers depend on.
- *
- * libxpc registers _xpc_dyld_image_callback here from _xpc_collect_images and builds
- * its "initial images" dictionary inside that callback. Returning 0 without invoking
- * it (the unimplemented-slot default) left libxpc's global NULL, and _xpc_init_pid_domain
- * later passed that NULL to xpc_dictionary_apply -> _xpc_api_misuse abort -- which is
- * the ViewBridge/NSRemoteView path AppKit takes from +[NSTextInputContext initialize],
- * so every Cocoa app died before it could put a window on screen.
- *
- * Signature: func(unsigned count, const struct mach_header *mhs[], const char *paths[]).
- * The image set is the same launch closure the image-list slots report. Subsequent
- * batch loads (dlopen) are not yet re-notified -- see notes/wine_bringup.md. */
 static int api_register_for_bulk_image_loads(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t func = cpu->gpr[OCERZ_RSI];
@@ -697,7 +517,7 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
         uint64_t e = infos + (uint64_t)k * 0x20;
         ocerz_st(e + 0x00, 8, mhs[k]);
         ocerz_st(e + 0x08, 8, paths[k]);
-        ocerz_st(e + 0x10, 8, mhs[k]);   /* sectionLocations: ocerz's opaque handle = the mh */
+        ocerz_st(e + 0x10, 8, mhs[k]);
         ocerz_st(e + 0x18, 8, iis[k]);
     }
 
@@ -711,12 +531,6 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
     uint64_t args[3] = { (uint64_t)n, infos, g_objc_make_mutable };
     ocerz_vm_call(vm, mapped, args, 3, ret_rsp);
 
-    /* Record the images whose objc classes were just registered, so a later
-     * dlopen of a NON-boot disk dylib (winemac.drv) is NOT mistaken for already
-     * registered. ocerz_dyldapi_register_image appends every disk image to the
-     * image-list closure (g_closure_mh) for the dyld image/unwind APIs, but that
-     * closure is not the objc-registration set: only the images driven through
-     * map_images here (and later through objc_map_one) have realized classes. */
     for (int k = 0; k < n; k++)
         if (g_objc_dlopen_mapped_n < (int)(sizeof g_objc_dlopen_mapped / sizeof g_objc_dlopen_mapped[0]))
             g_objc_dlopen_mapped[g_objc_dlopen_mapped_n++] = mhs[k];
@@ -735,8 +549,6 @@ static int objc_image_already_loaded(uint64_t mh)
     return 0;
 }
 
-/* Drive libobjc's map_images for a batch of images in one call (the boot path
- * does this for the whole launch closure; this is the same call, factored). */
 static void objc_drive_map_images(struct OcerzVM *vm, const uint64_t *mhs, int n)
 {
     if (!g_objc_mapped_cb || n <= 0)
@@ -750,7 +562,7 @@ static void objc_drive_map_images(struct OcerzVM *vm, const uint64_t *mhs, int n
         const char *path = cache_path_for_mh(g_cache, mhs[k]);
         ocerz_st(e + 0x00, 8, mhs[k]);
         ocerz_st(e + 0x08, 8, path ? ocerz_h2g(path) : 0);
-        ocerz_st(e + 0x10, 8, mhs[k]);   /* sectionLocations: ocerz's opaque handle = the mh */
+        ocerz_st(e + 0x10, 8, mhs[k]);
         ocerz_st(e + 0x18, 8, find_section_any(mhs[k], "__objc_imageinfo"));
     }
     if (getenv("OCERZ_DLOPENLOG"))
@@ -763,14 +575,6 @@ static void objc_drive_map_images(struct OcerzVM *vm, const uint64_t *mhs, int n
     ocerz_vm_call(vm, g_objc_mapped_cb, args, 3, istk + 0x100000 - 64);
 }
 
-/* When a cache framework is dlopen'd after boot, dyld brings up its WHOLE
- * not-yet-loaded dependency sub-closure and drives objc map_images over all of
- * them together -- so categories a private dependency vends (e.g. AppIntents'
- * +[NSXPCConnection ln_applicationServiceWithError:]) get attached, not just
- * the leaf framework's own classes. Reproduce that: BFS the LC_LOAD_DYLIB tree
- * from mh, collect every objc-bearing cache image not already loaded, and
- * map_images the batch once. An already-loaded image's subtree is itself
- * already loaded, so it is not re-walked. */
 void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
 {
     if (getenv("OCERZ_OBJCLOG"))
@@ -887,11 +691,6 @@ static uint64_t clshash_lookup8(const uint8_t *k, size_t length, uint64_t level)
 
 #define CLSOPT_MAX_HITS 16
 
-/* Perfect-hash lookup over a shared-cache objc_stringhash_t table (the layout
- * both the class table and the protocol table use: header, salt, scramble[256],
- * tab[mask+1], checkbytes[capacity], string offsets, 64-bit object words, then
- * a duplicates array). Returns the raw object words; the caller decodes them
- * ((value<<1|dup-flag) with the owning dylib's header index in the top bits). */
 static int stringhash_find_raw(uint64_t table, const char *key, uint64_t *od_out, uint64_t *dups_out)
 {
     if (!table || !key || !key[0])
@@ -955,24 +754,6 @@ static int clsopt_lookup(const char *key, uint64_t *out, int max)
     return stringhash_lookup(g_clsopt, key, out, max);
 }
 
-/* _dyld_get_objc_selector must return the cache's CANONICAL pointer for a
- * selector name so it pointer-equals the (relative) selector references baked
- * into cache method lists; otherwise sel_registerName mints a fresh selector
- * and protocol/method lookups by SEL silently miss (the NSXPCInterface protocol
- * method-signature path, e.g. -[...WMXPCServerInterface retrieveStagesWithReply:]).
- * The selector string pool at relativeMethodSelectorBase holds every canonical
- * selector once; a linear scan with a fixed cap missed selectors stored past
- * the cap, so build a one-shot open-addressing string->pointer index over the
- * whole pool and look up O(1).
- *
- * Building is serialized by g_selidx_lock and double-checked: a real process
- * resolves selectors from several guest threads at once (the first ObjC use in a
- * re-exec'd Wine child races worker threads), and without the lock each entrant
- * sees g_selidx still NULL, builds its own table, and stomps the half-built
- * shared one — readers then walk a torn table and the open-addressing probe
- * never terminates (a 100% CPU hang). g_selidx is published last, after the
- * table is fully populated, so a thread that observes it non-NULL sees a
- * complete index. The probe bound is belt-and-suspenders against a full table. */
 static const char **g_selidx;
 static uint32_t g_selidx_cap;
 static pthread_mutex_t g_selidx_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1040,17 +821,6 @@ static void selpool_build(void)
     pthread_mutex_unlock(&g_selidx_lock);
 }
 
-/* Fast _dyld_get_objc_selector: look the name up in the shared cache's
- * precomputed objc selector hash (objc_selopt_t at objc_opt_t+0x08). It is the
- * same perfect-hash format the class table uses (stringhash_find_raw), but the
- * selector table ends at the string-offset array -- no object-word/duplicate
- * arrays -- and the canonical selector pointer IS the hashed string itself,
- * table + offsets[h]. O(1), needs no build. This replaces the ~11s open-
- * addressing index over the 2.5M-entry relativeMethodSelectorBase pool, which
- * was blowing past winemac.drv's 5s Cocoa-startup deadline. The returned pointer
- * is the cache's canonical selector (deduped into one pool), so it pointer-equals
- * the selectors baked into the cache's relative method lists, which is what the
- * caller needs. A name absent from the cache returns 0 (objc then mints its own). */
 static uint64_t selopt_canonical(const char *want)
 {
     if (!g_selopt || !want || !want[0])
@@ -1126,14 +896,6 @@ static uint64_t selpool_canonical(const char *want)
     return 0;
 }
 
-/* Public: the shared cache's canonical selector pointer for a name string (host
- * pointer), or 0 if the cache has no such selector. The mini-dyld uses this to
- * canonicalize an arena dylib's __objc_selrefs at load -- modern objc, on a
- * shared-cache launch, assumes dyld already uniqued every selector reference and
- * skips its own per-image selref fixup, so a selref left pointing at the image's
- * local __objc_methname string is a DISTINCT pointer from the cache's canonical
- * selector and fails objc_msgSend's pointer-equality method match (the
- * "selector ... does not match selector known to Objective C runtime" abort). */
 uint64_t ocerz_dyldapi_canonical_selector(const char *name)
 {
     return selpool_canonical(name);
@@ -1190,13 +952,6 @@ static int api_for_each_objc_class(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
-/* _dyld_for_each_objc_protocol: the protocol analog of for_each_objc_class
- * (libobjc's getPreoptimizedProtocol drives NSProtocolFromString,
- * protocol_getMethodDescription, NSXPCInterface...). Same stringhash table
- * shape, but the duplicate runs are huge (NSObject appears in thousands of
- * images), so iterate the run inline invoking the block per entry instead of
- * collecting into a fixed array; libobjc's block stops at the first entry
- * whose image is loaded. */
 static int api_for_each_objc_protocol(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t name = cpu->gpr[OCERZ_RSI];
@@ -1361,13 +1116,6 @@ static void meth_list_print_substr(uint64_t ml, const char *substr)
     }
 }
 
-/* OCERZ_METHDUMP diagnostic: for class `cls`, walk its METACLASS's static
- * baseMethods (a shared-cache relative-list-list of per-image sub-lists) and
- * report, for each sub-list, its image index, that image's objc "loaded" bit
- * (objc excludes a sub-list whose image is not loaded when it realizes the
- * class), and whether the sub-list defines `sel`. Pins down whether a cluster
- * override (e.g. +allocWithZone:) is being dropped because its image is unloaded
- * at realize time. */
 void ocerz_dyldapi_dump_method(uint64_t cls, const char *sel)
 {
     if (!in_cache(cls) || !g_sel_pool) {
@@ -1412,10 +1160,7 @@ void ocerz_dyldapi_dump_method(uint64_t cls, const char *sel)
     } else {
         fprintf(stderr, "ocerz:   single list has(%s)=%d\n", sel, meth_list_has(ptr, sel));
     }
-    /* +[NSString allocWithZone:] (Foundation IMP 0x7ff8040b450a) returns the
-     * placeholder only when (self == *0x7ff8436dad48); that global is a runtime-
-     * fixed-up NSString class reference (0 in the static cache, == NSString in an
-     * isolated ocerz run). Read it here to see if the Wine process fixed it up. */
+
     uint64_t g = 0x7ff8436dad48ull;
     fprintf(stderr, "ocerz:   ALLOCGLOBAL[%#llx]=%#llx  cls=%#llx  match=%d\n",
             (unsigned long long)g, (unsigned long long)ocerz_ld(g, 8),
@@ -1428,15 +1173,7 @@ void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t sta
         return;
     const char *imgpath = g_cache ? cache_path_for_mh(g_cache, mh) : NULL;
     OCERZ_LOG("loadphase: image %s (mh=%#llx)\n", imgpath ? imgpath : "?", (unsigned long long)mh);
-    /* Hand the image to libobjc's own `init` (load_images) callback, which is exactly what
-     * dyld does as each image is initialized, rather than hand-rolling the +load scan below.
-     * objc uses its FIRST load_images call to run loadAllCategories(): EVERY category present
-     * at startup is deferred until then, and objc gates that on didCallDyldNotifyRegister, so
-     * the call must come after _dyld_objc_register_callbacks has returned -- which the load
-     * phase satisfies and the register handler itself does not. Driving +load by hand skipped
-     * that trigger entirely, so no startup category ever attached (Platypus's NSColor(Inverted)
-     * -inverted threw unrecognized-selector out of nib loading) and objc never saw its own
-     * +load bookkeeping. objc also orders and locks +load itself. */
+
     if (g_objc_init_cb) {
         if (!g_objc_init_info) {
             g_objc_init_info = ocerz_map_anywhere(0x20, PROT_READ | PROT_WRITE);
@@ -1445,7 +1182,7 @@ void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t sta
         }
         ocerz_st(g_objc_init_info + 0x00, 8, mh);
         ocerz_st(g_objc_init_info + 0x08, 8, imgpath ? ocerz_h2g(imgpath) : 0);
-        ocerz_st(g_objc_init_info + 0x10, 8, mh);   /* sectionLocations handle (see above) */
+        ocerz_st(g_objc_init_info + 0x10, 8, mh);
         ocerz_st(g_objc_init_info + 0x18, 8, find_section_any(mh, "__objc_imageinfo"));
         uint64_t ia[1] = { g_objc_init_info };
         ocerz_vm_call(vm, g_objc_init_cb, ia, 1, stack_top);
@@ -1720,17 +1457,7 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x358:
         return api_objc_register_callbacks(vm, cpu);
     case 0x378: {
-        /* _dyld_lookup_section_info(mach_header*, info_out, kind): returns the
-         * named __TEXT/__DATA section's {addr in rax, size in rdx}. Kinds 0..5
-         * are the Swift metadata sections, 6..17 the objc sections, in the
-         * order of dyld's _dyld_section_location_kind enum. The Swift runtime's
-         * conformance scanner walks every loaded image (including shared-cache
-         * dylibs) asking for kind 1 (__swift5_proto, the protocol-conformance
-         * records); without it `String: Hashable` is never found and generic
-         * metadata such as _DictionaryStorage<String,Data> instantiates to NULL.
-         * The objc kinds keep their pre-existing behaviour of reporting nothing
-         * for shared-cache images so objc takes its preoptimized path instead of
-         * re-walking the Mach-O. */
+
         static const char *const kindsect[] = {
             [0] = "__swift5_protos", [1] = "__swift5_proto",
             [2] = "__swift5_types",  [3] = "__swift5_replace",
@@ -1738,15 +1465,7 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
             [6] = "__objc_imageinfo", [7] = "__objc_selrefs",
             [8] = "__objc_msgrefs",   [9] = "__objc_classrefs",
             [10] = "__objc_superrefs", [11] = "__objc_protorefs",
-            /* dyld's enum has an entry (__objc_stublist) between nlclslist and catlist
-             * that this table lacked, so every kind from 14 up was shifted by one:
-             * objc asking for category_list(15) was answered with __objc_catlist2
-             * (absent) and NO category was ever discovered, while protolist(18),
-             * fork_ok(19) and rawisa(20) fell off the end of the table entirely.
-             * Mapping verified against the REAL dyld: calling its own
-             * _dyld_lookup_section_info for each kind and matching the returned
-             * address to the image's sections gives 6=imageinfo, 12=classlist,
-             * 13=nlclslist, 15=catlist, 17=nlcatlist. */
+
             [12] = "__objc_classlist", [13] = "__objc_nlclslist",
             [14] = "__objc_stublist",  [15] = "__objc_catlist",
             [16] = "__objc_catlist2",  [17] = "__objc_nlcatlist",
@@ -1756,17 +1475,9 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         uint64_t mh = cpu->gpr[OCERZ_RSI];
         uint64_t kind = cpu->gpr[OCERZ_RCX];
         uint64_t addr = 0, size = 0;
-        /* Shared-cache images must NOT report the class/category DISCOVERY sections
-         * (classlist/catlist/...): objc has preoptimized data for them, and answering
-         * from the Mach-O too makes it register every cache class twice ("Class X is
-         * implemented in both ..."). But the +load MARKER sections must be reported for
-         * every image: libobjc's load_images returns early unless hasLoadMethods() sees
-         * a non-lazy class/category list, and load_images is the ONLY caller of
-         * loadAllCategoriesIfNeeded -- so hiding them from the cache meant Foundation's
-         * +load never ran and NO category anywhere ever attached. Swift kinds are
-         * reported for every image (the conformance scanner walks the cache). */
+
         int is_swift_kind = kind <= 5;
-        int is_load_marker = (kind == 13 || kind == 17);   /* nlclslist / nlcatlist */
+        int is_load_marker = (kind == 13 || kind == 17);
         if (mh && (is_swift_kind || is_load_marker || mh < g_cache_start) &&
             kind < (sizeof kindsect / sizeof kindsect[0]) && kindsect[kind])
             addr = find_section_sz(mh, kindsect[kind], &size);

@@ -1,33 +1,4 @@
-/*
- * include/ocerz/interp_common.h
- *
- * Shared inline operand machinery for all interpreter translation units.
- * These helpers are the ONLY sanctioned way handlers read and write decoded
- * operands; they encode the architectural rules that are easy to get wrong:
- *
- *  - 32-bit register writes ZERO the upper 32 bits of the GPR (including
- *    CMOVcc with a false condition, which still writes its destination).
- *  - 8/16-bit register writes merge into the low bits, leaving the rest of
- *    the register untouched; high8 operands address bits 8..15.
- *  - Effective addresses wrap at 64 bits, truncate to 32 bits first when the
- *    address-size prefix was present, and add fs_base/gs_base afterwards.
- *    RIP-relative operands arrive pre-resolved with the absolute address in
- *    disp, so no special case is needed here.
- *  - Immediates were sign-extended by the decoder; ocerz_read_op only masks
- *    them to the operand size.
- *  - Stack pushes/pops move RSP by the operand size and use 64-bit slots in
- *    long mode (16-bit with a 66 prefix, which real code never uses but the
- *    helpers honor).
- *
- * ocerz_read_op returns the operand zero-extended to 64 bits; callers who
- * need a signed view apply ocerz_sext. ocerz_read_op128/write_op128 handle
- * XMM registers and 16-byte memory; scalar SSE forms read/write only the
- * low lanes via the sized variants.
- *
- * ocerz_unimpl prints a uniform unimplemented-instruction diagnostic (op
- * name, rip, raw bytes, CPU dump) and returns OCERZ_STEP_FATAL so call
- * sites can `return ocerz_unimpl(...)`.
- */
+/* Shared inline operand machinery for the interpreter translation units. */
 #ifndef OCERZ_INTERP_COMMON_H
 #define OCERZ_INTERP_COMMON_H
 
@@ -133,29 +104,6 @@ static inline void ocerz_write_op128(OcerzCPU *cpu, const X86Insn *insn, const X
         ocerz_st(ocerz_ea(cpu, insn, op), op->size, v.lo);
 }
 
-/* NOTE THE ORDER: the store happens BEFORE rsp is committed.
- *
- * On the non-faulting path this is indistinguishable from decrementing rsp
- * first -- the address stored to is identical. It matters only when the store
- * FAULTS, and then it is the difference between correct and silently wrong.
- *
- * A faulting x86 instruction is ABORTED: it has no architectural effect, so rsp
- * must be unchanged when the handler sees the fault, and re-executing the push
- * on return must push to the SAME address. Committing rsp first left it already
- * decremented, so the canonical fix-and-retry idiom -- which is exactly how a
- * guest grows a thread stack when a push hits the guard page -- would decrement
- * rsp a SECOND time on the retry, permanently shifting the stack and silently
- * leaving an 8-byte hole. (Reachable only now that a delivered fault rewinds rip
- * to the faulting instruction so the push is genuinely retried; see
- * OcerzCPU::cur_rip and crash_handler in src/vm.c.)
- *
- * ocerz_pop below loads before it increments, which makes the LOAD fault-safe --
- * but that is NOT sufficient on its own: a caller whose destination can also fault
- * (`pop qword [mem]`) must not let rsp commit before that store lands. op_stack's
- * POP/LEAVE therefore do the load themselves and commit rsp last; do not "simplify"
- * them back into ocerz_pop. The JIT's inlined push/pop reproduce this order exactly
- * (reg destinations only, so they cannot fault after the load) -- see emit_push_pop
- * in src/jit.c. */
 static inline void ocerz_push(OcerzCPU *cpu, int size, uint64_t v)
 {
     uint64_t sp = cpu->gpr[OCERZ_RSP] - (uint64_t)size;
