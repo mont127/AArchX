@@ -448,6 +448,31 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             if (rip_exact && !rewind_off)
                 g_cur_cpu->rip = fault_rip;
         }
+        {
+            static int faultlog = -1;
+            if (faultlog < 0)
+                faultlog = getenv("OCERZ_FAULTLOG") ? 1 : 0;
+            if (faultlog && ocerz_addr_committed(gaddr) != 1) {
+                uint64_t rb = 0, rs = 0;
+                unsigned hp = ocerz_host_region_prot(gaddr, &rb, &rs);
+                char fb[256];
+                char *f = fb;
+                f = str_into(f, "ocerz: FAULT-NONGUEST addr=");
+                f = hex_into(f, gaddr);
+                f = str_into(f, " committed=");
+                f = hex_into(f, (uint64_t)(int64_t)ocerz_addr_committed(gaddr));
+                f = str_into(f, " host_prot=");
+                f = hex_into(f, hp);
+                f = str_into(f, " region=");
+                f = hex_into(f, rb);
+                f = str_into(f, "+");
+                f = hex_into(f, rs);
+                f = str_into(f, " rip=");
+                f = hex_into(f, g_cur_cpu->rip);
+                f = str_into(f, "\n");
+                write(2, fb, (size_t)(f - fb));
+            }
+        }
         int delivered = looping ? 0
                        : ocerz_signal_deliver(g_cur_cpu, SIGSEGV, gaddr, code, err);
         if (g_sigtrace) {
