@@ -163,7 +163,10 @@ static void memtrace(const char *op, uint64_t a, uint64_t l, int prot, int flags
     static int on = -1;
     if (on < 0)
         on = getenv("OCERZ_MEMTRACE") != NULL ? 1 : 0;
-    if (on && a >= 0x7ff00000ull && a < 0x80000000ull)
+    static int all = -1;
+    if (all < 0)
+        all = getenv("OCERZ_MEMTRACE_ALL") != NULL ? 1 : 0;
+    if (on && (all || (a >= 0x7ff00000ull && a < 0x80000000ull)))
         fprintf(stderr, "ocerz: MEM %s addr=%#llx len=%#llx prot=%#x flags=%#x comm=%d\n",
                 op, (unsigned long long)a, (unsigned long long)l, prot, flags,
                 ocerz_addr_committed(a));
@@ -3146,10 +3149,10 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (machleak < 0) machleak = getenv("OCERZ_MACHLEAK") != NULL ? 1 : 0;
         if (reply_buf != 0 && machleak) {
 
-            for (uint64_t off = 0x18; off <= 0x158; off += 8) {
+            for (uint64_t off = 0x20; off <= 0x158; off += 8) {
                 uint64_t v = ocerz_ld(reply_buf + off, 8);
-                if (v >= 0x100000000ull && v < OCERZ_LOW_LIMIT &&
-                    ocerz_addr_committed(v) == 0)
+                if (v >= 0x100001000ull && v < OCERZ_LOW_LIMIT &&
+                    (v & 0xfffull) == 0 && ocerz_addr_committed(v) <= 0)
                     fprintf(stderr,
                             "ocerz: MACHLEAK reply_id=%u off=%#llx host_val=%#llx icount=%#llx\n",
                             (uint32_t)ocerz_ld(reply_buf + 0x14, 4),
