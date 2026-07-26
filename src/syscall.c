@@ -511,6 +511,9 @@ static void ocerz_kev_timer_to_host(void *hev, int nev);
 #define OCERZ_NOTE_LEEWAY   0x00000010u
 #define OCERZ_NOTE_MACHTIME 0x00000100u
 
+#define OCERZ_WQ_FLAG_OVERCOMMIT 0x10000ull
+#define OCERZ_PTHREAD_PRIORITY_OVERCOMMIT 0x80000000ull
+
 static void wl_dqdump(const char *tag, uint64_t id, unsigned cpun, unsigned kp)
 {
     if (!id)
@@ -973,7 +976,9 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             t.gpr[OCERZ_RSI] = 0;
             t.gpr[OCERZ_RDX] = pth;
             t.gpr[OCERZ_RCX] = 0;
-            t.gpr[OCERZ_R8] = 0x40000ull | 0x200000ull | 0x4000ull | (uint64_t)qos_idx;
+            t.gpr[OCERZ_R8] = 0x40000ull | 0x200000ull | 0x4000ull | (uint64_t)qos_idx
+                            | ((prio & OCERZ_PTHREAD_PRIORITY_OVERCOMMIT)
+                               ? OCERZ_WQ_FLAG_OVERCOMMIT : 0);
             t.gpr[OCERZ_R9] = 0;
             t.gs_base = pth + 0xe0;
             t.sig_altstack_sp = 0;
@@ -1217,6 +1222,44 @@ static uint64_t ocerz_guest_ns_to_host_ticks(uint64_t ns)
     if (numer == denom || ns == 0)
         return ns;
     return (uint64_t)(((__uint128_t)ns * denom) / numer);
+}
+
+static uint64_t ocerz_host_ticks_to_guest_ns(uint64_t ticks)
+{
+    static uint32_t numer, denom;
+    if (!denom) {
+        mach_timebase_info_data_t tb;
+        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0 || tb.denom == 0) {
+            numer = denom = 1;
+        } else {
+            numer = tb.numer;
+            denom = tb.denom;
+        }
+    }
+    if (numer == denom || ticks == 0)
+        return ticks;
+    return (uint64_t)(((__uint128_t)ticks * numer) / denom);
+}
+
+static int sys_gettimeofday(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    uint64_t fa[8];
+    memcpy(fa, a, sizeof fa);
+    for (int i = 0; i < 3; i++)
+        if (fa[i])
+            fa[i] = (uint64_t)(uintptr_t)ocerz_g2h(fa[i]);
+    uint64_t ret2 = 0;
+    int err = 0;
+    uint64_t r = ocerz_host_syscall(116, fa, &ret2, &err);
+    if (err) {
+        ret_err(cpu, r);
+        return OCERZ_STEP_OK;
+    }
+    if (a[2])
+        ocerz_st(a[2], 8, ocerz_host_ticks_to_guest_ns(ocerz_ld(a[2], 8)));
+    ret_ok(cpu, r);
+    return OCERZ_STEP_OK;
 }
 
 static void ocerz_kev_timer_to_host(void *hev, int nev)
@@ -1476,7 +1519,8 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
     t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | extra_r8 | mgr | (mgr ? 0 : 4u)
                     | (registered ? OCERZ_WQ_FLAG_REUSE : 0);
     if (mgr && getenv("OCERZ_ULOCKLOG"))
-        fprintf(stderr, "ocerz: WQ-MANAGER delivery nev=%d\n", nev);
+        fprintf(stderr, "ocerz: WQ-MANAGER delivery nev=%d guest_tsd_qos=%#llx\n", nev,
+                (unsigned long long)ocerz_ld(pth + 0xe0 + 4 * 8, 8));
     t.gpr[OCERZ_R9] = (uint64_t)nev;
     t.gs_base = pth + 0xe0;
     if (getenv("OCERZ_GSTRACE"))
@@ -2364,7 +2408,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [104] = { "bind",        3, 0x02, 0, NULL },
     [105] = { "setsockopt",  5, 0x08, 0, NULL },
     [106] = { "listen",      2, 0x00, 0, NULL },
-    [116] = { "gettimeofday",2, 0x03, 0, NULL },
+    [116] = { "gettimeofday",3, 0x07, 0, sys_gettimeofday },
     [117] = { "getrusage",   2, 0x02, 0, NULL },
     [118] = { "getsockopt",  5, 0x18, 0, NULL },
     [120] = { "readv",       3, 0x00, 0, sys_readv },
