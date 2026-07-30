@@ -7,6 +7,7 @@
 struct OcerzVM;
 
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_is_wqthread_exit(uint64_t rip);
 
 #define OCERZ_SIGTRAP 5
 #define OCERZ_SIGSYS  12

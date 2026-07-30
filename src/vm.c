@@ -592,14 +592,29 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
         if (no_teb) {
             if (g_sigtrace) {
-                char tb[96];
-                char *t = tb;
-                t = str_into(t, "ocerz: gs0x320 WILD-WORKER-TERMINATE pid=");
-                t = hex_into(t, (uint64_t)getpid());
-                t = str_into(t, " addr=");
-                t = hex_into(t, (uint64_t)(uintptr_t)si->si_addr);
-                t = str_into(t, "\n");
-                write(2, tb, (size_t)(t - tb));
+                static volatile unsigned wild_logs;
+                unsigned n = __atomic_fetch_add(&wild_logs, 1, __ATOMIC_RELAXED);
+                if (n < 32) {
+                    const ucontext_t *uc = (const ucontext_t *)ctx;
+                    char tb[256];
+                    char *t = tb;
+                    t = str_into(t, "ocerz: WILD-WORKER-TERMINATE pid=");
+                    t = hex_into(t, (uint64_t)getpid());
+                    t = str_into(t, " addr=");
+                    t = hex_into(t, (uint64_t)(uintptr_t)si->si_addr);
+                    t = str_into(t, " host_pc=");
+                    t = hex_into(t, uc ? uc->uc_mcontext->__ss.__pc : 0);
+                    t = str_into(t, " rip=");
+                    t = hex_into(t, g_cur_cpu->rip);
+                    t = str_into(t, " cur_rip=");
+                    t = hex_into(t, g_cur_cpu->cur_rip);
+                    t = str_into(t, " rsp=");
+                    t = hex_into(t, g_cur_cpu->gpr[OCERZ_RSP]);
+                    t = str_into(t, " gs=");
+                    t = hex_into(t, g_cur_cpu->gs_base);
+                    t = str_into(t, "\n");
+                    write(2, tb, (size_t)(t - tb));
+                }
             }
             g_cur_cpu->terminated = 1;
             siglongjmp(*g_sig_recover, 1);
@@ -999,7 +1014,7 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     g_sig_recover = &jb;
     sigsetjmp(jb, 1);
     g_cur_cpu = &local;
-    while (local.rip != sentinel && !vm->exited) {
+    while (local.rip != sentinel && !vm->exited && !local.terminated) {
         g_riphist[g_riphist_n++ & 31] = local.rip;
         int r;
         int mtrace_hit = 0;
@@ -1126,6 +1141,7 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     uint64_t trace_lo = tlo ? strtoull(tlo, NULL, 0) : 0;
     uint64_t trace_hi = thi ? strtoull(thi, NULL, 0) : 0;
     sigjmp_buf jb;
+    OcerzCPU *prev_cpu = g_cur_cpu;
     sigjmp_buf *prev_recover = g_sig_recover;
     g_sig_recover = &jb;
 
@@ -1186,11 +1202,13 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
             fprintf(stderr, "\nocerz: %llu instructions executed\n",
                     (unsigned long long)vm->insn_count);
             g_sig_recover = prev_recover;
+            g_cur_cpu = prev_cpu;
             ocerz_cpu_unregister(cpu);
             return 125;
         }
     }
     g_sig_recover = prev_recover;
+    g_cur_cpu = prev_cpu;
     ocerz_cpu_unregister(cpu);
     return vm->exit_code;
 }

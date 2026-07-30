@@ -10,7 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <mach/mach.h>
+#include <mach/mig.h>
 #include <mach/mach_vm.h>
 
 static int tests_run;
@@ -408,6 +410,388 @@ static void test_mach_vm_allocate(void)
     CHECK(cpu->gpr[OCERZ_RAX] == 0);
 }
 
+static int run_raw_mach_msg2(uint64_t gmsg, uint32_t send_size,
+                             uint32_t request_id, uint32_t descriptor_count,
+                             mach_port_t reply_port)
+{
+    const uint64_t mach64_send_kobject_call = 0x0000000200000000ull;
+    uint64_t bits = ocerz_ld(gmsg + 0x00, 4);
+    uint64_t remote_local =
+        ocerz_ld(gmsg + 0x08, 4) | ((uint64_t)reply_port << 32);
+    uint64_t voucher_id =
+        ocerz_ld(gmsg + 0x10, 4) | ((uint64_t)request_id << 32);
+    uint64_t desc_count_rcv_name =
+        descriptor_count | ((uint64_t)reply_port << 32);
+
+    OcerzCPU *cpu = &vm.cpu;
+    set_args(cpu, mach(47), gmsg,
+             MACH_SEND_MSG | MACH_RCV_MSG | mach64_send_kobject_call,
+             bits | ((uint64_t)send_size << 32), remote_local, voucher_id,
+             desc_count_rcv_name);
+    ocerz_st(cpu->gpr[OCERZ_RSP] + 8, 8, 0x400);
+    ocerz_st(cpu->gpr[OCERZ_RSP] + 16, 8, MACH_MSG_TIMEOUT_NONE);
+    int step = ocerz_handle_syscall(&vm, cpu);
+    CHECK(step == OCERZ_STEP_OK);
+    CHECK(cpu->gpr[OCERZ_RAX] == MACH_MSG_SUCCESS);
+    return step == OCERZ_STEP_OK &&
+           cpu->gpr[OCERZ_RAX] == MACH_MSG_SUCCESS ? 0 : -1;
+}
+
+static int run_raw_mach_msg2_vector(uint64_t gmsg, uint32_t send_size,
+                                    uint32_t request_id,
+                                    uint32_t descriptor_count,
+                                    mach_port_t reply_port)
+{
+    const uint64_t mach64_msg_vector = 0x0000000100000000ull;
+    const uint64_t mach64_send_mq_call = 0x0000000400000000ull;
+    uint64_t gvec = scratch + 0x9000;
+    uint64_t gaux = scratch + 0x9400;
+    memset(ocerz_g2h(gvec), 0, 48);
+    memset(ocerz_g2h(gaux), 0, 0x80);
+    ocerz_st(gvec + 0x00, 8, gmsg);
+    ocerz_st(gvec + 0x10, 4, send_size);
+    ocerz_st(gvec + 0x14, 4, 0x400);
+    ocerz_st(gvec + 0x18, 8, gaux);
+    ocerz_st(gvec + 0x2c, 4, 0x80);
+
+    uint64_t bits = ocerz_ld(gmsg + 0x00, 4);
+    uint64_t remote_local =
+        ocerz_ld(gmsg + 0x08, 4) | ((uint64_t)reply_port << 32);
+    uint64_t voucher_id =
+        ocerz_ld(gmsg + 0x10, 4) | ((uint64_t)request_id << 32);
+    uint64_t desc_count_rcv_name =
+        descriptor_count | ((uint64_t)reply_port << 32);
+
+    OcerzCPU *cpu = &vm.cpu;
+    set_args(cpu, mach(47), gvec,
+             MACH_SEND_MSG | MACH_RCV_MSG | mach64_msg_vector |
+                 mach64_send_mq_call,
+             bits | (2ull << 32), remote_local, voucher_id,
+             desc_count_rcv_name);
+    ocerz_st(cpu->gpr[OCERZ_RSP] + 8, 8, 2);
+    ocerz_st(cpu->gpr[OCERZ_RSP] + 16, 8, MACH_MSG_TIMEOUT_NONE);
+    int step = ocerz_handle_syscall(&vm, cpu);
+    CHECK(step == OCERZ_STEP_OK);
+    CHECK(cpu->gpr[OCERZ_RAX] == MACH_MSG_SUCCESS);
+    return step == OCERZ_STEP_OK &&
+           cpu->gpr[OCERZ_RAX] == MACH_MSG_SUCCESS ? 0 : -1;
+}
+
+static int run_raw_vm_region_query(uint32_t request_id, uint64_t query,
+                                   uint64_t gmsg)
+{
+    mach_port_t reply_port = mig_get_reply_port();
+    CHECK(reply_port != MACH_PORT_NULL);
+    if (reply_port == MACH_PORT_NULL)
+        return -1;
+
+    memset(ocerz_g2h(gmsg), 0, 0x400);
+    ocerz_st(gmsg + 0x00, 4,
+             MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,
+                            MACH_MSG_TYPE_MAKE_SEND_ONCE));
+    ocerz_st(gmsg + 0x04, 4, 0x30);
+    ocerz_st(gmsg + 0x08, 4, mach_task_self());
+    ocerz_st(gmsg + 0x0c, 4, reply_port);
+    ocerz_st(gmsg + 0x10, 4, MACH_PORT_NULL);
+    ocerz_st(gmsg + 0x14, 4, request_id);
+    memcpy(ocerz_g2h(gmsg + 0x18), &NDR_record, sizeof NDR_record);
+    ocerz_st(gmsg + 0x20, 8, query);
+    if (request_id == 4815) {
+        ocerz_st(gmsg + 0x28, 4, 0);
+        ocerz_st(gmsg + 0x2c, 4, VM_REGION_SUBMAP_INFO_COUNT_64);
+    } else {
+        ocerz_st(gmsg + 0x28, 4, VM_REGION_BASIC_INFO_64);
+        ocerz_st(gmsg + 0x2c, 4, VM_REGION_BASIC_INFO_COUNT_64);
+    }
+
+    int step = run_raw_mach_msg2(gmsg, 0x30, request_id, 0, reply_port);
+    mig_put_reply_port(reply_port);
+    return step;
+}
+
+static void test_mach_vm_region_mig_translation(void)
+{
+    uint64_t query = scratch + 0x1000;
+
+    uint64_t recurse_msg = scratch + 0x4000;
+    if (run_raw_vm_region_query(4815, query, recurse_msg) == 0) {
+        CHECK(ocerz_ld(recurse_msg + 0x14, 4) == 4915);
+        CHECK((ocerz_ld(recurse_msg, 4) & 0x80000000u) == 0);
+        CHECK(ocerz_ld(recurse_msg + 0x20, 4) == KERN_SUCCESS);
+        uint64_t address = ocerz_ld(recurse_msg + 0x24, 8);
+        uint64_t size = ocerz_ld(recurse_msg + 0x2c, 8);
+        CHECK(address >= ocerz_arena_lo && address < ocerz_arena_hi);
+        CHECK(query >= address && query - address < size);
+        CHECK((uint64_t)(uintptr_t)ocerz_g2h(address) != address);
+    }
+
+    uint64_t region_msg = scratch + 0x4400;
+    if (run_raw_vm_region_query(4816, query, region_msg) == 0) {
+        CHECK(ocerz_ld(region_msg + 0x14, 4) == 4916);
+        CHECK((ocerz_ld(region_msg, 4) & 0x80000000u) != 0);
+        CHECK(ocerz_ld(region_msg + 0x18, 4) == 1);
+        CHECK(ocerz_ld(region_msg + 0x27, 1) == 0);
+        uint64_t address = ocerz_ld(region_msg + 0x30, 8);
+        uint64_t size = ocerz_ld(region_msg + 0x38, 8);
+        CHECK(address >= ocerz_arena_lo && address < ocerz_arena_hi);
+        CHECK(query >= address && query - address < size);
+        CHECK((uint64_t)(uintptr_t)ocerz_g2h(address) != address);
+
+        mach_port_t object_name =
+            (mach_port_t)(uint32_t)ocerz_ld(region_msg + 0x1c, 4);
+        if (object_name != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), object_name);
+    }
+}
+
+struct vector_reply_server {
+    mach_port_t port;
+    uint64_t host_address;
+    int result;
+};
+
+static void *serve_vector_reply(void *opaque)
+{
+    struct vector_reply_server *server = opaque;
+    _Alignas(8) unsigned char request[0x100];
+    memset(request, 0, sizeof request);
+    mach_msg_header_t *request_header = (mach_msg_header_t *)request;
+    mach_msg_return_t mr =
+        mach_msg(request_header, MACH_RCV_MSG, 0, sizeof request,
+                 server->port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    if (mr != MACH_MSG_SUCCESS) {
+        server->result = (int)mr;
+        return NULL;
+    }
+
+    _Alignas(8) unsigned char reply[0x34];
+    memset(reply, 0, sizeof reply);
+    mach_msg_header_t *reply_header = (mach_msg_header_t *)reply;
+    reply_header->msgh_bits =
+        MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+    reply_header->msgh_size = sizeof reply;
+    reply_header->msgh_remote_port = request_header->msgh_remote_port;
+    reply_header->msgh_id = 4915;
+    memcpy(reply + 0x18, &NDR_record, sizeof NDR_record);
+    memcpy(reply + 0x24, &server->host_address,
+           sizeof server->host_address);
+    uint64_t region_size = 0x4000;
+    memcpy(reply + 0x2c, &region_size, sizeof region_size);
+    mr = mach_msg(reply_header, MACH_SEND_MSG, sizeof reply, 0,
+                  MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    server->result = (int)mr;
+    return NULL;
+}
+
+static void test_mach_msg2_vector_in_place_reply(void)
+{
+    struct vector_reply_server server = {0};
+    kern_return_t kr =
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE,
+                           &server.port);
+    CHECK(kr == KERN_SUCCESS);
+    if (kr != KERN_SUCCESS)
+        return;
+    kr = mach_port_insert_right(mach_task_self(), server.port, server.port,
+                                MACH_MSG_TYPE_MAKE_SEND);
+    CHECK(kr == KERN_SUCCESS);
+    if (kr != KERN_SUCCESS) {
+        mach_port_destruct(mach_task_self(), server.port, -1, 0);
+        return;
+    }
+
+    uint64_t query = scratch + 0x1000;
+    server.host_address = (uint64_t)(uintptr_t)ocerz_g2h(query);
+    pthread_t thread;
+    int pr = pthread_create(&thread, NULL, serve_vector_reply, &server);
+    CHECK(pr == 0);
+    if (pr != 0) {
+        mach_port_destruct(mach_task_self(), server.port, -1, 0);
+        return;
+    }
+
+    mach_port_t reply_port = mig_get_reply_port();
+    CHECK(reply_port != MACH_PORT_NULL);
+    uint64_t gmsg = scratch + 0x4800;
+    memset(ocerz_g2h(gmsg), 0, 0x400);
+    ocerz_st(gmsg + 0x00, 4,
+             MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,
+                            MACH_MSG_TYPE_MAKE_SEND_ONCE));
+    ocerz_st(gmsg + 0x04, 4, 0x18);
+    ocerz_st(gmsg + 0x08, 4, server.port);
+    ocerz_st(gmsg + 0x0c, 4, reply_port);
+    ocerz_st(gmsg + 0x14, 4, 4815);
+
+    if (reply_port != MACH_PORT_NULL &&
+        run_raw_mach_msg2_vector(gmsg, 0x18, 4815, 0, reply_port) == 0) {
+        CHECK(ocerz_ld(gmsg + 0x14, 4) == 4915);
+        CHECK(ocerz_ld(gmsg + 0x24, 8) == query);
+        CHECK(ocerz_ld(gmsg + 0x2c, 8) == 0x4000);
+    }
+
+    pthread_join(thread, NULL);
+    CHECK(server.result == MACH_MSG_SUCCESS);
+    if (reply_port != MACH_PORT_NULL)
+        mig_put_reply_port(reply_port);
+    mach_port_destruct(mach_task_self(), server.port, -1, 0);
+}
+
+static int host_range_readable(uint64_t address, uint64_t size)
+{
+    mach_vm_address_t region = address;
+    mach_vm_size_t region_size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object_name = MACH_PORT_NULL;
+    kern_return_t kr =
+        mach_vm_region(mach_task_self(), &region, &region_size,
+                       VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                       &count, &object_name);
+    if (object_name != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), object_name);
+    return kr == KERN_SUCCESS && region <= address &&
+           address - region <= region_size &&
+           size <= region_size - (address - region) &&
+           (info.protection & VM_PROT_READ) != 0;
+}
+
+static void test_mach_vm_remap_mig_relocation(void)
+{
+    const uint64_t page_size = 0x4000;
+    const uint64_t first = 0x0123456789abcdefull;
+    const uint64_t last = 0xfedcba9876543210ull;
+    CHECK(ocerz_low_base != 0);
+
+    mach_vm_address_t source = 0;
+    kern_return_t kr =
+        mach_vm_allocate(mach_task_self(), &source, page_size,
+                         VM_FLAGS_ANYWHERE);
+    CHECK(kr == KERN_SUCCESS);
+    if (kr != KERN_SUCCESS)
+        return;
+    memcpy((void *)(uintptr_t)source, &first, sizeof first);
+    memcpy((void *)(uintptr_t)(source + page_size - sizeof last),
+           &last, sizeof last);
+
+    static const mach_vm_address_t cage_candidates[] = {
+        0x10000000000ull,
+        0x100000000000ull,
+        0x600000000000ull,
+    };
+    mach_vm_address_t cage = 0;
+    kr = KERN_NO_SPACE;
+    for (size_t i = 0;
+         i < sizeof cage_candidates / sizeof cage_candidates[0]; i++) {
+        cage = cage_candidates[i];
+        kr = mach_vm_allocate(mach_task_self(), &cage, page_size * 5,
+                              VM_FLAGS_FIXED);
+        if (kr == KERN_SUCCESS)
+            break;
+    }
+    CHECK(kr == KERN_SUCCESS);
+    if (kr != KERN_SUCCESS) {
+        mach_vm_deallocate(mach_task_self(), source, page_size);
+        return;
+    }
+    kr = mach_vm_deallocate(mach_task_self(), cage + page_size,
+                            page_size * 3);
+    CHECK(kr == KERN_SUCCESS);
+    if (kr != KERN_SUCCESS) {
+        mach_vm_deallocate(mach_task_self(), cage, page_size * 5);
+        mach_vm_deallocate(mach_task_self(), source, page_size);
+        return;
+    }
+    mach_vm_address_t target = cage + page_size * 2;
+
+    mach_port_t reply_port = mig_get_reply_port();
+    CHECK(reply_port != MACH_PORT_NULL);
+    if (reply_port == MACH_PORT_NULL) {
+        mach_vm_deallocate(mach_task_self(), cage, page_size);
+        mach_vm_deallocate(mach_task_self(), cage + page_size * 4, page_size);
+        mach_vm_deallocate(mach_task_self(), source, page_size);
+        return;
+    }
+
+    uint64_t gmsg = scratch + 0x5000;
+    memset(ocerz_g2h(gmsg), 0, 0x400);
+    ocerz_st(gmsg + 0x00, 4,
+             MACH_MSGH_BITS_COMPLEX |
+             MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,
+                            MACH_MSG_TYPE_MAKE_SEND_ONCE));
+    ocerz_st(gmsg + 0x04, 4, 0x5c);
+    ocerz_st(gmsg + 0x08, 4, mach_task_self());
+    ocerz_st(gmsg + 0x0c, 4, reply_port);
+    ocerz_st(gmsg + 0x10, 4, MACH_PORT_NULL);
+    ocerz_st(gmsg + 0x14, 4, 4813);
+    ocerz_st(gmsg + 0x18, 4, 1);
+    ocerz_st(gmsg + 0x1c, 4, mach_task_self());
+    ocerz_st(gmsg + 0x26, 1, MACH_MSG_TYPE_COPY_SEND);
+    ocerz_st(gmsg + 0x27, 1, MACH_MSG_PORT_DESCRIPTOR);
+    memcpy(ocerz_g2h(gmsg + 0x28), &NDR_record, sizeof NDR_record);
+    ocerz_st(gmsg + 0x30, 8, target);
+    ocerz_st(gmsg + 0x38, 8, page_size);
+    ocerz_st(gmsg + 0x40, 8, 0);
+    ocerz_st(gmsg + 0x48, 4, VM_FLAGS_FIXED);
+    ocerz_st(gmsg + 0x4c, 8, source);
+    ocerz_st(gmsg + 0x54, 4, FALSE);
+    ocerz_st(gmsg + 0x58, 4, VM_INHERIT_DEFAULT);
+
+    if (run_raw_mach_msg2(gmsg, 0x5c, 4813, 1, reply_port) == 0) {
+        CHECK(ocerz_ld(gmsg + 0x14, 4) == 4913);
+        CHECK((ocerz_ld(gmsg, 4) & MACH_MSGH_BITS_COMPLEX) == 0);
+        CHECK(ocerz_ld(gmsg + 0x20, 4) == KERN_SUCCESS);
+
+        uint64_t guest_address = ocerz_ld(gmsg + 0x24, 8);
+        uint64_t host_address =
+            (uint64_t)(uintptr_t)ocerz_g2h(guest_address);
+        CHECK(guest_address >= ocerz_arena_lo &&
+              guest_address < ocerz_arena_hi);
+        CHECK(guest_address < OCERZ_LOW_LIMIT);
+        CHECK(host_address != guest_address);
+
+        int translated_readable =
+            host_range_readable(host_address, page_size);
+        int raw_readable =
+            host_range_readable(guest_address, page_size);
+        CHECK(translated_readable);
+        if (translated_readable) {
+            uint64_t got_first;
+            uint64_t got_last;
+            memcpy(&got_first, (const void *)(uintptr_t)host_address,
+                   sizeof got_first);
+            memcpy(&got_last,
+                   (const void *)(uintptr_t)
+                       (host_address + page_size - sizeof got_last),
+                   sizeof got_last);
+            CHECK(got_first == first);
+            CHECK(got_last == last);
+        }
+
+        int raw_has_contents = 0;
+        if (raw_readable) {
+            uint64_t got_first;
+            uint64_t got_last;
+            memcpy(&got_first, (const void *)(uintptr_t)guest_address,
+                   sizeof got_first);
+            memcpy(&got_last,
+                   (const void *)(uintptr_t)
+                       (guest_address + page_size - sizeof got_last),
+                   sizeof got_last);
+            raw_has_contents = got_first == first && got_last == last;
+        }
+        CHECK(!raw_has_contents);
+        if (raw_has_contents)
+            mach_vm_deallocate(mach_task_self(), guest_address, page_size);
+        ocerz_unmap(guest_address, page_size);
+    }
+
+    mig_put_reply_port(reply_port);
+    mach_vm_deallocate(mach_task_self(), target, page_size);
+    mach_vm_deallocate(mach_task_self(), cage, page_size);
+    mach_vm_deallocate(mach_task_self(), cage + page_size * 4, page_size);
+    mach_vm_deallocate(mach_task_self(), source, page_size);
+}
+
 static void test_mach_timebase(void)
 {
     OcerzCPU *cpu = &vm.cpu;
@@ -456,6 +840,28 @@ static void test_execve_bad_args(void)
     CHECK(cpu->gpr[OCERZ_RAX] == 22);
 }
 
+static void test_bsdthread_terminate_unmaps_stack(void)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    uint64_t freeaddr = ocerz_map_anywhere(0x8000, PROT_READ | PROT_WRITE);
+    CHECK(freeaddr != 0);
+    CHECK(ocerz_addr_committed(freeaddr) == 1);
+
+    uint64_t saved_gs = cpu->gs_base;
+    cpu->gs_base = scratch + 0x2000 + 0xe0;
+    ocerz_st(cpu->gs_base - 0xe0 + 0x34, 4, 0x55667788);
+    cpu->terminated = 0;
+    set_args(cpu, bsd(361), freeaddr, 0x8000, 0x11223344, 0, 0, 0);
+    int r = ocerz_handle_syscall(&vm, cpu);
+
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    CHECK(cpu->terminated == 1);
+    CHECK(ocerz_addr_committed(freeaddr) == 0);
+    cpu->terminated = 0;
+    cpu->gs_base = saved_gs;
+}
+
 static void test_unknown_bsd(void)
 {
     OcerzCPU *cpu = &vm.cpu;
@@ -484,8 +890,12 @@ static void test_exit(void)
 
 int main(void)
 {
-    if (ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK) {
+    if (ocerz_mem_init(0x100000000ull, 0x700000000ull) != OCERZ_OK) {
         fprintf(stderr, "mem init failed\n");
+        return 2;
+    }
+    if (ocerz_mem_init_low_shadow() != OCERZ_OK) {
+        fprintf(stderr, "low shadow init failed\n");
         return 2;
     }
     if (ocerz_vm_init(&vm) != OCERZ_OK) {
@@ -500,6 +910,7 @@ int main(void)
     }
     vm.cpu.gpr[OCERZ_RSP] = scratch + 0x8000;
 
+    test_mach_vm_remap_mig_relocation();
     test_getpid();
     test_pipe_and_io();
     test_open_fstat_close();
@@ -519,9 +930,12 @@ int main(void)
     test_mach_task_self();
     test_mach_thread_self();
     test_mach_vm_allocate();
+    test_mach_msg2_vector_in_place_reply();
+    test_mach_vm_region_mig_translation();
     test_mach_timebase();
     test_mach_unknown();
     test_execve_bad_args();
+    test_bsdthread_terminate_unmaps_stack();
     test_unknown_bsd();
     test_unknown_class();
     test_exit();
