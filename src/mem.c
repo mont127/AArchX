@@ -53,6 +53,7 @@ uint64_t ocerz_top_base;
 uint8_t *ocerz_commpage;
 
 static uint64_t bump_next;
+static uint64_t alloc_floor;
 
 #define MEM_ISLAND_MAX 64
 static struct { uint64_t lo, hi; } islands[MEM_ISLAND_MAX];
@@ -74,6 +75,11 @@ static uint64_t bump_skip_islands(uint64_t start, uint64_t glen, uint64_t align)
             break;
     }
     return start;
+}
+
+static uint64_t align_up(uint64_t value, uint64_t align)
+{
+    return (value + (align - 1)) & ~(align - 1);
 }
 
 typedef struct {
@@ -306,7 +312,8 @@ int ocerz_mem_init(uint64_t lo, uint64_t hi)
     ocerz_guest_base = host_base - lo;
     ocerz_arena_lo = lo;
     ocerz_arena_hi = hi;
-    bump_next = lo + (len / 4);
+    alloc_floor = lo + (len / 4);
+    bump_next = alloc_floor;
     if (!region_add(lo, hi))
         return OCERZ_ENOMEM;
     OCERZ_LOG("guest arena [%#llx, %#llx) -> host %#llx, guest_base %#llx\n",
@@ -335,13 +342,69 @@ int ocerz_mem_init_identity(uint64_t size)
     ocerz_arena_lo = lo;
     ocerz_arena_hi = lo + size;
 
-    bump_next = lo + size / 4;
+    uint64_t loader_reserve = size / 4;
+    if (loader_reserve > (1ull << 30))
+        loader_reserve = 1ull << 30;
+    alloc_floor = lo + loader_reserve;
+    bump_next = alloc_floor;
     if (!region_add(lo, lo + size))
         return OCERZ_ENOMEM;
     OCERZ_LOG("identity guest arena [%#llx, %#llx), bump %#llx, guest_base 0\n",
               (unsigned long long)lo, (unsigned long long)ocerz_arena_hi, (unsigned long long)bump_next);
     ocerz_init_gate_arm();
     return OCERZ_OK;
+}
+
+static uint64_t find_free_span_locked(uint64_t start, uint64_t end,
+                                      uint64_t glen, uint64_t align)
+{
+    if (start < alloc_floor)
+        start = alloc_floor;
+    if (end > ocerz_arena_hi)
+        end = ocerz_arena_hi;
+    if (glen == 0 || glen > UINT64_MAX - OCERZ_HOST_PAGE)
+        return 0;
+    uint64_t need = glen + OCERZ_HOST_PAGE;
+    if (start >= end || need > end - start)
+        return 0;
+
+    const MemRegion *r = region_for_range(alloc_floor, ocerz_arena_hi);
+    if (!r)
+        return 0;
+
+    uint64_t candidate = align_up(start, align);
+    while (candidate < end && need <= end - candidate) {
+        candidate = bump_skip_islands(candidate, need, align);
+        if (candidate >= end || need > end - candidate)
+            break;
+
+        uint64_t occupied = 0;
+        for (uint64_t p = candidate; p < candidate + need; p += OCERZ_HOST_PAGE) {
+            if (bit_test(r, pg_index(r, p))) {
+                occupied = p;
+                break;
+            }
+        }
+        if (!occupied)
+            return candidate;
+
+        if (occupied > UINT64_MAX - 2 * OCERZ_HOST_PAGE)
+            break;
+        candidate = align_up(occupied + 2 * OCERZ_HOST_PAGE, align);
+    }
+    return 0;
+}
+
+static uint64_t find_anywhere_locked(uint64_t glen, uint64_t align)
+{
+    uint64_t start = bump_next;
+    if (start < alloc_floor || start >= ocerz_arena_hi)
+        start = alloc_floor;
+
+    uint64_t gaddr = find_free_span_locked(start, ocerz_arena_hi, glen, align);
+    if (!gaddr && start > alloc_floor)
+        gaddr = find_free_span_locked(alloc_floor, start, glen, align);
+    return gaddr;
 }
 
 static uint64_t reserve_host_fixed(uint64_t base, uint64_t size)
@@ -490,8 +553,8 @@ uint64_t ocerz_map_anywhere(uint64_t len, int prot)
 {
     uint64_t glen = round_up(len);
     pthread_mutex_lock(&map_lock);
-    uint64_t gaddr = bump_skip_islands(bump_next, glen, OCERZ_HOST_PAGE);
-    if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
+    uint64_t gaddr = find_anywhere_locked(glen, OCERZ_HOST_PAGE);
+    if (!gaddr) {
         if (getenv("OCERZ_OOMLOG")) {
             uint64_t isl = 0;
             for (int i = 0; i < island_n; i++) isl += islands[i].hi - islands[i].lo;
@@ -505,8 +568,9 @@ uint64_t ocerz_map_anywhere(uint64_t len, int prot)
         pthread_mutex_unlock(&map_lock);
         return 0;
     }
-    bump_next = gaddr + glen + OCERZ_HOST_PAGE;
     int rc = map_fixed_locked(gaddr, glen, prot, 0);
+    if (rc == OCERZ_OK)
+        bump_next = gaddr + glen + OCERZ_HOST_PAGE;
     pthread_mutex_unlock(&map_lock);
     return rc == OCERZ_OK ? gaddr : 0;
 }
@@ -517,14 +581,14 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
         align = OCERZ_HOST_PAGE;
     uint64_t glen = round_up(len);
     pthread_mutex_lock(&map_lock);
-    uint64_t gaddr = (bump_next + (align - 1)) & ~(align - 1);
-    gaddr = bump_skip_islands(gaddr, glen, align);
-    if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
+    uint64_t gaddr = find_anywhere_locked(glen, align);
+    if (!gaddr) {
         pthread_mutex_unlock(&map_lock);
         return 0;
     }
-    bump_next = gaddr + glen + OCERZ_HOST_PAGE;
     int rc = map_fixed_locked(gaddr, glen, prot, 0);
+    if (rc == OCERZ_OK)
+        bump_next = gaddr + glen + OCERZ_HOST_PAGE;
     pthread_mutex_unlock(&map_lock);
     return rc == OCERZ_OK ? gaddr : 0;
 }
@@ -596,8 +660,8 @@ uint64_t ocerz_map_donate(uint64_t len)
 {
     uint64_t glen = round_up(len);
     pthread_mutex_lock(&map_lock);
-    uint64_t gaddr = bump_next;
-    if (gaddr + glen + OCERZ_HOST_PAGE > ocerz_arena_hi) {
+    uint64_t gaddr = find_anywhere_locked(glen, OCERZ_HOST_PAGE);
+    if (!gaddr) {
         pthread_mutex_unlock(&map_lock);
         return 0;
     }

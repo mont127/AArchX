@@ -1135,7 +1135,7 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
 
     case OCERZ_OP_UD2:
 
-        if (insnp->rip == 0x7ff802e6f81bull) {
+        if (ocerz_is_wqthread_exit(insnp->rip)) {
             cpu->terminated = 1;
             return OCERZ_STEP_OK;
         }
