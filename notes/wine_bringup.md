@@ -3741,3 +3741,51 @@ address matching.
 No mmap/vm_allocate/vm_map/mprotect operation exists anywhere within 4MB of a faulting address
 (3526 MEM ops traced with `OCERZ_MEMTRACE_ALL`), so the guest never obtained that page through
 any traced mapping path. That is what pointed at the MIG reply path in the first place.
+
+## UPDATE #38 -- Metal works; the whole display-config chain is fixed
+
+`wine notepad` under ocerz: **display-config errors 447 -> 0, "Failed to find any Vulkan GPU"
+235 -> 0, macdrv Cocoa startup no longer times out, 0 ocerz fatals.** Committed as `b070fd1`,
+gates green.
+
+### The chain (confirmed against wine-11.6 source)
+`lock_display_devices` (dlls/win32u/sysparams.c:2838) reads the display registry; on failure it
+forces `update_display_devices` -> `macdrv_UpdateDisplayDevices`, then re-reads. If the re-read
+still fails it prints "Failed to read display config." `macdrv_get_gpus` (winemac.drv
+cocoa_display.m:476) tries **Metal first** (`MTLCopyAllDevices` -> `registryID` ->
+`IOServiceGetMatchingService(IORegistryEntryIDMatching(...))` -> IORegistry parent walk), then an
+IOKit fallback that matches `IOPCIDevice` with `IOName=="display"` -- which matches NOTHING on
+Apple Silicon and returns "success with zero GPUs". Zero GPUs -> nothing written -> re-read fails
+-> ERR, repeated per display API call per process. Hence 447.
+
+Note for future debugging: those enumeration TRACEs are on channel **`display`**, not `macdrv`
+(display.c:34 is `WINE_DEFAULT_DEBUG_CHANNEL(display)`), which is why `WINEDEBUG=+macdrv` showed
+macdrv running but no display lines. Use `WINEDEBUG=+display,+system`.
+
+### Root cause: dyld API slot +0x88 is dlopen_preflight
+`MTLCreateSystemDefaultDevice()` returned NULL under ocerz. Verbose load showed Metal calling
+dyld API vtable slot **+0x88** twice, with
+`/System/Library/PrivateFrameworks/MTLCompiler.framework/Versions/32023/MTLCompiler` and then
+`.../32024/MTLCompiler`. The slot was unimplemented, so it fell through to the default that
+returns 0. **Both versions exist on disk**, so Metal concluded it had no compiler and gave up.
+Slot 0x68/0x2e0 are dlopen (path in RSI), 0x70 dlclose, 0x78 dlerror, 0x80 dlsym -- 0x88 is
+dlopen_preflight, same argument shape. Implemented against the shared cache and `access()`.
+
+With that fixed, mapping AGXMetal's objc metadata no longer aborts (the abort was a *consequence*
+of preflight failing), so the AGXMetal skip in src/dyld.c is now off by default;
+`OCERZ_NO_AGXMAP` restores it. `MTLCreateSystemDefaultDevice` returns the real Apple M2 Max,
+10/10 runs, with or without the AGX mapping.
+
+### Still open: SEH frame vs TEB stack limits
+The run now ends with, repeatedly:
+
+    err:seh:call_seh_handlers invalid frame 00000081000FB270 (0000000000012000-0000000000110000)
+    err:seh:NtRaiseException Exception frame is not in stack limits => unable to dispatch exception.
+
+`call_seh_handlers` rejects an unwind frame that is outside `NtCurrentTeb()->Tib.StackLimit ..
+StackBase`. The frame is a high 64-bit stack address while the TEB records a low ~1MB range that
+looks like a 32-bit WoW64 stack. Note `0x81000FB270 = 0x8100000000 + 0xFB270` and `0xFB270` IS
+inside `[0x12000,0x110000)` -- i.e. the offset is right and a 4GB+low-shadow base has been added
+to it. So either the running thread is reading the 32-bit TEB via `%gs:0x30` while executing
+64-bit code, or a host low-shadow address has leaked into a guest-visible frame/context field.
+That is the next thing to chase; no window until it is fixed.
