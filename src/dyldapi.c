@@ -1302,6 +1302,20 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         api_return(cpu, h);
         return OCERZ_STEP_OK;
     }
+    case 0x88: {
+        uint64_t pathg = cpu->gpr[OCERZ_RSI];
+        uint64_t ok = 0;
+        if (pathg) {
+            const char *host = (const char *)ocerz_g2h(pathg);
+            ok = (g_cache && cache_find_path(g_cache, host) != 0) ||
+                 access(host, R_OK) == 0;
+            if (getenv("OCERZ_DLPATH"))
+                fprintf(stderr, "ocerz: dlopen_preflight(\"%s\") -> %llu\n",
+                        host, (unsigned long long)ok);
+        }
+        api_return(cpu, ok);
+        return OCERZ_STEP_OK;
+    }
     case 0x80: {
         uint64_t handle = cpu->gpr[OCERZ_RSI];
         uint64_t symg = cpu->gpr[OCERZ_RDX];
