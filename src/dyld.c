@@ -15,7 +15,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
 
-#define DYN_ARENA_SIZE (4ull << 30)
+#define DYN_ARENA_SIZE (32ull << 30)
 #define DYN_STACK_SIZE (8ull << 20)
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -243,7 +243,6 @@ static int map_segments(DynImage *img, int is_main)
             if (cmd == LC_SEGMENT_64) {
                 uint64_t vmaddr = rd64(lc + 24);
                 uint64_t vmsize = rd64(lc + 32);
-                uint64_t filesize = rd64(lc + 48);
                 uint32_t initprot = rd32(lc + 56);
                 if (!(vmaddr == 0 && initprot == 0) && vmsize) {
                     if (vmaddr < OCERZ_LOW_LIMIT) {
@@ -255,8 +254,8 @@ static int map_segments(DynImage *img, int is_main)
                         if (ocerz_mem_register_range(vmaddr, vmaddr + vmsize) != OCERZ_OK)
                             return OCERZ_ENOMEM;
                     }
-                    if (filesize &&
-                        ocerz_map_fixed(vmaddr, vmsize, PROT_READ | PROT_WRITE) != OCERZ_OK)
+                    if (ocerz_map_fixed(vmaddr, vmsize,
+                                        PROT_READ | PROT_WRITE) != OCERZ_OK)
                         return OCERZ_ENOMEM;
                 }
             }
@@ -1971,6 +1970,18 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
     DynImage *d = dlopen_load_image(g_run_cache, loadpath);
     if (!d)
         return 0;
+    if (!g_run_init_ready && g_run_vm && !vm->exited &&
+        g_dimgs_n > before) {
+        for (int i = g_dimgs_n - 1; i >= before; i--) {
+            if (getenv("OCERZ_NO_AGXMAP") &&
+                strstr(g_dimgs[i].path,
+                       "/System/Library/Extensions/AGXMetal"))
+                continue;
+            ocerz_dyldapi_objc_map_one(g_run_vm, g_dimgs[i].load_base);
+            if (vm->exited)
+                break;
+        }
+    }
     if (g_run_init_ready && g_run_vm && !vm->exited && g_dimgs_n > before) {
         uint64_t istk = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
         if (istk) {
@@ -1980,14 +1991,14 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
                 if (vm->exited)
                     break;
             }
-
-            for (int i = g_dimgs_n - 1; i >= before; i--) {
-
-                if (strstr(g_dimgs[i].path, "/System/Library/Extensions/"))
+            for (int i = g_dimgs_n - 1;
+                 i >= before && !vm->exited; i--) {
+                if (getenv("OCERZ_NO_AGXMAP") &&
+                    strstr(g_dimgs[i].path,
+                           "/System/Library/Extensions/AGXMetal"))
                     continue;
-                ocerz_dyldapi_objc_map_one(g_run_vm, g_dimgs[i].load_base);
-                if (vm->exited)
-                    break;
+                ocerz_dyldapi_objc_map_one(g_run_vm,
+                                           g_dimgs[i].load_base);
             }
             init_closure(g_run_vm, g_run_cache, d->load_base, g_run_init_args, itop);
         }
