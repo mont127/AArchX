@@ -1908,6 +1908,12 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             chg0fl = (unsigned)(uint16_t)ocerz_ld(a[1] + 0x0a, 2);
             chg0id = ocerz_ld(a[1] + 0x00, 8);
         }
+        if (getenv("OCERZ_KEVLOG") && (int)a[2] == 0 && (int64_t)a[4] > 0)
+            fprintf(stderr,
+                    "ocerz: KEVIDWAIT-ENTER[%d] cpu#%u id=%#llx nev=%lld flags=%#llx caller=%#llx\n",
+                    (int)getpid(), cpu->cpu_number, (unsigned long long)a[0],
+                    (long long)a[4], (unsigned long long)fa[7],
+                    (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
         uint64_t r = ocerz_host_syscall(375, fa, &ret2, &err);
         if (kid_log)
             fprintf(stderr, "ocerz: KEVID[%d] cpu#%u id=%#llx nchg=%lld nev=%lld flags=%#llx chg0{id=%#llx filt=%d fl=%#x} -> r=%lld err=%d\n",
@@ -2831,7 +2837,26 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         fprintf(stderr, "ocerz: KEVWAIT-ENTER[%d] num=%d kq=%lld(=fd %d) nev=%lld timeout=%#llx caller=%#llx\n",
                 (int)getpid(), num, (long long)orig[0], (int)orig[0], (long long)orig[4],
                 (unsigned long long)orig[5], (unsigned long long)cpu->rip);
+    static int blocklog = -1;
+    if (blocklog < 0) blocklog = getenv("OCERZ_BLOCKLOG") != NULL ? 1 : 0;
+    static uint64_t blockseq;
+    uint64_t bseq = 0;
+    int btrack = blocklog &&
+        (num == 3 || num == 27 || num == 29 || num == 93 || num == 133 ||
+         num == 230 || num == 231 || num == 301 || num == 305 ||
+         num == 334 || num == 368 || num == 478 || num == 516);
+    if (btrack) {
+        bseq = __atomic_add_fetch(&blockseq, 1, __ATOMIC_RELAXED);
+        fprintf(stderr,
+                "ocerz: BLK-IN[%d] seq=%llu cpu#%u num=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx\n",
+                (int)getpid(), (unsigned long long)bseq, cpu->cpu_number, num,
+                (unsigned long long)orig[0], (unsigned long long)orig[1],
+                (unsigned long long)orig[2], (unsigned long long)cpu->rip);
+    }
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
+    if (btrack)
+        fprintf(stderr, "ocerz: BLK-OUT[%d] seq=%llu num=%d r=%lld err=%d\n",
+                (int)getpid(), (unsigned long long)bseq, num, (long long)r, err);
     if ((num == 362 || num == 363 || num == 369) && getenv("OCERZ_KEVLOG")) {
         static int kev_dumped = 0;
         if (!kev_dumped) { kev_dumped = 1; ocerz_dyld_dump_images(); }
