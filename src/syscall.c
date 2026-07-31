@@ -1862,7 +1862,7 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             for (int i = 0; i < nc; i++) {
                 uint64_t k = a[1] + (uint64_t)i * OCERZ_KEVENT_QOS_S;
                 int16_t filt = (int16_t)ocerz_ld(k + 0x08, 2);
-                if (filt != -8) continue;
+                if (filt != -8 && filt != -7) continue;
                 fprintf(stderr,
                         "ocerz: KEVREG[%d] filt=%d flags=%#llx fflags=%#llx ident=%#llx udata=%#llx ext0=%#llx ext1=%#llx (ext0 g=%d)\n",
                         i, filt, (unsigned long long)ocerz_ld(k + 0x0a, 2),
