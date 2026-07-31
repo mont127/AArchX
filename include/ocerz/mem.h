@@ -81,6 +81,8 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len);
 int ocerz_addr_committed(uint64_t gaddr);
 int ocerz_commit_fault_page(uint64_t gaddr);
 unsigned ocerz_host_region_prot(uint64_t gaddr, uint64_t *base, uint64_t *size);
+int ocerz_guest_vm_region(uint64_t *addr, uint64_t *size, unsigned *prot,
+                          unsigned *max_prot);
 
 void ocerz_init_gate_arm(void);
 void ocerz_init_gate_release(void);
@@ -115,6 +117,7 @@ static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
 
 extern uint64_t ocerz_watch_addr;
 extern uint64_t ocerz_watch_val;
+extern uint64_t ocerz_watch_shadow;
 void ocerz_watch_hit(uint64_t gaddr, int size, uint64_t lo, uint64_t hi);
 
 static inline void ocerz_st(uint64_t gaddr, int size, uint64_t v)
@@ -122,6 +125,9 @@ static inline void ocerz_st(uint64_t gaddr, int size, uint64_t v)
     if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
         ocerz_watch_hit(gaddr, size, v, 0);
     if (ocerz_watch_val && v == ocerz_watch_val)
+        ocerz_watch_hit(gaddr, size, v, 0);
+    if (ocerz_watch_shadow && ocerz_low_base && size == 8 &&
+        v - ocerz_low_base < OCERZ_LOW_LIMIT)
         ocerz_watch_hit(gaddr, size, v, 0);
     void *p = ocerz_g2h(gaddr);
     switch (size) {
@@ -172,6 +178,10 @@ static inline void ocerz_st128(uint64_t gaddr, Ocerz128 v)
     if (ocerz_watch_addr && ocerz_watch_addr - gaddr < 16)
         ocerz_watch_hit(gaddr, 16, v.lo, v.hi);
     if (ocerz_watch_val && (v.lo == ocerz_watch_val || v.hi == ocerz_watch_val))
+        ocerz_watch_hit(gaddr, 16, v.lo, v.hi);
+    if (ocerz_watch_shadow && ocerz_low_base &&
+        (v.lo - ocerz_low_base < OCERZ_LOW_LIMIT ||
+         v.hi - ocerz_low_base < OCERZ_LOW_LIMIT))
         ocerz_watch_hit(gaddr, 16, v.lo, v.hi);
     void *p = ocerz_g2h(gaddr);
     if (((uintptr_t)p & 7) == 0) {

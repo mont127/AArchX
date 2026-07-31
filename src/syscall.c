@@ -1141,6 +1141,29 @@ static int ocerz_no_stackbounds(void)
     return v;
 }
 
+static void ocerz_shadow_scan(const char *tag, uint64_t id, uint64_t gaddr, uint64_t len)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_MACHLEAK") != NULL ? 1 : 0;
+    if (!on || !ocerz_low_base || !gaddr)
+        return;
+    if (len > 0x2000)
+        len = 0x2000;
+    int hits = 0;
+    for (uint64_t off = 0; off + 8 <= len && hits < 8; off += 4) {
+        uint64_t v = ocerz_ld(gaddr + off, 8);
+        if (v - ocerz_low_base < OCERZ_LOW_LIMIT) {
+            fprintf(stderr,
+                    "ocerz: SHADOWLEAK[%d] %s id=%llu off=%#llx addr=%#llx val=%#llx guest=%#llx\n",
+                    (int)getpid(), tag, (unsigned long long)id,
+                    (unsigned long long)off, (unsigned long long)(gaddr + off),
+                    (unsigned long long)v,
+                    (unsigned long long)(v - ocerz_low_base));
+            hits++;
+        }
+    }
+}
+
 static uint64_t ocerz_bridge_mach_msg(uint64_t hbuf, uint64_t sz)
 {
     if (!hbuf || !sz || sz > 0x100000)
@@ -1221,6 +1244,7 @@ static uint64_t ocerz_bridge_mach_msg(uint64_t hbuf, uint64_t sz)
                 mm_ool, mm_oolfail, mm_unhandled,
                 (msgh_size > sz ? " **MSGH_SIZE>RECV**" : ""));
     }
+    ocerz_shadow_scan("bridge", (uint32_t)ocerz_ld(gbuf + 0x14, 4), gbuf, total);
 
     return gbuf;
 }
@@ -1363,7 +1387,8 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
     if ((msg_id == 4815 || msg_id == 4816) &&
         (!send_size || send_size >= 0x28) && n < max_saved) {
         uint64_t ga = ocerz_ld(gmsg + 0x20, 8);
-        uint64_t ha = (uint64_t)(uintptr_t)ocerz_g2h(ga);
+        uint64_t ha = ocerz_low_base ? ocerz_low_base
+                                     : (uint64_t)(uintptr_t)ocerz_g2h(ga);
         if (ha != ga) {
             saved[n].off = 0x20;
             saved[n].orig = ga;
@@ -1413,7 +1438,8 @@ static void ocerz_send_restore_descriptors(uint64_t gmsg, const struct ocerz_ool
     }
 }
 
-static void ocerz_reply_xlate_vm_region(uint64_t reply_buf, uint32_t recv_size)
+static void ocerz_reply_xlate_vm_region(uint64_t reply_buf, uint32_t recv_size,
+                                        uint64_t req_addr)
 {
     if (!reply_buf)
         return;
@@ -1433,6 +1459,23 @@ static void ocerz_reply_xlate_vm_region(uint64_t reply_buf, uint32_t recv_size)
             return;
         address_off = 0x30;
     } else {
+        return;
+    }
+
+    if (ocerz_low_base && req_addr != (uint64_t)-1) {
+        uint64_t ga = req_addr, gsz = 0;
+        unsigned prot = 0, maxprot = 0;
+        ocerz_guest_vm_region(&ga, &gsz, &prot, &maxprot);
+        ocerz_st(reply_buf + address_off, 8, ga);
+        ocerz_st(reply_buf + address_off + 8, 8, gsz);
+        if (reply_id == 4915 && size >= 0x44) {
+            ocerz_st(reply_buf + 0x34, 4, 0);
+            ocerz_st(reply_buf + 0x3c, 4, prot);
+            ocerz_st(reply_buf + 0x40, 4, maxprot);
+        } else if (reply_id == 4916 && size >= 0x4c) {
+            ocerz_st(reply_buf + 0x44, 4, prot);
+            ocerz_st(reply_buf + 0x48, 4, maxprot);
+        }
         return;
     }
 
@@ -1558,6 +1601,8 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
                         (unsigned long long)gbuf,
                         (*(volatile uint32_t *)(uintptr_t)hbuf & 0x80000000u) ? " COMPLEX" : "");
         }
+    ocerz_shadow_scan("wqev", (uint64_t)nev, evbuf,
+                      (uint64_t)nev * OCERZ_KEVENT_QOS_S);
     mach_port_t kp = mach_thread_self();
 
     if (g_hostwq_tl_fatal || !getenv("OCERZ_NO_DDIRESET")) {
@@ -1866,6 +1911,8 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 else if (hb)
                     ocerz_st(ev + 0x28, 8, 0);
             }
+            ocerz_shadow_scan("kevid", r, a[3],
+                              (uint64_t)got * OCERZ_KEVENT_QOS_S);
         }
         if (err)
             ret_err(cpu, r);
@@ -1936,6 +1983,8 @@ static int sys_kevent_qos(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 else if (hb)
                     ocerz_st(ev + 0x28, 8, 0);
             }
+            ocerz_shadow_scan("kevqos", r, a[3],
+                              (uint64_t)got * OCERZ_KEVENT_QOS_S);
         }
         if (err)
             ret_err(cpu, r);
@@ -3250,6 +3299,38 @@ static void ocerz_reply_relocate_ool(OcerzVM *vm, uint64_t reply_buf,
     }
 }
 
+static void ocerz_reply_alias_iokit(OcerzVM *vm, uint64_t reply_buf,
+                                    uint32_t recv_size)
+{
+    if (!ocerz_low_base || !reply_buf)
+        return;
+    uint32_t reply_id = (uint32_t)ocerz_ld(reply_buf + 0x14, 4);
+    if (reply_id < 2900 || reply_id > 2999)
+        return;
+    uint64_t sz = (uint32_t)ocerz_ld(reply_buf + 4, 4);
+    if (recv_size && sz > recv_size)
+        sz = recv_size;
+    if (sz > 0x200)
+        sz = 0x200;
+    static int alog = -1;
+    if (alog < 0) alog = getenv("OCERZ_MACHLEAK") != NULL ? 1 : 0;
+    int tries = 0;
+    for (uint64_t off = 0x20; off + 8 <= sz && tries < 8; off += 4) {
+        uint64_t v = ocerz_ld(reply_buf + off, 8);
+        if ((v & 0xfffull) != 0 || v < 0x1000000ull || v >= OCERZ_LOW_LIMIT)
+            continue;
+        if (ocerz_addr_committed(v) == 1)
+            continue;
+        tries++;
+        int rc = ocerz_alias_raw_region(vm, v);
+        if (alog)
+            fprintf(stderr,
+                    "ocerz: IOKIT-ALIAS[%d] id=%u off=%#llx addr=%#llx rc=%d\n",
+                    (int)getpid(), reply_id, (unsigned long long)off,
+                    (unsigned long long)v, rc);
+    }
+}
+
 static void ocerz_vmmsg_trace(const char *phase, uint64_t msg, uint32_t size_limit)
 {
     static int enabled = -1;
@@ -3425,6 +3506,13 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 31: {
         uint64_t gmsg31 = a[0];
 
+        uint64_t vm_region_req31 = (uint64_t)-1;
+        if (gmsg31 != 0 && (a[1] & 0x1) &&
+            (uint32_t)ocerz_ld(gmsg31 + 4, 4) >= 0x28) {
+            uint32_t sid31 = (uint32_t)ocerz_ld(gmsg31 + 0x14, 4);
+            if (sid31 == 4815 || sid31 == 4816)
+                vm_region_req31 = ocerz_ld(gmsg31 + 0x20, 8);
+        }
         struct ocerz_ool_save sv31[64];
         int nsv31 = 0;
         if (gmsg31 != 0)
@@ -3440,9 +3528,19 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0)
             ocerz_vmmsg_trace("REPLY", gmsg31, (uint32_t)a[3]);
         if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0)
-            ocerz_reply_xlate_vm_region(gmsg31, (uint32_t)a[3]);
+            ocerz_reply_xlate_vm_region(gmsg31, (uint32_t)a[3], vm_region_req31);
         if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0)
             ocerz_reply_relocate_ool(vm, gmsg31, (uint32_t)a[3], 31);
+        if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0)
+            ocerz_reply_alias_iokit(vm, gmsg31, (uint32_t)a[3]);
+        if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0) {
+            uint64_t ssz31 = (uint32_t)ocerz_ld(gmsg31 + 4, 4);
+            if (a[3] && ssz31 > (uint32_t)a[3])
+                ssz31 = (uint32_t)a[3];
+            ocerz_shadow_scan("msg31",
+                              (uint32_t)ocerz_ld(gmsg31 + 0x14, 4),
+                              gmsg31, ssz31);
+        }
         if (gmsg31 != 0 && ocerz_mach_err_interesting(r31))
             ocerz_log_mach_send_err(31, r31, a, gmsg31);
         break;
@@ -3488,6 +3586,10 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         else if (request_buf != 0 &&
                  (msgh_id == 4811 || msgh_id == 4813))
             vm_result_size = ocerz_ld(request_buf + 0x38, 8);
+        uint64_t vm_region_req = (uint64_t)-1;
+        if (request_buf != 0 && (msgh_id == 4815 || msgh_id == 4816) &&
+            (uint32_t)ocerz_ld(request_buf + 4, 4) >= 0x28)
+            vm_region_req = ocerz_ld(request_buf + 0x20, 8);
 
         a[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
         a[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
@@ -3577,7 +3679,8 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_vmmsg_trace("REPLY", mach_reply_buf, mach_reply_size);
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
-            ocerz_reply_xlate_vm_region(mach_reply_buf, mach_reply_size);
+            ocerz_reply_xlate_vm_region(mach_reply_buf, mach_reply_size,
+                                        vm_region_req);
         static int machleak = -1;
         if (machleak < 0) machleak = getenv("OCERZ_MACHLEAK") != NULL ? 1 : 0;
         if (mach_reply_buf != 0 && machleak) {
@@ -3601,6 +3704,8 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_reply_relocate_ool(vm, mach_reply_buf,
                                      mach_reply_size, 47);
+        if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
+            ocerz_reply_alias_iokit(vm, mach_reply_buf, mach_reply_size);
         if (mach_reply_buf != 0) {
             uint32_t rid = (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4);
             if ((rid == 4900 || rid == 4911 || rid == 4913) &&
@@ -3659,6 +3764,14 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                                 ocerz_addr_committed(cpu->gs_base));
                 }
             }
+        }
+        if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0) {
+            uint64_t ssz47 = (uint32_t)ocerz_ld(mach_reply_buf + 4, 4);
+            if (mach_reply_size && ssz47 > mach_reply_size)
+                ssz47 = mach_reply_size;
+            ocerz_shadow_scan("msg2",
+                              (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4),
+                              mach_reply_buf, ssz47);
         }
         if (msgh_id == 8000 && mach_reply_buf != 0 &&
             (a[1] & 0x2) && r47 == 0 &&
