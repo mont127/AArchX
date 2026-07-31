@@ -18,6 +18,7 @@ int main(int argc, char **argv)
     int strace = 0;
     int nojit = 0;
     const char *load_path = NULL;
+    setenv("MallocNanoZone", "0", 1);
     int i = 1;
     for (; i < argc; i++) {
         if (argv[i][0] != '-')
