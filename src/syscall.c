@@ -2848,10 +2848,20 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     if (btrack) {
         bseq = __atomic_add_fetch(&blockseq, 1, __ATOMIC_RELAXED);
         fprintf(stderr,
-                "ocerz: BLK-IN[%d] seq=%llu cpu#%u num=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx\n",
+                "ocerz: BLK-IN[%d] seq=%llu cpu#%u num=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx ret0=%#llx bt:",
                 (int)getpid(), (unsigned long long)bseq, cpu->cpu_number, num,
                 (unsigned long long)orig[0], (unsigned long long)orig[1],
-                (unsigned long long)orig[2], (unsigned long long)cpu->rip);
+                (unsigned long long)orig[2], (unsigned long long)cpu->rip,
+                (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
+        uint64_t bfp = cpu->gpr[OCERZ_RBP];
+        for (int d = 0; d < 8 && bfp > 0x1000; d++) {
+            fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(bfp + 8, 8));
+            uint64_t nf = ocerz_ld(bfp, 8);
+            if (nf <= bfp)
+                break;
+            bfp = nf;
+        }
+        fprintf(stderr, "\n");
     }
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     if (btrack)
