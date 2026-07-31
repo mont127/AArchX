@@ -718,15 +718,19 @@ static int env_inject_lowbase(char **henv, int m, int cap)
 {
     static char lowbase_kv[40];
     static char topbase_kv[40];
-    if (!ocerz_low_base)
-        return m;
-    int have_low = 0, have_top = 0;
+    int have_low = 0, have_top = 0, have_nano = 0;
     for (int i = 0; i < m; i++) {
         if (strncmp(henv[i], "OCERZ_LOWBASE=", 14) == 0)
             have_low = 1;
         if (strncmp(henv[i], "OCERZ_TOPBASE=", 14) == 0)
             have_top = 1;
+        if (strncmp(henv[i], "MallocNanoZone=", 15) == 0)
+            have_nano = 1;
     }
+    if (!have_nano && m < cap)
+        henv[m++] = (char *)"MallocNanoZone=0";
+    if (!ocerz_low_base)
+        return m;
     if (!have_low && m < cap) {
         snprintf(lowbase_kv, sizeof lowbase_kv, "OCERZ_LOWBASE=%#llx",
                  (unsigned long long)ocerz_low_base);
@@ -1339,7 +1343,8 @@ static void ocerz_kev_timer_to_host(void *hev, int nev)
     }
 }
 
-static void ocerz_log_mach_send_err(int trap, uint64_t kr, const uint64_t *a, uint64_t gmsg)
+static void ocerz_log_mach_send_err(int trap, uint64_t kr, const uint64_t *a, uint64_t gmsg,
+                                    const OcerzCPU *cpu)
 {
     static int slog = -1;
     if (slog < 0) slog = getenv("OCERZ_MACHMSG") ? 1 : 0;
@@ -1367,6 +1372,21 @@ static void ocerz_log_mach_send_err(int trap, uint64_t kr, const uint64_t *a, ui
     fprintf(stderr, " buf:");
     for (int k = 0; k < 0x30; k += 8)
         fprintf(stderr, " %016llx", (unsigned long long)ocerz_ld(gmsg + (uint64_t)k, 8));
+    mach_port_t dest = (trap == 47) ? (mach_port_t)a[3]
+                                    : (mach_port_t)ocerz_ld(gmsg + 8, 4);
+    mach_port_type_t pt = 0;
+    kern_return_t pkr = mach_port_type(mach_task_self(), dest, &pt);
+    fprintf(stderr, " dest=%#x type_kr=%d type=%#x rip=%#llx ret0=%#llx bt:", dest, pkr, pt,
+            (unsigned long long)cpu->rip,
+            (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
+    uint64_t fp = cpu->gpr[OCERZ_RBP];
+    for (int d = 0; d < 6 && fp > 0x1000; d++) {
+        fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+        uint64_t nf = ocerz_ld(fp, 8);
+        if (nf <= fp)
+            break;
+        fp = nf;
+    }
     fprintf(stderr, "\n");
 }
 
@@ -3372,6 +3392,16 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     a[4] = cpu->gpr[OCERZ_R8];
     a[5] = cpu->gpr[OCERZ_R9];
 
+    static int portlog = -1;
+    if (portlog < 0) portlog = getenv("OCERZ_PORTLOG") != NULL ? 1 : 0;
+    if (portlog &&
+        (num == 17 || num == 18 || num == 19 || num == 25))
+        fprintf(stderr,
+                "ocerz: PORT-DROP[%d] trap=%d name=%#llx a2=%#llx a3=%#llx rip=%#llx\n",
+                (int)getpid(), num, (unsigned long long)a[1],
+                (unsigned long long)a[2], (unsigned long long)a[3],
+                (unsigned long long)cpu->rip);
+
     switch (num) {
     case 10: {
         uint64_t size = a[2];
@@ -3457,17 +3487,33 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         break;
     }
     case 16: {
+        uint64_t gname16 = a[2];
         if (a[2] != 0)
             a[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
-        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        uint64_t r16 = ocerz_host_mach_trap(num, a);
+        mach_ret(cpu, r16);
+        if (portlog && r16 == 0 && gname16)
+            fprintf(stderr,
+                    "ocerz: PORT-NEW[%d] alloc right=%llu name=%#llx rip=%#llx\n",
+                    (int)getpid(), (unsigned long long)a[1],
+                    (unsigned long long)ocerz_ld(gname16, 4),
+                    (unsigned long long)cpu->rip);
         break;
     }
     case 24: {
+        uint64_t gname24 = a[3];
         if (a[1] != 0)
             a[1] = (uint64_t)(uintptr_t)ocerz_g2h(a[1]);
         if (a[3] != 0)
             a[3] = (uint64_t)(uintptr_t)ocerz_g2h(a[3]);
-        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        uint64_t r24 = ocerz_host_mach_trap(num, a);
+        mach_ret(cpu, r24);
+        if (portlog && r24 == 0 && gname24)
+            fprintf(stderr,
+                    "ocerz: PORT-NEW[%d] construct name=%#llx rip=%#llx\n",
+                    (int)getpid(),
+                    (unsigned long long)ocerz_ld(gname24, 4),
+                    (unsigned long long)cpu->rip);
         break;
     }
     case 40: {
@@ -3542,7 +3588,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                               gmsg31, ssz31);
         }
         if (gmsg31 != 0 && ocerz_mach_err_interesting(r31))
-            ocerz_log_mach_send_err(31, r31, a, gmsg31);
+            ocerz_log_mach_send_err(31, r31, a, gmsg31, cpu);
         break;
     }
     case 43: {
@@ -3667,7 +3713,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             ocerz_send_restore_descriptors(reply_buf, sv47, nsv47);
 
         if (request_buf != 0 && ocerz_mach_err_interesting(r47))
-            ocerz_log_mach_send_err(47, r47, a, request_buf);
+            ocerz_log_mach_send_err(47, r47, a, request_buf, cpu);
         uint64_t mach_reply_buf = reply_buf;
         uint32_t mach_reply_size = (uint32_t)a[6];
         if (reply_buf != 0 && vector_mode) {
