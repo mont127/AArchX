@@ -492,6 +492,84 @@ int ocerz_mem_register_range(uint64_t glo, uint64_t ghi)
     return ok ? OCERZ_OK : OCERZ_ENOMEM;
 }
 
+int ocerz_guest_vm_region(uint64_t *addr, uint64_t *size, unsigned *prot,
+                          unsigned *max_prot)
+{
+    uint64_t query = *addr & ~(OCERZ_HOST_PAGE - 1);
+    const uint64_t tail_end = 0x1000000000000ull;
+    pthread_mutex_lock(&map_lock);
+    for (int guard = 0; guard < 4096; guard++) {
+        const MemRegion *cls = NULL;
+        const MemRegion *next = NULL;
+        for (int k = 0; k < region_n; k++) {
+            if (query >= regions[k].glo && query < regions[k].ghi)
+                cls = &regions[k];
+            else if (regions[k].glo > query &&
+                     (!next || regions[k].glo < next->glo))
+                next = &regions[k];
+        }
+        if (cls) {
+            uint64_t base = (uint64_t)(uintptr_t)ocerz_g2h(cls->glo);
+            uint64_t host_end = base + (cls->ghi - cls->glo);
+            uint64_t pos = query;
+            int found = 0;
+            for (int i = 0; i < 4096 && pos < cls->ghi; i++) {
+                mach_vm_address_t h = base + (pos - cls->glo);
+                mach_vm_size_t hs = 0;
+                vm_region_basic_info_data_64_t info;
+                mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t obj = MACH_PORT_NULL;
+                kern_return_t kr =
+                    mach_vm_region(mach_task_self(), &h, &hs,
+                                   VM_REGION_BASIC_INFO_64,
+                                   (vm_region_info_t)&info, &cnt, &obj);
+                if (obj != MACH_PORT_NULL)
+                    mach_port_deallocate(mach_task_self(), obj);
+                if (kr != KERN_SUCCESS || h >= host_end || hs == 0)
+                    break;
+                uint64_t gs = h < base ? cls->glo : cls->glo + (h - base);
+                uint64_t ge = cls->glo + ((uint64_t)h + hs > host_end
+                                          ? cls->ghi - cls->glo
+                                          : (uint64_t)h + hs - base);
+                if (gs < pos && info.protection == 0)
+                    gs = pos;
+                if (info.protection != 0) {
+                    *addr = gs;
+                    *size = ge - gs;
+                    *prot = (unsigned)info.protection;
+                    *max_prot = (unsigned)info.max_protection;
+                    found = 1;
+                    break;
+                }
+                if (ge <= pos)
+                    break;
+                pos = ge;
+            }
+            if (found) {
+                pthread_mutex_unlock(&map_lock);
+                return 1;
+            }
+            query = cls->ghi;
+            continue;
+        }
+        if (next && query < next->glo) {
+            *addr = query;
+            *size = next->glo - query;
+            *prot = 0;
+            *max_prot = 0;
+            pthread_mutex_unlock(&map_lock);
+            return 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&map_lock);
+    *addr = query;
+    *size = query < tail_end ? tail_end - query : OCERZ_HOST_PAGE;
+    *prot = 0;
+    *max_prot = 0;
+    return 1;
+}
+
 static int map_fixed_locked(uint64_t gaddr, uint64_t len, int prot, int zero_overlap)
 {
     uint64_t lo = round_down(gaddr);

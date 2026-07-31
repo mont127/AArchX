@@ -102,6 +102,7 @@ static int g_sigtrace;
 
 uint64_t ocerz_watch_addr;
 uint64_t ocerz_watch_val;
+uint64_t ocerz_watch_shadow;
 uint64_t ocerz_exc_trap;
 
 int ocerz_init_tolerant;
@@ -898,6 +899,7 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     const char *wv = getenv("OCERZ_STVAL");
     if (wv)
         ocerz_watch_val = strtoull(wv, NULL, 0);
+    ocerz_watch_shadow = getenv("OCERZ_SHADOWST") != NULL;
     const char *et = getenv("OCERZ_EXCTRAP");
     if (et)
         ocerz_exc_trap = strtoull(et, NULL, 0);
