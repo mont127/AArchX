@@ -15,10 +15,9 @@
 
 
 <p align="center">
-  <img alt="license" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg">
+  <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-lightgrey.svg">
-  <img alt="Shell" src="https://img.shields.io/badge/Shell-orange.svg">
-  <img alt="Python" src="https://img.shields.io/badge/Python-blue.svg">
+  <img alt="language" src="https://img.shields.io/badge/C-c11-orange.svg">
 </p>
 
 ---
