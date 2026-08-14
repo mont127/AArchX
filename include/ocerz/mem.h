@@ -16,6 +16,8 @@ extern uint8_t *ocerz_commpage;
 #define OCERZ_LOW_LIMIT   0x0000000300000000ull
 #define OCERZ_TOP_LO      0x00007ffffe000000ull
 #define OCERZ_TOP_HI      0x00007fffffe00000ull
+#define OCERZ_GUEST_PAGE_SIZE 0x1000ull
+#define OCERZ_HOST_PAGE_SIZE  0x4000ull
 
 static inline void *ocerz_g2h(uint64_t gaddr)
 {
@@ -68,6 +70,8 @@ int ocerz_mem_register_range(uint64_t glo, uint64_t ghi);
 int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_map_shared_anon(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_map_shared_file(uint64_t gaddr, uint64_t len, int prot, int fd, uint64_t off);
+int ocerz_map_shared_file_padded(uint64_t gaddr, uint64_t len, int prot,
+                                 int fd, uint64_t off);
 int ocerz_map_hint(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_map_claim_region(uint64_t gaddr, uint64_t len, int prot);
@@ -79,6 +83,8 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align);
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_unmap(uint64_t gaddr, uint64_t len);
 int ocerz_addr_committed(uint64_t gaddr);
+int ocerz_addr_prot(uint64_t gaddr);
+int ocerz_addr_readable(uint64_t gaddr);
 int ocerz_commit_fault_page(uint64_t gaddr);
 unsigned ocerz_host_region_prot(uint64_t gaddr, uint64_t *base, uint64_t *size);
 int ocerz_guest_vm_region(uint64_t *addr, uint64_t *size, unsigned *prot,
@@ -87,6 +93,9 @@ int ocerz_guest_vm_region(uint64_t *addr, uint64_t *size, unsigned *prot,
 void ocerz_init_gate_arm(void);
 void ocerz_init_gate_release(void);
 void ocerz_init_gate_wait(void);
+void ocerz_init_gate_prefork(void);
+void ocerz_init_gate_postfork_parent(void);
+void ocerz_init_gate_postfork_child(void);
 
 static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
 {

@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <time.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
 
 #define OCERZ_CALL_SENTINEL 0x00000000deadca11ull
 
@@ -26,8 +27,10 @@ static __thread OcerzCPU *g_cur_cpu;
 #define OCERZ_MAX_CPUS 512
 static uint64_t g_image_slide;
 static OcerzCPU *g_cpus[OCERZ_MAX_CPUS];
+static pthread_t g_cpu_threads[OCERZ_MAX_CPUS];
 static int g_cpus_n;
 static pthread_mutex_t g_cpus_lock = PTHREAD_MUTEX_INITIALIZER;
+static OcerzCPU *g_fork_surviving_cpu;
 
 static void ocerz_cpu_register(OcerzCPU *cpu)
 {
@@ -42,8 +45,11 @@ static void ocerz_cpu_register(OcerzCPU *cpu)
             pthread_mutex_unlock(&g_cpus_lock);
             return;
         }
-    if (g_cpus_n < OCERZ_MAX_CPUS)
-        g_cpus[g_cpus_n++] = cpu;
+    if (g_cpus_n < OCERZ_MAX_CPUS) {
+        g_cpus[g_cpus_n] = cpu;
+        g_cpu_threads[g_cpus_n] = pthread_self();
+        g_cpus_n++;
+    }
 
     pthread_mutex_unlock(&g_cpus_lock);
 }
@@ -53,7 +59,10 @@ static void ocerz_cpu_unregister(OcerzCPU *cpu)
     pthread_mutex_lock(&g_cpus_lock);
     for (int i = 0; i < g_cpus_n; i++) {
         if (g_cpus[i] == cpu) {
-            g_cpus[i] = g_cpus[--g_cpus_n];
+            int last = --g_cpus_n;
+            g_cpus[i] = g_cpus[last];
+            g_cpu_threads[i] = g_cpu_threads[last];
+            g_cpus[last] = NULL;
             i--;
         }
     }
@@ -89,6 +98,44 @@ static __thread uint64_t g_riphist[32];
 static __thread unsigned g_riphist_n;
 static int g_crash_stack;
 
+void ocerz_vm_atfork_prepare(void)
+{
+    pthread_t self = pthread_self();
+
+    pthread_mutex_lock(&g_cpus_lock);
+    g_fork_surviving_cpu = NULL;
+    for (int i = 0; i < g_cpus_n; i++) {
+        if (pthread_equal(g_cpu_threads[i], self)) {
+            g_fork_surviving_cpu = g_cpus[i];
+            break;
+        }
+    }
+}
+
+void ocerz_vm_atfork_parent(void)
+{
+    g_fork_surviving_cpu = NULL;
+    pthread_mutex_unlock(&g_cpus_lock);
+}
+
+void ocerz_vm_atfork_child(void)
+{
+    OcerzCPU *survivor = g_fork_surviving_cpu;
+
+    for (int i = 0; i < g_cpus_n; i++)
+        g_cpus[i] = NULL;
+    g_cpus_n = 0;
+    if (survivor) {
+        g_cpus[0] = survivor;
+        g_cpu_threads[0] = pthread_self();
+        g_cpus_n = 1;
+    }
+    g_fork_surviving_cpu = NULL;
+    g_pending_async_mask = 0;
+    g_riphist_n = 0;
+    pthread_mutex_unlock(&g_cpus_lock);
+}
+
 unsigned ocerz_vm_riphist(uint64_t *out, unsigned max)
 {
     unsigned n = g_riphist_n < 32 ? g_riphist_n : 32;
@@ -99,6 +146,7 @@ unsigned ocerz_vm_riphist(uint64_t *out, unsigned max)
 }
 
 static int g_sigtrace;
+static int g_winefaultlog;
 
 uint64_t ocerz_watch_addr;
 uint64_t ocerz_watch_val;
@@ -201,7 +249,8 @@ static void arg_trap_report(const OcerzCPU *c)
     for (unsigned i = 0; i < sizeof A / sizeof A[0]; i++) {
         uint64_t v = c->gpr[A[i].r];
         fprintf(stderr, " %s=%#llx", A[i].n, (unsigned long long)v);
-        if (v && ocerz_addr_committed(v) == 1)
+        if (v && ocerz_addr_readable(v) &&
+            ocerz_addr_readable(v + 8))
             fprintf(stderr, "->{%#llx,%#llx}", (unsigned long long)ocerz_ld(v, 8),
                     (unsigned long long)ocerz_ld(v + 8, 8));
         else if (v)
@@ -344,7 +393,8 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
         char *q = x;
         q = str_into(q, "ocerz:   @");
         q = hex_into(q, r);
-        if (ocerz_addr_committed(r) != 1) {
+        if (!ocerz_addr_readable(r) ||
+            !ocerz_addr_readable(r + 15)) {
             q = str_into(q, " (uncommitted)\n");
             write(2, x, (size_t)(q - x));
             continue;
@@ -363,7 +413,7 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
 
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
-    static volatile int depth;
+    static __thread volatile int depth;
 
     if (ocerz_jit_decode_recover)
         siglongjmp(*ocerz_jit_decode_recover, 1);
@@ -419,7 +469,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         int no_wine_teb = g_cur_cpu->sig_altstack_sp == 0;
         if (!no_wine_teb) {
             uint64_t sb = g_cur_cpu->gpr[OCERZ_RSP] & ~0xffffull;
-            if (ocerz_addr_committed(sb) == 1 && ocerz_addr_committed(ocerz_ld(sb, 8)) != 1)
+            if (ocerz_addr_readable(sb) &&
+                ocerz_addr_committed(ocerz_ld(sb, 8)) != 1)
                 no_wine_teb = 1;
         }
         if (looping && no_wine_teb) {
@@ -453,15 +504,17 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             static int faultlog = -1;
             if (faultlog < 0)
                 faultlog = getenv("OCERZ_FAULTLOG") ? 1 : 0;
-            if (faultlog && ocerz_addr_committed(gaddr) != 1) {
+            if (faultlog) {
                 uint64_t rb = 0, rs = 0;
                 unsigned hp = ocerz_host_region_prot(gaddr, &rb, &rs);
-                char fb[256];
+                char fb[384];
                 char *f = fb;
-                f = str_into(f, "ocerz: FAULT-NONGUEST addr=");
+                f = str_into(f, "ocerz: FAULT-MAP addr=");
                 f = hex_into(f, gaddr);
-                f = str_into(f, " committed=");
+                f = str_into(f, " owned=");
                 f = hex_into(f, (uint64_t)(int64_t)ocerz_addr_committed(gaddr));
+                f = str_into(f, " slot_prot=");
+                f = hex_into(f, (uint64_t)(int64_t)ocerz_addr_prot(gaddr));
                 f = str_into(f, " host_prot=");
                 f = hex_into(f, hp);
                 f = str_into(f, " region=");
@@ -470,12 +523,80 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 f = hex_into(f, rs);
                 f = str_into(f, " rip=");
                 f = hex_into(f, g_cur_cpu->rip);
+                f = str_into(f, " hpc=");
+                f = hex_into(f, (uint64_t)(uintptr_t)hpc);
+                f = str_into(f, " hinsn=");
+                f = hex_into(f, hpc ? *(const uint32_t *)hpc : 0);
+                f = str_into(f, " esr=");
+                f = hex_into(f, esr);
                 f = str_into(f, "\n");
                 write(2, fb, (size_t)(f - fb));
+                if (in_jit && uc) {
+                    OcerzJitFaultInfo ji;
+                    if (ocerz_jit_fault_info(fvm, hpc, &ji)) {
+                        char jb[640];
+                        char *j = jb;
+                        j = str_into(j, "ocerz: JITFAULT block=");
+                        j = hex_into(j, ji.block_rip);
+                        j = str_into(j, " insn=");
+                        j = hex_into(j, ji.insn_rip);
+                        j = str_into(j, " idx=");
+                        j = hex_into(j, (uint64_t)(uint32_t)ji.insn_index);
+                        j = str_into(j, " hoff=");
+                        j = hex_into(j, ji.host_word);
+                        j = str_into(j, " class=");
+                        j = hex_into(j, ji.pin_class);
+                        j = str_into(j, " pins=");
+                        j = hex_into(j, ji.n_pinned);
+                        for (int i = 0; i < ji.n_pinned; i++) {
+                            j = str_into(j, " x");
+                            j = hex_into(j, (uint64_t)(21 + i));
+                            j = str_into(j, "/g");
+                            j = hex_into(j, ji.host_holds[i]);
+                            j = str_into(j, "=");
+                            j = hex_into(j,
+                                uc->uc_mcontext->__ss.__x[21 + i]);
+                        }
+                        j = str_into(j, "\n");
+                        write(2, jb, (size_t)(j - jb));
+                    }
+                }
             }
         }
+        uint64_t fault_rsp = g_cur_cpu->gpr[OCERZ_RSP];
         int delivered = looping ? 0
                        : ocerz_signal_deliver(g_cur_cpu, SIGSEGV, gaddr, code, err);
+        if (g_winefaultlog && delivered && g_cur_cpu->sig_altstack_sp != 0) {
+            int teb_committed = gs <= UINT64_MAX - 16 &&
+                                ocerz_addr_readable(gs + 8) &&
+                                ocerz_addr_readable(gs + 16);
+            uint64_t stack_base = teb_committed ? ocerz_ld(gs + 8, 8) : 0;
+            uint64_t stack_limit = teb_committed ? ocerz_ld(gs + 16, 8) : 0;
+            char wb[512];
+            char *w = wb;
+            w = str_into(w, "ocerz: WINEFAULT host_sig=");
+            w = hex_into(w, (uint64_t)sig);
+            w = str_into(w, " addr=");
+            w = hex_into(w, gaddr);
+            w = str_into(w, " rip=");
+            w = hex_into(w, fault_rip);
+            w = str_into(w, " gs=");
+            w = hex_into(w, gs);
+            w = str_into(w, " rsp=");
+            w = hex_into(w, fault_rsp);
+            w = str_into(w, " TEB+8.StackBase=");
+            w = hex_into(w, stack_base);
+            w = str_into(w, " TEB+16.StackLimit=");
+            w = hex_into(w, stack_limit);
+            w = str_into(w, " teb_committed=");
+            w = hex_into(w, (uint64_t)teb_committed);
+            w = str_into(w, " low_base=");
+            w = hex_into(w, ocerz_low_base);
+            w = str_into(w, " h2g(rsp)=");
+            w = hex_into(w, ocerz_h2g((const void *)(uintptr_t)fault_rsp));
+            w = str_into(w, "\n");
+            write(2, wb, (size_t)(w - wb));
+        }
         if (g_sigtrace) {
             char tb[256];
             char *t = tb;
@@ -551,8 +672,10 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     for (int q = 0; q < 8; q++) {
                         uint64_t a = b + (uint64_t)q * 8;
                         m = str_into(m, " ");
-                        if (ocerz_addr_committed(a) == 1) m = hex_into(m, ocerz_ld(a, 8));
-                        else m = str_into(m, "<unc>");
+                        if (ocerz_addr_readable(a))
+                            m = hex_into(m, ocerz_ld(a, 8));
+                        else
+                            m = str_into(m, "<unc>");
                     }
                     m = str_into(m, "\n");
                     write(2, mb, (size_t)(m - mb));
@@ -587,7 +710,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         int no_teb = g_cur_cpu->sig_altstack_sp == 0;
         if (!no_teb) {
             uint64_t sb = g_cur_cpu->gpr[OCERZ_RSP] & ~0xffffull;
-            uint64_t teb = ocerz_addr_committed(sb) == 1 ? ocerz_ld(sb, 8) : 0;
+            uint64_t teb = ocerz_addr_readable(sb)
+                         ? ocerz_ld(sb, 8) : 0;
             if (ocerz_addr_committed(teb) != 1)
                 no_teb = 1;
         }
@@ -642,6 +766,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = str_into(p, " comm=");
         p = hex_into(p, (uint64_t)(int64_t)(ocerz_host_in_guest_space(si->si_addr)
                                             ? ocerz_addr_committed(ocerz_h2g(si->si_addr)) : -2));
+        p = str_into(p, " prot=");
+        p = hex_into(p, (uint64_t)(int64_t)(ocerz_host_in_guest_space(si->si_addr)
+                                            ? ocerz_addr_prot(ocerz_h2g(si->si_addr)) : -2));
+        p = str_into(p, " slide=");
+        p = hex_into(p, g_image_slide);
         p = str_into(p, "\n");
         write(2, buf, (size_t)(p - buf));
         _exit(139);
@@ -718,7 +847,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             p = str_into(p, " r15=");
             p = hex_into(p, c->gpr[OCERZ_R15]);
             p = str_into(p, " [r15+0x18]=");
-            p = hex_into(p, ocerz_addr_committed(c->gpr[OCERZ_R15] + 0x18) == 1
+            p = hex_into(p, ocerz_addr_readable(c->gpr[OCERZ_R15] + 0x18)
                               ? ocerz_ld(c->gpr[OCERZ_R15] + 0x18, 8) : 0);
             *p++ = '\n';
             write(2, buf, (size_t)(p - buf));
@@ -769,6 +898,9 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = buf;
         p = str_into(p, "  rbp-chain:");
         for (int d = 0; d < 9 && fp >= 0x300000000ull; d++) {
+            if (!ocerz_addr_readable(fp) ||
+                !ocerz_addr_readable(fp + 8))
+                break;
             p = str_into(p, " ");
             p = hex_into(p, ocerz_ld(fp + 8, 8));
             uint64_t nf = ocerz_ld(fp, 8);
@@ -789,7 +921,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 p = str_into(p, " [");
                 p = hex_into(p, a);
                 p = str_into(p, "]=");
-                if (ocerz_addr_committed(a) != 0)
+                if (ocerz_addr_readable(a))
                     p = hex_into(p, ocerz_ld(a, 8));
                 else
                     p = str_into(p, "uncommitted");
@@ -887,12 +1019,60 @@ int ocerz_vm_init(OcerzVM *vm)
     return OCERZ_OK;
 }
 
+/* OCERZ_PORTDUMP=1 + SIGUSR2: dump every receive right with queued messages.
+ * Diagnostic for lost-wakeup wedges: a port with a growing queue and no
+ * receiver names the conversation whose delivery ocerz dropped. */
+static void portdump_handler(int sig, siginfo_t *si, void *ctx)
+{
+    (void)sig; (void)si; (void)ctx;
+    mach_port_name_array_t names = NULL;
+    mach_port_type_array_t types = NULL;
+    mach_msg_type_number_t ncnt = 0, tcnt = 0;
+    if (mach_port_names(mach_task_self(), &names, &ncnt, &types, &tcnt) !=
+        KERN_SUCCESS)
+        return;
+    fprintf(stderr, "ocerz: PORTDUMP[%d] rights=%u\n", (int)getpid(), ncnt);
+    for (mach_msg_type_number_t i = 0; i < ncnt; i++) {
+        if (!(types[i] & MACH_PORT_TYPE_RECEIVE))
+            continue;
+        mach_port_status_t st;
+        mach_msg_type_number_t cnt = MACH_PORT_RECEIVE_STATUS_COUNT;
+        if (mach_port_get_attributes(mach_task_self(), names[i],
+                                     MACH_PORT_RECEIVE_STATUS,
+                                     (mach_port_info_t)&st,
+                                     &cnt) != KERN_SUCCESS)
+            continue;
+        if (!st.mps_msgcount)
+            continue;
+        mach_port_seqno_t seq = 0;
+        mach_msg_size_t msize = 0;
+        mach_msg_id_t mid = 0;
+        char tinfo[68];
+        mach_msg_type_number_t tsz = sizeof(tinfo);
+        kern_return_t pk = mach_port_peek(mach_task_self(), names[i],
+                                          MACH_RCV_TRAILER_TYPE(MACH_RCV_TRAILER_NULL),
+                                          &seq, &msize, &mid,
+                                          (mach_msg_trailer_info_t)tinfo, &tsz);
+        fprintf(stderr,
+                "ocerz: PORTDUMP[%d] port=%#x msgs=%u psets=%u srights=%u "
+                "sorights=%u peek_kr=%d id=%#x size=%u\n",
+                (int)getpid(), names[i], st.mps_msgcount,
+                (unsigned)st.mps_pset, (unsigned)st.mps_srights,
+                (unsigned)st.mps_sorights, pk, mid, msize);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)(uintptr_t)names,
+                  ncnt * sizeof(*names));
+    vm_deallocate(mach_task_self(), (vm_address_t)(uintptr_t)types,
+                  tcnt * sizeof(*types));
+}
+
 void ocerz_vm_install_handlers(OcerzVM *vm)
 {
     extern int ocerz_cftrap_on;
     ocerz_cftrap_on = getenv("OCERZ_CFTRAP") != NULL;
     g_crash_stack = getenv("OCERZ_CRASH_STACK") != NULL;
     g_sigtrace = getenv("OCERZ_SIGTRACE") != NULL;
+    g_winefaultlog = getenv("OCERZ_WINEFAULTLOG") != NULL;
     const char *w = getenv("OCERZ_WATCH");
     if (w)
         ocerz_watch_addr = strtoull(w, NULL, 0);
@@ -948,6 +1128,13 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
         sigaction(SIGUSR1, &su, NULL);
     } else {
         sigaction(SIGUSR1, &as, NULL);
+    }
+    if (getenv("OCERZ_PORTDUMP")) {
+        struct sigaction sp;
+        memset(&sp, 0, sizeof sp);
+        sp.sa_sigaction = portdump_handler;
+        sp.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigaction(SIGUSR2, &sp, NULL);
     }
     g_vm = vm;
     if (vm->jit_enabled && !vm->jit)
@@ -1102,9 +1289,11 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
                 fprintf(stderr, "ocerz: initabort-bt rip=%#llx", (unsigned long long)local.rip);
                 uint64_t fp = local.gpr[OCERZ_RBP];
                 for (int d = 0; d < 24 && fp >= 0x10000; d++) {
-                    uint64_t ra = ocerz_addr_committed(fp + 8) == 1 ? ocerz_ld(fp + 8, 8) : 0;
+                    uint64_t ra = ocerz_addr_readable(fp + 8)
+                                ? ocerz_ld(fp + 8, 8) : 0;
                     fprintf(stderr, " %#llx", (unsigned long long)ra);
-                    uint64_t nf = ocerz_addr_committed(fp) == 1 ? ocerz_ld(fp, 8) : 0;
+                    uint64_t nf = ocerz_addr_readable(fp)
+                                ? ocerz_ld(fp, 8) : 0;
                     if (nf <= fp) break;
                     fp = nf;
                 }

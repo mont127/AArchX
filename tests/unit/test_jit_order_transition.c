@@ -144,6 +144,53 @@ int main(void)
     CHECK(ocerz_ld(DATA_ADDR, 8) == 40, "ordered store value=%#llx",
           (unsigned long long)ocerz_ld(DATA_ADDR, 8));
 
+    vm.cpu.ras_top = 1;
+    vm.cpu.ras[0].guest_rip = A_RIP;
+    vm.cpu.ras[0].host_entry = (void *)(uintptr_t)1;
+    ocerz_jit_invalidate_range(&vm, DATA_ADDR, sizeof(uint64_t));
+    CHECK(vm.cpu.ras_top == 1, "non-code invalidation purged ras_top=%u",
+          vm.cpu.ras_top);
+    CHECK(step_at(&vm, B_RIP, 60) == OCERZ_STEP_OK,
+          "non-code invalidation lost cached B");
+    CHECK(vm.cpu.gpr[OCERZ_RAX] == 61,
+          "non-code invalidation result=%#llx",
+          (unsigned long long)vm.cpu.gpr[OCERZ_RAX]);
+    CHECK(ocerz_jit_blocks(vm.jit) == 4,
+          "non-code invalidation retired cache (blocks=%llu)",
+          (unsigned long long)ocerz_jit_blocks(vm.jit));
+
+    vm.cpu.ras_top = 1;
+    vm.cpu.ras[0].guest_rip = B_RIP;
+    vm.cpu.ras[0].host_entry = (void *)(uintptr_t)1;
+    ocerz_jit_invalidate_range(&vm, B_RIP + 1, 1);
+    CHECK(vm.cpu.ras_top == 0, "code invalidation retained ras_top=%u",
+          vm.cpu.ras_top);
+
+    CHECK(ocerz_unmap(CODE_BASE, 0x10000) == OCERZ_OK,
+          "executable mapping unmap failed");
+    CHECK(ocerz_map_fixed(CODE_BASE, 0x10000,
+                          PROT_READ | PROT_WRITE) == OCERZ_OK,
+          "executable address reuse failed");
+    memcpy(ocerz_g2h(A_RIP), store, sizeof store);
+    emit_rel32(A_RIP + sizeof store, 0xe8, B_RIP);
+    const uint8_t add_seven[] = { 0x48, 0x83, 0xc0, 0x07 };
+    memcpy(ocerz_g2h(B_RIP), add_seven, sizeof add_seven);
+    emit_rel32(B_RIP + sizeof add_seven, 0xe9, DONE_RIP);
+
+    CHECK(step_at(&vm, A_RIP, 50) == OCERZ_STEP_OK,
+          "reused A did not return STEP_OK");
+    CHECK(vm.cpu.rip == B_RIP, "reused A rip=%#llx",
+          (unsigned long long)vm.cpu.rip);
+    CHECK(step_at(&vm, B_RIP, 50) == OCERZ_STEP_OK,
+          "reused B did not return STEP_OK");
+    CHECK(vm.cpu.rip == DONE_RIP && vm.cpu.gpr[OCERZ_RAX] == 57,
+          "reused code result rip=%#llx rax=%#llx",
+          (unsigned long long)vm.cpu.rip,
+          (unsigned long long)vm.cpu.gpr[OCERZ_RAX]);
+    CHECK(ocerz_jit_blocks(vm.jit) == 6,
+          "reused code did not translate again (blocks=%llu)",
+          (unsigned long long)ocerz_jit_blocks(vm.jit));
+
     ocerz_jit_destroy(vm.jit);
     fprintf(stderr, "test_jit_order_transition: %s\n",
             failed ? "FAILED" : "OK");
