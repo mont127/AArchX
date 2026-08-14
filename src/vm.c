@@ -1392,6 +1392,11 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
             }
             fprintf(stderr, "\nocerz: %llu instructions executed\n",
                     (unsigned long long)vm->insn_count);
+            /* A 32-bit mode entry can strike on a secondary thread; leaving
+             * the process half-alive wedges the guest's parent, which waits
+             * for the child forever.  Die as a process so wine can move on. */
+            if (cpu->mode32)
+                exit(125);
             g_sig_recover = prev_recover;
             g_cur_cpu = prev_cpu;
             ocerz_cpu_unregister(cpu);
