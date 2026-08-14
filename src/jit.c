@@ -63,6 +63,7 @@ typedef struct JitBlock {
     X86Insn *insns;
     int n_insns;
     struct JitBlock *hnext;
+    struct JitBlock *retired_next;
 
     uint64_t exec_count;
     int n_inlined;
@@ -97,6 +98,13 @@ typedef struct JitBlock {
     uint16_t entry_live;
 } JitBlock;
 
+typedef struct JitCodeIndex {
+    struct JitCodeIndex *older;
+    size_t capacity;
+    size_t count;
+    JitBlock *blocks[];
+} JitCodeIndex;
+
 enum { EDGE_XBLOCK = 0, EDGE_SELFLOOP = 1, EDGE_BODY = 2 };
 
 struct OcerzJit {
@@ -113,9 +121,7 @@ struct OcerzJit {
     int stop_requested;
     uint64_t blocks_translated;
 
-    JitBlock **ci;
-    size_t ci_cap;
-    size_t ci_n;
+    JitCodeIndex *ci;
 };
 
 int ocerz_perfstat = -1;
@@ -3948,6 +3954,40 @@ static int build_fault_flag_recipes(const X86Insn *insns, int n,
     return found;
 }
 
+static int code_index_append_locked(OcerzJit *jit, JitBlock *block)
+{
+    JitCodeIndex *index = __atomic_load_n(&jit->ci, __ATOMIC_RELAXED);
+    size_t count = index
+        ? __atomic_load_n(&index->count, __ATOMIC_RELAXED) : 0;
+
+    if (!index || count == index->capacity) {
+        size_t capacity = index ? index->capacity * 2 : 4096;
+        if ((index && capacity < index->capacity) ||
+            capacity > (SIZE_MAX - sizeof(JitCodeIndex)) /
+                       sizeof(index->blocks[0]))
+            return 0;
+
+        JitCodeIndex *next = (JitCodeIndex *)malloc(
+            sizeof(*next) + capacity * sizeof(next->blocks[0]));
+        if (!next)
+            return 0;
+        next->older = index;
+        next->capacity = capacity;
+        next->count = 0;
+        if (count)
+            memcpy(next->blocks, index->blocks,
+                   count * sizeof(next->blocks[0]));
+        next->blocks[count] = block;
+        __atomic_store_n(&next->count, count + 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&jit->ci, next, __ATOMIC_RELEASE);
+        return 1;
+    }
+
+    index->blocks[count] = block;
+    __atomic_store_n(&index->count, count + 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
 static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
 {
     if (g_n_oslow <= 0)
@@ -4568,17 +4608,19 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         }
     }
 
-    if (jit->ci_n == jit->ci_cap) {
-        size_t ncap = jit->ci_cap ? jit->ci_cap * 2 : 4096;
-        JitBlock **nci = (JitBlock **)realloc(jit->ci, ncap * sizeof *nci);
-        if (nci) {
-            jit->ci = nci;
-            jit->ci_cap = ncap;
-        }
-    }
-    if (jit->ci_n < jit->ci_cap) {
-        jit->ci[jit->ci_n] = blk;
-        __atomic_store_n(&jit->ci_n, jit->ci_n + 1, __ATOMIC_RELEASE);
+    if (!code_index_append_locked(jit, blk)) {
+        blk->n_slow = n;
+        blk->n_inlined = 0;
+        blk->n_pinned = 0;
+        blk->pin_class = 0;
+        blk->code = NULL;
+        blk->body_code = NULL;
+        g_pin = NULL;
+        g_pin_hold = NULL;
+        g_n_pinned = 0;
+        g_pin_class = 0;
+        cache_insert(jit, blk);
+        return blk;
     }
 
     cache_insert(jit, blk);
@@ -4643,24 +4685,28 @@ int ocerz_jit_pc_in_arena(const struct OcerzVM *vm, const void *host_pc)
 
 static const JitBlock *fault_block(const OcerzJit *jit, const uint32_t *pc)
 {
-    if (!jit || !jit->ci)
+    if (!jit)
         return NULL;
     if (pc < jit->code_base || pc >= jit->code_end)
         return NULL;
-    size_t n = __atomic_load_n(&jit->ci_n, __ATOMIC_ACQUIRE);
+    const JitCodeIndex *index =
+        __atomic_load_n(&jit->ci, __ATOMIC_ACQUIRE);
+    if (!index)
+        return NULL;
+    size_t n = __atomic_load_n(&index->count, __ATOMIC_ACQUIRE);
     if (!n)
         return NULL;
     size_t lo = 0, hi = n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if ((const uint32_t *)jit->ci[mid]->code <= pc)
+        if ((const uint32_t *)index->blocks[mid]->code <= pc)
             lo = mid + 1;
         else
             hi = mid;
     }
     if (lo == 0)
         return NULL;
-    const JitBlock *b = jit->ci[lo - 1];
+    const JitBlock *b = index->blocks[lo - 1];
     const uint32_t *base = (const uint32_t *)b->code;
     if (!base || pc >= base + b->code_words)
         return NULL;
@@ -4798,6 +4844,26 @@ int ocerz_jit_fault_rip(const struct OcerzVM *vm, const void *host_pc, uint64_t 
     return 1;
 }
 
+int ocerz_jit_fault_info(const struct OcerzVM *vm, const void *host_pc,
+                         OcerzJitFaultInfo *out)
+{
+    const OcerzJit *jit = vm ? vm->jit : NULL;
+    const uint32_t *pc = (const uint32_t *)host_pc;
+    const JitBlock *b = fault_block(jit, pc);
+    if (!b || !out)
+        return 0;
+    memset(out, 0, sizeof(*out));
+    out->block_rip = b->guest_rip;
+    out->host_word = (uint32_t)(pc - (const uint32_t *)b->code);
+    out->insn_index = fault_insn_index(b, pc);
+    if (out->insn_index >= 0)
+        out->insn_rip = b->insns[out->insn_index].rip;
+    out->n_pinned = b->n_pinned;
+    out->pin_class = b->pin_class;
+    memcpy(out->host_holds, b->host_holds, sizeof(out->host_holds));
+    return 1;
+}
+
 OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
 {
     OcerzJit *jit = (OcerzJit *)calloc(1, sizeof *jit);
@@ -4825,16 +4891,39 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
 
 static void ps_report(OcerzJit *jit);
 
+static void block_destroy(JitBlock *b)
+{
+    free(b->insn_off);
+    free(b->oslow);
+    free(b->fault_flags);
+    free(b->insns);
+    free(b);
+}
+
 static void block_list_destroy(JitBlock *b)
 {
     while (b) {
         JitBlock *next = b->hnext;
-        free(b->insn_off);
-        free(b->oslow);
-        free(b->fault_flags);
-        free(b->insns);
-        free(b);
+        block_destroy(b);
         b = next;
+    }
+}
+
+static void retired_list_destroy(JitBlock *b)
+{
+    while (b) {
+        JitBlock *next = b->retired_next;
+        block_destroy(b);
+        b = next;
+    }
+}
+
+static void code_index_destroy(JitCodeIndex *index)
+{
+    while (index) {
+        JitCodeIndex *older = index->older;
+        free(index);
+        index = older;
     }
 }
 
@@ -4859,10 +4948,10 @@ void ocerz_jit_destroy(OcerzJit *jit)
         ps_report(jit);
     for (unsigned i = 0; i < JIT_HASH_SIZE; i++)
         block_list_destroy(jit->buckets[i]);
-    block_list_destroy(jit->retired);
+    retired_list_destroy(jit->retired);
 
     pending_clear();
-    free(jit->ci);
+    code_index_destroy(__atomic_load_n(&jit->ci, __ATOMIC_RELAXED));
     munmap(jit->code_base, jit->code_bytes);
     free(jit);
 }
@@ -4886,6 +4975,93 @@ static int force_stop_sites_writable(OcerzJit *jit)
         }
     }
     return patched;
+}
+
+static void invalidate_all_locked(OcerzJit *jit)
+{
+    int patched = 0;
+
+    pthread_jit_write_protect_np(0);
+    patched |= force_stop_sites_writable(jit);
+    for (unsigned h = 0; h < JIT_HASH_SIZE; h++) {
+        for (JitBlock *b = jit->buckets[h]; b; b = b->hnext) {
+            for (int i = 0; i < b->n_edges; i++) {
+                uint32_t *at = b->edges[i].patch_b;
+                uint32_t fallback = b->edges[i].fallback_insn;
+                if (at && fallback && *at != fallback) {
+                    __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
+                    patched = 1;
+                }
+            }
+        }
+    }
+    pthread_jit_write_protect_np(1);
+    if (patched)
+        sys_icache_invalidate(jit->code_base,
+            (size_t)((uint8_t *)jit->code_cur - (uint8_t *)jit->code_base));
+
+    for (unsigned h = 0; h < JIT_HASH_SIZE; h++) {
+        JitBlock *b = __atomic_exchange_n(&jit->buckets[h], NULL,
+                                           __ATOMIC_ACQ_REL);
+        while (b) {
+            JitBlock *next = b->hnext;
+            b->retired_next = jit->retired;
+            jit->retired = b;
+            b = next;
+        }
+    }
+
+    pending_clear();
+    for (unsigned i = 0; i < g_ras_slot_n; i++)
+        __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
+}
+
+void ocerz_jit_invalidate_all(struct OcerzVM *vm)
+{
+    if (!vm)
+        return;
+
+    OcerzJit *jit = vm->jit;
+    if (jit) {
+        pthread_mutex_lock(&jit_lock);
+        invalidate_all_locked(jit);
+        pthread_mutex_unlock(&jit_lock);
+    }
+    ocerz_vm_purge_jit_ras(vm);
+}
+
+static int ranges_overlap(uint64_t a, uint64_t alen,
+                          uint64_t b, uint64_t blen)
+{
+    if (!alen || !blen)
+        return 0;
+    return a <= b ? b - a < alen : a - b < blen;
+}
+
+void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
+{
+    if (!vm || !len || !vm->jit)
+        return;
+
+    OcerzJit *jit = vm->jit;
+    int invalidated = 0;
+    pthread_mutex_lock(&jit_lock);
+    for (unsigned h = 0; h < JIT_HASH_SIZE && !invalidated; h++) {
+        for (JitBlock *b = jit->buckets[h]; b && !invalidated; b = b->hnext) {
+            for (int i = 0; i < b->n_insns; i++) {
+                if (ranges_overlap(addr, len, b->insns[i].rip,
+                                   b->insns[i].len)) {
+                    invalidate_all_locked(jit);
+                    invalidated = 1;
+                    break;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&jit_lock);
+
+    if (invalidated)
+        ocerz_vm_purge_jit_ras(vm);
 }
 
 void ocerz_jit_request_stop(struct OcerzVM *vm)
@@ -4923,41 +5099,7 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
     if (jit->plain_mem) {
         jit->plain_mem = 0;
         g_plain_mem = 0;
-
-        int patched = 0;
-        pthread_jit_write_protect_np(0);
-        patched |= force_stop_sites_writable(jit);
-        for (unsigned h = 0; h < JIT_HASH_SIZE; h++) {
-            for (JitBlock *b = jit->buckets[h]; b; b = b->hnext) {
-                for (int i = 0; i < b->n_edges; i++) {
-                    uint32_t *at = b->edges[i].patch_b;
-                    uint32_t fallback = b->edges[i].fallback_insn;
-                    if (at && fallback && *at != fallback) {
-                        __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
-                        patched = 1;
-                    }
-                }
-            }
-        }
-        pthread_jit_write_protect_np(1);
-        if (patched)
-            sys_icache_invalidate(jit->code_base,
-                (size_t)((uint8_t *)jit->code_cur - (uint8_t *)jit->code_base));
-
-        for (unsigned h = 0; h < JIT_HASH_SIZE; h++) {
-            JitBlock *b = __atomic_exchange_n(&jit->buckets[h], NULL,
-                                               __ATOMIC_ACQ_REL);
-            while (b) {
-                JitBlock *next = b->hnext;
-                b->hnext = jit->retired;
-                jit->retired = b;
-                b = next;
-            }
-        }
-
-        pending_clear();
-        for (unsigned i = 0; i < g_ras_slot_n; i++)
-            __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
+        invalidate_all_locked(jit);
     }
     pthread_mutex_unlock(&jit_lock);
 

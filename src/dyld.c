@@ -137,6 +137,8 @@ typedef struct DynImage {
 #define DYN_DIMG_MAX 64
 static DynImage g_dimgs[DYN_DIMG_MAX];
 static int g_dimgs_n;
+static DynImage g_main_dimg;
+static int g_main_dimg_valid;
 static char g_main_hostpath[1024];
 
 uint64_t ocerz_main_mh;
@@ -2052,6 +2054,14 @@ static uint64_t image_symtab_resolve(DynImage *img, const char *sym)
     return 0;
 }
 
+static uint64_t main_image_resolve(const char *sym)
+{
+    if (!g_main_dimg_valid)
+        return 0;
+    uint64_t value = ocerz_image_self_resolve(&g_main_dimg, sym);
+    return value ? value : image_symtab_resolve(&g_main_dimg, sym);
+}
+
 uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
 {
     if (!sym || !sym[0])
@@ -2062,7 +2072,9 @@ uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
 
     int64_t sh = (int64_t)handle;
     if (sh == -2 || sh == -3) {
-        uint64_t v = disk_flat_resolve(buf);
+        uint64_t v = main_image_resolve(buf);
+        if (!v)
+            v = disk_flat_resolve(buf);
         if (v)
             return v;
         if (g_run_cache)
@@ -2070,11 +2082,12 @@ uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
         return v;
     }
     if (sh == -5) {
-        DynImage *m = g_dimgs_n > 0 ? &g_dimgs[0] : NULL;
-        return m ? ocerz_image_self_resolve(m, buf) : 0;
+        return main_image_resolve(buf);
     }
     if (sh == -1) {
-        uint64_t v = disk_flat_resolve(buf);
+        uint64_t v = main_image_resolve(buf);
+        if (!v)
+            v = disk_flat_resolve(buf);
         if (v)
             return v;
         if (g_run_cache)
@@ -2193,6 +2206,12 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     vm->cpu.gs_base = gs;
     ocerz_st(gs, 8, self);
 
+    if (g_main_dimg_valid)
+        free(g_main_dimg.owned_buf);
+    g_main_dimg = img;
+    g_main_dimg.owned_buf = buf;
+    g_main_dimg_valid = 1;
+    buf = NULL;
     free(buf);
 
     ocerz_vm_install_handlers(vm);

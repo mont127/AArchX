@@ -177,6 +177,27 @@ static void memtrace(const char *op, uint64_t a, uint64_t l, int prot, int flags
                 ocerz_addr_committed(a));
 }
 
+static void invalidate_guest_mapping(OcerzVM *vm, uint64_t addr, uint64_t len)
+{
+    ocerz_jit_invalidate_range(vm, addr, len);
+}
+
+static int readonly_shared_subpage(uint64_t addr, uint64_t len, int prot,
+                                   int flags)
+{
+    return (flags & MAP_SHARED) && !(prot & PROT_WRITE) &&
+           ((addr | len) & (OCERZ_HOST_PAGE_SIZE - 1));
+}
+
+static int wine_kuser_shared_page(uint64_t addr, uint64_t len, int prot,
+                                  int flags, uint64_t pos)
+{
+    return addr == 0x7ffe0000ull && len == OCERZ_GUEST_PAGE_SIZE &&
+           pos == 0 && (flags & (MAP_FIXED | MAP_SHARED)) ==
+                       (MAP_FIXED | MAP_SHARED) &&
+           !(prot & PROT_WRITE);
+}
+
 static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t addr = a[0];
@@ -195,17 +216,11 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     memtrace(anon ? "mmap-anon" : "mmap-file", addr, len, prot, flags);
     if (anon) {
         if (fixed) {
-            int rc;
-            if ((prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0) {
-                rc = ocerz_unmap(addr, len);
-                if (rc != OCERZ_OK)
-                    rc = ocerz_mem_register_range(addr, addr + len);
-            } else {
+            invalidate_guest_mapping(vm, addr, len);
+            int rc = ocerz_map_fixed(addr, len, prot);
+            if (rc != OCERZ_OK &&
+                ocerz_mem_register_range(addr, addr + len) == OCERZ_OK)
                 rc = ocerz_map_fixed(addr, len, prot);
-                if (rc != OCERZ_OK &&
-                    ocerz_mem_register_range(addr, addr + len) == OCERZ_OK)
-                    rc = ocerz_map_fixed(addr, len, prot);
-            }
             if (rc != OCERZ_OK) {
                 ret_err(cpu, OCERZ_ENOMEM_V);
                 return OCERZ_STEP_OK;
@@ -216,6 +231,9 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 ret_err(cpu, OCERZ_ENOMEM_V);
                 return OCERZ_STEP_OK;
             }
+            if (prot == PROT_NONE && addr <= 0x10000ull &&
+                len >= 0x100000000ull - addr)
+                ocerz_init_gate_release();
             ret_ok(cpu, addr);
             return OCERZ_STEP_OK;
         }
@@ -230,6 +248,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             ret_err(cpu, OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
+        invalidate_guest_mapping(vm, gaddr, len);
         if ((flags & MAP_SHARED) &&
             ocerz_map_shared_anon(gaddr, len, prot) != OCERZ_OK) {
             ocerz_unmap(gaddr, len);
@@ -241,6 +260,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
 
     if (fixed) {
+        invalidate_guest_mapping(vm, addr, len);
         int rc = ocerz_map_fixed(addr, len, PROT_READ | PROT_WRITE);
         if (rc != OCERZ_OK &&
             ocerz_mem_register_range(addr, addr + len) == OCERZ_OK)
@@ -256,6 +276,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             ret_err(cpu, OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
+        invalidate_guest_mapping(vm, gaddr, len);
     }
 
     if (getenv("OCERZ_MEMTRACE")) {
@@ -268,13 +289,39 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
 
     if (flags & MAP_SHARED) {
-        int src = ocerz_map_shared_file(gaddr, len, prot, fd, pos);
-        if (getenv("OCERZ_MEMTRACE"))
+        /* A read-only guest subpage may later gain a private 4K sibling.
+         * Wine's KUSER page is the narrow exception: its writable backing is
+         * extended through the host page so the adjacent dispatcher can use
+         * the shared padding without breaking KUSER clock coherence. */
+        int padded_kuser = wine_kuser_shared_page(gaddr, len, prot,
+                                                  flags, pos);
+        int src = padded_kuser
+                ? ocerz_map_shared_file_padded(gaddr, len, prot, fd, pos)
+                : readonly_shared_subpage(gaddr, len, prot, flags)
+                  ? OCERZ_EUNSUP
+                  : ocerz_map_shared_file(gaddr, len, prot, fd, pos);
+        if (getenv("OCERZ_MEMTRACE")) {
+            const char *result = src == OCERZ_OK
+                               ? (padded_kuser ? "shared-padded" : "shared-ok")
+                               : (prot & PROT_WRITE)
+                                 ? "FAILED(writable-shared)"
+                                 : "private-copy(readonly)";
             fprintf(stderr, "ocerz: SHAREDMAP gaddr=%#llx len=%#llx -> %s\n",
                     (unsigned long long)gaddr, (unsigned long long)len,
-                    src == OCERZ_OK ? "shared-ok" : "FAILED(fallback-pread)");
+                    result);
+        }
         if (src == OCERZ_OK) {
             ret_ok(cpu, gaddr);
+            return OCERZ_STEP_OK;
+        }
+        if (padded_kuser) {
+            ocerz_unmap(gaddr, len);
+            ret_err(cpu, src == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V);
+            return OCERZ_STEP_OK;
+        }
+        if (prot & PROT_WRITE) {
+            ocerz_unmap(gaddr, len);
+            ret_err(cpu, src == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
     }
@@ -282,17 +329,25 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         uint64_t pa[8] = { (uint64_t)fd, (uint64_t)(uintptr_t)ocerz_g2h(gaddr), len, pos, 0, 0, 0, 0 };
         int err = 0;
         uint64_t ret2 = 0;
-        ocerz_host_syscall(153, pa, &ret2, &err);
-        (void)err;
+        uint64_t r = ocerz_host_syscall(153, pa, &ret2, &err);
+        if (err) {
+            ocerz_unmap(gaddr, len);
+            ret_err(cpu, r);
+            return OCERZ_STEP_OK;
+        }
     }
-    ocerz_protect(gaddr, len, prot);
+    if (ocerz_protect(gaddr, len, prot) != OCERZ_OK) {
+        ocerz_unmap(gaddr, len);
+        ret_err(cpu, OCERZ_ENOMEM_V);
+        return OCERZ_STEP_OK;
+    }
     ret_ok(cpu, gaddr);
     return OCERZ_STEP_OK;
 }
 
 static int sys_munmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    (void)vm;
+    invalidate_guest_mapping(vm, a[0], a[1]);
     ocerz_unmap(a[0], a[1]);
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
@@ -300,10 +355,13 @@ static int sys_munmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 
 static int sys_mprotect(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    (void)vm;
     memtrace("mprotect", a[0], a[1], (int)a[2], 0);
-    ocerz_protect(a[0], a[1], (int)a[2]);
-    ret_ok(cpu, 0);
+    invalidate_guest_mapping(vm, a[0], a[1]);
+    int rc = ocerz_protect(a[0], a[1], (int)a[2]);
+    if (rc == OCERZ_OK)
+        ret_ok(cpu, 0);
+    else
+        ret_err(cpu, rc == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V);
     return OCERZ_STEP_OK;
 }
 
@@ -660,8 +718,15 @@ static int ocerz_spawn_worker(OcerzVM *vm, const OcerzCPU *tmpl)
     return 0;
 }
 
+void ocerz_vm_atfork_prepare(void);
+void ocerz_vm_atfork_parent(void);
+void ocerz_vm_atfork_child(void);
+
 static void ocerz_fork_prepare(void)
 {
+    ocerz_init_gate_prefork();
+    ocerz_vm_atfork_prepare();
+    pthread_mutex_lock(&g_wl_lock);
     ocerz_jit_prefork();
     ocerz_mem_prefork();
 }
@@ -670,25 +735,39 @@ static void ocerz_fork_parent(void)
 {
     ocerz_mem_postfork();
     ocerz_jit_postfork();
+    pthread_mutex_unlock(&g_wl_lock);
+    ocerz_vm_atfork_parent();
+    ocerz_init_gate_postfork_parent();
 }
 
 static void ocerz_fork_child(void)
 {
     ocerz_mem_postfork();
     ocerz_jit_postfork();
+    memset(g_active_wl, 0, sizeof g_active_wl);
+    pthread_mutex_unlock(&g_wl_lock);
+    ocerz_vm_atfork_child();
     __atomic_store_n(&g_wq_running, 0, __ATOMIC_SEQ_CST);
+    ocerz_init_gate_postfork_child();
+}
 
-    ocerz_init_gate_release();
+static pthread_once_t g_fork_atfork_once = PTHREAD_ONCE_INIT;
+static int g_fork_atfork_error;
+
+static void ocerz_fork_register_atfork(void)
+{
+    g_fork_atfork_error = pthread_atfork(
+        ocerz_fork_prepare, ocerz_fork_parent, ocerz_fork_child);
 }
 
 static int sys_fork(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)a;
     ocerz_jit_require_ordered(vm);
-    static int registered;
-    if (!registered) {
-        registered = 1;
-        pthread_atfork(ocerz_fork_prepare, ocerz_fork_parent, ocerz_fork_child);
+    int once_error = pthread_once(&g_fork_atfork_once, ocerz_fork_register_atfork);
+    if (once_error != 0 || g_fork_atfork_error != 0) {
+        ret_err(cpu, (uint64_t)(once_error ? once_error : g_fork_atfork_error));
+        return OCERZ_STEP_OK;
     }
     pid_t pid = fork();
     if (pid < 0) {
@@ -1764,7 +1843,9 @@ static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
     t.gpr[OCERZ_RDX] = region + OCERZ_WQ_GUARD_SIZE;
     t.gpr[OCERZ_RCX] = 0;
     t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | (uint64_t)qos_idx
-                    | (registered ? OCERZ_WQ_FLAG_REUSE : 0);
+                    | (registered ? OCERZ_WQ_FLAG_REUSE : 0)
+                    | (((uint64_t)pri & OCERZ_PTHREAD_PRIORITY_OVERCOMMIT)
+                       ? OCERZ_WQ_FLAG_OVERCOMMIT : 0);
     t.gpr[OCERZ_R9] = 0;
     t.gs_base = pth + 0xe0;
     ocerz_init_gate_wait();
@@ -1956,6 +2037,15 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 wl_release(a[0]);
         }
     }
+    if (OCERZ_ENV_ON("OCERZ_MACHMSG")) {
+        int filt0 = a[1] && (int)a[2] > 0
+                  ? (int)(int16_t)ocerz_ld(a[1] + 0x08, 2) : 0;
+        uint64_t id0 = a[1] && (int)a[2] > 0 ? ocerz_ld(a[1], 8) : 0;
+        fprintf(stderr,
+                "ocerz: KEVID-STUB[%d] wl=%#llx nchg=%lld nev=%lld filt0=%d ident0=%#llx (dropped)\n",
+                (int)getpid(), (unsigned long long)a[0], (long long)a[2],
+                (long long)a[4], filt0, (unsigned long long)id0);
+    }
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
 }
@@ -2086,24 +2176,35 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
-#define OCERZ_PTH_JOIN_WORD 0x34
+#define OCERZ_UL_UNFAIR_LOCK             0x00000002ull
+#define OCERZ_ULF_WAKE_ALL               0x00000100ull
+#define OCERZ_ULF_WAKE_ALLOW_NON_OWNER   0x00000400ull
+
+static int ocerz_bsdthread_sema_is_port(uint64_t value)
+{
+    return value == (uint64_t)(uint32_t)value && (value & 3u) == 3u;
+}
 
 static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    (void)vm;
-    uint64_t pth = cpu->gs_base - 0xe0;
-    uint64_t jw = pth + OCERZ_PTH_JOIN_WORD;
-    if (pth > ocerz_arena_lo && pth < ocerz_arena_hi &&
-        (uint32_t)ocerz_ld(jw, 4) == (uint32_t)a[2]) {
-        ocerz_st(jw, 4, 0xffffffffull);
-        uint64_t wa[8] = { 0x1000002ull, (uint64_t)(uintptr_t)ocerz_g2h(jw), 0, 0, 0, 0, 0, 0 };
+    uint64_t sema_or_ulock = a[3];
+    if (sema_or_ulock != 0 && ocerz_bsdthread_sema_is_port(sema_or_ulock)) {
+        semaphore_signal((semaphore_t)(uint32_t)sema_or_ulock);
+    } else if (sema_or_ulock != 0) {
+        ocerz_st(sema_or_ulock, 4, (uint32_t)a[2] & ~3u);
+        uint64_t wa[8] = {
+            OCERZ_UL_UNFAIR_LOCK | OCERZ_ULF_WAKE_ALL |
+                OCERZ_ULF_WAKE_ALLOW_NON_OWNER,
+            (uint64_t)(uintptr_t)ocerz_g2h(sema_or_ulock),
+            0, 0, 0, 0, 0, 0
+        };
         int err = 0;
         ocerz_host_syscall(516, wa, NULL, &err);
     }
-    if (a[3] != 0)
-        semaphore_signal((semaphore_t)a[3]);
-    if (a[0] != 0 && a[1] != 0 && a[0] + a[1] > a[0])
+    if (a[0] != 0 && a[1] != 0 && a[0] + a[1] > a[0]) {
+        invalidate_guest_mapping(vm, a[0], a[1]);
         ocerz_unmap(a[0], a[1]);
+    }
     cpu->terminated = 1;
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
@@ -2205,6 +2306,7 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 #define OCERZ_MCTX_SIZE 1032u
 #define OCERZ_UCTX_SIZE 768u
 #define OCERZ_SIGINFO_SIZE 104u
+#define OCERZ_UCTX_SEGBASE_COOKIE 0x4f4345525a534547ull
 
 __thread int g_ocerz_deliver_src;
 
@@ -2231,8 +2333,8 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
 
     uint64_t asp = cpu->sig_altstack_sp, asz = cpu->sig_altstack_size;
     int sp_on_alt = asp && (cpu->gpr[OCERZ_RSP] - asp < asz);
-    int use_alt = (sa->flags & DARWIN_SA_ONSTACK) && asp &&
-                  (!cpu->sig_on_stack || !sp_on_alt);
+    int old_on_stack = cpu->sig_on_stack;
+    int use_alt = (sa->flags & DARWIN_SA_ONSTACK) && asp && !old_on_stack;
     if (getenv("OCERZ_SIGTRACE"))
         fprintf(stderr,
                 "ocerz:   altstk sig=%d flags=%#x ONSTACK=%d altsp=%#llx altsz=%#llx on_stack=%d sp_on_alt=%d -> use_alt=%d\n",
@@ -2281,13 +2383,16 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
         ocerz_st128(mc + 352 + (uint64_t)i * 16, cpu->xmm[i]);
 
     uint64_t old_mask = cpu->sig_mask;
-    ocerz_st(uc + 0, 4, (use_alt || cpu->sig_on_stack) ? 1u : 0u);
+    ocerz_st(uc + 0, 4, old_on_stack ? 1u : 0u);
     ocerz_st(uc + 4, 4, (uint32_t)old_mask);
     ocerz_st(uc + 8, 8, cpu->sig_altstack_sp);
     ocerz_st(uc + 16, 8, cpu->sig_altstack_size);
     ocerz_st(uc + 24, 4, cpu->sig_on_stack ? 1u : 0u);
     ocerz_st(uc + 40, 8, OCERZ_MCTX_SIZE);
     ocerz_st(uc + 48, 8, mc);
+    ocerz_st(uc + 56, 8, cpu->gs_base);
+    ocerz_st(uc + 64, 8, cpu->fs_base);
+    ocerz_st(uc + 72, 8, OCERZ_UCTX_SEGBASE_COOKIE);
 
     ocerz_st(si + 0, 4, (uint32_t)sig);
     ocerz_st(si + 8, 4, (uint32_t)si_code);
@@ -2344,12 +2449,23 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     cpu->mxcsr = (uint32_t)ocerz_ld(mc + 216, 4);
     cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
 
+    int restore_segbases =
+        ocerz_ld(uc + 72, 8) == OCERZ_UCTX_SEGBASE_COOKIE;
+    if (restore_segbases) {
+        cpu->gs_base = ocerz_ld(uc + 56, 8);
+        cpu->fs_base = ocerz_ld(uc + 64, 8);
+        ocerz_st(uc + 72, 8, 0);
+        if (ocerz_gs_is_teb_band(cpu->gs_base))
+            cpu->wine_teb_base = cpu->gs_base;
+    }
     if (getenv("OCERZ_GSTRACE"))
-        fprintf(stderr, "ocerz: GS sigreturn[%d] cpu#%u gs stays %#llx rip=%#llx\n",
+        fprintf(stderr,
+                "ocerz: GS sigreturn[%d] cpu#%u gs %#llx rip=%#llx%s\n",
                 (int)getpid(), cpu->cpu_number,
-                (unsigned long long)cpu->gs_base, (unsigned long long)cpu->rip);
-    if (!(uint32_t)ocerz_ld(uc + 0, 4))
-        cpu->sig_on_stack = 0;
+                (unsigned long long)cpu->gs_base,
+                (unsigned long long)cpu->rip,
+                restore_segbases ? " (restored)" : " (unchanged)");
+    cpu->sig_on_stack = (uint32_t)ocerz_ld(uc + 0, 4) != 0;
     return OCERZ_STEP_OK;
 }
 
@@ -3043,11 +3159,12 @@ static int ocerz_alias_raw_region(OcerzVM *vm, uint64_t pointer)
     if (guest >= OCERZ_LOW_LIMIT ||
         rsize > OCERZ_LOW_LIMIT - guest)
         return -1;
-    if (ocerz_addr_committed(guest) == 1 &&
-        ocerz_addr_committed(guest + rsize - 1) == 1)
+    if (ocerz_addr_readable(guest) &&
+        ocerz_addr_readable(guest + rsize - 1))
         return 0;
-    if (ocerz_map_claim_region(guest, rsize,
-                               PROT_READ | PROT_WRITE) != OCERZ_OK)
+    invalidate_guest_mapping(vm, guest, rsize);
+    int prot = info.protection & (PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (ocerz_map_fixed(guest, rsize, prot) != OCERZ_OK)
         return -1;
 
     mach_vm_address_t dst = host_dst;
@@ -3108,7 +3225,7 @@ static int ocerz_alias_raw_contiguous(OcerzVM *vm, uint64_t pointer)
             return -1;
         pos += size;
     }
-    return ocerz_addr_committed(pointer) == 1 ? 0 : -1;
+    return ocerz_addr_readable(pointer) ? 0 : -1;
 }
 
 static int ocerz_alias_raw_range(OcerzVM *vm, uint64_t pointer, uint64_t bytes)
@@ -3151,8 +3268,8 @@ static int ocerz_alias_raw_range(OcerzVM *vm, uint64_t pointer, uint64_t bytes)
             return -1;
         pos += size;
         if (pos >= end)
-            return ocerz_addr_committed(pointer) == 1 &&
-                   ocerz_addr_committed(end - 1) == 1 ? 0 : -1;
+            return ocerz_addr_readable(pointer) &&
+                   ocerz_addr_readable(end - 1) ? 0 : -1;
     }
     return -1;
 }
@@ -3217,6 +3334,7 @@ static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
     uint64_t gaddr;
     if (keep_address) {
         gaddr = haddr;
+        invalidate_guest_mapping(vm, gaddr, size);
         if (ocerz_map_claim_region(gaddr, size,
                                    PROT_READ | PROT_WRITE) != OCERZ_OK) {
             if (preserve_address)
@@ -3228,6 +3346,7 @@ static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
         gaddr = ocerz_map_donate(size);
         if (gaddr == 0)
             return;
+        invalidate_guest_mapping(vm, gaddr, size);
     }
     mach_vm_address_t host_dst =
         (mach_vm_address_t)(uintptr_t)ocerz_g2h(gaddr);
@@ -3374,7 +3493,28 @@ static void ocerz_reply_alias_iokit(OcerzVM *vm, uint64_t reply_buf,
         uint64_t v = ocerz_ld(reply_buf + off, 8);
         if ((v & 0xfffull) != 0 || v < 0x1000000ull || v >= OCERZ_LOW_LIMIT)
             continue;
-        if (ocerz_addr_committed(v) == 1)
+        int slot_prot = ocerz_addr_prot(v);
+        if (alog) {
+            mach_vm_address_t raw = v;
+            mach_vm_size_t raw_size = 0;
+            vm_region_basic_info_data_64_t raw_info;
+            mach_msg_type_number_t raw_count = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t raw_object = MACH_PORT_NULL;
+            kern_return_t raw_kr = mach_vm_region(
+                mach_task_self(), &raw, &raw_size,
+                VM_REGION_BASIC_INFO_64,
+                (vm_region_info_t)&raw_info, &raw_count, &raw_object);
+            if (raw_object != MACH_PORT_NULL)
+                mach_port_deallocate(mach_task_self(), raw_object);
+            fprintf(stderr,
+                    "ocerz: IOKIT-CANDIDATE[%d] id=%u off=%#llx addr=%#llx slot_prot=%d raw_kr=%d raw=%#llx+%#llx raw_prot=%d\n",
+                    (int)getpid(), reply_id, (unsigned long long)off,
+                    (unsigned long long)v, slot_prot, raw_kr,
+                    (unsigned long long)raw,
+                    (unsigned long long)raw_size,
+                    raw_kr == KERN_SUCCESS ? raw_info.protection : -1);
+        }
+        if (slot_prot >= 0 && (slot_prot & PROT_READ))
             continue;
         tries++;
         int rc = ocerz_alias_raw_region(vm, v);
@@ -3444,6 +3584,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (!(flags & 1)) {
             uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
             memtrace("vm_alloc", want, size, 0, (int)flags);
+            invalidate_guest_mapping(vm, want, size);
             if (want == 0 ||
                 (ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
                  ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
@@ -3464,6 +3605,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
             break;
         }
+        invalidate_guest_mapping(vm, gaddr, size);
         if (a[1] != 0)
             ocerz_st(a[1], 8, gaddr);
         mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
@@ -3478,12 +3620,14 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     }
     case 12: {
         memtrace("vm_dealloc", a[1], a[2], 0, 0);
+        invalidate_guest_mapping(vm, a[1], a[2]);
         ocerz_unmap(a[1], a[2]);
         mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
         break;
     }
     case 14: {
         memtrace("vm_protect", a[1], a[2], (int)a[4], 0);
+        invalidate_guest_mapping(vm, a[1], a[2]);
         ocerz_protect(a[1], a[2], (int)a[4]);
         mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
         break;
@@ -3495,6 +3639,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (!(flags & 1)) {
             uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
             memtrace("vm_map", want, size, 0, (int)flags);
+            invalidate_guest_mapping(vm, want, size);
             if (want == 0 ||
                 (ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
                  ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
@@ -3516,6 +3661,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
             break;
         }
+        invalidate_guest_mapping(vm, gaddr, size);
         if (a[1] != 0)
             ocerz_st(a[1], 8, gaddr);
         mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
@@ -3652,6 +3798,10 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         uint64_t request_buf = reply_buf;
         if (vector_mode && request_buf != 0)
             request_buf = ocerz_ld(request_buf, 8);
+        uint32_t thread_info_flavor = 0;
+        if (request_buf != 0 && msgh_id == 3612 &&
+            (uint32_t)ocerz_ld(request_buf + 4, 4) >= 0x24)
+            thread_info_flavor = (uint32_t)ocerz_ld(request_buf + 0x20, 4);
         int sc_map_request = msgh_id == 10052;
         uint32_t sc_uid = 0;
         uint32_t sc_segment = 0;
@@ -3773,7 +3923,8 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             for (uint64_t off = 0x20; off + 8 <= msg_size; off += 4) {
                 uint64_t v = ocerz_ld(mach_reply_buf + off, 8);
                 if (v >= 0x100001000ull && v < OCERZ_LOW_LIMIT &&
-                    (v & 0xfffull) == 0 && ocerz_addr_committed(v) <= 0)
+                    (v & 0xfffull) == 0 &&
+                    !ocerz_addr_readable(v))
                     fprintf(stderr,
                             "ocerz: MACHLEAK reply_id=%u off=%#llx host_val=%#llx icount=%#llx\n",
                             (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4),
@@ -3787,6 +3938,45 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                                      mach_reply_size, 47);
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_reply_alias_iokit(vm, mach_reply_buf, mach_reply_size);
+        if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0 &&
+            OCERZ_ENV_ON("OCERZ_PORTRECV")) {
+            uint32_t rb = (uint32_t)ocerz_ld(mach_reply_buf, 4);
+            uint32_t rs = (uint32_t)ocerz_ld(mach_reply_buf + 4, 4);
+            if (mach_reply_size && rs > mach_reply_size)
+                rs = mach_reply_size;
+            fprintf(stderr,
+                    "ocerz: PORTRECV[%d] id=%u size=%u bits=%#x remote=%#x local=%#x",
+                    (int)getpid(), (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4),
+                    rs, rb, (uint32_t)ocerz_ld(mach_reply_buf + 8, 4),
+                    (uint32_t)ocerz_ld(mach_reply_buf + 0xc, 4));
+            if (rb & 0x80000000u) {
+                uint32_t dc = (uint32_t)ocerz_ld(mach_reply_buf + 0x18, 4);
+                uint64_t off = 0x1c;
+                for (uint32_t d = 0; d < dc && d < 8 && off + 12 <= rs; d++) {
+                    uint8_t ty = (uint8_t)ocerz_ld(mach_reply_buf + off + 11, 1);
+                    if (ty == 0) {
+                        fprintf(stderr, " port[%u]{name=%#x disp=%u}", d,
+                                (uint32_t)ocerz_ld(mach_reply_buf + off, 4),
+                                (uint8_t)ocerz_ld(mach_reply_buf + off + 10, 1));
+                        off += 12;
+                    } else if (ty == 1 || ty == 2 || ty == 3) {
+                        fprintf(stderr, " ool[%u]{addr=%#llx sz=%u ty=%u}", d,
+                                (unsigned long long)ocerz_ld(mach_reply_buf + off, 8),
+                                (uint32_t)ocerz_ld(mach_reply_buf + off + 12, 4),
+                                ty);
+                        off += 16;
+                    } else if (ty == 4) {
+                        fprintf(stderr, " gport[%u]{name=%#x}", d,
+                                (uint32_t)ocerz_ld(mach_reply_buf + off + 12, 4));
+                        off += 16;
+                    } else {
+                        fprintf(stderr, " ?ty=%u", ty);
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "\n");
+        }
         if (mach_reply_buf != 0) {
             uint32_t rid = (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4);
             if ((rid == 4900 || rid == 4911 || rid == 4913) &&
@@ -3830,10 +4020,14 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                 }
             }
 
-            if (rid == 3712) {
+            if (rid == 3712 && msgh_id == 3612 &&
+                thread_info_flavor == THREAD_IDENTIFIER_INFO &&
+                (a[1] & 0x2) && r47 == 0 && rsize >= 0x40 &&
+                (uint32_t)ocerz_ld(mach_reply_buf + 0x20, 4) ==
+                    OCERZ_MACH_KERN_SUCCESS &&
+                (uint32_t)ocerz_ld(mach_reply_buf + 0x24, 4) >= 6) {
                 uint64_t h = ocerz_ld(mach_reply_buf + 0x30, 8);
-                if (h >= 0x140000000ull && h < OCERZ_LOW_LIMIT &&
-                    ocerz_addr_committed(h) == 0) {
+                if (h >= 0x140000000ull && h < OCERZ_LOW_LIMIT) {
                     uint64_t qa = ocerz_ld(mach_reply_buf + 0x38, 8);
                     ocerz_st(mach_reply_buf + 0x30, 8, cpu->gs_base);
                     ocerz_st(mach_reply_buf + 0x38, 8, cpu->gs_base + (qa - h));
