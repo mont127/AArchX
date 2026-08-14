@@ -2979,7 +2979,18 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
         fprintf(stderr, "\n");
     }
+    static int reqlog = -1;
+    if (reqlog < 0) reqlog = getenv("OCERZ_REQLOG") != NULL ? 1 : 0;
+    int rtrack = reqlog && (num == 4 || num == 121) &&
+        (orig[2] == 8 || orig[2] == 16 || orig[2] == 64 || orig[2] == 80 ||
+         num == 121);
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
+    if (rtrack)
+        fprintf(stderr,
+                "ocerz: REQW[%d] num=%d fd=%lld len=%lld first=%#x -> r=%lld err=%d rip=%#llx\n",
+                (int)getpid(), num, (long long)orig[0], (long long)orig[2],
+                num == 4 && orig[1] ? (uint32_t)ocerz_ld(orig[1], 4) : 0,
+                (long long)r, err, (unsigned long long)cpu->rip);
     if (btrack)
         fprintf(stderr, "ocerz: BLK-OUT[%d] seq=%llu num=%d r=%lld err=%d\n",
                 (int)getpid(), (unsigned long long)bseq, num, (long long)r, err);
