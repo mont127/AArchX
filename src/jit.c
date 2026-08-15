@@ -96,6 +96,7 @@ typedef struct JitBlock {
     uint8_t n_edges;
 
     uint16_t entry_live;
+    uint16_t xmm_pinned;      /* xmmN held in V(16+N) for the block's body */
 } JitBlock;
 
 typedef struct JitCodeIndex {
@@ -569,6 +570,8 @@ static void emit_defer_flags(A64Buf *b, uint32_t ccop, int src_reg, int dst_reg)
     a64_str(b, 4, JTT, 20, CC_OP_OFF);
 }
 
+static void emit_xmm_pin_load_all(A64Buf *b);
+static void emit_xmm_pin_spill_all(A64Buf *b);
 static void emit_materialize(A64Buf *b)
 {
 
@@ -577,10 +580,12 @@ static void emit_materialize(A64Buf *b)
     a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
     uint32_t *skip = a64_label(b);
     a64_cbz(b, 0, JT0, 0);
+    emit_xmm_pin_spill_all(b);           /* C clobbers V16-V31 */
     a64_mov_reg(b, 1, 0, 20);
     a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_flags_materialize);
     a64_blr(b, 16);
     emit_reload_mem_base(b);
+    emit_xmm_pin_load_all(b);
     a64_patch_cbz(skip, a64_label(b));
 }
 
@@ -1081,6 +1086,7 @@ static int emit_incdec_eager(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
+static void emit_cc_predicate(A64Buf *b, unsigned cc);
 static int emit_incdec(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (!g_defer)
@@ -1115,9 +1121,10 @@ static int emit_incdec(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (need == 0)
         return 1;
 
-    emit_materialize(b);
-    a64_ldr(b, 8, JTT, 20, RF_OFF);
-    a64_ubfx(b, 1, JT0, JTT, 0, 1);
+    /* CF is preserved by inc/dec: fetch it inline from the pending record
+     * (or RFLAGS) without a C materialize call. */
+    emit_cc_predicate(b, OCERZ_CC_B);        /* NE <=> CF */
+    a64_cset(b, JT0, A64_NE);
     emit_gpr_rd(b, 1, JT1, d->reg);
     emit_defer_flags(b, ocerz_cc_pack(is_inc ? OCERZ_CC_INC : OCERZ_CC_DEC,
                                       d->size, 0), JT0, JT1);
@@ -2302,11 +2309,27 @@ static unsigned producer_record_kind(const X86Insn *p, int *size)
 
 static void emit_cc_predicate(A64Buf *b, unsigned cc)
 {
+    if (getenv("OCERZ_CCLOG")) {
+        char tb[96] = "(none)";
+        if (g_flag_producer) ocerz_format_insn(g_flag_producer, tb, sizeof tb);
+        fprintf(stderr, "ocerz: CCPRED cc=%u producer=%s\n", cc, tb);
+    }
     uint32_t *to_generic[8]; int ng = 0;
     uint32_t *done[4]; int nd = 0;
     int c_sub = cc_after_subs(cc), c_and = cc_after_ands(cc);
     int psize = 0;
     unsigned pkind = producer_record_kind(g_flag_producer, &psize);
+    /* Producers that write RFLAGS eagerly (no deferred record): comis/ucomis,
+     * rotates.  Flags are already current -> just read them (~8 words). */
+    if (g_flag_producer && (g_flag_producer->op == OCERZ_OP_UCOMISD ||
+                            g_flag_producer->op == OCERZ_OP_UCOMISS ||
+                            g_flag_producer->op == OCERZ_OP_COMISD ||
+                            g_flag_producer->op == OCERZ_OP_COMISS)) {
+        /* still cheap-guard: if the producer went slow it also materialized. */
+        emit_cc_predicate_rflags(b, cc);
+        a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+        return;
+    }
     if (g_defer && pkind && cc != OCERZ_CC_P && cc != OCERZ_CC_NP &&
         (psize == 1 || psize == 2 || psize == 4 || psize == 8) &&
         ((pkind == OCERZ_CC_SUB && c_sub >= 0) || (pkind == OCERZ_CC_LOGIC && c_and >= 0))) {
@@ -2827,21 +2850,62 @@ static int emit_bswap(A64Buf *b, const X86Insn *insn)
 #define XMM_BASE_OFF ((uint32_t)offsetof(OcerzCPU, xmm))
 enum { VX0 = 0, VX1 = 1, VX2 = 2, VX3 = 3 };
 
+/* ---- XMM pinning: xmmN lives in host V(16+N) for the whole block ----
+ * g_xmm_pinned: mask of xmm regs the block keeps in V16-V31 (loaded after
+ * body entry, spilled at every exit and around every C callout, which
+ * clobbers V16-V31).  Loads/stores below become register moves when the
+ * register is pinned. */
+static uint16_t g_xmm_pinned;
+static int xmm_pinning_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_XMM_PIN") ? 0 : 1;
+    return on;
+}
+static inline int xmm_vreg(unsigned xr) { return 16 + (int)xr; }
+static inline int xmm_is_pinned(unsigned xr) { return (g_xmm_pinned >> xr) & 1; }
+static void emit_pk_consts_load(A64Buf *b);
+static void emit_xmm_pin_load_all(A64Buf *b)
+{
+    for (unsigned r = 0; r < 16; r++)
+        if (xmm_is_pinned(r))
+            a64_ldr_v(b, 16, xmm_vreg(r), 20, XMM_BASE_OFF + r * 16);
+    emit_pk_consts_load(b);      /* V4-V7 are caller-saved: rebuild after callouts too */
+}
+static void emit_xmm_pin_spill_all(A64Buf *b)
+{
+    for (unsigned r = 0; r < 16; r++)
+        if (xmm_is_pinned(r))
+            a64_str_v(b, 16, xmm_vreg(r), 20, XMM_BASE_OFF + r * 16);
+}
+
 _Static_assert(offsetof(OcerzCPU, xmm) % 16 == 0, "xmm must be 16-aligned for scaled q loads");
 static void emit_xmm_ld(A64Buf *b, int vd, unsigned xr)   /* full 128-bit */
 {
+    if (xmm_is_pinned(xr)) { if (vd != xmm_vreg(xr)) a64_v_mov(b, vd, xmm_vreg(xr)); return; }
     a64_ldr_v(b, 16, vd, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
 static void emit_xmm_st(A64Buf *b, int vs, unsigned xr)
 {
+    if (xmm_is_pinned(xr)) { if (vs != xmm_vreg(xr)) a64_v_mov(b, xmm_vreg(xr), vs); return; }
     a64_str_v(b, 16, vs, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
 static void emit_xmm_ld_lo(A64Buf *b, int size, int vd, unsigned xr) /* 4/8 low bytes; upper zero */
 {
+    if (xmm_is_pinned(xr)) {
+        /* fmov d/s zeroes the upper part of the destination */
+        if (size == 8) a64_fmov_d_d(b, vd, xmm_vreg(xr)); else a64_fmov_s_s(b, vd, xmm_vreg(xr));
+        return;
+    }
     a64_ldr_v(b, size, vd, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
 static void emit_xmm_st_lo(A64Buf *b, int size, int vs, unsigned xr) /* only low 4/8 bytes */
 {
+    if (xmm_is_pinned(xr)) {
+        /* insert the low lane, keep the rest */
+        if (size == 8) a64_ins_d_d(b, xmm_vreg(xr), 0, vs, 0); else a64_ins_s_s(b, xmm_vreg(xr), 0, vs, 0);
+        return;
+    }
     a64_str_v(b, size, vs, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
 
@@ -2954,50 +3018,95 @@ static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **ex
     return 0;
 }
 
-/* x86 generates the negative default NaN (0xfff8.., 0xffc0..) where arm64
- * generates the positive one.  Fix up results that equal arm64's default NaN. */
-static void emit_nan_fix_scalar(A64Buf *b, int dbl, int v)   /* v = result reg */
+/* x86 SSE NaN rule: result NaN -> quiet(a) if a is NaN, else quiet(b) if b is
+ * NaN, else the (negative) default NaN.  arm64 differs (SNaN priority and a
+ * positive default), so results that are NaN get fixed from the INPUTS.
+ * Hot path is a NaN test + not-taken branch. va/vb = inputs, vr = result. */
+static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
 {
-    /* hot path: fcmp + not-taken branch (results are almost never NaN) */
-    a64_fcmp(b, dbl, v, v);
-    uint32_t *ok = a64_label(b); a64_bcond(b, A64_VC, 0);
-    if (dbl) {
-        a64_fmov_x_from_v(b, 1, JT0, v);
-        a64_mov_imm64(b, JT1, 0x7ff8000000000000ull);
-        a64_subs_reg(b, 1, A64_ZR, JT0, JT1, 0);
-        a64_mov_imm64(b, JT1, 0xfff8000000000000ull);
-        a64_csel(b, 1, JT0, JT1, JT0, A64_EQ);
-        a64_fmov_v_from_x(b, 1, v, JT0);
-    } else {
-        a64_fmov_x_from_v(b, 0, JT0, v);
-        a64_mov_imm64(b, JT1, 0x7fc00000ull);
-        a64_subs_reg(b, 0, A64_ZR, JT0, JT1, 0);
-        a64_mov_imm64(b, JT1, 0xffc00000ull);
-        a64_csel(b, 0, JT0, JT1, JT0, A64_EQ);
-        a64_fmov_v_from_x(b, 0, v, JT0);
-    }
+    a64_fcmp(b, dbl, vr, vr);
+    uint32_t *ok = a64_label(b); a64_bcond(b, A64_VC, 0);   /* ordered = not NaN */
+    /* cold: */
+    uint64_t quiet = dbl ? 0x0008000000000000ull : 0x00400000ull;
+    uint64_t dflt  = dbl ? 0xfff8000000000000ull : 0xffc00000ull;
+    a64_fcmp(b, dbl, va, va);
+    uint32_t *a_ok = a64_label(b); a64_bcond(b, A64_VC, 0);
+    a64_fmov_x_from_v(b, dbl, JT0, va);
+    uint32_t *use = a64_label(b); a64_b(b, 0);
+    a64_patch_bcond(a_ok, a64_label(b));
+    a64_fcmp(b, dbl, vb, vb);
+    uint32_t *b_ok = a64_label(b); a64_bcond(b, A64_VC, 0);
+    a64_fmov_x_from_v(b, dbl, JT0, vb);
+    uint32_t *use2 = a64_label(b); a64_b(b, 0);
+    a64_patch_bcond(b_ok, a64_label(b));
+    a64_mov_imm64(b, JT0, dflt);
+    a64_fmov_v_from_x(b, dbl, vr, JT0);
+    uint32_t *done = a64_label(b); a64_b(b, 0);
+    a64_patch_b(use, a64_label(b));
+    a64_patch_b(use2, a64_label(b));
+    a64_mov_imm64(b, JT1, quiet);
+    a64_orr_reg(b, dbl, JT0, JT0, JT1, 0);
+    a64_fmov_v_from_x(b, dbl, vr, JT0);
+    a64_patch_b(done, a64_label(b));
     a64_patch_bcond(ok, a64_label(b));
 }
-static void emit_nan_fix_packed(A64Buf *b, int dbl, int v, int tmp1, int tmp2)
+/* Packed: per-lane exact rule.  Constants: V4/V6 = quiet bit per lane (2D/4S),
+ * V5/V7 = default NaN per lane. */
+static int g_pk_consts_needed;
+static void emit_pk_consts_load(A64Buf *b)
 {
-    /* mask = (v == +defaultNaN) per lane ; v |= mask & signbit */
-    if (dbl) {
-        a64_mov_imm64(b, JT0, 0x7ff8000000000000ull);
-        a64_fmov_v_from_x(b, 1, tmp1, JT0); a64_v_dup_d(b, tmp1, tmp1, 0);
-        a64_v_cmeq(b, 3, tmp2, v, tmp1);
-        a64_mov_imm64(b, JT0, 0x8000000000000000ull);
-        a64_fmov_v_from_x(b, 1, tmp1, JT0); a64_v_dup_d(b, tmp1, tmp1, 0);
-        a64_v_and(b, tmp2, tmp2, tmp1);
-        a64_v_orr(b, v, v, tmp2);
-    } else {
-        a64_mov_imm64(b, JT0, 0x7fc00000ull);
-        a64_fmov_v_from_x(b, 0, tmp1, JT0); a64_v_dup_s(b, tmp1, tmp1, 0);
-        a64_v_cmeq(b, 2, tmp2, v, tmp1);
-        a64_mov_imm64(b, JT0, 0x80000000ull);
-        a64_fmov_v_from_x(b, 0, tmp1, JT0); a64_v_dup_s(b, tmp1, tmp1, 0);
-        a64_v_and(b, tmp2, tmp2, tmp1);
-        a64_v_orr(b, v, v, tmp2);
+    if (!g_pk_consts_needed) return;
+    a64_mov_imm64(b, JT0, 0x0008000000000000ull); a64_fmov_v_from_x(b, 1, 4, JT0); a64_v_dup_d(b, 4, 4, 0);
+    a64_mov_imm64(b, JT0, 0xfff8000000000000ull); a64_fmov_v_from_x(b, 1, 5, JT0); a64_v_dup_d(b, 5, 5, 0);
+    a64_mov_imm64(b, JT0, 0x00400000ull);         a64_fmov_v_from_x(b, 0, 6, JT0); a64_v_dup_s(b, 6, 6, 0);
+    a64_mov_imm64(b, JT0, 0xffc00000ull);         a64_fmov_v_from_x(b, 0, 7, JT0); a64_v_dup_s(b, 7, 7, 0);
+}
+static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int t1, int t2)
+{
+    (void)t2;
+    /* hot: any NaN lane in vr?  fcmeq t1 = (vr==vr) -> 0 in NaN lanes; uminv -> 0 iff any */
+    a64_v_fcmeq(b, dbl, t1, vr, vr);
+    a64_v_uminv_4s(b, t1, t1);
+    a64_fmov_x_from_v(b, 0, JT0, t1);
+    uint32_t *ok = a64_label(b); a64_cbnz(b, 0, JT0, 0);
+    /* cold, exact, lane by lane through a stack scratch area:
+     *   [sp+0]=a [sp+16]=b [sp+32]=r ; for each lane: r = isnan(a)?a|q : isnan(b)?b|q : dflt(if r NaN) */
+    a64_sub_imm(b, 1, 31, 31, 48);
+    a64_str_v(b, 16, va, 31, 0);
+    a64_str_v(b, 16, vb, 31, 16);
+    a64_str_v(b, 16, vr, 31, 32);
+    int lanes = dbl ? 2 : 4, esz = dbl ? 8 : 4;
+    uint64_t quiet = dbl ? 0x0008000000000000ull : 0x00400000ull;
+    uint64_t dflt  = dbl ? 0xfff8000000000000ull : 0xffc00000ull;
+    for (int l = 0; l < lanes; l++) {
+        uint32_t oa = (uint32_t)(0 + l * esz), ob = (uint32_t)(16 + l * esz), orr_ = (uint32_t)(32 + l * esz);
+        a64_ldr(b, esz, JT0, 31, orr_);                 /* r lane bits */
+        a64_ldr_v(b, esz, t1, 31, orr_);
+        a64_fcmp(b, dbl, t1, t1);
+        uint32_t *lane_ok = a64_label(b); a64_bcond(b, A64_VC, 0);   /* r not NaN: keep */
+        a64_ldr_v(b, esz, t1, 31, oa);
+        a64_fcmp(b, dbl, t1, t1);
+        uint32_t *a_ok = a64_label(b); a64_bcond(b, A64_VC, 0);
+        a64_ldr(b, esz, JT0, 31, oa);
+        a64_mov_imm64(b, JT1, quiet); a64_orr_reg(b, dbl, JT0, JT0, JT1, 0);
+        uint32_t *w1 = a64_label(b); a64_b(b, 0);
+        a64_patch_bcond(a_ok, a64_label(b));
+        a64_ldr_v(b, esz, t1, 31, ob);
+        a64_fcmp(b, dbl, t1, t1);
+        uint32_t *b_ok = a64_label(b); a64_bcond(b, A64_VC, 0);
+        a64_ldr(b, esz, JT0, 31, ob);
+        a64_mov_imm64(b, JT1, quiet); a64_orr_reg(b, dbl, JT0, JT0, JT1, 0);
+        uint32_t *w2 = a64_label(b); a64_b(b, 0);
+        a64_patch_bcond(b_ok, a64_label(b));
+        a64_mov_imm64(b, JT0, dflt);
+        a64_patch_b(w1, a64_label(b));
+        a64_patch_b(w2, a64_label(b));
+        a64_str(b, esz, JT0, 31, orr_);
+        a64_patch_bcond(lane_ok, a64_label(b));
     }
+    a64_ldr_v(b, 16, vr, 31, 32);
+    a64_add_imm(b, 1, 31, 31, 48);
+    a64_patch_cbz(ok, a64_label(b));
 }
 
 /* ---- scalar / packed FP arithmetic ---- */
@@ -3021,31 +3130,33 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     case OCERZ_OP_SQRTPS: kind=6; packed=1; break; case OCERZ_OP_SQRTPD: kind=6; dbl=1; packed=1; break;
     default: return 0;
     }
-    /* x86 MAX/MIN return the SECOND operand when either is NaN or both zero;
-     * arm64 fmax/fmin do not.  Keep them slow (rare in hot code). */
-    if (kind == 4 || kind == 5) return 0;
+    if (kind == 4 || kind == 5) return 0;      /* x86 max/min NaN/zero rules: keep slow */
     int esz = dbl ? 8 : 4;
+    /* inputs: a (dst) -> VX0 copy, b (src) -> VX1 ; result -> VX2 */
     if (!emit_sse_src(b, insn, s, packed ? 16 : esz, VX1, exit_sites, n_exits)) return 0;
     if (kind == 6) {
-        if (packed) { a64_v_fsqrt(b, dbl, VX0, VX1); emit_nan_fix_packed(b, dbl, VX0, VX2, VX3); emit_xmm_st(b, VX0, d->reg); }
-        else {
-            /* result low lane = sqrt(src); upper lanes of dst preserved */
-            a64_fsqrt_s(b, dbl, VX0, VX1);
-            emit_nan_fix_scalar(b, dbl, VX0);
-            emit_xmm_st_lo(b, esz, VX0, d->reg);
+        /* sqrt: single input (b).  x86: NaN input -> quiet(b) ; negative -> default NaN */
+        if (packed) {
+            a64_v_fsqrt(b, dbl, VX2, VX1);
+            emit_nan_fix_packed2(b, dbl, VX2, VX1, VX1, VX3, VX0);
+            emit_xmm_st(b, VX2, d->reg);
+        } else {
+            a64_fsqrt_s(b, dbl, VX2, VX1);
+            emit_nan_fix_scalar2(b, dbl, VX2, VX1, VX1);
+            emit_xmm_st_lo(b, esz, VX2, d->reg);
         }
         return 1;
     }
     emit_xmm_ld(b, VX0, d->reg);
     if (packed) {
         switch (kind) {
-        case 0: a64_v_fadd(b, dbl, VX0, VX0, VX1); break;
-        case 1: a64_v_fsub(b, dbl, VX0, VX0, VX1); break;
-        case 2: a64_v_fmul(b, dbl, VX0, VX0, VX1); break;
-        case 3: a64_v_fdiv(b, dbl, VX0, VX0, VX1); break;
+        case 0: a64_v_fadd(b, dbl, VX2, VX0, VX1); break;
+        case 1: a64_v_fsub(b, dbl, VX2, VX0, VX1); break;
+        case 2: a64_v_fmul(b, dbl, VX2, VX0, VX1); break;
+        case 3: a64_v_fdiv(b, dbl, VX2, VX0, VX1); break;
         }
-        emit_nan_fix_packed(b, dbl, VX0, VX2, VX3);
-        emit_xmm_st(b, VX0, d->reg);
+        emit_nan_fix_packed2(b, dbl, VX2, VX0, VX1, VX3, VX3);
+        emit_xmm_st(b, VX2, d->reg);
     } else {
         switch (kind) {
         case 0: a64_fadd_s(b, dbl, VX2, VX0, VX1); break;
@@ -3053,7 +3164,7 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
         case 2: a64_fmul_s(b, dbl, VX2, VX0, VX1); break;
         case 3: a64_fdiv_s(b, dbl, VX2, VX0, VX1); break;
         }
-        emit_nan_fix_scalar(b, dbl, VX2);
+        emit_nan_fix_scalar2(b, dbl, VX2, VX0, VX1);
         emit_xmm_st_lo(b, esz, VX2, d->reg);   /* only low lane written */
     }
     return 1;
@@ -3108,7 +3219,10 @@ static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (d->kind != OCERZ_OPK_XMM) return 0;
     int dbl = insn->op == OCERZ_OP_UCOMISD || insn->op == OCERZ_OP_COMISD;
     int esz = dbl ? 8 : 4;
-    emit_materialize(b);
+    /* comis overwrites every arithmetic flag: a pending deferred record is
+     * dead -- drop it instead of materializing it. */
+    if (g_defer)
+        a64_str(b, 4, A64_ZR, 20, CC_OP_OFF);
     if (!emit_sse_src(b, insn, s, esz, VX1, exit_sites, n_exits)) return 0;
     emit_xmm_ld_lo(b, esz, VX0, d->reg);
     a64_fcmp(b, dbl, VX0, VX1);
@@ -4539,6 +4653,7 @@ static int emit_call_region_call(A64Buf *b, const X86Insn *insn,
     }
     patch_guard_skip(skip, a64_label(b));
 
+    emit_xmm_pin_spill_all(b);            /* callee body sees xmm in memory */
     uint32_t *adr = a64_label(b);
     a64_emit32(b, 0x10000000u | (uint32_t)JRET_HOST);
     uint32_t *callee_patch = a64_label(b);
@@ -4546,6 +4661,7 @@ static int emit_call_region_call(A64Buf *b, const X86Insn *insn,
 
     uint32_t *host_cont = a64_label(b);
     patch_local_adr(adr, host_cont, JRET_HOST);
+    emit_xmm_pin_load_all(b);             /* back from the callee: reload pins */
     uint32_t *return_patch = emit_body_chain_tail(b, retaddr, 0,
                                                   epi_sites, n_epi);
 
@@ -4599,6 +4715,7 @@ static int emit_call_region_ret(A64Buf *b, const X86Insn *insn,
     a64_subs_reg(b, 1, A64_ZR, JRET_GUEST, JT1, 0);
     uint32_t *mismatch = a64_label(b);
     a64_bcond(b, A64_NE, 0);
+    emit_xmm_pin_spill_all(b);
     a64_br(b, JRET_HOST);
 
     uint32_t *fallback = a64_label(b);
@@ -4687,11 +4804,13 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
                 a64_patch_bcond(full, a64_label(b));
             } else {
+                emit_xmm_pin_spill_all(b);
                 a64_mov_reg(b, 1, 0, 19);
                 a64_mov_reg(b, 1, 1, 20);
                 a64_mov_imm64(b, 2, retaddr);
                 a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_ras_push);
                 a64_blr(b, 16);
+                emit_xmm_pin_load_all(b);
             }
         }
     } else if (insn->op == OCERZ_OP_RET) {
@@ -4729,6 +4848,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
 
+            emit_xmm_pin_spill_all(b);
             emit_spill_pinned(b);
             a64_mov_reg(b, 1, 0, 19);
             a64_mov_reg(b, 1, 1, 20);
@@ -4827,6 +4947,7 @@ static void emit_dispatch_stub(OcerzJit *jit)
 
 static void emit_indirect_leave_br(A64Buf *b, int code_reg)
 {
+    emit_xmm_pin_spill_all(b);
     emit_spill_pinned(b);
     a64_mov_reg(b, 1, 0, 19);
     a64_mov_reg(b, 1, 1, 20);
@@ -4880,6 +5001,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
             nocode = a64_label(b); a64_cbz(b, 1, JT0, 0);
             a64_ldr(b, 4, JTU, 20, INT_OFF);         /* interrupt poll (back edges) */
             uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
+            emit_xmm_pin_spill_all(b);
             a64_br(b, JT0);
             a64_patch_cbz(intr, a64_label(b));
             a64_patch_cbz(notbody, a64_label(b));
@@ -4896,6 +5018,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
     uint32_t *nofind = a64_label(b);
     for (int i = 0; i < nm; i++) a64_patch_cbz(to_miss[i], nofind);
     if (slot) {
+        emit_xmm_pin_spill_all(b);
         emit_spill_pinned(b);
         a64_mov_reg(b, 1, 0, 19);
         a64_mov_reg(b, 1, 1, 20);
@@ -4904,6 +5027,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         a64_blr(b, 16);
         emit_fill_pinned(b);
         emit_reload_mem_base(b);
+        emit_xmm_pin_load_all(b);
     }
     a64_mov_imm64(b, 0, OCERZ_STEP_OK);
     epi_sites[*n_epi] = a64_label(b);
@@ -5011,6 +5135,7 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
     emit_materialize(b);
 
+    emit_xmm_pin_spill_all(b);           /* interpreter reads/writes cpu->xmm */
     emit_spill_pinned(b);
     a64_mov_reg(b, 1, 0, 19);
     a64_mov_reg(b, 1, 1, 20);
@@ -5018,6 +5143,8 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_jit_exec_one);
     a64_blr(b, 16);
     emit_fill_pinned(b);
+    emit_xmm_pin_load_all(b);            /* BEFORE the exit test: exit_label spills V regs,
+                                            so they must equal memory on that path too */
     exit_sites[*n_exits] = a64_label(b);
     a64_cbnz(b, 0, 0, 0);
     (*n_exits)++;
@@ -5250,6 +5377,7 @@ static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
 {
     int patch_stop = poll && !g_stop_patch;
     uint32_t *intr = NULL;
+    emit_xmm_pin_spill_all(b);           /* leaving the block: xmm state to memory */
     if (poll && !patch_stop) {
         a64_ldr(b, 4, JT1, 20, INT_OFF);
         intr = a64_label(b);
@@ -5284,6 +5412,7 @@ static uint32_t *emit_chain_tail(A64Buf *b, int poll)
 
     if (poll)
         a64_ldr(b, 4, JT1, 20, INT_OFF);
+    emit_xmm_pin_spill_all(b);
     emit_spill_pinned(b);
     a64_mov_reg(b, 1, 0, 19);
     a64_mov_reg(b, 1, 1, 20);
@@ -5754,6 +5883,30 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 
     g_mem_hoist_greg = select_mem_base_hoist(blk->insns, n, rip);
 
+    /* XMM pin mask: every xmm register any instruction of the block touches
+     * (blendv also reads xmm0).  Slow ops are fine: callouts spill/reload. */
+    g_xmm_pinned = 0;
+    if (xmm_pinning_enabled() && sse_enabled()) {
+        for (int i = 0; i < n; i++) {
+            const X86Insn *in = &blk->insns[i];
+            for (int k = 0; k < in->nops; k++)
+                if (in->ops[k].kind == OCERZ_OPK_XMM && in->ops[k].reg < 16)
+                    g_xmm_pinned |= (uint16_t)(1u << in->ops[k].reg);
+            if (in->op == OCERZ_OP_BLENDVPD || in->op == OCERZ_OP_BLENDVPS || in->op == OCERZ_OP_PBLENDVB)
+                g_xmm_pinned |= 1u;
+        }
+    }
+    blk->xmm_pinned = g_xmm_pinned;
+    g_pk_consts_needed = 0;
+    for (int i = 0; i < n && sse_enabled(); i++) {
+        switch (blk->insns[i].op) {
+        case OCERZ_OP_ADDPS: case OCERZ_OP_ADDPD: case OCERZ_OP_SUBPS: case OCERZ_OP_SUBPD:
+        case OCERZ_OP_MULPS: case OCERZ_OP_MULPD: case OCERZ_OP_DIVPS: case OCERZ_OP_DIVPD:
+        case OCERZ_OP_SQRTPS: case OCERZ_OP_SQRTPD:
+            g_pk_consts_needed = 1; break;
+        default: break;
+        }
+    }
     pthread_jit_write_protect_np(0);
     if (!jit->dispatch_stub && !getenv("OCERZ_NO_DISPATCH_STUB"))
         emit_dispatch_stub(jit);
@@ -5777,17 +5930,19 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     if (g_pin_class == 2)
         a64_add_imm(&b, 1, 29, 31, 0);
 
-    if (ocerz_perfstat > 0) {
+    if (!g_no_chain && !jit->stop_requested) {
+        g_body_entry = a64_label(&b);
+        emit_reload_mem_base(&b);
+        emit_xmm_pin_load_all(&b);
+        g_loop_entry = a64_label(&b);
+    } else {
+        emit_xmm_pin_load_all(&b);
+    }
+    if (ocerz_perfstat > 0) {   /* after body entry: counts every entry (PERFSTAT only) */
         a64_mov_imm64(&b, JT0, (uint64_t)(uintptr_t)&blk->exec_count);
         a64_ldr(&b, 8, JT1, JT0, 0);
         a64_add_imm(&b, 1, JT1, JT1, 1);
         a64_str(&b, 8, JT1, JT0, 0);
-    }
-
-    if (!g_no_chain && !jit->stop_requested) {
-        g_body_entry = a64_label(&b);
-        emit_reload_mem_base(&b);
-        g_loop_entry = a64_label(&b);
     }
 
     JitFaultFlagRecipe fault_recipes[JIT_MAX_BLOCK_INSNS];
@@ -6004,6 +6159,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     }
 
     uint32_t *exit_label = a64_label(&b);
+    emit_xmm_pin_spill_all(&b);
     emit_spill_pinned(&b);
     emit_pin_epilogue_restore(&b);
     if (jit->dispatch_stub) {
@@ -6132,9 +6288,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         if (g_jitdis > 0 && g_jf && blk->insn_off) {
             char tb[128];
             uint32_t epi = (uint32_t)(exit_label - entry);
-            fprintf(g_jf, "BLOCK rip=%#llx words=%u n_insns=%d inlined=%d slow=%d"
+            fprintf(g_jf, "BLOCK rip=%#llx host=%p words=%u n_insns=%d inlined=%d slow=%d"
                           " prologue_words=%u epilogue_words=%u pin_class=%d n_pinned=%d body=%d\n",
-                    (unsigned long long)rip, blk->code_words, n,
+                    (unsigned long long)rip, (void *)entry, blk->code_words, n,
                     blk->n_inlined, blk->n_slow, blk->insn_off[0],
                     blk->code_words - epi, (int)blk->pin_class, (int)blk->n_pinned,
                     blk->body_code != NULL);
@@ -6273,6 +6429,21 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
             value -= ocerz_guest_base;
         cpu->gpr[b->host_holds[i]] = value;
     }
+}
+
+/* XMM pins live in host V16-V31 while a block runs; on a fault the memory
+ * copy is stale, so copy them back from the signal frame's NEON state. */
+void ocerz_jit_fault_recover_xmm(const struct OcerzVM *vm, const void *host_pc,
+                                 const void *host_v /* __uint128_t[32] */, OcerzCPU *cpu)
+{
+    const OcerzJit *jit = vm ? vm->jit : NULL;
+    const JitBlock *b = fault_block(jit, (const uint32_t *)host_pc);
+    if (!b || !host_v || !cpu || !b->xmm_pinned)
+        return;
+    const unsigned char *v = (const unsigned char *)host_v;
+    for (unsigned r = 0; r < 16; r++)
+        if ((b->xmm_pinned >> r) & 1)
+            memcpy(&cpu->xmm[r], v + (16 + r) * 16, 16);
 }
 
 static int fault_insn_index(const JitBlock *b, const uint32_t *pc)
@@ -6745,6 +6916,28 @@ static void ps_report(OcerzJit *jit)
         (double)nblocks / (double)JIT_HASH_SIZE, maxchain,
         blk_exec ? (double)probe_w / (double)blk_exec : 0.0);
 
+    /* HOTBLOCKS: top blocks by exec_count*code_words (static cost estimate) */
+    {
+        enum { HB = 12 };
+        JitBlock *top[HB] = {0}; double topw[HB] = {0};
+        for (unsigned i = 0; i < JIT_HASH_SIZE; i++)
+            for (JitBlock *bb = __atomic_load_n(&jit->buckets[i], __ATOMIC_ACQUIRE); bb; bb = bb->hnext) {
+                double w = (double)bb->exec_count * (double)bb->code_words;
+                for (int k = 0; k < HB; k++)
+                    if (w > topw[k]) {
+                        for (int m = HB - 1; m > k; m--) { top[m] = top[m-1]; topw[m] = topw[m-1]; }
+                        top[k] = bb; topw[k] = w; break;
+                    }
+            }
+        for (int k = 0; k < HB && top[k]; k++) {
+            JitBlock *bb = top[k];
+            fprintf(stderr, "ocerz: PERFSTAT[%d]   HOTBLOCK #%2d rip=%#llx execs=%llu insns=%d words=%u w/insn=%.1f pin=%d slow=%d\n",
+                    (int)getpid(), k + 1, (unsigned long long)bb->guest_rip,
+                    (unsigned long long)bb->exec_count, bb->n_insns, bb->code_words,
+                    bb->n_insns ? (double)bb->code_words / bb->n_insns : 0.0,
+                    (int)bb->pin_class, bb->n_slow);
+        }
+    }
     fprintf(stderr, "ocerz: PERFSTAT[%d]   IC miss_calls=%llu fills=%llu nocode=%llu slots_used=%u\n",
             (int)getpid(), (unsigned long long)g_ic_miss_calls, (unsigned long long)g_ic_fills,
             (unsigned long long)g_ic_nocode, g_ic_next);

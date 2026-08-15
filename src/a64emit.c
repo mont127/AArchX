@@ -563,6 +563,9 @@ void a64_fsqrt_s(A64Buf *b, int dbl, int vd, int vn)
 {
     a64_emit32(b, 0x1e21c000u | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
 }
+/* FMOV Dd, Dn / FMOV Sd, Sn (scalar move; zeroes the upper part of Vd) */
+void a64_fmov_d_d(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x1e604000u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_fmov_s_s(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x1e204000u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 /* FCMP Sn/Dn, Sm/Dm  (sets NZCV) */
 void a64_fcmp(A64Buf *b, int dbl, int vn, int vm)
 {
@@ -637,3 +640,10 @@ void a64_v_bsl(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6e601c00u, vd, vn, v
 /* SSHR Vd.2D/#imm ; SSHR Vd.4S ; used for sign masks (arith shift right) */
 void a64_v_sshr_2d(A64Buf *b, int vd, int vn, int sh) { a64_emit32(b, 0x4f400400u | ((uint32_t)(128 - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_sshr_4s(A64Buf *b, int vd, int vn, int sh) { a64_emit32(b, 0x4f200400u | ((uint32_t)(64 - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+/* FCMEQ Vd.4S/2D, Vn, Vm  (all-ones where equal; NaN lanes -> 0) */
+void a64_v_fcmeq(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4e60e400u : 0x4e20e400u, vd, vn, vm); }
+/* UMINV Sd, Vn.4S (min across lanes) */
+void a64_v_uminv_4s(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x6eb1a800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+/* BIT Vd, Vn, Vm : vd = (vd & ~vm) | (vn & vm)  -- insert vn where vm set */
+void a64_v_bit(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6ea01c00u, vd, vn, vm); }
+/* ORR Vd.4S, #imm8 shifted -- used for quieting: not general; use and/orr with const regs instead */
