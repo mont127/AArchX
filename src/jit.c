@@ -316,6 +316,41 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
     __atomic_store_n(&jit->buckets[h], b, __ATOMIC_RELEASE);
 }
 
+/* ---- monomorphic inline caches for indirect jmp/call ----------------------
+ * Each indirect-branch site owns a slot {guest_rip, host_entry}.  The emitted
+ * code compares the computed target with slot->rip and, on a hit, jumps
+ * straight to the compiled block (same tail as a RAS-hit ret).  On a miss it
+ * calls ocerz_jit_ic_fill, which rewrites the slot for the *current* target
+ * when that block is compiled, then falls out to the dispatcher. */
+typedef struct JitIcSlot { uint64_t rip; void *code; } JitIcSlot;
+#define JIT_IC_SLOTS (1u << 16)
+static JitIcSlot g_ic_slots[JIT_IC_SLOTS];
+static unsigned g_ic_next;
+
+static JitIcSlot *ic_slot_alloc(void)
+{
+    unsigned i = __atomic_fetch_add(&g_ic_next, 1, __ATOMIC_RELAXED);
+    if (i >= JIT_IC_SLOTS)
+        return NULL;
+    return &g_ic_slots[i];
+}
+
+void ocerz_jit_ic_fill(struct OcerzVM *vm, OcerzCPU *cpu, JitIcSlot *slot);
+static _Atomic unsigned long long g_ic_miss_calls, g_ic_fills, g_ic_nocode;
+void ocerz_jit_ic_fill(struct OcerzVM *vm, OcerzCPU *cpu, JitIcSlot *slot)
+{
+    OcerzJit *jit = vm->jit;
+    if (!jit || !slot)
+        return;
+    g_ic_miss_calls++;
+    JitBlock *t = cache_lookup(jit, cpu->rip);
+    if (!t || !t->code) g_ic_nocode++; else g_ic_fills++;
+    if (t && t->code) {
+        __atomic_store_n(&slot->code, (void *)t->code, __ATOMIC_RELAXED);
+        __atomic_store_n(&slot->rip, cpu->rip, __ATOMIC_RELEASE);
+    }
+}
+
 static uint64_t xlive_decode_entry(uint64_t rip)
 {
     X86Insn insns[JIT_MAX_BLOCK_INSNS];
@@ -366,8 +401,7 @@ static int canonical_body_successor(uint64_t rip)
                 break;
             if (is_terminator(insn.op)) {
                 compatible = insn.op == OCERZ_OP_JCC ||
-                    (insn.op == OCERZ_OP_JMP &&
-                     insn.ops[0].kind == OCERZ_OPK_IMM);
+                    insn.op == OCERZ_OP_JMP;   /* direct or indirect */
                 break;
             }
             pc += insn.len;
@@ -3767,6 +3801,190 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     return 1;
 }
 
+/* Emit: target(JT1) -> RIP; monomorphic IC probe; on miss an inline hashed
+ * lookup of the block cache (walks up to 4 chain entries); found -> br host
+ * code; else C fill of the IC slot + epilogue to the dispatcher. */
+static void emit_indirect_leave_br(A64Buf *b, int code_reg)
+{
+    emit_spill_pinned(b);
+    a64_mov_reg(b, 1, 0, 19);
+    a64_mov_reg(b, 1, 1, 20);
+    emit_pin_epilogue_restore(b);
+    a64_ldp_post(b, 19, 20, 31, 16);
+    a64_ldp_post(b, 29, 30, 31, 16);
+    a64_br(b, code_reg);
+}
+
+static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
+                               uint32_t **epi_sites, int *n_epi)
+{
+    a64_str(b, 8, JT1, 20, RIP_OFF);
+    uint32_t *to_miss[8]; int nm = 0;
+    if (slot) {
+        a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)slot);
+        a64_ldr(b, 8, JTF, JTA, 0);                       /* slot->rip  */
+        a64_ldr(b, 8, JT0, JTA, 8);                       /* slot->code */
+        a64_sub_reg(b, 1, JTT, JTF, JT1, 0);
+        to_miss[nm++] = a64_label(b); a64_cbnz(b, 1, JTT, 0);
+        to_miss[nm++] = a64_label(b); a64_cbz(b, 1, JT0, 0);
+        emit_indirect_leave_br(b, JT0);
+    }
+    uint32_t *miss = a64_label(b);
+    for (int i = 0; i < nm; i++) a64_patch_cbz(to_miss[i], miss);
+    nm = 0;
+    /* inline hashed lookup: h = hash_rip(JT1); walk jit->buckets[h] */
+    a64_lsr_imm(b, 1, JTT, JT1, 33);
+    a64_eor_reg(b, 1, JTT, JTT, JT1, 0);
+    a64_mov_imm64(b, JTU, 0xff51afd7ed558ccdull);
+    a64_mul(b, 1, JTT, JTT, JTU);
+    a64_lsr_imm(b, 1, JTU, JTT, 29);
+    a64_eor_reg(b, 1, JTT, JTT, JTU, 0);
+    a64_mov_imm64(b, JTU, JIT_HASH_MASK);
+    a64_and_reg(b, 1, JTT, JTT, JTU, 0);
+    a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)g_xlat_jit->buckets);
+    a64_ldr_regoff(b, 8, JTF, JTA, JTT, 1);               /* JTF = bucket head */
+    for (int k = 0; k < 4; k++) {
+        to_miss[nm++] = a64_label(b); a64_cbz(b, 1, JTF, 0);
+        a64_ldr(b, 8, JTU, JTF, (uint32_t)offsetof(JitBlock, guest_rip));
+        a64_sub_reg(b, 1, JTU, JTU, JT1, 0);
+        uint32_t *nxt = a64_label(b); a64_cbnz(b, 1, JTU, 0);
+        uint32_t *nocode = NULL, *notbody = NULL;
+        if (g_pin_class == 1) {
+            /* same canonical pin layout on both sides -> jump into the body,
+             * pinned host registers stay live, no frame traffic at all. */
+            a64_ldr(b, 1, JTU, JTF, (uint32_t)offsetof(JitBlock, pin_class));
+            a64_sub_imm(b, 0, JTU, JTU, 1);
+            notbody = a64_label(b); a64_cbnz(b, 0, JTU, 0);
+            a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, body_code));
+            nocode = a64_label(b); a64_cbz(b, 1, JT0, 0);
+            a64_ldr(b, 4, JTU, 20, INT_OFF);         /* interrupt poll (back edges) */
+            uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
+            a64_br(b, JT0);
+            a64_patch_cbz(intr, a64_label(b));
+            a64_patch_cbz(notbody, a64_label(b));
+            a64_patch_cbz(nocode, a64_label(b));
+        }
+        a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, code));
+        nocode = a64_label(b); a64_cbz(b, 1, JT0, 0);
+        emit_indirect_leave_br(b, JT0);
+        uint32_t *cont = a64_label(b);
+        a64_patch_cbz(nxt, cont);
+        a64_patch_cbz(nocode, cont);
+        a64_ldr(b, 8, JTF, JTF, (uint32_t)offsetof(JitBlock, hnext));
+    }
+    uint32_t *nofind = a64_label(b);
+    for (int i = 0; i < nm; i++) a64_patch_cbz(to_miss[i], nofind);
+    if (slot) {
+        emit_spill_pinned(b);
+        a64_mov_reg(b, 1, 0, 19);
+        a64_mov_reg(b, 1, 1, 20);
+        a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)slot);
+        a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_jit_ic_fill);
+        a64_blr(b, 16);
+        emit_fill_pinned(b);
+        emit_reload_mem_base(b);
+    }
+    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+    epi_sites[*n_epi] = a64_label(b);
+    a64_b(b, 0);
+    (*n_epi)++;
+}
+
+/* Load an indirect branch target operand (reg or mem) into JT1. */
+static int emit_branch_target(A64Buf *b, const X86Insn *insn, const X86Operand *o,
+                              uint32_t **exit_sites, int *n_exits)
+{
+    if (o->kind == OCERZ_OPK_REG) {
+        if (o->high8 || o->size != 8)
+            return 0;
+        if (g_pin_class == 2 && o->reg == OCERZ_RSP)
+            return 0;
+        emit_gpr_rd(b, 1, JT1, o->reg);
+        return 1;
+    }
+    if (o->kind == OCERZ_OPK_MEM) {
+        if (o->size != 8)
+            return 0;
+        if (!emit_mem_ea(b, insn, o, JTA))
+            return 0;
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        emit_guest_load_ordered(b, 8, JT1, JTA, JTU);
+        patch_guard_skip(skip, a64_label(b));
+        return 1;
+    }
+    return 0;
+}
+
+static int emit_indirect_jmp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
+                             int *n_exits, uint32_t **epi_sites, int *n_epi)
+{
+    if (insn->op != OCERZ_OP_JMP || insn->ops[0].kind == OCERZ_OPK_IMM)
+        return 0;
+    if (getenv("OCERZ_NO_INLINE_INDIRECT"))
+        return 0;
+    if (insn->seg != OCERZ_SEG_NONE)
+        return 0;
+    emit_materialize(b);
+    if (!emit_branch_target(b, insn, &insn->ops[0], exit_sites, n_exits))
+        return 0;
+    emit_indirect_tail(b, ic_slot_alloc(), epi_sites, n_epi);
+    return 1;
+}
+
+static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
+                              int *n_exits, uint32_t **epi_sites, int *n_epi)
+{
+    if (insn->op != OCERZ_OP_CALL || insn->ops[0].kind == OCERZ_OPK_IMM)
+        return 0;
+    if (getenv("OCERZ_NO_INLINE_INDIRECT"))
+        return 0;
+    if (insn->seg != OCERZ_SEG_NONE || !mem_native_store_ok())
+        return 0;
+    emit_materialize(b);
+    if (!emit_branch_target(b, insn, &insn->ops[0], exit_sites, n_exits))
+        return 0;
+    /* push return address (target already in JT1) */
+    uint64_t retaddr = insn->rip + insn->len;
+    a64_mov_imm64(b, JT2, retaddr);
+    emit_gpr_rd(b, 1, JT0, OCERZ_RSP);
+    a64_sub_imm(b, 1, JTA, JT0, 8);
+    emit_add_const(b, JTA, ea_fold());
+    uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+    emit_guest_store_ordered(b, 8, JT2, JTA, JTU);
+    a64_sub_imm(b, 1, JT0, JT0, 8);
+    emit_gpr_wr(b, JT0, OCERZ_RSP);
+    patch_guard_skip(skip, a64_label(b));
+    /* RAS push so the matching ret predicts */
+    if (!g_no_ras) {
+        void **rslot = ras_slot_alloc();
+        if (rslot) {
+            JitBlock *rb = cache_lookup(g_xlat_jit, retaddr);
+            if (rb && rb->code)
+                *rslot = (void *)rb->code;
+            else
+                pending_add_ras(retaddr, rslot);
+            a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
+            a64_subs_imm(b, 0, A64_ZR, JT2, OCERZ_RAS_SIZE);
+            uint32_t *full = a64_label(b);
+            a64_bcond(b, A64_CS, 0);
+            a64_mov_imm64(b, JTF, retaddr);
+            a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)rslot);
+            a64_ldr(b, 8, JT0, JTA, 0);
+            a64_lsl_imm(b, 1, JTA, JT2, 4);
+            a64_add_reg(b, 1, JTA, JTA, 20, 0);
+            a64_str(b, 8, JTF, JTA, RAS_OFF);
+            a64_str(b, 8, JT0, JTA, RAS_OFF + 8);
+            a64_add_imm(b, 0, JT2, JT2, 1);
+            a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
+            a64_patch_bcond(full, a64_label(b));
+        }
+    }
+    emit_indirect_tail(b, ic_slot_alloc(), epi_sites, n_epi);
+    return 1;
+}
+
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
 
@@ -4431,9 +4649,13 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         }
     }
 
+    int indirect_jmp_term = term->op == OCERZ_OP_JMP &&
+                            term->ops[0].kind != OCERZ_OPK_IMM &&
+                            term->seg == OCERZ_SEG_NONE;
     int fixed_region = !call_region && !g_no_regflags &&
         (term->op == OCERZ_OP_JCC ||
-         (term->op == OCERZ_OP_JMP && term->ops[0].kind == OCERZ_OPK_IMM));
+         (term->op == OCERZ_OP_JMP && term->ops[0].kind == OCERZ_OPK_IMM) ||
+         indirect_jmp_term);
     if (call_region) {
 
         static const uint8_t call_gpr[6] = {
@@ -4450,7 +4672,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         g_pin_hold = blk->host_holds;
         g_n_pinned = 6;
         g_pin_class = 2;
-    } else if (fixed_region) {
+    } else if (fixed_region && !indirect_jmp_term) {
         uint64_t target = term->ops[0].imm;
         fixed_region = canonical_body_successor(target);
         if (term->op == OCERZ_OP_JCC)
@@ -4720,14 +4942,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         }
 
         if (i == n - 1 && insn->op == OCERZ_OP_JMP) {
-            if (emit_jmp(&b, insn, epi_sites, &n_epi)) {
+            if (emit_jmp(&b, insn, epi_sites, &n_epi) ||
+                emit_indirect_jmp(&b, insn, exit_sites, &n_exits, epi_sites, &n_epi)) {
                 blk->n_inlined++;
                 continue;
             }
         }
 
         if (i == n - 1 && (insn->op == OCERZ_OP_CALL || insn->op == OCERZ_OP_RET)) {
-            if (emit_call_ret(&b, insn, exit_sites, &n_exits, epi_sites, &n_epi)) {
+            if (emit_call_ret(&b, insn, exit_sites, &n_exits, epi_sites, &n_epi) ||
+                emit_indirect_call(&b, insn, exit_sites, &n_exits, epi_sites, &n_epi)) {
                 blk->n_inlined++;
                 continue;
             }
@@ -5469,6 +5693,9 @@ static void ps_report(OcerzJit *jit)
         (double)nblocks / (double)JIT_HASH_SIZE, maxchain,
         blk_exec ? (double)probe_w / (double)blk_exec : 0.0);
 
+    fprintf(stderr, "ocerz: PERFSTAT[%d]   IC miss_calls=%llu fills=%llu nocode=%llu slots_used=%u\n",
+            (int)getpid(), (unsigned long long)g_ic_miss_calls, (unsigned long long)g_ic_fills,
+            (unsigned long long)g_ic_nocode, g_ic_next);
     PsOpRow rows[OCERZ_OP_COUNT];
     for (unsigned i = 0; i < OCERZ_OP_COUNT; i++) {
         rows[i].op = i;
