@@ -57,7 +57,7 @@ typedef struct OcerzCPU {
 
     uint8_t mode32;
     uint16_t cs_sel;
-    Ocerz128 xmm[16];
+    Ocerz128 xmm[16] __attribute__((aligned(16)));   /* 16-aligned: JIT uses scaled ldr/str q */
     uint32_t mxcsr;
     uint16_t fcw;
     uint16_t fsw;
