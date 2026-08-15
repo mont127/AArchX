@@ -193,6 +193,23 @@ static int g_mem_hoist_greg = -1;
 static int g_mem_hoist_aux_disp;
 #define JMEMBASE 17
 #define JMEMAUX 29
+/* x0 holds ocerz_guest_base for the whole block (materialized at function
+ * entry and after every C callout; C calls set x0 themselves).  Only used
+ * when there is no low_base alias (ea_fold() == guest_base). */
+#define JGB 0
+static inline int jgb_usable(void) { return ocerz_low_base == 0; }
+void ocerz_jgb_trap(uint64_t rip, uint64_t x0);
+void ocerz_jgb_trap(uint64_t rip, uint64_t x0)
+{
+    fprintf(stderr, "ocerz: JGB TRAP entering body of block %#llx with x0=%#llx (gbase=%#llx)\n",
+            (unsigned long long)rip, (unsigned long long)x0, (unsigned long long)ocerz_guest_base);
+    abort();
+}
+static void emit_reload_jgb(A64Buf *b)
+{
+    if (jgb_usable())
+        a64_mov_imm64(b, JGB, ocerz_guest_base);
+}
 static void emit_reload_mem_base(A64Buf *b);
 
 static struct {
@@ -602,6 +619,7 @@ static void emit_materialize(A64Buf *b)
     a64_blr(b, 16);
     emit_fill_pinned_callersaved(b);
     emit_reload_mem_base(b);
+    emit_reload_jgb(b);
     emit_xmm_pin_load_all(b);
     a64_patch_cbz(skip, a64_label(b));
 }
@@ -1635,6 +1653,29 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     if (g_pin_class == 2 && op->base == OCERZ_RSP &&
         pin_slot(OCERZ_RSP) >= 0)
         initial = (uint64_t)op->disp;
+    /* fast form: gbase lives in JGB -> add base/index to it, then the
+     * displacement as an immediate (no 2-3 word constant materialization) */
+    if (jgb_usable() && fold == ocerz_guest_base && seg == OCERZ_SEG_NONE &&
+        !(g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) &&
+        op->disp >= -4095 && op->disp <= 4095 &&
+        (op->base == OCERZ_REG_NONE || pin_slot(op->base) >= 0) &&
+        (op->index == OCERZ_REG_NONE || pin_slot(op->index) >= 0)) {
+        int have = 0;
+        if (op->base != OCERZ_REG_NONE) {
+            a64_add_reg(b, 1, addr_reg, JGB, pin_hreg(pin_slot(op->base)), 0);
+            have = 1;
+        }
+        if (op->index != OCERZ_REG_NONE) {
+            a64_add_reg(b, 1, addr_reg, have ? addr_reg : JGB,
+                        pin_hreg(pin_slot(op->index)), op->scale & 3);
+            have = 1;
+        }
+        if (!have)
+            a64_mov_reg(b, 1, addr_reg, JGB);
+        if (op->disp > 0)      a64_add_imm(b, 1, addr_reg, addr_reg, (uint32_t)op->disp);
+        else if (op->disp < 0) a64_sub_imm(b, 1, addr_reg, addr_reg, (uint32_t)-op->disp);
+        return 1;
+    }
     a64_mov_imm64(b, addr_reg, initial);
     if (op->base != OCERZ_REG_NONE) {
         int s = pin_slot(op->base);
@@ -5102,6 +5143,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_ras_push);
                 a64_blr(b, 16);
                 emit_fill_pinned_callersaved(b);
+                emit_reload_jgb(b);
                 emit_xmm_pin_load_all(b);
             }
         }
@@ -5450,6 +5492,7 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     a64_cbnz(b, 0, 0, 0);
     (*n_exits)++;
     emit_reload_mem_base(b);
+    emit_reload_jgb(b);
 }
 
 int ocerz_jitstat = -1;
@@ -6237,6 +6280,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     a64_stp_pre(&b, 19, 20, 31, -16);
     a64_mov_reg(&b, 1, 19, 0);
     a64_mov_reg(&b, 1, 20, 1);
+    emit_reload_jgb(&b);
 
     emit_pin_prologue(&b);
 
@@ -6256,6 +6300,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     if (!g_no_chain && !jit->stop_requested) {
         g_body_entry = a64_label(&b);
         emit_reload_mem_base(&b);
+        if (getenv("OCERZ_JGB_CHECK") && jgb_usable()) {   /* debug trap: body entered with x0 != gbase */
+            a64_mov_imm64(&b, JTU, ocerz_guest_base);
+            a64_subs_reg(&b, 1, A64_ZR, 0, JTU, 0);
+            uint32_t *okl = a64_label(&b); a64_bcond(&b, A64_EQ, 0);
+            /* report: x0 (bad), this block rip, then abort */
+            a64_mov_reg(&b, 1, 1, 0);
+            a64_mov_imm64(&b, 0, rip);
+            a64_mov_imm64(&b, 16, (uint64_t)(uintptr_t)&ocerz_jgb_trap);
+            a64_blr(&b, 16);
+            a64_patch_bcond(okl, a64_label(&b));
+        }
         if (!xmm_global_enabled())
             emit_xmm_pin_load_all(&b);
         g_loop_entry = a64_label(&b);
@@ -6553,7 +6608,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         chain_tail_lbl = a64_label(&b);
         if (g_pin_class == 3) {
             /* every block shares the full layout: chain into the callee BODY
-             * (no leave/enter); fallback path stores RIP and exits normally */
+             * (no leave/enter); fallback path stores RIP and exits normally.
+             * The CALL path set x0 = STEP_OK for its epilogue branch (which is
+             * what lands here): restore the block-invariant x0 = gbase first. */
+            emit_reload_jgb(&b);
             chain_patch_b = emit_body_chain_tail(&b, g_chain_target, 0, epi_sites, &n_epi);
             chain_is_body = 1;
         } else {
