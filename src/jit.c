@@ -3128,21 +3128,23 @@ static void emit_nan_cold_packed(A64Buf *b, int dbl, int vr, int va, int vb, int
 static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int t1, int t2)
 {
     (void)t2;
-    /* hot: any NaN lane in vr?  fcmeq t1 = (vr==vr) -> 0 in NaN lanes; uminv -> 0 iff any */
+    /* hot: any NaN lane in vr?  fcmeq t1 = (vr==vr) -> all-ones per non-NaN lane;
+     * xtn narrows to 64 bits (no cross-lane reduce); == -1 iff no NaN. */
     a64_v_fcmeq(b, dbl, t1, vr, vr);
-    a64_v_uminv_4s(b, t1, t1);
-    a64_fmov_x_from_v(b, 0, JT0, t1);
+    a64_v_xtn(b, dbl ? 2 : 1, t1, t1);
+    a64_fmov_x_from_v(b, 1, JT0, t1);
+    a64_cmn_imm(b, 1, JT0, 1);                                /* Z iff all ones */
     if (g_n_nanool < NANOOL_MAX) {
         NanOolPend *o = &g_nanool[g_n_nanool++];
-        o->site = a64_label(b); a64_cbz(b, 0, JT0, 0);       /* NaN -> out of line */
+        o->site = a64_label(b); a64_bcond(b, A64_NE, 0);      /* NaN -> out of line */
         o->back = a64_label(b);
         o->dbl = (uint8_t)dbl; o->packed = 1; o->vr = (uint8_t)vr; o->va = (uint8_t)va; o->vb = (uint8_t)vb; o->t1 = (uint8_t)t1;
-        o->idx = g_cur_insn_idx; o->is_cbz = 1;
+        o->idx = g_cur_insn_idx; o->is_cbz = 0;
         return;
     }
-    uint32_t *ok = a64_label(b); a64_cbnz(b, 0, JT0, 0);
+    uint32_t *ok = a64_label(b); a64_bcond(b, A64_EQ, 0);
     emit_nan_cold_packed(b, dbl, vr, va, vb, t1);
-    a64_patch_cbz(ok, a64_label(b));
+    a64_patch_bcond(ok, a64_label(b));
 }
 
 /* Emit all pending NaN out-of-line arms (after the block body). */
@@ -3184,39 +3186,45 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     }
     if (kind == 4 || kind == 5) return 0;      /* x86 max/min NaN/zero rules: keep slow */
     int esz = dbl ? 8 : 4;
-    /* inputs: a (dst) -> VX0 copy, b (src) -> VX1 ; result -> VX2 */
-    if (!emit_sse_src(b, insn, s, packed ? 16 : esz, VX1, exit_sites, n_exits)) return 0;
+    /* Operand registers: pinned xmm operands are used in place (no copies);
+     * memory / unpinned sources go through VX1; the dst value through VX0.
+     * Result -> VX2, then written back (needed: the fix reads the inputs). */
+    int vb;
+    if (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) vb = xmm_vreg(s->reg);
+    else { if (!emit_sse_src(b, insn, s, packed ? 16 : esz, VX1, exit_sites, n_exits)) return 0; vb = VX1; }
     if (kind == 6) {
         /* sqrt: single input (b).  x86: NaN input -> quiet(b) ; negative -> default NaN */
         if (packed) {
-            a64_v_fsqrt(b, dbl, VX2, VX1);
-            emit_nan_fix_packed2(b, dbl, VX2, VX1, VX1, VX3, VX0);
+            a64_v_fsqrt(b, dbl, VX2, vb);
+            emit_nan_fix_packed2(b, dbl, VX2, vb, vb, VX3, VX0);
             emit_xmm_st(b, VX2, d->reg);
         } else {
-            a64_fsqrt_s(b, dbl, VX2, VX1);
-            emit_nan_fix_scalar2(b, dbl, VX2, VX1, VX1);
+            a64_fsqrt_s(b, dbl, VX2, vb);
+            emit_nan_fix_scalar2(b, dbl, VX2, vb, vb);
             emit_xmm_st_lo(b, esz, VX2, d->reg);
         }
         return 1;
     }
-    emit_xmm_ld(b, VX0, d->reg);
+    int va;
+    if (xmm_is_pinned(d->reg)) va = xmm_vreg(d->reg);
+    else { emit_xmm_ld(b, VX0, d->reg); va = VX0; }
     if (packed) {
         switch (kind) {
-        case 0: a64_v_fadd(b, dbl, VX2, VX0, VX1); break;
-        case 1: a64_v_fsub(b, dbl, VX2, VX0, VX1); break;
-        case 2: a64_v_fmul(b, dbl, VX2, VX0, VX1); break;
-        case 3: a64_v_fdiv(b, dbl, VX2, VX0, VX1); break;
+        case 0: a64_v_fadd(b, dbl, VX2, va, vb); break;
+        case 1: a64_v_fsub(b, dbl, VX2, va, vb); break;
+        case 2: a64_v_fmul(b, dbl, VX2, va, vb); break;
+        case 3: a64_v_fdiv(b, dbl, VX2, va, vb); break;
         }
-        emit_nan_fix_packed2(b, dbl, VX2, VX0, VX1, VX3, VX3);
+        emit_nan_fix_packed2(b, dbl, VX2, va, vb, VX3, VX3);
         emit_xmm_st(b, VX2, d->reg);
     } else {
         switch (kind) {
-        case 0: a64_fadd_s(b, dbl, VX2, VX0, VX1); break;
-        case 1: a64_fsub_s(b, dbl, VX2, VX0, VX1); break;
-        case 2: a64_fmul_s(b, dbl, VX2, VX0, VX1); break;
-        case 3: a64_fdiv_s(b, dbl, VX2, VX0, VX1); break;
+        case 0: a64_fadd_s(b, dbl, VX2, va, vb); break;
+        case 1: a64_fsub_s(b, dbl, VX2, va, vb); break;
+        case 2: a64_fmul_s(b, dbl, VX2, va, vb); break;
+        case 3: a64_fdiv_s(b, dbl, VX2, va, vb); break;
         }
-        emit_nan_fix_scalar2(b, dbl, VX2, VX0, VX1);
+        emit_nan_fix_scalar2(b, dbl, VX2, va, vb);
         emit_xmm_st_lo(b, esz, VX2, d->reg);   /* only low lane written */
     }
     return 1;
