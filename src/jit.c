@@ -3769,14 +3769,91 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
     return s->kind == OCERZ_OPK_IMM || s_mem;
 }
 
+/* Registers written by a simple instruction (for gap-fusion legality). */
+static int insn_writes_reg(const X86Insn *in, unsigned reg)
+{
+    if (in->nops == 0) return 0;
+    const X86Operand *d = &in->ops[0];
+    return d->kind == OCERZ_OPK_REG && (d->reg & 15) == (reg & 15);
+}
+/* Pure predicate: can emit_flag_neutral handle `in`?  (must be decided before
+ * any code is emitted -- exit sites etc. cannot be rolled back) */
+static int flag_neutral_ok(const X86Insn *in)
+{
+    if (g_pin_class != 3) return 0;
+    if (in->op == OCERZ_OP_LEA) {
+        /* exactly the emit_lea fast paths (which touch only pinned regs);
+         * its fallback path clobbers JT0/JT2, which may hold the record */
+        const X86Operand *d = &in->ops[0], *m = &in->ops[1];
+        if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+        if (m->kind != OCERZ_OPK_MEM || m->riprel || in->addrsize != 8 || in->seg != OCERZ_SEG_NONE) return 0;
+        if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
+        int has_idx = m->index != OCERZ_REG_NONE;
+        if (has_idx && pin_slot(m->index) < 0) return 0;
+        if (m->disp >= -4095 && m->disp <= 4095) return 1;          /* both fast paths */
+        return has_idx && m->disp == 0;
+    }
+    if (in->op == OCERZ_OP_MOV) {
+        const X86Operand *d = &in->ops[0], *s = &in->ops[1];
+        if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+        if (s->kind == OCERZ_OPK_REG) return !s->high8 && s->size == d->size;
+        return s->kind == OCERZ_OPK_IMM;
+    }
+    return 0;
+}
+/* Emit a flag-NEUTRAL instruction (host NZCV must survive): only shapes whose
+ * emitters use mov/add/lsl/ubfx/sxt* without S-forms.  Returns 0 if not safe. */
+static int emit_flag_neutral(A64Buf *b, const X86Insn *in)
+{
+    switch (in->op) {
+    case OCERZ_OP_LEA:
+        return emit_lea(b, in);                       /* add/lsl/mov only */
+    case OCERZ_OP_MOV: {
+        const X86Operand *d = &in->ops[0], *s = &in->ops[1];
+        if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+        if (s->kind == OCERZ_OPK_REG) {
+            if (s->high8 || s->size != d->size) return 0;
+            int ds = pin_slot(d->reg), ss = pin_slot(s->reg);
+            if (ds < 0 || ss < 0 || (g_pin_class == 2 && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP))) return 0;
+            if (ds != ss || d->size == 4) a64_mov_reg(b, d->size == 8, pin_hreg(ds), pin_hreg(ss));
+            return 1;
+        }
+        if (s->kind == OCERZ_OPK_IMM) {
+            int ds = pin_slot(d->reg);
+            if (ds < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+            uint64_t v = s->imm; if (d->size == 4) v &= 0xffffffffull;
+            a64_mov_imm64(b, pin_hreg(ds), v);        /* movz/movk: no flags */
+            return 1;
+        }
+        return 0;
+    }
+    default:
+        return 0;
+    }
+}
+
 static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
                              const X86Insn *jcc,
                              uint32_t **epilogue_sites, int *n_epi,
                              uint32_t **jcc_label,
-                             uint32_t **exit_sites, int *n_exits)
+                             uint32_t **exit_sites, int *n_exits,
+                             const X86Insn *gap, uint32_t **gap_label)
 {
     if (!can_fuse_cmp_test_jcc(producer, jcc, g_self_rip) || !g_defer)
         return 0;
+    /* gap fusion (cmp ; neutral ; jcc): the neutral insn must not write a
+     * register the compare read as a live record operand, and must be one of
+     * the flag-neutral shapes.  With a memory operand the record lives in JT
+     * registers, so any lea/mov register write is fine. */
+    if (gap) {
+        const X86Operand *pd = &producer->ops[0], *ps = &producer->ops[1];
+        if (pd->kind == OCERZ_OPK_REG && insn_writes_reg(gap, pd->reg)) return 0;
+        if (ps->kind == OCERZ_OPK_REG && insn_writes_reg(gap, ps->reg)) return 0;
+        /* memory-operand compares also read base/index registers */
+        const X86Operand *pm = pd->kind == OCERZ_OPK_MEM ? pd : ps->kind == OCERZ_OPK_MEM ? ps : NULL;
+        (void)pm;   /* the load happens BEFORE the gap, so later base/index writes are fine */
+        if (!flag_neutral_ok(gap)) return 0;
+    }
 
     const X86Operand *d = &producer->ops[0];
     const X86Operand *s = &producer->ops[1];
@@ -3890,6 +3967,15 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         if (!emitted)
             return 0;
         ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0);
+    }
+    if (gap) {
+        /* NZCV is live now; the record operands (JT0/JT1 or pinned regs) must
+         * survive -- guaranteed by the checks above. */
+        uint32_t *gl = a64_label(b);
+        int ok = emit_flag_neutral(b, gap);
+        assert(ok && "flag_neutral_ok admitted an unhandled shape");
+        (void)ok;
+        if (gap_label) *gap_label = gl;
     }
     *jcc_label = a64_label(b);
     int taken_cond = fused_jcc_cond(producer, jcc);
@@ -6281,12 +6367,31 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 continue;
             }
         }
+        if (n >= 3 && i == n - 3 && !g_no_jccfuse && g_defer &&
+            (insn->op == OCERZ_OP_CMP || insn->op == OCERZ_OP_TEST) &&
+            can_fuse_cmp_test_jcc(insn, &blk->insns[n - 1], rip)) {
+            /* gap fusion: cmp/test ; lea|mov ; jcc  (NZCV forwarded over the gap) */
+            uint32_t *jcc_label = NULL, *gap_label = NULL;
+            int fused = emit_cmp_test_jcc(&b, insn, &blk->insns[n - 1],
+                                          epi_sites, &n_epi, &jcc_label,
+                                          exit_sites, &n_exits,
+                                          &blk->insns[n - 2], &gap_label);
+            if (fused && jcc_label && gap_label) {
+                if (blk->insn_off) {
+                    blk->insn_off[i + 1] = (uint32_t)(gap_label - entry);
+                    blk->insn_off[i + 2] = (uint32_t)(jcc_label - entry);
+                }
+                blk->n_inlined += 3;
+                i += 2;
+                continue;
+            }
+        }
         if (fuse_pair && i == n - 2) {
             uint32_t *jcc_label = NULL;
             int fused = fuse_cmp
                 ? emit_cmp_test_jcc(&b, insn, &blk->insns[i + 1],
                                     epi_sites, &n_epi, &jcc_label,
-                                    exit_sites, &n_exits)
+                                    exit_sites, &n_exits, NULL, NULL)
                 : emit_incdec_jcc(&b, insn, &blk->insns[i + 1],
                                   epi_sites, &n_epi, &jcc_label);
             if (fused) {
