@@ -2230,11 +2230,9 @@ static int emit_lea(A64Buf *b, const X86Insn *insn)
 
 /* Compute the x86 condition `cc` from (materialized) RFLAGS into JTF as 0/1
  * and set host NZCV so that NE == condition true.  Mirrors emit_jcc. */
-static void emit_cc_predicate(A64Buf *b, unsigned cc)
+/* JTF = x86 condition `cc` (0/1) evaluated from RFLAGS (must be materialized). */
+static void emit_cc_predicate_rflags(A64Buf *b, unsigned cc)
 {
-    /* Caller must have run emit_materialize() already (it calls out to C
-     * and clobbers every JT register).  Uses JT0, JT1, JTA, JTT, JTU, JTF;
-     * JT2 is deliberately left untouched so callers can hold a value there. */
     a64_ldr(b, 8, JT0, 20, RF_OFF);
     a64_ubfx(b, 1, JT1, JT0, 0, 1);    /* CF */
     a64_ubfx(b, 1, JTA, JT0, 6, 1);    /* ZF */
@@ -2257,10 +2255,118 @@ static void emit_cc_predicate(A64Buf *b, unsigned cc)
         a64_mov_imm64(b, JTU, 1);
         a64_eor_reg(b, 1, JTF, JTF, JTU, 0);
     }
-    a64_subs_imm(b, 1, A64_ZR, JTF, 0);   /* NE <=> taken */
 }
 
-/* adc/sbb reg, reg|imm (4/8-byte): result uses current CF; flags deferred with cin. */
+/* x86 cc -> arm64 cond after `subs` (CF=!C) ; -1 = needs PF (not derivable) */
+static int cc_after_subs(unsigned cc)
+{
+    static const int t[16] = { A64_VS, A64_VC, A64_CC, A64_CS, A64_EQ, A64_NE, A64_LS, A64_HI,
+                               A64_MI, A64_PL, -1, -1, A64_LT, A64_GE, A64_LE, A64_GT };
+    return cc < 16 ? t[cc] : -1;
+}
+/* x86 cc -> arm64 cond after `ands` (CF=OF=0): B/O never, AE/NO always */
+static int cc_after_ands(unsigned cc)
+{
+    switch (cc) {
+    case OCERZ_CC_O: case OCERZ_CC_B: return A64_NV;   /* never  */
+    case OCERZ_CC_NO: case OCERZ_CC_AE: return A64_AL;  /* always */
+    case OCERZ_CC_E: return A64_EQ;  case OCERZ_CC_NE: return A64_NE;
+    case OCERZ_CC_BE: return A64_EQ; case OCERZ_CC_A: return A64_NE;   /* CF=0 -> BE==ZF, A==!ZF */
+    case OCERZ_CC_S: return A64_MI;  case OCERZ_CC_NS: return A64_PL;
+    case OCERZ_CC_L: return A64_MI;  case OCERZ_CC_GE: return A64_PL;  /* OF=0 -> SF */
+    case OCERZ_CC_LE: return A64_LE; case OCERZ_CC_G: return A64_GT;   /* Z||N ; !Z&&!N (V=0) */
+    default: return -1;                                                 /* P/NP */
+    }
+}
+
+/* Set host NZCV so that NE <=> x86 condition `cc` holds.  Fast paths
+ * evaluate a pending deferred CMP/SUB or logic record inline (recompute
+ * subs/ands on cc_src/cc_dst); anything else materializes through C and
+ * reads RFLAGS.  Uses JT0, JT1, JTA, JTT, JTU, JTF; JT2 is untouched. */
+static void emit_cc_predicate(A64Buf *b, unsigned cc)
+{
+    uint32_t *to_generic[8]; int ng = 0;
+    uint32_t *done[4]; int nd = 0;
+    int c_sub = cc_after_subs(cc), c_and = cc_after_ands(cc);
+    if (g_defer && c_sub >= 0 && c_and >= 0 && cc != OCERZ_CC_P && cc != OCERZ_CC_NP) {
+        a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
+        to_generic[ng++] = a64_label(b); a64_cbz(b, 0, JT0, 0);       /* no pending -> rflags path */
+        a64_ldr(b, 8, JT1, 20, CC_SRC_OFF);
+        a64_ldr(b, 8, JTA, 20, CC_DST_OFF);
+        /* kind = low byte, size = next byte */
+        a64_ubfx(b, 0, JTT, JT0, 8, 8);                                  /* size */
+        a64_ubfx(b, 0, JTU, JT0, 0, 8);                                  /* kind */
+        a64_ubfx(b, 0, JTF, JT0, 16, 1);                                 /* cin */
+        to_generic[ng++] = a64_label(b); a64_cbnz(b, 0, JTF, 0);         /* carry-in forms -> generic */
+        /* SUB record?  */
+        a64_subs_imm(b, 0, A64_ZR, JTU, OCERZ_CC_SUB);
+        uint32_t *not_sub = a64_label(b); a64_bcond(b, A64_NE, 0);
+        /* extend operands to size and subs (size 8 -> x-form; 4 -> w-form; 2/1 -> shifted w-form) */
+        a64_subs_imm(b, 0, A64_ZR, JTT, 8);
+        uint32_t *s8 = a64_label(b); a64_bcond(b, A64_EQ, 0);
+        a64_subs_imm(b, 0, A64_ZR, JTT, 4);
+        uint32_t *s4 = a64_label(b); a64_bcond(b, A64_EQ, 0);
+        /* size 1/2: shift left so the top bit is the sign */
+        a64_mov_imm64(b, JTF, 32);
+        a64_lsl_imm(b, 0, JTT, JTT, 3);                                  /* bits */
+        a64_sub_reg(b, 0, JTF, JTF, JTT, 0);                             /* 32-bits */
+        a64_lslv(b, 0, JT1, JT1, JTF);
+        a64_lslv(b, 0, JTA, JTA, JTF);
+        a64_subs_reg(b, 0, A64_ZR, JT1, JTA, 0);
+        done[nd++] = a64_label(b); a64_b(b, 0);
+        a64_patch_bcond(s4, a64_label(b));
+        a64_subs_reg(b, 0, A64_ZR, JT1, JTA, 0);
+        done[nd++] = a64_label(b); a64_b(b, 0);
+        a64_patch_bcond(s8, a64_label(b));
+        a64_subs_reg(b, 1, A64_ZR, JT1, JTA, 0);
+        done[nd++] = a64_label(b); a64_b(b, 0);
+        /* LOGIC record? (result already in cc_dst) */
+        a64_patch_bcond(not_sub, a64_label(b));
+        a64_subs_imm(b, 0, A64_ZR, JTU, OCERZ_CC_LOGIC);
+        to_generic[ng++] = a64_label(b); a64_bcond(b, A64_NE, 0);
+        /* set NZ from result at size: shift so sign lands in bit 31/63 */
+        a64_subs_imm(b, 0, A64_ZR, JTT, 8);
+        uint32_t *l8 = a64_label(b); a64_bcond(b, A64_EQ, 0);
+        a64_mov_imm64(b, JTF, 32);
+        a64_lsl_imm(b, 0, JTT, JTT, 3);
+        a64_sub_reg(b, 0, JTF, JTF, JTT, 0);
+        a64_lslv(b, 0, JTA, JTA, JTF);
+        a64_ands_reg(b, 0, A64_ZR, JTA, JTA, 0);
+        /* logic: condition table differs (CF=OF=0) -> materialize predicate now */
+        if (c_and == A64_AL) a64_mov_imm64(b, JTF, 1);
+        else if (c_and == A64_NV) a64_mov_imm64(b, JTF, 0);
+        else a64_cset(b, JTF, c_and);
+        uint32_t *lg_done = a64_label(b); a64_b(b, 0);
+        a64_patch_bcond(l8, a64_label(b));
+        a64_ands_reg(b, 1, A64_ZR, JTA, JTA, 0);
+        if (c_and == A64_AL) a64_mov_imm64(b, JTF, 1);
+        else if (c_and == A64_NV) a64_mov_imm64(b, JTF, 0);
+        else a64_cset(b, JTF, c_and);
+        a64_patch_b(lg_done, a64_label(b));
+        uint32_t *lg_pred = a64_label(b); a64_b(b, 0);       /* -> pred_ready */
+        /* SUB fast path lands here: predicate from c_sub */
+        for (int i = 0; i < nd; i++) a64_patch_b(done[i], a64_label(b));
+        a64_cset(b, JTF, c_sub);
+        uint32_t *sub_pred = a64_label(b); a64_b(b, 0);      /* -> pred_ready */
+        /* generic path */
+        for (int i = 0; i < ng; i++) {
+            uint32_t w = *to_generic[i];
+            if ((w & 0xff000010u) == 0x54000000u) a64_patch_bcond(to_generic[i], a64_label(b));
+            else a64_patch_cbz(to_generic[i], a64_label(b));
+        }
+        emit_materialize(b);
+        emit_cc_predicate_rflags(b, cc);                     /* JTF = predicate */
+        /* pred_ready: */
+        a64_patch_b(lg_pred, a64_label(b));
+        a64_patch_b(sub_pred, a64_label(b));
+        a64_subs_imm(b, 1, A64_ZR, JTF, 0);                  /* NE <=> taken */
+        return;
+    }
+    emit_materialize(b);
+    emit_cc_predicate_rflags(b, cc);
+    a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+}
+
 static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -2271,9 +2377,9 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
     else if (s->kind != OCERZ_OPK_IMM) return 0;
     int sf = d->size == 8;
     int is_sbb = insn->op == OCERZ_OP_SBB;
-    emit_materialize(b);                     /* need real CF */
-    a64_ldr(b, 8, JTT, 20, RF_OFF);
-    a64_ubfx(b, 1, JTT, JTT, 0, 1);          /* JTT = CF */
+    /* CF: inline from a pending cmp/sub/logic record when possible */
+    emit_cc_predicate(b, OCERZ_CC_B);        /* NE <=> CF set */
+    a64_cset(b, JTT, A64_NE);                /* JTT = CF */
     emit_gpr_rd(b, sf, JT0, d->reg);
     if (s->kind == OCERZ_OPK_REG) emit_gpr_rd(b, sf, JT1, s->reg);
     else a64_mov_imm64(b, JT1, sf ? (uint64_t)ocerz_sext(s->imm, s->size) : ((uint64_t)ocerz_sext(s->imm, s->size) & 0xffffffffull));
@@ -2585,6 +2691,8 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
+static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o,
+                             uint32_t **exit_sites, int *n_exits, uint32_t **skip_out);
 static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0];
@@ -2594,22 +2702,27 @@ static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int 
     if (g_pin_class == 2 && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP)))
         return 0;
     int sf = d->size == 8;
-    emit_materialize(b);                 /* before anything lives in JT regs */
-    /* source value -> JT2 (memory sources are loaded even when not taken, as x86 does) */
+    /* source value -> JT2 (memory sources are loaded even when not taken, as x86 does);
+     * emit_cc_predicate may call C on its generic path, which clobbers JT regs
+     * except that we reload nothing: JT2 must survive -> load the source AFTER. */
     if (s->kind == OCERZ_OPK_REG) {
         if (s->high8 || s->size != d->size)
             return 0;
-        emit_gpr_rd(b, sf, JT2, s->reg);
-    } else if (s->kind == OCERZ_OPK_MEM) {
-        if (!emit_mem_ea(b, insn, s, JTA))
-            return 0;
-        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
-        emit_guest_load_ordered(b, d->size, JT2, JTA, JTU);
-        patch_guard_skip(skip, a64_label(b));
-    } else
+    } else if (s->kind != OCERZ_OPK_MEM)
         return 0;
-    emit_cc_predicate(b, insn->cc);      /* clobbers JT0,JT1,JTT,JTU,JTF; NE = take */
+    /* predicate first (may call C), then load the source into JT2 */
+    emit_cc_predicate(b, insn->cc);      /* NE = take ; leaves NZCV */
+    a64_cset(b, JTF, A64_NE);            /* keep predicate in JTF across the loads */
+    if (s->kind == OCERZ_OPK_REG) {
+        emit_gpr_rd(b, sf, JT2, s->reg);
+    } else {
+        /* re-materialise the memory source (EA may clobber JT0/JTA; JTF survives) */
+        uint32_t *skip2;
+        if (!emit_sse_mem_addr(b, insn, s, exit_sites, n_exits, &skip2)) return 0;
+        emit_guest_load_ordered(b, d->size, JT2, JTA, JTU);
+        patch_guard_skip(skip2, a64_label(b));
+    }
+    a64_subs_imm(b, 1, A64_ZR, JTF, 0);
     emit_gpr_rd(b, sf, JT0, d->reg);
     a64_csel(b, sf, JT0, JT2, JT0, A64_NE);
     if (!sf)
@@ -2625,7 +2738,6 @@ static int emit_setcc(A64Buf *b, const X86Insn *insn)
         return 0;
     if (g_pin_class == 2 && d->reg == OCERZ_RSP)
         return 0;
-    emit_materialize(b);
     emit_cc_predicate(b, insn->cc);
     a64_cset(b, JT2, A64_NE);
     /* write low byte only, preserving the rest of the register */
@@ -3375,8 +3487,9 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
 
     const X86Operand *d = &producer->ops[0];
     const X86Operand *s = &producer->ops[1];
-    if (d->kind != OCERZ_OPK_REG || d->high8 ||
-        (d->size != 4 && d->size != 8) || s->size != d->size)
+    if (d->kind != OCERZ_OPK_REG || d->high8 || s->size != d->size)
+        return 0;
+    if (d->size != 4 && d->size != 8 && d->size != 1 && d->size != 2)
         return 0;
     if (s->kind == OCERZ_OPK_REG)
         return !s->high8;
@@ -3403,7 +3516,31 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     int record_src = JT2;
     int record_dst = JT2;
     uint32_t ccop;
-    if (producer->op == OCERZ_OP_CMP) {
+    if (d->size == 1 || d->size == 2) {
+        /* narrow: NZCV from a 32-bit op on left-shifted operands, flag record
+         * from the unshifted zero-extended values at the narrow size. */
+        int size = d->size, sh = 32 - 8 * size;
+        uint64_t mask = size == 1 ? 0xffull : 0xffffull;
+        emit_gpr_rd(b, 1, JT0, d->reg);
+        if (size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0);
+        if (s->kind == OCERZ_OPK_REG) {
+            emit_gpr_rd(b, 1, JT1, s->reg);
+            if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
+        } else
+            a64_mov_imm64(b, JT1, (uint64_t)s->imm & mask);
+        a64_lsl_imm(b, 0, JTA, JT0, sh);
+        a64_lsl_imm(b, 0, JTU, JT1, sh);
+        if (producer->op == OCERZ_OP_CMP) {
+            a64_subs_reg(b, 0, A64_ZR, JTA, JTU, 0);
+            record_src = JT0; record_dst = JT1;
+            ccop = ocerz_cc_pack(OCERZ_CC_SUB, size, 0);
+        } else {
+            a64_ands_reg(b, 0, JT2, JTA, JTU, 0);      /* NZ from shifted; result in JT2 (shifted) */
+            a64_lsr_imm(b, 0, JT2, JT2, sh);            /* unshift for the record */
+            record_src = JT2; record_dst = JT2;
+            ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0);
+        }
+    } else if (producer->op == OCERZ_OP_CMP) {
         int ds = pin_slot(d->reg);
         record_src = ds >= 0 ? 21 + ds : JT0;
         if (ds < 0)
@@ -4173,37 +4310,15 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     uint64_t taken = insn->ops[0].imm;
     uint64_t fall = insn->rip + insn->len;
 
-    emit_materialize(b);
-    a64_ldr(b, 8, JT0, 20, RF_OFF);
-    a64_ubfx(b, 1, JT1, JT0, 0, 1);
-    a64_ubfx(b, 1, JT2, JT0, 6, 1);
-    a64_ubfx(b, 1, JTT, JT0, 7, 1);
-    a64_ubfx(b, 1, JTU, JT0, 11, 1);
-
-    switch (cc >> 1) {
-    case 0: a64_mov_reg(b, 1, JTF, JTU); break;
-    case 1: a64_mov_reg(b, 1, JTF, JT1); break;
-    case 2: a64_mov_reg(b, 1, JTF, JT2); break;
-    case 3: a64_orr_reg(b, 1, JTF, JT1, JT2, 0); break;
-    case 4: a64_mov_reg(b, 1, JTF, JTT); break;
-    case 5: a64_ubfx(b, 1, JTF, JT0, 2, 1); break;
-    case 6: a64_eor_reg(b, 1, JTF, JTT, JTU, 0); break;
-    default:
-        a64_eor_reg(b, 1, JTF, JTT, JTU, 0);
-        a64_orr_reg(b, 1, JTF, JTF, JT2, 0);
-        break;
-    }
-
-    a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+    /* NZCV: NE <=> taken.  Inline evaluation of a pending cmp/test record
+     * (no C call) or, failing that, materialize + RFLAGS. */
+    emit_cc_predicate(b, cc);
     int self_loop = !g_no_chain && g_loop_entry && taken == g_self_rip;
     int two_way = !self_loop && !g_no_chain && !g_no_jcclink;
     if (!two_way) {
         a64_mov_imm64(b, JT1, fall);
         a64_mov_imm64(b, JT2, taken);
-        if (cc & 1)
-            a64_csel(b, 1, JT0, JT2, JT1, A64_EQ);
-        else
-            a64_csel(b, 1, JT0, JT2, JT1, A64_NE);
+        a64_csel(b, 1, JT0, JT2, JT1, A64_NE);   /* NE <=> taken (negation folded) */
         a64_str(b, 8, JT0, 20, RIP_OFF);
     }
 
@@ -4225,7 +4340,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         int poll_taken = taken <= g_self_rip;
         int edge_class = body_edge_pin_class();
         int body_edge = edge_class >= 0;
-        int taken_eq = (cc & 1);
+        int taken_eq = 0;   /* predicate already folds the negated forms */
         uint32_t *to_taken = a64_label(b);
         a64_bcond(b, taken_eq ? A64_EQ : A64_NE, 0);
 
