@@ -4,13 +4,36 @@
 
 static int insn_touches_memory(const X86Insn *insn)
 {
-    if (insn->op == OCERZ_OP_LEA || insn->op == OCERZ_OP_PREFETCH ||
-        insn->op == OCERZ_OP_CLFLUSH || insn->op == OCERZ_OP_NOP)
+    switch (insn->op) {
+    case OCERZ_OP_LEA: case OCERZ_OP_PREFETCH: case OCERZ_OP_CLFLUSH:
+    case OCERZ_OP_NOP:
         return 0;
+    /* implicit stack / string memory */
+    case OCERZ_OP_PUSH: case OCERZ_OP_POP: case OCERZ_OP_PUSHF: case OCERZ_OP_POPF:
+    case OCERZ_OP_CALL: case OCERZ_OP_RET: case OCERZ_OP_LEAVE:
+    case OCERZ_OP_MOVS: case OCERZ_OP_STOS: case OCERZ_OP_LODS:
+    case OCERZ_OP_SCAS: case OCERZ_OP_CMPS:
+        return 1;
+    default:
+        break;
+    }
     for (int i = 0; i < insn->nops; i++)
         if (insn->ops[i].kind == OCERZ_OPK_MEM)
             return 1;
     return 0;
+}
+
+/* Strict fault barrier: force every flag live across any memory-touching
+ * instruction so a guest signal handler would observe architecturally exact
+ * (even dead) flags in its context.  Off by default: dead flags are dead in
+ * the guest's own code, and a handler resuming/redirecting execution never
+ * assumes flag state.  Live flags are always recoverable regardless. */
+static int fault_barrier_enabled(void)
+{
+    static int en = -1;
+    if (en < 0)
+        en = getenv("OCERZ_FAULT_FLAG_BARRIER") ? 1 : 0;
+    return en;
 }
 
 static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
@@ -35,10 +58,24 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
     case OCERZ_OP_LFENCE:
     case OCERZ_OP_SFENCE:
     case OCERZ_OP_BSWAP:
-
     case OCERZ_OP_NOT:
+    case OCERZ_OP_PUSH: case OCERZ_OP_POP: case OCERZ_OP_CALL: case OCERZ_OP_RET:
+    case OCERZ_OP_LEAVE: case OCERZ_OP_XCHG: case OCERZ_OP_CBW: case OCERZ_OP_CWD:
+    case OCERZ_OP_MOVS: case OCERZ_OP_STOS: case OCERZ_OP_LODS:
+    case OCERZ_OP_CLD: case OCERZ_OP_STD:
+    case OCERZ_OP_CPUID: case OCERZ_OP_RDTSC: case OCERZ_OP_RDTSCP:
+    case OCERZ_OP_MOVSEG: case OCERZ_OP_FXSAVE: case OCERZ_OP_FXRSTOR:
+    case OCERZ_OP_LDMXCSR: case OCERZ_OP_STMXCSR: case OCERZ_OP_XGETBV:
         d = 0;
         u = 0;
+        break;
+    case OCERZ_OP_POPF:
+        d = OCERZ_FL_ALL;
+        u = 0;
+        break;
+    case OCERZ_OP_LAHF:
+        d = 0;
+        u = OCERZ_SF | OCERZ_ZF | OCERZ_AF | OCERZ_PF | OCERZ_CF;
         break;
 
     case OCERZ_OP_ADD:
@@ -138,13 +175,29 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         u = OCERZ_ZF;
         break;
 
-    default:
+    /* x87 / SSE: only the compare-into-RFLAGS forms and PTEST touch the
+     * arithmetic flags; FCMOVcc reads CF/ZF/PF.  Everything else in those
+     * ranges is flag-neutral (memory forms stay fault barriers below). */
+    case OCERZ_OP_FCOMI: case OCERZ_OP_FCOMIP:
+    case OCERZ_OP_FUCOMI: case OCERZ_OP_FUCOMIP:
+    case OCERZ_OP_PTEST:
+        d = OCERZ_FL_ALL;
+        u = 0;
+        break;
+    case OCERZ_OP_FCMOVCC:
+        d = 0;
+        u = OCERZ_CF | OCERZ_ZF | OCERZ_PF;
+        break;
 
+    default:
+        if (insn->op >= OCERZ_OP_X87_FIRST && insn->op < OCERZ_OP_COUNT) {
+            d = 0;
+            u = 0;
+        }
         break;
     }
 
-    if (fault_barrier && insn_touches_memory(insn) &&
-        !getenv("OCERZ_NO_FAULT_FLAGS"))
+    if (fault_barrier && fault_barrier_enabled() && insn_touches_memory(insn))
         u = OCERZ_FL_ALL;
 
     *def = d;
