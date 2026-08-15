@@ -184,6 +184,13 @@ static int g_plain_mem;
 
 static uint64_t g_chain_target;
 static uint32_t *g_chain_epi;
+static int g_chain_keeps_jgb;      /* the CALL path branches to the chain tail with x0 = JGB intact */
+/* RAS slot literals: `ldr Xt, <lit>` sites whose 8-byte slot cell is placed in
+ * a pool at the end of the block (patched + registered there) */
+typedef struct { uint32_t *site; uint64_t retaddr; } RasLit;
+#define RASLIT_MAX 32
+static RasLit g_raslit[RASLIT_MAX];
+static int g_n_raslit;
 
 static uint64_t g_self_rip;
 static uint32_t *g_body_entry;
@@ -5643,20 +5650,32 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
         if (!g_no_ras) {
 
-            void **slot = ras_slot_alloc();
-            if (slot) {
-                JitBlock *rb = cache_lookup(g_xlat_jit, retaddr);
-                if (rb && rb->code)
-                    *slot = ras_entry_for(rb);
-                else
-                    pending_add_ras(retaddr, slot);
+            void **slot = NULL;
+            int lit = fast3 && g_n_raslit < RASLIT_MAX;
+            if (!lit) slot = ras_slot_alloc();
+            if (slot || lit) {
+                if (slot) {
+                    JitBlock *rb = cache_lookup(g_xlat_jit, retaddr);
+                    if (rb && rb->code)
+                        *slot = ras_entry_for(rb);
+                    else
+                        pending_add_ras(retaddr, slot);
+                }
                 a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
                 a64_subs_imm(b, 0, A64_ZR, JT2, OCERZ_RAS_SIZE);
                 uint32_t *full = a64_label(b);
                 a64_bcond(b, A64_CS, 0);
                 if (!fast3) a64_mov_imm64(b, JT1, retaddr);   /* fast3: JT1 still holds it */
-                a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)slot);
-                a64_ldr(b, 8, JT0, JTA, 0);
+                if (lit) {
+                    /* ldr JT0, <pool cell> -- patched when the pool is laid out */
+                    g_raslit[g_n_raslit].site = a64_label(b);
+                    g_raslit[g_n_raslit].retaddr = retaddr;
+                    g_n_raslit++;
+                    a64_emit32(b, 0x58000000u | (uint32_t)JT0);
+                } else {
+                    a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)slot);
+                    a64_ldr(b, 8, JT0, JTA, 0);
+                }
                 a64_add_reg(b, 1, JTA, 20, JT2, 4);           /* &ras[top] (16-byte entries) */
                 a64_str(b, 8, JT1, JTA, RAS_OFF);
                 a64_str(b, 8, JT0, JTA, RAS_OFF + 8);
@@ -5759,7 +5778,14 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         return 0;
     }
 
-    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+    if (insn->op == OCERZ_OP_CALL && g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
+        g_plain_mem && jgb_usable() && !ocerz_commpage && !ocerz_low_base && !g_no_chain) {
+        /* lands on the chain tail (never the exit): x0 stays JGB, the tail's
+         * fallback sets STEP_OK itself */
+        g_chain_keeps_jgb = 1;
+    } else {
+        a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+    }
     epi_sites[*n_epi] = a64_label(b);
 
     g_chain_epi = epi_sites[*n_epi];
@@ -6609,6 +6635,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_defer = !g_no_regflags;
     blk->n_edges = 0;
     g_chain_target = 0;
+    g_chain_keeps_jgb = 0;
+    g_n_raslit = 0;
     g_chain_epi = NULL;
     g_n_jcc_edges = 0;
     g_n_oslow = 0;
@@ -7232,7 +7260,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
              * (no leave/enter); fallback path stores RIP and exits normally.
              * The CALL path set x0 = STEP_OK for its epilogue branch (which is
              * what lands here): restore the block-invariant x0 = gbase first. */
-            emit_reload_jgb(&b);
+            if (!g_chain_keeps_jgb) emit_reload_jgb(&b);
             chain_patch_b = emit_body_chain_tail(&b, g_chain_target, 0, epi_sites, &n_epi);
             chain_is_body = 1;
         } else {
@@ -7244,6 +7272,24 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         fprintf(stderr, "ocerz: FLAGLIVE rip=%#llx EMITTED words=%d guest=%d per_guest=%.2f\n",
                 (unsigned long long)rip, (int)(b.p - entry), n,
                 (double)(b.p - entry) / (double)n);
+
+    /* RAS slot literal pool: 8-byte cells after the code, ldr sites patched */
+    if (g_n_raslit && !b.overflow) {
+        if (((uintptr_t)b.p & 7) != 0) a64_emit32(&b, 0xd503201fu);   /* nop */
+        for (int i = 0; i < g_n_raslit; i++) {
+            void **cell = (void **)b.p;
+            a64_emit32(&b, 0); a64_emit32(&b, 0);
+            if (b.overflow) break;
+            int32_t off = (int32_t)((uint32_t *)cell - g_raslit[i].site);
+            *g_raslit[i].site = 0x58000000u | (((uint32_t)off & 0x7ffffu) << 5) | (uint32_t)JT0;
+            JitBlock *rb = cache_lookup(g_xlat_jit, g_raslit[i].retaddr);
+            if (rb && rb->code)
+                *cell = ras_entry_for(rb);
+            else
+                pending_add_ras(g_raslit[i].retaddr, cell);
+        }
+        g_n_raslit = 0;
+    }
 
     if (!b.overflow) {
         for (int i = 0; i < n_exits; i++)
