@@ -646,6 +646,12 @@ void a64_v_fcmeq(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4e6
 void a64_v_uminv_4s(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x6eb1a800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 /* BIT Vd, Vn, Vm : vd = (vd & ~vm) | (vn & vm)  -- insert vn where vm set */
 void a64_v_bit(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6ea01c00u, vd, vn, vm); }
+/* BIF Vd, Vn, Vm : vd = (vd & vm) | (vn & ~vm)  -- insert vn where vm clear */
+void a64_v_bif(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6ee01c00u, vd, vn, vm); }
+/* FCMGT Vd.4S/2D, Vn, Vm : all-ones per lane where n > m (false on NaN) */
+void a64_v_fcmgt(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x6ee0e400u : 0x6ea0e400u, vd, vn, vm); }
+/* FCSEL Sd/Dd, Sn, Sm, cond */
+void a64_fcsel(A64Buf *b, int dbl, int vd, int vn, int vm, int cond) { a64_emit32(b, (dbl ? 0x1e600c00u : 0x1e200c00u) | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(cond & 15) << 12) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 /* ORR Vd.4S, #imm8 shifted -- used for quieting: not general; use and/orr with const regs instead */
 /* XTN Vd.4H, Vn.4S (esz=1) / XTN Vd.2S, Vn.2D (esz=2): narrow lanes (low half) */
 void a64_v_xtn(A64Buf *b, int esz, int vd, int vn) { a64_emit32(b, 0x0e212800u | ((uint32_t)esz << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
