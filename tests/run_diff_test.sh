@@ -11,7 +11,7 @@ fail=0
 
 prog_env() {
     case "$1" in
-        interrupt_test) echo "OCERZ_TEST_ASYNC_STOP_ICOUNT=500000" ;;
+        interrupt_test) echo "OCERZ_TEST_ASYNC_STOP_MS=200" ;;
         link_spin) echo "OCERZ_TEST_ASYNC_STOP_MS=200" ;;
         *) echo "" ;;
     esac

@@ -3753,19 +3753,27 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
 
     const X86Operand *d = &producer->ops[0];
     const X86Operand *s = &producer->ops[1];
-    if (d->kind != OCERZ_OPK_REG || d->high8 || s->size != d->size)
+    if (s->size != d->size)
         return 0;
     if (d->size != 4 && d->size != 8 && d->size != 1 && d->size != 2)
         return 0;
+    int d_mem = d->kind == OCERZ_OPK_MEM, s_mem = s->kind == OCERZ_OPK_MEM;
+    if (d_mem && s_mem)
+        return 0;
+    if ((d_mem || s_mem) && producer->seg != OCERZ_SEG_NONE)
+        return 0;
+    if (!d_mem && (d->kind != OCERZ_OPK_REG || d->high8))
+        return 0;
     if (s->kind == OCERZ_OPK_REG)
         return !s->high8;
-    return s->kind == OCERZ_OPK_IMM;
+    return s->kind == OCERZ_OPK_IMM || s_mem;
 }
 
 static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
                              const X86Insn *jcc,
                              uint32_t **epilogue_sites, int *n_epi,
-                             uint32_t **jcc_label)
+                             uint32_t **jcc_label,
+                             uint32_t **exit_sites, int *n_exits)
 {
     if (!can_fuse_cmp_test_jcc(producer, jcc, g_self_rip) || !g_defer)
         return 0;
@@ -3782,14 +3790,30 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     int record_src = JT2;
     int record_dst = JT2;
     uint32_t ccop;
+    int d_mem = d->kind == OCERZ_OPK_MEM, s_mem = s->kind == OCERZ_OPK_MEM;
+    /* memory operand (at most one) -> loaded up front into JT0 (dst) or JT1 (src),
+     * zero-extended to the operand size; then treated like a register held there */
+    int d_in_jt0 = 0, s_in_jt1 = 0;
+    if (d_mem || s_mem) {
+        const X86Operand *m = d_mem ? d : s;
+        int into = d_mem ? JT0 : JT1;
+        if (!emit_mem_ea(b, producer, m, JTA)) return 0;
+        uint32_t *skip = emit_commpage_guard(b, producer, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        emit_guest_load_ordered(b, d->size, into, JTA, JTU);
+        patch_guard_skip(skip, a64_label(b));
+        if (d_mem) d_in_jt0 = 1; else s_in_jt1 = 1;
+    }
     if (d->size == 1 || d->size == 2) {
         /* narrow: NZCV from a 32-bit op on left-shifted operands, flag record
          * from the unshifted zero-extended values at the narrow size. */
         int size = d->size, sh = 32 - 8 * size;
         uint64_t mask = size == 1 ? 0xffull : 0xffffull;
-        emit_gpr_rd(b, 1, JT0, d->reg);
+        if (!d_in_jt0) emit_gpr_rd(b, 1, JT0, d->reg);
         if (size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0);
-        if (s->kind == OCERZ_OPK_REG) {
+        if (s_in_jt1) {
+            if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
+        } else if (s->kind == OCERZ_OPK_REG) {
             emit_gpr_rd(b, 1, JT1, s->reg);
             if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
         } else
@@ -3807,11 +3831,13 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0);
         }
     } else if (producer->op == OCERZ_OP_CMP) {
-        int ds = pin_slot(d->reg);
+        int ds = d_in_jt0 ? -1 : pin_slot(d->reg);
         record_src = ds >= 0 ? pin_hreg(ds) : JT0;
-        if (ds < 0)
+        if (ds < 0 && !d_in_jt0)
             emit_gpr_rd(b, sf, JT0, d->reg);
-        if (s->kind == OCERZ_OPK_REG && !s->high8) {
+        if (s_in_jt1) {
+            record_dst = JT1;
+        } else if (s->kind == OCERZ_OPK_REG && !s->high8) {
             int ss = pin_slot(s->reg);
             record_dst = ss >= 0 ? pin_hreg(ss) : JT1;
             if (ss < 0)
@@ -3828,12 +3854,15 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         a64_subs_reg(b, sf, A64_ZR, record_src, record_dst, 0);
         ccop = ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0);
     } else {
-        int ds = pin_slot(d->reg);
+        int ds = d_in_jt0 ? -1 : pin_slot(d->reg);
         int rn = ds >= 0 ? pin_hreg(ds) : JT0;
-        if (ds < 0)
+        if (ds < 0 && !d_in_jt0)
             emit_gpr_rd(b, sf, JT0, d->reg);
         int emitted = 0;
-        if (s->kind == OCERZ_OPK_IMM) {
+        if (s_in_jt1) {
+            a64_ands_reg(b, sf, JT2, rn, JT1, 0);
+            emitted = 1;
+        } else if (s->kind == OCERZ_OPK_IMM) {
             uint64_t v = s->imm;
             if (!sf)
                 v &= 0xffffffffull;
@@ -5092,24 +5121,15 @@ static void emit_indirect_leave_br(A64Buf *b, int code_reg)
     a64_br(b, code_reg);
 }
 
+/* Shared "leave the block and enter target function entry in JT0" stub for the
+ * current block layout is not shareable across pin classes; keep it inline
+ * only on the rare non-body path.  The hot path is compact: a looped hashed
+ * lookup that br's into the target BODY when it has our pin class. */
 static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
                                uint32_t **epi_sites, int *n_epi)
 {
     a64_str(b, 8, JT1, 20, RIP_OFF);
-    uint32_t *to_miss[8]; int nm = 0;
-    if (slot) {
-        a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)slot);
-        a64_ldr(b, 8, JTF, JTA, 0);                       /* slot->rip  */
-        a64_ldr(b, 8, JT0, JTA, 8);                       /* slot->code */
-        a64_sub_reg(b, 1, JTT, JTF, JT1, 0);
-        to_miss[nm++] = a64_label(b); a64_cbnz(b, 1, JTT, 0);
-        to_miss[nm++] = a64_label(b); a64_cbz(b, 1, JT0, 0);
-        emit_indirect_leave_br(b, JT0);
-    }
-    uint32_t *miss = a64_label(b);
-    for (int i = 0; i < nm; i++) a64_patch_cbz(to_miss[i], miss);
-    nm = 0;
-    /* inline hashed lookup: h = hash_rip(JT1); walk jit->buckets[h] */
+    /* hash */
     a64_lsr_imm(b, 1, JTT, JT1, 33);
     a64_eor_reg(b, 1, JTT, JTT, JT1, 0);
     a64_mov_imm64(b, JTU, 0xff51afd7ed558ccdull);
@@ -5120,50 +5140,47 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
     a64_and_reg(b, 1, JTT, JTT, JTU, 0);
     a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)g_xlat_jit->buckets);
     a64_ldr_regoff(b, 8, JTF, JTA, JTT, 1);               /* JTF = bucket head */
-    for (int k = 0; k < 4; k++) {
-        to_miss[nm++] = a64_label(b); a64_cbz(b, 1, JTF, 0);
-        a64_ldr(b, 8, JTU, JTF, (uint32_t)offsetof(JitBlock, guest_rip));
-        a64_sub_reg(b, 1, JTU, JTU, JT1, 0);
-        uint32_t *nxt = a64_label(b); a64_cbnz(b, 1, JTU, 0);
-        uint32_t *nocode = NULL, *notbody = NULL;
-        if (g_pin_class == 1 || g_pin_class == 3) {
-            /* same canonical pin layout on both sides -> jump into the body,
-             * pinned host registers stay live, no frame traffic at all. */
-            a64_ldr(b, 1, JTU, JTF, (uint32_t)offsetof(JitBlock, pin_class));
-            a64_sub_imm(b, 0, JTU, JTU, (uint32_t)g_pin_class);
-            notbody = a64_label(b); a64_cbnz(b, 0, JTU, 0);
-            a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, body_code));
-            nocode = a64_label(b); a64_cbz(b, 1, JT0, 0);
-            a64_ldr(b, 4, JTU, 20, INT_OFF);         /* interrupt poll (back edges) */
-            uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
-            emit_xmm_pin_spill_all(b);
-            a64_br(b, JT0);
-            a64_patch_cbz(intr, a64_label(b));
-            a64_patch_cbz(notbody, a64_label(b));
-            a64_patch_cbz(nocode, a64_label(b));
-        }
-        a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, code));
-        nocode = a64_label(b); a64_cbz(b, 1, JT0, 0);
-        emit_indirect_leave_br(b, JT0);
-        uint32_t *cont = a64_label(b);
-        a64_patch_cbz(nxt, cont);
-        a64_patch_cbz(nocode, cont);
-        a64_ldr(b, 8, JTF, JTF, (uint32_t)offsetof(JitBlock, hnext));
-    }
-    uint32_t *nofind = a64_label(b);
-    for (int i = 0; i < nm; i++) a64_patch_cbz(to_miss[i], nofind);
-    if (slot) {
+    /* loop: */
+    uint32_t *loop = a64_label(b);
+    uint32_t *to_nofind = a64_label(b); a64_cbz(b, 1, JTF, 0);
+    a64_ldr(b, 8, JTU, JTF, (uint32_t)offsetof(JitBlock, guest_rip));
+    a64_sub_reg(b, 1, JTU, JTU, JT1, 0);
+    uint32_t *found = a64_label(b); a64_cbz(b, 1, JTU, 0);
+    a64_ldr(b, 8, JTF, JTF, (uint32_t)offsetof(JitBlock, hnext));
+    { uint32_t *here = a64_label(b); a64_b(b, (int32_t)(loop - here)); }
+    /* found: */
+    a64_patch_cbz(found, a64_label(b));
+    uint32_t *to_full = NULL;
+    if (g_pin_class == 1 || g_pin_class == 3) {
+        a64_ldr(b, 1, JTU, JTF, (uint32_t)offsetof(JitBlock, pin_class));
+        a64_sub_imm(b, 0, JTU, JTU, (uint32_t)g_pin_class);
+        to_full = a64_label(b); a64_cbnz(b, 0, JTU, 0);
+        a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, body_code));
+        uint32_t *nobody = a64_label(b); a64_cbz(b, 1, JT0, 0);
+        a64_ldr(b, 4, JTU, 20, INT_OFF);                  /* interrupt poll (back edges) */
+        uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
         emit_xmm_pin_spill_all(b);
-        emit_spill_pinned(b);
-        a64_mov_reg(b, 1, 0, 19);
-        a64_mov_reg(b, 1, 1, 20);
-        a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)slot);
-        a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_jit_ic_fill);
-        a64_blr(b, 16);
-        emit_fill_pinned(b);
-        emit_reload_mem_base(b);
-        emit_xmm_pin_load_all(b);
+        a64_br(b, JT0);
+        a64_patch_cbz(nobody, a64_label(b));
+        a64_patch_cbz(intr, a64_label(b));
+        /* interrupt or no body: fall to the epilogue (RIP already stored) */
+        uint32_t *to_epi = a64_label(b); a64_b(b, 0);
+        a64_patch_cbz(to_full, a64_label(b));
+        /* different layout: full leave into the function entry */
+        a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, code));
+        uint32_t *nocode = a64_label(b); a64_cbz(b, 1, JT0, 0);
+        emit_indirect_leave_br(b, JT0);
+        a64_patch_cbz(nocode, a64_label(b));
+        a64_patch_b(to_epi, a64_label(b));
+    } else {
+        a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, code));
+        uint32_t *nocode = a64_label(b); a64_cbz(b, 1, JT0, 0);
+        emit_indirect_leave_br(b, JT0);
+        a64_patch_cbz(nocode, a64_label(b));
     }
+    /* not found / no code: epilogue -> dispatcher compiles it */
+    a64_patch_cbz(to_nofind, a64_label(b));
+    (void)slot;
     a64_mov_imm64(b, 0, OCERZ_STEP_OK);
     epi_sites[*n_epi] = a64_label(b);
     a64_b(b, 0);
@@ -5205,7 +5222,7 @@ static int emit_indirect_jmp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
         return 0;
     if (insn->seg != OCERZ_SEG_NONE)
         return 0;
-    emit_materialize(b);
+    if (getenv("OCERZ_EXP_MAT_IND")) emit_materialize(b);
     if (!emit_branch_target(b, insn, &insn->ops[0], exit_sites, n_exits))
         return 0;
     emit_indirect_tail(b, ic_slot_alloc(), epi_sites, n_epi);
@@ -5221,7 +5238,7 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
         return 0;
     if (insn->seg != OCERZ_SEG_NONE || !mem_native_store_ok())
         return 0;
-    emit_materialize(b);
+    if (getenv("OCERZ_EXP_MAT_IND")) emit_materialize(b);
     if (!emit_branch_target(b, insn, &insn->ops[0], exit_sites, n_exits))
         return 0;
     /* push return address (target already in JT1) */
@@ -6081,11 +6098,19 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     if (g_pin_class == 2)
         a64_add_imm(&b, 1, 29, 31, 0);
 
+    uint32_t *loop_poll_exit = NULL;
     if (!g_no_chain && !jit->stop_requested) {
         g_body_entry = a64_label(&b);
         emit_reload_mem_base(&b);
         emit_xmm_pin_load_all(&b);
         g_loop_entry = a64_label(&b);
+        /* Interrupt poll at the loop head.  Self-loops branch straight here
+         * with no C callout, and a core spinning in a tiny fully-inlined loop
+         * does not reliably observe the stop-site patch (no pipeline flush),
+         * so a 2-instruction poll is the only robust way to break out. */
+        a64_ldr(&b, 4, JT0, 20, INT_OFF);
+        loop_poll_exit = a64_label(&b);
+        a64_cbnz(&b, 0, JT0, 0);
     } else {
         emit_xmm_pin_load_all(&b);
     }
@@ -6260,7 +6285,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             uint32_t *jcc_label = NULL;
             int fused = fuse_cmp
                 ? emit_cmp_test_jcc(&b, insn, &blk->insns[i + 1],
-                                    epi_sites, &n_epi, &jcc_label)
+                                    epi_sites, &n_epi, &jcc_label,
+                                    exit_sites, &n_exits)
                 : emit_incdec_jcc(&b, insn, &blk->insns[i + 1],
                                   epi_sites, &n_epi, &jcc_label);
             if (fused) {
@@ -6334,6 +6360,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     }
     emit_ordered_slow_arms(&b, blk, entry);
     emit_nan_ool_arms(&b, blk, entry);
+    if (loop_poll_exit) {
+        /* interrupt seen at the loop head: leave with RIP = this block (OOL) */
+        uint32_t *poll_stub = a64_label(&b);
+        a64_mov_imm64(&b, JT0, rip);
+        a64_str(&b, 8, JT0, 20, RIP_OFF);
+        a64_mov_imm64(&b, 0, OCERZ_STEP_OK);
+        uint32_t *here = a64_label(&b);
+        a64_b(&b, (int32_t)(exit_label - here));
+        a64_patch_cbz(loop_poll_exit, poll_stub);
+    }
 
     uint32_t *chain_tail_lbl = NULL;
     uint32_t *chain_patch_b = NULL;
@@ -6366,10 +6402,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         if (g_stop_patch) {
             assert(g_stop_target);
             uint32_t running_insn = *g_stop_patch;
-            a64_patch_b(g_stop_patch, g_stop_target);
+            /* The stop replacement must be an UNCONDITIONAL b to stop_target
+             * whatever the site currently holds (b or b.cond): patch_b keeps
+             * the site's opcode bits, which mangles a b.cond into a
+             * branch-to-self. */
+            int32_t off = (int32_t)(g_stop_target - g_stop_patch);
             blk->stop_patch = g_stop_patch;
-            blk->stop_insn = *g_stop_patch;
-            if (!jit->stop_requested)
+            blk->stop_insn = 0x14000000u | ((uint32_t)off & 0x03ffffffu);
+            if (jit->stop_requested)
+                *g_stop_patch = blk->stop_insn;
+            else
                 *g_stop_patch = running_insn;
         }
     }
@@ -6853,6 +6895,10 @@ static int force_stop_sites_writable(OcerzJit *jit)
 {
     int patched = 0;
     for (JitBlock *b = jit->stop_blocks; b; b = b->stop_next) {
+        if (getenv("OCERZ_STOPLOG"))
+            fprintf(stderr, "ocerz: STOPSITE rip=%#llx patch=%p cur=%08x stop_insn=%08x\n",
+                    (unsigned long long)b->guest_rip, (void *)b->stop_patch,
+                    b->stop_patch ? *b->stop_patch : 0u, b->stop_insn);
         if (b->stop_patch && b->stop_insn && *b->stop_patch != b->stop_insn) {
             __atomic_store_n(b->stop_patch, b->stop_insn, __ATOMIC_RELEASE);
             patched = 1;
@@ -6898,6 +6944,11 @@ static void invalidate_all_locked(OcerzJit *jit)
     pending_clear();
     for (unsigned i = 0; i < g_ras_slot_n; i++)
         __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
+    /* inline caches of indirect branches must not keep retired code alive */
+    for (unsigned i = 0; i < g_ic_next && i < JIT_IC_SLOTS; i++) {
+        __atomic_store_n(&g_ic_slots[i].code, NULL, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_ic_slots[i].rip, 0, __ATOMIC_RELEASE);
+    }
 }
 
 void ocerz_jit_invalidate_all(struct OcerzVM *vm)
