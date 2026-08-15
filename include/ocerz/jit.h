@@ -36,6 +36,8 @@ void ocerz_jit_invalidate_all(struct OcerzVM *vm);
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len);
 
 int ocerz_jit_fault_rip(const struct OcerzVM *vm, const void *host_pc, uint64_t *out_rip);
+void ocerz_jit_fault_recover_xmm(const struct OcerzVM *vm, const void *host_pc,
+                                 const void *host_v, OcerzCPU *cpu);
 int ocerz_jit_fault_info(const struct OcerzVM *vm, const void *host_pc,
                          OcerzJitFaultInfo *out);
 

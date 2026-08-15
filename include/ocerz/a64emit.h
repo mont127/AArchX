@@ -137,6 +137,8 @@ void a64_fdiv_s(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_fmax_s(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_fmin_s(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_fsqrt_s(A64Buf *b, int dbl, int vd, int vn);
+void a64_fmov_d_d(A64Buf *b, int vd, int vn);
+void a64_fmov_s_s(A64Buf *b, int vd, int vn);
 void a64_fcmp(A64Buf *b, int dbl, int vn, int vm);
 void a64_fcvt_d2s(A64Buf *b, int vd, int vn);
 void a64_fcvt_s2d(A64Buf *b, int vd, int vn);
@@ -176,5 +178,8 @@ void a64_v_zip2(A64Buf *b, int esz, int vd, int vn, int vm);
 void a64_v_bsl(A64Buf *b, int vd, int vn, int vm);
 void a64_v_sshr_2d(A64Buf *b, int vd, int vn, int sh);
 void a64_v_sshr_4s(A64Buf *b, int vd, int vn, int sh);
+void a64_v_fcmeq(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_v_uminv_4s(A64Buf *b, int vd, int vn);
+void a64_v_bit(A64Buf *b, int vd, int vn, int vm);
 
 #endif

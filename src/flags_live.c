@@ -65,6 +65,30 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         u = OCERZ_CF;
         break;
 
+    /* SSE compares write ZF/PF/CF and clear OF/SF/AF: they define everything. */
+    case OCERZ_OP_UCOMISS:
+    case OCERZ_OP_UCOMISD:
+    case OCERZ_OP_COMISS:
+    case OCERZ_OP_COMISD:
+        d = OCERZ_FL_ALL;
+        u = 0;
+        break;
+
+    case OCERZ_OP_SETCC:
+    case OCERZ_OP_CMOVCC:
+        d = 0;
+        switch (insn->cc >> 1) {
+        case 0: u = OCERZ_OF; break;
+        case 1: u = OCERZ_CF; break;
+        case 2: u = OCERZ_ZF; break;
+        case 3: u = OCERZ_CF | OCERZ_ZF; break;
+        case 4: u = OCERZ_SF; break;
+        case 5: u = OCERZ_PF; break;
+        case 6: u = OCERZ_SF | OCERZ_OF; break;
+        default: u = OCERZ_ZF | OCERZ_SF | OCERZ_OF; break;
+        }
+        break;
+
     case OCERZ_OP_INC:
     case OCERZ_OP_DEC:
         d = OCERZ_FL_ALL & ~(uint64_t)OCERZ_CF;

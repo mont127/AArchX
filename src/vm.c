@@ -459,6 +459,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
 
             ocerz_jit_fault_recover_regs(fvm, hpc,
                 uc->uc_mcontext->__ss.__x, g_cur_cpu);
+            ocerz_jit_fault_recover_xmm(fvm, hpc,
+                uc->uc_mcontext->__ns.__v, g_cur_cpu);
             ocerz_jit_fault_recover_flags(fvm, hpc, g_cur_cpu);
         }
 
