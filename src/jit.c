@@ -253,6 +253,7 @@ static const char *ps_shape_name[9] = { "push", "pop", "test", "movsxd", "call",
                                         "jmp", "jmpind", "jmpmem" };
 
 static _Atomic unsigned long long ps_chain_ok, ps_chain_far;
+static unsigned long long ps_ras_miss, ps_ras_stale;   /* JIT-side counters (perfstat) */
 static uint64_t ps_t0;
 
 static __attribute__((noinline, cold, preserve_most)) void jit_trace_one(const X86Insn *insn)
@@ -4901,9 +4902,19 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         else
             emit_defer_flags(b, ccop, JT2, JT2);
     }
-    a64_mov_imm64(b, JT0, fall);
-    uint32_t *fall_to_common = a64_label(b);
-    a64_b(b, 0);
+    /* loop exit: chain into the fall-through block like any other edge
+     * (used to leave through the frame epilogue + dispatcher every time) */
+    {
+        int edge_class = body_edge_pin_class();
+        int body_edge = edge_class >= 0;
+        uint32_t *pb_fall = emit_static_chain_tail(
+            b, fall, fall <= g_self_rip, body_edge, epilogue_sites, n_epi);
+        g_jcc_edge[0].target_rip = fall;
+        g_jcc_edge[0].patch_b = pb_fall;
+        g_jcc_edge[0].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
+        g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
+        g_n_jcc_edges = 1;
+    }
 
     g_stop_target = a64_label(b);
     if (g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0) {
@@ -4913,9 +4924,6 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             emit_defer_flags(b, ccop, JT2, JT2);
     }
     a64_mov_imm64(b, JT0, taken);
-
-    uint32_t *common = a64_label(b);
-    a64_patch_b(fall_to_common, common);
     a64_str(b, 8, JT0, 20, RIP_OFF);
     a64_mov_imm64(b, 0, OCERZ_STEP_OK);
     epilogue_sites[*n_epi] = a64_label(b);
@@ -5560,6 +5568,18 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         a64_subs_reg(b, 1, A64_ZR, JT0, JT1, 0);
         g_stop_patch = a64_label(b);
         a64_bcond(b, A64_EQ, (int32_t)(g_loop_entry - g_stop_patch));
+        /* loop exit: chain to the fall-through block (RIP=fall already stored) */
+        {
+            int edge_class = body_edge_pin_class();
+            int body_edge = edge_class >= 0;
+            uint32_t *pb_fall = emit_static_chain_tail(
+                b, fall, fall <= g_self_rip, body_edge, epilogue_sites, n_epi);
+            g_jcc_edge[0].target_rip = fall;
+            g_jcc_edge[0].patch_b = pb_fall;
+            g_jcc_edge[0].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
+            g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
+            g_n_jcc_edges = 1;
+        }
         g_stop_target = a64_label(b);
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
         epilogue_sites[*n_epi] = a64_label(b);
@@ -5983,8 +6003,16 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
             uint32_t *miss_pop = a64_label(b);
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
+            if (ocerz_perfstat > 0) {   /* count stale (popped) misses */
+                a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_stale);
+                a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
+            }
             uint32_t *miss = a64_label(b);
             a64_patch_cbz(ras_empty, miss);
+            if (ocerz_perfstat > 0) {   /* count all misses */
+                a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_miss);
+                a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
+            }
             for (int i = 0; i < nst; i++) {
                 if ((*ras_stale[i] & 0x7f000000u) == 0x36000000u ||
                     (*ras_stale[i] & 0x7f000000u) == 0x37000000u)
@@ -8321,6 +8349,7 @@ static void ps_report(OcerzJit *jit)
                 total ? 100.0 * (double)rows[i].n / (double)total : 0.0);
     }
     {
+        fprintf(stderr, "ocerz: PERFSTAT[%d]   RAS misses=%llu (stale=%llu)\n", (int)getpid(), ps_ras_miss, ps_ras_stale);
         unsigned long long cok = ps_chain_ok, cfar = ps_chain_far, ctot = cok + cfar;
         if (ctot)
             fprintf(stderr,
