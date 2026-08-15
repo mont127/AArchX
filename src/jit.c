@@ -145,6 +145,19 @@ typedef struct {
 } OrderedSlowPend;
 #define OSLOW_MAX 64
 static OrderedSlowPend g_oslow[OSLOW_MAX];
+
+/* Out-of-line NaN fixups: the hot path branches here on a NaN result and the
+ * arm branches back.  Emitted after the block body (emit_nan_ool_arms). */
+typedef struct {
+    uint32_t *site;     /* the taken-on-NaN branch (bcond VS or cbz) to patch */
+    uint32_t *back;
+    uint8_t dbl, packed, vr, va, vb, t1;
+    int idx;
+    int is_cbz;
+} NanOolPend;
+#define NANOOL_MAX 64
+static NanOolPend g_nanool[NANOOL_MAX];
+static int g_n_nanool;
 static int g_n_oslow;
 static int g_cur_insn_idx;
 /* Static flag-producer hint for the instruction being emitted: the nearest
@@ -3022,11 +3035,9 @@ static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **ex
  * NaN, else the (negative) default NaN.  arm64 differs (SNaN priority and a
  * positive default), so results that are NaN get fixed from the INPUTS.
  * Hot path is a NaN test + not-taken branch. va/vb = inputs, vr = result. */
-static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
+/* cold: r = isnan(a) ? a|q : isnan(b) ? b|q : dflt  (scalar; result in vr) */
+static void emit_nan_cold_scalar(A64Buf *b, int dbl, int vr, int va, int vb)
 {
-    a64_fcmp(b, dbl, vr, vr);
-    uint32_t *ok = a64_label(b); a64_bcond(b, A64_VC, 0);   /* ordered = not NaN */
-    /* cold: */
     uint64_t quiet = dbl ? 0x0008000000000000ull : 0x00400000ull;
     uint64_t dflt  = dbl ? 0xfff8000000000000ull : 0xffc00000ull;
     a64_fcmp(b, dbl, va, va);
@@ -3048,6 +3059,21 @@ static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
     a64_orr_reg(b, dbl, JT0, JT0, JT1, 0);
     a64_fmov_v_from_x(b, dbl, vr, JT0);
     a64_patch_b(done, a64_label(b));
+}
+static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
+{
+    a64_fcmp(b, dbl, vr, vr);
+    if (g_n_nanool < NANOOL_MAX) {
+        NanOolPend *o = &g_nanool[g_n_nanool++];
+        o->site = a64_label(b); a64_bcond(b, A64_VS, 0);      /* NaN -> out of line */
+        o->back = a64_label(b);
+        o->dbl = (uint8_t)dbl; o->packed = 0; o->vr = (uint8_t)vr; o->va = (uint8_t)va; o->vb = (uint8_t)vb; o->t1 = 0;
+        o->idx = g_cur_insn_idx; o->is_cbz = 0;
+        return;
+    }
+    /* table full: inline cold path */
+    uint32_t *ok = a64_label(b); a64_bcond(b, A64_VC, 0);
+    emit_nan_cold_scalar(b, dbl, vr, va, vb);
     a64_patch_bcond(ok, a64_label(b));
 }
 /* Packed: per-lane exact rule.  Constants: V4/V6 = quiet bit per lane (2D/4S),
@@ -3061,16 +3087,9 @@ static void emit_pk_consts_load(A64Buf *b)
     a64_mov_imm64(b, JT0, 0x00400000ull);         a64_fmov_v_from_x(b, 0, 6, JT0); a64_v_dup_s(b, 6, 6, 0);
     a64_mov_imm64(b, JT0, 0xffc00000ull);         a64_fmov_v_from_x(b, 0, 7, JT0); a64_v_dup_s(b, 7, 7, 0);
 }
-static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int t1, int t2)
+/* cold packed: exact, lane by lane through a stack scratch area */
+static void emit_nan_cold_packed(A64Buf *b, int dbl, int vr, int va, int vb, int t1)
 {
-    (void)t2;
-    /* hot: any NaN lane in vr?  fcmeq t1 = (vr==vr) -> 0 in NaN lanes; uminv -> 0 iff any */
-    a64_v_fcmeq(b, dbl, t1, vr, vr);
-    a64_v_uminv_4s(b, t1, t1);
-    a64_fmov_x_from_v(b, 0, JT0, t1);
-    uint32_t *ok = a64_label(b); a64_cbnz(b, 0, JT0, 0);
-    /* cold, exact, lane by lane through a stack scratch area:
-     *   [sp+0]=a [sp+16]=b [sp+32]=r ; for each lane: r = isnan(a)?a|q : isnan(b)?b|q : dflt(if r NaN) */
     a64_sub_imm(b, 1, 31, 31, 48);
     a64_str_v(b, 16, va, 31, 0);
     a64_str_v(b, 16, vb, 31, 16);
@@ -3080,10 +3099,9 @@ static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int
     uint64_t dflt  = dbl ? 0xfff8000000000000ull : 0xffc00000ull;
     for (int l = 0; l < lanes; l++) {
         uint32_t oa = (uint32_t)(0 + l * esz), ob = (uint32_t)(16 + l * esz), orr_ = (uint32_t)(32 + l * esz);
-        a64_ldr(b, esz, JT0, 31, orr_);                 /* r lane bits */
         a64_ldr_v(b, esz, t1, 31, orr_);
         a64_fcmp(b, dbl, t1, t1);
-        uint32_t *lane_ok = a64_label(b); a64_bcond(b, A64_VC, 0);   /* r not NaN: keep */
+        uint32_t *lane_ok = a64_label(b); a64_bcond(b, A64_VC, 0);
         a64_ldr_v(b, esz, t1, 31, oa);
         a64_fcmp(b, dbl, t1, t1);
         uint32_t *a_ok = a64_label(b); a64_bcond(b, A64_VC, 0);
@@ -3106,7 +3124,41 @@ static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int
     }
     a64_ldr_v(b, 16, vr, 31, 32);
     a64_add_imm(b, 1, 31, 31, 48);
+}
+static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int t1, int t2)
+{
+    (void)t2;
+    /* hot: any NaN lane in vr?  fcmeq t1 = (vr==vr) -> 0 in NaN lanes; uminv -> 0 iff any */
+    a64_v_fcmeq(b, dbl, t1, vr, vr);
+    a64_v_uminv_4s(b, t1, t1);
+    a64_fmov_x_from_v(b, 0, JT0, t1);
+    if (g_n_nanool < NANOOL_MAX) {
+        NanOolPend *o = &g_nanool[g_n_nanool++];
+        o->site = a64_label(b); a64_cbz(b, 0, JT0, 0);       /* NaN -> out of line */
+        o->back = a64_label(b);
+        o->dbl = (uint8_t)dbl; o->packed = 1; o->vr = (uint8_t)vr; o->va = (uint8_t)va; o->vb = (uint8_t)vb; o->t1 = (uint8_t)t1;
+        o->idx = g_cur_insn_idx; o->is_cbz = 1;
+        return;
+    }
+    uint32_t *ok = a64_label(b); a64_cbnz(b, 0, JT0, 0);
+    emit_nan_cold_packed(b, dbl, vr, va, vb, t1);
     a64_patch_cbz(ok, a64_label(b));
+}
+
+/* Emit all pending NaN out-of-line arms (after the block body). */
+static void emit_nan_ool_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
+{
+    (void)blk; (void)entry;
+    for (int i = 0; i < g_n_nanool; i++) {
+        const NanOolPend *o = &g_nanool[i];
+        uint32_t *lo = a64_label(b);
+        if (o->is_cbz) a64_patch_cbz(o->site, lo); else a64_patch_bcond(o->site, lo);
+        if (o->packed) emit_nan_cold_packed(b, o->dbl, o->vr, o->va, o->vb, o->t1);
+        else           emit_nan_cold_scalar(b, o->dbl, o->vr, o->va, o->vb);
+        uint32_t *here = a64_label(b);
+        a64_b(b, (int32_t)(o->back - here));
+    }
+    g_n_nanool = 0;
 }
 
 /* ---- scalar / packed FP arithmetic ---- */
@@ -5726,6 +5778,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_chain_epi = NULL;
     g_n_jcc_edges = 0;
     g_n_oslow = 0;
+    g_n_nanool = 0;
     g_n_call_edges = 0;
     g_xlat_jit = jit;
     g_self_rip = rip;
@@ -6182,6 +6235,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         a64_ret(&b);
     }
     emit_ordered_slow_arms(&b, blk, entry);
+    emit_nan_ool_arms(&b, blk, entry);
 
     uint32_t *chain_tail_lbl = NULL;
     uint32_t *chain_patch_b = NULL;
