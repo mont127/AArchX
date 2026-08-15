@@ -4582,6 +4582,8 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     int test_bit = -1;
     int test_rn = -1;
     uint64_t test_mask = 0;
+    int cbz_rn = -1, cbz_sf = 0;   /* cmp x,0 + je/jne -> cbz/cbnz (no subs, record dst = xzr) */
+    int cc_is_zero_test = jcc->cc == OCERZ_CC_E || jcc->cc == OCERZ_CC_NE;
     int record_src = JT2;
     int record_dst = JT2;
     uint32_t ccop;
@@ -4620,10 +4622,14 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             rm = JT1; a64_subs_reg(b, 0, A64_ZR, rn, rm, 0);
         } else {
             uint64_t v = (uint64_t)s->imm & mask;
-            a64_mov_imm64(b, JT1, v);
-            rm = JT1;
-            if (v <= 4095) a64_subs_imm(b, 0, A64_ZR, rn, (uint32_t)v);
-            else a64_subs_reg(b, 0, A64_ZR, rn, rm, 0);
+            if (v == 0 && cc_is_zero_test) {
+                cbz_rn = rn; cbz_sf = 0; rm = A64_ZR;
+            } else {
+                a64_mov_imm64(b, JT1, v);
+                rm = JT1;
+                if (v <= 4095) a64_subs_imm(b, 0, A64_ZR, rn, (uint32_t)v);
+                else a64_subs_reg(b, 0, A64_ZR, rn, rm, 0);
+            }
         }
         record_dst = rm;
         ccop = ocerz_cc_pack(OCERZ_CC_SUB, size, 0);
@@ -4689,12 +4695,17 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             uint64_t v = s->imm;
             if (!sf)
                 v &= 0xffffffffull;
-            a64_mov_imm64(b, JT1, v);
-            record_dst = JT1;
+            if (v == 0 && cc_is_zero_test) {
+                cbz_rn = record_src; cbz_sf = sf; record_dst = A64_ZR;
+            } else {
+                a64_mov_imm64(b, JT1, v);
+                record_dst = JT1;
+            }
         } else {
             return 0;
         }
-        a64_subs_reg(b, sf, A64_ZR, record_src, record_dst, 0);
+        if (cbz_rn < 0)
+            a64_subs_reg(b, sf, A64_ZR, record_src, record_dst, 0);
         ccop = ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0);
     } else {
         int ds = d_in_jt0 ? -1 : pin_slot(d->reg);
@@ -4757,6 +4768,9 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
                 a64_tbz(b, test_rn, test_bit, 0);
             else
                 a64_tbnz(b, test_rn, test_bit, 0);
+        } else if (cbz_rn >= 0) {
+            if (jcc->cc == OCERZ_CC_E) a64_cbz(b, cbz_sf, cbz_rn, 0);
+            else                       a64_cbnz(b, cbz_sf, cbz_rn, 0);
         } else {
             a64_bcond(b, taken_cond, 0);
         }
@@ -4777,6 +4791,8 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         uint32_t *taken_label = a64_label(b);
         if (test_bit >= 0)
             a64_patch_tbz(to_taken, taken_label);
+        else if (cbz_rn >= 0)
+            a64_patch_cbz(to_taken, taken_label);
         else
             a64_patch_bcond(to_taken, taken_label);
         if (g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0) {
@@ -4808,7 +4824,11 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         return 0;
 
     g_stop_patch = a64_label(b);
-    a64_bcond(b, taken_cond, (int32_t)(g_loop_entry - g_stop_patch));
+    if (cbz_rn >= 0) {
+        if (jcc->cc == OCERZ_CC_E) a64_cbz(b, cbz_sf, cbz_rn, (int32_t)(g_loop_entry - g_stop_patch));
+        else                       a64_cbnz(b, cbz_sf, cbz_rn, (int32_t)(g_loop_entry - g_stop_patch));
+    } else
+        a64_bcond(b, taken_cond, (int32_t)(g_loop_entry - g_stop_patch));
 
     if (g_no_xlive || xlive_succ_live(g_xlat_jit, fall) != 0) {
         if (producer->op == OCERZ_OP_CMP)
