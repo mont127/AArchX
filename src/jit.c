@@ -2357,8 +2357,24 @@ static unsigned producer_record_kind(const X86Insn *p, int *size)
     case OCERZ_OP_CMP: case OCERZ_OP_SUB: *size = p->ops[0].size; return OCERZ_CC_SUB;
     case OCERZ_OP_TEST: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
         *size = p->ops[0].size; return OCERZ_CC_LOGIC;
+    case OCERZ_OP_ADD: *size = p->ops[0].size; return OCERZ_CC_ADD;
+    case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR:
+        /* constant-count register shifts defer a {val, cnt} record */
+        if (p->ops[1].kind == OCERZ_OPK_IMM && p->ops[0].kind == OCERZ_OPK_REG &&
+            (p->ops[0].size == 4 || p->ops[0].size == 8)) {
+            *size = p->ops[0].size;
+            return p->op == OCERZ_OP_SHL ? OCERZ_CC_SHL : p->op == OCERZ_OP_SHR ? OCERZ_CC_SHR : OCERZ_CC_SAR;
+        }
+        return 0;
     default: return 0;
     }
+}
+/* after `adds`: CF = C (no inversion), same table as subs otherwise except B/AE */
+static int cc_after_adds(unsigned cc)
+{
+    static const int t[16] = { A64_VS, A64_VC, A64_CS, A64_CC, A64_EQ, A64_NE, -1, -1,
+                               A64_MI, A64_PL, -1, -1, A64_LT, A64_GE, A64_LE, A64_GT };
+    return cc < 16 ? t[cc] : -1;   /* BE/A need CF|ZF: -1 (generic) */
 }
 
 static void emit_cc_predicate(A64Buf *b, unsigned cc)
@@ -2373,6 +2389,44 @@ static void emit_cc_predicate(A64Buf *b, unsigned cc)
     int c_sub = cc_after_subs(cc), c_and = cc_after_ands(cc);
     int psize = 0;
     unsigned pkind = producer_record_kind(g_flag_producer, &psize);
+    int c_add = cc_after_adds(cc);
+    /* SHIFT records: {src=val, dst=cnt}; only ZF/SF-based conditions are cheap
+     * (E/NE/S/NS/L/GE need OF too -> only E/NE/S/NS here) */
+    int shift_ok = (pkind == OCERZ_CC_SHL || pkind == OCERZ_CC_SHR || pkind == OCERZ_CC_SAR) &&
+                   (cc == OCERZ_CC_E || cc == OCERZ_CC_NE || cc == OCERZ_CC_S || cc == OCERZ_CC_NS);
+    if (g_defer && shift_ok && g_flag_producer) {
+        unsigned cnt = (unsigned)(g_flag_producer->ops[1].imm & (psize == 8 ? 63u : 31u));
+        int sf = psize == 8;
+        a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
+        uint32_t *to_rf = a64_label(b); a64_cbz(b, 0, JT0, 0);
+        a64_ldr(b, 8, JT1, 20, CC_SRC_OFF);                 /* val */
+        if (pkind == OCERZ_CC_SHL) a64_lsl_imm(b, sf, JT1, JT1, (int)cnt);
+        else if (pkind == OCERZ_CC_SHR) a64_lsr_imm(b, sf, JT1, JT1, (int)cnt);
+        else a64_asr_imm(b, sf, JT1, JT1, (int)cnt);
+        a64_ands_reg(b, sf, A64_ZR, JT1, JT1, 0);           /* Z, N of the result */
+        a64_cset(b, JTF, cc == OCERZ_CC_E ? A64_EQ : cc == OCERZ_CC_NE ? A64_NE :
+                          cc == OCERZ_CC_S ? A64_MI : A64_PL);
+        uint32_t *ready = a64_label(b); a64_b(b, 0);
+        a64_patch_cbz(to_rf, a64_label(b));
+        emit_cc_predicate_rflags(b, cc);
+        a64_patch_b(ready, a64_label(b));
+        a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+        return;
+    }
+    if (g_defer && pkind == OCERZ_CC_ADD && c_add >= 0 && (psize == 4 || psize == 8)) {
+        a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
+        uint32_t *to_rf = a64_label(b); a64_cbz(b, 0, JT0, 0);
+        a64_ldr(b, 8, JT1, 20, CC_SRC_OFF);
+        a64_ldr(b, 8, JTA, 20, CC_DST_OFF);
+        a64_adds_reg(b, psize == 8, A64_ZR, JT1, JTA, 0);
+        a64_cset(b, JTF, c_add);
+        uint32_t *ready = a64_label(b); a64_b(b, 0);
+        a64_patch_cbz(to_rf, a64_label(b));
+        emit_cc_predicate_rflags(b, cc);
+        a64_patch_b(ready, a64_label(b));
+        a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+        return;
+    }
     /* Producers that write RFLAGS eagerly (no deferred record): comis/ucomis,
      * rotates.  Flags are already current -> just read them (~8 words). */
     if (g_flag_producer && (g_flag_producer->op == OCERZ_OP_UCOMISD ||
