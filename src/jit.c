@@ -146,6 +146,10 @@ typedef struct {
 static OrderedSlowPend g_oslow[OSLOW_MAX];
 static int g_n_oslow;
 static int g_cur_insn_idx;
+/* Static flag-producer hint for the instruction being emitted: the nearest
+ * earlier instruction in the block that defines flags (NULL if flags come
+ * from outside the block).  Lets emit_cc_predicate specialize. */
+static const X86Insn *g_flag_producer;
 
 static int g_no_regflags;
 
@@ -2283,11 +2287,58 @@ static int cc_after_ands(unsigned cc)
  * evaluate a pending deferred CMP/SUB or logic record inline (recompute
  * subs/ands on cc_src/cc_dst); anything else materializes through C and
  * reads RFLAGS.  Uses JT0, JT1, JTA, JTT, JTU, JTF; JT2 is untouched. */
+/* Deferred-record kind/size the producer would leave if it went through the
+ * deferred path (0 = unknown / not a simple record). */
+static unsigned producer_record_kind(const X86Insn *p, int *size)
+{
+    if (!p) return 0;
+    switch (p->op) {
+    case OCERZ_OP_CMP: case OCERZ_OP_SUB: *size = p->ops[0].size; return OCERZ_CC_SUB;
+    case OCERZ_OP_TEST: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
+        *size = p->ops[0].size; return OCERZ_CC_LOGIC;
+    default: return 0;
+    }
+}
+
 static void emit_cc_predicate(A64Buf *b, unsigned cc)
 {
     uint32_t *to_generic[8]; int ng = 0;
     uint32_t *done[4]; int nd = 0;
     int c_sub = cc_after_subs(cc), c_and = cc_after_ands(cc);
+    int psize = 0;
+    unsigned pkind = producer_record_kind(g_flag_producer, &psize);
+    if (g_defer && pkind && cc != OCERZ_CC_P && cc != OCERZ_CC_NP &&
+        (psize == 1 || psize == 2 || psize == 4 || psize == 8) &&
+        ((pkind == OCERZ_CC_SUB && c_sub >= 0) || (pkind == OCERZ_CC_LOGIC && c_and >= 0))) {
+        /* STATIC fast path: the producer is known; only its deferred-vs-
+         * materialized state is dynamic (cc_op == 0 means flags are in RFLAGS,
+         * e.g. the producer went slow).  ~8 words on the hot path. */
+        a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
+        uint32_t *to_rf = a64_label(b); a64_cbz(b, 0, JT0, 0);
+        a64_ldr(b, 8, JT1, 20, CC_SRC_OFF);
+        a64_ldr(b, 8, JTA, 20, CC_DST_OFF);
+        int sh = psize < 4 ? 32 - 8 * psize : 0;
+        if (pkind == OCERZ_CC_SUB) {
+            if (psize == 8) a64_subs_reg(b, 1, A64_ZR, JT1, JTA, 0);
+            else if (psize == 4) a64_subs_reg(b, 0, A64_ZR, JT1, JTA, 0);
+            else { a64_lsl_imm(b, 0, JT1, JT1, sh); a64_lsl_imm(b, 0, JTA, JTA, sh);
+                   a64_subs_reg(b, 0, A64_ZR, JT1, JTA, 0); }
+            a64_cset(b, JTF, c_sub);
+        } else {
+            if (psize == 8) a64_ands_reg(b, 1, A64_ZR, JTA, JTA, 0);
+            else if (psize == 4) a64_ands_reg(b, 0, A64_ZR, JTA, JTA, 0);
+            else { a64_lsl_imm(b, 0, JTA, JTA, sh); a64_ands_reg(b, 0, A64_ZR, JTA, JTA, 0); }
+            if (c_and == A64_AL) a64_mov_imm64(b, JTF, 1);
+            else if (c_and == A64_NV) a64_mov_imm64(b, JTF, 0);
+            else a64_cset(b, JTF, c_and);
+        }
+        uint32_t *ready = a64_label(b); a64_b(b, 0);
+        a64_patch_cbz(to_rf, a64_label(b));
+        emit_cc_predicate_rflags(b, cc);            /* cc_op == 0: RFLAGS is current */
+        a64_patch_b(ready, a64_label(b));
+        a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+        return;
+    }
     if (g_defer && c_sub >= 0 && c_and >= 0 && cc != OCERZ_CC_P && cc != OCERZ_CC_NP) {
         a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
         to_generic[ng++] = a64_label(b); a64_cbz(b, 0, JT0, 0);       /* no pending -> rflags path */
@@ -5820,9 +5871,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     int n_exits = 0;
     int n_epi = 0;
 
+    int last_flag_def = -1;
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
         g_cur_insn_idx = i;
+        g_flag_producer = last_flag_def >= 0 ? &blk->insns[last_flag_def] : NULL;
+        {
+            uint64_t pdef, puse;
+            ocerz_flags_defuse(insn, &pdef, &puse);
+            if (pdef & JIT_ARITH_FLAGS)
+                last_flag_def = i;
+        }
         if (blk->insn_off)
             blk->insn_off[i] = (uint32_t)(b.p - entry);
         if (i == n - 2) {
@@ -6074,10 +6133,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             char tb[128];
             uint32_t epi = (uint32_t)(exit_label - entry);
             fprintf(g_jf, "BLOCK rip=%#llx words=%u n_insns=%d inlined=%d slow=%d"
-                          " prologue_words=%u epilogue_words=%u\n",
+                          " prologue_words=%u epilogue_words=%u pin_class=%d n_pinned=%d body=%d\n",
                     (unsigned long long)rip, blk->code_words, n,
                     blk->n_inlined, blk->n_slow, blk->insn_off[0],
-                    blk->code_words - epi);
+                    blk->code_words - epi, (int)blk->pin_class, (int)blk->n_pinned,
+                    blk->body_code != NULL);
+            for (int e = 0; e < blk->n_edges; e++)
+                fprintf(g_jf, "  EDGE -> %#llx kind=%d pin_class=%d\n",
+                        (unsigned long long)blk->edges[e].target_rip,
+                        (int)blk->edges[e].kind, (int)blk->edges[e].pin_class);
             for (int i = 0; i < n; i++) {
                 uint32_t s = blk->insn_off[i];
                 uint32_t e = (i + 1 < n) ? blk->insn_off[i + 1] : epi;
