@@ -3375,6 +3375,10 @@ static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
 static int g_pk_consts_needed;
 static void emit_pk_consts_load(A64Buf *b)
 {
+    /* the packed cold path builds its constants in GPRs on demand; V4-V7
+     * are not referenced anywhere -> this used to cost 16 words per
+     * callout return for nothing */
+    return;
     if (!g_pk_consts_needed) return;
     a64_mov_imm64(b, JT0, 0x0008000000000000ull); a64_fmov_v_from_x(b, 1, 4, JT0); a64_v_dup_d(b, 4, 4, 0);
     a64_mov_imm64(b, JT0, 0xfff8000000000000ull); a64_fmov_v_from_x(b, 1, 5, JT0); a64_v_dup_d(b, 5, 5, 0);
@@ -3457,6 +3461,211 @@ static void emit_nan_ool_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
     g_n_nanool = 0;
 }
 
+/* ---- FP batches: in-place arithmetic with a single NaN check per batch ----
+ *
+ * arm64 differs from x86 SSE only in what it does with NaNs (SNaN priority,
+ * positive default NaN); it agrees on every non-NaN result and it always
+ * propagates NaN through add/sub/mul/div/sqrt/min/max/moves.  So a run of
+ * such instructions can execute at native speed (in place, no per-op checks)
+ * as long as, before anything else can observe the values, we verify that no
+ * register the run wrote holds a NaN.  If one does, the whole run is
+ * re-executed with the exact per-op semantics from a checkpoint of the
+ * registers it overwrote (loads/moves are simply repeated; nothing else in
+ * the run has side effects).  A NaN that was overwritten before being read
+ * is unobservable, so checking the final register set is sufficient. */
+#define FPB_MAX 32
+typedef struct {
+    int first, last;          /* member insn range */
+    uint16_t ckpt;            /* regs to checkpoint (read before written) */
+    uint16_t full, s0, d0;    /* tainted regs: full 128 / lane0 float / lane0 double */
+    int gain;                 /* estimated uops saved */
+    uint32_t *site;           /* b.vs to the replay (patched later) */
+    uint32_t *back;           /* where the replay returns */
+} FpBatch;
+static FpBatch g_fpb[FPB_MAX];
+static int g_n_fpb;
+static int g_fpb_fast;        /* emitting a batch member: in place, no NaN fixups */
+static int g_fpb_disabled = -1;
+/* host ranges of replay code, merged into blk->oslow for fault mapping */
+static struct JitOslowMap g_fpbmap[JIT_MAX_BLOCK_INSNS];
+static int g_n_fpbmap;
+#define FPCKPT_OFF ((uint32_t)offsetof(OcerzCPU, fp_ckpt))
+_Static_assert(offsetof(OcerzCPU, fp_ckpt) % 16 == 0 && offsetof(OcerzCPU, fp_ckpt) + 256 <= 65520,
+               "fp_ckpt must be q-addressable");
+
+/* Classify an instruction for batching.  0: not a member (ends the batch).
+ * 1: arithmetic (taints dst).  2: full move/load. 3: lane-0 move/load. */
+static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, int *sqrt_like)
+{
+    *packed = *dbl = *from_mem = *sqrt_like = 0;
+    if (in->seg != OCERZ_SEG_NONE || in->nops < 2) return 0;
+    const X86Operand *d = &in->ops[0], *sr = &in->ops[1];
+    if (d->kind != OCERZ_OPK_XMM || !xmm_is_pinned(d->reg)) return 0;
+    if (sr->kind == OCERZ_OPK_MEM) {
+        if (sr->riprel) { *from_mem = 1; }
+        else if (in->addrsize != 8) return 0;
+        else *from_mem = 1;
+    } else if (sr->kind != OCERZ_OPK_XMM || !xmm_is_pinned(sr->reg)) return 0;
+    switch (in->op) {
+    case OCERZ_OP_ADDSS: case OCERZ_OP_SUBSS: case OCERZ_OP_MULSS: case OCERZ_OP_DIVSS:
+    case OCERZ_OP_MAXSS: case OCERZ_OP_MINSS: return 1;
+    case OCERZ_OP_ADDSD: case OCERZ_OP_SUBSD: case OCERZ_OP_MULSD: case OCERZ_OP_DIVSD:
+    case OCERZ_OP_MAXSD: case OCERZ_OP_MINSD: *dbl = 1; return 1;
+    case OCERZ_OP_ADDPS: case OCERZ_OP_SUBPS: case OCERZ_OP_MULPS: case OCERZ_OP_DIVPS:
+    case OCERZ_OP_MAXPS: case OCERZ_OP_MINPS: *packed = 1; return 1;
+    case OCERZ_OP_ADDPD: case OCERZ_OP_SUBPD: case OCERZ_OP_MULPD: case OCERZ_OP_DIVPD:
+    case OCERZ_OP_MAXPD: case OCERZ_OP_MINPD: *packed = 1; *dbl = 1; return 1;
+    case OCERZ_OP_SQRTSS: *sqrt_like = 1; return 1;
+    case OCERZ_OP_SQRTSD: *sqrt_like = 1; *dbl = 1; return 1;
+    case OCERZ_OP_SQRTPS: *sqrt_like = 1; *packed = 1; return 1;
+    case OCERZ_OP_SQRTPD: *sqrt_like = 1; *packed = 1; *dbl = 1; return 1;
+    case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU:
+        return 2;
+    case OCERZ_OP_MOVSS: return 3;
+    case OCERZ_OP_MOVSDX: *dbl = 1; return 3;
+    default: return 0;
+    }
+}
+
+/* Pre-scan a block: fill g_fpb, return per-insn batch index in `bat` (-1 none). */
+static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
+{
+    g_n_fpb = 0;
+    for (int i = 0; i < n; i++) bat[i] = -1;
+    if (g_fpb_disabled < 0) g_fpb_disabled = getenv("OCERZ_NO_FPBATCH") ? 1 : 0;
+    if (g_fpb_disabled || !sse_enabled() || !xmm_global_enabled()) return;
+    int i = 0;
+    while (i < n) {
+        int packed, dbl, from_mem, sq;
+        if (!fpb_class(&insns[i], &packed, &dbl, &from_mem, &sq)) { i++; continue; }
+        /* collect the run */
+        int j = i;
+        uint16_t written = 0, ckpt = 0, full = 0, s0 = 0, d0 = 0;
+        int gain = 0, n_arith = 0;
+        while (j < n) {
+            int c = fpb_class(&insns[j], &packed, &dbl, &from_mem, &sq);
+            if (!c) break;
+            const X86Operand *d = &insns[j].ops[0], *sr = &insns[j].ops[1];
+            unsigned dr = d->reg;
+            unsigned sbit = sr->kind == OCERZ_OPK_XMM ? (1u << sr->reg) : 0;
+            /* reads-before-writes: sources (dst is read too for arith and lane moves) */
+            uint16_t reads = (uint16_t)sbit;
+            if (c == 1 || c == 3) reads |= (uint16_t)(1u << dr);
+            if (c == 3 && from_mem) reads &= (uint16_t)~(1u << dr);   /* movss/movsd load zero-extends */
+            ckpt |= (uint16_t)(reads & ~written);
+            /* taint */
+            uint16_t st_full = (uint16_t)(full & sbit), st_s0 = (uint16_t)(s0 & sbit), st_d0 = (uint16_t)(d0 & sbit);
+            if (c == 1) {
+                if (packed) { full |= (uint16_t)(1u << dr); s0 &= (uint16_t)~(1u << dr); d0 &= (uint16_t)~(1u << dr); }
+                else if (dbl) { d0 |= (uint16_t)(1u << dr); s0 &= (uint16_t)~(1u << dr); }
+                else          { s0 |= (uint16_t)(1u << dr); d0 &= (uint16_t)~(1u << dr); }
+                /* min/max/sqrt are exact anyway; only add/sub/mul/div profit */
+                int is_minmax = insns[j].op == OCERZ_OP_MAXSS || insns[j].op == OCERZ_OP_MINSS ||
+                                insns[j].op == OCERZ_OP_MAXSD || insns[j].op == OCERZ_OP_MINSD ||
+                                insns[j].op == OCERZ_OP_MAXPS || insns[j].op == OCERZ_OP_MINPS ||
+                                insns[j].op == OCERZ_OP_MAXPD || insns[j].op == OCERZ_OP_MINPD;
+                if (!is_minmax) { gain += packed ? 6 : 2; n_arith++; }
+            } else if (c == 2) {
+                if (from_mem) { full &= (uint16_t)~(1u << dr); s0 &= (uint16_t)~(1u << dr); d0 &= (uint16_t)~(1u << dr); }
+                else {
+                    full = (uint16_t)((full & ~(1u << dr)) | (st_full ? (1u << dr) : 0));
+                    s0   = (uint16_t)((s0   & ~(1u << dr)) | (st_s0   ? (1u << dr) : 0));
+                    d0   = (uint16_t)((d0   & ~(1u << dr)) | (st_d0   ? (1u << dr) : 0));
+                }
+            } else { /* c == 3: lane-0 move */
+                if (from_mem) { full &= (uint16_t)~(1u << dr); s0 &= (uint16_t)~(1u << dr); d0 &= (uint16_t)~(1u << dr); }
+                else {
+                    /* dst keeps its upper-lane taint; lane 0 gets the source's */
+                    if (st_full) full |= (uint16_t)(1u << dr);
+                    if (dbl) { if (st_d0 || st_full) d0 |= (uint16_t)(1u << dr); s0 &= (uint16_t)~(1u << dr); }
+                    else     { if (st_s0 || st_full) s0 |= (uint16_t)(1u << dr); d0 &= (uint16_t)~(1u << dr); }
+                }
+            }
+            written |= (uint16_t)(1u << dr);
+            j++;
+        }
+        /* trim trailing non-arith members (they add nothing) */
+        int last = j - 1;
+        while (last >= i) {
+            int c = fpb_class(&insns[last], &packed, &dbl, &from_mem, &sq);
+            if (c == 1) break;
+            last--;
+        }
+        ckpt &= written;                /* only registers the run overwrites need saving */
+        int nregs = __builtin_popcount((unsigned)(full | s0 | d0));
+        int cost = __builtin_popcount((unsigned)ckpt) + 3 + nregs;
+        if (n_arith >= 1 && gain > cost && g_n_fpb < FPB_MAX && last >= i && (full | s0 | d0)) {
+            FpBatch *fb = &g_fpb[g_n_fpb];
+            fb->first = i; fb->last = last; fb->ckpt = ckpt;
+            fb->full = full; fb->s0 = s0; fb->d0 = d0; fb->gain = gain - cost;
+            fb->site = NULL; fb->back = NULL;
+            for (int k = i; k <= last; k++) bat[k] = (int8_t)g_n_fpb;
+            g_n_fpb++;
+        }
+        i = j;
+    }
+}
+
+/* Batch end: merge the tainted registers, one fcmp per class, b.vs -> replay. */
+static void fpb_emit_check(A64Buf *b, FpBatch *fb)
+{
+    int have_f = 0, have_d = 0;
+    if (fb->full) {
+        int first = -1, acc = -1;
+        for (int r = 0; r < 16; r++) if (fb->full & (1u << r)) {
+            int v = xmm_vreg((unsigned)r);
+            if (first < 0) first = v;
+            else if (acc < 0) { a64_v_fmax(b, 0, VX0, first, v); acc = VX0; }
+            else a64_v_fmax(b, 0, VX0, VX0, v);
+        }
+        a64_fmaxv_4s(b, VX1, acc >= 0 ? acc : first);   /* s1 = max over all lanes (NaN if any) */
+        have_f = 1;
+    }
+    if (fb->s0) {
+        int cur = have_f ? VX1 : -1;
+        for (int r = 0; r < 16; r++) if (fb->s0 & (1u << r)) {
+            int v = xmm_vreg((unsigned)r);
+            if (cur < 0) cur = v;
+            else { a64_fmax_s(b, 0, VX1, cur, v); cur = VX1; }
+        }
+        if (cur != VX1) { a64_fmax_s(b, 0, VX1, cur, cur); }
+        have_f = 1;
+    }
+    if (fb->d0) {
+        int cur = -1;
+        for (int r = 0; r < 16; r++) if (fb->d0 & (1u << r)) {
+            int v = xmm_vreg((unsigned)r);
+            if (cur < 0) cur = v;
+            else { a64_fmax_s(b, 1, VX2, cur, v); cur = VX2; }
+        }
+        a64_fcmp(b, 1, cur, cur);
+        have_d = 1;
+    }
+    /* one branch: with both classes, fold the double verdict into a flag-preserving path */
+    if (have_d && have_f) {
+        uint32_t *dnan = a64_label(b); a64_bcond(b, A64_VS, 0);
+        a64_fcmp(b, 0, VX1, VX1);
+        fb->site = a64_label(b); a64_bcond(b, A64_VS, 0);
+        /* the double-NaN branch needs the same target: patch to a tiny trampoline */
+        uint32_t *skip = a64_label(b); a64_b(b, 0);
+        a64_patch_bcond(dnan, a64_label(b));
+        uint32_t *tramp = a64_label(b); a64_b(b, 0);      /* -> replay (patched with site) */
+        a64_patch_b(skip, a64_label(b));
+        fb->back = a64_label(b);
+        /* remember the trampoline as a second site via the high bit trick: store in gain (unused after) */
+        fb->gain = (int)(tramp - fb->site);              /* offset from site to trampoline */
+    } else if (have_d) {
+        fb->site = a64_label(b); a64_bcond(b, A64_VS, 0);
+        fb->back = a64_label(b);
+        fb->gain = 0;
+    } else {
+        a64_fcmp(b, 0, VX1, VX1);
+        fb->site = a64_label(b); a64_bcond(b, A64_VS, 0);
+        fb->back = a64_label(b);
+        fb->gain = 0;
+    }
+}
+
 /* ---- scalar / packed FP arithmetic ---- */
 static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
@@ -3481,8 +3690,9 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     default: return 0;
     }
     int esz = dbl ? 8 : 4;
-    static int inexact_nan = -1;               /* OCERZ_INEXACT_NAN=1: arm64 NaN semantics, no fixups */
-    if (inexact_nan < 0) inexact_nan = getenv("OCERZ_INEXACT_NAN") ? 1 : 0;
+    static int inexact_env = -1;               /* OCERZ_INEXACT_NAN=1: arm64 NaN semantics, no fixups */
+    if (inexact_env < 0) inexact_env = getenv("OCERZ_INEXACT_NAN") ? 1 : 0;
+    int inexact_nan = inexact_env || g_fpb_fast; /* batch member: checked once at batch end */
     /* Operand registers: pinned xmm operands are used in place (no copies);
      * memory / unpinned sources go through VX1; the dst value through VX0.
      * Result -> VX2, then written back (needed: the fix reads the inputs). */
@@ -3491,6 +3701,11 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     else { if (!emit_sse_src(b, insn, s, packed ? 16 : esz, VX1, exit_sites, n_exits)) return 0; vb = VX1; }
     if (kind == 6) {
         /* sqrt: single input (b).  x86: NaN input -> quiet(b) ; negative -> default NaN */
+        if (inexact_nan) {
+            if (packed) { int vd = xmm_dst_reg(d->reg, VX2); a64_v_fsqrt(b, dbl, vd, vb); if (vd == VX2) emit_xmm_st(b, VX2, d->reg); }
+            else        { a64_fsqrt_s(b, dbl, VX2, vb); emit_xmm_st_lo(b, esz, VX2, d->reg); }
+            return 1;
+        }
         if (packed) {
             a64_v_fsqrt(b, dbl, VX2, vb);
             emit_nan_fix_packed2(b, dbl, VX2, vb, vb, VX3, VX0);
@@ -6215,10 +6430,15 @@ static int code_index_append_locked(OcerzJit *jit, JitBlock *block)
 
 static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
 {
-    if (g_n_oslow <= 0)
+    if (g_n_oslow <= 0 && g_n_fpbmap <= 0)
         return;
-    blk->oslow = (struct JitOslowMap *)malloc((size_t)g_n_oslow * sizeof *blk->oslow);
+    blk->oslow = (struct JitOslowMap *)malloc((size_t)(g_n_oslow + g_n_fpbmap) * sizeof *blk->oslow);
     blk->n_oslow = 0;
+    if (blk->oslow) {
+        for (int i = 0; i < g_n_fpbmap; i++)
+            blk->oslow[blk->n_oslow++] = g_fpbmap[i];
+    }
+    g_n_fpbmap = 0;
     for (int i = 0; i < g_n_oslow; i++) {
         const OrderedSlowPend *o = &g_oslow[i];
         uint32_t *lo = a64_label(b);
@@ -6656,10 +6876,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                     100.0 * (double)killed / (double)wrote);
     }
 
-    uint32_t *exit_sites[JIT_MAX_BLOCK_INSNS];
-    uint32_t *epi_sites[JIT_MAX_BLOCK_INSNS];
+    uint32_t *exit_sites[2 * JIT_MAX_BLOCK_INSNS + 64];
+    uint32_t *epi_sites[2 * JIT_MAX_BLOCK_INSNS + 64];
     int n_exits = 0;
     int n_epi = 0;
+    int8_t fpb_of[JIT_MAX_BLOCK_INSNS];
+    fpb_scan(blk->insns, n, fpb_of);
+    g_fpb_fast = 0;
+    g_n_fpbmap = 0;
+    int fpb_open = -1;
 
     int last_flag_def = -1;
     for (int i = 0; i < n; i++) {
@@ -6667,6 +6892,21 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         g_cur_insn_idx = i;
         g_cur_need = fl_need[i];
         g_cur_insns = blk->insns;
+        /* FP batch boundaries: close an open batch before the first non-member,
+         * open one (checkpoint) at its first member */
+        if (fpb_open >= 0 && (fpb_of[i] != fpb_open)) {
+            fpb_emit_check(&b, &g_fpb[fpb_open]);
+            fpb_open = -1;
+            g_fpb_fast = 0;
+        }
+        if (fpb_of[i] >= 0 && fpb_open < 0 && g_fpb[fpb_of[i]].first == i) {
+            fpb_open = fpb_of[i];
+            FpBatch *fb = &g_fpb[fpb_open];
+            for (int r = 0; r < 16; r++)
+                if (fb->ckpt & (1u << r))
+                    a64_str_v(&b, 16, xmm_vreg((unsigned)r), 20, FPCKPT_OFF + (uint32_t)r * 16);
+            g_fpb_fast = 1;
+        }
         g_flag_producer = last_flag_def >= 0 ? &blk->insns[last_flag_def] : NULL;
         {
             /* operands intact: scan intervening insns for writes to the
@@ -6821,6 +7061,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         }
     }
 
+    if (fpb_open >= 0) {
+        fpb_emit_check(&b, &g_fpb[fpb_open]);
+        fpb_open = -1;
+        g_fpb_fast = 0;
+    }
     if (!is_terminator(blk->insns[n - 1].op)) {
 
         emit_materialize(&b);
@@ -6851,6 +7096,33 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         a64_ldp_post(&b, 19, 20, 31, 16);
         a64_ldp_post(&b, 29, 30, 31, 16);
         a64_ret(&b);
+    }
+    /* FP batch replays: restore checkpoints, re-run the members exactly, return */
+    for (int k = 0; k < g_n_fpb; k++) {
+        FpBatch *fb = &g_fpb[k];
+        if (!fb->site) continue;
+        uint32_t *lbl = a64_label(&b);
+        a64_patch_bcond(fb->site, lbl);
+        if (fb->gain) a64_patch_b(fb->site + fb->gain, lbl);   /* double-class trampoline */
+        for (int r = 0; r < 16; r++)
+            if (fb->ckpt & (1u << r))
+                a64_ldr_v(&b, 16, xmm_vreg((unsigned)r), 20, FPCKPT_OFF + (uint32_t)r * 16);
+        g_fpb_fast = 0;
+        for (int m = fb->first; m <= fb->last; m++) {
+            g_cur_insn_idx = m;
+            g_cur_need = fl_need[m];
+            uint32_t *lo = a64_label(&b);
+            if (!try_inline(&b, &blk->insns[m], fl_need[m], exit_sites, &n_exits))
+                emit_slowcall(&b, &blk->insns[m], exit_sites, &n_exits);
+            if (g_n_fpbmap < JIT_MAX_BLOCK_INSNS) {
+                g_fpbmap[g_n_fpbmap].lo = (uint32_t)(lo - entry);
+                g_fpbmap[g_n_fpbmap].hi = (uint32_t)(a64_label(&b) - entry);
+                g_fpbmap[g_n_fpbmap].idx = m;
+                g_n_fpbmap++;
+            }
+        }
+        uint32_t *here = a64_label(&b);
+        a64_b(&b, (int32_t)(fb->back - here));
     }
     emit_ordered_slow_arms(&b, blk, entry);
     emit_nan_ool_arms(&b, blk, entry);
