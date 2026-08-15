@@ -367,6 +367,13 @@ void a64_cset(A64Buf *b, int rd, int cond)
     a64_emit32(b, 0x1a9f07e0u | ((uint32_t)(inv & 15) << 12) | (uint32_t)(rd & 31));
 }
 
+/* CSETM Xd, cond  == CSINV Xd, XZR, XZR, invert(cond) */
+void a64_csetm(A64Buf *b, int rd, int cond)
+{
+    int inv = A64_INV(cond);
+    a64_emit32(b, 0xda9f03e0u | ((uint32_t)(inv & 15) << 12) | (uint32_t)(rd & 31));
+}
+
 void a64_csel(A64Buf *b, int sf, int rd, int rn, int rm, int cond)
 {
     a64_emit32(b, 0x1a800000u | ((uint32_t)sf << 31) | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
@@ -502,3 +509,123 @@ void a64_ldp_off(A64Buf *b, int rt, int rt2, int rn, int imm)
 {
     a64_emit32(b, 0xa9400000u | (ldstp_imm7(imm) << 15) | ((uint32_t)(rt2 & 31) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
+
+/* ---------------- FP / SIMD (V registers) ---------------- */
+/* LDR/STR Qt, [Xn, #imm] (imm scaled by 16); size 16 -> Q, 8 -> D, 4 -> S */
+void a64_ldr_v(A64Buf *b, int size, int vt, int rn, uint32_t off)
+{
+    uint32_t base, scale;
+    if (size == 16)      { base = 0x3dc00000u; scale = 16; }
+    else if (size == 8)  { base = 0xfd400000u; scale = 8; }
+    else                 { base = 0xbd400000u; scale = 4; }
+    a64_emit32(b, base | ((off / scale) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vt & 31));
+}
+void a64_str_v(A64Buf *b, int size, int vt, int rn, uint32_t off)
+{
+    uint32_t base, scale;
+    if (size == 16)      { base = 0x3d800000u; scale = 16; }
+    else if (size == 8)  { base = 0xfd000000u; scale = 8; }
+    else                 { base = 0xbd000000u; scale = 4; }
+    a64_emit32(b, base | ((off / scale) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vt & 31));
+}
+/* LDUR/STUR Qt/Dt/St, [Xn, #simm9] -- unscaled, for arbitrary offsets */
+void a64_ldur_v(A64Buf *b, int size, int vt, int rn, int32_t simm9)
+{
+    uint32_t base = size == 16 ? 0x3cc00000u : size == 8 ? 0xfc400000u : 0xbc400000u;
+    a64_emit32(b, base | (((uint32_t)simm9 & 0x1ffu) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vt & 31));
+}
+void a64_stur_v(A64Buf *b, int size, int vt, int rn, int32_t simm9)
+{
+    uint32_t base = size == 16 ? 0x3c800000u : size == 8 ? 0xfc000000u : 0xbc000000u;
+    a64_emit32(b, base | (((uint32_t)simm9 & 0x1ffu) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vt & 31));
+}
+/* scalar FP arithmetic: type 0 = single, 1 = double */
+static void fp2(A64Buf *b, uint32_t opc, int dbl, int vd, int vn, int vm)
+{
+    a64_emit32(b, 0x1e200800u | ((uint32_t)dbl << 22) | ((uint32_t)(vm & 31) << 16) | (opc << 12) |
+               ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
+}
+void a64_fadd_s(A64Buf *b, int dbl, int vd, int vn, int vm) { fp2(b, 0x2, dbl, vd, vn, vm); }
+void a64_fsub_s(A64Buf *b, int dbl, int vd, int vn, int vm) { fp2(b, 0x3, dbl, vd, vn, vm); }
+void a64_fmul_s(A64Buf *b, int dbl, int vd, int vn, int vm) { fp2(b, 0x0, dbl, vd, vn, vm); }
+void a64_fdiv_s(A64Buf *b, int dbl, int vd, int vn, int vm) { fp2(b, 0x1, dbl, vd, vn, vm); }
+void a64_fmax_s(A64Buf *b, int dbl, int vd, int vn, int vm) { fp2(b, 0x4, dbl, vd, vn, vm); }
+void a64_fmin_s(A64Buf *b, int dbl, int vd, int vn, int vm) { fp2(b, 0x5, dbl, vd, vn, vm); }
+void a64_fsqrt_s(A64Buf *b, int dbl, int vd, int vn)
+{
+    a64_emit32(b, 0x1e21c000u | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
+}
+/* FCMP Sn/Dn, Sm/Dm  (sets NZCV) */
+void a64_fcmp(A64Buf *b, int dbl, int vn, int vm)
+{
+    a64_emit32(b, 0x1e202000u | ((uint32_t)dbl << 22) | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(vn & 31) << 5));
+}
+/* FCVT: double<->single  (fcvt Sd, Dn : opc=00 type=01 ; fcvt Dd, Sn : opc=01 type=00) */
+void a64_fcvt_d2s(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x1e624000u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_fcvt_s2d(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x1e22c000u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+/* FCVTZS Xd/Wd, Sn/Dn : truncating float->int */
+void a64_fcvtzs(A64Buf *b, int sf, int dbl, int rd, int vn)
+{
+    a64_emit32(b, 0x1e380000u | ((uint32_t)sf << 31) | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31));
+}
+/* SCVTF Sd/Dd, Xn/Wn : int->float */
+void a64_scvtf(A64Buf *b, int sf, int dbl, int vd, int rn)
+{
+    a64_emit32(b, 0x1e220000u | ((uint32_t)sf << 31) | ((uint32_t)dbl << 22) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vd & 31));
+}
+/* FMOV Xd, Dn / FMOV Dd, Xn / FMOV Wd, Sn / FMOV Sd, Wn */
+void a64_fmov_x_from_v(A64Buf *b, int sf, int rd, int vn)   /* sf=1: X<-D ; sf=0: W<-S */
+{
+    a64_emit32(b, (sf ? 0x9e660000u : 0x1e260000u) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31));
+}
+void a64_fmov_v_from_x(A64Buf *b, int sf, int vd, int rn)   /* sf=1: D<-X ; sf=0: S<-W */
+{
+    a64_emit32(b, (sf ? 0x9e670000u : 0x1e270000u) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vd & 31));
+}
+/* Vector (128-bit) ops on Vd.16B/4S/2D */
+static void v3(A64Buf *b, uint32_t base, int vd, int vn, int vm)
+{
+    a64_emit32(b, base | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
+}
+void a64_v_fadd(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4e60d400u : 0x4e20d400u, vd, vn, vm); }
+void a64_v_fsub(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4ee0d400u : 0x4ea0d400u, vd, vn, vm); }
+void a64_v_fmul(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x6e60dc00u : 0x6e20dc00u, vd, vn, vm); }
+void a64_v_fdiv(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x6e60fc00u : 0x6e20fc00u, vd, vn, vm); }
+void a64_v_fmax(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4e60f400u : 0x4e20f400u, vd, vn, vm); }
+void a64_v_fmin(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4ee0f400u : 0x4ea0f400u, vd, vn, vm); }
+void a64_v_fsqrt(A64Buf *b, int dbl, int vd, int vn) { v3(b, dbl ? 0x6ee1f800u : 0x6ea1f800u, vd, vn, 0); }
+void a64_v_and(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x4e201c00u, vd, vn, vm); }
+void a64_v_orr(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x4ea01c00u, vd, vn, vm); }
+void a64_v_eor(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6e201c00u, vd, vn, vm); }
+void a64_v_bic(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x4e601c00u, vd, vn, vm); }   /* vd = vn & ~vm */
+void a64_v_mov(A64Buf *b, int vd, int vn) { v3(b, 0x4ea01c00u, vd, vn, vn); }            /* orr vd, vn, vn */
+/* integer vector add/sub: esz 0=B 1=H 2=S 3=D */
+void a64_v_add(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e208400u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_sub(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e208400u | ((uint32_t)esz << 22), vd, vn, vm); }
+/* MOVI Vd.2D, #0  (zero a vector register) */
+void a64_v_zero(A64Buf *b, int vd) { a64_emit32(b, 0x6f00e400u | (uint32_t)(vd & 31)); }
+/* INS Vd.D[idx], Xn ; UMOV Xd, Vn.D[idx] ; INS Vd.D[i1], Vn.D[i2] */
+void a64_ins_d_x(A64Buf *b, int vd, int idx, int rn) { a64_emit32(b, 0x4e081c00u | ((uint32_t)(idx & 1) << 20) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_umov_x_d(A64Buf *b, int rd, int vn, int idx) { a64_emit32(b, 0x4e083c00u | ((uint32_t)(idx & 1) << 20) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31)); }
+void a64_ins_d_d(A64Buf *b, int vd, int i1, int vn, int i2) { a64_emit32(b, 0x6e080400u | ((uint32_t)(i1 & 1) << 20) | ((uint32_t)(i2 & 1) << 14) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_ins_s_s(A64Buf *b, int vd, int i1, int vn, int i2) { a64_emit32(b, 0x6e040400u | ((uint32_t)(i1 & 3) << 19) | ((uint32_t)(i2 & 3) << 13) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+/* FCVTL Vd.2D, Vn.2S (low half) ; FCVTN Vd.2S, Vn.2D */
+void a64_v_fcvtl(A64Buf *b, int vd, int vn) { v3(b, 0x0e617800u, vd, vn, 0); }
+void a64_v_fcvtn(A64Buf *b, int vd, int vn) { v3(b, 0x0e616800u, vd, vn, 0); }
+/* SCVTF Vd.4S, Vn.4S (int->float, vector) ; FCVTZS Vd.4S, Vn.4S */
+void a64_v_scvtf_4s(A64Buf *b, int vd, int vn) { v3(b, 0x4e21d800u, vd, vn, 0); }
+void a64_v_fcvtzs_4s(A64Buf *b, int vd, int vn) { v3(b, 0x4ea1b800u, vd, vn, 0); }
+/* CMEQ/CMGT integer vector (esz as above) */
+void a64_v_cmeq(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e208c00u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_cmgt(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e203400u | ((uint32_t)esz << 22), vd, vn, vm); }
+/* DUP Vd.2D, Vn.D[idx] ; DUP Vd.4S, Vn.S[idx] */
+void a64_v_dup_d(A64Buf *b, int vd, int vn, int idx) { a64_emit32(b, 0x4e080400u | ((uint32_t)(idx & 1) << 20) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_dup_s(A64Buf *b, int vd, int vn, int idx) { a64_emit32(b, 0x4e040400u | ((uint32_t)(idx & 3) << 19) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+/* ZIP1/ZIP2/UZP1/UZP2/TRN Vd.2D  (esz=3), Vd.4S (esz=2) */
+void a64_v_zip1(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e003800u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_zip2(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e007800u | ((uint32_t)esz << 22), vd, vn, vm); }
+/* BSL Vd.16B, Vn, Vm  (bitwise select: vd = (vd & vn) | (~vd & vm)) */
+void a64_v_bsl(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6e601c00u, vd, vn, vm); }
+/* SSHR Vd.2D/#imm ; SSHR Vd.4S ; used for sign masks (arith shift right) */
+void a64_v_sshr_2d(A64Buf *b, int vd, int vn, int sh) { a64_emit32(b, 0x4f400400u | ((uint32_t)(128 - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_sshr_4s(A64Buf *b, int vd, int vn, int sh) { a64_emit32(b, 0x4f200400u | ((uint32_t)(64 - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }

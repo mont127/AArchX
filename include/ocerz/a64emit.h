@@ -92,6 +92,7 @@ void a64_sxth(A64Buf *b, int sf, int rd, int rn);
 void a64_sxtw(A64Buf *b, int rd, int rn);
 
 void a64_cset(A64Buf *b, int rd, int cond);
+void a64_csetm(A64Buf *b, int rd, int cond);
 void a64_csel(A64Buf *b, int sf, int rd, int rn, int rm, int cond);
 
 void a64_mul(A64Buf *b, int sf, int rd, int rn, int rm);
@@ -119,5 +120,58 @@ void a64_stp_pre(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_ldp_post(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_stp_off(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_ldp_off(A64Buf *b, int rt, int rt2, int rn, int imm);
+
+
+/* FP / SIMD */
+void a64_ldr_v(A64Buf *b, int size, int vt, int rn, uint32_t off);
+void a64_str_v(A64Buf *b, int size, int vt, int rn, uint32_t off);
+void a64_ldur_v(A64Buf *b, int size, int vt, int rn, int32_t simm9);
+void a64_stur_v(A64Buf *b, int size, int vt, int rn, int32_t simm9);
+void a64_fadd_s(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_fsub_s(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_fmul_s(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_fdiv_s(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_fmax_s(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_fmin_s(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_fsqrt_s(A64Buf *b, int dbl, int vd, int vn);
+void a64_fcmp(A64Buf *b, int dbl, int vn, int vm);
+void a64_fcvt_d2s(A64Buf *b, int vd, int vn);
+void a64_fcvt_s2d(A64Buf *b, int vd, int vn);
+void a64_fcvtzs(A64Buf *b, int sf, int dbl, int rd, int vn);
+void a64_scvtf(A64Buf *b, int sf, int dbl, int vd, int rn);
+void a64_fmov_x_from_v(A64Buf *b, int sf, int rd, int vn);
+void a64_fmov_v_from_x(A64Buf *b, int sf, int vd, int rn);
+void a64_v_fadd(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_v_fsub(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_v_fmul(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_v_fdiv(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_v_fmax(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_v_fmin(A64Buf *b, int dbl, int vd, int vn, int vm);
+void a64_v_fsqrt(A64Buf *b, int dbl, int vd, int vn);
+void a64_v_and(A64Buf *b, int vd, int vn, int vm);
+void a64_v_orr(A64Buf *b, int vd, int vn, int vm);
+void a64_v_eor(A64Buf *b, int vd, int vn, int vm);
+void a64_v_bic(A64Buf *b, int vd, int vn, int vm);
+void a64_v_mov(A64Buf *b, int vd, int vn);
+void a64_v_add(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_sub(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_zero(A64Buf *b, int vd);
+void a64_ins_d_x(A64Buf *b, int vd, int idx, int rn);
+void a64_umov_x_d(A64Buf *b, int rd, int vn, int idx);
+void a64_ins_d_d(A64Buf *b, int vd, int i1, int vn, int i2);
+void a64_ins_s_s(A64Buf *b, int vd, int i1, int vn, int i2);
+void a64_v_fcvtl(A64Buf *b, int vd, int vn);
+void a64_v_fcvtn(A64Buf *b, int vd, int vn);
+void a64_v_scvtf_4s(A64Buf *b, int vd, int vn);
+void a64_v_fcvtzs_4s(A64Buf *b, int vd, int vn);
+void a64_v_cmeq(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_cmgt(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_dup_d(A64Buf *b, int vd, int vn, int idx);
+void a64_v_dup_s(A64Buf *b, int vd, int vn, int idx);
+void a64_v_zip1(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_zip2(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_bsl(A64Buf *b, int vd, int vn, int vm);
+void a64_v_sshr_2d(A64Buf *b, int vd, int vn, int sh);
+void a64_v_sshr_4s(A64Buf *b, int vd, int vn, int sh);
 
 #endif
