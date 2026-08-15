@@ -92,6 +92,8 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
 
     case OCERZ_OP_MUL:
     case OCERZ_OP_IMUL:
+    case OCERZ_OP_DIV:      /* flags undefined after div/idiv: nothing may read them */
+    case OCERZ_OP_IDIV:
         d = OCERZ_FL_ALL;
         u = 0;
         break;
