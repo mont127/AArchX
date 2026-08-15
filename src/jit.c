@@ -2013,10 +2013,12 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         int hi = pin_hreg(pin_slot(m->index));
         int sc = m->scale & 3;
         int want = size == 16 ? 4 : size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
-        if (m->disp == 0 && (sc == 0 || sc == want)) {
-            /* register-offset form (scales by the access size only) */
+        if ((m->disp == 0 || (hoisted && m->disp == g_mem_hoist_aux_disp && m->disp != 0)) &&
+            (sc == 0 || sc == want)) {
+            /* register-offset form (scales by the access size only); the
+             * hoisted aux base already includes the block's common displacement */
             int ra = JTA;
-            if (hoisted) ra = JMEMBASE; else a64_add_reg(b, 1, JTA, JGB, hb, 0);
+            if (hoisted) ra = m->disp ? JMEMAUX : JMEMBASE; else a64_add_reg(b, 1, JTA, JGB, hb, 0);
             if (vec) { if (store) a64_str_v_regoff(b, size, reg, ra, hi, sc != 0); else a64_ldr_v_regoff(b, size, reg, ra, hi, sc != 0); }
             else     { if (store) a64_str_regoff(b, size, reg, ra, hi, sc != 0); else a64_ldr_regoff(b, size, reg, ra, hi, sc != 0); }
             return 1;
