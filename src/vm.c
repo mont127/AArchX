@@ -351,6 +351,36 @@ static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
         __atomic_or_fetch(&g_pending_async_mask, 1u << sig, __ATOMIC_SEQ_CST);
 }
 
+/* Mirror a guest sigaction() onto the host for plain asynchronous signals.
+ * The guest table alone is not enough: the HOST kernel decides what SIGPIPE
+ * (write to a closed pipe) does to the process, and its default is to kill
+ * it silently.  wineserver ignores SIGPIPE and relies on EPIPE; without
+ * this mirror the whole server vanished the first time a client died with
+ * a reply in flight.  kind: 0 = SIG_DFL, 1 = SIG_IGN, 2 = guest handler
+ * (delivered through the pending-async mask like SIGQUIT/SIGUSR1). */
+void ocerz_vm_mirror_host_signal(int sig, int kind)
+{
+    switch (sig) {
+    case SIGPIPE: case SIGHUP: case SIGINT: case SIGTERM: case SIGALRM:
+    case SIGCHLD: case SIGWINCH: case SIGURG: case SIGIO: case SIGVTALRM:
+    case SIGPROF: case SIGXCPU: case SIGXFSZ: case SIGTSTP: case SIGTTIN:
+    case SIGTTOU: case SIGCONT: case SIGINFO:
+        break;
+    default:
+        return;  /* SEGV/BUS/USR1/USR2/QUIT/ILL/TRAP/FPE/ABRT: ocerz owns these */
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    if (kind == 1)
+        sa.sa_handler = SIG_IGN;
+    else if (kind == 2) {
+        sa.sa_sigaction = async_sig_handler;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESTART;
+    } else
+        sa.sa_handler = SIG_DFL;
+    sigaction(sig, &sa, NULL);
+}
+
 static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)sig; (void)si; (void)ctx;
