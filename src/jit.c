@@ -3146,6 +3146,23 @@ static int emit_sse_src(A64Buf *b, const X86Insn *insn, const X86Operand *o, int
     return 0;
 }
 
+/* Resolve operand `o` to a V register holding its value: a pinned xmm is
+ * returned in place (no copy); memory (or unpinned) is loaded into vtmp.
+ * Returns the register, or -1 on failure. */
+static int emit_sse_src_reg(A64Buf *b, const X86Insn *insn, const X86Operand *o, int size,
+                            int vtmp, uint32_t **exit_sites, int *n_exits)
+{
+    if (o->kind == OCERZ_OPK_XMM && xmm_is_pinned(o->reg))
+        return xmm_vreg(o->reg);
+    if (!emit_sse_src(b, insn, o, size, vtmp, exit_sites, n_exits))
+        return -1;
+    return vtmp;
+}
+static inline int xmm_dst_reg(unsigned xr, int vtmp)   /* where to compute a full-width result */
+{
+    return xmm_is_pinned(xr) ? xmm_vreg(xr) : vtmp;
+}
+
 static int sse_enabled(void)
 {
     static int on = -1;
@@ -3438,23 +3455,26 @@ static int emit_sse_bitwise(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     }
     /* pxor x,x -> zero (very common idiom) */
     if (kind == 0 && s->kind == OCERZ_OPK_XMM && s->reg == d->reg) {
-        a64_v_zero(b, VX0);
-        emit_xmm_st(b, VX0, d->reg);
+        int vd = xmm_dst_reg(d->reg, VX0);
+        a64_v_zero(b, vd);
+        if (vd == VX0) emit_xmm_st(b, VX0, d->reg);
         return 1;
     }
-    if (!emit_sse_src(b, insn, s, 16, VX1, exit_sites, n_exits)) return 0;
-    emit_xmm_ld(b, VX0, d->reg);
+    int vb = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
+    if (vb < 0) return 0;
+    int vd = xmm_dst_reg(d->reg, VX0);
+    if (vd == VX0) emit_xmm_ld(b, VX0, d->reg);
     switch (kind) {
-    case 0: a64_v_eor(b, VX0, VX0, VX1); break;
-    case 1: a64_v_and(b, VX0, VX0, VX1); break;
-    case 2: a64_v_orr(b, VX0, VX0, VX1); break;
-    case 3: a64_v_bic(b, VX0, VX1, VX0); break;    /* s & ~d */
-    case 4: a64_v_add(b, esz, VX0, VX0, VX1); break;
-    case 5: a64_v_sub(b, esz, VX0, VX0, VX1); break;
-    case 6: a64_v_cmeq(b, esz, VX0, VX0, VX1); break;
-    case 7: a64_v_cmgt(b, esz, VX0, VX0, VX1); break;
+    case 0: a64_v_eor(b, vd, vd, vb); break;
+    case 1: a64_v_and(b, vd, vd, vb); break;
+    case 2: a64_v_orr(b, vd, vd, vb); break;
+    case 3: a64_v_bic(b, vd, vb, vd); break;    /* s & ~d */
+    case 4: a64_v_add(b, esz, vd, vd, vb); break;
+    case 5: a64_v_sub(b, esz, vd, vd, vb); break;
+    case 6: a64_v_cmeq(b, esz, vd, vd, vb); break;
+    case 7: a64_v_cmgt(b, esz, vd, vd, vb); break;
     }
-    emit_xmm_st(b, VX0, d->reg);
+    if (vd == VX0) emit_xmm_st(b, VX0, d->reg);
     return 1;
 }
 
@@ -3469,9 +3489,11 @@ static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
      * dead -- drop it instead of materializing it. */
     if (g_defer)
         a64_str(b, 4, A64_ZR, 20, CC_OP_OFF);
-    if (!emit_sse_src(b, insn, s, esz, VX1, exit_sites, n_exits)) return 0;
-    emit_xmm_ld_lo(b, esz, VX0, d->reg);
-    a64_fcmp(b, dbl, VX0, VX1);
+    int vb = emit_sse_src_reg(b, insn, s, esz, VX1, exit_sites, n_exits);
+    if (vb < 0) return 0;
+    int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
+    if (va == VX0) emit_xmm_ld_lo(b, esz, VX0, d->reg);
+    a64_fcmp(b, dbl, va, vb);              /* scalar fcmp reads the low lane only */
     /* arm64 after fcmp: unordered -> N=0,Z=0,C=1,V=1 ; a<b -> N=1 ; a==b -> Z=1,C=1 ; a>b -> C=1
      * x86: unordered -> ZF=PF=CF=1 ; a<b -> CF=1 ; a==b -> ZF=1 ; a>b -> all 0 */
     a64_ldr(b, 8, JTT, 20, RF_OFF);
@@ -3604,18 +3626,22 @@ static int emit_sse_unpck(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_XMM) return 0;
-    if (!emit_sse_src(b, insn, s, 16, VX1, exit_sites, n_exits)) return 0;
-    emit_xmm_ld(b, VX0, d->reg);
+    int vb = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
+    if (vb < 0) return 0;
+    int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
+    if (va == VX0) emit_xmm_ld(b, VX0, d->reg);
+    int vd = xmm_dst_reg(d->reg, VX2);
     switch (insn->op) {
-    case OCERZ_OP_UNPCKLPD: case OCERZ_OP_MOVLHPS: a64_v_zip1(b, 3, VX2, VX0, VX1); break; /* {d.lo, s.lo} */
-    case OCERZ_OP_UNPCKHPD:                        a64_v_zip2(b, 3, VX2, VX0, VX1); break; /* {d.hi, s.hi} */
+    case OCERZ_OP_UNPCKLPD: case OCERZ_OP_MOVLHPS: a64_v_zip1(b, 3, vd, va, vb); break; /* {d.lo, s.lo} */
+    case OCERZ_OP_UNPCKHPD:                        a64_v_zip2(b, 3, vd, va, vb); break; /* {d.hi, s.hi} */
     case OCERZ_OP_MOVHLPS:  /* d.lo = s.hi ; d.hi kept */
-        a64_v_mov(b, VX2, VX0); a64_ins_d_d(b, VX2, 0, VX1, 1); break;
-    case OCERZ_OP_UNPCKLPS: a64_v_zip1(b, 2, VX2, VX0, VX1); break;
-    case OCERZ_OP_UNPCKHPS: a64_v_zip2(b, 2, VX2, VX0, VX1); break;
+        if (vd != va) a64_v_mov(b, vd, va);
+        a64_ins_d_d(b, vd, 0, vb, 1); break;
+    case OCERZ_OP_UNPCKLPS: a64_v_zip1(b, 2, vd, va, vb); break;
+    case OCERZ_OP_UNPCKHPS: a64_v_zip2(b, 2, vd, va, vb); break;
     default: return 0;
     }
-    emit_xmm_st(b, VX2, d->reg);
+    if (vd == VX2) emit_xmm_st(b, VX2, d->reg);
     return 1;
 }
 
@@ -3627,9 +3653,11 @@ static int emit_sse_cmps(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     int dbl = insn->op == OCERZ_OP_CMPSDX;
     int esz = dbl ? 8 : 4;
     unsigned pred = (unsigned)insn->ops[2].imm & 7;
-    if (!emit_sse_src(b, insn, s, esz, VX1, exit_sites, n_exits)) return 0;
-    emit_xmm_ld_lo(b, esz, VX0, d->reg);
-    a64_fcmp(b, dbl, VX0, VX1);
+    int vb = emit_sse_src_reg(b, insn, s, esz, VX1, exit_sites, n_exits);
+    if (vb < 0) return 0;
+    int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
+    if (va == VX0) emit_xmm_ld_lo(b, esz, VX0, d->reg);
+    a64_fcmp(b, dbl, va, vb);
     int cond;
     switch (pred) {
     case 0: cond = A64_EQ; break;   /* eq (ordered)            */
@@ -3652,22 +3680,23 @@ static int emit_sse_blendv(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_XMM) return 0;
-    if (!emit_sse_src(b, insn, s, 16, VX1, exit_sites, n_exits)) return 0;
-    emit_xmm_ld(b, VX0, d->reg);
-    emit_xmm_ld(b, VX2, 0);                       /* xmm0 = mask source */
+    int vb = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
+    if (vb < 0) return 0;
+    int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
+    if (va == VX0) emit_xmm_ld(b, VX0, d->reg);
+    emit_xmm_ld(b, VX2, 0);                       /* xmm0 = mask source (copy: we shift it) */
     switch (insn->op) {
     case OCERZ_OP_BLENDVPD: a64_v_sshr_2d(b, VX2, VX2, 63); break;   /* sign -> all ones */
     case OCERZ_OP_BLENDVPS: a64_v_sshr_4s(b, VX2, VX2, 31); break;
     case OCERZ_OP_PBLENDVB: {
-        /* byte lanes: mask = (v2 as signed bytes) >> 7 : use cmgt 0 > v2 -> all ones where negative */
         a64_v_zero(b, VX3);
         a64_v_cmgt(b, 0, VX2, VX3, VX2);          /* 0 > v2 (signed byte) */
         break;
     }
     default: return 0;
     }
-    a64_v_bsl(b, VX2, VX1, VX0);                  /* v2 = mask ? v1(src) : v0(dst) */
-    emit_xmm_st(b, VX2, d->reg);
+    a64_v_bsl(b, VX2, vb, va);                    /* v2 = mask ? src : dst */
+    emit_xmm_st(b, VX2, d->reg);                  /* mov into the pin (1 word) or store */
     return 1;
 }
 
