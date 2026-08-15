@@ -2504,8 +2504,18 @@ static int cc_after_adds(unsigned cc)
     return cc < 16 ? t[cc] : -1;   /* BE/A need CF|ZF: -1 (generic) */
 }
 
+/* When emit_cc_predicate_ex(..., want_direct=1) can express the condition as
+ * a single arm64 condition on the NZCV it just set, it emits only the compare
+ * and reports the condition here (else -1 and the NE <=> taken contract). */
+static int g_cc_direct = -1;
+static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct);
 static void emit_cc_predicate(A64Buf *b, unsigned cc)
 {
+    emit_cc_predicate_ex(b, cc, 0);
+}
+static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
+{
+    g_cc_direct = -1;
     if (getenv("OCERZ_CCLOG")) {
         char tb[96] = "(none)";
         if (g_flag_producer) ocerz_format_insn(g_flag_producer, tb, sizeof tb);
@@ -2566,6 +2576,12 @@ static void emit_cc_predicate(A64Buf *b, unsigned cc)
         g_flag_producer = &g_cur_insns[comis_fuse_producer(g_cur_insns, g_cur_insn_idx)];
         int dbl = g_flag_producer->op == OCERZ_OP_UCOMISD || g_flag_producer->op == OCERZ_OP_COMISD;
         a64_fcmp(b, dbl, xmm_vreg(g_flag_producer->ops[0].reg), xmm_vreg(g_flag_producer->ops[1].reg));
+        if (want_direct) {
+            int dc = cc == OCERZ_CC_A ? A64_GT : cc == OCERZ_CC_AE ? A64_GE :
+                     cc == OCERZ_CC_B ? A64_LT : cc == OCERZ_CC_BE ? A64_LE :
+                     cc == OCERZ_CC_P ? A64_VS : cc == OCERZ_CC_NP ? A64_VC : -1;
+            if (dc >= 0) { g_cc_direct = dc; return; }
+        }
         switch (cc) {
         case OCERZ_CC_A:  a64_cset(b, JTF, A64_GT); break;
         case OCERZ_CC_AE: a64_cset(b, JTF, A64_GE); break;
@@ -3560,6 +3576,11 @@ static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (d->kind != OCERZ_OPK_XMM) return 0;
     int dbl = insn->op == OCERZ_OP_UCOMISD || insn->op == OCERZ_OP_COMISD;
     int esz = dbl ? 8 : 4;
+    /* flags dead (every consumer re-derives them from fcmp via the comis
+     * fusion, or nothing reads them): a register-register compare has no
+     * other effect -> emit nothing at all */
+    if (g_cur_need == 0 && s->kind == OCERZ_OPK_XMM)
+        return 1;
     /* comis overwrites every arithmetic flag: a pending deferred record is
      * dead -- drop it instead of materializing it. */
     if (g_defer)
@@ -3568,8 +3589,6 @@ static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (vb < 0) return 0;
     int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
     if (va == VX0) emit_xmm_ld_lo(b, esz, VX0, d->reg);
-    if (g_cur_need == 0)
-        return 1;                          /* flags dead (consumer fuses on fcmp): no RFLAGS write */
     a64_fcmp(b, dbl, va, vb);              /* scalar fcmp reads the low lane only */
     /* arm64 after fcmp: unordered -> N=0,Z=0,C=1,V=1 ; a<b -> N=1 ; a==b -> Z=1,C=1 ; a>b -> C=1
      * x86: unordered -> ZF=PF=CF=1 ; a<b -> CF=1 ; a==b -> ZF=1 ; a>b -> all 0.
@@ -4959,9 +4978,10 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
 
     /* NZCV: NE <=> taken.  Inline evaluation of a pending cmp/test record
      * (no C call) or, failing that, materialize + RFLAGS. */
-    emit_cc_predicate(b, cc);
     int self_loop = !g_no_chain && g_loop_entry && taken == g_self_rip;
     int two_way = !self_loop && !g_no_chain && !g_no_jcclink;
+    emit_cc_predicate_ex(b, cc, two_way);
+    int direct = two_way ? g_cc_direct : -1;
     if (!two_way) {
         a64_mov_imm64(b, JT1, fall);
         a64_mov_imm64(b, JT2, taken);
@@ -4987,9 +5007,8 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         int poll_taken = taken <= g_self_rip;
         int edge_class = body_edge_pin_class();
         int body_edge = edge_class >= 0;
-        int taken_eq = 0;   /* predicate already folds the negated forms */
         uint32_t *to_taken = a64_label(b);
-        a64_bcond(b, taken_eq ? A64_EQ : A64_NE, 0);
+        a64_bcond(b, direct >= 0 ? direct : A64_NE, 0);
 
         uint32_t *pb_fall = emit_static_chain_tail(
             b, fall, poll_fall, body_edge, epilogue_sites, n_epi);
