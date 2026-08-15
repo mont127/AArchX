@@ -185,5 +185,6 @@ void a64_v_uminv_4s(A64Buf *b, int vd, int vn);
 void a64_v_bit(A64Buf *b, int vd, int vn, int vm);
 void a64_v_xtn(A64Buf *b, int esz, int vd, int vn);
 void a64_cmn_imm(A64Buf *b, int sf, int rn, int imm12);
+void a64_cmp_ext_sxtw(A64Buf *b, int rn, int rm);
 
 #endif
