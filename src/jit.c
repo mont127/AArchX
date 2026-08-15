@@ -2001,11 +2001,23 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
     int64_t disp = op->disp;
     int fits = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
     int have = 0;
-    if (op->base != OCERZ_REG_NONE) {
+    if (op->base != OCERZ_REG_NONE && g_mem_hoist_greg >= 0 && op->base == (unsigned)g_mem_hoist_greg) {
+        /* JMEMBASE = guest_base + base for the whole block */
+        if (op->index == OCERZ_REG_NONE) {
+            if (fits) { *ra_out = JMEMBASE; *disp_out = (uint32_t)disp; return 1; }
+            if (disp > 0 && disp <= 4095)       a64_add_imm(b, 1, JTA, JMEMBASE, (uint32_t)disp);
+            else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, JMEMBASE, (uint32_t)-disp);
+            else { a64_mov_imm64(b, JTU, (uint64_t)disp); a64_add_reg(b, 1, JTA, JMEMBASE, JTU, 0); }
+            *ra_out = JTA; *disp_out = 0;
+            return 1;
+        }
+        a64_add_reg(b, 1, JTA, JMEMBASE, pin_hreg(pin_slot(op->index)), op->scale & 3);
+        have = 1;
+    } else if (op->base != OCERZ_REG_NONE) {
         a64_add_reg(b, 1, JTA, JGB, pin_hreg(pin_slot(op->base)), 0);
         have = 1;
     }
-    if (op->index != OCERZ_REG_NONE) {
+    if (op->index != OCERZ_REG_NONE && !(have && op->base == (unsigned)g_mem_hoist_greg && g_mem_hoist_greg >= 0)) {
         a64_add_reg(b, 1, JTA, have ? JTA : JGB, pin_hreg(pin_slot(op->index)), op->scale & 3);
         have = 1;
     }
@@ -3191,8 +3203,9 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
-static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o,
+static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o, int size,
                              uint32_t **exit_sites, int *n_exits, uint32_t **skip_out);
+static void emit_sse_mem_ld_gpr(A64Buf *b, int size, int rd);
 static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0];
@@ -3218,8 +3231,8 @@ static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int 
     } else {
         /* re-materialise the memory source (EA may clobber JT0/JTA; JTF survives) */
         uint32_t *skip2;
-        if (!emit_sse_mem_addr(b, insn, s, exit_sites, n_exits, &skip2)) return 0;
-        emit_guest_load_ordered(b, d->size, JT2, JTA, JTU);
+        if (!emit_sse_mem_addr(b, insn, s, d->size, exit_sites, n_exits, &skip2)) return 0;
+        emit_sse_mem_ld_gpr(b, d->size, JT2);
         patch_guard_skip(skip2, a64_label(b));
     }
     a64_subs_imm(b, 1, A64_ZR, JTF, 0);
@@ -3345,26 +3358,41 @@ static void emit_xmm_st_lo(A64Buf *b, int size, int vs, unsigned xr) /* only low
 }
 
 /* Guest memory operand -> host address in JTA (with guard/skip pair). */
-static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o,
+static int g_sse_mem_ra = JTA;      /* base register / folded displacement for the */
+static uint32_t g_sse_mem_disp;     /* access that follows emit_sse_mem_addr */
+static int g_sse_mem_plain;         /* 1: plain form (no guard), address = [ra, #disp] */
+static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o, int size,
                              uint32_t **exit_sites, int *n_exits, uint32_t **skip_out)
 {
+    if (emit_mem_ea_plain(b, insn, o, size, &g_sse_mem_ra, &g_sse_mem_disp)) {
+        g_sse_mem_plain = 1;
+        *skip_out = NULL;
+        return 1;
+    }
+    g_sse_mem_plain = 0;
+    g_sse_mem_ra = JTA; g_sse_mem_disp = 0;
     if (!emit_mem_ea(b, insn, o, JTA))
         return 0;
     *skip_out = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
     emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
     return 1;
 }
-static void emit_sse_mem_ld(A64Buf *b, int size, int vd)   /* from [JTA] */
+static void emit_sse_mem_ld_gpr(A64Buf *b, int size, int rd)   /* GPR load from the address set up above */
 {
-    a64_ldr_v(b, size, vd, JTA, 0);
+    if (g_sse_mem_plain) a64_ldr(b, size, rd, g_sse_mem_ra, g_sse_mem_disp);
+    else emit_guest_load_ordered(b, size, rd, JTA, JTU);
+}
+static void emit_sse_mem_ld(A64Buf *b, int size, int vd)   /* from the address set up above */
+{
+    a64_ldr_v(b, size, vd, g_sse_mem_ra, g_sse_mem_disp);
     if (!g_plain_mem)
         a64_dmb_ish(b);          /* conservative acquire */
 }
-static void emit_sse_mem_st(A64Buf *b, int size, int vs)   /* to [JTA] */
+static void emit_sse_mem_st(A64Buf *b, int size, int vs)   /* to the address set up above */
 {
     if (!g_plain_mem)
         a64_dmb_ish(b);          /* conservative release */
-    a64_str_v(b, size, vs, JTA, 0);
+    a64_str_v(b, size, vs, g_sse_mem_ra, g_sse_mem_disp);
 }
 
 /* Load operand `o` (xmm or mem) of width `size` (4/8/16) into vd.
@@ -3378,7 +3406,7 @@ static int emit_sse_src(A64Buf *b, const X86Insn *insn, const X86Operand *o, int
     }
     if (o->kind == OCERZ_OPK_MEM) {
         uint32_t *skip;
-        if (!emit_sse_mem_addr(b, insn, o, exit_sites, n_exits, &skip))
+        if (!emit_sse_mem_addr(b, insn, o, size, exit_sites, n_exits, &skip))
             return 0;
         emit_sse_mem_ld(b, size, vd);
         patch_guard_skip(skip, a64_label(b));
@@ -3427,7 +3455,7 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
         uint32_t *skip;
         int vd = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;   /* load straight into the pin */
         if (vd != VX0 && emit_plain_mem_fast(b, insn, s, 16, vd, 0, 1)) return 1;
-        if (!emit_sse_mem_addr(b, insn, s, exit_sites, n_exits, &skip)) return 0;
+        if (!emit_sse_mem_addr(b, insn, s, 16, exit_sites, n_exits, &skip)) return 0;
         emit_sse_mem_ld(b, 16, vd);
         patch_guard_skip(skip, a64_label(b));
         if (vd == VX0) emit_xmm_st(b, VX0, d->reg);
@@ -3438,7 +3466,7 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
         if (vs != VX0 && emit_plain_mem_fast(b, insn, d, 16, vs, 1, 1)) return 1;
         if (vs == VX0) emit_xmm_ld(b, VX0, s->reg);
         uint32_t *skip;
-        if (!emit_sse_mem_addr(b, insn, d, exit_sites, n_exits, &skip)) return 0;
+        if (!emit_sse_mem_addr(b, insn, d, 16, exit_sites, n_exits, &skip)) return 0;
         emit_sse_mem_st(b, 16, vs);
         patch_guard_skip(skip, a64_label(b));
         return 1;
@@ -3458,7 +3486,7 @@ static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **ex
     }
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_MEM) {
         uint32_t *skip;
-        if (!emit_sse_mem_addr(b, insn, s, exit_sites, n_exits, &skip)) return 0;
+        if (!emit_sse_mem_addr(b, insn, s, size, exit_sites, n_exits, &skip)) return 0;
         emit_sse_mem_ld(b, size, VX0);          /* ldr s/d zeroes the rest of V0 */
         patch_guard_skip(skip, a64_label(b));
         emit_xmm_st(b, VX0, d->reg);            /* whole 128: upper zeroed (x86 semantics) */
@@ -3467,7 +3495,7 @@ static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **ex
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_XMM) {
         emit_xmm_ld_lo(b, size, VX0, s->reg);
         uint32_t *skip;
-        if (!emit_sse_mem_addr(b, insn, d, exit_sites, n_exits, &skip)) return 0;
+        if (!emit_sse_mem_addr(b, insn, d, size, exit_sites, n_exits, &skip)) return 0;
         emit_sse_mem_st(b, size, VX0);
         patch_guard_skip(skip, a64_label(b));
         return 1;
@@ -4063,8 +4091,8 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
             if (s->size != 4 && s->size != 8) return 0;
             sf = s->size == 8;
             uint32_t *skip;
-            if (!emit_sse_mem_addr(b, insn, s, exit_sites, n_exits, &skip)) return 0;
-            emit_guest_load_ordered(b, s->size, JT0, JTA, JTU);
+            if (!emit_sse_mem_addr(b, insn, s, s->size, exit_sites, n_exits, &skip)) return 0;
+            emit_sse_mem_ld_gpr(b, s->size, JT0);
             patch_guard_skip(skip, a64_label(b));
         } else return 0;
         a64_scvtf(b, sf, dbl, VX0, JT0);
@@ -4117,7 +4145,7 @@ static int emit_sse_movd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_MEM) {
         if (s->size != 4 && s->size != 8) return 0;
         uint32_t *skip;
-        if (!emit_sse_mem_addr(b, insn, s, exit_sites, n_exits, &skip)) return 0;
+        if (!emit_sse_mem_addr(b, insn, s, s->size, exit_sites, n_exits, &skip)) return 0;
         emit_sse_mem_ld(b, s->size, VX0);
         patch_guard_skip(skip, a64_label(b));
         emit_xmm_st(b, VX0, d->reg);
@@ -4127,7 +4155,7 @@ static int emit_sse_movd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         if (d->size != 4 && d->size != 8) return 0;
         emit_xmm_ld_lo(b, d->size, VX0, s->reg);
         uint32_t *skip;
-        if (!emit_sse_mem_addr(b, insn, d, exit_sites, n_exits, &skip)) return 0;
+        if (!emit_sse_mem_addr(b, insn, d, d->size, exit_sites, n_exits, &skip)) return 0;
         emit_sse_mem_st(b, d->size, VX0);
         patch_guard_skip(skip, a64_label(b));
         return 1;
@@ -6461,6 +6489,61 @@ static uint32_t *emit_static_chain_tail(A64Buf *b, uint64_t target_rip,
     return emit_chain_tail(b, poll);
 }
 
+/* May `in` write general register `reg` (any width)?  Conservative: the
+ * destination operand of everything, plus the implicit writers.  Used to
+ * decide whether a hoisted (guest_base + base) stays valid across a block. */
+static int insn_may_write_gpr(const X86Insn *in, unsigned reg)
+{
+    reg &= 15;
+    switch (in->op) {
+    case OCERZ_OP_CMP: case OCERZ_OP_TEST: case OCERZ_OP_BT:
+    case OCERZ_OP_JMP: case OCERZ_OP_JCC: case OCERZ_OP_JRCXZ:
+    case OCERZ_OP_NOP: case OCERZ_OP_PREFETCH: case OCERZ_OP_CLFLUSH:
+    case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
+    case OCERZ_OP_PTEST:
+        return 0;
+    case OCERZ_OP_PUSH: case OCERZ_OP_POP: case OCERZ_OP_CALL: case OCERZ_OP_RET:
+    case OCERZ_OP_PUSHF: case OCERZ_OP_POPF: case OCERZ_OP_LEAVE:
+        if (reg == OCERZ_RSP || reg == OCERZ_RBP) return 1;
+        break;
+    case OCERZ_OP_DIV: case OCERZ_OP_IDIV: case OCERZ_OP_MUL:
+    case OCERZ_OP_CBW: case OCERZ_OP_CWD:
+        if (reg == OCERZ_RAX || reg == OCERZ_RDX) return 1;
+        break;
+    case OCERZ_OP_IMUL:
+        if (in->nops == 1 && (reg == OCERZ_RAX || reg == OCERZ_RDX)) return 1;
+        break;
+    case OCERZ_OP_CPUID:
+        if (reg == OCERZ_RAX || reg == OCERZ_RBX || reg == OCERZ_RCX || reg == OCERZ_RDX) return 1;
+        break;
+    case OCERZ_OP_RDTSC: case OCERZ_OP_RDTSCP: case OCERZ_OP_XGETBV:
+        if (reg == OCERZ_RAX || reg == OCERZ_RDX || reg == OCERZ_RCX) return 1;
+        break;
+    case OCERZ_OP_MOVS: case OCERZ_OP_STOS: case OCERZ_OP_LODS: case OCERZ_OP_SCAS: case OCERZ_OP_CMPS:
+        if (reg == OCERZ_RSI || reg == OCERZ_RDI || reg == OCERZ_RCX || reg == OCERZ_RAX) return 1;
+        break;
+    case OCERZ_OP_SYSCALL:
+        if (reg == OCERZ_RAX || reg == OCERZ_RCX || (reg == 11)) return 1;
+        break;
+    case OCERZ_OP_XCHG: case OCERZ_OP_XADD:
+        for (int k = 0; k < in->nops; k++)
+            if (in->ops[k].kind == OCERZ_OPK_REG && (in->ops[k].reg & 15) == reg) return 1;
+        return 0;
+    case OCERZ_OP_CMPXCHG: case OCERZ_OP_CMPXCHGXB:
+        if (reg == OCERZ_RAX || reg == OCERZ_RDX || reg == OCERZ_RBX || reg == OCERZ_RCX) return 1;
+        break;
+    default:
+        break;
+    }
+    /* generic: the destination operand */
+    if (in->nops > 0 && in->ops[0].kind == OCERZ_OPK_REG && (in->ops[0].reg & 15) == reg)
+        return 1;
+    /* anything not classified above that touches memory implicitly or is
+     * exotic: be safe for the string/stack family already handled; the rest
+     * only writes ops[0] */
+    return 0;
+}
+
 static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
 {
     g_mem_hoist_aux_disp = 0;
@@ -6474,60 +6557,37 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
            term->ops[0].imm == rip)))
         return -1;
 
-    int base = -1;
-    int accesses = 0;
+    /* candidate bases: every memory operand's base register; pick the one
+     * with the most accesses that no instruction in the block may write */
+    int count[16] = {0};
+    int aux[16] = {0};
     for (int i = 0; i < n; i++) {
         const X86Insn *in = &insns[i];
-        if (in->op != OCERZ_OP_MOV || in->nops != 2)
-            continue;
-        const X86Operand *mem = NULL;
-        const X86Operand *reg = NULL;
-        if (in->ops[0].kind == OCERZ_OPK_MEM &&
-            in->ops[1].kind == OCERZ_OPK_REG) {
-            mem = &in->ops[0];
-            reg = &in->ops[1];
-        } else if (in->ops[0].kind == OCERZ_OPK_REG &&
-                   in->ops[1].kind == OCERZ_OPK_MEM) {
-            reg = &in->ops[0];
-            mem = &in->ops[1];
-        }
-        if (!mem || reg->high8 || (reg->size != 4 && reg->size != 8) ||
-            in->seg != OCERZ_SEG_NONE || in->addrsize != 8 || mem->riprel ||
-            mem->base == OCERZ_REG_NONE)
-            continue;
-        if (base < 0)
-            base = mem->base;
-        else if (base != mem->base)
-            return -1;
-
-        if (g_pin_class != 2 && mem->index != OCERZ_REG_NONE &&
-            mem->disp != 0 && mem->disp >= -4095 && mem->disp <= 4095 &&
-            g_mem_hoist_aux_disp == 0)
-            g_mem_hoist_aux_disp = (int)mem->disp;
-        accesses++;
-    }
-    if (accesses < 2 || base < 0 || pin_slot(base) < 0)
-        return -1;
-
-    for (int i = 0; i < n; i++) {
-        const X86Insn *in = &insns[i];
-        if (in->nops == 0 || in->ops[0].kind != OCERZ_OPK_REG ||
-            in->ops[0].reg != base)
-            continue;
-        switch (in->op) {
-        case OCERZ_OP_MOV: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX:
-        case OCERZ_OP_MOVSXD: case OCERZ_OP_LEA:
-        case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_AND:
-        case OCERZ_OP_OR: case OCERZ_OP_XOR:
-        case OCERZ_OP_INC: case OCERZ_OP_DEC:
-        case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR:
-        case OCERZ_OP_IMUL: case OCERZ_OP_POP:
-            return -1;
-        default:
-            break;
+        if (in->seg != OCERZ_SEG_NONE || in->addrsize != 8) continue;
+        for (int k = 0; k < in->nops; k++) {
+            const X86Operand *mem = &in->ops[k];
+            if (mem->kind != OCERZ_OPK_MEM || mem->riprel || mem->base == OCERZ_REG_NONE) continue;
+            if (pin_slot(mem->base) < 0) continue;
+            unsigned bb = mem->base & 15;
+            count[bb]++;
+            if (g_pin_class != 2 && mem->index != OCERZ_REG_NONE &&
+                mem->disp != 0 && mem->disp >= -4095 && mem->disp <= 4095 && aux[bb] == 0)
+                aux[bb] = (int)mem->disp;
         }
     }
-    return base;
+    int best = -1, bestn = 0;
+    for (int r = 0; r < 16; r++) {
+        if (count[r] <= bestn) continue;
+        if (g_pin_class == 2 && r == OCERZ_RSP) continue;
+        int written = 0;
+        for (int i = 0; i < n && !written; i++)
+            written = insn_may_write_gpr(&insns[i], (unsigned)r);
+        if (written) continue;
+        best = r; bestn = count[r];
+    }
+    if (best < 0) return -1;
+    g_mem_hoist_aux_disp = aux[best];
+    return best;
 }
 
 static int fault_recipe_native_mov(const X86Insn *insn)
