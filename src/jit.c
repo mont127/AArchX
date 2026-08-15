@@ -2486,6 +2486,13 @@ static int comis_fuse_producer(const X86Insn *insns, int ci)
         if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_XMM &&
             (m->ops[0].reg == p->ops[0].reg || m->ops[0].reg == p->ops[1].reg))
             return -1;
+        /* an op the table cannot classify (def=0,use=ALL: e.g. shift by CL,
+         * which writes flags only when the count is nonzero) may have
+         * overwritten the flags: this static fusion cannot see that */
+        uint64_t mdef, muse;
+        ocerz_flags_defuse_nofault(m, &mdef, &muse);
+        if (!(mdef & JIT_ARITH_FLAGS) && (muse & JIT_ARITH_FLAGS) == JIT_ARITH_FLAGS)
+            return -1;
     }
     return pi;
 }
