@@ -3473,13 +3473,16 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     case OCERZ_OP_DIVSS: kind=3; break;  case OCERZ_OP_DIVSD: kind=3; dbl=1; break;
     case OCERZ_OP_DIVPS: kind=3; packed=1; break; case OCERZ_OP_DIVPD: kind=3; dbl=1; packed=1; break;
     case OCERZ_OP_MAXSS: kind=4; break;  case OCERZ_OP_MAXSD: kind=4; dbl=1; break;
+    case OCERZ_OP_MAXPS: kind=4; packed=1; break; case OCERZ_OP_MAXPD: kind=4; dbl=1; packed=1; break;
     case OCERZ_OP_MINSS: kind=5; break;  case OCERZ_OP_MINSD: kind=5; dbl=1; break;
+    case OCERZ_OP_MINPS: kind=5; packed=1; break; case OCERZ_OP_MINPD: kind=5; dbl=1; packed=1; break;
     case OCERZ_OP_SQRTSS: kind=6; break; case OCERZ_OP_SQRTSD: kind=6; dbl=1; break;
     case OCERZ_OP_SQRTPS: kind=6; packed=1; break; case OCERZ_OP_SQRTPD: kind=6; dbl=1; packed=1; break;
     default: return 0;
     }
-    if (kind == 4 || kind == 5) return 0;      /* x86 max/min NaN/zero rules: keep slow */
     int esz = dbl ? 8 : 4;
+    static int inexact_nan = -1;               /* OCERZ_INEXACT_NAN=1: arm64 NaN semantics, no fixups */
+    if (inexact_nan < 0) inexact_nan = getenv("OCERZ_INEXACT_NAN") ? 1 : 0;
     /* Operand registers: pinned xmm operands are used in place (no copies);
      * memory / unpinned sources go through VX1; the dst value through VX0.
      * Result -> VX2, then written back (needed: the fix reads the inputs). */
@@ -3502,6 +3505,34 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     int va;
     if (xmm_is_pinned(d->reg)) va = xmm_vreg(d->reg);
     else { emit_xmm_ld(b, VX0, d->reg); va = VX0; }
+    if (kind == 4 || kind == 5) {
+        /* x86 max: a > b ? a : b ; min: a < b ? a : b -- NaN (unordered) and
+         * equal zeros both select b.  Exactly a compare-false-on-NaN + select. */
+        if (packed) {
+            if (kind == 4) a64_v_fcmgt(b, dbl, VX2, va, vb);   /* a > b */
+            else           a64_v_fcmgt(b, dbl, VX2, vb, va);   /* b > a  <=> a < b */
+            if (va == xmm_vreg(d->reg) && xmm_is_pinned(d->reg)) {
+                a64_v_bif(b, va, vb, VX2);                     /* a = mask ? a : b (in place) */
+            } else {
+                a64_v_bsl(b, VX2, va, vb);                     /* VX2 = mask ? a : b */
+                emit_xmm_st(b, VX2, d->reg);
+            }
+        } else {
+            a64_fcmp(b, dbl, va, vb);
+            a64_fcsel(b, dbl, VX2, va, vb, kind == 4 ? A64_GT : A64_MI);
+            emit_xmm_st_lo(b, esz, VX2, d->reg);
+        }
+        return 1;
+    }
+    if (inexact_nan && packed && xmm_is_pinned(d->reg)) {
+        switch (kind) {
+        case 0: a64_v_fadd(b, dbl, va, va, vb); break;
+        case 1: a64_v_fsub(b, dbl, va, va, vb); break;
+        case 2: a64_v_fmul(b, dbl, va, va, vb); break;
+        case 3: a64_v_fdiv(b, dbl, va, va, vb); break;
+        }
+        return 1;
+    }
     if (packed) {
         switch (kind) {
         case 0: a64_v_fadd(b, dbl, VX2, va, vb); break;
@@ -3511,6 +3542,14 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
         }
         emit_nan_fix_packed2(b, dbl, VX2, va, vb, VX3, VX3);
         emit_xmm_st(b, VX2, d->reg);
+    } else if (inexact_nan) {
+        switch (kind) {
+        case 0: a64_fadd_s(b, dbl, VX2, va, vb); break;
+        case 1: a64_fsub_s(b, dbl, VX2, va, vb); break;
+        case 2: a64_fmul_s(b, dbl, VX2, va, vb); break;
+        case 3: a64_fdiv_s(b, dbl, VX2, va, vb); break;
+        }
+        emit_xmm_st_lo(b, esz, VX2, d->reg);
     } else {
         switch (kind) {
         case 0: a64_fadd_s(b, dbl, VX2, va, vb); break;
@@ -3824,6 +3863,7 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_MULSS: case OCERZ_OP_MULSD: case OCERZ_OP_MULPS: case OCERZ_OP_MULPD:
     case OCERZ_OP_DIVSS: case OCERZ_OP_DIVSD: case OCERZ_OP_DIVPS: case OCERZ_OP_DIVPD:
     case OCERZ_OP_MAXSS: case OCERZ_OP_MAXSD: case OCERZ_OP_MINSS: case OCERZ_OP_MINSD:
+    case OCERZ_OP_MAXPS: case OCERZ_OP_MAXPD: case OCERZ_OP_MINPS: case OCERZ_OP_MINPD:
     case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_SQRTPS: case OCERZ_OP_SQRTPD:
         return emit_sse_fparith(b, insn, exit_sites, n_exits);
     case OCERZ_OP_PXOR: case OCERZ_OP_XORPS: case OCERZ_OP_PAND: case OCERZ_OP_ANDPS:
@@ -3963,6 +4003,7 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_MULSS: case OCERZ_OP_MULSD: case OCERZ_OP_MULPS: case OCERZ_OP_MULPD:
     case OCERZ_OP_DIVSS: case OCERZ_OP_DIVSD: case OCERZ_OP_DIVPS: case OCERZ_OP_DIVPD:
     case OCERZ_OP_MAXSS: case OCERZ_OP_MAXSD: case OCERZ_OP_MINSS: case OCERZ_OP_MINSD:
+    case OCERZ_OP_MAXPS: case OCERZ_OP_MAXPD: case OCERZ_OP_MINPS: case OCERZ_OP_MINPD:
     case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_SQRTPS: case OCERZ_OP_SQRTPD:
     case OCERZ_OP_PXOR: case OCERZ_OP_XORPS: case OCERZ_OP_PAND: case OCERZ_OP_ANDPS:
     case OCERZ_OP_POR: case OCERZ_OP_ORPS: case OCERZ_OP_PANDN: case OCERZ_OP_ANDNPS:
