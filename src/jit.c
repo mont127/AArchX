@@ -164,6 +164,7 @@ static int g_cur_insn_idx;
  * earlier instruction in the block that defines flags (NULL if flags come
  * from outside the block).  Lets emit_cc_predicate specialize. */
 static const X86Insn *g_flag_producer;
+static int g_flag_producer_operands_intact;   /* no later insn wrote the producer's xmm operands */
 
 static int g_no_regflags;
 
@@ -1159,6 +1160,8 @@ static int emit_incdec_eager(A64Buf *b, const X86Insn *insn, uint64_t need)
 }
 
 static void emit_cc_predicate(A64Buf *b, unsigned cc);
+static inline int xmm_vreg(unsigned xr);
+static inline int xmm_is_pinned(unsigned xr);
 static int emit_incdec(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (!g_defer)
@@ -2512,6 +2515,34 @@ static void emit_cc_predicate(A64Buf *b, unsigned cc)
         a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
     }
+    /* comis producer with pinned xmm operands: redo the fcmp and branch on
+     * NZCV directly (2 words) -- valid because between producer and consumer
+     * no instruction wrote flags (producer is the nearest flag writer) and we
+     * additionally require the two xmm operands to be untouched. */
+    if (g_flag_producer && (g_flag_producer->op == OCERZ_OP_UCOMISD ||
+                            g_flag_producer->op == OCERZ_OP_UCOMISS ||
+                            g_flag_producer->op == OCERZ_OP_COMISD ||
+                            g_flag_producer->op == OCERZ_OP_COMISS) &&
+        g_flag_producer_operands_intact &&
+        g_flag_producer->ops[0].kind == OCERZ_OPK_XMM && xmm_is_pinned(g_flag_producer->ops[0].reg) &&
+        g_flag_producer->ops[1].kind == OCERZ_OPK_XMM && xmm_is_pinned(g_flag_producer->ops[1].reg) &&
+        (cc == OCERZ_CC_A || cc == OCERZ_CC_AE || cc == OCERZ_CC_B || cc == OCERZ_CC_BE ||
+         cc == OCERZ_CC_P || cc == OCERZ_CC_NP || cc == OCERZ_CC_E || cc == OCERZ_CC_NE)) {
+        int dbl = g_flag_producer->op == OCERZ_OP_UCOMISD || g_flag_producer->op == OCERZ_OP_COMISD;
+        a64_fcmp(b, dbl, xmm_vreg(g_flag_producer->ops[0].reg), xmm_vreg(g_flag_producer->ops[1].reg));
+        switch (cc) {
+        case OCERZ_CC_A:  a64_cset(b, JTF, A64_GT); break;
+        case OCERZ_CC_AE: a64_cset(b, JTF, A64_GE); break;
+        case OCERZ_CC_B:  a64_cset(b, JTF, A64_LT); break;
+        case OCERZ_CC_BE: a64_cset(b, JTF, A64_LE); break;
+        case OCERZ_CC_P:  a64_cset(b, JTF, A64_VS); break;
+        case OCERZ_CC_NP: a64_cset(b, JTF, A64_VC); break;
+        case OCERZ_CC_E:  a64_cset(b, JTF, A64_EQ); a64_cset(b, JTU, A64_VS); a64_orr_reg(b, 1, JTF, JTF, JTU, 0); break;
+        default:          a64_cset(b, JTF, A64_NE); a64_cset(b, JTU, A64_VC); a64_and_reg(b, 1, JTF, JTF, JTU, 0); break;
+        }
+        a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+        return;
+    }
     /* Producers that write RFLAGS eagerly (no deferred record): comis/ucomis,
      * rotates.  Flags are already current -> just read them (~8 words). */
     if (g_flag_producer && (g_flag_producer->op == OCERZ_OP_UCOMISD ||
@@ -3503,20 +3534,19 @@ static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (va == VX0) emit_xmm_ld_lo(b, esz, VX0, d->reg);
     a64_fcmp(b, dbl, va, vb);              /* scalar fcmp reads the low lane only */
     /* arm64 after fcmp: unordered -> N=0,Z=0,C=1,V=1 ; a<b -> N=1 ; a==b -> Z=1,C=1 ; a>b -> C=1
-     * x86: unordered -> ZF=PF=CF=1 ; a<b -> CF=1 ; a==b -> ZF=1 ; a>b -> all 0 */
+     * x86: unordered -> ZF=PF=CF=1 ; a<b -> CF=1 ; a==b -> ZF=1 ; a>b -> all 0.
+     * CF = LT (N!=V: a<b or unordered) ; ZF = (EQ or VS) = LE && !LT ... use LE (Z||N!=V)
+     * minus LT: ZF = LE & !LT.  Cheaper: ZF = !(GT||LT) = !NE_ordered ... use two csets. */
     a64_ldr(b, 8, JTT, 20, RF_OFF);
-    a64_mov_imm64(b, JTU, ~(uint64_t)(OCERZ_CF | OCERZ_PF | OCERZ_ZF | OCERZ_SF | OCERZ_OF | OCERZ_AF));
-    a64_and_reg(b, 1, JTT, JTT, JTU, 0);
-    a64_cset(b, JT0, A64_VS);            /* unordered */
-    a64_lsl_imm(b, 1, JT1, JT0, 2);      /* PF bit */
-    a64_orr_reg(b, 1, JTT, JTT, JT1, 0);
-    a64_cset(b, JT1, A64_MI);            /* less than -> CF */
-    a64_orr_reg(b, 1, JT1, JT1, JT0, 0); /* unordered -> CF too */
-    a64_orr_reg(b, 1, JTT, JTT, JT1, 0);
-    a64_cset(b, JT1, A64_EQ);            /* equal -> ZF */
-    a64_orr_reg(b, 1, JT1, JT1, JT0, 0); /* unordered -> ZF too */
-    a64_lsl_imm(b, 1, JT1, JT1, 6);
-    a64_orr_reg(b, 1, JTT, JTT, JT1, 0);
+    a64_cset(b, JT0, A64_LT);            /* CF: a<b or unordered */
+    a64_cset(b, JT1, A64_VS);            /* PF: unordered */
+    a64_bfi(b, 1, JTT, JT0, 0, 1);       /* CF bit 0 */
+    a64_bfi(b, 1, JTT, JT1, 2, 1);       /* PF bit 2 */
+    a64_cset(b, JT0, A64_EQ);
+    a64_orr_reg(b, 1, JT0, JT0, JT1, 0); /* ZF: equal or unordered */
+    a64_bfi(b, 1, JTT, JT0, 6, 1);       /* ZF bit 6 */
+    a64_mov_imm64(b, JTU, ~(uint64_t)(OCERZ_SF | OCERZ_OF | OCERZ_AF));
+    a64_and_reg(b, 1, JTT, JTT, JTU, 0); /* SF/OF/AF cleared */
     a64_str(b, 8, JTT, 20, RF_OFF);
     return 1;
 }
@@ -6513,6 +6543,20 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         g_cur_insn_idx = i;
         g_flag_producer = last_flag_def >= 0 ? &blk->insns[last_flag_def] : NULL;
         {
+            /* operands intact: scan intervening insns for writes to the
+             * producer's xmm operands (dst operand of an SSE insn) */
+            g_flag_producer_operands_intact = 1;
+            if (g_flag_producer) {
+                for (int k = last_flag_def + 1; k < i; k++) {
+                    const X86Insn *m = &blk->insns[k];
+                    if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_XMM) {
+                        unsigned w = m->ops[0].reg;
+                        if ((g_flag_producer->ops[0].kind == OCERZ_OPK_XMM && g_flag_producer->ops[0].reg == w) ||
+                            (g_flag_producer->ops[1].kind == OCERZ_OPK_XMM && g_flag_producer->ops[1].reg == w))
+                            g_flag_producer_operands_intact = 0;
+                    }
+                }
+            }
             uint64_t pdef, puse;
             ocerz_flags_defuse(insn, &pdef, &puse);
             if (pdef & JIT_ARITH_FLAGS)
