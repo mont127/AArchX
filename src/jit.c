@@ -3616,36 +3616,35 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: {
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
         int dbl = insn->op == OCERZ_OP_CVTTSD2SI;
-        if (!emit_sse_src(b, insn, s, dbl ? 8 : 4, VX0, exit_sites, n_exits)) return 0;
-        /* x86 returns 0x8000.. (indefinite) on overflow/NaN; arm64 saturates.  Match x86 for NaN
-         * and out-of-range by checking the flags: unordered/overflow are rare -> accept saturation
-         * differences?  No: keep exactness -- detect NaN via fcmp and force indefinite. */
-        /* hot path: fcvtzs + a range/NaN check that almost never fires.
-         * x86 returns the "integer indefinite" (INT_MIN) for NaN and for
-         * out-of-range; arm64 saturates.  Only INT_MAX (positive overflow) and
-         * NaN (-> arm64 gives 0) differ, so: result == INT_MAX or NaN -> fix. */
-        /* x86: NaN or |v| out of range -> "integer indefinite" (INT_MIN).
-         * arm64 fcvtzs saturates.  The only divergences are NaN (arm64 -> 0)
-         * and v >= 2^31 / 2^63 (arm64 -> INT_MAX): test the INPUT against the
-         * positive threshold: (v >= thr) or unordered  <=>  fcmp cond GE|VS. */
-        a64_fcvtzs(b, d->size == 8, dbl, JT0, VX0);
-        {
-            uint64_t thr_bits;
-            if (dbl) thr_bits = d->size == 8 ? 0x43e0000000000000ull /* 2^63 */ : 0x41e0000000000000ull /* 2^31 */;
-            else     thr_bits = d->size == 8 ? 0x5f000000ull /* 2^63f */ : 0x4f000000ull /* 2^31f */;
-            a64_mov_imm64(b, JTU, thr_bits);
-            a64_fmov_v_from_x(b, dbl, VX1, JTU);
-            a64_fcmp(b, dbl, VX0, VX1);          /* GE: v >= thr ; VS: NaN */
-            uint32_t *ovf = a64_label(b); a64_bcond(b, A64_GE, 0);
-            uint32_t *nan = a64_label(b); a64_bcond(b, A64_VS, 0);
-            uint32_t *ok  = a64_label(b); a64_b(b, 0);
-            a64_patch_bcond(ovf, a64_label(b));
-            a64_patch_bcond(nan, a64_label(b));
-            a64_mov_imm64(b, JT0, d->size == 8 ? 0x8000000000000000ull : 0x80000000ull);
-            a64_patch_b(ok, a64_label(b));
+        int vs = emit_sse_src_reg(b, insn, s, dbl ? 8 : 4, VX0, exit_sites, n_exits);
+        if (vs < 0) return 0;
+        /* x86: NaN or out-of-range -> "integer indefinite" (INT_MIN); arm64
+         * fcvtzs saturates (NaN -> 0).  Branch-free fixup:
+         *   64-bit: the only positive-overflow result is INT64_MAX (no double
+         *           truncates to it legitimately: ulp near 2^63 is 1024), and
+         *           cmn x,#1 sets V exactly for INT64_MAX;
+         *   32-bit: convert to 64 bits, then "fits in int32" (cmp x, w, sxtw)
+         *           is exactly the in-range test (2^31-1.5 truncates to
+         *           INT32_MAX legitimately, so the result test would be wrong);
+         *   NaN:    fcmp v,v -> VS. */
+        int ds = pin_slot(d->reg);
+        int rd = ds >= 0 ? pin_hreg(ds) : JT0;
+        if (d->size == 8) {
+            a64_fcvtzs(b, 1, dbl, rd, vs);
+            a64_cmn_imm(b, 1, rd, 1);                          /* V <=> rd == INT64_MAX */
+            a64_movz(b, JTU, 0x8000, 3);                       /* INT64_MIN */
+            a64_csel(b, 1, rd, JTU, rd, A64_VS);
+            a64_fcmp(b, dbl, vs, vs);                          /* VS <=> NaN */
+            a64_csel(b, 1, rd, JTU, rd, A64_VS);
+        } else {
+            a64_fcvtzs(b, 1, dbl, JT0, vs);
+            a64_cmp_ext_sxtw(b, JT0, JT0);                     /* Z <=> fits int32 */
+            a64_movz(b, JTU, 0x8000, 1);                       /* INT32_MIN (w) */
+            a64_csel(b, 0, rd, JTU, JT0, A64_NE);              /* wD zero-extends */
+            a64_fcmp(b, dbl, vs, vs);
+            a64_csel(b, 0, rd, JTU, rd, A64_VS);
         }
-        if (d->size == 4) a64_mov_reg(b, 0, JT0, JT0);
-        emit_gpr_wr(b, JT0, d->reg);
+        if (ds < 0) emit_gpr_wr(b, JT0, d->reg);
         return 1;
     }
     case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS: {
@@ -4166,7 +4165,27 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         patch_guard_skip(skip, a64_label(b));
         if (d_mem) d_in_jt0 = 1; else s_in_jt1 = 1;
     }
-    if (d->size == 1 || d->size == 2) {
+    if ((d->size == 1 || d->size == 2) && producer->op == OCERZ_OP_TEST &&
+        !d_mem && !d->high8 && s->kind == OCERZ_OPK_IMM &&
+        (jcc->cc == OCERZ_CC_E || jcc->cc == OCERZ_CC_NE)) {
+        /* narrow test-with-immediate feeding je/jne: only Z matters and the
+         * immediate masks the operand to its width, so test the full pinned
+         * register directly (tbz/tbnz for a single bit, else ands #imm) */
+        uint64_t v = s->imm & (d->size == 1 ? 0xffull : 0xffffull);
+        int ds = pin_slot(d->reg);
+        int rn = ds >= 0 ? pin_hreg(ds) : JT0;
+        if (ds < 0) emit_gpr_rd(b, 1, JT0, d->reg);
+        if (!self_loop && v != 0 && (v & (v - 1)) == 0) {
+            test_bit = __builtin_ctzll(v);
+            test_rn = rn;
+            test_mask = v;
+        } else if (!a64_try_ands_imm(b, 0, JT2, rn, v)) {
+            a64_mov_imm64(b, JT1, v);
+            a64_ands_reg(b, 0, JT2, rn, JT1, 0);
+        }
+        record_src = JT2; record_dst = JT2;
+        ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0);
+    } else if (d->size == 1 || d->size == 2) {
         /* narrow: NZCV from a 32-bit op on left-shifted operands, flag record
          * from the unshifted zero-extended values at the narrow size. */
         int size = d->size, sh = 32 - 8 * size;

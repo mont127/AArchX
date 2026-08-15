@@ -650,6 +650,8 @@ void a64_v_bit(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6ea01c00u, vd, vn, v
 /* XTN Vd.4H, Vn.4S (esz=1) / XTN Vd.2S, Vn.2D (esz=2): narrow lanes (low half) */
 void a64_v_xtn(A64Buf *b, int esz, int vd, int vn) { a64_emit32(b, 0x0e212800u | ((uint32_t)esz << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 /* CMN Xn, #imm12  == ADDS XZR, Xn, #imm */
+/* CMP Xn, Wm, SXTW  (SUBS XZR, Xn, Wm, SXTW #0): Z iff Xn == sext32(Wm) */
+void a64_cmp_ext_sxtw(A64Buf *b, int rn, int rm) { a64_emit32(b, 0xeb20c01fu | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(rn & 31) << 5)); }
 void a64_cmn_imm(A64Buf *b, int sf, int rn, int imm12) { a64_emit32(b, 0x3100001fu | ((uint32_t)sf << 31) | ((uint32_t)(imm12 & 0xfff) << 10) | ((uint32_t)(rn & 31) << 5)); }
 /* LDR/STR Qt/Dt/St, [Xn, Xm, LSL #s] register-offset (scaled iff `scaled`) */
 void a64_ldr_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled)
