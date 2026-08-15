@@ -308,6 +308,15 @@ static void datap2(A64Buf *b, uint32_t op, int sf, int rd, int rn, int rm)
 void a64_lslv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0x8, sf, rd, rn, rm); }
 void a64_lsrv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0x9, sf, rd, rn, rm); }
 void a64_asrv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0xa, sf, rd, rn, rm); }
+void a64_rorv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0xb, sf, rd, rn, rm); }
+
+/* EXTR rd, rn, rm, #lsb  (ROR rd, rn, #imm when rn == rm) */
+void a64_extr(A64Buf *b, int sf, int rd, int rn, int rm, int lsb)
+{
+    uint32_t n = sf ? 1u : 0u;
+    a64_emit32(b, 0x13800000u | ((uint32_t)sf << 31) | (n << 22) | ((uint32_t)(rm & 31) << 16) |
+               ((uint32_t)(lsb & 63) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
+}
 
 static void bfm(A64Buf *b, uint32_t opc, int sf, int rd, int rn, int immr, int imms)
 {

@@ -49,7 +49,7 @@ TESTS := hello exit42 args alu branches strings fib sse mmap_test fileio memstre
 # two-point regression variants of bench's `call` and `mem` workloads, used to
 # cancel process startup and fixed-work terms that make the short raw wall
 # clocks unusable as throughput ratios. Same rule: benchbin/, never bin/.
-BENCH := benchbin/bench benchbin/fibn benchbin/memn
+BENCH := benchbin/bench benchbin/fibn benchbin/memn benchbin/xbench
 BINS := $(addprefix bin/,$(TESTS))
 
 all: $(BINS)
@@ -71,6 +71,10 @@ benchbin/fibn: fibn.c $(COMMON) gsys.h
 benchbin/memn: memn.c $(COMMON) gsys.h
 	@mkdir -p benchbin
 	$(CC) $(CFLAGS) -o $@ $(COMMON) memn.c
+
+benchbin/xbench: xbench.c $(COMMON) gsys.h
+	@mkdir -p benchbin
+	$(CC) $(CFLAGS) -o $@ $(COMMON) xbench.c
 
 clean:
 	rm -rf bin benchbin
