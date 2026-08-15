@@ -2970,6 +2970,15 @@ static int xmm_pinning_enabled(void)
     if (on < 0) on = getenv("OCERZ_NO_XMM_PIN") ? 0 : 1;
     return on;
 }
+/* Global XMM layout: every block pins all 16 xmm registers (with full GPR
+ * pinning), so body-to-body transitions carry them in V16-V31 with no
+ * spill/reload; only function entry/exit and C callouts touch memory. */
+static int xmm_global_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = (getenv("OCERZ_NO_XMM_GLOBAL") || getenv("OCERZ_NO_FULLPIN")) ? 0 : 1;
+    return on;
+}
 static inline int xmm_vreg(unsigned xr) { return 16 + (int)xr; }
 static inline int xmm_is_pinned(unsigned xr) { return (g_xmm_pinned >> xr) & 1; }
 static void emit_pk_consts_load(A64Buf *b);
@@ -5137,7 +5146,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 not_body = a64_label(b); a64_tbz(b, JT0, 0, 0);
                 a64_mov_imm64(b, JTU, 1);
                 a64_bic_reg(b, 1, JT0, JT0, JTU, 0);
-                emit_xmm_pin_spill_all(b);
+                if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
                 a64_br(b, JT0);
                 a64_patch_tbz(not_body, a64_label(b));
                 a64_mov_imm64(b, JTU, 1);
@@ -5299,7 +5308,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         uint32_t *nobody = a64_label(b); a64_cbz(b, 1, JT0, 0);
         a64_ldr(b, 4, JTU, 20, INT_OFF);                  /* interrupt poll (back edges) */
         uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
-        emit_xmm_pin_spill_all(b);
+        if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
         a64_br(b, JT0);
         a64_patch_cbz(nobody, a64_label(b));
         a64_patch_cbz(intr, a64_label(b));
@@ -5669,7 +5678,8 @@ static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
 {
     int patch_stop = poll && !g_stop_patch;
     uint32_t *intr = NULL;
-    emit_xmm_pin_spill_all(b);           /* leaving the block: xmm state to memory */
+    if (!xmm_global_enabled())
+        emit_xmm_pin_spill_all(b);       /* per-block layouts: xmm state to memory */
     if (poll && !patch_stop) {
         a64_ldr(b, 4, JT1, 20, INT_OFF);
         intr = a64_label(b);
@@ -6194,7 +6204,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     /* XMM pin mask: every xmm register any instruction of the block touches
      * (blendv also reads xmm0).  Slow ops are fine: callouts spill/reload. */
     g_xmm_pinned = 0;
-    if (xmm_pinning_enabled() && sse_enabled()) {
+    if (xmm_pinning_enabled() && sse_enabled() && xmm_global_enabled() && !g_no_regflags) {
+        g_xmm_pinned = 0xffff;
+    } else if (xmm_pinning_enabled() && sse_enabled()) {
         for (int i = 0; i < n; i++) {
             const X86Insn *in = &blk->insns[i];
             for (int k = 0; k < in->nops; k++)
@@ -6239,10 +6251,13 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         a64_add_imm(&b, 1, 29, 31, 0);
 
     uint32_t *loop_poll_exit = NULL;
+    if (xmm_global_enabled())
+        emit_xmm_pin_load_all(&b);       /* function entry only: body edges keep V16-V31 live */
     if (!g_no_chain && !jit->stop_requested) {
         g_body_entry = a64_label(&b);
         emit_reload_mem_base(&b);
-        emit_xmm_pin_load_all(&b);
+        if (!xmm_global_enabled())
+            emit_xmm_pin_load_all(&b);
         g_loop_entry = a64_label(&b);
         /* Interrupt poll at the loop head.  Self-loops branch straight here
          * with no C callout, and a core spinning in a tiny fully-inlined loop
@@ -6252,7 +6267,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         loop_poll_exit = a64_label(&b);
         a64_cbnz(&b, 0, JT0, 0);
     } else {
-        emit_xmm_pin_load_all(&b);
+        if (!xmm_global_enabled())
+            emit_xmm_pin_load_all(&b);
     }
     if (ocerz_perfstat > 0) {   /* after body entry: counts every entry (PERFSTAT only) */
         a64_mov_imm64(&b, JT0, (uint64_t)(uintptr_t)&blk->exec_count);
