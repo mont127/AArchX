@@ -42,6 +42,8 @@ void a64_str(A64Buf *b, int size, int rt, int rn, uint32_t off);
 void a64_ldr_post64(A64Buf *b, int rt, int rn, int imm);
 void a64_str_pre64(A64Buf *b, int rt, int rn, int imm);
 void a64_ldr_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
+void a64_ldr_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled);
+void a64_str_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled);
 void a64_str_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
 void a64_ldar(A64Buf *b, int size, int rt, int rn);
 void a64_stlr(A64Buf *b, int size, int rt, int rn);
