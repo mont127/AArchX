@@ -250,6 +250,14 @@ static int g_mem_hoist_greg = -1;
 static int g_mem_hoist_aux_disp;
 #define JMEMBASE 17
 #define JMEMAUX 29
+#define JMEMBASE2 16          /* second hoisted base (x16 is only ever clobbered by callouts, which reload) */
+static int g_mem_hoist_greg2 = -1;
+static inline int hoist_reg_for(unsigned base)
+{
+    if (g_mem_hoist_greg >= 0 && base == (unsigned)g_mem_hoist_greg) return JMEMBASE;
+    if (g_mem_hoist_greg2 >= 0 && base == (unsigned)g_mem_hoist_greg2) return JMEMBASE2;
+    return -1;
+}
 /* x0 holds ocerz_guest_base for the whole block (materialized at function
  * entry and after every C callout; C calls set x0 themselves).  Only used
  * when there is no low_base alias (ea_fold() == guest_base). */
@@ -677,8 +685,8 @@ static void emit_materialize(A64Buf *b)
     a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_flags_materialize);
     a64_blr(b, 16);
     emit_fill_pinned_callersaved(b);
+    emit_reload_jgb(b);           /* JGB first: the hoisted bases derive from it */
     emit_reload_mem_base(b);
-    emit_reload_jgb(b);
     emit_xmm_pin_load_all(b);
     a64_patch_cbz(skip, a64_label(b));
 }
@@ -1867,14 +1875,24 @@ static void emit_reload_mem_base(A64Buf *b)
         return;
     int bs = pin_slot(g_mem_hoist_greg);
     assert(bs >= 0);
-    a64_mov_imm64(b, JMEMBASE, ocerz_guest_base);
-    a64_add_reg(b, 1, JMEMBASE, JMEMBASE, pin_hreg(bs), 0);
+    if (jgb_usable()) {
+        a64_add_reg(b, 1, JMEMBASE, JGB, pin_hreg(bs), 0);
+    } else {
+        a64_mov_imm64(b, JMEMBASE, ocerz_guest_base);
+        a64_add_reg(b, 1, JMEMBASE, JMEMBASE, pin_hreg(bs), 0);
+    }
     if (g_mem_hoist_aux_disp > 0)
         a64_add_imm(b, 1, JMEMAUX, JMEMBASE,
                     (uint32_t)g_mem_hoist_aux_disp);
     else if (g_mem_hoist_aux_disp < 0)
         a64_sub_imm(b, 1, JMEMAUX, JMEMBASE,
                     (uint32_t)-g_mem_hoist_aux_disp);
+    if (g_mem_hoist_greg2 >= 0) {
+        int bs2 = pin_slot(g_mem_hoist_greg2);
+        assert(bs2 >= 0);
+        if (jgb_usable()) a64_add_reg(b, 1, JMEMBASE2, JGB, pin_hreg(bs2), 0);
+        else { a64_mov_imm64(b, JMEMBASE2, ocerz_guest_base); a64_add_reg(b, 1, JMEMBASE2, JMEMBASE2, pin_hreg(bs2), 0); }
+    }
 }
 
 static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
@@ -1883,7 +1901,10 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
 {
     if (!g_plain_mem || g_mem_hoist_greg < 0 ||
         insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || mem->riprel ||
-        mem->base != g_mem_hoist_greg)
+        mem->base == OCERZ_REG_NONE)
+        return 0;
+    int hbase = hoist_reg_for(mem->base);
+    if (hbase < 0)
         return 0;
 
     int64_t disp = mem->disp;
@@ -1892,9 +1913,9 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
             (disp & (size - 1)) != 0)
             return 0;
         if (store)
-            a64_str(b, size, value_reg, JMEMBASE, (uint32_t)disp);
+            a64_str(b, size, value_reg, hbase, (uint32_t)disp);
         else
-            a64_ldr(b, size, value_reg, JMEMBASE, (uint32_t)disp);
+            a64_ldr(b, size, value_reg, hbase, (uint32_t)disp);
         return 1;
     }
 
@@ -1904,14 +1925,14 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
     if (is < 0 || (mem->scale & 3) != want_scale ||
         disp < -4095 || disp > 4095)
         return 0;
-    int base = JMEMBASE;
-    if (disp != 0 && disp == g_mem_hoist_aux_disp) {
+    int base = hbase;
+    if (disp != 0 && disp == g_mem_hoist_aux_disp && hbase == JMEMBASE) {
         base = JMEMAUX;
     } else if (disp != 0) {
         if (disp > 0)
-            a64_add_imm(b, 1, JTA, JMEMBASE, (uint32_t)disp);
+            a64_add_imm(b, 1, JTA, hbase, (uint32_t)disp);
         else
-            a64_sub_imm(b, 1, JTA, JMEMBASE, (uint32_t)-disp);
+            a64_sub_imm(b, 1, JTA, hbase, (uint32_t)-disp);
         base = JTA;
     }
     if (store)
@@ -2006,19 +2027,20 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
     if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
     int hb = pin_hreg(pin_slot(m->base));
-    /* hoisted base: JMEMBASE already holds guest_base + base */
-    int hoisted = g_mem_hoist_greg >= 0 && m->base == (unsigned)g_mem_hoist_greg;
+    /* hoisted base: JMEMBASE/JMEMBASE2 already holds guest_base + base */
+    int hreg = hoist_reg_for(m->base);
+    int hoisted = hreg >= 0;
     if (m->index != OCERZ_REG_NONE) {
         if (pin_slot(m->index) < 0) return 0;
         int hi = pin_hreg(pin_slot(m->index));
         int sc = m->scale & 3;
         int want = size == 16 ? 4 : size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
-        if ((m->disp == 0 || (hoisted && m->disp == g_mem_hoist_aux_disp && m->disp != 0)) &&
+        if ((m->disp == 0 || (hoisted && hreg == JMEMBASE && m->disp == g_mem_hoist_aux_disp && m->disp != 0)) &&
             (sc == 0 || sc == want)) {
             /* register-offset form (scales by the access size only); the
              * hoisted aux base already includes the block's common displacement */
             int ra = JTA;
-            if (hoisted) ra = m->disp ? JMEMAUX : JMEMBASE; else a64_add_reg(b, 1, JTA, JGB, hb, 0);
+            if (hoisted) ra = m->disp ? JMEMAUX : hreg; else a64_add_reg(b, 1, JTA, JGB, hb, 0);
             if (vec) { if (store) a64_str_v_regoff(b, size, reg, ra, hi, sc != 0); else a64_ldr_v_regoff(b, size, reg, ra, hi, sc != 0); }
             else     { if (store) a64_str_regoff(b, size, reg, ra, hi, sc != 0); else a64_ldr_regoff(b, size, reg, ra, hi, sc != 0); }
             return 1;
@@ -2034,7 +2056,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         }
         /* base + index<<s + disp: two adds, then a scaled immediate */
         if (m->disp < 0 || (m->disp % size) != 0 || m->disp / size > 4095) return 0;
-        if (hoisted) a64_add_reg(b, 1, JTA, JMEMBASE, hi, sc);
+        if (hoisted) a64_add_reg(b, 1, JTA, hreg, hi, sc);
         else { a64_add_reg(b, 1, JTA, JGB, hb, 0); a64_add_reg(b, 1, JTA, JTA, hi, sc); }
         if (vec) { if (store) a64_str_v(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JTA, (uint32_t)m->disp); }
         else     { if (store) a64_str(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr(b, size, reg, JTA, (uint32_t)m->disp); }
@@ -2043,7 +2065,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     /* base + disp: scaled unsigned immediate */
     if (m->disp < 0 || (m->disp % size) != 0 || m->disp / size > 4095) return 0;
     int ra = JTA;
-    if (hoisted) ra = JMEMBASE; else a64_add_reg(b, 1, JTA, JGB, hb, 0);
+    if (hoisted) ra = hreg; else a64_add_reg(b, 1, JTA, JGB, hb, 0);
     if (vec) { if (store) a64_str_v(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, ra, (uint32_t)m->disp); }
     else     { if (store) a64_str(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr(b, size, reg, ra, (uint32_t)m->disp); }
     return 1;
@@ -2071,23 +2093,24 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
     int64_t disp = op->disp;
     int fits = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
     int have = 0;
-    if (op->base != OCERZ_REG_NONE && g_mem_hoist_greg >= 0 && op->base == (unsigned)g_mem_hoist_greg) {
-        /* JMEMBASE = guest_base + base for the whole block */
+    int hreg = op->base != OCERZ_REG_NONE ? hoist_reg_for(op->base) : -1;
+    if (hreg >= 0) {
+        /* JMEMBASE/JMEMBASE2 = guest_base + base for the whole block */
         if (op->index == OCERZ_REG_NONE) {
-            if (fits) { *ra_out = JMEMBASE; *disp_out = (uint32_t)disp; return 1; }
-            if (disp > 0 && disp <= 4095)       a64_add_imm(b, 1, JTA, JMEMBASE, (uint32_t)disp);
-            else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, JMEMBASE, (uint32_t)-disp);
-            else { a64_mov_imm64(b, JTU, (uint64_t)disp); a64_add_reg(b, 1, JTA, JMEMBASE, JTU, 0); }
+            if (fits) { *ra_out = hreg; *disp_out = (uint32_t)disp; return 1; }
+            if (disp > 0 && disp <= 4095)       a64_add_imm(b, 1, JTA, hreg, (uint32_t)disp);
+            else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, hreg, (uint32_t)-disp);
+            else { a64_mov_imm64(b, JTU, (uint64_t)disp); a64_add_reg(b, 1, JTA, hreg, JTU, 0); }
             *ra_out = JTA; *disp_out = 0;
             return 1;
         }
-        a64_add_reg(b, 1, JTA, JMEMBASE, pin_hreg(pin_slot(op->index)), op->scale & 3);
+        a64_add_reg(b, 1, JTA, hreg, pin_hreg(pin_slot(op->index)), op->scale & 3);
         have = 1;
     } else if (op->base != OCERZ_REG_NONE) {
         a64_add_reg(b, 1, JTA, JGB, pin_hreg(pin_slot(op->base)), 0);
         have = 1;
     }
-    if (op->index != OCERZ_REG_NONE && !(have && op->base == (unsigned)g_mem_hoist_greg && g_mem_hoist_greg >= 0)) {
+    if (op->index != OCERZ_REG_NONE && !(have && hreg >= 0)) {
         a64_add_reg(b, 1, JTA, have ? JTA : JGB, pin_hreg(pin_slot(op->index)), op->scale & 3);
         have = 1;
     }
@@ -2116,8 +2139,8 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
         int sc = op->scale & 3;
         int want = size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
         if (sc == 0 || sc == want) {
-            int hb = (g_mem_hoist_greg >= 0 && op->base == (unsigned)g_mem_hoist_greg) ? JMEMBASE : JTA;
-            if (hb == JTA) a64_add_reg(b, 1, JTA, JGB, pin_hreg(pin_slot(op->base)), 0);
+            int hb = hoist_reg_for(op->base);
+            if (hb < 0) { hb = JTA; a64_add_reg(b, 1, JTA, JGB, pin_hreg(pin_slot(op->base)), 0); }
             a64_ldr_regoff(b, size, rd, hb, pin_hreg(pin_slot(op->index)), sc != 0);
             return 1;
         }
@@ -6492,8 +6515,8 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     exit_sites[*n_exits] = a64_label(b);
     a64_cbnz(b, 0, 0, 0);
     (*n_exits)++;
+    emit_reload_jgb(b);           /* JGB first: the hoisted bases derive from it */
     emit_reload_mem_base(b);
-    emit_reload_jgb(b);
 }
 
 int ocerz_jitstat = -1;
@@ -6857,9 +6880,8 @@ static int insn_may_write_gpr(const X86Insn *in, unsigned reg)
     case OCERZ_OP_MOVS: case OCERZ_OP_STOS: case OCERZ_OP_LODS: case OCERZ_OP_SCAS: case OCERZ_OP_CMPS:
         if (reg == OCERZ_RSI || reg == OCERZ_RDI || reg == OCERZ_RCX || reg == OCERZ_RAX) return 1;
         break;
-    case OCERZ_OP_SYSCALL:
-        if (reg == OCERZ_RAX || reg == OCERZ_RCX || (reg == 11)) return 1;
-        break;
+    case OCERZ_OP_SYSCALL: case OCERZ_OP_INT: case OCERZ_OP_INT3:
+        return 1;                       /* kernel/emulator side: rax, rdx (2nd result), rcx, r11, ... */
     case OCERZ_OP_XCHG: case OCERZ_OP_XADD:
         for (int k = 0; k < in->nops; k++)
             if (in->ops[k].kind == OCERZ_OPK_REG && (in->ops[k].reg & 15) == reg) return 1;
@@ -6910,18 +6932,22 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
                 aux[bb] = (int)mem->disp;
         }
     }
-    int best = -1, bestn = 0;
+    int best = -1, bestn = 0, second = -1, secondn = 0;
     for (int r = 0; r < 16; r++) {
-        if (count[r] <= bestn) continue;
+        if (count[r] <= 0 || count[r] <= secondn) continue;
         if (g_pin_class == 2 && r == OCERZ_RSP) continue;
         int written = 0;
         for (int i = 0; i < n && !written; i++)
             written = insn_may_write_gpr(&insns[i], (unsigned)r);
         if (written) continue;
-        best = r; bestn = count[r];
+        if (count[r] > bestn) { second = best; secondn = bestn; best = r; bestn = count[r]; }
+        else { second = r; secondn = count[r]; }
     }
     if (best < 0) return -1;
     g_mem_hoist_aux_disp = aux[best];
+    g_mem_hoist_greg2 = second;
+    if (getenv("OCERZ_HOISTLOG"))
+        fprintf(stderr, "HOIST rip=%#llx base=%d(n=%d) aux=%d second=%d(n=%d)\n", (unsigned long long)rip, best, bestn, aux[best], second, secondn);
     return best;
 }
 
@@ -7153,6 +7179,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_stop_patch = NULL;
     g_stop_target = NULL;
     g_mem_hoist_greg = -1;
+    g_mem_hoist_greg2 = -1;
     g_mem_hoist_aux_disp = 0;
     int fuse_cmp = n >= 2 &&
         can_fuse_cmp_test_jcc(&blk->insns[n - 2], &blk->insns[n - 1], rip);
