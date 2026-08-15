@@ -2457,6 +2457,38 @@ static unsigned producer_record_kind(const X86Insn *p, int *size)
     default: return 0;
     }
 }
+/* Will the flag consumer `insns[ci]` (jcc/setcc/cmov) be evaluated with the
+ * fcmp-based comis fusion?  Pure predicate shared by the liveness pass and
+ * emit_cc_predicate so both agree.  Returns the producer index or -1. */
+static uint64_t g_cur_need;          /* fl_need of the instruction being emitted */
+static const X86Insn *g_cur_insns;   /* the block's instructions (for index-based predicates) */
+static int sse_enabled(void);
+static int comis_fuse_producer(const X86Insn *insns, int ci)
+{
+    unsigned cc = insns[ci].cc;
+    if (!(cc == OCERZ_CC_A || cc == OCERZ_CC_AE || cc == OCERZ_CC_B || cc == OCERZ_CC_BE ||
+          cc == OCERZ_CC_P || cc == OCERZ_CC_NP || cc == OCERZ_CC_E || cc == OCERZ_CC_NE))
+        return -1;
+    int pi = -1;
+    for (int k = ci - 1; k >= 0; k--) {
+        uint64_t def, use;
+        ocerz_flags_defuse(&insns[k], &def, &use);
+        if (def & JIT_ARITH_FLAGS) { pi = k; break; }
+    }
+    if (pi < 0) return -1;
+    const X86Insn *p = &insns[pi];
+    if (!(p->op == OCERZ_OP_UCOMISD || p->op == OCERZ_OP_UCOMISS ||
+          p->op == OCERZ_OP_COMISD || p->op == OCERZ_OP_COMISS)) return -1;
+    if (p->ops[0].kind != OCERZ_OPK_XMM || !xmm_is_pinned(p->ops[0].reg)) return -1;
+    if (p->ops[1].kind != OCERZ_OPK_XMM || !xmm_is_pinned(p->ops[1].reg)) return -1;
+    for (int k = pi + 1; k < ci; k++) {
+        const X86Insn *m = &insns[k];
+        if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_XMM &&
+            (m->ops[0].reg == p->ops[0].reg || m->ops[0].reg == p->ops[1].reg))
+            return -1;
+    }
+    return pi;
+}
 /* after `adds`: CF = C (no inversion), same table as subs otherwise except B/AE */
 static int cc_after_adds(unsigned cc)
 {
@@ -2519,15 +2551,12 @@ static void emit_cc_predicate(A64Buf *b, unsigned cc)
      * NZCV directly (2 words) -- valid because between producer and consumer
      * no instruction wrote flags (producer is the nearest flag writer) and we
      * additionally require the two xmm operands to be untouched. */
-    if (g_flag_producer && (g_flag_producer->op == OCERZ_OP_UCOMISD ||
-                            g_flag_producer->op == OCERZ_OP_UCOMISS ||
-                            g_flag_producer->op == OCERZ_OP_COMISD ||
-                            g_flag_producer->op == OCERZ_OP_COMISS) &&
-        g_flag_producer_operands_intact &&
-        g_flag_producer->ops[0].kind == OCERZ_OPK_XMM && xmm_is_pinned(g_flag_producer->ops[0].reg) &&
-        g_flag_producer->ops[1].kind == OCERZ_OPK_XMM && xmm_is_pinned(g_flag_producer->ops[1].reg) &&
-        (cc == OCERZ_CC_A || cc == OCERZ_CC_AE || cc == OCERZ_CC_B || cc == OCERZ_CC_BE ||
-         cc == OCERZ_CC_P || cc == OCERZ_CC_NP || cc == OCERZ_CC_E || cc == OCERZ_CC_NE)) {
+    if (g_cur_insns && g_cur_insn_idx >= 0 && sse_enabled() &&
+        (g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_JCC || g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_SETCC ||
+         g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_CMOVCC) &&
+        g_cur_insns[g_cur_insn_idx].cc == cc &&
+        comis_fuse_producer(g_cur_insns, g_cur_insn_idx) >= 0) {
+        g_flag_producer = &g_cur_insns[comis_fuse_producer(g_cur_insns, g_cur_insn_idx)];
         int dbl = g_flag_producer->op == OCERZ_OP_UCOMISD || g_flag_producer->op == OCERZ_OP_COMISD;
         a64_fcmp(b, dbl, xmm_vreg(g_flag_producer->ops[0].reg), xmm_vreg(g_flag_producer->ops[1].reg));
         switch (cc) {
@@ -3532,6 +3561,8 @@ static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (vb < 0) return 0;
     int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
     if (va == VX0) emit_xmm_ld_lo(b, esz, VX0, d->reg);
+    if (g_cur_need == 0)
+        return 1;                          /* flags dead (consumer fuses on fcmp): no RFLAGS write */
     a64_fcmp(b, dbl, va, vb);              /* scalar fcmp reads the low lane only */
     /* arm64 after fcmp: unordered -> N=0,Z=0,C=1,V=1 ; a<b -> N=1 ; a==b -> Z=1,C=1 ; a>b -> C=1
      * x86: unordered -> ZF=PF=CF=1 ; a<b -> CF=1 ; a==b -> ZF=1 ; a>b -> all 0.
@@ -6500,6 +6531,13 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 ocerz_flags_defuse_nofault(&blk->insns[i], &def, &use);
             else
                 ocerz_flags_defuse(&blk->insns[i], &def, &use);
+            /* a jcc/setcc/cmov that will re-derive its condition from fcmp
+             * (comis fusion) does not read RFLAGS: don't keep the comis's
+             * flag write alive on its account */
+            if ((blk->insns[i].op == OCERZ_OP_JCC || blk->insns[i].op == OCERZ_OP_SETCC ||
+                 blk->insns[i].op == OCERZ_OP_CMOVCC) && sse_enabled() &&
+                comis_fuse_producer(blk->insns, i) >= 0)
+                use = 0;
             fl_need[i] = def & live_seam;
             live_seam = (live_seam & ~def) | use;
             live_all = (live_all & ~def) | use;
@@ -6541,6 +6579,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
         g_cur_insn_idx = i;
+        g_cur_need = fl_need[i];
+        g_cur_insns = blk->insns;
         g_flag_producer = last_flag_def >= 0 ? &blk->insns[last_flag_def] : NULL;
         {
             /* operands intact: scan intervening insns for writes to the
