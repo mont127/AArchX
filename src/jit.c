@@ -2293,6 +2293,149 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
+/* 8/16-bit register-destination add/sub/and/or/xor with reg/imm source
+ * (deferred flags with the narrow size; result inserted into the low
+ * byte/word of the destination register). */
+static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (!g_defer) return 0;
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 1 && d->size != 2)) return 0;
+    if (g_pin_class == 2 && d->reg == OCERZ_RSP) return 0;
+    if (s->kind == OCERZ_OPK_REG) { if (s->high8 || s->size != d->size) return 0; }
+    else if (s->kind != OCERZ_OPK_IMM) return 0;
+    unsigned op = insn->op;
+    if (op != OCERZ_OP_ADD && op != OCERZ_OP_SUB && op != OCERZ_OP_AND &&
+        op != OCERZ_OP_OR && op != OCERZ_OP_XOR) return 0;
+    int size = d->size, bits = size * 8;
+    uint64_t mask = size == 1 ? 0xffull : 0xffffull;
+    emit_gpr_rd(b, 1, JT0, d->reg);            /* full reg in JT0 */
+    if (size == 1) a64_uxtb(b, JTT, JT0); else a64_uxth(b, JTT, JT0);   /* JTT = narrow dst */
+    if (s->kind == OCERZ_OPK_REG) {
+        emit_gpr_rd(b, 1, JT1, s->reg);
+        if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
+    } else
+        a64_mov_imm64(b, JT1, (uint64_t)s->imm & mask);
+    switch (op) {
+    case OCERZ_OP_ADD: a64_add_reg(b, 0, JT2, JTT, JT1, 0); break;
+    case OCERZ_OP_SUB: a64_sub_reg(b, 0, JT2, JTT, JT1, 0); break;
+    case OCERZ_OP_AND: a64_and_reg(b, 0, JT2, JTT, JT1, 0); break;
+    case OCERZ_OP_OR:  a64_orr_reg(b, 0, JT2, JTT, JT1, 0); break;
+    case OCERZ_OP_XOR: a64_eor_reg(b, 0, JT2, JTT, JT1, 0); break;
+    }
+    a64_bfi(b, 1, JT0, JT2, 0, bits);          /* insert low bits */
+    emit_gpr_wr(b, JT0, d->reg);
+    if (need) {
+        if (op == OCERZ_OP_ADD)      emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_ADD, size, 0), JTT, JT1);
+        else if (op == OCERZ_OP_SUB) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JTT, JT1);
+        else {
+            if (size == 1) a64_uxtb(b, JT2, JT2); else a64_uxth(b, JT2, JT2);
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2);
+        }
+    }
+    return 1;
+}
+
+/* cbw/cwde/cdqe and cwd/cdq/cqo */
+static int emit_cbw_cwd(A64Buf *b, const X86Insn *insn)
+{
+    if (g_pin_class == 2) return 0;
+    if (insn->op == OCERZ_OP_CBW) {
+        emit_gpr_rd(b, 1, JT0, OCERZ_RAX);
+        if (insn->opsize == 2)      { a64_sxtb(b, 0, JT1, JT0); a64_bfi(b, 1, JT0, JT1, 0, 16); }
+        else if (insn->opsize == 4) { a64_sxth(b, 0, JT0, JT0); }        /* W-form: zero-extends to 64 */
+        else                        { a64_sxtw(b, JT0, JT0); }
+        emit_gpr_wr(b, JT0, OCERZ_RAX);
+        return 1;
+    }
+    /* CWD/CDQ/CQO: RDX = sign(RAX) */
+    emit_gpr_rd(b, 1, JT0, OCERZ_RAX);
+    if (insn->opsize == 2) {
+        emit_gpr_rd(b, 1, JT1, OCERZ_RDX);
+        a64_sbfx(b, 1, JT0, JT0, 15, 1);      /* -1/0 from bit 15 */
+        a64_bfi(b, 1, JT1, JT0, 0, 16);
+        emit_gpr_wr(b, JT1, OCERZ_RDX);
+    } else if (insn->opsize == 4) {
+        a64_asr_imm(b, 0, JT0, JT0, 31);      /* W-form: 0/0xffffffff, upper zero */
+        emit_gpr_wr(b, JT0, OCERZ_RDX);
+    } else {
+        a64_asr_imm(b, 1, JT0, JT0, 63);
+        emit_gpr_wr(b, JT0, OCERZ_RDX);
+    }
+    return 1;
+}
+
+/* div/idiv (32/64-bit, register or memory divisor).  Fast path when the
+ * high half is the trivial extension (RDX==0 for div, RDX==sext(RAX) for
+ * idiv) -- the overwhelmingly common shape after xor edx,edx / cqo.  Any
+ * other case (128-bit numerator, zero divisor, overflow) takes the slow call,
+ * which traps exactly like the interpreter. */
+static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *o = &insn->ops[0];
+    if (o->size != 4 && o->size != 8) return 0;
+    if (g_pin_class == 2) return 0;
+    if (insn->seg != OCERZ_SEG_NONE) return 0;
+    int sf = o->size == 8;
+    int is_idiv = insn->op == OCERZ_OP_IDIV;
+    /* divisor -> JT2 (memory first: EA clobbers JT0) */
+    if (o->kind == OCERZ_OPK_MEM) {
+        if (!emit_mem_ea(b, insn, o, JTA)) return 0;
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        emit_guest_load_ordered(b, o->size, JT2, JTA, JTU);
+        patch_guard_skip(skip, a64_label(b));
+    } else if (o->kind == OCERZ_OPK_REG) {
+        if (o->high8) return 0;
+        emit_gpr_rd(b, sf, JT2, o->reg);
+    } else return 0;
+    emit_gpr_rd(b, sf, JT0, OCERZ_RAX);
+    emit_gpr_rd(b, sf, JT1, OCERZ_RDX);
+    /* slow-path conditions */
+    uint32_t *to_slow[2]; int ns = 0;
+    a64_subs_imm(b, sf, A64_ZR, JT2, 0);                 /* divisor == 0 */
+    to_slow[ns++] = a64_label(b); a64_bcond(b, A64_EQ, 0);
+    if (is_idiv) {
+        a64_asr_imm(b, sf, JTT, JT0, sf ? 63 : 31);      /* expected high = sext */
+        a64_subs_reg(b, sf, A64_ZR, JT1, JTT, 0);
+    } else {
+        a64_subs_imm(b, sf, A64_ZR, JT1, 0);
+    }
+    to_slow[ns++] = a64_label(b); a64_bcond(b, A64_NE, 0);
+    if (is_idiv) {
+        /* INT_MIN / -1 overflows on x86 (#DE) -> slow */
+        a64_mov_imm64(b, JTT, sf ? 0x8000000000000000ull : 0x80000000ull);
+        a64_subs_reg(b, sf, A64_ZR, JT0, JTT, 0);
+        uint32_t *not_min = a64_label(b); a64_bcond(b, A64_NE, 0);
+        a64_mov_imm64(b, JTT, sf ? ~0ull : 0xffffffffull);
+        a64_subs_reg(b, sf, A64_ZR, JT2, JTT, 0);
+        uint32_t *to_slow3 = a64_label(b); a64_bcond(b, A64_EQ, 0);
+        a64_patch_bcond(not_min, a64_label(b));
+        /* compute */
+        a64_sdiv(b, sf, JTT, JT0, JT2);
+        a64_msub(b, sf, JTU, JTT, JT2, JT0);          /* rem = rax - q*div */
+        emit_gpr_wr(b, JTT, OCERZ_RAX);
+        emit_gpr_wr(b, JTU, OCERZ_RDX);
+        uint32_t *done = a64_label(b); a64_b(b, 0);
+        uint32_t *slow = a64_label(b);
+        a64_patch_bcond(to_slow3, slow);
+        for (int i = 0; i < ns; i++) a64_patch_bcond(to_slow[i], slow);
+        emit_slowcall(b, insn, exit_sites, n_exits);
+        a64_patch_b(done, a64_label(b));
+    } else {
+        a64_udiv(b, sf, JTT, JT0, JT2);
+        a64_msub(b, sf, JTU, JTT, JT2, JT0);
+        emit_gpr_wr(b, JTT, OCERZ_RAX);
+        emit_gpr_wr(b, JTU, OCERZ_RDX);
+        uint32_t *done = a64_label(b); a64_b(b, 0);
+        uint32_t *slow = a64_label(b);
+        for (int i = 0; i < ns; i++) a64_patch_bcond(to_slow[i], slow);
+        emit_slowcall(b, insn, exit_sites, n_exits);
+        a64_patch_b(done, a64_label(b));
+    }
+    return 1;
+}
+
 static int emit_not_neg(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
@@ -3114,6 +3257,8 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
 
         if (emit_cmp_test_narrow(b, insn, need, exit_sites, n_exits))
             return 1;
+        if (emit_arith_narrow(b, insn, need))
+            return 1;
         if (insn->ops[1].kind == OCERZ_OPK_MEM)
             return emit_arith_mem(b, insn, need, exit_sites, n_exits);
         return emit_arith(b, insn, need);
@@ -3135,6 +3280,12 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_ADC:
     case OCERZ_OP_SBB:
         return emit_adc_sbb(b, insn, need);
+    case OCERZ_OP_CBW:
+    case OCERZ_OP_CWD:
+        return emit_cbw_cwd(b, insn);
+    case OCERZ_OP_DIV:
+    case OCERZ_OP_IDIV:
+        return emit_div(b, insn, exit_sites, n_exits);
     case OCERZ_OP_CMOVCC:
         if (getenv("OCERZ_NO_INLINE_CMOV")) return 0;
         return emit_cmov(b, insn, exit_sites, n_exits);
