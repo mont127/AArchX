@@ -72,6 +72,9 @@ void a64_bic_reg(A64Buf *b, int sf, int rd, int rn, int rm, int lsl);
 
 void a64_lslv(A64Buf *b, int sf, int rd, int rn, int rm);
 void a64_rorv(A64Buf *b, int sf, int rd, int rn, int rm);
+void a64_udiv(A64Buf *b, int sf, int rd, int rn, int rm);
+void a64_sdiv(A64Buf *b, int sf, int rd, int rn, int rm);
+void a64_msub(A64Buf *b, int sf, int rd, int rn, int rm, int ra);
 void a64_extr(A64Buf *b, int sf, int rd, int rn, int rm, int lsb);
 void a64_lsrv(A64Buf *b, int sf, int rd, int rn, int rm);
 void a64_asrv(A64Buf *b, int sf, int rd, int rn, int rm);

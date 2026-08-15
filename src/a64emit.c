@@ -309,6 +309,14 @@ void a64_lslv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0x8, sf, rd
 void a64_lsrv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0x9, sf, rd, rn, rm); }
 void a64_asrv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0xa, sf, rd, rn, rm); }
 void a64_rorv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0xb, sf, rd, rn, rm); }
+void a64_udiv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0x2, sf, rd, rn, rm); }
+void a64_sdiv(A64Buf *b, int sf, int rd, int rn, int rm) { datap2(b, 0x3, sf, rd, rn, rm); }
+/* MSUB rd = ra - rn*rm */
+void a64_msub(A64Buf *b, int sf, int rd, int rn, int rm, int ra)
+{
+    a64_emit32(b, 0x1b008000u | ((uint32_t)sf << 31) | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(ra & 31) << 10) |
+               ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
+}
 
 /* EXTR rd, rn, rm, #lsb  (ROR rd, rn, #imm when rn == rm) */
 void a64_extr(A64Buf *b, int sf, int rd, int rn, int rm, int lsb)
