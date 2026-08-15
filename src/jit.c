@@ -1905,15 +1905,23 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
     int hb = pin_hreg(pin_slot(m->base));
     if (m->index != OCERZ_REG_NONE) {
-        if (m->disp != 0 || pin_slot(m->index) < 0) return 0;
+        if (pin_slot(m->index) < 0) return 0;
         int hi = pin_hreg(pin_slot(m->index));
         int sc = m->scale & 3;
-        /* register-offset form scales by the access size only */
         int want = size == 16 ? 4 : size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
-        if (sc != 0 && sc != want) return 0;
+        if (m->disp == 0 && (sc == 0 || sc == want)) {
+            /* register-offset form (scales by the access size only) */
+            a64_add_reg(b, 1, JTA, JGB, hb, 0);
+            if (vec) { if (store) a64_str_v_regoff(b, size, reg, JTA, hi, sc != 0); else a64_ldr_v_regoff(b, size, reg, JTA, hi, sc != 0); }
+            else     { if (store) a64_str_regoff(b, size, reg, JTA, hi, sc != 0); else a64_ldr_regoff(b, size, reg, JTA, hi, sc != 0); }
+            return 1;
+        }
+        /* base + index<<s + disp: two adds, then a scaled immediate */
+        if (m->disp < 0 || (m->disp % size) != 0 || m->disp / size > 4095) return 0;
         a64_add_reg(b, 1, JTA, JGB, hb, 0);
-        if (vec) { if (store) a64_str_v_regoff(b, size, reg, JTA, hi, sc != 0); else a64_ldr_v_regoff(b, size, reg, JTA, hi, sc != 0); }
-        else     { if (store) a64_str_regoff(b, size, reg, JTA, hi, sc != 0); else a64_ldr_regoff(b, size, reg, JTA, hi, sc != 0); }
+        a64_add_reg(b, 1, JTA, JTA, hi, sc);
+        if (vec) { if (store) a64_str_v(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JTA, (uint32_t)m->disp); }
+        else     { if (store) a64_str(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr(b, size, reg, JTA, (uint32_t)m->disp); }
         return 1;
     }
     /* base + disp: scaled unsigned immediate */
@@ -3525,14 +3533,30 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         /* x86 returns 0x8000.. (indefinite) on overflow/NaN; arm64 saturates.  Match x86 for NaN
          * and out-of-range by checking the flags: unordered/overflow are rare -> accept saturation
          * differences?  No: keep exactness -- detect NaN via fcmp and force indefinite. */
+        /* hot path: fcvtzs + a range/NaN check that almost never fires.
+         * x86 returns the "integer indefinite" (INT_MIN) for NaN and for
+         * out-of-range; arm64 saturates.  Only INT_MAX (positive overflow) and
+         * NaN (-> arm64 gives 0) differ, so: result == INT_MAX or NaN -> fix. */
+        /* x86: NaN or |v| out of range -> "integer indefinite" (INT_MIN).
+         * arm64 fcvtzs saturates.  The only divergences are NaN (arm64 -> 0)
+         * and v >= 2^31 / 2^63 (arm64 -> INT_MAX): test the INPUT against the
+         * positive threshold: (v >= thr) or unordered  <=>  fcmp cond GE|VS. */
         a64_fcvtzs(b, d->size == 8, dbl, JT0, VX0);
-        a64_fcmp(b, dbl, VX0, VX0);              /* VS <=> NaN */
-        a64_mov_imm64(b, JT1, d->size == 8 ? 0x8000000000000000ull : 0x80000000ull);
-        a64_csel(b, 1, JT0, JT1, JT0, A64_VS);
-        /* out-of-range: arm64 saturates to INT_MAX/INT_MIN, x86 gives INT_MIN.  Fix INT_MAX case. */
-        a64_mov_imm64(b, JTU, d->size == 8 ? 0x7fffffffffffffffull : 0x7fffffffull);
-        a64_subs_reg(b, 1, A64_ZR, JT0, JTU, 0);
-        a64_csel(b, 1, JT0, JT1, JT0, A64_EQ);
+        {
+            uint64_t thr_bits;
+            if (dbl) thr_bits = d->size == 8 ? 0x43e0000000000000ull /* 2^63 */ : 0x41e0000000000000ull /* 2^31 */;
+            else     thr_bits = d->size == 8 ? 0x5f000000ull /* 2^63f */ : 0x4f000000ull /* 2^31f */;
+            a64_mov_imm64(b, JTU, thr_bits);
+            a64_fmov_v_from_x(b, dbl, VX1, JTU);
+            a64_fcmp(b, dbl, VX0, VX1);          /* GE: v >= thr ; VS: NaN */
+            uint32_t *ovf = a64_label(b); a64_bcond(b, A64_GE, 0);
+            uint32_t *nan = a64_label(b); a64_bcond(b, A64_VS, 0);
+            uint32_t *ok  = a64_label(b); a64_b(b, 0);
+            a64_patch_bcond(ovf, a64_label(b));
+            a64_patch_bcond(nan, a64_label(b));
+            a64_mov_imm64(b, JT0, d->size == 8 ? 0x8000000000000000ull : 0x80000000ull);
+            a64_patch_b(ok, a64_label(b));
+        }
         if (d->size == 4) a64_mov_reg(b, 0, JT0, JT0);
         emit_gpr_wr(b, JT0, d->reg);
         return 1;
