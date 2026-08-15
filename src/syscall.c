@@ -2261,6 +2261,8 @@ static int sys_sigaction(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         guest_sigact[sig].tramp = ocerz_ld(act + 8, 8);
         guest_sigact[sig].mask = (uint32_t)ocerz_ld(act + 16, 4);
         guest_sigact[sig].flags = (uint32_t)ocerz_ld(act + 20, 4);
+        uint64_t h = guest_sigact[sig].handler;
+        ocerz_vm_mirror_host_signal(sig, h == 0 ? 0 : h == 1 ? 1 : 2);
     }
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
