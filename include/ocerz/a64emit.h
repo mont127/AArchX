@@ -8,7 +8,7 @@ enum {
     A64_EQ = 0, A64_NE = 1, A64_CS = 2, A64_CC = 3,
     A64_MI = 4, A64_PL = 5, A64_VS = 6, A64_VC = 7,
     A64_HI = 8, A64_LS = 9, A64_GE = 10, A64_LT = 11,
-    A64_GT = 12, A64_LE = 13, A64_AL = 14,
+    A64_GT = 12, A64_LE = 13, A64_AL = 14, A64_NV = 15,
 };
 
 #define A64_INV(cc) ((cc) ^ 1)
