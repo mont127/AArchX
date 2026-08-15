@@ -122,6 +122,7 @@ struct OcerzJit {
     uint64_t blocks_translated;
 
     JitCodeIndex *ci;
+    uint32_t *dispatch_stub;   /* in-arena block dispatcher (see emit_dispatch_stub) */
 };
 
 int ocerz_perfstat = -1;
@@ -2520,29 +2521,22 @@ static int emit_bswap(A64Buf *b, const X86Insn *insn)
 #define XMM_BASE_OFF ((uint32_t)offsetof(OcerzCPU, xmm))
 enum { VX0 = 0, VX1 = 1, VX2 = 2, VX3 = 3 };
 
-static void emit_xmm_base(A64Buf *b, int reg)      /* reg = x20 + xmm base */
-{
-    a64_add_imm(b, 1, reg, 20, XMM_BASE_OFF);
-}
+_Static_assert(offsetof(OcerzCPU, xmm) % 16 == 0, "xmm must be 16-aligned for scaled q loads");
 static void emit_xmm_ld(A64Buf *b, int vd, unsigned xr)   /* full 128-bit */
 {
-    emit_xmm_base(b, JTA);
-    a64_ldr_v(b, 16, vd, JTA, (uint32_t)xr * 16);
+    a64_ldr_v(b, 16, vd, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
 static void emit_xmm_st(A64Buf *b, int vs, unsigned xr)
 {
-    emit_xmm_base(b, JTA);
-    a64_str_v(b, 16, vs, JTA, (uint32_t)xr * 16);
+    a64_str_v(b, 16, vs, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
 static void emit_xmm_ld_lo(A64Buf *b, int size, int vd, unsigned xr) /* 4/8 low bytes; upper zero */
 {
-    emit_xmm_base(b, JTA);
-    a64_ldr_v(b, size, vd, JTA, (uint32_t)xr * 16);
+    a64_ldr_v(b, size, vd, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
 static void emit_xmm_st_lo(A64Buf *b, int size, int vs, unsigned xr) /* only low 4/8 bytes */
 {
-    emit_xmm_base(b, JTA);
-    a64_str_v(b, size, vs, JTA, (uint32_t)xr * 16);
+    a64_str_v(b, size, vs, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
 
 /* Guest memory operand -> host address in JTA (with guard/skip pair). */
@@ -2631,9 +2625,8 @@ static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **ex
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_XMM) {
         /* dst.lo(size) = src.lo(size); rest of dst preserved */
-        emit_xmm_base(b, JTA);
-        a64_ldr_v(b, size, VX0, JTA, (uint32_t)s->reg * 16);
-        a64_str_v(b, size, VX0, JTA, (uint32_t)d->reg * 16);
+        emit_xmm_ld_lo(b, size, VX0, s->reg);
+        emit_xmm_st_lo(b, size, VX0, d->reg);
         return 1;
     }
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_MEM) {
@@ -2659,6 +2652,9 @@ static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **ex
  * generates the positive one.  Fix up results that equal arm64's default NaN. */
 static void emit_nan_fix_scalar(A64Buf *b, int dbl, int v)   /* v = result reg */
 {
+    /* hot path: fcmp + not-taken branch (results are almost never NaN) */
+    a64_fcmp(b, dbl, v, v);
+    uint32_t *ok = a64_label(b); a64_bcond(b, A64_VC, 0);
     if (dbl) {
         a64_fmov_x_from_v(b, 1, JT0, v);
         a64_mov_imm64(b, JT1, 0x7ff8000000000000ull);
@@ -2674,6 +2670,7 @@ static void emit_nan_fix_scalar(A64Buf *b, int dbl, int v)   /* v = result reg *
         a64_csel(b, 0, JT0, JT1, JT0, A64_EQ);
         a64_fmov_v_from_x(b, 0, v, JT0);
     }
+    a64_patch_bcond(ok, a64_label(b));
 }
 static void emit_nan_fix_packed(A64Buf *b, int dbl, int v, int tmp1, int tmp2)
 {
@@ -4446,6 +4443,71 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 /* Emit: target(JT1) -> RIP; monomorphic IC probe; on miss an inline hashed
  * lookup of the block cache (walks up to 4 chain entries); found -> br host
  * code; else C fill of the IC slot + epilogue to the dispatcher. */
+/* Global dispatch stub.  Entered like a block (x0=vm, x1=cpu, no frame of
+ * its own).  If the CPU must stop (interrupt/terminated) or the VM exited,
+ * returns to C with x0 = STEP_OK so the run loop sees the flags.  Otherwise
+ * looks the current rip up in the block cache and br's to the compiled
+ * block; on a miss returns to C (which compiles it).  Blocks branch here
+ * instead of ret'ing, so a hot loop never re-enters ocerz_jit_step. */
+static void emit_dispatch_stub(OcerzJit *jit)
+{
+    A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
+    uint32_t *entry = b.p;
+    uint32_t *to_ret[6]; int nr = 0;
+    a64_ldr(&b, 4, JT0, 1, INT_OFF);
+    to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 0, JT0, 0);
+    a64_ldr(&b, 4, JT0, 1, (uint32_t)offsetof(OcerzCPU, terminated));
+    to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 0, JT0, 0);
+    a64_ldr(&b, 4, JT0, 0, (uint32_t)offsetof(struct OcerzVM, exited));
+    to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 0, JT0, 0);
+    a64_ldr(&b, 8, JT1, 1, RIP_OFF);                    /* JT1 = rip */
+    /* dyldapi range must go through C */
+    a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_LO);
+    a64_sub_reg(&b, 1, JTT, JT1, JTU, 0);
+    a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO);
+    a64_subs_reg(&b, 1, A64_ZR, JTT, JTU, 0);
+    to_ret[nr++] = a64_label(&b); a64_bcond(&b, A64_CC, 0);
+    /* hash */
+    a64_lsr_imm(&b, 1, JTT, JT1, 33);
+    a64_eor_reg(&b, 1, JTT, JTT, JT1, 0);
+    a64_mov_imm64(&b, JTU, 0xff51afd7ed558ccdull);
+    a64_mul(&b, 1, JTT, JTT, JTU);
+    a64_lsr_imm(&b, 1, JTU, JTT, 29);
+    a64_eor_reg(&b, 1, JTT, JTT, JTU, 0);
+    a64_mov_imm64(&b, JTU, JIT_HASH_MASK);
+    a64_and_reg(&b, 1, JTT, JTT, JTU, 0);
+    a64_mov_imm64(&b, JTA, (uint64_t)(uintptr_t)jit->buckets);
+    a64_ldr_regoff(&b, 8, JTF, JTA, JTT, 1);
+    for (int k = 0; k < 6; k++) {
+        to_ret[nr] = a64_label(&b); a64_cbz(&b, 1, JTF, 0);
+        if (nr < 5) nr++;   /* keep last slot for chain-end */
+        a64_ldr(&b, 8, JTU, JTF, (uint32_t)offsetof(JitBlock, guest_rip));
+        a64_sub_reg(&b, 1, JTU, JTU, JT1, 0);
+        uint32_t *nxt = a64_label(&b); a64_cbnz(&b, 1, JTU, 0);
+        a64_ldr(&b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, code));
+        uint32_t *nocode = a64_label(&b); a64_cbz(&b, 1, JT0, 0);
+        /* found & compiled: x0=vm, x1=cpu are untouched (we only used x9-x15) */
+        a64_br(&b, JT0);
+        uint32_t *cont = a64_label(&b);
+        a64_patch_cbz(nxt, cont);
+        a64_patch_cbz(nocode, cont);
+        a64_ldr(&b, 8, JTF, JTF, (uint32_t)offsetof(JitBlock, hnext));
+    }
+    uint32_t *retl = a64_label(&b);
+    for (int i = 0; i < nr; i++) {
+        uint32_t w = *to_ret[i];
+        if ((w & 0xff000010u) == 0x54000000u) a64_patch_bcond(to_ret[i], retl);
+        else a64_patch_cbz(to_ret[i], retl);
+    }
+    a64_mov_imm64(&b, 0, OCERZ_STEP_OK);
+    a64_ret(&b);
+    if (!b.overflow) {
+        jit->dispatch_stub = entry;
+        jit->code_cur = b.p;
+        sys_icache_invalidate(entry, (size_t)((uint8_t *)b.p - (uint8_t *)entry));
+    }
+}
+
 static void emit_indirect_leave_br(A64Buf *b, int code_reg)
 {
     emit_spill_pinned(b);
@@ -5376,6 +5438,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_mem_hoist_greg = select_mem_base_hoist(blk->insns, n, rip);
 
     pthread_jit_write_protect_np(0);
+    if (!jit->dispatch_stub && !getenv("OCERZ_NO_DISPATCH_STUB"))
+        emit_dispatch_stub(jit);
     A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
     uint32_t *entry = b.p;
 
@@ -5617,9 +5681,25 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     uint32_t *exit_label = a64_label(&b);
     emit_spill_pinned(&b);
     emit_pin_epilogue_restore(&b);
-    a64_ldp_post(&b, 19, 20, 31, 16);
-    a64_ldp_post(&b, 29, 30, 31, 16);
-    a64_ret(&b);
+    if (jit->dispatch_stub) {
+        /* x0 = step code.  STEP_OK -> continue in the arena via the dispatch
+         * stub (needs x0=vm, x1=cpu, no frame); anything else -> ret to C. */
+        a64_mov_reg(&b, 1, 1, 20);
+        a64_mov_reg(&b, 1, JTT, 0);
+        a64_mov_reg(&b, 1, 0, 19);
+        a64_ldp_post(&b, 19, 20, 31, 16);
+        a64_ldp_post(&b, 29, 30, 31, 16);
+        uint32_t *nonzero = a64_label(&b); a64_cbnz(&b, 1, JTT, 0);
+        uint32_t *here = a64_label(&b);
+        a64_b(&b, (int32_t)(jit->dispatch_stub - here));
+        a64_patch_cbz(nonzero, a64_label(&b));
+        a64_mov_reg(&b, 1, 0, JTT);
+        a64_ret(&b);
+    } else {
+        a64_ldp_post(&b, 19, 20, 31, 16);
+        a64_ldp_post(&b, 29, 30, 31, 16);
+        a64_ret(&b);
+    }
     emit_ordered_slow_arms(&b, blk, entry);
 
     uint32_t *chain_tail_lbl = NULL;
