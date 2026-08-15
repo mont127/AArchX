@@ -90,6 +90,8 @@ typedef struct JitBlock {
         uint64_t target_rip;
         uint32_t *patch_b;
         uint32_t fallback_insn;
+        uint32_t *cond_site;      /* conditional branch that targets patch_b (may be retargeted directly) */
+        uint32_t cond_orig;
         uint8_t kind;
         uint8_t pin_class;
     } edges[2];
@@ -270,6 +272,7 @@ static void emit_reload_mem_base(A64Buf *b);
 static struct {
     uint64_t target_rip;
     uint32_t *patch_b;
+    uint32_t *cond_site;
     uint8_t kind;
     uint8_t pin_class;
 } g_jcc_edge[2];
@@ -5007,10 +5010,12 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
 
         g_jcc_edge[0].target_rip = fall;
         g_jcc_edge[0].patch_b = pb_fall;
+        g_jcc_edge[0].cond_site = NULL;
         g_jcc_edge[0].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
         g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
         g_jcc_edge[1].target_rip = taken;
         g_jcc_edge[1].patch_b = pb_taken;
+        g_jcc_edge[1].cond_site = to_taken;
         g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
         g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
         g_n_jcc_edges = 2;
@@ -5149,6 +5154,7 @@ static int emit_incdec_jcc(A64Buf *b, const X86Insn *producer,
     g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_jcc_edge[1].target_rip = taken;
     g_jcc_edge[1].patch_b = pb_taken;
+    g_jcc_edge[1].cond_site = to_taken;
     g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
     g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_n_jcc_edges = 2;
@@ -5266,6 +5272,7 @@ static int emit_arith_incdec_jcc(A64Buf *b, const X86Insn *arith,
     g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_jcc_edge[1].target_rip = taken;
     g_jcc_edge[1].patch_b = pb_taken;
+    g_jcc_edge[1].cond_site = to_taken;
     g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
     g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_n_jcc_edges = 2;
@@ -5364,6 +5371,7 @@ static int emit_logic_jmp_incdec_jcc(A64Buf *b, const X86Insn *logic,
     g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_jcc_edge[1].target_rip = taken;
     g_jcc_edge[1].patch_b = pb_taken;
+    g_jcc_edge[1].cond_site = to_taken;
     g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
     g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_n_jcc_edges = 2;
@@ -5740,6 +5748,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
         g_jcc_edge[1].target_rip = taken;
         g_jcc_edge[1].patch_b = pb_taken;
+        g_jcc_edge[1].cond_site = to_taken;
         g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
         g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
         g_n_jcc_edges = 2;
@@ -6577,6 +6586,32 @@ static void chain_batch_end(void)
     g_chain_batching = 0;
 }
 
+/* Retarget the conditional branch that feeds a chain trampoline straight at
+ * the destination when it is in range (b.cond/cbz: +-1MB, tbz: +-32KB). */
+static void chain_cond_short(uint32_t *cond_site, void *dst)
+{
+    if (!cond_site || !dst) return;
+    uint32_t w = *cond_site;
+    ptrdiff_t off = (uint32_t *)dst - cond_site;
+    uint32_t nw;
+    if ((w & 0xff000010u) == 0x54000000u || (w & 0x7e000000u) == 0x34000000u) {   /* b.cond / cbz / cbnz */
+        if (off < -(1 << 18) || off >= (1 << 18)) return;
+        nw = (w & ~(0x7ffffu << 5)) | (((uint32_t)off & 0x7ffffu) << 5);
+    } else if ((w & 0x7e000000u) == 0x36000000u) {                                 /* tbz / tbnz */
+        if (off < -(1 << 13) || off >= (1 << 13)) return;
+        nw = (w & ~(0x3fffu << 5)) | (((uint32_t)off & 0x3fffu) << 5);
+    } else return;
+    if (g_chain_batching) {
+        *cond_site = nw;
+        if (g_chain_npatched < CHAIN_BATCH_MAX) g_chain_patched[g_chain_npatched++] = cond_site;
+        else sys_icache_invalidate(cond_site, 4);
+    } else {
+        pthread_jit_write_protect_np(0);
+        *cond_site = nw;
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(cond_site, 4);
+    }
+}
 static void chain_activate(uint32_t *patch_b, void *dst)
 {
     if (!patch_b || !dst)
@@ -6605,6 +6640,7 @@ static void chain_activate(uint32_t *patch_b, void *dst)
 typedef struct PendingChain {
     uint64_t target_rip;
     uint32_t *patch_b;
+    uint32_t *cond_site;
     void **ras_slot;
     uint8_t kind;
     uint8_t pin_class;
@@ -6616,7 +6652,7 @@ typedef struct PendingChain {
 static PendingChain *g_pending[PEND_SIZE];
 
 static void pending_add(uint64_t target_rip, uint32_t *patch_b, uint8_t kind,
-                        uint8_t pin_class)
+                        uint8_t pin_class, uint32_t *cond_site)
 {
     PendingChain *e = (PendingChain *)malloc(sizeof *e);
     if (!e)
@@ -6624,6 +6660,7 @@ static void pending_add(uint64_t target_rip, uint32_t *patch_b, uint8_t kind,
     unsigned h = (unsigned)(hash_rip(target_rip) & PEND_MASK);
     e->target_rip = target_rip;
     e->patch_b = patch_b;
+    e->cond_site = cond_site;
     e->ras_slot = NULL;
     e->kind = kind;
     e->pin_class = pin_class;
@@ -6659,6 +6696,7 @@ static void pending_add_ras(uint64_t target_rip, void **ras_slot)
     unsigned h = (unsigned)(hash_rip(target_rip) & PEND_MASK);
     e->target_rip = target_rip;
     e->patch_b = NULL;
+    e->cond_site = NULL;
     e->ras_slot = ras_slot;
     e->kind = EDGE_XBLOCK;
     e->pin_class = 0;
@@ -6680,10 +6718,13 @@ static void pending_drain(uint64_t rip, JitBlock *target)
                 int compatible = e->pin_class
                     ? target->pin_class == e->pin_class
                     : (target->pin_class == 0 && target->n_pinned == 0);
-                if (compatible && target->body_code)
+                if (compatible && target->body_code) {
                     chain_activate(e->patch_b, target->body_code);
+                    chain_cond_short(e->cond_site, target->body_code);
+                }
             } else {
                 chain_activate(e->patch_b, (void *)target->code);
+                chain_cond_short(e->cond_site, (void *)target->code);
             }
             *pp = e->next;
             free(e);
@@ -7086,6 +7127,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_n_raslit = 0;
     g_chain_epi = NULL;
     g_n_jcc_edges = 0;
+    g_jcc_edge[0].cond_site = NULL; g_jcc_edge[1].cond_site = NULL;
     g_n_oslow = 0;
     g_n_nanool = 0;
     g_n_call_edges = 0;
@@ -7809,6 +7851,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         for (int i = 0; i < g_n_call_edges; i++) {
             blk->edges[i].target_rip = g_call_edge[i].target_rip;
             blk->edges[i].patch_b = g_call_edge[i].patch_b;
+            blk->edges[i].cond_site = NULL;
             blk->edges[i].kind = g_call_edge[i].kind;
             blk->edges[i].pin_class = g_call_edge[i].pin_class;
         }
@@ -7816,6 +7859,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     } else if (chain_patch_b) {
         blk->edges[0].target_rip = g_chain_target;
         blk->edges[0].patch_b = chain_patch_b;
+        blk->edges[0].cond_site = NULL;
         blk->edges[0].kind = chain_is_body ? EDGE_BODY : EDGE_XBLOCK;
         blk->edges[0].pin_class = chain_is_body ? 3 : 0;
         blk->n_edges = 1;
@@ -7823,13 +7867,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         for (int i = 0; i < g_n_jcc_edges; i++) {
             blk->edges[i].target_rip = g_jcc_edge[i].target_rip;
             blk->edges[i].patch_b = g_jcc_edge[i].patch_b;
+            blk->edges[i].cond_site = g_jcc_edge[i].cond_site;
             blk->edges[i].kind = g_jcc_edge[i].kind;
             blk->edges[i].pin_class = g_jcc_edge[i].pin_class;
         }
         blk->n_edges = (uint8_t)g_n_jcc_edges;
     }
-    for (int i = 0; i < blk->n_edges; i++)
+    for (int i = 0; i < blk->n_edges; i++) {
         blk->edges[i].fallback_insn = *blk->edges[i].patch_b;
+        blk->edges[i].cond_orig = blk->edges[i].cond_site ? *blk->edges[i].cond_site : 0;
+    }
 
     {
         static int g_jitdis = -1;
@@ -7898,12 +7945,14 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                     else
                         dst = (void *)t->body_code;
                 }
-                if (dst)
+                if (dst) {
                     chain_activate(blk->edges[i].patch_b, dst);
+                    chain_cond_short(blk->edges[i].cond_site, dst);
+                }
             } else {
                 pending_add(blk->edges[i].target_rip,
                             blk->edges[i].patch_b, blk->edges[i].kind,
-                            blk->edges[i].pin_class);
+                            blk->edges[i].pin_class, blk->edges[i].cond_site);
             }
         }
         pending_drain(blk->guest_rip, blk);
@@ -8276,6 +8325,11 @@ static void invalidate_all_locked(OcerzJit *jit)
                 uint32_t fallback = b->edges[i].fallback_insn;
                 if (at && fallback && *at != fallback) {
                     __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
+                    patched = 1;
+                }
+                uint32_t *cs = b->edges[i].cond_site;
+                if (cs && b->edges[i].cond_orig && *cs != b->edges[i].cond_orig) {
+                    __atomic_store_n(cs, b->edges[i].cond_orig, __ATOMIC_RELEASE);
                     patched = 1;
                 }
             }
