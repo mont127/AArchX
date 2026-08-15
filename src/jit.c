@@ -3123,24 +3123,27 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_XMM) {
         if (d->reg != s->reg) {
-            emit_xmm_ld(b, VX0, s->reg);
-            emit_xmm_st(b, VX0, d->reg);
+            if (xmm_is_pinned(d->reg) && xmm_is_pinned(s->reg))
+                a64_v_mov(b, xmm_vreg(d->reg), xmm_vreg(s->reg));   /* 1 word */
+            else { emit_xmm_ld(b, VX0, s->reg); emit_xmm_st(b, VX0, d->reg); }
         }
         return 1;
     }
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_MEM) {
         uint32_t *skip;
+        int vd = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;   /* load straight into the pin */
         if (!emit_sse_mem_addr(b, insn, s, exit_sites, n_exits, &skip)) return 0;
-        emit_sse_mem_ld(b, 16, VX0);
+        emit_sse_mem_ld(b, 16, vd);
         patch_guard_skip(skip, a64_label(b));
-        emit_xmm_st(b, VX0, d->reg);
+        if (vd == VX0) emit_xmm_st(b, VX0, d->reg);
         return 1;
     }
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_XMM) {
-        emit_xmm_ld(b, VX0, s->reg);
+        int vs = xmm_is_pinned(s->reg) ? xmm_vreg(s->reg) : VX0;   /* store straight from the pin */
+        if (vs == VX0) emit_xmm_ld(b, VX0, s->reg);
         uint32_t *skip;
         if (!emit_sse_mem_addr(b, insn, d, exit_sites, n_exits, &skip)) return 0;
-        emit_sse_mem_st(b, 16, VX0);
+        emit_sse_mem_st(b, 16, vs);
         patch_guard_skip(skip, a64_label(b));
         return 1;
     }
