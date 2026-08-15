@@ -2741,6 +2741,54 @@ static int comis_fuse_producer(const X86Insn *insns, int ci)
     }
     return pi;
 }
+/* Value-based conditions: E/NE/S/NS after an instruction whose ZF/SF are
+ * exactly "result == 0" / "sign(result)" and whose result sits in a pinned
+ * 32/64-bit register that no later instruction (before the consumer) writes.
+ * Returns the producer index or -1.  Shared by liveness and emit_cc_predicate. */
+static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
+static int value_cond_fuse_producer(const X86Insn *insns, int ci)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_VALCC") ? 1 : 0;
+    if (dis) return -1;
+    unsigned cc = insns[ci].cc;
+    if (!(cc == OCERZ_CC_E || cc == OCERZ_CC_NE || cc == OCERZ_CC_S || cc == OCERZ_CC_NS))
+        return -1;
+    int pi = -1;
+    for (int k = ci - 1; k >= 0; k--) {
+        uint64_t def, use;
+        ocerz_flags_defuse(&insns[k], &def, &use);
+        if (def & JIT_ARITH_FLAGS) { pi = k; break; }
+    }
+    if (pi < 0) return -1;
+    const X86Insn *p = &insns[pi];
+    static int only = -2;
+    if (only == -2) { const char *e = getenv("OCERZ_VALCC_ONLY"); only = e ? atoi(e) : -1; }
+    if (only >= 0 && (int)p->op != only) return -1;
+    switch (p->op) {
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
+    case OCERZ_OP_INC: case OCERZ_OP_DEC: case OCERZ_OP_NEG:
+        break;
+    case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR:
+        /* only with a nonzero immediate count (else flags unchanged) */
+        if (p->nops < 2 || p->ops[1].kind != OCERZ_OPK_IMM ||
+            (p->ops[1].imm & (p->ops[0].size == 8 ? 63u : 31u)) == 0) return -1;
+        break;
+    default: return -1;
+    }
+    const X86Operand *d = &p->ops[0];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return -1;
+    if (pin_slot(d->reg) < 0) return -1;
+    if (g_pin_class == 2 && d->reg == OCERZ_RSP) return -1;
+    for (int k = pi + 1; k < ci; k++) {
+        if (insn_may_write_gpr(&insns[k], d->reg)) return -1;
+        uint64_t mdef, muse;
+        ocerz_flags_defuse_nofault(&insns[k], &mdef, &muse);
+        if (!(mdef & JIT_ARITH_FLAGS) && (muse & JIT_ARITH_FLAGS) == JIT_ARITH_FLAGS)
+            return -1;      /* unclassifiable op may have written flags */
+    }
+    return pi;
+}
 /* after `adds`: CF = C (no inversion), same table as subs otherwise except B/AE */
 static int cc_after_adds(unsigned cc)
 {
@@ -2765,6 +2813,25 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         char tb[96] = "(none)";
         if (g_flag_producer) ocerz_format_insn(g_flag_producer, tb, sizeof tb);
         fprintf(stderr, "ocerz: CCPRED cc=%u producer=%s\n", cc, tb);
+    }
+    /* value-based condition: E/NE/S/NS straight from the producer's result
+     * register (still intact): cmp #0 gives Z and N */
+    if (g_defer && !g_no_regflags && g_cur_insns && g_cur_insn_idx >= 0 &&
+        (g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_JCC || g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_SETCC ||
+         g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_CMOVCC) &&
+        g_cur_insns[g_cur_insn_idx].cc == cc) {
+        int pi = value_cond_fuse_producer(g_cur_insns, g_cur_insn_idx);
+        if (pi >= 0) {
+            const X86Operand *d = &g_cur_insns[pi].ops[0];
+            int rd = pin_hreg(pin_slot(d->reg));
+            a64_subs_imm(b, d->size == 8, A64_ZR, rd, 0);
+            int dc = cc == OCERZ_CC_E ? A64_EQ : cc == OCERZ_CC_NE ? A64_NE :
+                     cc == OCERZ_CC_S ? A64_MI : A64_PL;
+            if (want_direct) { g_cc_direct = dc; return; }
+            a64_cset(b, JTF, dc);
+            a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+            return;
+        }
     }
     uint32_t *to_generic[8]; int ng = 0;
     uint32_t *done[4]; int nd = 0;
@@ -7334,8 +7401,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
              * (comis fusion) does not read RFLAGS: don't keep the comis's
              * flag write alive on its account */
             if ((blk->insns[i].op == OCERZ_OP_JCC || blk->insns[i].op == OCERZ_OP_SETCC ||
-                 blk->insns[i].op == OCERZ_OP_CMOVCC) && sse_enabled() &&
-                comis_fuse_producer(blk->insns, i) >= 0)
+                 blk->insns[i].op == OCERZ_OP_CMOVCC) &&
+                ((sse_enabled() && comis_fuse_producer(blk->insns, i) >= 0) ||
+                 (g_defer && !g_no_regflags && value_cond_fuse_producer(blk->insns, i) >= 0)))
                 use = 0;
             fl_need[i] = def & live_seam;
             live_seam = (live_seam & ~def) | use;
