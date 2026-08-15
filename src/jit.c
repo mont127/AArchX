@@ -80,7 +80,7 @@ typedef struct JitBlock {
     uint32_t stop_insn;
     struct JitBlock *stop_next;
 
-    uint8_t host_holds[8];
+    uint8_t host_holds[16];
     int8_t guest_in_host[16];
     uint8_t n_pinned;
 
@@ -585,6 +585,8 @@ static void emit_defer_flags(A64Buf *b, uint32_t ccop, int src_reg, int dst_reg)
 
 static void emit_xmm_pin_load_all(A64Buf *b);
 static void emit_xmm_pin_spill_all(A64Buf *b);
+static void emit_spill_pinned_callersaved(A64Buf *b);
+static void emit_fill_pinned_callersaved(A64Buf *b);
 static void emit_materialize(A64Buf *b)
 {
 
@@ -594,9 +596,11 @@ static void emit_materialize(A64Buf *b)
     uint32_t *skip = a64_label(b);
     a64_cbz(b, 0, JT0, 0);
     emit_xmm_pin_spill_all(b);           /* C clobbers V16-V31 */
+    emit_spill_pinned_callersaved(b);    /* and x1-x8 pin slots */
     a64_mov_reg(b, 1, 0, 20);
     a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_flags_materialize);
     a64_blr(b, 16);
+    emit_fill_pinned_callersaved(b);
     emit_reload_mem_base(b);
     emit_xmm_pin_load_all(b);
     a64_patch_cbz(skip, a64_label(b));
@@ -605,6 +609,24 @@ static void emit_materialize(A64Buf *b)
 static inline int pin_slot(unsigned greg)
 {
     return (g_pin && greg < 16) ? g_pin[greg] : -1;
+}
+
+/* Host register holding pin slot `slot`.  Slots 0-7 -> x21-x28 (callee-
+ * saved), 8-13 -> x3-x8, 14-15 -> x1-x2 (caller-saved: spilled/reloaded
+ * around every C callout by emit_spill_pinned/emit_fill_pinned). */
+/* Class 3 = every guest GPR permanently pinned (slot == guest reg number).
+ * All blocks share the layout, so every transition is body-to-body. */
+static int fullpin_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_FULLPIN") ? 0 : 1;
+    return on;
+}
+static inline int pin_hreg(int slot)
+{
+    if (slot < 8)  return 21 + slot;
+    if (slot < 14) return 3 + (slot - 8);
+    return 1 + (slot - 14);
 }
 
 static inline int body_edge_pin_class(void)
@@ -620,11 +642,11 @@ static void emit_gpr_rd(A64Buf *b, int sf, int dst, unsigned greg)
     if (s >= 0 && g_pin_class == 2 && greg == OCERZ_RSP) {
 
         a64_mov_imm64(b, dst, ocerz_guest_base);
-        a64_sub_reg(b, 1, dst, 21 + s, dst, 0);
+        a64_sub_reg(b, 1, dst, pin_hreg(s), dst, 0);
         if (!sf)
             a64_mov_reg(b, 0, dst, dst);
     } else if (s >= 0)
-        a64_mov_reg(b, sf, dst, 21 + s);
+        a64_mov_reg(b, sf, dst, pin_hreg(s));
     else
         a64_ldr(b, sf ? 8 : 4, dst, 20, GPR_OFF(greg));
 }
@@ -633,7 +655,7 @@ static void emit_gpr_rd_sw(A64Buf *b, int dst, unsigned greg)
 {
     int s = pin_slot(greg);
     if (s >= 0)
-        a64_sxtw(b, dst, 21 + s);
+        a64_sxtw(b, dst, pin_hreg(s));
     else
         a64_ldrsw(b, dst, 20, GPR_OFF(greg));
 }
@@ -644,9 +666,9 @@ static void emit_gpr_wr(A64Buf *b, int src, unsigned greg)
     if (s >= 0 && g_pin_class == 2 && greg == OCERZ_RSP) {
         int tmp = src == JTU ? JTA : JTU;
         a64_mov_imm64(b, tmp, ocerz_guest_base);
-        a64_add_reg(b, 1, 21 + s, src, tmp, 0);
+        a64_add_reg(b, 1, pin_hreg(s), src, tmp, 0);
     } else if (s >= 0)
-        a64_mov_reg(b, 1, 21 + s, src);
+        a64_mov_reg(b, 1, pin_hreg(s), src);
     else
         a64_str(b, 8, src, 20, GPR_OFF(greg));
 }
@@ -656,32 +678,50 @@ static void emit_spill_pinned(A64Buf *b)
     for (int i = 0; i < g_n_pinned; i++) {
         if (g_pin_class == 2 && g_pin_hold[i] == OCERZ_RSP) {
             a64_mov_imm64(b, JTA, ocerz_guest_base);
-            a64_sub_reg(b, 1, JTA, 21 + i, JTA, 0);
+            a64_sub_reg(b, 1, JTA, pin_hreg(i), JTA, 0);
             a64_str(b, 8, JTA, 20, GPR_OFF(OCERZ_RSP));
         } else {
-            a64_str(b, 8, 21 + i, 20, GPR_OFF(g_pin_hold[i]));
+            a64_str(b, 8, pin_hreg(i), 20, GPR_OFF(g_pin_hold[i]));
         }
     }
+}
+
+/* Spill/fill only the pin slots that live in caller-saved host registers
+ * (slot >= 8): used around C calls that leave x21-x28 intact. */
+static void emit_spill_pinned_callersaved(A64Buf *b)
+{
+    for (int i = 8; i < g_n_pinned; i++)
+        a64_str(b, 8, pin_hreg(i), 20, GPR_OFF(g_pin_hold[i]));
+}
+static void emit_fill_pinned_callersaved(A64Buf *b)
+{
+    for (int i = 8; i < g_n_pinned; i++)
+        a64_ldr(b, 8, pin_hreg(i), 20, GPR_OFF(g_pin_hold[i]));
 }
 
 static void emit_fill_pinned(A64Buf *b)
 {
     for (int i = 0; i < g_n_pinned; i++)
-        a64_ldr(b, 8, 21 + i, 20, GPR_OFF(g_pin_hold[i]));
+        a64_ldr(b, 8, pin_hreg(i), 20, GPR_OFF(g_pin_hold[i]));
     if (g_pin_class == 2) {
         int s = pin_slot(OCERZ_RSP);
         assert(s >= 0);
         a64_mov_imm64(b, JTA, ocerz_guest_base);
-        a64_add_reg(b, 1, 21 + s, 21 + s, JTA, 0);
+        a64_add_reg(b, 1, pin_hreg(s), pin_hreg(s), JTA, 0);
     }
 }
 
+/* Only the callee-saved slots (0-7 -> x21-x28) are saved/restored around a
+ * block; slots >= 8 live in caller-saved registers. */
+static inline int pin_saved_count(void) { return g_n_pinned < 8 ? g_n_pinned : 8; }
+
 static void emit_pin_prologue(A64Buf *b)
 {
-    for (int i = 0; i < g_n_pinned; i += 2)
+    int ns = pin_saved_count();
+    for (int i = 0; i < ns; i += 2)
         a64_stp_pre(b, 21 + i, 21 + i + 1, 31, -16);
     for (int i = 0; i < g_n_pinned; i++)
-        a64_ldr(b, 8, 21 + i, 20, GPR_OFF(g_pin_hold[i]));
+        a64_ldr(b, 8, pin_hreg(i), 20, GPR_OFF(g_pin_hold[i]));
     if (g_pin_class == 2) {
         a64_stp_pre(b, JRET_GUEST, JRET_HOST, 31, -16);
         a64_mov_imm64(b, JRET_HOST, 0);
@@ -692,7 +732,8 @@ static void emit_pin_epilogue_restore(A64Buf *b)
 {
     if (g_pin_class == 2)
         a64_ldp_post(b, JRET_GUEST, JRET_HOST, 31, 16);
-    int last = (g_n_pinned & 1) ? g_n_pinned - 1 : g_n_pinned - 2;
+    int ns = pin_saved_count();
+    int last = (ns & 1) ? ns - 1 : ns - 2;
     for (int i = last; i >= 0; i -= 2)
         a64_ldp_post(b, 21 + i, 21 + i + 1, 31, 16);
 }
@@ -810,7 +851,7 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
 
     if (writes && need == 0) {
         int ds = pin_slot(d->reg);
-        int rd = ds >= 0 ? 21 + ds : JT2;
+        int rd = ds >= 0 ? pin_hreg(ds) : JT2;
         int rn = ds >= 0 ? rd : JT0;
         int rm;
 
@@ -821,7 +862,7 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
                 return 0;
             int ss = pin_slot(s->reg);
             if (ss >= 0)
-                rm = 21 + ss;
+                rm = pin_hreg(ss);
             else {
                 emit_gpr_rd(b, sf, JT1, s->reg);
                 rm = JT1;
@@ -1115,7 +1156,7 @@ static int emit_incdec(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (need == 0) {
         int ds = pin_slot(d->reg);
         if (ds >= 0) {
-            int rd = 21 + ds;
+            int rd = pin_hreg(ds);
             if (is_inc)
                 a64_add_imm(b, sf, rd, rd, 1);
             else
@@ -1175,8 +1216,8 @@ static int emit_mov_logic_pair(A64Buf *b, const X86Insn *mov,
     int sf = md->size == 8;
     int ds = pin_slot(md->reg);
     int ss = pin_slot(ms->reg);
-    int rd = ds >= 0 ? 21 + ds : JT2;
-    int rn = ss >= 0 ? 21 + ss : JT0;
+    int rd = ds >= 0 ? pin_hreg(ds) : JT2;
+    int rn = ss >= 0 ? pin_hreg(ss) : JT0;
     if (ss < 0)
         emit_gpr_rd(b, sf, JT0, ms->reg);
 
@@ -1207,7 +1248,7 @@ static int emit_mov_logic_pair(A64Buf *b, const X86Insn *mov,
     } else {
         int ls_slot = pin_slot(ls->reg);
         if (ls_slot >= 0)
-            rm = 21 + ls_slot;
+            rm = pin_hreg(ls_slot);
         else
             emit_gpr_rd(b, sf, JT1, ls->reg);
     }
@@ -1253,7 +1294,7 @@ static int emit_add_inc_pair(A64Buf *b, const X86Insn *add,
 
     int sf = d->size == 8;
     int ds = pin_slot(d->reg);
-    int rd = ds >= 0 ? 21 + ds : JT2;
+    int rd = ds >= 0 ? pin_hreg(ds) : JT2;
     if (ds < 0)
         emit_gpr_rd(b, sf, rd, d->reg);
     int emitted = 0;
@@ -1273,7 +1314,7 @@ static int emit_add_inc_pair(A64Buf *b, const X86Insn *add,
         if (s->reg == d->reg)
             rm = rd;
         else if (ss >= 0)
-            rm = 21 + ss;
+            rm = pin_hreg(ss);
         else
             emit_gpr_rd(b, sf, JT1, s->reg);
     }
@@ -1393,7 +1434,7 @@ static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (need == 0) {
         int ds = pin_slot(d->reg);
         if (ds >= 0) {
-            int rd = 21 + ds;
+            int rd = pin_hreg(ds);
             switch (op) {
             case OCERZ_OP_SHL: a64_lsl_imm(b, sf, rd, rd, (int)cnt); break;
             case OCERZ_OP_SHR: a64_lsr_imm(b, sf, rd, rd, (int)cnt); break;
@@ -1486,7 +1527,7 @@ static int emit_imul(A64Buf *b, const X86Insn *insn, uint64_t need)
                         return 0;
                     int ps = pin_slot(ops[i]->reg);
                     if (ps >= 0)
-                        src[i] = 21 + ps;
+                        src[i] = pin_hreg(ps);
                     else {
                         int tmp = i ? JT1 : JT0;
                         emit_gpr_rd(b, sf, tmp, ops[i]->reg);
@@ -1503,7 +1544,7 @@ static int emit_imul(A64Buf *b, const X86Insn *insn, uint64_t need)
                     return 0;
                 }
             }
-            a64_mul(b, sf, 21 + ds, src[0], src[1]);
+            a64_mul(b, sf, pin_hreg(ds), src[0], src[1]);
             return 1;
         }
     }
@@ -1598,7 +1639,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     if (op->base != OCERZ_REG_NONE) {
         int s = pin_slot(op->base);
         if (s >= 0)
-            a64_add_reg(b, 1, addr_reg, addr_reg, 21 + s, 0);
+            a64_add_reg(b, 1, addr_reg, addr_reg, pin_hreg(s), 0);
         else {
             emit_gpr_rd(b, 1, JT0, op->base);
             a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
@@ -1607,7 +1648,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     if (op->index != OCERZ_REG_NONE) {
         int s = pin_slot(op->index);
         if (s >= 0 && !(g_pin_class == 2 && op->index == OCERZ_RSP))
-            a64_add_reg(b, 1, addr_reg, addr_reg, 21 + s, op->scale & 3);
+            a64_add_reg(b, 1, addr_reg, addr_reg, pin_hreg(s), op->scale & 3);
         else {
             emit_gpr_rd(b, 1, JT0, op->index);
             a64_add_reg(b, 1, addr_reg, addr_reg, JT0, op->scale & 3);
@@ -1684,7 +1725,7 @@ static void emit_reload_mem_base(A64Buf *b)
     int bs = pin_slot(g_mem_hoist_greg);
     assert(bs >= 0);
     a64_mov_imm64(b, JMEMBASE, ocerz_guest_base);
-    a64_add_reg(b, 1, JMEMBASE, JMEMBASE, 21 + bs, 0);
+    a64_add_reg(b, 1, JMEMBASE, JMEMBASE, pin_hreg(bs), 0);
     if (g_mem_hoist_aux_disp > 0)
         a64_add_imm(b, 1, JMEMAUX, JMEMBASE,
                     (uint32_t)g_mem_hoist_aux_disp);
@@ -1731,9 +1772,9 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
         base = JTA;
     }
     if (store)
-        a64_str_regoff(b, size, value_reg, base, 21 + is, 1);
+        a64_str_regoff(b, size, value_reg, base, pin_hreg(is), 1);
     else
-        a64_ldr_regoff(b, size, value_reg, base, 21 + is, 1);
+        a64_ldr_regoff(b, size, value_reg, base, pin_hreg(is), 1);
     return 1;
 }
 
@@ -1822,7 +1863,7 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         if (!mem_native_store_ok())
             return 0;
         int ss = pin_slot(s->reg);
-        int rv = ss >= 0 ? 21 + ss : JT1;
+        int rv = ss >= 0 ? pin_hreg(ss) : JT1;
         if (ss >= 0 && emit_hoisted_mem_access(b, insn, d, s->size, rv, 1))
             return 1;
         if (!emit_mem_ea(b, insn, d, JTA))
@@ -1840,7 +1881,7 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         if (d->high8 || (d->size != 4 && d->size != 8))
             return 0;
         int ds = pin_slot(d->reg);
-        int rd = ds >= 0 ? 21 + ds : JT1;
+        int rd = ds >= 0 ? pin_hreg(ds) : JT1;
         if (emit_hoisted_mem_access(b, insn, s, d->size, rd, 0))
             return 1;
         if (!emit_mem_ea(b, insn, s, JTA))
@@ -1943,7 +1984,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             if (o->kind == OCERZ_OPK_REG && o->reg != OCERZ_RSP) {
                 int vs = pin_slot(o->reg);
                 if (vs >= 0)
-                    rv = 21 + vs;
+                    rv = pin_hreg(vs);
                 else
                     emit_gpr_rd(b, 1, JT1, o->reg);
             } else if (o->kind == OCERZ_OPK_REG) {
@@ -1953,13 +1994,13 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             }
             uint32_t *skip = NULL;
             if (g_plain_mem && !ocerz_commpage) {
-                a64_str_pre64(b, rv, 21 + rs, -8);
+                a64_str_pre64(b, rv, pin_hreg(rs), -8);
             } else {
-                a64_sub_imm(b, 1, JTA, 21 + rs, 8);
+                a64_sub_imm(b, 1, JTA, pin_hreg(rs), 8);
                 skip = emit_commpage_guard(b, insn, JTA,
                                            exit_sites, n_exits);
                 emit_guest_store_ordered(b, 8, rv, JTA, JTU);
-                a64_sub_imm(b, 1, 21 + rs, 21 + rs, 8);
+                a64_sub_imm(b, 1, pin_hreg(rs), pin_hreg(rs), 8);
             }
             patch_guard_skip(skip, a64_label(b));
             return 1;
@@ -1991,16 +2032,16 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         if (g_pin_class == 2) {
             int rs = pin_slot(OCERZ_RSP);
             int ds = o->reg == OCERZ_RSP ? -1 : pin_slot(o->reg);
-            int rd = ds >= 0 ? 21 + ds : JT1;
+            int rd = ds >= 0 ? pin_hreg(ds) : JT1;
             assert(rs >= 0);
             uint32_t *skip = NULL;
             if (g_plain_mem && !ocerz_commpage) {
-                a64_ldr_post64(b, rd, 21 + rs, 8);
+                a64_ldr_post64(b, rd, pin_hreg(rs), 8);
             } else {
-                skip = emit_commpage_guard(b, insn, 21 + rs,
+                skip = emit_commpage_guard(b, insn, pin_hreg(rs),
                                            exit_sites, n_exits);
-                emit_guest_load_ordered(b, 8, rd, 21 + rs, JTU);
-                a64_add_imm(b, 1, 21 + rs, 21 + rs, 8);
+                emit_guest_load_ordered(b, 8, rd, pin_hreg(rs), JTU);
+                a64_add_imm(b, 1, pin_hreg(rs), pin_hreg(rs), 8);
             }
             if (ds < 0)
                 emit_gpr_wr(b, JT1, o->reg);
@@ -2203,16 +2244,16 @@ static int emit_lea(A64Buf *b, const X86Insn *insn)
     if (ds >= 0 && !s->riprel && bs >= 0 && !host_rsp_operand) {
         int sf = insn->addrsize == 8 && d->size == 8;
         int64_t disp = s->disp;
-        int rd = 21 + ds;
+        int rd = pin_hreg(ds);
         if (s->index == OCERZ_REG_NONE && disp >= -4095 && disp <= 4095) {
             if (disp >= 0)
-                a64_add_imm(b, sf, rd, 21 + bs, (uint32_t)disp);
+                a64_add_imm(b, sf, rd, pin_hreg(bs), (uint32_t)disp);
             else
-                a64_sub_imm(b, sf, rd, 21 + bs, (uint32_t)-disp);
+                a64_sub_imm(b, sf, rd, pin_hreg(bs), (uint32_t)-disp);
             return 1;
         }
         if (is >= 0 && disp >= -4095 && disp <= 4095) {
-            a64_add_reg(b, sf, rd, 21 + bs, 21 + is, s->scale & 3);
+            a64_add_reg(b, sf, rd, pin_hreg(bs), pin_hreg(is), s->scale & 3);
             if (disp > 0)
                 a64_add_imm(b, sf, rd, rd, (uint32_t)disp);
             else if (disp < 0)
@@ -2222,7 +2263,7 @@ static int emit_lea(A64Buf *b, const X86Insn *insn)
     }
     if (ds >= 0 && !s->riprel && !host_rsp_operand && insn->addrsize == 8 &&
         s->disp == 0 && bs >= 0 && is >= 0) {
-        a64_add_reg(b, d->size == 8, 21 + ds, 21 + bs, 21 + is, s->scale & 3);
+        a64_add_reg(b, d->size == 8, pin_hreg(ds), pin_hreg(bs), pin_hreg(is), s->scale & 3);
         return 1;
     }
 
@@ -2638,7 +2679,7 @@ static int emit_not_neg(A64Buf *b, const X86Insn *insn, uint64_t need)
     int ds = pin_slot(d->reg);
     if (insn->op == OCERZ_OP_NOT) {
         if (ds >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP)) {
-            a64_orn_reg(b, sf, 21 + ds, A64_ZR, 21 + ds, 0);
+            a64_orn_reg(b, sf, pin_hreg(ds), A64_ZR, pin_hreg(ds), 0);
             return 1;
         }
         emit_gpr_rd(b, sf, JT0, d->reg);
@@ -2698,7 +2739,7 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (need && variable)
         return 0;                       /* count==0 must not touch flags; keep slow */
     int ds = pin_slot(d->reg);
-    int rd = ds >= 0 ? 21 + ds : JT2;
+    int rd = ds >= 0 ? pin_hreg(ds) : JT2;
     if (ds < 0)
         emit_gpr_rd(b, sf, JT0, d->reg);
     int rn = ds >= 0 ? rd : JT0;
@@ -2763,7 +2804,7 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (!emit_shift_count(b, insn, sf, JT1, &cnt))
         return 0;
     int ds = pin_slot(d->reg);
-    int rd = ds >= 0 ? 21 + ds : JT2;
+    int rd = ds >= 0 ? pin_hreg(ds) : JT2;
     if (ds < 0)
         emit_gpr_rd(b, sf, JT0, d->reg);
     int rn = ds >= 0 ? rd : JT0;
@@ -2844,7 +2885,7 @@ static int emit_bswap(A64Buf *b, const X86Insn *insn)
     int sf = d->size == 8;
     int ds = pin_slot(d->reg);
     if (ds >= 0) {
-        a64_rev(b, sf, 21 + ds, 21 + ds);
+        a64_rev(b, sf, pin_hreg(ds), pin_hreg(ds));
         return 1;
     }
     emit_gpr_rd(b, sf, JT0, d->reg);
@@ -3550,14 +3591,14 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                     return 1;
                 if (g_pin_class == 2 && !sz4 && s->reg == OCERZ_RSP &&
                     d->reg != OCERZ_RSP && ds >= 0 && ss >= 0) {
-                    a64_mov_imm64(b, 21 + ds, ocerz_guest_base);
-                    a64_sub_reg(b, 1, 21 + ds, 21 + ss, 21 + ds, 0);
+                    a64_mov_imm64(b, pin_hreg(ds), ocerz_guest_base);
+                    a64_sub_reg(b, 1, pin_hreg(ds), pin_hreg(ss), pin_hreg(ds), 0);
                     return 1;
                 }
                 if (ds >= 0 && ss >= 0 && !host_rsp) {
 
                     if (ds != ss || sz4)
-                        a64_mov_reg(b, sz4 ? 0 : 1, 21 + ds, 21 + ss);
+                        a64_mov_reg(b, sz4 ? 0 : 1, pin_hreg(ds), pin_hreg(ss));
                     return 1;
                 }
                 emit_gpr_rd(b, sz4 ? 0 : 1, JT0, s->reg);
@@ -3570,7 +3611,7 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                     v &= 0xffffffffull;
                 int ds = pin_slot(d->reg);
                 if (ds >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP))
-                    a64_mov_imm64(b, 21 + ds, v);
+                    a64_mov_imm64(b, pin_hreg(ds), v);
                 else {
                     a64_mov_imm64(b, JT0, v);
                     emit_gpr_wr(b, JT0, d->reg);
@@ -3767,12 +3808,12 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         }
     } else if (producer->op == OCERZ_OP_CMP) {
         int ds = pin_slot(d->reg);
-        record_src = ds >= 0 ? 21 + ds : JT0;
+        record_src = ds >= 0 ? pin_hreg(ds) : JT0;
         if (ds < 0)
             emit_gpr_rd(b, sf, JT0, d->reg);
         if (s->kind == OCERZ_OPK_REG && !s->high8) {
             int ss = pin_slot(s->reg);
-            record_dst = ss >= 0 ? 21 + ss : JT1;
+            record_dst = ss >= 0 ? pin_hreg(ss) : JT1;
             if (ss < 0)
                 emit_gpr_rd(b, sf, JT1, s->reg);
         } else if (s->kind == OCERZ_OPK_IMM) {
@@ -3788,7 +3829,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         ccop = ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0);
     } else {
         int ds = pin_slot(d->reg);
-        int rn = ds >= 0 ? 21 + ds : JT0;
+        int rn = ds >= 0 ? pin_hreg(ds) : JT0;
         if (ds < 0)
             emit_gpr_rd(b, sf, JT0, d->reg);
         int emitted = 0;
@@ -3811,7 +3852,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             }
         } else if (s->kind == OCERZ_OPK_REG && !s->high8) {
             int ss = pin_slot(s->reg);
-            int rm = ss >= 0 ? 21 + ss : JT1;
+            int rm = ss >= 0 ? pin_hreg(ss) : JT1;
             if (ss < 0)
                 emit_gpr_rd(b, sf, JT1, s->reg);
             a64_ands_reg(b, sf, JT2, rn, rm, 0);
@@ -3964,7 +4005,7 @@ static int emit_incdec_jcc(A64Buf *b, const X86Insn *producer,
     const X86Operand *d = &producer->ops[0];
     int sf = d->size == 8;
     int ds = pin_slot(d->reg);
-    int rd = ds >= 0 ? 21 + ds : JT2;
+    int rd = ds >= 0 ? pin_hreg(ds) : JT2;
     if (ds >= 0) {
         if (producer->op == OCERZ_OP_INC)
             a64_adds_imm(b, sf, rd, rd, 1);
@@ -4046,7 +4087,7 @@ static int emit_arith_incdec_jcc(A64Buf *b, const X86Insn *arith,
 
     int sf = d->size == 8;
     int ds = pin_slot(d->reg);
-    int rn = ds >= 0 ? 21 + ds : JT2;
+    int rn = ds >= 0 ? pin_hreg(ds) : JT2;
     if (ds < 0)
         emit_gpr_rd(b, sf, rn, d->reg);
 
@@ -4070,7 +4111,7 @@ static int emit_arith_incdec_jcc(A64Buf *b, const X86Insn *arith,
         if (s->reg == d->reg)
             rm = rn;
         else if (ss >= 0)
-            rm = 21 + ss;
+            rm = pin_hreg(ss);
         else
             emit_gpr_rd(b, sf, JT1, s->reg);
     }
@@ -4086,7 +4127,7 @@ static int emit_arith_incdec_jcc(A64Buf *b, const X86Insn *arith,
 
     *incdec_label = a64_label(b);
     int ids = pin_slot(id->reg);
-    int ird = ids >= 0 ? 21 + ids : JT2;
+    int ird = ids >= 0 ? pin_hreg(ids) : JT2;
     if (ids < 0)
         emit_gpr_rd(b, sf, ird, id->reg);
     if (incdec->op == OCERZ_OP_INC)
@@ -4185,7 +4226,7 @@ static int emit_logic_jmp_incdec_jcc(A64Buf *b, const X86Insn *logic,
     const X86Operand *id = &incdec->ops[0];
     int sf = id->size == 8;
     int ids = pin_slot(id->reg);
-    int rd = ids >= 0 ? 21 + ids : JT2;
+    int rd = ids >= 0 ? pin_hreg(ids) : JT2;
     if (ids < 0)
         emit_gpr_rd(b, sf, rd, id->reg);
     if (incdec->op == OCERZ_OP_INC)
@@ -4435,15 +4476,15 @@ static int emit_ifconv_diamond(A64Buf *b, const X86Insn *test,
     const X86Operand *src = &m.complex[0].ops[1];
     const X86Operand *ld = &latch->ops[0];
     int sf = acc->size == 8;
-    int acc_hr = 21 + pin_slot(acc->reg);
-    int tmp_hr = 21 + pin_slot(tmp->reg);
-    int src_hr = 21 + pin_slot(src->reg);
-    int latch_hr = 21 + pin_slot(ld->reg);
+    int acc_hr = pin_hreg(pin_slot(acc->reg));
+    int tmp_hr = pin_hreg(pin_slot(tmp->reg));
+    int src_hr = pin_hreg(pin_slot(src->reg));
+    int latch_hr = pin_hreg(pin_slot(ld->reg));
 
-    a64_ubfx(b, 1, JT0, 21 + pin_slot(test->ops[0].reg),
+    a64_ubfx(b, 1, JT0, pin_hreg(pin_slot(test->ops[0].reg)),
              m.first_bit, 1);
     *jcc_label = a64_label(b);
-    a64_ubfx(b, 1, JT1, 21 + pin_slot(m.nested[0].ops[0].reg),
+    a64_ubfx(b, 1, JT1, pin_hreg(pin_slot(m.nested[0].ops[0].reg)),
              m.nested_bit, 1);
 
     uint64_t imm = arith->ops[1].imm &
@@ -4655,6 +4696,17 @@ static int callret_inline_enabled(void)
     return en;
 }
 
+/* Host entry to record for a return target: under full pinning the caller
+ * and callee share the register layout, so return straight into the BODY
+ * (tag bit 0 set) and skip the frame traffic; otherwise the function entry. */
+static void *ras_entry_for(const JitBlock *blk)
+{
+    if (!blk || !blk->code) return NULL;
+    if (blk->pin_class == 3 && blk->body_code)
+        return (void *)((uintptr_t)blk->body_code | 1u);
+    return (void *)blk->code;
+}
+
 void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
 {
     uint32_t t = cpu->ras_top;
@@ -4662,7 +4714,7 @@ void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
         return;
     JitBlock *blk = cache_lookup(vm->jit, retaddr);
     cpu->ras[t].guest_rip = retaddr;
-    cpu->ras[t].host_entry = (blk && blk->code) ? (void *)blk->code : NULL;
+    cpu->ras[t].host_entry = ras_entry_for(blk);
     cpu->ras_top = t + 1;
 }
 
@@ -4704,12 +4756,12 @@ static int emit_call_region_call(A64Buf *b, const X86Insn *insn,
     a64_mov_imm64(b, JRET_GUEST, retaddr);
     uint32_t *skip = NULL;
     if (g_plain_mem && !ocerz_commpage) {
-        a64_str_pre64(b, JRET_GUEST, 21 + rs, -8);
+        a64_str_pre64(b, JRET_GUEST, pin_hreg(rs), -8);
     } else {
-        a64_sub_imm(b, 1, JTA, 21 + rs, 8);
+        a64_sub_imm(b, 1, JTA, pin_hreg(rs), 8);
         skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         emit_guest_store_ordered(b, 8, JRET_GUEST, JTA, JTU);
-        a64_sub_imm(b, 1, 21 + rs, 21 + rs, 8);
+        a64_sub_imm(b, 1, pin_hreg(rs), pin_hreg(rs), 8);
     }
     patch_guard_skip(skip, a64_label(b));
 
@@ -4761,12 +4813,12 @@ static int emit_call_region_ret(A64Buf *b, const X86Insn *insn,
     assert(rs >= 0);
     uint32_t *skip = NULL;
     if (g_plain_mem && !ocerz_commpage) {
-        a64_ldr_post64(b, JT1, 21 + rs, 8);
+        a64_ldr_post64(b, JT1, pin_hreg(rs), 8);
     } else {
-        skip = emit_commpage_guard(b, insn, 21 + rs,
+        skip = emit_commpage_guard(b, insn, pin_hreg(rs),
                                    exit_sites, n_exits);
-        emit_guest_load_ordered(b, 8, JT1, 21 + rs, JTU);
-        a64_add_imm(b, 1, 21 + rs, 21 + rs, 8);
+        emit_guest_load_ordered(b, 8, JT1, pin_hreg(rs), JTU);
+        a64_add_imm(b, 1, pin_hreg(rs), pin_hreg(rs), 8);
     }
 
     uint32_t *check = a64_label(b);
@@ -4846,7 +4898,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             if (slot) {
                 JitBlock *rb = cache_lookup(g_xlat_jit, retaddr);
                 if (rb && rb->code)
-                    *slot = (void *)rb->code;
+                    *slot = ras_entry_for(rb);
                 else
                     pending_add_ras(retaddr, slot);
                 a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
@@ -4865,11 +4917,13 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 a64_patch_bcond(full, a64_label(b));
             } else {
                 emit_xmm_pin_spill_all(b);
+                emit_spill_pinned_callersaved(b);
                 a64_mov_reg(b, 1, 0, 19);
                 a64_mov_reg(b, 1, 1, 20);
                 a64_mov_imm64(b, 2, retaddr);
                 a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_ras_push);
                 a64_blr(b, 16);
+                emit_fill_pinned_callersaved(b);
                 emit_xmm_pin_load_all(b);
             }
         }
@@ -4892,7 +4946,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
         if (!g_no_ras) {
             uint32_t *ras_empty;
-            uint32_t *ras_stale[2];
+            uint32_t *ras_stale[3];
             int nst = 0;
             a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
             ras_empty = a64_label(b); a64_cbz(b, 0, JT2, 0);
@@ -4908,6 +4962,22 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
 
+            uint32_t *not_body = NULL;
+            if (g_pin_class == 3) {
+                /* tagged entry = callee body with our own register layout */
+                not_body = a64_label(b); a64_tbz(b, JT0, 0, 0);
+                a64_mov_imm64(b, JTU, 1);
+                a64_bic_reg(b, 1, JT0, JT0, JTU, 0);
+                emit_xmm_pin_spill_all(b);
+                a64_br(b, JT0);
+                a64_patch_tbz(not_body, a64_label(b));
+                a64_mov_imm64(b, JTU, 1);
+                a64_bic_reg(b, 1, JT0, JT0, JTU, 0);
+            } else {
+                /* a tagged (body) entry is only usable from a class-3 block:
+                 * treat it as a RAS miss here */
+                ras_stale[nst] = a64_label(b); a64_tbnz(b, JT0, 0, 0); nst++;
+            }
             emit_xmm_pin_spill_all(b);
             emit_spill_pinned(b);
             a64_mov_reg(b, 1, 0, 19);
@@ -4921,8 +4991,13 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
             uint32_t *miss = a64_label(b);
             a64_patch_cbz(ras_empty, miss);
-            for (int i = 0; i < nst; i++)
-                a64_patch_cbz(ras_stale[i], miss_pop);
+            for (int i = 0; i < nst; i++) {
+                if ((*ras_stale[i] & 0x7f000000u) == 0x36000000u ||
+                    (*ras_stale[i] & 0x7f000000u) == 0x37000000u)
+                    a64_patch_tbz(ras_stale[i], miss_pop);   /* tbz/tbnz */
+                else
+                    a64_patch_cbz(ras_stale[i], miss_pop);
+            }
         }
     } else {
         return 0;
@@ -5051,11 +5126,11 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         a64_sub_reg(b, 1, JTU, JTU, JT1, 0);
         uint32_t *nxt = a64_label(b); a64_cbnz(b, 1, JTU, 0);
         uint32_t *nocode = NULL, *notbody = NULL;
-        if (g_pin_class == 1) {
+        if (g_pin_class == 1 || g_pin_class == 3) {
             /* same canonical pin layout on both sides -> jump into the body,
              * pinned host registers stay live, no frame traffic at all. */
             a64_ldr(b, 1, JTU, JTF, (uint32_t)offsetof(JitBlock, pin_class));
-            a64_sub_imm(b, 0, JTU, JTU, 1);
+            a64_sub_imm(b, 0, JTU, JTU, (uint32_t)g_pin_class);
             notbody = a64_label(b); a64_cbnz(b, 0, JTU, 0);
             a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, body_code));
             nocode = a64_label(b); a64_cbz(b, 1, JT0, 0);
@@ -5167,7 +5242,7 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
         if (rslot) {
             JitBlock *rb = cache_lookup(g_xlat_jit, retaddr);
             if (rb && rb->code)
-                *rslot = (void *)rb->code;
+                *rslot = ras_entry_for(rb);
             else
                 pending_add_ras(retaddr, rslot);
             a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
@@ -5414,7 +5489,7 @@ static void pending_drain(uint64_t rip, JitBlock *target)
         if (e->target_rip == rip) {
             if (e->ras_slot)
 
-                __atomic_store_n(e->ras_slot, (void *)target->code, __ATOMIC_RELEASE);
+                __atomic_store_n(e->ras_slot, ras_entry_for(target), __ATOMIC_RELEASE);
             else if (e->kind == EDGE_BODY) {
                 int compatible = e->pin_class
                     ? target->pin_class == e->pin_class
@@ -5867,6 +5942,21 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         (term->op == OCERZ_OP_JCC ||
          (term->op == OCERZ_OP_JMP && term->ops[0].kind == OCERZ_OPK_IMM) ||
          indirect_jmp_term);
+    int full_pin = fullpin_enabled() && !g_no_regflags;
+    if (full_pin) {
+        call_region = 0;
+        fixed_region = 0;
+        for (int i = 0; i < 16; i++) {
+            blk->host_holds[i] = (uint8_t)i;
+            blk->guest_in_host[i] = (int8_t)i;
+        }
+        blk->n_pinned = 16;
+        blk->pin_class = 3;
+        g_pin = blk->guest_in_host;
+        g_pin_hold = blk->host_holds;
+        g_n_pinned = 16;
+        g_pin_class = 3;
+    } else
     if (call_region) {
 
         static const uint8_t call_gpr[6] = {
@@ -5905,7 +5995,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         g_pin_hold = blk->host_holds;
         g_n_pinned = 8;
         g_pin_class = 1;
-    } else if (!call_region && !g_no_regflags &&
+    } else if (!full_pin && !call_region && !g_no_regflags &&
                (n >= g_pin_min || fuse_self)) {
         int cnt[16] = {0};
         for (int i = 0; i < n; i++) {
@@ -5985,7 +6075,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         int rs = pin_slot(OCERZ_RSP);
         assert(rs >= 0);
         a64_mov_imm64(&b, JT0, ocerz_guest_base);
-        a64_add_reg(&b, 1, 21 + rs, 21 + rs, JT0, 0);
+        a64_add_reg(&b, 1, pin_hreg(rs), pin_hreg(rs), JT0, 0);
     }
 
     if (g_pin_class == 2)
@@ -6247,9 +6337,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 
     uint32_t *chain_tail_lbl = NULL;
     uint32_t *chain_patch_b = NULL;
+    int chain_is_body = 0;
     if (!g_no_chain && g_chain_target) {
         chain_tail_lbl = a64_label(&b);
-        chain_patch_b = emit_chain_tail(&b, 0);
+        if (g_pin_class == 3) {
+            /* every block shares the full layout: chain into the callee BODY
+             * (no leave/enter); fallback path stores RIP and exits normally */
+            chain_patch_b = emit_body_chain_tail(&b, g_chain_target, 0, epi_sites, &n_epi);
+            chain_is_body = 1;
+        } else {
+            chain_patch_b = emit_chain_tail(&b, 0);
+        }
     }
 
     if (g_flaglive_log)
@@ -6323,8 +6421,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     } else if (chain_patch_b) {
         blk->edges[0].target_rip = g_chain_target;
         blk->edges[0].patch_b = chain_patch_b;
-        blk->edges[0].kind = EDGE_XBLOCK;
-        blk->edges[0].pin_class = 0;
+        blk->edges[0].kind = chain_is_body ? EDGE_BODY : EDGE_XBLOCK;
+        blk->edges[0].pin_class = chain_is_body ? 3 : 0;
         blk->n_edges = 1;
     } else if (g_n_jcc_edges) {
         for (int i = 0; i < g_n_jcc_edges; i++) {
@@ -6486,7 +6584,7 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
     if (!b || !host_x || !cpu)
         return;
     for (int i = 0; i < b->n_pinned; i++) {
-        uint64_t value = host_x[21 + i];
+        uint64_t value = host_x[pin_hreg(i)];
         if (b->pin_class == 2 && b->host_holds[i] == OCERZ_RSP)
             value -= ocerz_guest_base;
         cpu->gpr[b->host_holds[i]] = value;
