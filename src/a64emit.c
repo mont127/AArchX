@@ -599,6 +599,8 @@ static void v3(A64Buf *b, uint32_t base, int vd, int vn, int vm)
     a64_emit32(b, base | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
 }
 void a64_v_fadd(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4e60d400u : 0x4e20d400u, vd, vn, vm); }
+/* FMAXV Sd, Vn.4S (NaN-propagating max across lanes) */
+void a64_fmaxv_4s(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x6e30f800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_fsub(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4ee0d400u : 0x4ea0d400u, vd, vn, vm); }
 void a64_v_fmul(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x6e60dc00u : 0x6e20dc00u, vd, vn, vm); }
 void a64_v_fdiv(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x6e60fc00u : 0x6e20fc00u, vd, vn, vm); }

@@ -65,7 +65,13 @@ int main(void)
     g_u64 after = churn(0, 1);
     if (waited == pid && status == (7 << 8) && after != 0 && cells[0] != 0)
         g_puts("fork ordered ok\n");
-    else
+    else {
         g_puts("fork ordered bad\n");
+        g_puts("  pid="); g_putu64((g_u64)pid);
+        g_puts("  waited="); g_putu64((g_u64)waited);
+        g_puts("  status="); g_putu64((g_u64)status);
+        g_puts("  after="); g_putu64(after);
+        g_puts("  cells0="); g_putu64(cells[0]);
+    }
     return 0;
 }

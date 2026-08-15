@@ -184,6 +184,7 @@ void a64_v_fcmeq(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_v_uminv_4s(A64Buf *b, int vd, int vn);
 void a64_v_bit(A64Buf *b, int vd, int vn, int vm);
 void a64_v_bif(A64Buf *b, int vd, int vn, int vm);
+void a64_fmaxv_4s(A64Buf *b, int vd, int vn);
 void a64_v_fcmgt(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_fcsel(A64Buf *b, int dbl, int vd, int vn, int vm, int cond);
 void a64_v_xtn(A64Buf *b, int esz, int vd, int vn);
