@@ -10,6 +10,8 @@
 #include <stddef.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
@@ -133,8 +135,8 @@ static void mach_ret(OcerzCPU *cpu, uint64_t kr)
 static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     if (getenv("OCERZ_EXITLOG")) {
-        fprintf(stderr, "ocerz: EXITLOG code=%d rip=%#llx ret-chain:",
-                (int)a[0], (unsigned long long)cpu->rip);
+        fprintf(stderr, "ocerz: EXITLOG[%d] code=%d rip=%#llx ret-chain:",
+                (int)getpid(), (int)a[0], (unsigned long long)cpu->rip);
         uint64_t fp = cpu->gpr[OCERZ_RBP];
         for (int d = 0; d < 8 && fp >= ocerz_arena_lo && fp < ocerz_arena_hi; d++) {
             fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
@@ -143,6 +145,19 @@ static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         fprintf(stderr, "\n");
     }
     ocerz_vm_request_exit(vm, (int)(uint32_t)a[0] & 0xff);
+    /* exit() is process-wide on Darwin.  request_exit only raises a flag
+     * that CPUs notice between instructions; a CPU parked in a blocking
+     * host syscall (mach_msg receive, pipe read) never looks.  When the
+     * exiting thread is a worker, the main host thread may be exactly
+     * such a sleeper: the workers unwind, the process lingers as a
+     * shell with all its pipes open, and wineserver's peers wait
+     * forever.  Do what the kernel would do: end the process now.
+     * (On the main CPU the normal unwind through ocerz_dyld_run
+     * returns the code and exit() runs on its own.) */
+    if (!pthread_main_np()) {
+        fflush(stderr);
+        _exit((int)(uint32_t)a[0] & 0xff);
+    }
     return OCERZ_STEP_EXIT;
 }
 
@@ -160,6 +175,10 @@ static int sys_abort_payload(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
               (unsigned long long)a[0], (unsigned long long)a[1]);
     (void)cpu;
     ocerz_vm_request_exit(vm, 134);
+    if (!pthread_main_np()) {
+        fflush(stderr);
+        _exit(134);
+    }
     return OCERZ_STEP_EXIT;
 }
 
@@ -2187,6 +2206,21 @@ static int ocerz_bsdthread_sema_is_port(uint64_t value)
 
 static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
+    if (getenv("OCERZ_EXITLOG")) {
+        fprintf(stderr,
+                "ocerz: THREADEXIT[%d] cpu#%u rip=%#llx kport=%#llx sema=%#llx bt:",
+                (int)getpid(), cpu->cpu_number, (unsigned long long)cpu->rip,
+                (unsigned long long)a[2], (unsigned long long)a[3]);
+        uint64_t fp = cpu->gpr[OCERZ_RBP];
+        for (int d = 0; d < 8 && fp > 0x1000; d++) {
+            fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+            uint64_t nf = ocerz_ld(fp, 8);
+            if (nf <= fp)
+                break;
+            fp = nf;
+        }
+        fprintf(stderr, "\n");
+    }
     uint64_t sema_or_ulock = a[3];
     if (sema_or_ulock != 0 && ocerz_bsdthread_sema_is_port(sema_or_ulock)) {
         semaphore_signal((semaphore_t)(uint32_t)sema_or_ulock);
@@ -3029,10 +3063,35 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (num != 362 && orig[3] && !err && (int64_t)r > 0) {
             for (int64_t i = 0; i < (int64_t)r && i < 2; i++) {
                 uint64_t ke = orig[3] + (uint64_t)i * 32;
-                fprintf(stderr, "ocerz:   EVENT ident=%#llx filter=%d flags=%#x fflags=%#x data=%#llx\n",
+                fprintf(stderr, "ocerz:   EVENT ident=%#llx filter=%d flags=%#x fflags=%#x data=%#llx udata=%#llx\n",
                         (unsigned long long)ocerz_ld(ke, 8), (int)(int16_t)ocerz_ld(ke + 8, 2),
                         (unsigned)(uint16_t)ocerz_ld(ke + 10, 2), (unsigned)(uint32_t)ocerz_ld(ke + 12, 4),
-                        (unsigned long long)ocerz_ld(ke + 16, 8));
+                        (unsigned long long)ocerz_ld(ke + 16, 8),
+                        (unsigned long long)ocerz_ld(ke + 24, 8));
+            }
+            /* EOF guard: every EV_EOF read-filter event gets a host-side
+             * truth check.  A reap-triggering EOF for an fd that is still
+             * open, still a pipe, and still readable is the smoking gun. */
+            for (int64_t i = 0; i < (int64_t)r; i++) {
+                uint64_t ke = orig[3] + (uint64_t)i * 32;
+                uint16_t kfl = (uint16_t)ocerz_ld(ke + 10, 2);
+                int16_t kfilt = (int16_t)ocerz_ld(ke + 8, 2);
+                if (!(kfl & 0x8000) || kfilt != -1)
+                    continue;
+                int kfd = (int)ocerz_ld(ke, 8);
+                int fl = fcntl(kfd, F_GETFL);
+                int qn = -1;
+                (void)ioctl(kfd, FIONREAD, &qn);
+                struct stat kst;
+                int st_ok = fstat(kfd, &kst);
+                fprintf(stderr,
+                        "ocerz: KEVGUARD[%d] EOF ident=%d udata=%#llx data=%#llx "
+                        "getfl=%#x qread=%d mode=%#x ino=%llu\n",
+                        (int)getpid(), kfd,
+                        (unsigned long long)ocerz_ld(ke + 24, 8),
+                        (unsigned long long)ocerz_ld(ke + 16, 8), fl, qn,
+                        st_ok == 0 ? (unsigned)kst.st_mode : 0u,
+                        st_ok == 0 ? (unsigned long long)kst.st_ino : 0ull);
             }
         }
     }
