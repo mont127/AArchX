@@ -2145,6 +2145,261 @@ static int emit_lea(A64Buf *b, const X86Insn *insn)
     return 1;
 }
 
+
+/* ---- batch-1 GPR emitters: not/neg/rol/ror/shift-by-cl/cmovcc/setcc/bswap ---- */
+
+/* Load a 4/8-byte register operand into host reg dst; returns 0 if unsupported. */
+
+/* Compute the x86 condition `cc` from (materialized) RFLAGS into JTF as 0/1
+ * and set host NZCV so that NE == condition true.  Mirrors emit_jcc. */
+static void emit_cc_predicate(A64Buf *b, unsigned cc)
+{
+    /* Caller must have run emit_materialize() already (it calls out to C
+     * and clobbers every JT register).  Uses JT0, JT1, JTA, JTT, JTU, JTF;
+     * JT2 is deliberately left untouched so callers can hold a value there. */
+    a64_ldr(b, 8, JT0, 20, RF_OFF);
+    a64_ubfx(b, 1, JT1, JT0, 0, 1);    /* CF */
+    a64_ubfx(b, 1, JTA, JT0, 6, 1);    /* ZF */
+    a64_ubfx(b, 1, JTT, JT0, 7, 1);    /* SF */
+    a64_ubfx(b, 1, JTU, JT0, 11, 1);   /* OF */
+    switch (cc >> 1) {
+    case 0: a64_mov_reg(b, 1, JTF, JTU); break;                 /* O  */
+    case 1: a64_mov_reg(b, 1, JTF, JT1); break;                 /* B  */
+    case 2: a64_mov_reg(b, 1, JTF, JTA); break;                 /* E  */
+    case 3: a64_orr_reg(b, 1, JTF, JT1, JTA, 0); break;         /* BE */
+    case 4: a64_mov_reg(b, 1, JTF, JTT); break;                 /* S  */
+    case 5: a64_ubfx(b, 1, JTF, JT0, 2, 1); break;              /* P  */
+    case 6: a64_eor_reg(b, 1, JTF, JTT, JTU, 0); break;         /* L  */
+    default:
+        a64_eor_reg(b, 1, JTF, JTT, JTU, 0);                    /* LE */
+        a64_orr_reg(b, 1, JTF, JTF, JTA, 0);
+        break;
+    }
+    if (cc & 1) {  /* negated form: predicate = !JTF */
+        a64_mov_imm64(b, JTU, 1);
+        a64_eor_reg(b, 1, JTF, JTF, JTU, 0);
+    }
+    a64_subs_imm(b, 1, A64_ZR, JTF, 0);   /* NE <=> taken */
+}
+
+static int emit_not_neg(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    const X86Operand *d = &insn->ops[0];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
+        return 0;
+    int sf = d->size == 8;
+    int ds = pin_slot(d->reg);
+    if (insn->op == OCERZ_OP_NOT) {
+        if (ds >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP)) {
+            a64_orn_reg(b, sf, 21 + ds, A64_ZR, 21 + ds, 0);
+            return 1;
+        }
+        emit_gpr_rd(b, sf, JT0, d->reg);
+        a64_orn_reg(b, sf, JT2, A64_ZR, JT0, 0);
+        emit_gpr_wr(b, JT2, d->reg);
+        return 1;
+    }
+    /* NEG: result = 0 - a; flags = SUB(0, a) */
+    if (!g_defer && need)
+        return 0;
+    emit_gpr_rd(b, sf, JT0, d->reg);
+    a64_sub_reg(b, sf, JT2, A64_ZR, JT0, 0);
+    emit_gpr_wr(b, JT2, d->reg);
+    if (need) {
+        a64_mov_imm64(b, JT1, 0);
+        emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0), JT1, JT0);
+    }
+    return 1;
+}
+
+/* Shift/rotate count source: imm -> constant; CL -> masked register. */
+static int emit_shift_count(A64Buf *b, const X86Insn *insn, int sf, int dst,
+                            unsigned *const_cnt)
+{
+    const X86Operand *s = &insn->ops[1];
+    unsigned mask = sf ? 63u : 31u;
+    if (s->kind == OCERZ_OPK_IMM) {
+        *const_cnt = (unsigned)(s->imm & mask);
+        return 1;
+    }
+    if (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RCX && !s->high8 && s->size == 1) {
+        emit_gpr_rd(b, 1, dst, OCERZ_RCX);
+        a64_mov_imm64(b, JTU, mask);
+        a64_and_reg(b, 1, dst, dst, JTU, 0);
+        *const_cnt = 0xffffffffu;   /* variable */
+        return 1;
+    }
+    return 0;
+}
+
+static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    const X86Operand *d = &insn->ops[0];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
+        return 0;
+    if (g_pin_class == 2 && d->reg == OCERZ_RSP)
+        return 0;
+    int sf = d->size == 8;
+    int bits = sf ? 64 : 32;
+    int is_rol = insn->op == OCERZ_OP_ROL;
+    unsigned cnt;
+    if (!emit_shift_count(b, insn, sf, JT1, &cnt))
+        return 0;
+    int variable = cnt == 0xffffffffu;
+    if (!variable && cnt == 0)
+        return 1;                       /* no-op, flags untouched */
+    if (need && variable)
+        return 0;                       /* count==0 must not touch flags; keep slow */
+    int ds = pin_slot(d->reg);
+    int rd = ds >= 0 ? 21 + ds : JT2;
+    if (ds < 0)
+        emit_gpr_rd(b, sf, JT0, d->reg);
+    int rn = ds >= 0 ? rd : JT0;
+    if (variable) {
+        if (is_rol) {                   /* rol by n == ror by (bits - n) */
+            a64_mov_imm64(b, JTU, (uint64_t)bits);
+            a64_sub_reg(b, 1, JT1, JTU, JT1, 0);
+        }
+        a64_rorv(b, sf, rd, rn, JT1);
+    } else {
+        unsigned r = is_rol ? (unsigned)(bits - (int)(cnt % (unsigned)bits)) % (unsigned)bits
+                            : cnt % (unsigned)bits;
+        if (r == 0)
+            a64_mov_reg(b, sf, rd, rn);
+        else
+            a64_extr(b, sf, rd, rn, rn, (int)r);
+    }
+    if (ds < 0)
+        emit_gpr_wr(b, rd, d->reg);
+    if (!need)
+        return 1;
+    /* Flags (constant count only): CF = rol ? res&1 : msb(res); OF only when cnt==1. */
+    emit_materialize(b);
+    a64_ldr(b, 8, JTT, 20, RF_OFF);
+    if (is_rol)
+        a64_ubfx(b, 1, JT1, rd, 0, 1);
+    else
+        a64_ubfx(b, 1, JT1, rd, bits - 1, 1);
+    a64_mov_imm64(b, JTU, ~(uint64_t)OCERZ_CF & (cnt == 1 ? ~(uint64_t)OCERZ_OF : ~0ull));
+    a64_and_reg(b, 1, JTT, JTT, JTU, 0);
+    a64_orr_reg(b, 1, JTT, JTT, JT1, 0);
+    if (cnt == 1) {
+        if (is_rol) {                   /* OF = CF ^ msb(res) */
+            a64_ubfx(b, 1, JTU, rd, bits - 1, 1);
+            a64_eor_reg(b, 1, JTU, JTU, JT1, 0);
+        } else {                        /* OF = msb(res) ^ bit(bits-2)(res) */
+            a64_ubfx(b, 1, JTU, rd, bits - 2, 1);
+            a64_eor_reg(b, 1, JTU, JTU, JT1, 0);
+        }
+        a64_lsl_imm(b, 1, JTU, JTU, 11);
+        a64_orr_reg(b, 1, JTT, JTT, JTU, 0);
+    }
+    a64_str(b, 8, JTT, 20, RF_OFF);
+    return 1;
+}
+
+/* shl/shr/sar by CL (the immediate forms live in emit_shift). */
+static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    const X86Operand *d = &insn->ops[0];
+    const X86Operand *s = &insn->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
+        return 0;
+    if (!(s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RCX && !s->high8 && s->size == 1))
+        return 0;
+    if (g_pin_class == 2 && d->reg == OCERZ_RSP)
+        return 0;
+    if (need)
+        return 0;                       /* flags: count==0 keeps them; stay slow */
+    int sf = d->size == 8;
+    unsigned cnt;
+    if (!emit_shift_count(b, insn, sf, JT1, &cnt))
+        return 0;
+    int ds = pin_slot(d->reg);
+    int rd = ds >= 0 ? 21 + ds : JT2;
+    if (ds < 0)
+        emit_gpr_rd(b, sf, JT0, d->reg);
+    int rn = ds >= 0 ? rd : JT0;
+    switch (insn->op) {
+    case OCERZ_OP_SHL: a64_lslv(b, sf, rd, rn, JT1); break;
+    case OCERZ_OP_SHR: a64_lsrv(b, sf, rd, rn, JT1); break;
+    case OCERZ_OP_SAR: a64_asrv(b, sf, rd, rn, JT1); break;
+    default: return 0;
+    }
+    if (ds < 0)
+        emit_gpr_wr(b, rd, d->reg);
+    return 1;
+}
+
+static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0];
+    const X86Operand *s = &insn->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
+        return 0;
+    if (g_pin_class == 2 && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP)))
+        return 0;
+    int sf = d->size == 8;
+    emit_materialize(b);                 /* before anything lives in JT regs */
+    /* source value -> JT2 (memory sources are loaded even when not taken, as x86 does) */
+    if (s->kind == OCERZ_OPK_REG) {
+        if (s->high8 || s->size != d->size)
+            return 0;
+        emit_gpr_rd(b, sf, JT2, s->reg);
+    } else if (s->kind == OCERZ_OPK_MEM) {
+        if (!emit_mem_ea(b, insn, s, JTA))
+            return 0;
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        emit_guest_load_ordered(b, d->size, JT2, JTA, JTU);
+        patch_guard_skip(skip, a64_label(b));
+    } else
+        return 0;
+    emit_cc_predicate(b, insn->cc);      /* clobbers JT0,JT1,JTT,JTU,JTF; NE = take */
+    emit_gpr_rd(b, sf, JT0, d->reg);
+    a64_csel(b, sf, JT0, JT2, JT0, A64_NE);
+    if (!sf)
+        a64_mov_reg(b, 0, JT0, JT0);     /* zero-extend 32-bit result */
+    emit_gpr_wr(b, JT0, d->reg);
+    return 1;
+}
+
+static int emit_setcc(A64Buf *b, const X86Insn *insn)
+{
+    const X86Operand *d = &insn->ops[0];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || d->size != 1)
+        return 0;
+    if (g_pin_class == 2 && d->reg == OCERZ_RSP)
+        return 0;
+    emit_materialize(b);
+    emit_cc_predicate(b, insn->cc);
+    a64_cset(b, JT2, A64_NE);
+    /* write low byte only, preserving the rest of the register */
+    emit_gpr_rd(b, 1, JT0, d->reg);
+    a64_bfi(b, 1, JT0, JT2, 0, 8);
+    emit_gpr_wr(b, JT0, d->reg);
+    return 1;
+}
+
+static int emit_bswap(A64Buf *b, const X86Insn *insn)
+{
+    const X86Operand *d = &insn->ops[0];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
+        return 0;
+    if (g_pin_class == 2 && d->reg == OCERZ_RSP)
+        return 0;
+    int sf = d->size == 8;
+    int ds = pin_slot(d->reg);
+    if (ds >= 0) {
+        a64_rev(b, sf, 21 + ds, 21 + ds);
+        return 1;
+    }
+    emit_gpr_rd(b, sf, JT0, d->reg);
+    a64_rev(b, sf, JT2, JT0);
+    emit_gpr_wr(b, JT2, d->reg);
+    return 1;
+}
+
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
@@ -2221,7 +2476,23 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_SHL:
     case OCERZ_OP_SHR:
     case OCERZ_OP_SAR:
+        if (insn->ops[1].kind == OCERZ_OPK_REG)
+            return emit_shift_cl(b, insn, need);
         return emit_shift(b, insn, need);
+    case OCERZ_OP_ROL:
+    case OCERZ_OP_ROR:
+        return emit_rot(b, insn, need);
+    case OCERZ_OP_NOT:
+    case OCERZ_OP_NEG:
+        return emit_not_neg(b, insn, need);
+    case OCERZ_OP_CMOVCC:
+        if (getenv("OCERZ_NO_INLINE_CMOV")) return 0;
+        return emit_cmov(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_SETCC:
+        if (getenv("OCERZ_NO_INLINE_SETCC")) return 0;
+        return emit_setcc(b, insn);
+    case OCERZ_OP_BSWAP:
+        return emit_bswap(b, insn);
     case OCERZ_OP_IMUL:
         if (insn->ops[0].kind == OCERZ_OPK_MEM ||
             (insn->nops > 1 && insn->ops[1].kind == OCERZ_OPK_MEM) ||
@@ -4890,6 +5161,12 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
 }
 
 static void ps_report(OcerzJit *jit);
+static OcerzJit *g_ps_atexit_jit;
+static void ps_report_atexit(void)
+{
+    if (g_ps_atexit_jit)
+        ps_report(g_ps_atexit_jit);
+}
 
 static void block_destroy(JitBlock *b)
 {
@@ -5234,6 +5511,10 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             js_t0 = ps_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             ocerz_perfstat = getenv("OCERZ_PERFSTAT") ? 1 : 0;
             ocerz_jitstat = getenv("OCERZ_JITSTAT") ? 1 : 0;
+            if (ocerz_perfstat > 0) {
+                g_ps_atexit_jit = jit;
+                atexit(ps_report_atexit);
+            }
             g_flaglive_log = getenv("OCERZ_FLAGLIVE") ? 1 : 0;
             g_no_lazyflags = getenv("OCERZ_NO_LAZYFLAGS") ? 1 : 0;
             g_no_ras = getenv("OCERZ_NO_RAS") ? 1 : 0;
