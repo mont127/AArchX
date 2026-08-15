@@ -1892,6 +1892,38 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
     a64_patch_b(to_done, a64_label(b));
 }
 
+/* Plain-memory fast path for [base+index<<s] / [base+disp] accesses when no
+ * commpage/low-base guard is needed (standalone plain-mode processes):
+ *   add JTA, JGB, base ; ldr/str [JTA, index, lsl s]   or   ldr/str [JTA, #disp]
+ * Returns 1 if emitted.  `vec` selects V-register load/store (size 4/8/16). */
+static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand *m,
+                               int size, int reg, int store, int vec)
+{
+    if (!g_plain_mem || !jgb_usable() || ocerz_commpage || ocerz_low_base) return 0;
+    if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || m->riprel) return 0;
+    if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
+    if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
+    int hb = pin_hreg(pin_slot(m->base));
+    if (m->index != OCERZ_REG_NONE) {
+        if (m->disp != 0 || pin_slot(m->index) < 0) return 0;
+        int hi = pin_hreg(pin_slot(m->index));
+        int sc = m->scale & 3;
+        /* register-offset form scales by the access size only */
+        int want = size == 16 ? 4 : size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
+        if (sc != 0 && sc != want) return 0;
+        a64_add_reg(b, 1, JTA, JGB, hb, 0);
+        if (vec) { if (store) a64_str_v_regoff(b, size, reg, JTA, hi, sc != 0); else a64_ldr_v_regoff(b, size, reg, JTA, hi, sc != 0); }
+        else     { if (store) a64_str_regoff(b, size, reg, JTA, hi, sc != 0); else a64_ldr_regoff(b, size, reg, JTA, hi, sc != 0); }
+        return 1;
+    }
+    /* base + disp: scaled unsigned immediate */
+    if (m->disp < 0 || (m->disp % size) != 0 || m->disp / size > 4095) return 0;
+    a64_add_reg(b, 1, JTA, JGB, hb, 0);
+    if (vec) { if (store) a64_str_v(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JTA, (uint32_t)m->disp); }
+    else     { if (store) a64_str(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr(b, size, reg, JTA, (uint32_t)m->disp); }
+    return 1;
+}
+
 static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0];
@@ -1906,6 +1938,8 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         int ss = pin_slot(s->reg);
         int rv = ss >= 0 ? pin_hreg(ss) : JT1;
         if (ss >= 0 && emit_hoisted_mem_access(b, insn, d, s->size, rv, 1))
+            return 1;
+        if (ss >= 0 && emit_plain_mem_fast(b, insn, d, s->size, rv, 1, 0))
             return 1;
         if (!emit_mem_ea(b, insn, d, JTA))
             return 0;
@@ -1924,6 +1958,8 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         int ds = pin_slot(d->reg);
         int rd = ds >= 0 ? pin_hreg(ds) : JT1;
         if (emit_hoisted_mem_access(b, insn, s, d->size, rd, 0))
+            return 1;
+        if (ds >= 0 && emit_plain_mem_fast(b, insn, s, d->size, rd, 0, 0))
             return 1;
         if (!emit_mem_ea(b, insn, s, JTA))
             return 0;
@@ -3132,6 +3168,7 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_MEM) {
         uint32_t *skip;
         int vd = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;   /* load straight into the pin */
+        if (vd != VX0 && emit_plain_mem_fast(b, insn, s, 16, vd, 0, 1)) return 1;
         if (!emit_sse_mem_addr(b, insn, s, exit_sites, n_exits, &skip)) return 0;
         emit_sse_mem_ld(b, 16, vd);
         patch_guard_skip(skip, a64_label(b));
@@ -3140,6 +3177,7 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     }
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_XMM) {
         int vs = xmm_is_pinned(s->reg) ? xmm_vreg(s->reg) : VX0;   /* store straight from the pin */
+        if (vs != VX0 && emit_plain_mem_fast(b, insn, d, 16, vs, 1, 1)) return 1;
         if (vs == VX0) emit_xmm_ld(b, VX0, s->reg);
         uint32_t *skip;
         if (!emit_sse_mem_addr(b, insn, d, exit_sites, n_exits, &skip)) return 0;

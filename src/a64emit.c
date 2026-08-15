@@ -651,3 +651,14 @@ void a64_v_bit(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6ea01c00u, vd, vn, v
 void a64_v_xtn(A64Buf *b, int esz, int vd, int vn) { a64_emit32(b, 0x0e212800u | ((uint32_t)esz << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 /* CMN Xn, #imm12  == ADDS XZR, Xn, #imm */
 void a64_cmn_imm(A64Buf *b, int sf, int rn, int imm12) { a64_emit32(b, 0x3100001fu | ((uint32_t)sf << 31) | ((uint32_t)(imm12 & 0xfff) << 10) | ((uint32_t)(rn & 31) << 5)); }
+/* LDR/STR Qt/Dt/St, [Xn, Xm, LSL #s] register-offset (scaled iff `scaled`) */
+void a64_ldr_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled)
+{
+    uint32_t base = size == 16 ? 0x3ce06800u : size == 8 ? 0xfc606800u : 0xbc606800u;
+    a64_emit32(b, base | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(scaled != 0) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vt & 31));
+}
+void a64_str_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled)
+{
+    uint32_t base = size == 16 ? 0x3ca06800u : size == 8 ? 0xfc206800u : 0xbc206800u;
+    a64_emit32(b, base | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(scaled != 0) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vt & 31));
+}
