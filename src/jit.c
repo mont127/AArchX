@@ -187,10 +187,57 @@ static uint32_t *g_chain_epi;
 static int g_chain_keeps_jgb;      /* the CALL path branches to the chain tail with x0 = JGB intact */
 /* RAS slot literals: `ldr Xt, <lit>` sites whose 8-byte slot cell is placed in
  * a pool at the end of the block (patched + registered there) */
-typedef struct { uint32_t *site; uint64_t retaddr; } RasLit;
+typedef struct { uint32_t *site; uint64_t retaddr; int kind; int rt; } RasLit;   /* kind 0: RAS cell for retaddr; 1: constant (retaddr = value) */
 #define RASLIT_MAX 32
 static RasLit g_raslit[RASLIT_MAX];
 static int g_n_raslit;
+/* per-site caches for indirect jmp/call: 32 direct-mapped {rip, body} entries */
+typedef struct { uint64_t rip; void *body; } JitPscEnt;
+#define PSC_N 32
+static JitPscEnt *g_psc_pool;
+static size_t g_psc_used, g_psc_cap;      /* in entries */
+static JitPscEnt **g_psc_tables;
+static size_t g_n_psc_tables, g_cap_psc_tables;
+static JitPscEnt *psc_alloc(void)
+{
+    if (g_psc_used + PSC_N > g_psc_cap) {
+        size_t bytes = (size_t)1 << 22;    /* 4 MB chunks: 8192 sites */
+        void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (p == MAP_FAILED) return NULL;
+        g_psc_pool = (JitPscEnt *)p; g_psc_used = 0; g_psc_cap = bytes / sizeof(JitPscEnt);
+    }
+    JitPscEnt *t = &g_psc_pool[g_psc_used];
+    g_psc_used += PSC_N;
+    if (g_n_psc_tables == g_cap_psc_tables) {
+        size_t ncap = g_cap_psc_tables ? g_cap_psc_tables * 2 : 1024;
+        JitPscEnt **nv = (JitPscEnt **)realloc(g_psc_tables, ncap * sizeof *nv);
+        if (nv) { g_psc_tables = nv; g_cap_psc_tables = ncap; }
+    }
+    if (g_n_psc_tables < g_cap_psc_tables) g_psc_tables[g_n_psc_tables++] = t;
+    return t;
+}
+static void psc_clear_all(void)
+{
+    for (size_t i = 0; i < g_n_psc_tables; i++)
+        for (int k = 0; k < PSC_N; k++) {
+            __atomic_store_n(&g_psc_tables[i][k].body, (void *)NULL, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_psc_tables[i][k].rip, (uint64_t)0, __ATOMIC_RELEASE);
+        }
+}
+/* registry of every pool cell (they live in JIT memory, which is never
+ * reused, so invalidation can NULL them all inside the write window) */
+static void ***g_ras_cells;
+static size_t g_n_ras_cells, g_cap_ras_cells;
+static void ras_cell_register(void **cell)
+{
+    if (g_n_ras_cells == g_cap_ras_cells) {
+        size_t ncap = g_cap_ras_cells ? g_cap_ras_cells * 2 : 1024;
+        void ***nv = (void ***)realloc(g_ras_cells, ncap * sizeof *nv);
+        if (!nv) return;
+        g_ras_cells = nv; g_cap_ras_cells = ncap;
+    }
+    g_ras_cells[g_n_ras_cells++] = cell;
+}
 
 static uint64_t g_self_rip;
 static uint32_t *g_body_entry;
@@ -5911,6 +5958,8 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                     /* ldr JT0, <pool cell> -- patched when the pool is laid out */
                     g_raslit[g_n_raslit].site = a64_label(b);
                     g_raslit[g_n_raslit].retaddr = retaddr;
+                    g_raslit[g_n_raslit].kind = 0;
+                    g_raslit[g_n_raslit].rt = JT0;
                     g_n_raslit++;
                     a64_emit32(b, 0x58000000u | (uint32_t)JT0);
                 } else {
@@ -6131,6 +6180,38 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
                                uint32_t **epi_sites, int *n_epi)
 {
     a64_str(b, 8, JT1, 20, RIP_OFF);
+    /* per-site direct-mapped cache: {rip, body} x 32, indexed by rip bits
+     * 2..6; hit -> poll interrupt, br body.  Miss falls into the global
+     * hash lookup, which fills the entry when it finds a compatible body. */
+    JitPscEnt *psc = NULL;
+    if (g_pin_class == 3 && g_n_raslit < RASLIT_MAX && !getenv("OCERZ_NO_PSC"))
+        psc = psc_alloc();
+    uint32_t *psc_miss = NULL;
+    if (psc) {
+        g_raslit[g_n_raslit].site = a64_label(b);
+        g_raslit[g_n_raslit].retaddr = (uint64_t)(uintptr_t)psc;
+        g_raslit[g_n_raslit].kind = 1;
+        g_raslit[g_n_raslit].rt = JT2;
+        g_n_raslit++;
+        a64_emit32(b, 0x58000000u | (uint32_t)JT2);        /* ldr JT2, <table> */
+        a64_ubfx(b, 1, JTT, JT1, 2, 5);
+        a64_add_reg(b, 1, JT2, JT2, JTT, 4);              /* JT2 = &table[idx] */
+        a64_ldp_off(b, JTU, JT0, JT2, 0);
+        a64_subs_reg(b, 1, A64_ZR, JTU, JT1, 0);
+        psc_miss = a64_label(b); a64_bcond(b, A64_NE, 0);
+        uint32_t *psc_empty = a64_label(b); a64_cbz(b, 1, JT0, 0);   /* empty entry (rip 0) */
+        a64_ldr(b, 4, JTU, 20, INT_OFF);
+        uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
+        a64_br(b, JT0);
+        a64_patch_cbz(intr, a64_label(b));
+        /* interrupt: leave via the epilogue (RIP stored) */
+        a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+        epi_sites[*n_epi] = a64_label(b);
+        a64_b(b, 0);
+        (*n_epi)++;
+        a64_patch_bcond(psc_miss, a64_label(b));
+        a64_patch_cbz(psc_empty, a64_label(b));
+    }
     /* hash */
     a64_lsr_imm(b, 1, JTT, JT1, 33);
     a64_eor_reg(b, 1, JTT, JTT, JT1, 0);
@@ -6159,6 +6240,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         to_full = a64_label(b); a64_cbnz(b, 0, JTU, 0);
         a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, body_code));
         uint32_t *nobody = a64_label(b); a64_cbz(b, 1, JT0, 0);
+        if (psc) a64_stp_off(b, JT1, JT0, JT2, 0);        /* fill the site cache entry */
         a64_ldr(b, 4, JTU, 20, INT_OFF);                  /* interrupt poll (back edges) */
         uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
         if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
@@ -7562,7 +7644,12 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             a64_emit32(&b, 0); a64_emit32(&b, 0);
             if (b.overflow) break;
             int32_t off = (int32_t)((uint32_t *)cell - g_raslit[i].site);
-            *g_raslit[i].site = 0x58000000u | (((uint32_t)off & 0x7ffffu) << 5) | (uint32_t)JT0;
+            *g_raslit[i].site = 0x58000000u | (((uint32_t)off & 0x7ffffu) << 5) | (uint32_t)(g_raslit[i].rt & 31);
+            if (g_raslit[i].kind == 1) {
+                *cell = (void *)(uintptr_t)g_raslit[i].retaddr;      /* constant */
+                continue;
+            }
+            ras_cell_register(cell);
             JitBlock *rb = cache_lookup(g_xlat_jit, g_raslit[i].retaddr);
             if (rb && rb->code)
                 *cell = ras_entry_for(rb);
@@ -8094,6 +8181,9 @@ static void invalidate_all_locked(OcerzJit *jit)
 
     pthread_jit_write_protect_np(0);
     patched |= force_stop_sites_writable(jit);
+    /* RAS pool cells (in JIT memory) must not keep retired code reachable */
+    for (size_t i = 0; i < g_n_ras_cells; i++)
+        __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
     for (unsigned h = 0; h < JIT_HASH_SIZE; h++) {
         for (JitBlock *b = jit->buckets[h]; b; b = b->hnext) {
             for (int i = 0; i < b->n_edges; i++) {
@@ -8126,6 +8216,7 @@ static void invalidate_all_locked(OcerzJit *jit)
     for (unsigned i = 0; i < g_ras_slot_n; i++)
         __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
     /* inline caches of indirect branches must not keep retired code alive */
+    psc_clear_all();
     for (unsigned i = 0; i < g_ic_next && i < JIT_IC_SLOTS; i++) {
         __atomic_store_n(&g_ic_slots[i].code, NULL, __ATOMIC_RELAXED);
         __atomic_store_n(&g_ic_slots[i].rip, 0, __ATOMIC_RELEASE);
