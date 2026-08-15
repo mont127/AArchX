@@ -2006,6 +2006,8 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
     if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
     int hb = pin_hreg(pin_slot(m->base));
+    /* hoisted base: JMEMBASE already holds guest_base + base */
+    int hoisted = g_mem_hoist_greg >= 0 && m->base == (unsigned)g_mem_hoist_greg;
     if (m->index != OCERZ_REG_NONE) {
         if (pin_slot(m->index) < 0) return 0;
         int hi = pin_hreg(pin_slot(m->index));
@@ -2013,24 +2015,35 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         int want = size == 16 ? 4 : size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
         if (m->disp == 0 && (sc == 0 || sc == want)) {
             /* register-offset form (scales by the access size only) */
-            a64_add_reg(b, 1, JTA, JGB, hb, 0);
-            if (vec) { if (store) a64_str_v_regoff(b, size, reg, JTA, hi, sc != 0); else a64_ldr_v_regoff(b, size, reg, JTA, hi, sc != 0); }
-            else     { if (store) a64_str_regoff(b, size, reg, JTA, hi, sc != 0); else a64_ldr_regoff(b, size, reg, JTA, hi, sc != 0); }
+            int ra = JTA;
+            if (hoisted) ra = JMEMBASE; else a64_add_reg(b, 1, JTA, JGB, hb, 0);
+            if (vec) { if (store) a64_str_v_regoff(b, size, reg, ra, hi, sc != 0); else a64_ldr_v_regoff(b, size, reg, ra, hi, sc != 0); }
+            else     { if (store) a64_str_regoff(b, size, reg, ra, hi, sc != 0); else a64_ldr_regoff(b, size, reg, ra, hi, sc != 0); }
             return 1;
+        }
+        if (m->disp == 0 && sc != 0) {
+            /* scaled index the access cannot fold: guest address then [JGB, addr] */
+            if (!hoisted) {
+                a64_add_reg(b, 1, JTA, hb, hi, sc);
+                if (vec) { if (store) a64_str_v_regoff(b, size, reg, JGB, JTA, 0); else a64_ldr_v_regoff(b, size, reg, JGB, JTA, 0); }
+                else     { if (store) a64_str_regoff(b, size, reg, JGB, JTA, 0); else a64_ldr_regoff(b, size, reg, JGB, JTA, 0); }
+                return 1;
+            }
         }
         /* base + index<<s + disp: two adds, then a scaled immediate */
         if (m->disp < 0 || (m->disp % size) != 0 || m->disp / size > 4095) return 0;
-        a64_add_reg(b, 1, JTA, JGB, hb, 0);
-        a64_add_reg(b, 1, JTA, JTA, hi, sc);
+        if (hoisted) a64_add_reg(b, 1, JTA, JMEMBASE, hi, sc);
+        else { a64_add_reg(b, 1, JTA, JGB, hb, 0); a64_add_reg(b, 1, JTA, JTA, hi, sc); }
         if (vec) { if (store) a64_str_v(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JTA, (uint32_t)m->disp); }
         else     { if (store) a64_str(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr(b, size, reg, JTA, (uint32_t)m->disp); }
         return 1;
     }
     /* base + disp: scaled unsigned immediate */
     if (m->disp < 0 || (m->disp % size) != 0 || m->disp / size > 4095) return 0;
-    a64_add_reg(b, 1, JTA, JGB, hb, 0);
-    if (vec) { if (store) a64_str_v(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JTA, (uint32_t)m->disp); }
-    else     { if (store) a64_str(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr(b, size, reg, JTA, (uint32_t)m->disp); }
+    int ra = JTA;
+    if (hoisted) ra = JMEMBASE; else a64_add_reg(b, 1, JTA, JGB, hb, 0);
+    if (vec) { if (store) a64_str_v(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, ra, (uint32_t)m->disp); }
+    else     { if (store) a64_str(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr(b, size, reg, ra, (uint32_t)m->disp); }
     return 1;
 }
 
