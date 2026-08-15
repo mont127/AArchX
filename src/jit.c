@@ -4564,13 +4564,42 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     if (d_mem || s_mem) {
         const X86Operand *m = d_mem ? d : s;
         int into = d_mem ? JT0 : JT1;
-        if (!emit_mem_ea(b, producer, m, JTA)) return 0;
-        uint32_t *skip = emit_commpage_guard(b, producer, JTA, exit_sites, n_exits);
-        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
-        emit_guest_load_ordered(b, d->size, into, JTA, JTU);
-        patch_guard_skip(skip, a64_label(b));
+        if (!emit_mem_load_plain(b, producer, m, d->size, into)) {
+            if (!emit_mem_ea(b, producer, m, JTA)) return 0;
+            uint32_t *skip = emit_commpage_guard(b, producer, JTA, exit_sites, n_exits);
+            emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+            emit_guest_load_ordered(b, d->size, into, JTA, JTU);
+            patch_guard_skip(skip, a64_label(b));
+        }
         if (d_mem) d_in_jt0 = 1; else s_in_jt1 = 1;
     }
+    /* narrow compare whose condition needs only Z or the unsigned flags:
+     * compare the zero-extended values directly (no shifting) */
+    int narrow_direct = (d->size == 1 || d->size == 2) && producer->op == OCERZ_OP_CMP &&
+        (jcc->cc == OCERZ_CC_E || jcc->cc == OCERZ_CC_NE || jcc->cc == OCERZ_CC_B ||
+         jcc->cc == OCERZ_CC_AE || jcc->cc == OCERZ_CC_A || jcc->cc == OCERZ_CC_BE) &&
+        !d->high8 && (s->kind != OCERZ_OPK_REG || !s->high8);
+    if (narrow_direct) {
+        int size = d->size;
+        uint64_t mask = size == 1 ? 0xffull : 0xffffull;
+        int rn, rm;
+        if (d_in_jt0) rn = JT0;                                    /* loads zero-extend */
+        else { emit_gpr_rd(b, 1, JT0, d->reg); if (size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0); rn = JT0; }
+        record_src = rn;
+        if (s_in_jt1) { rm = JT1; a64_subs_reg(b, 0, A64_ZR, rn, rm, 0); }
+        else if (s->kind == OCERZ_OPK_REG) {
+            emit_gpr_rd(b, 1, JT1, s->reg); if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
+            rm = JT1; a64_subs_reg(b, 0, A64_ZR, rn, rm, 0);
+        } else {
+            uint64_t v = (uint64_t)s->imm & mask;
+            a64_mov_imm64(b, JT1, v);
+            rm = JT1;
+            if (v <= 4095) a64_subs_imm(b, 0, A64_ZR, rn, (uint32_t)v);
+            else a64_subs_reg(b, 0, A64_ZR, rn, rm, 0);
+        }
+        record_dst = rm;
+        ccop = ocerz_cc_pack(OCERZ_CC_SUB, size, 0);
+    } else
     if ((d->size == 1 || d->size == 2) && producer->op == OCERZ_OP_TEST &&
         !d_mem && !d->high8 && s->kind == OCERZ_OPK_IMM &&
         (jcc->cc == OCERZ_CC_E || jcc->cc == OCERZ_CC_NE)) {
@@ -4596,10 +4625,9 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
          * from the unshifted zero-extended values at the narrow size. */
         int size = d->size, sh = 32 - 8 * size;
         uint64_t mask = size == 1 ? 0xffull : 0xffffull;
-        if (!d_in_jt0) emit_gpr_rd(b, 1, JT0, d->reg);
-        if (size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0);
+        if (!d_in_jt0) { emit_gpr_rd(b, 1, JT0, d->reg); if (size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0); }
         if (s_in_jt1) {
-            if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
+            /* loaded value is already zero-extended */
         } else if (s->kind == OCERZ_OPK_REG) {
             emit_gpr_rd(b, 1, JT1, s->reg);
             if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
