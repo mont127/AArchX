@@ -1979,6 +1979,57 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     return 1;
 }
 
+/* Plain-memory effective address for an access of `size` bytes: emits
+ * base(+index<<s)+JGB into JTA (or picks JGB itself when there is neither)
+ * and returns the register to use in *ra_out plus the displacement left for
+ * the access in *disp_out (folded into the address when it does not fit the
+ * scaled unsigned-imm12 form).  Returns 0 when the plain/JGB fast form does
+ * not apply (guards needed, unpinned regs, ...): caller uses the generic path. */
+static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *op,
+                             int size, int *ra_out, uint32_t *disp_out)
+{
+    if (!g_plain_mem || !jgb_usable() || ocerz_commpage || ocerz_low_base) return 0;
+    if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
+    if (g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
+    if (op->riprel) {
+        a64_mov_imm64(b, JTA, (uint64_t)op->disp + ocerz_guest_base);
+        *ra_out = JTA; *disp_out = 0;
+        return 1;
+    }
+    if (op->base != OCERZ_REG_NONE && pin_slot(op->base) < 0) return 0;
+    if (op->index != OCERZ_REG_NONE && pin_slot(op->index) < 0) return 0;
+    int64_t disp = op->disp;
+    int fits = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
+    int have = 0;
+    if (op->base != OCERZ_REG_NONE) {
+        a64_add_reg(b, 1, JTA, JGB, pin_hreg(pin_slot(op->base)), 0);
+        have = 1;
+    }
+    if (op->index != OCERZ_REG_NONE) {
+        a64_add_reg(b, 1, JTA, have ? JTA : JGB, pin_hreg(pin_slot(op->index)), op->scale & 3);
+        have = 1;
+    }
+    if (!have) {
+        if (fits) { *ra_out = JGB; *disp_out = (uint32_t)disp; return 1; }
+        a64_mov_imm64(b, JTA, (uint64_t)disp + ocerz_guest_base);
+        *ra_out = JTA; *disp_out = 0;
+        return 1;
+    }
+    if (fits) { *ra_out = JTA; *disp_out = (uint32_t)disp; return 1; }
+    if (disp > 0 && disp <= 4095)       a64_add_imm(b, 1, JTA, JTA, (uint32_t)disp);
+    else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, JTA, (uint32_t)-disp);
+    else { a64_mov_imm64(b, JTU, (uint64_t)disp); a64_add_reg(b, 1, JTA, JTA, JTU, 0); }
+    *ra_out = JTA; *disp_out = 0;
+    return 1;
+}
+static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand *op, int size, int rd)
+{
+    int ra; uint32_t disp;
+    if (!emit_mem_ea_plain(b, insn, op, size, &ra, &disp)) return 0;
+    a64_ldr(b, size, rd, ra, disp);
+    return 1;
+}
+
 static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0];
@@ -2341,14 +2392,6 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         return 0;
     int sf = d->size == 8;
 
-    if (!emit_mem_ea(b, insn, s, JTA))
-        return 0;
-    uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
-
-    emit_guest_load_ordered(b, sf ? 8 : 4, JT1, JTA, JTU);
-    emit_gpr_rd(b, sf, JT0, d->reg);
-
     unsigned op = insn->op;
     int is_sub = (op == OCERZ_OP_SUB || op == OCERZ_OP_CMP);
     int is_add = (op == OCERZ_OP_ADD);
@@ -2356,6 +2399,43 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
                     op == OCERZ_OP_XOR || op == OCERZ_OP_TEST);
     int writes = (op == OCERZ_OP_ADD || op == OCERZ_OP_SUB ||
                   op == OCERZ_OP_AND || op == OCERZ_OP_OR || op == OCERZ_OP_XOR);
+
+    /* plain memory + pinned destination: load, then operate in place */
+    if (pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP) &&
+        emit_mem_load_plain(b, insn, s, sf ? 8 : 4, JT1)) {
+        int rd = pin_hreg(pin_slot(d->reg));
+        if (!writes) {                       /* cmp / test */
+            if (need == 0) return 1;
+            if (is_sub) { emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0), rd, JT1); return 1; }
+            a64_and_reg(b, sf, JT2, rd, JT1, 0);
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0), JT2, JT2);
+            return 1;
+        }
+        if (need != 0 && (is_add || is_sub)) {
+            if (sf) a64_stp_off(b, rd, JT1, 20, CC_SRC_OFF);
+            else { a64_mov_reg(b, 0, JT0, rd); a64_stp_off(b, JT0, JT1, 20, CC_SRC_OFF); }
+            a64_mov_imm64(b, JTT, ocerz_cc_pack(is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB, d->size, 0));
+            a64_str(b, 4, JTT, 20, CC_OP_OFF);
+        }
+        switch (op) {
+        case OCERZ_OP_ADD: a64_add_reg(b, sf, rd, rd, JT1, 0); break;
+        case OCERZ_OP_SUB: a64_sub_reg(b, sf, rd, rd, JT1, 0); break;
+        case OCERZ_OP_AND: a64_and_reg(b, sf, rd, rd, JT1, 0); break;
+        case OCERZ_OP_OR:  a64_orr_reg(b, sf, rd, rd, JT1, 0); break;
+        default:           a64_eor_reg(b, sf, rd, rd, JT1, 0); break;
+        }
+        if (need != 0 && is_logic)
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0), rd, rd);
+        return 1;
+    }
+
+    if (!emit_mem_ea(b, insn, s, JTA))
+        return 0;
+    uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+
+    emit_guest_load_ordered(b, sf ? 8 : 4, JT1, JTA, JTU);
+    emit_gpr_rd(b, sf, JT0, d->reg);
 
     switch (op) {
     case OCERZ_OP_ADD: a64_add_reg(b, sf, JT2, JT0, JT1, 0); break;
