@@ -3120,6 +3120,23 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         if (o->high8) return 0;
         emit_gpr_rd(b, sf, JT2, o->reg);
     } else return 0;
+    /* pinned rax/rdx, unsigned: operate on the pins directly (6 words) */
+    if (!is_idiv && pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0 && g_pin_class == 3) {
+        int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
+        int hdv = JT2;
+        if (o->kind == OCERZ_OPK_REG && pin_slot(o->reg) >= 0) hdv = pin_hreg(pin_slot(o->reg));
+        uint32_t *s1 = a64_label(b); a64_cbz(b, sf, hdv, 0);        /* divisor == 0 */
+        uint32_t *s2 = a64_label(b); a64_cbnz(b, sf, hdx, 0);       /* rdx != 0: 128-bit case */
+        a64_udiv(b, sf, JTT, hax, hdv);
+        a64_msub(b, sf, hdx, JTT, hdv, hax);                        /* rdx = rax - q*div (W form zero-extends) */
+        a64_mov_reg(b, sf, hax, JTT);
+        uint32_t *done = a64_label(b); a64_b(b, 0);
+        uint32_t *slow = a64_label(b);
+        a64_patch_cbz(s1, slow); a64_patch_cbz(s2, slow);
+        emit_slowcall(b, insn, exit_sites, n_exits);
+        a64_patch_b(done, a64_label(b));
+        return 1;
+    }
     emit_gpr_rd(b, sf, JT0, OCERZ_RAX);
     emit_gpr_rd(b, sf, JT1, OCERZ_RDX);
     /* slow-path conditions */
