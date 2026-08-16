@@ -1098,8 +1098,10 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
                   tcnt * sizeof(*types));
 }
 
+static void ocerz_install_kick_handler(void);
 void ocerz_vm_install_handlers(OcerzVM *vm)
 {
+    ocerz_install_kick_handler();
     extern int ocerz_cftrap_on;
     ocerz_cftrap_on = getenv("OCERZ_CFTRAP") != NULL;
     g_crash_stack = getenv("OCERZ_CRASH_STACK") != NULL;
@@ -1344,6 +1346,23 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     return local.gpr[OCERZ_RAX];
 }
 
+/* Host-signal kick: a no-op handler whose return is a context-synchronization
+ * event on the target core, so a thread spinning in JIT code observes the
+ * stop-site patches made by ocerz_jit_request_stop. */
+static void ocerz_kick_handler(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig; (void)si; (void)uc;
+}
+static void ocerz_install_kick_handler(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = ocerz_kick_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGEMT, &sa, NULL);
+}
+
 void ocerz_vm_request_exit(OcerzVM *vm, int code)
 {
     vm->exit_code = code;
@@ -1351,9 +1370,13 @@ void ocerz_vm_request_exit(OcerzVM *vm, int code)
 
     ocerz_jit_request_stop(vm);
 
+    pthread_t self = pthread_self();
     pthread_mutex_lock(&g_cpus_lock);
     for (int i = 0; i < g_cpus_n; i++)
         __atomic_store_n(&g_cpus[i]->interrupt, 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < g_cpus_n; i++)
+        if (!pthread_equal(g_cpu_threads[i], self))
+            pthread_kill(g_cpu_threads[i], SIGEMT);
     pthread_mutex_unlock(&g_cpus_lock);
 }
 

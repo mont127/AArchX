@@ -7072,6 +7072,7 @@ static void chain_batch_end(void)
 static void chain_cond_short(uint32_t *cond_site, void *dst)
 {
     if (!cond_site || !dst) return;
+    if (g_xlat_jit && g_xlat_jit->stop_requested) return;   /* stop sites must stay reachable */
     uint32_t w = *cond_site;
     ptrdiff_t off = (uint32_t *)dst - cond_site;
     uint32_t nw;
@@ -7858,13 +7859,20 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         if (!xmm_global_enabled())
             emit_xmm_pin_load_all(&b);
         g_loop_entry = a64_label(&b);
-        /* Interrupt poll at the loop head.  Self-loops branch straight here
-         * with no C callout, and a core spinning in a tiny fully-inlined loop
-         * does not reliably observe the stop-site patch (no pipeline flush),
-         * so a 2-instruction poll is the only robust way to break out. */
-        a64_ldr(&b, 4, JT0, 20, INT_OFF);
-        loop_poll_exit = a64_label(&b);
-        a64_cbnz(&b, 0, JT0, 0);
+        /* Interrupt poll at the loop head.  A core spinning in a tiny
+         * fully-inlined loop does not observe the stop-site patch on its own
+         * (no pipeline flush), so the requester now kicks every guest thread
+         * with a host signal after patching (a signal return is a context
+         * synchronization event, so the patched back-edge is seen).  The
+         * 2-instruction poll is therefore off by default: OCERZ_LOOP_POLL=1
+         * restores it. */
+        static int loop_poll = -1;
+        if (loop_poll < 0) loop_poll = getenv("OCERZ_LOOP_POLL") ? 1 : 0;
+        if (loop_poll) {
+            a64_ldr(&b, 4, JT0, 20, INT_OFF);
+            loop_poll_exit = a64_label(&b);
+            a64_cbnz(&b, 0, JT0, 0);
+        }
     } else {
         if (!xmm_global_enabled())
             emit_xmm_pin_load_all(&b);
@@ -8810,6 +8818,16 @@ static int force_stop_sites_writable(OcerzJit *jit)
         if (b->stop_patch && b->stop_insn && *b->stop_patch != b->stop_insn) {
             __atomic_store_n(b->stop_patch, b->stop_insn, __ATOMIC_RELEASE);
             patched = 1;
+        }
+        /* a conditional branch short-circuited past the trampoline would
+         * bypass the stop site: route it back through the trampoline */
+        for (int i = 0; i < b->n_edges; i++) {
+            uint32_t *cs = b->edges[i].cond_site;
+            if (cs && b->edges[i].cond_orig && *cs != b->edges[i].cond_orig &&
+                b->edges[i].patch_b == b->stop_patch) {
+                __atomic_store_n(cs, b->edges[i].cond_orig, __ATOMIC_RELEASE);
+                patched = 1;
+            }
         }
     }
     return patched;
