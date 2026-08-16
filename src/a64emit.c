@@ -537,6 +537,17 @@ void a64_str_v(A64Buf *b, int size, int vt, int rn, uint32_t off)
     a64_emit32(b, base | ((off / scale) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vt & 31));
 }
 /* LDUR/STUR Qt/Dt/St, [Xn, #simm9] -- unscaled, for arbitrary offsets */
+/* LDUR/STUR (unscaled signed 9-bit offset), GPR forms */
+void a64_ldur(A64Buf *b, int size, int rt, int rn, int32_t simm9)
+{
+    uint32_t sz = ldst_size_bits(size);
+    a64_emit32(b, 0x38400000u | (sz << 30) | (((uint32_t)simm9 & 0x1ffu) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+void a64_stur(A64Buf *b, int size, int rt, int rn, int32_t simm9)
+{
+    uint32_t sz = ldst_size_bits(size);
+    a64_emit32(b, 0x38000000u | (sz << 30) | (((uint32_t)simm9 & 0x1ffu) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
 void a64_ldur_v(A64Buf *b, int size, int vt, int rn, int32_t simm9)
 {
     uint32_t base = size == 16 ? 0x3cc00000u : size == 8 ? 0xfc400000u : 0xbc400000u;

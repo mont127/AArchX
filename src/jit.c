@@ -2276,27 +2276,45 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
                 return 1;
             }
         }
-        /* base + index<<s + disp: two adds, then a scaled immediate
-         * (or the adjacent instruction's identical base+index still in JTA) */
-        if (m->disp < 0 || (m->disp % size) != 0 || m->disp / size > 4095) return 0;
+        /* base + index<<s + disp: two adds, then a scaled immediate (or an
+         * unscaled signed one for small negative/unaligned displacements;
+         * or the earlier identical base+index still in JTA) */
+        int scaled = m->disp >= 0 && (m->disp % size) == 0 && m->disp / size <= 4095;
+        int unscaled = !scaled && m->disp >= -256 && m->disp <= 255;
+        if (!scaled && !unscaled) return 0;
         if (!ea_cache_reusable(b, m)) {
             if (hoisted) a64_add_reg(b, 1, JTA, hreg, hi, sc);
             else if (ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, JTA, hi, sc);
             else { a64_add_reg(b, 1, JTA, JGB, hb, 0); a64_add_reg(b, 1, JTA, JTA, hi, sc); }
         }
         ea_cache_set(b, m);
-        if (vec) { if (store) a64_str_v(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JTA, (uint32_t)m->disp); }
-        else     { if (store) a64_str(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr(b, size, reg, JTA, (uint32_t)m->disp); }
+        if (scaled) {
+            if (vec) { if (store) a64_str_v(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JTA, (uint32_t)m->disp); }
+            else     { if (store) a64_str(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr(b, size, reg, JTA, (uint32_t)m->disp); }
+        } else {
+            if (vec) { if (store) a64_stur_v(b, size, reg, JTA, (int32_t)m->disp); else a64_ldur_v(b, size, reg, JTA, (int32_t)m->disp); }
+            else     { if (store) a64_stur(b, size, reg, JTA, (int32_t)m->disp); else a64_ldur(b, size, reg, JTA, (int32_t)m->disp); }
+        }
         return 1;
     }
-    /* base + disp: scaled unsigned immediate */
-    if (m->disp < 0 || (m->disp % size) != 0 || m->disp / size > 4095) return 0;
-    int ra = JTA;
-    if (hoisted) ra = hreg;
-    else { if (!ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, JGB, hb, 0); ea_cache_set_full(b, m->base, OCERZ_REG_NONE, 0); }
-    if (vec) { if (store) a64_str_v(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, ra, (uint32_t)m->disp); }
-    else     { if (store) a64_str(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr(b, size, reg, ra, (uint32_t)m->disp); }
-    return 1;
+    /* base + disp: scaled unsigned immediate, or unscaled signed for small
+     * negative/unaligned displacements */
+    {
+        int scaled = m->disp >= 0 && (m->disp % size) == 0 && m->disp / size <= 4095;
+        int unscaled = !scaled && m->disp >= -256 && m->disp <= 255;
+        if (!scaled && !unscaled) return 0;
+        int ra = JTA;
+        if (hoisted) ra = hreg;
+        else { if (!ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, JGB, hb, 0); ea_cache_set_full(b, m->base, OCERZ_REG_NONE, 0); }
+        if (scaled) {
+            if (vec) { if (store) a64_str_v(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, ra, (uint32_t)m->disp); }
+            else     { if (store) a64_str(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr(b, size, reg, ra, (uint32_t)m->disp); }
+        } else {
+            if (vec) { if (store) a64_stur_v(b, size, reg, ra, (int32_t)m->disp); else a64_ldur_v(b, size, reg, ra, (int32_t)m->disp); }
+            else     { if (store) a64_stur(b, size, reg, ra, (int32_t)m->disp); else a64_ldur(b, size, reg, ra, (int32_t)m->disp); }
+        }
+        return 1;
+    }
 }
 
 /* Plain-memory effective address for an access of `size` bytes: emits
