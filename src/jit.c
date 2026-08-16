@@ -1217,6 +1217,43 @@ static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
     uint64_t mask = (size == 1) ? 0xffull : 0xffffull;
     int sh = 32 - 8 * size;
 
+    /* pinned register forms on the deferred path: operate on the pin directly */
+    if (g_defer && !d_mem && !s_mem && pin_slot(d->reg) >= 0 &&
+        !(g_pin_class == 2 && d->reg == OCERZ_RSP) &&
+        (s->kind == OCERZ_OPK_IMM || (pin_slot(s->reg) >= 0 && !(g_pin_class == 2 && s->reg == OCERZ_RSP)))) {
+        int rd = pin_hreg(pin_slot(d->reg));
+        if (!is_sub && s->kind == OCERZ_OPK_IMM) {
+            /* TEST reg, imm: the masked immediate keeps the AND within the width */
+            uint64_t v = (uint64_t)s->imm & mask;
+            if (g_nzcv_want) {
+                if (!a64_try_ands_imm(b, 1, JT2, rd, v)) { a64_mov_imm64(b, JT1, v); a64_ands_reg(b, 1, JT2, rd, JT1, 0); }
+                if (need) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2);
+                g_nzcv_kind = OCERZ_CC_LOGIC;
+                g_nzcv_from = g_cur_insn_idx;
+                return 1;
+            }
+            if (!need) return 1;
+            if (!a64_try_and_imm(b, 1, JT2, rd, v)) { a64_mov_imm64(b, JT1, v); a64_and_reg(b, 1, JT2, rd, JT1, 0); }
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2);
+            return 1;
+        }
+        if (!need && !g_nzcv_want) return 1;
+        /* zero-extended operands in JT0/JT1 (the record wants exactly these) */
+        if (size == 1) a64_uxtb(b, JT0, rd); else a64_uxth(b, JT0, rd);
+        if (s->kind == OCERZ_OPK_IMM) a64_mov_imm64(b, JT1, (uint64_t)s->imm & mask);
+        else { int rs = pin_hreg(pin_slot(s->reg)); if (size == 1) a64_uxtb(b, JT1, rs); else a64_uxth(b, JT1, rs); }
+        if (g_nzcv_want && is_sub) {
+            a64_subs_reg(b, 0, A64_ZR, JT0, JT1, 0);       /* Z and C exact for zero-extended values */
+            if (need) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, JT1);
+            g_nzcv_kind = OCERZ_CC_SUB;
+            g_nzcv_from = g_cur_insn_idx;
+            return 1;
+        }
+        if (is_sub) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, JT1);
+        else { a64_and_reg(b, 1, JT2, JT0, JT1, 0); emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2); }
+        return 1;
+    }
+
     /* memory operand FIRST: emit_mem_ea clobbers JT0 while forming the EA.
      * (loads zero-extend: no uxt needed) */
     if (s_mem) {
@@ -3184,8 +3221,25 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     (void)kind;
     if (p->nops != 2 || p->seg != OCERZ_SEG_NONE) return -1;
     const X86Operand *d = &p->ops[0], *sr = &p->ops[1];
-    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return -1;
+    if (d->kind != OCERZ_OPK_REG || d->high8) return -1;
     if (pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return -1;
+    if (d->size == 1 || d->size == 2) {
+        /* narrow producers (emit_cmp_test_narrow): TEST reg,imm sets Z of the
+         * masked AND (E/NE only); CMP on zero-extended operands sets Z and C
+         * exactly (E/NE and the unsigned conditions), N/V are not narrow. */
+        if (sr->size != d->size || sr->high8) return -1;
+        if (p->op == OCERZ_OP_TEST) {
+            if (sr->kind != OCERZ_OPK_IMM) return -1;
+            if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE) return -1;
+        } else if (p->op == OCERZ_OP_CMP) {
+            if (sr->kind == OCERZ_OPK_REG) { if (pin_slot(sr->reg) < 0 || (g_pin_class == 2 && sr->reg == OCERZ_RSP)) return -1; }
+            else if (sr->kind != OCERZ_OPK_IMM) return -1;
+            if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE && cc != OCERZ_CC_B && cc != OCERZ_CC_AE &&
+                cc != OCERZ_CC_A && cc != OCERZ_CC_BE) return -1;
+        } else return -1;
+        return ci - 1;
+    }
+    if (d->size != 4 && d->size != 8) return -1;
     if (sr->size != d->size) return -1;
     if (sr->kind == OCERZ_OPK_REG) {
         if (sr->high8 || pin_slot(sr->reg) < 0 || (g_pin_class == 2 && sr->reg == OCERZ_RSP)) return -1;
@@ -3848,6 +3902,17 @@ static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int 
             return 0;
     } else if (s->kind != OCERZ_OPK_MEM)
         return 0;
+    if (s->kind == OCERZ_OPK_REG && pin_slot(d->reg) >= 0 && pin_slot(s->reg) >= 0) {
+        /* both pinned: one csel on the predicate's NZCV (32-bit csel zero-extends,
+         * as x86 cmov does even when not taken) */
+        emit_cc_predicate_ex(b, insn->cc, 1);
+        int cond = g_cc_direct >= 0 ? g_cc_direct : A64_NE;
+        int rd = pin_hreg(pin_slot(d->reg)), rs = pin_hreg(pin_slot(s->reg));
+        if (cond == A64_AL) { if (sf) a64_mov_reg(b, 1, rd, rs); else a64_mov_reg(b, 0, rd, rs); }
+        else if (cond == A64_NV) { if (!sf) a64_mov_reg(b, 0, rd, rd); }
+        else a64_csel(b, sf, rd, rs, rd, cond);
+        return 1;
+    }
     /* predicate first (may call C), then load the source into JT2 */
     emit_cc_predicate(b, insn->cc);      /* NE = take ; leaves NZCV */
     a64_cset(b, JTF, A64_NE);            /* keep predicate in JTF across the loads */
