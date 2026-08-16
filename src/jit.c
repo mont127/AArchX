@@ -4712,25 +4712,27 @@ static int emit_sse_cmps(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     int dbl = insn->op == OCERZ_OP_CMPSDX;
     int esz = dbl ? 8 : 4;
     unsigned pred = (unsigned)insn->ops[2].imm & 7;
-    int vb = emit_sse_src_reg(b, insn, s, esz, VX1, exit_sites, n_exits);
+    int vb = (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) ? l0_src(s->reg, dbl)
+           : emit_sse_src_reg(b, insn, s, esz, VX1, exit_sites, n_exits);
     if (vb < 0) return 0;
-    int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
+    int va = xmm_is_pinned(d->reg) ? l0_src(d->reg, dbl) : VX0;
     if (va == VX0) emit_xmm_ld_lo(b, esz, VX0, d->reg);
-    a64_fcmp(b, dbl, va, vb);
-    int cond;
+    /* SIMD-scalar compares give the mask directly (no GPR round trip);
+     * "unordered" predicates are the complement of the ordered ones */
     switch (pred) {
-    case 0: cond = A64_EQ; break;   /* eq (ordered)            */
-    case 1: cond = A64_MI; break;   /* lt (ordered)            */
-    case 2: cond = A64_LS; break;   /* le (ordered)            */
-    case 3: cond = A64_VS; break;   /* unordered               */
-    case 4: cond = A64_NE; break;   /* neq or unordered        */
-    case 5: cond = A64_PL; break;   /* !lt  (ge or unordered)  */
-    case 6: cond = A64_HI; break;   /* !le  (gt or unordered)  */
-    default: cond = A64_VC; break;  /* ordered                 */
+    case 0: a64_fcmeq_s(b, dbl, VX2, va, vb); break;                        /* eq (ordered) */
+    case 1: a64_fcmgt_s(b, dbl, VX2, vb, va); break;                        /* lt: b > a */
+    case 2: a64_fcmge_s(b, dbl, VX2, vb, va); break;                        /* le: b >= a */
+    case 3: a64_fcmeq_s(b, dbl, VX2, va, va); a64_fcmeq_s(b, dbl, VX3, vb, vb);
+            a64_v_and(b, VX2, VX2, VX3); a64_v_not(b, VX2, VX2); break;     /* unordered */
+    case 4: a64_fcmeq_s(b, dbl, VX2, va, vb); a64_v_not(b, VX2, VX2); break; /* neq or unordered */
+    case 5: a64_fcmgt_s(b, dbl, VX2, vb, va); a64_v_not(b, VX2, VX2); break; /* !lt */
+    case 6: a64_fcmge_s(b, dbl, VX2, vb, va); a64_v_not(b, VX2, VX2); break; /* !le */
+    default: a64_fcmeq_s(b, dbl, VX2, va, va); a64_fcmeq_s(b, dbl, VX3, vb, vb);
+            a64_v_and(b, VX2, VX2, VX3); break;                             /* ordered */
     }
-    a64_csetm(b, JT0, cond);
-    a64_fmov_v_from_x(b, dbl, VX2, JT0);
     emit_xmm_st_lo(b, esz, VX2, d->reg);
+    l0_inval(d->reg);
     return 1;
 }
 
@@ -4743,19 +4745,24 @@ static int emit_sse_blendv(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     if (vb < 0) return 0;
     int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
     if (va == VX0) emit_xmm_ld(b, VX0, d->reg);
-    emit_xmm_ld(b, VX2, 0);                       /* xmm0 = mask source (copy: we shift it) */
+    int vm = xmm_is_pinned(0) ? xmm_vreg(0) : VX2;   /* xmm0 = mask source */
+    if (vm == VX2) emit_xmm_ld(b, VX2, 0);
     switch (insn->op) {
-    case OCERZ_OP_BLENDVPD: a64_v_sshr_2d(b, VX2, VX2, 63); break;   /* sign -> all ones */
-    case OCERZ_OP_BLENDVPS: a64_v_sshr_4s(b, VX2, VX2, 31); break;
+    case OCERZ_OP_BLENDVPD: a64_v_sshr_2d(b, VX2, vm, 63); break;   /* sign -> all ones */
+    case OCERZ_OP_BLENDVPS: a64_v_sshr_4s(b, VX2, vm, 31); break;
     case OCERZ_OP_PBLENDVB: {
         a64_v_zero(b, VX3);
-        a64_v_cmgt(b, 0, VX2, VX3, VX2);          /* 0 > v2 (signed byte) */
+        a64_v_cmgt(b, 0, VX2, VX3, vm);           /* 0 > mask (signed byte) */
         break;
     }
     default: return 0;
     }
-    a64_v_bsl(b, VX2, vb, va);                    /* v2 = mask ? src : dst */
-    emit_xmm_st(b, VX2, d->reg);                  /* mov into the pin (1 word) or store */
+    if (va != VX0) {
+        a64_v_bit(b, va, vb, VX2);                /* dst = mask ? src : dst (in place) */
+    } else {
+        a64_v_bsl(b, VX2, vb, va);                /* v2 = mask ? src : dst */
+        emit_xmm_st(b, VX2, d->reg);
+    }
     return 1;
 }
 

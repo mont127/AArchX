@@ -650,6 +650,12 @@ void a64_v_uminv_4s(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x6eb1a800u | ((u
 void a64_v_bit(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6ea01c00u, vd, vn, vm); }
 /* BIF Vd, Vn, Vm : vd = (vd & vm) | (vn & ~vm)  -- insert vn where vm clear */
 void a64_v_bif(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6ee01c00u, vd, vn, vm); }
+/* scalar SIMD compares -> mask in Dd/Sd (upper lanes zeroed); FCMGE vector; NOT vector */
+void a64_fcmeq_s(A64Buf *b, int dbl, int vd, int vn, int vm) { a64_emit32(b, (dbl ? 0x5e60e400u : 0x5e20e400u) | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_fcmgt_s(A64Buf *b, int dbl, int vd, int vn, int vm) { a64_emit32(b, (dbl ? 0x7ee0e400u : 0x7ea0e400u) | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_fcmge_s(A64Buf *b, int dbl, int vd, int vn, int vm) { a64_emit32(b, (dbl ? 0x7e60e400u : 0x7e20e400u) | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_fcmge(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x6e60e400u : 0x6e20e400u, vd, vn, vm); }
+void a64_v_not(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x6e205800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 /* FCMGT Vd.4S/2D, Vn, Vm : all-ones per lane where n > m (false on NaN) */
 void a64_v_fcmgt(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x6ee0e400u : 0x6ea0e400u, vd, vn, vm); }
 /* FCSEL Sd/Dd, Sn, Sm, cond */
