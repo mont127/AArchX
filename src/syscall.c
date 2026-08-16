@@ -217,6 +217,22 @@ static int wine_kuser_shared_page(uint64_t addr, uint64_t len, int prot,
            !(prot & PROT_WRITE);
 }
 
+/* read-only MAP_SHARED ranges (plain memory model kept): an mprotect that
+ * makes one writable must retire the plain model */
+static struct { uint64_t lo, hi; } g_shared_ro[64];
+static int g_n_shared_ro;
+static void shared_ro_record(uint64_t gaddr, uint64_t len)
+{
+    if (g_n_shared_ro < 64) { g_shared_ro[g_n_shared_ro].lo = gaddr; g_shared_ro[g_n_shared_ro].hi = gaddr + len; g_n_shared_ro++; }
+    else g_shared_ro[0].lo = 0, g_shared_ro[0].hi = ~0ull;      /* table full: treat everything as shared */
+}
+static int shared_ro_overlaps(uint64_t gaddr, uint64_t len)
+{
+    for (int i = 0; i < g_n_shared_ro; i++)
+        if (gaddr < g_shared_ro[i].hi && gaddr + len > g_shared_ro[i].lo) return 1;
+    return 0;
+}
+
 static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t addr = a[0];
@@ -229,7 +245,13 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int fixed = (flags & MAP_FIXED) != 0;
     uint64_t gaddr;
 
-    if (flags & MAP_SHARED)
+    /* A writable shared mapping is a communication channel: guest memory
+     * must be TSO-ordered from here on.  A read-only shared file mapping
+     * (dyld maps closures and the executable this way in every process) is
+     * not: nothing this process stores can be observed through it, and the
+     * range is remembered so an mprotect that makes it writable retires the
+     * plain model too. */
+    if ((flags & MAP_SHARED) && (prot & PROT_WRITE))
         ocerz_jit_require_ordered(vm);
 
     memtrace(anon ? "mmap-anon" : "mmap-file", addr, len, prot, flags);
@@ -330,6 +352,8 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                     result);
         }
         if (src == OCERZ_OK) {
+            if (!(prot & PROT_WRITE)) shared_ro_record(gaddr, len);
+            if (padded_kuser) ocerz_jit_require_ordered(vm);   /* written by wineserver: readers need TSO */
             ret_ok(cpu, gaddr);
             return OCERZ_STEP_OK;
         }
@@ -375,6 +399,8 @@ static int sys_munmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 static int sys_mprotect(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     memtrace("mprotect", a[0], a[1], (int)a[2], 0);
+    if (((int)a[2] & PROT_WRITE) && shared_ro_overlaps(a[0], a[1]))
+        ocerz_jit_require_ordered(vm);
     invalidate_guest_mapping(vm, a[0], a[1]);
     int rc = ocerz_protect(a[0], a[1], (int)a[2]);
     if (rc == OCERZ_OK)

@@ -62,10 +62,13 @@ int main(int argc, char **argv)
         OCERZ_FATAL("cannot read %s\n", load_path);
         return 65;
     }
+    /* single-observer ("plain") memory model until a second observer appears
+     * (thread, fork/spawn, hostwq worker, writable shared mapping, remap):
+     * the syscall layer retires it through ocerz_jit_require_ordered() */
+    vm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;
+
     if (dynamic)
         return ocerz_dyld_run(&vm, load_path, argc - i, argv + i, environ);
-
-    vm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;
 
     if (ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK)
         return 70;

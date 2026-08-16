@@ -1011,6 +1011,10 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
         ocerz_format_insn(&insn, buf, sizeof buf);
         fprintf(stderr, "ocerz: %#llx: %s\n", (unsigned long long)cpu->rip, buf);
     }
+    { static int sl = -1; if (sl < 0) sl = getenv("OCERZ_STEPLOG") ? 1 : 0;
+      if (sl) { fprintf(stderr, "STEP %#llx", (unsigned long long)cpu->rip);
+                for (int i = 0; i < 16; i++) fprintf(stderr, " %llx", (unsigned long long)cpu->gpr[i]);
+                fprintf(stderr, "\n"); } }
 
     cpu->cur_rip = cpu->rip;
     cpu->rip += insn.len;

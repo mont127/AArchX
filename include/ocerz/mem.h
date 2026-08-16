@@ -53,6 +53,10 @@ static inline int ocerz_host_in_guest_space(const void *haddr)
         uint64_t c = (uint64_t)(uintptr_t)ocerz_commpage;
         if (h - c < OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO)
             return 1;
+        /* identity mode: a plain-form JIT access to the guest commpage range
+         * faults on the unmappable host address; the fault handler resolves it */
+        if (ocerz_guest_base == 0 && h - OCERZ_COMMPAGE_LO < OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO)
+            return 1;
     }
     if (ocerz_low_base) {
         if (h - ocerz_low_base < OCERZ_LOW_LIMIT)

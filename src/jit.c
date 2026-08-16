@@ -1,3 +1,4 @@
+#include <execinfo.h>
 /* The JIT: basic blocks translated to native arm64, with the interpreter as fallback. */
 #include "ocerz/jit.h"
 #include "ocerz/vm.h"
@@ -277,6 +278,37 @@ static int superblock_enabled(void)
 }
 static uint32_t g_push_fix[JIT_MAX_BLOCK_INSNS];   /* offsets relative to the block entry */
 static int g_n_push_fix;
+
+/* Commpage handling in the identity-mapped dynamic mode: the x86 commpage
+ * (0x7fffffe00000, emulated in ocerz_commpage) is not mappable on the host,
+ * so blocks are translated with the plain fast memory forms by default; an
+ * access that reaches the commpage faults, the fault handler marks the
+ * block's rip and the faulting instruction's rip in this set and invalidates
+ * the block, and the retranslation of a marked rip emits the address guard
+ * on every access instead.  A handful of libsystem blocks end up marked;
+ * everything else runs at static-mode speed. */
+#define CP_MARK_SIZE 256
+static uint64_t g_cp_marks[CP_MARK_SIZE];
+static int g_cp_nmarks;
+static int g_cp_guard;               /* this translation: guard every access */
+static int cp_marked(uint64_t rip)
+{
+    for (int i = 0; i < g_cp_nmarks; i++) if (g_cp_marks[i] == rip) return 1;
+    return 0;
+}
+static void cp_mark(uint64_t rip)
+{
+    if (cp_marked(rip)) return;
+    if (g_cp_nmarks < CP_MARK_SIZE) g_cp_marks[g_cp_nmarks++] = rip;
+    else g_cp_marks[0] = 0;          /* full: rip 0 is never translated; keep going (fault storms unlikely) */
+}
+/* guards are needed for every access when: low-base shadow mapping (address
+ * translation) or a marked block in commpage mode */
+static inline int mem_guard_needed(void) { return ocerz_low_base != 0 || g_cp_guard; }
+/* stack accesses (push/pop/call/ret through [JGB, rsp]) and the RAS/CALL/RET
+ * protocol never touch the commpage: independent of the per-block mark, so
+ * every block in a process speaks the same RAS protocol */
+static inline int stack_guard_needed(void) { return ocerz_low_base != 0; }
 static const uint32_t *g_push_entry;                /* block entry for offset computation */
 static struct { uint32_t *site; uint32_t *target; } g_stop_extra[6];
 static int g_n_stop_extra;
@@ -2256,7 +2288,9 @@ static void ea_cache_reset(void);
 static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand *m,
                                int size, int reg, int store, int vec)
 {
-    if (!g_plain_mem || !jgb_usable() || ocerz_commpage || ocerz_low_base) return 0;
+    static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_PLAINFAST") ? 1 : 0;
+    if (dis) return 0;
+    if (!g_plain_mem || !jgb_usable() || mem_guard_needed()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || m->riprel) return 0;
     if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
     if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
@@ -2415,23 +2449,29 @@ static void ea_cache_set_full(const A64Buf *b, unsigned base, unsigned index, in
     g_ea_cache.scale = scale & 3; g_ea_cache.seq = g_callout_seq; g_ea_cache.after = b->p;
 }
 static void ea_cache_set(const A64Buf *b, const X86Operand *op) { ea_cache_set_full(b, op->base, op->index, op->scale & 3); }
-static void ea_cache_step(const X86Insn *in)   /* called before emitting each instruction */
+static void ea_cache_step(const X86Insn *in, const X86Insn *prev)   /* called before emitting each instruction */
 {
     if (!g_ea_cache.valid) return;
-    if (g_ea_cache.base != OCERZ_REG_NONE && insn_may_write_gpr(in, g_ea_cache.base)) { g_ea_cache.valid = 0; return; }
-    if (g_ea_cache.index != OCERZ_REG_NONE && insn_may_write_gpr(in, g_ea_cache.index)) { g_ea_cache.valid = 0; return; }
+    /* the instruction that set the cache may itself have written the base or
+     * index AFTER forming the EA (mov rax, [rax]): check the previous
+     * instruction as well as the one about to be emitted */
+    if (g_ea_cache.base != OCERZ_REG_NONE &&
+        (insn_may_write_gpr(in, g_ea_cache.base) || (prev && insn_may_write_gpr(prev, g_ea_cache.base)))) { g_ea_cache.valid = 0; return; }
+    if (g_ea_cache.index != OCERZ_REG_NONE &&
+        (insn_may_write_gpr(in, g_ea_cache.index) || (prev && insn_may_write_gpr(prev, g_ea_cache.index)))) { g_ea_cache.valid = 0; return; }
 }
 
 static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *op,
                              int size, int *ra_out, uint32_t *disp_out)
 {
-    if (!g_plain_mem || !jgb_usable() || ocerz_commpage || ocerz_low_base) return 0;
+    if (!g_plain_mem || !jgb_usable() || mem_guard_needed()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
     if (g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
     if (op->riprel) {
         uint64_t c = (uint64_t)op->disp + ocerz_guest_base;
         /* a 3+-word constant: one ldr from the block's literal pool instead */
-        if (g_n_raslit < RASLIT_MAX && (c >> 32) != 0 && ((c >> 16) & 0xffff) != 0) {
+        static int nolit = -1; if (nolit < 0) nolit = getenv("OCERZ_NO_RIPLIT") ? 1 : 0;
+        if (!nolit && g_n_raslit < RASLIT_MAX && (c >> 32) != 0 && ((c >> 16) & 0xffff) != 0) {
             g_raslit[g_n_raslit].site = a64_label(b);
             g_raslit[g_n_raslit].retaddr = c;
             g_raslit[g_n_raslit].kind = 1;
@@ -2518,7 +2558,7 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
     int aux_disp_ok = op->disp != 0 && g_pin_class != 2 && g_mem_hoist_aux_index < 0 &&
                       op->disp == g_mem_hoist_aux_disp && op->base != OCERZ_REG_NONE &&
                       hoist_reg_for(op->base) == JMEMBASE;
-    if (g_plain_mem && jgb_usable() && !ocerz_commpage && !ocerz_low_base &&
+    if (g_plain_mem && jgb_usable() && !mem_guard_needed() &&
         insn->seg == OCERZ_SEG_NONE && insn->addrsize == 8 && !op->riprel &&
         op->base != OCERZ_REG_NONE && op->index != OCERZ_REG_NONE && (op->disp == 0 || aux_disp_ok) &&
         pin_slot(op->base) >= 0 && pin_slot(op->index) >= 0 &&
@@ -2540,7 +2580,8 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
             a64_ldr_regoff(b, size, rd, hb, pin_hreg(pin_slot(op->index)), sc != 0);
             return 1;
         }
-        if (hoist_reg_for(op->base) < 0 && !ea_cache_has_base(b, op) && !ea_cache_reusable(b, op)) {
+        static int nogea = -1; if (nogea < 0) nogea = getenv("OCERZ_NO_GEAFORM") ? 1 : 0;
+        if (!nogea && hoist_reg_for(op->base) < 0 && !ea_cache_has_base(b, op) && !ea_cache_reusable(b, op)) {
             /* scale the access cannot fold and no hoisted/cached base: guest
              * address in JTA, then [JGB, JTA] (2 words instead of 3) */
             a64_add_reg(b, 1, JTA, pin_hreg(pin_slot(op->base)), pin_hreg(pin_slot(op->index)), sc);
@@ -2744,7 +2785,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         }
 
         if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem && jgb_usable() &&
-            !ocerz_commpage && !ocerz_low_base) {
+            !stack_guard_needed()) {
             /* guest rsp pinned, guest base in JGB: 3 words, rsp updated after
              * the store so a fault leaves it architecturally intact */
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
@@ -2786,7 +2827,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
                 a64_mov_imm64(b, JT1, o->imm);
             }
             uint32_t *skip = NULL;
-            if (g_plain_mem && !ocerz_commpage) {
+            if (g_plain_mem && !stack_guard_needed()) {
                 a64_str_pre64(b, rv, pin_hreg(rs), -8);
             } else {
                 a64_sub_imm(b, 1, JTA, pin_hreg(rs), 8);
@@ -2823,7 +2864,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             return 0;
 
         if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem && jgb_usable() &&
-            !ocerz_commpage && !ocerz_low_base && o->reg != OCERZ_RSP && pin_slot(o->reg) >= 0) {
+            !stack_guard_needed() && o->reg != OCERZ_RSP && pin_slot(o->reg) >= 0) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             a64_ldr_regoff(b, 8, pin_hreg(pin_slot(o->reg)), JGB, hs, 0);
             a64_add_imm(b, 1, hs, hs, 8);
@@ -2835,7 +2876,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             int rd = ds >= 0 ? pin_hreg(ds) : JT1;
             assert(rs >= 0);
             uint32_t *skip = NULL;
-            if (g_plain_mem && !ocerz_commpage) {
+            if (g_plain_mem && !stack_guard_needed()) {
                 a64_ldr_post64(b, rd, pin_hreg(rs), 8);
             } else {
                 skip = emit_commpage_guard(b, insn, pin_hreg(rs),
@@ -3386,7 +3427,7 @@ static int cc_after_ands(unsigned cc);
 static int cc_after_adds(unsigned cc);
 static int mem_plain_ok(const X86Insn *insn, const X86Operand *op)
 {
-    if (!g_plain_mem || !jgb_usable() || ocerz_commpage || ocerz_low_base) return 0;
+    if (!g_plain_mem || !jgb_usable() || mem_guard_needed()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
     if (g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
     if (op->riprel) return 1;
@@ -4622,6 +4663,8 @@ typedef struct {
     int gain;                 /* estimated uops saved */
     uint32_t *site;           /* b.vs to the replay (patched later) */
     uint32_t *back;           /* where the replay returns */
+    int8_t l0[16];            /* lane-0 cache state at the check (kept alive across it) */
+    uint8_t l0_dbl[16];
 } FpBatch;
 static FpBatch g_fpb[FPB_MAX];
 static int g_n_fpb;
@@ -4823,7 +4866,7 @@ static unsigned g_l0_next;
 static int l0_enabled(void)
 {
     static int en = -1;
-    if (en < 0) en = (getenv("OCERZ_NO_L0CACHE") || ocerz_commpage || ocerz_low_base) ? 0 : 1;
+    if (en < 0) en = (getenv("OCERZ_NO_L0CACHE") || mem_guard_needed()) ? 0 : 1;
     return en;
 }
 static void l0_reset(void)
@@ -6796,7 +6839,7 @@ static int ras_body_only(void)
      * body-pointer protocol (fast3); evaluated dynamically because plain
      * memory can be retired at runtime (the transition purges the RAS) */
     return fullpin_enabled() && !g_no_regflags && g_plain_mem && jgb_usable() &&
-           !ocerz_commpage && !ocerz_low_base && !g_no_chain && !g_no_ras;
+           !stack_guard_needed() && !g_no_chain && !g_no_ras;
 }
 static void *ras_entry_for(const JitBlock *blk)
 {
@@ -6863,7 +6906,7 @@ static int emit_call_region_call(A64Buf *b, const X86Insn *insn,
 
     a64_mov_imm64(b, JRET_GUEST, retaddr);
     uint32_t *skip = NULL;
-    if (g_plain_mem && !ocerz_commpage) {
+    if (g_plain_mem && !stack_guard_needed()) {
         a64_str_pre64(b, JRET_GUEST, pin_hreg(rs), -8);
     } else {
         a64_sub_imm(b, 1, JTA, pin_hreg(rs), 8);
@@ -6920,7 +6963,7 @@ static int emit_call_region_ret(A64Buf *b, const X86Insn *insn,
     int rs = pin_slot(OCERZ_RSP);
     assert(rs >= 0);
     uint32_t *skip = NULL;
-    if (g_plain_mem && !ocerz_commpage) {
+    if (g_plain_mem && !stack_guard_needed()) {
         a64_ldr_post64(b, JT1, pin_hreg(rs), 8);
     } else {
         skip = emit_commpage_guard(b, insn, pin_hreg(rs),
@@ -6986,7 +7029,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         a64_mov_imm64(b, JT1, retaddr);
 
         int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem &&
-                    jgb_usable() && !ocerz_commpage && !ocerz_low_base && !g_no_chain;
+                    jgb_usable() && !stack_guard_needed() && !g_no_chain;
         static int no_blret = -1;
         if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
         if (fast3 && ras_body_only() && !g_no_ras && !no_blret) {
@@ -7114,7 +7157,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             return 0;
 
         int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem &&
-                    jgb_usable() && !ocerz_commpage && !ocerz_low_base;
+                    jgb_usable() && !stack_guard_needed();
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
@@ -7225,7 +7268,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     }
 
     if (insn->op == OCERZ_OP_CALL && g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
-        g_plain_mem && jgb_usable() && !ocerz_commpage && !ocerz_low_base && !g_no_chain) {
+        g_plain_mem && jgb_usable() && !stack_guard_needed() && !g_no_chain) {
         /* lands on the chain tail (never the exit): x0 stays JGB, the tail's
          * fallback sets STEP_OK itself */
         g_chain_keeps_jgb = 1;
@@ -7521,7 +7564,7 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
         static int no_blret_i = -1;
         if (no_blret_i < 0) no_blret_i = getenv("OCERZ_NO_BLRET") ? 1 : 0;
         int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem &&
-                    jgb_usable() && !ocerz_commpage && !ocerz_low_base && !g_no_chain &&
+                    jgb_usable() && !stack_guard_needed() && !g_no_chain &&
                     !g_no_ras && ras_body_only() && !no_blret_i;
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
@@ -8016,7 +8059,8 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
 {
     g_mem_hoist_aux_disp = 0;
     g_mem_hoist_aux_index = -1;
-    if (!g_plain_mem || g_no_chain || ocerz_commpage || ocerz_low_base ||
+    { static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_HOIST") ? 1 : 0; if (dis) return -1; }
+    if (!g_plain_mem || g_no_chain || mem_guard_needed() ||
         !mem_native_store_ok() || n < 2)
         return -1;
     const X86Insn *term = &insns[n - 1];
@@ -8101,7 +8145,7 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
 
 static int fault_recipe_native_mov(const X86Insn *insn)
 {
-    if (!g_defer || ocerz_commpage || ocerz_low_base ||
+    if (!g_defer || mem_guard_needed() ||
         insn->op != OCERZ_OP_MOV || insn->nops != 2 ||
         insn->seg != OCERZ_SEG_NONE || insn->addrsize == 4)
         return 0;
@@ -8378,6 +8422,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_n_stop_extra = 0;
     g_n_push_fix = 0;
     g_n_oolslow = 0;
+    g_cp_guard = ocerz_commpage && (getenv("OCERZ_CP_GUARD_ALL") || cp_marked(rip));
     g_push_entry = NULL;
     g_n_side = 0;
     g_stop_target = NULL;
@@ -8771,7 +8816,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         g_cur_need = fl_need[i];
         g_cur_insns = blk->insns;
         g_cur_fpb = fpb_of[i];
-        ea_cache_step(insn);
+        ea_cache_step(insn, i > 0 ? &blk->insns[i - 1] : NULL);
         g_nzcv_want = (i + 1 < n && nzcv_fuse_producer(blk->insns, i + 1) == i);
         /* lane-0 caches: a callout since the last instruction clobbered V4-V7;
          * an xmm writer that is not cache-aware invalidates its destination */
@@ -8787,9 +8832,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
          * open one (checkpoint) at its first member */
         if (fpb_open >= 0 && (fpb_of[i] != fpb_open)) {
             fpb_emit_check(&b, &g_fpb[fpb_open]);
+            /* the lane-0 caches stay alive across the check: the replay path
+             * re-establishes exactly this state before it rejoins */
+            for (int r = 0; r < 16; r++) { g_fpb[fpb_open].l0[r] = g_l0[r]; g_fpb[fpb_open].l0_dbl[r] = g_l0_dbl[r]; }
             fpb_open = -1;
             g_fpb_fast = 0;
-            l0_reset();          /* the replay path rejoins here with other temps */
         }
         if (fpb_of[i] >= 0 && fpb_open < 0 && g_fpb[fpb_of[i]].first == i) {
             fpb_open = fpb_of[i];
@@ -8992,6 +9039,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 
     if (fpb_open >= 0) {
         fpb_emit_check(&b, &g_fpb[fpb_open]);
+        for (int r = 0; r < 16; r++) { g_fpb[fpb_open].l0[r] = g_l0[r]; g_fpb[fpb_open].l0_dbl[r] = g_l0_dbl[r]; }
         fpb_open = -1;
         g_fpb_fast = 0;
         l0_reset();
@@ -9064,6 +9112,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 g_fpbmap[g_n_fpbmap].hi = (uint32_t)(a64_label(&b) - entry);
                 g_fpbmap[g_n_fpbmap].idx = m;
                 g_n_fpbmap++;
+            }
+        }
+        /* re-establish the fast path's lane-0 caches (one copy per temp) */
+        for (int t = 4; t <= 7; t++) {
+            for (int r = 0; r < 16; r++) {
+                if (fb->l0[r] != (int8_t)t) continue;
+                if (fb->l0_dbl[r]) a64_ins_d_d(&b, t, 0, xmm_vreg((unsigned)r), 0);
+                else               a64_ins_s_s(&b, t, 0, xmm_vreg((unsigned)r), 0);
+                break;
             }
         }
         uint32_t *here = a64_label(&b);
@@ -9529,6 +9586,25 @@ void ocerz_jit_fault_recover_flags(const struct OcerzVM *vm,
     cpu->cc_op = cc_op;
 }
 
+/* A plain-form access in JIT code faulted on the (unmappable) commpage
+ * address range: mark the block and the instruction, invalidate the block so
+ * it is retranslated with guards, and report success (the run loop resumes at
+ * the faulting instruction).  Returns 0 if the fault site cannot be mapped. */
+int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint64_t fault_rip)
+{
+    OcerzJit *jit = vm ? vm->jit : NULL;
+    const uint32_t *pc = (const uint32_t *)host_pc;
+    const JitBlock *b = fault_block(jit, pc);
+    if (!b) return 0;
+    uint64_t block_rip = b->guest_rip;
+    cp_mark(block_rip);
+    cp_mark(fault_rip);
+    if (getenv("OCERZ_CP_NOINVAL")) return 1;
+    ocerz_jit_invalidate_range(vm, block_rip, 1);
+    if (fault_rip != block_rip) ocerz_jit_invalidate_range(vm, fault_rip, 1);
+    return 1;
+}
+
 int ocerz_jit_fault_rip(const struct OcerzVM *vm, const void *host_pc, uint64_t *out_rip)
 {
     const OcerzJit *jit = vm ? vm->jit : NULL;
@@ -9826,6 +9902,10 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
 {
     if (!vm)
         return;
+    if (getenv("OCERZ_ORDERLOG") && !vm->jit_ordered_required) {
+        fprintf(stderr, "ocerz: ORDERED memory required from here (caller %p)\n", __builtin_return_address(0));
+        void *bt[8]; int n = backtrace(bt, 8); backtrace_symbols_fd(bt, n, 2);
+    }
 
     vm->jit_ordered_required = 1;
     vm->jit_plain_mem = 0;
@@ -9990,10 +10070,17 @@ static void ps_report(OcerzJit *jit)
     }
 }
 
+static void steplog(const OcerzCPU *cpu)
+{
+    fprintf(stderr, "STEP %#llx", (unsigned long long)cpu->rip);
+    for (int i = 0; i < 16; i++) fprintf(stderr, " %llx", (unsigned long long)cpu->gpr[i]);
+    fprintf(stderr, "\n");
+}
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
         return OCERZ_EUNSUP;
+    { static int sl = -1; if (sl < 0) sl = getenv("OCERZ_STEPLOG") ? 1 : 0; if (sl) steplog(cpu); }
     OcerzJit *jit = vm->jit;
     if (ocerz_jitstat < 0) {
         pthread_mutex_lock(&jit_lock);
