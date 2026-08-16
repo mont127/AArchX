@@ -655,6 +655,21 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 #define RAS_OFF ((uint32_t)offsetof(OcerzCPU, ras))
 
 enum { JT0 = 9, JT1 = 10, JT2 = 11, JTF = 12, JTT = 13, JTU = 14, JTA = 15 };
+/* push of host register rv through the pinned rsp hs and JGB: 2 words when the
+ * fault fixup table has room (a faulting store is repaired by rsp += 8), else
+ * the 3-word temp form */
+static void emit_push_pinned(A64Buf *b, int hs, int rv)
+{
+    if (g_push_entry && g_n_push_fix < JIT_MAX_BLOCK_INSNS && rv != hs) {
+        a64_sub_imm(b, 1, hs, hs, 8);
+        g_push_fix[g_n_push_fix++] = (uint32_t)(a64_label(b) - g_push_entry);
+        a64_str_regoff(b, 8, rv, JGB, hs, 0);
+        return;
+    }
+    a64_sub_imm(b, 1, JTA, hs, 8);
+    a64_str_regoff(b, 8, rv, JGB, JTA, 0);
+    a64_mov_reg(b, 1, hs, JTA);
+}
 static void a64_and_imm_or_mov(A64Buf *b, int sf, int rd, int rn, uint64_t imm)
 {
     if (!a64_try_and_imm(b, sf, rd, rn, imm)) { a64_mov_imm64(b, JTT, imm); a64_and_reg(b, sf, rd, rn, JTT, 0); }
@@ -1031,6 +1046,29 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
         } else {
             uint64_t v = s->imm;
             if (!sf) v &= 0xffffffffull;
+            if (is_logic) {
+                /* logical immediate forms when encodable (no mov) */
+                int done = 0;
+                switch (op) {
+                case OCERZ_OP_AND: done = a64_try_and_imm(b, sf, rd, rd, v); break;
+                case OCERZ_OP_OR:  done = a64_try_orr_imm(b, sf, rd, rd, v); break;
+                default:           done = a64_try_eor_imm(b, sf, rd, rd, v); break;
+                }
+                if (done) { emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0), rd, rd); return 1; }
+            } else if (is_add || is_sub) {
+                /* record from the pre-op values with the immediate materialized,
+                 * then add/sub imm12 in place */
+                if (v <= 4095 || ((v & 0xfff) == 0 && (v >> 12) <= 4095)) {
+                    a64_mov_imm64(b, JT1, v);
+                    if (sf) a64_stp_off(b, rd, JT1, 20, CC_SRC_OFF);
+                    else { a64_mov_reg(b, 0, JT0, rd); a64_stp_off(b, JT0, JT1, 20, CC_SRC_OFF); }
+                    a64_mov_imm64(b, JTT, ocerz_cc_pack(is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB, d->size, 0));
+                    a64_str(b, 4, JTT, 20, CC_OP_OFF);
+                    if (v <= 4095) { if (is_add) a64_add_imm(b, sf, rd, rd, (uint32_t)v); else a64_sub_imm(b, sf, rd, rd, (uint32_t)v); }
+                    else { if (is_add) a64_add_reg(b, sf, rd, rd, JT1, 0); else a64_sub_reg(b, sf, rd, rd, JT1, 0); }
+                    return 1;
+                }
+            }
             a64_mov_imm64(b, JT1, v);
             rm = JT1;
         }
@@ -6953,9 +6991,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
              * callee's RET can `ret` (hardware return-address prediction) and
              * the continuation chains into the return-address block. */
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
-            a64_sub_imm(b, 1, JTA, hs, 8);
-            a64_str_regoff(b, 8, JT1, JGB, JTA, 0);
-            a64_mov_reg(b, 1, hs, JTA);
+            emit_push_pinned(b, hs, JT1);
             /* RAS is a ring: monotonic top, index = top & (SIZE-1) */
             a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
             uint32_t *adr_site = a64_label(b);
@@ -7002,9 +7038,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             /* pinned guest rsp + JGB: push in 3 words; RIP is stored by the
              * chain tail's fallback only (the hot path chains into the callee) */
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
-            a64_sub_imm(b, 1, JTA, hs, 8);
-            a64_str_regoff(b, 8, JT1, JGB, JTA, 0);
-            a64_mov_reg(b, 1, hs, JTA);
+            emit_push_pinned(b, hs, JT1);
         } else {
             emit_gpr_rd(b, 1, JT0, OCERZ_RSP);
             a64_sub_imm(b, 1, JTA, JT0, 8);
@@ -7488,9 +7522,7 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             a64_mov_imm64(b, JT2, retaddr);
-            a64_sub_imm(b, 1, JTA, hs, 8);
-            a64_str_regoff(b, 8, JT2, JGB, JTA, 0);
-            a64_mov_reg(b, 1, hs, JTA);
+            emit_push_pinned(b, hs, JT2);
             /* RAS push: {retaddr, &cont} (ring: monotonic top, index top & (SIZE-1)) */
             a64_ldr(b, 4, JTF, 20, RAS_TOP_OFF);
             uint32_t *adr_site = a64_label(b);
