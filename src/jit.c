@@ -1679,6 +1679,43 @@ static int emit_imul_src(A64Buf *b, const X86Operand *op, int dst)
     return 0;
 }
 
+/* one-operand mul/imul: rdx:rax = rax * src (32: edx:eax), 64/32-bit only.
+ * CF = OF = (high half is not the sign/zero extension of the low half);
+ * the other flags are undefined (record LOGIC on the CF/OF value). */
+static int emit_mul_wide(A64Buf *b, const X86Insn *insn, uint64_t need, int is_signed)
+{
+    const X86Operand *o = &insn->ops[0];
+    if (insn->nops != 1 || (o->size != 4 && o->size != 8)) return 0;
+    if (g_pin_class != 3 || pin_slot(OCERZ_RAX) < 0 || pin_slot(OCERZ_RDX) < 0) return 0;
+    if (!g_defer) return 0;
+    int sf = o->size == 8;
+    int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
+    int src;
+    if (o->kind == OCERZ_OPK_REG) {
+        if (o->high8 || pin_slot(o->reg) < 0) return 0;
+        src = pin_hreg(pin_slot(o->reg));
+    } else if (o->kind == OCERZ_OPK_MEM) {
+        if (!emit_mem_load_plain(b, insn, o, o->size, JT1)) return 0;
+        src = JT1;
+    } else return 0;
+    if (sf) {
+        if (is_signed) a64_smulh(b, JT2, hax, src); else a64_umulh(b, JT2, hax, src);
+        a64_mul(b, 1, hax, hax, src);
+        a64_mov_reg(b, 1, hdx, JT2);
+    } else {
+        /* 32-bit: 64-bit product of the low words */
+        a64_mov_reg(b, 0, JT0, hax);
+        a64_mov_reg(b, 0, JT1, src);
+        if (is_signed) { a64_sxtw(b, JT0, JT0); a64_sxtw(b, JT1, JT1); }
+        a64_mul(b, 1, JT2, JT0, JT1);
+        a64_mov_reg(b, 0, hax, JT2);                       /* eax = low 32 (zero-extends) */
+        a64_lsr_imm(b, 1, hdx, JT2, 32);                  /* edx = high 32 */
+    }
+    if (need)   /* deferred MUL/IMUL record {lo, hi}: same flags as the interpreter */
+        emit_defer_flags(b, ocerz_cc_pack(is_signed ? OCERZ_CC_IMUL : OCERZ_CC_MUL, o->size, 0), hax, hdx);
+    return 1;
+}
+
 static int emit_imul(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (!imul_inline_enabled())
@@ -5060,7 +5097,11 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX:
     case OCERZ_OP_BLENDVPD: case OCERZ_OP_BLENDVPS: case OCERZ_OP_PBLENDVB:
         return emit_sse(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_MUL:
+        return emit_mul_wide(b, insn, need, 0);
     case OCERZ_OP_IMUL:
+        if (insn->nops == 1)
+            return emit_mul_wide(b, insn, need, 1);
         if (insn->ops[0].kind == OCERZ_OPK_MEM ||
             (insn->nops > 1 && insn->ops[1].kind == OCERZ_OPK_MEM) ||
             (insn->nops > 2 && insn->ops[2].kind == OCERZ_OPK_MEM))
