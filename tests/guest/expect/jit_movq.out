@@ -1,0 +1,92 @@
+movq x<-r lo 0x0123456789abcdef
+movq x<-r hi 0x0000000000000000
+movq x<-x lo 0x0123456789abcdef
+movq x<-x hi 0x0000000000000000
+movq x<-m lo 0x0123456789abcdef
+movq x<-m hi 0x0000000000000000
+movq m<-x m0 0x0123456789abcdef
+movq m<-x m1 0x2222222222222222
+movq r<-x 0x0123456789abcdba
+pshufd lo 0x0000000000000000
+pshufd hi 0x89abcdef01234567
+pshufd39 lo 0x13579bde02468acf
+pshufd39 hi 0x13579bde02468acf
+pshufdc6 lo 0x0123456700000000
+pshufdc6 hi 0x0000000089abcdef
+pshufd00 lo 0x89abcdef89abcdef
+pshufd55 lo 0x0123456701234567
+pshufd4e lo 0x0000000000000000
+pshufdb1 lo 0x89abcdef01234567
+pinsrd lo 0x0123456789abcdef
+pinsrd hi 0x0000000089abcdef
+pmovsxbd lo 0xffffffcdffffffef
+pmovsxbd hi 0xffffff89ffffffab
+movq x<-r lo 0xffffffffffffffff
+movq x<-r hi 0x0000000000000000
+movq x<-x lo 0xffffffffffffffff
+movq x<-x hi 0x0000000000000000
+movq x<-m lo 0xffffffffffffffff
+movq x<-m hi 0x0000000000000000
+movq m<-x m0 0xffffffffffffffff
+movq m<-x m1 0x2222222222222222
+movq r<-x 0xffffffffffffffaa
+pshufd lo 0x0000000000000000
+pshufd hi 0xffffffffffffffff
+pshufd39 lo 0xfffffffeffffffff
+pshufd39 hi 0xfffffffeffffffff
+pshufdc6 lo 0xffffffff00000000
+pshufdc6 hi 0x00000000ffffffff
+pshufd00 lo 0xffffffffffffffff
+pshufd55 lo 0xffffffffffffffff
+pshufd4e lo 0x0000000000000000
+pshufdb1 lo 0xffffffffffffffff
+pinsrd lo 0xffffffffffffffff
+pinsrd hi 0x00000000ffffffff
+pmovsxbd lo 0xffffffffffffffff
+pmovsxbd hi 0xffffffffffffffff
+movq x<-r lo 0x8000000000000000
+movq x<-r hi 0x0000000000000000
+movq x<-x lo 0x8000000000000000
+movq x<-x hi 0x0000000000000000
+movq x<-m lo 0x8000000000000000
+movq x<-m hi 0x0000000000000000
+movq m<-x m0 0x8000000000000000
+movq m<-x m1 0x2222222222222222
+movq r<-x 0x8000000000000055
+pshufd lo 0x0000000000000000
+pshufd hi 0x0000000080000000
+pshufd39 lo 0x0000000000000000
+pshufd39 hi 0x0000000000000000
+pshufdc6 lo 0x8000000000000000
+pshufdc6 hi 0x0000000000000000
+pshufd00 lo 0x0000000000000000
+pshufd55 lo 0x8000000080000000
+pshufd4e lo 0x0000000000000000
+pshufdb1 lo 0x0000000080000000
+pinsrd lo 0x8000000000000000
+pinsrd hi 0x0000000000000000
+pmovsxbd lo 0x0000000000000000
+pmovsxbd hi 0x0000000000000000
+movq x<-r lo 0x00000000000000ff
+movq x<-r hi 0x0000000000000000
+movq x<-x lo 0x00000000000000ff
+movq x<-x hi 0x0000000000000000
+movq x<-m lo 0x00000000000000ff
+movq x<-m hi 0x0000000000000000
+movq m<-x m0 0x00000000000000ff
+movq m<-x m1 0x2222222222222222
+movq r<-x 0x00000000000000aa
+pshufd lo 0x0000000000000000
+pshufd hi 0x000000ff00000000
+pshufd39 lo 0x000001fe00000000
+pshufd39 hi 0x000001fe00000000
+pshufdc6 lo 0x0000000000000000
+pshufdc6 hi 0x00000000000000ff
+pshufd00 lo 0x000000ff000000ff
+pshufd55 lo 0x0000000000000000
+pshufd4e lo 0x0000000000000000
+pshufdb1 lo 0x000000ff00000000
+pinsrd lo 0x00000000000000ff
+pinsrd hi 0x00000000000000ff
+pmovsxbd lo 0x00000000ffffffff
+pmovsxbd hi 0x0000000000000000

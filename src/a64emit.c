@@ -746,3 +746,10 @@ void a64_neg_reg(A64Buf *b, int sf, int rd, int rm)
 { a64_emit32(b, (sf ? 0xcb0003e0u : 0x4b0003e0u) | ((uint32_t)(rm & 31) << 16) | (uint32_t)(rd & 31)); }
 void a64_mvn_reg(A64Buf *b, int sf, int rd, int rm)
 { a64_emit32(b, (sf ? 0xaa2003e0u : 0x2a2003e0u) | ((uint32_t)(rm & 31) << 16) | (uint32_t)(rd & 31)); }
+
+void a64_v_tbl1(A64Buf *b, int vd, int vn, int vm)          /* tbl vd.16b, {vn.16b}, vm.16b */
+{ a64_emit32(b, 0x4e000000u | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_ext(A64Buf *b, int vd, int vn, int vm, int idx)   /* ext vd.16b, vn, vm, #idx */
+{ a64_emit32(b, 0x6e000000u | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(idx & 15) << 11) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_rev64_4s(A64Buf *b, int vd, int vn)
+{ a64_emit32(b, 0x4ea00800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }

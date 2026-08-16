@@ -5281,6 +5281,90 @@ static int emit_sse_movd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     return 0;
 }
 
+/* ---- movq: 64-bit moves between xmm, GPR and memory (xmm destinations zero the upper half) ---- */
+static int emit_sse_movq(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (insn->nops != 2) return 0;
+    if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_XMM) {
+        if (!xmm_is_pinned(d->reg) || !xmm_is_pinned(s->reg)) return 0;
+        a64_fmov_d_d(b, xmm_vreg(d->reg), xmm_vreg(s->reg));           /* zeroes the upper half */
+        return 1;
+    }
+    if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_REG) {
+        if (s->high8 || s->size != 8 || !xmm_is_pinned(d->reg)) return 0;
+        emit_gpr_rd(b, 1, JT0, s->reg);
+        a64_fmov_v_from_x(b, 1, xmm_vreg(d->reg), JT0);
+        return 1;
+    }
+    if (d->kind == OCERZ_OPK_REG && s->kind == OCERZ_OPK_XMM) {
+        if (d->high8 || d->size != 8 || !xmm_is_pinned(s->reg)) return 0;
+        a64_fmov_x_from_v(b, 1, JT0, xmm_vreg(s->reg));
+        emit_gpr_wr(b, JT0, d->reg);
+        return 1;
+    }
+    if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_MEM) {
+        if (!xmm_is_pinned(d->reg)) return 0;
+        int vd = xmm_vreg(d->reg);
+        if (emit_plain_mem_fast(b, insn, s, 8, vd, 0, 1)) return 1;    /* ldr d: upper zeroed */
+        uint32_t *skip;
+        if (!emit_sse_mem_addr(b, insn, s, 8, exit_sites, n_exits, &skip)) return 0;
+        emit_sse_mem_ld(b, 8, vd);
+        patch_guard_skip(skip, a64_label(b));
+        return 1;
+    }
+    if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_XMM) {
+        if (!xmm_is_pinned(s->reg)) return 0;
+        int vs = xmm_vreg(s->reg);
+        if (emit_plain_mem_fast(b, insn, d, 8, vs, 1, 1)) return 1;
+        uint32_t *skip;
+        if (!emit_sse_mem_addr(b, insn, d, 8, exit_sites, n_exits, &skip)) return 0;
+        emit_sse_mem_st(b, 8, vs);
+        patch_guard_skip(skip, a64_label(b));
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- pshufd xmm, xmm/m128, imm8: dword permutation (dup/ext for the common
+ * patterns, tbl with a literal-pool index vector otherwise) ---- */
+static int emit_sse_pshufd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    if (insn->nops != 3 || !sse_enabled()) return 0;
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (d->kind != OCERZ_OPK_XMM || !xmm_is_pinned(d->reg)) return 0;
+    unsigned imm = (unsigned)insn->ops[2].imm & 0xff;
+    int vs = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
+    if (vs < 0) return 0;
+    int vd = xmm_vreg(d->reg);
+    unsigned sel[4] = { imm & 3, (imm >> 2) & 3, (imm >> 4) & 3, (imm >> 6) & 3 };
+    if (sel[0] == sel[1] && sel[1] == sel[2] && sel[2] == sel[3]) { a64_v_dup_s(b, vd, vs, (int)sel[0]); return 1; }
+    if (sel[0] == 0 && sel[1] == 1 && sel[2] == 0 && sel[3] == 1) { a64_v_dup_d(b, vd, vs, 0); return 1; }
+    if (sel[0] == 2 && sel[1] == 3 && sel[2] == 2 && sel[3] == 3) { a64_v_dup_d(b, vd, vs, 1); return 1; }
+    if (sel[0] == 2 && sel[1] == 3 && sel[2] == 0 && sel[3] == 1) { a64_v_ext(b, vd, vs, vs, 8); return 1; }
+    if (sel[0] == 0 && sel[1] == 1 && sel[2] == 2 && sel[3] == 3) { if (vd != vs) a64_v_mov(b, vd, vs); return 1; }
+    if (sel[0] == 1 && sel[1] == 0 && sel[2] == 3 && sel[3] == 2) { a64_v_rev64_4s(b, vd, vs); return 1; }
+    if (sel[0] == 3 && sel[1] == 2 && sel[2] == 1 && sel[3] == 0) { a64_v_rev64_4s(b, VX0, vs); a64_v_ext(b, vd, VX0, VX0, 8); return 1; }
+    /* general: byte-index table from the literal pool */
+    if (g_n_raslit >= RASLIT_MAX) return 0;
+    uint64_t lo = 0, hi = 0;
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 4; k++) {
+            uint64_t byte = (uint64_t)(sel[i] * 4 + (unsigned)k);
+            int pos = i * 4 + k;
+            if (pos < 8) lo |= byte << (8 * pos); else hi |= byte << (8 * (pos - 8));
+        }
+    g_raslit[g_n_raslit].site = a64_label(b);
+    g_raslit[g_n_raslit].retaddr = lo;
+    g_raslit[g_n_raslit].hi = hi;
+    g_raslit[g_n_raslit].kind = 2;
+    g_raslit[g_n_raslit].rt = VX0;
+    g_n_raslit++;
+    a64_emit32(b, 0x9c000000u | (uint32_t)VX0);           /* ldr q VX0, <lit> (patched) */
+    a64_v_tbl1(b, vd, vs, VX0);
+    return 1;
+}
+
 /* ---- unpckl/hpd, movlhps/movhlps ---- */
 static int emit_sse_unpck(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
@@ -5398,6 +5482,8 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
     case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTDQ2PS:
         return emit_sse_cvt(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_MOVQX: return emit_sse_movq(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_PSHUFD: return emit_sse_pshufd(b, insn, exit_sites, n_exits);
     case OCERZ_OP_MOVD:
         return emit_sse_movd(b, insn, exit_sites, n_exits);
     case OCERZ_OP_UNPCKLPD: case OCERZ_OP_UNPCKHPD: case OCERZ_OP_MOVLHPS: case OCERZ_OP_MOVHLPS:
@@ -5903,7 +5989,7 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
     case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTDQ2PS:
-    case OCERZ_OP_MOVD:
+    case OCERZ_OP_MOVD: case OCERZ_OP_MOVQX: case OCERZ_OP_PSHUFD:
     case OCERZ_OP_UNPCKLPD: case OCERZ_OP_UNPCKHPD: case OCERZ_OP_MOVLHPS: case OCERZ_OP_MOVHLPS:
     case OCERZ_OP_UNPCKLPS: case OCERZ_OP_UNPCKHPS:
     case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX:
