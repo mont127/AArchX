@@ -4,6 +4,7 @@
 #include "ocerz/jit.h"
 #include "ocerz/flags.h"
 #include "ocerz/mem.h"
+#include "ocerz/cache.h"
 #include "ocerz/syscall.h"
 #include "ocerz/dyldapi.h"
 
@@ -454,6 +455,13 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
     static __thread volatile int depth;
+
+    /* first touch of a lazily-slid shared-cache data page (host or guest
+     * access alike): unpack it and retry the faulting instruction */
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        if (ocerz_cache_lazy_fault((uintptr_t)si->si_addr))
+            return;
+    }
 
     if (ocerz_jit_decode_recover)
         siglongjmp(*ocerz_jit_decode_recover, 1);

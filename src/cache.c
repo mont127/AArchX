@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /* Maps the x86_64 dyld shared cache and resolves symbols out of it. */
 #include "ocerz/cache.h"
 
@@ -78,6 +79,90 @@ static void rebase_chain_v2(uint64_t page_base, uint64_t page_end, uint16_t star
     }
 }
 
+/* ---- lazy rebasing of the slid (pointer-chain) data regions ----
+ * The v2 slide info stores every pointer as offset|delta-chain bits, so the
+ * DATA/DATA_CONST regions (~500 MB) need unpacking even at slide 0.  Doing
+ * that eagerly touched (and copy-on-wrote) every page at process start
+ * (~200 ms).  Instead the regions are mapped PROT_NONE and each 16K host page
+ * is unpacked on its first touch from the SIGSEGV handler
+ * (ocerz_cache_lazy_fault), then given its final protection. */
+#define LAZY_MAX 16
+static struct {
+    uint64_t addr, size;          /* mapping */
+    uint32_t page_size;           /* slide-info page size (4096) */
+    const uint8_t *si;            /* slide info v2 */
+    uint64_t cache_base;
+    int final_prot;
+    uint8_t *done;                /* one byte per host page */
+} g_lazy[LAZY_MAX];
+static int g_n_lazy;
+static volatile int g_lazy_lock;
+
+static void rebase_page_v2(uint64_t page_base, uint64_t page_size, uint32_t pg,
+                           uint64_t cache_base, const uint8_t *si)
+{
+    uint32_t ps_off = rd32(si + 8);
+    uint32_t ps_cnt = rd32(si + 12);
+    uint32_t pe_off = rd32(si + 16);
+    uint32_t pe_cnt = rd32(si + 20);
+    uint64_t delta_mask = rd64(si + 24);
+    int delta_shift = __builtin_ctzll(delta_mask) - 2;
+    const uint8_t *page_starts = si + ps_off;
+    const uint8_t *page_extras = si + pe_off;
+    if (pg >= ps_cnt) return;
+    uint16_t start = (uint16_t)(page_starts[pg * 2] | (page_starts[pg * 2 + 1] << 8));
+    if (start == 0x4000) return;
+    uint64_t page_end = page_base + page_size;
+    if (start & 0x8000) {
+        for (uint32_t idx = start & 0x3fff; idx < pe_cnt; idx++) {
+            uint16_t e = (uint16_t)(page_extras[idx * 2] | (page_extras[idx * 2 + 1] << 8));
+            rebase_chain_v2(page_base, page_end, e & 0x3fff, cache_base, delta_mask, delta_shift);
+            if (e & 0x8000) break;
+        }
+    } else {
+        rebase_chain_v2(page_base, page_end, start, cache_base, delta_mask, delta_shift);
+    }
+}
+
+/* Called from the SIGSEGV handler with the faulting host address.  Returns 1
+ * when the address lies in a lazily-slid region: the containing host page has
+ * been unpacked and made accessible, and the faulting access can be retried. */
+int ocerz_cache_lazy_fault(uintptr_t addr)
+{
+    for (int i = 0; i < g_n_lazy; i++) {
+        if (addr - g_lazy[i].addr >= g_lazy[i].size) continue;
+        uint64_t hp = 0x4000;
+        uint64_t off = (addr - g_lazy[i].addr) & ~(hp - 1);
+        size_t hidx = (size_t)(off / hp);
+        while (__atomic_exchange_n(&g_lazy_lock, 1, __ATOMIC_ACQUIRE)) { }
+        if (!g_lazy[i].done[hidx]) {
+            uint64_t base = g_lazy[i].addr + off;
+            mprotect((void *)(uintptr_t)base, (size_t)hp, PROT_READ | PROT_WRITE);
+            uint32_t per = (uint32_t)(hp / g_lazy[i].page_size);
+            for (uint32_t k = 0; k < per; k++) {
+                uint64_t pb = base + (uint64_t)k * g_lazy[i].page_size;
+                if (pb + g_lazy[i].page_size > g_lazy[i].addr + g_lazy[i].size) break;
+                rebase_page_v2(pb, g_lazy[i].page_size,
+                               (uint32_t)((pb - g_lazy[i].addr) / g_lazy[i].page_size),
+                               g_lazy[i].cache_base, g_lazy[i].si);
+            }
+            if (g_lazy[i].final_prot != (PROT_READ | PROT_WRITE))
+                mprotect((void *)(uintptr_t)base, (size_t)hp, g_lazy[i].final_prot);
+            g_lazy[i].done[hidx] = 1;
+        }
+        __atomic_store_n(&g_lazy_lock, 0, __ATOMIC_RELEASE);
+        return 1;
+    }
+    return 0;
+}
+
+int ocerz_cache_lazy_region(uintptr_t addr)
+{
+    for (int i = 0; i < g_n_lazy; i++)
+        if (addr - g_lazy[i].addr < g_lazy[i].size) return 1;
+    return 0;
+}
+
 static void rebase_slide_v2(uint64_t map_addr, uint64_t map_size, uint64_t cache_base, const uint8_t *si)
 {
     uint32_t page_size = rd32(si + 4);
@@ -128,7 +213,7 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
         close(fd);
         return -1;
     }
-    uint64_t slide_regions[8][3];
+    uint64_t slide_regions[8][5];
     int n_slide = 0;
     for (uint32_t i = 0; i < rec_cnt; i++) {
         const uint8_t *m = hdr + rec_off + i * 56;
@@ -149,7 +234,10 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
             prot |= PROT_READ | PROT_WRITE;
         if (prot == 0)
             prot = PROT_READ;
-        void *p = mmap((void *)(uintptr_t)addr, (size_t)size, prot,
+        static int eager = -1;
+        if (eager < 0) eager = getenv("OCERZ_EAGER_SLIDE") ? 1 : 0;
+        int lazy = slide_size != 0 && !eager && g_n_lazy < LAZY_MAX;
+        void *p = mmap((void *)(uintptr_t)addr, (size_t)size, lazy ? PROT_NONE : prot,
                        MAP_PRIVATE | MAP_FIXED, fd, (off_t)foff);
         if (p != (void *)(uintptr_t)addr) {
             OCERZ_FATAL("cache mapping %u of %s failed (%p want %#llx)\n",
@@ -165,6 +253,8 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
             slide_regions[n_slide][0] = addr;
             slide_regions[n_slide][1] = slide_off;
             slide_regions[n_slide][2] = size;
+            slide_regions[n_slide][3] = (uint64_t)lazy;
+            slide_regions[n_slide][4] = (uint64_t)((initp & VM_PROT_WRITE) ? (PROT_READ | PROT_WRITE) : PROT_READ);
             n_slide++;
         }
     }
@@ -174,8 +264,24 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
         if (si_addr == 0)
             continue;
         const uint8_t *si = (const uint8_t *)(uintptr_t)si_addr;
-        if (rd32(si) == 2)
+        if (rd32(si) != 2)
+            continue;
+        if (slide_regions[i][3]) {
+            /* lazy: remember the region; pages unpack on first touch */
+            uint64_t hp = 0x4000;
+            size_t npages = (size_t)((slide_regions[i][2] + hp - 1) / hp);
+            g_lazy[g_n_lazy].addr = slide_regions[i][0];
+            g_lazy[g_n_lazy].size = slide_regions[i][2];
+            g_lazy[g_n_lazy].page_size = rd32(si + 4);
+            g_lazy[g_n_lazy].si = si;
+            g_lazy[g_n_lazy].cache_base = cache_base;
+            g_lazy[g_n_lazy].final_prot = (int)slide_regions[i][4];
+            g_lazy[g_n_lazy].done = (uint8_t *)calloc(npages, 1);
+            if (g_lazy[g_n_lazy].done) g_n_lazy++;
+            else rebase_slide_v2(slide_regions[i][0], slide_regions[i][2], cache_base, si);   /* fallback: eager */
+        } else {
             rebase_slide_v2(slide_regions[i][0], slide_regions[i][2], cache_base, si);
+        }
     }
     close(fd);
     return 0;
