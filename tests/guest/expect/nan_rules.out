@@ -2852,6 +2852,20 @@ cmpsd6 0x0000000000000000
 cmpsd7 0xffffffffffffffff
 blendvpd 0x8000000000000000
 blendvpd.hi 0x2222222222222222
+movlpd ld lo 0x1122334455667788
+movlpd ld hi 0xbbbbbbbbbbbbbbbb
+movhpd ld lo 0xaaaaaaaaaaaaaaaa
+movhpd ld hi 0x1122334455667788
+movlps ld lo 0x1122334455667788
+movlps ld hi 0xbbbbbbbbbbbbbbbb
+movhps ld lo 0xaaaaaaaaaaaaaaaa
+movhps ld hi 0x1122334455667788
+movlpd st 0xaaaaaaaaaaaaaaaa
+movhpd st 0xbbbbbbbbbbbbbbbb
+movlps st 0xaaaaaaaaaaaaaaaa
+movhps st 0xbbbbbbbbbbbbbbbb
+addsd+movlpd st 0x3ff0000000000000
+addsd+movhpd st 0xbbbbbbbbbbbbbbbb
 inf-inf 0x00000000ffc00000
 0*inf 0x00000000ffc00000
 0/0 0x00000000ffc00000

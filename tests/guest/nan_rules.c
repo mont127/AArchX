@@ -84,6 +84,23 @@ int main(void){
         /* blendvpd with the compare mask in xmm0 */
         X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $1, %%xmm1, %%xmm0\n\tmovaps %1, %%xmm2\n\tblendvpd %%xmm0, %%xmm1, %%xmm2\n\tmovaps %%xmm2, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1","xmm2"); put("blendvpd ", r.lo); put("blendvpd.hi ", r.hi);
     }
+    /* movlpd/movhpd/movlps/movhps loads and stores: lane placement */
+    {
+        volatile g_u64 m8 = 0x1122334455667788ULL, o8 = 0;
+        a.lo = 0xaaaaaaaaaaaaaaaaULL; a.hi = 0xbbbbbbbbbbbbbbbbULL;
+        X("movaps %1, %%xmm0\n\tmovlpd %2, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(m8) : "xmm0"); put("movlpd ld lo ", r.lo); put("movlpd ld hi ", r.hi);
+        X("movaps %1, %%xmm0\n\tmovhpd %2, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(m8) : "xmm0"); put("movhpd ld lo ", r.lo); put("movhpd ld hi ", r.hi);
+        X("movaps %1, %%xmm0\n\tmovlps %2, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(m8) : "xmm0"); put("movlps ld lo ", r.lo); put("movlps ld hi ", r.hi);
+        X("movaps %1, %%xmm0\n\tmovhps %2, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(m8) : "xmm0"); put("movhps ld lo ", r.lo); put("movhps ld hi ", r.hi);
+        X("movaps %1, %%xmm0\n\tmovlpd %%xmm0, %0", "=m"(o8) : "m"(a) : "xmm0"); put("movlpd st ", o8);
+        X("movaps %1, %%xmm0\n\tmovhpd %%xmm0, %0", "=m"(o8) : "m"(a) : "xmm0"); put("movhpd st ", o8);
+        X("movaps %1, %%xmm0\n\tmovlps %%xmm0, %0", "=m"(o8) : "m"(a) : "xmm0"); put("movlps st ", o8);
+        X("movaps %1, %%xmm0\n\tmovhps %%xmm0, %0", "=m"(o8) : "m"(a) : "xmm0"); put("movhps st ", o8);
+        /* after a scalar op (lane-0 cache): store the low lane */
+        b.lo = 0x3ff0000000000000ULL; b.hi = 0;
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\taddsd %%xmm1, %%xmm0\n\tmovlpd %%xmm0, %0", "=m"(o8) : "m"(a), "m"(b) : "xmm0","xmm1"); put("addsd+movlpd st ", o8);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\taddsd %%xmm1, %%xmm0\n\tmovhpd %%xmm0, %0", "=m"(o8) : "m"(a), "m"(b) : "xmm0","xmm1"); put("addsd+movhpd st ", o8);
+    }
     /* invalid ops without NaN inputs: inf-inf, 0*inf, 0/0, sqrt(-1) -> default NaN sign */
     a.lo = 0x7f800000u; b.lo = 0x7f800000u; a.hi = b.hi = 0;
     X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tsubss %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("inf-inf ", r.lo);
