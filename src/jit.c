@@ -5877,13 +5877,15 @@ static int emit_push_pop_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
         return 1;
     }
     if (m->base == OCERZ_RSP || m->index == OCERZ_RSP) return 0;
+    /* store first, then bump rsp: a faulting store must leave rsp untouched */
     a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
+    if (!emit_plain_mem_fast(b, insn, m, 8, JT1, 1, 0)) {
+        if (!emit_mem_ea(b, insn, m, JTA)) return 0;
+        (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        emit_guest_store_ordered(b, 8, JT1, JTA, JTU);
+    }
     a64_add_imm(b, 1, hs, hs, 8);
-    if (emit_plain_mem_fast(b, insn, m, 8, JT1, 1, 0)) return 1;
-    if (!emit_mem_ea(b, insn, m, JTA)) { a64_sub_imm(b, 1, hs, hs, 8); return 0; }
-    (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
-    emit_guest_store_ordered(b, 8, JT1, JTA, JTU);
     return 1;
 }
 
