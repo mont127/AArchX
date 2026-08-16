@@ -144,6 +144,35 @@ for name in "${NAMES[@]}"; do
     fi
 done
 
+# Dynamic-mode smoke test: a real Mach-O from the x86_64 shared cache world.
+# The synthetic guests all run in plain/static mode; this is the only test
+# that exercises the commpage guard, dyld-cache-sized block counts and the
+# hostwq path.  Skipped (not counted) when no x86_64 Wine is installed.
+WINE_BIN="${OCERZ_WINE:-$HOME/Wine Devel.app/Contents/Resources/wine/bin/wine}"
+if [ -x "$WINE_BIN" ]; then
+    export OCERZ_HOSTWQ=1
+    saved_timeout=$TIMEOUT_SECS
+    TIMEOUT_SECS=60
+    run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$WINE_BIN" --version
+    rc=$?
+    TIMEOUT_SECS=$saved_timeout
+    unset OCERZ_HOSTWQ
+    if [ "$rc" -eq 0 ] && grep -q '^wine-' "$ACTUAL_OUT"; then
+        echo "PASS wine_version ($(head -1 "$ACTUAL_OUT"))"
+        PASS=$((PASS + 1))
+    else
+        if [ "$rc" -eq 124 ]; then reason="timed out (dynamic-mode hang)"; else reason="exit code $rc / no wine- banner"; fi
+        echo "FAIL wine_version ($reason)"
+        FAIL=$((FAIL + 1))
+        if [ -s "$ACTUAL_ERR" ]; then
+            echo "  --- stderr ---" >&2
+            tail -20 "$ACTUAL_ERR" | sed 's/^/  | /' >&2
+        fi
+    fi
+else
+    echo "SKIP wine_version (no x86_64 wine at $WINE_BIN; set OCERZ_WINE)"
+fi
+
 TOTAL=$((PASS + FAIL))
 echo "----------------------------------------"
 echo "guest tests: $PASS/$TOTAL passed, $FAIL failed"
