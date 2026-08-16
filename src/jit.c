@@ -6339,6 +6339,61 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
         int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem &&
                     jgb_usable() && !ocerz_commpage && !ocerz_low_base && !g_no_chain;
+        static int no_blret = -1;
+        if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
+        if (fast3 && ras_body_only() && !g_no_ras && !no_blret) {
+            /* Host call/return protocol: the RAS entry's host pointer is the
+             * continuation right after a `bl` into the callee body, so the
+             * callee's RET can `ret` (hardware return-address prediction) and
+             * the continuation chains into the return-address block. */
+            int hs = pin_hreg(pin_slot(OCERZ_RSP));
+            a64_sub_imm(b, 1, JTA, hs, 8);
+            a64_str_regoff(b, 8, JT1, JGB, JTA, 0);
+            a64_mov_reg(b, 1, hs, JTA);
+            a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
+            a64_subs_imm(b, 0, A64_ZR, JT2, OCERZ_RAS_SIZE);
+            uint32_t *full = a64_label(b);
+            a64_bcond(b, A64_CS, 0);
+            uint32_t *adr_site = a64_label(b);
+            a64_emit32(b, 0x10000000u | (uint32_t)JT0);          /* adr JT0, cont (patched) */
+            a64_add_reg(b, 1, JTA, 20, JT2, 4);
+            a64_str(b, 8, JT1, JTA, RAS_OFF);
+            a64_str(b, 8, JT0, JTA, RAS_OFF + 8);
+            a64_add_imm(b, 0, JT2, JT2, 1);
+            a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
+            a64_patch_bcond(full, a64_label(b));
+            /* bl into the callee body (chained).  The continuation must be the
+             * word right after the bl so the hardware return stack matches
+             * the RAS entry; the not-yet-chained fallback goes out of line. */
+            uint32_t *pb_callee = a64_label(b);
+            a64_emit32(b, 0x94000000u);                          /* bl fallback (patched below / by chaining) */
+            uint32_t *cont = a64_label(b);
+            patch_local_adr(adr_site, cont, JT0);
+            /* continuation: chain into the return-address block */
+            uint32_t *pb_ret = emit_body_chain_tail(b, retaddr, 0, epi_sites, n_epi);
+            /* out-of-line callee fallback: RIP = target, exit to the dispatcher */
+            uint32_t *callee_fb = a64_label(b);
+            *pb_callee = 0x94000000u | ((uint32_t)(callee_fb - pb_callee) & 0x03ffffffu);
+            a64_mov_imm64(b, JT0, target);
+            a64_str(b, 8, JT0, 20, RIP_OFF);
+            a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+            epi_sites[*n_epi] = a64_label(b);
+            a64_b(b, 0);
+            (*n_epi)++;
+            g_chain_target = 0;
+            g_jcc_edge[0].target_rip = target;
+            g_jcc_edge[0].patch_b = pb_callee;
+            g_jcc_edge[0].cond_site = NULL;
+            g_jcc_edge[0].kind = EDGE_BODY;
+            g_jcc_edge[0].pin_class = 3;
+            g_jcc_edge[1].target_rip = retaddr;
+            g_jcc_edge[1].patch_b = pb_ret;
+            g_jcc_edge[1].cond_site = NULL;
+            g_jcc_edge[1].kind = EDGE_BODY;
+            g_jcc_edge[1].pin_class = 3;
+            g_n_jcc_edges = 2;
+            return 1;
+        }
         if (fast3) {
             /* pinned guest rsp + JGB: push in 3 words; RIP is stored by the
              * chain tail's fallback only (the hot path chains into the callee) */
@@ -6446,19 +6501,25 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             ras_empty = a64_label(b); a64_cbz(b, 0, JT2, 0);
             a64_sub_imm(b, 0, JT2, JT2, 1);
             a64_add_reg(b, 1, JTA, 20, JT2, 4);
+            static int no_blret_r = -1;
+            if (no_blret_r < 0) no_blret_r = getenv("OCERZ_NO_BLRET") ? 1 : 0;
+            int use_ret = g_pin_class == 3 && fast3 && ras_body_only() && !no_blret_r;
+            int host_reg = use_ret ? 30 : JT0;
             a64_ldr(b, 8, JTF, JTA, RAS_OFF);
-            a64_ldr(b, 8, JT0, JTA, RAS_OFF + 8);
+            a64_ldr(b, 8, host_reg, JTA, RAS_OFF + 8);
             a64_subs_reg(b, 1, A64_ZR, JTF, JT1, 0);       /* JT1 = return address */
             ras_stale[nst] = a64_label(b); a64_bcond(b, A64_NE, 0); nst++;
-            ras_stale[nst] = a64_label(b); a64_cbz(b, 1, JT0, 0); nst++;
+            ras_stale[nst] = a64_label(b); a64_cbz(b, 1, host_reg, 0); nst++;
 
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
 
             uint32_t *not_body = NULL;
             if (g_pin_class == 3 && fast3 && ras_body_only()) {
-                /* entries are body pointers: branch straight in */
+                /* entries are host continuations (after a bl): return through
+                 * the predicted return stack; without the bl protocol they are
+                 * body pointers: plain br */
                 if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
-                a64_br(b, JT0);
+                if (use_ret) a64_ret(b); else a64_br(b, JT0);
                 /* the full-leave path below is unreachable but keeps the
                  * generic epilogue shape; RIP for the miss paths */
                 not_body = NULL;
