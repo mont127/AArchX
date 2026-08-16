@@ -58,6 +58,10 @@ typedef struct OcerzCPU {
     uint8_t mode32;
     uint16_t cs_sel;
     Ocerz128 xmm[16] __attribute__((aligned(16)));   /* 16-aligned: JIT uses scaled ldr/str q */
+    /* return-address stack right after xmm: keeps ras[] within stp/ldp
+     * immediate reach (<= 504 bytes) for the JIT's call/ret paths */
+    uint32_t ras_top;
+    struct { uint64_t guest_rip; void *host_entry; } ras[256];
     Ocerz128 fp_ckpt[16] __attribute__((aligned(16))); /* JIT FP-batch checkpoints (replay inputs) */
     uint32_t mxcsr;
     uint16_t fcw;
@@ -80,9 +84,6 @@ typedef struct OcerzCPU {
     uint64_t wine_teb_base;
 
     volatile int interrupt;
-
-    uint32_t ras_top;
-    struct { uint64_t guest_rip; void *host_entry; } ras[256];
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256
