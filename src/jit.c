@@ -2211,8 +2211,31 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
     const X86Operand *s = &insn->ops[1];
     uint64_t gbase = ocerz_guest_base;
 
+    if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_IMM) {
+        /* mov [mem], imm (1/2/4/8): value in JT1 (xzr for 0), then a plain store */
+        int size = d->size;
+        if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
+        if (!mem_native_store_ok()) return 0;
+        uint64_t v = (uint64_t)ocerz_sext(s->imm, s->size);
+        if (size < 8) v &= (1ull << (size * 8)) - 1;
+        int rv = A64_ZR;
+        if (v != 0) { a64_mov_imm64(b, JT1, v); rv = JT1; }
+        if (emit_hoisted_mem_access(b, insn, d, size, rv, 1))
+            return 1;
+        if (emit_plain_mem_fast(b, insn, d, size, rv, 1, 0))
+            return 1;
+        if (!emit_mem_ea(b, insn, d, JTA))
+            return 0;
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        if (v != 0) a64_mov_imm64(b, JT1, v);          /* guard code may clobber JT1 */
+        emit_add_const(b, JTA, gbase - ea_fold());
+        emit_guest_store_ordered(b, size, rv, JTA, JTU);
+        patch_guard_skip(skip, a64_label(b));
+        return 1;
+    }
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_REG) {
-        if (s->high8 || (s->size != 4 && s->size != 8))
+        /* 1/2-byte stores take the low bits of the (pinned) register */
+        if (s->high8 || (s->size != 1 && s->size != 2 && s->size != 4 && s->size != 8))
             return 0;
         if (!mem_native_store_ok())
             return 0;
@@ -2231,6 +2254,22 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
 
         emit_guest_store_ordered(b, s->size, rv, JTA, JTU);
         patch_guard_skip(skip, a64_label(b));
+        return 1;
+    }
+    if (d->kind == OCERZ_OPK_REG && s->kind == OCERZ_OPK_MEM &&
+        (d->size == 1 || d->size == 2) && !d->high8) {
+        /* partial-register load: merge into the low byte/word of the pin */
+        int ds = pin_slot(d->reg);
+        if (ds < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+        if (!emit_mem_load_plain(b, insn, s, d->size, JT1)) {
+            if (!emit_mem_ea(b, insn, s, JTA))
+                return 0;
+            uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+            emit_add_const(b, JTA, gbase - ea_fold());
+            emit_guest_load_ordered(b, d->size, JT1, JTA, JTU);
+            patch_guard_skip(skip, a64_label(b));
+        }
+        a64_bfi(b, 1, pin_hreg(ds), JT1, 0, d->size * 8);
         return 1;
     }
     if (d->kind == OCERZ_OPK_REG && s->kind == OCERZ_OPK_MEM) {
@@ -4890,6 +4929,22 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                     a64_mov_imm64(b, JT0, v);
                     emit_gpr_wr(b, JT0, d->reg);
                 }
+                return 1;
+            }
+        }
+        if (d->kind == OCERZ_OPK_REG && (d->size == 1 || d->size == 2) &&
+            pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP)) {
+            /* partial-register moves: insert the low byte/word */
+            int rd = pin_hreg(pin_slot(d->reg));
+            if (s->kind == OCERZ_OPK_REG && !s->high8 && s->size == d->size && pin_slot(s->reg) >= 0 &&
+                !(g_pin_class == 2 && s->reg == OCERZ_RSP)) {
+                if (s->reg != d->reg) a64_bfi(b, 1, rd, pin_hreg(pin_slot(s->reg)), 0, d->size * 8);
+                return 1;
+            }
+            if (s->kind == OCERZ_OPK_IMM) {
+                uint64_t v = (uint64_t)s->imm & ((1ull << (d->size * 8)) - 1);
+                a64_mov_imm64(b, JT0, v);
+                a64_bfi(b, 1, rd, JT0, 0, d->size * 8);
                 return 1;
             }
         }
