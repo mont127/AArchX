@@ -6675,10 +6675,17 @@ static void emit_indirect_leave_br(A64Buf *b, int code_reg)
  * current block layout is not shareable across pin classes; keep it inline
  * only on the rare non-body path.  The hot path is compact: a looped hashed
  * lookup that br's into the target BODY when it has our pin class. */
+/* When non-NULL, emit_indirect_tail is emitting an indirect CALL under the
+ * host bl/ret protocol: every "found a body" path converges on one
+ * `blr JT0`, and *call_cont_out receives the label right after it (the RAS
+ * entry's host pointer; the caller chains it into the return-address block). */
+static uint32_t **g_ind_call_cont;
+static uint32_t *g_ind_call_tocont;   /* the `b` after the blr, to patch to the continuation code */
 static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
                                uint32_t **epi_sites, int *n_epi)
 {
     a64_str(b, 8, JT1, 20, RIP_OFF);
+    uint32_t *to_blr = NULL;              /* hash-hit path -> the shared blr site */
     /* per-site direct-mapped cache: {rip, body} x 32, indexed by rip bits
      * 2..6; hit -> poll interrupt, br body.  Miss falls into the global
      * hash lookup, which fills the entry when it finds a compatible body. */
@@ -6701,7 +6708,17 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         uint32_t *psc_empty = a64_label(b); a64_cbz(b, 1, JT0, 0);   /* empty entry (rip 0) */
         a64_ldr(b, 4, JTU, 20, INT_OFF);
         uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
-        a64_br(b, JT0);
+        if (g_ind_call_cont) {
+            /* shared blr site: hardware pushes the continuation */
+            to_blr = a64_label(b);
+            a64_blr(b, JT0);
+            *g_ind_call_cont = a64_label(b);
+            /* the continuation code is emitted by the caller after this tail;
+             * jump over the rest of the tail to reach it */
+            g_ind_call_tocont = a64_label(b); a64_b(b, 0);
+        } else {
+            a64_br(b, JT0);
+        }
         a64_patch_cbz(intr, a64_label(b));
         /* interrupt: leave via the epilogue (RIP stored) */
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
@@ -6743,7 +6760,14 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         a64_ldr(b, 4, JTU, 20, INT_OFF);                  /* interrupt poll (back edges) */
         uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
         if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
-        a64_br(b, JT0);
+        if (to_blr) { uint32_t *here = a64_label(b); a64_b(b, (int32_t)(to_blr - here)); }
+        else if (g_ind_call_cont) {
+            to_blr = a64_label(b);
+            a64_blr(b, JT0);
+            *g_ind_call_cont = a64_label(b);
+            g_ind_call_tocont = a64_label(b); a64_b(b, 0);
+        }
+        else a64_br(b, JT0);
         a64_patch_cbz(nobody, a64_label(b));
         a64_patch_cbz(intr, a64_label(b));
         /* interrupt or no body: fall to the epilogue (RIP already stored) */
@@ -6826,6 +6850,56 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
         return 0;
     /* push return address (target already in JT1) */
     uint64_t retaddr = insn->rip + insn->len;
+    {
+        static int no_blret_i = -1;
+        if (no_blret_i < 0) no_blret_i = getenv("OCERZ_NO_BLRET") ? 1 : 0;
+        int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem &&
+                    jgb_usable() && !ocerz_commpage && !ocerz_low_base && !g_no_chain &&
+                    !g_no_ras && ras_body_only() && !no_blret_i;
+        if (fast3) {
+            int hs = pin_hreg(pin_slot(OCERZ_RSP));
+            a64_mov_imm64(b, JT2, retaddr);
+            a64_sub_imm(b, 1, JTA, hs, 8);
+            a64_str_regoff(b, 8, JT2, JGB, JTA, 0);
+            a64_mov_reg(b, 1, hs, JTA);
+            /* RAS push: {retaddr, &cont} */
+            a64_ldr(b, 4, JTF, 20, RAS_TOP_OFF);
+            a64_subs_imm(b, 0, A64_ZR, JTF, OCERZ_RAS_SIZE);
+            uint32_t *full = a64_label(b);
+            a64_bcond(b, A64_CS, 0);
+            uint32_t *adr_site = a64_label(b);
+            a64_emit32(b, 0x10000000u | (uint32_t)JT0);          /* adr JT0, cont */
+            a64_add_reg(b, 1, JTA, 20, JTF, 4);
+            if (RAS_OFF <= 504) a64_stp_off(b, JT2, JT0, JTA, RAS_OFF);
+            else { a64_str(b, 8, JT2, JTA, RAS_OFF); a64_str(b, 8, JT0, JTA, RAS_OFF + 8); }
+            a64_add_imm(b, 0, JTF, JTF, 1);
+            a64_str(b, 4, JTF, 20, RAS_TOP_OFF);
+            a64_patch_bcond(full, a64_label(b));
+            /* dispatch through the site cache / hash with a shared blr site */
+            uint32_t *cont = NULL;
+            g_ind_call_cont = &cont;
+            g_ind_call_tocont = NULL;
+            emit_indirect_tail(b, ic_slot_alloc(), epi_sites, n_epi);
+            uint32_t *to_cont = g_ind_call_tocont;
+            g_ind_call_cont = NULL;
+            if (cont && to_cont) {
+                patch_local_adr(adr_site, cont, JT0);
+                a64_patch_b(to_cont, a64_label(b));
+                /* continuation: chain into the return-address block */
+                uint32_t *pb_ret = emit_body_chain_tail(b, retaddr, 0, epi_sites, n_epi);
+                g_jcc_edge[0].target_rip = retaddr;
+                g_jcc_edge[0].patch_b = pb_ret;
+                g_jcc_edge[0].cond_site = NULL;
+                g_jcc_edge[0].kind = EDGE_BODY;
+                g_jcc_edge[0].pin_class = 3;
+                g_n_jcc_edges = 1;
+            } else {
+                /* cannot happen (both paths emit the blr site) */
+                assert(0 && "indirect call: no continuation site");
+            }
+            return 1;
+        }
+    }
     a64_mov_imm64(b, JT2, retaddr);
     emit_gpr_rd(b, 1, JT0, OCERZ_RSP);
     a64_sub_imm(b, 1, JTA, JT0, 8);
