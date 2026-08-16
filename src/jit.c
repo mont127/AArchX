@@ -1938,49 +1938,62 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
 static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
                                      int addr_reg, uint32_t **exit_sites, int *n_exits)
 {
-
+    /* addr_reg holds gaddr + ea_fold(); the caller adds (guest_base - fold)
+     * before the access.  Redirect the specially mapped guest ranges so that
+     * the final host address equals ocerz_g2h(gaddr).  This is pure address
+     * translation on the fast path -- no interpreter fallback: an interpreter
+     * callout here would execute the WHOLE instruction, while the callers only
+     * skip their load/store (the fused compare, ALU and SSE emitters keep
+     * computing with the value they expect in the temp register), which
+     * corrupted results for every commpage access in dynamic mode. */
+    (void)insn; (void)exit_sites; (void)n_exits;
     if (!ocerz_commpage && !ocerz_low_base)
         return NULL;
 
     uint64_t fold = ea_fold();
     uint32_t *to_native = NULL;
     if (ocerz_low_base) {
-        a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT);
+        /* LOW_LIMIT <= gaddr < TOP_LO: the plain guest_base mapping */
+        a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT + fold);
         a64_sub_reg(b, 1, JTT, addr_reg, JTU, 0);
         a64_mov_imm64(b, JTU, OCERZ_TOP_LO - OCERZ_LOW_LIMIT);
         a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
         to_native = a64_label(b);
         a64_bcond(b, A64_CC, 0);
     }
-    a64_mov_imm64(b, JTU, OCERZ_COMMPAGE_LO + fold);
-    a64_sub_reg(b, 1, JTT, addr_reg, JTU, 0);
-    a64_mov_imm64(b, JTU, OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO);
-    a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
-    uint32_t *over = a64_label(b);
-    a64_bcond(b, A64_CS, 0);
-    uint32_t *slow = a64_label(b);
-    emit_slowcall(b, insn, exit_sites, n_exits);
-    uint32_t *skip = a64_label(b);
-    a64_b(b, 0);
-    a64_patch_bcond(over, a64_label(b));
-    if (ocerz_low_base) {
-
-        a64_mov_imm64(b, JTU, OCERZ_TOP_LO);
-        a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
-        uint32_t *cur = a64_label(b);
-        a64_bcond(b, A64_CS, (int32_t)(slow - cur));
-
-        a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT);
-        a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
-        uint32_t *ge_low = a64_label(b);
+    uint32_t *done_cp = NULL;
+    if (ocerz_commpage) {
+        a64_mov_imm64(b, JTU, OCERZ_COMMPAGE_LO + fold);
+        a64_sub_reg(b, 1, JTT, addr_reg, JTU, 0);
+        a64_mov_imm64(b, JTU, OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO);
+        a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
+        uint32_t *not_cp = a64_label(b);
         a64_bcond(b, A64_CS, 0);
+        /* host = ocerz_commpage + (gaddr - COMMPAGE_LO) */
+        a64_mov_imm64(b, JTU, (uint64_t)(uintptr_t)ocerz_commpage - OCERZ_COMMPAGE_LO - ocerz_guest_base);
+        a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
+        done_cp = a64_label(b);
+        a64_b(b, 0);
+        a64_patch_bcond(not_cp, a64_label(b));
+    }
+    if (ocerz_low_base) {
+        /* gaddr >= TOP_LO: host = top_base + (gaddr - TOP_LO); else (< LOW_LIMIT): low_base + gaddr */
+        a64_mov_imm64(b, JTU, OCERZ_TOP_LO + fold);
+        a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
+        uint32_t *is_low = a64_label(b);
+        a64_bcond(b, A64_CC, 0);
+        a64_mov_imm64(b, JTU, ocerz_top_base - OCERZ_TOP_LO - ocerz_guest_base);
+        a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
+        uint32_t *done_top = a64_label(b);
+        a64_b(b, 0);
+        a64_patch_bcond(is_low, a64_label(b));
         a64_mov_imm64(b, JTU, ocerz_low_base - ocerz_guest_base);
         a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
-        a64_patch_bcond(ge_low, a64_label(b));
+        a64_patch_b(done_top, a64_label(b));
     }
-    if (to_native)
-        a64_patch_bcond(to_native, a64_label(b));
-    return skip;
+    if (done_cp) a64_patch_b(done_cp, a64_label(b));
+    if (to_native) a64_patch_bcond(to_native, a64_label(b));
+    return NULL;
 }
 
 static inline void patch_guard_skip(uint32_t *skip, uint32_t *target)
@@ -6940,7 +6953,7 @@ static void emit_dispatch_stub(OcerzJit *jit)
 {
     A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
     uint32_t *entry = b.p;
-    uint32_t *to_ret[6]; int nr = 0;
+    uint32_t *to_ret[12]; int nr = 0;
     a64_ldr(&b, 4, JT0, 1, INT_OFF);
     to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 0, JT0, 0);
     a64_ldr(&b, 4, JT0, 1, (uint32_t)offsetof(OcerzCPU, terminated));
@@ -6966,8 +6979,10 @@ static void emit_dispatch_stub(OcerzJit *jit)
     a64_mov_imm64(&b, JTA, (uint64_t)(uintptr_t)jit->buckets);
     a64_ldr_regoff(&b, 8, JTF, JTA, JTT, 1);
     for (int k = 0; k < 6; k++) {
-        to_ret[nr] = a64_label(&b); a64_cbz(&b, 1, JTF, 0);
-        if (nr < 5) nr++;   /* keep last slot for chain-end */
+        /* every chain-end test must reach the C fallback: an unpatched cbz
+         * (offset 0) is a branch to itself -- a hang the moment a hash chain
+         * ends at depth 2..5 (only ever seen with Wine-sized block counts) */
+        to_ret[nr++] = a64_label(&b); a64_cbz(&b, 1, JTF, 0);
         a64_ldr(&b, 8, JTU, JTF, (uint32_t)offsetof(JitBlock, guest_rip));
         a64_sub_reg(&b, 1, JTU, JTU, JT1, 0);
         uint32_t *nxt = a64_label(&b); a64_cbnz(&b, 1, JTU, 0);
