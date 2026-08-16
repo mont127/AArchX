@@ -874,21 +874,24 @@ static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_CMPXCHG: {
         int size = insn->ops[0].size;
         uint64_t acc = read_acc(cpu, size);
+        /* Rosetta (the golden oracle for the guest tests) sets the flags as
+         * (dest - accumulator) and writes the accumulator in both cases (so
+         * the 32-bit form zero-extends rax on a match as well). */
         if (mem) {
             uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
             uint64_t src = ocerz_read_op(cpu, insn, &insn->ops[1]);
             uint64_t seen = acc;
             int ok = ocerz_atomic_cmpxchg(addr, size, &seen, src);
-            ocerz_flags_sub(cpu, size, acc, seen, 0, acc - seen);
-            if (!ok)
-                write_acc(cpu, size, seen);
+            ocerz_flags_sub(cpu, size, seen, acc, 0, seen - acc);
+            write_acc(cpu, size, ok ? acc : seen);
             return OCERZ_STEP_OK;
         }
         uint64_t d = ocerz_read_op(cpu, insn, &insn->ops[0]);
-        ocerz_flags_sub(cpu, size, acc, d, 0, acc - d);
+        ocerz_flags_sub(cpu, size, d, acc, 0, d - acc);
         if (ocerz_trunc(acc, size) == ocerz_trunc(d, size)) {
             uint64_t src = ocerz_read_op(cpu, insn, &insn->ops[1]);
             ocerz_write_op(cpu, insn, &insn->ops[0], src);
+            write_acc(cpu, size, acc);
         } else {
             write_acc(cpu, size, d);
         }

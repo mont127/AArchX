@@ -5474,6 +5474,208 @@ static int emit_pmovmskb(A64Buf *b, const X86Insn *insn)
     return 1;
 }
 
+/* Read-modify-write memory forms: add/sub/and/or/xor/inc/dec/neg/not [mem]
+ * (lock or not), xchg/xadd/cmpxchg with memory, and cmp/test [mem], x.
+ * Plain memory model: load, operate, store.  Ordered model: LSE atomics
+ * (acquire-release) for the atomic forms with an alignment check that sends
+ * misaligned accesses to the interpreter; ldapr/stlr for the plain RMW. */
+static int rmw_src_to(A64Buf *b, const X86Operand *s, int size, int into, int *out)
+{
+    if (s->kind == OCERZ_OPK_IMM) {
+        uint64_t v = (uint64_t)ocerz_sext(s->imm, s->size);
+        if (size == 4) v &= 0xffffffffull; else if (size == 2) v &= 0xffff; else if (size == 1) v &= 0xff;
+        a64_mov_imm64(b, into, v); *out = into; return 1;
+    }
+    if (s->kind != OCERZ_OPK_REG || s->high8) return 0;
+    int ss = pin_slot(s->reg);
+    if (ss < 0 || (g_pin_class == 2 && s->reg == OCERZ_RSP)) return 0;
+    int r = pin_hreg(ss);
+    if (size == 1) { a64_uxtb(b, into, r); *out = into; }
+    else if (size == 2) { a64_uxth(b, into, r); *out = into; }
+    else *out = r;
+    return 1;
+}
+static void rmw_write_reg(A64Buf *b, const X86Operand *d, int size, int val)   /* val zero-extended to size */
+{
+    int rd = pin_hreg(pin_slot(d->reg));
+    if (size == 8) a64_mov_reg(b, 1, rd, val);
+    else if (size == 4) a64_mov_reg(b, 0, rd, val);
+    else a64_bfi(b, 1, rd, val, 0, size * 8);
+}
+static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
+                        uint32_t **exit_sites, int *n_exits)
+{
+    static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_INLINE_RMW") ? 1 : 0;
+    if (dis || !g_defer || insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
+    unsigned op = insn->op;
+    const X86Operand *m, *s = NULL, *r = NULL;   /* memory operand; source; register operand (xchg/xadd) */
+    if (op == OCERZ_OP_XCHG) {
+        if (insn->nops != 2) return 0;
+        if (insn->ops[0].kind == OCERZ_OPK_MEM) { m = &insn->ops[0]; r = &insn->ops[1]; }
+        else if (insn->ops[1].kind == OCERZ_OPK_MEM) { m = &insn->ops[1]; r = &insn->ops[0]; }
+        else return 0;
+        if (r->kind != OCERZ_OPK_REG || r->high8 || pin_slot(r->reg) < 0 || r->size != m->size) return 0;
+        s = r;                                   /* the register is also the value stored */
+    } else {
+        if (insn->nops < 1 || insn->ops[0].kind != OCERZ_OPK_MEM) return 0;
+        m = &insn->ops[0];
+        if (insn->nops == 2) {
+            s = &insn->ops[1];
+            if (s->size != m->size) return 0;
+            if (op == OCERZ_OP_XADD) { r = s; if (r->kind != OCERZ_OPK_REG || r->high8 || pin_slot(r->reg) < 0) return 0; }
+        } else if (op != OCERZ_OP_INC && op != OCERZ_OP_DEC && op != OCERZ_OP_NEG && op != OCERZ_OP_NOT) return 0;
+    }
+    int size = m->size;
+    if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
+    if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
+    if (op == OCERZ_OP_CMPXCHG && (pin_slot(OCERZ_RAX) < 0 || !s || s->kind != OCERZ_OPK_REG || s->high8 || pin_slot(s->reg) < 0)) return 0;
+    if (!mem_native_store_ok()) return 0;
+    int atomic = op == OCERZ_OP_XCHG || op == OCERZ_OP_XADD || op == OCERZ_OP_CMPXCHG || insn->lock;
+    int is_cmp = op == OCERZ_OP_CMP || op == OCERZ_OP_TEST;
+    if (!g_plain_mem && atomic && op == OCERZ_OP_NEG) return 0;   /* no LSE primitive */
+    int sf = size == 8;
+    int ordered = !g_plain_mem;
+
+    /* inc/dec keep CF: fetch the pending CF first (the predicate may call C
+     * and clobber every temp) into a callout-safe slot */
+    int incdec_cf = (op == OCERZ_OP_INC || op == OCERZ_OP_DEC) && need;
+    if (incdec_cf) {
+        emit_cc_predicate(b, OCERZ_CC_B);
+        a64_cset(b, JT1, A64_NE);
+        a64_str(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
+    }
+    /* address: (ra, disp) for plain ldr/str; a bare host address in JTA otherwise */
+    int ra; uint32_t disp;
+    if (g_plain_mem && !ordered) {
+        if (!emit_mem_ea_plain(b, insn, m, size, &ra, &disp)) {
+            if (!emit_mem_ea(b, insn, m, JTA)) return 0;
+            (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+            emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+            ra = JTA; disp = 0;
+        }
+    } else {
+        if (!emit_mem_ea(b, insn, m, JTA)) return 0;
+        (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        ra = JTA; disp = 0;
+    }
+    /* source value */
+    int rs = -1;
+    if (s && op != OCERZ_OP_CMPXCHG) { if (!rmw_src_to(b, s, size, JT1, &rs)) return 0; }
+    if (op == OCERZ_OP_CMPXCHG) rs = pin_hreg(pin_slot(s->reg));       /* new value (low bits used) */
+    if (op == OCERZ_OP_CMPXCHG && size < 4) { if (size == 1) a64_uxtb(b, JT1, rs); else a64_uxth(b, JT1, rs); rs = JT1; }
+    int hax = pin_slot(OCERZ_RAX) >= 0 ? pin_hreg(pin_slot(OCERZ_RAX)) : -1;
+
+    /* ---- old value -> JT0 ---- */
+    uint32_t *align_bne = NULL;
+    if (ordered && atomic) {
+        if (size > 1) {
+            a64_try_ands_imm(b, 1, A64_ZR, ra, (uint64_t)(size - 1));
+            align_bne = a64_label(b); a64_bcond(b, A64_NE, 0);       /* misaligned -> interpreter */
+        }
+        switch (op) {
+        case OCERZ_OP_ADD: case OCERZ_OP_XADD: a64_ldop_al(b, size, 0, rs, JT0, ra); break;
+        case OCERZ_OP_SUB: a64_neg_reg(b, sf, JT2, rs); if (size == 1) a64_uxtb(b, JT2, JT2); else if (size == 2) a64_uxth(b, JT2, JT2);
+                           a64_ldop_al(b, size, 0, JT2, JT0, ra); break;
+        case OCERZ_OP_OR:  a64_ldop_al(b, size, 3, rs, JT0, ra); break;
+        case OCERZ_OP_XOR: a64_ldop_al(b, size, 2, rs, JT0, ra); break;
+        case OCERZ_OP_AND: a64_mvn_reg(b, sf, JT2, rs); a64_ldop_al(b, size, 1, JT2, JT0, ra); break;
+        case OCERZ_OP_INC: a64_mov_imm64(b, JT2, 1); a64_ldop_al(b, size, 0, JT2, JT0, ra); break;
+        case OCERZ_OP_DEC: a64_mov_imm64(b, JT2, size == 8 ? ~0ull : size == 4 ? 0xffffffffull : size == 2 ? 0xffffull : 0xffull);
+                           a64_ldop_al(b, size, 0, JT2, JT0, ra); break;
+        case OCERZ_OP_NOT: a64_mov_imm64(b, JT2, ~0ull); a64_ldop_al(b, size, 2, JT2, JT0, ra); break;
+        case OCERZ_OP_XCHG: a64_swpal(b, size, rs, JT0, ra); break;
+        case OCERZ_OP_CMPXCHG:
+            if (size == 8) a64_mov_reg(b, 1, JT0, hax); else if (size == 4) a64_mov_reg(b, 0, JT0, hax);
+            else if (size == 2) a64_uxth(b, JT0, hax); else a64_uxtb(b, JT0, hax);
+            a64_casal(b, size, JT0, rs, ra);                          /* JT0 <- old */
+            break;
+        default: return 0;
+        }
+    } else if (ordered) {
+        emit_guest_load_ordered(b, size, JT0, ra, JTU);
+    } else {
+        a64_ldr(b, size, JT0, ra, disp);
+    }
+
+    /* ---- new value -> JT2 (and register results) ---- */
+    int have_new = 1;
+    switch (op) {
+    case OCERZ_OP_ADD: case OCERZ_OP_XADD: a64_add_reg(b, sf, JT2, JT0, rs, 0); break;
+    case OCERZ_OP_SUB: a64_sub_reg(b, sf, JT2, JT0, rs, 0); break;
+    case OCERZ_OP_AND: case OCERZ_OP_TEST: a64_and_reg(b, sf, JT2, JT0, rs, 0); break;
+    case OCERZ_OP_OR:  a64_orr_reg(b, sf, JT2, JT0, rs, 0); break;
+    case OCERZ_OP_XOR: a64_eor_reg(b, sf, JT2, JT0, rs, 0); break;
+    case OCERZ_OP_INC: a64_add_imm(b, sf, JT2, JT0, 1); break;
+    case OCERZ_OP_DEC: a64_sub_imm(b, sf, JT2, JT0, 1); break;
+    case OCERZ_OP_NEG: a64_neg_reg(b, sf, JT2, JT0); break;
+    case OCERZ_OP_NOT: a64_mvn_reg(b, sf, JT2, JT0); break;
+    case OCERZ_OP_XCHG: a64_mov_reg(b, 1, JT2, rs); break;
+    case OCERZ_OP_CMPXCHG: {
+        /* flags = cmp acc, old; store new if equal (else the old value back) */
+        /* Rosetta (the golden oracle) sets the flags as (dest - acc) and always
+         * writes the accumulator (the 32-bit form zero-extends rax on a match
+         * too); the interpreter is aligned with that. */
+        int acc = JTU;                            /* accumulator at the operand size (JT1 may hold the source) */
+        if (size == 8) acc = hax; else if (size == 4) a64_mov_reg(b, 0, JTU, hax); else if (size == 2) a64_uxth(b, JTU, hax); else a64_uxtb(b, JTU, hax);
+        if (size == 8) a64_subs_reg(b, 1, A64_ZR, JT0, hax, 0); else a64_subs_reg(b, 0, A64_ZR, JT0, acc, 0);
+        a64_csel(b, 1, JT2, rs, JT0, A64_EQ);
+        if (need) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, acc);
+        /* accumulator <- old on mismatch; on a match the same value is written */
+        if (size == 8) a64_csel(b, 1, hax, hax, JT0, A64_EQ);
+        else if (size == 4) a64_csel(b, 1, hax, acc, JT0, A64_EQ);         /* zero-extends either way */
+        else { a64_csel(b, 1, JT1, acc, JT0, A64_EQ); a64_bfi(b, 1, hax, JT1, 0, size * 8); }
+        break;
+    }
+    case OCERZ_OP_CMP: a64_sub_reg(b, sf, JT2, JT0, rs, 0); have_new = 0; break;
+    default: return 0;
+    }
+    if (size == 1) a64_uxtb(b, JT2, JT2); else if (size == 2) a64_uxth(b, JT2, JT2);
+    else if (size == 4 && (op == OCERZ_OP_NEG || op == OCERZ_OP_NOT || op == OCERZ_OP_SUB || op == OCERZ_OP_ADD || op == OCERZ_OP_XADD || op == OCERZ_OP_INC || op == OCERZ_OP_DEC || op == OCERZ_OP_CMP))
+        a64_mov_reg(b, 0, JT2, JT2);        /* w-form results are already zero-extended; harmless */
+
+    /* ---- store ---- */
+    if (!is_cmp && !(ordered && atomic)) {
+        if (ordered) emit_guest_store_ordered(b, size, JT2, ra, JTU);
+        else a64_str(b, size, JT2, ra, disp);
+    }
+    /* ---- flags (before the register results: the record may read the source pin) ---- */
+    if (need && op != OCERZ_OP_CMPXCHG) {
+        switch (op) {
+        case OCERZ_OP_ADD: case OCERZ_OP_XADD:
+            if (rs == JT1) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_ADD, size, 0), JT0, JT1);
+            else { if (size == 8) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_ADD, size, 0), JT0, rs);
+                   else { a64_mov_reg(b, 0, JT1, rs); emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_ADD, size, 0), JT0, JT1); } }
+            break;
+        case OCERZ_OP_SUB: case OCERZ_OP_CMP:
+            if (rs == JT1) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, JT1);
+            else { if (size == 8) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, rs);
+                   else { a64_mov_reg(b, 0, JT1, rs); emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, JT1); } }
+            break;
+        case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR: case OCERZ_OP_TEST:
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2);
+            break;
+        case OCERZ_OP_INC: case OCERZ_OP_DEC:
+            a64_ldr(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));   /* old CF */
+            emit_defer_flags(b, ocerz_cc_pack(op == OCERZ_OP_INC ? OCERZ_CC_INC : OCERZ_CC_DEC, size, 0), JT1, JT2);
+            break;
+        case OCERZ_OP_NEG:
+            a64_mov_imm64(b, JT1, 0);
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT1, JT0);
+            break;
+        default: break;                          /* not, xchg: no flags */
+        }
+    }
+    /* ---- register results ---- */
+    if (op == OCERZ_OP_XCHG || op == OCERZ_OP_XADD) rmw_write_reg(b, r, size, JT0);
+    (void)have_new;
+    if (align_bne) {
+        uint32_t *sites[1] = { align_bne };
+        if (!oolslow_add(insn, sites, 1, a64_label(b))) return 0;   /* (out of arms: leave it; caller falls back) */
+    }
+    return 1;
+}
+
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
@@ -5559,12 +5761,20 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
             return 1;
         if (emit_arith_narrow(b, insn, need))
             return 1;
+        if (insn->ops[0].kind == OCERZ_OPK_MEM)
+            return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
         if (insn->ops[1].kind == OCERZ_OPK_MEM)
             return emit_arith_mem(b, insn, need, exit_sites, n_exits);
         return emit_arith(b, insn, need);
     case OCERZ_OP_INC:
     case OCERZ_OP_DEC:
+        if (insn->ops[0].kind == OCERZ_OPK_MEM)
+            return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
         return emit_incdec(b, insn, need);
+    case OCERZ_OP_XCHG:
+    case OCERZ_OP_XADD:
+    case OCERZ_OP_CMPXCHG:
+        return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
     case OCERZ_OP_SHL:
     case OCERZ_OP_SHR:
     case OCERZ_OP_SAR:
@@ -5576,6 +5786,8 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         return emit_rot(b, insn, need);
     case OCERZ_OP_NOT:
     case OCERZ_OP_NEG:
+        if (insn->ops[0].kind == OCERZ_OPK_MEM)
+            return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
         return emit_not_neg(b, insn, need);
     case OCERZ_OP_ADC:
     case OCERZ_OP_SBB:

@@ -63,6 +63,7 @@ typedef struct OcerzCPU {
     uint32_t ras_top;
     struct { uint64_t guest_rip; void *host_entry; } ras[256];
     Ocerz128 fp_ckpt[16] __attribute__((aligned(16))); /* JIT FP-batch checkpoints (replay inputs) */
+    uint64_t jit_scratch[2];        /* JIT temporaries that must survive a C callout (e.g. an old CF) */
     uint32_t mxcsr;
     uint16_t fcw;
     uint16_t fsw;
