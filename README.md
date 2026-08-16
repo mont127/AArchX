@@ -90,8 +90,44 @@ Same x86_64 binary run under both engines, same machine, best of three:
 | `fib(42)` (call/return) | 0.67s | 1.09s |
 
 Branch-heavy code wins from two-way block linking, which jumps straight between compiled
-blocks instead of returning to the dispatcher. Call/return is still the weak spot. Both
-engines produce byte-identical output. `tests/run_bench_compare.sh` reproduces it.
+blocks instead of returning to the dispatcher. Both engines produce byte-identical output.
+`tests/run_bench_compare.sh` reproduces it.
+
+The wider `xbench` suite (`tests/guest/xbench.c`, 15 kernels) is measured with the
+paired-delta method of `tests/xbench_compare.py`: each kernel is timed at a scale and at
+half that scale under both engines, and the difference is compared, which cancels process
+startup and JIT warm-up. Ratio is Ocerz time over Rosetta 2 time (lower is better; below
+1.0 Ocerz is faster). Apple M2 Max, `REPS=5`, same static x86_64 binary, byte-identical
+output on every kernel:
+
+| Kernel | What it exercises | Rosetta 2 | Ocerz | Ratio |
+| --- | --- | --- | --- | --- |
+| `depchain` | long dependent integer chains | 0.297s | 0.269s | **0.90x** |
+| `jtab` | switch / jump-table dispatch | 0.299s | 0.290s | **0.97x** |
+| `chase` | pointer chasing (cache latency) | 0.296s | 0.295s | **1.00x** |
+| `hash` | hashing (mul/xor/shift + loads) | 0.292s | 0.296s | 1.01x |
+| `icall` | indirect calls through a function table | 0.297s | 0.314s | 1.06x |
+| `brmiss` | unpredictable branches | 0.298s | 0.318s | 1.07x |
+| `qsort` | recursive quicksort (compare + swap) | 0.295s | 0.339s | 1.16x |
+| `str` | strlen/strcmp-style byte loops | 0.298s | 0.346s | 1.16x |
+| `fpsse` | scalar double chain with sqrt/div | 0.296s | 0.359s | 1.22x |
+| `vm` | bytecode-interpreter dispatch loop | 0.299s | 0.377s | 1.26x |
+| `idiv` | 64/32-bit unsigned division | 0.104s | 0.138s | 1.33x |
+| `leafcall` | many small non-recursive calls | 0.297s | 0.431s | 1.45x |
+| `fpvec` | packed single-precision loop (SSE) | 0.030s | 0.044s | 1.46x |
+| `memcpy` | memcpy of mixed sizes | 0.288s | 0.429s | 1.48x |
+| `mixed` | struct updates, FP compares, branches | 0.178s | 0.270s | 1.51x |
+
+Three kernels are already faster than Rosetta 2 and the rest are within 1.5x. What made
+the difference so far: full guest-register pinning with body-to-body block chaining, lazy
+flags with static producer/consumer fusion (`cmp`/`test`/shift results feed `jcc`,
+`setcc`, `cmov`, `adc` straight from NZCV), per-site caches for indirect branches, direct
+`[guest_base, rsp]` addressing for push/pop/call/ret, and FP "batches": runs of SSE
+arithmetic execute in place at native speed with one NaN check per run, replaying exactly
+from a checkpoint only when a NaN shows up (x86 NaN semantics are still bit-exact, checked
+by a 2,859-case golden test against Rosetta). Where Rosetta still wins it has hardware
+help Ocerz lacks: an x86-flavoured FP mode on Apple silicon and identity-mapped guest
+memory.
 
 Loads and stores are plain `ldr`/`str` while the process is single-observer, and switch to
 `ldar`/`stlr` for x86-TSO once guest memory can be seen by another thread or process.
