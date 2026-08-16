@@ -34,7 +34,7 @@ ARCH := -arch x86_64
 CFLAGS := $(ARCH) -nostdlib -static -fno-stack-protector -O2 -Wl,-e,_start
 COMMON := crt0.s libmini.c
 
-TESTS := hello exit42 args alu branches strings fib sse mmap_test fileio memstress flags flags_deferred longblock signal_test signal_jump0 rip_test stack_test popmem_test flags_live flags_carry fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress chaincall link_spin fault_link fault_xlive fork_order shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq
+TESTS := hello exit42 args alu branches strings fib sse mmap_test fileio memstress flags flags_deferred longblock signal_test signal_jump0 rip_test stack_test popmem_test flags_live flags_carry fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress chaincall link_spin fault_link fault_xlive fork_order shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq jit_narrow
 
 # bench is a THROUGHPUT benchmark, not a correctness test. It is built into
 # benchbin/, NOT bin/, and that separation is load-bearing: run_diff_test.sh and

@@ -379,6 +379,20 @@ static int g_pin_class;
 
 static int g_defer;
 static _Atomic unsigned long long ps_ops[OCERZ_OP_COUNT];
+/* per op: up to 3 distinct instruction shapes seen going slow (for the report) */
+static char ps_shapes[OCERZ_OP_COUNT][3][96];
+static void ps_note_shape(const X86Insn *insn)
+{
+    unsigned o = insn->op;
+    if (o >= OCERZ_OP_COUNT) return;
+    char buf[96];
+    ocerz_format_insn(insn, buf, sizeof buf);
+    /* normalize immediates/displacements out so shapes group */
+    for (int i = 0; i < 3; i++) {
+        if (ps_shapes[o][i][0] == 0) { snprintf(ps_shapes[o][i], sizeof ps_shapes[o][i], "%s", buf); return; }
+        if (strcmp(ps_shapes[o][i], buf) == 0) return;
+    }
+}
 static _Atomic unsigned long long ps_slow_insns;
 static _Atomic unsigned long long ps_steps, ps_hits, ps_misses;
 
@@ -403,6 +417,7 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
     unsigned o = insn->op;
     if (o < OCERZ_OP_COUNT)
         ps_ops[o]++;
+        if ((ps_ops[o] & 0xff) == 1) ps_note_shape(insn);
 
     if (o == OCERZ_OP_PUSH || o == OCERZ_OP_POP) {
         ps_shape[o == OCERZ_OP_PUSH ? 0 : 1][
@@ -1767,6 +1782,31 @@ static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
         return emit_shift_eager(b, insn, need);
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
+    if (d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 1 || d->size == 2) &&
+        s->kind == OCERZ_OPK_IMM && pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP) &&
+        (insn->op == OCERZ_OP_SHL || insn->op == OCERZ_OP_SHR || insn->op == OCERZ_OP_SAR)) {
+        /* 8/16-bit register shifts: count masked to 5 bits like x86; the low
+         * bits of a 32-bit shift of the (zero/sign) extended value are exact */
+        unsigned ncnt = (unsigned)(s->imm & 31u);
+        if (ncnt == 0) return 1;
+        int rd = pin_hreg(pin_slot(d->reg));
+        int nbits = d->size * 8;
+        if (d->size == 1) { if (insn->op == OCERZ_OP_SAR) a64_sxtb(b, 0, JT0, rd); else a64_uxtb(b, JT0, rd); }
+        else              { if (insn->op == OCERZ_OP_SAR) a64_sxth(b, 0, JT0, rd); else a64_uxth(b, JT0, rd); }
+        switch (insn->op) {
+        case OCERZ_OP_SHL: a64_lsl_imm(b, 0, JT2, JT0, (int)ncnt); break;
+        case OCERZ_OP_SHR: a64_lsr_imm(b, 0, JT2, JT0, (int)ncnt); break;
+        default:           a64_asr_imm(b, 0, JT2, JT0, (int)ncnt); break;
+        }
+        a64_bfi(b, 1, rd, JT2, 0, nbits);
+        if (need) {
+            if (insn->op == OCERZ_OP_SAR) { if (d->size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0); }
+            a64_mov_imm64(b, JT1, ncnt);
+            unsigned nk = insn->op == OCERZ_OP_SHL ? OCERZ_CC_SHL : insn->op == OCERZ_OP_SHR ? OCERZ_CC_SHR : OCERZ_CC_SAR;
+            emit_defer_flags(b, ocerz_cc_pack(nk, d->size, 0), JT0, JT1);
+        }
+        return 1;
+    }
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
         return 0;
     if (s->kind != OCERZ_OPK_IMM)
@@ -3847,13 +3887,47 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (!g_defer) return 0;
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 1 && d->size != 2)) return 0;
     if (g_pin_class == 2 && d->reg == OCERZ_RSP) return 0;
+    int s_mem = 0;
     if (s->kind == OCERZ_OPK_REG) { if (s->high8 || s->size != d->size) return 0; }
+    else if (s->kind == OCERZ_OPK_MEM) { if (s->size != d->size || insn->seg != OCERZ_SEG_NONE) return 0; s_mem = 1; }
     else if (s->kind != OCERZ_OPK_IMM) return 0;
     unsigned op = insn->op;
     if (op != OCERZ_OP_ADD && op != OCERZ_OP_SUB && op != OCERZ_OP_AND &&
         op != OCERZ_OP_OR && op != OCERZ_OP_XOR) return 0;
     int size = d->size, bits = size * 8;
     uint64_t mask = size == 1 ? 0xffull : 0xffffull;
+    if (s_mem) {
+        /* memory source: load it zero-extended into JT1 first (plain fast form only) */
+        if (!emit_mem_load_plain(b, insn, s, size, JT1)) return 0;
+        int ds = pin_slot(d->reg);
+        if (ds < 0) return 0;
+        int rd = pin_hreg(ds);
+        if (!need) {
+            switch (op) {
+            case OCERZ_OP_ADD: a64_add_reg(b, 0, JT2, rd, JT1, 0); break;
+            case OCERZ_OP_SUB: a64_sub_reg(b, 0, JT2, rd, JT1, 0); break;
+            case OCERZ_OP_AND: a64_and_reg(b, 0, JT2, rd, JT1, 0); break;
+            case OCERZ_OP_OR:  a64_orr_reg(b, 0, JT2, rd, JT1, 0); break;
+            default:           a64_eor_reg(b, 0, JT2, rd, JT1, 0); break;
+            }
+            a64_bfi(b, 1, rd, JT2, 0, bits);
+            return 1;
+        }
+        if (size == 1) a64_uxtb(b, JTT, rd); else a64_uxth(b, JTT, rd);
+        switch (op) {
+        case OCERZ_OP_ADD: a64_add_reg(b, 0, JT2, JTT, JT1, 0); break;
+        case OCERZ_OP_SUB: a64_sub_reg(b, 0, JT2, JTT, JT1, 0); break;
+        case OCERZ_OP_AND: a64_and_reg(b, 0, JT2, JTT, JT1, 0); break;
+        case OCERZ_OP_OR:  a64_orr_reg(b, 0, JT2, JTT, JT1, 0); break;
+        default:           a64_eor_reg(b, 0, JT2, JTT, JT1, 0); break;
+        }
+        a64_bfi(b, 1, rd, JT2, 0, bits);
+        if (op == OCERZ_OP_ADD)      emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_ADD, size, 0), JTT, JT1);
+        else if (op == OCERZ_OP_SUB) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JTT, JT1);
+        else { if (size == 1) a64_uxtb(b, JT2, JT2); else a64_uxth(b, JT2, JT2);
+               emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2); }
+        return 1;
+    }
     /* pinned destination, dead flags: compute the low bits directly from the
      * pinned register (the operation only depends on the low `bits`) and
      * insert them back: 2-3 words */
@@ -4035,6 +4109,24 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
 static int emit_not_neg(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
+    if (d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 1 || d->size == 2) && g_defer &&
+        pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP)) {
+        /* 8/16-bit register forms in place */
+        int rd = pin_hreg(pin_slot(d->reg));
+        int bits = d->size * 8;
+        if (insn->op == OCERZ_OP_NOT) {
+            a64_try_eor_imm(b, 1, rd, rd, d->size == 1 ? 0xffull : 0xffffull);
+            return 1;
+        }
+        if (d->size == 1) a64_uxtb(b, JT0, rd); else a64_uxth(b, JT0, rd);   /* old, zero-extended */
+        a64_neg_reg(b, 0, JT2, JT0);
+        a64_bfi(b, 1, rd, JT2, 0, bits);
+        if (need) {
+            a64_mov_imm64(b, JT1, 0);
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0), JT1, JT0);
+        }
+        return 1;
+    }
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
         return 0;
     int sf = d->size == 8;
@@ -10561,11 +10653,12 @@ static void ps_report(OcerzJit *jit)
     unsigned long long cum = 0;
     for (int i = 0; i < 24 && rows[i].n; i++) {
         cum += rows[i].n;
-        fprintf(stderr, "ocerz: PERFSTAT[%d]   SLOWOP #%2d %-12s %14llu  %5.2f%% of slow  cum %5.2f%%  (%.2f%% of ALL)\n",
+        fprintf(stderr, "ocerz: PERFSTAT[%d]   SLOWOP #%2d %-12s %14llu  %5.2f%% of slow  cum %5.2f%%  (%.2f%% of ALL)  e.g. %s | %s | %s\n",
                 (int)getpid(), i + 1, ocerz_op_name(rows[i].op), rows[i].n,
                 slow ? 100.0 * (double)rows[i].n / (double)slow : 0.0,
                 slow ? 100.0 * (double)cum / (double)slow : 0.0,
-                total ? 100.0 * (double)rows[i].n / (double)total : 0.0);
+                total ? 100.0 * (double)rows[i].n / (double)total : 0.0,
+                ps_shapes[rows[i].op][0], ps_shapes[rows[i].op][1], ps_shapes[rows[i].op][2]);
     }
     {
         fprintf(stderr, "ocerz: PERFSTAT[%d]   RAS misses=%llu (stale=%llu)\n", (int)getpid(), ps_ras_miss, ps_ras_stale);
