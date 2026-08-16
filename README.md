@@ -102,23 +102,23 @@ output on every kernel:
 
 | Kernel | What it exercises | Rosetta 2 | Ocerz | Ratio |
 | --- | --- | --- | --- | --- |
-| `depchain` | long dependent integer chains | 0.297s | 0.269s | **0.90x** |
-| `jtab` | switch / jump-table dispatch | 0.299s | 0.290s | **0.97x** |
-| `chase` | pointer chasing (cache latency) | 0.296s | 0.295s | **1.00x** |
-| `hash` | hashing (mul/xor/shift + loads) | 0.292s | 0.296s | 1.01x |
-| `icall` | indirect calls through a function table | 0.297s | 0.314s | 1.06x |
-| `brmiss` | unpredictable branches | 0.298s | 0.318s | 1.07x |
-| `qsort` | recursive quicksort (compare + swap) | 0.295s | 0.339s | 1.16x |
-| `str` | strlen/strcmp-style byte loops | 0.298s | 0.346s | 1.16x |
-| `fpsse` | scalar double chain with sqrt/div | 0.296s | 0.359s | 1.22x |
-| `vm` | bytecode-interpreter dispatch loop | 0.299s | 0.377s | 1.26x |
-| `idiv` | 64/32-bit unsigned division | 0.104s | 0.138s | 1.33x |
-| `leafcall` | many small non-recursive calls | 0.297s | 0.431s | 1.45x |
-| `fpvec` | packed single-precision loop (SSE) | 0.030s | 0.044s | 1.46x |
-| `memcpy` | memcpy of mixed sizes | 0.288s | 0.429s | 1.48x |
-| `mixed` | struct updates, FP compares, branches | 0.178s | 0.270s | 1.51x |
+| `depchain` | long dependent integer chains | 0.294s | 0.270s | **0.90x** |
+| `memcpy` | memcpy of mixed sizes | 0.288s | 0.273s | **0.95x** |
+| `jtab` | switch / jump-table dispatch | 0.294s | 0.283s | **0.97x** |
+| `chase` | pointer chasing (cache latency) | 0.294s | 0.291s | **0.99x** |
+| `hash` | hashing (mul/xor/shift + loads) | 0.287s | 0.293s | 1.02x |
+| `brmiss` | unpredictable branches | 0.296s | 0.315s | 1.07x |
+| `qsort` | recursive quicksort (compare + swap) | 0.291s | 0.313s | 1.08x |
+| `icall` | indirect calls through a function table | 0.296s | 0.322s | 1.09x |
+| `idiv` | 64/32-bit unsigned division | 0.107s | 0.119s | 1.10x |
+| `str` | strlen/strcmp-style byte loops | 0.301s | 0.348s | 1.17x |
+| `fpsse` | scalar double chain with sqrt/div | 0.292s | 0.353s | 1.21x |
+| `vm` | bytecode-interpreter dispatch loop | 0.296s | 0.371s | 1.25x |
+| `leafcall` | many small non-recursive calls | 0.299s | 0.380s | 1.27x |
+| `mixed` | struct updates, FP compares, branches | 0.183s | 0.236s | 1.29x |
+| `fpvec` | packed single-precision loop (SSE) | 0.031s | 0.044s | 1.41x |
 
-Three kernels are already faster than Rosetta 2 and the rest are within 1.5x. What made
+Four kernels are faster than Rosetta 2, five more are within 10%, and the rest are within 1.5x. What made
 the difference so far: full guest-register pinning with body-to-body block chaining, lazy
 flags with static producer/consumer fusion (`cmp`/`test`/shift results feed `jcc`,
 `setcc`, `cmov`, `adc` straight from NZCV), per-site caches for indirect branches, direct
