@@ -6475,9 +6475,11 @@ static int callret_inline_enabled(void)
  * are plain body pointers (or NULL) and RET branches without a tag check. */
 static int ras_body_only(void)
 {
-    static int on = -1;
-    if (on < 0) on = (fullpin_enabled() && !g_no_regflags) ? 1 : 0;
-    return on;
+    /* must match the conditions under which CALL/RET emit the bl/ret + untagged
+     * body-pointer protocol (fast3); evaluated dynamically because plain
+     * memory can be retired at runtime (the transition purges the RAS) */
+    return fullpin_enabled() && !g_no_regflags && g_plain_mem && jgb_usable() &&
+           !ocerz_commpage && !ocerz_low_base && !g_no_chain && !g_no_ras;
 }
 static void *ras_entry_for(const JitBlock *blk)
 {
