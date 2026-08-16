@@ -605,6 +605,21 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 }
             }
         }
+        if (in_jit && rip_exact && ocerz_commpage && ocerz_guest_base == 0 &&
+            gaddr >= OCERZ_COMMPAGE_LO && gaddr < OCERZ_COMMPAGE_HI &&
+            ocerz_jit_note_commpage_fault(fvm, hpc, fault_rip)) {
+            /* plain-form access to the emulated commpage: the block is now
+             * marked for guarded retranslation; resume at the instruction */
+            g_cur_cpu->rip = fault_rip;
+            g_cur_cpu->sig_repeat = 0;
+            g_cur_cpu->interp_once = 1;      /* this instruction: interpreter (exact commpage semantics) */
+            if (getenv("OCERZ_CPFAULTLOG")) {
+                fprintf(stderr, "ocerz: CPFAULT rip=%#llx gaddr=%#llx\n", (unsigned long long)fault_rip, (unsigned long long)gaddr);
+                ocerz_cpu_dump(g_cur_cpu, stderr);
+            }
+            depth = 0;
+            siglongjmp(*g_sig_recover, 1);
+        }
         uint64_t fault_rsp = g_cur_cpu->gpr[OCERZ_RSP];
         int delivered = looping ? 0
                        : ocerz_signal_deliver(g_cur_cpu, SIGSEGV, gaddr, code, err);
@@ -1308,8 +1323,14 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
         }
         }
 
-        if (mtrace_hit) {
+        if (mtrace_hit || local.interp_once) {
+            int was_once = local.interp_once;
+            local.interp_once = 0;
             r = ocerz_interp_step(vm, &local);
+            if (was_once && getenv("OCERZ_CPFAULTLOG"))
+                fprintf(stderr, "ocerz: INTERP-ONCE done -> rip=%#llx rax=%#llx rcx=%#llx rdx=%#llx r=%d\n",
+                        (unsigned long long)local.rip, (unsigned long long)local.gpr[OCERZ_RAX],
+                        (unsigned long long)local.gpr[OCERZ_RCX], (unsigned long long)local.gpr[OCERZ_RDX], r);
         } else if (vm->jit_enabled && vm->jit) {
             r = ocerz_jit_step(vm, &local);
             if (r == OCERZ_EUNSUP)
@@ -1435,7 +1456,10 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
                 goto fatal;
             continue;
         }
-        if (vm->jit_enabled && vm->jit) {
+        if (cpu->interp_once) {
+            cpu->interp_once = 0;
+            r = ocerz_interp_step(vm, cpu);
+        } else if (vm->jit_enabled && vm->jit) {
             r = ocerz_jit_step(vm, cpu);
             if (r == OCERZ_EUNSUP)
                 r = ocerz_interp_step(vm, cpu);

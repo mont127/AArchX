@@ -71,6 +71,7 @@ typedef struct OcerzCPU {
     double fpr[8];
     struct OcerzVM *vm;
     int terminated;
+    int interp_once;                /* run the next instruction in the interpreter (fault recovery) */
     int cpu_number;
     uint64_t wq_workloop_id;
 
