@@ -2221,7 +2221,18 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
     if (g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
     if (op->riprel) {
-        a64_mov_imm64(b, JTA, (uint64_t)op->disp + ocerz_guest_base);
+        uint64_t c = (uint64_t)op->disp + ocerz_guest_base;
+        /* a 3+-word constant: one ldr from the block's literal pool instead */
+        if (g_n_raslit < RASLIT_MAX && (c >> 32) != 0 && ((c >> 16) & 0xffff) != 0) {
+            g_raslit[g_n_raslit].site = a64_label(b);
+            g_raslit[g_n_raslit].retaddr = c;
+            g_raslit[g_n_raslit].kind = 1;
+            g_raslit[g_n_raslit].rt = JTA;
+            g_n_raslit++;
+            a64_emit32(b, 0x58000000u | (uint32_t)JTA);      /* ldr JTA, <lit> */
+        } else {
+            a64_mov_imm64(b, JTA, c);
+        }
         *ra_out = JTA; *disp_out = 0;
         return 1;
     }
