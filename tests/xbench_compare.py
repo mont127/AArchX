@@ -9,7 +9,7 @@ import os, subprocess, sys, time, statistics
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OCERZ = os.environ.get("OCERZ", os.path.join(REPO, "ocerz"))
-XB = os.path.join(REPO, "tests/guest/benchbin/xbench")
+XB = os.environ.get("XB", os.path.join(REPO, "tests/guest/benchbin/xbench"))   # XB=tests/guest/benchbin/xbench_dyn for the dynamically linked build (needs OCERZ_HOSTWQ=1)
 REPS = int(os.environ.get("REPS", "3"))
 TARGET = float(os.environ.get("TARGET", "0.6"))
 DFLT = dict(icall=50000000, jtab=50000000, depchain=100000000, brmiss=50000000,
