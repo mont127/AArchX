@@ -2200,6 +2200,8 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
  * commpage/low-base guard is needed (standalone plain-mode processes):
  *   add JTA, JGB, base ; ldr/str [JTA, index, lsl s]   or   ldr/str [JTA, #disp]
  * Returns 1 if emitted.  `vec` selects V-register load/store (size 4/8/16). */
+static int ea_cache_reusable(const X86Operand *op);
+static void ea_cache_set(const X86Operand *op);
 static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand *m,
                                int size, int reg, int store, int vec)
 {
@@ -2241,10 +2243,14 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
                 return 1;
             }
         }
-        /* base + index<<s + disp: two adds, then a scaled immediate */
+        /* base + index<<s + disp: two adds, then a scaled immediate
+         * (or the adjacent instruction's identical base+index still in JTA) */
         if (m->disp < 0 || (m->disp % size) != 0 || m->disp / size > 4095) return 0;
-        if (hoisted) a64_add_reg(b, 1, JTA, hreg, hi, sc);
-        else { a64_add_reg(b, 1, JTA, JGB, hb, 0); a64_add_reg(b, 1, JTA, JTA, hi, sc); }
+        if (!ea_cache_reusable(m)) {
+            if (hoisted) a64_add_reg(b, 1, JTA, hreg, hi, sc);
+            else { a64_add_reg(b, 1, JTA, JGB, hb, 0); a64_add_reg(b, 1, JTA, JTA, hi, sc); }
+        }
+        ea_cache_set(m);
         if (vec) { if (store) a64_str_v(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JTA, (uint32_t)m->disp); }
         else     { if (store) a64_str(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr(b, size, reg, JTA, (uint32_t)m->disp); }
         return 1;
@@ -2264,6 +2270,57 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
  * the access in *disp_out (folded into the address when it does not fit the
  * scaled unsigned-imm12 form).  Returns 0 when the plain/JGB fast form does
  * not apply (guards needed, unpinned regs, ...): caller uses the generic path. */
+/* EA reuse across adjacent instructions: when the previous instruction left
+ * JTA = guest_base + base + index<<scale (no displacement folded) and its
+ * emitter never touches JTA after the access, an adjacent access with the
+ * same (base, index, scale) reads through [JTA, #disp] without recomputing.
+ * Only ops whose emitters are known to leave JTA alone after the EA qualify;
+ * anything else (callouts, batch replays, block starts) invalidates. */
+static const X86Insn *g_cur_insns;   /* the block's instructions (for index-based predicates) */
+static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
+static struct { int valid; unsigned base, index; int scale; int insn_idx; unsigned long long seq; int fpb; } g_ea_cache;
+static int g_cur_fpb = -1;
+static void ea_cache_reset(void) { g_ea_cache.valid = 0; }
+static int ea_cache_op_ok(unsigned op)
+{
+    switch (op) {
+    case OCERZ_OP_MOV: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD:
+    case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU:
+    case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX:
+    case OCERZ_OP_ADDPS: case OCERZ_OP_SUBPS: case OCERZ_OP_MULPS: case OCERZ_OP_DIVPS:
+    case OCERZ_OP_ADDPD: case OCERZ_OP_SUBPD: case OCERZ_OP_MULPD: case OCERZ_OP_DIVPD:
+    case OCERZ_OP_ADDSS: case OCERZ_OP_SUBSS: case OCERZ_OP_MULSS: case OCERZ_OP_DIVSS:
+    case OCERZ_OP_ADDSD: case OCERZ_OP_SUBSD: case OCERZ_OP_MULSD: case OCERZ_OP_DIVSD:
+    case OCERZ_OP_MAXPS: case OCERZ_OP_MINPS: case OCERZ_OP_MAXPD: case OCERZ_OP_MINPD:
+    case OCERZ_OP_MAXSS: case OCERZ_OP_MINSS: case OCERZ_OP_MAXSD: case OCERZ_OP_MINSD:
+    case OCERZ_OP_SQRTPS: case OCERZ_OP_SQRTPD: case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD:
+        return 1;
+    default: return 0;
+    }
+}
+static int ea_cache_reusable(const X86Operand *op)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_EACACHE") ? 1 : 0;
+    if (dis || !g_ea_cache.valid || !g_cur_insns || g_cur_insn_idx < 1) return 0;
+    if (g_ea_cache.insn_idx != g_cur_insn_idx - 1 || g_ea_cache.seq != g_callout_seq) return 0;
+    if (g_ea_cache.fpb != g_cur_fpb) return 0;
+    if (g_ea_cache.base != op->base || g_ea_cache.index != op->index || g_ea_cache.scale != (op->scale & 3)) return 0;
+    const X86Insn *prev = &g_cur_insns[g_cur_insn_idx - 1];
+    /* both the producer and the consumer must be ops whose emitters form the
+     * EA first and never touch JTA afterwards */
+    if (!ea_cache_op_ok(prev->op) || !ea_cache_op_ok(g_cur_insns[g_cur_insn_idx].op)) return 0;
+    if (op->base != OCERZ_REG_NONE && insn_may_write_gpr(prev, op->base)) return 0;
+    if (op->index != OCERZ_REG_NONE && insn_may_write_gpr(prev, op->index)) return 0;
+    return 1;
+}
+static void ea_cache_set(const X86Operand *op)
+{
+    g_ea_cache.valid = 1; g_ea_cache.base = op->base; g_ea_cache.index = op->index;
+    g_ea_cache.scale = op->scale & 3; g_ea_cache.insn_idx = g_cur_insn_idx;
+    g_ea_cache.seq = g_callout_seq; g_ea_cache.fpb = g_cur_fpb;
+}
+
 static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *op,
                              int size, int *ra_out, uint32_t *disp_out)
 {
@@ -2292,6 +2349,11 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
     int fits = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
     int have = 0;
     int hreg = op->base != OCERZ_REG_NONE ? hoist_reg_for(op->base) : -1;
+    if (fits && (op->base != OCERZ_REG_NONE || op->index != OCERZ_REG_NONE) && ea_cache_reusable(op)) {
+        *ra_out = JTA; *disp_out = (uint32_t)disp;
+        return 1;
+    }
+    g_ea_cache.valid = 0;
     if (hreg == JMEMBASE && g_mem_hoist_aux_index >= 0 && op->index != OCERZ_REG_NONE &&
         op->index == (unsigned)g_mem_hoist_aux_index && (op->scale & 3) == g_mem_hoist_aux_scale) {
         if (fits) { *ra_out = JMEMAUX; *disp_out = (uint32_t)disp; return 1; }
@@ -2327,7 +2389,7 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
         *ra_out = JTA; *disp_out = 0;
         return 1;
     }
-    if (fits) { *ra_out = JTA; *disp_out = (uint32_t)disp; return 1; }
+    if (fits) { ea_cache_set(op); *ra_out = JTA; *disp_out = (uint32_t)disp; return 1; }
     if (disp > 0 && disp <= 4095)       a64_add_imm(b, 1, JTA, JTA, (uint32_t)disp);
     else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, JTA, (uint32_t)-disp);
     else { a64_mov_imm64(b, JTU, (uint64_t)disp); a64_add_reg(b, 1, JTA, JTA, JTU, 0); }
@@ -3059,7 +3121,6 @@ static unsigned producer_record_kind(const X86Insn *p, int *size)
  * fcmp-based comis fusion?  Pure predicate shared by the liveness pass and
  * emit_cc_predicate so both agree.  Returns the producer index or -1. */
 static uint64_t g_cur_need;          /* fl_need of the instruction being emitted */
-static const X86Insn *g_cur_insns;   /* the block's instructions (for index-based predicates) */
 static int sse_enabled(void);
 /* Will this flag consumer be emitted INLINE through emit_cc_predicate?  (A
  * consumer that goes to the interpreter needs the flags materialized, so the
@@ -8494,11 +8555,13 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     int fpb_open = -1;
 
     int last_flag_def = -1;
+    ea_cache_reset();
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
         g_cur_insn_idx = i;
         g_cur_need = fl_need[i];
         g_cur_insns = blk->insns;
+        g_cur_fpb = fpb_of[i];
         g_nzcv_want = (i + 1 < n && nzcv_fuse_producer(blk->insns, i + 1) == i);
         /* lane-0 caches: a callout since the last instruction clobbered V4-V7;
          * an xmm writer that is not cache-aware invalidates its destination */
@@ -8778,9 +8841,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 a64_ldr_v(&b, 16, xmm_vreg((unsigned)r), 20, FPCKPT_OFF + (uint32_t)r * 16);
         g_fpb_fast = 0;
         l0_reset();
+        ea_cache_reset();
         for (int m = fb->first; m <= fb->last; m++) {
             g_cur_insn_idx = m;
             g_cur_need = fl_need[m];
+            g_cur_fpb = -1;
             uint32_t *lo = a64_label(&b);
             if (!try_inline(&b, &blk->insns[m], fl_need[m], exit_sites, &n_exits))
                 emit_slowcall(&b, &blk->insns[m], exit_sites, &n_exits);
