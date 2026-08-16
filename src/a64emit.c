@@ -731,3 +731,18 @@ void a64_v_cnt_8b(A64Buf *b, int vd, int vn)
 { a64_emit32(b, 0x0e205800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_addv_b_8b(A64Buf *b, int vd, int vn)
 { a64_emit32(b, 0x0e31b800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+
+/* ---- LSE atomics (acquire-release forms) ---- */
+static uint32_t lse_size_bits(int size) { return size == 8 ? 3u : size == 4 ? 2u : size == 2 ? 1u : 0u; }
+/* LDADDAL/LDCLRAL/LDEORAL/LDSETAL: opc 0/1/2/3; Rt = old value */
+void a64_ldop_al(A64Buf *b, int size, int opc, int rs, int rt, int rn)
+{ a64_emit32(b, 0x38e00000u | (lse_size_bits(size) << 30) | ((uint32_t)(rs & 31) << 16) | ((uint32_t)opc << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31)); }
+void a64_swpal(A64Buf *b, int size, int rs, int rt, int rn)
+{ a64_emit32(b, 0x38e08000u | (lse_size_bits(size) << 30) | ((uint32_t)(rs & 31) << 16) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31)); }
+/* CASAL: Rs = compare/old (updated), Rt = new */
+void a64_casal(A64Buf *b, int size, int rs, int rt, int rn)
+{ a64_emit32(b, 0x08e0fc00u | (lse_size_bits(size) << 30) | ((uint32_t)(rs & 31) << 16) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31)); }
+void a64_neg_reg(A64Buf *b, int sf, int rd, int rm)
+{ a64_emit32(b, (sf ? 0xcb0003e0u : 0x4b0003e0u) | ((uint32_t)(rm & 31) << 16) | (uint32_t)(rd & 31)); }
+void a64_mvn_reg(A64Buf *b, int sf, int rd, int rm)
+{ a64_emit32(b, (sf ? 0xaa2003e0u : 0x2a2003e0u) | ((uint32_t)(rm & 31) << 16) | (uint32_t)(rd & 31)); }

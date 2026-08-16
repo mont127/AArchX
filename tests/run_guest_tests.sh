@@ -55,7 +55,7 @@ run_with_timeout() {
     return $?
 }
 
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan)
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw)
 
 expected_exit() {
     case "$1" in
@@ -141,6 +141,24 @@ for name in "${NAMES[@]}"; do
             echo "  --- stderr ---" >&2
             sed 's/^/  | /' "$ACTUAL_ERR" >&2
         fi
+    fi
+done
+
+# Ordered-memory (multi-observer) model: the RMW/atomic emitters take the LSE
+# and ldapr/stlr paths there; run the tests that exercise them under
+# OCERZ_NO_PLAIN_MEM=1 as well.
+for name in jit_rmw jit_scan jit_ops; do
+    bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
+    [ -x "$bin" ] && [ -f "$golden" ] || continue
+    export OCERZ_NO_PLAIN_MEM=1
+    run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$bin"
+    rc=$?
+    unset OCERZ_NO_PLAIN_MEM
+    if [ "$rc" -eq 0 ] && cmp -s "$ACTUAL_OUT" "$golden"; then
+        echo "PASS $name (ordered)"; PASS=$((PASS + 1))
+    else
+        echo "FAIL $name (ordered: rc=$rc)"; FAIL=$((FAIL + 1))
+        diff "$golden" "$ACTUAL_OUT" | head -20 | sed 's/^/  | /' >&2
     fi
 done
 

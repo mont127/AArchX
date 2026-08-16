@@ -202,6 +202,10 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
     case OCERZ_OP_POPCNT:
         d = OCERZ_FL_ALL; u = 0;
         break;
+    /* xadd/cmpxchg set the arithmetic flags like add/cmp; xchg touches none */
+    case OCERZ_OP_XADD: case OCERZ_OP_CMPXCHG:
+        d = OCERZ_FL_ALL; u = 0;
+        break;
 
     default:
         if (insn->op >= OCERZ_OP_X87_FIRST && insn->op < OCERZ_OP_COUNT) {
