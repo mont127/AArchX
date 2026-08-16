@@ -6357,8 +6357,8 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             uint32_t *adr_site = a64_label(b);
             a64_emit32(b, 0x10000000u | (uint32_t)JT0);          /* adr JT0, cont (patched) */
             a64_add_reg(b, 1, JTA, 20, JT2, 4);
-            a64_str(b, 8, JT1, JTA, RAS_OFF);
-            a64_str(b, 8, JT0, JTA, RAS_OFF + 8);
+            if (RAS_OFF <= 504) a64_stp_off(b, JT1, JT0, JTA, RAS_OFF);
+            else { a64_str(b, 8, JT1, JTA, RAS_OFF); a64_str(b, 8, JT0, JTA, RAS_OFF + 8); }
             a64_add_imm(b, 0, JT2, JT2, 1);
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
             a64_patch_bcond(full, a64_label(b));
@@ -6505,8 +6505,8 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             if (no_blret_r < 0) no_blret_r = getenv("OCERZ_NO_BLRET") ? 1 : 0;
             int use_ret = g_pin_class == 3 && fast3 && ras_body_only() && !no_blret_r;
             int host_reg = use_ret ? 30 : JT0;
-            a64_ldr(b, 8, JTF, JTA, RAS_OFF);
-            a64_ldr(b, 8, host_reg, JTA, RAS_OFF + 8);
+            if (RAS_OFF <= 504) a64_ldp_off(b, JTF, host_reg, JTA, RAS_OFF);
+            else { a64_ldr(b, 8, JTF, JTA, RAS_OFF); a64_ldr(b, 8, host_reg, JTA, RAS_OFF + 8); }
             a64_subs_reg(b, 1, A64_ZR, JTF, JT1, 0);       /* JT1 = return address */
             ras_stale[nst] = a64_label(b); a64_bcond(b, A64_NE, 0); nst++;
             ras_stale[nst] = a64_label(b); a64_cbz(b, 1, host_reg, 0); nst++;
