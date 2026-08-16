@@ -415,9 +415,10 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
 {
     ps_slow_insns++;
     unsigned o = insn->op;
-    if (o < OCERZ_OP_COUNT)
+    if (o < OCERZ_OP_COUNT) {
         ps_ops[o]++;
         if ((ps_ops[o] & 0xff) == 1) ps_note_shape(insn);
+    }
 
     if (o == OCERZ_OP_PUSH || o == OCERZ_OP_POP) {
         ps_shape[o == OCERZ_OP_PUSH ? 0 : 1][
@@ -3508,14 +3509,14 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     else return -1;
     const X86Insn *p = &insns[ci - 1];
     unsigned kind;
-    if (p->op == OCERZ_OP_BT) {
-        /* bt: NZCV.Z <=> bit clear (tst); only CF conditions make sense */
+    if (p->op == OCERZ_OP_BT || p->op == OCERZ_OP_BTS || p->op == OCERZ_OP_BTR || p->op == OCERZ_OP_BTC) {
+        /* bt*: NZCV.Z <=> (old) bit clear (tst); only CF conditions make sense */
         if (cc != OCERZ_CC_B && cc != OCERZ_CC_AE) return -1;
         if (p->nops != 2 || p->seg != OCERZ_SEG_NONE || p->addrsize != 8) return -1;
         const X86Operand *bd = &p->ops[0], *bo = &p->ops[1];
         if (bd->size != 2 && bd->size != 4 && bd->size != 8) return -1;
         if (bd->kind == OCERZ_OPK_REG) { if (bd->high8 || pin_slot(bd->reg) < 0 || (g_pin_class == 2 && bd->reg == OCERZ_RSP)) return -1; }
-        else if (bd->kind != OCERZ_OPK_MEM) return -1;
+        else if (bd->kind != OCERZ_OPK_MEM || p->op != OCERZ_OP_BT) return -1;
         if (bo->kind == OCERZ_OPK_REG) { if (bo->high8 || pin_slot(bo->reg) < 0 || (g_pin_class == 2 && bo->reg == OCERZ_RSP)) return -1; }
         else if (bo->kind != OCERZ_OPK_IMM) return -1;
         return ci - 1;
@@ -3897,10 +3898,16 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     int size = d->size, bits = size * 8;
     uint64_t mask = size == 1 ? 0xffull : 0xffffull;
     if (s_mem) {
-        /* memory source: load it zero-extended into JT1 first (plain fast form only) */
-        if (!emit_mem_load_plain(b, insn, s, size, JT1)) return 0;
+        /* memory source: load it zero-extended into JT1 first (plain fast
+         * form, else the guarded generic address) */
         int ds = pin_slot(d->reg);
         if (ds < 0) return 0;
+        if (!emit_mem_load_plain(b, insn, s, size, JT1)) {
+            if (!emit_mem_ea(b, insn, s, JTA)) return 0;
+            (void)emit_commpage_guard(b, insn, JTA, NULL, NULL);
+            emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+            emit_guest_load_ordered(b, size, JT1, JTA, JTU);
+        }
         int rd = pin_hreg(ds);
         if (!need) {
             switch (op) {
@@ -5335,6 +5342,9 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
 }
 
 /* ---- movd/movq between gpr/mem and xmm ---- */
+static int emit_sse_pinsr_pextr(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
+static int emit_sse_pmovx(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
+static int emit_sse_round(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
 static int emit_sse_movd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -5576,6 +5586,14 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         return emit_sse_cvt(b, insn, exit_sites, n_exits);
     case OCERZ_OP_MOVQX: return emit_sse_movq(b, insn, exit_sites, n_exits);
     case OCERZ_OP_PSHUFD: return emit_sse_pshufd(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_PINSRB: case OCERZ_OP_PINSRW: case OCERZ_OP_PINSRD: case OCERZ_OP_PINSRQ:
+    case OCERZ_OP_PEXTRB: case OCERZ_OP_PEXTRW: case OCERZ_OP_PEXTRD: case OCERZ_OP_PEXTRQ:
+        return emit_sse_pinsr_pextr(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_PMOVSXBW: case OCERZ_OP_PMOVSXBD: case OCERZ_OP_PMOVSXBQ: case OCERZ_OP_PMOVSXWD: case OCERZ_OP_PMOVSXWQ: case OCERZ_OP_PMOVSXDQ:
+    case OCERZ_OP_PMOVZXBW: case OCERZ_OP_PMOVZXBD: case OCERZ_OP_PMOVZXBQ: case OCERZ_OP_PMOVZXWD: case OCERZ_OP_PMOVZXWQ: case OCERZ_OP_PMOVZXDQ:
+        return emit_sse_pmovx(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_ROUNDSS: case OCERZ_OP_ROUNDSD: case OCERZ_OP_ROUNDPS: case OCERZ_OP_ROUNDPD:
+        return emit_sse_round(b, insn, exit_sites, n_exits);
     case OCERZ_OP_MOVD:
         return emit_sse_movd(b, insn, exit_sites, n_exits);
     case OCERZ_OP_UNPCKLPD: case OCERZ_OP_UNPCKHPD: case OCERZ_OP_MOVLHPS: case OCERZ_OP_MOVHLPS:
@@ -5651,6 +5669,46 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
     const X86Operand *d = &insn->ops[0], *o = &insn->ops[1];
     int size = d->size;
     if (size != 2 && size != 4 && size != 8) return 0;
+    if (insn->op != OCERZ_OP_BT) {
+        /* bts/btr/btc on a register: CF <- old bit, then set/clear/flip it */
+        if (d->kind != OCERZ_OPK_REG || d->high8 || pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+        if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (g_pin_class == 2 && o->reg == OCERZ_RSP)) return 0; }
+        else if (o->kind != OCERZ_OPK_IMM) return 0;
+        if (need != 0) emit_materialize(b);
+        int rd = pin_hreg(pin_slot(d->reg));
+        int sf = size == 8;
+        unsigned bits = (unsigned)size * 8;
+        /* mask bit -> JT1, old bit -> JT0 */
+        if (o->kind == OCERZ_OPK_IMM) {
+            unsigned n = (unsigned)o->imm & (bits - 1);
+            a64_ubfx(b, 1, JT0, rd, (int)n, 1);
+            a64_mov_imm64(b, JT1, 1ull << n);
+        } else {
+            a64_try_and_imm(b, 1, JT2, pin_hreg(pin_slot(o->reg)), bits - 1);
+            a64_lsrv(b, 1, JT0, rd, JT2);
+            a64_try_and_imm(b, 1, JT0, JT0, 1);
+            a64_mov_imm64(b, JT1, 1);
+            a64_lslv(b, 1, JT1, JT1, JT2);
+        }
+        if (size == 2) {
+            a64_uxth(b, JT2, rd);
+            if (insn->op == OCERZ_OP_BTS) a64_orr_reg(b, 0, JT2, JT2, JT1, 0);
+            else if (insn->op == OCERZ_OP_BTR) a64_bic_reg(b, 0, JT2, JT2, JT1, 0);
+            else a64_eor_reg(b, 0, JT2, JT2, JT1, 0);
+            a64_bfi(b, 1, rd, JT2, 0, 16);
+        } else {
+            if (insn->op == OCERZ_OP_BTS) a64_orr_reg(b, sf, rd, rd, JT1, 0);
+            else if (insn->op == OCERZ_OP_BTR) a64_bic_reg(b, sf, rd, rd, JT1, 0);
+            else a64_eor_reg(b, sf, rd, rd, JT1, 0);
+        }
+        if (need != 0) {
+            a64_ldr(b, 8, JT1, 20, RFLAGS_OFF);
+            a64_bfi(b, 1, JT1, JT0, 0, 1);
+            a64_str(b, 8, JT1, 20, RFLAGS_OFF);
+        }
+        if (g_nzcv_want) { a64_subs_imm(b, 1, A64_ZR, JT0, 0); g_nzcv_kind = NZCV_KIND_BT; g_nzcv_from = g_cur_insn_idx; }
+        return 1;
+    }
     if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (g_pin_class == 2 && o->reg == OCERZ_RSP)) return 0; }
     else if (o->kind != OCERZ_OPK_IMM) return 0;
     int mat = need != 0 && !g_nzcv_want;         /* CF live beyond a forwarded consumer: patch RFLAGS */
@@ -5701,6 +5759,156 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
         g_nzcv_kind = NZCV_KIND_BT;
         g_nzcv_from = g_cur_insn_idx;
     }
+    return 1;
+}
+
+/* leave: rsp = rbp; pop rbp (class 3, plain stack) */
+static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    (void)insn; (void)exit_sites; (void)n_exits;
+    if (g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || pin_slot(OCERZ_RBP) < 0 ||
+        !g_plain_mem || !jgb_usable() || stack_guard_needed())
+        return 0;
+    int hs = pin_hreg(pin_slot(OCERZ_RSP)), hb = pin_hreg(pin_slot(OCERZ_RBP));
+    a64_mov_reg(b, 1, hs, hb);
+    a64_ldr_regoff(b, 8, hb, JGB, hs, 0);
+    a64_add_imm(b, 1, hs, hs, 8);
+    return 1;
+}
+
+/* shld/shrd reg, reg, imm with dead flags: one extr */
+static int emit_shiftd(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    if (need != 0 || !g_defer || insn->nops != 3) return 0;
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1], *c = &insn->ops[2];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+    if (s->kind != OCERZ_OPK_REG || s->high8 || s->size != d->size || c->kind != OCERZ_OPK_IMM) return 0;
+    if (pin_slot(d->reg) < 0 || pin_slot(s->reg) < 0) return 0;
+    if (g_pin_class == 2 && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP)) return 0;
+    int sf = d->size == 8;
+    unsigned bits = (unsigned)d->size * 8;
+    unsigned cnt = (unsigned)c->imm & (sf ? 63u : 31u);
+    if (cnt == 0) return 1;
+    int rd = pin_hreg(pin_slot(d->reg)), rs = pin_hreg(pin_slot(s->reg));
+    if (insn->op == OCERZ_OP_SHRD) a64_extr(b, sf, rd, rs, rd, (int)cnt);          /* (src:dst) >> cnt */
+    else                           a64_extr(b, sf, rd, rd, rs, (int)(bits - cnt)); /* (dst:src) >> (bits-cnt) */
+    return 1;
+}
+
+/* pinsrb/w/d/q xmm, r32/r64|mem, imm ; pextrb/w/d/q r/mem, xmm, imm */
+static int emit_sse_pinsr_pextr(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    if (insn->nops != 3 || !sse_enabled()) return 0;
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    unsigned op = insn->op;
+    int esize = (op == OCERZ_OP_PINSRB || op == OCERZ_OP_PEXTRB) ? 1 : (op == OCERZ_OP_PINSRW || op == OCERZ_OP_PEXTRW) ? 2 :
+                (op == OCERZ_OP_PINSRD || op == OCERZ_OP_PEXTRD) ? 4 : 8;
+    unsigned lanes = 16u / (unsigned)esize;
+    unsigned idx = (unsigned)insn->ops[2].imm & (lanes - 1);
+    if (op == OCERZ_OP_PINSRB || op == OCERZ_OP_PINSRW || op == OCERZ_OP_PINSRD || op == OCERZ_OP_PINSRQ) {
+        if (d->kind != OCERZ_OPK_XMM || !xmm_is_pinned(d->reg)) return 0;
+        int vd = xmm_vreg(d->reg);
+        if (s->kind == OCERZ_OPK_REG) {
+            if (s->high8) return 0;
+            emit_gpr_rd(b, 1, JT0, s->reg);
+            a64_ins_gpr(b, esize, vd, (int)idx, JT0);
+            return 1;
+        }
+        if (s->kind == OCERZ_OPK_MEM) {
+            if (!emit_mem_load_plain(b, insn, s, esize, JT0)) return 0;
+            a64_ins_gpr(b, esize, vd, (int)idx, JT0);
+            return 1;
+        }
+        return 0;
+    }
+    /* pextr */
+    if (s->kind != OCERZ_OPK_XMM || !xmm_is_pinned(s->reg)) return 0;
+    int vs = xmm_vreg(s->reg);
+    if (d->kind == OCERZ_OPK_REG) {
+        if (d->high8) return 0;
+        a64_umov_gpr(b, esize, JT0, vs, (int)idx);       /* zero-extended */
+        emit_gpr_wr(b, JT0, d->reg);
+        return 1;
+    }
+    if (d->kind == OCERZ_OPK_MEM) {
+        a64_umov_gpr(b, esize, JT0, vs, (int)idx);
+        if (emit_plain_mem_fast(b, insn, d, esize, JT0, 1, 0)) return 1;
+        return 0;
+    }
+    return 0;
+}
+
+/* pmovsx and pmovzx (b/w/d -> w/d/q) xmm, xmm/mem: widen the low lanes */
+static int emit_sse_pmovx(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    if (insn->nops != 2 || !sse_enabled()) return 0;
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (d->kind != OCERZ_OPK_XMM || !xmm_is_pinned(d->reg)) return 0;
+    unsigned op = insn->op;
+    int sx = op == OCERZ_OP_PMOVSXBW || op == OCERZ_OP_PMOVSXBD || op == OCERZ_OP_PMOVSXBQ ||
+             op == OCERZ_OP_PMOVSXWD || op == OCERZ_OP_PMOVSXWQ || op == OCERZ_OP_PMOVSXDQ;
+    int from, steps, srcw;   /* element size in bytes, number of doublings, source bytes consumed */
+    switch (op) {
+    case OCERZ_OP_PMOVSXBW: case OCERZ_OP_PMOVZXBW: from = 1; steps = 1; srcw = 8; break;
+    case OCERZ_OP_PMOVSXBD: case OCERZ_OP_PMOVZXBD: from = 1; steps = 2; srcw = 4; break;
+    case OCERZ_OP_PMOVSXBQ: case OCERZ_OP_PMOVZXBQ: from = 1; steps = 3; srcw = 2; break;
+    case OCERZ_OP_PMOVSXWD: case OCERZ_OP_PMOVZXWD: from = 2; steps = 1; srcw = 8; break;
+    case OCERZ_OP_PMOVSXWQ: case OCERZ_OP_PMOVZXWQ: from = 2; steps = 2; srcw = 4; break;
+    case OCERZ_OP_PMOVSXDQ: case OCERZ_OP_PMOVZXDQ: from = 4; steps = 1; srcw = 8; break;
+    default: return 0;
+    }
+    int vsrc;
+    if (s->kind == OCERZ_OPK_XMM) {
+        if (!xmm_is_pinned(s->reg)) return 0;
+        vsrc = xmm_vreg(s->reg);
+    } else if (s->kind == OCERZ_OPK_MEM) {
+        /* load the consumed bytes (2/4/8) into VX1 (upper zero) */
+        uint32_t *skip;
+        if (srcw == 2) {
+            if (!emit_mem_load_plain(b, insn, s, 2, JT0)) return 0;
+            a64_fmov_v_from_x(b, 0, VX1, JT0);
+        } else {
+            if (!emit_sse_mem_addr(b, insn, s, srcw, exit_sites, n_exits, &skip)) return 0;
+            emit_sse_mem_ld(b, srcw, VX1);
+            patch_guard_skip(skip, a64_label(b));
+        }
+        vsrc = VX1;
+    } else return 0;
+    int vd = xmm_vreg(d->reg);
+    int cur = vsrc, e = from;
+    for (int k = 0; k < steps; k++) {
+        a64_v_xtl(b, sx, e, vd, cur);
+        cur = vd; e *= 2;
+    }
+    return 1;
+}
+
+/* roundss/sd/ps/pd xmm, xmm/mem, imm */
+static int emit_sse_round(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    if (insn->nops != 3 || !sse_enabled()) return 0;
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (d->kind != OCERZ_OPK_XMM || !xmm_is_pinned(d->reg)) return 0;
+    unsigned op = insn->op;
+    unsigned imm = (unsigned)insn->ops[2].imm;
+    int mode = (imm & 4) ? 4 : (int)(imm & 3);          /* 0 nearest 1 floor 2 ceil 3 trunc 4 current */
+    int mode_a64 = mode == 0 ? 0 : mode == 1 ? 1 : mode == 2 ? 2 : mode == 3 ? 3 : 4;
+    int dbl = op == OCERZ_OP_ROUNDSD || op == OCERZ_OP_ROUNDPD;
+    int packed = op == OCERZ_OP_ROUNDPS || op == OCERZ_OP_ROUNDPD;
+    int vd = xmm_vreg(d->reg);
+    if (packed) {
+        int vs = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
+        if (vs < 0) return 0;
+        a64_v_frint(b, dbl, mode_a64, vd, vs);
+        return 1;
+    }
+    /* scalar: round lane 0 of the source into lane 0 of the destination */
+    int esz = dbl ? 8 : 4;
+    int vs;
+    if (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) vs = xmm_vreg(s->reg);
+    else { if (!emit_sse_src(b, insn, s, esz, VX1, exit_sites, n_exits)) return 0; vs = VX1; }
+    a64_frint_s(b, dbl, mode_a64, VX0, vs);
+    if (dbl) a64_ins_d_d(b, vd, 0, VX0, 0); else a64_ins_s_s(b, vd, 0, VX0, 0);
     return 1;
 }
 
@@ -6082,6 +6290,11 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
     case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTDQ2PS:
     case OCERZ_OP_MOVD: case OCERZ_OP_MOVQX: case OCERZ_OP_PSHUFD:
+    case OCERZ_OP_PINSRB: case OCERZ_OP_PINSRW: case OCERZ_OP_PINSRD: case OCERZ_OP_PINSRQ:
+    case OCERZ_OP_PEXTRB: case OCERZ_OP_PEXTRW: case OCERZ_OP_PEXTRD: case OCERZ_OP_PEXTRQ:
+    case OCERZ_OP_PMOVSXBW: case OCERZ_OP_PMOVSXBD: case OCERZ_OP_PMOVSXBQ: case OCERZ_OP_PMOVSXWD: case OCERZ_OP_PMOVSXWQ: case OCERZ_OP_PMOVSXDQ:
+    case OCERZ_OP_PMOVZXBW: case OCERZ_OP_PMOVZXBD: case OCERZ_OP_PMOVZXBQ: case OCERZ_OP_PMOVZXWD: case OCERZ_OP_PMOVZXWQ: case OCERZ_OP_PMOVZXDQ:
+    case OCERZ_OP_ROUNDSS: case OCERZ_OP_ROUNDSD: case OCERZ_OP_ROUNDPS: case OCERZ_OP_ROUNDPD:
     case OCERZ_OP_UNPCKLPD: case OCERZ_OP_UNPCKHPD: case OCERZ_OP_MOVLHPS: case OCERZ_OP_MOVHLPS:
     case OCERZ_OP_UNPCKLPS: case OCERZ_OP_UNPCKHPS:
     case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX:
@@ -6103,8 +6316,12 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         return emit_bitscan(b, insn, need);
     case OCERZ_OP_PMOVMSKB:
         return emit_pmovmskb(b, insn);
-    case OCERZ_OP_BT:
+    case OCERZ_OP_BT: case OCERZ_OP_BTS: case OCERZ_OP_BTR: case OCERZ_OP_BTC:
         return emit_bt(b, insn, need, exit_sites, n_exits);
+    case OCERZ_OP_LEAVE:
+        return emit_leave(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_SHLD: case OCERZ_OP_SHRD:
+        return emit_shiftd(b, insn, need);
     case OCERZ_OP_PUSH:
     case OCERZ_OP_POP:
         return emit_push_pop(b, insn, exit_sites, n_exits);
