@@ -130,6 +130,8 @@ void a64_ldp_off(A64Buf *b, int rt, int rt2, int rn, int imm);
 /* FP / SIMD */
 void a64_ldr_v(A64Buf *b, int size, int vt, int rn, uint32_t off);
 void a64_str_v(A64Buf *b, int size, int vt, int rn, uint32_t off);
+void a64_ldur(A64Buf *b, int size, int rt, int rn, int32_t simm9);
+void a64_stur(A64Buf *b, int size, int rt, int rn, int32_t simm9);
 void a64_ldur_v(A64Buf *b, int size, int vt, int rn, int32_t simm9);
 void a64_stur_v(A64Buf *b, int size, int vt, int rn, int32_t simm9);
 void a64_fadd_s(A64Buf *b, int dbl, int vd, int vn, int vm);
