@@ -169,6 +169,9 @@ static const X86Insn *g_flag_producer;
 static int g_flag_producer_operands_intact;   /* no later insn wrote the producer's xmm operands */
 
 static int g_no_regflags;
+static int g_nzcv_want;          /* emitting the producer of an NZCV-forwarded pair */
+static int g_nzcv_from = -1;     /* insn index that left NZCV = its result flags */
+static unsigned g_nzcv_kind;     /* OCERZ_CC_SUB / ADD / LOGIC */
 
 static int g_no_chain;
 
@@ -930,6 +933,43 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
     int writes = (op == OCERZ_OP_ADD || op == OCERZ_OP_SUB ||
                   op == OCERZ_OP_AND || op == OCERZ_OP_OR || op == OCERZ_OP_XOR);
     (void)is_logic;
+
+    /* NZCV forwarding to the adjacent consumer: flag-setting arm64 op */
+    if (g_nzcv_want && pin_slot(d->reg) >= 0 &&
+        !(g_pin_class == 2 && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP))) &&
+        (s->kind == OCERZ_OPK_IMM || (s->kind == OCERZ_OPK_REG && !s->high8 && pin_slot(s->reg) >= 0))) {
+        int rd = pin_hreg(pin_slot(d->reg));
+        int rm;
+        uint64_t v = 0; int imm = s->kind == OCERZ_OPK_IMM;
+        if (imm) { v = s->imm; if (!sf) v &= 0xffffffffull; a64_mov_imm64(b, JT1, v); rm = JT1; }
+        else rm = pin_hreg(pin_slot(s->reg));
+        if (is_add || is_sub) {
+            if (need) {
+                if (sf) a64_stp_off(b, rd, rm, 20, CC_SRC_OFF);
+                else { a64_mov_reg(b, 0, JT0, rd); a64_mov_reg(b, 0, JT2, rm); a64_stp_off(b, JT0, JT2, 20, CC_SRC_OFF); }
+                a64_mov_imm64(b, JTT, ocerz_cc_pack(is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB, d->size, 0));
+                a64_str(b, 4, JTT, 20, CC_OP_OFF);
+            }
+            int rdst = writes ? rd : A64_ZR;
+            if (is_add) a64_adds_reg(b, sf, rdst, rd, rm, 0);
+            else        a64_subs_reg(b, sf, rdst, rd, rm, 0);
+            g_nzcv_kind = is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB;
+        } else {
+            switch (op) {
+            case OCERZ_OP_TEST: a64_ands_reg(b, sf, JT2, rd, rm, 0); break;
+            case OCERZ_OP_AND:  a64_ands_reg(b, sf, rd, rd, rm, 0); break;
+            case OCERZ_OP_OR:   a64_orr_reg(b, sf, rd, rd, rm, 0); a64_ands_reg(b, sf, A64_ZR, rd, rd, 0); break;
+            default:            a64_eor_reg(b, sf, rd, rd, rm, 0); a64_ands_reg(b, sf, A64_ZR, rd, rd, 0); break;
+            }
+            if (need) {
+                int rr = op == OCERZ_OP_TEST ? JT2 : rd;
+                emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0), rr, rr);
+            }
+            g_nzcv_kind = OCERZ_CC_LOGIC;
+        }
+        g_nzcv_from = g_cur_insn_idx;
+        return 1;
+    }
 
     if (!writes && need == 0)
         return 1;
@@ -2524,6 +2564,34 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     if (pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP) &&
         emit_mem_load_plain(b, insn, s, sf ? 8 : 4, JT1)) {
         int rd = pin_hreg(pin_slot(d->reg));
+        if (g_nzcv_want) {                   /* NZCV forwarding: flag-setting forms */
+            if (is_add || is_sub) {
+                if (need) {
+                    if (sf) a64_stp_off(b, rd, JT1, 20, CC_SRC_OFF);
+                    else { a64_mov_reg(b, 0, JT0, rd); a64_stp_off(b, JT0, JT1, 20, CC_SRC_OFF); }
+                    a64_mov_imm64(b, JTT, ocerz_cc_pack(is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB, d->size, 0));
+                    a64_str(b, 4, JTT, 20, CC_OP_OFF);
+                }
+                int rdst = writes ? rd : A64_ZR;
+                if (is_add) a64_adds_reg(b, sf, rdst, rd, JT1, 0);
+                else        a64_subs_reg(b, sf, rdst, rd, JT1, 0);
+                g_nzcv_kind = is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB;
+            } else {
+                switch (op) {
+                case OCERZ_OP_TEST: a64_ands_reg(b, sf, JT2, rd, JT1, 0); break;
+                case OCERZ_OP_AND:  a64_ands_reg(b, sf, rd, rd, JT1, 0); break;
+                case OCERZ_OP_OR:   a64_orr_reg(b, sf, rd, rd, JT1, 0); a64_ands_reg(b, sf, A64_ZR, rd, rd, 0); break;
+                default:            a64_eor_reg(b, sf, rd, rd, JT1, 0); a64_ands_reg(b, sf, A64_ZR, rd, rd, 0); break;
+                }
+                if (need) {
+                    int rr = op == OCERZ_OP_TEST ? JT2 : rd;
+                    emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0), rr, rr);
+                }
+                g_nzcv_kind = OCERZ_CC_LOGIC;
+            }
+            g_nzcv_from = g_cur_insn_idx;
+            return 1;
+        }
         if (!writes) {                       /* cmp / test */
             if (need == 0) return 1;
             if (is_sub) { emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0), rd, JT1); return 1; }
@@ -2749,8 +2817,45 @@ static unsigned producer_record_kind(const X86Insn *p, int *size)
 static uint64_t g_cur_need;          /* fl_need of the instruction being emitted */
 static const X86Insn *g_cur_insns;   /* the block's instructions (for index-based predicates) */
 static int sse_enabled(void);
+/* Will this flag consumer be emitted INLINE through emit_cc_predicate?  (A
+ * consumer that goes to the interpreter needs the flags materialized, so the
+ * static fusions must not drop its flag use.)  Mirrors the emitters' checks. */
+static int cc_consumer_inline_ok(const X86Insn *c)
+{
+    const X86Operand *d = &c->ops[0];
+    switch (c->op) {
+    case OCERZ_OP_JCC:
+        return 1;
+    case OCERZ_OP_SETCC: {
+        static int no = -1; if (no < 0) no = getenv("OCERZ_NO_INLINE_SETCC") ? 1 : 0;
+        if (no) return 0;
+        return d->kind == OCERZ_OPK_REG && !d->high8 && d->size == 1 &&
+               !(g_pin_class == 2 && d->reg == OCERZ_RSP);
+    }
+    case OCERZ_OP_CMOVCC: {
+        static int no = -1; if (no < 0) no = getenv("OCERZ_NO_INLINE_CMOV") ? 1 : 0;
+        if (no) return 0;
+        const X86Operand *sr = &c->ops[1];
+        if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+        if (g_pin_class == 2 && (d->reg == OCERZ_RSP || (sr->kind == OCERZ_OPK_REG && sr->reg == OCERZ_RSP))) return 0;
+        if (sr->kind == OCERZ_OPK_REG) return !sr->high8 && sr->size == d->size;
+        return sr->kind == OCERZ_OPK_MEM;
+    }
+    case OCERZ_OP_ADC: case OCERZ_OP_SBB: {
+        const X86Operand *sr = &c->ops[1];
+        if (!g_defer) return 0;
+        if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+        if (g_pin_class == 2 && d->reg == OCERZ_RSP) return 0;
+        if (sr->kind == OCERZ_OPK_REG) return !sr->high8 && sr->size == d->size;
+        return sr->kind == OCERZ_OPK_IMM;
+    }
+    default:
+        return 0;
+    }
+}
 static int comis_fuse_producer(const X86Insn *insns, int ci)
 {
+    if (!cc_consumer_inline_ok(&insns[ci])) return -1;
     unsigned cc = insns[ci].cc;
     if (!(cc == OCERZ_CC_A || cc == OCERZ_CC_AE || cc == OCERZ_CC_B || cc == OCERZ_CC_BE ||
           cc == OCERZ_CC_P || cc == OCERZ_CC_NP || cc == OCERZ_CC_E || cc == OCERZ_CC_NE))
@@ -2792,6 +2897,7 @@ static int value_cond_fuse_producer(const X86Insn *insns, int ci)
     static int dis = -1;
     if (dis < 0) dis = getenv("OCERZ_NO_VALCC") ? 1 : 0;
     if (dis) return -1;
+    if (!cc_consumer_inline_ok(&insns[ci])) return -1;
     unsigned cc = insns[ci].cc;
     if (!(cc == OCERZ_CC_E || cc == OCERZ_CC_NE || cc == OCERZ_CC_S || cc == OCERZ_CC_NS))
         return -1;
@@ -2830,6 +2936,56 @@ static int value_cond_fuse_producer(const X86Insn *insns, int ci)
     }
     return pi;
 }
+/* NZCV forwarding: an adjacent producer (cmp/test/add/sub/and/or/xor on a
+ * pinned 32/64-bit register with a pinned-register / immediate / plain-memory
+ * source) is emitted with a flag-setting arm64 op and the consumer
+ * (setcc/cmovcc/adc/sbb) reads NZCV directly.  Pure predicate shared by the
+ * liveness pass, the producer emitter and emit_cc_predicate. */
+static int cc_after_ands(unsigned cc);
+static int cc_after_adds(unsigned cc);
+static int mem_plain_ok(const X86Insn *insn, const X86Operand *op)
+{
+    if (!g_plain_mem || !jgb_usable() || ocerz_commpage || ocerz_low_base) return 0;
+    if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
+    if (g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
+    if (op->riprel) return 1;
+    if (op->base != OCERZ_REG_NONE && pin_slot(op->base) < 0) return 0;
+    if (op->index != OCERZ_REG_NONE && pin_slot(op->index) < 0) return 0;
+    return 1;
+}
+static int nzcv_fuse_producer(const X86Insn *insns, int ci)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_NZCVFWD") ? 1 : 0;
+    if (dis || ci < 1 || !g_defer || g_no_regflags) return -1;
+    const X86Insn *c = &insns[ci];
+    if (!cc_consumer_inline_ok(c)) return -1;
+    unsigned cc;
+    if (c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC) cc = c->cc;
+    else if (c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) cc = OCERZ_CC_B;
+    else return -1;
+    const X86Insn *p = &insns[ci - 1];
+    unsigned kind;
+    switch (p->op) {
+    case OCERZ_OP_CMP: case OCERZ_OP_SUB: kind = OCERZ_CC_SUB; if (cc_after_subs(cc) < 0) return -1; break;
+    case OCERZ_OP_ADD:                    kind = OCERZ_CC_ADD; if (cc_after_adds(cc) < 0) return -1; break;
+    case OCERZ_OP_TEST: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
+                                          kind = OCERZ_CC_LOGIC; if (cc_after_ands(cc) < 0) return -1; break;
+    default: return -1;
+    }
+    (void)kind;
+    if (p->nops != 2 || p->seg != OCERZ_SEG_NONE) return -1;
+    const X86Operand *d = &p->ops[0], *sr = &p->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return -1;
+    if (pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return -1;
+    if (sr->size != d->size) return -1;
+    if (sr->kind == OCERZ_OPK_REG) {
+        if (sr->high8 || pin_slot(sr->reg) < 0 || (g_pin_class == 2 && sr->reg == OCERZ_RSP)) return -1;
+    } else if (sr->kind == OCERZ_OPK_MEM) {
+        if (!mem_plain_ok(p, sr)) return -1;
+    } else if (sr->kind != OCERZ_OPK_IMM) return -1;
+    return ci - 1;
+}
 /* after `adds`: CF = C (no inversion), same table as subs otherwise except B/AE */
 static int cc_after_adds(unsigned cc)
 {
@@ -2854,6 +3010,29 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         char tb[96] = "(none)";
         if (g_flag_producer) ocerz_format_insn(g_flag_producer, tb, sizeof tb);
         fprintf(stderr, "ocerz: CCPRED cc=%u producer=%s\n", cc, tb);
+    }
+    /* NZCV forwarded from the adjacent producer */
+    if (g_nzcv_from >= 0 && g_cur_insns && g_nzcv_from == g_cur_insn_idx - 1 &&
+        nzcv_fuse_producer(g_cur_insns, g_cur_insn_idx) == g_nzcv_from) {
+        const X86Insn *c = &g_cur_insns[g_cur_insn_idx];
+        unsigned want_cc = (c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) ? OCERZ_CC_B : c->cc;
+        if (want_cc == cc) {
+            int dc = g_nzcv_kind == OCERZ_CC_SUB ? cc_after_subs(cc) :
+                     g_nzcv_kind == OCERZ_CC_ADD ? cc_after_adds(cc) : cc_after_ands(cc);
+            if (dc == A64_AL || dc == A64_NV) {
+                /* constant condition (CF/OF are 0 after logic): cset cannot
+                 * encode AL/NV, and b.cond treats both as always */
+                a64_mov_imm64(b, JTF, dc == A64_AL ? 1 : 0);
+                a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+                return;
+            }
+            if (dc >= 0) {
+                if (want_direct) { g_cc_direct = dc; return; }
+                a64_cset(b, JTF, dc);
+                a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+                return;
+            }
+        }
     }
     /* value-based condition: E/NE/S/NS straight from the producer's result
      * register (still intact): cmp #0 gives Z and N */
@@ -3489,9 +3668,13 @@ static int emit_setcc(A64Buf *b, const X86Insn *insn)
         return 0;
     if (g_pin_class == 2 && d->reg == OCERZ_RSP)
         return 0;
-    emit_cc_predicate(b, insn->cc);
-    a64_cset(b, JT2, A64_NE);
+    emit_cc_predicate_ex(b, insn->cc, 1);
+    a64_cset(b, JT2, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
     /* write low byte only, preserving the rest of the register */
+    if (pin_slot(d->reg) >= 0) {
+        a64_bfi(b, 1, pin_hreg(pin_slot(d->reg)), JT2, 0, 8);
+        return 1;
+    }
     emit_gpr_rd(b, 1, JT0, d->reg);
     a64_bfi(b, 1, JT0, JT2, 0, 8);
     emit_gpr_wr(b, JT0, d->reg);
@@ -7168,6 +7351,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_n_raslit = 0;
     g_chain_epi = NULL;
     g_n_jcc_edges = 0;
+    g_nzcv_want = 0; g_nzcv_from = -1;
     g_jcc_edge[0].cond_site = NULL; g_jcc_edge[1].cond_site = NULL;
     g_n_oslow = 0;
     g_n_nanool = 0;
@@ -7489,6 +7673,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 ((sse_enabled() && comis_fuse_producer(blk->insns, i) >= 0) ||
                  (g_defer && !g_no_regflags && value_cond_fuse_producer(blk->insns, i) >= 0)))
                 use = 0;
+            if ((blk->insns[i].op == OCERZ_OP_SETCC || blk->insns[i].op == OCERZ_OP_CMOVCC ||
+                 blk->insns[i].op == OCERZ_OP_ADC || blk->insns[i].op == OCERZ_OP_SBB) &&
+                nzcv_fuse_producer(blk->insns, i) >= 0)
+                use &= ~(uint64_t)JIT_ARITH_FLAGS;   /* adc/sbb still: CF from NZCV, no record */
             fl_need[i] = def & live_seam;
             live_seam = (live_seam & ~def) | use;
             live_all = (live_all & ~def) | use;
@@ -7537,6 +7725,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         g_cur_insn_idx = i;
         g_cur_need = fl_need[i];
         g_cur_insns = blk->insns;
+        g_nzcv_want = (i + 1 < n && nzcv_fuse_producer(blk->insns, i + 1) == i);
         /* FP batch boundaries: close an open batch before the first non-member,
          * open one (checkpoint) at its first member */
         if (fpb_open >= 0 && (fpb_of[i] != fpb_open)) {
@@ -7606,7 +7795,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 continue;
             }
         }
-        if (i + 1 < n) {
+        if (i + 1 < n && !(i + 2 < n && nzcv_fuse_producer(blk->insns, i + 2) == i + 1)) {
             uint32_t *logic_label = NULL;
             if (emit_mov_logic_pair(&b, insn, &blk->insns[i + 1],
                                     fl_need[i + 1], &logic_label)) {
