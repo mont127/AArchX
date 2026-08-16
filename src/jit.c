@@ -102,7 +102,7 @@ typedef struct JitBlock {
         uint32_t cond_orig;
         uint8_t kind;
         uint8_t pin_class;
-    } edges[2];
+    } edges[8];                 /* terminator edges (<= 2) + forward-jcc side exits */
     uint8_t n_edges;
 
     uint16_t entry_live;
@@ -181,6 +181,9 @@ static unsigned long long g_callout_seq;   /* bumped by every C callout emitter 
 static int l0_src(unsigned r, int dbl);
 static void l0_share(unsigned dst, unsigned src);
 static void l0_inval(unsigned r);
+static int g_xlat_n;             /* instruction count of the block being translated */
+static int g_jcc_side_mode;      /* emit_cmp_test_jcc: jcc is a superblock side exit (fall-through continues inline) */
+static uint64_t g_jcc_side_need; /* producer's fl_need in side mode (flags live on the fall-through path) */
 static int g_nzcv_want;          /* emitting the producer of an NZCV-forwarded pair */
 static int g_nzcv_from = -1;     /* insn index that left NZCV = its result flags */
 static unsigned g_nzcv_kind;     /* OCERZ_CC_SUB / ADD / LOGIC */
@@ -260,6 +263,18 @@ static uint64_t g_self_rip;
 static uint32_t *g_body_entry;
 static uint32_t *g_loop_entry;
 static uint32_t *g_stop_patch;
+/* Superblocks: a block may run past a FORWARD conditional branch (the
+ * fall-through continues inline); the taken side becomes an out-of-line chain
+ * stub recorded here and emitted after the body. */
+#define SIDE_MAX 6
+static struct { uint32_t *site; uint64_t taken; int idx; uint32_t *stub; uint32_t *patch_b; } g_side[SIDE_MAX];
+static int g_n_side;
+static int superblock_enabled(void)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("OCERZ_NO_SUPERBLOCK") ? 0 : 1;
+    return en;
+}
 static uint32_t g_push_fix[JIT_MAX_BLOCK_INSNS];   /* offsets relative to the block entry */
 static int g_n_push_fix;
 static const uint32_t *g_push_entry;                /* block entry for offset computation */
@@ -3131,6 +3146,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     unsigned cc;
     if (c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC) cc = c->cc;
     else if (c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) cc = OCERZ_CC_B;
+    else if (c->op == OCERZ_OP_JCC && ci < g_xlat_n - 1) cc = c->cc;   /* superblock side exit */
     else return -1;
     const X86Insn *p = &insns[ci - 1];
     unsigned kind;
@@ -5229,6 +5245,20 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
     return s->kind == OCERZ_OPK_IMM || s_mem;
 }
 
+/* Superblock side exit fused with its adjacent cmp/test producer (index i is
+ * the producer; i+1 the jcc, which must not be the block's last instruction). */
+static int side_fuse_ok(const X86Insn *insns, int i, int n)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_SIDEFUSE") ? 1 : 0;
+    if (dis || i + 1 >= n - 1) return 0;
+    const X86Insn *p = &insns[i], *j = &insns[i + 1];
+    if (j->op != OCERZ_OP_JCC || (p->op != OCERZ_OP_CMP && p->op != OCERZ_OP_TEST)) return 0;
+    if (!g_defer || j->ops[0].kind != OCERZ_OPK_IMM || j->ops[0].imm == g_self_rip) return 0;
+    if (!can_fuse_cmp_test_jcc(p, j, g_self_rip)) return 0;
+    if (p->addrsize != 8) return 0;      /* emit_mem_ea refuses 32-bit addressing */
+    return 1;
+}
 /* Registers written by a simple instruction (for gap-fusion legality). */
 static int insn_writes_reg(const X86Insn *in, unsigned reg)
 {
@@ -5516,6 +5546,43 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     }
     *jcc_label = a64_label(b);
     int taken_cond = fused_jcc_cond(producer, jcc);
+
+    if (g_jcc_side_mode && !self_loop) {
+        /* superblock side exit: the record (if anything may read the flags on
+         * either path) goes inline before the branch; the taken side is an
+         * out-of-line chain stub registered in g_side; fall-through continues */
+        int need_rec = g_jcc_side_need != 0 || g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0;
+        if (need_rec) {
+            if (producer->op == OCERZ_OP_CMP) {
+                if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
+                emit_defer_flags(b, ccop, record_src, record_dst);
+            } else {
+                if (test_bit >= 0) {
+                    /* the LOGIC result is not materialized on the tbz path: compute it */
+                    a64_mov_imm64(b, JT2, test_mask);
+                    a64_and_reg(b, 1, JT2, test_rn, JT2, 0);
+                }
+                emit_defer_flags(b, ccop, JT2, JT2);
+            }
+        }
+        if (g_n_side >= SIDE_MAX) return 0;   /* cannot happen: the caller checked */
+        g_side[g_n_side].site = a64_label(b);
+        g_side[g_n_side].taken = taken;
+        g_side[g_n_side].idx = -1;
+        g_side[g_n_side].stub = NULL;
+        g_side[g_n_side].patch_b = NULL;
+        g_n_side++;
+        if (test_bit >= 0) {
+            if (jcc->cc == OCERZ_CC_E) a64_tbz(b, test_rn, test_bit, 0);
+            else                       a64_tbnz(b, test_rn, test_bit, 0);
+        } else if (cbz_rn >= 0) {
+            if (jcc->cc == OCERZ_CC_E) a64_cbz(b, cbz_sf, cbz_rn, 0);
+            else                       a64_cbnz(b, cbz_sf, cbz_rn, 0);
+        } else {
+            a64_bcond(b, taken_cond, 0);
+        }
+        return 1;
+    }
 
     if (!self_loop) {
         int poll_fall = fall <= g_self_rip;
@@ -7864,6 +7931,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     uint64_t pc = rip;
     {
         volatile int vn = 0;
+        volatile int vext = 0;
         volatile uint64_t vpc = rip;
         sigjmp_buf db;
         sigjmp_buf *prev_dr = ocerz_jit_decode_recover;
@@ -7877,8 +7945,19 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 unsigned op = scratch[vn].op;
                 uint8_t len = scratch[vn].len;
                 vn++;
-                if (is_terminator(op))
+                if (is_terminator(op)) {
+                    /* superblock: continue past a forward jcc (taken side exits
+                     * out of line), up to SIDE_MAX times per block */
+                    if (op == OCERZ_OP_JCC && superblock_enabled() && !g_no_chain &&
+                        vext < SIDE_MAX && vn < JIT_MAX_BLOCK_INSNS - 1 &&
+                        scratch[vn - 1].ops[0].kind == OCERZ_OPK_IMM &&
+                        scratch[vn - 1].ops[0].imm > vpc + len) {
+                        vext++;
+                        vpc += len;
+                        continue;
+                    }
                     break;
+                }
                 vpc += len;
             }
         }
@@ -7886,6 +7965,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         n = vn;
         pc = vpc;
     }
+    g_xlat_n = n;
     if (ocerz_jitstat > 0)
         js_decoded_insns += (unsigned)n;
     if (n == 0) {
@@ -7936,6 +8016,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_n_stop_extra = 0;
     g_n_push_fix = 0;
     g_push_entry = NULL;
+    g_n_side = 0;
     g_stop_target = NULL;
     g_mem_hoist_greg = -1;
     g_mem_hoist_greg2 = -1;
@@ -8247,6 +8328,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         uint64_t live_all = OCERZ_FL_ALL;
         for (int i = n - 1; i >= 0; i--) {
             uint64_t def, use;
+            if (i < n - 1 && blk->insns[i].op == OCERZ_OP_JCC) {
+                /* side exit: flags live at its taken target must be recorded too */
+                uint64_t tl = (g_no_xlive || blk->insns[i].ops[0].kind != OCERZ_OPK_IMM)
+                              ? OCERZ_FL_ALL : xlive_succ_live(jit, blk->insns[i].ops[0].imm);
+                live_seam |= tl;
+                live_all |= tl;
+            }
+            int side_fused = i < n - 1 && i >= 1 && blk->insns[i].op == OCERZ_OP_JCC &&
+                             side_fuse_ok(blk->insns, i - 1, n);
             if (blk->fault_flags && blk->fault_flags[i].kind != JFF_NONE)
                 ocerz_flags_defuse_nofault(&blk->insns[i], &def, &use);
             else
@@ -8260,9 +8350,12 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                  (g_defer && !g_no_regflags && value_cond_fuse_producer(blk->insns, i) >= 0)))
                 use = 0;
             if ((blk->insns[i].op == OCERZ_OP_SETCC || blk->insns[i].op == OCERZ_OP_CMOVCC ||
-                 blk->insns[i].op == OCERZ_OP_ADC || blk->insns[i].op == OCERZ_OP_SBB) &&
+                 blk->insns[i].op == OCERZ_OP_ADC || blk->insns[i].op == OCERZ_OP_SBB ||
+                 blk->insns[i].op == OCERZ_OP_JCC) &&
                 nzcv_fuse_producer(blk->insns, i) >= 0)
-                use &= ~(uint64_t)JIT_ARITH_FLAGS;   /* adc/sbb still: CF from NZCV, no record */
+                use &= ~(uint64_t)JIT_ARITH_FLAGS;   /* consumer reads NZCV, no record needed */
+            if (side_fused)
+                use = 0;                          /* the fused side exit reads NZCV, not the record */
             fl_need[i] = def & live_seam;
             live_seam = (live_seam & ~def) | use;
             live_all = (live_all & ~def) | use;
@@ -8360,6 +8453,43 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             ocerz_flags_defuse(insn, &pdef, &puse);
             if (pdef & JIT_ARITH_FLAGS)
                 last_flag_def = i;
+        }
+        /* superblock side exit fused with its cmp/test producer */
+        if (g_n_side < SIDE_MAX && side_fuse_ok(blk->insns, i, n)) {
+            uint32_t *jcc_label = NULL;
+            if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
+            g_jcc_side_mode = 1;
+            g_jcc_side_need = fl_need[i];
+            int fused = emit_cmp_test_jcc(&b, insn, &blk->insns[i + 1], epi_sites, &n_epi,
+                                          &jcc_label, exit_sites, &n_exits, NULL, NULL);
+            g_jcc_side_mode = 0;
+            if (fused) {
+                if (blk->insn_off) blk->insn_off[i + 1] = (uint32_t)(jcc_label - entry);
+                blk->n_inlined += 2;
+                i++;
+                continue;
+            }
+        }
+        /* superblock side exit: forward jcc in the middle of the block */
+        if (i < n - 1 && insn->op == OCERZ_OP_JCC) {
+            if (fpb_open >= 0) { fpb_emit_check(&b, &g_fpb[fpb_open]); fpb_open = -1; g_fpb_fast = 0; l0_reset(); }
+            if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
+            emit_cc_predicate_ex(&b, insn->cc, 1);
+            int cond = g_cc_direct >= 0 ? g_cc_direct : A64_NE;
+            if (g_n_side < SIDE_MAX) {
+                g_side[g_n_side].site = a64_label(&b);
+                g_side[g_n_side].taken = insn->ops[0].imm;
+                g_side[g_n_side].idx = i;
+                g_side[g_n_side].stub = NULL;
+                g_side[g_n_side].patch_b = NULL;
+                a64_bcond(&b, cond, 0);                    /* patched to the OOL stub */
+                g_n_side++;
+            } else {
+                assert(0 && "side exit table full");
+            }
+            blk->n_inlined++;
+            uint64_t pdef, puse; ocerz_flags_defuse(insn, &pdef, &puse); (void)pdef; (void)puse;
+            continue;
         }
         if (blk->insn_off)
             blk->insn_off[i] = (uint32_t)(b.p - entry);
@@ -8530,6 +8660,18 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         a64_ldp_post(&b, 19, 20, 31, 16);
         a64_ldp_post(&b, 29, 30, 31, 16);
         a64_ret(&b);
+    }
+    /* superblock side exits: out-of-line chain stubs for the taken targets */
+    for (int k = 0; k < g_n_side; k++) {
+        uint32_t *stub = a64_label(&b);
+        uint32_t w = *g_side[k].site;
+        if ((w & 0x7e000000u) == 0x36000000u) a64_patch_tbz(g_side[k].site, stub);        /* tbz/tbnz */
+        else if ((w & 0x7e000000u) == 0x34000000u) a64_patch_cbz(g_side[k].site, stub);   /* cbz/cbnz */
+        else a64_patch_bcond(g_side[k].site, stub);
+        int edge_class = body_edge_pin_class();
+        int body_edge = edge_class >= 0;
+        g_side[k].stub = stub;
+        g_side[k].patch_b = emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);
     }
     /* FP batch replays: restore checkpoints, re-run the members exactly, return */
     for (int k = 0; k < g_n_fpb; k++) {
@@ -8722,6 +8864,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             blk->edges[i].pin_class = g_jcc_edge[i].pin_class;
         }
         blk->n_edges = (uint8_t)g_n_jcc_edges;
+    }
+    for (int k = 0; k < g_n_side && blk->n_edges < 8; k++) {
+        if (!g_side[k].patch_b) continue;
+        int e = blk->n_edges++;
+        blk->edges[e].target_rip = g_side[k].taken;
+        blk->edges[e].patch_b = g_side[k].patch_b;
+        blk->edges[e].cond_site = g_side[k].site;
+        blk->edges[e].kind = body_edge_pin_class() >= 0 ? EDGE_BODY : EDGE_XBLOCK;
+        blk->edges[e].pin_class = body_edge_pin_class() >= 0 ? (uint8_t)body_edge_pin_class() : 0;
     }
     for (int i = 0; i < blk->n_edges; i++) {
         blk->edges[i].fallback_insn = *blk->edges[i].patch_b;
