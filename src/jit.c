@@ -6149,9 +6149,19 @@ static int callret_inline_enabled(void)
 /* Host entry to record for a return target: under full pinning the caller
  * and callee share the register layout, so return straight into the BODY
  * (tag bit 0 set) and skip the frame traffic; otherwise the function entry. */
+/* Under full pinning every compiled block shares the layout, so RAS entries
+ * are plain body pointers (or NULL) and RET branches without a tag check. */
+static int ras_body_only(void)
+{
+    static int on = -1;
+    if (on < 0) on = (fullpin_enabled() && !g_no_regflags) ? 1 : 0;
+    return on;
+}
 static void *ras_entry_for(const JitBlock *blk)
 {
     if (!blk || !blk->code) return NULL;
+    if (ras_body_only())
+        return (blk->pin_class == 3 && blk->body_code) ? (void *)blk->body_code : NULL;
     if (blk->pin_class == 3 && blk->body_code)
         return (void *)((uintptr_t)blk->body_code | 1u);
     return (void *)blk->code;
@@ -6412,7 +6422,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
             a64_add_imm(b, 1, hs, hs, 8);
-            a64_str(b, 8, JT1, 20, RIP_OFF);
+            if (!ras_body_only()) a64_str(b, 8, JT1, 20, RIP_OFF);   /* else: stored on the miss paths */
         } else {
             emit_gpr_rd(b, 1, JT0, OCERZ_RSP);
             a64_mov_reg(b, 1, JTA, JT0);
@@ -6445,7 +6455,14 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
 
             uint32_t *not_body = NULL;
-            if (g_pin_class == 3) {
+            if (g_pin_class == 3 && fast3 && ras_body_only()) {
+                /* entries are body pointers: branch straight in */
+                if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
+                a64_br(b, JT0);
+                /* the full-leave path below is unreachable but keeps the
+                 * generic epilogue shape; RIP for the miss paths */
+                not_body = NULL;
+            } else if (g_pin_class == 3) {
                 /* tagged entry = callee body with our own register layout */
                 not_body = a64_label(b); a64_tbz(b, JT0, 0, 0);
                 if (!a64_try_and_imm(b, 1, JT0, JT0, ~1ull)) { a64_mov_imm64(b, JTU, 1); a64_bic_reg(b, 1, JT0, JT0, JTU, 0); }
@@ -6469,12 +6486,16 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
             uint32_t *miss_pop = a64_label(b);
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
+            if (fast3 && ras_body_only()) a64_str(b, 8, JT1, 20, RIP_OFF);
             if (ocerz_perfstat > 0) {   /* count stale (popped) misses */
                 a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_stale);
                 a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
             }
+            uint32_t *skip_rip = NULL;
+            if (fast3 && ras_body_only()) { skip_rip = a64_label(b); a64_b(b, 0); }   /* miss_pop already stored RIP */
             uint32_t *miss = a64_label(b);
             a64_patch_cbz(ras_empty, miss);
+            if (fast3 && ras_body_only()) { a64_str(b, 8, JT1, 20, RIP_OFF); a64_patch_b(skip_rip, a64_label(b)); }
             if (ocerz_perfstat > 0) {   /* count all misses */
                 a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_miss);
                 a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
