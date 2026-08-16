@@ -864,13 +864,39 @@ static uint64_t find_dylib_init(OcerzCache *cache, const char *substr)
     return 0;
 }
 
-static uint64_t dep_find(OcerzCache *cache, const char *path)
+/* image path -> mach header: hash table built once over the cache's image
+ * table (thousands of images, looked up for every dependency of every image) */
+#define DEPMAP_BITS 13
+static struct { const char *path; uint64_t mh; } g_depmap[1u << DEPMAP_BITS];
+static int g_depmap_built;
+static uint32_t depmap_hash(const char *s)
+{
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
+static void depmap_build(OcerzCache *cache)
 {
     for (uint32_t i = 0; i < cache->images_cnt; i++) {
         const char *p = NULL;
         uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
-        if (mh && p && strcmp(p, path) == 0)
-            return mh;
+        if (!mh || !p) continue;
+        uint32_t h = depmap_hash(p) & ((1u << DEPMAP_BITS) - 1);
+        while (g_depmap[h].path) {
+            if (strcmp(g_depmap[h].path, p) == 0) break;      /* first wins, like the linear scan */
+            h = (h + 1) & ((1u << DEPMAP_BITS) - 1);
+        }
+        if (!g_depmap[h].path) { g_depmap[h].path = p; g_depmap[h].mh = mh; }
+    }
+    g_depmap_built = 1;
+}
+static uint64_t dep_find(OcerzCache *cache, const char *path)
+{
+    if (!g_depmap_built) depmap_build(cache);
+    uint32_t h = depmap_hash(path) & ((1u << DEPMAP_BITS) - 1);
+    for (unsigned n = 0; n < (1u << DEPMAP_BITS) && g_depmap[h].path; n++) {
+        if (strcmp(g_depmap[h].path, path) == 0) return g_depmap[h].mh;
+        h = (h + 1) & ((1u << DEPMAP_BITS) - 1);
     }
     return 0;
 }
