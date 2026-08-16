@@ -69,17 +69,27 @@ static void ocerz_cpu_unregister(OcerzCPU *cpu)
     pthread_mutex_unlock(&g_cpus_lock);
 }
 
+/* The JIT's RAS is a ring (index = top & (SIZE-1)): stale entries below the
+ * top must not survive an invalidation, so purge clears the entries too. */
+static void ras_clear(OcerzCPU *cpu)
+{
+    for (int i = 0; i < OCERZ_RAS_SIZE; i++) {
+        __atomic_store_n(&cpu->ras[i].host_entry, (void *)NULL, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu->ras[i].guest_rip, (uint64_t)0, __ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&cpu->ras_top, 0, __ATOMIC_RELEASE);
+}
 void ocerz_vm_purge_jit_ras(OcerzVM *vm)
 {
     if (!vm)
         return;
-    __atomic_store_n(&vm->cpu.ras_top, 0, __ATOMIC_RELEASE);
+    ras_clear(&vm->cpu);
     if (g_cur_cpu && g_cur_cpu->vm == vm)
-        __atomic_store_n(&g_cur_cpu->ras_top, 0, __ATOMIC_RELEASE);
+        ras_clear(g_cur_cpu);
     pthread_mutex_lock(&g_cpus_lock);
     for (int i = 0; i < g_cpus_n; i++)
         if (g_cpus[i] && g_cpus[i]->vm == vm)
-            __atomic_store_n(&g_cpus[i]->ras_top, 0, __ATOMIC_RELEASE);
+            ras_clear(g_cpus[i]);
     pthread_mutex_unlock(&g_cpus_lock);
 }
 

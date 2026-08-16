@@ -723,6 +723,7 @@ static int ocerz_spawn_worker(OcerzVM *vm, const OcerzCPU *tmpl)
     w->counts_wq = 1;
 
     w->cpu.ras_top = 0;
+    memset(w->cpu.ras, 0, sizeof w->cpu.ras);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 16ull * 1024 * 1024);
@@ -2150,6 +2151,7 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     w->vm = vm;
     w->cpu = *cpu;
     w->cpu.ras_top = 0;
+    memset(w->cpu.ras, 0, sizeof w->cpu.ras);
     w->cpu.terminated = 0;
     w->cpu.cpu_number = ocerz_next_cpu_number();
     w->cpu.rip = pthread_start;

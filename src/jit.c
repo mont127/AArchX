@@ -633,6 +633,10 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 #define RAS_OFF ((uint32_t)offsetof(OcerzCPU, ras))
 
 enum { JT0 = 9, JT1 = 10, JT2 = 11, JTF = 12, JTT = 13, JTU = 14, JTA = 15 };
+static void a64_and_imm_or_mov(A64Buf *b, int sf, int rd, int rn, uint64_t imm)
+{
+    if (!a64_try_and_imm(b, sf, rd, rn, imm)) { a64_mov_imm64(b, JTT, imm); a64_and_reg(b, sf, rd, rn, JTT, 0); }
+}
 
 #define JRET_GUEST 27
 #define JRET_HOST  28
@@ -6395,6 +6399,13 @@ static void *ras_entry_for(const JitBlock *blk)
 void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
 {
     uint32_t t = cpu->ras_top;
+    if (ras_body_only()) {                 /* ring semantics */
+        JitBlock *blk = cache_lookup(vm->jit, retaddr);
+        cpu->ras[t & (OCERZ_RAS_SIZE - 1)].guest_rip = retaddr;
+        cpu->ras[t & (OCERZ_RAS_SIZE - 1)].host_entry = ras_entry_for(blk);
+        cpu->ras_top = t + 1;
+        return;
+    }
     if (t >= OCERZ_RAS_SIZE)
         return;
     JitBlock *blk = cache_lookup(vm->jit, retaddr);
@@ -6575,18 +6586,16 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             a64_sub_imm(b, 1, JTA, hs, 8);
             a64_str_regoff(b, 8, JT1, JGB, JTA, 0);
             a64_mov_reg(b, 1, hs, JTA);
+            /* RAS is a ring: monotonic top, index = top & (SIZE-1) */
             a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
-            a64_subs_imm(b, 0, A64_ZR, JT2, OCERZ_RAS_SIZE);
-            uint32_t *full = a64_label(b);
-            a64_bcond(b, A64_CS, 0);
             uint32_t *adr_site = a64_label(b);
             a64_emit32(b, 0x10000000u | (uint32_t)JT0);          /* adr JT0, cont (patched) */
-            a64_add_reg(b, 1, JTA, 20, JT2, 4);
+            a64_and_imm_or_mov(b, 0, JTF, JT2, OCERZ_RAS_SIZE - 1);
+            a64_add_reg(b, 1, JTA, 20, JTF, 4);
             if (RAS_OFF <= 504) a64_stp_off(b, JT1, JT0, JTA, RAS_OFF);
             else { a64_str(b, 8, JT1, JTA, RAS_OFF); a64_str(b, 8, JT0, JTA, RAS_OFF + 8); }
             a64_add_imm(b, 0, JT2, JT2, 1);
             a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
-            a64_patch_bcond(full, a64_label(b));
             /* bl into the callee body (chained).  The continuation must be the
              * word right after the bl so the hardware return stack matches
              * the RAS entry; the not-yet-chained fallback goes out of line. */
@@ -6719,13 +6728,20 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         }
 
         if (!g_no_ras) {
-            uint32_t *ras_empty;
+            uint32_t *ras_empty = NULL;
             uint32_t *ras_stale[3];
             int nst = 0;
             a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
-            ras_empty = a64_label(b); a64_cbz(b, 0, JT2, 0);
-            a64_sub_imm(b, 0, JT2, JT2, 1);
-            a64_add_reg(b, 1, JTA, 20, JT2, 4);
+            if (fast3 && ras_body_only()) {
+                /* ring: top-1 & (SIZE-1); an unpushed slot holds {0, NULL} and misses */
+                a64_sub_imm(b, 0, JT2, JT2, 1);
+                a64_and_imm_or_mov(b, 0, JTU, JT2, OCERZ_RAS_SIZE - 1);
+                a64_add_reg(b, 1, JTA, 20, JTU, 4);
+            } else {
+                ras_empty = a64_label(b); a64_cbz(b, 0, JT2, 0);
+                a64_sub_imm(b, 0, JT2, JT2, 1);
+                a64_add_reg(b, 1, JTA, 20, JT2, 4);
+            }
             static int no_blret_r = -1;
             if (no_blret_r < 0) no_blret_r = getenv("OCERZ_NO_BLRET") ? 1 : 0;
             int use_ret = g_pin_class == 3 && fast3 && ras_body_only() && !no_blret_r;
@@ -6780,7 +6796,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             uint32_t *skip_rip = NULL;
             if (fast3 && ras_body_only()) { skip_rip = a64_label(b); a64_b(b, 0); }   /* miss_pop already stored RIP */
             uint32_t *miss = a64_label(b);
-            a64_patch_cbz(ras_empty, miss);
+            if (ras_empty) a64_patch_cbz(ras_empty, miss);
             if (fast3 && ras_body_only()) { a64_str(b, 8, JT1, 20, RIP_OFF); a64_patch_b(skip_rip, a64_label(b)); }
             if (ocerz_perfstat > 0) {   /* count all misses */
                 a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_miss);
@@ -7103,19 +7119,16 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
             a64_sub_imm(b, 1, JTA, hs, 8);
             a64_str_regoff(b, 8, JT2, JGB, JTA, 0);
             a64_mov_reg(b, 1, hs, JTA);
-            /* RAS push: {retaddr, &cont} */
+            /* RAS push: {retaddr, &cont} (ring: monotonic top, index top & (SIZE-1)) */
             a64_ldr(b, 4, JTF, 20, RAS_TOP_OFF);
-            a64_subs_imm(b, 0, A64_ZR, JTF, OCERZ_RAS_SIZE);
-            uint32_t *full = a64_label(b);
-            a64_bcond(b, A64_CS, 0);
             uint32_t *adr_site = a64_label(b);
             a64_emit32(b, 0x10000000u | (uint32_t)JT0);          /* adr JT0, cont */
-            a64_add_reg(b, 1, JTA, 20, JTF, 4);
+            a64_and_imm_or_mov(b, 0, JTU, JTF, OCERZ_RAS_SIZE - 1);
+            a64_add_reg(b, 1, JTA, 20, JTU, 4);
             if (RAS_OFF <= 504) a64_stp_off(b, JT2, JT0, JTA, RAS_OFF);
             else { a64_str(b, 8, JT2, JTA, RAS_OFF); a64_str(b, 8, JT0, JTA, RAS_OFF + 8); }
             a64_add_imm(b, 0, JTF, JTF, 1);
             a64_str(b, 4, JTF, 20, RAS_TOP_OFF);
-            a64_patch_bcond(full, a64_label(b));
             /* dispatch through the site cache / hash with a shared blr site */
             uint32_t *cont = NULL;
             g_ind_call_cont = &cont;
