@@ -194,6 +194,7 @@ void a64_v_not(A64Buf *b, int vd, int vn);
 void a64_fcsel(A64Buf *b, int dbl, int vd, int vn, int vm, int cond);
 void a64_v_xtn(A64Buf *b, int esz, int vd, int vn);
 void a64_cmn_imm(A64Buf *b, int sf, int rn, int imm12);
+void a64_subs_imm_sh12(A64Buf *b, int sf, int rd, int rn, uint32_t imm12);
 void a64_cmp_ext_sxtw(A64Buf *b, int rn, int rm);
 
 #endif
