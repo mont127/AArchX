@@ -122,7 +122,8 @@ Four kernels are faster than Rosetta 2, five more are within 10%, and the rest a
 the difference so far: full guest-register pinning with body-to-body block chaining, lazy
 flags with static producer/consumer fusion (`cmp`/`test`/shift results feed `jcc`,
 `setcc`, `cmov`, `adc` straight from NZCV), per-site caches for indirect branches, direct
-`[guest_base, rsp]` addressing for push/pop/call/ret, and FP "batches": runs of SSE
+`[guest_base, rsp]` addressing for push/pop/call/ret with the host `bl`/`ret` protocol,
+patch-and-signal stop requests instead of interrupt polls in loops, and FP "batches": runs of SSE
 arithmetic execute in place at native speed with one NaN check per run, replaying exactly
 from a checkpoint only when a NaN shows up (x86 NaN semantics are still bit-exact, checked
 by a 2,859-case golden test against Rosetta). Where Rosetta still wins it has hardware
