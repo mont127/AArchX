@@ -3974,6 +3974,38 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     return 0;
 }
 
+/* ---- movlps/movlpd (low 64) and movhps/movhpd (high 64) with memory; movlhps/movhlps ---- */
+static int emit_sse_movlh(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    int hi = insn->op == OCERZ_OP_MOVHPS;
+    if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_MEM) {
+        if (!xmm_is_pinned(d->reg)) return 0;
+        uint32_t *skip;
+        l0_inval(d->reg);
+        if (!emit_sse_mem_addr(b, insn, s, 8, exit_sites, n_exits, &skip)) return 0;
+        emit_sse_mem_ld(b, 8, VX0);
+        patch_guard_skip(skip, a64_label(b));
+        a64_ins_d_d(b, xmm_vreg(d->reg), hi ? 1 : 0, VX0, 0);
+        return 1;
+    }
+    if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_XMM) {
+        int vs;
+        if (!hi) vs = xmm_is_pinned(s->reg) ? l0_src(s->reg, 1) : VX0;
+        else vs = VX0;
+        if (vs == VX0) {
+            if (xmm_is_pinned(s->reg)) a64_ins_d_d(b, VX0, 0, xmm_vreg(s->reg), hi ? 1 : 0);
+            else { emit_xmm_ld(b, VX0, s->reg); if (hi) a64_ins_d_d(b, VX0, 0, VX0, 1); }
+        }
+        uint32_t *skip;
+        if (!emit_sse_mem_addr(b, insn, d, 8, exit_sites, n_exits, &skip)) return 0;
+        emit_sse_mem_st(b, 8, vs);
+        patch_guard_skip(skip, a64_label(b));
+        return 1;
+    }
+    return 0;
+}
+
 /* ---- movss / movsd (scalar moves; size 4 / 8) ---- */
 static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **exit_sites, int *n_exits)
 {
@@ -4847,6 +4879,8 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         return emit_sse_mov128(b, insn, exit_sites, n_exits);
     case OCERZ_OP_MOVSS:  return emit_sse_movs(b, insn, 4, exit_sites, n_exits);
     case OCERZ_OP_MOVSDX: return emit_sse_movs(b, insn, 8, exit_sites, n_exits);
+    case OCERZ_OP_MOVLPS: case OCERZ_OP_MOVHPS:
+        return emit_sse_movlh(b, insn, exit_sites, n_exits);
     case OCERZ_OP_ADDSS: case OCERZ_OP_ADDSD: case OCERZ_OP_ADDPS: case OCERZ_OP_ADDPD:
     case OCERZ_OP_SUBSS: case OCERZ_OP_SUBSD: case OCERZ_OP_SUBPS: case OCERZ_OP_SUBPD:
     case OCERZ_OP_MULSS: case OCERZ_OP_MULSD: case OCERZ_OP_MULPS: case OCERZ_OP_MULPD:
@@ -5003,6 +5037,7 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         return emit_bswap(b, insn);
     case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU:
     case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX:
+    case OCERZ_OP_MOVLPS: case OCERZ_OP_MOVHPS:
     case OCERZ_OP_ADDSS: case OCERZ_OP_ADDSD: case OCERZ_OP_ADDPS: case OCERZ_OP_ADDPD:
     case OCERZ_OP_SUBSS: case OCERZ_OP_SUBSD: case OCERZ_OP_SUBPS: case OCERZ_OP_SUBPD:
     case OCERZ_OP_MULSS: case OCERZ_OP_MULSD: case OCERZ_OP_MULPS: case OCERZ_OP_MULPD:
