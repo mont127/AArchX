@@ -1031,7 +1031,17 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
         int rd = pin_hreg(pin_slot(d->reg));
         int rm;
         uint64_t v = 0; int imm = s->kind == OCERZ_OPK_IMM;
-        if (imm) { v = s->imm; if (!sf) v &= 0xffffffffull; a64_mov_imm64(b, JT1, v); rm = JT1; }
+        if (imm) { v = s->imm; if (!sf) v &= 0xffffffffull; }
+        if (imm && (is_add || is_sub) && !need && v <= 4095) {
+            /* dead record: flag-setting immediate form */
+            int rdst = writes ? rd : A64_ZR;
+            if (is_add) a64_adds_imm(b, sf, rdst, rd, (uint32_t)v);
+            else        a64_subs_imm(b, sf, rdst, rd, (uint32_t)v);
+            g_nzcv_kind = is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB;
+            g_nzcv_from = g_cur_insn_idx;
+            return 1;
+        }
+        if (imm) { a64_mov_imm64(b, JT1, v); rm = JT1; }
         else rm = pin_hreg(pin_slot(s->reg));
         if (is_add || is_sub) {
             if (need) {
@@ -3445,7 +3455,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     unsigned cc;
     if (c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC) cc = c->cc;
     else if (c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) cc = OCERZ_CC_B;
-    else if (c->op == OCERZ_OP_JCC && ci < g_xlat_n - 1) cc = c->cc;   /* superblock side exit */
+    else if (c->op == OCERZ_OP_JCC) cc = c->cc;   /* superblock side exit or the terminator (sub/add/logic + jcc; cmp/test+jcc pairs fuse earlier) */
     else return -1;
     const X86Insn *p = &insns[ci - 1];
     unsigned kind;
@@ -6780,8 +6790,32 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
      * (no C call) or, failing that, materialize + RFLAGS. */
     int self_loop = !g_no_chain && g_loop_entry && taken == g_self_rip;
     int two_way = !self_loop && !g_no_chain && !g_no_jcclink;
-    emit_cc_predicate_ex(b, cc, two_way);
-    int direct = two_way ? g_cc_direct : -1;
+    emit_cc_predicate_ex(b, cc, two_way || self_loop);
+    int direct = (two_way || self_loop) ? g_cc_direct : -1;
+    if (self_loop && direct >= 0) {
+        /* direct condition on the back edge (patchable stop site); the exit
+         * chains to the fall-through block; a stop leaves with RIP = head */
+        g_stop_patch = a64_label(b);
+        a64_bcond(b, direct, (int32_t)(g_loop_entry - g_stop_patch));
+        int edge_class = body_edge_pin_class();
+        int body_edge = edge_class >= 0;
+        uint32_t *pb_fall = emit_static_chain_tail(
+            b, fall, fall <= g_self_rip, body_edge, epilogue_sites, n_epi);
+        g_jcc_edge[0].target_rip = fall;
+        g_jcc_edge[0].patch_b = pb_fall;
+        g_jcc_edge[0].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
+        g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
+        g_n_jcc_edges = 1;
+        g_stop_target = a64_label(b);
+        a64_mov_imm64(b, JT0, taken);
+        a64_str(b, 8, JT0, 20, RIP_OFF);
+        emit_materialize(b);
+        a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+        epilogue_sites[*n_epi] = a64_label(b);
+        a64_b(b, 0);
+        (*n_epi)++;
+        return 1;
+    }
     if (!two_way) {
         a64_mov_imm64(b, JT1, fall);
         a64_mov_imm64(b, JT2, taken);
