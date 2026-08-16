@@ -181,6 +181,9 @@ void a64_v_zip1(A64Buf *b, int esz, int vd, int vn, int vm);
 void a64_v_zip2(A64Buf *b, int esz, int vd, int vn, int vm);
 void a64_v_bsl(A64Buf *b, int vd, int vn, int vm);
 void a64_v_sshr_2d(A64Buf *b, int vd, int vn, int sh);
+void a64_v_tbl1(A64Buf *b, int vd, int vn, int vm);
+void a64_v_ext(A64Buf *b, int vd, int vn, int vm, int idx);
+void a64_v_rev64_4s(A64Buf *b, int vd, int vn);
 void a64_ldop_al(A64Buf *b, int size, int opc, int rs, int rt, int rn);   /* 0 add 1 clr 2 eor 3 set */
 void a64_swpal(A64Buf *b, int size, int rs, int rt, int rn);
 void a64_casal(A64Buf *b, int size, int rs, int rt, int rn);
