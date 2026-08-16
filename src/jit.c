@@ -265,6 +265,8 @@ static void stop_extra_add(uint32_t *site, uint32_t *target)
 static uint32_t *g_stop_target;
 static int g_mem_hoist_greg = -1;
 static int g_mem_hoist_aux_disp;
+static int g_mem_hoist_aux_index = -1;   /* aux kind 2: JMEMAUX = JMEMBASE + index << scale (recomputed at the loop head) */
+static int g_mem_hoist_aux_scale;
 #define JMEMBASE 17
 #define JMEMAUX 29
 #define JMEMBASE2 16          /* second hoisted base (x16 is only ever clobbered by callouts, which reload) */
@@ -1973,7 +1975,9 @@ static void emit_reload_mem_base(A64Buf *b)
         a64_mov_imm64(b, JMEMBASE, ocerz_guest_base);
         a64_add_reg(b, 1, JMEMBASE, JMEMBASE, pin_hreg(bs), 0);
     }
-    if (g_mem_hoist_aux_disp > 0)
+    if (g_mem_hoist_aux_index >= 0)
+        a64_add_reg(b, 1, JMEMAUX, JMEMBASE, pin_hreg(pin_slot(g_mem_hoist_aux_index)), g_mem_hoist_aux_scale);
+    else if (g_mem_hoist_aux_disp > 0)
         a64_add_imm(b, 1, JMEMAUX, JMEMBASE,
                     (uint32_t)g_mem_hoist_aux_disp);
     else if (g_mem_hoist_aux_disp < 0)
@@ -2018,7 +2022,16 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
         disp < -4095 || disp > 4095)
         return 0;
     int base = hbase;
-    if (disp != 0 && disp == g_mem_hoist_aux_disp && hbase == JMEMBASE) {
+    if (hbase == JMEMBASE && g_mem_hoist_aux_index >= 0 && mem->index == (unsigned)g_mem_hoist_aux_index &&
+        (mem->scale & 3) == g_mem_hoist_aux_scale) {
+        /* JMEMAUX = base + index<<scale: immediate offset only */
+        if (disp < 0 || (uint64_t)disp > (uint64_t)4095 * (uint64_t)size || (disp & (size - 1)) != 0)
+            return 0;
+        if (store) a64_str(b, size, value_reg, JMEMAUX, (uint32_t)disp);
+        else       a64_ldr(b, size, value_reg, JMEMAUX, (uint32_t)disp);
+        return 1;
+    }
+    if (disp != 0 && disp == g_mem_hoist_aux_disp && g_mem_hoist_aux_index < 0 && hbase == JMEMBASE) {
         base = JMEMAUX;
     } else if (disp != 0) {
         if (disp > 0)
@@ -2127,7 +2140,13 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         int hi = pin_hreg(pin_slot(m->index));
         int sc = m->scale & 3;
         int want = size == 16 ? 4 : size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
-        if ((m->disp == 0 || (hoisted && hreg == JMEMBASE && m->disp == g_mem_hoist_aux_disp && m->disp != 0)) &&
+        if (hoisted && hreg == JMEMBASE && g_mem_hoist_aux_index >= 0 && m->index == (unsigned)g_mem_hoist_aux_index &&
+            sc == g_mem_hoist_aux_scale && m->disp >= 0 && (m->disp % size) == 0 && m->disp / size <= 4095) {
+            if (vec) { if (store) a64_str_v(b, size, reg, JMEMAUX, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JMEMAUX, (uint32_t)m->disp); }
+            else     { if (store) a64_str(b, size, reg, JMEMAUX, (uint32_t)m->disp); else a64_ldr(b, size, reg, JMEMAUX, (uint32_t)m->disp); }
+            return 1;
+        }
+        if ((m->disp == 0 || (hoisted && hreg == JMEMBASE && g_mem_hoist_aux_index < 0 && m->disp == g_mem_hoist_aux_disp && m->disp != 0)) &&
             (sc == 0 || sc == want)) {
             /* register-offset form (scales by the access size only); the
              * hoisted aux base already includes the block's common displacement */
@@ -2186,6 +2205,15 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
     int fits = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
     int have = 0;
     int hreg = op->base != OCERZ_REG_NONE ? hoist_reg_for(op->base) : -1;
+    if (hreg == JMEMBASE && g_mem_hoist_aux_index >= 0 && op->index != OCERZ_REG_NONE &&
+        op->index == (unsigned)g_mem_hoist_aux_index && (op->scale & 3) == g_mem_hoist_aux_scale) {
+        if (fits) { *ra_out = JMEMAUX; *disp_out = (uint32_t)disp; return 1; }
+        if (disp > 0 && disp <= 4095)       a64_add_imm(b, 1, JTA, JMEMAUX, (uint32_t)disp);
+        else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, JMEMAUX, (uint32_t)-disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)disp); a64_add_reg(b, 1, JTA, JMEMAUX, JTU, 0); }
+        *ra_out = JTA; *disp_out = 0;
+        return 1;
+    }
     if (hreg >= 0) {
         /* JMEMBASE/JMEMBASE2 = guest_base + base for the whole block */
         if (op->index == OCERZ_REG_NONE) {
@@ -7552,6 +7580,7 @@ static int insn_may_write_gpr(const X86Insn *in, unsigned reg)
 static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
 {
     g_mem_hoist_aux_disp = 0;
+    g_mem_hoist_aux_index = -1;
     if (!g_plain_mem || g_no_chain || ocerz_commpage || ocerz_low_base ||
         !mem_native_store_ok() || n < 2)
         return -1;
@@ -7594,6 +7623,42 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
     if (best < 0) return -1;
     g_mem_hoist_aux_disp = aux[best];
     g_mem_hoist_greg2 = second;
+    g_mem_hoist_aux_index = -1;
+    /* index aux: if the hoisted base's accesses mostly share one (index, scale)
+     * pair that no instruction writes before their last use, keep
+     * base + index<<scale in JMEMAUX (recomputed at the loop head) */
+    {
+        int icnt[16][4] = {{0}};
+        int ilast[16][4] = {{0}};
+        int total = 0;
+        for (int i = 0; i < n; i++) {
+            const X86Insn *in = &insns[i];
+            if (in->seg != OCERZ_SEG_NONE || in->addrsize != 8) continue;
+            for (int k = 0; k < in->nops; k++) {
+                const X86Operand *mem = &in->ops[k];
+                if (mem->kind != OCERZ_OPK_MEM || mem->riprel || mem->base != (unsigned)best) continue;
+                total++;
+                if (mem->index == OCERZ_REG_NONE || pin_slot(mem->index) < 0) continue;
+                if (g_pin_class == 2 && mem->index == OCERZ_RSP) continue;
+                icnt[mem->index & 15][mem->scale & 3]++;
+                ilast[mem->index & 15][mem->scale & 3] = i;
+            }
+        }
+        int bi = -1, bs = 0, bc = 0;
+        for (int r = 0; r < 16; r++) for (int sc = 0; sc < 4; sc++)
+            if (icnt[r][sc] > bc) { bc = icnt[r][sc]; bi = r; bs = sc; }
+        if (bi >= 0 && bc >= 2 && bi != best) {
+            int written = 0;
+            for (int i = 0; i < ilast[bi][bs] && !written; i++)
+                written = insn_may_write_gpr(&insns[i], (unsigned)bi);
+            if (!written) {
+                g_mem_hoist_aux_index = bi;
+                g_mem_hoist_aux_scale = bs;
+                g_mem_hoist_aux_disp = 0;
+            }
+        }
+        (void)total;
+    }
     if (getenv("OCERZ_HOISTLOG"))
         fprintf(stderr, "HOIST rip=%#llx base=%d(n=%d) aux=%d second=%d(n=%d)\n", (unsigned long long)rip, best, bestn, aux[best], second, secondn);
     return best;
@@ -7830,6 +7895,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_stop_target = NULL;
     g_mem_hoist_greg = -1;
     g_mem_hoist_greg2 = -1;
+    g_mem_hoist_aux_index = -1;
     g_mem_hoist_aux_disp = 0;
     int fuse_cmp = n >= 2 &&
         can_fuse_cmp_test_jcc(&blk->insns[n - 2], &blk->insns[n - 1], rip);
@@ -8071,6 +8137,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
          * synchronization event, so the patched back-edge is seen).  The
          * 2-instruction poll is therefore off by default: OCERZ_LOOP_POLL=1
          * restores it. */
+        if (g_mem_hoist_greg >= 0 && g_mem_hoist_aux_index >= 0)   /* index aux: refresh every iteration */
+            a64_add_reg(&b, 1, JMEMAUX, JMEMBASE, pin_hreg(pin_slot(g_mem_hoist_aux_index)), g_mem_hoist_aux_scale);
         static int loop_poll = -1;
         if (loop_poll < 0) loop_poll = getenv("OCERZ_LOOP_POLL") ? 1 : 0;
         if (loop_poll) {
