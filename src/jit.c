@@ -188,6 +188,7 @@ static int g_xlat_n;             /* instruction count of the block being transla
 static int g_jcc_side_mode;      /* emit_cmp_test_jcc: jcc is a superblock side exit (fall-through continues inline) */
 static uint64_t g_jcc_side_need; /* producer's fl_need in side mode (flags live on the fall-through path) */
 static int g_nzcv_want;          /* emitting the producer of an NZCV-forwarded pair */
+#define NZCV_KIND_BT 0x7f        /* g_nzcv_kind for bt: Z <=> bit clear (B -> NE, AE -> EQ) */
 static int g_nzcv_from = -1;     /* insn index that left NZCV = its result flags */
 static unsigned g_nzcv_kind;     /* OCERZ_CC_SUB / ADD / LOGIC */
 
@@ -3467,6 +3468,18 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     else return -1;
     const X86Insn *p = &insns[ci - 1];
     unsigned kind;
+    if (p->op == OCERZ_OP_BT) {
+        /* bt: NZCV.Z <=> bit clear (tst); only CF conditions make sense */
+        if (cc != OCERZ_CC_B && cc != OCERZ_CC_AE) return -1;
+        if (p->nops != 2 || p->seg != OCERZ_SEG_NONE || p->addrsize != 8) return -1;
+        const X86Operand *bd = &p->ops[0], *bo = &p->ops[1];
+        if (bd->size != 2 && bd->size != 4 && bd->size != 8) return -1;
+        if (bd->kind == OCERZ_OPK_REG) { if (bd->high8 || pin_slot(bd->reg) < 0 || (g_pin_class == 2 && bd->reg == OCERZ_RSP)) return -1; }
+        else if (bd->kind != OCERZ_OPK_MEM) return -1;
+        if (bo->kind == OCERZ_OPK_REG) { if (bo->high8 || pin_slot(bo->reg) < 0 || (g_pin_class == 2 && bo->reg == OCERZ_RSP)) return -1; }
+        else if (bo->kind != OCERZ_OPK_IMM) return -1;
+        return ci - 1;
+    }
     switch (p->op) {
     case OCERZ_OP_CMP: case OCERZ_OP_SUB: kind = OCERZ_CC_SUB; if (cc_after_subs(cc) < 0) return -1; break;
     case OCERZ_OP_ADD:                    kind = OCERZ_CC_ADD; if (cc_after_adds(cc) < 0) return -1; break;
@@ -3543,7 +3556,9 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         unsigned want_cc = (c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) ? OCERZ_CC_B : c->cc;
         if (want_cc == cc) {
             int dc = g_nzcv_kind == OCERZ_CC_SUB ? cc_after_subs(cc) :
-                     g_nzcv_kind == OCERZ_CC_ADD ? cc_after_adds(cc) : cc_after_ands(cc);
+                     g_nzcv_kind == OCERZ_CC_ADD ? cc_after_adds(cc) :
+                     g_nzcv_kind == NZCV_KIND_BT ? (cc == OCERZ_CC_B ? A64_NE : cc == OCERZ_CC_AE ? A64_EQ : -1) :
+                     cc_after_ands(cc);
             if (dc == A64_AL || dc == A64_NV) {
                 /* constant condition (CF/OF are 0 after logic): cset cannot
                  * encode AL/NV, and b.cond treats both as always */
@@ -5448,6 +5463,69 @@ static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
     }
 }
 
+/* bt reg/mem, imm/reg: CF <- bit.  Adjacent CF consumers (jc/jnc, setc, adc,
+ * cmovc...) take the bit from NZCV (tst -> Z means clear); when CF must
+ * survive in RFLAGS the pending flags are materialized first and CF patched. */
+#define RFLAGS_OFF ((uint32_t)offsetof(OcerzCPU, rflags))
+static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exit_sites, int *n_exits)
+{
+    if (!g_defer || insn->nops != 2 || insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
+    const X86Operand *d = &insn->ops[0], *o = &insn->ops[1];
+    int size = d->size;
+    if (size != 2 && size != 4 && size != 8) return 0;
+    if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (g_pin_class == 2 && o->reg == OCERZ_RSP)) return 0; }
+    else if (o->kind != OCERZ_OPK_IMM) return 0;
+    int mat = need != 0 && !g_nzcv_want;         /* CF live beyond a forwarded consumer: patch RFLAGS */
+    if (need != 0 && g_nzcv_want) mat = 1;       /* both: RFLAGS must be right too */
+    if (mat) emit_materialize(b);               /* first: it may call C */
+    unsigned bits = (unsigned)size * 8;
+    if (d->kind == OCERZ_OPK_REG) {
+        if (d->high8 || pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+        int rd = pin_hreg(pin_slot(d->reg));
+        if (o->kind == OCERZ_OPK_IMM) {
+            unsigned n = (unsigned)o->imm & (bits - 1);
+            a64_ubfx(b, 1, JT0, rd, (int)n, 1);                 /* JT0 = bit */
+        } else {
+            a64_try_and_imm(b, 1, JT1, pin_hreg(pin_slot(o->reg)), bits - 1);
+            a64_lsrv(b, 1, JT0, rd, JT1);
+            a64_try_and_imm(b, 1, JT0, JT0, 1);
+        }
+    } else if (d->kind == OCERZ_OPK_MEM) {
+        /* byte-granular: address = base + (offset >> 3), bit = offset & 7 */
+        if (!emit_mem_ea(b, insn, d, JTA)) return 0;
+        (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        if (o->kind == OCERZ_OPK_IMM) {
+            unsigned n = (unsigned)o->imm & (bits - 1);
+            if (n >> 3) a64_add_imm(b, 1, JTA, JTA, n >> 3);
+            emit_guest_load_ordered(b, 1, JT0, JTA, JTU);
+            a64_ubfx(b, 1, JT0, JT0, (int)(n & 7), 1);
+        } else {
+            int ro = pin_hreg(pin_slot(o->reg));
+            int osf = o->size == 8;
+            if (o->size == 2) a64_sxth(b, 1, JT1, ro); else if (o->size == 4) a64_sxtw(b, JT1, ro); else a64_mov_reg(b, 1, JT1, ro);
+            (void)osf;
+            a64_asr_imm(b, 1, JT2, JT1, 3);
+            a64_add_reg(b, 1, JTA, JTA, JT2, 0);
+            emit_guest_load_ordered(b, 1, JT0, JTA, JTU);
+            a64_try_and_imm(b, 1, JT1, JT1, 7);
+            a64_lsrv(b, 1, JT0, JT0, JT1);
+            a64_try_and_imm(b, 1, JT0, JT0, 1);
+        }
+    } else return 0;
+    if (mat) {
+        a64_ldr(b, 8, JT1, 20, RFLAGS_OFF);
+        a64_bfi(b, 1, JT1, JT0, 0, 1);
+        a64_str(b, 8, JT1, 20, RFLAGS_OFF);
+    }
+    if (g_nzcv_want) {
+        a64_subs_imm(b, 1, A64_ZR, JT0, 0);       /* Z <=> bit clear */
+        g_nzcv_kind = NZCV_KIND_BT;
+        g_nzcv_from = g_cur_insn_idx;
+    }
+    return 1;
+}
+
 /* pmovmskb r32/r64, xmm: sign bits of the 16 bytes -> low 16 bits of the GPR */
 static int emit_pmovmskb(A64Buf *b, const X86Insn *insn)
 {
@@ -5847,6 +5925,8 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         return emit_bitscan(b, insn, need);
     case OCERZ_OP_PMOVMSKB:
         return emit_pmovmskb(b, insn);
+    case OCERZ_OP_BT:
+        return emit_bt(b, insn, need, exit_sites, n_exits);
     case OCERZ_OP_PUSH:
     case OCERZ_OP_POP:
         return emit_push_pop(b, insn, exit_sites, n_exits);
