@@ -208,7 +208,7 @@ static uint32_t *g_chain_epi;
 static int g_chain_keeps_jgb;      /* the CALL path branches to the chain tail with x0 = JGB intact */
 /* RAS slot literals: `ldr Xt, <lit>` sites whose 8-byte slot cell is placed in
  * a pool at the end of the block (patched + registered there) */
-typedef struct { uint32_t *site; uint64_t retaddr; int kind; int rt; } RasLit;   /* kind 0: RAS cell for retaddr; 1: constant (retaddr = value) */
+typedef struct { uint32_t *site; uint64_t retaddr; uint64_t hi; int kind; int rt; } RasLit;   /* kind 0: RAS cell for retaddr; 1: 8-byte constant (retaddr = value); 2: 16-byte constant {retaddr, hi} loaded into V rt */
 #define RASLIT_MAX 32
 static RasLit g_raslit[RASLIT_MAX];
 static int g_n_raslit;
@@ -5379,6 +5379,83 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     }
 }
 
+/* bsf/bsr/tzcnt/lzcnt/popcnt with dead result flags: rbit/clz/cnt sequences.
+ * (With live flags they keep going to the interpreter: bsf/bsr write ZF only
+ * and leave the rest, which needs materialized flags.) */
+static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    if (need != 0 || !g_defer || insn->nops != 2 || insn->seg != OCERZ_SEG_NONE) return 0;
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+    if (s->size != d->size) return 0;
+    int ds = pin_slot(d->reg);
+    if (ds < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+    int sf = d->size == 8;
+    int rs;
+    if (s->kind == OCERZ_OPK_REG) {
+        if (s->high8) return 0;
+        int ss = pin_slot(s->reg);
+        if (ss < 0 || (g_pin_class == 2 && s->reg == OCERZ_RSP)) return 0;
+        rs = pin_hreg(ss);
+    } else if (s->kind == OCERZ_OPK_MEM) {
+        if (!emit_mem_load_plain(b, insn, s, d->size, JT1)) return 0;
+        rs = JT1;
+    } else return 0;
+    int rd = pin_hreg(ds);
+    switch (insn->op) {
+    case OCERZ_OP_BSF:
+        a64_rbit(b, sf, JT0, rs); a64_clz(b, sf, JT0, JT0);
+        a64_subs_imm(b, sf, A64_ZR, rs, 0);
+        a64_csel(b, 1, rd, rd, JT0, A64_EQ);              /* source 0: destination unchanged */
+        return 1;
+    case OCERZ_OP_BSR:
+        a64_clz(b, sf, JT0, rs);
+        if (sf) a64_try_eor_imm(b, 1, JT0, JT0, 63); else a64_try_eor_imm(b, 0, JT0, JT0, 31);
+        a64_subs_imm(b, sf, A64_ZR, rs, 0);
+        a64_csel(b, 1, rd, rd, JT0, A64_EQ);
+        return 1;
+    case OCERZ_OP_TZCNT:
+        a64_rbit(b, sf, rd, rs); a64_clz(b, sf, rd, rd);   /* 0 -> operand width, as tzcnt */
+        return 1;
+    case OCERZ_OP_LZCNT:
+        a64_clz(b, sf, rd, rs);
+        return 1;
+    case OCERZ_OP_POPCNT:
+        a64_fmov_v_from_x(b, sf, VX0, rs);                /* 32-bit: upper lanes zero */
+        a64_v_cnt_8b(b, VX0, VX0);
+        a64_addv_b_8b(b, VX0, VX0);
+        a64_umov_w_b(b, rd, VX0, 0);
+        return 1;
+    default: return 0;
+    }
+}
+
+/* pmovmskb r32/r64, xmm: sign bits of the 16 bytes -> low 16 bits of the GPR */
+static int emit_pmovmskb(A64Buf *b, const X86Insn *insn)
+{
+    if (!sse_enabled() || insn->nops != 2) return 0;
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+    if (s->kind != OCERZ_OPK_XMM || !xmm_is_pinned(s->reg)) return 0;
+    if (g_n_raslit >= RASLIT_MAX) return 0;
+    int ds = pin_slot(d->reg);
+    if (ds < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+    a64_v_sshr_16b(b, VX0, xmm_vreg(s->reg), 7);          /* 0x00 / 0xff per byte */
+    g_raslit[g_n_raslit].site = a64_label(b);
+    g_raslit[g_n_raslit].retaddr = 0x8040201008040201ull;
+    g_raslit[g_n_raslit].hi = 0x8040201008040201ull;
+    g_raslit[g_n_raslit].kind = 2;
+    g_raslit[g_n_raslit].rt = VX1;
+    g_n_raslit++;
+    a64_emit32(b, 0x9c000000u | (uint32_t)VX1);           /* ldr q VX1, <lit> (patched) */
+    a64_v_and(b, VX0, VX0, VX1);                          /* byte i -> its bit within the half */
+    a64_v_addp_16b(b, VX0, VX0, VX0);
+    a64_v_addp_16b(b, VX0, VX0, VX0);
+    a64_v_addp_16b(b, VX0, VX0, VX0);                    /* byte0 = low half OR, byte1 = high half OR */
+    a64_umov_w_h(b, pin_hreg(ds), VX0, 0);               /* zero-extends into the 32/64-bit dst */
+    return 1;
+}
+
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
@@ -5536,6 +5613,10 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         return emit_imul(b, insn, need);
     case OCERZ_OP_LEA:
         return emit_lea(b, insn);
+    case OCERZ_OP_BSF: case OCERZ_OP_BSR: case OCERZ_OP_TZCNT: case OCERZ_OP_LZCNT: case OCERZ_OP_POPCNT:
+        return emit_bitscan(b, insn, need);
+    case OCERZ_OP_PMOVMSKB:
+        return emit_pmovmskb(b, insn);
     case OCERZ_OP_PUSH:
     case OCERZ_OP_POP:
         return emit_push_pop(b, insn, exit_sites, n_exits);
@@ -9171,6 +9252,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             a64_emit32(&b, 0); a64_emit32(&b, 0);
             if (b.overflow) break;
             int32_t off = (int32_t)((uint32_t *)cell - g_raslit[i].site);
+            if (g_raslit[i].kind == 2) {
+                /* 16-byte vector constant: two more words, LDR (literal, SIMD&FP) Q form */
+                a64_emit32(&b, 0); a64_emit32(&b, 0);
+                if (b.overflow) break;
+                *g_raslit[i].site = 0x9c000000u | (((uint32_t)off & 0x7ffffu) << 5) | (uint32_t)(g_raslit[i].rt & 31);
+                ((uint64_t *)cell)[0] = g_raslit[i].retaddr;
+                ((uint64_t *)cell)[1] = g_raslit[i].hi;
+                continue;
+            }
             *g_raslit[i].site = 0x58000000u | (((uint32_t)off & 0x7ffffu) << 5) | (uint32_t)(g_raslit[i].rt & 31);
             if (g_raslit[i].kind == 1) {
                 *cell = (void *)(uintptr_t)g_raslit[i].retaddr;      /* constant */

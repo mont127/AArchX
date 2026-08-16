@@ -691,3 +691,21 @@ void a64_str_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled)
     uint32_t base = size == 16 ? 0x3ca06800u : size == 8 ? 0xfc206800u : 0xbc206800u;
     a64_emit32(b, base | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(scaled != 0) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vt & 31));
 }
+
+/* ---- bit scans / population count / byte mask helpers ---- */
+void a64_rbit(A64Buf *b, int sf, int rd, int rn)
+{ a64_emit32(b, (sf ? 0xdac00000u : 0x5ac00000u) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31)); }
+void a64_clz(A64Buf *b, int sf, int rd, int rn)
+{ a64_emit32(b, (sf ? 0xdac01000u : 0x5ac01000u) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31)); }
+void a64_v_sshr_16b(A64Buf *b, int vd, int vn, int sh)          /* 1..8 */
+{ a64_emit32(b, 0x4f000400u | ((uint32_t)(16 - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_addp_16b(A64Buf *b, int vd, int vn, int vm)
+{ a64_emit32(b, 0x4e20bc00u | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_umov_w_h(A64Buf *b, int rd, int vn, int idx)          /* w = v.h[idx] */
+{ a64_emit32(b, 0x0e023c00u | ((uint32_t)idx << 18) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31)); }
+void a64_umov_w_b(A64Buf *b, int rd, int vn, int idx)          /* w = v.b[idx] */
+{ a64_emit32(b, 0x0e013c00u | ((uint32_t)idx << 17) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31)); }
+void a64_v_cnt_8b(A64Buf *b, int vd, int vn)
+{ a64_emit32(b, 0x0e205800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_addv_b_8b(A64Buf *b, int vd, int vn)
+{ a64_emit32(b, 0x0e31b800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }

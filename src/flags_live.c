@@ -191,6 +191,18 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         u = OCERZ_CF | OCERZ_ZF | OCERZ_PF;
         break;
 
+    /* bit scans: bsf/bsr write ZF and leave the rest (interpreter semantics,
+     * matches the goldens); tzcnt/lzcnt write CF and ZF; popcnt writes all */
+    case OCERZ_OP_BSF: case OCERZ_OP_BSR:
+        d = OCERZ_ZF; u = 0;
+        break;
+    case OCERZ_OP_TZCNT: case OCERZ_OP_LZCNT:
+        d = OCERZ_CF | OCERZ_ZF; u = 0;
+        break;
+    case OCERZ_OP_POPCNT:
+        d = OCERZ_FL_ALL; u = 0;
+        break;
+
     default:
         if (insn->op >= OCERZ_OP_X87_FIRST && insn->op < OCERZ_OP_COUNT) {
             d = 0;
