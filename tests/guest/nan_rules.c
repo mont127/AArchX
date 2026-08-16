@@ -59,6 +59,31 @@ int main(void){
         X("movaps %1, %%xmm0\n\tcvtpd2ps %%xmm0, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a) : "xmm0"); put("cvtpd2ps ", r.lo);
         g_u64 g; X("movaps %1, %%xmm0\n\tcvttsd2si %%xmm0, %0", "=r"(g) : "m"(a) : "xmm0"); put("cvttsd2si ", g);
     }
+    /* cmpss/cmpsd predicates 0..7 with NaN / ordered operands (mask results) */
+    for (int i = 0; i < NF; i += 2) for (int j = 1; j < NF; j += 3) {
+        a.lo = fv[i]; a.hi = 0x11111111u; b.lo = fv[j]; b.hi = 0;
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpss $0, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpss0 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpss $1, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpss1 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpss $2, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpss2 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpss $3, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpss3 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpss $4, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpss4 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpss $5, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpss5 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpss $6, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpss6 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpss $7, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpss7 ", r.lo);
+    }
+    for (int i = 0; i < ND; i += 2) for (int j = 1; j < ND; j += 3) {
+        a.lo = dv[i]; a.hi = 0x2222222222222222ULL; b.lo = dv[j]; b.hi = 0;
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $0, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpsd0 ", r.lo); put("cmpsd0.hi ", r.hi);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $1, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpsd1 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $2, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpsd2 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $3, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpsd3 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $4, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpsd4 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $5, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpsd5 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $6, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpsd6 ", r.lo);
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $7, %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("cmpsd7 ", r.lo);
+        /* blendvpd with the compare mask in xmm0 */
+        X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tcmpsd $1, %%xmm1, %%xmm0\n\tmovaps %1, %%xmm2\n\tblendvpd %%xmm0, %%xmm1, %%xmm2\n\tmovaps %%xmm2, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1","xmm2"); put("blendvpd ", r.lo); put("blendvpd.hi ", r.hi);
+    }
     /* invalid ops without NaN inputs: inf-inf, 0*inf, 0/0, sqrt(-1) -> default NaN sign */
     a.lo = 0x7f800000u; b.lo = 0x7f800000u; a.hi = b.hi = 0;
     X("movaps %1, %%xmm0\n\tmovaps %2, %%xmm1\n\tsubss %%xmm1, %%xmm0\n\tmovaps %%xmm0, %0", "=m"(r) : "m"(a), "m"(b) : "xmm0","xmm1"); put("inf-inf ", r.lo);
