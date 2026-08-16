@@ -49,7 +49,7 @@ TESTS := hello exit42 args alu branches strings fib sse mmap_test fileio memstre
 # two-point regression variants of bench's `call` and `mem` workloads, used to
 # cancel process startup and fixed-work terms that make the short raw wall
 # clocks unusable as throughput ratios. Same rule: benchbin/, never bin/.
-BENCH := benchbin/bench benchbin/fibn benchbin/memn benchbin/xbench
+BENCH := benchbin/bench benchbin/fibn benchbin/memn benchbin/xbench benchbin/xbench_dyn
 BINS := $(addprefix bin/,$(TESTS))
 
 all: $(BINS)
@@ -75,6 +75,12 @@ benchbin/memn: memn.c $(COMMON) gsys.h
 benchbin/xbench: xbench.c $(COMMON) gsys.h
 	@mkdir -p benchbin
 	$(CC) $(CFLAGS) -o $@ $(COMMON) xbench.c
+
+# the same kernels as an ordinary dynamically linked x86_64 binary (libSystem,
+# dyld shared cache): exercises Ocerz's dynamic mode -- run with OCERZ_HOSTWQ=1
+benchbin/xbench_dyn: xbench.c gsys.h
+	@mkdir -p benchbin
+	$(CC) $(ARCH) -O2 -fno-stack-protector -o $@ xbench.c
 
 clean:
 	rm -rf bin benchbin
