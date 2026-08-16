@@ -753,3 +753,38 @@ void a64_v_ext(A64Buf *b, int vd, int vn, int vm, int idx)   /* ext vd.16b, vn, 
 { a64_emit32(b, 0x6e000000u | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(idx & 15) << 11) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_rev64_4s(A64Buf *b, int vd, int vn)
 { a64_emit32(b, 0x4ea00800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+
+/* ---- lane insert/extract from GPRs, widening, rounding, extr ---- */
+void a64_ins_gpr(A64Buf *b, int esize, int vd, int idx, int rn)     /* ins vd.<esize>[idx], w/x rn */
+{
+    uint32_t imm5 = esize == 1 ? ((uint32_t)idx << 1) | 1u : esize == 2 ? ((uint32_t)idx << 2) | 2u :
+                    esize == 4 ? ((uint32_t)idx << 3) | 4u : ((uint32_t)idx << 4) | 8u;
+    a64_emit32(b, 0x4e001c00u | (imm5 << 16) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vd & 31));
+}
+void a64_umov_gpr(A64Buf *b, int esize, int rd, int vn, int idx)    /* umov w/x rd, vn.<esize>[idx] (zero-extends) */
+{
+    uint32_t imm5 = esize == 1 ? ((uint32_t)idx << 1) | 1u : esize == 2 ? ((uint32_t)idx << 2) | 2u :
+                    esize == 4 ? ((uint32_t)idx << 3) | 4u : ((uint32_t)idx << 4) | 8u;
+    a64_emit32(b, (esize == 8 ? 0x4e003c00u : 0x0e003c00u) | (imm5 << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31));
+}
+/* sshll/ushll (low half, shift 0): from = 1 (8b->8h), 2 (4h->4s), 4 (2s->2d) */
+void a64_v_xtl(A64Buf *b, int is_signed, int from, int vd, int vn)
+{
+    uint32_t immh = from == 1 ? 0x08u : from == 2 ? 0x10u : 0x20u;
+    a64_emit32(b, (is_signed ? 0x0f00a400u : 0x2f00a400u) | (immh << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
+}
+/* scalar frint: mode 0 nearest-even (n), 1 floor (m), 2 ceil (p), 3 trunc (z), 4 current (i) */
+void a64_frint_s(A64Buf *b, int dbl, int mode, int vd, int vn)
+{
+    static const uint32_t opc[5] = { 0x1e244000u, 0x1e254000u, 0x1e24c000u, 0x1e25c000u, 0x1e27c000u };
+    uint32_t base = opc[mode] | (dbl ? 0x00400000u : 0);
+    a64_emit32(b, base | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
+}
+/* vector frint: modes as above, dbl 1 -> .2d, 0 -> .4s */
+void a64_v_frint(A64Buf *b, int dbl, int mode, int vd, int vn)
+{
+    /* .4s: frintn 4e218800 frintm 4e219800 frintp 4ea18800 frintz 4ea19800 frinti 6ea19800 */
+    static const uint32_t opc[5] = { 0x4e218800u, 0x4e219800u, 0x4ea18800u, 0x4ea19800u, 0x6ea19800u };
+    uint32_t base = opc[mode] | (dbl ? 0x00400000u : 0);
+    a64_emit32(b, base | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
+}
