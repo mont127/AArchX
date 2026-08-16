@@ -3871,6 +3871,7 @@ static int emit_cbw_cwd(A64Buf *b, const X86Insn *insn)
  * idiv) -- the overwhelmingly common shape after xor edx,edx / cqo.  Any
  * other case (128-bit numerator, zero divisor, overflow) takes the slow call,
  * which traps exactly like the interpreter. */
+static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32_t *back);
 static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *o = &insn->ops[0];
@@ -3900,6 +3901,9 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         a64_udiv(b, sf, JTT, hax, hdv);
         a64_msub(b, sf, hdx, JTT, hdv, hax);                        /* rdx = rax - q*div (W form zero-extends) */
         a64_mov_reg(b, sf, hax, JTT);
+        uint32_t *sites[2] = { s1, s2 };
+        if (oolslow_add(insn, sites, 2, a64_label(b)))
+            return 1;                                                /* rare cases out of line */
         uint32_t *done = a64_label(b); a64_b(b, 0);
         uint32_t *slow = a64_label(b);
         a64_patch_cbz(s1, slow); a64_patch_cbz(s2, slow);
@@ -8207,6 +8211,42 @@ static int code_index_append_locked(OcerzJit *jit, JitBlock *block)
     return 1;
 }
 
+/* Out-of-line interpreter fallbacks: an emitter's rare-case branch (cbz/cbnz/
+ * b.cond) targets a stub emitted after the body that runs the instruction in
+ * the interpreter and branches back, so the common path has no taken branch. */
+#define OOLSLOW_MAX 32
+static struct { uint32_t *sites[3]; int nsites; const X86Insn *insn; uint32_t *back; } g_oolslow[OOLSLOW_MAX];
+static int g_n_oolslow;
+static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32_t *back)
+{
+    if (g_n_oolslow >= OOLSLOW_MAX || nsites > 3) return 0;
+    for (int i = 0; i < nsites; i++) g_oolslow[g_n_oolslow].sites[i] = sites[i];
+    g_oolslow[g_n_oolslow].nsites = nsites;
+    g_oolslow[g_n_oolslow].insn = insn;
+    g_oolslow[g_n_oolslow].back = back;
+    g_n_oolslow++;
+    return 1;
+}
+static void patch_any_branch(uint32_t *site, uint32_t *target)
+{
+    uint32_t w = *site;
+    if ((w & 0x7e000000u) == 0x34000000u) a64_patch_cbz(site, target);          /* cbz/cbnz */
+    else if ((w & 0x7e000000u) == 0x36000000u) a64_patch_tbz(site, target);     /* tbz/tbnz */
+    else if ((w & 0xff000010u) == 0x54000000u) a64_patch_bcond(site, target);   /* b.cond */
+    else a64_patch_b(site, target);
+}
+static void emit_oolslow_arms(A64Buf *b, uint32_t **exit_sites, int *n_exits)
+{
+    for (int k = 0; k < g_n_oolslow; k++) {
+        uint32_t *lbl = a64_label(b);
+        for (int i = 0; i < g_oolslow[k].nsites; i++) patch_any_branch(g_oolslow[k].sites[i], lbl);
+        emit_slowcall(b, g_oolslow[k].insn, exit_sites, n_exits);
+        uint32_t *here = a64_label(b);
+        a64_b(b, (int32_t)(g_oolslow[k].back - here));
+    }
+    g_n_oolslow = 0;
+}
+
 static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
 {
     if (g_n_oslow <= 0 && g_n_fpbmap <= 0)
@@ -8337,6 +8377,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_stop_patch = NULL;
     g_n_stop_extra = 0;
     g_n_push_fix = 0;
+    g_n_oolslow = 0;
     g_push_entry = NULL;
     g_n_side = 0;
     g_stop_target = NULL;
@@ -9028,6 +9069,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         uint32_t *here = a64_label(&b);
         a64_b(&b, (int32_t)(fb->back - here));
     }
+    emit_oolslow_arms(&b, exit_sites, &n_exits);
     emit_ordered_slow_arms(&b, blk, entry);
     emit_nan_ool_arms(&b, blk, entry);
     if (loop_poll_exit) {
