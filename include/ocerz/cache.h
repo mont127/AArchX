@@ -13,6 +13,8 @@ typedef struct OcerzCache {
 } OcerzCache;
 
 int ocerz_cache_map(OcerzCache *c);
+int ocerz_cache_lazy_fault(uintptr_t addr);     /* SIGSEGV in a lazily-slid cache page: unpack + retry */
+int ocerz_cache_lazy_region(uintptr_t addr);
 uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol);
 
 uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found);

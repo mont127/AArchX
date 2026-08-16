@@ -135,6 +135,8 @@ struct OcerzJit {
 
     JitCodeIndex *ci;
     uint32_t *dispatch_stub;   /* in-arena block dispatcher (see emit_dispatch_stub) */
+    JitBlock **live;           /* every block currently in the buckets (invalidation walks this, not the 1M buckets) */
+    size_t n_live, cap_live;
 };
 
 int ocerz_perfstat = -1;
@@ -490,6 +492,12 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
     unsigned h = hash_rip(b->guest_rip);
     b->hnext = jit->buckets[h];
     __atomic_store_n(&jit->buckets[h], b, __ATOMIC_RELEASE);
+    if (jit->n_live == jit->cap_live) {
+        size_t nc = jit->cap_live ? jit->cap_live * 2 : 4096;
+        JitBlock **nl = (JitBlock **)realloc(jit->live, nc * sizeof *nl);
+        if (nl) { jit->live = nl; jit->cap_live = nc; }
+    }
+    if (jit->n_live < jit->cap_live) jit->live[jit->n_live++] = b;
 }
 
 /* ---- monomorphic inline caches for indirect jmp/call ----------------------
@@ -534,7 +542,7 @@ static uint64_t xlive_decode_entry(uint64_t rip)
     volatile uint64_t pc = rip;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 1) == 0) {
+    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
         ocerz_jit_decode_recover = &db;
         while (n < JIT_MAX_BLOCK_INSNS) {
             int rc = ocerz_decode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -569,7 +577,7 @@ static int canonical_body_successor(uint64_t rip)
     volatile int compatible = 0;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 1) == 0) {
+    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
         ocerz_jit_decode_recover = &db;
         for (int n = 0; n < JIT_MAX_BLOCK_INSNS; n++) {
             if (ocerz_decode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -594,7 +602,7 @@ static unsigned decoded_terminator(uint64_t rip)
     volatile unsigned term = 0;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 1) == 0) {
+    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
         ocerz_jit_decode_recover = &db;
         for (int n = 0; n < JIT_MAX_BLOCK_INSNS; n++) {
             if (ocerz_decode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -625,7 +633,7 @@ static int decoded_call_region_entry(uint64_t rip)
     volatile int rsp_ok = 1;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 1) == 0) {
+    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
         ocerz_jit_decode_recover = &db;
         for (int n = 0; n < JIT_MAX_BLOCK_INSNS; n++) {
             if (ocerz_decode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -6395,7 +6403,7 @@ static int emit_logic_jmp_incdec_jcc(A64Buf *b, const X86Insn *logic,
     volatile uint64_t pc = jmp->ops[0].imm;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 1) == 0) {
+    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
         ocerz_jit_decode_recover = &db;
         while (n < 2) {
             int rc = ocerz_decode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -6494,7 +6502,7 @@ static int decode_ifconv_block(uint64_t rip, X86Insn *out, int cap)
     volatile uint64_t pc = rip;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 1) == 0) {
+    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
         ocerz_jit_decode_recover = &db;
         while (n < cap) {
             if (ocerz_decode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -7811,7 +7819,7 @@ static void js_note_fail(uint64_t rip, unsigned reason, int nins)
             js_ftab[k].reason = reason; js_ftab[k].nins = nins;
             const uint8_t *c = (const uint8_t *)ocerz_g2h(rip);
             sigjmp_buf bb, *prev = ocerz_jit_decode_recover;
-            if (sigsetjmp(bb, 1) == 0) {
+            if (sigsetjmp(bb, 0) == 0) {
                 ocerz_jit_decode_recover = &bb;
                 memcpy(js_ftab[k].bytes, c, 8);
             }
@@ -8456,7 +8464,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         volatile uint64_t vpc = rip;
         sigjmp_buf db;
         sigjmp_buf *prev_dr = ocerz_jit_decode_recover;
-        if (sigsetjmp(db, 1) == 0) {
+        if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
             ocerz_jit_decode_recover = &db;
             for (; vn < JIT_MAX_BLOCK_INSNS; ) {
                 const uint8_t *code = (const uint8_t *)ocerz_g2h(vpc);
@@ -9913,20 +9921,19 @@ static void invalidate_all_locked(OcerzJit *jit)
     /* RAS pool cells (in JIT memory) must not keep retired code reachable */
     for (size_t i = 0; i < g_n_ras_cells; i++)
         __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
-    for (unsigned h = 0; h < JIT_HASH_SIZE; h++) {
-        for (JitBlock *b = jit->buckets[h]; b; b = b->hnext) {
-            for (int i = 0; i < b->n_edges; i++) {
-                uint32_t *at = b->edges[i].patch_b;
-                uint32_t fallback = b->edges[i].fallback_insn;
-                if (at && fallback && *at != fallback) {
-                    __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
-                    patched = 1;
-                }
-                uint32_t *cs = b->edges[i].cond_site;
-                if (cs && b->edges[i].cond_orig && *cs != b->edges[i].cond_orig) {
-                    __atomic_store_n(cs, b->edges[i].cond_orig, __ATOMIC_RELEASE);
-                    patched = 1;
-                }
+    for (size_t k = 0; k < jit->n_live; k++) {
+        JitBlock *b = jit->live[k];
+        for (int i = 0; i < b->n_edges; i++) {
+            uint32_t *at = b->edges[i].patch_b;
+            uint32_t fallback = b->edges[i].fallback_insn;
+            if (at && fallback && *at != fallback) {
+                __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
+                patched = 1;
+            }
+            uint32_t *cs = b->edges[i].cond_site;
+            if (cs && b->edges[i].cond_orig && *cs != b->edges[i].cond_orig) {
+                __atomic_store_n(cs, b->edges[i].cond_orig, __ATOMIC_RELEASE);
+                patched = 1;
             }
         }
     }
@@ -9935,16 +9942,18 @@ static void invalidate_all_locked(OcerzJit *jit)
         sys_icache_invalidate(jit->code_base,
             (size_t)((uint8_t *)jit->code_cur - (uint8_t *)jit->code_base));
 
-    for (unsigned h = 0; h < JIT_HASH_SIZE; h++) {
-        JitBlock *b = __atomic_exchange_n(&jit->buckets[h], NULL,
-                                           __ATOMIC_ACQ_REL);
-        while (b) {
-            JitBlock *next = b->hnext;
-            b->retired_next = jit->retired;
-            jit->retired = b;
-            b = next;
-        }
+    /* unlink every live block (its bucket head goes to NULL; chains are all
+     * in the live list too) and retire it */
+    for (size_t k = 0; k < jit->n_live; k++) {
+        JitBlock *b = jit->live[k];
+        __atomic_store_n(&jit->buckets[hash_rip(b->guest_rip)], (JitBlock *)NULL, __ATOMIC_RELEASE);
     }
+    for (size_t k = 0; k < jit->n_live; k++) {
+        JitBlock *b = jit->live[k];
+        b->retired_next = jit->retired;
+        jit->retired = b;
+    }
+    jit->n_live = 0;
 
     pending_clear();
     for (unsigned i = 0; i < g_ras_slot_n; i++)
@@ -9987,15 +9996,18 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     OcerzJit *jit = vm->jit;
     int invalidated = 0;
     pthread_mutex_lock(&jit_lock);
-    for (unsigned h = 0; h < JIT_HASH_SIZE && !invalidated; h++) {
-        for (JitBlock *b = jit->buckets[h]; b && !invalidated; b = b->hnext) {
-            for (int i = 0; i < b->n_insns; i++) {
-                if (ranges_overlap(addr, len, b->insns[i].rip,
-                                   b->insns[i].len)) {
-                    invalidate_all_locked(jit);
-                    invalidated = 1;
-                    break;
-                }
+    for (size_t k = 0; k < jit->n_live && !invalidated; k++) {
+        JitBlock *b = jit->live[k];
+        /* cheap block-range test first (insns are contiguous) */
+        uint64_t blo = b->insns[0].rip;
+        uint64_t bhi = b->insns[b->n_insns - 1].rip + b->insns[b->n_insns - 1].len;
+        if (!ranges_overlap(addr, len, blo, bhi - blo)) continue;
+        for (int i = 0; i < b->n_insns; i++) {
+            if (ranges_overlap(addr, len, b->insns[i].rip,
+                               b->insns[i].len)) {
+                invalidate_all_locked(jit);
+                invalidated = 1;
+                break;
             }
         }
     }
