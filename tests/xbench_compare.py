@@ -29,9 +29,10 @@ def main():
     losing = 0
     for k in KERNELS:
         n = DFLT[k]
-        t, _ = run("R", k, n)
-        t = max(t, 0.05)
-        n = max(2, int(n * TARGET / t))
+        for _ in range(4):                      # calibrate until Rosetta takes >= TARGET/2
+            t, _ = run("R", k, n)
+            if t >= TARGET * 0.5: break
+            n = max(2, int(n * min(30.0, TARGET / max(t, 0.02))))
         half = max(1, n // 2)
         rd, od, ratios = [], [], []
         for rep in range(REPS):
