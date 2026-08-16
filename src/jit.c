@@ -2287,6 +2287,18 @@ static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
         return 1;
     }
     if (s->kind == OCERZ_OPK_MEM) {
+        int ds = pin_slot(d->reg);
+        if (g_pin_class == 2 && d->reg == OCERZ_RSP) ds = -1;
+        if (ds >= 0) {
+            int ra; uint32_t disp;
+            if (!is_signed && emit_mem_load_plain(b, insn, s, s->size, pin_hreg(ds)))
+                return 1;                                   /* ldrb/ldrh zero-extend to 64 */
+            if (is_signed && emit_mem_ea_plain(b, insn, s, s->size, &ra, &disp)) {
+                if (s->size == 1) a64_ldrsb(b, sf, pin_hreg(ds), ra, disp);
+                else              a64_ldrsh(b, sf, pin_hreg(ds), ra, disp);
+                return 1;
+            }
+        }
         if (!emit_mem_ea(b, insn, s, JTA))
             return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
@@ -2460,16 +2472,27 @@ static int emit_movsxd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, in
     if (s->size != 4)
         return 0;
 
+    int ds = pin_slot(d->reg);
+    if (g_pin_class == 2 && d->reg == OCERZ_RSP) ds = -1;
     if (s->kind == OCERZ_OPK_REG) {
         if (s->high8)
             return 0;
-
+        int ss = pin_slot(s->reg);
+        if (ds >= 0 && ss >= 0 && !(g_pin_class == 2 && s->reg == OCERZ_RSP)) {
+            a64_sxtw(b, pin_hreg(ds), pin_hreg(ss));
+            return 1;
+        }
         emit_gpr_rd(b, 0, JT0, s->reg);
         a64_sxtw(b, JT0, JT0);
         emit_gpr_wr(b, JT0, d->reg);
         return 1;
     }
     if (s->kind == OCERZ_OPK_MEM) {
+        int ra; uint32_t disp;
+        if (ds >= 0 && emit_mem_ea_plain(b, insn, s, 4, &ra, &disp)) {
+            a64_ldrsw(b, pin_hreg(ds), ra, disp);
+            return 1;
+        }
         if (!emit_mem_ea(b, insn, s, JTA))
             return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
@@ -6694,7 +6717,6 @@ static uint32_t *g_ind_call_tocont;   /* the `b` after the blr, to patch to the 
 static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
                                uint32_t **epi_sites, int *n_epi)
 {
-    a64_str(b, 8, JT1, 20, RIP_OFF);
     uint32_t *to_blr = NULL;              /* hash-hit path -> the shared blr site */
     /* per-site direct-mapped cache: {rip, body} x 32, indexed by rip bits
      * 2..6; hit -> poll interrupt, br body.  Miss falls into the global
@@ -6737,7 +6759,8 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         uint32_t *stop_lbl = a64_label(b);
         if (intr) a64_patch_cbz(intr, stop_lbl);
         if (stop_site_ok) stop_extra_add(br_site, stop_lbl);
-        /* interrupt / stop: leave via the epilogue (RIP stored) */
+        /* interrupt / stop: leave via the epilogue with RIP = target */
+        a64_str(b, 8, JT1, 20, RIP_OFF);
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
         epi_sites[*n_epi] = a64_label(b);
         a64_b(b, 0);
@@ -6745,6 +6768,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         a64_patch_bcond(psc_miss, a64_label(b));
         a64_patch_cbz(psc_empty, a64_label(b));
     }
+    a64_str(b, 8, JT1, 20, RIP_OFF);      /* every path from here may leave to the dispatcher */
     /* hash */
     a64_lsr_imm(b, 1, JTT, JT1, 33);
     a64_eor_reg(b, 1, JTT, JTT, JT1, 0);
