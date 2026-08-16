@@ -82,6 +82,10 @@ typedef struct JitBlock {
      * a branch word replaced by an unconditional b to its stop target */
     struct { uint32_t *site; uint32_t insn; } stop_extra[6];
     uint8_t n_stop_extra;
+    /* host word offsets of push stores emitted after their rsp decrement: a
+     * fault there must hand the guest the pre-push rsp (+8) */
+    uint32_t *push_fix;
+    uint16_t n_push_fix;
     struct JitBlock *stop_next;
 
     uint8_t host_holds[16];
@@ -256,6 +260,9 @@ static uint64_t g_self_rip;
 static uint32_t *g_body_entry;
 static uint32_t *g_loop_entry;
 static uint32_t *g_stop_patch;
+static uint32_t g_push_fix[JIT_MAX_BLOCK_INSNS];   /* offsets relative to the block entry */
+static int g_n_push_fix;
+static const uint32_t *g_push_entry;                /* block entry for offset computation */
 static struct { uint32_t *site; uint32_t *target; } g_stop_extra[6];
 static int g_n_stop_extra;
 static void stop_extra_add(uint32_t *site, uint32_t *target)
@@ -2475,6 +2482,14 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             } else {
                 a64_mov_imm64(b, JT1, o->imm);
                 rv = JT1;
+            }
+            if (g_push_entry && g_n_push_fix < JIT_MAX_BLOCK_INSNS && rv != hs) {
+                /* 2 words: decrement first, store second; a fault at the store is
+                 * repaired by ocerz_jit_fault_recover_regs (rsp += 8) */
+                a64_sub_imm(b, 1, hs, hs, 8);
+                g_push_fix[g_n_push_fix++] = (uint32_t)(a64_label(b) - g_push_entry);
+                a64_str_regoff(b, 8, rv, JGB, hs, 0);
+                return 1;
             }
             a64_sub_imm(b, 1, JTA, hs, 8);
             a64_str_regoff(b, 8, rv, JGB, JTA, 0);
@@ -7919,6 +7934,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_loop_entry = NULL;
     g_stop_patch = NULL;
     g_n_stop_extra = 0;
+    g_n_push_fix = 0;
+    g_push_entry = NULL;
     g_stop_target = NULL;
     g_mem_hoist_greg = -1;
     g_mem_hoist_greg2 = -1;
@@ -8118,6 +8135,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         emit_dispatch_stub(jit);
     A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
     uint32_t *entry = b.p;
+    g_push_entry = entry;
 
     a64_stp_pre(&b, 29, 30, 31, -16);
     a64_stp_pre(&b, 19, 20, 31, -16);
@@ -8623,6 +8641,14 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             else
                 *g_stop_patch = running_insn;
         }
+        blk->push_fix = NULL; blk->n_push_fix = 0;
+        if (g_n_push_fix) {
+            blk->push_fix = (uint32_t *)malloc((size_t)g_n_push_fix * sizeof(uint32_t));
+            if (blk->push_fix) {
+                memcpy(blk->push_fix, g_push_fix, (size_t)g_n_push_fix * sizeof(uint32_t));
+                blk->n_push_fix = (uint16_t)g_n_push_fix;
+            }
+        }
         blk->n_stop_extra = 0;
         for (int i = 0; i < g_n_stop_extra; i++) {
             uint32_t *site = g_stop_extra[i].site;
@@ -8857,6 +8883,13 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
             value -= ocerz_guest_base;
         cpu->gpr[b->host_holds[i]] = value;
     }
+    /* a push whose store faulted: the decrement already happened in the
+     * host register, but the guest instruction did not complete */
+    if (b->n_push_fix && b->code) {
+        uint32_t off = (uint32_t)((const uint32_t *)host_pc - (const uint32_t *)b->code);
+        for (int i = 0; i < b->n_push_fix; i++)
+            if (b->push_fix[i] == off) { cpu->gpr[OCERZ_RSP] += 8; break; }
+    }
 }
 
 /* XMM pins live in host V16-V31 while a block runs; on a fault the memory
@@ -9048,6 +9081,7 @@ static void block_destroy(JitBlock *b)
     free(b->insn_off);
     free(b->oslow);
     free(b->fault_flags);
+    free(b->push_fix);
     free(b->insns);
     free(b);
 }
