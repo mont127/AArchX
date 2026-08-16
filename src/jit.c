@@ -2379,6 +2379,13 @@ static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
     if (s->kind == OCERZ_OPK_REG) {
         if (s->high8)
             return 0;
+        if (pin_slot(d->reg) >= 0 && pin_slot(s->reg) >= 0 &&
+            !(g_pin_class == 2 && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP))) {
+            int rd = pin_hreg(pin_slot(d->reg)), rs = pin_hreg(pin_slot(s->reg));
+            if (is_signed) { if (s->size == 1) a64_sxtb(b, sf, rd, rs); else a64_sxth(b, sf, rd, rs); }
+            else           { if (s->size == 1) a64_uxtb(b, rd, rs); else a64_uxth(b, rd, rs); }
+            return 1;
+        }
         emit_gpr_rd(b, 1, JT1, s->reg);
         if (is_signed) {
             if (s->size == 1) a64_sxtb(b, sf, JT1, JT1);
@@ -5331,11 +5338,18 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         uint64_t mask = size == 1 ? 0xffull : 0xffffull;
         int rn, rm;
         if (d_in_jt0) rn = JT0;                                    /* loads zero-extend */
-        else { emit_gpr_rd(b, 1, JT0, d->reg); if (size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0); rn = JT0; }
+        else {
+            int ds = pin_slot(d->reg);
+            if (ds >= 0) { if (size == 1) a64_uxtb(b, JT0, pin_hreg(ds)); else a64_uxth(b, JT0, pin_hreg(ds)); }
+            else { emit_gpr_rd(b, 1, JT0, d->reg); if (size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0); }
+            rn = JT0;
+        }
         record_src = rn;
         if (s_in_jt1) { rm = JT1; a64_subs_reg(b, 0, A64_ZR, rn, rm, 0); }
         else if (s->kind == OCERZ_OPK_REG) {
-            emit_gpr_rd(b, 1, JT1, s->reg); if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
+            int ss = pin_slot(s->reg);
+            if (ss >= 0) { if (size == 1) a64_uxtb(b, JT1, pin_hreg(ss)); else a64_uxth(b, JT1, pin_hreg(ss)); }
+            else { emit_gpr_rd(b, 1, JT1, s->reg); if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1); }
             rm = JT1; a64_subs_reg(b, 0, A64_ZR, rn, rm, 0);
         } else {
             uint64_t v = (uint64_t)s->imm & mask;
