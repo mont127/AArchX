@@ -78,6 +78,10 @@ typedef struct JitBlock {
 
     uint32_t *stop_patch;
     uint32_t stop_insn;
+    /* extra stop sites (indirect tails, further backward chains): each is
+     * a branch word replaced by an unconditional b to its stop target */
+    struct { uint32_t *site; uint32_t insn; } stop_extra[6];
+    uint8_t n_stop_extra;
     struct JitBlock *stop_next;
 
     uint8_t host_holds[16];
@@ -252,6 +256,12 @@ static uint64_t g_self_rip;
 static uint32_t *g_body_entry;
 static uint32_t *g_loop_entry;
 static uint32_t *g_stop_patch;
+static struct { uint32_t *site; uint32_t *target; } g_stop_extra[6];
+static int g_n_stop_extra;
+static void stop_extra_add(uint32_t *site, uint32_t *target)
+{
+    if (g_n_stop_extra < 6) { g_stop_extra[g_n_stop_extra].site = site; g_stop_extra[g_n_stop_extra].target = target; g_n_stop_extra++; }
+}
 static uint32_t *g_stop_target;
 static int g_mem_hoist_greg = -1;
 static int g_mem_hoist_aux_disp;
@@ -6706,8 +6716,13 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         a64_subs_reg(b, 1, A64_ZR, JTU, JT1, 0);
         psc_miss = a64_label(b); a64_bcond(b, A64_NE, 0);
         uint32_t *psc_empty = a64_label(b); a64_cbz(b, 1, JT0, 0);   /* empty entry (rip 0) */
-        a64_ldr(b, 4, JTU, 20, INT_OFF);
-        uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
+        uint32_t *intr = NULL;
+        int stop_site_ok = g_n_stop_extra < 6;
+        if (!stop_site_ok) {                       /* out of stop slots: poll */
+            a64_ldr(b, 4, JTU, 20, INT_OFF);
+            intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
+        }
+        uint32_t *br_site = a64_label(b);
         if (g_ind_call_cont) {
             /* shared blr site: hardware pushes the continuation */
             to_blr = a64_label(b);
@@ -6719,8 +6734,10 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         } else {
             a64_br(b, JT0);
         }
-        a64_patch_cbz(intr, a64_label(b));
-        /* interrupt: leave via the epilogue (RIP stored) */
+        uint32_t *stop_lbl = a64_label(b);
+        if (intr) a64_patch_cbz(intr, stop_lbl);
+        if (stop_site_ok) stop_extra_add(br_site, stop_lbl);
+        /* interrupt / stop: leave via the epilogue (RIP stored) */
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
         epi_sites[*n_epi] = a64_label(b);
         a64_b(b, 0);
@@ -6757,9 +6774,14 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, body_code));
         uint32_t *nobody = a64_label(b); a64_cbz(b, 1, JT0, 0);
         if (psc) a64_stp_off(b, JT1, JT0, JT2, 0);        /* fill the site cache entry */
-        a64_ldr(b, 4, JTU, 20, INT_OFF);                  /* interrupt poll (back edges) */
-        uint32_t *intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
+        uint32_t *intr = NULL;
+        int stop_site_ok2 = g_n_stop_extra < 6;
+        if (!stop_site_ok2) {
+            a64_ldr(b, 4, JTU, 20, INT_OFF);              /* interrupt poll (back edges) */
+            intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
+        }
         if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
+        uint32_t *br_site2 = a64_label(b);
         if (to_blr) { uint32_t *here = a64_label(b); a64_b(b, (int32_t)(to_blr - here)); }
         else if (g_ind_call_cont) {
             to_blr = a64_label(b);
@@ -6768,8 +6790,11 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
             g_ind_call_tocont = a64_label(b); a64_b(b, 0);
         }
         else a64_br(b, JT0);
-        a64_patch_cbz(nobody, a64_label(b));
-        a64_patch_cbz(intr, a64_label(b));
+        uint32_t *stop_lbl2 = a64_label(b);
+        a64_patch_cbz(nobody, stop_lbl2);
+        if (intr) a64_patch_cbz(intr, stop_lbl2);
+        if (stop_site_ok2 && !to_blr) stop_extra_add(br_site2, stop_lbl2);
+        else if (stop_site_ok2 && to_blr && br_site2 != to_blr) stop_extra_add(br_site2, stop_lbl2);
         /* interrupt or no body: fall to the epilogue (RIP already stored) */
         uint32_t *to_epi = a64_label(b); a64_b(b, 0);
         a64_patch_cbz(to_full, a64_label(b));
@@ -7098,6 +7123,8 @@ static void chain_activate(uint32_t *patch_b, void *dst)
 {
     if (!patch_b || !dst)
         return;
+    if (g_xlat_jit && g_xlat_jit->stop_requested)
+        return;                          /* stop sites must keep their stop branch */
     int ok;
     if (g_chain_batching) {
         ok = a64_try_patch_b(patch_b, (uint32_t *)dst);
@@ -7220,10 +7247,11 @@ static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
                                       uint32_t **epilogue_sites, int *n_epi)
 {
     int patch_stop = poll && !g_stop_patch;
+    int extra_stop = poll && !patch_stop && g_n_stop_extra < 6;
     uint32_t *intr = NULL;
     if (!xmm_global_enabled())
         emit_xmm_pin_spill_all(b);       /* per-block layouts: xmm state to memory */
-    if (poll && !patch_stop) {
+    if (poll && !patch_stop && !extra_stop) {
         a64_ldr(b, 4, JT1, 20, INT_OFF);
         intr = a64_label(b);
         a64_cbnz(b, 0, JT1, 0);
@@ -7237,6 +7265,8 @@ static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
     if (patch_stop) {
         g_stop_patch = patch_b;
         g_stop_target = fallback;
+    } else if (extra_stop) {
+        stop_extra_add(patch_b, fallback);
     }
 
     if (g_pin_class == 2)
@@ -7622,6 +7652,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_body_entry = NULL;
     g_loop_entry = NULL;
     g_stop_patch = NULL;
+    g_n_stop_extra = 0;
     g_stop_target = NULL;
     g_mem_hoist_greg = -1;
     g_mem_hoist_greg2 = -1;
@@ -8323,6 +8354,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             else
                 *g_stop_patch = running_insn;
         }
+        blk->n_stop_extra = 0;
+        for (int i = 0; i < g_n_stop_extra; i++) {
+            uint32_t *site = g_stop_extra[i].site;
+            int32_t off = (int32_t)(g_stop_extra[i].target - site);
+            blk->stop_extra[blk->n_stop_extra].site = site;
+            blk->stop_extra[blk->n_stop_extra].insn = 0x14000000u | ((uint32_t)off & 0x03ffffffu);
+            blk->n_stop_extra++;
+            if (jit->stop_requested)
+                *site = blk->stop_extra[blk->n_stop_extra - 1].insn;
+        }
     }
 
     pthread_jit_write_protect_np(1);
@@ -8352,7 +8393,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     blk->code = (JitBlockFn)entry;
     blk->body_code = g_body_entry;
     blk->code_words = (uint32_t)(b.p - entry);
-    if (blk->stop_patch) {
+    if (blk->stop_patch || blk->n_stop_extra) {
         blk->stop_next = jit->stop_blocks;
         jit->stop_blocks = blk;
     }
@@ -8819,12 +8860,19 @@ static int force_stop_sites_writable(OcerzJit *jit)
             __atomic_store_n(b->stop_patch, b->stop_insn, __ATOMIC_RELEASE);
             patched = 1;
         }
+        for (int i = 0; i < b->n_stop_extra; i++)
+            if (*b->stop_extra[i].site != b->stop_extra[i].insn) {
+                __atomic_store_n(b->stop_extra[i].site, b->stop_extra[i].insn, __ATOMIC_RELEASE);
+                patched = 1;
+            }
         /* a conditional branch short-circuited past the trampoline would
          * bypass the stop site: route it back through the trampoline */
         for (int i = 0; i < b->n_edges; i++) {
             uint32_t *cs = b->edges[i].cond_site;
-            if (cs && b->edges[i].cond_orig && *cs != b->edges[i].cond_orig &&
-                b->edges[i].patch_b == b->stop_patch) {
+            int is_stop = b->edges[i].patch_b == b->stop_patch;
+            for (int k = 0; k < b->n_stop_extra && !is_stop; k++)
+                is_stop = b->edges[i].patch_b == b->stop_extra[k].site;
+            if (cs && b->edges[i].cond_orig && *cs != b->edges[i].cond_orig && is_stop) {
                 __atomic_store_n(cs, b->edges[i].cond_orig, __ATOMIC_RELEASE);
                 patched = 1;
             }
