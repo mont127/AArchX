@@ -134,6 +134,14 @@ help Ocerz lacks: an x86-flavoured FP mode on Apple silicon and identity-mapped 
 memory, and its ahead-of-time translation lays out call/return code without the per-call
 return-stack bookkeeping a block JIT needs.
 
+The same kernels built as an ordinary dynamically linked binary (`tests/guest/benchbin/xbench_dyn`:
+libSystem, dyld shared cache — the mode Wine and every real macOS binary run in) measure the
+same way (`OCERZ_HOSTWQ=1 XB=tests/guest/benchbin/xbench_dyn python3 tests/xbench_compare.py`,
+`REPS=3`): jtab 0.96x, depchain 0.92x, brmiss 0.97x, chase 0.97x, vm 0.78x, memcpy 1.03x
+(libc `memmove`), hash 1.03x, qsort 1.05x, fpvec 1.07x, icall 1.09x, str 1.12x (libc's SIMD
+`strlen`), idiv 1.14x, fpsse 1.20x, leafcall 1.24x, mixed 1.32x. Process startup for a
+dynamically linked binary is about 0.06 s (`wine --version`: 0.12 s).
+
 Loads and stores are plain `ldr`/`str` while the process is single-observer, and switch to
 `ldar`/`stlr` for x86-TSO once guest memory can be seen by another thread or process.
 
