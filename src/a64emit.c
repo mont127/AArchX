@@ -55,29 +55,51 @@ static int logical_imm_fields(int sf, uint64_t imm, uint32_t *fields)
     if (imm == 0 || imm == width_mask)
         return 0;
 
-    for (unsigned esize = 2; esize <= width; esize <<= 1) {
-        uint64_t emask = low_mask(esize);
+    /* smallest element size that replicates to imm */
+    unsigned esize = width;
+    for (unsigned e = 2; e < width; e <<= 1) {
+        uint64_t emask = low_mask(e);
         uint64_t element = imm & emask;
         uint64_t replicated = element;
-        for (unsigned shift = esize; shift < width; shift <<= 1)
+        for (unsigned shift = e; shift < width; shift <<= 1)
             replicated |= replicated << shift;
-        if ((replicated & width_mask) != imm)
-            continue;
-
-        unsigned ones = (unsigned)__builtin_popcountll(element);
-        if (ones == 0 || ones == esize)
-            continue;
-        uint64_t run = low_mask(ones);
-        for (unsigned rot = 0; rot < esize; rot++) {
-            if (ror_element(run, rot, esize) != element)
-                continue;
-            uint32_t n = esize == 64 ? 1u : 0u;
-            uint32_t imms = ((~(esize * 2u - 1u)) & 0x3fu) | (ones - 1u);
-            *fields = (n << 22) | ((rot & 0x3fu) << 16) | (imms << 10);
-            return 1;
+        if ((replicated & width_mask) == imm) { esize = e; break; }
+    }
+    uint64_t emask = low_mask(esize);
+    uint64_t element = imm & emask;
+    unsigned ones = (unsigned)__builtin_popcountll(element);
+    if (ones == 0 || ones == esize)
+        return 0;
+    /* the element must be a rotated run of ones: either the run itself does
+     * not wrap (v + lowest_bit(v) is a power of two) or its complement does */
+    unsigned rot;
+    uint64_t v = element;
+    uint64_t lowbit = v & (~v + 1);
+    {
+        uint64_t t = (v + lowbit) & emask;
+        if ((t & (t - 1)) == 0) {
+            /* contiguous run at bit s = ctz(v): imm = ROR(run, e - s) */
+            unsigned sbit = (unsigned)__builtin_ctzll(v);
+            rot = (esize - sbit) % esize;
+        } else {
+            uint64_t nv = ~v & emask;
+            uint64_t nlow = nv & (~nv + 1);
+            uint64_t nt = (nv + nlow) & emask;
+            if ((nt & (nt - 1)) != 0)
+                return 0;
+            /* zeros are contiguous at [s', s'+k): the ones run starts at s'+k */
+            unsigned sp = (unsigned)__builtin_ctzll(nv);
+            unsigned k = (unsigned)__builtin_popcountll(nv);
+            rot = (esize - (sp + k)) % esize;
         }
     }
-    return 0;
+    uint64_t run = low_mask(ones);
+    if (ror_element(run, rot, esize) != element)
+        return 0;
+    uint32_t n = esize == 64 ? 1u : 0u;
+    uint32_t imms = ((~(esize * 2u - 1u)) & 0x3fu) | (ones - 1u);
+    *fields = (n << 22) | ((rot & 0x3fu) << 16) | (imms << 10);
+    return 1;
 }
 
 static int try_logic_imm(A64Buf *b, uint32_t base, int sf, int rd, int rn,
