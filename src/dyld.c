@@ -2043,6 +2043,9 @@ uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
     pthread_mutex_lock(&g_load_lock);
     uint64_t r = ocerz_dlopen_inner(vm, hostpath, mode);
     pthread_mutex_unlock(&g_load_lock);
+    if (getenv("OCERZ_DLOPENLOG"))
+        fprintf(stderr, "ocerz: DLOPEN \"%s\" -> %#llx%s%s\n", hostpath ? hostpath : "(null)", (unsigned long long)r,
+                (!r && g_dlerror_g) ? " err=" : "", (!r && g_dlerror_g) ? (const char *)ocerz_g2h(g_dlerror_g) : "");
     return r;
 }
 

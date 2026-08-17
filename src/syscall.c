@@ -4038,6 +4038,22 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                                      mach_reply_size, 47);
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_reply_alias_iokit(vm, mach_reply_buf, mach_reply_size);
+        {
+            /* light IOKit MIG log: request id 2800..2999 -> reply id, RetCode/first words */
+            static int iomig = -1;
+            if (iomig < 0) iomig = getenv("OCERZ_IOKITMIG") ? 1 : 0;
+            if (iomig && request_buf != 0) {
+                uint32_t rid = (uint32_t)ocerz_ld(request_buf + 0x14, 4);
+                if (rid >= 2800 && rid < 3000) {
+                    uint32_t repid = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4) : 0;
+                    uint32_t w0 = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf + 0x20, 4) : 0;
+                    uint32_t w1 = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf + 0x24, 4) : 0;
+                    uint32_t rbits = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf, 4) : 0;
+                    fprintf(stderr, "ocerz: IOKITMIG[%d] req=%u rport=%#x -> kr=%#llx reply_id=%u bits=%#x w0=%#x w1=%#x\n",
+                            (int)getpid(), rid, (uint32_t)ocerz_ld(request_buf + 8, 4), (unsigned long long)r47, repid, rbits, w0, w1);
+                }
+            }
+        }
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0 &&
             OCERZ_ENV_ON("OCERZ_PORTRECV")) {
             uint32_t rb = (uint32_t)ocerz_ld(mach_reply_buf, 4);
