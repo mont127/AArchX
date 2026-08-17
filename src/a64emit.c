@@ -788,3 +788,17 @@ void a64_v_frint(A64Buf *b, int dbl, int mode, int vd, int vn)
     uint32_t base = opc[mode] | (dbl ? 0x00400000u : 0);
     a64_emit32(b, base | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
 }
+
+/* LDAPUR / STLUR (FEAT_LRCPC2): acquire-load / release-store with an unscaled signed 9-bit offset */
+void a64_ldapur(A64Buf *b, int size, int rt, int rn, int32_t simm9)
+{
+    uint32_t sz = ldst_size_bits(size);
+    a64_emit32(b, 0x19400000u | (sz << 30) | (((uint32_t)simm9 & 0x1ffu) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+void a64_stlur(A64Buf *b, int size, int rt, int rn, int32_t simm9)
+{
+    uint32_t sz = ldst_size_bits(size);
+    a64_emit32(b, 0x19000000u | (sz << 30) | (((uint32_t)simm9 & 0x1ffu) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
+void a64_dmb_ishld(A64Buf *b) { a64_emit32(b, 0xd50339bfu); }   /* dmb ishld: load-load / load-store */

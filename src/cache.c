@@ -134,8 +134,21 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
         uint64_t hp = 0x4000;
         uint64_t off = (addr - g_lazy[i].addr) & ~(hp - 1);
         size_t hidx = (size_t)(off / hp);
+        /* a page this thread already retried once (or that was unpacked
+         * before the fault) is not a lazy-unpack fault: an alignment or
+         * protection fault on an unpacked page must reach the real handler
+         * instead of retrying forever */
+        static __thread uintptr_t last_retry;
+        uintptr_t page = (uintptr_t)(g_lazy[i].addr + off);
         while (__atomic_exchange_n(&g_lazy_lock, 1, __ATOMIC_ACQUIRE)) { }
-        if (!g_lazy[i].done[hidx]) {
+        if (g_lazy[i].done[hidx]) {
+            int again = last_retry == page;
+            last_retry = page;
+            __atomic_store_n(&g_lazy_lock, 0, __ATOMIC_RELEASE);
+            return again ? 0 : 1;      /* once: another thread may have just unpacked it */
+        }
+        last_retry = 0;
+        {
             uint64_t base = g_lazy[i].addr + off;
             mprotect((void *)(uintptr_t)base, (size_t)hp, PROT_READ | PROT_WRITE);
             uint32_t per = (uint32_t)(hp / g_lazy[i].page_size);
