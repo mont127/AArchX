@@ -440,6 +440,16 @@ static const X86Operand *mem_hoist_view(const X86Operand *m, X86Operand *tmp)
  * when there is no low_base alias (ea_fold() == guest_base). */
 #define JGB 0
 static inline int jgb_usable(void) { return ocerz_low_base == 0; }
+/* identity mapping (dynamic mode / guest_base 0): stack pushes/pops can use the
+ * pre/post-indexed forms on the pinned rsp directly (1 word instead of 2).  A
+ * faulting indexed access leaves the base register unchanged, so no rsp fixup
+ * is needed. */
+static inline int stack_identity(void)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_STACK_IDX") ? 1 : 0;
+    return !dis && ocerz_guest_base == 0 && ocerz_low_base == 0;
+}
 void ocerz_jgb_trap(uint64_t rip, uint64_t x0);
 void ocerz_jgb_trap(uint64_t rip, uint64_t x0)
 {
@@ -844,6 +854,10 @@ enum { JT0 = 9, JT1 = 10, JT2 = 11, JTF = 12, JTT = 13, JTU = 14, JTA = 15 };
  * the 3-word temp form */
 static void emit_push_pinned(A64Buf *b, int hs, int rv)
 {
+    if (stack_identity() && rv != hs) {
+        a64_str_pre64(b, rv, hs, -8);
+        return;
+    }
     if (g_push_entry && g_n_push_fix < JIT_MAX_BLOCK_INSNS && rv != hs) {
         a64_sub_imm(b, 1, hs, hs, 8);
         g_push_fix[g_n_push_fix++] = (uint32_t)(a64_label(b) - g_push_entry);
@@ -3253,6 +3267,10 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
                 a64_mov_imm64(b, JT1, o->imm);
                 rv = JT1;
             }
+            if (stack_identity() && rv != hs) {
+                a64_str_pre64(b, rv, hs, -8);
+                return 1;
+            }
             if (g_push_entry && g_n_push_fix < JIT_MAX_BLOCK_INSNS && rv != hs) {
                 /* 2 words: decrement first, store second; a fault at the store is
                  * repaired by ocerz_jit_fault_recover_regs (rsp += 8) */
@@ -3321,6 +3339,10 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() && jgb_usable() &&
             !stack_guard_needed() && o->reg != OCERZ_RSP && pin_slot(o->reg) >= 0) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
+            if (stack_identity()) {
+                a64_ldr_post64(b, pin_hreg(pin_slot(o->reg)), hs, 8);
+                return 1;
+            }
             a64_ldr_regoff(b, 8, pin_hreg(pin_slot(o->reg)), JGB, hs, 0);
             a64_add_imm(b, 1, hs, hs, 8);
             return 1;
@@ -6358,6 +6380,10 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
         return 0;
     int hs = pin_hreg(pin_slot(OCERZ_RSP)), hb = pin_hreg(pin_slot(OCERZ_RBP));
     a64_mov_reg(b, 1, hs, hb);
+    if (stack_identity()) {
+        a64_ldr_post64(b, hb, hs, 8);
+        return 1;
+    }
     a64_ldr_regoff(b, 8, hb, JGB, hs, 0);
     a64_add_imm(b, 1, hs, hs, 8);
     return 1;
@@ -8622,8 +8648,12 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                     jgb_usable() && !stack_guard_needed();
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
-            a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
-            a64_add_imm(b, 1, hs, hs, 8);
+            if (stack_identity()) {
+                a64_ldr_post64(b, JT1, hs, 8);
+            } else {
+                a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
+                a64_add_imm(b, 1, hs, hs, 8);
+            }
             if (!ras_body_only()) a64_str(b, 8, JT1, 20, RIP_OFF);   /* else: stored on the miss paths */
         } else {
             emit_gpr_rd(b, 1, JT0, OCERZ_RSP);
@@ -9001,6 +9031,10 @@ static int emit_branch_target(A64Buf *b, const X86Insn *insn, const X86Operand *
     if (o->kind == OCERZ_OPK_MEM) {
         if (o->size != 8)
             return 0;
+        /* same fast forms as an ordinary load (identity/hoisted bases, no
+         * commpage guard when the block is unmarked) */
+        if (emit_plain_mem_fast(b, insn, o, 8, JT1, 0, 0))
+            return 1;
         if (!emit_mem_ea(b, insn, o, JTA))
             return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
