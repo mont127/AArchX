@@ -162,6 +162,25 @@ for name in jit_rmw jit_scan jit_ops jit_bt jit_align jit_align2 jit_movq jit_ss
     fi
 done
 
+# Interpreted-block path (jit_interp_block: blocks without code once the arena
+# is full).  A tiny arena makes almost every block run through it; superblock
+# side exits taken mid-block must stop the block (bug fixed 2026-08-17: the
+# rest of the block ran after a taken jcc -> guest crashes 1/150 wine runs).
+for name in branches jit_ops jit_misc2 fib strings; do
+    bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
+    [ -x "$bin" ] && [ -f "$golden" ] || continue
+    export OCERZ_JIT_CODE_KB=64
+    run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$bin"
+    rc=$?
+    unset OCERZ_JIT_CODE_KB
+    if [ "$rc" -eq 0 ] && cmp -s "$ACTUAL_OUT" "$golden"; then
+        echo "PASS $name (tiny arena)"; PASS=$((PASS + 1))
+    else
+        echo "FAIL $name (tiny arena: rc=$rc)"; FAIL=$((FAIL + 1))
+        diff "$golden" "$ACTUAL_OUT" | head -20 | sed 's/^/  | /' >&2
+    fi
+done
+
 # Dynamic-mode smoke test: a real Mach-O from the x86_64 shared cache world.
 # The synthetic guests all run in plain/static mode; this is the only test
 # that exercises the commpage guard, dyld-cache-sized block counts and the
@@ -181,6 +200,25 @@ if [ -x "$WINE_BIN" ]; then
     else
         if [ "$rc" -eq 124 ]; then reason="timed out (dynamic-mode hang)"; else reason="exit code $rc / no wine- banner"; fi
         echo "FAIL wine_version ($reason)"
+        FAIL=$((FAIL + 1))
+        if [ -s "$ACTUAL_ERR" ]; then
+            echo "  --- stderr ---" >&2
+            tail -20 "$ACTUAL_ERR" | sed 's/^/  | /' >&2
+        fi
+    fi
+    # the same run with a 512 KB code arena: ~650k blocks go through
+    # jit_interp_block (superblock side exits, records, redirects)
+    export OCERZ_HOSTWQ=1 OCERZ_JIT_CODE_KB=512
+    TIMEOUT_SECS=120
+    run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$WINE_BIN" --version
+    rc=$?
+    TIMEOUT_SECS=$saved_timeout
+    unset OCERZ_HOSTWQ OCERZ_JIT_CODE_KB
+    if [ "$rc" -eq 0 ] && grep -q '^wine-' "$ACTUAL_OUT"; then
+        echo "PASS wine_version (tiny arena)"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL wine_version (tiny arena: rc=$rc)"
         FAIL=$((FAIL + 1))
         if [ -s "$ACTUAL_ERR" ]; then
             echo "  --- stderr ---" >&2

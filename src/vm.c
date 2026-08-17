@@ -105,6 +105,7 @@ static __thread sigjmp_buf *g_sig_recover;
 
 #define OCERZ_SIG_MAX_REPEAT 16
 
+extern __thread int ocerz_jit_exec_state;
 static __thread uint64_t g_riphist[32];
 static __thread unsigned g_riphist_n;
 static int g_crash_stack;
@@ -896,7 +897,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             siglongjmp(*g_sig_recover, 1);
         }
     }
-    char buf[256];
+    char buf[640];
     char *p = buf;
 
     if (depth > 0 && ocerz_host_in_guest_space(si->si_addr)) {
@@ -945,6 +946,16 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = hex_into(p, uc->uc_mcontext->__ss.__lr);
         p = str_into(p, " slide=");
         p = hex_into(p, g_image_slide);
+        /* host frame-pointer chain (symbolize offline: atos -o ocerz -l <slide+0x100000000> addr...) */
+        p = str_into(p, " host_bt=");
+        uint64_t fp = uc->uc_mcontext->__ss.__fp;
+        for (int i = 0; i < 8 && fp && (fp & 7) == 0 && ocerz_addr_readable(fp) && ocerz_addr_readable(fp + 8); i++) {
+            uint64_t ret = *(const uint64_t *)(uintptr_t)(fp + 8);
+            if (!ret) break;
+            p = hex_into(p, ret);
+            p = str_into(p, ",");
+            fp = *(const uint64_t *)(uintptr_t)fp;
+        }
     }
     OcerzCPU *c = g_cur_cpu ? g_cur_cpu : (g_vm ? &g_vm->cpu : NULL);
     if (c) {
@@ -954,6 +965,12 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = hex_into(p, ocerz_h2g(si->si_addr));
         p = str_into(p, " icount=");
         p = hex_into(p, g_vm ? g_vm->insn_count : 0);
+        p = str_into(p, " cur_rip=");
+        p = hex_into(p, c->cur_rip);
+        p = str_into(p, " interp_once=");
+        p = hex_into(p, (uint64_t)c->interp_once);
+        p = str_into(p, " exec_state=");
+        p = hex_into(p, (uint64_t)ocerz_jit_exec_state);
     }
     p = str_into(p, "\n");
     write(2, buf, (size_t)(p - buf));
