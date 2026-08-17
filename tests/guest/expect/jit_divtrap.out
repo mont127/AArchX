@@ -1,0 +1,5 @@
+div0: faults=1 rax=0x0000000000003039 rdx=0x0000000000000000 rip=ok
+idivm1: faults=1 rax=0x8000000000000000 rdx=0xffffffffffffffff rip=ok
+idivl_m1: faults=1 rax=0x0000000080000000 rdx=0x00000000ffffffff rip=ok
+div7: q=1763 r=4 faults=0
+idiv12345: q=-81004 r=-5627 faults=0
