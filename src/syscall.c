@@ -135,14 +135,31 @@ static void mach_ret(OcerzCPU *cpu, uint64_t kr)
 static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     if (getenv("OCERZ_EXITLOG")) {
-        fprintf(stderr, "ocerz: EXITLOG[%d] code=%d rip=%#llx ret-chain:",
-                (int)getpid(), (int)a[0], (unsigned long long)cpu->rip);
+        extern char ocerz_cmdline_summary[];
+        fprintf(stderr, "ocerz: EXITLOG[%d \"%s\"] code=%d rip=%#llx ret-chain:",
+                (int)getpid(), ocerz_cmdline_summary, (int)a[0], (unsigned long long)cpu->rip);
         uint64_t fp = cpu->gpr[OCERZ_RBP];
         for (int d = 0; d < 8 && fp >= ocerz_arena_lo && fp < ocerz_arena_hi; d++) {
             fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
             fp = ocerz_ld(fp, 8);
         }
         fprintf(stderr, "\n");
+        if ((uint32_t)a[0] != 0 && getenv("OCERZ_EXITHIST")) {
+            /* nonzero exit: recent block rips + a return-address scan of the
+             * stack (rbp chains are often broken at exit()) */
+            uint64_t rh[32]; unsigned rn = ocerz_vm_riphist(rh, 32);
+            fprintf(stderr, "ocerz: EXITHIST[%d] riphist:", (int)getpid());
+            for (unsigned i = 0; i < rn; i++) fprintf(stderr, " %#llx", (unsigned long long)rh[i]);
+            fprintf(stderr, "\nocerz: EXITHIST[%d] stackscan:", (int)getpid());
+            uint64_t sp = cpu->gpr[OCERZ_RSP];
+            int printed = 0;
+            for (uint64_t o = 0; o < 0x800 && printed < 24; o += 8) {
+                if (!ocerz_addr_readable(sp + o)) break;
+                uint64_t v = ocerz_ld(sp + o, 8);
+                if (v >= 0x7ff800000000ull && v < 0x7ffb00000000ull) { fprintf(stderr, " %#llx", (unsigned long long)v); printed++; }
+            }
+            fprintf(stderr, "\n");
+        }
     }
     ocerz_vm_request_exit(vm, (int)(uint32_t)a[0] & 0xff);
     /* exit() is process-wide on Darwin.  request_exit only raises a flag
@@ -1529,6 +1546,29 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
     uint32_t bits = (uint32_t)ocerz_ld(gmsg, 4);
     uint32_t msg_id = (uint32_t)ocerz_ld(gmsg + 0x14, 4);
     int n = 0;
+    /* io_registry_entry_get_properties_bin_buf (2888) / io_registry_entry_get_
+     * property_bin_buf (2889): the request tail is {caller buffer pointer (8),
+     * buffer size (8)} INLINE in the body; the kernel copies the serialized
+     * property data straight to that address.  A guest pointer in a shadowed
+     * range (wine's low 4GB) is not host-valid -> kIOReturnVMError and every
+     * registry property read in a Wine process fails (Metal GPU enumeration,
+     * wine's SMBIOS queries).  Rewrite to the host address for the trap. */
+    if ((msg_id == 2888 || msg_id == 2889) && n < max_saved) {
+        uint32_t msz = (uint32_t)ocerz_ld(gmsg + 4, 4);
+        if (msz >= 0x30 && (!send_size || msz <= send_size)) {
+            uint64_t poff = msz - 0x10;
+            uint64_t ga = ocerz_ld(gmsg + poff, 8);
+            if (ga) {
+                uint64_t ha = (uint64_t)(uintptr_t)ocerz_g2h(ga);
+                if (ha != ga) {
+                    saved[n].off = poff;
+                    saved[n].orig = ga;
+                    n++;
+                    ocerz_st(gmsg + poff, 8, ha);
+                }
+            }
+        }
+    }
     if ((msg_id == 4815 || msg_id == 4816) &&
         (!send_size || send_size >= 0x28) && n < max_saved) {
         uint64_t ga = ocerz_ld(gmsg + 0x20, 8);
@@ -3827,6 +3867,12 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 60:
     case 61:
     case 70: {
+        static int plog = -1;
+        if (plog < 0) plog = getenv("OCERZ_PORTLOG") ? 1 : 0;
+        if (plog && (num == 18 || num == 19))
+            fprintf(stderr, "ocerz: PORTLOG[%d] %s name=%#llx right=%#llx delta=%#llx\n",
+                    (int)getpid(), mach_trap_name(num), (unsigned long long)a[1],
+                    (unsigned long long)a[2], (unsigned long long)a[3]);
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }
@@ -3966,6 +4012,42 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                     (uint32_t)ocerz_ld(request_buf, 4), (uint32_t)ocerz_ld(request_buf + 8, 4),
                     (uint32_t)ocerz_ld(request_buf + 0xc, 4),
                     (uint32_t)ocerz_ld(request_buf + 0x14, 4), nsv47);
+        {
+            /* pre-trap request dump for IOKit MIG (the reply overwrites the buffer) */
+            static int iomigq = -1;
+            if (iomigq < 0) { const char *e = getenv("OCERZ_IOKITMIG"); iomigq = e ? atoi(e) : 0; }
+            uint32_t qid = request_buf ? (uint32_t)ocerz_ld(request_buf + 0x14, 4) : 0;
+            if (iomigq >= 2 && qid >= 2800 && qid < 2900) {
+                uint32_t qbits = (uint32_t)ocerz_ld(request_buf, 4);
+                uint32_t qsize = (uint32_t)ocerz_ld(request_buf + 4, 4);
+                uint32_t qdcnt = (qbits & 0x80000000u) ? (uint32_t)ocerz_ld(request_buf + 0x18, 4) : 0;
+                fprintf(stderr, "ocerz: IOKITREQ[%d] id=%u dest=%#x bits=%#x size=%#x dcnt=%u opts=%#llx\n",
+                        (int)getpid(), qid, (uint32_t)a[3], qbits, qsize, qdcnt, (unsigned long long)a[1]);
+                uint64_t qoff = 0x1c;
+                for (uint32_t d = 0; d < qdcnt && d < 8; d++) {
+                    uint8_t ty = (uint8_t)ocerz_ld(request_buf + qoff + 11, 1);
+                    if (ty >= 1 && ty <= 3) {
+                        uint64_t ga = ocerz_ld(request_buf + qoff, 8);
+                        uint32_t oolsz = (uint32_t)ocerz_ld(request_buf + qoff + 12, 4);
+                        int rdb = ga != 0 && ocerz_addr_readable(ga);
+                        fprintf(stderr, "ocerz: IOKITREQ[%d]   desc[%u] type=%u ool ga=%#llx sz=%#x g2h=%#llx readable=%d head=%08x\n",
+                                (int)getpid(), d, ty, (unsigned long long)ga, oolsz,
+                                ga ? (unsigned long long)(uintptr_t)ocerz_g2h(ga) : 0, rdb,
+                                rdb ? (uint32_t)ocerz_ld(ga, 4) : 0);
+                        qoff += 16;
+                    } else if (ty == 0) {
+                        fprintf(stderr, "ocerz: IOKITREQ[%d]   desc[%u] port=%#x disp=%u\n",
+                                (int)getpid(), d, (uint32_t)ocerz_ld(request_buf + qoff, 4),
+                                (uint8_t)ocerz_ld(request_buf + qoff + 10, 1));
+                        qoff += 12;
+                    } else qoff += 16;
+                }
+                fprintf(stderr, "ocerz: IOKITREQ[%d]   body:", (int)getpid());
+                for (uint64_t o = 0x18; o < 0x98 && o + 4 <= qsize; o += 4)
+                    fprintf(stderr, " %08x", (uint32_t)ocerz_ld(request_buf + o, 4));
+                fprintf(stderr, "\n");
+            }
+        }
         if (request_buf != 0 && OCERZ_ENV_ON("OCERZ_VMMAPPROBE") &&
             (uint32_t)ocerz_ld(request_buf + 0x14, 4) == 4811) {
             fprintf(stderr, "ocerz: VMMAPREQ id=4811 dcnt=%u portname=%#x raw18:",
@@ -4039,18 +4121,78 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_reply_alias_iokit(vm, mach_reply_buf, mach_reply_size);
         {
-            /* light IOKit MIG log: request id 2800..2999 -> reply id, RetCode/first words */
+            /* light IOKit MIG log: request id 2800..2999 -> reply id, RetCode/first words.
+             * Level 2 also prints reply port descriptors (entry/iterator ports handed to
+             * the guest) and, on MACH_SEND_INVALID_DEST, the host's view of the dest name. */
             static int iomig = -1;
-            if (iomig < 0) iomig = getenv("OCERZ_IOKITMIG") ? 1 : 0;
+            if (iomig < 0) { const char *e = getenv("OCERZ_IOKITMIG"); iomig = e ? atoi(e) : 0; if (e && !iomig) iomig = 1; }
             if (iomig && request_buf != 0) {
                 uint32_t rid = (uint32_t)ocerz_ld(request_buf + 0x14, 4);
                 if (rid >= 2800 && rid < 3000) {
+                    /* mach_msg2: header ports live in the trap scalars (a[3] = remote|local),
+                     * the buffer header copy is often zeroed */
+                    uint32_t dport = (uint32_t)a[3];
+                    if (!dport) dport = (uint32_t)ocerz_ld(request_buf + 8, 4);
                     uint32_t repid = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4) : 0;
                     uint32_t w0 = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf + 0x20, 4) : 0;
                     uint32_t w1 = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf + 0x24, 4) : 0;
                     uint32_t rbits = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf, 4) : 0;
                     fprintf(stderr, "ocerz: IOKITMIG[%d] req=%u rport=%#x -> kr=%#llx reply_id=%u bits=%#x w0=%#x w1=%#x\n",
-                            (int)getpid(), rid, (uint32_t)ocerz_ld(request_buf + 8, 4), (unsigned long long)r47, repid, rbits, w0, w1);
+                            (int)getpid(), rid, dport, (unsigned long long)r47, repid, rbits, w0, w1);
+                    if (r47 == 0x10000003ull /* MACH_SEND_INVALID_DEST */) {
+                        mach_port_type_t pt = 0;
+                        kern_return_t tkr = mach_port_type(mach_task_self(), dport, &pt);
+                        fprintf(stderr, "ocerz: IOKITMIG[%d]   dest %#x host mach_port_type kr=%d type=%#x\n",
+                                (int)getpid(), dport, tkr, pt);
+                    }
+                    if (iomig >= 2 && (rid == 2989 || rid == 2984 || rid == 2988 || r47 != 0)) {
+                        uint32_t qbits = (uint32_t)ocerz_ld(request_buf, 4);
+                        uint32_t qsize = (uint32_t)ocerz_ld(request_buf + 4, 4);
+                        uint32_t qdcnt = (qbits & 0x80000000u) ? (uint32_t)ocerz_ld(request_buf + 0x18, 4) : 0;
+                        fprintf(stderr, "ocerz: IOKITMIG[%d]   req=%u qbits=%#x qsize=%#x dcnt=%u opts=%#llx\n",
+                                (int)getpid(), rid, qbits, qsize, qdcnt, (unsigned long long)a[1]);
+                        uint64_t qoff = 0x1c;
+                        for (uint32_t d = 0; d < qdcnt && d < 8; d++) {
+                            uint8_t ty = (uint8_t)ocerz_ld(request_buf + qoff + 11, 1);
+                            if (ty >= 1 && ty <= 3) {
+                                uint64_t ga = ocerz_ld(request_buf + qoff, 8);
+                                uint32_t oolsz = (uint32_t)ocerz_ld(request_buf + qoff + 12, 4);
+                                uint64_t ha = ga ? (uint64_t)(uintptr_t)ocerz_g2h(ga) : 0;
+                                int rdb = ga != 0 && ocerz_addr_readable(ga);
+                                uint32_t b0 = rdb ? (uint32_t)ocerz_ld(ga, 4) : 0;
+                                fprintf(stderr, "ocerz: IOKITMIG[%d]     desc[%u] type=%u ool ga=%#llx sz=%#x g2h=%#llx readable=%d bytes0=%08x\n",
+                                        (int)getpid(), d, ty, (unsigned long long)ga, oolsz,
+                                        (unsigned long long)ha, rdb, b0);
+                                qoff += 16;
+                            } else if (ty == 0) {
+                                fprintf(stderr, "ocerz: IOKITMIG[%d]     desc[%u] port=%#x disp=%u\n",
+                                        (int)getpid(), d, (uint32_t)ocerz_ld(request_buf + qoff, 4),
+                                        (uint8_t)ocerz_ld(request_buf + qoff + 10, 1));
+                                qoff += 12;
+                            } else { qoff += 16; }
+                        }
+                        /* inline body head (the matching dict may be inline, not ool) */
+                        fprintf(stderr, "ocerz: IOKITMIG[%d]     body:", (int)getpid());
+                        for (uint64_t o = 0x18; o < 0x58 && o + 4 <= qsize; o += 4)
+                            fprintf(stderr, " %08x", (uint32_t)ocerz_ld(request_buf + o, 4));
+                        fprintf(stderr, "\n");
+                    }
+                    if (iomig >= 2 && mach_reply_buf && (rbits & 0x80000000u)) {
+                        uint32_t dcnt = (uint32_t)ocerz_ld(mach_reply_buf + 0x18, 4);
+                        uint64_t doff = 0x1c;
+                        for (uint32_t d = 0; d < dcnt && d < 16; d++) {
+                            uint8_t ty = (uint8_t)ocerz_ld(mach_reply_buf + doff + 11, 1);
+                            if (ty == 0) {   /* port descriptor */
+                                fprintf(stderr, "ocerz: IOKITMIG[%d]   reply_id=%u port-desc[%u]=%#x disp=%u\n",
+                                        (int)getpid(), repid, d,
+                                        (uint32_t)ocerz_ld(mach_reply_buf + doff, 4),
+                                        (uint8_t)ocerz_ld(mach_reply_buf + doff + 10, 1));
+                                doff += 12;
+                            } else if (ty >= 1 && ty <= 3) doff += 16;
+                            else if (ty == 4) doff += 16;
+                            else break;
+                        }
+                    }
                 }
             }
         }
