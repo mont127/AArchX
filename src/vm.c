@@ -106,6 +106,29 @@ static __thread sigjmp_buf *g_sig_recover;
 #define OCERZ_SIG_MAX_REPEAT 16
 
 extern __thread int ocerz_jit_exec_state;
+/* per-thread ring of fault-recovery events (what unwound guest execution
+ * mid-flight); dumped by the UD2 diagnostics to correlate aborts like the
+ * libplatform os_unfair_lock recursion with a preceding recovery */
+static __thread struct { uint32_t n; struct { uint8_t kind; uint64_t rip; uint64_t icount; } e[16]; } g_recov_ring;
+static const char *const g_recov_names[] = { "?", "ras-overflow", "align-interp", "worker-term", "commpage-interp", "sig-deliver", "wild-term" };
+void ocerz_recov_note(int kind, uint64_t rip)
+{
+    unsigned i = g_recov_ring.n++ & 15;
+    g_recov_ring.e[i].kind = (uint8_t)kind;
+    g_recov_ring.e[i].rip = rip;
+    g_recov_ring.e[i].icount = g_vm ? g_vm->insn_count : 0;
+}
+void ocerz_recov_dump(FILE *f)
+{
+    fprintf(f, "ocerz: RECOV[%d] total=%u:", (int)getpid(), g_recov_ring.n);
+    unsigned n = g_recov_ring.n < 16 ? g_recov_ring.n : 16;
+    for (unsigned i = 0; i < n; i++) {
+        unsigned j = (g_recov_ring.n - n + i) & 15;
+        fprintf(f, " %s@%#llx/ic=%#llx", g_recov_names[g_recov_ring.e[j].kind],
+                (unsigned long long)g_recov_ring.e[j].rip, (unsigned long long)g_recov_ring.e[j].icount);
+    }
+    fprintf(f, "\n");
+}
 static __thread uint64_t g_riphist[32];
 static __thread unsigned g_riphist_n;
 static int g_crash_stack;
@@ -497,8 +520,9 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 g_cur_cpu->sig_repeat = 0;
                 g_cur_cpu->interp_once = 1;
                 if (getenv("OCERZ_RASLOG"))
-                    fprintf(stderr, "ocerz: host RAS overflow at rip=%#llx sp=%#llx: CALL via interpreter\n",
-                            (unsigned long long)jrip, (unsigned long long)uc->uc_mcontext->__ss.__sp);
+                    fprintf(stderr, "ocerz: host RAS overflow[%d] at rip=%#llx sp=%#llx: CALL via interpreter\n",
+                            (int)getpid(), (unsigned long long)jrip, (unsigned long long)uc->uc_mcontext->__ss.__sp);
+                ocerz_recov_note(1, jrip);
                 depth = 0;
                 siglongjmp(*g_sig_recover, 1);
             }
@@ -531,7 +555,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 g_cur_cpu->sig_repeat = 0;
                 g_cur_cpu->interp_once = 1;
                 if (getenv("OCERZ_ALFAULTLOG"))
-                    fprintf(stderr, "ocerz: ALFAULT rip=%#llx addr=%p\n", (unsigned long long)jrip, si->si_addr);
+                    fprintf(stderr, "ocerz: ALFAULT[%d] rip=%#llx addr=%p\n", (int)getpid(), (unsigned long long)jrip, si->si_addr);
+                ocerz_recov_note(2, jrip);
                 depth = 0;
                 siglongjmp(*g_sig_recover, 1);
             }
@@ -612,6 +637,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 write(2, wb, (size_t)(w - wb));
             }
             g_cur_cpu->terminated = 1;
+            ocerz_recov_note(3, g_cur_cpu->rip);
             depth = 0;
             siglongjmp(*g_sig_recover, 1);
         }
@@ -698,6 +724,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 fprintf(stderr, "ocerz: CPFAULT rip=%#llx gaddr=%#llx\n", (unsigned long long)fault_rip, (unsigned long long)gaddr);
                 ocerz_cpu_dump(g_cur_cpu, stderr);
             }
+            ocerz_recov_note(4, fault_rip);
             depth = 0;
             siglongjmp(*g_sig_recover, 1);
         }
@@ -839,8 +866,10 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             }
         }
         depth = 0;
-        if (delivered)
+        if (delivered) {
+            ocerz_recov_note(5, fault_rip);
             siglongjmp(*g_sig_recover, 1);
+        }
     }
 
     if (g_cur_cpu && g_sig_recover && depth == 0 &&
@@ -894,6 +923,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 }
             }
             g_cur_cpu->terminated = 1;
+            ocerz_recov_note(6, g_cur_cpu->rip);
             siglongjmp(*g_sig_recover, 1);
         }
     }

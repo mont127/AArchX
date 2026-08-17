@@ -1160,6 +1160,8 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
             return OCERZ_STEP_OK;
         }
         if (getenv("OCERZ_UD2DUMP")) {
+            extern void ocerz_recov_dump(FILE *);
+            ocerz_recov_dump(stderr);
             uint64_t gs = cpu->gs_base;
             uint64_t gate = cpu->gpr[OCERZ_RDX];
             fprintf(stderr, "ocerz: UD2DUMP rip=%#llx gs_base=%#llx gs+0x18=%#llx "
