@@ -1099,6 +1099,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = buf;
         p = str_into(p, "  bt:");
         for (uint64_t a = sp; a < sp + 0x400 && shown < 14; a += 8) {
+            if (!ocerz_addr_readable(a)) break;         /* the report must not fault itself */
             uint64_t v = ocerz_ld(a, 8);
             if (v >= 0x7ff802000000ull && v < 0x7ff818000000ull) {
                 p = str_into(p, " ");

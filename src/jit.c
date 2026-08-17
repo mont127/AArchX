@@ -215,7 +215,7 @@ static int g_chain_keeps_jgb;      /* the CALL path branches to the chain tail w
 /* RAS slot literals: `ldr Xt, <lit>` sites whose 8-byte slot cell is placed in
  * a pool at the end of the block (patched + registered there) */
 typedef struct { uint32_t *site; uint64_t retaddr; uint64_t hi; int kind; int rt; } RasLit;   /* kind 0: RAS cell for retaddr; 1: 8-byte constant (retaddr = value); 2: 16-byte constant {retaddr, hi} loaded into V rt */
-#define RASLIT_MAX 32
+#define RASLIT_MAX 96
 static RasLit g_raslit[RASLIT_MAX];
 static int g_n_raslit;
 /* per-site caches for indirect jmp/call: 32 direct-mapped {rip, body} entries */
@@ -281,6 +281,12 @@ static int superblock_enabled(void)
 {
     static int en = -1;
     if (en < 0) en = getenv("OCERZ_NO_SUPERBLOCK") ? 0 : 1;
+    return en;
+}
+static int superblock_back_enabled(void)      /* continue past backward jcc too (OCERZ_NO_SB_BACK disables) */
+{
+    static int en = -1;
+    if (en < 0) en = getenv("OCERZ_NO_SB_BACK") ? 0 : 1;
     return en;
 }
 static uint32_t g_push_fix[JIT_MAX_BLOCK_INSNS];   /* offsets relative to the block entry */
@@ -404,6 +410,16 @@ static inline int hoist_reg_for(unsigned base)
         if (!dis) return pin_hreg(pin_slot(base));
     }
     return -1;
+}
+/* [base + index*1 + disp] == [index + base*1 + disp]: when only the index
+ * register is hoisted, view it as the base (the caller decides the stack
+ * heuristic on the original operand before swapping) */
+static const X86Operand *mem_hoist_view(const X86Operand *m, X86Operand *tmp)
+{
+    if (m->riprel || m->base == OCERZ_REG_NONE || m->index == OCERZ_REG_NONE || (m->scale & 3) != 0) return m;
+    if (hoist_reg_for(m->base) >= 0 || hoist_reg_for(m->index) < 0) return m;
+    *tmp = *m; tmp->base = m->index; tmp->index = m->base;
+    return tmp;
 }
 /* x0 holds ocerz_guest_base for the whole block (materialized at function
  * entry and after every C callout; C calls set x0 themselves).  Only used
@@ -1196,6 +1212,19 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
             g_nzcv_kind = is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB;
             g_nzcv_from = g_cur_insn_idx;
             return 1;
+        }
+        {   /* add r,-k == sub r,k for every flag (CF included), so the opposite
+             * flag-setting immediate form serves with the ORIGINAL op's NZCV
+             * interpretation (add: CF == C; sub: CF == !C) */
+            uint64_t neg = (0ull - v) & (sf ? UINT64_MAX : 0xffffffffull);
+            if (imm && (is_add || is_sub) && !need && neg >= 1 && neg <= 4095) {
+                int rdst = writes ? rd : A64_ZR;
+                if (is_add) a64_subs_imm(b, sf, rdst, rd, (uint32_t)neg);
+                else        a64_adds_imm(b, sf, rdst, rd, (uint32_t)neg);
+                g_nzcv_kind = is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB;
+                g_nzcv_from = g_cur_insn_idx;
+                return 1;
+            }
         }
         if (imm) { a64_mov_imm64(b, JT1, v); rm = JT1; }
         else rm = pin_hreg(pin_slot(s->reg));
@@ -2394,10 +2423,11 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
         insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || mem->riprel ||
         mem->base == OCERZ_REG_NONE)
         return 0;
+    int plain = mem_plain_access_ok(mem);
+    X86Operand mview; mem = mem_hoist_view(mem, &mview);
     int hbase = hoist_reg_for(mem->base);
     if (hbase < 0)
         return 0;
-    int plain = mem_plain_access_ok(mem);
 
     int64_t disp = mem->disp;
     if (mem->index == OCERZ_REG_NONE) {
@@ -2703,6 +2733,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
     if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
     int plain = mem_plain_access_ok(m);
+    X86Operand mview; m = mem_hoist_view(m, &mview);
     int hb = pin_hreg(pin_slot(m->base));
     /* hoisted base: JMEMBASE/JMEMBASE2 already holds guest_base + base */
     int hreg = hoist_reg_for(m->base);
@@ -2888,6 +2919,7 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
     }
     if (op->base != OCERZ_REG_NONE && pin_slot(op->base) < 0) return 0;
     if (op->index != OCERZ_REG_NONE && pin_slot(op->index) < 0) return 0;
+    X86Operand mview; op = mem_hoist_view(op, &mview);
     int64_t disp = op->disp;
     int fits = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
     int have = 0;
@@ -2955,6 +2987,7 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
 {
     int ra; uint32_t disp;
     int plain = mem_plain_access_ok(op);
+    X86Operand mview; op = mem_hoist_view(op, &mview);
     /* base + index (scale 1 or the access size), no displacement (or the
      * hoisted aux displacement): register-offset load */
     int aux_disp_ok = op->disp != 0 && g_pin_class != 2 && g_mem_hoist_aux_index < 0 &&
@@ -3938,6 +3971,11 @@ static int cc_after_adds(unsigned cc)
  * a single arm64 condition on the NZCV it just set, it emits only the compare
  * and reports the condition here (else -1 and the NE <=> taken contract). */
 static int g_cc_direct = -1;
+/* value-cond E/NE on a pinned register: when the caller allows it
+ * (g_cc_want_cbz), the predicate emits nothing and reports the register so
+ * the branch is a single cbz/cbnz instead of cmp + b.cond */
+static int g_cc_want_cbz;
+static int g_cc_cbz_reg = -1, g_cc_cbz_sf, g_cc_cbz_nz;
 static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct);
 static void emit_cc_predicate(A64Buf *b, unsigned cc)
 {
@@ -3946,6 +3984,7 @@ static void emit_cc_predicate(A64Buf *b, unsigned cc)
 static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
 {
     g_cc_direct = -1;
+    g_cc_cbz_reg = -1;
     if (getenv("OCERZ_CCLOG")) {
         char tb[96] = "(none)";
         if (g_flag_producer) ocerz_format_insn(g_flag_producer, tb, sizeof tb);
@@ -3986,6 +4025,11 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         if (pi >= 0) {
             const X86Operand *d = &g_cur_insns[pi].ops[0];
             int rd = pin_hreg(pin_slot(d->reg));
+            if (want_direct && g_cc_want_cbz && (cc == OCERZ_CC_E || cc == OCERZ_CC_NE)) {
+                g_cc_cbz_reg = rd; g_cc_cbz_sf = d->size == 8; g_cc_cbz_nz = cc == OCERZ_CC_NE;
+                g_cc_direct = cc == OCERZ_CC_E ? A64_EQ : A64_NE;
+                return;
+            }
             a64_subs_imm(b, d->size == 8, A64_ZR, rd, 0);
             int dc = cc == OCERZ_CC_E ? A64_EQ : cc == OCERZ_CC_NE ? A64_NE :
                      cc == OCERZ_CC_S ? A64_MI : A64_PL;
@@ -7202,8 +7246,13 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         /* superblock side exit: the record (if anything may read the flags on
          * either path) goes inline before the branch; the taken side is an
          * out-of-line chain stub registered in g_side; fall-through continues */
-        int need_rec = g_jcc_side_need != 0 || g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0;
-        if (need_rec) {
+        int taken_live = g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0;
+        int need_rec = g_jcc_side_need != 0 || taken_live;
+        /* the record goes before the branch only when the taken side may read
+         * it; when only the fall-through continuation needs the flags it goes
+         * after the branch (the record instructions do not touch NZCV) */
+        int rec_after = need_rec && !taken_live;
+        if (need_rec && !rec_after) {
             if (producer->op == OCERZ_OP_CMP) {
                 if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
                 emit_defer_flags(b, ccop, record_src, record_dst);
@@ -7231,6 +7280,18 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             else                       a64_cbnz(b, cbz_sf, cbz_rn, 0);
         } else {
             a64_bcond(b, taken_cond, 0);
+        }
+        if (rec_after) {
+            if (producer->op == OCERZ_OP_CMP) {
+                if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
+                emit_defer_flags(b, ccop, record_src, record_dst);
+            } else {
+                if (test_bit >= 0) {
+                    a64_mov_imm64(b, JT2, test_mask);
+                    a64_and_reg(b, 1, JT2, test_rn, JT2, 0);
+                }
+                emit_defer_flags(b, ccop, JT2, JT2);
+            }
         }
         return 1;
     }
@@ -7979,7 +8040,9 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
      * (no C call) or, failing that, materialize + RFLAGS. */
     int self_loop = !g_no_chain && g_loop_entry && taken == g_self_rip;
     int two_way = !self_loop && !g_no_chain && !g_no_jcclink;
+    g_cc_want_cbz = two_way;
     emit_cc_predicate_ex(b, cc, two_way || self_loop);
+    g_cc_want_cbz = 0;
     int direct = (two_way || self_loop) ? g_cc_direct : -1;
     if (self_loop && direct >= 0) {
         /* direct condition on the back edge (patchable stop site); the exit
@@ -8043,13 +8106,18 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         int edge_class = body_edge_pin_class();
         int body_edge = edge_class >= 0;
         uint32_t *to_taken = a64_label(b);
+        if (g_cc_cbz_reg >= 0) {
+            if (g_cc_cbz_nz) a64_cbnz(b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
+            else             a64_cbz(b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
+        } else
         a64_bcond(b, direct >= 0 ? direct : A64_NE, 0);
 
         uint32_t *pb_fall = emit_static_chain_tail(
             b, fall, poll_fall, body_edge, epilogue_sites, n_epi);
 
         uint32_t *ltaken = a64_label(b);
-        a64_patch_bcond(to_taken, ltaken);
+        if ((*to_taken & 0x7e000000u) == 0x34000000u) a64_patch_cbz(to_taken, ltaken);   /* cbz/cbnz site */
+        else a64_patch_bcond(to_taken, ltaken);
         uint32_t *pb_taken = emit_static_chain_tail(
             b, taken, poll_taken, body_edge, epilogue_sites, n_epi);
         g_jcc_edge[0].target_rip = fall;
@@ -9432,6 +9500,10 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
             if (pin_slot(mem->base) < 0) continue;
             unsigned bb = mem->base & 15;
             count[bb]++;
+            /* a scale-1 index is a base too ([b + i] == [i + b]) */
+            if (mem->index != OCERZ_REG_NONE && (mem->scale & 3) == 0 && pin_slot(mem->index) >= 0 &&
+                !(g_pin_class == 2 && mem->index == OCERZ_RSP))
+                count[mem->index & 15]++;
             if (g_pin_class != 2 && mem->index != OCERZ_REG_NONE &&
                 mem->disp != 0 && mem->disp >= -4095 && mem->disp <= 4095 && aux[bb] == 0)
                 aux[bb] = (int)mem->disp;
@@ -9449,6 +9521,8 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
         else if (count[r] > secondn) { third = second; thirdn = secondn; second = r; secondn = count[r]; }
         else { third = r; thirdn = count[r]; }
     }
+    if (getenv("OCERZ_HOISTLOG") && best < 0)
+        fprintf(stderr, "HOIST rip=%#llx no candidate (self_loop=%d n=%d)\n", (unsigned long long)rip, self_loop, n);
     if (best < 0 || bestn < min_count) return -1;
     if (secondn < min_count) second = -1;
     if (thirdn < min_count) third = -1;
@@ -9792,7 +9866,12 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                     if (op == OCERZ_OP_JCC && superblock_enabled() && !g_no_chain &&
                         vext < SIDE_MAX && vn < JIT_MAX_BLOCK_INSNS - 1 &&
                         scratch[vn - 1].ops[0].kind == OCERZ_OPK_IMM &&
-                        scratch[vn - 1].ops[0].imm > vpc + len) {
+                        (scratch[vn - 1].ops[0].imm > vpc + len ||
+                         /* backward jcc that is not this block's own back edge:
+                          * the taken side is a loop elsewhere, the fall-through
+                          * continues inline (no chained b for the not-taken path) */
+                         (superblock_back_enabled() && scratch[vn - 1].ops[0].imm != rip &&
+                          scratch[vn - 1].ops[0].imm < vpc))) {
                         vext++;
                         vpc += len;
                         continue;
@@ -10334,6 +10413,32 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             if (pdef & JIT_ARITH_FLAGS)
                 last_flag_def = i;
         }
+        /* superblock side exit fused with its cmp/test producer over one
+         * flag-neutral gap instruction: cmp ; lea|mov ; jcc */
+        if (g_n_side < SIDE_MAX && i + 2 < n - 1 && !g_no_jccfuse && g_defer &&
+            (insn->op == OCERZ_OP_CMP || insn->op == OCERZ_OP_TEST) &&
+            blk->insns[i + 2].op == OCERZ_OP_JCC && blk->insns[i + 2].ops[0].kind == OCERZ_OPK_IMM &&
+            blk->insns[i + 2].ops[0].imm != g_self_rip && insn->addrsize == 8 &&
+            can_fuse_cmp_test_jcc(insn, &blk->insns[i + 2], g_self_rip) &&
+            flag_neutral_ok(&blk->insns[i + 1])) {
+            uint32_t *jcc_label = NULL, *gap_label = NULL;
+            if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
+            g_jcc_side_mode = 1;
+            g_jcc_side_need = fl_need[i];
+            int fused = emit_cmp_test_jcc(&b, insn, &blk->insns[i + 2], epi_sites, &n_epi,
+                                          &jcc_label, exit_sites, &n_exits,
+                                          &blk->insns[i + 1], &gap_label);
+            g_jcc_side_mode = 0;
+            if (fused && jcc_label && gap_label) {
+                if (blk->insn_off) {
+                    blk->insn_off[i + 1] = (uint32_t)(gap_label - entry);
+                    blk->insn_off[i + 2] = (uint32_t)(jcc_label - entry);
+                }
+                blk->n_inlined += 3;
+                i += 2;
+                continue;
+            }
+        }
         /* superblock side exit fused with its cmp/test producer */
         if (g_n_side < SIDE_MAX && side_fuse_ok(blk->insns, i, n)) {
             uint32_t *jcc_label = NULL;
@@ -10354,7 +10459,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         if (i < n - 1 && insn->op == OCERZ_OP_JCC) {
             if (fpb_open >= 0) { fpb_emit_check(&b, &g_fpb[fpb_open]); fpb_open = -1; g_fpb_fast = 0; l0_reset(); }
             if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
+            g_cc_want_cbz = 1;
             emit_cc_predicate_ex(&b, insn->cc, 1);
+            g_cc_want_cbz = 0;
             int cond = g_cc_direct >= 0 ? g_cc_direct : A64_NE;
             if (g_n_side < SIDE_MAX) {
                 g_side[g_n_side].site = a64_label(&b);
@@ -10362,6 +10469,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 g_side[g_n_side].idx = i;
                 g_side[g_n_side].stub = NULL;
                 g_side[g_n_side].patch_b = NULL;
+                if (g_cc_cbz_reg >= 0) {                     /* value-cond E/NE: one cbz/cbnz */
+                    if (g_cc_cbz_nz) a64_cbnz(&b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
+                    else             a64_cbz(&b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
+                } else
                 a64_bcond(&b, cond, 0);                    /* patched to the OOL stub */
                 g_n_side++;
             } else {
