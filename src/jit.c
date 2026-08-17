@@ -3937,6 +3937,65 @@ static int mem_plain_ok(const X86Insn *insn, const X86Operand *op)
     if (op->index != OCERZ_REG_NONE && pin_slot(op->index) < 0) return 0;
     return 1;
 }
+static int nzcv_fuse_producer(const X86Insn *insns, int ci);
+static int flag_neutral_ok(const X86Insn *in);
+#define NZCV_GAP_MAX 3
+static int nzcv_gap_max(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("OCERZ_NZCV_GAP"); v = e ? atoi(e) : NZCV_GAP_MAX; if (v < 0) v = 0; if (v > NZCV_GAP_MAX) v = NZCV_GAP_MAX; }
+    return v;
+}
+static int nzcv_producer_candidate(const X86Insn *p)
+{
+    switch (p->op) {
+    case OCERZ_OP_CMP: case OCERZ_OP_SUB: case OCERZ_OP_ADD:
+    case OCERZ_OP_TEST: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
+    case OCERZ_OP_BSF: case OCERZ_OP_BSR:
+    case OCERZ_OP_BT: case OCERZ_OP_BTS: case OCERZ_OP_BTR: case OCERZ_OP_BTC:
+        return 1;
+    default:
+        return 0;
+    }
+}
+/* shape test (no producer needed yet): may `in` sit between a producer and a
+ * consumer without touching NZCV? */
+static int nzcv_gap_shape(const X86Insn *in)
+{
+    if (nzcv_gap_max() == 0) return 0;
+    if (in->op == OCERZ_OP_CMOVCC) {
+        const X86Operand *d = &in->ops[0], *sr = &in->ops[1];
+        return d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 4 || d->size == 8) &&
+               sr->kind == OCERZ_OPK_REG && !sr->high8 && sr->size == d->size &&
+               pin_slot(d->reg) >= 0 && pin_slot(sr->reg) >= 0 && g_pin_class == 3;
+    }
+    if (in->op == OCERZ_OP_SETCC) {
+        const X86Operand *d = &in->ops[0];
+        return d->kind == OCERZ_OPK_REG && !d->high8 && d->size == 1 && g_pin_class == 3;
+    }
+    return flag_neutral_ok(in);
+}
+static int nzcv_dc_for(unsigned kind, unsigned cc);
+/* full check once the producer k is known: a cmov/setcc in the gap must itself
+ * forward NZCV from k with a real (non AL/NV) condition, so its emitter is a
+ * single csel/cset */
+static int nzcv_gap_ok(const X86Insn *insns, int m, int k)
+{
+    const X86Insn *in = &insns[m];
+    if (in->op == OCERZ_OP_CMOVCC || in->op == OCERZ_OP_SETCC) {
+        if (!nzcv_gap_shape(in)) return 0;
+        if (nzcv_fuse_producer(insns, m) != k) return 0;
+        const X86Insn *p = &insns[k];
+        unsigned kind = (p->op == OCERZ_OP_CMP || p->op == OCERZ_OP_SUB) ? OCERZ_CC_SUB :
+                        p->op == OCERZ_OP_ADD ? OCERZ_CC_ADD :
+                        (p->op == OCERZ_OP_BSF || p->op == OCERZ_OP_BSR) ? OCERZ_CC_SUB :
+                        (p->op == OCERZ_OP_BT || p->op == OCERZ_OP_BTS || p->op == OCERZ_OP_BTR || p->op == OCERZ_OP_BTC) ? NZCV_KIND_BT :
+                        OCERZ_CC_LOGIC;
+        int dc = nzcv_dc_for(kind, in->cc);
+        return dc >= 0 && dc != A64_AL && dc != A64_NV;
+    }
+    return flag_neutral_ok(in);
+}
 static int nzcv_fuse_producer(const X86Insn *insns, int ci)
 {
     static int dis = -1;
@@ -3949,7 +4008,16 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     else if (c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) cc = OCERZ_CC_B;
     else if (c->op == OCERZ_OP_JCC) cc = c->cc;   /* superblock side exit or the terminator (sub/add/logic + jcc; cmp/test+jcc pairs fuse earlier) */
     else return -1;
-    const X86Insn *p = &insns[ci - 1];
+    /* the producer: the nearest flag writer, at most NZCV_GAP_MAX NZCV-transparent
+     * instructions back (mov/lea, or a reg cmov/setcc that itself forwards from
+     * the same producer -- csel/cset leave NZCV alone) */
+    int k = ci - 1;
+    while (k >= 0 && ci - 1 - k < NZCV_GAP_MAX && !nzcv_producer_candidate(&insns[k]) && nzcv_gap_shape(&insns[k]))
+        k--;
+    if (k < 0 || !nzcv_producer_candidate(&insns[k])) return -1;
+    for (int m = k + 1; m < ci; m++)
+        if (!nzcv_gap_ok(insns, m, k)) return -1;
+    const X86Insn *p = &insns[k];
     unsigned kind;
     if (p->op == OCERZ_OP_BSF || p->op == OCERZ_OP_BSR) {
         /* bsf/bsr: ZF <=> source == 0 -> cmp source, #0 (E/NE only) */
@@ -3961,7 +4029,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
         else if (bs->kind == OCERZ_OPK_MEM) { if (!mem_plain_ok(p, bs) || bs->size != bd->size) return -1; }
         else return -1;
         if (g_pin_class == 2) return -1;
-        return ci - 1;
+        return k;
     }
     if (p->op == OCERZ_OP_BT || p->op == OCERZ_OP_BTS || p->op == OCERZ_OP_BTR || p->op == OCERZ_OP_BTC) {
         /* bt*: NZCV.Z <=> (old) bit clear (tst); only CF conditions make sense */
@@ -3973,7 +4041,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
         else if (bd->kind != OCERZ_OPK_MEM || p->op != OCERZ_OP_BT) return -1;
         if (bo->kind == OCERZ_OPK_REG) { if (bo->high8 || pin_slot(bo->reg) < 0 || (g_pin_class == 2 && bo->reg == OCERZ_RSP)) return -1; }
         else if (bo->kind != OCERZ_OPK_IMM) return -1;
-        return ci - 1;
+        return k;
     }
     switch (p->op) {
     case OCERZ_OP_CMP: case OCERZ_OP_SUB: kind = OCERZ_CC_SUB; if (cc_after_subs(cc) < 0) return -1; break;
@@ -4006,7 +4074,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
             if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE && cc != OCERZ_CC_B && cc != OCERZ_CC_AE &&
                 cc != OCERZ_CC_A && cc != OCERZ_CC_BE) return -1;
         } else return -1;
-        return ci - 1;
+        return k;
     }
     if (d->kind != OCERZ_OPK_REG || d->high8) return -1;
     if (pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return -1;
@@ -4017,7 +4085,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     } else if (sr->kind == OCERZ_OPK_MEM) {
         if (!mem_plain_ok(p, sr)) return -1;
     } else if (sr->kind != OCERZ_OPK_IMM) return -1;
-    return ci - 1;
+    return k;
 }
 /* after `adds`: CF = C (no inversion), same table as subs otherwise except B/AE */
 static int cc_after_adds(unsigned cc)
@@ -4041,6 +4109,13 @@ static void emit_cc_predicate(A64Buf *b, unsigned cc)
 {
     emit_cc_predicate_ex(b, cc, 0);
 }
+static int nzcv_dc_for(unsigned kind, unsigned cc)
+{
+    return kind == OCERZ_CC_SUB ? cc_after_subs(cc) :
+           kind == OCERZ_CC_ADD ? cc_after_adds(cc) :
+           kind == NZCV_KIND_BT ? (cc == OCERZ_CC_B ? A64_NE : cc == OCERZ_CC_AE ? A64_EQ : -1) :
+           cc_after_ands(cc);
+}
 static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
 {
     g_cc_direct = -1;
@@ -4051,7 +4126,7 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         fprintf(stderr, "ocerz: CCPRED cc=%u producer=%s\n", cc, tb);
     }
     /* NZCV forwarded from the adjacent producer */
-    if (g_nzcv_from >= 0 && g_cur_insns && g_nzcv_from == g_cur_insn_idx - 1 &&
+    if (g_nzcv_from >= 0 && g_cur_insns && g_nzcv_from < g_cur_insn_idx &&
         nzcv_fuse_producer(g_cur_insns, g_cur_insn_idx) == g_nzcv_from) {
         const X86Insn *c = &g_cur_insns[g_cur_insn_idx];
         unsigned want_cc = (c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) ? OCERZ_CC_B : c->cc;
@@ -10529,7 +10604,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         g_cur_insns = blk->insns;
         g_cur_fpb = fpb_of[i];
         ea_cache_step(insn, i > 0 ? &blk->insns[i - 1] : NULL);
-        g_nzcv_want = (i + 1 < n && nzcv_fuse_producer(blk->insns, i + 1) == i);
+        g_nzcv_want = 0;
+        for (int j = i + 1; j < n && j <= i + 1 + NZCV_GAP_MAX; j++)
+            if (nzcv_fuse_producer(blk->insns, j) == i) { g_nzcv_want = 1; break; }
         /* lane-0 caches: a callout since the last instruction clobbered V4-V7;
          * an xmm writer that is not cache-aware invalidates its destination */
         if (g_callout_seq != l0_last_seq) { l0_reset(); l0_last_seq = g_callout_seq; }
@@ -10679,7 +10756,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 continue;
             }
         }
-        if (i + 1 < n && !(i + 2 < n && nzcv_fuse_producer(blk->insns, i + 2) == i + 1)) {
+        int pair_consumed = 0;
+        for (int j = i + 2; j < n && j <= i + 2 + NZCV_GAP_MAX; j++)
+            if (nzcv_fuse_producer(blk->insns, j) == i + 1) { pair_consumed = 1; break; }
+        if (i + 1 < n && !pair_consumed) {
             uint32_t *logic_label = NULL;
             if (emit_mov_logic_pair(&b, insn, &blk->insns[i + 1],
                                     fl_need[i + 1], &logic_label)) {
