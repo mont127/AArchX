@@ -108,6 +108,7 @@ typedef struct JitBlock {
 
     uint16_t entry_live;
     uint16_t xmm_pinned;      /* xmmN held in V(16+N) for the block's body */
+    uint8_t ordered_loads;    /* the block emitted ordered loads (hot-patch arms: dmb store vs pieces) */
 } JitBlock;
 
 typedef struct JitCodeIndex {
@@ -155,6 +156,8 @@ typedef struct {
     uint32_t *bne;
     uint32_t *back;
     int size, rv, ra, store, idx;
+    int vec;                 /* rv is a V register: ldr/str q|d|s + barrier */
+    int32_t disp;
 } OrderedSlowPend;
 #define OSLOW_MAX 64
 static OrderedSlowPend g_oslow[OSLOW_MAX];
@@ -308,6 +311,59 @@ static void cp_mark(uint64_t rip)
 /* guards are needed for every access when: low-base shadow mapping (address
  * translation) or a marked block in commpage mode */
 static inline int mem_guard_needed(void) { return ocerz_low_base != 0 || g_cp_guard; }
+
+/* Ordered (multi-observer, x86-TSO) memory model costs: acquire loads and
+ * release stores are 3-6x slower than plain ones on Apple silicon.  Two
+ * mitigations, both bounded in what they assume:
+ *  - rsp-based accesses (push/pop/call/ret and [rsp+disp]) are treated as
+ *    thread-private and stay plain (OCERZ_TSO_STRICT=1 turns this off);
+ *  - alignment: an ldapur/stlur crossing a 16-byte granule faults; the
+ *    fault handler hot-patches that one instruction into a checked
+ *    out-of-line arm (ocerz_jit_hotpatch_align).  When a site cannot be
+ *    patched (branch range) the block is marked (al_mark) and its next
+ *    translation uses the alignment-checked emitters throughout
+ *    (g_align_guard), like the commpage marks. */
+static int stack_plain_ok(void)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("OCERZ_TSO_STRICT") ? 0 : 1;
+    return en;
+}
+#define AL_MARK_SIZE 256
+static uint64_t g_al_marks[AL_MARK_SIZE];
+static int g_al_nmarks;
+static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_align_guard;            /* this translation: alignment-checked ordered accesses */
+static unsigned long long ps_align_patches;   /* PERFSTAT: hot-patched alignment-fault sites */
+static int g_blk_ordered_loads;      /* this translation emitted an ordered load (throttles the store stream) */
+static int g_al_all;                 /* mark table full (or OCERZ_AL_GUARD_ALL): every block checked */
+static int al_marked(uint64_t rip)
+{
+    if (g_al_all) return 1;
+    for (int i = 0; i < g_al_nmarks; i++) if (g_al_marks[i] == rip) return 1;
+    return 0;
+}
+static void al_mark(uint64_t rip)
+{
+    if (al_marked(rip)) return;
+    if (g_al_nmarks < AL_MARK_SIZE) g_al_marks[g_al_nmarks++] = rip;
+    else g_al_all = 1;
+}
+/* stack protocol (push/pop/call/ret/leave and the RAS body-pointer scheme):
+ * plain accesses through [JGB, rsp] in plain mode or under the stack
+ * heuristic.  Evaluated per translation so the CALL/RET protocol stays
+ * uniform across the plain -> ordered transition (unless OCERZ_TSO_STRICT). */
+static inline int stack_plain_access_ok(void) { return g_plain_mem || stack_plain_ok(); }
+/* the plain (unordered) access forms may be used for this operand: single
+ * observer, or an rsp-based access under the stack heuristic */
+static inline int mem_plain_access_ok(const X86Operand *m)
+{
+    if (g_plain_mem) return 1;
+    return stack_plain_ok() && m->base == OCERZ_RSP && !m->riprel;
+}
+/* fast address forms are independent of the memory model */
+static inline int jgb_usable(void);
+static inline int mem_fast_forms_ok(void) { return jgb_usable() && !mem_guard_needed(); }
 /* stack accesses (push/pop/call/ret through [JGB, rsp]) and the RAS/CALL/RET
  * protocol never touch the commpage: independent of the per-block mark, so
  * every block in a process speaks the same RAS protocol */
@@ -2234,27 +2290,30 @@ static void emit_reload_mem_base(A64Buf *b)
     }
 }
 
+static void emit_gpr_ld_at(A64Buf *b, int size, int rd, int ra, int32_t disp, int plain);
+static void emit_gpr_st_at(A64Buf *b, int size, int rs, int ra, int32_t disp, int plain);
+static void emit_gpr_ld_regoff(A64Buf *b, int size, int rd, int ra, int ri, int scaled, int plain);
+static void emit_gpr_st_regoff(A64Buf *b, int size, int rs, int ra, int ri, int scaled, int plain);
 static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
                                    const X86Operand *mem, int size,
                                    int value_reg, int store)
 {
-    if (!g_plain_mem || g_mem_hoist_greg < 0 ||
+    if (g_mem_hoist_greg < 0 ||
         insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || mem->riprel ||
         mem->base == OCERZ_REG_NONE)
         return 0;
     int hbase = hoist_reg_for(mem->base);
     if (hbase < 0)
         return 0;
+    int plain = mem_plain_access_ok(mem);
 
     int64_t disp = mem->disp;
     if (mem->index == OCERZ_REG_NONE) {
         if (disp < 0 || (uint64_t)disp > (uint64_t)4095 * (uint64_t)size ||
             (disp & (size - 1)) != 0)
             return 0;
-        if (store)
-            a64_str(b, size, value_reg, hbase, (uint32_t)disp);
-        else
-            a64_ldr(b, size, value_reg, hbase, (uint32_t)disp);
+        if (store) emit_gpr_st_at(b, size, value_reg, hbase, (int32_t)disp, plain);
+        else       emit_gpr_ld_at(b, size, value_reg, hbase, (int32_t)disp, plain);
         return 1;
     }
 
@@ -2270,8 +2329,8 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
         /* JMEMAUX = base + index<<scale: immediate offset only */
         if (disp < 0 || (uint64_t)disp > (uint64_t)4095 * (uint64_t)size || (disp & (size - 1)) != 0)
             return 0;
-        if (store) a64_str(b, size, value_reg, JMEMAUX, (uint32_t)disp);
-        else       a64_ldr(b, size, value_reg, JMEMAUX, (uint32_t)disp);
+        if (store) emit_gpr_st_at(b, size, value_reg, JMEMAUX, (int32_t)disp, plain);
+        else       emit_gpr_ld_at(b, size, value_reg, JMEMAUX, (int32_t)disp, plain);
         return 1;
     }
     if (disp != 0 && disp == g_mem_hoist_aux_disp && g_mem_hoist_aux_index < 0 && hbase == JMEMBASE) {
@@ -2283,10 +2342,8 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
             a64_sub_imm(b, 1, JTA, hbase, (uint32_t)-disp);
         base = JTA;
     }
-    if (store)
-        a64_str_regoff(b, size, value_reg, base, pin_hreg(is), 1);
-    else
-        a64_ldr_regoff(b, size, value_reg, base, pin_hreg(is), 1);
+    if (store) emit_gpr_st_regoff(b, size, value_reg, base, pin_hreg(is), 1, plain);
+    else       emit_gpr_ld_regoff(b, size, value_reg, base, pin_hreg(is), 1, plain);
     return 1;
 }
 
@@ -2310,7 +2367,7 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
         a64_bcond(b, A64_NE, 0);
         a64_stlr(b, size, rv, ra);
         g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, rv, ra, 1,
-                                                g_cur_insn_idx };
+                                                g_cur_insn_idx, 0, 0 };
         g_n_oslow++;
         return;
     }
@@ -2331,6 +2388,7 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
         a64_ldr(b, size, rd, ra, 0);
         return;
     }
+    g_blk_ordered_loads = 1;
     if (size == 1) {
         if (g_no_ldapr) a64_ldar(b, 1, rd, ra);
         else            a64_ldapr(b, 1, rd, ra);
@@ -2346,7 +2404,7 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
         if (g_no_ldapr) a64_ldar(b, size, rd, ra);
         else            a64_ldapr(b, size, rd, ra);
         g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, rd, ra, 0,
-                                                g_cur_insn_idx };
+                                                g_cur_insn_idx, 0, 0 };
         g_n_oslow++;
         return;
     }
@@ -2363,6 +2421,177 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
     a64_patch_b(to_done, a64_label(b));
 }
 
+/* ---- model-aware access primitives ----
+ * plain: ldr/str [ra, #disp] (scaled, or ldur/stur for small odd/negative)
+ * ordered: ldapur/stlur [ra, #simm9] (LRCPC2), else add JTA + ldapur/stlur.
+ * Apple silicon takes an alignment fault when an acquire/release access
+ * crosses a 16-byte boundary; the fault marks the block (al_mark) and its
+ * retranslation uses the checked emit_guest_load/store_ordered forms
+ * (g_align_guard), whose misaligned arm is a plain access + dmb.
+ * The address register may be JTA; with disp != 0 the ordered forms may
+ * rewrite JTA, so callers reusing (ra, disp) for a second access must
+ * materialize the address first (emit_rmw_mem does). */
+static void emit_gpr_ld_at(A64Buf *b, int size, int rd, int ra, int32_t disp, int plain)
+{
+    int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
+    if (!plain) g_blk_ordered_loads = 1;
+    if (plain) {
+        if (scaled) a64_ldr(b, size, rd, ra, (uint32_t)disp);
+        else if (disp >= -256 && disp <= 255) a64_ldur(b, size, rd, ra, disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); a64_ldr(b, size, rd, JTA, 0); }
+        return;
+    }
+    if (!g_align_guard || size == 1) {
+        if (disp >= -256 && disp <= 255) { a64_ldapur(b, size, rd, ra, disp); return; }
+        if (scaled && disp <= 4095) a64_add_imm(b, 1, JTA, ra, (uint32_t)disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
+        a64_ldapur(b, size, rd, JTA, 0);
+        return;
+    }
+    if (disp == 0) { emit_guest_load_ordered(b, size, rd, ra, JTU); return; }
+    if (disp > 0 && disp <= 4095) a64_add_imm(b, 1, JTA, ra, (uint32_t)disp);
+    else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, ra, (uint32_t)-disp);
+    else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
+    emit_guest_load_ordered(b, size, rd, JTA, JTU);
+}
+static void emit_gpr_st_at(A64Buf *b, int size, int rv, int ra, int32_t disp, int plain)
+{
+    int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
+    if (plain) {
+        if (scaled) a64_str(b, size, rv, ra, (uint32_t)disp);
+        else if (disp >= -256 && disp <= 255) a64_stur(b, size, rv, ra, disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); a64_str(b, size, rv, JTA, 0); }
+        return;
+    }
+    if (!g_align_guard || size == 1) {
+        if (disp >= -256 && disp <= 255) { a64_stlur(b, size, rv, ra, disp); return; }
+        if (scaled && disp <= 4095) a64_add_imm(b, 1, JTA, ra, (uint32_t)disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
+        a64_stlur(b, size, rv, JTA, 0);
+        return;
+    }
+    if (disp == 0) { emit_guest_store_ordered(b, size, rv, ra, JTU); return; }
+    if (disp > 0 && disp <= 4095) a64_add_imm(b, 1, JTA, ra, (uint32_t)disp);
+    else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, ra, (uint32_t)-disp);
+    else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
+    emit_guest_store_ordered(b, size, rv, JTA, JTU);
+}
+/* [ra + ri << shift] (shift 0 or the access size) */
+static void emit_gpr_ld_regoff(A64Buf *b, int size, int rd, int ra, int ri, int scaled, int plain)
+{
+    if (plain) { a64_ldr_regoff(b, size, rd, ra, ri, scaled); return; }
+    int sh = scaled ? (size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0) : 0;
+    a64_add_reg(b, 1, JTA, ra, ri, sh);
+    emit_gpr_ld_at(b, size, rd, JTA, 0, 0);
+}
+static void emit_gpr_st_regoff(A64Buf *b, int size, int rv, int ra, int ri, int scaled, int plain)
+{
+    if (plain) { a64_str_regoff(b, size, rv, ra, ri, scaled); return; }
+    int sh = scaled ? (size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0) : 0;
+    a64_add_reg(b, 1, JTA, ra, ri, sh);
+    emit_gpr_st_at(b, size, rv, JTA, 0, 0);
+}
+/* vector (4/8/16 bytes).  Ordered loads: plain load + dmb ishld (cheap,
+ * alignment-free).  Ordered stores go through GPRs with stlur (2 x 8 bytes
+ * for a full register): drain-free, whereas dmb ish + str next to a store
+ * stream is 10x slower (vector memset: 1.1s vs 0.1s).  A 16-byte store this
+ * way needs 8-byte alignment (each half must not cross a 16-byte granule);
+ * marked blocks (g_align_guard) check that inline and take an out-of-line
+ * arm when misaligned. */
+static void emit_v_st_ordered_fast(A64Buf *b, int size, int vs, int ra, int32_t disp)
+{
+    if (size == 16) {
+        a64_fmov_x_from_v(b, 1, JT0, vs);
+        a64_umov_gpr(b, 8, JTU, vs, 1);
+        a64_stlur(b, 8, JT0, ra, disp);
+        a64_stlur(b, 8, JTU, ra, disp + 8);
+    } else if (size == 8) {
+        a64_fmov_x_from_v(b, 1, JT0, vs);
+        a64_stlur(b, 8, JT0, ra, disp);
+    } else {
+        a64_fmov_x_from_v(b, 0, JT0, vs);
+        a64_stlur(b, 4, JT0, ra, disp);
+    }
+}
+/* ordered vector store, alignment-checked (marked blocks): the fast form
+ * when (addr & (size==16 ? 7 : size-1)) == 0, else an out-of-line arm */
+static void emit_v_acc_ordered_checked(A64Buf *b, int size, int vr, int ra, int32_t disp, int store)
+{
+    if (disp != 0) {
+        if (disp > 0 && disp <= 4095) a64_add_imm(b, 1, JTA, ra, (uint32_t)disp);
+        else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, ra, (uint32_t)-disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
+        ra = JTA;
+    }
+    uint64_t mask = size == 16 ? 7 : (uint64_t)(size - 1);
+    a64_try_ands_imm(b, 1, A64_ZR, ra, mask);
+    (void)store;                                  /* loads never take this path */
+    if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
+        uint32_t *bne = a64_label(b);
+        a64_bcond(b, A64_NE, 0);
+        emit_v_st_ordered_fast(b, size, vr, ra, 0);
+        g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, vr, ra, 1,
+                                                g_cur_insn_idx, 1, 0 };
+        g_n_oslow++;
+        return;
+    }
+    uint32_t *to_aligned = a64_label(b);
+    a64_bcond(b, A64_EQ, 0);
+    a64_dmb_ish(b); a64_str_v(b, size, vr, ra, 0);
+    uint32_t *to_done = a64_label(b);
+    a64_b(b, 0);
+    a64_patch_bcond(to_aligned, a64_label(b));
+    emit_v_st_ordered_fast(b, size, vr, ra, 0);
+    a64_patch_b(to_done, a64_label(b));
+}
+static void emit_v_ld_at(A64Buf *b, int size, int vd, int ra, int32_t disp, int plain)
+{
+    int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
+    if (!plain) g_blk_ordered_loads = 1;
+    if (plain) {
+        if (scaled) a64_ldr_v(b, size, vd, ra, (uint32_t)disp);
+        else if (disp >= -256 && disp <= 255) a64_ldur_v(b, size, vd, ra, disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); a64_ldr_v(b, size, vd, JTA, 0); }
+        return;
+    }
+    /* ordered vector load: plain load + dmb ishld (alignment-free; measured
+     * clearly better than an ldapur pair moved into the V register: fpvec
+     * 0.042s vs 0.066s) */
+    if (scaled) a64_ldr_v(b, size, vd, ra, (uint32_t)disp);
+    else if (disp >= -256 && disp <= 255) a64_ldur_v(b, size, vd, ra, disp);
+    else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); a64_ldr_v(b, size, vd, JTA, 0); }
+    a64_dmb_ishld(b);
+}
+static void emit_v_st_at(A64Buf *b, int size, int vs, int ra, int32_t disp, int plain)
+{
+    int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
+    if (plain) {
+        if (scaled) a64_str_v(b, size, vs, ra, (uint32_t)disp);
+        else if (disp >= -256 && disp <= 255) a64_stur_v(b, size, vs, ra, disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); a64_str_v(b, size, vs, JTA, 0); }
+        return;
+    }
+    if (g_align_guard) { emit_v_acc_ordered_checked(b, size, vs, ra, disp, 1); return; }
+    if (!(disp >= -256 && disp + (size == 16 ? 8 : 0) <= 255)) {
+        a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); ra = JTA; disp = 0;
+    }
+    emit_v_st_ordered_fast(b, size, vs, ra, disp);
+}
+static void emit_v_ld_regoff(A64Buf *b, int size, int vd, int ra, int ri, int scaled, int plain)
+{
+    if (plain) { a64_ldr_v_regoff(b, size, vd, ra, ri, scaled); return; }
+    int sh = scaled ? (size == 16 ? 4 : size == 8 ? 3 : 2) : 0;
+    a64_add_reg(b, 1, JTA, ra, ri, sh);
+    emit_v_ld_at(b, size, vd, JTA, 0, 0);
+}
+static void emit_v_st_regoff(A64Buf *b, int size, int vs, int ra, int ri, int scaled, int plain)
+{
+    if (plain) { a64_str_v_regoff(b, size, vs, ra, ri, scaled); return; }
+    int sh = scaled ? (size == 16 ? 4 : size == 8 ? 3 : 2) : 0;
+    a64_add_reg(b, 1, JTA, ra, ri, sh);
+    emit_v_st_at(b, size, vs, JTA, 0, 0);
+}
+
 /* Plain-memory fast path for [base+index<<s] / [base+disp] accesses when no
  * commpage/low-base guard is needed (standalone plain-mode processes):
  *   add JTA, JGB, base ; ldr/str [JTA, index, lsl s]   or   ldr/str [JTA, #disp]
@@ -2377,14 +2606,19 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
 {
     static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_PLAINFAST") ? 1 : 0;
     if (dis) return 0;
-    if (!g_plain_mem || !jgb_usable() || mem_guard_needed()) return 0;
+    if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || m->riprel) return 0;
     if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
     if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
+    int plain = mem_plain_access_ok(m);
     int hb = pin_hreg(pin_slot(m->base));
     /* hoisted base: JMEMBASE/JMEMBASE2 already holds guest_base + base */
     int hreg = hoist_reg_for(m->base);
     int hoisted = hreg >= 0;
+#define ACC_AT(ra, d)  do { if (vec) { if (store) emit_v_st_at(b, size, reg, (ra), (int32_t)(d), plain); else emit_v_ld_at(b, size, reg, (ra), (int32_t)(d), plain); } \
+                            else     { if (store) emit_gpr_st_at(b, size, reg, (ra), (int32_t)(d), plain); else emit_gpr_ld_at(b, size, reg, (ra), (int32_t)(d), plain); } } while (0)
+#define ACC_REGOFF(ra, ri, sc) do { if (vec) { if (store) emit_v_st_regoff(b, size, reg, (ra), (ri), (sc), plain); else emit_v_ld_regoff(b, size, reg, (ra), (ri), (sc), plain); } \
+                                    else     { if (store) emit_gpr_st_regoff(b, size, reg, (ra), (ri), (sc), plain); else emit_gpr_ld_regoff(b, size, reg, (ra), (ri), (sc), plain); } } while (0)
     if (m->index != OCERZ_REG_NONE) {
         if (pin_slot(m->index) < 0) return 0;
         int hi = pin_hreg(pin_slot(m->index));
@@ -2392,8 +2626,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         int want = size == 16 ? 4 : size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
         if (hoisted && hreg == JMEMBASE && g_mem_hoist_aux_index >= 0 && m->index == (unsigned)g_mem_hoist_aux_index &&
             sc == g_mem_hoist_aux_scale && m->disp >= 0 && (m->disp % size) == 0 && m->disp / size <= 4095) {
-            if (vec) { if (store) a64_str_v(b, size, reg, JMEMAUX, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JMEMAUX, (uint32_t)m->disp); }
-            else     { if (store) a64_str(b, size, reg, JMEMAUX, (uint32_t)m->disp); else a64_ldr(b, size, reg, JMEMAUX, (uint32_t)m->disp); }
+            ACC_AT(JMEMAUX, m->disp);
             return 1;
         }
         if ((m->disp == 0 || (hoisted && hreg == JMEMBASE && g_mem_hoist_aux_index < 0 && m->disp == g_mem_hoist_aux_disp && m->disp != 0)) &&
@@ -2404,34 +2637,32 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
             if (hoisted) ra = m->disp ? JMEMAUX : hreg;
             else if (ea_cache_reusable(b, m)) {
                 /* JTA already holds base + index<<scale: plain [JTA] */
-                if (vec) { if (store) a64_str_v(b, size, reg, JTA, 0); else a64_ldr_v(b, size, reg, JTA, 0); }
-                else     { if (store) a64_str(b, size, reg, JTA, 0); else a64_ldr(b, size, reg, JTA, 0); }
+                ACC_AT(JTA, 0);
                 return 1;
             }
             else { if (!ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, JGB, hb, 0); ea_cache_set_full(b, m->base, OCERZ_REG_NONE, 0); }
-            if (vec) { if (store) a64_str_v_regoff(b, size, reg, ra, hi, sc != 0); else a64_ldr_v_regoff(b, size, reg, ra, hi, sc != 0); }
-            else     { if (store) a64_str_regoff(b, size, reg, ra, hi, sc != 0); else a64_ldr_regoff(b, size, reg, ra, hi, sc != 0); }
+            ACC_REGOFF(ra, hi, sc != 0);
             return 1;
         }
         if (m->disp == 0 && sc != 0) {
             /* scaled index the access cannot fold: guest address then [JGB, addr] */
             if (!hoisted) {
-                if (ea_cache_reusable(b, m)) {
-                    if (vec) { if (store) a64_str_v(b, size, reg, JTA, 0); else a64_ldr_v(b, size, reg, JTA, 0); }
-                    else     { if (store) a64_str(b, size, reg, JTA, 0); else a64_ldr(b, size, reg, JTA, 0); }
-                    return 1;
-                }
+                if (ea_cache_reusable(b, m)) { ACC_AT(JTA, 0); return 1; }
                 if (ea_cache_has_base(b, m)) {
                     a64_add_reg(b, 1, JTA, JTA, hi, sc);
                     ea_cache_set(b, m);
-                    if (vec) { if (store) a64_str_v(b, size, reg, JTA, 0); else a64_ldr_v(b, size, reg, JTA, 0); }
-                    else     { if (store) a64_str(b, size, reg, JTA, 0); else a64_ldr(b, size, reg, JTA, 0); }
+                    ACC_AT(JTA, 0);
                     return 1;
                 }
-                a64_add_reg(b, 1, JTA, hb, hi, sc);
-                ea_cache_reset();                       /* JTA = guest address, no JGB */
-                if (vec) { if (store) a64_str_v_regoff(b, size, reg, JGB, JTA, 0); else a64_ldr_v_regoff(b, size, reg, JGB, JTA, 0); }
-                else     { if (store) a64_str_regoff(b, size, reg, JGB, JTA, 0); else a64_ldr_regoff(b, size, reg, JGB, JTA, 0); }
+                if (plain) {
+                    a64_add_reg(b, 1, JTA, hb, hi, sc);
+                    ea_cache_reset();                       /* JTA = guest address, no JGB */
+                    ACC_REGOFF(JGB, JTA, 0);
+                    return 1;
+                }
+                a64_add_reg(b, 1, JTA, JGB, hb, 0); a64_add_reg(b, 1, JTA, JTA, hi, sc);
+                ea_cache_set(b, m);
+                ACC_AT(JTA, 0);
                 return 1;
             }
         }
@@ -2447,13 +2678,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
             else { a64_add_reg(b, 1, JTA, JGB, hb, 0); a64_add_reg(b, 1, JTA, JTA, hi, sc); }
         }
         ea_cache_set(b, m);
-        if (scaled) {
-            if (vec) { if (store) a64_str_v(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, JTA, (uint32_t)m->disp); }
-            else     { if (store) a64_str(b, size, reg, JTA, (uint32_t)m->disp); else a64_ldr(b, size, reg, JTA, (uint32_t)m->disp); }
-        } else {
-            if (vec) { if (store) a64_stur_v(b, size, reg, JTA, (int32_t)m->disp); else a64_ldur_v(b, size, reg, JTA, (int32_t)m->disp); }
-            else     { if (store) a64_stur(b, size, reg, JTA, (int32_t)m->disp); else a64_ldur(b, size, reg, JTA, (int32_t)m->disp); }
-        }
+        ACC_AT(JTA, m->disp);
         return 1;
     }
     /* base + disp: scaled unsigned immediate, or unscaled signed for small
@@ -2465,15 +2690,11 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         int ra = JTA;
         if (hoisted) ra = hreg;
         else { if (!ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, JGB, hb, 0); ea_cache_set_full(b, m->base, OCERZ_REG_NONE, 0); }
-        if (scaled) {
-            if (vec) { if (store) a64_str_v(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr_v(b, size, reg, ra, (uint32_t)m->disp); }
-            else     { if (store) a64_str(b, size, reg, ra, (uint32_t)m->disp); else a64_ldr(b, size, reg, ra, (uint32_t)m->disp); }
-        } else {
-            if (vec) { if (store) a64_stur_v(b, size, reg, ra, (int32_t)m->disp); else a64_ldur_v(b, size, reg, ra, (int32_t)m->disp); }
-            else     { if (store) a64_stur(b, size, reg, ra, (int32_t)m->disp); else a64_ldur(b, size, reg, ra, (int32_t)m->disp); }
-        }
+        ACC_AT(ra, m->disp);
         return 1;
     }
+#undef ACC_AT
+#undef ACC_REGOFF
 }
 
 /* Plain-memory effective address for an access of `size` bytes: emits
@@ -2551,7 +2772,7 @@ static void ea_cache_step(const X86Insn *in, const X86Insn *prev)   /* called be
 static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *op,
                              int size, int *ra_out, uint32_t *disp_out)
 {
-    if (!g_plain_mem || !jgb_usable() || mem_guard_needed()) return 0;
+    if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
     if (g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
     if (op->riprel) {
@@ -2640,12 +2861,13 @@ fold_disp:
 static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand *op, int size, int rd)
 {
     int ra; uint32_t disp;
+    int plain = mem_plain_access_ok(op);
     /* base + index (scale 1 or the access size), no displacement (or the
      * hoisted aux displacement): register-offset load */
     int aux_disp_ok = op->disp != 0 && g_pin_class != 2 && g_mem_hoist_aux_index < 0 &&
                       op->disp == g_mem_hoist_aux_disp && op->base != OCERZ_REG_NONE &&
                       hoist_reg_for(op->base) == JMEMBASE;
-    if (g_plain_mem && jgb_usable() && !mem_guard_needed() &&
+    if (mem_fast_forms_ok() &&
         insn->seg == OCERZ_SEG_NONE && insn->addrsize == 8 && !op->riprel &&
         op->base != OCERZ_REG_NONE && op->index != OCERZ_REG_NONE && (op->disp == 0 || aux_disp_ok) &&
         pin_slot(op->base) >= 0 && pin_slot(op->index) >= 0 &&
@@ -2653,7 +2875,7 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
         int sc = op->scale & 3;
         int want = size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
         if (aux_disp_ok && (sc == 0 || sc == want)) {
-            a64_ldr_regoff(b, size, rd, JMEMAUX, pin_hreg(pin_slot(op->index)), sc != 0);
+            emit_gpr_ld_regoff(b, size, rd, JMEMAUX, pin_hreg(pin_slot(op->index)), sc != 0, plain);
             return 1;
         }
         if (aux_disp_ok) goto generic;
@@ -2664,11 +2886,11 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
                 if (!ea_cache_has_base(b, op)) a64_add_reg(b, 1, JTA, JGB, pin_hreg(pin_slot(op->base)), 0);
                 ea_cache_set_full(b, op->base, OCERZ_REG_NONE, 0);
             }
-            a64_ldr_regoff(b, size, rd, hb, pin_hreg(pin_slot(op->index)), sc != 0);
+            emit_gpr_ld_regoff(b, size, rd, hb, pin_hreg(pin_slot(op->index)), sc != 0, plain);
             return 1;
         }
         static int nogea = -1; if (nogea < 0) nogea = getenv("OCERZ_NO_GEAFORM") ? 1 : 0;
-        if (!nogea && hoist_reg_for(op->base) < 0 && !ea_cache_has_base(b, op) && !ea_cache_reusable(b, op)) {
+        if (!nogea && plain && hoist_reg_for(op->base) < 0 && !ea_cache_has_base(b, op) && !ea_cache_reusable(b, op)) {
             /* scale the access cannot fold and no hoisted/cached base: guest
              * address in JTA, then [JGB, JTA] (2 words instead of 3) */
             a64_add_reg(b, 1, JTA, pin_hreg(pin_slot(op->base)), pin_hreg(pin_slot(op->index)), sc);
@@ -2679,7 +2901,7 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
     }
 generic:
     if (!emit_mem_ea_plain(b, insn, op, size, &ra, &disp)) return 0;
-    a64_ldr(b, size, rd, ra, disp);
+    emit_gpr_ld_at(b, size, rd, ra, (int32_t)disp, plain);
     return 1;
 }
 
@@ -2818,8 +3040,14 @@ static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
             if (!is_signed && emit_mem_load_plain(b, insn, s, s->size, pin_hreg(ds)))
                 return 1;                                   /* ldrb/ldrh zero-extend to 64 */
             if (is_signed && emit_mem_ea_plain(b, insn, s, s->size, &ra, &disp)) {
-                if (s->size == 1) a64_ldrsb(b, sf, pin_hreg(ds), ra, disp);
-                else              a64_ldrsh(b, sf, pin_hreg(ds), ra, disp);
+                if (mem_plain_access_ok(s)) {
+                    if (s->size == 1) a64_ldrsb(b, sf, pin_hreg(ds), ra, disp);
+                    else              a64_ldrsh(b, sf, pin_hreg(ds), ra, disp);
+                } else {            /* ordered: acquire zero-extending load, then sign-extend */
+                    emit_gpr_ld_at(b, s->size, JT1, ra, (int32_t)disp, 0);
+                    if (s->size == 1) a64_sxtb(b, sf, pin_hreg(ds), JT1);
+                    else              a64_sxth(b, sf, pin_hreg(ds), JT1);
+                }
                 return 1;
             }
         }
@@ -2871,7 +3099,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             return 0;
         }
 
-        if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem && jgb_usable() &&
+        if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() && jgb_usable() &&
             !stack_guard_needed()) {
             /* guest rsp pinned, guest base in JGB: 3 words, rsp updated after
              * the store so a fault leaves it architecturally intact */
@@ -2914,7 +3142,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
                 a64_mov_imm64(b, JT1, o->imm);
             }
             uint32_t *skip = NULL;
-            if (g_plain_mem && !stack_guard_needed()) {
+            if (stack_plain_access_ok() && !stack_guard_needed()) {
                 a64_str_pre64(b, rv, pin_hreg(rs), -8);
             } else {
                 a64_sub_imm(b, 1, JTA, pin_hreg(rs), 8);
@@ -2950,7 +3178,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         if (o->kind != OCERZ_OPK_REG || o->high8 || o->size != 8)
             return 0;
 
-        if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem && jgb_usable() &&
+        if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() && jgb_usable() &&
             !stack_guard_needed() && o->reg != OCERZ_RSP && pin_slot(o->reg) >= 0) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             a64_ldr_regoff(b, 8, pin_hreg(pin_slot(o->reg)), JGB, hs, 0);
@@ -2963,7 +3191,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             int rd = ds >= 0 ? pin_hreg(ds) : JT1;
             assert(rs >= 0);
             uint32_t *skip = NULL;
-            if (g_plain_mem && !stack_guard_needed()) {
+            if (stack_plain_access_ok() && !stack_guard_needed()) {
                 a64_ldr_post64(b, rd, pin_hreg(rs), 8);
             } else {
                 skip = emit_commpage_guard(b, insn, pin_hreg(rs),
@@ -3022,7 +3250,8 @@ static int emit_movsxd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, in
     if (s->kind == OCERZ_OPK_MEM) {
         int ra; uint32_t disp;
         if (ds >= 0 && emit_mem_ea_plain(b, insn, s, 4, &ra, &disp)) {
-            a64_ldrsw(b, pin_hreg(ds), ra, disp);
+            if (mem_plain_access_ok(s)) a64_ldrsw(b, pin_hreg(ds), ra, disp);
+            else { emit_gpr_ld_at(b, 4, JT1, ra, (int32_t)disp, 0); a64_sxtw(b, pin_hreg(ds), JT1); }
             return 1;
         }
         if (!emit_mem_ea(b, insn, s, JTA))
@@ -3514,7 +3743,7 @@ static int cc_after_ands(unsigned cc);
 static int cc_after_adds(unsigned cc);
 static int mem_plain_ok(const X86Insn *insn, const X86Operand *op)
 {
-    if (!g_plain_mem || !jgb_usable() || mem_guard_needed()) return 0;
+    if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
     if (g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
     if (op->riprel) return 1;
@@ -4504,9 +4733,11 @@ static void emit_xmm_st_lo(A64Buf *b, int size, int vs, unsigned xr) /* only low
 static int g_sse_mem_ra = JTA;      /* base register / folded displacement for the */
 static uint32_t g_sse_mem_disp;     /* access that follows emit_sse_mem_addr */
 static int g_sse_mem_plain;         /* 1: plain form (no guard), address = [ra, #disp] */
+static int g_sse_mem_plainacc;      /* plain (unordered) access allowed for the operand set up above */
 static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o, int size,
                              uint32_t **exit_sites, int *n_exits, uint32_t **skip_out)
 {
+    g_sse_mem_plainacc = mem_plain_access_ok(o);
     if (emit_mem_ea_plain(b, insn, o, size, &g_sse_mem_ra, &g_sse_mem_disp)) {
         g_sse_mem_plain = 1;
         *skip_out = NULL;
@@ -4522,20 +4753,16 @@ static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o
 }
 static void emit_sse_mem_ld_gpr(A64Buf *b, int size, int rd)   /* GPR load from the address set up above */
 {
-    if (g_sse_mem_plain) a64_ldr(b, size, rd, g_sse_mem_ra, g_sse_mem_disp);
+    if (g_sse_mem_plain) emit_gpr_ld_at(b, size, rd, g_sse_mem_ra, (int32_t)g_sse_mem_disp, g_sse_mem_plainacc);
     else emit_guest_load_ordered(b, size, rd, JTA, JTU);
 }
 static void emit_sse_mem_ld(A64Buf *b, int size, int vd)   /* from the address set up above */
 {
-    a64_ldr_v(b, size, vd, g_sse_mem_ra, g_sse_mem_disp);
-    if (!g_plain_mem)
-        a64_dmb_ish(b);          /* conservative acquire */
+    emit_v_ld_at(b, size, vd, g_sse_mem_ra, (int32_t)g_sse_mem_disp, g_sse_mem_plainacc);
 }
 static void emit_sse_mem_st(A64Buf *b, int size, int vs)   /* to the address set up above */
 {
-    if (!g_plain_mem)
-        a64_dmb_ish(b);          /* conservative release */
-    a64_str_v(b, size, vs, g_sse_mem_ra, g_sse_mem_disp);
+    emit_v_st_at(b, size, vs, g_sse_mem_ra, (int32_t)g_sse_mem_disp, g_sse_mem_plainacc);
 }
 
 /* Load operand `o` (xmm or mem) of width `size` (4/8/16) into vd.
@@ -5861,7 +6088,7 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
  * through the guarded generic address; pop with rsp as its base -> interpreter) */
 static int emit_push_pop_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
-    if (g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || !g_plain_mem || !jgb_usable() || stack_guard_needed()) return 0;
+    if (g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || !stack_plain_access_ok() || !jgb_usable() || stack_guard_needed()) return 0;
     if (insn->nops != 1 || insn->ops[0].kind != OCERZ_OPK_MEM || insn->ops[0].size != 8) return 0;
     if (insn->addrsize != 8 || (insn->seg != OCERZ_SEG_NONE && insn->seg != OCERZ_SEG_GS && insn->seg != OCERZ_SEG_FS)) return 0;
     const X86Operand *m = &insn->ops[0];
@@ -5894,7 +6121,7 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
 {
     (void)insn; (void)exit_sites; (void)n_exits;
     if (g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || pin_slot(OCERZ_RBP) < 0 ||
-        !g_plain_mem || !jgb_usable() || stack_guard_needed())
+        !stack_plain_access_ok() || !jgb_usable() || stack_guard_needed())
         return 0;
     int hs = pin_hreg(pin_slot(OCERZ_RSP)), hb = pin_hreg(pin_slot(OCERZ_RBP));
     a64_mov_reg(b, 1, hs, hb);
@@ -6136,19 +6363,18 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         a64_cset(b, JT1, A64_NE);
         a64_str(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
     }
-    /* address: (ra, disp) for plain ldr/str; a bare host address in JTA otherwise */
+    /* address: (ra, disp) for plain ldr/str; a bare host address in JTA for
+     * the LSE atomics and the ordered load+store pair (one address, used twice) */
     int ra; uint32_t disp;
-    if (g_plain_mem && !ordered) {
-        if (insn->seg != OCERZ_SEG_NONE || !emit_mem_ea_plain(b, insn, m, size, &ra, &disp)) {
-            if (!emit_mem_ea(b, insn, m, JTA)) return 0;
-            (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-            emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
-            ra = JTA; disp = 0;
-        }
-    } else {
+    int plainacc = mem_plain_access_ok(m);
+    if (insn->seg != OCERZ_SEG_NONE || !emit_mem_ea_plain(b, insn, m, size, &ra, &disp)) {
         if (!emit_mem_ea(b, insn, m, JTA)) return 0;
         (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        ra = JTA; disp = 0;
+    } else if (!plainacc && disp != 0) {
+        if (disp <= 4095) a64_add_imm(b, 1, JTA, ra, disp);
+        else { a64_mov_imm64(b, JTU, disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
         ra = JTA; disp = 0;
     }
     /* source value */
@@ -6184,10 +6410,8 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
             break;
         default: return 0;
         }
-    } else if (ordered) {
-        emit_guest_load_ordered(b, size, JT0, ra, JTU);
     } else {
-        a64_ldr(b, size, JT0, ra, disp);
+        emit_gpr_ld_at(b, size, JT0, ra, (int32_t)disp, plainacc);
     }
 
     /* ---- new value -> JT2 (and register results) ---- */
@@ -6227,10 +6451,8 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         a64_mov_reg(b, 0, JT2, JT2);        /* w-form results are already zero-extended; harmless */
 
     /* ---- store ---- */
-    if (!is_cmp && !(ordered && atomic)) {
-        if (ordered) emit_guest_store_ordered(b, size, JT2, ra, JTU);
-        else a64_str(b, size, JT2, ra, disp);
-    }
+    if (!is_cmp && !(ordered && atomic))
+        emit_gpr_st_at(b, size, JT2, ra, (int32_t)disp, plainacc);
     /* ---- flags (before the register results: the record may read the source pin) ---- */
     if (need && op != OCERZ_OP_CMPXCHG) {
         switch (op) {
@@ -7781,7 +8003,7 @@ static int ras_body_only(void)
     /* must match the conditions under which CALL/RET emit the bl/ret + untagged
      * body-pointer protocol (fast3); evaluated dynamically because plain
      * memory can be retired at runtime (the transition purges the RAS) */
-    return fullpin_enabled() && !g_no_regflags && g_plain_mem && jgb_usable() &&
+    return fullpin_enabled() && !g_no_regflags && stack_plain_access_ok() && jgb_usable() &&
            !stack_guard_needed() && !g_no_chain && !g_no_ras;
 }
 static void *ras_entry_for(const JitBlock *blk)
@@ -7849,7 +8071,7 @@ static int emit_call_region_call(A64Buf *b, const X86Insn *insn,
 
     a64_mov_imm64(b, JRET_GUEST, retaddr);
     uint32_t *skip = NULL;
-    if (g_plain_mem && !stack_guard_needed()) {
+    if (stack_plain_access_ok() && !stack_guard_needed()) {
         a64_str_pre64(b, JRET_GUEST, pin_hreg(rs), -8);
     } else {
         a64_sub_imm(b, 1, JTA, pin_hreg(rs), 8);
@@ -7906,7 +8128,7 @@ static int emit_call_region_ret(A64Buf *b, const X86Insn *insn,
     int rs = pin_slot(OCERZ_RSP);
     assert(rs >= 0);
     uint32_t *skip = NULL;
-    if (g_plain_mem && !stack_guard_needed()) {
+    if (stack_plain_access_ok() && !stack_guard_needed()) {
         a64_ldr_post64(b, JT1, pin_hreg(rs), 8);
     } else {
         skip = emit_commpage_guard(b, insn, pin_hreg(rs),
@@ -7971,7 +8193,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
         a64_mov_imm64(b, JT1, retaddr);
 
-        int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem &&
+        int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
                     jgb_usable() && !stack_guard_needed() && !g_no_chain;
         static int no_blret = -1;
         if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
@@ -8099,7 +8321,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         if (insn->nops != 0)
             return 0;
 
-        int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem &&
+        int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
                     jgb_usable() && !stack_guard_needed();
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
@@ -8211,7 +8433,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     }
 
     if (insn->op == OCERZ_OP_CALL && g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
-        g_plain_mem && jgb_usable() && !stack_guard_needed() && !g_no_chain) {
+        stack_plain_access_ok() && jgb_usable() && !stack_guard_needed() && !g_no_chain) {
         /* lands on the chain tail (never the exit): x0 stays JGB, the tail's
          * fallback sets STEP_OK itself */
         g_chain_keeps_jgb = 1;
@@ -8506,7 +8728,7 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
     {
         static int no_blret_i = -1;
         if (no_blret_i < 0) no_blret_i = getenv("OCERZ_NO_BLRET") ? 1 : 0;
-        int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && g_plain_mem &&
+        int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
                     jgb_usable() && !stack_guard_needed() && !g_no_chain &&
                     !g_no_ras && ras_body_only() && !no_blret_i;
         if (fast3) {
@@ -9003,7 +9225,7 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
     g_mem_hoist_aux_disp = 0;
     g_mem_hoist_aux_index = -1;
     { static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_HOIST") ? 1 : 0; if (dis) return -1; }
-    if (!g_plain_mem || g_no_chain || mem_guard_needed() ||
+    if (g_no_chain || mem_guard_needed() ||
         !mem_native_store_ok() || n < 2)
         return -1;
     const X86Insn *term = &insns[n - 1];
@@ -9234,6 +9456,92 @@ static void emit_oolslow_arms(A64Buf *b, uint32_t **exit_sites, int *n_exits)
     g_n_oolslow = 0;
 }
 
+/* Misaligned ordered access (the address crosses a 16-byte granule, so a
+ * single acquire/release access would fault).  Loads: plain load + dmb
+ * ishld.  Stores: either dmb ish + plain store, or release-store pieces that
+ * never cross a granule (4/2/1 bytes by the address's alignment); see
+ * emit_misaligned_arm for the measured trade-off.  Tearing granularity is
+ * the piece size; a plain host access crossing a granule is not single-copy
+ * atomic on this hardware either. */
+static void emit_misaligned_pieces_st(A64Buf *b, int psize, int n, int rv, int ra, int32_t disp, int s1)
+{
+    a64_stlur(b, psize, rv, ra, disp);
+    for (int i = 1; i < n; i++) {
+        a64_lsr_imm(b, 1, s1, rv, i * psize * 8);
+        a64_stlur(b, psize, s1, ra, disp + i * psize);
+    }
+}
+static void emit_misaligned_arm(A64Buf *b, const OrderedSlowPend *o)
+{
+    /* scratch: JTF/JTT are never live across a guest memory access (JT0-JT2
+     * can be: rmw old/new values, bt indices; JTU: a vector store's second
+     * half); a host-stack spill instead costs 2-3x on the arm */
+    int cand[3] = { JTF, JTT, JTU }, sc[2], n = 0;
+    for (int i = 0; i < 3 && n < 2; i++)
+        if (cand[i] != o->rv && cand[i] != o->ra) sc[n++] = cand[i];
+    int s1 = sc[0], s2 = sc[1];
+    int size = o->size;
+    if (!o->store) {
+        /* loads: a plain load + dmb ishld.  Piece assembly (ldapur + bfi
+         * chain) is a serial dependency into the destination and measured
+         * 2.5x slower on memcpy; ldr + dmb ishld is 1x-2x a plain access. */
+        if (o->vec) a64_ldr_v(b, size, o->rv, o->ra, (uint32_t)o->disp);
+        else        a64_ldr(b, size, o->rv, o->ra, 0);
+        a64_dmb_ishld(b);
+        return;
+    }
+    /* stores: the cost of dmb ish + plain store is the store-buffer drain,
+     * i.e. proportional to the pending stores.  In a block that also does
+     * ordered loads the stream is already throttled and the drain is cheap
+     * (memcpy: dmb 0.45s vs pieces 0.94-1.09s); in a store-only block
+     * (memset) the buffer is full and the drain is catastrophic (dmb 0.51s
+     * vs pieces 0.11s).  Vector stores follow that heuristic; GPR stores use
+     * pieces (equal to dmb on memcpy, 8x better on memset). */
+    if (o->vec && g_blk_ordered_loads) {
+        a64_dmb_ish(b);
+        a64_str_v(b, size, o->rv, o->ra, (uint32_t)o->disp);
+        return;
+    }
+    if (!o->vec) {
+        if (size == 8) {
+            a64_try_ands_imm(b, 1, A64_ZR, o->ra, 3);
+            uint32_t *to_bytes = a64_label(b); a64_bcond(b, A64_NE, 0);
+            emit_misaligned_pieces_st(b, 4, 2, o->rv, o->ra, o->disp, s1);
+            uint32_t *to_done = a64_label(b); a64_b(b, 0);
+            a64_patch_bcond(to_bytes, a64_label(b));
+            emit_misaligned_pieces_st(b, 1, 8, o->rv, o->ra, o->disp, s1);
+            a64_patch_b(to_done, a64_label(b));
+        } else {
+            emit_misaligned_pieces_st(b, 1, size, o->rv, o->ra, o->disp, s1);
+        }
+        return;
+    }
+    /* vector store pieces: halves in s1 (low) / s2 (high), shifted in place;
+     * 4-byte pieces when 4-aligned, 2-byte when 2-aligned, else bytes */
+    int nh = size == 16 ? 2 : 1, hs = size == 4 ? 4 : 8;
+    if (size == 4)  a64_fmov_x_from_v(b, 0, s1, o->rv); else a64_fmov_x_from_v(b, 1, s1, o->rv);
+    if (nh == 2)    a64_umov_gpr(b, 8, s2, o->rv, 1);
+    uint32_t *to_done[2] = { NULL, NULL };
+    for (int level = 0; level < 3; level++) {
+        int psize = level == 0 ? 4 : level == 1 ? 2 : 1;
+        uint32_t *to_next = NULL;
+        if (level < 2) {
+            a64_try_ands_imm(b, 1, A64_ZR, o->ra, (uint64_t)(psize - 1));
+            to_next = a64_label(b); a64_bcond(b, A64_NE, 0);
+        }
+        for (int h = 0; h < nh; h++) {
+            int r = h ? s2 : s1;
+            for (int i = 0; i < hs / psize; i++) {
+                if (i) a64_lsr_imm(b, 1, r, r, psize * 8);
+                a64_stlur(b, psize, r, o->ra, o->disp + h * 8 + i * psize);
+            }
+        }
+        if (level < 2) { to_done[level] = a64_label(b); a64_b(b, 0); a64_patch_bcond(to_next, a64_label(b)); }
+    }
+    a64_patch_b(to_done[0], a64_label(b));
+    a64_patch_b(to_done[1], a64_label(b));
+}
+
 static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
 {
     if (g_n_oslow <= 0 && g_n_fpbmap <= 0)
@@ -9249,13 +9557,7 @@ static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *ent
         const OrderedSlowPend *o = &g_oslow[i];
         uint32_t *lo = a64_label(b);
         a64_patch_bcond(o->bne, lo);
-        if (o->store) {
-            a64_dmb_ish(b);
-            a64_str(b, o->size, o->rv, o->ra, 0);
-        } else {
-            a64_ldr(b, o->size, o->rv, o->ra, 0);
-            a64_dmb_ish(b);
-        }
+        emit_misaligned_arm(b, o);
         uint32_t *here = a64_label(b);
         a64_b(b, (int32_t)(o->back - here));
         if (blk->oslow) {
@@ -9366,6 +9668,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_n_push_fix = 0;
     g_n_oolslow = 0;
     g_cp_guard = ocerz_commpage && (getenv("OCERZ_CP_GUARD_ALL") || cp_marked(rip));
+    { static int all = -1; if (all < 0) all = getenv("OCERZ_AL_GUARD_ALL") ? 1 : 0; if (all) g_al_all = 1; }
+    g_align_guard = !g_plain_mem && al_marked(rip);
+    g_blk_ordered_loads = 0;
     g_push_entry = NULL;
     g_n_side = 0;
     g_stop_target = NULL;
@@ -10207,6 +10512,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     jit->code_cur = b.p;
     blk->code = (JitBlockFn)entry;
     blk->body_code = g_body_entry;
+    blk->ordered_loads = (uint8_t)g_blk_ordered_loads;
     blk->code_words = (uint32_t)(b.p - entry);
     if (blk->stop_patch || blk->n_stop_extra) {
         blk->stop_next = jit->stop_blocks;
@@ -10557,6 +10863,136 @@ int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint6
     return 1;
 }
 
+/* an ordered (ldapur/stlur) access in a translated block crossed a 16-byte
+ * boundary (Apple silicon: alignment fault): mark the block (and the
+ * instruction's own block, if it is a block head elsewhere) so its next
+ * translation uses the alignment-checked forms, and invalidate it */
+int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t fault_rip)
+{
+    OcerzJit *jit = vm ? vm->jit : NULL;
+    const uint32_t *pc = (const uint32_t *)host_pc;
+    const JitBlock *b = fault_block(jit, pc);
+    if (!b || jit->plain_mem) return 0;
+    uint64_t block_rip = b->guest_rip;
+    al_mark(block_rip);
+    al_mark(fault_rip);
+    ocerz_jit_invalidate_range(vm, block_rip, 1);
+    if (fault_rip != block_rip) ocerz_jit_invalidate_range(vm, fault_rip, 1);
+    return 1;
+}
+
+/* Alignment fault at an unguarded ordered access (ldapur/stlur crossing a
+ * 16-byte granule): hot-patch that one instruction into a branch to a fresh
+ * out-of-line arm that does the same access alignment-checked -- the fast
+ * form when aligned, else load + dmb ishld / release-store pieces -- and
+ * branches back.  Nothing is invalidated (an invalidate-all per fault made
+ * a wineboot retranslate everything hundreds of times: 7 GB resident in
+ * seconds) and the faulting instruction has not executed, so the handler
+ * simply returns and the site re-executes into the arm.
+ * Returns 1 patched (resume at host_pc), 2 already patched by another
+ * thread (resume), 0 not patchable (caller falls back to mark+invalidate). */
+int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
+{
+    OcerzJit *jit = vm ? vm->jit : NULL;
+    uint32_t *site = (uint32_t *)(uintptr_t)host_pc;
+    if (!jit || !ocerz_jit_pc_in_arena(vm, host_pc)) return 0;
+    uint32_t w = *site;
+    if ((w & 0xfc000000u) == 0x14000000u) return 2;              /* b: already patched */
+    int is_ld = (w & 0x3fe00c00u) == 0x19400000u;
+    int is_st = (w & 0x3fe00c00u) == 0x19000000u;
+    if (!is_ld && !is_st) return 0;
+    int size = 1 << (w >> 30);
+    if (size < 2) return 0;
+    int32_t imm9 = (int32_t)((w >> 12) & 0x1ff); if (imm9 & 0x100) imm9 -= 0x200;
+    int rn = (int)((w >> 5) & 31), rt = (int)(w & 31);
+    if (rn == 31 || rt == 31) return 0;
+    /* a vector store's two halves (fmov JT0 / umov JTU, then stlur JT0 [rn,#d];
+     * stlur JTU [rn,#d+8]) are handled as one 16-byte access when the first
+     * half is the faulting site: one alignment test covers both */
+    int pair = 0;
+    if (is_st && size == 8 && rt == JT0 && imm9 <= 247) {
+        uint32_t w2 = site[1];
+        uint32_t want = (w & ~(0x1ffu << 12) & ~0x1fu) | (((uint32_t)(imm9 + 8) & 0x1ffu) << 12) | (uint32_t)JTU;
+        if (w2 == want) pair = 1;
+    }
+    /* address temp and piece scratch: JTF/JTT are never live across a guest
+     * memory access; JTU only as a last resort (a vector store's second half
+     * is held in JTU across the first half's stlur); never rt or rn */
+    int cand[3] = { JTF, JTT, JTU }, sc[2], n = 0;
+    for (int i = 0; i < 3 && n < 2; i++) if (cand[i] != rt && cand[i] != rn && !(pair && cand[i] == JTU)) sc[n++] = cand[i];
+    int ta = sc[0], s1 = sc[1];
+    /* store arms: dmb ish + plain store when the block also does ordered
+     * loads (the drain is cheap then: memcpy 0.31s vs pieces 1.1s), else
+     * release-store pieces (store-only loops: memset 0.10s vs dmb 0.5-1.0s) */
+    const JitBlock *blk = fault_block(jit, site);
+    int use_dmb = blk && blk->ordered_loads;
+
+    pthread_mutex_lock(&jit_lock);
+    int rc = 0;
+    if ((size_t)(jit->code_end - jit->code_cur) > 128) {
+        pthread_jit_write_protect_np(0);
+        A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
+        uint32_t *arm = b.p;
+        if (imm9 > 0)      a64_add_imm(&b, 1, ta, rn, (uint32_t)imm9);
+        else if (imm9 < 0) a64_sub_imm(&b, 1, ta, rn, (uint32_t)-imm9);
+        else               a64_mov_reg(&b, 1, ta, rn);
+        a64_try_ands_imm(&b, 1, A64_ZR, ta, (uint64_t)(size - 1));
+        uint32_t *bne = a64_label(&b); a64_bcond(&b, A64_NE, 0);
+        if (is_ld) a64_ldapur(&b, size, rt, ta, 0);
+        else { a64_stlur(&b, size, rt, ta, 0); if (pair) a64_stlur(&b, 8, JTU, ta, 8); }
+        uint32_t *back1 = a64_label(&b); a64_b(&b, 0);
+        a64_patch_bcond(bne, a64_label(&b));
+        if (is_ld) {
+            a64_ldr(&b, size, rt, ta, 0);
+            a64_dmb_ishld(&b);
+        } else if (use_dmb) {
+            a64_dmb_ish(&b);
+            a64_str(&b, size, rt, ta, 0);
+            if (pair) a64_str(&b, 8, JTU, ta, 8);
+        } else if (size == 8) {
+            a64_try_ands_imm(&b, 1, A64_ZR, ta, 3);
+            uint32_t *tob = a64_label(&b); a64_bcond(&b, A64_NE, 0);
+            emit_misaligned_pieces_st(&b, 4, 2, rt, ta, 0, s1);
+            if (pair) emit_misaligned_pieces_st(&b, 4, 2, JTU, ta, 8, s1);
+            uint32_t *tod = a64_label(&b); a64_b(&b, 0);
+            a64_patch_bcond(tob, a64_label(&b));
+            emit_misaligned_pieces_st(&b, 1, 8, rt, ta, 0, s1);
+            if (pair) emit_misaligned_pieces_st(&b, 1, 8, JTU, ta, 8, s1);
+            a64_patch_b(tod, a64_label(&b));
+        } else {
+            emit_misaligned_pieces_st(&b, 1, size, rt, ta, 0, s1);
+        }
+        uint32_t *back2 = a64_label(&b); a64_b(&b, 0);
+        uint32_t *back = site + (pair ? 2 : 1);
+        int ok = !b.overflow && a64_try_patch_b(back1, back) && a64_try_patch_b(back2, back);
+        if (ok) {
+            uint32_t saved = *site;
+            *site = 0x14000000u;                                    /* placeholder b */
+            if (a64_try_patch_b(site, arm)) {
+                jit->code_cur = b.p;
+                sys_icache_invalidate(arm, (size_t)((uint8_t *)b.p - (uint8_t *)arm));
+                sys_icache_invalidate(site, 4);
+                rc = 1;
+            } else {
+                *site = saved;                                      /* out of branch range: give the arm back */
+            }
+        }
+        pthread_jit_write_protect_np(1);
+    }
+    pthread_mutex_unlock(&jit_lock);
+    if (rc == 1 && ocerz_perfstat > 0) ps_align_patches++;
+    if (rc == 1 && getenv("OCERZ_ALPATCHLOG")) {
+        const uint32_t *arm = (const uint32_t *)((uint8_t *)site + (((int32_t)(*site << 6) >> 6) * 4));
+        fprintf(stderr, "ocerz: ALPATCH site=%p w=%08x size=%d rt=%d rn=%d imm=%d pair=%d dmb=%d ta=%d s1=%d arm=%p arm:", (void *)site, w, size, rt, rn, imm9, pair, use_dmb, ta, s1, (const void *)arm);
+        for (int i = 0; i < 40 && arm + i < jit->code_cur; i++) {
+            fprintf(stderr, " %08x", arm[i]);
+            if ((arm[i] & 0xfc000000u) == 0x14000000u) fprintf(stderr, "(->%p)", (const void *)(arm + i + (((int32_t)(arm[i] << 6) >> 6))));
+        }
+        fprintf(stderr, "\n");
+    }
+    return rc;
+}
+
 int ocerz_jit_fault_rip(const struct OcerzVM *vm, const void *host_pc, uint64_t *out_rip)
 {
     const OcerzJit *jit = vm ? vm->jit : NULL;
@@ -10695,7 +11131,6 @@ uint64_t ocerz_jit_blocks(const OcerzJit *jit)
     return jit ? jit->blocks_translated : 0;
 }
 
-static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
 
 __thread sigjmp_buf *ocerz_jit_decode_recover;
 
@@ -11011,7 +11446,7 @@ static void ps_report(OcerzJit *jit)
                 ps_shapes[rows[i].op][0], ps_shapes[rows[i].op][1], ps_shapes[rows[i].op][2]);
     }
     {
-        fprintf(stderr, "ocerz: PERFSTAT[%d]   RAS misses=%llu (stale=%llu)\n", (int)getpid(), ps_ras_miss, ps_ras_stale);
+        fprintf(stderr, "ocerz: PERFSTAT[%d]   RAS misses=%llu (stale=%llu)  align-hotpatches=%llu\n", (int)getpid(), ps_ras_miss, ps_ras_stale, ps_align_patches);
         unsigned long long cok = ps_chain_ok, cfar = ps_chain_far, ctot = cok + cfar;
         if (ctot)
             fprintf(stderr,

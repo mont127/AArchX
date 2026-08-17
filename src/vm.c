@@ -458,13 +458,55 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
 
     /* first touch of a lazily-slid shared-cache data page (host or guest
      * access alike): unpack it and retry the faulting instruction */
+    int align_fault = 0;
     if (sig == SIGSEGV || sig == SIGBUS) {
-        if (ocerz_cache_lazy_fault((uintptr_t)si->si_addr))
+        const ucontext_t *luc = (const ucontext_t *)ctx;
+        uint64_t lesr = luc ? luc->uc_mcontext->__es.__esr : 0;
+        align_fault = sig == SIGBUS && (lesr & 0x3f) == 0x21;
+        if (!align_fault && ocerz_cache_lazy_fault((uintptr_t)si->si_addr))
             return;
     }
 
     if (ocerz_jit_decode_recover)
         siglongjmp(*ocerz_jit_decode_recover, 1);
+
+    /* Alignment fault in translated code: an ordered (acquire/release)
+     * access crossed a 16-byte boundary.  The address can be anything
+     * readable (shared-cache constants included), so this is handled before
+     * the guest-space test: mark the block for alignment-checked
+     * retranslation, run the instruction in the interpreter, resume. */
+    if (align_fault && depth == 0 && g_cur_cpu && g_sig_recover && ctx) {
+        const ucontext_t *uc = (const ucontext_t *)ctx;
+        const void *hpc = (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+        struct OcerzVM *fvm = g_cur_cpu->vm;
+        if (fvm && ocerz_jit_pc_in_arena(fvm, hpc)) {
+            /* preferred: hot-patch the one access into an alignment-checked
+             * arm and re-execute it (nothing executed, nothing invalidated) */
+            int hp = ocerz_jit_hotpatch_align(fvm, hpc);
+            if (hp) {
+                if (getenv("OCERZ_ALFAULTLOG"))
+                    fprintf(stderr, "ocerz: ALFAULT hotpatch=%d hpc=%p addr=%p\n", hp, hpc, si->si_addr);
+                return;
+            }
+            depth = 1;
+            ocerz_jit_fault_recover_regs(fvm, hpc, uc->uc_mcontext->__ss.__x, g_cur_cpu);
+            ocerz_jit_fault_recover_xmm(fvm, hpc, uc->uc_mcontext->__ns.__v, g_cur_cpu);
+            ocerz_jit_fault_recover_flags(fvm, hpc, g_cur_cpu);
+            ocerz_flags_materialize(g_cur_cpu);
+            uint64_t jrip;
+            if (ocerz_jit_fault_rip(fvm, hpc, &jrip) &&
+                ocerz_jit_note_align_fault(fvm, hpc, jrip)) {
+                g_cur_cpu->rip = jrip;
+                g_cur_cpu->sig_repeat = 0;
+                g_cur_cpu->interp_once = 1;
+                if (getenv("OCERZ_ALFAULTLOG"))
+                    fprintf(stderr, "ocerz: ALFAULT rip=%#llx addr=%p\n", (unsigned long long)jrip, si->si_addr);
+                depth = 0;
+                siglongjmp(*g_sig_recover, 1);
+            }
+            depth = 0;
+        }
+    }
 
     if (depth == 0 && g_cur_cpu && g_sig_recover &&
         ocerz_host_in_guest_space(si->si_addr)) {
@@ -786,7 +828,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 unsigned n = __atomic_fetch_add(&wild_logs, 1, __ATOMIC_RELAXED);
                 if (n < 32) {
                     const ucontext_t *uc = (const ucontext_t *)ctx;
-                    char tb[256];
+                    char tb[512];
                     char *t = tb;
                     t = str_into(t, "ocerz: WILD-WORKER-TERMINATE pid=");
                     t = hex_into(t, (uint64_t)getpid());
@@ -802,6 +844,20 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     t = hex_into(t, g_cur_cpu->gpr[OCERZ_RSP]);
                     t = str_into(t, " gs=");
                     t = hex_into(t, g_cur_cpu->gs_base);
+                    OcerzJitFaultInfo wji;
+                    if (uc && g_cur_cpu->vm && ocerz_jit_pc_in_arena(g_cur_cpu->vm, (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc) &&
+                        ocerz_jit_fault_info(g_cur_cpu->vm, (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc, &wji)) {
+                        t = str_into(t, " jit-block=");
+                        t = hex_into(t, wji.block_rip);
+                        t = str_into(t, " insn=");
+                        t = hex_into(t, wji.insn_rip);
+                        t = str_into(t, " hoff=");
+                        t = hex_into(t, wji.host_word);
+                        t = str_into(t, " hinsn=");
+                        t = hex_into(t, *(const uint32_t *)(uintptr_t)uc->uc_mcontext->__ss.__pc);
+                        t = str_into(t, " esr=");
+                        t = hex_into(t, uc->uc_mcontext->__es.__esr);
+                    }
                     t = str_into(t, "\n");
                     write(2, tb, (size_t)(t - tb));
                 }

@@ -143,7 +143,16 @@ same way (`OCERZ_HOSTWQ=1 XB=tests/guest/benchbin/xbench_dyn python3 tests/xbenc
 dynamically linked binary is about 0.06 s (`wine --version`: 0.12 s).
 
 Loads and stores are plain `ldr`/`str` while the process is single-observer, and switch to
-`ldar`/`stlr` for x86-TSO once guest memory can be seen by another thread or process.
+the ordered (x86-TSO) forms once guest memory can be seen by another thread or process:
+`ldapur`/`stlur` (LRCPC2) for integer accesses, `ldr q`+`dmb ishld` for vector loads and a
+pair of `stlur`s for vector stores; rsp-relative accesses stay plain (thread-private stack;
+`OCERZ_TSO_STRICT=1` turns that off). Apple silicon faults when such an access crosses a
+16-byte granule, so the fault handler hot-patches that one instruction into an alignment-
+checked out-of-line arm and resumes; nothing is retranslated. Ordered-mode cost over plain
+on the static kernels (`OCERZ_NO_PLAIN_MEM=1`): leafcall 0.99x, str 1.06x, chase 1.11x,
+fpvec 1.45x, memcpy 2.8x (random-alignment `movups` copies); a store-only misaligned memset
+loop runs 3.5x faster than under Rosetta. Before this work the same mode cost 2.4x on
+leafcall, 2.2x on memcpy and 28x on misaligned memset.
 
 ## CLI
 
