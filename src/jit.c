@@ -560,6 +560,7 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
     }
 }
 
+__thread int ocerz_jit_exec_state;   /* crash diagnostics: 1 = in exec_one (slow call), 2 = in jit_interp_block */
 int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
     if (__builtin_expect(ocerz_perfstat > 0, 0))
@@ -569,7 +570,11 @@ int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     cpu->rip = insn->rip + insn->len;
     if (__builtin_expect(vm->trace != 0, 0))
         jit_trace_one(insn);
-    return ocerz_interp_exec(vm, cpu, insn);
+    int prev = ocerz_jit_exec_state;
+    if (!prev) ocerz_jit_exec_state = 1;
+    int r = ocerz_interp_exec(vm, cpu, insn);
+    ocerz_jit_exec_state = prev;
+    return r;
 }
 
 static int is_terminator(unsigned op)
@@ -11117,9 +11122,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 
         if (!jit->code_full) {
             jit->code_full = 1;
-            OCERZ_LOG("JIT code arena full (%zu MB, %llu blocks); further blocks run interpreted\n",
-                      jit->code_bytes >> 20,
-                      (unsigned long long)jit->blocks_translated);
+            fprintf(stderr, "ocerz: warning: JIT code arena full (%zu MB, %llu blocks); further blocks run interpreted\n",
+                    jit->code_bytes >> 20,
+                    (unsigned long long)jit->blocks_translated);
         }
         if (ocerz_jitstat > 0) { js_fail_overflow++; js_note_fail(rip, JSR_OVERFLOW, n); }
 
@@ -11228,6 +11233,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     }
 
     if (!code_index_append_locked(jit, blk)) {
+        static int warned;
+        if (!warned) { warned = 1; fprintf(stderr, "ocerz: warning: JIT code index allocation failed; block %#llx runs interpreted\n", (unsigned long long)rip); }
         blk->n_slow = n;
         blk->n_inlined = 0;
         blk->n_pinned = 0;
@@ -11959,15 +11966,28 @@ void ocerz_jit_postfork(void)
 
 static int jit_interp_block(struct OcerzVM *vm, OcerzCPU *cpu, JitBlock *b)
 {
-
+    static int lg = -1; if (lg < 0) lg = getenv("OCERZ_IBLOG") ? 1 : 0;
+    if (lg) fprintf(stderr, "ocerz: INTERP-BLOCK rip=%#llx n=%d\n", (unsigned long long)b->guest_rip, b->n_insns);
+    ocerz_jit_exec_state = 2;
     ocerz_flags_materialize(cpu);
     if (ocerz_perfstat > 0)
         b->exec_count++;
     for (int i = 0; i < b->n_insns; i++) {
-        int r = ocerz_jit_exec_one(vm, cpu, &b->insns[i]);
-        if (r != OCERZ_STEP_OK)
+        const X86Insn *in = &b->insns[i];
+        int r = ocerz_jit_exec_one(vm, cpu, in);
+        if (r != OCERZ_STEP_OK) {
+            ocerz_jit_exec_state = 0;
             return r;
+        }
+        /* a taken branch inside the block (superblock side exit, or a
+         * signal delivered by the instruction): the rest of the block is
+         * not on the path -- re-dispatch at the new rip */
+        if (cpu->rip != in->rip + in->len || cpu->interp_once) {
+            ocerz_jit_exec_state = 0;
+            return OCERZ_STEP_OK;
+        }
     }
+    ocerz_jit_exec_state = 0;
     return OCERZ_STEP_OK;
 }
 
