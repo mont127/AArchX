@@ -664,8 +664,20 @@ void ocerz_jit_ic_fill(struct OcerzVM *vm, OcerzCPU *cpu, JitIcSlot *slot)
     }
 }
 
-static uint64_t xlive_decode_entry(uint64_t rip)
+static uint64_t xlive_decode_entry_d(uint64_t rip, int depth);
+static int g_xlive_log = -1;
+
+static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth);
+/* Flags live at the entry of the (not yet translated) code at rip: decode up
+ * to the terminator and, for direct jmp/call/jcc terminators, peek at the
+ * successors too (bounded depth): a caller is translated before its callee,
+ * so a callee whose first block ends in another call would otherwise report
+ * "everything live" and force the caller to spill its flag record. */
+static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
 {
+    static int maxd = -1;
+    if (maxd < 0) { const char *e = getenv("OCERZ_XLIVE_DEPTH"); maxd = e ? atoi(e) : 3; }
+    if (g_xlive_log < 0) g_xlive_log = getenv("OCERZ_XLIVELOG") ? 1 : 0;
     X86Insn insns[JIT_MAX_BLOCK_INSNS];
     volatile int n = 0;
     volatile uint64_t pc = rip;
@@ -691,11 +703,20 @@ static uint64_t xlive_decode_entry(uint64_t rip)
         return OCERZ_FL_ALL;
 
     uint64_t live = OCERZ_FL_ALL;
+    if (depth < maxd && is_terminator(insns[n - 1].op)) {
+        const X86Insn *t = &insns[n - 1];
+        if ((t->op == OCERZ_OP_JMP || t->op == OCERZ_OP_CALL) && t->ops[0].kind == OCERZ_OPK_IMM)
+            live = xlive_succ_live_d(g_xlat_jit, t->ops[0].imm, depth + 1);
+        else if (t->op == OCERZ_OP_JCC && t->ops[0].kind == OCERZ_OPK_IMM)
+            live = xlive_succ_live_d(g_xlat_jit, t->ops[0].imm, depth + 1) |
+                   xlive_succ_live_d(g_xlat_jit, t->rip + t->len, depth + 1);
+    }
     for (int i = n - 1; i >= 0; i--) {
         uint64_t def, use;
         ocerz_flags_defuse(&insns[i], &def, &use);
         live = (live & ~def) | use;
     }
+    if (g_xlive_log) fprintf(stderr, "ocerz: XLIVE rip=%#llx depth=%d n=%d term=%d live=%#llx\n", (unsigned long long)rip, depth, n, (int)insns[n-1].op, (unsigned long long)live);
     return live;
 }
 
@@ -802,11 +823,14 @@ static int decoded_call_region_entry(uint64_t rip)
     return compatible;
 }
 
-static uint64_t xlive_succ_live(OcerzJit *jit, uint64_t rip)
+static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth)
 {
-    JitBlock *t = cache_lookup(jit, rip);
-    return (t && t->code) ? (uint64_t)t->entry_live : xlive_decode_entry(rip);
+    JitBlock *t = jit ? cache_lookup(jit, rip) : NULL;
+    if (g_xlive_log < 0) g_xlive_log = getenv("OCERZ_XLIVELOG") ? 1 : 0;
+    if (t && t->code && g_xlive_log) fprintf(stderr, "ocerz: XLIVE cached rip=%#llx entry_live=%#x n_insns=%d\n", (unsigned long long)rip, t->entry_live, t->n_insns);
+    return (t && t->code) ? (uint64_t)t->entry_live : xlive_decode_entry_d(rip, depth);
 }
+static uint64_t xlive_succ_live(OcerzJit *jit, uint64_t rip) { return xlive_succ_live_d(jit, rip, 0); }
 
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
 
@@ -10449,7 +10473,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             if (g_no_lazyflags)
                 fl_need[i] = def;
         }
-        entry_all = live_all;
+        /* Published entry liveness: what a predecessor must supply.  The
+         * seam-based value (this block's own uses plus what its statically
+         * known successors need) is an over-approximation of the truth as
+         * long as every value it was derived from is one -- and every
+         * recursion leaf (unknown successor, peek depth cap, indirect
+         * terminator) is ALL.  OCERZ_XLIVE_ALL=1 publishes the successor
+         * independent live_all instead (the pre-2026-08 behaviour). */
+        static int pub_all = -1;
+        if (pub_all < 0) pub_all = getenv("OCERZ_XLIVE_ALL") ? 1 : 0;
+        entry_all = pub_all ? live_all : live_seam;
     }
 
     blk->entry_live = (uint16_t)entry_all;
