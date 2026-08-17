@@ -189,7 +189,8 @@ static void l0_share(unsigned dst, unsigned src);
 static void l0_inval(unsigned r);
 static int g_xlat_n;             /* instruction count of the block being translated */
 static int g_jcc_side_mode;      /* emit_cmp_test_jcc: jcc is a superblock side exit (fall-through continues inline) */
-static uint64_t g_jcc_side_need; /* producer's fl_need in side mode (flags live on the fall-through path) */
+static uint64_t g_jcc_side_need; /* producer's fl_need in side mode (flags live on either path) */
+static uint64_t g_jcc_side_fall_need; /* ... and on the fall-through continuation only */
 static int g_nzcv_want;          /* emitting the producer of an NZCV-forwarded pair */
 #define NZCV_KIND_BT 0x7f        /* g_nzcv_kind for bt: Z <=> bit clear (B -> NE, AE -> EQ) */
 static int g_nzcv_from = -1;     /* insn index that left NZCV = its result flags */
@@ -275,7 +276,8 @@ static uint32_t *g_stop_patch;
  * fall-through continues inline); the taken side becomes an out-of-line chain
  * stub recorded here and emitted after the body. */
 #define SIDE_MAX 6
-static struct { uint32_t *site; uint64_t taken; int idx; uint32_t *stub; uint32_t *patch_b; } g_side[SIDE_MAX];
+static struct { uint32_t *site; uint64_t taken; int idx; uint32_t *stub; uint32_t *patch_b;
+                int rec; uint32_t rec_ccop; int rec_src, rec_dst, rec_imm_pending; uint64_t rec_imm; } g_side[SIDE_MAX];
 static int g_n_side;
 static int superblock_enabled(void)
 {
@@ -4410,6 +4412,12 @@ static int emit_cbw_cwd(A64Buf *b, const X86Insn *insn)
         return 1;
     }
     /* CWD/CDQ/CQO: RDX = sign(RAX) */
+    if (insn->opsize != 2 && pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0 && g_pin_class == 3) {
+        int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
+        if (insn->opsize == 4) a64_asr_imm(b, 0, hdx, hax, 31);      /* W-form: 0/0xffffffff, upper zero */
+        else                   a64_asr_imm(b, 1, hdx, hax, 63);
+        return 1;
+    }
     emit_gpr_rd(b, 1, JT0, OCERZ_RAX);
     if (insn->opsize == 2) {
         emit_gpr_rd(b, 1, JT1, OCERZ_RDX);
@@ -4432,6 +4440,7 @@ static int emit_cbw_cwd(A64Buf *b, const X86Insn *insn)
  * other case (128-bit numerator, zero divisor, overflow) takes the slow call,
  * which traps exactly like the interpreter. */
 static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32_t *back);
+static void patch_any_branch(uint32_t *site, uint32_t *target);
 static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *o = &insn->ops[0];
@@ -4440,7 +4449,18 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     if (insn->seg != OCERZ_SEG_NONE) return 0;
     int sf = o->size == 8;
     int is_idiv = insn->op == OCERZ_OP_IDIV;
-    /* divisor -> JT2 (memory first: EA clobbers JT0) */
+    /* the previous instruction fixed rdx: xor edx,edx / xor rdx,rdx (div) or
+     * cqo / cdq (idiv) -> the high-half check is statically satisfied */
+    int rdx_zero = 0, rdx_sext = 0;
+    if (g_cur_insns && g_cur_insn_idx >= 1) {
+        const X86Insn *pv = &g_cur_insns[g_cur_insn_idx - 1];
+        if (pv->op == OCERZ_OP_XOR && pv->nops == 2 && pv->ops[0].kind == OCERZ_OPK_REG && pv->ops[1].kind == OCERZ_OPK_REG &&
+            pv->ops[0].reg == OCERZ_RDX && pv->ops[1].reg == OCERZ_RDX && !pv->ops[0].high8 && (pv->ops[0].size == 4 || pv->ops[0].size == 8))
+            rdx_zero = 1;
+        if (pv->op == OCERZ_OP_CWD && ((sf && pv->opsize == 8) || (!sf && pv->opsize == 4))) rdx_sext = 1;   /* cqo / cdq */
+    }
+    /* divisor: a pinned register is used in place, else -> JT2 (memory first: EA clobbers JT0) */
+    int hdv = JT2;
     if (o->kind == OCERZ_OPK_MEM) {
         if (!emit_mem_ea(b, insn, o, JTA)) return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
@@ -4449,24 +4469,42 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         patch_guard_skip(skip, a64_label(b));
     } else if (o->kind == OCERZ_OPK_REG) {
         if (o->high8) return 0;
-        emit_gpr_rd(b, sf, JT2, o->reg);
+        if (pin_slot(o->reg) >= 0 && g_pin_class == 3 && pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0)
+            hdv = pin_hreg(pin_slot(o->reg));
+        else
+            emit_gpr_rd(b, sf, JT2, o->reg);
     } else return 0;
-    /* pinned rax/rdx, unsigned: operate on the pins directly (6 words) */
-    if (!is_idiv && pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0 && g_pin_class == 3) {
+    /* pinned rax/rdx: operate on the pins directly */
+    if (pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0 && g_pin_class == 3) {
         int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
-        int hdv = JT2;
-        if (o->kind == OCERZ_OPK_REG && pin_slot(o->reg) >= 0) hdv = pin_hreg(pin_slot(o->reg));
-        uint32_t *s1 = a64_label(b); a64_cbz(b, sf, hdv, 0);        /* divisor == 0 */
-        uint32_t *s2 = a64_label(b); a64_cbnz(b, sf, hdx, 0);       /* rdx != 0: 128-bit case */
-        a64_udiv(b, sf, JTT, hax, hdv);
+        uint32_t *sites[4]; int ns = 0;
+        sites[ns++] = a64_label(b); a64_cbz(b, sf, hdv, 0);        /* divisor == 0 */
+        if (!is_idiv) {
+            if (!rdx_zero) { sites[ns++] = a64_label(b); a64_cbnz(b, sf, hdx, 0); }   /* rdx != 0: 128-bit case */
+            a64_udiv(b, sf, JTT, hax, hdv);
+        } else {
+            if (!rdx_sext) {                                          /* rdx:rax must be sext(rax) */
+                a64_asr_imm(b, sf, JTT, hax, sf ? 63 : 31);
+                a64_subs_reg(b, sf, A64_ZR, hdx, JTT, 0);
+                sites[ns++] = a64_label(b); a64_bcond(b, A64_NE, 0);
+            }
+            /* INT_MIN / -1 raises #DE on x86: divisor -1 and rax == INT_MIN -> slow */
+            a64_subs_imm(b, sf, A64_ZR, hdv, 0);                      /* placeholder: cmn hdv, #1 below */
+            b->p--;                                                   /* (drop the placeholder) */
+            a64_emit32(b, (sf ? 0xb100041fu : 0x3100041fu) | ((uint32_t)hdv << 5));   /* cmn hdv, #1 */
+            uint32_t *not_m1 = a64_label(b); a64_bcond(b, A64_NE, 0);
+            a64_try_eor_imm(b, sf, JTT, hax, sf ? 0x8000000000000000ull : 0x80000000ull);
+            sites[ns++] = a64_label(b); a64_cbz(b, sf, JTT, 0);
+            a64_patch_bcond(not_m1, a64_label(b));
+            a64_sdiv(b, sf, JTT, hax, hdv);
+        }
         a64_msub(b, sf, hdx, JTT, hdv, hax);                        /* rdx = rax - q*div (W form zero-extends) */
         a64_mov_reg(b, sf, hax, JTT);
-        uint32_t *sites[2] = { s1, s2 };
-        if (oolslow_add(insn, sites, 2, a64_label(b)))
+        if (oolslow_add(insn, sites, ns, a64_label(b)))
             return 1;                                                /* rare cases out of line */
         uint32_t *done = a64_label(b); a64_b(b, 0);
         uint32_t *slow = a64_label(b);
-        a64_patch_cbz(s1, slow); a64_patch_cbz(s2, slow);
+        for (int i = 0; i < ns; i++) patch_any_branch(sites[i], slow);
         emit_slowcall(b, insn, exit_sites, n_exits);
         a64_patch_b(done, a64_label(b));
         return 1;
@@ -6928,6 +6966,25 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
 
 /* Superblock side exit fused with its adjacent cmp/test producer (index i is
  * the producer; i+1 the jcc, which must not be the block's last instruction). */
+static int flag_neutral_ok(const X86Insn *in);
+static int insn_writes_reg(const X86Insn *in, unsigned reg);
+static int side_gap_fuse_ok(const X86Insn *insns, int i, int n)   /* cmp/test at i, neutral at i+1, jcc at i+2 (side exit) */
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_SIDEFUSE") ? 1 : 0;
+    if (dis || i < 0 || i + 2 >= n - 1) return 0;
+    const X86Insn *p = &insns[i], *j = &insns[i + 2];
+    if (j->op != OCERZ_OP_JCC || (p->op != OCERZ_OP_CMP && p->op != OCERZ_OP_TEST)) return 0;
+    if (!g_defer || g_no_jccfuse || j->ops[0].kind != OCERZ_OPK_IMM || j->ops[0].imm == g_self_rip) return 0;
+    if (!can_fuse_cmp_test_jcc(p, j, g_self_rip)) return 0;
+    if (p->addrsize != 8) return 0;
+    if (!flag_neutral_ok(&insns[i + 1])) return 0;
+    /* the same legality the emitter applies: the gap must not write a register
+     * the compare read as a record operand */
+    if (p->ops[0].kind == OCERZ_OPK_REG && insn_writes_reg(&insns[i + 1], p->ops[0].reg)) return 0;
+    if (p->ops[1].kind == OCERZ_OPK_REG && insn_writes_reg(&insns[i + 1], p->ops[1].reg)) return 0;
+    return 1;
+}
 static int side_fuse_ok(const X86Insn *insns, int i, int n)
 {
     static int dis = -1;
@@ -7248,11 +7305,16 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
          * out-of-line chain stub registered in g_side; fall-through continues */
         int taken_live = g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0;
         int need_rec = g_jcc_side_need != 0 || taken_live;
-        /* the record goes before the branch only when the taken side may read
-         * it; when only the fall-through continuation needs the flags it goes
-         * after the branch (the record instructions do not touch NZCV) */
+        /* where the record goes: before the branch when both sides may read
+         * it; after the branch when only the fall-through continuation does;
+         * in the taken stub when only the taken side does and the operands
+         * are pins or an immediate (still intact there) */
         int rec_after = need_rec && !taken_live;
-        if (need_rec && !rec_after) {
+        static int nostub = -1; if (nostub < 0) nostub = getenv("OCERZ_NO_RECSTUB") ? 1 : 0;
+        int rec_stub = !nostub && need_rec && taken_live && g_jcc_side_fall_need == 0 && producer->op == OCERZ_OP_CMP &&
+                       g_n_side < SIDE_MAX && record_src >= 0 && record_dst >= 0 &&
+                       (record_src < 9 || record_src > 15) && (record_dst < 9 || record_dst > 15 || (rec_imm_pending && record_dst == JT1));
+        if (need_rec && !rec_after && !rec_stub) {
             if (producer->op == OCERZ_OP_CMP) {
                 if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
                 emit_defer_flags(b, ccop, record_src, record_dst);
@@ -7271,6 +7333,11 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         g_side[g_n_side].idx = -1;
         g_side[g_n_side].stub = NULL;
         g_side[g_n_side].patch_b = NULL;
+        g_side[g_n_side].rec = rec_stub;
+        if (rec_stub) {
+            g_side[g_n_side].rec_ccop = ccop; g_side[g_n_side].rec_src = record_src; g_side[g_n_side].rec_dst = record_dst;
+            g_side[g_n_side].rec_imm_pending = rec_imm_pending; g_side[g_n_side].rec_imm = rec_imm;
+        }
         g_n_side++;
         if (test_bit >= 0) {
             if (jcc->cc == OCERZ_CC_E) a64_tbz(b, test_rn, test_bit, 0);
@@ -10275,21 +10342,24 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     }
 
     uint64_t fl_need[JIT_MAX_BLOCK_INSNS];
+    uint64_t jcc_fall_live[JIT_MAX_BLOCK_INSNS];   /* side-exit jcc: flags live on the fall-through continuation */
     uint64_t entry_all;
     {
         uint64_t live_seam = seam_seed;
         uint64_t live_all = OCERZ_FL_ALL;
         for (int i = n - 1; i >= 0; i--) {
             uint64_t def, use;
+            jcc_fall_live[i] = 0;
             if (i < n - 1 && blk->insns[i].op == OCERZ_OP_JCC) {
                 /* side exit: flags live at its taken target must be recorded too */
                 uint64_t tl = (g_no_xlive || blk->insns[i].ops[0].kind != OCERZ_OPK_IMM)
                               ? OCERZ_FL_ALL : xlive_succ_live(jit, blk->insns[i].ops[0].imm);
+                jcc_fall_live[i] = live_seam;
                 live_seam |= tl;
                 live_all |= tl;
             }
             int side_fused = i < n - 1 && i >= 1 && blk->insns[i].op == OCERZ_OP_JCC &&
-                             side_fuse_ok(blk->insns, i - 1, n);
+                             (side_fuse_ok(blk->insns, i - 1, n) || (i >= 2 && side_gap_fuse_ok(blk->insns, i - 2, n)));
             if (blk->fault_flags && blk->fault_flags[i].kind != JFF_NONE)
                 ocerz_flags_defuse_nofault(&blk->insns[i], &def, &use);
             else
@@ -10415,16 +10485,12 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         }
         /* superblock side exit fused with its cmp/test producer over one
          * flag-neutral gap instruction: cmp ; lea|mov ; jcc */
-        if (g_n_side < SIDE_MAX && i + 2 < n - 1 && !g_no_jccfuse && g_defer &&
-            (insn->op == OCERZ_OP_CMP || insn->op == OCERZ_OP_TEST) &&
-            blk->insns[i + 2].op == OCERZ_OP_JCC && blk->insns[i + 2].ops[0].kind == OCERZ_OPK_IMM &&
-            blk->insns[i + 2].ops[0].imm != g_self_rip && insn->addrsize == 8 &&
-            can_fuse_cmp_test_jcc(insn, &blk->insns[i + 2], g_self_rip) &&
-            flag_neutral_ok(&blk->insns[i + 1])) {
+        if (g_n_side < SIDE_MAX && side_gap_fuse_ok(blk->insns, i, n)) {
             uint32_t *jcc_label = NULL, *gap_label = NULL;
             if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
             g_jcc_side_mode = 1;
             g_jcc_side_need = fl_need[i];
+            { uint64_t pdef, puse; ocerz_flags_defuse(insn, &pdef, &puse); g_jcc_side_fall_need = pdef & jcc_fall_live[i + 2]; }
             int fused = emit_cmp_test_jcc(&b, insn, &blk->insns[i + 2], epi_sites, &n_epi,
                                           &jcc_label, exit_sites, &n_exits,
                                           &blk->insns[i + 1], &gap_label);
@@ -10445,6 +10511,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
             g_jcc_side_mode = 1;
             g_jcc_side_need = fl_need[i];
+            { uint64_t pdef, puse; ocerz_flags_defuse(insn, &pdef, &puse); g_jcc_side_fall_need = pdef & jcc_fall_live[i + 1]; }
             int fused = emit_cmp_test_jcc(&b, insn, &blk->insns[i + 1], epi_sites, &n_epi,
                                           &jcc_label, exit_sites, &n_exits, NULL, NULL);
             g_jcc_side_mode = 0;
@@ -10469,6 +10536,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                 g_side[g_n_side].idx = i;
                 g_side[g_n_side].stub = NULL;
                 g_side[g_n_side].patch_b = NULL;
+                g_side[g_n_side].rec = 0;
                 if (g_cc_cbz_reg >= 0) {                     /* value-cond E/NE: one cbz/cbnz */
                     if (g_cc_cbz_nz) a64_cbnz(&b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
                     else             a64_cbz(&b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
@@ -10664,6 +10732,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         int edge_class = body_edge_pin_class();
         int body_edge = edge_class >= 0;
         g_side[k].stub = stub;
+        if (g_side[k].rec) {          /* the producer's flag record, only on this (taken) side */
+            if (g_side[k].rec_imm_pending) a64_mov_imm64(&b, JT1, g_side[k].rec_imm);
+            emit_defer_flags(&b, g_side[k].rec_ccop, g_side[k].rec_src, g_side[k].rec_dst);
+        }
         g_side[k].patch_b = emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);
     }
     /* FP batch replays: restore checkpoints, re-run the members exactly, return */
@@ -10885,7 +10957,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         int e = blk->n_edges++;
         blk->edges[e].target_rip = g_side[k].taken;
         blk->edges[e].patch_b = g_side[k].patch_b;
-        blk->edges[e].cond_site = g_side[k].site;
+        /* a stub that carries the producer's flag record must stay on the
+         * path: no short-circuit of the conditional branch to the target */
+        blk->edges[e].cond_site = g_side[k].rec ? NULL : g_side[k].site;
         blk->edges[e].kind = body_edge_pin_class() >= 0 ? EDGE_BODY : EDGE_XBLOCK;
         blk->edges[e].pin_class = body_edge_pin_class() >= 0 ? (uint8_t)body_edge_pin_class() : 0;
     }
