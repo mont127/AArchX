@@ -61,6 +61,8 @@ typedef struct JitBlock {
     uint64_t guest_rip;
     JitBlockFn code;
     uint32_t *body_code;
+    uint32_t *body_noreload;    /* body entry after the hoisted-base reload (for a same-signature predecessor) */
+    uint64_t hoist_sig;         /* hoisted bases / aux signature (0: none) */
     X86Insn *insns;
     int n_insns;
     struct JitBlock *hnext;
@@ -397,6 +399,16 @@ static int g_mem_hoist_aux_scale;
                                  address from the frame, callouts/bl clobber it and reload */
 static int g_mem_hoist_greg2 = -1;
 static int g_mem_hoist_greg3 = -1;
+/* signature of the current translation's hoisting: a chained predecessor
+ * with the same signature enters the target after its reload */
+static inline uint64_t hoist_signature(void)
+{
+    if (g_mem_hoist_greg < 0) return 0;
+    return 1ull | ((uint64_t)(g_mem_hoist_greg & 0xff) << 8) | ((uint64_t)((g_mem_hoist_greg2 + 1) & 0xff) << 16) |
+           ((uint64_t)((g_mem_hoist_greg3 + 1) & 0xff) << 24) | ((uint64_t)((g_mem_hoist_aux_index + 1) & 0xff) << 32) |
+           ((uint64_t)(g_mem_hoist_aux_scale & 3) << 40) | ((uint64_t)((uint32_t)(g_mem_hoist_aux_disp + 0x8000) & 0xffff) << 44);
+}
+
 static inline int pin_slot(unsigned greg);
 static inline int pin_hreg(int slot);
 extern int g_pin_class_fwd(void);
@@ -9309,6 +9321,7 @@ typedef struct PendingChain {
     uint32_t *patch_b;
     uint32_t *cond_site;
     void **ras_slot;
+    uint64_t src_sig;              /* source block's hoist signature (body edges) */
     uint8_t kind;
     uint8_t pin_class;
     struct PendingChain *next;
@@ -9319,7 +9332,7 @@ typedef struct PendingChain {
 static PendingChain *g_pending[PEND_SIZE];
 
 static void pending_add(uint64_t target_rip, uint32_t *patch_b, uint8_t kind,
-                        uint8_t pin_class, uint32_t *cond_site)
+                        uint8_t pin_class, uint32_t *cond_site, uint64_t src_sig)
 {
     PendingChain *e = (PendingChain *)malloc(sizeof *e);
     if (!e)
@@ -9329,6 +9342,7 @@ static void pending_add(uint64_t target_rip, uint32_t *patch_b, uint8_t kind,
     e->patch_b = patch_b;
     e->cond_site = cond_site;
     e->ras_slot = NULL;
+    e->src_sig = src_sig;
     e->kind = kind;
     e->pin_class = pin_class;
     e->next = g_pending[h];
@@ -9371,6 +9385,16 @@ static void pending_add_ras(uint64_t target_rip, void **ras_slot)
     g_pending[h] = e;
 }
 
+/* body entry for a chained predecessor: after the hoisted-base reload when
+ * the predecessor left the same hoisted registers (same signature) */
+static void *body_entry_for(const JitBlock *t, uint64_t src_sig)
+{
+    static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_HOIST_HANDOFF") ? 1 : 0;
+    /* never across a hoisted x30 (JMEMBASE3): a bl into the callee clobbers it */
+    if (!dis && src_sig && t->hoist_sig == src_sig && t->body_noreload && ((src_sig >> 24) & 0xff) == 0)
+        return (void *)t->body_noreload;
+    return (void *)t->body_code;
+}
 static void pending_drain(uint64_t rip, JitBlock *target)
 {
     unsigned h = (unsigned)(hash_rip(rip) & PEND_MASK);
@@ -9386,8 +9410,9 @@ static void pending_drain(uint64_t rip, JitBlock *target)
                     ? target->pin_class == e->pin_class
                     : (target->pin_class == 0 && target->n_pinned == 0);
                 if (compatible && target->body_code) {
-                    chain_activate(e->patch_b, target->body_code);
-                    chain_cond_short(e->cond_site, target->body_code);
+                    void *dst = body_entry_for(target, e->src_sig);
+                    chain_activate(e->patch_b, dst);
+                    chain_cond_short(e->cond_site, dst);
                 }
             } else {
                 chain_activate(e->patch_b, (void *)target->code);
@@ -9552,7 +9577,8 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
      * per access; identity mode needs none of this (bases are their own) */
     static int hoist_all = -1; if (hoist_all < 0) hoist_all = getenv("OCERZ_NO_HOIST_ALL") ? 0 : 1;
     if (!self_loop && (!hoist_all || ocerz_guest_base == 0)) return -1;
-    int min_count = self_loop ? 1 : 2;
+    static int mc = -1; if (mc < 0) { const char *e = getenv("OCERZ_HOIST_MIN"); mc = e ? atoi(e) : 2; }
+    int min_count = self_loop ? 1 : mc;
 
     /* candidate bases: every memory operand's base register; pick the one
      * with the most accesses that no instruction in the block may write */
@@ -10238,9 +10264,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     uint32_t *loop_poll_exit = NULL;
     if (xmm_global_enabled())
         emit_xmm_pin_load_all(&b);       /* function entry only: body edges keep V16-V31 live */
+    uint32_t *body_noreload = NULL;
     if (!g_no_chain && !jit->stop_requested) {
         g_body_entry = a64_label(&b);
         emit_reload_mem_base(&b);
+        body_noreload = a64_label(&b);
         if (getenv("OCERZ_JGB_CHECK") && jgb_usable()) {   /* debug trap: body entered with x0 != gbase */
             a64_mov_imm64(&b, JTU, ocerz_guest_base);
             a64_subs_reg(&b, 1, A64_ZR, 0, JTU, 0);
@@ -10272,6 +10300,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                   memmove(g_body_entry + pad, g_body_entry, k * sizeof(uint32_t));
                   for (size_t q = 0; q < pad; q++) g_body_entry[q] = 0xd503201fu;
                   g_body_entry += pad;
+                  if (body_noreload) body_noreload += pad;
                   b.p += pad;
               }
           } }
@@ -10915,6 +10944,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     jit->code_cur = b.p;
     blk->code = (JitBlockFn)entry;
     blk->body_code = g_body_entry;
+    blk->body_noreload = body_noreload;
+    blk->hoist_sig = hoist_signature();
     blk->ordered_loads = (uint8_t)g_blk_ordered_loads;
     blk->code_words = (uint32_t)(b.p - entry);
     if (blk->stop_patch || blk->n_stop_extra) {
@@ -11033,7 +11064,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
                     if (!compatible || !t->body_code)
                         dst = NULL;
                     else
-                        dst = (void *)t->body_code;
+                        dst = body_entry_for(t, blk->hoist_sig);
                 }
                 if (dst) {
                     chain_activate(blk->edges[i].patch_b, dst);
@@ -11042,7 +11073,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
             } else {
                 pending_add(blk->edges[i].target_rip,
                             blk->edges[i].patch_b, blk->edges[i].kind,
-                            blk->edges[i].pin_class, blk->edges[i].cond_site);
+                            blk->edges[i].pin_class, blk->edges[i].cond_site, blk->hoist_sig);
             }
         }
         pending_drain(blk->guest_rip, blk);
