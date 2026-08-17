@@ -52,6 +52,19 @@ static int trap_fatal(const X86Insn *insn, const char *msg)
     return OCERZ_STEP_FATAL;
 }
 
+/* #DE (divide by zero / quotient overflow): a fault, so the guest handler
+ * sees rip at the div; SIGFPE with FPE_INTDIV / FPE_INTOVF like Darwin.
+ * With no guest handler installed it stays fatal. */
+static int div_trap(OcerzCPU *cpu, const X86Insn *insn, int code, const char *msg)
+{
+    uint64_t next = cpu->rip;
+    cpu->rip = insn->rip;
+    if (ocerz_signal_deliver(cpu, OCERZ_SIGFPE, insn->rip, code, 0))
+        return OCERZ_STEP_REDIRECT;
+    cpu->rip = next;
+    return trap_fatal(insn, msg);
+}
+
 static uint64_t lea_addr(const OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op)
 {
     uint64_t a = (uint64_t)op->disp;
@@ -348,7 +361,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     uint64_t divisor = ocerz_read_op(cpu, insn, &insn->ops[0]);
     (void)vm;
     if (ocerz_trunc(divisor, size) == 0)
-        return trap_fatal(insn, "integer divide by zero");
+        return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "integer divide by zero");
 
     if (insn->op == OCERZ_OP_DIV) {
         if (size == 1) {
@@ -357,7 +370,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             uint64_t q = num / d;
             uint64_t r = num % d;
             if (q > 0xff)
-                return trap_fatal(insn, "divide quotient overflow");
+                return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
             ocerz_write_gpr(cpu, OCERZ_RAX, 1, 0, q);
             ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, r);
         } else if (size == 8) {
@@ -366,7 +379,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             __uint128_t q = num / d;
             __uint128_t r = num % d;
             if (q > (__uint128_t)~(uint64_t)0)
-                return trap_fatal(insn, "divide quotient overflow");
+                return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
             cpu->gpr[OCERZ_RAX] = (uint64_t)q;
             cpu->gpr[OCERZ_RDX] = (uint64_t)r;
         } else {
@@ -377,7 +390,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             uint64_t q = num / d;
             uint64_t r = num % d;
             if (q > ocerz_mask(size))
-                return trap_fatal(insn, "divide quotient overflow");
+                return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
             write_acc(cpu, size, q);
             ocerz_write_gpr(cpu, OCERZ_RDX, size, 0, r);
         }
@@ -390,7 +403,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         int64_t q = num / d;
         int64_t r = num % d;
         if (q < -128 || q > 127)
-            return trap_fatal(insn, "divide quotient overflow");
+            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
         ocerz_write_gpr(cpu, OCERZ_RAX, 1, 0, (uint64_t)q);
         ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, (uint64_t)r);
     } else if (size == 8) {
@@ -399,7 +412,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         __int128_t q = num / d;
         __int128_t r = num % d;
         if (q < -(__int128_t)1 - (__int128_t)((__uint128_t)~(uint64_t)0 >> 1) || q > (__int128_t)((__uint128_t)~(uint64_t)0 >> 1))
-            return trap_fatal(insn, "divide quotient overflow");
+            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
         cpu->gpr[OCERZ_RAX] = (uint64_t)q;
         cpu->gpr[OCERZ_RDX] = (uint64_t)r;
     } else {
@@ -412,7 +425,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         int64_t qmin = -(int64_t)1 - (int64_t)(ocerz_mask(size) >> 1);
         int64_t qmax = (int64_t)(ocerz_mask(size) >> 1);
         if (q < qmin || q > qmax)
-            return trap_fatal(insn, "divide quotient overflow");
+            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
         write_acc(cpu, size, (uint64_t)q);
         ocerz_write_gpr(cpu, OCERZ_RDX, size, 0, (uint64_t)r);
     }

@@ -2888,6 +2888,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
  * instruction by ea_cache_step().  Out-of-line code that rejoins the body
  * (NaN fixups, batch replays) leaves JTA as the body did. */
 static const X86Insn *g_cur_insns;   /* the block's instructions (for index-based predicates) */
+static int g_cur_insns_n;
 const struct X86Insn *g_cur_insns_fwd(void) { return g_cur_insns; }
 static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
 static struct {
@@ -4574,6 +4575,30 @@ static int emit_cbw_cwd(A64Buf *b, const X86Insn *insn)
  * which traps exactly like the interpreter. */
 static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32_t *back);
 static void patch_any_branch(uint32_t *site, uint32_t *target);
+static int g_div_prev_skipped;
+static uint32_t g_oolslow_pre;      /* one host word the next out-of-line slow arm runs before its slow call (0: none) */
+/* xor edx,edx / xor rdx,rdx right before a div, or cqo/cdq right before an
+ * idiv of the same size, with dead flags and a pinned register divisor: the
+ * div's pin fast path never reads rdx (it is statically known) and overwrites
+ * it, so the preparation is dead code.  Its slow arm re-materialises rdx. */
+static int rdx_prep_skippable(const X86Insn *insns, int i, int n, uint64_t need)
+{
+    static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_RDXSKIP") ? 1 : 0;
+    if (dis || !insns || i + 1 >= n || need != 0 || g_pin_class != 3) return 0;
+    if (pin_slot(OCERZ_RAX) < 0 || pin_slot(OCERZ_RDX) < 0) return 0;
+    const X86Insn *p = &insns[i], *d = &insns[i + 1];
+    if (d->seg != OCERZ_SEG_NONE || d->nops < 1) return 0;
+    const X86Operand *o = &d->ops[0];
+    if (o->kind != OCERZ_OPK_REG || o->high8 || (o->size != 4 && o->size != 8) || pin_slot(o->reg) < 0) return 0;
+    if (getenv("OCERZ_NO_INLINE_DIV")) return 0;
+    if (d->op == OCERZ_OP_DIV)
+        return p->op == OCERZ_OP_XOR && p->nops == 2 && p->ops[0].kind == OCERZ_OPK_REG && p->ops[1].kind == OCERZ_OPK_REG &&
+               p->ops[0].reg == OCERZ_RDX && p->ops[1].reg == OCERZ_RDX && !p->ops[0].high8 && !p->ops[1].high8 &&
+               (p->ops[0].size == 4 || p->ops[0].size == 8) && p->ops[1].size == p->ops[0].size;
+    if (d->op == OCERZ_OP_IDIV)
+        return p->op == OCERZ_OP_CWD && p->opsize == o->size;
+    return 0;
+}
 static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *o = &insn->ops[0];
@@ -4591,6 +4616,15 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
             pv->ops[0].reg == OCERZ_RDX && pv->ops[1].reg == OCERZ_RDX && !pv->ops[0].high8 && (pv->ops[0].size == 4 || pv->ops[0].size == 8))
             rdx_zero = 1;
         if (pv->op == OCERZ_OP_CWD && ((sf && pv->opsize == 8) || (!sf && pv->opsize == 4))) rdx_sext = 1;   /* cqo / cdq */
+    }
+    /* the rdx preparation was not emitted (rdx_prep_skippable): the slow
+     * arm materialises it first (the interpreter needs the real rdx) */
+    int prep_skipped = g_div_prev_skipped; g_div_prev_skipped = 0;
+    uint32_t pre_word = 0;
+    if (prep_skipped && pin_slot(OCERZ_RDX) >= 0 && pin_slot(OCERZ_RAX) >= 0) {
+        int hdx0 = pin_hreg(pin_slot(OCERZ_RDX)), hax0 = pin_hreg(pin_slot(OCERZ_RAX));
+        if (rdx_zero) pre_word = 0xaa1f03e0u | (uint32_t)hdx0;                          /* mov hdx, xzr */
+        else pre_word = (sf ? 0x9340fc00u : 0x13007c00u) | ((uint32_t)hax0 << 5) | (uint32_t)hdx0;   /* asr hdx, hax, #63 / #31 */
     }
     /* divisor: a pinned register is used in place, else -> JT2 (memory first: EA clobbers JT0) */
     int hdv = JT2;
@@ -4633,11 +4667,14 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         }
         a64_msub(b, sf, hdx, JTT, hdv, hax);                        /* rdx = rax - q*div (W form zero-extends) */
         a64_mov_reg(b, sf, hax, JTT);
+        g_oolslow_pre = pre_word;
         if (oolslow_add(insn, sites, ns, a64_label(b)))
             return 1;                                                /* rare cases out of line */
+        g_oolslow_pre = 0;
         uint32_t *done = a64_label(b); a64_b(b, 0);
         uint32_t *slow = a64_label(b);
         for (int i = 0; i < ns; i++) patch_any_branch(sites[i], slow);
+        if (pre_word) a64_emit32(b, pre_word);
         emit_slowcall(b, insn, exit_sites, n_exits);
         a64_patch_b(done, a64_label(b));
         return 1;
@@ -6854,6 +6891,12 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     if (insn->op == OCERZ_OP_NOP || insn->op == OCERZ_OP_PAUSE ||
         insn->op == OCERZ_OP_PREFETCH || insn->op == OCERZ_OP_CLFLUSH)
         return 1;
+    if ((insn->op == OCERZ_OP_XOR || insn->op == OCERZ_OP_CWD) && g_cur_insns && insn == &g_cur_insns[g_cur_insn_idx] &&
+        rdx_prep_skippable(g_cur_insns, g_cur_insn_idx, g_cur_insns_n, need)) {
+        g_div_prev_skipped = 1;          /* the following div/idiv materialises rdx on its slow arm */
+        return 1;
+    }
+    g_div_prev_skipped = 0;
 
     if (insn->op == OCERZ_OP_MOV) {
         const X86Operand *d = &insn->ops[0];
@@ -9914,7 +9957,7 @@ static int code_index_append_locked(OcerzJit *jit, JitBlock *block)
  * b.cond) targets a stub emitted after the body that runs the instruction in
  * the interpreter and branches back, so the common path has no taken branch. */
 #define OOLSLOW_MAX 32
-static struct { uint32_t *sites[3]; int nsites; const X86Insn *insn; uint32_t *back; } g_oolslow[OOLSLOW_MAX];
+static struct { uint32_t *sites[3]; int nsites; const X86Insn *insn; uint32_t *back; uint32_t pre; } g_oolslow[OOLSLOW_MAX];
 static int g_n_oolslow;
 static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32_t *back)
 {
@@ -9923,6 +9966,8 @@ static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32
     g_oolslow[g_n_oolslow].nsites = nsites;
     g_oolslow[g_n_oolslow].insn = insn;
     g_oolslow[g_n_oolslow].back = back;
+    g_oolslow[g_n_oolslow].pre = g_oolslow_pre;
+    g_oolslow_pre = 0;
     g_n_oolslow++;
     return 1;
 }
@@ -9939,6 +9984,7 @@ static void emit_oolslow_arms(A64Buf *b, uint32_t **exit_sites, int *n_exits)
     for (int k = 0; k < g_n_oolslow; k++) {
         uint32_t *lbl = a64_label(b);
         for (int i = 0; i < g_oolslow[k].nsites; i++) patch_any_branch(g_oolslow[k].sites[i], lbl);
+        if (g_oolslow[k].pre) a64_emit32(b, g_oolslow[k].pre);
         emit_slowcall(b, g_oolslow[k].insn, exit_sites, n_exits);
         uint32_t *here = a64_label(b);
         a64_b(b, (int32_t)(g_oolslow[k].back - here));
@@ -10601,7 +10647,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         g_cur_insn_idx = i;
         g_cur_insn_start = b.p;
         g_cur_need = fl_need[i];
-        g_cur_insns = blk->insns;
+        g_cur_insns = blk->insns; g_cur_insns_n = n;
         g_cur_fpb = fpb_of[i];
         ea_cache_step(insn, i > 0 ? &blk->insns[i - 1] : NULL);
         g_nzcv_want = 0;

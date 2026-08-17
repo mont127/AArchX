@@ -9,6 +9,7 @@ enum OcerzStep {
     OCERZ_STEP_OK = 0,
     OCERZ_STEP_EXIT = 1,
     OCERZ_STEP_FATAL = 2,
+    OCERZ_STEP_REDIRECT = 3,   /* a non-terminator changed rip (guest signal delivered): re-dispatch */
 };
 
 struct OcerzVM;
