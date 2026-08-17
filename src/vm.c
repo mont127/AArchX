@@ -475,6 +475,36 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
      * readable (shared-cache constants included), so this is handled before
      * the guest-space test: mark the block for alignment-checked
      * retranslation, run the instruction in the interpreter, resume. */
+    /* Host-stack RAS overflow: the CALL's shadow push (stp x, x, [sp, #-16]!)
+     * hit the host stack guard.  Nothing of the CALL has executed yet (the
+     * shadow push comes first), so run the CALL in the interpreter and
+     * abandon the JIT frame; the shadow restarts empty. */
+    if ((sig == SIGSEGV || sig == SIGBUS) && depth == 0 && g_cur_cpu && g_sig_recover && ctx) {
+        const ucontext_t *uc = (const ucontext_t *)ctx;
+        const uint32_t *hpc = (const uint32_t *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+        struct OcerzVM *fvm = g_cur_cpu->vm;
+        if (fvm && ocerz_jit_pc_in_arena(fvm, hpc) && (*hpc & 0xffff83e0u) == 0xa9bf03e0u &&
+            (uint64_t)(uintptr_t)si->si_addr - (uc->uc_mcontext->__ss.__sp - 16) < 32) {
+            depth = 1;
+            ocerz_jit_fault_recover_regs(fvm, hpc, uc->uc_mcontext->__ss.__x, g_cur_cpu);
+            ocerz_jit_fault_recover_xmm(fvm, hpc, uc->uc_mcontext->__ns.__v, g_cur_cpu);
+            ocerz_jit_fault_recover_flags(fvm, hpc, g_cur_cpu);
+            ocerz_flags_materialize(g_cur_cpu);
+            uint64_t jrip;
+            if (ocerz_jit_fault_rip(fvm, hpc, &jrip)) {
+                g_cur_cpu->rip = jrip;
+                g_cur_cpu->sig_repeat = 0;
+                g_cur_cpu->interp_once = 1;
+                if (getenv("OCERZ_RASLOG"))
+                    fprintf(stderr, "ocerz: host RAS overflow at rip=%#llx sp=%#llx: CALL via interpreter\n",
+                            (unsigned long long)jrip, (unsigned long long)uc->uc_mcontext->__ss.__sp);
+                depth = 0;
+                siglongjmp(*g_sig_recover, 1);
+            }
+            depth = 0;
+        }
+    }
+
     if (align_fault && depth == 0 && g_cur_cpu && g_sig_recover && ctx) {
         const ucontext_t *uc = (const ucontext_t *)ctx;
         const void *hpc = (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
