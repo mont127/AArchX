@@ -101,46 +101,52 @@ startup and JIT warm-up. Ratio is Ocerz time over Rosetta 2 time (lower is bette
 
 | Kernel | What it exercises | Rosetta 2 | Ocerz | Ratio |
 | --- | --- | --- | --- | --- |
-| `depchain` | long dependent integer chains | 0.154s | 0.140s | **0.91x** |
-| `jtab` | switch / jump-table dispatch | 0.256s | 0.247s | **0.96x** |
-| `memcpy` | memcpy of mixed sizes | 0.287s | 0.276s | **0.96x** |
-| `chase` | pointer chasing (cache latency) | 0.301s | 0.304s | 1.01x |
-| `brmiss` | unpredictable branches | 0.200s | 0.204s | 1.01x |
-| `str` | strlen/strcmp-style byte loops | 0.294s | 0.299s | 1.03x |
-| `hash` | hashing (mul/xor/shift + loads) | 0.286s | 0.294s | 1.03x |
-| `qsort` | recursive quicksort (compare + swap) | 0.293s | 0.299s | 1.04x |
-| `fpvec` | packed single-precision loop (SSE) | 0.289s | 0.300s | 1.04x |
-| `vm` | bytecode-interpreter dispatch loop | 0.156s | 0.166s | 1.07x |
-| `icall` | indirect calls through a function table | 0.236s | 0.257s | 1.09x |
-| `idiv` | 64/32-bit unsigned division | 0.258s | 0.286s | 1.11x |
-| `fpsse` | scalar double chain with sqrt/div | 0.292s | 0.354s | 1.21x |
-| `leafcall` | many small non-recursive calls | 0.295s | 0.369s | 1.24x |
-| `mixed` | struct updates, FP compares, branches | 0.279s | 0.361s | 1.29x |
+| `depchain` | long dependent integer chains | 0.151s | 0.129s | **0.85x** |
+| `memcpy` | memcpy of mixed sizes | 0.289s | 0.268s | **0.93x** |
+| `jtab` | switch / jump-table dispatch | 0.254s | 0.236s | **0.93x** |
+| `brmiss` | unpredictable branches | 0.198s | 0.190s | **0.96x** |
+| `fpvec` | packed single-precision loop (SSE) | 0.296s | 0.283s | **0.96x** |
+| `qsort` | recursive quicksort (compare + swap) | 0.291s | 0.286s | **0.98x** |
+| `str` | strlen/strcmp-style byte loops | 0.297s | 0.295s | **0.99x** |
+| `icall` | indirect calls through a function table | 0.233s | 0.232s | **0.99x** |
+| `chase` | pointer chasing (cache latency) | 0.294s | 0.294s | 1.00x |
+| `hash` | hashing (mul/xor/shift + loads) | 0.296s | 0.296s | 1.00x |
+| `vm` | bytecode-interpreter dispatch loop | 0.154s | 0.154s | 1.00x |
+| `idiv` | 64/32-bit unsigned division | 0.252s | 0.264s | 1.05x |
+| `leafcall` | many small non-recursive calls | 0.296s | 0.352s | 1.18x |
+| `fpsse` | scalar double chain with sqrt/div | 0.296s | 0.356s | 1.21x |
+| `mixed` | struct updates, FP compares, branches | 0.267s | 0.326s | 1.22x |
 
-(Apple M2 Max, `REPS=7`, quiet machine; kernels within about 3% of 1.0 trade places from
-run to run.)  Three kernels are faster than Rosetta 2, six more are within 5%, three within
-11%, and the rest within 1.3x. What made the difference so far: full guest-register pinning
+(Apple M2 Max, `REPS=5`, quiet machine; kernels within about 1% of 1.0 trade places from
+run to run.)  Eight kernels are faster than Rosetta 2, three more are at parity, one within 5%,
+and the rest within 1.25x. What made the difference so far: full guest-register pinning
 with body-to-body block chaining, lazy flags with static producer/consumer fusion
 (`cmp`/`test`/shift results feed `jcc`, `setcc`, `cmov`, `adc` straight from NZCV, including
-the narrow 8/16-bit forms), per-site caches for indirect branches, direct
-`[guest_base, rsp]` addressing for push/pop/call/ret with the host `bl`/`ret` protocol,
-hoisted and cached effective addresses (loop-invariant bases in registers, base+index
-reused across neighbouring accesses), superblocks across forward branches,
-patch-and-signal stop requests instead of interrupt polls in loops, and FP "batches": runs of SSE
-arithmetic execute in place at native speed with one NaN check per run, replaying exactly
-from a checkpoint only when a NaN shows up (x86 NaN semantics are still bit-exact, checked
-by a 2,859-case golden test against Rosetta). Where Rosetta still wins it has hardware
-help Ocerz lacks: an x86-flavoured FP mode on Apple silicon and identity-mapped guest
-memory, and its ahead-of-time translation lays out call/return code without the per-call
-return-stack bookkeeping a block JIT needs.
+the narrow 8/16-bit forms and across flag-neutral gaps such as `cmp; mov; cmova; cmovae`),
+cross-block flag liveness that peeks through direct calls and jumps (no flag-record spill
+before a call whose callee overwrites the flags), per-site caches for indirect branches with
+the target loaded like any other memory operand, direct `[guest_base, rsp]` addressing for
+push/pop/call/ret with the host `bl`/`ret` protocol and a host-stack return-address shadow,
+hoisted and cached effective addresses (up to three loop-invariant bases in registers, handed
+over across chained blocks, base+index reused across neighbouring accesses), superblocks
+across forward and backward branches, `cbz`/`cbnz` side exits, div/idiv on pinned registers,
+patch-and-signal stop requests instead of interrupt polls in loops, and FP "batches": runs
+of SSE arithmetic execute in place at native speed with one NaN check per run, replaying
+exactly from a checkpoint only when a NaN shows up (x86 NaN semantics are still bit-exact,
+checked by a 2,859-case golden test against Rosetta). Where Rosetta still wins it has
+hardware help Ocerz lacks: an x86-flavoured FP mode on Apple silicon and identity-mapped
+guest memory, and its ahead-of-time translation lays out call/return code without the
+per-call return-stack bookkeeping a block JIT needs.
 
 The same kernels built as an ordinary dynamically linked binary (`tests/guest/benchbin/xbench_dyn`:
 libSystem, dyld shared cache — the mode Wine and every real macOS binary run in) measure the
 same way (`OCERZ_HOSTWQ=1 XB=tests/guest/benchbin/xbench_dyn python3 tests/xbench_compare.py`,
-`REPS=3`): jtab 0.96x, depchain 0.92x, brmiss 0.97x, chase 0.97x, vm 0.78x, memcpy 1.03x
-(libc `memmove`), hash 1.03x, qsort 1.05x, fpvec 1.07x, icall 1.09x, str 1.12x (libc's SIMD
-`strlen`), idiv 1.14x, fpsse 1.20x, leafcall 1.24x, mixed 1.32x. Process startup for a
-dynamically linked binary is about 0.06 s (`wine --version`: 0.12 s).
+`REPS=5`): nine kernels are faster than Rosetta 2 — depchain 0.85x, jtab 0.90x, vm 0.96x,
+brmiss 0.96x, fpvec 0.96x, chase 0.97x, memcpy 0.97x (libc `memmove`), icall 0.99x,
+qsort 1.00x — and hash 1.01x, idiv 1.03x, str 1.04x (libc's SIMD `strlen`), leafcall 1.17x,
+fpsse 1.20x, mixed 1.21x. Guest memory is identity mapped in this mode, so push/pop/call/ret
+use the pre/post-indexed forms on the pinned rsp. Process startup for a dynamically linked
+binary is about 0.06 s (`wine --version`: 0.12 s).
 
 Loads and stores are plain `ldr`/`str` while the process is single-observer, and switch to
 the ordered (x86-TSO) forms once guest memory can be seen by another thread or process:
