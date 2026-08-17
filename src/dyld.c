@@ -2033,6 +2033,33 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
     }
     if (g_dlerror_g)
         ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+    /* diagnostic piggyback: OCERZ_DLOPEN_PIGGYBACK="<substr>:<dylib>" loads
+     * <dylib> (guest initializers and all) right after the first dlopen whose
+     * path contains <substr> -- puts a probe INSIDE the real process, on the
+     * same thread, at the same point in its life. */
+    {
+        static char pig_key[256], pig_lib[1024];
+        static int pig = -1, pig_done;
+        if (pig < 0) {
+            const char *e = getenv("OCERZ_DLOPEN_PIGGYBACK");
+            pig = 0;
+            if (e) {
+                const char *c = strchr(e, ':');
+                if (c && (size_t)(c - e) < sizeof pig_key && strlen(c + 1) < sizeof pig_lib) {
+                    memcpy(pig_key, e, (size_t)(c - e)); pig_key[c - e] = '\0';
+                    strcpy(pig_lib, c + 1);
+                    pig = 1;
+                }
+            }
+        }
+        if (pig && !pig_done && loadpath && strstr(loadpath, pig_key)) {
+            pig_done = 1;
+            fprintf(stderr, "ocerz: PIGGYBACK[%d] after \"%s\": dlopen \"%s\"\n",
+                    (int)getpid(), loadpath, pig_lib);
+            uint64_t pb = ocerz_dlopen_inner(vm, pig_lib, 2 /* RTLD_NOW */);
+            fprintf(stderr, "ocerz: PIGGYBACK[%d] -> %#llx\n", (int)getpid(), (unsigned long long)pb);
+        }
+    }
     return d->load_base;
 }
 
