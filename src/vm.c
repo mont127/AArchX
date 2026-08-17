@@ -280,7 +280,22 @@ static void arg_trap_report(const OcerzCPU *c)
         { "rdi", OCERZ_RDI }, { "rsi", OCERZ_RSI }, { "rdx", OCERZ_RDX },
         { "rcx", OCERZ_RCX }, { "r8",  OCERZ_R8  }, { "r9",  OCERZ_R9  },
     };
-    fprintf(stderr, "ocerz: ARGTRAP rip=%#llx", (unsigned long long)c->rip);
+    fprintf(stderr, "ocerz: ARGTRAP[%d] rip=%#llx", (int)getpid(), (unsigned long long)c->rip);
+    if (ocerz_addr_readable(c->gpr[OCERZ_RSP])) {
+        fprintf(stderr, " ra=%#llx", (unsigned long long)ocerz_ld(c->gpr[OCERZ_RSP], 8));
+        /* a few more return-address-looking stack words for context */
+        for (uint64_t o = 8; o < 0x3000; o += 8) {
+            if (!ocerz_addr_readable(c->gpr[OCERZ_RSP] + o)) break;
+            uint64_t v = ocerz_ld(c->gpr[OCERZ_RSP] + o, 8);
+            int codey = (v >= 0x7ff800000000ull && v < 0x7ffb00000000ull) ||   /* shared cache */
+                        (v >= 0x700000000000ull && v < 0x710000000000ull) ||   /* wine .so images */
+                        (v >= 0x6fff00000000ull && v < 0x700000000000ull) ||   /* PE builtins */
+                        (v >= 0x140000000ull && v < 0x180000000ull) ||          /* PE exes */
+                        (v >= 0x7ff000000000ull && v < 0x7ff100000000ull);      /* relocated builtins */
+            if (codey)
+                fprintf(stderr, " +%#llx:%#llx", (unsigned long long)o, (unsigned long long)v);
+        }
+    }
     for (unsigned i = 0; i < sizeof A / sizeof A[0]; i++) {
         uint64_t v = c->gpr[A[i].r];
         fprintf(stderr, " %s=%#llx", A[i].n, (unsigned long long)v);

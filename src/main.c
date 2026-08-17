@@ -1,4 +1,5 @@
 /* Command-line parsing and the entry point. */
+#include <string.h>
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/dyld.h"
@@ -12,8 +13,19 @@ static void usage(void)
     fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]\n");
 }
 
+char ocerz_cmdline_summary[256];   /* guest argv tail for diagnostics (EXITLOG) */
 int main(int argc, char **argv)
 {
+    {
+        char *w = ocerz_cmdline_summary, *end = ocerz_cmdline_summary + sizeof ocerz_cmdline_summary - 1;
+        for (int i = 1; i < argc && w < end; i++) {
+            const char *b = strrchr(argv[i], '/');
+            b = b ? b + 1 : argv[i];
+            if (w != ocerz_cmdline_summary && w < end) *w++ = ' ';
+            while (*b && w < end) *w++ = *b++;
+        }
+        *w = 0;
+    }
     int trace = 0;
     int strace = 0;
     int nojit = 0;
