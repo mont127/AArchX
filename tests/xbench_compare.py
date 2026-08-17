@@ -17,11 +17,13 @@ DFLT = dict(icall=50000000, jtab=50000000, depchain=100000000, brmiss=50000000,
             fpvec=5000, chase=30000000, qsort=30, leafcall=50000000, mixed=20000, vm=500000)
 KERNELS = os.environ.get("KERNELS", ",".join(DFLT)).split(",")
 
+LAST_ERR = {}
 def run(engine, k, n):
     cmd = [XB, k, str(n)] if engine == "R" else [OCERZ, XB, k, str(n)]
     t0 = time.perf_counter()
-    out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
-    return time.perf_counter() - t0, out
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    LAST_ERR[(engine, k, n)] = (r.returncode, r.stderr[-2000:])
+    return time.perf_counter() - t0, r.stdout
 
 def main():
     print(f"{'kernel':<10}{'scale':>12}{'Rosetta_s':>11}{'Ocerz_s':>10}{'ratio':>9}  verdict")
@@ -43,7 +45,11 @@ def main():
                 oh, oo2 = run("O", k, n);   rh, ro2 = run("R", k, n)
                 ol, oo = run("O", k, half); rl, ro = run("R", k, half)
             if ro != oo or ro2 != oo2:
-                print(f"{k}: OUTPUT MISMATCH rosetta={ro2!r} ocerz={oo2!r}"); sys.exit(2)
+                print(f"{k}: OUTPUT MISMATCH half rosetta={ro!r} ocerz={oo!r} full rosetta={ro2!r} ocerz={oo2!r}")
+                for key in (("O", k, half), ("O", k, n)):
+                    rc, err = LAST_ERR.get(key, (None, b""))
+                    print(f"  ocerz {key}: rc={rc} stderr={err!r}")
+                sys.exit(2)
             r = max(rh - rl, 1e-3); o = max(oh - ol, 1e-3)
             rd.append(r); od.append(o); ratios.append(o / r)
         rm, om, ratio = statistics.median(rd), statistics.median(od), statistics.median(ratios)
