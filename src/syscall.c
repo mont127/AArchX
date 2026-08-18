@@ -4019,7 +4019,9 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         {
             static int norlk31 = -1;
             if (norlk31 < 0) norlk31 = getenv("OCERZ_NO_RCV_TIMEOUT_KICK") ? 1 : 0;
-            if (!norlk31 && r31 == 0x10004005ull && (a[1] & 0x2))
+            /* receive-only, never a combined send+receive MIG RPC (see the
+             * mach_msg2 site below for the full rationale) */
+            if (!norlk31 && r31 == 0x10004005ull && (a[1] & 0x3) == 0x2)
                 r31 = 0x10004003ull;
         }
         mach_ret(cpu, r31);
@@ -4249,7 +4251,16 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         {
             static int norlk = -1;
             if (norlk < 0) norlk = getenv("OCERZ_NO_RCV_TIMEOUT_KICK") ? 1 : 0;
-            if (!norlk && r47 == 0x10004005ull /* MACH_RCV_INTERRUPTED */ && (a[1] & 0x2))
+            /* Receive-ONLY calls: CFRunLoop retries an interrupted receive
+             * without re-checking its sources, so a kicked receive must look
+             * like a timeout for the run loop to make a full pass.
+             * A COMBINED send+receive (options SEND|RCV) is a MIG RPC: the
+             * kernel can never return MACH_RCV_TIMED_OUT there, and a MIG
+             * client stub that sees it deallocates its reply port and fails
+             * the RPC, which surfaces as a failed AppKit/CGS call.  Never
+             * rewrite those. */
+            if (!norlk && r47 == 0x10004005ull /* MACH_RCV_INTERRUPTED */ &&
+                (a[1] & 0x3) == 0x2)
                 r47 = 0x10004003ull;           /* MACH_RCV_TIMED_OUT */
         }
         mach_ret(cpu, r47);
