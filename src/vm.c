@@ -9,6 +9,8 @@
 #include "ocerz/dyldapi.h"
 
 #include <signal.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <setjmp.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -482,7 +484,19 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                     q = str_into(q, " ->");
                     mach_port_name_t *mem = NULL; mach_msg_type_number_t nm = 0;
                     if (mach_port_get_set_status(mach_task_self(), names[i], &mem, &nm) == KERN_SUCCESS) {
-                        for (unsigned j = 0; j < nm && j < 32; j++) { q = str_into(q, " "); q = hex_into(q, mem[j]); }
+                        for (unsigned j = 0; j < nm && j < 32; j++) {
+                            q = str_into(q, " ");
+                            q = hex_into(q, mem[j]);
+                            mach_port_status_t pst;
+                            mach_msg_type_number_t pn = MACH_PORT_RECEIVE_STATUS_COUNT;
+                            if (mach_port_get_attributes(mach_task_self(), mem[j],
+                                                         MACH_PORT_RECEIVE_STATUS,
+                                                         (mach_port_info_t)&pst, &pn) == KERN_SUCCESS &&
+                                pst.mps_msgcount) {
+                                q = str_into(q, ":n=");
+                                q = hex_into(q, pst.mps_msgcount);
+                            }
+                        }
                         if (mem) mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)mem, nm * sizeof(*mem));
                     }
                     q = str_into(q, "\n");
@@ -490,6 +504,23 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                 }
                 mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)names, nn * sizeof(*names));
                 mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)types, nt * sizeof(*types));
+            }
+            for (int fd = 0; fd < 96; fd++) {
+                struct stat st;
+                int nread = 0;
+                if (fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode))
+                    continue;
+                if (ioctl(fd, FIONREAD, &nread) != 0)
+                    continue;
+                if (!nread)
+                    continue;
+                char fb[96]; char *fq = fb;
+                fq = str_into(fq, "ocerz: PIPE fd=");
+                fq = hex_into(fq, (uint64_t)fd);
+                fq = str_into(fq, " nread=");
+                fq = hex_into(fq, (uint64_t)nread);
+                fq = str_into(fq, "\n");
+                write(2, fb, (size_t)(fq - fb));
             }
             once = 0;
         }
@@ -509,7 +540,9 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
         q = str_into(q, "\n");
         write(2, rb, (size_t)(q - rb));
     }
-    p = str_into(p, "ocerz: RIPDUMP rip=");
+    p = str_into(p, "ocerz: RIPDUMP cpu#");
+    p = hex_into(p, g_cur_cpu->cpu_number);
+    p = str_into(p, " rip=");
     p = hex_into(p, g_cur_cpu->rip);
     p = str_into(p, " gs=");
     p = hex_into(p, g_cur_cpu->gs_base);
@@ -532,6 +565,70 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
     }
     *p++ = '\n';
     write(2, b, (size_t)(p - b));
+
+    {   /* OCERZ_MACDRVDUMP=<winemac.so base>: dump the WineApplicationController
+         * request machinery (singleton at +0x560f0; +0x8 requestsSource,
+         * +0x10 requests NSMutableArray, +0x18 requestsManipQueue). */
+        static uint64_t mbase; static int minit;
+        if (!minit) {
+            const char *e = getenv("OCERZ_MACDRVDUMP");
+            mbase = e ? strtoull(e, NULL, 0) : 0;
+            minit = 1;
+        }
+        static _Atomic int monce;
+        int mexp = 0;
+        if (mbase &&
+            __c11_atomic_compare_exchange_strong(&monce, &mexp, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            char mb[512]; char *mq = mb;
+            mq = str_into(mq, "ocerz: MACDRV ctrl=");
+            uint64_t slot = mbase + 0x560f0;
+            uint64_t ctrl = ocerz_addr_readable(slot) ? ocerz_ld(slot, 8) : 0;
+            mq = hex_into(mq, ctrl);
+            if (ctrl && ocerz_addr_readable(ctrl) && ocerz_addr_readable(ctrl + 0x1f)) {
+                uint64_t src = ocerz_ld(ctrl + 0x8, 8);
+                uint64_t arr = ocerz_ld(ctrl + 0x10, 8);
+                uint64_t mnq = ocerz_ld(ctrl + 0x18, 8);
+                mq = str_into(mq, " src="); mq = hex_into(mq, src);
+                mq = str_into(mq, " arr="); mq = hex_into(mq, arr);
+                mq = str_into(mq, " q=");   mq = hex_into(mq, mnq);
+                if (src && ocerz_addr_readable(src) && ocerz_addr_readable(src + 0x1f)) {
+                    mq = str_into(mq, " srcw:");
+                    for (int k = 0; k < 4; k++) { mq = str_into(mq, " "); mq = hex_into(mq, ocerz_ld(src + 8ull * k, 8)); }
+                }
+                if (arr && ocerz_addr_readable(arr) && ocerz_addr_readable(arr + 0x1f)) {
+                    mq = str_into(mq, " arrw:");
+                    for (int k = 0; k < 4; k++) { mq = str_into(mq, " "); mq = hex_into(mq, ocerz_ld(arr + 8ull * k, 8)); }
+                }
+            }
+            mq = str_into(mq, "\n");
+            write(2, mb, (size_t)(mq - mb));
+            monce = 0;
+        }
+    }
+    {   /* guest backtrace by rbp-chain walk (system frameworks keep
+         * frame pointers, so this is reliable through CF/AppKit/wine) */
+        p = b;
+        p = str_into(p, "ocerz:   gbt");
+        uint64_t fp = g_cur_cpu->gpr[5];   /* rbp */
+        for (int i = 0; i < 24; i++) {
+            if (!fp || (fp & 7) || !ocerz_addr_readable(fp) ||
+                !ocerz_addr_readable(fp + 15))
+                break;
+            uint64_t ra = ocerz_ld(fp + 8, 8);
+            uint64_t nfp = ocerz_ld(fp, 8);
+            if (!ra)
+                break;
+            p = str_into(p, " ");
+            p = hex_into(p, ra);
+            if (nfp <= fp)
+                break;
+            fp = nfp;
+            if ((size_t)(p - b) > sizeof b - 40)
+                break;
+        }
+        *p++ = '\n';
+        write(2, b, (size_t)(p - b));
+    }
 
     for (int i = 0; i < 24; i++) {
         uint64_t r = g_riphist[(g_riphist_n - 1 - (unsigned)i) & 31];

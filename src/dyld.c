@@ -2261,6 +2261,20 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     uint64_t gs = self + 0xe0;
     vm->cpu.gs_base = gs;
     ocerz_st(gs, 8, self);
+    {
+        /* libpthread caches __thread_selfid() at TSD base - 8
+         * (_PTHREAD_STRUCT_DIRECT_THREADID_OFFSET).  Guest libpthread only
+         * fills it in _pthread_set_self_internal, which the hand-built main
+         * thread never runs, so pthread_threadid_np()/_pthread_selfid_direct
+         * returned 0 on the main thread.  The pthread firstfit mutex protocol
+         * stores that tid as the lock owner: owner 0 looks UNLOCKED, so any
+         * mutex taken by the main thread had no mutual exclusion at all
+         * against other threads (CFRunLoopSource locks!) -> lost psynch
+         * wakes, corrupted signaled flags, the explorer sync freeze. */
+        uint64_t htid = 0;
+        pthread_threadid_np(NULL, &htid);
+        ocerz_st(gs - 8, 8, htid);
+    }
 
     if (g_main_dimg_valid)
         free(g_main_dimg.owned_buf);
