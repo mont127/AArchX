@@ -197,6 +197,7 @@ static int g_sigtrace;
 static int g_winefaultlog;
 
 uint64_t ocerz_watch_addr;
+uint64_t ocerz_watch_len = 8;
 uint64_t ocerz_watch_val;
 uint64_t ocerz_watch_shadow;
 uint64_t ocerz_exc_trap;
@@ -435,8 +436,19 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
     case SIGPROF: case SIGXCPU: case SIGXFSZ: case SIGTSTP: case SIGTTIN:
     case SIGTTOU: case SIGCONT: case SIGINFO:
         break;
+    case SIGUSR1:
+        /* wine's ntdll delivers server APCs/suspend requests via SIGUSR1;
+         * without mirroring, a guest-directed SIGUSR1 either killed the
+         * process (default action) or was eaten by the ripdump handler.
+         * Keep SIGUSR1 for the ripdump diagnostics only when that env is
+         * set (those sessions accept the distortion). */
+        if (getenv("OCERZ_RIPDUMP"))
+            return;
+        break;
+    case SIGUSR2:
+        break;
     default:
-        return;  /* SEGV/BUS/USR1/USR2/QUIT/ILL/TRAP/FPE/ABRT: ocerz owns these */
+        return;  /* SEGV/BUS/QUIT/ILL/TRAP/FPE/ABRT: ocerz owns these */
     }
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -445,6 +457,11 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
     else if (kind == 2) {
         sa.sa_sigaction = async_sig_handler;
         sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESTART;
+        /* wine's SIGUSR1 (server APC/suspend) must interrupt blocked
+         * syscalls: EINTR bubbles the thread out of its wait, the vm loop
+         * delivers the guest handler, then the guest retries the call. */
+        if (sig == SIGUSR1 || sig == SIGUSR2)
+            sa.sa_flags &= ~SA_RESTART;
     } else
         sa.sa_handler = SIG_DFL;
     sigaction(sig, &sa, NULL);
@@ -542,6 +559,9 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
     }
     p = str_into(p, "ocerz: RIPDUMP cpu#");
     p = hex_into(p, g_cur_cpu->cpu_number);
+    p = str_into(p, " slot3=");
+    p = hex_into(p, ocerz_addr_readable(g_cur_cpu->gs_base + 0x18)
+                     ? ocerz_ld(g_cur_cpu->gs_base + 0x18, 8) : 0);
     p = str_into(p, " rip=");
     p = hex_into(p, g_cur_cpu->rip);
     p = str_into(p, " gs=");
@@ -580,7 +600,10 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
         if (mbase &&
             __c11_atomic_compare_exchange_strong(&monce, &mexp, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
             char mb[512]; char *mq = mb;
-            mq = str_into(mq, "ocerz: MACDRV ctrl=");
+            mq = str_into(mq, "ocerz: MACDRV token=");
+            mq = hex_into(mq, ocerz_addr_readable(mbase + 0x560f8)
+                              ? ocerz_ld(mbase + 0x560f8, 8) : 0);
+            mq = str_into(mq, " ctrl=");
             uint64_t slot = mbase + 0x560f0;
             uint64_t ctrl = ocerz_addr_readable(slot) ? ocerz_ld(slot, 8) : 0;
             mq = hex_into(mq, ctrl);
@@ -597,9 +620,9 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                     mq = str_into(mq, " src.sig58=");
                     mq = hex_into(mq, ocerz_ld(src + 0x58, 8));
                 }
-                if (arr && ocerz_addr_readable(arr) && ocerz_addr_readable(arr + 0x1f)) {
+                if (arr && ocerz_addr_readable(arr) && ocerz_addr_readable(arr + 0x2f)) {
                     mq = str_into(mq, " arrw:");
-                    for (int k = 0; k < 4; k++) { mq = str_into(mq, " "); mq = hex_into(mq, ocerz_ld(arr + 8ull * k, 8)); }
+                    for (int k = 0; k < 6; k++) { mq = str_into(mq, " "); mq = hex_into(mq, ocerz_ld(arr + 8ull * k, 8)); }
                     uint64_t st = ocerz_ld(arr + 0x10, 8);
                     if (st && ocerz_addr_readable(st) && ocerz_addr_readable(st + 0x2f)) {
                         mq = str_into(mq, " deque:");
@@ -618,6 +641,94 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
             }
             mq = str_into(mq, "\n");
             write(2, mb, (size_t)(mq - mb));
+            if (getenv("OCERZ_UNFREEZE") && ctrl && ocerz_addr_readable(ctrl + 8)) {
+                /* force-signal the macdrv request source: if a request is
+                 * still queued despite count==0, the next runloop pass will
+                 * perform it and the session unfreezes. */
+                uint64_t fsrc = ocerz_ld(ctrl + 8, 8);
+                if (fsrc && ocerz_addr_readable(fsrc + 0x58)) {
+                    ocerz_st(fsrc + 0x58, 8, 0x123456789abull);
+                    const char *msg = "ocerz: UNFREEZE signal word forced\n";
+                    write(2, msg, strlen(msg));
+                }
+            }
+            {   /* hunt live OnMainThread wrapper blocks (invoke = winemac
+                 * +0x11a50) and the thunk blocks (+0x1e770) in the guest
+                 * heap; print their captured words so the frozen request's
+                 * actual target queue/array can be identified. */
+                uint64_t inv1 = mbase + 0x11a50, inv2 = mbase + 0x1e770;
+                uint64_t ctrl_isa = 0;
+                {   /* count WineApplicationController instances: compare isa
+                     * words against the known singleton's isa */
+                    uint64_t sl = mbase + 0x560f0;
+                    uint64_t c0 = ocerz_addr_readable(sl) ? ocerz_ld(sl, 8) : 0;
+                    if (c0 && ocerz_addr_readable(c0))
+                        ctrl_isa = ocerz_ld(c0, 8);
+                }
+                static const uint64_t ranges[][2] = {
+                    { 0x100000000ull, 0x140000000ull },
+                    { 0x7040000000ull, 0x7070000000ull },
+                };
+                for (int ri = 0; ri < 2; ri++)
+                for (uint64_t page = ranges[ri][0]; page < ranges[ri][1];
+                     page += 0x1000) {
+                    if (!ocerz_addr_readable(page))
+                        continue;
+                    for (uint64_t off = 0; off < 0x1000; off += 16) {
+                        uint64_t a = page + off;
+                        uint64_t w = ocerz_ld(a, 8);
+                        if (ctrl_isa && w == ctrl_isa && off == 0 + (a & 0xff0) - (a & 0xff0)) {
+                            /* isa match at any 16-aligned slot: report */
+                            char cb[80]; char *cq = cb;
+                            cq = str_into(cq, "ocerz: CTRLOBJ ");
+                            cq = hex_into(cq, a);
+                            cq = str_into(cq, "\n");
+                            write(2, cb, (size_t)(cq - cb));
+                        }
+                        if (w != inv1 && w != inv2)
+                            continue;
+                        /* candidate block: invoke at +0x10 => block base a-0x10 */
+                        uint64_t blk = a - 0x10;
+                        uint64_t isa = ocerz_ld(blk, 8);
+                        uint64_t fl = ocerz_ld(blk + 8, 8);
+                        char hb[300]; char *hq = hb;
+                        hq = str_into(hq, "ocerz: WRAPBLK ");
+                        hq = hex_into(hq, blk);
+                        hq = str_into(hq, w == inv1 ? " kind=wrapper" : " kind=thunk");
+                        hq = str_into(hq, " isa=");
+                        hq = hex_into(hq, isa);
+                        hq = str_into(hq, " fl=");
+                        hq = hex_into(hq, fl);
+                        hq = str_into(hq, " caps:");
+                        for (int k = 0; k < 5; k++) {
+                            hq = str_into(hq, " ");
+                            hq = hex_into(hq, ocerz_addr_readable(blk + 0x20 + 8ull * k)
+                                              ? ocerz_ld(blk + 0x20 + 8ull * k, 8) : 0);
+                        }
+                        hq = str_into(hq, "\n");
+                        write(2, hb, (size_t)(hq - hb));
+                        if (w == inv1 && (uint32_t)fl == 0xc3000002u) {
+                            /* heap wrapper: find every holder of a pointer
+                             * to it (the array backing store that owns it) */
+                            for (int rj = 0; rj < 2; rj++)
+                            for (uint64_t p2 = ranges[rj][0]; p2 < ranges[rj][1];
+                                 p2 += 0x1000) {
+                                if (!ocerz_addr_readable(p2))
+                                    continue;
+                                for (uint64_t o2 = 0; o2 < 0x1000; o2 += 8) {
+                                    if (ocerz_ld(p2 + o2, 8) != blk)
+                                        continue;
+                                    char rb2[100]; char *rq = rb2;
+                                    rq = str_into(rq, "ocerz: WRAPREF holder=");
+                                    rq = hex_into(rq, p2 + o2);
+                                    rq = str_into(rq, "\n");
+                                    write(2, rb2, (size_t)(rq - rb2));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             monce = 0;
         }
     }
@@ -1601,6 +1712,7 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     g_sigtrace = getenv("OCERZ_SIGTRACE") != NULL;
     g_winefaultlog = getenv("OCERZ_WINEFAULTLOG") != NULL;
     const char *w = getenv("OCERZ_WATCH");
+    { const char *wl = getenv("OCERZ_WATCHLEN"); if (wl) ocerz_watch_len = strtoull(wl, NULL, 0); }
     if (w)
         ocerz_watch_addr = strtoull(w, NULL, 0);
     const char *wv = getenv("OCERZ_STVAL");
@@ -1885,9 +1997,35 @@ static void *ocerz_unstick_thread(void *arg)
     (void)arg;
     static int lg = -1;
     if (lg < 0) lg = getenv("OCERZ_UNSTICKLOG") ? 1 : 0;
+    static int wauto = -1;
+    static uint64_t wbase;
+    if (wauto < 0) {
+        const char *w = getenv("OCERZ_WATCH");
+        const char *b = getenv("OCERZ_MACDRVDUMP");
+        wauto = (w && strcmp(w, "auto") == 0 && b) ? 1 : 0;
+        wbase = b ? strtoull(b, NULL, 0) : 0;
+    }
     for (;;) {
         struct timespec ts = { 0, 250 * 1000 * 1000 };
         nanosleep(&ts, NULL);
+        if (wauto == 1) {
+            /* auto-resolve the winemac requestSource signal word:
+             * base+0x560f0 -> controller; controller+8 -> source; +0x58. */
+            uint64_t slot = wbase + 0x560f0;
+            if (ocerz_addr_readable(slot)) {
+                uint64_t ctrl = ocerz_ld(slot, 8);
+                if (ctrl && ocerz_addr_readable(ctrl + 0x10)) {
+                    uint64_t src = ocerz_ld(ctrl + 0x10, 8);   /* requests array */
+                    if (src && ocerz_addr_readable(src + 0x30)) {
+                        ocerz_watch_addr = src + 0x10;         /* storage/cap-head/count-mut */
+                        ocerz_watch_len = 0x20;
+                        fprintf(stderr, "ocerz: WATCH-AUTO[%d] resolved %#llx\n",
+                                (int)getpid(), (unsigned long long)ocerz_watch_addr);
+                        wauto = 2;
+                    }
+                }
+            }
+        }
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         pthread_mutex_lock(&g_cpus_lock);
         for (int i = 0; i < g_cpus_n; i++) {
