@@ -120,6 +120,7 @@ int a64_try_patch_b(uint32_t *at, uint32_t *target);
 void a64_patch_bcond(uint32_t *at, uint32_t *target);
 void a64_patch_cbz(uint32_t *at, uint32_t *target);
 void a64_patch_tbz(uint32_t *at, uint32_t *target);
+int a64_try_patch_tbz(uint32_t *at, uint32_t *target);
 void a64_ret(A64Buf *b);
 void a64_br(A64Buf *b, int rn);
 void a64_blr(A64Buf *b, int rn);

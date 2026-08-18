@@ -500,6 +500,20 @@ void a64_patch_tbz(uint32_t *at, uint32_t *target)
     *at = (*at & 0xfff8001fu) | (((uint32_t)off & 0x3fff) << 5);
 }
 
+/* TBZ/TBNZ carry a signed imm14 (+-8191 words, +-32 KB): far smaller than the
+ * imm19 of cbz/b.cond or the imm26 of b.  A superblock whose out-of-line side-
+ * exit stubs land beyond that range would have its branch silently truncated
+ * into a wild jump inside the code arena, so the patch has to be checked.
+ * Returns 0 (and leaves the site alone) when the target is out of reach. */
+int a64_try_patch_tbz(uint32_t *at, uint32_t *target)
+{
+    ptrdiff_t off = target - at;
+    if (off < -(ptrdiff_t)(1 << 13) || off > (ptrdiff_t)((1 << 13) - 1))
+        return 0;
+    *at = (*at & 0xfff8001fu) | (((uint32_t)(int32_t)off & 0x3fff) << 5);
+    return 1;
+}
+
 void a64_ret(A64Buf *b)
 {
     a64_emit32(b, 0xd65f03c0u);

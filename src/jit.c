@@ -10143,6 +10143,24 @@ static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *ent
 
 static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 {
+    {   /* OCERZ_INTERP_RIP=a[,b,...]: never compile a block starting at these
+         * guest addresses - they fall back to the interpreter, where
+         * OCERZ_RIPTRAP can observe them even in an otherwise JIT run. */
+        static uint64_t irips[8];
+        static int n_irips = -1;
+        if (n_irips < 0) {
+            const char *e = getenv("OCERZ_INTERP_RIP");
+            n_irips = 0;
+            while (e && *e && n_irips < 8) {
+                irips[n_irips++] = strtoull(e, NULL, 0);
+                e = strchr(e, ',');
+                if (e) e++;
+            }
+        }
+        for (int i = 0; i < n_irips; i++)
+            if (irips[i] == rip)
+                return NULL;
+    }
 
     static int g_jitmeasure = -1;
     if (g_jitmeasure < 0)
@@ -11000,10 +11018,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         a64_ret(&b);
     }
     /* superblock side exits: out-of-line chain stubs for the taken targets */
+    int side_patch_oor = 0;
     for (int k = 0; k < g_n_side; k++) {
         uint32_t *stub = a64_label(&b);
         uint32_t w = *g_side[k].site;
-        if ((w & 0x7e000000u) == 0x36000000u) a64_patch_tbz(g_side[k].site, stub);        /* tbz/tbnz */
+        if ((w & 0x7e000000u) == 0x36000000u) {
+            /* imm14: a big superblock can put the stub out of reach.  Never
+             * truncate the offset (that lands a wild branch in the arena);
+             * flag the block instead and let it run interpreted. */
+            if (!a64_try_patch_tbz(g_side[k].site, stub))
+                side_patch_oor = 1;
+        }
         else if ((w & 0x7e000000u) == 0x34000000u) a64_patch_cbz(g_side[k].site, stub);   /* cbz/cbnz */
         else a64_patch_bcond(g_side[k].site, stub);
         int edge_class = body_edge_pin_class();
@@ -11167,6 +11192,29 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     }
 
     pthread_jit_write_protect_np(1);
+
+    if (side_patch_oor) {
+        /* A superblock side exit could not reach its stub with TBZ's imm14.
+         * Truncating the offset would branch wild inside the arena, so drop
+         * the compiled code and let this (rare, very large) block run
+         * interpreted.  Nothing on the hot path changes. */
+        static int warned_oor;
+        if (!warned_oor) {
+            warned_oor = 1;
+            fprintf(stderr, "ocerz: note: superblock side exit out of TBZ range at rip=%#llx"
+                            " (%u words); block runs interpreted\n",
+                    (unsigned long long)rip, (unsigned)(b.p - entry));
+        }
+        blk->n_slow = n;
+        blk->n_inlined = 0;
+        blk->n_pinned = 0;
+        blk->pin_class = 0;
+        blk->code = NULL;
+        blk->body_code = NULL;
+        g_pin = NULL; g_pin_hold = NULL; g_n_pinned = 0; g_pin_class = 0;
+        cache_insert(jit, blk);
+        return blk;
+    }
 
     if (b.overflow) {
 
