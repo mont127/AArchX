@@ -1022,9 +1022,55 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
             if (traps[ti] && cpu->rip == traps[ti]) { traphit = 1; break; }
         if (traphit) {
             fprintf(stderr,
-                    "ocerz: RIPTRAP rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx rax=%#llx rbx=%#llx rsp=%#llx ret0=%#llx ic=%#llx\n",
+                    "ocerz: RIPTRAP rip=%#llx tid=%#llx acnt=%#llx fwd2=%#llx blk=%#llx c20=%#llx c28=%#llx inv=%#llx dst=%#llx dstv=%#llx rdi=%#llx r13=%#llx byref=%#llx user=%#llx rsi=%#llx rdx=%#llx rax=%#llx rbx=%#llx rsp=%#llx ret0=%#llx ic=%#llx\n",
                     (unsigned long long)cpu->rip,
+                    (unsigned long long)(ocerz_addr_readable(cpu->gs_base + 0x18)
+                                         ? ocerz_ld(cpu->gs_base + 0x18, 8) : 0),
+                    (unsigned long long)({
+                        uint64_t _c = 0;
+                        const char *_mb = getenv("OCERZ_MACDRVDUMP");
+                        if (_mb) {
+                            uint64_t _base = strtoull(_mb, NULL, 0);
+                            uint64_t _slot = _base + 0x560f0;
+                            if (ocerz_addr_readable(_slot)) {
+                                uint64_t _ctrl = ocerz_ld(_slot, 8);
+                                if (_ctrl && ocerz_addr_readable(_ctrl + 0x10)) {
+                                    uint64_t _arr = ocerz_ld(_ctrl + 0x10, 8);
+                                    if (_arr && ocerz_addr_readable(_arr + 0x20))
+                                        _c = ocerz_ld(_arr + 0x20, 8) >> 32;
+                                }
+                            }
+                        }
+                        _c;
+                    }),
+                    (unsigned long long)({
+                        uint64_t _f = ocerz_addr_readable(cpu->gpr[OCERZ_RBP] - 0x58)
+                                      ? ocerz_ld(cpu->gpr[OCERZ_RBP] - 0x58, 8) : 0;
+                        _f;
+                    }),
+                    (unsigned long long)({
+                        uint64_t _f = ocerz_addr_readable(cpu->gpr[OCERZ_RBP] - 0x58)
+                                      ? ocerz_ld(cpu->gpr[OCERZ_RBP] - 0x58, 8) : 0;
+                        (_f && ocerz_addr_readable(_f + 0x28)) ? ocerz_ld(_f + 0x28, 8) : 0;
+                    }),
+                    (unsigned long long)(ocerz_addr_readable(cpu->gpr[OCERZ_RDI] + 0x20)
+                                         ? ocerz_ld(cpu->gpr[OCERZ_RDI] + 0x20, 8) : 0),
+                    (unsigned long long)(ocerz_addr_readable(cpu->gpr[OCERZ_RDI] + 0x28)
+                                         ? ocerz_ld(cpu->gpr[OCERZ_RDI] + 0x28, 8) : 0),
+                    (unsigned long long)({
+                        uint64_t _b = ocerz_addr_readable(cpu->gpr[OCERZ_RDI] + 0x28)
+                                      ? ocerz_ld(cpu->gpr[OCERZ_RDI] + 0x28, 8) : 0;
+                        (_b && ocerz_addr_readable(_b + 0x10)) ? ocerz_ld(_b + 0x10, 8) : 0;
+                    }),
+                    (unsigned long long)cpu->gpr[OCERZ_RAX],
+                    (unsigned long long)(ocerz_addr_readable(cpu->gpr[OCERZ_RAX] + 0x18)
+                                         ? ocerz_ld(cpu->gpr[OCERZ_RAX] + 0x18, 1) : 0xff),
                     (unsigned long long)cpu->gpr[OCERZ_RDI],
+                    (unsigned long long)cpu->gpr[OCERZ_R13],
+                    (unsigned long long)(ocerz_addr_readable(cpu->gpr[OCERZ_RDI] + 0x38)
+                                         ? ocerz_ld(cpu->gpr[OCERZ_RDI] + 0x38, 8) : 0),
+                    (unsigned long long)(ocerz_addr_readable(cpu->gpr[OCERZ_RDI] + 0x30)
+                                         ? ocerz_ld(cpu->gpr[OCERZ_RDI] + 0x30, 8) : 0),
                     (unsigned long long)cpu->gpr[OCERZ_RSI],
                     (unsigned long long)cpu->gpr[OCERZ_RDX],
                     (unsigned long long)cpu->gpr[OCERZ_RAX],

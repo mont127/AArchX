@@ -147,7 +147,36 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
                 d = OCERZ_FL_ALL;
                 u = 0;
             }
+        } else {
+            /* %cl count: MAY define (count 0 architecturally preserves the
+             * flags, any other count writes them).  It must be reported as a
+             * definition, otherwise the backward pass gives it need == 0, no
+             * record is written, and a later jcc silently consumes the
+             * PREVIOUS producer's record -- a wrong-direction branch.
+             * u = ALL keeps the predecessor's record alive for the count == 0
+             * case. */
+            d = OCERZ_FL_ALL;
+            u = OCERZ_FL_ALL;
         }
+        break;
+
+    /* rotates: ROL/ROR write CF (and OF for count 1), RCL/RCR read and write
+     * CF.  They were falling into the default arm with d = 0, so a following
+     * jcc branched on a stale record.  Same may-define encoding as the
+     * variable shifts (SHLD/SHRD already declare d = ALL below). */
+    case OCERZ_OP_ROL:
+    case OCERZ_OP_ROR:
+    case OCERZ_OP_RCL:
+    case OCERZ_OP_RCR:
+        d = OCERZ_FL_ALL;
+        u = OCERZ_FL_ALL;
+        break;
+
+    /* string compares write the arithmetic flags (and rep/repne reads ZF) */
+    case OCERZ_OP_SCAS:
+    case OCERZ_OP_CMPS:
+        d = OCERZ_FL_ALL;
+        u = OCERZ_FL_ALL;
         break;
 
     case OCERZ_OP_JCC:

@@ -639,6 +639,32 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                                 mq = hex_into(mq, ocerz_ld(obj + 0x10, 8));
                             }
                         }
+                        /* DEFINITIVE: NSMutableArray count (w4>>32), head (w3 low32),
+                         * and each live element (storage[head..head+count]) with its
+                         * block invoke pointer so enqueue-loss vs lost-wakeup is settled. */
+                        {
+                            uint64_t w3 = ocerz_ld(arr + 0x18, 8);
+                            uint64_t w4 = ocerz_ld(arr + 0x20, 8);
+                            uint64_t cnt = w4 >> 32;
+                            uint64_t head = w3 & 0xffffffffu;
+                            uint64_t cap  = w3 >> 32;
+                            mq = str_into(mq, " COUNT="); mq = hex_into(mq, cnt);
+                            mq = str_into(mq, " head="); mq = hex_into(mq, head);
+                            mq = str_into(mq, " cap="); mq = hex_into(mq, cap);
+                            if (st && cap && ocerz_addr_readable(st)) {
+                                mq = str_into(mq, " elems:");
+                                for (uint64_t e = 0; e < cnt && e < 6; e++) {
+                                    uint64_t idx = cap ? (head + e) % cap : e;
+                                    uint64_t el = ocerz_ld(st + 8 * idx, 8);
+                                    mq = str_into(mq, " ");
+                                    mq = hex_into(mq, el);
+                                    if (el && ocerz_addr_readable(el + 0x17)) {
+                                        mq = str_into(mq, "/inv=");
+                                        mq = hex_into(mq, ocerz_ld(el + 0x10, 8));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
