@@ -502,6 +502,13 @@ static struct ocerz_sysctl_ovr g_sysctl_ovr[] = {
     { "hw.cpusubtype",          0, NULL,     4,           {0}, 0, 0 },
     { "hw.cpufamily",           0, NULL,     0x573B5EECu, {0}, 0, 0 },
     { "sysctl.proc_translated", 0, NULL,     1,           {0}, 0, 0 },
+    /* x86_64 processes must see 4K pages (Rosetta reports 4096 for all of
+     * getpagesize/sysconf/hw.pagesize while the arm64 kernel's real page
+     * size is 16K; without this the guest mixes 16K from sysctl with 4K
+     * from the commpage vm_page_size and libSystem page math diverges). */
+    { "hw.pagesize",            0, NULL,     4096,        {0}, 0, 0 },
+    { "hw.pagesize32",          0, NULL,     4096,        {0}, 0, 0 },
+    { "vm.pagesize",            0, NULL,     4096,        {0}, 0, 0 },
 };
 
 static void ocerz_sysctl_ovr_resolve(void)
@@ -563,6 +570,14 @@ static int sys_sysctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 continue;
             if (memcmp(mib, o->mib, (size_t)nlen * sizeof(int)) == 0)
                 return ocerz_sysctl_ovr_emit(cpu, o, a[2], a[3]);
+        }
+        /* legacy numeric mibs bypass sysctlnametomib: getpagesize() and
+         * sysconf(_SC_PAGESIZE) use {CTL_HW, HW_PAGESIZE} directly, which
+         * must report 4K to an x86_64 process (Rosetta does). */
+        if (nlen == 2 && mib[0] == 6 /* CTL_HW */ && mib[1] == 7 /* HW_PAGESIZE */) {
+            static const struct ocerz_sysctl_ovr pgo =
+                { "hw.pagesize(legacy)", 0, NULL, 4096, {0}, 2, 1 };
+            return ocerz_sysctl_ovr_emit(cpu, &pgo, a[2], a[3]);
         }
     }
     uint64_t fa[8];
@@ -3138,6 +3153,30 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     if (btrack)
         fprintf(stderr, "ocerz: BLK-OUT[%d] seq=%llu num=%d r=%lld err=%d\n",
                 (int)getpid(), (unsigned long long)bseq, num, (long long)r, err);
+    {
+        /* OCERZ_PIPELOG: byte-level FIFO traffic + kevent wakeups, to trace
+         * macdrv's OnMainThread completion signal (1-byte pipe writes). */
+        static int plog = -1;
+        if (plog < 0) plog = getenv("OCERZ_PIPELOG") ? 1 : 0;
+        if (plog) {
+            int isw = (num == 4 || num == 397) && orig[2] <= 8;
+            int isr = (num == 3 || num == 396) && orig[2] <= 512;
+            if (isw || isr) {
+                struct stat pst;
+                if (fstat((int)orig[0], &pst) == 0 && S_ISFIFO(pst.st_mode))
+                    fprintf(stderr,
+                            "ocerz: PIPE%s[%d] cpu#%u fd=%lld len=%lld -> r=%lld err=%d ic=%#llx\n",
+                            isw ? "W" : "R", (int)getpid(), cpu->cpu_number,
+                            (long long)orig[0], (long long)orig[2], (long long)r, err,
+                            (unsigned long long)vm->insn_count);
+            } else if (num == 363 && (int64_t)r != 0) {
+                fprintf(stderr,
+                        "ocerz: PIPEKEV[%d] cpu#%u kq=%lld -> r=%lld err=%d ic=%#llx\n",
+                        (int)getpid(), cpu->cpu_number, (long long)orig[0],
+                        (long long)r, err, (unsigned long long)vm->insn_count);
+            }
+        }
+    }
     if ((num == 362 || num == 363 || num == 369) && getenv("OCERZ_KEVLOG")) {
         static int kev_dumped = 0;
         if (!kev_dumped) { kev_dumped = 1; ocerz_dyld_dump_images(); }

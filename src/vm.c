@@ -591,13 +591,29 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                 mq = str_into(mq, " src="); mq = hex_into(mq, src);
                 mq = str_into(mq, " arr="); mq = hex_into(mq, arr);
                 mq = str_into(mq, " q=");   mq = hex_into(mq, mnq);
-                if (src && ocerz_addr_readable(src) && ocerz_addr_readable(src + 0x1f)) {
-                    mq = str_into(mq, " srcw:");
-                    for (int k = 0; k < 4; k++) { mq = str_into(mq, " "); mq = hex_into(mq, ocerz_ld(src + 8ull * k, 8)); }
+                if (src && ocerz_addr_readable(src) && ocerz_addr_readable(src + 0x5f)) {
+                    mq = str_into(mq, " src.info=");
+                    mq = hex_into(mq, ocerz_ld(src + 8, 8));
+                    mq = str_into(mq, " src.sig58=");
+                    mq = hex_into(mq, ocerz_ld(src + 0x58, 8));
                 }
                 if (arr && ocerz_addr_readable(arr) && ocerz_addr_readable(arr + 0x1f)) {
                     mq = str_into(mq, " arrw:");
                     for (int k = 0; k < 4; k++) { mq = str_into(mq, " "); mq = hex_into(mq, ocerz_ld(arr + 8ull * k, 8)); }
+                    uint64_t st = ocerz_ld(arr + 0x10, 8);
+                    if (st && ocerz_addr_readable(st) && ocerz_addr_readable(st + 0x2f)) {
+                        mq = str_into(mq, " deque:");
+                        for (int k = 0; k < 6; k++) { mq = str_into(mq, " "); mq = hex_into(mq, ocerz_ld(st + 8ull * k, 8)); }
+                        for (int k = 0; k < 4; k++) {
+                            uint64_t obj = ocerz_ld(st + 8ull * k, 8);
+                            if (obj && ocerz_addr_readable(obj) && ocerz_addr_readable(obj + 0x17)) {
+                                mq = str_into(mq, " inv");
+                                mq = hex_into(mq, (uint64_t)k);
+                                mq = str_into(mq, "=");
+                                mq = hex_into(mq, ocerz_ld(obj + 0x10, 8));
+                            }
+                        }
+                    }
                 }
             }
             mq = str_into(mq, "\n");
@@ -618,6 +634,36 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
             uint64_t nfp = ocerz_ld(fp, 8);
             if (!ra)
                 break;
+            {   /* OnMainThread frame (returns into the thunk at winemac
+                 * +0x1e763): dump the __block "finished" byref cell. */
+                static uint64_t wbase; static int winit;
+                if (!winit) {
+                    const char *e = getenv("OCERZ_MACDRVDUMP");
+                    wbase = e ? strtoull(e, NULL, 0) : 0;
+                    winit = 1;
+                }
+                if (wbase && ra == wbase + 0x1e763 &&
+                    ocerz_addr_readable(fp - 0x40) &&
+                    ocerz_addr_readable(fp - 0x39)) {
+                    uint64_t fwd = ocerz_ld(fp - 0x40, 8);
+                    char fb[200]; char *fq = fb;
+                    fq = str_into(fq, "\nocerz:   FINISHED cell=");
+                    fq = hex_into(fq, fp - 0x48);
+                    fq = str_into(fq, " fwd=");
+                    fq = hex_into(fq, fwd);
+                    if (fwd && ocerz_addr_readable(fwd) &&
+                        ocerz_addr_readable(fwd + 0x1f)) {
+                        fq = str_into(fq, " flags=");
+                        fq = hex_into(fq, ocerz_ld(fwd + 0x10, 8));
+                        fq = str_into(fq, " val=");
+                        fq = hex_into(fq, ocerz_ld(fwd + 0x18, 1));
+                    }
+                    fq = str_into(fq, " stackval=");
+                    fq = hex_into(fq, ocerz_ld(fp - 0x48 + 0x18, 1));
+                    fq = str_into(fq, "\n");
+                    write(2, fb, (size_t)(fq - fb));
+                }
+            }
             p = str_into(p, " ");
             p = hex_into(p, ra);
             if (nfp <= fp)
