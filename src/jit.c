@@ -123,6 +123,7 @@ typedef struct JitCodeIndex {
 enum { EDGE_XBLOCK = 0, EDGE_SELFLOOP = 1, EDGE_BODY = 2 };
 
 struct OcerzJit {
+    int owner_pid;                 /* pid that created the arena (fork diagnostics) */
     struct OcerzVM *vm;
     uint32_t *code_base;
     uint32_t *code_cur;
@@ -654,6 +655,7 @@ static JitIcSlot *ic_slot_alloc(void)
 }
 
 void ocerz_jit_ic_fill(struct OcerzVM *vm, OcerzCPU *cpu, JitIcSlot *slot);
+static void chaincheck(const char *what, const void *dst);
 static _Atomic unsigned long long g_ic_miss_calls, g_ic_fills, g_ic_nocode;
 void ocerz_jit_ic_fill(struct OcerzVM *vm, OcerzCPU *cpu, JitIcSlot *slot)
 {
@@ -664,6 +666,7 @@ void ocerz_jit_ic_fill(struct OcerzVM *vm, OcerzCPU *cpu, JitIcSlot *slot)
     JitBlock *t = cache_lookup(jit, cpu->rip);
     if (!t || !t->code) g_ic_nocode++; else g_ic_fills++;
     if (t && t->code) {
+        chaincheck("ic_fill", (void *)t->code);
         __atomic_store_n(&slot->code, (void *)t->code, __ATOMIC_RELAXED);
         __atomic_store_n(&slot->rip, cpu->rip, __ATOMIC_RELEASE);
     }
@@ -872,8 +875,13 @@ static int host_ras_enabled(void)
 static void emit_frame_sp_reset(A64Buf *b)     /* before popping the block frame */
 {
     if (g_pin_class == 3 && host_ras_enabled()) {
-        a64_ldr(b, 8, 9, 20, JIT_FP_OFF);       /* JT0 */
-        a64_add_imm(b, 1, 31, 9, 0);            /* mov sp, JT0 */
+        /* scratch is JTA (x15), NEVER JT0: several epilogues hold their branch
+         * target in JT0 across this call (emit_indirect_leave_br, the RET
+         * full-leave) -- using x9 here replaced the target with cpu->jit_fp
+         * and the process died on a silent SIGILL (frame-base bytes = the
+         * {0,0} sentinel = udf).  That was THE wine explorer killer. */
+        a64_ldr(b, 8, 15, 20, JIT_FP_OFF);      /* JTA */
+        a64_add_imm(b, 1, 31, 15, 0);           /* mov sp, JTA */
     }
 }
 
@@ -9448,6 +9456,7 @@ static void chain_batch_end(void)
 static void chain_cond_short(uint32_t *cond_site, void *dst)
 {
     if (!cond_site || !dst) return;
+    chaincheck("chain_cond_short", dst);
     if (g_xlat_jit && g_xlat_jit->stop_requested) return;   /* stop sites must stay reachable */
     uint32_t w = *cond_site;
     ptrdiff_t off = (uint32_t *)dst - cond_site;
@@ -9470,10 +9479,22 @@ static void chain_cond_short(uint32_t *cond_site, void *dst)
         sys_icache_invalidate(cond_site, 4);
     }
 }
+/* OCERZ_CHAINCHECK: validate every published jump target against the code
+ * arena; a guest address or heap pointer here becomes a wild host jump. */
+static void chaincheck(const char *what, const void *dst)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("OCERZ_CHAINCHECK") ? 1 : 0;
+    if (!en || !dst || !g_xlat_jit) return;
+    if ((const uint32_t *)dst < g_xlat_jit->code_base || (const uint32_t *)dst >= g_xlat_jit->code_cur)
+        fprintf(stderr, "ocerz: CHAINCHECK[%d] %s target %p OUTSIDE arena [%p,%p)\n",
+                (int)getpid(), what, dst, (void *)g_xlat_jit->code_base, (void *)g_xlat_jit->code_cur);
+}
 static void chain_activate(uint32_t *patch_b, void *dst)
 {
     if (!patch_b || !dst)
         return;
+    chaincheck("chain_activate", dst);
     if (g_xlat_jit && g_xlat_jit->stop_requested)
         return;                          /* stop sites must keep their stop branch */
     int ok;
@@ -9583,9 +9604,10 @@ static void pending_drain(uint64_t rip, JitBlock *target)
     while (*pp) {
         PendingChain *e = *pp;
         if (e->target_rip == rip) {
-            if (e->ras_slot)
-
+            if (e->ras_slot) {
+                chaincheck("ras_slot", ras_entry_for(target));
                 __atomic_store_n(e->ras_slot, ras_entry_for(target), __ATOMIC_RELEASE);
+            }
             else if (e->kind == EDGE_BODY) {
                 int compatible = e->pin_class
                     ? target->pin_class == e->pin_class
@@ -9987,6 +10009,14 @@ static void patch_any_branch(uint32_t *site, uint32_t *target)
 static void emit_oolslow_arms(A64Buf *b, uint32_t **exit_sites, int *n_exits)
 {
     for (int k = 0; k < g_n_oolslow; k++) {
+        /* every recorded pointer must lie in the block being emitted */
+        int sane = g_oolslow[k].back >= g_push_entry && g_oolslow[k].back < b->p;
+        for (int i = 0; sane && i < g_oolslow[k].nsites; i++)
+            sane = g_oolslow[k].sites[i] >= g_push_entry && g_oolslow[k].sites[i] < b->p;
+        if (!sane) {
+            fprintf(stderr, "ocerz: warning: dropping stale oolslow arm (site/back outside the current block)\n");
+            continue;
+        }
         uint32_t *lbl = a64_label(b);
         for (int i = 0; i < g_oolslow[k].nsites; i++) patch_any_branch(g_oolslow[k].sites[i], lbl);
         if (g_oolslow[k].pre) a64_emit32(b, g_oolslow[k].pre);
@@ -10205,6 +10235,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
     g_n_oslow = 0;
     g_n_nanool = 0;
     g_n_call_edges = 0;
+    /* Out-of-line slow-arm and stop-site state MUST start clean: a
+     * translation that returns without emitting its arms (overflow, index
+     * failure, any early exit) would otherwise leak entries whose site/back
+     * pointers live in the PREVIOUS block -- the next translation then emits
+     * branches to another block's coordinates and patches another block's
+     * words.  That was the explorer-killing wild-branch bug. */
+    g_n_oolslow = 0;
+    g_oolslow_pre = 0;
+    g_n_stop_extra = 0;
     g_xlat_jit = jit;
     g_self_rip = rip;
     g_body_entry = NULL;
@@ -10940,7 +10979,18 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         a64_ldp_post(&b, 29, 30, 31, 16);
         uint32_t *nonzero = a64_label(&b); a64_cbnz(&b, 1, JTT, 0);
         uint32_t *here = a64_label(&b);
-        a64_b(&b, (int32_t)(jit->dispatch_stub - here));
+        ptrdiff_t soff = jit->dispatch_stub - here;
+        if (soff >= -(ptrdiff_t)(1 << 25) && soff <= (ptrdiff_t)((1 << 25) - 1)) {
+            a64_b(&b, (int32_t)soff);
+        } else {
+            /* the stub sits at the arena start; once >128MB of code has been
+             * appended a direct b silently WRAPS its imm26 and jumps ~+128MB
+             * into virgin arena (SIGILL on zeroes).  That killed wine's
+             * explorer after heavy invalidation churn.  Go through a
+             * register instead (x16 is free here: pins are spilled). */
+            a64_mov_imm64(&b, 16, (uint64_t)(uintptr_t)jit->dispatch_stub);
+            a64_br(&b, 16);
+        }
         a64_patch_cbz(nonzero, a64_label(&b));
         a64_mov_reg(&b, 1, 0, JTT);
         a64_ret(&b);
@@ -11203,8 +11253,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         if (g_jitdis < 0) {
             const char *p = getenv("OCERZ_JITDIS");
             g_jitdis = p ? 1 : 0;
-            if (p)
-                g_jf = fopen(p, "w");
+            if (p) {
+                char pb[1024];
+                snprintf(pb, sizeof pb, "%s.%d", p, (int)getpid());
+                g_jf = fopen(pb, "w");
+            }
         }
         if (g_jitdis > 0 && g_jf && blk->insn_off) {
             char tb[128];
@@ -11249,6 +11302,38 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         return blk;
     }
 
+    {
+        static int ec = -1;
+        if (ec < 0) ec = getenv("OCERZ_EMITCHECK") ? 1 : 0;
+        if (ec && blk->code) {
+            const uint32_t *cw = (const uint32_t *)blk->code;
+            for (uint32_t w = 0; w < blk->code_words; w++) {
+                uint32_t v = cw[w];
+                if ((v & 0x7c000000u) != 0x14000000u) continue;   /* b/bl only */
+                int64_t off = (int64_t)((int32_t)(v << 6) >> 6) * 4;
+                const uint32_t *tgt = (const uint32_t *)((const uint8_t *)(cw + w) + off);
+                if (tgt < jit->code_base || tgt > jit->code_cur + 4096) {
+                    int ii = -1;
+                    if (blk->insn_off)
+                        for (int k = 0; k < blk->n_insns; k++)
+                            if (blk->insn_off[k] <= w) ii = k;
+                    fprintf(stderr, "ocerz: EMITCHECK[%d] rip=%#llx word=%u insn=%d v=%08x tgt=%p arena=[%p,%p)\n",
+                            (int)getpid(), (unsigned long long)blk->guest_rip, w, ii, v, (const void *)tgt,
+                            (void *)jit->code_base, (void *)jit->code_cur);
+                    fprintf(stderr, "ocerz: EMITCHECK[%d]   ctx:", (int)getpid());
+                    for (int q = (int)w - 6; q <= (int)w + 6 && q < (int)blk->code_words; q++)
+                        if (q >= 0) fprintf(stderr, "%s%08x", q == (int)w ? " |" : " ", cw[q]);
+                    fprintf(stderr, "\n" "ocerz: EMITCHECK[%d]   edges:", (int)getpid());
+                    for (int q = 0; q < blk->n_edges; q++)
+                        fprintf(stderr, " [%d]tgt=%#llx pb=+%#lx cs=+%#lx", q,
+                                (unsigned long long)blk->edges[q].target_rip,
+                                blk->edges[q].patch_b ? (long)(blk->edges[q].patch_b - (uint32_t *)blk->code) : -1L,
+                                blk->edges[q].cond_site ? (long)(blk->edges[q].cond_site - (uint32_t *)blk->code) : -1L);
+                    fprintf(stderr, " nool=%d nosl=%d nstop=%d\n", g_n_oolslow, g_n_oslow, blk->n_stop_extra);
+                }
+            }
+        }
+    }
     cache_insert(jit, blk);
 
     if (!g_no_chain) {
@@ -11663,6 +11748,19 @@ int ocerz_jit_fault_info(const struct OcerzVM *vm, const void *host_pc,
     return 1;
 }
 
+int ocerz_jit_code_range(struct OcerzVM *vm, const uint32_t **lo, const uint32_t **hi)
+{
+    OcerzJit *jit = vm ? vm->jit : NULL;
+    if (!jit) return 0;
+    *lo = jit->code_base;
+    *hi = jit->code_cur;
+    return 1;
+}
+int ocerz_jit_owner_pid(struct OcerzVM *vm)
+{
+    return vm && vm->jit ? vm->jit->owner_pid : -1;
+}
+
 OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
 {
     OcerzJit *jit = (OcerzJit *)calloc(1, sizeof *jit);
@@ -11679,6 +11777,7 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
         free(jit);
         return NULL;
     }
+    jit->owner_pid = (int)getpid();
     jit->code_base = (uint32_t *)p;
     jit->code_cur = (uint32_t *)p;
     jit->code_end = (uint32_t *)((uint8_t *)p + bytes);
@@ -11770,10 +11869,26 @@ uint64_t ocerz_jit_blocks(const OcerzJit *jit)
 
 __thread sigjmp_buf *ocerz_jit_decode_recover;
 
+static void stopcheck(const JitBlock *b, const uint32_t *site, uint32_t insn, const char *what)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("OCERZ_STOPCHECK") ? 1 : 0;
+    if (!en || !site) return;
+    int64_t off = (int64_t)((int32_t)(insn << 6) >> 6) * 4;
+    const uint32_t *tgt = (const uint32_t *)((const uint8_t *)site + off);
+    const uint32_t *lo = (const uint32_t *)b->code, *hi = lo ? lo + b->code_words : NULL;
+    if (!lo || tgt < lo || tgt >= hi)
+        fprintf(stderr, "ocerz: STOPCHECK[%d] %s rip=%#llx site=%p insn=%08x tgt=%p block=[%p,%p)\n",
+                (int)getpid(), what, (unsigned long long)b->guest_rip, (const void *)site, insn,
+                (const void *)tgt, (const void *)lo, (const void *)hi);
+}
 static int force_stop_sites_writable(OcerzJit *jit)
 {
     int patched = 0;
     for (JitBlock *b = jit->stop_blocks; b; b = b->stop_next) {
+        stopcheck(b, b->stop_patch, b->stop_insn, "stop");
+        for (int i = 0; i < b->n_stop_extra; i++)
+            stopcheck(b, b->stop_extra[i].site, b->stop_extra[i].insn, "extra");
         if (getenv("OCERZ_STOPLOG"))
             fprintf(stderr, "ocerz: STOPSITE rip=%#llx patch=%p cur=%08x stop_insn=%08x\n",
                     (unsigned long long)b->guest_rip, (void *)b->stop_patch,
@@ -12203,5 +12318,22 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
         return OCERZ_EUNSUP;
     if (!b->code)
         return jit_interp_block(vm, cpu, b);
+    {
+        static int cc = -1;
+        if (cc < 0) cc = getenv("OCERZ_CODECHECK") ? 1 : 0;
+        if (cc && ((uint32_t *)b->code < jit->code_base || (uint32_t *)b->code >= jit->code_cur)) {
+            fprintf(stderr, "ocerz: CODECHECK[%d] blk=%p rip=%#llx code=%p OUTSIDE arena [%p,%p) "
+                    "n_insns=%d pin_class=%d n_pinned=%d body=%p noreload=%p hoist_sig=%#llx guest_rip_field=%#llx code_words=%u\n",
+                    (int)getpid(), (void *)b, (unsigned long long)cpu->rip, (void *)b->code,
+                    (void *)jit->code_base, (void *)jit->code_cur, b->n_insns, b->pin_class,
+                    b->n_pinned, (void *)b->body_code, (void *)b->body_noreload,
+                    (unsigned long long)b->hoist_sig, (unsigned long long)b->guest_rip, b->code_words);
+            fprintf(stderr, "ocerz: CODECHECK[%d] blk words:", (int)getpid());
+            for (int i = 0; i < 24; i++)
+                fprintf(stderr, " %llx", (unsigned long long)((const uint64_t *)(const void *)b)[i]);
+            fprintf(stderr, "\n");
+            return OCERZ_STEP_FATAL;
+        }
+    }
     return b->code(vm, cpu);
 }
