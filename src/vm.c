@@ -562,6 +562,9 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
     p = str_into(p, " slot3=");
     p = hex_into(p, ocerz_addr_readable(g_cur_cpu->gs_base + 0x18)
                      ? ocerz_ld(g_cur_cpu->gs_base + 0x18, 8) : 0);
+    p = str_into(p, " ctid=");    /* cached thread_selfid at TSD[-1] */
+    p = hex_into(p, ocerz_addr_readable(g_cur_cpu->gs_base - 8)
+                     ? ocerz_ld(g_cur_cpu->gs_base - 8, 8) : 0);
     p = str_into(p, " rip=");
     p = hex_into(p, g_cur_cpu->rip);
     p = str_into(p, " gs=");

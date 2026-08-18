@@ -1006,17 +1006,21 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     {   /* OCERZ_RIPTRAP=addr1[,addr2]: log guest register state whenever
          * execution reaches these addresses (interp only, diagnostics) */
-        static uint64_t trap1 = (uint64_t)-1, trap2 = (uint64_t)-1;
-        if (trap1 == (uint64_t)-1) {
+        static uint64_t traps[8];
+        static int ntraps = -1;
+        if (ntraps < 0) {
             const char *e = getenv("OCERZ_RIPTRAP");
-            trap1 = trap2 = 0;
-            if (e) {
-                trap1 = strtoull(e, NULL, 0);
-                const char *c = strchr(e, 44);
-                if (c) trap2 = strtoull(c + 1, NULL, 0);
+            ntraps = 0;
+            while (e && *e && ntraps < 8) {
+                traps[ntraps++] = strtoull(e, NULL, 0);
+                e = strchr(e, 44);
+                if (e) e++;
             }
         }
-        if ((trap1 && cpu->rip == trap1) || (trap2 && cpu->rip == trap2)) {
+        int traphit = 0;
+        for (int ti = 0; ti < ntraps; ti++)
+            if (traps[ti] && cpu->rip == traps[ti]) { traphit = 1; break; }
+        if (traphit) {
             fprintf(stderr,
                     "ocerz: RIPTRAP rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx rax=%#llx rbx=%#llx rsp=%#llx ret0=%#llx ic=%#llx\n",
                     (unsigned long long)cpu->rip,

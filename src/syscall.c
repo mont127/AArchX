@@ -3071,6 +3071,24 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     uint64_t orig[8];
     memcpy(orig, a, sizeof orig);
 
+    {   /* OCERZ_STRACE_CPU=<n>: one-line log of every BSD syscall made by
+         * that guest cpu (JIT and interp alike) */
+        static int scpu = -2;
+        if (scpu == -2) {
+            const char *e2 = getenv("OCERZ_STRACE_CPU");
+            scpu = e2 ? atoi(e2) : -1;
+        }
+        if ((int)cpu->cpu_number == scpu)
+            fprintf(stderr, "ocerz: SC[%d] cpu#%u bsd %s(%d) a0=%#llx a1=%#llx a2=%#llx rip=%#llx gs=%#llx gs18=%#llx ic=%#llx\n",
+                    (int)getpid(), cpu->cpu_number, e->name ? e->name : "?", num,
+                    (unsigned long long)a[0], (unsigned long long)a[1],
+                    (unsigned long long)a[2], (unsigned long long)cpu->rip,
+                    (unsigned long long)cpu->gs_base,
+                    (unsigned long long)(ocerz_addr_readable(cpu->gs_base + 0x18)
+                                         ? ocerz_ld(cpu->gs_base + 0x18, 8) : 0),
+                    (unsigned long long)vm->insn_count);
+    }
+
     if (e->intercept) {
         int r = e->intercept(vm, cpu, a);
         if (r == OCERZ_STEP_FATAL) {
@@ -3778,6 +3796,24 @@ static void ocerz_vmmsg_trace(const char *phase, uint64_t msg, uint32_t size_lim
 
 static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 {
+    {   /* OCERZ_STRACE_CPU: mirror for mach traps */
+        static int scpu = -2;
+        if (scpu == -2) {
+            const char *e2 = getenv("OCERZ_STRACE_CPU");
+            scpu = e2 ? atoi(e2) : -1;
+        }
+        if ((int)cpu->cpu_number == scpu)
+            fprintf(stderr, "ocerz: SC[%d] cpu#%u mach %d rdi=%#llx rsi=%#llx rdx=%#llx rip=%#llx gs=%#llx gs18=%#llx ic=%#llx\n",
+                    (int)getpid(), cpu->cpu_number, num,
+                    (unsigned long long)cpu->gpr[OCERZ_RDI],
+                    (unsigned long long)cpu->gpr[OCERZ_RSI],
+                    (unsigned long long)cpu->gpr[OCERZ_RDX],
+                    (unsigned long long)cpu->rip,
+                    (unsigned long long)cpu->gs_base,
+                    (unsigned long long)(ocerz_addr_readable(cpu->gs_base + 0x18)
+                                         ? ocerz_ld(cpu->gs_base + 0x18, 8) : 0),
+                    (unsigned long long)vm->insn_count);
+    }
     uint64_t a[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     a[0] = cpu->gpr[OCERZ_RDI];
     a[1] = cpu->gpr[OCERZ_RSI];
