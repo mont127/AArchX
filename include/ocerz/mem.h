@@ -129,13 +129,15 @@ static inline uint64_t ocerz_ld(uint64_t gaddr, int size)
 }
 
 extern uint64_t ocerz_watch_addr;
+extern uint64_t ocerz_watch_len;
 extern uint64_t ocerz_watch_val;
 extern uint64_t ocerz_watch_shadow;
 void ocerz_watch_hit(uint64_t gaddr, int size, uint64_t lo, uint64_t hi);
 
 static inline void ocerz_st(uint64_t gaddr, int size, uint64_t v)
 {
-    if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
+    if (ocerz_watch_addr && gaddr < ocerz_watch_addr + ocerz_watch_len &&
+        gaddr + (uint64_t)size > ocerz_watch_addr)
         ocerz_watch_hit(gaddr, size, v, 0);
     if (ocerz_watch_val && v == ocerz_watch_val)
         ocerz_watch_hit(gaddr, size, v, 0);
