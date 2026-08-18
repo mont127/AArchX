@@ -65,6 +65,13 @@ typedef struct OcerzCPU {
     Ocerz128 fp_ckpt[16] __attribute__((aligned(16))); /* JIT FP-batch checkpoints (replay inputs) */
     uint64_t jit_scratch[2];        /* JIT temporaries that must survive a C callout (e.g. an old CF) */
     uint64_t jit_fp;
+    /* OCERZ_BTRACE: per-cpu ring of guest block entries, written by JIT'd code
+     * itself.  g_riphist only samples JIT *exit* points, so with block chaining
+     * it is blind to control flow that stays inside the code arena; this ring
+     * is the only way to see which guest block actually ran. */
+    uint64_t *btrace;
+    uint32_t btrace_n;              /* monotonic write counter */
+    uint32_t btrace_mask;           /* ring mask; 0 latches (stops recording) */
     volatile uint64_t block_since_ns;  /* nonzero while parked in a blocking host syscall (unstick monitor) */
     volatile uint32_t last_rcv_name;   /* port/set of the current mach receive (diagnostics) */                /* host sp at the active JIT function's frame base (class 3):
                                        every exit resets sp to it, dropping the host-stack RAS entries */

@@ -10510,6 +10510,23 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         g_body_entry = a64_label(&b);
         emit_reload_mem_base(&b);
         body_noreload = a64_label(&b);
+        {   /* OCERZ_BTRACE: record this guest block entry.  Gated at translate
+             * time, so an unset env var costs exactly nothing.  JT0/JT2/JTT/JTA
+             * are scratch at body entry (the RAS pop uses the same set). */
+            static int bt = -1;
+            if (bt < 0) bt = getenv("OCERZ_BTRACE") ? 1 : 0;
+            if (bt) {
+                a64_ldr(&b, 8, JTA, 20, (uint32_t)offsetof(OcerzCPU, btrace));
+                a64_ldr(&b, 4, JT2, 20, (uint32_t)offsetof(OcerzCPU, btrace_n));
+                a64_ldr(&b, 4, JTT, 20, (uint32_t)offsetof(OcerzCPU, btrace_mask));
+                a64_and_reg(&b, 0, JTT, JT2, JTT, 0);        /* idx = n & mask */
+                a64_add_reg(&b, 1, JTA, JTA, JTT, 3);        /* &ring[idx] */
+                a64_mov_imm64(&b, JT0, rip);
+                a64_str(&b, 8, JT0, JTA, 0);
+                a64_add_imm(&b, 0, JT2, JT2, 1);
+                a64_str(&b, 4, JT2, 20, (uint32_t)offsetof(OcerzCPU, btrace_n));
+            }
+        }
         if (getenv("OCERZ_JGB_CHECK") && jgb_usable()) {   /* debug trap: body entered with x0 != gbase */
             a64_mov_imm64(&b, JTU, ocerz_guest_base);
             a64_subs_reg(&b, 1, A64_ZR, 0, JTU, 0);

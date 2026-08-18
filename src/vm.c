@@ -34,10 +34,25 @@ static OcerzCPU *g_cpus[OCERZ_MAX_CPUS];
 static pthread_t g_cpu_threads[OCERZ_MAX_CPUS];
 static int g_cpus_n;
 static pthread_mutex_t g_cpus_lock = PTHREAD_MUTEX_INITIALIZER;
+/* OCERZ_BTRACE: SIGUSR1 (ripdump) asks the monitor thread to latch and print
+ * the block-entry rings.  The handler only sets a flag: printing 64K entries
+ * is not async-signal-safe, and the stuck thread is never idle (it spins in a
+ * kevent wait loop), so a quiet-based latch cannot see it. */
+static volatile int g_btrace_req;
+static int g_btrace_on = -1;
 static OcerzCPU *g_fork_surviving_cpu;
 
 static void ocerz_cpu_register(OcerzCPU *cpu)
 {
+    if (g_btrace_on < 0) g_btrace_on = getenv("OCERZ_BTRACE") ? 1 : 0;
+    if (!cpu->btrace && g_btrace_on > 0) {
+        unsigned n = 1u << 16;                       /* 64K entries = 512 KB */
+        cpu->btrace = (uint64_t *)calloc(n, sizeof(uint64_t));
+        if (cpu->btrace) {
+            cpu->btrace_n = 0;
+            __atomic_store_n(&cpu->btrace_mask, n - 1, __ATOMIC_RELEASE);
+        }
+    }
     pthread_mutex_lock(&g_cpus_lock);
     for (int i = 0; i < g_cpus_n; i++)
         if (g_cpus[i] == cpu) {
@@ -470,6 +485,8 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
 static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)sig; (void)si; (void)ctx;
+    if (g_btrace_on > 0)
+        __atomic_store_n(&g_btrace_req, 1, __ATOMIC_RELEASE);
     {   /* fan out to every cpu thread once per second at most */
         static _Atomic uint64_t last_fan;
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -2066,6 +2083,37 @@ static void *ocerz_unstick_thread(void *arg)
                             (int)getpid(), g_cpus[i]->cpu_number,
                             (unsigned long long)((now - t0) / 1000000));
                 pthread_kill(g_cpu_threads[i], SIGEMT);
+            }
+        }
+        {   /* OCERZ_BTRACE freeze latch: a cpu that has entered NO guest block
+             * for 20 polls (5 s) while others keep running is the stuck thread.
+             * Storing mask 0 stops every ring so the last 64K block entries
+             * survive, then dump them.  This is the only instrument that can
+             * see control flow which never leaves the code arena. */
+            static unsigned bt_quiet[OCERZ_MAX_CPUS];
+            static int bt_latched;
+            if (!bt_latched && g_cpus_n > 0 && g_cpus[0]->btrace) {
+                if (__atomic_load_n(&g_btrace_req, __ATOMIC_ACQUIRE)) {
+                    bt_latched = 1;
+                    for (int i = 0; i < g_cpus_n; i++)
+                        __atomic_store_n(&g_cpus[i]->btrace_mask, 0u, __ATOMIC_RELEASE);
+                    const char *e = getenv("OCERZ_BTRACE_DEPTH");
+                    uint32_t depth = e ? (uint32_t)strtoul(e, NULL, 0) : 400;
+                    for (int i = 0; i < g_cpus_n; i++) {
+                        OcerzCPU *c = g_cpus[i];
+                        if (!c->btrace) continue;
+                        uint32_t bn = c->btrace_n, m = (1u << 16) - 1;
+                        fprintf(stderr, "ocerz: BTRACE[%d] cpu#%u tid=%#llx quiet=%u n=%u\n",
+                                (int)getpid(), c->cpu_number,
+                                (unsigned long long)(ocerz_addr_readable(c->gs_base + 0x18)
+                                                     ? ocerz_ld(c->gs_base + 0x18, 8) : 0),
+                                bt_quiet[i], bn);
+                        for (uint32_t k = 1; k <= depth && k <= bn; k++)
+                            fprintf(stderr, "  %u %#llx\n", k,
+                                    (unsigned long long)c->btrace[(bn - k) & m]);
+                    }
+                    fflush(stderr);
+                }
             }
         }
         pthread_mutex_unlock(&g_cpus_lock);
