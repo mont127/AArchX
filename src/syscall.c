@@ -469,6 +469,11 @@ static int sys_bsdthread_register(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     uint64_t feat = 0x4000005f;
     if (getenv("OCERZ_HOSTWQ"))
         feat |= 0x80ull;
+    /* Diagnostic: hide PTHREAD_FEATURE_KEVENT (0x40) and _WORKLOOP (0x80)
+     * so guest libdispatch falls back to the classic workq + manager-thread
+     * model instead of kqworkloop kernel-ownership handoffs. */
+    if (getenv("OCERZ_NO_KEVWQ"))
+        feat &= ~0xc0ull;
     ret_ok(cpu, feat);
     return OCERZ_STEP_OK;
 }
@@ -1128,9 +1133,19 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             return OCERZ_STEP_OK;
         }
         int running = __atomic_load_n(&g_wq_running, __ATOMIC_SEQ_CST);
-        int want = reqcount - running;
+        /* workq addthreads semantics are ADDITIVE: the caller asks for
+         * reqcount MORE threads on top of whatever is already running
+         * (libdispatch pokes with the number of newly pending work items).
+         * The old "reqcount - running" treated it as a target total, so a
+         * single busy worker starved every later request and any pattern
+         * needing two concurrent workers deadlocked (explorer's
+         * dispatch_sync freeze at sync_window_position #4).  Cap the pool
+         * so a runaway poke loop cannot explode the process. */
+        int want = reqcount;
         if (want > 8)
             want = 8;
+        if (running + want > 32)
+            want = 32 - running;
         for (int i = 0; i < want; i++) {
             uint64_t region = ocerz_map_anywhere(0x200000, PROT_READ | PROT_WRITE);
             if (region == 0)
@@ -4115,6 +4130,40 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t r47 = ocerz_host_mach_trap(num, a);
         cpu->block_since_ns = 0;
+        {
+            /* OCERZ_WAKELOG: trace CFRunLoopWakeUp-sized traffic (tiny
+             * msgh_id==0 messages) to catch lost run-loop wakeups. */
+            static int wklog = -1;
+            if (wklog < 0) wklog = getenv("OCERZ_WAKELOG") ? 1 : 0;
+            if (wklog) {
+                if ((a[1] & 0x1) && request_buf != 0) {
+                    uint32_t ssz = (uint32_t)(a[2] >> 32);
+                    uint32_t sid = (uint32_t)(a[4] >> 32);
+                    if (ssz <= 0x30 && sid == 0)
+                        fprintf(stderr,
+                                "ocerz: WAKESEND[%d] cpu#%u dest=%#x sz=%#x -> r=%#llx ic=%#llx\n",
+                                (int)getpid(), cpu->cpu_number, (uint32_t)a[3], ssz,
+                                (unsigned long long)r47,
+                                (unsigned long long)vm->insn_count);
+                }
+                if ((a[1] & 0x2) && r47 == 0 && reply_buf != 0) {
+                    uint64_t rb = reply_buf;
+                    if (vector_mode) {
+                        rb = ocerz_ld(reply_buf + 8, 8);
+                        if (rb == 0) rb = ocerz_ld(reply_buf, 8);
+                    }
+                    uint32_t rsz = rb ? (uint32_t)ocerz_ld(rb + 4, 4) : 0;
+                    uint32_t rid = rb ? (uint32_t)ocerz_ld(rb + 0x14, 4) : 1;
+                    if (rsz <= 0x30 && rid == 0)
+                        fprintf(stderr,
+                                "ocerz: WAKERECV[%d] cpu#%u on=%#x set=%#x sz=%#x ic=%#llx\n",
+                                (int)getpid(), cpu->cpu_number,
+                                rb ? (uint32_t)ocerz_ld(rb + 0xc, 4) : 0,
+                                (uint32_t)(a[5] >> 32), rsz,
+                                (unsigned long long)vm->insn_count);
+                }
+            }
+        }
         /* A kicked (unstick) receive returns MACH_RCV_INTERRUPTED; CFRunLoop
          * handles that by RETRYING the receive without re-checking its
          * sources, so a lost CFRunLoopWakeUp stays lost forever (the frozen
