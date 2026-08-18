@@ -4785,6 +4785,12 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
         for (int s = 1; pend && s < 32; s++)
             if (pend & (1u << s)) {
                 g_ocerz_deliver_src = 1;
+                if (OCERZ_ENV_ON("OCERZ_ASIGLOG"))
+                    fprintf(stderr,
+                            "ocerz: ASYNCSIG[%d] cpu#%u sig=%d rip=%#llx ic=%#llx\n",
+                            (int)getpid(), cpu->cpu_number, s,
+                            (unsigned long long)cpu->rip,
+                            (unsigned long long)vm->insn_count);
                 ocerz_signal_deliver(cpu, s, 0, 0, 0);
             }
     }

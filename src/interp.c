@@ -99,7 +99,8 @@ static uint64_t ocerz_atomic_xchg(uint64_t gaddr, int size, uint64_t v)
     case 4: { uint32_t x = (uint32_t)v; old = __atomic_exchange_n((uint32_t *)p, x, __ATOMIC_SEQ_CST); break; }
     default:{ uint64_t x = v;           old = __atomic_exchange_n((uint64_t *)p, x, __ATOMIC_SEQ_CST); break; }
     }
-    if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
+    if (ocerz_watch_addr && gaddr < ocerz_watch_addr + ocerz_watch_len &&
+        gaddr + (uint64_t)size > ocerz_watch_addr)
         ocerz_watch_hit(gaddr, size, v, 0);
     return old;
 }
@@ -114,7 +115,8 @@ static uint64_t ocerz_atomic_fetch_add(uint64_t gaddr, int size, uint64_t v)
     case 4: old = __atomic_fetch_add((uint32_t *)p, (uint32_t)v, __ATOMIC_SEQ_CST); break;
     default:old = __atomic_fetch_add((uint64_t *)p, v,           __ATOMIC_SEQ_CST); break;
     }
-    if (ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
+    if (ocerz_watch_addr && gaddr < ocerz_watch_addr + ocerz_watch_len &&
+        gaddr + (uint64_t)size > ocerz_watch_addr)
         ocerz_watch_hit(gaddr, size, ocerz_trunc(old + v, size), 0);
     return old;
 }
@@ -129,8 +131,9 @@ static int ocerz_atomic_cmpxchg(uint64_t gaddr, int size, uint64_t *expected, ui
     case 4: { uint32_t e = (uint32_t)*expected; ok = __atomic_compare_exchange_n((uint32_t *)p, &e, (uint32_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; break; }
     default:{ uint64_t e = *expected;           ok = __atomic_compare_exchange_n((uint64_t *)p, &e, desired,           0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; break; }
     }
-    if (ok && ocerz_watch_addr && ocerz_watch_addr - gaddr < (uint64_t)size)
-        ocerz_watch_hit(gaddr, size, desired, 0);
+    if (ocerz_watch_addr && gaddr < ocerz_watch_addr + ocerz_watch_len &&
+        gaddr + (uint64_t)size > ocerz_watch_addr)
+        ocerz_watch_hit(gaddr, size, desired, ok ? 0xCA5 : 0xFA11);
     return ok;
 }
 
@@ -1001,6 +1004,32 @@ static int op_flagctl(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 
 int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    {   /* OCERZ_RIPTRAP=addr1[,addr2]: log guest register state whenever
+         * execution reaches these addresses (interp only, diagnostics) */
+        static uint64_t trap1 = (uint64_t)-1, trap2 = (uint64_t)-1;
+        if (trap1 == (uint64_t)-1) {
+            const char *e = getenv("OCERZ_RIPTRAP");
+            trap1 = trap2 = 0;
+            if (e) {
+                trap1 = strtoull(e, NULL, 0);
+                const char *c = strchr(e, 44);
+                if (c) trap2 = strtoull(c + 1, NULL, 0);
+            }
+        }
+        if ((trap1 && cpu->rip == trap1) || (trap2 && cpu->rip == trap2)) {
+            fprintf(stderr,
+                    "ocerz: RIPTRAP rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx rax=%#llx rbx=%#llx rsp=%#llx ret0=%#llx ic=%#llx\n",
+                    (unsigned long long)cpu->rip,
+                    (unsigned long long)cpu->gpr[OCERZ_RDI],
+                    (unsigned long long)cpu->gpr[OCERZ_RSI],
+                    (unsigned long long)cpu->gpr[OCERZ_RDX],
+                    (unsigned long long)cpu->gpr[OCERZ_RAX],
+                    (unsigned long long)cpu->gpr[OCERZ_RBX],
+                    (unsigned long long)cpu->gpr[OCERZ_RSP],
+                    (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8),
+                    (unsigned long long)vm->insn_count);
+        }
+    }
 
     ocerz_flags_materialize(cpu);
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
