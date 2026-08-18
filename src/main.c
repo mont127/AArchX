@@ -68,6 +68,18 @@ int main(int argc, char **argv)
     vm.trace = trace;
     vm.strace = strace;
     vm.jit_enabled = !nojit && getenv("OCERZ_NOJIT") == NULL;
+    {   /* OCERZ_NOJIT_EXE=<substr>: interpret only processes whose command
+         * line matches (e.g. explorer.exe) - the env inherits through
+         * wine's exec chain, so one process can be singled out for the
+         * full-visibility interpreter while the rest stay on the JIT. */
+        const char *nx = getenv("OCERZ_NOJIT_EXE");
+        extern char ocerz_cmdline_summary[];
+        if (nx && *nx && strstr(ocerz_cmdline_summary, nx)) {
+            vm.jit_enabled = 0;
+            fprintf(stderr, "ocerz: NOJIT-EXE interpreting '%s'\n",
+                    ocerz_cmdline_summary);
+        }
+    }
 
     int dynamic = ocerz_peek_dynamic(load_path);
     if (dynamic < 0) {
