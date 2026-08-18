@@ -3922,9 +3922,16 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                           gmsg31 ? (uint32_t)ocerz_ld(gmsg31 + 4, 4) : 0);
         if (a[0] != 0)
             a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
+        cpu->last_rcv_name = (a[1] & 0x2) ? (uint32_t)a[4] : 0;
         cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t r31 = ocerz_host_mach_trap(num, a);
         cpu->block_since_ns = 0;
+        {
+            static int norlk31 = -1;
+            if (norlk31 < 0) norlk31 = getenv("OCERZ_NO_RCV_TIMEOUT_KICK") ? 1 : 0;
+            if (!norlk31 && r31 == 0x10004005ull && (a[1] & 0x2))
+                r31 = 0x10004003ull;
+        }
         mach_ret(cpu, r31);
         if (nsv31)
             ocerz_send_restore_descriptors(gmsg31, sv31, nsv31);
@@ -4104,9 +4111,23 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                         (uint32_t)(a[4] >> 32),
                         (uint32_t)ocerz_ld(request_buf + 8, 4), asc);
         }
+        cpu->last_rcv_name = (a[1] & 0x2) ? (uint32_t)a[5] : 0;
         cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t r47 = ocerz_host_mach_trap(num, a);
         cpu->block_since_ns = 0;
+        /* A kicked (unstick) receive returns MACH_RCV_INTERRUPTED; CFRunLoop
+         * handles that by RETRYING the receive without re-checking its
+         * sources, so a lost CFRunLoopWakeUp stays lost forever (the frozen
+         * OnMainThread family).  Convert to MACH_RCV_TIMED_OUT: a full
+         * run-loop pass re-evaluates signaled sources.  Only for receives
+         * (option bit 2) and only when the caller could see timeouts anyway
+         * or waited forever. */
+        {
+            static int norlk = -1;
+            if (norlk < 0) norlk = getenv("OCERZ_NO_RCV_TIMEOUT_KICK") ? 1 : 0;
+            if (!norlk && r47 == 0x10004005ull /* MACH_RCV_INTERRUPTED */ && (a[1] & 0x2))
+                r47 = 0x10004003ull;           /* MACH_RCV_TIMED_OUT */
+        }
         mach_ret(cpu, r47);
         if (nsv47)
             ocerz_send_restore_descriptors(reply_buf, sv47, nsv47);

@@ -169,6 +169,16 @@ void ocerz_vm_atfork_child(void)
     g_fork_surviving_cpu = NULL;
     g_pending_async_mask = 0;
     g_riphist_n = 0;
+    /* The MAP_JIT arena is inherited READ-ONLY-EXECUTABLE-WISE-BROKEN by a
+     * fork child on Apple silicon: the pages read fine but executing them
+     * raises SIGBUS (seen as the rare early-exit crash of wine's double-fork
+     * intermediate at icount ~0x6ce).  A fork child that does not exec only
+     * runs the fork-return + _exit()/execve() path, so drop it to the
+     * interpreter. */
+    if (g_vm && g_vm->jit_enabled) {
+        g_vm->jit_enabled = 0;
+        if (survivor) survivor->interp_once = 1;
+    }
     pthread_mutex_unlock(&g_cpus_lock);
 }
 
@@ -441,10 +451,64 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
 static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)sig; (void)si; (void)ctx;
+    {   /* fan out to every cpu thread once per second at most */
+        static _Atomic uint64_t last_fan;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint64_t prev = last_fan;
+        if (now - prev > 1000000000ull &&
+            __c11_atomic_compare_exchange_strong(&last_fan, &prev, now, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            pthread_t self = pthread_self();
+            for (int i = 0; i < g_cpus_n; i++)
+                if (!pthread_equal(g_cpu_threads[i], self))
+                    pthread_kill(g_cpu_threads[i], SIGUSR1);
+        }
+    }
     if (!g_cur_cpu)
         return;
     char b[640];
     char *p = b;
+    {   /* one thread also dumps every port set in the task */
+        static _Atomic int once;
+        int exp = 0;
+        if (__c11_atomic_compare_exchange_strong(&once, &exp, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            mach_port_name_array_t names = NULL; mach_port_type_array_t types = NULL;
+            mach_msg_type_number_t nn = 0, nt = 0;
+            if (mach_port_names(mach_task_self(), &names, &nn, &types, &nt) == KERN_SUCCESS) {
+                for (unsigned i = 0; i < nn; i++) {
+                    if (!(types[i] & MACH_PORT_TYPE_PORT_SET)) continue;
+                    char rb[512]; char *q = rb;
+                    q = str_into(q, "ocerz: PORTSET ");
+                    q = hex_into(q, names[i]);
+                    q = str_into(q, " ->");
+                    mach_port_name_t *mem = NULL; mach_msg_type_number_t nm = 0;
+                    if (mach_port_get_set_status(mach_task_self(), names[i], &mem, &nm) == KERN_SUCCESS) {
+                        for (unsigned j = 0; j < nm && j < 32; j++) { q = str_into(q, " "); q = hex_into(q, mem[j]); }
+                        if (mem) mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)mem, nm * sizeof(*mem));
+                    }
+                    q = str_into(q, "\n");
+                    write(2, rb, (size_t)(q - rb));
+                }
+                mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)names, nn * sizeof(*names));
+                mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)types, nt * sizeof(*types));
+            }
+            once = 0;
+        }
+    }
+    if (g_cur_cpu->last_rcv_name) {
+        char rb[400]; char *q = rb;
+        q = str_into(q, "ocerz: RIPDUMP rcv-port=");
+        q = hex_into(q, g_cur_cpu->last_rcv_name);
+        mach_port_name_t *members = NULL;
+        mach_msg_type_number_t nmem = 0;
+        if (mach_port_get_set_status(mach_task_self(), g_cur_cpu->last_rcv_name, &members, &nmem) == KERN_SUCCESS) {
+            q = str_into(q, " set-members:");
+            for (unsigned i = 0; i < nmem && i < 24; i++) { q = str_into(q, " "); q = hex_into(q, members[i]); }
+            if (members) mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)members, nmem * sizeof(*members));
+        } else
+            q = str_into(q, " (not-a-set)");
+        q = str_into(q, "\n");
+        write(2, rb, (size_t)(q - rb));
+    }
     p = str_into(p, "ocerz: RIPDUMP rip=");
     p = hex_into(p, g_cur_cpu->rip);
     p = str_into(p, " gs=");
