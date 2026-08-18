@@ -63,7 +63,17 @@ make check                                                 # build + run every t
 | sse | 246 |
 | syscall | 96 |
 
-End-to-end: **17 / 17** guest binaries in interpreter mode, **17 / 17** in JIT mode, **18 / 18** in the JIT-vs-interpreter differential, and **2 / 2** dynamic-linking tests.
+End-to-end, the suites that gate every commit:
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| guest binaries (interpreter, JIT, ordered mode, tiny-arena, `wine --version`) | `tests/run_guest_tests.sh` | 65 / 65 |
+| JIT-vs-interpreter differential | `tests/run_diff_test.sh` | 53 / 53 |
+| dynamic-mode `xbench` (plain and `OCERZ_NO_PLAIN_MEM=1`) | `tests/run_dyn_test.sh` | 15 / 15 each |
+| benchmark-binary differential | `tests/run_bench_diff.sh` | 4 / 4 |
+| dynamic linking against the live shared cache | `tests/run_dynamic_tests.sh` | 2 / 2 |
+
+`xbench` output is also checked byte-identical to Rosetta 2 in both plain and ordered memory mode.
 
 JIT speedup on `fib(30)`: **0.59s → 0.08s (~7.5×)**.
 
@@ -171,8 +181,20 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `-v` | verbose (repeatable, raises level) |
 | `-trace` | per-instruction trace |
 | `-strace` | syscall trace |
-| `-no-jit` | force the interpreter (JIT is on by default) |
+| `-no-jit` | force the interpreter for **this process only** (JIT is on by default) |
 | `--` | end of Ocerz options; everything after is guest `argv` |
+
+`-no-jit` is an argv flag, so it does **not** survive `execve` — a guest that spawns children
+(Wine does, constantly) keeps running those under the JIT. Use the environment switch when you
+want a whole process tree interpreted, since the environment is inherited across exec:
+
+| Variable | Effect |
+| --- | --- |
+| `OCERZ_NOJIT=1` | interpret every process in the tree |
+| `OCERZ_NOJIT_EXE=<substr>` | interpret only processes whose command line contains `<substr>` |
+| `OCERZ_HOSTWQ=1` | bridge guest libdispatch onto the host workqueue (required for Wine and most real apps) |
+| `OCERZ_NO_PLAIN_MEM=1` | force ordered (x86-TSO) memory forms everywhere |
+| `OCERZ_TSO_STRICT=1` | drop the thread-private-stack exemption in ordered mode |
 
 ## Architecture
 
@@ -187,7 +209,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 **Eager flags.** Flags are evaluated eagerly into `cpu->rflags`; `flags.c` is the bit-for-bit reference the JIT must match — ADC/SBB folded via carry-in relations, INC/DEC preserving CF, deterministic values for architecturally-undefined flags, and x86 NaN semantics (negative QNaN indefinite, propagation rules).
 
-**The JIT.** A block is the straight-line run from an entry rip to the first control-flow or system instruction. Each block is decoded once; cheap ops are inlined as arm64 and everything else calls back into the shared interpreter dispatch, so the JIT and interpreter can never disagree on semantics. A 1GB `MAP_JIT` reservation (address space, not RSS) with `pthread_jit_write_protect_np` and per-block icache invalidation; a 2^20-bucket cache keyed by guest rip with a lock-free lookup on the hot path. Stack traffic (`push`/`pop`) is inlined natively, since it is ~27% of everything a real app executes. If the arena ever fills, a block is demoted to the interpreter tier rather than retried forever. Aligned guest loads/stores use ordinary `ldr`/`str` while the process is provably single-observer and upgrade to `ldar`/`stlr` once guest memory can be shared with another thread or process, so x86's TSO ordering survives arm64's weak memory model without paying for barriers that single-threaded code cannot observe.
+**The JIT.** A block is the straight-line run from an entry rip to the first control-flow or system instruction. Each block is decoded once; cheap ops are inlined as arm64 and everything else calls back into the shared interpreter dispatch, so the JIT and interpreter can never disagree on semantics. A 1GB `MAP_JIT` reservation (address space, not RSS) with `pthread_jit_write_protect_np` and per-block icache invalidation; a 2^20-bucket cache keyed by guest rip with a lock-free lookup on the hot path. Stack traffic (`push`/`pop`) is inlined natively, since it is ~27% of everything a real app executes. If the arena ever fills, a block is demoted to the interpreter tier rather than retried forever. Aligned guest loads/stores use ordinary `ldr`/`str` while the process is provably single-observer and upgrade to the ordered forms (`ldapur`/`stlur`, see below) once guest memory can be shared with another thread or process, so x86's TSO ordering survives arm64's weak memory model without paying for barriers that single-threaded code cannot observe.
 
 **The mini-dyld.** Maps the real `dyld_shared_cache_x86_64` at slide 0 and implements the dyld runtime API surface that libdyld's trampolines dispatch through — `dlopen`/`dlsym`, image lists, TLV, unwind, `_dyld_register_for_bulk_image_loads` — plus the objc↔dyld handshake (`_dyld_objc_register_callbacks`, `map_images`/`load_images`, and the shared cache's selector and class perfect-hash tables).
 
@@ -197,8 +219,16 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 ## What does NOT work yet
 
-- A real app hangs on roughly half of launches. When it works, `Mousecape.app` reaches its window in ~19s and settles to 0% CPU. When it does not, the process parks at 0% CPU with no window and macOS reports "Application not responding": the main thread never services the run loop. Over 24 consecutive launches, 13 OK, 8 hung, 3 died. It is a lost-wakeup race in the libdispatch workloop bridge, where one workloop is armed (`EVFILT_WORKLOOP`, `EV_ADD|EV_ENABLE`) over 140 times, never drained, and everything parks. This is the single blocker to a usable app.
-- Wine bring-up is in progress (see `notes/wine_bringup.md`); `wineboot` runs end-to-end into the GUI layer.
+- A real app hangs on roughly half of launches (same family as the Wine hang below: a lost
+  completion in the libdispatch/run-loop bridge, not a translation fault). When it works, `Mousecape.app` reaches its window in ~19s and settles to 0% CPU. When it does not, the process parks at 0% CPU with no window and macOS reports "Application not responding": the main thread never services the run loop. Over 24 consecutive launches, 13 OK, 8 hung, 3 died. It is a lost-wakeup race in the libdispatch workloop bridge, where one workloop is armed (`EVFILT_WORKLOOP`, `EV_ADD|EV_ENABLE`) over 140 times, never drained, and everything parks. This is the single blocker to a usable app.
+- **Wine.** An unmodified x86_64 Wine 11.8 boots under Ocerz: `wineserver`, the service
+  processes, `explorer.exe` and `notepad.exe` all start, `winemac.drv` loads, Metal enumerates
+  the real GPU, and macdrv creates genuine Cocoa windows against the live WindowServer.
+  `notepad` renders its window (1026x769, titled) — but only on a minority of launches. The
+  rest hang with one wine GUI thread parked forever in macdrv's `OnMainThread`, waiting on a
+  completion flag that is never set, while the rest of the process (main run loop, clipboard
+  poll thread, other request traffic) keeps running normally. Root-causing is in
+  `notes/wine_bringup.md` (UPDATE #46-#48).
 - Categories and `+load` run for the launch closure, but later batch loads (post-boot `dlopen`) are not yet re-notified through `_dyld_register_for_bulk_image_loads`.
 
 Other rough edges: x87 is 64-bit double, not 80-bit; `RSQRT`/`RCP` are exact rather than the ~12-bit approximations; MXCSR dynamic rounding is ignored (assumes round-to-nearest); the JIT block cache is never invalidated (no self-modifying-code support); guest `mprotect` is resolved onto 16KB host pages (permissive changes round outward, restrictive inward, so a shared page keeps the union); the stack guard is fixed rather than randomized; inbound OOL relocation covers flat Mach messages but not `MACH64_MSG_VECTOR` receives.
