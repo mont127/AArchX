@@ -64,7 +64,8 @@ typedef struct OcerzCPU {
     struct { uint64_t guest_rip; void *host_entry; } ras[256];
     Ocerz128 fp_ckpt[16] __attribute__((aligned(16))); /* JIT FP-batch checkpoints (replay inputs) */
     uint64_t jit_scratch[2];        /* JIT temporaries that must survive a C callout (e.g. an old CF) */
-    uint64_t jit_fp;                /* host sp at the active JIT function's frame base (class 3):
+    uint64_t jit_fp;
+    volatile uint64_t block_since_ns;  /* nonzero while parked in a blocking host syscall (unstick monitor) */                /* host sp at the active JIT function's frame base (class 3):
                                        every exit resets sp to it, dropping the host-stack RAS entries */
     uint32_t mxcsr;
     uint16_t fcw;

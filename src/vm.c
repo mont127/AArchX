@@ -19,6 +19,7 @@
 #include <time.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 #define OCERZ_CALL_SENTINEL 0x00000000deadca11ull
 
@@ -281,6 +282,12 @@ static void arg_trap_report(const OcerzCPU *c)
         { "rcx", OCERZ_RCX }, { "r8",  OCERZ_R8  }, { "r9",  OCERZ_R9  },
     };
     fprintf(stderr, "ocerz: ARGTRAP[%d] rip=%#llx", (int)getpid(), (unsigned long long)c->rip);
+    {
+        uint64_t rh[32]; unsigned rn = ocerz_vm_riphist(rh, 32);
+        fprintf(stderr, " hist:");
+        for (unsigned i = 0; i < rn && i < 16; i++)
+            fprintf(stderr, " %#llx", (unsigned long long)rh[i]);
+    }
     if (ocerz_addr_readable(c->gpr[OCERZ_RSP])) {
         fprintf(stderr, " ra=%#llx", (unsigned long long)ocerz_ld(c->gpr[OCERZ_RSP], 8));
         /* a few more return-address-looking stack words for context */
@@ -977,7 +984,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     p = str_into(p, "] cpu#");
     p = hex_into(p, g_cur_cpu ? (uint64_t)g_cur_cpu->cpu_number : 0xffff);
     p = str_into(p, " ");
-    p = str_into(p, sig == SIGBUS ? "SIGBUS" : "SIGSEGV");
+    p = str_into(p, sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL" :
+                    sig == SIGTRAP ? "SIGTRAP" : sig == SIGSYS ? "SIGSYS" : "SIGSEGV");
     p = str_into(p, " host_addr=");
     p = hex_into(p, (uint64_t)(uintptr_t)si->si_addr);
     if (ctx) {
@@ -991,6 +999,101 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = hex_into(p, uc->uc_mcontext->__ss.__lr);
         p = str_into(p, " slide=");
         p = hex_into(p, g_image_slide);
+        write(2, buf, (size_t)(p - buf)); p = buf;
+        p = str_into(p, "\n  host-x:");
+        for (int i = 0; i < 29; i++) {
+            p = str_into(p, i % 8 == 0 ? "\n    " : " ");
+            p = hex_into(p, uc->uc_mcontext->__ss.__x[i]);
+        }
+        p = str_into(p, " fp=");
+        p = hex_into(p, uc->uc_mcontext->__ss.__fp);
+        p = str_into(p, " lr=");
+        p = hex_into(p, uc->uc_mcontext->__ss.__lr);
+        p = str_into(p, " sp=");
+        p = hex_into(p, uc->uc_mcontext->__ss.__sp);
+        write(2, buf, (size_t)(p - buf)); p = buf;
+        if (sig == SIGILL) {
+            /* find who branched here: scan the arena for b/bl/b.cond/cbz/tbz
+             * words whose target is the fault pc */
+            uint64_t pc0 = uc->uc_mcontext->__ss.__pc;
+            const uint32_t *cb, *ce;
+            if (g_vm && ocerz_jit_code_range(g_vm, &cb, &ce)) {
+                p = str_into(p, "  jit-owner=");
+                p = hex_into(p, (uint64_t)(uint32_t)ocerz_jit_owner_pid(g_vm));
+                p = str_into(p, " self=");
+                p = hex_into(p, (uint64_t)(uint32_t)getpid());
+                p = str_into(p, " arena=[");
+                p = hex_into(p, (uint64_t)(uintptr_t)cb);
+                p = str_into(p, ",");
+                p = hex_into(p, (uint64_t)(uintptr_t)ce);
+                p = str_into(p, ") base-word=");
+                p = hex_into(p, *cb);
+                p = str_into(p, "\n  branch-sites->pc:");
+                int found = 0;
+                for (const uint32_t *w = cb; w < ce && found < 8; w++) {
+                    uint32_t v = *w;
+                    int64_t off = 0; int is = 0;
+                    if ((v & 0x7c000000u) == 0x14000000u) { off = (int64_t)((int32_t)(v << 6) >> 6) * 4; is = 1; }          /* b/bl */
+                    else if ((v & 0xff000010u) == 0x54000000u || (v & 0x7e000000u) == 0x34000000u) { off = (int64_t)((int32_t)((v >> 5) << 13) >> 13) * 4; is = 1; }  /* b.cond / cbz */
+                    if (is && (uint64_t)(uintptr_t)w + (uint64_t)off == pc0) {
+                        p = str_into(p, " ");
+                        p = hex_into(p, (uint64_t)(uintptr_t)w);
+                        p = str_into(p, "/w=");
+                        p = hex_into(p, v);
+                        found++;
+                    }
+                }
+                if (!found) p = str_into(p, " none");
+                p = str_into(p, "\n");
+                write(2, buf, (size_t)(p - buf)); p = buf;
+                {
+                    OcerzJitFaultInfo fi;
+                    if (ocerz_jit_fault_info(g_vm, (const void *)(uintptr_t)pc0, &fi)) {
+                        p = str_into(p, "  owner-block: rip=");
+                        p = hex_into(p, fi.block_rip);
+                        p = str_into(p, " word=");
+                        p = hex_into(p, fi.host_word);
+                        p = str_into(p, " insn=");
+                        p = hex_into(p, (uint64_t)(int64_t)fi.insn_index);
+                        p = str_into(p, " pin=");
+                        p = hex_into(p, fi.pin_class);
+                        p = str_into(p, "\n");
+                    } else
+                        p = str_into(p, "  owner-block: none\n");
+                    write(2, buf, (size_t)(p - buf)); p = buf;
+                }
+                {
+                    uint32_t w[64];
+                    vm_size_t got = 0;
+                    if (mach_vm_read_overwrite(mach_task_self(), pc0 - 0x80, sizeof w,
+                                               (mach_vm_address_t)(uintptr_t)w, (mach_vm_size_t *)&got) == KERN_SUCCESS && got == sizeof w) {
+                        p = str_into(p, "  mem@pc-80:");
+                        for (int i = 0; i < 64; i++) {
+                            p = str_into(p, i == 32 ? " |" : " ");
+                            p = hex_into(p, w[i]);
+                            if (i == 47) { p = str_into(p, "\n   "); write(2, buf, (size_t)(p - buf)); p = buf; }
+                        }
+                        p = str_into(p, "\n");
+                        write(2, buf, (size_t)(p - buf)); p = buf;
+                    }
+                }
+            }
+        }
+        p = str_into(p, "  host-stack:");
+        {
+            /* host sp is not guest memory: probe with mach instead */
+            uint64_t a0 = uc->uc_mcontext->__ss.__sp;
+            vm_size_t got = 0;
+            uint64_t w[12];
+            if (mach_vm_read_overwrite(mach_task_self(), a0, sizeof w,
+                                       (mach_vm_address_t)(uintptr_t)w, (mach_vm_size_t *)&got) == KERN_SUCCESS)
+                for (unsigned i = 0; i * 8 < (uint64_t)got && i < 12; i++) {
+                    p = str_into(p, " ");
+                    p = hex_into(p, w[i]);
+                }
+        }
+        p = str_into(p, "\n");
+        write(2, buf, (size_t)(p - buf)); p = buf;
         /* host frame-pointer chain (symbolize offline: atos -o ocerz -l <slide+0x100000000> addr...) */
         p = str_into(p, " host_bt=");
         uint64_t fp = uc->uc_mcontext->__ss.__fp;
@@ -1284,6 +1387,7 @@ static void ocerz_install_kick_handler(void);
 void ocerz_vm_install_handlers(OcerzVM *vm)
 {
     ocerz_install_kick_handler();
+    { void ocerz_unstick_start(void); ocerz_unstick_start(); }
     extern int ocerz_cftrap_on;
     ocerz_cftrap_on = getenv("OCERZ_CFTRAP") != NULL;
     g_crash_stack = getenv("OCERZ_CRASH_STACK") != NULL;
@@ -1330,6 +1434,14 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     sa.sa_flags = SA_SIGINFO | SA_NODEFER | (altss.ss_sp ? SA_ONSTACK : 0);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    /* SIGILL/SIGTRAP/SIGSYS have no default handler in ocerz, so a jump to a
+     * garbage code pointer used to kill the process SILENTLY (macOS .ips was
+     * the only trace; three of those on 2026-08-17: br to an mmap pool base /
+     * arena code_cur that was never written).  Route them through the crash
+     * reporter so the death is diagnosable in our own logs. */
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGSYS, &sa, NULL);
 
     struct sigaction as;
     memset(&as, 0, sizeof as);
@@ -1546,9 +1658,54 @@ static void ocerz_install_kick_handler(void)
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = ocerz_kick_handler;
-    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    /* deliberately NOT SA_RESTART: the unstick monitor uses this signal to
+     * EINTR guest threads out of lost-wakeup parks (the manual `sample`
+     * "shake" that always revived wedged wine sessions, automated).  Every
+     * guest-visible blocking call handles EINTR (wine loops on it). */
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGEMT, &sa, NULL);
+}
+
+/* ---- unstick monitor -------------------------------------------------
+ * UPDATE #39 family: a guest thread parks in a blocking host wait whose
+ * wakeup was lost (waiter/waker alias, kevent edge, ...); an EINTR shake
+ * always revives the session.  Automate the shake: kick any cpu thread
+ * that has been inside one blocking host call for >800ms.  Legitimate
+ * long waits just retry (EINTR is part of every wait's contract). */
+static void *ocerz_unstick_thread(void *arg)
+{
+    (void)arg;
+    static int lg = -1;
+    if (lg < 0) lg = getenv("OCERZ_UNSTICKLOG") ? 1 : 0;
+    for (;;) {
+        struct timespec ts = { 0, 250 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        pthread_mutex_lock(&g_cpus_lock);
+        for (int i = 0; i < g_cpus_n; i++) {
+            uint64_t t0 = g_cpus[i]->block_since_ns;
+            if (t0 && now - t0 > 800ull * 1000 * 1000) {
+                g_cpus[i]->block_since_ns = now;   /* re-arm: kick again in 800ms if still stuck */
+                if (lg)
+                    fprintf(stderr, "ocerz: UNSTICK[%d] kicking cpu#%u (blocked %llums)\n",
+                            (int)getpid(), g_cpus[i]->cpu_number,
+                            (unsigned long long)((now - t0) / 1000000));
+                pthread_kill(g_cpu_threads[i], SIGEMT);
+            }
+        }
+        pthread_mutex_unlock(&g_cpus_lock);
+    }
+    return NULL;
+}
+void ocerz_unstick_start(void)
+{
+    static int started;
+    if (started || getenv("OCERZ_NO_UNSTICK")) return;
+    started = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, ocerz_unstick_thread, NULL) == 0)
+        pthread_detach(t);
 }
 
 void ocerz_vm_request_exit(OcerzVM *vm, int code)

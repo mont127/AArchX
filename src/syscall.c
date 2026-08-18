@@ -144,7 +144,9 @@ static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             fp = ocerz_ld(fp, 8);
         }
         fprintf(stderr, "\n");
-        if ((uint32_t)a[0] != 0 && getenv("OCERZ_EXITHIST")) {
+        {
+            const char *eh = getenv("OCERZ_EXITHIST");
+            if (eh && ((uint32_t)a[0] != 0 || !strcmp(eh, "all"))) {
             /* nonzero exit: recent block rips + a return-address scan of the
              * stack (rbp chains are often broken at exit()) */
             uint64_t rh[32]; unsigned rn = ocerz_vm_riphist(rh, 32);
@@ -153,12 +155,18 @@ static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             fprintf(stderr, "\nocerz: EXITHIST[%d] stackscan:", (int)getpid());
             uint64_t sp = cpu->gpr[OCERZ_RSP];
             int printed = 0;
-            for (uint64_t o = 0; o < 0x800 && printed < 24; o += 8) {
+            for (uint64_t o = 0; o < 0x3000 && printed < 48; o += 8) {
                 if (!ocerz_addr_readable(sp + o)) break;
                 uint64_t v = ocerz_ld(sp + o, 8);
-                if (v >= 0x7ff800000000ull && v < 0x7ffb00000000ull) { fprintf(stderr, " %#llx", (unsigned long long)v); printed++; }
+                int codey = (v >= 0x7ff800000000ull && v < 0x7ffb00000000ull) ||
+                            (v >= 0x700000000000ull && v < 0x710000000000ull) ||
+                            (v >= 0x6fff00000000ull && v < 0x700000000000ull) ||
+                            (v >= 0x140000000ull && v < 0x180000000ull) ||
+                            (v >= 0x7ff000000000ull && v < 0x7ff100000000ull);
+                if (codey) { fprintf(stderr, " +%llx:%#llx", (unsigned long long)o, (unsigned long long)v); printed++; }
             }
             fprintf(stderr, "\n");
+            }
         }
     }
     ocerz_vm_request_exit(vm, (int)(uint32_t)a[0] & 0xff);
@@ -2081,7 +2089,9 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                     (int)getpid(), cpu->cpu_number, (unsigned long long)a[0],
                     (long long)a[4], (unsigned long long)fa[7],
                     (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
+        cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t r = ocerz_host_syscall(375, fa, &ret2, &err);
+        cpu->block_since_ns = 0;
         if (kid_log)
             fprintf(stderr, "ocerz: KEVID[%d] cpu#%u id=%#llx nchg=%lld nev=%lld flags=%#llx chg0{id=%#llx filt=%d fl=%#x} -> r=%lld err=%d\n",
                     (int)getpid(), cpu->cpu_number, (unsigned long long)a[0],
@@ -2170,7 +2180,9 @@ static int sys_kevent_qos(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         if (fa[6]) fa[6] = (uint64_t)(uintptr_t)ocerz_g2h(fa[6]);
         uint64_t ret2 = 0;
         int err = 0;
+        cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t r = ocerz_host_syscall(374, fa, &ret2, &err);
+        cpu->block_since_ns = 0;
         if (!err && (int64_t)r > 0 && a[3]) {
             int got = (int)r;
             if (got > 64) got = 64;
@@ -2587,7 +2599,9 @@ static int forward_with_scratch(OcerzCPU *cpu, int num, uint64_t a[8], int dual_
 {
     int err = 0;
     uint64_t ret2 = 0;
+    cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
+    cpu->block_since_ns = 0;
     if (err) {
         ret_err(cpu, r);
     } else if (dual_ret) {
@@ -2662,7 +2676,9 @@ static int sys_msg(OcerzCPU *cpu, uint64_t a[8], int num, int is_send)
     uint64_t fa[8] = { a[0], (uint64_t)(uintptr_t)&h, a[2], 0, 0, 0, 0, 0 };
     int err = 0;
     uint64_t ret2 = 0;
+    cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t r = ocerz_host_syscall(num, fa, &ret2, &err);
+    cpu->block_since_ns = 0;
     if (err) {
         ret_err(cpu, r);
         return OCERZ_STEP_OK;
@@ -3058,7 +3074,14 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                 (int)getpid(), num, (long long)orig[0], (int)orig[0], (long long)orig[4],
                 (unsigned long long)orig[5], (unsigned long long)cpu->rip);
     static int blocklog = -1;
-    if (blocklog < 0) blocklog = getenv("OCERZ_BLOCKLOG") != NULL ? 1 : 0;
+    if (blocklog < 0) {
+        blocklog = getenv("OCERZ_BLOCKLOG") != NULL ? 1 : 0;
+        const char *fx = getenv("OCERZ_BLOCKLOG_EXE");   /* only processes whose cmdline contains this */
+        if (fx && *fx) {
+            extern char ocerz_cmdline_summary[];
+            blocklog = strstr(ocerz_cmdline_summary, fx) != NULL;
+        }
+    }
     static uint64_t blockseq;
     uint64_t bseq = 0;
     int btrack = blocklog &&
@@ -3088,7 +3111,9 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     int rtrack = reqlog && (num == 4 || num == 121) &&
         (orig[2] == 8 || orig[2] == 16 || orig[2] == 64 || orig[2] == 80 ||
          num == 121);
+    cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
+    cpu->block_since_ns = 0;
     if (rtrack)
         fprintf(stderr,
                 "ocerz: REQW[%d] num=%d fd=%lld len=%lld first=%#x -> r=%lld err=%d rip=%#llx\n",
@@ -3873,7 +3898,10 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             fprintf(stderr, "ocerz: PORTLOG[%d] %s name=%#llx right=%#llx delta=%#llx\n",
                     (int)getpid(), mach_trap_name(num), (unsigned long long)a[1],
                     (unsigned long long)a[2], (unsigned long long)a[3]);
-        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint64_t rg = ocerz_host_mach_trap(num, a);
+        cpu->block_since_ns = 0;
+        mach_ret(cpu, rg);
         break;
     }
     case 31: {
@@ -3894,7 +3922,9 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                           gmsg31 ? (uint32_t)ocerz_ld(gmsg31 + 4, 4) : 0);
         if (a[0] != 0)
             a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
+        cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t r31 = ocerz_host_mach_trap(num, a);
+        cpu->block_since_ns = 0;
         mach_ret(cpu, r31);
         if (nsv31)
             ocerz_send_restore_descriptors(gmsg31, sv31, nsv31);
@@ -4074,7 +4104,9 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                         (uint32_t)(a[4] >> 32),
                         (uint32_t)ocerz_ld(request_buf + 8, 4), asc);
         }
+        cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t r47 = ocerz_host_mach_trap(num, a);
+        cpu->block_since_ns = 0;
         mach_ret(cpu, r47);
         if (nsv47)
             ocerz_send_restore_descriptors(reply_buf, sv47, nsv47);
