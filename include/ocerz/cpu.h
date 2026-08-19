@@ -97,6 +97,16 @@ typedef struct OcerzCPU {
     uint64_t wine_teb_base;
 
     volatile int interrupt;
+
+    /* Segment selectors, indexed by OcerzSreg (ES,CS,SS,DS,FS,GS).  Only the
+     * 32-bit guest touches these: PUSH/POP sreg and LES/LDS name a segment
+     * register as a value rather than as an address override, so the selector
+     * has to live somewhere.  cs_sel above stays the authority for CS -- these
+     * mirror it -- because the JIT and the far-branch paths already read it.
+     * Appended at the very end of the struct so that no existing field, and in
+     * particular neither the 16-byte-aligned xmm[] nor the ras[] window the
+     * JIT reaches with stp/ldp immediates, moves by a single byte. */
+    uint16_t seg_sel[6];
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256

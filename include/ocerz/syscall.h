@@ -20,5 +20,8 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
 
 uint64_t ocerz_ldt_base(uint32_t sel);
 int ocerz_ldt_is_big(uint32_t sel);
+int ocerz_ldt_is_long(uint32_t sel);
+void ocerz_ldt_install(uint32_t sel, uint64_t base, uint32_t limit,
+                       uint8_t access, int big, int is_long, int gran);
 
 #endif
