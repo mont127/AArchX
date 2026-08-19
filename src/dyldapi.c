@@ -18,6 +18,7 @@
 #define DYLDAPI_VTABLE_SIZE 0x2000
 
 #define DYLDAPI_CLOSURE_MAX 1024
+#define PRELOAD_MAX 8192
 
 static uint64_t g_apis_global;
 static struct OcerzCache *g_cache;
@@ -46,6 +47,28 @@ static uint64_t g_objc_dlopen_mapped[DYLDAPI_CLOSURE_MAX];
 static int g_objc_dlopen_mapped_n;
 
 static uint32_t g_main_bv_platform, g_main_bv_minos, g_main_bv_sdk;
+
+static void hinfo_diag(const char *tag, uint64_t mh);
+static int hinfo_ro_index(uint64_t mh);
+static uint64_t objc_index_loaded(uint32_t idx);
+
+/* DIAG (OCERZ_METHDUMP="<clshex>:<sel>"): dump a cache class's baseMethods
+ * sublists (and their owning image-index / isLoaded gate) at each map_images. */
+static void methdump_diag(const char *tag)
+{
+    const char *spec = getenv("OCERZ_METHDUMP");
+    if (!spec)
+        return;
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *colon = strchr(buf, ':');
+    if (!colon)
+        return;
+    *colon = '\0';
+    uint64_t cls = strtoull(buf, NULL, 16);
+    fprintf(stderr, "ocerz: === METHDUMP @%s ===\n", tag);
+    ocerz_dyldapi_dump_method(cls, colon + 1);
+}
 
 static void parse_build_version(uint64_t mh, uint32_t *plat, uint32_t *minos, uint32_t *sdk)
 {
@@ -474,6 +497,93 @@ static int api_register_for_bulk_image_loads(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+
+/* EXPERIMENT (OCERZ_PRELOAD_OBJC=<substr>[,<substr>...]): add the dependency
+ * closure of the named shared-cache image(s) to the INITIAL objc map_images
+ * batch, so libobjc sees them (and sets their headeropt_rw isLoaded bit)
+ * before any class gets realized -- the same position a linked framework has.
+ * Categories that such an image adds to classes in other cache images are only
+ * visible if the image is known-loaded at the time the target class is
+ * realized; a plain dlopen happens far too late for that. */
+static void objc_preload_append(uint64_t *mhs, uint64_t *paths, uint64_t *iis,
+                                int *np, int max)
+{
+    const char *spec = getenv("OCERZ_PRELOAD_OBJC");
+    if (!spec || !g_cache)
+        return;
+    static uint64_t visited[8192];
+    int vn = 0;
+    char buf[2048];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        /* "@cat": every cache image that defines ObjC categories.  A category
+         * an image adds to a class in ANOTHER cache image is only honoured if
+         * that image is known-loaded when the target class is realized, so a
+         * dlopen arrives far too late.  Naming frameworks one at a time is
+         * whack-a-mole (AppKit, then QuartzCore, then whatever dlopens next),
+         * and only images with a __objc_catlist can be affected - so preload
+         * exactly those. */
+        int all_cats = (strcmp(tok, "@cat") == 0);
+        for (uint32_t i = 0; i < g_cache->images_cnt && *np < max; i++) {
+            const char *p = NULL;
+            uint64_t mh = ocerz_cache_image_addr(g_cache, i, &p);
+            if (!mh || !p)
+                continue;
+            if (all_cats) {
+                if (!find_section_any(mh, "__objc_catlist"))
+                    continue;
+            } else if (!strstr(p, tok)) {
+                continue;
+            }
+            uint64_t queue[8192];
+            int qn = 0;
+            queue[qn++] = mh;
+            while (qn > 0 && *np < max) {
+                uint64_t cur = queue[--qn];
+                int seen = 0;
+                for (int k = 0; k < vn; k++)
+                    if (visited[k] == cur) { seen = 1; break; }
+                if (seen)
+                    continue;
+                if (vn < (int)(sizeof visited / sizeof visited[0]))
+                    visited[vn++] = cur;
+                const struct mach_header_64 *h = (const void *)(uintptr_t)cur;
+                if (h->magic != MH_MAGIC_64)
+                    continue;
+                int dup = 0;
+                for (int k = 0; k < *np; k++)
+                    if (mhs[k] == cur) { dup = 1; break; }
+                uint64_t ii = dup ? 0 : find_section_any(cur, "__objc_imageinfo");
+                if (ii) {
+                    const char *cp = cache_path_for_mh(g_cache, cur);
+                    mhs[*np] = cur;
+                    paths[*np] = cp ? ocerz_h2g(cp) : 0;
+                    iis[*np] = ii;
+                    (*np)++;
+                }
+                const uint8_t *lc = (const uint8_t *)(h + 1);
+                for (uint32_t j = 0; j < h->ncmds; j++) {
+                    const struct load_command *l = (const void *)lc;
+                    if (l->cmd == LC_LOAD_DYLIB || l->cmd == LC_LOAD_WEAK_DYLIB ||
+                        l->cmd == LC_REEXPORT_DYLIB || l->cmd == LC_LOAD_UPWARD_DYLIB) {
+                        uint32_t noff;
+                        memcpy(&noff, lc + 8, 4);
+                        if (noff < l->cmdsize) {
+                            uint64_t dep = cache_find_path(g_cache, (const char *)lc + noff);
+                            if (dep && qn < (int)(sizeof queue / sizeof queue[0]))
+                                queue[qn++] = dep;
+                        }
+                    }
+                    lc += l->cmdsize;
+                }
+            }
+        }
+    }
+}
+
+static int g_objc_preload_added;
+
 static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t cb = cpu->gpr[OCERZ_RSI];
@@ -490,7 +600,7 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
     g_objc_mapped_cb = mapped;
     g_objc_init_cb = cb ? ocerz_ld(cb + 0x10, 8) : 0;
 
-    uint64_t mhs[DYLDAPI_CLOSURE_MAX], paths[DYLDAPI_CLOSURE_MAX], iis[DYLDAPI_CLOSURE_MAX];
+    static uint64_t mhs[PRELOAD_MAX], paths[PRELOAD_MAX], iis[PRELOAD_MAX];
     int n = 0;
     for (int i = 0; i < g_closure_n && n < DYLDAPI_CLOSURE_MAX; i++) {
         uint64_t mh = g_closure_mh[i];
@@ -502,6 +612,14 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
         paths[n] = path ? ocerz_h2g(path) : 0;
         iis[n] = ii;
         n++;
+    }
+    {
+        int before = n;
+        objc_preload_append(mhs, paths, iis, &n, PRELOAD_MAX);
+        g_objc_preload_added = n - before;
+        if (g_objc_preload_added && getenv("OCERZ_OBJCLOG"))
+            fprintf(stderr, "ocerz: PRELOAD_OBJC added %d image(s) to the initial batch (%d total)\n",
+                    g_objc_preload_added, n);
     }
     if (n == 0) {
         api_return(cpu, 0);
@@ -528,8 +646,45 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
     OCERZ_LOG("dyldapi: objc map_images driving %d images (infos=%#llx)\n",
               n, (unsigned long long)infos);
 
+    for (int k = 0; k < n && k < 3; k++)
+        hinfo_diag("pre-init", mhs[k]);
     uint64_t args[3] = { (uint64_t)n, infos, g_objc_make_mutable };
     ocerz_vm_call(vm, mapped, args, 3, ret_rsp);
+    if (getenv("OCERZ_HINFO")) {
+        int loaded = 0;
+        for (int k = 0; k < n; k++) {
+            int idx = hinfo_ro_index(mhs[k]);
+            if (idx >= 0 && objc_index_loaded((uint32_t)idx))
+                loaded++;
+        }
+        fprintf(stderr, "ocerz: HINFO initial batch n=%d isLoaded-after=%d\n", n, loaded);
+    }
+    methdump_diag("post-initial");
+    /* DIAG (OCERZ_HINFO_PRESET=<substr>): mark matching cache images as
+     * "loaded" in libobjc's headeropt_rw BEFORE any class gets realized. */
+    {
+        const char *want = getenv("OCERZ_HINFO_PRESET");
+        if (want && g_headeropt_ro && g_headeropt_rw) {
+            uint32_t rocnt, roent, rwcnt, rwent;
+            memcpy(&rocnt, (const void *)(uintptr_t)g_headeropt_ro, 4);
+            memcpy(&roent, (const void *)(uintptr_t)(g_headeropt_ro + 4), 4);
+            memcpy(&rwcnt, (const void *)(uintptr_t)g_headeropt_rw, 4);
+            memcpy(&rwent, (const void *)(uintptr_t)(g_headeropt_rw + 4), 4);
+            int set = 0;
+            for (uint32_t i = 0; i < rocnt && i < rwcnt && roent && rwent; i++) {
+                uint64_t e = g_headeropt_ro + 8 + (uint64_t)i * roent;
+                uint64_t mh = (uint64_t)((int64_t)e + (int64_t)ocerz_ld(e, 8));
+                const char *p = cache_path_for_mh(g_cache, mh);
+                if (!p || !strstr(p, want))
+                    continue;
+                uint64_t rwe = g_headeropt_rw + 8 + (uint64_t)i * rwent;
+                ocerz_st(rwe, 8, ocerz_ld(rwe, 8) | 1);
+                fprintf(stderr, "ocerz: HINFO PRESET idx=%u %s\n", i, p);
+                set++;
+            }
+            fprintf(stderr, "ocerz: HINFO PRESET set %d image(s)\n", set);
+        }
+    }
 
     for (int k = 0; k < n; k++)
         if (g_objc_dlopen_mapped_n < (int)(sizeof g_objc_dlopen_mapped / sizeof g_objc_dlopen_mapped[0]))
@@ -547,6 +702,41 @@ static int objc_image_already_loaded(uint64_t mh)
         if (g_objc_dlopen_mapped[i] == mh)
             return 1;
     return 0;
+}
+
+/* DIAG (OCERZ_HINFO=1): map a cache mach_header to its index in libobjc's
+ * preoptimized headeropt_ro table and report the matching headeropt_rw
+ * isLoaded bit -- the bit addHeader() uses to "weed out duplicates". */
+static uint64_t objc_index_loaded(uint32_t idx);
+
+static int hinfo_ro_index(uint64_t mh)
+{
+    if (!g_headeropt_ro)
+        return -1;
+    uint32_t count, entsize;
+    memcpy(&count, (const void *)(uintptr_t)g_headeropt_ro, 4);
+    memcpy(&entsize, (const void *)(uintptr_t)(g_headeropt_ro + 4), 4);
+    if (entsize == 0 || entsize > 0x40 || count > 100000)
+        return -1;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t e = g_headeropt_ro + 8 + (uint64_t)i * entsize;
+        int64_t off = (int64_t)ocerz_ld(e, 8);
+        if ((uint64_t)((int64_t)e + off) == mh)
+            return (int)i;
+    }
+    return -1;
+}
+
+static void hinfo_diag(const char *tag, uint64_t mh)
+{
+    if (!getenv("OCERZ_HINFO"))
+        return;
+    int idx = hinfo_ro_index(mh);
+    const char *p = g_cache ? cache_path_for_mh(g_cache, mh) : NULL;
+    fprintf(stderr, "ocerz: HINFO %-10s mh=%#llx roidx=%d isLoaded=%llu %s\n",
+            tag, (unsigned long long)mh, idx,
+            idx >= 0 ? (unsigned long long)objc_index_loaded((uint32_t)idx) : 9ull,
+            p ? p : "?");
 }
 
 static void objc_drive_map_images(struct OcerzVM *vm, const uint64_t *mhs, int n)
@@ -571,8 +761,14 @@ static void objc_drive_map_images(struct OcerzVM *vm, const uint64_t *mhs, int n
                     cache_path_for_mh(g_cache, mhs[k]) ? cache_path_for_mh(g_cache, mhs[k]) : "?");
     OCERZ_LOG("dyldapi: objc map_images (dlopen) %d image(s), first %s\n",
               n, cache_path_for_mh(g_cache, mhs[0]) ? cache_path_for_mh(g_cache, mhs[0]) : "?");
+    for (int k = 0; k < n; k++)
+        hinfo_diag("pre-dlopen", mhs[k]);
+    methdump_diag("pre-dlopen");
     uint64_t args[3] = { (uint64_t)n, infos, g_objc_make_mutable };
     ocerz_vm_call(vm, g_objc_mapped_cb, args, 3, istk + 0x100000 - 64);
+    for (int k = 0; k < n; k++)
+        hinfo_diag("post-dlopen", mhs[k]);
+    methdump_diag("post-dlopen");
 }
 
 void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
