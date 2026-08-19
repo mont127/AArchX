@@ -35,6 +35,13 @@ check: ocerz unit guest
 	bash tests/run_diff_test.sh
 	bash tests/run_dynamic_tests.sh
 
+# 32-bit decode conformance vs capstone CS_MODE_32.  Reports a coverage
+# percentage; deliberately NOT part of `check`, because i386 support is being
+# built up in stages and the number is a progress measure, not a pass/fail.
+# Pass --min-coverage N to turn it into a gate.  See tools/i386diff.sh.
+i386diff:
+	bash tools/i386diff.sh .
+
 clean:
 	rm -f $(OBJS) $(DEPS) ocerz
 	rm -rf tests/unit/bin
@@ -42,4 +49,4 @@ clean:
 
 -include $(DEPS)
 
-.PHONY: unit guest check clean
+.PHONY: unit guest check clean i386diff

@@ -237,6 +237,26 @@ Other rough edges: x87 is 64-bit double, not 80-bit; `RSQRT`/`RCP` are exact rat
 
 Plain `Makefile`: `clang -arch arm64 -std=c11 -O2 -Wall -Wextra`. Guest tests are cross-compiled `-arch x86_64 -nostdlib -static` (`crt0.s` + `libmini.c` + raw syscalls). `make check` builds and runs everything.
 
+### Decoder gates
+
+Two differential harnesses guard `src/decode.c`. They link against `src/decode.o`
+alone, run native arm64, and need no guest binary:
+
+```sh
+tools/decodiff-cmp.sh <pristine-tree> <patched-tree>   # must print IDENTICAL
+tools/i386diff.sh .                                    # 32-bit coverage vs capstone
+tools/i386diff.sh . --quick                            # ~2s inner-loop version
+tools/i386diff.sh . --mode 64                          # calibrate the harness itself
+```
+
+`decodiff` hashes every field of all 2^24 three-byte decodes in both trees and
+proves a patch changed **nothing** in 64-bit mode. `i386diff` sweeps the same
+space in 32-bit mode against capstone `CS_MODE_32` as an oracle and reports a
+coverage percentage plus classified length / missing / mnemonic / operand-shape
+mismatches. Both must be satisfied by any decoder change: one says 64-bit did
+not move, the other says how much of i386 works. `i386diff` needs
+`pip3 install capstone`; capstone is used only as a black box.
+
 ## License
 
 [LGPL-2.1](LICENSE).

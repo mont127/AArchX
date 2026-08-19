@@ -12341,6 +12341,14 @@ static void steplog(const OcerzCPU *cpu)
 }
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    /* i386 guest code goes to the interpreter.  Every ocerz_decode() call in
+     * this file is the 64-bit decoder, and a block translated from 32-bit
+     * bytes under 64-bit rules would be silently wrong rather than merely
+     * slow -- 0x40 alone would read as a REX prefix.  One predictable test on
+     * a field the dispatcher already has in cache, taken before any block
+     * lookup, and nothing is emitted that has to check the mode at run time. */
+    if (cpu->mode32)
+        return OCERZ_EUNSUP;
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
         return OCERZ_EUNSUP;
     { static int sl = -1; if (sl < 0) sl = getenv("OCERZ_STEPLOG") ? 1 : 0; if (sl) steplog(cpu); }

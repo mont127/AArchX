@@ -457,7 +457,42 @@ enum OcerzOp {
     OCERZ_OP_AESKEYGENASSIST,
     OCERZ_OP_PCLMULQDQ,
 
+    /* i386-only one-byte opcodes.  Appended at the very END of the enum so
+     * that every pre-existing OcerzOp keeps the numeric value it had; nothing
+     * is renumbered.  None of these is reachable from 64-bit decode -- the
+     * opcode bytes stay OCERZ_EUNDEF in long mode exactly as before. */
+    OCERZ_OP_PUSHA,
+    OCERZ_OP_POPA,
+    OCERZ_OP_PUSHSEG,
+    OCERZ_OP_POPSEG,
+    OCERZ_OP_DAA,
+    OCERZ_OP_DAS,
+    OCERZ_OP_AAA,
+    OCERZ_OP_AAS,
+    OCERZ_OP_AAM,
+    OCERZ_OP_AAD,
+    OCERZ_OP_BOUND,
+    OCERZ_OP_LES,
+    OCERZ_OP_LDS,
+    OCERZ_OP_INTO,
+    OCERZ_OP_SALC,
+
     OCERZ_OP_COUNT,
+};
+
+/* Segment-register numbering as it appears in a ModRM reg field and in the
+ * 0x06/0x07/0x0e/0x16/0x17/0x1e/0x1f opcodes.  OCERZ_OP_PUSHSEG/POPSEG carry
+ * one of these in ops[0] as an OCERZ_OPK_IMM of size 1 -- the same convention
+ * OCERZ_OP_MOVSEG already uses for its destination sreg: the immediate is a
+ * segment *index*, not a value, and the width actually moved on the stack is
+ * in insn.opsize. */
+enum OcerzSreg {
+    OCERZ_SREG_ES = 0,
+    OCERZ_SREG_CS = 1,
+    OCERZ_SREG_SS = 2,
+    OCERZ_SREG_DS = 3,
+    OCERZ_SREG_FS = 4,
+    OCERZ_SREG_GS = 5,
 };
 
 typedef struct X86Operand {
@@ -484,10 +519,18 @@ typedef struct X86Insn {
     uint8_t seg;
     uint8_t cc;
     uint8_t nops;
+    uint8_t mode32;   /* 1 if decoded in i386 (32-bit) mode, 0 in long mode */
     X86Operand ops[3];
 } X86Insn;
 
+/* Decode one instruction.  ocerz_decode() is the 64-bit long-mode decoder and
+ * always has been; ocerz_decode_mode() takes the mode explicitly, with
+ * mode32=1 selecting i386 semantics (32-bit default operand and address size,
+ * no REX, AH..BH byte registers, absolute rather than RIP-relative
+ * mod=00 rm=101, 16-bit addressing under 0x67). */
 int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out);
+int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
+                      X86Insn *out, int mode32);
 const char *ocerz_op_name(unsigned op);
 void ocerz_format_insn(const X86Insn *insn, char *buf, size_t cap);
 

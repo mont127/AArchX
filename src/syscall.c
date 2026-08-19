@@ -4594,6 +4594,7 @@ struct ocerz_ldt_entry {
     uint32_t limit;
     uint8_t  access;
     uint8_t  big;
+    uint8_t  is_long;
     uint8_t  gran;
     uint8_t  present;
 };
@@ -4617,11 +4618,47 @@ int ocerz_ldt_is_big(uint32_t sel)
     return g_ldt[idx].present && g_ldt[idx].big;
 }
 
+/* Descriptor bit 53, the L bit: set on a 64-bit code segment.  L and D are
+ * mutually exclusive on a code segment, so a selector with L=1 is 64-bit no
+ * matter what D says.  The i386_set_ldt path this build serves cannot create
+ * one -- Darwin rejects it -- but the mode decision reads better as "L then D"
+ * than as "D, and trust that L is impossible". */
+int ocerz_ldt_is_long(uint32_t sel)
+{
+    uint32_t idx = sel >> 3;
+    if (!(sel & 4) || idx == 0 || idx >= OCERZ_LDT_MAX)
+        return 0;
+    return g_ldt[idx].present && g_ldt[idx].is_long;
+}
+
+/* Install one LDT descriptor directly, without a guest page to unpack it from.
+ * dispatch_machdep_ldt() below is the guest-facing route; this is the same
+ * effect for callers already inside the emulator. */
+void ocerz_ldt_install(uint32_t sel, uint64_t base, uint32_t limit,
+                       uint8_t access, int big, int is_long, int gran)
+{
+    uint32_t idx = sel >> 3;
+    if (!(sel & 4) || idx == 0 || idx >= OCERZ_LDT_MAX)
+        return;
+    pthread_mutex_lock(&g_ldt_lock);
+    g_ldt[idx].base = base;
+    g_ldt[idx].limit = limit;
+    g_ldt[idx].access = access;
+    g_ldt[idx].big = (uint8_t)(big ? 1 : 0);
+    g_ldt[idx].is_long = (uint8_t)(is_long ? 1 : 0);
+    g_ldt[idx].gran = (uint8_t)(gran ? 1 : 0);
+    g_ldt[idx].present = (uint8_t)((access >> 7) & 1);
+    if ((int)idx + 1 > g_ldt_next)
+        g_ldt_next = (int)idx + 1;
+    pthread_mutex_unlock(&g_ldt_lock);
+}
+
 static void ocerz_ldt_unpack(uint64_t d, struct ocerz_ldt_entry *e)
 {
     e->limit   = (uint32_t)((d & 0xffffu) | (((d >> 48) & 0xfu) << 16));
     e->base    = (uint64_t)(((d >> 16) & 0xffffffu) | (((d >> 56) & 0xffu) << 24));
     e->access  = (uint8_t)((d >> 40) & 0xff);
+    e->is_long = (uint8_t)((d >> 53) & 1);
     e->big     = (uint8_t)((d >> 54) & 1);
     e->gran    = (uint8_t)((d >> 55) & 1);
     e->present = (uint8_t)((e->access >> 7) & 1);
@@ -4635,6 +4672,7 @@ static uint64_t ocerz_ldt_pack(const struct ocerz_ldt_entry *e)
          | ((base & 0xffffffu) << 16)
          | ((uint64_t)e->access << 40)
          | (((lim >> 16) & 0xfu) << 48)
+         | ((uint64_t)(e->is_long & 1) << 53)
          | ((uint64_t)(e->big & 1) << 54)
          | ((uint64_t)(e->gran & 1) << 55)
          | (((base >> 24) & 0xffu) << 56);

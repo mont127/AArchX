@@ -21,6 +21,8 @@ typedef struct DecState {
     int rex_r;
     int rex_x;
     int rex_b;
+    int mode32;   /* 0: 64-bit long mode.  1: i386 compatibility mode. */
+    int addr16;   /* resolved 16-bit addressing (32-bit mode + 0x67 only) */
     X86Insn *out;
 } DecState;
 
@@ -204,6 +206,56 @@ typedef struct ModRM {
     X86Operand mem;
 } ModRM;
 
+/* 16-bit addressing.  Reachable only from 32-bit mode with a 0x67 prefix; in
+ * 64-bit mode 0x67 selects 32-bit addressing and this table is never used.
+ * The r/m encoding is nothing like the 32/64-bit one: no SIB byte, a fixed set
+ * of BX/BP bases optionally paired with SI/DI, and the displacement-only form
+ * sitting at mod=00 rm=110 instead of rm=101.  The caller has already zeroed
+ * *mo and set base/index to OCERZ_REG_NONE.
+ *
+ * Displacements are sign-extended, as they are in the 32-bit table; the
+ * effective address is only meaningful masked to 16 bits, which is the
+ * consumer's job either way. */
+static int decode_modrm16(DecState *s, ModRM *m, int rm)
+{
+    static const uint8_t base16[8] = {
+        OCERZ_RBX, OCERZ_RBX, OCERZ_RBP, OCERZ_RBP,
+        OCERZ_RSI, OCERZ_RDI, OCERZ_RBP, OCERZ_RBX,
+    };
+    static const uint8_t index16[8] = {
+        OCERZ_RSI, OCERZ_RDI, OCERZ_RSI, OCERZ_RDI,
+        OCERZ_REG_NONE, OCERZ_REG_NONE, OCERZ_REG_NONE, OCERZ_REG_NONE,
+    };
+    X86Operand *mo = &m->mem;
+    int e;
+
+    if (m->mod == 0 && rm == 6) {
+        uint16_t d16;
+        e = fetch16(s, &d16);
+        if (e)
+            return e;
+        mo->disp = ocerz_sext(d16, 2);
+        return OCERZ_OK;
+    }
+
+    mo->base = base16[rm];
+    mo->index = index16[rm];
+    if (m->mod == 1) {
+        uint8_t d8;
+        e = fetch8(s, &d8);
+        if (e)
+            return e;
+        mo->disp = ocerz_sext(d8, 1);
+    } else if (m->mod == 2) {
+        uint16_t d16;
+        e = fetch16(s, &d16);
+        if (e)
+            return e;
+        mo->disp = ocerz_sext(d16, 2);
+    }
+    return OCERZ_OK;
+}
+
 static int decode_modrm(DecState *s, ModRM *m, int mem_size)
 {
     uint8_t b;
@@ -233,6 +285,9 @@ static int decode_modrm(DecState *s, ModRM *m, int mem_size)
     mo->imm = 0;
     m->rm = -1;
 
+    if (s->addr16)
+        return decode_modrm16(s, m, rm);
+
     int base = -1;
     int has_disp8 = 0;
     int has_disp32 = 0;
@@ -258,7 +313,8 @@ static int decode_modrm(DecState *s, ModRM *m, int mem_size)
             base = sbase;
         }
     } else if (rm == 5 && m->mod == 0) {
-        riprel = 1;
+        /* RIP-relative in 64-bit mode; a plain absolute disp32 in 32-bit. */
+        riprel = !s->mode32;
         has_disp32 = 1;
     } else {
         base = rm | (s->rex_b ? 8 : 0);
@@ -354,11 +410,39 @@ static int opsize_default(DecState *s)
     return 4;
 }
 
-static int opsize_branch(DecState *s)
+/* Stack width for the ops that carry an EXPLICIT stack operand: PUSH/POP r,
+ * PUSH imm, PUSH/POP r/m.  0x66 selects the 16-bit form in both modes, which
+ * is exactly what HEAD's opsize_branch() did, so the 64-bit arm here is
+ * value-for-value the old function. */
+static int opsize_stack(DecState *s)
 {
     if (s->has_66)
         return 2;
-    return 8;
+    return s->mode32 ? 4 : 8;
+}
+
+/* Stack width for the ops whose stack traffic is IMPLICIT: RET, LEAVE,
+ * PUSHF/POPF.  HEAD hard-codes 8 at each of those sites in 64-bit mode -- it
+ * does not implement the RETW/PUSHFW 0x66 forms -- and the decodiff gate
+ * requires that stay exactly so, hence the unconditional 8 below.  Only the
+ * 32-bit arm is new. */
+static int opsize_stack_implicit(DecState *s)
+{
+    if (!s->mode32)
+        return 8;
+    return s->has_66 ? 2 : 4;
+}
+
+/* Near branches: JMP/CALL rel and r/m, Jcc, LOOP, JrCXZ.  In 64-bit mode the
+ * operand size is FORCED to 64 and 0x66 is ignored (SDM Vol.2, JMP/CALL: "In
+ * 64-bit mode ... the operand size is forced to 64 bits"), which is why HEAD
+ * writes a literal 8 at each of these sites.  That literal is preserved here;
+ * only the 32-bit arm, where 0x66 does apply, is new. */
+static int opsize_nearbranch(DecState *s)
+{
+    if (!s->mode32)
+        return 8;
+    return s->has_66 ? 2 : 4;
 }
 
 static void set_op(DecState *s, int op)
@@ -451,18 +535,37 @@ static int branch_rel(DecState *s, int op, int rel_size, int lo4_for_cc)
 {
     int e;
     X86Operand tmp;
-    if (rel_size == 1)
+    int osize = opsize_nearbranch(s);
+    if (rel_size == 1) {
         e = read_imm8s(s, &tmp, 8);
-    else
+    } else if (osize == 2) {
+        /* 32-bit mode only: 0x66 turns rel32 into rel16 and the target wraps
+         * at 16 bits.  osize is 8 in 64-bit mode, so this arm is dead there. */
+        uint16_t w;
+        e = fetch16(s, &w);
+        if (!e)
+            set_imm(&tmp, (uint64_t)ocerz_sext(w, 2), 2);
+    } else {
         e = read_imm32s(s, &tmp, 8);
+    }
     if (e)
         return e;
     set_op(s, op);
-    s->out->opsize = 8;
+    s->out->opsize = (uint8_t)osize;
     if (lo4_for_cc >= 0)
         set_cc_from_low(s, lo4_for_cc);
     uint64_t target = s->rip + (uint64_t)cur_len(s) + tmp.imm;
-    set_imm(&s->out->ops[0], target, 8);
+    /* EIP wraps at 32 bits, and with a 16-bit operand size the SDM clears the
+     * top half of EIP outright ("the upper two bytes of the EIP register are
+     * cleared", SDM Vol.2 JMP).  capstone does not model that second rule, so
+     * a target-level diff against it disagrees here -- only for a 0x66-
+     * prefixed near branch whose target crosses 64K, which is why the
+     * capstone-checked test rows sit below that boundary. */
+    if (osize == 4)
+        target &= 0xffffffffull;
+    else if (osize == 2)
+        target &= 0xffffull;
+    set_imm(&s->out->ops[0], target, osize);
     s->out->nops = 1;
     return OCERZ_OK;
 }
@@ -474,9 +577,12 @@ static int decode_x87(DecState *s, uint8_t op);
 
 static int decode_one_byte(DecState *s, uint8_t op);
 
-int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out)
+int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
+                      X86Insn *out, int mode32)
 {
     DecState s;
+    s.mode32 = mode32 ? 1 : 0;
+    s.addr16 = 0;
     s.base = code;
     s.p = code;
     s.avail = avail;
@@ -498,6 +604,7 @@ int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out)
 
     memset(out, 0, sizeof(*out));
     out->rip = rip;
+    out->mode32 = (uint8_t)s.mode32;
     for (int i = 0; i < 3; i++) {
         out->ops[i].base = OCERZ_REG_NONE;
         out->ops[i].index = OCERZ_REG_NONE;
@@ -508,7 +615,9 @@ int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out)
         if (s.p >= s.end)
             return avail >= 16 ? OCERZ_ETOOLONG : OCERZ_ETRUNC;
         uint8_t b = *s.p;
-        if (b >= 0x40 && b <= 0x4f) {
+        /* 0x40-0x4f are REX only in 64-bit mode; in 32-bit mode they are
+         * INC/DEC r32 opcodes and must fall through to the opcode decoder. */
+        if (!s.mode32 && b >= 0x40 && b <= 0x4f) {
             s.rex_present = 1;
             s.rex = b;
             s.rex_w = (b >> 3) & 1;
@@ -566,7 +675,10 @@ int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out)
         s.p++;
     }
 prefixes_done:
-    out->addrsize = s.has_67 ? 4 : 8;
+    /* 0x67 swaps the mode's default address size for the other size that mode
+     * can name: 64 <-> 32 in long mode, 32 <-> 16 in 32-bit mode. */
+    out->addrsize = s.mode32 ? (s.has_67 ? 2 : 4) : (s.has_67 ? 4 : 8);
+    s.addr16 = (out->addrsize == 2);
     out->seg = (uint8_t)s.seg;
     out->lock = (uint8_t)(s.has_f0 ? 1 : 0);
     out->rep = (uint8_t)OCERZ_REP_NONE;
@@ -610,7 +722,9 @@ prefixes_done:
 static int group1(DecState *s, uint8_t op)
 {
     ModRM m;
-    int byte_form = (op == 0x80);
+    /* 0x82 is the i386-only alias of 0x80 and is byte-form for the same
+     * reason; it can only get here from the mode32-guarded i386 dispatch. */
+    int byte_form = (op == 0x80 || op == 0x82);
     int size = byte_form ? 1 : opsize_default(s);
     int e = decode_modrm(s, &m, size);
     if (e)
@@ -622,7 +736,7 @@ static int group1(DecState *s, uint8_t op)
         place_rm8(s, &m, &s->out->ops[0]);
     else
         place_rm(s, &m, &s->out->ops[0], size, 1);
-    if (op == 0x80)
+    if (op == 0x80 || op == 0x82)
         return read_imm8s(s, &s->out->ops[1], 1);
     if (op == 0x83)
         return read_imm8s(s, &s->out->ops[1], size);
@@ -741,24 +855,30 @@ static int group45(DecState *s, uint8_t op)
         s->out->nops = 1;
         place_rm(s, &m, &s->out->ops[0], size, 1);
         return OCERZ_OK;
-    case 2:
+    case 2: {
+        int bsize = opsize_nearbranch(s);
         set_op(s, OCERZ_OP_CALL);
-        s->out->opsize = 8;
+        s->out->opsize = (uint8_t)bsize;
         s->out->nops = 1;
-        place_rm(s, &m, &s->out->ops[0], 8, 1);
+        place_rm(s, &m, &s->out->ops[0], bsize, 1);
         return OCERZ_OK;
-    case 4:
+    }
+    case 4: {
+        int bsize = opsize_nearbranch(s);
         set_op(s, OCERZ_OP_JMP);
-        s->out->opsize = 8;
+        s->out->opsize = (uint8_t)bsize;
         s->out->nops = 1;
-        place_rm(s, &m, &s->out->ops[0], 8, 1);
+        place_rm(s, &m, &s->out->ops[0], bsize, 1);
         return OCERZ_OK;
-    case 6:
+    }
+    case 6: {
+        int psize = opsize_stack(s);
         set_op(s, OCERZ_OP_PUSH);
-        s->out->opsize = (uint8_t)opsize_branch(s);
+        s->out->opsize = (uint8_t)psize;
         s->out->nops = 1;
-        place_rm(s, &m, &s->out->ops[0], opsize_branch(s), 1);
+        place_rm(s, &m, &s->out->ops[0], psize, 1);
         return OCERZ_OK;
+    }
     case 3:
     case 5: {
 
@@ -775,9 +895,215 @@ static int group45(DecState *s, uint8_t op)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * The i386-only slice of the one-byte opcode map.
+ *
+ * Every byte handled here is UNDEFINED in long mode, where it falls out of one
+ * of decode_one_byte's OCERZ_EUNDEF returns (0x06..0x37 from the ALU block's,
+ * the rest from the one at the end).  Rather than sprinkle `if (s->mode32)`
+ * through that function -- where a single misplaced test would silently change
+ * 64-bit decode -- the whole i386 slice lives in one function that
+ * decode_one_byte calls only when s->mode32 is set.  In 64-bit mode nothing
+ * below runs at all, which is what makes the decodiff gate hold by
+ * construction rather than by inspection.
+ *
+ * *handled is set for every byte this function owns, including the forms that
+ * are architecturally invalid (BOUND/LES/LDS with a register r/m): those must
+ * report OCERZ_EUNDEF from here, not fall through to a generic path.
+ *
+ * Two representational notes, both forced by the existing X86Operand vocabulary:
+ *
+ *  - There is no OCERZ_OPK_SREG.  OCERZ_OP_MOVSEG (0x8e) already encodes its
+ *    destination segment register as an OCERZ_OPK_IMM of size 1 holding the
+ *    sreg index, and PUSHSEG/POPSEG follow that exact convention.  The width
+ *    actually moved on the stack is in insn.opsize, not in the operand.
+ *
+ *  - LES/LDS load a far pointer, so the memory operand is sized 2+opsize (6
+ *    bytes for the 32-bit form, 4 for the 0x66 form).  capstone reports 4 for
+ *    both and prints no size keyword at all, which is capstone declining to
+ *    model m16:32 rather than a fact about the ISA; the SDM width is used here.
+ * ------------------------------------------------------------------------- */
+static int decode_i386_only(DecState *s, uint8_t op, int *handled)
+{
+    int e;
+
+    *handled = 1;
+
+    /* 0x40-0x4f: INC/DEC r32.  These bytes are REX in long mode, and the
+     * prefix loop only strips them there, so they arrive here intact. */
+    if (op >= 0x40 && op <= 0x4f) {
+        int size = opsize_default(s);
+        set_op(s, (op < 0x48) ? OCERZ_OP_INC : OCERZ_OP_DEC);
+        s->out->opsize = (uint8_t)size;
+        s->out->nops = 1;
+        set_reg(&s->out->ops[0], op & 7, size);
+        return OCERZ_OK;
+    }
+
+    switch (op) {
+
+    /* Segment PUSH/POP.  0x0f is the two-byte escape, so there is no POP CS
+     * in the map; ES/SS/DS have both directions and CS only PUSH. */
+    case 0x06: case 0x0e: case 0x16: case 0x1e:
+    case 0x07:            case 0x17: case 0x1f: {
+        static const uint8_t sreg_of[4] = {
+            OCERZ_SREG_ES, OCERZ_SREG_CS, OCERZ_SREG_SS, OCERZ_SREG_DS,
+        };
+        int is_pop = (op & 1);
+        set_op(s, is_pop ? OCERZ_OP_POPSEG : OCERZ_OP_PUSHSEG);
+        s->out->opsize = (uint8_t)opsize_stack(s);
+        s->out->nops = 1;
+        set_imm(&s->out->ops[0], sreg_of[(op >> 3) & 3], 1);
+        return OCERZ_OK;
+    }
+
+    /* Packed-BCD / ASCII adjust.  All operate implicitly on AL (DAA/DAS) or
+     * AX (AAA/AAS) and carry no encoded operand; opsize records which. */
+    case 0x27:
+        set_op(s, OCERZ_OP_DAA);
+        s->out->opsize = 1;
+        s->out->nops = 0;
+        return OCERZ_OK;
+    case 0x2f:
+        set_op(s, OCERZ_OP_DAS);
+        s->out->opsize = 1;
+        s->out->nops = 0;
+        return OCERZ_OK;
+    case 0x37:
+        set_op(s, OCERZ_OP_AAA);
+        s->out->opsize = 2;
+        s->out->nops = 0;
+        return OCERZ_OK;
+    case 0x3f:
+        set_op(s, OCERZ_OP_AAS);
+        s->out->opsize = 2;
+        s->out->nops = 0;
+        return OCERZ_OK;
+
+    /* PUSHA/POPA.  No operands: the register set is implicit.  opsize is the
+     * per-register stack slot, so 0x66 gives the PUSHAW/POPAW forms. */
+    case 0x60:
+        set_op(s, OCERZ_OP_PUSHA);
+        s->out->opsize = (uint8_t)opsize_stack(s);
+        s->out->nops = 0;
+        return OCERZ_OK;
+    case 0x61:
+        set_op(s, OCERZ_OP_POPA);
+        s->out->opsize = (uint8_t)opsize_stack(s);
+        s->out->nops = 0;
+        return OCERZ_OK;
+
+    /* BOUND r32, m32&32.  The memory operand is the *pair* of bounds, so it is
+     * twice the operand size; a register r/m is undefined. */
+    case 0x62: {
+        ModRM m;
+        int size = opsize_default(s);
+        e = decode_modrm(s, &m, size * 2);
+        if (e)
+            return e;
+        if (rm_is_reg(&m))
+            return OCERZ_EUNDEF;
+        set_op(s, OCERZ_OP_BOUND);
+        s->out->opsize = (uint8_t)size;
+        s->out->nops = 2;
+        set_reg(&s->out->ops[0], m.reg, size);
+        place_rm(s, &m, &s->out->ops[1], size * 2, 1);
+        return OCERZ_OK;
+    }
+
+    /* 0x82 is an undocumented-but-real alias of 0x80: group-1 ALU on a byte
+     * r/m with an imm8.  group1() is told about it there rather than here so
+     * the two opcodes cannot drift apart. */
+    case 0x82:
+        return group1(s, op);
+
+    /* Direct far CALL/JMP, ptr16:32.  The encoding is offset-then-selector,
+     * but the operands are recorded selector-first to match how a far pointer
+     * reads (and prints) as seg:off.  This is the only CALLF/JMPF form with
+     * two operands -- the 0xff /3 and /5 forms carry a single memory operand
+     * -- so a consumer can tell them apart on nops alone. */
+    case 0x9a:
+    case 0xea: {
+        int size = opsize_default(s);
+        X86Operand off, sel;
+        e = read_imm_sized(s, &off, size);
+        if (e)
+            return e;
+        e = read_imm16(s, &sel);
+        if (e)
+            return e;
+        set_op(s, (op == 0x9a) ? OCERZ_OP_CALLF : OCERZ_OP_JMPF);
+        s->out->opsize = (uint8_t)size;
+        s->out->nops = 2;
+        s->out->ops[0] = sel;
+        s->out->ops[1] = off;
+        return OCERZ_OK;
+    }
+
+    /* LES/LDS r32, m16:32.  A register r/m is undefined. */
+    case 0xc4:
+    case 0xc5: {
+        ModRM m;
+        int size = opsize_default(s);
+        e = decode_modrm(s, &m, size + 2);
+        if (e)
+            return e;
+        if (rm_is_reg(&m))
+            return OCERZ_EUNDEF;
+        set_op(s, (op == 0xc4) ? OCERZ_OP_LES : OCERZ_OP_LDS);
+        s->out->opsize = (uint8_t)size;
+        s->out->nops = 2;
+        set_reg(&s->out->ops[0], m.reg, size);
+        place_rm(s, &m, &s->out->ops[1], size + 2, 1);
+        return OCERZ_OK;
+    }
+
+    case 0xce:
+        set_op(s, OCERZ_OP_INTO);
+        s->out->nops = 0;
+        return OCERZ_OK;
+
+    /* AAM/AAD take an imm8 base -- 10 in every encoding a compiler emits, but
+     * the byte is part of the instruction and any value is legal. */
+    case 0xd4:
+    case 0xd5: {
+        set_op(s, (op == 0xd4) ? OCERZ_OP_AAM : OCERZ_OP_AAD);
+        s->out->opsize = 2;
+        s->out->nops = 1;
+        uint8_t b;
+        e = fetch8(s, &b);
+        if (e)
+            return e;
+        set_imm(&s->out->ops[0], b, 1);
+        return OCERZ_OK;
+    }
+
+    /* SALC: set AL to 0xff if CF else 0.  Undocumented but universally
+     * implemented, and it does appear in hand-written 32-bit code. */
+    case 0xd6:
+        set_op(s, OCERZ_OP_SALC);
+        s->out->opsize = 1;
+        s->out->nops = 0;
+        return OCERZ_OK;
+    }
+
+    *handled = 0;
+    return OCERZ_EUNDEF;
+}
+
 static int decode_one_byte(DecState *s, uint8_t op)
 {
     int e;
+
+    /* The i386-only slice of the map.  Guarded so that in long mode not one
+     * byte of behaviour below is reachable through a different path than it
+     * was before. */
+    if (s->mode32) {
+        int handled = 0;
+        e = decode_i386_only(s, op, &handled);
+        if (handled)
+            return e;
+    }
 
     if (op <= 0x3d) {
         int hi = op >> 3;
@@ -803,7 +1129,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
 
     if (op >= 0x50 && op <= 0x57) {
         int reg = (op - 0x50) | (s->rex_b ? 8 : 0);
-        int size = opsize_branch(s);
+        int size = opsize_stack(s);
         set_op(s, OCERZ_OP_PUSH);
         s->out->opsize = (uint8_t)size;
         s->out->nops = 1;
@@ -812,7 +1138,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
     }
     if (op >= 0x58 && op <= 0x5f) {
         int reg = (op - 0x58) | (s->rex_b ? 8 : 0);
-        int size = opsize_branch(s);
+        int size = opsize_stack(s);
         set_op(s, OCERZ_OP_POP);
         s->out->opsize = (uint8_t)size;
         s->out->nops = 1;
@@ -835,14 +1161,14 @@ static int decode_one_byte(DecState *s, uint8_t op)
         return OCERZ_OK;
     }
     case 0x68: {
-        int size = opsize_branch(s);
+        int size = opsize_stack(s);
         set_op(s, OCERZ_OP_PUSH);
         s->out->opsize = (uint8_t)size;
         s->out->nops = 1;
         return read_imm_sized(s, &s->out->ops[0], size);
     }
     case 0x6a: {
-        int size = opsize_branch(s);
+        int size = opsize_stack(s);
         set_op(s, OCERZ_OP_PUSH);
         s->out->opsize = (uint8_t)size;
         s->out->nops = 1;
@@ -994,7 +1320,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
     }
     case 0x8f: {
         ModRM m;
-        int size = opsize_branch(s);
+        int size = opsize_stack(s);
         e = decode_modrm(s, &m, size);
         if (e)
             return e;
@@ -1060,12 +1386,12 @@ static int decode_one_byte(DecState *s, uint8_t op)
         return OCERZ_OK;
     case 0x9c:
         set_op(s, OCERZ_OP_PUSHF);
-        s->out->opsize = 8;
+        s->out->opsize = (uint8_t)opsize_stack_implicit(s);
         s->out->nops = 0;
         return OCERZ_OK;
     case 0x9d:
         set_op(s, OCERZ_OP_POPF);
-        s->out->opsize = 8;
+        s->out->opsize = (uint8_t)opsize_stack_implicit(s);
         s->out->nops = 0;
         return OCERZ_OK;
     case 0x9e:
@@ -1084,7 +1410,8 @@ static int decode_one_byte(DecState *s, uint8_t op)
         int size = byte_form ? 1 : opsize_default(s);
         int store = (op == 0xa2 || op == 0xa3);
         uint64_t off;
-        if (s->out->addrsize == 4) { uint32_t o32; e = fetch32(s, &o32); off = o32; }
+        if (s->out->addrsize == 2) { uint16_t o16; e = fetch16(s, &o16); off = o16; }
+        else if (s->out->addrsize == 4) { uint32_t o32; e = fetch32(s, &o32); off = o32; }
         else e = fetch64(s, &off);
         if (e)
             return e;
@@ -1213,7 +1540,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
         return group2(s, op);
     case 0xc2: {
         set_op(s, OCERZ_OP_RET);
-        s->out->opsize = 8;
+        s->out->opsize = (uint8_t)opsize_stack_implicit(s);
         s->out->nops = 1;
         uint16_t w;
         e = fetch16(s, &w);
@@ -1224,7 +1551,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
     }
     case 0xc3:
         set_op(s, OCERZ_OP_RET);
-        s->out->opsize = 8;
+        s->out->opsize = (uint8_t)opsize_stack_implicit(s);
         s->out->nops = 0;
         return OCERZ_OK;
     case 0xca:
@@ -1265,7 +1592,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
     }
     case 0xc9:
         set_op(s, OCERZ_OP_LEAVE);
-        s->out->opsize = 8;
+        s->out->opsize = (uint8_t)opsize_stack_implicit(s);
         s->out->nops = 0;
         return OCERZ_OK;
     case 0xcc:
@@ -1435,14 +1762,20 @@ static int decode_0f(DecState *s, uint8_t op2)
         int grpreg = (modrm >> 3) & 7;
         if (modrm < 0xc0 && (grpreg == 0 || grpreg == 1)) {
             ModRM m;
+            /* The pseudo-descriptor SGDT/SIDT stores is 2 bytes of limit plus
+             * one base: 4 bytes of it in 32-bit mode, 8 in long mode.  So the
+             * destination is 6 bytes wide here and 10 there, and the operand
+             * size prefix does not change either (SDM Vol.2, SGDT).  The 10
+             * is HEAD's literal, kept as the 64-bit arm untouched. */
+            int psize = s->mode32 ? 6 : 10;
             s->p -= 1;
-            e = decode_modrm(s, &m, 10);
+            e = decode_modrm(s, &m, psize);
             if (e)
                 return e;
             set_op(s, grpreg == 0 ? OCERZ_OP_SGDT : OCERZ_OP_SIDT);
             s->out->nops = 1;
             s->out->ops[0] = m.mem;
-            s->out->ops[0].size = 10;
+            s->out->ops[0].size = (uint8_t)psize;
             return OCERZ_OK;
         }
         s->out->nops = 0;
@@ -3290,6 +3623,29 @@ static void init_op_names(void)
     op_names[OCERZ_OP_AESIMC] = "aesimc";
     op_names[OCERZ_OP_AESKEYGENASSIST] = "aeskeygenassist";
     op_names[OCERZ_OP_PCLMULQDQ] = "pclmulqdq";
+
+    op_names[OCERZ_OP_PUSHA] = "pusha";
+    op_names[OCERZ_OP_POPA] = "popa";
+    op_names[OCERZ_OP_PUSHSEG] = "push_sreg";
+    op_names[OCERZ_OP_POPSEG] = "pop_sreg";
+    op_names[OCERZ_OP_DAA] = "daa";
+    op_names[OCERZ_OP_DAS] = "das";
+    op_names[OCERZ_OP_AAA] = "aaa";
+    op_names[OCERZ_OP_AAS] = "aas";
+    op_names[OCERZ_OP_AAM] = "aam";
+    op_names[OCERZ_OP_AAD] = "aad";
+    op_names[OCERZ_OP_BOUND] = "bound";
+    op_names[OCERZ_OP_LES] = "les";
+    op_names[OCERZ_OP_LDS] = "lds";
+    op_names[OCERZ_OP_INTO] = "into";
+    op_names[OCERZ_OP_SALC] = "salc";
+}
+
+/* The 64-bit entry point.  Bit-for-bit what it has always been: every seam
+ * above collapses to HEAD's constant when mode32 is 0. */
+int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out)
+{
+    return ocerz_decode_mode(code, avail, rip, out, 0);
 }
 
 const char *ocerz_op_name(unsigned op)
@@ -3369,16 +3725,20 @@ static void fmt_mem(char *b, size_t cap, size_t *n, const X86Insn *insn, const X
     written = snprintf(b + *n, cap > *n ? cap - *n : 0, "%s %s[", size_kw(op->size), seg);
     if (written > 0)
         *n += (size_t)written;
+    /* Address registers print at the address size, but only in 32-bit mode:
+     * 64-bit output stays exactly as it has always been, rax-names even under
+     * a 0x67 prefix. */
+    int aw = insn->mode32 ? insn->addrsize : 8;
     int any = 0;
     if (op->base != OCERZ_REG_NONE) {
-        written = snprintf(b + *n, cap > *n ? cap - *n : 0, "%s", gpr_name(op->base, 8, 0));
+        written = snprintf(b + *n, cap > *n ? cap - *n : 0, "%s", gpr_name(op->base, aw, 0));
         if (written > 0)
             *n += (size_t)written;
         any = 1;
     }
     if (op->index != OCERZ_REG_NONE) {
         written = snprintf(b + *n, cap > *n ? cap - *n : 0, "%s%s*%d", any ? "+" : "",
-                           gpr_name(op->index, 8, 0), 1 << op->scale);
+                           gpr_name(op->index, aw, 0), 1 << op->scale);
         if (written > 0)
             *n += (size_t)written;
         any = 1;

@@ -2218,9 +2218,13 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
             }
             fprintf(stderr, "\nocerz: %llu instructions executed\n",
                     (unsigned long long)vm->insn_count);
-            /* A 32-bit mode entry can strike on a secondary thread; leaving
-             * the process half-alive wedges the guest's parent, which waits
-             * for the child forever.  Die as a process so wine can move on. */
+            /* A fatal in 32-bit guest code usually lands on a WoW64 thread,
+             * and leaving the process half-alive wedges the guest's parent,
+             * which waits for the child forever.  Die as a process so wine can
+             * move on.  (This test used to mean "a 32-bit mode entry, which we
+             * could not execute, just happened"; now that the interpreter does
+             * execute 32-bit code, cpu->mode32 means the thread was IN 32-bit
+             * code when it died, and the same reasoning applies.) */
             if (cpu->mode32)
                 exit(125);
             g_sig_recover = prev_recover;

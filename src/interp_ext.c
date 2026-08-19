@@ -7,10 +7,18 @@
 #include <math.h>
 #include <mach/mach_time.h>
 
+/* String ops count in rCX and step rSI/rDI at the ADDRESS size: RCX/RSI/RDI at
+ * 8, ECX/ESI/EDI at 4, CX/SI/DI at 2.  The 2 case is 32-bit mode with a 0x67
+ * prefix and cannot arise in long mode, where addrsize is only ever 8 or 4;
+ * the 8 and 4 arms are untouched.  Note that a 16-bit step writes back only
+ * the low half of the register, which is why it goes through ocerz_write_gpr
+ * rather than assigning the slot. */
 static uint64_t ext_rcx_read(const OcerzCPU *cpu, const X86Insn *insn)
 {
     if (insn->addrsize == 4)
         return (uint32_t)cpu->gpr[OCERZ_RCX];
+    if (insn->addrsize == 2)
+        return (uint16_t)cpu->gpr[OCERZ_RCX];
     return cpu->gpr[OCERZ_RCX];
 }
 
@@ -18,6 +26,8 @@ static void ext_rcx_write(OcerzCPU *cpu, const X86Insn *insn, uint64_t v)
 {
     if (insn->addrsize == 4)
         cpu->gpr[OCERZ_RCX] = (uint32_t)v;
+    else if (insn->addrsize == 2)
+        ocerz_write_gpr(cpu, OCERZ_RCX, 2, 0, v);
     else
         cpu->gpr[OCERZ_RCX] = v;
 }
@@ -26,6 +36,8 @@ static uint64_t ext_ptr_read(const OcerzCPU *cpu, const X86Insn *insn, unsigned 
 {
     if (insn->addrsize == 4)
         return (uint32_t)cpu->gpr[reg];
+    if (insn->addrsize == 2)
+        return (uint16_t)cpu->gpr[reg];
     return cpu->gpr[reg];
 }
 
@@ -33,6 +45,8 @@ static void ext_ptr_write(OcerzCPU *cpu, const X86Insn *insn, unsigned reg, uint
 {
     if (insn->addrsize == 4)
         cpu->gpr[reg] = (uint32_t)v;
+    else if (insn->addrsize == 2)
+        ocerz_write_gpr(cpu, reg, 2, 0, v);
     else
         cpu->gpr[reg] = v;
 }

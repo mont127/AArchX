@@ -21,6 +21,8 @@ static inline uint64_t ocerz_ea(const OcerzCPU *cpu, const X86Insn *insn, const 
             a += cpu->gpr[op->index] << op->scale;
         if (insn->addrsize == 4)
             a = (uint32_t)a;
+        else if (insn->addrsize == 2)
+            a = (uint16_t)a;   /* 32-bit mode + 0x67; addrsize is never 2 in long mode */
     }
     if (insn->seg == OCERZ_SEG_FS)
         a += cpu->fs_base;
@@ -104,18 +106,39 @@ static inline void ocerz_write_op128(OcerzCPU *cpu, const X86Insn *insn, const X
         ocerz_st(ocerz_ea(cpu, insn, op), op->size, v.lo);
 }
 
-static inline void ocerz_push(OcerzCPU *cpu, int size, uint64_t v)
+/* The stack pointer is RSP in long mode and ESP in i386 mode, so in 32-bit
+ * mode every update wraps at 32 bits instead of 64.  The mode comes from the
+ * decoded instruction, never from a test inside the emitted code.
+ *
+ * ocerz_push()/ocerz_pop() keep their exact 64-bit behaviour by delegating
+ * with mode32 = 0; nothing that calls them today changes. */
+static inline uint64_t ocerz_stack_wrap(uint64_t sp, int mode32)
 {
-    uint64_t sp = cpu->gpr[OCERZ_RSP] - (uint64_t)size;
+    return mode32 ? (uint32_t)sp : sp;
+}
+
+static inline void ocerz_push_mode(OcerzCPU *cpu, int size, uint64_t v, int mode32)
+{
+    uint64_t sp = ocerz_stack_wrap(cpu->gpr[OCERZ_RSP] - (uint64_t)size, mode32);
     ocerz_st(sp, size, v);
     cpu->gpr[OCERZ_RSP] = sp;
 }
 
-static inline uint64_t ocerz_pop(OcerzCPU *cpu, int size)
+static inline uint64_t ocerz_pop_mode(OcerzCPU *cpu, int size, int mode32)
 {
     uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RSP], size);
-    cpu->gpr[OCERZ_RSP] += (uint64_t)size;
+    cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(cpu->gpr[OCERZ_RSP] + (uint64_t)size, mode32);
     return v;
+}
+
+static inline void ocerz_push(OcerzCPU *cpu, int size, uint64_t v)
+{
+    ocerz_push_mode(cpu, size, v, 0);
+}
+
+static inline uint64_t ocerz_pop(OcerzCPU *cpu, int size)
+{
+    return ocerz_pop_mode(cpu, size, 0);
 }
 
 int ocerz_unimpl(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn, const char *why);

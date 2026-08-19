@@ -7,8 +7,15 @@
 #include "ocerz/dyld.h"
 #include <stdlib.h>
 
-static int ocerz_mode32_unsupported(OcerzVM *vm, OcerzCPU *cpu, uint32_t sel,
-                                    uint64_t target, const char *how);
+static int far_transfer(OcerzCPU *cpu, uint32_t sel, uint64_t off);
+
+/* Reading order for the whole i386 slice of this file: the CPU never asks
+ * "am I in 32-bit mode?" at run time.  Every decoded instruction carries the
+ * mode it was decoded in (insn->mode32), the decoder has already given every
+ * operand and every implicit stack slot its 32-bit width, and the handlers
+ * below just use those widths.  In long mode insn->mode32 is 0 and each of the
+ * expressions added here collapses to the constant that was written there
+ * before, which is why none of the 64-bit unit tests move. */
 
 static void dump_raw_bytes(FILE *out, uint64_t rip, unsigned len)
 {
@@ -77,6 +84,8 @@ static uint64_t lea_addr(const OcerzCPU *cpu, const X86Insn *insn, const X86Oper
         a += cpu->gpr[op->index] << op->scale;
     if (insn->addrsize == 4)
         a = (uint32_t)a;
+    else if (insn->addrsize == 2)
+        a = (uint16_t)a;   /* 32-bit mode + 0x67; addrsize is never 2 in long mode */
     return a;
 }
 
@@ -640,7 +649,7 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_PUSH: {
         int size = insn->opsize;
         uint64_t v = ocerz_read_op(cpu, insn, &insn->ops[0]);
-        ocerz_push(cpu, size, v);
+        ocerz_push_mode(cpu, size, v, insn->mode32);
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_POP: {
@@ -648,15 +657,22 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         int size = insn->opsize;
         uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RSP], size);
         ocerz_write_op(cpu, insn, &insn->ops[0], v);
+        /* POP ESP takes its new value from the slot, not from the adjustment. */
         if (!(insn->ops[0].kind == OCERZ_OPK_REG && insn->ops[0].reg == OCERZ_RSP))
-            cpu->gpr[OCERZ_RSP] += (uint64_t)size;
+            cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(cpu->gpr[OCERZ_RSP] + (uint64_t)size,
+                                                   insn->mode32);
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_PUSHF:
-        ocerz_push(cpu, 8, cpu->rflags);
+        /* opsize is 8 in long mode -- the decoder still hard-codes it there --
+         * and 4 (2 under 0x66) in i386 mode. */
+        ocerz_push_mode(cpu, insn->opsize ? insn->opsize : 8, cpu->rflags, insn->mode32);
         return OCERZ_STEP_OK;
     case OCERZ_OP_POPF: {
-        uint64_t v = ocerz_pop(cpu, 8);
+        uint64_t v = ocerz_pop_mode(cpu, insn->opsize ? insn->opsize : 8, insn->mode32);
+        /* Every writable bit lives below bit 12, so POPFW and POPFD restore
+         * the same set here; only the number of stack bytes consumed differs,
+         * and that came from opsize above. */
         uint64_t writable = OCERZ_CF | OCERZ_PF | OCERZ_AF | OCERZ_ZF | OCERZ_SF |
                             OCERZ_TF | OCERZ_DF | OCERZ_OF;
         cpu->rflags = (v & writable) | OCERZ_FLAG_FIXED1 | OCERZ_IF;
@@ -675,10 +691,16 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_LEAVE: {
-
-        uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RBP], 8);
-        cpu->gpr[OCERZ_RSP] = cpu->gpr[OCERZ_RBP] + 8;
-        cpu->gpr[OCERZ_RBP] = v;
+        /* SDM: the STACK ADDRESS size moves the whole of ESP/RSP from EBP/RBP,
+         * while the OPERAND size decides how much of EBP/RBP the pop rewrites.
+         * The two only differ for the 0x66 form in 32-bit mode, where ESP is
+         * still set in full but only BP is popped. */
+        int m32 = insn->mode32;
+        int size = insn->opsize ? insn->opsize : 8;
+        uint64_t bp = m32 ? (uint32_t)cpu->gpr[OCERZ_RBP] : cpu->gpr[OCERZ_RBP];
+        uint64_t v = ocerz_ld(bp, size);
+        cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(bp + (uint64_t)size, m32);
+        ocerz_write_gpr(cpu, OCERZ_RBP, size, 0, v);
         return OCERZ_STEP_OK;
     }
     default:
@@ -734,7 +756,11 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             cpu->rip = insn->ops[0].imm;
         return OCERZ_STEP_OK;
     case OCERZ_OP_JRCXZ: {
-        uint64_t c = (insn->addrsize == 4) ? (uint32_t)cpu->gpr[OCERZ_RCX] : cpu->gpr[OCERZ_RCX];
+        uint64_t c = cpu->gpr[OCERZ_RCX];
+        if (insn->addrsize == 4)
+            c = (uint32_t)c;
+        else if (insn->addrsize == 2)
+            c = (uint16_t)c;   /* JCXZ: 0x67 in 32-bit mode */
         if (c == 0)
             cpu->rip = insn->ops[0].imm;
         return OCERZ_STEP_OK;
@@ -747,6 +773,10 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             c = (uint32_t)cpu->gpr[OCERZ_RCX] - 1;
             ocerz_write_gpr(cpu, OCERZ_RCX, 4, 0, c);
             c = (uint32_t)c;
+        } else if (insn->addrsize == 2) {
+            /* LOOPW: only CX counts and only CX is written back. */
+            c = (uint16_t)((uint16_t)cpu->gpr[OCERZ_RCX] - 1);
+            ocerz_write_gpr(cpu, OCERZ_RCX, 2, 0, c);
         } else {
             c = cpu->gpr[OCERZ_RCX] - 1;
             cpu->gpr[OCERZ_RCX] = c;
@@ -770,14 +800,18 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             if (ocerz_cftrap_on && target - 0x7ff840000000ull < 0x10000000ull)
                 ocerz_cftrap(cpu, insn->rip, target, "call");
         }
-        ocerz_push(cpu, 8, cpu->rip);
+        /* opsize is the near-branch width: 8 in long mode (forced, 0x66
+         * ignored), 4 or 2 in i386 mode. */
+        ocerz_push_mode(cpu, insn->opsize ? insn->opsize : 8, cpu->rip, insn->mode32);
         cpu->rip = target;
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_RET: {
-        uint64_t ret = ocerz_pop(cpu, 8);
+        int size = insn->opsize ? insn->opsize : 8;
+        uint64_t ret = ocerz_pop_mode(cpu, size, insn->mode32);
         if (insn->nops == 1)
-            cpu->gpr[OCERZ_RSP] += ocerz_trunc(insn->ops[0].imm, 2);
+            cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(
+                cpu->gpr[OCERZ_RSP] + ocerz_trunc(insn->ops[0].imm, 2), insn->mode32);
         cpu->rip = ret;
         return OCERZ_STEP_OK;
     }
@@ -792,42 +826,50 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             else if (seg == 5)
                 cpu->gs_base = base;
         }
+        if (seg < 6)
+            cpu->seg_sel[seg] = (uint16_t)sel;
         if (seg == 1)
             cpu->cs_sel = (uint16_t)sel;
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_JMPF:
     case OCERZ_OP_CALLF: {
-
+        /* Stack slots stay 8 bytes wide in long mode: that is what this path
+         * has always pushed and what the 64-bit tests pin.  In i386 mode the
+         * selector and the return offset each take one operand-size slot. */
+        int m32 = insn->mode32;
         int sz = insn->opsize ? insn->opsize : 4;
-        uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
-        uint64_t off = ocerz_ld(ea, sz);
-        uint32_t sel = (uint32_t)ocerz_ld(ea + (uint64_t)sz, 2);
-        if (ocerz_ldt_is_big(sel))
-            return ocerz_mode32_unsupported(vm, cpu, sel, off, "far jump/call");
-        if (insn->op == OCERZ_OP_CALLF) {
-            ocerz_push(cpu, 8, cpu->cs_sel);
-            ocerz_push(cpu, 8, insn->rip + insn->len);
+        int ssz = m32 ? sz : 8;
+        uint64_t off;
+        uint32_t sel;
+        if (insn->nops == 2) {
+            /* ptr16:32 direct form (0x9a / 0xea), i386 only.  The decoder
+             * records it selector-first; the encoding is offset-first. */
+            sel = (uint32_t)insn->ops[0].imm;
+            off = ocerz_trunc(insn->ops[1].imm, sz);
+        } else {
+            uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
+            off = ocerz_ld(ea, sz);
+            sel = (uint32_t)ocerz_ld(ea + (uint64_t)sz, 2);
         }
-        cpu->cs_sel = (uint16_t)sel;
-        cpu->rip = off;
-        return OCERZ_STEP_OK;
+        if (insn->op == OCERZ_OP_CALLF) {
+            ocerz_push_mode(cpu, ssz, cpu->cs_sel, m32);
+            ocerz_push_mode(cpu, ssz, insn->rip + insn->len, m32);
+        }
+        return far_transfer(cpu, sel, off);
     }
     case OCERZ_OP_RETF: {
-
-        int sz = insn->opsize ? insn->opsize : 8;
-        uint64_t off = ocerz_pop(cpu, 8);
-        uint32_t sel = (uint32_t)ocerz_pop(cpu, 8);
-        (void)sz;
+        int m32 = insn->mode32;
+        int ssz = m32 ? (insn->opsize ? insn->opsize : 4) : 8;
+        uint64_t off = ocerz_pop_mode(cpu, ssz, m32);
+        uint32_t sel = (uint32_t)ocerz_pop_mode(cpu, ssz, m32);
         if (insn->nops == 1)
-            cpu->gpr[OCERZ_RSP] += ocerz_trunc(insn->ops[0].imm, 2);
-        if (ocerz_ldt_is_big(sel))
-            return ocerz_mode32_unsupported(vm, cpu, sel, off, "far return");
-        cpu->cs_sel = (uint16_t)sel;
-        cpu->rip = off;
-        return OCERZ_STEP_OK;
+            cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(
+                cpu->gpr[OCERZ_RSP] + ocerz_trunc(insn->ops[0].imm, 2), m32);
+        return far_transfer(cpu, sel, off);
     }
     case OCERZ_OP_IRET: {
+        int m32 = insn->mode32;
         int sz = insn->opsize ? insn->opsize : 8;
         uint64_t sp = cpu->gpr[OCERZ_RSP];
         uint64_t rip = ocerz_ld(sp, sz);
@@ -835,34 +877,327 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         uint32_t cs = (uint32_t)ocerz_ld(sp + (uint64_t)sz, sz);
         uint64_t flags = ocerz_ld(sp + (uint64_t)sz * 2, sz);
         uint64_t newsp = ocerz_ld(sp + (uint64_t)sz * 3, sz);
-        if (ocerz_ldt_is_big(cs))
-            return ocerz_mode32_unsupported(vm, cpu, cs, rip, "iret");
-        if (cs)
-            cpu->cs_sel = (uint16_t)cs;
-        cpu->rip = rip;
         cpu->rflags = flags | 0x2;
-        cpu->gpr[OCERZ_RSP] = newsp;
-        return OCERZ_STEP_OK;
+        cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(newsp, m32);
+        /* A zero CS on the stack is not a mode decision, it is a frame this
+         * emulator built itself; keep the current selector and mode. */
+        if (!cs) {
+            cpu->rip = m32 ? (uint32_t)rip : rip;
+            return OCERZ_STEP_OK;
+        }
+        return far_transfer(cpu, cs, rip);
     }
     default:
         return ocerz_unimpl(vm, cpu, insn, "branch");
     }
 }
 
-static int ocerz_mode32_unsupported(OcerzVM *vm, OcerzCPU *cpu, uint32_t sel,
-                                    uint64_t target, const char *how)
+/* Is this code selector a 32-bit one?
+ *
+ * A code descriptor's L bit (53) says 64-bit and its D bit (54) says 32-bit,
+ * and the two are mutually exclusive, so the answer is "L then D".  Everything
+ * this emulator can see about a selector comes from the LDT that the guest
+ * installs through i386_set_ldt: ocerz_ldt_is_big() answers 0 for a GDT
+ * selector and for an absent entry.
+ *
+ * That single fact is what makes mode ENTRY and mode EXIT the same rule read
+ * in opposite directions.  wine's WoW64 thunk far-jumps to an LDT selector it
+ * installed with D=1, which lands here as 1; the 32-bit side far-returns to
+ * the flat 64-bit CS, which is a GDT selector and lands here as 0.  There is
+ * no separate "leave 32-bit mode" path to forget to write, and no way for a
+ * thread to be stranded in 32-bit mode by a transfer that did not name a
+ * 32-bit code segment. */
+static int cs_is_32bit(uint32_t sel)
 {
-    (void)vm;
-    cpu->mode32 = 1;
+    if (ocerz_ldt_is_long(sel))
+        return 0;
+    return ocerz_ldt_is_big(sel) ? 1 : 0;
+}
+
+/* Every far transfer -- JMPF, CALLF, RETF, IRET -- funnels through here, so
+ * the mode, the selector and EIP/RIP can never disagree. */
+static int far_transfer(OcerzCPU *cpu, uint32_t sel, uint64_t off)
+{
+    int to32 = cs_is_32bit(sel);
     cpu->cs_sel = (uint16_t)sel;
-    fprintf(stderr,
-            "ocerz: fatal: 32-bit mode entry via %s -- cs=%#x (LDT index %u, base=%#llx) "
-            "target=%#llx rip=%#llx\n"
-            "ocerz: the WoW64 mode switch is recognised but 32-bit instruction decoding is "
-            "not implemented yet\n",
-            how, sel, sel >> 3, (unsigned long long)ocerz_ldt_base(sel),
-            (unsigned long long)target, (unsigned long long)cpu->rip);
-    return OCERZ_STEP_FATAL;
+    cpu->seg_sel[OCERZ_SREG_CS] = (uint16_t)sel;
+    cpu->mode32 = (uint8_t)to32;
+    /* EIP has 32 significant bits; a stale high half from the 64-bit side must
+     * not survive the switch. */
+    cpu->rip = to32 ? (uint64_t)(uint32_t)off : off;
+    { static int modelog = -1;
+      if (modelog < 0) modelog = getenv("OCERZ_MODELOG") ? 1 : 0;
+      if (modelog)
+          fprintf(stderr, "ocerz: far transfer cs=%#x -> %s eip=%#llx\n",
+                  sel, to32 ? "i386" : "long", (unsigned long long)cpu->rip); }
+    return OCERZ_STEP_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * The i386-only instructions.
+ *
+ * None of these exists in long mode -- the decoder only emits them when it was
+ * called with mode32=1 -- so this whole function is unreachable from 64-bit
+ * execution and nothing above it changes shape to accommodate it.
+ *
+ * The BCD/ASCII adjusts are transcriptions of the SDM Vol.2 pseudocode rather
+ * than reimplementations of what some other emulator does, and where the SDM
+ * says a flag is UNDEFINED this code says so at the site and then does one
+ * specific thing: it leaves that flag alone.  That is both the cheapest choice
+ * and the one that makes a mistaken dependency in guest code fail the same way
+ * on every run instead of intermittently.
+ * ------------------------------------------------------------------------- */
+
+/* AL, AH and AX, spelled once so the adjust handlers read like the SDM. */
+static uint8_t  get_al(const OcerzCPU *cpu) { return (uint8_t)cpu->gpr[OCERZ_RAX]; }
+static uint8_t  get_ah(const OcerzCPU *cpu) { return (uint8_t)(cpu->gpr[OCERZ_RAX] >> 8); }
+static uint16_t get_ax(const OcerzCPU *cpu) { return (uint16_t)cpu->gpr[OCERZ_RAX]; }
+static void set_al(OcerzCPU *cpu, uint8_t v)  { ocerz_write_gpr(cpu, OCERZ_RAX, 1, 0, v); }
+static void set_ah(OcerzCPU *cpu, uint8_t v)  { ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, v); }
+static void set_ax(OcerzCPU *cpu, uint16_t v) { ocerz_write_gpr(cpu, OCERZ_RAX, 2, 0, v); }
+
+/* #BR (BOUND range exceeded, vector 5) and #OF (INTO, vector 4).  Darwin has
+ * no signal that means either one; both are faults, so rip is rewound to the
+ * faulting instruction the way div_trap() does it, and they are reported as
+ * SIGTRAP -- the signal INT3 already uses here for "the guest asked for a
+ * trap".  With no guest handler installed both stay fatal. */
+static int i386_trap(OcerzCPU *cpu, const X86Insn *insn, const char *msg)
+{
+    uint64_t next = cpu->rip;
+    cpu->rip = insn->rip;
+    if (ocerz_signal_deliver(cpu, OCERZ_SIGTRAP, insn->rip, 0, 0))
+        return OCERZ_STEP_REDIRECT;
+    cpu->rip = next;
+    return trap_fatal(insn, msg);
+}
+
+/* PUSHA/POPA move the eight GPRs in the fixed order the SDM gives.  The ESP
+ * slot PUSHA writes holds the value ESP had BEFORE the first push, and the one
+ * POPA reads is discarded: ESP ends where the eight pops leave it, not where
+ * the saved image says. */
+static int op_pusha(OcerzCPU *cpu, const X86Insn *insn)
+{
+    static const uint8_t order[8] = {
+        OCERZ_RAX, OCERZ_RCX, OCERZ_RDX, OCERZ_RBX,
+        OCERZ_RSP, OCERZ_RBP, OCERZ_RSI, OCERZ_RDI,
+    };
+    int size = insn->opsize ? insn->opsize : 4;
+    uint64_t saved_sp = cpu->gpr[OCERZ_RSP];
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = (order[i] == OCERZ_RSP) ? saved_sp : cpu->gpr[order[i]];
+        ocerz_push_mode(cpu, size, v, insn->mode32);
+    }
+    return OCERZ_STEP_OK;
+}
+
+static int op_popa(OcerzCPU *cpu, const X86Insn *insn)
+{
+    static const uint8_t order[8] = {
+        OCERZ_RDI, OCERZ_RSI, OCERZ_RBP, OCERZ_RSP,
+        OCERZ_RBX, OCERZ_RDX, OCERZ_RCX, OCERZ_RAX,
+    };
+    int size = insn->opsize ? insn->opsize : 4;
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = ocerz_pop_mode(cpu, size, insn->mode32);
+        if (order[i] == OCERZ_RSP)
+            continue;   /* the saved ESP image is discarded, per the SDM */
+        ocerz_write_gpr(cpu, order[i], size, 0, v);
+    }
+    return OCERZ_STEP_OK;
+}
+
+static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    switch (insn->op) {
+
+    case OCERZ_OP_PUSHA:
+        return op_pusha(cpu, insn);
+    case OCERZ_OP_POPA:
+        return op_popa(cpu, insn);
+
+    case OCERZ_OP_PUSHSEG: {
+        unsigned seg = (unsigned)insn->ops[0].imm;
+        int size = insn->opsize ? insn->opsize : 4;
+        /* PUSH sreg consumes a whole operand-size slot with the selector
+         * zero-extended into it. */
+        ocerz_push_mode(cpu, size, seg < 6 ? cpu->seg_sel[seg] : 0, insn->mode32);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_POPSEG: {
+        unsigned seg = (unsigned)insn->ops[0].imm;
+        int size = insn->opsize ? insn->opsize : 4;
+        uint32_t sel = (uint32_t)ocerz_pop_mode(cpu, size, insn->mode32);
+        uint64_t base;
+        if (seg < 6)
+            cpu->seg_sel[seg] = (uint16_t)sel;
+        /* FS and GS are the two whose base this emulator applies to addresses,
+         * so loading one has to move the base too -- exactly what MOVSEG does.
+         * ES/SS/DS are flat here and carry no base. */
+        base = ocerz_ldt_base(sel);
+        if (base) {
+            if (seg == OCERZ_SREG_FS)
+                cpu->fs_base = base;
+            else if (seg == OCERZ_SREG_GS)
+                cpu->gs_base = base;
+        }
+        return OCERZ_STEP_OK;
+    }
+
+    /* DAA.  SDM: CF and AF as computed below, SF/ZF/PF from the result, OF
+     * UNDEFINED -- left untouched. */
+    case OCERZ_OP_DAA: {
+        uint8_t old_al = get_al(cpu);
+        int old_cf = (cpu->rflags & OCERZ_CF) != 0;
+        uint8_t al = old_al;
+        int carry;
+        ocerz_flag_assign(cpu, OCERZ_CF, 0);
+        if ((al & 0x0f) > 9 || (cpu->rflags & OCERZ_AF)) {
+            unsigned t = (unsigned)al + 6;
+            al = (uint8_t)t;
+            carry = old_cf || (t > 0xff);
+            ocerz_flag_assign(cpu, OCERZ_AF, 1);
+        } else {
+            carry = 0;
+            ocerz_flag_assign(cpu, OCERZ_AF, 0);
+        }
+        ocerz_flag_assign(cpu, OCERZ_CF, carry);
+        /* The second test overrides CF in BOTH directions for DAA. */
+        if (old_al > 0x99 || old_cf) {
+            al = (uint8_t)(al + 0x60);
+            ocerz_flag_assign(cpu, OCERZ_CF, 1);
+        } else {
+            ocerz_flag_assign(cpu, OCERZ_CF, 0);
+        }
+        set_al(cpu, al);
+        ocerz_flags_szp(cpu, 1, al);
+        return OCERZ_STEP_OK;
+    }
+
+    /* DAS.  Same shape as DAA with one asymmetry that is in the SDM and is
+     * easy to miss: its second test has no ELSE, so a CF raised by the first
+     * adjustment survives when the second does not fire. */
+    case OCERZ_OP_DAS: {
+        uint8_t old_al = get_al(cpu);
+        int old_cf = (cpu->rflags & OCERZ_CF) != 0;
+        uint8_t al = old_al;
+        ocerz_flag_assign(cpu, OCERZ_CF, 0);
+        if ((al & 0x0f) > 9 || (cpu->rflags & OCERZ_AF)) {
+            int borrow = (al < 6);
+            al = (uint8_t)(al - 6);
+            ocerz_flag_assign(cpu, OCERZ_CF, old_cf || borrow);
+            ocerz_flag_assign(cpu, OCERZ_AF, 1);
+        } else {
+            ocerz_flag_assign(cpu, OCERZ_AF, 0);
+        }
+        if (old_al > 0x99 || old_cf) {
+            al = (uint8_t)(al - 0x60);
+            ocerz_flag_assign(cpu, OCERZ_CF, 1);
+        }
+        set_al(cpu, al);
+        ocerz_flags_szp(cpu, 1, al);   /* OF UNDEFINED: left untouched */
+        return OCERZ_STEP_OK;
+    }
+
+    /* AAA.  SDM: AF and CF defined, OF/SF/ZF/PF UNDEFINED -- all four left
+     * untouched.  The adjustment is written as AX := AX + 0x106 because that
+     * is what the SDM says; it differs from "AL += 6 with wrap, AH += 1" for
+     * AL >= 0xfa, where the carry out of AL reaches AH a second time. */
+    case OCERZ_OP_AAA: {
+        if ((get_al(cpu) & 0x0f) > 9 || (cpu->rflags & OCERZ_AF)) {
+            set_ax(cpu, (uint16_t)(get_ax(cpu) + 0x106));
+            ocerz_flag_assign(cpu, OCERZ_AF, 1);
+            ocerz_flag_assign(cpu, OCERZ_CF, 1);
+        } else {
+            ocerz_flag_assign(cpu, OCERZ_AF, 0);
+            ocerz_flag_assign(cpu, OCERZ_CF, 0);
+        }
+        set_al(cpu, (uint8_t)(get_al(cpu) & 0x0f));
+        return OCERZ_STEP_OK;
+    }
+
+    /* AAS.  SDM: AX := AX - 6 first (so a borrow out of AL already reaches
+     * AH), then AH := AH - 1.  AF/CF defined, OF/SF/ZF/PF UNDEFINED. */
+    case OCERZ_OP_AAS: {
+        if ((get_al(cpu) & 0x0f) > 9 || (cpu->rflags & OCERZ_AF)) {
+            set_ax(cpu, (uint16_t)(get_ax(cpu) - 6));
+            set_ah(cpu, (uint8_t)(get_ah(cpu) - 1));
+            ocerz_flag_assign(cpu, OCERZ_AF, 1);
+            ocerz_flag_assign(cpu, OCERZ_CF, 1);
+        } else {
+            ocerz_flag_assign(cpu, OCERZ_AF, 0);
+            ocerz_flag_assign(cpu, OCERZ_CF, 0);
+        }
+        set_al(cpu, (uint8_t)(get_al(cpu) & 0x0f));
+        return OCERZ_STEP_OK;
+    }
+
+    /* AAM imm8.  A real division, so base 0 raises #DE exactly as DIV does and
+     * goes out through the same delivery path.  SF/ZF/PF follow AL; OF/AF/CF
+     * UNDEFINED and left untouched. */
+    case OCERZ_OP_AAM: {
+        unsigned base = (unsigned)(insn->ops[0].imm & 0xff);
+        uint8_t al;
+        if (base == 0)
+            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "AAM with base 0");
+        al = get_al(cpu);
+        set_ah(cpu, (uint8_t)(al / base));
+        set_al(cpu, (uint8_t)(al % base));
+        ocerz_flags_szp(cpu, 1, get_al(cpu));
+        return OCERZ_STEP_OK;
+    }
+
+    /* AAD imm8.  Cannot fault.  SF/ZF/PF follow AL; OF/AF/CF UNDEFINED. */
+    case OCERZ_OP_AAD: {
+        unsigned base = (unsigned)(insn->ops[0].imm & 0xff);
+        uint8_t al = (uint8_t)(get_al(cpu) + (unsigned)get_ah(cpu) * base);
+        set_ax(cpu, al);   /* AL := result and AH := 0, in one 16-bit write */
+        ocerz_flags_szp(cpu, 1, al);
+        return OCERZ_STEP_OK;
+    }
+
+    /* SALC (0xd6, undocumented): AL := CF ? 0xff : 0.  No flags. */
+    case OCERZ_OP_SALC:
+        set_al(cpu, (cpu->rflags & OCERZ_CF) ? 0xff : 0x00);
+        return OCERZ_STEP_OK;
+
+    /* BOUND r32, m32&32.  SIGNED comparison against a lower bound at m and an
+     * upper bound at m+opsize; in range is a no-op, out of range is #BR.  No
+     * flags are affected either way. */
+    case OCERZ_OP_BOUND: {
+        int size = insn->opsize ? insn->opsize : 4;
+        uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[1]);
+        int64_t idx = ocerz_sext(ocerz_read_op(cpu, insn, &insn->ops[0]), size);
+        int64_t lo = ocerz_sext(ocerz_ld(ea, size), size);
+        int64_t hi = ocerz_sext(ocerz_ld(ea + (uint64_t)size, size), size);
+        if (idx < lo || idx > hi)
+            return i386_trap(cpu, insn, "BOUND range exceeded (#BR)");
+        return OCERZ_STEP_OK;
+    }
+
+    /* INTO: #OF if OF is set, otherwise nothing at all. */
+    case OCERZ_OP_INTO:
+        if (cpu->rflags & OCERZ_OF)
+            return i386_trap(cpu, insn, "INTO with OF set (#OF)");
+        return OCERZ_STEP_OK;
+
+    /* LES/LDS r32, m16:32.  Offset into the register, selector into ES or DS.
+     * Both segments are flat in this emulator, so the selector is recorded and
+     * no base moves; the register load is the part guest code depends on. */
+    case OCERZ_OP_LES:
+    case OCERZ_OP_LDS: {
+        int size = insn->opsize ? insn->opsize : 4;
+        uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[1]);
+        uint64_t off = ocerz_ld(ea, size);
+        uint32_t sel = (uint32_t)ocerz_ld(ea + (uint64_t)size, 2);
+        unsigned seg = (insn->op == OCERZ_OP_LES) ? OCERZ_SREG_ES : OCERZ_SREG_DS;
+        ocerz_write_gpr(cpu, insn->ops[0].reg, size, 0, off);
+        cpu->seg_sel[seg] = (uint16_t)sel;
+        return OCERZ_STEP_OK;
+    }
+
+    default:
+        return ocerz_unimpl(vm, cpu, insn, "i386-only");
+    }
 }
 
 static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
@@ -1167,10 +1502,14 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 
     X86Insn insn;
     const uint8_t *code = (const uint8_t *)ocerz_g2h(cpu->rip);
-    int rc = ocerz_decode(code, 15, cpu->rip, &insn);
+    /* The one place the interpreter chooses a decode mode.  Everything
+     * downstream reads insn.mode32 rather than cpu->mode32, so a decoded
+     * instruction always executes under the mode it was decoded in even if a
+     * far transfer inside it changes the CPU's mode. */
+    int rc = ocerz_decode_mode(code, 15, cpu->rip, &insn, cpu->mode32);
     if (rc != OCERZ_OK) {
-        fprintf(stderr, "ocerz: fatal: decode failed (%d) at rip=%#llx\n  bytes: ",
-                rc, (unsigned long long)cpu->rip);
+        fprintf(stderr, "ocerz: fatal: decode failed (%d, %s mode) at rip=%#llx\n  bytes: ",
+                rc, cpu->mode32 ? "i386" : "long", (unsigned long long)cpu->rip);
         dump_raw_bytes(stderr, cpu->rip, 15);
         fprintf(stderr, "\n  [rsp]=%#llx [rsp+8]=%#llx rbp-ret=%#llx\n",
                 (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8),
@@ -1193,7 +1532,15 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 
     cpu->cur_rip = cpu->rip;
     cpu->rip += insn.len;
-    return ocerz_interp_exec(vm, cpu, &insn);
+    if (insn.mode32)
+        cpu->rip = (uint32_t)cpu->rip;   /* EIP wraps at 32 bits */
+    rc = ocerz_interp_exec(vm, cpu, &insn);
+    /* EIP wrap again after execution, but keyed on the mode the CPU is in NOW:
+     * a far transfer that just left 32-bit mode has already produced a full
+     * 64-bit rip and must not be truncated. */
+    if (cpu->mode32)
+        cpu->rip = (uint32_t)cpu->rip;
+    return rc;
 }
 
 int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restrict insnp)
@@ -1284,6 +1631,25 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
     case OCERZ_OP_CMPXCHG:
     case OCERZ_OP_CMPXCHGXB:
         return op_atomic(vm, cpu, insnp);
+
+    /* i386-only.  Unreachable from 64-bit execution: the decoder leaves every
+     * one of these opcode bytes undefined in long mode. */
+    case OCERZ_OP_PUSHA:
+    case OCERZ_OP_POPA:
+    case OCERZ_OP_PUSHSEG:
+    case OCERZ_OP_POPSEG:
+    case OCERZ_OP_DAA:
+    case OCERZ_OP_DAS:
+    case OCERZ_OP_AAA:
+    case OCERZ_OP_AAS:
+    case OCERZ_OP_AAM:
+    case OCERZ_OP_AAD:
+    case OCERZ_OP_SALC:
+    case OCERZ_OP_BOUND:
+    case OCERZ_OP_INTO:
+    case OCERZ_OP_LES:
+    case OCERZ_OP_LDS:
+        return op_i386(vm, cpu, insnp);
 
     case OCERZ_OP_CLC:
     case OCERZ_OP_STC:
