@@ -1084,7 +1084,8 @@ static int decode_one_byte(DecState *s, uint8_t op)
         int size = byte_form ? 1 : opsize_default(s);
         int store = (op == 0xa2 || op == 0xa3);
         uint64_t off;
-        e = fetch64(s, &off);
+        if (s->out->addrsize == 4) { uint32_t o32; e = fetch32(s, &o32); off = o32; }
+        else e = fetch64(s, &off);
         if (e)
             return e;
         set_op(s, OCERZ_OP_MOV);
