@@ -13,7 +13,9 @@ static void usage(void)
     fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]\n");
 }
 
-char ocerz_cmdline_summary[256];   /* guest argv tail for diagnostics (EXITLOG) */
+
+extern char ocerz_cmdline_summary[256];
+
 int main(int argc, char **argv)
 {
     {
