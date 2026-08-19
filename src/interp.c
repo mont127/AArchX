@@ -4,6 +4,7 @@
 #include "ocerz/vm.h"
 #include "ocerz/syscall.h"
 #include "ocerz/dyldapi.h"
+#include "ocerz/dyld.h"
 #include <stdlib.h>
 
 static int ocerz_mode32_unsupported(OcerzVM *vm, OcerzCPU *cpu, uint32_t sel,
@@ -1002,8 +1003,87 @@ static int op_flagctl(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
+/* OCERZ_EXCLOG helper: slot holds an NSString*; for __NSCFConstantString the
+ * C string pointer is at +0x10 and the length at +0x18.  Returns NULL unless
+ * the result looks like printable ASCII of a sane length. */
+static const char *ocerz_exc_read_cfstr(uint64_t slot, char *out, size_t cap)
+{
+    if (!ocerz_addr_readable(slot)) return NULL;
+    uint64_t obj = ocerz_ld(slot, 8);
+    if (!obj || (obj & 7u) != 0 || !ocerz_addr_readable(obj + 0x18)) return NULL;
+    uint64_t cstr = ocerz_ld(obj + 0x10, 8);
+    uint64_t len  = ocerz_ld(obj + 0x18, 8);
+    if (cstr && len && len < cap &&
+        ocerz_addr_readable(cstr) && ocerz_addr_readable(cstr + len)) {
+        uint64_t i = 0;
+        for (; i < len; i++) {
+            uint64_t c = ocerz_ld(cstr + i, 1);
+            if (c < 0x20 || c > 0x7e) break;
+            out[i] = (char)c;
+        }
+        if (i == len) { out[len] = 0; return out; }
+    }
+    /* inline form: a length byte at +0x10 followed by the characters */
+    if (ocerz_addr_readable(obj + 0x11)) {
+        uint64_t ilen = ocerz_ld(obj + 0x10, 1);
+        if (ilen && ilen < cap && ocerz_addr_readable(obj + 0x11 + ilen)) {
+            uint64_t i = 0;
+            for (; i < ilen; i++) {
+                uint64_t c = ocerz_ld(obj + 0x11 + i, 1);
+                if (c < 0x20 || c > 0x7e) break;
+                out[i] = (char)c;
+            }
+            if (i == ilen) { out[ilen] = 0; return out; }
+        }
+    }
+    return NULL;
+}
+
 int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    {   /* OCERZ_EXCLOG=1: trap the guest's _objc_exception_throw and print the
+         * NSException's name (and reason when it is a constant string), read
+         * straight out of guest memory.  NSException ivars: isa, name, reason.
+         * A __NSCFConstantString keeps its C string pointer at +0x10 and its
+         * length at +0x18. */
+        static int exclog = -1;
+        if (exclog < 0) {
+            exclog = getenv("OCERZ_EXCLOG") ? 1 : 0;
+            if (exclog) {
+                ocerz_exc_trap_rip = ocerz_dyld_resolve_guest_sym("_objc_exception_throw");
+                fprintf(stderr, "ocerz: EXCLOG _objc_exception_throw=%#llx\n",
+                        (unsigned long long)ocerz_exc_trap_rip);
+            }
+        }
+        if (exclog && ocerz_exc_trap_rip && (uint64_t)cpu->rip == ocerz_exc_trap_rip) {
+            uint64_t exc = cpu->gpr[7];   /* RDI */
+            char nbuf[192], rbuf[384];
+            const char *nm = ocerz_exc_read_cfstr(exc + 8, nbuf, sizeof nbuf);
+            const char *rs = ocerz_exc_read_cfstr(exc + 16, rbuf, sizeof rbuf);
+            fprintf(stderr, "ocerz: EXCTHROW exc=%#llx name=%s reason=%s\n",
+                    (unsigned long long)exc, nm ? nm : "<unreadable>",
+                    rs ? rs : "<unreadable>");
+            if (!nm || !rs) {
+                /* fall back to raw words so an unfamiliar string class can
+                 * still be decoded by hand instead of losing the datum */
+                for (int w = 0; w < 3; w++) {
+                    uint64_t slot = exc + 8 + (uint64_t)w * 8;
+                    if (!ocerz_addr_readable(slot)) continue;
+                    uint64_t o = ocerz_ld(slot, 8);
+                    fprintf(stderr, "ocerz: EXCTHROW   ivar+%d=%#llx", 8 + w * 8,
+                            (unsigned long long)o);
+                    if (o && (o & 7u) == 0 && ocerz_addr_readable(o + 0x20)) {
+                        for (int q = 0; q < 4; q++)
+                            fprintf(stderr, " [%d]=%#llx", q * 8,
+                                    (unsigned long long)ocerz_ld(o + (uint64_t)q * 8, 8));
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+            fflush(stderr);
+        }
+    }
+
     {   /* OCERZ_RIPTRAP=addr1[,addr2]: log guest register state whenever
          * execution reaches these addresses (interp only, diagnostics) */
         static uint64_t traps[8];

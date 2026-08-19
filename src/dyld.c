@@ -144,6 +144,14 @@ static char g_main_hostpath[1024];
 uint64_t ocerz_main_mh;
 
 static OcerzCache *g_run_cache;
+
+/* OCERZ_EXCLOG: resolve a symbol in the guest's shared cache so a diagnostic
+ * can trap it (e.g. _objc_exception_throw).  Returns 0 when unavailable. */
+uint64_t ocerz_dyld_resolve_guest_sym(const char *name)
+{
+    if (!g_run_cache || !name) return 0;
+    return ocerz_cache_resolve(g_run_cache, name);
+}
 static struct OcerzVM *g_run_vm;
 static uint64_t g_run_init_args[5];
 static int g_run_init_ready;
