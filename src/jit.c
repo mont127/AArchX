@@ -1,6 +1,7 @@
 #include <execinfo.h>
 /* The JIT: basic blocks translated to native arm64, with the interpreter as fallback. */
 #include "ocerz/jit.h"
+#include "ocerz/dyld.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/decode.h"
@@ -388,6 +389,34 @@ static void stop_extra_add(uint32_t *site, uint32_t *target)
     if (g_n_stop_extra < 6) { g_stop_extra[g_n_stop_extra].site = site; g_stop_extra[g_n_stop_extra].target = target; g_n_stop_extra++; }
 }
 static uint32_t *g_stop_target;
+
+/* Re-target the branch already emitted at `site` so it goes to `target`,
+ * PRESERVING its class and condition.
+ *
+ * A stop site is whatever branch closes a self-loop back edge: b, b.cond,
+ * cbz/cbnz or tbz/tbnz (and, for indirect tails, br/blr).  Rewriting a
+ * conditional site as an unconditional `b` does not just "leave the JIT" --
+ * it forces the branch to be TAKEN, and the stop target for a self-loop is
+ * the stub that stores RIP = <loop head>.  The guest loop's exit condition
+ * is then unreachable and the loop runs forever (walking off the end of
+ * whatever it is scanning).  Keeping the condition makes the patch exact:
+ * taken -> leave the JIT with RIP = loop head (what a stop wants), not
+ * taken -> fall through to the ordinary loop-exit chain tail (unchanged).
+ * br/blr have no offset field, so they keep the unconditional `b` form. */
+static uint32_t stop_retarget(uint32_t insn, const uint32_t *site,
+                              const uint32_t *target)
+{
+    int32_t off = (int32_t)(target - site);
+    if ((insn & 0xfc000000u) == 0x14000000u)             /* b      imm26 */
+        return 0x14000000u | ((uint32_t)off & 0x03ffffffu);
+    if ((insn & 0xff000010u) == 0x54000000u)             /* b.cond imm19 */
+        return (insn & 0xff00001fu) | (((uint32_t)off & 0x7ffffu) << 5);
+    if ((insn & 0x7e000000u) == 0x34000000u)             /* cbz/cbnz imm19 */
+        return (insn & 0xff00001fu) | (((uint32_t)off & 0x7ffffu) << 5);
+    if ((insn & 0x7e000000u) == 0x36000000u)             /* tbz/tbnz imm14 */
+        return (insn & 0xfff8001fu) | (((uint32_t)off & 0x3fffu) << 5);
+    return 0x14000000u | ((uint32_t)off & 0x03ffffffu);  /* br/blr and friends */
+}
 static int g_mem_hoist_greg = -1;
 static int g_mem_hoist_aux_disp;
 static int g_mem_hoist_aux_index = -1;   /* aux kind 2: JMEMAUX = JMEMBASE + index << scale (recomputed at the loop head) */
@@ -10143,6 +10172,9 @@ static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *ent
 
 static JitBlock *translate(OcerzJit *jit, uint64_t rip)
 {
+    if (ocerz_exc_trap_rip && rip == ocerz_exc_trap_rip)
+        return NULL;                 /* OCERZ_EXCLOG: keep the throw site interpreted */
+
     {   /* OCERZ_INTERP_RIP=a[,b,...]: never compile a block starting at these
          * guest addresses - they fall back to the interpreter, where
          * OCERZ_RIPTRAP can observe them even in an otherwise JIT run. */
@@ -11176,13 +11208,13 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         if (g_stop_patch) {
             assert(g_stop_target);
             uint32_t running_insn = *g_stop_patch;
-            /* The stop replacement must be an UNCONDITIONAL b to stop_target
-             * whatever the site currently holds (b or b.cond): patch_b keeps
-             * the site's opcode bits, which mangles a b.cond into a
-             * branch-to-self. */
-            int32_t off = (int32_t)(g_stop_target - g_stop_patch);
+            /* The stop replacement re-targets the site at stop_target while
+             * keeping its class and condition (see stop_retarget): a64_patch_b
+             * cannot be used because it assumes a `b` imm26 and would mangle a
+             * b.cond, but turning the site unconditional is equally wrong --
+             * it forces a self-loop's back edge to be taken forever. */
             blk->stop_patch = g_stop_patch;
-            blk->stop_insn = 0x14000000u | ((uint32_t)off & 0x03ffffffu);
+            blk->stop_insn = stop_retarget(running_insn, g_stop_patch, g_stop_target);
             if (jit->stop_requested)
                 *g_stop_patch = blk->stop_insn;
             else
@@ -11199,9 +11231,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip)
         blk->n_stop_extra = 0;
         for (int i = 0; i < g_n_stop_extra; i++) {
             uint32_t *site = g_stop_extra[i].site;
-            int32_t off = (int32_t)(g_stop_extra[i].target - site);
             blk->stop_extra[blk->n_stop_extra].site = site;
-            blk->stop_extra[blk->n_stop_extra].insn = 0x14000000u | ((uint32_t)off & 0x03ffffffu);
+            blk->stop_extra[blk->n_stop_extra].insn =
+                stop_retarget(*site, site, g_stop_extra[i].target);
             blk->n_stop_extra++;
             if (jit->stop_requested)
                 *site = blk->stop_extra[blk->n_stop_extra - 1].insn;
@@ -11939,7 +11971,17 @@ static void stopcheck(const JitBlock *b, const uint32_t *site, uint32_t insn, co
     static int en = -1;
     if (en < 0) en = getenv("OCERZ_STOPCHECK") ? 1 : 0;
     if (!en || !site) return;
-    int64_t off = (int64_t)((int32_t)(insn << 6) >> 6) * 4;
+    /* decode the offset by class: a stop insn is no longer always a `b` */
+    int64_t off;
+    if ((insn & 0xfc000000u) == 0x14000000u)
+        off = (int64_t)((int32_t)(insn << 6) >> 6) * 4;
+    else if ((insn & 0xff000010u) == 0x54000000u ||
+             (insn & 0x7e000000u) == 0x34000000u)
+        off = (int64_t)((int32_t)(insn << 8) >> 13) * 4;     /* imm19 @ 23:5 */
+    else if ((insn & 0x7e000000u) == 0x36000000u)
+        off = (int64_t)((int32_t)(insn << 13) >> 18) * 4;    /* imm14 @ 18:5 */
+    else
+        off = 0;
     const uint32_t *tgt = (const uint32_t *)((const uint8_t *)site + off);
     const uint32_t *lo = (const uint32_t *)b->code, *hi = lo ? lo + b->code_words : NULL;
     if (!lo || tgt < lo || tgt >= hi)

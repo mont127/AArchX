@@ -38,6 +38,7 @@ static pthread_mutex_t g_cpus_lock = PTHREAD_MUTEX_INITIALIZER;
  * the block-entry rings.  The handler only sets a flag: printing 64K entries
  * is not async-signal-safe, and the stuck thread is never idle (it spins in a
  * kevent wait loop), so a quiet-based latch cannot see it. */
+uint64_t ocerz_exc_trap_rip;      /* OCERZ_EXCLOG: guest _objc_exception_throw entry */
 static volatile int g_btrace_req;
 static int g_btrace_on = -1;
 static OcerzCPU *g_fork_surviving_cpu;
