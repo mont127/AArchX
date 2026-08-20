@@ -170,15 +170,7 @@ static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
     }
     ocerz_vm_request_exit(vm, (int)(uint32_t)a[0] & 0xff);
-    /* exit() is process-wide on Darwin.  request_exit only raises a flag
-     * that CPUs notice between instructions; a CPU parked in a blocking
-     * host syscall (mach_msg receive, pipe read) never looks.  When the
-     * exiting thread is a worker, the main host thread may be exactly
-     * such a sleeper: the workers unwind, the process lingers as a
-     * shell with all its pipes open, and wineserver's peers wait
-     * forever.  Do what the kernel would do: end the process now.
-     * (On the main CPU the normal unwind through ocerz_dyld_run
-     * returns the code and exit() runs on its own.) */
+    /* exit() is process-wide on Darwin. */
     if (!pthread_main_np()) {
         fflush(stderr);
         _exit((int)(uint32_t)a[0] & 0xff);
@@ -270,12 +262,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int fixed = (flags & MAP_FIXED) != 0;
     uint64_t gaddr;
 
-    /* A writable shared mapping is a communication channel: guest memory
-     * must be TSO-ordered from here on.  A read-only shared file mapping
-     * (dyld maps closures and the executable this way in every process) is
-     * not: nothing this process stores can be observed through it, and the
-     * range is remembered so an mprotect that makes it writable retires the
-     * plain model too. */
+    /* A writable shared mapping is a communication channel: guest memory must be TSO-ordered from */
     if ((flags & MAP_SHARED) && (prot & PROT_WRITE))
         ocerz_jit_require_ordered(vm);
 
@@ -355,10 +342,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
 
     if (flags & MAP_SHARED) {
-        /* A read-only guest subpage may later gain a private 4K sibling.
-         * Wine's KUSER page is the narrow exception: its writable backing is
-         * extended through the host page so the adjacent dispatcher can use
-         * the shared padding without breaking KUSER clock coherence. */
+        /* A read-only guest subpage may later gain a private 4K sibling. */
         int padded_kuser = wine_kuser_shared_page(gaddr, len, prot,
                                                   flags, pos);
         int src = padded_kuser
@@ -502,10 +486,7 @@ static struct ocerz_sysctl_ovr g_sysctl_ovr[] = {
     { "hw.cpusubtype",          0, NULL,     4,           {0}, 0, 0 },
     { "hw.cpufamily",           0, NULL,     0x573B5EECu, {0}, 0, 0 },
     { "sysctl.proc_translated", 0, NULL,     1,           {0}, 0, 0 },
-    /* x86_64 processes must see 4K pages (Rosetta reports 4096 for all of
-     * getpagesize/sysconf/hw.pagesize while the arm64 kernel's real page
-     * size is 16K; without this the guest mixes 16K from sysctl with 4K
-     * from the commpage vm_page_size and libSystem page math diverges). */
+    /* x86_64 processes must see 4K pages (Rosetta reports 4096 for all of */
     { "hw.pagesize",            0, NULL,     4096,        {0}, 0, 0 },
     { "hw.pagesize32",          0, NULL,     4096,        {0}, 0, 0 },
     { "vm.pagesize",            0, NULL,     4096,        {0}, 0, 0 },
@@ -1148,14 +1129,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             return OCERZ_STEP_OK;
         }
         int running = __atomic_load_n(&g_wq_running, __ATOMIC_SEQ_CST);
-        /* workq addthreads semantics are ADDITIVE: the caller asks for
-         * reqcount MORE threads on top of whatever is already running
-         * (libdispatch pokes with the number of newly pending work items).
-         * The old "reqcount - running" treated it as a target total, so a
-         * single busy worker starved every later request and any pattern
-         * needing two concurrent workers deadlocked (explorer's
-         * dispatch_sync freeze at sync_window_position #4).  Cap the pool
-         * so a runaway poke loop cannot explode the process. */
+        /* workq addthreads semantics are ADDITIVE: the caller asks for reqcount MORE threads on top of */
         int want = reqcount;
         if (want > 8)
             want = 8;
@@ -1584,13 +1558,7 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
     uint32_t bits = (uint32_t)ocerz_ld(gmsg, 4);
     uint32_t msg_id = (uint32_t)ocerz_ld(gmsg + 0x14, 4);
     int n = 0;
-    /* io_registry_entry_get_properties_bin_buf (2888) / io_registry_entry_get_
-     * property_bin_buf (2889): the request tail is {caller buffer pointer (8),
-     * buffer size (8)} INLINE in the body; the kernel copies the serialized
-     * property data straight to that address.  A guest pointer in a shadowed
-     * range (wine's low 4GB) is not host-valid -> kIOReturnVMError and every
-     * registry property read in a Wine process fails (Metal GPU enumeration,
-     * wine's SMBIOS queries).  Rewrite to the host address for the trap. */
+    /* io_registry_entry_get_properties_bin_buf (2888) / io_registry_entry_get_ property_bin_buf */
     if ((msg_id == 2888 || msg_id == 2889) && n < max_saved) {
         uint32_t msz = (uint32_t)ocerz_ld(gmsg + 4, 4);
         if (msz >= 0x30 && (!send_size || msz <= send_size)) {
@@ -2449,7 +2417,17 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+/* Two mcontext flavours, and the offsets that move between them. */
 #define OCERZ_MCTX_SIZE 1032u
+#define OCERZ_MCTX_FULL_SIZE 1064u
+#define OCERZ_MCTX_FP_OFF 184u
+#define OCERZ_MCTX_FULL_FP_OFF 216u
+#define OCERZ_MCTX_FULL_DS_OFF 184u     /* __ds, __es, __ss, __gsbase */
+#define OCERZ_FP_MXCSR_OFF 32u
+#define OCERZ_FP_XMM_OFF 168u
+/* Darwin's flat 64-bit user selectors. */
+#define OCERZ_SEL_USER_CS64 0x2bu
+#define OCERZ_SEL_USER_DS64 0x23u
 #define OCERZ_UCTX_SIZE 768u
 #define OCERZ_SIGINFO_SIZE 104u
 #define OCERZ_UCTX_SEGBASE_COOKIE 0x4f4345525a534547ull
@@ -2488,14 +2466,19 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
                 (unsigned long long)cpu->sig_altstack_sp,
                 (unsigned long long)cpu->sig_altstack_size, cpu->sig_on_stack,
                 sp_on_alt, use_alt);
+    /* Flavour choice. */
+    int full = ocerz_ldt_installed();
+    uint32_t mcsize = full ? OCERZ_MCTX_FULL_SIZE : OCERZ_MCTX_SIZE;
+    uint64_t fpoff = full ? OCERZ_MCTX_FULL_FP_OFF : OCERZ_MCTX_FP_OFF;
+
     uint64_t top = use_alt ? (cpu->sig_altstack_sp + cpu->sig_altstack_size)
                            : cpu->gpr[OCERZ_RSP];
-    uint64_t mc = (top - OCERZ_MCTX_SIZE) & ~15ull;
+    uint64_t mc = (top - mcsize) & ~15ull;
     uint64_t uc = (mc - OCERZ_UCTX_SIZE) & ~15ull;
     uint64_t si = (uc - OCERZ_SIGINFO_SIZE) & ~15ull;
     uint64_t newsp = si - 8;
 
-    memset(ocerz_g2h(mc), 0, OCERZ_MCTX_SIZE);
+    memset(ocerz_g2h(mc), 0, mcsize);
     memset(ocerz_g2h(uc), 0, OCERZ_UCTX_SIZE);
     memset(ocerz_g2h(si), 0, OCERZ_SIGINFO_SIZE);
 
@@ -2523,10 +2506,19 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     ocerz_st(mc + 136, 8, cpu->gpr[OCERZ_R15]);
     ocerz_st(mc + 144, 8, cpu->rip);
     ocerz_st(mc + 152, 8, cpu->rflags);
-    ocerz_st(mc + 160, 8, 0x2b);
-    ocerz_st(mc + 216, 4, cpu->mxcsr);
+    /* __ss.__cs.  cpu->cs_sel is 0x2b out of reset and only a far transfer
+     * through an LDT descriptor moves it, so a 64-bit thread still reports the
+     * same literal this line used to write. */
+    ocerz_st(mc + 160, 8, cpu->cs_sel);
+    if (full) {
+        ocerz_st(mc + OCERZ_MCTX_FULL_DS_OFF + 0, 8, OCERZ_SEL_USER_DS64);
+        ocerz_st(mc + OCERZ_MCTX_FULL_DS_OFF + 8, 8, OCERZ_SEL_USER_DS64);
+        ocerz_st(mc + OCERZ_MCTX_FULL_DS_OFF + 16, 8, OCERZ_SEL_USER_DS64);
+        ocerz_st(mc + OCERZ_MCTX_FULL_DS_OFF + 24, 8, cpu->gs_base);
+    }
+    ocerz_st(mc + fpoff + OCERZ_FP_MXCSR_OFF, 4, cpu->mxcsr);
     for (int i = 0; i < 16; i++)
-        ocerz_st128(mc + 352 + (uint64_t)i * 16, cpu->xmm[i]);
+        ocerz_st128(mc + fpoff + OCERZ_FP_XMM_OFF + (uint64_t)i * 16, cpu->xmm[i]);
 
     uint64_t old_mask = cpu->sig_mask;
     ocerz_st(uc + 0, 4, old_on_stack ? 1u : 0u);
@@ -2534,7 +2526,7 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     ocerz_st(uc + 8, 8, cpu->sig_altstack_sp);
     ocerz_st(uc + 16, 8, cpu->sig_altstack_size);
     ocerz_st(uc + 24, 4, cpu->sig_on_stack ? 1u : 0u);
-    ocerz_st(uc + 40, 8, OCERZ_MCTX_SIZE);
+    ocerz_st(uc + 40, 8, mcsize);
     ocerz_st(uc + 48, 8, mc);
     ocerz_st(uc + 56, 8, cpu->gs_base);
     ocerz_st(uc + 64, 8, cpu->fs_base);
@@ -2551,6 +2543,10 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     cpu->gpr[OCERZ_R9] = uc;
     cpu->gpr[OCERZ_RSP] = newsp;
     cpu->rip = sa->tramp;
+    /* The trampoline and the handler are 64-bit code. */
+    cpu->mode32 = 0;
+    cpu->cs_sel = OCERZ_SEL_USER_CS64;
+    cpu->seg_sel[OCERZ_SREG_CS] = OCERZ_SEL_USER_CS64;
     if (use_alt)
         cpu->sig_on_stack = 1;
     cpu->sig_mask = old_mask | sa->mask;
@@ -2572,6 +2568,10 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         ret_err(cpu, EINVAL);
         return OCERZ_STEP_OK;
     }
+    /* The flavour comes back from the frame, not from a global: a handler can hand sigreturn any */
+    uint64_t mcsize = ocerz_ld(uc + 40, 8);
+    int full = mcsize >= OCERZ_MCTX_FULL_SIZE;
+    uint64_t fpoff = full ? OCERZ_MCTX_FULL_FP_OFF : OCERZ_MCTX_FP_OFF;
     cpu->gpr[OCERZ_RAX] = ocerz_ld(mc + 16, 8);
     cpu->gpr[OCERZ_RBX] = ocerz_ld(mc + 24, 8);
     cpu->gpr[OCERZ_RCX] = ocerz_ld(mc + 32, 8);
@@ -2591,9 +2591,21 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     cpu->rip = ocerz_ld(mc + 144, 8);
     cpu->rflags = ocerz_ld(mc + 152, 8) | 0x2;
     for (int i = 0; i < 16; i++)
-        cpu->xmm[i] = ocerz_ld128(mc + 352 + (uint64_t)i * 16);
-    cpu->mxcsr = (uint32_t)ocerz_ld(mc + 216, 4);
+        cpu->xmm[i] = ocerz_ld128(mc + fpoff + OCERZ_FP_XMM_OFF + (uint64_t)i * 16);
+    cpu->mxcsr = (uint32_t)ocerz_ld(mc + fpoff + OCERZ_FP_MXCSR_OFF, 4);
     cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
+
+    /* Restore CS, and with it the execution mode. */
+    {
+        uint32_t cs = (uint32_t)ocerz_ld(mc + 160, 8);
+        if (cs) {
+            cpu->cs_sel = (uint16_t)cs;
+            cpu->seg_sel[OCERZ_SREG_CS] = (uint16_t)cs;
+            cpu->mode32 = (uint8_t)(!ocerz_ldt_is_long(cs) && ocerz_ldt_is_big(cs));
+            if (cpu->mode32)
+                cpu->rip = (uint32_t)cpu->rip;
+        }
+    }
 
     int restore_segbases =
         ocerz_ld(uc + 72, 8) == OCERZ_UCTX_SEGBASE_COOKIE;
@@ -4241,24 +4253,11 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                 }
             }
         }
-        /* A kicked (unstick) receive returns MACH_RCV_INTERRUPTED; CFRunLoop
-         * handles that by RETRYING the receive without re-checking its
-         * sources, so a lost CFRunLoopWakeUp stays lost forever (the frozen
-         * OnMainThread family).  Convert to MACH_RCV_TIMED_OUT: a full
-         * run-loop pass re-evaluates signaled sources.  Only for receives
-         * (option bit 2) and only when the caller could see timeouts anyway
-         * or waited forever. */
+        /* A kicked (unstick) receive returns MACH_RCV_INTERRUPTED; CFRunLoop handles that by RETRYING */
         {
             static int norlk = -1;
             if (norlk < 0) norlk = getenv("OCERZ_NO_RCV_TIMEOUT_KICK") ? 1 : 0;
-            /* Receive-ONLY calls: CFRunLoop retries an interrupted receive
-             * without re-checking its sources, so a kicked receive must look
-             * like a timeout for the run loop to make a full pass.
-             * A COMBINED send+receive (options SEND|RCV) is a MIG RPC: the
-             * kernel can never return MACH_RCV_TIMED_OUT there, and a MIG
-             * client stub that sees it deallocates its reply port and fails
-             * the RPC, which surfaces as a failed AppKit/CGS call.  Never
-             * rewrite those. */
+            /* Receive-ONLY calls: CFRunLoop retries an interrupted receive without re-checking its sources */
             if (!norlk && r47 == 0x10004005ull /* MACH_RCV_INTERRUPTED */ &&
                 (a[1] & 0x3) == 0x2)
                 r47 = 0x10004003ull;           /* MACH_RCV_TIMED_OUT */
@@ -4588,7 +4587,8 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     return OCERZ_STEP_OK;
 }
 
-#define OCERZ_LDT_MAX 512
+/* wine's LDT_SIZE is 8192 (dlls/ntdll/unix/signal_i386.c), and its WoW64 code segment routinely */
+#define OCERZ_LDT_MAX 8192
 struct ocerz_ldt_entry {
     uint64_t base;
     uint32_t limit;
@@ -4601,11 +4601,14 @@ struct ocerz_ldt_entry {
 static struct ocerz_ldt_entry g_ldt[OCERZ_LDT_MAX];
 static int g_ldt_next = 1;
 static pthread_mutex_t g_ldt_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Has the guest ever installed a present LDT descriptor? This is the one bit that separates "an */
+static volatile int g_ldt_installed;
 
+/* An LDT selector's index is sel >> 3, and index 0 is a perfectly ordinary entry: the "null */
 uint64_t ocerz_ldt_base(uint32_t sel)
 {
     uint32_t idx = sel >> 3;
-    if (!(sel & 4) || idx == 0 || idx >= OCERZ_LDT_MAX)
+    if (!(sel & 4) || idx >= OCERZ_LDT_MAX)
         return 0;
     return g_ldt[idx].present ? g_ldt[idx].base : 0;
 }
@@ -4613,20 +4616,21 @@ uint64_t ocerz_ldt_base(uint32_t sel)
 int ocerz_ldt_is_big(uint32_t sel)
 {
     uint32_t idx = sel >> 3;
-    if (!(sel & 4) || idx == 0 || idx >= OCERZ_LDT_MAX)
+    if (!(sel & 4) || idx >= OCERZ_LDT_MAX)
         return 0;
     return g_ldt[idx].present && g_ldt[idx].big;
 }
 
-/* Descriptor bit 53, the L bit: set on a 64-bit code segment.  L and D are
- * mutually exclusive on a code segment, so a selector with L=1 is 64-bit no
- * matter what D says.  The i386_set_ldt path this build serves cannot create
- * one -- Darwin rejects it -- but the mode decision reads better as "L then D"
- * than as "D, and trust that L is impossible". */
+int ocerz_ldt_installed(void)
+{
+    return g_ldt_installed;
+}
+
+/* Descriptor bit 53, the L bit: set on a 64-bit code segment. */
 int ocerz_ldt_is_long(uint32_t sel)
 {
     uint32_t idx = sel >> 3;
-    if (!(sel & 4) || idx == 0 || idx >= OCERZ_LDT_MAX)
+    if (!(sel & 4) || idx >= OCERZ_LDT_MAX)
         return 0;
     return g_ldt[idx].present && g_ldt[idx].is_long;
 }
@@ -4638,7 +4642,7 @@ void ocerz_ldt_install(uint32_t sel, uint64_t base, uint32_t limit,
                        uint8_t access, int big, int is_long, int gran)
 {
     uint32_t idx = sel >> 3;
-    if (!(sel & 4) || idx == 0 || idx >= OCERZ_LDT_MAX)
+    if (!(sel & 4) || idx >= OCERZ_LDT_MAX)
         return;
     pthread_mutex_lock(&g_ldt_lock);
     g_ldt[idx].base = base;
@@ -4650,6 +4654,8 @@ void ocerz_ldt_install(uint32_t sel, uint64_t base, uint32_t limit,
     g_ldt[idx].present = (uint8_t)((access >> 7) & 1);
     if ((int)idx + 1 > g_ldt_next)
         g_ldt_next = (int)idx + 1;
+    if (g_ldt[idx].present)
+        g_ldt_installed = 1;
     pthread_mutex_unlock(&g_ldt_lock);
 }
 
@@ -4700,8 +4706,11 @@ static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
             idx = g_ldt_next;
             g_ldt_next += (int)count;
         } else {
+            /* An explicit index of 0 is legal: see the note on ocerz_ldt_base.
+             * wine hands i386_set_ldt the index it wants, and rejecting 0 here
+             * would turn a valid install into EINVAL. */
             idx = (int)start;
-            if (idx <= 0 || idx + (int)count > OCERZ_LDT_MAX) {
+            if (idx < 0 || idx + (int)count > OCERZ_LDT_MAX) {
                 pthread_mutex_unlock(&g_ldt_lock);
                 ret_err(cpu, EINVAL);
                 return OCERZ_STEP_OK;
@@ -4709,8 +4718,11 @@ static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
             if (idx + (int)count > g_ldt_next)
                 g_ldt_next = idx + (int)count;
         }
-        for (int i = 0; i < count; i++)
+        for (int i = 0; i < count; i++) {
             ocerz_ldt_unpack(ocerz_ld(descs + (uint64_t)i * 8, 8), &g_ldt[idx + i]);
+            if (g_ldt[idx + i].present)
+                g_ldt_installed = 1;
+        }
         pthread_mutex_unlock(&g_ldt_lock);
         if (getenv("OCERZ_LDTLOG"))
             fprintf(stderr, "ocerz: LDT set idx=%d count=%lld base=%#llx big=%d access=%#x\n",

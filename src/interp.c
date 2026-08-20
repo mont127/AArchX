@@ -9,13 +9,7 @@
 
 static int far_transfer(OcerzCPU *cpu, uint32_t sel, uint64_t off);
 
-/* Reading order for the whole i386 slice of this file: the CPU never asks
- * "am I in 32-bit mode?" at run time.  Every decoded instruction carries the
- * mode it was decoded in (insn->mode32), the decoder has already given every
- * operand and every implicit stack slot its 32-bit width, and the handlers
- * below just use those widths.  In long mode insn->mode32 is 0 and each of the
- * expressions added here collapses to the constant that was written there
- * before, which is why none of the 64-bit unit tests move. */
+/* Reading order for the whole i386 slice of this file: the CPU never asks "am I in 32-bit mode?" */
 
 static void dump_raw_bytes(FILE *out, uint64_t rip, unsigned len)
 {
@@ -691,10 +685,7 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_LEAVE: {
-        /* SDM: the STACK ADDRESS size moves the whole of ESP/RSP from EBP/RBP,
-         * while the OPERAND size decides how much of EBP/RBP the pop rewrites.
-         * The two only differ for the 0x66 form in 32-bit mode, where ESP is
-         * still set in full but only BP is popped. */
+        /* SDM: the STACK ADDRESS size moves the whole of ESP/RSP from EBP/RBP, while the OPERAND size */
         int m32 = insn->mode32;
         int size = insn->opsize ? insn->opsize : 8;
         uint64_t bp = m32 ? (uint32_t)cpu->gpr[OCERZ_RBP] : cpu->gpr[OCERZ_RBP];
@@ -877,8 +868,14 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         uint32_t cs = (uint32_t)ocerz_ld(sp + (uint64_t)sz, sz);
         uint64_t flags = ocerz_ld(sp + (uint64_t)sz * 2, sz);
         uint64_t newsp = ocerz_ld(sp + (uint64_t)sz * 3, sz);
+        /* The fifth slot, SS. IRET to an outer privilege level -- which is every IRET this emulator will */
+        uint32_t ss = (uint32_t)ocerz_ld(sp + (uint64_t)sz * 4, sz);
         cpu->rflags = flags | 0x2;
         cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(newsp, m32);
+        /* A zero SS is a frame that did not name one; keep the current SS
+         * rather than installing the null selector. */
+        if (ss)
+            cpu->seg_sel[OCERZ_SREG_SS] = (uint16_t)ss;
         /* A zero CS on the stack is not a mode decision, it is a frame this
          * emulator built itself; keep the current selector and mode. */
         if (!cs) {
@@ -892,21 +889,7 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
-/* Is this code selector a 32-bit one?
- *
- * A code descriptor's L bit (53) says 64-bit and its D bit (54) says 32-bit,
- * and the two are mutually exclusive, so the answer is "L then D".  Everything
- * this emulator can see about a selector comes from the LDT that the guest
- * installs through i386_set_ldt: ocerz_ldt_is_big() answers 0 for a GDT
- * selector and for an absent entry.
- *
- * That single fact is what makes mode ENTRY and mode EXIT the same rule read
- * in opposite directions.  wine's WoW64 thunk far-jumps to an LDT selector it
- * installed with D=1, which lands here as 1; the 32-bit side far-returns to
- * the flat 64-bit CS, which is a GDT selector and lands here as 0.  There is
- * no separate "leave 32-bit mode" path to forget to write, and no way for a
- * thread to be stranded in 32-bit mode by a transfer that did not name a
- * 32-bit code segment. */
+/* Is this code selector a 32-bit one? A code descriptor's L bit (53) says 64-bit and its D bit */
 static int cs_is_32bit(uint32_t sel)
 {
     if (ocerz_ldt_is_long(sel))
@@ -933,20 +916,7 @@ static int far_transfer(OcerzCPU *cpu, uint32_t sel, uint64_t off)
     return OCERZ_STEP_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * The i386-only instructions.
- *
- * None of these exists in long mode -- the decoder only emits them when it was
- * called with mode32=1 -- so this whole function is unreachable from 64-bit
- * execution and nothing above it changes shape to accommodate it.
- *
- * The BCD/ASCII adjusts are transcriptions of the SDM Vol.2 pseudocode rather
- * than reimplementations of what some other emulator does, and where the SDM
- * says a flag is UNDEFINED this code says so at the site and then does one
- * specific thing: it leaves that flag alone.  That is both the cheapest choice
- * and the one that makes a mistaken dependency in guest code fail the same way
- * on every run instead of intermittently.
- * ------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------------- The i386-only */
 
 /* AL, AH and AX, spelled once so the adjust handlers read like the SDM. */
 static uint8_t  get_al(const OcerzCPU *cpu) { return (uint8_t)cpu->gpr[OCERZ_RAX]; }
@@ -956,11 +926,7 @@ static void set_al(OcerzCPU *cpu, uint8_t v)  { ocerz_write_gpr(cpu, OCERZ_RAX, 
 static void set_ah(OcerzCPU *cpu, uint8_t v)  { ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, v); }
 static void set_ax(OcerzCPU *cpu, uint16_t v) { ocerz_write_gpr(cpu, OCERZ_RAX, 2, 0, v); }
 
-/* #BR (BOUND range exceeded, vector 5) and #OF (INTO, vector 4).  Darwin has
- * no signal that means either one; both are faults, so rip is rewound to the
- * faulting instruction the way div_trap() does it, and they are reported as
- * SIGTRAP -- the signal INT3 already uses here for "the guest asked for a
- * trap".  With no guest handler installed both stay fatal. */
+/* #BR (BOUND range exceeded, vector 5) and #OF (INTO, vector 4). */
 static int i386_trap(OcerzCPU *cpu, const X86Insn *insn, const char *msg)
 {
     uint64_t next = cpu->rip;
@@ -971,10 +937,7 @@ static int i386_trap(OcerzCPU *cpu, const X86Insn *insn, const char *msg)
     return trap_fatal(insn, msg);
 }
 
-/* PUSHA/POPA move the eight GPRs in the fixed order the SDM gives.  The ESP
- * slot PUSHA writes holds the value ESP had BEFORE the first push, and the one
- * POPA reads is discarded: ESP ends where the eight pops leave it, not where
- * the saved image says. */
+/* PUSHA/POPA move the eight GPRs in the fixed order the SDM gives. */
 static int op_pusha(OcerzCPU *cpu, const X86Insn *insn)
 {
     static const uint8_t order[8] = {
@@ -1098,10 +1061,7 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
 
-    /* AAA.  SDM: AF and CF defined, OF/SF/ZF/PF UNDEFINED -- all four left
-     * untouched.  The adjustment is written as AX := AX + 0x106 because that
-     * is what the SDM says; it differs from "AL += 6 with wrap, AH += 1" for
-     * AL >= 0xfa, where the carry out of AL reaches AH a second time. */
+    /* AAA. SDM: AF and CF defined, OF/SF/ZF/PF UNDEFINED -- all four left untouched. */
     case OCERZ_OP_AAA: {
         if ((get_al(cpu) & 0x0f) > 9 || (cpu->rflags & OCERZ_AF)) {
             set_ax(cpu, (uint16_t)(get_ax(cpu) + 0x106));
@@ -1502,10 +1462,7 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 
     X86Insn insn;
     const uint8_t *code = (const uint8_t *)ocerz_g2h(cpu->rip);
-    /* The one place the interpreter chooses a decode mode.  Everything
-     * downstream reads insn.mode32 rather than cpu->mode32, so a decoded
-     * instruction always executes under the mode it was decoded in even if a
-     * far transfer inside it changes the CPU's mode. */
+    /* The one place the interpreter chooses a decode mode. */
     int rc = ocerz_decode_mode(code, 15, cpu->rip, &insn, cpu->mode32);
     if (rc != OCERZ_OK) {
         fprintf(stderr, "ocerz: fatal: decode failed (%d, %s mode) at rip=%#llx\n  bytes: ",
@@ -1714,6 +1671,9 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
         return trap_fatal(insnp, "guest HLT");
 
     case OCERZ_OP_SYSCALL:
+        /* SYSCALL is the one instruction the interpreter reaches that writes a register the 32-bit world */
+        if (insnp->mode32)
+            return ocerz_unimpl(vm, cpu, insnp, "syscall in 32-bit mode");
         cpu->gpr[OCERZ_RCX] = cpu->rip;
         cpu->gpr[OCERZ_R11] = cpu->rflags & 0x3c7fd7ull;
         return ocerz_handle_syscall(vm, cpu);

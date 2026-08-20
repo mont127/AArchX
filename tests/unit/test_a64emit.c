@@ -109,6 +109,18 @@ static void b_ldrh(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scrat
 static void b_ldr_regoff(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_mov_imm64(b, 3, 5); a64_ldr_regoff(b, 8, 0, 2, 3, 1); a64_ret(b); }
 static void b_str_regoff(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_mov_imm64(b, 3, 5); a64_str_regoff(b, 8, 0, 2, 3, 1); a64_ldr(b, 8, 0, 2, 8 * 5); a64_ret(b); }
 
+/* The UXTW forms: the index register carries a nonzero HIGH half that the
+ * extend must discard.  If it were taken whole (option = LSL, as the plain
+ * regoff forms use) the address would be astronomically out of range and the
+ * access would fault, so a pass here is the positive statement that these
+ * three encodings really do zero-extend from 32 bits. */
+static void b_add_ext_uxtw(A64Buf *b) { a64_add_ext_uxtw(b, 0, 0, 1, 0); a64_ret(b); }
+static void b_add_ext_uxtw_sh3(A64Buf *b) { a64_add_ext_uxtw(b, 0, 0, 1, 3); a64_ret(b); }
+static void b_ldr_regoff_uxtw(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_mov_imm64(b, 3, 0xdead000000000028ull); a64_ldr_regoff_uxtw(b, 8, 0, 2, 3); a64_ret(b); }
+static void b_ldr4_regoff_uxtw(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_mov_imm64(b, 3, 0xdead000000000028ull); a64_ldr_regoff_uxtw(b, 4, 0, 2, 3); a64_ret(b); }
+static void b_str_regoff_uxtw(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_mov_imm64(b, 3, 0xdead000000000030ull); a64_str_regoff_uxtw(b, 8, 0, 2, 3); a64_ldr(b, 8, 0, 2, 8 * 6); a64_ret(b); }
+static void b_str4_regoff_uxtw(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_mov_imm64(b, 1, 0); a64_str(b, 8, 1, 2, 8 * 6); a64_mov_imm64(b, 3, 0xdead000000000030ull); a64_str_regoff_uxtw(b, 4, 0, 2, 3); a64_ldr(b, 8, 0, 2, 8 * 6); a64_ret(b); }
+
 static void b_ldrsw_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 4, 1, 2, 8 * 5); a64_ldrsw(b, 0, 2, 8 * 5); a64_ret(b); }
 static void b_ldrsb_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 1, 1, 2, 8 * 5); a64_ldrsb(b, 1, 0, 2, 8 * 5); a64_ret(b); }
 static void b_ldrsh_off(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 2, 1, 2, 8 * 5); a64_ldrsh(b, 1, 0, 2, 8 * 5); a64_ret(b); }
@@ -448,6 +460,18 @@ int main(void)
     CHECK(run2(b_ldrsb_off, 0, 0x80) == (uint64_t)-128, "ldrsb nonzero offset");
     CHECK(run2(b_ldrsh_off, 0, 0x8000) == (uint64_t)-32768, "ldrsh nonzero offset");
     CHECK(run2(b_ldrh, 0, 0xbeef) == 0xbeef, "ldrh scaled offset");
+    CHECK(run2(b_add_ext_uxtw, 0x1000, 0xdeadbeef00000010ull) == 0x1010ull,
+          "add x0, x0, w1, uxtw discards the high half");
+    CHECK(run2(b_add_ext_uxtw_sh3, 0x1000, 0xdeadbeef00000010ull) == 0x1080ull,
+          "add x0, x0, w1, uxtw #3 shifts the zero-extended half");
+    CHECK(run2(b_ldr_regoff_uxtw, 0, 0x123456789abcdef0ull) == 0x123456789abcdef0ull,
+          "ldr x, [x, w, uxtw]");
+    CHECK(run2(b_ldr4_regoff_uxtw, 0, 0x123456789abcdef0ull) == 0x9abcdef0ull,
+          "ldr w, [x, w, uxtw] zero-extends the loaded value");
+    CHECK(run2(b_str_regoff_uxtw, 0x0f0e0d0c0b0a0908ull, 0) == 0x0f0e0d0c0b0a0908ull,
+          "str x, [x, w, uxtw]");
+    CHECK(run2(b_str4_regoff_uxtw, 0x0f0e0d0c0b0a0908ull, 0) == 0x0b0a0908ull,
+          "str w, [x, w, uxtw] stores only the low word");
     CHECK(run2(b_ldr_regoff, 0, 0x123456789abcdef0ull) == 0x123456789abcdef0ull,
           "ldr register offset scaled");
     CHECK(run2(b_str_regoff, 0xfeedfacecafebeefull, 0) == 0xfeedfacecafebeefull,

@@ -33,7 +33,17 @@ check: ocerz unit guest
 	bash tests/run_guest_tests.sh --no-jit
 	bash tests/run_guest_tests.sh
 	bash tests/run_diff_test.sh
+	bash tests/run_diff32.sh .
 	bash tests/run_dynamic_tests.sh
+
+# The 32-bit half of the differential.  run_diff_test.sh cannot cover i386 --
+# there is no i386 Mach-O to load -- so this one builds the sequences itself and
+# runs each under the interpreter and under the JIT.  Unlike i386diff it IS a
+# pass/fail gate and IS part of `check`.  With stage 9 landed the JIT really
+# compiles the 32-bit side, so run_diff32.sh passes --jit-required and a JIT
+# that stops translating 32-bit blocks fails the gate rather than passing it.
+diff32:
+	bash tests/run_diff32.sh .
 
 # 32-bit decode conformance vs capstone CS_MODE_32.  Reports a coverage
 # percentage; deliberately NOT part of `check`, because i386 support is being
@@ -49,4 +59,4 @@ clean:
 
 -include $(DEPS)
 
-.PHONY: unit guest check clean i386diff
+.PHONY: unit guest check clean i386diff diff32

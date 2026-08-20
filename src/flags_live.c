@@ -23,11 +23,7 @@ static int insn_touches_memory(const X86Insn *insn)
     return 0;
 }
 
-/* Strict fault barrier: force every flag live across any memory-touching
- * instruction so a guest signal handler would observe architecturally exact
- * (even dead) flags in its context.  Off by default: dead flags are dead in
- * the guest's own code, and a handler resuming/redirecting execution never
- * assumes flag state.  Live flags are always recoverable regardless. */
+/* Strict fault barrier: force every flag live across any memory-touching instruction so a guest */
 static int fault_barrier_enabled(void)
 {
     static int en = -1;
@@ -92,9 +88,14 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
 
     case OCERZ_OP_MUL:
     case OCERZ_OP_IMUL:
-    case OCERZ_OP_DIV:      /* flags undefined after div/idiv: nothing may read them */
-    case OCERZ_OP_IDIV:
         d = OCERZ_FL_ALL;
+        u = 0;
+        break;
+
+    /* DIV/IDIV leave the flags ARCHITECTURALLY UNDEFINED, but "undefined" is not "killed": ocerz has */
+    case OCERZ_OP_DIV:
+    case OCERZ_OP_IDIV:
+        d = 0;
         u = 0;
         break;
 
@@ -148,22 +149,13 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
                 u = 0;
             }
         } else {
-            /* %cl count: MAY define (count 0 architecturally preserves the
-             * flags, any other count writes them).  It must be reported as a
-             * definition, otherwise the backward pass gives it need == 0, no
-             * record is written, and a later jcc silently consumes the
-             * PREVIOUS producer's record -- a wrong-direction branch.
-             * u = ALL keeps the predecessor's record alive for the count == 0
-             * case. */
+            /* %cl count: MAY define (count 0 architecturally preserves the flags, any other count writes */
             d = OCERZ_FL_ALL;
             u = OCERZ_FL_ALL;
         }
         break;
 
-    /* rotates: ROL/ROR write CF (and OF for count 1), RCL/RCR read and write
-     * CF.  They were falling into the default arm with d = 0, so a following
-     * jcc branched on a stale record.  Same may-define encoding as the
-     * variable shifts (SHLD/SHRD already declare d = ALL below). */
+    /* rotates: ROL/ROR write CF (and OF for count 1), RCL/RCR read and write CF. They were falling */
     case OCERZ_OP_ROL:
     case OCERZ_OP_ROR:
     case OCERZ_OP_RCL:
@@ -234,8 +226,16 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
     case OCERZ_OP_BT: case OCERZ_OP_BTS: case OCERZ_OP_BTR: case OCERZ_OP_BTC:
         d = OCERZ_CF; u = 0;
         break;
+    /* SHLD/SHRD are MAY-define, exactly like the variable shifts and the rotates above: src/interp.c */
     case OCERZ_OP_SHLD: case OCERZ_OP_SHRD:
-        d = OCERZ_FL_ALL; u = 0;
+        if (insn->nops >= 3 && insn->ops[2].kind == OCERZ_OPK_IMM) {
+            unsigned scnt = (unsigned)(insn->ops[2].imm &
+                                       (insn->ops[0].size == 8 ? 63u : 31u));
+            if (scnt == 0) { d = 0; u = 0; }          /* a complete no-op */
+            else           { d = OCERZ_FL_ALL; u = 0; }
+        } else {
+            d = OCERZ_FL_ALL; u = OCERZ_FL_ALL;       /* CL count: may-define */
+        }
         break;
     /* xadd/cmpxchg set the arithmetic flags like add/cmp; xchg touches none */
     case OCERZ_OP_XADD: case OCERZ_OP_CMPXCHG:
@@ -243,7 +243,8 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         break;
 
     default:
-        if (insn->op >= OCERZ_OP_X87_FIRST && insn->op < OCERZ_OP_COUNT) {
+        /* The x87/SSE region is flag-neutral apart from the compare forms handled above. */
+        if (insn->op >= OCERZ_OP_X87_FIRST && insn->op < OCERZ_OP_PUSHA) {
             d = 0;
             u = 0;
         }

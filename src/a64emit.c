@@ -231,6 +231,23 @@ void a64_ldr_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled)
                   ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 
+/* The same two forms with the index EXTENDED from 32 bits (option = UXTW) instead of taken whole */
+void a64_ldr_regoff_uxtw(A64Buf *b, int size, int rt, int rn, int rm)
+{
+    uint32_t sz = size == 8 ? 3u : size == 4 ? 2u : size == 2 ? 1u : 0u;
+    a64_emit32(b, 0x38604800u | (sz << 30) |
+                  ((uint32_t)(rm & 31) << 16) |
+                  ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
+void a64_str_regoff_uxtw(A64Buf *b, int size, int rt, int rn, int rm)
+{
+    uint32_t sz = size == 8 ? 3u : size == 4 ? 2u : size == 2 ? 1u : 0u;
+    a64_emit32(b, 0x38204800u | (sz << 30) |
+                  ((uint32_t)(rm & 31) << 16) |
+                  ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+
 void a64_str_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled)
 {
     uint32_t sz = size == 8 ? 3u : size == 4 ? 2u : size == 2 ? 1u : 0u;
@@ -299,6 +316,14 @@ void a64_add_reg(A64Buf *b, int sf, int rd, int rn, int rm, int lsl) { addsub_re
 void a64_adds_reg(A64Buf *b, int sf, int rd, int rn, int rm, int lsl) { addsub_reg(b, 0x2b000000u, sf, rd, rn, rm, lsl); }
 void a64_sub_reg(A64Buf *b, int sf, int rd, int rn, int rm, int lsl) { addsub_reg(b, 0x4b000000u, sf, rd, rn, rm, lsl); }
 void a64_subs_reg(A64Buf *b, int sf, int rd, int rn, int rm, int lsl) { addsub_reg(b, 0x6b000000u, sf, rd, rn, rm, lsl); }
+
+/* ADD Xd, Xn, Wm, UXTW #imm3 -- add the ZERO-EXTENDED low 32 bits of Xm, optionally pre-shifted */
+void a64_add_ext_uxtw(A64Buf *b, int rd, int rn, int rm, int shift)
+{
+    a64_emit32(b, 0x8b200000u | ((uint32_t)(rm & 31) << 16) | (2u << 13) |
+                  ((uint32_t)(shift & 7) << 10) | ((uint32_t)(rn & 31) << 5) |
+                  (uint32_t)(rd & 31));
+}
 
 void a64_adcs_reg(A64Buf *b, int sf, int rd, int rn, int rm)
 {
@@ -500,11 +525,7 @@ void a64_patch_tbz(uint32_t *at, uint32_t *target)
     *at = (*at & 0xfff8001fu) | (((uint32_t)off & 0x3fff) << 5);
 }
 
-/* TBZ/TBNZ carry a signed imm14 (+-8191 words, +-32 KB): far smaller than the
- * imm19 of cbz/b.cond or the imm26 of b.  A superblock whose out-of-line side-
- * exit stubs land beyond that range would have its branch silently truncated
- * into a wild jump inside the code arena, so the patch has to be checked.
- * Returns 0 (and leaves the site alone) when the target is out of reach. */
+/* TBZ/TBNZ carry a signed imm14 (+-8191 words, +-32 KB): far smaller than the imm19 of */
 int a64_try_patch_tbz(uint32_t *at, uint32_t *target)
 {
     ptrdiff_t off = target - at;
