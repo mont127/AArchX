@@ -1,5 +1,6 @@
 /* CPU reset state, plus the register dump used by fatal paths and -trace. */
 #include "ocerz/cpu.h"
+#include "ocerz/decode.h"
 #include "ocerz/mem.h"
 
 #include <stdlib.h>
@@ -12,6 +13,9 @@ void ocerz_cpu_reset(OcerzCPU *cpu)
     cpu->rflags = OCERZ_FLAG_FIXED1 | OCERZ_IF;
     cpu->fcw = 0x037f;
     cpu->mxcsr = 0x1f80;
+    /* Darwin's flat 64-bit user code selector. */
+    cpu->cs_sel = 0x2b;
+    cpu->seg_sel[OCERZ_SREG_CS] = 0x2b;
 }
 
 void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out)

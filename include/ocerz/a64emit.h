@@ -45,6 +45,8 @@ void a64_ldr_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
 void a64_ldr_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled);
 void a64_str_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled);
 void a64_str_regoff(A64Buf *b, int size, int rt, int rn, int rm, int scaled);
+void a64_ldr_regoff_uxtw(A64Buf *b, int size, int rt, int rn, int rm);
+void a64_str_regoff_uxtw(A64Buf *b, int size, int rt, int rn, int rm);
 void a64_ldar(A64Buf *b, int size, int rt, int rn);
 void a64_stlr(A64Buf *b, int size, int rt, int rn);
 void a64_ldapr(A64Buf *b, int size, int rt, int rn);
@@ -65,6 +67,7 @@ void a64_add_reg(A64Buf *b, int sf, int rd, int rn, int rm, int lsl);
 void a64_adds_reg(A64Buf *b, int sf, int rd, int rn, int rm, int lsl);
 void a64_sub_reg(A64Buf *b, int sf, int rd, int rn, int rm, int lsl);
 void a64_subs_reg(A64Buf *b, int sf, int rd, int rn, int rm, int lsl);
+void a64_add_ext_uxtw(A64Buf *b, int rd, int rn, int rm, int shift);
 void a64_adcs_reg(A64Buf *b, int sf, int rd, int rn, int rm);
 void a64_sbcs_reg(A64Buf *b, int sf, int rd, int rn, int rm);
 

@@ -126,7 +126,12 @@ static inline void ocerz_push_mode(OcerzCPU *cpu, int size, uint64_t v, int mode
 
 static inline uint64_t ocerz_pop_mode(OcerzCPU *cpu, int size, int mode32)
 {
-    uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RSP], size);
+    /* The address is SS:ESP, i.e. it wraps at 32 bits like every other i386
+     * address -- ocerz_push_mode already stored through a wrapped pointer, so
+     * only the load was reading an untruncated rsp.  mode32 = 0 is the
+     * identity, so no 64-bit behaviour changes; the JIT's 32-bit POP/RET use
+     * a UXTW-indexed load, which is the same rule at zero instruction cost. */
+    uint64_t v = ocerz_ld(ocerz_stack_wrap(cpu->gpr[OCERZ_RSP], mode32), size);
     cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(cpu->gpr[OCERZ_RSP] + (uint64_t)size, mode32);
     return v;
 }
