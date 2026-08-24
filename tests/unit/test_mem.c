@@ -170,6 +170,10 @@ int main(void)
     const uint64_t chunk = 10ull * 1024 * 1024;
 
     CHECK(ocerz_mem_init(lo, hi) == OCERZ_OK);
+    uint64_t host_lo = (uint64_t)(uintptr_t)ocerz_g2h(lo);
+    CHECK(ocerz_host_in_guest_space((const void *)(uintptr_t)host_lo));
+    CHECK(!ocerz_host_in_guest_reservation(
+        (const void *)(uintptr_t)(host_lo - OCERZ_GUEST_PAGE_SIZE)));
 
     uint64_t first = ocerz_map_anywhere(chunk, PROT_READ | PROT_WRITE);
     uint64_t second = ocerz_map_anywhere(chunk, PROT_READ | PROT_WRITE);

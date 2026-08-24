@@ -2,6 +2,7 @@
 #include "ocerz/cache.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 static int checks, fails;
 
@@ -9,6 +10,9 @@ static int checks, fails;
 
 int main(void)
 {
+    /* Raw cache reads here run without the VM's lazy-fault handler. */
+    setenv("OCERZ_EAGER_SLIDE", "1", 1);
+
     OcerzCache c;
     if (ocerz_cache_map(&c) != OCERZ_OK) {
         printf("test_cache: SKIP (shared cache not mappable here)\n");
