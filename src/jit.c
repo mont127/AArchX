@@ -576,6 +576,14 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
 __thread int ocerz_jit_exec_state;   /* crash diagnostics: 1 = in exec_one (slow call), 2 = in jit_interp_block */
 int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
+    if (__builtin_expect(insn->op == OCERZ_OP_SYSCALL && !insn->mode32 &&
+                         cpu->gpr[OCERZ_RAX] == ((2ull << 24) | 2), 0)) {
+        /* fork must not run from JIT'd code: the child would resume inside the
+         * inherited MAP_JIT arena, which faults ADRALN on Apple silicon. */
+        cpu->cur_rip = insn->rip;
+        cpu->rip = insn->rip;
+        return OCERZ_EUNSUP;
+    }
     if (__builtin_expect(ocerz_perfstat > 0, 0))
         jit_perfstat_one(insn);
     vm->insn_count++;
