@@ -200,7 +200,7 @@ void ocerz_vm_atfork_child(void)
      * runs the fork-return + _exit()/execve() path, so drop it to the
      * interpreter. */
     if (g_vm && g_vm->jit_enabled && g_fork_keepjit <= 0) {
-        g_vm->jit_enabled = 0;
+        ocerz_jit_forget(g_vm);
         if (survivor) survivor->interp_once = 1;
     }
     pthread_mutex_unlock(&g_cpus_lock);
@@ -2010,7 +2010,7 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
                 fprintf(stderr, "ocerz: INTERP-ONCE done -> rip=%#llx rax=%#llx rcx=%#llx rdx=%#llx r=%d\n",
                         (unsigned long long)local.rip, (unsigned long long)local.gpr[OCERZ_RAX],
                         (unsigned long long)local.gpr[OCERZ_RCX], (unsigned long long)local.gpr[OCERZ_RDX], r);
-        } else if (vm->jit_enabled && vm->jit) {
+        } else if (vm->jit_enabled && (vm->jit || (vm->jit = ocerz_jit_create(vm)))) {
             r = ocerz_jit_step(vm, &local);
             if (r == OCERZ_EUNSUP)
                 r = ocerz_interp_step(vm, &local);
@@ -2256,7 +2256,7 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
         if (cpu->interp_once) {
             cpu->interp_once = 0;
             r = ocerz_interp_step(vm, cpu);
-        } else if (vm->jit_enabled && vm->jit) {
+        } else if (vm->jit_enabled && (vm->jit || (vm->jit = ocerz_jit_create(vm)))) {
             r = ocerz_jit_step(vm, cpu);
             if (r == OCERZ_EUNSUP)
                 r = ocerz_interp_step(vm, cpu);

@@ -34,6 +34,7 @@ void ocerz_jit_request_stop(struct OcerzVM *vm);
 void ocerz_jit_require_ordered(struct OcerzVM *vm);
 void ocerz_jit_invalidate_all(struct OcerzVM *vm);
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len);
+void ocerz_jit_forget(struct OcerzVM *vm);
 
 int ocerz_jit_code_range(struct OcerzVM *vm, const uint32_t **lo, const uint32_t **hi);
 int ocerz_jit_owner_pid(struct OcerzVM *vm);
