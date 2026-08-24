@@ -157,6 +157,7 @@ struct OcerzJit {
     uint32_t *dispatch_stub32; /* the same for 32-bit blocks (see emit_dispatch_stub) */
     JitBlock **live;           /* every block currently in the buckets (invalidation walks this, not the 1M buckets) */
     size_t n_live, cap_live;
+    uint64_t code_lo, code_hi; /* guest range spanned by live blocks; code_hi==0 means none */
 };
 
 int ocerz_perfstat = -1;
@@ -674,9 +675,16 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
         if (nl) { jit->live = nl; jit->cap_live = nc; }
     }
     if (jit->n_live < jit->cap_live) jit->live[jit->n_live++] = b;
-    if (b->n_insns > 0)
-        ocerz_cache_arm_exec(b->insns[0].rip,
-                             b->insns[b->n_insns - 1].rip + b->insns[b->n_insns - 1].len);
+    if (b->n_insns > 0) {
+        uint64_t lo = b->insns[0].rip;
+        uint64_t hi = b->insns[b->n_insns - 1].rip + b->insns[b->n_insns - 1].len;
+        if (!jit->code_hi) { jit->code_lo = lo; jit->code_hi = hi; }
+        else {
+            if (lo < jit->code_lo) jit->code_lo = lo;
+            if (hi > jit->code_hi) jit->code_hi = hi;
+        }
+        ocerz_cache_arm_exec(lo, hi);
+    }
 }
 
 /* ---- monomorphic inline caches for indirect jmp/call ---------------------- Each */
@@ -11986,6 +11994,22 @@ int ocerz_jit_owner_pid(struct OcerzVM *vm)
     return vm && vm->jit ? vm->jit->owner_pid : -1;
 }
 
+/* A fork child inherits the parent's MAP_JIT arena, whose pages fault when it
+ * tries to execute them. Abandon the arena rather than free it (the fork may
+ * have caught the allocator mid-update) and drop every global that points into
+ * it; the exec loop builds a fresh one on the next step, so the child keeps the
+ * JIT instead of interpreting for the rest of its life. */
+void ocerz_jit_forget(struct OcerzVM *vm)
+{
+    pthread_mutex_init(&jit_lock, NULL);
+    g_xlat_jit = NULL;
+    g_n_ras_cells = 0;
+    g_ras_slot_n = 0;
+    memset(g_pending, 0, sizeof g_pending);
+    if (vm)
+        vm->jit = NULL;
+}
+
 OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
 {
     OcerzJit *jit = (OcerzJit *)calloc(1, sizeof *jit);
@@ -12195,6 +12219,8 @@ static void invalidate_all_locked(OcerzJit *jit)
         jit->retired = b;
     }
     jit->n_live = 0;
+    jit->code_lo = 0;
+    jit->code_hi = 0;
 
     pending_clear();
     for (unsigned i = 0; i < g_ras_slot_n; i++)
@@ -12237,6 +12263,14 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     OcerzJit *jit = vm->jit;
     int invalidated = 0;
     pthread_mutex_lock(&jit_lock);
+    /* Callers hand us whole VM regions (vm_deallocate, vm_protect); almost none
+     * of them hold translated code. One range test beats walking every live
+     * block, and any overlap drops the whole cache anyway. */
+    if (!jit->code_hi || !ranges_overlap(addr, len, jit->code_lo,
+                                         jit->code_hi - jit->code_lo)) {
+        pthread_mutex_unlock(&jit_lock);
+        return;
+    }
     for (size_t k = 0; k < jit->n_live && !invalidated; k++) {
         JitBlock *b = jit->live[k];
         /* cheap block-range test first (insns are contiguous) */

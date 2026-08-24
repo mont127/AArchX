@@ -3062,6 +3062,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [313] = { "psynch_rw_unlock2", 5, 0x01, 0, NULL },
     [529] = { "psynch_cvclrprepost", 7, 0x01, 0, NULL },
     [394] = { "pselect",        6, 0x3e, 0, NULL },
+    [530] = { "kqueue_workloop_ctl", 4, 0x04, 0, NULL },
     [395] = { "pselect_nocancel", 6, 0x3e, 0, NULL },
     [396] = { "read_nocancel",  3, 0x02, 0, NULL },
     [397] = { "write_nocancel", 3, 0x02, 0, NULL },
@@ -3138,11 +3139,16 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
 
     if (!e) {
 
-        if (getenv("OCERZ_SYSPROBE")) {
+        /* Aborting here is worse than failing the call: the guest thread dies
+         * wherever it stood, and under Wine that is often inside LdrLoadDll
+         * holding the loader lock, which deadlocks every other thread. Report
+         * once and hand back ENOSYS so the caller can take its fallback.
+         * OCERZ_STRICT_SYSCALL restores the abort for bring-up work. */
+        if (!getenv("OCERZ_STRICT_SYSCALL")) {
             static uint8_t probed[OCERZ_BSD_MAX];
             if (num >= 0 && num < OCERZ_BSD_MAX && !probed[num]) {
                 probed[num] = 1;
-                fprintf(stderr, "ocerz: SYSPROBE missing class=2 num=%d rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx\n",
+                fprintf(stderr, "ocerz: unimplemented BSD syscall num=%d -> ENOSYS rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx\n",
                         num, (unsigned long long)cpu->rip,
                         (unsigned long long)cpu->gpr[OCERZ_RDI], (unsigned long long)cpu->gpr[OCERZ_RSI],
                         (unsigned long long)cpu->gpr[OCERZ_RDX], (unsigned long long)cpu->gpr[OCERZ_R10]);
@@ -3280,6 +3286,15 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     {
         static int nlog = -1;
         if (nlog < 0) nlog = getenv("OCERZ_NETLOG") ? 1 : 0;
+        if (nlog && num == 363 && a[1] && (int64_t)a[2] > 0) {
+            struct kevc { uint64_t ident; int16_t filter; uint16_t flags;
+                          uint32_t fflags; int64_t data; uint64_t udata; };
+            const struct kevc *cl = (const struct kevc *)(uintptr_t)a[1];
+            for (int64_t i = 0; i < (int64_t)a[2] && i < 8; i++)
+                fprintf(stderr, "ocerz: KEVCH[%d] ident=%llu filter=%d flags=%#x\n",
+                        (int)getpid(), (unsigned long long)cl[i].ident,
+                        (int)cl[i].filter, cl[i].flags);
+        }
         if (nlog && num == 363 && (int64_t)r > 0 && a[3]) {
             struct kev { uint64_t ident; int16_t filter; uint16_t flags;
                          uint32_t fflags; int64_t data; uint64_t udata; };
