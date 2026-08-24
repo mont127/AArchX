@@ -2402,6 +2402,20 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 (unsigned long long)(signo < OCERZ_NSIG ? guest_sigact[signo].handler : 0));
     }
     (void)vm; (void)signo;
+    if (signo == 6) {
+        /* guest abort(): fatal and otherwise silent (stderr may be closed) */
+        fprintf(stderr, "ocerz: GUEST-ABORT[%d] cpu#%u rip=%#llx bt:",
+                (int)getpid(), cpu->cpu_number, (unsigned long long)cpu->rip);
+        uint64_t fp = cpu->gpr[OCERZ_RBP];
+        for (int d = 0; d < 10 && fp > 0x1000 && ocerz_addr_readable(fp + 8); d++) {
+            fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+            uint64_t nf = ocerz_ld(fp, 8);
+            if (nf <= fp) break;
+            fp = nf;
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
 
     int err = 0;
     uint64_t r = ocerz_host_syscall(328, a, NULL, &err);
