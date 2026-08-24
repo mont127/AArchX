@@ -1,5 +1,6 @@
 /* The guest-to-host syscall boundary: emulated x86_64 syscalls onto the arm64 kernel. */
 #include "ocerz/syscall.h"
+#include "ocerz/cache.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/jit.h"
@@ -408,6 +409,21 @@ static int sys_munmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 static int sys_mprotect(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     memtrace("mprotect", a[0], a[1], (int)a[2], 0);
+    /* mprotect on a shared-cache page (1:1 mapped, outside the guest arena):
+     * some engines make a libsystem page writable to patch it in place.  The
+     * arena logic would ENOMEM it, so forward straight to the host and drop
+     * PROT_EXEC (guest code is JIT'd, never host-executed). */
+    if (ocerz_cache_lazy_region((uintptr_t)a[0])) {
+        int prot = (int)a[2] & ~PROT_EXEC;
+        int rc = mprotect((void *)(uintptr_t)a[0], (size_t)a[1], prot ? prot : PROT_READ);
+        if (rc == 0) {
+            if ((int)a[2] & PROT_WRITE) invalidate_guest_mapping(vm, a[0], a[1]);
+            ret_ok(cpu, 0);
+        } else {
+            ret_err(cpu, errno);
+        }
+        return OCERZ_STEP_OK;
+    }
     if (((int)a[2] & PROT_WRITE) && shared_ro_overlaps(a[0], a[1]))
         ocerz_jit_require_ordered(vm);
     invalidate_guest_mapping(vm, a[0], a[1]);
