@@ -48,11 +48,11 @@ make i386diff
 | x86-64 decode | 199 / 199 cases |
 | i386 decode | 102 cases, 26 rejects, 122 address cases |
 | extension / SSE suites | 233 / 0, 246 / 0 |
-| loader / syscall suites | 54 / 0, 250 / 0 |
-| memory / shared mappings | 2690 / 0, 91 / 0 |
+| loader / syscall suites | 54 / 0, 324 / 0 |
+| memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 65 / 65 |
-| x86-64 differential gate | 53 / 53 |
+| x86-64 guest gate | 65 / 66 |
+| x86-64 differential gate | 54 / 54 |
 | i386 differential gate | 20,032 / 20,032 |
 
 Highlights:
@@ -76,6 +76,8 @@ export WINEPREFIX="$HOME/.wine-ocerz"
 ./ocerz "$WINE/bin/wine" notepad
 ```
 
+MacNdCheese's Wine build also runs under Ocerz. Steam loads its own DLLs, completes its update check against the Steam CDN, and reaches the client core. Signing in does not complete yet.
+
 Rosetta also runs i386 PE code through Wine WoW64. Ocerz's i386 support is replacement parity, not an exclusive capability. Standalone i386 Mach-O applications are not supported by current macOS SDKs or macOS itself.
 
 ## Benchmarks
@@ -84,23 +86,23 @@ Ratio is Ocerz time divided by Rosetta time. Lower is better.
 
 | Kernel | Static | Dynamic |
 | --- | ---: | ---: |
-| `depchain` | **0.85x** | **0.85x** |
-| `jtab` | **0.93x** | **0.90x** |
-| `memcpy` | **0.93x** | **0.97x** |
-| `brmiss` | **0.96x** | **0.96x** |
+| `depchain` | **0.86x** | **0.85x** |
+| `jtab` | **0.93x** | **0.91x** |
+| `memcpy` | **0.93x** | **0.96x** |
+| `brmiss` | **0.95x** | **0.96x** |
 | `fpvec` | **0.96x** | **0.96x** |
 | `qsort` | **0.98x** | 1.00x |
-| `str` | **0.99x** | 1.04x |
-| `icall` | **0.99x** | **0.99x** |
-| `chase` | 1.00x | **0.97x** |
-| `hash` | 1.00x | 1.01x |
-| `vm` | 1.00x | **0.96x** |
-| `idiv` | 1.05x | 1.03x |
-| `leafcall` | 1.18x | 1.17x |
-| `fpsse` | 1.21x | 1.20x |
-| `mixed` | 1.22x | 1.21x |
+| `str` | **0.98x** | 1.04x |
+| `idiv` | **0.99x** | **0.99x** |
+| `vm` | **0.99x** | **0.95x** |
+| `chase` | 1.00x | 1.02x |
+| `hash` | 1.02x | 1.00x |
+| `icall` | 1.05x | 1.05x |
+| `leafcall` | 1.18x | 1.18x |
+| `fpsse` | 1.20x | 1.20x |
+| `mixed` | 1.22x | 1.19x |
 
-Apple M2 Max, 2026-08-17, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`; set `XB=tests/guest/benchbin/xbench_dyn` for the dynamic binary.
+Apple M2 Max, 2026-08-25, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`; set `XB=tests/guest/benchbin/xbench_dyn` for the dynamic binary.
 
 ## CLI
 
@@ -125,6 +127,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `OCERZ_NO_PLAIN_MEM=1` | use ordered memory forms from startup |
 | `OCERZ_TSO_STRICT=1` | order stack-relative memory accesses too |
 | `OCERZ_PRELOAD_OBJC=<paths>` | preload matching shared-cache Objective-C images |
+| `OCERZ_STRICT_SYSCALL=1` | abort on an unimplemented syscall instead of returning `ENOSYS` |
 
 ## Architecture
 
