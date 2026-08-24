@@ -576,6 +576,14 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
 __thread int ocerz_jit_exec_state;   /* crash diagnostics: 1 = in exec_one (slow call), 2 = in jit_interp_block */
 int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
+    if (__builtin_expect(insn->op == OCERZ_OP_SYSCALL && !insn->mode32 &&
+                         cpu->gpr[OCERZ_RAX] == ((2ull << 24) | 2), 0)) {
+        /* A fork child cannot execute its inherited MAP_JIT pages.  Return to
+         * the C dispatcher before entering the host fork. */
+        cpu->cur_rip = insn->rip;
+        cpu->rip = insn->rip;
+        return OCERZ_EUNSUP;
+    }
     if (__builtin_expect(ocerz_perfstat > 0, 0))
         jit_perfstat_one(insn);
     vm->insn_count++;
@@ -863,6 +871,10 @@ static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth)
     return (t && t->code) ? (uint64_t)t->entry_live : xlive_decode_entry_d(rip, depth);
 }
 static uint64_t xlive_succ_live(OcerzJit *jit, uint64_t rip) { return xlive_succ_live_d(jit, rip, 0); }
+
+#define JIT_EXIT_SITE_MAX (2 * JIT_MAX_BLOCK_INSNS + 64)
+static uint32_t *g_terminal_exit_sites[JIT_EXIT_SITE_MAX];
+static int g_n_terminal_exit_sites;
 
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
 
@@ -9519,7 +9531,8 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
 
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
-
+    (void)exit_sites;
+    (void)n_exits;
     emit_materialize(b);
 
     emit_xmm_pin_spill_all(b);           /* interpreter reads/writes cpu->xmm */
@@ -9530,12 +9543,11 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_jit_exec_one);
     a64_blr(b, 16);
     g_callout_seq++;
-    emit_fill_pinned(b);
-    emit_xmm_pin_load_all(b);            /* BEFORE the exit test: exit_label spills V regs,
-                                            so they must equal memory on that path too */
-    exit_sites[*n_exits] = a64_label(b);
+    assert(g_n_terminal_exit_sites < JIT_EXIT_SITE_MAX);
+    g_terminal_exit_sites[g_n_terminal_exit_sites++] = a64_label(b);
     a64_cbnz(b, 0, 0, 0);
-    (*n_exits)++;
+    emit_fill_pinned(b);
+    emit_xmm_pin_load_all(b);
     emit_reload_jgb(b);           /* JGB first: the hoisted bases derive from it */
     emit_reload_mem_base(b);
 }
@@ -10444,6 +10456,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     /* Out-of-line slow-arm and stop-site state MUST start clean: a translation that returns without */
     g_n_oolslow = 0;
     g_oolslow_pre = 0;
+    g_n_terminal_exit_sites = 0;
     g_n_stop_extra = 0;
     g_xlat_jit = jit;
     g_self_rip = rip;
@@ -10880,8 +10893,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                     100.0 * (double)killed / (double)wrote);
     }
 
-    uint32_t *exit_sites[2 * JIT_MAX_BLOCK_INSNS + 64];
-    uint32_t *epi_sites[2 * JIT_MAX_BLOCK_INSNS + 64];
+    uint32_t *exit_sites[JIT_EXIT_SITE_MAX];
+    uint32_t *epi_sites[JIT_EXIT_SITE_MAX];
     int n_exits = 0;
     int n_epi = 0;
     int8_t fpb_of[JIT_MAX_BLOCK_INSNS];
@@ -11207,6 +11220,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         a64_ldp_post(&b, 29, 30, 31, 16);
         a64_ret(&b);
     }
+    uint32_t *terminal_exit_label = NULL;
+    if (g_n_terminal_exit_sites) {
+        terminal_exit_label = a64_label(&b);
+        emit_frame_sp_reset(&b);
+        emit_pin_epilogue_restore(&b);
+        a64_ldp_post(&b, 19, 20, 31, 16);
+        a64_ldp_post(&b, 29, 30, 31, 16);
+        a64_ret(&b);
+    }
     /* superblock side exits: out-of-line chain stubs for the taken targets */
     int side_patch_oor = 0;
     for (int k = 0; k < g_n_side; k++) {
@@ -11338,6 +11360,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     if (!b.overflow) {
         for (int i = 0; i < n_exits; i++)
             a64_patch_cbz(exit_sites[i], exit_label);
+        for (int i = 0; i < g_n_terminal_exit_sites; i++)
+            a64_patch_cbz(g_terminal_exit_sites[i], terminal_exit_label);
         for (int i = 0; i < n_epi; i++)
             a64_patch_b(epi_sites[i], exit_label);
 

@@ -647,12 +647,14 @@ static uint64_t ocerz_kev_stride(void)
 #define OCERZ_KEVENT_QOS_S (ocerz_kev_stride())
 
 #define OCERZ_WQ_KEVENT_LIST_LEN 16
+#define OCERZ_OOL_COPY_MAX (64ull * 1024 * 1024)
 
 #define OCERZ_KEVENT_QOS_REARM ((uint64_t)0x48)
 
 static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]);
 static void ocerz_hostwq_register(OcerzVM *vm);
 static void ocerz_kev_timer_to_host(void *hev, int nev);
+void ocerz_unstick_start(void);
 
 #define OCERZ_EVFILT_TIMER (-7)
 #define OCERZ_NOTE_LEEWAY   0x00000010u
@@ -787,6 +789,7 @@ static int ocerz_spawn_worker(OcerzVM *vm, const OcerzCPU *tmpl)
         free(w);
         return -1;
     }
+    ocerz_unstick_start();
     return 0;
 }
 
@@ -1030,7 +1033,11 @@ static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         fprintf(stderr, "\n");
     }
     execve(self, hargv, a[2] ? henv : NULL);
-    ret_err(cpu, (uint64_t)errno);
+    int exec_errno = errno;
+    if (getenv("OCERZ_EXECLOG"))
+        fprintf(stderr, "ocerz: EXECFAIL[%d] %s: %s (%d)\n",
+                (int)getpid(), self, strerror(exec_errno), exec_errno);
+    ret_err(cpu, (uint64_t)exec_errno);
     return OCERZ_STEP_OK;
 }
 
@@ -1322,6 +1329,30 @@ static void ocerz_shadow_scan(const char *tag, uint64_t id, uint64_t gaddr, uint
     }
 }
 
+static void ocerz_release_received_ool(const mach_msg_descriptor_t *descriptor,
+                                       uint8_t type, uint64_t address,
+                                       uint64_t bytes, int keep_port_rights)
+{
+    if (!address || !bytes || getenv("OCERZ_KEEP_RAW_OOL"))
+        return;
+    if (type == MACH_MSG_OOL_PORTS_DESCRIPTOR && !keep_port_rights) {
+        struct {
+            mach_msg_header_t header;
+            mach_msg_body_t body;
+            mach_msg_ool_ports_descriptor_t descriptor;
+        } message;
+        memset(&message, 0, sizeof message);
+        message.header.msgh_bits = MACH_MSGH_BITS_COMPLEX;
+        message.header.msgh_size = sizeof message;
+        message.body.msgh_descriptor_count = 1;
+        memcpy(&message.descriptor, descriptor,
+               sizeof message.descriptor);
+        mach_msg_destroy(&message.header);
+        return;
+    }
+    mach_vm_deallocate(mach_task_self(), address, bytes);
+}
+
 static uint64_t ocerz_bridge_mach_msg(uint64_t hbuf, uint64_t sz)
 {
     if (!hbuf || !sz || sz > 0x100000)
@@ -1363,12 +1394,14 @@ static uint64_t ocerz_bridge_mach_msg(uint64_t hbuf, uint64_t sz)
 
                 uint64_t bytes = (type == 2) ? (uint64_t)ool_n * 4u : ool_n;
                 if (g_mm_log)
-                    fprintf(stderr, "ocerz: BRIDGE-OOL type=%u ool_addr=%#llx bytes=%#llx%s\n",
-                            type, (unsigned long long)ool_addr, (unsigned long long)bytes,
-                            bytes > 0x1000000 ? "  **OVER-16MB-SKIPPED**" : "");
-                if (ool_addr && bytes && bytes <= 0x1000000) {
-                    uint64_t ogb = ocerz_map_anywhere((bytes + 0x3fffull) & ~0x3fffull,
-                                                      PROT_READ | PROT_WRITE);
+                    fprintf(stderr, "ocerz: BRIDGE-OOL type=%u ool_addr=%#llx bytes=%#llx\n",
+                            type, (unsigned long long)ool_addr,
+                            (unsigned long long)bytes);
+                if (ool_addr && bytes) {
+                    uint64_t ogb = bytes <= OCERZ_OOL_COPY_MAX
+                        ? ocerz_map_anywhere((bytes + 0x3fffull) & ~0x3fffull,
+                                            PROT_READ | PROT_WRITE)
+                        : 0;
                     if (ogb) {
                         memcpy(ocerz_g2h(ogb), (const void *)(uintptr_t)ool_addr, (size_t)bytes);
                         memcpy(g + off, &ogb, 8);
@@ -2035,6 +2068,8 @@ static void ocerz_hostwq_register(OcerzVM *vm)
         g_hostwq_vm = vm;
         int rc = _pthread_workqueue_init_with_workloop(
             ocerz_hostwq_queue_cb, ocerz_hostwq_kevent_cb, ocerz_hostwq_workloop_cb, 0, 0);
+        if (rc == 0)
+            ocerz_unstick_start();
         if (getenv("OCERZ_HOSTWQ_LOG"))
             fprintf(stderr, "ocerz: HOSTWQ registered rc=%d\n", rc);
     }
@@ -2269,6 +2304,7 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         ret_err(cpu, OCERZ_ENOMEM_V);
         return OCERZ_STEP_OK;
     }
+    ocerz_unstick_start();
     ret_ok(cpu, pth);
     return OCERZ_STEP_OK;
 }
@@ -2985,7 +3021,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [414] = { "pread_nocancel", 4, 0x02, 0, NULL },
     [415] = { "pwrite_nocancel",4, 0x02, 0, NULL },
     [417] = { "poll_nocancel", 3, 0x02, 0, NULL },
-    [420] = { "sem_wait_nocancel", 1, 0x00, 0, sys_workq_stub },
+    [420] = { "sem_wait_nocancel", 1, 0x00, 0, NULL },
     [423] = { "__semwait_signal_nocancel", 6, 0x00, 0, NULL },
     [427] = { "fsgetpath",   4, 0x05, 0, NULL },
     [428] = { "audit_session_self", 0, 0x00, 0, NULL },
@@ -3477,52 +3513,6 @@ static int ocerz_alias_raw_contiguous(OcerzVM *vm, uint64_t pointer)
     return ocerz_addr_readable(pointer) ? 0 : -1;
 }
 
-static int ocerz_alias_raw_range(OcerzVM *vm, uint64_t pointer, uint64_t bytes)
-{
-    if (!pointer || !bytes || bytes > UINT64_MAX - pointer)
-        return -1;
-    uint64_t end = pointer + bytes;
-    mach_vm_address_t first = pointer;
-    mach_vm_size_t first_size = 0;
-    vm_region_basic_info_data_64_t first_info;
-    mach_msg_type_number_t first_count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t first_object = MACH_PORT_NULL;
-    kern_return_t kr =
-        mach_vm_region(mach_task_self(), &first, &first_size,
-                       VM_REGION_BASIC_INFO_64,
-                       (vm_region_info_t)&first_info, &first_count,
-                       &first_object);
-    if (first_object != MACH_PORT_NULL)
-        mach_port_deallocate(mach_task_self(), first_object);
-    if (kr != KERN_SUCCESS || first > pointer ||
-        pointer - first >= first_size)
-        return -1;
-
-    uint64_t pos = (uint64_t)first;
-    for (int i = 0; i < 4096; i++) {
-        mach_vm_address_t region = pos;
-        mach_vm_size_t size = 0;
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t object = MACH_PORT_NULL;
-        kr = mach_vm_region(mach_task_self(), &region, &size,
-                            VM_REGION_BASIC_INFO_64,
-                            (vm_region_info_t)&info, &count, &object);
-        if (object != MACH_PORT_NULL)
-            mach_port_deallocate(mach_task_self(), object);
-        if (kr != KERN_SUCCESS || region != pos || size == 0 ||
-            size > UINT64_MAX - pos)
-            return -1;
-        if (ocerz_alias_raw_region(vm, pos) != 0)
-            return -1;
-        pos += size;
-        if (pos >= end)
-            return ocerz_addr_readable(pointer) &&
-                   ocerz_addr_readable(end - 1) ? 0 : -1;
-    }
-    return -1;
-}
-
 static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
                                   int preserve_address,
                                   uint64_t requested_size)
@@ -3640,8 +3630,8 @@ static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
                 (unsigned long long)gaddr);
 }
 
-static void ocerz_reply_relocate_ool(OcerzVM *vm, uint64_t reply_buf,
-                                     uint32_t recv_size, int trap)
+static void ocerz_reply_relocate_ool(uint64_t reply_buf, uint32_t recv_size,
+                                     int trap)
 {
     uint32_t bits = (uint32_t)ocerz_ld(reply_buf, 4);
     if (!(bits & 0x80000000u))
@@ -3669,35 +3659,23 @@ static void ocerz_reply_relocate_ool(OcerzVM *vm, uint64_t reply_buf,
                 break;
             uint64_t ool_addr = ocerz_ld(reply_buf + off, 8);
             uint32_t ool_n = (uint32_t)ocerz_ld(reply_buf + off + 12, 4);
+            mach_msg_descriptor_t raw_descriptor;
+            memcpy(&raw_descriptor, ocerz_g2h(reply_buf + off),
+                   sizeof raw_descriptor);
 
             uint64_t bytes = (type == 2) ? (uint64_t)ool_n * 4u : ool_n;
             int host_owned = ool_addr &&
-                             !(ool_addr >= ocerz_arena_lo && ool_addr < ocerz_arena_hi);
+                             !ocerz_host_in_guest_space(
+                                 (const void *)(uintptr_t)ool_addr);
             if (rlog)
-                fprintf(stderr, "ocerz: REPLY-OOL(t%d)[%d] type=%u ool_addr=%#llx bytes=%#llx host=%d%s\n",
+                fprintf(stderr, "ocerz: REPLY-OOL(t%d)[%d] type=%u ool_addr=%#llx bytes=%#llx host=%d\n",
                         trap, (int)getpid(), type, (unsigned long long)ool_addr,
-                        (unsigned long long)bytes, host_owned,
-                        bytes > 0x1000000 ? "  **OVER-16MB-LEFT-RAW**" : "");
-            if (ooltrace && host_owned && bytes > 0x1000000)
-                fprintf(stderr, "ocerz: OOLTRACE-RAW16(t%d)[%d] id=%u type=%u ool_addr=%#llx bytes=%#llx LEFT-RAW\n",
-                        trap, (int)getpid(), reply_id, type,
-                        (unsigned long long)ool_addr, (unsigned long long)bytes);
-            if (host_owned && bytes && bytes <= 0x1000000 &&
-                ocerz_low_base && ool_addr < OCERZ_LOW_LIMIT &&
-                bytes <= OCERZ_LOW_LIMIT - ool_addr &&
-                ocerz_alias_raw_range(vm, ool_addr, bytes) == 0) {
-                if (ooltrace)
-                    fprintf(stderr,
-                            "ocerz: OOLTRACE-ALIAS(t%d)[%d] id=%u type=%u raw=%#llx bytes=%#llx\n",
-                            trap, (int)getpid(), reply_id, type,
-                            (unsigned long long)ool_addr,
-                            (unsigned long long)bytes);
-                off += 16;
-                continue;
-            }
-            if (host_owned && bytes && bytes <= 0x1000000) {
-                uint64_t gb = ocerz_map_anywhere((bytes + 0x3fffull) & ~0x3fffull,
-                                                 PROT_READ | PROT_WRITE);
+                        (unsigned long long)bytes, host_owned);
+            if (host_owned && bytes) {
+                uint64_t gb = bytes <= OCERZ_OOL_COPY_MAX
+                    ? ocerz_map_anywhere((bytes + 0x3fffull) & ~0x3fffull,
+                                         PROT_READ | PROT_WRITE)
+                    : 0;
                 if (gb) {
                     memcpy(ocerz_g2h(gb), (const void *)(uintptr_t)ool_addr, (size_t)bytes);
                     ocerz_st(reply_buf + off, 8, gb);
@@ -3710,6 +3688,8 @@ static void ocerz_reply_relocate_ool(OcerzVM *vm, uint64_t reply_buf,
                     ocerz_st(reply_buf + off, 8, 0);
                     ocerz_st(reply_buf + off + 12, 4, 0);
                 }
+                ocerz_release_received_ool(&raw_descriptor, type, ool_addr,
+                                           bytes, gb != 0);
             }
             off += 16;
             continue;
@@ -4044,7 +4024,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0)
             ocerz_reply_xlate_vm_region(gmsg31, (uint32_t)a[3], vm_region_req31);
         if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0)
-            ocerz_reply_relocate_ool(vm, gmsg31, (uint32_t)a[3], 31);
+            ocerz_reply_relocate_ool(gmsg31, (uint32_t)a[3], 31);
         if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0)
             ocerz_reply_alias_iokit(vm, gmsg31, (uint32_t)a[3]);
         if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0) {
@@ -4303,8 +4283,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
 
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
-            ocerz_reply_relocate_ool(vm, mach_reply_buf,
-                                     mach_reply_size, 47);
+            ocerz_reply_relocate_ool(mach_reply_buf, mach_reply_size, 47);
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_reply_alias_iokit(vm, mach_reply_buf, mach_reply_size);
         {

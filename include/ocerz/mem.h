@@ -64,7 +64,8 @@ static inline int ocerz_host_in_guest_space(const void *haddr)
         if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
             return 1;
     }
-    return h - ocerz_guest_base < ocerz_arena_hi;
+    uint64_t g = h - ocerz_guest_base;
+    return g >= ocerz_arena_lo && g < ocerz_arena_hi;
 }
 
 int ocerz_mem_init(uint64_t lo, uint64_t hi);

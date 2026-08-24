@@ -42,6 +42,7 @@ uint64_t ocerz_exc_trap_rip;      /* OCERZ_EXCLOG: guest _objc_exception_throw e
 static volatile int g_btrace_req;
 static int g_btrace_on = -1;
 static OcerzCPU *g_fork_surviving_cpu;
+static int g_unstick_started;
 
 static void ocerz_cpu_register(OcerzCPU *cpu)
 {
@@ -187,6 +188,7 @@ void ocerz_vm_atfork_child(void)
     g_fork_surviving_cpu = NULL;
     g_pending_async_mask = 0;
     g_riphist_n = 0;
+    __atomic_store_n(&g_unstick_started, 0, __ATOMIC_RELEASE);
     /* The MAP_JIT arena is inherited READ-ONLY-EXECUTABLE-WISE-BROKEN by a
      * fork child on Apple silicon: the pages read fine but executing them
      * raises SIGBUS (seen as the rare early-exit crash of wine's double-fork
@@ -1752,7 +1754,6 @@ static void ocerz_install_kick_handler(void);
 void ocerz_vm_install_handlers(OcerzVM *vm)
 {
     ocerz_install_kick_handler();
-    { void ocerz_unstick_start(void); ocerz_unstick_start(); }
     extern int ocerz_cftrap_on;
     ocerz_cftrap_on = getenv("OCERZ_CFTRAP") != NULL;
     g_crash_stack = getenv("OCERZ_CRASH_STACK") != NULL;
@@ -2123,12 +2124,18 @@ static void *ocerz_unstick_thread(void *arg)
 }
 void ocerz_unstick_start(void)
 {
-    static int started;
-    if (started || getenv("OCERZ_NO_UNSTICK")) return;
-    started = 1;
+    if (getenv("OCERZ_NO_UNSTICK"))
+        return;
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&g_unstick_started, &expected, 1, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return;
     pthread_t t;
-    if (pthread_create(&t, NULL, ocerz_unstick_thread, NULL) == 0)
+    if (pthread_create(&t, NULL, ocerz_unstick_thread, NULL) == 0) {
         pthread_detach(t);
+    } else {
+        __atomic_store_n(&g_unstick_started, 0, __ATOMIC_RELEASE);
+    }
 }
 
 void ocerz_vm_request_exit(OcerzVM *vm, int code)
