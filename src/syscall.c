@@ -3061,6 +3061,8 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [312] = { "psynch_rw_unlock",  5, 0x01, 0, NULL },
     [313] = { "psynch_rw_unlock2", 5, 0x01, 0, NULL },
     [529] = { "psynch_cvclrprepost", 7, 0x01, 0, NULL },
+    [394] = { "pselect",        6, 0x3e, 0, NULL },
+    [395] = { "pselect_nocancel", 6, 0x3e, 0, NULL },
     [396] = { "read_nocancel",  3, 0x02, 0, NULL },
     [397] = { "write_nocancel", 3, 0x02, 0, NULL },
     [398] = { "open_nocancel",  3, 0x01, 0, NULL },
@@ -3272,8 +3274,43 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         (orig[2] == 8 || orig[2] == 16 || orig[2] == 64 || orig[2] == 80 ||
          num == 121);
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t t0blk = cpu->block_since_ns;
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
+    {
+        static int nlog = -1;
+        if (nlog < 0) nlog = getenv("OCERZ_NETLOG") ? 1 : 0;
+        if (nlog && num == 363 && (int64_t)r > 0 && a[3]) {
+            struct kev { uint64_t ident; int16_t filter; uint16_t flags;
+                         uint32_t fflags; int64_t data; uint64_t udata; };
+            const struct kev *ev = (const struct kev *)(uintptr_t)a[3];
+            fprintf(stderr, "ocerz: KEV[%d] n=%llu ident=%llu filter=%d flags=%#x fflags=%#x data=%lld\n",
+                    (int)getpid(), (unsigned long long)r,
+                    (unsigned long long)ev->ident, (int)ev->filter,
+                    ev->flags, ev->fflags, (long long)ev->data);
+        }
+        if (nlog && (num == 97 || num == 98 || num == 104 || num == 106 ||
+                     num == 30 || num == 133 || num == 29 || num == 361 ||
+                     num == 362 || num == 363 || num == 403 || num == 404 ||
+                     num == 413))
+            fprintf(stderr, "ocerz: NET[%d] num=%d(%s) a0=%#llx a1=%#llx a2=%#llx -> r=%llu err=%d\n",
+                    (int)getpid(), num,
+                    (num < OCERZ_BSD_MAX && bsd_table[num].name) ? bsd_table[num].name : "?",
+                    (unsigned long long)a[0], (unsigned long long)a[1],
+                    (unsigned long long)a[2], (unsigned long long)r, err);
+    }
+    {
+        static int slog = -1;
+        if (slog < 0) slog = getenv("OCERZ_SLOWBSD") ? 1 : 0;
+        if (slog) {
+            uint64_t el = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0blk;
+            if (el > 1500000000ull)
+                fprintf(stderr, "ocerz: SLOWBSD[%d] cpu#%u num=%d(%s) %llums -> r=%llu err=%d\n",
+                        (int)getpid(), cpu->cpu_number, num,
+                        (num < OCERZ_BSD_MAX && bsd_table[num].name) ? bsd_table[num].name : "?",
+                        (unsigned long long)(el / 1000000), (unsigned long long)r, err);
+        }
+    }
     {
         static int klog = -1;
         if (klog < 0) klog = getenv("OCERZ_KICKLOG") ? 1 : 0;
