@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 #include <pthread.h>
 #include <mach/mach.h>
 #include <mach/mig.h>
@@ -1548,9 +1549,24 @@ static void test_fork_dual_return(void)
 
 static void test_unknown_bsd(void)
 {
+    /* An unknown syscall fails the call rather than killing the thread:
+     * aborting left wine deadlocked when the thread died holding the
+     * loader lock. OCERZ_STRICT_SYSCALL restores the abort. */
     OcerzCPU *cpu = &vm.cpu;
     set_args(cpu, bsd(9999), 0, 0, 0, 0, 0, 0);
     int r = ocerz_handle_syscall(&vm, cpu);
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cf(cpu));
+    CHECK(cpu->gpr[OCERZ_RAX] == (uint64_t)ENOSYS);
+}
+
+static void test_unknown_bsd_strict(void)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    setenv("OCERZ_STRICT_SYSCALL", "1", 1);
+    set_args(cpu, bsd(9998), 0, 0, 0, 0, 0, 0);
+    int r = ocerz_handle_syscall(&vm, cpu);
+    unsetenv("OCERZ_STRICT_SYSCALL");
     CHECK(r == OCERZ_STEP_FATAL);
 }
 
@@ -1631,6 +1647,7 @@ int main(void)
     test_bsdthread_terminate_unmaps_stack();
     test_fork_dual_return();
     test_unknown_bsd();
+    test_unknown_bsd_strict();
     test_unknown_class();
     test_exit();
 
