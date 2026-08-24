@@ -10,6 +10,7 @@
 #include "ocerz/flags_live.h"
 #include "ocerz/a64emit.h"
 #include "ocerz/dyldapi.h"
+#include "ocerz/cache.h"
 
 #include <sys/mman.h>
 #include <pthread.h>
@@ -673,6 +674,9 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
         if (nl) { jit->live = nl; jit->cap_live = nc; }
     }
     if (jit->n_live < jit->cap_live) jit->live[jit->n_live++] = b;
+    if (b->n_insns > 0)
+        ocerz_cache_arm_exec(b->insns[0].rip,
+                             b->insns[b->n_insns - 1].rip + b->insns[b->n_insns - 1].len);
 }
 
 /* ---- monomorphic inline caches for indirect jmp/call ---------------------- Each */

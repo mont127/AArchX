@@ -15,6 +15,10 @@ typedef struct OcerzCache {
 int ocerz_cache_map(OcerzCache *c);
 int ocerz_cache_lazy_fault(uintptr_t addr);     /* SIGSEGV in a lazily-slid cache page: unpack + retry */
 int ocerz_cache_lazy_region(uintptr_t addr);
+int ocerz_cache_region(uintptr_t addr);                 /* anywhere in the mapped cache, TEXT included */
+int ocerz_cache_protect(uintptr_t addr, uint64_t len, int prot);
+int ocerz_cache_write_fault(uintptr_t addr);            /* store into a re-armed patched page */
+void ocerz_cache_arm_exec(uint64_t lo, uint64_t hi);    /* code translated out of [lo,hi) */
 uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol);
 
 uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found);

@@ -130,7 +130,7 @@ extern __thread int ocerz_jit_exec_state;
  * mid-flight); dumped by the UD2 diagnostics to correlate aborts like the
  * libplatform os_unfair_lock recursion with a preceding recovery */
 static __thread struct { uint32_t n; struct { uint8_t kind; uint64_t rip; uint64_t icount; } e[16]; } g_recov_ring;
-static const char *const g_recov_names[] = { "?", "ras-overflow", "align-interp", "worker-term", "commpage-interp", "sig-deliver", "wild-term" };
+static const char *const g_recov_names[] = { "?", "ras-overflow", "align-interp", "worker-term", "commpage-interp", "sig-deliver", "wild-term", "cache-patch" };
 void ocerz_recov_note(int kind, uint64_t rip)
 {
     unsigned i = g_recov_ring.n++ & 15;
@@ -954,6 +954,45 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 siglongjmp(*g_sig_recover, 1);
             }
             depth = 0;
+        }
+    }
+
+    /* Store into a shared-cache page the guest made writable to patch it.  The
+     * page is armed read-only once code has been translated out of it, so this
+     * fault IS the notification: grant write, drop the stale translations and
+     * restart the store. */
+    if ((sig == SIGSEGV || sig == SIGBUS) && !align_fault && depth == 0 &&
+        g_cur_cpu && g_sig_recover && ctx) {
+        const ucontext_t *uc = (const ucontext_t *)ctx;
+        uint64_t esr = uc->uc_mcontext->__es.__esr;
+        uint32_t ec = (uint32_t)((esr >> 26) & 0x3f);
+        if (ec != 0x20 && ec != 0x21 && (esr & (1u << 6)) &&
+            ocerz_cache_write_fault((uintptr_t)si->si_addr)) {
+            struct OcerzVM *fvm = g_cur_cpu->vm;
+            const void *hpc = (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+            uint64_t page = (uint64_t)(uintptr_t)si->si_addr & ~(OCERZ_HOST_PAGE_SIZE - 1);
+            uint64_t jrip = 0;
+            int in_jit = fvm && ocerz_jit_pc_in_arena(fvm, hpc) &&
+                         ocerz_jit_fault_rip(fvm, hpc, &jrip);
+            if (in_jit) {
+                depth = 1;
+                ocerz_jit_fault_recover_regs(fvm, hpc, uc->uc_mcontext->__ss.__x, g_cur_cpu);
+                ocerz_jit_fault_recover_xmm(fvm, hpc, uc->uc_mcontext->__ns.__v, g_cur_cpu);
+                ocerz_jit_fault_recover_flags(fvm, hpc, g_cur_cpu);
+                ocerz_flags_materialize(g_cur_cpu);
+            }
+            ocerz_jit_invalidate_range(fvm, page, OCERZ_HOST_PAGE_SIZE);
+            if (getenv("OCERZ_CACHEPATCHLOG"))
+                fprintf(stderr, "ocerz: CACHEPATCH[%d] rip=%#llx addr=%p injit=%d\n",
+                        (int)getpid(), (unsigned long long)jrip, si->si_addr, in_jit);
+            if (in_jit) {
+                g_cur_cpu->rip = jrip;
+                g_cur_cpu->sig_repeat = 0;
+                ocerz_recov_note(7, jrip);
+                depth = 0;
+                siglongjmp(*g_sig_recover, 1);
+            }
+            return;              /* interpreter store: retrying it is enough */
         }
     }
 
