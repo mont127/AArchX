@@ -108,6 +108,94 @@ static uint64_t build_version_at_least(uint32_t plat, uint32_t have, uint64_t q)
     return have >= qver;
 }
 
+static int dylib_name_matches(const char *install_name, const char *library_name)
+{
+    const char *leaf = strrchr(install_name, '/');
+    leaf = leaf ? leaf + 1 : install_name;
+    if (strcmp(leaf, library_name) == 0)
+        return 1;
+
+    size_t leaf_len = strlen(leaf);
+    size_t name_len = strlen(library_name);
+    if (leaf_len < name_len + 9 || strncmp(leaf, "lib", 3) != 0 ||
+        strcmp(leaf + leaf_len - 6, ".dylib") != 0 ||
+        strncmp(leaf + 3, library_name, name_len) != 0)
+        return 0;
+    return leaf[name_len + 3] == '.';
+}
+
+static int32_t link_time_library_version(const char *library_name)
+{
+    if (!library_name || !ocerz_main_mh)
+        return -1;
+
+    const struct mach_header_64 *h =
+        (const struct mach_header_64 *)ocerz_g2h(ocerz_main_mh);
+    if (h->magic != MH_MAGIC_64)
+        return -1;
+
+    const uint8_t *lc = (const uint8_t *)(h + 1);
+    const uint8_t *end = lc + h->sizeofcmds;
+    int32_t result = -1;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        if ((size_t)(end - lc) < sizeof(struct load_command))
+            break;
+        const struct load_command *l = (const void *)lc;
+        if (l->cmdsize < sizeof(*l) || (size_t)(end - lc) < l->cmdsize)
+            break;
+        if ((l->cmd == LC_LOAD_DYLIB || l->cmd == LC_LOAD_WEAK_DYLIB ||
+             l->cmd == LC_REEXPORT_DYLIB || l->cmd == LC_LOAD_UPWARD_DYLIB) &&
+            l->cmdsize >= sizeof(struct dylib_command)) {
+            const struct dylib_command *d = (const void *)lc;
+            uint32_t name_off = d->dylib.name.offset;
+            if (name_off < l->cmdsize) {
+                const char *install_name = (const char *)lc + name_off;
+                size_t avail = l->cmdsize - name_off;
+                if (memchr(install_name, '\0', avail) &&
+                    dylib_name_matches(install_name, library_name))
+                    result = (int32_t)d->dylib.current_version;
+            }
+        }
+        lc += l->cmdsize;
+    }
+    return result;
+}
+
+static int32_t runtime_library_version(const char *library_name)
+{
+    if (!library_name)
+        return -1;
+
+    for (int image = 0; image < g_closure_n; image++) {
+        const struct mach_header_64 *h =
+            (const struct mach_header_64 *)ocerz_g2h(g_closure_mh[image]);
+        if (h->magic != MH_MAGIC_64)
+            continue;
+        const uint8_t *lc = (const uint8_t *)(h + 1);
+        const uint8_t *end = lc + h->sizeofcmds;
+        for (uint32_t i = 0; i < h->ncmds; i++) {
+            if ((size_t)(end - lc) < sizeof(struct load_command))
+                break;
+            const struct load_command *l = (const void *)lc;
+            if (l->cmdsize < sizeof(*l) || (size_t)(end - lc) < l->cmdsize)
+                break;
+            if (l->cmd == LC_ID_DYLIB && l->cmdsize >= sizeof(struct dylib_command)) {
+                const struct dylib_command *d = (const void *)lc;
+                uint32_t name_off = d->dylib.name.offset;
+                if (name_off < l->cmdsize) {
+                    const char *install_name = (const char *)lc + name_off;
+                    size_t avail = l->cmdsize - name_off;
+                    if (memchr(install_name, '\0', avail) &&
+                        dylib_name_matches(install_name, library_name))
+                        return (int32_t)d->dylib.current_version;
+                }
+            }
+            lc += l->cmdsize;
+        }
+    }
+    return -1;
+}
+
 #define DYLDAPI_DISK_MAX 64
 static uint64_t g_disk_mh[DYLDAPI_DISK_MAX];
 static uint64_t g_disk_path[DYLDAPI_DISK_MAX];
@@ -1548,6 +1636,22 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         else if (idx < (uint32_t)g_closure_n)
             name = (uint64_t)(uintptr_t)cache_path_for_mh(g_cache, g_closure_mh[idx]);
         api_return(cpu, name);
+        return OCERZ_STEP_OK;
+    }
+    case 0x40: {
+        uint64_t name = cpu->gpr[OCERZ_RSI];
+        int32_t version = name
+            ? link_time_library_version((const char *)ocerz_g2h(name))
+            : -1;
+        api_return(cpu, (uint32_t)version);
+        return OCERZ_STEP_OK;
+    }
+    case 0x48: {
+        uint64_t name = cpu->gpr[OCERZ_RSI];
+        int32_t version = name
+            ? runtime_library_version((const char *)ocerz_g2h(name))
+            : -1;
+        api_return(cpu, (uint32_t)version);
         return OCERZ_STEP_OK;
     }
     case 0x50: {

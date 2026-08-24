@@ -5,263 +5,146 @@
 <h1 align="center"><em>Ocerz</em></h1>
 
 <p align="center">
-  <b>A from-scratch x86_64 → arm64 userspace binary translator for macOS.</b><br>
-  <sub>Zero Rosetta translation involvement.</sub>
+  <b>A from-scratch x86-64 to arm64 userspace binary translator for macOS.</b><br>
+  <sub>No Rosetta translation at runtime.</sub>
 </p>
-
-
-> [!WARNING]
-> This project is in BETA do not expect much of it in its current state. (ROSSETA IS STILL NEEDED)
-
 
 <p align="center">
   <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1-blue.svg">
-  <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-lightgrey.svg">
-  <img alt="language" src="https://img.shields.io/badge/C-c11-orange.svg">
+  <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
+  <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
 </p>
 
----
+> [!WARNING]
+> Ocerz is experimental. Do not use it for production workloads.
 
-Ocerz runs x86_64 Mach-O binaries directly on Apple Silicon. It does its own loading, decoding, flag emulation, JIT translation, dynamic linking and syscall forwarding to the native arm64 kernel. Rosetta 2 is never invoked.
+Ocerz loads and executes x86-64 Mach-O programs on Apple Silicon with its own decoder, interpreter, JIT, dynamic linker, and syscall layer. It also executes i386 PE code inside Wine's WoW64 process.
 
-It started as a static-binary translator. It now brings up its own dyld, mapping the real `dyld_shared_cache_x86_64`, linking against the system frameworks and driving the Objective-C runtime, which is enough to run unmodified macOS applications.
+The Rosetta package must be installed because it supplies macOS's x86-64 shared cache. Ocerz maps that cache itself and does not invoke Rosetta's translator.
 
-Ocerz ships no Apple code and reimplements no framework. It links the guest against the x86_64 frameworks already on your Mac, read at runtime from the system cryptex, the same way any program `dlopen`s a system library. Nothing is bundled or redistributed.
-
-> **Dependency:** that x86_64 framework cache is the one macOS ships as part of Rosetta support, so Rosetta must be *installed*. It is never *invoked* — Ocerz does not execute a single instruction through it.
+## Build And Run
 
 ```sh
-git clone https://github.com/mont127/Ocerz && cd Ocerz
-make check                                                 # build + run every test
-./ocerz tests/guest/bin/hello                              # a static guest binary
-./ocerz /Applications/SomeApp.app/Contents/MacOS/SomeApp   # a real x86_64 app
+make -j
+./ocerz tests/guest/bin/hello
+./ocerz /Applications/SomeApp.app/Contents/MacOS/SomeApp
 ```
 
-## Highlights
+Run the main gates with:
 
-- Own loader, decoder, interpreter, JIT, dynamic linker and syscall layer. No Rosetta, no QEMU, no LLVM.
-- `flags.c` is an eager bit-for-bit x86 flag reference, including the architecturally-undefined
-  bits, ADC/SBB carry-in and x86 NaN semantics. A differential suite checks interpreter against JIT.
-- The mini-dyld maps the live shared cache at slide 0, walks export tries, applies chained
-  fixups, runs initializers in dependency order and does the objc/dyld handshake.
-- Cocoa apps reach window creation against the real WindowServer.
-- arm64 encodings are validated by executing them, not by reading the manual.
+```sh
+make check
+make i386diff
+```
+
+`i386diff` requires the Python `capstone` package.
 
 ## Status
 
-`make check` is green:
-
-| Suite | Result |
+| Area | Current result |
 | --- | --- |
-| `a64emit` (run-don't-read encoder) | all encodings validated |
-| corpus length validation | 511 / 511 |
-| decode | 190 cases |
-| cache (shared-cache map/resolve) | 14 |
-| ext (strings/bits/CPUID/x87) | 165 |
-| interp | all assertions |
-| loader | 54 |
-| sse | 246 |
-| syscall | 96 |
+| arm64 emitter | encodings validated by execution |
+| instruction corpus | 511 instructions |
+| x86-64 decode | 199 / 199 cases |
+| i386 decode | 102 cases, 26 rejects, 122 address cases |
+| extension / SSE suites | 233 / 0, 246 / 0 |
+| loader / syscall suites | 54 / 0, 250 / 0 |
+| memory / shared mappings | 2690 / 0, 91 / 0 |
+| i386 interpreter / JIT / WoW64 | passing |
+| x86-64 guest gate | 65 / 65 |
+| x86-64 differential gate | 53 / 53 |
+| i386 differential gate | 20,032 / 20,032 |
 
-End-to-end, the suites that gate every commit:
+Highlights:
 
-| Gate | Command | Result |
-| --- | --- | --- |
-| guest binaries (interpreter, JIT, ordered mode, tiny-arena, `wine --version`) | `tests/run_guest_tests.sh` | 65 / 65 |
-| JIT-vs-interpreter differential | `tests/run_diff_test.sh` | 53 / 53 |
-| dynamic-mode `xbench` (plain and `OCERZ_NO_PLAIN_MEM=1`) | `tests/run_dyn_test.sh` | 15 / 15 each |
-| benchmark-binary differential | `tests/run_bench_diff.sh` | 4 / 4 |
-| dynamic linking against the live shared cache | `tests/run_dynamic_tests.sh` | 2 / 2 |
+- From-scratch Mach-O loader, x86 decoder, interpreter, arm64 JIT, mini-dyld, and syscall layer.
+- Live `dyld_shared_cache_x86_64` mapping, fixups, initializers, Objective-C registration, and `dlopen`/`dlsym` support.
+- Native guest threads, libdispatch workqueue bridging, Mach messages, signals, and x86-TSO memory ordering.
+- JIT cache invalidation for guest code writes and executable mapping changes.
+- Differential tests for x86-64 and i386 execution.
 
-`xbench` output is also checked byte-identical to Rosetta 2 in both plain and ordered memory mode.
+## Wine And i386
 
-JIT speedup on `fib(30)`: **0.59s → 0.08s (~7.5×)**.
+Wine 11.8 runs x86-64 and i386 PE applications through Ocerz. With a WoW64 prefix, 32-bit Notepad and WineMine load `winemac.drv` and create titled Cocoa windows. Wine launchers automatically enable the workqueue bridge and the targeted Objective-C category preload required by AppKit.
 
-### Real applications
+```sh
+WINE="/path/to/Wine Devel.app/Contents/Resources/wine"
+export WINEARCH=wow64
+export WINEPREFIX="$HOME/.wine-ocerz"
 
-Ocerz runs real x86_64 Cocoa apps end-to-end with zero translator faults.
+./ocerz "$WINE/bin/wine" wineboot -u
+./ocerz "$WINE/bin/wine" notepad
+```
 
-Nothing above the translator is reimplemented. libobjc (classes, categories, `+load`, protocols), Swift, libdispatch, XPC, Foundation and AppKit are Apple's own x86_64 code out of the shared cache, executed under translation. The one piece Ocerz supplies is dyld: it maps the cache, resolves and fixes up symbols, runs the initializers and answers the dyld API calls those frameworks make.
-
-`Mousecape.app` reaches window creation on the live WindowServer. Its main window comes up at 711×342 against a native Rosetta control's 711×339, alongside AppKit's four menu-bar windows at pixel-identical geometry.
-
-This is early. The window comes up on roughly half of launches; the other half hang before it appears. See [What does NOT work yet](#what-does-not-work-yet).
-
-> **Ocerz is more faithful than Rosetta for the test binaries.** The freestanding (`-nostdlib`, raw-syscall) guest tests actually *drop output lines* under Rosetta 2 — SSE printed 21 of 52 lines, even with vectorization off. Ocerz's output matches independent real-libc oracles (arm64-native and x86_64+printf) byte-for-byte. Goldens were regenerated from those oracles.
+Rosetta also runs i386 PE code through Wine WoW64. Ocerz's i386 support is replacement parity, not an exclusive capability. Standalone i386 Mach-O applications are not supported by current macOS SDKs or macOS itself.
 
 ## Benchmarks
 
-Same x86_64 binary run under both engines, same machine, best of three:
+Ratio is Ocerz time divided by Rosetta time. Lower is better.
 
-| Kernel | Rosetta 2 | Ocerz |
-| --- | --- | --- |
-| `alu` (register ALU loop) | 0.49s | 0.49s |
-| `br` (data-dependent branches) | 0.88s | 0.31s |
-| `fib(42)` (call/return) | 0.67s | 1.09s |
+| Kernel | Static | Dynamic |
+| --- | ---: | ---: |
+| `depchain` | **0.85x** | **0.85x** |
+| `jtab` | **0.93x** | **0.90x** |
+| `memcpy` | **0.93x** | **0.97x** |
+| `brmiss` | **0.96x** | **0.96x** |
+| `fpvec` | **0.96x** | **0.96x** |
+| `qsort` | **0.98x** | 1.00x |
+| `str` | **0.99x** | 1.04x |
+| `icall` | **0.99x** | **0.99x** |
+| `chase` | 1.00x | **0.97x** |
+| `hash` | 1.00x | 1.01x |
+| `vm` | 1.00x | **0.96x** |
+| `idiv` | 1.05x | 1.03x |
+| `leafcall` | 1.18x | 1.17x |
+| `fpsse` | 1.21x | 1.20x |
+| `mixed` | 1.22x | 1.21x |
 
-Branch-heavy code wins from two-way block linking, which jumps straight between compiled
-blocks instead of returning to the dispatcher. Both engines produce byte-identical output.
-`tests/run_bench_compare.sh` reproduces it.
-
-The wider `xbench` suite (`tests/guest/xbench.c`, 15 kernels) is measured with the
-paired-delta method of `tests/xbench_compare.py`: each kernel is timed at a scale and at
-half that scale under both engines, and the difference is compared, which cancels process
-startup and JIT warm-up. Ratio is Ocerz time over Rosetta 2 time (lower is better; below
-1.0 Ocerz is faster). Same static x86_64 binary, byte-identical output on every kernel:
-
-| Kernel | What it exercises | Rosetta 2 | Ocerz | Ratio |
-| --- | --- | --- | --- | --- |
-| `depchain` | long dependent integer chains | 0.151s | 0.129s | **0.85x** |
-| `memcpy` | memcpy of mixed sizes | 0.289s | 0.268s | **0.93x** |
-| `jtab` | switch / jump-table dispatch | 0.254s | 0.236s | **0.93x** |
-| `brmiss` | unpredictable branches | 0.198s | 0.190s | **0.96x** |
-| `fpvec` | packed single-precision loop (SSE) | 0.296s | 0.283s | **0.96x** |
-| `qsort` | recursive quicksort (compare + swap) | 0.291s | 0.286s | **0.98x** |
-| `str` | strlen/strcmp-style byte loops | 0.297s | 0.295s | **0.99x** |
-| `icall` | indirect calls through a function table | 0.233s | 0.232s | **0.99x** |
-| `chase` | pointer chasing (cache latency) | 0.294s | 0.294s | 1.00x |
-| `hash` | hashing (mul/xor/shift + loads) | 0.296s | 0.296s | 1.00x |
-| `vm` | bytecode-interpreter dispatch loop | 0.154s | 0.154s | 1.00x |
-| `idiv` | 64/32-bit unsigned division | 0.252s | 0.264s | 1.05x |
-| `leafcall` | many small non-recursive calls | 0.296s | 0.352s | 1.18x |
-| `fpsse` | scalar double chain with sqrt/div | 0.296s | 0.356s | 1.21x |
-| `mixed` | struct updates, FP compares, branches | 0.267s | 0.326s | 1.22x |
-
-(Apple M2 Max, `REPS=5`, quiet machine; kernels within about 1% of 1.0 trade places from
-run to run.)  Eight kernels are faster than Rosetta 2, three more are at parity, one within 5%,
-and the rest within 1.25x. What made the difference so far: full guest-register pinning
-with body-to-body block chaining, lazy flags with static producer/consumer fusion
-(`cmp`/`test`/shift results feed `jcc`, `setcc`, `cmov`, `adc` straight from NZCV, including
-the narrow 8/16-bit forms and across flag-neutral gaps such as `cmp; mov; cmova; cmovae`),
-cross-block flag liveness that peeks through direct calls and jumps (no flag-record spill
-before a call whose callee overwrites the flags), per-site caches for indirect branches with
-the target loaded like any other memory operand, direct `[guest_base, rsp]` addressing for
-push/pop/call/ret with the host `bl`/`ret` protocol and a host-stack return-address shadow,
-hoisted and cached effective addresses (up to three loop-invariant bases in registers, handed
-over across chained blocks, base+index reused across neighbouring accesses), superblocks
-across forward and backward branches, `cbz`/`cbnz` side exits, div/idiv on pinned registers,
-patch-and-signal stop requests instead of interrupt polls in loops, and FP "batches": runs
-of SSE arithmetic execute in place at native speed with one NaN check per run, replaying
-exactly from a checkpoint only when a NaN shows up (x86 NaN semantics are still bit-exact,
-checked by a 2,859-case golden test against Rosetta). Where Rosetta still wins it has
-hardware help Ocerz lacks: an x86-flavoured FP mode on Apple silicon and identity-mapped
-guest memory, and its ahead-of-time translation lays out call/return code without the
-per-call return-stack bookkeeping a block JIT needs.
-
-The same kernels built as an ordinary dynamically linked binary (`tests/guest/benchbin/xbench_dyn`:
-libSystem, dyld shared cache — the mode Wine and every real macOS binary run in) measure the
-same way (`OCERZ_HOSTWQ=1 XB=tests/guest/benchbin/xbench_dyn python3 tests/xbench_compare.py`,
-`REPS=5`): nine kernels are faster than Rosetta 2 — depchain 0.85x, jtab 0.90x, vm 0.96x,
-brmiss 0.96x, fpvec 0.96x, chase 0.97x, memcpy 0.97x (libc `memmove`), icall 0.99x,
-qsort 1.00x — and hash 1.01x, idiv 1.03x, str 1.04x (libc's SIMD `strlen`), leafcall 1.17x,
-fpsse 1.20x, mixed 1.21x. Guest memory is identity mapped in this mode, so push/pop/call/ret
-use the pre/post-indexed forms on the pinned rsp. Process startup for a dynamically linked
-binary is about 0.06 s (`wine --version`: 0.12 s).
-
-Loads and stores are plain `ldr`/`str` while the process is single-observer, and switch to
-the ordered (x86-TSO) forms once guest memory can be seen by another thread or process:
-`ldapur`/`stlur` (LRCPC2) for integer accesses, `ldr q`+`dmb ishld` for vector loads and a
-pair of `stlur`s for vector stores; rsp-relative accesses stay plain (thread-private stack;
-`OCERZ_TSO_STRICT=1` turns that off). Apple silicon faults when such an access crosses a
-16-byte granule, so the fault handler hot-patches that one instruction into an alignment-
-checked out-of-line arm and resumes; nothing is retranslated. Ordered-mode cost over plain
-on the static kernels (`OCERZ_NO_PLAIN_MEM=1`): leafcall 0.99x, str 1.06x, chase 1.11x,
-fpvec 1.45x, memcpy 2.8x (random-alignment `movups` copies); a store-only misaligned memset
-loop runs 3.5x faster than under Rosetta. Before this work the same mode cost 2.4x on
-leafcall, 2.2x on memcpy and 28x on misaligned memset.
+Apple M2 Max, 2026-08-17, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`; set `XB=tests/guest/benchbin/xbench_dyn` for the dynamic binary.
 
 ## CLI
 
-```
+```text
 usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]
 ```
 
-| Flag | Effect |
+| Option | Effect |
 | --- | --- |
-| `-v` | verbose (repeatable, raises level) |
-| `-trace` | per-instruction trace |
-| `-strace` | syscall trace |
-| `-no-jit` | force the interpreter for **this process only** (JIT is on by default) |
-| `--` | end of Ocerz options; everything after is guest `argv` |
+| `-v` | increase logging level |
+| `-trace` | trace guest instructions |
+| `-strace` | trace guest syscalls |
+| `-no-jit` | interpret this process only |
+| `-path file` | load `file` while preserving the following guest arguments |
+| `--` | end Ocerz option parsing |
 
-`-no-jit` is an argv flag, so it does **not** survive `execve` — a guest that spawns children
-(Wine does, constantly) keeps running those under the JIT. Use the environment switch when you
-want a whole process tree interpreted, since the environment is inherited across exec:
-
-| Variable | Effect |
+| Environment | Effect |
 | --- | --- |
-| `OCERZ_NOJIT=1` | interpret every process in the tree |
-| `OCERZ_NOJIT_EXE=<substr>` | interpret only processes whose command line contains `<substr>` |
-| `OCERZ_HOSTWQ=1` | bridge guest libdispatch onto the host workqueue (required for Wine and most real apps) |
-| `OCERZ_NO_PLAIN_MEM=1` | force ordered (x86-TSO) memory forms everywhere |
-| `OCERZ_TSO_STRICT=1` | drop the thread-private-stack exemption in ordered mode |
+| `OCERZ_NOJIT=1` | interpret the entire process tree |
+| `OCERZ_NOJIT_EXE=<text>` | interpret matching process command lines |
+| `OCERZ_HOSTWQ=1` | enable the host workqueue bridge |
+| `OCERZ_NO_PLAIN_MEM=1` | use ordered memory forms from startup |
+| `OCERZ_TSO_STRICT=1` | order stack-relative memory accesses too |
+| `OCERZ_PRELOAD_OBJC=<paths>` | preload matching shared-cache Objective-C images |
 
 ## Architecture
 
-| Tier | Source | What it does |
+| Component | Source | Responsibility |
 | --- | --- | --- |
-| **Loader** | `loader.c` | Parses `LC_UNIXTHREAD` and `LC_MAIN` Mach-O, maps segments, builds the stack. |
-| **Decoder** | `decode.c` | x86_64 → internal `X86Insn` (the `OcerzOp` enum has 397 values). |
-| **Interpreter** | `interp*.c`, `flags.c` | GP core, SSE through an SSE4.1 subset (plus SSE3 `ADDSUBPS/PD`), x87-on-doubles, CPUID/RDTSC. |
-| **JIT** | `jit.c`, `a64emit.c` | Call-threaded basic-block translator emitting native arm64. |
-| **Mini-dyld** | `dyld.c`, `cache.c`, `dyldapi.c` | Shared cache, symbol resolution, fixups, initializers, the dyld API surface, objc handshake. |
-| **Syscalls** | `syscall.c` | BSD syscalls, Mach traps, signals, threads. |
+| Loader | `src/loader.c` | Mach-O parsing, mappings, initial stack |
+| Decoder | `src/decode.c` | x86-64/i386 to the 411-operation internal IR |
+| Interpreter | `src/interp*.c`, `src/flags.c` | reference execution and x86 flag semantics |
+| JIT | `src/jit.c`, `src/a64emit.c` | native arm64 code generation and linking |
+| Mini-dyld | `src/dyld.c`, `src/cache.c`, `src/dyldapi.c` | shared cache, symbols, fixups, Objective-C |
+| Syscalls | `src/syscall.c` | BSD, Mach, signals, threads, and WoW64 host calls |
 
-**Eager flags.** Flags are evaluated eagerly into `cpu->rflags`; `flags.c` is the bit-for-bit reference the JIT must match — ADC/SBB folded via carry-in relations, INC/DEC preserving CF, deterministic values for architecturally-undefined flags, and x86 NaN semantics (negative QNaN indefinite, propagation rules).
+## Limitations
 
-**The JIT.** A block is the straight-line run from an entry rip to the first control-flow or system instruction. Each block is decoded once; cheap ops are inlined as arm64 and everything else calls back into the shared interpreter dispatch, so the JIT and interpreter can never disagree on semantics. A 1GB `MAP_JIT` reservation (address space, not RSS) with `pthread_jit_write_protect_np` and per-block icache invalidation; a 2^20-bucket cache keyed by guest rip with a lock-free lookup on the hot path. Stack traffic (`push`/`pop`) is inlined natively, since it is ~27% of everything a real app executes. If the arena ever fills, a block is demoted to the interpreter tier rather than retried forever. Aligned guest loads/stores use ordinary `ldr`/`str` while the process is provably single-observer and upgrade to the ordered forms (`ldapur`/`stlur`, see below) once guest memory can be shared with another thread or process, so x86's TSO ordering survives arm64's weak memory model without paying for barriers that single-threaded code cannot observe.
-
-**The mini-dyld.** Maps the real `dyld_shared_cache_x86_64` at slide 0 and implements the dyld runtime API surface that libdyld's trampolines dispatch through — `dlopen`/`dlsym`, image lists, TLV, unwind, `_dyld_register_for_bulk_image_loads` — plus the objc↔dyld handshake (`_dyld_objc_register_callbacks`, `map_images`/`load_images`, and the shared cache's selector and class perfect-hash tables).
-
-**Syscalls.** BSD class-2 syscalls go to the native arm64 kernel via `svc #0x80` with per-syscall pointer-mask translation. Mach traps and `kernelrpc` vm calls are forwarded or intercepted onto the arena; Mach message OOL/port descriptors are translated in both directions. Guest signals are delivered with a faithful Darwin signal frame, and guest threads become real host threads, bridged to the host workqueue for libdispatch.
-
-**Address translation.** Every guest address `G` maps to host `G + ocerz_guest_base`. Static binaries get a non-zero `guest_base` (the QEMU technique): Ocerz reserves the guest range as one hintless `PROT_NONE` region, because arm64 macOS refuses mappings below the ASLR-slid main executable and ignores non-`MAP_FIXED` placement hints. Dynamic binaries instead run **identity-mapped** (`guest_base = 0`, `g2h(G) = G`) so the shared cache sits at its unslid addresses, with a separate 12GB **low-shadow** reservation backing guest addresses below `OCERZ_LOW_LIMIT`.
-
-## What does NOT work yet
-
-- A real app hangs on roughly half of launches (same family as the Wine hang below: a lost
-  completion in the libdispatch/run-loop bridge, not a translation fault). When it works, `Mousecape.app` reaches its window in ~19s and settles to 0% CPU. When it does not, the process parks at 0% CPU with no window and macOS reports "Application not responding": the main thread never services the run loop. Over 24 consecutive launches, 13 OK, 8 hung, 3 died. It is a lost-wakeup race in the libdispatch workloop bridge, where one workloop is armed (`EVFILT_WORKLOOP`, `EV_ADD|EV_ENABLE`) over 140 times, never drained, and everything parks. This is the single blocker to a usable app.
-- **Wine.** An unmodified x86_64 Wine 11.8 boots under Ocerz: `wineserver`, the service
-  processes, `explorer.exe` and `notepad.exe` all start, `winemac.drv` loads, Metal enumerates
-  the real GPU, and macdrv creates genuine Cocoa windows against the live WindowServer.
-  `notepad` renders its window (1026x769, titled) — but only on a minority of launches. The
-  rest hang with one wine GUI thread parked forever in macdrv's `OnMainThread`, waiting on a
-  completion flag that is never set, while the rest of the process (main run loop, clipboard
-  poll thread, other request traffic) keeps running normally. Root-causing is in
-  `notes/wine_bringup.md` (UPDATE #46-#48).
-- Categories and `+load` run for the launch closure, but later batch loads (post-boot `dlopen`) are not yet re-notified through `_dyld_register_for_bulk_image_loads`.
-
-Other rough edges: x87 is 64-bit double, not 80-bit; `RSQRT`/`RCP` are exact rather than the ~12-bit approximations; MXCSR dynamic rounding is ignored (assumes round-to-nearest); the JIT block cache is never invalidated (no self-modifying-code support); guest `mprotect` is resolved onto 16KB host pages (permissive changes round outward, restrictive inward, so a shared page keeps the union); the stack guard is fixed rather than randomized; inbound OOL relocation covers flat Mach messages but not `MACH64_MSG_VECTOR` receives.
-
-## Build
-
-Plain `Makefile`: `clang -arch arm64 -std=c11 -O2 -Wall -Wextra`. Guest tests are cross-compiled `-arch x86_64 -nostdlib -static` (`crt0.s` + `libmini.c` + raw syscalls). `make check` builds and runs everything.
-
-### Decoder gates
-
-Two differential harnesses guard `src/decode.c`. They link against `src/decode.o`
-alone, run native arm64, and need no guest binary:
-
-```sh
-tools/decodiff-cmp.sh <pristine-tree> <patched-tree>   # must print IDENTICAL
-tools/i386diff.sh .                                    # 32-bit coverage vs capstone
-tools/i386diff.sh . --quick                            # ~2s inner-loop version
-tools/i386diff.sh . --mode 64                          # calibrate the harness itself
-```
-
-`decodiff` hashes every field of all 2^24 three-byte decodes in both trees and
-proves a patch changed **nothing** in 64-bit mode. `i386diff` sweeps the same
-space in 32-bit mode against capstone `CS_MODE_32` as an oracle and reports a
-coverage percentage plus classified length / missing / mnemonic / operand-shape
-mismatches. Both must be satisfied by any decoder change: one says 64-bit did
-not move, the other says how much of i386 works. `i386diff` needs
-`pip3 install capstone`; capstone is used only as a black box.
+- Application compatibility is incomplete; unsupported syscalls and framework behavior remain.
+- Generic late-loaded shared-cache Objective-C images are not fully registered. Wine uses a targeted compatibility preload.
+- x87 uses 64-bit doubles instead of 80-bit extended precision.
+- Dynamic MXCSR rounding modes and approximate `RCP`/`RSQRT` results are not implemented.
+- Guest protection changes are resolved on the host's 16 KB page boundaries.
 
 ## License
 
-[LGPL-2.1](LICENSE).
-
----
-
-> [!WARNING]
-> This project is experimental and was vibecoded. Use at your own risk.
+[LGPL-2.1](LICENSE)

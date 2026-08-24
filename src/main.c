@@ -4,7 +4,9 @@
 #include "ocerz/mem.h"
 #include "ocerz/dyld.h"
 
+#include <limits.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 extern char **environ;
 
@@ -13,11 +15,50 @@ static void usage(void)
     fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]\n");
 }
 
+static int is_wine_loader(const char *path)
+{
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved))
+        path = resolved;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return strcmp(base, "wine") == 0 || strcmp(base, "wine64") == 0;
+}
+
+static void apply_wine_defaults(const char *path)
+{
+    static const char objc_images[] =
+        "/AppKit.framework/,/QuartzCore.framework/,/HIToolbox.framework/";
+    if (!is_wine_loader(path))
+        return;
+    if (!getenv("OCERZ_HOSTWQ"))
+        setenv("OCERZ_HOSTWQ", "1", 0);
+    const char *preload = getenv("OCERZ_PRELOAD_OBJC");
+    if (!preload || strcmp(preload, "1") == 0)
+        setenv("OCERZ_PRELOAD_OBJC", objc_images, 1);
+}
+
 
 extern char ocerz_cmdline_summary[256];
 
 int main(int argc, char **argv)
 {
+    if (getenv("OCERZ_EXECLOG")) {
+        fprintf(stderr, "ocerz: EXECSTART[%d]", (int)getpid());
+        for (int k = 0; k < argc; k++)
+            fprintf(stderr, " %s", argv[k] ? argv[k] : "(null)");
+        int envc = 0, noexec = -1, reserve = -1, socket = -1;
+        for (; environ[envc]; envc++) {
+            if (strncmp(environ[envc], "WINELOADERNOEXEC=", 17) == 0)
+                noexec = envc;
+            else if (strncmp(environ[envc], "WINEPRELOADRESERVE=", 19) == 0)
+                reserve = envc;
+            else if (strncmp(environ[envc], "WINESERVERSOCKET=", 17) == 0)
+                socket = envc;
+        }
+        fprintf(stderr, " envc=%d wine_env=%d/%d/%d\n",
+                envc, noexec, reserve, socket);
+    }
     {
         char *w = ocerz_cmdline_summary, *end = ocerz_cmdline_summary + sizeof ocerz_cmdline_summary - 1;
         for (int i = 1; i < argc && w < end; i++) {
@@ -61,6 +102,8 @@ int main(int argc, char **argv)
     }
     if (!load_path)
         load_path = argv[i];
+
+    apply_wine_defaults(load_path);
 
     if (ocerz_verbose >= 2)
         trace = 1;

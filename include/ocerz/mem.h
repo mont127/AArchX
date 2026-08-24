@@ -64,7 +64,22 @@ static inline int ocerz_host_in_guest_space(const void *haddr)
         if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
             return 1;
     }
+    /* attribution: guest faults below arena_lo (e.g. NULL derefs) count */
     return h - ocerz_guest_base < ocerz_arena_hi;
+}
+
+/* strict: inside the actual reservation only (host allocations excluded) */
+static inline int ocerz_host_in_guest_reservation(const void *haddr)
+{
+    uint64_t h = (uint64_t)(uintptr_t)haddr;
+    if (ocerz_low_base) {
+        if (h - ocerz_low_base < OCERZ_LOW_LIMIT)
+            return 1;
+        if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
+            return 1;
+    }
+    uint64_t g = h - ocerz_guest_base;
+    return g >= ocerz_arena_lo && g < ocerz_arena_hi;
 }
 
 int ocerz_mem_init(uint64_t lo, uint64_t hi);

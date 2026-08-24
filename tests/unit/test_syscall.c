@@ -8,6 +8,8 @@
 
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <semaphore.h>
 #include <unistd.h>
 #include <sched.h>
 #include <stdlib.h>
@@ -515,6 +517,180 @@ static int run_raw_mach_msg2_vector(uint64_t gmsg, uint32_t send_size,
     CHECK(cpu->gpr[OCERZ_RAX] == MACH_MSG_SUCCESS);
     return step == OCERZ_STEP_OK &&
            cpu->gpr[OCERZ_RAX] == MACH_MSG_SUCCESS ? 0 : -1;
+}
+
+struct ool_reply_server {
+    mach_port_t port;
+    mach_vm_address_t payload;
+    mach_msg_size_t payload_size;
+    uint32_t reply_id;
+    int result;
+};
+
+static void *serve_ool_reply(void *opaque)
+{
+    struct ool_reply_server *server = opaque;
+    _Alignas(8) unsigned char request[0x100];
+    memset(request, 0, sizeof request);
+    mach_msg_header_t *request_header = (mach_msg_header_t *)request;
+    mach_msg_return_t mr =
+        mach_msg(request_header, MACH_RCV_MSG, 0, sizeof request,
+                 server->port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    if (mr != MACH_MSG_SUCCESS) {
+        server->result = (int)mr;
+        return NULL;
+    }
+
+    _Alignas(8) unsigned char reply[0x2c];
+    memset(reply, 0, sizeof reply);
+    mach_msg_header_t *reply_header = (mach_msg_header_t *)reply;
+    reply_header->msgh_bits =
+        MACH_MSGH_BITS_COMPLEX |
+        MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+    reply_header->msgh_size = sizeof reply;
+    reply_header->msgh_remote_port = request_header->msgh_remote_port;
+    reply_header->msgh_id = (mach_msg_id_t)server->reply_id;
+
+    mach_msg_body_t body = { .msgh_descriptor_count = 1 };
+    mach_msg_ool_descriptor_t descriptor = {
+        .address = (void *)(uintptr_t)server->payload,
+        .deallocate = FALSE,
+        .copy = MACH_MSG_VIRTUAL_COPY,
+        .type = MACH_MSG_OOL_DESCRIPTOR,
+        .size = server->payload_size,
+    };
+    memcpy(reply + 0x18, &body, sizeof body);
+    memcpy(reply + 0x1c, &descriptor, sizeof descriptor);
+
+    mr = mach_msg(reply_header, MACH_SEND_MSG, sizeof reply, 0,
+                  MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    server->result = (int)mr;
+    return NULL;
+}
+
+static void run_received_ool_case(mach_vm_size_t payload_size, int expect_copy,
+                                  uint32_t request_id)
+{
+    const uint64_t first = 0x0123456789abcdefull;
+    const uint64_t last = 0xfedcba9876543210ull;
+    struct ool_reply_server server = {
+        .payload_size = (mach_msg_size_t)payload_size,
+        .reply_id = request_id + 100,
+        .result = -1,
+    };
+
+    kern_return_t kr = mach_vm_allocate(mach_task_self(), &server.payload,
+                                        payload_size, VM_FLAGS_ANYWHERE);
+    CHECK(kr == KERN_SUCCESS);
+    if (kr != KERN_SUCCESS)
+        return;
+    if (expect_copy) {
+        memcpy((void *)(uintptr_t)server.payload, &first, sizeof first);
+        memcpy((void *)(uintptr_t)(server.payload + payload_size - sizeof last),
+               &last, sizeof last);
+    }
+
+    kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE,
+                            &server.port);
+    CHECK(kr == KERN_SUCCESS);
+    if (kr != KERN_SUCCESS)
+        goto out_payload;
+    kr = mach_port_insert_right(mach_task_self(), server.port, server.port,
+                                MACH_MSG_TYPE_MAKE_SEND);
+    CHECK(kr == KERN_SUCCESS);
+    if (kr != KERN_SUCCESS)
+        goto out_port;
+
+    mach_port_t reply_port = mig_get_reply_port();
+    CHECK(reply_port != MACH_PORT_NULL);
+    if (reply_port == MACH_PORT_NULL)
+        goto out_port;
+
+    pthread_t thread;
+    int pr = pthread_create(&thread, NULL, serve_ool_reply, &server);
+    CHECK(pr == 0);
+    if (pr != 0) {
+        mig_put_reply_port(reply_port);
+        goto out_port;
+    }
+
+    uint64_t guest_copy = 0;
+    uint64_t gmsg = scratch + 0x5c00;
+    memset(ocerz_g2h(gmsg), 0, 0x400);
+    ocerz_st(gmsg + 0x00, 4,
+             MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,
+                            MACH_MSG_TYPE_MAKE_SEND_ONCE));
+    ocerz_st(gmsg + 0x04, 4, 0x18);
+    ocerz_st(gmsg + 0x08, 4, server.port);
+    ocerz_st(gmsg + 0x0c, 4, reply_port);
+    ocerz_st(gmsg + 0x14, 4, request_id);
+
+    int msg_rc = run_raw_mach_msg2_vector(gmsg, 0x18, request_id, 0,
+                                          reply_port);
+    if (msg_rc == 0) {
+        CHECK(ocerz_ld(gmsg + 0x14, 4) == server.reply_id);
+        CHECK((ocerz_ld(gmsg, 4) & MACH_MSGH_BITS_COMPLEX) != 0);
+        CHECK(ocerz_ld(gmsg + 0x18, 4) == 1);
+        CHECK(ocerz_ld(gmsg + 0x27, 1) == MACH_MSG_OOL_DESCRIPTOR);
+        guest_copy = ocerz_ld(gmsg + 0x1c, 8);
+        uint32_t delivered_size = (uint32_t)ocerz_ld(gmsg + 0x28, 4);
+        if (expect_copy) {
+            CHECK(guest_copy >= ocerz_arena_lo && guest_copy < ocerz_arena_hi);
+            CHECK(guest_copy != server.payload);
+            CHECK(delivered_size == payload_size);
+            CHECK(ocerz_addr_readable(guest_copy));
+            CHECK(ocerz_addr_readable(guest_copy + payload_size - 1));
+            if (guest_copy >= ocerz_arena_lo && guest_copy < ocerz_arena_hi &&
+                ocerz_addr_readable(guest_copy) &&
+                ocerz_addr_readable(guest_copy + payload_size - 1)) {
+                CHECK(ocerz_ld(guest_copy, 8) == first);
+                CHECK(ocerz_ld(guest_copy + payload_size - sizeof last, 8) == last);
+            }
+        } else {
+            CHECK(guest_copy == 0);
+            CHECK(delivered_size == 0);
+        }
+    }
+
+    CHECK(pthread_join(thread, NULL) == 0);
+    CHECK(server.result == MACH_MSG_SUCCESS);
+    mig_put_reply_port(reply_port);
+    if (expect_copy && guest_copy >= ocerz_arena_lo &&
+        guest_copy < ocerz_arena_hi)
+        CHECK(ocerz_unmap(guest_copy, payload_size) == OCERZ_OK);
+
+out_port:
+    mach_port_destruct(mach_task_self(), server.port, -1, 0);
+out_payload:
+    mach_vm_deallocate(mach_task_self(), server.payload, payload_size);
+}
+
+static uint64_t task_virtual_size(void)
+{
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO,
+                                 (task_info_t)&info, &count);
+    CHECK(kr == KERN_SUCCESS);
+    return kr == KERN_SUCCESS ? info.virtual_size : 0;
+}
+
+static void test_received_large_ool_is_relocated(void)
+{
+    const uint64_t allowance = 8ull * 1024 * 1024;
+    run_received_ool_case(0x4000, 1, 31900);
+
+    uint64_t before = task_virtual_size();
+    run_received_ool_case(0x1000000 + 0x4000, 1, 32000);
+    uint64_t after = task_virtual_size();
+    if (before && after)
+        CHECK(after <= before + allowance);
+
+    before = after;
+    run_received_ool_case(0x4000000 + 0x4000, 0, 32100);
+    after = task_virtual_size();
+    if (before && after)
+        CHECK(after <= before + allowance);
 }
 
 static int run_raw_vm_region_query(uint32_t request_id, uint64_t query,
@@ -1192,6 +1368,57 @@ static void test_execve_bad_args(void)
     CHECK(cpu->gpr[OCERZ_RAX] == 22);
 }
 
+struct delayed_sem_post {
+    sem_t *sem;
+    volatile int ready;
+};
+
+static void *post_sem_after_delay(void *arg)
+{
+    struct delayed_sem_post *post = arg;
+    __atomic_store_n(&post->ready, 1, __ATOMIC_RELEASE);
+    usleep(50000);
+    sem_post(post->sem);
+    return NULL;
+}
+
+static void test_sem_wait_nocancel_blocks(void)
+{
+    char name[64];
+    snprintf(name, sizeof(name), "/ocerz-test-sem-%d", getpid());
+    sem_unlink(name);
+    sem_t *sem = sem_open(name, O_CREAT | O_EXCL, 0600, 0);
+    CHECK(sem != SEM_FAILED);
+    if (sem == SEM_FAILED)
+        return;
+
+    struct delayed_sem_post post = { .sem = sem };
+    pthread_t thread;
+    int pr = pthread_create(&thread, NULL, post_sem_after_delay, &post);
+    CHECK(pr == 0);
+    if (pr != 0) {
+        sem_close(sem);
+        sem_unlink(name);
+        return;
+    }
+    while (!__atomic_load_n(&post.ready, __ATOMIC_ACQUIRE))
+        sched_yield();
+
+    uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    OcerzCPU *cpu = &vm.cpu;
+    set_args(cpu, bsd(420), (uint64_t)(uintptr_t)sem, 0, 0, 0, 0, 0);
+    int r = ocerz_handle_syscall(&vm, cpu);
+    uint64_t elapsed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    CHECK(cpu->gpr[OCERZ_RAX] == 0);
+    CHECK(elapsed >= 20000000ull);
+    CHECK(pthread_join(thread, NULL) == 0);
+    CHECK(sem_close(sem) == 0);
+    CHECK(sem_unlink(name) == 0);
+}
+
 struct terminate_waiter {
     void *address;
     uint32_t owner;
@@ -1390,6 +1617,7 @@ int main(void)
     test_mach_task_self();
     test_mach_thread_self();
     test_mach_vm_allocate();
+    test_received_large_ool_is_relocated();
     test_mach_msg2_vector_in_place_reply();
     test_thread_info_rewrites_reserved_host_handle();
     test_iokit_alias_replaces_prot_none_reservation();
@@ -1397,6 +1625,7 @@ int main(void)
     test_mach_timebase();
     test_mach_unknown();
     test_execve_bad_args();
+    test_sem_wait_nocancel_blocks();
     test_bsdthread_terminate_wakes_ulock();
     test_bsdthread_terminate_signals_semaphore();
     test_bsdthread_terminate_unmaps_stack();

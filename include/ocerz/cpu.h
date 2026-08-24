@@ -73,6 +73,10 @@ typedef struct OcerzCPU {
     uint32_t btrace_n;              /* monotonic write counter */
     uint32_t btrace_mask;           /* ring mask; 0 latches (stops recording) */
     volatile uint64_t block_since_ns;  /* nonzero while parked in a blocking host syscall (unstick monitor) */
+    volatile uint64_t block_started_ns; /* like block_since_ns but never re-armed: true episode start */
+    volatile int block_what;            /* syscall/trap number of the blocking call */
+    uint32_t sendring_id[8], sendring_port[8], sendring_sz[8];
+    int sendring_n;                     /* MACHSLOW: last mach sends, for wedge diagnostics */
     volatile uint32_t last_rcv_name;   /* port/set of the current mach receive (diagnostics) */                /* host sp at the active JIT function's frame base (class 3):
                                        every exit resets sp to it, dropping the host-stack RAS entries */
     uint32_t mxcsr;
