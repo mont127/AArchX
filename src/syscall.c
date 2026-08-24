@@ -3162,6 +3162,17 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                     (unsigned long long)vm->insn_count);
     }
 
+    {   /* MSGLOG: wine server requests/replies are fixed 64-byte read/write */
+        static int wrlog = -1;
+        if (wrlog < 0) wrlog = getenv("OCERZ_MSGLOG") ? 1 : 0;
+        if (wrlog && (num == 3 || num == 4 || num == 396 || num == 397) && a[2] == 64 && a[1]) {
+            fprintf(stderr, "ocerz: %s64[%d] cpu#%u fd=%d req=%#x ic=%#llx\n",
+                    (num == 4 || num == 397) ? "WR" : "RD", (int)getpid(),
+                    cpu->cpu_number, (int)a[0],
+                    (unsigned)ocerz_ld(a[1], 4),
+                    (unsigned long long)vm->insn_count);
+        }
+    }
     if (e->intercept) {
         int r = e->intercept(vm, cpu, a);
         if (r == OCERZ_STEP_FATAL) {
@@ -3235,6 +3246,22 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
+    {
+        static int rd1 = -1; static int rd1n;
+        if (rd1 < 0) rd1 = getenv("OCERZ_MSGLOG") ? 1 : 0;
+        if (rd1 && num == 3 && orig[2] == 1 && rd1n < 60) {
+            rd1n++;
+            fprintf(stderr, "ocerz: RD1[%d] cpu#%u fd=%d -> r=%lld err=%d\n",
+                    (int)getpid(), cpu->cpu_number, (int)orig[0],
+                    (long long)r, err ? (int)r : 0);
+        }
+        if (rd1 && num == 3 && orig[2] == 64 && orig[1] && r == 64) {
+            fprintf(stderr, "ocerz: RPLY[%d] cpu#%u fd=%d err=%#x sz=%u w2=%#x w3=%#x\n",
+                    (int)getpid(), cpu->cpu_number, (int)orig[0],
+                    (unsigned)ocerz_ld(orig[1], 4), (unsigned)ocerz_ld(orig[1] + 4, 4),
+                    (unsigned)ocerz_ld(orig[1] + 8, 4), (unsigned)ocerz_ld(orig[1] + 12, 4));
+        }
+    }
     if (rtrack)
         fprintf(stderr,
                 "ocerz: REQW[%d] num=%d fd=%lld len=%lld first=%#x -> r=%lld err=%d rip=%#llx\n",
