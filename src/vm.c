@@ -153,9 +153,13 @@ static __thread uint64_t g_riphist[32];
 static __thread unsigned g_riphist_n;
 static int g_crash_stack;
 
+static int g_fork_keepjit = -1;
+
 void ocerz_vm_atfork_prepare(void)
 {
     pthread_t self = pthread_self();
+    if (g_fork_keepjit < 0)
+        g_fork_keepjit = getenv("OCERZ_FORK_KEEPJIT") ? 1 : 0;
 
     pthread_mutex_lock(&g_cpus_lock);
     g_fork_surviving_cpu = NULL;
@@ -195,7 +199,7 @@ void ocerz_vm_atfork_child(void)
      * intermediate at icount ~0x6ce).  A fork child that does not exec only
      * runs the fork-return + _exit()/execve() path, so drop it to the
      * interpreter. */
-    if (g_vm && g_vm->jit_enabled) {
+    if (g_vm && g_vm->jit_enabled && g_fork_keepjit <= 0) {
         g_vm->jit_enabled = 0;
         if (survivor) survivor->interp_once = 1;
     }
