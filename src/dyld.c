@@ -381,9 +381,11 @@ static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int 
     const char *s = sym;
     while (p < end) {
         uint64_t term = self_uleb(&p, end);
-        if (*s == '\0') {
-            if (term == 0)
-                return 0;
+        /* term==0 with the name consumed is not a miss: the node carries an
+         * empty edge to the terminal child (happens when a symbol is a strict
+         * prefix of others, e.g. _libiconv vs _libiconv_open).  Fall through
+         * to the child search, where the empty edge matches. */
+        if (*s == '\0' && term != 0) {
             const uint8_t *tp = p;
             uint64_t flags = self_uleb(&tp, end);
             if (flags & 0x08)
@@ -460,6 +462,9 @@ static uint64_t disk_flat_resolve(const char *name)
     return disk_flat_resolve_ex(name, &f);
 }
 
+static int expand_at_prefix(DynImage *loader, const char *name, char *out, size_t n);
+
+
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
                                int libord, int weak)
 {
@@ -472,6 +477,16 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
             DynImage *dep = dimg_find_by_install_name(tgt);
             if (!dep)
                 dep = dimg_find_by_path(tgt);
+            if (!dep && tgt[0] == '@') {
+                /* relocatable install name: the dep is recorded under its
+                 * resolved path, so expand against this image first */
+                char ex[1024];
+                if (expand_at_prefix(img, tgt, ex, sizeof ex)) {
+                    dep = dimg_find_by_path(ex);
+                    if (!dep)
+                        dep = dimg_find_by_install_name(ex);
+                }
+            }
             if (dep)
                 value = ocerz_image_self_resolve_ex(dep, name, &found);
         }
@@ -482,8 +497,9 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
         value = ocerz_image_self_resolve_ex(img, name, &found);
     if (!found)
         value = disk_flat_resolve_ex(name, &found);
-    if (!found && !weak)
+    if (!found && !weak) {
         OCERZ_FATAL("unresolved import: %s\n", name);
+    }
     return value;
 }
 
