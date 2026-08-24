@@ -3247,6 +3247,13 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
     {
+        static int klog = -1;
+        if (klog < 0) klog = getenv("OCERZ_KICKLOG") ? 1 : 0;
+        if (klog && err && r == 4 /* EINTR */)
+            fprintf(stderr, "ocerz: KICKRET[%d] cpu#%u bsd %d -> EINTR rip=%#llx\n",
+                    (int)getpid(), cpu->cpu_number, num, (unsigned long long)cpu->rip);
+    }
+    {
         static int rd1 = -1; static int rd1n;
         if (rd1 < 0) rd1 = getenv("OCERZ_MSGLOG") ? 1 : 0;
         if (rd1 && num == 3 && orig[2] == 1 && rd1n < 60) {
@@ -4045,6 +4052,14 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t rg = ocerz_host_mach_trap(num, a);
         cpu->block_since_ns = 0;
+        {
+            static int klog3 = -1;
+            if (klog3 < 0) klog3 = getenv("OCERZ_KICKLOG") ? 1 : 0;
+            if (klog3 && rg == 14 /* KERN_ABORTED */)
+                fprintf(stderr, "ocerz: KICKRET[%d] cpu#%u %s -> ABORTED rip=%#llx\n",
+                        (int)getpid(), cpu->cpu_number, mach_trap_name(num),
+                        (unsigned long long)cpu->rip);
+        }
         mach_ret(cpu, rg);
         break;
     }
@@ -4075,8 +4090,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             if (norlk31 < 0) norlk31 = getenv("OCERZ_NO_RCV_TIMEOUT_KICK") ? 1 : 0;
             /* receive-only, never a combined send+receive MIG RPC (see the
              * mach_msg2 site below for the full rationale) */
-            if (!norlk31 && r31 == 0x10004005ull && (a[1] & 0x3) == 0x2)
-                r31 = 0x10004003ull;
         }
         mach_ret(cpu, r31);
         if (nsv31)
@@ -4311,9 +4324,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             static int norlk = -1;
             if (norlk < 0) norlk = getenv("OCERZ_NO_RCV_TIMEOUT_KICK") ? 1 : 0;
             /* Receive-ONLY calls: CFRunLoop retries an interrupted receive without re-checking its sources */
-            if (!norlk && r47 == 0x10004005ull /* MACH_RCV_INTERRUPTED */ &&
-                (a[1] & 0x3) == 0x2)
-                r47 = 0x10004003ull;           /* MACH_RCV_TIMED_OUT */
             {
                 static int islog = -1; static int islogn;
                 if (islog < 0) islog = getenv("OCERZ_MACHSLOW") ? 1 : 0;
@@ -4334,6 +4344,14 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                     fprintf(stderr, "\n");
                 }
             }
+        }
+        {
+            static int klog2 = -1;
+            if (klog2 < 0) klog2 = getenv("OCERZ_KICKLOG") ? 1 : 0;
+            if (klog2 && (r47 == 0x10004005ull || r47 == 14 || r47 == 0x10004003ull))
+                fprintf(stderr, "ocerz: KICKRET[%d] cpu#%u mach47 -> %#llx rip=%#llx\n",
+                        (int)getpid(), cpu->cpu_number, (unsigned long long)r47,
+                        (unsigned long long)cpu->rip);
         }
         mach_ret(cpu, r47);
         if (nsv47)
