@@ -411,16 +411,14 @@ static int sys_mprotect(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     memtrace("mprotect", a[0], a[1], (int)a[2], 0);
     /* mprotect on a shared-cache page (1:1 mapped, outside the guest arena):
      * some engines make a libsystem page writable to patch it in place.  The
-     * arena logic would ENOMEM it, so forward straight to the host and drop
-     * PROT_EXEC (guest code is JIT'd, never host-executed). */
-    if (ocerz_cache_lazy_region((uintptr_t)a[0])) {
-        int prot = (int)a[2] & ~PROT_EXEC;
-        int rc = mprotect((void *)(uintptr_t)a[0], (size_t)a[1], prot ? prot : PROT_READ);
-        if (rc == 0) {
+     * arena logic would ENOMEM it, so let cache.c grant it on the host. */
+    if (ocerz_cache_region((uintptr_t)a[0])) {
+        int e = ocerz_cache_protect((uintptr_t)a[0], a[1], (int)a[2]);
+        if (e) {
+            ret_err(cpu, e);
+        } else {
             if ((int)a[2] & PROT_WRITE) invalidate_guest_mapping(vm, a[0], a[1]);
             ret_ok(cpu, 0);
-        } else {
-            ret_err(cpu, errno);
         }
         return OCERZ_STEP_OK;
     }

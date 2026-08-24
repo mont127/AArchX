@@ -7,6 +7,9 @@
 #include <sys/mman.h>
 #include <mach-o/loader.h>
 #include <string.h>
+#include <errno.h>
+
+#include "ocerz/mem.h"
 
 #define CACHE_DIR "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/"
 #define CACHE_STEM "dyld_shared_cache_x86_64"
@@ -176,6 +179,108 @@ int ocerz_cache_lazy_region(uintptr_t addr)
     return 0;
 }
 
+/* Every subcache mapping, so an address in the cache (TEXT included) can be
+ * told apart from a wild one, plus write-watch state for the host pages a
+ * guest has mprotect'ed writable in order to hot-patch them. */
+#define CMAP_MAX (CACHE_MAX_SUBCACHES * 8)
+#define WATCH_ARMED    1        /* watched, currently read-only */
+#define WATCH_WRITABLE 2
+static struct {
+    uint64_t addr, size;
+    uint8_t *watch;             /* one byte per host page */
+} g_cmap[CMAP_MAX];
+static int g_n_cmap;
+static uint64_t g_cmap_lo = ~0ull, g_cmap_hi;
+static volatile int g_any_watch;
+
+static int cmap_find(uintptr_t addr)
+{
+    if (addr - g_cmap_lo >= g_cmap_hi - g_cmap_lo) return -1;
+    for (int i = 0; i < g_n_cmap; i++)
+        if (addr - g_cmap[i].addr < g_cmap[i].size) return i;
+    return -1;
+}
+
+int ocerz_cache_region(uintptr_t addr)
+{
+    return cmap_find(addr) >= 0;
+}
+
+/* alloc=0 is the signal-handler path and never allocates */
+static uint8_t *watch_slot(uintptr_t addr, int alloc)
+{
+    int i = cmap_find(addr);
+    if (i < 0) return NULL;
+    uint8_t *w = __atomic_load_n(&g_cmap[i].watch, __ATOMIC_ACQUIRE);
+    if (!w) {
+        if (!alloc) return NULL;
+        size_t n = (size_t)((g_cmap[i].size + OCERZ_HOST_PAGE_SIZE - 1) / OCERZ_HOST_PAGE_SIZE);
+        w = (uint8_t *)calloc(n, 1);
+        if (!w) return NULL;
+        uint8_t *had = NULL;
+        if (!__atomic_compare_exchange_n(&g_cmap[i].watch, &had, w, 0,
+                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+            free(w);
+            w = had;
+        }
+    }
+    return w + (addr - g_cmap[i].addr) / OCERZ_HOST_PAGE_SIZE;
+}
+
+/* Guest mprotect of a cache page.  A lazily-slid page must be unpacked first:
+ * once it is accessible the fault that would have rebased it never comes.
+ * PROT_EXEC is dropped, guest code is never executed by the host. */
+int ocerz_cache_protect(uintptr_t addr, uint64_t len, int prot)
+{
+    uint64_t hp = OCERZ_HOST_PAGE_SIZE;
+    uint64_t lo = addr & ~(hp - 1);
+    uint64_t hi = (addr + len + hp - 1) & ~(hp - 1);
+    if (hi <= lo) return EINVAL;
+    prot &= ~PROT_EXEC;
+    if (!prot) prot = PROT_READ;
+    for (uint64_t p = lo; p < hi; p += hp)
+        if (ocerz_cache_lazy_region((uintptr_t)p)) ocerz_cache_lazy_fault((uintptr_t)p);
+    if (mprotect((void *)(uintptr_t)lo, (size_t)(hi - lo), prot) != 0) return errno;
+    if (prot & PROT_WRITE) {
+        for (uint64_t p = lo; p < hi; p += hp) {
+            uint8_t *s = watch_slot((uintptr_t)p, 1);
+            if (s) __atomic_store_n(s, WATCH_WRITABLE, __ATOMIC_RELEASE);
+        }
+        __atomic_store_n(&g_any_watch, 1, __ATOMIC_RELEASE);
+    }
+    return 0;
+}
+
+/* Store fault on a page re-armed by ocerz_cache_arm_exec: grant write again.
+ * The caller drops the translations that were made from it. */
+int ocerz_cache_write_fault(uintptr_t addr)
+{
+    if (!__atomic_load_n(&g_any_watch, __ATOMIC_ACQUIRE)) return 0;
+    uint8_t *s = watch_slot(addr, 0);
+    if (!s || !__atomic_load_n(s, __ATOMIC_ACQUIRE)) return 0;
+    uint64_t page = addr & ~(OCERZ_HOST_PAGE_SIZE - 1);
+    if (mprotect((void *)(uintptr_t)page, (size_t)OCERZ_HOST_PAGE_SIZE,
+                 PROT_READ | PROT_WRITE) != 0)
+        return 0;
+    __atomic_store_n(s, WATCH_WRITABLE, __ATOMIC_RELEASE);
+    return 1;
+}
+
+/* Code has been translated out of [lo,hi): take write back off any patched
+ * page in it, so the next patch of those bytes faults instead of going unseen. */
+void ocerz_cache_arm_exec(uint64_t lo, uint64_t hi)
+{
+    if (!__atomic_load_n(&g_any_watch, __ATOMIC_ACQUIRE)) return;
+    uint64_t hp = OCERZ_HOST_PAGE_SIZE;
+    if (hi <= lo || hi - lo > (1u << 20)) return;
+    for (uint64_t p = lo & ~(hp - 1); p < hi; p += hp) {
+        uint8_t *s = watch_slot((uintptr_t)p, 0);
+        if (!s || __atomic_load_n(s, __ATOMIC_ACQUIRE) != WATCH_WRITABLE) continue;
+        if (mprotect((void *)(uintptr_t)p, (size_t)hp, PROT_READ) == 0)
+            __atomic_store_n(s, WATCH_ARMED, __ATOMIC_RELEASE);
+    }
+}
+
 static void rebase_slide_v2(uint64_t map_addr, uint64_t map_size, uint64_t cache_base, const uint8_t *si)
 {
     uint32_t page_size = rd32(si + 4);
@@ -257,6 +362,13 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
                         i, path, p, (unsigned long long)addr);
             close(fd);
             return -1;
+        }
+        if (g_n_cmap < CMAP_MAX) {
+            g_cmap[g_n_cmap].addr = addr;
+            g_cmap[g_n_cmap].size = size;
+            g_n_cmap++;
+            if (addr < g_cmap_lo) g_cmap_lo = addr;
+            if (addr + size > g_cmap_hi) g_cmap_hi = addr + size;
         }
         if (is_main && i == 0) {
             c->base = addr;
