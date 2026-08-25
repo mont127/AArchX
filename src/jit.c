@@ -6046,8 +6046,11 @@ static uint8_t g_l0_fixed_dbl[16];
 static int l0_alloc2(A64Buf *b, unsigned r, int dbl)
 {
     if (g_l0_fixed) {
-        if (g_l0_fixed_lane[r] < 0)
-            return -1;                 /* not one of the fixed regs: caller falls back */
+        if (g_l0_fixed_lane[r] < 0) {
+            l0_inval(r);               /* the caller writes the arch reg: a stale
+                                        * shared mapping must not outlive that */
+            return -1;
+        }
         int t = g_l0_fixed_lane[r];
         uint16_t own = g_l0_owners[t - 4];
         for (int i = 0; i < 16; i++) if ((own & (1u << i)) && i != (int)r) {
@@ -6093,11 +6096,26 @@ static void l0_share(unsigned dst, unsigned src)
 static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, int *sqrt_like);
 static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
 {
-    int cnt[16] = {0}; int8_t firstdbl[16];
+    int cnt[16] = {0}; int8_t firstdbl[16]; uint8_t wfirst[16];
     memset(firstdbl, -1, sizeof firstdbl);
+    memset(wfirst, 0, sizeof wfirst);      /* 1: read seen first, 2: full write first */
     for (int i = 0; i < n; i++) {
         int packed, dbl, from_mem, sq;
         int c = fpb_class(&insns[i], &packed, &dbl, &from_mem, &sq);
+        /* first-touch classification: a reg whose block life starts with a
+         * full overwrite (load, reg copy, self-xor zeroing) carries nothing
+         * across the back edge and would waste a fixed lane */
+        if (insns[i].nops >= 1 && insns[i].ops[0].kind == OCERZ_OPK_XMM) {
+            unsigned dr = insns[i].ops[0].reg;
+            if (!wfirst[dr]) {
+                int selfzero = (insns[i].op == OCERZ_OP_XORPS || insns[i].op == OCERZ_OP_PXOR) &&
+                               insns[i].nops >= 2 && insns[i].ops[1].kind == OCERZ_OPK_XMM &&
+                               insns[i].ops[1].reg == dr;
+                wfirst[dr] = (uint8_t)((c == 2 || selfzero) ? 2 : 1);
+            }
+        }
+        if (insns[i].nops >= 2 && insns[i].ops[1].kind == OCERZ_OPK_XMM && !wfirst[insns[i].ops[1].reg])
+            wfirst[insns[i].ops[1].reg] = 1;
         int use = (c == 1 || c == 3) && !packed;
         if (!use && (insns[i].op == OCERZ_OP_CVTSI2SD || insns[i].op == OCERZ_OP_CVTSI2SS)) {
             use = 1; dbl = insns[i].op == OCERZ_OP_CVTSI2SD;
@@ -6111,6 +6129,8 @@ static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
             }
         }
     }
+    for (int r = 0; r < 16; r++)
+        if (wfirst[r] == 2) cnt[r] = 0;
     int lanes = 0;
     for (int k = 0; k < 4; k++) {
         int best = -1;
@@ -6137,6 +6157,12 @@ static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
  * re-copy any drifted lane and reset the maps.  Usually emits nothing. */
 static void l0_fixed_restore(A64Buf *b)
 {
+    /* OCERZ_UNSAFE_NOFLUSH: measurement aid only - skips the pre-back-edge
+     * flush, leaving arch regs stale across iterations (exits/faults see
+     * wrong xmm state).  Never enable outside benchmarking. */
+    static int noflush = -1;
+    if (noflush < 0) noflush = getenv("OCERZ_UNSAFE_NOFLUSH") ? 1 : 0;
+    if (noflush) { g_l0_dirty = 0; return; }
     l0_flush_all(b);
     for (int r = 0; r < 16; r++) {
         if (g_l0_fixed_lane[r] >= 0) {
@@ -6153,6 +6179,14 @@ static void l0_fixed_restore(A64Buf *b)
             g_l0[r] = -1;
         }
     }
+}
+
+/* every self back edge re-enters past the preamble, so the contract must
+ * hold whenever one is emitted, no matter which emitter produced it */
+static void l0_fixed_backedge(A64Buf *b)
+{
+    if (g_l0_fixed)
+        l0_fixed_restore(b);
 }
 
 /* instructions whose emitters keep the caches consistent themselves */
@@ -8148,6 +8182,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     if (!g_loop_entry)
         return 0;
 
+    l0_fixed_backedge(b);
     g_stop_patch = a64_label(b);
     if (cbz_rn >= 0) {
         if (jcc->cc == OCERZ_CC_E) a64_cbz(b, cbz_sf, cbz_rn, (int32_t)(g_loop_entry - g_stop_patch));
@@ -8784,6 +8819,7 @@ static int emit_ifconv_diamond(A64Buf *b, const X86Insn *test,
     int taken_cond = latch_jcc->cc == OCERZ_CC_E ? A64_EQ : A64_NE;
     int self_cond = latch_taken == g_self_rip
         ? taken_cond : A64_INV(taken_cond);
+    l0_fixed_backedge(b);
     g_stop_patch = a64_label(b);
     a64_bcond(b, self_cond, (int32_t)(g_loop_entry - g_stop_patch));
 
@@ -8837,6 +8873,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     if (self_loop && direct >= 0) {
         /* direct condition on the back edge (patchable stop site); the exit
          * chains to the fall-through block; a stop leaves with RIP = head */
+        l0_fixed_backedge(b);
         g_stop_patch = a64_label(b);
         a64_bcond(b, direct, (int32_t)(g_loop_entry - g_stop_patch));
         int edge_class = body_edge_pin_class();
@@ -8868,6 +8905,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     if (self_loop) {
         a64_mov_imm64(b, JT1, g_self_rip);
         a64_subs_reg(b, 1, A64_ZR, JT0, JT1, 0);
+        l0_fixed_backedge(b);
         g_stop_patch = a64_label(b);
         a64_bcond(b, A64_EQ, (int32_t)(g_loop_entry - g_stop_patch));
         /* loop exit: chain to the fall-through block (RIP=fall already stored) */
@@ -8947,6 +8985,7 @@ static int emit_jmp(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     uint64_t target = insn->ops[0].imm;
 
     if (!g_no_chain && g_loop_entry && target == g_self_rip) {
+        l0_fixed_backedge(b);
         g_stop_patch = a64_label(b);
         a64_b(b, (int32_t)(g_loop_entry - g_stop_patch));
         g_stop_target = a64_label(b);
@@ -11754,12 +11793,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
         if (blk->insn_off)
             blk->insn_off[i] = (uint32_t)(b.p - entry);
-        if (g_l0_fixed &&
-            (i == n - 1 ||
-             (i == n - 2 && !(insn->nops > 0 && insn->ops[0].kind == OCERZ_OPK_XMM)))) {
-            l0_fixed_restore(&b);
-            g_l0_fixed = 0;    /* contract met: nothing below may rely on it */
-        }
         if (i == n - 2) {
             uint32_t *jmp_label = NULL;
             if (emit_logic_jmp_incdec_jcc(&b, insn, &blk->insns[i + 1],
