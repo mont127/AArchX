@@ -3437,6 +3437,17 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
     {
+        /* OCERZ_ULOCKLOG: any ulock_wait/wake error besides the routine ones */
+        static int ulog = -1;
+        if (ulog < 0) ulog = getenv("OCERZ_ULOCKLOG") ? 1 : 0;
+        if (ulog && (num == 515 || num == 516 || num == 544) && err &&
+            err != 4 /*EINTR*/ && err != 60 /*ETIMEDOUT*/)
+            fprintf(stderr, "ocerz: ULOCK[%d] num=%d op=%#llx addr=%#llx val=%#llx err=%d rip=%#llx\n",
+                    (int)getpid(), num, (unsigned long long)a[0],
+                    (unsigned long long)a[1], (unsigned long long)a[2], err,
+                    (unsigned long long)cpu->rip);
+    }
+    {
         static const char *olog = (const char *)-1;
         if (olog == (const char *)-1) olog = getenv("OCERZ_OPENLOG");
         if (olog && (num == 5 || num == 398 || num == 463)) {
