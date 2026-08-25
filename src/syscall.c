@@ -3291,6 +3291,15 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
     {
+        static const char *olog = (const char *)-1;
+        if (olog == (const char *)-1) olog = getenv("OCERZ_OPENLOG");
+        if (olog && (num == 5 || num == 398 || num == 463)) {
+            uint64_t pp = (num == 463) ? a[1] : a[0];
+            const char *path = (const char *)(uintptr_t)pp;
+            if (path && (!*olog || strstr(path, olog)))
+                fprintf(stderr, "ocerz: OPEN[%d] %s -> r=%llu err=%d\n",
+                        (int)getpid(), path, (unsigned long long)r, err);
+        }
         static int nlog = -1;
         if (nlog < 0) nlog = getenv("OCERZ_NETLOG") ? 1 : 0;
         if (nlog && num == 363 && a[1] && (int64_t)a[2] > 0) {
