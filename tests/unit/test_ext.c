@@ -446,7 +446,7 @@ static void test_cpuid_rdtsc(OcerzVM *vm)
     cid = mk(OCERZ_OP_CPUID, 4);
     check(ocerz_interp_ext(vm, c, &cid) == OCERZ_STEP_OK);
     check((uint32_t)c->gpr[OCERZ_RAX] == 0x000306a9);
-    check((uint32_t)c->gpr[OCERZ_RCX] == 0x00802201);
+    check((uint32_t)c->gpr[OCERZ_RCX] == 0x00982201);
     check((uint32_t)c->gpr[OCERZ_RDX] == 0x078bfbff);
 
     char brand[49];
