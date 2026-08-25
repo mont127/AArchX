@@ -474,7 +474,13 @@ static inline int jgb_usable(void) { return ocerz_low_base == 0; }
 static inline int stack_identity(void)
 {
     static int dis = -1;
-    if (dis < 0) dis = getenv("OCERZ_NO_STACK_IDX") ? 1 : 0;
+    if (dis < 0) {
+        dis = getenv("OCERZ_NO_STACK_IDX") ? 1 : 0;
+        if (getenv("OCERZ_IDLOG"))
+            fprintf(stderr, "ocerz: stack_identity=%d guest_base=%#llx low_base=%#llx\n",
+                    !dis && ocerz_guest_base == 0 && ocerz_low_base == 0,
+                    (unsigned long long)ocerz_guest_base, (unsigned long long)ocerz_low_base);
+    }
     return !dis && ocerz_guest_base == 0 && ocerz_low_base == 0;
 }
 void ocerz_jgb_trap(uint64_t rip, uint64_t x0);
@@ -10528,29 +10534,63 @@ static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *ent
  * the ret a compare-against-the-known-return-address pop; a mismatch (the
  * guest repointed its return slot) leaves at the ret's rip and re-enters
  * through the normal dispatcher, which executes the real ret. */
-static uint8_t  g_ic_kind[JIT_MAX_BLOCK_INSNS];      /* 0 none, 1 pushed call, 2 checked ret */
+static uint8_t  g_ic_kind[JIT_MAX_BLOCK_INSNS];      /* 0 none, 1 pushed call, 2 checked ret, 3 elided ret */
 static uint64_t g_ic_expect[JIT_MAX_BLOCK_INSNS];    /* kind 2: the return rip */
-static int inline_call_ok(uint64_t target, uint64_t self_rip, X86Insn *out, int max)
+static int inline_calls_off(void)
 {
     static int off = -1;
     if (off < 0) off = getenv("OCERZ_NO_INLINE_CALL") != NULL;
-    if (off || target == self_rip)
+    return off;
+}
+/* Recursively splice callee(s) into scratch[] starting at *vn.  Appends the
+ * callee's instructions, turning a nested direct call into another splice
+ * (depth-limited) and the final ret into a checked-ret marker carrying
+ * ret_rip.  Returns 1 and advances *vn on success; on failure *vn is
+ * restored and nothing is marked. */
+static int splice_callee(uint64_t target, uint64_t ret_rip, uint64_t self_rip,
+                         X86Insn *scratch, int *vn, int depth)
+{
+    if (inline_calls_off() || target == self_rip || depth > 2)
         return 0;
-    int n = 0;
+    int start = *vn;
     uint64_t pc = target;
-    for (; n < max; n++) {
+    for (int steps = 0; steps < 24; steps++) {
+        if (*vn + 2 >= JIT_MAX_BLOCK_INSNS)
+            goto fail;
         const uint8_t *code = (const uint8_t *)ocerz_g2h(pc);
-        if (ocerz_decode_mode(code, 15, pc, &out[n], 0) != OCERZ_OK)
-            return 0;
-        unsigned op = out[n].op;
-        if (op == OCERZ_OP_RET)
-            return out[n].nops == 0 ? n + 1 : 0;   /* plain ret only */
-        if (is_terminator(op) || op == OCERZ_OP_JCC || op == OCERZ_OP_SYSCALL)
-            return 0;
-        if (op == OCERZ_OP_FXSAVE || op == OCERZ_OP_FXRSTOR)
-            return 0;
-        pc += out[n].len;
+        X86Insn *in = &scratch[*vn];
+        if (ocerz_decode_mode(code, 15, pc, in, 0) != OCERZ_OK)
+            goto fail;
+        unsigned op = in->op;
+        if (op == OCERZ_OP_RET) {
+            if (in->nops != 0)
+                goto fail;                          /* plain ret only */
+            g_ic_kind[*vn] = 2;
+            g_ic_expect[*vn] = ret_rip;
+            (*vn)++;
+            return 1;
+        }
+        if (op == OCERZ_OP_CALL && in->ops[0].kind == OCERZ_OPK_IMM && !in->mode32) {
+            int at = *vn;
+            g_ic_kind[at] = 1;
+            (*vn)++;
+            if (!splice_callee(in->ops[0].imm, pc + in->len, self_rip,
+                               scratch, vn, depth + 1)) {
+                g_ic_kind[at] = 0;
+                goto fail;
+            }
+            pc += in->len;
+            continue;
+        }
+        if (is_terminator(op) || op == OCERZ_OP_JCC || op == OCERZ_OP_SYSCALL ||
+            op == OCERZ_OP_FXSAVE || op == OCERZ_OP_FXRSTOR)
+            goto fail;
+        (*vn)++;
+        pc += in->len;
     }
+fail:
+    for (int k = start; k < *vn; k++) g_ic_kind[k] = 0;
+    *vn = start;
     return 0;
 }
 
@@ -10612,23 +10652,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 uint8_t len = scratch[vn].len;
                 if (op == OCERZ_OP_CALL && !mode32 &&
                     scratch[vn].ops[0].kind == OCERZ_OPK_IMM &&
-                    vn + 16 < JIT_MAX_BLOCK_INSNS) {
-                    X86Insn callee[14];
-                    int cn = inline_call_ok(scratch[vn].ops[0].imm, rip, callee, 14);
-                    if (cn > 0) {
-                        g_ic_kind[vn] = 1;
-                        vn++;
-                        for (int c = 0; c < cn; c++) {
-                            scratch[vn] = callee[c];
-                            if (c == cn - 1) {
-                                g_ic_kind[vn] = 2;
-                                g_ic_expect[vn] = vpc + len;
-                            }
-                            vn++;
-                        }
+                    vn + 48 < JIT_MAX_BLOCK_INSNS) {
+                    int at = (int)vn;
+                    int vni = (int)vn + 1;
+                    g_ic_kind[at] = 1;
+                    if (splice_callee(scratch[at].ops[0].imm, vpc + len, rip,
+                                      scratch, &vni, 1)) {
+                        vn = vni;
                         vpc += len;        /* resume at the return address */
                         continue;
                     }
+                    g_ic_kind[at] = 0;
                 }
                 vn++;
                 if (is_terminator(op)) {
@@ -11129,6 +11163,52 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 
     blk->entry_live = (uint16_t)entry_all;
 
+    /* Inlined-call return checks: if between the push and the check the
+     * stack pointer moves only by push/pop and nothing stores to memory,
+     * the pushed slot provably still holds the return address (pushes only
+     * write below it; a guest signal frame lands below live rsp too).  The
+     * check's reload of the slot is then dead - and it is a
+     * store-to-load-forwarding stall on the hottest path of call-dense
+     * code - so drop it and just pop. */
+    for (int ci = 0; ci < n; ci++) {
+        if (g_ic_kind[ci] != 1) continue;
+        int64_t delta = 0;
+        int safe = 1, rj = -1, nest = 0;
+        for (int k = ci + 1; k < n; k++) {
+            const X86Insn *m = &blk->insns[k];
+            if (g_ic_kind[k] == 2 || g_ic_kind[k] == 3) {
+                if (nest == 0) { rj = k; break; }
+                nest--; delta += 8;                 /* the inner ret pops */
+                continue;
+            }
+            if (g_ic_kind[k] == 1) { nest++; delta -= 8; continue; }   /* the inner call pushes */
+            switch (m->op) {
+            case OCERZ_OP_PUSH:
+                if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_MEM) { safe = 0; break; }
+                delta -= 8; break;
+            case OCERZ_OP_POP:
+                if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_MEM) { safe = 0; break; }
+                delta += 8; break;
+            case OCERZ_OP_MOV: case OCERZ_OP_LEA: case OCERZ_OP_ADD: case OCERZ_OP_SUB:
+            case OCERZ_OP_XOR: case OCERZ_OP_OR: case OCERZ_OP_AND: case OCERZ_OP_SHR:
+            case OCERZ_OP_SHL: case OCERZ_OP_SAR: case OCERZ_OP_IMUL: case OCERZ_OP_INC:
+            case OCERZ_OP_DEC: case OCERZ_OP_NEG: case OCERZ_OP_NOT: case OCERZ_OP_MOVZX:
+            case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD: case OCERZ_OP_NOP:
+            case OCERZ_OP_TEST: case OCERZ_OP_CMP:
+                if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_MEM &&
+                    m->op != OCERZ_OP_TEST && m->op != OCERZ_OP_CMP) { safe = 0; break; }
+                if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_REG &&
+                    m->ops[0].reg == OCERZ_RSP) { safe = 0; break; }
+                break;
+            default:
+                safe = 0; break;
+            }
+            if (!safe) break;
+        }
+        if (safe && rj >= 0 && delta == 0)
+            g_ic_kind[rj] = 3;
+    }
+
     if (g_flaglive_log) {
         int wrote = 0, killed = 0;
         for (int i = 0; i < n; i++) {
@@ -11428,7 +11508,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             }
         }
 
-        if (g_ic_kind[i] == 1 || g_ic_kind[i] == 2) {
+        if (g_ic_kind[i] != 0) {
             int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
                         stack_plain_access_ok() && jgb_usable() && !stack_guard_needed();
             if (!fast3) {
@@ -11443,6 +11523,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             if (g_ic_kind[i] == 1) {
                 a64_mov_imm64(&b, JT1, insn->rip + insn->len);
                 emit_push_pinned(&b, hs, JT1);
+            } else if (g_ic_kind[i] == 3) {
+                a64_add_imm(&b, 1, hs, hs, 8);   /* slot proven intact: just pop */
             } else {
                 a64_ldr_regoff(&b, 8, JT0, JGB, hs, 0);
                 a64_add_imm(&b, 1, hs, hs, 8);
