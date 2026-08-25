@@ -1674,6 +1674,12 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
         /* SYSCALL is the one instruction the interpreter reaches that writes a register the 32-bit world */
         if (insnp->mode32)
             return ocerz_unimpl(vm, cpu, insnp, "syscall in 32-bit mode");
+        /* A signal that landed in user-mode code is only a bit in the pending
+         * mask until some syscall returns.  Vector it here, before a blocking
+         * call parks on top of the wakeup; rip rewinds so the syscall runs
+         * again after sigreturn. */
+        if (ocerz_signal_before_syscall(cpu, insnp->rip))
+            return OCERZ_STEP_OK;
         cpu->gpr[OCERZ_RCX] = cpu->rip;
         cpu->gpr[OCERZ_R11] = cpu->rflags & 0x3c7fd7ull;
         return ocerz_handle_syscall(vm, cpu);

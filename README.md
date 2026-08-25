@@ -51,8 +51,8 @@ make i386diff
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 65 / 66 |
-| x86-64 differential gate | 54 / 54 |
+| x86-64 guest gate | 66 / 67 |
+| x86-64 differential gate | 55 / 55 |
 | i386 differential gate | 20,032 / 20,032 |
 
 Highlights:

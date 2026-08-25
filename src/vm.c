@@ -116,6 +116,11 @@ void ocerz_vm_purge_jit_ras(OcerzVM *vm)
 
 static __thread volatile uint32_t g_pending_async_mask;
 
+uint32_t ocerz_peek_pending_async_sig(void)
+{
+    return __atomic_load_n(&g_pending_async_mask, __ATOMIC_SEQ_CST);
+}
+
 uint32_t ocerz_take_pending_async_sig(void)
 {
     return __atomic_exchange_n(&g_pending_async_mask, 0u, __ATOMIC_SEQ_CST);
@@ -191,6 +196,8 @@ void ocerz_vm_atfork_child(void)
     }
     g_fork_surviving_cpu = NULL;
     g_pending_async_mask = 0;
+    if (survivor)
+        survivor->sig_pending = 0;   /* fork clears pending signals in the child */
     g_riphist_n = 0;
     __atomic_store_n(&g_unstick_started, 0, __ATOMIC_RELEASE);
     /* The MAP_JIT arena is inherited READ-ONLY-EXECUTABLE-WISE-BROKEN by a

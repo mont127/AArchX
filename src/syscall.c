@@ -1066,6 +1066,9 @@ static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 #define OCERZ_PTHREAD_COOKIE 0x7ff8436bd690ull
 #define OCERZ_WQ_GUARD_SIZE 0x1000ull
 
+extern uint32_t ocerz_take_pending_async_sig(void);
+extern uint32_t ocerz_peek_pending_async_sig(void);
+
 #define OCERZ_ENV_ON(name) (__extension__({ static int _env_c = -1; if (_env_c < 0) _env_c = getenv(name) ? 1 : 0; _env_c; }))
 
 static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
@@ -1194,7 +1197,11 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             t.gs_base = pth + 0xe0;
             t.sig_altstack_sp = 0;
             t.sig_altstack_size = 0;
+            /* workqueue threads are made by the kernel, not forked off the
+             * requester, so they start with an empty mask rather than inheriting
+             * one. */
             t.sig_mask = 0;
+            t.sig_pending = 0;
             t.sig_on_stack = 0;
             t.sig_last_fault = 0;
             t.sig_repeat = 0;
@@ -1297,7 +1304,11 @@ static int ocerz_spawn_workloop_worker(OcerzVM *vm, const OcerzCPU *cpu,
     t.wq_workloop_id = workloop_id;
     t.sig_altstack_sp = 0;
     t.sig_altstack_size = 0;
+    /* workqueue threads are made by the kernel, not forked off the
+     * requester, so they start with an empty mask rather than inheriting
+     * one. */
     t.sig_mask = 0;
+    t.sig_pending = 0;
     t.sig_on_stack = 0;
     t.sig_last_fault = 0;
     t.sig_repeat = 0;
@@ -2299,7 +2310,11 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 
     w->cpu.sig_altstack_sp = 0;
     w->cpu.sig_altstack_size = 0;
-    w->cpu.sig_mask = 0;
+    /* sig_mask is inherited from the creator (the *cpu copy above already
+     * carries it), as POSIX requires of pthread_create; wine blocks
+     * server_block_set once on the main thread and counts on it.  Pending
+     * signals are not inherited. */
+    w->cpu.sig_pending = 0;
     w->cpu.sig_on_stack = 0;
     w->cpu.sig_last_fault = 0;
     w->cpu.sig_repeat = 0;
@@ -2627,6 +2642,68 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     return 1;
 }
 
+/* Asynchronous signals -- the ones the host handler in vm.c records in the
+ * pending mask -- obey the guest signal mask.  Synchronous faults (SEGV/BUS/
+ * FPE/TRAP/SYS) do not come through here and are never gated.
+ *
+ * Enforcing this is what keeps wine's server protocol in one piece.  wine
+ * blocks server_block_set (SIGUSR1 among them) around a wineserver
+ * request/reply pair so a suspend kick can only land BETWEEN calls.  Deliver
+ * one mid-pair and usr1_handler runs wait_suspend -> server_select, a second
+ * complete round trip nested inside the first on the same strictly ordered fd
+ * pair; the stream desynchronises and every client parks in read() forever.
+ *
+ * `taken` uses vm.c's bit-per-signal convention (1 << sig); sig_mask and
+ * sig_pending use the guest sigset_t one (1 << (sig - 1)).
+ * Returns the number of handlers vectored. */
+static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
+{
+    for (int s = 1; s < 32; s++)
+        if (taken & (1u << s))
+            cpu->sig_pending |= 1ull << (s - 1);
+
+    int n = 0;
+    /* Each pass clears one bit and can only widen the mask (sa->mask), so this
+     * terminates. */
+    while (cpu->sig_pending & ~cpu->sig_mask) {
+        int s = __builtin_ctzll(cpu->sig_pending & ~cpu->sig_mask) + 1;
+        cpu->sig_pending &= ~(1ull << (s - 1));
+        g_ocerz_deliver_src = 1;
+        if (OCERZ_ENV_ON("OCERZ_ASIGLOG"))
+            fprintf(stderr,
+                    "ocerz: ASYNCSIG[%d] cpu#%u sig=%d rip=%#llx ic=%#llx\n",
+                    (int)getpid(), cpu->cpu_number, s,
+                    (unsigned long long)cpu->rip,
+                    (unsigned long long)(vm ? vm->insn_count : 0));
+        n += ocerz_signal_deliver(cpu, s, 0, 0, 0);
+    }
+    return n;
+}
+
+/* Offer pending signals on the ENTRY edge of a syscall, before it runs.
+ *
+ * The host handler only sets a bit; the drain at the end of
+ * ocerz_handle_syscall runs on the RETURN edge.  A signal that lands while the
+ * guest is in pure user-mode code therefore sits unnoticed until some later
+ * syscall returns -- and if the next syscall is a blocking one, it parks with
+ * the wakeup still undelivered and never comes back.
+ *
+ * Rewind rip to the syscall instruction before vectoring, so the call
+ * re-executes once the handler returns: the signal simply arrived first, which
+ * is precisely what happened.  Nothing is lost and no return value is faked.
+ * Returns nonzero if the syscall must not run yet. */
+int ocerz_signal_before_syscall(OcerzCPU *cpu, uint64_t insn_rip)
+{
+    if (!ocerz_peek_pending_async_sig() && !(cpu->sig_pending & ~cpu->sig_mask))
+        return 0;
+    uint64_t resume = cpu->rip;
+    cpu->rip = insn_rip;
+    if (deliver_async_signals(cpu->vm, cpu, ocerz_take_pending_async_sig()))
+        return 1;
+    cpu->rip = resume;
+    return 0;
+}
+
 static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
@@ -2703,8 +2780,10 @@ static int sys_sigpending(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
     uint64_t set = a[0];
+    /* Signals held back by the mask must show up here, or the classic
+     * "block, work, sigpending, unblock" sequence loses them silently. */
     if (set != 0)
-        memset(ocerz_g2h(set), 0, 4);
+        ocerz_st(set, 4, (uint32_t)cpu->sig_pending);
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
 }
@@ -4982,8 +5061,6 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
     return OCERZ_STEP_FATAL;
 }
 
-extern uint32_t ocerz_take_pending_async_sig(void);
-
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t rax = cpu->gpr[OCERZ_RAX];
@@ -5083,19 +5160,10 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
         return OCERZ_STEP_FATAL;
     }
 
-    if (rc == OCERZ_STEP_OK) {
-        uint32_t pend = ocerz_take_pending_async_sig();
-        for (int s = 1; pend && s < 32; s++)
-            if (pend & (1u << s)) {
-                g_ocerz_deliver_src = 1;
-                if (OCERZ_ENV_ON("OCERZ_ASIGLOG"))
-                    fprintf(stderr,
-                            "ocerz: ASYNCSIG[%d] cpu#%u sig=%d rip=%#llx ic=%#llx\n",
-                            (int)getpid(), cpu->cpu_number, s,
-                            (unsigned long long)cpu->rip,
-                            (unsigned long long)vm->insn_count);
-                ocerz_signal_deliver(cpu, s, 0, 0, 0);
-            }
-    }
+    /* Return edge: deliver what arrived during the call, and re-offer anything
+     * the mask was holding -- sigprocmask() and sigreturn() land here too, so
+     * lowering the mask releases held signals at once. */
+    if (rc == OCERZ_STEP_OK)
+        deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig());
     return rc;
 }
