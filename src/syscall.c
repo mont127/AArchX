@@ -693,10 +693,17 @@ static __thread void **g_hostwq_tl_events;
 static __thread int   *g_hostwq_tl_nevents;
 static __thread int    g_hostwq_tl_evcap;
 
+struct ocerz_worker_pub {
+    pthread_mutex_t m;
+    pthread_cond_t c;
+    int published;
+};
+
 struct ocerz_worker {
     OcerzVM *vm;
     OcerzCPU cpu;
     int counts_wq;
+    struct ocerz_worker_pub *pub;
 };
 
 static volatile int g_wq_running;
@@ -770,6 +777,19 @@ static void *ocerz_worker_entry(void *p)
     mach_port_t kp = mach_thread_self();
     w->cpu.gpr[OCERZ_RSI] = kp;
     ocerz_st(w->cpu.gpr[OCERZ_RDI] + 0xf8, 4, (uint64_t)(uint32_t)kp);
+    /* The creator is blocked in sys_bsdthread_create until the kernel port is
+     * in the pthread struct, matching the kernel, where bsdthread_create
+     * writes it before returning. Without this a pthread_join right after
+     * pthread_create can read an empty port slot, conclude the thread already
+     * exited, and free the stack of a live thread. */
+    if (w->pub) {
+        struct ocerz_worker_pub *pub = w->pub;
+        w->pub = NULL;
+        pthread_mutex_lock(&pub->m);
+        pub->published = 1;
+        pthread_cond_signal(&pub->c);
+        pthread_mutex_unlock(&pub->m);
+    }
     if (getenv("OCERZ_THREADLOG"))
         fprintf(stderr, "ocerz: THREADSTART[%d] cpu#%u rip=%#llx pth=%#llx kp=%#x\n",
                 (int)getpid(), w->cpu.cpu_number,
@@ -2317,6 +2337,14 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     w->cpu.gpr[OCERZ_R8] = stack;
     w->cpu.gpr[OCERZ_R9] = flags | 0x10000000ull;
     w->cpu.gs_base = pth + 0xe0;
+    {
+        static int tl = -1;
+        if (tl < 0) tl = getenv("OCERZ_TERMLOG") ? 1 : 0;
+        if (tl)
+            fprintf(stderr, "ocerz: TCREATE[%d] cpu#%u stack=%#llx pth=%#llx gs=%#llx\n",
+                    (int)getpid(), w->cpu.cpu_number, (unsigned long long)stack,
+                    (unsigned long long)pth, (unsigned long long)w->cpu.gs_base);
+    }
 
     w->cpu.sig_altstack_sp = 0;
     w->cpu.sig_altstack_size = 0;
@@ -2343,6 +2371,11 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 16ull * 1024 * 1024);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    struct ocerz_worker_pub pub;
+    pthread_mutex_init(&pub.m, NULL);
+    pthread_cond_init(&pub.c, NULL);
+    pub.published = 0;
+    w->pub = &pub;
     pthread_t th;
     int rc = pthread_create(&th, &attr, ocerz_worker_entry, w);
     pthread_attr_destroy(&attr);
@@ -2351,6 +2384,12 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         ret_err(cpu, OCERZ_ENOMEM_V);
         return OCERZ_STEP_OK;
     }
+    pthread_mutex_lock(&pub.m);
+    while (!pub.published)
+        pthread_cond_wait(&pub.c, &pub.m);
+    pthread_mutex_unlock(&pub.m);
+    pthread_mutex_destroy(&pub.m);
+    pthread_cond_destroy(&pub.c);
     ocerz_unstick_start();
     ret_ok(cpu, pth);
     return OCERZ_STEP_OK;
@@ -2381,6 +2420,15 @@ static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             fp = nf;
         }
         fprintf(stderr, "\n");
+    }
+    {
+        static int tl = -1;
+        if (tl < 0) tl = getenv("OCERZ_TERMLOG") ? 1 : 0;
+        if (tl)
+            fprintf(stderr, "ocerz: TERM[%d] cpu#%u freeaddr=%#llx freesize=%#llx kport=%#llx sema=%#llx\n",
+                    (int)getpid(), cpu->cpu_number,
+                    (unsigned long long)a[0], (unsigned long long)a[1],
+                    (unsigned long long)a[2], (unsigned long long)a[3]);
     }
     uint64_t sema_or_ulock = a[3];
     if (sema_or_ulock != 0 && ocerz_bsdthread_sema_is_port(sema_or_ulock)) {
@@ -5026,6 +5074,24 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
         return dispatch_machdep_ldt(cpu, num);
     if (num == 3) {
         uint64_t newgs = cpu->gpr[OCERZ_RDI];
+        {
+            static int gl = -1;
+            if (gl < 0) gl = getenv("OCERZ_GSSETLOG") ? 1 : 0;
+            if (gl) {
+                static uint64_t seen[64];
+                static int nseen;
+                uint64_t key = newgs & ~0xfffull;
+                int found = 0;
+                for (int i = 0; i < nseen; i++)
+                    if (seen[i] == key) { found = 1; break; }
+                if (!found && nseen < 64) {
+                    seen[nseen++] = key;
+                    fprintf(stderr, "ocerz: GSSET[%d] cpu#%u newgs=%#llx oldgs=%#llx rip=%#llx\n",
+                            (int)getpid(), cpu->cpu_number, (unsigned long long)newgs,
+                            (unsigned long long)cpu->gs_base, (unsigned long long)cpu->rip);
+                }
+            }
+        }
 
         if (newgs < 0x100000 && cpu->gs_base >= 0x100000) {
             if (getenv("OCERZ_GSTRACE"))
