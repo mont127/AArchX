@@ -1634,13 +1634,13 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
             return OCERZ_STEP_OK;
         return trap_fatal(insnp, "guest breakpoint/interrupt");
     case OCERZ_OP_INT:
-        /* Any int vector other than 3 is a #GP for user code. Windows uses
-         * int $0x29 as __fastfail, and wine's SIGSEGV handler decodes the
-         * instruction bytes to turn it into STATUS_STACK_BUFFER_OVERRUN, so
-         * the guest must see the fault with rip still on the int. */
-        cpu->rip = insnp->rip;
-        if (ocerz_signal_deliver(cpu, SIGSEGV, insnp->rip, 0, 0))
-            return OCERZ_STEP_OK;
+        /* Windows uses int $0x29 as __fastfail, which means "die now".
+         * Handing it to the guest as a #GP so wine can raise
+         * STATUS_STACK_BUFFER_OVERRUN was tried and measured worse: the
+         * thread that fast-fails is already deep, dispatching the exception
+         * overflows its stack, and it wedges holding ntdll's loader_section
+         * so the process can never exit.  Dying here is both the documented
+         * intent and the only outcome that terminates. */
         return trap_fatal(insnp, "guest breakpoint/interrupt");
 
     case OCERZ_OP_UD2:
