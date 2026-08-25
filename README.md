@@ -104,6 +104,12 @@ Ratio is Ocerz time divided by Rosetta time. Lower is better.
 
 Apple M2 Max, 2026-08-25, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`; set `XB=tests/guest/benchbin/xbench_dyn` for the dynamic binary.
 
+These kernels never create a thread, fork, or map shared memory, so they run in plain
+memory mode throughout. A program that does any of those retires plain mode permanently
+(`ocerz_jit_require_ordered`) and pays for TSO-ordered loads and stores: under
+`OCERZ_NO_PLAIN_MEM=1` the same table reads 3.55x on `memcpy` and 3.67x on `fpvec`.
+Wine is always in ordered mode, so the numbers above do not describe it.
+
 ## CLI
 
 ```text
