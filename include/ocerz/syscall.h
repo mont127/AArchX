@@ -17,6 +17,9 @@ int ocerz_is_wqthread_exit(uint64_t rip);
 
 int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_code,
                          uint32_t err);
+/* Deliver any unmasked pending async signal before a syscall runs; rewinds rip
+ * to insn_rip so the syscall re-executes afterwards.  Nonzero = do not run it. */
+int ocerz_signal_before_syscall(OcerzCPU *cpu, uint64_t insn_rip);
 
 uint64_t ocerz_ldt_base(uint32_t sel);
 int ocerz_ldt_is_big(uint32_t sel);

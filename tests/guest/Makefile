@@ -34,7 +34,15 @@ ARCH := -arch x86_64
 CFLAGS := $(ARCH) -nostdlib -static -fno-stack-protector -O2 -Wl,-e,_start
 COMMON := crt0.s libmini.c
 
-TESTS := hello exit42 args alu branches strings fib sse mmap_test fileio memstress flags flags_deferred longblock signal_test signal_jump0 rip_test stack_test popmem_test flags_live flags_carry fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress chaincall link_spin fault_link fault_xlive fork_order fork_exec shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq jit_narrow jit_misc2 jit_misc3 jit_align jit_align2 jit_nanabs jit_divtrap
+TESTS := hello exit42 args alu branches strings fib sse mmap_test fileio memstress flags flags_deferred longblock signal_test signal_jump0 rip_test stack_test popmem_test flags_live flags_carry fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress chaincall link_spin fault_link fault_xlive fork_order fork_exec shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq jit_narrow jit_misc2 jit_misc3 jit_align jit_align2 jit_nanabs jit_divtrap sigmask_test
+
+# lostwake.c is deliberately NOT in TESTS. It is a manual reproducer for the
+# entry-edge signal drain and is timing-dependent by construction (a forked
+# child must deliver SIGUSR1 while the parent spins), plus its 300M-iteration
+# spin takes minutes under the interpreter. Both gates glob bin/*, so keeping
+# it out of bin/ keeps them deterministic. Build and run it by hand with:
+#   clang $(CFLAGS) -o /tmp/lostwake crt0.s libmini.c lostwake.c
+#   ../../ocerz /tmp/lostwake     # must print "start" then "woke rc=1"
 
 # bench is a THROUGHPUT benchmark, not a correctness test. It is built into
 # benchbin/, NOT bin/, and that separation is load-bearing: run_diff_test.sh and

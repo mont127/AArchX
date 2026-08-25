@@ -94,6 +94,10 @@ typedef struct OcerzCPU {
     uint64_t sig_altstack_sp;
     uint64_t sig_altstack_size;
     uint64_t sig_mask;
+    /* Signals raised while sig_mask blocked them, held until it drops.  Same
+     * bit convention as sig_mask (bit sig-1), which is also the guest's
+     * sigset_t layout, so sigpending() can copy it out directly. */
+    uint64_t sig_pending;
     int sig_on_stack;
     uint64_t sig_last_fault;
     int sig_repeat;
