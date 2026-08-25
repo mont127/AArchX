@@ -86,23 +86,23 @@ Ratio is Ocerz time divided by Rosetta time. Lower is better.
 
 | Kernel | Static | Dynamic |
 | --- | ---: | ---: |
-| `depchain` | **0.86x** | **0.85x** |
-| `jtab` | **0.93x** | **0.91x** |
-| `memcpy` | **0.93x** | **0.96x** |
-| `brmiss` | **0.95x** | **0.96x** |
-| `fpvec` | **0.96x** | **0.96x** |
-| `qsort` | **0.98x** | 1.00x |
-| `str` | **0.98x** | 1.04x |
+| `depchain` | **0.85x** | **0.85x** |
+| `memcpy` | **0.92x** | **0.96x** |
+| `jtab` | **0.95x** | **0.91x** |
+| `brmiss` | **0.96x** | **0.96x** |
+| `qsort` | **0.98x** | **1.00x** |
+| `fpvec` | **0.97x** | **0.96x** |
+| `icall` | **0.99x** | 1.05x |
+| `str` | **0.99x** | 1.04x |
+| `hash` | **1.00x** | **1.00x** |
 | `idiv` | **0.99x** | **0.99x** |
 | `vm` | **0.99x** | **0.95x** |
-| `chase` | 1.00x | 1.02x |
-| `hash` | 1.02x | 1.00x |
-| `icall` | 1.05x | 1.05x |
-| `leafcall` | 1.18x | 1.18x |
-| `fpsse` | 1.20x | 1.20x |
-| `mixed` | 1.22x | 1.19x |
+| `chase` | **0.99x** | 1.02x |
+| `fpsse` | 1.15x | 1.20x |
+| `leafcall` | 1.19x | 1.18x |
+| `mixed` | 1.23x | 1.19x |
 
-Apple M2 Max, 2026-08-25, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`; set `XB=tests/guest/benchbin/xbench_dyn` for the dynamic binary.
+Apple M2 Max, 2026-08-25, static `REPS=11` / dynamic `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`; set `XB=tests/guest/benchbin/xbench_dyn` for the dynamic binary.
 
 These kernels never create a thread, fork, or map shared memory, so they run in plain
 memory mode throughout. A program that does any of those retires plain mode permanently
