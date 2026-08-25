@@ -47,12 +47,12 @@ make i386diff
 | instruction corpus | 511 instructions |
 | x86-64 decode | 199 / 199 cases |
 | i386 decode | 102 cases, 26 rejects, 122 address cases |
-| extension / SSE suites | 233 / 0, 246 / 0 |
+| extension / SSE suites | 233 / 0, 246 / 0, SSE4.2 differential vs Rosetta |
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 66 / 67 |
-| x86-64 differential gate | 55 / 55 |
+| x86-64 guest gate | 68 / 69 |
+| x86-64 differential gate | 56 / 56 |
 | i386 differential gate | 20,032 / 20,032 |
 
 Highlights:
@@ -76,7 +76,7 @@ export WINEPREFIX="$HOME/.wine-ocerz"
 ./ocerz "$WINE/bin/wine" notepad
 ```
 
-MacNdCheese's Wine build also runs under Ocerz. Steam loads its own DLLs, completes its update check against the Steam CDN, and reaches the client core. Signing in does not complete yet.
+MacNdCheese's Wine build also runs under Ocerz. Steam's client core starts: the connectivity test passes, CEF runs and executes the login page's JavaScript, and the remaining work is the rendering path. SSE4.2 is implemented and advertised, which Steam requires.
 
 Rosetta also runs i386 PE code through Wine WoW64. Ocerz's i386 support is replacement parity, not an exclusive capability. Standalone i386 Mach-O applications are not supported by current macOS SDKs or macOS itself.
 
