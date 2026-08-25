@@ -476,10 +476,6 @@ static inline int stack_identity(void)
     static int dis = -1;
     if (dis < 0) {
         dis = getenv("OCERZ_NO_STACK_IDX") ? 1 : 0;
-        if (getenv("OCERZ_IDLOG"))
-            fprintf(stderr, "ocerz: stack_identity=%d guest_base=%#llx low_base=%#llx\n",
-                    !dis && ocerz_guest_base == 0 && ocerz_low_base == 0,
-                    (unsigned long long)ocerz_guest_base, (unsigned long long)ocerz_low_base);
     }
     return !dis && ocerz_guest_base == 0 && ocerz_low_base == 0;
 }
@@ -517,11 +513,29 @@ static int g_n_call_edges;
 static OcerzJit *g_xlat_jit;
 /* Guest mode of the block currently being translated. */
 static int g_xlat_mode32;
+static int g_xlat_mode32_fwd(void) { return g_xlat_mode32; }
 
 static int8_t *g_pin;
 static uint8_t *g_pin_hold;
 static int g_n_pinned;
 static int g_pin_class;
+/* Class 3 keeps rsp's host register as guest_base + rsp, like class 2 always
+ * did: push/pop become single pre/post-index accesses and rsp-relative
+ * addresses drop the base add.  Reads and writes of the rsp VALUE convert at
+ * the accessors; spill/fill and fault recovery convert at the boundaries.
+ * OCERZ_RSP_VALUE restores the old value-keeping class 3. */
+static inline int rsp_ptr3(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_RSP_VALUE") != NULL;
+    return !off;
+}
+static int g_xlat_mode32_fwd(void);
+static inline int rsp_is_ptr(void)
+{
+    return g_pin_class == 2 ||
+           (g_pin_class == 3 && !g_xlat_mode32_fwd() && rsp_ptr3());
+}
 int g_pin_class_fwd(void) { return g_pin_class; }
 
 static int g_defer;
@@ -1022,7 +1036,7 @@ enum { JT0 = 9, JT1 = 10, JT2 = 11, JTF = 12, JTT = 13, JTU = 14, JTA = 15 };
  * the 3-word temp form */
 static void emit_push_pinned(A64Buf *b, int hs, int rv)
 {
-    if (stack_identity() && rv != hs) {
+    if ((stack_identity() || rsp_is_ptr()) && rv != hs) {
         a64_str_pre64(b, rv, hs, -8);
         return;
     }
@@ -1151,7 +1165,7 @@ static inline int body_edge_pin_class(void)
 static void emit_gpr_rd(A64Buf *b, int sf, int dst, unsigned greg)
 {
     int s = pin_slot(greg);
-    if (s >= 0 && g_pin_class == 2 && greg == OCERZ_RSP) {
+    if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
 
         a64_mov_imm64(b, dst, ocerz_guest_base);
         a64_sub_reg(b, 1, dst, pin_hreg(s), dst, 0);
@@ -1175,7 +1189,7 @@ static void emit_gpr_rd_sw(A64Buf *b, int dst, unsigned greg)
 static void emit_gpr_wr(A64Buf *b, int src, unsigned greg)
 {
     int s = pin_slot(greg);
-    if (s >= 0 && g_pin_class == 2 && greg == OCERZ_RSP) {
+    if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
         int tmp = src == JTU ? JTA : JTU;
         a64_mov_imm64(b, tmp, ocerz_guest_base);
         a64_add_reg(b, 1, pin_hreg(s), src, tmp, 0);
@@ -1188,7 +1202,7 @@ static void emit_gpr_wr(A64Buf *b, int src, unsigned greg)
 static void emit_spill_pinned(A64Buf *b)
 {
     for (int i = 0; i < g_n_pinned; i++) {
-        if (g_pin_class == 2 && g_pin_hold[i] == OCERZ_RSP) {
+        if (rsp_is_ptr() && g_pin_hold[i] == OCERZ_RSP) {
             a64_mov_imm64(b, JTA, ocerz_guest_base);
             a64_sub_reg(b, 1, JTA, pin_hreg(i), JTA, 0);
             a64_str(b, 8, JTA, 20, GPR_OFF(OCERZ_RSP));
@@ -1215,7 +1229,7 @@ static void emit_fill_pinned(A64Buf *b)
 {
     for (int i = 0; i < g_n_pinned; i++)
         a64_ldr(b, 8, pin_hreg(i), 20, GPR_OFF(g_pin_hold[i]));
-    if (g_pin_class == 2) {
+    if (rsp_is_ptr()) {
         int s = pin_slot(OCERZ_RSP);
         assert(s >= 0);
         a64_mov_imm64(b, JTA, ocerz_guest_base);
@@ -1290,7 +1304,7 @@ static int fuse_prev_mov(A64Buf *b, unsigned dreg, int size, int *hs_out,
     if (pd->reg != dreg || pd->size != size || ps->size != size || (size != 4 && size != 8)) return -1;
     if (ps->reg == dreg) return -1;
     if (pin_slot(dreg) < 0 || pin_slot(ps->reg) < 0) return -1;
-    if (g_pin_class == 2 && (dreg == OCERZ_RSP || ps->reg == OCERZ_RSP)) return -1;
+    if (rsp_is_ptr() && (dreg == OCERZ_RSP || ps->reg == OCERZ_RSP)) return -1;
     int hd = pin_hreg(pin_slot(dreg)), hs = pin_hreg(pin_slot(ps->reg));
     uint32_t want = (size == 8 ? 0xaa0003e0u : 0x2a0003e0u) | ((uint32_t)hs << 16) | (uint32_t)hd;   /* orr hd, (x|w)zr, hs */
     if (b->p <= b->start + 1 || b->p[-1] != want) return -1;
@@ -1389,9 +1403,21 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
                   op == OCERZ_OP_AND || op == OCERZ_OP_OR || op == OCERZ_OP_XOR);
     (void)is_logic;
 
+    /* add/sub imm on a pointer-held rsp: base + (v +- imm) == (base + v) +- imm,
+     * so the pointer form is exact.  Dead flags only: records would capture the
+     * pointer, and materialize would compute flags of the wrong value. */
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP && sf && !need &&
+        (op == OCERZ_OP_ADD || op == OCERZ_OP_SUB) &&
+        s->kind == OCERZ_OPK_IMM && s->imm <= 4095 && pin_slot(OCERZ_RSP) >= 0) {
+        int hs = pin_hreg(pin_slot(OCERZ_RSP));
+        if (op == OCERZ_OP_ADD) a64_add_imm(b, 1, hs, hs, (uint32_t)s->imm);
+        else                    a64_sub_imm(b, 1, hs, hs, (uint32_t)s->imm);
+        return 1;
+    }
+
     /* NZCV forwarding to the adjacent consumer: flag-setting arm64 op */
     if (g_nzcv_want && pin_slot(d->reg) >= 0 &&
-        !(g_pin_class == 2 && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP))) &&
+        !(rsp_is_ptr() && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP))) &&
         (s->kind == OCERZ_OPK_IMM || (s->kind == OCERZ_OPK_REG && !s->high8 && pin_slot(s->reg) >= 0))) {
         int rd = pin_hreg(pin_slot(d->reg));
         int rm;
@@ -1455,7 +1481,7 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
     /* pinned destination with live flags: record from the pre-op operands,
      * then operate in place (no JT round trips) */
     if (writes && need != 0 && pin_slot(d->reg) >= 0 && (is_add || is_sub || is_logic) &&
-        !(g_pin_class == 2 && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP))) &&
+        !(rsp_is_ptr() && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP))) &&
         (s->kind == OCERZ_OPK_IMM || (s->kind == OCERZ_OPK_REG && !s->high8))) {
         int rd = pin_hreg(pin_slot(d->reg));
         int rm;
@@ -1681,8 +1707,8 @@ static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
 
     /* pinned register forms on the deferred path: operate on the pin directly */
     if (g_defer && !d_mem && !s_mem && pin_slot(d->reg) >= 0 &&
-        !(g_pin_class == 2 && d->reg == OCERZ_RSP) &&
-        (s->kind == OCERZ_OPK_IMM || (pin_slot(s->reg) >= 0 && !(g_pin_class == 2 && s->reg == OCERZ_RSP)))) {
+        !(rsp_is_ptr() && d->reg == OCERZ_RSP) &&
+        (s->kind == OCERZ_OPK_IMM || (pin_slot(s->reg) >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)))) {
         int rd = pin_hreg(pin_slot(d->reg));
         if (!is_sub && s->kind == OCERZ_OPK_IMM) {
             /* TEST reg, imm: the masked immediate keeps the AND within the width */
@@ -1741,7 +1767,7 @@ static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
     }
     if (s->kind == OCERZ_OPK_REG) {
         int ss = pin_slot(s->reg);
-        int rs = (ss >= 0 && !(g_pin_class == 2 && s->reg == OCERZ_RSP)) ? pin_hreg(ss) : JT1;
+        int rs = (ss >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)) ? pin_hreg(ss) : JT1;
         if (rs == JT1) emit_gpr_rd(b, 1, JT1, s->reg);
         if (size == 1) a64_uxtb(b, JT1, rs); else a64_uxth(b, JT1, rs);
     } else if (!s_mem) {
@@ -1865,7 +1891,7 @@ static int emit_incdec_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
     if (!g_defer || d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 1 && d->size != 2)) return 0;
-    if (pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+    if (pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
     int rd = pin_hreg(pin_slot(d->reg));
     int bits = d->size * 8;
     int is_inc = insn->op == OCERZ_OP_INC;
@@ -2171,7 +2197,7 @@ static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
     if (d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 1 || d->size == 2) &&
-        s->kind == OCERZ_OPK_IMM && pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP) &&
+        s->kind == OCERZ_OPK_IMM && pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP) &&
         (insn->op == OCERZ_OP_SHL || insn->op == OCERZ_OP_SHR || insn->op == OCERZ_OP_SAR)) {
         /* 8/16-bit register shifts: count masked to 5 bits like x86; the low
          * bits of a 32-bit shift of the (zero/sign) extended value are exact */
@@ -2456,7 +2482,7 @@ static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, i
     /* pin class 2 keeps guest rsp as guest_base+rsp in its host register; it
      * is a 64-bit stack protocol and translate() never selects it for a
      * 32-bit block.  Refuse rather than read a biased register. */
-    if (g_pin_class == 2 && ((has_b && op->base == OCERZ_RSP) ||
+    if (rsp_is_ptr() && ((has_b && op->base == OCERZ_RSP) ||
                              (has_i && op->index == OCERZ_RSP)))
         return 0;
 
@@ -2543,13 +2569,13 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     if (insn->addrsize != 8)
         return 0;                    /* i386 16-bit addressing (0x67): interpreted */
     uint64_t initial = (uint64_t)op->disp + fold;
-    if (g_pin_class == 2 && op->base == OCERZ_RSP &&
+    if (rsp_is_ptr() && op->base == OCERZ_RSP &&
         pin_slot(OCERZ_RSP) >= 0)
         initial = (uint64_t)op->disp;
     /* fast form: gbase lives in JGB -> add base/index to it, then the
      * displacement as an immediate (no 2-3 word constant materialization) */
     if (jgb_usable() && fold == ocerz_guest_base && seg == OCERZ_SEG_NONE &&
-        !(g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) &&
+        !(rsp_is_ptr() && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) &&
         op->disp >= -4095 && op->disp <= 4095 &&
         (op->base == OCERZ_REG_NONE || pin_slot(op->base) >= 0) &&
         (op->index == OCERZ_REG_NONE || pin_slot(op->index) >= 0)) {
@@ -2581,7 +2607,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     }
     if (op->index != OCERZ_REG_NONE) {
         int s = pin_slot(op->index);
-        if (s >= 0 && !(g_pin_class == 2 && op->index == OCERZ_RSP))
+        if (s >= 0 && !(rsp_is_ptr() && op->index == OCERZ_RSP))
             a64_add_reg(b, 1, addr_reg, addr_reg, pin_hreg(s), op->scale & 3);
         else {
             emit_gpr_rd(b, 1, JT0, op->index);
@@ -3008,7 +3034,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || m->riprel) return 0;
     if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
-    if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
+    if (rsp_is_ptr() && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
     int plain = mem_plain_access_ok(m);
     X86Operand mview; m = mem_hoist_view(m, &mview);
     int hb = pin_hreg(pin_slot(m->base));
@@ -3163,7 +3189,7 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
 {
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
-    if (g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
+    if (rsp_is_ptr() && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
     if (op->riprel) {
         uint64_t c = (uint64_t)op->disp + ocerz_guest_base;
         /* a 3+-word constant: one ldr from the block's literal pool instead */
@@ -3262,7 +3288,7 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
         insn->seg == OCERZ_SEG_NONE && insn->addrsize == 8 && !op->riprel &&
         op->base != OCERZ_REG_NONE && op->index != OCERZ_REG_NONE && (op->disp == 0 || aux_disp_ok) &&
         pin_slot(op->base) >= 0 && pin_slot(op->index) >= 0 &&
-        !(g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP))) {
+        !(rsp_is_ptr() && (op->base == OCERZ_RSP || op->index == OCERZ_RSP))) {
         int sc = op->scale & 3;
         int want = size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
         if (aux_disp_ok && (sc == 0 || sc == want)) {
@@ -3351,7 +3377,7 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         (d->size == 1 || d->size == 2) && !d->high8) {
         /* partial-register load: merge into the low byte/word of the pin */
         int ds = pin_slot(d->reg);
-        if (ds < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+        if (ds < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
         if (!emit_mem_load_plain(b, insn, s, d->size, JT1)) {
             if (!emit_mem_ea(b, insn, s, JTA))
                 return 0;
@@ -3406,7 +3432,7 @@ static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
         if (s->high8)
             return 0;
         if (pin_slot(d->reg) >= 0 && pin_slot(s->reg) >= 0 &&
-            !(g_pin_class == 2 && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP))) {
+            !(rsp_is_ptr() && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP))) {
             int rd = pin_hreg(pin_slot(d->reg)), rs = pin_hreg(pin_slot(s->reg));
             if (is_signed) { if (s->size == 1) a64_sxtb(b, sf, rd, rs); else a64_sxth(b, sf, rd, rs); }
             else           { if (s->size == 1) a64_uxtb(b, rd, rs); else a64_uxth(b, rd, rs); }
@@ -3425,7 +3451,7 @@ static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
     }
     if (s->kind == OCERZ_OPK_MEM) {
         int ds = pin_slot(d->reg);
-        if (g_pin_class == 2 && d->reg == OCERZ_RSP) ds = -1;
+        if (rsp_is_ptr() && d->reg == OCERZ_RSP) ds = -1;
         if (ds >= 0) {
             int ra; uint32_t disp;
             if (!is_signed && emit_mem_load_plain(b, insn, s, s->size, pin_hreg(ds)))
@@ -3580,13 +3606,13 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             int rv;
             if (o->kind == OCERZ_OPK_REG) {
                 int vs = pin_slot(o->reg);
-                if (vs >= 0) rv = pin_hreg(vs);
+                if (vs >= 0 && !(rsp_is_ptr() && o->reg == OCERZ_RSP)) rv = pin_hreg(vs);
                 else { emit_gpr_rd(b, 1, JT1, o->reg); rv = JT1; }
             } else {
                 a64_mov_imm64(b, JT1, o->imm);
                 rv = JT1;
             }
-            if (stack_identity() && rv != hs) {
+            if ((stack_identity() || rsp_is_ptr()) && rv != hs) {
                 a64_str_pre64(b, rv, hs, -8);
                 return 1;
             }
@@ -3658,7 +3684,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() && jgb_usable() &&
             !stack_guard_needed() && o->reg != OCERZ_RSP && pin_slot(o->reg) >= 0) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
-            if (stack_identity()) {
+            if (stack_identity() || rsp_is_ptr()) {
                 a64_ldr_post64(b, pin_hreg(pin_slot(o->reg)), hs, 8);
                 return 1;
             }
@@ -3714,12 +3740,12 @@ static int emit_movsxd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, in
         return 0;
 
     int ds = pin_slot(d->reg);
-    if (g_pin_class == 2 && d->reg == OCERZ_RSP) ds = -1;
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP) ds = -1;
     if (s->kind == OCERZ_OPK_REG) {
         if (s->high8)
             return 0;
         int ss = pin_slot(s->reg);
-        if (ds >= 0 && ss >= 0 && !(g_pin_class == 2 && s->reg == OCERZ_RSP)) {
+        if (ds >= 0 && ss >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)) {
             a64_sxtw(b, pin_hreg(ds), pin_hreg(ss));
             return 1;
         }
@@ -3841,7 +3867,7 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
                   op == OCERZ_OP_AND || op == OCERZ_OP_OR || op == OCERZ_OP_XOR);
 
     /* plain memory + pinned destination: load, then operate in place */
-    if (pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP) &&
+    if (pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP) &&
         emit_mem_load_plain(b, insn, s, sf ? 8 : 4, JT1)) {
         int rd = pin_hreg(pin_slot(d->reg));
         if (g_nzcv_want) {                   /* NZCV forwarding: flag-setting forms */
@@ -3945,8 +3971,8 @@ static int emit_lea(A64Buf *b, const X86Insn *insn)
     int ds = pin_slot(d->reg);
     int bs = s->base != OCERZ_REG_NONE ? pin_slot(s->base) : -1;
     int is = s->index != OCERZ_REG_NONE ? pin_slot(s->index) : -1;
-    int host_rsp_operand = g_pin_class == 2 &&
-        (s->base == OCERZ_RSP || s->index == OCERZ_RSP);
+    int host_rsp_operand = rsp_is_ptr() &&
+        (d->reg == OCERZ_RSP || s->base == OCERZ_RSP || s->index == OCERZ_RSP);
     if (ds >= 0 && !s->riprel && bs >= 0 && !host_rsp_operand) {
         int sf = insn->addrsize == 8 && d->size == 8;
         int64_t disp = s->disp;
@@ -4106,14 +4132,14 @@ static int cc_consumer_inline_ok(const X86Insn *c)
         static int no = -1; if (no < 0) no = getenv("OCERZ_NO_INLINE_SETCC") ? 1 : 0;
         if (no) return 0;
         return d->kind == OCERZ_OPK_REG && !d->high8 && d->size == 1 &&
-               !(g_pin_class == 2 && d->reg == OCERZ_RSP);
+               !(rsp_is_ptr() && d->reg == OCERZ_RSP);
     }
     case OCERZ_OP_CMOVCC: {
         static int no = -1; if (no < 0) no = getenv("OCERZ_NO_INLINE_CMOV") ? 1 : 0;
         if (no) return 0;
         const X86Operand *sr = &c->ops[1];
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
-        if (g_pin_class == 2 && (d->reg == OCERZ_RSP || (sr->kind == OCERZ_OPK_REG && sr->reg == OCERZ_RSP))) return 0;
+        if (rsp_is_ptr() && (d->reg == OCERZ_RSP || (sr->kind == OCERZ_OPK_REG && sr->reg == OCERZ_RSP))) return 0;
         if (sr->kind == OCERZ_OPK_REG) return !sr->high8 && sr->size == d->size;
         return sr->kind == OCERZ_OPK_MEM;
     }
@@ -4121,7 +4147,7 @@ static int cc_consumer_inline_ok(const X86Insn *c)
         const X86Operand *sr = &c->ops[1];
         if (!g_defer) return 0;
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
-        if (g_pin_class == 2 && d->reg == OCERZ_RSP) return 0;
+        if (rsp_is_ptr() && d->reg == OCERZ_RSP) return 0;
         if (sr->kind == OCERZ_OPK_REG) return !sr->high8 && sr->size == d->size;
         return sr->kind == OCERZ_OPK_IMM;
     }
@@ -4202,7 +4228,7 @@ static int value_cond_fuse_producer(const X86Insn *insns, int ci)
     const X86Operand *d = &p->ops[0];
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return -1;
     if (pin_slot(d->reg) < 0) return -1;
-    if (g_pin_class == 2 && d->reg == OCERZ_RSP) return -1;
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP) return -1;
     for (int k = pi + 1; k < ci; k++) {
         if (insn_may_write_gpr(&insns[k], d->reg)) return -1;
         uint64_t mdef, muse;
@@ -4219,7 +4245,7 @@ static int mem_plain_ok(const X86Insn *insn, const X86Operand *op)
 {
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
-    if (g_pin_class == 2 && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
+    if (rsp_is_ptr() && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
     if (op->riprel) return 1;
     if (op->base != OCERZ_REG_NONE && pin_slot(op->base) < 0) return 0;
     if (op->index != OCERZ_REG_NONE && pin_slot(op->index) < 0) return 0;
@@ -4326,9 +4352,9 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
         if (p->nops != 2 || p->seg != OCERZ_SEG_NONE || p->addrsize != 8) return -1;
         const X86Operand *bd = &p->ops[0], *bo = &p->ops[1];
         if (bd->size != 2 && bd->size != 4 && bd->size != 8) return -1;
-        if (bd->kind == OCERZ_OPK_REG) { if (bd->high8 || pin_slot(bd->reg) < 0 || (g_pin_class == 2 && bd->reg == OCERZ_RSP)) return -1; }
+        if (bd->kind == OCERZ_OPK_REG) { if (bd->high8 || pin_slot(bd->reg) < 0 || (rsp_is_ptr() && bd->reg == OCERZ_RSP)) return -1; }
         else if (bd->kind != OCERZ_OPK_MEM || p->op != OCERZ_OP_BT) return -1;
-        if (bo->kind == OCERZ_OPK_REG) { if (bo->high8 || pin_slot(bo->reg) < 0 || (g_pin_class == 2 && bo->reg == OCERZ_RSP)) return -1; }
+        if (bo->kind == OCERZ_OPK_REG) { if (bo->high8 || pin_slot(bo->reg) < 0 || (rsp_is_ptr() && bo->reg == OCERZ_RSP)) return -1; }
         else if (bo->kind != OCERZ_OPK_IMM) return -1;
         return k;
     }
@@ -4346,7 +4372,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
         /* narrow producers (emit_cmp_test_narrow): TEST reg,imm sets Z of the masked AND (E/NE only) */
         if (sr->size != d->size || sr->high8) return -1;
         if (d->kind == OCERZ_OPK_REG) {
-            if (d->high8 || pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return -1;
+            if (d->high8 || pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return -1;
         } else if (d->kind == OCERZ_OPK_MEM) {
             if (p->op != OCERZ_OP_CMP || !mem_plain_ok(p, d) || sr->kind == OCERZ_OPK_MEM) return -1;
         } else return -1;
@@ -4354,7 +4380,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
             if (sr->kind != OCERZ_OPK_IMM) return -1;
             if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE) return -1;
         } else if (p->op == OCERZ_OP_CMP) {
-            if (sr->kind == OCERZ_OPK_REG) { if (pin_slot(sr->reg) < 0 || (g_pin_class == 2 && sr->reg == OCERZ_RSP)) return -1; }
+            if (sr->kind == OCERZ_OPK_REG) { if (pin_slot(sr->reg) < 0 || (rsp_is_ptr() && sr->reg == OCERZ_RSP)) return -1; }
             else if (sr->kind == OCERZ_OPK_MEM) { if (!mem_plain_ok(p, sr)) return -1; }
             else if (sr->kind != OCERZ_OPK_IMM) return -1;
             if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE && cc != OCERZ_CC_B && cc != OCERZ_CC_AE &&
@@ -4363,11 +4389,11 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
         return k;
     }
     if (d->kind != OCERZ_OPK_REG || d->high8) return -1;
-    if (pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return -1;
+    if (pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return -1;
     if (d->size != 4 && d->size != 8) return -1;
     if (sr->size != d->size) return -1;
     if (sr->kind == OCERZ_OPK_REG) {
-        if (sr->high8 || pin_slot(sr->reg) < 0 || (g_pin_class == 2 && sr->reg == OCERZ_RSP)) return -1;
+        if (sr->high8 || pin_slot(sr->reg) < 0 || (rsp_is_ptr() && sr->reg == OCERZ_RSP)) return -1;
     } else if (sr->kind == OCERZ_OPK_MEM) {
         if (!mem_plain_ok(p, sr)) return -1;
     } else if (sr->kind != OCERZ_OPK_IMM) return -1;
@@ -4658,13 +4684,13 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (!g_defer) return 0;
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
-    if (g_pin_class == 2 && d->reg == OCERZ_RSP) return 0;
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP) return 0;
     if (s->kind == OCERZ_OPK_REG) { if (s->high8 || s->size != d->size) return 0; }
     else if (s->kind != OCERZ_OPK_IMM) return 0;
     int sf = d->size == 8;
     int is_sbb = insn->op == OCERZ_OP_SBB;
     if (!need && pin_slot(d->reg) >= 0 &&
-        (s->kind == OCERZ_OPK_IMM || (pin_slot(s->reg) >= 0 && !(g_pin_class == 2 && s->reg == OCERZ_RSP)))) {
+        (s->kind == OCERZ_OPK_IMM || (pin_slot(s->reg) >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)))) {
         /* dead result flags, pinned operands: CF -> JTT, then two adds/subs in place */
         int rd = pin_hreg(pin_slot(d->reg));
         emit_cc_predicate_ex(b, OCERZ_CC_B, 1);
@@ -4710,7 +4736,7 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (!g_defer) return 0;
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 1 && d->size != 2)) return 0;
-    if (g_pin_class == 2 && d->reg == OCERZ_RSP) return 0;
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP) return 0;
     int s_mem = 0;
     if (s->kind == OCERZ_OPK_REG) { if (s->high8 || s->size != d->size) return 0; }
     else if (s->kind == OCERZ_OPK_MEM) { if (s->size != d->size || insn->seg != OCERZ_SEG_NONE) return 0; s_mem = 1; }
@@ -4761,12 +4787,12 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     /* pinned destination, dead flags: compute the low bits directly from the
      * pinned register (the operation only depends on the low `bits`) and
      * insert them back: 2-3 words */
-    if (!need && pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP)) {
+    if (!need && pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
         int rd = pin_hreg(pin_slot(d->reg));
         int rm;
         if (s->kind == OCERZ_OPK_REG) {
             int ss = pin_slot(s->reg);
-            if (ss >= 0 && !(g_pin_class == 2 && s->reg == OCERZ_RSP)) rm = pin_hreg(ss);
+            if (ss >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)) rm = pin_hreg(ss);
             else { emit_gpr_rd(b, 1, JT1, s->reg); rm = JT1; }
         } else {
             uint64_t v = (uint64_t)s->imm & mask;
@@ -5005,7 +5031,7 @@ static int emit_not_neg(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
     if (d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 1 || d->size == 2) && g_defer &&
-        pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP)) {
+        pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
         /* 8/16-bit register forms in place */
         int rd = pin_hreg(pin_slot(d->reg));
         int bits = d->size * 8;
@@ -5027,7 +5053,7 @@ static int emit_not_neg(A64Buf *b, const X86Insn *insn, uint64_t need)
     int sf = d->size == 8;
     int ds = pin_slot(d->reg);
     if (insn->op == OCERZ_OP_NOT) {
-        if (ds >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP)) {
+        if (ds >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
             a64_orn_reg(b, sf, pin_hreg(ds), A64_ZR, pin_hreg(ds), 0);
             return 1;
         }
@@ -5074,7 +5100,7 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
     const X86Operand *d = &insn->ops[0];
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
         return 0;
-    if (g_pin_class == 2 && d->reg == OCERZ_RSP)
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
     /* i386 block, CL count: a count that masks to 0 must leave the destination COMPLETELY untouched */
     if (insn->mode32 && insn->ops[1].kind != OCERZ_OPK_IMM)
@@ -5147,7 +5173,7 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
         return 0;
     if (!(s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RCX && !s->high8 && s->size == 1))
         return 0;
-    if (g_pin_class == 2 && d->reg == OCERZ_RSP)
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
     if (need)
         return 0;                       /* flags: count==0 keeps them; stay slow */
@@ -5183,7 +5209,7 @@ static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int 
     const X86Operand *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
         return 0;
-    if (g_pin_class == 2 && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP)))
+    if (rsp_is_ptr() && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP)))
         return 0;
     int sf = d->size == 8;
     /* source value -> JT2 (memory sources are loaded even when not taken, as x86 does);
@@ -5243,7 +5269,7 @@ static int emit_setcc(A64Buf *b, const X86Insn *insn)
     }
     if (d->kind != OCERZ_OPK_REG || d->high8 || d->size != 1)
         return 0;
-    if (g_pin_class == 2 && d->reg == OCERZ_RSP)
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
     emit_cc_predicate_ex(b, insn->cc, 1);
     a64_cset(b, JT2, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
@@ -5263,7 +5289,7 @@ static int emit_bswap(A64Buf *b, const X86Insn *insn)
     const X86Operand *d = &insn->ops[0];
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
         return 0;
-    if (g_pin_class == 2 && d->reg == OCERZ_RSP)
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
     int sf = d->size == 8;
     int ds = pin_slot(d->reg);
@@ -6635,13 +6661,13 @@ static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
     if (s->size != d->size) return 0;
     int ds = pin_slot(d->reg);
-    if (ds < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+    if (ds < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
     int sf = d->size == 8;
     int rs;
     if (s->kind == OCERZ_OPK_REG) {
         if (s->high8) return 0;
         int ss = pin_slot(s->reg);
-        if (ss < 0 || (g_pin_class == 2 && s->reg == OCERZ_RSP)) return 0;
+        if (ss < 0 || (rsp_is_ptr() && s->reg == OCERZ_RSP)) return 0;
         rs = pin_hreg(ss);
     } else if (s->kind == OCERZ_OPK_MEM) {
         if (!emit_mem_load_plain(b, insn, s, d->size, JT1)) return 0;
@@ -6685,8 +6711,8 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
     if (size != 2 && size != 4 && size != 8) return 0;
     if (insn->op != OCERZ_OP_BT) {
         /* bts/btr/btc on a register: CF <- old bit, then set/clear/flip it */
-        if (d->kind != OCERZ_OPK_REG || d->high8 || pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
-        if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (g_pin_class == 2 && o->reg == OCERZ_RSP)) return 0; }
+        if (d->kind != OCERZ_OPK_REG || d->high8 || pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
+        if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (rsp_is_ptr() && o->reg == OCERZ_RSP)) return 0; }
         else if (o->kind != OCERZ_OPK_IMM) return 0;
         if (need != 0) emit_materialize(b);
         int rd = pin_hreg(pin_slot(d->reg));
@@ -6723,14 +6749,14 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
         if (g_nzcv_want) { a64_subs_imm(b, 1, A64_ZR, JT0, 0); g_nzcv_kind = NZCV_KIND_BT; g_nzcv_from = g_cur_insn_idx; }
         return 1;
     }
-    if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (g_pin_class == 2 && o->reg == OCERZ_RSP)) return 0; }
+    if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (rsp_is_ptr() && o->reg == OCERZ_RSP)) return 0; }
     else if (o->kind != OCERZ_OPK_IMM) return 0;
     int mat = need != 0 && !g_nzcv_want;         /* CF live beyond a forwarded consumer: patch RFLAGS */
     if (need != 0 && g_nzcv_want) mat = 1;       /* both: RFLAGS must be right too */
     if (mat) emit_materialize(b);               /* first: it may call C */
     unsigned bits = (unsigned)size * 8;
     if (d->kind == OCERZ_OPK_REG) {
-        if (d->high8 || pin_slot(d->reg) < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+        if (d->high8 || pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
         int rd = pin_hreg(pin_slot(d->reg));
         if (o->kind == OCERZ_OPK_IMM) {
             unsigned n = (unsigned)o->imm & (bits - 1);
@@ -6797,7 +6823,8 @@ static int emit_push_pop_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
     }
     if (m->base == OCERZ_RSP || m->index == OCERZ_RSP) return 0;
     /* store first, then bump rsp: a faulting store must leave rsp untouched */
-    a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
+    if (rsp_is_ptr()) a64_ldr(b, 8, JT1, hs, 0);
+    else a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
     if (!emit_plain_mem_fast(b, insn, m, 8, JT1, 1, 0)) {
         if (!emit_mem_ea(b, insn, m, JTA)) return 0;
         (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
@@ -6818,6 +6845,13 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
         !stack_plain_access_ok() || !jgb_usable() || stack_guard_needed())
         return 0;
     int hs = pin_hreg(pin_slot(OCERZ_RSP)), hb = pin_hreg(pin_slot(OCERZ_RBP));
+    if (rsp_is_ptr()) {
+        /* rsp = rbp: rbp holds a guest value, hs holds guest_base + rsp */
+        a64_mov_imm64(b, JTA, ocerz_guest_base);
+        a64_add_reg(b, 1, hs, hb, JTA, 0);
+        a64_ldr_post64(b, hb, hs, 8);
+        return 1;
+    }
     a64_mov_reg(b, 1, hs, hb);
     if (stack_identity()) {
         a64_ldr_post64(b, hb, hs, 8);
@@ -6836,7 +6870,7 @@ static int emit_shiftd(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
     if (s->kind != OCERZ_OPK_REG || s->high8 || s->size != d->size || c->kind != OCERZ_OPK_IMM) return 0;
     if (pin_slot(d->reg) < 0 || pin_slot(s->reg) < 0) return 0;
-    if (g_pin_class == 2 && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP)) return 0;
+    if (rsp_is_ptr() && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP)) return 0;
     int sf = d->size == 8;
     unsigned bits = (unsigned)d->size * 8;
     unsigned cnt = (unsigned)c->imm & (sf ? 63u : 31u);
@@ -6975,7 +7009,7 @@ static int emit_pmovmskb(A64Buf *b, const X86Insn *insn)
     if (s->kind != OCERZ_OPK_XMM || !xmm_is_pinned(s->reg)) return 0;
     if (g_n_raslit >= RASLIT_MAX) return 0;
     int ds = pin_slot(d->reg);
-    if (ds < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+    if (ds < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
     a64_v_sshr_16b(b, VX0, xmm_vreg(s->reg), 7);          /* 0x00 / 0xff per byte */
     g_raslit[g_n_raslit].site = a64_label(b);
     g_raslit[g_n_raslit].retaddr = 0x8040201008040201ull;
@@ -7002,7 +7036,7 @@ static int rmw_src_to(A64Buf *b, const X86Operand *s, int size, int into, int *o
     }
     if (s->kind != OCERZ_OPK_REG || s->high8) return 0;
     int ss = pin_slot(s->reg);
-    if (ss < 0 || (g_pin_class == 2 && s->reg == OCERZ_RSP)) return 0;
+    if (ss < 0 || (rsp_is_ptr() && s->reg == OCERZ_RSP)) return 0;
     int r = pin_hreg(ss);
     if (size == 1) { a64_uxtb(b, into, r); *out = into; }
     else if (size == 2) { a64_uxth(b, into, r); *out = into; }
@@ -7042,7 +7076,7 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     }
     int size = m->size;
     if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
-    if (g_pin_class == 2 && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
+    if (rsp_is_ptr() && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
     if (op == OCERZ_OP_CMPXCHG && (pin_slot(OCERZ_RAX) < 0 || !s || s->kind != OCERZ_OPK_REG || s->high8 || pin_slot(s->reg) < 0)) return 0;
     if (!mem_native_store_ok()) return 0;
     int atomic = op == OCERZ_OP_XCHG || op == OCERZ_OP_XADD || op == OCERZ_OP_CMPXCHG || insn->lock;
@@ -7245,11 +7279,11 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                 int sz4 = d->size == 4;
                 int ds = pin_slot(d->reg);
                 int ss = pin_slot(s->reg);
-                int host_rsp = g_pin_class == 2 &&
+                int host_rsp = rsp_is_ptr() &&
                     (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP);
                 if (host_rsp && !sz4 && d->reg == s->reg)
                     return 1;
-                if (g_pin_class == 2 && !sz4 && s->reg == OCERZ_RSP &&
+                if (rsp_is_ptr() && !sz4 && s->reg == OCERZ_RSP &&
                     d->reg != OCERZ_RSP && ds >= 0 && ss >= 0) {
                     a64_mov_imm64(b, pin_hreg(ds), ocerz_guest_base);
                     a64_sub_reg(b, 1, pin_hreg(ds), pin_hreg(ss), pin_hreg(ds), 0);
@@ -7270,7 +7304,7 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                 if (d->size == 4)
                     v &= 0xffffffffull;
                 int ds = pin_slot(d->reg);
-                if (ds >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP))
+                if (ds >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP))
                     a64_mov_imm64(b, pin_hreg(ds), v);
                 else {
                     a64_mov_imm64(b, JT0, v);
@@ -7280,11 +7314,11 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
             }
         }
         if (d->kind == OCERZ_OPK_REG && (d->size == 1 || d->size == 2) &&
-            pin_slot(d->reg) >= 0 && !(g_pin_class == 2 && d->reg == OCERZ_RSP)) {
+            pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
             /* partial-register moves: insert the low byte/word */
             int rd = pin_hreg(pin_slot(d->reg));
             if (s->kind == OCERZ_OPK_REG && !s->high8 && s->size == d->size && pin_slot(s->reg) >= 0 &&
-                !(g_pin_class == 2 && s->reg == OCERZ_RSP)) {
+                !(rsp_is_ptr() && s->reg == OCERZ_RSP)) {
                 if (s->reg != d->reg) a64_bfi(b, 1, rd, pin_hreg(pin_slot(s->reg)), 0, d->size * 8);
                 return 1;
             }
@@ -7565,13 +7599,13 @@ static int emit_flag_neutral(A64Buf *b, const X86Insn *in)
         if (s->kind == OCERZ_OPK_REG) {
             if (s->high8 || s->size != d->size) return 0;
             int ds = pin_slot(d->reg), ss = pin_slot(s->reg);
-            if (ds < 0 || ss < 0 || (g_pin_class == 2 && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP))) return 0;
+            if (ds < 0 || ss < 0 || (rsp_is_ptr() && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP))) return 0;
             if (ds != ss || d->size == 4) a64_mov_reg(b, d->size == 8, pin_hreg(ds), pin_hreg(ss));
             return 1;
         }
         if (s->kind == OCERZ_OPK_IMM) {
             int ds = pin_slot(d->reg);
-            if (ds < 0 || (g_pin_class == 2 && d->reg == OCERZ_RSP)) return 0;
+            if (ds < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
             uint64_t v = s->imm; if (d->size == 4) v &= 0xffffffffull;
             a64_mov_imm64(b, pin_hreg(ds), v);        /* movz/movk: no flags */
             return 1;
@@ -9206,7 +9240,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                     jgb_usable() && !stack_guard_needed();
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
-            if (stack_identity()) {
+            if (stack_identity() || rsp_is_ptr()) {
                 a64_ldr_post64(b, JT1, hs, 8);
             } else {
                 a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
@@ -9572,7 +9606,7 @@ static int emit_branch_target(A64Buf *b, const X86Insn *insn, const X86Operand *
     if (o->kind == OCERZ_OPK_REG) {
         if (o->high8 || o->size != 8)
             return 0;
-        if (g_pin_class == 2 && o->reg == OCERZ_RSP)
+        if (rsp_is_ptr() && o->reg == OCERZ_RSP)
             return 0;
         /* a pinned target register is used directly by the site-cache lookup
          * (no copy); rsp is not (a CALL's push moves it first) */
@@ -10198,7 +10232,7 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
             count[bb]++;
             /* a scale-1 index is a base too ([b + i] == [i + b]) */
             if (mem->index != OCERZ_REG_NONE && (mem->scale & 3) == 0 && pin_slot(mem->index) >= 0 &&
-                !(g_pin_class == 2 && mem->index == OCERZ_RSP))
+                !(rsp_is_ptr() && mem->index == OCERZ_RSP))
                 count[mem->index & 15]++;
             if (g_pin_class != 2 && mem->index != OCERZ_REG_NONE &&
                 mem->disp != 0 && mem->disp >= -4095 && mem->disp <= 4095 && aux[bb] == 0)
@@ -10208,7 +10242,7 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
     int best = -1, bestn = 0, second = -1, secondn = 0, third = -1, thirdn = 0;
     for (int r = 0; r < 16; r++) {
         if (count[r] <= 0 || count[r] <= thirdn) continue;
-        if (g_pin_class == 2 && r == OCERZ_RSP) continue;
+        if (rsp_is_ptr() && r == OCERZ_RSP) continue;
         int written = 0;
         for (int i = 0; i < n && !written; i++)
             written = insn_may_write_gpr(&insns[i], (unsigned)r);
@@ -10243,7 +10277,7 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
                 if (mem->kind != OCERZ_OPK_MEM || mem->riprel || mem->base != (unsigned)best) continue;
                 total++;
                 if (mem->index == OCERZ_REG_NONE || pin_slot(mem->index) < 0) continue;
-                if (g_pin_class == 2 && mem->index == OCERZ_RSP) continue;
+                if (rsp_is_ptr() && mem->index == OCERZ_RSP) continue;
                 icnt[mem->index & 15][mem->scale & 3]++;
                 ilast[mem->index & 15][mem->scale & 3] = i;
             }
@@ -10967,7 +11001,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 
     emit_pin_prologue(&b);
 
-    if (g_pin_class == 2) {
+    if (rsp_is_ptr()) {
         int rs = pin_slot(OCERZ_RSP);
         assert(rs >= 0);
         a64_mov_imm64(&b, JT0, ocerz_guest_base);
@@ -11526,8 +11560,12 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             } else if (g_ic_kind[i] == 3) {
                 a64_add_imm(&b, 1, hs, hs, 8);   /* slot proven intact: just pop */
             } else {
-                a64_ldr_regoff(&b, 8, JT0, JGB, hs, 0);
-                a64_add_imm(&b, 1, hs, hs, 8);
+                if (stack_identity() || rsp_is_ptr()) {
+                    a64_ldr_post64(&b, JT0, hs, 8);
+                } else {
+                    a64_ldr_regoff(&b, 8, JT0, JGB, hs, 0);
+                    a64_add_imm(&b, 1, hs, hs, 8);
+                }
                 a64_mov_imm64(&b, JT1, g_ic_expect[i]);
                 a64_subs_reg(&b, 1, 31, JT0, JT1, 0);
                 uint32_t *ok = a64_label(&b);
@@ -12071,7 +12109,9 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
         return;
     for (int i = 0; i < b->n_pinned; i++) {
         uint64_t value = host_x[pin_hreg(i)];
-        if (b->pin_class == 2 && b->host_holds[i] == OCERZ_RSP)
+        if ((b->pin_class == 2 ||
+             (b->pin_class == 3 && b->n_insns > 0 && !b->insns[0].mode32 && rsp_ptr3())) &&
+            b->host_holds[i] == OCERZ_RSP)
             value -= ocerz_guest_base;
         cpu->gpr[b->host_holds[i]] = value;
     }
