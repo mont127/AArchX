@@ -775,10 +775,20 @@ static void *ocerz_worker_entry(void *p)
                 (int)getpid(), w->cpu.cpu_number,
                 (unsigned long long)w->cpu.rip,
                 (unsigned long long)w->cpu.gpr[OCERZ_RDI], kp);
-    ocerz_vm_run_cpu(w->vm, &w->cpu);
+    int wrc = ocerz_vm_run_cpu(w->vm, &w->cpu);
     if (getenv("OCERZ_THREADLOG"))
-        fprintf(stderr, "ocerz: THREADDONE[%d] cpu#%u rip=%#llx\n",
-                (int)getpid(), w->cpu.cpu_number, (unsigned long long)w->cpu.rip);
+        fprintf(stderr, "ocerz: THREADDONE[%d] cpu#%u rip=%#llx rc=%d\n",
+                (int)getpid(), w->cpu.cpu_number, (unsigned long long)w->cpu.rip, wrc);
+    if (wrc == 125) {
+        /* Same reasoning as the mode32 arm in ocerz_vm_run_cpu: a guest thread
+         * that dies mid-flight leaves whatever joins or waits on it stuck
+         * forever, and under wine that parks the whole tree until something
+         * kills it. Die as a process so the failure is visible and the parent
+         * can move on. */
+        fprintf(stderr, "ocerz: fatal on guest thread cpu#%u; exiting process\n",
+                w->cpu.cpu_number);
+        exit(125);
+    }
     mach_port_deallocate(mach_task_self(), kp);
     if (w->counts_wq) {
         wl_release(w->cpu.wq_workloop_id);

@@ -6,6 +6,7 @@
 #include "ocerz/dyldapi.h"
 #include "ocerz/dyld.h"
 #include <stdlib.h>
+#include <signal.h>
 
 static int far_transfer(OcerzCPU *cpu, uint32_t sel, uint64_t off);
 
@@ -1633,6 +1634,13 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
             return OCERZ_STEP_OK;
         return trap_fatal(insnp, "guest breakpoint/interrupt");
     case OCERZ_OP_INT:
+        /* Any int vector other than 3 is a #GP for user code. Windows uses
+         * int $0x29 as __fastfail, and wine's SIGSEGV handler decodes the
+         * instruction bytes to turn it into STATUS_STACK_BUFFER_OVERRUN, so
+         * the guest must see the fault with rip still on the int. */
+        cpu->rip = insnp->rip;
+        if (ocerz_signal_deliver(cpu, SIGSEGV, insnp->rip, 0, 0))
+            return OCERZ_STEP_OK;
         return trap_fatal(insnp, "guest breakpoint/interrupt");
 
     case OCERZ_OP_UD2:
