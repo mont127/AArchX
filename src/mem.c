@@ -105,7 +105,7 @@ typedef struct {
     uint32_t *slots;
 } MemRegion;
 
-#define MEM_REGION_MAX 16
+#define MEM_REGION_MAX 128
 static MemRegion regions[MEM_REGION_MAX];
 static int region_n;
 
@@ -1016,8 +1016,16 @@ static uint64_t reserve_host_fixed(uint64_t base, uint64_t size)
 {
     mach_vm_address_t addr = base;
     kern_return_t kr = mach_vm_allocate(mach_task_self(), &addr, size, VM_FLAGS_FIXED);
-    if (kr != KERN_SUCCESS)
+    if (kr != KERN_SUCCESS) {
+        static int rlog = -1;
+        static _Atomic unsigned long long rn;
+        if (rlog < 0) rlog = getenv("OCERZ_RESVLOG") ? 1 : 0;
+        unsigned long long c = ++rn;
+        if (rlog && ((c & 0x3ff) == 0 || c < 8))
+            fprintf(stderr, "ocerz: RESV-FAIL n=%llu base=%#llx size=%#llx kr=%d\n",
+                    c, (unsigned long long)base, (unsigned long long)size, (int)kr);
         return 0;
+    }
     if (mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_NONE) != 0) {
         mach_vm_deallocate(mach_task_self(), addr, size);
         return 0;
@@ -1090,6 +1098,9 @@ int ocerz_mem_register_range(uint64_t glo, uint64_t ghi)
         return OCERZ_ENOMEM;
     }
     int ok = region_add(lo, hi) != NULL;
+    if (!ok)   /* the reservation must not leak: the next overlapping attempt
+                * would fail KERN_NO_SPACE forever */
+        mach_vm_deallocate(mach_task_self(), lo, hi - lo);
     pthread_mutex_unlock(&map_lock);
     if (ok)
         OCERZ_LOG("registered identity guest range [%#llx, %#llx)\n",
