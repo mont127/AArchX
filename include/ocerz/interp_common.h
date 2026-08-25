@@ -26,8 +26,24 @@ static inline uint64_t ocerz_ea(const OcerzCPU *cpu, const X86Insn *insn, const 
     }
     if (insn->seg == OCERZ_SEG_FS)
         a += cpu->fs_base;
-    else if (insn->seg == OCERZ_SEG_GS)
+    else if (insn->seg == OCERZ_SEG_GS) {
         a += cpu->gs_base;
+        /* Wine on macOS runs 64-bit PE code with gs at the darwin TSD and
+         * mirrors the TEB fields PE code reads into the wine-reserved slots.
+         * ThreadLocalStoragePointer (0x58) is the one of them that changes
+         * after the mirror is taken, so a thread whose snapshot preceded its
+         * TLS setup reads 0 and MSVC __declspec(thread) code crashes.  Slot 6
+         * (0x30) holds the TEB self pointer on wine threads and is 0 on
+         * everything else, so indirecting the exact gs:[0x58] absolute form
+         * through it yields the live field and is self-selecting. */
+        if (op->disp == 0x58 && op->base == OCERZ_REG_NONE &&
+            op->index == OCERZ_REG_NONE && !op->riprel &&
+            insn->addrsize == 8 && (cpu->gs_base >> 32) != 0) {
+            uint64_t self = ocerz_ld(cpu->gs_base + 0x30, 8);
+            if (self != 0 && self != cpu->gs_base)
+                a = self + 0x58;
+        }
+    }
     return a;
 }
 

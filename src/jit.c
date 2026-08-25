@@ -2575,6 +2575,20 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     } else if (seg == OCERZ_SEG_GS) {
         a64_ldr(b, 8, JT0, 20, (uint32_t)offsetof(OcerzCPU, gs_base));
         a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
+        /* Same rule as ocerz_ea: the absolute gs:[0x58] form reads wine's
+         * ThreadLocalStoragePointer, whose TSD mirror can be stale; indirect
+         * it through the TEB self pointer in slot 6 when one is present.
+         * Identity mapping only (fold 0): the ldr below is a host access. */
+        if (op->disp == 0x58 && op->base == OCERZ_REG_NONE &&
+            op->index == OCERZ_REG_NONE && !op->riprel &&
+            insn->addrsize == 8 && fold == 0) {
+            a64_lsr_imm(b, 1, JTU, JT0, 32);
+            a64_cbz(b, 1, JTU, 5);
+            a64_sub_imm(b, 1, JTT, addr_reg, 0x28);
+            a64_ldr(b, 8, JTT, JTT, 0);
+            a64_cbz(b, 1, JTT, 2);
+            a64_add_imm(b, 1, addr_reg, JTT, 0x58);
+        }
     }
     return 1;
 }
