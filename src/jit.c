@@ -6036,8 +6036,29 @@ static void l0_inval(unsigned r)
     if (r < 16 && g_l0[r] >= 0) { g_l0_owners[g_l0[r] - 4] &= (uint16_t)~(1u << r); g_l0[r] = -1; }
     g_l0_dirty &= (uint16_t)~(1u << r);   /* full overwrite: the stale lane is dead */
 }
+/* Fixed-lane mode for self-looping blocks: four regs own the four scratches
+ * for the whole body, a preamble establishes them once per cold entry, and
+ * the back edge re-enters past it - so loop-carried scalar chains stay in
+ * the scratches instead of round-tripping through the architectural regs. */
+static int g_l0_fixed;
+static int8_t g_l0_fixed_lane[16];
+static uint8_t g_l0_fixed_dbl[16];
 static int l0_alloc2(A64Buf *b, unsigned r, int dbl)
 {
+    if (g_l0_fixed) {
+        if (g_l0_fixed_lane[r] < 0)
+            return -1;                 /* not one of the fixed regs: caller falls back */
+        int t = g_l0_fixed_lane[r];
+        uint16_t own = g_l0_owners[t - 4];
+        for (int i = 0; i < 16; i++) if ((own & (1u << i)) && i != (int)r) {
+            if (g_l0_dirty & (1u << i))
+                l0_flush_reg(b, (unsigned)i);
+            g_l0[i] = -1;
+        }
+        g_l0_owners[t - 4] = (uint16_t)(1u << r);
+        g_l0[r] = (int8_t)t; g_l0_dbl[r] = (uint8_t)dbl;
+        return t;
+    }
     l0_inval(r);                       /* drop r from its previous temp's owner set */
     int t = 4 + (int)(g_l0_next++ & 3u);
     uint16_t own = g_l0_owners[t - 4];
@@ -6067,6 +6088,73 @@ static void l0_share(unsigned dst, unsigned src)
             g_l0_dirty |= (uint16_t)(1u << dst);
     }
 }
+/* Pick up to four scalar-hot pinned xmm regs for fixed lanes and emit the
+ * cold-entry preamble (scratch := arch, both precisions valid). */
+static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, int *sqrt_like);
+static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
+{
+    int cnt[16] = {0}; int8_t firstdbl[16];
+    memset(firstdbl, -1, sizeof firstdbl);
+    for (int i = 0; i < n; i++) {
+        int packed, dbl, from_mem, sq;
+        int c = fpb_class(&insns[i], &packed, &dbl, &from_mem, &sq);
+        int use = (c == 1 || c == 3) && !packed;
+        if (!use && (insns[i].op == OCERZ_OP_CVTSI2SD || insns[i].op == OCERZ_OP_CVTSI2SS)) {
+            use = 1; dbl = insns[i].op == OCERZ_OP_CVTSI2SD;
+        }
+        if (!use) continue;
+        for (int q = 0; q < insns[i].nops && q < 2; q++) {
+            const X86Operand *o = &insns[i].ops[q];
+            if (o->kind == OCERZ_OPK_XMM && xmm_is_pinned(o->reg)) {
+                cnt[o->reg]++;
+                if (firstdbl[o->reg] < 0) firstdbl[o->reg] = (int8_t)dbl;
+            }
+        }
+    }
+    int lanes = 0;
+    for (int k = 0; k < 4; k++) {
+        int best = -1;
+        for (int r = 0; r < 16; r++)
+            if (g_l0_fixed_lane[r] < 0 && cnt[r] >= 2 && (best < 0 || cnt[r] > cnt[best])) best = r;
+        if (best < 0) break;
+        g_l0_fixed_lane[best] = (int8_t)(4 + lanes);
+        g_l0_fixed_dbl[best] = (uint8_t)(firstdbl[best] > 0);
+        lanes++;
+    }
+    if (!lanes) return 0;
+    for (int r = 0; r < 16; r++) if (g_l0_fixed_lane[r] >= 0) {
+        a64_v_mov(b, g_l0_fixed_lane[r], xmm_vreg(r));
+        g_l0[r] = g_l0_fixed_lane[r];
+        g_l0_dbl[r] = g_l0_fixed_dbl[r];
+        g_l0_owners[g_l0_fixed_lane[r] - 4] = (uint16_t)(1u << r);
+    }
+    g_l0_dirty = 0;
+    g_l0_fixed = 1;
+    return 1;
+}
+
+/* Re-establish the preamble contract before the back edge: flush, then
+ * re-copy any drifted lane and reset the maps.  Usually emits nothing. */
+static void l0_fixed_restore(A64Buf *b)
+{
+    l0_flush_all(b);
+    for (int r = 0; r < 16; r++) {
+        if (g_l0_fixed_lane[r] >= 0) {
+            int t = g_l0_fixed_lane[r];
+            if (g_l0[r] != t || g_l0_dbl[r] != g_l0_fixed_dbl[r] ||
+                g_l0_owners[t - 4] != (uint16_t)(1u << r)) {
+                a64_v_mov(b, t, xmm_vreg(r));
+                g_l0[r] = (int8_t)t;
+                g_l0_dbl[r] = g_l0_fixed_dbl[r];
+                g_l0_owners[t - 4] = (uint16_t)(1u << r);
+            }
+        } else if (g_l0[r] >= 0) {
+            g_l0_owners[g_l0[r] - 4] &= (uint16_t)~(1u << r);
+            g_l0[r] = -1;
+        }
+    }
+}
+
 /* instructions whose emitters keep the caches consistent themselves */
 static int l0_aware_op(unsigned op)
 {
@@ -6129,6 +6217,7 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
             if (packed) { int vd = xmm_dst_reg(d->reg, VX2); a64_v_fsqrt(b, dbl, vd, vb); if (vd == VX2) emit_xmm_st(b, VX2, d->reg); }
             else {
                 int t = dst_pinned && l0_enabled() ? l0_alloc(d->reg, dbl) : VX2;
+            if (t < 0) t = VX2;
                 a64_fsqrt_s(b, dbl, t, vb); emit_xmm_st_lo(b, esz, t, d->reg);
             }
             return 1;
@@ -6139,6 +6228,7 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
             emit_xmm_st(b, VX2, d->reg);
         } else {
             int t = dst_pinned && l0_enabled() ? l0_alloc(d->reg, dbl) : VX2;
+            if (t < 0) t = VX2;
             a64_fsqrt_s(b, dbl, t, vb);
             emit_nan_fix_scalar2(b, dbl, t, vb, vb);
             emit_xmm_st_lo(b, esz, t, d->reg);
@@ -6162,6 +6252,7 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
             }
         } else {
             int t = dst_pinned && l0_enabled() ? l0_alloc(d->reg, dbl) : VX2;
+            if (t < 0) t = VX2;
             a64_fcmp(b, dbl, va, vb);
             a64_fcsel(b, dbl, t, va, vb, kind == 4 ? A64_GT : A64_MI);
             emit_xmm_st_lo(b, esz, t, d->reg);
@@ -6188,6 +6279,7 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
         emit_xmm_st(b, VX2, d->reg);
     } else if (inexact_nan) {
         int t = dst_pinned && l0_enabled() ? l0_alloc(d->reg, dbl) : VX2;
+            if (t < 0) t = VX2;
         switch (kind) {
         case 0: a64_fadd_s(b, dbl, t, va, vb); break;
         case 1: a64_fsub_s(b, dbl, t, va, vb); break;
@@ -6197,6 +6289,7 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
         emit_xmm_st_lo(b, esz, t, d->reg);
     } else {
         int t = dst_pinned && l0_enabled() ? l0_alloc(d->reg, dbl) : VX2;
+            if (t < 0) t = VX2;
         switch (kind) {
         case 0: a64_fadd_s(b, dbl, t, va, vb); break;
         case 1: a64_fsub_s(b, dbl, t, va, vb); break;
@@ -6359,6 +6452,7 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         } else return 0;
         {
             int t = xmm_is_pinned(d->reg) && l0_enabled() ? l0_alloc(d->reg, dbl) : VX0;
+            if (t < 0) t = VX0;
             a64_scvtf(b, sf, dbl, t, JT0);
             emit_xmm_st_lo(b, dbl ? 8 : 4, t, d->reg);   /* upper lanes preserved */
         }
@@ -10895,6 +10989,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_self_rip = rip;
     g_body_entry = NULL;
     g_loop_entry = NULL;
+    g_l0_fixed = 0;
+    memset(g_l0_fixed_lane, -1, sizeof g_l0_fixed_lane);
     g_stop_patch = NULL;
     g_n_stop_extra = 0;
     g_n_push_fix = 0;
@@ -11193,6 +11289,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                   b.p += pad;
               }
           } }
+        { const X86Insn *t = &blk->insns[n - 1];
+          int selfl = (t->op == OCERZ_OP_JCC || t->op == OCERZ_OP_JMP) &&
+                      t->nops == 1 && t->ops[0].kind == OCERZ_OPK_IMM && t->ops[0].imm == rip;
+          static int nofix = -1;
+          if (nofix < 0) nofix = getenv("OCERZ_NO_L0FIXED") ? 1 : 0;
+          if (!nofix && selfl && !g_xlat_mode32 && l0_enabled() &&
+              sse_enabled() && xmm_global_enabled() && !g_no_regflags)
+              l0_fixed_setup(&b, blk->insns, n);
+        }
         g_loop_entry = a64_label(&b);
         /* Interrupt poll at the loop head. */
         if (g_mem_hoist_greg >= 0 && g_mem_hoist_aux_index >= 0)   /* index aux: refresh every iteration */
@@ -11649,6 +11754,12 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
         if (blk->insn_off)
             blk->insn_off[i] = (uint32_t)(b.p - entry);
+        if (g_l0_fixed &&
+            (i == n - 1 ||
+             (i == n - 2 && !(insn->nops > 0 && insn->ops[0].kind == OCERZ_OPK_XMM)))) {
+            l0_fixed_restore(&b);
+            g_l0_fixed = 0;    /* contract met: nothing below may rely on it */
+        }
         if (i == n - 2) {
             uint32_t *jmp_label = NULL;
             if (emit_logic_jmp_incdec_jcc(&b, insn, &blk->insns[i + 1],
