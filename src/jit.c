@@ -198,6 +198,7 @@ typedef struct {
     uint32_t *site;     /* the taken-on-NaN branch (bcond VS or cbz) to patch */
     uint32_t *back;
     uint8_t dbl, packed, vr, va, vb, t1;
+    uint8_t cvt;        /* 0 none, 1 cvtt->int64 indefinite, 2 cvtt->int32 exact recompute */
     int idx;
     int is_cbz;
 } NanOolPend;
@@ -1166,9 +1167,12 @@ static void emit_gpr_rd(A64Buf *b, int sf, int dst, unsigned greg)
 {
     int s = pin_slot(greg);
     if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
-
-        a64_mov_imm64(b, dst, ocerz_guest_base);
-        a64_sub_reg(b, 1, dst, pin_hreg(s), dst, 0);
+        if (jgb_usable())
+            a64_sub_reg(b, 1, dst, pin_hreg(s), JGB, 0);
+        else {
+            a64_mov_imm64(b, dst, ocerz_guest_base);
+            a64_sub_reg(b, 1, dst, pin_hreg(s), dst, 0);
+        }
         if (!sf)
             a64_mov_reg(b, 0, dst, dst);
     } else if (s >= 0)
@@ -1190,9 +1194,13 @@ static void emit_gpr_wr(A64Buf *b, int src, unsigned greg)
 {
     int s = pin_slot(greg);
     if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
-        int tmp = src == JTU ? JTA : JTU;
-        a64_mov_imm64(b, tmp, ocerz_guest_base);
-        a64_add_reg(b, 1, pin_hreg(s), src, tmp, 0);
+        if (jgb_usable())
+            a64_add_reg(b, 1, pin_hreg(s), src, JGB, 0);
+        else {
+            int tmp = src == JTU ? JTA : JTU;
+            a64_mov_imm64(b, tmp, ocerz_guest_base);
+            a64_add_reg(b, 1, pin_hreg(s), src, tmp, 0);
+        }
     } else if (s >= 0)
         a64_mov_reg(b, 1, pin_hreg(s), src);
     else
@@ -1539,12 +1547,17 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
     }
 
     if (writes && need == 0) {
+        int rsp_d = rsp_is_ptr() && d->reg == OCERZ_RSP;
+        int rsp_s = rsp_is_ptr() && s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP;
+        /* pointer-held rsp dest: only 64-bit add/sub commute with the base */
+        if (rsp_d && (!sf || (op != OCERZ_OP_ADD && op != OCERZ_OP_SUB) || rsp_s))
+            return 0;
         int ds = pin_slot(d->reg);
         int rd = ds >= 0 ? pin_hreg(ds) : JT2;
         int rn = ds >= 0 ? rd : JT0;
         int rm;
 
-        if (ds >= 0 && (s->kind == OCERZ_OPK_IMM || (s->kind == OCERZ_OPK_REG && !s->high8))) {
+        if (ds >= 0 && !rsp_d && (s->kind == OCERZ_OPK_IMM || (s->kind == OCERZ_OPK_REG && !s->high8))) {
             int hs; if (fuse_prev_mov(b, d->reg, d->size, &hs, insn) >= 0) rn = hs;
         }
         if (ds < 0)
@@ -1553,7 +1566,7 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
             if (s->high8)
                 return 0;
             int ss = pin_slot(s->reg);
-            if (ss >= 0)
+            if (ss >= 0 && !rsp_s)
                 rm = pin_hreg(ss);
             else {
                 emit_gpr_rd(b, sf, JT1, s->reg);
@@ -2355,6 +2368,10 @@ static int emit_imul(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (s1->kind != OCERZ_OPK_IMM && s1->size != d->size)
         return 0;
     if (s2->kind != OCERZ_OPK_IMM && s2->size != d->size)
+        return 0;
+    if (rsp_is_ptr() && (d->reg == OCERZ_RSP ||
+        (s1->kind == OCERZ_OPK_REG && s1->reg == OCERZ_RSP) ||
+        (s2->kind == OCERZ_OPK_REG && s2->reg == OCERZ_RSP)))
         return 0;
 
     if (need == 0) {
@@ -5606,7 +5623,7 @@ static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
         o->site = a64_label(b); a64_bcond(b, A64_VS, 0);      /* NaN -> out of line */
         o->back = a64_label(b);
         o->dbl = (uint8_t)dbl; o->packed = 0; o->vr = (uint8_t)vr; o->va = (uint8_t)va; o->vb = (uint8_t)vb; o->t1 = 0;
-        o->idx = g_cur_insn_idx; o->is_cbz = 0;
+        o->cvt = 0; o->idx = g_cur_insn_idx; o->is_cbz = 0;
         return;
     }
     /* table full: inline cold path */
@@ -5681,7 +5698,7 @@ static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int
         o->site = a64_label(b); a64_bcond(b, A64_NE, 0);      /* NaN -> out of line */
         o->back = a64_label(b);
         o->dbl = (uint8_t)dbl; o->packed = 1; o->vr = (uint8_t)vr; o->va = (uint8_t)va; o->vb = (uint8_t)vb; o->t1 = (uint8_t)t1;
-        o->idx = g_cur_insn_idx; o->is_cbz = 0;
+        o->cvt = 0; o->idx = g_cur_insn_idx; o->is_cbz = 0;
         return;
     }
     uint32_t *ok = a64_label(b); a64_bcond(b, A64_EQ, 0);
@@ -5697,8 +5714,19 @@ static void emit_nan_ool_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
         const NanOolPend *o = &g_nanool[i];
         uint32_t *lo = a64_label(b);
         if (o->is_cbz) a64_patch_cbz(o->site, lo); else a64_patch_bcond(o->site, lo);
-        if (o->packed) emit_nan_cold_packed(b, o->dbl, o->vr, o->va, o->vb, o->t1);
-        else           emit_nan_cold_scalar(b, o->dbl, o->vr, o->va, o->vb);
+        if (o->cvt == 1) {
+            a64_movz(b, o->vr, 0x8000, 3);                    /* INT64_MIN */
+        } else if (o->cvt == 2) {
+            /* exact recompute: the hot-path branch can be a false positive
+             * (a genuine INT32_MAX result) */
+            a64_fcvtzs(b, 1, o->dbl, JT0, o->va);
+            a64_cmp_ext_sxtw(b, JT0, JT0);
+            a64_movz(b, JTU, 0x8000, 1);
+            a64_csel(b, 0, o->vr, JTU, JT0, A64_NE);
+            a64_fcmp(b, o->dbl, o->va, o->va);
+            a64_csel(b, 0, o->vr, JTU, o->vr, A64_VS);
+        } else if (o->packed) emit_nan_cold_packed(b, o->dbl, o->vr, o->va, o->vb, o->t1);
+        else                  emit_nan_cold_scalar(b, o->dbl, o->vr, o->va, o->vb);
         uint32_t *here = a64_label(b);
         a64_b(b, (int32_t)(o->back - here));
     }
@@ -6256,6 +6284,7 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
     switch (insn->op) {
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: {
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+        if (rsp_is_ptr() && d->reg == OCERZ_RSP) return 0;
         int dbl = insn->op == OCERZ_OP_CVTTSD2SI;
         int vs = (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) ? l0_src(s->reg, dbl)
                : emit_sse_src_reg(b, insn, s, dbl ? 8 : 4, VX0, exit_sites, n_exits);
@@ -6263,7 +6292,24 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         /* x86: NaN or out-of-range -> "integer indefinite" (INT_MIN); arm64 fcvtzs saturates (NaN -> 0). */
         int ds = pin_slot(d->reg);
         int rd = ds >= 0 ? pin_hreg(ds) : JT0;
-        if (d->size == 8) {
+        if (g_n_nanool + 2 <= NANOOL_MAX) {
+            /* rare cases out of line: keeps the csel chain off the result */
+            a64_fcvtzs(b, d->size == 8, dbl, rd, vs);
+            a64_cmn_imm(b, d->size == 8, rd, 1);   /* V <=> rd == INT_MAX (32: maybe false positive) */
+            for (int p = 0; p < 2; p++) {
+                NanOolPend *o = &g_nanool[g_n_nanool++];
+                o->site = a64_label(b); a64_bcond(b, A64_VS, 0);
+                o->back = NULL;
+                o->dbl = (uint8_t)dbl; o->packed = 0; o->vr = (uint8_t)rd;
+                o->va = (uint8_t)vs; o->vb = 0; o->t1 = 0;
+                o->cvt = d->size == 8 ? 1 : 2;
+                o->idx = g_cur_insn_idx; o->is_cbz = 0;
+                if (p == 0) a64_fcmp(b, dbl, vs, vs);          /* VS <=> NaN */
+            }
+            uint32_t *back = a64_label(b);
+            g_nanool[g_n_nanool - 2].back = back;
+            g_nanool[g_n_nanool - 1].back = back;
+        } else if (d->size == 8) {
             a64_fcvtzs(b, 1, dbl, rd, vs);
             a64_cmn_imm(b, 1, rd, 1);                          /* V <=> rd == INT64_MAX */
             a64_movz(b, JTU, 0x8000, 3);                       /* INT64_MIN */
@@ -6847,8 +6893,7 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
     int hs = pin_hreg(pin_slot(OCERZ_RSP)), hb = pin_hreg(pin_slot(OCERZ_RBP));
     if (rsp_is_ptr()) {
         /* rsp = rbp: rbp holds a guest value, hs holds guest_base + rsp */
-        a64_mov_imm64(b, JTA, ocerz_guest_base);
-        a64_add_reg(b, 1, hs, hb, JTA, 0);
+        a64_add_reg(b, 1, hs, hb, JGB, 0);
         a64_ldr_post64(b, hb, hs, 8);
         return 1;
     }
@@ -7285,8 +7330,12 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                     return 1;
                 if (rsp_is_ptr() && !sz4 && s->reg == OCERZ_RSP &&
                     d->reg != OCERZ_RSP && ds >= 0 && ss >= 0) {
-                    a64_mov_imm64(b, pin_hreg(ds), ocerz_guest_base);
-                    a64_sub_reg(b, 1, pin_hreg(ds), pin_hreg(ss), pin_hreg(ds), 0);
+                    if (jgb_usable())
+                        a64_sub_reg(b, 1, pin_hreg(ds), pin_hreg(ss), JGB, 0);
+                    else {
+                        a64_mov_imm64(b, pin_hreg(ds), ocerz_guest_base);
+                        a64_sub_reg(b, 1, pin_hreg(ds), pin_hreg(ss), pin_hreg(ds), 0);
+                    }
                     return 1;
                 }
                 if (ds >= 0 && ss >= 0 && !host_rsp) {
@@ -9762,6 +9811,7 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
     emit_materialize(b);
 
+    l0_flush_all(b);                     /* deferred lane-0 results must reach the v regs */
     emit_xmm_pin_spill_all(b);           /* interpreter reads/writes cpu->xmm */
     emit_spill_pinned(b);
     a64_mov_reg(b, 1, 0, 19);
