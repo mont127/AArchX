@@ -761,15 +761,24 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
     }
     if (jit->n_live < jit->cap_live) jit->live[jit->n_live++] = b;
     if (b->n_insns > 0) {
+        /* an inlined call splices a far-away callee into the block, so
+         * register each contiguous rip run, not the naive min..max span */
         uint64_t lo = b->insns[0].rip;
-        uint64_t hi = b->insns[b->n_insns - 1].rip + b->insns[b->n_insns - 1].len;
-        if (!jit->code_hi) { jit->code_lo = lo; jit->code_hi = hi; }
-        else {
-            if (lo < jit->code_lo) jit->code_lo = lo;
-            if (hi > jit->code_hi) jit->code_hi = hi;
+        uint64_t hi = lo + b->insns[0].len;
+        for (int i = 1; i <= b->n_insns; i++) {
+            if (i < b->n_insns && b->insns[i].rip == hi) {
+                hi += b->insns[i].len;
+                continue;
+            }
+            if (!jit->code_hi) { jit->code_lo = lo; jit->code_hi = hi; }
+            else {
+                if (lo < jit->code_lo) jit->code_lo = lo;
+                if (hi > jit->code_hi) jit->code_hi = hi;
+            }
+            invmap_add(jit, lo, hi);
+            ocerz_cache_arm_exec(lo, hi);
+            if (i < b->n_insns) { lo = b->insns[i].rip; hi = lo + b->insns[i].len; }
         }
-        invmap_add(jit, lo, hi);
-        ocerz_cache_arm_exec(lo, hi);
     }
 }
 
@@ -5920,7 +5929,7 @@ static void l0_reset(void)
 static int l0_defer(void)
 {
     static int v = -1;
-    if (v < 0) v = getenv("OCERZ_L0_DEFER") != NULL;
+    if (v < 0) v = getenv("OCERZ_NO_L0_DEFER") == NULL;
     return v;
 }
 static void l0_flush_reg(A64Buf *b, unsigned r)
@@ -10514,6 +10523,37 @@ static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *ent
     g_n_oslow = 0;
 }
 
+/* Call inlining: a small straight-line callee ending in a plain ret is
+ * spliced into the caller's block.  The call becomes a return-address push,
+ * the ret a compare-against-the-known-return-address pop; a mismatch (the
+ * guest repointed its return slot) leaves at the ret's rip and re-enters
+ * through the normal dispatcher, which executes the real ret. */
+static uint8_t  g_ic_kind[JIT_MAX_BLOCK_INSNS];      /* 0 none, 1 pushed call, 2 checked ret */
+static uint64_t g_ic_expect[JIT_MAX_BLOCK_INSNS];    /* kind 2: the return rip */
+static int inline_call_ok(uint64_t target, uint64_t self_rip, X86Insn *out, int max)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_INLINE_CALL") != NULL;
+    if (off || target == self_rip)
+        return 0;
+    int n = 0;
+    uint64_t pc = target;
+    for (; n < max; n++) {
+        const uint8_t *code = (const uint8_t *)ocerz_g2h(pc);
+        if (ocerz_decode_mode(code, 15, pc, &out[n], 0) != OCERZ_OK)
+            return 0;
+        unsigned op = out[n].op;
+        if (op == OCERZ_OP_RET)
+            return out[n].nops == 0 ? n + 1 : 0;   /* plain ret only */
+        if (is_terminator(op) || op == OCERZ_OP_JCC || op == OCERZ_OP_SYSCALL)
+            return 0;
+        if (op == OCERZ_OP_FXSAVE || op == OCERZ_OP_FXRSTOR)
+            return 0;
+        pc += out[n].len;
+    }
+    return 0;
+}
+
 static int ret_flags_live(void)
 {
     static int v = -1;
@@ -10560,6 +10600,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         volatile uint64_t vpc = rip;
         sigjmp_buf db;
         sigjmp_buf *prev_dr = ocerz_jit_decode_recover;
+        memset(g_ic_kind, 0, sizeof g_ic_kind);
         if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
             ocerz_jit_decode_recover = &db;
             for (; vn < JIT_MAX_BLOCK_INSNS; ) {
@@ -10569,6 +10610,26 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                     break;
                 unsigned op = scratch[vn].op;
                 uint8_t len = scratch[vn].len;
+                if (op == OCERZ_OP_CALL && !mode32 &&
+                    scratch[vn].ops[0].kind == OCERZ_OPK_IMM &&
+                    vn + 16 < JIT_MAX_BLOCK_INSNS) {
+                    X86Insn callee[14];
+                    int cn = inline_call_ok(scratch[vn].ops[0].imm, rip, callee, 14);
+                    if (cn > 0) {
+                        g_ic_kind[vn] = 1;
+                        vn++;
+                        for (int c = 0; c < cn; c++) {
+                            scratch[vn] = callee[c];
+                            if (c == cn - 1) {
+                                g_ic_kind[vn] = 2;
+                                g_ic_expect[vn] = vpc + len;
+                            }
+                            vn++;
+                        }
+                        vpc += len;        /* resume at the return address */
+                        continue;
+                    }
+                }
                 vn++;
                 if (is_terminator(op)) {
                     /* superblock: continue past a forward jcc (taken side exits
@@ -11367,6 +11428,42 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             }
         }
 
+        if (g_ic_kind[i] == 1 || g_ic_kind[i] == 2) {
+            int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
+                        stack_plain_access_ok() && jgb_usable() && !stack_guard_needed();
+            if (!fast3) {
+                /* conservative: run the real call/ret in the interpreter; it
+                 * transfers control out of the block, the spliced remainder
+                 * is dead code */
+                emit_slowcall(&b, insn, exit_sites, &n_exits);
+                blk->n_slow++;
+                continue;
+            }
+            int hs = pin_hreg(pin_slot(OCERZ_RSP));
+            if (g_ic_kind[i] == 1) {
+                a64_mov_imm64(&b, JT1, insn->rip + insn->len);
+                emit_push_pinned(&b, hs, JT1);
+            } else {
+                a64_ldr_regoff(&b, 8, JT0, JGB, hs, 0);
+                a64_add_imm(&b, 1, hs, hs, 8);
+                a64_mov_imm64(&b, JT1, g_ic_expect[i]);
+                a64_subs_reg(&b, 1, 31, JT0, JT1, 0);
+                uint32_t *ok = a64_label(&b);
+                a64_bcond(&b, A64_EQ, 0);
+                /* mismatch: leave at the ret itself with rsp restored; the
+                 * dispatcher runs the real ret */
+                a64_sub_imm(&b, 1, hs, hs, 8);
+                a64_mov_imm64(&b, JT0, insn->rip);
+                a64_str(&b, 8, JT0, 20, RIP_OFF);
+                a64_mov_imm64(&b, 0, OCERZ_STEP_OK);
+                epi_sites[n_epi] = a64_label(&b);
+                a64_b(&b, 0);
+                n_epi++;
+                a64_patch_bcond(ok, a64_label(&b));
+            }
+            blk->n_inlined++;
+            continue;
+        }
         if (i == n - 1 && (insn->op == OCERZ_OP_CALL || insn->op == OCERZ_OP_RET)) {
             if (emit_call_ret(&b, insn, exit_sites, &n_exits, epi_sites, &n_epi) ||
                 emit_indirect_call(&b, insn, exit_sites, &n_exits, epi_sites, &n_epi)) {
