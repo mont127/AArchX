@@ -4197,19 +4197,29 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (!(flags & 1)) {
             uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
             memtrace("vm_map", want, size, 0, (int)flags);
-            invalidate_guest_mapping(vm, want, size);
             if (want == 0 ||
                 (ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
                  ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
                  (ocerz_mem_register_range(want, want + size) != OCERZ_OK ||
                   ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK))) {
-                if (vm->strace)
-                    fprintf(stderr, "ocerz: mach_vm_map FIXED denied want=%#llx size=%#llx mask=%#llx flags=%#llx\n",
-                            (unsigned long long)want, (unsigned long long)size,
-                            (unsigned long long)mask, (unsigned long long)flags);
+                {
+                    static int dlog = -1;
+                    static _Atomic unsigned long long dn;
+                    if (dlog < 0) dlog = getenv("OCERZ_DENYLOG") ? 1 : 0;
+                    unsigned long long dcur = ++dn;
+                    if (vm->strace || (dlog && ((dcur & 0x3ff) == 0 || dcur < 8)))
+                        fprintf(stderr, "ocerz: mach_vm_map FIXED denied n=%llu want=%#llx size=%#llx mask=%#llx flags=%#llx rip=%#llx\n",
+                                dcur, (unsigned long long)want, (unsigned long long)size,
+                                (unsigned long long)mask, (unsigned long long)flags,
+                                (unsigned long long)cpu->rip);
+                }
                 mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
                 break;
             }
+            /* only a map that actually happened can make translations stale
+             * (a JS engine probing thousands of denied fixed reservations
+             * must not trigger an invalidation walk per attempt) */
+            invalidate_guest_mapping(vm, want, size);
             mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
             break;
         }
@@ -4527,6 +4537,19 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t r47 = ocerz_host_mach_trap(num, a);
         cpu->block_since_ns = 0;
+        {
+            /* OCERZ_MSGSPIN: every 65536th mach_msg, print who is calling
+             * and what it gets back - catches busy receive loops. */
+            static int msl = -1;
+            static _Atomic unsigned long long msn;
+            if (msl < 0) msl = getenv("OCERZ_MSGSPIN") ? 1 : 0;
+            if (msl && (++msn & 0xffff) == 0)
+                fprintf(stderr, "ocerz: MSGSPIN[%d] n=%llu cpu#%u rip=%#llx opt=%#llx sz=%#llx kr=%#llx rcvname=%#llx\n",
+                        (int)getpid(), (unsigned long long)msn, cpu->cpu_number,
+                        (unsigned long long)cpu->rip, (unsigned long long)a[1],
+                        (unsigned long long)a[2], (unsigned long long)r47,
+                        (unsigned long long)a[5]);
+        }
         {
             /* OCERZ_WAKELOG: trace CFRunLoopWakeUp-sized traffic (tiny
              * msgh_id==0 messages) to catch lost run-loop wakeups. */

@@ -1,4 +1,5 @@
 /* The core single-step interpreter: reference semantics for x86_64. */
+#include <unistd.h>
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/vm.h"
@@ -1630,6 +1631,16 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
 
     case OCERZ_OP_INT3:
 
+        {
+            static int tl = -1;
+            if (tl < 0) tl = getenv("OCERZ_TRAPLOG") ? 1 : 0;
+            if (tl) {
+                const unsigned char *ip = (const unsigned char *)(uintptr_t)(cpu->rip + ocerz_guest_base);
+                fprintf(stderr, "ocerz: INT3 pid=%d rip=%#llx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        (int)getpid(), (unsigned long long)cpu->rip,
+                        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]);
+            }
+        }
         if (ocerz_signal_deliver(cpu, OCERZ_SIGTRAP, cpu->rip, 0, 0))
             return OCERZ_STEP_OK;
         return trap_fatal(insnp, "guest breakpoint/interrupt");

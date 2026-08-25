@@ -115,6 +115,7 @@ typedef struct JitBlock {
     uint8_t n_pinned;
 
     uint8_t pin_class;
+    uint8_t inv_hit;            /* scratch: marked by range invalidation */
 
     struct {
         uint64_t target_rip;
@@ -142,6 +143,7 @@ static inline int blk_mode32(const JitBlock *b) { return jit_key_mode32(b->key);
 #define INVMAP_MAX_SPAN 64                     /* slots; wider ranges skip the probe */
 
 typedef struct { uint64_t tag, bits; } InvSlot;   /* tag 0: empty; else region+1 */
+#define INVMAP_TOMB ((uint64_t)-1)             /* deleted row: probes continue, inserts reuse */
 
 typedef struct JitCodeIndex {
     struct JitCodeIndex *older;
@@ -755,12 +757,48 @@ static void invmap_add(OcerzJit *jit, uint64_t lo, uint64_t hi)
     for (uint64_t r = lo >> INVMAP_RSHIFT; r <= (hi - 1) >> INVMAP_RSHIFT; r++) {
         uint64_t tag = r + 1, m = invmap_mask(r, lo, hi);
         unsigned i = invmap_slot(tag);
+        int tomb = -1;
         for (unsigned n = 0; n < INVMAP_PROBE; n++, i = (i + 1) & (INVMAP_SLOTS - 1)) {
-            if (jit->invmap[i].tag == 0) jit->invmap[i].tag = tag;
+            if (jit->invmap[i].tag == INVMAP_TOMB) { if (tomb < 0) tomb = (int)i; continue; }
+            if (jit->invmap[i].tag == 0) {
+                if (tomb >= 0) i = (unsigned)tomb;
+                jit->invmap[i].tag = tag;
+            }
             if (jit->invmap[i].tag == tag) { jit->invmap[i].bits |= m; goto next; }
+        }
+        if (tomb >= 0) {
+            jit->invmap[tomb].tag = tag;
+            jit->invmap[tomb].bits = m;
+            goto next;
         }
         jit->invmap_full = 1;
 next:;
+    }
+}
+
+/* After a scan proved no live block overlaps [lo, hi), the granule bits
+ * fully inside the range are stale: clear them so the next flip of the
+ * same region rejects in constant time instead of walking the live set. */
+static void invmap_clear_range(OcerzJit *jit, uint64_t lo, uint64_t hi)
+{
+    uint64_t g = 1ull << INVMAP_GSHIFT;
+    uint64_t clo = (lo + g - 1) & ~(g - 1), chi = hi & ~(g - 1);
+    if (clo >= chi || jit->invmap_full)
+        return;
+    if (((chi - 1) >> INVMAP_RSHIFT) - (clo >> INVMAP_RSHIFT) >= INVMAP_MAX_SPAN)
+        return;
+    for (uint64_t r = clo >> INVMAP_RSHIFT; r <= (chi - 1) >> INVMAP_RSHIFT; r++) {
+        uint64_t tag = r + 1, m = invmap_mask(r, clo, chi);
+        unsigned i = invmap_slot(tag);
+        for (unsigned n = 0; n < INVMAP_PROBE; n++, i = (i + 1) & (INVMAP_SLOTS - 1)) {
+            if (jit->invmap[i].tag == 0) break;
+            if (jit->invmap[i].tag == tag) {
+                jit->invmap[i].bits &= ~m;
+                if (jit->invmap[i].bits == 0)
+                    jit->invmap[i].tag = INVMAP_TOMB;
+                break;
+            }
+        }
     }
 }
 
@@ -784,6 +822,93 @@ static int invmap_may_hold(const OcerzJit *jit, uint64_t lo, uint64_t hi)
     return 0;
 }
 
+/* per-64KB-granule count of live blocks touching it: a flip over granules
+ * that hold nothing skips the live-set walk entirely.  Same run-walk as the
+ * invmap registration; counts drop when blocks retire. */
+#define GRAN_SLOTS 65536
+#define GRAN4_SLOTS 16384
+static struct { uint64_t page; int32_t count; } g_gran[GRAN_SLOTS];
+static struct { uint64_t row; int32_t count; } g_gran4[GRAN4_SLOTS];
+static int g_gran_degenerate;
+static void gran4_bump(uint64_t row, int d)
+{
+    unsigned i = (unsigned)(row * 0x9E3779B97F4A7C15ull >> 50) & (GRAN4_SLOTS - 1);
+    for (unsigned n = 0; n < 32; n++, i = (i + 1) & (GRAN4_SLOTS - 1)) {
+        if (g_gran4[i].row == row || (g_gran4[i].row == 0 && g_gran4[i].count == 0)) {
+            g_gran4[i].row = row;
+            g_gran4[i].count += d;
+            return;
+        }
+    }
+    g_gran_degenerate = 1;
+}
+static int gran4_count(uint64_t row)
+{
+    unsigned i = (unsigned)(row * 0x9E3779B97F4A7C15ull >> 50) & (GRAN4_SLOTS - 1);
+    for (unsigned n = 0; n < 32; n++, i = (i + 1) & (GRAN4_SLOTS - 1)) {
+        if (g_gran4[i].row == row) return g_gran4[i].count;
+        if (g_gran4[i].row == 0 && g_gran4[i].count == 0) return 0;
+    }
+    return 1;   /* unknown: conservative */
+}
+static void gran_bump(uint64_t rip, int d)
+{
+    uint64_t page = rip >> INVMAP_GSHIFT;
+    gran4_bump(page >> 6, d);
+    unsigned i = (unsigned)(page * 0x9E3779B97F4A7C15ull >> 48) & (GRAN_SLOTS - 1);
+    for (unsigned n = 0; n < 32; n++, i = (i + 1) & (GRAN_SLOTS - 1)) {
+        if (g_gran[i].page == page || (g_gran[i].page == 0 && g_gran[i].count == 0)) {
+            g_gran[i].page = page;
+            g_gran[i].count += d;
+            return;
+        }
+    }
+    g_gran_degenerate = 1;
+}
+static int gran_fine_any(uint64_t p0, uint64_t p1)
+{
+    for (uint64_t p = p0; p <= p1; p++) {
+        unsigned i = (unsigned)(p * 0x9E3779B97F4A7C15ull >> 48) & (GRAN_SLOTS - 1);
+        for (unsigned n = 0; n < 32; n++, i = (i + 1) & (GRAN_SLOTS - 1)) {
+            if (g_gran[i].page == p) { if (g_gran[i].count > 0) return 1; break; }
+            if (g_gran[i].page == 0 && g_gran[i].count == 0) break;
+        }
+    }
+    return 0;
+}
+static int gran_any(uint64_t lo, uint64_t hi)
+{
+    if (g_gran_degenerate) return 1;
+    uint64_t p0 = lo >> INVMAP_GSHIFT, p1 = (hi - 1) >> INVMAP_GSHIFT;
+    if (p1 - p0 < 64)
+        return gran_fine_any(p0, p1);
+    for (uint64_t r = p0 >> 6; r <= p1 >> 6; r++) {
+        if (gran4_count(r) <= 0) continue;
+        uint64_t f0 = r << 6, f1 = f0 + 63;
+        if (f0 < p0) f0 = p0;
+        if (f1 > p1) f1 = p1;
+        if (gran_fine_any(f0, f1)) return 1;
+    }
+    return 0;
+}
+static void gran_block(JitBlock *b, int d)
+{
+    if (b->n_insns <= 0) return;
+    uint64_t lo = b->insns[0].rip, hi = lo + b->insns[0].len;
+    for (int i = 1; i <= b->n_insns; i++) {
+        if (i < b->n_insns && b->insns[i].rip == hi) { hi += b->insns[i].len; continue; }
+        for (uint64_t p = lo >> INVMAP_GSHIFT; p <= (hi - 1) >> INVMAP_GSHIFT; p++)
+            gran_bump(p << INVMAP_GSHIFT, d);
+        if (i < b->n_insns) { lo = b->insns[i].rip; hi = lo + b->insns[i].len; }
+    }
+}
+static void gran_clear_all(void)
+{
+    memset(g_gran, 0, sizeof g_gran);
+    memset(g_gran4, 0, sizeof g_gran4);
+    g_gran_degenerate = 0;
+}
+
 static void cache_insert(OcerzJit *jit, JitBlock *b)
 {
     unsigned h = hash_key(b->key);
@@ -795,6 +920,7 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
         if (nl) { jit->live = nl; jit->cap_live = nc; }
     }
     if (jit->n_live < jit->cap_live) jit->live[jit->n_live++] = b;
+    gran_block(b, +1);
     if (b->n_insns > 0) {
         /* an inlined call splices a far-away callee into the block, so
          * register each contiguous rip run, not the naive min..max span */
@@ -9078,7 +9204,9 @@ static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
 static void patch_local_adr(uint32_t *at, uint32_t *target, int rd)
 {
     ptrdiff_t off = (char *)target - (char *)at;
-    assert(off >= -(1 << 20) && off < (1 << 20));
+    if (!(off >= -(1 << 20) && off < (1 << 20)))
+        return;   /* overflow mode: labels point at b->sink and the whole
+                   * translation is discarded - nothing to patch */
     uint32_t imm = (uint32_t)((uint64_t)off & 0x1fffffu);
     *at = 0x10000000u | ((imm & 3u) << 29) |
           (((imm >> 2) & 0x7ffffu) << 5) | (uint32_t)(rd & 31);
@@ -10881,12 +11009,17 @@ static int ret_flags_live(void)
     return v;
 }
 
+static int churn_blacklisted(uint64_t rip);
+
 static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 {
     g_xlat_mode32 = mode32;
 
     if (ocerz_exc_trap_rip && rip == ocerz_exc_trap_rip)
         return NULL;                 /* OCERZ_EXCLOG: keep the throw site interpreted */
+
+    if (churn_blacklisted(rip))
+        return NULL;                 /* invalidation-storm region: interpret */
 
     {   /* OCERZ_INTERP_RIP=a[,b,...]: never compile a block starting at these
          * guest addresses - they fall back to the interpreter, where
@@ -13094,6 +13227,7 @@ static void invalidate_all_locked(OcerzJit *jit)
     jit->code_hi = 0;
     memset(jit->invmap, 0, sizeof jit->invmap);
     jit->invmap_full = 0;
+    gran_clear_all();
 
     pending_clear();
     for (unsigned i = 0; i < g_ras_slot_n; i++)
@@ -13146,6 +13280,183 @@ static void invmap_check_reject(const OcerzJit *jit, uint64_t addr, uint64_t len
     }
 }
 
+/* 64KB regions whose translations keep getting invalidated (a browser JS
+ * engine W^X-flipping its code space): after a few hits the region runs
+ * interpreted - fresh decode every entry, nothing cached, nothing to
+ * invalidate - and the flip storm stops touching the JIT entirely. */
+#define CHURN_SLOTS 4096
+#define CHURN_LIMIT 3
+static struct { uint64_t page; uint32_t hits; } g_churn[CHURN_SLOTS];
+static void churn_bump(uint64_t rip)
+{
+    uint64_t page = rip >> 16;
+    unsigned i = (unsigned)(page * 0x9E3779B97F4A7C15ull >> 52) & (CHURN_SLOTS - 1);
+    for (unsigned n = 0; n < 8; n++, i = (i + 1) & (CHURN_SLOTS - 1)) {
+        if (g_churn[i].page == page) { g_churn[i].hits++; return; }
+        if (g_churn[i].page == 0) { g_churn[i].page = page; g_churn[i].hits = 1; return; }
+    }
+}
+static int churn_blacklisted(uint64_t rip)
+{
+    uint64_t page = rip >> 16;
+    unsigned i = (unsigned)(page * 0x9E3779B97F4A7C15ull >> 52) & (CHURN_SLOTS - 1);
+    for (unsigned n = 0; n < 8; n++, i = (i + 1) & (CHURN_SLOTS - 1)) {
+        if (g_churn[i].page == page) return g_churn[i].hits >= CHURN_LIMIT;
+        if (g_churn[i].page == 0) return 0;
+    }
+    return 0;
+}
+
+/* aarch64 direct-branch target of the word at `site`, or NULL */
+static uint32_t *branch_word_target(uint32_t *site, uint32_t w)
+{
+    int64_t off;
+    if ((w & 0xFC000000u) == 0x14000000u) {                 /* B */
+        off = ((int64_t)(int32_t)(w << 6) >> 6) * 4;
+        return (uint32_t *)((uint8_t *)site + off);
+    }
+    if ((w & 0xFF000010u) == 0x54000000u ||                 /* B.cond */
+        (w & 0x7E000000u) == 0x34000000u) {                 /* CBZ/CBNZ */
+        off = ((int64_t)(int32_t)(((w >> 5) & 0x7FFFFu) << 13) >> 13) * 4;
+        return (uint32_t *)((uint8_t *)site + off);
+    }
+    return 0;
+}
+
+static int ptr_in_block_code(const JitBlock *b, const uint32_t *p)
+{
+    const uint32_t *lo = (const uint32_t *)(uintptr_t)b->code;
+    return p >= lo && p < lo + b->code_words;
+}
+
+/* hits are sorted by code address: binary-search the covering block */
+static int ptr_in_hits(JitBlock *const *hits, size_t n_hits, const uint32_t *p)
+{
+    if (!p) return 0;
+    size_t lo = 0, hi = n_hits;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if ((const uint32_t *)(uintptr_t)hits[mid]->code <= p)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo > 0 && ptr_in_block_code(hits[lo - 1], p);
+}
+
+static int hit_code_cmp(const void *pa, const void *pb)
+{
+    const JitBlock *a = *(JitBlock *const *)pa, *b = *(JitBlock *const *)pb;
+    if ((uintptr_t)a->code < (uintptr_t)b->code) return -1;
+    return (uintptr_t)a->code > (uintptr_t)b->code;
+}
+
+/* Retire only the blocks marked inv_hit: force their stop sites (an
+ * in-flight loop exits at its next back edge), unpatch every surviving
+ * chained edge that branches into them, unlink them from the hash and the
+ * live set, and drop the code-pointer caches (RAS, indirect-branch ICs).
+ * Their code stays allocated on the retired list, so a thread still inside
+ * runs to its next exit exactly as under invalidate_all. */
+static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hits)
+{
+    int any_code = 0;
+    for (size_t m = 0; m < n_hits; m++)
+        if (hits[m]->code) {
+            any_code = 1;
+            churn_bump(hits[m]->insns[0].rip);
+        }
+    if (!any_code) {
+        /* interpreter-fallback blocks: nothing branches into them, no code
+         * pointers exist - unlink and retire, skip the patch/cache phases */
+        size_t w0 = 0;
+        for (size_t k = 0; k < jit->n_live; k++) {
+            JitBlock *b = jit->live[k];
+            if (!b->inv_hit) { jit->live[w0++] = b; continue; }
+            unsigned h = hash_key(b->key);
+            JitBlock **pp = &jit->buckets[h];
+            while (*pp && *pp != b) pp = &(*pp)->hnext;
+            if (*pp == b)
+                __atomic_store_n(pp, b->hnext, __ATOMIC_RELEASE);
+            gran_block(b, -1);
+            b->retired_next = jit->retired;
+            jit->retired = b;
+        }
+        jit->n_live = w0;
+        return;
+    }
+    qsort(hits, n_hits, sizeof *hits, hit_code_cmp);
+    pthread_jit_write_protect_np(0);
+    for (size_t i = 0; i < g_n_ras_cells; i++)
+        __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
+    for (size_t k = 0; k < jit->n_live; k++) {
+        JitBlock *b = jit->live[k];
+        if (!b->inv_hit) continue;
+        if (b->stop_patch && b->stop_insn && *b->stop_patch != b->stop_insn) {
+            __atomic_store_n(b->stop_patch, b->stop_insn, __ATOMIC_RELEASE);
+            sys_icache_invalidate(b->stop_patch, 4);
+        }
+        for (int i = 0; i < b->n_stop_extra; i++)
+            if (*b->stop_extra[i].site != b->stop_extra[i].insn) {
+                __atomic_store_n(b->stop_extra[i].site, b->stop_extra[i].insn, __ATOMIC_RELEASE);
+                sys_icache_invalidate(b->stop_extra[i].site, 4);
+            }
+        for (int i = 0; i < b->n_edges; i++) {
+            uint32_t *cs = b->edges[i].cond_site;
+            int is_stop = b->edges[i].patch_b == b->stop_patch;
+            for (int q = 0; q < b->n_stop_extra && !is_stop; q++)
+                is_stop = b->edges[i].patch_b == b->stop_extra[q].site;
+            if (cs && b->edges[i].cond_orig && *cs != b->edges[i].cond_orig && is_stop) {
+                __atomic_store_n(cs, b->edges[i].cond_orig, __ATOMIC_RELEASE);
+                sys_icache_invalidate(cs, 4);
+            }
+        }
+    }
+    /* surviving blocks: cut any chain that lands inside a retired one */
+    for (size_t k = 0; k < jit->n_live; k++) {
+        JitBlock *sblk = jit->live[k];
+        if (sblk->inv_hit) continue;
+        for (int i = 0; i < sblk->n_edges; i++) {
+            uint32_t *at = sblk->edges[i].patch_b;
+            uint32_t fallback = sblk->edges[i].fallback_insn;
+            if (at && fallback && *at != fallback &&
+                ptr_in_hits(hits, n_hits, branch_word_target(at, *at))) {
+                __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
+                sys_icache_invalidate(at, 4);
+            }
+            uint32_t *cs = sblk->edges[i].cond_site;
+            if (cs && sblk->edges[i].cond_orig && *cs != sblk->edges[i].cond_orig &&
+                ptr_in_hits(hits, n_hits, branch_word_target(cs, *cs))) {
+                __atomic_store_n(cs, sblk->edges[i].cond_orig, __ATOMIC_RELEASE);
+                sys_icache_invalidate(cs, 4);
+            }
+        }
+    }
+    pthread_jit_write_protect_np(1);
+    /* unlink + retire, compacting the live array */
+    size_t w = 0;
+    for (size_t k = 0; k < jit->n_live; k++) {
+        JitBlock *b = jit->live[k];
+        if (!b->inv_hit) { jit->live[w++] = b; continue; }
+        unsigned h = hash_key(b->key);
+        JitBlock **pp = &jit->buckets[h];
+        while (*pp && *pp != b) pp = &(*pp)->hnext;
+        if (*pp == b)
+            __atomic_store_n(pp, b->hnext, __ATOMIC_RELEASE);
+        gran_block(b, -1);
+        b->retired_next = jit->retired;
+        jit->retired = b;
+    }
+    jit->n_live = w;
+    /* code-pointer caches may hold entries into retired code */
+    for (unsigned i = 0; i < g_ras_slot_n; i++)
+        __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
+    psc_clear_all();
+    for (unsigned i = 0; i < g_ic_next && i < JIT_IC_SLOTS; i++) {
+        __atomic_store_n(&g_ic_slots[i].code, NULL, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_ic_slots[i].rip, 0, __ATOMIC_RELEASE);
+    }
+}
+
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
 {
     if (!vm || !len || !vm->jit)
@@ -13155,30 +13466,85 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     int invalidated = 0;
     pthread_mutex_lock(&jit_lock);
     /* Callers hand us whole VM regions (vm_deallocate, vm_protect); almost none
-     * of them hold translated code, and any overlap drops the whole cache
-     * anyway.  The region map answers that in constant time. */
+     * of them hold translated code.  The region map answers that in constant
+     * time.  When a region DOES hold code - a browser's JS engine W^X-flipping
+     * its own jitted pages, hundreds of times during startup - only the
+     * overlapping blocks are retired; dropping the whole cache per flip made
+     * CEF startup a full-cache retranslation storm. */
     if (!jit->code_hi || !ranges_overlap(addr, len, jit->code_lo,
-                                         jit->code_hi - jit->code_lo) ||
-        !invmap_may_hold(jit, addr, addr + len)) {
+                                         jit->code_hi - jit->code_lo)) {
         if (ENV_ON("OCERZ_INVMAP_CHECK"))
             invmap_check_reject(jit, addr, len);
         pthread_mutex_unlock(&jit_lock);
         return;
     }
-    for (size_t k = 0; k < jit->n_live && !invalidated; k++) {
-        JitBlock *b = jit->live[k];
-        /* cheap block-range test first (insns are contiguous) */
-        uint64_t blo = b->insns[0].rip;
-        uint64_t bhi = b->insns[b->n_insns - 1].rip + b->insns[b->n_insns - 1].len;
-        if (!ranges_overlap(addr, len, blo, bhi - blo)) continue;
-        for (int i = 0; i < b->n_insns; i++) {
-            if (ranges_overlap(addr, len, b->insns[i].rip,
-                               b->insns[i].len)) {
-                invalidate_all_locked(jit);
-                invalidated = 1;
-                break;
-            }
+    /* clip to the translated span: a browser's multi-GB reservation must not
+     * defeat the region map's span limit */
+    if (addr < jit->code_lo) { len -= jit->code_lo - addr; addr = jit->code_lo; }
+    if (addr + len > jit->code_hi) len = jit->code_hi - addr;
+    /* widen to region-map granules: invalidating more is always safe, and a
+     * sub-granule flip (a JS engine W^X-flipping one page) can then actually
+     * clear its granule bit instead of rescanning the live set forever */
+    {
+        uint64_t g = 1ull << INVMAP_GSHIFT;
+        uint64_t alo = addr & ~(g - 1);
+        uint64_t ahi = (addr + len + g - 1) & ~(g - 1);
+        addr = alo;
+        len = ahi - alo;
+    }
+    {
+        static int ivlog = -1;
+        static _Atomic unsigned long long ivn;
+        if (ivlog < 0) ivlog = getenv("OCERZ_INVLOG") ? 1 : 0;
+        if (ivlog && (++ivn & 0xfff) == 0)
+            fprintf(stderr, "ocerz: INVQ[%d] n=%llu addr=%#llx len=%#llx nlive=%zu\n",
+                    (int)getpid(), (unsigned long long)ivn,
+                    (unsigned long long)addr, (unsigned long long)len, jit->n_live);
+    }
+    if (!invmap_may_hold(jit, addr, addr + len) || !gran_any(addr, addr + len)) {
+        if (ENV_ON("OCERZ_INVMAP_CHECK"))
+            invmap_check_reject(jit, addr, len);
+        pthread_mutex_unlock(&jit_lock);
+        return;
+    }
+    {
+        static int noprec = -1;
+        if (noprec < 0) noprec = getenv("OCERZ_INV_ALL") ? 1 : 0;
+        size_t n_hit = 0, cap = 0;
+        JitBlock **hits = NULL;
+        for (size_t k = 0; k < jit->n_live; k++) {
+            JitBlock *b = jit->live[k];
+            uint64_t blo = b->insns[0].rip;
+            uint64_t bhi = b->insns[b->n_insns - 1].rip + b->insns[b->n_insns - 1].len;
+            b->inv_hit = 0;
+            if (!ranges_overlap(addr, len, blo, bhi - blo)) continue;
+            for (int i = 0; i < b->n_insns; i++)
+                if (ranges_overlap(addr, len, b->insns[i].rip, b->insns[i].len)) {
+                    b->inv_hit = 1;
+                    if (n_hit == cap) {
+                        cap = cap ? cap * 2 : 64;
+                        JitBlock **nh = (JitBlock **)realloc(hits, cap * sizeof *nh);
+                        if (!nh) { free(hits); hits = NULL; n_hit = (size_t)-1; break; }
+                        hits = nh;
+                    }
+                    hits[n_hit++] = b;
+                    break;
+                }
+            if (n_hit == (size_t)-1) break;
         }
+        if (n_hit == (size_t)-1) {          /* allocation failed: the big hammer */
+            invalidated = 1;
+            invalidate_all_locked(jit);
+        } else if (n_hit > 0) {
+            invalidated = 1;
+            if (noprec)
+                invalidate_all_locked(jit);
+            else
+                retire_hit_blocks_locked(jit, hits, n_hit);
+        }
+        free(hits);
+        if (n_hit != (size_t)-1)
+            invmap_clear_range(jit, addr, addr + len);   /* nothing lives there now */
     }
     pthread_mutex_unlock(&jit_lock);
 
