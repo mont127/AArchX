@@ -218,6 +218,7 @@ static int g_n_pe_real;
 static struct JitPromo g_promo_real[PE_MAX];         /* promoted pairs emitted so far */
 static int g_n_promo_real;
 static const X86Insn *g_pe_insns;                    /* main-loop insns (NULL outside it) */
+static uint32_t g_rsp_lag;                           /* rsp adds deferred across a mov-only run */
 static int g_n_oslow;
 static int g_cur_insn_idx;
 /* Static flag-producer hint for the instruction being emitted: the nearest
@@ -6356,8 +6357,11 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
             emit_sse_mem_ld_gpr(b, s->size, JT0);
             patch_guard_skip(skip, a64_label(b));
         } else return 0;
-        a64_scvtf(b, sf, dbl, VX0, JT0);
-        emit_xmm_st_lo(b, dbl ? 8 : 4, VX0, d->reg);   /* upper lanes preserved */
+        {
+            int t = xmm_is_pinned(d->reg) && l0_enabled() ? l0_alloc(d->reg, dbl) : VX0;
+            a64_scvtf(b, sf, dbl, t, JT0);
+            emit_xmm_st_lo(b, dbl ? 8 : 4, t, d->reg);   /* upper lanes preserved */
+        }
         return 1;
     }
     case OCERZ_OP_CVTSD2SS: {
@@ -10669,6 +10673,16 @@ static uint8_t  g_ic_pushelide[JIT_MAX_BLOCK_INSNS]; /* kind 1: retaddr push pro
 static int32_t  g_ic_pair_rj[JIT_MAX_BLOCK_INSNS];   /* kind 1 with pushelide: the matching ret */
 static uint8_t  g_promo_reg[JIT_MAX_BLOCK_INSNS];    /* push/pop: promo host reg (0 = memory) */
 static int32_t  g_promo_mate[JIT_MAX_BLOCK_INSNS];   /* push: its matching pop */
+/* next insn emits only a register mov plus an rsp += 8 (promoted pop or
+ * elided ret): safe to defer this insn's rsp add onto it - no fault, exit,
+ * or rsp read can occur in between */
+static int rsp_run_member(const X86Insn *insns, int j, int n, int fast3)
+{
+    if (j >= n) return 0;
+    if (g_promo_reg[j] && insns[j].op == OCERZ_OP_POP) return 1;
+    if (g_ic_kind[j] == 3 && fast3) return 1;
+    return 0;
+}
 static int inline_calls_off(void)
 {
     static int off = -1;
@@ -10870,6 +10884,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_nanool = 0;
     g_n_pe_real = 0;
     g_n_promo_real = 0;
+    g_rsp_lag = 0;
     g_pe_insns = blk->insns;
     g_n_call_edges = 0;
     /* Out-of-line slow-arm and stop-site state MUST start clean: a translation that returns without */
@@ -11769,8 +11784,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                         (int32_t)i, g_promo_mate[i], (uint8_t)pr };
                 goto promo_push_fallthrough;   /* the normal push emitter stores it */
             } else {
+                int f3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
+                         stack_plain_access_ok() && jgb_usable() && !stack_guard_needed();
                 a64_mov_reg(&b, 1, gr, pr);
-                a64_add_imm(&b, 1, hsp, hsp, 8);
+                if (rsp_run_member(blk->insns, i + 1, n, f3)) {
+                    g_rsp_lag += 8;
+                } else {
+                    a64_add_imm(&b, 1, hsp, hsp, 8 + g_rsp_lag);
+                    g_rsp_lag = 0;
+                }
             }
             blk->n_inlined++;
             continue;
@@ -11800,7 +11822,12 @@ promo_push_fallthrough:
                     emit_push_pinned(&b, hs, JT1);
                 }
             } else if (g_ic_kind[i] == 3) {
-                a64_add_imm(&b, 1, hs, hs, 8);   /* slot proven intact: just pop */
+                if (rsp_run_member(blk->insns, i + 1, n, fast3)) {
+                    g_rsp_lag += 8;              /* fold into the run's last add */
+                } else {
+                    a64_add_imm(&b, 1, hs, hs, 8 + g_rsp_lag);
+                    g_rsp_lag = 0;
+                }
             } else {
                 if (stack_identity() || rsp_is_ptr()) {
                     a64_ldr_post64(&b, JT0, hs, 8);
