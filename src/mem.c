@@ -518,7 +518,32 @@ static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
             bit_set(r, pg_index(r, p));
         return OCERZ_OK;
     }
+    /* Wine's PE loader re-commits over live pages constantly, and the loop
+     * below costs a memset plus two mprotects for every 16 KB page.  A run of
+     * whole pages that all have to end up zeroed is cheaper to replace with
+     * one fresh anonymous mapping.  Pages shared with another process are
+     * excluded: remapping them would break the sharing. */
+    uint64_t blo = round_up(zlo > lo ? zlo : lo);
+    uint64_t bhi = round_down(zhi < hi ? zhi : hi);
+    if (ocerz_no_batch_vm())
+        bhi = blo;
+    for (uint64_t p = blo; p < bhi; p += OCERZ_HOST_PAGE)
+        if (shared_load(r, pg_index(r, p)) & MEM_SHARED_PHYSICAL) {
+            bhi = blo;
+            break;
+        }
+    if (blo < bhi) {
+        void *bp = ocerz_g2h(blo);
+        if (mmap(bp, (size_t)(bhi - blo), hprot,
+                 MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != bp)
+            return OCERZ_ENOMEM;
+        for (uint64_t p = blo; p < bhi; p += OCERZ_HOST_PAGE)
+            bit_set(r, pg_index(r, p));
+    }
+
     for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
+        if (p >= blo && p < bhi)
+            continue;
         size_t i = pg_index(r, p);
         void *hp = ocerz_g2h(p);
         int committed = bit_test(r, i) ? 1 : 0;

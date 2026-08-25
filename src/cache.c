@@ -8,6 +8,7 @@
 #include <mach-o/loader.h>
 #include <string.h>
 #include <errno.h>
+#include <pthread.h>
 
 #include "ocerz/mem.h"
 
@@ -598,6 +599,36 @@ static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, in
     return resolve_in_dylib(c, tmh, want, depth + 1, found);
 }
 
+/* Every import that is not satisfied by its own declared dependency lands in
+ * the walk below, which visits all ~3000 cache images.  Wine's loaders resolve
+ * the same libsystem symbols for every module they map, so remember the
+ * answers -- the cache's export tries do not change at runtime. */
+#define RMEMO_SLOTS 4096
+typedef struct { char *name; uint64_t val; int found; } ResolveMemo;
+static ResolveMemo g_rmemo[RMEMO_SLOTS];
+static pthread_mutex_t g_rmemo_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned rmemo_hash(const char *s)
+{
+    unsigned h = 2166136261u;
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+    return h & (RMEMO_SLOTS - 1);
+}
+
+static ResolveMemo *rmemo_find(const char *symbol)
+{
+    unsigned i = rmemo_hash(symbol);
+    for (unsigned n = 0; n < 8; n++, i = (i + 1) & (RMEMO_SLOTS - 1)) {
+        if (!g_rmemo[i].name)
+            return &g_rmemo[i];              /* free slot for the caller to fill */
+        if (strcmp(g_rmemo[i].name, symbol) == 0)
+            return &g_rmemo[i];
+    }
+    return NULL;
+}
+
+static uint64_t cache_resolve_walk(OcerzCache *c, const char *symbol, int *found);
+
 uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found)
 {
     int dummy = 0;
@@ -606,6 +637,35 @@ uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found)
     *found = 0;
     if (!c->mapped)
         return 0;
+
+    pthread_mutex_lock(&g_rmemo_lock);
+    ResolveMemo *m = rmemo_find(symbol);
+    if (m && m->name) {
+        *found = m->found;
+        uint64_t v = m->val;
+        pthread_mutex_unlock(&g_rmemo_lock);
+        return v;
+    }
+    pthread_mutex_unlock(&g_rmemo_lock);
+
+    int f = 0;
+    uint64_t v = cache_resolve_walk(c, symbol, &f);
+
+    pthread_mutex_lock(&g_rmemo_lock);
+    m = rmemo_find(symbol);
+    if (m && !m->name) {
+        m->val = v;
+        m->found = f;
+        m->name = strdup(symbol);
+    }
+    pthread_mutex_unlock(&g_rmemo_lock);
+
+    *found = f;
+    return v;
+}
+
+static uint64_t cache_resolve_walk(OcerzCache *c, const char *symbol, int *found)
+{
     for (uint32_t i = 0; i < c->images_cnt; i++) {
         uint64_t mh = ocerz_cache_image_addr(c, i, NULL);
         if (mh == 0 || rd32((const uint8_t *)(uintptr_t)mh) != MH_MAGIC_64)

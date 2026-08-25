@@ -128,6 +128,14 @@ typedef struct JitBlock {
 static inline uint64_t blk_rip(const JitBlock *b) { return jit_key_rip(b->key); }
 static inline int blk_mode32(const JitBlock *b) { return jit_key_mode32(b->key); }
 
+#define INVMAP_RSHIFT 22                       /* 4 MB per slot */
+#define INVMAP_GSHIFT 16                       /* 64 KB per bit */
+#define INVMAP_SLOTS  8192
+#define INVMAP_PROBE  32
+#define INVMAP_MAX_SPAN 64                     /* slots; wider ranges skip the probe */
+
+typedef struct { uint64_t tag, bits; } InvSlot;   /* tag 0: empty; else region+1 */
+
 typedef struct JitCodeIndex {
     struct JitCodeIndex *older;
     size_t capacity;
@@ -158,6 +166,8 @@ struct OcerzJit {
     JitBlock **live;           /* every block currently in the buckets (invalidation walks this, not the 1M buckets) */
     size_t n_live, cap_live;
     uint64_t code_lo, code_hi; /* guest range spanned by live blocks; code_hi==0 means none */
+    InvSlot invmap[INVMAP_SLOTS];   /* see invmap_may_hold */
+    int invmap_full;
 };
 
 int ocerz_perfstat = -1;
@@ -646,6 +656,12 @@ static int term_may_switch_mode(unsigned op)
            op == OCERZ_OP_CALLF || op == OCERZ_OP_RETF;
 }
 
+/* getenv() is a locked linear scan of environ, and these debug gates sit in
+ * per-block and per-instruction paths; latch each site's answer on first use. */
+#define ENV_ON(name) ({ static int on_ = -1;                     \
+                        if (on_ < 0) on_ = getenv(name) != NULL; \
+                        on_; })
+
 static unsigned hash_key(uint64_t key)
 {
     key ^= key >> 33;
@@ -662,6 +678,71 @@ static JitBlock *cache_lookup(OcerzJit *jit, uint64_t rip, int mode32)
         if (b->key == key)
             return b;
     return NULL;
+}
+
+/* Coarse "which guest pages hold translated code" map.
+ *
+ * Every guest mmap/mprotect/munmap asks the JIT to drop any code it holds in
+ * that range.  A single global min/max over all live blocks cannot answer that
+ * under wine, where the live set spans PE images down at 32-bit addresses and
+ * shared-cache dylibs up at 0x7ff8_0000_0000, so the reject test used to walk
+ * the whole live list -- hundreds of millions of range tests per process
+ * during prefix startup.
+ *
+ * Each slot covers one 4 MB region and holds a bitmap of the 64 KB granules in
+ * it that a live block spans.  Entries are only added, so the map may say
+ * "maybe" after the code is gone, but never "no" while it is present.
+ * invalidate_all_locked clears it because it drops every block.  Both the add
+ * and the probe run under jit_lock. */
+
+static inline unsigned invmap_slot(uint64_t tag)
+{
+    uint64_t h = tag * 0x9e3779b97f4a7c15ull;
+    return (unsigned)((h >> 40) & (INVMAP_SLOTS - 1));
+}
+
+static inline uint64_t invmap_mask(uint64_t region, uint64_t lo, uint64_t hi)
+{
+    uint64_t rlo = region << INVMAP_RSHIFT, rhi = rlo + (1ull << INVMAP_RSHIFT);
+    uint64_t a = lo > rlo ? lo : rlo, b = hi < rhi ? hi : rhi;
+    unsigned g0 = (unsigned)((a - rlo) >> INVMAP_GSHIFT);
+    unsigned g1 = (unsigned)((b - 1 - rlo) >> INVMAP_GSHIFT);
+    return g1 - g0 >= 63 ? ~0ull
+                         : (((1ull << (g1 - g0 + 1)) - 1) << g0);
+}
+
+static void invmap_add(OcerzJit *jit, uint64_t lo, uint64_t hi)
+{
+    for (uint64_t r = lo >> INVMAP_RSHIFT; r <= (hi - 1) >> INVMAP_RSHIFT; r++) {
+        uint64_t tag = r + 1, m = invmap_mask(r, lo, hi);
+        unsigned i = invmap_slot(tag);
+        for (unsigned n = 0; n < INVMAP_PROBE; n++, i = (i + 1) & (INVMAP_SLOTS - 1)) {
+            if (jit->invmap[i].tag == 0) jit->invmap[i].tag = tag;
+            if (jit->invmap[i].tag == tag) { jit->invmap[i].bits |= m; goto next; }
+        }
+        jit->invmap_full = 1;
+next:;
+    }
+}
+
+static int invmap_may_hold(const OcerzJit *jit, uint64_t lo, uint64_t hi)
+{
+    uint64_t r0 = lo >> INVMAP_RSHIFT, r1 = (hi - 1) >> INVMAP_RSHIFT;
+    if (ENV_ON("OCERZ_NO_INVMAP") || jit->invmap_full ||
+        r1 - r0 >= INVMAP_MAX_SPAN)
+        return 1;
+    for (uint64_t r = r0; r <= r1; r++) {
+        uint64_t tag = r + 1, m = invmap_mask(r, lo, hi);
+        unsigned i = invmap_slot(tag);
+        for (unsigned n = 0; n < INVMAP_PROBE; n++, i = (i + 1) & (INVMAP_SLOTS - 1)) {
+            if (jit->invmap[i].tag == 0) break;
+            if (jit->invmap[i].tag == tag) {
+                if (jit->invmap[i].bits & m) return 1;
+                break;
+            }
+        }
+    }
+    return 0;
 }
 
 static void cache_insert(OcerzJit *jit, JitBlock *b)
@@ -683,6 +764,7 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
             if (lo < jit->code_lo) jit->code_lo = lo;
             if (hi > jit->code_hi) jit->code_hi = hi;
         }
+        invmap_add(jit, lo, hi);
         ocerz_cache_arm_exec(lo, hi);
     }
 }
@@ -4291,7 +4373,7 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
 {
     g_cc_direct = -1;
     g_cc_cbz_reg = -1;
-    if (getenv("OCERZ_CCLOG")) {
+    if (ENV_ON("OCERZ_CCLOG")) {
         char tb[96] = "(none)";
         if (g_flag_producer) ocerz_format_insn(g_flag_producer, tb, sizeof tb);
         fprintf(stderr, "ocerz: CCPRED cc=%u producer=%s\n", cc, tb);
@@ -4750,7 +4832,7 @@ static int rdx_prep_skippable(const X86Insn *insns, int i, int n, uint64_t need)
     if (d->seg != OCERZ_SEG_NONE || d->nops < 1) return 0;
     const X86Operand *o = &d->ops[0];
     if (o->kind != OCERZ_OPK_REG || o->high8 || (o->size != 4 && o->size != 8) || pin_slot(o->reg) < 0) return 0;
-    if (getenv("OCERZ_NO_INLINE_DIV")) return 0;
+    if (ENV_ON("OCERZ_NO_INLINE_DIV")) return 0;
     if (d->op == OCERZ_OP_DIV)
         return p->op == OCERZ_OP_XOR && p->nops == 2 && p->ops[0].kind == OCERZ_OPK_REG && p->ops[1].kind == OCERZ_OPK_REG &&
                p->ops[0].reg == OCERZ_RDX && p->ops[1].reg == OCERZ_RDX && !p->ops[0].high8 && !p->ops[1].high8 &&
@@ -7165,10 +7247,10 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_IDIV:
         return emit_div(b, insn, exit_sites, n_exits);
     case OCERZ_OP_CMOVCC:
-        if (getenv("OCERZ_NO_INLINE_CMOV")) return 0;
+        if (ENV_ON("OCERZ_NO_INLINE_CMOV")) return 0;
         return emit_cmov(b, insn, exit_sites, n_exits);
     case OCERZ_OP_SETCC:
-        if (getenv("OCERZ_NO_INLINE_SETCC")) return 0;
+        if (ENV_ON("OCERZ_NO_INLINE_SETCC")) return 0;
         return emit_setcc(b, insn);
     case OCERZ_OP_BSWAP:
         return emit_bswap(b, insn);
@@ -9253,7 +9335,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
     JitPscEnt *psc = NULL;
     int treg = g_ind_treg;                /* target: a pin (no copy) or JT1 */
     g_ind_treg = JT1;
-    if (g_pin_class == 3 && g_n_raslit < RASLIT_MAX && !getenv("OCERZ_NO_PSC"))
+    if (g_pin_class == 3 && g_n_raslit < RASLIT_MAX && !ENV_ON("OCERZ_NO_PSC"))
         psc = psc_alloc();
     uint32_t *psc_miss = NULL;
     if (psc) {
@@ -9390,7 +9472,7 @@ static int emit_branch_target(A64Buf *b, const X86Insn *insn, const X86Operand *
             return 0;
         /* a pinned target register is used directly by the site-cache lookup
          * (no copy); rsp is not (a CALL's push moves it first) */
-        if (pin_slot(o->reg) >= 0 && o->reg != OCERZ_RSP && !getenv("OCERZ_NO_IND_TREG")) {
+        if (pin_slot(o->reg) >= 0 && o->reg != OCERZ_RSP && !ENV_ON("OCERZ_NO_IND_TREG")) {
             g_ind_treg = pin_hreg(pin_slot(o->reg));
             return 1;
         }
@@ -9420,11 +9502,11 @@ static int emit_indirect_jmp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
 {
     if (insn->op != OCERZ_OP_JMP || insn->ops[0].kind == OCERZ_OPK_IMM)
         return 0;
-    if (getenv("OCERZ_NO_INLINE_INDIRECT"))
+    if (ENV_ON("OCERZ_NO_INLINE_INDIRECT"))
         return 0;
     if (insn->seg != OCERZ_SEG_NONE)
         return 0;
-    if (getenv("OCERZ_EXP_MAT_IND")) emit_materialize(b);
+    if (ENV_ON("OCERZ_EXP_MAT_IND")) emit_materialize(b);
     if (!emit_branch_target(b, insn, &insn->ops[0], exit_sites, n_exits))
         return 0;
     emit_indirect_tail(b, ic_slot_alloc(), epi_sites, n_epi);
@@ -9436,11 +9518,11 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
 {
     if (insn->op != OCERZ_OP_CALL || insn->ops[0].kind == OCERZ_OPK_IMM)
         return 0;
-    if (getenv("OCERZ_NO_INLINE_INDIRECT"))
+    if (ENV_ON("OCERZ_NO_INLINE_INDIRECT"))
         return 0;
     if (insn->seg != OCERZ_SEG_NONE || !mem_native_store_ok())
         return 0;
-    if (getenv("OCERZ_EXP_MAT_IND")) emit_materialize(b);
+    if (ENV_ON("OCERZ_EXP_MAT_IND")) emit_materialize(b);
     if (!emit_branch_target(b, insn, &insn->ops[0], exit_sites, n_exits))
         return 0;
     /* push return address (target already in JT1) */
@@ -10031,7 +10113,7 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
         else if (count[r] > secondn) { third = second; thirdn = secondn; second = r; secondn = count[r]; }
         else { third = r; thirdn = count[r]; }
     }
-    if (getenv("OCERZ_HOISTLOG") && best < 0)
+    if (ENV_ON("OCERZ_HOISTLOG") && best < 0)
         fprintf(stderr, "HOIST rip=%#llx no candidate (self_loop=%d n=%d)\n", (unsigned long long)rip, self_loop, n);
     if (best < 0 || bestn < min_count) return -1;
     if (secondn < min_count) second = -1;
@@ -10077,7 +10159,7 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
         }
         (void)total;
     }
-    if (getenv("OCERZ_HOISTLOG"))
+    if (ENV_ON("OCERZ_HOISTLOG"))
         fprintf(stderr, "HOIST rip=%#llx base=%d(n=%d) aux=%d second=%d(n=%d) third=%d(n=%d)\n", (unsigned long long)rip, best, bestn, aux[best], second, secondn, third, thirdn);
     return best;
 }
@@ -10473,7 +10555,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_stop_extra = 0;
     g_n_push_fix = 0;
     g_n_oolslow = 0;
-    g_cp_guard = ocerz_commpage && (getenv("OCERZ_CP_GUARD_ALL") || cp_marked(jit_key(rip, mode32)));
+    g_cp_guard = ocerz_commpage && (ENV_ON("OCERZ_CP_GUARD_ALL") || cp_marked(jit_key(rip, mode32)));
     { static int all = -1; if (all < 0) all = getenv("OCERZ_AL_GUARD_ALL") ? 1 : 0; if (all) g_al_all = 1; }
     g_align_guard = !g_plain_mem && al_marked(jit_key(rip, mode32));
     g_blk_ordered_loads = 0;
@@ -10678,7 +10760,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
     }
     pthread_jit_write_protect_np(0);
-    if (!getenv("OCERZ_NO_DISPATCH_STUB")) {
+    if (!ENV_ON("OCERZ_NO_DISPATCH_STUB")) {
         if (mode32) { if (!jit->dispatch_stub32) emit_dispatch_stub(jit, 1); }
         else        { if (!jit->dispatch_stub)   emit_dispatch_stub(jit, 0); }
     }
@@ -10735,7 +10817,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 a64_str(&b, 4, JT2, 20, (uint32_t)offsetof(OcerzCPU, btrace_n));
             }
         }
-        if (getenv("OCERZ_JGB_CHECK") && jgb_usable()) {   /* debug trap: body entered with x0 != gbase */
+        if (ENV_ON("OCERZ_JGB_CHECK") && jgb_usable()) {   /* debug trap: body entered with x0 != gbase */
             a64_mov_imm64(&b, JTU, ocerz_guest_base);
             a64_subs_reg(&b, 1, A64_ZR, 0, JTU, 0);
             uint32_t *okl = a64_label(&b); a64_bcond(&b, A64_EQ, 0);
@@ -11823,7 +11905,7 @@ int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint6
     uint64_t block_rip = blk_rip(b);
     cp_mark(b->key);
     cp_mark(jit_key(fault_rip, blk_mode32(b)));
-    if (getenv("OCERZ_CP_NOINVAL")) return 1;
+    if (ENV_ON("OCERZ_CP_NOINVAL")) return 1;
     ocerz_jit_invalidate_range(vm, block_rip, 1);
     if (fault_rip != block_rip) ocerz_jit_invalidate_range(vm, fault_rip, 1);
     return 1;
@@ -11935,7 +12017,7 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
     }
     pthread_mutex_unlock(&jit_lock);
     if (rc == 1 && ocerz_perfstat > 0) ps_align_patches++;
-    if (rc == 1 && getenv("OCERZ_ALPATCHLOG")) {
+    if (rc == 1 && ENV_ON("OCERZ_ALPATCHLOG")) {
         const uint32_t *arm = (const uint32_t *)((uint8_t *)site + (((int32_t)(*site << 6) >> 6) * 4));
         fprintf(stderr, "ocerz: ALPATCH site=%p w=%08x size=%d rt=%d rn=%d imm=%d pair=%d dmb=%d ta=%d s1=%d arm=%p arm:", (void *)site, w, size, rt, rn, imm9, pair, use_dmb, ta, s1, (const void *)arm);
         for (int i = 0; i < 40 && arm + i < jit->code_cur; i++) {
@@ -12148,7 +12230,7 @@ static int force_stop_sites_writable(OcerzJit *jit)
         stopcheck(b, b->stop_patch, b->stop_insn, "stop");
         for (int i = 0; i < b->n_stop_extra; i++)
             stopcheck(b, b->stop_extra[i].site, b->stop_extra[i].insn, "extra");
-        if (getenv("OCERZ_STOPLOG"))
+        if (ENV_ON("OCERZ_STOPLOG"))
             fprintf(stderr, "ocerz: STOPSITE rip=%#llx patch=%p cur=%08x stop_insn=%08x\n",
                     (unsigned long long)blk_rip(b), (void *)b->stop_patch,
                     b->stop_patch ? *b->stop_patch : 0u, b->stop_insn);
@@ -12221,6 +12303,8 @@ static void invalidate_all_locked(OcerzJit *jit)
     jit->n_live = 0;
     jit->code_lo = 0;
     jit->code_hi = 0;
+    memset(jit->invmap, 0, sizeof jit->invmap);
+    jit->invmap_full = 0;
 
     pending_clear();
     for (unsigned i = 0; i < g_ras_slot_n; i++)
@@ -12255,6 +12339,24 @@ static int ranges_overlap(uint64_t a, uint64_t alen,
     return a <= b ? b - a < alen : a - b < blen;
 }
 
+/* OCERZ_INVMAP_CHECK=1: assert the map's one invariant -- it may answer
+ * "maybe" for code that is already gone, but never "no" for code that is
+ * still live.  Runs the full walk the map exists to avoid, so it is slow. */
+static void invmap_check_reject(const OcerzJit *jit, uint64_t addr, uint64_t len)
+{
+    for (size_t k = 0; k < jit->n_live; k++) {
+        const JitBlock *b = jit->live[k];
+        for (int i = 0; i < b->n_insns; i++) {
+            if (!ranges_overlap(addr, len, b->insns[i].rip, b->insns[i].len))
+                continue;
+            fprintf(stderr, "ocerz: INVMAP MISS[%d] addr=%#llx len=%#llx block=%#llx\n",
+                    (int)getpid(), (unsigned long long)addr,
+                    (unsigned long long)len, (unsigned long long)blk_rip(b));
+            abort();
+        }
+    }
+}
+
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
 {
     if (!vm || !len || !vm->jit)
@@ -12264,10 +12366,13 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     int invalidated = 0;
     pthread_mutex_lock(&jit_lock);
     /* Callers hand us whole VM regions (vm_deallocate, vm_protect); almost none
-     * of them hold translated code. One range test beats walking every live
-     * block, and any overlap drops the whole cache anyway. */
+     * of them hold translated code, and any overlap drops the whole cache
+     * anyway.  The region map answers that in constant time. */
     if (!jit->code_hi || !ranges_overlap(addr, len, jit->code_lo,
-                                         jit->code_hi - jit->code_lo)) {
+                                         jit->code_hi - jit->code_lo) ||
+        !invmap_may_hold(jit, addr, addr + len)) {
+        if (ENV_ON("OCERZ_INVMAP_CHECK"))
+            invmap_check_reject(jit, addr, len);
         pthread_mutex_unlock(&jit_lock);
         return;
     }
@@ -12313,7 +12418,7 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
 {
     if (!vm)
         return;
-    if (getenv("OCERZ_ORDERLOG") && !vm->jit_ordered_required) {
+    if (ENV_ON("OCERZ_ORDERLOG") && !vm->jit_ordered_required) {
         fprintf(stderr, "ocerz: ORDERED memory required from here (caller %p)\n", __builtin_return_address(0));
         void *bt[8]; int n = backtrace(bt, 8); backtrace_symbols_fd(bt, n, 2);
     }
