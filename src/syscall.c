@@ -146,6 +146,15 @@ static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
         fprintf(stderr, "\n");
         {
+            extern unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
+            uint64_t h[32];
+            unsigned n = ocerz_vm_riphist(h, 32);
+            fprintf(stderr, "ocerz: EXIT-BLOCKHIST[%d]", (int)getpid());
+            for (unsigned k = 0; k < n; k++)
+                fprintf(stderr, " %#llx", (unsigned long long)h[k]);
+            fprintf(stderr, "\n");
+        }
+        {
             const char *eh = getenv("OCERZ_EXITHIST");
             if (eh && ((uint32_t)a[0] != 0 || !strcmp(eh, "all"))) {
             /* nonzero exit: recent block rips + a return-address scan of the
