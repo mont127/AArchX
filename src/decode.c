@@ -2732,6 +2732,26 @@ static int decode_0f38(DecState *s)
     int e = fetch8(s, &op3);
     if (e)
         return e;
+    if (op3 == 0xf0 || op3 == 0xf1) {
+        /* crc32: F2-prefixed, GPR dest; 66 with F2 selects a 16-bit source */
+        if (sse_prefix(s) != MAND_F2)
+            return OCERZ_EUNDEF;
+        int dsize = s->rex_w ? 8 : 4;
+        int ssize = op3 == 0xf0 ? 1 : (s->rex_w ? 8 : (s->has_66 ? 2 : 4));
+        ModRM m;
+        e = decode_modrm(s, &m, ssize);
+        if (e)
+            return e;
+        set_op(s, OCERZ_OP_CRC32);
+        s->out->opsize = (uint8_t)dsize;
+        s->out->nops = 2;
+        set_reg(&s->out->ops[0], m.reg, dsize);
+        if (ssize == 1)
+            place_rm8(s, &m, &s->out->ops[1]);
+        else
+            place_rm(s, &m, &s->out->ops[1], ssize, 1);
+        return OCERZ_OK;
+    }
     if (sse_prefix(s) != MAND_66)
         return OCERZ_EUNDEF;
 
@@ -2762,6 +2782,7 @@ static int decode_0f38(DecState *s)
     case 0x23: op = OCERZ_OP_PMOVSXWD; break;
     case 0x24: op = OCERZ_OP_PMOVSXWQ; break;
     case 0x25: op = OCERZ_OP_PMOVSXDQ; break;
+    case 0x28: op = OCERZ_OP_PMULDQ; break;
     case 0x29: op = OCERZ_OP_PCMPEQQ; break;
     case 0x2a: op = OCERZ_OP_MOVDQA; break;
     case 0x30: op = OCERZ_OP_PMOVZXBW; break;
@@ -2780,6 +2801,7 @@ static int decode_0f38(DecState *s)
     case 0x3e: op = OCERZ_OP_PMAXUW; break;
     case 0x3f: op = OCERZ_OP_PMAXUD; break;
     case 0x40: op = OCERZ_OP_PMULLD; break;
+    case 0x41: op = OCERZ_OP_PHMINPOSUW; break;
     case 0x2b: op = OCERZ_OP_PACKUSDW; break;
     case 0xdb: op = OCERZ_OP_AESIMC; break;
     case 0xdc: op = OCERZ_OP_AESENC; break;
@@ -2817,6 +2839,20 @@ static int decode_0f3a(DecState *s)
         return decode_pint_imm(s, OCERZ_OP_PBLENDW);
     case 0x0f:
         return decode_pint_imm(s, OCERZ_OP_PALIGNR);
+    case 0x40:
+        return decode_pint_imm(s, OCERZ_OP_DPPS);
+    case 0x41:
+        return decode_pint_imm(s, OCERZ_OP_DPPD);
+    case 0x42:
+        return decode_pint_imm(s, OCERZ_OP_MPSADBW);
+    case 0x60:
+        return decode_pint_imm(s, OCERZ_OP_PCMPESTRM);
+    case 0x61:
+        return decode_pint_imm(s, OCERZ_OP_PCMPESTRI);
+    case 0x62:
+        return decode_pint_imm(s, OCERZ_OP_PCMPISTRM);
+    case 0x63:
+        return decode_pint_imm(s, OCERZ_OP_PCMPISTRI);
     case 0x14: {
         ModRM m;
         e = decode_modrm(s, &m, 1);
@@ -3483,6 +3519,16 @@ static void init_op_names(void)
     op_names[OCERZ_OP_PCMPGTW] = "pcmpgtw";
     op_names[OCERZ_OP_PCMPGTD] = "pcmpgtd";
     op_names[OCERZ_OP_PCMPGTQ] = "pcmpgtq";
+    op_names[OCERZ_OP_PMULDQ] = "pmuldq";
+    op_names[OCERZ_OP_MPSADBW] = "mpsadbw";
+    op_names[OCERZ_OP_PHMINPOSUW] = "phminposuw";
+    op_names[OCERZ_OP_DPPS] = "dpps";
+    op_names[OCERZ_OP_DPPD] = "dppd";
+    op_names[OCERZ_OP_CRC32] = "crc32";
+    op_names[OCERZ_OP_PCMPESTRM] = "pcmpestrm";
+    op_names[OCERZ_OP_PCMPESTRI] = "pcmpestri";
+    op_names[OCERZ_OP_PCMPISTRM] = "pcmpistrm";
+    op_names[OCERZ_OP_PCMPISTRI] = "pcmpistri";
     op_names[OCERZ_OP_CVTSI2SS] = "cvtsi2ss";
     op_names[OCERZ_OP_CVTSI2SD] = "cvtsi2sd";
     op_names[OCERZ_OP_CVTSS2SI] = "cvtss2si";

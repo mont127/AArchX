@@ -206,6 +206,21 @@ static int ext_bit(OcerzCPU *cpu, const X86Insn *insn)
     return OCERZ_STEP_OK;
 }
 
+static int ext_crc32(OcerzCPU *cpu, const X86Insn *insn)
+{
+    /* CRC-32C, reflected polynomial, bitwise: correctness over speed here
+     * (the JIT does not translate it; hashing loops run interpreted). */
+    uint32_t crc = (uint32_t)cpu->gpr[insn->ops[0].reg];
+    uint64_t v = ocerz_read_op(cpu, insn, &insn->ops[1]);
+    for (int i = 0; i < insn->ops[1].size; i++) {
+        crc ^= (uint8_t)(v >> (8 * i));
+        for (int k = 0; k < 8; k++)
+            crc = (crc >> 1) ^ (0x82f63b78u & (uint32_t)-(int32_t)(crc & 1));
+    }
+    ocerz_write_op(cpu, insn, &insn->ops[0], crc);
+    return OCERZ_STEP_OK;
+}
+
 static int ext_scan(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *dst = &insn->ops[0];
@@ -282,7 +297,10 @@ static int ext_cpuid(OcerzCPU *cpu)
     } else if (leaf == 1) {
         r[0] = 0x000306a9;
         r[1] = 0x00100800;
-        r[2] = 0x00802201;
+        /* sse3+ssse3+cx16+sse4.1+sse4.2+popcnt: everything here is
+         * implemented in full, and steam's bootstrapper refuses to start
+         * the client on a CPU without sse4.2. */
+        r[2] = 0x00982201;
         r[3] = 0x078bfbff;
     } else if (leaf == 0x80000000u) {
         r[0] = 0x80000004;
@@ -921,6 +939,9 @@ int ocerz_interp_ext(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_BTR:
     case OCERZ_OP_BTC:
         return ext_bit(cpu, insn);
+
+    case OCERZ_OP_CRC32:
+        return ext_crc32(cpu, insn);
 
     case OCERZ_OP_BSF:
     case OCERZ_OP_BSR:

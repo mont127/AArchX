@@ -703,6 +703,10 @@ static int do_int_arith(OcerzCPU *cpu, const X86Insn *insn)
         r.u64[0] = (uint64_t)a.u32[0] * b.u32[0];
         r.u64[1] = (uint64_t)a.u32[2] * b.u32[2];
         break;
+    case OP(OCERZ_OP_PMULDQ):
+        r.i64[0] = (int64_t)a.i32[0] * b.i32[0];
+        r.i64[1] = (int64_t)a.i32[2] * b.i32[2];
+        break;
     case OP(OCERZ_OP_PMADDWD):
         for (int i = 0; i < 4; i++)
             r.i32[i] = (int32_t)a.i16[2 * i] * b.i16[2 * i]
@@ -1096,6 +1100,200 @@ static int do_insert_extract(OcerzCPU *cpu, const X86Insn *insn)
     default:
         return OCERZ_EUNSUP;
     }
+}
+
+/* pcmpXstrY string units.  a is the first (reg) operand, b the second.
+ * The imm8 fields follow the architectural definition: [1:0] element format,
+ * [3:2] aggregation, [5:4] polarity, [6] index/mask selection. */
+static int str_elem(const vec *v, int i, int words, int sgn, int32_t *out)
+{
+    if (words)
+        *out = sgn ? (int32_t)v->i16[i] : (int32_t)v->u16[i];
+    else
+        *out = sgn ? (int32_t)v->i8[i] : (int32_t)v->u8[i];
+    return *out == 0;
+}
+
+static int str_implicit_len(const vec *v, int n, int words, int sgn)
+{
+    int32_t e;
+    for (int i = 0; i < n; i++)
+        if (str_elem(v, i, words, sgn, &e))
+            return i;
+    return n;
+}
+
+static int do_pcmpstr(OcerzCPU *cpu, const X86Insn *insn)
+{
+    int imm = (int)(insn->ops[2].imm & 0xff);
+    int words = imm & 1;
+    int sgn = (imm >> 1) & 1;
+    int n = words ? 8 : 16;
+    int is_index = insn->op == OCERZ_OP_PCMPESTRI || insn->op == OCERZ_OP_PCMPISTRI;
+    int is_expl = insn->op == OCERZ_OP_PCMPESTRI || insn->op == OCERZ_OP_PCMPESTRM;
+
+    vec a = vec_of(cpu->xmm[insn->ops[0].reg]);
+    vec b = vec_read(cpu, insn, &insn->ops[1]);
+
+    int la, lb;
+    if (is_expl) {
+        int64_t va = (int64_t)(int32_t)cpu->gpr[OCERZ_RAX];
+        int64_t vb = (int64_t)(int32_t)cpu->gpr[OCERZ_RDX];
+        if (va < 0) va = -va;
+        if (vb < 0) vb = -vb;
+        la = va > n ? n : (int)va;
+        lb = vb > n ? n : (int)vb;
+    } else {
+        la = str_implicit_len(&a, n, words, sgn);
+        lb = str_implicit_len(&b, n, words, sgn);
+    }
+
+    uint32_t res1 = 0;
+    int agg = (imm >> 2) & 3;
+    for (int j = 0; j < n; j++) {
+        int bit = 0;
+        int32_t ea, eb;
+        switch (agg) {
+        case 0:                                   /* equal any: a is a set */
+            if (j < lb) {
+                str_elem(&b, j, words, sgn, &eb);
+                for (int i = 0; i < la; i++) {
+                    str_elem(&a, i, words, sgn, &ea);
+                    if (ea == eb) { bit = 1; break; }
+                }
+            }
+            break;
+        case 1:                                   /* ranges: a is lo/hi pairs */
+            if (j < lb) {
+                str_elem(&b, j, words, sgn, &eb);
+                for (int i = 0; i + 1 < la; i += 2) {
+                    int32_t lo, hi;
+                    str_elem(&a, i, words, sgn, &lo);
+                    str_elem(&a, i + 1, words, sgn, &hi);
+                    if (eb >= lo && eb <= hi) { bit = 1; break; }
+                }
+            }
+            break;
+        case 2:                                   /* equal each */
+            if (j < la && j < lb) {
+                str_elem(&a, j, words, sgn, &ea);
+                str_elem(&b, j, words, sgn, &eb);
+                bit = ea == eb;
+            } else if (j >= la && j >= lb) {
+                bit = 1;
+            }
+            break;
+        default:                                  /* equal ordered: substring */
+            bit = 1;
+            for (int i = 0; i < la; i++) {
+                if (j + i >= lb) { bit = 0; break; }
+                str_elem(&a, i, words, sgn, &ea);
+                str_elem(&b, j + i, words, sgn, &eb);
+                if (ea != eb) { bit = 0; break; }
+            }
+            break;
+        }
+        if (bit)
+            res1 |= 1u << j;
+    }
+
+    uint32_t valid = n == 16 ? 0xffffu : 0xffu;
+    uint32_t res2 = res1;
+    switch ((imm >> 4) & 3) {
+    case 1: res2 = ~res1 & valid; break;
+    case 3: res2 = res1 ^ (lb >= n ? valid : ((1u << lb) - 1)); break;
+    default: break;
+    }
+    res2 &= valid;
+
+    if (is_index) {
+        uint32_t idx = (uint32_t)n;
+        if (res2)
+            idx = (imm & 0x40) ? (uint32_t)(31 - __builtin_clz(res2))
+                               : (uint32_t)__builtin_ctz(res2);
+        cpu->gpr[OCERZ_RCX] = idx;
+    } else {
+        vec m;
+        m.q.lo = 0;
+        m.q.hi = 0;
+        if (imm & 0x40) {
+            for (int j = 0; j < n; j++)
+                if (res2 & (1u << j)) {
+                    if (words) m.u16[j] = 0xffff;
+                    else m.u8[j] = 0xff;
+                }
+        } else {
+            m.q.lo = res2;
+        }
+        cpu->xmm[0] = m.q;
+    }
+
+    ocerz_flag_assign(cpu, OCERZ_CF, res2 != 0);
+    ocerz_flag_assign(cpu, OCERZ_ZF, lb < n);
+    ocerz_flag_assign(cpu, OCERZ_SF, la < n);
+    ocerz_flag_assign(cpu, OCERZ_OF, res2 & 1);
+    ocerz_flag_assign(cpu, OCERZ_AF, 0);
+    ocerz_flag_assign(cpu, OCERZ_PF, 0);
+    return OCERZ_STEP_OK;
+}
+
+static int do_sse41_misc(OcerzCPU *cpu, const X86Insn *insn)
+{
+    const X86Operand *d = &insn->ops[0];
+    vec a = vec_of(cpu->xmm[d->reg]);
+    vec b = vec_read(cpu, insn, &insn->ops[1]);
+    vec r;
+    r.q.lo = 0;
+    r.q.hi = 0;
+    switch (insn->op) {
+    case OP(OCERZ_OP_PHMINPOSUW): {
+        int best = 0;
+        for (int i = 1; i < 8; i++)
+            if (b.u16[i] < b.u16[best])
+                best = i;
+        r.u16[0] = b.u16[best];
+        r.u16[1] = (uint16_t)best;
+        break;
+    }
+    case OP(OCERZ_OP_MPSADBW): {
+        int imm = (int)(insn->ops[2].imm & 0xff);
+        int soff = (imm & 3) * 4;
+        int doff = ((imm >> 2) & 1) * 4;
+        for (int i = 0; i < 8; i++) {
+            int sum = 0;
+            for (int k = 0; k < 4; k++) {
+                int diff = (int)a.u8[doff + i + k] - (int)b.u8[soff + k];
+                sum += diff < 0 ? -diff : diff;
+            }
+            r.u16[i] = (uint16_t)sum;
+        }
+        break;
+    }
+    case OP(OCERZ_OP_DPPS): {
+        /* the sum is specified pairwise: (t0+t1) + (t2+t3) */
+        int imm = (int)(insn->ops[2].imm & 0xff);
+        float t[4];
+        for (int i = 0; i < 4; i++)
+            t[i] = (imm & (0x10 << i)) ? a.f[i] * b.f[i] : 0.0f;
+        float sum = (t[0] + t[1]) + (t[2] + t[3]);
+        for (int i = 0; i < 4; i++)
+            r.f[i] = (imm & (1 << i)) ? sum : 0.0f;
+        break;
+    }
+    case OP(OCERZ_OP_DPPD): {
+        int imm = (int)(insn->ops[2].imm & 0xff);
+        double t0 = (imm & 0x10) ? a.d[0] * b.d[0] : 0.0;
+        double t1 = (imm & 0x20) ? a.d[1] * b.d[1] : 0.0;
+        double sum = t0 + t1;
+        for (int i = 0; i < 2; i++)
+            r.d[i] = (imm & (1 << i)) ? sum : 0.0;
+        break;
+    }
+    default:
+        return OCERZ_EUNSUP;
+    }
+    cpu->xmm[d->reg] = r.q;
+    return OCERZ_STEP_OK;
 }
 
 static int do_ptest_blend(OcerzCPU *cpu, const X86Insn *insn)
@@ -1511,7 +1709,8 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OP(OCERZ_OP_PADDSB): case OP(OCERZ_OP_PADDSW): case OP(OCERZ_OP_PADDUSB): case OP(OCERZ_OP_PADDUSW):
     case OP(OCERZ_OP_PSUBSB): case OP(OCERZ_OP_PSUBSW): case OP(OCERZ_OP_PSUBUSB): case OP(OCERZ_OP_PSUBUSW):
     case OP(OCERZ_OP_PMULLW): case OP(OCERZ_OP_PMULLD): case OP(OCERZ_OP_PMULHW): case OP(OCERZ_OP_PMULHUW):
-    case OP(OCERZ_OP_PMULUDQ): case OP(OCERZ_OP_PMADDWD): case OP(OCERZ_OP_PAVGB): case OP(OCERZ_OP_PAVGW):
+    case OP(OCERZ_OP_PMULUDQ): case OP(OCERZ_OP_PMULDQ):
+    case OP(OCERZ_OP_PMADDWD): case OP(OCERZ_OP_PAVGB): case OP(OCERZ_OP_PAVGW):
     case OP(OCERZ_OP_PMAXUB): case OP(OCERZ_OP_PMAXSW): case OP(OCERZ_OP_PMINUB): case OP(OCERZ_OP_PMINSW):
     case OP(OCERZ_OP_PMAXSB): case OP(OCERZ_OP_PMAXSD): case OP(OCERZ_OP_PMAXUW): case OP(OCERZ_OP_PMAXUD):
     case OP(OCERZ_OP_PMINSB): case OP(OCERZ_OP_PMINSD): case OP(OCERZ_OP_PMINUW): case OP(OCERZ_OP_PMINUD):
@@ -1553,6 +1752,14 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 
     case OP(OCERZ_OP_ROUNDPS): case OP(OCERZ_OP_ROUNDPD): case OP(OCERZ_OP_ROUNDSS): case OP(OCERZ_OP_ROUNDSD):
         return do_round(cpu, insn);
+
+    case OP(OCERZ_OP_PCMPESTRM): case OP(OCERZ_OP_PCMPESTRI):
+    case OP(OCERZ_OP_PCMPISTRM): case OP(OCERZ_OP_PCMPISTRI):
+        return do_pcmpstr(cpu, insn);
+
+    case OP(OCERZ_OP_PHMINPOSUW): case OP(OCERZ_OP_MPSADBW):
+    case OP(OCERZ_OP_DPPS): case OP(OCERZ_OP_DPPD):
+        return do_sse41_misc(cpu, insn);
 
     case OP(OCERZ_OP_AESENC): case OP(OCERZ_OP_AESENCLAST):
     case OP(OCERZ_OP_AESDEC): case OP(OCERZ_OP_AESDECLAST):
