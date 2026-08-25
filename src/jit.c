@@ -101,6 +101,13 @@ typedef struct JitBlock {
      * fault there must hand the guest the pre-push rsp (+8) */
     uint32_t *push_fix;
     uint16_t n_push_fix;
+    /* spliced call/ret pairs whose return-address push was elided: a fault
+     * with ci < insn < rj must write ra back into the frame's slot */
+    struct JitPushElide { int32_t ci, rj; uint64_t ra; } *pushelide;
+    uint16_t n_pushelide;
+    /* load-promoted frame saves (translate-time only in recovery terms: the
+     * push still stores, so slots are always architecturally valid) */
+    struct JitPromo { int32_t pi, qi; uint8_t hreg; };
     struct JitBlock *stop_next;
 
     uint8_t host_holds[16];
@@ -205,6 +212,12 @@ typedef struct {
 #define NANOOL_MAX 64
 static NanOolPend g_nanool[NANOOL_MAX];
 static int g_n_nanool;
+#define PE_MAX 48
+static struct JitPushElide g_pe_real[PE_MAX];        /* elided retaddr pairs emitted so far */
+static int g_n_pe_real;
+static struct JitPromo g_promo_real[PE_MAX];         /* promoted pairs emitted so far */
+static int g_n_promo_real;
+static const X86Insn *g_pe_insns;                    /* main-loop insns (NULL outside it) */
 static int g_n_oslow;
 static int g_cur_insn_idx;
 /* Static flag-producer hint for the instruction being emitted: the nearest
@@ -9809,6 +9822,24 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
 
+    /* inside an elided frame the retaddr slot is garbage; the interpreter
+     * (or an exit it requests) may expose it - write the address first */
+    if (g_pe_insns && g_n_pe_real && pin_slot(OCERZ_RSP) >= 0) {
+        int hsp = pin_hreg(pin_slot(OCERZ_RSP));
+        for (int i = 0; i < g_n_pe_real; i++) {
+            const struct JitPushElide *p = &g_pe_real[i];
+            if (g_cur_insn_idx <= p->ci || g_cur_insn_idx >= p->rj) continue;
+            int64_t delta = 0;
+            for (int m = p->ci + 1; m < g_cur_insn_idx; m++) {
+                unsigned op2 = g_pe_insns[m].op;
+                if (op2 == OCERZ_OP_PUSH || op2 == OCERZ_OP_CALL) delta -= 8;
+                else if (op2 == OCERZ_OP_POP || op2 == OCERZ_OP_RET) delta += 8;
+            }
+            a64_mov_imm64(b, JT1, p->ra);
+            a64_str(b, 8, JT1, hsp, (uint32_t)(-delta));
+        }
+    }
+
     emit_materialize(b);
 
     l0_flush_all(b);                     /* deferred lane-0 results must reach the v regs */
@@ -9828,6 +9859,20 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     (*n_exits)++;
     emit_reload_jgb(b);           /* JGB first: the hoisted bases derive from it */
     emit_reload_mem_base(b);
+    if (g_pe_insns && g_n_promo_real && pin_slot(OCERZ_RSP) >= 0) {
+        int hsp = pin_hreg(pin_slot(OCERZ_RSP));
+        for (int i = 0; i < g_n_promo_real; i++) {
+            const struct JitPromo *p = &g_promo_real[i];
+            if (g_cur_insn_idx <= p->pi || g_cur_insn_idx >= p->qi) continue;
+            int64_t delta = 0;
+            for (int m = p->pi + 1; m < g_cur_insn_idx; m++) {
+                unsigned op2 = g_pe_insns[m].op;
+                if (op2 == OCERZ_OP_PUSH || op2 == OCERZ_OP_CALL) delta -= 8;
+                else if (op2 == OCERZ_OP_POP || op2 == OCERZ_OP_RET) delta += 8;
+            }
+            a64_ldr(b, 8, p->hreg, hsp, (uint32_t)(-delta));
+        }
+    }
 }
 
 int ocerz_jitstat = -1;
@@ -10620,6 +10665,10 @@ static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *ent
  * through the normal dispatcher, which executes the real ret. */
 static uint8_t  g_ic_kind[JIT_MAX_BLOCK_INSNS];      /* 0 none, 1 pushed call, 2 checked ret, 3 elided ret */
 static uint64_t g_ic_expect[JIT_MAX_BLOCK_INSNS];    /* kind 2: the return rip */
+static uint8_t  g_ic_pushelide[JIT_MAX_BLOCK_INSNS]; /* kind 1: retaddr push provably dead */
+static int32_t  g_ic_pair_rj[JIT_MAX_BLOCK_INSNS];   /* kind 1 with pushelide: the matching ret */
+static uint8_t  g_promo_reg[JIT_MAX_BLOCK_INSNS];    /* push/pop: promo host reg (0 = memory) */
+static int32_t  g_promo_mate[JIT_MAX_BLOCK_INSNS];   /* push: its matching pop */
 static int inline_calls_off(void)
 {
     static int off = -1;
@@ -10725,6 +10774,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         sigjmp_buf db;
         sigjmp_buf *prev_dr = ocerz_jit_decode_recover;
         memset(g_ic_kind, 0, sizeof g_ic_kind);
+        memset(g_ic_pushelide, 0, sizeof g_ic_pushelide);
+        memset(g_promo_reg, 0, sizeof g_promo_reg);
         if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
             ocerz_jit_decode_recover = &db;
             for (; vn < JIT_MAX_BLOCK_INSNS; ) {
@@ -10817,6 +10868,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_jcc_edge[0].cond_site = NULL; g_jcc_edge[1].cond_site = NULL;
     g_n_oslow = 0;
     g_n_nanool = 0;
+    g_n_pe_real = 0;
+    g_n_promo_real = 0;
+    g_pe_insns = blk->insns;
     g_n_call_edges = 0;
     /* Out-of-line slow-arm and stop-site state MUST start clean: a translation that returns without */
     g_n_oolslow = 0;
@@ -11268,10 +11322,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             if (g_ic_kind[k] == 1) { nest++; delta -= 8; continue; }   /* the inner call pushes */
             switch (m->op) {
             case OCERZ_OP_PUSH:
-                if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_MEM) { safe = 0; break; }
+                if (m->nops > 0 && (m->ops[0].kind == OCERZ_OPK_MEM || m->ops[0].size != 8)) { safe = 0; break; }
                 delta -= 8; break;
             case OCERZ_OP_POP:
-                if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_MEM) { safe = 0; break; }
+                if (m->nops > 0 && (m->ops[0].kind == OCERZ_OPK_MEM || m->ops[0].size != 8)) { safe = 0; break; }
                 delta += 8; break;
             case OCERZ_OP_MOV: case OCERZ_OP_LEA: case OCERZ_OP_ADD: case OCERZ_OP_SUB:
             case OCERZ_OP_XOR: case OCERZ_OP_OR: case OCERZ_OP_AND: case OCERZ_OP_SHR:
@@ -11291,6 +11345,113 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
         if (safe && rj >= 0 && delta == 0)
             g_ic_kind[rj] = 3;
+    }
+
+    /* Second, stricter pass: when a frame is pure register work (only reg
+     * push/pop and reg-to-reg ops, no memory operands, no rsp writes), the
+     * pushed return address is never read - the matching ret is already
+     * elided - so the push itself can become a bare rsp -= 8.  rsp stays
+     * architectural throughout; only the slot's CONTENT is garbage, and a
+     * fault inside the region repairs it from blk->pushelide.  Innermost
+     * frames must qualify before their enclosers (3 sweeps cover the
+     * nesting depth the splicer allows). */
+    for (int sweep = 0; sweep < 3; sweep++) {
+        for (int ci = 0; ci < n; ci++) {
+            if (g_ic_kind[ci] != 1 || g_ic_pushelide[ci] || blk->insns[ci].mode32)
+                continue;
+            int64_t delta = 0;
+            int ok = 1, rj = -1, nest = 0;
+            for (int k = ci + 1; k < n; k++) {
+                const X86Insn *m = &blk->insns[k];
+                if (g_ic_kind[k] == 3) {
+                    if (nest == 0) { rj = k; break; }
+                    nest--; delta += 8;
+                    continue;
+                }
+                if (g_ic_kind[k] == 2) { ok = 0; break; }
+                if (g_ic_kind[k] == 1) {
+                    if (!g_ic_pushelide[k]) { ok = 0; break; }
+                    nest++; delta -= 8;
+                    continue;
+                }
+                int memop = 0;
+                for (int q = 0; q < m->nops; q++)
+                    if (m->ops[q].kind == OCERZ_OPK_MEM) memop = 1;
+                switch (m->op) {
+                case OCERZ_OP_PUSH:
+                    if (memop || m->ops[0].size != 8) { ok = 0; break; }
+                    delta -= 8; break;
+                case OCERZ_OP_POP:
+                    if (memop || delta == 0 || m->ops[0].size != 8) { ok = 0; break; }
+                    delta += 8; break;
+                case OCERZ_OP_MOV: case OCERZ_OP_LEA: case OCERZ_OP_ADD: case OCERZ_OP_SUB:
+                case OCERZ_OP_XOR: case OCERZ_OP_OR: case OCERZ_OP_AND: case OCERZ_OP_SHR:
+                case OCERZ_OP_SHL: case OCERZ_OP_SAR: case OCERZ_OP_IMUL: case OCERZ_OP_INC:
+                case OCERZ_OP_DEC: case OCERZ_OP_NEG: case OCERZ_OP_NOT: case OCERZ_OP_MOVZX:
+                case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD: case OCERZ_OP_NOP:
+                case OCERZ_OP_TEST: case OCERZ_OP_CMP:
+                    if (memop && m->op != OCERZ_OP_LEA) { ok = 0; break; }
+                    if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_REG &&
+                        m->ops[0].reg == OCERZ_RSP) { ok = 0; break; }
+                    break;
+                default:
+                    ok = 0; break;
+                }
+                if (!ok) break;
+            }
+            if (ok && rj >= 0 && delta == 0) {
+                g_ic_pushelide[ci] = 1;
+                g_ic_pair_rj[ci] = rj;
+            }
+        }
+    }
+
+    /* Frame-save promotion: inside the accepted regions the slot of a
+     * matched reg push/pop pair is provably never read or written, so the
+     * round trip through memory - a loop-carried store-to-load chain in
+     * call-dense loops - becomes two register renames.  x16/x17/x30 serve
+     * when they are not hoisted memory bases this block. */
+    static int no_promo = -1;
+    if (no_promo < 0) no_promo = getenv("OCERZ_NO_PROMO") ? 1 : 0;
+    if (!no_promo && g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
+        (stack_identity() || rsp_is_ptr())) {
+        int freer[3]; int nfree = 0;
+        if (g_mem_hoist_greg2 < 0) freer[nfree++] = JMEMBASE2;
+        if (g_mem_hoist_greg  < 0) freer[nfree++] = JMEMBASE;
+        if (g_mem_hoist_greg3 < 0) freer[nfree++] = JMEMBASE3;
+        int npairs = 0;
+        int sp = 0, dead = 0; int pstk[64]; int8_t rres[64];
+        int nend = 0; int32_t endstk[8];
+        for (int i = 0; i < n; i++) {
+            while (nend > 0 && i >= endstk[nend - 1]) nend--;
+            if (g_ic_kind[i] == 1 && g_ic_pushelide[i]) {
+                if (nend < 8) endstk[nend++] = g_ic_pair_rj[i];
+                continue;
+            }
+            if (nend == 0) { sp = 0; dead = 0; continue; }
+            if (dead) continue;
+            const X86Insn *m = &blk->insns[i];
+            int plain = m->nops > 0 && m->ops[0].kind == OCERZ_OPK_REG &&
+                        !m->ops[0].high8 && m->ops[0].size == 8 &&
+                        m->ops[0].reg != OCERZ_RSP &&
+                        pin_slot(m->ops[0].reg) >= 0 && !m->mode32;
+            if (m->op == OCERZ_OP_PUSH) {
+                if (!plain || sp >= 64) { dead = 1; continue; }
+                if (nfree > 0 && npairs < PE_MAX) { rres[sp] = (int8_t)freer[--nfree]; }
+                else rres[sp] = -1;
+                pstk[sp++] = i;
+            } else if (m->op == OCERZ_OP_POP) {
+                if (!plain || sp <= 0) { dead = 1; continue; }
+                sp--;
+                if (rres[sp] >= 0) {
+                    g_promo_reg[pstk[sp]] = (uint8_t)rres[sp];
+                    g_promo_reg[i] = (uint8_t)rres[sp];
+                    g_promo_mate[pstk[sp]] = i;
+                    freer[nfree++] = rres[sp];
+                    npairs++;
+                }
+            }
+        }
     }
 
     if (g_flaglive_log) {
@@ -11592,6 +11753,29 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             }
         }
 
+        if (g_promo_reg[i] != 0) {
+            /* load-promoted frame save: the push stays a real store (fault
+             * order and memory stay exact), but the value also rides in a
+             * shadow host register so the pop is a rename, not a
+             * store-to-load forward - the loop-carried chain of call-dense
+             * code.  Slots stay valid, so no fault repair is needed. */
+            int hsp = pin_hreg(pin_slot(OCERZ_RSP));
+            int pr = g_promo_reg[i];
+            int gr = pin_hreg(pin_slot(insn->ops[0].reg));
+            if (insn->op == OCERZ_OP_PUSH) {
+                a64_mov_reg(&b, 1, pr, gr);
+                if (g_n_promo_real < PE_MAX)
+                    g_promo_real[g_n_promo_real++] = (struct JitPromo){
+                        (int32_t)i, g_promo_mate[i], (uint8_t)pr };
+                goto promo_push_fallthrough;   /* the normal push emitter stores it */
+            } else {
+                a64_mov_reg(&b, 1, gr, pr);
+                a64_add_imm(&b, 1, hsp, hsp, 8);
+            }
+            blk->n_inlined++;
+            continue;
+        }
+promo_push_fallthrough:
         if (g_ic_kind[i] != 0) {
             int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
                         stack_plain_access_ok() && jgb_usable() && !stack_guard_needed();
@@ -11605,8 +11789,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             }
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             if (g_ic_kind[i] == 1) {
-                a64_mov_imm64(&b, JT1, insn->rip + insn->len);
-                emit_push_pinned(&b, hs, JT1);
+                if (g_ic_pushelide[i] && g_n_pe_real < PE_MAX &&
+                    (stack_identity() || rsp_is_ptr())) {
+                    /* slot content dead until the elided ret: allocate only */
+                    a64_sub_imm(&b, 1, hs, hs, 8);
+                    g_pe_real[g_n_pe_real++] = (struct JitPushElide){
+                        (int32_t)i, g_ic_pair_rj[i], insn->rip + insn->len };
+                } else {
+                    a64_mov_imm64(&b, JT1, insn->rip + insn->len);
+                    emit_push_pinned(&b, hs, JT1);
+                }
             } else if (g_ic_kind[i] == 3) {
                 a64_add_imm(&b, 1, hs, hs, 8);   /* slot proven intact: just pop */
             } else {
@@ -11657,6 +11849,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         l0_flush_all(&b);
         l0_reset();
     }
+    g_pe_insns = NULL;
+    if (g_n_pe_real > 0) {
+        blk->pushelide = (struct JitPushElide *)malloc((size_t)g_n_pe_real * sizeof *blk->pushelide);
+        if (blk->pushelide) {
+            memcpy(blk->pushelide, g_pe_real, (size_t)g_n_pe_real * sizeof *blk->pushelide);
+            blk->n_pushelide = (uint16_t)g_n_pe_real;
+        }
+    }
+
     l0_flush_all(&b);   /* fallthrough or leftovers: nothing stale may escape the block */
     if (!is_terminator(blk->insns[n - 1].op)) {
 
@@ -12150,6 +12351,8 @@ static const JitBlock *fault_block(const OcerzJit *jit, const uint32_t *pc)
     return b;
 }
 
+static int fault_insn_index(const JitBlock *b, const uint32_t *pc);
+
 void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
                                   const uint64_t *host_x, OcerzCPU *cpu)
 {
@@ -12171,6 +12374,24 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
         uint32_t off = (uint32_t)((const uint32_t *)host_pc - (const uint32_t *)b->code);
         for (int i = 0; i < b->n_push_fix; i++)
             if (b->push_fix[i] == off) { cpu->gpr[OCERZ_RSP] += 8; break; }
+    }
+    /* elided return-address slots: the interpreter resumes mid-frame, so the
+     * enclosing frames' slots must hold their addresses (rsp itself is
+     * architectural throughout - only the content was skipped) */
+    if (b->n_pushelide && b->pushelide && b->insns) {
+        int k = fault_insn_index(b, (const uint32_t *)host_pc);
+        for (int i = 0; k > 0 && i < b->n_pushelide; i++) {
+            const struct JitPushElide *p = &b->pushelide[i];
+            if (k <= p->ci || k >= p->rj) continue;
+            int64_t delta = 0;
+            for (int m = p->ci + 1; m < k; m++) {
+                unsigned op2 = b->insns[m].op;
+                if (op2 == OCERZ_OP_PUSH || op2 == OCERZ_OP_CALL) delta -= 8;
+                else if (op2 == OCERZ_OP_POP || op2 == OCERZ_OP_RET) delta += 8;
+            }
+            uint64_t slot = cpu->gpr[OCERZ_RSP] + (uint64_t)(-delta);
+            *(uint64_t *)(uintptr_t)(slot + ocerz_guest_base) = p->ra;
+        }
     }
 }
 
@@ -12528,6 +12749,7 @@ static void block_destroy(JitBlock *b)
     free(b->oslow);
     free(b->fault_flags);
     free(b->push_fix);
+    free(b->pushelide);
     free(b->insns);
     free(b);
 }
