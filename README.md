@@ -84,25 +84,33 @@ Rosetta also runs i386 PE code through Wine WoW64. Ocerz's i386 support is repla
 
 Ratio is Ocerz time divided by Rosetta time. Lower is better.
 
-| Kernel | Static | Dynamic |
-| --- | ---: | ---: |
-| `depchain` | **0.85x** | **0.85x** |
-| `jtab` | **0.93x** | **0.91x** |
-| `memcpy` | **0.94x** | **0.96x** |
-| `brmiss` | **0.96x** | **0.96x** |
-| `vm` | **0.96x** | **0.95x** |
-| `fpvec` | **0.97x** | **0.96x** |
-| `qsort` | **0.97x** | **1.00x** |
-| `idiv` | **0.99x** | **0.99x** |
-| `str` | **0.99x** | 1.04x |
-| `icall` | **0.99x** | 1.05x |
-| `hash` | **1.00x** | **1.00x** |
-| `chase` | 1.01x | 1.02x |
-| `leafcall` | 1.15x | 1.18x |
-| `fpsse` | 1.17x | 1.20x |
-| `mixed` | 1.21x | 1.19x |
+| Kernel | Static |
+| --- | ---: |
+| `depchain` | **0.84x** |
+| `jtab` | **0.94x** |
+| `memcpy` | **0.94x** |
+| `brmiss` | **0.95x** |
+| `leafcall` | **0.95x** |
+| `fpvec` | **0.97x** |
+| `str` | **0.99x** |
+| `qsort` | **0.99x** |
+| `idiv` | **0.99x** |
+| `chase` | **1.00x** |
+| `hash` | **1.00x** |
+| `vm` | **1.00x** |
+| `icall` | 1.00x |
+| `fpsse` | 1.16x |
+| `mixed` | 1.20x |
 
-Apple M2 Max, 2026-08-25, static `REPS=11` / dynamic `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`; set `XB=tests/guest/benchbin/xbench_dyn` for the dynamic binary.
+Apple M2 Max, 2026-08-25, `REPS=11`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`.
+
+`icall`, `hash`, `chase`, and `vm` sit at parity and flip winner run to run. The two
+remaining losses are the price of bit-exact x86 NaN semantics: `mixed` runs at
+Rosetta speed with `OCERZ_NO_FPBATCH=1 OCERZ_INEXACT_NAN=1`, and Rosetta gets the
+same exactness from an Apple-private per-thread FP mode that userspace cannot
+enable (M2 advertises no FEAT_AFP and FPCR.AH/FIZ/NEP writes are ignored, yet
+Rosetta produces x86-flavored NaNs at native speed). `fpsse` is bound by
+divide/sqrt unit scheduling.
 
 These kernels never create a thread, fork, or map shared memory, so they run in plain
 memory mode throughout. A program that does any of those retires plain mode permanently
