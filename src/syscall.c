@@ -4629,12 +4629,18 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             static int msl = -1;
             static _Atomic unsigned long long msn;
             if (msl < 0) msl = getenv("OCERZ_MSGSPIN") ? 1 : 0;
-            if (msl && (++msn & 0xffff) == 0)
-                fprintf(stderr, "ocerz: MSGSPIN[%d] n=%llu cpu#%u rip=%#llx opt=%#llx sz=%#llx kr=%#llx rcvname=%#llx\n",
+            if (msl && (++msn & 0x3ff) == 0) {
+                uint32_t sid = 0, sdst = 0;
+                if ((a[1] & 0x1) && request_buf) {
+                    sid = (uint32_t)(a[4] >> 32);
+                    sdst = (uint32_t)ocerz_ld(request_buf + 8, 4);
+                }
+                fprintf(stderr, "ocerz: MSGSPIN[%d] n=%llu cpu#%u opt=%#llx kr=%#llx rcvname=%#llx rcvsz=%#llx timeout=%llu sid=%u sdst=%#x\n",
                         (int)getpid(), (unsigned long long)msn, cpu->cpu_number,
-                        (unsigned long long)cpu->rip, (unsigned long long)a[1],
-                        (unsigned long long)a[2], (unsigned long long)r47,
-                        (unsigned long long)a[5]);
+                        (unsigned long long)a[1], (unsigned long long)r47,
+                        (unsigned long long)a[5], (unsigned long long)a[6],
+                        (unsigned long long)a[7], sid, sdst);
+            }
         }
         {
             /* OCERZ_WAKELOG: trace CFRunLoopWakeUp-sized traffic (tiny
