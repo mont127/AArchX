@@ -3492,6 +3492,21 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
 
+    /* OCERZ_SYSFAIL: ENOMEM and EFAULT are the two errnos a guest almost
+     * never earns honestly - they are what a missing pointer translation or
+     * an exhausted mapping table looks like from inside the guest. */
+    {
+        static int flog = -1;
+        if (flog < 0) flog = getenv("OCERZ_SYSFAIL") ? 1 : 0;
+        if (flog && (err == ENOMEM || err == EFAULT))
+            fprintf(stderr, "ocerz: SYSFAIL[%d] num=%d(%s) err=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx\n",
+                    (int)getpid(), num,
+                    (num > 0 && num < OCERZ_BSD_MAX && bsd_table[num].name)
+                        ? bsd_table[num].name : "?", err,
+                    (unsigned long long)orig[0], (unsigned long long)orig[1],
+                    (unsigned long long)orig[2], (unsigned long long)cpu->rip);
+    }
+
     /* Robust os_unfair_lock: __ulock_wait(UL_UNFAIR_LOCK) returns EOWNERDEAD
      * when the owner thread died holding the lock.  libplatform's reaction is
      * to CRASH ("Owner in ulock is unknown - possible memory corruption").
