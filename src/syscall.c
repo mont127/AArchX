@@ -5360,7 +5360,10 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
             uint64_t a0 = cpu->gpr[OCERZ_RDI], a1 = cpu->gpr[OCERZ_RSI], a2 = cpu->gpr[OCERZ_RDX];
             uint64_t ret = ocerz_ld(cpu->gpr[OCERZ_RSP], 8), ic0 = vm->insn_count;
             uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            cpu->block_started_ns = t0;
+            cpu->block_what = num;
             rc = dispatch_bsd(vm, cpu, num);
+            cpu->block_started_ns = 0;
             uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
             if (dt > 20000000ull)
                 fprintf(stderr, "ocerz: SCSLOW num=%d dt=%llums addr=%#llx len=%#llx a2=%#llx ret=%#llx dicount=%#llx\n",
