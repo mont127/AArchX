@@ -3296,6 +3296,38 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [500] = { "getentropy",  2, 0x01, 0, NULL },
 };
 
+/* OCERZ_SYSFAIL: ENOMEM and EFAULT are the two errnos a guest almost never
+ * earns honestly - they are what a missing pointer translation or an exhausted
+ * mapping table looks like from inside the guest.  Level 2 widens it to every
+ * failure except the errnos a healthy program earns constantly. */
+static void ocerz_sysfail_note(OcerzCPU *cpu, int num, int eno, const uint64_t *orig)
+{
+    static int flog = -1;
+    if (flog < 0) {
+        const char *e = getenv("OCERZ_SYSFAIL");
+        flog = e ? atoi(e) : 0;
+        if (e && flog == 0) flog = 1;
+    }
+    if (!flog || !eno)
+        return;
+    if (num == 333)     /* __pthread_canceled: EINVAL is the kernel's "no" */
+        return;
+    int interesting = (eno == ENOMEM || eno == EFAULT) ||
+                      (flog >= 2 &&
+                       eno != EINTR && eno != EAGAIN && eno != ENOENT &&
+                       eno != EEXIST && eno != EINPROGRESS && eno != ETIMEDOUT &&
+                       eno != ENOTCONN && eno != EISDIR && eno != ESRCH);
+    if (!interesting)
+        return;
+    fprintf(stderr,
+            "ocerz: SYSFAIL[%d] num=%d(%s) errno=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx\n",
+            (int)getpid(), num,
+            (num > 0 && num < OCERZ_BSD_MAX && bsd_table[num].name)
+                ? bsd_table[num].name : "?",
+            eno, (unsigned long long)orig[0], (unsigned long long)orig[1],
+            (unsigned long long)orig[2], (unsigned long long)cpu->rip);
+}
+
 static void strace_bsd(OcerzVM *vm, const ocerz_bsd_entry *e, int num,
                        const uint64_t orig[8], OcerzCPU *cpu)
 {
@@ -3420,6 +3452,12 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
             OCERZ_FATAL("not yet supported: class=2 num=%d name=%s\n", num, e->name);
             return OCERZ_STEP_FATAL;
         }
+        /* Intercepted syscalls never reach the passthrough's SYSFAIL check, so
+         * the errors ocerz synthesises itself - notably every hand-made ENOMEM
+         * in sys_mmap - were the only failures invisible to it.  Read the
+         * result back off the guest, where ret_err() just put it. */
+        if (r == OCERZ_STEP_OK && (cpu->rflags & OCERZ_CF))
+            ocerz_sysfail_note(cpu, num, (int)cpu->gpr[OCERZ_RAX], orig);
         strace_bsd(vm, e, num, orig, cpu);
         return r;
     }
@@ -3495,32 +3533,9 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     /* OCERZ_SYSFAIL: ENOMEM and EFAULT are the two errnos a guest almost
      * never earns honestly - they are what a missing pointer translation or
      * an exhausted mapping table looks like from inside the guest. */
-    {
-        static int flog = -1;
-        if (flog < 0) {
-            const char *e = getenv("OCERZ_SYSFAIL");
-            flog = e ? atoi(e) : 0;
-            if (e && flog == 0) flog = 1;
-        }
-        /* `err` is the carry flag, not an errno: the kernel returns the errno
-         * in x0 alongside CS.  Comparing it against ENOMEM/EFAULT silently
-         * matches nothing. */
-        int eno = err ? (int)r : 0;
-        /* level 2: every failure except the errnos a healthy program earns
-         * constantly (path probing, non-blocking I/O, interrupted waits) */
-        int interesting = (eno == ENOMEM || eno == EFAULT) ||
-                          (flog >= 2 && eno &&
-                           eno != EINTR && eno != EAGAIN && eno != ENOENT &&
-                           eno != EEXIST && eno != EINPROGRESS && eno != ETIMEDOUT &&
-                           eno != ENOTCONN && eno != EISDIR && eno != ESRCH);
-        if (flog && interesting)
-            fprintf(stderr, "ocerz: SYSFAIL[%d] num=%d(%s) errno=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx\n",
-                    (int)getpid(), num,
-                    (num > 0 && num < OCERZ_BSD_MAX && bsd_table[num].name)
-                        ? bsd_table[num].name : "?", eno,
-                    (unsigned long long)orig[0], (unsigned long long)orig[1],
-                    (unsigned long long)orig[2], (unsigned long long)cpu->rip);
-    }
+    /* `err` is the carry flag, not an errno: the kernel returns the errno in
+     * x0 alongside CS. */
+    ocerz_sysfail_note(cpu, num, err ? (int)r : 0, orig);
 
     /* Robust os_unfair_lock: __ulock_wait(UL_UNFAIR_LOCK) returns EOWNERDEAD
      * when the owner thread died holding the lock.  libplatform's reaction is
