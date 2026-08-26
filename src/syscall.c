@@ -3382,10 +3382,13 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
 
     if ((num == 515 || num == 516 || num == 544) && getenv("OCERZ_ULOCKLOG")) {
         uint64_t myport = cpu->gs_base ? ocerz_ld(cpu->gs_base + 0x18, 4) : 0;
-        fprintf(stderr, "ocerz: ULOCK[%d] cpu#%u %s op=%#llx addr=%#llx val=%#llx myport=%#llx caller=%#llx\n",
+        extern mach_port_t mach_thread_self(void);
+        mach_port_t hs = mach_thread_self();
+        fprintf(stderr, "ocerz: ULOCK[%d] cpu#%u %s op=%#llx addr=%#llx val=%#llx gs18=%#llx hostself=%#x %s caller=%#llx\n",
                 (int)getpid(), cpu->cpu_number, e->name,
                 (unsigned long long)orig[0], (unsigned long long)orig[1],
-                (unsigned long long)orig[2], (unsigned long long)myport,
+                (unsigned long long)orig[2], (unsigned long long)myport, hs,
+                (myport == (uint64_t)hs) ? "MATCH" : "MISMATCH",
                 (unsigned long long)cpu->rip);
     }
 
@@ -3436,16 +3439,56 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     uint64_t t0blk = cpu->block_since_ns;
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
+
+    /* Robust os_unfair_lock: __ulock_wait(UL_UNFAIR_LOCK) returns EOWNERDEAD
+     * when the owner thread died holding the lock.  libplatform's reaction is
+     * to CRASH ("Owner in ulock is unknown - possible memory corruption").
+     * A guest thread that grabbed a libsystem lock uncontended and was then
+     * torn down (thread churn, GPU-subprocess death) orphans the lock; the
+     * next waiter then takes the whole process down.  Instead break the
+     * orphaned lock the way PTHREAD_MUTEX_ROBUST does: clear the dead owner
+     * from the lock word so the waiter re-CASes and acquires it, and hand
+     * back EINTR so it re-loops.  The owner is provably dead (the kernel
+     * could not resolve its port), so this steals nothing live.  a[1] is the
+     * already-translated host lock address; orig[2]/a[2] the value waited on.
+     * ULF_NO_ERRNO returns -errno directly with err==0. */
     {
-        /* OCERZ_ULOCKLOG: any ulock_wait/wake error besides the routine ones */
+        static int robust = -1;
+        if (robust < 0) robust = getenv("OCERZ_NO_ROBUST_ULOCK") ? 0 : 1;
+        int is_wait = (num == 515 || num == 544);
+        int unfair = (orig[0] & 0xff) == 2;   /* UL_UNFAIR_LOCK */
+        int ownerdead = err == 105 || (err == 0 && (int64_t)r == -105);
+        if (robust && is_wait && unfair && ownerdead && a[1]) {
+            uint32_t *w = (uint32_t *)(uintptr_t)a[1];
+            uint32_t expect = (uint32_t)orig[2], zero = 0;
+            __atomic_compare_exchange_n(w, &expect, zero, 0,
+                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+            static int rlog = -1;
+            if (rlog < 0) rlog = getenv("OCERZ_ULOCKLOG") ? 1 : 0;
+            if (rlog)
+                fprintf(stderr, "ocerz: ROBUST-ULOCK[%d] broke dead-owner lock addr=%#llx owner=%#llx\n",
+                        (int)getpid(), (unsigned long long)orig[1], (unsigned long long)orig[2]);
+            err = 0;
+            r = (uint64_t)(int64_t)-4;   /* -EINTR passthrough: waiter re-loops */
+        }
+    }
+    {
+        /* OCERZ_ULOCKLOG: ulock_wait/wake results - r can carry -errno directly
+         * under ULF_NO_ERRNO (host returns it with no carry, so err==0) */
         static int ulog = -1;
         if (ulog < 0) ulog = getenv("OCERZ_ULOCKLOG") ? 1 : 0;
-        if (ulog && (num == 515 || num == 516 || num == 544) && err &&
-            err != 4 /*EINTR*/ && err != 60 /*ETIMEDOUT*/)
-            fprintf(stderr, "ocerz: ULOCK[%d] num=%d op=%#llx addr=%#llx val=%#llx err=%d rip=%#llx\n",
-                    (int)getpid(), num, (unsigned long long)a[0],
-                    (unsigned long long)a[1], (unsigned long long)a[2], err,
-                    (unsigned long long)cpu->rip);
+        if (ulog && (num == 515 || num == 544)) {
+            int64_t sr = (int64_t)r;
+            int neg = sr < 0 && sr > -4096;   /* -errno passthrough */
+            if (err || neg) {
+                extern mach_port_t mach_thread_self(void);
+                mach_port_t self = mach_thread_self();
+                fprintf(stderr, "ocerz: ULOCKW[%d] num=%d op=%#llx addr=%#llx owner=%#llx r=%lld err=%d hostself=%#x rip=%#llx\n",
+                        (int)getpid(), num, (unsigned long long)orig[0],
+                        (unsigned long long)orig[1], (unsigned long long)orig[2],
+                        (long long)sr, err, self, (unsigned long long)cpu->rip);
+            }
+        }
     }
     {
         static const char *olog = (const char *)-1;
