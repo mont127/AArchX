@@ -1,0 +1,6 @@
+parent setlk ok
+child sees wrlck
+range ok
+child conflict ALLOWED
+child exit 0
+done
