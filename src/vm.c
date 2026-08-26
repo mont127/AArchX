@@ -2140,15 +2140,34 @@ static void *ocerz_unstick_thread(void *arg)
             }
             uint64_t bs = g_cpus[i]->block_started_ns;
             static uint64_t warned[OCERZ_MAX_CPUS];
-            if (bs && now - bs > 5000000000ull && warned[i] != bs) {
+            /* `now` is sampled before the scan, so a cpu that enters a
+             * syscall mid-scan has bs > now: unsigned wrap made every such
+             * thread look blocked for 2^64ns. */
+            if (bs && now > bs && now - bs > 5000000000ull && warned[i] != bs) {
                 warned[i] = bs;
-                fprintf(stderr, "ocerz: BLOCKED[%d] cpu#%u trap=%d for %llus rip=%#llx a0=%#llx a1=%#llx a2=%#llx\n",
+                fprintf(stderr, "ocerz: BLOCKED[%d] cpu#%u trap=%d for %llus rip=%#llx a0=%#llx a1=%#llx a2=%#llx",
                         (int)getpid(), g_cpus[i]->cpu_number, g_cpus[i]->block_what,
                         (unsigned long long)((now - bs) / 1000000000ull),
                         (unsigned long long)g_cpus[i]->rip,
                         (unsigned long long)g_cpus[i]->gpr[OCERZ_RDI],
                         (unsigned long long)g_cpus[i]->gpr[OCERZ_RSI],
                         (unsigned long long)g_cpus[i]->gpr[OCERZ_RDX]);
+                /* Guest caller chain.  rbp is only a frame pointer by
+                 * convention, so every link is untrusted: require 8-byte
+                 * alignment and READABLE (committed alone is true for the
+                 * PROT_NONE identity reservations, where a load is a SIGBUS
+                 * this thread cannot attribute - it has no cpu). */
+                if (getenv("OCERZ_BLOCKBT")) {
+                    uint64_t sp = g_cpus[i]->gpr[OCERZ_RSP], fp = g_cpus[i]->gpr[5];
+                    if (sp && !(sp & 7) && ocerz_addr_readable(sp))
+                        fprintf(stderr, " bt=%#llx", (unsigned long long)ocerz_ld(sp, 8));
+                    for (int fj = 0; fj < 8 && fp && !(fp & 7) &&
+                                     ocerz_addr_readable(fp) && ocerz_addr_readable(fp + 8); fj++) {
+                        fprintf(stderr, ",%#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+                        fp = ocerz_ld(fp, 8);
+                    }
+                }
+                fputc('\n', stderr);
             }
         }
         {   /* OCERZ_BTRACE freeze latch: a cpu that has entered NO guest block

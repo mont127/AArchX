@@ -5345,11 +5345,13 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
             cpu->block_started_ns = 0;
             uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
             if (dt > 3000000000ull)
-                fprintf(stderr, "ocerz: MACHSLOW[%d] cpu#%u trap=%d dt=%llus rip=%#llx a0=%#llx a1=%#llx\n",
+                fprintf(stderr, "ocerz: MACHSLOW[%d] cpu#%u trap=%d dt=%llus rip=%#llx a0=%#llx a1=%#llx rcvname=%#llx kr=%#llx\n",
                         (int)getpid(), cpu->cpu_number, num,
                         (unsigned long long)(dt / 1000000000ull),
                         (unsigned long long)rip0,
-                        (unsigned long long)a0, (unsigned long long)a1);
+                        (unsigned long long)a0, (unsigned long long)a1,
+                        (unsigned long long)(cpu->gpr[OCERZ_R9] >> 32),
+                        (unsigned long long)cpu->gpr[OCERZ_RAX]);
         } else {
             rc = dispatch_mach(vm, cpu, num);
         }
