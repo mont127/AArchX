@@ -3497,12 +3497,27 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
      * an exhausted mapping table looks like from inside the guest. */
     {
         static int flog = -1;
-        if (flog < 0) flog = getenv("OCERZ_SYSFAIL") ? 1 : 0;
-        if (flog && (err == ENOMEM || err == EFAULT))
-            fprintf(stderr, "ocerz: SYSFAIL[%d] num=%d(%s) err=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx\n",
+        if (flog < 0) {
+            const char *e = getenv("OCERZ_SYSFAIL");
+            flog = e ? atoi(e) : 0;
+            if (e && flog == 0) flog = 1;
+        }
+        /* `err` is the carry flag, not an errno: the kernel returns the errno
+         * in x0 alongside CS.  Comparing it against ENOMEM/EFAULT silently
+         * matches nothing. */
+        int eno = err ? (int)r : 0;
+        /* level 2: every failure except the errnos a healthy program earns
+         * constantly (path probing, non-blocking I/O, interrupted waits) */
+        int interesting = (eno == ENOMEM || eno == EFAULT) ||
+                          (flog >= 2 && eno &&
+                           eno != EINTR && eno != EAGAIN && eno != ENOENT &&
+                           eno != EEXIST && eno != EINPROGRESS && eno != ETIMEDOUT &&
+                           eno != ENOTCONN && eno != EISDIR && eno != ESRCH);
+        if (flog && interesting)
+            fprintf(stderr, "ocerz: SYSFAIL[%d] num=%d(%s) errno=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx\n",
                     (int)getpid(), num,
                     (num > 0 && num < OCERZ_BSD_MAX && bsd_table[num].name)
-                        ? bsd_table[num].name : "?", err,
+                        ? bsd_table[num].name : "?", eno,
                     (unsigned long long)orig[0], (unsigned long long)orig[1],
                     (unsigned long long)orig[2], (unsigned long long)cpu->rip);
     }
@@ -3524,7 +3539,9 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (robust < 0) robust = getenv("OCERZ_NO_ROBUST_ULOCK") ? 0 : 1;
         int is_wait = (num == 515 || num == 544);
         int unfair = (orig[0] & 0xff) == 2;   /* UL_UNFAIR_LOCK */
-        int ownerdead = err == 105 || (err == 0 && (int64_t)r == -105);
+        /* EOWNERDEAD arrives either as carry + errno in x0, or, under
+         * ULF_NO_ERRNO, as a negative return with carry clear. */
+        int ownerdead = (err && (int)r == 105) || (err == 0 && (int64_t)r == -105);
         if (robust && is_wait && unfair && ownerdead && a[1]) {
             uint32_t *w = (uint32_t *)(uintptr_t)a[1];
             uint32_t expect = (uint32_t)orig[2], zero = 0;
