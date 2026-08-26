@@ -11018,8 +11018,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     if (ocerz_exc_trap_rip && rip == ocerz_exc_trap_rip)
         return NULL;                 /* OCERZ_EXCLOG: keep the throw site interpreted */
 
-    if (churn_blacklisted(rip))
+    if (churn_blacklisted(rip)) {
+        static _Atomic unsigned long long refn;
+        static int clog = -1;
+        if (clog < 0) clog = getenv("OCERZ_CHURNLOG") ? 1 : 0;
+        if (clog && (++refn & 0xfff) == 0)
+            fprintf(stderr, "ocerz: CHURNREF[%d] n=%llu rip=%#llx\n", (int)getpid(),
+                    (unsigned long long)refn, (unsigned long long)rip);
         return NULL;                 /* invalidation-storm region: interpret */
+    }
 
     {   /* OCERZ_INTERP_RIP=a[,b,...]: never compile a block starting at these
          * guest addresses - they fall back to the interpreter, where
@@ -13283,17 +13290,35 @@ static void invmap_check_reject(const OcerzJit *jit, uint64_t addr, uint64_t len
 /* 64KB regions whose translations keep getting invalidated (a browser JS
  * engine W^X-flipping its code space): after a few hits the region runs
  * interpreted - fresh decode every entry, nothing cached, nothing to
- * invalidate - and the flip storm stops touching the JIT entirely. */
+ * invalidate - and the flip storm stops touching the JIT entirely.
+ * The sentence is not permanent: module-load fixups (relocations, import
+ * patches) also retire blocks a few times and then never again, and a
+ * permanent blacklist left the hottest DLL code interpreting forever.  A
+ * region quiet for CHURN_QUIET_NS is re-probed; one further retire
+ * re-blacklists it immediately. */
 #define CHURN_SLOTS 4096
 #define CHURN_LIMIT 3
-static struct { uint64_t page; uint32_t hits; } g_churn[CHURN_SLOTS];
+#define CHURN_QUIET_NS 1500000000ull
+static struct { uint64_t page; uint32_t hits; uint64_t last_ns; } g_churn[CHURN_SLOTS];
 static void churn_bump(uint64_t rip)
 {
     uint64_t page = rip >> 16;
     unsigned i = (unsigned)(page * 0x9E3779B97F4A7C15ull >> 52) & (CHURN_SLOTS - 1);
     for (unsigned n = 0; n < 8; n++, i = (i + 1) & (CHURN_SLOTS - 1)) {
-        if (g_churn[i].page == page) { g_churn[i].hits++; return; }
-        if (g_churn[i].page == 0) { g_churn[i].page = page; g_churn[i].hits = 1; return; }
+        if (g_churn[i].page == page) {
+            g_churn[i].hits++;
+            g_churn[i].last_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (g_churn[i].hits == CHURN_LIMIT && getenv("OCERZ_CHURNLOG"))
+                fprintf(stderr, "ocerz: CHURN[%d] blacklist page=%#llx\n",
+                        (int)getpid(), (unsigned long long)(page << 16));
+            return;
+        }
+        if (g_churn[i].page == 0) {
+            g_churn[i].page = page;
+            g_churn[i].hits = 1;
+            g_churn[i].last_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            return;
+        }
     }
 }
 static int churn_blacklisted(uint64_t rip)
@@ -13301,7 +13326,20 @@ static int churn_blacklisted(uint64_t rip)
     uint64_t page = rip >> 16;
     unsigned i = (unsigned)(page * 0x9E3779B97F4A7C15ull >> 52) & (CHURN_SLOTS - 1);
     for (unsigned n = 0; n < 8; n++, i = (i + 1) & (CHURN_SLOTS - 1)) {
-        if (g_churn[i].page == page) return g_churn[i].hits >= CHURN_LIMIT;
+        if (g_churn[i].page == page) {
+            if (g_churn[i].hits < CHURN_LIMIT)
+                return 0;
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (now - g_churn[i].last_ns > CHURN_QUIET_NS) {
+                g_churn[i].hits = CHURN_LIMIT - 1;
+                g_churn[i].last_ns = now;
+                if (getenv("OCERZ_CHURNLOG"))
+                    fprintf(stderr, "ocerz: CHURN[%d] reprieve page=%#llx\n",
+                            (int)getpid(), (unsigned long long)(page << 16));
+                return 0;
+            }
+            return 1;
+        }
         if (g_churn[i].page == 0) return 0;
     }
     return 0;
