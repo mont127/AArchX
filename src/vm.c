@@ -2142,9 +2142,13 @@ static void *ocerz_unstick_thread(void *arg)
             static uint64_t warned[OCERZ_MAX_CPUS];
             if (bs && now - bs > 5000000000ull && warned[i] != bs) {
                 warned[i] = bs;
-                fprintf(stderr, "ocerz: BLOCKED[%d] cpu#%u trap=%d for %llus (unstick alive)\n",
+                fprintf(stderr, "ocerz: BLOCKED[%d] cpu#%u trap=%d for %llus rip=%#llx a0=%#llx a1=%#llx a2=%#llx\n",
                         (int)getpid(), g_cpus[i]->cpu_number, g_cpus[i]->block_what,
-                        (unsigned long long)((now - bs) / 1000000000ull));
+                        (unsigned long long)((now - bs) / 1000000000ull),
+                        (unsigned long long)g_cpus[i]->rip,
+                        (unsigned long long)g_cpus[i]->gpr[OCERZ_RDI],
+                        (unsigned long long)g_cpus[i]->gpr[OCERZ_RSI],
+                        (unsigned long long)g_cpus[i]->gpr[OCERZ_RDX]);
             }
         }
         {   /* OCERZ_BTRACE freeze latch: a cpu that has entered NO guest block
