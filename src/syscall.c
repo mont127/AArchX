@@ -2513,6 +2513,38 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         fflush(stderr);
     }
 
+    /* Self-directed pthread_kill (the guest's abort()/raise(), and every
+     * Chromium CHECK/NOTREACHED): forwarding it to the host raises a REAL
+     * signal on the ocerz process, so a guest abort turns into a host
+     * SIGABRT -> macOS ReportCrash spawns and pegs a core, starving the rest
+     * of the emulation (and every other ocerz process on the box).  Under
+     * Steam's GPU-process crash loop this happened constantly and slowed
+     * startup past Steam's watchdogs.  Instead deliver the signal to the
+     * GUEST: wine has a handler installed for these (it turns the Unix signal
+     * into a Windows exception that the guest's own crash machinery handles),
+     * which is both the faithful emulation and free of host ReportCrash. */
+    {
+        static int route = -1;
+        if (route < 0) route = getenv("OCERZ_NO_GUEST_SELFKILL") ? 0 : 1;
+        mach_port_t self = mach_thread_self();
+        int is_self = (a[0] == 0 || a[0] == (uint64_t)self);
+        if (self) mach_port_deallocate(mach_task_self(), self);
+        if (route && is_self && signo > 0 && signo < OCERZ_NSIG) {
+            if (ocerz_signal_deliver(cpu, (int)signo, 0, 0, 0))
+                return OCERZ_STEP_OK;  /* rip now points at the guest handler */
+            /* no guest handler: default action.  For a terminating signal
+             * exit cleanly (128+signo) rather than host-aborting. */
+            int fatal = (signo == 4 || signo == 5 || signo == 6 || signo == 8 ||
+                         signo == 10 || signo == 11 || signo == 3 || signo == 7);
+            if (fatal) {
+                fprintf(stderr, "ocerz: guest self-signal %llu, no handler; exiting %d\n",
+                        (unsigned long long)signo, 128 + (int)signo);
+                fflush(stderr);
+                _exit(128 + (int)signo);
+            }
+        }
+    }
+
     int err = 0;
     uint64_t r = ocerz_host_syscall(328, a, NULL, &err);
     if (err)
