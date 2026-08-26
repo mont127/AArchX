@@ -298,6 +298,20 @@ static int allocation_guard_end(uint64_t data_hi, uint64_t *guard_hi)
     return 1;
 }
 
+/* OCERZ_MAPFAILLOG: which test in the fixed-mapping path refused.  A guest
+ * mmap(MAP_FIXED) that comes back ENOMEM is indistinguishable from real memory
+ * pressure inside the guest, so name the branch instead of guessing. */
+static int map_refuse(int site, uint64_t lo, uint64_t hi, int rc)
+{
+    static int lg = -1;
+    if (lg < 0) lg = getenv("OCERZ_MAPFAILLOG") ? 1 : 0;
+    if (lg)
+        fprintf(stderr, "ocerz: MAPFAIL[%d] site=%d range=[%#llx,%#llx) rc=%d\n",
+                (int)getpid(), site, (unsigned long long)lo,
+                (unsigned long long)hi, rc);
+    return rc;
+}
+
 static uint32_t owner_create_locked(const MemRegion *r, uint32_t live_slots,
                                     uint64_t guard_lo, uint64_t guard_hi)
 {
@@ -755,21 +769,21 @@ static int install_mapping_locked(MemRegion *r, uint64_t lo, uint64_t hi,
 {
     if (!r || lo < r->glo || lo >= hi || guard_hi < hi ||
         guard_hi > r->ghi)
-        return OCERZ_ENOMEM;
+        return map_refuse(3, lo, hi, OCERZ_ENOMEM);
     uint64_t nslots64 = (hi - lo) / OCERZ_GUEST_PAGE;
     if (nslots64 == 0 || nslots64 > UINT32_MAX)
-        return OCERZ_ENOMEM;
+        return map_refuse(4, lo, hi, OCERZ_ENOMEM);
     if ((!replace && !slots_are_free(r, lo, guard_hi)) ||
         (replace && guard_hi > hi && !slots_are_free(r, hi, guard_hi)))
-        return OCERZ_ENOMEM;
+        return map_refuse(5, lo, hi, OCERZ_ENOMEM);
     if (!shared_replacement_allowed_locked(r, lo, hi))
-        return OCERZ_EUNSUP;
+        return map_refuse(6, lo, hi, OCERZ_EUNSUP);
 
     uint32_t *old_states = NULL;
     if (replace) {
         old_states = (uint32_t *)malloc((size_t)nslots64 * sizeof(*old_states));
         if (!old_states)
-            return OCERZ_ENOMEM;
+            return map_refuse(7, lo, hi, OCERZ_ENOMEM);
         for (uint64_t slot = 0; slot < nslots64; slot++)
             old_states[slot] = slot_load(
                 r, slot_index(r, lo + slot * OCERZ_GUEST_PAGE));
@@ -778,14 +792,14 @@ static int install_mapping_locked(MemRegion *r, uint64_t lo, uint64_t hi,
     uint32_t owner = owner_create_locked(r, (uint32_t)nslots64, hi, guard_hi);
     if (!owner) {
         free(old_states);
-        return OCERZ_ENOMEM;
+        return map_refuse(8, lo, hi, OCERZ_ENOMEM);
     }
 
     int rc = detach_replaced_shared_pages_locked(r, lo, hi);
     if (rc != OCERZ_OK) {
         owner_cancel_locked(owner);
         free(old_states);
-        return rc;
+        return map_refuse(9, lo, hi, rc);
     }
 
     int prepare_prot = host_prot(prot);
@@ -800,7 +814,7 @@ static int install_mapping_locked(MemRegion *r, uint64_t lo, uint64_t hi,
         owner_cancel_locked(owner);
         (void)sync_host_range_locked(r, lo, hi);
         free(old_states);
-        return rc;
+        return map_refuse(10, lo, hi, rc);
     }
 
     uint64_t affected_lo = UINT64_MAX;
@@ -1187,10 +1201,10 @@ static int map_fixed_locked(uint64_t gaddr, uint64_t len, int prot, int zero_ove
 {
     uint64_t lo, hi;
     if (!guest_range(gaddr, len, &lo, &hi))
-        return OCERZ_ENOMEM;
+        return map_refuse(1, gaddr, gaddr + len, OCERZ_ENOMEM);
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     if (!r)
-        return OCERZ_ENOMEM;
+        return map_refuse(2, lo, hi, OCERZ_ENOMEM);
     return install_mapping_locked(r, lo, hi, hi, prot, 1,
                                   zero_overlap ? gaddr : 0,
                                   zero_overlap ? gaddr + len : 0, NULL);
