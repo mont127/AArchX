@@ -44,6 +44,26 @@
 #define OCERZ_F_PREALLOCATE 42
 #define OCERZ_F_GETPATH 50
 
+/* fcntl commands whose third argument is a guest pointer */
+static int ocerz_fcntl_ptr_cmd(int cmd)
+{
+    switch (cmd) {
+    case 7: case 8: case 9:            /* F_GETLK, F_SETLK, F_SETLKW */
+    case 66:                           /* F_GETLKPID */
+    case 90: case 91: case 92:         /* F_OFD_SETLK, F_OFD_SETLKW, F_OFD_GETLK */
+    case OCERZ_F_PREALLOCATE:
+    case 44:                           /* F_RDADVISE */
+    case 49: case 65:                  /* F_LOG2PHYS, F_LOG2PHYS_EXT */
+    case OCERZ_F_GETPATH:
+    case 102:                          /* F_GETPATH_NOFIRMLINK */
+    case 52:                           /* F_PATHPKG_CHECK */
+    case 99:                           /* F_PUNCHHOLE */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 #define OCERZ_IOV_MAX 64
 
 struct ocerz_iovec {
@@ -3039,7 +3059,7 @@ static int sys_fcntl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     (void)vm;
     int cmd = (int)a[1];
     uint64_t fa[8] = { a[0], a[1], a[2], 0, 0, 0, 0, 0 };
-    if ((cmd == OCERZ_F_GETPATH || cmd == OCERZ_F_PREALLOCATE) && a[2] != 0)
+    if (ocerz_fcntl_ptr_cmd(cmd) && a[2] != 0)
         fa[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
     forward_with_scratch(cpu, 92, fa, 0);
     return OCERZ_STEP_OK;
@@ -4635,11 +4655,23 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                     sid = (uint32_t)(a[4] >> 32);
                     sdst = (uint32_t)ocerz_ld(request_buf + 8, 4);
                 }
-                fprintf(stderr, "ocerz: MSGSPIN[%d] n=%llu cpu#%u opt=%#llx kr=%#llx rcvname=%#llx rcvsz=%#llx timeout=%llu sid=%u sdst=%#x\n",
+                if (!sdst)
+                    sdst = (uint32_t)a[3];
+                fprintf(stderr, "ocerz: MSGSPIN[%d] n=%llu cpu#%u opt=%#llx kr=%#llx rcvname=%#llx rcvsz=%#llx timeout=%llu sid=%u sdst=%#x",
                         (int)getpid(), (unsigned long long)msn, cpu->cpu_number,
                         (unsigned long long)a[1], (unsigned long long)r47,
                         (unsigned long long)a[5], (unsigned long long)a[6],
                         (unsigned long long)a[7], sid, sdst);
+                /* guest caller chain: return addr + rbp frame walk */
+                uint64_t sp = cpu->gpr[OCERZ_RSP], fp = cpu->gpr[5];
+                if (sp && ocerz_addr_committed(sp) == 1)
+                    fprintf(stderr, " bt=%#llx", (unsigned long long)ocerz_ld(sp, 8));
+                for (int fi = 0; fi < 5 && fp && ocerz_addr_committed(fp) == 1 &&
+                                 ocerz_addr_committed(fp + 8) == 1; fi++) {
+                    fprintf(stderr, ",%#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+                    fp = ocerz_ld(fp, 8);
+                }
+                fputc('\n', stderr);
             }
         }
         {
