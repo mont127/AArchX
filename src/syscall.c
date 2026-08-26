@@ -3320,12 +3320,13 @@ static void ocerz_sysfail_note(OcerzCPU *cpu, int num, int eno, const uint64_t *
     if (!interesting)
         return;
     fprintf(stderr,
-            "ocerz: SYSFAIL[%d] num=%d(%s) errno=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx\n",
+            "ocerz: SYSFAIL[%d] num=%d(%s) errno=%d a0=%#llx a1=%#llx a2=%#llx a3=%#llx rip=%#llx\n",
             (int)getpid(), num,
             (num > 0 && num < OCERZ_BSD_MAX && bsd_table[num].name)
                 ? bsd_table[num].name : "?",
             eno, (unsigned long long)orig[0], (unsigned long long)orig[1],
-            (unsigned long long)orig[2], (unsigned long long)cpu->rip);
+            (unsigned long long)orig[2], (unsigned long long)orig[3],
+            (unsigned long long)cpu->rip);
 }
 
 static void strace_bsd(OcerzVM *vm, const ocerz_bsd_entry *e, int num,
