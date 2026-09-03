@@ -138,6 +138,49 @@ static void test_partial_unmap_keeps_shared_survivors(int fd)
     CHECK(ocerz_unmap(alias, OCERZ_HOST_PAGE_SIZE) == OCERZ_OK);
 }
 
+static void test_private_replaces_only_shared_slice(OcerzVM *vm, int fd)
+{
+    uint64_t first = ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE,
+                                        PROT_READ | PROT_WRITE);
+    uint64_t alias = ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE,
+                                        PROT_READ | PROT_WRITE);
+    CHECK(first != 0);
+    CHECK(alias != 0);
+    CHECK(ocerz_map_shared_file(first, OCERZ_GUEST_PAGE_SIZE,
+                                PROT_READ | PROT_WRITE, fd, 0) == OCERZ_OK);
+    CHECK(ocerz_map_shared_file(alias, OCERZ_GUEST_PAGE_SIZE,
+                                PROT_READ | PROT_WRITE, fd, 0) == OCERZ_OK);
+
+    const uint64_t shared_value = 0x1020304050607080ull;
+    ocerz_st(first + 32, 8, shared_value);
+    CHECK(ocerz_ld(alias + 32, 8) == shared_value);
+
+    set_args(&vm->cpu, bsd(197), first, OCERZ_GUEST_PAGE_SIZE,
+             PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON,
+             (uint64_t)-1, 0);
+    CHECK(ocerz_handle_syscall(vm, &vm->cpu) == OCERZ_STEP_OK);
+    CHECK(carry(&vm->cpu) == 0);
+    CHECK(vm->cpu.gpr[OCERZ_RAX] == first);
+    CHECK(ocerz_ld(first + 32, 8) == 0);
+    CHECK(ocerz_ld(alias + 32, 8) == shared_value);
+
+    const uint64_t private_value = 0xfedcba9876543210ull;
+    ocerz_st(first + 32, 8, private_value);
+    CHECK(ocerz_ld(alias + 32, 8) == shared_value);
+    uint64_t file_value = 0;
+    CHECK(pread(fd, &file_value, sizeof file_value, 32) == sizeof file_value);
+    CHECK(file_value == shared_value);
+
+    const uint64_t alias_value = 0x8877665544332211ull;
+    ocerz_st(alias + 32, 8, alias_value);
+    CHECK(ocerz_ld(first + 32, 8) == private_value);
+    CHECK(pread(fd, &file_value, sizeof file_value, 32) == sizeof file_value);
+    CHECK(file_value == alias_value);
+
+    CHECK(ocerz_unmap(first, OCERZ_GUEST_PAGE_SIZE) == OCERZ_OK);
+    CHECK(ocerz_unmap(alias, OCERZ_GUEST_PAGE_SIZE) == OCERZ_OK);
+}
+
 static void test_readonly_copy_and_writable_rejection(OcerzVM *vm, int fd,
                                                        uint64_t base)
 {
@@ -301,6 +344,7 @@ int main(void)
 
     test_writable_4k_coherence(fd);
     test_partial_unmap_keeps_shared_survivors(fd);
+    test_private_replaces_only_shared_slice(&vm, fd);
     test_readonly_copy_and_writable_rejection(&vm, fd, lo + 0x10000);
     test_readonly_subpage_allows_private_sibling(&vm, fd, lo + 0x20000);
     test_shared_anon_stays_shared(&vm, lo + 0x30000);

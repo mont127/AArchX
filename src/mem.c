@@ -700,14 +700,19 @@ static int shared_replacement_allowed_locked(const MemRegion *r,
             continue;
         if (lo <= page && hi >= page + OCERZ_HOST_PAGE)
             continue;
-        if (!(shared & MEM_SHARED_PADDED))
-            return 0;
         uint64_t first = lo > page ? lo : page;
         uint64_t end = hi < page + OCERZ_HOST_PAGE
                      ? hi : page + OCERZ_HOST_PAGE;
+        uint8_t replaced = 0;
         for (uint64_t p = first; p < end; p += OCERZ_GUEST_PAGE)
-            if (shared & shared_slot_bit(p))
+            replaced |= shared_slot_bit(p);
+        if (shared & MEM_SHARED_PADDED) {
+            if (shared & replaced)
                 return 0;
+            continue;
+        }
+        if ((shared & MEM_SHARED_SLOT_MASK & (uint8_t)~replaced) != 0)
+            return 0;
     }
     return 1;
 }
@@ -859,7 +864,7 @@ static int install_mapping_locked(MemRegion *r, uint64_t lo, uint64_t hi,
         owner_cancel_locked(owner);
         (void)sync_host_range_locked(r, affected_lo, affected_hi);
         free(old_states);
-        return rc;
+        return map_refuse(11, lo, hi, rc);
     }
 
     if (replace) {
