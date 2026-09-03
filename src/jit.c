@@ -69,6 +69,14 @@ typedef struct JitFaultFlagRecipe {
     uint8_t producer;
 } JitFaultFlagRecipe;
 
+/* trace-inversion probe of one superblock side exit (see g_flip) */
+typedef struct JitProf {
+    uint32_t taken, ft;         /* counted in the arena by the two stubs */
+    uint32_t *ft_site;          /* the body's detour to the fall-through counter (nop once decided) */
+    uint32_t *tk_trip;          /* the taken stub's tbnz to its tagged exit (nop once decided) */
+    uint8_t windows, prev;      /* verdicts so far: decided when two in a row agree */
+} JitProf;
+
 typedef struct JitBlock {
     uint64_t key;               /* jit_key(guest rip, mode32) -- see JIT_KEY_M32 */
     JitBlockFn code;
@@ -125,8 +133,16 @@ typedef struct JitBlock {
         uint32_t cond_orig;
         uint8_t kind;
         uint8_t pin_class;
+        uint8_t side;             /* 1 + the g_side index of a superblock side exit */
+        uint8_t probing;          /* both sides of its jcc are being counted: no short-circuit yet */
+        uint64_t jcc_rip;
     } edges[8];                 /* terminator edges (<= 2) + forward-jcc side exits */
     uint8_t n_edges;
+    JitProf *prof;              /* one per g_side slot, when any side exit is probed */
+    /* blocks chained INTO this one (source block + edge), so a flip retire
+     * cuts its incoming chains without a walk of the whole live set */
+    struct { struct JitBlock *pb; uint8_t e; } *preds;
+    uint32_t n_preds, cap_preds;
 
     uint16_t entry_live;
     uint16_t xmm_pinned;      /* xmmN held in V(16+N) for the block's body */
@@ -331,8 +347,51 @@ static uint32_t *g_stop_patch;
  * stub recorded here and emitted after the body. */
 #define SIDE_MAX 6
 static struct { uint32_t *site; uint64_t taken; int idx; uint32_t *stub; uint32_t *patch_b;
-                int rec; uint32_t rec_ccop; int rec_src, rec_dst, rec_imm_pending; uint64_t rec_imm; } g_side[SIDE_MAX];
+                int rec; uint32_t rec_ccop; int rec_src, rec_dst, rec_imm_pending; uint64_t rec_imm;
+                uint64_t jcc_rip; int probe; uint32_t *ft_site; uint64_t ft_rip; } g_side[SIDE_MAX];
 static int g_n_side;
+
+/* ---- trace-inversion profile ----
+ * A superblock follows a forward jcc's fall-through.  When the compiler laid
+ * the rare path out inline (if (rare) {...}) the hot path is the taken edge
+ * and the loop fragments into a chain of blocks.  An undecided branch is
+ * probed: both sides count in the arena (the taken side in its chain stub,
+ * the fall-through through a one-word detour to a counting stub) and the
+ * first side to reach 1 << PROBE_BIT exits comes back to C once.  A clearly
+ * hotter taken side retires the block, which retranslates following that
+ * edge with the jcc rewritten as its complement; otherwise the probes are
+ * patched to nops and the branch chains normally.  Decisions are per jcc. */
+#define FLIP_N 4096
+#define PROBE_BIT 10                   /* a side trips when its count reaches 1 << PROBE_BIT */
+#define PROBE_MAX 65536                /* probes per process */
+enum { FLIP_NONE = 0, FLIP_DECIDED_ORIG, FLIP_DECIDED_INV };
+static struct { uint64_t rip; uint8_t state; } g_flip[FLIP_N];
+static int g_churn_suppress;          /* a flip retire is not code churn */
+static int g_n_probes;
+static int flip_disabled(void)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("OCERZ_NO_FLIP") ? 1 : 0;
+    return en;
+}
+static int flip_find(uint64_t rip, int insert)
+{
+    unsigned h = (unsigned)((rip * 0x9E3779B97F4A7C15ull) >> 52) & (FLIP_N - 1);
+    for (unsigned n = 0; n < 64; n++, h = (h + 1) & (FLIP_N - 1)) {
+        if (g_flip[h].rip == rip) return (int)h;
+        if (g_flip[h].rip == 0) {
+            if (!insert) return -1;
+            g_flip[h].rip = rip; g_flip[h].state = FLIP_NONE;
+            return (int)h;
+        }
+    }
+    return -1;
+}
+static int flip_state(uint64_t rip)
+{
+    int i = flip_find(rip, 0);
+    return i < 0 ? FLIP_NONE : g_flip[i].state;
+}
 static int superblock_enabled(void)
 {
     static int en = -1;
@@ -362,7 +421,8 @@ static int jcc_flip_wanted(uint64_t jcc_rip)
     }
     for (int i = 0; i < n; i++)
         if (rips[i] == jcc_rip) return 1;
-    return 0;
+    int s = flip_state(jcc_rip);
+    return s == FLIP_DECIDED_INV;
 }
 static int superblock_back_enabled(void)      /* continue past backward jcc too (OCERZ_NO_SB_BACK disables) */
 {
@@ -1168,10 +1228,22 @@ static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth)
 }
 static uint64_t xlive_succ_live(OcerzJit *jit, uint64_t rip) { return xlive_succ_live_d(jit, rip, 0); }
 
+/* Probe this superblock side exit?  (translation runs under jit_lock) */
+static int probe_wanted(uint64_t jcc_rip, uint64_t ft_rip)
+{
+    if (flip_disabled() || g_n_probes >= PROBE_MAX) return 0;
+    if (flip_state(jcc_rip) != FLIP_NONE) return 0;
+    if (xlive_succ_live(g_xlat_jit, ft_rip) != 0) return 0;   /* an exit there would need a flag record */
+    g_n_probes++;
+    return 1;
+}
+
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
 
 #define RF_OFF ((uint32_t)offsetof(OcerzCPU, rflags))
 #define RIP_OFF ((uint32_t)offsetof(OcerzCPU, rip))
+#define SIDE_BLK_OFF ((uint32_t)offsetof(OcerzCPU, side_blk))
+#define SIDE_IDX_OFF ((uint32_t)offsetof(OcerzCPU, side_idx))
 
 #define INT_OFF ((uint32_t)offsetof(OcerzCPU, interrupt))
 #define GPR_OFF(r) ((uint32_t)((unsigned)(r) * 8))
@@ -7927,6 +7999,27 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
 }
 
 static uint32_t *emit_chain_tail(A64Buf *b, int poll);
+
+/* The side exit whose chain stub is being emitted: its C fallback stores the
+ * block and side index so ocerz_jit_step can count the exit. */
+static JitBlock *g_tag_blk;
+static int g_tag_idx;
+#define A64_NOP 0xd503201fu
+static void emit_prof_count(A64Buf *b, JitProf *pf, uint32_t off)
+{
+    a64_mov_imm64(b, JT1, (uint64_t)(uintptr_t)pf);
+    a64_ldr(b, 4, JT2, JT1, off);
+    a64_add_imm(b, 0, JT2, JT2, 1);
+    a64_str(b, 4, JT2, JT1, off);
+}
+static void emit_side_tag(A64Buf *b, int cpu_reg)
+{
+    if (!g_tag_blk) return;
+    a64_mov_imm64(b, JT0, (uint64_t)(uintptr_t)g_tag_blk);
+    a64_str(b, 8, JT0, cpu_reg, SIDE_BLK_OFF);
+    a64_mov_imm64(b, JT0, (uint64_t)g_tag_idx);
+    a64_str(b, 4, JT0, cpu_reg, SIDE_IDX_OFF);
+}
 static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
                                       uint32_t **epilogue_sites, int *n_epi);
 static uint32_t *emit_static_chain_tail(A64Buf *b, uint64_t target_rip,
@@ -8351,6 +8444,10 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         g_side[g_n_side].stub = NULL;
         g_side[g_n_side].patch_b = NULL;
         g_side[g_n_side].rec = rec_stub;
+        g_side[g_n_side].jcc_rip = jcc->rip;
+        g_side[g_n_side].ft_rip = jcc->rip + jcc->len;
+        g_side[g_n_side].ft_site = NULL;
+        g_side[g_n_side].probe = !need_rec && probe_wanted(jcc->rip, jcc->rip + jcc->len);
         if (rec_stub) {
             g_side[g_n_side].rec_ccop = ccop; g_side[g_n_side].rec_src = record_src; g_side[g_n_side].rec_dst = record_dst;
             g_side[g_n_side].rec_imm_pending = rec_imm_pending; g_side[g_n_side].rec_imm = rec_imm;
@@ -8364,6 +8461,10 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             else                       a64_cbnz(b, cbz_sf, cbz_rn, 0);
         } else {
             a64_bcond(b, taken_cond, 0);
+        }
+        if (g_side[g_n_side - 1].probe) {           /* fall-through probe detour (see g_flip) */
+            g_side[g_n_side - 1].ft_site = a64_label(b);
+            a64_b(b, 0);
         }
         if (rec_after) {
             if (producer->op == OCERZ_OP_CMP) {
@@ -10458,6 +10559,8 @@ typedef struct PendingChain {
     uint32_t *cond_site;
     void **ras_slot;
     uint64_t src_sig;              /* source block's hoist signature (body edges) */
+    JitBlock *src;                 /* source block + edge index (predecessor record) */
+    uint8_t edge;
     uint8_t kind;
     uint8_t pin_class;
     struct PendingChain *next;
@@ -10467,8 +10570,27 @@ typedef struct PendingChain {
 #define PEND_MASK (PEND_SIZE - 1)
 static PendingChain *g_pending[PEND_SIZE];
 
+/* Record that src's edge e is chained into target (see JitBlock.preds). */
+static void pred_add(JitBlock *target, JitBlock *src, int e)
+{
+    if (!target || !src || target == src) return;
+    if (target->n_preds && target->preds[target->n_preds - 1].pb == src &&
+        target->preds[target->n_preds - 1].e == e) return;
+    if (target->n_preds == target->cap_preds) {
+        uint32_t cap = target->cap_preds ? target->cap_preds * 2 : 4;
+        void *np = realloc(target->preds, cap * sizeof target->preds[0]);
+        if (!np) return;
+        target->preds = np;
+        target->cap_preds = cap;
+    }
+    target->preds[target->n_preds].pb = src;
+    target->preds[target->n_preds].e = (uint8_t)e;
+    target->n_preds++;
+}
+
 static void pending_add(uint64_t target_key, uint32_t *patch_b, uint8_t kind,
-                        uint8_t pin_class, uint32_t *cond_site, uint64_t src_sig)
+                        uint8_t pin_class, uint32_t *cond_site, uint64_t src_sig,
+                        JitBlock *src, int edge)
 {
     PendingChain *e = (PendingChain *)malloc(sizeof *e);
     if (!e)
@@ -10478,6 +10600,8 @@ static void pending_add(uint64_t target_key, uint32_t *patch_b, uint8_t kind,
     e->patch_b = patch_b;
     e->cond_site = cond_site;
     e->ras_slot = NULL;
+    e->src = src;
+    e->edge = (uint8_t)edge;
     e->src_sig = src_sig;
     e->kind = kind;
     e->pin_class = pin_class;
@@ -10515,6 +10639,8 @@ static void pending_add_ras(uint64_t target_key, void **ras_slot)
     e->patch_b = NULL;
     e->cond_site = NULL;
     e->ras_slot = ras_slot;
+    e->src = NULL;
+    e->edge = 0;
     e->kind = EDGE_XBLOCK;
     e->pin_class = 0;
     e->next = g_pending[h];
@@ -10550,10 +10676,12 @@ static void pending_drain(uint64_t key, JitBlock *target)
                     void *dst = body_entry_for(target, e->src_sig);
                     chain_activate(e->patch_b, dst);
                     chain_cond_short(e->cond_site, dst);
+                    pred_add(target, e->src, e->edge);
                 }
             } else {
                 chain_activate(e->patch_b, (void *)target->code);
                 chain_cond_short(e->cond_site, (void *)target->code);
+                pred_add(target, e->src, e->edge);
             }
             *pp = e->next;
             free(e);
@@ -10592,9 +10720,11 @@ static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
     if (g_pin_class == 2)
         a64_add_imm(b, 1, 31, 29, 0);
 
+    emit_side_tag(b, 20);
     a64_mov_imm64(b, JT0, target_rip);
     a64_str(b, 8, JT0, 20, RIP_OFF);
-    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+    /* a profiled exit must reach C: a nonzero status skips the arena dispatcher */
+    a64_mov_imm64(b, 0, g_tag_blk ? OCERZ_STEP_PROFILE : OCERZ_STEP_OK);
     epilogue_sites[*n_epi] = a64_label(b);
     a64_b(b, 0);
     (*n_epi)++;
@@ -10625,6 +10755,7 @@ static uint32_t *emit_chain_tail(A64Buf *b, int poll)
     a64_patch_b(patch_b, fallback);
     if (poll)
         a64_patch_cbz(intr, fallback);
+    emit_side_tag(b, 1);                 /* x1 = cpu here */
     a64_mov_imm64(b, 0, OCERZ_STEP_OK);
     a64_ret(b);
     return patch_b;
@@ -12070,11 +12201,19 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 g_side[g_n_side].stub = NULL;
                 g_side[g_n_side].patch_b = NULL;
                 g_side[g_n_side].rec = 0;
+                g_side[g_n_side].jcc_rip = insn->rip;
+                g_side[g_n_side].ft_rip = insn->rip + insn->len;
+                g_side[g_n_side].ft_site = NULL;
+                g_side[g_n_side].probe = probe_wanted(insn->rip, insn->rip + insn->len);
                 if (g_cc_cbz_reg >= 0) {                     /* value-cond E/NE: one cbz/cbnz */
                     if (g_cc_cbz_nz) a64_cbnz(&b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
                     else             a64_cbz(&b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
                 } else
                 a64_bcond(&b, cond, 0);                    /* patched to the OOL stub */
+                if (g_side[g_n_side].probe) {              /* fall-through probe detour (see g_flip) */
+                    g_side[g_n_side].ft_site = a64_label(&b);
+                    a64_b(&b, 0);
+                }
                 g_n_side++;
             } else {
                 assert(0 && "side exit table full");
@@ -12367,6 +12506,8 @@ promo_push_fallthrough:
     }
     /* superblock side exits: out-of-line chain stubs for the taken targets */
     int side_patch_oor = 0;
+    for (int k = 0; k < g_n_side; k++)
+        if (g_side[k].probe && !blk->prof) blk->prof = (JitProf *)calloc(SIDE_MAX, sizeof(JitProf));
     for (int k = 0; k < g_n_side; k++) {
         uint32_t *stub = a64_label(&b);
         uint32_t w = *g_side[k].site;
@@ -12386,7 +12527,30 @@ promo_push_fallthrough:
             if (g_side[k].rec_imm_pending) a64_mov_imm64(&b, JT1, g_side[k].rec_imm);
             emit_defer_flags(&b, g_side[k].rec_ccop, g_side[k].rec_src, g_side[k].rec_dst);
         }
-        g_side[k].patch_b = emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);
+        if (g_side[k].probe && blk->prof) {
+            JitProf *pf = &blk->prof[k];
+            /* taken side: count; at the threshold trip through a tagged copy of the exit */
+            emit_prof_count(&b, pf, 0);
+            pf->tk_trip = a64_label(&b);
+            a64_tbnz(&b, JT2, PROBE_BIT, 0);
+            g_side[k].patch_b = emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);
+            a64_patch_tbz(pf->tk_trip, a64_label(&b));
+            g_tag_blk = blk; g_tag_idx = k;
+            emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);   /* never chained */
+            /* fall-through side: count, back inline below the threshold */
+            a64_patch_b(g_side[k].ft_site, a64_label(&b));
+            emit_prof_count(&b, pf, 4);
+            a64_tbnz(&b, JT2, PROBE_BIT, 2);
+            uint32_t *back = a64_label(&b);
+            a64_b(&b, 0);
+            a64_patch_b(back, g_side[k].ft_site + 1);
+            emit_static_chain_tail(&b, g_side[k].ft_rip, 0, body_edge, epi_sites, &n_epi);  /* never chained */
+            g_tag_blk = NULL;
+            pf->ft_site = g_side[k].ft_site;
+        } else {
+            if (g_side[k].ft_site) a64_patch_b(g_side[k].ft_site, g_side[k].ft_site + 1);
+            g_side[k].patch_b = emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);
+        }
     }
     /* FP batch replays: restore checkpoints, re-run the members exactly, return */
     for (int k = 0; k < g_n_fpb; k++) {
@@ -12631,6 +12795,9 @@ promo_push_fallthrough:
         blk->edges[e].cond_site = g_side[k].rec ? NULL : g_side[k].site;
         blk->edges[e].kind = body_edge_pin_class() >= 0 ? EDGE_BODY : EDGE_XBLOCK;
         blk->edges[e].pin_class = body_edge_pin_class() >= 0 ? (uint8_t)body_edge_pin_class() : 0;
+        blk->edges[e].side = (uint8_t)(k + 1);          /* the stub reports side index k */
+        blk->edges[e].jcc_rip = g_side[k].jcc_rip;
+        blk->edges[e].probing = (uint8_t)(g_side[k].probe && blk->prof != NULL);
     }
     for (int i = 0; i < blk->n_edges; i++) {
         blk->edges[i].fallback_insn = *blk->edges[i].patch_b;
@@ -12659,9 +12826,11 @@ promo_push_fallthrough:
                     blk->code_words - epi, (int)blk->pin_class, (int)blk->n_pinned,
                     blk->body_code != NULL);
             for (int e = 0; e < blk->n_edges; e++)
-                fprintf(g_jf, "  EDGE -> %#llx kind=%d pin_class=%d\n",
+                fprintf(g_jf, "  EDGE -> %#llx kind=%d pin_class=%d side=%d pb=+%ld cs=+%ld\n",
                         (unsigned long long)blk->edges[e].target_rip,
-                        (int)blk->edges[e].kind, (int)blk->edges[e].pin_class);
+                        (int)blk->edges[e].kind, (int)blk->edges[e].pin_class, (int)blk->edges[e].side,
+                        blk->edges[e].patch_b ? (long)(blk->edges[e].patch_b - entry) : -1L,
+                        blk->edges[e].cond_site ? (long)(blk->edges[e].cond_site - entry) : -1L);
             for (int i = 0; i < n; i++) {
                 uint32_t s = blk->insn_off[i];
                 uint32_t e = (i + 1 < n) ? blk->insn_off[i + 1] : epi;
@@ -12671,6 +12840,9 @@ promo_push_fallthrough:
                 for (uint32_t w = s; w < e; w++)
                     fprintf(g_jf, "    %08x\n", entry[w]);
             }
+            fprintf(g_jf, "  EPI off=%u words=%u\n", epi, blk->code_words - epi);
+            for (uint32_t w = epi; w < blk->code_words; w++)
+                fprintf(g_jf, "    %08x\n", entry[w]);
             fflush(g_jf);
         }
     }
@@ -12729,6 +12901,7 @@ promo_push_fallthrough:
     if (!g_no_chain) {
         chain_batch_begin();
         for (int i = 0; i < blk->n_edges; i++) {
+            uint32_t *cs = blk->edges[i].probing ? NULL : blk->edges[i].cond_site;
             JitBlock *t = cache_lookup(jit, blk->edges[i].target_rip, blk_mode32(blk));
             if (t && t->code) {
                 void *dst = (void *)t->code;
@@ -12743,12 +12916,13 @@ promo_push_fallthrough:
                 }
                 if (dst) {
                     chain_activate(blk->edges[i].patch_b, dst);
-                    chain_cond_short(blk->edges[i].cond_site, dst);
+                    chain_cond_short(cs, dst);
+                    pred_add(t, blk, i);
                 }
             } else {
                 pending_add(jit_key(blk->edges[i].target_rip, blk_mode32(blk)),
                             blk->edges[i].patch_b, blk->edges[i].kind,
-                            blk->edges[i].pin_class, blk->edges[i].cond_site, blk->hoist_sig);
+                            blk->edges[i].pin_class, cs, blk->hoist_sig, blk, i);
             }
         }
         pending_drain(blk->key, blk);
@@ -13216,6 +13390,8 @@ static void block_destroy(JitBlock *b)
     free(b->push_fix);
     free(b->pushelide);
     free(b->insns);
+    free(b->prof);
+    free(b->preds);
     free(b);
 }
 
@@ -13456,6 +13632,7 @@ static void invmap_check_reject(const OcerzJit *jit, uint64_t addr, uint64_t len
 static struct { uint64_t page; uint32_t hits; uint64_t last_ns; } g_churn[CHURN_SLOTS];
 static void churn_bump(uint64_t rip)
 {
+    if (g_churn_suppress) return;
     uint64_t page = rip >> 16;
     unsigned i = (unsigned)(page * 0x9E3779B97F4A7C15ull >> 52) & (CHURN_SLOTS - 1);
     for (unsigned n = 0; n < 8; n++, i = (i + 1) & (CHURN_SLOTS - 1)) {
@@ -13953,6 +14130,219 @@ static void steplog(const OcerzCPU *cpu)
     for (int i = 0; i < 16; i++) fprintf(stderr, " %llx", (unsigned long long)cpu->gpr[i]);
     fprintf(stderr, "\n");
 }
+/* Chain one edge of a block now (the target may or may not exist yet). */
+static void chain_edge_now(OcerzJit *jit, JitBlock *blk, int e)
+{
+    JitBlock *t = cache_lookup(jit, blk->edges[e].target_rip, blk_mode32(blk));
+    if (t && t->code) {
+        void *dst = (void *)t->code;
+        if (blk->edges[e].kind == EDGE_BODY) {
+            int compatible = blk->edges[e].pin_class
+                ? t->pin_class == blk->edges[e].pin_class
+                : (t->pin_class == 0 && t->n_pinned == 0);
+            dst = (compatible && t->body_code) ? body_entry_for(t, blk->hoist_sig) : NULL;
+        }
+        if (dst) {
+            chain_activate(blk->edges[e].patch_b, dst);
+            chain_cond_short(blk->edges[e].cond_site, dst);
+            pred_add(t, blk, e);
+            return;
+        }
+    }
+    pending_add(jit_key(blk->edges[e].target_rip, blk_mode32(blk)),
+                blk->edges[e].patch_b, blk->edges[e].kind,
+                blk->edges[e].pin_class, blk->edges[e].cond_site, blk->hoist_sig, blk, e);
+}
+
+/* Retire exactly one block so it retranslates (a flip): the precise path,
+ * not the range invalidator, whose 64 KB granule would take neighbours too. */
+static uint64_t g_flip_ns_retire, g_flip_ns_hit, g_flip_n_retire, g_flip_n_hit;
+static OcerzJit *g_flip_atexit_jit;
+static void flip_report_atexit(void)
+{
+    fprintf(stderr, "ocerz: FLIPSTAT[%d] trips=%llu hit_ms=%.1f retires=%llu retire_ms=%.1f translated=%llu live=%zu probes=%d\n",
+            (int)getpid(), (unsigned long long)g_flip_n_hit, g_flip_ns_hit / 1e6,
+            (unsigned long long)g_flip_n_retire, g_flip_ns_retire / 1e6,
+            (unsigned long long)(g_flip_atexit_jit ? g_flip_atexit_jit->blocks_translated : 0),
+            g_flip_atexit_jit ? g_flip_atexit_jit->n_live : (size_t)0, g_n_probes);
+}
+/* Retire one block whose code stays valid (the arena is never reused): cut
+ * only what points INTO it - incoming chains, return-address cells and the
+ * indirect-branch caches - instead of the range invalidator's wholesale
+ * purge, which would cost every call site its prediction on each flip. */
+static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
+{
+    const uint32_t *lo = (const uint32_t *)blk->code, *hi = lo + blk->code_words;
+#define IN_BLK(p) ((const uint32_t *)(p) >= lo && (const uint32_t *)(p) < hi)
+    size_t idx = jit->n_live;
+    for (size_t k = 0; k < jit->n_live; k++)
+        if (jit->live[k] == blk) { idx = k; break; }
+    if (idx == jit->n_live) return;                    /* already retired */
+    pthread_jit_write_protect_np(0);
+    /* a thread still inside it must leave through its stop sites */
+    if (blk->stop_patch && blk->stop_insn && *blk->stop_patch != blk->stop_insn) {
+        __atomic_store_n(blk->stop_patch, blk->stop_insn, __ATOMIC_RELEASE);
+        sys_icache_invalidate(blk->stop_patch, 4);
+    }
+    for (int i = 0; i < blk->n_stop_extra; i++)
+        if (*blk->stop_extra[i].site != blk->stop_extra[i].insn) {
+            __atomic_store_n(blk->stop_extra[i].site, blk->stop_extra[i].insn, __ATOMIC_RELEASE);
+            sys_icache_invalidate(blk->stop_extra[i].site, 4);
+        }
+    for (int i = 0; i < blk->n_edges; i++) {
+        uint32_t *cs = blk->edges[i].cond_site;
+        int is_stop = blk->edges[i].patch_b == blk->stop_patch;
+        for (int q = 0; q < blk->n_stop_extra && !is_stop; q++)
+            is_stop = blk->edges[i].patch_b == blk->stop_extra[q].site;
+        if (cs && blk->edges[i].cond_orig && *cs != blk->edges[i].cond_orig && is_stop) {
+            __atomic_store_n(cs, blk->edges[i].cond_orig, __ATOMIC_RELEASE);
+            sys_icache_invalidate(cs, 4);
+        }
+    }
+    /* incoming chains from the survivors: cut, and queued so the block's
+     * replacement picks them up again (an edge left on its fallback would
+     * pay a trip through C for the rest of the process) */
+    for (uint32_t q = 0; q < blk->n_preds; q++) {
+        JitBlock *sblk = blk->preds[q].pb;
+        int i = blk->preds[q].e;
+        if (sblk == blk || i >= sblk->n_edges) continue;
+        {
+            uint32_t *at = sblk->edges[i].patch_b;
+            uint32_t fallback = sblk->edges[i].fallback_insn;
+            int cut = 0;
+            if (at && fallback && *at != fallback && IN_BLK(branch_word_target(at, *at))) {
+                __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
+                sys_icache_invalidate(at, 4);
+                cut = 1;
+            }
+            uint32_t *cs = sblk->edges[i].cond_site;
+            if (cs && sblk->edges[i].cond_orig && *cs != sblk->edges[i].cond_orig &&
+                IN_BLK(branch_word_target(cs, *cs))) {
+                __atomic_store_n(cs, sblk->edges[i].cond_orig, __ATOMIC_RELEASE);
+                sys_icache_invalidate(cs, 4);
+                cut = 1;
+            }
+            if (cut)
+                pending_add(jit_key(sblk->edges[i].target_rip, blk_mode32(sblk)), at,
+                            sblk->edges[i].kind, sblk->edges[i].pin_class,
+                            sblk->edges[i].probing ? NULL : cs, sblk->hoist_sig, sblk, i);
+        }
+    }
+    blk->n_preds = 0;
+    for (size_t i = 0; i < g_n_ras_cells; i++)
+        if (IN_BLK(*g_ras_cells[i]))
+            __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
+    pthread_jit_write_protect_np(1);
+    /* unlink + retire */
+    unsigned h = hash_key(blk->key);
+    JitBlock **pp = &jit->buckets[h];
+    while (*pp && *pp != blk) pp = &(*pp)->hnext;
+    if (*pp == blk)
+        __atomic_store_n(pp, blk->hnext, __ATOMIC_RELEASE);
+    memmove(&jit->live[idx], &jit->live[idx + 1], (jit->n_live - idx - 1) * sizeof jit->live[0]);
+    jit->n_live--;
+    gran_block(blk, -1);
+    blk->retired_next = jit->retired;
+    jit->retired = blk;
+    /* code-pointer caches: only the entries into this block */
+    for (unsigned i = 0; i < g_ras_slot_n; i++)
+        if (IN_BLK(g_ras_slots[i]))
+            __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
+    for (size_t i = 0; i < g_n_psc_tables; i++)
+        for (int k = 0; k < PSC_N; k++)
+            if (IN_BLK(g_psc_tables[i][k].body)) {
+                __atomic_store_n(&g_psc_tables[i][k].rip, PSC_EMPTY_RIP, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_psc_tables[i][k].body, (void *)NULL, __ATOMIC_RELEASE);
+            }
+    for (unsigned i = 0; i < g_ic_next && i < JIT_IC_SLOTS; i++)
+        if (IN_BLK(g_ic_slots[i].code)) {
+            __atomic_store_n(&g_ic_slots[i].code, NULL, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_ic_slots[i].rip, 0, __ATOMIC_RELEASE);
+        }
+#undef IN_BLK
+}
+
+static void flip_retire_block(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
+{
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    g_flip_n_retire++;
+    pthread_mutex_lock(&jit_lock);
+    int live = blk->code != NULL;
+    if (live) flip_retire_locked(jit, blk);
+    pthread_mutex_unlock(&jit_lock);
+    if (live) ocerz_vm_purge_jit_ras(vm);
+    g_flip_ns_retire += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+}
+
+/* Decide one probed side exit from its counts.  Returns 1 to invert. */
+static int flip_decide_locked(JitBlock *blk, int e, int tk, int ft, int logit)
+{
+    uint64_t jcc_rip = blk->edges[e].jcc_rip;
+    int flip = tk >= 2 * ft && tk >= (1 << (PROBE_BIT - 1));
+    int i = flip_find(jcc_rip, 1);
+    if (i < 0) flip = 0;                                  /* table full: keep the layout */
+    else if (g_flip[i].state != FLIP_NONE) flip = g_flip[i].state == FLIP_DECIDED_INV;
+    else g_flip[i].state = flip ? FLIP_DECIDED_INV : FLIP_DECIDED_ORIG;
+    if (logit)
+        fprintf(stderr, "ocerz: FLIP[%d] blk=%#llx jcc=%#llx taken=%d fall=%d -> %s\n", (int)getpid(),
+                (unsigned long long)blk_rip(blk), (unsigned long long)jcc_rip, tk, ft, flip ? "invert" : "keep");
+    blk->edges[e].probing = 0;
+    if (!flip) {
+        /* probes out: the fall-through detour and the taken trip become nops,
+         * and the branch may now short-circuit to its target */
+        JitProf *pf = &blk->prof[blk->edges[e].side - 1];
+        pthread_jit_write_protect_np(0);
+        __atomic_store_n(pf->ft_site, A64_NOP, __ATOMIC_RELEASE);
+        __atomic_store_n(pf->tk_trip, A64_NOP, __ATOMIC_RELEASE);
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(pf->ft_site, 4);
+        sys_icache_invalidate(pf->tk_trip, 4);
+    }
+    return flip;
+}
+
+/* A probed side exit tripped: one side of its jcc reached the threshold.
+ * The first window of a loop is often unlike its steady state (the setup
+ * pass takes the rare path), so a verdict counts only when the next window
+ * repeats it; the fourth window decides regardless. */
+static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
+{
+    JitBlock *blk = (JitBlock *)cpu->side_blk;
+    int k = cpu->side_idx;
+    cpu->side_blk = NULL;
+    if (!blk || !blk->prof || k < 0 || k >= SIDE_MAX) return;
+    int e = -1;
+    for (int i = 0; i < blk->n_edges; i++)
+        if (blk->edges[i].side == k + 1) { e = i; break; }
+    if (e < 0 || !blk->edges[e].probing) return;      /* decided by an earlier trip */
+    static int fliplog = -1;
+    if (fliplog < 0) {
+        fliplog = getenv("OCERZ_FLIPLOG") ? 1 : 0;
+        if (fliplog) { g_flip_atexit_jit = jit; atexit(flip_report_atexit); }
+    }
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    g_flip_n_hit++;
+    JitProf *pf = &blk->prof[k];
+    int tk = (int)pf->taken, ft = (int)pf->ft;
+    int verdict = tk >= 2 * ft && tk >= (1 << (PROBE_BIT - 1));
+    int flip = 0;
+    pthread_mutex_lock(&jit_lock);
+    if (pf->windows == 0 || (pf->prev != verdict && pf->windows < 3)) {
+        pf->prev = (uint8_t)verdict;
+        pf->windows++;
+        pf->taken = pf->ft = 0;                       /* next window */
+        pthread_mutex_unlock(&jit_lock);
+        return;
+    }
+    flip = flip_decide_locked(blk, e, tk, ft, fliplog);
+    if (!flip) chain_edge_now(jit, blk, e);
+    pthread_mutex_unlock(&jit_lock);
+    g_flip_ns_hit += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    static int noretire = -1;
+    if (noretire < 0) noretire = getenv("OCERZ_FLIP_NORETIRE") ? 1 : 0;
+    if (flip && !noretire) flip_retire_block(vm, jit, blk);
+}
+
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     /* Stage 9: i386 blocks are compiled. */
@@ -13960,6 +14350,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
         return OCERZ_EUNSUP;
     { static int sl = -1; if (sl < 0) sl = getenv("OCERZ_STEPLOG") ? 1 : 0; if (sl) steplog(cpu); }
     OcerzJit *jit = vm->jit;
+    if (cpu->side_blk) flip_side_hit(vm, jit, cpu);
     if (ocerz_jitstat < 0) {
         pthread_mutex_lock(&jit_lock);
         if (ocerz_jitstat < 0) {

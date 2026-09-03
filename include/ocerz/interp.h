@@ -10,6 +10,7 @@ enum OcerzStep {
     OCERZ_STEP_EXIT = 1,
     OCERZ_STEP_FATAL = 2,
     OCERZ_STEP_REDIRECT = 3,   /* a non-terminator changed rip (guest signal delivered): re-dispatch */
+    OCERZ_STEP_PROFILE = 4,    /* a profiled JIT side exit: came back to C to be counted, then continue */
 };
 
 struct OcerzVM;

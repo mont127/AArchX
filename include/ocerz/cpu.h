@@ -105,6 +105,10 @@ typedef struct OcerzCPU {
     uint64_t wine_teb_base;
 
     volatile int interrupt;
+    /* a probed superblock side exit that just tripped to C: the block and
+     * its side index, for the trace-inversion decision (see g_flip in jit.c) */
+    void *side_blk;
+    int side_idx;
 
     /* Segment selectors, indexed by OcerzSreg (ES,CS,SS,DS,FS,GS).  Only the
      * 32-bit guest touches these: PUSH/POP sreg and LES/LDS name a segment
