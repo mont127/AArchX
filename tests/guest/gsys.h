@@ -35,7 +35,7 @@ typedef unsigned int g_u32;
 static inline g_i64 g_syscall0(g_i64 num)
 {
     register g_i64 rax __asm__("rax") = num;
-    __asm__ volatile("syscall" : "+r"(rax) : : "rcx", "r11", "memory", "cc");
+    __asm__ volatile("syscall" : "+r"(rax) : : "rcx", "rdx", "r11", "memory", "cc");
     return rax;
 }
 
@@ -43,7 +43,7 @@ static inline g_i64 g_syscall1(g_i64 num, g_i64 a1)
 {
     register g_i64 rax __asm__("rax") = num;
     register g_i64 rdi __asm__("rdi") = a1;
-    __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi) : "rcx", "r11", "memory", "cc");
+    __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi) : "rcx", "rdx", "r11", "memory", "cc");
     return rax;
 }
 
@@ -54,8 +54,8 @@ static inline g_i64 g_syscall3(g_i64 num, g_i64 a1, g_i64 a2, g_i64 a3)
     register g_i64 rsi __asm__("rsi") = a2;
     register g_i64 rdx __asm__("rdx") = a3;
     __asm__ volatile("syscall"
-                     : "+r"(rax)
-                     : "r"(rdi), "r"(rsi), "r"(rdx)
+                     : "+r"(rax), "+r"(rdx)
+                     : "r"(rdi), "r"(rsi)
                      : "rcx", "r11", "memory", "cc");
     return rax;
 }
@@ -70,8 +70,8 @@ static inline g_i64 g_syscall6(g_i64 num, g_i64 a1, g_i64 a2, g_i64 a3, g_i64 a4
     register g_i64 r8 __asm__("r8") = a5;
     register g_i64 r9 __asm__("r9") = a6;
     __asm__ volatile("syscall"
-                     : "+r"(rax)
-                     : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9)
+                     : "+r"(rax), "+r"(rdx)
+                     : "r"(rdi), "r"(rsi), "r"(r10), "r"(r8), "r"(r9)
                      : "rcx", "r11", "memory", "cc");
     return rax;
 }
