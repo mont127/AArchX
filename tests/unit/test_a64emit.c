@@ -98,6 +98,11 @@ static void b_mul(A64Buf *b) { a64_mul(b, 1, 0, 0, 1); a64_ret(b); }
 static void b_umulh(A64Buf *b) { a64_umulh(b, 0, 0, 1); a64_ret(b); }
 static void b_smulh(A64Buf *b) { a64_smulh(b, 0, 0, 1); a64_ret(b); }
 static void b_csel(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_csel(b, 1, 0, 0, 1, A64_LT); a64_ret(b); }
+/* ccmn: with V clear (x1-x1) the compare runs, V := x0 + 1 overflows; with V
+ * set (INT64_MAX+INT64_MAX) the immediate nzcv 0001 is taken instead */
+static void b_ccmn_vc(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmn_imm(b, 1, 0, 1, 1, A64_VC); a64_cset(b, 0, A64_VS); a64_ret(b); }
+static void b_ccmn_else(A64Buf *b) { a64_adds_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmn_imm(b, 1, 0, 1, 1, A64_VC); a64_cset(b, 0, A64_VS); a64_ret(b); }
+static void b_ccmp_w(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmp_imm(b, 0, 0, 7, 0, A64_EQ); a64_cset(b, 0, A64_EQ); a64_ret(b); }
 static void b_rev64(A64Buf *b) { a64_rev(b, 1, 0, 0); a64_ret(b); }
 static void b_rev32(A64Buf *b) { a64_rev(b, 0, 0, 0); a64_ret(b); }
 static void b_cset(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_EQ); a64_ret(b); }
@@ -447,6 +452,12 @@ int main(void)
     CHECK(run2(b_umulh, 0xffffffffffffffffull, 2) == 1, "umulh");
     CHECK(run2(b_smulh, (uint64_t)-1, 2) == (uint64_t)-1, "smulh");
     CHECK(run2(b_csel, 3, 9) == 3, "csel LT picks rn");
+    CHECK(run2(b_ccmn_vc, 0x7fffffffffffffffull, 0) == 1, "ccmn VC leg: INT64_MAX + 1 overflows");
+    CHECK(run2(b_ccmn_vc, 5, 0) == 0, "ccmn VC leg: 5 + 1 does not");
+    CHECK(run2(b_ccmn_vc, 0, 0) == 0, "ccmn VC leg: 0 + 1 does not");
+    CHECK(run2(b_ccmn_else, 5, 0x7fffffffffffffffull) == 1, "ccmn else leg: nzcv immediate forces V");
+    CHECK(run2(b_ccmp_w, 7, 0) == 1, "ccmp w: equal");
+    CHECK(run2(b_ccmp_w, 8, 0) == 0, "ccmp w: not equal");
     CHECK(run2(b_rev64, 0x0102030405060708ull, 0) == 0x0807060504030201ull, "rev64");
     CHECK(run2(b_rev32, 0x01020304ull, 0) == 0x04030201ull, "rev32 zero-extends");
     CHECK(run2(b_cset, 5, 5) == 1, "cset EQ");
