@@ -129,9 +129,13 @@ void ocerz_flags_sar(OcerzCPU *cpu, int size, uint64_t val, unsigned cnt, uint64
     put_arith(cpu, f);
 }
 
+/* MUL/IMUL define CF and OF only; SF, ZF, AF and PF are architecturally
+ * undefined, and Rosetta leaves all four clear regardless of the result or
+ * the flags going in (probed 2026-09-03).  Follow it exactly. */
 void ocerz_flags_mul(OcerzCPU *cpu, int size, uint64_t lo, uint64_t hi)
 {
-    uint64_t f = szp_bits(size, lo);
+    (void)lo;
+    uint64_t f = 0;
     if (hi & ocerz_mask(size))
         f |= OCERZ_CF | OCERZ_OF;
     put_arith(cpu, f);
@@ -141,7 +145,7 @@ void ocerz_flags_imul(OcerzCPU *cpu, int size, uint64_t lo, uint64_t hi)
 {
     uint64_t m = ocerz_mask(size);
     uint64_t sign = ocerz_msb(lo, size) ? m : 0;
-    uint64_t f = szp_bits(size, lo);
+    uint64_t f = 0;
     if ((hi & m) != sign)
         f |= OCERZ_CF | OCERZ_OF;
     put_arith(cpu, f);

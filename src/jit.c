@@ -339,6 +339,31 @@ static int superblock_enabled(void)
     if (en < 0) en = getenv("OCERZ_NO_SUPERBLOCK") ? 0 : 1;
     return en;
 }
+/* Superblock trace inversion: a forward jcc the compiler laid out with the
+ * rare path inline (if (rare) {...} - the branch over it is usually taken)
+ * fragments the hot path into a chain of blocks.  Continuing along the
+ * TAKEN edge instead - the jcc rewritten as its complement targeting the
+ * old fall-through - keeps the hot path in one block.  OCERZ_FLIP_JCC=rip,..
+ * names the branches to invert. */
+static int jcc_flip_wanted(uint64_t jcc_rip)
+{
+    static uint64_t rips[32];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char *e = getenv("OCERZ_FLIP_JCC");
+        while (e && *e && n < 32) {
+            char *end;
+            uint64_t v = strtoull(e, &end, 0);
+            if (end == e) break;
+            rips[n++] = v;
+            e = *end == ',' ? end + 1 : end;
+        }
+    }
+    for (int i = 0; i < n; i++)
+        if (rips[i] == jcc_rip) return 1;
+    return 0;
+}
 static int superblock_back_enabled(void)      /* continue past backward jcc too (OCERZ_NO_SB_BACK disables) */
 {
     static int en = -1;
@@ -2575,12 +2600,9 @@ static int emit_imul(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (need == 0)
         return 1;
 
-    if (need & (OCERZ_ZF | OCERZ_SF))
-        a64_subs_imm(b, sf, A64_ZR, JT2, 0);
+    /* IMUL defines CF and OF only; SF/ZF/AF/PF are undefined and Rosetta
+     * leaves them clear, so the flag word starts empty (see ocerz_flags_imul) */
     a64_mov_imm64(b, JTF, 0);
-    emit_zf_sf(b, need);
-    if (need & OCERZ_PF)
-        emit_pf(b, JT2);
     if (need & (OCERZ_CF | OCERZ_OF)) {
         if (sf) {
             a64_asr_imm(b, 1, JTU, JT2, 63);
@@ -3295,6 +3317,11 @@ static struct {
     const uint32_t *after;          /* first host word after the EA computation */
 } g_ea_cache;
 static int g_cur_fpb = -1;
+/* NZCV holds fcmp(v, v) of this vreg, emitted by the batch check that closed
+ * right before instruction g_fcmp_self_idx: a conversion of the same lane
+ * can reuse it instead of comparing again */
+static int g_fcmp_self_vreg = -1;
+static int g_fcmp_self_idx = -1;
 static void ea_cache_reset(void) { g_ea_cache.valid = 0; }
 static int a64_word_may_write_x15(uint32_t w)
 {
@@ -5887,6 +5914,9 @@ typedef struct {
     uint32_t *back;           /* where the replay returns */
     int8_t l0[16];            /* lane-0 cache state at the check (kept alive across it) */
     uint8_t l0_dbl[16];
+    int8_t fcmp_vreg;         /* the check ended in fcmp(v, v) of this vreg: the replay
+                               * re-establishes that NZCV before rejoining, because the
+                               * conversion that follows may reuse it */
 } FpBatch;
 static FpBatch g_fpb[FPB_MAX];
 static int g_n_fpb;
@@ -6051,10 +6081,20 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
     }
 }
 
+/* OCERZ_UNSAFE_NOCHECKBR: measurement aid only - emit every NaN/overflow
+ * check but not its branch, to price the branches apart from the compares. */
+static int unsafe_nocheckbr(void)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("OCERZ_UNSAFE_NOCHECKBR") ? 1 : 0;
+    return en;
+}
+
 /* Batch end: merge the tainted registers, one fcmp per class, b.vs -> replay. */
 static void fpb_emit_check(A64Buf *b, FpBatch *fb)
 {
     int have_f = 0, have_d = 0;
+    fb->fcmp_vreg = -1;
     if (fb->full) {
         int first = -1, acc = -1;
         for (int r = 0; r < 16; r++) if (fb->full & (1u << r)) {
@@ -6084,6 +6124,9 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
             else { a64_fmax_s(b, 1, VX2, cur, v); cur = VX2; }
         }
         a64_fcmp(b, 1, cur, cur);
+        g_fcmp_self_vreg = cur;
+        g_fcmp_self_idx = g_cur_insn_idx;
+        fb->fcmp_vreg = (int8_t)cur;
         have_d = 1;
     }
     /* one branch: with both classes, fold the double verdict into a flag-preserving path */
@@ -6100,12 +6143,14 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
         /* remember the trampoline as a second site via the high bit trick: store in gain (unused after) */
         fb->gain = (int)(tramp - fb->site);              /* offset from site to trampoline */
     } else if (have_d) {
-        fb->site = a64_label(b); a64_bcond(b, A64_VS, 0);
+        if (unsafe_nocheckbr()) fb->site = NULL;
+        else { fb->site = a64_label(b); a64_bcond(b, A64_VS, 0); }
         fb->back = a64_label(b);
         fb->gain = 0;
     } else {
         a64_fcmp(b, 0, VX1, VX1);
-        fb->site = a64_label(b); a64_bcond(b, A64_VS, 0);
+        if (unsafe_nocheckbr()) fb->site = NULL;
+        else { fb->site = a64_label(b); a64_bcond(b, A64_VS, 0); }
         fb->back = a64_label(b);
         fb->gain = 0;
     }
@@ -6562,23 +6607,27 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         /* x86: NaN or out-of-range -> "integer indefinite" (INT_MIN); arm64 fcvtzs saturates (NaN -> 0). */
         int ds = pin_slot(d->reg);
         int rd = ds >= 0 ? pin_hreg(ds) : JT0;
-        if (g_n_nanool + 2 <= NANOOL_MAX) {
-            /* rare cases out of line: keeps the csel chain off the result */
+        if (g_n_nanool + 1 <= NANOOL_MAX) {
+            /* rare cases out of line behind one branch: fcmp raises V for
+             * NaN, and the conditional compare runs only when it did not,
+             * raising V for the saturated INT_MAX (32: a genuine INT32_MAX
+             * is a false positive the arm recomputes exactly) */
             a64_fcvtzs(b, d->size == 8, dbl, rd, vs);
-            a64_cmn_imm(b, d->size == 8, rd, 1);   /* V <=> rd == INT_MAX (32: maybe false positive) */
-            for (int p = 0; p < 2; p++) {
+            /* the batch check that just closed compared this very lane with
+             * itself and nothing since has written NZCV: reuse its V */
+            if (!(dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs))
+                a64_fcmp(b, dbl, vs, vs);
+            g_fcmp_self_idx = -1;
+            a64_ccmn_imm(b, d->size == 8, rd, 1, 1, A64_VC);
+            if (!unsafe_nocheckbr()) {
                 NanOolPend *o = &g_nanool[g_n_nanool++];
                 o->site = a64_label(b); a64_bcond(b, A64_VS, 0);
-                o->back = NULL;
+                o->back = a64_label(b);
                 o->dbl = (uint8_t)dbl; o->packed = 0; o->vr = (uint8_t)rd;
                 o->va = (uint8_t)vs; o->vb = 0; o->t1 = 0;
                 o->cvt = d->size == 8 ? 1 : 2;
                 o->idx = g_cur_insn_idx; o->is_cbz = 0;
-                if (p == 0) a64_fcmp(b, dbl, vs, vs);          /* VS <=> NaN */
             }
-            uint32_t *back = a64_label(b);
-            g_nanool[g_n_nanool - 2].back = back;
-            g_nanool[g_n_nanool - 1].back = back;
         } else if (d->size == 8) {
             a64_fcvtzs(b, 1, dbl, rd, vs);
             a64_cmn_imm(b, 1, rd, 1);                          /* V <=> rd == INT64_MAX */
@@ -11100,6 +11149,16 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                          (superblock_back_enabled() && scratch[vn - 1].ops[0].imm != rip &&
                           scratch[vn - 1].ops[0].imm < vpc))) {
                         vext++;
+                        if (scratch[vn - 1].ops[0].imm > vpc + len &&
+                            jcc_flip_wanted(scratch[vn - 1].rip)) {
+                            /* follow the taken edge: the side exit becomes the
+                             * complement branch to the old fall-through */
+                            uint64_t tgt = scratch[vn - 1].ops[0].imm;
+                            scratch[vn - 1].ops[0].imm = vpc + len;
+                            scratch[vn - 1].cc ^= 1;
+                            vpc = tgt;
+                            continue;
+                        }
                         vpc += len;
                         continue;
                     }
@@ -11779,6 +11838,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     int8_t fpb_of[JIT_MAX_BLOCK_INSNS];
     fpb_scan(blk->insns, n, fpb_of);
     g_fpb_fast = 0;
+    g_fcmp_self_idx = -1;
     l0_reset();
     unsigned long long l0_last_seq = g_callout_seq;
     g_n_fpbmap = 0;
@@ -12273,6 +12333,8 @@ promo_push_fallthrough:
                 break;
             }
         }
+        if (fb->fcmp_vreg >= 0)
+            a64_fcmp(&b, 1, fb->fcmp_vreg, fb->fcmp_vreg);
         uint32_t *here = a64_label(&b);
         a64_b(&b, (int32_t)(fb->back - here));
     }

@@ -737,6 +737,17 @@ void a64_cmp_ext_sxtw(A64Buf *b, int rn, int rm) { a64_emit32(b, 0xeb20c01fu | (
 /* SUBS Rd, Rn, #imm12, LSL #12 */
 void a64_subs_imm_sh12(A64Buf *b, int sf, int rd, int rn, uint32_t imm12) { a64_emit32(b, 0x71400000u | ((uint32_t)sf << 31) | ((imm12 & 0xfffu) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31)); }
 void a64_cmn_imm(A64Buf *b, int sf, int rn, int imm12) { a64_emit32(b, 0x3100001fu | ((uint32_t)sf << 31) | ((uint32_t)(imm12 & 0xfff) << 10) | ((uint32_t)(rn & 31) << 5)); }
+/* CCMN/CCMP (immediate): NZCV = cond ? flags of (Rn + imm5) / (Rn - imm5) : nzcv */
+void a64_ccmn_imm(A64Buf *b, int sf, int rn, int imm5, int nzcv, int cond)
+{
+    a64_emit32(b, 0x3a400800u | ((uint32_t)sf << 31) | ((uint32_t)(imm5 & 31) << 16) |
+                  ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(nzcv & 15));
+}
+void a64_ccmp_imm(A64Buf *b, int sf, int rn, int imm5, int nzcv, int cond)
+{
+    a64_emit32(b, 0x7a400800u | ((uint32_t)sf << 31) | ((uint32_t)(imm5 & 31) << 16) |
+                  ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(nzcv & 15));
+}
 /* LDR/STR Qt/Dt/St, [Xn, Xm, LSL #s] register-offset (scaled iff `scaled`) */
 void a64_ldr_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled)
 {
