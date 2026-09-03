@@ -5654,11 +5654,13 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_XMM) {
         if (d->reg != s->reg) {
             if (xmm_is_pinned(d->reg) && xmm_is_pinned(s->reg)) {
-                l0_flush_reg(b, s->reg);
+                /* the copy may carry a stale lane 0: dst shares src's lane
+                 * scratch (and its dirty bit) below, so nothing reads the
+                 * stale lane and the merge stays off the loop-carried chain */
                 l0_inval(d->reg);
                 a64_v_mov(b, xmm_vreg(d->reg), xmm_vreg(s->reg));   /* 1 word */
             }
-            else { emit_xmm_ld(b, VX0, s->reg); emit_xmm_st(b, VX0, d->reg); }
+            else { l0_flush_reg(b, s->reg); emit_xmm_ld(b, VX0, s->reg); emit_xmm_st(b, VX0, d->reg); }
             l0_share(d->reg, s->reg);
         }
         return 1;
@@ -6364,9 +6366,30 @@ static void l0_fixed_backedge(A64Buf *b)
 }
 
 /* instructions whose emitters keep the caches consistent themselves */
+/* cmpsd/cmpss into xmm0 immediately followed by blendvpd/blendvps: the
+ * compare's mask can stay in VX2 and the blend can work in lane scratches,
+ * which keeps two merges off a loop-carried scalar chain.  Both emitters
+ * consult this so they agree. */
+static int g_cmps_mask_idx = -1;      /* insn index whose lane-0 mask is live in VX2 */
+static int cmps_blendv_fusable(int cmps_idx)
+{
+    if (!g_cur_insns || cmps_idx < 0 || cmps_idx + 1 >= g_cur_insns_n) return 0;
+    const X86Insn *c = &g_cur_insns[cmps_idx], *v = &g_cur_insns[cmps_idx + 1];
+    if (c->ops[0].kind != OCERZ_OPK_XMM || c->ops[0].reg != 0 || c->nops < 3) return 0;
+    if (!((c->op == OCERZ_OP_CMPSDX && v->op == OCERZ_OP_BLENDVPD) ||
+          (c->op == OCERZ_OP_CMPSS && v->op == OCERZ_OP_BLENDVPS))) return 0;
+    if (v->nops < 2 || v->ops[0].kind != OCERZ_OPK_XMM || v->ops[0].reg == 0 ||
+        !xmm_is_pinned(v->ops[0].reg) || !xmm_is_pinned(0)) return 0;
+    if (v->ops[1].kind == OCERZ_OPK_XMM && v->ops[1].reg == 0) return 0;
+    if (v->seg != OCERZ_SEG_NONE || !l0_enabled()) return 0;
+    return 1;
+}
+
 static int l0_aware_op(unsigned op)
 {
     switch (op) {
+    case OCERZ_OP_BLENDVPD: case OCERZ_OP_BLENDVPS:
+    case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX:     /* read lanes through l0_src, write xmm0 explicitly */
     case OCERZ_OP_ADDSS: case OCERZ_OP_ADDSD: case OCERZ_OP_SUBSS: case OCERZ_OP_SUBSD:
     case OCERZ_OP_MULSS: case OCERZ_OP_MULSD: case OCERZ_OP_DIVSS: case OCERZ_OP_DIVSD:
     case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_MINSS: case OCERZ_OP_MINSD:
@@ -6437,8 +6460,15 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
         } else {
             int t = dst_pinned && l0_enabled() ? l0_alloc(d->reg, dbl) : VX2;
             if (t < 0) t = VX2;
+            /* in place on its own input: the exact NaN arm must still see the
+             * operand, so keep a copy (off the chain - the sqrt does not wait) */
+            int fb = vb;
+            if (t == vb) {
+                if (dbl) a64_fmov_d_d(b, VX3, vb); else a64_fmov_s_s(b, VX3, vb);
+                fb = VX3;
+            }
             a64_fsqrt_s(b, dbl, t, vb);
-            emit_nan_fix_scalar2(b, dbl, t, vb, vb);
+            emit_nan_fix_scalar2(b, dbl, t, fb, fb);
             emit_xmm_st_lo(b, esz, t, d->reg);
         }
         return 1;
@@ -6498,13 +6528,25 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     } else {
         int t = dst_pinned && l0_enabled() ? l0_alloc(d->reg, dbl) : VX2;
             if (t < 0) t = VX2;
+        /* A lane scratch makes the op run in place on its own input.  The
+         * exact NaN arm decides between "propagated" and "generated" by
+         * looking at the inputs, so the one the result overwrites must be
+         * kept: an off-chain copy the arithmetic does not wait for.  Without
+         * it a generated NaN kept arm64's sign (found by fp_loop_nan). */
+        int fa = va, fb = vb;
+        if (t == va || t == vb) {
+            int alias = t == va ? va : vb;
+            if (dbl) a64_fmov_d_d(b, VX3, alias); else a64_fmov_s_s(b, VX3, alias);
+            if (t == va) fa = VX3;
+            if (t == vb) fb = VX3;
+        }
         switch (kind) {
         case 0: a64_fadd_s(b, dbl, t, va, vb); break;
         case 1: a64_fsub_s(b, dbl, t, va, vb); break;
         case 2: a64_fmul_s(b, dbl, t, va, vb); break;
         case 3: a64_fdiv_s(b, dbl, t, va, vb); break;
         }
-        emit_nan_fix_scalar2(b, dbl, t, va, vb);
+        emit_nan_fix_scalar2(b, dbl, t, fa, fb);
         emit_xmm_st_lo(b, esz, t, d->reg);   /* only low lane written */
     }
     return 1;
@@ -6922,6 +6964,13 @@ static int emit_sse_cmps(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     default: a64_fcmeq_s(b, dbl, VX2, va, va); a64_fcmeq_s(b, dbl, VX3, vb, vb);
             a64_v_and(b, VX2, VX2, VX3); break;                             /* ordered */
     }
+    if (cmps_blendv_fusable(g_cur_insn_idx)) {
+        /* the blend that follows takes the mask straight from VX2 and
+         * materializes xmm0's lane afterwards, off the chain */
+        g_cmps_mask_idx = g_cur_insn_idx;
+        l0_inval(d->reg);
+        return 1;
+    }
     emit_xmm_st_lo(b, esz, VX2, d->reg);
     l0_inval(d->reg);
     return 1;
@@ -6932,6 +6981,49 @@ static int emit_sse_blendv(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_XMM) return 0;
+    int fused = g_cmps_mask_idx == g_cur_insn_idx - 1 && cmps_blendv_fusable(g_cur_insn_idx - 1);
+    g_cmps_mask_idx = -1;
+    if (fused) {
+        /* cmpsd/cmpss into xmm0 left its lane-0 mask in VX2 (zero above).
+         * Lane 0 of the blend is done in the destination's lane scratch so
+         * the loop-carried value never leaves it; the upper lanes use the
+         * architectural registers, whose upper lanes are always current,
+         * and garbage-blend lane 0 of the arch dst, which the dirty bit
+         * covers.  xmm0's own lane 0 is merged last, off the chain. */
+        int dbl = insn->op == OCERZ_OP_BLENDVPD;
+        int esz = dbl ? 8 : 4;
+        int vd0 = l0_src(d->reg, dbl);
+        int t = l0_alloc(d->reg, dbl);
+        if (t >= 0) {
+            int vs0, vsfull;
+            if (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) {
+                vs0 = l0_src(s->reg, dbl);
+                vsfull = xmm_vreg(s->reg);
+            } else {
+                vsfull = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
+                if (vsfull < 0) return 0;
+                vs0 = vsfull;
+            }
+            if (vd0 != t) {
+                if (dbl) a64_ins_d_d(b, t, 0, vd0, 0); else a64_ins_s_s(b, t, 0, vd0, 0);
+            }
+            a64_v_bit(b, t, vs0, VX2);                              /* lane 0, in the scratch */
+            if (dbl) a64_v_sshr_2d(b, VX3, xmm_vreg(0), 63);
+            else     a64_v_sshr_4s(b, VX3, xmm_vreg(0), 31);
+            a64_v_bit(b, xmm_vreg(d->reg), vsfull, VX3);            /* upper lanes (lane 0 garbage) */
+            g_l0_dirty |= (uint16_t)(1u << d->reg);
+            if (dbl) a64_ins_d_d(b, xmm_vreg(0), 0, VX2, 0); else a64_ins_s_s(b, xmm_vreg(0), 0, VX2, 0);
+            (void)esz;
+            return 1;
+        }
+        /* no lane scratch for the destination: give xmm0 its mask and take the plain path */
+        if (dbl) a64_ins_d_d(b, xmm_vreg(0), 0, VX2, 0); else a64_ins_s_s(b, xmm_vreg(0), 0, VX2, 0);
+    }
+    /* lane-aware op: the plain path reads architectural registers */
+    if (s->kind == OCERZ_OPK_XMM) l0_flush_reg(b, s->reg);
+    l0_flush_reg(b, d->reg);
+    l0_flush_reg(b, 0);
+    l0_inval(d->reg);
     int vb = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
     if (vb < 0) return 0;
     int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
@@ -11839,6 +11931,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     fpb_scan(blk->insns, n, fpb_of);
     g_fpb_fast = 0;
     g_fcmp_self_idx = -1;
+    g_cmps_mask_idx = -1;
     l0_reset();
     unsigned long long l0_last_seq = g_callout_seq;
     g_n_fpbmap = 0;
