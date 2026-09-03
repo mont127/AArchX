@@ -129,27 +129,48 @@ static const char *errno_name(int e)
     }
 }
 
+/* XNU returns every unix syscall through rax AND rdx (the second result
+ * slot, zero unless the call fills it) - on success and on error alike.
+ * Rosetta reproduces that, so a caller whose wrapper forgot to declare rdx
+ * clobbered sees rdx = 0 there; leaving rdx alone was silently kinder. */
+/* Rosetta returns from a trap with a fixed arithmetic-flag pattern, whatever
+ * the caller had (probed 2026-09-03): unix success PF|AF, unix error
+ * CF|ZF|PF, mach traps AF.  Only CF is architecturally meaningful (the
+ * libSystem stubs branch on it); the rest is matched so a program that
+ * reads the others sees what it sees on Rosetta. */
+#define SYSRET_FLAGS_OK   (OCERZ_PF | OCERZ_AF)
+#define SYSRET_FLAGS_ERR  (OCERZ_CF | OCERZ_ZF | OCERZ_PF)
+#define SYSRET_FLAGS_MACH (OCERZ_AF)
+#define SYSRET_ARITH_FLAGS (OCERZ_CF | OCERZ_PF | OCERZ_AF | OCERZ_ZF | OCERZ_SF | OCERZ_OF)
+static void sysret_flags(OcerzCPU *cpu, uint64_t pattern)
+{
+    cpu->rflags = (cpu->rflags & ~(uint64_t)SYSRET_ARITH_FLAGS) | pattern;
+}
+
 static void ret_ok(OcerzCPU *cpu, uint64_t v)
 {
-    cpu->rflags &= ~(uint64_t)OCERZ_CF;
+    sysret_flags(cpu, SYSRET_FLAGS_OK);
     cpu->gpr[OCERZ_RAX] = v;
+    cpu->gpr[OCERZ_RDX] = 0;
 }
 
 static void ret_ok2(OcerzCPU *cpu, uint64_t v, uint64_t v2)
 {
-    cpu->rflags &= ~(uint64_t)OCERZ_CF;
+    sysret_flags(cpu, SYSRET_FLAGS_OK);
     cpu->gpr[OCERZ_RAX] = v;
     cpu->gpr[OCERZ_RDX] = v2;
 }
 
 static void ret_err(OcerzCPU *cpu, uint64_t errno_v)
 {
-    cpu->rflags |= OCERZ_CF;
+    sysret_flags(cpu, SYSRET_FLAGS_ERR);
     cpu->gpr[OCERZ_RAX] = errno_v;
+    cpu->gpr[OCERZ_RDX] = 0;
 }
 
 static void mach_ret(OcerzCPU *cpu, uint64_t kr)
 {
+    sysret_flags(cpu, SYSRET_FLAGS_MACH);
     cpu->gpr[OCERZ_RAX] = kr;
 }
 
