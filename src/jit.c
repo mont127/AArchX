@@ -273,6 +273,7 @@ static int g_n_raslit;
 /* per-site caches for indirect jmp/call: 32 direct-mapped {rip, body} entries */
 typedef struct { _Alignas(16) uint64_t rip; void *body; } JitPscEnt;   /* 16-aligned: the lookup's ldp is single-copy atomic */
 #define PSC_N 32
+#define PSC_EMPTY_RIP UINT64_MAX   /* outside the macOS user address space */
 static JitPscEnt *g_psc_pool;
 static size_t g_psc_used, g_psc_cap;      /* in entries */
 static JitPscEnt **g_psc_tables;
@@ -287,6 +288,8 @@ static JitPscEnt *psc_alloc(void)
     }
     JitPscEnt *t = &g_psc_pool[g_psc_used];
     g_psc_used += PSC_N;
+    for (int k = 0; k < PSC_N; k++)
+        t[k].rip = PSC_EMPTY_RIP;
     if (g_n_psc_tables == g_cap_psc_tables) {
         size_t ncap = g_cap_psc_tables ? g_cap_psc_tables * 2 : 1024;
         JitPscEnt **nv = (JitPscEnt **)realloc(g_psc_tables, ncap * sizeof *nv);
@@ -300,7 +303,7 @@ static void psc_clear_all(void)
     for (size_t i = 0; i < g_n_psc_tables; i++)
         for (int k = 0; k < PSC_N; k++) {
             /* rip first: a reader that still sees the old rip also sees the old body */
-            __atomic_store_n(&g_psc_tables[i][k].rip, (uint64_t)0, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_psc_tables[i][k].rip, PSC_EMPTY_RIP, __ATOMIC_RELEASE);
             __atomic_store_n(&g_psc_tables[i][k].body, (void *)NULL, __ATOMIC_RELEASE);
         }
 }
@@ -9815,9 +9818,6 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         a64_ldp_off(b, JTU, JT0, JT2, 0);
         a64_subs_reg(b, 1, A64_ZR, JTU, treg, 0);
         psc_miss = a64_label(b); a64_bcond(b, A64_NE, 0);
-        /* empty entry {0, NULL}: a guest jump to rip 0 (signal_jump0) must not
-         * match it and br NULL -- keep the body test */
-        uint32_t *psc_empty = a64_label(b); a64_cbz(b, 1, JT0, 0);
         uint32_t *intr = NULL;
         int stop_site_ok = g_n_stop_extra < 6;
         if (!stop_site_ok) {                       /* out of stop slots: poll */
@@ -9846,7 +9846,6 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         a64_b(b, 0);
         (*n_epi)++;
         a64_patch_bcond(psc_miss, a64_label(b));
-        a64_patch_cbz(psc_empty, a64_label(b));
     }
     if (treg != JT1) a64_mov_reg(b, 1, JT1, treg);   /* the slow paths below work on JT1 */
     a64_str(b, 8, JT1, 20, RIP_OFF);      /* every path from here may leave to the dispatcher */
