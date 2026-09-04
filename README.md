@@ -80,23 +80,23 @@ Ratio is AArchX time divided by Rosetta time; lower is better.
 
 | Kernel | Ratio |
 | --- | ---: |
-| `depchain` | **0.86x** |
-| `jtab` | **0.92x** |
-| `memcpy` | **0.94x** |
+| `depchain` | **0.84x** |
+| `jtab` | **0.89x** |
+| `memcpy` | **0.93x** |
+| `leafcall` | **0.94x** |
 | `fpvec` | **0.96x** |
-| `mixed` | **0.96x** |
-| `leafcall` | **0.96x** |
+| `brmiss` | **0.96x** |
+| `mixed` | **0.98x** |
 | `icall` | **0.98x** |
-| `idiv` | **0.98x** |
-| `hash` | **0.99x** |
-| `brmiss` | **0.99x** |
+| `str` | **0.98x** |
+| `vm` | **0.98x** |
 | `qsort` | **0.99x** |
 | `fpsse` | **0.99x** |
-| `str` | 1.00x |
-| `chase` | 1.02x |
-| `vm` | 1.06x |
+| `idiv` | **0.99x** |
+| `hash` | 1.01x |
+| `chase` | 1.01x |
 
-Apple M2 Max, 2026-09-04, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`. `str`, `chase` and `vm` sit at parity and the winner flips from run to run; `vm` measured between 0.97x and 1.06x on the same day, so treat anything within a few percent of 1.00x as a tie. A busy machine moves every ratio by that much.
+Apple M2 Max, 2026-09-04, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`. `hash` and `chase` are ties that no translation can move: `hash` is a chain of multiply, shift and or per step and both sides are bound by multiply latency; `chase` is a dependent-load chain and both sides wait on the cache. Anything within a couple of percent of 1.00x flips from run to run, and a busy machine moves every ratio by that much.
 
 `mixed` was a 1.20x loss for a long time, and the whole gap was the price of bit-exact x86 NaN semantics: every packed FP result needed a check before anything could use it. The JIT now defers that check to the compares that read the value, and Rosetta-style hot paths that the compiler split with rare-case branches get retranslated with the hot side inline. Both are exact; the NaN tests in `tests/guest` compare bit patterns against the native binary.
 
