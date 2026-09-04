@@ -1,8 +1,8 @@
 <p align="center">
-  <img width="852" height="418" alt="Screenshot 2026-09-04 at 19 53 16" src="https://github.com/user-attachments/assets/08becae1-7ea9-4f61-9ba9-2a57424235a7" />
+  <img width="852" height="418" alt="AArchX" src="https://github.com/user-attachments/assets/08becae1-7ea9-4f61-9ba9-2a57424235a7" />
 </p>
 
-<h1 align="center"><em>ArmX</em></h1>
+<h1 align="center"><em>AArchX</em></h1>
 
 <p align="center">
   <b>A from-scratch x86-64 to arm64 userspace binary translator for macOS.</b><br>
@@ -17,11 +17,11 @@
 </p>
 
 > [!WARNING]
-> ArmX is experimental. Do not use it for production workloads.
+> AArchX is experimental. Do not use it for production workloads.
 
-ArmX loads and runs x86-64 Mach-O programs on Apple Silicon with its own decoder, interpreter, JIT, dynamic linker and syscall layer. It also runs i386 PE code inside Wine's WoW64 process.
+AArchX loads and runs x86-64 Mach-O programs on Apple Silicon with its own decoder, interpreter, JIT, dynamic linker and syscall layer. It also runs i386 PE code inside Wine's WoW64 process.
 
-The Rosetta package still has to be installed, because it is what ships the x86-64 shared cache. ArmX maps that cache itself and never calls Rosetta's translator.
+The Rosetta package still has to be installed, because it is what ships the x86-64 shared cache. AArchX maps that cache itself and never calls Rosetta's translator.
 
 ## Build and run
 
@@ -59,7 +59,7 @@ What is in the box:
 
 ## Wine and i386
 
-Wine 11.8 runs x86-64 and i386 PE applications through ArmX. With a WoW64 prefix, 32-bit Notepad and WineMine load `winemac.drv` and open titled Cocoa windows. The Wine launchers turn on the workqueue bridge and the Objective-C category preload that AppKit needs.
+Wine 11.8 runs x86-64 and i386 PE applications through AArchX. With a WoW64 prefix, 32-bit Notepad and WineMine load `winemac.drv` and open titled Cocoa windows. The Wine launchers turn on the workqueue bridge and the Objective-C category preload that AppKit needs.
 
 ```sh
 WINE="/path/to/Wine Devel.app/Contents/Resources/wine"
@@ -70,13 +70,13 @@ export WINEPREFIX="$HOME/.wine-ocerz"
 ./ocerz "$WINE/bin/wine" notepad
 ```
 
-MacNdCheese's Wine build runs under ArmX as well. Steam's client core starts: the connectivity test passes, CEF runs the login page's JavaScript, and what is left is the rendering path. SSE4.2 is implemented and advertised because Steam checks for it.
+MacNdCheese's Wine build runs under AArchX as well. Steam's client core starts: the connectivity test passes, CEF runs the login page's JavaScript, and what is left is the rendering path. SSE4.2 is implemented and advertised because Steam checks for it.
 
-Rosetta runs i386 PE code through Wine WoW64 too, so ArmX's i386 support is replacement parity rather than something new. Standalone i386 Mach-O applications are not supported by current macOS or its SDKs.
+Rosetta runs i386 PE code through Wine WoW64 too, so AArchX's i386 support is replacement parity rather than something new. Standalone i386 Mach-O applications are not supported by current macOS or its SDKs.
 
 ## Benchmarks
 
-Ratio is ArmX time divided by Rosetta time; lower is better.
+Ratio is AArchX time divided by Rosetta time; lower is better.
 
 | Kernel | Ratio |
 | --- | ---: |
@@ -115,7 +115,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `-strace` | trace guest syscalls |
 | `-no-jit` | interpret this process only |
 | `-path file` | load `file` but keep the following guest arguments as they are |
-| `--` | end of ArmX options |
+| `--` | end of AArchX options |
 
 | Environment | Effect |
 | --- | --- |
