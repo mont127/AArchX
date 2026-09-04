@@ -1,0 +1,6 @@
+tsd_base rax_is_base 1
+ rdx 4660
+ flags 16
+gs0 30787852042528112
+getpid rdx 0
+ flags 20
