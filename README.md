@@ -18,11 +18,11 @@
 > [!WARNING]
 > Ocerz is experimental. Do not use it for production workloads.
 
-Ocerz loads and executes x86-64 Mach-O programs on Apple Silicon with its own decoder, interpreter, JIT, dynamic linker, and syscall layer. It also executes i386 PE code inside Wine's WoW64 process.
+Ocerz loads and runs x86-64 Mach-O programs on Apple Silicon with its own decoder, interpreter, JIT, dynamic linker and syscall layer. It also runs i386 PE code inside Wine's WoW64 process.
 
-The Rosetta package must be installed because it supplies macOS's x86-64 shared cache. Ocerz maps that cache itself and does not invoke Rosetta's translator.
+The Rosetta package still has to be installed, because it is what ships the x86-64 shared cache. Ocerz maps that cache itself and never calls Rosetta's translator.
 
-## Build And Run
+## Build and run
 
 ```sh
 make -j
@@ -30,14 +30,7 @@ make -j
 ./ocerz /Applications/SomeApp.app/Contents/MacOS/SomeApp
 ```
 
-Run the main gates with:
-
-```sh
-make check
-make i386diff
-```
-
-`i386diff` requires the Python `capstone` package.
+`make check` builds the unit and guest tests and runs every gate: the guest suite under the interpreter and under the JIT, the x86-64 differential gate (each guest binary under `-no-jit` and under the JIT must match byte for byte), the i386 differential gate and the dynamic-linking tests. The i386 gate needs the Python `capstone` package.
 
 ## Status
 
@@ -47,25 +40,25 @@ make i386diff
 | instruction corpus | 511 instructions |
 | x86-64 decode | 199 / 199 cases |
 | i386 decode | 102 cases, 26 rejects, 122 address cases |
-| extension / SSE suites | 233 / 0, 246 / 0, SSE4.2 differential vs Rosetta |
+| extension / SSE suites | 233 / 0, 246 / 0, SSE4.2 differential against Rosetta |
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 68 / 69 |
+| x86-64 guest gate | 75 / 75 |
 | x86-64 differential gate | 56 / 56 |
 | i386 differential gate | 20,032 / 20,032 |
 
-Highlights:
+What is in the box:
 
-- From-scratch Mach-O loader, x86 decoder, interpreter, arm64 JIT, mini-dyld, and syscall layer.
-- Live `dyld_shared_cache_x86_64` mapping, fixups, initializers, Objective-C registration, and `dlopen`/`dlsym` support.
-- Native guest threads, libdispatch workqueue bridging, Mach messages, signals, and x86-TSO memory ordering.
-- JIT cache invalidation for guest code writes and executable mapping changes.
-- Differential tests for x86-64 and i386 execution.
+- Mach-O loader, x86 decoder, interpreter, arm64 JIT, mini-dyld and syscall layer, all written for this project.
+- Live `dyld_shared_cache_x86_64` mapping with fixups, initializers, Objective-C registration and `dlopen`/`dlsym`.
+- Native guest threads, libdispatch workqueue bridging, Mach messages, signals and x86-TSO memory ordering.
+- JIT cache invalidation on guest code writes and executable mapping changes.
+- Differential tests for both x86-64 and i386 execution.
 
-## Wine And i386
+## Wine and i386
 
-Wine 11.8 runs x86-64 and i386 PE applications through Ocerz. With a WoW64 prefix, 32-bit Notepad and WineMine load `winemac.drv` and create titled Cocoa windows. Wine launchers automatically enable the workqueue bridge and the targeted Objective-C category preload required by AppKit.
+Wine 11.8 runs x86-64 and i386 PE applications through Ocerz. With a WoW64 prefix, 32-bit Notepad and WineMine load `winemac.drv` and open titled Cocoa windows. The Wine launchers turn on the workqueue bridge and the Objective-C category preload that AppKit needs.
 
 ```sh
 WINE="/path/to/Wine Devel.app/Contents/Resources/wine"
@@ -76,47 +69,37 @@ export WINEPREFIX="$HOME/.wine-ocerz"
 ./ocerz "$WINE/bin/wine" notepad
 ```
 
-MacNdCheese's Wine build also runs under Ocerz. Steam's client core starts: the connectivity test passes, CEF runs and executes the login page's JavaScript, and the remaining work is the rendering path. SSE4.2 is implemented and advertised, which Steam requires.
+MacNdCheese's Wine build runs under Ocerz as well. Steam's client core starts: the connectivity test passes, CEF runs the login page's JavaScript, and what is left is the rendering path. SSE4.2 is implemented and advertised because Steam checks for it.
 
-Rosetta also runs i386 PE code through Wine WoW64. Ocerz's i386 support is replacement parity, not an exclusive capability. Standalone i386 Mach-O applications are not supported by current macOS SDKs or macOS itself.
+Rosetta runs i386 PE code through Wine WoW64 too, so Ocerz's i386 support is replacement parity rather than something new. Standalone i386 Mach-O applications are not supported by current macOS or its SDKs.
 
 ## Benchmarks
 
-Ratio is Ocerz time divided by Rosetta time. Lower is better.
+Ratio is Ocerz time divided by Rosetta time; lower is better.
 
-| Kernel | Static |
+| Kernel | Ratio |
 | --- | ---: |
-| `depchain` | **0.84x** |
-| `jtab` | **0.94x** |
+| `depchain` | **0.86x** |
+| `jtab` | **0.92x** |
 | `memcpy` | **0.94x** |
-| `brmiss` | **0.95x** |
-| `leafcall` | **0.95x** |
-| `fpvec` | **0.97x** |
-| `str` | **0.99x** |
+| `fpvec` | **0.96x** |
+| `mixed` | **0.96x** |
+| `leafcall` | **0.96x** |
+| `icall` | **0.98x** |
+| `idiv` | **0.98x** |
+| `hash` | **0.99x** |
+| `brmiss` | **0.99x** |
 | `qsort` | **0.99x** |
-| `idiv` | **0.99x** |
-| `chase` | **1.00x** |
-| `hash` | **1.00x** |
-| `vm` | **1.00x** |
-| `icall` | 1.00x |
-| `fpsse` | 1.16x |
-| `mixed` | 1.20x |
+| `fpsse` | **0.99x** |
+| `str` | 1.00x |
+| `chase` | 1.02x |
+| `vm` | 1.06x |
 
-Apple M2 Max, 2026-08-25, `REPS=11`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`.
+Apple M2 Max, 2026-09-04, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`. `str`, `chase` and `vm` sit at parity and the winner flips from run to run; `vm` measured between 0.97x and 1.06x on the same day, so treat anything within a few percent of 1.00x as a tie. A busy machine moves every ratio by that much.
 
-`icall`, `hash`, `chase`, and `vm` sit at parity and flip winner run to run. The two
-remaining losses are the price of bit-exact x86 NaN semantics: `mixed` runs at
-Rosetta speed with `OCERZ_NO_FPBATCH=1 OCERZ_INEXACT_NAN=1`, and Rosetta gets the
-same exactness from an Apple-private per-thread FP mode that userspace cannot
-enable (M2 advertises no FEAT_AFP and FPCR.AH/FIZ/NEP writes are ignored, yet
-Rosetta produces x86-flavored NaNs at native speed). `fpsse` is bound by
-divide/sqrt unit scheduling.
+`mixed` was a 1.20x loss for a long time, and the whole gap was the price of bit-exact x86 NaN semantics: every packed FP result needed a check before anything could use it. The JIT now defers that check to the compares that read the value, and Rosetta-style hot paths that the compiler split with rare-case branches get retranslated with the hot side inline. Both are exact; the NaN tests in `tests/guest` compare bit patterns against the native binary.
 
-These kernels never create a thread, fork, or map shared memory, so they run in plain
-memory mode throughout. A program that does any of those retires plain mode permanently
-(`ocerz_jit_require_ordered`) and pays for TSO-ordered loads and stores: under
-`OCERZ_NO_PLAIN_MEM=1` the same table reads 3.55x on `memcpy` and 3.67x on `fpvec`.
-Wine is always in ordered mode, so the numbers above do not describe it.
+These kernels never create a thread, fork or map shared memory, so they run in plain memory mode throughout. A program that does any of those retires plain mode for good (`ocerz_jit_require_ordered`) and pays for TSO-ordered loads and stores: under `OCERZ_NO_PLAIN_MEM=1` the same table reads 3.55x on `memcpy` and 3.67x on `fpvec`. Wine is always in ordered mode, so the numbers above say nothing about it.
 
 ## CLI
 
@@ -126,22 +109,25 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 | Option | Effect |
 | --- | --- |
-| `-v` | increase logging level |
+| `-v` | more logging |
 | `-trace` | trace guest instructions |
 | `-strace` | trace guest syscalls |
 | `-no-jit` | interpret this process only |
-| `-path file` | load `file` while preserving the following guest arguments |
-| `--` | end Ocerz option parsing |
+| `-path file` | load `file` but keep the following guest arguments as they are |
+| `--` | end of Ocerz options |
 
 | Environment | Effect |
 | --- | --- |
-| `OCERZ_NOJIT=1` | interpret the entire process tree |
-| `OCERZ_NOJIT_EXE=<text>` | interpret matching process command lines |
-| `OCERZ_HOSTWQ=1` | enable the host workqueue bridge |
-| `OCERZ_NO_PLAIN_MEM=1` | use ordered memory forms from startup |
-| `OCERZ_TSO_STRICT=1` | order stack-relative memory accesses too |
+| `OCERZ_NOJIT=1` | interpret the whole process tree |
+| `OCERZ_NOJIT_EXE=<text>` | interpret processes whose command line matches |
+| `OCERZ_HOSTWQ=1` | host workqueue bridge |
+| `OCERZ_NO_PLAIN_MEM=1` | ordered memory forms from the start |
+| `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |
 | `OCERZ_PRELOAD_OBJC=<paths>` | preload matching shared-cache Objective-C images |
 | `OCERZ_STRICT_SYSCALL=1` | abort on an unimplemented syscall instead of returning `ENOSYS` |
+| `OCERZ_NO_FLIP=1` | no profile-driven retranslation of superblocks |
+| `OCERZ_NO_FPB_DEFER=1` | check every FP batch immediately instead of at its consumers |
+| `OCERZ_NO_MOVFUSE=1` | no folding of `mov` into a following shift |
 
 ## Architecture
 
@@ -150,16 +136,16 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | Loader | `src/loader.c` | Mach-O parsing, mappings, initial stack |
 | Decoder | `src/decode.c` | x86-64/i386 to the 411-operation internal IR |
 | Interpreter | `src/interp*.c`, `src/flags.c` | reference execution and x86 flag semantics |
-| JIT | `src/jit.c`, `src/a64emit.c` | native arm64 code generation and linking |
+| JIT | `src/jit.c`, `src/a64emit.c` | arm64 code generation, block chaining, superblocks |
 | Mini-dyld | `src/dyld.c`, `src/cache.c`, `src/dyldapi.c` | shared cache, symbols, fixups, Objective-C |
-| Syscalls | `src/syscall.c` | BSD, Mach, signals, threads, and WoW64 host calls |
+| Syscalls | `src/syscall.c` | BSD, Mach, signals, threads and WoW64 host calls |
 
 ## Limitations
 
 - Application compatibility is incomplete; unsupported syscalls and framework behavior remain.
-- Generic late-loaded shared-cache Objective-C images are not fully registered. Wine uses a targeted compatibility preload.
-- x87 uses 64-bit doubles instead of 80-bit extended precision.
-- Dynamic MXCSR rounding modes and approximate `RCP`/`RSQRT` results are not implemented.
+- Late-loaded shared-cache Objective-C images are not fully registered in general. Wine uses a targeted preload.
+- x87 uses 64-bit doubles rather than 80-bit extended precision.
+- Dynamic MXCSR rounding modes and the approximate `RCP`/`RSQRT` results are not implemented.
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
 
 ## License
