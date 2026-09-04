@@ -225,6 +225,7 @@ typedef struct {
     uint8_t dbl, packed, vr, va, vb, t1;
     uint8_t cvt;        /* 0 none, 1 cvtt->int64 indefinite, 2 cvtt->int32 exact recompute */
     uint8_t refcmp;     /* scalar arm: redo fcmp(vr, vr) before returning (a conversion may reuse NZCV) */
+    uint8_t pre, pvr, pva, pvb;   /* cvt arm: first the exact-NaN fix of the scalar op whose branch it absorbed */
     int idx;
     int is_cbz;
 } NanOolPend;
@@ -647,6 +648,8 @@ static inline int rsp_is_ptr(void)
 int g_pin_class_fwd(void) { return g_pin_class; }
 
 static int g_defer;
+static int16_t g_mov_sink_at[JIT_MAX_BLOCK_INSNS];   /* shift j: index of the mov it absorbs, or -1 (see mov_sink_scan) */
+static uint8_t g_mov_skip[JIT_MAX_BLOCK_INSNS];      /* mov i: sunk, emit nothing */
 static _Atomic unsigned long long ps_ops[OCERZ_OP_COUNT];
 /* per op: up to 3 distinct instruction shapes seen going slow (for the report) */
 static char ps_shapes[OCERZ_OP_COUNT][3][96];
@@ -1072,6 +1075,7 @@ static int g_xlive_log = -1;
 
 static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth);
 static void fpb_site_emit(A64Buf *b, int end, int va, int vb, int dbl);
+static int unsafe_nocheckbr(void);
 static int fpb_det_here(int idx);
 /* Flags live at the entry of the (not yet translated) code at rip: decode up to the terminator */
 static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
@@ -2496,6 +2500,8 @@ static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
             int rd = pin_hreg(ds), rn = rd;
             if (op == OCERZ_OP_SHL || op == OCERZ_OP_SHR || op == OCERZ_OP_SAR) {
                 int hs; if (fuse_prev_mov(b, d->reg, d->size, &hs, insn) >= 0) rn = hs;
+                else if (g_cur_insns_fwd() && g_cur_insn_idx >= 0 && g_mov_sink_at[g_cur_insn_idx] >= 0)
+                    rn = pin_hreg(pin_slot(g_cur_insns_fwd()[g_mov_sink_at[g_cur_insn_idx]].ops[1].reg));
             }
             switch (op) {
             case OCERZ_OP_SHL: a64_lsl_imm(b, sf, rd, rn, (int)cnt); break;
@@ -5869,6 +5875,23 @@ static void emit_nan_cold_scalar(A64Buf *b, int dbl, int vr, int va, int vb)
     a64_fmov_v_from_x(b, dbl, vr, JT0);
     a64_patch_b(done, a64_label(b));
 }
+/* A scalar op's NaN branch merged into the conversion that follows it: the
+ * conversion's check reuses the op's fcmp, and its out-of-line arm runs the
+ * op's exact-NaN fix before its own (see emit_sse_cvt). */
+static struct { int valid, idx, dbl, vr, va, vb; } g_scpend;
+static int g_scalar_merge_next;
+static int scalar_cvt_follows(unsigned xreg, int dbl)
+{
+    if (!dbl || !g_cur_insns || g_cur_insn_idx < 0 || g_cur_insn_idx + 1 >= g_cur_insns_n) return 0;
+    if (g_n_nanool + 2 > NANOOL_MAX || unsafe_nocheckbr()) return 0;
+    const X86Insn *c = &g_cur_insns[g_cur_insn_idx + 1];
+    if (c->op != OCERZ_OP_CVTTSD2SI || c->nops != 2) return 0;
+    const X86Operand *d = &c->ops[0], *sr = &c->ops[1];
+    if (sr->kind != OCERZ_OPK_XMM || sr->reg != xreg || !xmm_is_pinned(xreg)) return 0;
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+    if (rsp_is_ptr() && d->reg == OCERZ_RSP) return 0;
+    return 1;
+}
 static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
 {
     a64_fcmp(b, dbl, vr, vr);
@@ -5876,12 +5899,18 @@ static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
      * both paths leave NZCV = fcmp(vr, vr) */
     g_fcmp_self_vreg = vr;
     g_fcmp_self_idx = g_cur_insn_idx + 1;
+    if (g_scalar_merge_next) {
+        g_scalar_merge_next = 0;
+        g_scpend.valid = 1; g_scpend.idx = g_cur_insn_idx; g_scpend.dbl = dbl;
+        g_scpend.vr = vr; g_scpend.va = va; g_scpend.vb = vb;
+        return;
+    }
     if (g_n_nanool < NANOOL_MAX) {
         NanOolPend *o = &g_nanool[g_n_nanool++];
         o->site = a64_label(b); a64_bcond(b, A64_VS, 0);      /* NaN -> out of line */
         o->back = a64_label(b);
         o->dbl = (uint8_t)dbl; o->packed = 0; o->vr = (uint8_t)vr; o->va = (uint8_t)va; o->vb = (uint8_t)vb; o->t1 = 0;
-        o->cvt = 0; o->refcmp = 1; o->idx = g_cur_insn_idx; o->is_cbz = 0;
+        o->cvt = 0; o->refcmp = 1; o->pre = 0; o->idx = g_cur_insn_idx; o->is_cbz = 0;
         return;
     }
     /* table full: inline cold path */
@@ -5889,6 +5918,14 @@ static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
     emit_nan_cold_scalar(b, dbl, vr, va, vb);
     a64_fcmp(b, dbl, vr, vr);
     a64_patch_bcond(ok, a64_label(b));
+}
+/* The merge did not happen after all: give the scalar op its own branch now. */
+static void scalar_pend_flush(A64Buf *b)
+{
+    if (!g_scpend.valid) return;
+    g_scpend.valid = 0;
+    g_scalar_merge_next = 0;
+    emit_nan_fix_scalar2(b, g_scpend.dbl, g_scpend.vr, g_scpend.va, g_scpend.vb);
 }
 /* Packed: per-lane exact rule.  Constants: V4/V6 = quiet bit per lane (2D/4S),
  * V5/V7 = default NaN per lane. */
@@ -5957,7 +5994,7 @@ static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int
         o->site = a64_label(b); a64_bcond(b, A64_NE, 0);      /* NaN -> out of line */
         o->back = a64_label(b);
         o->dbl = (uint8_t)dbl; o->packed = 1; o->vr = (uint8_t)vr; o->va = (uint8_t)va; o->vb = (uint8_t)vb; o->t1 = (uint8_t)t1;
-        o->cvt = 0; o->refcmp = 0; o->idx = g_cur_insn_idx; o->is_cbz = 0;
+        o->cvt = 0; o->refcmp = 0; o->pre = 0; o->idx = g_cur_insn_idx; o->is_cbz = 0;
         return;
     }
     uint32_t *ok = a64_label(b); a64_bcond(b, A64_EQ, 0);
@@ -5973,6 +6010,13 @@ static void emit_nan_ool_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
         const NanOolPend *o = &g_nanool[i];
         uint32_t *lo = a64_label(b);
         if (o->is_cbz) a64_patch_cbz(o->site, lo); else a64_patch_bcond(o->site, lo);
+        if (o->pre) {
+            /* the scalar op's NaN (a saturated conversion arrives here too: skip then) */
+            a64_fcmp(b, o->dbl, o->pvr, o->pvr);
+            uint32_t *sk = a64_label(b); a64_bcond(b, A64_VC, 0);
+            emit_nan_cold_scalar(b, o->dbl, o->pvr, o->pva, o->pvb);
+            a64_patch_bcond(sk, a64_label(b));
+        }
         if (o->cvt == 1) {
             a64_movz(b, o->vr, 0x8000, 3);                    /* INT64_MIN */
         } else if (o->cvt == 2) {
@@ -6036,6 +6080,76 @@ static uint8_t g_fpb_member[JIT_MAX_BLOCK_INSNS];   /* arithmetic/move member: i
 static uint8_t g_fpb_det[JIT_MAX_BLOCK_INSNS];      /* its fcmp detects for the open batch */
 static uint16_t g_fpb_sidechk[JIT_MAX_BLOCK_INSNS]; /* regs the side-exit stub of this jcc checks */
 static uint16_t g_fpb_mrd[JIT_MAX_BLOCK_INSNS], g_fpb_mwr[JIT_MAX_BLOCK_INSNS];   /* xmm reads/writes per insn */
+
+/* ---- mov sinking ---- `mov rD, rS` a few instructions ahead of a shift of
+ * rD by an immediate (sign extraction: mov r9, r8 ... sar r9, 63) is not
+ * emitted; the shift reads rS instead.  Legal when nothing in between
+ * touches rD, writes rS, can fault (memory), or leaves the block. */
+static int mov_sink_gap_ok(const X86Insn *in, unsigned dreg, unsigned sreg)
+{
+    switch (in->op) {
+    case OCERZ_OP_MOV: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: case OCERZ_OP_LEA:
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
+    case OCERZ_OP_CMP: case OCERZ_OP_TEST: case OCERZ_OP_INC: case OCERZ_OP_DEC:
+    case OCERZ_OP_NEG: case OCERZ_OP_NOT: case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR:
+    case OCERZ_OP_ADDSS: case OCERZ_OP_ADDSD: case OCERZ_OP_SUBSS: case OCERZ_OP_SUBSD:
+    case OCERZ_OP_MULSS: case OCERZ_OP_MULSD: case OCERZ_OP_DIVSS: case OCERZ_OP_DIVSD:
+    case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_MINSS: case OCERZ_OP_MINSD:
+    case OCERZ_OP_MAXSS: case OCERZ_OP_MAXSD:
+    case OCERZ_OP_ADDPS: case OCERZ_OP_ADDPD: case OCERZ_OP_SUBPS: case OCERZ_OP_SUBPD:
+    case OCERZ_OP_MULPS: case OCERZ_OP_MULPD: case OCERZ_OP_DIVPS: case OCERZ_OP_DIVPD:
+    case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTTSD2SI:
+    case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
+    case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU:
+    case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX: case OCERZ_OP_UNPCKHPD: case OCERZ_OP_UNPCKLPD:
+        break;
+    default:
+        return 0;                         /* implicit registers, memory strings, control flow ... */
+    }
+    if (in->seg != OCERZ_SEG_NONE) return 0;
+    for (int k = 0; k < in->nops; k++) {
+        const X86Operand *o = &in->ops[k];
+        if (o->kind == OCERZ_OPK_MEM) {
+            if (in->op != OCERZ_OP_LEA) return 0;                       /* may fault */
+            if (o->base == dreg || o->index == dreg) return 0;
+            continue;
+        }
+        if (o->kind != OCERZ_OPK_REG) continue;
+        if ((o->reg & 15) == (dreg & 15)) return 0;                     /* any touch of rD */
+        if (k == 0 && (o->reg & 15) == (sreg & 15)) return 0;           /* rS rewritten */
+    }
+    /* shifts by cl read rcx implicitly */
+    if ((in->op == OCERZ_OP_SHL || in->op == OCERZ_OP_SHR || in->op == OCERZ_OP_SAR) &&
+        in->ops[1].kind != OCERZ_OPK_IMM) return 0;
+    return 1;
+}
+static void mov_sink_scan(const X86Insn *insns, int n, const uint64_t *fl_need)
+{
+    for (int i = 0; i < n; i++) { g_mov_sink_at[i] = -1; g_mov_skip[i] = 0; }
+    static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_MOVFUSE") ? 1 : 0;
+    if (dis || !g_defer || g_xlat_mode32) return;
+    for (int i = 0; i + 1 < n; i++) {
+        const X86Insn *m = &insns[i];
+        if (m->op != OCERZ_OP_MOV || m->nops != 2) continue;
+        const X86Operand *md = &m->ops[0], *ms = &m->ops[1];
+        if (md->kind != OCERZ_OPK_REG || ms->kind != OCERZ_OPK_REG || md->high8 || ms->high8) continue;
+        if ((md->size != 4 && md->size != 8) || ms->size != md->size || md->reg == ms->reg) continue;
+        if (pin_slot(md->reg) < 0 || pin_slot(ms->reg) < 0) continue;
+        if (rsp_is_ptr() && (md->reg == OCERZ_RSP || ms->reg == OCERZ_RSP)) continue;
+        for (int j = i + 2; j < n && j <= i + 5; j++) {       /* adjacent pairs: fuse_prev_mov */
+            const X86Insn *t = &insns[j];
+            if (!mov_sink_gap_ok(&insns[j - 1], md->reg, ms->reg)) break;
+            if ((t->op == OCERZ_OP_SHL || t->op == OCERZ_OP_SHR || t->op == OCERZ_OP_SAR) &&
+                t->ops[0].kind == OCERZ_OPK_REG && !t->ops[0].high8 && t->ops[0].reg == md->reg &&
+                t->ops[0].size == md->size && t->ops[1].kind == OCERZ_OPK_IMM && fl_need[j] == 0) {
+                g_mov_sink_at[j] = (int16_t)i;
+                g_mov_skip[i] = 1;
+                break;
+            }
+            if (!mov_sink_gap_ok(t, md->reg, ms->reg)) break;
+        }
+    }
+}
 static uint8_t g_fpb_mmem[JIT_MAX_BLOCK_INSNS], g_fpb_marith[JIT_MAX_BLOCK_INSNS]; /* member reads memory / is arithmetic */
 static int g_fpb_open = -1;                          /* batch open at the emission point */
 static const int8_t *g_fpb_of;                       /* per-insn batch index of the block being emitted */
@@ -6779,6 +6893,7 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
                 fb = VX3;
             }
             a64_fsqrt_s(b, dbl, t, vb);
+            g_scalar_merge_next = t != VX2 && scalar_cvt_follows(d->reg, dbl);
             emit_nan_fix_scalar2(b, dbl, t, fb, fb);
             emit_xmm_st_lo(b, esz, t, d->reg);
         }
@@ -6857,6 +6972,7 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
         case 2: a64_fmul_s(b, dbl, t, va, vb); break;
         case 3: a64_fdiv_s(b, dbl, t, va, vb); break;
         }
+        g_scalar_merge_next = t != VX2 && scalar_cvt_follows(d->reg, dbl);
         emit_nan_fix_scalar2(b, dbl, t, fa, fb);
         emit_xmm_st_lo(b, esz, t, d->reg);   /* only low lane written */
     }
@@ -6968,6 +7084,13 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         /* x86: NaN or out-of-range -> "integer indefinite" (INT_MIN); arm64 fcvtzs saturates (NaN -> 0). */
         int ds = pin_slot(d->reg);
         int rd = ds >= 0 ? pin_hreg(ds) : JT0;
+        int reuse = dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs;
+        int pend = g_scpend.valid && g_scpend.idx == g_cur_insn_idx - 1;
+        if (pend && (!reuse || g_n_nanool + 1 > NANOOL_MAX || unsafe_nocheckbr())) {
+            scalar_pend_flush(b);            /* the merge is off: the op gets its own branch */
+            pend = 0;
+            reuse = dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs;
+        }
         if (g_n_nanool + 1 <= NANOOL_MAX) {
             /* rare cases out of line behind one branch: fcmp raises V for
              * NaN, and the conditional compare runs only when it did not,
@@ -6976,7 +7099,7 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
             a64_fcvtzs(b, d->size == 8, dbl, rd, vs);
             /* the batch check that just closed compared this very lane with
              * itself and nothing since has written NZCV: reuse its V */
-            if (!(dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs))
+            if (!reuse)
                 a64_fcmp(b, dbl, vs, vs);
             g_fcmp_self_idx = -1;
             a64_ccmn_imm(b, d->size == 8, rd, 1, 1, A64_VC);
@@ -6987,6 +7110,8 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
                 o->dbl = (uint8_t)dbl; o->packed = 0; o->vr = (uint8_t)rd;
                 o->va = (uint8_t)vs; o->vb = 0; o->t1 = 0;
                 o->cvt = d->size == 8 ? 1 : 2; o->refcmp = 0;
+                o->pre = (uint8_t)pend;
+                if (pend) { o->pvr = (uint8_t)g_scpend.vr; o->pva = (uint8_t)g_scpend.va; o->pvb = (uint8_t)g_scpend.vb; g_scpend.valid = 0; }
                 o->idx = g_cur_insn_idx; o->is_cbz = 0;
             }
         } else if (d->size == 8) {
@@ -8449,7 +8574,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     uint64_t taken = jcc->ops[0].imm;
     uint64_t fall = jcc->rip + jcc->len;
     int self_loop = taken == g_self_rip;
-    int test_bit = -1;
+    int test_bit = -1, test_sf = 0;
     int test_rn = -1;
     uint64_t test_mask = 0;
     int cbz_rn = -1, cbz_sf = 0;   /* cmp x,0 + je/jne -> cbz/cbnz (no subs, record dst = xzr) */
@@ -8522,10 +8647,11 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         int ds = pin_slot(d->reg);
         int rn = ds >= 0 ? pin_hreg(ds) : JT0;
         if (ds < 0) emit_gpr_rd(b, 1, JT0, d->reg);
-        if (!self_loop && v != 0 && (v & (v - 1)) == 0) {
+        if (v != 0 && (v & (v - 1)) == 0) {
             test_bit = __builtin_ctzll(v);
             test_rn = rn;
             test_mask = v;
+            test_sf = 0;
         } else if (!a64_try_ands_imm(b, 0, JT2, rn, v)) {
             a64_mov_imm64(b, JT1, v);
             a64_ands_reg(b, 0, JT2, rn, JT1, 0);
@@ -8622,10 +8748,11 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             uint64_t v = s->imm;
             if (!sf)
                 v &= 0xffffffffull;
-            if (!self_loop && v != 0 && (v & (v - 1)) == 0) {
+            if (v != 0 && (v & (v - 1)) == 0) {
                 test_bit = __builtin_ctzll(v);
                 test_rn = rn;
                 test_mask = v;
+                test_sf = sf;
                 emitted = 1;
             } else {
                 emitted = a64_try_ands_imm(b, sf, JT2, rn, v);
@@ -8804,8 +8931,22 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         return 0;
 
     l0_fixed_backedge(b);
+    int tb_ok = 0;
+    if (test_bit >= 0) {
+        /* single-bit test on the back edge: tbz/tbnz when the loop head is
+         * within imm14 reach, else the ands the fold left out */
+        ptrdiff_t reach = g_loop_entry - a64_label(b);
+        tb_ok = reach >= -(ptrdiff_t)(1 << 13) && reach < (ptrdiff_t)(1 << 13);
+        if (!tb_ok && !a64_try_ands_imm(b, test_sf, JT2, test_rn, test_mask)) {
+            a64_mov_imm64(b, JT1, test_mask);
+            a64_ands_reg(b, test_sf, JT2, test_rn, JT1, 0);
+        }
+    }
     g_stop_patch = a64_label(b);
-    if (cbz_rn >= 0) {
+    if (test_bit >= 0 && tb_ok) {
+        if (jcc->cc == OCERZ_CC_E) a64_tbz(b, test_rn, test_bit, (int32_t)(g_loop_entry - g_stop_patch));
+        else                       a64_tbnz(b, test_rn, test_bit, (int32_t)(g_loop_entry - g_stop_patch));
+    } else if (cbz_rn >= 0) {
         if (jcc->cc == OCERZ_CC_E) a64_cbz(b, cbz_sf, cbz_rn, (int32_t)(g_loop_entry - g_stop_patch));
         else                       a64_cbnz(b, cbz_sf, cbz_rn, (int32_t)(g_loop_entry - g_stop_patch));
     } else
@@ -8816,8 +8957,12 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
             emit_defer_flags(b, ccop, record_src, record_dst);
         }
-        else
+        else {
+            /* the fold never computed the masked value: on this (not-taken)
+             * side the tested bit is known */
+            if (test_bit >= 0) a64_mov_imm64(b, JT2, jcc->cc == OCERZ_CC_E ? test_mask : 0);
             emit_defer_flags(b, ccop, JT2, JT2);
+        }
     }
     /* loop exit: chain into the fall-through block like any other edge
      * (used to leave through the frame epilogue + dispatcher every time) */
@@ -8839,8 +8984,10 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
             emit_defer_flags(b, ccop, record_src, record_dst);
         }
-        else
+        else {
+            if (test_bit >= 0) a64_mov_imm64(b, JT2, jcc->cc == OCERZ_CC_E ? 0 : test_mask);   /* taken side */
             emit_defer_flags(b, ccop, JT2, JT2);
+        }
     }
     a64_mov_imm64(b, JT0, taken);
     a64_str(b, 8, JT0, 20, RIP_OFF);
@@ -12310,6 +12457,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     int n_epi = 0;
     int8_t fpb_of[JIT_MAX_BLOCK_INSNS];
     fpb_scan(blk->insns, n, fpb_of);
+    mov_sink_scan(blk->insns, n, fl_need);
+    g_scpend.valid = 0; g_scalar_merge_next = 0;
     g_fpb_of = fpb_of;
     g_fpb_open = -1;
     g_fpb_fast = 0;
@@ -12329,6 +12478,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         g_cur_need = fl_need[i];
         g_cur_insns = blk->insns; g_cur_insns_n = n;
         g_cur_fpb = fpb_of[i];
+        if (g_scpend.valid && g_scpend.idx < i - 1) scalar_pend_flush(&b);   /* insurance: never unconsumed */
         g_fpb_open = fpb_open;
         g_fpb_fast = fpb_open >= 0 && g_fpb_member[i];   /* region non-members emit normally */
         ea_cache_step(insn, i > 0 ? &blk->insns[i - 1] : NULL);
@@ -12699,6 +12849,11 @@ promo_push_fallthrough:
                 blk->n_inlined++;
                 continue;
             }
+        }
+        if (g_mov_skip[i]) {                    /* sunk into the shift that follows */
+            if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
+            blk->n_inlined++;
+            continue;
         }
         if (!try_inline(&b, insn, fl_need[i], exit_sites, &n_exits)) {
             emit_slowcall(&b, insn, exit_sites, &n_exits);
