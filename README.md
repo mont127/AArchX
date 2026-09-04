@@ -14,6 +14,7 @@
   <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
+  <img alt="version" src="https://img.shields.io/badge/version-0.1-green.svg">
 </p>
 
 > [!WARNING]
@@ -27,6 +28,7 @@ The Rosetta package still has to be installed, because it is what ships the x86-
 
 ```sh
 make -j
+./ocerz version
 ./ocerz tests/guest/bin/hello
 ./ocerz /Applications/SomeApp.app/Contents/MacOS/SomeApp
 ```
@@ -46,8 +48,12 @@ make -j
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
 | x86-64 guest gate | 75 / 75 |
-| x86-64 differential gate | 56 / 56 |
+| x86-64 differential gate (interpreter vs JIT) | 64 / 64 |
 | i386 differential gate | 20,032 / 20,032 |
+| dynamic-mode tests | 5 / 5 |
+| xbench output vs native | 15 / 15 kernels bit-identical |
+| xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
+| Wine boot (MacNdCheese build, `cmd /c ver`) | 16 s |
 
 What is in the box:
 
@@ -106,6 +112,7 @@ These kernels never create a thread, fork or map shared memory, so they run in p
 
 ```text
 usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]
+       ocerz version
 ```
 
 | Option | Effect |
@@ -116,6 +123,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `-no-jit` | interpret this process only |
 | `-path file` | load `file` but keep the following guest arguments as they are |
 | `--` | end of AArchX options |
+| `version` | print the name and version (`AArchX 0.1`) |
 
 | Environment | Effect |
 | --- | --- |

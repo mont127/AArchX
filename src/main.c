@@ -1,5 +1,6 @@
 /* Command-line parsing and the entry point. */
 #include <string.h>
+#include "ocerz/version.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/dyld.h"
@@ -12,7 +13,8 @@ extern char **environ;
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]\n");
+    fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]\n"
+                    "       ocerz version\n");
 }
 
 static int is_wine_loader(const char *path)
@@ -75,6 +77,11 @@ int main(int argc, char **argv)
     const char *load_path = NULL;
     setenv("MallocNanoZone", "0", 1);
     int i = 1;
+    if (argc == 2 && (strcmp(argv[1], "version") == 0 || strcmp(argv[1], "-version") == 0 ||
+                      strcmp(argv[1], "--version") == 0)) {
+        printf("%s %s\n", OCERZ_PROJECT, OCERZ_VERSION);
+        return 0;
+    }
     for (; i < argc; i++) {
         if (argv[i][0] != '-')
             break;
