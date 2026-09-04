@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="460" alt="ArmX" src="[https://github.com/user-attachments/assets/9a5cd4c8-9cf1-45cd-b4e1-7865adca40b3](https://github.com/user-attachments/assets/53b06c7b-99bd-44e6-9325-38992f6219f1)" />
+  <img width="852" height="418" alt="Screenshot 2026-09-04 at 19 53 16" src="https://github.com/user-attachments/assets/08becae1-7ea9-4f61-9ba9-2a57424235a7" />
 </p>
 
 <h1 align="center"><em>ArmX</em></h1>
