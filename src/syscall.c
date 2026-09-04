@@ -165,13 +165,29 @@ static void ret_err(OcerzCPU *cpu, uint64_t errno_v)
 {
     sysret_flags(cpu, SYSRET_FLAGS_ERR);
     cpu->gpr[OCERZ_RAX] = errno_v;
-    cpu->gpr[OCERZ_RDX] = 0;
+    cpu->gpr[OCERZ_RDX] = 0;            /* Rosetta zeroes rdx on errors too (probed 2026-09-04) */
 }
 
 static void mach_ret(OcerzCPU *cpu, uint64_t kr)
 {
     sysret_flags(cpu, SYSRET_FLAGS_MACH);
     cpu->gpr[OCERZ_RAX] = kr;
+}
+
+/* Machdep (class 3) syscalls return through rax alone: XNU's machdep path
+ * leaves rdx and the arithmetic flags as they were, and Wine's syscall
+ * dispatcher keeps its frame pointer in rdx across thread_set_tsd_base.
+ * Zeroing rdx there (the unix-class rule) cost every Wine process a NULL
+ * dereference at the first return to PE code (2026-09-04). */
+static void machdep_ret(OcerzCPU *cpu, uint64_t v)
+{
+    sysret_flags(cpu, SYSRET_FLAGS_MACH);      /* AF, like a mach trap (probed 2026-09-04) */
+    cpu->gpr[OCERZ_RAX] = v;
+}
+static void machdep_err(OcerzCPU *cpu, uint64_t errno_v)
+{
+    sysret_flags(cpu, SYSRET_FLAGS_ERR);
+    cpu->gpr[OCERZ_RAX] = errno_v;
 }
 
 static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
@@ -3363,6 +3379,8 @@ static void strace_bsd(OcerzVM *vm, const ocerz_bsd_entry *e, int num,
         fprintf(stderr, "%s%#llx", i ? ", " : "", (unsigned long long)orig[i]);
     if (cpu->rflags & OCERZ_CF)
         fprintf(stderr, ") = -1 %s\n", errno_name((int)cpu->gpr[OCERZ_RAX]));
+    else if (n < 3 && orig[2] != 0)
+        fprintf(stderr, ") = %#llx [rdx_in=%#llx]\n", (unsigned long long)cpu->gpr[OCERZ_RAX], (unsigned long long)orig[2]);
     else
         fprintf(stderr, ") = %#llx\n", (unsigned long long)cpu->gpr[OCERZ_RAX]);
     if (e && e->name && (strcmp(e->name, "open") == 0 || strcmp(e->name, "access") == 0)) {
@@ -5239,7 +5257,7 @@ static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
     uint64_t descs = cpu->gpr[OCERZ_RSI];
     int32_t count = (int32_t)cpu->gpr[OCERZ_RDX];
     if (count < 0 || count > OCERZ_LDT_MAX || descs == 0) {
-        ret_err(cpu, EINVAL);
+        machdep_err(cpu, EINVAL);
         return OCERZ_STEP_OK;
     }
     pthread_mutex_lock(&g_ldt_lock);
@@ -5248,7 +5266,7 @@ static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
         if (start < 0) {
             if (g_ldt_next + (int)count > OCERZ_LDT_MAX) {
                 pthread_mutex_unlock(&g_ldt_lock);
-                ret_err(cpu, ENOMEM);
+                machdep_err(cpu, ENOMEM);
                 return OCERZ_STEP_OK;
             }
             idx = g_ldt_next;
@@ -5260,7 +5278,7 @@ static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
             idx = (int)start;
             if (idx < 0 || idx + (int)count > OCERZ_LDT_MAX) {
                 pthread_mutex_unlock(&g_ldt_lock);
-                ret_err(cpu, EINVAL);
+                machdep_err(cpu, EINVAL);
                 return OCERZ_STEP_OK;
             }
             if (idx + (int)count > g_ldt_next)
@@ -5276,20 +5294,20 @@ static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
             fprintf(stderr, "ocerz: LDT set idx=%d count=%lld base=%#llx big=%d access=%#x\n",
                     idx, (long long)count, (unsigned long long)g_ldt[idx].base,
                     g_ldt[idx].big, g_ldt[idx].access);
-        ret_ok(cpu, (uint64_t)(uint32_t)idx);
+        machdep_ret(cpu, (uint64_t)(uint32_t)idx);
         return OCERZ_STEP_OK;
     }
 
     int idx = (int)start;
     if (idx < 0 || idx + (int)count > OCERZ_LDT_MAX) {
         pthread_mutex_unlock(&g_ldt_lock);
-        ret_err(cpu, EINVAL);
+        machdep_err(cpu, EINVAL);
         return OCERZ_STEP_OK;
     }
     for (int i = 0; i < count; i++)
         ocerz_st(descs + (uint64_t)i * 8, 8, ocerz_ldt_pack(&g_ldt[idx + i]));
     pthread_mutex_unlock(&g_ldt_lock);
-    ret_ok(cpu, (uint64_t)(uint32_t)count);
+    machdep_ret(cpu, (uint64_t)(uint32_t)count);
     return OCERZ_STEP_OK;
 }
 
@@ -5323,13 +5341,13 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
                 fprintf(stderr, "ocerz: GS machdep KEEP gs=%#llx (rejected junk %#llx) rip=%#llx\n",
                         (unsigned long long)cpu->gs_base, (unsigned long long)newgs,
                         (unsigned long long)cpu->rip);
-            ret_ok(cpu, 0x60);
+            machdep_ret(cpu, cpu->gs_base);
             return OCERZ_STEP_OK;
         }
         cpu->gs_base = newgs;
         if (ocerz_gs_is_teb_band(newgs))
             cpu->wine_teb_base = newgs;
-        ret_ok(cpu, 0x60);
+        machdep_ret(cpu, cpu->gs_base);
         if (getenv("OCERZ_GSTRACE"))
             fprintf(stderr, "ocerz: GS machdep[%d] cpu#%u gs=%#llx teb=%#llx rip=%#llx icount=%#llx%s\n",
                     (int)getpid(), cpu->cpu_number,
