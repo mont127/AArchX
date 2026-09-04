@@ -6126,7 +6126,7 @@ static int mov_sink_gap_ok(const X86Insn *in, unsigned dreg, unsigned sreg)
 static void mov_sink_scan(const X86Insn *insns, int n, const uint64_t *fl_need)
 {
     for (int i = 0; i < n; i++) { g_mov_sink_at[i] = -1; g_mov_skip[i] = 0; }
-    static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_MOVFUSE") ? 1 : 0;
+    static int dis = -1; if (dis < 0) dis = (getenv("OCERZ_NO_MOVFUSE") || getenv("OCERZ_NO_MOVSINK")) ? 1 : 0;
     if (dis || !g_defer || g_xlat_mode32) return;
     for (int i = 0; i + 1 < n; i++) {
         const X86Insn *m = &insns[i];
