@@ -3454,8 +3454,18 @@ static void ea_cache_step(const X86Insn *in, const X86Insn *prev)   /* called be
         (insn_may_write_gpr(in, g_ea_cache.index) || (prev && insn_may_write_gpr(prev, g_ea_cache.index)))) { g_ea_cache.valid = 0; return; }
 }
 
+static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand *op,
+                                int size, int *ra_out, uint32_t *disp_out, int unscaled_ok);
+/* ra + a non-negative scaled displacement the access folds as imm12 */
 static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *op,
                              int size, int *ra_out, uint32_t *disp_out)
+{
+    return emit_mem_ea_plain_ex(b, insn, op, size, ra_out, disp_out, 0);
+}
+/* unscaled_ok: the caller also takes a signed 9-bit displacement (ldur/stur,
+ * ldapur/stlur), so [rbp-0x40] needs no sub */
+static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand *op,
+                                int size, int *ra_out, uint32_t *disp_out, int unscaled_ok)
 {
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
@@ -3482,7 +3492,8 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
     if (op->index != OCERZ_REG_NONE && pin_slot(op->index) < 0) return 0;
     X86Operand mview; op = mem_hoist_view(op, &mview);
     int64_t disp = op->disp;
-    int fits = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
+    int fits = (disp >= 0 && (disp % size) == 0 && disp / size <= 4095) ||
+               (unscaled_ok && disp >= -256 && disp <= 255);
     int have = 0;
     int hreg = op->base != OCERZ_REG_NONE ? hoist_reg_for(op->base) : -1;
     if (fits && (op->base != OCERZ_REG_NONE || op->index != OCERZ_REG_NONE) && ea_cache_reusable(b, op)) {
@@ -3587,7 +3598,7 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
         }
     }
 generic:
-    if (!emit_mem_ea_plain(b, insn, op, size, &ra, &disp)) return 0;
+    if (!emit_mem_ea_plain_ex(b, insn, op, size, &ra, &disp, 1)) return 0;
     emit_gpr_ld_at(b, size, rd, ra, (int32_t)disp, plain);
     return 1;
 }
@@ -6141,7 +6152,8 @@ static void mov_sink_scan(const X86Insn *insns, int n, const uint64_t *fl_need)
             if (!mov_sink_gap_ok(&insns[j - 1], md->reg, ms->reg)) break;
             if ((t->op == OCERZ_OP_SHL || t->op == OCERZ_OP_SHR || t->op == OCERZ_OP_SAR) &&
                 t->ops[0].kind == OCERZ_OPK_REG && !t->ops[0].high8 && t->ops[0].reg == md->reg &&
-                t->ops[0].size == md->size && t->ops[1].kind == OCERZ_OPK_IMM && fl_need[j] == 0) {
+                t->ops[0].size == md->size && t->ops[1].kind == OCERZ_OPK_IMM && fl_need[j] == 0 &&
+                (t->ops[1].imm & (md->size == 8 ? 63u : 31u)) != 0) {   /* a zero count emits nothing */
                 g_mov_sink_at[j] = (int16_t)i;
                 g_mov_skip[i] = 1;
                 break;
