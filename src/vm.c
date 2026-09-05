@@ -391,6 +391,15 @@ uint64_t ocerz_current_guest_rsp(void)
     return g_cur_cpu ? g_cur_cpu->gpr[OCERZ_RSP] : 0;
 }
 
+uint64_t ocerz_current_guest_gpr(int i)
+{
+    return (g_cur_cpu && i >= 0 && i < 16) ? g_cur_cpu->gpr[i] : 0;
+}
+uint64_t ocerz_current_dbg_ind_src(void)
+{
+    return g_cur_cpu ? g_cur_cpu->dbg_ind_src : 0;
+}
+
 void ocerz_watch_hit(uint64_t gaddr, int size, uint64_t lo, uint64_t hi)
 {
     OcerzCPU *c = g_cur_cpu ? g_cur_cpu : (g_vm ? &g_vm->cpu : NULL);

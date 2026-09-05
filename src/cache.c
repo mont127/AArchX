@@ -342,6 +342,16 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
         uint64_t slide_off = rd64(m + 24);
         uint64_t slide_size = rd64(m + 32);
         uint32_t initp = rd32(m + 52);
+        {
+            const char *cml = getenv("OCERZ_CACHEMAPLOG");
+            if (cml) {
+                uint64_t of = cml[0] ? strtoull(cml, NULL, 0) : 0;    /* optional address of interest */
+                fprintf(stderr, "ocerz: CMAP %s map%u addr=%#llx size=%#llx foff=%#llx slide_off=%#llx slide_size=%#llx initp=%#x %s\n",
+                        is_main?"main":"sub", i, (unsigned long long)addr, (unsigned long long)size,
+                        (unsigned long long)foff, (unsigned long long)slide_off, (unsigned long long)slide_size, initp,
+                        (of && of >= addr && of < addr + size) ? "<-- contains address of interest" : "");
+            }
+        }
         int prot = 0;
         if (initp & VM_PROT_READ)
             prot |= PROT_READ;
