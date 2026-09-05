@@ -317,6 +317,66 @@ static int shared_ro_overlaps(uint64_t gaddr, uint64_t len)
     return 0;
 }
 
+/* Read [lo, hi) of the guest range from the file; a short read (EOF) leaves
+ * the rest of the anonymous page zero, which is what a mapping past the end
+ * of a file reads as. */
+static int pread_range(int fd, uint64_t gaddr, uint64_t lo, uint64_t hi, uint64_t pos)
+{
+    while (lo < hi) {
+        ssize_t n = pread(fd, ocerz_g2h(lo), (size_t)(hi - lo), (off_t)(pos + (lo - gaddr)));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return errno;
+        }
+        if (n == 0) break;
+        lo += (uint64_t)n;
+    }
+    return 0;
+}
+
+/* A MAP_PRIVATE file mapping used to be read into anonymous memory in full:
+ * guest pages are 4 KB and host pages 16 KB, so the host cannot map the file
+ * at every guest offset.  When the file offset and the guest address agree
+ * modulo 16 KB, which they do for nearly everything wine maps (PE images at
+ * 64 KB-aligned bases, fonts, resource files), the 16 KB-aligned interior can
+ * be a real private mapping of the file: its pages then sit in the shared
+ * page cache instead of being copied into each process.  A GUI Wine process
+ * carried 280 MB of such copies, and wine maps every system font this way
+ * while enumerating fonts (5 GB of Songti.ttc in one winemine run).  The
+ * partial head and tail pages, and any range beyond the file, are still read
+ * in.  The memory layer does not track host backing, so nothing else
+ * changes: mprotect works on file pages, a partial unmap keeps the page, and
+ * a replacement mapping remaps the page anonymous. */
+static int private_file_backing(uint64_t gaddr, uint64_t len, int fd, uint64_t pos)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_FILEMAP") ? 1 : 0;
+    uint64_t lo = gaddr, hi = gaddr + len;
+    uint64_t ilo = (lo + 0x3fffull) & ~0x3fffull, ihi = hi & ~0x3fffull;
+    struct stat st;
+    if (!off && ((pos - gaddr) & 0x3fffull) == 0 && ihi > ilo &&
+        fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && (uint64_t)st.st_size > pos) {
+        /* pages wholly past EOF would SIGBUS; the page holding EOF reads zero past it */
+        uint64_t file_hi = gaddr + ((uint64_t)st.st_size - pos);
+        uint64_t mhi = (file_hi + 0x3fffull) & ~0x3fffull;
+        if (mhi > ihi) mhi = ihi;
+        if (mhi > ilo) {
+            void *hp = ocerz_g2h(ilo);
+            if (mmap(hp, (size_t)(mhi - ilo), PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_FIXED, fd, (off_t)(pos + (ilo - lo))) == hp) {
+                if (getenv("OCERZ_MEMTRACE"))
+                    fprintf(stderr, "ocerz: FILEMAP-DIRECT gaddr=%#llx interior=[%#llx,%#llx) of len=%#llx\n",
+                            (unsigned long long)gaddr, (unsigned long long)ilo,
+                            (unsigned long long)mhi, (unsigned long long)len);
+                int e = pread_range(fd, gaddr, lo, ilo, pos);
+                if (!e) e = pread_range(fd, gaddr, mhi, hi, pos);
+                return e;
+            }
+        }
+    }
+    return pread_range(fd, gaddr, lo, hi, pos);
+}
+
 static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t addr = a[0];
@@ -445,13 +505,10 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
     }
     {
-        uint64_t pa[8] = { (uint64_t)fd, (uint64_t)(uintptr_t)ocerz_g2h(gaddr), len, pos, 0, 0, 0, 0 };
-        int err = 0;
-        uint64_t ret2 = 0;
-        uint64_t r = ocerz_host_syscall(153, pa, &ret2, &err);
-        if (err) {
+        int e = private_file_backing(gaddr, len, fd, pos);
+        if (e) {
             ocerz_unmap(gaddr, len);
-            ret_err(cpu, r);
+            ret_err(cpu, (uint64_t)e);
             return OCERZ_STEP_OK;
         }
     }
@@ -3263,6 +3320,8 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [442] = { "guarded_close_np", 2, 0x02, 0, NULL },
     [443] = { "guarded_kqueue_np", 2, 0x01, 0, NULL },
     [444] = { "change_fdguard_np", 6, 0x2a, 0, NULL },
+    [484] = { "guarded_open_dprotected_np", 7, 0x03, 0, NULL },
+    [131] = { "flock", 2, 0x00, 0, NULL },
     [501] = { "necp_open", 1, 0x00, 0, NULL },
     [502] = { "necp_client_action", 6, 0x14, 0, NULL },
 

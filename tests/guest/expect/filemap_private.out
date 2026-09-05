@@ -1,0 +1,8 @@
+whole 1
+past-eof-zero 1
+beyond-file-zero 1
+cow 1
+neighbours 1
+offset4k 1
+fixed4k 1
+offset16k 1
