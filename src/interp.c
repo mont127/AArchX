@@ -810,7 +810,7 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
     case OCERZ_OP_MOVSEG: {
 
-        uint32_t sel = (uint32_t)ocerz_read_op(cpu, insn, &insn->ops[0]);
+        uint32_t sel = (uint16_t)ocerz_read_op(cpu, insn, &insn->ops[0]);
         unsigned seg = (unsigned)insn->ops[1].imm;
         uint64_t base = ocerz_ldt_base(sel);
         if (base) {
@@ -823,6 +823,14 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             cpu->seg_sel[seg] = (uint16_t)sel;
         if (seg == 1)
             cpu->cs_sel = (uint16_t)sel;
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_MOVFROMSEG: {
+        /* The live selector, zero-extended into the destination width the
+         * decoder chose (operand size for a register, 16 bits for memory). */
+        unsigned seg = (unsigned)insn->ops[1].imm;
+        uint64_t sel = seg == OCERZ_SREG_CS ? cpu->cs_sel : seg < 6 ? cpu->seg_sel[seg] : 0;
+        ocerz_write_op(cpu, insn, &insn->ops[0], sel);
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_JMPF:
@@ -838,7 +846,7 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         if (insn->nops == 2) {
             /* ptr16:32 direct form (0x9a / 0xea), i386 only.  The decoder
              * records it selector-first; the encoding is offset-first. */
-            sel = (uint32_t)insn->ops[0].imm;
+            sel = (uint16_t)insn->ops[0].imm;
             off = ocerz_trunc(insn->ops[1].imm, sz);
         } else {
             uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
@@ -855,7 +863,7 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         int m32 = insn->mode32;
         int ssz = m32 ? (insn->opsize ? insn->opsize : 4) : 8;
         uint64_t off = ocerz_pop_mode(cpu, ssz, m32);
-        uint32_t sel = (uint32_t)ocerz_pop_mode(cpu, ssz, m32);
+        uint32_t sel = (uint16_t)ocerz_pop_mode(cpu, ssz, m32);
         if (insn->nops == 1)
             cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(
                 cpu->gpr[OCERZ_RSP] + ocerz_trunc(insn->ops[0].imm, 2), m32);
@@ -867,11 +875,15 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         uint64_t sp = cpu->gpr[OCERZ_RSP];
         uint64_t rip = ocerz_ld(sp, sz);
 
-        uint32_t cs = (uint32_t)ocerz_ld(sp + (uint64_t)sz, sz);
+        /* A selector slot holds 16 bits; hardware ignores the rest.  Wine's
+         * I386_CONTEXT stores SegCs/SegSs as DWORDs that RtlCaptureContext
+         * fills with a 16-bit store, so their upper halves are stack garbage
+         * by the time wow64cpu pushes them for this iretq. */
+        uint32_t cs = (uint16_t)ocerz_ld(sp + (uint64_t)sz, sz);
         uint64_t flags = ocerz_ld(sp + (uint64_t)sz * 2, sz);
         uint64_t newsp = ocerz_ld(sp + (uint64_t)sz * 3, sz);
         /* The fifth slot, SS. IRET to an outer privilege level -- which is every IRET this emulator will */
-        uint32_t ss = (uint32_t)ocerz_ld(sp + (uint64_t)sz * 4, sz);
+        uint32_t ss = (uint16_t)ocerz_ld(sp + (uint64_t)sz * 4, sz);
         cpu->rflags = flags | 0x2;
         cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(newsp, m32);
         /* A zero SS is a frame that did not name one; keep the current SS
@@ -991,7 +1003,7 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_POPSEG: {
         unsigned seg = (unsigned)insn->ops[0].imm;
         int size = insn->opsize ? insn->opsize : 4;
-        uint32_t sel = (uint32_t)ocerz_pop_mode(cpu, size, insn->mode32);
+        uint32_t sel = (uint16_t)ocerz_pop_mode(cpu, size, insn->mode32);
         uint64_t base;
         if (seg < 6)
             cpu->seg_sel[seg] = (uint16_t)sel;
@@ -1638,6 +1650,7 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
     case OCERZ_OP_CALLF:
     case OCERZ_OP_RETF:
     case OCERZ_OP_MOVSEG:
+    case OCERZ_OP_MOVFROMSEG:
         return op_branch(vm, cpu, insnp);
 
     case OCERZ_OP_XADD:

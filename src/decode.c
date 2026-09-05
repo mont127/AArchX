@@ -1274,19 +1274,29 @@ static int decode_one_byte(DecState *s, uint8_t op)
         return OCERZ_OK;
     }
     case 0x8c: {
-
-        static const uint16_t seg_sel[8] = {
-            0x00, 0x2b, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00,
-        };
+        /* mov r/m, Sreg.  This used to fold the selector into an immediate
+         * (CS=0x2b, SS=0x23), which is only true in long mode: 32-bit code in
+         * a WoW64 process has an LDT code selector, and wine's RtlCaptureContext
+         * stores what it reads here into the context that later decides which
+         * mode an iretq returns to.  A register destination takes the operand
+         * size, zero-extended; a memory destination takes 16 bits. */
         ModRM m;
         e = decode_modrm(s, &m, 2);
         if (e)
             return e;
-        set_op(s, OCERZ_OP_MOV);
-        s->out->opsize = 2;
+        if ((m.reg & 7) > 5)
+            return OCERZ_EUNDEF;
+        set_op(s, OCERZ_OP_MOVFROMSEG);
         s->out->nops = 2;
-        place_rm(s, &m, &s->out->ops[0], 2, 1);
-        set_imm(&s->out->ops[1], seg_sel[m.reg & 7], 2);
+        if (rm_is_reg(&m)) {
+            int size = opsize_default(s);
+            s->out->opsize = (uint8_t)size;
+            place_rm(s, &m, &s->out->ops[0], size, 1);
+        } else {
+            s->out->opsize = 2;
+            place_rm(s, &m, &s->out->ops[0], 2, 1);
+        }
+        set_imm(&s->out->ops[1], m.reg & 7, 1);
         return OCERZ_OK;
     }
     case 0x8e: {
@@ -3334,6 +3344,7 @@ static void init_op_names(void)
     op_names[OCERZ_OP_CALLF] = "callf";
     op_names[OCERZ_OP_RETF] = "retf";
     op_names[OCERZ_OP_MOVSEG] = "mov_sreg";
+    op_names[OCERZ_OP_MOVFROMSEG] = "mov_from_sreg";
     op_names[OCERZ_OP_LEAVE] = "leave";
     op_names[OCERZ_OP_INT3] = "int3";
     op_names[OCERZ_OP_INT] = "int";

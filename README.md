@@ -47,13 +47,13 @@ make -j
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 77 / 77 |
-| x86-64 differential gate (interpreter vs JIT) | 66 / 66 |
-| i386 differential gate | 20,032 / 20,032 |
+| x86-64 guest gate | 79 / 79 |
+| x86-64 differential gate (interpreter vs JIT) | 68 / 68 |
+| i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 5 / 5 |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
-| Wine boot (MacNdCheese build, `cmd /c ver`) | 16 s |
+| Wine boot (MacNdCheese build, `cmd /c ver`) | 14 s |
 
 What is in the box:
 
@@ -76,7 +76,7 @@ export WINEPREFIX="$HOME/.wine-ocerz"
 ./ocerz "$WINE/bin/wine" notepad
 ```
 
-MacNdCheese's Wine build runs under AArchX as well. Steam's client core starts: the connectivity test passes, CEF runs the login page's JavaScript, and what is left is the rendering path. SSE4.2 is implemented and advertised because Steam checks for it.
+MacNdCheese's Wine build runs under AArchX as well, and Steam is the application the Wine work is measured against. Exceptions raised in 32-bit code now reach the 32-bit handler. Until 2026-09-05 the decoder folded `mov r/m, sreg` into the long-mode constants, so the 32-bit `RtlCaptureContext` recorded the 64-bit code selector, WoW64 copied it into the frame it restores with `iretq`, and the 32-bit exception dispatcher ran as 64-bit code until the stack overflowed. Every Steam process died that way within a second of starting, at its first `OutputDebugString`, and Steam relaunched itself in a loop. Selectors are CPU state now, and a far transfer takes the low 16 bits of a selector slot the way the hardware does, because Wine's `I386_CONTEXT` leaves stack garbage above them. A 32-bit program that raises and catches exceptions runs to completion; the guest tests `mov_sreg` and `far_sel_bits` and the i386 differential case `mov-sreg` pin the behavior. Steam's client core starts: the connectivity test passes and CEF runs the login page's JavaScript. SSE4.2 is implemented and advertised because Steam checks for it.
 
 Rosetta runs i386 PE code through Wine WoW64 too, so AArchX's i386 support is replacement parity rather than something new. Standalone i386 Mach-O applications are not supported by current macOS or its SDKs.
 
@@ -158,6 +158,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `OCERZ_NO_VMMAP_STEER=1` | let `mach_vm_map` place mappings anywhere in host space instead of at guest-visible addresses |
 | `OCERZ_EXCLOG=1` | print every Objective-C and C++ exception thrown, with the throw site |
 | `OCERZ_WILDLOG=1` | report indirect branches whose target lies outside the guest address space, with the source instruction and registers |
+| `OCERZ_MODELOG=1` | print every far transfer with its selector, target mode and target address (the WoW64 32/64 switches) |
 | `OCERZ_STRICT_SYSCALL=1` | abort on an unimplemented syscall instead of returning `ENOSYS` |
 | `OCERZ_NO_FLIP=1` | no profile-driven retranslation of superblocks |
 | `OCERZ_NO_FPB_DEFER=1` | check every FP batch immediately instead of at its consumers |

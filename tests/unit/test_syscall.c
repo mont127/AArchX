@@ -404,7 +404,9 @@ static void test_machdep_gs_base(void)
     CHECK(r == OCERZ_STEP_OK);
     CHECK(cf(cpu) == 0);
     CHECK(cpu->gs_base == tls);
-    CHECK(cpu->gpr[OCERZ_RAX] == 0x60);
+    /* XNU hands the base back in rax, not a selector (probed under Rosetta
+     * 2026-09-04; see machdep_ret). */
+    CHECK(cpu->gpr[OCERZ_RAX] == tls);
 }
 
 static void test_machdep_unknown(void)

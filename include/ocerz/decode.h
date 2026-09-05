@@ -488,6 +488,9 @@ enum OcerzOp {
     OCERZ_OP_PCMPISTRM,
     OCERZ_OP_PCMPISTRI,
 
+    /* mov r/m16, Sreg: the selector is CPU state, read at run time. */
+    OCERZ_OP_MOVFROMSEG,
+
     OCERZ_OP_COUNT,
 };
 
