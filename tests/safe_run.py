@@ -48,8 +48,29 @@ def group_stats(pgid):
         if pid == SELF or pid in ANCESTORS or parts[3].startswith("Z"): continue
         argv0 = cmd.split()[0].rsplit("/", 1)[-1] if cmd else "?"
         if pg == pgid or (PATTERN and argv0 == PATTERN):
-            n += 1; rss += r; names.append(argv0); pids.append(pid)
-    return n, rss * 1024, names, pids
+            n += 1; rss += phys_footprint(pid, r * 1024); names.append(argv0); pids.append(pid)
+    return n, rss, names, pids
+
+_LIBC = None
+def phys_footprint(pid, fallback):
+    """The kernel's physical footprint of PID (what Activity Monitor calls
+    Memory): private, compressed and IOKit pages, not the shared-cache file
+    pages every emulated process also has resident.  ps's RSS counts those in
+    each process, so fifteen Wine processes summed to 12 GB of RSS while the
+    machine still had 9 GB free.  Falls back to the RSS handed in."""
+    global _LIBC
+    try:
+        if _LIBC is None:
+            import ctypes
+            _LIBC = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            _LIBC.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        import ctypes
+        buf = ctypes.create_string_buffer(1024)
+        if _LIBC.proc_pid_rusage(pid, 0, buf) != 0:
+            return fallback
+        return int.from_bytes(buf.raw[72:80], "little")   # rusage_info_v0.ri_phys_footprint
+    except Exception:
+        return fallback
 
 def kill_group(pgid, leader):
     """SIGKILL every live process in the group; repeat until none is left
@@ -69,7 +90,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--max-procs", type=int, default=8)
-    ap.add_argument("--max-rss-gb", type=float, default=12.0)
+    ap.add_argument("--max-rss-gb", type=float, default=12.0, help="cap on the group's summed physical footprint")
     ap.add_argument("--log", default=None, help="redirect the command's stdout+stderr here")
     ap.add_argument("--pattern", default="ocerz", help="also track/kill processes whose argv[0] basename is this (default: ocerz)")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
