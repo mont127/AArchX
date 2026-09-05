@@ -471,6 +471,24 @@ static uint64_t g_al_marks[AL_MARK_SIZE];
 static int g_al_nmarks;
 static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_align_guard;            /* this translation: alignment-checked ordered accesses */
+/* Ordered mode keeps scalar accesses acquire/release (all but the rsp-based
+ * ones under the stack heuristic above): flags, locks and atomics are scalar,
+ * a release scalar store orders every earlier vector store, an acquire scalar
+ * load orders every later vector load.  SSE/vector accesses themselves stay
+ * plain by default: programs do not synchronize through a 16-byte access
+ * (x86 does not even make them atomic), and ordering them cost memcpy 3.3x
+ * and fpvec 3.0x of Rosetta (release-store pairs; an acquire load stalling
+ * behind an in-place store).  What this gives up: a vector load followed by
+ * a scalar re-read of a seqlock counter may observe newer data than the
+ * counter covers, and two vector stores may become visible out of order.
+ * OCERZ_TSO_VECTOR=1 orders them too.  Measured 2026-09-05 on M2 Max; FEX
+ * ships the same default (VectorTSOEnabled=false). */
+static int vec_tso_relaxed(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("OCERZ_TSO_VECTOR") == NULL;
+    return v;
+}
 static unsigned long long ps_align_patches;   /* PERFSTAT: hot-patched alignment-fault sites */
 static int g_blk_ordered_loads;      /* this translation emitted an ordered load (throttles the store stream) */
 static int g_al_all;                 /* mark table full (or OCERZ_AL_GUARD_ALL): every block checked */
@@ -3055,6 +3073,19 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
     return 1;
 }
 
+/* NE <=> [ra, ra+size) crosses a 16-byte granule, the only misalignment
+ * Apple silicon faults an acquire/release access on (probed 2026-09-05 on
+ * M2 Max: ldapur/stlur w at +1..+3 of a granule are fine, +13..+15 fault; x
+ * at +1..+8 fine, +9..+15 fault; ldar/stlr the same).  Testing natural
+ * alignment instead sent three quarters of the unaligned dword accesses in
+ * memcpy tails down the dmb arm. */
+static void emit_granule_cross_test(A64Buf *b, int size, int ra, int scratch)
+{
+    a64_add_imm(b, 1, scratch, ra, (uint32_t)(size - 1));
+    a64_eor_reg(b, 1, scratch, scratch, ra, 0);
+    a64_try_ands_imm(b, 1, A64_ZR, scratch, 16);
+}
+
 static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int scratch)
 {
     if (g_plain_mem) {
@@ -3066,10 +3097,7 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
         a64_stlr(b, 1, rv, ra);
         return;
     }
-    if (!a64_try_ands_imm(b, 1, A64_ZR, ra, (uint64_t)(size - 1))) {
-        a64_mov_imm64(b, scratch, (uint64_t)(size - 1));
-        a64_ands_reg(b, 1, A64_ZR, ra, scratch, 0);
-    }
+    emit_granule_cross_test(b, size, ra, scratch);
     if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
         uint32_t *bne = a64_label(b);
         a64_bcond(b, A64_NE, 0);
@@ -3102,10 +3130,7 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
         else            a64_ldapr(b, 1, rd, ra);
         return;
     }
-    if (!a64_try_ands_imm(b, 1, A64_ZR, ra, (uint64_t)(size - 1))) {
-        a64_mov_imm64(b, scratch, (uint64_t)(size - 1));
-        a64_ands_reg(b, 1, A64_ZR, ra, scratch, 0);
-    }
+    emit_granule_cross_test(b, size, ra, scratch);
     if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
         uint32_t *bne = a64_label(b);
         a64_bcond(b, A64_NE, 0);
@@ -3216,8 +3241,8 @@ static void emit_v_acc_ordered_checked(A64Buf *b, int size, int vr, int ra, int3
         else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
         ra = JTA;
     }
-    uint64_t mask = size == 16 ? 7 : (uint64_t)(size - 1);
-    a64_try_ands_imm(b, 1, A64_ZR, ra, mask);
+    if (size == 16) a64_try_ands_imm(b, 1, A64_ZR, ra, 7);   /* two 8-byte halves: 8-aligned <=> neither crosses */
+    else emit_granule_cross_test(b, size, ra, JTU);
     (void)store;                                  /* loads never take this path */
     if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
         uint32_t *bne = a64_label(b);
@@ -3240,6 +3265,7 @@ static void emit_v_acc_ordered_checked(A64Buf *b, int size, int vr, int ra, int3
 static void emit_v_ld_at(A64Buf *b, int size, int vd, int ra, int32_t disp, int plain)
 {
     int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
+    if (!plain && vec_tso_relaxed()) plain = 1;
     if (!plain) g_blk_ordered_loads = 1;
     if (plain) {
         if (scaled) a64_ldr_v(b, size, vd, ra, (uint32_t)disp);
@@ -3247,17 +3273,29 @@ static void emit_v_ld_at(A64Buf *b, int size, int vd, int ra, int32_t disp, int 
         else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); a64_ldr_v(b, size, vd, JTA, 0); }
         return;
     }
-    /* ordered vector load: plain load + dmb ishld (alignment-free; measured
-     * clearly better than an ldapur pair moved into the V register: fpvec
-     * 0.042s vs 0.066s) */
-    if (scaled) a64_ldr_v(b, size, vd, ra, (uint32_t)disp);
-    else if (disp >= -256 && disp <= 255) a64_ldur_v(b, size, vd, ra, disp);
-    else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); a64_ldr_v(b, size, vd, JTA, 0); }
-    a64_dmb_ishld(b);
+    /* Ordered vector load: the plain load, then a one-byte ACQUIRE load of
+     * the same address.  Same-address reads are coherent, so the acquire
+     * copy sees a value at least as new as the vector, and everything after
+     * it is ordered behind that: TSO's load ordering, with no barrier.  A dmb
+     * ishld here waited for every outstanding miss (40-60 ns per access on a
+     * 4 MB working set, memcpy 3.5x Rosetta); an ldapur pair moved through
+     * GPRs cost the FP chain its latency (fpvec).  The byte form never
+     * faults on alignment.  Measured 2026-09-05. */
+    if (disp >= -256 && disp <= 255) {
+        if (scaled) a64_ldr_v(b, size, vd, ra, (uint32_t)disp); else a64_ldur_v(b, size, vd, ra, disp);
+        a64_ldapur(b, 1, JTU, ra, disp);
+    } else {
+        if (disp > 0 && disp <= 4095) a64_add_imm(b, 1, JTA, ra, (uint32_t)disp);
+        else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, ra, (uint32_t)-disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
+        a64_ldr_v(b, size, vd, JTA, 0);
+        a64_ldapur(b, 1, JTU, JTA, 0);
+    }
 }
 static void emit_v_st_at(A64Buf *b, int size, int vs, int ra, int32_t disp, int plain)
 {
     int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
+    if (!plain && vec_tso_relaxed()) plain = 1;
     if (plain) {
         if (scaled) a64_str_v(b, size, vs, ra, (uint32_t)disp);
         else if (disp >= -256 && disp <= 255) a64_stur_v(b, size, vs, ra, disp);
@@ -3272,14 +3310,14 @@ static void emit_v_st_at(A64Buf *b, int size, int vs, int ra, int32_t disp, int 
 }
 static void emit_v_ld_regoff(A64Buf *b, int size, int vd, int ra, int ri, int scaled, int plain)
 {
-    if (plain) { a64_ldr_v_regoff(b, size, vd, ra, ri, scaled); return; }
+    if (plain || vec_tso_relaxed()) { a64_ldr_v_regoff(b, size, vd, ra, ri, scaled); return; }
     int sh = scaled ? (size == 16 ? 4 : size == 8 ? 3 : 2) : 0;
     a64_add_reg(b, 1, JTA, ra, ri, sh);
     emit_v_ld_at(b, size, vd, JTA, 0, 0);
 }
 static void emit_v_st_regoff(A64Buf *b, int size, int vs, int ra, int ri, int scaled, int plain)
 {
-    if (plain) { a64_str_v_regoff(b, size, vs, ra, ri, scaled); return; }
+    if (plain || vec_tso_relaxed()) { a64_str_v_regoff(b, size, vs, ra, ri, scaled); return; }
     int sh = scaled ? (size == 16 ? 4 : size == 8 ? 3 : 2) : 0;
     a64_add_reg(b, 1, JTA, ra, ri, sh);
     emit_v_st_at(b, size, vs, JTA, 0, 0);
@@ -13355,12 +13393,21 @@ promo_push_fallthrough:
                     blk->n_inlined, blk->n_slow, blk->insn_off[0],
                     blk->code_words - epi, (int)blk->pin_class, (int)blk->n_pinned,
                     blk->body_code != NULL);
+            fprintf(g_jf, "  LABELS body_entry=%ld loop_entry=%ld stop_patch=%ld\n",
+                    g_body_entry ? (long)(g_body_entry - entry) : -1L,
+                    g_loop_entry ? (long)(g_loop_entry - entry) : -1L,
+                    g_stop_patch ? (long)(g_stop_patch - entry) : -1L);
             for (int e = 0; e < blk->n_edges; e++)
                 fprintf(g_jf, "  EDGE -> %#llx kind=%d pin_class=%d side=%d pb=+%ld cs=+%ld\n",
                         (unsigned long long)blk->edges[e].target_rip,
                         (int)blk->edges[e].kind, (int)blk->edges[e].pin_class, (int)blk->edges[e].side,
                         blk->edges[e].patch_b ? (long)(blk->edges[e].patch_b - entry) : -1L,
                         blk->edges[e].cond_site ? (long)(blk->edges[e].cond_site - entry) : -1L);
+            if (n > 0 && blk->insn_off[0] > 0) {
+                fprintf(g_jf, "  PRO off=0 words=%u\n", blk->insn_off[0]);
+                for (uint32_t w = 0; w < blk->insn_off[0]; w++)
+                    fprintf(g_jf, "    %08x\n", entry[w]);
+            }
             for (int i = 0; i < n; i++) {
                 uint32_t s = blk->insn_off[i];
                 uint32_t e = (i + 1 < n) ? blk->insn_off[i + 1] : epi;
@@ -13758,7 +13805,8 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
         if (imm9 > 0)      a64_add_imm(&b, 1, ta, rn, (uint32_t)imm9);
         else if (imm9 < 0) a64_sub_imm(&b, 1, ta, rn, (uint32_t)-imm9);
         else               a64_mov_reg(&b, 1, ta, rn);
-        a64_try_ands_imm(&b, 1, A64_ZR, ta, (uint64_t)(size - 1));
+        if (pair) a64_try_ands_imm(&b, 1, A64_ZR, ta, 7);     /* two 8-byte halves: 8-aligned <=> neither crosses */
+        else emit_granule_cross_test(&b, size, ta, s1);
         uint32_t *bne = a64_label(&b); a64_bcond(&b, A64_NE, 0);
         if (is_ld) a64_ldapur(&b, size, rt, ta, 0);
         else { a64_stlur(&b, size, rt, ta, 0); if (pair) a64_stlur(&b, 8, JTU, ta, 8); }
