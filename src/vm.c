@@ -1,5 +1,6 @@
 /* The master run loop and crash containment. */
 #include "ocerz/vm.h"
+#include "ocerz/dyld.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"
 #include "ocerz/flags.h"
@@ -39,6 +40,7 @@ static pthread_mutex_t g_cpus_lock = PTHREAD_MUTEX_INITIALIZER;
  * is not async-signal-safe, and the stuck thread is never idle (it spins in a
  * kevent wait loop), so a quiet-based latch cannot see it. */
 uint64_t ocerz_exc_trap_rip;      /* OCERZ_EXCLOG: guest _objc_exception_throw entry */
+uint64_t ocerz_cxa_throw_rip;    /* OCERZ_EXCLOG: guest ___cxa_throw entry */
 static volatile int g_btrace_req;
 static int g_btrace_on = -1;
 static OcerzCPU *g_fork_surviving_cpu;
@@ -899,6 +901,36 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (!align_fault && ocerz_cache_lazy_fault((uintptr_t)si->si_addr))
             return;
     }
+    /* A raw host pointer the guest was handed inline (IOSurface's per-client
+     * page, mapped into the task by the kernel during io_connect_method and
+     * returned in the output struct; anything IOKit maps for a client): the
+     * guest address is unmapped in the shadow but the same numeric address
+     * is a live device/shared mapping in the host.  Alias it at that guest
+     * address and retry, the way the SkyLight universe pages are aliased. */
+    if ((sig == SIGSEGV || sig == SIGBUS) && !align_fault && g_vm &&
+        ocerz_host_in_guest_space(si->si_addr)) {
+        static __thread uint64_t last_alias_page;
+        uint64_t ga = ocerz_h2g(si->si_addr);
+        uint64_t page = ga & ~0x3fffull;
+        if (ga < OCERZ_LOW_LIMIT && page != last_alias_page && !ocerz_addr_readable(ga)) {
+            extern int ocerz_host_region_is_device(uint64_t, int *);
+            extern int ocerz_alias_raw_region(OcerzVM *, uint64_t);
+            int hprot = 0;
+            if (ocerz_host_region_is_device(ga, &hprot)) {
+                last_alias_page = page;
+                if (ocerz_alias_raw_region(g_vm, ga) == 0 && ocerz_addr_readable(ga)) {
+                    if (g_sigtrace) {
+                        char ab[120]; char *w = ab;
+                        w = str_into(w, "ocerz: RAWALIAS-ON-FAULT gaddr=");
+                        w = hex_into(w, ga);
+                        w = str_into(w, "\n");
+                        write(2, ab, (size_t)(w - ab));
+                    }
+                    return;
+                }
+            }
+        }
+    }
 
     if (ocerz_jit_decode_recover)
         siglongjmp(*ocerz_jit_decode_recover, 1);
@@ -1232,6 +1264,23 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             t = hex_into(t, g_vm ? g_vm->insn_count : 0);
             t = str_into(t, "\n");
             write(2, tb, (size_t)(t - tb));
+            {   /* frame-pointer chain and the images holding addr/rip */
+                char bb[640]; char *w = bb;
+                uint64_t ib = 0; const char *in = ocerz_dyld_name_for_addr(gaddr, &ib);
+                w = str_into(w, "ocerz:   addr-image=");
+                w = str_into(w, in ? in : "<none>");
+                w = str_into(w, " bt:");
+                uint64_t fp = g_cur_cpu->gpr[OCERZ_RBP];
+                for (int d = 0; d < 12 && fp > 0x1000 && ocerz_addr_readable(fp + 8) && w < bb + 560; d++) {
+                    w = str_into(w, " ");
+                    w = hex_into(w, ocerz_ld(fp + 8, 8));
+                    uint64_t nf = ocerz_addr_readable(fp) ? ocerz_ld(fp, 8) : 0;
+                    if (nf <= fp) break;
+                    fp = nf;
+                }
+                w = str_into(w, "\n");
+                write(2, bb, (size_t)(w - bb));
+            }
             if (fault_rip != 0) {
                 char xb[200];
                 char *x = xb;

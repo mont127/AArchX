@@ -29,8 +29,16 @@ static int is_wine_loader(const char *path)
 
 static void apply_wine_defaults(const char *path)
 {
+    /* Shared-cache images whose Objective-C categories must be visible before
+     * any class is realized (a dlopen registers them too late for classes that
+     * already exist).  CoreSpotlight adds encodeWithCSCoder: categories to
+     * Foundation's collection classes; without it, the indexing that AppKit
+     * kicks off ~20 s into a session throws an unrecognized-selector
+     * NSException inside a dispatch block and takes the process down.
+     * OCERZ_PRELOAD_OBJC=@cat preloads every category-bearing image instead
+     * (about 3-4 s more per boot). */
     static const char objc_images[] =
-        "/AppKit.framework/,/QuartzCore.framework/,/HIToolbox.framework/";
+        "/AppKit.framework/,/QuartzCore.framework/,/HIToolbox.framework/,/CoreSpotlight.framework/";
     if (!is_wine_loader(path))
         return;
     if (!getenv("OCERZ_HOSTWQ"))

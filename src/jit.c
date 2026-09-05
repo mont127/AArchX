@@ -11799,6 +11799,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 
     if (ocerz_exc_trap_rip && rip == ocerz_exc_trap_rip)
         return NULL;                 /* OCERZ_EXCLOG: keep the throw site interpreted */
+    { extern uint64_t ocerz_cxa_throw_rip; if (ocerz_cxa_throw_rip && rip == ocerz_cxa_throw_rip) return NULL; }
 
     if (churn_blacklisted(rip)) {
         static _Atomic unsigned long long refn;

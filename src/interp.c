@@ -1348,8 +1348,62 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
             exclog = getenv("OCERZ_EXCLOG") ? 1 : 0;
             if (exclog) {
                 ocerz_exc_trap_rip = ocerz_dyld_resolve_guest_sym("_objc_exception_throw");
-                fprintf(stderr, "ocerz: EXCLOG _objc_exception_throw=%#llx\n",
-                        (unsigned long long)ocerz_exc_trap_rip);
+                extern uint64_t ocerz_cxa_throw_rip;
+                ocerz_cxa_throw_rip = ocerz_dyld_resolve_guest_sym("___cxa_throw");
+                fprintf(stderr, "ocerz: EXCLOG _objc_exception_throw=%#llx ___cxa_throw=%#llx\n",
+                        (unsigned long long)ocerz_exc_trap_rip, (unsigned long long)ocerz_cxa_throw_rip);
+            }
+        }
+        {   /* ___cxa_throw(void *obj, std::type_info *tinfo, void (*dtor)()): print the
+             * type name and the return-address chain (the throw site and its callers). */
+            extern uint64_t ocerz_cxa_throw_rip;
+            if (exclog && ocerz_cxa_throw_rip && (uint64_t)cpu->rip == ocerz_cxa_throw_rip) {
+                uint64_t obj = cpu->gpr[7], tinfo = cpu->gpr[6];
+                char tn[200]; tn[0] = 0;
+                if (ocerz_addr_readable(tinfo + 8)) {
+                    uint64_t np = ocerz_ld(tinfo + 8, 8);
+                    for (int k = 0; k < 199 && ocerz_addr_readable(np + (uint64_t)k); k++) {
+                        uint64_t c = ocerz_ld(np + (uint64_t)k, 1); if (!c) break; tn[k] = (char)c; tn[k + 1] = 0;
+                    }
+                }
+                uint64_t sp = cpu->gpr[4], fp = cpu->gpr[5];
+                fprintf(stderr, "ocerz: CXATHROW[%d] obj=%#llx type=\"%s\" ret=%#llx chain:",
+                        (int)getpid(), (unsigned long long)obj, tn,
+                        (unsigned long long)(ocerz_addr_readable(sp) ? ocerz_ld(sp, 8) : 0));
+                for (int d = 0; d < 10 && fp > 0x1000 && ocerz_addr_readable(fp + 8); d++) {
+                    fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+                    uint64_t nf = ocerz_addr_readable(fp) ? ocerz_ld(fp, 8) : 0;
+                    if (nf <= fp) break;
+                    fp = nf;
+                }
+                /* the thrown object's first words: what() for std::exception subclasses
+                 * is virtual, so just dump the words for offline decoding */
+                fprintf(stderr, " obj-words:");
+                for (int w = 0; w < 4; w++)
+                    fprintf(stderr, " %#llx", (unsigned long long)(ocerz_addr_readable(obj + 8 * (uint64_t)w) ? ocerz_ld(obj + 8 * (uint64_t)w, 8) : 0));
+                fprintf(stderr, "\n");
+                /* objc_exception_throw throws the NSException `id` itself: dump its name and
+                 * the reason object's bytes (and the objects behind its pointer words) so the
+                 * text can be recovered offline whatever CFString layout it uses. */
+                uint64_t nsexc = ocerz_addr_readable(obj) ? ocerz_ld(obj, 8) : 0;
+                if (nsexc && ocerz_addr_readable(nsexc + 16)) {
+                    char nb[192]; const char *nm = ocerz_exc_read_cfstr(nsexc + 8, nb, sizeof nb);
+                    uint64_t reason = ocerz_ld(nsexc + 16, 8);
+                    fprintf(stderr, "ocerz: CXATHROW-NS[%d] nsexc=%#llx name=%s reason_obj=%#llx\n",
+                            (int)getpid(), (unsigned long long)nsexc, nm ? nm : "?", (unsigned long long)reason);
+                    uint64_t tg[5] = { reason, 0, 0, 0, 0 }; int nt = 1;
+                    for (int w = 1; w < 5 && nt < 5; w++) {
+                        uint64_t q = ocerz_addr_readable(reason + 8 * (uint64_t)w) ? ocerz_ld(reason + 8 * (uint64_t)w, 8) : 0;
+                        if (q > 0x1000 && ocerz_addr_readable(q)) tg[nt++] = q;
+                    }
+                    for (int t = 0; t < nt; t++) {
+                        fprintf(stderr, "ocerz: CXATHROW-HEX[%d] %#llx:", (int)getpid(), (unsigned long long)tg[t]);
+                        for (int k = 0; k < 160 && ocerz_addr_readable(tg[t] + (uint64_t)k); k++)
+                            fprintf(stderr, "%02x", (unsigned)ocerz_ld(tg[t] + (uint64_t)k, 1));
+                        fprintf(stderr, "\n");
+                    }
+                }
+                fflush(stderr);
             }
         }
         if (exclog && ocerz_exc_trap_rip && (uint64_t)cpu->rip == ocerz_exc_trap_rip) {
