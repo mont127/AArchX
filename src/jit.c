@@ -12267,8 +12267,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
              * interpreter side of the differential gate would catch any
              * corpus case that does. OCERZ_RET_FLAGS_LIVE restores the
              * conservative seam. */
-            if (!ret_flags_live_at(term->rip) && !mode32)
-                seam_seed = ret_seam_live(blk->insns, n);
+            if (!ret_flags_live_at(term->rip) && !mode32) {
+                static int dead = -1;          /* OCERZ_RET_FLAGS_DEAD=1: the pre-e3d15d2 rule, for A/B and tests */
+                if (dead < 0) dead = getenv("OCERZ_RET_FLAGS_DEAD") != NULL;
+                seam_seed = dead ? 0 : ret_seam_live(blk->insns, n);
+            }
             break;
         default:
 
