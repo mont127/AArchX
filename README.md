@@ -47,8 +47,8 @@ make -j
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 75 / 75 |
-| x86-64 differential gate (interpreter vs JIT) | 64 / 64 |
+| x86-64 guest gate | 77 / 77 |
+| x86-64 differential gate (interpreter vs JIT) | 66 / 66 |
 | i386 differential gate | 20,032 / 20,032 |
 | dynamic-mode tests | 5 / 5 |
 | xbench output vs native | 15 / 15 kernels bit-identical |
@@ -106,7 +106,7 @@ Apple M2 Max, 2026-09-04, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical
 
 `mixed` was a 1.20x loss for a long time, and the whole gap was the price of bit-exact x86 NaN semantics: every packed FP result needed a check before anything could use it. The JIT now defers that check to the compares that read the value, and Rosetta-style hot paths that the compiler split with rare-case branches get retranslated with the hot side inline. Both are exact; the NaN tests in `tests/guest` compare bit patterns against the native binary.
 
-These kernels never create a thread, fork or map shared memory, so they run in plain memory mode throughout. A program that does any of those retires plain mode for good (`ocerz_jit_require_ordered`) and pays for TSO-ordered loads and stores: under `OCERZ_NO_PLAIN_MEM=1` the same table reads 3.55x on `memcpy` and 3.67x on `fpvec`. Wine is always in ordered mode, so the numbers above say nothing about it.
+These kernels never create a thread, fork or map shared memory, so they run in plain memory mode throughout. A program that does any of those retires plain mode for good (`ocerz_jit_require_ordered`) and pays for x86-TSO ordering on every scalar load and store; Wine is always in that mode. Under `OCERZ_NO_PLAIN_MEM=1` the same table reads 1.35x on `memcpy`, 0.99x on `fpvec`, 1.08x on `str`, 1.13x on `chase` and stays at parity elsewhere. Scalar accesses use acquire and release forms (flags, locks and atomics are scalar, and a release store orders every earlier vector store); SSE loads and stores are left plain, the default FEX ships too, because ordering them cost 3.3x on `memcpy` and 3.0x on `fpvec`. `OCERZ_TSO_VECTOR=1` orders them as well.
 
 ## CLI
 
@@ -132,6 +132,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `OCERZ_HOSTWQ=1` | host workqueue bridge |
 | `OCERZ_NO_PLAIN_MEM=1` | ordered memory forms from the start |
 | `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |
+| `OCERZ_TSO_VECTOR=1` | order SSE loads and stores too |
 | `OCERZ_PRELOAD_OBJC=<paths>` | preload matching shared-cache Objective-C images |
 | `OCERZ_STRICT_SYSCALL=1` | abort on an unimplemented syscall instead of returning `ENOSYS` |
 | `OCERZ_NO_FLIP=1` | no profile-driven retranslation of superblocks |
