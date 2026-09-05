@@ -11688,6 +11688,45 @@ static int ret_flags_live(void)
     if (v < 0) v = getenv("OCERZ_RET_FLAGS_LIVE") != NULL;
     return v;
 }
+/* Bisection aid: OCERZ_RETFL_LO/HI keep flags live across returns and
+ * indirect calls whose instruction lies in [lo, hi) only. */
+static int ret_flags_live_at(uint64_t rip)
+{
+    static int have = -1; static uint64_t lo, hi;
+    if (have < 0) {
+        const char *a = getenv("OCERZ_RETFL_LO"), *b = getenv("OCERZ_RETFL_HI");
+        have = (a && b) ? 1 : 0;
+        if (have) { lo = strtoull(a, NULL, 0); hi = strtoull(b, NULL, 0); }
+    }
+    if (have) return rip >= lo && rip < hi;
+    return ret_flags_live();
+}
+
+/* Flags across a return.  No ABI passes them, but clang's outliner does:
+ * vImage's `cmpq $0, init_CGInterfaces(%rip); retq` helpers hand their
+ * compare back in EFLAGS and the caller branches on it after the call
+ * (found 2026-09-05: every Wine window painted black because CoreGraphics
+ * concluded libCGInterfaces had not loaded).  A pure flag producer that
+ * reaches the ret with nothing else writing flags is such a result, so
+ * its flags stay live; a tail whose last flag writer is arithmetic
+ * (xor eax,eax; ret) returns a value, and the dead seam keeps its win. */
+static uint64_t ret_seam_live(const X86Insn *insns, int n)
+{
+    for (int i = n - 2; i >= 0; i--) {
+        uint64_t def, use;
+        ocerz_flags_defuse(&insns[i], &def, &use);
+        if (!(def & JIT_ARITH_FLAGS)) continue;
+        switch (insns[i].op) {
+        case OCERZ_OP_CMP: case OCERZ_OP_TEST:
+        case OCERZ_OP_BT: case OCERZ_OP_BTS: case OCERZ_OP_BTR: case OCERZ_OP_BTC:
+        case OCERZ_OP_CMPXCHG:
+            return OCERZ_FL_ALL;
+        default:
+            return 0;
+        }
+    }
+    return OCERZ_FL_ALL;                /* the writer is in an earlier block: unknown, keep them */
+}
 
 static int churn_blacklisted(uint64_t rip);
 
@@ -12220,7 +12259,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             /* direct call: execution continues at the callee entry */
             if (term->ops[0].kind == OCERZ_OPK_IMM)
                 seam_seed = xlive_succ_live(jit, term->ops[0].imm);
-            else if (!ret_flags_live() && !mode32)
+            else if (!ret_flags_live_at(term->rip) && !mode32)
                 seam_seed = 0;   /* indirect call: no callee reads entry flags */
             break;
         case OCERZ_OP_RET:
@@ -12228,8 +12267,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
              * interpreter side of the differential gate would catch any
              * corpus case that does. OCERZ_RET_FLAGS_LIVE restores the
              * conservative seam. */
-            if (!ret_flags_live() && !mode32)
-                seam_seed = 0;
+            if (!ret_flags_live_at(term->rip) && !mode32)
+                seam_seed = ret_seam_live(blk->insns, n);
             break;
         default:
 

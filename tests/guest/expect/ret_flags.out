@@ -1,0 +1,11 @@
+cmp_ptr null 1
+cmp_ptr set  0
+test_bit on  0
+test_bit off 1
+bt on        2
+cmp_regs a<b 1
+cmp_regs b<a 0
+after_jcc sel1 0
+after_jcc sel2 0
+xor_tail 0
+ 1
