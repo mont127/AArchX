@@ -1737,6 +1737,37 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
             }
         }
     }
+    /* mach_vm_map (4811) asking for VM_FLAGS_ANYWHERE under the low-base
+     * shadow: the kernel would place the mapping in host space below the
+     * guest's identity range, where the guest cannot see it, and relocating
+     * the result afterwards leaves dangling host pointers wherever the kernel
+     * recorded the original address (IOSurface's per-client bulk-attachment
+     * page, read back by CoreAnimation when it prepares a layer's contents).
+     * Choose a guest-visible identity address ourselves and ask for it
+     * FIXED|OVERWRITE, so what the kernel maps is what the guest sees.
+     * Request body after the object port descriptor: NDR@0x28 address@0x30
+     * size@0x38 mask@0x40 flags@0x48. */
+    if (msg_id == 4811 && ocerz_low_base && (bits & 0x80000000u) &&
+        (!send_size || send_size >= 0x4c) && !getenv("OCERZ_NO_VMMAP_STEER")) {
+        uint32_t flags = (uint32_t)ocerz_ld(gmsg + 0x48, 4);
+        uint64_t size = ocerz_ld(gmsg + 0x38, 8);
+        uint64_t mask = ocerz_ld(gmsg + 0x40, 8);
+        if ((flags & 0x1u) && size != 0 && size < (1ull << 32) && mask < (1ull << 30)) {
+            uint64_t align = mask ? mask + 1 : 0x4000;
+            if (align < 0x4000) align = 0x4000;
+            uint64_t rsz = (size + 0x3fffull) & ~0x3fffull;
+            uint64_t g = ocerz_map_anywhere_aligned(rsz, PROT_READ | PROT_WRITE, align);
+            if (g && g >= OCERZ_LOW_LIMIT && g < OCERZ_TOP_LO &&
+                (uint64_t)(uintptr_t)ocerz_g2h(g) == g) {
+                ocerz_st(gmsg + 0x30, 8, g);
+                ocerz_st(gmsg + 0x48, 4, (flags & ~0x1u) | 0x4000u);   /* FIXED|OVERWRITE */
+                if (getenv("OCERZ_MIGTRACE"))
+                    fprintf(stderr, "ocerz: VMMAP-STEER[%d] size=%#llx mask=%#llx -> guest identity %#llx\n",
+                            (int)getpid(), (unsigned long long)size, (unsigned long long)mask,
+                            (unsigned long long)g);
+            }
+        }
+    }
     if ((msg_id == 4815 || msg_id == 4816) &&
         (!send_size || send_size >= 0x28) && n < max_saved) {
         uint64_t ga = ocerz_ld(gmsg + 0x20, 8);
@@ -3911,7 +3942,30 @@ static uint64_t ocerz_sc_find_universe(uint32_t uid)
     return address;
 }
 
-static int ocerz_alias_raw_region(OcerzVM *vm, uint64_t pointer)
+/* A host region the guest can legitimately hold a raw pointer to: kernel-
+ * created device memory (IOKit / IOSurface / accelerator mappings) or memory
+ * shared with another task.  ocerz's own heap, images and the JIT arena are
+ * private/COW and never qualify. */
+int ocerz_host_region_is_device(uint64_t addr, int *prot_out)
+{
+    mach_vm_address_t a = addr; mach_vm_size_t sz = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    if (mach_vm_region_recurse(mach_task_self(), &a, &sz, &depth,
+                               (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS)
+        return 0;
+    if (a > addr || addr - a >= sz)
+        return 0;
+    if (prot_out) *prot_out = info.protection;
+    int shared = info.share_mode == SM_SHARED || info.share_mode == SM_TRUESHARED ||
+                 info.share_mode == SM_SHARED_ALIASED;
+    int device = info.user_tag == VM_MEMORY_IOKIT || info.user_tag == 81 /* VM_MEMORY_IOSURFACE */ ||
+                 info.user_tag == 70 /* VM_MEMORY_IOACCELERATOR */;
+    return (shared || device) && (info.protection & VM_PROT_READ);
+}
+
+int ocerz_alias_raw_region(OcerzVM *vm, uint64_t pointer)
 {
     if (!pointer)
         return -1;
@@ -4013,6 +4067,11 @@ static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
 {
     uint64_t haddr = ocerz_ld(reply_buf + 0x24, 8);
     if (haddr == 0 || (haddr >= ocerz_arena_lo && haddr < ocerz_arena_hi))
+        return;
+    /* a steered mach_vm_map already landed at a registered guest identity
+     * address: nothing to relocate (moving it would strand the kernel's record) */
+    if (ocerz_low_base && haddr >= OCERZ_LOW_LIMIT && haddr < OCERZ_TOP_LO &&
+        (uint64_t)(uintptr_t)ocerz_g2h(haddr) == haddr && ocerz_addr_committed(haddr) == 1)
         return;
     if (preserve_address &&
         (uint64_t)(uintptr_t)ocerz_g2h(haddr) == haddr)
