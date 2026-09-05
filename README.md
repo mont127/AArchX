@@ -65,7 +65,7 @@ What is in the box:
 
 ## Wine and i386
 
-Wine 11.8 runs x86-64 and i386 PE applications through AArchX. With a WoW64 prefix, 32-bit Notepad and WineMine load `winemac.drv` and open titled Cocoa windows. The Wine launchers turn on the workqueue bridge and the Objective-C category preload that AppKit needs.
+Wine 11.8 runs x86-64 and i386 PE applications through AArchX. With a WoW64 prefix, 32-bit Notepad and WineMine load `winemac.drv` and open titled Cocoa windows. They stay up. Until 2026-09-05 every Wine GUI process died about 24 seconds in: a CoreSpotlight category that never attached threw inside a dispatch block, and an IOSurface page the kernel mapped for the process sat at an address the guest could not see. Both are fixed; the first is why CoreSpotlight is in the default Objective-C preload list. The Wine launchers turn on the workqueue bridge and the Objective-C category preload that AppKit needs.
 
 ```sh
 WINE="/path/to/Wine Devel.app/Contents/Resources/wine"
@@ -154,7 +154,10 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `OCERZ_NO_PLAIN_MEM=1` | ordered memory forms from the start |
 | `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |
 | `OCERZ_TSO_VECTOR=1` | order SSE loads and stores too |
-| `OCERZ_PRELOAD_OBJC=<paths>` | preload matching shared-cache Objective-C images |
+| `OCERZ_PRELOAD_OBJC=<paths>` | preload matching shared-cache Objective-C images so their categories attach; `@cat` preloads every image that defines categories (3-4 s more per boot) |
+| `OCERZ_NO_VMMAP_STEER=1` | let `mach_vm_map` place mappings anywhere in host space instead of at guest-visible addresses |
+| `OCERZ_EXCLOG=1` | print every Objective-C and C++ exception thrown, with the throw site |
+| `OCERZ_WILDLOG=1` | report indirect branches whose target lies outside the guest address space, with the source instruction and registers |
 | `OCERZ_STRICT_SYSCALL=1` | abort on an unimplemented syscall instead of returning `ENOSYS` |
 | `OCERZ_NO_FLIP=1` | no profile-driven retranslation of superblocks |
 | `OCERZ_NO_FPB_DEFER=1` | check every FP batch immediately instead of at its consumers |
