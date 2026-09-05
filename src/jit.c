@@ -830,6 +830,22 @@ static JitBlock *cache_lookup(OcerzJit *jit, uint64_t rip, int mode32)
          b; b = b->hnext)
         if (b->key == key)
             return b;
+    {
+        static int wl = -1; if (wl < 0) wl = getenv("OCERZ_WILDLOG") ? 1 : 0;
+        if (wl && rip >= 0x800000000000ull) {
+            extern unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
+            extern uint64_t ocerz_current_dbg_ind_src(void);
+            extern uint64_t ocerz_current_guest_gpr(int);
+            uint64_t h[8]; unsigned n = ocerz_vm_riphist(h, 8);
+            static const char *rn[16] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"};
+            fprintf(stderr, "ocerz: WILD-LOOKUP[%d] target=%#llx ind_src=%#llx riphist:",
+                    (int)getpid(), (unsigned long long)rip, (unsigned long long)ocerz_current_dbg_ind_src());
+            for (unsigned k = 0; k < n; k++) fprintf(stderr, " %#llx", (unsigned long long)h[k]);
+            fprintf(stderr, "\n  WILD-GPR[%d]", (int)getpid());
+            for (int g = 0; g < 16; g++) fprintf(stderr, " %s=%#llx", rn[g], (unsigned long long)ocerz_current_guest_gpr(g));
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+    }
     return NULL;
 }
 
@@ -10482,9 +10498,17 @@ static void emit_indirect_leave_br(A64Buf *b, int code_reg)
 static uint32_t **g_ind_call_cont;
 static uint32_t *g_ind_call_tocont;   /* the `b` after the blr, to patch to the continuation code */
 static int g_ind_treg = JT1;     /* register holding the indirect target for emit_indirect_tail's fast path */
+static uint64_t g_dbg_ind_src;   /* OCERZ_WILDLOG: rip of the indirect jmp/call being emitted */
 static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
                                uint32_t **epi_sites, int *n_epi)
 {
+    {
+        static int dbg = -1; if (dbg < 0) dbg = getenv("OCERZ_WILDLOG") ? 1 : 0;
+        if (dbg && g_dbg_ind_src) {
+            a64_mov_imm64(b, JTU, g_dbg_ind_src);
+            a64_str(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, dbg_ind_src));
+        }
+    }
     uint32_t *to_blr = NULL;              /* hash-hit path -> the shared blr site */
     /* per-site direct-mapped cache: {rip, body} x 32, indexed by rip bits
      * 2..6; hit -> poll interrupt, br body.  Miss falls into the global
@@ -10669,6 +10693,7 @@ static int emit_indirect_jmp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
 static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                               int *n_exits, uint32_t **epi_sites, int *n_epi)
 {
+    g_dbg_ind_src = insn->rip;
     if (insn->op != OCERZ_OP_CALL || insn->ops[0].kind == OCERZ_OPK_IMM)
         return 0;
     if (ENV_ON("OCERZ_NO_INLINE_INDIRECT"))
@@ -13375,16 +13400,20 @@ promo_push_fallthrough:
     {
         static int g_jitdis = -1;
         static FILE *g_jf;
+        static uint64_t g_jd_lo, g_jd_hi;
         if (g_jitdis < 0) {
             const char *p = getenv("OCERZ_JITDIS");
             g_jitdis = p ? 1 : 0;
+            const char *lo = getenv("OCERZ_JITDIS_LO"), *hi = getenv("OCERZ_JITDIS_HI");
+            g_jd_lo = lo ? strtoull(lo, NULL, 0) : 0;
+            g_jd_hi = hi ? strtoull(hi, NULL, 0) : ~0ull;
             if (p) {
                 char pb[1024];
                 snprintf(pb, sizeof pb, "%s.%d", p, (int)getpid());
                 g_jf = fopen(pb, "w");
             }
         }
-        if (g_jitdis > 0 && g_jf && blk->insn_off) {
+        if (g_jitdis > 0 && g_jf && blk->insn_off && rip >= g_jd_lo && rip < g_jd_hi) {
             char tb[128];
             uint32_t epi = (uint32_t)(exit_label - entry);
             fprintf(g_jf, "BLOCK rip=%#llx host=%p words=%u n_insns=%d inlined=%d slow=%d"

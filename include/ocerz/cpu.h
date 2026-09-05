@@ -119,6 +119,7 @@ typedef struct OcerzCPU {
      * particular neither the 16-byte-aligned xmm[] nor the ras[] window the
      * JIT reaches with stp/ldp immediates, moves by a single byte. */
     uint16_t seg_sel[6];
+    uint64_t dbg_ind_src;   /* OCERZ_WILDLOG: guest rip of the last indirect jmp/call dispatched */
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256
