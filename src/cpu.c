@@ -16,6 +16,8 @@ void ocerz_cpu_reset(OcerzCPU *cpu)
     /* Darwin's flat 64-bit user code selector. */
     cpu->cs_sel = 0x2b;
     cpu->seg_sel[OCERZ_SREG_CS] = 0x2b;
+    /* and its 64-bit user data selector: what `mov %ss, r` reads out of reset */
+    cpu->seg_sel[OCERZ_SREG_SS] = 0x23;
 }
 
 void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out)

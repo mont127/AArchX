@@ -1195,6 +1195,23 @@ static void h_highbyte(Gen *g)
     eb(g, 0x0f); eb(g, 0x9f); eb(g, 0xc7);       /* setg bh */
 }
 
+static void h_mov_sreg(Gen *g)
+{
+    /* mov r/m, Sreg in 32-bit mode: the live selectors, not long-mode
+     * constants, in every width and to memory */
+    MF m;
+    eb(g, 0x8c); eb(g, 0xc8);                    /* mov eax, cs */
+    eb(g, 0x8c); eb(g, 0xd3);                    /* mov ebx, ss */
+    eb(g, 0x8c); eb(g, 0xd9);                    /* mov ecx, ds */
+    eb(g, 0x8c); eb(g, 0xc2);                    /* mov edx, es */
+    eb(g, 0x8c); eb(g, 0xe6);                    /* mov esi, fs */
+    eb(g, 0x8c); eb(g, 0xef);                    /* mov edi, gs */
+    eb(g, 0x66); eb(g, 0x8c); eb(g, 0xcf);       /* mov di, cs */
+    mf_abs32(&m, (uint32_t)SCRATCH_MID);
+    eb(g, 0x8c); emit_modrm(g, 1, &m);           /* mov word [SCRATCH_MID], cs */
+    eb(g, 0x8b); emit_modrm(g, 5, &m);           /* mov ebp, [SCRATCH_MID] */
+}
+
 static void h_highbyte_mem(Gen *g)
 {
     MF m;
@@ -1759,6 +1776,7 @@ static void h_callret(Gen *g)
 static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "highbyte",      h_highbyte },
     { "highbyte-mem",  h_highbyte_mem },
+    { "mov-sreg",      h_mov_sreg },
     { "disp32-abs",    h_disp32_abs },
     { "moffs",         h_moffs },
     { "stack4",        h_stack4 },
