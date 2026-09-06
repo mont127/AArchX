@@ -55,7 +55,7 @@ run_with_timeout() {
     return $?
 }
 
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order fork_exec shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq jit_narrow jit_misc2 jit_misc3 jit_align jit_align2 jit_nanabs jit_divtrap sigmask_test int3_test sse42_test rsp_ops fcntl_locks cvt_nan_batch fp_loop_nan fpb_defer_nan cvt_merge_nan machdep_rdx ret_flags mov_sreg far_sel_bits filemap_private bigenv stack_align jcc_chain_rec)
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order fork_exec shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq jit_narrow jit_misc2 jit_misc3 jit_align jit_align2 jit_nanabs jit_divtrap sigmask_test int3_test sse42_test rsp_ops fcntl_locks cvt_nan_batch fp_loop_nan fpb_defer_nan cvt_merge_nan machdep_rdx ret_flags mov_sreg far_sel_bits filemap_private bigenv stack_align jcc_chain_rec atomic_unaligned)
 
 expected_exit() {
     case "$1" in

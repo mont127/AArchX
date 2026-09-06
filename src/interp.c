@@ -1,5 +1,6 @@
 /* The core single-step interpreter: reference semantics for x86_64. */
 #include <unistd.h>
+#include <string.h>
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/vm.h"
@@ -95,11 +96,51 @@ static void write_acc(OcerzCPU *cpu, int size, uint64_t v)
     ocerz_write_gpr(cpu, OCERZ_RAX, size, 0, v);
 }
 
+/* x86 makes a LOCK-prefixed access atomic at any alignment (the bus or
+ * cache-line lock covers a split access too); ARM64's LSE atomics fault on a
+ * misaligned address, and so does clang's __atomic_* on one.  Wine's
+ * CRITICAL_SECTION inside a packed Valve struct sits at +0x446, so every
+ * EnterCriticalSection in Steam's CEF host is a `lock cmpxchg` on a dword
+ * that is 2 mod 4: the JIT sends misaligned atomics here, and this used to
+ * fault again.  A misaligned access takes a lock striped by address and
+ * does the read-modify-write with plain unaligned copies: atomic against
+ * every other misaligned access to the same location, which is the only
+ * kind a lock word ever sees. */
+static uint32_t g_unal_lock[256];
+
+static inline uint32_t *unal_lock_for(uint64_t gaddr)
+{
+    return &g_unal_lock[(gaddr >> 3) & 255];
+}
+static inline void unal_lock(uint32_t *l)
+{
+    while (__atomic_exchange_n(l, 1u, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(l, __ATOMIC_RELAXED)) __builtin_arm_yield();
+}
+static inline void unal_unlock(uint32_t *l) { __atomic_store_n(l, 0u, __ATOMIC_RELEASE); }
+static inline int unal_misaligned(uint64_t gaddr, int size) { return (gaddr & (uint64_t)(size - 1)) != 0; }
+static inline uint64_t unal_load(const void *p, int size)
+{
+    uint64_t v = 0;
+    memcpy(&v, p, (size_t)size);
+    return v;
+}
+static inline void unal_store(void *p, int size, uint64_t v)
+{
+    memcpy(p, &v, (size_t)size);
+}
+
 static uint64_t ocerz_atomic_xchg(uint64_t gaddr, int size, uint64_t v)
 {
     void *p = ocerz_g2h(gaddr);
     uint64_t old;
-    switch (size) {
+    if (unal_misaligned(gaddr, size)) {
+        uint32_t *l = unal_lock_for(gaddr);
+        unal_lock(l);
+        old = unal_load(p, size);
+        unal_store(p, size, v);
+        unal_unlock(l);
+    } else switch (size) {
     case 1: { uint8_t  x = (uint8_t)v;  old = __atomic_exchange_n((uint8_t  *)p, x, __ATOMIC_SEQ_CST); break; }
     case 2: { uint16_t x = (uint16_t)v; old = __atomic_exchange_n((uint16_t *)p, x, __ATOMIC_SEQ_CST); break; }
     case 4: { uint32_t x = (uint32_t)v; old = __atomic_exchange_n((uint32_t *)p, x, __ATOMIC_SEQ_CST); break; }
@@ -115,7 +156,13 @@ static uint64_t ocerz_atomic_fetch_add(uint64_t gaddr, int size, uint64_t v)
 {
     void *p = ocerz_g2h(gaddr);
     uint64_t old;
-    switch (size) {
+    if (unal_misaligned(gaddr, size)) {
+        uint32_t *l = unal_lock_for(gaddr);
+        unal_lock(l);
+        old = unal_load(p, size);
+        unal_store(p, size, ocerz_trunc(old + v, size));
+        unal_unlock(l);
+    } else switch (size) {
     case 1: old = __atomic_fetch_add((uint8_t  *)p, (uint8_t)v,  __ATOMIC_SEQ_CST); break;
     case 2: old = __atomic_fetch_add((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST); break;
     case 4: old = __atomic_fetch_add((uint32_t *)p, (uint32_t)v, __ATOMIC_SEQ_CST); break;
@@ -131,7 +178,15 @@ static int ocerz_atomic_cmpxchg(uint64_t gaddr, int size, uint64_t *expected, ui
 {
     void *p = ocerz_g2h(gaddr);
     int ok;
-    switch (size) {
+    if (unal_misaligned(gaddr, size)) {
+        uint32_t *l = unal_lock_for(gaddr);
+        unal_lock(l);
+        uint64_t cur = unal_load(p, size);
+        ok = cur == ocerz_trunc(*expected, size);
+        if (ok) unal_store(p, size, desired);
+        unal_unlock(l);
+        *expected = cur;
+    } else switch (size) {
     case 1: { uint8_t  e = (uint8_t)*expected;  ok = __atomic_compare_exchange_n((uint8_t  *)p, &e, (uint8_t)desired,  0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; break; }
     case 2: { uint16_t e = (uint16_t)*expected; ok = __atomic_compare_exchange_n((uint16_t *)p, &e, (uint16_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; break; }
     case 4: { uint32_t e = (uint32_t)*expected; ok = __atomic_compare_exchange_n((uint32_t *)p, &e, (uint32_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; break; }
@@ -146,6 +201,13 @@ static int ocerz_atomic_cmpxchg(uint64_t gaddr, int size, uint64_t *expected, ui
 static uint64_t ocerz_atomic_load(uint64_t gaddr, int size)
 {
     void *p = ocerz_g2h(gaddr);
+    if (unal_misaligned(gaddr, size)) {
+        uint32_t *l = unal_lock_for(gaddr);
+        unal_lock(l);
+        uint64_t v = unal_load(p, size);
+        unal_unlock(l);
+        return v;
+    }
     switch (size) {
     case 1:  return __atomic_load_n((uint8_t  *)p, __ATOMIC_SEQ_CST);
     case 2:  return __atomic_load_n((uint16_t *)p, __ATOMIC_SEQ_CST);

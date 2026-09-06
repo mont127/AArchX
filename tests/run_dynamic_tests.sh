@@ -156,6 +156,7 @@ int main(void) {
 run_file_case dfork_signal tests/dynamic/fork_signal.c 'fork signal ok'
 run_file_case dthread_signal tests/dynamic/thread_signal.c 'OK'
 run_file_case dshmem_coherence tests/dynamic/shmem_coherence.c 'OK'
+run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"

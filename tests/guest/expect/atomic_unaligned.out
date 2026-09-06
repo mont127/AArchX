@@ -1,0 +1,196 @@
+== dword 2 mod 4
+cmpxchg-hit old 305419896
+cmpxchg-hit mem 3735928559
+cmpxchg-hit flags z c s o = 1 0 0 0
+cmpxchg-miss old 3735928559
+cmpxchg-miss mem 3735928559
+cmpxchg-miss flags z c s o = 0 0 1 0
+xadd ret 3735928559
+xadd mem 1588444910
+xadd flags z c s o = 0 1 0 0
+xchg ret 1588444910
+xchg mem 2779096485
+add mem 0
+add flags z c s o = 1 1 0 0
+sub mem 4294967295
+sub flags z c s o = 0 1 1 0
+or mem 4294967295
+or flags z c s o = 0 0 1 0
+xor mem 0
+xor flags z c s o = 1 0 0 0
+and mem 0
+and flags z c s o = 1 0 0 0
+inc mem 1
+inc flags z c s o = 0 0 0 0
+dec mem 0
+dec flags z c s o = 1 0 0 0
+neg mem 0
+neg flags z c s o = 1 0 0 0
+not mem 4294967295
+bts mem 4294967295
+bts carry 1
+== dword crosses 16-byte granule
+cmpxchg-hit old 305419896
+cmpxchg-hit mem 3735928559
+cmpxchg-hit flags z c s o = 1 0 0 0
+cmpxchg-miss old 3735928559
+cmpxchg-miss mem 3735928559
+cmpxchg-miss flags z c s o = 0 0 1 0
+xadd ret 3735928559
+xadd mem 1588444910
+xadd flags z c s o = 0 1 0 0
+xchg ret 1588444910
+xchg mem 2779096485
+add mem 0
+add flags z c s o = 1 1 0 0
+sub mem 4294967295
+sub flags z c s o = 0 1 1 0
+or mem 4294967295
+or flags z c s o = 0 0 1 0
+xor mem 0
+xor flags z c s o = 1 0 0 0
+and mem 0
+and flags z c s o = 1 0 0 0
+inc mem 1
+inc flags z c s o = 0 0 0 0
+dec mem 0
+dec flags z c s o = 1 0 0 0
+neg mem 0
+neg flags z c s o = 1 0 0 0
+not mem 4294967295
+bts mem 4294967295
+bts carry 1
+== dword crosses page
+cmpxchg-hit old 305419896
+cmpxchg-hit mem 3735928559
+cmpxchg-hit flags z c s o = 1 0 0 0
+cmpxchg-miss old 3735928559
+cmpxchg-miss mem 3735928559
+cmpxchg-miss flags z c s o = 0 0 1 0
+xadd ret 3735928559
+xadd mem 1588444910
+xadd flags z c s o = 0 1 0 0
+xchg ret 1588444910
+xchg mem 2779096485
+add mem 0
+add flags z c s o = 1 1 0 0
+sub mem 4294967295
+sub flags z c s o = 0 1 1 0
+or mem 4294967295
+or flags z c s o = 0 0 1 0
+xor mem 0
+xor flags z c s o = 1 0 0 0
+and mem 0
+and flags z c s o = 1 0 0 0
+inc mem 1
+inc flags z c s o = 0 0 0 0
+dec mem 0
+dec flags z c s o = 1 0 0 0
+neg mem 0
+neg flags z c s o = 1 0 0 0
+not mem 4294967295
+bts mem 4294967295
+bts carry 1
+== qword 4 mod 8
+cmpxchg-hit old 81985529216486895
+cmpxchg-hit mem 18364758544493064720
+cmpxchg-hit flags z c s o = 1 0 0 0
+cmpxchg-miss old 18364758544493064720
+cmpxchg-miss mem 18364758544493064720
+cmpxchg-miss flags z c s o = 0 0 1 0
+xadd ret 18364758544493064720
+xadd mem 9141386507638288911
+xadd flags z c s o = 0 1 0 0
+xchg ret 9141386507638288911
+xchg mem 6510615555426900570
+add mem 6510615555426900569
+add flags z c s o = 0 1 0 0
+or mem 6510615555426900607
+or flags z c s o = 0 0 0 0
+inc mem 6510615555426900608
+inc flags z c s o = 0 0 0 0
+neg mem 11936128518282651008
+neg flags z c s o = 0 1 1 0
+cmpxchg8b-hit mem 13527612320434006698
+cmpxchg8b-hit zf 1
+cmpxchg8b-hit eax 1432778632
+cmpxchg8b-hit edx 287454020
+cmpxchg8b-miss mem 13527612320434006698
+cmpxchg8b-miss zf 0
+cmpxchg8b-miss eax 2863311530
+cmpxchg8b-miss edx 3149642683
+== qword crosses 16-byte granule
+cmpxchg-hit old 81985529216486895
+cmpxchg-hit mem 18364758544493064720
+cmpxchg-hit flags z c s o = 1 0 0 0
+cmpxchg-miss old 18364758544493064720
+cmpxchg-miss mem 18364758544493064720
+cmpxchg-miss flags z c s o = 0 0 1 0
+xadd ret 18364758544493064720
+xadd mem 9141386507638288911
+xadd flags z c s o = 0 1 0 0
+xchg ret 9141386507638288911
+xchg mem 6510615555426900570
+add mem 6510615555426900569
+add flags z c s o = 0 1 0 0
+or mem 6510615555426900607
+or flags z c s o = 0 0 0 0
+inc mem 6510615555426900608
+inc flags z c s o = 0 0 0 0
+neg mem 11936128518282651008
+neg flags z c s o = 0 1 1 0
+cmpxchg8b-hit mem 13527612320434006698
+cmpxchg8b-hit zf 1
+cmpxchg8b-hit eax 1432778632
+cmpxchg8b-hit edx 287454020
+cmpxchg8b-miss mem 13527612320434006698
+cmpxchg8b-miss zf 0
+cmpxchg8b-miss eax 2863311530
+cmpxchg8b-miss edx 3149642683
+== qword crosses page
+cmpxchg-hit old 81985529216486895
+cmpxchg-hit mem 18364758544493064720
+cmpxchg-hit flags z c s o = 1 0 0 0
+cmpxchg-miss old 18364758544493064720
+cmpxchg-miss mem 18364758544493064720
+cmpxchg-miss flags z c s o = 0 0 1 0
+xadd ret 18364758544493064720
+xadd mem 9141386507638288911
+xadd flags z c s o = 0 1 0 0
+xchg ret 9141386507638288911
+xchg mem 6510615555426900570
+add mem 6510615555426900569
+add flags z c s o = 0 1 0 0
+or mem 6510615555426900607
+or flags z c s o = 0 0 0 0
+inc mem 6510615555426900608
+inc flags z c s o = 0 0 0 0
+neg mem 11936128518282651008
+neg flags z c s o = 0 1 1 0
+cmpxchg8b-hit mem 13527612320434006698
+cmpxchg8b-hit zf 1
+cmpxchg8b-hit eax 1432778632
+cmpxchg8b-hit edx 287454020
+cmpxchg8b-miss mem 13527612320434006698
+cmpxchg8b-miss zf 0
+cmpxchg8b-miss eax 2863311530
+cmpxchg8b-miss edx 3149642683
+== word 1 mod 2
+cmpxchg-hit old 4660
+cmpxchg-hit mem 48879
+cmpxchg-hit flags z c s o = 1 0 0 0
+xadd ret 48879
+xadd mem 16111
+xadd flags z c s o = 0 1 0 1
+dec mem 16110
+dec flags z c s o = 0 0 0 0
+== word crosses page
+cmpxchg-hit old 4660
+cmpxchg-hit mem 48879
+cmpxchg-hit flags z c s o = 1 0 0 0
+xadd ret 48879
+xadd mem 16111
+xadd flags z c s o = 0 1 0 1
+dec mem 16110
+dec flags z c s o = 0 0 0 0
+checksum 12639309125701677817
