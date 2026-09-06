@@ -323,6 +323,8 @@ static int shared_ro_overlaps(uint64_t gaddr, uint64_t len)
 /* OCERZ_MAPFAILLOG: every mmap the guest sees fail, with what it asked for.
  * Chromium's allocator treats a refused 4 KB commit as out-of-memory. */
 static void pe_scan_print(OcerzCPU *cpu, const char *tag, const char *detail);
+static void pagetrap_init(void);
+static uint64_t g_pagetrap_lo = ~0ull, g_pagetrap_hi;
 static void mmap_fail_log(OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t pos)
 {
     static int lg = -1;
@@ -3861,9 +3863,8 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
          * trapped address (the kernel-chosen placement, invisible to the
          * entry-side check in pagetrap_check) */
         {
-            static uint64_t ptrap = ~0ull;
-            if (ptrap == ~0ull) { const char *e = getenv("OCERZ_PAGETRAP"); ptrap = e ? strtoull(e, NULL, 0) : 0; }
-            if (ptrap && num == 197 && !err && !(orig[3] & MAP_FIXED) && (uint64_t)r < (ptrap | 0x3fff) + 1 && (ptrap & ~0x3fffull) < (uint64_t)r + orig[1]) {
+            pagetrap_init();
+            if (g_pagetrap_hi && num == 197 && !err && !(orig[3] & MAP_FIXED) && (uint64_t)r < g_pagetrap_hi && g_pagetrap_lo < (uint64_t)r + orig[1]) {
                 char d[160];
                 snprintf(d, sizeof d, " mmap-placed addr=%#llx len=%#llx prot=%#llx flags=%#llx fd=%lld -> %#llx",
                          (unsigned long long)orig[0], (unsigned long long)orig[1], (unsigned long long)orig[2],
@@ -5685,11 +5686,25 @@ static void writetrap_check(OcerzCPU *cpu, int num)
  * (mmap MAP_FIXED, munmap, mprotect, madvise) prints the PE stack of the
  * thread making it.  Names the code that decommits a page a later access
  * faults on (a freed object still referenced by a pending callback). */
+/* OCERZ_PAGETRAP=<addr>[:<len>] (declared above) */
+static void pagetrap_init(void)
+{
+    if (g_pagetrap_lo != ~0ull) return;
+    const char *e = getenv("OCERZ_PAGETRAP");
+    g_pagetrap_lo = 0; g_pagetrap_hi = 0;
+    if (!e) return;
+    char *end = NULL;
+    uint64_t a = strtoull(e, &end, 0);
+    uint64_t len = (end && *end == ':') ? strtoull(end + 1, NULL, 0) : 1;
+    /* a single address means its whole 16 KB host page: a sibling 4 KB guest
+     * page shares that page's protection */
+    g_pagetrap_lo = len == 1 ? (a & ~0x3fffull) : a;
+    g_pagetrap_hi = len == 1 ? g_pagetrap_lo + 0x4000 : a + len;
+}
 static void pagetrap_check(OcerzCPU *cpu, int num)
 {
-    static uint64_t trap = ~0ull;
-    if (trap == ~0ull) { const char *e = getenv("OCERZ_PAGETRAP"); trap = e ? strtoull(e, NULL, 0) : 0; }
-    if (!trap) return;
+    pagetrap_init();
+    if (!g_pagetrap_hi) return;
     uint64_t a = cpu->gpr[OCERZ_RDI], l = cpu->gpr[OCERZ_RSI];
     const char *what;
     switch (num) {
@@ -5699,10 +5714,7 @@ static void pagetrap_check(OcerzCPU *cpu, int num)
     case 197: if (!(cpu->gpr[OCERZ_R10] & MAP_FIXED)) return; what = "mmap-fixed"; break;
     default: return;
     }
-    /* any operation touching the 16 KB host page that holds the address:
-     * a sibling 4 KB guest page shares its protection */
-    uint64_t hp = trap & ~0x3fffull;
-    if (!(a < hp + 0x4000 && hp < a + l)) return;
+    if (!(a < g_pagetrap_hi && g_pagetrap_lo < a + l)) return;
     char d[160];
     snprintf(d, sizeof d, " %s addr=%#llx len=%#llx a3=%#llx a4=%#llx", what,
              (unsigned long long)a, (unsigned long long)l,
