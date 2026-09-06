@@ -8536,6 +8536,15 @@ static int fused_jcc_cond(const X86Insn *producer, const X86Insn *jcc)
     return jcc->cc < 16 ? cmp_cond[jcc->cc] : -1;
 }
 
+/* May chaining retarget this conditional branch straight at the successor?
+ * Only when nothing the successor needs sits between the branch and the
+ * chain tail: no flag record on the taken side, and a body edge (an
+ * out-of-block tail spills the pins and pops the frame first). */
+static uint32_t *cond_short_site(uint32_t *to_taken, int taken_rec, int body_edge)
+{
+    return (taken_rec || !body_edge) ? NULL : to_taken;
+}
+
 static int can_fuse_cmp_test_jcc(const X86Insn *producer,
                                  const X86Insn *jcc, uint64_t block_rip)
 {
@@ -9029,7 +9038,8 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             a64_patch_cbz(to_taken, taken_label);
         else
             a64_patch_bcond(to_taken, taken_label);
-        if (g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0) {
+        int taken_rec = g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0;
+        if (taken_rec) {
             if (producer->op == OCERZ_OP_CMP) {
                 if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
                 emit_defer_flags(b, ccop, record_src, record_dst);
@@ -9051,7 +9061,11 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
         g_jcc_edge[1].target_rip = taken;
         g_jcc_edge[1].patch_b = pb_taken;
-        g_jcc_edge[1].cond_site = to_taken;
+        /* the taken side's flag record sits between the conditional branch
+         * and the chain tail: a short-circuit past it hands the successor a
+         * stale record (libcef's btree cell walk, `cmp ebp,0xb ; jbe L` with
+         * `L: ja`, failed every SQLite open that way) */
+        g_jcc_edge[1].cond_site = cond_short_site(to_taken, taken_rec, body_edge);
         g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
         g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
         g_n_jcc_edges = 2;
@@ -9144,10 +9158,12 @@ static int can_fuse_incdec_jcc(const X86Insn *producer, const X86Insn *jcc)
 static uint32_t *emit_incdec_jcc_arm(A64Buf *b, const X86Insn *producer,
                                      uint64_t target, int poll, int body_edge,
                                      int cf_reg,
-                                     uint32_t **epilogue_sites, int *n_epi)
+                                     uint32_t **epilogue_sites, int *n_epi,
+                                     int *recorded)
 {
     uint64_t live = g_no_xlive ? (uint64_t)OCERZ_FL_ALL
                                : xlive_succ_live(g_xlat_jit, target);
+    if (recorded) *recorded = live != 0;
     if (live != 0) {
         const X86Operand *d = &producer->ops[0];
         if (cf_reg < 0) {
@@ -9204,12 +9220,13 @@ static int emit_incdec_jcc(A64Buf *b, const X86Insn *producer,
 
     uint32_t *pb_fall = emit_incdec_jcc_arm(
         b, producer, fall, fall <= g_self_rip,
-        body_edge, -1, epilogue_sites, n_epi);
+        body_edge, -1, epilogue_sites, n_epi, NULL);
     uint32_t *taken_label = a64_label(b);
     a64_patch_bcond(to_taken, taken_label);
+    int taken_rec = 0;
     uint32_t *pb_taken = emit_incdec_jcc_arm(
         b, producer, taken, taken <= g_self_rip,
-        body_edge, -1, epilogue_sites, n_epi);
+        body_edge, -1, epilogue_sites, n_epi, &taken_rec);
 
     g_jcc_edge[0].target_rip = fall;
     g_jcc_edge[0].patch_b = pb_fall;
@@ -9217,7 +9234,7 @@ static int emit_incdec_jcc(A64Buf *b, const X86Insn *producer,
     g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_jcc_edge[1].target_rip = taken;
     g_jcc_edge[1].patch_b = pb_taken;
-    g_jcc_edge[1].cond_site = to_taken;
+    g_jcc_edge[1].cond_site = cond_short_site(to_taken, taken_rec, body_edge);
     g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
     g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_n_jcc_edges = 2;
@@ -9324,12 +9341,13 @@ static int emit_arith_incdec_jcc(A64Buf *b, const X86Insn *arith,
 
     uint32_t *pb_fall = emit_incdec_jcc_arm(
         b, incdec, fall, fall <= g_self_rip,
-        body_edge, JT0, epilogue_sites, n_epi);
+        body_edge, JT0, epilogue_sites, n_epi, NULL);
     uint32_t *taken_label = a64_label(b);
     a64_patch_bcond(to_taken, taken_label);
+    int taken_rec = 0;
     uint32_t *pb_taken = emit_incdec_jcc_arm(
         b, incdec, taken, taken <= g_self_rip,
-        body_edge, JT0, epilogue_sites, n_epi);
+        body_edge, JT0, epilogue_sites, n_epi, &taken_rec);
 
     g_jcc_edge[0].target_rip = fall;
     g_jcc_edge[0].patch_b = pb_fall;
@@ -9337,7 +9355,7 @@ static int emit_arith_incdec_jcc(A64Buf *b, const X86Insn *arith,
     g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_jcc_edge[1].target_rip = taken;
     g_jcc_edge[1].patch_b = pb_taken;
-    g_jcc_edge[1].cond_site = to_taken;
+    g_jcc_edge[1].cond_site = cond_short_site(to_taken, taken_rec, body_edge);
     g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
     g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_n_jcc_edges = 2;
@@ -9425,12 +9443,13 @@ static int emit_logic_jmp_incdec_jcc(A64Buf *b, const X86Insn *logic,
 
     uint32_t *pb_fall = emit_incdec_jcc_arm(
         b, incdec, fall, fall <= g_self_rip, body_edge, A64_ZR,
-        epilogue_sites, n_epi);
+        epilogue_sites, n_epi, NULL);
     uint32_t *taken_label = a64_label(b);
     a64_patch_bcond(to_taken, taken_label);
+    int taken_rec = 0;
     uint32_t *pb_taken = emit_incdec_jcc_arm(
         b, incdec, taken, taken <= g_self_rip, body_edge, A64_ZR,
-        epilogue_sites, n_epi);
+        epilogue_sites, n_epi, &taken_rec);
 
     g_jcc_edge[0].target_rip = fall;
     g_jcc_edge[0].patch_b = pb_fall;
@@ -9438,7 +9457,7 @@ static int emit_logic_jmp_incdec_jcc(A64Buf *b, const X86Insn *logic,
     g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_jcc_edge[1].target_rip = taken;
     g_jcc_edge[1].patch_b = pb_taken;
-    g_jcc_edge[1].cond_site = to_taken;
+    g_jcc_edge[1].cond_site = cond_short_site(to_taken, taken_rec, body_edge);
     g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
     g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
     g_n_jcc_edges = 2;
@@ -9726,7 +9745,7 @@ static int emit_ifconv_diamond(A64Buf *b, const X86Insn *test,
     int body_edge = edge_class >= 0;
     uint32_t *pb_exit = emit_incdec_jcc_arm(
         b, latch, m.exit_rip, m.exit_rip <= g_self_rip,
-        body_edge, JT0, epilogue_sites, n_epi);
+        body_edge, JT0, epilogue_sites, n_epi, NULL);
 
     g_stop_target = a64_label(b);
     emit_gpr_rd(b, 1, JT1, ld->reg);
@@ -9853,7 +9872,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
         g_jcc_edge[1].target_rip = taken;
         g_jcc_edge[1].patch_b = pb_taken;
-        g_jcc_edge[1].cond_site = to_taken;
+        g_jcc_edge[1].cond_site = cond_short_site(to_taken, 0, body_edge);
         g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
         g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
         g_n_jcc_edges = 2;
@@ -11228,8 +11247,8 @@ static void pending_drain(uint64_t key, JitBlock *target)
                     pred_add(target, e->src, e->edge);
                 }
             } else {
+                /* no cond short-circuit: the full entry needs the tail's spill */
                 chain_activate(e->patch_b, (void *)target->code);
-                chain_cond_short(e->cond_site, (void *)target->code);
                 pred_add(target, e->src, e->edge);
             }
             *pp = e->next;
@@ -14898,7 +14917,8 @@ static void chain_edge_now(OcerzJit *jit, JitBlock *blk, int e)
         }
         if (dst) {
             chain_activate(blk->edges[e].patch_b, dst);
-            chain_cond_short(blk->edges[e].cond_site, dst);
+            if (blk->edges[e].kind == EDGE_BODY)
+                chain_cond_short(blk->edges[e].cond_site, dst);
             pred_add(t, blk, e);
             return;
         }

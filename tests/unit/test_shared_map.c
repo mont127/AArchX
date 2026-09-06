@@ -212,7 +212,12 @@ static void test_readonly_copy_and_writable_rejection(OcerzVM *vm, int fd,
           0x3333333344444444ull);
 }
 
-static void test_readonly_subpage_allows_private_sibling(OcerzVM *vm, int fd,
+/* A read-only MAP_SHARED view that is not 16 KB-aligned maps the whole host
+ * page from the file (81e6d9e): the reader sees another process's writes,
+ * which Steam's UI ring buffer needs.  The price is the 4 KB siblings of
+ * that host page: a later mapping into one of them is refused, never
+ * silently turned into a private slot. */
+static void test_readonly_subpage_shared_refuses_sibling(OcerzVM *vm, int fd,
                                                          uint64_t base)
 {
     uint64_t before = 0x0badf00dc001d00dull;
@@ -226,22 +231,15 @@ static void test_readonly_subpage_allows_private_sibling(OcerzVM *vm, int fd,
 
     uint64_t after = 0x123456789abcdef0ull;
     CHECK(pwrite(fd, &after, sizeof after, 64) == sizeof after);
-    CHECK(ocerz_ld(base + 64, 8) == before);
+    CHECK(ocerz_ld(base + 64, 8) == after);
 
     uint64_t sibling = base + OCERZ_GUEST_PAGE_SIZE;
     set_args(&vm->cpu, bsd(197), sibling, OCERZ_GUEST_PAGE_SIZE,
              PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON,
              (uint64_t)-1, 0);
     CHECK(ocerz_handle_syscall(vm, &vm->cpu) == OCERZ_STEP_OK);
-    CHECK(carry(&vm->cpu) == 0);
-    CHECK(vm->cpu.gpr[OCERZ_RAX] == sibling);
-    ocerz_st(sibling, 8, 0xabcdef0123456789ull);
-    CHECK(ocerz_ld(sibling, 8) == 0xabcdef0123456789ull);
-    CHECK(ocerz_ld(base + 64, 8) == before);
-    uint64_t file_value = 0;
-    CHECK(pread(fd, &file_value, sizeof file_value,
-                OCERZ_GUEST_PAGE_SIZE) == sizeof file_value);
-    CHECK(file_value != 0xabcdef0123456789ull);
+    CHECK(carry(&vm->cpu) == 1);
+    CHECK(ocerz_ld(base + 64, 8) == after);
 }
 
 static void test_shared_anon_stays_shared(OcerzVM *vm, uint64_t base)
@@ -346,7 +344,7 @@ int main(void)
     test_partial_unmap_keeps_shared_survivors(fd);
     test_private_replaces_only_shared_slice(&vm, fd);
     test_readonly_copy_and_writable_rejection(&vm, fd, lo + 0x10000);
-    test_readonly_subpage_allows_private_sibling(&vm, fd, lo + 0x20000);
+    test_readonly_subpage_shared_refuses_sibling(&vm, fd, lo + 0x20000);
     test_shared_anon_stays_shared(&vm, lo + 0x30000);
     test_wine_kuser_padded_mapping(&vm);
 
