@@ -20,6 +20,11 @@ Permission is granted to make copies of this software solely for your own backup
 or installation purposes, provided those copies are not made available to any
 third party.
 
+Forking this repository on GitHub in order to read the code or to propose changes
+back to this repository is permitted. A fork may not be published, promoted,
+distributed, or used as a separate version of the software, and remains subject
+to every restriction in this license.
+
 Non-commercial use does not include selling, licensing for a fee, offering the
 software as part of a paid product or service, using the software primarily for
 commercial advantage or monetary compensation, or otherwise commercially
@@ -62,6 +67,12 @@ Any commercial use of this software or any modified version, including use by or
 on behalf of a company or other organization for business purposes, and any
 incorporation into a commercial product or service, requires prior written
 permission from mont127 and may be subject to additional terms and conditions.
+
+EXCLUDED PARTIES
+
+No permission of any kind is granted under this license to GameSir, its parent,
+subsidiaries and affiliates, or to any person acting on their behalf. This
+exclusion cannot be lifted through the permission process below.
 
 RESERVATION OF RIGHTS
 
