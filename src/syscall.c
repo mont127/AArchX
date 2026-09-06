@@ -320,6 +320,18 @@ static int shared_ro_overlaps(uint64_t gaddr, uint64_t len)
 /* Read [lo, hi) of the guest range from the file; a short read (EOF) leaves
  * the rest of the anonymous page zero, which is what a mapping past the end
  * of a file reads as. */
+/* OCERZ_MAPFAILLOG: every mmap the guest sees fail, with what it asked for.
+ * Chromium's allocator treats a refused 4 KB commit as out-of-memory. */
+static void mmap_fail_log(OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t pos)
+{
+    static int lg = -1;
+    if (lg < 0) lg = getenv("OCERZ_MAPFAILLOG") ? 1 : 0;
+    if (lg)
+        fprintf(stderr, "ocerz: MMAPFAIL[%d] addr=%#llx len=%#llx prot=%#x flags=%#x fd=%d off=%#llx rip=%#llx\n",
+                (int)getpid(), (unsigned long long)addr, (unsigned long long)len, prot, flags, fd,
+                (unsigned long long)pos, (unsigned long long)cpu->rip);
+}
+
 static int pread_range(int fd, uint64_t gaddr, uint64_t lo, uint64_t hi, uint64_t pos)
 {
     while (lo < hi) {
@@ -402,13 +414,15 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 ocerz_mem_register_range(addr, addr + len) == OCERZ_OK)
                 rc = ocerz_map_fixed(addr, len, prot);
             if (rc != OCERZ_OK) {
-                ret_err(cpu, OCERZ_ENOMEM_V);
+                mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
+            ret_err(cpu, OCERZ_ENOMEM_V);
                 return OCERZ_STEP_OK;
             }
             if ((flags & MAP_SHARED) &&
                 ocerz_map_shared_anon(addr, len, prot) != OCERZ_OK) {
                 ocerz_unmap(addr, len);
-                ret_err(cpu, OCERZ_ENOMEM_V);
+                mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
+            ret_err(cpu, OCERZ_ENOMEM_V);
                 return OCERZ_STEP_OK;
             }
             if (prot == PROT_NONE && addr <= 0x10000ull &&
@@ -425,6 +439,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         if (gaddr == 0)
             gaddr = ocerz_map_anywhere(len, prot);
         if (gaddr == 0) {
+            mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
             ret_err(cpu, OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
@@ -432,6 +447,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         if ((flags & MAP_SHARED) &&
             ocerz_map_shared_anon(gaddr, len, prot) != OCERZ_OK) {
             ocerz_unmap(gaddr, len);
+            mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
             ret_err(cpu, OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
@@ -446,6 +462,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             ocerz_mem_register_range(addr, addr + len) == OCERZ_OK)
             rc = ocerz_map_fixed(addr, len, PROT_READ | PROT_WRITE);
         if (rc != OCERZ_OK) {
+            mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
             ret_err(cpu, OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
@@ -453,6 +470,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     } else {
         gaddr = ocerz_map_anywhere(len, PROT_READ | PROT_WRITE);
         if (gaddr == 0) {
+            mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
             ret_err(cpu, OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
@@ -514,6 +532,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     if (ocerz_protect(gaddr, len, prot) != OCERZ_OK) {
         ocerz_unmap(gaddr, len);
+        mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
         ret_err(cpu, OCERZ_ENOMEM_V);
         return OCERZ_STEP_OK;
     }
@@ -549,6 +568,9 @@ static int sys_mprotect(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         ocerz_jit_require_ordered(vm);
     invalidate_guest_mapping(vm, a[0], a[1]);
     int rc = ocerz_protect(a[0], a[1], (int)a[2]);
+    if (rc != OCERZ_OK && getenv("OCERZ_MAPFAILLOG"))
+        fprintf(stderr, "ocerz: PROTFAIL[%d] addr=%#llx len=%#llx prot=%#x rc=%d rip=%#llx\n", (int)getpid(),
+                (unsigned long long)a[0], (unsigned long long)a[1], (unsigned)a[2], rc, (unsigned long long)cpu->rip);
     if (rc == OCERZ_OK)
         ret_ok(cpu, 0);
     else
@@ -4836,7 +4858,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         cpu->last_rcv_name = (a[1] & 0x2) ? (uint32_t)a[5] : 0;
         {
             static int rlog = -1;
-            if (rlog < 0) rlog = getenv("OCERZ_MACHSLOW") ? 1 : 0;
+            if (rlog < 0) rlog = (getenv("OCERZ_MACHSLOW") || getenv("OCERZ_PORTDUMP")) ? 1 : 0;
             if (rlog && (a[1] & 0x1) && request_buf) {
                 int k = cpu->sendring_n % 8;
                 cpu->sendring_id[k] = (uint32_t)(a[4] >> 32);

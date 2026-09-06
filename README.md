@@ -47,8 +47,8 @@ make -j
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 80 / 80 |
-| x86-64 differential gate (interpreter vs JIT) | 69 / 69 |
+| x86-64 guest gate | 82 / 82 |
+| x86-64 differential gate (interpreter vs JIT) | 71 / 71 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 5 / 5 |
 | xbench output vs native | 15 / 15 kernels bit-identical |

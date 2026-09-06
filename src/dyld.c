@@ -779,24 +779,46 @@ static uint64_t put_str(uint64_t *sp, const char *s)
 
 static int build_frame(const char *path, int argc, char **argv, char **envp, DynFrame *out)
 {
-    uint64_t aux = ocerz_map_anywhere(1u << 20, PROT_READ | PROT_WRITE);
+    /* Every argument and environment entry goes onto the guest stack: the
+     * arrays were fixed at 64 and the environment cut at 60 entries, which
+     * silently dropped the last variables of a large environment.  Wine's
+     * loader marks its one-time re-exec by appending WINELOADERNOEXEC=1, so
+     * a launch with one variable too many re-exec'd every wine process
+     * forever (2026-09-06, Steam).  Count first, size the string area to
+     * the real need, allocate the pointer arrays by count. */
+    int envc = 0;
+    while (envp && envp[envc])
+        envc++;
+    char apple0[2048];
+    snprintf(apple0, sizeof apple0, "executable_path=%s", path);
+    size_t need = strlen(apple0) + 1 + 512;
+    for (int i = 0; i < argc; i++)
+        need += strlen(argv[i]) + 1;
+    for (int i = 0; i < envc; i++)
+        need += strlen(envp[i]) + 1;
+    need += ((size_t)argc + (size_t)envc + 16) * 8 + 256;
+    uint64_t aux_size = 1u << 20;
+    if (need + 65536 > aux_size)
+        aux_size = (need + 65536 + 0x3fff) & ~(uint64_t)0x3fff;
+    uint64_t aux = ocerz_map_anywhere(aux_size, PROT_READ | PROT_WRITE);
     uint64_t stack = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
     if (aux == 0 || stack == 0)
         return OCERZ_ENOMEM;
+    uint64_t *argv_g = (uint64_t *)calloc((size_t)argc + 1, sizeof *argv_g);
+    uint64_t *envp_g = (uint64_t *)calloc((size_t)envc + 1, sizeof *envp_g);
+    if (!argv_g || !envp_g) {
+        free(argv_g);
+        free(envp_g);
+        return OCERZ_ENOMEM;
+    }
 
     static const uint8_t exit_stub[] = { 0x89, 0xc7, 0xb8, 0x01, 0x00, 0x00, 0x02, 0x0f, 0x05 };
     out->exit_stub = stack + DYN_STACK_SIZE - 64;
     memcpy(ocerz_g2h(out->exit_stub), exit_stub, sizeof exit_stub);
     out->stack_top = (out->exit_stub - 256) & ~0xfull;
 
-    char apple0[2048];
-    snprintf(apple0, sizeof apple0, "executable_path=%s", path);
-
-    uint64_t sp = aux + (1u << 20);
-    uint64_t argv_g[64], envp_g[64], apple_g[8];
-    int envc = 0;
-    while (envp && envp[envc] && envc < 60)
-        envc++;
+    uint64_t sp = aux + aux_size;
+    uint64_t apple_g[8];
 
     for (int i = argc - 1; i >= 0; i--)
         argv_g[i] = put_str(&sp, argv[i]);
@@ -853,6 +875,8 @@ static int build_frame(const char *path, int argc, char **argv, char **envp, Dyn
     out->envp_arr = envp_arr;
     out->apple_arr = apple_arr;
     out->progvars = pv;
+    free(argv_g);
+    free(envp_g);
     return OCERZ_OK;
 }
 
