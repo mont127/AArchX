@@ -2209,6 +2209,13 @@ static int decode_0f(DecState *s, uint8_t op2)
         if (mand == MAND_F3)
             return decode_sse_rr(s, OCERZ_OP_MOVDQU, 16, 1);
         return OCERZ_EUNDEF;
+    case 0xf0:
+        /* LDDQU xmm, m128 (SSE3): an unaligned 16-byte load, same as MOVDQU
+         * for us.  Chromium's renderer (SIMD UTF-8 scanning) uses it; a
+         * decode failure there killed every renderer Steam launched. */
+        if (mand == MAND_F2)
+            return decode_sse_rr(s, OCERZ_OP_MOVDQU, 16, 1);
+        return OCERZ_EUNDEF;
     case 0x70: {
         int op;
         switch (mand) {
