@@ -8687,6 +8687,16 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         const X86Operand *pm = pd->kind == OCERZ_OPK_MEM ? pd : ps->kind == OCERZ_OPK_MEM ? ps : NULL;
         (void)pm;   /* the load happens BEFORE the gap, so later base/index writes are fine */
         if (!flag_neutral_ok(gap)) return 0;
+        /* the admission test knows the shape, not the pin state; emit into a
+         * scratch buffer first so a gap the emitter cannot place (an unpinned
+         * register, rsp held as a pointer) is a refusal here rather than an
+         * assertion after the compare has been emitted.  This aborted a Steam
+         * process on 2026-09-06. */
+        {
+            uint32_t tmpw[128];
+            A64Buf tb = { tmpw, tmpw, tmpw + 128, 0, 0 };
+            if (!emit_flag_neutral(&tb, gap) || tb.overflow) return 0;
+        }
     }
 
     const X86Operand *d = &producer->ops[0];

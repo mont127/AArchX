@@ -1824,6 +1824,26 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
         KERN_SUCCESS)
         return;
     fprintf(stderr, "ocerz: PORTDUMP[%d] rights=%u\n", (int)getpid(), ncnt);
+    /* every guest thread: where it is, how long it has been inside a mach
+     * trap, the port it receives on and its last sends (recorded while
+     * OCERZ_PORTDUMP is set) - the blocked one names the conversation */
+    {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        for (int i = 0; i < g_cpus_n; i++) {
+            OcerzCPU *c = g_cpus[i];
+            if (!c) continue;
+            fprintf(stderr, "ocerz: PORTDUMP[%d] cpu#%u rip=%#llx rax=%#llx rdi=%#llx blocked=%.1fs rcv_name=%#x sends:",
+                    (int)getpid(), c->cpu_number, (unsigned long long)c->rip,
+                    (unsigned long long)c->gpr[OCERZ_RAX], (unsigned long long)c->gpr[OCERZ_RDI],
+                    c->block_since_ns ? (double)(now - c->block_since_ns) / 1e9 : 0.0,
+                    c->last_rcv_name);
+            for (int k = 0; k < 8 && k < c->sendring_n; k++) {
+                int j = (c->sendring_n - 1 - k) % 8;
+                fprintf(stderr, " [id=%u port=%#x sz=%u]", c->sendring_id[j], c->sendring_port[j], c->sendring_sz[j]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     for (mach_msg_type_number_t i = 0; i < ncnt; i++) {
         if (!(types[i] & MACH_PORT_TYPE_RECEIVE))
             continue;
