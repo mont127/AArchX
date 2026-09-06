@@ -564,7 +564,16 @@ static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
         int physical = (shared_load(r, i) & MEM_SHARED_PHYSICAL) != 0;
         uint64_t mlo = p > zlo ? p : zlo;
         uint64_t mhi = p + OCERZ_HOST_PAGE < zhi ? p + OCERZ_HOST_PAGE : zhi;
-        if (committed && mlo < mhi) {
+        /* A sibling slot of a padded shared page (wine's syscall-dispatcher
+         * slot at 0x7ffe1000, next to KUSER_SHARED_DATA) is physically the
+         * shared file every process of the prefix maps.  Zero-filling it for
+         * this process's fresh anonymous mapping zeroes it for all of them,
+         * and until this process stores its pointer a few instructions
+         * later every syscall elsewhere calls NULL (Steam's CEF children
+         * died that way, 2026-09-06).  The value is the same in every
+         * process, so leave the slot as it is. */
+        int padded = (shared_load(r, i) & MEM_SHARED_PADDED) != 0;
+        if (committed && mlo < mhi && !padded) {
             if (physical
                     ? mprotect(hp, (size_t)OCERZ_HOST_PAGE,
                                PROT_READ | PROT_WRITE) != 0
