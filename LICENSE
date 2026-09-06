@@ -5,17 +5,29 @@ All source code, binaries, documentation, and other materials contained in this
 version of AArchX are proprietary to mont127, except where explicitly stated
 otherwise.
 
-No permission is granted to copy, modify, reproduce, distribute, publish,
-sublicense, sell, commercially exploit, reverse engineer, or create derivative
-works from this software, in whole or in part, without prior written permission
-from mont127, except to the extent such restriction is prohibited by applicable
-law.
+Permission is granted to use, copy, and modify this software, in whole or in part,
+solely for non-commercial purposes, including personal, educational, academic,
+research, and evaluation purposes, provided that all copyright notices, license
+notices, and attribution notices are retained.
 
-Access to the source code does not grant any ownership rights or license to use,
-redistribute, modify, or incorporate the software into another product.
+Non-commercial use does not include selling, licensing for a fee, offering the
+software or derivative works as part of a paid product or service, using the
+software primarily for commercial advantage or monetary compensation, or otherwise
+commercially exploiting the software.
 
-Any permission granted by mont127 must be provided explicitly in writing and may
-be subject to additional terms and conditions.
+Except for the non-commercial permissions expressly granted above, no permission
+is granted to reproduce, distribute, publish, sublicense, sell, commercially
+exploit, reverse engineer, or create derivative works from this software, in whole
+or in part, without prior written permission from mont127, except to the extent
+such restriction is prohibited by applicable law.
+
+Access to the source code does not grant any ownership rights. All rights not
+expressly granted under this license remain reserved by mont127.
+
+Any commercial use, commercial distribution, commercial modification, or
+incorporation of AArchX into a commercial product or service requires prior
+written permission from mont127 and may be subject to additional terms and
+conditions.
 
 Third-party components, libraries, or portions of code included with AArchX remain
 subject to their respective licenses and copyright notices.
@@ -26,7 +38,7 @@ available under the terms of the license that applied to those versions at the
 time they were distributed. This license does not revoke rights previously granted
 under those licenses.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR
 A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER
 BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN
