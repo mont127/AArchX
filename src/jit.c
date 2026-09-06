@@ -875,7 +875,7 @@ static JitBlock *cache_lookup(OcerzJit *jit, uint64_t rip, int mode32)
             return b;
     {
         static int wl = -1; if (wl < 0) wl = getenv("OCERZ_WILDLOG") ? 1 : 0;
-        if (wl && rip >= 0x800000000000ull) {
+        if (wl && (rip >= 0x800000000000ull || rip < 0x10000ull)) {   /* outside guest space, or the NULL page */
             extern unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
             extern uint64_t ocerz_current_dbg_ind_src(void);
             extern uint64_t ocerz_current_guest_gpr(int);

@@ -1,5 +1,8 @@
 /* The x86_64 instruction decoder. */
+#include <stdio.h>
+#include <unistd.h>
 #include "ocerz/decode.h"
+#include "ocerz/mem.h"
 #include "ocerz/cpu.h"
 #include "ocerz/flags.h"
 
@@ -580,6 +583,20 @@ static int decode_one_byte(DecState *s, uint8_t op);
 int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
                       X86Insn *out, int mode32)
 {
+    if (!code) {
+        /* A NULL code pointer is an emulator bug upstream (every caller goes
+         * through ocerz_g2h): say where once, and fail the decode instead of
+         * reading address 0. */
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "ocerz: DECODE-NULL[%d] rip=%#llx mode32=%d avail=%zu low_base=%#llx top_base=%#llx guest_base=%#llx\n",
+                    (int)getpid(), (unsigned long long)rip, mode32, avail,
+                    (unsigned long long)ocerz_low_base, (unsigned long long)ocerz_top_base,
+                    (unsigned long long)ocerz_guest_base);
+        }
+        return OCERZ_ETRUNC;
+    }
     DecState s;
     s.mode32 = mode32 ? 1 : 0;
     s.addr16 = 0;
