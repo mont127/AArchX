@@ -189,4 +189,4 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 ## License
 
-[AArchX Proprietary License](LICENSE). Free to use, copy and modify for non-commercial purposes (personal, educational, academic, research and evaluation) as long as the copyright, license and attribution notices stay. Commercial use, distribution or inclusion in a paid product or service needs prior written permission from mont127. Versions published earlier under LGPL-2.1 keep the license they were released under.
+[AArchX Proprietary License](LICENSE). Source-available, not open source: you may run it, build it from source and modify it for your own personal, educational, academic or research use, with the notices kept. Redistribution, mirroring, bundling with other software, sharing modified versions, and any commercial or organizational use need prior written permission from mont127. Commits before the license change remain available under the LGPL-2.1 they were published with.
