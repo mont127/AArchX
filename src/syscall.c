@@ -322,6 +322,7 @@ static int shared_ro_overlaps(uint64_t gaddr, uint64_t len)
  * of a file reads as. */
 /* OCERZ_MAPFAILLOG: every mmap the guest sees fail, with what it asked for.
  * Chromium's allocator treats a refused 4 KB commit as out-of-memory. */
+static void pe_scan_print(OcerzCPU *cpu, const char *tag, const char *detail);
 static void mmap_fail_log(OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t pos)
 {
     static int lg = -1;
@@ -3393,6 +3394,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [443] = { "guarded_kqueue_np", 2, 0x01, 0, NULL },
     [444] = { "change_fdguard_np", 6, 0x2a, 0, NULL },
     [484] = { "guarded_open_dprotected_np", 7, 0x03, 0, NULL },
+    [486] = { "guarded_pwrite_np", 5, 0x06, 0, NULL },   /* fd, guard*, buf, nbyte, offset */
     [131] = { "flock", 2, 0x00, 0, NULL },
     [501] = { "necp_open", 1, 0x00, 0, NULL },
     [502] = { "necp_client_action", 6, 0x14, 0, NULL },
@@ -3854,6 +3856,20 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
             fprintf(stderr, "ocerz: PREAD[%d] cpu#%u num=%d fd=%d off=%#llx len=%llu -> r=%lld err=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x %.16s\n",
                     (int)getpid(), cpu->cpu_number, num, (int)orig[0], (unsigned long long)orig[3], (unsigned long long)orig[2],
                     (long long)r, err ? (int)r : 0, b?b[0]:0, b?b[1]:0, b?b[2]:0, b?b[3]:0, b?b[4]:0, b?b[5]:0, b?b[6]:0, b?b[7]:0, b ? (const char *)b : "");
+        }
+        /* OCERZ_PAGETRAP: an mmap without MAP_FIXED whose result covers the
+         * trapped address (the kernel-chosen placement, invisible to the
+         * entry-side check in pagetrap_check) */
+        {
+            static uint64_t ptrap = ~0ull;
+            if (ptrap == ~0ull) { const char *e = getenv("OCERZ_PAGETRAP"); ptrap = e ? strtoull(e, NULL, 0) : 0; }
+            if (ptrap && num == 197 && !err && !(orig[3] & MAP_FIXED) && (uint64_t)r < (ptrap | 0x3fff) + 1 && (ptrap & ~0x3fffull) < (uint64_t)r + orig[1]) {
+                char d[160];
+                snprintf(d, sizeof d, " mmap-placed addr=%#llx len=%#llx prot=%#llx flags=%#llx fd=%lld -> %#llx",
+                         (unsigned long long)orig[0], (unsigned long long)orig[1], (unsigned long long)orig[2],
+                         (unsigned long long)orig[3], (long long)orig[4], (unsigned long long)r);
+                pe_scan_print(cpu, "PAGETRAP", d);
+            }
         }
         /* OCERZ_FDLOG=<minfd>: every read/write/pread/pwrite/fstat/lseek on
          * fds >= minfd, with results, to follow one file's I/O (SQLite). */
@@ -5600,6 +5616,26 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
  * containing the substring, print the PE-side stack (through the wine
  * syscall frame at TEB+0x378) so a logged message can be traced to the code
  * that emitted it -- used to place Chromium's NOTREACHED log lines. */
+/* Print the PE-side stack of the calling guest thread (wine 11.0 syscall
+ * frame at TEB+0x378, user rsp at +0x88): every slot that looks like a code
+ * address, for symbolising with the module map. */
+static void pe_scan_print(OcerzCPU *cpu, const char *tag, const char *detail)
+{
+    uint64_t teb = cpu->gs_base && ocerz_addr_readable(cpu->gs_base + 0x30) ? ocerz_ld(cpu->gs_base + 0x30, 8) : 0;
+    uint64_t frame = teb && ocerz_addr_readable(teb + 0x378) ? ocerz_ld(teb + 0x378, 8) : 0;
+    uint64_t ursp = frame && ocerz_addr_readable(frame + 0x88) ? ocerz_ld(frame + 0x88, 8) : 0;
+    uint64_t wtid = teb && ocerz_addr_readable(teb + 0x48) ? ocerz_ld(teb + 0x48, 8) : 0;
+    fprintf(stderr, "ocerz: %s[%d] tid=%04llx%s pe-rsp=%#llx scan:", tag, (int)getpid(), (unsigned long long)wtid, detail, (unsigned long long)ursp);
+    int printed = 0;
+    for (uint64_t o = 0; ursp && o < 0x4000 && printed < 48; o += 8) {
+        if (!ocerz_addr_readable(ursp + o)) break;
+        uint64_t v = ocerz_ld(ursp + o, 8);
+        int codey = (v >= 0x6fff00000000ull && v < 0x7ffc00000000ull) || (v >= 0x100000000ull && v < 0x200000000ull);
+        if (codey) { fprintf(stderr, " +%llx:%#llx", (unsigned long long)o, (unsigned long long)v); printed++; }
+    }
+    fprintf(stderr, "\n");
+}
+
 static void writetrap_check(OcerzCPU *cpu, int num)
 {
     static const char *trap = (const char *)-1;
@@ -5642,19 +5678,36 @@ static void writetrap_check(OcerzCPU *cpu, int num)
             hit = 1;
     }
     if (!hit) return;
-    uint64_t teb = cpu->gs_base && ocerz_addr_readable(cpu->gs_base + 0x30) ? ocerz_ld(cpu->gs_base + 0x30, 8) : 0;
-    uint64_t frame = teb && ocerz_addr_readable(teb + 0x378) ? ocerz_ld(teb + 0x378, 8) : 0;
-    uint64_t ursp = frame && ocerz_addr_readable(frame + 0x88) ? ocerz_ld(frame + 0x88, 8) : 0;
-    uint64_t wtid = teb && ocerz_addr_readable(teb + 0x48) ? ocerz_ld(teb + 0x48, 8) : 0;
-    fprintf(stderr, "ocerz: WRITETRAP[%d] tid=%04llx pe-rsp=%#llx scan:", (int)getpid(), (unsigned long long)wtid, (unsigned long long)ursp);
-    int printed = 0;
-    for (uint64_t o = 0; ursp && o < 0x4000 && printed < 48; o += 8) {
-        if (!ocerz_addr_readable(ursp + o)) break;
-        uint64_t v = ocerz_ld(ursp + o, 8);
-        int codey = (v >= 0x6fff00000000ull && v < 0x7ffc00000000ull) || (v >= 0x100000000ull && v < 0x200000000ull);
-        if (codey) { fprintf(stderr, " +%llx:%#llx", (unsigned long long)o, (unsigned long long)v); printed++; }
+    pe_scan_print(cpu, "WRITETRAP", "");
+}
+
+/* OCERZ_PAGETRAP=<guest addr>: every mapping change that covers that address
+ * (mmap MAP_FIXED, munmap, mprotect, madvise) prints the PE stack of the
+ * thread making it.  Names the code that decommits a page a later access
+ * faults on (a freed object still referenced by a pending callback). */
+static void pagetrap_check(OcerzCPU *cpu, int num)
+{
+    static uint64_t trap = ~0ull;
+    if (trap == ~0ull) { const char *e = getenv("OCERZ_PAGETRAP"); trap = e ? strtoull(e, NULL, 0) : 0; }
+    if (!trap) return;
+    uint64_t a = cpu->gpr[OCERZ_RDI], l = cpu->gpr[OCERZ_RSI];
+    const char *what;
+    switch (num) {
+    case 73: what = "munmap"; break;
+    case 74: what = "mprotect"; break;
+    case 75: what = "madvise"; break;
+    case 197: if (!(cpu->gpr[OCERZ_R10] & MAP_FIXED)) return; what = "mmap-fixed"; break;
+    default: return;
     }
-    fprintf(stderr, "\n");
+    /* any operation touching the 16 KB host page that holds the address:
+     * a sibling 4 KB guest page shares its protection */
+    uint64_t hp = trap & ~0x3fffull;
+    if (!(a < hp + 0x4000 && hp < a + l)) return;
+    char d[160];
+    snprintf(d, sizeof d, " %s addr=%#llx len=%#llx a3=%#llx a4=%#llx", what,
+             (unsigned long long)a, (unsigned long long)l,
+             (unsigned long long)cpu->gpr[OCERZ_RDX], (unsigned long long)cpu->gpr[OCERZ_R10]);
+    pe_scan_print(cpu, "PAGETRAP", d);
 }
 
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -5665,6 +5718,8 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 
     if (class == 2 && (num == 4 || num == 121 || num == 154 || num == 397 || num == 415))
         writetrap_check(cpu, num == 121 ? 121 : 4);   /* write/pwrite family: buf=rsi len=rdx */
+    if (class == 2 && (num == 73 || num == 74 || num == 75 || num == 197))
+        pagetrap_check(cpu, num);
 
     /* OCERZ_HOSTMASKLOG: the HOST signal mask of this thread at every syscall
      * entry.  ocerz never touches host masks itself, so any change is news:

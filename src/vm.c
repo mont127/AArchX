@@ -1246,6 +1246,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             siglongjmp(*g_sig_recover, 1);
         }
         uint64_t fault_rsp = g_cur_cpu->gpr[OCERZ_RSP];
+        /* OCERZ_FAULTDUMP=<gpr index>: that register's value before the
+         * delivery rewrites the guest state for the handler */
+        static int fault_dreg = -2;
+        if (fault_dreg == -2) { const char *e = getenv("OCERZ_FAULTDUMP"); fault_dreg = e ? atoi(e) : -1; }
+        uint64_t fault_dumpval = (fault_dreg >= 0 && fault_dreg < 16) ? g_cur_cpu->gpr[fault_dreg] : 0;
         int delivered = looping ? 0
                        : ocerz_signal_deliver(g_cur_cpu, SIGSEGV, gaddr, code, err);
         if (g_winefaultlog && delivered && g_cur_cpu->sig_altstack_sp != 0) {
@@ -1256,7 +1261,9 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             uint64_t stack_limit = teb_committed ? ocerz_ld(gs + 16, 8) : 0;
             char wb[512];
             char *w = wb;
-            w = str_into(w, "ocerz: WINEFAULT host_sig=");
+            w = str_into(w, "ocerz: WINEFAULT[");
+            w = hex_into(w, (uint64_t)getpid());
+            w = str_into(w, "] host_sig=");
             w = hex_into(w, (uint64_t)sig);
             w = str_into(w, " addr=");
             w = hex_into(w, gaddr);
@@ -1278,6 +1285,34 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             w = hex_into(w, ocerz_h2g((const void *)(uintptr_t)fault_rsp));
             w = str_into(w, "\n");
             write(2, wb, (size_t)(w - wb));
+            /* OCERZ_FAULTDUMP=<gpr index>: hexdump the guest memory around
+             * that register's value (the object a faulting copy reads from) */
+            {
+                int dreg = fault_dreg;
+                if (dreg >= 0 && dreg < 16) {
+                    uint64_t base = (fault_dumpval & ~0xfull) - 0x40;
+                    static char db[4096];
+                    char *q = db;
+                    q = str_into(q, "ocerz: FAULTDUMP reg=");
+                    q = hex_into(q, (uint64_t)dreg);
+                    q = str_into(q, " val=");
+                    q = hex_into(q, fault_dumpval);
+                    q = str_into(q, "\n");
+                    for (uint64_t o = 0; o < 0x140; o += 0x10) {
+                        q = str_into(q, "  ");
+                        q = hex_into(q, base + o);
+                        q = str_into(q, ":");
+                        for (int k = 0; k < 16; k += 8) {
+                            q = str_into(q, " ");
+                            if (ocerz_addr_readable(base + o + (uint64_t)k) && ocerz_addr_readable(base + o + (uint64_t)k + 7))
+                                q = hex_into(q, ocerz_ld(base + o + (uint64_t)k, 8));
+                            else q = str_into(q, "????????");
+                        }
+                        q = str_into(q, "\n");
+                    }
+                    write(2, db, (size_t)(q - db));
+                }
+            }
             /* PE stack scan from the faulting rsp: return addresses into the
              * guest's modules (symbolised later with the +server module map). */
             {
