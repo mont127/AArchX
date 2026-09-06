@@ -490,20 +490,33 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         /* A read-only guest subpage may later gain a private 4K sibling. */
         int padded_kuser = wine_kuser_shared_page(gaddr, len, prot,
                                                   flags, pos);
+        /* A read-only shared mapping that is not 16 KB-aligned used to be
+         * turned into a private snapshot up front.  Steam's UI stream is
+         * exactly that: steam.exe opens the SteamChrome ring buffer read-only,
+         * the browser writes it, and a snapshot never shows the writes, so
+         * Steam re-created the stream forever and no window came up
+         * (2026-09-06).  Try the real shared overlay first: it maps the whole
+         * host page from the file when the sibling slots are free, which
+         * Wine's 64 KB view granularity guarantees, and it refuses any later
+         * mapping into those siblings.  The private copy stays as the
+         * fallback when the overlay cannot be placed. */
         int src = padded_kuser
                 ? ocerz_map_shared_file_padded(gaddr, len, prot, fd, pos)
-                : readonly_shared_subpage(gaddr, len, prot, flags)
-                  ? OCERZ_EUNSUP
-                  : ocerz_map_shared_file(gaddr, len, prot, fd, pos);
-        if (getenv("OCERZ_MEMTRACE")) {
+                : ocerz_map_shared_file(gaddr, len, prot, fd, pos);
+        (void)readonly_shared_subpage;
+        if (getenv("OCERZ_MEMTRACE") || getenv("OCERZ_SHAREDLOG")) {
+            char path[256];
+            path[0] = 0;
+            fcntl(fd, F_GETPATH, path);
             const char *result = src == OCERZ_OK
                                ? (padded_kuser ? "shared-padded" : "shared-ok")
                                : (prot & PROT_WRITE)
                                  ? "FAILED(writable-shared)"
                                  : "private-copy(readonly)";
-            fprintf(stderr, "ocerz: SHAREDMAP gaddr=%#llx len=%#llx -> %s\n",
-                    (unsigned long long)gaddr, (unsigned long long)len,
-                    result);
+            fprintf(stderr, "ocerz: SHAREDMAP[%d] gaddr=%#llx len=%#llx prot=%#x off=%#llx -> %s (src=%d) %s\n",
+                    (int)getpid(), (unsigned long long)gaddr,
+                    (unsigned long long)len, prot, (unsigned long long)pos,
+                    result, src, path);
         }
         if (src == OCERZ_OK) {
             if (!(prot & PROT_WRITE)) shared_ro_record(gaddr, len);
@@ -513,11 +526,13 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
         if (padded_kuser) {
             ocerz_unmap(gaddr, len);
+            mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
             ret_err(cpu, src == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
         if (prot & PROT_WRITE) {
             ocerz_unmap(gaddr, len);
+            mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);   /* writable shared mapping refused (src=%d) */
             ret_err(cpu, src == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
