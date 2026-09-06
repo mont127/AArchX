@@ -1057,6 +1057,14 @@ static int sys_fork(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         return OCERZ_STEP_OK;
     }
     pid_t pid = fork();
+    if (pid == 0) {
+    if (getenv("OCERZ_HOSTMASKLOG")) {
+        sigset_t hm_; unsigned hv_ = 0;
+        if (pthread_sigmask(SIG_BLOCK, NULL, &hm_) == 0)
+            for (int sg_ = 1; sg_ < 32; sg_++) if (sigismember(&hm_, sg_)) hv_ |= 1u << sg_;
+        fprintf(stderr, "ocerz: HOSTMASK-FORKCHILD[%d] mask=%#x\n", (int)getpid(), hv_);
+    }
+    }
     if (pid < 0) {
         ret_err(cpu, (uint64_t)errno);
         return OCERZ_STEP_OK;
@@ -1198,6 +1206,12 @@ static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         return OCERZ_STEP_OK;
     }
     const char *gpath = (const char *)ocerz_g2h(a[0]);
+    if (getenv("OCERZ_HOSTMASKLOG")) {
+        sigset_t hm_; unsigned hv_ = 0;
+        if (pthread_sigmask(SIG_BLOCK, NULL, &hm_) == 0)
+            for (int sg_ = 1; sg_ < 32; sg_++) if (sigismember(&hm_, sg_)) hv_ |= 1u << sg_;
+        fprintf(stderr, "ocerz: HOSTMASK-EXEC[%d] mask=%#x path=%s\n", (int)getpid(), hv_, gpath);
+    }
 
     if (access(gpath, X_OK) != 0) {
         ret_err(cpu, errno);
@@ -2499,6 +2513,13 @@ static int sys_kevent_qos(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 
 static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
+    if (getenv("OCERZ_HOSTMASKLOG")) {
+        sigset_t cm_; unsigned cv_ = 0;
+        if (pthread_sigmask(SIG_BLOCK, NULL, &cm_) == 0)
+            for (int sg_ = 1; sg_ < 32; sg_++) if (sigismember(&cm_, sg_)) cv_ |= 1u << sg_;
+        if (cv_) fprintf(stderr, "ocerz: HOSTMASK-CREATOR[%d] cpu#%u creating a thread with %#x blocked rip=%#llx\n",
+                         (int)getpid(), cpu->cpu_number, cv_, (unsigned long long)cpu->rip);
+    }
     uint64_t func = a[0], funarg = a[1], stack = a[2], pth = a[3], flags = a[4];
     uint64_t pthread_start = __atomic_load_n(&g_pthread_start, __ATOMIC_ACQUIRE);
     if (!pthread_start) {
@@ -2956,7 +2977,15 @@ static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
                     (int)getpid(), cpu->cpu_number, s,
                     (unsigned long long)cpu->rip,
                     (unsigned long long)(vm ? vm->insn_count : 0));
-        n += ocerz_signal_deliver(cpu, s, 0, 0, 0);
+        if (ocerz_signal_deliver(cpu, s, 0, 0, 0)) {
+            n++;
+            cpu->sig_delivered[s]++;
+            cpu->in_sighandler++;
+            if (OCERZ_ENV_ON("OCERZ_SIGCTXLOG"))
+                fprintf(stderr, "ocerz: SIGENTER[%d] cpu#%u sig=%d depth=%u handler-rip=%#llx rsp=%#llx\n",
+                        (int)getpid(), cpu->cpu_number, s, cpu->in_sighandler,
+                        (unsigned long long)cpu->rip, (unsigned long long)cpu->gpr[OCERZ_RSP]);
+        }
     }
     return n;
 }
@@ -2998,6 +3027,12 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         ret_err(cpu, EINVAL);
         return OCERZ_STEP_OK;
     }
+    if (cpu->in_sighandler) cpu->in_sighandler--;
+    if (OCERZ_ENV_ON("OCERZ_SIGCTXLOG"))
+        fprintf(stderr, "ocerz: SIGRET[%d] cpu#%u depth=%u -> rip=%#llx rsp=%#llx mask=%#x\n",
+                (int)getpid(), cpu->cpu_number, cpu->in_sighandler,
+                (unsigned long long)ocerz_ld(mc + 144, 8), (unsigned long long)ocerz_ld(mc + 72, 8),
+                (unsigned)ocerz_ld(uc + 4, 4));
     /* The flavour comes back from the frame, not from a global: a handler can hand sigreturn any */
     uint64_t mcsize = ocerz_ld(uc + 40, 8);
     int full = mcsize >= OCERZ_MCTX_FULL_SIZE;
@@ -3809,6 +3844,31 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
     }
     {
+        /* OCERZ_PREADLOG=<len>: pread()/read() of exactly <len> bytes -- SQLite
+         * reads its 100-byte file header first, so the header read shows
+         * whether the database bytes reach the guest intact. */
+        static long plog = -2;
+        if (plog == -2) { const char *e = getenv("OCERZ_PREADLOG"); plog = e ? strtol(e, NULL, 0) : -1; }
+        if (plog >= 0 && (num == 153 || num == 3) && orig[2] == (uint64_t)plog) {
+            const unsigned char *b = ocerz_addr_readable(orig[1]) ? (const unsigned char *)ocerz_g2h(orig[1]) : NULL;
+            fprintf(stderr, "ocerz: PREAD[%d] cpu#%u num=%d fd=%d off=%#llx len=%llu -> r=%lld err=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x %.16s\n",
+                    (int)getpid(), cpu->cpu_number, num, (int)orig[0], (unsigned long long)orig[3], (unsigned long long)orig[2],
+                    (long long)r, err ? (int)r : 0, b?b[0]:0, b?b[1]:0, b?b[2]:0, b?b[3]:0, b?b[4]:0, b?b[5]:0, b?b[6]:0, b?b[7]:0, b ? (const char *)b : "");
+        }
+        /* OCERZ_FDLOG=<minfd>: every read/write/pread/pwrite/fstat/lseek on
+         * fds >= minfd, with results, to follow one file's I/O (SQLite). */
+        static long fdlog = -2;
+        if (fdlog == -2) { const char *e = getenv("OCERZ_FDLOG"); fdlog = e ? strtol(e, NULL, 0) : -1; }
+        if (fdlog >= 0 && (num == 3 || num == 4 || num == 153 || num == 154 || num == 189 || num == 339 || num == 199 || num == 95 || num == 6) &&
+            (int64_t)orig[0] >= fdlog && (int64_t)orig[0] < 4096) {
+            long long sz = -1;
+            if ((num == 189 || num == 339) && !err && ocerz_addr_readable(orig[1] + 104)) sz = (long long)ocerz_ld(orig[1] + 96, 8);
+            fprintf(stderr, "ocerz: FDLOG[%d] cpu#%u %s fd=%d a1=%#llx a2=%#llx a3=%#llx -> r=%lld err=%d%s%lld\n",
+                    (int)getpid(), cpu->cpu_number,
+                    num == 3 ? "read" : num == 4 ? "write" : num == 153 ? "pread" : num == 154 ? "pwrite" : num == 189 ? "fstat" : num == 339 ? "fstat64" : num == 199 ? "lseek" : num == 95 ? "fsync" : "close",
+                    (int)orig[0], (unsigned long long)orig[1], (unsigned long long)orig[2], (unsigned long long)orig[3],
+                    (long long)r, err ? (int)r : 0, sz >= 0 ? " st_size=" : "", sz >= 0 ? sz : 0);
+        }
         static int klog = -1;
         if (klog < 0) klog = getenv("OCERZ_KICKLOG") ? 1 : 0;
         if (klog && err && r == 4 /* EINTR */)
@@ -5535,11 +5595,105 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
     return OCERZ_STEP_FATAL;
 }
 
+
+/* OCERZ_WRITETRAP=<substring>: when the guest write()s or writev()s a buffer
+ * containing the substring, print the PE-side stack (through the wine
+ * syscall frame at TEB+0x378) so a logged message can be traced to the code
+ * that emitted it -- used to place Chromium's NOTREACHED log lines. */
+static void writetrap_check(OcerzCPU *cpu, int num)
+{
+    static const char *trap = (const char *)-1;
+    if (trap == (const char *)-1) trap = getenv("OCERZ_WRITETRAP");
+    if (!trap && !getenv("OCERZ_REQTRAP")) return;
+    size_t tl = trap ? strlen(trap) : 0;
+    int hit = 0;
+    if (!trap) { }
+    else if (num == 4) {
+        uint64_t buf = cpu->gpr[OCERZ_RSI], len = cpu->gpr[OCERZ_RDX];
+        if (len && len < 0x100000 && ocerz_addr_readable(buf) && ocerz_addr_readable(buf + len - 1))
+            hit = memmem(ocerz_g2h(buf), (size_t)len, trap, tl) != NULL;
+    } else if (num == 121) {
+        uint64_t iov = cpu->gpr[OCERZ_RSI], cnt = cpu->gpr[OCERZ_RDX];
+        for (uint64_t i = 0; i < cnt && i < 64 && !hit; i++) {
+            if (!ocerz_addr_readable(iov + i * 16 + 15)) break;
+            uint64_t b = ocerz_ld(iov + i * 16, 8), l = ocerz_ld(iov + i * 16 + 8, 8);
+            if (l && l < 0x100000 && ocerz_addr_readable(b) && ocerz_addr_readable(b + l - 1))
+                hit = memmem(ocerz_g2h(b), (size_t)l, trap, tl) != NULL;
+        }
+    }
+    /* OCERZ_REQTRAP=<req>:<handlehex>: a wineserver request (64-byte header
+     * written with write() or as iov[0] of writev()) whose req number and
+     * handle field match.  Names the guest code that hands a bogus handle to
+     * the server, e.g. GetCurrentThread() to a file API. */
+    static const char *rtrap = (const char *)-1;
+    static int rreq = -1; static uint32_t rhandle = 0;
+    if (rtrap == (const char *)-1) {
+        rtrap = getenv("OCERZ_REQTRAP");
+        if (rtrap) { rreq = (int)strtol(rtrap, NULL, 10); const char *c = strchr(rtrap, ':'); rhandle = c ? (uint32_t)strtoul(c + 1, NULL, 16) : 0; }
+    }
+    if (rtrap && !hit) {
+        uint64_t b = 0, l = 0;
+        if (num == 4) { b = cpu->gpr[OCERZ_RSI]; l = cpu->gpr[OCERZ_RDX]; }
+        else if (num == 121 && cpu->gpr[OCERZ_RDX] >= 1 && ocerz_addr_readable(cpu->gpr[OCERZ_RSI] + 15)) {
+            b = ocerz_ld(cpu->gpr[OCERZ_RSI], 8); l = ocerz_ld(cpu->gpr[OCERZ_RSI] + 8, 8);
+        }
+        if (b && l >= 16 && ocerz_addr_readable(b + 15) &&
+            (int)ocerz_ld(b, 4) == rreq && (uint32_t)ocerz_ld(b + 12, 4) == rhandle)
+            hit = 1;
+    }
+    if (!hit) return;
+    uint64_t teb = cpu->gs_base && ocerz_addr_readable(cpu->gs_base + 0x30) ? ocerz_ld(cpu->gs_base + 0x30, 8) : 0;
+    uint64_t frame = teb && ocerz_addr_readable(teb + 0x378) ? ocerz_ld(teb + 0x378, 8) : 0;
+    uint64_t ursp = frame && ocerz_addr_readable(frame + 0x88) ? ocerz_ld(frame + 0x88, 8) : 0;
+    uint64_t wtid = teb && ocerz_addr_readable(teb + 0x48) ? ocerz_ld(teb + 0x48, 8) : 0;
+    fprintf(stderr, "ocerz: WRITETRAP[%d] tid=%04llx pe-rsp=%#llx scan:", (int)getpid(), (unsigned long long)wtid, (unsigned long long)ursp);
+    int printed = 0;
+    for (uint64_t o = 0; ursp && o < 0x4000 && printed < 48; o += 8) {
+        if (!ocerz_addr_readable(ursp + o)) break;
+        uint64_t v = ocerz_ld(ursp + o, 8);
+        int codey = (v >= 0x6fff00000000ull && v < 0x7ffc00000000ull) || (v >= 0x100000000ull && v < 0x200000000ull);
+        if (codey) { fprintf(stderr, " +%llx:%#llx", (unsigned long long)o, (unsigned long long)v); printed++; }
+    }
+    fprintf(stderr, "\n");
+}
+
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t rax = cpu->gpr[OCERZ_RAX];
     int class = (int)((rax >> 24) & 0xff);
     int num = (int)(rax & 0xffffff);
+
+    if (class == 2 && (num == 4 || num == 121 || num == 154 || num == 397 || num == 415))
+        writetrap_check(cpu, num == 121 ? 121 : 4);   /* write/pwrite family: buf=rsi len=rdx */
+
+    /* OCERZ_HOSTMASKLOG: the HOST signal mask of this thread at every syscall
+     * entry.  ocerz never touches host masks itself, so any change is news:
+     * a thread that reaches a blocking call with SIGUSR1 blocked at the host
+     * level can never be suspended by wineserver again. */
+    static int hml = -1;
+    if (hml < 0) hml = getenv("OCERZ_HOSTMASKLOG") ? 1 : 0;
+    if (hml) {
+        sigset_t m; uint32_t v = 0;
+        if (pthread_sigmask(SIG_BLOCK, NULL, &m) == 0) {
+            for (int sg = 1; sg < 32; sg++) if (sigismember(&m, sg)) v |= 1u << sg;
+            if (v != cpu->host_mask_last) {
+                cpu->host_mask_changes++;
+                fprintf(stderr, "ocerz: HOSTMASK[%d] cpu#%u kport=%#x mask %#x -> %#x at sys=%d/%d rip=%#llx depth=%u\n",
+                        (int)getpid(), cpu->cpu_number, cpu->host_kport, cpu->host_mask_last, v,
+                        class, num, (unsigned long long)cpu->rip, cpu->in_sighandler);
+                cpu->host_mask_last = v;
+            }
+        }
+    }
+
+    /* OCERZ_SIGCTXLOG: every syscall a guest signal handler makes, so a
+     * handler that never reaches the server (wine's usr1_handler must end in
+     * a select request) can be seen taking the wrong turn. */
+    if (cpu->in_sighandler && OCERZ_ENV_ON("OCERZ_SIGCTXLOG"))
+        fprintf(stderr, "ocerz: SIGCTX[%d] cpu#%u depth=%u sys=%d/%d rip=%#llx a0=%#llx a1=%#llx a2=%#llx\n",
+                (int)getpid(), cpu->cpu_number, cpu->in_sighandler, class, num,
+                (unsigned long long)cpu->rip, (unsigned long long)cpu->gpr[OCERZ_RDI],
+                (unsigned long long)cpu->gpr[OCERZ_RSI], (unsigned long long)cpu->gpr[OCERZ_RDX]);
 
     static int g_sccount = -1;
     if (g_sccount < 0)

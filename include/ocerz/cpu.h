@@ -98,6 +98,15 @@ typedef struct OcerzCPU {
      * bit convention as sig_mask (bit sig-1), which is also the guest's
      * sigset_t layout, so sigpending() can copy it out directly. */
     uint64_t sig_pending;
+    /* Diagnostics for OCERZ_PORTDUMP: host signals received on this thread
+     * versus guest handlers vectored, per signal number. */
+    uint32_t sig_host_rcvd[32];
+    uint32_t sig_delivered[32];
+    uint32_t in_sighandler;          /* diagnostics: guest handlers currently on this thread's stack */
+    void    *host_pthread;           /* diagnostics: the host thread running this cpu */
+    uint32_t host_kport;
+    uint32_t host_mask_last;         /* diagnostics: host sigmask seen at the last syscall entry */
+    uint32_t host_mask_changes;
     int sig_on_stack;
     uint64_t sig_last_fault;
     int sig_repeat;

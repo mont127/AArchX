@@ -11924,6 +11924,18 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         return NULL;                 /* invalidation-storm region: interpret */
     }
 
+    {   /* OCERZ_INTERP_LO/HI: never compile a block starting inside [lo,hi);
+         * the range runs in the interpreter.  Bisection tool for JIT
+         * miscompiles: shrink the range until the misbehaviour returns. */
+        static uint64_t ilo = 0, ihi = 0; static int irng = -1;
+        if (irng < 0) {
+            const char *l = getenv("OCERZ_INTERP_LO"), *h = getenv("OCERZ_INTERP_HI");
+            if (l && h) { ilo = strtoull(l, NULL, 0); ihi = strtoull(h, NULL, 0); }
+            irng = (ilo < ihi) ? 1 : 0;
+        }
+        if (irng && rip >= ilo && rip < ihi)
+            return NULL;
+    }
     {   /* OCERZ_INTERP_RIP=a[,b,...]: never compile a block starting at these
          * guest addresses - they fall back to the interpreter, where
          * OCERZ_RIPTRAP can observe them even in an otherwise JIT run. */

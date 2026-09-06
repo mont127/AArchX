@@ -1,4 +1,6 @@
 /* Command-line parsing and the entry point. */
+#include <signal.h>
+#include <pthread.h>
 #include <string.h>
 #include "ocerz/version.h"
 #include "ocerz/vm.h"
@@ -53,6 +55,12 @@ extern char ocerz_cmdline_summary[256];
 
 int main(int argc, char **argv)
 {
+    if (getenv("OCERZ_HOSTMASKLOG")) {
+        sigset_t hm_; unsigned hv_ = 0;
+        if (pthread_sigmask(SIG_BLOCK, NULL, &hm_) == 0)
+            for (int sg_ = 1; sg_ < 32; sg_++) if (sigismember(&hm_, sg_)) hv_ |= 1u << sg_;
+        fprintf(stderr, "ocerz: HOSTMASK-START[%d] mask=%#x argv1=%s\n", (int)getpid(), hv_, argc > 1 ? argv[1] : "");
+    }
     if (getenv("OCERZ_EXECLOG")) {
         fprintf(stderr, "ocerz: EXECSTART[%d]", (int)getpid());
         for (int k = 0; k < argc; k++)
