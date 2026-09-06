@@ -77,14 +77,33 @@ typedef struct JitProf {
     uint8_t windows, prev;      /* verdicts so far: decided when two in a row agree */
 } JitProf;
 
+/* What a published block keeps of each decoded instruction: 16 bytes instead
+ * of the 96-byte X86Insn.  Invalidation and fault recovery need rip, len and
+ * op; the few instructions the block still executes through the interpreter
+ * (slow calls) or inspects in full (fault-flag producers) are copied into
+ * blk->kept and found through `keep` (index + 1, 0 = not kept). */
+#define JIT_MAX_EDGES 8
+
+typedef struct JitInsnRef {
+    uint64_t rip;
+    uint16_t op;
+    uint8_t len;
+    uint8_t flags;
+    uint16_t keep;
+    uint16_t pad;
+} JitInsnRef;
+
 typedef struct JitBlock {
     uint64_t key;               /* jit_key(guest rip, mode32) -- see JIT_KEY_M32 */
     JitBlockFn code;
     uint32_t *body_code;
     uint32_t *body_noreload;    /* body entry after the hoisted-base reload (for a same-signature predecessor) */
     uint64_t hoist_sig;         /* hoisted bases / aux signature (0: none) */
-    X86Insn *insns;
+    X86Insn *insns;             /* full decode: only until compact_block(), and for blocks without code */
     int n_insns;
+    JitInsnRef *iref;           /* per-insn rip/op/len after compaction */
+    X86Insn *kept;              /* the insns still needed in full */
+    uint16_t n_kept;
     struct JitBlock *hnext;
     struct JitBlock *retired_next;
 
@@ -136,7 +155,7 @@ typedef struct JitBlock {
         uint8_t side;             /* 1 + the g_side index of a superblock side exit */
         uint8_t probing;          /* both sides of its jcc are being counted: no short-circuit yet */
         uint64_t jcc_rip;
-    } edges[8];                 /* terminator edges (<= 2) + forward-jcc side exits */
+    } *edges;                   /* terminator edges (<= 2) + forward-jcc side exits; 8 slots while translating, shrunk to n_edges at publication */
     uint8_t n_edges;
     JitProf *prof;              /* one per g_side slot, when any side exit is probed */
     /* blocks chained INTO this one (source block + edge), so a flip retire
@@ -151,6 +170,16 @@ typedef struct JitBlock {
 
 static inline uint64_t blk_rip(const JitBlock *b) { return jit_key_rip(b->key); }
 static inline int blk_mode32(const JitBlock *b) { return jit_key_mode32(b->key); }
+static inline uint64_t blk_insn_rip(const JitBlock *b, int i) { return b->insns ? b->insns[i].rip : b->iref[i].rip; }
+static inline unsigned blk_insn_len(const JitBlock *b, int i) { return b->insns ? b->insns[i].len : b->iref[i].len; }
+static inline unsigned blk_insn_op(const JitBlock *b, int i) { return b->insns ? b->insns[i].op : b->iref[i].op; }
+/* the full X86Insn, or NULL when the block did not keep it */
+static inline const X86Insn *blk_insn_full(const JitBlock *b, int i)
+{
+    if (b->insns) return &b->insns[i];
+    unsigned k = b->iref[i].keep;
+    return k ? &b->kept[k - 1] : NULL;
+}
 
 #define INVMAP_RSHIFT 22                       /* 4 MB per slot */
 #define INVMAP_GSHIFT 16                       /* 64 KB per bit */
@@ -772,6 +801,20 @@ int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     return r;
 }
 
+/* Slow-call entry from compiled code: the block and the insn index, so the
+ * decoded array can be dropped after translation (see compact_block). */
+static int ocerz_jit_exec_one_at(struct OcerzVM *vm, OcerzCPU *cpu, const JitBlock *b, uint64_t idx)
+{
+    return ocerz_jit_exec_one(vm, cpu, blk_insn_full(b, (int)idx));
+}
+
+/* translation state for compact_block(): the block being emitted, which of
+ * its insns a slow call references, and whether something referenced an insn
+ * outside the block's array (then the array must stay) */
+static JitBlock *g_cur_blk;
+static uint8_t *g_keep;
+static int g_keep_cap, g_keep_n, g_no_compact;
+
 static int is_terminator(unsigned op)
 {
     switch (op) {
@@ -1022,12 +1065,12 @@ static int gran_any(uint64_t lo, uint64_t hi)
 static void gran_block(JitBlock *b, int d)
 {
     if (b->n_insns <= 0) return;
-    uint64_t lo = b->insns[0].rip, hi = lo + b->insns[0].len;
+    uint64_t lo = blk_insn_rip(b, 0), hi = lo + blk_insn_len(b, 0);
     for (int i = 1; i <= b->n_insns; i++) {
-        if (i < b->n_insns && b->insns[i].rip == hi) { hi += b->insns[i].len; continue; }
+        if (i < b->n_insns && blk_insn_rip(b, i) == hi) { hi += blk_insn_len(b, i); continue; }
         for (uint64_t p = lo >> INVMAP_GSHIFT; p <= (hi - 1) >> INVMAP_GSHIFT; p++)
             gran_bump(p << INVMAP_GSHIFT, d);
-        if (i < b->n_insns) { lo = b->insns[i].rip; hi = lo + b->insns[i].len; }
+        if (i < b->n_insns) { lo = blk_insn_rip(b, i); hi = lo + blk_insn_len(b, i); }
     }
 }
 static void gran_clear_all(void)
@@ -1037,8 +1080,20 @@ static void gran_clear_all(void)
     g_gran_degenerate = 0;
 }
 
+/* the edge array is sized for the worst case while translating; a published
+ * block keeps only what it has (48 bytes per edge, most blocks have one) */
+static void shrink_edges(JitBlock *b)
+{
+    unsigned n = b->n_edges ? b->n_edges : 1;
+    if (b->edges && n < JIT_MAX_EDGES) {
+        void *p = realloc(b->edges, n * sizeof *b->edges);
+        if (p) b->edges = p;
+    }
+}
+
 static void cache_insert(OcerzJit *jit, JitBlock *b)
 {
+    shrink_edges(b);
     unsigned h = hash_key(b->key);
     b->hnext = jit->buckets[h];
     __atomic_store_n(&jit->buckets[h], b, __ATOMIC_RELEASE);
@@ -1052,11 +1107,11 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
     if (b->n_insns > 0) {
         /* an inlined call splices a far-away callee into the block, so
          * register each contiguous rip run, not the naive min..max span */
-        uint64_t lo = b->insns[0].rip;
-        uint64_t hi = lo + b->insns[0].len;
+        uint64_t lo = blk_insn_rip(b, 0);
+        uint64_t hi = lo + blk_insn_len(b, 0);
         for (int i = 1; i <= b->n_insns; i++) {
-            if (i < b->n_insns && b->insns[i].rip == hi) {
-                hi += b->insns[i].len;
+            if (i < b->n_insns && blk_insn_rip(b, i) == hi) {
+                hi += blk_insn_len(b, i);
                 continue;
             }
             if (!jit->code_hi) { jit->code_lo = lo; jit->code_hi = hi; }
@@ -1066,7 +1121,7 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
             }
             invmap_add(jit, lo, hi);
             ocerz_cache_arm_exec(lo, hi);
-            if (i < b->n_insns) { lo = b->insns[i].rip; hi = lo + b->insns[i].len; }
+            if (i < b->n_insns) { lo = blk_insn_rip(b, i); hi = lo + blk_insn_len(b, i); }
         }
     }
 }
@@ -10825,8 +10880,20 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     emit_spill_pinned(b);
     a64_mov_reg(b, 1, 0, 19);
     a64_mov_reg(b, 1, 1, 20);
-    a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)insn);
-    a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_jit_exec_one);
+    {
+        const X86Insn *base = g_cur_blk ? g_cur_blk->insns : NULL;
+        ptrdiff_t idx = (base && insn >= base && insn < base + g_cur_blk->n_insns) ? insn - base : -1;
+        if (idx >= 0 && g_keep && idx < g_keep_n) {
+            g_keep[idx] = 1;
+            a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_cur_blk);
+            a64_mov_imm64(b, 3, (uint64_t)idx);
+            a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_jit_exec_one_at);
+        } else {
+            g_no_compact = 1;
+            a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)insn);
+            a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_jit_exec_one);
+        }
+    }
     a64_blr(b, 16);
     g_callout_seq++;
     emit_fill_pinned(b);
@@ -11793,6 +11860,42 @@ static uint64_t ret_seam_live(const X86Insn *insns, int n)
 
 static int churn_blacklisted(uint64_t rip);
 
+/* Drop the decoded array once the block is compiled.  A GUI Wine process
+ * carried ~870 bytes of X86Insn per block across 215k blocks (180 MB); what
+ * the block still needs at run time fits the 16-byte JitInsnRef plus full
+ * copies of the slow-call and fault-flag-producer insns. */
+static void compact_block(JitBlock *blk)
+{
+    int n = blk->n_insns;
+    if (!blk->code || !blk->insns || g_no_compact || g_cur_blk != blk ||
+        g_keep_n != n || ENV_ON("OCERZ_NO_COMPACT"))
+        return;
+    if (blk->fault_flags)
+        for (int i = 0; i < n; i++) {
+            const JitFaultFlagRecipe *r = &blk->fault_flags[i];
+            if (r->kind == JFF_NONE) continue;
+            if (r->producer < n) g_keep[r->producer] = 1;
+            if (r->kind == JFF_ADD_INC_RESULT_SRC && r->producer + 1 < n) g_keep[r->producer + 1] = 1;
+        }
+    int nk = 0;
+    for (int i = 0; i < n; i++) nk += g_keep[i] != 0;
+    if (nk > 65535) return;
+    JitInsnRef *ref = (JitInsnRef *)malloc((size_t)n * sizeof *ref);
+    X86Insn *kept = nk ? (X86Insn *)malloc((size_t)nk * sizeof *kept) : NULL;
+    if (!ref || (nk && !kept)) { free(ref); free(kept); return; }
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        const X86Insn *in = &blk->insns[i];
+        ref[i].rip = in->rip; ref[i].op = (uint16_t)in->op; ref[i].len = (uint8_t)in->len;
+        ref[i].flags = 0; ref[i].pad = 0; ref[i].keep = 0;
+        if (g_keep[i]) { kept[k] = *in; ref[i].keep = (uint16_t)(k + 1); k++; }
+    }
+    blk->iref = ref; blk->kept = kept; blk->n_kept = (uint16_t)nk;
+    free(blk->insns); blk->insns = NULL;
+    g_pe_insns = NULL; g_cur_insns = NULL; g_cur_insns_n = 0;
+    g_cur_blk = NULL;
+}
+
 static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 {
     g_xlat_mode32 = mode32;
@@ -11928,6 +12031,22 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     memcpy(blk->insns, scratch, (size_t)n * sizeof(X86Insn));
     blk->n_insns = n;
     blk->key = jit_key(rip, mode32);
+    blk->edges = calloc(JIT_MAX_EDGES, sizeof *blk->edges);
+    if (!blk->edges) {
+        free(blk->insns);
+        free(blk);
+        if (ocerz_jitstat > 0) { js_xlat_fail++; js_fail_alloc++; js_note_fail(rip, JSR_ALLOC, n); }
+        return NULL;
+    }
+    if (g_keep_cap < n) {
+        free(g_keep);
+        g_keep = (uint8_t *)malloc((size_t)n);
+        g_keep_cap = g_keep ? n : 0;
+    }
+    if (g_keep) memset(g_keep, 0, (size_t)n);
+    g_keep_n = g_keep ? n : 0;
+    g_cur_blk = blk;
+    g_no_compact = 0;
 
     for (int g = 0; g < 16; g++)
         blk->guest_in_host[g] = -1;
@@ -13503,6 +13622,7 @@ promo_push_fallthrough:
             }
         }
     }
+    compact_block(blk);
     cache_insert(jit, blk);
 
     if (!g_no_chain) {
@@ -13609,7 +13729,7 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
     for (int i = 0; i < b->n_pinned; i++) {
         uint64_t value = host_x[pin_hreg(i)];
         if ((b->pin_class == 2 ||
-             (b->pin_class == 3 && b->n_insns > 0 && !b->insns[0].mode32 && rsp_ptr3())) &&
+             (b->pin_class == 3 && b->n_insns > 0 && !blk_mode32(b) && rsp_ptr3())) &&
             b->host_holds[i] == OCERZ_RSP)
             value -= ocerz_guest_base;
         cpu->gpr[b->host_holds[i]] = value;
@@ -13624,14 +13744,14 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
     /* elided return-address slots: the interpreter resumes mid-frame, so the
      * enclosing frames' slots must hold their addresses (rsp itself is
      * architectural throughout - only the content was skipped) */
-    if (b->n_pushelide && b->pushelide && b->insns) {
+    if (b->n_pushelide && b->pushelide && (b->insns || b->iref)) {
         int k = fault_insn_index(b, (const uint32_t *)host_pc);
         for (int i = 0; k > 0 && i < b->n_pushelide; i++) {
             const struct JitPushElide *p = &b->pushelide[i];
             if (k <= p->ci || k >= p->rj) continue;
             int64_t delta = 0;
             for (int m = p->ci + 1; m < k; m++) {
-                unsigned op2 = b->insns[m].op;
+                unsigned op2 = blk_insn_op(b, m);
                 if (op2 == OCERZ_OP_PUSH || op2 == OCERZ_OP_CALL) delta -= 8;
                 else if (op2 == OCERZ_OP_POP || op2 == OCERZ_OP_RET) delta += 8;
             }
@@ -13705,8 +13825,8 @@ void ocerz_jit_fault_recover_flags(const struct OcerzVM *vm,
     JitFaultFlagRecipe recipe = b->fault_flags[fi];
     if (recipe.kind == JFF_NONE || recipe.producer >= b->n_insns)
         return;
-    const X86Insn *p = &b->insns[recipe.producer];
-    if (p->nops < 1 || p->ops[0].kind != OCERZ_OPK_REG ||
+    const X86Insn *p = blk_insn_full(b, recipe.producer);
+    if (!p || p->nops < 1 || p->ops[0].kind != OCERZ_OPK_REG ||
         p->ops[0].high8 || (p->ops[0].size != 4 && p->ops[0].size != 8))
         return;
 
@@ -13737,8 +13857,8 @@ void ocerz_jit_fault_recover_flags(const struct OcerzVM *vm,
             recipe.producer + 1 >= b->n_insns ||
             !fault_recipe_rhs(cpu, &p->ops[1], size, &src))
             return;
-        const X86Insn *inc = &b->insns[recipe.producer + 1];
-        if (inc->op != OCERZ_OP_INC || inc->nops != 1 ||
+        const X86Insn *inc = blk_insn_full(b, recipe.producer + 1);
+        if (!inc || inc->op != OCERZ_OP_INC || inc->nops != 1 ||
             inc->ops[0].kind != OCERZ_OPK_REG || inc->ops[0].high8 ||
             inc->ops[0].reg != p->ops[0].reg || inc->ops[0].size != size)
             return;
@@ -13903,7 +14023,7 @@ int ocerz_jit_fault_rip(const struct OcerzVM *vm, const void *host_pc, uint64_t 
     int i = fault_insn_index(b, pc);
     if (i < 0)
         return 0;
-    *out_rip = b->insns[i].rip;
+    *out_rip = blk_insn_rip(b, i);
     return 1;
 }
 
@@ -13920,7 +14040,7 @@ int ocerz_jit_fault_info(const struct OcerzVM *vm, const void *host_pc,
     out->host_word = (uint32_t)(pc - (const uint32_t *)b->code);
     out->insn_index = fault_insn_index(b, pc);
     if (out->insn_index >= 0)
-        out->insn_rip = b->insns[out->insn_index].rip;
+        out->insn_rip = blk_insn_rip(b, out->insn_index);
     out->n_pinned = b->n_pinned;
     out->pin_class = b->pin_class;
     memcpy(out->host_holds, b->host_holds, sizeof(out->host_holds));
@@ -13998,6 +14118,9 @@ static void block_destroy(JitBlock *b)
     free(b->push_fix);
     free(b->pushelide);
     free(b->insns);
+    free(b->iref);
+    free(b->kept);
+    free(b->edges);
     free(b->prof);
     free(b->preds);
     free(b);
@@ -14215,7 +14338,7 @@ static void invmap_check_reject(const OcerzJit *jit, uint64_t addr, uint64_t len
     for (size_t k = 0; k < jit->n_live; k++) {
         const JitBlock *b = jit->live[k];
         for (int i = 0; i < b->n_insns; i++) {
-            if (!ranges_overlap(addr, len, b->insns[i].rip, b->insns[i].len))
+            if (!ranges_overlap(addr, len, blk_insn_rip(b, i), blk_insn_len(b, i)))
                 continue;
             fprintf(stderr, "ocerz: INVMAP MISS[%d] addr=%#llx len=%#llx block=%#llx\n",
                     (int)getpid(), (unsigned long long)addr,
@@ -14340,7 +14463,7 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
     for (size_t m = 0; m < n_hits; m++)
         if (hits[m]->code) {
             any_code = 1;
-            churn_bump(hits[m]->insns[0].rip);
+            churn_bump(blk_insn_rip(hits[m], 0));
         }
     if (!any_code) {
         /* interpreter-fallback blocks: nothing branches into them, no code
@@ -14491,12 +14614,12 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
         JitBlock **hits = NULL;
         for (size_t k = 0; k < jit->n_live; k++) {
             JitBlock *b = jit->live[k];
-            uint64_t blo = b->insns[0].rip;
-            uint64_t bhi = b->insns[b->n_insns - 1].rip + b->insns[b->n_insns - 1].len;
+            uint64_t blo = blk_insn_rip(b, 0);
+            uint64_t bhi = blk_insn_rip(b, b->n_insns - 1) + blk_insn_len(b, b->n_insns - 1);
             b->inv_hit = 0;
             if (!ranges_overlap(addr, len, blo, bhi - blo)) continue;
             for (int i = 0; i < b->n_insns; i++)
-                if (ranges_overlap(addr, len, b->insns[i].rip, b->insns[i].len)) {
+                if (ranges_overlap(addr, len, blk_insn_rip(b, i), blk_insn_len(b, i))) {
                     b->inv_hit = 1;
                     if (n_hit == cap) {
                         cap = cap ? cap * 2 : 64;
@@ -14589,6 +14712,7 @@ static int jit_interp_block(struct OcerzVM *vm, OcerzCPU *cpu, JitBlock *b)
 {
     static int lg = -1; if (lg < 0) lg = getenv("OCERZ_IBLOG") ? 1 : 0;
     if (lg) fprintf(stderr, "ocerz: INTERP-BLOCK rip=%#llx n=%d\n", (unsigned long long)blk_rip(b), b->n_insns);
+    if (!b->insns) return OCERZ_EUNSUP;   /* only code-less blocks are interpreted; they keep the array */
     ocerz_jit_exec_state = 2;
     ocerz_flags_materialize(cpu);
     if (ocerz_perfstat > 0)
