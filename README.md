@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1-blue.svg">
+  <img alt="license" src="https://img.shields.io/badge/license-Proprietary-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
   <img alt="version" src="https://img.shields.io/badge/version-0.1-green.svg">
@@ -188,4 +188,4 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 ## License
 
-[LGPL-2.1](LICENSE)
+[AArchX Proprietary License](LICENSE). All rights reserved; see the LICENSE file for the terms.
