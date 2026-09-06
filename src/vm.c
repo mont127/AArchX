@@ -454,11 +454,41 @@ static char *str_into(char *p, const char *s)
     return p;
 }
 
+
+/* ocerz emulates the guest's signal mask itself (cpu->sig_mask), so the HOST
+ * thread must never block asynchronous signals: wineserver suspends and
+ * APC-kicks guest threads with SIGUSR1 sent to the host thread, and a host
+ * mask that blocks it leaves the thread "suspended" server-side forever
+ * (every wait it makes then stays pending; Steam's CEF browser deadlocked
+ * that way, 2026-09-06).  XNU starts libdispatch workqueue threads with all
+ * asynchronous signals blocked (0xf7fdc04e), and a pthread created from such a
+ * thread inherits that mask, so a guest thread created while a HOSTWQ worker
+ * was running guest code came up unable to receive wine's signals.  Clear the
+ * mask whenever a host thread starts running guest code. */
+static void ocerz_host_sigmask_clear(const char *where)
+{
+    sigset_t cur, empty;
+    if (pthread_sigmask(SIG_BLOCK, NULL, &cur) != 0)
+        return;
+    unsigned v = 0;
+    for (int sg = 1; sg < 32; sg++)
+        if (sigismember(&cur, sg)) v |= 1u << sg;
+    if (!v)
+        return;
+    sigemptyset(&empty);
+    pthread_sigmask(SIG_SETMASK, &empty, NULL);
+    if (getenv("OCERZ_HOSTMASKLOG"))
+        fprintf(stderr, "ocerz: HOSTMASK-CLEARED[%d] %s had %#x blocked\n", (int)getpid(), where, v);
+}
+
 static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)si; (void)ctx;
-    if (sig > 0 && sig < 32)
+    if (sig > 0 && sig < 32) {
         __atomic_or_fetch(&g_pending_async_mask, 1u << sig, __ATOMIC_SEQ_CST);
+        if (g_cur_cpu)
+            __atomic_fetch_add(&g_cur_cpu->sig_host_rcvd[sig], 1u, __ATOMIC_RELAXED);
+    }
 }
 
 /* Mirror a guest sigaction() onto the host for plain asynchronous signals.
@@ -470,6 +500,8 @@ static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
  * (delivered through the pending-async mask like SIGQUIT/SIGUSR1). */
 void ocerz_vm_mirror_host_signal(int sig, int kind)
 {
+    if (sig == SIGUSR1 && getenv("OCERZ_PORTDUMP"))
+        fprintf(stderr, "ocerz: SIGACT[%d] guest sigaction(SIGUSR1) kind=%d\n", (int)getpid(), kind);
     switch (sig) {
     case SIGPIPE: case SIGHUP: case SIGINT: case SIGTERM: case SIGALRM:
     case SIGCHLD: case SIGWINCH: case SIGURG: case SIGIO: case SIGVTALRM:
@@ -1246,6 +1278,25 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             w = hex_into(w, ocerz_h2g((const void *)(uintptr_t)fault_rsp));
             w = str_into(w, "\n");
             write(2, wb, (size_t)(w - wb));
+            /* PE stack scan from the faulting rsp: return addresses into the
+             * guest's modules (symbolised later with the +server module map). */
+            {
+                static char sb[2048];
+                char *q = sb;
+                q = str_into(q, "ocerz: WINEFAULT-SCAN rsp=");
+                q = hex_into(q, fault_rsp);
+                q = str_into(q, ":");
+                int printed = 0;
+                for (uint64_t o = 0; o < 0x3000 && printed < 40 && q < sb + sizeof sb - 48; o += 8) {
+                    if (!ocerz_addr_readable(fault_rsp + o)) break;
+                    uint64_t v = ocerz_ld(fault_rsp + o, 8);
+                    int codey = (v >= 0x6fff00000000ull && v < 0x7ffc00000000ull) ||
+                                (v >= 0x100000000ull && v < 0x200000000ull);
+                    if (codey) { q = str_into(q, " +"); q = hex_into(q, o); q = str_into(q, ":"); q = hex_into(q, v); printed++; }
+                }
+                q = str_into(q, "\n");
+                write(2, sb, (size_t)(q - sb));
+            }
         }
         if (g_sigtrace) {
             char tb[256];
@@ -1840,11 +1891,13 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
         for (int i = 0; i < g_cpus_n; i++) {
             OcerzCPU *c = g_cpus[i];
             if (!c) continue;
-            fprintf(stderr, "ocerz: PORTDUMP[%d] cpu#%u rip=%#llx rax=%#llx rdi=%#llx blocked=%.1fs rcv_name=%#x sends:",
+            fprintf(stderr, "ocerz: PORTDUMP[%d] cpu#%u rip=%#llx rax=%#llx rdi=%#llx blocked=%.1fs rcv_name=%#x usr1=%u/%u sigpend=%#llx sigmask=%#llx hostmask=%#x(%u) sends:",
                     (int)getpid(), c->cpu_number, (unsigned long long)c->rip,
                     (unsigned long long)c->gpr[OCERZ_RAX], (unsigned long long)c->gpr[OCERZ_RDI],
                     c->block_since_ns ? (double)(now - c->block_since_ns) / 1e9 : 0.0,
-                    c->last_rcv_name);
+                    c->last_rcv_name, c->sig_host_rcvd[30], c->sig_delivered[30],
+                    (unsigned long long)c->sig_pending, (unsigned long long)c->sig_mask,
+                    c->host_mask_last, c->host_mask_changes);
             for (int k = 0; k < 8 && k < c->sendring_n; k++) {
                 int j = (c->sendring_n - 1 - k) % 8;
                 fprintf(stderr, " [id=%u port=%#x sz=%u]", c->sendring_id[j], c->sendring_port[j], c->sendring_sz[j]);
@@ -1902,6 +1955,37 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
                 fprintf(stderr, "ocerz: PORTDUMP[%d] cpu#%u teb=%#llx frame=%#llx (no pe frame)\n",
                         (int)getpid(), c->cpu_number, (unsigned long long)teb, (unsigned long long)frame);
             }
+        }
+    }
+    {
+        struct sigaction cur;
+        sigset_t hm; sigemptyset(&hm);
+        if (sigaction(SIGUSR1, NULL, &cur) == 0)
+            fprintf(stderr, "ocerz: PORTDUMP[%d] host SIGUSR1 disposition=%p (async_sig_handler=%p) flags=%#x\n",
+                    (int)getpid(), (void *)cur.sa_sigaction, (void *)async_sig_handler, cur.sa_flags);
+        if (pthread_sigmask(SIG_BLOCK, NULL, &hm) == 0)
+            fprintf(stderr, "ocerz: PORTDUMP[%d] this host thread sigmask has SIGUSR1 blocked=%d\n",
+                    (int)getpid(), sigismember(&hm, SIGUSR1));
+    }
+    if (getenv("OCERZ_PORTDUMP_KICK")) {
+        /* Send every guest thread a real SIGUSR1 through its host thread and
+         * see whether the host handler counts it: a thread that cannot be
+         * reached this way has a host-level block on the signal. */
+        uint32_t before[64] = {0}; int nb = g_cpus_n < 64 ? g_cpus_n : 64;
+        for (int i = 0; i < nb; i++) if (g_cpus[i]) before[i] = g_cpus[i]->sig_host_rcvd[30];
+        for (int i = 0; i < nb; i++) {
+            OcerzCPU *c = g_cpus[i];
+            if (!c || !c->host_pthread || pthread_equal((pthread_t)c->host_pthread, pthread_self())) continue;
+            int rc = pthread_kill((pthread_t)c->host_pthread, SIGUSR1);
+            if (rc) fprintf(stderr, "ocerz: PORTDUMP[%d] KICK cpu#%u pthread_kill failed rc=%d\n", (int)getpid(), c->cpu_number, rc);
+        }
+        usleep(400000);
+        for (int i = 0; i < nb; i++) {
+            OcerzCPU *c = g_cpus[i];
+            if (!c) continue;
+            fprintf(stderr, "ocerz: PORTDUMP[%d] KICK cpu#%u kport=%#x rcvd %u -> %u delivered=%u%s\n",
+                    (int)getpid(), c->cpu_number, c->host_kport, before[i], c->sig_host_rcvd[30], c->sig_delivered[30],
+                    (c->sig_host_rcvd[30] == before[i] && c->host_pthread && !pthread_equal((pthread_t)c->host_pthread, pthread_self())) ? "   <== NOT RECEIVED" : "");
         }
     }
     for (mach_msg_type_number_t i = 0; i < ncnt; i++) {
@@ -2085,6 +2169,9 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     sigjmp_buf jb;
     sigjmp_buf *prev_recover = g_sig_recover;
     g_sig_recover = &jb;
+    /* Before the jump buffer captures the mask: every fault recovery
+     * siglongjmps here and restores it. */
+    ocerz_host_sigmask_clear("callback");
     sigsetjmp(jb, 1);
     g_cur_cpu = &local;
     while (local.rip != sentinel && !vm->exited && !local.terminated) {
@@ -2389,6 +2476,10 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     g_sig_recover = &jb;
 
     ocerz_cpu_register(cpu);
+    /* Before sigsetjmp(jb, 1) captures the host mask: every fault recovery
+     * siglongjmps back here and restores whatever was saved, so a mask that
+     * is cleared only after this point comes back at the first guest fault. */
+    ocerz_host_sigmask_clear("run_cpu");
     if (sigsetjmp(jb, 1) != 0 && getenv("OCERZ_CPUREG_LOG")) {
 
         static _Atomic unsigned recov;
@@ -2396,6 +2487,8 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
                 ++recov);
     }
     g_cur_cpu = cpu;
+    cpu->host_pthread = (void *)pthread_self();
+    cpu->host_kport = pthread_mach_thread_np(pthread_self());
 
     while (!vm->exited && !cpu->terminated && !cpu->interrupt) {
         g_riphist[g_riphist_n++ & 31] = cpu->rip;
