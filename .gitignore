@@ -9,3 +9,4 @@ notes/
 .notes
 MacNdCheese-WineEngine-PRIVATE/
 /ocerz
+tests/__pycache__/

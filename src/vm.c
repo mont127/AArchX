@@ -486,6 +486,11 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
             return;
         break;
     case SIGUSR2:
+        if (getenv("OCERZ_PORTDUMP")) {
+            fprintf(stderr, "ocerz: PORTDUMP[%d] guest sigaction(SIGUSR2, kind=%d) ignored, dump handler kept\n",
+                    (int)getpid(), kind);
+            return;
+        }
         break;
     default:
         return;  /* SEGV/BUS/QUIT/ILL/TRAP/FPE/ABRT: ocerz owns these */
@@ -1820,9 +1825,12 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
     mach_port_name_array_t names = NULL;
     mach_port_type_array_t types = NULL;
     mach_msg_type_number_t ncnt = 0, tcnt = 0;
-    if (mach_port_names(mach_task_self(), &names, &ncnt, &types, &tcnt) !=
-        KERN_SUCCESS)
-        return;
+    fprintf(stderr, "ocerz: PORTDUMP[%d] begin cpus=%d\n", (int)getpid(), g_cpus_n);
+    kern_return_t pkr = mach_port_names(mach_task_self(), &names, &ncnt, &types, &tcnt);
+    if (pkr != KERN_SUCCESS) {
+        fprintf(stderr, "ocerz: PORTDUMP[%d] mach_port_names failed kr=%d\n", (int)getpid(), (int)pkr);
+        ncnt = 0; names = NULL; types = NULL;
+    }
     fprintf(stderr, "ocerz: PORTDUMP[%d] rights=%u\n", (int)getpid(), ncnt);
     /* every guest thread: where it is, how long it has been inside a mach
      * trap, the port it receives on and its last sends (recorded while
@@ -1842,6 +1850,58 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
                 fprintf(stderr, " [id=%u port=%#x sz=%u]", c->sendring_id[j], c->sendring_port[j], c->sendring_sz[j]);
             }
             fprintf(stderr, "\n");
+            /* Guest stack of a parked thread: the rbp chain first, then a
+             * scan for anything that looks like a code address.  Wine's PE
+             * modules sit at 0x6fff..-0x7ffc.., 64-bit images at 0x1_0000_0000
+             * and up, host dylibs in the shared cache at 0x7ff8..; the +loaddll
+             * channel turns the values into module+offset. */
+            uint64_t sp = c->gpr[OCERZ_RSP], fp = c->gpr[OCERZ_RBP];
+            fprintf(stderr, "ocerz: PORTDUMP[%d] cpu#%u rsp=%#llx rbp=%#llx ret-chain:",
+                    (int)getpid(), c->cpu_number, (unsigned long long)sp, (unsigned long long)fp);
+            for (int d = 0; d < 12 && ocerz_addr_readable(fp) && ocerz_addr_readable(fp + 8); d++) {
+                fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+                uint64_t nfp = ocerz_ld(fp, 8);
+                if (nfp <= fp) break;
+                fp = nfp;
+            }
+            fprintf(stderr, "\nocerz: PORTDUMP[%d] cpu#%u stackscan:", (int)getpid(), c->cpu_number);
+            int printed = 0;
+            for (uint64_t o = 0; o < 0x4000 && printed < 40; o += 8) {
+                if (!ocerz_addr_readable(sp + o)) break;
+                uint64_t v = ocerz_ld(sp + o, 8);
+                int codey = (v >= 0x6fff00000000ull && v < 0x7ffc00000000ull) ||
+                            (v >= 0x100000000ull && v < 0x200000000ull);
+                if (codey) { fprintf(stderr, " +%llx:%#llx", (unsigned long long)o, (unsigned long long)v); printed++; }
+            }
+            fprintf(stderr, "\n");
+            /* Wine runs unix-side code on a separate stack; the PE caller's
+             * registers sit in the thread's syscall frame
+             * (TEB+0x2f0 GdiTebBatch = ntdll_thread_data; wine 11.0 keeps syscall_frame at
+             * TEB+0x378; frame: rip +0x70, cs +0x78, rsp +0x88,
+             * rbp +0x98).  cs==0x33 is the sanity check on the layout. */
+            uint64_t teb = c->gs_base && ocerz_addr_readable(c->gs_base + 0x30)
+                         ? ocerz_ld(c->gs_base + 0x30, 8) : 0;
+            uint64_t frame = teb && ocerz_addr_readable(teb + 0x378) ? ocerz_ld(teb + 0x378, 8) : 0;
+            if (frame && ocerz_addr_readable(frame) && ocerz_addr_readable(frame + 0xa0)) {
+                uint64_t urip = ocerz_ld(frame + 0x70, 8), ursp = ocerz_ld(frame + 0x88, 8);
+                uint64_t ucs = ocerz_ld(frame + 0x78, 8);
+                uint64_t wtid = ocerz_addr_readable(teb + 0x48) ? ocerz_ld(teb + 0x48, 8) : 0;   /* ClientId.UniqueThread */
+                fprintf(stderr, "ocerz: PORTDUMP[%d] cpu#%u teb=%#llx tid=%04llx cs=%#llx pe-rip=%#llx pe-rsp=%#llx pe-scan:",
+                        (int)getpid(), c->cpu_number, (unsigned long long)teb, (unsigned long long)wtid,
+                        (unsigned long long)ucs, (unsigned long long)urip, (unsigned long long)ursp);
+                printed = 0;
+                for (uint64_t o = 0; o < 0x8000 && printed < 48; o += 8) {
+                    if (!ocerz_addr_readable(ursp + o)) break;
+                    uint64_t v = ocerz_ld(ursp + o, 8);
+                    int codey = (v >= 0x6fff00000000ull && v < 0x7ffc00000000ull) ||
+                                (v >= 0x100000000ull && v < 0x200000000ull);
+                    if (codey) { fprintf(stderr, " +%llx:%#llx", (unsigned long long)o, (unsigned long long)v); printed++; }
+                }
+                fprintf(stderr, "\n");
+            } else {
+                fprintf(stderr, "ocerz: PORTDUMP[%d] cpu#%u teb=%#llx frame=%#llx (no pe frame)\n",
+                        (int)getpid(), c->cpu_number, (unsigned long long)teb, (unsigned long long)frame);
+            }
         }
     }
     for (mach_msg_type_number_t i = 0; i < ncnt; i++) {
@@ -1958,6 +2018,7 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
         sp.sa_sigaction = portdump_handler;
         sp.sa_flags = SA_SIGINFO | SA_NODEFER;
         sigaction(SIGUSR2, &sp, NULL);
+        fprintf(stderr, "ocerz: PORTDUMP[%d] armed\n", (int)getpid());
     }
     g_vm = vm;
     if (vm->jit_enabled && !vm->jit)
