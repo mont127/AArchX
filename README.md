@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img alt="license" src="https://img.shields.io/badge/license-Proprietary-blue.svg">
+  <img alt="license" src="https://img.shields.io/badge/license-Non--commercial-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
   <img alt="version" src="https://img.shields.io/badge/version-0.1-green.svg">
@@ -189,4 +189,4 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 
 ## License
 
-[AArchX Proprietary License](LICENSE). All rights reserved; see the LICENSE file for the terms.
+[AArchX Proprietary License](LICENSE). Free to use, copy and modify for non-commercial purposes (personal, educational, academic, research and evaluation) as long as the copyright, license and attribution notices stay. Commercial use, distribution or inclusion in a paid product or service needs prior written permission from mont127. Versions published earlier under LGPL-2.1 keep the license they were released under.
