@@ -158,6 +158,7 @@ run_file_case dthread_signal tests/dynamic/thread_signal.c 'OK'
 run_file_case dshmem_coherence tests/dynamic/shmem_coherence.c 'OK'
 run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
 run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
+run_file_case dbyte_atomics tests/dynamic/byte_atomics.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"
