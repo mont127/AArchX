@@ -4642,6 +4642,7 @@ static int mem_plain_ok(const X86Insn *insn, const X86Operand *op)
     return 1;
 }
 static int nzcv_fuse_producer(const X86Insn *insns, int ci);
+static int insn_writes_reg(const X86Insn *in, unsigned reg);
 static int flag_neutral_ok(const X86Insn *in);
 #define NZCV_GAP_MAX 3
 static int nzcv_gap_max(void)
@@ -4720,8 +4721,23 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     while (k >= 0 && ci - 1 - k < NZCV_GAP_MAX && !nzcv_producer_candidate(&insns[k]) && nzcv_gap_shape(&insns[k]))
         k--;
     if (k < 0 || !nzcv_producer_candidate(&insns[k])) return -1;
-    for (int m = k + 1; m < ci; m++)
+    for (int m = k + 1; m < ci; m++) {
         if (!nzcv_gap_ok(insns, m, k)) return -1;
+        /* a consumer that re-derives the condition from the producer's
+         * operands needs them intact: no gap may write a register the
+         * producer reads, its memory base/index included
+         * (`cmp byte [rax+rcx-1],0xc0 ; mov rcx,rbx ; jcc` spun libSystem's
+         * UTF-8 scan forever when the gap fusion declined it) */
+        const X86Insn *p = &insns[k];
+        for (int o = 0; o < p->nops; o++) {
+            const X86Operand *po = &p->ops[o];
+            if (po->kind == OCERZ_OPK_REG && insn_writes_reg(&insns[m], po->reg)) return -1;
+            if (po->kind == OCERZ_OPK_MEM) {
+                if (po->base != OCERZ_REG_NONE && insn_writes_reg(&insns[m], po->base)) return -1;
+                if (po->index != OCERZ_REG_NONE && insn_writes_reg(&insns[m], po->index)) return -1;
+            }
+        }
+    }
     const X86Insn *p = &insns[k];
     unsigned kind;
     if (p->op == OCERZ_OP_BSF || p->op == OCERZ_OP_BSR) {
@@ -8634,13 +8650,20 @@ static int flag_neutral_ok(const X86Insn *in)
         if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
         int has_idx = m->index != OCERZ_REG_NONE;
         if (has_idx && pin_slot(m->index) < 0) return 0;
+        /* rsp held as a host pointer: emit_lea takes its fallback, which
+         * loads the base through JT0/JT2 (the temps a fused compare holds
+         * its value in) */
+        if (rsp_is_ptr() && (d->reg == OCERZ_RSP || m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
+        if (pin_slot(d->reg) < 0) return 0;
         if (m->disp >= -4095 && m->disp <= 4095) return 1;          /* both fast paths */
         return has_idx && m->disp == 0;
     }
     if (in->op == OCERZ_OP_MOV) {
         const X86Operand *d = &in->ops[0], *s = &in->ops[1];
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
-        if (s->kind == OCERZ_OPK_REG) return !s->high8 && s->size == d->size;
+        if (pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
+        if (s->kind == OCERZ_OPK_REG)
+            return !s->high8 && s->size == d->size && pin_slot(s->reg) >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP);
         return s->kind == OCERZ_OPK_IMM;
     }
     return 0;
@@ -8687,14 +8710,18 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         return 0;      /* stage 9: no instruction fusion in a 32-bit block */
     if (!can_fuse_cmp_test_jcc(producer, jcc, g_self_rip) || !g_defer)
         return 0;
-    /* gap fusion (cmp ; neutral ; jcc): the neutral insn must not write a register the compare read */
+    /* gap fusion (cmp ; neutral ; jcc): the compare's operands are loaded
+     * first, then the gap, then the branch, so the gap may write the
+     * compare's memory base/index but not its register operands, and its
+     * emission must touch nothing but pinned registers (flag_neutral_ok
+     * admits exactly those shapes: emit_lea's pointer-rsp form goes through
+     * JT0, which held the compared byte for a cbz - libcef's
+     * `cmp byte [rdi+0x210],0 ; lea r15,[rsp+0x290] ; jne` then branched on
+     * rsp and Steam's CEF browser copied an unengaged optional, 2026-09-06). */
     if (gap) {
         const X86Operand *pd = &producer->ops[0], *ps = &producer->ops[1];
         if (pd->kind == OCERZ_OPK_REG && insn_writes_reg(gap, pd->reg)) return 0;
         if (ps->kind == OCERZ_OPK_REG && insn_writes_reg(gap, ps->reg)) return 0;
-        /* memory-operand compares also read base/index registers */
-        const X86Operand *pm = pd->kind == OCERZ_OPK_MEM ? pd : ps->kind == OCERZ_OPK_MEM ? ps : NULL;
-        (void)pm;   /* the load happens BEFORE the gap, so later base/index writes are fine */
         if (!flag_neutral_ok(gap)) return 0;
         /* the admission test knows the shape, not the pin state; emit into a
          * scratch buffer first so a gap the emitter cannot place (an unpinned
@@ -8915,8 +8942,8 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0);
     }
     if (gap) {
-        /* NZCV is live now; the record operands (JT0/JT1 or pinned regs) must
-         * survive -- guaranteed by the checks above. */
+        /* NZCV (or the loaded value in a temp) is live now; the gap touches
+         * only pinned registers, none of them a compare operand */
         uint32_t *gl = a64_label(b);
         int ok = emit_flag_neutral(b, gap);
         assert(ok && "flag_neutral_ok admitted an unhandled shape");
