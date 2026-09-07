@@ -23,8 +23,12 @@ tests/unit/bin/%: tests/unit/%.c $(CORE_OBJS)
 	@mkdir -p tests/unit/bin
 	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS)
 
+# The JIT unit harnesses drive ocerz_jit_step without a CPU run loop, so the
+# self-modifying-code write trap (ocerz_mem_arm_exec) has no fault recovery
+# to land on when their data window shares a page with their code; it is
+# covered by the guest smc and dynamic smc_io tests instead.
 unit: $(UNIT_BINS)
-	@for t in $(UNIT_BINS); do echo "== $$t"; $$t || exit 1; done
+	@for t in $(UNIT_BINS); do echo "== $$t"; OCERZ_NO_ARM_EXEC=1 $$t || exit 1; done
 
 guest:
 	$(MAKE) -C tests/guest
