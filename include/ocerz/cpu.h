@@ -132,6 +132,10 @@ typedef struct OcerzCPU {
     uint64_t host_tid;      /* pthread_threadid_np of the host thread running this CPU (debugger thread map) */
     int32_t cur_sys_class;  /* syscall currently being dispatched on the host, -1 when in guest code */
     int32_t cur_sys_num;
+    /* AVX: upper 128 bits of ymm0-15.  Legacy SSE ops leave them alone, VEX.128
+     * ops zero the destination's, VEX.256 ops write them.  Only the interpreter
+     * touches them (the JIT declines every VEX-encoded instruction). */
+    Ocerz128 ymmh[16] __attribute__((aligned(16)));
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256

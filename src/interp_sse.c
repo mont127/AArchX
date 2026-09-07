@@ -36,6 +36,13 @@ static inline void vec_write(OcerzCPU *cpu, const X86Insn *insn, const X86Operan
     ocerz_write_op128(cpu, insn, op, v.q);
 }
 
+/* First source of a two-input op: the destination register for legacy SSE,
+ * VEX.vvvv for the AVX three-operand (NDS) forms. */
+static inline vec src1_of(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *d)
+{
+    return vec_of(cpu->xmm[(insn->vex & OCERZ_VEX_NDS) ? insn->vvvv : d->reg]);
+}
+
 static inline uint32_t f2bits(float f)
 {
     uint32_t u;
@@ -208,6 +215,22 @@ static int do_moves(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
+    if ((insn->vex & OCERZ_VEX_NDS) && d->kind == OCERZ_OPK_XMM) {
+        /* AVX merge forms: the untouched part comes from vvvv, not from dst */
+        Ocerz128 src = s->kind == OCERZ_OPK_XMM ? cpu->xmm[s->reg] : (Ocerz128){ 0, 0 };
+        Ocerz128 r = cpu->xmm[insn->vvvv];
+        switch (insn->op) {
+        case OP(OCERZ_OP_MOVSS):  r.lo = (r.lo & ~(uint64_t)0xffffffff) | (uint32_t)src.lo; break;
+        case OP(OCERZ_OP_MOVSDX): r.lo = src.lo; break;
+        case OP(OCERZ_OP_MOVLPS): r.lo = ocerz_ld(ocerz_ea(cpu, insn, s), 8); break;
+        case OP(OCERZ_OP_MOVHPS): r.hi = ocerz_ld(ocerz_ea(cpu, insn, s), 8); break;
+        case OP(OCERZ_OP_MOVLHPS): r.hi = src.lo; break;
+        case OP(OCERZ_OP_MOVHLPS): r.lo = src.hi; break;
+        default: return OCERZ_EUNSUP;
+        }
+        cpu->xmm[d->reg] = r;
+        return OCERZ_STEP_OK;
+    }
     switch (insn->op) {
     case OP(OCERZ_OP_MOVUPS):
     case OP(OCERZ_OP_MOVAPS):
@@ -387,7 +410,7 @@ static int do_fp_arith(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
-    vec a = vec_of(cpu->xmm[d->reg]);
+    vec a = src1_of(cpu, insn, d);
     vec b = vec_read(cpu, insn, s);
     vec r = a;
     switch (insn->op) {
@@ -467,7 +490,7 @@ static int do_logic(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
-    Ocerz128 a = cpu->xmm[d->reg];
+    Ocerz128 a = src1_of(cpu, insn, d).q;
     Ocerz128 b = ocerz_read_op128(cpu, insn, s);
     Ocerz128 r;
     switch (insn->op) {
@@ -495,7 +518,7 @@ static int do_cmpfp(OcerzCPU *cpu, const X86Insn *insn)
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
     int pred = (int)(insn->ops[2].imm & 7);
-    vec a = vec_of(cpu->xmm[d->reg]);
+    vec a = src1_of(cpu, insn, d);
     vec b = vec_read(cpu, insn, s);
     vec r = a;
     switch (insn->op) {
@@ -525,13 +548,13 @@ static int do_comis(OcerzCPU *cpu, const X86Insn *insn)
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
     if (insn->op == OP(OCERZ_OP_COMISS) || insn->op == OP(OCERZ_OP_UCOMISS)) {
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         vec b = vec_read(cpu, insn, s);
         float x = a.f[0], y = b.f[0];
         int unord = isnan(x) || isnan(y);
         set_comis_flags(cpu, unord, !unord && x < y, !unord && x == y);
     } else {
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         vec b = vec_read(cpu, insn, s);
         double x = a.d[0], y = b.d[0];
         int unord = isnan(x) || isnan(y);
@@ -544,7 +567,7 @@ static int do_pcmp(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
-    vec a = vec_of(cpu->xmm[d->reg]);
+    vec a = src1_of(cpu, insn, d);
     vec b = vec_read(cpu, insn, s);
     vec r;
     switch (insn->op) {
@@ -567,6 +590,18 @@ static int do_convert(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
+    if ((insn->vex & OCERZ_VEX_NDS) && d->kind == OCERZ_OPK_XMM) {
+        /* AVX scalar converts merge into vvvv, not into the destination */
+        Ocerz128 base = cpu->xmm[insn->vvvv];
+        if (insn->op == OCERZ_OP_CVTSS2SD || insn->op == OCERZ_OP_CVTSD2SS) {
+            vec b = vec_read(cpu, insn, s);            /* read before dst may change */
+            if (insn->op == OCERZ_OP_CVTSS2SD) base.lo = d2bits((double)b.f[0]);
+            else base.lo = (base.lo & ~(uint64_t)0xffffffff) | f2bits((float)b.d[0]);
+            cpu->xmm[d->reg] = base;
+            return OCERZ_STEP_OK;
+        }
+        cpu->xmm[d->reg] = base;                       /* cvtsi2ss/sd: source is a gpr/memory */
+    }
     switch (insn->op) {
     case OP(OCERZ_OP_CVTSI2SS): {
         uint64_t g = ocerz_read_op(cpu, insn, s);
@@ -675,7 +710,7 @@ static int do_int_arith(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
-    vec a = vec_of(cpu->xmm[d->reg]);
+    vec a = src1_of(cpu, insn, d);
     vec b = vec_read(cpu, insn, s);
     vec r = a;
     switch (insn->op) {
@@ -796,7 +831,7 @@ static int do_pack_shuffle(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
-    vec a = vec_of(cpu->xmm[d->reg]);
+    vec a = src1_of(cpu, insn, d);
     vec b = vec_read(cpu, insn, s);
     vec r;
     switch (insn->op) {
@@ -921,7 +956,7 @@ static unsigned shift_count(OcerzCPU *cpu, const X86Insn *insn)
 static int do_shift(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
-    vec a = vec_of(cpu->xmm[d->reg]);
+    vec a = (insn->vex & OCERZ_VEX_NDD) ? vec_read(cpu, insn, &insn->ops[2]) : src1_of(cpu, insn, d);
     vec r = a;
     unsigned c = shift_count(cpu, insn);
     switch (insn->op) {
@@ -1026,7 +1061,7 @@ static int do_insert_extract(OcerzCPU *cpu, const X86Insn *insn)
             e = (uint8_t)ocerz_ld(ocerz_ea(cpu, insn, s), 1);
         else
             e = (uint8_t)ocerz_read_op(cpu, insn, s);
-        vec v = vec_of(cpu->xmm[d->reg]);
+        vec v = src1_of(cpu, insn, d);
         v.u8[idx] = e;
         cpu->xmm[d->reg] = v.q;
         return OCERZ_STEP_OK;
@@ -1038,7 +1073,7 @@ static int do_insert_extract(OcerzCPU *cpu, const X86Insn *insn)
             e = (uint16_t)ocerz_ld(ocerz_ea(cpu, insn, s), 2);
         else
             e = (uint16_t)ocerz_read_op(cpu, insn, s);
-        vec v = vec_of(cpu->xmm[d->reg]);
+        vec v = src1_of(cpu, insn, d);
         v.u16[idx] = e;
         cpu->xmm[d->reg] = v.q;
         return OCERZ_STEP_OK;
@@ -1050,7 +1085,7 @@ static int do_insert_extract(OcerzCPU *cpu, const X86Insn *insn)
             e = (uint32_t)ocerz_ld(ocerz_ea(cpu, insn, s), 4);
         else
             e = (uint32_t)ocerz_read_op(cpu, insn, s);
-        vec v = vec_of(cpu->xmm[d->reg]);
+        vec v = src1_of(cpu, insn, d);
         v.u32[idx] = e;
         cpu->xmm[d->reg] = v.q;
         return OCERZ_STEP_OK;
@@ -1062,7 +1097,7 @@ static int do_insert_extract(OcerzCPU *cpu, const X86Insn *insn)
             e = ocerz_ld(ocerz_ea(cpu, insn, s), 8);
         else
             e = ocerz_read_op(cpu, insn, s);
-        vec v = vec_of(cpu->xmm[d->reg]);
+        vec v = src1_of(cpu, insn, d);
         v.u64[idx] = e;
         cpu->xmm[d->reg] = v.q;
         return OCERZ_STEP_OK;
@@ -1089,7 +1124,7 @@ static int do_insert_extract(OcerzCPU *cpu, const X86Insn *insn)
             vec sv = vec_of(cpu->xmm[s->reg]);
             sel = sv.u32[count_s];
         }
-        vec v = vec_of(cpu->xmm[d->reg]);
+        vec v = src1_of(cpu, insn, d);
         v.u32[count_d] = sel;
         for (int i = 0; i < 4; i++)
             if (zmask & (1 << i))
@@ -1132,7 +1167,7 @@ static int do_pcmpstr(OcerzCPU *cpu, const X86Insn *insn)
     int is_index = insn->op == OCERZ_OP_PCMPESTRI || insn->op == OCERZ_OP_PCMPISTRI;
     int is_expl = insn->op == OCERZ_OP_PCMPESTRI || insn->op == OCERZ_OP_PCMPESTRM;
 
-    vec a = vec_of(cpu->xmm[insn->ops[0].reg]);
+    vec a = src1_of(cpu, insn, &insn->ops[0]);
     vec b = vec_read(cpu, insn, &insn->ops[1]);
 
     int la, lb;
@@ -1240,7 +1275,7 @@ static int do_pcmpstr(OcerzCPU *cpu, const X86Insn *insn)
 static int do_sse41_misc(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
-    vec a = vec_of(cpu->xmm[d->reg]);
+    vec a = src1_of(cpu, insn, d);
     vec b = vec_read(cpu, insn, &insn->ops[1]);
     vec r;
     r.q.lo = 0;
@@ -1302,7 +1337,7 @@ static int do_ptest_blend(OcerzCPU *cpu, const X86Insn *insn)
     const X86Operand *s = &insn->ops[1];
     switch (insn->op) {
     case OP(OCERZ_OP_PTEST): {
-        Ocerz128 a = cpu->xmm[d->reg];
+        Ocerz128 a = cpu->xmm[d->reg];       /* ptest: no NDS form, ops[0] is a source */
         Ocerz128 b = ocerz_read_op128(cpu, insn, s);
         int zf = ((a.lo & b.lo) == 0 && (a.hi & b.hi) == 0);
         int cf = ((~a.lo & b.lo) == 0 && (~a.hi & b.hi) == 0);
@@ -1316,7 +1351,7 @@ static int do_ptest_blend(OcerzCPU *cpu, const X86Insn *insn)
     }
     case OP(OCERZ_OP_PBLENDW): {
         int imm = (int)(insn->ops[2].imm & 0xff);
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         vec b = vec_read(cpu, insn, s);
         vec r = a;
         for (int i = 0; i < 8; i++)
@@ -1327,7 +1362,7 @@ static int do_ptest_blend(OcerzCPU *cpu, const X86Insn *insn)
     }
     case OP(OCERZ_OP_BLENDPS): {
         int imm = (int)(insn->ops[2].imm & 0x0f);
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         vec b = vec_read(cpu, insn, s);
         vec r = a;
         for (int i = 0; i < 4; i++)
@@ -1338,7 +1373,7 @@ static int do_ptest_blend(OcerzCPU *cpu, const X86Insn *insn)
     }
     case OP(OCERZ_OP_BLENDPD): {
         int imm = (int)(insn->ops[2].imm & 0x03);
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         vec b = vec_read(cpu, insn, s);
         vec r = a;
         for (int i = 0; i < 2; i++)
@@ -1348,9 +1383,9 @@ static int do_ptest_blend(OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OP(OCERZ_OP_PBLENDVB): {
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         vec b = vec_read(cpu, insn, s);
-        vec m = vec_of(cpu->xmm[0]);
+        vec m = vec_of(cpu->xmm[(insn->vex & OCERZ_VEX_IS4) ? insn->ops[2].reg : 0]);
         vec r = a;
         for (int i = 0; i < 16; i++)
             if (m.u8[i] & 0x80)
@@ -1359,9 +1394,9 @@ static int do_ptest_blend(OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OP(OCERZ_OP_BLENDVPS): {
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         vec b = vec_read(cpu, insn, s);
-        vec m = vec_of(cpu->xmm[0]);
+        vec m = vec_of(cpu->xmm[(insn->vex & OCERZ_VEX_IS4) ? insn->ops[2].reg : 0]);
         vec r = a;
         for (int i = 0; i < 4; i++)
             if (m.u32[i] & 0x80000000u)
@@ -1370,9 +1405,9 @@ static int do_ptest_blend(OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OP(OCERZ_OP_BLENDVPD): {
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         vec b = vec_read(cpu, insn, s);
-        vec m = vec_of(cpu->xmm[0]);
+        vec m = vec_of(cpu->xmm[(insn->vex & OCERZ_VEX_IS4) ? insn->ops[2].reg : 0]);
         vec r = a;
         for (int i = 0; i < 2; i++)
             if (m.u64[i] & 0x8000000000000000ull)
@@ -1445,13 +1480,13 @@ static int do_round(OcerzCPU *cpu, const X86Insn *insn)
         cpu->xmm[d->reg] = r.q;
         return OCERZ_STEP_OK;
     case OP(OCERZ_OP_ROUNDSS): {
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         a.f[0] = round_imm_f(b.f[0], imm);
         cpu->xmm[d->reg] = a.q;
         return OCERZ_STEP_OK;
     }
     case OP(OCERZ_OP_ROUNDSD): {
-        vec a = vec_of(cpu->xmm[d->reg]);
+        vec a = src1_of(cpu, insn, d);
         a.d[0] = round_imm_d(b.d[0], imm);
         cpu->xmm[d->reg] = a.q;
         return OCERZ_STEP_OK;
@@ -1577,7 +1612,7 @@ static uint32_t aes_rotr8(uint32_t w)
 static int do_aes(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
-    vec a = vec_of(cpu->xmm[d->reg]);
+    vec a = src1_of(cpu, insn, d);
     switch (insn->op) {
     case OP(OCERZ_OP_AESENC):
     case OP(OCERZ_OP_AESENCLAST): {
@@ -1627,7 +1662,7 @@ static int do_aes(OcerzCPU *cpu, const X86Insn *insn)
 static int do_pclmul(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
-    vec a = vec_of(cpu->xmm[d->reg]);
+    vec a = src1_of(cpu, insn, d);
     vec b = vec_read(cpu, insn, &insn->ops[1]);
     int imm = (int)(insn->ops[2].imm & 0xff);
     uint64_t x = (imm & 0x01) ? a.u64[1] : a.u64[0];
@@ -1647,7 +1682,9 @@ static int do_pclmul(OcerzCPU *cpu, const X86Insn *insn)
     return OCERZ_STEP_OK;
 }
 
-int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn);
+
+static int sse_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
     (void)vm;
     switch (insn->op) {
@@ -1770,6 +1807,364 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return do_pclmul(cpu, insn);
 
     default:
+        return do_avx_only(cpu, insn);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * AVX (VEX-encoded) execution.
+ *
+ * A VEX.128 instruction is the legacy SSE op with the first source taken from
+ * vvvv (src1_of above) and the upper half of the destination ymm zeroed.  A
+ * VEX.256 instruction is executed twice: once on the low 128-bit halves and
+ * once with the involved registers swapped for their ymm upper halves (memory
+ * operands 16 bytes further on).  Ops that cross the 128-bit lanes (widening
+ * and narrowing converts, broadcasts, 128-bit insert/extract, mask/test) are
+ * handled explicitly. */
+static uint16_t f2h(float f)
+{
+    uint32_t x = f2bits(f);
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = (int32_t)((x >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = x & 0x7fffff;
+    if (((x >> 23) & 0xff) == 0xff)                       /* inf / nan */
+        return (uint16_t)(sign | 0x7c00 | (mant ? 0x200 | (mant >> 13) : 0));
+    if (exp >= 0x1f)
+        return (uint16_t)(sign | 0x7c00);                  /* overflow -> inf */
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;              /* underflow -> 0 */
+        mant |= 0x800000;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t hm = mant >> shift, rem = mant & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (hm & 1))) hm++;
+        return (uint16_t)(sign | hm);
+    }
+    uint32_t hm = mant >> 13, rem = mant & 0x1fff;
+    uint32_t h = sign | ((uint32_t)exp << 10) | hm;
+    if (rem > 0x1000 || (rem == 0x1000 && (hm & 1))) h++;  /* may carry into exp: correct */
+    return (uint16_t)h;
+}
+
+static float h2f(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16, exp = (h >> 10) & 0x1f, mant = h & 0x3ff, x;
+    if (exp == 0x1f) x = sign | 0x7f800000 | (mant << 13);
+    else if (exp == 0) {
+        if (mant == 0) x = sign;
+        else {                                             /* subnormal half -> normal float */
+            int e = -1;
+            do { e++; mant <<= 1; } while (!(mant & 0x400));
+            x = sign | ((uint32_t)(127 - 15 - e) << 23) | ((mant & 0x3ff) << 13);
+        }
+    } else x = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    float f; memcpy(&f, &x, 4); return f;
+}
+
+static Ocerz128 mem_read16(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, int off)
+{
+    X86Operand t = *op; t.disp += off; t.size = 16;
+    return ocerz_read_op128(cpu, insn, &t);
+}
+static void mem_write16(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, int off, Ocerz128 v)
+{
+    X86Operand t = *op; t.disp += off; t.size = 16;
+    ocerz_write_op128(cpu, insn, &t, v);
+}
+/* 256-bit source: {low, high} from a register pair or 32 bytes of memory */
+static void read256(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, vec *lo, vec *hi)
+{
+    if (op->kind == OCERZ_OPK_XMM) { *lo = vec_of(cpu->xmm[op->reg]); *hi = vec_of(cpu->ymmh[op->reg]); }
+    else { *lo = vec_of(mem_read16(cpu, insn, op, 0)); *hi = vec_of(mem_read16(cpu, insn, op, 16)); }
+}
+static void write_ymm(OcerzCPU *cpu, int reg, vec lo, vec hi) { cpu->xmm[reg] = lo.q; cpu->ymmh[reg] = hi.q; }
+static void write_xmm_zero_hi(OcerzCPU *cpu, int reg, vec v) { cpu->xmm[reg] = v.q; cpu->ymmh[reg].lo = cpu->ymmh[reg].hi = 0; }
+
+static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn)
+{
+    const X86Operand *d = &insn->ops[0];
+    const X86Operand *s = &insn->ops[1];
+    int L = (insn->vex & OCERZ_VEX_L) != 0;
+    vec r, lo, hi;
+    memset(&r, 0, sizeof r);
+    switch (insn->op) {
+    case OP(OCERZ_OP_VBROADCASTSS): {
+        uint32_t v = s->kind == OCERZ_OPK_XMM ? (uint32_t)cpu->xmm[s->reg].lo : (uint32_t)ocerz_ld(ocerz_ea(cpu, insn, s), 4);
+        for (int i = 0; i < 4; i++) r.u32[i] = v;
+        if (L) write_ymm(cpu, d->reg, r, r); else write_xmm_zero_hi(cpu, d->reg, r);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VBROADCASTSD): {
+        uint64_t v = s->kind == OCERZ_OPK_XMM ? cpu->xmm[s->reg].lo : ocerz_ld(ocerz_ea(cpu, insn, s), 8);
+        r.u64[0] = r.u64[1] = v;
+        if (L) write_ymm(cpu, d->reg, r, r); else write_xmm_zero_hi(cpu, d->reg, r);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VBROADCASTF128): {
+        r = vec_of(mem_read16(cpu, insn, s, 0));
+        write_ymm(cpu, d->reg, r, r);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPERMILPS): case OP(OCERZ_OP_VPERMILPD): {
+        int pd = insn->op == OCERZ_OP_VPERMILPD;
+        int immform = insn->ops[2].kind == OCERZ_OPK_IMM;
+        vec dlo, dhi, clo, chi;
+        if (immform) { read256(cpu, insn, s, &dlo, &dhi); memset(&clo, 0, sizeof clo); chi = clo; }
+        else { dlo = vec_of(cpu->xmm[insn->vvvv]); dhi = vec_of(cpu->ymmh[insn->vvvv]); read256(cpu, insn, s, &clo, &chi); }
+        unsigned imm = immform ? (unsigned)insn->ops[2].imm : 0;
+        for (int lane = 0; lane < (L ? 2 : 1); lane++) {
+            vec dd = lane ? dhi : dlo, cc = lane ? chi : clo, rr;
+            if (pd) {
+                for (int i = 0; i < 2; i++) {
+                    int sel = immform ? (int)((imm >> (lane * 2 + i)) & 1) : (int)((cc.u64[i] >> 1) & 1);
+                    rr.d[i] = dd.d[sel];
+                }
+            } else {
+                for (int i = 0; i < 4; i++) {
+                    int sel = immform ? (int)((imm >> (2 * i)) & 3) : (int)(cc.u32[i] & 3);
+                    rr.f[i] = dd.f[sel];
+                }
+            }
+            if (lane) hi = rr; else lo = rr;
+        }
+        if (L) write_ymm(cpu, d->reg, lo, hi); else write_xmm_zero_hi(cpu, d->reg, lo);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VTESTPS): case OP(OCERZ_OP_VTESTPD): {
+        vec alo = vec_of(cpu->xmm[d->reg]), ahi = vec_of(cpu->ymmh[d->reg]), blo, bhi;
+        read256(cpu, insn, s, &blo, &bhi);
+        uint64_t m = insn->op == OCERZ_OP_VTESTPS ? 0x8000000080000000ull : 0x8000000000000000ull;
+        uint64_t and_ = ((alo.u64[0] & blo.u64[0]) | (alo.u64[1] & blo.u64[1])) & m;
+        uint64_t andn = ((~alo.u64[0] & blo.u64[0]) | (~alo.u64[1] & blo.u64[1])) & m;
+        if (L) {
+            and_ |= ((ahi.u64[0] & bhi.u64[0]) | (ahi.u64[1] & bhi.u64[1])) & m;
+            andn |= ((~ahi.u64[0] & bhi.u64[0]) | (~ahi.u64[1] & bhi.u64[1])) & m;
+        }
+        ocerz_flag_assign(cpu, OCERZ_ZF, and_ == 0);
+        ocerz_flag_assign(cpu, OCERZ_CF, andn == 0);
+        ocerz_flag_assign(cpu, OCERZ_PF, 0);
+        ocerz_flag_assign(cpu, OCERZ_AF, 0);
+        ocerz_flag_assign(cpu, OCERZ_SF, 0);
+        ocerz_flag_assign(cpu, OCERZ_OF, 0);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VCVTPH2PS): {
+        vec b;
+        if (s->kind == OCERZ_OPK_XMM) b = vec_of(cpu->xmm[s->reg]);
+        else { b.q.lo = ocerz_ld(ocerz_ea(cpu, insn, s), 8); b.q.hi = L ? ocerz_ld(ocerz_ea(cpu, insn, s) + 8, 8) : 0; }
+        for (int i = 0; i < 4; i++) lo.f[i] = h2f(b.u16[i]);
+        if (L) { for (int i = 0; i < 4; i++) hi.f[i] = h2f(b.u16[4 + i]); write_ymm(cpu, d->reg, lo, hi); }
+        else write_xmm_zero_hi(cpu, d->reg, lo);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VCVTPS2PH): {
+        /* ops[0] = xmm or memory destination, ops[1] = source register */
+        vec alo = vec_of(cpu->xmm[s->reg]), ahi = vec_of(cpu->ymmh[s->reg]);
+        for (int i = 0; i < 4; i++) r.u16[i] = f2h(alo.f[i]);
+        if (L) for (int i = 0; i < 4; i++) r.u16[4 + i] = f2h(ahi.f[i]);
+        if (d->kind == OCERZ_OPK_XMM) write_xmm_zero_hi(cpu, d->reg, r);
+        else { ocerz_st(ocerz_ea(cpu, insn, d), 8, r.q.lo); if (L) ocerz_st(ocerz_ea(cpu, insn, d) + 8, 8, r.q.hi); }
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VINSERTF128): {
+        vec base_lo = vec_of(cpu->xmm[insn->vvvv]), base_hi = vec_of(cpu->ymmh[insn->vvvv]);
+        vec ins = vec_of(s->kind == OCERZ_OPK_XMM ? cpu->xmm[s->reg] : mem_read16(cpu, insn, s, 0));
+        if (insn->ops[2].imm & 1) base_hi = ins; else base_lo = ins;
+        write_ymm(cpu, d->reg, base_lo, base_hi);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VEXTRACTF128): {
+        /* ops[0] = xmm/m128 destination, ops[1] = ymm source */
+        vec v = vec_of((insn->ops[2].imm & 1) ? cpu->ymmh[s->reg] : cpu->xmm[s->reg]);
+        if (d->kind == OCERZ_OPK_XMM) write_xmm_zero_hi(cpu, d->reg, v);
+        else mem_write16(cpu, insn, d, 0, v.q);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPERM2F128): {
+        vec s1lo = vec_of(cpu->xmm[insn->vvvv]), s1hi = vec_of(cpu->ymmh[insn->vvvv]), s2lo, s2hi;
+        read256(cpu, insn, s, &s2lo, &s2hi);
+        unsigned imm = (unsigned)insn->ops[2].imm;
+        vec pick[4] = { s1lo, s1hi, s2lo, s2hi };
+        lo = pick[imm & 3]; hi = pick[(imm >> 4) & 3];
+        if (imm & 0x08) memset(&lo, 0, sizeof lo);
+        if (imm & 0x80) memset(&hi, 0, sizeof hi);
+        write_ymm(cpu, d->reg, lo, hi);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VZEROUPPER):
+        memset(cpu->ymmh, 0, sizeof cpu->ymmh);
+        return OCERZ_STEP_OK;
+    case OP(OCERZ_OP_VZEROALL):
+        memset(cpu->ymmh, 0, sizeof cpu->ymmh);
+        memset(cpu->xmm, 0, sizeof cpu->xmm);
+        return OCERZ_STEP_OK;
+    default:
         return OCERZ_EUNSUP;
     }
+}
+
+/* VEX.256 forms of legacy ops whose result does not stay within 128-bit lanes */
+static int do_avx256_cross(OcerzCPU *cpu, const X86Insn *insn)
+{
+    const X86Operand *d = &insn->ops[0];
+    const X86Operand *s = &insn->ops[1];
+    vec lo, hi, r;
+    memset(&r, 0, sizeof r);
+    switch (insn->op) {
+    case OP(OCERZ_OP_CVTPD2PS): case OP(OCERZ_OP_CVTPD2DQ): case OP(OCERZ_OP_CVTTPD2DQ): {
+        read256(cpu, insn, s, &lo, &hi);
+        double v[4] = { lo.d[0], lo.d[1], hi.d[0], hi.d[1] };
+        for (int i = 0; i < 4; i++) {
+            if (insn->op == OCERZ_OP_CVTPD2PS) r.f[i] = (float)v[i];
+            else r.i32[i] = cvt_d2i32(v[i], insn->op == OCERZ_OP_CVTTPD2DQ);
+        }
+        write_xmm_zero_hi(cpu, d->reg, r);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_CVTPS2PD): case OP(OCERZ_OP_CVTDQ2PD): {
+        vec b = vec_of(s->kind == OCERZ_OPK_XMM ? cpu->xmm[s->reg] : mem_read16(cpu, insn, s, 0));
+        vec rl, rh;
+        for (int i = 0; i < 2; i++) {
+            rl.d[i] = insn->op == OCERZ_OP_CVTPS2PD ? (double)b.f[i] : (double)b.i32[i];
+            rh.d[i] = insn->op == OCERZ_OP_CVTPS2PD ? (double)b.f[2 + i] : (double)b.i32[2 + i];
+        }
+        write_ymm(cpu, d->reg, rl, rh);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_MOVMSKPS): case OP(OCERZ_OP_MOVMSKPD): case OP(OCERZ_OP_PMOVMSKB): {
+        vec a = vec_of(cpu->xmm[s->reg]), b = vec_of(cpu->ymmh[s->reg]);
+        uint64_t m = 0;
+        if (insn->op == OCERZ_OP_MOVMSKPS) { for (int i = 0; i < 4; i++) { m |= (uint64_t)(a.u32[i] >> 31) << i; m |= (uint64_t)(b.u32[i] >> 31) << (4 + i); } }
+        else if (insn->op == OCERZ_OP_MOVMSKPD) { for (int i = 0; i < 2; i++) { m |= (a.u64[i] >> 63) << i; m |= (b.u64[i] >> 63) << (2 + i); } }
+        else { for (int i = 0; i < 16; i++) { m |= (uint64_t)(a.u8[i] >> 7) << i; m |= (uint64_t)(b.u8[i] >> 7) << (16 + i); } }
+        ocerz_write_op(cpu, insn, d, m);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_PTEST): {
+        vec alo = vec_of(cpu->xmm[d->reg]), ahi = vec_of(cpu->ymmh[d->reg]), blo, bhi;
+        read256(cpu, insn, s, &blo, &bhi);
+        int zf = ((alo.u64[0] & blo.u64[0]) | (alo.u64[1] & blo.u64[1]) | (ahi.u64[0] & bhi.u64[0]) | (ahi.u64[1] & bhi.u64[1])) == 0;
+        int cf = ((~alo.u64[0] & blo.u64[0]) | (~alo.u64[1] & blo.u64[1]) | (~ahi.u64[0] & bhi.u64[0]) | (~ahi.u64[1] & bhi.u64[1])) == 0;
+        ocerz_flag_assign(cpu, OCERZ_ZF, zf); ocerz_flag_assign(cpu, OCERZ_CF, cf);
+        ocerz_flag_assign(cpu, OCERZ_PF, 0); ocerz_flag_assign(cpu, OCERZ_AF, 0);
+        ocerz_flag_assign(cpu, OCERZ_SF, 0); ocerz_flag_assign(cpu, OCERZ_OF, 0);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_PMOVZXBW): case OP(OCERZ_OP_PMOVZXBD): case OP(OCERZ_OP_PMOVZXBQ):
+    case OP(OCERZ_OP_PMOVZXWD): case OP(OCERZ_OP_PMOVZXWQ): case OP(OCERZ_OP_PMOVZXDQ):
+    case OP(OCERZ_OP_PMOVSXBW): case OP(OCERZ_OP_PMOVSXBD): case OP(OCERZ_OP_PMOVSXBQ):
+    case OP(OCERZ_OP_PMOVSXWD): case OP(OCERZ_OP_PMOVSXWQ): case OP(OCERZ_OP_PMOVSXDQ): {
+        int in, out, sgn;
+        switch (insn->op) {
+        case OCERZ_OP_PMOVZXBW: in = 1; out = 2; sgn = 0; break;  case OCERZ_OP_PMOVSXBW: in = 1; out = 2; sgn = 1; break;
+        case OCERZ_OP_PMOVZXBD: in = 1; out = 4; sgn = 0; break;  case OCERZ_OP_PMOVSXBD: in = 1; out = 4; sgn = 1; break;
+        case OCERZ_OP_PMOVZXBQ: in = 1; out = 8; sgn = 0; break;  case OCERZ_OP_PMOVSXBQ: in = 1; out = 8; sgn = 1; break;
+        case OCERZ_OP_PMOVZXWD: in = 2; out = 4; sgn = 0; break;  case OCERZ_OP_PMOVSXWD: in = 2; out = 4; sgn = 1; break;
+        case OCERZ_OP_PMOVZXWQ: in = 2; out = 8; sgn = 0; break;  case OCERZ_OP_PMOVSXWQ: in = 2; out = 8; sgn = 1; break;
+        default:                in = 4; out = 8; sgn = insn->op == OCERZ_OP_PMOVSXDQ; break;
+        }
+        int n = 32 / out;                                  /* elements in the ymm result */
+        int srcbytes = n * in;                             /* 16 / (out/in) * 2 */
+        vec b;
+        if (s->kind == OCERZ_OPK_XMM) b = vec_of(cpu->xmm[s->reg]);
+        else { b.q.lo = ocerz_ld(ocerz_ea(cpu, insn, s), srcbytes > 8 ? 8 : srcbytes); b.q.hi = srcbytes > 8 ? ocerz_ld(ocerz_ea(cpu, insn, s) + 8, srcbytes - 8) : 0; }
+        uint8_t outb[32]; memset(outb, 0, sizeof outb);
+        for (int i = 0; i < n; i++) {
+            int64_t v = 0;
+            if (in == 1) v = sgn ? (int64_t)b.i8[i] : (int64_t)b.u8[i];
+            else if (in == 2) v = sgn ? (int64_t)b.i16[i] : (int64_t)b.u16[i];
+            else v = sgn ? (int64_t)b.i32[i] : (int64_t)b.u32[i];
+            memcpy(outb + i * out, &v, (size_t)out);
+        }
+        memcpy(&lo, outb, 16); memcpy(&hi, outb + 16, 16);
+        write_ymm(cpu, d->reg, lo, hi);
+        return OCERZ_STEP_OK;
+    }
+    default:
+        return OCERZ_EUNSUP;
+    }
+}
+
+static int vex_writes_xmm_dst(const X86Insn *insn)
+{
+    if (insn->ops[0].kind != OCERZ_OPK_XMM) return 0;
+    switch (insn->op) {
+    case OCERZ_OP_COMISS: case OCERZ_OP_COMISD: case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD:
+    case OCERZ_OP_PTEST: case OCERZ_OP_VTESTPS: case OCERZ_OP_VTESTPD:
+        return 0;                                          /* ops[0] is a source, only flags change */
+    default:
+        return 1;
+    }
+}
+
+static int vex_is_shift(int op)
+{
+    switch (op) {
+    case OCERZ_OP_PSLLW: case OCERZ_OP_PSLLD: case OCERZ_OP_PSLLQ:
+    case OCERZ_OP_PSRLW: case OCERZ_OP_PSRLD: case OCERZ_OP_PSRLQ:
+    case OCERZ_OP_PSRAW: case OCERZ_OP_PSRAD: case OCERZ_OP_PSLLDQ: case OCERZ_OP_PSRLDQ:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
+{
+    if (!insn->vex)
+        return sse_exec(vm, cpu, insn);
+    switch (insn->op) {
+    case OCERZ_OP_VBROADCASTSS: case OCERZ_OP_VBROADCASTSD: case OCERZ_OP_VBROADCASTF128:
+    case OCERZ_OP_VPERMILPS: case OCERZ_OP_VPERMILPD: case OCERZ_OP_VTESTPS: case OCERZ_OP_VTESTPD:
+    case OCERZ_OP_VCVTPH2PS: case OCERZ_OP_VCVTPS2PH: case OCERZ_OP_VINSERTF128: case OCERZ_OP_VEXTRACTF128:
+    case OCERZ_OP_VPERM2F128: case OCERZ_OP_VZEROUPPER: case OCERZ_OP_VZEROALL:
+        return do_avx_only(cpu, insn);
+    default:
+        break;
+    }
+    if (!(insn->vex & OCERZ_VEX_L)) {
+        int rc = sse_exec(vm, cpu, insn);
+        if (rc != OCERZ_STEP_OK) return rc;
+        if (vex_writes_xmm_dst(insn)) { cpu->ymmh[insn->ops[0].reg].lo = 0; cpu->ymmh[insn->ops[0].reg].hi = 0; }
+        return OCERZ_STEP_OK;
+    }
+    switch (insn->op) {
+    case OCERZ_OP_CVTPD2PS: case OCERZ_OP_CVTPD2DQ: case OCERZ_OP_CVTTPD2DQ:
+    case OCERZ_OP_CVTPS2PD: case OCERZ_OP_CVTDQ2PD:
+    case OCERZ_OP_MOVMSKPS: case OCERZ_OP_MOVMSKPD: case OCERZ_OP_PMOVMSKB: case OCERZ_OP_PTEST:
+    case OCERZ_OP_PMOVZXBW: case OCERZ_OP_PMOVZXBD: case OCERZ_OP_PMOVZXBQ:
+    case OCERZ_OP_PMOVZXWD: case OCERZ_OP_PMOVZXWQ: case OCERZ_OP_PMOVZXDQ:
+    case OCERZ_OP_PMOVSXBW: case OCERZ_OP_PMOVSXBD: case OCERZ_OP_PMOVSXBQ:
+    case OCERZ_OP_PMOVSXWD: case OCERZ_OP_PMOVSXWQ: case OCERZ_OP_PMOVSXDQ:
+        return do_avx256_cross(cpu, insn);
+    default:
+        break;
+    }
+    /* in-lane 256-bit op: low halves first, then the same op on the upper halves */
+    int rc = sse_exec(vm, cpu, insn);
+    if (rc != OCERZ_STEP_OK) return rc;
+    X86Insn hi = *insn;
+    int regs[5], nregs = 0;
+    int shift = vex_is_shift(insn->op);
+    for (int i = 0; i < insn->nops; i++) {
+        if (shift && i == 1) continue;                     /* the count operand is not per-lane */
+        if (insn->ops[i].kind == OCERZ_OPK_XMM) {
+            int r = insn->ops[i].reg, dup = 0;
+            for (int k = 0; k < nregs; k++) if (regs[k] == r) dup = 1;
+            if (!dup) regs[nregs++] = r;
+        } else if (insn->ops[i].kind == OCERZ_OPK_MEM) {
+            hi.ops[i].disp += 16;
+        }
+    }
+    if (insn->vex & OCERZ_VEX_NDS) {
+        int r = insn->vvvv, dup = 0;
+        for (int k = 0; k < nregs; k++) if (regs[k] == r) dup = 1;
+        if (!dup) regs[nregs++] = r;
+    }
+    /* per-lane immediates */
+    if (insn->op == OCERZ_OP_BLENDPS) hi.ops[2].imm = (insn->ops[2].imm >> 4) & 0xf;
+    else if (insn->op == OCERZ_OP_BLENDPD) hi.ops[2].imm = (insn->ops[2].imm >> 2) & 0x3;
+    for (int k = 0; k < nregs; k++) { Ocerz128 t = cpu->xmm[regs[k]]; cpu->xmm[regs[k]] = cpu->ymmh[regs[k]]; cpu->ymmh[regs[k]] = t; }
+    rc = sse_exec(vm, cpu, &hi);
+    for (int k = 0; k < nregs; k++) { Ocerz128 t = cpu->xmm[regs[k]]; cpu->xmm[regs[k]] = cpu->ymmh[regs[k]]; cpu->ymmh[regs[k]] = t; }
+    return rc;
 }
