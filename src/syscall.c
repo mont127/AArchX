@@ -3714,7 +3714,14 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
 
     {   /* MSGLOG: wine server requests/replies are fixed 64-byte read/write */
         static int wrlog = -1;
-        if (wrlog < 0) wrlog = getenv("OCERZ_MSGLOG") ? 1 : 0;
+        if (wrlog < 0) {
+            wrlog = getenv("OCERZ_MSGLOG") ? 1 : 0;
+            const char *fx = getenv("OCERZ_MSGLOG_EXE");   /* only processes whose cmdline contains this */
+            if (wrlog && fx && *fx) {
+                extern char ocerz_cmdline_summary[];
+                wrlog = strstr(ocerz_cmdline_summary, fx) != NULL;
+            }
+        }
         if (wrlog && (num == 3 || num == 4 || num == 396 || num == 397) && a[2] == 64 && a[1]) {
             fprintf(stderr, "ocerz: %s64[%d] cpu#%u fd=%d req=%#x ic=%#llx\n",
                     (num == 4 || num == 397) ? "WR" : "RD", (int)getpid(),
@@ -3797,6 +3804,38 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
         fprintf(stderr, "\n");
     }
+    {   /* OCERZ_SOCKLOG: connect/bind/socket/setsockopt with the sockaddr
+         * decoded, plus the result - to see whether a loopback WebSocket
+         * actually reaches the host and what it gets back. */
+        static int socklog = -1;
+        if (socklog < 0) {
+            socklog = getenv("OCERZ_SOCKLOG") ? 1 : 0;
+            const char *fx = getenv("OCERZ_SOCKLOG_EXE");
+            if (socklog && fx && *fx) {
+                extern char ocerz_cmdline_summary[];
+                socklog = strstr(ocerz_cmdline_summary, fx) != NULL;
+            }
+        }
+        if (socklog && (num == 97 || num == 98 || num == 104 || num == 105 || num == 30 || num == 106)) {
+            char ab[160]; ab[0] = 0;
+            if ((num == 98 || num == 104) && a[1] && ocerz_addr_readable(a[1] + 1)) {
+                uint8_t fam = (uint8_t)ocerz_ld(a[1] + 1, 1);   /* macOS sockaddr: [0]=len [1]=family */
+                if (fam == 2 && ocerz_addr_readable(a[1] + 7)) {           /* AF_INET */
+                    uint16_t port = (uint16_t)((ocerz_ld(a[1]+2,1)<<8)|ocerz_ld(a[1]+3,1));
+                    uint32_t ip = (uint32_t)ocerz_ld(a[1]+4,4);
+                    snprintf(ab, sizeof ab, " AF_INET %u.%u.%u.%u:%u", ip&0xff,(ip>>8)&0xff,(ip>>16)&0xff,(ip>>24)&0xff, port);
+                } else if (fam == 30 && ocerz_addr_readable(a[1] + 7)) {   /* AF_INET6 */
+                    uint16_t port = (uint16_t)((ocerz_ld(a[1]+2,1)<<8)|ocerz_ld(a[1]+3,1));
+                    snprintf(ab, sizeof ab, " AF_INET6 [..]:%u", port);
+                } else if (fam == 1) {                                     /* AF_UNIX */
+                    snprintf(ab, sizeof ab, " AF_UNIX");
+                } else snprintf(ab, sizeof ab, " fam=%u", fam);
+            }
+            const char *nm = num==97?"socket":num==98?"connect":num==104?"bind":num==105?"setsockopt":num==30?"accept":"listen";
+            fprintf(stderr, "ocerz: SOCK[%d] %s fd=%d a1=%#llx a2=%#llx%s len=%#llx\n",
+                    (int)getpid(), nm, (int)a[0], (unsigned long long)a[1], (unsigned long long)a[2], ab, (unsigned long long)a[2]);
+        }
+    }
     static int reqlog = -1;
     if (reqlog < 0) reqlog = getenv("OCERZ_REQLOG") != NULL ? 1 : 0;
     int rtrack = reqlog && (num == 4 || num == 121) &&
@@ -3808,6 +3847,21 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     if (err && r == EFAULT && efault_disarm_retry(cpu, num))
         r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
+    {
+        static int socklog = -1;
+        if (socklog < 0) {
+            socklog = getenv("OCERZ_SOCKLOG") ? 1 : 0;
+            const char *fx = getenv("OCERZ_SOCKLOG_EXE");
+            if (socklog && fx && *fx) {
+                extern char ocerz_cmdline_summary[];
+                socklog = strstr(ocerz_cmdline_summary, fx) != NULL;
+            }
+        }
+        if (socklog && (num == 97 || num == 98 || num == 104 || num == 105 || num == 30 || num == 106))
+            fprintf(stderr, "ocerz: SOCK[%d]  -> %s ret=%#llx err=%d\n", (int)getpid(),
+                    num==97?"socket":num==98?"connect":num==104?"bind":num==105?"setsockopt":num==30?"accept":"listen",
+                    (unsigned long long)r, err ? (int)r : 0);
+    }
 
     /* OCERZ_SYSFAIL: ENOMEM and EFAULT are the two errnos a guest almost
      * never earns honestly - they are what a missing pointer translation or
