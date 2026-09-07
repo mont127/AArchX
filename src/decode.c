@@ -26,6 +26,10 @@ typedef struct DecState {
     int rex_b;
     int mode32;   /* 0: 64-bit long mode.  1: i386 compatibility mode. */
     int addr16;   /* resolved 16-bit addressing (32-bit mode + 0x67 only) */
+    int vex;      /* VEX prefix seen: vex_l/vex_w/vex_vvvv valid */
+    int vex_l;
+    int vex_w;
+    int vex_vvvv;
     X86Insn *out;
 } DecState;
 
@@ -580,6 +584,165 @@ static int decode_x87(DecState *s, uint8_t op);
 
 static int decode_one_byte(DecState *s, uint8_t op);
 
+
+/* AVX: the VEX prefix (C5 = 2-byte, C4 = 3-byte) carries REX-like R/X/B/W,
+ * the opcode map (0F, 0F38, 0F3A), the mandatory prefix (none/66/F3/F2), the
+ * vector length L and an extra register vvvv.  It is decoded onto the legacy
+ * SSE opcode maps and the result is tagged (X86Insn.vex/vvvv): the interpreter
+ * applies the AVX semantics (non-destructive first source, upper zeroing,
+ * 256-bit forms) and the JIT declines every VEX instruction. */
+static int vex_finish(DecState *s);
+
+static int decode_vex(DecState *s, uint8_t op)
+{
+    uint8_t p1, p2;
+    int e = fetch8(s, &p1);
+    if (e)
+        return e;
+    int map = 1, w = 0;
+    if (op == 0xc4) {
+        e = fetch8(s, &p2);
+        if (e)
+            return e;
+        s->rex_r = !((p1 >> 7) & 1);
+        s->rex_x = !((p1 >> 6) & 1);
+        s->rex_b = !((p1 >> 5) & 1);
+        map = p1 & 0x1f;
+        w = (p2 >> 7) & 1;
+    } else {
+        s->rex_r = !((p1 >> 7) & 1);
+        s->rex_x = 0;
+        s->rex_b = 0;
+        p2 = p1;
+    }
+    s->rex_present = 1;
+    s->rex_w = w;
+    s->vex = 1;
+    s->vex_w = w;
+    s->vex_l = (p2 >> 2) & 1;
+    s->vex_vvvv = (~p2 >> 3) & 0xf;
+    int pp = p2 & 3;
+    s->mand = pp == 0 ? MAND_NONE : pp == 1 ? MAND_66 : pp == 2 ? MAND_F3 : MAND_F2;
+    s->has_66 = (pp == 1);
+    s->rep = pp == 2 ? OCERZ_REP_REP : pp == 3 ? OCERZ_REP_REPNE : OCERZ_REP_NONE;
+    int r;
+    if (map == 1) {
+        uint8_t op2;
+        e = fetch8(s, &op2);
+        if (e)
+            return e;
+        r = decode_0f(s, op2);
+    } else if (map == 2) {
+        r = decode_0f38(s);
+    } else if (map == 3) {
+        r = decode_0f3a(s);
+    } else {
+        return OCERZ_EUNDEF;
+    }
+    if (r != OCERZ_OK)
+        return r;
+    return vex_finish(s);
+}
+
+static int vex_finish(DecState *s)
+{
+    X86Insn *o = s->out;
+    o->vex = (uint8_t)(OCERZ_VEX_PRESENT | (s->vex_l ? OCERZ_VEX_L : 0) | (s->vex_w ? OCERZ_VEX_W : 0));
+    o->vvvv = (uint8_t)s->vex_vvvv;
+    switch (o->op) {
+    /* three-operand forms: dst = op(vvvv, rm) */
+    case OCERZ_OP_ADDPS: case OCERZ_OP_ADDPD: case OCERZ_OP_ADDSS: case OCERZ_OP_ADDSD:
+    case OCERZ_OP_SUBPS: case OCERZ_OP_SUBPD: case OCERZ_OP_SUBSS: case OCERZ_OP_SUBSD:
+    case OCERZ_OP_MULPS: case OCERZ_OP_MULPD: case OCERZ_OP_MULSS: case OCERZ_OP_MULSD:
+    case OCERZ_OP_DIVPS: case OCERZ_OP_DIVPD: case OCERZ_OP_DIVSS: case OCERZ_OP_DIVSD:
+    case OCERZ_OP_MINPS: case OCERZ_OP_MINPD: case OCERZ_OP_MINSS: case OCERZ_OP_MINSD:
+    case OCERZ_OP_MAXPS: case OCERZ_OP_MAXPD: case OCERZ_OP_MAXSS: case OCERZ_OP_MAXSD:
+    case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_RSQRTSS: case OCERZ_OP_RCPSS:
+    case OCERZ_OP_HADDPS: case OCERZ_OP_HADDPD: case OCERZ_OP_HSUBPS: case OCERZ_OP_HSUBPD:
+    case OCERZ_OP_ADDSUBPS: case OCERZ_OP_ADDSUBPD:
+    case OCERZ_OP_ANDPS: case OCERZ_OP_ANDNPS: case OCERZ_OP_ORPS: case OCERZ_OP_XORPS:
+    case OCERZ_OP_PAND: case OCERZ_OP_PANDN: case OCERZ_OP_POR: case OCERZ_OP_PXOR:
+    case OCERZ_OP_CMPPS: case OCERZ_OP_CMPPD: case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX:
+    case OCERZ_OP_PCMPEQB: case OCERZ_OP_PCMPEQW: case OCERZ_OP_PCMPEQD: case OCERZ_OP_PCMPEQQ:
+    case OCERZ_OP_PCMPGTB: case OCERZ_OP_PCMPGTW: case OCERZ_OP_PCMPGTD: case OCERZ_OP_PCMPGTQ:
+    case OCERZ_OP_CVTSI2SS: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTSD2SS:
+    case OCERZ_OP_PADDB: case OCERZ_OP_PADDW: case OCERZ_OP_PADDD: case OCERZ_OP_PADDQ:
+    case OCERZ_OP_PSUBB: case OCERZ_OP_PSUBW: case OCERZ_OP_PSUBD: case OCERZ_OP_PSUBQ:
+    case OCERZ_OP_PADDSB: case OCERZ_OP_PADDSW: case OCERZ_OP_PADDUSB: case OCERZ_OP_PADDUSW:
+    case OCERZ_OP_PSUBSB: case OCERZ_OP_PSUBSW: case OCERZ_OP_PSUBUSB: case OCERZ_OP_PSUBUSW:
+    case OCERZ_OP_PMULLW: case OCERZ_OP_PMULLD: case OCERZ_OP_PMULHW: case OCERZ_OP_PMULHUW:
+    case OCERZ_OP_PMULUDQ: case OCERZ_OP_PMULDQ: case OCERZ_OP_PMADDWD: case OCERZ_OP_PAVGB: case OCERZ_OP_PAVGW:
+    case OCERZ_OP_PMAXUB: case OCERZ_OP_PMAXSW: case OCERZ_OP_PMINUB: case OCERZ_OP_PMINSW:
+    case OCERZ_OP_PMAXSB: case OCERZ_OP_PMAXSD: case OCERZ_OP_PMAXUW: case OCERZ_OP_PMAXUD:
+    case OCERZ_OP_PMINSB: case OCERZ_OP_PMINSD: case OCERZ_OP_PMINUW: case OCERZ_OP_PMINUD:
+    case OCERZ_OP_PSADBW: case OCERZ_OP_PHADDW: case OCERZ_OP_PHADDD: case OCERZ_OP_PHADDSW:
+    case OCERZ_OP_PHSUBW: case OCERZ_OP_PHSUBD: case OCERZ_OP_PHSUBSW:
+    case OCERZ_OP_PSIGNB: case OCERZ_OP_PSIGNW: case OCERZ_OP_PSIGND:
+    case OCERZ_OP_PMADDUBSW: case OCERZ_OP_PMULHRSW:
+    case OCERZ_OP_PACKSSWB: case OCERZ_OP_PACKSSDW: case OCERZ_OP_PACKUSWB: case OCERZ_OP_PACKUSDW:
+    case OCERZ_OP_PUNPCKLBW: case OCERZ_OP_PUNPCKLWD: case OCERZ_OP_PUNPCKLDQ: case OCERZ_OP_PUNPCKLQDQ:
+    case OCERZ_OP_PUNPCKHBW: case OCERZ_OP_PUNPCKHWD: case OCERZ_OP_PUNPCKHDQ: case OCERZ_OP_PUNPCKHQDQ:
+    case OCERZ_OP_PSHUFB: case OCERZ_OP_PALIGNR: case OCERZ_OP_SHUFPS: case OCERZ_OP_SHUFPD:
+    case OCERZ_OP_UNPCKLPS: case OCERZ_OP_UNPCKHPS: case OCERZ_OP_UNPCKLPD: case OCERZ_OP_UNPCKHPD:
+    case OCERZ_OP_PINSRB: case OCERZ_OP_PINSRW: case OCERZ_OP_PINSRD: case OCERZ_OP_PINSRQ: case OCERZ_OP_INSERTPS:
+    case OCERZ_OP_PBLENDW: case OCERZ_OP_BLENDPS: case OCERZ_OP_BLENDPD:
+    case OCERZ_OP_ROUNDSS: case OCERZ_OP_ROUNDSD: case OCERZ_OP_DPPS: case OCERZ_OP_DPPD: case OCERZ_OP_MPSADBW:
+    case OCERZ_OP_PCLMULQDQ: case OCERZ_OP_AESENC: case OCERZ_OP_AESENCLAST: case OCERZ_OP_AESDEC: case OCERZ_OP_AESDECLAST:
+    case OCERZ_OP_MOVLHPS: case OCERZ_OP_MOVHLPS:
+    case OCERZ_OP_VINSERTF128: case OCERZ_OP_VPERM2F128:
+        o->vex |= OCERZ_VEX_NDS;
+        break;
+    case OCERZ_OP_VPERMILPS: case OCERZ_OP_VPERMILPD:
+        if (o->ops[2].kind != OCERZ_OPK_IMM)      /* 0F38 form: control vector in rm, data in vvvv */
+            o->vex |= OCERZ_VEX_NDS;
+        break;
+    /* scalar/partial moves merge into vvvv only in their register form; the
+     * memory forms are plain loads/stores */
+    case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX:
+        if (o->ops[0].kind == OCERZ_OPK_XMM && o->ops[1].kind == OCERZ_OPK_XMM)
+            o->vex |= OCERZ_VEX_NDS;
+        break;
+    case OCERZ_OP_MOVLPS: case OCERZ_OP_MOVHPS:
+        if (o->ops[0].kind == OCERZ_OPK_XMM)
+            o->vex |= OCERZ_VEX_NDS;
+        break;
+    /* shifts: register/memory count is three-operand, an immediate count is
+     * the NDD form (vvvv is the destination, rm the source) */
+    case OCERZ_OP_PSLLW: case OCERZ_OP_PSLLD: case OCERZ_OP_PSLLQ:
+    case OCERZ_OP_PSRLW: case OCERZ_OP_PSRLD: case OCERZ_OP_PSRLQ:
+    case OCERZ_OP_PSRAW: case OCERZ_OP_PSRAD:
+    case OCERZ_OP_PSLLDQ: case OCERZ_OP_PSRLDQ:
+        if (o->ops[1].kind == OCERZ_OPK_IMM) {
+            o->ops[2] = o->ops[0];
+            set_xmm(&o->ops[0], s->vex_vvvv, 16);
+            o->nops = 3;
+            o->vex |= OCERZ_VEX_NDD;
+        } else {
+            o->vex |= OCERZ_VEX_NDS;
+        }
+        break;
+    case OCERZ_OP_BLENDVPS: case OCERZ_OP_BLENDVPD: case OCERZ_OP_PBLENDVB:
+        o->vex |= OCERZ_VEX_NDS | OCERZ_VEX_IS4;
+        break;
+    /* AVX-only two-operand forms with narrow memory sources */
+    case OCERZ_OP_VBROADCASTSS:
+        if (o->ops[1].kind == OCERZ_OPK_MEM) o->ops[1].size = 4;
+        break;
+    case OCERZ_OP_VBROADCASTSD:
+        if (o->ops[1].kind == OCERZ_OPK_MEM) o->ops[1].size = 8;
+        break;
+    case OCERZ_OP_VCVTPH2PS:
+        if (o->ops[1].kind == OCERZ_OPK_MEM) o->ops[1].size = (uint8_t)(s->vex_l ? 16 : 8);
+        break;
+    case OCERZ_OP_VCVTPS2PH:
+        if (o->ops[0].kind == OCERZ_OPK_MEM) o->ops[0].size = (uint8_t)(s->vex_l ? 16 : 8);
+        break;
+    default:
+        break;
+    }
+    return OCERZ_OK;
+}
+
 int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
                       X86Insn *out, int mode32)
 {
@@ -617,6 +780,10 @@ int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
     s.rex_r = 0;
     s.rex_x = 0;
     s.rex_b = 0;
+    s.vex = 0;
+    s.vex_l = 0;
+    s.vex_w = 0;
+    s.vex_vvvv = 0;
     s.out = out;
 
     memset(out, 0, sizeof(*out));
@@ -705,6 +872,8 @@ prefixes_done:
     int r;
     if (e) {
         r = e;
+    } else if (!s.mode32 && (op == 0xc4 || op == 0xc5)) {
+        r = decode_vex(&s, op);
     } else if (op == 0x0f) {
         uint8_t op2;
         e = fetch8(&s, &op2);
@@ -2268,7 +2437,7 @@ static int decode_0f(DecState *s, uint8_t op2)
     case 0x76:
         return decode_pint(s, OCERZ_OP_PCMPEQD, 1);
     case 0x77:
-        set_op(s, OCERZ_OP_EMMS);
+        set_op(s, s->vex ? (s->vex_l ? OCERZ_OP_VZEROALL : OCERZ_OP_VZEROUPPER) : OCERZ_OP_EMMS);
         s->out->nops = 0;
         return OCERZ_OK;
     case 0x7e: {
@@ -2803,6 +2972,15 @@ static int decode_0f38(DecState *s)
     case 0x09: op = OCERZ_OP_PSIGNW; break;
     case 0x0a: op = OCERZ_OP_PSIGND; break;
     case 0x0b: op = OCERZ_OP_PMULHRSW; break;
+    /* VEX-only (AVX): undefined without the VEX prefix */
+    case 0x0c: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VPERMILPS; break;
+    case 0x0d: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VPERMILPD; break;
+    case 0x0e: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VTESTPS; break;
+    case 0x0f: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VTESTPD; break;
+    case 0x13: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VCVTPH2PS; break;
+    case 0x18: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VBROADCASTSS; break;
+    case 0x19: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VBROADCASTSD; break;
+    case 0x1a: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VBROADCASTF128; break;
     case 0x10: op = OCERZ_OP_PBLENDVB; break;
     case 0x14: op = OCERZ_OP_BLENDVPS; break;
     case 0x15: op = OCERZ_OP_BLENDVPD; break;
@@ -2857,6 +3035,23 @@ static int decode_0f3a(DecState *s)
         return OCERZ_EUNDEF;
 
     switch (op3) {
+    /* VEX-only (AVX) */
+    case 0x04: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERMILPS);
+    case 0x05: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERMILPD);
+    case 0x06: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERM2F128);
+    case 0x18: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VINSERTF128);
+    case 0x19: if (!s->vex) return OCERZ_EUNDEF; return decode_sse_rri(s, OCERZ_OP_VEXTRACTF128, 16, 0);
+    case 0x1d: if (!s->vex) return OCERZ_EUNDEF; return decode_sse_rri(s, OCERZ_OP_VCVTPS2PH, 16, 0);
+    case 0x4a: case 0x4b: case 0x4c: {
+        if (!s->vex) return OCERZ_EUNDEF;
+        int bop = op3 == 0x4a ? OCERZ_OP_BLENDVPS : op3 == 0x4b ? OCERZ_OP_BLENDVPD : OCERZ_OP_PBLENDVB;
+        e = decode_pint_imm(s, bop);
+        if (e)
+            return e;
+        /* is4: the mask register lives in imm8[7:4] */
+        set_xmm(&s->out->ops[2], (int)((s->out->ops[2].imm >> 4) & 0xf), 16);
+        return OCERZ_OK;
+    }
     case 0x08:
         return decode_pint_imm(s, OCERZ_OP_ROUNDPS);
     case 0x09:
@@ -3616,6 +3811,20 @@ static void init_op_names(void)
     op_names[OCERZ_OP_PMINSD] = "pminsd";
     op_names[OCERZ_OP_PMINUW] = "pminuw";
     op_names[OCERZ_OP_PMINUD] = "pminud";
+    op_names[OCERZ_OP_VBROADCASTSS] = "vbroadcastss";
+    op_names[OCERZ_OP_VBROADCASTSD] = "vbroadcastsd";
+    op_names[OCERZ_OP_VBROADCASTF128] = "vbroadcastf128";
+    op_names[OCERZ_OP_VPERMILPS] = "vpermilps";
+    op_names[OCERZ_OP_VPERMILPD] = "vpermilpd";
+    op_names[OCERZ_OP_VTESTPS] = "vtestps";
+    op_names[OCERZ_OP_VTESTPD] = "vtestpd";
+    op_names[OCERZ_OP_VCVTPH2PS] = "vcvtph2ps";
+    op_names[OCERZ_OP_VCVTPS2PH] = "vcvtps2ph";
+    op_names[OCERZ_OP_VINSERTF128] = "vinsertf128";
+    op_names[OCERZ_OP_VEXTRACTF128] = "vextractf128";
+    op_names[OCERZ_OP_VPERM2F128] = "vperm2f128";
+    op_names[OCERZ_OP_VZEROUPPER] = "vzeroupper";
+    op_names[OCERZ_OP_VZEROALL] = "vzeroall";
     op_names[OCERZ_OP_PSADBW] = "psadbw";
     op_names[OCERZ_OP_PABSB] = "pabsb";
     op_names[OCERZ_OP_PABSW] = "pabsw";

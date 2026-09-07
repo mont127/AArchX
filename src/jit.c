@@ -3102,6 +3102,11 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
         return 0;
     int plain = mem_plain_access_ok(mem);
     X86Operand mview; mem = mem_hoist_view(mem, &mview);
+    /* With rsp promoted to a host pointer (JGB + rsp) an [rsp + reg] access
+     * must not also go through a hoisted JGB + reg base: that adds the guest
+     * base twice (seen as a wild store after AVX code split a loop). */
+    if (rsp_is_ptr() && (mem->base == OCERZ_RSP || mem->index == OCERZ_RSP))
+        return 0;
     int hbase = hoist_reg_for(mem->base);
     if (hbase < 0)
         return 0;
@@ -8303,6 +8308,7 @@ static int m32_inline_ok(const X86Insn *insn)
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
+    if (insn->vex) return 0;      /* AVX: the interpreter owns VEX-encoded instructions */
     if (insn->mode32 && !m32_inline_ok(insn))
         return 0;                        /* -> emit_slowcall, i.e. interpreted */
     if (insn->op == OCERZ_OP_NOP || insn->op == OCERZ_OP_PAUSE ||
@@ -11463,7 +11469,7 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
             count[bb]++;
             /* a scale-1 index is a base too ([b + i] == [i + b]) */
             if (mem->index != OCERZ_REG_NONE && (mem->scale & 3) == 0 && pin_slot(mem->index) >= 0 &&
-                !(rsp_is_ptr() && mem->index == OCERZ_RSP))
+                !(rsp_is_ptr() && (mem->index == OCERZ_RSP || mem->base == OCERZ_RSP)))
                 count[mem->index & 15]++;
             if (g_pin_class != 2 && mem->index != OCERZ_REG_NONE &&
                 mem->disp != 0 && mem->disp >= -4095 && mem->disp <= 4095 && aux[bb] == 0)
