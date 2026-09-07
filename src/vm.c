@@ -544,6 +544,18 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
     sigaction(sig, &sa, NULL);
 }
 
+
+/* Host address of a page the guest owns: the low/top windows, or (identity
+ * mode) a committed page of a registered region.  ocerz_host_in_guest_space
+ * caps identity addresses at ocerz_arena_hi, but wine maps most of its
+ * memory above that (0x6fff...), and V8's code pages live there: a write
+ * into an armed page up there must still reach the SMC path below, not the
+ * wild-fault path (which used to kill the thread). */
+static inline int host_addr_is_guest_page(const void *h)
+{
+    return ocerz_host_in_guest_space(h) || ocerz_addr_committed(ocerz_h2g(h)) == 1;
+}
+
 static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)sig; (void)si; (void)ctx;
@@ -1059,16 +1071,14 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         static __thread int retry_n;
         if (ec != 0x20 && ec != 0x21 && (esr & (1u << 6)) &&
             (ocerz_cache_write_fault((uintptr_t)si->si_addr) ||
-             (ocerz_host_in_guest_space(si->si_addr) &&
+             (host_addr_is_guest_page(si->si_addr) &&
               (armed_hit = ocerz_mem_exec_write_fault(ocerz_h2g(si->si_addr))) != 0 &&
               (armed_hit != 2 ||
                (retry_addr == (uint64_t)(uintptr_t)si->si_addr ? ++retry_n : (retry_n = 1, retry_addr = (uint64_t)(uintptr_t)si->si_addr, 1)) <= 4)))) {
             if (armed_hit != 2) retry_n = 0;
             struct OcerzVM *fvm = g_cur_cpu->vm;
             const void *hpc = (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
-            uint64_t page = (ocerz_host_in_guest_space(si->si_addr) ? ocerz_h2g(si->si_addr)
-                                                                     : (uint64_t)(uintptr_t)si->si_addr)
-                            & ~(OCERZ_HOST_PAGE_SIZE - 1);
+            uint64_t page = ocerz_h2g(si->si_addr) & ~(OCERZ_HOST_PAGE_SIZE - 1);
             uint64_t jrip = 0;
             int in_jit = fvm && ocerz_jit_pc_in_arena(fvm, hpc) &&
                          ocerz_jit_fault_rip(fvm, hpc, &jrip);
@@ -1099,7 +1109,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
      * test harness or a loader thread rewriting guest code it already ran):
      * unarm, drop the translations, retry the host store. */
     if ((sig == SIGSEGV || sig == SIGBUS) && !align_fault && depth == 0 && ctx &&
-        !(g_cur_cpu && g_sig_recover) && g_vm && ocerz_host_in_guest_space(si->si_addr)) {
+        !(g_cur_cpu && g_sig_recover) && g_vm && host_addr_is_guest_page(si->si_addr)) {
         const ucontext_t *uc = (const ucontext_t *)ctx;
         uint64_t esr = uc->uc_mcontext->__es.__esr;
         uint32_t ec = (uint32_t)((esr >> 26) & 0x3f);
@@ -1171,8 +1181,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 no_wine_teb = 1;
         }
         if (looping && no_wine_teb) {
-            if (g_sigtrace) {
-                char wb[160];
+            {
+                char wb[200];
                 char *w = wb;
                 w = str_into(w, "ocerz: gs0x320 WORKER-TERMINATE pid=");
                 w = hex_into(w, (uint64_t)getpid());
@@ -1494,16 +1504,86 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
 
     if (g_cur_cpu && g_sig_recover && depth == 0 &&
         !ocerz_host_in_guest_space(si->si_addr)) {
-        int no_teb = g_cur_cpu->sig_altstack_sp == 0;
+        /* wine thread?  Its TEB sits in pthread TSD slot 6 (gs+0x30) and
+         * NtTib.Self points back at it.  (The old test read the TEB pointer
+         * from rsp&~0xffff, which is only the stack bottom near the start of
+         * a thread; mid-stack it read garbage and mistook a real Windows
+         * thread for a host-runtime worker.) */
+        uint64_t wine_teb = 0;
+        {
+            uint64_t gs = g_cur_cpu->gs_base;
+            if (gs && ocerz_addr_readable(gs + 0x30)) {
+                uint64_t t = ocerz_ld(gs + 0x30, 8);
+                if (t && ocerz_addr_readable(t + 0x30) && ocerz_ld(t + 0x30, 8) == t)
+                    wine_teb = t;
+            }
+        }
+        int no_teb = wine_teb == 0;
         if (!no_teb) {
-            uint64_t sb = g_cur_cpu->gpr[OCERZ_RSP] & ~0xffffull;
-            uint64_t teb = ocerz_addr_readable(sb)
-                         ? ocerz_ld(sb, 8) : 0;
-            if (ocerz_addr_committed(teb) != 1)
-                no_teb = 1;
+            /* Hand the fault to the guest as an access violation at the faulting
+             * instruction.  Killing the thread instead (the path below) leaves
+             * every lock it held taken forever: a V8 background job died this way
+             * holding a JitPage mutex with its LocalHeap still Running, and the
+             * renderer's GC safepoint then waited on it until the end of time. */
+            const ucontext_t *uc = (const ucontext_t *)ctx;
+            const void *hpc = uc ? (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc : NULL;
+            struct OcerzVM *fvm = g_cur_cpu->vm;
+            uint64_t jrip = 0;
+            int in_jit = hpc && fvm && ocerz_jit_pc_in_arena(fvm, hpc) &&
+                         ocerz_jit_fault_rip(fvm, hpc, &jrip);
+            depth = 1;
+            if (in_jit) {
+                ocerz_jit_fault_recover_regs(fvm, hpc, uc->uc_mcontext->__ss.__x, g_cur_cpu);
+                ocerz_jit_fault_recover_xmm(fvm, hpc, uc->uc_mcontext->__ns.__v, g_cur_cpu);
+                ocerz_jit_fault_recover_flags(fvm, hpc, g_cur_cpu);
+                g_cur_cpu->rip = jrip;
+            } else {
+                g_cur_cpu->rip = g_cur_cpu->cur_rip;
+            }
+            ocerz_flags_materialize(g_cur_cpu);
+            uint64_t wesr = uc ? uc->uc_mcontext->__es.__esr : 0;
+            uint32_t wec = (uint32_t)((wesr >> 26) & 0x3f);
+            int wfetch = (wec == 0x20 || wec == 0x21);
+            int wwrite = !wfetch && (wesr & (1u << 6)) != 0;
+            uint32_t werr = 0x4u | (wwrite ? 0x2u : 0u) | (wfetch ? 0x10u : 0u);
+            uint64_t wgaddr = ocerz_h2g(si->si_addr);
+            {
+                char ab[256];
+                char *a = ab;
+                a = str_into(a, "ocerz: WILD-FAULT-AV pid=");
+                a = hex_into(a, (uint64_t)getpid());
+                a = str_into(a, " wtid=");
+                a = hex_into(a, ocerz_addr_readable(wine_teb + 0x48) ? ocerz_ld(wine_teb + 0x48, 8) : 0);
+                a = str_into(a, " addr=");
+                a = hex_into(a, (uint64_t)(uintptr_t)si->si_addr);
+                a = str_into(a, " rip=");
+                a = hex_into(a, g_cur_cpu->rip);
+                a = str_into(a, " injit=");
+                a = hex_into(a, (uint64_t)in_jit);
+                a = str_into(a, "\n");
+                write(2, ab, (size_t)(a - ab));
+            }
+            if (getenv("OCERZ_WILDDUMP")) {
+                ocerz_cpu_dump(g_cur_cpu, stderr);
+                uint64_t rsp = g_cur_cpu->gpr[OCERZ_RSP];
+                fprintf(stderr, "ocerz: WILD-STACK rsp=%#llx:", (unsigned long long)rsp);
+                for (int i = 0; i < 24; i++)
+                    fprintf(stderr, " %#llx", ocerz_addr_readable(rsp + 8 * (uint64_t)i) ? (unsigned long long)ocerz_ld(rsp + 8 * (uint64_t)i, 8) : 0ull);
+                fprintf(stderr, "\nocerz: WILD-RIPHIST:");
+                for (int i = 1; i <= 16; i++)
+                    fprintf(stderr, " %#llx", (unsigned long long)g_riphist[(g_riphist_n - (unsigned)i) & 31]);
+                fprintf(stderr, "\n");
+            }
+            if (ocerz_signal_deliver(g_cur_cpu, SIGSEGV, wgaddr, 1, werr)) {
+                ocerz_recov_note(5, g_cur_cpu->rip);
+                depth = 0;
+                siglongjmp(*g_sig_recover, 1);
+            }
+            depth = 0;
+            no_teb = 1;     /* undeliverable: fall back to ending the thread */
         }
         if (no_teb) {
-            if (g_sigtrace) {
+            {
                 static volatile unsigned wild_logs;
                 unsigned n = __atomic_fetch_add(&wild_logs, 1, __ATOMIC_RELAXED);
                 if (n < 32) {
@@ -1512,6 +1592,18 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     char *t = tb;
                     t = str_into(t, "ocerz: WILD-WORKER-TERMINATE pid=");
                     t = hex_into(t, (uint64_t)getpid());
+                    t = str_into(t, " cpu=");
+                    t = hex_into(t, g_cur_cpu->cpu_number);
+                    {   /* wine TEB via pthread TSD slot 6, NtTib.Self check */
+                        uint64_t gs = g_cur_cpu->gs_base, teb = 0, wtid = 0;
+                        if (gs && ocerz_addr_readable(gs + 0x30)) teb = ocerz_ld(gs + 0x30, 8);
+                        if (teb && ocerz_addr_readable(teb + 0x48) && ocerz_ld(teb + 0x30, 8) == teb)
+                            wtid = ocerz_ld(teb + 0x48, 8);
+                        t = str_into(t, " teb=");
+                        t = hex_into(t, teb);
+                        t = str_into(t, " wtid=");
+                        t = hex_into(t, wtid);
+                    }
                     t = str_into(t, " addr=");
                     t = hex_into(t, (uint64_t)(uintptr_t)si->si_addr);
                     t = str_into(t, " host_pc=");
@@ -2543,6 +2635,8 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     g_sig_recover = &jb;
 
     ocerz_cpu_register(cpu);
+    pthread_threadid_np(NULL, &cpu->host_tid);
+    cpu->cur_sys_class = -1;
     /* Before sigsetjmp(jb, 1) captures the host mask: every fault recovery
      * siglongjmps back here and restores whatever was saved, so a mask that
      * is cleared only after this point comes back at the first guest fault. */
