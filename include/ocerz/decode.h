@@ -491,6 +491,23 @@ enum OcerzOp {
     /* mov r/m16, Sreg: the selector is CPU state, read at run time. */
     OCERZ_OP_MOVFROMSEG,
 
+    /* AVX-only operations (VEX encodings without a legacy SSE twin).
+     * Appended after everything else, above OCERZ_OP_SSE_FIRST, so the
+     * interpreter routes them to the SSE unit. */
+    OCERZ_OP_VBROADCASTSS,
+    OCERZ_OP_VBROADCASTSD,
+    OCERZ_OP_VBROADCASTF128,
+    OCERZ_OP_VPERMILPS,
+    OCERZ_OP_VPERMILPD,
+    OCERZ_OP_VTESTPS,
+    OCERZ_OP_VTESTPD,
+    OCERZ_OP_VCVTPH2PS,
+    OCERZ_OP_VCVTPS2PH,
+    OCERZ_OP_VINSERTF128,
+    OCERZ_OP_VEXTRACTF128,
+    OCERZ_OP_VPERM2F128,
+    OCERZ_OP_VZEROUPPER,
+    OCERZ_OP_VZEROALL,
     OCERZ_OP_COUNT,
 };
 
@@ -534,8 +551,18 @@ typedef struct X86Insn {
     uint8_t cc;
     uint8_t nops;
     uint8_t mode32;   /* 1 if decoded in i386 (32-bit) mode, 0 in long mode */
+    uint8_t vex;      /* OCERZ_VEX_* flags: AVX (VEX-encoded) form of the op */
+    uint8_t vvvv;     /* VEX.vvvv register (already inverted): src1 for NDS ops */
     X86Operand ops[3];
 } X86Insn;
+
+/* X86Insn.vex */
+#define OCERZ_VEX_PRESENT 0x01
+#define OCERZ_VEX_L       0x02   /* 256-bit (ymm) form */
+#define OCERZ_VEX_W       0x04
+#define OCERZ_VEX_NDS     0x08   /* dst = op(xmm[vvvv], rm): the first source is vvvv, not the destination */
+#define OCERZ_VEX_NDD     0x10   /* shift-by-immediate: ops[0] = xmm[vvvv] (dst), ops[2] = rm (src) */
+#define OCERZ_VEX_IS4     0x20   /* blendv: the mask register sits in ops[2] (imm8[7:4]) */
 
 /* Decode one instruction.  ocerz_decode() is the 64-bit long-mode decoder and
  * always has been; ocerz_decode_mode() takes the mode explicitly, with
