@@ -1602,6 +1602,18 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
                 (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8),
                 (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8),
                 (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RBP] + 8, 8));
+        {
+            uint64_t base = 0;
+            const char *mod = ocerz_dyld_name_for_addr(cpu->rip, &base);
+            fprintf(stderr, "  rip committed=%d prot=%d module=%s+%#llx\n",
+                    ocerz_addr_committed(cpu->rip), ocerz_addr_prot(cpu->rip),
+                    mod ? mod : "(none)", mod ? (unsigned long long)(cpu->rip - base) : 0ull);
+            extern unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
+            uint64_t h[16]; unsigned nh = ocerz_vm_riphist(h, 16);
+            fprintf(stderr, "  guest riphist:");
+            for (unsigned i = 0; i < nh; i++) fprintf(stderr, " %#llx", (unsigned long long)h[i]);
+            fprintf(stderr, "\n");
+        }
         return OCERZ_STEP_FATAL;
     }
 
