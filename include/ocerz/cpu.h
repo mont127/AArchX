@@ -129,6 +129,9 @@ typedef struct OcerzCPU {
      * JIT reaches with stp/ldp immediates, moves by a single byte. */
     uint16_t seg_sel[6];
     uint64_t dbg_ind_src;   /* OCERZ_WILDLOG: guest rip of the last indirect jmp/call dispatched */
+    uint64_t host_tid;      /* pthread_threadid_np of the host thread running this CPU (debugger thread map) */
+    int32_t cur_sys_class;  /* syscall currently being dispatched on the host, -1 when in guest code */
+    int32_t cur_sys_num;
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256
