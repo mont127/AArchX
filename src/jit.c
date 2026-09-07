@@ -235,6 +235,7 @@ static int g_no_ras;
 static int g_no_ldapr;
 
 static int g_no_oolslow;
+static void ea_cache_reset(void);          /* JTA-address cache (defined with the cache below) */
 
 typedef struct {
     uint32_t *bne;
@@ -3177,6 +3178,7 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
         g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, rv, ra, 1,
                                                 g_cur_insn_idx, 0, 0 };
         g_n_oslow++;
+        ea_cache_reset();                 /* the arm is a C call: JTA is dead on the slow path */
         return;
     }
     uint32_t *to_aligned = a64_label(b);
@@ -3210,6 +3212,7 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
         else            a64_ldapr(b, size, rd, ra);
         g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, rd, ra, 0,
                                                 g_cur_insn_idx, 0, 0 };
+        ea_cache_reset();                 /* the arm is a C call: JTA is dead on the slow path */
         g_n_oslow++;
         return;
     }
@@ -3323,6 +3326,7 @@ static void emit_v_acc_ordered_checked(A64Buf *b, int size, int vr, int ra, int3
         g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, vr, ra, 1,
                                                 g_cur_insn_idx, 1, 0 };
         g_n_oslow++;
+        ea_cache_reset();                 /* the arm is a C call: JTA is dead on the slow path */
         return;
     }
     uint32_t *to_aligned = a64_label(b);
@@ -11650,6 +11654,12 @@ static int g_n_oolslow;
 static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32_t *back)
 {
     if (g_n_oolslow >= OOLSLOW_MAX || nsites > 3) return 0;
+    /* The arm runs the instruction out of line (a C call, temps clobbered)
+     * and comes back to `back`: whatever the address cache says JTA holds
+     * is gone on that path, and the next instruction must recompute.  A
+     * misaligned `lock add word [r8+rsi]` followed by `lock or word
+     * [r8+rsi]` reused a dead JTA and atomically or'ed address 0. */
+    ea_cache_reset();
     for (int i = 0; i < nsites; i++) g_oolslow[g_n_oolslow].sites[i] = sites[i];
     g_oolslow[g_n_oolslow].nsites = nsites;
     g_oolslow[g_n_oolslow].insn = insn;
