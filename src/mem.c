@@ -102,11 +102,13 @@ typedef struct {
     uint64_t ghi;
     uint8_t *bm;
     uint8_t *shared;
+    uint8_t *armed;      /* per host page: write revoked because translations were made from it */
     uint32_t *slots;
 } MemRegion;
 
 #define MEM_REGION_MAX 128
 static MemRegion regions[MEM_REGION_MAX];
+static long g_armed_live;      /* armed pages right now: the syscall layer skips its buffer checks at 0 */
 static int region_n;
 
 static MemOwner *owners;
@@ -163,6 +165,16 @@ static int host_prot(int prot)
         p |= PROT_READ | PROT_WRITE;
     if (prot & PROT_EXEC)
         p |= PROT_READ;
+    return p;
+}
+/* The host protection of one host page: the slots' union, minus write while
+ * the page is armed (translations exist for code in it; the next guest
+ * store faults, drops them and unarms - see ocerz_mem_arm_exec). */
+static int page_host_prot(const MemRegion *r, size_t i, int guest_prot)
+{
+    int p = host_prot(guest_prot);
+    if (r->armed && r->armed[i])
+        p &= ~PROT_WRITE;
     return p;
 }
 
@@ -258,10 +270,12 @@ static MemRegion *region_add(uint64_t glo, uint64_t ghi)
     uint64_t nslots = (ghi - glo) / OCERZ_GUEST_PAGE;
     uint8_t *bm = (uint8_t *)calloc(1, (size_t)((npages + 7) / 8));
     uint8_t *shared = (uint8_t *)calloc((size_t)npages, sizeof(*shared));
+    uint8_t *armed = (uint8_t *)calloc((size_t)npages, sizeof(*armed));
     uint32_t *slots = (uint32_t *)calloc((size_t)nslots, sizeof(*slots));
-    if (!bm || !shared || !slots) {
+    if (!bm || !shared || !armed || !slots) {
         free(bm);
         free(shared);
+        free(armed);
         free(slots);
         return NULL;
     }
@@ -269,6 +283,7 @@ static MemRegion *region_add(uint64_t glo, uint64_t ghi)
     regions[region_n].ghi = ghi;
     regions[region_n].bm = bm;
     regions[region_n].shared = shared;
+    regions[region_n].armed = armed;
     regions[region_n].slots = slots;
     MemRegion *result = &regions[region_n];
     __atomic_store_n(&region_n, region_n + 1, __ATOMIC_RELEASE);
@@ -528,8 +543,11 @@ static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
             }
     if (!ocerz_no_batch_vm() && !needs_overlap_zero && hi > lo &&
         mprotect(ocerz_g2h(lo), (size_t)(hi - lo), hprot) == 0) {
-        for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE)
+        for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
             bit_set(r, pg_index(r, p));
+            if (r->armed && r->armed[pg_index(r, p)])      /* content kept: keep the write trap */
+                mprotect(ocerz_g2h(p), (size_t)OCERZ_HOST_PAGE, hprot & ~PROT_WRITE);
+        }
         return OCERZ_OK;
     }
     /* Wine's PE loader re-commits over live pages constantly, and the loop
@@ -551,8 +569,13 @@ static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
         if (mmap(bp, (size_t)(bhi - blo), hprot,
                  MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != bp)
             return OCERZ_ENOMEM;
-        for (uint64_t p = blo; p < bhi; p += OCERZ_HOST_PAGE)
+        for (uint64_t p = blo; p < bhi; p += OCERZ_HOST_PAGE) {
             bit_set(r, pg_index(r, p));
+            if (r->armed && r->armed[pg_index(r, p)]) {    /* fresh zero page: the code is gone */
+                r->armed[pg_index(r, p)] = 0;
+                __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
+            }
+        }
     }
 
     for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
@@ -586,6 +609,12 @@ static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
                 mmap(hp, (size_t)OCERZ_HOST_PAGE, hprot,
                      MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != hp)
                 return OCERZ_ENOMEM;
+            if (r->armed && r->armed[i]) {
+                r->armed[i] = 0;
+                __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
+            }
+        } else if (r->armed && r->armed[i]) {
+            mprotect(hp, (size_t)OCERZ_HOST_PAGE, hprot & ~PROT_WRITE);
         }
         if (!committed)
             bit_set(r, i);
@@ -613,7 +642,11 @@ static int sync_host_page_locked(const MemRegion *r, uint64_t page)
 {
     size_t i = pg_index(r, page);
     int has_data;
-    int prot = host_prot(host_page_guest_prot(r, page, &has_data));
+    int prot = page_host_prot(r, i, host_page_guest_prot(r, page, &has_data));
+    if (!has_data && r->armed && r->armed[i]) {
+        r->armed[i] = 0;
+        __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
+    }
     void *hp = ocerz_g2h(page);
     uint8_t shared = shared_load(r, i);
     if ((shared & MEM_SHARED_PHYSICAL) &&
@@ -669,7 +702,7 @@ static int sync_host_range_locked(const MemRegion *r, uint64_t lo, uint64_t hi)
         int has_data = 0;
         int prot = 0;
         if (p < hi)
-            prot = host_prot(host_page_guest_prot(r, p, &has_data));
+            prot = page_host_prot(r, pg_index(r, p), host_page_guest_prot(r, p, &has_data));
         if (have_run && (p == hi || !has_data || prot != run_prot)) {
             if (mprotect(ocerz_g2h(run_lo), (size_t)(p - run_lo),
                          run_prot) == 0) {
@@ -1569,6 +1602,155 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len)
     if (gaddr <= 0x10000ull && hi >= 0x100000000ull)
         ocerz_init_gate_release();
     return rc;
+}
+
+/* Code was translated out of [lo,hi): revoke host write on every guest-
+ * writable page in it, so a later store (a guest JIT rewriting its code,
+ * as V8 does with plain stores into RWX pages) faults and the translations
+ * are dropped before the new bytes run.  Pages with no writable slot need
+ * nothing: writing them faults anyway. */
+static unsigned long g_armstat_armed, g_armstat_faults;
+int ocerz_mem_armed_any(void) { return __atomic_load_n(&g_armed_live, __ATOMIC_RELAXED) > 0; }
+static void armstat_dump(void)
+{
+    fprintf(stderr, "ocerz: ARMSTAT[%d] armed=%lu write-faults=%lu\n", (int)getpid(),
+            g_armstat_armed, g_armstat_faults);
+}
+int ocerz_mem_arm_exec(uint64_t lo, uint64_t hi)
+{
+    static int dis = -1;
+    if (dis < 0) {
+        dis = getenv("OCERZ_NO_ARM_EXEC") ? 1 : 0;
+        if (getenv("OCERZ_ARMSTAT")) atexit(armstat_dump);
+    }
+    if (dis || hi <= lo) return 0;
+    uint64_t plo = round_down(lo), phi = round_up(hi);
+    pthread_mutex_lock(&map_lock);
+    MemRegion *r = region_for_range(plo, phi);
+    int n = 0;
+    if (r && r->armed) {
+        for (uint64_t page = plo; page < phi; page += OCERZ_HOST_PAGE) {
+            size_t i = pg_index(r, page);
+            if (r->armed[i]) continue;
+            if (!bit_test(r, i)) continue;
+            if (shared_load(r, i) & MEM_SHARED_PHYSICAL) continue;   /* another process's view: leave it */
+            /* Only code that itself sits in a guest-writable slot can be
+             * rewritten by a store; code in an RX slot changes only through
+             * mprotect/mmap, which invalidate on their own.  So a page is
+             * armed only when a writable slot overlaps the translated bytes -
+             * wine's PE images, whose .text tail shares a 16 KB host page
+             * with a writable section, stay untouched. */
+            int code_writable = 0;
+            uint64_t slo = lo > page ? lo : page;
+            uint64_t shi = hi < page + OCERZ_HOST_PAGE ? hi : page + OCERZ_HOST_PAGE;
+            for (uint64_t p = slo & ~(OCERZ_GUEST_PAGE - 1); p < shi; p += OCERZ_GUEST_PAGE) {
+                uint32_t st = slot_load(r, slot_index(r, p));
+                if (slot_is_data(st) && ((st & MEM_SLOT_PROT_MASK) >> MEM_SLOT_PROT_SHIFT) & PROT_WRITE) {
+                    code_writable = 1;
+                    break;
+                }
+            }
+            if (!code_writable) continue;
+            int has_data;
+            int gp = host_page_guest_prot(r, page, &has_data);
+            if (!has_data) continue;
+            r->armed[i] = 1;
+            if (mprotect(ocerz_g2h(page), (size_t)OCERZ_HOST_PAGE, host_prot(gp) & ~PROT_WRITE) != 0)
+                r->armed[i] = 0;
+            else {
+                n++, g_armstat_armed++;
+                __atomic_add_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
+            }
+        }
+    }
+    pthread_mutex_unlock(&map_lock);
+    return n;
+}
+
+/* Unarm every armed page overlapping [lo,hi): a kernel copyout is about to
+ * land there (a mach receive buffer, a read(2) buffer) and a copyout that
+ * meets a read-only page does not fault - it fails, and a mach reply is
+ * destroyed with it.  Fills pages[] for the caller to drop translations. */
+int ocerz_mem_disarm_range(uint64_t lo, uint64_t hi, uint64_t *pages, int max)
+{
+    if (hi <= lo || __atomic_load_n(&g_armed_live, __ATOMIC_RELAXED) <= 0) return 0;
+    uint64_t plo = round_down(lo), phi = round_up(hi);
+    int n = 0;
+    pthread_mutex_lock(&map_lock);
+    MemRegion *r = region_for_range(plo, phi);
+    if (r && r->armed) {
+        for (uint64_t page = plo; page < phi && n < max; page += OCERZ_HOST_PAGE) {
+            size_t i = pg_index(r, page);
+            if (!r->armed[i]) continue;
+            r->armed[i] = 0;
+            __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
+            int has_data;
+            int gp = host_page_guest_prot(r, page, &has_data);
+            if (has_data)
+                mprotect(ocerz_g2h(page), (size_t)OCERZ_HOST_PAGE, host_prot(gp));
+            pages[n++] = page;
+        }
+    }
+    pthread_mutex_unlock(&map_lock);
+    return n;
+}
+
+/* Every armed page, unarmed: for a kernel copyout that hit one (EFAULT from
+ * a syscall writing into guest memory).  Fills pages[] with the guest page
+ * addresses (the caller drops their translations) and returns the count;
+ * more than max armed pages means call again. */
+int ocerz_mem_disarm_all(uint64_t *pages, int max)
+{
+    int n = 0;
+    pthread_mutex_lock(&map_lock);
+    for (int ri = 0; ri < region_n && n < max; ri++) {
+        MemRegion *r = &regions[ri];
+        if (!r->armed) continue;
+        size_t np = (size_t)((r->ghi - r->glo) / OCERZ_HOST_PAGE);
+        for (size_t i = 0; i < np && n < max; i++) {
+            if (!r->armed[i]) continue;
+            r->armed[i] = 0;
+            __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
+            uint64_t page = r->glo + (uint64_t)i * OCERZ_HOST_PAGE;
+            int has_data;
+            int gp = host_page_guest_prot(r, page, &has_data);
+            if (has_data)
+                mprotect(ocerz_g2h(page), (size_t)OCERZ_HOST_PAGE, host_prot(gp));
+            pages[n++] = page;
+        }
+    }
+    pthread_mutex_unlock(&map_lock);
+    return n;
+}
+
+/* A write faulted on gaddr: if its page is armed, unarm it (write back on)
+ * and report 1 so the caller drops the translations and retries the store.
+ * 2: the page is guest-writable and not armed - another thread unarmed it
+ * between this thread's fault and its handler; just retry the store. */
+int ocerz_mem_exec_write_fault(uint64_t gaddr)
+{
+    if (gaddr == UINT64_MAX) return 0;
+    uint64_t page = round_down(gaddr);
+    pthread_mutex_lock(&map_lock);
+    MemRegion *r = region_for_range(page, page + OCERZ_HOST_PAGE);
+    int hit = 0;
+    if (r && r->armed) {
+        size_t i = pg_index(r, page);
+        int has_data;
+        int gp = host_page_guest_prot(r, page, &has_data);
+        if (r->armed[i]) {
+            r->armed[i] = 0;
+            __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
+            g_armstat_faults++;
+            if (has_data && mprotect(ocerz_g2h(page), (size_t)OCERZ_HOST_PAGE, host_prot(gp)) == 0)
+                hit = 1;
+        } else if (has_data && bit_test(r, i) && (gp & PROT_WRITE) &&
+                   !(shared_load(r, i) & MEM_SHARED_PHYSICAL)) {
+            hit = 2;
+        }
+    }
+    pthread_mutex_unlock(&map_lock);
+    return hit;
 }
 
 int ocerz_addr_committed(uint64_t gaddr)

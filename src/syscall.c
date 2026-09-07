@@ -3107,12 +3107,64 @@ static int sys_sigpending(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+/* A buffer the kernel is about to write (a receive, a read): unarm any page
+ * of it that carries translations (ocerz_mem_arm_exec) first.  A kernel
+ * copyout onto a read-only page fails instead of faulting, and for a mach
+ * receive the reply is destroyed with it - wineboot hung forever on exactly
+ * that (2026-09-07). Free when nothing is armed. */
+static void disarm_guest_buffer(OcerzCPU *cpu, uint64_t gaddr, uint64_t len)
+{
+    if (!gaddr || !len || !ocerz_mem_armed_any())
+        return;
+    uint64_t pages[64];
+    int n;
+    while ((n = ocerz_mem_disarm_range(gaddr, gaddr + len, pages, 64)) > 0) {
+        for (int i = 0; i < n; i++)
+            ocerz_jit_invalidate_range(cpu->vm, pages[i], OCERZ_HOST_PAGE_SIZE);
+        if (getenv("OCERZ_CACHEPATCHLOG"))
+            fprintf(stderr, "ocerz: ARMBUF[%d] gaddr=%#llx len=%#llx pages=%d rip=%#llx\n", (int)getpid(),
+                    (unsigned long long)gaddr, (unsigned long long)len, n, (unsigned long long)cpu->rip);
+        if (n < 64) break;
+    }
+}
+static void disarm_guest_iov(OcerzCPU *cpu, uint64_t giov, uint64_t cnt)
+{
+    if (!giov || !ocerz_mem_armed_any())
+        return;
+    if (cnt > 1024) cnt = 1024;
+    for (uint64_t k = 0; k < cnt; k++) {
+        if (!ocerz_addr_readable(giov + k * 16 + 15)) break;
+        disarm_guest_buffer(cpu, ocerz_ld(giov + k * 16, 8), ocerz_ld(giov + k * 16 + 8, 8));
+    }
+}
+
+/* EFAULT with armed pages about: the kernel's copyout hit a guest page whose
+ * host write bit was revoked because code was translated from it
+ * (ocerz_mem_arm_exec).  Unarm them all, drop those translations and tell
+ * the caller to run the syscall once more. */
+static int efault_disarm_retry(OcerzCPU *cpu, int num)
+{
+    uint64_t pages[64];
+    int n, any = 0;
+    while ((n = ocerz_mem_disarm_all(pages, 64)) > 0) {
+        for (int i = 0; i < n; i++)
+            ocerz_jit_invalidate_range(cpu->vm, pages[i], OCERZ_HOST_PAGE_SIZE);
+        any = 1;
+    }
+    if (any && getenv("OCERZ_CACHEPATCHLOG"))
+        fprintf(stderr, "ocerz: ARMRETRY[%d] num=%d rip=%#llx\n", (int)getpid(), num,
+                (unsigned long long)cpu->rip);
+    return any;
+}
+
 static int forward_with_scratch(OcerzCPU *cpu, int num, uint64_t a[8], int dual_ret)
 {
     int err = 0;
     uint64_t ret2 = 0;
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
+    if (err && r == EFAULT && efault_disarm_retry(cpu, num))
+        r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
     if (err) {
         ret_err(cpu, r);
@@ -3623,6 +3675,25 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     uint64_t orig[8];
     memcpy(orig, a, sizeof orig);
 
+    if (ocerz_mem_armed_any()) {
+        switch (num) {
+        case 3: case 396:                      /* read */
+        case 153: case 414:                    /* pread */
+        case 29: case 403:                     /* recvfrom */
+            disarm_guest_buffer(cpu, orig[1], orig[2]);
+            break;
+        case 120: case 411:                    /* readv */
+            disarm_guest_iov(cpu, orig[1], orig[2]);
+            break;
+        case 27: case 401:                     /* recvmsg: msghdr.msg_iov / msg_iovlen */
+            if (ocerz_addr_readable(orig[1] + 31))
+                disarm_guest_iov(cpu, ocerz_ld(orig[1] + 16, 8), (uint32_t)ocerz_ld(orig[1] + 24, 4));
+            break;
+        default:
+            break;
+        }
+    }
+
     {   /* OCERZ_STRACE_CPU=<n>: one-line log of every BSD syscall made by
          * that guest cpu (JIT and interp alike) */
         static int scpu = -2;
@@ -3734,6 +3805,8 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t t0blk = cpu->block_since_ns;
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
+    if (err && r == EFAULT && efault_disarm_retry(cpu, num))
+        r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
 
     /* OCERZ_SYSFAIL: ENOMEM and EFAULT are the two errnos a guest almost
@@ -4756,6 +4829,8 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             nsv31 = ocerz_send_xlate_descriptors(gmsg31, (uint32_t)ocerz_ld(gmsg31 + 4, 4), sv31, 64);
         ocerz_vmmsg_trace("REQ", gmsg31,
                           gmsg31 ? (uint32_t)ocerz_ld(gmsg31 + 4, 4) : 0);
+        if ((a[1] & 0x2) && gmsg31)            /* MACH_RCV_MSG: the reply is copied out here */
+            disarm_guest_buffer(cpu, gmsg31, (uint32_t)a[3]);
         if (a[0] != 0)
             a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
         cpu->last_rcv_name = (a[1] & 0x2) ? (uint32_t)a[4] : 0;
@@ -4843,6 +4918,12 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 
         a[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
         a[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
+        if ((a[1] & 0x2) && reply_buf) {       /* MACH_RCV_MSG: the reply is copied out here */
+            if (vector_mode)
+                disarm_guest_buffer(cpu, ocerz_ld(reply_buf + 8, 8), (uint32_t)ocerz_ld(reply_buf + 20, 4));
+            else
+                disarm_guest_buffer(cpu, reply_buf, (uint32_t)a[6]);
+        }
 
         struct ocerz_ool_save sv47[64];
         int nsv47 = 0;
