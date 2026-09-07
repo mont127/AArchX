@@ -3674,6 +3674,25 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
 
     uint64_t orig[8];
     memcpy(orig, a, sizeof orig);
+    {   /* OCERZ_FDOPLOG: close / guarded_close_np / dup2 / socketpair with the fd
+         * numbers and the guest rip, to catch a stray close of another
+         * thread's wineserver request socket (the server then kills that
+         * thread while it waits: abort_thread from wait_select_reply). */
+        static int fdlog = -1;
+        if (fdlog < 0) {
+            fdlog = getenv("OCERZ_FDOPLOG") ? 1 : 0;
+            const char *fx = getenv("OCERZ_FDOPLOG_EXE");
+            if (fdlog && fx && *fx) {
+                extern char ocerz_cmdline_summary[];
+                if (!ocerz_cmdline_summary[0]) fdlog = -1;          /* summary not built yet: decide later */
+                else fdlog = strstr(ocerz_cmdline_summary, fx) != NULL;
+            }
+        }
+        if (fdlog && (num == 6 || num == 442 || num == 90 || num == 41 || num == 135 || num == 399))
+            fprintf(stderr, "ocerz: FD[%d] cpu#%u %s fd=%d a1=%#llx rip=%#llx\n", (int)getpid(), cpu->cpu_number,
+                    num==6?"close":num==442?"guarded_close":num==90?"dup2":num==41?"dup":num==135?"socketpair":"close_nocancel",
+                    (int)orig[0], (unsigned long long)orig[1], (unsigned long long)cpu->rip);
+    }
 
     if (ocerz_mem_armed_any()) {
         switch (num) {
@@ -3856,6 +3875,32 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                 extern char ocerz_cmdline_summary[];
                 socklog = strstr(ocerz_cmdline_summary, fx) != NULL;
             }
+        }
+        {   /* OCERZ_FDOPLOG: socketpair / dup / dup2 results (the fds a thread's
+             * wineserver request, reply and wait sockets end up with) */
+            static int fdlog2 = -1;
+            if (fdlog2 < 0) {
+                fdlog2 = getenv("OCERZ_FDOPLOG") ? 1 : 0;
+                const char *fx = getenv("OCERZ_FDOPLOG_EXE");
+                if (fdlog2 && fx && *fx) {
+                    extern char ocerz_cmdline_summary[];
+                    if (!ocerz_cmdline_summary[0]) fdlog2 = -1;
+                    else fdlog2 = strstr(ocerz_cmdline_summary, fx) != NULL;
+                }
+            }
+            if (fdlog2 > 0 && !err && num == 135 && orig[3] && ocerz_addr_readable(orig[3] + 7))
+                fprintf(stderr, "ocerz: FD[%d] cpu#%u socketpair -> %d %d rip=%#llx\n", (int)getpid(), cpu->cpu_number,
+                        (int)ocerz_ld(orig[3], 4), (int)ocerz_ld(orig[3] + 4, 4), (unsigned long long)cpu->rip);
+            /* a 16-byte read that came back with a zero first qword: wine's
+             * wait_select_reply treats a zero cookie as "thread got killed"
+             * and calls abort_thread - log who got one and from which fd */
+            if (fdlog2 > 0 && !err && num == 3 && orig[2] == 16 && r == 16 && ocerz_addr_readable(orig[1] + 15) &&
+                ocerz_ld(orig[1], 8) == 0)
+                fprintf(stderr, "ocerz: FD[%d] cpu#%u WAKEUP0 fd=%d signaled=%#llx rip=%#llx\n", (int)getpid(), cpu->cpu_number,
+                        (int)orig[0], (unsigned long long)ocerz_ld(orig[1] + 8, 8), (unsigned long long)cpu->rip);
+            if (fdlog2 > 0 && !err && (num == 41 || num == 90 || num == 42))
+                fprintf(stderr, "ocerz: FD[%d] cpu#%u %s -> %d rip=%#llx\n", (int)getpid(), cpu->cpu_number,
+                        num == 41 ? "dup" : num == 90 ? "dup2" : "pipe", (int)r, (unsigned long long)cpu->rip);
         }
         if (socklog && (num == 97 || num == 98 || num == 104 || num == 105 || num == 30 || num == 106))
             fprintf(stderr, "ocerz: SOCK[%d]  -> %s ret=%#llx err=%d\n", (int)getpid(),
