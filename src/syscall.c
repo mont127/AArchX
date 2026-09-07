@@ -2619,6 +2619,72 @@ static int ocerz_bsdthread_sema_is_port(uint64_t value)
     return value == (uint64_t)(uint32_t)value && (value & 3u) == 3u;
 }
 
+/* OCERZ_EXITLOG: Windows-side view of a thread that is exiting.  Wine leaves the
+ * syscall frame of the last PE->unix transition at TEB+0x378 (regs @+0, rip +0x70,
+ * rsp +0x88, syscall id +0xb0); for an exiting thread that is NtTerminateThread, so
+ * the PE stack above it is the caller chain that decided to exit. */
+static void exitlog_pe_stack(OcerzCPU *cpu)
+{
+    uint64_t tsd = cpu->gs_base;
+    if (!tsd) return;
+    uint64_t teb = ocerz_ld(tsd + 0x30, 8);
+    if (teb < 0x10000 || teb > 0x7fffffffffffull || (teb & 0xfff)) return;
+    if (ocerz_ld(teb + 0x30, 8) != teb) return;             /* NtTib.Self */
+    uint64_t wtid = ocerz_ld(teb + 0x48, 8);
+    uint64_t sbase = ocerz_ld(teb + 8, 8);
+    uint64_t sf = ocerz_ld(teb + 0x378, 8);
+    char line[4096]; int pos = 0;
+#define PEOUT(...) do { if (pos < (int)sizeof(line) - 1) pos += snprintf(line + pos, sizeof(line) - (size_t)pos, __VA_ARGS__); } while (0)
+    PEOUT("ocerz: THREADEXIT-PE[%d] cpu#%u wtid=%#llx", (int)getpid(),
+          cpu->cpu_number, (unsigned long long)wtid);
+    if (!sf) { PEOUT(" no-syscall-frame\n"); fputs(line, stderr); return; }
+    uint64_t rsp = ocerz_ld(sf + 0x88, 8), rip = ocerz_ld(sf + 0x70, 8);
+    uint64_t rcx = ocerz_ld(sf + 0x10, 8), rdx = ocerz_ld(sf + 0x18, 8);
+    uint32_t sid = (uint32_t)ocerz_ld(sf + 0xb0, 4);
+    struct { uint64_t base, size; char name[24]; } mods[160];
+    int nmods = 0;
+    uint64_t peb = ocerz_ld(teb + 0x60, 8), ldr = peb ? ocerz_ld(peb + 0x18, 8) : 0;
+    if (ldr) {
+        uint64_t head = ldr + 0x10, e = ocerz_ld(head, 8);
+        while (e && e != head && nmods < 160) {
+            mods[nmods].base = ocerz_ld(e + 0x30, 8);
+            mods[nmods].size = ocerz_ld(e + 0x40, 8) & 0xffffffffull;
+            unsigned len = (unsigned)ocerz_ld(e + 0x58, 2) / 2;
+            uint64_t buf = ocerz_ld(e + 0x60, 8);
+            unsigned k = 0;
+            for (; k < len && k < sizeof(mods[0].name) - 1 && buf; k++) {
+                uint32_t c = (uint32_t)ocerz_ld(buf + 2 * k, 2);
+                mods[nmods].name[k] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+            }
+            mods[nmods].name[k] = 0;
+            nmods++;
+            e = ocerz_ld(e, 8);
+        }
+    }
+    PEOUT(" sid=%#x rcx=%#llx rdx=%#llx rsp=%#llx", sid, (unsigned long long)rcx,
+          (unsigned long long)rdx, (unsigned long long)rsp);
+    int hits = 0;
+    for (int i = -1; i < 400 && hits < 48; i++) {
+        uint64_t w = i < 0 ? rip : 0;
+        if (i >= 0) {
+            uint64_t at = rsp + 8 * (uint64_t)i;
+            if (sbase && at >= sbase) break;
+            w = ocerz_ld(at, 8);
+        }
+        for (int m = 0; m < nmods; m++) {
+            if (w >= mods[m].base && w < mods[m].base + mods[m].size) {
+                PEOUT(" %s%s+%#llx", i < 0 ? "rip=" : "", mods[m].name,
+                      (unsigned long long)(w - mods[m].base));
+                hits++;
+                break;
+            }
+        }
+    }
+    PEOUT("\n");
+#undef PEOUT
+    fputs(line, stderr);
+}
+
 static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     if (getenv("OCERZ_EXITLOG")) {
@@ -2635,6 +2701,7 @@ static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             fp = nf;
         }
         fprintf(stderr, "\n");
+        exitlog_pe_stack(cpu);
     }
     {
         static int tl = -1;
@@ -3742,11 +3809,15 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
             }
         }
         if (wrlog && (num == 3 || num == 4 || num == 396 || num == 397) && a[2] == 64 && a[1]) {
-            fprintf(stderr, "ocerz: %s64[%d] cpu#%u fd=%d req=%#x ic=%#llx\n",
+            unsigned rq = (unsigned)ocerz_ld(a[1], 4);
+            fprintf(stderr, "ocerz: %s64[%d] cpu#%u fd=%d req=%#x ic=%#llx",
                     (num == 4 || num == 397) ? "WR" : "RD", (int)getpid(),
-                    cpu->cpu_number, (int)a[0],
-                    (unsigned)ocerz_ld(a[1], 4),
+                    cpu->cpu_number, (int)a[0], rq,
                     (unsigned long long)vm->insn_count);
+            if ((num == 4 || num == 397) && rq == 8)   /* REQ_terminate_thread: handle, exit_code */
+                fprintf(stderr, " handle=%#x exit_code=%#x",
+                        (unsigned)ocerz_ld(a[1] + 12, 4), (unsigned)ocerz_ld(a[1] + 16, 4));
+            fputc('\n', stderr);
         }
     }
     if (e->intercept) {
@@ -5984,7 +6055,9 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
             uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             cpu->block_started_ns = t0;
             cpu->block_what = num;
+            cpu->cur_sys_class = class; cpu->cur_sys_num = num;
             rc = dispatch_mach(vm, cpu, num);
+            cpu->cur_sys_class = -1;
             cpu->block_started_ns = 0;
             uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
             if (dt > 3000000000ull)
@@ -5996,7 +6069,9 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
                         (unsigned long long)(cpu->gpr[OCERZ_R9] >> 32),
                         (unsigned long long)cpu->gpr[OCERZ_RAX]);
         } else {
+            cpu->cur_sys_class = class; cpu->cur_sys_num = num;
             rc = dispatch_mach(vm, cpu, num);
+            cpu->cur_sys_class = -1;
         }
         break;
     }
@@ -6007,7 +6082,9 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
             uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             cpu->block_started_ns = t0;
             cpu->block_what = num;
+            cpu->cur_sys_class = class; cpu->cur_sys_num = num;
             rc = dispatch_bsd(vm, cpu, num);
+            cpu->cur_sys_class = -1;
             cpu->block_started_ns = 0;
             uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
             if (dt > 20000000ull)
@@ -6016,11 +6093,15 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
                         (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)ret,
                         (unsigned long long)(vm->insn_count - ic0));
         } else {
+            cpu->cur_sys_class = class; cpu->cur_sys_num = num;
             rc = dispatch_bsd(vm, cpu, num);
+            cpu->cur_sys_class = -1;
         }
         break;
     case 3:
+        cpu->cur_sys_class = class; cpu->cur_sys_num = num;
         rc = dispatch_machdep(vm, cpu, num);
+        cpu->cur_sys_class = -1;
         break;
     default:
 
