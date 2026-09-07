@@ -1121,6 +1121,7 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
             }
             invmap_add(jit, lo, hi);
             ocerz_cache_arm_exec(lo, hi);
+            ocerz_mem_arm_exec(lo, hi);
             if (i < b->n_insns) { lo = blk_insn_rip(b, i); hi = lo + blk_insn_len(b, i); }
         }
     }
@@ -11973,13 +11974,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     {   /* OCERZ_INTERP_LO/HI: never compile a block starting inside [lo,hi);
          * the range runs in the interpreter.  Bisection tool for JIT
          * miscompiles: shrink the range until the misbehaviour returns. */
-        static uint64_t ilo = 0, ihi = 0; static int irng = -1;
+        static uint64_t ilo = 0, ihi = 0, ilo2 = 0, ihi2 = 0; static int irng = -1;
         if (irng < 0) {
             const char *l = getenv("OCERZ_INTERP_LO"), *h = getenv("OCERZ_INTERP_HI");
             if (l && h) { ilo = strtoull(l, NULL, 0); ihi = strtoull(h, NULL, 0); }
-            irng = (ilo < ihi) ? 1 : 0;
+            const char *l2 = getenv("OCERZ_INTERP_LO2"), *h2 = getenv("OCERZ_INTERP_HI2");
+            if (l2 && h2) { ilo2 = strtoull(l2, NULL, 0); ihi2 = strtoull(h2, NULL, 0); }
+            irng = (ilo < ihi || ilo2 < ihi2) ? 1 : 0;
         }
-        if (irng && rip >= ilo && rip < ihi)
+        if (irng && ((rip >= ilo && rip < ihi) || (rip >= ilo2 && rip < ihi2)))
             return NULL;
     }
     {   /* OCERZ_INTERP_RIP=a[,b,...]: never compile a block starting at these

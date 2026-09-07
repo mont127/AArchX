@@ -1613,6 +1613,52 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
             fprintf(stderr, "  guest riphist:");
             for (unsigned i = 0; i < nh; i++) fprintf(stderr, " %#llx", (unsigned long long)h[i]);
             fprintf(stderr, "\n");
+            /* OCERZ_FAULTDUMP=<gpr>: 32 qwords from that register's value
+             * (a table the bad jump was read from) */
+            const char *fd = getenv("OCERZ_FAULTDUMP");
+            int dreg = fd ? atoi(fd) : -1;
+            if (dreg >= 0 && dreg < 16) {
+                uint64_t base = cpu->gpr[dreg] & ~0x7ull;
+                fprintf(stderr, "  FAULTDUMP r%d=%#llx:", dreg, (unsigned long long)cpu->gpr[dreg]);
+                for (int i = 0; i < 32; i++) {
+                    uint64_t a = base + (uint64_t)i * 8;
+                    if ((i & 3) == 0) fprintf(stderr, "\n    %#llx:", (unsigned long long)a);
+                    if (ocerz_addr_readable(a) && ocerz_addr_readable(a + 7)) fprintf(stderr, " %016llx", (unsigned long long)ocerz_ld(a, 8));
+                    else fprintf(stderr, " ????????????????");
+                }
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "  signals: usr1 rcvd=%u delivered=%u  usr2 rcvd=%u  in_handler=%u  cpu#%u\n",
+                    cpu->sig_host_rcvd[SIGUSR1], cpu->sig_delivered[SIGUSR1], cpu->sig_host_rcvd[SIGUSR2],
+                    cpu->in_sighandler, cpu->cpu_number);
+            /* OCERZ_BTRACE: the JIT's per-cpu block-entry ring, most recent first */
+            if (cpu->btrace) {
+                uint32_t bn = cpu->btrace_n, m = (1u << 16) - 1;
+                fprintf(stderr, "  BTRACE n=%u:", bn);
+                for (uint32_t k = 1; k <= 96 && k <= bn; k++) fprintf(stderr, " %#llx", (unsigned long long)cpu->btrace[(bn - k) & m]);
+                fprintf(stderr, "\n");
+            }
+            /* OCERZ_V8DUMP: V8 Ignition state - the dispatch table pointer
+             * at [r13+0x4c40] (r13 = root register) and its first entries,
+             * plus the bytecode array header at r12 */
+            if (getenv("OCERZ_V8DUMP")) {
+                uint64_t r13 = cpu->gpr[13], r12 = cpu->gpr[12];
+                uint64_t tp = ocerz_addr_readable(r13 + 0x4c40) ? ocerz_ld(r13 + 0x4c40, 8) : 0;
+                fprintf(stderr, "  V8DUMP [r13+0x4c40]=%#llx", (unsigned long long)tp);
+                for (int i = 0; i < 24; i++) {
+                    uint64_t a = tp + (uint64_t)i * 8;
+                    if ((i & 3) == 0) fprintf(stderr, "\n    table[%2d]:", i);
+                    if (tp && ocerz_addr_readable(a) && ocerz_addr_readable(a + 7)) fprintf(stderr, " %016llx", (unsigned long long)ocerz_ld(a, 8));
+                    else fprintf(stderr, " ????????????????");
+                }
+                fprintf(stderr, "\n  V8DUMP bytecode array r12=%#llx:", (unsigned long long)r12);
+                for (int i = -1; i < 8; i++) {
+                    uint64_t a = r12 + (uint64_t)(int64_t)i * 8 - 1;   /* untag */
+                    if (ocerz_addr_readable(a) && ocerz_addr_readable(a + 7)) fprintf(stderr, " %016llx", (unsigned long long)ocerz_ld(a, 8));
+                    else fprintf(stderr, " ????????????????");
+                }
+                fprintf(stderr, "\n");
+            }
         }
         return OCERZ_STEP_FATAL;
     }

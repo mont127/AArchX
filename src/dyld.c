@@ -503,6 +503,34 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
     return value;
 }
 
+/* Real dyld maps each segment with its initprot; ours maps every image
+ * read-write so the copy and the fixups can land.  Once fixups are done,
+ * give __TEXT (any segment without write in its initprot) its real
+ * protection: code that sits in a writable slot is treated as possibly
+ * self-modifying by the JIT (ocerz_mem_arm_exec) and a write-trapped
+ * page costs a fault per store to its data neighbours. */
+static void protect_ro_segments(DynImage *img)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_TEXT_RO") ? 1 : 0;
+    if (dis || !img->slice) return;
+    const uint8_t *mh = img->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_SEGMENT_64) {
+            uint64_t vmaddr = rd64(lc + 24);
+            uint64_t vmsize = rd64(lc + 32);
+            uint32_t initprot = rd32(lc + 56);
+            if (vmsize && !(vmaddr == 0 && initprot == 0) && !(initprot & 2) && (initprot & 4) &&
+                memcmp(lc + 8, "__TEXT", 7) == 0)
+                ocerz_protect(vmaddr + img->slide, vmsize, PROT_READ | PROT_EXEC);
+        }
+        lc += rd32(lc + 4);
+    }
+}
+
 static int apply_fixups(DynImage *img, OcerzCache *cache)
 {
     if (img->cf_off == 0)
@@ -1781,6 +1809,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     }
     if (d->cf_off == 0)
         apply_classic_fixups(d, cache);
+    protect_ro_segments(d);
 
     ocerz_dyldapi_register_image(d->load_base, d->path);
     canonicalize_objc_selrefs(d);
@@ -2291,6 +2320,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
             return r;
         }
     }
+    protect_ro_segments(&img);
 
     DynFrame fr;
     memset(&fr, 0, sizeof fr);

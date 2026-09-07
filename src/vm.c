@@ -1051,11 +1051,24 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         const ucontext_t *uc = (const ucontext_t *)ctx;
         uint64_t esr = uc->uc_mcontext->__es.__esr;
         uint32_t ec = (uint32_t)((esr >> 26) & 0x3f);
+        int armed_hit = 0;
+        /* a "just retry" verdict (2) on the same address more than a few
+         * times in a row means the page is read-only for a reason this
+         * path does not know: let the fault through instead of spinning */
+        static __thread uint64_t retry_addr;
+        static __thread int retry_n;
         if (ec != 0x20 && ec != 0x21 && (esr & (1u << 6)) &&
-            ocerz_cache_write_fault((uintptr_t)si->si_addr)) {
+            (ocerz_cache_write_fault((uintptr_t)si->si_addr) ||
+             (ocerz_host_in_guest_space(si->si_addr) &&
+              (armed_hit = ocerz_mem_exec_write_fault(ocerz_h2g(si->si_addr))) != 0 &&
+              (armed_hit != 2 ||
+               (retry_addr == (uint64_t)(uintptr_t)si->si_addr ? ++retry_n : (retry_n = 1, retry_addr = (uint64_t)(uintptr_t)si->si_addr, 1)) <= 4)))) {
+            if (armed_hit != 2) retry_n = 0;
             struct OcerzVM *fvm = g_cur_cpu->vm;
             const void *hpc = (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
-            uint64_t page = (uint64_t)(uintptr_t)si->si_addr & ~(OCERZ_HOST_PAGE_SIZE - 1);
+            uint64_t page = (ocerz_host_in_guest_space(si->si_addr) ? ocerz_h2g(si->si_addr)
+                                                                     : (uint64_t)(uintptr_t)si->si_addr)
+                            & ~(OCERZ_HOST_PAGE_SIZE - 1);
             uint64_t jrip = 0;
             int in_jit = fvm && ocerz_jit_pc_in_arena(fvm, hpc) &&
                          ocerz_jit_fault_rip(fvm, hpc, &jrip);
@@ -1066,7 +1079,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 ocerz_jit_fault_recover_flags(fvm, hpc, g_cur_cpu);
                 ocerz_flags_materialize(g_cur_cpu);
             }
-            ocerz_jit_invalidate_range(fvm, page, OCERZ_HOST_PAGE_SIZE);
+            if (armed_hit != 2)      /* 2: raced another thread's unarm, nothing to drop */
+                ocerz_jit_invalidate_range(fvm, page, OCERZ_HOST_PAGE_SIZE);
             if (getenv("OCERZ_CACHEPATCHLOG"))
                 fprintf(stderr, "ocerz: CACHEPATCH[%d] rip=%#llx addr=%p injit=%d\n",
                         (int)getpid(), (unsigned long long)jrip, si->si_addr, in_jit);
@@ -1078,6 +1092,24 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 siglongjmp(*g_sig_recover, 1);
             }
             return;              /* interpreter store: retrying it is enough */
+        }
+    }
+
+    /* The same write-trap, hit by host code outside a CPU run loop (a unit
+     * test harness or a loader thread rewriting guest code it already ran):
+     * unarm, drop the translations, retry the host store. */
+    if ((sig == SIGSEGV || sig == SIGBUS) && !align_fault && depth == 0 && ctx &&
+        !(g_cur_cpu && g_sig_recover) && g_vm && ocerz_host_in_guest_space(si->si_addr)) {
+        const ucontext_t *uc = (const ucontext_t *)ctx;
+        uint64_t esr = uc->uc_mcontext->__es.__esr;
+        uint32_t ec = (uint32_t)((esr >> 26) & 0x3f);
+        if (ec != 0x20 && ec != 0x21 && (esr & (1u << 6))) {
+            uint64_t ga = ocerz_h2g(si->si_addr);
+            int h = ocerz_mem_exec_write_fault(ga);
+            if (h == 1)
+                ocerz_jit_invalidate_range(g_vm, ga & ~(OCERZ_HOST_PAGE_SIZE - 1), OCERZ_HOST_PAGE_SIZE);
+            if (h)
+                return;
         }
     }
 
