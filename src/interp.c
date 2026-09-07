@@ -714,7 +714,25 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 
         int size = insn->opsize;
         uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RSP], size);
-        ocerz_write_op(cpu, insn, &insn->ops[0], v);
+        const X86Operand *d = &insn->ops[0];
+        if (d->kind == OCERZ_OPK_MEM && (d->base == OCERZ_RSP || d->index == OCERZ_RSP)) {
+            /* SDM, POP: with (E)SP as a base/index of the memory destination
+             * the effective address is computed AFTER the pop adjusts (E)SP.
+             * V8's TailCallRuntime trampoline moves the return address with
+             * `pop qword [rsp+0x98]` and jumps to CEntry; computed with the
+             * old rsp it lands one slot low and CEntry returns into a stale
+             * heap pointer.  Commit rsp only once the store is done so a
+             * faulting store leaves it untouched. */
+            uint64_t old = cpu->gpr[OCERZ_RSP];
+            uint64_t bumped = ocerz_stack_wrap(old + (uint64_t)size, insn->mode32);
+            cpu->gpr[OCERZ_RSP] = bumped;
+            uint64_t ea = ocerz_ea(cpu, insn, d);
+            cpu->gpr[OCERZ_RSP] = old;
+            ocerz_st(ea, size, v);
+            cpu->gpr[OCERZ_RSP] = bumped;
+            return OCERZ_STEP_OK;
+        }
+        ocerz_write_op(cpu, insn, d, v);
         /* POP ESP takes its new value from the slot, not from the adjustment. */
         if (!(insn->ops[0].kind == OCERZ_OPK_REG && insn->ops[0].reg == OCERZ_RSP))
             cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(cpu->gpr[OCERZ_RSP] + (uint64_t)size,

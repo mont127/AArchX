@@ -35,12 +35,12 @@ void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out)
         uint64_t v = cpu->gpr[i];
         char s[192];
         int n = 0;
-        if (v == 0 || ocerz_addr_committed(v) != 1)
+        if (v == 0 || !ocerz_addr_readable(v))     /* committed != host-readable (reserved cages) */
             continue;
         for (; n < (int)sizeof s - 1; n++) {
             uint64_t a = v + (uint64_t)n;
             unsigned char c;
-            if ((a & 0xfffu) == 0 && ocerz_addr_committed(a) != 1)
+            if ((a & 0xfffu) == 0 && !ocerz_addr_readable(a))
                 break;
             c = (unsigned char)ocerz_ld(a, 1);
             if (c == 0)

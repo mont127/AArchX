@@ -1548,7 +1548,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             uint32_t werr = 0x4u | (wwrite ? 0x2u : 0u) | (wfetch ? 0x10u : 0u);
             uint64_t wgaddr = ocerz_h2g(si->si_addr);
             {
-                char ab[256];
+                char ab[400];
                 char *a = ab;
                 a = str_into(a, "ocerz: WILD-FAULT-AV pid=");
                 a = hex_into(a, (uint64_t)getpid());
@@ -1560,6 +1560,21 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 a = hex_into(a, g_cur_cpu->rip);
                 a = str_into(a, " injit=");
                 a = hex_into(a, (uint64_t)in_jit);
+                a = str_into(a, " hpc=");
+                a = hex_into(a, (uint64_t)(uintptr_t)hpc);
+                a = str_into(a, " arena=");
+                a = hex_into(a, (uint64_t)(hpc && fvm && ocerz_jit_pc_in_arena(fvm, hpc)));
+                {
+                    OcerzJitFaultInfo fi;
+                    if (hpc && fvm && ocerz_jit_pc_in_arena(fvm, hpc) && ocerz_jit_fault_info(fvm, hpc, &fi)) {
+                        a = str_into(a, " blk=");
+                        a = hex_into(a, fi.block_rip);
+                        a = str_into(a, " insn=");
+                        a = hex_into(a, fi.insn_rip);
+                        a = str_into(a, " hinsn=");
+                        a = hex_into(a, *(const uint32_t *)hpc);
+                    }
+                }
                 a = str_into(a, "\n");
                 write(2, ab, (size_t)(a - ab));
             }
@@ -2665,10 +2680,29 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
         if (ocerz_bt_lo && cpu->rip >= ocerz_bt_lo && cpu->rip < ocerz_bt_hi)
             ocerz_bt_report(cpu);
         if (trace_lo && cpu->rip >= trace_lo && cpu->rip < trace_hi) {
-            fprintf(stderr, "WT %#llx rax=%#llx rdi=%#llx rsi=%#llx r8=%#llx r12=%#llx\n",
+            {   /* OCERZ_TRACE_PEEK=<off>: also print [r13+off], [r13+off+8] and [rbp+8] (V8 handle scope + return slot) */
+                static long peek = -2;
+                if (peek == -2) { const char *e = getenv("OCERZ_TRACE_PEEK"); peek = e ? strtol(e, NULL, 0) : -1; }
+                if (peek >= 0) {
+                    uint64_t r13 = cpu->gpr[OCERZ_R13], rbp = cpu->gpr[OCERZ_RBP];
+                    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+                    fprintf(stderr, "WP [rsp]=%#llx [rsp+8]=%#llx [rsp+16]=%#llx r13[%#lx]=%#llx r13[%#lx]=%#llx [rbp+8]=%#llx rbx=%#llx\n",
+                            ocerz_addr_readable(rsp) ? (unsigned long long)ocerz_ld(rsp, 8) : 0ull,
+                            ocerz_addr_readable(rsp + 8) ? (unsigned long long)ocerz_ld(rsp + 8, 8) : 0ull,
+                            ocerz_addr_readable(rsp + 16) ? (unsigned long long)ocerz_ld(rsp + 16, 8) : 0ull, peek,
+                            ocerz_addr_readable(r13 + (uint64_t)peek) ? (unsigned long long)ocerz_ld(r13 + (uint64_t)peek, 8) : 0ull, peek + 8,
+                            ocerz_addr_readable(r13 + (uint64_t)peek + 8) ? (unsigned long long)ocerz_ld(r13 + (uint64_t)peek + 8, 8) : 0ull,
+                            ocerz_addr_readable(rbp + 8) ? (unsigned long long)ocerz_ld(rbp + 8, 8) : 0ull,
+                            (unsigned long long)cpu->gpr[OCERZ_RBX]);
+                }
+            }
+            fprintf(stderr, "WT %#llx rax=%#llx rcx=%#llx rdi=%#llx rsi=%#llx r8=%#llx r12=%#llx rsp=%#llx rbp=%#llx r13=%#llx r15=%#llx\n",
                     (unsigned long long)cpu->rip, (unsigned long long)cpu->gpr[OCERZ_RAX],
+                    (unsigned long long)cpu->gpr[OCERZ_RCX],
                     (unsigned long long)cpu->gpr[OCERZ_RDI], (unsigned long long)cpu->gpr[OCERZ_RSI],
-                    (unsigned long long)cpu->gpr[OCERZ_R8], (unsigned long long)cpu->gpr[OCERZ_R12]);
+                    (unsigned long long)cpu->gpr[OCERZ_R8], (unsigned long long)cpu->gpr[OCERZ_R12],
+                    (unsigned long long)cpu->gpr[OCERZ_RSP], (unsigned long long)cpu->gpr[OCERZ_RBP],
+                    (unsigned long long)cpu->gpr[OCERZ_R13], (unsigned long long)cpu->gpr[OCERZ_R15]);
             r = ocerz_interp_step(vm, cpu);
             if (r == OCERZ_STEP_EXIT)
                 break;
