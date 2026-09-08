@@ -1019,6 +1019,7 @@ static void ocerz_fork_prepare(void)
     pthread_mutex_lock(&g_wl_lock);
     ocerz_jit_prefork();
     ocerz_mem_prefork();
+    ocerz_cache_prefork();
 }
 
 static void ocerz_fork_parent(void)
@@ -1028,6 +1029,7 @@ static void ocerz_fork_parent(void)
     pthread_mutex_unlock(&g_wl_lock);
     ocerz_vm_atfork_parent();
     ocerz_init_gate_postfork_parent();
+    ocerz_cache_postfork();
 }
 
 static void ocerz_fork_child(void)
@@ -1039,6 +1041,7 @@ static void ocerz_fork_child(void)
     ocerz_vm_atfork_child();
     __atomic_store_n(&g_wq_running, 0, __ATOMIC_SEQ_CST);
     ocerz_init_gate_postfork_child();
+    ocerz_cache_postfork();
 }
 
 static pthread_once_t g_fork_atfork_once = PTHREAD_ONCE_INIT;

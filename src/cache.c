@@ -167,7 +167,9 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
              * remap, a concurrent reader faults, waits on the lock and
              * retries against the finished page. */
             int installed = 0;
-            uint8_t *tmp = g_lazy[i].fd >= 0
+            static int no_remap = -1;
+            if (no_remap < 0) no_remap = getenv("OCERZ_NO_LAZY_REMAP") ? 1 : 0;
+            uint8_t *tmp = (g_lazy[i].fd >= 0 && !no_remap)
                 ? (uint8_t *)mmap(NULL, (size_t)hp, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
                 : (uint8_t *)MAP_FAILED;
             if (tmp != MAP_FAILED) {
@@ -191,6 +193,23 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
                         mprotect((void *)(uintptr_t)base, (size_t)hp, g_lazy[i].final_prot);
                         installed = 1;
                     }
+                    if (getenv("OCERZ_LAZYCHECK") && kr == KERN_SUCCESS) {
+                        /* validation: rebuild the same page the old way from a fresh file
+                         * read and compare */
+                        uint8_t *chk = (uint8_t *)mmap(NULL, (size_t)hp, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                        if (chk != MAP_FAILED && pread(g_lazy[i].fd, chk, (size_t)hp, (off_t)(g_lazy[i].foff + off)) == got) {
+                            for (uint32_t k = 0; k < per; k++) {
+                                uint64_t pb = base + (uint64_t)k * g_lazy[i].page_size;
+                                if (pb + g_lazy[i].page_size > g_lazy[i].addr + g_lazy[i].size) break;
+                                rebase_page_v2((uint64_t)(uintptr_t)chk + (uint64_t)k * g_lazy[i].page_size, g_lazy[i].page_size,
+                                               (uint32_t)((pb - g_lazy[i].addr) / g_lazy[i].page_size), g_lazy[i].cache_base, g_lazy[i].si);
+                            }
+                            int rc = memcmp(chk, (const void *)(uintptr_t)base, (size_t)got);
+                            fprintf(stderr, "ocerz: LAZYCHECK[%d] page=%#llx region=%d off=%#llx got=%zd %s\n", (int)getpid(),
+                                    (unsigned long long)base, i, (unsigned long long)off, got, rc ? "MISMATCH" : "ok");
+                        }
+                        if (chk != MAP_FAILED) munmap(chk, (size_t)hp);
+                    }
                 }
                 munmap(tmp, (size_t)hp);
             }
@@ -213,6 +232,19 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
         return 1;
     }
     return 0;
+}
+
+/* fork: the lazy unpack holds g_lazy_lock for a whole page rebuild now, so a
+ * fork landing inside it would hand the child a lock nobody releases; take
+ * the lock across the fork like the other emulator locks. */
+void ocerz_cache_prefork(void)
+{
+    while (__atomic_exchange_n(&g_lazy_lock, 1, __ATOMIC_ACQUIRE)) { }
+}
+
+void ocerz_cache_postfork(void)
+{
+    __atomic_store_n(&g_lazy_lock, 0, __ATOMIC_RELEASE);
 }
 
 int ocerz_cache_lazy_region(uintptr_t addr)
