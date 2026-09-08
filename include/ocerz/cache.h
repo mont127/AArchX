@@ -24,4 +24,7 @@ uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol);
 uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found);
 uint64_t ocerz_cache_image_addr(OcerzCache *c, uint32_t i, const char **path_out);
 
+void ocerz_cache_prefork(void);
+void ocerz_cache_postfork(void);
+
 #endif
