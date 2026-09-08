@@ -1851,6 +1851,29 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
             }
         }
     }
+    /* io_connect_method (2865) / io_connect_async_method (2866): the request
+     * ends with ool_input, ool_input_size, scalar_outputCnt, inband_outputCnt,
+     * ool_output, ool_output_size.  ool_input/ool_output are task addresses
+     * the kernel copies from/to directly (IOConnectCallMethod uses them for
+     * any struct argument over 4 KB, e.g. IOSurface's get-value path); a guest
+     * pointer left untranslated makes the copy fail with kIOReturnVMError. */
+    if ((msg_id == 2865 || msg_id == 2866) && n + 2 <= max_saved) {
+        uint32_t msz = (uint32_t)ocerz_ld(gmsg + 4, 4);
+        if (msz >= 0x28 + 0x28 && (!send_size || msz <= send_size)) {
+            const uint64_t offs[2] = { msz - 0x28, msz - 0x10 };
+            for (int k = 0; k < 2; k++) {
+                uint64_t ga = ocerz_ld(gmsg + offs[k], 8);
+                if (!ga) continue;
+                uint64_t ha = (uint64_t)(uintptr_t)ocerz_g2h(ga);
+                if (ha != ga) {
+                    saved[n].off = offs[k];
+                    saved[n].orig = ga;
+                    n++;
+                    ocerz_st(gmsg + offs[k], 8, ha);
+                }
+            }
+        }
+    }
     /* mach_vm_map (4811) asking for VM_FLAGS_ANYWHERE under the low-base
      * shadow: the kernel would place the mapping in host space below the
      * guest's identity range, where the guest cannot see it, and relocating
@@ -2626,7 +2649,10 @@ static int ocerz_bsdthread_sema_is_port(uint64_t value)
  * syscall frame of the last PE->unix transition at TEB+0x378 (regs @+0, rip +0x70,
  * rsp +0x88, syscall id +0xb0); for an exiting thread that is NtTerminateThread, so
  * the PE stack above it is the caller chain that decided to exit. */
-static void exitlog_pe_stack(OcerzCPU *cpu)
+/* Windows-side stack of a wine thread (module+offset per return address found
+ * between the syscall frame's rsp and the TEB stack base).  Shared by the
+ * THREADEXIT log and the SIGINFO thread dump (ocerz_vm_thread_dump). */
+void ocerz_pe_stack_dump(OcerzCPU *cpu, const char *tag)
 {
     uint64_t tsd = cpu->gs_base;
     if (!tsd) return;
@@ -2638,7 +2664,7 @@ static void exitlog_pe_stack(OcerzCPU *cpu)
     uint64_t sf = ocerz_ld(teb + 0x378, 8);
     char line[4096]; int pos = 0;
 #define PEOUT(...) do { if (pos < (int)sizeof(line) - 1) pos += snprintf(line + pos, sizeof(line) - (size_t)pos, __VA_ARGS__); } while (0)
-    PEOUT("ocerz: THREADEXIT-PE[%d] cpu#%u wtid=%#llx", (int)getpid(),
+    PEOUT("ocerz: %s[%d] cpu#%u wtid=%#llx", tag, (int)getpid(),
           cpu->cpu_number, (unsigned long long)wtid);
     if (!sf) { PEOUT(" no-syscall-frame\n"); fputs(line, stderr); return; }
     uint64_t rsp = ocerz_ld(sf + 0x88, 8), rip = ocerz_ld(sf + 0x70, 8);
@@ -2686,6 +2712,11 @@ static void exitlog_pe_stack(OcerzCPU *cpu)
     PEOUT("\n");
 #undef PEOUT
     fputs(line, stderr);
+}
+
+static void exitlog_pe_stack(OcerzCPU *cpu)
+{
+    ocerz_pe_stack_dump(cpu, "THREADEXIT-PE");
 }
 
 static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
@@ -5359,6 +5390,34 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             ocerz_reply_relocate_ool(mach_reply_buf, mach_reply_size, 47);
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_reply_alias_iokit(vm, mach_reply_buf, mach_reply_size);
+        {
+            /* OCERZ_MSGHEX=<request id|all>: dump the request and reply words of a
+             * mach_msg2 round trip as the guest sees them (after any relocation). */
+            static int msghex = -2;
+            if (msghex == -2) { const char *e = getenv("OCERZ_MSGHEX"); msghex = e ? (!strcmp(e, "all") ? -1 : atoi(e)) : 0; }
+            if (msghex && request_buf != 0) {
+                uint32_t rid = (uint32_t)ocerz_ld(request_buf + 0x14, 4);
+                if (msghex == -1 || msghex == (int)rid) {
+                    uint32_t qsize = (uint32_t)ocerz_ld(request_buf + 4, 4);
+                    fprintf(stderr, "ocerz: MSGHEX[%d] req id=%u bits=%#x size=%#x dst=%#x opts=%#llx kr=%#llx:",
+                            (int)getpid(), rid, (uint32_t)ocerz_ld(request_buf, 4), qsize,
+                            (uint32_t)a[3], (unsigned long long)a[1], (unsigned long long)r47);
+                    for (uint64_t o = 0x18; o < 0x78 && o + 4 <= qsize; o += 4)
+                        fprintf(stderr, " %08x", (uint32_t)ocerz_ld(request_buf + o, 4));
+                    fprintf(stderr, "\n");
+                    if (mach_reply_buf) {
+                        uint32_t rsize = (uint32_t)ocerz_ld(mach_reply_buf + 4, 4);
+                        fprintf(stderr, "ocerz: MSGHEX[%d]   reply@%#llx id=%u bits=%#x size=%#x (rcvsz=%#llx):",
+                                (int)getpid(), (unsigned long long)mach_reply_buf,
+                                (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4), (uint32_t)ocerz_ld(mach_reply_buf, 4),
+                                rsize, (unsigned long long)mach_reply_size);
+                        for (uint64_t o = 0x18; o < 0x98 && o + 4 <= rsize; o += 4)
+                            fprintf(stderr, " %08x", (uint32_t)ocerz_ld(mach_reply_buf + o, 4));
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
         {
             /* light IOKit MIG log: request id 2800..2999 -> reply id, RetCode/first words.
              * Level 2 also prints reply port descriptors (entry/iterator ports handed to
