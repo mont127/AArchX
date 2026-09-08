@@ -2436,6 +2436,18 @@ static int decode_0f(DecState *s, uint8_t op2)
         return decode_pint(s, OCERZ_OP_PCMPEQW, 1);
     case 0x76:
         return decode_pint(s, OCERZ_OP_PCMPEQD, 1);
+    case 0x2b: {
+        /* MOVNTPS/MOVNTPD m128, xmm: a non-temporal store; the cache hint has
+         * no observable effect here, so it is the plain unaligned store. */
+        if (mand != MAND_NONE && mand != MAND_66)
+            return OCERZ_EUNDEF;
+        e = decode_sse_rr(s, OCERZ_OP_MOVUPS, 16, 0);
+        if (e)
+            return e;
+        if (s->out->ops[0].kind != OCERZ_OPK_MEM)
+            return OCERZ_EUNDEF;
+        return OCERZ_OK;
+    }
     case 0x77:
         set_op(s, s->vex ? (s->vex_l ? OCERZ_OP_VZEROALL : OCERZ_OP_VZEROUPPER) : OCERZ_OP_EMMS);
         s->out->nops = 0;
