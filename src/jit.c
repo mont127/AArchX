@@ -8569,7 +8569,26 @@ static int fused_jcc_cond(const X86Insn *producer, const X86Insn *jcc)
  * out-of-block tail spills the pins and pops the frame first). */
 static uint32_t *cond_short_site(uint32_t *to_taken, int taken_rec, int body_edge)
 {
-    return (taken_rec || !body_edge) ? NULL : to_taken;
+    /* g_l0_dirty: a lane-0 result still in its scratch register would be
+     * flushed by the chain tail; a branch retargeted past it leaks the stale
+     * architectural lane into the successor. */
+    return (taken_rec || !body_edge || g_l0_dirty) ? NULL : to_taken;
+}
+
+/* A side-exit stub does work the successor needs when it replays lane-0
+ * flushes, an FP-batch check, or the producer's flag record.  Such a stub
+ * must stay on the path: chaining may not retarget the conditional branch
+ * straight at the successor's body (the AppKit view-transform helper hit
+ * exactly that: subsd's result left in scratch, the je's side exit chained
+ * past the flush, NSViewGetTransformToDescendant asserted on a singular
+ * matrix). */
+static int side_stub_has_work(int k)
+{
+    if (g_side[k].rec) return 1;
+    if (g_side[k].fpb >= 0 && g_side[k].fpb_chk) return 1;
+    for (int r = 0; r < 16; r++)
+        if ((g_side[k].l0_dirty & (1u << r)) && g_side[k].l0[r] >= 0) return 1;
+    return 0;
 }
 
 static int can_fuse_cmp_test_jcc(const X86Insn *producer,
@@ -13592,7 +13611,7 @@ promo_push_fallthrough:
         blk->edges[e].patch_b = g_side[k].patch_b;
         /* a stub that carries the producer's flag record must stay on the
          * path: no short-circuit of the conditional branch to the target */
-        blk->edges[e].cond_site = g_side[k].rec ? NULL : g_side[k].site;
+        blk->edges[e].cond_site = side_stub_has_work(k) ? NULL : g_side[k].site;
         blk->edges[e].kind = body_edge_pin_class() >= 0 ? EDGE_BODY : EDGE_XBLOCK;
         blk->edges[e].pin_class = body_edge_pin_class() >= 0 ? (uint8_t)body_edge_pin_class() : 0;
         blk->edges[e].side = (uint8_t)(k + 1);          /* the stub reports side index k */
@@ -13618,6 +13637,7 @@ promo_push_fallthrough:
                 char pb[1024];
                 snprintf(pb, sizeof pb, "%s.%d", p, (int)getpid());
                 g_jf = fopen(pb, "w");
+                if (g_jf) setvbuf(g_jf, NULL, _IOLBF, 0);   /* survive an abort() of the guest */
             }
         }
         if (g_jitdis > 0 && g_jf && blk->insn_off && rip >= g_jd_lo && rip < g_jd_hi) {
