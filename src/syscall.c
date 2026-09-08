@@ -2723,9 +2723,11 @@ static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     if (getenv("OCERZ_EXITLOG")) {
         fprintf(stderr,
-                "ocerz: THREADEXIT[%d] cpu#%u rip=%#llx kport=%#llx sema=%#llx bt:",
+                "ocerz: THREADEXIT[%d] cpu#%u rip=%#llx kport=%#llx sema=%#llx quit=%u/%u usr1=%u/%u bt:",
                 (int)getpid(), cpu->cpu_number, (unsigned long long)cpu->rip,
-                (unsigned long long)a[2], (unsigned long long)a[3]);
+                (unsigned long long)a[2], (unsigned long long)a[3],
+                cpu->sig_host_rcvd[SIGQUIT], cpu->sig_delivered[SIGQUIT],
+                cpu->sig_host_rcvd[SIGUSR1], cpu->sig_delivered[SIGUSR1]);
         uint64_t fp = cpu->gpr[OCERZ_RBP];
         for (int d = 0; d < 8 && fp > 0x1000; d++) {
             fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
