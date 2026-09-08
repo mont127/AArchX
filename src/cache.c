@@ -5,6 +5,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach-o/loader.h>
 #include <string.h>
 #include <errno.h>
@@ -98,6 +100,8 @@ static struct {
     uint64_t cache_base;
     int final_prot;
     uint8_t *done;                /* one byte per host page */
+    int fd;                       /* the cache file, kept open: pages are rebuilt from it */
+    uint64_t foff;                /* file offset of the mapping */
 } g_lazy[LAZY_MAX];
 static int g_n_lazy;
 static volatile int g_lazy_lock;
@@ -154,17 +158,55 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
         last_retry = 0;
         {
             uint64_t base = g_lazy[i].addr + off;
-            mprotect((void *)(uintptr_t)base, (size_t)hp, PROT_READ | PROT_WRITE);
             uint32_t per = (uint32_t)(hp / g_lazy[i].page_size);
-            for (uint32_t k = 0; k < per; k++) {
-                uint64_t pb = base + (uint64_t)k * g_lazy[i].page_size;
-                if (pb + g_lazy[i].page_size > g_lazy[i].addr + g_lazy[i].size) break;
-                rebase_page_v2(pb, g_lazy[i].page_size,
-                               (uint32_t)((pb - g_lazy[i].addr) / g_lazy[i].page_size),
-                               g_lazy[i].cache_base, g_lazy[i].si);
+            /* Build the unpacked page in a private scratch mapping and install
+             * it atomically.  Unpacking in place after an mprotect(RW) let
+             * every other thread read the raw pointer chains during the
+             * unpack (libswiftCore in steam.exe dereferenced one of those
+             * half-baked pointers); with the page kept PROT_NONE until the
+             * remap, a concurrent reader faults, waits on the lock and
+             * retries against the finished page. */
+            int installed = 0;
+            uint8_t *tmp = g_lazy[i].fd >= 0
+                ? (uint8_t *)mmap(NULL, (size_t)hp, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+                : (uint8_t *)MAP_FAILED;
+            if (tmp != MAP_FAILED) {
+                ssize_t got = pread(g_lazy[i].fd, tmp, (size_t)hp, (off_t)(g_lazy[i].foff + off));
+                if (got > 0) {
+                    for (uint32_t k = 0; k < per; k++) {
+                        uint64_t pb = base + (uint64_t)k * g_lazy[i].page_size;
+                        if (pb + g_lazy[i].page_size > g_lazy[i].addr + g_lazy[i].size) break;
+                        rebase_page_v2((uint64_t)(uintptr_t)tmp + (uint64_t)k * g_lazy[i].page_size,
+                                       g_lazy[i].page_size,
+                                       (uint32_t)((pb - g_lazy[i].addr) / g_lazy[i].page_size),
+                                       g_lazy[i].cache_base, g_lazy[i].si);
+                    }
+                    mach_vm_address_t dst = (mach_vm_address_t)base;
+                    vm_prot_t curp = 0, maxp = 0;
+                    kern_return_t kr = mach_vm_remap(mach_task_self(), &dst, (mach_vm_size_t)hp, 0,
+                                                     VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                                     mach_task_self(), (mach_vm_address_t)(uintptr_t)tmp, FALSE,
+                                                     &curp, &maxp, VM_INHERIT_DEFAULT);
+                    if (kr == KERN_SUCCESS && dst == (mach_vm_address_t)base) {
+                        mprotect((void *)(uintptr_t)base, (size_t)hp, g_lazy[i].final_prot);
+                        installed = 1;
+                    }
+                }
+                munmap(tmp, (size_t)hp);
             }
-            if (g_lazy[i].final_prot != (PROT_READ | PROT_WRITE))
-                mprotect((void *)(uintptr_t)base, (size_t)hp, g_lazy[i].final_prot);
+            if (!installed) {
+                /* fallback: the old in-place unpack */
+                mprotect((void *)(uintptr_t)base, (size_t)hp, PROT_READ | PROT_WRITE);
+                for (uint32_t k = 0; k < per; k++) {
+                    uint64_t pb = base + (uint64_t)k * g_lazy[i].page_size;
+                    if (pb + g_lazy[i].page_size > g_lazy[i].addr + g_lazy[i].size) break;
+                    rebase_page_v2(pb, g_lazy[i].page_size,
+                                   (uint32_t)((pb - g_lazy[i].addr) / g_lazy[i].page_size),
+                                   g_lazy[i].cache_base, g_lazy[i].si);
+                }
+                if (g_lazy[i].final_prot != (PROT_READ | PROT_WRITE))
+                    mprotect((void *)(uintptr_t)base, (size_t)hp, g_lazy[i].final_prot);
+            }
             g_lazy[i].done[hidx] = 1;
         }
         __atomic_store_n(&g_lazy_lock, 0, __ATOMIC_RELEASE);
@@ -332,7 +374,7 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
         close(fd);
         return -1;
     }
-    uint64_t slide_regions[8][5];
+    uint64_t slide_regions[8][6];
     int n_slide = 0;
     for (uint32_t i = 0; i < rec_cnt; i++) {
         const uint8_t *m = hdr + rec_off + i * 56;
@@ -391,6 +433,7 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
             slide_regions[n_slide][2] = size;
             slide_regions[n_slide][3] = (uint64_t)lazy;
             slide_regions[n_slide][4] = (uint64_t)((initp & VM_PROT_WRITE) ? (PROT_READ | PROT_WRITE) : PROT_READ);
+            slide_regions[n_slide][5] = foff;
             n_slide++;
         }
     }
@@ -412,6 +455,8 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
             g_lazy[g_n_lazy].si = si;
             g_lazy[g_n_lazy].cache_base = cache_base;
             g_lazy[g_n_lazy].final_prot = (int)slide_regions[i][4];
+            g_lazy[g_n_lazy].fd = dup(fd);             /* kept open for the page rebuilds */
+            g_lazy[g_n_lazy].foff = slide_regions[i][5];
             g_lazy[g_n_lazy].done = (uint8_t *)calloc(npages, 1);
             if (g_lazy[g_n_lazy].done) g_n_lazy++;
             else rebase_slide_v2(slide_regions[i][0], slide_regions[i][2], cache_base, si);   /* fallback: eager */
