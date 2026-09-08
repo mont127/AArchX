@@ -2041,6 +2041,28 @@ int ocerz_vm_init(OcerzVM *vm)
     return OCERZ_OK;
 }
 
+/* SIGINFO (kill -INFO <pid>): dump every guest thread - host tid, rip/rsp, the
+ * syscall it is blocked in, and its Windows-side stack.  Always armed, so a
+ * hung wine process can be inspected without a debugger attach. */
+void ocerz_pe_stack_dump(OcerzCPU *cpu, const char *tag);
+static void threaddump_handler(int sig, siginfo_t *si, void *ctx)
+{
+    (void)sig; (void)si; (void)ctx;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    fprintf(stderr, "ocerz: THREADDUMP[%d] begin cpus=%d\n", (int)getpid(), g_cpus_n);
+    for (int i = 0; i < g_cpus_n; i++) {
+        OcerzCPU *c = g_cpus[i];
+        if (!c) continue;
+        fprintf(stderr, "ocerz: THREADDUMP[%d] cpu#%u host_tid=%#llx rip=%#llx rsp=%#llx rax=%#llx sys=%d/%d in_sig=%u blocked=%.1fs\n",
+                (int)getpid(), c->cpu_number, (unsigned long long)c->host_tid,
+                (unsigned long long)c->rip, (unsigned long long)c->gpr[OCERZ_RSP],
+                (unsigned long long)c->gpr[OCERZ_RAX], c->cur_sys_class, c->cur_sys_num,
+                c->in_sighandler, c->block_since_ns ? (double)(now - c->block_since_ns) / 1e9 : 0.0);
+        ocerz_pe_stack_dump(c, "THREADDUMP-PE");
+    }
+    fprintf(stderr, "ocerz: THREADDUMP[%d] end\n", (int)getpid());
+}
+
 /* OCERZ_PORTDUMP=1 + SIGUSR2: dump every receive right with queued messages.
  * Diagnostic for lost-wakeup wedges: a port with a growing queue and no
  * receiver names the conversation whose delivery ocerz dropped. */
@@ -2277,6 +2299,13 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
         sp.sa_flags = SA_SIGINFO | SA_NODEFER;
         sigaction(SIGUSR2, &sp, NULL);
         fprintf(stderr, "ocerz: PORTDUMP[%d] armed\n", (int)getpid());
+    }
+    {
+        struct sigaction st;
+        memset(&st, 0, sizeof st);
+        st.sa_sigaction = threaddump_handler;
+        st.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigaction(SIGINFO, &st, NULL);
     }
     g_vm = vm;
     if (vm->jit_enabled && !vm->jit)
