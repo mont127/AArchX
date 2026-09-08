@@ -2053,11 +2053,16 @@ static void threaddump_handler(int sig, siginfo_t *si, void *ctx)
     for (int i = 0; i < g_cpus_n; i++) {
         OcerzCPU *c = g_cpus[i];
         if (!c) continue;
-        fprintf(stderr, "ocerz: THREADDUMP[%d] cpu#%u host_tid=%#llx rip=%#llx rsp=%#llx rax=%#llx sys=%d/%d in_sig=%u blocked=%.1fs\n",
-                (int)getpid(), c->cpu_number, (unsigned long long)c->host_tid,
+        mach_port_t tport = 0;
+        for (int k = 0; k < g_cpus_n; k++)
+            if (g_cpus[k] == c) { tport = pthread_mach_thread_np(g_cpu_threads[k]); break; }
+        fprintf(stderr, "ocerz: THREADDUMP[%d] cpu#%u host_tid=%#llx port=%#x rip=%#llx rsp=%#llx rax=%#llx sys=%d/%d in_sig=%u blocked=%.1fs sigpend=%#llx sigmask=%#llx hostmask=%#x quit=%u/%u usr1=%u/%u\n",
+                (int)getpid(), c->cpu_number, (unsigned long long)c->host_tid, (unsigned)tport,
                 (unsigned long long)c->rip, (unsigned long long)c->gpr[OCERZ_RSP],
                 (unsigned long long)c->gpr[OCERZ_RAX], c->cur_sys_class, c->cur_sys_num,
-                c->in_sighandler, c->block_since_ns ? (double)(now - c->block_since_ns) / 1e9 : 0.0);
+                c->in_sighandler, c->block_since_ns ? (double)(now - c->block_since_ns) / 1e9 : 0.0,
+                (unsigned long long)c->sig_pending, (unsigned long long)c->sig_mask, c->host_mask_last,
+                c->sig_host_rcvd[SIGQUIT], c->sig_delivered[SIGQUIT], c->sig_host_rcvd[SIGUSR1], c->sig_delivered[SIGUSR1]);
         ocerz_pe_stack_dump(c, "THREADDUMP-PE");
     }
     fprintf(stderr, "ocerz: THREADDUMP[%d] end\n", (int)getpid());
