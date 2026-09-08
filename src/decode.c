@@ -2351,7 +2351,8 @@ static int decode_0f(DecState *s, uint8_t op2)
         case 0x69: op = OCERZ_OP_PUNPCKHWD; break;
         case 0x6a: op = OCERZ_OP_PUNPCKHDQ; break;
         case 0x6b: op = OCERZ_OP_PACKSSDW; break;
-        default: op = OCERZ_OP_PUNPCKLQDQ; break;
+        case 0x6c: op = OCERZ_OP_PUNPCKLQDQ; break;
+        default:   op = OCERZ_OP_PUNPCKHQDQ; break;   /* 0x6d */
         }
         return decode_pint(s, op, 1);
     }
