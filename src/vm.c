@@ -2428,6 +2428,14 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     ocerz_host_sigmask_clear("callback");
     sigsetjmp(jb, 1);
     g_cur_cpu = &local;
+    /* The thread running here is a guest CPU like any other -- for a dynamic
+     * binary this is where main() itself runs -- so put it in the registry.
+     * Without it SIGINFO reported cpus=0 for a process whose main thread was
+     * wedged in a syscall, and the unstick monitor could not see it either.
+     * Registration is idempotent, so the siglongjmp back to the sigsetjmp
+     * above re-running it is harmless; the single normal return below
+     * unregisters, and the two _exit() paths take the process with them. */
+    ocerz_cpu_register(&local);
     while (local.rip != sentinel && !vm->exited && !local.terminated) {
         g_riphist[g_riphist_n++ & 31] = local.rip;
         int r;
@@ -2548,6 +2556,7 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
             _exit(125);
         }
     }
+    ocerz_cpu_unregister(&local);
     g_sig_recover = prev_recover;
     if (prev_cpu && vm->jit_ordered_required)
         __atomic_store_n(&prev_cpu->ras_top, 0, __ATOMIC_RELEASE);
