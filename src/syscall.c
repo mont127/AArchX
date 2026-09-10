@@ -45,6 +45,8 @@
 #define OCERZ_F_GETPATH 50
 
 /* fcntl commands whose third argument is a guest pointer */
+static void peekguard(OcerzCPU *cpu, int class, int num, const char *when);
+
 static int ocerz_fcntl_ptr_cmd(int cmd)
 {
     switch (cmd) {
@@ -655,18 +657,20 @@ struct ocerz_sysctl_ovr {
     int mib[8];
     size_t miblen;
     int resolved;
+    uint8_t width;   /* bytes the real node returns; 0 = not probed, use 4 */
 };
 
+/* width is probed from the real node by ocerz_sysctl_ovr_resolve(). */
 static struct ocerz_sysctl_ovr g_sysctl_ovr[] = {
-    { "hw.machine",             1, "x86_64", 0,           {0}, 0, 0 },
-    { "hw.cputype",             0, NULL,     7,           {0}, 0, 0 },
-    { "hw.cpusubtype",          0, NULL,     4,           {0}, 0, 0 },
-    { "hw.cpufamily",           0, NULL,     0x573B5EECu, {0}, 0, 0 },
-    { "sysctl.proc_translated", 0, NULL,     1,           {0}, 0, 0 },
+    { "hw.machine",             1, "x86_64", 0,           {0}, 0, 0, 0 },
+    { "hw.cputype",             0, NULL,     7,           {0}, 0, 0, 0 },
+    { "hw.cpusubtype",          0, NULL,     4,           {0}, 0, 0, 0 },
+    { "hw.cpufamily",           0, NULL,     0x573B5EECu, {0}, 0, 0, 0 },
+    { "sysctl.proc_translated", 0, NULL,     1,           {0}, 0, 0, 0 },
     /* x86_64 processes must see 4K pages (Rosetta reports 4096 for all of */
-    { "hw.pagesize",            0, NULL,     4096,        {0}, 0, 0 },
-    { "hw.pagesize32",          0, NULL,     4096,        {0}, 0, 0 },
-    { "vm.pagesize",            0, NULL,     4096,        {0}, 0, 0 },
+    { "hw.pagesize",            0, NULL,     4096,        {0}, 0, 0, 0 },
+    { "hw.pagesize32",          0, NULL,     4096,        {0}, 0, 0, 0 },
+    { "vm.pagesize",            0, NULL,     4096,        {0}, 0, 0, 0 },
 };
 
 static void ocerz_sysctl_ovr_resolve(void)
@@ -678,15 +682,31 @@ static void ocerz_sysctl_ovr_resolve(void)
     for (unsigned i = 0; i < sizeof g_sysctl_ovr / sizeof g_sysctl_ovr[0]; i++) {
         g_sysctl_ovr[i].miblen = 8;
         if (sysctlnametomib(g_sysctl_ovr[i].name, g_sysctl_ovr[i].mib,
-                            &g_sysctl_ovr[i].miblen) == 0)
-            g_sysctl_ovr[i].resolved = 1;
+                            &g_sysctl_ovr[i].miblen) != 0)
+            continue;
+        g_sysctl_ovr[i].resolved = 1;
+        if (g_sysctl_ovr[i].is_str)
+            continue;
+        /* Mirror the real node's width, do not assume 4.  "hw.pagesize"
+         * reached by name is a 64-bit node -- the legacy {CTL_HW,
+         * HW_PAGESIZE} mib is the 32-bit one -- so writing 4 bytes into the
+         * 8 the caller offered left the top half of its variable dirty.
+         * sysconf(_SC_PHYS_PAGES) divides hw.memsize by exactly that
+         * variable, so it returned 0 whenever the stack happened to be
+         * non-zero there, and sort(1) died on "sysconf pages". */
+        uint64_t probe = 0;
+        size_t plen = sizeof probe;
+        if (sysctl(g_sysctl_ovr[i].mib, (unsigned)g_sysctl_ovr[i].miblen,
+                   &probe, &plen, NULL, 0) == 0 && (plen == 4 || plen == 8))
+            g_sysctl_ovr[i].width = (uint8_t)plen;
     }
 }
 
 static int ocerz_sysctl_ovr_emit(OcerzCPU *cpu, const struct ocerz_sysctl_ovr *o,
                                  uint64_t oldp, uint64_t oldlenp)
 {
-    uint64_t need = o->is_str ? (uint64_t)strlen(o->sval) + 1 : 4;
+    uint64_t need = o->is_str ? (uint64_t)strlen(o->sval) + 1
+                             : (o->width ? o->width : 4);
     if (oldp) {
         uint64_t cap = oldlenp ? ocerz_ld(oldlenp, 8) : need;
         if (cap < need) {
@@ -699,7 +719,7 @@ static int ocerz_sysctl_ovr_emit(OcerzCPU *cpu, const struct ocerz_sysctl_ovr *o
             for (uint64_t k = 0; k < need; k++)
                 ocerz_st(oldp + k, 1, (uint64_t)(uint8_t)o->sval[k]);
         else
-            ocerz_st(oldp, 4, o->ival);
+            ocerz_st(oldp, (int)need, o->ival);
     }
     if (oldlenp)
         ocerz_st(oldlenp, 8, need);
@@ -733,8 +753,10 @@ static int sys_sysctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
          * sysconf(_SC_PAGESIZE) use {CTL_HW, HW_PAGESIZE} directly, which
          * must report 4K to an x86_64 process (Rosetta does). */
         if (nlen == 2 && mib[0] == 6 /* CTL_HW */ && mib[1] == 7 /* HW_PAGESIZE */) {
+            /* width 4: the legacy numeric node really is the 32-bit one,
+             * unlike "hw.pagesize" reached by name.  See ovr_resolve. */
             static const struct ocerz_sysctl_ovr pgo =
-                { "hw.pagesize(legacy)", 0, NULL, 4096, {0}, 2, 1 };
+                { "hw.pagesize(legacy)", 0, NULL, 4096, {0}, 2, 1, 4 };
             return ocerz_sysctl_ovr_emit(cpu, &pgo, a[2], a[3]);
         }
     }
@@ -1824,6 +1846,91 @@ struct ocerz_ool_save { uint64_t off; uint64_t orig; };
 
 static int g_sendxlate_off = -1;
 
+
+/* A guest mach_vm_map(FIXED|OVERWRITE) is 4 KB-granular, the host kernel is
+ * 16 KB-granular.  When the request does not start and end on a host page,
+ * the kernel replaces the whole enclosing host pages and takes the guest
+ * bytes on either side with it -- guest memory the request never named.
+ * mmap() goes through mem.c, which owns the 4 KB-in-16 KB slot machinery;
+ * this path hands the message straight to the kernel, so it has to preserve
+ * the fragments itself: copy them out before the call and put them back
+ * after.  Safari asked for 0x4000 at a ...e000 address inside the shared
+ * cache and lost the 8 KB below it, which held a constant Engram checks with
+ * a Swift precondition -- it trapped one framework away from the cause. */
+static __thread struct {
+    int armed;
+    uint64_t head_lo, head_n;
+    uint64_t tail_lo, tail_n;
+    uint8_t *head, *tail;
+} g_vmmap_pad;
+
+static uint8_t *vmmap_pad_take(uint64_t lo, uint64_t n)
+{
+    if (!n)
+        return NULL;
+    uint8_t *b = (uint8_t *)malloc((size_t)n);
+    if (!b)
+        return NULL;
+    for (uint64_t i = 0; i < n; i++) {
+        if (!ocerz_addr_readable(lo + i) && !ocerz_cache_region((uintptr_t)(lo + i))) {
+            free(b);
+            return NULL;
+        }
+        b[i] = (uint8_t)ocerz_ld(lo + i, 1);
+    }
+    return b;
+}
+
+static void vmmap_pad_save(uint64_t gmsg, uint32_t send_size)
+{
+    g_vmmap_pad.armed = 0;
+    if (send_size && send_size < 0x4c)
+        return;
+    uint32_t flags = (uint32_t)ocerz_ld(gmsg + 0x48, 4);
+    if ((flags & 0x1u) || !(flags & 0x4000u))      /* ANYWHERE, or not OVERWRITE */
+        return;
+    uint64_t addr = ocerz_ld(gmsg + 0x30, 8);
+    uint64_t size = ocerz_ld(gmsg + 0x38, 8);
+    if (!addr || !size || size > (1ull << 30))
+        return;
+    const uint64_t hp = OCERZ_HOST_PAGE_SIZE;
+    uint64_t lo = addr & ~(hp - 1);
+    uint64_t hi = (addr + size + hp - 1) & ~(hp - 1);
+    if (lo == addr && hi == addr + size)
+        return;                                    /* host-page aligned: nothing to lose */
+    g_vmmap_pad.head_lo = lo;
+    g_vmmap_pad.head_n  = addr - lo;
+    g_vmmap_pad.tail_lo = addr + size;
+    g_vmmap_pad.tail_n  = hi - (addr + size);
+    g_vmmap_pad.head = vmmap_pad_take(g_vmmap_pad.head_lo, g_vmmap_pad.head_n);
+    g_vmmap_pad.tail = vmmap_pad_take(g_vmmap_pad.tail_lo, g_vmmap_pad.tail_n);
+    g_vmmap_pad.armed = (g_vmmap_pad.head || g_vmmap_pad.tail);
+    if (g_vmmap_pad.armed && getenv("OCERZ_VMMAPLOG"))
+        fprintf(stderr, "ocerz: VMMAP-PAD save addr=%#llx size=%#llx head=%#llx+%#llx tail=%#llx+%#llx\n",
+                (unsigned long long)addr, (unsigned long long)size,
+                (unsigned long long)g_vmmap_pad.head_lo, (unsigned long long)g_vmmap_pad.head_n,
+                (unsigned long long)g_vmmap_pad.tail_lo, (unsigned long long)g_vmmap_pad.tail_n);
+}
+
+static void vmmap_pad_restore(void)
+{
+    if (!g_vmmap_pad.armed)
+        return;
+    g_vmmap_pad.armed = 0;
+    if (g_vmmap_pad.head) {
+        for (uint64_t i = 0; i < g_vmmap_pad.head_n; i++)
+            ocerz_st(g_vmmap_pad.head_lo + i, 1, g_vmmap_pad.head[i]);
+        free(g_vmmap_pad.head);
+        g_vmmap_pad.head = NULL;
+    }
+    if (g_vmmap_pad.tail) {
+        for (uint64_t i = 0; i < g_vmmap_pad.tail_n; i++)
+            ocerz_st(g_vmmap_pad.tail_lo + i, 1, g_vmmap_pad.tail[i]);
+        free(g_vmmap_pad.tail);
+        g_vmmap_pad.tail = NULL;
+    }
+}
+
 static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
                                         struct ocerz_ool_save *saved, int max_saved)
 {
@@ -1884,6 +1991,15 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
      * FIXED|OVERWRITE, so what the kernel maps is what the guest sees.
      * Request body after the object port descriptor: NDR@0x28 address@0x30
      * size@0x38 mask@0x40 flags@0x48. */
+    if (msg_id == 4811) {
+        if ((!send_size || send_size >= 0x4c) && getenv("OCERZ_VMMAPLOG"))
+            fprintf(stderr, "ocerz: VMMAP-REQ addr=%#llx size=%#llx mask=%#llx flags=%#x\n",
+                    (unsigned long long)ocerz_ld(gmsg + 0x30, 8),
+                    (unsigned long long)ocerz_ld(gmsg + 0x38, 8),
+                    (unsigned long long)ocerz_ld(gmsg + 0x40, 8),
+                    (unsigned)ocerz_ld(gmsg + 0x48, 4));
+        vmmap_pad_save(gmsg, send_size);
+    }
     if (msg_id == 4811 && ocerz_low_base && (bits & 0x80000000u) &&
         (!send_size || send_size >= 0x4c) && !getenv("OCERZ_NO_VMMAP_STEER")) {
         uint32_t flags = (uint32_t)ocerz_ld(gmsg + 0x48, 4);
@@ -2778,11 +2894,19 @@ static int sys_sigaction(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int sig = (int)a[0];
     uint64_t act = a[1];
     uint64_t oact = a[2];
+    /* The two directions do NOT share a layout.  The kernel takes a
+     * `struct __sigaction` in -- 24 bytes, sa_tramp at 8, sa_mask at 16,
+     * sa_flags at 20 -- but hands back a `struct sigaction`, which has no
+     * trampoline: 16 bytes, sa_mask at 8, sa_flags at 12.  Writing the
+     * inbound layout to oldact overran the caller's 16-byte buffer by 8
+     * bytes and reported mask and flags from the wrong offsets.  In sort(1)
+     * those 8 bytes were the saved rbx one slot above a sigaction() oldact
+     * local, so its `outfile` pointer came back from the epilogue as NULL
+     * and it died dereferencing it. */
     if (oact != 0 && sig >= 0 && sig < OCERZ_NSIG) {
         ocerz_st(oact + 0, 8, guest_sigact[sig].handler);
-        ocerz_st(oact + 8, 8, guest_sigact[sig].tramp);
-        ocerz_st(oact + 16, 4, (uint32_t)guest_sigact[sig].mask);
-        ocerz_st(oact + 20, 4, guest_sigact[sig].flags);
+        ocerz_st(oact + 8, 4, (uint32_t)guest_sigact[sig].mask);
+        ocerz_st(oact + 12, 4, guest_sigact[sig].flags);
     }
     if (act != 0 && sig >= 0 && sig < OCERZ_NSIG) {
         guest_sigact[sig].handler = ocerz_ld(act, 8);
@@ -3640,6 +3764,11 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [413] = { "sendto_nocancel", 6, 0x12, 0, NULL },
     [414] = { "pread_nocancel", 4, 0x02, 0, NULL },
     [415] = { "pwrite_nocancel",4, 0x02, 0, NULL },
+    /* the iovec pair needs the same guest-pointer translation as 120/121, so
+     * they share the handlers rather than falling through to the host.
+     * Without these, sort(1) took ENOSYS from its first writev and died. */
+    [411] = { "readv_nocancel", 3, 0x00, 0, sys_readv },
+    [412] = { "writev_nocancel",3, 0x00, 0, sys_writev },
     [417] = { "poll_nocancel", 3, 0x01, 0, NULL },
     [420] = { "sem_wait_nocancel", 1, 0x00, 0, NULL },
     [423] = { "__semwait_signal_nocancel", 6, 0x00, 0, NULL },
@@ -4521,6 +4650,15 @@ static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
     uint64_t haddr = ocerz_ld(reply_buf + 0x24, 8);
     if (haddr == 0 || (haddr >= ocerz_arena_lo && haddr < ocerz_arena_hi))
         return;
+    /* The shared cache is the other guest-visible window: guest code runs at
+     * these very addresses, so a reply that lands in it has nothing to
+     * relocate.  Moving it would mach_vm_deallocate() a range every image in
+     * the cache is linked against, and the hole is only noticed when some
+     * unrelated code touches the page.  Safari died that way one mach_msg
+     * after a mach_vm_map (id 4911) reply came back on a cache __DATA page:
+     * the next _platform_* access to it faulted and took the thread out. */
+    if (ocerz_cache_region((uintptr_t)haddr))
+        return;
     /* a steered mach_vm_map already landed at a registered guest identity
      * address: nothing to relocate (moving it would strand the kernel's record) */
     if (ocerz_low_base && haddr >= OCERZ_LOW_LIMIT && haddr < OCERZ_TOP_LO &&
@@ -4670,9 +4808,21 @@ static void ocerz_reply_relocate_ool(uint64_t reply_buf, uint32_t recv_size,
                    sizeof raw_descriptor);
 
             uint64_t bytes = (type == 2) ? (uint64_t)ool_n * 4u : ool_n;
+            /* The shared cache is guest-visible memory, not host-only memory
+             * the kernel just handed us: there is nothing to copy out of it,
+             * and ocerz_release_received_ool() would mach_vm_deallocate() a
+             * range every image in the cache is linked against.  The page
+             * comes back zero-filled on the next fault, so the damage only
+             * shows up when unrelated code reads a constant and gets 0 --
+             * Safari tripped a Swift precondition in Engram that way, a
+             * whole framework away from the message that caused it.
+             * ocerz_host_in_guest_reservation() only knows the arena, hence
+             * the explicit cache test (mig_vm_reply_relocate needs the
+             * same guard, for the same reason). */
             int host_owned = ool_addr &&
                              !ocerz_host_in_guest_reservation(
-                                 (const void *)(uintptr_t)ool_addr);
+                                 (const void *)(uintptr_t)ool_addr) &&
+                             !ocerz_cache_region((uintptr_t)ool_addr);
             if (rlog)
                 fprintf(stderr, "ocerz: REPLY-OOL(t%d)[%d] type=%u ool_addr=%#llx bytes=%#llx host=%d\n",
                         trap, (int)getpid(), type, (unsigned long long)ool_addr,
@@ -5349,6 +5499,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                         (int)getpid(), cpu->cpu_number, (unsigned long long)r47,
                         (unsigned long long)cpu->rip);
         }
+        vmmap_pad_restore();
         mach_ret(cpu, r47);
         if (nsv47)
             ocerz_send_restore_descriptors(reply_buf, sv47, nsv47);
@@ -6038,11 +6189,42 @@ static void pagetrap_check(OcerzCPU *cpu, int num)
     pe_scan_print(cpu, "PAGETRAP", d);
 }
 
+/* OCERZ_PEEKGUARD=<addr>: watch one guest word across the syscall boundary
+ * and report the first call it changes across.  A store watch only sees the
+ * guest's own stores; this catches the other two writers -- ocerz copying
+ * into guest memory, and the kernel writing through a buffer ocerz handed
+ * it -- by bracketing every syscall. */
+static void peekguard(OcerzCPU *cpu, int class, int num, const char *when)
+{
+    static uint64_t addr, last;
+    static int on = -1;
+    if (on < 0) {
+        const char *g = getenv("OCERZ_PEEKGUARD");
+        on = g ? 1 : 0;
+        if (on) { addr = strtoull(g, NULL, 0); last = ocerz_ld(addr, 8); }
+    }
+    if (!on)
+        return;
+    uint64_t v = ocerz_ld(addr, 8);
+    if (v != last) {
+        fprintf(stderr, "ocerz: PEEKGUARD [%#llx] %#llx -> %#llx at %s of sys=%d/%d rip=%#llx "
+                        "a0=%#llx a1=%#llx a2=%#llx\n",
+                (unsigned long long)addr, (unsigned long long)last, (unsigned long long)v,
+                when, class, num, (unsigned long long)cpu->rip,
+                (unsigned long long)cpu->gpr[OCERZ_RDI],
+                (unsigned long long)cpu->gpr[OCERZ_RSI],
+                (unsigned long long)cpu->gpr[OCERZ_RDX]);
+        fflush(stderr);
+        last = v;
+    }
+}
+
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t rax = cpu->gpr[OCERZ_RAX];
     int class = (int)((rax >> 24) & 0xff);
     int num = (int)(rax & 0xffffff);
+    peekguard(cpu, class, num, "entry");
 
     if (class == 2 && (num == 4 || num == 121 || num == 154 || num == 397 || num == 415))
         writetrap_check(cpu, num == 121 ? 121 : 4);   /* write/pwrite family: buf=rsi len=rdx */
@@ -6189,6 +6371,7 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
     /* Return edge: deliver what arrived during the call, and re-offer anything
      * the mask was holding -- sigprocmask() and sigreturn() land here too, so
      * lowering the mask releases held signals at once. */
+    peekguard(cpu, class, num, "exit");
     if (rc == OCERZ_STEP_OK)
         deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig());
     return rc;
