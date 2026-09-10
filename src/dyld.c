@@ -868,22 +868,32 @@ static int build_frame(const char *path, int argc, char **argv, char **envp, Dyn
 
     sp &= ~0xfull;
 
-    uint64_t argv_arr = sp - (uint64_t)(argc + 1) * 8;
+    /* The three vectors are one contiguous ascending run --
+     * argv NULL envp NULL apple NULL -- because that is the layout XNU's
+     * exec path produces and libSystem relies on it: apple is not passed
+     * anywhere, it is found by walking off the end of envp
+     * (apple = &envp[envc + 1]).  Stacking them downward instead put the
+     * argv vector where apple belongs, so that walk ran past argv's
+     * terminator into the string area and handed strlen() the bytes of
+     * "th_port=0x..." as a pointer.  python3 died there. */
+    uint64_t vec_bytes = ((uint64_t)argc + 1 + (uint64_t)envc + 1 +
+                          (uint64_t)applec + 1) * 8;
+    uint64_t argv_arr = (sp - vec_bytes) & ~0xfull;
     for (int i = 0; i < argc; i++)
         ocerz_st(argv_arr + (uint64_t)i * 8, 8, argv_g[i]);
     ocerz_st(argv_arr + (uint64_t)argc * 8, 8, 0);
 
-    uint64_t envp_arr = argv_arr - (uint64_t)(envc + 1) * 8;
+    uint64_t envp_arr = argv_arr + ((uint64_t)argc + 1) * 8;
     for (int i = 0; i < envc; i++)
         ocerz_st(envp_arr + (uint64_t)i * 8, 8, envp_g[i]);
     ocerz_st(envp_arr + (uint64_t)envc * 8, 8, 0);
 
-    uint64_t apple_arr = envp_arr - (uint64_t)(applec + 1) * 8;
+    uint64_t apple_arr = envp_arr + ((uint64_t)envc + 1) * 8;
     for (int i = 0; i < applec; i++)
         ocerz_st(apple_arr + (uint64_t)i * 8, 8, apple_g[i]);
     ocerz_st(apple_arr + (uint64_t)applec * 8, 8, 0);
 
-    uint64_t cells = (apple_arr - 8 * 8) & ~0xfull;
+    uint64_t cells = (argv_arr - 8 * 8) & ~0xfull;
     const char *slash = strrchr(argv[0], '/');
     uint64_t leaf = argv_g[0] + (slash ? (uint64_t)(slash - argv[0] + 1) : 0);
     ocerz_st(cells + 0, 4, (uint64_t)argc);
@@ -1124,6 +1134,66 @@ static void eager_add_direct_deps(OcerzCache *cache, uint64_t mh)
     }
 }
 
+/* Does this program pull in CoreFoundation / Foundation / AppKit through its
+ * own frameworks?  img.links_cf asks the same question of the main
+ * executable's own load commands, which is the wrong depth for an
+ * application bundle: a .app is a small stub that links one umbrella
+ * framework and libSystem and nothing else, so Safari -- a Cocoa app by any
+ * measure -- read as "not a CF program" and skipped the dependency-ordered
+ * initializer phase completely.
+ *
+ * libSystem's own closure is deliberately not followed.  libxpc weak-links
+ * XPCSupport, which links Foundation, so descending there makes *every*
+ * dynamically linked program look like a Cocoa app -- /usr/bin/sort included
+ * -- and turns the initializer phase on for all of them.  Names only, no
+ * section scanning: this runs before compute_eager_set(). */
+static int is_libsystem_path(const char *p)
+{
+    return strstr(p, "/usr/lib/system/") != NULL ||
+           strcmp(p, "/usr/lib/libSystem.B.dylib") == 0;
+}
+
+static int closure_links_cf(OcerzCache *cache, uint64_t main_mh)
+{
+    static uint64_t seen[EAGER_MAX];
+    int n = 0;
+    if (main_mh)
+        seen[n++] = main_mh;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *h = (const uint8_t *)ocerz_g2h(seen[i]);
+        if (rd32(h) != MH_MAGIC_64)
+            continue;
+        uint32_t ncmds = rd32(h + 16);
+        const uint8_t *lc = h + sizeof(struct mach_header_64);
+        for (uint32_t j = 0; j < ncmds; j++) {
+            uint32_t cmd = rd32(lc);
+            if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+                cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+                uint32_t noff = rd32(lc + 8);
+                if (noff < rd32(lc + 4)) {
+                    const char *dp = (const char *)(lc + noff);
+                    if (strstr(dp, "/CoreFoundation.framework/") ||
+                        strstr(dp, "/Foundation.framework/") ||
+                        strstr(dp, "/AppKit.framework/"))
+                        return 1;
+                    if (is_libsystem_path(dp))
+                        continue;
+                    uint64_t dmh = dep_mh(cache, dp);
+                    if (dmh && n < EAGER_MAX) {
+                        int dup = 0;
+                        for (int k = 0; k < n; k++)
+                            if (seen[k] == dmh) { dup = 1; break; }
+                        if (!dup)
+                            seen[n++] = dmh;
+                    }
+                }
+            }
+            lc += rd32(lc + 4);
+        }
+    }
+    return 0;
+}
+
 static void compute_eager_set(OcerzCache *cache, uint64_t main_mh)
 {
     build_segs(cache);
@@ -1138,8 +1208,19 @@ static void compute_eager_set(OcerzCache *cache, uint64_t main_mh)
             eager_add(mh);
     }
     int root_n = g_eager_n;
-    for (int i = 0; i < g_eager_n; i++)
+    /* Close the set under dependencies as well as over data references.
+     * run_init_phase() recurses into every dependency but only *runs* the
+     * initializers of images in this set, so an image here whose dependency
+     * is missing gets initialized on top of an uninitialized library.  That
+     * is how Safari aborted in an Engram static initializer that called
+     * operator new before libc++abi's own initializer had run: libc++abi is
+     * not under /usr/lib/system/, is not a direct dependency of the stub, and
+     * no scanned pointer happened to land in it.  g_eager_n grows as this
+     * loop runs, so appending inside it walks the whole closure. */
+    for (int i = 0; i < g_eager_n; i++) {
+        eager_add_direct_deps(cache, g_eager[i]);
         scan_uses(g_eager[i]);
+    }
     if (getenv("OCERZ_INITLOG"))
         fprintf(stderr, "dynamic: eager init set: root=%d eager=%d (of closure)\n", root_n, g_eager_n);
 }
@@ -1517,6 +1598,12 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
     const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
     if (rd32(h) != MH_MAGIC_64)
         return;
+    /* Pruning on g_init_done is what keeps this walk small: the libSystem
+     * closure is marked done the moment libSystem_initializer returns, so a
+     * library whose only dependency is libSystem -- libc++abi, say -- stops
+     * right there and initializes early, instead of descending through
+     * libxpc into Foundation and dragging the whole system into its own
+     * subtree. */
     int idx = init_mark(mh);
     if (idx >= 0 && (g_init_done[idx] || g_init_gen[idx] == g_init_cur_gen)) {
         if (getenv("OCERZ_INITTRACE"))
@@ -1547,8 +1634,17 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
     }
     for (uint32_t j = 0; j < ncmds; j++) {
         uint32_t cmd = rd32(lc);
+        /* LC_LOAD_UPWARD_DYLIB is skipped on purpose.  An upward link is how a
+         * library declares the back edge of a dependency cycle -- "I need
+         * this, but it needs me, so do not wait for it" -- and it is an
+         * ordering edge for nothing.  Following it made CoreFoundation's
+         * upward link to CoreServicesInternal a real edge, which put all of
+         * QuickLookThumbnailing, SiriTTS and CoreML inside libc++abi's
+         * dependency subtree: libc++abi then sat unfinished on the recursion
+         * stack while MLAssetIO's initializer ran and called operator new
+         * into a libc++ that had not been initialized yet. */
         if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
-            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+            cmd == LC_REEXPORT_DYLIB) {
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4)) {
                 uint64_t dmh = dep_mh(cache, (const char *)(lc + noff));
@@ -1567,9 +1663,27 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
     if (vm->exited)
         return;
     if (mh != skip_mh && (g_init_force || g_eager_n == 0 || eager_has(mh))) {
+        /* dyld's order, per image and bottom-up: this image's objc load
+         * notification (its +load methods) and then its own initializers,
+         * with every dependency already finished.  Neither global order
+         * works: all +load first runs SiriTTSService's ahead of libc++'s
+         * initializer, and all initializers first recurses libsystem_malloc
+         * into its own zone setup. */
+        if (idx < 0 || !g_load_done[idx]) {
+            ocerz_dyldapi_run_image_loads(vm, mh, stack_top);
+            if (idx >= 0)
+                g_load_done[idx] = 1;
+            if (vm->exited)
+                return;
+        }
         run_image_inits(vm, mh, ia, stack_top);
         if (idx >= 0)
             g_init_done[idx] = 1;
+    } else if (getenv("OCERZ_INITLOG")) {
+        /* an image with initializers that never runs them is the shape of an
+         * ordering bug: say so rather than leaving it silent */
+        fprintf(stderr, "INITSKIP mh=%#llx eager=%d is_libsystem=%d\n",
+                (unsigned long long)mh, eager_has(mh), mh == skip_mh);
     }
 }
 
@@ -1592,7 +1706,7 @@ static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t
     for (uint32_t j = 0; j < ncmds; j++) {
         uint32_t cmd = rd32(lc);
         if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
-            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+            cmd == LC_REEXPORT_DYLIB) {   /* upward links are not ordering edges */
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4))
                 run_load_phase(vm, cache, dep_mh(cache, (const char *)(lc + noff)),
@@ -2364,6 +2478,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
 
     ocerz_vm_install_handlers(vm);
     ocerz_commpage_init();
+    { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("cache-mapped"); }
     if (ocerz_dyldapi_setup(&cache) != OCERZ_OK)
         OCERZ_LOG("dynamic: dyld API shim not installed\n");
 
@@ -2408,6 +2523,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
             if (vm->exited)
                 return vm->exit_code;
             OCERZ_LOG("dynamic: libSystem_initializer returned\n");
+            { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("post-libSystem"); }
             ran_init = 1;
         } else {
             OCERZ_LOG("dynamic: no libSystem initializer found\n");
@@ -2417,15 +2533,22 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
             g_libsys_mh = dep_find(&cache, "/usr/lib/libSystem.B.dylib");
             init_mark_done_closure(&cache, g_libsys_mh);
         }
-        if (ran_init && (img.links_cf || getenv("OCERZ_INITPHASE")) && !getenv("OCERZ_NOINITPHASE")) {
+        if (ran_init && (img.links_cf || closure_links_cf(&cache, img.load_base) ||
+                         getenv("OCERZ_INITPHASE")) && !getenv("OCERZ_NOINITPHASE")) {
             uint64_t libsys = g_libsys_mh;
             compute_eager_set(&cache, img.load_base);
             OCERZ_LOG("dynamic: eager init set = %d images (of closure)\n", g_eager_n);
             ocerz_tlv_register_closure(vm, &cache, img.load_base, fr.stack_top);
             if (vm->exited)
                 return vm->exit_code;
+            /* The libSystem closure is already initialized -- its
+             * initializers ran inside libSystem_initializer and
+             * init_mark_done_closure() recorded that -- so the walk below
+             * prunes it.  Deliver its objc load notifications here, before
+             * that prune hides them; everything else gets its notification
+             * interleaved with its initializers, the way dyld does it. */
             g_init_cur_gen++;
-            run_load_phase(vm, &cache, img.load_base, fr.stack_top, libsys);
+            run_load_phase(vm, &cache, libsys, fr.stack_top, 0);
             if (vm->exited)
                 return vm->exit_code;
             g_init_cur_gen++;
@@ -2434,6 +2557,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
             if (vm->exited)
                 return vm->exit_code;
             OCERZ_LOG("dynamic: initializer phase complete\n");
+            { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("post-init-phase"); }
         }
         if (ran_init)
             g_run_init_ready = 1;
