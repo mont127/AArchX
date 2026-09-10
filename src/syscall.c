@@ -2988,6 +2988,7 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             int fatal = (signo == 4 || signo == 5 || signo == 6 || signo == 8 ||
                          signo == 10 || signo == 11 || signo == 3 || signo == 7);
             if (fatal) {
+                { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("guest-abort"); }
                 fprintf(stderr, "ocerz: guest self-signal %llu, no handler; exiting %d\n",
                         (unsigned long long)signo, 128 + (int)signo);
                 fflush(stderr);
