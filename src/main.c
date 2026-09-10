@@ -43,8 +43,6 @@ static void apply_wine_defaults(const char *path)
         "/AppKit.framework/,/QuartzCore.framework/,/HIToolbox.framework/,/CoreSpotlight.framework/";
     if (!is_wine_loader(path))
         return;
-    if (!getenv("OCERZ_HOSTWQ"))
-        setenv("OCERZ_HOSTWQ", "1", 0);
     const char *preload = getenv("OCERZ_PRELOAD_OBJC");
     if (!preload || strcmp(preload, "1") == 0)
         setenv("OCERZ_PRELOAD_OBJC", objc_images, 1);
