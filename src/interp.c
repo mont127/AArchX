@@ -1547,6 +1547,29 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
             if (rtr[ti] && cpu->rip == rtr[ti]) {
                 fprintf(stderr, "ocerz: REGTRAP rip=%#llx\n", (unsigned long long)cpu->rip);
                 ocerz_cpu_dump(cpu, stderr);
+                /* OCERZ_REGTRAP_DEREF=1: 0x40 bytes behind every register that
+                 * points at readable guest memory.  A heap address is never
+                 * the same twice, so a watch cannot be aimed at it in a later
+                 * run -- the trap has to report the memory itself. */
+                if (getenv("OCERZ_REGTRAP_DEREF")) {
+                    static const char *const rn[16] = {
+                        "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                        "r8","r9","r10","r11","r12","r13","r14","r15" };
+                    for (int g = 0; g < 16; g++) {
+                        uint64_t base = cpu->gpr[g];
+                        if (base < 0x1000 || !ocerz_addr_readable(base))
+                            continue;
+                        fprintf(stderr, "  [%s=%#llx]", rn[g], (unsigned long long)base);
+                        for (int o = -0x20; o < 0x40; o += 8) {
+                            uint64_t at = base + (uint64_t)(int64_t)o;
+                            if (o == 0) fprintf(stderr, " |");
+                            if (ocerz_addr_readable(at))
+                                fprintf(stderr, " %+d:%016llx", o,
+                                        (unsigned long long)ocerz_ld(at, 8));
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
                 break;
             }
     }

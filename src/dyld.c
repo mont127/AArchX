@@ -1314,7 +1314,24 @@ static void ocerz_tlv_register_image(OcerzVM *vm, OcerzCache *cache, uint64_t mh
     uint64_t descs_rt = (uint64_t)((int64_t)vars_addr + slide);
     for (uint64_t off = 0; off + 24 <= vars_size; off += 24) {
         uint64_t desc = descs_rt + off;
-        uint32_t var_off = (uint32_t)ocerz_ld(desc + 16, 8);
+        /* Two descriptor layouts share the same 24 bytes.  A static linker
+         * emits the classic tlv_descriptor { thunk, key:u64, offset:u64 },
+         * so the offset is the 8 bytes at +0x10.  The shared cache ships the
+         * packed form dyld uses now -- { thunk, key:u32, offset:u32,
+         * initialContentDelta:i32, initialContentSize:u32 } -- where the
+         * offset is the u32 at +0xc and +0x10 is the delta.  We always WRITE
+         * the packed form, so reading +0x10 unconditionally took the delta
+         * (0) for a cache image and then stored that over the real offset:
+         * every thread-local in the image collapsed onto offset 0 and they
+         * all aliased each other.  SwiftUI reads a thread-local holding its
+         * current PropertyList element that way, got the small integer that
+         * lives at block offset 0, and unconditionally cast it to a class --
+         * "Could not cast value of type 'NSIndirectTaggedPointerString'".
+         * A key is small enough that a classic descriptor's u64 leaves +0xc
+         * zero, so a non-zero +0xc means the packed form is already there. */
+        uint32_t packed_off = (uint32_t)ocerz_ld(desc + 0xc, 4);
+        uint32_t var_off = packed_off ? packed_off
+                                      : (uint32_t)ocerz_ld(desc + 0x10, 8);
         int32_t self_rel = has_data
             ? (int32_t)((int64_t)tmpl_runtime - (int64_t)(desc + 0x10))
             : 0;
