@@ -2317,6 +2317,52 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
         vm->jit = ocerz_jit_create(vm);
 }
 
+/* OCERZ_PEEK=a[,b,...]: dump those guest words.  The crash handler has its
+ * own async-signal-safe copy; this one serves the places that are not signal
+ * context -- a guest UD2, and startup -- because "was this global already
+ * wrong before the guest ran, or did something change it?" is the first
+ * question worth asking when a guest assertion fires on a constant. */
+void ocerz_peek_dump(const char *tag)
+{
+    const char *pk = getenv("OCERZ_PEEK");
+    if (!pk)
+        return;
+    fprintf(stderr, "ocerz: peek(%s):", tag ? tag : "");
+    while (*pk) {
+        uint64_t a = strtoull(pk, (char **)&pk, 0);
+        if (*pk == ',')
+            pk++;
+        fprintf(stderr, " [%#llx]=", (unsigned long long)a);
+        /* the shared cache is readable guest memory too, and
+         * ocerz_addr_readable() only knows the arena */
+        if (ocerz_addr_readable(a) || ocerz_cache_region((uintptr_t)a))
+            fprintf(stderr, "%#llx", (unsigned long long)ocerz_ld(a, 8));
+        else
+            fprintf(stderr, "uncommitted");
+        /* the host mapping behind it too: a value that changed with no guest
+         * store is either an emulator-side write into the same mapping or a
+         * remap, and the region identity tells the two apart */
+        mach_vm_address_t ra = a;
+        mach_vm_size_t rs = 0;
+        vm_region_basic_info_data_64_t bi;
+        mach_msg_type_number_t bc = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t ob = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&bi, &bc, &ob) == KERN_SUCCESS) {
+            if (ob != MACH_PORT_NULL)
+                mach_port_deallocate(mach_task_self(), ob);
+            fprintf(stderr, "{region %#llx+%#llx %c%c%c}",
+                    (unsigned long long)ra, (unsigned long long)rs,
+                    bi.protection & VM_PROT_READ ? 'r' : '-',
+                    bi.protection & VM_PROT_WRITE ? 'w' : '-',
+                    bi.protection & VM_PROT_EXECUTE ? 'x' : '-');
+        }
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+
+}
+
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top)
 {
     static const int ar[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
@@ -2432,13 +2478,24 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
             _exit(126);
         }
         if (mtrace_lo && local.rip >= mtrace_lo && local.rip < mtrace_hi) {
-            fprintf(stderr, "MT %#llx rax=%#llx rdi=%#llx rsi=%#llx rsp=%#llx [rsp]=%#llx\n",
+            /* The callee-saved set is here on purpose.  "a register the ABI
+             * says survives a call did not" is a whole class of emulation
+             * bug, and without rbx/rbp/r12-r15 in the trace there is no way
+             * to see which call lost one. */
+            fprintf(stderr, "MT %#llx rax=%#llx rdi=%#llx rsi=%#llx rsp=%#llx [rsp]=%#llx"
+                            " rbx=%#llx rbp=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
                     (unsigned long long)local.rip,
                     (unsigned long long)local.gpr[OCERZ_RAX],
                     (unsigned long long)local.gpr[OCERZ_RDI],
                     (unsigned long long)local.gpr[OCERZ_RSI],
                     (unsigned long long)local.gpr[OCERZ_RSP],
-                    (unsigned long long)ocerz_ld(local.gpr[OCERZ_RSP], 8));
+                    (unsigned long long)ocerz_ld(local.gpr[OCERZ_RSP], 8),
+                    (unsigned long long)local.gpr[OCERZ_RBX],
+                    (unsigned long long)local.gpr[OCERZ_RBP],
+                    (unsigned long long)local.gpr[OCERZ_R12],
+                    (unsigned long long)local.gpr[OCERZ_R13],
+                    (unsigned long long)local.gpr[OCERZ_R14],
+                    (unsigned long long)local.gpr[OCERZ_R15]);
             mtrace_hit = 1;
         }
         }
@@ -2485,6 +2542,7 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
                 fprintf(stderr, "\n");
             }
             ocerz_cpu_dump(&local, stderr);
+            ocerz_peek_dump("fatal");
             OCERZ_FATAL("initializer call to %#llx aborted after %llu instructions\n",
                         (unsigned long long)func, (unsigned long long)vm->insn_count);
             _exit(125);
