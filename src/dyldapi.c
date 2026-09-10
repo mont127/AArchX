@@ -17,7 +17,6 @@
 
 #define DYLDAPI_VTABLE_SIZE 0x2000
 
-#define DYLDAPI_CLOSURE_MAX 1024
 #define PRELOAD_MAX 8192
 
 static uint64_t g_apis_global;
@@ -35,20 +34,31 @@ static uint64_t g_cache_size;
 uint64_t g_main_path;
 
 #define DYLDAPI_NOOP_OFF 0x2000
-static uint64_t g_closure_mh[DYLDAPI_CLOSURE_MAX];
+/* The dependency closure, and an open-addressed set of the same mach_headers
+ * so that adding to it stays O(1).  Both are sized from the cache in
+ * ocerz_dyldapi_setup(), because a process can load every image the cache
+ * has: Safari's closure is about 1500 of this cache's 3609.  They are NULL
+ * until then -- ocerz_dyldapi_register_image() runs first for the main
+ * image's disk dependencies, and compute_closure() picks those up from
+ * g_disk_mh[] at the end. */
+static uint64_t *g_closure_mh;
 static int g_closure_n;
+static int g_closure_cap;
+static uint64_t *g_closure_hash;
+static unsigned g_closure_hash_mask;
 
 static uint64_t g_objc_mapped_cb;
 
 static uint64_t g_objc_init_cb;
 
 static uint64_t g_objc_init_info;
-static uint64_t g_objc_dlopen_mapped[DYLDAPI_CLOSURE_MAX];
+static uint64_t *g_objc_dlopen_mapped;   /* cache-sized in ocerz_dyldapi_setup */
 static int g_objc_dlopen_mapped_n;
 
 static uint32_t g_main_bv_platform, g_main_bv_minos, g_main_bv_sdk;
 
 static void hinfo_diag(const char *tag, uint64_t mh);
+static void closure_add(uint64_t mh);
 static int hinfo_ro_index(uint64_t mh);
 static uint64_t objc_index_loaded(uint32_t idx);
 
@@ -221,11 +231,7 @@ void ocerz_dyldapi_register_image(uint64_t mh, const char *path)
         g_disk_path[g_disk_n] = gpath;
         g_disk_n++;
     }
-    for (int i = 0; i < g_closure_n; i++)
-        if (g_closure_mh[i] == mh)
-            return;
-    if (g_closure_n < DYLDAPI_CLOSURE_MAX)
-        g_closure_mh[g_closure_n++] = mh;
+    closure_add(mh);
 }
 
 static uint64_t disk_gpath_for_mh(uint64_t mh)
@@ -429,48 +435,89 @@ static const char *cache_path_for_mh(struct OcerzCache *cache, uint64_t mh)
     return NULL;
 }
 
-static int closure_seen(uint64_t mh)
+/* Append mh to out[] (n entries used, capacity cap) unless the open-addressed
+ * set seen[] already holds it, keeping the append O(1).  Skips a mach_header
+ * that does not look like one, so nothing bogus reaches libobjc.  Returns the
+ * new count. */
+static int set_add(uint64_t *out, int n, int cap, uint64_t *seen, unsigned mask,
+                   uint64_t mh)
 {
-    for (int i = 0; i < g_closure_n; i++)
-        if (g_closure_mh[i] == mh)
-            return 1;
-    return 0;
+    if (!mh || !out || !seen)
+        return n;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
+    if (h->magic != MH_MAGIC_64)
+        return n;
+    unsigned i = (unsigned)((mh * 0x9E3779B97F4A7C15ull) >> 40) & mask;
+    for (; seen[i]; i = (i + 1) & mask)
+        if (seen[i] == mh)
+            return n;
+    if (n >= cap)
+        return n;
+    seen[i] = mh;
+    out[n++] = mh;
+    return n;
 }
 
-static void compute_closure(struct OcerzCache *cache, uint64_t main_mh)
+static void closure_add(uint64_t mh)
 {
-    uint64_t queue[DYLDAPI_CLOSURE_MAX];
-    int qn = 0;
-    g_closure_n = 0;
-    if (main_mh)
-        queue[qn++] = main_mh;
-    while (qn > 0 && g_closure_n < DYLDAPI_CLOSURE_MAX) {
-        uint64_t mh = queue[--qn];
-        if (closure_seen(mh))
-            continue;
-        const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
-        if (h->magic != MH_MAGIC_64)
-            continue;
-        g_closure_mh[g_closure_n++] = mh;
+    g_closure_n = set_add(g_closure_mh, g_closure_n, g_closure_cap,
+                          g_closure_hash, g_closure_hash_mask, mh);
+}
+
+/* Walk the LC_LOAD_DYLIB graph from root, appending every image reached to
+ * out[] (which already holds n entries, capacity cap) and deduping through
+ * the open-addressed set seen[] (mask + 1 entries, zeroed by the caller).
+ * out[] doubles as the work list, so each image is appended -- and therefore
+ * walked -- exactly once, and there is no second queue that can overflow and
+ * drop a dependency for good.  Returns the new count. */
+static int image_closure_walk(struct OcerzCache *cache, uint64_t root,
+                              uint64_t *out, int n, int cap,
+                              uint64_t *seen, unsigned mask)
+{
+    int start = n;
+    n = set_add(out, n, cap, seen, mask, root);
+    for (int i = start; i < n; i++) {
+        const struct mach_header_64 *h =
+            (const struct mach_header_64 *)ocerz_g2h(out[i]);
         const uint8_t *lc = (const uint8_t *)(h + 1);
-        for (uint32_t i = 0; i < h->ncmds; i++) {
+        for (uint32_t j = 0; j < h->ncmds; j++) {
             const struct load_command *l = (const void *)lc;
             if (l->cmd == LC_LOAD_DYLIB || l->cmd == LC_LOAD_WEAK_DYLIB ||
                 l->cmd == LC_REEXPORT_DYLIB || l->cmd == LC_LOAD_UPWARD_DYLIB) {
                 uint32_t noff;
                 memcpy(&noff, lc + 8, 4);
-                if (noff < l->cmdsize) {
-                    uint64_t dep = cache_find_path(cache, (const char *)lc + noff);
-                    if (dep && qn < DYLDAPI_CLOSURE_MAX && !closure_seen(dep))
-                        queue[qn++] = dep;
-                }
+                if (noff < l->cmdsize)
+                    n = set_add(out, n, cap, seen, mask,
+                                cache_find_path(cache, (const char *)lc + noff));
             }
             lc += l->cmdsize;
         }
     }
+    return n;
+}
+
+/* Every image in the closure is handed to libobjc's map_images in the initial
+ * batch, and an image left out is one whose categories never attach to classes
+ * that other images own -- which surfaces as an unrecognized selector a long
+ * way from the cause.  This used to walk a separate fixed 1024-entry queue
+ * that (a) capped the closure well below the 3609 images the cache holds and
+ * (b) dropped a dependency for good once it filled, which it did early because
+ * a dylib every image links was pushed once per dependent.  The closure array
+ * is the work list now: closure_add() dedupes, so each image is appended and
+ * therefore walked exactly once, and the only bound left is the cache's own
+ * size.  Safari died in SafariMain on -[NSBundle safari_version] under the old
+ * cap; the guest test for this is that it reaches its first window. */
+static void compute_closure(struct OcerzCache *cache, uint64_t main_mh)
+{
+    g_closure_n = 0;
+    if (g_closure_hash)
+        memset(g_closure_hash, 0, ((size_t)g_closure_hash_mask + 1) * sizeof *g_closure_hash);
+    g_closure_n = image_closure_walk(cache, main_mh, g_closure_mh, g_closure_n,
+                                     g_closure_cap, g_closure_hash,
+                                     g_closure_hash_mask);
+    /* disk images registered before the closure arrays existed */
     for (int i = 0; i < g_disk_n; i++)
-        if (!closure_seen(g_disk_mh[i]) && g_closure_n < DYLDAPI_CLOSURE_MAX)
-            g_closure_mh[g_closure_n++] = g_disk_mh[i];
+        closure_add(g_disk_mh[i]);
 }
 
 int ocerz_dyldapi_setup(struct OcerzCache *cache)
@@ -500,7 +547,24 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache)
     g_cache_start = cache->base;
     g_cache_size = 0x40000000000ull;
 
+    /* Bound the closure by the cache rather than by a constant, so a bigger
+     * cache cannot silently truncate it again.  +DYLDAPI_DISK_MAX for the
+     * images that came off disk instead. */
+    g_closure_cap = (int)cache->images_cnt + DYLDAPI_DISK_MAX;
+    unsigned hsz = 1;
+    while (hsz < (unsigned)g_closure_cap * 2)
+        hsz <<= 1;
+    g_closure_mh = (uint64_t *)calloc((size_t)g_closure_cap, sizeof *g_closure_mh);
+    g_closure_hash = (uint64_t *)calloc(hsz, sizeof *g_closure_hash);
+    g_objc_dlopen_mapped = (uint64_t *)calloc((size_t)g_closure_cap,
+                                              sizeof *g_objc_dlopen_mapped);
+    if (!g_closure_mh || !g_closure_hash || !g_objc_dlopen_mapped)
+        return OCERZ_ENOMEM;
+    g_closure_hash_mask = hsz - 1;
+
     compute_closure(cache, ocerz_main_mh);
+    OCERZ_LOG("dyldapi: closure %d image(s) of %u in the cache\n",
+              g_closure_n, cache->images_cnt);
 
     uint64_t objc_mh = 0;
     for (uint32_t i = 0; i < cache->images_cnt; i++) {
@@ -556,7 +620,7 @@ static void api_return(OcerzCPU *cpu, uint64_t result)
 static int api_register_for_bulk_image_loads(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t func = cpu->gpr[OCERZ_RSI];
-    int n = g_closure_n > DYLDAPI_CLOSURE_MAX ? DYLDAPI_CLOSURE_MAX : g_closure_n;
+    int n = g_closure_n;
     if (!func || n <= 0) {
         api_return(cpu, 0);
         return OCERZ_STEP_OK;
@@ -690,7 +754,7 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
 
     static uint64_t mhs[PRELOAD_MAX], paths[PRELOAD_MAX], iis[PRELOAD_MAX];
     int n = 0;
-    for (int i = 0; i < g_closure_n && n < DYLDAPI_CLOSURE_MAX; i++) {
+    for (int i = 0; i < g_closure_n && n < PRELOAD_MAX; i++) {
         uint64_t mh = g_closure_mh[i];
         uint64_t ii = find_section_any(mh, "__objc_imageinfo");
         if (!ii)
@@ -775,7 +839,7 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
     }
 
     for (int k = 0; k < n; k++)
-        if (g_objc_dlopen_mapped_n < (int)(sizeof g_objc_dlopen_mapped / sizeof g_objc_dlopen_mapped[0]))
+        if (g_objc_dlopen_mapped_n < g_closure_cap)
             g_objc_dlopen_mapped[g_objc_dlopen_mapped_n++] = mhs[k];
 
     cpu->rip = caller_ret;
@@ -786,6 +850,8 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
 
 static int objc_image_already_loaded(uint64_t mh)
 {
+    if (!g_objc_dlopen_mapped)
+        return 0;
     for (int i = 0; i < g_objc_dlopen_mapped_n; i++)
         if (g_objc_dlopen_mapped[i] == mh)
             return 1;
@@ -867,41 +933,25 @@ void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
                 mh ? objc_image_already_loaded(mh) : -1);
     if (!g_objc_mapped_cb || !mh || !g_cache || objc_image_already_loaded(mh))
         return;
-    uint64_t queue[DYLDAPI_CLOSURE_MAX], visited[DYLDAPI_CLOSURE_MAX], batch[DYLDAPI_CLOSURE_MAX];
-    int qn = 0, vn = 0, bn = 0;
-    queue[qn++] = mh;
-    while (qn > 0 && bn < DYLDAPI_CLOSURE_MAX) {
-        uint64_t cur = queue[--qn];
-        int seen = 0;
-        for (int i = 0; i < vn; i++)
-            if (visited[i] == cur) { seen = 1; break; }
-        if (seen)
-            continue;
-        if (vn < DYLDAPI_CLOSURE_MAX)
-            visited[vn++] = cur;
-        if (objc_image_already_loaded(cur))
-            continue;
-        const struct mach_header_64 *h = (const void *)(uintptr_t)cur;
-        if (h->magic != MH_MAGIC_64)
-            continue;
-        if (find_section_any(cur, "__objc_imageinfo") && bn < DYLDAPI_CLOSURE_MAX)
-            batch[bn++] = cur;
-        const uint8_t *lc = (const uint8_t *)(h + 1);
-        for (uint32_t i = 0; i < h->ncmds; i++) {
-            const struct load_command *l = (const void *)lc;
-            if (l->cmd == LC_LOAD_DYLIB || l->cmd == LC_LOAD_WEAK_DYLIB ||
-                l->cmd == LC_REEXPORT_DYLIB || l->cmd == LC_LOAD_UPWARD_DYLIB) {
-                uint32_t noff;
-                memcpy(&noff, lc + 8, 4);
-                if (noff < l->cmdsize) {
-                    uint64_t dep = cache_find_path(g_cache, (const char *)lc + noff);
-                    if (dep && qn < DYLDAPI_CLOSURE_MAX)
-                        queue[qn++] = dep;
-                }
-            }
-            lc += l->cmdsize;
-        }
+    /* The whole dependency closure of the dlopened image, then the subset
+     * libobjc has not seen: a dependency dropped here is a category that
+     * never attaches, the same failure compute_closure() guards against. */
+    uint64_t *walk = (uint64_t *)calloc((size_t)g_closure_cap, sizeof *walk);
+    uint64_t *seen = (uint64_t *)calloc((size_t)g_closure_hash_mask + 1, sizeof *seen);
+    uint64_t *batch = (uint64_t *)calloc((size_t)g_closure_cap, sizeof *batch);
+    int bn = 0;
+    if (!walk || !seen || !batch) {
+        free(walk); free(seen); free(batch);
+        return;
     }
+    int wn = image_closure_walk(g_cache, mh, walk, 0, g_closure_cap,
+                                seen, g_closure_hash_mask);
+    for (int i = 0; i < wn; i++)
+        if (!objc_image_already_loaded(walk[i]) &&
+            find_section_any(walk[i], "__objc_imageinfo"))
+            batch[bn++] = walk[i];
+    free(walk);
+    free(seen);
     if (getenv("OCERZ_OBJCLOG")) {
         fprintf(stderr, "ocerz: OBJCMAP mh=%#llx batch=%d path=%s\n",
                 (unsigned long long)mh, bn,
@@ -912,12 +962,15 @@ void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
                     (unsigned long long)batch[k], p ? p : "?");
         }
     }
-    if (bn == 0)
+    if (bn == 0) {
+        free(batch);
         return;
+    }
     for (int k = 0; k < bn; k++)
-        if (g_objc_dlopen_mapped_n < (int)(sizeof g_objc_dlopen_mapped / sizeof g_objc_dlopen_mapped[0]))
+        if (g_objc_dlopen_mapped_n < g_closure_cap)
             g_objc_dlopen_mapped[g_objc_dlopen_mapped_n++] = batch[k];
     objc_drive_map_images(vm, batch, bn);
+    free(batch);
 }
 
 #define CLSHASH_MIX(a, b, c) \
