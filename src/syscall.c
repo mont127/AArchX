@@ -47,6 +47,23 @@
 /* fcntl commands whose third argument is a guest pointer */
 static void peekguard(OcerzCPU *cpu, int class, int num, const char *when);
 
+/* The host workqueue bridge is on unless OCERZ_NO_HOSTWQ says otherwise.
+ * It used to be opt-in, which meant every Cocoa application deadlocked out
+ * of the box: AppKit and libdispatch hand work to workqueue threads and then
+ * wait for it, so with nothing servicing those queues the first dispatch_sync
+ * to another queue parked the main thread in __ulock_wait(UL_COMPARE_AND_WAIT)
+ * on a stack address forever.  Calculator, TextEdit and Safari all registered
+ * with LaunchServices as foreground apps and then sat there without ever
+ * connecting to the WindowServer.  OCERZ_HOSTWQ is still accepted and still
+ * means "on", so existing scripts and the README keep working. */
+static int ocerz_hostwq_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("OCERZ_NO_HOSTWQ") ? 0 : 1;
+    return on;
+}
+
 static int ocerz_fcntl_ptr_cmd(int cmd)
 {
     switch (cmd) {
@@ -630,7 +647,7 @@ static int sys_bsdthread_register(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 (unsigned long long)a[6]);
 
     uint64_t feat = 0x4000005f;
-    if (getenv("OCERZ_HOSTWQ"))
+    if (ocerz_hostwq_on())
         feat |= 0x80ull;
     /* Diagnostic: hide PTHREAD_FEATURE_KEVENT (0x40) and _WORKLOOP (0x80)
      * so guest libdispatch falls back to the classic workq + manager-thread
@@ -1372,7 +1389,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     if (op == 0x20) {
 
-        if (OCERZ_ENV_ON("OCERZ_HOSTWQ") && OCERZ_ENV_ON("OCERZ_HOSTWQ_ASYNC")) {
+        if (ocerz_hostwq_on() && OCERZ_ENV_ON("OCERZ_HOSTWQ_ASYNC")) {
             ocerz_hostwq_register(vm);
             uint64_t fa[8];
             memcpy(fa, a, sizeof fa);
@@ -2491,7 +2508,7 @@ static void ocerz_hostwq_register(OcerzVM *vm)
 
 static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    if (getenv("OCERZ_HOSTWQ")) {
+    if (ocerz_hostwq_on()) {
         ocerz_hostwq_register(vm);
 
         uint64_t fa[8];
@@ -2614,7 +2631,7 @@ static int sys_kevent_qos(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 
     static int fwd_workq = -1;
     if (fwd_workq < 0) fwd_workq = getenv("OCERZ_NO_FWD_WORKQ") ? 0 : 1;
-    if (getenv("OCERZ_HOSTWQ") && (!(kq_flags & 0x20ull) || fwd_workq)) {
+    if (ocerz_hostwq_on() && (!(kq_flags & 0x20ull) || fwd_workq)) {
         ocerz_hostwq_register(vm);
         uint64_t fa[8];
         memcpy(fa, a, sizeof fa);
@@ -4098,6 +4115,8 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         (orig[2] == 8 || orig[2] == 16 || orig[2] == 64 || orig[2] == 80 ||
          num == 121);
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    cpu->block_what = num;           /* the mach path records this; a BSD call
+                                      * that never returns showed up as what=0 */
     uint64_t t0blk = cpu->block_since_ns;
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     if (err && r == EFAULT && efault_disarm_retry(cpu, num))
