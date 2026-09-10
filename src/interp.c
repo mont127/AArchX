@@ -1527,6 +1527,30 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
         }
     }
 
+    {   /* OCERZ_REGTRAP=addr1[,addr2,...]: full register dump at these guest
+         * addresses (interp only -- pair it with OCERZ_INTERP_LO/HI).
+         * OCERZ_RIPTRAP below prints a fixed, purpose-built field set from an
+         * older investigation; this one is the general form, and reuses
+         * ocerz_cpu_dump so every GPR and its readable target come out. */
+        static uint64_t rtr[8];
+        static int nrtr = -1;
+        if (nrtr < 0) {
+            const char *e = getenv("OCERZ_REGTRAP");
+            nrtr = 0;
+            while (e && *e && nrtr < 8) {
+                rtr[nrtr++] = strtoull(e, NULL, 0);
+                e = strchr(e, 44);
+                if (e) e++;
+            }
+        }
+        for (int ti = 0; ti < nrtr; ti++)
+            if (rtr[ti] && cpu->rip == rtr[ti]) {
+                fprintf(stderr, "ocerz: REGTRAP rip=%#llx\n", (unsigned long long)cpu->rip);
+                ocerz_cpu_dump(cpu, stderr);
+                break;
+            }
+    }
+
     {   /* OCERZ_RIPTRAP=addr1[,addr2]: log guest register state whenever
          * execution reaches these addresses (interp only, diagnostics) */
         static uint64_t traps[8];
