@@ -2578,8 +2578,9 @@ static void ocerz_install_kick_handler(void)
     sa.sa_sigaction = ocerz_kick_handler;
     /* deliberately NOT SA_RESTART: the unstick monitor uses this signal to
      * EINTR guest threads out of lost-wakeup parks (the manual `sample`
-     * "shake" that always revived wedged wine sessions, automated).  Every
-     * guest-visible blocking call handles EINTR (wine loops on it). */
+     * "shake" that always revived wedged wine sessions, automated).  It
+     * only kicks waits whose callers loop on a spurious return -- see
+     * unstick_kickable() in syscall.c. */
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGEMT, &sa, NULL);
@@ -2590,12 +2591,16 @@ static void ocerz_install_kick_handler(void)
  * wakeup was lost (waiter/waker alias, kevent edge, ...); an EINTR shake
  * always revives the session.  Automate the shake: kick any cpu thread
  * that has been inside one blocking host call for >800ms.  Legitimate
- * long waits just retry (EINTR is part of every wait's contract). */
+ * long waits just retry -- but only where a spurious EINTR is part of the
+ * wait's contract.  A cpu in a read/recvmsg/poll/fcntl sets block_nokick
+ * and is left alone; OCERZ_UNSTICK_ALL=1 kicks those too, as before. */
 static void *ocerz_unstick_thread(void *arg)
 {
     (void)arg;
     static int lg = -1;
     if (lg < 0) lg = getenv("OCERZ_UNSTICKLOG") ? 1 : 0;
+    static int kick_all = -1;
+    if (kick_all < 0) kick_all = getenv("OCERZ_UNSTICK_ALL") ? 1 : 0;
     static int wauto = -1;
     static uint64_t wbase;
     if (wauto < 0) {
@@ -2629,7 +2634,7 @@ static void *ocerz_unstick_thread(void *arg)
         pthread_mutex_lock(&g_cpus_lock);
         for (int i = 0; i < g_cpus_n; i++) {
             uint64_t t0 = g_cpus[i]->block_since_ns;
-            if (t0 && now - t0 > 800ull * 1000 * 1000) {
+            if (t0 && now - t0 > 800ull * 1000 * 1000 && (kick_all || !g_cpus[i]->block_nokick)) {
                 g_cpus[i]->block_since_ns = now;   /* re-arm: kick again in 800ms if still stuck */
                 if (lg)
                     fprintf(stderr, "ocerz: UNSTICK[%d] kicking cpu#%u (blocked %llums) what=%d rip=%#llx\n",

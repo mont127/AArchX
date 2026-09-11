@@ -75,6 +75,7 @@ typedef struct OcerzCPU {
     volatile uint64_t block_since_ns;  /* nonzero while parked in a blocking host syscall (unstick monitor) */
     volatile uint64_t block_started_ns; /* like block_since_ns but never re-armed: true episode start */
     volatile int block_what;            /* syscall/trap number of the blocking call */
+    volatile int block_nokick;          /* parked in a call with no spurious-EINTR contract: the unstick monitor leaves it be */
     uint32_t sendring_id[8], sendring_port[8], sendring_sz[8];
     int sendring_n;                     /* MACHSLOW: last mach sends, for wedge diagnostics */
     volatile uint32_t last_rcv_name;   /* port/set of the current mach receive (diagnostics) */                /* host sp at the active JIT function's frame base (class 3):
