@@ -3549,6 +3549,7 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     for (int i = 0; i < 16; i++)
         cpu->xmm[i] = ocerz_ld128(mc + fpoff + OCERZ_FP_XMM_OFF + (uint64_t)i * 16);
     cpu->mxcsr = (uint32_t)ocerz_ld(mc + fpoff + OCERZ_FP_MXCSR_OFF, 4);
+    ocerz_apply_mxcsr_round(cpu->mxcsr);
     cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
 
     /* Restore CS, and with it the execution mode. */

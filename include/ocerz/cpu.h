@@ -154,5 +154,7 @@ static inline int ocerz_gs_is_teb_band(uint64_t gs)
 
 void ocerz_cpu_reset(OcerzCPU *cpu);
 void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out);
+/* set the host FP rounding mode from a guest MXCSR value (bits 13-14) */
+void ocerz_apply_mxcsr_round(uint32_t mxcsr);
 
 #endif

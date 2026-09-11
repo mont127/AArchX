@@ -218,7 +218,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 - Application compatibility is incomplete; unsupported syscalls and framework behavior remain.
 - Late-loaded shared-cache Objective-C images are not fully registered in general. Wine uses a targeted preload.
 - x87 uses 64-bit doubles rather than 80-bit extended precision.
-- Dynamic MXCSR rounding modes and the approximate `RCP`/`RSQRT` results are not implemented.
+- The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
 
 ## License
