@@ -379,6 +379,7 @@ static int ext_fxrstor(OcerzCPU *cpu, const X86Insn *insn)
     cpu->fsw = (uint16_t)ocerz_ld(ea + 2, 2);
     cpu->ftw = (uint8_t)ocerz_ld(ea + 4, 1);
     cpu->mxcsr = (uint32_t)ocerz_ld(ea + 24, 4);
+    ocerz_apply_mxcsr_round(cpu->mxcsr);
     for (int i = 0; i < 8; i++) {
         uint64_t bits = ocerz_ld(ea + 32 + i * 16 + 0, 8);
         memcpy(&cpu->fpr[i], &bits, 8);
@@ -408,6 +409,7 @@ static int ext_misc(OcerzCPU *cpu, const X86Insn *insn)
     }
     case OCERZ_OP_LDMXCSR:
         cpu->mxcsr = (uint32_t)ocerz_ld(ocerz_ea(cpu, insn, &insn->ops[0]), 4);
+        ocerz_apply_mxcsr_round(cpu->mxcsr);
         return OCERZ_STEP_OK;
     case OCERZ_OP_STMXCSR:
         ocerz_st(ocerz_ea(cpu, insn, &insn->ops[0]), 4, cpu->mxcsr);

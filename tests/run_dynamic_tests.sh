@@ -172,6 +172,7 @@ run_file_case dpreadv tests/dynamic/preadv.c 'OK'
 run_file_case dsysv_sem tests/dynamic/sysv_sem.c 'OK'
 run_file_case drel_acq_order tests/dynamic/rel_acq_order.c 'OK'
 run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
+run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"
