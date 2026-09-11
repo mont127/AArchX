@@ -92,6 +92,148 @@ static void ocerz_cpu_unregister(OcerzCPU *cpu)
     pthread_mutex_unlock(&g_cpus_lock);
 }
 
+/* ---- guest thread_suspend / thread_resume / thread_get_state ----------
+ * JavaScriptCore's garbage collector suspends each mutator, reads its
+ * registers with thread_get_state and scans its stack.  Handed to the host
+ * kernel, thread_suspend froze the ocerz thread wherever it happened to be:
+ * Safari's main thread stopped inside the translator holding jit_lock, and
+ * every other cpu, the collector included, then blocked on that lock for
+ * good.  An x86 thread_get_state on an arm64 thread fails outright too.
+ *
+ * So a suspend of a thread running guest code only reports done once the
+ * target holds no ocerz lock: parked at a safe point (the run loop, or a
+ * syscall's return edge), inside a raw host wait (block_since_ns), or
+ * stopped by the kernel with its pc in a translated block, whose pinned host
+ * registers are its guest registers.  Anywhere else -- translator, C
+ * helper, interpreter -- it is let go at once and caught a moment later.
+ * A thread not running guest code goes to the kernel as before.  Pinned by
+ * the dynamic test thread_suspend. */
+static pthread_mutex_t g_susp_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_susp_cv = PTHREAD_COND_INITIALIZER;
+
+static OcerzCPU *cpu_by_kport_locked(uint32_t port)
+{
+    for (int i = 0; i < g_cpus_n; i++)
+        if (g_cpus[i]->host_kport == port)
+            return g_cpus[i];
+    return NULL;
+}
+
+void ocerz_vm_suspend_point(OcerzCPU *cpu)
+{
+    if (!__atomic_load_n(&cpu->suspend_count, __ATOMIC_ACQUIRE))
+        return;
+    pthread_mutex_lock(&g_susp_lock);
+    __atomic_store_n(&cpu->susp_parked, 1, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&g_susp_cv);
+    while (__atomic_load_n(&cpu->suspend_count, __ATOMIC_ACQUIRE) > 0)
+        pthread_cond_wait(&g_susp_cv, &g_susp_lock);
+    __atomic_store_n(&cpu->susp_parked, 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_susp_lock);
+}
+
+/* t is stopped by the kernel: is it somewhere that holds no ocerz lock?
+ * Nothing here may take a lock or allocate -- t might hold malloc's. */
+static int susp_stop_is_safe(OcerzCPU *t)
+{
+    if (__atomic_load_n(&t->block_since_ns, __ATOMIC_ACQUIRE))
+        return 1;                           /* raw host wait: gpr[] is current */
+    arm_thread_state64_t hs;
+    mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(t->host_kport, ARM_THREAD_STATE64, (thread_state_t)&hs, &n) != KERN_SUCCESS)
+        return 0;
+    memcpy(t->susp_gpr, t->gpr, sizeof t->susp_gpr);
+    if (!ocerz_jit_guest_gprs_at(t->vm, (const void *)(uintptr_t)arm_thread_state64_get_pc(hs),
+                                 hs.__x, t, t->susp_gpr))
+        return 0;
+    t->susp_have_gpr = 1;
+    return 1;
+}
+
+int ocerz_vm_thread_suspend(OcerzCPU *self, uint32_t port)
+{
+    int counted = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_cpus_lock);
+        OcerzCPU *t = cpu_by_kport_locked(port);
+        if (!t) {
+            pthread_mutex_unlock(&g_cpus_lock);
+            return -1;
+        }
+        if (!counted) {
+            counted = 1;
+            /* already stopped; or itself, which parks at this syscall's return edge */
+            if (__atomic_add_fetch(&t->suspend_count, 1, __ATOMIC_ACQ_REL) > 1 || t == self) {
+                pthread_mutex_unlock(&g_cpus_lock);
+                return KERN_SUCCESS;
+            }
+        }
+        int ok = __atomic_load_n(&t->susp_parked, __ATOMIC_ACQUIRE);
+        if (!ok && thread_suspend(t->host_kport) == KERN_SUCCESS) {
+            t->susp_have_gpr = 0;
+            if (__atomic_load_n(&t->susp_parked, __ATOMIC_ACQUIRE)) {
+                thread_resume(t->host_kport);   /* it reached the park first and stays there */
+                ok = 1;
+            } else if (susp_stop_is_safe(t)) {
+                t->susp_host = 1;
+                ok = 1;
+            } else {
+                t->susp_have_gpr = 0;
+                thread_resume(t->host_kport);
+            }
+        }
+        pthread_mutex_unlock(&g_cpus_lock);
+        if (ok)
+            return KERN_SUCCESS;
+        /* let it run on to a safe point; t may be gone by the next look */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 200 * 1000;
+        if (ts.tv_nsec >= 1000000000) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000;
+        }
+        pthread_mutex_lock(&g_susp_lock);
+        pthread_cond_timedwait(&g_susp_cv, &g_susp_lock, &ts);
+        pthread_mutex_unlock(&g_susp_lock);
+    }
+}
+
+int ocerz_vm_thread_resume(uint32_t port)
+{
+    pthread_mutex_lock(&g_cpus_lock);
+    OcerzCPU *t = cpu_by_kport_locked(port);
+    if (!t || __atomic_load_n(&t->suspend_count, __ATOMIC_ACQUIRE) <= 0) {
+        pthread_mutex_unlock(&g_cpus_lock);
+        return -1;          /* not suspended by us: the kernel answers (KERN_FAILURE if running) */
+    }
+    if (__atomic_sub_fetch(&t->suspend_count, 1, __ATOMIC_ACQ_REL) == 0) {
+        if (t->susp_host) {
+            t->susp_host = 0;
+            thread_resume(t->host_kport);
+        }
+        t->susp_have_gpr = 0;
+        pthread_mutex_lock(&g_susp_lock);
+        pthread_cond_broadcast(&g_susp_cv);
+        pthread_mutex_unlock(&g_susp_lock);
+    }
+    pthread_mutex_unlock(&g_cpus_lock);
+    return KERN_SUCCESS;
+}
+
+int ocerz_vm_thread_regs(uint32_t port, uint64_t gpr[16], uint64_t *rip, uint64_t *rflags)
+{
+    pthread_mutex_lock(&g_cpus_lock);
+    OcerzCPU *t = cpu_by_kport_locked(port);
+    if (t) {
+        memcpy(gpr, t->susp_have_gpr ? t->susp_gpr : t->gpr, 16 * sizeof(uint64_t));
+        *rip = t->rip;
+        *rflags = t->rflags;
+    }
+    pthread_mutex_unlock(&g_cpus_lock);
+    return t ? 0 : -1;
+}
+
 /* The JIT's RAS is a ring (index = top & (SIZE-1)): stale entries below the
  * top must not survive an invalidation, so purge clears the entries too. */
 static void ras_clear(OcerzCPU *cpu)
@@ -2773,6 +2915,7 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     cpu->host_kport = pthread_mach_thread_np(pthread_self());
 
     while (!vm->exited && !cpu->terminated && !cpu->interrupt) {
+        ocerz_vm_suspend_point(cpu);
         g_riphist[g_riphist_n++ & 31] = cpu->rip;
         int r;
         if (ocerz_exc_trap && cpu->rip == ocerz_exc_trap)

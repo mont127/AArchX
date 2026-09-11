@@ -746,12 +746,105 @@ static int ocerz_sysctl_ovr_emit(OcerzCPU *cpu, const struct ocerz_sysctl_ovr *o
     return OCERZ_STEP_OK;
 }
 
+/* The x86 CPU description an x86_64 process gets under Rosetta, made to
+ * agree with ocerz's own CPUID: leaf 1 ecx 0x00982201 / edx 0x078bfbff
+ * (SSE through SSE4.2, CX16, POPCNT -- no AES, PCLMULQDQ or AVX) and
+ * 0x80000001 ecx 1 / edx 0x28100800.  The arm64 kernel has none of these
+ * nodes, so passed through, every one failed with ENOENT, and code that asks
+ * hw.optional.sse4_1 before taking a fast path took none.  Reachable by name
+ * and, for sysctlnametomib() + sysctl(), through a private top-level mib.
+ * Pinned by the dynamic test x86_sysctl. */
+#define X86_SYSCTL_MIB 0x4f43
+static const struct { const char *name; uint8_t width; uint64_t val; const char *sval; } g_x86_sysctl[] = {
+    { "hw.optional.mmx",              4, 1, NULL }, { "hw.optional.sse",               4, 1, NULL },
+    { "hw.optional.sse2",             4, 1, NULL }, { "hw.optional.sse3",              4, 1, NULL },
+    { "hw.optional.supplementalsse3", 4, 1, NULL }, { "hw.optional.sse4_1",            4, 1, NULL },
+    { "hw.optional.sse4_2",           4, 1, NULL }, { "hw.optional.x86_64",            4, 1, NULL },
+    { "hw.optional.aes",              4, 0, NULL }, { "hw.optional.avx1_0",            4, 0, NULL },
+    { "hw.optional.rdrand",           4, 0, NULL }, { "hw.optional.f16c",              4, 0, NULL },
+    { "hw.optional.enfstrg",          4, 0, NULL }, { "hw.optional.fma",               4, 0, NULL },
+    { "hw.optional.avx2_0",           4, 0, NULL }, { "hw.optional.bmi1",              4, 0, NULL },
+    { "hw.optional.bmi2",             4, 0, NULL }, { "hw.optional.rtm",               4, 0, NULL },
+    { "hw.optional.hle",              4, 0, NULL }, { "hw.optional.adx",               4, 0, NULL },
+    { "hw.optional.mpx",              4, 0, NULL }, { "hw.optional.sgx",               4, 0, NULL },
+    { "hw.optional.avx512f",          4, 0, NULL }, { "hw.optional.avx512cd",          4, 0, NULL },
+    { "hw.optional.avx512dq",         4, 0, NULL }, { "hw.optional.avx512bw",          4, 0, NULL },
+    { "hw.optional.avx512vl",         4, 0, NULL }, { "hw.optional.avx512ifma",        4, 0, NULL },
+    { "hw.optional.avx512vbmi",       4, 0, NULL },
+    { "machdep.cpu.features", 0, 0, "FPU VME DE PSE TSC MSR PAE MCE CX8 APIC SEP MTRR PGE MCA CMOV PAT "
+                                    "PSE36 CLFSH MMX FXSR SSE SSE2 SSE3 SSSE3 CX16 SSE4.1 SSE4.2 POPCNT" },
+    { "machdep.cpu.feature_bits",     8, 0x00982201078bfbffull, NULL },
+    { "machdep.cpu.extfeatures",      0, 0, "SYSCALL XD RDTSCP EM64T LAHF" },
+    { "machdep.cpu.extfeature_bits",  8, 0x0000000128100800ull, NULL },
+    { "machdep.cpu.leaf7_features",   0, 0, "" },
+    { "machdep.cpu.leaf7_feature_bits", 8, 0, NULL },
+    { "machdep.cpu.family",           4, 6, NULL },
+};
+
+static int x86_sysctl_find(const char *name)
+{
+    for (unsigned i = 0; i < sizeof g_x86_sysctl / sizeof g_x86_sysctl[0]; i++)
+        if (strcmp(name, g_x86_sysctl[i].name) == 0)
+            return (int)i;
+    return -1;
+}
+
+static int x86_sysctl_emit(OcerzCPU *cpu, int idx, uint64_t oldp, uint64_t oldlenp)
+{
+    const char *s = g_x86_sysctl[idx].sval;
+    uint64_t need = s ? (uint64_t)strlen(s) + 1 : g_x86_sysctl[idx].width;
+    if (oldp) {
+        uint64_t cap = oldlenp ? ocerz_ld(oldlenp, 8) : need;
+        if (cap < need) {
+            if (oldlenp)
+                ocerz_st(oldlenp, 8, need);
+            ret_err(cpu, OCERZ_ENOMEM_V);
+            return OCERZ_STEP_OK;
+        }
+        if (s)
+            for (uint64_t k = 0; k < need; k++)
+                ocerz_st(oldp + k, 1, (uint64_t)(uint8_t)s[k]);
+        else
+            ocerz_st(oldp, (int)need, g_x86_sysctl[idx].val);
+    }
+    if (oldlenp)
+        ocerz_st(oldlenp, 8, need);
+    ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
 static int sys_sysctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
     uint64_t nlen = a[1];
     static int sclog2 = -1;
     if (sclog2 < 0) sclog2 = getenv("OCERZ_SYSCTLLOG") ? 1 : 0;
+    /* {0, 3} is name-to-oid (sysctlnametomib): the name arrives as newp */
+    if (nlen == 2 && a[4] && a[5] && a[5] < 160 &&
+        ocerz_ld(a[0], 4) == 0 && ocerz_ld(a[0] + 4, 4) == 3) {
+        char nm[160];
+        for (uint64_t i = 0; i < a[5]; i++)
+            nm[i] = (char)ocerz_ld(a[4] + i, 1);
+        nm[a[5]] = 0;
+        int idx = x86_sysctl_find(nm);
+        if (idx >= 0) {
+            uint64_t cap = a[3] ? ocerz_ld(a[3], 8) : 0;
+            if (!a[2] || cap < 8) {
+                ret_err(cpu, OCERZ_ENOMEM_V);
+                return OCERZ_STEP_OK;
+            }
+            ocerz_st(a[2], 4, X86_SYSCTL_MIB);
+            ocerz_st(a[2] + 4, 4, (uint64_t)idx);
+            ocerz_st(a[3], 8, 8);
+            ret_ok(cpu, 0);
+            return OCERZ_STEP_OK;
+        }
+    }
+    if (a[4] == 0 && nlen == 2 && ocerz_ld(a[0], 4) == X86_SYSCTL_MIB) {
+        uint32_t idx = (uint32_t)ocerz_ld(a[0] + 4, 4);
+        if (idx < sizeof g_x86_sysctl / sizeof g_x86_sysctl[0])
+            return x86_sysctl_emit(cpu, (int)idx, a[2], a[3]);
+    }
     if (a[4] == 0 && nlen >= 2 && nlen <= 8) {
         int mib[8];
         for (uint64_t i = 0; i < nlen; i++)
@@ -817,6 +910,9 @@ static int sys_sysctlbyname(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         ret_ok(cpu, 0);
         return OCERZ_STEP_OK;
     }
+    int x86 = x86_sysctl_find(name);
+    if (x86 >= 0)
+        return x86_sysctl_emit(cpu, x86, a[2], a[3]);
     uint64_t fa[8];
     memcpy(fa, a, sizeof fa);
     for (int i = 0; i < 8; i++)
@@ -902,6 +998,22 @@ struct ocerz_worker_pub {
     pthread_cond_t c;
     int published;
 };
+
+/* A new thread's cpu starts as a copy of its creator's, taken inside the
+ * creator's syscall: nothing about the creator's own wait or suspension may
+ * come along.  A creator being suspended by the GC at that moment would
+ * otherwise hand the child suspend_count 1, and the child would park at its
+ * first safe point with nobody left to resume it. */
+static void cpu_fresh_thread_state(OcerzCPU *c)
+{
+    c->suspend_count = 0;
+    c->susp_parked = 0;
+    c->susp_host = 0;
+    c->susp_have_gpr = 0;
+    c->block_since_ns = 0;
+    c->block_started_ns = 0;
+    c->block_nokick = 0;
+}
 
 struct ocerz_worker {
     OcerzVM *vm;
@@ -1030,6 +1142,7 @@ static int ocerz_spawn_worker(OcerzVM *vm, const OcerzCPU *tmpl)
         return -1;
     w->vm = vm;
     w->cpu = *tmpl;
+    cpu_fresh_thread_state(&w->cpu);
     w->counts_wq = 1;
 
     w->cpu.ras_top = 0;
@@ -2817,6 +2930,7 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     w->vm = vm;
     w->cpu = *cpu;
+    cpu_fresh_thread_state(&w->cpu);
     w->cpu.ras_top = 0;
     memset(w->cpu.ras, 0, sizeof w->cpu.ras);
     w->cpu.terminated = 0;
@@ -3099,6 +3213,15 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         mach_port_t self = mach_thread_self();
         int is_self = (a[0] == 0 || a[0] == (uint64_t)self);
         if (self) mach_port_deallocate(mach_task_self(), self);
+        /* A self-directed signal the guest has blocked becomes pending, not
+         * a host raise: the host has no such block and its default action
+         * would kill the process.  This is what sigwait() harvests. */
+        if (route && is_self && signo > 0 && signo < OCERZ_NSIG &&
+            (cpu->sig_mask & (1ull << (signo - 1)))) {
+            cpu->sig_pending |= 1ull << (signo - 1);
+            ret_ok(cpu, 0);
+            return OCERZ_STEP_OK;
+        }
         if (route && is_self && signo > 0 && signo < OCERZ_NSIG) {
             if (ocerz_signal_deliver(cpu, (int)signo, 0, 0, 0))
                 return OCERZ_STEP_OK;  /* rip now points at the guest handler */
@@ -3578,6 +3701,132 @@ static int sys_iov(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8], int num)
     return OCERZ_STEP_OK;
 }
 
+/* preadv/pwritev(fd, iov, iovcnt, offset): sys_iov plus the offset in a[3]. */
+static int sys_preadv_pwritev(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8], int num)
+{
+    (void)vm;
+    uint64_t giov = a[1], cnt = a[2];
+    if (cnt > OCERZ_IOV_MAX)
+        cnt = OCERZ_IOV_MAX;
+    struct ocerz_iovec scratch[OCERZ_IOV_MAX];
+    for (uint64_t i = 0; i < cnt; i++) {
+        uint64_t base = ocerz_ld(giov + i * 16, 8);
+        scratch[i].iov_base = base ? (uint64_t)(uintptr_t)ocerz_g2h(base) : 0;
+        scratch[i].iov_len = ocerz_ld(giov + i * 16 + 8, 8);
+    }
+    uint64_t fa[8] = { a[0], (uint64_t)(uintptr_t)scratch, a[2], a[3], 0, 0, 0, 0 };
+    forward_with_scratch(cpu, num, fa, 0);
+    return OCERZ_STEP_OK;
+}
+static int sys_preadv(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_preadv_pwritev(vm, cpu, a, 540); }
+static int sys_pwritev(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_preadv_pwritev(vm, cpu, a, 541); }
+static int sys_preadv_nc(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_preadv_pwritev(vm, cpu, a, 542); }
+static int sys_pwritev_nc(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_preadv_pwritev(vm, cpu, a, 543); }
+
+/* sigsuspend(mask): install mask, wait for a signal not in it, restore, and
+ * return EINTR.  __sigwait(set, sig*): wait until one of `set` (which the
+ * caller has blocked) is pending, hand it back and consume it.  Both waited
+ * for a signal the host kernel could never deliver to the guest, so libc's
+ * sigsuspend and sigwait returned ENOSYS.  A guest async signal arrives
+ * through async_sig_handler into the pending mask; we poll it, kickable so
+ * the unstick monitor's SIGEMT (and any host signal) breaks the sleep at
+ * once.  Pinned by the dynamic test signal_wait. */
+static int sys_sigsuspend(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    /* the Darwin syscall takes the mask by value in a[0], not a pointer */
+    uint64_t saved = cpu->sig_mask;
+    uint64_t suspend = (uint32_t)a[0];
+    cpu->sig_mask = suspend;
+    cpu->block_nokick = 1;
+    cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int caught = 0;
+    for (;;) {
+        cpu->sig_pending |= ocerz_take_pending_async_sig() >> 1;   /* 1<<sig -> 1<<(sig-1) */
+        uint64_t ready = cpu->sig_pending & ~suspend;
+        if (ready) {
+            caught = __builtin_ctzll(ready) + 1;
+            break;
+        }
+        if (__atomic_load_n(&vm->exited, __ATOMIC_ACQUIRE) || cpu->interrupt)
+            break;
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    cpu->block_since_ns = 0;
+    cpu->block_nokick = 0;
+    /* Restore the original mask and set the EINTR return BEFORE delivering,
+     * so the context the handler's sigreturn restores carries -1/EINTR and
+     * the pre-suspend mask.  Deliver the catching signal directly (its
+     * handler is meant to run even though the restored mask now blocks it --
+     * that is exactly the window sigsuspend opens). */
+    cpu->sig_mask = saved;
+    ret_err(cpu, 4 /* EINTR */);
+    if (caught) {
+        cpu->sig_pending &= ~(1ull << (caught - 1));
+        g_ocerz_deliver_src = 1;
+        ocerz_signal_deliver(cpu, caught, 0, 0, 0);
+    }
+    return OCERZ_STEP_OK;
+}
+
+static int sys_sigwait(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    uint64_t setp = a[0], sigp = a[1];
+    uint32_t want = setp ? (uint32_t)ocerz_ld(setp, 4) : 0;
+    cpu->block_nokick = 1;
+    cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int got = 0;
+    for (;;) {
+        cpu->sig_pending |= ocerz_take_pending_async_sig() >> 1;
+        uint32_t hit = (uint32_t)cpu->sig_pending & want;
+        if (hit) {
+            got = __builtin_ctz(hit) + 1;
+            cpu->sig_pending &= ~(1ull << (got - 1));
+            break;
+        }
+        if (__atomic_load_n(&vm->exited, __ATOMIC_ACQUIRE) || cpu->interrupt)
+            break;
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    cpu->block_since_ns = 0;
+    cpu->block_nokick = 0;
+    if (!got) {
+        ret_err(cpu, 4 /* EINTR */);
+        return OCERZ_STEP_OK;
+    }
+    if (sigp)
+        ocerz_st(sigp, 4, (uint32_t)got);
+    ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
+/* A syscall whose argument structs hide guest pointers the ptr_mask cannot
+ * reach (connectx's endpoints, sendfile's header iovecs, the recvmsg_x
+ * array).  Correct only when a guest address is already a host address --
+ * identity mode, which every dynamic binary runs in.  In offset-arena mode
+ * the kernel would read or write host memory at the wrong place, so fail
+ * with ENOSYS and let the caller fall back rather than corrupt memory. */
+static int sys_identity_only(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8], int num, uint8_t mask)
+{
+    (void)vm;
+    if (ocerz_guest_base != 0) {
+        ret_err(cpu, ENOSYS);
+        return OCERZ_STEP_OK;
+    }
+    uint64_t fa[8];
+    memcpy(fa, a, sizeof fa);
+    for (int i = 0; i < 8; i++)
+        if ((mask & (1u << i)) && fa[i] != 0)
+            fa[i] = (uint64_t)(uintptr_t)ocerz_g2h(fa[i]);
+    forward_with_scratch(cpu, num, fa, 0);
+    return OCERZ_STEP_OK;
+}
+static int sys_connectx(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_identity_only(vm, cpu, a, 447, 0x00); }
+static int sys_sendfile(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_identity_only(vm, cpu, a, 337, 0x18); }
+static int sys_recvmsg_x(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_identity_only(vm, cpu, a, 480, 0x02); }
+static int sys_sendmsg_x(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_identity_only(vm, cpu, a, 481, 0x02); }
+
 static int sys_readv(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     return sys_iov(vm, cpu, a, 120);
@@ -3931,6 +4180,78 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [423] = { "__semwait_signal_nocancel", 6, 0x00, 0, NULL },
     [427] = { "fsgetpath",   4, 0x05, 0, NULL },
     [428] = { "audit_session_self", 0, 0x00, 0, NULL },
+    /* guest port names and fds are the host's: XPC hands Photos its library
+     * files as fileports, and PhotoFoundation aborts when makefd fails */
+    [430] = { "fileport_makeport", 2, 0x02, 0, NULL },
+    [431] = { "fileport_makefd", 1, 0x00, 0, NULL },
+    /* struct itimerval is two {long, int} timevals on either side; SIGALRM
+     * reaches a guest handler through ocerz_vm_mirror_host_signal */
+    [83]  = { "setitimer", 3, 0x06, 0, NULL },
+    [86]  = { "getitimer", 2, 0x02, 0, NULL },
+    /* ps(1) reads other processes through their task read ports */
+    [539] = { "task_read_for_pid", 3, 0x04, 0, NULL },
+    [538] = { "task_inspect_for_pid", 3, 0x04, 0, NULL },
+    /* struct stat is identical on x86_64 and arm64, so these forward as-is;
+     * the *64 twins already do.  x86 binaries built against older SDKs, and
+     * getdirentries(3), use the unsuffixed numbers. */
+    [188] = { "stat",        2, 0x03, 0, NULL },
+    [189] = { "fstat",       2, 0x02, 0, NULL },
+    [190] = { "lstat",       2, 0x03, 0, NULL },
+    [157] = { "statfs",      2, 0x03, 0, NULL },
+    [158] = { "fstatfs",     2, 0x02, 0, NULL },
+    [18]  = { "getfsstat",   3, 0x01, 0, NULL },
+    [196] = { "getdirentries", 4, 0x0a, 0, NULL },
+    [469] = { "fstatat",     4, 0x06, 0, NULL },
+    /* legacy path calls */
+    [9]   = { "link",        2, 0x03, 0, NULL },
+    [14]  = { "mknod",       3, 0x01, 0, NULL },
+    [61]  = { "chroot",      1, 0x01, 0, NULL },
+    [364] = { "lchown",      3, 0x01, 0, NULL },
+    [471] = { "linkat",      5, 0x0a, 0, NULL },
+    [474] = { "symlinkat",   3, 0x05, 0, NULL },
+    [553] = { "mkfifoat",    3, 0x02, 0, NULL },
+    [554] = { "mknodat",     4, 0x02, 0, NULL },
+    [187] = { "fdatasync",   1, 0x00, 0, NULL },
+    /* the _nocancel twins forward exactly as their base numbers do */
+    [400] = { "wait4_nocancel",   4, 0x0a, 0, NULL },
+    [405] = { "msync_nocancel",   3, 0x01, 0, NULL },
+    [408] = { "fsync_nocancel",   1, 0x00, 0, NULL },
+    [173] = { "waitid",      4, 0x04, 0, NULL },
+    [416] = { "waitid_nocancel", 4, 0x04, 0, NULL },
+    [540] = { "preadv",      4, 0x00, 0, sys_preadv },
+    [541] = { "pwritev",     4, 0x00, 0, sys_pwritev },
+    [542] = { "preadv_nocancel",  4, 0x00, 0, sys_preadv_nc },
+    [543] = { "pwritev_nocancel", 4, 0x00, 0, sys_pwritev_nc },
+    /* memory */
+    [203] = { "mlock",       2, 0x01, 0, NULL },
+    [204] = { "munlock",     2, 0x01, 0, NULL },
+    [324] = { "mlockall",    1, 0x00, 0, NULL },
+    [325] = { "munlockall",  1, 0x00, 0, NULL },
+    [78]  = { "mincore",     3, 0x05, 0, NULL },
+    [250] = { "minherit",    3, 0x01, 0, NULL },
+    [534] = { "memorystatus_available_memory", 2, 0x00, 0, NULL },
+    /* uid/gid setters and misc scalars */
+    [126] = { "setreuid",    2, 0x00, 0, NULL },
+    [127] = { "setregid",    2, 0x00, 0, NULL },
+    [181] = { "setgid",      1, 0x00, 0, NULL },
+    [182] = { "setegid",     1, 0x00, 0, NULL },
+    [183] = { "seteuid",     1, 0x00, 0, NULL },
+    [285] = { "settid",      2, 0x00, 0, NULL },
+    [66]  = { "vfork",       0, 0x00, 0, sys_fork },
+    [148] = { "pipe2",       2, 0x01, 0, NULL },
+    [149] = { "dup3",        3, 0x00, 0, NULL },
+    [369] = { "kevent64",    7, 0x4a, 0, NULL },
+    /* signal waits (real handlers above) */
+    [111] = { "sigsuspend",  1, 0x00, 0, sys_sigsuspend },
+    [410] = { "sigsuspend_nocancel", 1, 0x00, 0, sys_sigsuspend },
+    [330] = { "__sigwait",   2, 0x00, 0, sys_sigwait },
+    [422] = { "__sigwait_nocancel", 2, 0x00, 0, sys_sigwait },
+    /* sockets with pointers nested in argument structs: identity mode only */
+    [447] = { "connectx",    7, 0x00, 0, sys_connectx },
+    [448] = { "disconnectx", 3, 0x00, 0, NULL },
+    [337] = { "sendfile",    6, 0x00, 0, sys_sendfile },
+    [480] = { "recvmsg_x",   4, 0x00, 0, sys_recvmsg_x },
+    [481] = { "sendmsg_x",   4, 0x00, 0, sys_sendmsg_x },
     [461] = { "getattrlistbulk", 5, 0x06, 0, NULL },
     [463] = { "openat",      4, 0x02, 0, NULL },
     [464] = { "openat_nocancel", 4, 0x02, 0, NULL },
@@ -5103,6 +5424,67 @@ static void ocerz_vmmsg_trace(const char *phase, uint64_t msg, uint32_t size_lim
     fprintf(stderr, "\n");
 }
 
+/* thread_suspend (3605), thread_resume (3606) and thread_get_state (3603)
+ * sent to a thread running guest code: answered here, with the reply the
+ * kernel would have written (see ocerz_vm_thread_suspend in vm.c).  Returns
+ * 0 to send the message on to the kernel instead: a port that is not such a
+ * thread, a state flavor not produced here, or OCERZ_NO_THREADACT=1. */
+static int thread_act_emulate(OcerzCPU *cpu, uint64_t buf, uint32_t id, uint32_t rcv_size)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_THREADACT") ? 1 : 0;
+    uint32_t need = id == 3603 ? 40 + 44 * 4 + 8 : 36 + 8;
+    if (off || rcv_size < need)
+        return 0;
+    uint32_t port = (uint32_t)ocerz_ld(buf + 8, 4), reply_port = (uint32_t)ocerz_ld(buf + 12, 4);
+    uint32_t st[44], cnt = 0;
+    int kr;
+    if (id == 3605) {
+        kr = ocerz_vm_thread_suspend(cpu, port);
+    } else if (id == 3606) {
+        kr = ocerz_vm_thread_resume(port);
+    } else {
+        uint32_t flavor = (uint32_t)ocerz_ld(buf + 32, 4), want = (uint32_t)ocerz_ld(buf + 36, 4);
+        uint64_t g[16], rip, rfl;
+        if ((flavor != 4 && flavor != 7) || ocerz_vm_thread_regs(port, g, &rip, &rfl) < 0)
+            return 0;
+        /* x86_thread_state64_t: rax rbx rcx rdx rdi rsi rbp rsp r8-r15 rip rflags cs fs gs */
+        uint64_t s[21] = { g[OCERZ_RAX], g[OCERZ_RBX], g[OCERZ_RCX], g[OCERZ_RDX],
+                           g[OCERZ_RDI], g[OCERZ_RSI], g[OCERZ_RBP], g[OCERZ_RSP],
+                           g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15],
+                           rip, rfl | OCERZ_FLAG_FIXED1, 0x2b, 0, 0 };
+        uint32_t at = 0;
+        if (flavor == 7) {              /* x86_THREAD_STATE: {flavor, count}, then the 64-bit state */
+            st[0] = 4;
+            st[1] = 42;
+            at = 2;
+        }
+        memcpy(st + at, s, sizeof s);
+        cnt = at + 42;
+        kr = want < cnt ? KERN_INVALID_ARGUMENT : KERN_SUCCESS;
+    }
+    if (kr < 0)
+        return 0;
+    uint32_t size = (id == 3603 && kr == KERN_SUCCESS) ? 40 + cnt * 4 : 36;
+    ocerz_st(buf + 0, 4, 0x1200);       /* MACH_MSGH_BITS(0, PORT_SEND_ONCE): a kernel reply as received */
+    ocerz_st(buf + 4, 4, size);
+    ocerz_st(buf + 8, 4, 0);
+    ocerz_st(buf + 12, 4, reply_port);
+    ocerz_st(buf + 16, 4, 0);
+    ocerz_st(buf + 20, 4, id + 100);
+    ocerz_st(buf + 24, 8, 0x0000000100000000ull);   /* NDR_record: little-endian ints */
+    ocerz_st(buf + 32, 4, (uint32_t)kr);
+    if (size > 36) {
+        ocerz_st(buf + 36, 4, cnt);
+        for (uint32_t i = 0; i < cnt; i++)
+            ocerz_st(buf + 40 + 4 * i, 4, st[i]);
+    }
+    ocerz_st(buf + size, 4, 0);         /* MACH_MSG_TRAILER_FORMAT_0, 8 bytes */
+    ocerz_st(buf + size + 4, 4, 8);
+    mach_ret(cpu, KERN_SUCCESS);
+    return 1;
+}
+
 static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 {
     {   /* OCERZ_STRACE_CPU: mirror for mach traps */
@@ -5442,6 +5824,10 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             else
                 disarm_guest_buffer(cpu, reply_buf, (uint32_t)a[6]);
         }
+        if (!vector_mode && request_buf && (a[1] & 0x3) == 0x3 &&
+            (msgh_id == 3603 || msgh_id == 3605 || msgh_id == 3606) &&
+            thread_act_emulate(cpu, request_buf, msgh_id, (uint32_t)a[6]))
+            break;
 
         struct ocerz_ool_save sv47[64];
         int nsv47 = 0;
@@ -6535,5 +6921,6 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
     peekguard(cpu, class, num, "exit");
     if (rc == OCERZ_STEP_OK)
         deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig());
+    ocerz_vm_suspend_point(cpu);        /* a guest thread_suspend waits here, state consistent */
     return rc;
 }
