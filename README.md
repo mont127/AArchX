@@ -85,10 +85,9 @@ means the app drew its main window on screen and stayed up.
 | Steam (x86-64 client) | bootstrapper runs: self-updates over the network, opens its progress window, and spawns its child process tree (`ipcserver`, re-exec chain). The full CEF UI (`steamwebhelper`) is not up yet. SysV semaphores were the blocker — Steam's tier0 threading needs them. |
 
 Command-line tools match their native output byte for byte
-(`tools/apptest.sh cli`): `uname`, `sw_vers`, `echo`, `ls`, `id`,
-`basename`, `wc`, `sort`, `uniq`, `head`, `grep`, `file`, `xxd`, `nm` and
-`plutil`, 15 of 16. `openssl version` runs but reports LibreSSL 2.8.3 where
-the native binary reports 3.3.6.
+(`tools/apptest.sh cli`, 16 of 16): `uname`, `sw_vers`, `echo`, `ls`, `id`,
+`basename`, `wc`, `sort`, `uniq`, `head`, `grep`, `file`, `xxd`, `nm`,
+`plutil` and `openssl` (`version` and `dgst -sha256`).
 
 Not working yet:
 - **Safari** starts but never shows a window. JavaScriptCore's `thread_suspend` reaches the host kernel and freezes a thread that holds the JIT lock.
