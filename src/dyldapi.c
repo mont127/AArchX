@@ -1511,6 +1511,19 @@ void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t sta
     const char *imgpath = g_cache ? cache_path_for_mh(g_cache, mh) : NULL;
     OCERZ_LOG("loadphase: image %s (mh=%#llx)\n", imgpath ? imgpath : "?", (unsigned long long)mh);
 
+    /* Native dyld map_images'es an image before load_images runs its +load
+     * methods.  ocerz only drove the static-closure batch and dlopens through
+     * map_images, so a cache framework pulled up purely as a transitive
+     * LC_LOAD_DYLIB dependency (ViewBridge, QuickLook, ...) reaches its +load
+     * notification here never having been map_images'd; libobjc then walks its
+     * classes off unbound superclass links and SIGSEGVs.  Map it first so map
+     * precedes load, as dyld does.  objc_map_one is idempotent -- it skips the
+     * startup batch and prior dlopens -- and walks the image's closure, so this
+     * is a no-op for every already-covered image (objbasic and the dynamic
+     * suite live entirely in the startup batch).  OCERZ_NO_LOADMAP opts out. */
+    if (in_cache(mh) && !getenv("OCERZ_NO_LOADMAP"))
+        ocerz_dyldapi_objc_map_one(vm, mh);
+
     if (g_objc_init_cb) {
         if (!g_objc_init_info) {
             g_objc_init_info = ocerz_map_anywhere(0x20, PROT_READ | PROT_WRITE);
