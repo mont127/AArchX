@@ -1557,6 +1557,27 @@ handrolled:;
     }
 }
 
+/* LC_UUID of a guest Mach-O header, into guest memory at out; 0 if none. */
+static int mh_copy_uuid(uint64_t mh, uint64_t out)
+{
+    if (!mh || !out || !ocerz_addr_readable(mh + 32))
+        return 0;
+    uint32_t ncmds = (uint32_t)ocerz_ld(mh + 16, 4), sizeofcmds = (uint32_t)ocerz_ld(mh + 20, 4);
+    uint64_t lc = mh + 32, end = lc + sizeofcmds;
+    for (uint32_t i = 0; i < ncmds && lc + 8 <= end; i++) {
+        uint32_t cmd = (uint32_t)ocerz_ld(lc, 4), cmdsize = (uint32_t)ocerz_ld(lc + 4, 4);
+        if (cmdsize < 8 || lc + cmdsize > end)
+            return 0;
+        if (cmd == 0x1b /* LC_UUID */ && cmdsize >= 24) {
+            ocerz_st(out, 8, ocerz_ld(lc + 8, 8));
+            ocerz_st(out + 8, 8, ocerz_ld(lc + 16, 8));
+            return 1;
+        }
+        lc += cmdsize;
+    }
+    return 0;
+}
+
 int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t off = cpu->rip - OCERZ_DYLDAPI_LO;
@@ -1575,6 +1596,42 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x240:
         api_return(cpu, build_version_at_least(g_main_bv_platform, g_main_bv_minos,
                                                cpu->gpr[OCERZ_RSI]));
+        return OCERZ_STEP_OK;
+    /* dyld_get_program_sdk_version.  Answered 0 by the default below, which
+     * every "linked on or after" check reads as a pre-10.5 SDK: OpenGL then
+     * left the software renderer out of CGLChoosePixelFormat, any pixel
+     * format that did not say kCGLPFANoRecovery failed with 10002, and Photos
+     * asserted in +[PAOpenGLDevice _sharedPixelFormat:] and aborted. */
+    case 0x188:
+        api_return(cpu, g_main_bv_sdk);
+        return OCERZ_STEP_OK;
+    case 0x218: {                           /* dyld_get_base_platform */
+        uint64_t p = (uint32_t)cpu->gpr[OCERZ_RSI];
+        static const uint8_t base[] = { 0, 1, 2, 3, 4, 5, 2, 2, 3, 4, 10, 11, 11 };
+        api_return(cpu, p < sizeof base ? base[p] : p);
+        return OCERZ_STEP_OK;
+    }
+    case 0x1d8:                             /* _dyld_get_image_uuid(mh, uuid) */
+        api_return(cpu, mh_copy_uuid(cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX]));
+        return OCERZ_STEP_OK;
+    case 0x1e0: {                           /* _dyld_get_shared_cache_uuid(uuid) */
+        uint64_t out = cpu->gpr[OCERZ_RSI];
+        int ok = g_cache && out;
+        if (ok) {
+            ocerz_st(out, 8, ocerz_ld(g_cache->base + 0x58, 8));   /* dyld_cache_header.uuid */
+            ocerz_st(out + 8, 8, ocerz_ld(g_cache->base + 0x60, 8));
+        }
+        api_return(cpu, ok);
+        return OCERZ_STEP_OK;
+    }
+    case 0x2d0: {                           /* _dyld_shared_cache_real_path(path) */
+        uint64_t pathg = cpu->gpr[OCERZ_RSI];
+        api_return(cpu, pathg && g_cache &&
+                        cache_find_path(g_cache, (const char *)ocerz_g2h(pathg)) != 0 ? pathg : 0);
+        return OCERZ_STEP_OK;
+    }
+    case 0x278:                             /* dyld_has_inserted_or_interposing_libraries */
+        api_return(cpu, 0);
         return OCERZ_STEP_OK;
     case 0x228:
     case 0x230: {

@@ -162,6 +162,13 @@ run_file_case dsmc_high tests/dynamic/smc_high.c 'OK'
 run_file_case dbyte_atomics tests/dynamic/byte_atomics.c 'OK'
 run_file_case dspawn_pipe tests/dynamic/spawn_pipe.c 'OK'
 run_file_case dread_block tests/dynamic/read_block.c 'OK'
+run_file_case dthread_suspend tests/dynamic/thread_suspend.c 'OK'
+run_file_case dfileport tests/dynamic/fileport.c 'OK'
+run_file_case dx86_sysctl tests/dynamic/x86_sysctl.c 'OK'
+run_file_case ditimer tests/dynamic/itimer.c 'OK'
+run_file_case ddyld_apis tests/dynamic/dyld_apis.c 'OK'
+run_file_case dsignal_wait tests/dynamic/signal_wait.c 'OK'
+run_file_case dpreadv tests/dynamic/preadv.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"

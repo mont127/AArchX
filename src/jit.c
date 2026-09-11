@@ -13826,6 +13826,37 @@ static const JitBlock *fault_block(const OcerzJit *jit, const uint32_t *pc)
 
 static int fault_insn_index(const JitBlock *b, const uint32_t *pc);
 
+/* The guest GPRs of a thread stopped at host_pc inside a translated block,
+ * read-only: the register half of ocerz_jit_fault_recover_regs, written to
+ * out[] instead of the cpu, whose gpr[] a thread that resumes in JIT code
+ * may still fill from.  out[] comes in holding the cpu's spilled gpr[]; only
+ * the block's pinned registers are replaced.  Returns 0 when host_pc is not
+ * inside a published block (a stub, C code), where the host registers mean
+ * nothing.  Around a C callout x1/x2 carry the call's arguments (x1 = cpu)
+ * while r14/r15 sit spilled in gpr[] by emit_spill_pinned, so the spilled
+ * values stand there. */
+int ocerz_jit_guest_gprs_at(const struct OcerzVM *vm, const void *host_pc,
+                            const uint64_t *host_x, const OcerzCPU *cpu, uint64_t out[16])
+{
+    const OcerzJit *jit = vm ? vm->jit : NULL;
+    const JitBlock *b = fault_block(jit, (const uint32_t *)host_pc);
+    if (!b || !host_x)
+        return 0;
+    int in_callout = host_x[1] == (uint64_t)(uintptr_t)cpu;
+    for (int i = 0; i < b->n_pinned; i++) {
+        int hr = pin_hreg(i);
+        if (in_callout && (hr == 1 || hr == 2))
+            continue;
+        uint64_t value = host_x[hr];
+        if ((b->pin_class == 2 ||
+             (b->pin_class == 3 && b->n_insns > 0 && !blk_mode32(b) && rsp_ptr3())) &&
+            b->host_holds[i] == OCERZ_RSP)
+            value -= ocerz_guest_base;
+        out[b->host_holds[i]] = value;
+    }
+    return 1;
+}
+
 void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
                                   const uint64_t *host_x, OcerzCPU *cpu)
 {
