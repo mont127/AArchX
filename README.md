@@ -153,6 +153,8 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `OCERZ_NOJIT=1` | interpret the whole process tree |
 | `OCERZ_NOJIT_EXE=<text>` | interpret processes whose command line matches |
 | `OCERZ_NO_HOSTWQ=1` | turn the host workqueue bridge off (it is on by default; `OCERZ_HOSTWQ=1` is still accepted and still means on) |
+| `OCERZ_NO_UNSTICK=1` | never EINTR a guest thread out of a long wait (the unstick monitor otherwise kicks psynch, semwait, kevent, workq, ulock and Mach waits parked over 800 ms) |
+| `OCERZ_UNSTICK_ALL=1` | let the unstick monitor kick every blocking call, `read`/`recvmsg`/`poll` included, as it used to; apps that do not expect EINTR there fail |
 | `OCERZ_NO_PLAIN_MEM=1` | ordered memory forms from the start |
 | `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |
 | `OCERZ_TSO_VECTOR=1` | order SSE loads and stores too |
