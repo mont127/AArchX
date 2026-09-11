@@ -47,10 +47,11 @@ make -j
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 82 / 82 |
-| x86-64 differential gate (interpreter vs JIT) | 71 / 71 |
+| x86-64 guest gate | 93 / 93 |
+| x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
 | i386 differential gate | 20,033 / 20,033 |
-| dynamic-mode tests | 5 / 5 |
+| dynamic-mode tests | 21 / 21 |
+| real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
 | Wine boot (MacNdCheese build, `cmd /c ver`) | 14 s |
@@ -62,6 +63,36 @@ What is in the box:
 - Native guest threads, libdispatch workqueue bridging, Mach messages, signals and x86-TSO memory ordering.
 - JIT cache invalidation on guest code writes and executable mapping changes.
 - Differential tests for both x86-64 and i386 execution.
+
+## Application compatibility
+
+Confirmed on 2026-09-11 on an Apple silicon MacBook Air with macOS 26.6.
+Each app's x86-64 slice was launched straight from its bundle, for example
+`./ocerz /System/Applications/Chess.app/Contents/MacOS/Chess`. Here "works"
+means the app drew its main window on screen and stayed up.
+
+| Application | Result under AArchX |
+| --- | --- |
+| Chess | works and plays: board window, and the `sjeng` engine subprocess answers moves |
+| Calculator | works (window on screen) |
+| TextEdit | works (document window) |
+| Dictionary | works (window on screen) |
+| Font Book | works (window on screen) |
+| Grapher | works (window on screen) |
+| Digital Color Meter | works (window on screen) |
+| Activity Monitor | window on screen; its force-quit support library is not in the x86-64 shared cache |
+| Console | window on screen; logs a missing optional library |
+
+Command-line tools match their native output byte for byte
+(`tools/apptest.sh cli`): `uname`, `sw_vers`, `echo`, `ls`, `id`,
+`basename`, `wc`, `sort`, `uniq`, `head`, `grep`, `file`, `xxd`, `nm` and
+`plutil`, 15 of 16. `openssl version` runs but reports LibreSSL 2.8.3 where
+the native binary reports 3.3.6.
+
+Not working yet:
+- **Safari** starts but never shows a window. JavaScriptCore's `thread_suspend` reaches the host kernel and freezes a thread that holds the JIT lock.
+- **Photos** aborts inside PhotoFoundation.
+- **Preview** and **Script Editor** stay up but had no window after 35 s.
 
 ## Wine and i386
 
