@@ -91,7 +91,7 @@ the native binary reports 3.3.6.
 
 Not working yet:
 - **Safari** starts but never shows a window. JavaScriptCore's `thread_suspend` reaches the host kernel and freezes a thread that holds the JIT lock.
-- **Photos** aborts in `+[PAOpenGLDevice _sharedPixelFormat:]`: `CGLChoosePixelFormat` returns no accelerated pixel format under emulation, so PhotoFoundation asserts. This is a GPU/OpenGL-renderer gap, not a syscall one.
+- **Photos** aborts in `+[PAOpenGLDevice _sharedPixelFormat:]`: `CGLChoosePixelFormat` returns 10002 for every attribute set. Root cause: `IOServiceGetMatchingServices("IOAccelerator")` yields the `AppleMetalGLRenderer` compatibility service only to genuinely Rosetta-translated x86 processes — a native arm64 process and ocerz both see only the one hardware accelerator, and CGL needs that compat renderer to build a pixel format. Metal itself works under ocerz (real device, identical feature sets); the gap is the Rosetta-only GL compatibility renderer, which would have to be synthesized in the IOKit layer.
 
 ## Wine and i386
 
