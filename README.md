@@ -82,6 +82,7 @@ means the app drew its main window on screen and stayed up.
 | Activity Monitor | window on screen; its force-quit support library is not in the x86-64 shared cache |
 | Console | window on screen; logs a missing optional library |
 | TextEdit / Preview / Script Editor | run; open a document window when given a file to open |
+| Steam (x86-64 client) | bootstrapper runs: self-updates over the network, opens its progress window, and spawns its child process tree (`ipcserver`, re-exec chain). The full CEF UI (`steamwebhelper`) is not up yet. SysV semaphores were the blocker — Steam's tier0 threading needs them. |
 
 Command-line tools match their native output byte for byte
 (`tools/apptest.sh cli`): `uname`, `sw_vers`, `echo`, `ls`, `id`,

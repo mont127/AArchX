@@ -169,6 +169,7 @@ run_file_case ditimer tests/dynamic/itimer.c 'OK'
 run_file_case ddyld_apis tests/dynamic/dyld_apis.c 'OK'
 run_file_case dsignal_wait tests/dynamic/signal_wait.c 'OK'
 run_file_case dpreadv tests/dynamic/preadv.c 'OK'
+run_file_case dsysv_sem tests/dynamic/sysv_sem.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"

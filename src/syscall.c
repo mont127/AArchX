@@ -3827,6 +3827,27 @@ static int sys_sendfile(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_
 static int sys_recvmsg_x(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_identity_only(vm, cpu, a, 480, 0x02); }
 static int sys_sendmsg_x(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_identity_only(vm, cpu, a, 481, 0x02); }
 
+/* SysV semaphores: Steam's tier0 CThreadSemaphore is built on them, so
+ * without these every "thread synchronization object is unuseable".  The
+ * structs (sembuf, semid_ds) are identical on x86_64 and arm64, so semget
+ * and semop pass straight through.  semctl(semid, semnum, cmd, arg) is
+ * variadic: its union-semun arg is a pointer only for IPC_SET/IPC_STAT
+ * (struct semid_ds *) and GETALL/SETALL (unsigned short *); for SETVAL it is
+ * a plain int and for the rest it is unused.  Pinned by the dynamic test
+ * sysv_sem. */
+static int sys_semctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    int cmd = (int)a[2];
+    int is_ptr = (cmd == 1 /* IPC_SET */ || cmd == 2 /* IPC_STAT */ ||
+                  cmd == 6 /* GETALL */ || cmd == 9 /* SETALL */);
+    uint64_t fa[8] = { a[0], a[1], a[2],
+                       (is_ptr && a[3]) ? (uint64_t)(uintptr_t)ocerz_g2h(a[3]) : a[3],
+                       0, 0, 0, 0 };
+    forward_with_scratch(cpu, 254, fa, 0);
+    return OCERZ_STEP_OK;
+}
+
 static int sys_readv(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     return sys_iov(vm, cpu, a, 120);
@@ -4246,6 +4267,21 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [410] = { "sigsuspend_nocancel", 1, 0x00, 0, sys_sigsuspend },
     [330] = { "__sigwait",   2, 0x00, 0, sys_sigwait },
     [422] = { "__sigwait_nocancel", 2, 0x00, 0, sys_sigwait },
+    /* SysV IPC: Steam's threading, and much old Unix software, needs it */
+    [255] = { "semget",      3, 0x00, 0, NULL },
+    [256] = { "semop",       3, 0x02, 0, NULL },
+    [254] = { "semctl",      4, 0x00, 0, sys_semctl },
+    [265] = { "shmget",      3, 0x00, 0, NULL },
+    [263] = { "shmctl",      3, 0x04, 0, NULL },
+    [259] = { "msgget",      2, 0x00, 0, NULL },
+    [258] = { "msgctl",      3, 0x04, 0, NULL },
+    [260] = { "msgsnd",      4, 0x02, 0, NULL },
+    [261] = { "msgrcv",      5, 0x02, 0, NULL },
+    [132] = { "mkfifo",      2, 0x01, 0, NULL },
+    /* file-attribute and quota calls Steam and Finder-style code make */
+    [221] = { "setattrlist", 5, 0x07, 0, NULL },
+    [245] = { "ffsctl",      4, 0x04, 0, NULL },
+    [165] = { "quotactl",    4, 0x09, 0, NULL },
     /* sockets with pointers nested in argument structs: identity mode only */
     [447] = { "connectx",    7, 0x00, 0, sys_connectx },
     [448] = { "disconnectx", 3, 0x00, 0, NULL },
