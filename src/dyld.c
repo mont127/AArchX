@@ -489,6 +489,14 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
             }
             if (dep)
                 value = ocerz_image_self_resolve_ex(dep, name, &found);
+            /* Two-level namespace for a CACHE dependency: bind the symbol in
+             * the specific linked dylib, not by a flat search across every
+             * cache image.  openssl links libcrypto.46.dylib (3.3.6) but the
+             * cache also holds libcrypto.44 (2.8.3) exporting the same names;
+             * the flat fallback below bound OpenSSL_version to .44 and reported
+             * the wrong version. */
+            if (!found && !dep && tgt[0] != '@')
+                value = ocerz_cache_resolve_in_image(cache, tgt, name, &found);
         }
     }
     if (!found)
