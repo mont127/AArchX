@@ -137,6 +137,12 @@ typedef struct OcerzCPU {
      * ops zero the destination's, VEX.256 ops write them.  Only the interpreter
      * touches them (the JIT declines every VEX-encoded instruction). */
     Ocerz128 ymmh[16] __attribute__((aligned(16)));
+    /* guest thread_suspend of this thread (ocerz_vm_thread_suspend in vm.c) */
+    volatile int suspend_count;     /* outstanding guest suspends */
+    volatile int susp_parked;       /* waiting at a safe point for the count to drop */
+    int susp_host;                  /* stopped by the host kernel instead, somewhere lock-free */
+    int susp_have_gpr;              /* susp_gpr[] holds its registers, read from the JIT's host registers */
+    uint64_t susp_gpr[16];
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256

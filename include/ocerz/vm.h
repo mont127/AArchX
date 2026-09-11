@@ -32,6 +32,12 @@ void ocerz_vm_install_handlers(OcerzVM *vm);
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top);
 unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
 void ocerz_vm_purge_jit_ras(OcerzVM *vm);
+/* guest thread_suspend/thread_resume/thread_get_state: -1 = not a thread
+ * running guest code, the kernel answers as before */
+int ocerz_vm_thread_suspend(OcerzCPU *self, uint32_t port);
+int ocerz_vm_thread_resume(uint32_t port);
+int ocerz_vm_thread_regs(uint32_t port, uint64_t gpr[16], uint64_t *rip, uint64_t *rflags);
+void ocerz_vm_suspend_point(OcerzCPU *cpu);
 extern int ocerz_init_tolerant;
 
 #endif

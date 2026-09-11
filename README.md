@@ -51,7 +51,7 @@ make -j
 | x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 21 / 21 |
-| real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
+| real macOS apps opening their main window | 8 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
 | Wine boot (MacNdCheese build, `cmd /c ver`) | 14 s |
@@ -75,13 +75,13 @@ means the app drew its main window on screen and stayed up.
 | --- | --- |
 | Chess | works and plays: board window, and the `sjeng` engine subprocess answers moves |
 | Calculator | works (window on screen) |
-| TextEdit | works (document window) |
 | Dictionary | works (window on screen) |
 | Font Book | works (window on screen) |
 | Grapher | works (window on screen) |
 | Digital Color Meter | works (window on screen) |
 | Activity Monitor | window on screen; its force-quit support library is not in the x86-64 shared cache |
 | Console | window on screen; logs a missing optional library |
+| TextEdit / Preview / Script Editor | run; open a document window when given a file to open |
 
 Command-line tools match their native output byte for byte
 (`tools/apptest.sh cli`): `uname`, `sw_vers`, `echo`, `ls`, `id`,
@@ -91,8 +91,7 @@ the native binary reports 3.3.6.
 
 Not working yet:
 - **Safari** starts but never shows a window. JavaScriptCore's `thread_suspend` reaches the host kernel and freezes a thread that holds the JIT lock.
-- **Photos** aborts inside PhotoFoundation.
-- **Preview** and **Script Editor** stay up but had no window after 35 s.
+- **Photos** aborts in `+[PAOpenGLDevice _sharedPixelFormat:]`: `CGLChoosePixelFormat` returns no accelerated pixel format under emulation, so PhotoFoundation asserts. This is a GPU/OpenGL-renderer gap, not a syscall one.
 
 ## Wine and i386
 
@@ -185,6 +184,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `OCERZ_NOJIT_EXE=<text>` | interpret processes whose command line matches |
 | `OCERZ_NO_HOSTWQ=1` | turn the host workqueue bridge off (it is on by default; `OCERZ_HOSTWQ=1` is still accepted and still means on) |
 | `OCERZ_NO_UNSTICK=1` | never EINTR a guest thread out of a long wait (the unstick monitor otherwise kicks psynch, semwait, kevent, workq, ulock and Mach waits parked over 800 ms) |
+| `OCERZ_NO_THREADACT=1` | hand `thread_suspend`/`thread_resume`/`thread_get_state` on guest threads to the host kernel instead of emulating them (the kernel stops a thread anywhere, even holding the JIT lock, and cannot report x86 registers) |
 | `OCERZ_UNSTICK_ALL=1` | let the unstick monitor kick every blocking call, `read`/`recvmsg`/`poll` included, as it used to; apps that do not expect EINTR there fail |
 | `OCERZ_NO_PLAIN_MEM=1` | ordered memory forms from the start |
 | `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |
