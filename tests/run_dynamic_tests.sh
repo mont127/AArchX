@@ -98,6 +98,34 @@ run_file_case() {
     done
 }
 
+# like run_file_case but a C++ source, so the Itanium unwinder and libc++ are
+# exercised; skips cleanly if no x86_64 C++ toolchain is present.
+run_cpp_file_case() {
+    local name="$1" src="$2" want_out="$3"
+    if ! clang++ -arch x86_64 -std=c++17 -pthread -o "$TMP/$name" "$src" 2>/dev/null; then
+        echo "SKIP $name (no x86_64 c++ toolchain)"; return
+    fi
+
+    local mode got_out got_code out_file err_file
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$TMP/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$TMP/$name"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"
+            fail=$((fail+1))
+        fi
+    done
+}
+
 run_case dret 'int main(void){return 42;}' '' 42
 run_case dwrite '
 int main(void){
@@ -173,6 +201,8 @@ run_file_case dsysv_sem tests/dynamic/sysv_sem.c 'OK'
 run_file_case drel_acq_order tests/dynamic/rel_acq_order.c 'OK'
 run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
 run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
+run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
+run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"
