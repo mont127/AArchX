@@ -3,7 +3,21 @@
 #include "ocerz/decode.h"
 #include "ocerz/mem.h"
 
+#include <fenv.h>
 #include <stdlib.h>
+
+/* Propagate the guest MXCSR rounding-control (bits 13-14) to the host arm64
+ * FPCR, which both the JIT's arm64 FP instructions and the interpreter's
+ * C-computed SSE ops honour.  x86 and arm64 disagree on the directed
+ * encodings -- MXCSR 01 rounds toward -inf while FPCR 01 rounds toward +inf --
+ * so this maps through the fe* constants rather than copying the bits.
+ * Without it, divsd/sqrtsd/... always rounded to nearest whatever mode a
+ * program selected with ldmxcsr or fesetround. */
+void ocerz_apply_mxcsr_round(uint32_t mxcsr)
+{
+    static const int fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
+    fesetround(fe[(mxcsr >> 13) & 3]);
+}
 
 void ocerz_cpu_reset(OcerzCPU *cpu)
 {

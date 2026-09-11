@@ -2913,6 +2913,10 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     g_cur_cpu = cpu;
     cpu->host_pthread = (void *)pthread_self();
     cpu->host_kport = pthread_mach_thread_np(pthread_self());
+    /* This host thread's FPCR must reflect the guest's MXCSR rounding mode
+     * before any JIT'd SSE op runs -- a worker inherits the host default, and
+     * a thread that set the mode elsewhere resumes here. */
+    ocerz_apply_mxcsr_round(cpu->mxcsr);
 
     while (!vm->exited && !cpu->terminated && !cpu->interrupt) {
         ocerz_vm_suspend_point(cpu);
