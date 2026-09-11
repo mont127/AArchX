@@ -22,6 +22,9 @@ void ocerz_cache_arm_exec(uint64_t lo, uint64_t hi);    /* code translated out o
 uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol);
 
 uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found);
+/* resolve `symbol` in the specific cache dylib at `path` (two-level namespace) */
+uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
+                                      const char *symbol, int *found);
 uint64_t ocerz_cache_image_addr(OcerzCache *c, uint32_t i, const char **path_out);
 
 void ocerz_cache_prefork(void);
