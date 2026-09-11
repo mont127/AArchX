@@ -751,6 +751,62 @@ uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found)
     return v;
 }
 
+/* Two-level namespace: resolve `symbol` in the SPECIFIC cache dylib named by
+ * `path`, following re-exports, not by the flat walk over every cache image
+ * that ocerz_cache_resolve_ex does.  A binary that links
+ * /usr/lib/libcrypto.46.dylib (LibreSSL 3.3.6) must bind OpenSSL_version there,
+ * even though the cache also carries libcrypto.44 (2.8.3) exporting the same
+ * name; the flat walk bound it to whichever image came first and openssl
+ * reported the wrong version.  The path->mh lookup is memoized because
+ * resolving every import of a dependency would otherwise rescan all ~3600
+ * cache images; the cache is static, so a negative (mh==0, not a cache image)
+ * is cached too.  Returns 0 with *found==0 when the image or symbol is absent,
+ * so the caller can fall back to its flat search. */
+uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
+                                      const char *symbol, int *found)
+{
+    int dummy = 0;
+    if (!found)
+        found = &dummy;
+    *found = 0;
+    if (!c->mapped || !path || !symbol)
+        return 0;
+
+    static struct { char *path; uint64_t mh; } pmemo[512];
+    static pthread_mutex_t pmemo_lock = PTHREAD_MUTEX_INITIALIZER;
+    unsigned h = 2166136261u;
+    for (const char *s = path; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    unsigned slot = h & 511;
+
+    uint64_t mh = 0;
+    int have = 0;
+    pthread_mutex_lock(&pmemo_lock);
+    if (pmemo[slot].path && strcmp(pmemo[slot].path, path) == 0) {
+        mh = pmemo[slot].mh;
+        have = 1;
+    }
+    pthread_mutex_unlock(&pmemo_lock);
+    if (!have) {
+        mh = cache_image_by_path(c, path);
+        char *dup = strdup(path);
+        if (dup) {
+            pthread_mutex_lock(&pmemo_lock);
+            free(pmemo[slot].path);
+            pmemo[slot].path = dup;
+            pmemo[slot].mh = mh;
+            pthread_mutex_unlock(&pmemo_lock);
+        }
+    }
+    if (!mh)
+        return 0;
+
+    int f = 0;
+    uint64_t v = resolve_in_dylib(c, mh, symbol, 0, &f);
+    *found = f;
+    return v;
+}
+
 static uint64_t cache_resolve_walk(OcerzCache *c, const char *symbol, int *found)
 {
     for (uint32_t i = 0; i < c->images_cnt; i++) {
