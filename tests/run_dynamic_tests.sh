@@ -160,6 +160,8 @@ run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
 run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
 run_file_case dsmc_high tests/dynamic/smc_high.c 'OK'
 run_file_case dbyte_atomics tests/dynamic/byte_atomics.c 'OK'
+run_file_case dspawn_pipe tests/dynamic/spawn_pipe.c 'OK'
+run_file_case dread_block tests/dynamic/read_block.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"

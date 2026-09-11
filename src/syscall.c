@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <spawn.h>
+#include <dlfcn.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <signal.h>
@@ -1163,6 +1165,112 @@ static int env_inject_lowbase(char **henv, int m, int cap)
     return m;
 }
 
+/* posix_spawn(2)'s third argument is libsystem_kernel's packed form of the
+ * attributes and file actions: {size, pointer} pairs, attr first, file
+ * actions second. Both structs hold only ints and chars, so an x86-64 guest
+ * lays them out exactly as the host does -- {alloc, count} then 1040-byte
+ * actions of {type, fd, args}; attr flags/sigdefault/sigmask/pgroup at
+ * +0/+4/+8/+12. NSTask wires a child's stdin/stdout to its pipes with these,
+ * so dropping them hands the child the parent's descriptors instead. */
+#define PSFA_STRIDE 1040
+enum { PSFA_OPEN, PSFA_CLOSE, PSFA_DUP2, PSFA_INHERIT, PSFA_FILEPORT_DUP2, PSFA_CHDIR, PSFA_FCHDIR };
+/* RESETIDS SETPGROUP SETSIGDEF SETSIGMASK SETEXEC START_SUSPENDED SETSID CLOEXEC_DEFAULT */
+#define SPAWN_FLAGS_PUBLIC 0x44cf
+
+static const char *spawn_guest_path(uint64_t g)
+{
+    const char *p = (const char *)ocerz_g2h(g);
+    return memchr(p, 0, PATH_MAX) ? p : NULL;
+}
+
+static int spawn_guest_args(uint64_t adesc, posix_spawnattr_t *at, int *have_at,
+                            posix_spawn_file_actions_t *fa, int *have_fa)
+{
+    *have_at = *have_fa = 0;
+    if (!adesc)
+        return 0;
+    uint64_t attr_size = ocerz_ld(adesc, 8), attrp = ocerz_ld(adesc + 8, 8);
+    uint64_t fa_size = ocerz_ld(adesc + 16, 8), fap = ocerz_ld(adesc + 24, 8);
+    if (attrp && attr_size >= 16) {
+        sigset_t def = (sigset_t)ocerz_ld(attrp + 4, 4);
+        sigset_t mask = (sigset_t)ocerz_ld(attrp + 8, 4);
+        /* the child is ocerz, which still has to take its own fault and kick signals */
+        static const int keep[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE, SIGUSR1, SIGEMT };
+        for (size_t i = 0; i < sizeof keep / sizeof keep[0]; i++)
+            sigdelset(&mask, keep[i]);
+        posix_spawnattr_init(at);
+        *have_at = 1;
+        posix_spawnattr_setflags(at, (short)(ocerz_ld(attrp, 2) & SPAWN_FLAGS_PUBLIC));
+        posix_spawnattr_setsigdefault(at, &def);
+        posix_spawnattr_setsigmask(at, &mask);
+        posix_spawnattr_setpgroup(at, (pid_t)ocerz_ld(attrp + 12, 4));
+    }
+    if (!fap || fa_size < 8)
+        return 0;
+    uint32_t count = (uint32_t)ocerz_ld(fap + 4, 4);
+    if (8 + (uint64_t)count * PSFA_STRIDE > fa_size)
+        return EINVAL;
+    posix_spawn_file_actions_init(fa);
+    *have_fa = 1;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t act = fap + 8 + (uint64_t)i * PSFA_STRIDE;
+        int type = (int)ocerz_ld(act, 4), fd = (int)ocerz_ld(act + 4, 4), arg = (int)ocerz_ld(act + 8, 4);
+        const char *path = NULL;
+        int rc;
+        switch (type) {
+        case PSFA_OPEN:
+            path = spawn_guest_path(act + 14);
+            rc = path ? posix_spawn_file_actions_addopen(fa, fd, path, arg, (mode_t)ocerz_ld(act + 12, 2))
+                      : EINVAL;
+            break;
+        case PSFA_CLOSE:
+            rc = posix_spawn_file_actions_addclose(fa, fd);
+            break;
+        case PSFA_DUP2:
+            rc = posix_spawn_file_actions_adddup2(fa, fd, arg);
+            break;
+        case PSFA_INHERIT:
+            rc = posix_spawn_file_actions_addinherit_np(fa, fd);
+            break;
+        case PSFA_FILEPORT_DUP2: {
+            /* private libsystem_kernel entry; guest port names are host port names */
+            static int (*add_fileport)(posix_spawn_file_actions_t *, mach_port_t, int);
+            if (!add_fileport)
+                add_fileport = (int (*)(posix_spawn_file_actions_t *, mach_port_t, int))
+                    dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_add_fileportdup2_np");
+            rc = add_fileport ? add_fileport(fa, (mach_port_t)fd, arg) : ENOTSUP;
+            break;
+        }
+        case PSFA_CHDIR:
+        case PSFA_FCHDIR: {
+            /* the _np names are deprecated in the macOS 26 SDK; their replacements do not exist before it */
+            static int (*add_chdir)(posix_spawn_file_actions_t *, const char *);
+            static int (*add_fchdir)(posix_spawn_file_actions_t *, int);
+            if (!add_chdir) {
+                add_chdir = (int (*)(posix_spawn_file_actions_t *, const char *))
+                    dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_addchdir_np");
+                add_fchdir = (int (*)(posix_spawn_file_actions_t *, int))
+                    dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_addfchdir_np");
+            }
+            if (type == PSFA_FCHDIR)
+                rc = add_fchdir ? add_fchdir(fa, fd) : ENOTSUP;
+            else if (!(path = spawn_guest_path(act + 8)))
+                rc = EINVAL;
+            else
+                rc = add_chdir ? add_chdir(fa, path) : ENOTSUP;
+            break;
+        }
+        default:
+            fprintf(stderr, "ocerz: posix_spawn: skipping unknown file action %d\n", type);
+            rc = 0;
+            break;
+        }
+        if (rc)
+            return rc;
+    }
+    return 0;
+}
+
 static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     const char *self = ocerz_self_path();
@@ -1195,9 +1303,20 @@ static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         m = env_inject_lowbase(henv, m, 512);
     }
     henv[m] = NULL;
+    posix_spawnattr_t at;
+    posix_spawn_file_actions_t fa;
+    int have_at, have_fa;
+    int rc = spawn_guest_args(a[2], &at, &have_at, &fa, &have_fa);
     pid_t hpid = 0;
-    ocerz_jit_require_ordered(vm);
-    int rc = posix_spawn(&hpid, self, NULL, NULL, hargv, a[4] ? henv : NULL);
+    if (rc == 0) {
+        ocerz_jit_require_ordered(vm);
+        rc = posix_spawn(&hpid, self, have_fa ? &fa : NULL, have_at ? &at : NULL,
+                         hargv, a[4] ? henv : NULL);
+    }
+    if (have_fa)
+        posix_spawn_file_actions_destroy(&fa);
+    if (have_at)
+        posix_spawnattr_destroy(&at);
     if (rc != 0) {
         ret_err(cpu, (uint64_t)rc);
         return OCERZ_STEP_OK;
@@ -3403,15 +3522,33 @@ static int efault_disarm_retry(OcerzCPU *cpu, int num)
     return any;
 }
 
+/* The waits the unstick monitor may EINTR: the ones whose callers already
+ * treat a spurious return as "look again" (psynch, semwait, kevent, workq,
+ * ulock) and where a lost wakeup can really park a thread for good. A
+ * read, recvmsg, poll or fcntl lock never returns EINTR on its own -- only a
+ * guest signal handler causes one -- so apps rightly do not expect it:
+ * Chess's engine lexer took the -1 from a kicked read() as a byte count
+ * and died "out of dynamic memory". */
+static int unstick_kickable(int num)
+{
+    return (num >= 297 && num <= 309) || num == 312 ||   /* psynch_* */
+           num == 334 || num == 423 ||                   /* __semwait_signal(_nocancel) */
+           num == 363 || num == 369 || num == 374 || num == 375 ||   /* kevent family */
+           num == 368 ||                                 /* workq_kernreturn */
+           num == 515 || num == 544;                     /* ulock_wait(2) */
+}
+
 static int forward_with_scratch(OcerzCPU *cpu, int num, uint64_t a[8], int dual_ret)
 {
     int err = 0;
     uint64_t ret2 = 0;
+    cpu->block_nokick = 1;
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     if (err && r == EFAULT && efault_disarm_retry(cpu, num))
         r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
+    cpu->block_nokick = 0;
     if (err) {
         ret_err(cpu, r);
     } else if (dual_ret) {
@@ -3486,9 +3623,11 @@ static int sys_msg(OcerzCPU *cpu, uint64_t a[8], int num, int is_send)
     uint64_t fa[8] = { a[0], (uint64_t)(uintptr_t)&h, a[2], 0, 0, 0, 0, 0 };
     int err = 0;
     uint64_t ret2 = 0;
+    cpu->block_nokick = 1;
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t r = ocerz_host_syscall(num, fa, &ret2, &err);
     cpu->block_since_ns = 0;
+    cpu->block_nokick = 0;
     if (err) {
         ret_err(cpu, r);
         return OCERZ_STEP_OK;
@@ -4115,6 +4254,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     int rtrack = reqlog && (num == 4 || num == 121) &&
         (orig[2] == 8 || orig[2] == 16 || orig[2] == 64 || orig[2] == 80 ||
          num == 121);
+    cpu->block_nokick = !unstick_kickable(num);
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     cpu->block_what = num;           /* the mach path records this; a BSD call
                                       * that never returns showed up as what=0 */
@@ -4123,6 +4263,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     if (err && r == EFAULT && efault_disarm_retry(cpu, num))
         r = ocerz_host_syscall(num, a, &ret2, &err);
     cpu->block_since_ns = 0;
+    cpu->block_nokick = 0;
     {
         static int socklog = -1;
         if (socklog < 0) {
