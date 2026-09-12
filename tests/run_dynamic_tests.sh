@@ -4,6 +4,7 @@
 set -u
 cd "$(dirname "$0")/.."
 OCERZ=./ocerz
+OCERZ_ABS="$(pwd)/ocerz"
 TMP="${TMPDIR:-/tmp}/ocerz_dyn.$$"
 mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
@@ -126,6 +127,21 @@ run_cpp_file_case() {
     done
 }
 
+run_relpath_case() {
+    local name="$1" src="$2" want_out="$3"
+    if ! clang -arch x86_64 -o "$TMP/$name" "$src" 2>/dev/null; then
+        echo "FAIL $name (compile)"; fail=$((fail+1)); return
+    fi
+    local got_out got_code
+    got_out=$( cd "$TMP" && "$OCERZ_ABS" "./$name" 2>/dev/null )
+    got_code=$?
+    if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+        echo "PASS $name (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+    else
+        echo "FAIL $name (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+    fi
+}
+
 run_case dret 'int main(void){return 42;}' '' 42
 run_case dwrite '
 int main(void){
@@ -203,6 +219,7 @@ run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
 run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
 run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
+run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"
