@@ -192,6 +192,7 @@
 #include "ocerz/cache.h"
 
 #include <sys/mman.h>
+#include <mach/thread_act.h>
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
@@ -692,6 +693,25 @@ static void jl_dump(const char *tag, uint64_t wait_ns)
             __atomic_load_n(&g_jl_waits, __ATOMIC_RELAXED),
             __atomic_load_n(&g_jl_xlat_null, __ATOMIC_RELAXED),
             w[0], w[1], w[2], w[3], w[4], w[5]);
+    OcerzCPU *oc = (OcerzCPU *)g_jl_owner_cpu;
+    if (oc && oc->host_kport) {
+        thread_basic_info_data_t bi;
+        mach_msg_type_number_t bn = THREAD_BASIC_INFO_COUNT;
+        if (thread_info((thread_act_t)oc->host_kport, THREAD_BASIC_INFO,
+                        (thread_info_t)&bi, &bn) == KERN_SUCCESS)
+            fprintf(stderr,
+                    "ocerz: JITLOCK-OWNER-STATE[%d] run_state=%d(%s) suspend_count=%d flags=%#x cpu_usage=%d sleep_time=%d\n",
+                    (int)getpid(), bi.run_state,
+                    bi.run_state == TH_STATE_RUNNING ? "RUNNING" :
+                    bi.run_state == TH_STATE_STOPPED ? "STOPPED" :
+                    bi.run_state == TH_STATE_WAITING ? "WAITING" :
+                    bi.run_state == TH_STATE_UNINTERRUPTIBLE ? "UNINTERRUPTIBLE" :
+                    bi.run_state == TH_STATE_HALTED ? "HALTED" : "?",
+                    bi.suspend_count, bi.flags, bi.cpu_usage, bi.sleep_time);
+        else
+            fprintf(stderr, "ocerz: JITLOCK-OWNER-STATE[%d] thread_info failed kport=%#x\n",
+                    (int)getpid(), (unsigned)oc->host_kport);
+    }
 }
 
 static void jl_acquire(int site)
