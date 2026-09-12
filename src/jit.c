@@ -763,6 +763,32 @@ static void jl_release(void)
     pthread_mutex_unlock(&jit_lock);
 }
 
+static int g_xlp_log = -1;
+#define XLP_SIZE (1u << 17)
+static uint64_t g_xlp[XLP_SIZE];
+
+static void xlatpage_note(uint64_t rip)
+{
+    if (g_xlp_log < 0)
+        g_xlp_log = getenv("OCERZ_XLATPAGES") ? 1 : 0;
+    if (g_xlp_log <= 0)
+        return;
+    uint64_t page = rip & ~0xfffull;
+    if (!page)
+        return;
+    unsigned i = (unsigned)((page * 0x9E3779B97F4A7C15ull) >> 47) & (XLP_SIZE - 1);
+    for (unsigned n = 0; n < 8; n++, i = (i + 1) & (XLP_SIZE - 1)) {
+        if (g_xlp[i] == page)
+            return;
+        if (g_xlp[i] == 0) {
+            g_xlp[i] = page;
+            fprintf(stderr, "ocerz: XLATPAGE[%d] %#llx\n", (int)getpid(),
+                    (unsigned long long)page);
+            return;
+        }
+    }
+}
+
 static void jl_lock_step(uint64_t rip)
 {
     if (g_jl_log < 0)
@@ -14619,6 +14645,8 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             if (g_jl_log > 0)
                 __atomic_store_n(&g_jl_phase, 2, __ATOMIC_RELAXED);
             b = translate(jit, cpu->rip, cpu->mode32);
+            if (b)
+                xlatpage_note(cpu->rip);
             if (g_jl_log > 0 && !b)
                 __atomic_add_fetch(&g_jl_xlat_null, 1, __ATOMIC_RELAXED);
         }
