@@ -1557,15 +1557,26 @@ static void rewrite_launchd_plist_for_ocerz(const char *path, const char *self)
     if (file_contains(path, self))
         return;
     char exe[1024];
-    if ((!plistbuddy(path, "Print :ProgramArguments:0", exe, sizeof exe) || !exe[0]) &&
-        (!plistbuddy(path, "Print :Program", exe, sizeof exe) || !exe[0]))
+    int had_args = plistbuddy(path, "Print :ProgramArguments:0", exe, sizeof exe) && exe[0];
+    if (!had_args && (!plistbuddy(path, "Print :Program", exe, sizeof exe) || !exe[0]))
         return;
     if (strcmp(exe, self) == 0 || !file_has_x86_slice(exe))
         return;
     char cmd[1400];
+    if (!had_args) {
+        plistbuddy(path, "Delete :ProgramArguments", NULL, 0);
+        if (!plistbuddy(path, "Add :ProgramArguments array", NULL, 0))
+            return;
+    }
     snprintf(cmd, sizeof cmd, "Add :ProgramArguments:0 string %s", self);
     if (!plistbuddy(path, cmd, NULL, 0))
         return;
+    if (!had_args) {
+        snprintf(cmd, sizeof cmd, "Add :ProgramArguments:1 string %s", exe);
+        plistbuddy(path, cmd, NULL, 0);
+    }
+    snprintf(cmd, sizeof cmd, "Add :Program string %s", self);
+    plistbuddy(path, cmd, NULL, 0);
     snprintf(cmd, sizeof cmd, "Set :Program %s", self);
     plistbuddy(path, cmd, NULL, 0);
     if (getenv("OCERZ_IPCLOG")) {
