@@ -55,6 +55,21 @@
 
 static pthread_mutex_t map_lock = PTHREAD_MUTEX_INITIALIZER;
 
+extern int ocerz_jit_lock_held_self(void);
+
+static void map_lock_acquire(void)
+{
+    static int lg = -1;
+    if (lg < 0) lg = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
+    if (lg && ocerz_jit_lock_held_self()) {
+        static int once;
+        if (once++ < 6)
+            fprintf(stderr, "ocerz: LOCKORDER[%d] map_lock wanted while holding jit_lock (ABBA risk)\n",
+                    (int)getpid());
+    }
+    pthread_mutex_lock(&map_lock);
+}
+
 static pthread_mutex_t g_initgate_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_initgate_cv = PTHREAD_COND_INITIALIZER;
 static volatile int g_init_released = 1;
@@ -1120,7 +1135,7 @@ int ocerz_mem_init_low_shadow(void)
     };
     uint64_t topsz = OCERZ_TOP_HI - OCERZ_TOP_LO;
     uint64_t blocksz = OCERZ_LOW_LIMIT + topsz;
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     if (ocerz_low_base) {
         pthread_mutex_unlock(&map_lock);
         return OCERZ_OK;
@@ -1167,7 +1182,7 @@ int ocerz_mem_register_range(uint64_t glo, uint64_t ghi)
 {
     uint64_t lo = round_down(glo);
     uint64_t hi = round_up(ghi);
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     if (region_for_range(lo, hi)) {
         pthread_mutex_unlock(&map_lock);
         return OCERZ_OK;
@@ -1191,7 +1206,7 @@ int ocerz_guest_vm_region(uint64_t *addr, uint64_t *size, unsigned *prot,
 {
     uint64_t query = guest_round_down(*addr);
     const uint64_t tail_end = 0x1000000000000ull;
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     for (int guard = 0; guard <= MEM_REGION_MAX; guard++) {
         const MemRegion *cls = NULL;
         const MemRegion *next = NULL;
@@ -1276,7 +1291,7 @@ static int map_fixed_locked(uint64_t gaddr, uint64_t len, int prot, int zero_ove
 
 int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot)
 {
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     int rc = map_fixed_locked(gaddr, len, prot, 1);
     pthread_mutex_unlock(&map_lock);
     memlog(prot == 0 ? "reserve" : "commit", gaddr, len, prot);
@@ -1303,7 +1318,7 @@ static int map_shared_overlay(uint64_t gaddr, uint64_t len, int prot,
         if ((map_off & (OCERZ_HOST_PAGE - 1)) || map_off > INT64_MAX)
             return OCERZ_EUNSUP;
     }
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     MemRegion *r = region_for_range(lo, hi);
     if (!r) {
         pthread_mutex_unlock(&map_lock);
@@ -1403,7 +1418,7 @@ uint64_t ocerz_map_anywhere(uint64_t len, int prot)
     if (len == 0 || len > UINT64_MAX - (OCERZ_GUEST_PAGE - 1))
         return 0;
     uint64_t glen = guest_round_up(len);
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     uint64_t gaddr = find_anywhere_locked(glen, OCERZ_HOST_PAGE);
     if (!gaddr) {
         if (getenv("OCERZ_OOMLOG")) {
@@ -1437,7 +1452,7 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
         len > UINT64_MAX - (OCERZ_GUEST_PAGE - 1))
         return 0;
     uint64_t glen = guest_round_up(len);
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     uint64_t gaddr = find_anywhere_locked(glen, align);
     if (!gaddr) {
         pthread_mutex_unlock(&map_lock);
@@ -1458,7 +1473,7 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
 
 void ocerz_mem_prefork(void)
 {
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
 }
 
 void ocerz_mem_postfork(void)
@@ -1475,7 +1490,7 @@ int ocerz_map_hint(uint64_t gaddr, uint64_t len, int prot)
     uint64_t hi = round_up(gaddr + len);
     if (lo == 0 || hi <= lo || lo < OCERZ_LOW_LIMIT)
         return OCERZ_ENOMEM;
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     if (region_for_range(lo, hi)) {
         pthread_mutex_unlock(&map_lock);
         return OCERZ_ENOMEM;
@@ -1501,7 +1516,7 @@ int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot)
     uint64_t guard_hi;
     if (!allocation_guard_end(hi, &guard_hi))
         return OCERZ_ENOMEM;
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), guard_hi);
     if (!r || lo < alloc_floor || guard_hi > ocerz_arena_hi) {
         pthread_mutex_unlock(&map_lock);
@@ -1520,7 +1535,7 @@ uint64_t ocerz_map_donate(uint64_t len)
     if (len == 0 || len > UINT64_MAX - (OCERZ_HOST_PAGE - 1))
         return 0;
     uint64_t glen = round_up(len);
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     uint64_t gaddr = find_anywhere_locked(glen, OCERZ_HOST_PAGE);
     if (!gaddr) {
         pthread_mutex_unlock(&map_lock);
@@ -1554,7 +1569,7 @@ int ocerz_map_claim_region(uint64_t gaddr, uint64_t len, int prot)
     uint64_t lo, hi;
     if (!guest_range(gaddr, len, &lo, &hi))
         return OCERZ_ENOMEM;
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     if (!r || (r->glo == ocerz_arena_lo && r->ghi == ocerz_arena_hi)) {
         pthread_mutex_unlock(&map_lock);
@@ -1571,7 +1586,7 @@ int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
     uint64_t lo, hi;
     if (!guest_range(gaddr, len, &lo, &hi))
         return OCERZ_ENOMEM;
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     int rc = r ? OCERZ_OK : OCERZ_ENOMEM;
     for (uint64_t p = lo; rc == OCERZ_OK && p < hi;
@@ -1603,7 +1618,7 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len)
     uint64_t lo, hi;
     if (!guest_range(gaddr, len, &lo, &hi))
         return OCERZ_ENOMEM;
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     if (!r) {
         pthread_mutex_unlock(&map_lock);
@@ -1637,7 +1652,7 @@ int ocerz_mem_arm_exec(uint64_t lo, uint64_t hi)
     }
     if (dis || hi <= lo) return 0;
     uint64_t plo = round_down(lo), phi = round_up(hi);
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     MemRegion *r = region_for_range(plo, phi);
     int n = 0;
     if (r && r->armed) {
@@ -1678,7 +1693,7 @@ int ocerz_mem_disarm_range(uint64_t lo, uint64_t hi, uint64_t *pages, int max)
     if (hi <= lo || __atomic_load_n(&g_armed_live, __ATOMIC_RELAXED) <= 0) return 0;
     uint64_t plo = round_down(lo), phi = round_up(hi);
     int n = 0;
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     MemRegion *r = region_for_range(plo, phi);
     if (r && r->armed) {
         for (uint64_t page = plo; page < phi && n < max; page += OCERZ_HOST_PAGE) {
@@ -1700,7 +1715,7 @@ int ocerz_mem_disarm_range(uint64_t lo, uint64_t hi, uint64_t *pages, int max)
 int ocerz_mem_disarm_all(uint64_t *pages, int max)
 {
     int n = 0;
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     for (int ri = 0; ri < region_n && n < max; ri++) {
         MemRegion *r = &regions[ri];
         if (!r->armed) continue;
@@ -1725,7 +1740,7 @@ int ocerz_mem_exec_write_fault(uint64_t gaddr)
 {
     if (gaddr == UINT64_MAX) return 0;
     uint64_t page = round_down(gaddr);
-    pthread_mutex_lock(&map_lock);
+    map_lock_acquire();
     MemRegion *r = region_for_range(page, page + OCERZ_HOST_PAGE);
     int hit = 0;
     if (r && r->armed) {

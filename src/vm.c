@@ -209,6 +209,8 @@ void ocerz_vm_suspend_point(OcerzCPU *cpu)
 
 static int susp_stop_is_safe(OcerzCPU *t)
 {
+    if (ocerz_jit_lock_owner_cpu() == t)
+        return 0;
     if (__atomic_load_n(&t->block_since_ns, __ATOMIC_ACQUIRE))
         return 1;
     arm_thread_state64_t hs;

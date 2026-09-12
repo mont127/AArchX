@@ -28,6 +28,8 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm);
 void ocerz_jit_destroy(OcerzJit *jit);
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu);
 uint64_t ocerz_jit_blocks(const OcerzJit *jit);
+int ocerz_jit_lock_held_self(void);
+struct OcerzCPU *ocerz_jit_lock_owner_cpu(void);
 void ocerz_jit_prefork(void);
 void ocerz_jit_postfork(void);
 
