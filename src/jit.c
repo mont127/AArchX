@@ -11508,6 +11508,7 @@ static uint64_t ret_seam_live(const X86Insn *insns, int n)
 }
 
 static int churn_blacklisted(uint64_t rip);
+static void churn_note_refusal(uint64_t rip);
 
 static void compact_block(JitBlock *blk)
 {
@@ -11550,6 +11551,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     { extern uint64_t ocerz_cxa_throw_rip; if (ocerz_cxa_throw_rip && rip == ocerz_cxa_throw_rip) return NULL; }
 
     if (churn_blacklisted(rip)) {
+        churn_note_refusal(rip);
         static _Atomic unsigned long long refn;
         static int clog = -1;
         if (clog < 0) clog = getenv("OCERZ_CHURNLOG") ? 1 : 0;
@@ -13900,7 +13902,35 @@ static void invmap_check_reject(const OcerzJit *jit, uint64_t addr, uint64_t len
 #define CHURN_SLOTS 4096
 #define CHURN_LIMIT 3
 #define CHURN_QUIET_NS 1500000000ull
-static struct { uint64_t page; uint32_t hits; uint64_t last_ns; } g_churn[CHURN_SLOTS];
+#define CHURN_REFUSE_MAX 4096ull
+static struct { uint64_t page; uint32_t hits; uint64_t last_ns; uint64_t refused; } g_churn[CHURN_SLOTS];
+
+static void churn_note_refusal(uint64_t rip)
+{
+    static int blog = -1;
+    if (blog < 0) blog = getenv("OCERZ_BLACKLOG") ? 1 : 0;
+    if (blog <= 0)
+        return;
+    static unsigned long long tot;
+    if ((++tot & 0xffffu) != 0)
+        return;
+    fprintf(stderr, "ocerz: BLACKLOG[%d] refusals=%lluk blacklisted_pages=", (int)getpid(),
+            tot >> 10);
+    unsigned np = 0;
+    for (unsigned k = 0; k < CHURN_SLOTS; k++)
+        if (g_churn[k].page && g_churn[k].hits >= CHURN_LIMIT) np++;
+    fprintf(stderr, "%u top:", np);
+    for (int t = 0; t < 5; t++) {
+        unsigned best = CHURN_SLOTS; uint64_t bv = 0;
+        for (unsigned k = 0; k < CHURN_SLOTS; k++)
+            if (g_churn[k].refused > bv) { bv = g_churn[k].refused; best = k; }
+        if (best == CHURN_SLOTS) break;
+        fprintf(stderr, " %#llx=%lluk", (unsigned long long)(g_churn[best].page << 16),
+                (unsigned long long)(bv >> 10));
+        g_churn[best].refused = 0;
+    }
+    fprintf(stderr, "\n");
+}
 static void churn_bump(uint64_t rip)
 {
     if (g_churn_suppress) return;
@@ -13935,8 +13965,18 @@ static int churn_blacklisted(uint64_t rip)
             if (now - g_churn[i].last_ns > CHURN_QUIET_NS) {
                 g_churn[i].hits = CHURN_LIMIT - 1;
                 g_churn[i].last_ns = now;
+                g_churn[i].refused = 0;
                 if (getenv("OCERZ_CHURNLOG"))
                     fprintf(stderr, "ocerz: CHURN[%d] reprieve page=%#llx\n",
+                            (int)getpid(), (unsigned long long)(page << 16));
+                return 0;
+            }
+            if (++g_churn[i].refused > CHURN_REFUSE_MAX) {
+                g_churn[i].hits = CHURN_LIMIT - 1;
+                g_churn[i].last_ns = now;
+                g_churn[i].refused = 0;
+                if (getenv("OCERZ_CHURNLOG"))
+                    fprintf(stderr, "ocerz: CHURN[%d] cost-reprieve page=%#llx\n",
                             (int)getpid(), (unsigned long long)(page << 16));
                 return 0;
             }
