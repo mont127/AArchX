@@ -13459,6 +13459,8 @@ int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint6
     cp_mark(b->key);
     cp_mark(jit_key(fault_rip, blk_mode32(b)));
     if (ENV_ON("OCERZ_CP_NOINVAL")) return 1;
+    if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL"))
+        return 1;
     int prev = g_churn_suppress;
     if (fresh) g_churn_suppress = 1;
     ocerz_jit_invalidate_range(vm, block_rip, 1);
@@ -13477,6 +13479,8 @@ int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t
     int fresh = !al_marked(b->key);
     al_mark(b->key);
     al_mark(jit_key(fault_rip, blk_mode32(b)));
+    if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL"))
+        return 1;
     int prev = g_churn_suppress;
     if (fresh) g_churn_suppress = 1;
     ocerz_jit_invalidate_range(vm, block_rip, 1);
@@ -13931,9 +13935,59 @@ static void churn_note_refusal(uint64_t rip)
     }
     fprintf(stderr, "\n");
 }
+static __thread uint64_t g_inv_caller;
+static struct { uint64_t caller, page, bumps, retires; } g_invsrc[256];
+
+static void invsrc_note(uint64_t page, int is_retire)
+{
+    static int lg = -1;
+    if (lg < 0)
+        lg = getenv("OCERZ_INVSRC") ? 1 : 0;
+    if (lg <= 0)
+        return;
+    uint64_t c = g_inv_caller;
+    unsigned i = (unsigned)((c * 0x9E3779B97F4A7C15ull) >> 56);
+    for (unsigned n = 0; n < 256; n++, i = (i + 1) & 255u) {
+        if (g_invsrc[i].caller == c || g_invsrc[i].caller == 0) {
+            g_invsrc[i].caller = c;
+            if (is_retire) {
+                g_invsrc[i].retires++;
+            } else {
+                g_invsrc[i].bumps++;
+                g_invsrc[i].page = page << 16;
+            }
+            break;
+        }
+    }
+    static unsigned long long tot;
+    if (is_retire || (++tot & 0x3ffu) != 0)
+        return;
+    fprintf(stderr, "ocerz: INVSRC[%d] bumps=%llu |", (int)getpid(), tot);
+    unsigned char used[256] = { 0 };
+    for (int t = 0; t < 6; t++) {
+        int best = -1;
+        uint64_t bv = 0;
+        for (int k = 0; k < 256; k++)
+            if (!used[k] && g_invsrc[k].bumps > bv) {
+                bv = g_invsrc[k].bumps;
+                best = k;
+            }
+        if (best < 0)
+            break;
+        used[best] = 1;
+        fprintf(stderr, " rel=%lld:b=%llu,r=%llu,pg=%#llx",
+                (long long)(g_invsrc[best].caller - (uint64_t)(uintptr_t)&ocerz_jit_step),
+                (unsigned long long)g_invsrc[best].bumps,
+                (unsigned long long)g_invsrc[best].retires,
+                (unsigned long long)g_invsrc[best].page);
+    }
+    fprintf(stderr, "\n");
+}
+
 static void churn_bump(uint64_t rip)
 {
     if (g_churn_suppress) return;
+    invsrc_note(rip >> 16, 0);
     uint64_t page = rip >> 16;
     unsigned i = (unsigned)(page * 0x9E3779B97F4A7C15ull >> 52) & (CHURN_SLOTS - 1);
     for (unsigned n = 0; n < 8; n++, i = (i + 1) & (CHURN_SLOTS - 1)) {
@@ -14031,6 +14085,7 @@ static int hit_code_cmp(const void *pa, const void *pb)
 
 static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hits)
 {
+    invsrc_note(0, 1);
     int any_code = 0;
     for (size_t m = 0; m < n_hits; m++)
         if (hits[m]->code) {
@@ -14126,6 +14181,7 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
 
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
 {
+    g_inv_caller = (uint64_t)(uintptr_t)__builtin_return_address(0);
     if (!vm || !len || !vm->jit)
         return;
 
