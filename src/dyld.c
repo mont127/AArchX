@@ -2169,6 +2169,15 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
             ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
         return ocerz_main_mh ? ocerz_main_mh : ocerz_arena_lo;
     }
+    if (ocerz_main_mh && g_main_hostpath[0]) {
+        char rp[PATH_MAX];
+        if (strcmp(hostpath, g_main_hostpath) == 0 ||
+            (realpath(hostpath, rp) && strcmp(rp, g_main_hostpath) == 0)) {
+            if (g_dlerror_g)
+                ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+            return ocerz_main_mh;
+        }
+    }
     DynImage *already = dimg_find_by_path(hostpath);
     if (already) {
         if (g_dlerror_g)
