@@ -220,6 +220,7 @@ run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
 run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
 run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
+run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"
