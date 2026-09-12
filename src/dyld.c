@@ -67,6 +67,13 @@
  * the recursion stack while MLAssetIO's initializer called operator new into a
  * libc++ that had not been initialized yet.
  *
+ * The dlopen closure (init_closure) collects its images in dependency
+ * post-order and runs them in that order, never sorted by load address: a
+ * dlopen'd image is mapped below the dependencies it pulls in, so address
+ * order ran a dependent ahead of its dependency.  steamui initialized before
+ * libtier0_s, and its first CUtlMemory growth called through g_pMemAlloc while
+ * tier0's allocator singleton still had a null vtable.
+ *
  * ---- thread-local variables ----
  * Two descriptor layouts share the same 24 bytes.  A static linker emits the
  * classic tlv_descriptor { thunk, key:u64, offset:u64 }, so the offset is at
@@ -1588,8 +1595,6 @@ static void init_collect(OcerzCache *cache, uint64_t mh, uint64_t *list, int *n,
     if (idx < 0 || g_init_done[idx] || g_init_being[idx])
         return;
     g_init_being[idx] = 1;
-    if (*n < cap)
-        list[(*n)++] = mh;
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
     for (uint32_t j = 0; j < ncmds; j++) {
@@ -1602,12 +1607,8 @@ static void init_collect(OcerzCache *cache, uint64_t mh, uint64_t *list, int *n,
         }
         lc += rd32(lc + 4);
     }
-}
-
-static int init_addr_cmp(const void *a, const void *b)
-{
-    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-    return x < y ? -1 : x > y ? 1 : 0;
+    if (*n < cap)
+        list[(*n)++] = mh;
 }
 
 #define INIT_CLOSURE_CAP 4096
@@ -1632,7 +1633,6 @@ static void init_closure(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
         if (idx >= 0)
             g_init_being[idx] = 0;
     }
-    qsort(l, (size_t)n, sizeof l[0], init_addr_cmp);
     for (int i = 0; i < n && !vm->exited; i++) {
         uint64_t m = l[i];
         int idx = init_mark(m);
