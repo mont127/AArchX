@@ -159,11 +159,13 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <spawn.h>
 #include <dlfcn.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <signal.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -1410,6 +1412,163 @@ static int spawn_guest_args(uint64_t adesc, posix_spawnattr_t *at, int *have_at,
     return 0;
 }
 
+static int file_has_x86_slice(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t h[4096];
+    ssize_t n = read(fd, h, sizeof h);
+    close(fd);
+    if (n < 8) return 0;
+    uint32_t m = ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | h[3];
+    if (m == 0xcafebabe || m == 0xcafebabf) {
+        uint32_t nf = ((uint32_t)h[4] << 24) | ((uint32_t)h[5] << 16) | ((uint32_t)h[6] << 8) | h[7];
+        int is64 = m == 0xcafebabf;
+        size_t off = 8, esz = is64 ? 20 : 8;
+        for (uint32_t i = 0; i < nf && off + esz <= (size_t)n; i++, off += esz) {
+            uint32_t ct = ((uint32_t)h[off] << 24) | ((uint32_t)h[off+1] << 16) |
+                          ((uint32_t)h[off+2] << 8) | h[off+3];
+            if (ct == 0x01000007) return 1;
+        }
+        return 0;
+    }
+    if (m == 0xcffaedfe)
+        return ((uint32_t)h[4] | ((uint32_t)h[5] << 8) | ((uint32_t)h[6] << 16) |
+                ((uint32_t)h[7] << 24)) == 0x01000007;
+    return 0;
+}
+
+static int extract_plist_path(const char *cmd, char *out, size_t outsz)
+{
+    const char *dot = strstr(cmd, ".plist");
+    if (!dot) return 0;
+    const char *end = dot + 6;
+    const char *q = NULL;
+    for (const char *c = dot; c > cmd; c--)
+        if (c[-1] == '\'' || c[-1] == '"') { q = c; break; }
+    if (!q) return 0;
+    size_t len = (size_t)(end - q);
+    if (!len || len >= outsz) return 0;
+    memcpy(out, q, len);
+    out[len] = 0;
+    return 1;
+}
+
+static void launchctl_enable_label(const char *label)
+{
+    if (!label || !label[0])
+        return;
+    char target[512];
+    snprintf(target, sizeof target, "gui/%u/%s", (unsigned)getuid(), label);
+    char *const argv[] = { (char *)"launchctl", (char *)"enable", target, NULL };
+    extern char **environ;
+    pid_t pid = 0;
+    if (posix_spawn(&pid, "/bin/launchctl", NULL, NULL, argv, environ) != 0 || pid <= 0)
+        return;
+    int status;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+        ;
+}
+
+static void rewrite_launchd_plist_for_ocerz(const char *path, const char *self)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (1 << 20)) { close(fd); return; }
+    size_t sz = (size_t)st.st_size;
+    uint8_t *raw = (uint8_t *)malloc(sz);
+    if (!raw) { close(fd); return; }
+    ssize_t rn = read(fd, raw, sz);
+    close(fd);
+    if (rn != (ssize_t)sz) { free(raw); return; }
+
+    CFDataRef data = CFDataCreate(NULL, raw, (CFIndex)sz);
+    free(raw);
+    if (!data) return;
+    CFPropertyListRef pl = CFPropertyListCreateWithData(
+        NULL, data, kCFPropertyListMutableContainersAndLeaves, NULL, NULL);
+    CFRelease(data);
+    if (!pl) return;
+    if (CFGetTypeID(pl) != CFDictionaryGetTypeID()) { CFRelease(pl); return; }
+    CFMutableDictionaryRef d = (CFMutableDictionaryRef)pl;
+
+    CFStringRef lbl = (CFStringRef)CFDictionaryGetValue(d, CFSTR("Label"));
+    if (lbl && CFGetTypeID(lbl) == CFStringGetTypeID()) {
+        char lbuf[256] = { 0 };
+        if (CFStringGetCString(lbl, lbuf, sizeof lbuf, kCFStringEncodingUTF8))
+            launchctl_enable_label(lbuf);
+    }
+
+    CFArrayRef pa = (CFArrayRef)CFDictionaryGetValue(d, CFSTR("ProgramArguments"));
+    CFStringRef prog = (CFStringRef)CFDictionaryGetValue(d, CFSTR("Program"));
+    char exe[1024] = { 0 };
+    if (pa && CFGetTypeID(pa) == CFArrayGetTypeID() && CFArrayGetCount(pa) > 0) {
+        CFStringRef s0 = (CFStringRef)CFArrayGetValueAtIndex(pa, 0);
+        if (s0 && CFGetTypeID(s0) == CFStringGetTypeID())
+            CFStringGetCString(s0, exe, sizeof exe, kCFStringEncodingUTF8);
+    } else if (prog && CFGetTypeID(prog) == CFStringGetTypeID()) {
+        CFStringGetCString(prog, exe, sizeof exe, kCFStringEncodingUTF8);
+    }
+    if (!exe[0] || strcmp(exe, self) == 0 || !file_has_x86_slice(exe)) { CFRelease(pl); return; }
+
+    CFStringRef cfself = CFStringCreateWithCString(NULL, self, kCFStringEncodingUTF8);
+    if (!cfself) { CFRelease(pl); return; }
+    CFMutableArrayRef na;
+    if (pa && CFGetTypeID(pa) == CFArrayGetTypeID())
+        na = CFArrayCreateMutableCopy(NULL, 0, pa);
+    else {
+        na = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+        if (na && prog) CFArrayAppendValue(na, prog);
+    }
+    if (!na) { CFRelease(cfself); CFRelease(pl); return; }
+    CFArrayInsertValueAtIndex(na, 0, cfself);
+    CFDictionarySetValue(d, CFSTR("ProgramArguments"), na);
+    if (prog) CFDictionarySetValue(d, CFSTR("Program"), cfself);
+    CFRelease(na);
+    CFRelease(cfself);
+
+    if (getenv("OCERZ_IPCLOG")) {
+        CFStringRef ep = CFStringCreateWithCString(NULL, "/tmp/ocerz_ipcserver.err", kCFStringEncodingUTF8);
+        if (ep) {
+            CFDictionarySetValue(d, CFSTR("StandardErrorPath"), ep);
+            CFDictionarySetValue(d, CFSTR("StandardOutPath"), ep);
+            CFRelease(ep);
+        }
+    }
+
+    CFDataRef out = CFPropertyListCreateData(NULL, d, kCFPropertyListXMLFormat_v1_0, 0, NULL);
+    CFRelease(pl);
+    if (!out) return;
+    char tmp[1200];
+    snprintf(tmp, sizeof tmp, "%s.ocerz.tmp", path);
+    int wfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (wfd >= 0) {
+        const uint8_t *ob = CFDataGetBytePtr(out);
+        CFIndex ol = CFDataGetLength(out);
+        if (write(wfd, ob, (size_t)ol) == (ssize_t)ol) {
+            close(wfd);
+            rename(tmp, path);
+        } else {
+            close(wfd);
+            unlink(tmp);
+        }
+    }
+    CFRelease(out);
+}
+
+static void spawn_rewrite_launchd(char *const *hargv, int n, const char *self)
+{
+    for (int k = 0; k < n; k++) {
+        if (!hargv[k] || !strstr(hargv[k], "launchctl") || !strstr(hargv[k], ".plist"))
+            continue;
+        char pp[1200];
+        if (extract_plist_path(hargv[k], pp, sizeof pp) &&
+            strstr(pp, "valvesoftware.steam"))
+            rewrite_launchd_plist_for_ocerz(pp, self);
+    }
+}
+
 static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     const char *self = ocerz_self_path();
@@ -1433,6 +1592,7 @@ static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             hargv[n++] = (char *)ocerz_g2h(gv);
     }
     hargv[n] = NULL;
+    spawn_rewrite_launchd(hargv, n, self);
     char *henv[514];
     int m = 0;
     if (a[4]) {
