@@ -1611,6 +1611,17 @@ static void init_mark_done_closure(OcerzCache *cache, uint64_t mh)
     g_init_done[idx] = 1;
 }
 
+static int dylib_lc_is_init_dep(const uint8_t *lc)
+{
+    uint32_t cmd = rd32(lc);
+    if (cmd != LC_LOAD_DYLIB && cmd != LC_LOAD_WEAK_DYLIB && cmd != LC_REEXPORT_DYLIB)
+        return 0;
+    if (cmd != LC_REEXPORT_DYLIB && rd32(lc + 4) >= sizeof(struct dylib_use_command) &&
+        rd32(lc + 8) == sizeof(struct dylib_use_command) && rd32(lc + 12) == DYLIB_USE_MARKER)
+        return (rd32(lc + 24) & DYLIB_USE_UPWARD) == 0;
+    return 1;
+}
+
 static void init_collect(OcerzCache *cache, uint64_t mh, uint64_t *list, int *n, int cap)
 {
     if (!mh)
@@ -1625,9 +1636,7 @@ static void init_collect(OcerzCache *cache, uint64_t mh, uint64_t *list, int *n,
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
     for (uint32_t j = 0; j < ncmds; j++) {
-        uint32_t cmd = rd32(lc);
-        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
-            cmd == LC_REEXPORT_DYLIB) {
+        if (dylib_lc_is_init_dep(lc)) {
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4))
                 init_collect(cache, dep_mh(cache, (const char *)(lc + noff)), list, n, cap);
@@ -1720,9 +1729,7 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
         }
     }
     for (uint32_t j = 0; j < ncmds; j++) {
-        uint32_t cmd = rd32(lc);
-        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
-            cmd == LC_REEXPORT_DYLIB) {
+        if (dylib_lc_is_init_dep(lc)) {
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4)) {
                 uint64_t dmh = dep_mh(cache, (const char *)(lc + noff));
@@ -1774,9 +1781,7 @@ static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
     for (uint32_t j = 0; j < ncmds; j++) {
-        uint32_t cmd = rd32(lc);
-        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
-            cmd == LC_REEXPORT_DYLIB) {
+        if (dylib_lc_is_init_dep(lc)) {
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4))
                 run_load_phase(vm, cache, dep_mh(cache, (const char *)(lc + noff)),
