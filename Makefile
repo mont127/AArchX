@@ -20,8 +20,7 @@
 CC := clang
 ARCHFLAGS := -arch arm64
 CFLAGS := $(ARCHFLAGS) -std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Iinclude -MMD -MP
-FRAMEWORKS := -framework CoreFoundation
-LDFLAGS := $(ARCHFLAGS) $(FRAMEWORKS)
+LDFLAGS := $(ARCHFLAGS)
 
 SRCS := $(wildcard src/*.c)
 OBJS := $(SRCS:.c=.o)
@@ -39,7 +38,7 @@ src/%.o: src/%.c
 
 tests/unit/bin/%: tests/unit/%.c $(CORE_OBJS)
 	@mkdir -p tests/unit/bin
-	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(FRAMEWORKS)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS)
 
 unit: $(UNIT_BINS)
 	@for t in $(UNIT_BINS); do echo "== $$t"; OCERZ_NO_ARM_EXEC=1 $$t || exit 1; done
