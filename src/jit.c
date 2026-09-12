@@ -634,6 +634,103 @@ static int stack_plain_ok(void)
 #define AL_MARK_SIZE (1u << 18)
 static uint64_t g_al_marks[AL_MARK_SIZE];
 static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void jl_acquire(void)
+{
+    if (pthread_mutex_trylock(&jit_lock) == 0)
+        return;
+    for (unsigned long long s = 0;; s++) {
+        if (s < 64) {
+            sched_yield();
+        } else {
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = s < 512 ? 200000 : 2000000;
+            nanosleep(&ts, NULL);
+        }
+        if (pthread_mutex_trylock(&jit_lock) == 0)
+            return;
+    }
+}
+
+static int g_jl_log = -1;
+static unsigned long long g_jl_acq, g_jl_waits, g_jl_xlat_null;
+static uint64_t g_jl_owner, g_jl_since, g_jl_rip;
+static int g_jl_phase;
+
+static uint64_t jl_tid(void)
+{
+    uint64_t t = 0;
+    pthread_threadid_np(NULL, &t);
+    return t;
+}
+
+static void jl_dump(const char *tag, uint64_t wait_ns)
+{
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t since = __atomic_load_n(&g_jl_since, __ATOMIC_RELAXED);
+    const uint32_t *w = (const uint32_t *)(const void *)&jit_lock;
+    fprintf(stderr,
+            "ocerz: JITLOCK-%s[%d] tid=%llu wait_ms=%.1f owner=%llu held_ms=%.1f phase=%d rip=%#llx acq=%llu waits=%llu xlat_null=%llu mtx=%08x %08x %08x %08x %08x %08x\n",
+            tag, (int)getpid(), (unsigned long long)jl_tid(),
+            (double)wait_ns / 1e6,
+            (unsigned long long)__atomic_load_n(&g_jl_owner, __ATOMIC_RELAXED),
+            since ? (double)(now - since) / 1e6 : 0.0,
+            __atomic_load_n(&g_jl_phase, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_jl_rip, __ATOMIC_RELAXED),
+            __atomic_load_n(&g_jl_acq, __ATOMIC_RELAXED),
+            __atomic_load_n(&g_jl_waits, __ATOMIC_RELAXED),
+            __atomic_load_n(&g_jl_xlat_null, __ATOMIC_RELAXED),
+            w[0], w[1], w[2], w[3], w[4], w[5]);
+}
+
+static void jl_lock_step(uint64_t rip)
+{
+    if (g_jl_log < 0)
+        g_jl_log = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
+    if (pthread_mutex_trylock(&jit_lock) != 0) {
+        uint64_t t0 = g_jl_log > 0 ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+        if (g_jl_log > 0)
+            __atomic_add_fetch(&g_jl_waits, 1, __ATOMIC_RELAXED);
+        for (unsigned long long s = 0;; s++) {
+            if (s < 64) {
+                sched_yield();
+            } else {
+                struct timespec ts;
+                ts.tv_sec = 0;
+                ts.tv_nsec = s < 512 ? 200000 : 2000000;
+                nanosleep(&ts, NULL);
+            }
+            if (pthread_mutex_trylock(&jit_lock) == 0)
+                break;
+            if (g_jl_log > 0) {
+                uint64_t w = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+                if (w > 3000000000ull && (s % 2000) == 0)
+                    jl_dump("WAIT", w);
+            }
+        }
+    }
+    if (g_jl_log > 0) {
+        __atomic_add_fetch(&g_jl_acq, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_owner, jl_tid(), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_since, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_rip, rip, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_phase, 1, __ATOMIC_RELAXED);
+    }
+}
+
+static void jl_unlock_step(void)
+{
+    if (g_jl_log > 0)
+        __atomic_store_n(&g_jl_phase, 3, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&jit_lock);
+    if (g_jl_log > 0) {
+        __atomic_store_n(&g_jl_phase, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_owner, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_since, 0, __ATOMIC_RELAXED);
+    }
+}
+
 static int g_align_guard;
 static int vec_tso_relaxed(void)
 {
@@ -13304,7 +13401,7 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
     const JitBlock *blk = fault_block(jit, site);
     int use_dmb = blk && blk->ordered_loads;
 
-    pthread_mutex_lock(&jit_lock);
+    jl_acquire();
     int rc = 0;
     if ((size_t)(jit->code_end - jit->code_cur) > 128) {
         pthread_jit_write_protect_np(0);
@@ -13661,7 +13758,7 @@ void ocerz_jit_invalidate_all(struct OcerzVM *vm)
 
     OcerzJit *jit = vm->jit;
     if (jit) {
-        pthread_mutex_lock(&jit_lock);
+        jl_acquire();
         invalidate_all_locked(jit);
         pthread_mutex_unlock(&jit_lock);
     }
@@ -13885,7 +13982,7 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
 
     OcerzJit *jit = vm->jit;
     int invalidated = 0;
-    pthread_mutex_lock(&jit_lock);
+    jl_acquire();
     if (!jit->code_hi || !ranges_overlap(addr, len, jit->code_lo,
                                          jit->code_hi - jit->code_lo)) {
         if (ENV_ON("OCERZ_INVMAP_CHECK"))
@@ -13968,7 +14065,7 @@ void ocerz_jit_request_stop(struct OcerzVM *vm)
     if (!jit)
         return;
 
-    pthread_mutex_lock(&jit_lock);
+    jl_acquire();
     jit->stop_requested = 1;
     pthread_jit_write_protect_np(0);
     int patched = force_stop_sites_writable(jit);
@@ -13997,7 +14094,7 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
         return;
     }
 
-    pthread_mutex_lock(&jit_lock);
+    jl_acquire();
     if (jit->plain_mem) {
         jit->plain_mem = 0;
         g_plain_mem = 0;
@@ -14010,7 +14107,7 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
 
 void ocerz_jit_prefork(void)
 {
-    pthread_mutex_lock(&jit_lock);
+    jl_acquire();
 }
 
 void ocerz_jit_postfork(void)
@@ -14292,7 +14389,7 @@ static void flip_retire_block(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
 {
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     g_flip_n_retire++;
-    pthread_mutex_lock(&jit_lock);
+    jl_acquire();
     int live = blk->code != NULL;
     if (live) flip_retire_locked(jit, blk);
     pthread_mutex_unlock(&jit_lock);
@@ -14345,7 +14442,7 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     int tk = (int)pf->taken, ft = (int)pf->ft;
     int verdict = tk >= 2 * ft && tk >= (1 << (PROBE_BIT - 1));
     int flip = 0;
-    pthread_mutex_lock(&jit_lock);
+    jl_acquire();
     if (pf->windows == 0 || (pf->prev != verdict && pf->windows < 3)) {
         pf->prev = (uint8_t)verdict;
         pf->windows++;
@@ -14362,84 +14459,6 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     if (flip && !noretire) flip_retire_block(vm, jit, blk);
 }
 
-static int g_jl_log = -1;
-static unsigned long long g_jl_acq, g_jl_waits, g_jl_xlat_null;
-static uint64_t g_jl_owner, g_jl_since, g_jl_rip;
-static int g_jl_phase;
-
-static uint64_t jl_tid(void)
-{
-    uint64_t t = 0;
-    pthread_threadid_np(NULL, &t);
-    return t;
-}
-
-static void jl_dump(const char *tag, uint64_t wait_ns)
-{
-    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    uint64_t since = __atomic_load_n(&g_jl_since, __ATOMIC_RELAXED);
-    const uint32_t *w = (const uint32_t *)(const void *)&jit_lock;
-    fprintf(stderr,
-            "ocerz: JITLOCK-%s[%d] tid=%llu wait_ms=%.1f owner=%llu held_ms=%.1f phase=%d rip=%#llx acq=%llu waits=%llu xlat_null=%llu mtx=%08x %08x %08x %08x %08x %08x\n",
-            tag, (int)getpid(), (unsigned long long)jl_tid(),
-            (double)wait_ns / 1e6,
-            (unsigned long long)__atomic_load_n(&g_jl_owner, __ATOMIC_RELAXED),
-            since ? (double)(now - since) / 1e6 : 0.0,
-            __atomic_load_n(&g_jl_phase, __ATOMIC_RELAXED),
-            (unsigned long long)__atomic_load_n(&g_jl_rip, __ATOMIC_RELAXED),
-            __atomic_load_n(&g_jl_acq, __ATOMIC_RELAXED),
-            __atomic_load_n(&g_jl_waits, __ATOMIC_RELAXED),
-            __atomic_load_n(&g_jl_xlat_null, __ATOMIC_RELAXED),
-            w[0], w[1], w[2], w[3], w[4], w[5]);
-}
-
-static void jl_lock_step(uint64_t rip)
-{
-    if (g_jl_log < 0)
-        g_jl_log = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
-    if (pthread_mutex_trylock(&jit_lock) != 0) {
-        uint64_t t0 = g_jl_log > 0 ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
-        if (g_jl_log > 0)
-            __atomic_add_fetch(&g_jl_waits, 1, __ATOMIC_RELAXED);
-        for (unsigned long long s = 0;; s++) {
-            if (s < 64) {
-                sched_yield();
-            } else {
-                struct timespec ts;
-                ts.tv_sec = 0;
-                ts.tv_nsec = s < 512 ? 200000 : 2000000;
-                nanosleep(&ts, NULL);
-            }
-            if (pthread_mutex_trylock(&jit_lock) == 0)
-                break;
-            if (g_jl_log > 0) {
-                uint64_t w = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
-                if (w > 3000000000ull && (s % 2000) == 0)
-                    jl_dump("WAIT", w);
-            }
-        }
-    }
-    if (g_jl_log > 0) {
-        __atomic_add_fetch(&g_jl_acq, 1, __ATOMIC_RELAXED);
-        __atomic_store_n(&g_jl_owner, jl_tid(), __ATOMIC_RELAXED);
-        __atomic_store_n(&g_jl_since, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELAXED);
-        __atomic_store_n(&g_jl_rip, rip, __ATOMIC_RELAXED);
-        __atomic_store_n(&g_jl_phase, 1, __ATOMIC_RELAXED);
-    }
-}
-
-static void jl_unlock_step(void)
-{
-    if (g_jl_log > 0)
-        __atomic_store_n(&g_jl_phase, 3, __ATOMIC_RELAXED);
-    pthread_mutex_unlock(&jit_lock);
-    if (g_jl_log > 0) {
-        __atomic_store_n(&g_jl_phase, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&g_jl_owner, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&g_jl_since, 0, __ATOMIC_RELAXED);
-    }
-}
-
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
@@ -14448,7 +14467,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
     OcerzJit *jit = vm->jit;
     if (cpu->side_blk) flip_side_hit(vm, jit, cpu);
     if (ocerz_jitstat < 0) {
-        pthread_mutex_lock(&jit_lock);
+        jl_acquire();
         if (ocerz_jitstat < 0) {
             js_t0 = ps_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             ocerz_perfstat = getenv("OCERZ_PERFSTAT") ? 1 : 0;
