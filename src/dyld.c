@@ -803,6 +803,7 @@ typedef struct DynFrame {
     uint64_t progvars;
     uint64_t stack_top;
     uint64_t exit_stub;
+    uint64_t exec_path;
 } DynFrame;
 
 static uint64_t put_str(uint64_t *sp, const char *s)
@@ -872,6 +873,7 @@ static int build_frame(const char *path, int argc, char **argv, char **envp, Dyn
     apple_g[3] = put_str(&sp, "malloc_entropy=0x91827364a5b6c7d8,0x1f2e3d4c5b6a7988");
     apple_g[4] = put_str(&sp, stkbuf);
     apple_g[5] = put_str(&sp, thbuf);
+    out->exec_path = put_str(&sp, path);
     int applec = 6;
 
     sp &= ~0xfull;
@@ -2425,6 +2427,10 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         return OCERZ_EFORMAT;
     }
 
+    char abspath[PATH_MAX];
+    if (realpath(path, abspath))
+        path = abspath;
+
     DynImage img;
     memset(&img, 0, sizeof img);
     img.slice = slice;
@@ -2532,7 +2538,9 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     }
 
     extern uint64_t g_main_path;
-    if (fr.argv_arr)
+    if (fr.exec_path)
+        g_main_path = fr.exec_path;
+    else if (fr.argv_arr)
         g_main_path = ocerz_ld(fr.argv_arr, 8);
 
     int ran_init = 0;
