@@ -6,7 +6,11 @@
  * reads the flags with setcc/jcc without any compare of its own.  Also the
  * counter-case: a tail ending in arithmetic returns a value, not flags, and
  * the caller must not depend on them (it computes its own).  Goldens come
- * from the native binary. */
+ * from the native binary.
+ *
+ * One helper puts the compare after a jcc inside itself, so the flags must reach
+ * the ret along both paths.
+ */
 #include "gsys.h"
 
 static volatile g_u64 g_ptr = 0, g_word = 0x80;
@@ -50,7 +54,6 @@ int main(int argc, char **argv, char **envp)
     g_word = 0x80;
     g_puts("bt on        "); g_putu64(flags_after(h_bt, &g_word));
 
-    /* two-register compare: branch straight after the call */
     __asm__ __volatile__("call _h_cmp_regs\n\tmovq $0, %[r]\n\tjae 1f\n\tmovq $1, %[r]\n1:"
                          : [r] "=&r"(r) : "D"(g_a), "S"(g_b) : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc");
     g_puts("cmp_regs a<b "); g_putu64(r);
@@ -58,7 +61,6 @@ int main(int argc, char **argv, char **envp)
                          : [r] "=&r"(r) : "D"(g_b), "S"(g_a) : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc");
     g_puts("cmp_regs b<a "); g_putu64(r);
 
-    /* the compare sits after a jcc inside the helper: flags reach the ret both ways */
     __asm__ __volatile__("call _h_cmp_after_jcc\n\tsetz %b[r]\n\tmovzbq %b[r], %[r]"
                          : [r] "=&r"(r) : "D"((g_u64)1), "S"(&g_ptr) : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc");
     g_puts("after_jcc sel1 "); g_putu64(r);
@@ -66,7 +68,6 @@ int main(int argc, char **argv, char **envp)
                          : [r] "=&r"(r) : "D"((g_u64)2), "S"(&g_ptr) : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc");
     g_puts("after_jcc sel2 "); g_putu64(r);
 
-    /* value-returning tail: the caller compares for itself */
     r = h_xor_tail(g_a, g_b);
     g_puts("xor_tail "); g_putu64(r); g_puts(" "); g_putu64(g_a < g_b);
     return 0;

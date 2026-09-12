@@ -20,7 +20,6 @@ int main(void){
         "movupd %%xmm2, 32(%0)\n\t"
         : : "r"(r), "m"(one) : "xmm1", "xmm2", "xmm3", "memory");
     for (int i = 0; i < 6; i++) put("identity ", r[i]);
-    /* same shape with a non-zero xmm2 and movlpd instead */
     __asm__ volatile(
         "movsd %2, %%xmm2\n\t"
         "unpcklpd %%xmm2, %%xmm2\n\t"

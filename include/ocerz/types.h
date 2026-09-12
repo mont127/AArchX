@@ -1,4 +1,6 @@
-/* Shared primitive types, error codes and logging. */
+/*
+ * Shared primitive types, error codes and logging.
+ */
 #ifndef OCERZ_TYPES_H
 #define OCERZ_TYPES_H
 

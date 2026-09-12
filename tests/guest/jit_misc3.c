@@ -17,7 +17,6 @@ int main(void){
         r = v; __asm__ volatile("stc\n\tdecb %b0\n\tpushfq\n\tpopq %1" : "+q"(r), "=r"(f) :: "cc"); put("dec8 r ", r); put("dec8 f ", f & 0x8d5);
         r = 0x1122334455667788ULL; __asm__ volatile("bsfq %2, %0\n\tjz 1f\n\tmovq $0x99, %1\n\tjmp 2f\n\t1: movq $0x11, %1\n\t2:" : "+r"(r), "=r"(f) : "r"(v) : "cc"); put("bsf jz r ", r); put("bsf jz path ", f);
         r = 0x1122334455667788ULL; __asm__ volatile("bsrl %k2, %k0\n\tjnz 1f\n\tmovq $0x99, %1\n\tjmp 2f\n\t1: movq $0x11, %1\n\t2:" : "+r"(r), "=r"(f) : "r"(v) : "cc"); put("bsr jnz r ", r); put("bsr jnz path ", f);
-        /* pshufb: reverse bytes; select with high bit clears */
         static const g_u64 masks[3][2] = { {0x0001020304050607ULL, 0x08090a0b0c0d0e0fULL}, {0x0f0e0d0c0b0a0908ULL, 0x0706050403020100ULL}, {0x8080808000000000ULL, 0x0f8f0f8f7f7f7f7fULL} };
         for (int k = 0; k < 3; k++) {
             __asm__ volatile("movq %2, %%xmm1\n\tpunpcklqdq %%xmm1, %%xmm1\n\tpaddq %%xmm1, %%xmm1\n\tmovdqu %3, %%xmm2\n\tpshufb %%xmm2, %%xmm1\n\tmovq %%xmm1, %0\n\tpextrq $1, %%xmm1, %1"

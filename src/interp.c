@@ -1,4 +1,65 @@
-/* The core single-step interpreter: reference semantics for x86_64. */
+/*
+ * The core single-step interpreter: reference semantics for x86_64, and the
+ * oracle the JIT is checked against by the differential gates.
+ *
+ * x86 makes a LOCK-prefixed access atomic at any alignment - the bus or
+ * cache-line lock covers a split access - while ARM64's LSE atomics fault on a
+ * misaligned address, as does clang's __atomic_*.  Wine's CRITICAL_SECTION
+ * inside a packed Valve struct sits at +0x446, so every EnterCriticalSection in
+ * Steam's CEF host is a `lock cmpxchg` on a dword that is 2 mod 4.  The JIT
+ * sends those here, and a misaligned access takes a lock striped by address and
+ * does the read-modify-write with plain unaligned copies: atomic against every
+ * other misaligned access to the same location, which is the guarantee that
+ * actually matters.  cmpxchg's flags follow Rosetta, the golden oracle for the
+ * guest tests: flags as (dest - accumulator), and the accumulator written in
+ * both cases, so the 32-bit form zero-extends rax on a match too.
+ *
+ * A divide fault is delivered as a real fault - rip stays at the div and the
+ * guest handler sees SIGFPE with FPE_INTDIV/FPE_INTOVF, as on Darwin - and
+ * stays fatal when no handler is installed.  Windows' int $0x29 (__fastfail)
+ * dies here instead of being handed to the guest as a #GP: dispatching the
+ * exception so Wine can raise STATUS_STACK_BUFFER_OVERRUN was tried and
+ * measured worse, because the thread that fast-fails is already deep, the
+ * dispatch overflows its stack, and it wedges holding ntdll's loader_section so
+ * the process can never exit.
+ *
+ * ---- the i386 slice ----
+ * The CPU is never asked "am I in 32-bit mode?" at each instruction: the
+ * interpreter chooses a decode mode in exactly one place, and every far
+ * transfer - JMPF, CALLF, RETF, IRET - funnels through a single helper, so the
+ * mode, the selector and EIP/RIP can never disagree.  EIP is re-wrapped after
+ * execution keyed on the mode the CPU is in NOW, because a far transfer that
+ * just left 32-bit mode has already produced a full 64-bit rip.
+ *
+ * The details that bite are the ones the SDM states and that are easy to miss.
+ * With (E)SP as a base or index of a POP's memory destination the effective
+ * address is computed AFTER the pop adjusts (E)SP: V8's TailCallRuntime
+ * trampoline moves its return address with `pop qword [rsp+0x98]`, and computed
+ * with the old rsp it lands one slot low and CEntry returns into a stale heap
+ * pointer.  POP ESP takes its new value from the slot, not the adjustment.  A
+ * selector slot holds 16 bits and hardware ignores the rest - Wine's
+ * I386_CONTEXT stores SegCs/SegSs as DWORDs that RtlCaptureContext fills with a
+ * 16-bit store, so their upper halves are stack garbage by the time wow64cpu
+ * pushes them for an iretq - and a zero CS or SS on the stack is a frame this
+ * emulator built itself, not a mode decision, so the current selector is kept.
+ * DAS's second test has no ELSE, so a CF raised by the first adjustment
+ * survives when the second does not fire.  The BCD and adjust handlers leave
+ * every flag the SDM calls UNDEFINED untouched.  FS and GS are the two segments
+ * whose base is applied to addresses, so loading one moves the base; ES/SS/DS
+ * are flat and carry no base.
+ *
+ * ---- diagnostics ----
+ * Being the slow path makes this the right place to watch from.  OCERZ_EXCLOG
+ * traps the guest's _objc_exception_throw and __cxa_throw and recovers the
+ * exception name, reason and throw-site chain straight out of guest memory,
+ * falling back to raw words so an unfamiliar string class is still decodable by
+ * hand rather than lost.  OCERZ_REGTRAP dumps every register at chosen guest
+ * addresses (with OCERZ_REGTRAP_DEREF for the memory behind them, because a
+ * heap address is never the same twice and a watch cannot be aimed at it in a
+ * later run), OCERZ_RIPTRAP is the older fixed-field form, and OCERZ_V8DUMP
+ * reads V8's Ignition dispatch table and bytecode header.  These are interpreter
+ * only, so they are paired with OCERZ_INTERP_LO/HI to bring chosen code here.
+ */
 #include <unistd.h>
 #include <string.h>
 #include "ocerz/interp.h"
@@ -11,8 +72,6 @@
 #include <signal.h>
 
 static int far_transfer(OcerzCPU *cpu, uint32_t sel, uint64_t off);
-
-/* Reading order for the whole i386 slice of this file: the CPU never asks "am I in 32-bit mode?" */
 
 static void dump_raw_bytes(FILE *out, uint64_t rip, unsigned len)
 {
@@ -57,9 +116,6 @@ static int trap_fatal(const X86Insn *insn, const char *msg)
     return OCERZ_STEP_FATAL;
 }
 
-/* #DE (divide by zero / quotient overflow): a fault, so the guest handler
- * sees rip at the div; SIGFPE with FPE_INTDIV / FPE_INTOVF like Darwin.
- * With no guest handler installed it stays fatal. */
 static int div_trap(OcerzCPU *cpu, const X86Insn *insn, int code, const char *msg)
 {
     uint64_t next = cpu->rip;
@@ -82,7 +138,7 @@ static uint64_t lea_addr(const OcerzCPU *cpu, const X86Insn *insn, const X86Oper
     if (insn->addrsize == 4)
         a = (uint32_t)a;
     else if (insn->addrsize == 2)
-        a = (uint16_t)a;   /* 32-bit mode + 0x67; addrsize is never 2 in long mode */
+        a = (uint16_t)a;
     return a;
 }
 
@@ -96,16 +152,6 @@ static void write_acc(OcerzCPU *cpu, int size, uint64_t v)
     ocerz_write_gpr(cpu, OCERZ_RAX, size, 0, v);
 }
 
-/* x86 makes a LOCK-prefixed access atomic at any alignment (the bus or
- * cache-line lock covers a split access too); ARM64's LSE atomics fault on a
- * misaligned address, and so does clang's __atomic_* on one.  Wine's
- * CRITICAL_SECTION inside a packed Valve struct sits at +0x446, so every
- * EnterCriticalSection in Steam's CEF host is a `lock cmpxchg` on a dword
- * that is 2 mod 4: the JIT sends misaligned atomics here, and this used to
- * fault again.  A misaligned access takes a lock striped by address and
- * does the read-modify-write with plain unaligned copies: atomic against
- * every other misaligned access to the same location, which is the only
- * kind a lock word ever sees. */
 static uint32_t g_unal_lock[256];
 
 static inline uint32_t *unal_lock_for(uint64_t gaddr)
@@ -441,7 +487,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             uint64_t q = num / d;
             uint64_t r = num % d;
             if (q > 0xff)
-                return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
+                return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");
             ocerz_write_gpr(cpu, OCERZ_RAX, 1, 0, q);
             ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, r);
         } else if (size == 8) {
@@ -450,7 +496,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             __uint128_t q = num / d;
             __uint128_t r = num % d;
             if (q > (__uint128_t)~(uint64_t)0)
-                return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
+                return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");
             cpu->gpr[OCERZ_RAX] = (uint64_t)q;
             cpu->gpr[OCERZ_RDX] = (uint64_t)r;
         } else {
@@ -461,7 +507,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             uint64_t q = num / d;
             uint64_t r = num % d;
             if (q > ocerz_mask(size))
-                return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
+                return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");
             write_acc(cpu, size, q);
             ocerz_write_gpr(cpu, OCERZ_RDX, size, 0, r);
         }
@@ -474,7 +520,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         int64_t q = num / d;
         int64_t r = num % d;
         if (q < -128 || q > 127)
-            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
+            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");
         ocerz_write_gpr(cpu, OCERZ_RAX, 1, 0, (uint64_t)q);
         ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, (uint64_t)r);
     } else if (size == 8) {
@@ -483,7 +529,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         __int128_t q = num / d;
         __int128_t r = num % d;
         if (q < -(__int128_t)1 - (__int128_t)((__uint128_t)~(uint64_t)0 >> 1) || q > (__int128_t)((__uint128_t)~(uint64_t)0 >> 1))
-            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
+            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");
         cpu->gpr[OCERZ_RAX] = (uint64_t)q;
         cpu->gpr[OCERZ_RDX] = (uint64_t)r;
     } else {
@@ -496,7 +542,7 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         int64_t qmin = -(int64_t)1 - (int64_t)(ocerz_mask(size) >> 1);
         int64_t qmax = (int64_t)(ocerz_mask(size) >> 1);
         if (q < qmin || q > qmax)
-            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");   /* x86 #DE: Darwin reports FPE_INTDIV for both */
+            return div_trap(cpu, insn, OCERZ_FPE_INTDIV, "divide quotient overflow");
         write_acc(cpu, size, (uint64_t)q);
         ocerz_write_gpr(cpu, OCERZ_RDX, size, 0, (uint64_t)r);
     }
@@ -716,13 +762,6 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         uint64_t v = ocerz_ld(cpu->gpr[OCERZ_RSP], size);
         const X86Operand *d = &insn->ops[0];
         if (d->kind == OCERZ_OPK_MEM && (d->base == OCERZ_RSP || d->index == OCERZ_RSP)) {
-            /* SDM, POP: with (E)SP as a base/index of the memory destination
-             * the effective address is computed AFTER the pop adjusts (E)SP.
-             * V8's TailCallRuntime trampoline moves the return address with
-             * `pop qword [rsp+0x98]` and jumps to CEntry; computed with the
-             * old rsp it lands one slot low and CEntry returns into a stale
-             * heap pointer.  Commit rsp only once the store is done so a
-             * faulting store leaves it untouched. */
             uint64_t old = cpu->gpr[OCERZ_RSP];
             uint64_t bumped = ocerz_stack_wrap(old + (uint64_t)size, insn->mode32);
             cpu->gpr[OCERZ_RSP] = bumped;
@@ -733,22 +772,16 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             return OCERZ_STEP_OK;
         }
         ocerz_write_op(cpu, insn, d, v);
-        /* POP ESP takes its new value from the slot, not from the adjustment. */
         if (!(insn->ops[0].kind == OCERZ_OPK_REG && insn->ops[0].reg == OCERZ_RSP))
             cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(cpu->gpr[OCERZ_RSP] + (uint64_t)size,
                                                    insn->mode32);
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_PUSHF:
-        /* opsize is 8 in long mode -- the decoder still hard-codes it there --
-         * and 4 (2 under 0x66) in i386 mode. */
         ocerz_push_mode(cpu, insn->opsize ? insn->opsize : 8, cpu->rflags, insn->mode32);
         return OCERZ_STEP_OK;
     case OCERZ_OP_POPF: {
         uint64_t v = ocerz_pop_mode(cpu, insn->opsize ? insn->opsize : 8, insn->mode32);
-        /* Every writable bit lives below bit 12, so POPFW and POPFD restore
-         * the same set here; only the number of stack bytes consumed differs,
-         * and that came from opsize above. */
         uint64_t writable = OCERZ_CF | OCERZ_PF | OCERZ_AF | OCERZ_ZF | OCERZ_SF |
                             OCERZ_TF | OCERZ_DF | OCERZ_OF;
         cpu->rflags = (v & writable) | OCERZ_FLAG_FIXED1 | OCERZ_IF;
@@ -767,7 +800,6 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_LEAVE: {
-        /* SDM: the STACK ADDRESS size moves the whole of ESP/RSP from EBP/RBP, while the OPERAND size */
         int m32 = insn->mode32;
         int size = insn->opsize ? insn->opsize : 8;
         uint64_t bp = m32 ? (uint32_t)cpu->gpr[OCERZ_RBP] : cpu->gpr[OCERZ_RBP];
@@ -833,7 +865,7 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         if (insn->addrsize == 4)
             c = (uint32_t)c;
         else if (insn->addrsize == 2)
-            c = (uint16_t)c;   /* JCXZ: 0x67 in 32-bit mode */
+            c = (uint16_t)c;
         if (c == 0)
             cpu->rip = insn->ops[0].imm;
         return OCERZ_STEP_OK;
@@ -847,7 +879,6 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             ocerz_write_gpr(cpu, OCERZ_RCX, 4, 0, c);
             c = (uint32_t)c;
         } else if (insn->addrsize == 2) {
-            /* LOOPW: only CX counts and only CX is written back. */
             c = (uint16_t)((uint16_t)cpu->gpr[OCERZ_RCX] - 1);
             ocerz_write_gpr(cpu, OCERZ_RCX, 2, 0, c);
         } else {
@@ -873,8 +904,6 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             if (ocerz_cftrap_on && target - 0x7ff840000000ull < 0x10000000ull)
                 ocerz_cftrap(cpu, insn->rip, target, "call");
         }
-        /* opsize is the near-branch width: 8 in long mode (forced, 0x66
-         * ignored), 4 or 2 in i386 mode. */
         ocerz_push_mode(cpu, insn->opsize ? insn->opsize : 8, cpu->rip, insn->mode32);
         cpu->rip = target;
         return OCERZ_STEP_OK;
@@ -906,8 +935,6 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OCERZ_OP_MOVFROMSEG: {
-        /* The live selector, zero-extended into the destination width the
-         * decoder chose (operand size for a register, 16 bits for memory). */
         unsigned seg = (unsigned)insn->ops[1].imm;
         uint64_t sel = seg == OCERZ_SREG_CS ? cpu->cs_sel : seg < 6 ? cpu->seg_sel[seg] : 0;
         ocerz_write_op(cpu, insn, &insn->ops[0], sel);
@@ -915,17 +942,12 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
     case OCERZ_OP_JMPF:
     case OCERZ_OP_CALLF: {
-        /* Stack slots stay 8 bytes wide in long mode: that is what this path
-         * has always pushed and what the 64-bit tests pin.  In i386 mode the
-         * selector and the return offset each take one operand-size slot. */
         int m32 = insn->mode32;
         int sz = insn->opsize ? insn->opsize : 4;
         int ssz = m32 ? sz : 8;
         uint64_t off;
         uint32_t sel;
         if (insn->nops == 2) {
-            /* ptr16:32 direct form (0x9a / 0xea), i386 only.  The decoder
-             * records it selector-first; the encoding is offset-first. */
             sel = (uint16_t)insn->ops[0].imm;
             off = ocerz_trunc(insn->ops[1].imm, sz);
         } else {
@@ -955,23 +977,14 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         uint64_t sp = cpu->gpr[OCERZ_RSP];
         uint64_t rip = ocerz_ld(sp, sz);
 
-        /* A selector slot holds 16 bits; hardware ignores the rest.  Wine's
-         * I386_CONTEXT stores SegCs/SegSs as DWORDs that RtlCaptureContext
-         * fills with a 16-bit store, so their upper halves are stack garbage
-         * by the time wow64cpu pushes them for this iretq. */
         uint32_t cs = (uint16_t)ocerz_ld(sp + (uint64_t)sz, sz);
         uint64_t flags = ocerz_ld(sp + (uint64_t)sz * 2, sz);
         uint64_t newsp = ocerz_ld(sp + (uint64_t)sz * 3, sz);
-        /* The fifth slot, SS. IRET to an outer privilege level -- which is every IRET this emulator will */
         uint32_t ss = (uint16_t)ocerz_ld(sp + (uint64_t)sz * 4, sz);
         cpu->rflags = flags | 0x2;
         cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(newsp, m32);
-        /* A zero SS is a frame that did not name one; keep the current SS
-         * rather than installing the null selector. */
         if (ss)
             cpu->seg_sel[OCERZ_SREG_SS] = (uint16_t)ss;
-        /* A zero CS on the stack is not a mode decision, it is a frame this
-         * emulator built itself; keep the current selector and mode. */
         if (!cs) {
             cpu->rip = m32 ? (uint32_t)rip : rip;
             return OCERZ_STEP_OK;
@@ -983,7 +996,6 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
-/* Is this code selector a 32-bit one? A code descriptor's L bit (53) says 64-bit and its D bit */
 static int cs_is_32bit(uint32_t sel)
 {
     if (ocerz_ldt_is_long(sel))
@@ -991,16 +1003,12 @@ static int cs_is_32bit(uint32_t sel)
     return ocerz_ldt_is_big(sel) ? 1 : 0;
 }
 
-/* Every far transfer -- JMPF, CALLF, RETF, IRET -- funnels through here, so
- * the mode, the selector and EIP/RIP can never disagree. */
 static int far_transfer(OcerzCPU *cpu, uint32_t sel, uint64_t off)
 {
     int to32 = cs_is_32bit(sel);
     cpu->cs_sel = (uint16_t)sel;
     cpu->seg_sel[OCERZ_SREG_CS] = (uint16_t)sel;
     cpu->mode32 = (uint8_t)to32;
-    /* EIP has 32 significant bits; a stale high half from the 64-bit side must
-     * not survive the switch. */
     cpu->rip = to32 ? (uint64_t)(uint32_t)off : off;
     { static int modelog = -1;
       if (modelog < 0) modelog = getenv("OCERZ_MODELOG") ? 1 : 0;
@@ -1010,9 +1018,6 @@ static int far_transfer(OcerzCPU *cpu, uint32_t sel, uint64_t off)
     return OCERZ_STEP_OK;
 }
 
-/* --------------------------------------------------------------------------- The i386-only */
-
-/* AL, AH and AX, spelled once so the adjust handlers read like the SDM. */
 static uint8_t  get_al(const OcerzCPU *cpu) { return (uint8_t)cpu->gpr[OCERZ_RAX]; }
 static uint8_t  get_ah(const OcerzCPU *cpu) { return (uint8_t)(cpu->gpr[OCERZ_RAX] >> 8); }
 static uint16_t get_ax(const OcerzCPU *cpu) { return (uint16_t)cpu->gpr[OCERZ_RAX]; }
@@ -1020,7 +1025,6 @@ static void set_al(OcerzCPU *cpu, uint8_t v)  { ocerz_write_gpr(cpu, OCERZ_RAX, 
 static void set_ah(OcerzCPU *cpu, uint8_t v)  { ocerz_write_gpr(cpu, OCERZ_RAX, 1, 1, v); }
 static void set_ax(OcerzCPU *cpu, uint16_t v) { ocerz_write_gpr(cpu, OCERZ_RAX, 2, 0, v); }
 
-/* #BR (BOUND range exceeded, vector 5) and #OF (INTO, vector 4). */
 static int i386_trap(OcerzCPU *cpu, const X86Insn *insn, const char *msg)
 {
     uint64_t next = cpu->rip;
@@ -1031,7 +1035,6 @@ static int i386_trap(OcerzCPU *cpu, const X86Insn *insn, const char *msg)
     return trap_fatal(insn, msg);
 }
 
-/* PUSHA/POPA move the eight GPRs in the fixed order the SDM gives. */
 static int op_pusha(OcerzCPU *cpu, const X86Insn *insn)
 {
     static const uint8_t order[8] = {
@@ -1057,7 +1060,7 @@ static int op_popa(OcerzCPU *cpu, const X86Insn *insn)
     for (int i = 0; i < 8; i++) {
         uint64_t v = ocerz_pop_mode(cpu, size, insn->mode32);
         if (order[i] == OCERZ_RSP)
-            continue;   /* the saved ESP image is discarded, per the SDM */
+            continue;
         ocerz_write_gpr(cpu, order[i], size, 0, v);
     }
     return OCERZ_STEP_OK;
@@ -1075,8 +1078,6 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_PUSHSEG: {
         unsigned seg = (unsigned)insn->ops[0].imm;
         int size = insn->opsize ? insn->opsize : 4;
-        /* PUSH sreg consumes a whole operand-size slot with the selector
-         * zero-extended into it. */
         ocerz_push_mode(cpu, size, seg < 6 ? cpu->seg_sel[seg] : 0, insn->mode32);
         return OCERZ_STEP_OK;
     }
@@ -1087,9 +1088,6 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         uint64_t base;
         if (seg < 6)
             cpu->seg_sel[seg] = (uint16_t)sel;
-        /* FS and GS are the two whose base this emulator applies to addresses,
-         * so loading one has to move the base too -- exactly what MOVSEG does.
-         * ES/SS/DS are flat here and carry no base. */
         base = ocerz_ldt_base(sel);
         if (base) {
             if (seg == OCERZ_SREG_FS)
@@ -1100,8 +1098,6 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
 
-    /* DAA.  SDM: CF and AF as computed below, SF/ZF/PF from the result, OF
-     * UNDEFINED -- left untouched. */
     case OCERZ_OP_DAA: {
         uint8_t old_al = get_al(cpu);
         int old_cf = (cpu->rflags & OCERZ_CF) != 0;
@@ -1118,7 +1114,6 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             ocerz_flag_assign(cpu, OCERZ_AF, 0);
         }
         ocerz_flag_assign(cpu, OCERZ_CF, carry);
-        /* The second test overrides CF in BOTH directions for DAA. */
         if (old_al > 0x99 || old_cf) {
             al = (uint8_t)(al + 0x60);
             ocerz_flag_assign(cpu, OCERZ_CF, 1);
@@ -1130,9 +1125,6 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
 
-    /* DAS.  Same shape as DAA with one asymmetry that is in the SDM and is
-     * easy to miss: its second test has no ELSE, so a CF raised by the first
-     * adjustment survives when the second does not fire. */
     case OCERZ_OP_DAS: {
         uint8_t old_al = get_al(cpu);
         int old_cf = (cpu->rflags & OCERZ_CF) != 0;
@@ -1151,11 +1143,10 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             ocerz_flag_assign(cpu, OCERZ_CF, 1);
         }
         set_al(cpu, al);
-        ocerz_flags_szp(cpu, 1, al);   /* OF UNDEFINED: left untouched */
+        ocerz_flags_szp(cpu, 1, al);
         return OCERZ_STEP_OK;
     }
 
-    /* AAA. SDM: AF and CF defined, OF/SF/ZF/PF UNDEFINED -- all four left untouched. */
     case OCERZ_OP_AAA: {
         if ((get_al(cpu) & 0x0f) > 9 || (cpu->rflags & OCERZ_AF)) {
             set_ax(cpu, (uint16_t)(get_ax(cpu) + 0x106));
@@ -1169,8 +1160,6 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
 
-    /* AAS.  SDM: AX := AX - 6 first (so a borrow out of AL already reaches
-     * AH), then AH := AH - 1.  AF/CF defined, OF/SF/ZF/PF UNDEFINED. */
     case OCERZ_OP_AAS: {
         if ((get_al(cpu) & 0x0f) > 9 || (cpu->rflags & OCERZ_AF)) {
             set_ax(cpu, (uint16_t)(get_ax(cpu) - 6));
@@ -1185,9 +1174,6 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
 
-    /* AAM imm8.  A real division, so base 0 raises #DE exactly as DIV does and
-     * goes out through the same delivery path.  SF/ZF/PF follow AL; OF/AF/CF
-     * UNDEFINED and left untouched. */
     case OCERZ_OP_AAM: {
         unsigned base = (unsigned)(insn->ops[0].imm & 0xff);
         uint8_t al;
@@ -1200,23 +1186,18 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
 
-    /* AAD imm8.  Cannot fault.  SF/ZF/PF follow AL; OF/AF/CF UNDEFINED. */
     case OCERZ_OP_AAD: {
         unsigned base = (unsigned)(insn->ops[0].imm & 0xff);
         uint8_t al = (uint8_t)(get_al(cpu) + (unsigned)get_ah(cpu) * base);
-        set_ax(cpu, al);   /* AL := result and AH := 0, in one 16-bit write */
+        set_ax(cpu, al);
         ocerz_flags_szp(cpu, 1, al);
         return OCERZ_STEP_OK;
     }
 
-    /* SALC (0xd6, undocumented): AL := CF ? 0xff : 0.  No flags. */
     case OCERZ_OP_SALC:
         set_al(cpu, (cpu->rflags & OCERZ_CF) ? 0xff : 0x00);
         return OCERZ_STEP_OK;
 
-    /* BOUND r32, m32&32.  SIGNED comparison against a lower bound at m and an
-     * upper bound at m+opsize; in range is a no-op, out of range is #BR.  No
-     * flags are affected either way. */
     case OCERZ_OP_BOUND: {
         int size = insn->opsize ? insn->opsize : 4;
         uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[1]);
@@ -1228,15 +1209,11 @@ static int op_i386(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
 
-    /* INTO: #OF if OF is set, otherwise nothing at all. */
     case OCERZ_OP_INTO:
         if (cpu->rflags & OCERZ_OF)
             return i386_trap(cpu, insn, "INTO with OF set (#OF)");
         return OCERZ_STEP_OK;
 
-    /* LES/LDS r32, m16:32.  Offset into the register, selector into ES or DS.
-     * Both segments are flat in this emulator, so the selector is recorded and
-     * no base moves; the register load is the part guest code depends on. */
     case OCERZ_OP_LES:
     case OCERZ_OP_LDS: {
         int size = insn->opsize ? insn->opsize : 4;
@@ -1280,9 +1257,6 @@ static int op_atomic(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_CMPXCHG: {
         int size = insn->ops[0].size;
         uint64_t acc = read_acc(cpu, size);
-        /* Rosetta (the golden oracle for the guest tests) sets the flags as
-         * (dest - accumulator) and writes the accumulator in both cases (so
-         * the 32-bit form zero-extends rax on a match as well). */
         if (mem) {
             uint64_t addr = ocerz_ea(cpu, insn, &insn->ops[0]);
             uint64_t src = ocerz_read_op(cpu, insn, &insn->ops[1]);
@@ -1392,9 +1366,6 @@ static int op_flagctl(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
-/* OCERZ_EXCLOG helper: slot holds an NSString*; for __NSCFConstantString the
- * C string pointer is at +0x10 and the length at +0x18.  Returns NULL unless
- * the result looks like printable ASCII of a sane length. */
 static const char *ocerz_exc_read_cfstr(uint64_t slot, char *out, size_t cap)
 {
     if (!ocerz_addr_readable(slot)) return NULL;
@@ -1412,7 +1383,6 @@ static const char *ocerz_exc_read_cfstr(uint64_t slot, char *out, size_t cap)
         }
         if (i == len) { out[len] = 0; return out; }
     }
-    /* inline form: a length byte at +0x10 followed by the characters */
     if (ocerz_addr_readable(obj + 0x11)) {
         uint64_t ilen = ocerz_ld(obj + 0x10, 1);
         if (ilen && ilen < cap && ocerz_addr_readable(obj + 0x11 + ilen)) {
@@ -1430,11 +1400,7 @@ static const char *ocerz_exc_read_cfstr(uint64_t slot, char *out, size_t cap)
 
 int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    {   /* OCERZ_EXCLOG=1: trap the guest's _objc_exception_throw and print the
-         * NSException's name (and reason when it is a constant string), read
-         * straight out of guest memory.  NSException ivars: isa, name, reason.
-         * A __NSCFConstantString keeps its C string pointer at +0x10 and its
-         * length at +0x18. */
+    {
         static int exclog = -1;
         if (exclog < 0) {
             exclog = getenv("OCERZ_EXCLOG") ? 1 : 0;
@@ -1446,8 +1412,7 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
                         (unsigned long long)ocerz_exc_trap_rip, (unsigned long long)ocerz_cxa_throw_rip);
             }
         }
-        {   /* ___cxa_throw(void *obj, std::type_info *tinfo, void (*dtor)()): print the
-             * type name and the return-address chain (the throw site and its callers). */
+        {
             extern uint64_t ocerz_cxa_throw_rip;
             if (exclog && ocerz_cxa_throw_rip && (uint64_t)cpu->rip == ocerz_cxa_throw_rip) {
                 uint64_t obj = cpu->gpr[7], tinfo = cpu->gpr[6];
@@ -1468,15 +1433,10 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
                     if (nf <= fp) break;
                     fp = nf;
                 }
-                /* the thrown object's first words: what() for std::exception subclasses
-                 * is virtual, so just dump the words for offline decoding */
                 fprintf(stderr, " obj-words:");
                 for (int w = 0; w < 4; w++)
                     fprintf(stderr, " %#llx", (unsigned long long)(ocerz_addr_readable(obj + 8 * (uint64_t)w) ? ocerz_ld(obj + 8 * (uint64_t)w, 8) : 0));
                 fprintf(stderr, "\n");
-                /* objc_exception_throw throws the NSException `id` itself: dump its name and
-                 * the reason object's bytes (and the objects behind its pointer words) so the
-                 * text can be recovered offline whatever CFString layout it uses. */
                 uint64_t nsexc = ocerz_addr_readable(obj) ? ocerz_ld(obj, 8) : 0;
                 if (nsexc && ocerz_addr_readable(nsexc + 16)) {
                     char nb[192]; const char *nm = ocerz_exc_read_cfstr(nsexc + 8, nb, sizeof nb);
@@ -1499,7 +1459,7 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
             }
         }
         if (exclog && ocerz_exc_trap_rip && (uint64_t)cpu->rip == ocerz_exc_trap_rip) {
-            uint64_t exc = cpu->gpr[7];   /* RDI */
+            uint64_t exc = cpu->gpr[7];
             char nbuf[192], rbuf[384];
             const char *nm = ocerz_exc_read_cfstr(exc + 8, nbuf, sizeof nbuf);
             const char *rs = ocerz_exc_read_cfstr(exc + 16, rbuf, sizeof rbuf);
@@ -1507,8 +1467,6 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
                     (unsigned long long)exc, nm ? nm : "<unreadable>",
                     rs ? rs : "<unreadable>");
             if (!nm || !rs) {
-                /* fall back to raw words so an unfamiliar string class can
-                 * still be decoded by hand instead of losing the datum */
                 for (int w = 0; w < 3; w++) {
                     uint64_t slot = exc + 8 + (uint64_t)w * 8;
                     if (!ocerz_addr_readable(slot)) continue;
@@ -1527,11 +1485,7 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
         }
     }
 
-    {   /* OCERZ_REGTRAP=addr1[,addr2,...]: full register dump at these guest
-         * addresses (interp only -- pair it with OCERZ_INTERP_LO/HI).
-         * OCERZ_RIPTRAP below prints a fixed, purpose-built field set from an
-         * older investigation; this one is the general form, and reuses
-         * ocerz_cpu_dump so every GPR and its readable target come out. */
+    {
         static uint64_t rtr[8];
         static int nrtr = -1;
         if (nrtr < 0) {
@@ -1547,10 +1501,6 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
             if (rtr[ti] && cpu->rip == rtr[ti]) {
                 fprintf(stderr, "ocerz: REGTRAP rip=%#llx\n", (unsigned long long)cpu->rip);
                 ocerz_cpu_dump(cpu, stderr);
-                /* OCERZ_REGTRAP_DEREF=1: 0x40 bytes behind every register that
-                 * points at readable guest memory.  A heap address is never
-                 * the same twice, so a watch cannot be aimed at it in a later
-                 * run -- the trap has to report the memory itself. */
                 if (getenv("OCERZ_REGTRAP_DEREF")) {
                     static const char *const rn[16] = {
                         "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
@@ -1574,8 +1524,7 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
             }
     }
 
-    {   /* OCERZ_RIPTRAP=addr1[,addr2]: log guest register state whenever
-         * execution reaches these addresses (interp only, diagnostics) */
+    {
         static uint64_t traps[8];
         static int ntraps = -1;
         if (ntraps < 0) {
@@ -1657,7 +1606,6 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
 
     X86Insn insn;
     const uint8_t *code = (const uint8_t *)ocerz_g2h(cpu->rip);
-    /* The one place the interpreter chooses a decode mode. */
     int rc = ocerz_decode_mode(code, 15, cpu->rip, &insn, cpu->mode32);
     if (rc != OCERZ_OK) {
         fprintf(stderr, "ocerz: fatal: decode failed (%d, %s mode) at rip=%#llx\n  bytes: ",
@@ -1678,8 +1626,6 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
             fprintf(stderr, "  guest riphist:");
             for (unsigned i = 0; i < nh; i++) fprintf(stderr, " %#llx", (unsigned long long)h[i]);
             fprintf(stderr, "\n");
-            /* OCERZ_FAULTDUMP=<gpr>: 32 qwords from that register's value
-             * (a table the bad jump was read from) */
             const char *fd = getenv("OCERZ_FAULTDUMP");
             int dreg = fd ? atoi(fd) : -1;
             if (dreg >= 0 && dreg < 16) {
@@ -1696,16 +1642,12 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
             fprintf(stderr, "  signals: usr1 rcvd=%u delivered=%u  usr2 rcvd=%u  in_handler=%u  cpu#%u\n",
                     cpu->sig_host_rcvd[SIGUSR1], cpu->sig_delivered[SIGUSR1], cpu->sig_host_rcvd[SIGUSR2],
                     cpu->in_sighandler, cpu->cpu_number);
-            /* OCERZ_BTRACE: the JIT's per-cpu block-entry ring, most recent first */
             if (cpu->btrace) {
                 uint32_t bn = cpu->btrace_n, m = (1u << 16) - 1;
                 fprintf(stderr, "  BTRACE n=%u:", bn);
                 for (uint32_t k = 1; k <= 96 && k <= bn; k++) fprintf(stderr, " %#llx", (unsigned long long)cpu->btrace[(bn - k) & m]);
                 fprintf(stderr, "\n");
             }
-            /* OCERZ_V8DUMP: V8 Ignition state - the dispatch table pointer
-             * at [r13+0x4c40] (r13 = root register) and its first entries,
-             * plus the bytecode array header at r12 */
             if (getenv("OCERZ_V8DUMP")) {
                 uint64_t r13 = cpu->gpr[13], r12 = cpu->gpr[12];
                 uint64_t tp = ocerz_addr_readable(r13 + 0x4c40) ? ocerz_ld(r13 + 0x4c40, 8) : 0;
@@ -1718,7 +1660,7 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
                 }
                 fprintf(stderr, "\n  V8DUMP bytecode array r12=%#llx:", (unsigned long long)r12);
                 for (int i = -1; i < 8; i++) {
-                    uint64_t a = r12 + (uint64_t)(int64_t)i * 8 - 1;   /* untag */
+                    uint64_t a = r12 + (uint64_t)(int64_t)i * 8 - 1;
                     if (ocerz_addr_readable(a) && ocerz_addr_readable(a + 7)) fprintf(stderr, " %016llx", (unsigned long long)ocerz_ld(a, 8));
                     else fprintf(stderr, " ????????????????");
                 }
@@ -1743,11 +1685,8 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
     cpu->cur_rip = cpu->rip;
     cpu->rip += insn.len;
     if (insn.mode32)
-        cpu->rip = (uint32_t)cpu->rip;   /* EIP wraps at 32 bits */
+        cpu->rip = (uint32_t)cpu->rip;
     rc = ocerz_interp_exec(vm, cpu, &insn);
-    /* EIP wrap again after execution, but keyed on the mode the CPU is in NOW:
-     * a far transfer that just left 32-bit mode has already produced a full
-     * 64-bit rip and must not be truncated. */
     if (cpu->mode32)
         cpu->rip = (uint32_t)cpu->rip;
     return rc;
@@ -1843,8 +1782,6 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
     case OCERZ_OP_CMPXCHGXB:
         return op_atomic(vm, cpu, insnp);
 
-    /* i386-only.  Unreachable from 64-bit execution: the decoder leaves every
-     * one of these opcode bytes undefined in long mode. */
     case OCERZ_OP_PUSHA:
     case OCERZ_OP_POPA:
     case OCERZ_OP_PUSHSEG:
@@ -1897,13 +1834,6 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
             return OCERZ_STEP_OK;
         return trap_fatal(insnp, "guest breakpoint/interrupt");
     case OCERZ_OP_INT:
-        /* Windows uses int $0x29 as __fastfail, which means "die now".
-         * Handing it to the guest as a #GP so wine can raise
-         * STATUS_STACK_BUFFER_OVERRUN was tried and measured worse: the
-         * thread that fast-fails is already deep, dispatching the exception
-         * overflows its stack, and it wedges holding ntdll's loader_section
-         * so the process can never exit.  Dying here is both the documented
-         * intent and the only outcome that terminates. */
         return trap_fatal(insnp, "guest breakpoint/interrupt");
 
     case OCERZ_OP_UD2:
@@ -1942,13 +1872,8 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
         return trap_fatal(insnp, "guest HLT");
 
     case OCERZ_OP_SYSCALL:
-        /* SYSCALL is the one instruction the interpreter reaches that writes a register the 32-bit world */
         if (insnp->mode32)
             return ocerz_unimpl(vm, cpu, insnp, "syscall in 32-bit mode");
-        /* A signal that landed in user-mode code is only a bit in the pending
-         * mask until some syscall returns.  Vector it here, before a blocking
-         * call parks on top of the wakeup; rip rewinds so the syscall runs
-         * again after sigreturn. */
         if (ocerz_signal_before_syscall(cpu, insnp->rip))
             return OCERZ_STEP_OK;
         cpu->gpr[OCERZ_RCX] = cpu->rip;

@@ -1,12 +1,19 @@
-/* thread_suspend / thread_get_state / thread_resume on guest threads, the
- * way JavaScriptCore's garbage collector scans its mutators.  A thread
- * spinning in translated code must really stop (its counter freezes), its
- * x86 registers must come back with rsp inside its own stack, the suspender
- * must be able to run code it never ran before (which needs the JIT) while
- * the target is stopped, and a thread parked in a blocking read must be
- * suspendable too.  Handed to the host kernel, thread_suspend froze Safari's
- * main thread inside the translator with the JIT lock held, and the x86
- * thread_get_state failed outright. */
+/*
+ * thread_suspend / thread_get_state / thread_resume on guest threads, the way
+ * JavaScriptCore's garbage collector scans its mutators.  A thread spinning in
+ * translated code must really stop (its counter freezes), its x86 registers
+ * must come back with rsp inside its own stack, the suspender must be able to
+ * run code it never ran before - which needs the JIT - while the target is
+ * stopped, and a thread parked in a blocking read must be suspendable too.
+ * Handed to the host kernel, thread_suspend froze Safari's main thread inside
+ * the translator with the JIT lock held, and the x86 thread_get_state failed
+ * outright.
+ *
+ * There are deliberately no libc calls inside the suspended region: a thread
+ * suspended inside snprintf can hold the dtoa or malloc lock, and the
+ * suspender's own snprintf then waits for it forever - natively as much as
+ * under ocerz, which is why a real collector never does it either.
+ */
 #include <mach/mach.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -26,10 +33,6 @@ static void note_stack(int i)
     hi[i] = top;
 }
 
-/* No libc calls in here: a thread suspended inside snprintf can hold the
- * dtoa or malloc lock, and the suspender's own snprintf then waits for it
- * forever -- natively as much as under ocerz, which is why a collector never
- * allocates while its mutators are stopped. */
 static void *spin(void *a)
 {
     (void)a;
@@ -71,7 +74,7 @@ int main(void)
         return 1;
     while (!counter || !hi[1])
         usleep(1000);
-    usleep(20000);                          /* let the reader reach its read() */
+    usleep(20000);
     mach_port_t tp = pthread_mach_thread_np(t), rp = pthread_mach_thread_np(r);
 
     for (int i = 0; i < 100; i++) {

@@ -1,9 +1,11 @@
-/* Kernel copyouts into a page that holds executed code.  The JIT write-traps
- * such pages to catch self-modifying code (ocerz_mem_arm_exec); a kernel
- * copy into a read-only page does not fault, it fails (EFAULT, or a mach
- * reply destroyed - wineboot hung on that).  read/readv/pread and a mach
- * receive must land in a buffer next to running code, and the code must
- * still be rewritable afterwards.  Prints OK. */
+/*
+ * Kernel copyouts into a page that holds executed code.  The JIT write-traps
+ * such pages to catch self-modifying code, and a kernel copy into a read-only
+ * page does not fault - it fails with EFAULT, or a mach reply is destroyed
+ * with it, which is what wineboot hung on.  read/readv/pread and a mach
+ * receive must all land in a buffer next to running code, and the code must
+ * still be rewritable afterwards.
+ */
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <stdint.h>
@@ -15,8 +17,8 @@
 
 static void put_code(uint8_t *p, uint32_t imm)
 {
-    p[0] = 0xb8; memcpy(p + 1, &imm, 4);   /* mov eax, imm32 */
-    p[5] = 0xc3;                           /* ret */
+    p[0] = 0xb8; memcpy(p + 1, &imm, 4);
+    p[5] = 0xc3;
 }
 
 int main(void)
@@ -28,21 +30,18 @@ int main(void)
     int (*fn)(void) = (int (*)(void))page;
     int a = fn();
 
-    /* read(2) into the code page */
     int pfd[2]; pipe(pfd);
     write(pfd[1], "PIPEDATA", 8);
     char *buf1 = (char *)page + 0x800;
     memset(buf1, 0, 16);
     ssize_t n1 = read(pfd[0], buf1, 8);
 
-    /* readv(2) */
     write(pfd[1], "ABCDEFGH", 8);
     char *buf2 = (char *)page + 0x900;
     memset(buf2, 0, 16);
     struct iovec iov[2] = { { buf2, 4 }, { buf2 + 4, 4 } };
     ssize_t n2 = readv(pfd[0], iov, 2);
 
-    /* pread(2) from a file */
     char path[64]; snprintf(path, sizeof path, "/tmp/ocerz_smc_io_%d", (int)getpid());
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     write(fd, "xxxxFILEDATA", 12);
@@ -51,7 +50,6 @@ int main(void)
     ssize_t n3 = pread(fd, buf3, 8, 4);
     close(fd); unlink(path);
 
-    /* mach receive into the code page */
     mach_port_t port = MACH_PORT_NULL;
     mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
     mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
@@ -67,7 +65,6 @@ int main(void)
     kern_return_t kr = mach_msg(rcv, MACH_RCV_MSG, 0, 128, port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     int id = kr == KERN_SUCCESS ? (int)rcv->msgh_id : -(int)kr;
 
-    /* the code still runs, and can still be rewritten in place */
     int b = fn();
     put_code(page, 34);
     int c = fn();

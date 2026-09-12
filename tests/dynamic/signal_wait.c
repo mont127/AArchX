@@ -1,7 +1,9 @@
-/* sigsuspend and sigwait: both blocked on a signal the host kernel could
- * never route to the guest and returned ENOSYS.  A worker thread sends
- * SIGUSR1 so sigsuspend must wake in its handler; then a blocked SIGUSR2 is
- * raised and sigwait must hand its number back without any handler running. */
+/*
+ * sigsuspend and sigwait: both blocked on a signal the host kernel could never
+ * route to the guest and returned ENOSYS.  A worker thread sends SIGUSR1 so
+ * sigsuspend must wake in its handler; then a blocked SIGUSR2 is raised and
+ * sigwait must hand its number back without any handler running.
+ */
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>

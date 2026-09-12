@@ -1,6 +1,15 @@
 /* xbench: broad throughput suite for Ocerz-vs-Rosetta comparison.
  * Usage: xbench <kernel> <scale>   -- work is linear in <scale>.
- * Each kernel prints a checksum so both engines can be diffed. */
+ * Each kernel prints a checksum so both engines can be diffed.
+ *
+ * The kernels are: icall (indirect calls through a function-pointer table),
+ * jtab (a dense switch lowered to a jump table with an unpredictable selector),
+ * depchain (a long serial ALU dependency chain), brmiss (data-dependent
+ * unpredictable branches), memcpyk (memcpy of mixed sizes), hash (FNV/xxhash
+ * style mixing), chase (pointer chasing through a shuffled list, cache-latency
+ * bound), qsort (recursive quicksort), leafcall (many small non-recursive calls)
+ * and mixed (a "real program" blend of struct updates, branches and small loops).
+ */
 #include "gsys.h"
 
 static g_u64 parse(const char *p, g_u64 dflt)
@@ -10,7 +19,6 @@ static g_u64 parse(const char *p, g_u64 dflt)
     return any ? v : dflt;
 }
 
-/* ---- 1. icall: indirect calls through a function-pointer table (vtable-like) */
 static g_u64 f0(g_u64 x) { return x + 1; }
 static g_u64 f1(g_u64 x) { return x ^ 0x9e37; }
 static g_u64 f2(g_u64 x) { return x * 3; }
@@ -31,7 +39,6 @@ static g_u64 k_icall(g_u64 n)
     return x;
 }
 
-/* ---- 2. jtab: dense switch -> jump table with unpredictable selector */
 static g_u64 k_jtab(g_u64 n)
 {
     g_u64 x = 0, s = 777;
@@ -51,7 +58,6 @@ static g_u64 k_jtab(g_u64 n)
     return x;
 }
 
-/* ---- 3. depchain: long serial dependency chain (latency-bound ALU) */
 static g_u64 k_depchain(g_u64 n)
 {
     g_u64 x = 0x123456789abcdefULL;
@@ -65,7 +71,6 @@ static g_u64 k_depchain(g_u64 n)
     return x;
 }
 
-/* ---- 4. brmiss: data-dependent unpredictable branches (cmov-hostile) */
 static g_u64 k_brmiss(g_u64 n)
 {
     g_u64 s = 99, a = 0, b = 0, c = 0;
@@ -80,7 +85,6 @@ static g_u64 k_brmiss(g_u64 n)
     return a ^ b ^ c;
 }
 
-/* ---- 5. memcpyk: memcpy of mixed sizes (rep movsb / lowering paths) */
 static unsigned char sbuf[1 << 16], dbuf[1 << 16];
 static g_u64 k_memcpy(g_u64 n)
 {
@@ -96,7 +100,6 @@ static g_u64 k_memcpy(g_u64 n)
     return sum;
 }
 
-/* ---- 6. strk: strlen/strcmp-like byte loops on short strings */
 static g_u64 k_str(g_u64 n)
 {
     static char strs[64][40];
@@ -117,7 +120,6 @@ static g_u64 k_str(g_u64 n)
     return acc;
 }
 
-/* ---- 7. hash: FNV/xxhash-style mixing over a buffer (rotates, muls, loads) */
 static g_u64 k_hash(g_u64 n)
 {
     static g_u64 data[4096];
@@ -135,7 +137,6 @@ static g_u64 k_hash(g_u64 n)
     return h;
 }
 
-/* ---- 8. idiv: integer division/modulo (microcoded, slow on both) */
 static g_u64 k_idiv(g_u64 n)
 {
     g_u64 acc = 0, s = 1;
@@ -147,7 +148,6 @@ static g_u64 k_idiv(g_u64 n)
     return acc;
 }
 
-/* ---- 9. fpsse: scalar double math (SSE2 mulsd/addsd/divsd/sqrtsd) */
 static g_u64 k_fpsse(g_u64 n)
 {
     double x = 1.0, y = 0.5, acc = 0.0;
@@ -162,7 +162,6 @@ static g_u64 k_fpsse(g_u64 n)
     return u.u >> 8;
 }
 
-/* ---- 10. fpvec: vectorizable float loop (packed SSE / auto-vec) */
 static g_u64 k_fpvec(g_u64 n)
 {
     static float a[8192], b[8192], c[8192];
@@ -176,13 +175,12 @@ static g_u64 k_fpvec(g_u64 n)
     return u.u >> 4;
 }
 
-/* ---- 11. chase: pointer chasing through a shuffled linked list (cache-latency) */
 static g_u64 k_chase(g_u64 n)
 {
     static g_u64 next[1 << 16];
     g_u64 N = 1 << 16, s = 42;
     for (g_u64 i = 0; i < N; i++) next[i] = i;
-    for (g_u64 i = N - 1; i > 0; i--) {   /* Fisher-Yates */
+    for (g_u64 i = N - 1; i > 0; i--) {
         s = s * 6364136223846793005ULL + 1442695040888963407ULL;
         g_u64 j = (s >> 33) % (i + 1);
         g_u64 t = next[i]; next[i] = next[j]; next[j] = t;
@@ -192,7 +190,6 @@ static g_u64 k_chase(g_u64 n)
     return acc;
 }
 
-/* ---- 12. qsort: recursive quicksort of an int array (calls + branches + memory) */
 static void qs(int *a, int lo, int hi)
 {
     while (lo < hi) {
@@ -217,7 +214,6 @@ static g_u64 k_qsort(g_u64 n)
     return acc;
 }
 
-/* ---- 13. leafcall: many small non-recursive calls (call/ret + prologue) */
 __attribute__((noinline)) static g_u64 leaf(g_u64 a, g_u64 b) { return (a * 3) ^ (b >> 2); }
 __attribute__((noinline)) static g_u64 leaf2(g_u64 a) { return leaf(a, a + 1) + leaf(a ^ 5, a); }
 static g_u64 k_leafcall(g_u64 n)
@@ -227,7 +223,6 @@ static g_u64 k_leafcall(g_u64 n)
     return acc;
 }
 
-/* ---- 14. mixed: a "real program" style mix: struct updates, branches, small loops */
 struct particle { double x, y, vx, vy; g_u64 id; };
 static g_u64 k_mixed(g_u64 n)
 {
@@ -246,7 +241,6 @@ static g_u64 k_mixed(g_u64 n)
     return acc;
 }
 
-/* ---- 15. bigswitch: interpreter-style dispatch loop (bytecode VM) */
 static g_u64 k_vm(g_u64 n)
 {
     static unsigned char code[256];

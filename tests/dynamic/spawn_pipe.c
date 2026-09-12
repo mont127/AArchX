@@ -1,7 +1,9 @@
-/* posix_spawn with file actions and attributes, the way NSTask launches a
+/*
+ * posix_spawn with file actions and attributes, the way NSTask launches a
  * helper: the child's stdout is dup2'd onto a pipe, the read end closed, and
- * POSIX_SPAWN_CLOEXEC_DEFAULT drops everything else. If the actions are
- * lost, echo writes straight to our stdout and the pipe reads back empty. */
+ * POSIX_SPAWN_CLOEXEC_DEFAULT drops everything else.  If the actions are lost,
+ * echo writes straight to our stdout and the pipe reads back empty.
+ */
 #include <spawn.h>
 #include <stdio.h>
 #include <string.h>

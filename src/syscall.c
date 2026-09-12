@@ -1,4 +1,145 @@
-/* The guest-to-host syscall boundary: emulated x86_64 syscalls onto the arm64 kernel. */
+/*
+ * The guest-to-host syscall boundary: emulated x86_64 syscalls onto the arm64
+ * kernel.
+ *
+ * ---- the return ABI is Rosetta's, not the kernel's ----
+ * XNU returns every unix syscall through rax AND rdx (the second result slot,
+ * zero unless the call fills it), on success and on error alike, and Rosetta
+ * reproduces that - so a caller whose wrapper forgot to declare rdx clobbered
+ * sees rdx = 0 there, and leaving rdx alone was silently kinder.  Rosetta also
+ * returns from a trap with a fixed arithmetic-flag pattern whatever the caller
+ * had (probed 2026-09-03): unix success PF|AF, unix error CF|ZF|PF, mach traps
+ * AF.  Only CF is architecturally meaningful - the libSystem stubs branch on it
+ * - but the rest is matched so a program that reads them sees what it sees on
+ * Rosetta.  Machdep (class 3) calls are the exception: they return through rax
+ * alone, leaving rdx and the flags untouched, because Wine's syscall dispatcher
+ * keeps its frame pointer in rdx across thread_set_tsd_base and applying the
+ * unix rule there cost every Wine process a NULL dereference at its first
+ * return to PE code (2026-09-04).
+ *
+ * ---- 4 KB guest pages on a 16 KB host ----
+ * A MAP_PRIVATE file mapping used to be read into anonymous memory in full,
+ * because the host cannot map a file at every 4 KB guest offset.  When the file
+ * offset and the guest address agree modulo 16 KB - which they do for nearly
+ * everything Wine maps: PE images at 64 KB-aligned bases, fonts, resources -
+ * the aligned interior becomes a real private mapping of the file and its pages
+ * sit in the shared page cache instead of being copied per process.  A GUI Wine
+ * process carried 280 MB of such copies, and one winemine run read 5 GB of
+ * Songti.ttc while enumerating fonts.  Partial head and tail pages, and
+ * anything past EOF, are still read in.
+ *
+ * A read-only shared mapping that is not 16 KB-aligned used to become a private
+ * snapshot up front.  Steam's UI stream is exactly that - steam.exe opens the
+ * SteamChrome ring buffer read-only and the browser writes it - so a snapshot
+ * never showed the writes, Steam re-created the stream forever, and no window
+ * came up (2026-09-06).  The real shared overlay is tried first and the private
+ * copy is only the fallback.  Writable shared mappings are communication
+ * channels, so guest memory backing them is kept TSO-ordered.
+ *
+ * mach_vm_map(FIXED|OVERWRITE) is 4 KB-granular for the guest and 16 KB-granular
+ * for the kernel, which replaces whole host pages and takes the guest bytes on
+ * either side with it - memory the request never named.  mmap() goes through
+ * mem.c, which owns the slot machinery, but this path hands the message straight
+ * to the kernel and so copies the fragments out and back itself.  Safari asked
+ * for 0x4000 at a ...e000 address inside the shared cache and lost the 8 KB
+ * below it, which held a constant Engram checks with a Swift precondition: it
+ * trapped one framework away from the cause.  A mach_vm_map(ANYWHERE) under the
+ * low-base shadow is likewise placed by hand at a guest-visible identity
+ * address, because relocating the kernel's answer afterwards leaves dangling
+ * host pointers wherever the kernel recorded the original (IOSurface's
+ * bulk-attachment page, read back by CoreAnimation).  A mach reply must never
+ * land in the shared cache either: moving it would deallocate a range every
+ * image is linked against, and Safari died one mach_msg later when the next
+ * _platform_* access faulted.
+ *
+ * ---- sysctl ----
+ * An x86_64 process must see 4 KB pages, as it does under Rosetta, and the
+ * override has to mirror the real node's width rather than assume 4: reached by
+ * name "hw.pagesize" is a 64-bit node while the legacy {CTL_HW, HW_PAGESIZE}
+ * mib is the 32-bit one, and writing 4 bytes into the 8 the caller offered left
+ * the top half of its variable dirty - sysconf(_SC_PHYS_PAGES) divides
+ * hw.memsize by exactly that variable, so it returned 0 whenever the stack
+ * happened to be non-zero and sort(1) died on "sysconf pages".  The arm64
+ * kernel has no machdep.cpu nodes at all, so passed through they all failed
+ * with ENOENT and code that asks hw.optional.sse4_1 before taking a fast path
+ * took none; the x86 CPU description is synthesized to agree with ocerz's own
+ * CPUID (SSE through SSE4.2, CX16, POPCNT; no AES, PCLMULQDQ or AVX) and pinned
+ * by the dynamic test x86_sysctl.
+ *
+ * ---- threads ----
+ * The host workqueue bridge is on unless OCERZ_NO_HOSTWQ says otherwise.  It
+ * used to be opt-in, which meant every Cocoa application deadlocked out of the
+ * box: AppKit and libdispatch hand work to workqueue threads and then wait for
+ * it, so with nothing servicing those queues the first dispatch_sync parked the
+ * main thread in __ulock_wait forever, and Calculator, TextEdit and Safari all
+ * registered as foreground apps without ever reaching the WindowServer.
+ *
+ * A new thread's cpu is a copy of its creator's taken inside the creator's
+ * syscall, so nothing about the creator's own wait or suspension may come along
+ * - a creator suspended by the GC at that moment would hand the child
+ * suspend_count 1 and the child would park at its first safe point with nobody
+ * left to resume it.  The signal mask, by contrast, is inherited as POSIX
+ * requires.  bsdthread_create blocks until the kernel port is in the pthread
+ * struct, matching the kernel: without that a pthread_join right after
+ * pthread_create can read an empty port slot, conclude the thread exited, and
+ * free the stack of a live thread.
+ *
+ * ---- signals ----
+ * The two sigaction directions do NOT share a layout: the kernel takes a
+ * `struct __sigaction` (24 bytes, sa_tramp at 8) and hands back a `struct
+ * sigaction` (16 bytes, no trampoline).  Writing the inbound layout to oldact
+ * overran the caller's buffer by 8 bytes; in sort(1) those bytes were a saved
+ * rbx, so its `outfile` pointer came back NULL from the epilogue.
+ *
+ * Asynchronous signals obey the guest mask; synchronous faults never come
+ * through here and are never gated.  Enforcing that is what keeps Wine's server
+ * protocol in one piece: Wine blocks server_block_set around a wineserver
+ * request/reply pair so a suspend kick lands only between calls, and delivering
+ * one mid-pair nests a second round trip inside the first on the same strictly
+ * ordered fd pair, desynchronising the stream until every client parks in
+ * read() forever.  Pending signals are also offered on the ENTRY edge of a
+ * syscall, with rip rewound so the call re-executes afterwards: the host
+ * handler only sets a bit and the return-edge drain would otherwise leave a
+ * signal unnoticed until some later syscall returned - and if the next one
+ * blocks, it parks with the wakeup still undelivered.  sigsuspend and __sigwait
+ * are emulated against that pending mask (they waited for a signal the host
+ * kernel could never deliver, so libc returned ENOSYS) and are pinned by the
+ * dynamic test signal_wait.
+ *
+ * A self-directed pthread_kill - the guest's abort()/raise(), and every
+ * Chromium CHECK - is delivered to the GUEST rather than forwarded to the host.
+ * Forwarding raises a real signal on the ocerz process, so a guest abort became
+ * a host SIGABRT, ReportCrash spawned and pegged a core, and under Steam's
+ * GPU-process crash loop that starved the emulation past Steam's own watchdogs.
+ * Wine has a handler for these anyway, which is both the faithful emulation and
+ * free of ReportCrash.
+ *
+ * ---- pointers the kernel will write through ----
+ * Before a syscall whose buffer the kernel writes (a read, a mach receive), any
+ * page of that buffer carrying translations is unarmed: a copyout onto a
+ * read-only page fails instead of faulting, and for a mach receive the reply is
+ * destroyed with it - wineboot hung forever on exactly that (2026-09-07).  An
+ * EFAULT with armed pages about is retried once after unarming them.  Syscalls
+ * whose argument structs hide pointers the ptr_mask cannot reach (connectx,
+ * sendfile, recvmsg_x) are correct only when a guest address is already a host
+ * address, so outside identity mode they return ENOSYS rather than let the
+ * kernel read or write the wrong memory.
+ *
+ * ---- failure policy ----
+ * An unimplemented call reports once and returns ENOSYS rather than aborting:
+ * aborting kills the guest thread where it stands, and under Wine that is often
+ * inside LdrLoadDll holding the loader lock, which deadlocks every other
+ * thread.  OCERZ_STRICT_SYSCALL restores the abort for bring-up.  A contended
+ * os_unfair_lock whose owner died is broken the way PTHREAD_MUTEX_ROBUST does,
+ * because libplatform's reaction to EOWNERDEAD is to crash the process.
+ *
+ * ---- diagnostics ----
+ * OCERZ_SYSFAIL logs the failures a healthy guest almost never earns (ENOMEM
+ * and EFAULT are what a missing pointer translation looks like from inside),
+ * and the OCERZ_*LOG family - STRACE_CPU, FDOPLOG, FDLOG, MSGLOG, SOCKLOG,
+ * PIPELOG, ULOCKLOG, PREADLOG, EXITLOG, MAPFAILLOG - each exist because one
+ * real failure needed exactly that view.
+ */
 #include "ocerz/syscall.h"
 #include "ocerz/cache.h"
 #include "ocerz/vm.h"
@@ -46,18 +187,8 @@
 #define OCERZ_F_PREALLOCATE 42
 #define OCERZ_F_GETPATH 50
 
-/* fcntl commands whose third argument is a guest pointer */
 static void peekguard(OcerzCPU *cpu, int class, int num, const char *when);
 
-/* The host workqueue bridge is on unless OCERZ_NO_HOSTWQ says otherwise.
- * It used to be opt-in, which meant every Cocoa application deadlocked out
- * of the box: AppKit and libdispatch hand work to workqueue threads and then
- * wait for it, so with nothing servicing those queues the first dispatch_sync
- * to another queue parked the main thread in __ulock_wait(UL_COMPARE_AND_WAIT)
- * on a stack address forever.  Calculator, TextEdit and Safari all registered
- * with LaunchServices as foreground apps and then sat there without ever
- * connecting to the WindowServer.  OCERZ_HOSTWQ is still accepted and still
- * means "on", so existing scripts and the README keep working. */
 static int ocerz_hostwq_on(void)
 {
     static int on = -1;
@@ -69,16 +200,16 @@ static int ocerz_hostwq_on(void)
 static int ocerz_fcntl_ptr_cmd(int cmd)
 {
     switch (cmd) {
-    case 7: case 8: case 9:            /* F_GETLK, F_SETLK, F_SETLKW */
-    case 66:                           /* F_GETLKPID */
-    case 90: case 91: case 92:         /* F_OFD_SETLK, F_OFD_SETLKW, F_OFD_GETLK */
+    case 7: case 8: case 9:
+    case 66:
+    case 90: case 91: case 92:
     case OCERZ_F_PREALLOCATE:
-    case 44:                           /* F_RDADVISE */
-    case 49: case 65:                  /* F_LOG2PHYS, F_LOG2PHYS_EXT */
+    case 44:
+    case 49: case 65:
     case OCERZ_F_GETPATH:
-    case 102:                          /* F_GETPATH_NOFIRMLINK */
-    case 52:                           /* F_PATHPKG_CHECK */
-    case 99:                           /* F_PUNCHHOLE */
+    case 102:
+    case 52:
+    case 99:
         return 1;
     default:
         return 0;
@@ -150,15 +281,6 @@ static const char *errno_name(int e)
     }
 }
 
-/* XNU returns every unix syscall through rax AND rdx (the second result
- * slot, zero unless the call fills it) - on success and on error alike.
- * Rosetta reproduces that, so a caller whose wrapper forgot to declare rdx
- * clobbered sees rdx = 0 there; leaving rdx alone was silently kinder. */
-/* Rosetta returns from a trap with a fixed arithmetic-flag pattern, whatever
- * the caller had (probed 2026-09-03): unix success PF|AF, unix error
- * CF|ZF|PF, mach traps AF.  Only CF is architecturally meaningful (the
- * libSystem stubs branch on it); the rest is matched so a program that
- * reads the others sees what it sees on Rosetta. */
 #define SYSRET_FLAGS_OK   (OCERZ_PF | OCERZ_AF)
 #define SYSRET_FLAGS_ERR  (OCERZ_CF | OCERZ_ZF | OCERZ_PF)
 #define SYSRET_FLAGS_MACH (OCERZ_AF)
@@ -186,7 +308,7 @@ static void ret_err(OcerzCPU *cpu, uint64_t errno_v)
 {
     sysret_flags(cpu, SYSRET_FLAGS_ERR);
     cpu->gpr[OCERZ_RAX] = errno_v;
-    cpu->gpr[OCERZ_RDX] = 0;            /* Rosetta zeroes rdx on errors too (probed 2026-09-04) */
+    cpu->gpr[OCERZ_RDX] = 0;
 }
 
 static void mach_ret(OcerzCPU *cpu, uint64_t kr)
@@ -195,14 +317,9 @@ static void mach_ret(OcerzCPU *cpu, uint64_t kr)
     cpu->gpr[OCERZ_RAX] = kr;
 }
 
-/* Machdep (class 3) syscalls return through rax alone: XNU's machdep path
- * leaves rdx and the arithmetic flags as they were, and Wine's syscall
- * dispatcher keeps its frame pointer in rdx across thread_set_tsd_base.
- * Zeroing rdx there (the unix-class rule) cost every Wine process a NULL
- * dereference at the first return to PE code (2026-09-04). */
 static void machdep_ret(OcerzCPU *cpu, uint64_t v)
 {
-    sysret_flags(cpu, SYSRET_FLAGS_MACH);      /* AF, like a mach trap (probed 2026-09-04) */
+    sysret_flags(cpu, SYSRET_FLAGS_MACH);
     cpu->gpr[OCERZ_RAX] = v;
 }
 static void machdep_err(OcerzCPU *cpu, uint64_t errno_v)
@@ -235,8 +352,6 @@ static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         {
             const char *eh = getenv("OCERZ_EXITHIST");
             if (eh && ((uint32_t)a[0] != 0 || !strcmp(eh, "all"))) {
-            /* nonzero exit: recent block rips + a return-address scan of the
-             * stack (rbp chains are often broken at exit()) */
             uint64_t rh[32]; unsigned rn = ocerz_vm_riphist(rh, 32);
             fprintf(stderr, "ocerz: EXITHIST[%d] riphist:", (int)getpid());
             for (unsigned i = 0; i < rn; i++) fprintf(stderr, " %#llx", (unsigned long long)rh[i]);
@@ -258,7 +373,6 @@ static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
     }
     ocerz_vm_request_exit(vm, (int)(uint32_t)a[0] & 0xff);
-    /* exit() is process-wide on Darwin. */
     if (!pthread_main_np()) {
         fflush(stderr);
         _exit((int)(uint32_t)a[0] & 0xff);
@@ -322,14 +436,12 @@ static int wine_kuser_shared_page(uint64_t addr, uint64_t len, int prot,
            !(prot & PROT_WRITE);
 }
 
-/* read-only MAP_SHARED ranges (plain memory model kept): an mprotect that
- * makes one writable must retire the plain model */
 static struct { uint64_t lo, hi; } g_shared_ro[64];
 static int g_n_shared_ro;
 static void shared_ro_record(uint64_t gaddr, uint64_t len)
 {
     if (g_n_shared_ro < 64) { g_shared_ro[g_n_shared_ro].lo = gaddr; g_shared_ro[g_n_shared_ro].hi = gaddr + len; g_n_shared_ro++; }
-    else g_shared_ro[0].lo = 0, g_shared_ro[0].hi = ~0ull;      /* table full: treat everything as shared */
+    else g_shared_ro[0].lo = 0, g_shared_ro[0].hi = ~0ull;
 }
 static int shared_ro_overlaps(uint64_t gaddr, uint64_t len)
 {
@@ -338,11 +450,6 @@ static int shared_ro_overlaps(uint64_t gaddr, uint64_t len)
     return 0;
 }
 
-/* Read [lo, hi) of the guest range from the file; a short read (EOF) leaves
- * the rest of the anonymous page zero, which is what a mapping past the end
- * of a file reads as. */
-/* OCERZ_MAPFAILLOG: every mmap the guest sees fail, with what it asked for.
- * Chromium's allocator treats a refused 4 KB commit as out-of-memory. */
 static void pe_scan_print(OcerzCPU *cpu, const char *tag, const char *detail);
 static void pagetrap_init(void);
 static uint64_t g_pagetrap_lo = ~0ull, g_pagetrap_hi;
@@ -370,19 +477,6 @@ static int pread_range(int fd, uint64_t gaddr, uint64_t lo, uint64_t hi, uint64_
     return 0;
 }
 
-/* A MAP_PRIVATE file mapping used to be read into anonymous memory in full:
- * guest pages are 4 KB and host pages 16 KB, so the host cannot map the file
- * at every guest offset.  When the file offset and the guest address agree
- * modulo 16 KB, which they do for nearly everything wine maps (PE images at
- * 64 KB-aligned bases, fonts, resource files), the 16 KB-aligned interior can
- * be a real private mapping of the file: its pages then sit in the shared
- * page cache instead of being copied into each process.  A GUI Wine process
- * carried 280 MB of such copies, and wine maps every system font this way
- * while enumerating fonts (5 GB of Songti.ttc in one winemine run).  The
- * partial head and tail pages, and any range beyond the file, are still read
- * in.  The memory layer does not track host backing, so nothing else
- * changes: mprotect works on file pages, a partial unmap keeps the page, and
- * a replacement mapping remaps the page anonymous. */
 static int private_file_backing(uint64_t gaddr, uint64_t len, int fd, uint64_t pos)
 {
     static int off = -1;
@@ -392,7 +486,6 @@ static int private_file_backing(uint64_t gaddr, uint64_t len, int fd, uint64_t p
     struct stat st;
     if (!off && ((pos - gaddr) & 0x3fffull) == 0 && ihi > ilo &&
         fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && (uint64_t)st.st_size > pos) {
-        /* pages wholly past EOF would SIGBUS; the page holding EOF reads zero past it */
         uint64_t file_hi = gaddr + ((uint64_t)st.st_size - pos);
         uint64_t mhi = (file_hi + 0x3fffull) & ~0x3fffull;
         if (mhi > ihi) mhi = ihi;
@@ -425,7 +518,6 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int fixed = (flags & MAP_FIXED) != 0;
     uint64_t gaddr;
 
-    /* A writable shared mapping is a communication channel: guest memory must be TSO-ordered from */
     if ((flags & MAP_SHARED) && (prot & PROT_WRITE))
         ocerz_jit_require_ordered(vm);
 
@@ -511,19 +603,8 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
 
     if (flags & MAP_SHARED) {
-        /* A read-only guest subpage may later gain a private 4K sibling. */
         int padded_kuser = wine_kuser_shared_page(gaddr, len, prot,
                                                   flags, pos);
-        /* A read-only shared mapping that is not 16 KB-aligned used to be
-         * turned into a private snapshot up front.  Steam's UI stream is
-         * exactly that: steam.exe opens the SteamChrome ring buffer read-only,
-         * the browser writes it, and a snapshot never shows the writes, so
-         * Steam re-created the stream forever and no window came up
-         * (2026-09-06).  Try the real shared overlay first: it maps the whole
-         * host page from the file when the sibling slots are free, which
-         * Wine's 64 KB view granularity guarantees, and it refuses any later
-         * mapping into those siblings.  The private copy stays as the
-         * fallback when the overlay cannot be placed. */
         int src = padded_kuser
                 ? ocerz_map_shared_file_padded(gaddr, len, prot, fd, pos)
                 : ocerz_map_shared_file(gaddr, len, prot, fd, pos);
@@ -544,7 +625,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
         if (src == OCERZ_OK) {
             if (!(prot & PROT_WRITE)) shared_ro_record(gaddr, len);
-            if (padded_kuser) ocerz_jit_require_ordered(vm);   /* written by wineserver: readers need TSO */
+            if (padded_kuser) ocerz_jit_require_ordered(vm);
             ret_ok(cpu, gaddr);
             return OCERZ_STEP_OK;
         }
@@ -556,7 +637,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
         if (prot & PROT_WRITE) {
             ocerz_unmap(gaddr, len);
-            mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);   /* writable shared mapping refused (src=%d) */
+            mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
             ret_err(cpu, src == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V);
             return OCERZ_STEP_OK;
         }
@@ -590,9 +671,6 @@ static int sys_munmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 static int sys_mprotect(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     memtrace("mprotect", a[0], a[1], (int)a[2], 0);
-    /* mprotect on a shared-cache page (1:1 mapped, outside the guest arena):
-     * some engines make a libsystem page writable to patch it in place.  The
-     * arena logic would ENOMEM it, so let cache.c grant it on the host. */
     if (ocerz_cache_region((uintptr_t)a[0])) {
         int e = ocerz_cache_protect((uintptr_t)a[0], a[1], (int)a[2]);
         if (e) {
@@ -651,9 +729,6 @@ static int sys_bsdthread_register(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     uint64_t feat = 0x4000005f;
     if (ocerz_hostwq_on())
         feat |= 0x80ull;
-    /* Diagnostic: hide PTHREAD_FEATURE_KEVENT (0x40) and _WORKLOOP (0x80)
-     * so guest libdispatch falls back to the classic workq + manager-thread
-     * model instead of kqworkloop kernel-ownership handoffs. */
     if (getenv("OCERZ_NO_KEVWQ"))
         feat &= ~0xc0ull;
     ret_ok(cpu, feat);
@@ -676,17 +751,15 @@ struct ocerz_sysctl_ovr {
     int mib[8];
     size_t miblen;
     int resolved;
-    uint8_t width;   /* bytes the real node returns; 0 = not probed, use 4 */
+    uint8_t width;
 };
 
-/* width is probed from the real node by ocerz_sysctl_ovr_resolve(). */
 static struct ocerz_sysctl_ovr g_sysctl_ovr[] = {
     { "hw.machine",             1, "x86_64", 0,           {0}, 0, 0, 0 },
     { "hw.cputype",             0, NULL,     7,           {0}, 0, 0, 0 },
     { "hw.cpusubtype",          0, NULL,     4,           {0}, 0, 0, 0 },
     { "hw.cpufamily",           0, NULL,     0x573B5EECu, {0}, 0, 0, 0 },
     { "sysctl.proc_translated", 0, NULL,     1,           {0}, 0, 0, 0 },
-    /* x86_64 processes must see 4K pages (Rosetta reports 4096 for all of */
     { "hw.pagesize",            0, NULL,     4096,        {0}, 0, 0, 0 },
     { "hw.pagesize32",          0, NULL,     4096,        {0}, 0, 0, 0 },
     { "vm.pagesize",            0, NULL,     4096,        {0}, 0, 0, 0 },
@@ -706,13 +779,6 @@ static void ocerz_sysctl_ovr_resolve(void)
         g_sysctl_ovr[i].resolved = 1;
         if (g_sysctl_ovr[i].is_str)
             continue;
-        /* Mirror the real node's width, do not assume 4.  "hw.pagesize"
-         * reached by name is a 64-bit node -- the legacy {CTL_HW,
-         * HW_PAGESIZE} mib is the 32-bit one -- so writing 4 bytes into the
-         * 8 the caller offered left the top half of its variable dirty.
-         * sysconf(_SC_PHYS_PAGES) divides hw.memsize by exactly that
-         * variable, so it returned 0 whenever the stack happened to be
-         * non-zero there, and sort(1) died on "sysconf pages". */
         uint64_t probe = 0;
         size_t plen = sizeof probe;
         if (sysctl(g_sysctl_ovr[i].mib, (unsigned)g_sysctl_ovr[i].miblen,
@@ -746,14 +812,6 @@ static int ocerz_sysctl_ovr_emit(OcerzCPU *cpu, const struct ocerz_sysctl_ovr *o
     return OCERZ_STEP_OK;
 }
 
-/* The x86 CPU description an x86_64 process gets under Rosetta, made to
- * agree with ocerz's own CPUID: leaf 1 ecx 0x00982201 / edx 0x078bfbff
- * (SSE through SSE4.2, CX16, POPCNT -- no AES, PCLMULQDQ or AVX) and
- * 0x80000001 ecx 1 / edx 0x28100800.  The arm64 kernel has none of these
- * nodes, so passed through, every one failed with ENOENT, and code that asks
- * hw.optional.sse4_1 before taking a fast path took none.  Reachable by name
- * and, for sysctlnametomib() + sysctl(), through a private top-level mib.
- * Pinned by the dynamic test x86_sysctl. */
 #define X86_SYSCTL_MIB 0x4f43
 static const struct { const char *name; uint8_t width; uint64_t val; const char *sval; } g_x86_sysctl[] = {
     { "hw.optional.mmx",              4, 1, NULL }, { "hw.optional.sse",               4, 1, NULL },
@@ -819,7 +877,6 @@ static int sys_sysctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     uint64_t nlen = a[1];
     static int sclog2 = -1;
     if (sclog2 < 0) sclog2 = getenv("OCERZ_SYSCTLLOG") ? 1 : 0;
-    /* {0, 3} is name-to-oid (sysctlnametomib): the name arrives as newp */
     if (nlen == 2 && a[4] && a[5] && a[5] < 160 &&
         ocerz_ld(a[0], 4) == 0 && ocerz_ld(a[0] + 4, 4) == 3) {
         char nm[160];
@@ -861,12 +918,7 @@ static int sys_sysctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             if (memcmp(mib, o->mib, (size_t)nlen * sizeof(int)) == 0)
                 return ocerz_sysctl_ovr_emit(cpu, o, a[2], a[3]);
         }
-        /* legacy numeric mibs bypass sysctlnametomib: getpagesize() and
-         * sysconf(_SC_PAGESIZE) use {CTL_HW, HW_PAGESIZE} directly, which
-         * must report 4K to an x86_64 process (Rosetta does). */
-        if (nlen == 2 && mib[0] == 6 /* CTL_HW */ && mib[1] == 7 /* HW_PAGESIZE */) {
-            /* width 4: the legacy numeric node really is the 32-bit one,
-             * unlike "hw.pagesize" reached by name.  See ovr_resolve. */
+        if (nlen == 2 && mib[0] == 6 && mib[1] == 7 ) {
             static const struct ocerz_sysctl_ovr pgo =
                 { "hw.pagesize(legacy)", 0, NULL, 4096, {0}, 2, 1, 4 };
             return ocerz_sysctl_ovr_emit(cpu, &pgo, a[2], a[3]);
@@ -999,11 +1051,6 @@ struct ocerz_worker_pub {
     int published;
 };
 
-/* A new thread's cpu starts as a copy of its creator's, taken inside the
- * creator's syscall: nothing about the creator's own wait or suspension may
- * come along.  A creator being suspended by the GC at that moment would
- * otherwise hand the child suspend_count 1, and the child would park at its
- * first safe point with nobody left to resume it. */
 static void cpu_fresh_thread_state(OcerzCPU *c)
 {
     c->suspend_count = 0;
@@ -1093,11 +1140,6 @@ static void *ocerz_worker_entry(void *p)
     mach_port_t kp = mach_thread_self();
     w->cpu.gpr[OCERZ_RSI] = kp;
     ocerz_st(w->cpu.gpr[OCERZ_RDI] + 0xf8, 4, (uint64_t)(uint32_t)kp);
-    /* The creator is blocked in sys_bsdthread_create until the kernel port is
-     * in the pthread struct, matching the kernel, where bsdthread_create
-     * writes it before returning. Without this a pthread_join right after
-     * pthread_create can read an empty port slot, conclude the thread already
-     * exited, and free the stack of a live thread. */
     if (w->pub) {
         struct ocerz_worker_pub *pub = w->pub;
         w->pub = NULL;
@@ -1116,11 +1158,6 @@ static void *ocerz_worker_entry(void *p)
         fprintf(stderr, "ocerz: THREADDONE[%d] cpu#%u rip=%#llx rc=%d\n",
                 (int)getpid(), w->cpu.cpu_number, (unsigned long long)w->cpu.rip, wrc);
     if (wrc == 125) {
-        /* Same reasoning as the mode32 arm in ocerz_vm_run_cpu: a guest thread
-         * that dies mid-flight leaves whatever joins or waits on it stuck
-         * forever, and under wine that parks the whole tree until something
-         * kills it. Die as a process so the failure is visible and the parent
-         * can move on. */
         fprintf(stderr, "ocerz: fatal on guest thread cpu#%u; exiting process\n",
                 w->cpu.cpu_number);
         exit(125);
@@ -1278,16 +1315,8 @@ static int env_inject_lowbase(char **henv, int m, int cap)
     return m;
 }
 
-/* posix_spawn(2)'s third argument is libsystem_kernel's packed form of the
- * attributes and file actions: {size, pointer} pairs, attr first, file
- * actions second. Both structs hold only ints and chars, so an x86-64 guest
- * lays them out exactly as the host does -- {alloc, count} then 1040-byte
- * actions of {type, fd, args}; attr flags/sigdefault/sigmask/pgroup at
- * +0/+4/+8/+12. NSTask wires a child's stdin/stdout to its pipes with these,
- * so dropping them hands the child the parent's descriptors instead. */
 #define PSFA_STRIDE 1040
 enum { PSFA_OPEN, PSFA_CLOSE, PSFA_DUP2, PSFA_INHERIT, PSFA_FILEPORT_DUP2, PSFA_CHDIR, PSFA_FCHDIR };
-/* RESETIDS SETPGROUP SETSIGDEF SETSIGMASK SETEXEC START_SUSPENDED SETSID CLOEXEC_DEFAULT */
 #define SPAWN_FLAGS_PUBLIC 0x44cf
 
 static const char *spawn_guest_path(uint64_t g)
@@ -1307,7 +1336,6 @@ static int spawn_guest_args(uint64_t adesc, posix_spawnattr_t *at, int *have_at,
     if (attrp && attr_size >= 16) {
         sigset_t def = (sigset_t)ocerz_ld(attrp + 4, 4);
         sigset_t mask = (sigset_t)ocerz_ld(attrp + 8, 4);
-        /* the child is ocerz, which still has to take its own fault and kick signals */
         static const int keep[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE, SIGUSR1, SIGEMT };
         for (size_t i = 0; i < sizeof keep / sizeof keep[0]; i++)
             sigdelset(&mask, keep[i]);
@@ -1346,7 +1374,6 @@ static int spawn_guest_args(uint64_t adesc, posix_spawnattr_t *at, int *have_at,
             rc = posix_spawn_file_actions_addinherit_np(fa, fd);
             break;
         case PSFA_FILEPORT_DUP2: {
-            /* private libsystem_kernel entry; guest port names are host port names */
             static int (*add_fileport)(posix_spawn_file_actions_t *, mach_port_t, int);
             if (!add_fileport)
                 add_fileport = (int (*)(posix_spawn_file_actions_t *, mach_port_t, int))
@@ -1356,7 +1383,6 @@ static int spawn_guest_args(uint64_t adesc, posix_spawnattr_t *at, int *have_at,
         }
         case PSFA_CHDIR:
         case PSFA_FCHDIR: {
-            /* the _np names are deprecated in the macOS 26 SDK; their replacements do not exist before it */
             static int (*add_chdir)(posix_spawn_file_actions_t *, const char *);
             static int (*add_fchdir)(posix_spawn_file_actions_t *, int);
             if (!add_chdir) {
@@ -1642,7 +1668,6 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             return OCERZ_STEP_OK;
         }
         int running = __atomic_load_n(&g_wq_running, __ATOMIC_SEQ_CST);
-        /* workq addthreads semantics are ADDITIVE: the caller asks for reqcount MORE threads on top of */
         int want = reqcount;
         if (want > 8)
             want = 8;
@@ -1678,9 +1703,6 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             t.gs_base = pth + 0xe0;
             t.sig_altstack_sp = 0;
             t.sig_altstack_size = 0;
-            /* workqueue threads are made by the kernel, not forked off the
-             * requester, so they start with an empty mask rather than inheriting
-             * one. */
             t.sig_mask = 0;
             t.sig_pending = 0;
             t.sig_on_stack = 0;
@@ -1785,9 +1807,6 @@ static int ocerz_spawn_workloop_worker(OcerzVM *vm, const OcerzCPU *cpu,
     t.wq_workloop_id = workloop_id;
     t.sig_altstack_sp = 0;
     t.sig_altstack_size = 0;
-    /* workqueue threads are made by the kernel, not forked off the
-     * requester, so they start with an empty mask rather than inheriting
-     * one. */
     t.sig_mask = 0;
     t.sig_pending = 0;
     t.sig_on_stack = 0;
@@ -2095,17 +2114,6 @@ struct ocerz_ool_save { uint64_t off; uint64_t orig; };
 
 static int g_sendxlate_off = -1;
 
-
-/* A guest mach_vm_map(FIXED|OVERWRITE) is 4 KB-granular, the host kernel is
- * 16 KB-granular.  When the request does not start and end on a host page,
- * the kernel replaces the whole enclosing host pages and takes the guest
- * bytes on either side with it -- guest memory the request never named.
- * mmap() goes through mem.c, which owns the 4 KB-in-16 KB slot machinery;
- * this path hands the message straight to the kernel, so it has to preserve
- * the fragments itself: copy them out before the call and put them back
- * after.  Safari asked for 0x4000 at a ...e000 address inside the shared
- * cache and lost the 8 KB below it, which held a constant Engram checks with
- * a Swift precondition -- it trapped one framework away from the cause. */
 static __thread struct {
     int armed;
     uint64_t head_lo, head_n;
@@ -2136,7 +2144,7 @@ static void vmmap_pad_save(uint64_t gmsg, uint32_t send_size)
     if (send_size && send_size < 0x4c)
         return;
     uint32_t flags = (uint32_t)ocerz_ld(gmsg + 0x48, 4);
-    if ((flags & 0x1u) || !(flags & 0x4000u))      /* ANYWHERE, or not OVERWRITE */
+    if ((flags & 0x1u) || !(flags & 0x4000u))
         return;
     uint64_t addr = ocerz_ld(gmsg + 0x30, 8);
     uint64_t size = ocerz_ld(gmsg + 0x38, 8);
@@ -2146,7 +2154,7 @@ static void vmmap_pad_save(uint64_t gmsg, uint32_t send_size)
     uint64_t lo = addr & ~(hp - 1);
     uint64_t hi = (addr + size + hp - 1) & ~(hp - 1);
     if (lo == addr && hi == addr + size)
-        return;                                    /* host-page aligned: nothing to lose */
+        return;
     g_vmmap_pad.head_lo = lo;
     g_vmmap_pad.head_n  = addr - lo;
     g_vmmap_pad.tail_lo = addr + size;
@@ -2190,7 +2198,6 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
     uint32_t bits = (uint32_t)ocerz_ld(gmsg, 4);
     uint32_t msg_id = (uint32_t)ocerz_ld(gmsg + 0x14, 4);
     int n = 0;
-    /* io_registry_entry_get_properties_bin_buf (2888) / io_registry_entry_get_ property_bin_buf */
     if ((msg_id == 2888 || msg_id == 2889) && n < max_saved) {
         uint32_t msz = (uint32_t)ocerz_ld(gmsg + 4, 4);
         if (msz >= 0x30 && (!send_size || msz <= send_size)) {
@@ -2207,12 +2214,6 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
             }
         }
     }
-    /* io_connect_method (2865) / io_connect_async_method (2866): the request
-     * ends with ool_input, ool_input_size, scalar_outputCnt, inband_outputCnt,
-     * ool_output, ool_output_size.  ool_input/ool_output are task addresses
-     * the kernel copies from/to directly (IOConnectCallMethod uses them for
-     * any struct argument over 4 KB, e.g. IOSurface's get-value path); a guest
-     * pointer left untranslated makes the copy fail with kIOReturnVMError. */
     if ((msg_id == 2865 || msg_id == 2866) && n + 2 <= max_saved) {
         uint32_t msz = (uint32_t)ocerz_ld(gmsg + 4, 4);
         if (msz >= 0x28 + 0x28 && (!send_size || msz <= send_size)) {
@@ -2230,16 +2231,6 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
             }
         }
     }
-    /* mach_vm_map (4811) asking for VM_FLAGS_ANYWHERE under the low-base
-     * shadow: the kernel would place the mapping in host space below the
-     * guest's identity range, where the guest cannot see it, and relocating
-     * the result afterwards leaves dangling host pointers wherever the kernel
-     * recorded the original address (IOSurface's per-client bulk-attachment
-     * page, read back by CoreAnimation when it prepares a layer's contents).
-     * Choose a guest-visible identity address ourselves and ask for it
-     * FIXED|OVERWRITE, so what the kernel maps is what the guest sees.
-     * Request body after the object port descriptor: NDR@0x28 address@0x30
-     * size@0x38 mask@0x40 flags@0x48. */
     if (msg_id == 4811) {
         if ((!send_size || send_size >= 0x4c) && getenv("OCERZ_VMMAPLOG"))
             fprintf(stderr, "ocerz: VMMAP-REQ addr=%#llx size=%#llx mask=%#llx flags=%#x\n",
@@ -2262,7 +2253,7 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
             if (g && g >= OCERZ_LOW_LIMIT && g < OCERZ_TOP_LO &&
                 (uint64_t)(uintptr_t)ocerz_g2h(g) == g) {
                 ocerz_st(gmsg + 0x30, 8, g);
-                ocerz_st(gmsg + 0x48, 4, (flags & ~0x1u) | 0x4000u);   /* FIXED|OVERWRITE */
+                ocerz_st(gmsg + 0x48, 4, (flags & ~0x1u) | 0x4000u);
                 if (getenv("OCERZ_MIGTRACE"))
                     fprintf(stderr, "ocerz: VMMAP-STEER[%d] size=%#llx mask=%#llx -> guest identity %#llx\n",
                             (int)getpid(), (unsigned long long)size, (unsigned long long)mask,
@@ -2955,10 +2946,6 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 
     w->cpu.sig_altstack_sp = 0;
     w->cpu.sig_altstack_size = 0;
-    /* sig_mask is inherited from the creator (the *cpu copy above already
-     * carries it), as POSIX requires of pthread_create; wine blocks
-     * server_block_set once on the main thread and counts on it.  Pending
-     * signals are not inherited. */
     w->cpu.sig_pending = 0;
     w->cpu.sig_on_stack = 0;
     w->cpu.sig_last_fault = 0;
@@ -3011,20 +2998,13 @@ static int ocerz_bsdthread_sema_is_port(uint64_t value)
     return value == (uint64_t)(uint32_t)value && (value & 3u) == 3u;
 }
 
-/* OCERZ_EXITLOG: Windows-side view of a thread that is exiting.  Wine leaves the
- * syscall frame of the last PE->unix transition at TEB+0x378 (regs @+0, rip +0x70,
- * rsp +0x88, syscall id +0xb0); for an exiting thread that is NtTerminateThread, so
- * the PE stack above it is the caller chain that decided to exit. */
-/* Windows-side stack of a wine thread (module+offset per return address found
- * between the syscall frame's rsp and the TEB stack base).  Shared by the
- * THREADEXIT log and the SIGINFO thread dump (ocerz_vm_thread_dump). */
 void ocerz_pe_stack_dump(OcerzCPU *cpu, const char *tag)
 {
     uint64_t tsd = cpu->gs_base;
     if (!tsd) return;
     uint64_t teb = ocerz_ld(tsd + 0x30, 8);
     if (teb < 0x10000 || teb > 0x7fffffffffffull || (teb & 0xfff)) return;
-    if (ocerz_ld(teb + 0x30, 8) != teb) return;             /* NtTib.Self */
+    if (ocerz_ld(teb + 0x30, 8) != teb) return;
     uint64_t wtid = ocerz_ld(teb + 0x48, 8);
     uint64_t sbase = ocerz_ld(teb + 8, 8);
     uint64_t sf = ocerz_ld(teb + 0x378, 8);
@@ -3144,15 +3124,6 @@ static int sys_sigaction(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int sig = (int)a[0];
     uint64_t act = a[1];
     uint64_t oact = a[2];
-    /* The two directions do NOT share a layout.  The kernel takes a
-     * `struct __sigaction` in -- 24 bytes, sa_tramp at 8, sa_mask at 16,
-     * sa_flags at 20 -- but hands back a `struct sigaction`, which has no
-     * trampoline: 16 bytes, sa_mask at 8, sa_flags at 12.  Writing the
-     * inbound layout to oldact overran the caller's 16-byte buffer by 8
-     * bytes and reported mask and flags from the wrong offsets.  In sort(1)
-     * those 8 bytes were the saved rbx one slot above a sigaction() oldact
-     * local, so its `outfile` pointer came back from the epilogue as NULL
-     * and it died dereferencing it. */
     if (oact != 0 && sig >= 0 && sig < OCERZ_NSIG) {
         ocerz_st(oact + 0, 8, guest_sigact[sig].handler);
         ocerz_st(oact + 8, 4, (uint32_t)guest_sigact[sig].mask);
@@ -3183,7 +3154,6 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     (void)vm; (void)signo;
     if (signo == 6) {
-        /* guest abort(): fatal and otherwise silent (stderr may be closed) */
         fprintf(stderr, "ocerz: GUEST-ABORT[%d] cpu#%u rip=%#llx bt:",
                 (int)getpid(), cpu->cpu_number, (unsigned long long)cpu->rip);
         uint64_t fp = cpu->gpr[OCERZ_RBP];
@@ -3197,25 +3167,12 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         fflush(stderr);
     }
 
-    /* Self-directed pthread_kill (the guest's abort()/raise(), and every
-     * Chromium CHECK/NOTREACHED): forwarding it to the host raises a REAL
-     * signal on the ocerz process, so a guest abort turns into a host
-     * SIGABRT -> macOS ReportCrash spawns and pegs a core, starving the rest
-     * of the emulation (and every other ocerz process on the box).  Under
-     * Steam's GPU-process crash loop this happened constantly and slowed
-     * startup past Steam's watchdogs.  Instead deliver the signal to the
-     * GUEST: wine has a handler installed for these (it turns the Unix signal
-     * into a Windows exception that the guest's own crash machinery handles),
-     * which is both the faithful emulation and free of host ReportCrash. */
     {
         static int route = -1;
         if (route < 0) route = getenv("OCERZ_NO_GUEST_SELFKILL") ? 0 : 1;
         mach_port_t self = mach_thread_self();
         int is_self = (a[0] == 0 || a[0] == (uint64_t)self);
         if (self) mach_port_deallocate(mach_task_self(), self);
-        /* A self-directed signal the guest has blocked becomes pending, not
-         * a host raise: the host has no such block and its default action
-         * would kill the process.  This is what sigwait() harvests. */
         if (route && is_self && signo > 0 && signo < OCERZ_NSIG &&
             (cpu->sig_mask & (1ull << (signo - 1)))) {
             cpu->sig_pending |= 1ull << (signo - 1);
@@ -3224,9 +3181,7 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         }
         if (route && is_self && signo > 0 && signo < OCERZ_NSIG) {
             if (ocerz_signal_deliver(cpu, (int)signo, 0, 0, 0))
-                return OCERZ_STEP_OK;  /* rip now points at the guest handler */
-            /* no guest handler: default action.  For a terminating signal
-             * exit cleanly (128+signo) rather than host-aborting. */
+                return OCERZ_STEP_OK;
             int fatal = (signo == 4 || signo == 5 || signo == 6 || signo == 8 ||
                          signo == 10 || signo == 11 || signo == 3 || signo == 7);
             if (fatal) {
@@ -3297,15 +3252,13 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
-/* Two mcontext flavours, and the offsets that move between them. */
 #define OCERZ_MCTX_SIZE 1032u
 #define OCERZ_MCTX_FULL_SIZE 1064u
 #define OCERZ_MCTX_FP_OFF 184u
 #define OCERZ_MCTX_FULL_FP_OFF 216u
-#define OCERZ_MCTX_FULL_DS_OFF 184u     /* __ds, __es, __ss, __gsbase */
+#define OCERZ_MCTX_FULL_DS_OFF 184u
 #define OCERZ_FP_MXCSR_OFF 32u
 #define OCERZ_FP_XMM_OFF 168u
-/* Darwin's flat 64-bit user selectors. */
 #define OCERZ_SEL_USER_CS64 0x2bu
 #define OCERZ_SEL_USER_DS64 0x23u
 #define OCERZ_UCTX_SIZE 768u
@@ -3346,7 +3299,6 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
                 (unsigned long long)cpu->sig_altstack_sp,
                 (unsigned long long)cpu->sig_altstack_size, cpu->sig_on_stack,
                 sp_on_alt, use_alt);
-    /* Flavour choice. */
     int full = ocerz_ldt_installed();
     uint32_t mcsize = full ? OCERZ_MCTX_FULL_SIZE : OCERZ_MCTX_SIZE;
     uint64_t fpoff = full ? OCERZ_MCTX_FULL_FP_OFF : OCERZ_MCTX_FP_OFF;
@@ -3386,9 +3338,6 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     ocerz_st(mc + 136, 8, cpu->gpr[OCERZ_R15]);
     ocerz_st(mc + 144, 8, cpu->rip);
     ocerz_st(mc + 152, 8, cpu->rflags);
-    /* __ss.__cs.  cpu->cs_sel is 0x2b out of reset and only a far transfer
-     * through an LDT descriptor moves it, so a 64-bit thread still reports the
-     * same literal this line used to write. */
     ocerz_st(mc + 160, 8, cpu->cs_sel);
     if (full) {
         ocerz_st(mc + OCERZ_MCTX_FULL_DS_OFF + 0, 8, OCERZ_SEL_USER_DS64);
@@ -3423,7 +3372,6 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     cpu->gpr[OCERZ_R9] = uc;
     cpu->gpr[OCERZ_RSP] = newsp;
     cpu->rip = sa->tramp;
-    /* The trampoline and the handler are 64-bit code. */
     cpu->mode32 = 0;
     cpu->cs_sel = OCERZ_SEL_USER_CS64;
     cpu->seg_sel[OCERZ_SREG_CS] = OCERZ_SEL_USER_CS64;
@@ -3435,20 +3383,6 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     return 1;
 }
 
-/* Asynchronous signals -- the ones the host handler in vm.c records in the
- * pending mask -- obey the guest signal mask.  Synchronous faults (SEGV/BUS/
- * FPE/TRAP/SYS) do not come through here and are never gated.
- *
- * Enforcing this is what keeps wine's server protocol in one piece.  wine
- * blocks server_block_set (SIGUSR1 among them) around a wineserver
- * request/reply pair so a suspend kick can only land BETWEEN calls.  Deliver
- * one mid-pair and usr1_handler runs wait_suspend -> server_select, a second
- * complete round trip nested inside the first on the same strictly ordered fd
- * pair; the stream desynchronises and every client parks in read() forever.
- *
- * `taken` uses vm.c's bit-per-signal convention (1 << sig); sig_mask and
- * sig_pending use the guest sigset_t one (1 << (sig - 1)).
- * Returns the number of handlers vectored. */
 static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
 {
     for (int s = 1; s < 32; s++)
@@ -3456,8 +3390,6 @@ static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
             cpu->sig_pending |= 1ull << (s - 1);
 
     int n = 0;
-    /* Each pass clears one bit and can only widen the mask (sa->mask), so this
-     * terminates. */
     while (cpu->sig_pending & ~cpu->sig_mask) {
         int s = __builtin_ctzll(cpu->sig_pending & ~cpu->sig_mask) + 1;
         cpu->sig_pending &= ~(1ull << (s - 1));
@@ -3481,18 +3413,6 @@ static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
     return n;
 }
 
-/* Offer pending signals on the ENTRY edge of a syscall, before it runs.
- *
- * The host handler only sets a bit; the drain at the end of
- * ocerz_handle_syscall runs on the RETURN edge.  A signal that lands while the
- * guest is in pure user-mode code therefore sits unnoticed until some later
- * syscall returns -- and if the next syscall is a blocking one, it parks with
- * the wakeup still undelivered and never comes back.
- *
- * Rewind rip to the syscall instruction before vectoring, so the call
- * re-executes once the handler returns: the signal simply arrived first, which
- * is precisely what happened.  Nothing is lost and no return value is faked.
- * Returns nonzero if the syscall must not run yet. */
 int ocerz_signal_before_syscall(OcerzCPU *cpu, uint64_t insn_rip)
 {
     if (!ocerz_peek_pending_async_sig() && !(cpu->sig_pending & ~cpu->sig_mask))
@@ -3524,7 +3444,6 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 (int)getpid(), cpu->cpu_number, cpu->in_sighandler,
                 (unsigned long long)ocerz_ld(mc + 144, 8), (unsigned long long)ocerz_ld(mc + 72, 8),
                 (unsigned)ocerz_ld(uc + 4, 4));
-    /* The flavour comes back from the frame, not from a global: a handler can hand sigreturn any */
     uint64_t mcsize = ocerz_ld(uc + 40, 8);
     int full = mcsize >= OCERZ_MCTX_FULL_SIZE;
     uint64_t fpoff = full ? OCERZ_MCTX_FULL_FP_OFF : OCERZ_MCTX_FP_OFF;
@@ -3552,7 +3471,6 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     ocerz_apply_mxcsr_round(cpu->mxcsr);
     cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
 
-    /* Restore CS, and with it the execution mode. */
     {
         uint32_t cs = (uint32_t)ocerz_ld(mc + 160, 8);
         if (cs) {
@@ -3588,19 +3506,12 @@ static int sys_sigpending(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
     uint64_t set = a[0];
-    /* Signals held back by the mask must show up here, or the classic
-     * "block, work, sigpending, unblock" sequence loses them silently. */
     if (set != 0)
         ocerz_st(set, 4, (uint32_t)cpu->sig_pending);
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
 }
 
-/* A buffer the kernel is about to write (a receive, a read): unarm any page
- * of it that carries translations (ocerz_mem_arm_exec) first.  A kernel
- * copyout onto a read-only page fails instead of faulting, and for a mach
- * receive the reply is destroyed with it - wineboot hung forever on exactly
- * that (2026-09-07). Free when nothing is armed. */
 static void disarm_guest_buffer(OcerzCPU *cpu, uint64_t gaddr, uint64_t len)
 {
     if (!gaddr || !len || !ocerz_mem_armed_any())
@@ -3627,10 +3538,6 @@ static void disarm_guest_iov(OcerzCPU *cpu, uint64_t giov, uint64_t cnt)
     }
 }
 
-/* EFAULT with armed pages about: the kernel's copyout hit a guest page whose
- * host write bit was revoked because code was translated from it
- * (ocerz_mem_arm_exec).  Unarm them all, drop those translations and tell
- * the caller to run the syscall once more. */
 static int efault_disarm_retry(OcerzCPU *cpu, int num)
 {
     uint64_t pages[64];
@@ -3646,20 +3553,13 @@ static int efault_disarm_retry(OcerzCPU *cpu, int num)
     return any;
 }
 
-/* The waits the unstick monitor may EINTR: the ones whose callers already
- * treat a spurious return as "look again" (psynch, semwait, kevent, workq,
- * ulock) and where a lost wakeup can really park a thread for good. A
- * read, recvmsg, poll or fcntl lock never returns EINTR on its own -- only a
- * guest signal handler causes one -- so apps rightly do not expect it:
- * Chess's engine lexer took the -1 from a kicked read() as a byte count
- * and died "out of dynamic memory". */
 static int unstick_kickable(int num)
 {
-    return (num >= 297 && num <= 309) || num == 312 ||   /* psynch_* */
-           num == 334 || num == 423 ||                   /* __semwait_signal(_nocancel) */
-           num == 363 || num == 369 || num == 374 || num == 375 ||   /* kevent family */
-           num == 368 ||                                 /* workq_kernreturn */
-           num == 515 || num == 544;                     /* ulock_wait(2) */
+    return (num >= 297 && num <= 309) || num == 312 ||
+           num == 334 || num == 423 ||
+           num == 363 || num == 369 || num == 374 || num == 375 ||
+           num == 368 ||
+           num == 515 || num == 544;
 }
 
 static int forward_with_scratch(OcerzCPU *cpu, int num, uint64_t a[8], int dual_ret)
@@ -3702,7 +3602,6 @@ static int sys_iov(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8], int num)
     return OCERZ_STEP_OK;
 }
 
-/* preadv/pwritev(fd, iov, iovcnt, offset): sys_iov plus the offset in a[3]. */
 static int sys_preadv_pwritev(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8], int num)
 {
     (void)vm;
@@ -3724,17 +3623,8 @@ static int sys_pwritev(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_p
 static int sys_preadv_nc(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_preadv_pwritev(vm, cpu, a, 542); }
 static int sys_pwritev_nc(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_preadv_pwritev(vm, cpu, a, 543); }
 
-/* sigsuspend(mask): install mask, wait for a signal not in it, restore, and
- * return EINTR.  __sigwait(set, sig*): wait until one of `set` (which the
- * caller has blocked) is pending, hand it back and consume it.  Both waited
- * for a signal the host kernel could never deliver to the guest, so libc's
- * sigsuspend and sigwait returned ENOSYS.  A guest async signal arrives
- * through async_sig_handler into the pending mask; we poll it, kickable so
- * the unstick monitor's SIGEMT (and any host signal) breaks the sleep at
- * once.  Pinned by the dynamic test signal_wait. */
 static int sys_sigsuspend(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    /* the Darwin syscall takes the mask by value in a[0], not a pointer */
     uint64_t saved = cpu->sig_mask;
     uint64_t suspend = (uint32_t)a[0];
     cpu->sig_mask = suspend;
@@ -3742,7 +3632,7 @@ static int sys_sigsuspend(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     int caught = 0;
     for (;;) {
-        cpu->sig_pending |= ocerz_take_pending_async_sig() >> 1;   /* 1<<sig -> 1<<(sig-1) */
+        cpu->sig_pending |= ocerz_take_pending_async_sig() >> 1;
         uint64_t ready = cpu->sig_pending & ~suspend;
         if (ready) {
             caught = __builtin_ctzll(ready) + 1;
@@ -3755,13 +3645,8 @@ static int sys_sigsuspend(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     cpu->block_since_ns = 0;
     cpu->block_nokick = 0;
-    /* Restore the original mask and set the EINTR return BEFORE delivering,
-     * so the context the handler's sigreturn restores carries -1/EINTR and
-     * the pre-suspend mask.  Deliver the catching signal directly (its
-     * handler is meant to run even though the restored mask now blocks it --
-     * that is exactly the window sigsuspend opens). */
     cpu->sig_mask = saved;
-    ret_err(cpu, 4 /* EINTR */);
+    ret_err(cpu, 4);
     if (caught) {
         cpu->sig_pending &= ~(1ull << (caught - 1));
         g_ocerz_deliver_src = 1;
@@ -3793,7 +3678,7 @@ static int sys_sigwait(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     cpu->block_since_ns = 0;
     cpu->block_nokick = 0;
     if (!got) {
-        ret_err(cpu, 4 /* EINTR */);
+        ret_err(cpu, 4);
         return OCERZ_STEP_OK;
     }
     if (sigp)
@@ -3802,12 +3687,6 @@ static int sys_sigwait(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
-/* A syscall whose argument structs hide guest pointers the ptr_mask cannot
- * reach (connectx's endpoints, sendfile's header iovecs, the recvmsg_x
- * array).  Correct only when a guest address is already a host address --
- * identity mode, which every dynamic binary runs in.  In offset-arena mode
- * the kernel would read or write host memory at the wrong place, so fail
- * with ENOSYS and let the caller fall back rather than corrupt memory. */
 static int sys_identity_only(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8], int num, uint8_t mask)
 {
     (void)vm;
@@ -3828,20 +3707,12 @@ static int sys_sendfile(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_
 static int sys_recvmsg_x(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_identity_only(vm, cpu, a, 480, 0x02); }
 static int sys_sendmsg_x(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sys_identity_only(vm, cpu, a, 481, 0x02); }
 
-/* SysV semaphores: Steam's tier0 CThreadSemaphore is built on them, so
- * without these every "thread synchronization object is unuseable".  The
- * structs (sembuf, semid_ds) are identical on x86_64 and arm64, so semget
- * and semop pass straight through.  semctl(semid, semnum, cmd, arg) is
- * variadic: its union-semun arg is a pointer only for IPC_SET/IPC_STAT
- * (struct semid_ds *) and GETALL/SETALL (unsigned short *); for SETVAL it is
- * a plain int and for the rest it is unused.  Pinned by the dynamic test
- * sysv_sem. */
 static int sys_semctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
     int cmd = (int)a[2];
-    int is_ptr = (cmd == 1 /* IPC_SET */ || cmd == 2 /* IPC_STAT */ ||
-                  cmd == 6 /* GETALL */ || cmd == 9 /* SETALL */);
+    int is_ptr = (cmd == 1 || cmd == 2 ||
+                  cmd == 6 || cmd == 9 );
     uint64_t fa[8] = { a[0], a[1], a[2],
                        (is_ptr && a[3]) ? (uint64_t)(uintptr_t)ocerz_g2h(a[3]) : a[3],
                        0, 0, 0, 0 };
@@ -4104,7 +3975,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [443] = { "guarded_kqueue_np", 2, 0x01, 0, NULL },
     [444] = { "change_fdguard_np", 6, 0x2a, 0, NULL },
     [484] = { "guarded_open_dprotected_np", 7, 0x03, 0, NULL },
-    [486] = { "guarded_pwrite_np", 5, 0x06, 0, NULL },   /* fd, guard*, buf, nbyte, offset */
+    [486] = { "guarded_pwrite_np", 5, 0x06, 0, NULL },
     [131] = { "flock", 2, 0x00, 0, NULL },
     [501] = { "necp_open", 1, 0x00, 0, NULL },
     [502] = { "necp_client_action", 6, 0x14, 0, NULL },
@@ -4162,9 +4033,6 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [303] = { "psynch_cvbroad",   7, 0x11, 0, NULL },
     [304] = { "psynch_cvsignal",  7, 0x11, 0, NULL },
     [305] = { "psynch_cvwait",    8, 0x09, 0, NULL },
-    /* The psynch_rw_* block was numbered four low: 308 (rw_unlock) had no entry
-     * at all, so a contended pthread_rwlock unlock got ENOSYS and libpthread
-     * trapped with the lock still held.  These follow sys/syscall.h. */
     [297] = { "psynch_rw_longrdlock", 5, 0x01, 0, NULL },
     [298] = { "psynch_rw_yieldwrlock", 5, 0x01, 0, NULL },
     [299] = { "psynch_rw_downgrade", 5, 0x01, 0, NULL },
@@ -4192,9 +4060,6 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [413] = { "sendto_nocancel", 6, 0x12, 0, NULL },
     [414] = { "pread_nocancel", 4, 0x02, 0, NULL },
     [415] = { "pwrite_nocancel",4, 0x02, 0, NULL },
-    /* the iovec pair needs the same guest-pointer translation as 120/121, so
-     * they share the handlers rather than falling through to the host.
-     * Without these, sort(1) took ENOSYS from its first writev and died. */
     [411] = { "readv_nocancel", 3, 0x00, 0, sys_readv },
     [412] = { "writev_nocancel",3, 0x00, 0, sys_writev },
     [417] = { "poll_nocancel", 3, 0x01, 0, NULL },
@@ -4202,20 +4067,12 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [423] = { "__semwait_signal_nocancel", 6, 0x00, 0, NULL },
     [427] = { "fsgetpath",   4, 0x05, 0, NULL },
     [428] = { "audit_session_self", 0, 0x00, 0, NULL },
-    /* guest port names and fds are the host's: XPC hands Photos its library
-     * files as fileports, and PhotoFoundation aborts when makefd fails */
     [430] = { "fileport_makeport", 2, 0x02, 0, NULL },
     [431] = { "fileport_makefd", 1, 0x00, 0, NULL },
-    /* struct itimerval is two {long, int} timevals on either side; SIGALRM
-     * reaches a guest handler through ocerz_vm_mirror_host_signal */
     [83]  = { "setitimer", 3, 0x06, 0, NULL },
     [86]  = { "getitimer", 2, 0x02, 0, NULL },
-    /* ps(1) reads other processes through their task read ports */
     [539] = { "task_read_for_pid", 3, 0x04, 0, NULL },
     [538] = { "task_inspect_for_pid", 3, 0x04, 0, NULL },
-    /* struct stat is identical on x86_64 and arm64, so these forward as-is;
-     * the *64 twins already do.  x86 binaries built against older SDKs, and
-     * getdirentries(3), use the unsuffixed numbers. */
     [188] = { "stat",        2, 0x03, 0, NULL },
     [189] = { "fstat",       2, 0x02, 0, NULL },
     [190] = { "lstat",       2, 0x03, 0, NULL },
@@ -4224,7 +4081,6 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [18]  = { "getfsstat",   3, 0x01, 0, NULL },
     [196] = { "getdirentries", 4, 0x0a, 0, NULL },
     [469] = { "fstatat",     4, 0x06, 0, NULL },
-    /* legacy path calls */
     [9]   = { "link",        2, 0x03, 0, NULL },
     [14]  = { "mknod",       3, 0x01, 0, NULL },
     [61]  = { "chroot",      1, 0x01, 0, NULL },
@@ -4234,7 +4090,6 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [553] = { "mkfifoat",    3, 0x02, 0, NULL },
     [554] = { "mknodat",     4, 0x02, 0, NULL },
     [187] = { "fdatasync",   1, 0x00, 0, NULL },
-    /* the _nocancel twins forward exactly as their base numbers do */
     [400] = { "wait4_nocancel",   4, 0x0a, 0, NULL },
     [405] = { "msync_nocancel",   3, 0x01, 0, NULL },
     [408] = { "fsync_nocancel",   1, 0x00, 0, NULL },
@@ -4244,7 +4099,6 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [541] = { "pwritev",     4, 0x00, 0, sys_pwritev },
     [542] = { "preadv_nocancel",  4, 0x00, 0, sys_preadv_nc },
     [543] = { "pwritev_nocancel", 4, 0x00, 0, sys_pwritev_nc },
-    /* memory */
     [203] = { "mlock",       2, 0x01, 0, NULL },
     [204] = { "munlock",     2, 0x01, 0, NULL },
     [324] = { "mlockall",    1, 0x00, 0, NULL },
@@ -4252,7 +4106,6 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [78]  = { "mincore",     3, 0x05, 0, NULL },
     [250] = { "minherit",    3, 0x01, 0, NULL },
     [534] = { "memorystatus_available_memory", 2, 0x00, 0, NULL },
-    /* uid/gid setters and misc scalars */
     [126] = { "setreuid",    2, 0x00, 0, NULL },
     [127] = { "setregid",    2, 0x00, 0, NULL },
     [181] = { "setgid",      1, 0x00, 0, NULL },
@@ -4263,12 +4116,10 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [148] = { "pipe2",       2, 0x01, 0, NULL },
     [149] = { "dup3",        3, 0x00, 0, NULL },
     [369] = { "kevent64",    7, 0x4a, 0, NULL },
-    /* signal waits (real handlers above) */
     [111] = { "sigsuspend",  1, 0x00, 0, sys_sigsuspend },
     [410] = { "sigsuspend_nocancel", 1, 0x00, 0, sys_sigsuspend },
     [330] = { "__sigwait",   2, 0x00, 0, sys_sigwait },
     [422] = { "__sigwait_nocancel", 2, 0x00, 0, sys_sigwait },
-    /* SysV IPC: Steam's threading, and much old Unix software, needs it */
     [255] = { "semget",      3, 0x00, 0, NULL },
     [256] = { "semop",       3, 0x02, 0, NULL },
     [254] = { "semctl",      4, 0x00, 0, sys_semctl },
@@ -4279,11 +4130,9 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [260] = { "msgsnd",      4, 0x02, 0, NULL },
     [261] = { "msgrcv",      5, 0x02, 0, NULL },
     [132] = { "mkfifo",      2, 0x01, 0, NULL },
-    /* file-attribute and quota calls Steam and Finder-style code make */
     [221] = { "setattrlist", 5, 0x07, 0, NULL },
     [245] = { "ffsctl",      4, 0x04, 0, NULL },
     [165] = { "quotactl",    4, 0x09, 0, NULL },
-    /* sockets with pointers nested in argument structs: identity mode only */
     [447] = { "connectx",    7, 0x00, 0, sys_connectx },
     [448] = { "disconnectx", 3, 0x00, 0, NULL },
     [337] = { "sendfile",    6, 0x00, 0, sys_sendfile },
@@ -4299,10 +4148,6 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [500] = { "getentropy",  2, 0x01, 0, NULL },
 };
 
-/* OCERZ_SYSFAIL: ENOMEM and EFAULT are the two errnos a guest almost never
- * earns honestly - they are what a missing pointer translation or an exhausted
- * mapping table looks like from inside the guest.  Level 2 widens it to every
- * failure except the errnos a healthy program earns constantly. */
 static void ocerz_sysfail_note(OcerzCPU *cpu, int num, int eno, const uint64_t *orig)
 {
     static int flog = -1;
@@ -4313,7 +4158,7 @@ static void ocerz_sysfail_note(OcerzCPU *cpu, int num, int eno, const uint64_t *
     }
     if (!flog || !eno)
         return;
-    if (num == 333)     /* __pthread_canceled: EINVAL is the kernel's "no" */
+    if (num == 333)
         return;
     int interesting = (eno == ENOMEM || eno == EFAULT) ||
                       (flog >= 2 &&
@@ -4382,11 +4227,6 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
 
     if (!e) {
 
-        /* Aborting here is worse than failing the call: the guest thread dies
-         * wherever it stood, and under Wine that is often inside LdrLoadDll
-         * holding the loader lock, which deadlocks every other thread. Report
-         * once and hand back ENOSYS so the caller can take its fallback.
-         * OCERZ_STRICT_SYSCALL restores the abort for bring-up work. */
         if (!getenv("OCERZ_STRICT_SYSCALL")) {
             static uint8_t probed[OCERZ_BSD_MAX];
             if (num >= 0 && num < OCERZ_BSD_MAX && !probed[num]) {
@@ -4422,17 +4262,14 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
 
     uint64_t orig[8];
     memcpy(orig, a, sizeof orig);
-    {   /* OCERZ_FDOPLOG: close / guarded_close_np / dup2 / socketpair with the fd
-         * numbers and the guest rip, to catch a stray close of another
-         * thread's wineserver request socket (the server then kills that
-         * thread while it waits: abort_thread from wait_select_reply). */
+    {
         static int fdlog = -1;
         if (fdlog < 0) {
             fdlog = getenv("OCERZ_FDOPLOG") ? 1 : 0;
             const char *fx = getenv("OCERZ_FDOPLOG_EXE");
             if (fdlog && fx && *fx) {
                 extern char ocerz_cmdline_summary[];
-                if (!ocerz_cmdline_summary[0]) fdlog = -1;          /* summary not built yet: decide later */
+                if (!ocerz_cmdline_summary[0]) fdlog = -1;
                 else fdlog = strstr(ocerz_cmdline_summary, fx) != NULL;
             }
         }
@@ -4444,15 +4281,15 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
 
     if (ocerz_mem_armed_any()) {
         switch (num) {
-        case 3: case 396:                      /* read */
-        case 153: case 414:                    /* pread */
-        case 29: case 403:                     /* recvfrom */
+        case 3: case 396:
+        case 153: case 414:
+        case 29: case 403:
             disarm_guest_buffer(cpu, orig[1], orig[2]);
             break;
-        case 120: case 411:                    /* readv */
+        case 120: case 411:
             disarm_guest_iov(cpu, orig[1], orig[2]);
             break;
-        case 27: case 401:                     /* recvmsg: msghdr.msg_iov / msg_iovlen */
+        case 27: case 401:
             if (ocerz_addr_readable(orig[1] + 31))
                 disarm_guest_iov(cpu, ocerz_ld(orig[1] + 16, 8), (uint32_t)ocerz_ld(orig[1] + 24, 4));
             break;
@@ -4461,8 +4298,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
     }
 
-    {   /* OCERZ_STRACE_CPU=<n>: one-line log of every BSD syscall made by
-         * that guest cpu (JIT and interp alike) */
+    {
         static int scpu = -2;
         if (scpu == -2) {
             const char *e2 = getenv("OCERZ_STRACE_CPU");
@@ -4479,11 +4315,11 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                     (unsigned long long)vm->insn_count);
     }
 
-    {   /* MSGLOG: wine server requests/replies are fixed 64-byte read/write */
+    {
         static int wrlog = -1;
         if (wrlog < 0) {
             wrlog = getenv("OCERZ_MSGLOG") ? 1 : 0;
-            const char *fx = getenv("OCERZ_MSGLOG_EXE");   /* only processes whose cmdline contains this */
+            const char *fx = getenv("OCERZ_MSGLOG_EXE");
             if (wrlog && fx && *fx) {
                 extern char ocerz_cmdline_summary[];
                 wrlog = strstr(ocerz_cmdline_summary, fx) != NULL;
@@ -4495,7 +4331,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                     (num == 4 || num == 397) ? "WR" : "RD", (int)getpid(),
                     cpu->cpu_number, (int)a[0], rq,
                     (unsigned long long)vm->insn_count);
-            if ((num == 4 || num == 397) && rq == 8)   /* REQ_terminate_thread: handle, exit_code */
+            if ((num == 4 || num == 397) && rq == 8)
                 fprintf(stderr, " handle=%#x exit_code=%#x",
                         (unsigned)ocerz_ld(a[1] + 12, 4), (unsigned)ocerz_ld(a[1] + 16, 4));
             fputc('\n', stderr);
@@ -4507,10 +4343,6 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
             OCERZ_FATAL("not yet supported: class=2 num=%d name=%s\n", num, e->name);
             return OCERZ_STEP_FATAL;
         }
-        /* Intercepted syscalls never reach the passthrough's SYSFAIL check, so
-         * the errors ocerz synthesises itself - notably every hand-made ENOMEM
-         * in sys_mmap - were the only failures invisible to it.  Read the
-         * result back off the guest, where ret_err() just put it. */
         if (r == OCERZ_STEP_OK && (cpu->rflags & OCERZ_CF))
             ocerz_sysfail_note(cpu, num, (int)cpu->gpr[OCERZ_RAX], orig);
         strace_bsd(vm, e, num, orig, cpu);
@@ -4545,7 +4377,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     static int blocklog = -1;
     if (blocklog < 0) {
         blocklog = getenv("OCERZ_BLOCKLOG") != NULL ? 1 : 0;
-        const char *fx = getenv("OCERZ_BLOCKLOG_EXE");   /* only processes whose cmdline contains this */
+        const char *fx = getenv("OCERZ_BLOCKLOG_EXE");
         if (fx && *fx) {
             extern char ocerz_cmdline_summary[];
             blocklog = strstr(ocerz_cmdline_summary, fx) != NULL;
@@ -4575,9 +4407,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
         fprintf(stderr, "\n");
     }
-    {   /* OCERZ_SOCKLOG: connect/bind/socket/setsockopt with the sockaddr
-         * decoded, plus the result - to see whether a loopback WebSocket
-         * actually reaches the host and what it gets back. */
+    {
         static int socklog = -1;
         if (socklog < 0) {
             socklog = getenv("OCERZ_SOCKLOG") ? 1 : 0;
@@ -4590,15 +4420,15 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (socklog && (num == 97 || num == 98 || num == 104 || num == 105 || num == 30 || num == 106)) {
             char ab[160]; ab[0] = 0;
             if ((num == 98 || num == 104) && a[1] && ocerz_addr_readable(a[1] + 1)) {
-                uint8_t fam = (uint8_t)ocerz_ld(a[1] + 1, 1);   /* macOS sockaddr: [0]=len [1]=family */
-                if (fam == 2 && ocerz_addr_readable(a[1] + 7)) {           /* AF_INET */
+                uint8_t fam = (uint8_t)ocerz_ld(a[1] + 1, 1);
+                if (fam == 2 && ocerz_addr_readable(a[1] + 7)) {
                     uint16_t port = (uint16_t)((ocerz_ld(a[1]+2,1)<<8)|ocerz_ld(a[1]+3,1));
                     uint32_t ip = (uint32_t)ocerz_ld(a[1]+4,4);
                     snprintf(ab, sizeof ab, " AF_INET %u.%u.%u.%u:%u", ip&0xff,(ip>>8)&0xff,(ip>>16)&0xff,(ip>>24)&0xff, port);
-                } else if (fam == 30 && ocerz_addr_readable(a[1] + 7)) {   /* AF_INET6 */
+                } else if (fam == 30 && ocerz_addr_readable(a[1] + 7)) {
                     uint16_t port = (uint16_t)((ocerz_ld(a[1]+2,1)<<8)|ocerz_ld(a[1]+3,1));
                     snprintf(ab, sizeof ab, " AF_INET6 [..]:%u", port);
-                } else if (fam == 1) {                                     /* AF_UNIX */
+                } else if (fam == 1) {
                     snprintf(ab, sizeof ab, " AF_UNIX");
                 } else snprintf(ab, sizeof ab, " fam=%u", fam);
             }
@@ -4614,8 +4444,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
          num == 121);
     cpu->block_nokick = !unstick_kickable(num);
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    cpu->block_what = num;           /* the mach path records this; a BSD call
-                                      * that never returns showed up as what=0 */
+    cpu->block_what = num;
     uint64_t t0blk = cpu->block_since_ns;
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     if (err && r == EFAULT && efault_disarm_retry(cpu, num))
@@ -4632,8 +4461,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                 socklog = strstr(ocerz_cmdline_summary, fx) != NULL;
             }
         }
-        {   /* OCERZ_FDOPLOG: socketpair / dup / dup2 results (the fds a thread's
-             * wineserver request, reply and wait sockets end up with) */
+        {
             static int fdlog2 = -1;
             if (fdlog2 < 0) {
                 fdlog2 = getenv("OCERZ_FDOPLOG") ? 1 : 0;
@@ -4647,9 +4475,6 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
             if (fdlog2 > 0 && !err && num == 135 && orig[3] && ocerz_addr_readable(orig[3] + 7))
                 fprintf(stderr, "ocerz: FD[%d] cpu#%u socketpair -> %d %d rip=%#llx\n", (int)getpid(), cpu->cpu_number,
                         (int)ocerz_ld(orig[3], 4), (int)ocerz_ld(orig[3] + 4, 4), (unsigned long long)cpu->rip);
-            /* a 16-byte read that came back with a zero first qword: wine's
-             * wait_select_reply treats a zero cookie as "thread got killed"
-             * and calls abort_thread - log who got one and from which fd */
             if (fdlog2 > 0 && !err && num == 3 && orig[2] == 16 && r == 16 && ocerz_addr_readable(orig[1] + 15) &&
                 ocerz_ld(orig[1], 8) == 0)
                 fprintf(stderr, "ocerz: FD[%d] cpu#%u WAKEUP0 fd=%d signaled=%#llx rip=%#llx\n", (int)getpid(), cpu->cpu_number,
@@ -4664,32 +4489,13 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                     (unsigned long long)r, err ? (int)r : 0);
     }
 
-    /* OCERZ_SYSFAIL: ENOMEM and EFAULT are the two errnos a guest almost
-     * never earns honestly - they are what a missing pointer translation or
-     * an exhausted mapping table looks like from inside the guest. */
-    /* `err` is the carry flag, not an errno: the kernel returns the errno in
-     * x0 alongside CS. */
     ocerz_sysfail_note(cpu, num, err ? (int)r : 0, orig);
 
-    /* Robust os_unfair_lock: __ulock_wait(UL_UNFAIR_LOCK) returns EOWNERDEAD
-     * when the owner thread died holding the lock.  libplatform's reaction is
-     * to CRASH ("Owner in ulock is unknown - possible memory corruption").
-     * A guest thread that grabbed a libsystem lock uncontended and was then
-     * torn down (thread churn, GPU-subprocess death) orphans the lock; the
-     * next waiter then takes the whole process down.  Instead break the
-     * orphaned lock the way PTHREAD_MUTEX_ROBUST does: clear the dead owner
-     * from the lock word so the waiter re-CASes and acquires it, and hand
-     * back EINTR so it re-loops.  The owner is provably dead (the kernel
-     * could not resolve its port), so this steals nothing live.  a[1] is the
-     * already-translated host lock address; orig[2]/a[2] the value waited on.
-     * ULF_NO_ERRNO returns -errno directly with err==0. */
     {
         static int robust = -1;
         if (robust < 0) robust = getenv("OCERZ_NO_ROBUST_ULOCK") ? 0 : 1;
         int is_wait = (num == 515 || num == 544);
-        int unfair = (orig[0] & 0xff) == 2;   /* UL_UNFAIR_LOCK */
-        /* EOWNERDEAD arrives either as carry + errno in x0, or, under
-         * ULF_NO_ERRNO, as a negative return with carry clear. */
+        int unfair = (orig[0] & 0xff) == 2;
         int ownerdead = (err && (int)r == 105) || (err == 0 && (int64_t)r == -105);
         if (robust && is_wait && unfair && ownerdead && a[1]) {
             uint32_t *w = (uint32_t *)(uintptr_t)a[1];
@@ -4702,17 +4508,15 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                 fprintf(stderr, "ocerz: ROBUST-ULOCK[%d] broke dead-owner lock addr=%#llx owner=%#llx\n",
                         (int)getpid(), (unsigned long long)orig[1], (unsigned long long)orig[2]);
             err = 0;
-            r = (uint64_t)(int64_t)-4;   /* -EINTR passthrough: waiter re-loops */
+            r = (uint64_t)(int64_t)-4;
         }
     }
     {
-        /* OCERZ_ULOCKLOG: ulock_wait/wake results - r can carry -errno directly
-         * under ULF_NO_ERRNO (host returns it with no carry, so err==0) */
         static int ulog = -1;
         if (ulog < 0) ulog = getenv("OCERZ_ULOCKLOG") ? 1 : 0;
         if (ulog && (num == 515 || num == 544)) {
             int64_t sr = (int64_t)r;
-            int neg = sr < 0 && sr > -4096;   /* -errno passthrough */
+            int neg = sr < 0 && sr > -4096;
             if (err || neg) {
                 extern mach_port_t mach_thread_self(void);
                 mach_port_t self = mach_thread_self();
@@ -4776,9 +4580,6 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
     }
     {
-        /* OCERZ_PREADLOG=<len>: pread()/read() of exactly <len> bytes -- SQLite
-         * reads its 100-byte file header first, so the header read shows
-         * whether the database bytes reach the guest intact. */
         static long plog = -2;
         if (plog == -2) { const char *e = getenv("OCERZ_PREADLOG"); plog = e ? strtol(e, NULL, 0) : -1; }
         if (plog >= 0 && (num == 153 || num == 3) && orig[2] == (uint64_t)plog) {
@@ -4787,9 +4588,6 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                     (int)getpid(), cpu->cpu_number, num, (int)orig[0], (unsigned long long)orig[3], (unsigned long long)orig[2],
                     (long long)r, err ? (int)r : 0, b?b[0]:0, b?b[1]:0, b?b[2]:0, b?b[3]:0, b?b[4]:0, b?b[5]:0, b?b[6]:0, b?b[7]:0, b ? (const char *)b : "");
         }
-        /* OCERZ_PAGETRAP: an mmap without MAP_FIXED whose result covers the
-         * trapped address (the kernel-chosen placement, invisible to the
-         * entry-side check in pagetrap_check) */
         {
             pagetrap_init();
             if (g_pagetrap_hi && num == 197 && !err && !(orig[3] & MAP_FIXED) && (uint64_t)r < g_pagetrap_hi && g_pagetrap_lo < (uint64_t)r + orig[1]) {
@@ -4800,8 +4598,6 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                 pe_scan_print(cpu, "PAGETRAP", d);
             }
         }
-        /* OCERZ_FDLOG=<minfd>: every read/write/pread/pwrite/fstat/lseek on
-         * fds >= minfd, with results, to follow one file's I/O (SQLite). */
         static long fdlog = -2;
         if (fdlog == -2) { const char *e = getenv("OCERZ_FDLOG"); fdlog = e ? strtol(e, NULL, 0) : -1; }
         if (fdlog >= 0 && (num == 3 || num == 4 || num == 153 || num == 154 || num == 189 || num == 339 || num == 199 || num == 95 || num == 6) &&
@@ -4816,7 +4612,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
         static int klog = -1;
         if (klog < 0) klog = getenv("OCERZ_KICKLOG") ? 1 : 0;
-        if (klog && err && r == 4 /* EINTR */)
+        if (klog && err && r == 4)
             fprintf(stderr, "ocerz: KICKRET[%d] cpu#%u bsd %d -> EINTR rip=%#llx\n",
                     (int)getpid(), cpu->cpu_number, num, (unsigned long long)cpu->rip);
     }
@@ -4846,8 +4642,6 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         fprintf(stderr, "ocerz: BLK-OUT[%d] seq=%llu num=%d r=%lld err=%d\n",
                 (int)getpid(), (unsigned long long)bseq, num, (long long)r, err);
     {
-        /* OCERZ_PIPELOG: byte-level FIFO traffic + kevent wakeups, to trace
-         * macdrv's OnMainThread completion signal (1-byte pipe writes). */
         static int plog = -1;
         if (plog < 0) plog = getenv("OCERZ_PIPELOG") ? 1 : 0;
         if (plog) {
@@ -4910,9 +4704,6 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
                         (unsigned long long)ocerz_ld(ke + 16, 8),
                         (unsigned long long)ocerz_ld(ke + 24, 8));
             }
-            /* EOF guard: every EV_EOF read-filter event gets a host-side
-             * truth check.  A reap-triggering EOF for an fd that is still
-             * open, still a pipe, and still readable is the smoking gun. */
             for (int64_t i = 0; i < (int64_t)r; i++) {
                 uint64_t ke = orig[3] + (uint64_t)i * 32;
                 uint16_t kfl = (uint16_t)ocerz_ld(ke + 10, 2);
@@ -5043,10 +4834,6 @@ static uint64_t ocerz_sc_find_universe(uint32_t uid)
     return address;
 }
 
-/* A host region the guest can legitimately hold a raw pointer to: kernel-
- * created device memory (IOKit / IOSurface / accelerator mappings) or memory
- * shared with another task.  ocerz's own heap, images and the JIT arena are
- * private/COW and never qualify. */
 int ocerz_host_region_is_device(uint64_t addr, int *prot_out)
 {
     mach_vm_address_t a = addr; mach_vm_size_t sz = 0;
@@ -5061,8 +4848,8 @@ int ocerz_host_region_is_device(uint64_t addr, int *prot_out)
     if (prot_out) *prot_out = info.protection;
     int shared = info.share_mode == SM_SHARED || info.share_mode == SM_TRUESHARED ||
                  info.share_mode == SM_SHARED_ALIASED;
-    int device = info.user_tag == VM_MEMORY_IOKIT || info.user_tag == 81 /* VM_MEMORY_IOSURFACE */ ||
-                 info.user_tag == 70 /* VM_MEMORY_IOACCELERATOR */;
+    int device = info.user_tag == VM_MEMORY_IOKIT || info.user_tag == 81 ||
+                 info.user_tag == 70;
     return (shared || device) && (info.protection & VM_PROT_READ);
 }
 
@@ -5169,17 +4956,8 @@ static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
     uint64_t haddr = ocerz_ld(reply_buf + 0x24, 8);
     if (haddr == 0 || (haddr >= ocerz_arena_lo && haddr < ocerz_arena_hi))
         return;
-    /* The shared cache is the other guest-visible window: guest code runs at
-     * these very addresses, so a reply that lands in it has nothing to
-     * relocate.  Moving it would mach_vm_deallocate() a range every image in
-     * the cache is linked against, and the hole is only noticed when some
-     * unrelated code touches the page.  Safari died that way one mach_msg
-     * after a mach_vm_map (id 4911) reply came back on a cache __DATA page:
-     * the next _platform_* access to it faulted and took the thread out. */
     if (ocerz_cache_region((uintptr_t)haddr))
         return;
-    /* a steered mach_vm_map already landed at a registered guest identity
-     * address: nothing to relocate (moving it would strand the kernel's record) */
     if (ocerz_low_base && haddr >= OCERZ_LOW_LIMIT && haddr < OCERZ_TOP_LO &&
         (uint64_t)(uintptr_t)ocerz_g2h(haddr) == haddr && ocerz_addr_committed(haddr) == 1)
         return;
@@ -5327,17 +5105,6 @@ static void ocerz_reply_relocate_ool(uint64_t reply_buf, uint32_t recv_size,
                    sizeof raw_descriptor);
 
             uint64_t bytes = (type == 2) ? (uint64_t)ool_n * 4u : ool_n;
-            /* The shared cache is guest-visible memory, not host-only memory
-             * the kernel just handed us: there is nothing to copy out of it,
-             * and ocerz_release_received_ool() would mach_vm_deallocate() a
-             * range every image in the cache is linked against.  The page
-             * comes back zero-filled on the next fault, so the damage only
-             * shows up when unrelated code reads a constant and gets 0 --
-             * Safari tripped a Swift precondition in Engram that way, a
-             * whole framework away from the message that caused it.
-             * ocerz_host_in_guest_reservation() only knows the arena, hence
-             * the explicit cache test (mig_vm_reply_relocate needs the
-             * same guard, for the same reason). */
             int host_owned = ool_addr &&
                              !ocerz_host_in_guest_reservation(
                                  (const void *)(uintptr_t)ool_addr) &&
@@ -5461,11 +5228,6 @@ static void ocerz_vmmsg_trace(const char *phase, uint64_t msg, uint32_t size_lim
     fprintf(stderr, "\n");
 }
 
-/* thread_suspend (3605), thread_resume (3606) and thread_get_state (3603)
- * sent to a thread running guest code: answered here, with the reply the
- * kernel would have written (see ocerz_vm_thread_suspend in vm.c).  Returns
- * 0 to send the message on to the kernel instead: a port that is not such a
- * thread, a state flavor not produced here, or OCERZ_NO_THREADACT=1. */
 static int thread_act_emulate(OcerzCPU *cpu, uint64_t buf, uint32_t id, uint32_t rcv_size)
 {
     static int off = -1;
@@ -5485,13 +5247,12 @@ static int thread_act_emulate(OcerzCPU *cpu, uint64_t buf, uint32_t id, uint32_t
         uint64_t g[16], rip, rfl;
         if ((flavor != 4 && flavor != 7) || ocerz_vm_thread_regs(port, g, &rip, &rfl) < 0)
             return 0;
-        /* x86_thread_state64_t: rax rbx rcx rdx rdi rsi rbp rsp r8-r15 rip rflags cs fs gs */
         uint64_t s[21] = { g[OCERZ_RAX], g[OCERZ_RBX], g[OCERZ_RCX], g[OCERZ_RDX],
                            g[OCERZ_RDI], g[OCERZ_RSI], g[OCERZ_RBP], g[OCERZ_RSP],
                            g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15],
                            rip, rfl | OCERZ_FLAG_FIXED1, 0x2b, 0, 0 };
         uint32_t at = 0;
-        if (flavor == 7) {              /* x86_THREAD_STATE: {flavor, count}, then the 64-bit state */
+        if (flavor == 7) {
             st[0] = 4;
             st[1] = 42;
             at = 2;
@@ -5503,20 +5264,20 @@ static int thread_act_emulate(OcerzCPU *cpu, uint64_t buf, uint32_t id, uint32_t
     if (kr < 0)
         return 0;
     uint32_t size = (id == 3603 && kr == KERN_SUCCESS) ? 40 + cnt * 4 : 36;
-    ocerz_st(buf + 0, 4, 0x1200);       /* MACH_MSGH_BITS(0, PORT_SEND_ONCE): a kernel reply as received */
+    ocerz_st(buf + 0, 4, 0x1200);
     ocerz_st(buf + 4, 4, size);
     ocerz_st(buf + 8, 4, 0);
     ocerz_st(buf + 12, 4, reply_port);
     ocerz_st(buf + 16, 4, 0);
     ocerz_st(buf + 20, 4, id + 100);
-    ocerz_st(buf + 24, 8, 0x0000000100000000ull);   /* NDR_record: little-endian ints */
+    ocerz_st(buf + 24, 8, 0x0000000100000000ull);
     ocerz_st(buf + 32, 4, (uint32_t)kr);
     if (size > 36) {
         ocerz_st(buf + 36, 4, cnt);
         for (uint32_t i = 0; i < cnt; i++)
             ocerz_st(buf + 40 + 4 * i, 4, st[i]);
     }
-    ocerz_st(buf + size, 4, 0);         /* MACH_MSG_TRAILER_FORMAT_0, 8 bytes */
+    ocerz_st(buf + size, 4, 0);
     ocerz_st(buf + size + 4, 4, 8);
     mach_ret(cpu, KERN_SUCCESS);
     return 1;
@@ -5524,7 +5285,7 @@ static int thread_act_emulate(OcerzCPU *cpu, uint64_t buf, uint32_t id, uint32_t
 
 static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 {
-    {   /* OCERZ_STRACE_CPU: mirror for mach traps */
+    {
         static int scpu = -2;
         if (scpu == -2) {
             const char *e2 = getenv("OCERZ_STRACE_CPU");
@@ -5651,9 +5412,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                 mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
                 break;
             }
-            /* only a map that actually happened can make translations stale
-             * (a JS engine probing thousands of denied fixed reservations
-             * must not trigger an invalidation walk per attempt) */
             invalidate_guest_mapping(vm, want, size);
             mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
             break;
@@ -5742,7 +5500,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         {
             static int klog3 = -1;
             if (klog3 < 0) klog3 = getenv("OCERZ_KICKLOG") ? 1 : 0;
-            if (klog3 && rg == 14 /* KERN_ABORTED */)
+            if (klog3 && rg == 14)
                 fprintf(stderr, "ocerz: KICKRET[%d] cpu#%u %s -> ABORTED rip=%#llx\n",
                         (int)getpid(), cpu->cpu_number, mach_trap_name(num),
                         (unsigned long long)cpu->rip);
@@ -5766,7 +5524,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             nsv31 = ocerz_send_xlate_descriptors(gmsg31, (uint32_t)ocerz_ld(gmsg31 + 4, 4), sv31, 64);
         ocerz_vmmsg_trace("REQ", gmsg31,
                           gmsg31 ? (uint32_t)ocerz_ld(gmsg31 + 4, 4) : 0);
-        if ((a[1] & 0x2) && gmsg31)            /* MACH_RCV_MSG: the reply is copied out here */
+        if ((a[1] & 0x2) && gmsg31)
             disarm_guest_buffer(cpu, gmsg31, (uint32_t)a[3]);
         if (a[0] != 0)
             a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
@@ -5777,8 +5535,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         {
             static int norlk31 = -1;
             if (norlk31 < 0) norlk31 = getenv("OCERZ_NO_RCV_TIMEOUT_KICK") ? 1 : 0;
-            /* receive-only, never a combined send+receive MIG RPC (see the
-             * mach_msg2 site below for the full rationale) */
         }
         mach_ret(cpu, r31);
         if (nsv31)
@@ -5855,7 +5611,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 
         a[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
         a[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
-        if ((a[1] & 0x2) && reply_buf) {       /* MACH_RCV_MSG: the reply is copied out here */
+        if ((a[1] & 0x2) && reply_buf) {
             if (vector_mode)
                 disarm_guest_buffer(cpu, ocerz_ld(reply_buf + 8, 8), (uint32_t)ocerz_ld(reply_buf + 20, 4));
             else
@@ -5908,7 +5664,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                     (uint32_t)ocerz_ld(request_buf + 0xc, 4),
                     (uint32_t)ocerz_ld(request_buf + 0x14, 4), nsv47);
         {
-            /* pre-trap request dump for IOKit MIG (the reply overwrites the buffer) */
             static int iomigq = -1;
             if (iomigq < 0) { const char *e = getenv("OCERZ_IOKITMIG"); iomigq = e ? atoi(e) : 0; }
             uint32_t qid = request_buf ? (uint32_t)ocerz_ld(request_buf + 0x14, 4) : 0;
@@ -5985,8 +5740,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         uint64_t r47 = ocerz_host_mach_trap(num, a);
         cpu->block_since_ns = 0;
         {
-            /* OCERZ_MSGSPIN: every 65536th mach_msg, print who is calling
-             * and what it gets back - catches busy receive loops. */
             static int msl = -1;
             static _Atomic unsigned long long msn;
             if (msl < 0) msl = getenv("OCERZ_MSGSPIN") ? 1 : 0;
@@ -6003,7 +5756,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                         (unsigned long long)a[1], (unsigned long long)r47,
                         (unsigned long long)a[5], (unsigned long long)a[6],
                         (unsigned long long)a[7], sid, sdst);
-                /* guest caller chain: return addr + rbp frame walk */
                 uint64_t sp = cpu->gpr[OCERZ_RSP], fp = cpu->gpr[5];
                 if (sp && ocerz_addr_committed(sp) == 1)
                     fprintf(stderr, " bt=%#llx", (unsigned long long)ocerz_ld(sp, 8));
@@ -6016,8 +5768,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             }
         }
         {
-            /* OCERZ_WAKELOG: trace CFRunLoopWakeUp-sized traffic (tiny
-             * msgh_id==0 messages) to catch lost run-loop wakeups. */
             static int wklog = -1;
             if (wklog < 0) wklog = getenv("OCERZ_WAKELOG") ? 1 : 0;
             if (wklog) {
@@ -6049,11 +5799,9 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                 }
             }
         }
-        /* A kicked (unstick) receive returns MACH_RCV_INTERRUPTED; CFRunLoop handles that by RETRYING */
         {
             static int norlk = -1;
             if (norlk < 0) norlk = getenv("OCERZ_NO_RCV_TIMEOUT_KICK") ? 1 : 0;
-            /* Receive-ONLY calls: CFRunLoop retries an interrupted receive without re-checking its sources */
             {
                 static int islog = -1; static int islogn;
                 if (islog < 0) islog = getenv("OCERZ_MACHSLOW") ? 1 : 0;
@@ -6129,8 +5877,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_reply_alias_iokit(vm, mach_reply_buf, mach_reply_size);
         {
-            /* OCERZ_MSGHEX=<request id|all>: dump the request and reply words of a
-             * mach_msg2 round trip as the guest sees them (after any relocation). */
             static int msghex = -2;
             if (msghex == -2) { const char *e = getenv("OCERZ_MSGHEX"); msghex = e ? (!strcmp(e, "all") ? -1 : atoi(e)) : 0; }
             if (msghex && request_buf != 0) {
@@ -6157,16 +5903,11 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             }
         }
         {
-            /* light IOKit MIG log: request id 2800..2999 -> reply id, RetCode/first words.
-             * Level 2 also prints reply port descriptors (entry/iterator ports handed to
-             * the guest) and, on MACH_SEND_INVALID_DEST, the host's view of the dest name. */
             static int iomig = -1;
             if (iomig < 0) { const char *e = getenv("OCERZ_IOKITMIG"); iomig = e ? atoi(e) : 0; if (e && !iomig) iomig = 1; }
             if (iomig && request_buf != 0) {
                 uint32_t rid = (uint32_t)ocerz_ld(request_buf + 0x14, 4);
                 if (rid >= 2800 && rid < 3000) {
-                    /* mach_msg2: header ports live in the trap scalars (a[3] = remote|local),
-                     * the buffer header copy is often zeroed */
                     uint32_t dport = (uint32_t)a[3];
                     if (!dport) dport = (uint32_t)ocerz_ld(request_buf + 8, 4);
                     uint32_t repid = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4) : 0;
@@ -6175,7 +5916,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                     uint32_t rbits = mach_reply_buf ? (uint32_t)ocerz_ld(mach_reply_buf, 4) : 0;
                     fprintf(stderr, "ocerz: IOKITMIG[%d] req=%u rport=%#x -> kr=%#llx reply_id=%u bits=%#x w0=%#x w1=%#x\n",
                             (int)getpid(), rid, dport, (unsigned long long)r47, repid, rbits, w0, w1);
-                    if (r47 == 0x10000003ull /* MACH_SEND_INVALID_DEST */) {
+                    if (r47 == 0x10000003ull) {
                         mach_port_type_t pt = 0;
                         kern_return_t tkr = mach_port_type(mach_task_self(), dport, &pt);
                         fprintf(stderr, "ocerz: IOKITMIG[%d]   dest %#x host mach_port_type kr=%d type=%#x\n",
@@ -6207,7 +5948,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                                 qoff += 12;
                             } else { qoff += 16; }
                         }
-                        /* inline body head (the matching dict may be inline, not ool) */
                         fprintf(stderr, "ocerz: IOKITMIG[%d]     body:", (int)getpid());
                         for (uint64_t o = 0x18; o < 0x58 && o + 4 <= qsize; o += 4)
                             fprintf(stderr, " %08x", (uint32_t)ocerz_ld(request_buf + o, 4));
@@ -6218,7 +5958,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                         uint64_t doff = 0x1c;
                         for (uint32_t d = 0; d < dcnt && d < 16; d++) {
                             uint8_t ty = (uint8_t)ocerz_ld(mach_reply_buf + doff + 11, 1);
-                            if (ty == 0) {   /* port descriptor */
+                            if (ty == 0) {
                                 fprintf(stderr, "ocerz: IOKITMIG[%d]   reply_id=%u port-desc[%u]=%#x disp=%u\n",
                                         (int)getpid(), repid, d,
                                         (uint32_t)ocerz_ld(mach_reply_buf + doff, 4),
@@ -6436,7 +6176,6 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     return OCERZ_STEP_OK;
 }
 
-/* wine's LDT_SIZE is 8192 (dlls/ntdll/unix/signal_i386.c), and its WoW64 code segment routinely */
 #define OCERZ_LDT_MAX 8192
 struct ocerz_ldt_entry {
     uint64_t base;
@@ -6450,10 +6189,8 @@ struct ocerz_ldt_entry {
 static struct ocerz_ldt_entry g_ldt[OCERZ_LDT_MAX];
 static int g_ldt_next = 1;
 static pthread_mutex_t g_ldt_lock = PTHREAD_MUTEX_INITIALIZER;
-/* Has the guest ever installed a present LDT descriptor? This is the one bit that separates "an */
 static volatile int g_ldt_installed;
 
-/* An LDT selector's index is sel >> 3, and index 0 is a perfectly ordinary entry: the "null */
 uint64_t ocerz_ldt_base(uint32_t sel)
 {
     uint32_t idx = sel >> 3;
@@ -6475,7 +6212,6 @@ int ocerz_ldt_installed(void)
     return g_ldt_installed;
 }
 
-/* Descriptor bit 53, the L bit: set on a 64-bit code segment. */
 int ocerz_ldt_is_long(uint32_t sel)
 {
     uint32_t idx = sel >> 3;
@@ -6484,9 +6220,6 @@ int ocerz_ldt_is_long(uint32_t sel)
     return g_ldt[idx].present && g_ldt[idx].is_long;
 }
 
-/* Install one LDT descriptor directly, without a guest page to unpack it from.
- * dispatch_machdep_ldt() below is the guest-facing route; this is the same
- * effect for callers already inside the emulator. */
 void ocerz_ldt_install(uint32_t sel, uint64_t base, uint32_t limit,
                        uint8_t access, int big, int is_long, int gran)
 {
@@ -6555,9 +6288,6 @@ static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
             idx = g_ldt_next;
             g_ldt_next += (int)count;
         } else {
-            /* An explicit index of 0 is legal: see the note on ocerz_ldt_base.
-             * wine hands i386_set_ldt the index it wants, and rejecting 0 here
-             * would turn a valid install into EINVAL. */
             idx = (int)start;
             if (idx < 0 || idx + (int)count > OCERZ_LDT_MAX) {
                 pthread_mutex_unlock(&g_ldt_lock);
@@ -6663,14 +6393,6 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
     return OCERZ_STEP_FATAL;
 }
 
-
-/* OCERZ_WRITETRAP=<substring>: when the guest write()s or writev()s a buffer
- * containing the substring, print the PE-side stack (through the wine
- * syscall frame at TEB+0x378) so a logged message can be traced to the code
- * that emitted it -- used to place Chromium's NOTREACHED log lines. */
-/* Print the PE-side stack of the calling guest thread (wine 11.0 syscall
- * frame at TEB+0x378, user rsp at +0x88): every slot that looks like a code
- * address, for symbolising with the module map. */
 static void pe_scan_print(OcerzCPU *cpu, const char *tag, const char *detail)
 {
     uint64_t teb = cpu->gs_base && ocerz_addr_readable(cpu->gs_base + 0x30) ? ocerz_ld(cpu->gs_base + 0x30, 8) : 0;
@@ -6709,10 +6431,6 @@ static void writetrap_check(OcerzCPU *cpu, int num)
                 hit = memmem(ocerz_g2h(b), (size_t)l, trap, tl) != NULL;
         }
     }
-    /* OCERZ_REQTRAP=<req>:<handlehex>: a wineserver request (64-byte header
-     * written with write() or as iov[0] of writev()) whose req number and
-     * handle field match.  Names the guest code that hands a bogus handle to
-     * the server, e.g. GetCurrentThread() to a file API. */
     static const char *rtrap = (const char *)-1;
     static int rreq = -1; static uint32_t rhandle = 0;
     if (rtrap == (const char *)-1) {
@@ -6733,11 +6451,6 @@ static void writetrap_check(OcerzCPU *cpu, int num)
     pe_scan_print(cpu, "WRITETRAP", "");
 }
 
-/* OCERZ_PAGETRAP=<guest addr>: every mapping change that covers that address
- * (mmap MAP_FIXED, munmap, mprotect, madvise) prints the PE stack of the
- * thread making it.  Names the code that decommits a page a later access
- * faults on (a freed object still referenced by a pending callback). */
-/* OCERZ_PAGETRAP=<addr>[:<len>] (declared above) */
 static void pagetrap_init(void)
 {
     if (g_pagetrap_lo != ~0ull) return;
@@ -6747,8 +6460,6 @@ static void pagetrap_init(void)
     char *end = NULL;
     uint64_t a = strtoull(e, &end, 0);
     uint64_t len = (end && *end == ':') ? strtoull(end + 1, NULL, 0) : 1;
-    /* a single address means its whole 16 KB host page: a sibling 4 KB guest
-     * page shares that page's protection */
     g_pagetrap_lo = len == 1 ? (a & ~0x3fffull) : a;
     g_pagetrap_hi = len == 1 ? g_pagetrap_lo + 0x4000 : a + len;
 }
@@ -6773,11 +6484,6 @@ static void pagetrap_check(OcerzCPU *cpu, int num)
     pe_scan_print(cpu, "PAGETRAP", d);
 }
 
-/* OCERZ_PEEKGUARD=<addr>: watch one guest word across the syscall boundary
- * and report the first call it changes across.  A store watch only sees the
- * guest's own stores; this catches the other two writers -- ocerz copying
- * into guest memory, and the kernel writing through a buffer ocerz handed
- * it -- by bracketing every syscall. */
 static void peekguard(OcerzCPU *cpu, int class, int num, const char *when)
 {
     static uint64_t addr, last;
@@ -6811,14 +6517,10 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
     peekguard(cpu, class, num, "entry");
 
     if (class == 2 && (num == 4 || num == 121 || num == 154 || num == 397 || num == 415))
-        writetrap_check(cpu, num == 121 ? 121 : 4);   /* write/pwrite family: buf=rsi len=rdx */
+        writetrap_check(cpu, num == 121 ? 121 : 4);
     if (class == 2 && (num == 73 || num == 74 || num == 75 || num == 197))
         pagetrap_check(cpu, num);
 
-    /* OCERZ_HOSTMASKLOG: the HOST signal mask of this thread at every syscall
-     * entry.  ocerz never touches host masks itself, so any change is news:
-     * a thread that reaches a blocking call with SIGUSR1 blocked at the host
-     * level can never be suspended by wineserver again. */
     static int hml = -1;
     if (hml < 0) hml = getenv("OCERZ_HOSTMASKLOG") ? 1 : 0;
     if (hml) {
@@ -6835,9 +6537,6 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
         }
     }
 
-    /* OCERZ_SIGCTXLOG: every syscall a guest signal handler makes, so a
-     * handler that never reaches the server (wine's usr1_handler must end in
-     * a select request) can be seen taking the wrong turn. */
     if (cpu->in_sighandler && OCERZ_ENV_ON("OCERZ_SIGCTXLOG"))
         fprintf(stderr, "ocerz: SIGCTX[%d] cpu#%u depth=%u sys=%d/%d rip=%#llx a0=%#llx a1=%#llx a2=%#llx\n",
                 (int)getpid(), cpu->cpu_number, cpu->in_sighandler, class, num,
@@ -6952,12 +6651,9 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
         return OCERZ_STEP_FATAL;
     }
 
-    /* Return edge: deliver what arrived during the call, and re-offer anything
-     * the mask was holding -- sigprocmask() and sigreturn() land here too, so
-     * lowering the mask releases held signals at once. */
     peekguard(cpu, class, num, "exit");
     if (rc == OCERZ_STEP_OK)
         deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig());
-    ocerz_vm_suspend_point(cpu);        /* a guest thread_suspend waits here, state consistent */
+    ocerz_vm_suspend_point(cpu);
     return rc;
 }

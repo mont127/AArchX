@@ -1,5 +1,24 @@
 #!/usr/bin/env bash
-# Runs every prebuilt guest binary under ./ocerz and diffs stdout against its golden.
+# Runs every prebuilt guest binary under ./ocerz and diffs stdout against its
+# golden.
+#
+# The same binaries are run several ways, because each configuration reaches
+# code the others cannot. The ordered-memory (multi-observer) model sends the
+# RMW and atomic emitters down the LSE and ldapr/stlr paths, so the tests that
+# exercise them are run again under OCERZ_NO_PLAIN_MEM=1. A tiny code arena
+# makes almost every block run through the interpreted-block path, which is
+# where a superblock side exit taken mid-block must stop the block -- the bug
+# fixed 2026-08-17, where the rest of the block ran on after a taken jcc, was
+# crashing roughly 1 in 150 wine runs. A 512 KB arena puts ~650k blocks through
+# that path.
+#
+# The dynamic-mode case is a real Mach-O from the x86_64 shared cache world:
+# the synthetic guests all run in plain/static mode, so it is the only test
+# here that exercises the commpage guard, dyld-cache-sized block counts and the
+# hostwq path. It is skipped, not counted, when no x86_64 Wine is installed.
+#
+# Note that insn_count only ticks in the interpreter, so a fully-JITed loop
+# never reaches an ICOUNT.
 
 set -u
 
@@ -73,7 +92,7 @@ test_args() {
 
 test_env() {
     case "$1" in
-        interrupt_test) echo "OCERZ_TEST_ASYNC_STOP_MS=200" ;;   # insn_count only ticks in the interpreter; fully-JITed loops never reach an ICOUNT
+        interrupt_test) echo "OCERZ_TEST_ASYNC_STOP_MS=200" ;;
         link_spin) echo "OCERZ_TEST_ASYNC_STOP_MS=200" ;;
         *) echo "" ;;
     esac
@@ -144,9 +163,6 @@ for name in "${NAMES[@]}"; do
     fi
 done
 
-# Ordered-memory (multi-observer) model: the RMW/atomic emitters take the LSE
-# and ldapr/stlr paths there; run the tests that exercise them under
-# OCERZ_NO_PLAIN_MEM=1 as well.
 for name in jit_rmw jit_scan jit_ops jit_bt jit_align jit_align2 jit_movq jit_sse jit_misc2 unaligned_order; do
     bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
     [ -x "$bin" ] && [ -f "$golden" ] || continue
@@ -162,10 +178,6 @@ for name in jit_rmw jit_scan jit_ops jit_bt jit_align jit_align2 jit_movq jit_ss
     fi
 done
 
-# Interpreted-block path (jit_interp_block: blocks without code once the arena
-# is full).  A tiny arena makes almost every block run through it; superblock
-# side exits taken mid-block must stop the block (bug fixed 2026-08-17: the
-# rest of the block ran after a taken jcc -> guest crashes 1/150 wine runs).
 for name in branches jit_ops jit_misc2 fib strings; do
     bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
     [ -x "$bin" ] && [ -f "$golden" ] || continue
@@ -181,10 +193,6 @@ for name in branches jit_ops jit_misc2 fib strings; do
     fi
 done
 
-# Dynamic-mode smoke test: a real Mach-O from the x86_64 shared cache world.
-# The synthetic guests all run in plain/static mode; this is the only test
-# that exercises the commpage guard, dyld-cache-sized block counts and the
-# hostwq path.  Skipped (not counted) when no x86_64 Wine is installed.
 WINE_BIN="${OCERZ_WINE:-$HOME/Wine Devel.app/Contents/Resources/wine/bin/wine}"
 if [ -x "$WINE_BIN" ]; then
     export OCERZ_HOSTWQ=1
@@ -206,8 +214,6 @@ if [ -x "$WINE_BIN" ]; then
             tail -20 "$ACTUAL_ERR" | sed 's/^/  | /' >&2
         fi
     fi
-    # the same run with a 512 KB code arena: ~650k blocks go through
-    # jit_interp_block (superblock side exits, records, redirects)
     export OCERZ_HOSTWQ=1 OCERZ_JIT_CODE_KB=512
     TIMEOUT_SECS=120
     run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$WINE_BIN" --version

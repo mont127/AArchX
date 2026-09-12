@@ -1,4 +1,5 @@
-/* dec32probe -- read hex instruction bytes, print one canonical decode record.
+/*
+ * dec32probe -- read hex instruction bytes, print one canonical decode record.
  *
  * The i386 counterpart of decodiff: where decodiff proves 64-bit decoding is
  * unchanged, this feeds a real disassembler (capstone CS_MODE_32, driven by
@@ -8,11 +9,13 @@
  *   dec32probe                    -- decode stdin lines in 32-bit mode
  *   dec32probe 64                 -- ... in 64-bit mode (A/B on shared paths)
  *   dec32probe sweep <M> <out>    -- exhaustive 2^24 length sweep, one byte
- *                                    per three-byte opening (0 == decode
- *                                    error), for dec32-oracle.py's sweep suite
+ *                                   per three-byte opening (0 == decode
+ *                                   error), for dec32-oracle.py's sweep suite
  *
- * Each stdin line is whitespace-separated hex bytes.  Output is one line per
- * input line: either "ERR rc=N" or a canonical field dump.
+ * Each stdin line is whitespace-separated hex bytes; output is one line per
+ * input line, either "ERR rc=N" or a canonical field dump.  Inputs are padded
+ * to 16 bytes with NOPs so a short test string is never a spurious ETRUNC --
+ * the decoder must still report the true length.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,8 +73,6 @@ int main(int argc, char **argv)
         }
         if (n == 0)
             continue;
-        /* Pad to 16 with NOPs so a short test string is never a spurious
-         * ETRUNC; the decoder must still report the true length. */
         while (n < 16)
             code[n++] = 0x90;
 

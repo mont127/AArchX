@@ -1,4 +1,6 @@
-/* Mini-dyld: runs a dynamically-linked x86_64 Mach-O without Apple's dyld. */
+/*
+ * Mini-dyld: runs a dynamically-linked x86_64 Mach-O without Apple's dyld.
+ */
 #ifndef OCERZ_DYLD_H
 #define OCERZ_DYLD_H
 
@@ -19,6 +21,6 @@ uint64_t ocerz_dlerror(void);
 void ocerz_dyld_dump_images(void);
 const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out);
 uint64_t ocerz_dyld_resolve_guest_sym(const char *name);
-extern uint64_t ocerz_exc_trap_rip;   /* OCERZ_EXCLOG: guest _objc_exception_throw */
+extern uint64_t ocerz_exc_trap_rip;
 
 #endif

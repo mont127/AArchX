@@ -1,4 +1,24 @@
-#!/usr/bin/env python3
+# The capstone CS_MODE_32 oracle for the i386 decode gate: compares
+# dec32probe's canonical records field by field against a real disassembler.
+#
+# Two classes of deliberate divergence are encoded here, and neither is a bug
+# being papered over. First, ocerz models only the segments that can have a
+# nonzero base in the memory models it targets (NONE/FS/GS), folding
+# CS/DS/ES/SS overrides to NONE because they are flat in both long mode and
+# i386 Windows -- so the comparator accepts ocerz's NONE against any of the
+# flat four. Second, a short list of encodings where ocerz differs on purpose:
+#
+#   0x63        MOVSXD in long mode, ARPL in i386. Which OPERATION a byte names
+#               is the opcode-map stage's business, not this gate's.
+#   0F B9       UD1. ocerz consumes a ModRM byte, capstone stops at two bytes.
+#               Pre-existing and bit-identical in both modes (the decodiff
+#               digest pins it), so it is not an i386 question.
+#   66 0F C8+r  BSWAP with a 16-bit operand size. The SDM states the result is
+#               UNDEFINED for 16-bit operands, so there is no correct answer to
+#               match; ocerz keeps naming the 32-bit register.
+#
+# capstone also names an absent SIB index "riz"/"eiz", which the comparator
+# normalises away.
 """dec32-oracle -- differential 32-bit decode check against capstone.
 
 decodiff proves 64-bit decoding never changes.  This is the other gate: it
@@ -45,11 +65,6 @@ from capstone.x86 import X86_REG_INVALID
 
 BASE = 0x00401000
 
-# ocerz models only the two segments that can have a nonzero base in the
-# memory models it targets: OCERZ_SEG_NONE / FS / GS (include/ocerz/cpu.h).
-# CS/DS/ES/SS overrides are folded to NONE because they are flat (base 0) in
-# both long mode and i386 Windows.  That is a deliberate modelling choice, so
-# the comparator accepts ocerz's NONE against any of the flat four.
 OZSEG = [None, "fs", "gs"]
 FLAT_SEGS = (None, "cs", "ds", "es", "ss")
 
@@ -59,7 +74,6 @@ def seg_match(ozseg, csseg):
         return csseg in FLAT_SEGS
     return ozseg == csseg
 
-# ocerz GPR numbering (include/ocerz/cpu.h) -> capstone register-name stem.
 GPR = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di",
        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
 
@@ -78,7 +92,6 @@ def ocerz_regname(num, size, high8):
             return "e" + stem
         if size == 2:
             return stem
-        # 1-byte low registers: al/cl/dl/bl, then spl/bpl/sil/dil
         return ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil"][num]
     stem = GPR[num]
     return {8: stem, 4: stem + "d", 2: stem + "w", 1: stem + "b"}[size]
@@ -88,19 +101,6 @@ def addr_regname(num, addrsize):
     """A base/index register is named at the ADDRESS size, not the operand's."""
     return ocerz_regname(num, addrsize, 0)
 
-
-# Encodings where ocerz deliberately differs from capstone.  Every entry is a
-# decision with a reason, not a bug being papered over; nothing here is in the
-# addressing/width lane this gate covers.
-#
-#   0x63     -- MOVSXD in long mode, ARPL in i386.  Which OPERATION a byte
-#               names is the opcode-map stage's business, not this one.
-#   0F B9    -- UD1.  ocerz consumes a ModRM byte, capstone stops at two
-#               bytes.  Pre-existing and bit-identical in both modes (the
-#               decodiff digest pins it), so it is not an i386 question.
-#   66 0F C8+r -- BSWAP with a 16-bit operand size.  The SDM states the result
-#               is UNDEFINED for 16-bit operands, so there is no correct
-#               answer to match; ocerz keeps naming the 32-bit register.
 def excluded(seq):
     b = [x for x in seq]
     i = 0
@@ -207,9 +207,6 @@ class Checker:
             c, z = cs_mems[0].mem, oz_mems[0]
             cb = None if c.base == X86_REG_INVALID else ci.reg_name(c.base)
             cx = None if c.index == X86_REG_INVALID else ci.reg_name(c.index)
-            # capstone names an absent SIB index "riz"/"eiz", and names the
-            # RIP-relative base "rip"/"eip"; ocerz spells both as REG_NONE,
-            # the latter flagged by riprel.  Normalise, do not "fix".
             if cx in ("riz", "eiz"):
                 cx = None
             if cb in ("rip", "eip"):
@@ -234,8 +231,6 @@ class Checker:
                 self.fail(seq, "scale %d, capstone %d (%s %s)" %
                           (zsc, csc, ci.mnemonic, ci.op_str))
                 return
-            # ocerz folds a RIP-relative disp into an absolute target; capstone
-            # reports the raw displacement.  Only 64-bit mode can hit this.
             zd = z["d"]
             if z["rip"]:
                 zd -= BASE + ci.size
@@ -244,22 +239,6 @@ class Checker:
                           (zd & amask, c.disp & amask, ci.mnemonic, ci.op_str))
                 return
 
-            # Memory operand WIDTH is compared only where ocerz and capstone
-            # agree on what the field means.  Three documented exclusions,
-            # every one of them a pre-existing 64-bit modelling choice rather
-            # than an i386 question:
-            #   - size 0 is ocerz's "width does not apply" marker (fxsave...)
-            #   - SSE/x87 operands: ocerz records the register width, capstone
-            #     the memory width (movlps: 16 vs 8)
-            #   - callf/jmpf: ocerz's opsize is the far pointer's OFFSET width
-            #     (src/interp.c reads sel at ea+opsize), capstone's is the
-            #     whole m16:32.  capstone is also self-inconsistent here.
-            #   - les/lds (c4/c5): the same far-pointer disagreement seen from
-            #     the other side.  The source operand IS a whole m16:32, so the
-            #     SDM width is 6 with a 32-bit operand size and 4 with a 16-bit
-            #     one, and that is what src/decode.c records; capstone reports
-            #     4 for both forms, i.e. the offset half only.  Deliberate
-            #     divergence, documented at the decode site as well.
             wide = any(o["k"] in (2, 3) for o in rec["ops"])
             if (z["sz"] and not wide
                     and rec["op"] not in ("callf", "jmpf", "les", "lds")
@@ -278,11 +257,6 @@ class Checker:
         cs_regs = [o for o in ci.operands if o.type == CS_OP_REG]
         oz_regs = [o for o in rec["ops"] if o["k"] == 1]
         if want_reg and len(cs_regs) == len(oz_regs) and cs_regs:
-            # As a MULTISET: ocerz and capstone disagree on operand ORDER for
-            # some encodings (capstone prints "xchg ecx, eax" where ocerz
-            # records eAX first), and capstone's print order is not an
-            # authority on ocerz's internal order.  Register identity and
-            # width, which is what this stage changes, is order-free.
             cn = sorted(ci.reg_name(c.reg) for c in cs_regs)
             zn = sorted(ocerz_regname(z["r"], z["sz"], z["h8"])
                         for z in oz_regs)
@@ -319,17 +293,12 @@ class Checker:
             print("    x%-6d %-46s e.g. %s" % (len(seqs), key, seqs[0]))
         return ok
 
-
-# ---------------------------------------------------------------- suites ---
-
-# Opcodes with a ModRM byte and a plain r/m32 or r32 operand, safe to sweep.
 MODRM_OPCODES = [
     (0x01,), (0x03,), (0x09,), (0x0B,), (0x21,), (0x23,), (0x29,), (0x2B,),
     (0x31,), (0x33,), (0x39,), (0x3B,), (0x85,), (0x89,), (0x8B,), (0x8D,),
     (0x87,), (0xC7,), (0xF7,), (0xFF,),
     (0x0F, 0xB6), (0x0F, 0xB7), (0x0F, 0xAF), (0x0F, 0x10), (0x0F, 0x28),
 ]
-# Byte-operand ModRM opcodes: these are where AH..BH must appear.
 MODRM8_OPCODES = [(0x00,), (0x02,), (0x08,), (0x0A,), (0x30,), (0x32,),
                   (0x38,), (0x3A,), (0x84,), (0x86,), (0x88,), (0x8A,),
                   (0x0F, 0x90), (0x0F, 0x94), (0x0F, 0x9F)]
@@ -377,8 +346,6 @@ def suite_modrm16(probe):
     seqs = sweep_modrm([(0x8B,), (0x89,), (0x8D,), (0x8A,), (0x88,)],
                        prefixes=[0x67])
     c.check(seqs)
-    # 0x67 combined with 0x66 (16-bit operand AND 16-bit address) and with a
-    # segment override, since those stack on the same path.
     for pre in ([0x66, 0x67], [0x67, 0x66], [0x64, 0x67], [0x67, 0x2E]):
         c.check(sweep_modrm([(0x8B,), (0x8D,)], prefixes=pre))
     return c.report("modrm16")
@@ -387,7 +354,6 @@ def suite_modrm16(probe):
 def suite_byteregs(probe):
     c = Checker(probe, 32)
     c.check(sweep_modrm(MODRM8_OPCODES))
-    # ALU imm8 group and mov r8,imm8 reach the 8-bit register path too.
     c.check([[0x80, m] + TAIL for m in range(0xC0, 0x100)])
     c.check([[0xB0 + r, 0x5A] + TAIL for r in range(8)])
     c.check([[0xFE, m] + TAIL for m in range(0xC0, 0x100)])
@@ -441,10 +407,6 @@ def suite_misc(probe):
     c.check([s + TAIL[:16 - len(s)] for s in seqs])
     return c.report("misc")
 
-
-# --- 64-bit spot checks: the same comparator, aimed at the paths this stage
-# --- touched, to catch a regression the decodiff digest could only report as
-# --- an opaque hash mismatch.
 def suite_rip64(probe):
     c = Checker(probe, 64)
     seqs = sweep_modrm([(0x8B,), (0x89,), (0x8D,)])
@@ -589,8 +551,6 @@ SUITES = {
     "sweep64": suite_sweep64,
 }
 
-# The exhaustive sweeps are slow (~2 min each) and are dominated by opcode-map
-# gaps that belong to another stage, so they are opt-in rather than default.
 DEFAULT = ["modrm32", "sib32", "modrm16", "byteregs", "opsize", "misc",
            "rip64", "detail32"]
 

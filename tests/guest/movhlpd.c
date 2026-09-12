@@ -19,7 +19,6 @@ int main(void){
     __asm__ volatile("movdqu %1, %%xmm0\n\tmovlpd %%xmm0, %0" : "=m"(r[0]) : "m"(A[0]) : "xmm0"); show("movlpd store ", r);
     r[0] = r[1] = 0;
     __asm__ volatile("movdqu %1, %%xmm0\n\tmovhps %%xmm0, %0" : "=m"(r[0]) : "m"(A[0]) : "xmm0"); show("movhps store ", r);
-    /* xorpd + movhpd: the AppKit identity-transform idiom */
     __asm__ volatile("xorpd %%xmm3, %%xmm3\n\tmovhpd %1, %%xmm3\n\tmovdqu %%xmm3, %0" : "=m"(r[0]) : "m"(M) : "xmm3"); show("xorpd+movhpd ", r);
     __asm__ volatile("movdqu %1, %%xmm0\n\tmovdqu %2, %%xmm1\n\tunpckhpd %%xmm1, %%xmm0\n\tmovdqu %%xmm0, %0" : "=m"(r[0]) : "m"(A[0]), "m"(B[0]) : "xmm0", "xmm1"); show("unpckhpd ", r);
     __asm__ volatile("movdqu %1, %%xmm0\n\tmovdqu %2, %%xmm1\n\tunpcklpd %%xmm1, %%xmm0\n\tmovdqu %%xmm0, %0" : "=m"(r[0]) : "m"(A[0]), "m"(B[0]) : "xmm0", "xmm1"); show("unpcklpd ", r);

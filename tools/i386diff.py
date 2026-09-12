@@ -1,4 +1,21 @@
-#!/usr/bin/env python3
+# The oracle half of the i386 decode gate: drives capstone CS_MODE_32, compares
+# it against the records tools/i386diff.c swept, and prints the classified
+# report. Wired to the C half by tools/i386diff.sh.
+#
+# Operand SHAPE bits are read out of capstone's operand text and mirror
+# shape_flags() in i386diff.c, because length and mnemonic agreement alone is
+# not a sufficient test. (Note 64-bit prints [rip+..] where 0x67 prints
+# [eip+..].)
+#
+# The mnemonic table maps a capstone mnemonic to the set of ocerz op names that
+# mean the same thing. ocerz's X86Insn deliberately carries coarse op classes --
+# one JCC, one SETCC, one MOVS for all widths -- with the detail in the
+# operands, so an exact string match is the wrong test. Every entry is an
+# equivalence, never a loosening: each says "these two names denote the same
+# instruction". The 64-bit calibration sweep (--mode 64, where ocerz is
+# known-good) is what keeps the table honest, since any gap in it shows up
+# there as a false MNEM. That is how PUSHA/POPA were caught reading as 0%
+# covered: the table guessed "push"/"pop" from before those ops existed.
 """i386diff -- oracle + report half of the 32-bit decode conformance gate.
 
 tools/i386diff.c sweeps every probe through ocerz's decoder and writes one
@@ -91,10 +108,7 @@ REC_DT = np.dtype([("status", "u1"), ("len", "u1"), ("flags", "u1"),
                    ("pad", "u1"), ("mnem", "<u2"), ("pad2", "<u2")])
 REC_SZ = REC_DT.itemsize
 
-# Operand SHAPE bits, read out of capstone's operand text.  Mirrors
-# shape_flags() in i386diff.c -- see the comment there for why length and
-# mnemonic agreement is not a sufficient test.
-_SH_RIP = re.compile(r"\[[re]ip\b")   # 64-bit prints [rip+..], 0x67 prints [eip+..]
+_SH_RIP = re.compile(r"\[[re]ip\b")
 _SH_A16 = re.compile(r"\[(?:bx|bp|si|di)\b")
 _SH_R64 = re.compile(r"\b(?:r[abcds][xip]|r8|r9|r1[0-5])\b")
 _SH_H8 = re.compile(r"\b[abcd]h\b")
@@ -141,16 +155,6 @@ def shape_bad(o_fl, c_fl):
             | ((o_fl & ~c_fl) & SH_R64)
             | ((o_fl ^ c_fl) & SH_H8))
 
-# --------------------------------------------------------------------------
-# capstone mnemonic -> the set of ocerz op names that mean the same thing
-# --------------------------------------------------------------------------
-# ocerz's X86Insn deliberately carries coarse op classes (one JCC, one SETCC,
-# one MOVS for all widths) with the detail in the operands, so an exact string
-# match is the wrong test.  Everything here is an equivalence, never a
-# loosening: each entry says "these two names denote the same instruction".
-# The 64-bit calibration sweep (--mode 64, where ocerz is known-good) is what
-# keeps this table honest -- any gap in it shows up there as a false MNEM.
-
 _PFX_WORDS = {"lock", "rep", "repe", "repz", "repne", "repnz", "bnd",
               "notrack", "xacquire", "xrelease", "data16", "data32",
               "addr16", "addr32"}
@@ -160,32 +164,24 @@ _CC = {"o", "no", "b", "c", "nae", "ae", "nb", "nc", "e", "z", "ne", "nz",
        "ge", "nl", "le", "ng", "g", "nle"}
 
 _ALIAS = {
-    # stack / flags / sign-extend accumulators: width suffix, same op
     "pushf": "pushf", "pushfd": "pushf", "pushfq": "pushf",
     "popf": "popf", "popfd": "popf", "popfq": "popf",
-    # PUSHA/POPA: stage 4a gives these their own ops, named "pusha"/"popa".
-    # (This table originally guessed "push"/"pop", from before those ops
-    # existed; the guess is what made 60/61 read as 0% covered.)
     "pushal": "pusha", "pushaw": "pusha", "pusha": "pusha",
     "popal": "popa", "popaw": "popa", "popa": "popa",
     "cbw": "cbw", "cwde": "cbw", "cdqe": "cbw",
     "cwd": "cwd", "cdq": "cwd", "cqo": "cwd",
-    # control transfer
     "jcxz": "jrcxz", "jecxz": "jrcxz", "jrcxz": "jrcxz",
     "lcall": "callf", "ljmp": "jmpf",
     "iret": "iret", "iretd": "iret", "iretq": "iret",
     "retn": "ret", "lret": "retf",
-    # string ops: ocerz keeps one op and puts the width in the operands
     "movsb": "movs", "movsw": "movs", "movsq": "movs",
     "stosb": "stos", "stosw": "stos", "stosd": "stos", "stosq": "stos",
     "lodsb": "lods", "lodsw": "lods", "lodsd": "lods", "lodsq": "lods",
     "scasb": "scas", "scasw": "scas", "scasd": "scas", "scasq": "scas",
     "cmpsb": "cmps", "cmpsw": "cmps", "cmpsq": "cmps",
-    # x87 wait/no-wait spellings
     "wait": "fwait", "fwait": "fwait",
     "fstsw": "fnstsw", "fstcw": "fnstcw", "fclex": "fnclex",
     "finit": "fninit", "fstenv": "fnstenv",
-    # misc spellings
     "sal": "shl", "movabs": "mov",
     "cmpxchg8b": "cmpxchgxb", "cmpxchg16b": "cmpxchgxb",
     "prefetchnta": "prefetch", "prefetcht0": "prefetch",
@@ -195,56 +191,35 @@ _ALIAS = {
     "fcompi": "fcomip", "fucompi": "fucomip", "retfq": "retf",
 }
 
-# Genuinely ambiguous spellings: capstone reuses one mnemonic for a string op
-# and an SSE op (a5 "movsd" vs f2 0f 10 "movsd").  ocerz has separate ops whose
-# printed names collide the same way, so accept either.
 _MULTI = {
     "movsd": ("movs", "movsd"),
     "cmpsd": ("cmps", "cmpsd"),
-    "mov": ("mov", "mov_sreg"),          # 8c/8e segment moves print as "mov"
-    # 06/0e/16/1e and 07/17/1f: capstone spells the segment forms "push"/"pop"
-    # exactly like the register forms; ocerz keeps a distinct op because the
-    # operand is a segment index rather than a GPR.  Same instruction.
+    "mov": ("mov", "mov_sreg"),
     "push": ("push", "push_sreg"),
     "pop": ("pop", "pop_sreg"),
-    "nop": ("nop", "xchg"),              # 90 is xchg eax,eax
+    "nop": ("nop", "xchg"),
     "xchg": ("xchg", "nop"),
-    "call": ("call", "callf"),           # ff /3 far indirect prints as "call"
-    "jmp": ("jmp", "jmpf"),              # ff /5 likewise
+    "call": ("call", "callf"),
+    "jmp": ("jmp", "jmpf"),
 }
 
-# Places where ocerz's op enum is coarser than capstone's mnemonic set, or
-# spells the same instruction differently.  Every entry here was confirmed by
-# the 64-bit calibration sweep (tools/i386diff.sh . --mode 64), where ocerz is
-# the known-good decoder: they are pre-existing modelling choices, identical in
-# both modes, and therefore not i386 findings.  They are accepted, and the
-# report prints how many probes were accepted this way so the allowance stays
-# visible instead of quietly padding the coverage number.
 _COARSE = {
-    "fnsave": "fnstenv",     # dd /6: folded onto the environment-store op
-    "frstor": "fnstenv",     # dd /4: ditto
-    "ficom": "fcom",         # integer compare folded onto the float compare
+    "fnsave": "fnstenv",
+    "frstor": "fnstenv",
+    "ficom": "fcom",
     "ficomp": "fcomp",
     "fyl2xp1": "fyl2x",
-    "fxam": "fxch",          # d9 e5 -- looks like a genuine ocerz slip, but a
-                             # 64-bit one; out of scope for the i386 stages
+    "fxam": "fxch",
     "fnop": "nop",
-    # hint-shaped instructions ocerz decodes as a plain NOP.  Architecturally
-    # they ARE nops for a translator that does not model caches or MPX.
     "prefetchnta": "nop", "prefetcht0": "nop", "prefetcht1": "nop",
     "prefetcht2": "nop", "prefetchw": "nop", "prefetchwt1": "nop",
     "cldemote": "nop",
     "bndldx": "nop", "bndstx": "nop", "bndmov": "nop", "bndmk": "nop",
     "bndcl": "nop", "bndcu": "nop", "bndcn": "nop",
-    # the 66-prefixed double variants of moves and bitwise ops move exactly the
-    # same bits as their single counterparts; ocerz keeps one op for both
     "movupd": "movups", "movapd": "movaps", "andpd": "andps",
     "andnpd": "andnps", "orpd": "orps", "xorpd": "xorps",
 }
 
-# Things ocerz is not trying to decode at all: ring 0, port I/O, segmentation
-# and virtualisation.  Counted in the headline coverage, excluded from the
-# "user-mode" one, and listed so the split is auditable.
 NONGOAL = {
     "in", "out", "insb", "insw", "insd", "outsb", "outsw", "outsd",
     "cli", "sti", "lgdt", "lidt", "lldt", "ltr", "sldt", "str", "smsw",
@@ -280,9 +255,9 @@ def cs_classes(mnem):
             out.add("setcc")
         elif m.startswith("cmov") and m[4:] in _CC:
             out.add("cmovcc")
-        elif m.startswith("fcmov"):      # incl. fcmovu/fcmovnu (unordered)
+        elif m.startswith("fcmov"):
             out.add("fcmovcc")
-    out.add(m)          # the overwhelmingly common case: identical spelling
+    out.add(m)
     return frozenset(out)
 
 
@@ -298,21 +273,11 @@ def cs_base(mnem):
         parts.pop(0)
     return parts[0] if parts else ""
 
-
-# --------------------------------------------------------------------------
-# probe construction -- must match build_probe() in i386diff.c exactly
-# --------------------------------------------------------------------------
-
 def probe_bytes(i, p):
     if i < p["s3n"]:
         return bytes((i & 255, (i >> 8) & 255, (i >> 16) & 255)) + p["tail_a"]
     j = i - p["s3n"]
     return bytes((j & 255, (j >> 8) & 255)) + p["tail_b"]
-
-
-# --------------------------------------------------------------------------
-# oracle workers
-# --------------------------------------------------------------------------
 
 _W = {}
 
@@ -424,11 +389,6 @@ def oracle(p, mode, path, jobs, lo, hi, quiet=False):
     os.replace(path, final)
     return names
 
-
-# --------------------------------------------------------------------------
-# opcode signature (vectorised): the opcode byte after prefixes, or 0f00|second
-# --------------------------------------------------------------------------
-
 def opcode_sig(p, mode, lo, hi):
     n = hi - lo
     idx = np.arange(lo, hi, dtype=np.uint32)
@@ -469,11 +429,6 @@ def opcode_sig(p, mode, lo, hi):
 
 def sig_str(s):
     return "0f %02x" % (s & 0xFF) if s >= 0x0F00 else "%02x   " % s
-
-
-# --------------------------------------------------------------------------
-# report
-# --------------------------------------------------------------------------
 
 def human(x):
     return "{:,}".format(int(x))
@@ -519,11 +474,6 @@ def main():
     lo, hi = (p["s3n"], p["n"]) if args.quick else (0, p["n"])
     jobs = args.jobs or max(1, (os.cpu_count() or 4) - 2)
 
-    # The cache key covers everything that can change a cached byte: the sweep
-    # shape, the mode, the capstone version, AND the source of the two
-    # functions that produce the cached records.  Editing shape_of() and
-    # silently reusing yesterday's oracle file is exactly the stale-artifact
-    # trap decodiff-cmp.sh rebuilds decode.o to avoid.
     src = inspect.getsource(shape_of) + inspect.getsource(_run) + \
         _SH_RIP.pattern + _SH_A16.pattern + _SH_R64.pattern + _SH_H8.pattern
     key = hashlib.sha256(
@@ -557,7 +507,6 @@ def main():
     o_op = o["mnem"]
     c_mn = c["mnem"]
 
-    # name-agreement matrix: rows = capstone mnemonic id, cols = ocerz op id
     accept = np.zeros((max(len(cs_names), 1), len(names)), bool)
     oc_index = {}
     for i, nm in enumerate(names):
@@ -575,10 +524,6 @@ def main():
                 accept[i, j] = True
                 coarse[i, j] = True
         nongoal_row[i] = cs_base(mn) in NONGOAL
-        # ud0/ud1 are the "reserved, always faults" opcodes.  ocerz consumes a
-        # ModRM there (the modern SDM encoding), capstone does not; both mean
-        # #UD, nothing executes past either, and the disagreement is identical
-        # in 64-bit mode.  Counted, not classed as a length bug.
         knownlen_row[i] = cs_base(mn) in ("ud0", "ud1")
 
     both = o_ok & c_ok

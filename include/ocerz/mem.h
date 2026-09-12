@@ -1,4 +1,14 @@
-/* Guest memory: an affine guest to host mapping plus a reserved arena. */
+/*
+ * Guest memory: an affine guest-to-host mapping plus a reserved arena.
+ *
+ * The address predicates come in several strengths on purpose.  Fault
+ * attribution counts guest addresses below the arena (a NULL dereference is
+ * still the guest's fault), while the strict test covers only the actual
+ * reservation and excludes host allocations.  In identity mode a plain-form JIT
+ * access to the guest commpage range faults on an unmappable host address and
+ * the fault handler resolves it, so that range is deliberately not treated as
+ * invalid here.
+ */
 #ifndef OCERZ_MEM_H
 #define OCERZ_MEM_H
 
@@ -53,8 +63,6 @@ static inline int ocerz_host_in_guest_space(const void *haddr)
         uint64_t c = (uint64_t)(uintptr_t)ocerz_commpage;
         if (h - c < OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO)
             return 1;
-        /* identity mode: a plain-form JIT access to the guest commpage range
-         * faults on the unmappable host address; the fault handler resolves it */
         if (ocerz_guest_base == 0 && h - OCERZ_COMMPAGE_LO < OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO)
             return 1;
     }
@@ -64,11 +72,9 @@ static inline int ocerz_host_in_guest_space(const void *haddr)
         if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
             return 1;
     }
-    /* attribution: guest faults below arena_lo (e.g. NULL derefs) count */
     return h - ocerz_guest_base < ocerz_arena_hi;
 }
 
-/* strict: inside the actual reservation only (host allocations excluded) */
 static inline int ocerz_host_in_guest_reservation(const void *haddr)
 {
     uint64_t h = (uint64_t)(uintptr_t)haddr;

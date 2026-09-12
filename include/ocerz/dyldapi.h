@@ -1,4 +1,7 @@
-/* The dyld runtime API shim. */
+/*
+ * The dyld runtime API shim: the entry points libdyld's trampolines dispatch
+ * through.
+ */
 #ifndef OCERZ_DYLDAPI_H
 #define OCERZ_DYLDAPI_H
 

@@ -1,4 +1,11 @@
-#!/usr/bin/env python3
+# Runs a guest under a wall-clock and memory cap and guarantees nothing
+# survives it.
+#
+# Killing the process group is not enough on its own: Wine daemonizes out of
+# it, so processes are also tracked and killed by argv[0] basename. Our own
+# ancestors (the invoking shell) are never touched. After the group leader
+# exits, the group and the pattern set can still be alive -- wineserver and the
+# various services -- so teardown is given 3 s before the remainder is killed.
 """Watchdogged launcher for anything that may spawn emulated Wine processes.
 
     tests/safe_run.py [--timeout S] [--max-procs N] [--max-rss-gb G] [--log FILE] -- cmd args...
@@ -13,9 +20,9 @@ Wine session under ocerz without this.
 """
 import os, sys, time, signal, subprocess, argparse
 
-PATTERN = None      # also track/kill any process whose argv[0] basename equals this (Wine daemonizes out of the group)
+PATTERN = None
 SELF = os.getpid()
-ANCESTORS = set()   # never touch our own ancestors (the invoking shell)
+ANCESTORS = set()
 
 def find_ancestors():
     anc = set(); pid = os.getppid()
@@ -68,7 +75,7 @@ def phys_footprint(pid, fallback):
         buf = ctypes.create_string_buffer(1024)
         if _LIBC.proc_pid_rusage(pid, 0, buf) != 0:
             return fallback
-        return int.from_bytes(buf.raw[72:80], "little")   # rusage_info_v0.ri_phys_footprint
+        return int.from_bytes(buf.raw[72:80], "little")
     except Exception:
         return fallback
 
@@ -105,7 +112,7 @@ def main():
     out = open(a.log, "wb") if a.log else None
     p = subprocess.Popen(cmd, preexec_fn=os.setpgrp,
                          stdout=out if out else None, stderr=subprocess.STDOUT if out else None)
-    pgid = p.pid   # setpgrp: pgid == pid of the leader (same session: killpg allowed on macOS)
+    pgid = p.pid
     t0 = time.time(); reason = None; peak_n = 0; peak_rss = 0
     while True:
         rc = p.poll()
@@ -121,8 +128,6 @@ def main():
             kill_group(pgid, p)
             break
         if rc is not None and n > 0:
-            # leader exited but the group/pattern set lives on (wineserver,
-            # services): allow 3 s of teardown, then kill the rest
             main._lingering = getattr(main, "_lingering", 0) + 1
             if main._lingering > 10:
                 kill_group(pgid, p)

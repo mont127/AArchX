@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Generates the decoder cross-validation corpus using the host x86_64 assembler as the length oracle.
+# Generates the decoder cross-validation corpus using the host x86_64 assembler
+# as the length oracle: each instruction is assembled natively, and the bytes
+# and length the assembler produced become the expected answer that
+# tests/unit/test_corpus.c decodes and checks.
 
 set -euo pipefail
 

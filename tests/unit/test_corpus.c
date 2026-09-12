@@ -1,4 +1,8 @@
-/* Decoder length cross-validation against the host toolchain. */
+/*
+ * Decoder length cross-validation against the host toolchain: every row of
+ * tests/corpus/corpus.inc is decoded and its reported length checked against
+ * what the host x86_64 assembler actually emitted.
+ */
 #include "ocerz/decode.h"
 
 #include <stdio.h>

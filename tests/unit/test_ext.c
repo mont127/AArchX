@@ -1,4 +1,7 @@
-/* Unit tests for the extended interpreter ops. */
+/*
+ * Unit tests for the extended interpreter ops: string operations, CPUID and
+ * the rest of the long tail.
+ */
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/vm.h"

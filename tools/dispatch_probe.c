@@ -1,4 +1,7 @@
-/* Exercises one libdispatch primitive per run, so a hang pins the broken one. Build x86_64 and run under ocerz; see notes/wine_bringup.md UPDATE #30. */
+/*
+ * Exercises one libdispatch primitive per run, so a hang pins the broken one.
+ * Build x86_64 and run under ocerz.
+ */
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>

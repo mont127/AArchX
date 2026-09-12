@@ -1,7 +1,9 @@
-/* A read() that blocks well past the unstick monitor's 800 ms threshold
- * must come back with the data, not EINTR: natively a read only returns
- * EINTR when a signal handler ran, and this process installs none. Chess's
- * engine lexer read its pipe exactly like this and died on the -1. */
+/*
+ * A read() that blocks well past the unstick monitor's 800 ms threshold must
+ * come back with the data, not EINTR: natively a read only returns EINTR when
+ * a signal handler ran, and this process installs none.  Chess's engine lexer
+ * read its pipe exactly like this and died on the -1.
+ */
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>

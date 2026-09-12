@@ -1,4 +1,10 @@
-/* Mach-O image loading for the guest. */
+/*
+ * Mach-O image loading for the guest: pick the x86_64 slice out of a fat
+ * binary, read the load commands, and lay the segments out in guest memory.
+ * Reads are done at explicit offsets rather than by mapping the file, so a fat
+ * slice needs no separate mapping and a truncated or malformed image fails the
+ * read instead of faulting later.
+ */
 #include "ocerz/loader.h"
 #include "ocerz/mem.h"
 

@@ -1,8 +1,14 @@
-/* SSE directed rounding via MXCSR (fesetround sets it): a divide of an inexact
- * ratio must round differently in each mode.  ocerz stored MXCSR but never
- * pushed the rounding-control bits to the host FPCR, so divsd/sqrtsd always
- * rounded to nearest and every mode returned the same value.  Checks the
- * DIRECTION rather than exact bits, so it is robust across libm versions. */
+/*
+ * SSE directed rounding via MXCSR (which fesetround sets): a divide of an
+ * inexact ratio must round differently in each mode.  ocerz stored MXCSR but
+ * never pushed the rounding-control bits to the host FPCR, so divsd/sqrtsd
+ * always rounded to nearest and every mode returned the same value.
+ *
+ * The check is on DIRECTION rather than exact bits, so it is robust across
+ * libm versions: 1/3 is positive and inexact, so down < up strictly, nearest
+ * lies between, and toward-zero equals down; for -1/3, toward -inf is more
+ * negative than toward zero.
+ */
 #include <fenv.h>
 #include <stdio.h>
 
@@ -19,14 +25,11 @@ int main(void)
     fesetround(FE_TOWARDZERO);
     volatile double z = a / b;
 
-    /* 1/3 is positive and inexact: down < up strictly, nearest lies between,
-     * and toward-zero equals down (rounding toward 0 from above). */
     if (!(d < u && d <= n && n <= u && z == d)) {
         printf("BAD pos d=%.17g u=%.17g n=%.17g z=%.17g\n", d, u, n, z);
         return 1;
     }
 
-    /* -1/3: toward -inf is more negative than toward zero. */
     volatile double na = -1.0;
     fesetround(FE_DOWNWARD);
     volatile double nd = na / b;

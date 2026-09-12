@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Interp-vs-JIT differential for the benchmark binary, which run_diff_test.sh skips for time.
+# Interp-vs-JIT differential for the benchmark binary, which run_diff_test.sh
+# skips for time.
 
 set -u
 cd "$(dirname "$0")/.."

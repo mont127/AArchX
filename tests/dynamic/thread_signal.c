@@ -1,16 +1,18 @@
-/* Thread-directed signals into a thread parked in read().
+/*
+ * Thread-directed signals into a thread parked in read().
  *
- * wineserver suspends a thread (NtSuspendThread, the StackSamplingProfiler
- * in Steam's CEF does it 20 times a second) by sending it SIGUSR1 with
- * __pthread_kill(thread port); the handler reports the context back and the
- * server only then completes any wait for that thread.  One lost delivery
- * leaves the thread "suspended" forever server-side: every one of its waits
- * stays pending and the browser IO thread deadlocks (2026-09-06).
+ * wineserver suspends a thread by sending it SIGUSR1 with __pthread_kill(thread
+ * port) - Steam's CEF StackSamplingProfiler does it 20 times a second - and the
+ * handler reports the context back before the server completes any wait for
+ * that thread.  One lost delivery leaves the thread "suspended" forever
+ * server-side: every one of its waits stays pending and the browser IO thread
+ * deadlocks (2026-09-06).
  *
- * The target loops in a blocking read() on a pipe that never gets data.  The
- * sender fires SIGUSR1 at it and waits for the handler to run on the target
- * thread before firing the next one.  Natively every signal is delivered
- * within microseconds; a miss is a signal the emulator swallowed. */
+ * The target loops in a blocking read() on a pipe that never gets data, and
+ * the sender fires SIGUSR1 at it and waits for the handler to run on the
+ * target thread before firing the next.  Natively every signal is delivered
+ * within microseconds; a miss is a signal the emulator swallowed.
+ */
 #include <errno.h>
 #include <mach/mach.h>
 #include <pthread.h>
@@ -28,7 +30,7 @@ static atomic_int stop;
 static pthread_t target;
 static int pipe_rd;
 
-static int nested;          /* handler blocks in read() until resumed, like wine's wait_suspend */
+static int nested;
 static int resume_rd, resume_wr;
 static atomic_int in_handler;
 static atomic_int entered;
@@ -92,10 +94,6 @@ int main(int argc, char **argv)
     for (int i = 0; i < rounds; i++) {
         int before = atomic_load(&hits);
         if (nested) {
-            /* suspend: signal, wait until the handler is parked in its read,
-             * resume it and fire the NEXT suspend at once, so the second
-             * signal lands while the first handler is still unwinding with
-             * SIGUSR1 masked.  Both must enter the handler. */
             int e0 = atomic_load(&entered), h0 = atomic_load(&hits);
             if (pthread_kill(target, SIGUSR1) != 0) { perror("pthread_kill"); return 2; }
             double tw = now();
@@ -128,15 +126,14 @@ int main(int argc, char **argv)
         if (atomic_load(&hits) == before) {
             misses++;
             fprintf(stderr, "round %d: SIGUSR1 not delivered within 2s\n", i);
-            /* give the pending signal every chance: it must arrive eventually */
         } else {
             if (dt > worst) worst = dt;
             if (dt > 0.1) slow++;
         }
     }
     atomic_store(&stop, 1);
-    nested = 0;                      /* the wake-up below must not park in the handler */
-    pthread_kill(target, SIGUSR1);   /* wake the reader so it sees stop */
+    nested = 0;
+    pthread_kill(target, SIGUSR1);
     close(fds[1]);
     pthread_join(target, NULL);
 

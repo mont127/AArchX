@@ -1,7 +1,9 @@
-/* A loopback TCP client/server in one process: bind/listen/accept/connect/
+/*
+ * A loopback TCP client/server in one process: bind/listen/accept/connect/
  * send/recv/poll/getsockname/setsockopt across two guest threads.  The server
- * upper-cases what it receives; the client checks the echo.  Exercises the
- * socket syscalls and cross-thread blocking I/O. */
+ * upper-cases what it receives and the client checks the echo, exercising the
+ * socket syscalls and cross-thread blocking I/O.
+ */
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>

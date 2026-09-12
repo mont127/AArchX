@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+# Ocerz-vs-Rosetta throughput comparison for the xbench kernels: reports the
+# ratio, the paired delta and the median over REPS runs.
+#
+# Each kernel is calibrated until Rosetta takes at least half the target time,
+# so a kernel that finishes too fast to measure is scaled up rather than
+# reported as noise. Point XB at tests/guest/benchbin/xbench_dyn for the
+# dynamically linked build, which needs OCERZ_HOSTWQ=1.
 """Ocerz vs Rosetta over the xbench kernel suite (paired-delta method).
 
 For each kernel: calibrate a scale so Rosetta takes ~TARGET s, then for REPS
@@ -9,7 +15,7 @@ import os, subprocess, sys, time, statistics
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OCERZ = os.environ.get("OCERZ", os.path.join(REPO, "ocerz"))
-XB = os.environ.get("XB", os.path.join(REPO, "tests/guest/benchbin/xbench"))   # XB=tests/guest/benchbin/xbench_dyn for the dynamically linked build (needs OCERZ_HOSTWQ=1)
+XB = os.environ.get("XB", os.path.join(REPO, "tests/guest/benchbin/xbench"))
 REPS = int(os.environ.get("REPS", "3"))
 TARGET = float(os.environ.get("TARGET", "0.6"))
 DFLT = dict(icall=50000000, jtab=50000000, depchain=100000000, brmiss=50000000,
@@ -31,7 +37,7 @@ def main():
     losing = 0
     for k in KERNELS:
         n = DFLT[k]
-        for _ in range(4):                      # calibrate until Rosetta takes >= TARGET/2
+        for _ in range(4):
             t, _ = run("R", k, n)
             if t >= TARGET * 0.5: break
             n = max(2, int(n * min(30.0, TARGET / max(t, 0.02))))

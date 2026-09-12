@@ -1,4 +1,12 @@
-/* Guest arena allocation and reuse tests. */
+/*
+ * Guest arena allocation and reuse tests.
+ *
+ * One case is load-bearing rather than routine: activating a sibling slot must
+ * NOT zero-fill it.  The slot is physically the shared file every process of
+ * the prefix maps, and Wine's syscall-dispatcher pointer lives there, so
+ * zeroing it for one process's fresh mapping made every other process call
+ * NULL on its next syscall (2026-09-06).  The file keeps what it had.
+ */
 #include "ocerz/mem.h"
 
 #include <fcntl.h>
@@ -118,11 +126,6 @@ static void test_padded_shared_activation(uint64_t base)
     CHECK(ocerz_map_fixed(sibling, OCERZ_GUEST_PAGE_SIZE,
                           PROT_READ | PROT_WRITE) == OCERZ_OK);
     CHECK(ocerz_addr_prot(sibling) == (PROT_READ | PROT_WRITE));
-    /* Activating a sibling slot must NOT zero-fill it: the slot is
-     * physically the shared file every process of the prefix maps, and
-     * wine's syscall-dispatcher pointer lives there.  Zeroing it for one
-     * process's fresh mapping made every other process call NULL on its
-     * next syscall (2026-09-06).  The file keeps what it had. */
     uint64_t value = UINT64_MAX;
     CHECK(pread(fd, &value, sizeof value,
                 (off_t)OCERZ_GUEST_PAGE_SIZE + 32) == sizeof value);
@@ -145,7 +148,7 @@ static void test_padded_shared_activation(uint64_t base)
     CHECK(ocerz_ld(base + 64, 8) == clock_a);
     CHECK(ocerz_map_fixed(sibling, OCERZ_GUEST_PAGE_SIZE,
                           PROT_READ | PROT_WRITE) == OCERZ_OK);
-    CHECK(ocerz_ld(sibling + 32, 8) == dispatch);   /* remapped: still the shared file's bytes */
+    CHECK(ocerz_ld(sibling + 32, 8) == dispatch);
     CHECK(ocerz_ld(base + 64, 8) == clock_a);
     CHECK(ocerz_unmap(base, OCERZ_HOST_PAGE_SIZE) == OCERZ_OK);
     CHECK((ocerz_host_region_prot(base, NULL, NULL) & 0xff) == 0);

@@ -82,7 +82,6 @@ int main(int argc, char **argv, char **envp)
         return 1;
     }
     if (is_child) {
-        /* re-open: POSIX locks are per-process, the inherited fd shares them */
         g_i64 cfd = sys_open(PATH, O_WRONLY, 0);
         if (cfd < 0) {
             g_puts("child open fail\n");

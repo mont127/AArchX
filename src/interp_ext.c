@@ -1,4 +1,19 @@
-/* Interpreter ops that are neither core integer nor SSE. */
+/*
+ * Interpreter ops that are neither core integer nor SSE: string ops, CPUID,
+ * CRC-32C and the rest of the long tail.
+ *
+ * String ops count in rCX and step rSI/rDI at the ADDRESS size - RCX/RSI/RDI at
+ * 8, ECX/ESI/EDI at 4, CX/SI/DI at 2.  The 2 case is 32-bit mode with a 0x67
+ * prefix and cannot arise in long mode, where addrsize is only ever 8 or 4.  A
+ * 16-bit step writes back only the low half of the register, which is why it
+ * goes through the register accessor rather than a direct store.
+ *
+ * CRC-32C is done bitwise: correctness over speed, since the JIT does not
+ * translate it and hashing loops run interpreted anyway.  CPUID reports SSE3,
+ * SSSE3, CX16, SSE4.1, SSE4.2 and POPCNT, all of which are implemented in full
+ * - and Steam's bootstrapper refuses to start the client on a CPU without
+ * SSE4.2.
+ */
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/vm.h"
@@ -7,12 +22,6 @@
 #include <math.h>
 #include <mach/mach_time.h>
 
-/* String ops count in rCX and step rSI/rDI at the ADDRESS size: RCX/RSI/RDI at
- * 8, ECX/ESI/EDI at 4, CX/SI/DI at 2.  The 2 case is 32-bit mode with a 0x67
- * prefix and cannot arise in long mode, where addrsize is only ever 8 or 4;
- * the 8 and 4 arms are untouched.  Note that a 16-bit step writes back only
- * the low half of the register, which is why it goes through ocerz_write_gpr
- * rather than assigning the slot. */
 static uint64_t ext_rcx_read(const OcerzCPU *cpu, const X86Insn *insn)
 {
     if (insn->addrsize == 4)
@@ -208,8 +217,6 @@ static int ext_bit(OcerzCPU *cpu, const X86Insn *insn)
 
 static int ext_crc32(OcerzCPU *cpu, const X86Insn *insn)
 {
-    /* CRC-32C, reflected polynomial, bitwise: correctness over speed here
-     * (the JIT does not translate it; hashing loops run interpreted). */
     uint32_t crc = (uint32_t)cpu->gpr[insn->ops[0].reg];
     uint64_t v = ocerz_read_op(cpu, insn, &insn->ops[1]);
     for (int i = 0; i < insn->ops[1].size; i++) {
@@ -297,9 +304,6 @@ static int ext_cpuid(OcerzCPU *cpu)
     } else if (leaf == 1) {
         r[0] = 0x000306a9;
         r[1] = 0x00100800;
-        /* sse3+ssse3+cx16+sse4.1+sse4.2+popcnt: everything here is
-         * implemented in full, and steam's bootstrapper refuses to start
-         * the client on a CPU without sse4.2. */
         r[2] = 0x00982201;
         r[3] = 0x078bfbff;
     } else if (leaf == 0x80000000u) {

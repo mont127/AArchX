@@ -1,4 +1,6 @@
-/* RFLAGS helpers, and the semantic reference for x86 flags. */
+/*
+ * RFLAGS helpers, and the semantic reference for x86 flags.
+ */
 #ifndef OCERZ_FLAGS_H
 #define OCERZ_FLAGS_H
 

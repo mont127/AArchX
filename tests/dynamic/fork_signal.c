@@ -1,3 +1,9 @@
+/*
+ * A self-directed pthread_kill in a fork child, for a signal the parent set to
+ * SIG_IGN: the disposition is inherited across fork, so the call must succeed
+ * and the signal must be discarded rather than killing the child.  The parent
+ * reaps it and checks it exited cleanly.
+ */
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
