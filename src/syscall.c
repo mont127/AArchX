@@ -159,7 +159,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <CoreFoundation/CoreFoundation.h>
 #include <spawn.h>
 #include <dlfcn.h>
 #include <limits.h>
@@ -1470,91 +1469,111 @@ static void launchctl_enable_label(const char *label)
         ;
 }
 
-static void rewrite_launchd_plist_for_ocerz(const char *path, const char *self)
+static int plistbuddy(const char *path, const char *cmd, char *out, size_t outsz)
+{
+    char tmpl[] = "/tmp/ocerz_plb.XXXXXX";
+    int fd = -1;
+    if (out) {
+        fd = mkstemp(tmpl);
+        if (fd < 0)
+            return 0;
+    }
+    char *const argv[] = { (char *)"PlistBuddy", (char *)"-c", (char *)cmd,
+                           (char *)path, NULL };
+    posix_spawn_file_actions_t fa;
+    int have_fa = 0;
+    if (fd >= 0) {
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_adddup2(&fa, fd, 1);
+        have_fa = 1;
+    }
+    extern char **environ;
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, "/usr/libexec/PlistBuddy", have_fa ? &fa : NULL,
+                         NULL, argv, environ);
+    if (have_fa)
+        posix_spawn_file_actions_destroy(&fa);
+    if (fd >= 0)
+        close(fd);
+    if (rc != 0 || pid <= 0) {
+        if (fd >= 0)
+            unlink(tmpl);
+        return 0;
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+        ;
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (fd >= 0) {
+        if (ok) {
+            int r = open(tmpl, O_RDONLY);
+            if (r >= 0) {
+                ssize_t n = read(r, out, outsz - 1);
+                close(r);
+                if (n > 0) {
+                    out[n] = 0;
+                    char *nl = strchr(out, '\n');
+                    if (nl)
+                        *nl = 0;
+                } else {
+                    ok = 0;
+                }
+            } else {
+                ok = 0;
+            }
+        }
+        unlink(tmpl);
+    }
+    return ok;
+}
+
+static int file_contains(const char *path, const char *needle)
 {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return;
+    if (fd < 0)
+        return 0;
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (1 << 20)) { close(fd); return; }
-    size_t sz = (size_t)st.st_size;
-    uint8_t *raw = (uint8_t *)malloc(sz);
-    if (!raw) { close(fd); return; }
-    ssize_t rn = read(fd, raw, sz);
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (1 << 20)) {
+        close(fd);
+        return 0;
+    }
+    char *buf = (char *)malloc((size_t)st.st_size);
+    if (!buf) {
+        close(fd);
+        return 0;
+    }
+    ssize_t n = read(fd, buf, (size_t)st.st_size);
     close(fd);
-    if (rn != (ssize_t)sz) { free(raw); return; }
+    int found = n > 0 && memmem(buf, (size_t)n, needle, strlen(needle)) != NULL;
+    free(buf);
+    return found;
+}
 
-    CFDataRef data = CFDataCreate(NULL, raw, (CFIndex)sz);
-    free(raw);
-    if (!data) return;
-    CFPropertyListRef pl = CFPropertyListCreateWithData(
-        NULL, data, kCFPropertyListMutableContainersAndLeaves, NULL, NULL);
-    CFRelease(data);
-    if (!pl) return;
-    if (CFGetTypeID(pl) != CFDictionaryGetTypeID()) { CFRelease(pl); return; }
-    CFMutableDictionaryRef d = (CFMutableDictionaryRef)pl;
-
-    CFStringRef lbl = (CFStringRef)CFDictionaryGetValue(d, CFSTR("Label"));
-    if (lbl && CFGetTypeID(lbl) == CFStringGetTypeID()) {
-        char lbuf[256] = { 0 };
-        if (CFStringGetCString(lbl, lbuf, sizeof lbuf, kCFStringEncodingUTF8))
-            launchctl_enable_label(lbuf);
-    }
-
-    CFArrayRef pa = (CFArrayRef)CFDictionaryGetValue(d, CFSTR("ProgramArguments"));
-    CFStringRef prog = (CFStringRef)CFDictionaryGetValue(d, CFSTR("Program"));
-    char exe[1024] = { 0 };
-    if (pa && CFGetTypeID(pa) == CFArrayGetTypeID() && CFArrayGetCount(pa) > 0) {
-        CFStringRef s0 = (CFStringRef)CFArrayGetValueAtIndex(pa, 0);
-        if (s0 && CFGetTypeID(s0) == CFStringGetTypeID())
-            CFStringGetCString(s0, exe, sizeof exe, kCFStringEncodingUTF8);
-    } else if (prog && CFGetTypeID(prog) == CFStringGetTypeID()) {
-        CFStringGetCString(prog, exe, sizeof exe, kCFStringEncodingUTF8);
-    }
-    if (!exe[0] || strcmp(exe, self) == 0 || !file_has_x86_slice(exe)) { CFRelease(pl); return; }
-
-    CFStringRef cfself = CFStringCreateWithCString(NULL, self, kCFStringEncodingUTF8);
-    if (!cfself) { CFRelease(pl); return; }
-    CFMutableArrayRef na;
-    if (pa && CFGetTypeID(pa) == CFArrayGetTypeID())
-        na = CFArrayCreateMutableCopy(NULL, 0, pa);
-    else {
-        na = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-        if (na && prog) CFArrayAppendValue(na, prog);
-    }
-    if (!na) { CFRelease(cfself); CFRelease(pl); return; }
-    CFArrayInsertValueAtIndex(na, 0, cfself);
-    CFDictionarySetValue(d, CFSTR("ProgramArguments"), na);
-    if (prog) CFDictionarySetValue(d, CFSTR("Program"), cfself);
-    CFRelease(na);
-    CFRelease(cfself);
-
+static void rewrite_launchd_plist_for_ocerz(const char *path, const char *self)
+{
+    char label[256];
+    if (plistbuddy(path, "Print :Label", label, sizeof label))
+        launchctl_enable_label(label);
+    if (file_contains(path, self))
+        return;
+    char exe[1024];
+    if ((!plistbuddy(path, "Print :ProgramArguments:0", exe, sizeof exe) || !exe[0]) &&
+        (!plistbuddy(path, "Print :Program", exe, sizeof exe) || !exe[0]))
+        return;
+    if (strcmp(exe, self) == 0 || !file_has_x86_slice(exe))
+        return;
+    char cmd[1400];
+    snprintf(cmd, sizeof cmd, "Add :ProgramArguments:0 string %s", self);
+    if (!plistbuddy(path, cmd, NULL, 0))
+        return;
+    snprintf(cmd, sizeof cmd, "Set :Program %s", self);
+    plistbuddy(path, cmd, NULL, 0);
     if (getenv("OCERZ_IPCLOG")) {
-        CFStringRef ep = CFStringCreateWithCString(NULL, "/tmp/ocerz_ipcserver.err", kCFStringEncodingUTF8);
-        if (ep) {
-            CFDictionarySetValue(d, CFSTR("StandardErrorPath"), ep);
-            CFDictionarySetValue(d, CFSTR("StandardOutPath"), ep);
-            CFRelease(ep);
-        }
+        plistbuddy(path, "Add :StandardErrorPath string /tmp/ocerz_ipcserver.err", NULL, 0);
+        plistbuddy(path, "Set :StandardErrorPath /tmp/ocerz_ipcserver.err", NULL, 0);
+        plistbuddy(path, "Add :StandardOutPath string /tmp/ocerz_ipcserver.err", NULL, 0);
+        plistbuddy(path, "Set :StandardOutPath /tmp/ocerz_ipcserver.err", NULL, 0);
     }
-
-    CFDataRef out = CFPropertyListCreateData(NULL, d, kCFPropertyListXMLFormat_v1_0, 0, NULL);
-    CFRelease(pl);
-    if (!out) return;
-    char tmp[1200];
-    snprintf(tmp, sizeof tmp, "%s.ocerz.tmp", path);
-    int wfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (wfd >= 0) {
-        const uint8_t *ob = CFDataGetBytePtr(out);
-        CFIndex ol = CFDataGetLength(out);
-        if (write(wfd, ob, (size_t)ol) == (ssize_t)ol) {
-            close(wfd);
-            rename(tmp, path);
-        } else {
-            close(wfd);
-            unlink(tmp);
-        }
-    }
-    CFRelease(out);
 }
 
 static void spawn_rewrite_launchd(char *const *hargv, int n, const char *self)
