@@ -193,6 +193,7 @@
 
 #include <sys/mman.h>
 #include <pthread.h>
+#include <sched.h>
 #include <time.h>
 #include <unistd.h>
 #include <setjmp.h>
@@ -14361,6 +14362,84 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     if (flip && !noretire) flip_retire_block(vm, jit, blk);
 }
 
+static int g_jl_log = -1;
+static unsigned long long g_jl_acq, g_jl_waits, g_jl_xlat_null;
+static uint64_t g_jl_owner, g_jl_since, g_jl_rip;
+static int g_jl_phase;
+
+static uint64_t jl_tid(void)
+{
+    uint64_t t = 0;
+    pthread_threadid_np(NULL, &t);
+    return t;
+}
+
+static void jl_dump(const char *tag, uint64_t wait_ns)
+{
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t since = __atomic_load_n(&g_jl_since, __ATOMIC_RELAXED);
+    const uint32_t *w = (const uint32_t *)(const void *)&jit_lock;
+    fprintf(stderr,
+            "ocerz: JITLOCK-%s[%d] tid=%llu wait_ms=%.1f owner=%llu held_ms=%.1f phase=%d rip=%#llx acq=%llu waits=%llu xlat_null=%llu mtx=%08x %08x %08x %08x %08x %08x\n",
+            tag, (int)getpid(), (unsigned long long)jl_tid(),
+            (double)wait_ns / 1e6,
+            (unsigned long long)__atomic_load_n(&g_jl_owner, __ATOMIC_RELAXED),
+            since ? (double)(now - since) / 1e6 : 0.0,
+            __atomic_load_n(&g_jl_phase, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_jl_rip, __ATOMIC_RELAXED),
+            __atomic_load_n(&g_jl_acq, __ATOMIC_RELAXED),
+            __atomic_load_n(&g_jl_waits, __ATOMIC_RELAXED),
+            __atomic_load_n(&g_jl_xlat_null, __ATOMIC_RELAXED),
+            w[0], w[1], w[2], w[3], w[4], w[5]);
+}
+
+static void jl_lock_step(uint64_t rip)
+{
+    if (g_jl_log < 0)
+        g_jl_log = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
+    if (pthread_mutex_trylock(&jit_lock) != 0) {
+        uint64_t t0 = g_jl_log > 0 ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+        if (g_jl_log > 0)
+            __atomic_add_fetch(&g_jl_waits, 1, __ATOMIC_RELAXED);
+        for (unsigned long long s = 0;; s++) {
+            if (s < 64) {
+                sched_yield();
+            } else {
+                struct timespec ts;
+                ts.tv_sec = 0;
+                ts.tv_nsec = s < 512 ? 200000 : 2000000;
+                nanosleep(&ts, NULL);
+            }
+            if (pthread_mutex_trylock(&jit_lock) == 0)
+                break;
+            if (g_jl_log > 0) {
+                uint64_t w = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+                if (w > 3000000000ull && (s % 2000) == 0)
+                    jl_dump("WAIT", w);
+            }
+        }
+    }
+    if (g_jl_log > 0) {
+        __atomic_add_fetch(&g_jl_acq, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_owner, jl_tid(), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_since, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_rip, rip, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_phase, 1, __ATOMIC_RELAXED);
+    }
+}
+
+static void jl_unlock_step(void)
+{
+    if (g_jl_log > 0)
+        __atomic_store_n(&g_jl_phase, 3, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&jit_lock);
+    if (g_jl_log > 0) {
+        __atomic_store_n(&g_jl_phase, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_owner, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_since, 0, __ATOMIC_RELAXED);
+    }
+}
+
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
@@ -14412,7 +14491,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 
     JitBlock *b = cache_lookup(jit, cpu->rip, cpu->mode32);
     if (!b) {
-        pthread_mutex_lock(&jit_lock);
+        jl_lock_step(cpu->rip);
         if (ocerz_perfstat > 0)
             ps_misses++;
         if (ocerz_jitstat > 0) {
@@ -14434,9 +14513,13 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
         if (!b) {
             if (ocerz_jitstat > 0) js_xlat++;
             g_plain_mem = jit->plain_mem;
+            if (g_jl_log > 0)
+                __atomic_store_n(&g_jl_phase, 2, __ATOMIC_RELAXED);
             b = translate(jit, cpu->rip, cpu->mode32);
+            if (g_jl_log > 0 && !b)
+                __atomic_add_fetch(&g_jl_xlat_null, 1, __ATOMIC_RELAXED);
         }
-        pthread_mutex_unlock(&jit_lock);
+        jl_unlock_step();
     } else {
         if (ocerz_jitstat > 0)
             js_hits++;
