@@ -51,7 +51,7 @@ make -j
 | x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 47 / 47 |
-| real macOS apps opening their main window | 8 (see [Application compatibility](#application-compatibility)) |
+| real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
 | Wine boot (MacNdCheese build, `cmd /c ver`) | 14 s |
@@ -82,7 +82,7 @@ means the app drew its main window on screen and stayed up.
 | Activity Monitor | window on screen; its force-quit support library is not in the x86-64 shared cache |
 | Console | window on screen; logs a missing optional library |
 | TextEdit / Preview / Script Editor | run; open a document window when given a file to open |
-| Steam (x86-64 client) | bootstrapper runs: self-updates over the network, opens its progress window, and spawns its child process tree (`ipcserver`, re-exec chain). The full CEF UI (`steamwebhelper`) is not up yet. SysV semaphores were the blocker — Steam's tier0 threading needs them. |
+| Steam (x86-64 client) | works with `-cef-disable-gpu` (2026-09-12): bootstrapper, `ipcserver`, client and the CEF web helper with GPU, utility and renderer processes; the window draws with software rendering. Some launches still stall before the web UI starts. See [Steam](#steam). |
 
 Command-line tools match their native output byte for byte
 (`tools/apptest.sh cli`, 16 of 16): `uname`, `sw_vers`, `echo`, `ls`, `id`,
@@ -92,6 +92,28 @@ Command-line tools match their native output byte for byte
 Not working yet:
 - **Safari** starts but never shows a window. JavaScriptCore's `thread_suspend` reaches the host kernel and freezes a thread that holds the JIT lock.
 - **Photos** aborts in `+[PAOpenGLDevice _sharedPixelFormat:]`: `CGLChoosePixelFormat` returns 10002 for every attribute set. Root cause: `IOServiceGetMatchingServices("IOAccelerator")` yields the `AppleMetalGLRenderer` compatibility service only to genuinely Rosetta-translated x86 processes — a native arm64 process and ocerz both see only the one hardware accelerator, and CGL needs that compat renderer to build a pixel format. Metal itself works under ocerz (real device, identical feature sets); the gap is the Rosetta-only GL compatibility renderer, which would have to be synthesized in the IOKit layer.
+
+## Steam
+
+The x86-64 macOS Steam client comes up with its full UI under AArchX, confirmed 2026-09-12: the bootstrapper, `ipcserver`, the client and the CEF web helper with its GPU, utility and renderer processes, all translated, with the Steam window on screen. After its first update the client lives in Application Support, and CEF has to run without GPU acceleration:
+
+```sh
+./ocerz "$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/steam_osx" -cef-disable-gpu
+```
+
+Getting the client this far took SysV semaphores for Steam's tier0 threading, an absolute executable path (Steam derives its bundle root from it), `dlopen` of the executable returning the already loaded main image, C++ initializers run in dependency order, and a 96 GB guest arena, because Chromium's PartitionAlloc reserves a 32 GB region at startup.
+
+`steam_osx` starts `ipcserver` with `launchctl load -S Background` on a plist it writes into Application Support, which would have launchd run it natively. AArchX rewrites that plist on the way through, putting itself in front of `ProgramArguments` and in `Program` (Steam's own plist only has `Program`, so the array is built from it), and enables the job's label first: a legacy `launchctl unload` leaves the label disabled, and every load after that fails with an I/O error while the client reports `ipcserver init failed`. The Mach service lookup itself was never the problem, since Mach traps go straight to the host kernel.
+
+CEF's GPU process initializes ANGLE through CGL, which fails for the same reason Photos does: the `AppleMetalGLRenderer` compatibility service is only offered to Rosetta-translated processes. With `-cef-disable-gpu` CEF renders through SwiftShader instead. That works, and it is slower.
+
+The client then waits for the web helper to report ready, polling every 50 ms for 120 s, and gives up on the UI if it does not. Three JIT problems kept the helper from making it:
+
+- Threads blocked on the JIT lock could lose their wakeup and wedge translation for the whole process. The lock is now taken with trylock, yields and short sleeps, and never parks.
+- A page invalidated three times was left to the interpreter until it had been quiet for 1.5 s. Hot shared-cache pages in ICU, libdispatch and Foundation never went quiet: one ICU page was refused translation about 30 million times in a two-minute run. A blacklisted page is now also retranslated after 4096 refusals.
+- An alignment or commpage fault marks its block and invalidates its 64 KB granule, and the JIT's code index still finds retired blocks. Every other thread still running the retired translation faulted as well, found the block already marked, and invalidated the granule again, discarding the translation that had just been fixed. A fault from a retired translation now simply recovers.
+
+The last two changes took translate refusals from about 25 million to under 64 thousand per run, and the renderer has come up 85 to 151 s after launch. Some launches still stall before the web helper starts its child processes, with the JIT lock held inside translation; relaunching gets past it.
 
 ## Wine and i386
 
@@ -201,6 +223,12 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `OCERZ_NO_FLIP=1` | no profile-driven retranslation of superblocks |
 | `OCERZ_NO_FPB_DEFER=1` | check every FP batch immediately instead of at its consumers |
 | `OCERZ_NO_MOVFUSE=1` | no folding of `mov` into a following shift |
+| `OCERZ_REFAULT_INVAL=1` | invalidate again on every repeat alignment or commpage fault, including faults from retired translations (the old behaviour) |
+| `OCERZ_IPCLOG=1` | send the translated `ipcserver`'s output to `/tmp/ocerz_ipcserver.err` |
+| `OCERZ_JITLOCKLOG=1` | report JIT lock waits over 3 s with the holder's thread, acquire site, guest `rip` and kernel thread state |
+| `OCERZ_BLACKLOG=1` | print the pages most often refused translation because they churned |
+| `OCERZ_INVSRC=1` | attribute each churn strike to the code that invalidated the page, as an offset from `ocerz_jit_step` |
+| `OCERZ_XLATPAGES=1` | log each distinct 4 KB page a process translates |
 
 ## Architecture
 
