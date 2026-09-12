@@ -131,6 +131,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
@@ -252,6 +253,8 @@ typedef struct DynImage {
     int is_pie;
     int links_dylib;
     int links_cf;
+    uint64_t file_dev;
+    uint64_t file_ino;
 } DynImage;
 
 #define DYN_DIMG_MAX 64
@@ -260,6 +263,7 @@ static int g_dimgs_n;
 static DynImage g_main_dimg;
 static int g_main_dimg_valid;
 static char g_main_hostpath[1024];
+static uint64_t g_main_dev, g_main_ino;
 
 uint64_t ocerz_main_mh;
 
@@ -287,6 +291,29 @@ static DynImage *dimg_find_by_install_name(const char *iname)
 {
     for (int i = 0; i < g_dimgs_n; i++)
         if (g_dimgs[i].install_name[0] && strcmp(g_dimgs[i].install_name, iname) == 0)
+            return &g_dimgs[i];
+    return NULL;
+}
+
+static int file_identity(const char *path, uint64_t *dev, uint64_t *ino)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    struct stat st;
+    int ok = fstat(fd, &st) == 0 && st.st_ino != 0;
+    close(fd);
+    if (!ok)
+        return 0;
+    *dev = (uint64_t)st.st_dev;
+    *ino = (uint64_t)st.st_ino;
+    return 1;
+}
+
+static DynImage *dimg_find_by_identity(uint64_t dev, uint64_t ino)
+{
+    for (int i = 0; i < g_dimgs_n; i++)
+        if (g_dimgs[i].file_ino == ino && g_dimgs[i].file_dev == dev)
             return &g_dimgs[i];
     return NULL;
 }
@@ -1924,6 +1951,9 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     DynImage *existing = dimg_find_by_path(resolved);
     if (existing)
         return existing;
+    uint64_t fdev = 0, fino = 0;
+    if (file_identity(resolved, &fdev, &fino) && (existing = dimg_find_by_identity(fdev, fino)))
+        return existing;
     if (g_dimgs_n >= DYN_DIMG_MAX) {
         OCERZ_FATAL("too many disk dylibs to load (limit %d)\n", DYN_DIMG_MAX);
         return NULL;
@@ -1948,6 +1978,8 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     d->owned_buf = buf;
     snprintf(d->path, sizeof d->path, "%s", resolved);
     snprintf(d->install_name, sizeof d->install_name, "%s", install_name);
+    d->file_dev = fdev;
+    d->file_ino = fino;
 
     if (map_segments(d, 0) != OCERZ_OK) {
         OCERZ_FATAL("cannot map segments of %s\n", resolved);
@@ -2041,6 +2073,7 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     d->owned_buf = buf;
     snprintf(d->path, sizeof d->path, "%s", install_path);
     snprintf(d->install_name, sizeof d->install_name, "%s", install_path);
+    file_identity(install_path, &d->file_dev, &d->file_ino);
     if (map_segments(d, 0) != OCERZ_OK) {
         dlerror_set("dlopen(%s): cannot map segments", install_path);
         g_dimgs_n--;
@@ -2236,6 +2269,19 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
     if (mode & 0x10) {
         dlerror_set("dlopen(%s): not already loaded (RTLD_NOLOAD)", hostpath);
         return 0;
+    }
+    uint64_t fdev, fino;
+    if (file_identity(loadpath, &fdev, &fino)) {
+        uint64_t same = 0;
+        if (ocerz_main_mh && g_main_ino == fino && g_main_dev == fdev)
+            same = ocerz_main_mh;
+        else if ((already = dimg_find_by_identity(fdev, fino)))
+            same = already->load_base;
+        if (same) {
+            if (g_dlerror_g)
+                ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+            return same;
+        }
     }
     int before = g_dimgs_n;
     DynImage *d = dlopen_load_image(g_run_cache, loadpath);
@@ -2458,6 +2504,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     snprintf(img.path, sizeof img.path, "%s", path);
     snprintf(img.install_name, sizeof img.install_name, "%s", path);
     snprintf(g_main_hostpath, sizeof g_main_hostpath, "%s", path);
+    file_identity(path, &g_main_dev, &g_main_ino);
     int r = map_segments(&img, 1);
     if (r != OCERZ_OK) {
         OCERZ_FATAL("cannot map segments of %s\n", path);

@@ -146,6 +146,33 @@ run_relpath_case() {
     fi
 }
 
+run_alias_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir/real"
+    if ! clang -arch x86_64 -dynamiclib -install_name @executable_path/real/libalias_t.dylib \
+            -o "$dir/real/libalias_t.dylib" tests/dynamic/dlopen_alias_lib.c 2>/dev/null ||
+       ! ln "$dir/real/libalias_t.dylib" "$dir/real/libalias_hard.dylib" ||
+       ! ln -s real "$dir/link" ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/dlopen_alias.c "$dir/real/libalias_t.dylib" 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode got_out got_code
+    for mode in jit no-jit; do
+        if [ "$mode" = no-jit ]; then
+            got_out=$( cd "$dir" && "$OCERZ_ABS" -no-jit "./$name" 2>/dev/null )
+        else
+            got_out=$( cd "$dir" && "$OCERZ_ABS" "./$name" 2>/dev/null )
+        fi
+        got_code=$?
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_case dret 'int main(void){return 42;}' '' 42
 run_case dwrite '
 int main(void){
@@ -225,6 +252,7 @@ run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
 run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
 run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
+run_alias_case ddlopen_alias 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"
