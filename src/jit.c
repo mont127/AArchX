@@ -598,20 +598,29 @@ static int superblock_back_enabled(void)
 static uint32_t g_push_fix[JIT_MAX_BLOCK_INSNS];
 static int g_n_push_fix;
 
-#define CP_MARK_SIZE 256
+#define CP_MARK_SIZE (1u << 18)
 static uint64_t g_cp_marks[CP_MARK_SIZE];
-static int g_cp_nmarks;
 static int g_cp_guard;
 static int cp_marked(uint64_t key)
 {
-    for (int i = 0; i < g_cp_nmarks; i++) if (g_cp_marks[i] == key) return 1;
+    if (!key) return 0;
+    unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 46) & (CP_MARK_SIZE - 1);
+    for (unsigned n = 0; n < CP_MARK_SIZE; n++, i = (i + 1) & (CP_MARK_SIZE - 1)) {
+        uint64_t v = g_cp_marks[i];
+        if (v == key) return 1;
+        if (v == 0) return 0;
+    }
     return 0;
 }
 static void cp_mark(uint64_t key)
 {
-    if (cp_marked(key)) return;
-    if (g_cp_nmarks < CP_MARK_SIZE) g_cp_marks[g_cp_nmarks++] = key;
-    else g_cp_marks[0] = 0;
+    if (!key) return;
+    unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 46) & (CP_MARK_SIZE - 1);
+    for (unsigned n = 0; n < CP_MARK_SIZE; n++, i = (i + 1) & (CP_MARK_SIZE - 1)) {
+        uint64_t v = g_cp_marks[i];
+        if (v == key) return;
+        if (v == 0) { g_cp_marks[i] = key; return; }
+    }
 }
 static inline int mem_guard_needed(void) { return ocerz_low_base != 0 || g_cp_guard; }
 
@@ -621,9 +630,8 @@ static int stack_plain_ok(void)
     if (en < 0) en = getenv("OCERZ_TSO_STRICT") ? 0 : 1;
     return en;
 }
-#define AL_MARK_SIZE 256
+#define AL_MARK_SIZE (1u << 18)
 static uint64_t g_al_marks[AL_MARK_SIZE];
-static int g_al_nmarks;
 static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_align_guard;
 static int vec_tso_relaxed(void)
@@ -638,14 +646,25 @@ static int g_al_all;
 static int al_marked(uint64_t key)
 {
     if (g_al_all) return 1;
-    for (int i = 0; i < g_al_nmarks; i++) if (g_al_marks[i] == key) return 1;
+    if (!key) return 0;
+    unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 46) & (AL_MARK_SIZE - 1);
+    for (unsigned n = 0; n < AL_MARK_SIZE; n++, i = (i + 1) & (AL_MARK_SIZE - 1)) {
+        uint64_t v = g_al_marks[i];
+        if (v == key) return 1;
+        if (v == 0) return 0;
+    }
     return 0;
 }
 static void al_mark(uint64_t key)
 {
-    if (al_marked(key)) return;
-    if (g_al_nmarks < AL_MARK_SIZE) g_al_marks[g_al_nmarks++] = key;
-    else g_al_all = 1;
+    if (g_al_all || !key) return;
+    unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 46) & (AL_MARK_SIZE - 1);
+    for (unsigned n = 0; n < AL_MARK_SIZE; n++, i = (i + 1) & (AL_MARK_SIZE - 1)) {
+        uint64_t v = g_al_marks[i];
+        if (v == key) return;
+        if (v == 0) { g_al_marks[i] = key; return; }
+    }
+    g_al_all = 1;
 }
 static inline int stack_plain_access_ok(void) { return g_plain_mem || stack_plain_ok(); }
 static inline int mem_plain_access_ok(const X86Operand *m)
@@ -13227,11 +13246,15 @@ int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint6
     const JitBlock *b = fault_block(jit, pc);
     if (!b) return 0;
     uint64_t block_rip = blk_rip(b);
+    int fresh = !cp_marked(b->key);
     cp_mark(b->key);
     cp_mark(jit_key(fault_rip, blk_mode32(b)));
     if (ENV_ON("OCERZ_CP_NOINVAL")) return 1;
+    int prev = g_churn_suppress;
+    if (fresh) g_churn_suppress = 1;
     ocerz_jit_invalidate_range(vm, block_rip, 1);
     if (fault_rip != block_rip) ocerz_jit_invalidate_range(vm, fault_rip, 1);
+    g_churn_suppress = prev;
     return 1;
 }
 
@@ -13242,10 +13265,14 @@ int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t
     const JitBlock *b = fault_block(jit, pc);
     if (!b || jit->plain_mem) return 0;
     uint64_t block_rip = blk_rip(b);
+    int fresh = !al_marked(b->key);
     al_mark(b->key);
     al_mark(jit_key(fault_rip, blk_mode32(b)));
+    int prev = g_churn_suppress;
+    if (fresh) g_churn_suppress = 1;
     ocerz_jit_invalidate_range(vm, block_rip, 1);
     if (fault_rip != block_rip) ocerz_jit_invalidate_range(vm, fault_rip, 1);
+    g_churn_suppress = prev;
     return 1;
 }
 
