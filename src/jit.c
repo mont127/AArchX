@@ -635,28 +635,38 @@ static int stack_plain_ok(void)
 static uint64_t g_al_marks[AL_MARK_SIZE];
 static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void jl_acquire(void)
-{
-    if (pthread_mutex_trylock(&jit_lock) == 0)
-        return;
-    for (unsigned long long s = 0;; s++) {
-        if (s < 64) {
-            sched_yield();
-        } else {
-            struct timespec ts;
-            ts.tv_sec = 0;
-            ts.tv_nsec = s < 512 ? 200000 : 2000000;
-            nanosleep(&ts, NULL);
-        }
-        if (pthread_mutex_trylock(&jit_lock) == 0)
-            return;
-    }
-}
-
 static int g_jl_log = -1;
 static unsigned long long g_jl_acq, g_jl_waits, g_jl_xlat_null;
 static uint64_t g_jl_owner, g_jl_since, g_jl_rip;
 static int g_jl_phase;
+static __thread int jl_held;
+static OcerzCPU *volatile g_jl_owner_cpu;
+
+int ocerz_jit_lock_held_self(void)
+{
+    return jl_held;
+}
+
+struct OcerzCPU *ocerz_jit_lock_owner_cpu(void)
+{
+    return (struct OcerzCPU *)g_jl_owner_cpu;
+}
+
+static uint64_t jl_tid(void);
+
+static void jl_recursive_warn(const char *where)
+{
+    static int once;
+    if (__atomic_fetch_add(&once, 1, __ATOMIC_RELAXED) > 4)
+        return;
+    void *bt[24];
+    int nb = backtrace(bt, 24);
+    fprintf(stderr, "ocerz: JITLOCK-RECURSIVE[%d] at %s tid=%llu depth=%d phase=%d rip=%#llx\n",
+            (int)getpid(), where, (unsigned long long)jl_tid(), jl_held,
+            __atomic_load_n(&g_jl_phase, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_jl_rip, __ATOMIC_RELAXED));
+    backtrace_symbols_fd(bt, nb, 2);
+}
 
 static uint64_t jl_tid(void)
 {
@@ -684,10 +694,61 @@ static void jl_dump(const char *tag, uint64_t wait_ns)
             w[0], w[1], w[2], w[3], w[4], w[5]);
 }
 
+static void jl_acquire(int site)
+{
+    if (g_jl_log < 0)
+        g_jl_log = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
+    if (jl_held)
+        jl_recursive_warn("jl_acquire");
+    if (pthread_mutex_trylock(&jit_lock) != 0) {
+        uint64_t t0 = g_jl_log > 0 ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+        if (g_jl_log > 0)
+            __atomic_add_fetch(&g_jl_waits, 1, __ATOMIC_RELAXED);
+        for (unsigned long long s = 0;; s++) {
+            if (s < 64) {
+                sched_yield();
+            } else {
+                struct timespec ts;
+                ts.tv_sec = 0;
+                ts.tv_nsec = s < 512 ? 200000 : 2000000;
+                nanosleep(&ts, NULL);
+            }
+            if (pthread_mutex_trylock(&jit_lock) == 0)
+                break;
+            if (g_jl_log > 0) {
+                uint64_t w = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+                if (w > 3000000000ull && (s % 2000) == 0)
+                    jl_dump("WAIT", w);
+            }
+        }
+    }
+    if (g_jl_log > 0) {
+        __atomic_add_fetch(&g_jl_acq, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_owner, jl_tid(), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_since, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_rip, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_phase, site, __ATOMIC_RELAXED);
+    }
+    jl_held++;
+}
+
+static void jl_release(void)
+{
+    if (g_jl_log > 0) {
+        __atomic_store_n(&g_jl_phase, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_owner, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_jl_since, 0, __ATOMIC_RELAXED);
+    }
+    jl_held--;
+    pthread_mutex_unlock(&jit_lock);
+}
+
 static void jl_lock_step(uint64_t rip)
 {
     if (g_jl_log < 0)
         g_jl_log = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
+    if (jl_held)
+        jl_recursive_warn("jl_lock_step");
     if (pthread_mutex_trylock(&jit_lock) != 0) {
         uint64_t t0 = g_jl_log > 0 ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
         if (g_jl_log > 0)
@@ -717,12 +778,14 @@ static void jl_lock_step(uint64_t rip)
         __atomic_store_n(&g_jl_rip, rip, __ATOMIC_RELAXED);
         __atomic_store_n(&g_jl_phase, 1, __ATOMIC_RELAXED);
     }
+    jl_held++;
 }
 
 static void jl_unlock_step(void)
 {
     if (g_jl_log > 0)
         __atomic_store_n(&g_jl_phase, 3, __ATOMIC_RELAXED);
+    jl_held--;
     pthread_mutex_unlock(&jit_lock);
     if (g_jl_log > 0) {
         __atomic_store_n(&g_jl_phase, 0, __ATOMIC_RELAXED);
@@ -13401,7 +13464,7 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
     const JitBlock *blk = fault_block(jit, site);
     int use_dmb = blk && blk->ordered_loads;
 
-    jl_acquire();
+    jl_acquire(__LINE__);
     int rc = 0;
     if ((size_t)(jit->code_end - jit->code_cur) > 128) {
         pthread_jit_write_protect_np(0);
@@ -13454,7 +13517,7 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
         }
         pthread_jit_write_protect_np(1);
     }
-    pthread_mutex_unlock(&jit_lock);
+    jl_release();
     if (rc == 1 && ocerz_perfstat > 0) ps_align_patches++;
     if (rc == 1 && ENV_ON("OCERZ_ALPATCHLOG")) {
         const uint32_t *arm = (const uint32_t *)((uint8_t *)site + (((int32_t)(*site << 6) >> 6) * 4));
@@ -13758,9 +13821,9 @@ void ocerz_jit_invalidate_all(struct OcerzVM *vm)
 
     OcerzJit *jit = vm->jit;
     if (jit) {
-        jl_acquire();
+        jl_acquire(__LINE__);
         invalidate_all_locked(jit);
-        pthread_mutex_unlock(&jit_lock);
+        jl_release();
     }
     ocerz_vm_purge_jit_ras(vm);
 }
@@ -13982,12 +14045,12 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
 
     OcerzJit *jit = vm->jit;
     int invalidated = 0;
-    jl_acquire();
+    jl_acquire(__LINE__);
     if (!jit->code_hi || !ranges_overlap(addr, len, jit->code_lo,
                                          jit->code_hi - jit->code_lo)) {
         if (ENV_ON("OCERZ_INVMAP_CHECK"))
             invmap_check_reject(jit, addr, len);
-        pthread_mutex_unlock(&jit_lock);
+        jl_release();
         return;
     }
     if (addr < jit->code_lo) { len -= jit->code_lo - addr; addr = jit->code_lo; }
@@ -14011,7 +14074,7 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     if (!invmap_may_hold(jit, addr, addr + len) || !gran_any(addr, addr + len)) {
         if (ENV_ON("OCERZ_INVMAP_CHECK"))
             invmap_check_reject(jit, addr, len);
-        pthread_mutex_unlock(&jit_lock);
+        jl_release();
         return;
     }
     {
@@ -14053,7 +14116,7 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
         if (n_hit != (size_t)-1)
             invmap_clear_range(jit, addr, addr + len);
     }
-    pthread_mutex_unlock(&jit_lock);
+    jl_release();
 
     if (invalidated)
         ocerz_vm_purge_jit_ras(vm);
@@ -14065,7 +14128,7 @@ void ocerz_jit_request_stop(struct OcerzVM *vm)
     if (!jit)
         return;
 
-    jl_acquire();
+    jl_acquire(__LINE__);
     jit->stop_requested = 1;
     pthread_jit_write_protect_np(0);
     int patched = force_stop_sites_writable(jit);
@@ -14073,7 +14136,7 @@ void ocerz_jit_request_stop(struct OcerzVM *vm)
     if (patched)
         sys_icache_invalidate(jit->code_base,
             (size_t)((uint8_t *)jit->code_cur - (uint8_t *)jit->code_base));
-    pthread_mutex_unlock(&jit_lock);
+    jl_release();
 }
 
 void ocerz_jit_require_ordered(struct OcerzVM *vm)
@@ -14094,25 +14157,25 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
         return;
     }
 
-    jl_acquire();
+    jl_acquire(__LINE__);
     if (jit->plain_mem) {
         jit->plain_mem = 0;
         g_plain_mem = 0;
         invalidate_all_locked(jit);
     }
-    pthread_mutex_unlock(&jit_lock);
+    jl_release();
 
     ocerz_vm_purge_jit_ras(vm);
 }
 
 void ocerz_jit_prefork(void)
 {
-    jl_acquire();
+    jl_acquire(__LINE__);
 }
 
 void ocerz_jit_postfork(void)
 {
-    pthread_mutex_unlock(&jit_lock);
+    jl_release();
 }
 
 static int jit_interp_block(struct OcerzVM *vm, OcerzCPU *cpu, JitBlock *b)
@@ -14389,10 +14452,10 @@ static void flip_retire_block(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
 {
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     g_flip_n_retire++;
-    jl_acquire();
+    jl_acquire(__LINE__);
     int live = blk->code != NULL;
     if (live) flip_retire_locked(jit, blk);
-    pthread_mutex_unlock(&jit_lock);
+    jl_release();
     if (live) ocerz_vm_purge_jit_ras(vm);
     g_flip_ns_retire += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
 }
@@ -14442,17 +14505,17 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     int tk = (int)pf->taken, ft = (int)pf->ft;
     int verdict = tk >= 2 * ft && tk >= (1 << (PROBE_BIT - 1));
     int flip = 0;
-    jl_acquire();
+    jl_acquire(__LINE__);
     if (pf->windows == 0 || (pf->prev != verdict && pf->windows < 3)) {
         pf->prev = (uint8_t)verdict;
         pf->windows++;
         pf->taken = pf->ft = 0;
-        pthread_mutex_unlock(&jit_lock);
+        jl_release();
         return;
     }
     flip = flip_decide_locked(blk, e, tk, ft, fliplog);
     if (!flip) chain_edge_now(jit, blk, e);
-    pthread_mutex_unlock(&jit_lock);
+    jl_release();
     g_flip_ns_hit += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     static int noretire = -1;
     if (noretire < 0) noretire = getenv("OCERZ_FLIP_NORETIRE") ? 1 : 0;
@@ -14467,7 +14530,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
     OcerzJit *jit = vm->jit;
     if (cpu->side_blk) flip_side_hit(vm, jit, cpu);
     if (ocerz_jitstat < 0) {
-        jl_acquire();
+        jl_acquire(__LINE__);
         if (ocerz_jitstat < 0) {
             js_t0 = ps_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             ocerz_perfstat = getenv("OCERZ_PERFSTAT") ? 1 : 0;
@@ -14490,7 +14553,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             g_no_fault_recipes = getenv("OCERZ_NO_FAULT_RECIPES") ? 1 : 0;
             g_plain_mem = jit->plain_mem;
         }
-        pthread_mutex_unlock(&jit_lock);
+        jl_release();
     }
     if (ocerz_jitstat > 0)
         js_steps++;
@@ -14511,6 +14574,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
     JitBlock *b = cache_lookup(jit, cpu->rip, cpu->mode32);
     if (!b) {
         jl_lock_step(cpu->rip);
+        g_jl_owner_cpu = cpu;
         if (ocerz_perfstat > 0)
             ps_misses++;
         if (ocerz_jitstat > 0) {
@@ -14538,6 +14602,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             if (g_jl_log > 0 && !b)
                 __atomic_add_fetch(&g_jl_xlat_null, 1, __ATOMIC_RELAXED);
         }
+        g_jl_owner_cpu = NULL;
         jl_unlock_step();
     } else {
         if (ocerz_jitstat > 0)
