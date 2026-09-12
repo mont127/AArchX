@@ -1,4 +1,34 @@
-/* The emulated x86_64 CPU state and its conventions. */
+/*
+ * The emulated x86_64 CPU state and its conventions.
+ *
+ * The field ORDER here is load-bearing, because the JIT reaches this struct
+ * with immediate-offset instructions.  xmm[] is 16-aligned so the JIT can use
+ * scaled ldr/str q, and the return-address stack sits immediately after it so
+ * ras[] stays within the +-504-byte immediate reach of stp/ldp on the call and
+ * return paths.  The segment selectors were appended at the very END of the
+ * struct for the same reason: nothing that already existed, and in particular
+ * neither xmm[] nor the ras[] window, may move by a single byte.
+ *
+ * Those selectors exist because the 32-bit guest names a segment register as a
+ * value rather than as an address override (PUSH/POP sreg, LES/LDS), so the
+ * selector has to live somewhere; cs_sel remains the authority for CS and these
+ * mirror it, since the JIT and the far-branch paths already read it.  The AVX
+ * upper halves of ymm0-15 are likewise interpreter-only state: legacy SSE ops
+ * leave them alone, VEX.128 ops zero them, VEX.256 ops write them, and the JIT
+ * declines every VEX instruction.
+ *
+ * Pending signals use the guest sigset_t bit convention (bit sig-1), the same
+ * one as sig_mask, so sigpending() can copy the word out directly.
+ *
+ * A large part of the rest is instrumentation that has to live per-cpu: the
+ * OCERZ_BTRACE ring of guest block entries is written by JIT'd code itself,
+ * because the exit-point sampler is blind to control flow that stays inside the
+ * code arena once blocks are chained; the block_* fields are what the unstick
+ * monitor reads to decide whether a thread has been parked too long in a wait
+ * whose contract allows a spurious EINTR; and the suspend fields carry the
+ * safe-point handshake that lets a guest thread_suspend report done only when
+ * the target holds no emulator lock.
+ */
 #ifndef OCERZ_CPU_H
 #define OCERZ_CPU_H
 
@@ -57,29 +87,22 @@ typedef struct OcerzCPU {
 
     uint8_t mode32;
     uint16_t cs_sel;
-    Ocerz128 xmm[16] __attribute__((aligned(16)));   /* 16-aligned: JIT uses scaled ldr/str q */
-    /* return-address stack right after xmm: keeps ras[] within stp/ldp
-     * immediate reach (<= 504 bytes) for the JIT's call/ret paths */
+    Ocerz128 xmm[16] __attribute__((aligned(16)));
     uint32_t ras_top;
     struct { uint64_t guest_rip; void *host_entry; } ras[256];
-    Ocerz128 fp_ckpt[16] __attribute__((aligned(16))); /* JIT FP-batch checkpoints (replay inputs) */
-    uint64_t jit_scratch[2];        /* JIT temporaries that must survive a C callout (e.g. an old CF) */
+    Ocerz128 fp_ckpt[16] __attribute__((aligned(16)));
+    uint64_t jit_scratch[2];
     uint64_t jit_fp;
-    /* OCERZ_BTRACE: per-cpu ring of guest block entries, written by JIT'd code
-     * itself.  g_riphist only samples JIT *exit* points, so with block chaining
-     * it is blind to control flow that stays inside the code arena; this ring
-     * is the only way to see which guest block actually ran. */
     uint64_t *btrace;
-    uint32_t btrace_n;              /* monotonic write counter */
-    uint32_t btrace_mask;           /* ring mask; 0 latches (stops recording) */
-    volatile uint64_t block_since_ns;  /* nonzero while parked in a blocking host syscall (unstick monitor) */
-    volatile uint64_t block_started_ns; /* like block_since_ns but never re-armed: true episode start */
-    volatile int block_what;            /* syscall/trap number of the blocking call */
-    volatile int block_nokick;          /* parked in a call with no spurious-EINTR contract: the unstick monitor leaves it be */
+    uint32_t btrace_n;
+    uint32_t btrace_mask;
+    volatile uint64_t block_since_ns;
+    volatile uint64_t block_started_ns;
+    volatile int block_what;
+    volatile int block_nokick;
     uint32_t sendring_id[8], sendring_port[8], sendring_sz[8];
-    int sendring_n;                     /* MACHSLOW: last mach sends, for wedge diagnostics */
-    volatile uint32_t last_rcv_name;   /* port/set of the current mach receive (diagnostics) */                /* host sp at the active JIT function's frame base (class 3):
-                                       every exit resets sp to it, dropping the host-stack RAS entries */
+    int sendring_n;
+    volatile uint32_t last_rcv_name;
     uint32_t mxcsr;
     uint16_t fcw;
     uint16_t fsw;
@@ -88,25 +111,20 @@ typedef struct OcerzCPU {
     double fpr[8];
     struct OcerzVM *vm;
     int terminated;
-    int interp_once;                /* run the next instruction in the interpreter (fault recovery) */
+    int interp_once;
     int cpu_number;
     uint64_t wq_workloop_id;
 
     uint64_t sig_altstack_sp;
     uint64_t sig_altstack_size;
     uint64_t sig_mask;
-    /* Signals raised while sig_mask blocked them, held until it drops.  Same
-     * bit convention as sig_mask (bit sig-1), which is also the guest's
-     * sigset_t layout, so sigpending() can copy it out directly. */
     uint64_t sig_pending;
-    /* Diagnostics for OCERZ_PORTDUMP: host signals received on this thread
-     * versus guest handlers vectored, per signal number. */
     uint32_t sig_host_rcvd[32];
     uint32_t sig_delivered[32];
-    uint32_t in_sighandler;          /* diagnostics: guest handlers currently on this thread's stack */
-    void    *host_pthread;           /* diagnostics: the host thread running this cpu */
+    uint32_t in_sighandler;
+    void    *host_pthread;
     uint32_t host_kport;
-    uint32_t host_mask_last;         /* diagnostics: host sigmask seen at the last syscall entry */
+    uint32_t host_mask_last;
     uint32_t host_mask_changes;
     int sig_on_stack;
     uint64_t sig_last_fault;
@@ -115,33 +133,19 @@ typedef struct OcerzCPU {
     uint64_t wine_teb_base;
 
     volatile int interrupt;
-    /* a probed superblock side exit that just tripped to C: the block and
-     * its side index, for the trace-inversion decision (see g_flip in jit.c) */
     void *side_blk;
     int side_idx;
 
-    /* Segment selectors, indexed by OcerzSreg (ES,CS,SS,DS,FS,GS).  Only the
-     * 32-bit guest touches these: PUSH/POP sreg and LES/LDS name a segment
-     * register as a value rather than as an address override, so the selector
-     * has to live somewhere.  cs_sel above stays the authority for CS -- these
-     * mirror it -- because the JIT and the far-branch paths already read it.
-     * Appended at the very end of the struct so that no existing field, and in
-     * particular neither the 16-byte-aligned xmm[] nor the ras[] window the
-     * JIT reaches with stp/ldp immediates, moves by a single byte. */
     uint16_t seg_sel[6];
-    uint64_t dbg_ind_src;   /* OCERZ_WILDLOG: guest rip of the last indirect jmp/call dispatched */
-    uint64_t host_tid;      /* pthread_threadid_np of the host thread running this CPU (debugger thread map) */
-    int32_t cur_sys_class;  /* syscall currently being dispatched on the host, -1 when in guest code */
+    uint64_t dbg_ind_src;
+    uint64_t host_tid;
+    int32_t cur_sys_class;
     int32_t cur_sys_num;
-    /* AVX: upper 128 bits of ymm0-15.  Legacy SSE ops leave them alone, VEX.128
-     * ops zero the destination's, VEX.256 ops write them.  Only the interpreter
-     * touches them (the JIT declines every VEX-encoded instruction). */
     Ocerz128 ymmh[16] __attribute__((aligned(16)));
-    /* guest thread_suspend of this thread (ocerz_vm_thread_suspend in vm.c) */
-    volatile int suspend_count;     /* outstanding guest suspends */
-    volatile int susp_parked;       /* waiting at a safe point for the count to drop */
-    int susp_host;                  /* stopped by the host kernel instead, somewhere lock-free */
-    int susp_have_gpr;              /* susp_gpr[] holds its registers, read from the JIT's host registers */
+    volatile int suspend_count;
+    volatile int susp_parked;
+    int susp_host;
+    int susp_have_gpr;
     uint64_t susp_gpr[16];
 } OcerzCPU;
 
@@ -154,7 +158,6 @@ static inline int ocerz_gs_is_teb_band(uint64_t gs)
 
 void ocerz_cpu_reset(OcerzCPU *cpu);
 void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out);
-/* set the host FP rounding mode from a guest MXCSR value (bits 13-14) */
 void ocerz_apply_mxcsr_round(uint32_t mxcsr);
 
 #endif

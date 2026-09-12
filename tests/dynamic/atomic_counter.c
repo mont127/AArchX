@@ -1,7 +1,9 @@
-/* Atomicity and lock correctness under contention: eight guest threads each
- * do PER atomic fetch-add on one counter, then PER mutex-protected increments
- * on another.  A lost update (a non-atomic RMW, or a lock that does not
- * actually serialize) shows up as a final total below the expected one. */
+/*
+ * Atomicity and lock correctness under contention: eight guest threads each do
+ * PER atomic fetch-add on one counter, then PER mutex-protected increments on
+ * another.  A lost update - a non-atomic RMW, or a lock that does not actually
+ * serialize - shows up as a final total below the expected one.
+ */
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>

@@ -1,5 +1,7 @@
-/* SysV semaphores: semget/semop/semctl.  Steam's tier0 threading is built on
- * them; unimplemented, every "thread synchronization object is unuseable". */
+/*
+ * SysV semaphores: semget/semop/semctl.  Steam's tier0 threading is built on
+ * them, and unimplemented, every "thread synchronization object is unuseable".
+ */
 #include <errno.h>
 #include <stdio.h>
 #include <sys/ipc.h>
@@ -19,7 +21,7 @@ int main(void)
         printf("BAD SETALL\n");
         return 2;
     }
-    struct sembuf op = { 0, -1, 0 };      /* take sem 0 (1 -> 0) */
+    struct sembuf op = { 0, -1, 0 };
     if (semop(id, &op, 1) < 0) {
         printf("BAD semop\n");
         return 3;

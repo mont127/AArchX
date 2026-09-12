@@ -1,6 +1,9 @@
-/* A terminal interpreter callout must leave without reloading or re-spilling
- * pinned state.  The pre-call spill is authoritative once the syscall returns
- * OCERZ_STEP_EXIT. */
+/*
+ * A terminal interpreter callout must leave without reloading or re-spilling
+ * pinned state: once the syscall returns OCERZ_STEP_EXIT, the pre-call spill
+ * is authoritative and anything written after it would overwrite the real
+ * guest state.
+ */
 #include "ocerz/cpu.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"
@@ -41,7 +44,7 @@ static void prepare_cpu(OcerzVM *vm, int exit_code)
 
     cpu->rip = CODE_BASE;
     cpu->rflags = initial_flags;
-    cpu->gpr[OCERZ_RAX] = (2ull << 24) | 1; /* BSD exit */
+    cpu->gpr[OCERZ_RAX] = (2ull << 24) | 1;
     cpu->gpr[OCERZ_RBX] = 0x1122334455667780ull;
     cpu->gpr[OCERZ_RSP] = STACK_TOP;
     cpu->gpr[OCERZ_RDI] = (uint64_t)exit_code;
@@ -117,9 +120,9 @@ int main(void)
     }
 
     static const uint8_t code[] = {
-        0x48, 0x8d, 0x5b, 0x07, /* lea rbx, [rbx+7] */
-        0x66, 0x0f, 0xd4, 0xc1, /* paddq xmm0, xmm1 */
-        0x0f, 0x05,             /* syscall */
+        0x48, 0x8d, 0x5b, 0x07,
+        0x66, 0x0f, 0xd4, 0xc1,
+        0x0f, 0x05,
     };
     memcpy(ocerz_g2h(CODE_BASE), code, sizeof code);
 

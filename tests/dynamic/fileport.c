@@ -1,7 +1,9 @@
-/* fileport_makeport / fileport_makefd: an fd turned into a Mach port and
- * back, the way XPC hands files between processes.  Photos receives its
- * library files like this and asserted -- then aborted -- when
- * fileport_makefd came back ENOSYS. */
+/*
+ * fileport_makeport / fileport_makefd: an fd turned into a Mach port and back,
+ * the way XPC hands files between processes.  Photos receives its library
+ * files like this and asserted - then aborted - when fileport_makefd came back
+ * ENOSYS.
+ */
 #include <mach/mach.h>
 #include <stdio.h>
 #include <string.h>

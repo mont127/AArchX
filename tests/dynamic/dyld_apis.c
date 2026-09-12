@@ -1,8 +1,11 @@
-/* dyld queries that libSystem, libxpc, libsystem_trace and OpenGL make at
+/*
+ * dyld queries that libSystem, libxpc, libsystem_trace and OpenGL make at
  * startup, checked against the executable's own load commands.  All of them
- * fell through to "unimplemented vtable slot" and answered 0 -- the program
- * SDK version above all: OpenGL read 0 as a pre-10.5 SDK and dropped its
- * software renderer, which is why Photos could not get a pixel format. */
+ * used to fall through to an unimplemented vtable slot and answer 0 - the
+ * program SDK version above all, where OpenGL read 0 as a pre-10.5 SDK and
+ * dropped its software renderer, which is why Photos could not get a pixel
+ * format.
+ */
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <stdint.h>

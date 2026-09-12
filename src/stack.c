@@ -1,4 +1,10 @@
-/* Builds the initial process stack the way XNU's exec path lays it out. */
+/*
+ * Builds the initial process stack the way XNU's exec path lays it out: the
+ * strings at the top, then the apple[] array, envp, argv and argc below them,
+ * with the whole thing 16-byte aligned at entry.  Guest crt0 code and dyld both
+ * read this layout positionally, so the order and the alignment are the
+ * contract, not an implementation detail.
+ */
 #include "ocerz/loader.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"

@@ -1,5 +1,4 @@
 # x86_64 entry stub for the static guest tests: unpack the XNU exec stack into the SysV ABI, call main, exit.
-
 .text
 .globl _start
 _start:

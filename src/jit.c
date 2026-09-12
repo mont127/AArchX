@@ -1,5 +1,184 @@
+/*
+ * The JIT: guest basic blocks translated to native arm64, with the
+ * interpreter as the fallback for anything it will not encode.
+ *
+ * ---- blocks and the cache ----
+ * Blocks are keyed by jit_key(rip, mode32): the same guest address in 32- and
+ * 64-bit mode is not the same code and must never share a cache entry, a
+ * commpage mark or an invalidation mark.  A published block keeps 16 bytes per
+ * instruction (rip, len, op) instead of the 96-byte X86Insn; only the few
+ * instructions it still executes through the interpreter (slow calls) or
+ * inspects in full (fault-flag producers) are copied into blk->kept.  Dropping
+ * the decoded array matters: a GUI Wine process carried ~870 bytes of X86Insn
+ * per block across 215k blocks, 180 MB of it.
+ *
+ * ---- register pinning ----
+ * Pin class 3 keeps every guest GPR permanently in a host register (slot ==
+ * guest register number): slots 0-7 in x21-x28 (callee-saved), 8-13 in x3-x8,
+ * 14-15 in x1-x2 (caller-saved, spilled and reloaded around every C callout).
+ * All blocks share that layout, so every transition is body-to-body: chaining
+ * enters the callee's body directly, RAS entries are plain body pointers, and
+ * no block boundary pays frame traffic.  xmm0-15 live in V16-V31 for the whole
+ * body; only function entry/exit and C callouts touch memory.
+ *
+ * Class 3 also keeps guest rsp as guest_base + rsp - a host pointer, not a
+ * value - so push/pop are single pre/post-indexed accesses and rsp-relative
+ * addresses drop the base add.  Reads and writes of the rsp VALUE convert at
+ * the accessors; spill/fill and fault recovery convert at the boundaries.
+ * OCERZ_RSP_VALUE restores the old value-keeping class 3.
+ *
+ * ---- addressing ----
+ * Guest addresses reach the host through one of three maps (plain guest_base,
+ * low_base below LOW_LIMIT, top_base above TOP_LO) plus the commpage, which in
+ * identity-mapped dynamic mode cannot be mapped at its guest address at all.
+ * Blocks that need them carry a per-block mark so unmarked blocks emit no
+ * guards.  Bases with two or more accesses are hoisted into JMEMBASE/JMEMBASE2/
+ * JMEMBASE3 (x30 is free inside a body: a guest RET pops its continuation from
+ * the shadow and the epilogue restores the C return address from the frame),
+ * with base + index<<scale kept in JMEMAUX and recomputed at the loop head.
+ * The hoist signature is published so a chained predecessor with the same
+ * signature enters past the reload.  Identity mapping needs none of this: every
+ * pinned base already holds guest_base + base.
+ *
+ * ---- memory ordering ----
+ * Ordered (x86-TSO) mode makes scalar accesses acquire/release - flags, locks
+ * and atomics are scalar, a release scalar store orders every earlier vector
+ * store, an acquire scalar load orders every later vector load.  Vector
+ * accesses stay plain: programs do not synchronize through a 16-byte access
+ * (x86 does not even make them atomic), and ordering them cost memcpy 3.3x and
+ * fpvec 3.0x of Rosetta.  What that gives up is a vector load followed by a
+ * scalar re-read of a seqlock counter observing newer data than the counter
+ * covers, and two vector stores becoming visible out of order; OCERZ_TSO_VECTOR
+ * =1 orders them too.  Measured 2026-09-05 on M2 Max; FEX ships the same
+ * default.  An ordered vector load is a plain load followed by a one-byte
+ * ACQUIRE load of the same address: same-address reads are coherent, so the
+ * copy sees a value at least as new as the vector and everything after is
+ * ordered behind it - TSO's load ordering with no barrier, where a dmb ishld
+ * waited for every outstanding miss (40-60 ns per access on a 4 MB working set).
+ *
+ * Apple silicon faults an acquire/release access only when it crosses a 16-byte
+ * granule, so the alignment guard tests exactly that; testing natural alignment
+ * instead sent three quarters of memcpy's unaligned tail accesses down the slow
+ * arm.  Faulting sites are hot-patched, and the out-of-line store arm picks
+ * dmb ish + plain store when the block also does ordered loads (the drain is
+ * cheap then: memcpy 0.31s vs 1.1s for release pieces) and release pieces
+ * otherwise (store-only loops: memset 0.10s vs 0.5-1.0s).
+ *
+ * ---- flags ----
+ * Flags are deferred: an instruction records {kind, size, dst, src} and the
+ * flags are materialized only if something reads them.  On top of that sit
+ * three fusions - NZCV forwarded from an adjacent producer across
+ * NZCV-transparent gap instructions, value-based conditions taken straight from
+ * a result register (cmp #0, or no compare at all for cbz/cbnz), and the comis
+ * fusion, where a jcc/setcc/cmov re-derives its condition by redoing the fcmp.
+ * A static liveness pass and the emitters share the same predicates so they
+ * cannot disagree about what is live.  The legality rules here are written in
+ * blood: a gap may not write a register the producer read (`cmp byte
+ * [rax+rcx-1],0xc0 ; mov rcx,rbx ; jcc` spun libSystem's UTF-8 scan forever),
+ * and a gap's emission must touch only pinned registers (`cmp byte
+ * [rdi+0x210],0 ; lea r15,[rsp+0x290] ; jne` branched on rsp and made Steam's
+ * CEF browser copy an unengaged optional, 2026-09-06), so a gap is emitted into
+ * a scratch buffer first and refused there rather than asserting after the
+ * compare is already out.
+ *
+ * No ABI passes arithmetic flags across a return, but clang's outliner does:
+ * vImage's `cmpq $0, init_CGInterfaces(%rip); retq` helpers hand their compare
+ * back in EFLAGS, and every Wine window painted black because CoreGraphics
+ * concluded libCGInterfaces had not loaded (2026-09-05).  A pure flag producer
+ * reaching a ret keeps its flags live; a tail whose last flag writer is
+ * arithmetic (xor eax,eax; ret) returns a value, and keeps the dead seam.
+ *
+ * ---- SSE and FP ----
+ * x86's NaN rule (result NaN -> quiet(a) if a is NaN, else quiet(b), else the
+ * default NaN) differs from arm64's, so the hot path branches out of line to an
+ * exact fixup arm emitted after the body.  FP batches take that further: a run
+ * of arithmetic is checked once at its end rather than per instruction, with
+ * the registers it overwrites checkpointed and the whole run replayed exactly
+ * if the check fires.  A double batch's taint can ride past replayable
+ * instructions to a ucomisd/comisd, which raises V for a NaN in either
+ * operand's lane 0 and so detects for free; lanes still unverified at a
+ * superblock side exit are checked in that exit's stub, off the hot path.
+ * Scalar chains additionally keep lane 0 in a scratch V register (fixed-lane
+ * mode gives four scratches to a self-looping block for its whole body) so a
+ * loop-carried scalar chain never round-trips through the architectural
+ * register.  A generated NaN kept arm64's sign until the exact arm was given an
+ * off-chain copy of the operand the result overwrites (found by fp_loop_nan).
+ *
+ * ---- control flow ----
+ * A block may run past a FORWARD conditional branch, continuing inline and
+ * putting the taken side in an out-of-line chain stub (a superblock).  When the
+ * compiler laid the rare path out inline the hot path is the taken edge
+ * instead, and the loop fragments into a chain of blocks; such a branch is
+ * probed - both sides count in the arena - and a clearly hotter taken side
+ * retires the block, which retranslates with the jcc rewritten as its
+ * complement.  The first window of a loop is often unlike its steady state, so
+ * a verdict counts only when the next window repeats it, and the fourth window
+ * decides regardless.  OCERZ_FLIP_JCC names branches to invert by hand.
+ *
+ * Edges are chained block to block, and a conditional branch may be retargeted
+ * straight at its successor - but only when nothing the successor needs sits
+ * between the branch and the chain tail.  A stub that replays lane-0 flushes,
+ * an FP-batch check or the producer's flag record must stay on the path: subsd's
+ * result left in scratch and a je's side exit chained past the flush made
+ * NSViewGetTransformToDescendant assert on a singular matrix, and a stale flag
+ * record handed to a successor (`cmp ebp,0xb ; jbe L` with `L: ja`) failed every
+ * SQLite open in libcef.
+ *
+ * A guest CALL pushes its return address and also pushes {retaddr, host
+ * continuation} onto a host-stack shadow and a return-address stack, then `bl`s
+ * into the callee body, so the hardware return predictor matches the RAS and a
+ * guest RET is a plain ret.  Indirect jmp/call go through a per-site
+ * direct-mapped cache of 32 {rip, body} pairs (16-aligned, so the lookup's ldp
+ * is single-copy atomic) before falling into an inlined hash probe and finally
+ * C.  Small straight-line callees ending in a plain ret are spliced into the
+ * caller: the call becomes a push, the ret a compare against the known return
+ * address, and a mismatch leaves at the ret's rip for the dispatcher to run the
+ * real one.  Where a frame is pure register work the push's slot is provably
+ * never read, so the push becomes a bare rsp -= 8 and matched push/pop pairs
+ * become register renames - the loop-carried store-to-load chain of call-dense
+ * code.
+ *
+ * ---- invalidation ----
+ * Every guest mmap/mprotect/munmap asks the JIT to drop code in a range.  A
+ * global min/max cannot answer that under Wine, where the live set spans PE
+ * images at 32-bit addresses and shared-cache dylibs at 0x7ff8_0000_0000, so a
+ * region map (one slot per 4 MB, a bitmap of the 64 KB granules in it) answers
+ * in constant time; it may say "maybe" after code is gone but never "no" while
+ * it is present.  Only the overlapping blocks are retired - dropping the whole
+ * cache per flip made CEF startup a full retranslation storm.  Their code stays
+ * allocated on a retired list, so a thread still inside runs to its next exit.
+ * A 64 KB region whose translations keep being invalidated (a JS engine
+ * W^X-flipping its code space) is run interpreted after a few hits, but not
+ * permanently: module-load fixups also retire blocks a few times and then never
+ * again, and a permanent blacklist left the hottest DLL code interpreting
+ * forever, so a region quiet for CHURN_QUIET_NS is re-probed.
+ *
+ * ---- faults and fork ----
+ * A fault inside a block reconstructs the guest state from the host registers:
+ * a push whose store faulted has already decremented rsp in its host register
+ * (+8 repairs it), elided return-address slots are written back so the
+ * interpreter can resume mid-frame, and the XMM pins are recovered from the
+ * signal frame's NEON state because the memory copy is stale.  A fork child
+ * inherits the parent's MAP_JIT arena, whose pages fault when executed, so the
+ * child abandons the arena (rather than freeing it - the fork may have caught
+ * the allocator mid-update) and builds a fresh one on its next step.
+ *
+ * ---- i386 ----
+ * 32-bit blocks are compiled from a whitelist of instructions, with none of the
+ * fusions, no superblocks, and 0x67/16-bit addressing left to the interpreter.
+ * Effective addresses wrap at 2^32 before the host mapping is applied, and pin
+ * class 2 (the 64-bit CALL/RET protocol) is never selected for them.
+ *
+ * ---- bisection ----
+ * OCERZ_INTERP_LO/HI and OCERZ_INTERP_RIP keep chosen ranges or addresses in
+ * the interpreter, which is how a JIT miscompile is narrowed down;
+ * OCERZ_CHAINCHECK validates every published jump target against the arena,
+ * OCERZ_INVMAP_CHECK asserts the region map's one invariant, OCERZ_BTRACE
+ * records block entries, and the OCERZ_UNSAFE_* knobs are measurement aids that
+ * deliberately produce wrong state and must never be enabled outside a
+ * benchmark.
+ */
 #include <execinfo.h>
-/* The JIT: basic blocks translated to native arm64, with the interpreter as fallback. */
 #include "ocerz/jit.h"
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -45,7 +224,6 @@ static size_t jit_code_bytes(void)
 #define JIT_HASH_MASK (JIT_HASH_SIZE - 1)
 #define JIT_MAX_BLOCK_INSNS 256
 
-/* ---- block cache key: guest rip + guest mode ------------------------------- A 32-bit block */
 #define JIT_KEY_M32 (1ull << 63)
 
 static inline uint64_t jit_key(uint64_t rip, int mode32)
@@ -69,19 +247,13 @@ typedef struct JitFaultFlagRecipe {
     uint8_t producer;
 } JitFaultFlagRecipe;
 
-/* trace-inversion probe of one superblock side exit (see g_flip) */
 typedef struct JitProf {
-    uint32_t taken, ft;         /* counted in the arena by the two stubs */
-    uint32_t *ft_site;          /* the body's detour to the fall-through counter (nop once decided) */
-    uint32_t *tk_trip;          /* the taken stub's tbnz to its tagged exit (nop once decided) */
-    uint8_t windows, prev;      /* verdicts so far: decided when two in a row agree */
+    uint32_t taken, ft;
+    uint32_t *ft_site;
+    uint32_t *tk_trip;
+    uint8_t windows, prev;
 } JitProf;
 
-/* What a published block keeps of each decoded instruction: 16 bytes instead
- * of the 96-byte X86Insn.  Invalidation and fault recovery need rip, len and
- * op; the few instructions the block still executes through the interpreter
- * (slow calls) or inspects in full (fault-flag producers) are copied into
- * blk->kept and found through `keep` (index + 1, 0 = not kept). */
 #define JIT_MAX_EDGES 8
 
 typedef struct JitInsnRef {
@@ -94,15 +266,15 @@ typedef struct JitInsnRef {
 } JitInsnRef;
 
 typedef struct JitBlock {
-    uint64_t key;               /* jit_key(guest rip, mode32) -- see JIT_KEY_M32 */
+    uint64_t key;
     JitBlockFn code;
     uint32_t *body_code;
-    uint32_t *body_noreload;    /* body entry after the hoisted-base reload (for a same-signature predecessor) */
-    uint64_t hoist_sig;         /* hoisted bases / aux signature (0: none) */
-    X86Insn *insns;             /* full decode: only until compact_block(), and for blocks without code */
+    uint32_t *body_noreload;
+    uint64_t hoist_sig;
+    X86Insn *insns;
     int n_insns;
-    JitInsnRef *iref;           /* per-insn rip/op/len after compaction */
-    X86Insn *kept;              /* the insns still needed in full */
+    JitInsnRef *iref;
+    X86Insn *kept;
     uint16_t n_kept;
     struct JitBlock *hnext;
     struct JitBlock *retired_next;
@@ -120,20 +292,12 @@ typedef struct JitBlock {
 
     uint32_t *stop_patch;
     uint32_t stop_insn;
-    /* extra stop sites (indirect tails, further backward chains): each is
-     * a branch word replaced by an unconditional b to its stop target */
     struct { uint32_t *site; uint32_t insn; } stop_extra[6];
     uint8_t n_stop_extra;
-    /* host word offsets of push stores emitted after their rsp decrement: a
-     * fault there must hand the guest the pre-push rsp (+8) */
     uint32_t *push_fix;
     uint16_t n_push_fix;
-    /* spliced call/ret pairs whose return-address push was elided: a fault
-     * with ci < insn < rj must write ra back into the frame's slot */
     struct JitPushElide { int32_t ci, rj; uint64_t ra; } *pushelide;
     uint16_t n_pushelide;
-    /* load-promoted frame saves (translate-time only in recovery terms: the
-     * push still stores, so slots are always architecturally valid) */
     struct JitPromo { int32_t pi, qi; uint8_t hreg; };
     struct JitBlock *stop_next;
 
@@ -142,30 +306,28 @@ typedef struct JitBlock {
     uint8_t n_pinned;
 
     uint8_t pin_class;
-    uint8_t inv_hit;            /* scratch: marked by range invalidation */
+    uint8_t inv_hit;
 
     struct {
         uint64_t target_rip;
         uint32_t *patch_b;
         uint32_t fallback_insn;
-        uint32_t *cond_site;      /* conditional branch that targets patch_b (may be retargeted directly) */
+        uint32_t *cond_site;
         uint32_t cond_orig;
         uint8_t kind;
         uint8_t pin_class;
-        uint8_t side;             /* 1 + the g_side index of a superblock side exit */
-        uint8_t probing;          /* both sides of its jcc are being counted: no short-circuit yet */
+        uint8_t side;
+        uint8_t probing;
         uint64_t jcc_rip;
-    } *edges;                   /* terminator edges (<= 2) + forward-jcc side exits; 8 slots while translating, shrunk to n_edges at publication */
+    } *edges;
     uint8_t n_edges;
-    JitProf *prof;              /* one per g_side slot, when any side exit is probed */
-    /* blocks chained INTO this one (source block + edge), so a flip retire
-     * cuts its incoming chains without a walk of the whole live set */
+    JitProf *prof;
     struct { struct JitBlock *pb; uint8_t e; } *preds;
     uint32_t n_preds, cap_preds;
 
     uint16_t entry_live;
-    uint16_t xmm_pinned;      /* xmmN held in V(16+N) for the block's body */
-    uint8_t ordered_loads;    /* the block emitted ordered loads (hot-patch arms: dmb store vs pieces) */
+    uint16_t xmm_pinned;
+    uint8_t ordered_loads;
 } JitBlock;
 
 static inline uint64_t blk_rip(const JitBlock *b) { return jit_key_rip(b->key); }
@@ -173,7 +335,6 @@ static inline int blk_mode32(const JitBlock *b) { return jit_key_mode32(b->key);
 static inline uint64_t blk_insn_rip(const JitBlock *b, int i) { return b->insns ? b->insns[i].rip : b->iref[i].rip; }
 static inline unsigned blk_insn_len(const JitBlock *b, int i) { return b->insns ? b->insns[i].len : b->iref[i].len; }
 static inline unsigned blk_insn_op(const JitBlock *b, int i) { return b->insns ? b->insns[i].op : b->iref[i].op; }
-/* the full X86Insn, or NULL when the block did not keep it */
 static inline const X86Insn *blk_insn_full(const JitBlock *b, int i)
 {
     if (b->insns) return &b->insns[i];
@@ -181,14 +342,14 @@ static inline const X86Insn *blk_insn_full(const JitBlock *b, int i)
     return k ? &b->kept[k - 1] : NULL;
 }
 
-#define INVMAP_RSHIFT 22                       /* 4 MB per slot */
-#define INVMAP_GSHIFT 16                       /* 64 KB per bit */
+#define INVMAP_RSHIFT 22
+#define INVMAP_GSHIFT 16
 #define INVMAP_SLOTS  8192
 #define INVMAP_PROBE  32
-#define INVMAP_MAX_SPAN 64                     /* slots; wider ranges skip the probe */
+#define INVMAP_MAX_SPAN 64
 
-typedef struct { uint64_t tag, bits; } InvSlot;   /* tag 0: empty; else region+1 */
-#define INVMAP_TOMB ((uint64_t)-1)             /* deleted row: probes continue, inserts reuse */
+typedef struct { uint64_t tag, bits; } InvSlot;
+#define INVMAP_TOMB ((uint64_t)-1)
 
 typedef struct JitCodeIndex {
     struct JitCodeIndex *older;
@@ -200,7 +361,7 @@ typedef struct JitCodeIndex {
 enum { EDGE_XBLOCK = 0, EDGE_SELFLOOP = 1, EDGE_BODY = 2 };
 
 struct OcerzJit {
-    int owner_pid;                 /* pid that created the arena (fork diagnostics) */
+    int owner_pid;
     struct OcerzVM *vm;
     uint32_t *code_base;
     uint32_t *code_cur;
@@ -215,12 +376,12 @@ struct OcerzJit {
     uint64_t blocks_translated;
 
     JitCodeIndex *ci;
-    uint32_t *dispatch_stub;   /* in-arena block dispatcher for 64-bit blocks */
-    uint32_t *dispatch_stub32; /* the same for 32-bit blocks (see emit_dispatch_stub) */
-    JitBlock **live;           /* every block currently in the buckets (invalidation walks this, not the 1M buckets) */
+    uint32_t *dispatch_stub;
+    uint32_t *dispatch_stub32;
+    JitBlock **live;
     size_t n_live, cap_live;
-    uint64_t code_lo, code_hi; /* guest range spanned by live blocks; code_hi==0 means none */
-    InvSlot invmap[INVMAP_SLOTS];   /* see invmap_may_hold */
+    uint64_t code_lo, code_hi;
+    InvSlot invmap[INVMAP_SLOTS];
     int invmap_full;
 };
 
@@ -235,27 +396,25 @@ static int g_no_ras;
 static int g_no_ldapr;
 
 static int g_no_oolslow;
-static void ea_cache_reset(void);          /* JTA-address cache (defined with the cache below) */
+static void ea_cache_reset(void);
 
 typedef struct {
     uint32_t *bne;
     uint32_t *back;
     int size, rv, ra, store, idx;
-    int vec;                 /* rv is a V register: ldr/str q|d|s + barrier */
+    int vec;
     int32_t disp;
 } OrderedSlowPend;
 #define OSLOW_MAX 64
 static OrderedSlowPend g_oslow[OSLOW_MAX];
 
-/* Out-of-line NaN fixups: the hot path branches here on a NaN result and the
- * arm branches back.  Emitted after the block body (emit_nan_ool_arms). */
 typedef struct {
-    uint32_t *site;     /* the taken-on-NaN branch (bcond VS or cbz) to patch */
+    uint32_t *site;
     uint32_t *back;
     uint8_t dbl, packed, vr, va, vb, t1;
-    uint8_t cvt;        /* 0 none, 1 cvtt->int64 indefinite, 2 cvtt->int32 exact recompute */
-    uint8_t refcmp;     /* scalar arm: redo fcmp(vr, vr) before returning (a conversion may reuse NZCV) */
-    uint8_t pre, pvr, pva, pvb;   /* cvt arm: first the exact-NaN fix of the scalar op whose branch it absorbed */
+    uint8_t cvt;
+    uint8_t refcmp;
+    uint8_t pre, pvr, pva, pvb;
     int idx;
     int is_cbz;
 } NanOolPend;
@@ -263,22 +422,19 @@ typedef struct {
 static NanOolPend g_nanool[NANOOL_MAX];
 static int g_n_nanool;
 #define PE_MAX 48
-static struct JitPushElide g_pe_real[PE_MAX];        /* elided retaddr pairs emitted so far */
+static struct JitPushElide g_pe_real[PE_MAX];
 static int g_n_pe_real;
-static struct JitPromo g_promo_real[PE_MAX];         /* promoted pairs emitted so far */
+static struct JitPromo g_promo_real[PE_MAX];
 static int g_n_promo_real;
-static const X86Insn *g_pe_insns;                    /* main-loop insns (NULL outside it) */
-static uint32_t g_rsp_lag;                           /* rsp adds deferred across a mov-only run */
+static const X86Insn *g_pe_insns;
+static uint32_t g_rsp_lag;
 static int g_n_oslow;
 static int g_cur_insn_idx;
-/* Static flag-producer hint for the instruction being emitted: the nearest
- * earlier instruction in the block that defines flags (NULL if flags come
- * from outside the block).  Lets emit_cc_predicate specialize. */
 static const X86Insn *g_flag_producer;
-static int g_flag_producer_operands_intact;   /* no later insn wrote the producer's xmm operands */
+static int g_flag_producer_operands_intact;
 
 static int g_no_regflags;
-static unsigned long long g_callout_seq;   /* bumped by every C callout emitter */
+static unsigned long long g_callout_seq;
 static int l0_src2(struct A64Buf *b, unsigned r, int dbl);
 #define l0_src(r, dbl) l0_src2(b, r, dbl)
 static void l0_flush_reg(struct A64Buf *b, unsigned r);
@@ -286,14 +442,14 @@ static void l0_flush_all(struct A64Buf *b);
 static int l0_defer_take(int vs, unsigned xr, int size);
 static void l0_share(unsigned dst, unsigned src);
 static void l0_inval(unsigned r);
-static int g_xlat_n;             /* instruction count of the block being translated */
-static int g_jcc_side_mode;      /* emit_cmp_test_jcc: jcc is a superblock side exit (fall-through continues inline) */
-static uint64_t g_jcc_side_need; /* producer's fl_need in side mode (flags live on either path) */
-static uint64_t g_jcc_side_fall_need; /* ... and on the fall-through continuation only */
-static int g_nzcv_want;          /* emitting the producer of an NZCV-forwarded pair */
-#define NZCV_KIND_BT 0x7f        /* g_nzcv_kind for bt: Z <=> bit clear (B -> NE, AE -> EQ) */
-static int g_nzcv_from = -1;     /* insn index that left NZCV = its result flags */
-static unsigned g_nzcv_kind;     /* OCERZ_CC_SUB / ADD / LOGIC */
+static int g_xlat_n;
+static int g_jcc_side_mode;
+static uint64_t g_jcc_side_need;
+static uint64_t g_jcc_side_fall_need;
+static int g_nzcv_want;
+#define NZCV_KIND_BT 0x7f
+static int g_nzcv_from = -1;
+static unsigned g_nzcv_kind;
 
 static int g_no_chain;
 
@@ -311,25 +467,22 @@ static int g_plain_mem;
 
 static uint64_t g_chain_target;
 static uint32_t *g_chain_epi;
-static int g_chain_keeps_jgb;      /* the CALL path branches to the chain tail with x0 = JGB intact */
-/* RAS slot literals: `ldr Xt, <lit>` sites whose 8-byte slot cell is placed in
- * a pool at the end of the block (patched + registered there) */
-typedef struct { uint32_t *site; uint64_t retaddr; uint64_t hi; int kind; int rt; } RasLit;   /* kind 0: RAS cell for retaddr; 1: 8-byte constant (retaddr = value); 2: 16-byte constant {retaddr, hi} loaded into V rt */
+static int g_chain_keeps_jgb;
+typedef struct { uint32_t *site; uint64_t retaddr; uint64_t hi; int kind; int rt; } RasLit;
 #define RASLIT_MAX 96
 static RasLit g_raslit[RASLIT_MAX];
 static int g_n_raslit;
-/* per-site caches for indirect jmp/call: 32 direct-mapped {rip, body} entries */
-typedef struct { _Alignas(16) uint64_t rip; void *body; } JitPscEnt;   /* 16-aligned: the lookup's ldp is single-copy atomic */
+typedef struct { _Alignas(16) uint64_t rip; void *body; } JitPscEnt;
 #define PSC_N 32
-#define PSC_EMPTY_RIP UINT64_MAX   /* outside the macOS user address space */
+#define PSC_EMPTY_RIP UINT64_MAX
 static JitPscEnt *g_psc_pool;
-static size_t g_psc_used, g_psc_cap;      /* in entries */
+static size_t g_psc_used, g_psc_cap;
 static JitPscEnt **g_psc_tables;
 static size_t g_n_psc_tables, g_cap_psc_tables;
 static JitPscEnt *psc_alloc(void)
 {
     if (g_psc_used + PSC_N > g_psc_cap) {
-        size_t bytes = (size_t)1 << 22;    /* 4 MB chunks: 8192 sites */
+        size_t bytes = (size_t)1 << 22;
         void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
         if (p == MAP_FAILED) return NULL;
         g_psc_pool = (JitPscEnt *)p; g_psc_used = 0; g_psc_cap = bytes / sizeof(JitPscEnt);
@@ -350,13 +503,10 @@ static void psc_clear_all(void)
 {
     for (size_t i = 0; i < g_n_psc_tables; i++)
         for (int k = 0; k < PSC_N; k++) {
-            /* rip first: a reader that still sees the old rip also sees the old body */
             __atomic_store_n(&g_psc_tables[i][k].rip, PSC_EMPTY_RIP, __ATOMIC_RELEASE);
             __atomic_store_n(&g_psc_tables[i][k].body, (void *)NULL, __ATOMIC_RELEASE);
         }
 }
-/* registry of every pool cell (they live in JIT memory, which is never
- * reused, so invalidation can NULL them all inside the write window) */
 static void ***g_ras_cells;
 static size_t g_n_ras_cells, g_cap_ras_cells;
 static void ras_cell_register(void **cell)
@@ -374,9 +524,6 @@ static uint64_t g_self_rip;
 static uint32_t *g_body_entry;
 static uint32_t *g_loop_entry;
 static uint32_t *g_stop_patch;
-/* Superblocks: a block may run past a FORWARD conditional branch (the
- * fall-through continues inline); the taken side becomes an out-of-line chain
- * stub recorded here and emitted after the body. */
 #define SIDE_MAX 6
 static struct { uint32_t *site; uint64_t taken; int idx; uint32_t *stub; uint32_t *patch_b;
                 int rec; uint32_t rec_ccop; int rec_src, rec_dst, rec_imm_pending; uint64_t rec_imm;
@@ -385,22 +532,12 @@ static struct { uint32_t *site; uint64_t taken; int idx; uint32_t *stub; uint32_
                 uint16_t l0_dirty; } g_side[SIDE_MAX];
 static int g_n_side;
 
-/* ---- trace-inversion profile ----
- * A superblock follows a forward jcc's fall-through.  When the compiler laid
- * the rare path out inline (if (rare) {...}) the hot path is the taken edge
- * and the loop fragments into a chain of blocks.  An undecided branch is
- * probed: both sides count in the arena (the taken side in its chain stub,
- * the fall-through through a one-word detour to a counting stub) and the
- * first side to reach 1 << PROBE_BIT exits comes back to C once.  A clearly
- * hotter taken side retires the block, which retranslates following that
- * edge with the jcc rewritten as its complement; otherwise the probes are
- * patched to nops and the branch chains normally.  Decisions are per jcc. */
 #define FLIP_N 4096
-#define PROBE_BIT 10                   /* a side trips when its count reaches 1 << PROBE_BIT */
-#define PROBE_MAX 65536                /* probes per process */
+#define PROBE_BIT 10
+#define PROBE_MAX 65536
 enum { FLIP_NONE = 0, FLIP_DECIDED_ORIG, FLIP_DECIDED_INV };
 static struct { uint64_t rip; uint8_t state; } g_flip[FLIP_N];
-static int g_churn_suppress;          /* a flip retire is not code churn */
+static int g_churn_suppress;
 static int g_n_probes;
 static int flip_disabled(void)
 {
@@ -432,12 +569,6 @@ static int superblock_enabled(void)
     if (en < 0) en = getenv("OCERZ_NO_SUPERBLOCK") ? 0 : 1;
     return en;
 }
-/* Superblock trace inversion: a forward jcc the compiler laid out with the
- * rare path inline (if (rare) {...} - the branch over it is usually taken)
- * fragments the hot path into a chain of blocks.  Continuing along the
- * TAKEN edge instead - the jcc rewritten as its complement targeting the
- * old fall-through - keeps the hot path in one block.  OCERZ_FLIP_JCC=rip,..
- * names the branches to invert. */
 static int jcc_flip_wanted(uint64_t jcc_rip)
 {
     static uint64_t rips[32];
@@ -458,22 +589,19 @@ static int jcc_flip_wanted(uint64_t jcc_rip)
     int s = flip_state(jcc_rip);
     return s == FLIP_DECIDED_INV;
 }
-static int superblock_back_enabled(void)      /* continue past backward jcc too (OCERZ_NO_SB_BACK disables) */
+static int superblock_back_enabled(void)
 {
     static int en = -1;
     if (en < 0) en = getenv("OCERZ_NO_SB_BACK") ? 0 : 1;
     return en;
 }
-static uint32_t g_push_fix[JIT_MAX_BLOCK_INSNS];   /* offsets relative to the block entry */
+static uint32_t g_push_fix[JIT_MAX_BLOCK_INSNS];
 static int g_n_push_fix;
 
-/* Commpage handling in the identity-mapped dynamic mode: the x86 commpage (0x7fffffe00000 */
 #define CP_MARK_SIZE 256
 static uint64_t g_cp_marks[CP_MARK_SIZE];
 static int g_cp_nmarks;
-static int g_cp_guard;               /* this translation: guard every access */
-/* keyed by jit_key(rip, mode32), like the block cache: the same address in
- * the two modes is not the same code and must not share a mark */
+static int g_cp_guard;
 static int cp_marked(uint64_t key)
 {
     for (int i = 0; i < g_cp_nmarks; i++) if (g_cp_marks[i] == key) return 1;
@@ -483,13 +611,10 @@ static void cp_mark(uint64_t key)
 {
     if (cp_marked(key)) return;
     if (g_cp_nmarks < CP_MARK_SIZE) g_cp_marks[g_cp_nmarks++] = key;
-    else g_cp_marks[0] = 0;          /* full: rip 0 is never translated; keep going (fault storms unlikely) */
+    else g_cp_marks[0] = 0;
 }
-/* guards are needed for every access when: low-base shadow mapping (address
- * translation) or a marked block in commpage mode */
 static inline int mem_guard_needed(void) { return ocerz_low_base != 0 || g_cp_guard; }
 
-/* Ordered (multi-observer, x86-TSO) memory model costs: acquire loads and release stores are */
 static int stack_plain_ok(void)
 {
     static int en = -1;
@@ -500,28 +625,16 @@ static int stack_plain_ok(void)
 static uint64_t g_al_marks[AL_MARK_SIZE];
 static int g_al_nmarks;
 static pthread_mutex_t jit_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_align_guard;            /* this translation: alignment-checked ordered accesses */
-/* Ordered mode keeps scalar accesses acquire/release (all but the rsp-based
- * ones under the stack heuristic above): flags, locks and atomics are scalar,
- * a release scalar store orders every earlier vector store, an acquire scalar
- * load orders every later vector load.  SSE/vector accesses themselves stay
- * plain by default: programs do not synchronize through a 16-byte access
- * (x86 does not even make them atomic), and ordering them cost memcpy 3.3x
- * and fpvec 3.0x of Rosetta (release-store pairs; an acquire load stalling
- * behind an in-place store).  What this gives up: a vector load followed by
- * a scalar re-read of a seqlock counter may observe newer data than the
- * counter covers, and two vector stores may become visible out of order.
- * OCERZ_TSO_VECTOR=1 orders them too.  Measured 2026-09-05 on M2 Max; FEX
- * ships the same default (VectorTSOEnabled=false). */
+static int g_align_guard;
 static int vec_tso_relaxed(void)
 {
     static int v = -1;
     if (v < 0) v = getenv("OCERZ_TSO_VECTOR") == NULL;
     return v;
 }
-static unsigned long long ps_align_patches;   /* PERFSTAT: hot-patched alignment-fault sites */
-static int g_blk_ordered_loads;      /* this translation emitted an ordered load (throttles the store stream) */
-static int g_al_all;                 /* mark table full (or OCERZ_AL_GUARD_ALL): every block checked */
+static unsigned long long ps_align_patches;
+static int g_blk_ordered_loads;
+static int g_al_all;
 static int al_marked(uint64_t key)
 {
     if (g_al_all) return 1;
@@ -534,23 +647,16 @@ static void al_mark(uint64_t key)
     if (g_al_nmarks < AL_MARK_SIZE) g_al_marks[g_al_nmarks++] = key;
     else g_al_all = 1;
 }
-/* stack protocol (push/pop/call/ret/leave and the RAS body-pointer scheme): plain accesses */
 static inline int stack_plain_access_ok(void) { return g_plain_mem || stack_plain_ok(); }
-/* the plain (unordered) access forms may be used for this operand: single
- * observer, or an rsp-based access under the stack heuristic */
 static inline int mem_plain_access_ok(const X86Operand *m)
 {
     if (g_plain_mem) return 1;
     return stack_plain_ok() && m->base == OCERZ_RSP && !m->riprel;
 }
-/* fast address forms are independent of the memory model */
 static inline int jgb_usable(void);
 static inline int mem_fast_forms_ok(void) { return jgb_usable() && !mem_guard_needed(); }
-/* stack accesses (push/pop/call/ret through [JGB, rsp]) and the RAS/CALL/RET
- * protocol never touch the commpage: independent of the per-block mark, so
- * every block in a process speaks the same RAS protocol */
 static inline int stack_guard_needed(void) { return ocerz_low_base != 0; }
-static const uint32_t *g_push_entry;                /* block entry for offset computation */
+static const uint32_t *g_push_entry;
 static struct { uint32_t *site; uint32_t *target; } g_stop_extra[6];
 static int g_n_stop_extra;
 static void stop_extra_add(uint32_t *site, uint32_t *target)
@@ -559,35 +665,30 @@ static void stop_extra_add(uint32_t *site, uint32_t *target)
 }
 static uint32_t *g_stop_target;
 
-/* Re-target the branch already emitted at `site` so it goes to `target`, PRESERVING its class */
 static uint32_t stop_retarget(uint32_t insn, const uint32_t *site,
                               const uint32_t *target)
 {
     int32_t off = (int32_t)(target - site);
-    if ((insn & 0xfc000000u) == 0x14000000u)             /* b      imm26 */
+    if ((insn & 0xfc000000u) == 0x14000000u)
         return 0x14000000u | ((uint32_t)off & 0x03ffffffu);
-    if ((insn & 0xff000010u) == 0x54000000u)             /* b.cond imm19 */
+    if ((insn & 0xff000010u) == 0x54000000u)
         return (insn & 0xff00001fu) | (((uint32_t)off & 0x7ffffu) << 5);
-    if ((insn & 0x7e000000u) == 0x34000000u)             /* cbz/cbnz imm19 */
+    if ((insn & 0x7e000000u) == 0x34000000u)
         return (insn & 0xff00001fu) | (((uint32_t)off & 0x7ffffu) << 5);
-    if ((insn & 0x7e000000u) == 0x36000000u)             /* tbz/tbnz imm14 */
+    if ((insn & 0x7e000000u) == 0x36000000u)
         return (insn & 0xfff8001fu) | (((uint32_t)off & 0x3fffu) << 5);
-    return 0x14000000u | ((uint32_t)off & 0x03ffffffu);  /* br/blr and friends */
+    return 0x14000000u | ((uint32_t)off & 0x03ffffffu);
 }
 static int g_mem_hoist_greg = -1;
 static int g_mem_hoist_aux_disp;
-static int g_mem_hoist_aux_index = -1;   /* aux kind 2: JMEMAUX = JMEMBASE + index << scale (recomputed at the loop head) */
+static int g_mem_hoist_aux_index = -1;
 static int g_mem_hoist_aux_scale;
 #define JMEMBASE 17
 #define JMEMAUX 29
-#define JMEMBASE2 16          /* second hoisted base (x16 is only ever clobbered by callouts, which reload) */
-#define JMEMBASE3 30          /* third: x30 is free inside a block body -- a guest RET pops its
-                                 continuation from the shadow, the epilogue restores the C return
-                                 address from the frame, callouts/bl clobber it and reload */
+#define JMEMBASE2 16
+#define JMEMBASE3 30
 static int g_mem_hoist_greg2 = -1;
 static int g_mem_hoist_greg3 = -1;
-/* signature of the current translation's hoisting: a chained predecessor
- * with the same signature enters the target after its reload */
 static inline uint64_t hoist_signature(void)
 {
     if (g_mem_hoist_greg < 0) return 0;
@@ -604,17 +705,12 @@ static inline int hoist_reg_for(unsigned base)
     if (g_mem_hoist_greg >= 0 && base == (unsigned)g_mem_hoist_greg) return JMEMBASE;
     if (g_mem_hoist_greg2 >= 0 && base == (unsigned)g_mem_hoist_greg2) return JMEMBASE2;
     if (g_mem_hoist_greg3 >= 0 && base == (unsigned)g_mem_hoist_greg3) return JMEMBASE3;
-    /* identity mapping (guest_base 0): every pinned base register already
-     * holds guest_base + base, i.e. it IS its own hoisted register */
     if (ocerz_guest_base == 0 && pin_slot(base) >= 0 && !(g_pin_class_fwd() == 2 && base == OCERZ_RSP)) {
         static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_IDBASE") ? 1 : 0;
         if (!dis) return pin_hreg(pin_slot(base));
     }
     return -1;
 }
-/* [base + index*1 + disp] == [index + base*1 + disp]: when only the index
- * register is hoisted, view it as the base (the caller decides the stack
- * heuristic on the original operand before swapping) */
 static const X86Operand *mem_hoist_view(const X86Operand *m, X86Operand *tmp)
 {
     if (m->riprel || m->base == OCERZ_REG_NONE || m->index == OCERZ_REG_NONE || (m->scale & 3) != 0) return m;
@@ -622,12 +718,8 @@ static const X86Operand *mem_hoist_view(const X86Operand *m, X86Operand *tmp)
     *tmp = *m; tmp->base = m->index; tmp->index = m->base;
     return tmp;
 }
-/* x0 holds ocerz_guest_base for the whole block (materialized at function
- * entry and after every C callout; C calls set x0 themselves).  Only used
- * when there is no low_base alias (ea_fold() == guest_base). */
 #define JGB 0
 static inline int jgb_usable(void) { return ocerz_low_base == 0; }
-/* identity mapping (dynamic mode / guest_base 0): stack pushes/pops can use the pre/post-indexed */
 static inline int stack_identity(void)
 {
     static int dis = -1;
@@ -668,7 +760,6 @@ static struct {
 static int g_n_call_edges;
 
 static OcerzJit *g_xlat_jit;
-/* Guest mode of the block currently being translated. */
 static int g_xlat_mode32;
 static int g_xlat_mode32_fwd(void) { return g_xlat_mode32; }
 
@@ -676,11 +767,6 @@ static int8_t *g_pin;
 static uint8_t *g_pin_hold;
 static int g_n_pinned;
 static int g_pin_class;
-/* Class 3 keeps rsp's host register as guest_base + rsp, like class 2 always
- * did: push/pop become single pre/post-index accesses and rsp-relative
- * addresses drop the base add.  Reads and writes of the rsp VALUE convert at
- * the accessors; spill/fill and fault recovery convert at the boundaries.
- * OCERZ_RSP_VALUE restores the old value-keeping class 3. */
 static inline int rsp_ptr3(void)
 {
     static int off = -1;
@@ -696,10 +782,9 @@ static inline int rsp_is_ptr(void)
 int g_pin_class_fwd(void) { return g_pin_class; }
 
 static int g_defer;
-static int16_t g_mov_sink_at[JIT_MAX_BLOCK_INSNS];   /* shift j: index of the mov it absorbs, or -1 (see mov_sink_scan) */
-static uint8_t g_mov_skip[JIT_MAX_BLOCK_INSNS];      /* mov i: sunk, emit nothing */
+static int16_t g_mov_sink_at[JIT_MAX_BLOCK_INSNS];
+static uint8_t g_mov_skip[JIT_MAX_BLOCK_INSNS];
 static _Atomic unsigned long long ps_ops[OCERZ_OP_COUNT];
-/* per op: up to 3 distinct instruction shapes seen going slow (for the report) */
 static char ps_shapes[OCERZ_OP_COUNT][3][96];
 static void ps_note_shape(const X86Insn *insn)
 {
@@ -707,7 +792,6 @@ static void ps_note_shape(const X86Insn *insn)
     if (o >= OCERZ_OP_COUNT) return;
     char buf[96];
     ocerz_format_insn(insn, buf, sizeof buf);
-    /* normalize immediates/displacements out so shapes group */
     for (int i = 0; i < 3; i++) {
         if (ps_shapes[o][i][0] == 0) { snprintf(ps_shapes[o][i], sizeof ps_shapes[o][i], "%s", buf); return; }
         if (strcmp(ps_shapes[o][i], buf) == 0) return;
@@ -721,7 +805,7 @@ static const char *ps_shape_name[9] = { "push", "pop", "test", "movsxd", "call",
                                         "jmp", "jmpind", "jmpmem" };
 
 static _Atomic unsigned long long ps_chain_ok, ps_chain_far;
-static unsigned long long ps_ras_miss, ps_ras_stale;   /* JIT-side counters (perfstat) */
+static unsigned long long ps_ras_miss, ps_ras_stale;
 static uint64_t ps_t0;
 
 static __attribute__((noinline, cold, preserve_most)) void jit_trace_one(const X86Insn *insn)
@@ -768,13 +852,11 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
     }
 }
 
-__thread int ocerz_jit_exec_state;   /* crash diagnostics: 1 = in exec_one (slow call), 2 = in jit_interp_block */
+__thread int ocerz_jit_exec_state;
 int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
     if (__builtin_expect(insn->op == OCERZ_OP_SYSCALL && !insn->mode32 &&
                          cpu->gpr[OCERZ_RAX] == ((2ull << 24) | 2), 0)) {
-        /* fork must not run from JIT'd code: the child would resume inside the
-         * inherited MAP_JIT arena, which faults ADRALN on Apple silicon. */
         cpu->cur_rip = insn->rip;
         cpu->rip = insn->rip;
         return OCERZ_EUNSUP;
@@ -783,9 +865,6 @@ int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         jit_perfstat_one(insn);
     vm->insn_count++;
     cpu->cur_rip = insn->rip;
-    /* EIP wraps at 32 bits.  Written as a select rather than a branch: this
-     * runs on every interpreter callout from compiled 64-bit code too, where
-     * the mask is all-ones and nothing changes. */
     uint64_t next = insn->rip + insn->len;
     uint64_t m32mask = insn->mode32 ? 0xffffffffull : ~0ull;
     cpu->rip = next & m32mask;
@@ -794,24 +873,16 @@ int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     int prev = ocerz_jit_exec_state;
     if (!prev) ocerz_jit_exec_state = 1;
     int r = ocerz_interp_exec(vm, cpu, insn);
-    /* keyed on the mode the CPU is in NOW: a far transfer that just left
-     * 32-bit mode has produced a full 64-bit rip (ocerz_interp_step does
-     * exactly this, and a slow call must not disagree with it) */
     cpu->rip &= cpu->mode32 ? 0xffffffffull : ~0ull;
     ocerz_jit_exec_state = prev;
     return r;
 }
 
-/* Slow-call entry from compiled code: the block and the insn index, so the
- * decoded array can be dropped after translation (see compact_block). */
 static int ocerz_jit_exec_one_at(struct OcerzVM *vm, OcerzCPU *cpu, const JitBlock *b, uint64_t idx)
 {
     return ocerz_jit_exec_one(vm, cpu, blk_insn_full(b, (int)idx));
 }
 
-/* translation state for compact_block(): the block being emitted, which of
- * its insns a slow call references, and whether something referenced an insn
- * outside the block's array (then the array must stay) */
 static JitBlock *g_cur_blk;
 static uint8_t *g_keep;
 static int g_keep_cap, g_keep_n, g_no_compact;
@@ -843,18 +914,12 @@ static int is_terminator(unsigned op)
     }
 }
 
-/* Unchanged mixing function; it now takes the key, which for 64-bit code is
- * the rip it always took.  The emitted lookups inline exactly this sequence
- * (lsr 33 / eor / mul const / lsr 29 / eor / and MASK). */
-/* The four far transfers. */
 static int term_may_switch_mode(unsigned op)
 {
     return op == OCERZ_OP_IRET || op == OCERZ_OP_JMPF ||
            op == OCERZ_OP_CALLF || op == OCERZ_OP_RETF;
 }
 
-/* getenv() is a locked linear scan of environ, and these debug gates sit in
- * per-block and per-instruction paths; latch each site's answer on first use. */
 #define ENV_ON(name) ({ static int on_ = -1;                     \
                         if (on_ < 0) on_ = getenv(name) != NULL; \
                         on_; })
@@ -876,7 +941,7 @@ static JitBlock *cache_lookup(OcerzJit *jit, uint64_t rip, int mode32)
             return b;
     {
         static int wl = -1; if (wl < 0) wl = getenv("OCERZ_WILDLOG") ? 1 : 0;
-        if (wl && (rip >= 0x800000000000ull || rip < 0x10000ull)) {   /* outside guest space, or the NULL page */
+        if (wl && (rip >= 0x800000000000ull || rip < 0x10000ull)) {
             extern unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
             extern uint64_t ocerz_current_dbg_ind_src(void);
             extern uint64_t ocerz_current_guest_gpr(int);
@@ -892,21 +957,6 @@ static JitBlock *cache_lookup(OcerzJit *jit, uint64_t rip, int mode32)
     }
     return NULL;
 }
-
-/* Coarse "which guest pages hold translated code" map.
- *
- * Every guest mmap/mprotect/munmap asks the JIT to drop any code it holds in
- * that range.  A single global min/max over all live blocks cannot answer that
- * under wine, where the live set spans PE images down at 32-bit addresses and
- * shared-cache dylibs up at 0x7ff8_0000_0000, so the reject test used to walk
- * the whole live list -- hundreds of millions of range tests per process
- * during prefix startup.
- *
- * Each slot covers one 4 MB region and holds a bitmap of the 64 KB granules in
- * it that a live block spans.  Entries are only added, so the map may say
- * "maybe" after the code is gone, but never "no" while it is present.
- * invalidate_all_locked clears it because it drops every block.  Both the add
- * and the probe run under jit_lock. */
 
 static inline unsigned invmap_slot(uint64_t tag)
 {
@@ -948,9 +998,6 @@ next:;
     }
 }
 
-/* After a scan proved no live block overlaps [lo, hi), the granule bits
- * fully inside the range are stale: clear them so the next flip of the
- * same region rejects in constant time instead of walking the live set. */
 static void invmap_clear_range(OcerzJit *jit, uint64_t lo, uint64_t hi)
 {
     uint64_t g = 1ull << INVMAP_GSHIFT;
@@ -994,9 +1041,6 @@ static int invmap_may_hold(const OcerzJit *jit, uint64_t lo, uint64_t hi)
     return 0;
 }
 
-/* per-64KB-granule count of live blocks touching it: a flip over granules
- * that hold nothing skips the live-set walk entirely.  Same run-walk as the
- * invmap registration; counts drop when blocks retire. */
 #define GRAN_SLOTS 65536
 #define GRAN4_SLOTS 16384
 static struct { uint64_t page; int32_t count; } g_gran[GRAN_SLOTS];
@@ -1021,7 +1065,7 @@ static int gran4_count(uint64_t row)
         if (g_gran4[i].row == row) return g_gran4[i].count;
         if (g_gran4[i].row == 0 && g_gran4[i].count == 0) return 0;
     }
-    return 1;   /* unknown: conservative */
+    return 1;
 }
 static void gran_bump(uint64_t rip, int d)
 {
@@ -1081,8 +1125,6 @@ static void gran_clear_all(void)
     g_gran_degenerate = 0;
 }
 
-/* the edge array is sized for the worst case while translating; a published
- * block keeps only what it has (48 bytes per edge, most blocks have one) */
 static void shrink_edges(JitBlock *b)
 {
     unsigned n = b->n_edges ? b->n_edges : 1;
@@ -1106,8 +1148,6 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
     if (jit->n_live < jit->cap_live) jit->live[jit->n_live++] = b;
     gran_block(b, +1);
     if (b->n_insns > 0) {
-        /* an inlined call splices a far-away callee into the block, so
-         * register each contiguous rip run, not the naive min..max span */
         uint64_t lo = blk_insn_rip(b, 0);
         uint64_t hi = lo + blk_insn_len(b, 0);
         for (int i = 1; i <= b->n_insns; i++) {
@@ -1128,8 +1168,6 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
     }
 }
 
-/* ---- monomorphic inline caches for indirect jmp/call ---------------------- Each */
-/* slot->rip is a RAW guest rip, not a jit_key: it is compared against the computed branch target. */
 typedef struct JitIcSlot { uint64_t rip; void *code; } JitIcSlot;
 #define JIT_IC_SLOTS (1u << 16)
 static JitIcSlot g_ic_slots[JIT_IC_SLOTS];
@@ -1168,7 +1206,6 @@ static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth);
 static void fpb_site_emit(A64Buf *b, int end, int va, int vb, int dbl);
 static int unsafe_nocheckbr(void);
 static int fpb_det_here(int idx);
-/* Flags live at the entry of the (not yet translated) code at rip: decode up to the terminator */
 static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
 {
     static int maxd = -1;
@@ -1179,7 +1216,7 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
     volatile uint64_t pc = rip;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
+    if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         while (n < JIT_MAX_BLOCK_INSNS) {
             int rc = ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -1223,7 +1260,7 @@ static int canonical_body_successor(uint64_t rip)
     volatile int compatible = 0;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
+    if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         for (int n = 0; n < JIT_MAX_BLOCK_INSNS; n++) {
             if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -1231,7 +1268,7 @@ static int canonical_body_successor(uint64_t rip)
                 break;
             if (is_terminator(insn.op)) {
                 compatible = insn.op == OCERZ_OP_JCC ||
-                    insn.op == OCERZ_OP_JMP;   /* direct or indirect */
+                    insn.op == OCERZ_OP_JMP;
                 break;
             }
             pc += insn.len;
@@ -1248,7 +1285,7 @@ static unsigned decoded_terminator(uint64_t rip)
     volatile unsigned term = 0;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
+    if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         for (int n = 0; n < JIT_MAX_BLOCK_INSNS; n++) {
             if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -1279,7 +1316,7 @@ static int decoded_call_region_entry(uint64_t rip)
     volatile int rsp_ok = 1;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
+    if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         for (int n = 0; n < JIT_MAX_BLOCK_INSNS; n++) {
             if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -1328,12 +1365,11 @@ static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth)
 }
 static uint64_t xlive_succ_live(OcerzJit *jit, uint64_t rip) { return xlive_succ_live_d(jit, rip, 0); }
 
-/* Probe this superblock side exit?  (translation runs under jit_lock) */
 static int probe_wanted(uint64_t jcc_rip, uint64_t ft_rip)
 {
     if (flip_disabled() || g_n_probes >= PROBE_MAX) return 0;
     if (flip_state(jcc_rip) != FLIP_NONE) return 0;
-    if (xlive_succ_live(g_xlat_jit, ft_rip) != 0) return 0;   /* an exit there would need a flag record */
+    if (xlive_succ_live(g_xlat_jit, ft_rip) != 0) return 0;
     g_n_probes++;
     return 1;
 }
@@ -1355,26 +1391,21 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 #define RAS_TOP_OFF ((uint32_t)offsetof(OcerzCPU, ras_top))
 #define RAS_OFF ((uint32_t)offsetof(OcerzCPU, ras))
 #define JIT_FP_OFF ((uint32_t)offsetof(OcerzCPU, jit_fp))
-/* ---- host-stack return-address shadow (class 3, bl/ret protocol) ---- A guest CALL pushes */
 static int host_ras_enabled(void)
 {
     static int en = -1;
     if (en < 0) en = getenv("OCERZ_NO_HOST_RAS") ? 0 : 1;
     return en;
 }
-static void emit_frame_sp_reset(A64Buf *b)     /* before popping the block frame */
+static void emit_frame_sp_reset(A64Buf *b)
 {
     if (g_pin_class == 3 && host_ras_enabled()) {
-        /* scratch is JTA (x15), NEVER JT0: several epilogues hold their branch target in JT0 across this */
-        a64_ldr(b, 8, 15, 20, JIT_FP_OFF);      /* JTA */
-        a64_add_imm(b, 1, 31, 15, 0);           /* mov sp, JTA */
+        a64_ldr(b, 8, 15, 20, JIT_FP_OFF);
+        a64_add_imm(b, 1, 31, 15, 0);
     }
 }
 
 enum { JT0 = 9, JT1 = 10, JT2 = 11, JTF = 12, JTT = 13, JTU = 14, JTA = 15 };
-/* push of host register rv through the pinned rsp hs and JGB: 2 words when the
- * fault fixup table has room (a faulting store is repaired by rsp += 8), else
- * the 3-word temp form */
 static void emit_push_pinned(A64Buf *b, int hs, int rv)
 {
     if ((stack_identity() || rsp_is_ptr()) && rv != hs) {
@@ -1460,14 +1491,14 @@ static void emit_materialize(A64Buf *b)
     a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
     uint32_t *skip = a64_label(b);
     a64_cbz(b, 0, JT0, 0);
-    emit_xmm_pin_spill_all(b);           /* C clobbers V16-V31 */
-    emit_spill_pinned_callersaved(b);    /* and x1-x8 pin slots */
+    emit_xmm_pin_spill_all(b);
+    emit_spill_pinned_callersaved(b);
     a64_mov_reg(b, 1, 0, 20);
     a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_flags_materialize);
     a64_blr(b, 16);
     g_callout_seq++;
     emit_fill_pinned_callersaved(b);
-    emit_reload_jgb(b);           /* JGB first: the hoisted bases derive from it */
+    emit_reload_jgb(b);
     emit_reload_mem_base(b);
     emit_xmm_pin_load_all(b);
     a64_patch_cbz(skip, a64_label(b));
@@ -1478,11 +1509,6 @@ static inline int pin_slot(unsigned greg)
     return (g_pin && greg < 16) ? g_pin[greg] : -1;
 }
 
-/* Host register holding pin slot `slot`.  Slots 0-7 -> x21-x28 (callee-
- * saved), 8-13 -> x3-x8, 14-15 -> x1-x2 (caller-saved: spilled/reloaded
- * around every C callout by emit_spill_pinned/emit_fill_pinned). */
-/* Class 3 = every guest GPR permanently pinned (slot == guest reg number).
- * All blocks share the layout, so every transition is body-to-body. */
 static int fullpin_enabled(void)
 {
     static int on = -1;
@@ -1560,8 +1586,6 @@ static void emit_spill_pinned(A64Buf *b)
     }
 }
 
-/* Spill/fill only the pin slots that live in caller-saved host registers
- * (slot >= 8): used around C calls that leave x21-x28 intact. */
 static void emit_spill_pinned_callersaved(A64Buf *b)
 {
     for (int i = 8; i < g_n_pinned; i++)
@@ -1585,8 +1609,6 @@ static void emit_fill_pinned(A64Buf *b)
     }
 }
 
-/* Only the callee-saved slots (0-7 -> x21-x28) are saved/restored around a
- * block; slots >= 8 live in caller-saved registers. */
 static inline int pin_saved_count(void) { return g_n_pinned < 8 ? g_n_pinned : 8; }
 
 static void emit_pin_prologue(A64Buf *b)
@@ -1630,10 +1652,8 @@ static int emit_load_operand(A64Buf *b, const X86Operand *op, int sf, int dst)
     return 0;
 }
 
-/* ---- mov d,s ; op d,x -> op d,s,x ---- x86's two-address form makes "copy then operate" */
-static const uint32_t *g_cur_insn_start;   /* b->p when the current instruction's emission began */
+static const uint32_t *g_cur_insn_start;
 extern const struct X86Insn *g_cur_insns_fwd(void);
-/* Delete a just-emitted `mov dreg, src` and return src's host register, so the instruction now */
 static int fuse_prev_mov(A64Buf *b, unsigned dreg, int size, int *hs_out,
                          const X86Insn *cur)
 {
@@ -1644,7 +1664,7 @@ static int fuse_prev_mov(A64Buf *b, unsigned dreg, int size, int *hs_out,
             if (cur->ops[oi].kind == OCERZ_OPK_REG && !cur->ops[oi].high8 &&
                 cur->ops[oi].reg == dreg)
                 return -1;
-    if (!g_cur_insn_start || b->p != g_cur_insn_start) return -1;     /* nothing emitted yet by this instruction */
+    if (!g_cur_insn_start || b->p != g_cur_insn_start) return -1;
     const X86Insn *p = &g_cur_insns_fwd()[g_cur_insn_idx - 1];
     if (p->op != OCERZ_OP_MOV || p->nops != 2) return -1;
     const X86Operand *pd = &p->ops[0], *ps = &p->ops[1];
@@ -1654,7 +1674,7 @@ static int fuse_prev_mov(A64Buf *b, unsigned dreg, int size, int *hs_out,
     if (pin_slot(dreg) < 0 || pin_slot(ps->reg) < 0) return -1;
     if (rsp_is_ptr() && (dreg == OCERZ_RSP || ps->reg == OCERZ_RSP)) return -1;
     int hd = pin_hreg(pin_slot(dreg)), hs = pin_hreg(pin_slot(ps->reg));
-    uint32_t want = (size == 8 ? 0xaa0003e0u : 0x2a0003e0u) | ((uint32_t)hs << 16) | (uint32_t)hd;   /* orr hd, (x|w)zr, hs */
+    uint32_t want = (size == 8 ? 0xaa0003e0u : 0x2a0003e0u) | ((uint32_t)hs << 16) | (uint32_t)hd;
     if (b->p <= b->start + 1 || b->p[-1] != want) return -1;
     b->p--;
     *hs_out = hs;
@@ -1751,9 +1771,6 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
                   op == OCERZ_OP_AND || op == OCERZ_OP_OR || op == OCERZ_OP_XOR);
     (void)is_logic;
 
-    /* add/sub imm on a pointer-held rsp: base + (v +- imm) == (base + v) +- imm,
-     * so the pointer form is exact.  Dead flags only: records would capture the
-     * pointer, and materialize would compute flags of the wrong value. */
     if (rsp_is_ptr() && d->reg == OCERZ_RSP && sf && !need &&
         (op == OCERZ_OP_ADD || op == OCERZ_OP_SUB) &&
         s->kind == OCERZ_OPK_IMM && s->imm <= 4095 && pin_slot(OCERZ_RSP) >= 0) {
@@ -1763,7 +1780,6 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
         return 1;
     }
 
-    /* NZCV forwarding to the adjacent consumer: flag-setting arm64 op */
     if (g_nzcv_want && pin_slot(d->reg) >= 0 &&
         !(rsp_is_ptr() && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP))) &&
         (s->kind == OCERZ_OPK_IMM || (s->kind == OCERZ_OPK_REG && !s->high8 && pin_slot(s->reg) >= 0))) {
@@ -1772,7 +1788,6 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
         uint64_t v = 0; int imm = s->kind == OCERZ_OPK_IMM;
         if (imm) { v = s->imm; if (!sf) v &= 0xffffffffull; }
         if (imm && (is_add || is_sub) && !need && v <= 4095) {
-            /* dead record: flag-setting immediate form */
             int rdst = writes ? rd : A64_ZR;
             if (is_add) a64_adds_imm(b, sf, rdst, rd, (uint32_t)v);
             else        a64_subs_imm(b, sf, rdst, rd, (uint32_t)v);
@@ -1780,9 +1795,7 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
             g_nzcv_from = g_cur_insn_idx;
             return 1;
         }
-        {   /* add r,-k == sub r,k for every flag (CF included), so the opposite
-             * flag-setting immediate form serves with the ORIGINAL op's NZCV
-             * interpretation (add: CF == C; sub: CF == !C) */
+        {
             uint64_t neg = (0ull - v) & (sf ? UINT64_MAX : 0xffffffffull);
             if (imm && (is_add || is_sub) && !need && neg >= 1 && neg <= 4095) {
                 int rdst = writes ? rd : A64_ZR;
@@ -1826,8 +1839,6 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (!writes && need == 0)
         return 1;
 
-    /* pinned destination with live flags: record from the pre-op operands,
-     * then operate in place (no JT round trips) */
     if (writes && need != 0 && pin_slot(d->reg) >= 0 && (is_add || is_sub || is_logic) &&
         !(rsp_is_ptr() && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP))) &&
         (s->kind == OCERZ_OPK_IMM || (s->kind == OCERZ_OPK_REG && !s->high8))) {
@@ -1841,7 +1852,6 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
             uint64_t v = s->imm;
             if (!sf) v &= 0xffffffffull;
             if (is_logic) {
-                /* logical immediate forms when encodable (no mov) */
                 int done = 0;
                 switch (op) {
                 case OCERZ_OP_AND: done = a64_try_and_imm(b, sf, rd, rd, v); break;
@@ -1850,8 +1860,6 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
                 }
                 if (done) { emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0), rd, rd); return 1; }
             } else if (is_add || is_sub) {
-                /* record from the pre-op values with the immediate materialized,
-                 * then add/sub imm12 in place */
                 if (v <= 4095 || ((v & 0xfff) == 0 && (v >> 12) <= 4095)) {
                     a64_mov_imm64(b, JT1, v);
                     if (sf) a64_stp_off(b, rd, JT1, 20, CC_SRC_OFF);
@@ -1867,8 +1875,6 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
             rm = JT1;
         }
         if (is_add || is_sub) {
-            /* record {src=old dst, dst=src} BEFORE the write; 32-bit ops:
-             * the recorded operands are the (already zero-extended) values */
             if (sf) a64_stp_off(b, rd, rm, 20, CC_SRC_OFF);
             else { a64_mov_reg(b, 0, JT0, rd); a64_mov_reg(b, 0, JT2, rm); a64_stp_off(b, JT0, JT2, 20, CC_SRC_OFF); }
             a64_mov_imm64(b, JTT, ocerz_cc_pack(is_add ? OCERZ_CC_ADD : OCERZ_CC_SUB, d->size, 0));
@@ -1889,7 +1895,6 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (writes && need == 0) {
         int rsp_d = rsp_is_ptr() && d->reg == OCERZ_RSP;
         int rsp_s = rsp_is_ptr() && s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP;
-        /* pointer-held rsp dest: only 64-bit add/sub commute with the base */
         if (rsp_d && (!sf || (op != OCERZ_OP_ADD && op != OCERZ_OP_SUB) || rsp_s))
             return 0;
         int ds = pin_slot(d->reg);
@@ -2042,29 +2047,24 @@ static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
     } else if (s->kind != OCERZ_OPK_IMM) {
         return 0;
     }
-    /* memory forms only on the deferred-flags path (fault sites need the
-     * generic exit protocol; the deferred path never traps after the load);
-     * segment overrides go through the generic EA (which adds fs/gs base) */
     if ((d_mem || s_mem) && (!g_defer || (insn->seg != OCERZ_SEG_NONE && insn->seg != OCERZ_SEG_GS && insn->seg != OCERZ_SEG_FS)))
         return 0;
 
     if (!g_defer && need == 0)
         return 1;
     if ((d_mem || s_mem) && need == 0 && !g_nzcv_want)
-        return 1;                       /* compare with dead flags: nothing to do */
+        return 1;
 
     int is_sub = (op == OCERZ_OP_CMP);
     int size = d->size;
     uint64_t mask = (size == 1) ? 0xffull : 0xffffull;
     int sh = 32 - 8 * size;
 
-    /* pinned register forms on the deferred path: operate on the pin directly */
     if (g_defer && !d_mem && !s_mem && pin_slot(d->reg) >= 0 &&
         !(rsp_is_ptr() && d->reg == OCERZ_RSP) &&
         (s->kind == OCERZ_OPK_IMM || (pin_slot(s->reg) >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)))) {
         int rd = pin_hreg(pin_slot(d->reg));
         if (!is_sub && s->kind == OCERZ_OPK_IMM) {
-            /* TEST reg, imm: the masked immediate keeps the AND within the width */
             uint64_t v = (uint64_t)s->imm & mask;
             if (g_nzcv_want) {
                 if (!a64_try_ands_imm(b, 1, JT2, rd, v)) { a64_mov_imm64(b, JT1, v); a64_ands_reg(b, 1, JT2, rd, JT1, 0); }
@@ -2079,12 +2079,11 @@ static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
             return 1;
         }
         if (!need && !g_nzcv_want) return 1;
-        /* zero-extended operands in JT0/JT1 (the record wants exactly these) */
         if (size == 1) a64_uxtb(b, JT0, rd); else a64_uxth(b, JT0, rd);
         if (s->kind == OCERZ_OPK_IMM) a64_mov_imm64(b, JT1, (uint64_t)s->imm & mask);
         else { int rs = pin_hreg(pin_slot(s->reg)); if (size == 1) a64_uxtb(b, JT1, rs); else a64_uxth(b, JT1, rs); }
         if (g_nzcv_want && is_sub) {
-            a64_subs_reg(b, 0, A64_ZR, JT0, JT1, 0);       /* Z and C exact for zero-extended values */
+            a64_subs_reg(b, 0, A64_ZR, JT0, JT1, 0);
             if (need) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, JT1);
             g_nzcv_kind = OCERZ_CC_SUB;
             g_nzcv_from = g_cur_insn_idx;
@@ -2095,8 +2094,6 @@ static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
         return 1;
     }
 
-    /* memory operand FIRST: emit_mem_ea clobbers JT0 while forming the EA.
-     * (loads zero-extend: no uxt needed) */
     if (s_mem) {
         if (!emit_mem_load_plain(b, insn, s, size, JT1)) {
             if (!emit_mem_ea(b, insn, s, JTA)) return 0;
@@ -2130,7 +2127,6 @@ static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
 
     if (g_defer) {
         if (g_nzcv_want && is_sub) {
-            /* forwarded NZCV: Z and C of the zero-extended compare are exact */
             a64_subs_reg(b, 0, A64_ZR, JT0, JT1, 0);
             if (need) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, JT1);
             g_nzcv_kind = OCERZ_CC_SUB;
@@ -2250,7 +2246,6 @@ static int emit_incdec_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     int is_inc = insn->op == OCERZ_OP_INC;
     need &= JIT_ARITH_FLAGS & ~(uint64_t)OCERZ_CF;
     if (need) {
-        /* CF is preserved: fetch it before touching the temps */
         emit_cc_predicate(b, OCERZ_CC_B);
         a64_cset(b, JTU, A64_NE);
     }
@@ -2300,9 +2295,7 @@ static int emit_incdec(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (need == 0)
         return 1;
 
-    /* CF is preserved by inc/dec: fetch it inline from the pending record
-     * (or RFLAGS) without a C materialize call. */
-    emit_cc_predicate(b, OCERZ_CC_B);        /* NE <=> CF */
+    emit_cc_predicate(b, OCERZ_CC_B);
     a64_cset(b, JT0, A64_NE);
     emit_gpr_rd(b, 1, JT1, d->reg);
     emit_defer_flags(b, ocerz_cc_pack(is_inc ? OCERZ_CC_INC : OCERZ_CC_DEC,
@@ -2315,7 +2308,7 @@ static int emit_mov_logic_pair(A64Buf *b, const X86Insn *mov,
                                uint32_t **logic_label)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     if (mov->lock || logic->lock || logic_need != 0 ||
         mov->op != OCERZ_OP_MOV ||
         (logic->op != OCERZ_OP_AND && logic->op != OCERZ_OP_OR &&
@@ -2396,7 +2389,7 @@ static int emit_add_inc_pair(A64Buf *b, const X86Insn *add,
                              uint64_t inc_need, uint32_t **inc_label)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     if (!g_defer || g_no_addincfuse || g_no_lazyflags || add->lock || inc->lock)
         return 0;
     if (add->op != OCERZ_OP_ADD || inc->op != OCERZ_OP_INC ||
@@ -2552,8 +2545,6 @@ static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 1 || d->size == 2) &&
         s->kind == OCERZ_OPK_IMM && pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP) &&
         (insn->op == OCERZ_OP_SHL || insn->op == OCERZ_OP_SHR || insn->op == OCERZ_OP_SAR)) {
-        /* 8/16-bit register shifts: count masked to 5 bits like x86; the low
-         * bits of a 32-bit shift of the (zero/sign) extended value are exact */
         unsigned ncnt = (unsigned)(s->imm & 31u);
         if (ncnt == 0) return 1;
         int rd = pin_hreg(pin_slot(d->reg));
@@ -2655,9 +2646,6 @@ static int emit_imul_src(A64Buf *b, const X86Operand *op, int dst)
     return 0;
 }
 
-/* one-operand mul/imul: rdx:rax = rax * src (32: edx:eax), 64/32-bit only.
- * CF = OF = (high half is not the sign/zero extension of the low half);
- * the other flags are undefined (record LOGIC on the CF/OF value). */
 static int emit_mul_wide(A64Buf *b, const X86Insn *insn, uint64_t need, int is_signed)
 {
     const X86Operand *o = &insn->ops[0];
@@ -2679,15 +2667,14 @@ static int emit_mul_wide(A64Buf *b, const X86Insn *insn, uint64_t need, int is_s
         a64_mul(b, 1, hax, hax, src);
         a64_mov_reg(b, 1, hdx, JT2);
     } else {
-        /* 32-bit: 64-bit product of the low words */
         a64_mov_reg(b, 0, JT0, hax);
         a64_mov_reg(b, 0, JT1, src);
         if (is_signed) { a64_sxtw(b, JT0, JT0); a64_sxtw(b, JT1, JT1); }
         a64_mul(b, 1, JT2, JT0, JT1);
-        a64_mov_reg(b, 0, hax, JT2);                       /* eax = low 32 (zero-extends) */
-        a64_lsr_imm(b, 1, hdx, JT2, 32);                  /* edx = high 32 */
+        a64_mov_reg(b, 0, hax, JT2);
+        a64_lsr_imm(b, 1, hdx, JT2, 32);
     }
-    if (need)   /* deferred MUL/IMUL record {lo, hi}: same flags as the interpreter */
+    if (need)
         emit_defer_flags(b, ocerz_cc_pack(is_signed ? OCERZ_CC_IMUL : OCERZ_CC_MUL, o->size, 0), hax, hdx);
     return 1;
 }
@@ -2774,8 +2761,6 @@ static int emit_imul(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (need == 0)
         return 1;
 
-    /* IMUL defines CF and OF only; SF/ZF/AF/PF are undefined and Rosetta
-     * leaves them clear, so the flag word starts empty (see ocerz_flags_imul) */
     a64_mov_imm64(b, JTF, 0);
     if (need & (OCERZ_CF | OCERZ_OF)) {
         if (sf) {
@@ -2815,7 +2800,6 @@ static void emit_add_const(A64Buf *b, int reg, uint64_t c)
     }
 }
 
-/* Read guest register `greg` as a 32-bit value usable as an addressing source. */
 static int m32_addr_src(A64Buf *b, unsigned greg, int scratch)
 {
     int s = pin_slot(greg);
@@ -2825,7 +2809,6 @@ static int m32_addr_src(A64Buf *b, unsigned greg, int scratch)
     return scratch;
 }
 
-/* i386 effective address: (disp + base + index<<scale) mod 2^32, and only then the host */
 static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, int addr_reg)
 {
     uint64_t fold = ea_fold();
@@ -2835,14 +2818,11 @@ static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, i
     int64_t disp = op->disp;
     uint32_t d32 = (uint32_t)(int64_t)disp;
 
-    /* pin class 2 keeps guest rsp as guest_base+rsp in its host register; it
-     * is a 64-bit stack protocol and translate() never selects it for a
-     * 32-bit block.  Refuse rather than read a biased register. */
     if (rsp_is_ptr() && ((has_b && op->base == OCERZ_RSP) ||
                              (has_i && op->index == OCERZ_RSP)))
         return 0;
 
-    if (!has_b && !has_i) {                 /* absolute: a translate-time constant */
+    if (!has_b && !has_i) {
         a64_mov_imm64(b, addr_reg, (uint64_t)d32 + fold);
         return 1;
     }
@@ -2857,9 +2837,6 @@ static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, i
         }
     }
 
-    /* exactly one register and no displacement: truncate and fold in one
-     * instruction (this is [reg], [reg*s] and, with a base, the shape most
-     * i386 code actually emits) */
     if (fold_reg >= 0 && d32 == 0 && has_b != has_i) {
         unsigned g = has_b ? op->base : op->index;
         int r = m32_addr_src(b, g, addr_reg);
@@ -2873,9 +2850,9 @@ static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, i
     int have = 0;
 
     if (has_b && has_i && disp == 0) {
-        a64_add_reg(b, 0, t, rb, ri, sc);      /* [base+index*s]: one W add */
+        a64_add_reg(b, 0, t, rb, ri, sc);
         have = 1;
-        has_i = 0;                             /* folded in above */
+        has_i = 0;
     } else if (has_b && disp >= -4095 && disp <= 4095) {
         if (disp > 0)      a64_add_imm(b, 0, t, rb, (uint32_t)disp);
         else if (disp < 0) a64_sub_imm(b, 0, t, rb, (uint32_t)-disp);
@@ -2892,7 +2869,6 @@ static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, i
         if (have) a64_add_reg(b, 0, t, t, ri, sc);
         else      { a64_lsl_imm(b, 0, t, ri, sc); have = 1; }
     }
-    /* t now holds the 32-bit guest address, zero-extended by construction */
     if (fold_reg >= 0)
         a64_add_reg(b, 1, addr_reg, fold_reg, t, 0);
     return 1;
@@ -2915,21 +2891,16 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
         return 1;
     }
     if (insn->addrsize == 4) {
-        /* i386 addressing only.  A long-mode 0x67 operand also lands here with
-         * addrsize 4 and keeps refusing exactly as it always has, so no 64-bit
-         * block changes shape. */
         if (!insn->mode32)
             return 0;
         return emit_mem_ea32(b, insn, op, addr_reg);
     }
     if (insn->addrsize != 8)
-        return 0;                    /* i386 16-bit addressing (0x67): interpreted */
+        return 0;
     uint64_t initial = (uint64_t)op->disp + fold;
     if (rsp_is_ptr() && op->base == OCERZ_RSP &&
         pin_slot(OCERZ_RSP) >= 0)
         initial = (uint64_t)op->disp;
-    /* fast form: gbase lives in JGB -> add base/index to it, then the
-     * displacement as an immediate (no 2-3 word constant materialization) */
     if (jgb_usable() && fold == ocerz_guest_base && seg == OCERZ_SEG_NONE &&
         !(rsp_is_ptr() && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) &&
         op->disp >= -4095 && op->disp <= 4095 &&
@@ -2976,10 +2947,6 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     } else if (seg == OCERZ_SEG_GS) {
         a64_ldr(b, 8, JT0, 20, (uint32_t)offsetof(OcerzCPU, gs_base));
         a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
-        /* Same rule as ocerz_ea: the absolute gs:[0x58] form reads wine's
-         * ThreadLocalStoragePointer, whose TSD mirror can be stale; indirect
-         * it through the TEB self pointer in slot 6 when one is present.
-         * Identity mapping only (fold 0): the ldr below is a host access. */
         if (op->disp == 0x58 && op->base == OCERZ_REG_NONE &&
             op->index == OCERZ_REG_NONE && !op->riprel &&
             insn->addrsize == 8 && fold == 0) {
@@ -2997,7 +2964,6 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
 static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
                                      int addr_reg, uint32_t **exit_sites, int *n_exits)
 {
-    /* addr_reg holds gaddr + ea_fold(); the caller adds (guest_base - fold) before the access. */
     (void)insn; (void)exit_sites; (void)n_exits;
     if (!ocerz_commpage && !ocerz_low_base)
         return NULL;
@@ -3005,7 +2971,6 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
     uint64_t fold = ea_fold();
     uint32_t *to_native = NULL;
     if (ocerz_low_base) {
-        /* LOW_LIMIT <= gaddr < TOP_LO: the plain guest_base mapping */
         a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT + fold);
         a64_sub_reg(b, 1, JTT, addr_reg, JTU, 0);
         a64_mov_imm64(b, JTU, OCERZ_TOP_LO - OCERZ_LOW_LIMIT);
@@ -3021,7 +2986,6 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
         uint32_t *not_cp = a64_label(b);
         a64_bcond(b, A64_CS, 0);
-        /* host = ocerz_commpage + (gaddr - COMMPAGE_LO) */
         a64_mov_imm64(b, JTU, (uint64_t)(uintptr_t)ocerz_commpage - OCERZ_COMMPAGE_LO - ocerz_guest_base);
         a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
         done_cp = a64_label(b);
@@ -3029,7 +2993,6 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         a64_patch_bcond(not_cp, a64_label(b));
     }
     if (ocerz_low_base) {
-        /* gaddr >= TOP_LO: host = top_base + (gaddr - TOP_LO); else (< LOW_LIMIT): low_base + gaddr */
         a64_mov_imm64(b, JTU, OCERZ_TOP_LO + fold);
         a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
         uint32_t *is_low = a64_label(b);
@@ -3102,9 +3065,6 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
         return 0;
     int plain = mem_plain_access_ok(mem);
     X86Operand mview; mem = mem_hoist_view(mem, &mview);
-    /* With rsp promoted to a host pointer (JGB + rsp) an [rsp + reg] access
-     * must not also go through a hoisted JGB + reg base: that adds the guest
-     * base twice (seen as a wild store after AVX code split a loop). */
     if (rsp_is_ptr() && (mem->base == OCERZ_RSP || mem->index == OCERZ_RSP))
         return 0;
     int hbase = hoist_reg_for(mem->base);
@@ -3130,7 +3090,6 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
     int base = hbase;
     if (hbase == JMEMBASE && g_mem_hoist_aux_index >= 0 && mem->index == (unsigned)g_mem_hoist_aux_index &&
         (mem->scale & 3) == g_mem_hoist_aux_scale) {
-        /* JMEMAUX = base + index<<scale: immediate offset only */
         if (disp < 0 || (uint64_t)disp > (uint64_t)4095 * (uint64_t)size || (disp & (size - 1)) != 0)
             return 0;
         if (store) emit_gpr_st_at(b, size, value_reg, JMEMAUX, (int32_t)disp, plain);
@@ -3151,12 +3110,6 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
     return 1;
 }
 
-/* NE <=> [ra, ra+size) crosses a 16-byte granule, the only misalignment
- * Apple silicon faults an acquire/release access on (probed 2026-09-05 on
- * M2 Max: ldapur/stlur w at +1..+3 of a granule are fine, +13..+15 fault; x
- * at +1..+8 fine, +9..+15 fault; ldar/stlr the same).  Testing natural
- * alignment instead sent three quarters of the unaligned dword accesses in
- * memcpy tails down the dmb arm. */
 static void emit_granule_cross_test(A64Buf *b, int size, int ra, int scratch)
 {
     a64_add_imm(b, 1, scratch, ra, (uint32_t)(size - 1));
@@ -3183,7 +3136,7 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
         g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, rv, ra, 1,
                                                 g_cur_insn_idx, 0, 0 };
         g_n_oslow++;
-        ea_cache_reset();                 /* the arm is a C call: JTA is dead on the slow path */
+        ea_cache_reset();
         return;
     }
     uint32_t *to_aligned = a64_label(b);
@@ -3217,7 +3170,7 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
         else            a64_ldapr(b, size, rd, ra);
         g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, rd, ra, 0,
                                                 g_cur_insn_idx, 0, 0 };
-        ea_cache_reset();                 /* the arm is a C call: JTA is dead on the slow path */
+        ea_cache_reset();
         g_n_oslow++;
         return;
     }
@@ -3234,7 +3187,6 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
     a64_patch_b(to_done, a64_label(b));
 }
 
-/* ---- model-aware access primitives ---- plain: ldr/str [ra, #disp] (scaled, or ldur/stur for */
 static void emit_gpr_ld_at(A64Buf *b, int size, int rd, int ra, int32_t disp, int plain)
 {
     int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
@@ -3280,7 +3232,6 @@ static void emit_gpr_st_at(A64Buf *b, int size, int rv, int ra, int32_t disp, in
     else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
     emit_guest_store_ordered(b, size, rv, JTA, JTU);
 }
-/* [ra + ri << shift] (shift 0 or the access size) */
 static void emit_gpr_ld_regoff(A64Buf *b, int size, int rd, int ra, int ri, int scaled, int plain)
 {
     if (plain) { a64_ldr_regoff(b, size, rd, ra, ri, scaled); return; }
@@ -3295,7 +3246,6 @@ static void emit_gpr_st_regoff(A64Buf *b, int size, int rv, int ra, int ri, int 
     a64_add_reg(b, 1, JTA, ra, ri, sh);
     emit_gpr_st_at(b, size, rv, JTA, 0, 0);
 }
-/* vector (4/8/16 bytes). */
 static void emit_v_st_ordered_fast(A64Buf *b, int size, int vs, int ra, int32_t disp)
 {
     if (size == 16) {
@@ -3311,8 +3261,6 @@ static void emit_v_st_ordered_fast(A64Buf *b, int size, int vs, int ra, int32_t 
         a64_stlur(b, 4, JT0, ra, disp);
     }
 }
-/* ordered vector store, alignment-checked (marked blocks): the fast form
- * when (addr & (size==16 ? 7 : size-1)) == 0, else an out-of-line arm */
 static void emit_v_acc_ordered_checked(A64Buf *b, int size, int vr, int ra, int32_t disp, int store)
 {
     if (disp != 0) {
@@ -3321,9 +3269,9 @@ static void emit_v_acc_ordered_checked(A64Buf *b, int size, int vr, int ra, int3
         else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
         ra = JTA;
     }
-    if (size == 16) a64_try_ands_imm(b, 1, A64_ZR, ra, 7);   /* two 8-byte halves: 8-aligned <=> neither crosses */
+    if (size == 16) a64_try_ands_imm(b, 1, A64_ZR, ra, 7);
     else emit_granule_cross_test(b, size, ra, JTU);
-    (void)store;                                  /* loads never take this path */
+    (void)store;
     if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
         uint32_t *bne = a64_label(b);
         a64_bcond(b, A64_NE, 0);
@@ -3331,7 +3279,7 @@ static void emit_v_acc_ordered_checked(A64Buf *b, int size, int vr, int ra, int3
         g_oslow[g_n_oslow] = (OrderedSlowPend){ bne, a64_label(b), size, vr, ra, 1,
                                                 g_cur_insn_idx, 1, 0 };
         g_n_oslow++;
-        ea_cache_reset();                 /* the arm is a C call: JTA is dead on the slow path */
+        ea_cache_reset();
         return;
     }
     uint32_t *to_aligned = a64_label(b);
@@ -3354,14 +3302,6 @@ static void emit_v_ld_at(A64Buf *b, int size, int vd, int ra, int32_t disp, int 
         else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); a64_ldr_v(b, size, vd, JTA, 0); }
         return;
     }
-    /* Ordered vector load: the plain load, then a one-byte ACQUIRE load of
-     * the same address.  Same-address reads are coherent, so the acquire
-     * copy sees a value at least as new as the vector, and everything after
-     * it is ordered behind that: TSO's load ordering, with no barrier.  A dmb
-     * ishld here waited for every outstanding miss (40-60 ns per access on a
-     * 4 MB working set, memcpy 3.5x Rosetta); an ldapur pair moved through
-     * GPRs cost the FP chain its latency (fpvec).  The byte form never
-     * faults on alignment.  Measured 2026-09-05. */
     if (disp >= -256 && disp <= 255) {
         if (scaled) a64_ldr_v(b, size, vd, ra, (uint32_t)disp); else a64_ldur_v(b, size, vd, ra, disp);
         a64_ldapur(b, 1, JTU, ra, disp);
@@ -3404,7 +3344,6 @@ static void emit_v_st_regoff(A64Buf *b, int size, int vs, int ra, int ri, int sc
     emit_v_st_at(b, size, vs, JTA, 0, 0);
 }
 
-/* Plain-memory fast path for [base+index<<s] / [base+disp] accesses when no commpage/low-base */
 static int ea_cache_reusable(const A64Buf *b, const X86Operand *op);
 static int ea_cache_has_base(const A64Buf *b, const X86Operand *op);
 static void ea_cache_set(const A64Buf *b, const X86Operand *op);
@@ -3422,7 +3361,6 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     int plain = mem_plain_access_ok(m);
     X86Operand mview; m = mem_hoist_view(m, &mview);
     int hb = pin_hreg(pin_slot(m->base));
-    /* hoisted base: JMEMBASE/JMEMBASE2 already holds guest_base + base */
     int hreg = hoist_reg_for(m->base);
     int hoisted = hreg >= 0;
 #define ACC_AT(ra, d)  do { if (vec) { if (store) emit_v_st_at(b, size, reg, (ra), (int32_t)(d), plain); else emit_v_ld_at(b, size, reg, (ra), (int32_t)(d), plain); } \
@@ -3441,12 +3379,9 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         }
         if ((m->disp == 0 || (hoisted && hreg == JMEMBASE && g_mem_hoist_aux_index < 0 && m->disp == g_mem_hoist_aux_disp && m->disp != 0)) &&
             (sc == 0 || sc == want)) {
-            /* register-offset form (scales by the access size only); the
-             * hoisted aux base already includes the block's common displacement */
             int ra = JTA;
             if (hoisted) ra = m->disp ? JMEMAUX : hreg;
             else if (ea_cache_reusable(b, m)) {
-                /* JTA already holds base + index<<scale: plain [JTA] */
                 ACC_AT(JTA, 0);
                 return 1;
             }
@@ -3455,7 +3390,6 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
             return 1;
         }
         if (m->disp == 0 && sc != 0) {
-            /* scaled index the access cannot fold: guest address then [JGB, addr] */
             if (!hoisted) {
                 if (ea_cache_reusable(b, m)) { ACC_AT(JTA, 0); return 1; }
                 if (ea_cache_has_base(b, m)) {
@@ -3466,7 +3400,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
                 }
                 if (plain) {
                     a64_add_reg(b, 1, JTA, hb, hi, sc);
-                    ea_cache_reset();                       /* JTA = guest address, no JGB */
+                    ea_cache_reset();
                     ACC_REGOFF(JGB, JTA, 0);
                     return 1;
                 }
@@ -3476,9 +3410,6 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
                 return 1;
             }
         }
-        /* base + index<<s + disp: two adds, then a scaled immediate (or an
-         * unscaled signed one for small negative/unaligned displacements;
-         * or the earlier identical base+index still in JTA) */
         int scaled = m->disp >= 0 && (m->disp % size) == 0 && m->disp / size <= 4095;
         int unscaled = !scaled && m->disp >= -256 && m->disp <= 255;
         if (!scaled && !unscaled) return 0;
@@ -3491,8 +3422,6 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         ACC_AT(JTA, m->disp);
         return 1;
     }
-    /* base + disp: scaled unsigned immediate, or unscaled signed for small
-     * negative/unaligned displacements */
     {
         int scaled = m->disp >= 0 && (m->disp % size) == 0 && m->disp / size <= 4095;
         int unscaled = !scaled && m->disp >= -256 && m->disp <= 255;
@@ -3507,30 +3436,24 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
 #undef ACC_REGOFF
 }
 
-/* Plain-memory effective address for an access of `size` bytes: emits base(+index<<s)+JGB into */
-/* EA reuse across instructions: when an earlier EA computation left JTA = guest_base + base [+ */
-static const X86Insn *g_cur_insns;   /* the block's instructions (for index-based predicates) */
+static const X86Insn *g_cur_insns;
 static int g_cur_insns_n;
 const struct X86Insn *g_cur_insns_fwd(void) { return g_cur_insns; }
 static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
 static struct {
     int valid; unsigned base, index; int scale;
     unsigned long long seq;
-    const uint32_t *after;          /* first host word after the EA computation */
+    const uint32_t *after;
 } g_ea_cache;
 static int g_cur_fpb = -1;
-/* NZCV holds fcmp(v, v) of this vreg, emitted by the batch check that closed
- * right before instruction g_fcmp_self_idx: a conversion of the same lane
- * can reuse it instead of comparing again */
 static int g_fcmp_self_vreg = -1;
 static int g_fcmp_self_idx = -1;
 static void ea_cache_reset(void) { g_ea_cache.valid = 0; }
 static int a64_word_may_write_x15(uint32_t w)
 {
-    if ((w & 0x1f) == 15) return 1;                       /* Rd / Rt */
-    /* load pair (LDP/LDNP/LDPSW, any size): Rt2 in bits 14:10; also LDXP/LDAXP */
+    if ((w & 0x1f) == 15) return 1;
     if ((w & 0x3a000000u) == 0x28000000u && (w & 0x00400000u)) { if (((w >> 10) & 0x1f) == 15) return 1; }
-    if ((w & 0x3f000000u) == 0x08000000u && ((w >> 10) & 0x1f) == 15) return 1;   /* exclusive pair forms */
+    if ((w & 0x3f000000u) == 0x08000000u && ((w >> 10) & 0x1f) == 15) return 1;
     return 0;
 }
 static int ea_cache_usable(const A64Buf *b)
@@ -3544,13 +3467,13 @@ static int ea_cache_usable(const A64Buf *b)
         if (a64_word_may_write_x15(*w)) return 0;
     return 1;
 }
-static int ea_cache_reusable(const A64Buf *b, const X86Operand *op)     /* JTA == JGB + base + index<<scale exactly */
+static int ea_cache_reusable(const A64Buf *b, const X86Operand *op)
 {
     if (!ea_cache_usable(b)) return 0;
     return g_ea_cache.base == op->base && g_ea_cache.index == op->index &&
            g_ea_cache.scale == (op->scale & 3);
 }
-static int ea_cache_has_base(const A64Buf *b, const X86Operand *op)     /* JTA == JGB + base (no index) */
+static int ea_cache_has_base(const A64Buf *b, const X86Operand *op)
 {
     if (!ea_cache_usable(b)) return 0;
     return g_ea_cache.base == op->base && op->base != OCERZ_REG_NONE && g_ea_cache.index == OCERZ_REG_NONE;
@@ -3561,12 +3484,9 @@ static void ea_cache_set_full(const A64Buf *b, unsigned base, unsigned index, in
     g_ea_cache.scale = scale & 3; g_ea_cache.seq = g_callout_seq; g_ea_cache.after = b->p;
 }
 static void ea_cache_set(const A64Buf *b, const X86Operand *op) { ea_cache_set_full(b, op->base, op->index, op->scale & 3); }
-static void ea_cache_step(const X86Insn *in, const X86Insn *prev)   /* called before emitting each instruction */
+static void ea_cache_step(const X86Insn *in, const X86Insn *prev)
 {
     if (!g_ea_cache.valid) return;
-    /* the instruction that set the cache may itself have written the base or
-     * index AFTER forming the EA (mov rax, [rax]): check the previous
-     * instruction as well as the one about to be emitted */
     if (g_ea_cache.base != OCERZ_REG_NONE &&
         (insn_may_write_gpr(in, g_ea_cache.base) || (prev && insn_may_write_gpr(prev, g_ea_cache.base)))) { g_ea_cache.valid = 0; return; }
     if (g_ea_cache.index != OCERZ_REG_NONE &&
@@ -3575,14 +3495,11 @@ static void ea_cache_step(const X86Insn *in, const X86Insn *prev)   /* called be
 
 static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand *op,
                                 int size, int *ra_out, uint32_t *disp_out, int unscaled_ok);
-/* ra + a non-negative scaled displacement the access folds as imm12 */
 static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *op,
                              int size, int *ra_out, uint32_t *disp_out)
 {
     return emit_mem_ea_plain_ex(b, insn, op, size, ra_out, disp_out, 0);
 }
-/* unscaled_ok: the caller also takes a signed 9-bit displacement (ldur/stur,
- * ldapur/stlur), so [rbp-0x40] needs no sub */
 static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand *op,
                                 int size, int *ra_out, uint32_t *disp_out, int unscaled_ok)
 {
@@ -3591,7 +3508,6 @@ static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand
     if (rsp_is_ptr() && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
     if (op->riprel) {
         uint64_t c = (uint64_t)op->disp + ocerz_guest_base;
-        /* a 3+-word constant: one ldr from the block's literal pool instead */
         static int nolit = -1; if (nolit < 0) nolit = getenv("OCERZ_NO_RIPLIT") ? 1 : 0;
         if (!nolit && g_n_raslit < RASLIT_MAX && (c >> 32) != 0 && ((c >> 16) & 0xffff) != 0) {
             g_raslit[g_n_raslit].site = a64_label(b);
@@ -3599,7 +3515,7 @@ static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand
             g_raslit[g_n_raslit].kind = 1;
             g_raslit[g_n_raslit].rt = JTA;
             g_n_raslit++;
-            a64_emit32(b, 0x58000000u | (uint32_t)JTA);      /* ldr JTA, <lit> */
+            a64_emit32(b, 0x58000000u | (uint32_t)JTA);
         } else {
             a64_mov_imm64(b, JTA, c);
         }
@@ -3630,7 +3546,6 @@ static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand
         return 1;
     }
     if (hreg >= 0) {
-        /* JMEMBASE/JMEMBASE2 = guest_base + base for the whole block */
         if (op->index == OCERZ_REG_NONE) {
             if (fits) { *ra_out = hreg; *disp_out = (uint32_t)disp; return 1; }
             if (disp > 0 && disp <= 4095)       a64_add_imm(b, 1, JTA, hreg, (uint32_t)disp);
@@ -3679,8 +3594,6 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
     int ra; uint32_t disp;
     int plain = mem_plain_access_ok(op);
     X86Operand mview; op = mem_hoist_view(op, &mview);
-    /* base + index (scale 1 or the access size), no displacement (or the
-     * hoisted aux displacement): register-offset load */
     int aux_disp_ok = op->disp != 0 && g_pin_class != 2 && g_mem_hoist_aux_index < 0 &&
                       op->disp == g_mem_hoist_aux_disp && op->base != OCERZ_REG_NONE &&
                       hoist_reg_for(op->base) == JMEMBASE;
@@ -3708,8 +3621,6 @@ static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand 
         }
         static int nogea = -1; if (nogea < 0) nogea = getenv("OCERZ_NO_GEAFORM") ? 1 : 0;
         if (!nogea && plain && hoist_reg_for(op->base) < 0 && !ea_cache_has_base(b, op) && !ea_cache_reusable(b, op)) {
-            /* scale the access cannot fold and no hoisted/cached base: guest
-             * address in JTA, then [JGB, JTA] (2 words instead of 3) */
             a64_add_reg(b, 1, JTA, pin_hreg(pin_slot(op->base)), pin_hreg(pin_slot(op->index)), sc);
             ea_cache_reset();
             a64_ldr_regoff(b, size, rd, JGB, JTA, 0);
@@ -3729,7 +3640,6 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
     uint64_t gbase = ocerz_guest_base;
 
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_IMM) {
-        /* mov [mem], imm (1/2/4/8): value in JT1 (xzr for 0), then a plain store */
         int size = d->size;
         if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
         if (!mem_native_store_ok()) return 0;
@@ -3744,14 +3654,13 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         if (!emit_mem_ea(b, insn, d, JTA))
             return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-        if (v != 0) a64_mov_imm64(b, JT1, v);          /* guard code may clobber JT1 */
+        if (v != 0) a64_mov_imm64(b, JT1, v);
         emit_add_const(b, JTA, gbase - ea_fold());
         emit_guest_store_ordered(b, size, rv, JTA, JTU);
         patch_guard_skip(skip, a64_label(b));
         return 1;
     }
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_REG) {
-        /* 1/2-byte stores take the low bits of the (pinned) register */
         if (s->high8 || (s->size != 1 && s->size != 2 && s->size != 4 && s->size != 8))
             return 0;
         if (!mem_native_store_ok())
@@ -3775,7 +3684,6 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
     }
     if (d->kind == OCERZ_OPK_REG && s->kind == OCERZ_OPK_MEM &&
         (d->size == 1 || d->size == 2) && !d->high8) {
-        /* partial-register load: merge into the low byte/word of the pin */
         int ds = pin_slot(d->reg);
         if (ds < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
         if (!emit_mem_load_plain(b, insn, s, d->size, JT1)) {
@@ -3855,12 +3763,12 @@ static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
         if (ds >= 0) {
             int ra; uint32_t disp;
             if (!is_signed && emit_mem_load_plain(b, insn, s, s->size, pin_hreg(ds)))
-                return 1;                                   /* ldrb/ldrh zero-extend to 64 */
+                return 1;
             if (is_signed && emit_mem_ea_plain(b, insn, s, s->size, &ra, &disp)) {
                 if (mem_plain_access_ok(s)) {
                     if (s->size == 1) a64_ldrsb(b, sf, pin_hreg(ds), ra, disp);
                     else              a64_ldrsh(b, sf, pin_hreg(ds), ra, disp);
-                } else {            /* ordered: acquire zero-extending load, then sign-extend */
+                } else {
                     emit_gpr_ld_at(b, s->size, JT1, ra, (int32_t)disp, 0);
                     if (s->size == 1) a64_sxtb(b, sf, pin_hreg(ds), JT1);
                     else              a64_sxth(b, sf, pin_hreg(ds), JT1);
@@ -3892,7 +3800,6 @@ static int stack_inline_enabled(void)
     return en;
 }
 
-/* ---- i386 stack ---------------------------------------------------------- The slot is 4 bytes */
 static int m32_stack_ok(const X86Insn *insn)
 {
     return stack_inline_enabled() && insn->seg == OCERZ_SEG_NONE &&
@@ -3906,7 +3813,7 @@ static int emit_push_pop32(A64Buf *b, const X86Insn *insn)
     const X86Operand *o = &insn->ops[0];
     int size = insn->opsize ? insn->opsize : 4;
 
-    if (size != 4)                 /* 0x66 push/pop: 2-byte slot, interpreted */
+    if (size != 4)
         return 0;
     if (!m32_stack_ok(insn))
         return 0;
@@ -3926,10 +3833,8 @@ static int emit_push_pop32(A64Buf *b, const X86Insn *insn)
             a64_mov_imm64(b, JT1, (uint64_t)(uint32_t)o->imm);
             rv = JT1;
         } else {
-            return 0;              /* push m32: emit_push_pop_mem, 64-bit only */
+            return 0;
         }
-        /* esp is written only after the store, so a faulting push leaves it
-         * architecturally intact and the whole PUSH re-runs interpreted */
         a64_sub_imm(b, 0, JTA, hs, 4);
         a64_str_regoff_uxtw(b, 4, rv, JGB, JTA);
         a64_mov_reg(b, 0, hs, JTA);
@@ -3939,11 +3844,7 @@ static int emit_push_pop32(A64Buf *b, const X86Insn *insn)
     if (insn->op == OCERZ_OP_POP) {
         if (o->kind != OCERZ_OPK_REG || o->high8 || o->size != 4)
             return 0;
-        /* the load address is (uint32_t)ESP: the UXTW index does the
-         * truncation, so it costs nothing (see ocerz_pop_mode, which was made
-         * to truncate the same way) */
         if (o->reg == OCERZ_RSP) {
-            /* POP ESP: the popped value IS the new esp; the +4 is dead */
             a64_ldr_regoff_uxtw(b, 4, hs, JGB, hs);
             return 1;
         }
@@ -3952,13 +3853,12 @@ static int emit_push_pop32(A64Buf *b, const X86Insn *insn)
         a64_ldr_regoff_uxtw(b, 4, rd, JGB, hs);
         a64_add_imm(b, 0, hs, hs, 4);
         if (ds < 0)
-            emit_gpr_wr(b, JT1, o->reg);   /* JT1 is zero-extended by the ldr */
+            emit_gpr_wr(b, JT1, o->reg);
         return 1;
     }
     return 0;
 }
 
-/* LEAVE: esp = ebp (32-bit), ebp = [esp], esp += 4. */
 static int emit_leave32(A64Buf *b, const X86Insn *insn)
 {
     if ((insn->opsize ? insn->opsize : 4) != 4)
@@ -4000,8 +3900,6 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
 
         if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() && jgb_usable() &&
             !stack_guard_needed()) {
-            /* guest rsp pinned, guest base in JGB: 3 words, rsp updated after
-             * the store so a fault leaves it architecturally intact */
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             int rv;
             if (o->kind == OCERZ_OPK_REG) {
@@ -4017,8 +3915,6 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
                 return 1;
             }
             if (g_push_entry && g_n_push_fix < JIT_MAX_BLOCK_INSNS && rv != hs) {
-                /* 2 words: decrement first, store second; a fault at the store is
-                 * repaired by ocerz_jit_fault_recover_regs (rsp += 8) */
                 a64_sub_imm(b, 1, hs, hs, 8);
                 g_push_fix[g_n_push_fix++] = (uint32_t)(a64_label(b) - g_push_entry);
                 a64_str_regoff(b, 8, rv, JGB, hs, 0);
@@ -4266,11 +4162,10 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     int writes = (op == OCERZ_OP_ADD || op == OCERZ_OP_SUB ||
                   op == OCERZ_OP_AND || op == OCERZ_OP_OR || op == OCERZ_OP_XOR);
 
-    /* plain memory + pinned destination: load, then operate in place */
     if (pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP) &&
         emit_mem_load_plain(b, insn, s, sf ? 8 : 4, JT1)) {
         int rd = pin_hreg(pin_slot(d->reg));
-        if (g_nzcv_want) {                   /* NZCV forwarding: flag-setting forms */
+        if (g_nzcv_want) {
             if (is_add || is_sub) {
                 if (need) {
                     if (sf) a64_stp_off(b, rd, JT1, 20, CC_SRC_OFF);
@@ -4298,7 +4193,7 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
             g_nzcv_from = g_cur_insn_idx;
             return 1;
         }
-        if (!writes) {                       /* cmp / test */
+        if (!writes) {
             if (need == 0) return 1;
             if (is_sub) { emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0), rd, JT1); return 1; }
             a64_and_reg(b, sf, JT2, rd, JT1, 0);
@@ -4398,7 +4293,6 @@ static int emit_lea(A64Buf *b, const X86Insn *insn)
         a64_add_reg(b, d->size == 8, pin_hreg(ds), pin_hreg(bs), pin_hreg(is), s->scale & 3);
         return 1;
     }
-    /* index only: rd = index << scale (+ disp) */
     if (ds >= 0 && !s->riprel && !host_rsp_operand && insn->addrsize == 8 &&
         s->base == OCERZ_REG_NONE && is >= 0 && s->disp >= -4095 && s->disp <= 4095) {
         int sf = d->size == 8;
@@ -4436,65 +4330,52 @@ static int emit_lea(A64Buf *b, const X86Insn *insn)
     return 1;
 }
 
-
-/* ---- batch-1 GPR emitters: not/neg/rol/ror/shift-by-cl/cmovcc/setcc/bswap ---- */
-
-/* Load a 4/8-byte register operand into host reg dst; returns 0 if unsupported. */
-
-/* Compute the x86 condition `cc` from (materialized) RFLAGS into JTF as 0/1
- * and set host NZCV so that NE == condition true.  Mirrors emit_jcc. */
-/* JTF = x86 condition `cc` (0/1) evaluated from RFLAGS (must be materialized). */
 static void emit_cc_predicate_rflags(A64Buf *b, unsigned cc)
 {
     a64_ldr(b, 8, JT0, 20, RF_OFF);
-    a64_ubfx(b, 1, JT1, JT0, 0, 1);    /* CF */
-    a64_ubfx(b, 1, JTA, JT0, 6, 1);    /* ZF */
-    a64_ubfx(b, 1, JTT, JT0, 7, 1);    /* SF */
-    a64_ubfx(b, 1, JTU, JT0, 11, 1);   /* OF */
+    a64_ubfx(b, 1, JT1, JT0, 0, 1);
+    a64_ubfx(b, 1, JTA, JT0, 6, 1);
+    a64_ubfx(b, 1, JTT, JT0, 7, 1);
+    a64_ubfx(b, 1, JTU, JT0, 11, 1);
     switch (cc >> 1) {
-    case 0: a64_mov_reg(b, 1, JTF, JTU); break;                 /* O  */
-    case 1: a64_mov_reg(b, 1, JTF, JT1); break;                 /* B  */
-    case 2: a64_mov_reg(b, 1, JTF, JTA); break;                 /* E  */
-    case 3: a64_orr_reg(b, 1, JTF, JT1, JTA, 0); break;         /* BE */
-    case 4: a64_mov_reg(b, 1, JTF, JTT); break;                 /* S  */
-    case 5: a64_ubfx(b, 1, JTF, JT0, 2, 1); break;              /* P  */
-    case 6: a64_eor_reg(b, 1, JTF, JTT, JTU, 0); break;         /* L  */
+    case 0: a64_mov_reg(b, 1, JTF, JTU); break;
+    case 1: a64_mov_reg(b, 1, JTF, JT1); break;
+    case 2: a64_mov_reg(b, 1, JTF, JTA); break;
+    case 3: a64_orr_reg(b, 1, JTF, JT1, JTA, 0); break;
+    case 4: a64_mov_reg(b, 1, JTF, JTT); break;
+    case 5: a64_ubfx(b, 1, JTF, JT0, 2, 1); break;
+    case 6: a64_eor_reg(b, 1, JTF, JTT, JTU, 0); break;
     default:
-        a64_eor_reg(b, 1, JTF, JTT, JTU, 0);                    /* LE */
+        a64_eor_reg(b, 1, JTF, JTT, JTU, 0);
         a64_orr_reg(b, 1, JTF, JTF, JTA, 0);
         break;
     }
-    if (cc & 1) {  /* negated form: predicate = !JTF */
+    if (cc & 1) {
         a64_mov_imm64(b, JTU, 1);
         a64_eor_reg(b, 1, JTF, JTF, JTU, 0);
     }
 }
 
-/* x86 cc -> arm64 cond after `subs` (CF=!C) ; -1 = needs PF (not derivable) */
 static int cc_after_subs(unsigned cc)
 {
     static const int t[16] = { A64_VS, A64_VC, A64_CC, A64_CS, A64_EQ, A64_NE, A64_LS, A64_HI,
                                A64_MI, A64_PL, -1, -1, A64_LT, A64_GE, A64_LE, A64_GT };
     return cc < 16 ? t[cc] : -1;
 }
-/* x86 cc -> arm64 cond after `ands` (CF=OF=0): B/O never, AE/NO always */
 static int cc_after_ands(unsigned cc)
 {
     switch (cc) {
-    case OCERZ_CC_O: case OCERZ_CC_B: return A64_NV;   /* never  */
-    case OCERZ_CC_NO: case OCERZ_CC_AE: return A64_AL;  /* always */
+    case OCERZ_CC_O: case OCERZ_CC_B: return A64_NV;
+    case OCERZ_CC_NO: case OCERZ_CC_AE: return A64_AL;
     case OCERZ_CC_E: return A64_EQ;  case OCERZ_CC_NE: return A64_NE;
-    case OCERZ_CC_BE: return A64_EQ; case OCERZ_CC_A: return A64_NE;   /* CF=0 -> BE==ZF, A==!ZF */
+    case OCERZ_CC_BE: return A64_EQ; case OCERZ_CC_A: return A64_NE;
     case OCERZ_CC_S: return A64_MI;  case OCERZ_CC_NS: return A64_PL;
-    case OCERZ_CC_L: return A64_MI;  case OCERZ_CC_GE: return A64_PL;  /* OF=0 -> SF */
-    case OCERZ_CC_LE: return A64_LE; case OCERZ_CC_G: return A64_GT;   /* Z||N ; !Z&&!N (V=0) */
-    default: return -1;                                                 /* P/NP */
+    case OCERZ_CC_L: return A64_MI;  case OCERZ_CC_GE: return A64_PL;
+    case OCERZ_CC_LE: return A64_LE; case OCERZ_CC_G: return A64_GT;
+    default: return -1;
     }
 }
 
-/* Set host NZCV so that NE <=> x86 condition `cc` holds. */
-/* Deferred-record kind/size the producer would leave if it went through the
- * deferred path (0 = unknown / not a simple record). */
 static unsigned producer_record_kind(const X86Insn *p, int *size)
 {
     if (!p) return 0;
@@ -4504,7 +4385,6 @@ static unsigned producer_record_kind(const X86Insn *p, int *size)
         *size = p->ops[0].size; return OCERZ_CC_LOGIC;
     case OCERZ_OP_ADD: *size = p->ops[0].size; return OCERZ_CC_ADD;
     case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR:
-        /* constant-count register shifts defer a {val, cnt} record */
         if (p->ops[1].kind == OCERZ_OPK_IMM && p->ops[0].kind == OCERZ_OPK_REG &&
             (p->ops[0].size == 4 || p->ops[0].size == 8)) {
             *size = p->ops[0].size;
@@ -4514,14 +4394,8 @@ static unsigned producer_record_kind(const X86Insn *p, int *size)
     default: return 0;
     }
 }
-/* Will the flag consumer `insns[ci]` (jcc/setcc/cmov) be evaluated with the
- * fcmp-based comis fusion?  Pure predicate shared by the liveness pass and
- * emit_cc_predicate so both agree.  Returns the producer index or -1. */
-static uint64_t g_cur_need;          /* fl_need of the instruction being emitted */
+static uint64_t g_cur_need;
 static int sse_enabled(void);
-/* Will this flag consumer be emitted INLINE through emit_cc_predicate?  (A
- * consumer that goes to the interpreter needs the flags materialized, so the
- * static fusions must not drop its flag use.)  Mirrors the emitters' checks. */
 static int cc_consumer_inline_ok(const X86Insn *c)
 {
     const X86Operand *d = &c->ops[0];
@@ -4555,10 +4429,9 @@ static int cc_consumer_inline_ok(const X86Insn *c)
         return 0;
     }
 }
-/* Stage 9: none of the three condition-forwarding fusions may fire in a 32-bit block. */
 static int comis_fuse_producer(const X86Insn *insns, int ci)
 {
-    if (g_xlat_mode32) return -1;   /* see cc_fuse_blocked_m32 */
+    if (g_xlat_mode32) return -1;
     if (!cc_consumer_inline_ok(&insns[ci])) return -1;
     unsigned cc = insns[ci].cc;
     if (!(cc == OCERZ_CC_A || cc == OCERZ_CC_AE || cc == OCERZ_CC_B || cc == OCERZ_CC_BE ||
@@ -4581,9 +4454,6 @@ static int comis_fuse_producer(const X86Insn *insns, int ci)
         if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_XMM &&
             (m->ops[0].reg == p->ops[0].reg || m->ops[0].reg == p->ops[1].reg))
             return -1;
-        /* an op the table cannot classify (def=0,use=ALL: e.g. shift by CL,
-         * which writes flags only when the count is nonzero) may have
-         * overwritten the flags: this static fusion cannot see that */
         uint64_t mdef, muse;
         ocerz_flags_defuse_nofault(m, &mdef, &muse);
         if (!(mdef & JIT_ARITH_FLAGS) && (muse & JIT_ARITH_FLAGS) == JIT_ARITH_FLAGS)
@@ -4591,12 +4461,11 @@ static int comis_fuse_producer(const X86Insn *insns, int ci)
     }
     return pi;
 }
-/* Value-based conditions: E/NE/S/NS after an instruction whose ZF/SF are exactly "result == 0" / */
 static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
 static int value_cond_fuse_producer(const X86Insn *insns, int ci)
 {
     static int dis = -1;
-    if (g_xlat_mode32) return -1;   /* see cc_fuse_blocked_m32 */
+    if (g_xlat_mode32) return -1;
     if (dis < 0) dis = getenv("OCERZ_NO_VALCC") ? 1 : 0;
     if (dis) return -1;
     if (!cc_consumer_inline_ok(&insns[ci])) return -1;
@@ -4619,7 +4488,6 @@ static int value_cond_fuse_producer(const X86Insn *insns, int ci)
     case OCERZ_OP_INC: case OCERZ_OP_DEC: case OCERZ_OP_NEG:
         break;
     case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR:
-        /* only with a nonzero immediate count (else flags unchanged) */
         if (p->nops < 2 || p->ops[1].kind != OCERZ_OPK_IMM ||
             (p->ops[1].imm & (p->ops[0].size == 8 ? 63u : 31u)) == 0) return -1;
         break;
@@ -4634,11 +4502,10 @@ static int value_cond_fuse_producer(const X86Insn *insns, int ci)
         uint64_t mdef, muse;
         ocerz_flags_defuse_nofault(&insns[k], &mdef, &muse);
         if (!(mdef & JIT_ARITH_FLAGS) && (muse & JIT_ARITH_FLAGS) == JIT_ARITH_FLAGS)
-            return -1;      /* unclassifiable op may have written flags */
+            return -1;
     }
     return pi;
 }
-/* NZCV forwarding: an adjacent producer (cmp/test/add/sub/and/or/xor on a pinned 32/64-bit */
 static int cc_after_ands(unsigned cc);
 static int cc_after_adds(unsigned cc);
 static int mem_plain_ok(const X86Insn *insn, const X86Operand *op)
@@ -4673,8 +4540,6 @@ static int nzcv_producer_candidate(const X86Insn *p)
         return 0;
     }
 }
-/* shape test (no producer needed yet): may `in` sit between a producer and a
- * consumer without touching NZCV? */
 static int nzcv_gap_shape(const X86Insn *in)
 {
     if (nzcv_gap_max() == 0) return 0;
@@ -4691,9 +4556,6 @@ static int nzcv_gap_shape(const X86Insn *in)
     return flag_neutral_ok(in);
 }
 static int nzcv_dc_for(unsigned kind, unsigned cc);
-/* full check once the producer k is known: a cmov/setcc in the gap must itself
- * forward NZCV from k with a real (non AL/NV) condition, so its emitter is a
- * single csel/cset */
 static int nzcv_gap_ok(const X86Insn *insns, int m, int k)
 {
     const X86Insn *in = &insns[m];
@@ -4714,7 +4576,7 @@ static int nzcv_gap_ok(const X86Insn *insns, int m, int k)
 static int nzcv_fuse_producer(const X86Insn *insns, int ci)
 {
     static int dis = -1;
-    if (g_xlat_mode32) return -1;   /* see cc_fuse_blocked_m32 */
+    if (g_xlat_mode32) return -1;
     if (dis < 0) dis = getenv("OCERZ_NO_NZCVFWD") ? 1 : 0;
     if (dis || ci < 1 || !g_defer || g_no_regflags) return -1;
     const X86Insn *c = &insns[ci];
@@ -4722,22 +4584,14 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     unsigned cc;
     if (c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC) cc = c->cc;
     else if (c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) cc = OCERZ_CC_B;
-    else if (c->op == OCERZ_OP_JCC) cc = c->cc;   /* superblock side exit or the terminator (sub/add/logic + jcc; cmp/test+jcc pairs fuse earlier) */
+    else if (c->op == OCERZ_OP_JCC) cc = c->cc;
     else return -1;
-    /* the producer: the nearest flag writer, at most NZCV_GAP_MAX NZCV-transparent
-     * instructions back (mov/lea, or a reg cmov/setcc that itself forwards from
-     * the same producer -- csel/cset leave NZCV alone) */
     int k = ci - 1;
     while (k >= 0 && ci - 1 - k < NZCV_GAP_MAX && !nzcv_producer_candidate(&insns[k]) && nzcv_gap_shape(&insns[k]))
         k--;
     if (k < 0 || !nzcv_producer_candidate(&insns[k])) return -1;
     for (int m = k + 1; m < ci; m++) {
         if (!nzcv_gap_ok(insns, m, k)) return -1;
-        /* a consumer that re-derives the condition from the producer's
-         * operands needs them intact: no gap may write a register the
-         * producer reads, its memory base/index included
-         * (`cmp byte [rax+rcx-1],0xc0 ; mov rcx,rbx ; jcc` spun libSystem's
-         * UTF-8 scan forever when the gap fusion declined it) */
         const X86Insn *p = &insns[k];
         for (int o = 0; o < p->nops; o++) {
             const X86Operand *po = &p->ops[o];
@@ -4751,7 +4605,6 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     const X86Insn *p = &insns[k];
     unsigned kind;
     if (p->op == OCERZ_OP_BSF || p->op == OCERZ_OP_BSR) {
-        /* bsf/bsr: ZF <=> source == 0 -> cmp source, #0 (E/NE only) */
         if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE) return -1;
         if (p->nops != 2 || p->seg != OCERZ_SEG_NONE) return -1;
         const X86Operand *bd = &p->ops[0], *bs = &p->ops[1];
@@ -4763,7 +4616,6 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
         return k;
     }
     if (p->op == OCERZ_OP_BT || p->op == OCERZ_OP_BTS || p->op == OCERZ_OP_BTR || p->op == OCERZ_OP_BTC) {
-        /* bt*: NZCV.Z <=> (old) bit clear (tst); only CF conditions make sense */
         if (cc != OCERZ_CC_B && cc != OCERZ_CC_AE) return -1;
         if (p->nops != 2 || p->seg != OCERZ_SEG_NONE || p->addrsize != 8) return -1;
         const X86Operand *bd = &p->ops[0], *bo = &p->ops[1];
@@ -4785,7 +4637,6 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     if (p->nops != 2 || p->seg != OCERZ_SEG_NONE) return -1;
     const X86Operand *d = &p->ops[0], *sr = &p->ops[1];
     if (d->size == 1 || d->size == 2) {
-        /* narrow producers (emit_cmp_test_narrow): TEST reg,imm sets Z of the masked AND (E/NE only) */
         if (sr->size != d->size || sr->high8) return -1;
         if (d->kind == OCERZ_OPK_REG) {
             if (d->high8 || pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return -1;
@@ -4815,21 +4666,14 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     } else if (sr->kind != OCERZ_OPK_IMM) return -1;
     return k;
 }
-/* after `adds`: CF = C (no inversion), same table as subs otherwise except B/AE */
 static int cc_after_adds(unsigned cc)
 {
     static const int t[16] = { A64_VS, A64_VC, A64_CS, A64_CC, A64_EQ, A64_NE, -1, -1,
                                A64_MI, A64_PL, -1, -1, A64_LT, A64_GE, A64_LE, A64_GT };
-    return cc < 16 ? t[cc] : -1;   /* BE/A need CF|ZF: -1 (generic) */
+    return cc < 16 ? t[cc] : -1;
 }
 
-/* When emit_cc_predicate_ex(..., want_direct=1) can express the condition as
- * a single arm64 condition on the NZCV it just set, it emits only the compare
- * and reports the condition here (else -1 and the NE <=> taken contract). */
 static int g_cc_direct = -1;
-/* value-cond E/NE on a pinned register: when the caller allows it
- * (g_cc_want_cbz), the predicate emits nothing and reports the register so
- * the branch is a single cbz/cbnz instead of cmp + b.cond */
 static int g_cc_want_cbz;
 static int g_cc_cbz_reg = -1, g_cc_cbz_sf, g_cc_cbz_nz;
 static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct);
@@ -4853,7 +4697,6 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         if (g_flag_producer) ocerz_format_insn(g_flag_producer, tb, sizeof tb);
         fprintf(stderr, "ocerz: CCPRED cc=%u producer=%s\n", cc, tb);
     }
-    /* NZCV forwarded from the adjacent producer */
     if (g_nzcv_from >= 0 && g_cur_insns && g_nzcv_from < g_cur_insn_idx &&
         nzcv_fuse_producer(g_cur_insns, g_cur_insn_idx) == g_nzcv_from) {
         const X86Insn *c = &g_cur_insns[g_cur_insn_idx];
@@ -4864,8 +4707,6 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
                      g_nzcv_kind == NZCV_KIND_BT ? (cc == OCERZ_CC_B ? A64_NE : cc == OCERZ_CC_AE ? A64_EQ : -1) :
                      cc_after_ands(cc);
             if (dc == A64_AL || dc == A64_NV) {
-                /* constant condition (CF/OF are 0 after logic): cset cannot
-                 * encode AL/NV, and b.cond treats both as always */
                 a64_mov_imm64(b, JTF, dc == A64_AL ? 1 : 0);
                 a64_subs_imm(b, 1, A64_ZR, JTF, 0);
                 return;
@@ -4878,8 +4719,6 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
             }
         }
     }
-    /* value-based condition: E/NE/S/NS straight from the producer's result
-     * register (still intact): cmp #0 gives Z and N */
     if (g_defer && !g_no_regflags && g_cur_insns && g_cur_insn_idx >= 0 &&
         (g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_JCC || g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_SETCC ||
          g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_CMOVCC) &&
@@ -4908,8 +4747,6 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
     int psize = 0;
     unsigned pkind = producer_record_kind(g_flag_producer, &psize);
     int c_add = cc_after_adds(cc);
-    /* SHIFT records: {src=val, dst=cnt}; only ZF/SF-based conditions are cheap
-     * (E/NE/S/NS/L/GE need OF too -> only E/NE/S/NS here) */
     int shift_ok = (pkind == OCERZ_CC_SHL || pkind == OCERZ_CC_SHR || pkind == OCERZ_CC_SAR) &&
                    (cc == OCERZ_CC_E || cc == OCERZ_CC_NE || cc == OCERZ_CC_S || cc == OCERZ_CC_NS);
     if (g_defer && shift_ok && g_flag_producer) {
@@ -4917,11 +4754,11 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         int sf = psize == 8;
         a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
         uint32_t *to_rf = a64_label(b); a64_cbz(b, 0, JT0, 0);
-        a64_ldr(b, 8, JT1, 20, CC_SRC_OFF);                 /* val */
+        a64_ldr(b, 8, JT1, 20, CC_SRC_OFF);
         if (pkind == OCERZ_CC_SHL) a64_lsl_imm(b, sf, JT1, JT1, (int)cnt);
         else if (pkind == OCERZ_CC_SHR) a64_lsr_imm(b, sf, JT1, JT1, (int)cnt);
         else a64_asr_imm(b, sf, JT1, JT1, (int)cnt);
-        a64_ands_reg(b, sf, A64_ZR, JT1, JT1, 0);           /* Z, N of the result */
+        a64_ands_reg(b, sf, A64_ZR, JT1, JT1, 0);
         a64_cset(b, JTF, cc == OCERZ_CC_E ? A64_EQ : cc == OCERZ_CC_NE ? A64_NE :
                           cc == OCERZ_CC_S ? A64_MI : A64_PL);
         uint32_t *ready = a64_label(b); a64_b(b, 0);
@@ -4945,7 +4782,6 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
     }
-    /* comis producer with pinned xmm operands: redo the fcmp and branch on NZCV directly (2 words) */
     if (g_cur_insns && g_cur_insn_idx >= 0 && sse_enabled() &&
         (g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_JCC || g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_SETCC ||
          g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_CMOVCC) &&
@@ -4978,13 +4814,10 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
     }
-    /* Producers that write RFLAGS eagerly (no deferred record): comis/ucomis,
-     * rotates.  Flags are already current -> just read them (~8 words). */
     if (g_flag_producer && (g_flag_producer->op == OCERZ_OP_UCOMISD ||
                             g_flag_producer->op == OCERZ_OP_UCOMISS ||
                             g_flag_producer->op == OCERZ_OP_COMISD ||
                             g_flag_producer->op == OCERZ_OP_COMISS)) {
-        /* still cheap-guard: if the producer went slow it also materialized. */
         emit_cc_predicate_rflags(b, cc);
         a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
@@ -4992,9 +4825,6 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
     if (g_defer && pkind && cc != OCERZ_CC_P && cc != OCERZ_CC_NP &&
         (psize == 1 || psize == 2 || psize == 4 || psize == 8) &&
         ((pkind == OCERZ_CC_SUB && c_sub >= 0) || (pkind == OCERZ_CC_LOGIC && c_and >= 0))) {
-        /* STATIC fast path: the producer is known; only its deferred-vs-
-         * materialized state is dynamic (cc_op == 0 means flags are in RFLAGS,
-         * e.g. the producer went slow).  ~8 words on the hot path. */
         a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
         uint32_t *to_rf = a64_label(b); a64_cbz(b, 0, JT0, 0);
         a64_ldr(b, 8, JT1, 20, CC_SRC_OFF);
@@ -5016,33 +4846,29 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         }
         uint32_t *ready = a64_label(b); a64_b(b, 0);
         a64_patch_cbz(to_rf, a64_label(b));
-        emit_cc_predicate_rflags(b, cc);            /* cc_op == 0: RFLAGS is current */
+        emit_cc_predicate_rflags(b, cc);
         a64_patch_b(ready, a64_label(b));
         a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
     }
     if (g_defer && c_sub >= 0 && c_and >= 0 && cc != OCERZ_CC_P && cc != OCERZ_CC_NP) {
         a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
-        to_generic[ng++] = a64_label(b); a64_cbz(b, 0, JT0, 0);       /* no pending -> rflags path */
+        to_generic[ng++] = a64_label(b); a64_cbz(b, 0, JT0, 0);
         a64_ldr(b, 8, JT1, 20, CC_SRC_OFF);
         a64_ldr(b, 8, JTA, 20, CC_DST_OFF);
-        /* kind = low byte, size = next byte */
-        a64_ubfx(b, 0, JTT, JT0, 8, 8);                                  /* size */
-        a64_ubfx(b, 0, JTU, JT0, 0, 8);                                  /* kind */
-        a64_ubfx(b, 0, JTF, JT0, 16, 1);                                 /* cin */
-        to_generic[ng++] = a64_label(b); a64_cbnz(b, 0, JTF, 0);         /* carry-in forms -> generic */
-        /* SUB record?  */
+        a64_ubfx(b, 0, JTT, JT0, 8, 8);
+        a64_ubfx(b, 0, JTU, JT0, 0, 8);
+        a64_ubfx(b, 0, JTF, JT0, 16, 1);
+        to_generic[ng++] = a64_label(b); a64_cbnz(b, 0, JTF, 0);
         a64_subs_imm(b, 0, A64_ZR, JTU, OCERZ_CC_SUB);
         uint32_t *not_sub = a64_label(b); a64_bcond(b, A64_NE, 0);
-        /* extend operands to size and subs (size 8 -> x-form; 4 -> w-form; 2/1 -> shifted w-form) */
         a64_subs_imm(b, 0, A64_ZR, JTT, 8);
         uint32_t *s8 = a64_label(b); a64_bcond(b, A64_EQ, 0);
         a64_subs_imm(b, 0, A64_ZR, JTT, 4);
         uint32_t *s4 = a64_label(b); a64_bcond(b, A64_EQ, 0);
-        /* size 1/2: shift left so the top bit is the sign */
         a64_mov_imm64(b, JTF, 32);
-        a64_lsl_imm(b, 0, JTT, JTT, 3);                                  /* bits */
-        a64_sub_reg(b, 0, JTF, JTF, JTT, 0);                             /* 32-bits */
+        a64_lsl_imm(b, 0, JTT, JTT, 3);
+        a64_sub_reg(b, 0, JTF, JTF, JTT, 0);
         a64_lslv(b, 0, JT1, JT1, JTF);
         a64_lslv(b, 0, JTA, JTA, JTF);
         a64_subs_reg(b, 0, A64_ZR, JT1, JTA, 0);
@@ -5053,11 +4879,9 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         a64_patch_bcond(s8, a64_label(b));
         a64_subs_reg(b, 1, A64_ZR, JT1, JTA, 0);
         done[nd++] = a64_label(b); a64_b(b, 0);
-        /* LOGIC record? (result already in cc_dst) */
         a64_patch_bcond(not_sub, a64_label(b));
         a64_subs_imm(b, 0, A64_ZR, JTU, OCERZ_CC_LOGIC);
         to_generic[ng++] = a64_label(b); a64_bcond(b, A64_NE, 0);
-        /* set NZ from result at size: shift so sign lands in bit 31/63 */
         a64_subs_imm(b, 0, A64_ZR, JTT, 8);
         uint32_t *l8 = a64_label(b); a64_bcond(b, A64_EQ, 0);
         a64_mov_imm64(b, JTF, 32);
@@ -5065,7 +4889,6 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         a64_sub_reg(b, 0, JTF, JTF, JTT, 0);
         a64_lslv(b, 0, JTA, JTA, JTF);
         a64_ands_reg(b, 0, A64_ZR, JTA, JTA, 0);
-        /* logic: condition table differs (CF=OF=0) -> materialize predicate now */
         if (c_and == A64_AL) a64_mov_imm64(b, JTF, 1);
         else if (c_and == A64_NV) a64_mov_imm64(b, JTF, 0);
         else a64_cset(b, JTF, c_and);
@@ -5076,23 +4899,20 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         else if (c_and == A64_NV) a64_mov_imm64(b, JTF, 0);
         else a64_cset(b, JTF, c_and);
         a64_patch_b(lg_done, a64_label(b));
-        uint32_t *lg_pred = a64_label(b); a64_b(b, 0);       /* -> pred_ready */
-        /* SUB fast path lands here: predicate from c_sub */
+        uint32_t *lg_pred = a64_label(b); a64_b(b, 0);
         for (int i = 0; i < nd; i++) a64_patch_b(done[i], a64_label(b));
         a64_cset(b, JTF, c_sub);
-        uint32_t *sub_pred = a64_label(b); a64_b(b, 0);      /* -> pred_ready */
-        /* generic path */
+        uint32_t *sub_pred = a64_label(b); a64_b(b, 0);
         for (int i = 0; i < ng; i++) {
             uint32_t w = *to_generic[i];
             if ((w & 0xff000010u) == 0x54000000u) a64_patch_bcond(to_generic[i], a64_label(b));
             else a64_patch_cbz(to_generic[i], a64_label(b));
         }
         emit_materialize(b);
-        emit_cc_predicate_rflags(b, cc);                     /* JTF = predicate */
-        /* pred_ready: */
+        emit_cc_predicate_rflags(b, cc);
         a64_patch_b(lg_pred, a64_label(b));
         a64_patch_b(sub_pred, a64_label(b));
-        a64_subs_imm(b, 1, A64_ZR, JTF, 0);                  /* NE <=> taken */
+        a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
     }
     emit_materialize(b);
@@ -5112,7 +4932,6 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
     int is_sbb = insn->op == OCERZ_OP_SBB;
     if (!need && pin_slot(d->reg) >= 0 &&
         (s->kind == OCERZ_OPK_IMM || (pin_slot(s->reg) >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)))) {
-        /* dead result flags, pinned operands: CF -> JTT, then two adds/subs in place */
         int rd = pin_hreg(pin_slot(d->reg));
         emit_cc_predicate_ex(b, OCERZ_CC_B, 1);
         a64_cset(b, JTT, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
@@ -5127,9 +4946,8 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
         if (is_sbb) a64_sub_reg(b, sf, rd, rd, JTT, 0); else a64_add_reg(b, sf, rd, rd, JTT, 0);
         return 1;
     }
-    /* CF: inline from a pending cmp/sub/logic record when possible */
-    emit_cc_predicate(b, OCERZ_CC_B);        /* NE <=> CF set */
-    a64_cset(b, JTT, A64_NE);                /* JTT = CF */
+    emit_cc_predicate(b, OCERZ_CC_B);
+    a64_cset(b, JTT, A64_NE);
     emit_gpr_rd(b, sf, JT0, d->reg);
     if (s->kind == OCERZ_OPK_REG) emit_gpr_rd(b, sf, JT1, s->reg);
     else a64_mov_imm64(b, JT1, sf ? (uint64_t)ocerz_sext(s->imm, s->size) : ((uint64_t)ocerz_sext(s->imm, s->size) & 0xffffffffull));
@@ -5137,7 +4955,6 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
     else        { a64_add_reg(b, sf, JT2, JT0, JT1, 0); a64_add_reg(b, sf, JT2, JT2, JTT, 0); }
     emit_gpr_wr(b, JT2, d->reg);
     if (need) {
-        /* cin is dynamic: encode both variants and select the ccop word */
         a64_mov_imm64(b, JTU, ocerz_cc_pack(is_sbb ? OCERZ_CC_SUB : OCERZ_CC_ADD, d->size, 0));
         a64_mov_imm64(b, JTA, ocerz_cc_pack(is_sbb ? OCERZ_CC_SUB : OCERZ_CC_ADD, d->size, 1));
         a64_subs_imm(b, 1, A64_ZR, JTT, 0);
@@ -5149,9 +4966,6 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
-/* 8/16-bit register-destination add/sub/and/or/xor with reg/imm source
- * (deferred flags with the narrow size; result inserted into the low
- * byte/word of the destination register). */
 static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -5168,8 +4982,6 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     int size = d->size, bits = size * 8;
     uint64_t mask = size == 1 ? 0xffull : 0xffffull;
     if (s_mem) {
-        /* memory source: load it zero-extended into JT1 first (plain fast
-         * form, else the guarded generic address) */
         int ds = pin_slot(d->reg);
         if (ds < 0) return 0;
         if (!emit_mem_load_plain(b, insn, s, size, JT1)) {
@@ -5205,9 +5017,6 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
                emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2); }
         return 1;
     }
-    /* pinned destination, dead flags: compute the low bits directly from the
-     * pinned register (the operation only depends on the low `bits`) and
-     * insert them back: 2-3 words */
     if (!need && pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
         int rd = pin_hreg(pin_slot(d->reg));
         int rm;
@@ -5235,8 +5044,8 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
         a64_bfi(b, 1, rd, JT2, 0, bits);
         return 1;
     }
-    emit_gpr_rd(b, 1, JT0, d->reg);            /* full reg in JT0 */
-    if (size == 1) a64_uxtb(b, JTT, JT0); else a64_uxth(b, JTT, JT0);   /* JTT = narrow dst */
+    emit_gpr_rd(b, 1, JT0, d->reg);
+    if (size == 1) a64_uxtb(b, JTT, JT0); else a64_uxth(b, JTT, JT0);
     if (s->kind == OCERZ_OPK_REG) {
         emit_gpr_rd(b, 1, JT1, s->reg);
         if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
@@ -5249,7 +5058,7 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     case OCERZ_OP_OR:  a64_orr_reg(b, 0, JT2, JTT, JT1, 0); break;
     case OCERZ_OP_XOR: a64_eor_reg(b, 0, JT2, JTT, JT1, 0); break;
     }
-    a64_bfi(b, 1, JT0, JT2, 0, bits);          /* insert low bits */
+    a64_bfi(b, 1, JT0, JT2, 0, bits);
     emit_gpr_wr(b, JT0, d->reg);
     if (need) {
         if (op == OCERZ_OP_ADD)      emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_ADD, size, 0), JTT, JT1);
@@ -5262,33 +5071,31 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
-/* cbw/cwde/cdqe and cwd/cdq/cqo */
 static int emit_cbw_cwd(A64Buf *b, const X86Insn *insn)
 {
     if (g_pin_class == 2) return 0;
     if (insn->op == OCERZ_OP_CBW) {
         emit_gpr_rd(b, 1, JT0, OCERZ_RAX);
         if (insn->opsize == 2)      { a64_sxtb(b, 0, JT1, JT0); a64_bfi(b, 1, JT0, JT1, 0, 16); }
-        else if (insn->opsize == 4) { a64_sxth(b, 0, JT0, JT0); }        /* W-form: zero-extends to 64 */
+        else if (insn->opsize == 4) { a64_sxth(b, 0, JT0, JT0); }
         else                        { a64_sxtw(b, JT0, JT0); }
         emit_gpr_wr(b, JT0, OCERZ_RAX);
         return 1;
     }
-    /* CWD/CDQ/CQO: RDX = sign(RAX) */
     if (insn->opsize != 2 && pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0 && g_pin_class == 3) {
         int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
-        if (insn->opsize == 4) a64_asr_imm(b, 0, hdx, hax, 31);      /* W-form: 0/0xffffffff, upper zero */
+        if (insn->opsize == 4) a64_asr_imm(b, 0, hdx, hax, 31);
         else                   a64_asr_imm(b, 1, hdx, hax, 63);
         return 1;
     }
     emit_gpr_rd(b, 1, JT0, OCERZ_RAX);
     if (insn->opsize == 2) {
         emit_gpr_rd(b, 1, JT1, OCERZ_RDX);
-        a64_sbfx(b, 1, JT0, JT0, 15, 1);      /* -1/0 from bit 15 */
+        a64_sbfx(b, 1, JT0, JT0, 15, 1);
         a64_bfi(b, 1, JT1, JT0, 0, 16);
         emit_gpr_wr(b, JT1, OCERZ_RDX);
     } else if (insn->opsize == 4) {
-        a64_asr_imm(b, 0, JT0, JT0, 31);      /* W-form: 0/0xffffffff, upper zero */
+        a64_asr_imm(b, 0, JT0, JT0, 31);
         emit_gpr_wr(b, JT0, OCERZ_RDX);
     } else {
         a64_asr_imm(b, 1, JT0, JT0, 63);
@@ -5297,12 +5104,10 @@ static int emit_cbw_cwd(A64Buf *b, const X86Insn *insn)
     return 1;
 }
 
-/* div/idiv (32/64-bit, register or memory divisor). */
 static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32_t *back);
 static void patch_any_branch(uint32_t *site, uint32_t *target);
 static int g_div_prev_skipped;
-static uint32_t g_oolslow_pre;      /* one host word the next out-of-line slow arm runs before its slow call (0: none) */
-/* xor edx,edx / xor rdx,rdx right before a div, or cqo/cdq right before an idiv of the same */
+static uint32_t g_oolslow_pre;
 static int rdx_prep_skippable(const X86Insn *insns, int i, int n, uint64_t need)
 {
     static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_RDXSKIP") ? 1 : 0;
@@ -5329,26 +5134,21 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     if (insn->seg != OCERZ_SEG_NONE) return 0;
     int sf = o->size == 8;
     int is_idiv = insn->op == OCERZ_OP_IDIV;
-    /* the previous instruction fixed rdx: xor edx,edx / xor rdx,rdx (div) or
-     * cqo / cdq (idiv) -> the high-half check is statically satisfied */
     int rdx_zero = 0, rdx_sext = 0;
     if (g_cur_insns && g_cur_insn_idx >= 1) {
         const X86Insn *pv = &g_cur_insns[g_cur_insn_idx - 1];
         if (pv->op == OCERZ_OP_XOR && pv->nops == 2 && pv->ops[0].kind == OCERZ_OPK_REG && pv->ops[1].kind == OCERZ_OPK_REG &&
             pv->ops[0].reg == OCERZ_RDX && pv->ops[1].reg == OCERZ_RDX && !pv->ops[0].high8 && (pv->ops[0].size == 4 || pv->ops[0].size == 8))
             rdx_zero = 1;
-        if (pv->op == OCERZ_OP_CWD && ((sf && pv->opsize == 8) || (!sf && pv->opsize == 4))) rdx_sext = 1;   /* cqo / cdq */
+        if (pv->op == OCERZ_OP_CWD && ((sf && pv->opsize == 8) || (!sf && pv->opsize == 4))) rdx_sext = 1;
     }
-    /* the rdx preparation was not emitted (rdx_prep_skippable): the slow
-     * arm materialises it first (the interpreter needs the real rdx) */
     int prep_skipped = g_div_prev_skipped; g_div_prev_skipped = 0;
     uint32_t pre_word = 0;
     if (prep_skipped && pin_slot(OCERZ_RDX) >= 0 && pin_slot(OCERZ_RAX) >= 0) {
         int hdx0 = pin_hreg(pin_slot(OCERZ_RDX)), hax0 = pin_hreg(pin_slot(OCERZ_RAX));
-        if (rdx_zero) pre_word = 0xaa1f03e0u | (uint32_t)hdx0;                          /* mov hdx, xzr */
-        else pre_word = (sf ? 0x9340fc00u : 0x13007c00u) | ((uint32_t)hax0 << 5) | (uint32_t)hdx0;   /* asr hdx, hax, #63 / #31 */
+        if (rdx_zero) pre_word = 0xaa1f03e0u | (uint32_t)hdx0;
+        else pre_word = (sf ? 0x9340fc00u : 0x13007c00u) | ((uint32_t)hax0 << 5) | (uint32_t)hdx0;
     }
-    /* divisor: a pinned register is used in place, else -> JT2 (memory first: EA clobbers JT0) */
     int hdv = JT2;
     if (o->kind == OCERZ_OPK_MEM) {
         if (!emit_mem_ea(b, insn, o, JTA)) return 0;
@@ -5363,35 +5163,33 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         else
             emit_gpr_rd(b, sf, JT2, o->reg);
     } else return 0;
-    /* pinned rax/rdx: operate on the pins directly */
     if (pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0 && g_pin_class == 3) {
         int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
         uint32_t *sites[4]; int ns = 0;
-        sites[ns++] = a64_label(b); a64_cbz(b, sf, hdv, 0);        /* divisor == 0 */
+        sites[ns++] = a64_label(b); a64_cbz(b, sf, hdv, 0);
         if (!is_idiv) {
-            if (!rdx_zero) { sites[ns++] = a64_label(b); a64_cbnz(b, sf, hdx, 0); }   /* rdx != 0: 128-bit case */
+            if (!rdx_zero) { sites[ns++] = a64_label(b); a64_cbnz(b, sf, hdx, 0); }
             a64_udiv(b, sf, JTT, hax, hdv);
         } else {
-            if (!rdx_sext) {                                          /* rdx:rax must be sext(rax) */
+            if (!rdx_sext) {
                 a64_asr_imm(b, sf, JTT, hax, sf ? 63 : 31);
                 a64_subs_reg(b, sf, A64_ZR, hdx, JTT, 0);
                 sites[ns++] = a64_label(b); a64_bcond(b, A64_NE, 0);
             }
-            /* INT_MIN / -1 raises #DE on x86: divisor -1 and rax == INT_MIN -> slow */
-            a64_subs_imm(b, sf, A64_ZR, hdv, 0);                      /* placeholder: cmn hdv, #1 below */
-            b->p--;                                                   /* (drop the placeholder) */
-            a64_emit32(b, (sf ? 0xb100041fu : 0x3100041fu) | ((uint32_t)hdv << 5));   /* cmn hdv, #1 */
+            a64_subs_imm(b, sf, A64_ZR, hdv, 0);
+            b->p--;
+            a64_emit32(b, (sf ? 0xb100041fu : 0x3100041fu) | ((uint32_t)hdv << 5));
             uint32_t *not_m1 = a64_label(b); a64_bcond(b, A64_NE, 0);
             a64_try_eor_imm(b, sf, JTT, hax, sf ? 0x8000000000000000ull : 0x80000000ull);
             sites[ns++] = a64_label(b); a64_cbz(b, sf, JTT, 0);
             a64_patch_bcond(not_m1, a64_label(b));
             a64_sdiv(b, sf, JTT, hax, hdv);
         }
-        a64_msub(b, sf, hdx, JTT, hdv, hax);                        /* rdx = rax - q*div (W form zero-extends) */
+        a64_msub(b, sf, hdx, JTT, hdv, hax);
         a64_mov_reg(b, sf, hax, JTT);
         g_oolslow_pre = pre_word;
         if (oolslow_add(insn, sites, ns, a64_label(b)))
-            return 1;                                                /* rare cases out of line */
+            return 1;
         g_oolslow_pre = 0;
         uint32_t *done = a64_label(b); a64_b(b, 0);
         uint32_t *slow = a64_label(b);
@@ -5403,19 +5201,17 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     }
     emit_gpr_rd(b, sf, JT0, OCERZ_RAX);
     emit_gpr_rd(b, sf, JT1, OCERZ_RDX);
-    /* slow-path conditions */
     uint32_t *to_slow[2]; int ns = 0;
-    a64_subs_imm(b, sf, A64_ZR, JT2, 0);                 /* divisor == 0 */
+    a64_subs_imm(b, sf, A64_ZR, JT2, 0);
     to_slow[ns++] = a64_label(b); a64_bcond(b, A64_EQ, 0);
     if (is_idiv) {
-        a64_asr_imm(b, sf, JTT, JT0, sf ? 63 : 31);      /* expected high = sext */
+        a64_asr_imm(b, sf, JTT, JT0, sf ? 63 : 31);
         a64_subs_reg(b, sf, A64_ZR, JT1, JTT, 0);
     } else {
         a64_subs_imm(b, sf, A64_ZR, JT1, 0);
     }
     to_slow[ns++] = a64_label(b); a64_bcond(b, A64_NE, 0);
     if (is_idiv) {
-        /* INT_MIN / -1 overflows on x86 (#DE) -> slow */
         a64_mov_imm64(b, JTT, sf ? 0x8000000000000000ull : 0x80000000ull);
         a64_subs_reg(b, sf, A64_ZR, JT0, JTT, 0);
         uint32_t *not_min = a64_label(b); a64_bcond(b, A64_NE, 0);
@@ -5423,9 +5219,8 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         a64_subs_reg(b, sf, A64_ZR, JT2, JTT, 0);
         uint32_t *to_slow3 = a64_label(b); a64_bcond(b, A64_EQ, 0);
         a64_patch_bcond(not_min, a64_label(b));
-        /* compute */
         a64_sdiv(b, sf, JTT, JT0, JT2);
-        a64_msub(b, sf, JTU, JTT, JT2, JT0);          /* rem = rax - q*div */
+        a64_msub(b, sf, JTU, JTT, JT2, JT0);
         emit_gpr_wr(b, JTT, OCERZ_RAX);
         emit_gpr_wr(b, JTU, OCERZ_RDX);
         uint32_t *done = a64_label(b); a64_b(b, 0);
@@ -5453,14 +5248,13 @@ static int emit_not_neg(A64Buf *b, const X86Insn *insn, uint64_t need)
     const X86Operand *d = &insn->ops[0];
     if (d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 1 || d->size == 2) && g_defer &&
         pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
-        /* 8/16-bit register forms in place */
         int rd = pin_hreg(pin_slot(d->reg));
         int bits = d->size * 8;
         if (insn->op == OCERZ_OP_NOT) {
             a64_try_eor_imm(b, 1, rd, rd, d->size == 1 ? 0xffull : 0xffffull);
             return 1;
         }
-        if (d->size == 1) a64_uxtb(b, JT0, rd); else a64_uxth(b, JT0, rd);   /* old, zero-extended */
+        if (d->size == 1) a64_uxtb(b, JT0, rd); else a64_uxth(b, JT0, rd);
         a64_neg_reg(b, 0, JT2, JT0);
         a64_bfi(b, 1, rd, JT2, 0, bits);
         if (need) {
@@ -5483,7 +5277,6 @@ static int emit_not_neg(A64Buf *b, const X86Insn *insn, uint64_t need)
         emit_gpr_wr(b, JT2, d->reg);
         return 1;
     }
-    /* NEG: result = 0 - a; flags = SUB(0, a) */
     if (!g_defer && need)
         return 0;
     emit_gpr_rd(b, sf, JT0, d->reg);
@@ -5496,7 +5289,6 @@ static int emit_not_neg(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
-/* Shift/rotate count source: imm -> constant; CL -> masked register. */
 static int emit_shift_count(A64Buf *b, const X86Insn *insn, int sf, int dst,
                             unsigned *const_cnt)
 {
@@ -5510,7 +5302,7 @@ static int emit_shift_count(A64Buf *b, const X86Insn *insn, int sf, int dst,
         emit_gpr_rd(b, 1, dst, OCERZ_RCX);
         a64_mov_imm64(b, JTU, mask);
         a64_and_reg(b, 1, dst, dst, JTU, 0);
-        *const_cnt = 0xffffffffu;   /* variable */
+        *const_cnt = 0xffffffffu;
         return 1;
     }
     return 0;
@@ -5523,7 +5315,6 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
         return 0;
     if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
-    /* i386 block, CL count: a count that masks to 0 must leave the destination COMPLETELY untouched */
     if (insn->mode32 && insn->ops[1].kind != OCERZ_OPK_IMM)
         return 0;
     int sf = d->size == 8;
@@ -5534,16 +5325,16 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
         return 0;
     int variable = cnt == 0xffffffffu;
     if (!variable && cnt == 0)
-        return 1;                       /* no-op, flags untouched */
+        return 1;
     if (need && variable)
-        return 0;                       /* count==0 must not touch flags; keep slow */
+        return 0;
     int ds = pin_slot(d->reg);
     int rd = ds >= 0 ? pin_hreg(ds) : JT2;
     if (ds < 0)
         emit_gpr_rd(b, sf, JT0, d->reg);
     int rn = ds >= 0 ? rd : JT0;
     if (variable) {
-        if (is_rol) {                   /* rol by n == ror by (bits - n) */
+        if (is_rol) {
             a64_mov_imm64(b, JTU, (uint64_t)bits);
             a64_sub_reg(b, 1, JT1, JTU, JT1, 0);
         }
@@ -5560,7 +5351,6 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
         emit_gpr_wr(b, rd, d->reg);
     if (!need)
         return 1;
-    /* Flags (constant count only): CF = rol ? res&1 : msb(res); OF only when cnt==1. */
     emit_materialize(b);
     a64_ldr(b, 8, JTT, 20, RF_OFF);
     if (is_rol)
@@ -5571,10 +5361,10 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
     a64_and_reg(b, 1, JTT, JTT, JTU, 0);
     a64_orr_reg(b, 1, JTT, JTT, JT1, 0);
     if (cnt == 1) {
-        if (is_rol) {                   /* OF = CF ^ msb(res) */
+        if (is_rol) {
             a64_ubfx(b, 1, JTU, rd, bits - 1, 1);
             a64_eor_reg(b, 1, JTU, JTU, JT1, 0);
-        } else {                        /* OF = msb(res) ^ bit(bits-2)(res) */
+        } else {
             a64_ubfx(b, 1, JTU, rd, bits - 2, 1);
             a64_eor_reg(b, 1, JTU, JTU, JT1, 0);
         }
@@ -5585,7 +5375,6 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
-/* shl/shr/sar by CL (the immediate forms live in emit_shift). */
 static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
@@ -5597,8 +5386,7 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
     if (need)
-        return 0;                       /* flags: count==0 keeps them; stay slow */
-    /* Same count == 0 hazard as emit_rot: lslv/lsrv/asrv below write the destination unconditionally */
+        return 0;
     if (insn->mode32)
         return 0;
     int sf = d->size == 8;
@@ -5633,17 +5421,12 @@ static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int 
     if (rsp_is_ptr() && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP)))
         return 0;
     int sf = d->size == 8;
-    /* source value -> JT2 (memory sources are loaded even when not taken, as x86 does);
-     * emit_cc_predicate may call C on its generic path, which clobbers JT regs
-     * except that we reload nothing: JT2 must survive -> load the source AFTER. */
     if (s->kind == OCERZ_OPK_REG) {
         if (s->high8 || s->size != d->size)
             return 0;
     } else if (s->kind != OCERZ_OPK_MEM)
         return 0;
     if (s->kind == OCERZ_OPK_REG && pin_slot(d->reg) >= 0 && pin_slot(s->reg) >= 0) {
-        /* both pinned: one csel on the predicate's NZCV (32-bit csel zero-extends,
-         * as x86 cmov does even when not taken) */
         emit_cc_predicate_ex(b, insn->cc, 1);
         int cond = g_cc_direct >= 0 ? g_cc_direct : A64_NE;
         int rd = pin_hreg(pin_slot(d->reg)), rs = pin_hreg(pin_slot(s->reg));
@@ -5652,13 +5435,11 @@ static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int 
         else a64_csel(b, sf, rd, rs, rd, cond);
         return 1;
     }
-    /* predicate first (may call C), then load the source into JT2 */
-    emit_cc_predicate(b, insn->cc);      /* NE = take ; leaves NZCV */
-    a64_cset(b, JTF, A64_NE);            /* keep predicate in JTF across the loads */
+    emit_cc_predicate(b, insn->cc);
+    a64_cset(b, JTF, A64_NE);
     if (s->kind == OCERZ_OPK_REG) {
         emit_gpr_rd(b, sf, JT2, s->reg);
     } else {
-        /* re-materialise the memory source (EA may clobber JT0/JTA; JTF survives) */
         uint32_t *skip2;
         if (!emit_sse_mem_addr(b, insn, s, d->size, exit_sites, n_exits, &skip2)) return 0;
         emit_sse_mem_ld_gpr(b, d->size, JT2);
@@ -5668,7 +5449,7 @@ static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int 
     emit_gpr_rd(b, sf, JT0, d->reg);
     a64_csel(b, sf, JT0, JT2, JT0, A64_NE);
     if (!sf)
-        a64_mov_reg(b, 0, JT0, JT0);     /* zero-extend 32-bit result */
+        a64_mov_reg(b, 0, JT0, JT0);
     emit_gpr_wr(b, JT0, d->reg);
     return 1;
 }
@@ -5678,7 +5459,6 @@ static int emit_setcc(A64Buf *b, const X86Insn *insn)
     const X86Operand *d = &insn->ops[0];
     if (d->kind == OCERZ_OPK_MEM && d->size == 1 && insn->addrsize == 8 && g_defer &&
         (insn->seg == OCERZ_SEG_NONE || insn->seg == OCERZ_SEG_GS || insn->seg == OCERZ_SEG_FS)) {
-        /* setcc byte [mem]: predicate first (it may call C), then a byte store */
         emit_cc_predicate_ex(b, insn->cc, 1);
         a64_cset(b, JT2, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
         if (mem_native_store_ok() && emit_plain_mem_fast(b, insn, d, 1, JT2, 1, 0)) return 1;
@@ -5694,7 +5474,6 @@ static int emit_setcc(A64Buf *b, const X86Insn *insn)
         return 0;
     emit_cc_predicate_ex(b, insn->cc, 1);
     a64_cset(b, JT2, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
-    /* write low byte only, preserving the rest of the register */
     if (pin_slot(d->reg) >= 0) {
         a64_bfi(b, 1, pin_hreg(pin_slot(d->reg)), JT2, 0, 8);
         return 1;
@@ -5724,12 +5503,9 @@ static int emit_bswap(A64Buf *b, const X86Insn *insn)
     return 1;
 }
 
-
-/* ======================= SSE / SSE2 inline emitters ======================= v1 model: every op */
 #define XMM_BASE_OFF ((uint32_t)offsetof(OcerzCPU, xmm))
 enum { VX0 = 0, VX1 = 1, VX2 = 2, VX3 = 3 };
 
-/* ---- XMM pinning: xmmN lives in host V(16+N) for the whole block ---- g_xmm_pinned: mask of */
 static uint16_t g_xmm_pinned;
 static int xmm_pinning_enabled(void)
 {
@@ -5737,9 +5513,6 @@ static int xmm_pinning_enabled(void)
     if (on < 0) on = getenv("OCERZ_NO_XMM_PIN") ? 0 : 1;
     return on;
 }
-/* Global XMM layout: every block pins all 16 xmm registers (with full GPR
- * pinning), so body-to-body transitions carry them in V16-V31 with no
- * spill/reload; only function entry/exit and C callouts touch memory. */
 static int xmm_global_enabled(void)
 {
     static int on = -1;
@@ -5754,7 +5527,7 @@ static void emit_xmm_pin_load_all(A64Buf *b)
     for (unsigned r = 0; r < 16; r++)
         if (xmm_is_pinned(r))
             a64_ldr_v(b, 16, xmm_vreg(r), 20, XMM_BASE_OFF + r * 16);
-    emit_pk_consts_load(b);      /* V4-V7 are caller-saved: rebuild after callouts too */
+    emit_pk_consts_load(b);
 }
 static void emit_xmm_pin_spill_all(A64Buf *b)
 {
@@ -5764,7 +5537,7 @@ static void emit_xmm_pin_spill_all(A64Buf *b)
 }
 
 _Static_assert(offsetof(OcerzCPU, xmm) % 16 == 0, "xmm must be 16-aligned for scaled q loads");
-static void emit_xmm_ld(A64Buf *b, int vd, unsigned xr)   /* full 128-bit */
+static void emit_xmm_ld(A64Buf *b, int vd, unsigned xr)
 {
     l0_flush_reg(b, xr);
     if (xmm_is_pinned(xr)) { if (vd != xmm_vreg(xr)) a64_v_mov(b, vd, xmm_vreg(xr)); return; }
@@ -5775,35 +5548,30 @@ static void emit_xmm_st(A64Buf *b, int vs, unsigned xr)
     if (xmm_is_pinned(xr)) { if (vs != xmm_vreg(xr)) a64_v_mov(b, xmm_vreg(xr), vs); return; }
     a64_str_v(b, 16, vs, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
-static void emit_xmm_ld_lo(A64Buf *b, int size, int vd, unsigned xr) /* 4/8 low bytes; upper zero */
+static void emit_xmm_ld_lo(A64Buf *b, int size, int vd, unsigned xr)
 {
     l0_flush_reg(b, xr);
     if (xmm_is_pinned(xr)) {
-        /* fmov d/s zeroes the upper part of the destination */
         if (size == 8) a64_fmov_d_d(b, vd, xmm_vreg(xr)); else a64_fmov_s_s(b, vd, xmm_vreg(xr));
         return;
     }
     a64_ldr_v(b, size, vd, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
-static void emit_xmm_st_lo(A64Buf *b, int size, int vs, unsigned xr) /* only low 4/8 bytes */
+static void emit_xmm_st_lo(A64Buf *b, int size, int vs, unsigned xr)
 {
     if (xmm_is_pinned(xr)) {
-        /* value already lives in this reg's l0 scratch: defer the insert and
-         * mark the architectural lane stale (OCERZ_L0_DEFER prototype) */
         if (l0_defer_take(vs, xr, size))
             return;
-        /* insert the low lane, keep the rest */
         if (size == 8) a64_ins_d_d(b, xmm_vreg(xr), 0, vs, 0); else a64_ins_s_s(b, xmm_vreg(xr), 0, vs, 0);
         return;
     }
     a64_str_v(b, size, vs, 20, XMM_BASE_OFF + (uint32_t)xr * 16);
 }
 
-/* Guest memory operand -> host address in JTA (with guard/skip pair). */
-static int g_sse_mem_ra = JTA;      /* base register / folded displacement for the */
-static uint32_t g_sse_mem_disp;     /* access that follows emit_sse_mem_addr */
-static int g_sse_mem_plain;         /* 1: plain form (no guard), address = [ra, #disp] */
-static int g_sse_mem_plainacc;      /* plain (unordered) access allowed for the operand set up above */
+static int g_sse_mem_ra = JTA;
+static uint32_t g_sse_mem_disp;
+static int g_sse_mem_plain;
+static int g_sse_mem_plainacc;
 static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o, int size,
                              uint32_t **exit_sites, int *n_exits, uint32_t **skip_out)
 {
@@ -5821,22 +5589,20 @@ static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o
     emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
     return 1;
 }
-static void emit_sse_mem_ld_gpr(A64Buf *b, int size, int rd)   /* GPR load from the address set up above */
+static void emit_sse_mem_ld_gpr(A64Buf *b, int size, int rd)
 {
     if (g_sse_mem_plain) emit_gpr_ld_at(b, size, rd, g_sse_mem_ra, (int32_t)g_sse_mem_disp, g_sse_mem_plainacc);
     else emit_guest_load_ordered(b, size, rd, JTA, JTU);
 }
-static void emit_sse_mem_ld(A64Buf *b, int size, int vd)   /* from the address set up above */
+static void emit_sse_mem_ld(A64Buf *b, int size, int vd)
 {
     emit_v_ld_at(b, size, vd, g_sse_mem_ra, (int32_t)g_sse_mem_disp, g_sse_mem_plainacc);
 }
-static void emit_sse_mem_st(A64Buf *b, int size, int vs)   /* to the address set up above */
+static void emit_sse_mem_st(A64Buf *b, int size, int vs)
 {
     emit_v_st_at(b, size, vs, g_sse_mem_ra, (int32_t)g_sse_mem_disp, g_sse_mem_plainacc);
 }
 
-/* Load operand `o` (xmm or mem) of width `size` (4/8/16) into vd.
- * For xmm sources the whole register is loaded (harmless for scalar use). */
 static int emit_sse_src(A64Buf *b, const X86Insn *insn, const X86Operand *o, int size,
                         int vd, uint32_t **exit_sites, int *n_exits)
 {
@@ -5855,21 +5621,18 @@ static int emit_sse_src(A64Buf *b, const X86Insn *insn, const X86Operand *o, int
     return 0;
 }
 
-/* Resolve operand `o` to a V register holding its value: a pinned xmm is
- * returned in place (no copy); memory (or unpinned) is loaded into vtmp.
- * Returns the register, or -1 on failure. */
 static int emit_sse_src_reg(A64Buf *b, const X86Insn *insn, const X86Operand *o, int size,
                             int vtmp, uint32_t **exit_sites, int *n_exits)
 {
     if (o->kind == OCERZ_OPK_XMM && xmm_is_pinned(o->reg)) {
-        l0_flush_reg(b, o->reg);           /* full-width read of the architectural reg */
+        l0_flush_reg(b, o->reg);
         return xmm_vreg(o->reg);
     }
     if (!emit_sse_src(b, insn, o, size, vtmp, exit_sites, n_exits))
         return -1;
     return vtmp;
 }
-static inline int xmm_dst_reg(unsigned xr, int vtmp)   /* where to compute a full-width result */
+static inline int xmm_dst_reg(unsigned xr, int vtmp)
 {
     return xmm_is_pinned(xr) ? xmm_vreg(xr) : vtmp;
 }
@@ -5881,18 +5644,14 @@ static int sse_enabled(void)
     return on;
 }
 
-/* ---- movups/movaps/movdqa/movdqu (128-bit moves) ---- */
 static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_XMM) {
         if (d->reg != s->reg) {
             if (xmm_is_pinned(d->reg) && xmm_is_pinned(s->reg)) {
-                /* the copy may carry a stale lane 0: dst shares src's lane
-                 * scratch (and its dirty bit) below, so nothing reads the
-                 * stale lane and the merge stays off the loop-carried chain */
                 l0_inval(d->reg);
-                a64_v_mov(b, xmm_vreg(d->reg), xmm_vreg(s->reg));   /* 1 word */
+                a64_v_mov(b, xmm_vreg(d->reg), xmm_vreg(s->reg));
             }
             else { l0_flush_reg(b, s->reg); emit_xmm_ld(b, VX0, s->reg); emit_xmm_st(b, VX0, d->reg); }
             l0_share(d->reg, s->reg);
@@ -5902,7 +5661,7 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_MEM) {
         uint32_t *skip;
         l0_inval(d->reg);
-        int vd = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;   /* load straight into the pin */
+        int vd = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
         if (vd != VX0 && emit_plain_mem_fast(b, insn, s, 16, vd, 0, 1)) return 1;
         if (!emit_sse_mem_addr(b, insn, s, 16, exit_sites, n_exits, &skip)) return 0;
         emit_sse_mem_ld(b, 16, vd);
@@ -5912,7 +5671,7 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     }
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_XMM) {
         l0_flush_reg(b, s->reg);
-        int vs = xmm_is_pinned(s->reg) ? xmm_vreg(s->reg) : VX0;   /* store straight from the pin */
+        int vs = xmm_is_pinned(s->reg) ? xmm_vreg(s->reg) : VX0;
         if (vs != VX0 && emit_plain_mem_fast(b, insn, d, 16, vs, 1, 1)) return 1;
         if (vs == VX0) emit_xmm_ld(b, VX0, s->reg);
         uint32_t *skip;
@@ -5924,7 +5683,6 @@ static int emit_sse_mov128(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     return 0;
 }
 
-/* ---- movlps/movlpd (low 64) and movhps/movhpd (high 64) with memory; movlhps/movhlps ---- */
 static int emit_sse_movlh(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -5956,13 +5714,11 @@ static int emit_sse_movlh(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     return 0;
 }
 
-/* ---- movss / movsd (scalar moves; size 4 / 8) ---- */
 static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     int dbl = size == 8;
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_XMM) {
-        /* dst.lo(size) = src.lo(size); rest of dst preserved */
         if (xmm_is_pinned(s->reg) && xmm_is_pinned(d->reg)) {
             int vs = l0_src(s->reg, dbl);
             if (dbl) a64_ins_d_d(b, xmm_vreg(d->reg), 0, vs, 0); else a64_ins_s_s(b, xmm_vreg(d->reg), 0, vs, 0);
@@ -5978,9 +5734,9 @@ static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **ex
         uint32_t *skip;
         l0_inval(d->reg);
         if (!emit_sse_mem_addr(b, insn, s, size, exit_sites, n_exits, &skip)) return 0;
-        emit_sse_mem_ld(b, size, VX0);          /* ldr s/d zeroes the rest of V0 */
+        emit_sse_mem_ld(b, size, VX0);
         patch_guard_skip(skip, a64_label(b));
-        emit_xmm_st(b, VX0, d->reg);            /* whole 128: upper zeroed (x86 semantics) */
+        emit_xmm_st(b, VX0, d->reg);
         return 1;
     }
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_XMM) {
@@ -5995,8 +5751,6 @@ static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **ex
     return 0;
 }
 
-/* x86 SSE NaN rule: result NaN -> quiet(a) if a is NaN, else quiet(b) if b is NaN, else the */
-/* cold: r = isnan(a) ? a|q : isnan(b) ? b|q : dflt  (scalar; result in vr) */
 static void emit_nan_cold_scalar(A64Buf *b, int dbl, int vr, int va, int vb)
 {
     uint64_t quiet = dbl ? 0x0008000000000000ull : 0x00400000ull;
@@ -6021,9 +5775,6 @@ static void emit_nan_cold_scalar(A64Buf *b, int dbl, int vr, int va, int vb)
     a64_fmov_v_from_x(b, dbl, vr, JT0);
     a64_patch_b(done, a64_label(b));
 }
-/* A scalar op's NaN branch merged into the conversion that follows it: the
- * conversion's check reuses the op's fcmp, and its out-of-line arm runs the
- * op's exact-NaN fix before its own (see emit_sse_cvt). */
 static struct { int valid, idx, dbl, vr, va, vb; } g_scpend;
 static int g_scalar_merge_next;
 static int scalar_cvt_follows(unsigned xreg, int dbl)
@@ -6041,8 +5792,6 @@ static int scalar_cvt_follows(unsigned xreg, int dbl)
 static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
 {
     a64_fcmp(b, dbl, vr, vr);
-    /* a conversion right after this may reuse the V of this very compare:
-     * both paths leave NZCV = fcmp(vr, vr) */
     g_fcmp_self_vreg = vr;
     g_fcmp_self_idx = g_cur_insn_idx + 1;
     if (g_scalar_merge_next) {
@@ -6053,19 +5802,17 @@ static void emit_nan_fix_scalar2(A64Buf *b, int dbl, int vr, int va, int vb)
     }
     if (g_n_nanool < NANOOL_MAX) {
         NanOolPend *o = &g_nanool[g_n_nanool++];
-        o->site = a64_label(b); a64_bcond(b, A64_VS, 0);      /* NaN -> out of line */
+        o->site = a64_label(b); a64_bcond(b, A64_VS, 0);
         o->back = a64_label(b);
         o->dbl = (uint8_t)dbl; o->packed = 0; o->vr = (uint8_t)vr; o->va = (uint8_t)va; o->vb = (uint8_t)vb; o->t1 = 0;
         o->cvt = 0; o->refcmp = 1; o->pre = 0; o->idx = g_cur_insn_idx; o->is_cbz = 0;
         return;
     }
-    /* table full: inline cold path */
     uint32_t *ok = a64_label(b); a64_bcond(b, A64_VC, 0);
     emit_nan_cold_scalar(b, dbl, vr, va, vb);
     a64_fcmp(b, dbl, vr, vr);
     a64_patch_bcond(ok, a64_label(b));
 }
-/* The merge did not happen after all: give the scalar op its own branch now. */
 static void scalar_pend_flush(A64Buf *b)
 {
     if (!g_scpend.valid) return;
@@ -6073,14 +5820,9 @@ static void scalar_pend_flush(A64Buf *b)
     g_scalar_merge_next = 0;
     emit_nan_fix_scalar2(b, g_scpend.dbl, g_scpend.vr, g_scpend.va, g_scpend.vb);
 }
-/* Packed: per-lane exact rule.  Constants: V4/V6 = quiet bit per lane (2D/4S),
- * V5/V7 = default NaN per lane. */
 static int g_pk_consts_needed;
 static void emit_pk_consts_load(A64Buf *b)
 {
-    /* the packed cold path builds its constants in GPRs on demand; V4-V7
-     * are not referenced anywhere -> this used to cost 16 words per
-     * callout return for nothing */
     return;
     if (!g_pk_consts_needed) return;
     a64_mov_imm64(b, JT0, 0x0008000000000000ull); a64_fmov_v_from_x(b, 1, 4, JT0); a64_v_dup_d(b, 4, 4, 0);
@@ -6088,7 +5830,6 @@ static void emit_pk_consts_load(A64Buf *b)
     a64_mov_imm64(b, JT0, 0x00400000ull);         a64_fmov_v_from_x(b, 0, 6, JT0); a64_v_dup_s(b, 6, 6, 0);
     a64_mov_imm64(b, JT0, 0xffc00000ull);         a64_fmov_v_from_x(b, 0, 7, JT0); a64_v_dup_s(b, 7, 7, 0);
 }
-/* cold packed: exact, lane by lane through a stack scratch area */
 static void emit_nan_cold_packed(A64Buf *b, int dbl, int vr, int va, int vb, int t1)
 {
     a64_sub_imm(b, 1, 31, 31, 48);
@@ -6129,15 +5870,13 @@ static void emit_nan_cold_packed(A64Buf *b, int dbl, int vr, int va, int vb, int
 static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int t1, int t2)
 {
     (void)t2;
-    /* hot: any NaN lane in vr?  fcmeq t1 = (vr==vr) -> all-ones per non-NaN lane;
-     * xtn narrows to 64 bits (no cross-lane reduce); == -1 iff no NaN. */
     a64_v_fcmeq(b, dbl, t1, vr, vr);
     a64_v_xtn(b, dbl ? 2 : 1, t1, t1);
     a64_fmov_x_from_v(b, 1, JT0, t1);
-    a64_cmn_imm(b, 1, JT0, 1);                                /* Z iff all ones */
+    a64_cmn_imm(b, 1, JT0, 1);
     if (g_n_nanool < NANOOL_MAX) {
         NanOolPend *o = &g_nanool[g_n_nanool++];
-        o->site = a64_label(b); a64_bcond(b, A64_NE, 0);      /* NaN -> out of line */
+        o->site = a64_label(b); a64_bcond(b, A64_NE, 0);
         o->back = a64_label(b);
         o->dbl = (uint8_t)dbl; o->packed = 1; o->vr = (uint8_t)vr; o->va = (uint8_t)va; o->vb = (uint8_t)vb; o->t1 = (uint8_t)t1;
         o->cvt = 0; o->refcmp = 0; o->pre = 0; o->idx = g_cur_insn_idx; o->is_cbz = 0;
@@ -6148,7 +5887,6 @@ static void emit_nan_fix_packed2(A64Buf *b, int dbl, int vr, int va, int vb, int
     a64_patch_bcond(ok, a64_label(b));
 }
 
-/* Emit all pending NaN out-of-line arms (after the block body). */
 static void emit_nan_ool_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
 {
     (void)blk; (void)entry;
@@ -6157,17 +5895,14 @@ static void emit_nan_ool_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
         uint32_t *lo = a64_label(b);
         if (o->is_cbz) a64_patch_cbz(o->site, lo); else a64_patch_bcond(o->site, lo);
         if (o->pre) {
-            /* the scalar op's NaN (a saturated conversion arrives here too: skip then) */
             a64_fcmp(b, o->dbl, o->pvr, o->pvr);
             uint32_t *sk = a64_label(b); a64_bcond(b, A64_VC, 0);
             emit_nan_cold_scalar(b, o->dbl, o->pvr, o->pva, o->pvb);
             a64_patch_bcond(sk, a64_label(b));
         }
         if (o->cvt == 1) {
-            a64_movz(b, o->vr, 0x8000, 3);                    /* INT64_MIN */
+            a64_movz(b, o->vr, 0x8000, 3);
         } else if (o->cvt == 2) {
-            /* exact recompute: the hot-path branch can be a false positive
-             * (a genuine INT32_MAX result) */
             a64_fcvtzs(b, 1, o->dbl, JT0, o->va);
             a64_cmp_ext_sxtw(b, JT0, JT0);
             a64_movz(b, JTU, 0x8000, 1);
@@ -6185,52 +5920,36 @@ static void emit_nan_ool_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
     g_n_nanool = 0;
 }
 
-/* ---- FP batches: in-place arithmetic with a single NaN check per batch ---- arm64 differs from */
 #define FPB_MAX 32
 typedef struct {
-    int first, last;          /* member insn range */
-    uint16_t ckpt;            /* regs to checkpoint (read before written) */
-    uint16_t full, s0, d0;    /* tainted regs: full 128 / lane0 float / lane0 double */
-    int gain;                 /* estimated uops saved */
-    uint32_t *site;           /* b.vs to the replay (patched later) */
-    uint32_t *back;           /* where the replay returns */
-    int8_t l0[16];            /* lane-0 cache state at the check (kept alive across it) */
+    int first, last;
+    uint16_t ckpt;
+    uint16_t full, s0, d0;
+    int gain;
+    uint32_t *site;
+    uint32_t *back;
+    int8_t l0[16];
     uint8_t l0_dbl[16];
-    int8_t fcmp_vreg;         /* the check ended in fcmp(v, v) of this vreg: the replay
-                               * re-establishes that NZCV before rejoining, because the
-                               * conversion that follows may reuse it */
-    int end;                  /* deferral: the replay re-runs [first..end]; the residual
-                               * check (full/s0/d0 after the scan) sits after `end` */
+    int8_t fcmp_vreg;
+    int end;
 } FpBatch;
 static FpBatch g_fpb[FPB_MAX];
 static int g_n_fpb;
 
-/* ---- deferred batch checks ---- A double batch's taint may ride past
- * replayable instructions (stores, register moves, unpck*pd, loads) to the
- * compares that verify it: a ucomisd/comisd raises V for a NaN in lane 0 of
- * either operand, so a b.vs after its fcmp detects for free, and lanes
- * still unverified at a superblock side exit are checked in that exit's
- * stub, off the hot path.  Every detection site has its own replay: restore
- * the checkpoint, re-run the region (branches skipped: they were already
- * decided, and NaN-ness is exact even when the payload is not), rejoin. */
 #define FPB_SITES_MAX 128
 typedef struct {
     int batch, end;
     uint32_t *site, *back;
     int8_t l0[16]; uint8_t l0_dbl[16];
-    int8_t fcmp_a, fcmp_b; uint8_t fcmp_dbl;   /* the detector's compare, redone before rejoining */
+    int8_t fcmp_a, fcmp_b; uint8_t fcmp_dbl;
 } FpbSite;
 static FpbSite g_fpb_sites[FPB_SITES_MAX];
 static int g_n_fpb_sites;
-static uint8_t g_fpb_member[JIT_MAX_BLOCK_INSNS];   /* arithmetic/move member: in place, no fixups */
-static uint8_t g_fpb_det[JIT_MAX_BLOCK_INSNS];      /* its fcmp detects for the open batch */
-static uint16_t g_fpb_sidechk[JIT_MAX_BLOCK_INSNS]; /* regs the side-exit stub of this jcc checks */
-static uint16_t g_fpb_mrd[JIT_MAX_BLOCK_INSNS], g_fpb_mwr[JIT_MAX_BLOCK_INSNS];   /* xmm reads/writes per insn */
+static uint8_t g_fpb_member[JIT_MAX_BLOCK_INSNS];
+static uint8_t g_fpb_det[JIT_MAX_BLOCK_INSNS];
+static uint16_t g_fpb_sidechk[JIT_MAX_BLOCK_INSNS];
+static uint16_t g_fpb_mrd[JIT_MAX_BLOCK_INSNS], g_fpb_mwr[JIT_MAX_BLOCK_INSNS];
 
-/* ---- mov sinking ---- `mov rD, rS` a few instructions ahead of a shift of
- * rD by an immediate (sign extraction: mov r9, r8 ... sar r9, 63) is not
- * emitted; the shift reads rS instead.  Legal when nothing in between
- * touches rD, writes rS, can fault (memory), or leaves the block. */
 static int mov_sink_gap_ok(const X86Insn *in, unsigned dreg, unsigned sreg)
 {
     switch (in->op) {
@@ -6250,21 +5969,20 @@ static int mov_sink_gap_ok(const X86Insn *in, unsigned dreg, unsigned sreg)
     case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX: case OCERZ_OP_UNPCKHPD: case OCERZ_OP_UNPCKLPD:
         break;
     default:
-        return 0;                         /* implicit registers, memory strings, control flow ... */
+        return 0;
     }
     if (in->seg != OCERZ_SEG_NONE) return 0;
     for (int k = 0; k < in->nops; k++) {
         const X86Operand *o = &in->ops[k];
         if (o->kind == OCERZ_OPK_MEM) {
-            if (in->op != OCERZ_OP_LEA) return 0;                       /* may fault */
+            if (in->op != OCERZ_OP_LEA) return 0;
             if (o->base == dreg || o->index == dreg) return 0;
             continue;
         }
         if (o->kind != OCERZ_OPK_REG) continue;
-        if ((o->reg & 15) == (dreg & 15)) return 0;                     /* any touch of rD */
-        if (k == 0 && (o->reg & 15) == (sreg & 15)) return 0;           /* rS rewritten */
+        if ((o->reg & 15) == (dreg & 15)) return 0;
+        if (k == 0 && (o->reg & 15) == (sreg & 15)) return 0;
     }
-    /* shifts by cl read rcx implicitly */
     if ((in->op == OCERZ_OP_SHL || in->op == OCERZ_OP_SHR || in->op == OCERZ_OP_SAR) &&
         in->ops[1].kind != OCERZ_OPK_IMM) return 0;
     return 1;
@@ -6282,13 +6000,13 @@ static void mov_sink_scan(const X86Insn *insns, int n, const uint64_t *fl_need)
         if ((md->size != 4 && md->size != 8) || ms->size != md->size || md->reg == ms->reg) continue;
         if (pin_slot(md->reg) < 0 || pin_slot(ms->reg) < 0) continue;
         if (rsp_is_ptr() && (md->reg == OCERZ_RSP || ms->reg == OCERZ_RSP)) continue;
-        for (int j = i + 2; j < n && j <= i + 5; j++) {       /* adjacent pairs: fuse_prev_mov */
+        for (int j = i + 2; j < n && j <= i + 5; j++) {
             const X86Insn *t = &insns[j];
             if (!mov_sink_gap_ok(&insns[j - 1], md->reg, ms->reg)) break;
             if ((t->op == OCERZ_OP_SHL || t->op == OCERZ_OP_SHR || t->op == OCERZ_OP_SAR) &&
                 t->ops[0].kind == OCERZ_OPK_REG && !t->ops[0].high8 && t->ops[0].reg == md->reg &&
                 t->ops[0].size == md->size && t->ops[1].kind == OCERZ_OPK_IMM && fl_need[j] == 0 &&
-                (t->ops[1].imm & (md->size == 8 ? 63u : 31u)) != 0) {   /* a zero count emits nothing */
+                (t->ops[1].imm & (md->size == 8 ? 63u : 31u)) != 0) {
                 g_mov_sink_at[j] = (int16_t)i;
                 g_mov_skip[i] = 1;
                 break;
@@ -6297,12 +6015,10 @@ static void mov_sink_scan(const X86Insn *insns, int n, const uint64_t *fl_need)
         }
     }
 }
-static uint8_t g_fpb_mmem[JIT_MAX_BLOCK_INSNS], g_fpb_marith[JIT_MAX_BLOCK_INSNS]; /* member reads memory / is arithmetic */
-static int g_fpb_open = -1;                          /* batch open at the emission point */
-static const int8_t *g_fpb_of;                       /* per-insn batch index of the block being emitted */
+static uint8_t g_fpb_mmem[JIT_MAX_BLOCK_INSNS], g_fpb_marith[JIT_MAX_BLOCK_INSNS];
+static int g_fpb_open = -1;
+static const int8_t *g_fpb_of;
 
-/* May two 16-byte-or-smaller memory operands overlap?  Conservative unless
- * both are rip-relative or share base, index and scale. */
 static int mem_may_alias(const X86Insn *ia, const X86Operand *a, const X86Insn *ib, const X86Operand *b)
 {
     if (a->riprel && b->riprel) {
@@ -6334,26 +6050,23 @@ static int fpb_region_class(const X86Insn *in)
     case OCERZ_OP_MOVSDX:
         if (dx && sx) return RK_LMOVE;
         if (dm && sx) return RK_STORE;
-        if (dx && sm) return RK_LOAD;          /* zero-extends: both lanes clean */
+        if (dx && sm) return RK_LOAD;
         return RK_END;
     case OCERZ_OP_MOVLPS: case OCERZ_OP_MOVHPS:
-        return dm && sx ? RK_STORE : RK_END;   /* the loads merge one lane: not modelled */
+        return dm && sx ? RK_STORE : RK_END;
     case OCERZ_OP_UNPCKHPD: return dx && sx && d->reg == sr->reg ? RK_UNPCKH : RK_END;
     case OCERZ_OP_UNPCKLPD: return dx && sx && d->reg == sr->reg ? RK_UNPCKL : RK_END;
     default: return RK_END;
     }
 }
-static int g_fpb_fast;        /* emitting a batch member: in place, no NaN fixups */
+static int g_fpb_fast;
 static int g_fpb_disabled = -1;
-/* host ranges of replay code, merged into blk->oslow for fault mapping */
 static struct JitOslowMap g_fpbmap[JIT_MAX_BLOCK_INSNS];
 static int g_n_fpbmap;
 #define FPCKPT_OFF ((uint32_t)offsetof(OcerzCPU, fp_ckpt))
 _Static_assert(offsetof(OcerzCPU, fp_ckpt) % 16 == 0 && offsetof(OcerzCPU, fp_ckpt) + 256 <= 65520,
                "fp_ckpt must be q-addressable");
 
-/* Classify an instruction for batching.  0: not a member (ends the batch).
- * 1: arithmetic (taints dst).  2: full move/load. 3: lane-0 move/load. */
 static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, int *sqrt_like)
 {
     *packed = *dbl = *from_mem = *sqrt_like = 0;
@@ -6386,7 +6099,6 @@ static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, in
     }
 }
 
-/* Pre-scan a block: fill g_fpb, return per-insn batch index in `bat` (-1 none). */
 static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
 {
     g_n_fpb = 0;
@@ -6399,11 +6111,9 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
     while (i < n) {
         int packed, dbl, from_mem, sq;
         if (!fpb_class(&insns[i], &packed, &dbl, &from_mem, &sq)) { i++; continue; }
-        /* collect the run */
         int j = i;
         uint16_t written = 0, ckpt = 0, full = 0, s0 = 0, d0 = 0;
         int gain = 0, n_arith = 0;
-        /* NaN absorption: a tainted source S consumed by a NaN-propagating arithmetic op */
         struct { uint8_t s, d, cls; int t; } edges[64]; int n_edges = 0;
         int lastw[16], lastbreak[16]; uint8_t taint_dbl[16];
         for (int r = 0; r < 16; r++) { lastw[r] = -1; lastbreak[r] = -1; taint_dbl[r] = 0; }
@@ -6420,8 +6130,6 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
                                   insns[j].op == OCERZ_OP_MAXPD || insns[j].op == OCERZ_OP_MINPD;
                 unsigned sb = 1u << sr->reg;
                 if (!is_minmax_c) {
-                    /* class 0: full taint (packed consumer of the taint's precision);
-                     * 1: s0 (single consumer, scalar or packed); 2: d0 (double consumer) */
                     if (packed && (full & sb) && taint_dbl[sr->reg] == (uint8_t)dbl) { edges[n_edges].s = (uint8_t)sr->reg; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 0; n_edges++; }
                     if (!dbl && (s0 & sb) && n_edges < 64) { edges[n_edges].s = (uint8_t)sr->reg; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 1; n_edges++; }
                     if (dbl && (d0 & sb) && n_edges < 64)  { edges[n_edges].s = (uint8_t)sr->reg; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 2; n_edges++; }
@@ -6429,28 +6137,24 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
             }
             if (c == 1) taint_dbl[dr] = (uint8_t)dbl;
             lastw[dr] = j;
-            {   /* a write that does not carry dst's previous NaN forward breaks absorption chains into dst:
-                 * moves/loads, min/max, and sqrt from another register */
+            {
                 int is_mm = insns[j].op == OCERZ_OP_MAXSS || insns[j].op == OCERZ_OP_MINSS ||
                             insns[j].op == OCERZ_OP_MAXSD || insns[j].op == OCERZ_OP_MINSD ||
                             insns[j].op == OCERZ_OP_MAXPS || insns[j].op == OCERZ_OP_MINPS ||
                             insns[j].op == OCERZ_OP_MAXPD || insns[j].op == OCERZ_OP_MINPD;
                 if (c != 1 || is_mm || (sq && !(sr->kind == OCERZ_OPK_XMM && sr->reg == dr))) lastbreak[dr] = j;
             }
-            /* reads-before-writes: sources (dst is read too for arith and lane moves) */
             uint16_t reads = (uint16_t)sbit;
             if (c == 1 || c == 3) reads |= (uint16_t)(1u << dr);
-            if (c == 3 && from_mem) reads &= (uint16_t)~(1u << dr);   /* movss/movsd load zero-extends */
+            if (c == 3 && from_mem) reads &= (uint16_t)~(1u << dr);
             ckpt |= (uint16_t)(reads & ~written);
             g_fpb_mrd[j] = reads; g_fpb_mwr[j] = (uint16_t)(1u << dr);
             g_fpb_mmem[j] = (uint8_t)from_mem; g_fpb_marith[j] = (uint8_t)(c == 1);
-            /* taint */
             uint16_t st_full = (uint16_t)(full & sbit), st_s0 = (uint16_t)(s0 & sbit), st_d0 = (uint16_t)(d0 & sbit);
             if (c == 1) {
                 if (packed) { full |= (uint16_t)(1u << dr); s0 &= (uint16_t)~(1u << dr); d0 &= (uint16_t)~(1u << dr); }
                 else if (dbl) { d0 |= (uint16_t)(1u << dr); s0 &= (uint16_t)~(1u << dr); }
                 else          { s0 |= (uint16_t)(1u << dr); d0 &= (uint16_t)~(1u << dr); }
-                /* min/max/sqrt are exact anyway; only add/sub/mul/div profit */
                 int is_minmax = insns[j].op == OCERZ_OP_MAXSS || insns[j].op == OCERZ_OP_MINSS ||
                                 insns[j].op == OCERZ_OP_MAXSD || insns[j].op == OCERZ_OP_MINSD ||
                                 insns[j].op == OCERZ_OP_MAXPS || insns[j].op == OCERZ_OP_MINPS ||
@@ -6463,10 +6167,9 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
                     s0   = (uint16_t)((s0   & ~(1u << dr)) | (st_s0   ? (1u << dr) : 0));
                     d0   = (uint16_t)((d0   & ~(1u << dr)) | (st_d0   ? (1u << dr) : 0));
                 }
-            } else { /* c == 3: lane-0 move */
+            } else {
                 if (from_mem) { full &= (uint16_t)~(1u << dr); s0 &= (uint16_t)~(1u << dr); d0 &= (uint16_t)~(1u << dr); }
                 else {
-                    /* dst keeps its upper-lane taint; lane 0 gets the source's */
                     if (st_full) full |= (uint16_t)(1u << dr);
                     if (dbl) { if (st_d0 || st_full) d0 |= (uint16_t)(1u << dr); s0 &= (uint16_t)~(1u << dr); }
                     else     { if (st_s0 || st_full) s0 |= (uint16_t)(1u << dr); d0 &= (uint16_t)~(1u << dr); }
@@ -6475,22 +6178,20 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
             written |= (uint16_t)(1u << dr);
             j++;
         }
-        /* trim trailing non-arith members (they add nothing) */
         int last = j - 1;
         while (last >= i) {
             int c = fpb_class(&insns[last], &packed, &dbl, &from_mem, &sq);
             if (c == 1) break;
             last--;
         }
-        uint16_t ckpt_raw = ckpt;       /* reads-before-writes so far (the deferral scan continues it) */
-        ckpt &= written;                /* only registers the run overwrites need saving */
-        /* absorption: drop S from the check set when its consumer D still holds the consuming op's */
+        uint16_t ckpt_raw = ckpt;
+        ckpt &= written;
         { static int noabs = -1; if (noabs < 0) noabs = getenv("OCERZ_NO_FPB_ABSORB") ? 1 : 0;
           if (!noabs) for (int e = 0; e < n_edges; e++) {
             int S = edges[e].s, D = edges[e].d, t = edges[e].t;
             if (t > last) continue;
-            if (lastbreak[D] > t) continue;                 /* D's chain broken by a later move/min/max */
-            if (lastw[S] > t) continue;                     /* S rewritten later: a new value, its own coverage */
+            if (lastbreak[D] > t) continue;
+            if (lastw[S] > t) continue;
             if (edges[e].cls == 0) full &= (uint16_t)~(1u << S);
             else if (edges[e].cls == 1) s0 &= (uint16_t)~(1u << S);
             else d0 &= (uint16_t)~(1u << S);
@@ -6504,7 +6205,6 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
             fb->site = NULL; fb->back = NULL;
             fb->end = last;
             for (int k = i; k <= last; k++) { bat[k] = (int8_t)g_n_fpb; g_fpb_member[k] = 1; }
-            /* ---- deferral (double taint only; see g_fpb_sites) ---- */
             int dbl_only = s0 == 0;
             for (int r = 0; r < 16 && dbl_only; r++)
                 if ((full & (1u << r)) && !taint_dbl[r]) dbl_only = 0;
@@ -6524,8 +6224,6 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
                     int rk = fpb_region_class(in);
                     uint16_t m = 0;
                     if (rk == RK_END) {
-                        /* the superblock side exit that reads a detector's flags:
-                         * its stub checks the lanes still unverified there */
                         if (in->op != OCERZ_OP_JCC || jj != det_jcc) break;
                         for (int r = 0; r < 16; r++) if (vid[r][0] || vid[r][1]) m |= (uint16_t)(1u << r);
                         g_fpb_sidechk[jj] = m;
@@ -6539,11 +6237,6 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
                     unsigned sr = in->ops[1].kind == OCERZ_OPK_XMM ? in->ops[1].reg : 16;
                     uint16_t reads = 0, writes = 0;
                     if (rk == RK_STORE) {
-                        /* the replay re-runs the region: a store over memory a
-                         * batch load read must not be re-loaded.  A leading load
-                         * leaves the batch (its register is checkpointed at the
-                         * first arithmetic member instead); an arithmetic member
-                         * reading that memory ends the region before the store. */
                         int fa = -1, conflict = 0, shift = 0;
                         for (int k = fb->first; k <= last; k++) if (g_fpb_marith[k]) { fa = k; break; }
                         for (int k = fb->first; k <= last; k++)
@@ -6558,10 +6251,6 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
                         }
                     }
                     if (rk == RK_DET) {
-                        /* who reads its flags: a fusable forward jcc past replayable
-                         * gap insns (a side exit) emits the compare itself - the
-                         * side exit joins the region; anything else means the
-                         * ucomisd emits its own compare (g_fpb_det == 2) */
                         int k = jj + 1;
                         while (k < n) {
                             int rk2 = fpb_region_class(&insns[k]);
@@ -6602,9 +6291,9 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
                     fb->ckpt = (uint16_t)(rck & rwr);
                     uint16_t m = 0;
                     for (int r = 0; r < 16; r++) if (vid[r][0] || vid[r][1]) m |= (uint16_t)(1u << r);
-                    fb->full = left ? m : 0; fb->s0 = 0; fb->d0 = 0;   /* residual, checked after `end` */
+                    fb->full = left ? m : 0; fb->s0 = 0; fb->d0 = 0;
                     for (int k = last + 1; k <= fb->end; k++) bat[k] = (int8_t)g_n_fpb;
-                    for (int k = i; k < fb->first; k++) { bat[k] = -1; g_fpb_member[k] = 0; }   /* loads left out */
+                    for (int k = i; k < fb->first; k++) { bat[k] = -1; g_fpb_member[k] = 0; }
                 }
             }
             g_n_fpb++;
@@ -6614,8 +6303,6 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
     }
 }
 
-/* OCERZ_UNSAFE_NOCHECKBR: measurement aid only - emit every NaN/overflow
- * check but not its branch, to price the branches apart from the compares. */
 static int unsafe_nocheckbr(void)
 {
     static int en = -1;
@@ -6623,13 +6310,12 @@ static int unsafe_nocheckbr(void)
     return en;
 }
 
-/* Batch end: merge the tainted registers, one fcmp per class, b.vs -> replay. */
 static void fpb_emit_check(A64Buf *b, FpBatch *fb)
 {
     int have_f = 0, have_d = 0;
     fb->fcmp_vreg = -1;
-    g_fcmp_self_idx = -1;                 /* the merge below rewrites NZCV */
-    if (!(fb->full | fb->s0 | fb->d0)) { fb->site = NULL; fb->back = NULL; return; }   /* all verified by detectors */
+    g_fcmp_self_idx = -1;
+    if (!(fb->full | fb->s0 | fb->d0)) { fb->site = NULL; fb->back = NULL; return; }
     if (fb->full) {
         int first = -1, acc = -1;
         for (int r = 0; r < 16; r++) if (fb->full & (1u << r)) {
@@ -6638,7 +6324,7 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
             else if (acc < 0) { a64_v_fmax(b, 0, VX0, first, v); acc = VX0; }
             else a64_v_fmax(b, 0, VX0, VX0, v);
         }
-        a64_fmaxv_4s(b, VX1, acc >= 0 ? acc : first);   /* s1 = max over all lanes (NaN if any) */
+        a64_fmaxv_4s(b, VX1, acc >= 0 ? acc : first);
         have_f = 1;
     }
     if (fb->s0) {
@@ -6664,19 +6350,16 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
         fb->fcmp_vreg = (int8_t)cur;
         have_d = 1;
     }
-    /* one branch: with both classes, fold the double verdict into a flag-preserving path */
     if (have_d && have_f) {
         uint32_t *dnan = a64_label(b); a64_bcond(b, A64_VS, 0);
         a64_fcmp(b, 0, VX1, VX1);
         fb->site = a64_label(b); a64_bcond(b, A64_VS, 0);
-        /* the double-NaN branch needs the same target: patch to a tiny trampoline */
         uint32_t *skip = a64_label(b); a64_b(b, 0);
         a64_patch_bcond(dnan, a64_label(b));
-        uint32_t *tramp = a64_label(b); a64_b(b, 0);      /* -> replay (patched with site) */
+        uint32_t *tramp = a64_label(b); a64_b(b, 0);
         a64_patch_b(skip, a64_label(b));
         fb->back = a64_label(b);
-        /* remember the trampoline as a second site via the high bit trick: store in gain (unused after) */
-        fb->gain = (int)(tramp - fb->site);              /* offset from site to trampoline */
+        fb->gain = (int)(tramp - fb->site);
     } else if (have_d) {
         if (unsafe_nocheckbr()) fb->site = NULL;
         else { fb->site = a64_label(b); a64_bcond(b, A64_VS, 0); }
@@ -6691,17 +6374,14 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
     }
 }
 
-/* ---- lane-0 caches for scalar FP chains ---- A scalar op must merge its result into lane 0 of */
-static int8_t g_l0[16];           /* temp vreg holding lane 0 of xmmN, or -1 */
-static uint8_t g_l0_dbl[16];      /* 1: 64-bit lane cached, 0: 32-bit */
-static uint16_t g_l0_owners[8];   /* per temp (index vreg-4): xmm regs sharing it */
+static int8_t g_l0[16];
+static uint8_t g_l0_dbl[16];
+static uint16_t g_l0_owners[8];
 static unsigned g_l0_next;
 
-/* A detection site for the open batch: b.vs to its replay, which re-runs
- * [first..end] and redoes the compare (va, vb) before rejoining. */
 static void fpb_site_emit(A64Buf *b, int end, int va, int vb, int dbl)
 {
-    if (g_n_fpb_sites >= FPB_SITES_MAX) return;   /* the scanner reserved room: cannot happen */
+    if (g_n_fpb_sites >= FPB_SITES_MAX) return;
     FpbSite *st = &g_fpb_sites[g_n_fpb_sites++];
     st->batch = g_fpb_open; st->end = end;
     st->site = a64_label(b); a64_bcond(b, A64_VS, 0);
@@ -6709,13 +6389,10 @@ static void fpb_site_emit(A64Buf *b, int end, int va, int vb, int dbl)
     for (int r = 0; r < 16; r++) { st->l0[r] = g_l0[r]; st->l0_dbl[r] = g_l0_dbl[r]; }
     st->fcmp_a = (int8_t)va; st->fcmp_b = (int8_t)vb; st->fcmp_dbl = (uint8_t)dbl;
 }
-/* Is insn `idx` (a ucomisd/comisd) a detector of the open batch? */
 static int fpb_det_here(int idx)
 {
     return g_fpb_open >= 0 && g_fpb_of && idx >= 0 && g_fpb_det[idx] && g_fpb_of[idx] == g_fpb_open;
 }
-/* A side-exit stub's check of the lanes a batch has not verified yet: merge
- * the registers, one fmaxv + fcmp, b.vs to a replay that rejoins here. */
 static void fpb_emit_regs_check(A64Buf *b, uint16_t regs, int batch, int end, const int8_t *l0, const uint8_t *l0_dbl)
 {
     if (!regs || g_n_fpb_sites >= FPB_SITES_MAX) return;
@@ -6741,7 +6418,7 @@ static int l0_enabled(void)
     if (en < 0) en = (getenv("OCERZ_NO_L0CACHE") || mem_guard_needed()) ? 0 : 1;
     return en;
 }
-static uint16_t g_l0_dirty;   /* arch low lane stale; live value in the reg's l0 scratch */
+static uint16_t g_l0_dirty;
 static void l0_reset(void)
 {
     for (int i = 0; i < 16; i++) g_l0[i] = -1;
@@ -6772,7 +6449,7 @@ static void l0_flush_all(A64Buf *b)
 static int l0_defer_take(int vs, unsigned xr, int size)
 {
     if (g_xlat_mode32)
-        return 0;   /* the i386 tier keeps write-through; its paths are not audited */
+        return 0;
     if (!(l0_defer() && l0_enabled() && vs >= 4 && vs <= 7 &&
           g_l0[xr] == vs && g_l0_dbl[xr] == (uint8_t)(size == 8)))
         return 0;
@@ -6782,12 +6459,8 @@ static int l0_defer_take(int vs, unsigned xr, int size)
 static void l0_inval(unsigned r)
 {
     if (r < 16 && g_l0[r] >= 0) { g_l0_owners[g_l0[r] - 4] &= (uint16_t)~(1u << r); g_l0[r] = -1; }
-    g_l0_dirty &= (uint16_t)~(1u << r);   /* full overwrite: the stale lane is dead */
+    g_l0_dirty &= (uint16_t)~(1u << r);
 }
-/* Fixed-lane mode for self-looping blocks: four regs own the four scratches
- * for the whole body, a preamble establishes them once per cold entry, and
- * the back edge re-enters past it - so loop-carried scalar chains stay in
- * the scratches instead of round-tripping through the architectural regs. */
 static int g_l0_fixed;
 static int8_t g_l0_fixed_lane[16];
 static uint8_t g_l0_fixed_dbl[16];
@@ -6795,8 +6468,7 @@ static int l0_alloc2(A64Buf *b, unsigned r, int dbl)
 {
     if (g_l0_fixed) {
         if (g_l0_fixed_lane[r] < 0) {
-            l0_inval(r);               /* the caller writes the arch reg: a stale
-                                        * shared mapping must not outlive that */
+            l0_inval(r);
             return -1;
         }
         int t = g_l0_fixed_lane[r];
@@ -6810,7 +6482,7 @@ static int l0_alloc2(A64Buf *b, unsigned r, int dbl)
         g_l0[r] = (int8_t)t; g_l0_dbl[r] = (uint8_t)dbl;
         return t;
     }
-    l0_inval(r);                       /* drop r from its previous temp's owner set */
+    l0_inval(r);
     int t = 4 + (int)(g_l0_next++ & 3u);
     uint16_t own = g_l0_owners[t - 4];
     for (int i = 0; i < 16; i++) if (own & (1u << i)) {
@@ -6823,10 +6495,10 @@ static int l0_alloc2(A64Buf *b, unsigned r, int dbl)
     return t;
 }
 #define l0_alloc(r, dbl) l0_alloc2(b, r, dbl)
-static int l0_src2(A64Buf *b, unsigned r, int dbl)   /* vreg to read lane 0 of xmm r from */
+static int l0_src2(A64Buf *b, unsigned r, int dbl)
 {
     if (l0_enabled() && g_l0[r] >= 0 && g_l0_dbl[r] == (uint8_t)dbl) return g_l0[r];
-    l0_flush_reg(b, r);          /* falling back to the architectural register */
+    l0_flush_reg(b, r);
     return xmm_vreg(r);
 }
 static void l0_share(unsigned dst, unsigned src)
@@ -6839,20 +6511,15 @@ static void l0_share(unsigned dst, unsigned src)
             g_l0_dirty |= (uint16_t)(1u << dst);
     }
 }
-/* Pick up to four scalar-hot pinned xmm regs for fixed lanes and emit the
- * cold-entry preamble (scratch := arch, both precisions valid). */
 static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, int *sqrt_like);
 static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
 {
     int cnt[16] = {0}; int8_t firstdbl[16]; uint8_t wfirst[16];
     memset(firstdbl, -1, sizeof firstdbl);
-    memset(wfirst, 0, sizeof wfirst);      /* 1: read seen first, 2: full write first */
+    memset(wfirst, 0, sizeof wfirst);
     for (int i = 0; i < n; i++) {
         int packed, dbl, from_mem, sq;
         int c = fpb_class(&insns[i], &packed, &dbl, &from_mem, &sq);
-        /* first-touch classification: a reg whose block life starts with a
-         * full overwrite (load, reg copy, self-xor zeroing) carries nothing
-         * across the back edge and would waste a fixed lane */
         if (insns[i].nops >= 1 && insns[i].ops[0].kind == OCERZ_OPK_XMM) {
             unsigned dr = insns[i].ops[0].reg;
             if (!wfirst[dr]) {
@@ -6901,13 +6568,8 @@ static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
     return 1;
 }
 
-/* Re-establish the preamble contract before the back edge: flush, then
- * re-copy any drifted lane and reset the maps.  Usually emits nothing. */
 static void l0_fixed_restore(A64Buf *b)
 {
-    /* OCERZ_UNSAFE_NOFLUSH: measurement aid only - skips the pre-back-edge
-     * flush, leaving arch regs stale across iterations (exits/faults see
-     * wrong xmm state).  Never enable outside benchmarking. */
     static int noflush = -1;
     if (noflush < 0) noflush = getenv("OCERZ_UNSAFE_NOFLUSH") ? 1 : 0;
     if (noflush) { g_l0_dirty = 0; return; }
@@ -6929,20 +6591,13 @@ static void l0_fixed_restore(A64Buf *b)
     }
 }
 
-/* every self back edge re-enters past the preamble, so the contract must
- * hold whenever one is emitted, no matter which emitter produced it */
 static void l0_fixed_backedge(A64Buf *b)
 {
     if (g_l0_fixed)
         l0_fixed_restore(b);
 }
 
-/* instructions whose emitters keep the caches consistent themselves */
-/* cmpsd/cmpss into xmm0 immediately followed by blendvpd/blendvps: the
- * compare's mask can stay in VX2 and the blend can work in lane scratches,
- * which keeps two merges off a loop-carried scalar chain.  Both emitters
- * consult this so they agree. */
-static int g_cmps_mask_idx = -1;      /* insn index whose lane-0 mask is live in VX2 */
+static int g_cmps_mask_idx = -1;
 static int cmps_blendv_fusable(int cmps_idx)
 {
     if (!g_cur_insns || cmps_idx < 0 || cmps_idx + 1 >= g_cur_insns_n) return 0;
@@ -6961,7 +6616,7 @@ static int l0_aware_op(unsigned op)
 {
     switch (op) {
     case OCERZ_OP_BLENDVPD: case OCERZ_OP_BLENDVPS:
-    case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX:     /* read lanes through l0_src, write xmm0 explicitly */
+    case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX:
     case OCERZ_OP_ADDSS: case OCERZ_OP_ADDSD: case OCERZ_OP_SUBSS: case OCERZ_OP_SUBSD:
     case OCERZ_OP_MULSS: case OCERZ_OP_MULSD: case OCERZ_OP_DIVSS: case OCERZ_OP_DIVSD:
     case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_MINSS: case OCERZ_OP_MINSD:
@@ -6975,12 +6630,11 @@ static int l0_aware_op(unsigned op)
     }
 }
 
-/* ---- scalar / packed FP arithmetic ---- */
 static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_XMM) return 0;
-    int dbl = 0, packed = 0, kind = 0;   /* kind: 0 add 1 sub 2 mul 3 div 4 max 5 min 6 sqrt */
+    int dbl = 0, packed = 0, kind = 0;
     switch (insn->op) {
     case OCERZ_OP_ADDSS: kind=0; break;  case OCERZ_OP_ADDSD: kind=0; dbl=1; break;
     case OCERZ_OP_ADDPS: kind=0; packed=1; break; case OCERZ_OP_ADDPD: kind=0; dbl=1; packed=1; break;
@@ -6999,12 +6653,9 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     default: return 0;
     }
     int esz = dbl ? 8 : 4;
-    static int inexact_env = -1;               /* OCERZ_INEXACT_NAN=1: arm64 NaN semantics, no fixups */
+    static int inexact_env = -1;
     if (inexact_env < 0) inexact_env = getenv("OCERZ_INEXACT_NAN") ? 1 : 0;
-    int inexact_nan = inexact_env || g_fpb_fast; /* batch member: checked once at batch end */
-    /* Operand registers: pinned xmm operands are used in place (no copies);
-     * memory / unpinned sources go through VX1; the dst value through VX0.
-     * Result -> VX2, then written back (needed: the fix reads the inputs). */
+    int inexact_nan = inexact_env || g_fpb_fast;
     int vb;
     int dst_pinned = xmm_is_pinned(d->reg);
     if (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) vb = packed ? xmm_vreg(s->reg) : l0_src(s->reg, dbl);
@@ -7015,7 +6666,6 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
         l0_inval(d->reg);
     }
     if (kind == 6) {
-        /* sqrt: single input (b).  x86: NaN input -> quiet(b) ; negative -> default NaN */
         if (inexact_nan) {
             if (packed) { int vd = xmm_dst_reg(d->reg, VX2); a64_v_fsqrt(b, dbl, vd, vb); if (vd == VX2) emit_xmm_st(b, VX2, d->reg); }
             else {
@@ -7032,8 +6682,6 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
         } else {
             int t = dst_pinned && l0_enabled() ? l0_alloc(d->reg, dbl) : VX2;
             if (t < 0) t = VX2;
-            /* in place on its own input: the exact NaN arm must still see the
-             * operand, so keep a copy (off the chain - the sqrt does not wait) */
             int fb = vb;
             if (t == vb) {
                 if (dbl) a64_fmov_d_d(b, VX3, vb); else a64_fmov_s_s(b, VX3, vb);
@@ -7050,15 +6698,13 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     if (dst_pinned) va = packed ? xmm_vreg(d->reg) : l0_src(d->reg, dbl);
     else { emit_xmm_ld(b, VX0, d->reg); va = VX0; }
     if (kind == 4 || kind == 5) {
-        /* x86 max: a > b ? a : b ; min: a < b ? a : b -- NaN (unordered) and
-         * equal zeros both select b.  Exactly a compare-false-on-NaN + select. */
         if (packed) {
-            if (kind == 4) a64_v_fcmgt(b, dbl, VX2, va, vb);   /* a > b */
-            else           a64_v_fcmgt(b, dbl, VX2, vb, va);   /* b > a  <=> a < b */
+            if (kind == 4) a64_v_fcmgt(b, dbl, VX2, va, vb);
+            else           a64_v_fcmgt(b, dbl, VX2, vb, va);
             if (va == xmm_vreg(d->reg) && xmm_is_pinned(d->reg)) {
-                a64_v_bif(b, va, vb, VX2);                     /* a = mask ? a : b (in place) */
+                a64_v_bif(b, va, vb, VX2);
             } else {
-                a64_v_bsl(b, VX2, va, vb);                     /* VX2 = mask ? a : b */
+                a64_v_bsl(b, VX2, va, vb);
                 emit_xmm_st(b, VX2, d->reg);
             }
         } else {
@@ -7101,11 +6747,6 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     } else {
         int t = dst_pinned && l0_enabled() ? l0_alloc(d->reg, dbl) : VX2;
             if (t < 0) t = VX2;
-        /* A lane scratch makes the op run in place on its own input.  The
-         * exact NaN arm decides between "propagated" and "generated" by
-         * looking at the inputs, so the one the result overwrites must be
-         * kept: an off-chain copy the arithmetic does not wait for.  Without
-         * it a generated NaN kept arm64's sign (found by fp_loop_nan). */
         int fa = va, fb = vb;
         if (t == va || t == vb) {
             int alias = t == va ? va : vb;
@@ -7121,12 +6762,11 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
         }
         g_scalar_merge_next = t != VX2 && scalar_cvt_follows(d->reg, dbl);
         emit_nan_fix_scalar2(b, dbl, t, fa, fb);
-        emit_xmm_st_lo(b, esz, t, d->reg);   /* only low lane written */
+        emit_xmm_st_lo(b, esz, t, d->reg);
     }
     return 1;
 }
 
-/* ---- bitwise 128-bit: pxor/pand/pandn/por/xorps/andps/andnps/orps + padd/psub ---- */
 static int emit_sse_bitwise(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -7136,7 +6776,7 @@ static int emit_sse_bitwise(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     case OCERZ_OP_PXOR: case OCERZ_OP_XORPS: kind = 0; break;
     case OCERZ_OP_PAND: case OCERZ_OP_ANDPS: kind = 1; break;
     case OCERZ_OP_POR:  case OCERZ_OP_ORPS:  kind = 2; break;
-    case OCERZ_OP_PANDN: case OCERZ_OP_ANDNPS: kind = 3; break;   /* d = ~d & s */
+    case OCERZ_OP_PANDN: case OCERZ_OP_ANDNPS: kind = 3; break;
     case OCERZ_OP_PADDB: kind = 4; esz = 0; break; case OCERZ_OP_PADDW: kind = 4; esz = 1; break;
     case OCERZ_OP_PADDD: kind = 4; esz = 2; break; case OCERZ_OP_PADDQ: kind = 4; esz = 3; break;
     case OCERZ_OP_PSUBB: kind = 5; esz = 0; break; case OCERZ_OP_PSUBW: kind = 5; esz = 1; break;
@@ -7146,7 +6786,6 @@ static int emit_sse_bitwise(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     case OCERZ_OP_PCMPGTD: kind = 7; esz = 2; break;
     default: return 0;
     }
-    /* pxor x,x -> zero (very common idiom) */
     if (kind == 0 && s->kind == OCERZ_OPK_XMM && s->reg == d->reg) {
         int vd = xmm_dst_reg(d->reg, VX0);
         a64_v_zero(b, vd);
@@ -7161,7 +6800,7 @@ static int emit_sse_bitwise(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     case 0: a64_v_eor(b, vd, vd, vb); break;
     case 1: a64_v_and(b, vd, vd, vb); break;
     case 2: a64_v_orr(b, vd, vd, vb); break;
-    case 3: a64_v_bic(b, vd, vb, vd); break;    /* s & ~d */
+    case 3: a64_v_bic(b, vd, vb, vd); break;
     case 4: a64_v_add(b, esz, vd, vd, vb); break;
     case 5: a64_v_sub(b, esz, vd, vd, vb); break;
     case 6: a64_v_cmeq(b, esz, vd, vd, vb); break;
@@ -7171,27 +6810,20 @@ static int emit_sse_bitwise(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     return 1;
 }
 
-/* ---- ucomis[sd]/comis[sd]: ZF,PF,CF from compare; OF,SF,AF cleared ---- */
 static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_XMM) return 0;
     int dbl = insn->op == OCERZ_OP_UCOMISD || insn->op == OCERZ_OP_COMISD;
     int esz = dbl ? 8 : 4;
-    /* flags dead (every consumer re-derives them from fcmp via the comis
-     * fusion, or nothing reads them): a register-register compare has no
-     * other effect -> emit nothing at all */
     if (g_cur_need == 0 && s->kind == OCERZ_OPK_XMM) {
         if (fpb_det_here(g_cur_insn_idx) && g_fpb_det[g_cur_insn_idx] == 2) {
-            /* nobody fuses this compare, but it detects for the open batch */
             int vb = l0_src(s->reg, dbl), va = l0_src(d->reg, dbl);
             a64_fcmp(b, dbl, va, vb);
             fpb_site_emit(b, g_cur_insn_idx, va, vb, dbl);
         }
         return 1;
     }
-    /* comis overwrites every arithmetic flag: a pending deferred record is
-     * dead -- drop it instead of materializing it. */
     if (g_defer)
         a64_str(b, 4, A64_ZR, 20, CC_OP_OFF);
     int vb = (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) ? l0_src(s->reg, dbl)
@@ -7199,24 +6831,22 @@ static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (vb < 0) return 0;
     int va = xmm_is_pinned(d->reg) ? l0_src(d->reg, dbl) : VX0;
     if (va == VX0) emit_xmm_ld_lo(b, esz, VX0, d->reg);
-    a64_fcmp(b, dbl, va, vb);              /* scalar fcmp reads the low lane only */
+    a64_fcmp(b, dbl, va, vb);
     if (fpb_det_here(g_cur_insn_idx)) fpb_site_emit(b, g_cur_insn_idx, va, vb, dbl);
-    /* arm64 after fcmp: unordered -> N=0,Z=0,C=1,V=1 ; a<b -> N=1 ; a==b -> Z=1,C=1 ; a>b -> C=1 */
     a64_ldr(b, 8, JTT, 20, RF_OFF);
-    a64_cset(b, JT0, A64_LT);            /* CF: a<b or unordered */
-    a64_cset(b, JT1, A64_VS);            /* PF: unordered */
-    a64_bfi(b, 1, JTT, JT0, 0, 1);       /* CF bit 0 */
-    a64_bfi(b, 1, JTT, JT1, 2, 1);       /* PF bit 2 */
+    a64_cset(b, JT0, A64_LT);
+    a64_cset(b, JT1, A64_VS);
+    a64_bfi(b, 1, JTT, JT0, 0, 1);
+    a64_bfi(b, 1, JTT, JT1, 2, 1);
     a64_cset(b, JT0, A64_EQ);
-    a64_orr_reg(b, 1, JT0, JT0, JT1, 0); /* ZF: equal or unordered */
-    a64_bfi(b, 1, JTT, JT0, 6, 1);       /* ZF bit 6 */
+    a64_orr_reg(b, 1, JT0, JT0, JT1, 0);
+    a64_bfi(b, 1, JTT, JT0, 6, 1);
     a64_mov_imm64(b, JTU, ~(uint64_t)(OCERZ_SF | OCERZ_OF | OCERZ_AF));
-    a64_and_reg(b, 1, JTT, JTT, JTU, 0); /* SF/OF/AF cleared */
+    a64_and_reg(b, 1, JTT, JTT, JTU, 0);
     a64_str(b, 8, JTT, 20, RF_OFF);
     return 1;
 }
 
-/* ---- conversions ---- */
 static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -7228,24 +6858,17 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         int vs = (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) ? l0_src(s->reg, dbl)
                : emit_sse_src_reg(b, insn, s, dbl ? 8 : 4, VX0, exit_sites, n_exits);
         if (vs < 0) return 0;
-        /* x86: NaN or out-of-range -> "integer indefinite" (INT_MIN); arm64 fcvtzs saturates (NaN -> 0). */
         int ds = pin_slot(d->reg);
         int rd = ds >= 0 ? pin_hreg(ds) : JT0;
         int reuse = dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs;
         int pend = g_scpend.valid && g_scpend.idx == g_cur_insn_idx - 1;
         if (pend && (!reuse || g_n_nanool + 1 > NANOOL_MAX || unsafe_nocheckbr())) {
-            scalar_pend_flush(b);            /* the merge is off: the op gets its own branch */
+            scalar_pend_flush(b);
             pend = 0;
             reuse = dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs;
         }
         if (g_n_nanool + 1 <= NANOOL_MAX) {
-            /* rare cases out of line behind one branch: fcmp raises V for
-             * NaN, and the conditional compare runs only when it did not,
-             * raising V for the saturated INT_MAX (32: a genuine INT32_MAX
-             * is a false positive the arm recomputes exactly) */
             a64_fcvtzs(b, d->size == 8, dbl, rd, vs);
-            /* the batch check that just closed compared this very lane with
-             * itself and nothing since has written NZCV: reuse its V */
             if (!reuse)
                 a64_fcmp(b, dbl, vs, vs);
             g_fcmp_self_idx = -1;
@@ -7263,16 +6886,16 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
             }
         } else if (d->size == 8) {
             a64_fcvtzs(b, 1, dbl, rd, vs);
-            a64_cmn_imm(b, 1, rd, 1);                          /* V <=> rd == INT64_MAX */
-            a64_movz(b, JTU, 0x8000, 3);                       /* INT64_MIN */
+            a64_cmn_imm(b, 1, rd, 1);
+            a64_movz(b, JTU, 0x8000, 3);
             a64_csel(b, 1, rd, JTU, rd, A64_VS);
-            a64_fcmp(b, dbl, vs, vs);                          /* VS <=> NaN */
+            a64_fcmp(b, dbl, vs, vs);
             a64_csel(b, 1, rd, JTU, rd, A64_VS);
         } else {
             a64_fcvtzs(b, 1, dbl, JT0, vs);
-            a64_cmp_ext_sxtw(b, JT0, JT0);                     /* Z <=> fits int32 */
-            a64_movz(b, JTU, 0x8000, 1);                       /* INT32_MIN (w) */
-            a64_csel(b, 0, rd, JTU, JT0, A64_NE);              /* wD zero-extends */
+            a64_cmp_ext_sxtw(b, JT0, JT0);
+            a64_movz(b, JTU, 0x8000, 1);
+            a64_csel(b, 0, rd, JTU, JT0, A64_NE);
             a64_fcmp(b, dbl, vs, vs);
             a64_csel(b, 0, rd, JTU, rd, A64_VS);
         }
@@ -7299,7 +6922,7 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
             int t = xmm_is_pinned(d->reg) && l0_enabled() ? l0_alloc(d->reg, dbl) : VX0;
             if (t < 0) t = VX0;
             a64_scvtf(b, sf, dbl, t, JT0);
-            emit_xmm_st_lo(b, dbl ? 8 : 4, t, d->reg);   /* upper lanes preserved */
+            emit_xmm_st_lo(b, dbl ? 8 : 4, t, d->reg);
         }
         return 1;
     }
@@ -7328,7 +6951,6 @@ static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
     }
 }
 
-/* ---- movd/movq between gpr/mem and xmm ---- */
 static int emit_sse_pinsr_pextr(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
 static int emit_sse_pshufb(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
 static int emit_sse_punpck(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
@@ -7340,7 +6962,7 @@ static int emit_sse_movd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_REG) {
         if (s->high8 || (s->size != 4 && s->size != 8)) return 0;
         emit_gpr_rd(b, s->size == 8, JT0, s->reg);
-        a64_fmov_v_from_x(b, s->size == 8, VX0, JT0);   /* zero-extends to 128 */
+        a64_fmov_v_from_x(b, s->size == 8, VX0, JT0);
         emit_xmm_st(b, VX0, d->reg);
         return 1;
     }
@@ -7372,7 +6994,6 @@ static int emit_sse_movd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     return 0;
 }
 
-/* ---- movq: 64-bit moves between xmm, GPR and memory (xmm destinations zero the upper half) ---- */
 static int emit_sse_movq(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -7381,7 +7002,7 @@ static int emit_sse_movq(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         if (!xmm_is_pinned(d->reg) || !xmm_is_pinned(s->reg)) return 0;
         l0_flush_reg(b, s->reg);
         l0_inval(d->reg);
-        a64_fmov_d_d(b, xmm_vreg(d->reg), xmm_vreg(s->reg));           /* zeroes the upper half */
+        a64_fmov_d_d(b, xmm_vreg(d->reg), xmm_vreg(s->reg));
         return 1;
     }
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_REG) {
@@ -7401,7 +7022,7 @@ static int emit_sse_movq(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         if (!xmm_is_pinned(d->reg)) return 0;
         l0_inval(d->reg);
         int vd = xmm_vreg(d->reg);
-        if (emit_plain_mem_fast(b, insn, s, 8, vd, 0, 1)) return 1;    /* ldr d: upper zeroed */
+        if (emit_plain_mem_fast(b, insn, s, 8, vd, 0, 1)) return 1;
         uint32_t *skip;
         if (!emit_sse_mem_addr(b, insn, s, 8, exit_sites, n_exits, &skip)) return 0;
         emit_sse_mem_ld(b, 8, vd);
@@ -7422,8 +7043,6 @@ static int emit_sse_movq(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     return 0;
 }
 
-/* ---- pshufd xmm, xmm/m128, imm8: dword permutation (dup/ext for the common
- * patterns, tbl with a literal-pool index vector otherwise) ---- */
 static int emit_sse_pshufd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (insn->nops != 3 || !sse_enabled()) return 0;
@@ -7443,7 +7062,6 @@ static int emit_sse_pshufd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     if (sel[0] == 0 && sel[1] == 1 && sel[2] == 2 && sel[3] == 3) { if (vd != vs) a64_v_mov(b, vd, vs); return 1; }
     if (sel[0] == 1 && sel[1] == 0 && sel[2] == 3 && sel[3] == 2) { a64_v_rev64_4s(b, vd, vs); return 1; }
     if (sel[0] == 3 && sel[1] == 2 && sel[2] == 1 && sel[3] == 0) { a64_v_rev64_4s(b, VX0, vs); a64_v_ext(b, vd, VX0, VX0, 8); return 1; }
-    /* general: byte-index table from the literal pool */
     if (g_n_raslit >= RASLIT_MAX) return 0;
     uint64_t lo = 0, hi = 0;
     for (int i = 0; i < 4; i++)
@@ -7458,12 +7076,11 @@ static int emit_sse_pshufd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     g_raslit[g_n_raslit].kind = 2;
     g_raslit[g_n_raslit].rt = VX0;
     g_n_raslit++;
-    a64_emit32(b, 0x9c000000u | (uint32_t)VX0);           /* ldr q VX0, <lit> (patched) */
+    a64_emit32(b, 0x9c000000u | (uint32_t)VX0);
     a64_v_tbl1(b, vd, vs, VX0);
     return 1;
 }
 
-/* ---- pshufb xmm, xmm/m128: tbl with the control bytes masked to 0x8f (bit 7 -> out of range -> 0) ---- */
 static int emit_sse_pshufb(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (insn->nops != 2 || !sse_enabled()) return 0;
@@ -7474,12 +7091,11 @@ static int emit_sse_pshufb(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     l0_flush_reg(b, d->reg);
     l0_inval(d->reg);
     int vd = xmm_vreg(d->reg);
-    a64_emit32(b, 0x4f04e5e0u | (uint32_t)VX0);          /* movi VX0.16b, #0x8f */
+    a64_emit32(b, 0x4f04e5e0u | (uint32_t)VX0);
     a64_v_and(b, VX0, vb, VX0);
     a64_v_tbl1(b, vd, vd, VX0);
     return 1;
 }
-/* ---- punpckl/h bw/wd/dq/qdq: zip1/zip2 ---- */
 static int emit_sse_punpck(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (insn->nops != 2 || !sse_enabled()) return 0;
@@ -7504,7 +7120,6 @@ static int emit_sse_punpck(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     return 1;
 }
 
-/* ---- unpckl/hpd, movlhps/movhlps ---- */
 static int emit_sse_unpck(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -7515,9 +7130,9 @@ static int emit_sse_unpck(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (va == VX0) emit_xmm_ld(b, VX0, d->reg);
     int vd = xmm_dst_reg(d->reg, VX2);
     switch (insn->op) {
-    case OCERZ_OP_UNPCKLPD: case OCERZ_OP_MOVLHPS: a64_v_zip1(b, 3, vd, va, vb); break; /* {d.lo, s.lo} */
-    case OCERZ_OP_UNPCKHPD:                        a64_v_zip2(b, 3, vd, va, vb); break; /* {d.hi, s.hi} */
-    case OCERZ_OP_MOVHLPS:  /* d.lo = s.hi ; d.hi kept */
+    case OCERZ_OP_UNPCKLPD: case OCERZ_OP_MOVLHPS: a64_v_zip1(b, 3, vd, va, vb); break;
+    case OCERZ_OP_UNPCKHPD:                        a64_v_zip2(b, 3, vd, va, vb); break;
+    case OCERZ_OP_MOVHLPS:
         if (vd != va) a64_v_mov(b, vd, va);
         a64_ins_d_d(b, vd, 0, vb, 1); break;
     case OCERZ_OP_UNPCKLPS: a64_v_zip1(b, 2, vd, va, vb); break;
@@ -7528,7 +7143,6 @@ static int emit_sse_unpck(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     return 1;
 }
 
-/* ---- cmpss/cmpsd (scalar compare -> lane mask by imm8 predicate) ---- */
 static int emit_sse_cmps(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -7541,23 +7155,19 @@ static int emit_sse_cmps(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     if (vb < 0) return 0;
     int va = xmm_is_pinned(d->reg) ? l0_src(d->reg, dbl) : VX0;
     if (va == VX0) emit_xmm_ld_lo(b, esz, VX0, d->reg);
-    /* SIMD-scalar compares give the mask directly (no GPR round trip);
-     * "unordered" predicates are the complement of the ordered ones */
     switch (pred) {
-    case 0: a64_fcmeq_s(b, dbl, VX2, va, vb); break;                        /* eq (ordered) */
-    case 1: a64_fcmgt_s(b, dbl, VX2, vb, va); break;                        /* lt: b > a */
-    case 2: a64_fcmge_s(b, dbl, VX2, vb, va); break;                        /* le: b >= a */
+    case 0: a64_fcmeq_s(b, dbl, VX2, va, vb); break;
+    case 1: a64_fcmgt_s(b, dbl, VX2, vb, va); break;
+    case 2: a64_fcmge_s(b, dbl, VX2, vb, va); break;
     case 3: a64_fcmeq_s(b, dbl, VX2, va, va); a64_fcmeq_s(b, dbl, VX3, vb, vb);
-            a64_v_and(b, VX2, VX2, VX3); a64_v_not(b, VX2, VX2); break;     /* unordered */
-    case 4: a64_fcmeq_s(b, dbl, VX2, va, vb); a64_v_not(b, VX2, VX2); break; /* neq or unordered */
-    case 5: a64_fcmgt_s(b, dbl, VX2, vb, va); a64_v_not(b, VX2, VX2); break; /* !lt */
-    case 6: a64_fcmge_s(b, dbl, VX2, vb, va); a64_v_not(b, VX2, VX2); break; /* !le */
+            a64_v_and(b, VX2, VX2, VX3); a64_v_not(b, VX2, VX2); break;
+    case 4: a64_fcmeq_s(b, dbl, VX2, va, vb); a64_v_not(b, VX2, VX2); break;
+    case 5: a64_fcmgt_s(b, dbl, VX2, vb, va); a64_v_not(b, VX2, VX2); break;
+    case 6: a64_fcmge_s(b, dbl, VX2, vb, va); a64_v_not(b, VX2, VX2); break;
     default: a64_fcmeq_s(b, dbl, VX2, va, va); a64_fcmeq_s(b, dbl, VX3, vb, vb);
-            a64_v_and(b, VX2, VX2, VX3); break;                             /* ordered */
+            a64_v_and(b, VX2, VX2, VX3); break;
     }
     if (cmps_blendv_fusable(g_cur_insn_idx)) {
-        /* the blend that follows takes the mask straight from VX2 and
-         * materializes xmm0's lane afterwards, off the chain */
         g_cmps_mask_idx = g_cur_insn_idx;
         l0_inval(d->reg);
         return 1;
@@ -7567,7 +7177,6 @@ static int emit_sse_cmps(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     return 1;
 }
 
-/* ---- blendvpd/blendvps/pblendvb: per-lane select by xmm0's sign bits ---- */
 static int emit_sse_blendv(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -7575,12 +7184,6 @@ static int emit_sse_blendv(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     int fused = g_cmps_mask_idx == g_cur_insn_idx - 1 && cmps_blendv_fusable(g_cur_insn_idx - 1);
     g_cmps_mask_idx = -1;
     if (fused) {
-        /* cmpsd/cmpss into xmm0 left its lane-0 mask in VX2 (zero above).
-         * Lane 0 of the blend is done in the destination's lane scratch so
-         * the loop-carried value never leaves it; the upper lanes use the
-         * architectural registers, whose upper lanes are always current,
-         * and garbage-blend lane 0 of the arch dst, which the dirty bit
-         * covers.  xmm0's own lane 0 is merged last, off the chain. */
         int dbl = insn->op == OCERZ_OP_BLENDVPD;
         int esz = dbl ? 8 : 4;
         int vd0 = l0_src(d->reg, dbl);
@@ -7598,19 +7201,17 @@ static int emit_sse_blendv(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
             if (vd0 != t) {
                 if (dbl) a64_ins_d_d(b, t, 0, vd0, 0); else a64_ins_s_s(b, t, 0, vd0, 0);
             }
-            a64_v_bit(b, t, vs0, VX2);                              /* lane 0, in the scratch */
+            a64_v_bit(b, t, vs0, VX2);
             if (dbl) a64_v_sshr_2d(b, VX3, xmm_vreg(0), 63);
             else     a64_v_sshr_4s(b, VX3, xmm_vreg(0), 31);
-            a64_v_bit(b, xmm_vreg(d->reg), vsfull, VX3);            /* upper lanes (lane 0 garbage) */
+            a64_v_bit(b, xmm_vreg(d->reg), vsfull, VX3);
             g_l0_dirty |= (uint16_t)(1u << d->reg);
             if (dbl) a64_ins_d_d(b, xmm_vreg(0), 0, VX2, 0); else a64_ins_s_s(b, xmm_vreg(0), 0, VX2, 0);
             (void)esz;
             return 1;
         }
-        /* no lane scratch for the destination: give xmm0 its mask and take the plain path */
         if (dbl) a64_ins_d_d(b, xmm_vreg(0), 0, VX2, 0); else a64_ins_s_s(b, xmm_vreg(0), 0, VX2, 0);
     }
-    /* lane-aware op: the plain path reads architectural registers */
     if (s->kind == OCERZ_OPK_XMM) l0_flush_reg(b, s->reg);
     l0_flush_reg(b, d->reg);
     l0_flush_reg(b, 0);
@@ -7619,22 +7220,22 @@ static int emit_sse_blendv(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     if (vb < 0) return 0;
     int va = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
     if (va == VX0) emit_xmm_ld(b, VX0, d->reg);
-    int vm = xmm_is_pinned(0) ? xmm_vreg(0) : VX2;   /* xmm0 = mask source */
+    int vm = xmm_is_pinned(0) ? xmm_vreg(0) : VX2;
     if (vm == VX2) emit_xmm_ld(b, VX2, 0);
     switch (insn->op) {
-    case OCERZ_OP_BLENDVPD: a64_v_sshr_2d(b, VX2, vm, 63); break;   /* sign -> all ones */
+    case OCERZ_OP_BLENDVPD: a64_v_sshr_2d(b, VX2, vm, 63); break;
     case OCERZ_OP_BLENDVPS: a64_v_sshr_4s(b, VX2, vm, 31); break;
     case OCERZ_OP_PBLENDVB: {
         a64_v_zero(b, VX3);
-        a64_v_cmgt(b, 0, VX2, VX3, vm);           /* 0 > mask (signed byte) */
+        a64_v_cmgt(b, 0, VX2, VX3, vm);
         break;
     }
     default: return 0;
     }
     if (va != VX0) {
-        a64_v_bit(b, va, vb, VX2);                /* dst = mask ? src : dst (in place) */
+        a64_v_bit(b, va, vb, VX2);
     } else {
-        a64_v_bsl(b, VX2, vb, va);                /* v2 = mask ? src : dst */
+        a64_v_bsl(b, VX2, vb, va);
         emit_xmm_st(b, VX2, d->reg);
     }
     return 1;
@@ -7699,15 +7300,9 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     }
 }
 
-/* bsf/bsr/tzcnt/lzcnt/popcnt with dead result flags: rbit/clz/cnt sequences.
- * (With live flags they keep going to the interpreter: bsf/bsr write ZF only
- * and leave the rest, which needs materialized flags.) */
 static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (!g_defer || insn->nops != 2 || insn->seg != OCERZ_SEG_NONE) return 0;
-    /* flags: the dead form only (bsf/bsr feeding an adjacent je/jne count as
-     * dead: NZCV is forwarded from cmp src, #0); a partial ZF write that must
-     * survive in the record cannot be expressed -> interpreter */
     if (need != 0) return 0;
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
@@ -7731,18 +7326,18 @@ static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
     case OCERZ_OP_BSR:
         if (insn->op == OCERZ_OP_BSF) { a64_rbit(b, sf, JT0, rs); a64_clz(b, sf, JT0, JT0); }
         else { a64_clz(b, sf, JT0, rs); if (sf) a64_try_eor_imm(b, 1, JT0, JT0, 63); else a64_try_eor_imm(b, 0, JT0, JT0, 31); }
-        a64_subs_imm(b, sf, A64_ZR, rs, 0);               /* Z <=> source == 0 (== x86 ZF) */
-        a64_csel(b, 1, rd, rd, JT0, A64_EQ);              /* source 0: destination unchanged */
+        a64_subs_imm(b, sf, A64_ZR, rs, 0);
+        a64_csel(b, 1, rd, rd, JT0, A64_EQ);
         if (g_nzcv_want) { g_nzcv_kind = OCERZ_CC_SUB; g_nzcv_from = g_cur_insn_idx; }
         return 1;
     case OCERZ_OP_TZCNT:
-        a64_rbit(b, sf, rd, rs); a64_clz(b, sf, rd, rd);   /* 0 -> operand width, as tzcnt */
+        a64_rbit(b, sf, rd, rs); a64_clz(b, sf, rd, rd);
         return 1;
     case OCERZ_OP_LZCNT:
         a64_clz(b, sf, rd, rs);
         return 1;
     case OCERZ_OP_POPCNT:
-        a64_fmov_v_from_x(b, sf, VX0, rs);                /* 32-bit: upper lanes zero */
+        a64_fmov_v_from_x(b, sf, VX0, rs);
         a64_v_cnt_8b(b, VX0, VX0);
         a64_addv_b_8b(b, VX0, VX0);
         a64_umov_w_b(b, rd, VX0, 0);
@@ -7751,9 +7346,6 @@ static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
     }
 }
 
-/* bt reg/mem, imm/reg: CF <- bit.  Adjacent CF consumers (jc/jnc, setc, adc,
- * cmovc...) take the bit from NZCV (tst -> Z means clear); when CF must
- * survive in RFLAGS the pending flags are materialized first and CF patched. */
 #define RFLAGS_OFF ((uint32_t)offsetof(OcerzCPU, rflags))
 static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exit_sites, int *n_exits)
 {
@@ -7762,7 +7354,6 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
     int size = d->size;
     if (size != 2 && size != 4 && size != 8) return 0;
     if (insn->op != OCERZ_OP_BT) {
-        /* bts/btr/btc on a register: CF <- old bit, then set/clear/flip it */
         if (d->kind != OCERZ_OPK_REG || d->high8 || pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
         if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (rsp_is_ptr() && o->reg == OCERZ_RSP)) return 0; }
         else if (o->kind != OCERZ_OPK_IMM) return 0;
@@ -7770,7 +7361,6 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
         int rd = pin_hreg(pin_slot(d->reg));
         int sf = size == 8;
         unsigned bits = (unsigned)size * 8;
-        /* mask bit -> JT1, old bit -> JT0 */
         if (o->kind == OCERZ_OPK_IMM) {
             unsigned n = (unsigned)o->imm & (bits - 1);
             a64_ubfx(b, 1, JT0, rd, (int)n, 1);
@@ -7803,23 +7393,22 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
     }
     if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (rsp_is_ptr() && o->reg == OCERZ_RSP)) return 0; }
     else if (o->kind != OCERZ_OPK_IMM) return 0;
-    int mat = need != 0 && !g_nzcv_want;         /* CF live beyond a forwarded consumer: patch RFLAGS */
-    if (need != 0 && g_nzcv_want) mat = 1;       /* both: RFLAGS must be right too */
-    if (mat) emit_materialize(b);               /* first: it may call C */
+    int mat = need != 0 && !g_nzcv_want;
+    if (need != 0 && g_nzcv_want) mat = 1;
+    if (mat) emit_materialize(b);
     unsigned bits = (unsigned)size * 8;
     if (d->kind == OCERZ_OPK_REG) {
         if (d->high8 || pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
         int rd = pin_hreg(pin_slot(d->reg));
         if (o->kind == OCERZ_OPK_IMM) {
             unsigned n = (unsigned)o->imm & (bits - 1);
-            a64_ubfx(b, 1, JT0, rd, (int)n, 1);                 /* JT0 = bit */
+            a64_ubfx(b, 1, JT0, rd, (int)n, 1);
         } else {
             a64_try_and_imm(b, 1, JT1, pin_hreg(pin_slot(o->reg)), bits - 1);
             a64_lsrv(b, 1, JT0, rd, JT1);
             a64_try_and_imm(b, 1, JT0, JT0, 1);
         }
     } else if (d->kind == OCERZ_OPK_MEM) {
-        /* byte-granular: address = base + (offset >> 3), bit = offset & 7 */
         if (!emit_mem_ea(b, insn, d, JTA)) return 0;
         (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
@@ -7847,15 +7436,13 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
         a64_str(b, 8, JT1, 20, RFLAGS_OFF);
     }
     if (g_nzcv_want) {
-        a64_subs_imm(b, 1, A64_ZR, JT0, 0);       /* Z <=> bit clear */
+        a64_subs_imm(b, 1, A64_ZR, JT0, 0);
         g_nzcv_kind = NZCV_KIND_BT;
         g_nzcv_from = g_cur_insn_idx;
     }
     return 1;
 }
 
-/* push qword [mem] / pop qword [mem] (class 3, plain stack, memory operand
- * through the guarded generic address; pop with rsp as its base -> interpreter) */
 static int emit_push_pop_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || !stack_plain_access_ok() || !jgb_usable() || stack_guard_needed()) return 0;
@@ -7874,7 +7461,6 @@ static int emit_push_pop_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
         return 1;
     }
     if (m->base == OCERZ_RSP || m->index == OCERZ_RSP) return 0;
-    /* store first, then bump rsp: a faulting store must leave rsp untouched */
     if (rsp_is_ptr()) a64_ldr(b, 8, JT1, hs, 0);
     else a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
     if (!emit_plain_mem_fast(b, insn, m, 8, JT1, 1, 0)) {
@@ -7887,7 +7473,6 @@ static int emit_push_pop_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
     return 1;
 }
 
-/* leave: rsp = rbp; pop rbp (class 3, plain stack) */
 static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     (void)insn; (void)exit_sites; (void)n_exits;
@@ -7898,7 +7483,6 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
         return 0;
     int hs = pin_hreg(pin_slot(OCERZ_RSP)), hb = pin_hreg(pin_slot(OCERZ_RBP));
     if (rsp_is_ptr()) {
-        /* rsp = rbp: rbp holds a guest value, hs holds guest_base + rsp */
         a64_add_reg(b, 1, hs, hb, JGB, 0);
         a64_ldr_post64(b, hb, hs, 8);
         return 1;
@@ -7913,7 +7497,6 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
     return 1;
 }
 
-/* shld/shrd reg, reg, imm with dead flags: one extr */
 static int emit_shiftd(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (need != 0 || !g_defer || insn->nops != 3) return 0;
@@ -7927,12 +7510,11 @@ static int emit_shiftd(A64Buf *b, const X86Insn *insn, uint64_t need)
     unsigned cnt = (unsigned)c->imm & (sf ? 63u : 31u);
     if (cnt == 0) return 1;
     int rd = pin_hreg(pin_slot(d->reg)), rs = pin_hreg(pin_slot(s->reg));
-    if (insn->op == OCERZ_OP_SHRD) a64_extr(b, sf, rd, rs, rd, (int)cnt);          /* (src:dst) >> cnt */
-    else                           a64_extr(b, sf, rd, rd, rs, (int)(bits - cnt)); /* (dst:src) >> (bits-cnt) */
+    if (insn->op == OCERZ_OP_SHRD) a64_extr(b, sf, rd, rs, rd, (int)cnt);
+    else                           a64_extr(b, sf, rd, rd, rs, (int)(bits - cnt));
     return 1;
 }
 
-/* pinsrb/w/d/q xmm, r32/r64|mem, imm ; pextrb/w/d/q r/mem, xmm, imm */
 static int emit_sse_pinsr_pextr(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (insn->nops != 3 || !sse_enabled()) return 0;
@@ -7960,12 +7542,11 @@ static int emit_sse_pinsr_pextr(A64Buf *b, const X86Insn *insn, uint32_t **exit_
         }
         return 0;
     }
-    /* pextr */
     if (s->kind != OCERZ_OPK_XMM || !xmm_is_pinned(s->reg)) return 0;
     int vs = xmm_vreg(s->reg);
     if (d->kind == OCERZ_OPK_REG) {
         if (d->high8) return 0;
-        a64_umov_gpr(b, esize, JT0, vs, (int)idx);       /* zero-extended */
+        a64_umov_gpr(b, esize, JT0, vs, (int)idx);
         emit_gpr_wr(b, JT0, d->reg);
         return 1;
     }
@@ -7977,7 +7558,6 @@ static int emit_sse_pinsr_pextr(A64Buf *b, const X86Insn *insn, uint32_t **exit_
     return 0;
 }
 
-/* pmovsx and pmovzx (b/w/d -> w/d/q) xmm, xmm/mem: widen the low lanes */
 static int emit_sse_pmovx(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (insn->nops != 2 || !sse_enabled()) return 0;
@@ -7986,7 +7566,7 @@ static int emit_sse_pmovx(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     unsigned op = insn->op;
     int sx = op == OCERZ_OP_PMOVSXBW || op == OCERZ_OP_PMOVSXBD || op == OCERZ_OP_PMOVSXBQ ||
              op == OCERZ_OP_PMOVSXWD || op == OCERZ_OP_PMOVSXWQ || op == OCERZ_OP_PMOVSXDQ;
-    int from, steps, srcw;   /* element size in bytes, number of doublings, source bytes consumed */
+    int from, steps, srcw;
     switch (op) {
     case OCERZ_OP_PMOVSXBW: case OCERZ_OP_PMOVZXBW: from = 1; steps = 1; srcw = 8; break;
     case OCERZ_OP_PMOVSXBD: case OCERZ_OP_PMOVZXBD: from = 1; steps = 2; srcw = 4; break;
@@ -8001,7 +7581,6 @@ static int emit_sse_pmovx(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         if (!xmm_is_pinned(s->reg)) return 0;
         vsrc = xmm_vreg(s->reg);
     } else if (s->kind == OCERZ_OPK_MEM) {
-        /* load the consumed bytes (2/4/8) into VX1 (upper zero) */
         uint32_t *skip;
         if (srcw == 2) {
             if (!emit_mem_load_plain(b, insn, s, 2, JT0)) return 0;
@@ -8022,7 +7601,6 @@ static int emit_sse_pmovx(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     return 1;
 }
 
-/* roundss/sd/ps/pd xmm, xmm/mem, imm */
 static int emit_sse_round(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (insn->nops != 3 || !sse_enabled()) return 0;
@@ -8030,7 +7608,7 @@ static int emit_sse_round(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (d->kind != OCERZ_OPK_XMM || !xmm_is_pinned(d->reg)) return 0;
     unsigned op = insn->op;
     unsigned imm = (unsigned)insn->ops[2].imm;
-    int mode = (imm & 4) ? 4 : (int)(imm & 3);          /* 0 nearest 1 floor 2 ceil 3 trunc 4 current */
+    int mode = (imm & 4) ? 4 : (int)(imm & 3);
     int mode_a64 = mode == 0 ? 0 : mode == 1 ? 1 : mode == 2 ? 2 : mode == 3 ? 3 : 4;
     int dbl = op == OCERZ_OP_ROUNDSD || op == OCERZ_OP_ROUNDPD;
     int packed = op == OCERZ_OP_ROUNDPS || op == OCERZ_OP_ROUNDPD;
@@ -8041,7 +7619,6 @@ static int emit_sse_round(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         a64_v_frint(b, dbl, mode_a64, vd, vs);
         return 1;
     }
-    /* scalar: round lane 0 of the source into lane 0 of the destination */
     int esz = dbl ? 8 : 4;
     int vs;
     if (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) vs = xmm_vreg(s->reg);
@@ -8051,7 +7628,6 @@ static int emit_sse_round(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     return 1;
 }
 
-/* pmovmskb r32/r64, xmm: sign bits of the 16 bytes -> low 16 bits of the GPR */
 static int emit_pmovmskb(A64Buf *b, const X86Insn *insn)
 {
     if (!sse_enabled() || insn->nops != 2) return 0;
@@ -8061,23 +7637,22 @@ static int emit_pmovmskb(A64Buf *b, const X86Insn *insn)
     if (g_n_raslit >= RASLIT_MAX) return 0;
     int ds = pin_slot(d->reg);
     if (ds < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
-    a64_v_sshr_16b(b, VX0, xmm_vreg(s->reg), 7);          /* 0x00 / 0xff per byte */
+    a64_v_sshr_16b(b, VX0, xmm_vreg(s->reg), 7);
     g_raslit[g_n_raslit].site = a64_label(b);
     g_raslit[g_n_raslit].retaddr = 0x8040201008040201ull;
     g_raslit[g_n_raslit].hi = 0x8040201008040201ull;
     g_raslit[g_n_raslit].kind = 2;
     g_raslit[g_n_raslit].rt = VX1;
     g_n_raslit++;
-    a64_emit32(b, 0x9c000000u | (uint32_t)VX1);           /* ldr q VX1, <lit> (patched) */
-    a64_v_and(b, VX0, VX0, VX1);                          /* byte i -> its bit within the half */
+    a64_emit32(b, 0x9c000000u | (uint32_t)VX1);
+    a64_v_and(b, VX0, VX0, VX1);
     a64_v_addp_16b(b, VX0, VX0, VX0);
     a64_v_addp_16b(b, VX0, VX0, VX0);
-    a64_v_addp_16b(b, VX0, VX0, VX0);                    /* byte0 = low half OR, byte1 = high half OR */
-    a64_umov_w_h(b, pin_hreg(ds), VX0, 0);               /* zero-extends into the 32/64-bit dst */
+    a64_v_addp_16b(b, VX0, VX0, VX0);
+    a64_umov_w_h(b, pin_hreg(ds), VX0, 0);
     return 1;
 }
 
-/* Read-modify-write memory forms: add/sub/and/or/xor/inc/dec/neg/not [mem] (lock or not) */
 static int rmw_src_to(A64Buf *b, const X86Operand *s, int size, int into, int *out)
 {
     if (s->kind == OCERZ_OPK_IMM) {
@@ -8094,7 +7669,7 @@ static int rmw_src_to(A64Buf *b, const X86Operand *s, int size, int into, int *o
     else *out = r;
     return 1;
 }
-static void rmw_write_reg(A64Buf *b, const X86Operand *d, int size, int val)   /* val zero-extended to size */
+static void rmw_write_reg(A64Buf *b, const X86Operand *d, int size, int val)
 {
     int rd = pin_hreg(pin_slot(d->reg));
     if (size == 8) a64_mov_reg(b, 1, rd, val);
@@ -8108,14 +7683,14 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     if (dis || !g_defer || insn->addrsize != 8) return 0;
     if (insn->seg != OCERZ_SEG_NONE && insn->seg != OCERZ_SEG_GS && insn->seg != OCERZ_SEG_FS) return 0;
     unsigned op = insn->op;
-    const X86Operand *m, *s = NULL, *r = NULL;   /* memory operand; source; register operand (xchg/xadd) */
+    const X86Operand *m, *s = NULL, *r = NULL;
     if (op == OCERZ_OP_XCHG) {
         if (insn->nops != 2) return 0;
         if (insn->ops[0].kind == OCERZ_OPK_MEM) { m = &insn->ops[0]; r = &insn->ops[1]; }
         else if (insn->ops[1].kind == OCERZ_OPK_MEM) { m = &insn->ops[1]; r = &insn->ops[0]; }
         else return 0;
         if (r->kind != OCERZ_OPK_REG || r->high8 || pin_slot(r->reg) < 0 || r->size != m->size) return 0;
-        s = r;                                   /* the register is also the value stored */
+        s = r;
     } else {
         if (insn->nops < 1 || insn->ops[0].kind != OCERZ_OPK_MEM) return 0;
         m = &insn->ops[0];
@@ -8132,20 +7707,16 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     if (!mem_native_store_ok()) return 0;
     int atomic = op == OCERZ_OP_XCHG || op == OCERZ_OP_XADD || op == OCERZ_OP_CMPXCHG || insn->lock;
     int is_cmp = op == OCERZ_OP_CMP || op == OCERZ_OP_TEST;
-    if (!g_plain_mem && atomic && op == OCERZ_OP_NEG) return 0;   /* no LSE primitive */
+    if (!g_plain_mem && atomic && op == OCERZ_OP_NEG) return 0;
     int sf = size == 8;
     int ordered = !g_plain_mem;
 
-    /* inc/dec keep CF: fetch the pending CF first (the predicate may call C
-     * and clobber every temp) into a callout-safe slot */
     int incdec_cf = (op == OCERZ_OP_INC || op == OCERZ_OP_DEC) && need;
     if (incdec_cf) {
         emit_cc_predicate(b, OCERZ_CC_B);
         a64_cset(b, JT1, A64_NE);
         a64_str(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
     }
-    /* address: (ra, disp) for plain ldr/str; a bare host address in JTA for
-     * the LSE atomics and the ordered load+store pair (one address, used twice) */
     int ra; uint32_t disp;
     int plainacc = mem_plain_access_ok(m);
     if (insn->seg != OCERZ_SEG_NONE || !emit_mem_ea_plain(b, insn, m, size, &ra, &disp)) {
@@ -8158,19 +7729,17 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         else { a64_mov_imm64(b, JTU, disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
         ra = JTA; disp = 0;
     }
-    /* source value */
     int rs = -1;
     if (s && op != OCERZ_OP_CMPXCHG) { if (!rmw_src_to(b, s, size, JT1, &rs)) return 0; }
-    if (op == OCERZ_OP_CMPXCHG) rs = pin_hreg(pin_slot(s->reg));       /* new value (low bits used) */
+    if (op == OCERZ_OP_CMPXCHG) rs = pin_hreg(pin_slot(s->reg));
     if (op == OCERZ_OP_CMPXCHG && size < 4) { if (size == 1) a64_uxtb(b, JT1, rs); else a64_uxth(b, JT1, rs); rs = JT1; }
     int hax = pin_slot(OCERZ_RAX) >= 0 ? pin_hreg(pin_slot(OCERZ_RAX)) : -1;
 
-    /* ---- old value -> JT0 ---- */
     uint32_t *align_bne = NULL;
     if (ordered && atomic) {
         if (size > 1) {
             a64_try_ands_imm(b, 1, A64_ZR, ra, (uint64_t)(size - 1));
-            align_bne = a64_label(b); a64_bcond(b, A64_NE, 0);       /* misaligned -> interpreter */
+            align_bne = a64_label(b); a64_bcond(b, A64_NE, 0);
         }
         switch (op) {
         case OCERZ_OP_ADD: case OCERZ_OP_XADD: a64_ldop_al(b, size, 0, rs, JT0, ra); break;
@@ -8187,7 +7756,7 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         case OCERZ_OP_CMPXCHG:
             if (size == 8) a64_mov_reg(b, 1, JT0, hax); else if (size == 4) a64_mov_reg(b, 0, JT0, hax);
             else if (size == 2) a64_uxth(b, JT0, hax); else a64_uxtb(b, JT0, hax);
-            a64_casal(b, size, JT0, rs, ra);                          /* JT0 <- old */
+            a64_casal(b, size, JT0, rs, ra);
             break;
         default: return 0;
         }
@@ -8195,7 +7764,6 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         emit_gpr_ld_at(b, size, JT0, ra, (int32_t)disp, plainacc);
     }
 
-    /* ---- new value -> JT2 (and register results) ---- */
     int have_new = 1;
     switch (op) {
     case OCERZ_OP_ADD: case OCERZ_OP_XADD: a64_add_reg(b, sf, JT2, JT0, rs, 0); break;
@@ -8209,18 +7777,13 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_NOT: a64_mvn_reg(b, sf, JT2, JT0); break;
     case OCERZ_OP_XCHG: a64_mov_reg(b, 1, JT2, rs); break;
     case OCERZ_OP_CMPXCHG: {
-        /* flags = cmp acc, old; store new if equal (else the old value back) */
-        /* Rosetta (the golden oracle) sets the flags as (dest - acc) and always
-         * writes the accumulator (the 32-bit form zero-extends rax on a match
-         * too); the interpreter is aligned with that. */
-        int acc = JTU;                            /* accumulator at the operand size (JT1 may hold the source) */
+        int acc = JTU;
         if (size == 8) acc = hax; else if (size == 4) a64_mov_reg(b, 0, JTU, hax); else if (size == 2) a64_uxth(b, JTU, hax); else a64_uxtb(b, JTU, hax);
         if (size == 8) a64_subs_reg(b, 1, A64_ZR, JT0, hax, 0); else a64_subs_reg(b, 0, A64_ZR, JT0, acc, 0);
         a64_csel(b, 1, JT2, rs, JT0, A64_EQ);
         if (need) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT0, acc);
-        /* accumulator <- old on mismatch; on a match the same value is written */
         if (size == 8) a64_csel(b, 1, hax, hax, JT0, A64_EQ);
-        else if (size == 4) a64_csel(b, 1, hax, acc, JT0, A64_EQ);         /* zero-extends either way */
+        else if (size == 4) a64_csel(b, 1, hax, acc, JT0, A64_EQ);
         else { a64_csel(b, 1, JT1, acc, JT0, A64_EQ); a64_bfi(b, 1, hax, JT1, 0, size * 8); }
         break;
     }
@@ -8229,12 +7792,10 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     }
     if (size == 1) a64_uxtb(b, JT2, JT2); else if (size == 2) a64_uxth(b, JT2, JT2);
     else if (size == 4 && (op == OCERZ_OP_NEG || op == OCERZ_OP_NOT || op == OCERZ_OP_SUB || op == OCERZ_OP_ADD || op == OCERZ_OP_XADD || op == OCERZ_OP_INC || op == OCERZ_OP_DEC || op == OCERZ_OP_CMP))
-        a64_mov_reg(b, 0, JT2, JT2);        /* w-form results are already zero-extended; harmless */
+        a64_mov_reg(b, 0, JT2, JT2);
 
-    /* ---- store ---- */
     if (!is_cmp && !(ordered && atomic))
         emit_gpr_st_at(b, size, JT2, ra, (int32_t)disp, plainacc);
-    /* ---- flags (before the register results: the record may read the source pin) ---- */
     if (need && op != OCERZ_OP_CMPXCHG) {
         switch (op) {
         case OCERZ_OP_ADD: case OCERZ_OP_XADD:
@@ -8251,30 +7812,27 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
             emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2);
             break;
         case OCERZ_OP_INC: case OCERZ_OP_DEC:
-            a64_ldr(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));   /* old CF */
+            a64_ldr(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
             emit_defer_flags(b, ocerz_cc_pack(op == OCERZ_OP_INC ? OCERZ_CC_INC : OCERZ_CC_DEC, size, 0), JT1, JT2);
             break;
         case OCERZ_OP_NEG:
             a64_mov_imm64(b, JT1, 0);
             emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JT1, JT0);
             break;
-        default: break;                          /* not, xchg: no flags */
+        default: break;
         }
     }
-    /* ---- register results ---- */
     if (op == OCERZ_OP_XCHG || op == OCERZ_OP_XADD) rmw_write_reg(b, r, size, JT0);
     (void)have_new;
     if (align_bne) {
         uint32_t *sites[1] = { align_bne };
-        if (!oolslow_add(insn, sites, 1, a64_label(b))) return 0;   /* (out of arms: leave it; caller falls back) */
+        if (!oolslow_add(insn, sites, 1, a64_label(b))) return 0;
     }
     return 1;
 }
 
-/* ---- which instructions the JIT compiles in a 32-bit block ---------------- A whitelist, not a */
 static int m32_inline_ok(const X86Insn *insn)
 {
-    /* 0x67 in a 32-bit block selects 16-bit addressing: the effective address wraps at 0xffff, not */
     if (insn->addrsize != 4)
         return 0;
     switch (insn->op) {
@@ -8299,8 +7857,6 @@ static int m32_inline_ok(const X86Insn *insn)
     case OCERZ_OP_PMOVMSKB:
         return 1;
     default:
-        /* the SSE family: register forms are pure width arithmetic and memory
-         * forms go through emit_sse_mem_addr -> emit_mem_ea */
         return insn->op >= OCERZ_OP_MOVUPS && insn->op <= OCERZ_OP_PBLENDVB;
     }
 }
@@ -8308,15 +7864,15 @@ static int m32_inline_ok(const X86Insn *insn)
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
-    if (insn->vex) return 0;      /* AVX: the interpreter owns VEX-encoded instructions */
+    if (insn->vex) return 0;
     if (insn->mode32 && !m32_inline_ok(insn))
-        return 0;                        /* -> emit_slowcall, i.e. interpreted */
+        return 0;
     if (insn->op == OCERZ_OP_NOP || insn->op == OCERZ_OP_PAUSE ||
         insn->op == OCERZ_OP_PREFETCH || insn->op == OCERZ_OP_CLFLUSH)
         return 1;
     if ((insn->op == OCERZ_OP_XOR || insn->op == OCERZ_OP_CWD) && g_cur_insns && insn == &g_cur_insns[g_cur_insn_idx] &&
         rdx_prep_skippable(g_cur_insns, g_cur_insn_idx, g_cur_insns_n, need)) {
-        g_div_prev_skipped = 1;          /* the following div/idiv materialises rdx on its slow arm */
+        g_div_prev_skipped = 1;
         return 1;
     }
     g_div_prev_skipped = 0;
@@ -8371,7 +7927,6 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         }
         if (d->kind == OCERZ_OPK_REG && (d->size == 1 || d->size == 2) &&
             pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
-            /* partial-register moves: insert the low byte/word */
             int rd = pin_hreg(pin_slot(d->reg));
             if (s->kind == OCERZ_OPK_REG && !s->high8 && s->size == d->size && pin_slot(s->reg) >= 0 &&
                 !(rsp_is_ptr() && s->reg == OCERZ_RSP)) {
@@ -8520,8 +8075,6 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
 
 static uint32_t *emit_chain_tail(A64Buf *b, int poll);
 
-/* The side exit whose chain stub is being emitted: its C fallback stores the
- * block and side index so ocerz_jit_step can count the exit. */
 static JitBlock *g_tag_blk;
 static int g_tag_idx;
 #define A64_NOP 0xd503201fu
@@ -8563,25 +8116,11 @@ static int fused_jcc_cond(const X86Insn *producer, const X86Insn *jcc)
     return jcc->cc < 16 ? cmp_cond[jcc->cc] : -1;
 }
 
-/* May chaining retarget this conditional branch straight at the successor?
- * Only when nothing the successor needs sits between the branch and the
- * chain tail: no flag record on the taken side, and a body edge (an
- * out-of-block tail spills the pins and pops the frame first). */
 static uint32_t *cond_short_site(uint32_t *to_taken, int taken_rec, int body_edge)
 {
-    /* g_l0_dirty: a lane-0 result still in its scratch register would be
-     * flushed by the chain tail; a branch retargeted past it leaks the stale
-     * architectural lane into the successor. */
     return (taken_rec || !body_edge || g_l0_dirty) ? NULL : to_taken;
 }
 
-/* A side-exit stub does work the successor needs when it replays lane-0
- * flushes, an FP-batch check, or the producer's flag record.  Such a stub
- * must stay on the path: chaining may not retarget the conditional branch
- * straight at the successor's body (the AppKit view-transform helper hit
- * exactly that: subsd's result left in scratch, the je's side exit chained
- * past the flush, NSViewGetTransformToDescendant asserted on a singular
- * matrix). */
 static int side_stub_has_work(int k)
 {
     if (g_side[k].rec) return 1;
@@ -8595,7 +8134,7 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
                                  const X86Insn *jcc, uint64_t block_rip)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     if (g_no_jccfuse || g_no_regflags || g_no_chain ||
         jcc->op != OCERZ_OP_JCC || jcc->ops[0].kind != OCERZ_OPK_IMM ||
         (jcc->ops[0].imm != block_rip && g_no_jcclink) ||
@@ -8622,14 +8161,12 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
     return s->kind == OCERZ_OPK_IMM || s_mem;
 }
 
-/* Superblock side exit fused with its adjacent cmp/test producer (index i is
- * the producer; i+1 the jcc, which must not be the block's last instruction). */
 static int flag_neutral_ok(const X86Insn *in);
 static int insn_writes_reg(const X86Insn *in, unsigned reg);
-static int side_gap_fuse_ok(const X86Insn *insns, int i, int n)   /* cmp/test at i, neutral at i+1, jcc at i+2 (side exit) */
+static int side_gap_fuse_ok(const X86Insn *insns, int i, int n)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     static int dis = -1;
     if (dis < 0) dis = getenv("OCERZ_NO_SIDEFUSE") ? 1 : 0;
     if (dis || i < 0 || i + 2 >= n - 1) return 0;
@@ -8639,8 +8176,6 @@ static int side_gap_fuse_ok(const X86Insn *insns, int i, int n)   /* cmp/test at
     if (!can_fuse_cmp_test_jcc(p, j, g_self_rip)) return 0;
     if (p->addrsize != 8) return 0;
     if (!flag_neutral_ok(&insns[i + 1])) return 0;
-    /* the same legality the emitter applies: the gap must not write a register
-     * the compare read as a record operand */
     if (p->ops[0].kind == OCERZ_OPK_REG && insn_writes_reg(&insns[i + 1], p->ops[0].reg)) return 0;
     if (p->ops[1].kind == OCERZ_OPK_REG && insn_writes_reg(&insns[i + 1], p->ops[1].reg)) return 0;
     return 1;
@@ -8648,7 +8183,7 @@ static int side_gap_fuse_ok(const X86Insn *insns, int i, int n)   /* cmp/test at
 static int side_fuse_ok(const X86Insn *insns, int i, int n)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     static int dis = -1;
     if (dis < 0) dis = getenv("OCERZ_NO_SIDEFUSE") ? 1 : 0;
     if (dis || i + 1 >= n - 1) return 0;
@@ -8656,36 +8191,28 @@ static int side_fuse_ok(const X86Insn *insns, int i, int n)
     if (j->op != OCERZ_OP_JCC || (p->op != OCERZ_OP_CMP && p->op != OCERZ_OP_TEST)) return 0;
     if (!g_defer || j->ops[0].kind != OCERZ_OPK_IMM || j->ops[0].imm == g_self_rip) return 0;
     if (!can_fuse_cmp_test_jcc(p, j, g_self_rip)) return 0;
-    if (p->addrsize != 8) return 0;      /* emit_mem_ea refuses 32-bit addressing */
+    if (p->addrsize != 8) return 0;
     return 1;
 }
-/* Registers written by a simple instruction (for gap-fusion legality). */
 static int insn_writes_reg(const X86Insn *in, unsigned reg)
 {
     if (in->nops == 0) return 0;
     const X86Operand *d = &in->ops[0];
     return d->kind == OCERZ_OPK_REG && (d->reg & 15) == (reg & 15);
 }
-/* Pure predicate: can emit_flag_neutral handle `in`?  (must be decided before
- * any code is emitted -- exit sites etc. cannot be rolled back) */
 static int flag_neutral_ok(const X86Insn *in)
 {
     if (g_pin_class != 3) return 0;
     if (in->op == OCERZ_OP_LEA) {
-        /* exactly the emit_lea fast paths (which touch only pinned regs);
-         * its fallback path clobbers JT0/JT2, which may hold the record */
         const X86Operand *d = &in->ops[0], *m = &in->ops[1];
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
         if (m->kind != OCERZ_OPK_MEM || m->riprel || in->addrsize != 8 || in->seg != OCERZ_SEG_NONE) return 0;
         if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
         int has_idx = m->index != OCERZ_REG_NONE;
         if (has_idx && pin_slot(m->index) < 0) return 0;
-        /* rsp held as a host pointer: emit_lea takes its fallback, which
-         * loads the base through JT0/JT2 (the temps a fused compare holds
-         * its value in) */
         if (rsp_is_ptr() && (d->reg == OCERZ_RSP || m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
         if (pin_slot(d->reg) < 0) return 0;
-        if (m->disp >= -4095 && m->disp <= 4095) return 1;          /* both fast paths */
+        if (m->disp >= -4095 && m->disp <= 4095) return 1;
         return has_idx && m->disp == 0;
     }
     if (in->op == OCERZ_OP_MOV) {
@@ -8698,13 +8225,11 @@ static int flag_neutral_ok(const X86Insn *in)
     }
     return 0;
 }
-/* Emit a flag-NEUTRAL instruction (host NZCV must survive): only shapes whose
- * emitters use mov/add/lsl/ubfx/sxt* without S-forms.  Returns 0 if not safe. */
 static int emit_flag_neutral(A64Buf *b, const X86Insn *in)
 {
     switch (in->op) {
     case OCERZ_OP_LEA:
-        return emit_lea(b, in);                       /* add/lsl/mov only */
+        return emit_lea(b, in);
     case OCERZ_OP_MOV: {
         const X86Operand *d = &in->ops[0], *s = &in->ops[1];
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
@@ -8719,7 +8244,7 @@ static int emit_flag_neutral(A64Buf *b, const X86Insn *in)
             int ds = pin_slot(d->reg);
             if (ds < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
             uint64_t v = s->imm; if (d->size == 4) v &= 0xffffffffull;
-            a64_mov_imm64(b, pin_hreg(ds), v);        /* movz/movk: no flags */
+            a64_mov_imm64(b, pin_hreg(ds), v);
             return 1;
         }
         return 0;
@@ -8737,27 +8262,14 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
                              const X86Insn *gap, uint32_t **gap_label)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     if (!can_fuse_cmp_test_jcc(producer, jcc, g_self_rip) || !g_defer)
         return 0;
-    /* gap fusion (cmp ; neutral ; jcc): the compare's operands are loaded
-     * first, then the gap, then the branch, so the gap may write the
-     * compare's memory base/index but not its register operands, and its
-     * emission must touch nothing but pinned registers (flag_neutral_ok
-     * admits exactly those shapes: emit_lea's pointer-rsp form goes through
-     * JT0, which held the compared byte for a cbz - libcef's
-     * `cmp byte [rdi+0x210],0 ; lea r15,[rsp+0x290] ; jne` then branched on
-     * rsp and Steam's CEF browser copied an unengaged optional, 2026-09-06). */
     if (gap) {
         const X86Operand *pd = &producer->ops[0], *ps = &producer->ops[1];
         if (pd->kind == OCERZ_OPK_REG && insn_writes_reg(gap, pd->reg)) return 0;
         if (ps->kind == OCERZ_OPK_REG && insn_writes_reg(gap, ps->reg)) return 0;
         if (!flag_neutral_ok(gap)) return 0;
-        /* the admission test knows the shape, not the pin state; emit into a
-         * scratch buffer first so a gap the emitter cannot place (an unpinned
-         * register, rsp held as a pointer) is a refusal here rather than an
-         * assertion after the compare has been emitted.  This aborted a Steam
-         * process on 2026-09-06. */
         {
             uint32_t tmpw[128];
             A64Buf tb = { tmpw, tmpw, tmpw + 128, 0, 0 };
@@ -8774,15 +8286,13 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     int test_bit = -1, test_sf = 0;
     int test_rn = -1;
     uint64_t test_mask = 0;
-    int cbz_rn = -1, cbz_sf = 0;   /* cmp x,0 + je/jne -> cbz/cbnz (no subs, record dst = xzr) */
-    int rec_imm_pending = 0; uint64_t rec_imm = 0;   /* record dst immediate, materialized only when recorded */
+    int cbz_rn = -1, cbz_sf = 0;
+    int rec_imm_pending = 0; uint64_t rec_imm = 0;
     int cc_is_zero_test = jcc->cc == OCERZ_CC_E || jcc->cc == OCERZ_CC_NE;
     int record_src = JT2;
     int record_dst = JT2;
     uint32_t ccop;
     int d_mem = d->kind == OCERZ_OPK_MEM, s_mem = s->kind == OCERZ_OPK_MEM;
-    /* memory operand (at most one) -> loaded up front into JT0 (dst) or JT1 (src),
-     * zero-extended to the operand size; then treated like a register held there */
     int d_in_jt0 = 0, s_in_jt1 = 0;
     if (d_mem || s_mem) {
         const X86Operand *m = d_mem ? d : s;
@@ -8796,8 +8306,6 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         }
         if (d_mem) d_in_jt0 = 1; else s_in_jt1 = 1;
     }
-    /* narrow compare whose condition needs only Z or the unsigned flags:
-     * compare the zero-extended values directly (no shifting) */
     int narrow_direct = (d->size == 1 || d->size == 2) && producer->op == OCERZ_OP_CMP &&
         (jcc->cc == OCERZ_CC_E || jcc->cc == OCERZ_CC_NE || jcc->cc == OCERZ_CC_B ||
          jcc->cc == OCERZ_CC_AE || jcc->cc == OCERZ_CC_A || jcc->cc == OCERZ_CC_BE) &&
@@ -8806,7 +8314,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         int size = d->size;
         uint64_t mask = size == 1 ? 0xffull : 0xffffull;
         int rn, rm;
-        if (d_in_jt0) rn = JT0;                                    /* loads zero-extend */
+        if (d_in_jt0) rn = JT0;
         else {
             int ds = pin_slot(d->reg);
             if (ds >= 0) { if (size == 1) a64_uxtb(b, JT0, pin_hreg(ds)); else a64_uxth(b, JT0, pin_hreg(ds)); }
@@ -8837,9 +8345,6 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     if ((d->size == 1 || d->size == 2) && producer->op == OCERZ_OP_TEST &&
         !d_mem && !d->high8 && s->kind == OCERZ_OPK_IMM &&
         (jcc->cc == OCERZ_CC_E || jcc->cc == OCERZ_CC_NE)) {
-        /* narrow test-with-immediate feeding je/jne: only Z matters and the
-         * immediate masks the operand to its width, so test the full pinned
-         * register directly (tbz/tbnz for a single bit, else ands #imm) */
         uint64_t v = s->imm & (d->size == 1 ? 0xffull : 0xffffull);
         int ds = pin_slot(d->reg);
         int rn = ds >= 0 ? pin_hreg(ds) : JT0;
@@ -8858,8 +8363,6 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     } else if ((d->size == 1 || d->size == 2) && producer->op == OCERZ_OP_TEST &&
                !d_mem && !s_mem && s->kind == OCERZ_OPK_REG && !d->high8 && !s->high8 &&
                (jcc->cc == OCERZ_CC_E || jcc->cc == OCERZ_CC_NE)) {
-        /* narrow test reg,reg feeding je/jne: AND the raw registers, then a
-         * flag-setting mask to the width (the record is the masked value) */
         uint64_t mask = d->size == 1 ? 0xffull : 0xffffull;
         int ds = pin_slot(d->reg), ss = pin_slot(s->reg);
         int ra = ds >= 0 ? pin_hreg(ds) : JT0, rb = ss >= 0 ? pin_hreg(ss) : JT1;
@@ -8870,13 +8373,10 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         record_src = JT2; record_dst = JT2;
         ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0);
     } else if (d->size == 1 || d->size == 2) {
-        /* narrow: NZCV from a 32-bit op on left-shifted operands, flag record
-         * from the unshifted zero-extended values at the narrow size. */
         int size = d->size, sh = 32 - 8 * size;
         uint64_t mask = size == 1 ? 0xffull : 0xffffull;
         if (!d_in_jt0) { emit_gpr_rd(b, 1, JT0, d->reg); if (size == 1) a64_uxtb(b, JT0, JT0); else a64_uxth(b, JT0, JT0); }
         if (s_in_jt1) {
-            /* loaded value is already zero-extended */
         } else if (s->kind == OCERZ_OPK_REG) {
             emit_gpr_rd(b, 1, JT1, s->reg);
             if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
@@ -8889,8 +8389,8 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             record_src = JT0; record_dst = JT1;
             ccop = ocerz_cc_pack(OCERZ_CC_SUB, size, 0);
         } else {
-            a64_ands_reg(b, 0, JT2, JTA, JTU, 0);      /* NZ from shifted; result in JT2 (shifted) */
-            a64_lsr_imm(b, 0, JT2, JT2, sh);            /* unshift for the record */
+            a64_ands_reg(b, 0, JT2, JTA, JTU, 0);
+            a64_lsr_imm(b, 0, JT2, JT2, sh);
             record_src = JT2; record_dst = JT2;
             ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0);
         }
@@ -8913,8 +8413,6 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             if (v == 0 && cc_is_zero_test) {
                 cbz_rn = record_src; cbz_sf = sf; record_dst = A64_ZR;
             } else if (v <= 4095 || ((v & 0xfff) == 0 && (v >> 12) <= 4095)) {
-                /* immediate compare (optionally lsl #12); the record still needs
-                 * the value in a register only if the flags stay live */
                 if (v <= 4095) a64_subs_imm(b, sf, A64_ZR, record_src, (uint32_t)v);
                 else           a64_subs_imm_sh12(b, sf, A64_ZR, record_src, (uint32_t)(v >> 12));
                 rec_imm_pending = 1; rec_imm = v;
@@ -8972,8 +8470,6 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0);
     }
     if (gap) {
-        /* NZCV (or the loaded value in a temp) is live now; the gap touches
-         * only pinned registers, none of them a compare operand */
         uint32_t *gl = a64_label(b);
         int ok = emit_flag_neutral(b, gap);
         assert(ok && "flag_neutral_ok admitted an unhandled shape");
@@ -8984,12 +8480,8 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     int taken_cond = fused_jcc_cond(producer, jcc);
 
     if (g_jcc_side_mode && !self_loop) {
-        /* superblock side exit: the record (if anything may read the flags on
-         * either path) goes inline before the branch; the taken side is an
-         * out-of-line chain stub registered in g_side; fall-through continues */
         int taken_live = g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0;
         int need_rec = g_jcc_side_need != 0 || taken_live;
-        /* where the record goes: before the branch when both sides may read it; after the branch when */
         int rec_after = need_rec && !taken_live;
         static int nostub = -1; if (nostub < 0) nostub = getenv("OCERZ_NO_RECSTUB") ? 1 : 0;
         int rec_stub = !nostub && need_rec && taken_live && g_jcc_side_fall_need == 0 && producer->op == OCERZ_OP_CMP &&
@@ -9001,14 +8493,13 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
                 emit_defer_flags(b, ccop, record_src, record_dst);
             } else {
                 if (test_bit >= 0) {
-                    /* the LOGIC result is not materialized on the tbz path: compute it */
                     a64_mov_imm64(b, JT2, test_mask);
                     a64_and_reg(b, 1, JT2, test_rn, JT2, 0);
                 }
                 emit_defer_flags(b, ccop, JT2, JT2);
             }
         }
-        if (g_n_side >= SIDE_MAX) return 0;   /* cannot happen: the caller checked */
+        if (g_n_side >= SIDE_MAX) return 0;
         g_side[g_n_side].site = a64_label(b);
         g_side[g_n_side].taken = taken;
         g_side[g_n_side].idx = -1;
@@ -9016,7 +8507,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         g_side[g_n_side].patch_b = NULL;
         g_side[g_n_side].rec = rec_stub;
         g_side[g_n_side].fpb = -1; g_side[g_n_side].fpb_chk = 0;
-        g_side[g_n_side].l0_dirty = g_l0_dirty;      /* the stub flushes what is dirty here */
+        g_side[g_n_side].l0_dirty = g_l0_dirty;
         for (int r = 0; r < 16; r++) { g_side[g_n_side].l0[r] = g_l0[r]; g_side[g_n_side].l0_dbl[r] = g_l0_dbl[r]; }
         g_side[g_n_side].jcc_rip = jcc->rip;
         g_side[g_n_side].ft_rip = jcc->rip + jcc->len;
@@ -9036,7 +8527,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         } else {
             a64_bcond(b, taken_cond, 0);
         }
-        if (g_side[g_n_side - 1].probe) {           /* fall-through probe detour (see g_flip) */
+        if (g_side[g_n_side - 1].probe) {
             g_side[g_n_side - 1].ft_site = a64_label(b);
             a64_b(b, 0);
         }
@@ -9118,10 +8609,6 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
         g_jcc_edge[1].target_rip = taken;
         g_jcc_edge[1].patch_b = pb_taken;
-        /* the taken side's flag record sits between the conditional branch
-         * and the chain tail: a short-circuit past it hands the successor a
-         * stale record (libcef's btree cell walk, `cmp ebp,0xb ; jbe L` with
-         * `L: ja`, failed every SQLite open that way) */
         g_jcc_edge[1].cond_site = cond_short_site(to_taken, taken_rec, body_edge);
         g_jcc_edge[1].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
         g_jcc_edge[1].pin_class = body_edge ? (uint8_t)edge_class : 0;
@@ -9135,8 +8622,6 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     l0_fixed_backedge(b);
     int tb_ok = 0;
     if (test_bit >= 0) {
-        /* single-bit test on the back edge: tbz/tbnz when the loop head is
-         * within imm14 reach, else the ands the fold left out */
         ptrdiff_t reach = g_loop_entry - a64_label(b);
         tb_ok = reach >= -(ptrdiff_t)(1 << 13) && reach < (ptrdiff_t)(1 << 13);
         if (!tb_ok && !a64_try_ands_imm(b, test_sf, JT2, test_rn, test_mask)) {
@@ -9160,14 +8645,10 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             emit_defer_flags(b, ccop, record_src, record_dst);
         }
         else {
-            /* the fold never computed the masked value: on this (not-taken)
-             * side the tested bit is known */
             if (test_bit >= 0) a64_mov_imm64(b, JT2, jcc->cc == OCERZ_CC_E ? test_mask : 0);
             emit_defer_flags(b, ccop, JT2, JT2);
         }
     }
-    /* loop exit: chain into the fall-through block like any other edge
-     * (used to leave through the frame epilogue + dispatcher every time) */
     {
         int edge_class = body_edge_pin_class();
         int body_edge = edge_class >= 0;
@@ -9187,7 +8668,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             emit_defer_flags(b, ccop, record_src, record_dst);
         }
         else {
-            if (test_bit >= 0) a64_mov_imm64(b, JT2, jcc->cc == OCERZ_CC_E ? 0 : test_mask);   /* taken side */
+            if (test_bit >= 0) a64_mov_imm64(b, JT2, jcc->cc == OCERZ_CC_E ? 0 : test_mask);
             emit_defer_flags(b, ccop, JT2, JT2);
         }
     }
@@ -9245,7 +8726,7 @@ static int emit_incdec_jcc(A64Buf *b, const X86Insn *producer,
                            int *n_epi, uint32_t **jcc_label)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     if (!can_fuse_incdec_jcc(producer, jcc) || !g_defer)
         return 0;
     const X86Operand *d = &producer->ops[0];
@@ -9306,7 +8787,7 @@ static int emit_arith_incdec_jcc(A64Buf *b, const X86Insn *arith,
                                  uint32_t **jcc_label)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     if (!g_defer || g_no_jccfuse || g_no_regflags || g_no_chain ||
         g_no_jcclink || arith_need != OCERZ_CF ||
         (arith->op != OCERZ_OP_ADD && arith->op != OCERZ_OP_SUB) ||
@@ -9426,7 +8907,7 @@ static int emit_logic_jmp_incdec_jcc(A64Buf *b, const X86Insn *logic,
                                      uint32_t **jmp_label)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     if (!g_defer || g_no_jccfuse || g_no_regflags || g_no_chain ||
         g_no_jcclink || g_pin_class != 1 || logic_need != OCERZ_CF ||
         (logic->op != OCERZ_OP_AND && logic->op != OCERZ_OP_OR &&
@@ -9440,7 +8921,7 @@ static int emit_logic_jmp_incdec_jcc(A64Buf *b, const X86Insn *logic,
     volatile uint64_t pc = jmp->ops[0].imm;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
+    if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         while (n < 2) {
             int rc = ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -9540,7 +9021,7 @@ static int decode_ifconv_block(uint64_t rip, X86Insn *out, int cap)
     volatile uint64_t pc = rip;
     sigjmp_buf db;
     sigjmp_buf *prev = ocerz_jit_decode_recover;
-    if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
+    if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         while (n < cap) {
             if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
@@ -9720,7 +9201,7 @@ static int emit_ifconv_diamond(A64Buf *b, const X86Insn *test,
                                uint32_t **jcc_label)
 {
     if (g_xlat_mode32)
-        return 0;      /* stage 9: no instruction fusion in a 32-bit block */
+        return 0;
     IfConvDiamond m;
     if (!match_ifconv_diamond(test, jcc, &m))
         return 0;
@@ -9832,13 +9313,11 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     if (insn->op != OCERZ_OP_JCC)
         return 0;
     unsigned cc = insn->cc;
-    uint64_t taken = insn->ops[0].imm;   /* the decoder already wrapped EIP */
+    uint64_t taken = insn->ops[0].imm;
     uint64_t fall = insn->rip + insn->len;
     if (insn->mode32)
         fall = (uint32_t)fall;
 
-    /* NZCV: NE <=> taken.  Inline evaluation of a pending cmp/test record
-     * (no C call) or, failing that, materialize + RFLAGS. */
     int self_loop = !g_no_chain && g_loop_entry && taken == g_self_rip;
     int two_way = !self_loop && !g_no_chain && !g_no_jcclink;
     g_cc_want_cbz = two_way;
@@ -9846,8 +9325,6 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     g_cc_want_cbz = 0;
     int direct = (two_way || self_loop) ? g_cc_direct : -1;
     if (self_loop && direct >= 0) {
-        /* direct condition on the back edge (patchable stop site); the exit
-         * chains to the fall-through block; a stop leaves with RIP = head */
         l0_fixed_backedge(b);
         g_stop_patch = a64_label(b);
         a64_bcond(b, direct, (int32_t)(g_loop_entry - g_stop_patch));
@@ -9873,7 +9350,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
     if (!two_way) {
         a64_mov_imm64(b, JT1, fall);
         a64_mov_imm64(b, JT2, taken);
-        a64_csel(b, 1, JT0, JT2, JT1, A64_NE);   /* NE <=> taken (negation folded) */
+        a64_csel(b, 1, JT0, JT2, JT1, A64_NE);
         a64_str(b, 8, JT0, 20, RIP_OFF);
     }
 
@@ -9883,7 +9360,6 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         l0_fixed_backedge(b);
         g_stop_patch = a64_label(b);
         a64_bcond(b, A64_EQ, (int32_t)(g_loop_entry - g_stop_patch));
-        /* loop exit: chain to the fall-through block (RIP=fall already stored) */
         {
             int edge_class = body_edge_pin_class();
             int body_edge = edge_class >= 0;
@@ -9919,7 +9395,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
             b, fall, poll_fall, body_edge, epilogue_sites, n_epi);
 
         uint32_t *ltaken = a64_label(b);
-        if ((*to_taken & 0x7e000000u) == 0x34000000u) a64_patch_cbz(to_taken, ltaken);   /* cbz/cbnz site */
+        if ((*to_taken & 0x7e000000u) == 0x34000000u) a64_patch_cbz(to_taken, ltaken);
         else a64_patch_bcond(to_taken, ltaken);
         uint32_t *pb_taken = emit_static_chain_tail(
             b, taken, poll_taken, body_edge, epilogue_sites, n_epi);
@@ -10004,16 +9480,8 @@ static int callret_inline_enabled(void)
     return en;
 }
 
-/* Host entry to record for a return target: under full pinning the caller
- * and callee share the register layout, so return straight into the BODY
- * (tag bit 0 set) and skip the frame traffic; otherwise the function entry. */
-/* Under full pinning every compiled block shares the layout, so RAS entries
- * are plain body pointers (or NULL) and RET branches without a tag check. */
 static int ras_body_only(void)
 {
-    /* must match the conditions under which CALL/RET emit the bl/ret + untagged
-     * body-pointer protocol (fast3); evaluated dynamically because plain
-     * memory can be retired at runtime (the transition purges the RAS) */
     return fullpin_enabled() && !g_no_regflags && stack_plain_access_ok() && jgb_usable() &&
            !stack_guard_needed() && !g_no_chain && !g_no_ras;
 }
@@ -10030,7 +9498,7 @@ static void *ras_entry_for(const JitBlock *blk)
 void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
 {
     uint32_t t = cpu->ras_top;
-    if (ras_body_only()) {                 /* ring semantics */
+    if (ras_body_only()) {
         JitBlock *blk = cache_lookup(vm->jit, retaddr, cpu->mode32);
         cpu->ras[t & (OCERZ_RAS_SIZE - 1)].guest_rip = retaddr;
         cpu->ras[t & (OCERZ_RAS_SIZE - 1)].host_entry = ras_entry_for(blk);
@@ -10054,8 +9522,7 @@ static void patch_local_adr(uint32_t *at, uint32_t *target, int rd)
 {
     ptrdiff_t off = (char *)target - (char *)at;
     if (!(off >= -(1 << 20) && off < (1 << 20)))
-        return;   /* overflow mode: labels point at b->sink and the whole
-                   * translation is discarded - nothing to patch */
+        return;
     uint32_t imm = (uint32_t)((uint64_t)off & 0x1fffffu);
     *at = 0x10000000u | ((imm & 3u) << 29) |
           (((imm >> 2) & 0x7ffffu) << 5) | (uint32_t)(rd & 31);
@@ -10094,7 +9561,7 @@ static int emit_call_region_call(A64Buf *b, const X86Insn *insn,
     }
     patch_guard_skip(skip, a64_label(b));
 
-    emit_xmm_pin_spill_all(b);            /* callee body sees xmm in memory */
+    emit_xmm_pin_spill_all(b);
     uint32_t *adr = a64_label(b);
     a64_emit32(b, 0x10000000u | (uint32_t)JRET_HOST);
     uint32_t *callee_patch = a64_label(b);
@@ -10102,7 +9569,7 @@ static int emit_call_region_call(A64Buf *b, const X86Insn *insn,
 
     uint32_t *host_cont = a64_label(b);
     patch_local_adr(adr, host_cont, JRET_HOST);
-    emit_xmm_pin_load_all(b);             /* back from the callee: reload pins */
+    emit_xmm_pin_load_all(b);
     uint32_t *return_patch = emit_body_chain_tail(b, retaddr, 0,
                                                   epi_sites, n_epi);
 
@@ -10175,12 +9642,11 @@ static int emit_call_region_ret(A64Buf *b, const X86Insn *insn,
     return 1;
 }
 
-/* ---- i386 near CALL / near RET ------------------------------------------- A 4-byte return */
 static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
                            uint32_t **epi_sites, int *n_epi)
 {
     int size = insn->opsize ? insn->opsize : 4;
-    if (size != 4)                       /* 0x66 call/ret: 2-byte slot */
+    if (size != 4)
         return 0;
     if (!m32_stack_ok(insn))
         return 0;
@@ -10188,11 +9654,11 @@ static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
 
     if (insn->op == OCERZ_OP_CALL) {
         if (insn->ops[0].kind != OCERZ_OPK_IMM)
-            return 0;                    /* indirect: interpreted */
+            return 0;
         if (!mem_native_store_ok())
             return 0;
         uint64_t retaddr = (uint32_t)(insn->rip + insn->len);
-        uint64_t target = insn->ops[0].imm;   /* decoder already wrapped EIP */
+        uint64_t target = insn->ops[0].imm;
 
         a64_mov_imm64(b, JT1, retaddr);
         a64_sub_imm(b, 0, JTA, hs, 4);
@@ -10228,11 +9694,11 @@ static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
                 return 0;
             pop += (uint32_t)(insn->ops[0].imm & 0xffff);
         }
-        if (pop > 4095)                  /* a64_add_imm is imm12 */
+        if (pop > 4095)
             return 0;
         a64_ldr_regoff_uxtw(b, 4, JT0, JGB, hs);
         a64_add_imm(b, 0, hs, hs, pop);
-        a64_str(b, 8, JT0, 20, RIP_OFF);   /* the ldr zero-extended EIP */
+        a64_str(b, 8, JT0, 20, RIP_OFF);
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
         epi_sites[*n_epi] = a64_label(b);
         a64_b(b, 0);
@@ -10281,23 +9747,18 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         static int no_blret = -1;
         if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
         if (fast3 && ras_body_only() && !g_no_ras && !no_blret) {
-            /* Host call/return protocol: the RAS entry's host pointer is the continuation right after a `bl` */
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             uint32_t *adr_site;
             if (host_ras_enabled()) {
-                /* host-stack shadow: {retaddr, cont} pushed BEFORE the guest
-                 * push (a faulting shadow push = host stack overflow -> the
-                 * whole CALL re-runs in the interpreter, nothing done yet) */
                 adr_site = a64_label(b);
-                a64_emit32(b, 0x10000000u | (uint32_t)JT0);      /* adr JT0, cont (patched) */
+                a64_emit32(b, 0x10000000u | (uint32_t)JT0);
                 a64_stp_pre(b, JT1, JT0, 31, -16);
                 emit_push_pinned(b, hs, JT1);
             } else {
                 emit_push_pinned(b, hs, JT1);
-                /* RAS is a ring: monotonic top, index = top & (SIZE-1) */
                 a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
                 adr_site = a64_label(b);
-                a64_emit32(b, 0x10000000u | (uint32_t)JT0);      /* adr JT0, cont (patched) */
+                a64_emit32(b, 0x10000000u | (uint32_t)JT0);
                 a64_and_imm_or_mov(b, 0, JTF, JT2, OCERZ_RAS_SIZE - 1);
                 a64_add_reg(b, 1, JTA, 20, JTF, 4);
                 if (RAS_OFF <= 504) a64_stp_off(b, JT1, JT0, JTA, RAS_OFF);
@@ -10305,16 +9766,11 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 a64_add_imm(b, 0, JT2, JT2, 1);
                 a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
             }
-            /* bl into the callee body (chained).  The continuation must be the
-             * word right after the bl so the hardware return stack matches
-             * the RAS entry; the not-yet-chained fallback goes out of line. */
             uint32_t *pb_callee = a64_label(b);
-            a64_emit32(b, 0x94000000u);                          /* bl fallback (patched below / by chaining) */
+            a64_emit32(b, 0x94000000u);
             uint32_t *cont = a64_label(b);
             patch_local_adr(adr_site, cont, JT0);
-            /* continuation: chain into the return-address block */
             uint32_t *pb_ret = emit_body_chain_tail(b, retaddr, 0, epi_sites, n_epi);
-            /* out-of-line callee fallback: RIP = target, exit to the dispatcher */
             uint32_t *callee_fb = a64_label(b);
             *pb_callee = 0x94000000u | ((uint32_t)(callee_fb - pb_callee) & 0x03ffffffu);
             a64_mov_imm64(b, JT0, target);
@@ -10338,8 +9794,6 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             return 1;
         }
         if (fast3) {
-            /* pinned guest rsp + JGB: push in 3 words; RIP is stored by the
-             * chain tail's fallback only (the hot path chains into the callee) */
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             emit_push_pinned(b, hs, JT1);
         } else {
@@ -10376,9 +9830,8 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 a64_subs_imm(b, 0, A64_ZR, JT2, OCERZ_RAS_SIZE);
                 uint32_t *full = a64_label(b);
                 a64_bcond(b, A64_CS, 0);
-                if (!fast3) a64_mov_imm64(b, JT1, retaddr);   /* fast3: JT1 still holds it */
+                if (!fast3) a64_mov_imm64(b, JT1, retaddr);
                 if (lit) {
-                    /* ldr JT0, <pool cell> -- patched when the pool is laid out */
                     g_raslit[g_n_raslit].site = a64_label(b);
                     g_raslit[g_n_raslit].retaddr = retaddr;
                     g_raslit[g_n_raslit].kind = 0;
@@ -10389,7 +9842,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                     a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)slot);
                     a64_ldr(b, 8, JT0, JTA, 0);
                 }
-                a64_add_reg(b, 1, JTA, 20, JT2, 4);           /* &ras[top] (16-byte entries) */
+                a64_add_reg(b, 1, JTA, 20, JT2, 4);
                 a64_str(b, 8, JT1, JTA, RAS_OFF);
                 a64_str(b, 8, JT0, JTA, RAS_OFF + 8);
                 a64_add_imm(b, 0, JT2, JT2, 1);
@@ -10422,7 +9875,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
                 a64_add_imm(b, 1, hs, hs, 8);
             }
-            if (!ras_body_only()) a64_str(b, 8, JT1, 20, RIP_OFF);   /* else: stored on the miss paths */
+            if (!ras_body_only()) a64_str(b, 8, JT1, 20, RIP_OFF);
         } else {
             emit_gpr_rd(b, 1, JT0, OCERZ_RSP);
             a64_mov_reg(b, 1, JTA, JT0);
@@ -10445,10 +9898,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             int hostras = fast3 && ras_body_only() && host_ras_enabled();
             if (!hostras) a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
             if (hostras) {
-                /* host-stack shadow: pop {guest, cont}; the sentinel {0,0} below the
-                 * frame makes an empty pop miss (cbz on the continuation too) */
             } else if (fast3 && ras_body_only()) {
-                /* ring: top-1 & (SIZE-1); an unpushed slot holds {0, NULL} and misses */
                 a64_sub_imm(b, 0, JT2, JT2, 1);
                 a64_and_imm_or_mov(b, 0, JTU, JT2, OCERZ_RAS_SIZE - 1);
                 a64_add_reg(b, 1, JTA, 20, JTU, 4);
@@ -10464,7 +9914,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             if (hostras) a64_ldp_post(b, JTF, host_reg, 31, 16);
             else if (RAS_OFF <= 504) a64_ldp_off(b, JTF, host_reg, JTA, RAS_OFF);
             else { a64_ldr(b, 8, JTF, JTA, RAS_OFF); a64_ldr(b, 8, host_reg, JTA, RAS_OFF + 8); }
-            a64_subs_reg(b, 1, A64_ZR, JTF, JT1, 0);       /* JT1 = return address */
+            a64_subs_reg(b, 1, A64_ZR, JTF, JT1, 0);
             ras_stale[nst] = a64_label(b); a64_bcond(b, A64_NE, 0); nst++;
             ras_stale[nst] = a64_label(b); a64_cbz(b, 1, host_reg, 0); nst++;
 
@@ -10472,16 +9922,10 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
             uint32_t *not_body = NULL;
             if (g_pin_class == 3 && fast3 && ras_body_only()) {
-                /* entries are host continuations (after a bl): return through
-                 * the predicted return stack; without the bl protocol they are
-                 * body pointers: plain br */
                 if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
                 if (use_ret) a64_ret(b); else a64_br(b, JT0);
-                /* the full-leave path below is unreachable but keeps the
-                 * generic epilogue shape; RIP for the miss paths */
                 not_body = NULL;
             } else if (g_pin_class == 3) {
-                /* tagged entry = callee body with our own register layout */
                 not_body = a64_label(b); a64_tbz(b, JT0, 0, 0);
                 if (!a64_try_and_imm(b, 1, JT0, JT0, ~1ull)) { a64_mov_imm64(b, JTU, 1); a64_bic_reg(b, 1, JT0, JT0, JTU, 0); }
                 if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
@@ -10489,8 +9933,6 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 a64_patch_tbz(not_body, a64_label(b));
                 if (!a64_try_and_imm(b, 1, JT0, JT0, ~1ull)) { a64_mov_imm64(b, JTU, 1); a64_bic_reg(b, 1, JT0, JT0, JTU, 0); }
             } else {
-                /* a tagged (body) entry is only usable from a class-3 block:
-                 * treat it as a RAS miss here */
                 ras_stale[nst] = a64_label(b); a64_tbnz(b, JT0, 0, 0); nst++;
             }
             emit_xmm_pin_spill_all(b);
@@ -10506,25 +9948,25 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             uint32_t *miss_pop = a64_label(b);
             if (!hostras) a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
             if (fast3 && ras_body_only()) a64_str(b, 8, JT1, 20, RIP_OFF);
-            if (ocerz_perfstat > 0) {   /* count stale (popped) misses */
+            if (ocerz_perfstat > 0) {
                 a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_stale);
                 a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
             }
             uint32_t *skip_rip = NULL;
-            if (fast3 && ras_body_only()) { skip_rip = a64_label(b); a64_b(b, 0); }   /* miss_pop already stored RIP */
+            if (fast3 && ras_body_only()) { skip_rip = a64_label(b); a64_b(b, 0); }
             uint32_t *miss = a64_label(b);
             if (ras_empty) a64_patch_cbz(ras_empty, miss);
             if (fast3 && ras_body_only()) { a64_str(b, 8, JT1, 20, RIP_OFF); a64_patch_b(skip_rip, a64_label(b)); }
-            if (ocerz_perfstat > 0) {   /* count all misses */
+            if (ocerz_perfstat > 0) {
                 a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_miss);
                 a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
             }
             for (int i = 0; i < nst; i++) {
                 if ((*ras_stale[i] & 0x7f000000u) == 0x36000000u ||
                     (*ras_stale[i] & 0x7f000000u) == 0x37000000u)
-                    a64_patch_tbz(ras_stale[i], miss_pop);   /* tbz/tbnz */
+                    a64_patch_tbz(ras_stale[i], miss_pop);
                 else if ((*ras_stale[i] & 0xff000010u) == 0x54000000u)
-                    a64_patch_bcond(ras_stale[i], miss_pop); /* b.cond */
+                    a64_patch_bcond(ras_stale[i], miss_pop);
                 else
                     a64_patch_cbz(ras_stale[i], miss_pop);
             }
@@ -10535,8 +9977,6 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
     if (insn->op == OCERZ_OP_CALL && g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
         stack_plain_access_ok() && jgb_usable() && !stack_guard_needed() && !g_no_chain) {
-        /* lands on the chain tail (never the exit): x0 stays JGB, the tail's
-         * fallback sets STEP_OK itself */
         g_chain_keeps_jgb = 1;
     } else {
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
@@ -10549,11 +9989,6 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     return 1;
 }
 
-/* Emit: target(JT1) -> RIP; monomorphic IC probe; on miss an inline hashed
- * lookup of the block cache (walks up to 4 chain entries); found -> br host
- * code; else C fill of the IC slot + epilogue to the dispatcher. */
-/* Global dispatch stub. */
-/* The in-arena block dispatcher, one per guest mode. */
 static void emit_dispatch_stub(OcerzJit *jit, int mode32)
 {
     A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
@@ -10565,14 +10000,12 @@ static void emit_dispatch_stub(OcerzJit *jit, int mode32)
     to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 0, JT0, 0);
     a64_ldr(&b, 4, JT0, 0, (uint32_t)offsetof(struct OcerzVM, exited));
     to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 0, JT0, 0);
-    a64_ldr(&b, 8, JT1, 1, RIP_OFF);                    /* JT1 = rip */
-    /* dyldapi range must go through C */
+    a64_ldr(&b, 8, JT1, 1, RIP_OFF);
     a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_LO);
     a64_sub_reg(&b, 1, JTT, JT1, JTU, 0);
     a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO);
     a64_subs_reg(&b, 1, A64_ZR, JTT, JTU, 0);
     to_ret[nr++] = a64_label(&b); a64_bcond(&b, A64_CC, 0);
-    /* JT1 = the cache key. */
     if (mode32) {
         int ok = a64_try_orr_imm(&b, 1, JT1, JT1, JIT_KEY_M32);
         assert(ok && "JIT_KEY_M32 must encode as a logical immediate");
@@ -10589,16 +10022,12 @@ static void emit_dispatch_stub(OcerzJit *jit, int mode32)
     a64_mov_imm64(&b, JTA, (uint64_t)(uintptr_t)jit->buckets);
     a64_ldr_regoff(&b, 8, JTF, JTA, JTT, 1);
     for (int k = 0; k < 6; k++) {
-        /* every chain-end test must reach the C fallback: an unpatched cbz
-         * (offset 0) is a branch to itself -- a hang the moment a hash chain
-         * ends at depth 2..5 (only ever seen with Wine-sized block counts) */
         to_ret[nr++] = a64_label(&b); a64_cbz(&b, 1, JTF, 0);
         a64_ldr(&b, 8, JTU, JTF, (uint32_t)offsetof(JitBlock, key));
         a64_sub_reg(&b, 1, JTU, JTU, JT1, 0);
         uint32_t *nxt = a64_label(&b); a64_cbnz(&b, 1, JTU, 0);
         a64_ldr(&b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, code));
         uint32_t *nocode = a64_label(&b); a64_cbz(&b, 1, JT0, 0);
-        /* found & compiled: x0=vm, x1=cpu are untouched (we only used x9-x15) */
         a64_br(&b, JT0);
         uint32_t *cont = a64_label(&b);
         a64_patch_cbz(nxt, cont);
@@ -10634,12 +10063,10 @@ static void emit_indirect_leave_br(A64Buf *b, int code_reg)
     a64_br(b, code_reg);
 }
 
-/* Shared "leave the block and enter target function entry in JT0" stub for the current block */
-/* When non-NULL, emit_indirect_tail is emitting an indirect CALL under the host bl/ret protocol */
 static uint32_t **g_ind_call_cont;
-static uint32_t *g_ind_call_tocont;   /* the `b` after the blr, to patch to the continuation code */
-static int g_ind_treg = JT1;     /* register holding the indirect target for emit_indirect_tail's fast path */
-static uint64_t g_dbg_ind_src;   /* OCERZ_WILDLOG: rip of the indirect jmp/call being emitted */
+static uint32_t *g_ind_call_tocont;
+static int g_ind_treg = JT1;
+static uint64_t g_dbg_ind_src;
 static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
                                uint32_t **epi_sites, int *n_epi)
 {
@@ -10650,12 +10077,9 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
             a64_str(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, dbg_ind_src));
         }
     }
-    uint32_t *to_blr = NULL;              /* hash-hit path -> the shared blr site */
-    /* per-site direct-mapped cache: {rip, body} x 32, indexed by rip bits
-     * 2..6; hit -> poll interrupt, br body.  Miss falls into the global
-     * hash lookup, which fills the entry when it finds a compatible body. */
+    uint32_t *to_blr = NULL;
     JitPscEnt *psc = NULL;
-    int treg = g_ind_treg;                /* target: a pin (no copy) or JT1 */
+    int treg = g_ind_treg;
     g_ind_treg = JT1;
     if (g_pin_class == 3 && g_n_raslit < RASLIT_MAX && !ENV_ON("OCERZ_NO_PSC"))
         psc = psc_alloc();
@@ -10666,26 +10090,23 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         g_raslit[g_n_raslit].kind = 1;
         g_raslit[g_n_raslit].rt = JT2;
         g_n_raslit++;
-        a64_emit32(b, 0x58000000u | (uint32_t)JT2);        /* ldr JT2, <table> */
+        a64_emit32(b, 0x58000000u | (uint32_t)JT2);
         a64_ubfx(b, 1, JTT, treg, 2, 5);
-        a64_add_reg(b, 1, JT2, JT2, JTT, 4);              /* JT2 = &table[idx] */
+        a64_add_reg(b, 1, JT2, JT2, JTT, 4);
         a64_ldp_off(b, JTU, JT0, JT2, 0);
         a64_subs_reg(b, 1, A64_ZR, JTU, treg, 0);
         psc_miss = a64_label(b); a64_bcond(b, A64_NE, 0);
         uint32_t *intr = NULL;
         int stop_site_ok = g_n_stop_extra < 6;
-        if (!stop_site_ok) {                       /* out of stop slots: poll */
+        if (!stop_site_ok) {
             a64_ldr(b, 4, JTU, 20, INT_OFF);
             intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
         }
         uint32_t *br_site = a64_label(b);
         if (g_ind_call_cont) {
-            /* shared blr site: hardware pushes the continuation */
             to_blr = a64_label(b);
             a64_blr(b, JT0);
             *g_ind_call_cont = a64_label(b);
-            /* the continuation code is emitted by the caller after this tail;
-             * jump over the rest of the tail to reach it */
             g_ind_call_tocont = a64_label(b); a64_b(b, 0);
         } else {
             a64_br(b, JT0);
@@ -10693,7 +10114,6 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         uint32_t *stop_lbl = a64_label(b);
         if (intr) a64_patch_cbz(intr, stop_lbl);
         if (stop_site_ok) stop_extra_add(br_site, stop_lbl);
-        /* interrupt / stop: leave via the epilogue with RIP = target */
         a64_str(b, 8, treg, 20, RIP_OFF);
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
         epi_sites[*n_epi] = a64_label(b);
@@ -10701,10 +10121,8 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         (*n_epi)++;
         a64_patch_bcond(psc_miss, a64_label(b));
     }
-    if (treg != JT1) a64_mov_reg(b, 1, JT1, treg);   /* the slow paths below work on JT1 */
-    a64_str(b, 8, JT1, 20, RIP_OFF);      /* every path from here may leave to the dispatcher */
-    /* hash_key(target): 64-bit code only, where the key IS the rip (see
-     * JIT_KEY_M32); the compare below is against JitBlock.key. */
+    if (treg != JT1) a64_mov_reg(b, 1, JT1, treg);
+    a64_str(b, 8, JT1, 20, RIP_OFF);
     a64_lsr_imm(b, 1, JTT, JT1, 33);
     a64_eor_reg(b, 1, JTT, JTT, JT1, 0);
     a64_mov_imm64(b, JTU, 0xff51afd7ed558ccdull);
@@ -10714,8 +10132,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
     a64_mov_imm64(b, JTU, JIT_HASH_MASK);
     a64_and_reg(b, 1, JTT, JTT, JTU, 0);
     a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)g_xlat_jit->buckets);
-    a64_ldr_regoff(b, 8, JTF, JTA, JTT, 1);               /* JTF = bucket head */
-    /* loop: */
+    a64_ldr_regoff(b, 8, JTF, JTA, JTT, 1);
     uint32_t *loop = a64_label(b);
     uint32_t *to_nofind = a64_label(b); a64_cbz(b, 1, JTF, 0);
     a64_ldr(b, 8, JTU, JTF, (uint32_t)offsetof(JitBlock, key));
@@ -10723,7 +10140,6 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
     uint32_t *found = a64_label(b); a64_cbz(b, 1, JTU, 0);
     a64_ldr(b, 8, JTF, JTF, (uint32_t)offsetof(JitBlock, hnext));
     { uint32_t *here = a64_label(b); a64_b(b, (int32_t)(loop - here)); }
-    /* found: */
     a64_patch_cbz(found, a64_label(b));
     uint32_t *to_full = NULL;
     if (g_pin_class == 1 || g_pin_class == 3) {
@@ -10732,11 +10148,11 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         to_full = a64_label(b); a64_cbnz(b, 0, JTU, 0);
         a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, body_code));
         uint32_t *nobody = a64_label(b); a64_cbz(b, 1, JT0, 0);
-        if (psc) a64_stp_off(b, JT1, JT0, JT2, 0);        /* fill the site cache entry */
+        if (psc) a64_stp_off(b, JT1, JT0, JT2, 0);
         uint32_t *intr = NULL;
         int stop_site_ok2 = g_n_stop_extra < 6;
         if (!stop_site_ok2) {
-            a64_ldr(b, 4, JTU, 20, INT_OFF);              /* interrupt poll (back edges) */
+            a64_ldr(b, 4, JTU, 20, INT_OFF);
             intr = a64_label(b); a64_cbnz(b, 0, JTU, 0);
         }
         if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
@@ -10754,10 +10170,8 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         if (intr) a64_patch_cbz(intr, stop_lbl2);
         if (stop_site_ok2 && !to_blr) stop_extra_add(br_site2, stop_lbl2);
         else if (stop_site_ok2 && to_blr && br_site2 != to_blr) stop_extra_add(br_site2, stop_lbl2);
-        /* interrupt or no body: fall to the epilogue (RIP already stored) */
         uint32_t *to_epi = a64_label(b); a64_b(b, 0);
         a64_patch_cbz(to_full, a64_label(b));
-        /* different layout: full leave into the function entry */
         a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, code));
         uint32_t *nocode = a64_label(b); a64_cbz(b, 1, JT0, 0);
         emit_indirect_leave_br(b, JT0);
@@ -10769,7 +10183,6 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         emit_indirect_leave_br(b, JT0);
         a64_patch_cbz(nocode, a64_label(b));
     }
-    /* not found / no code: epilogue -> dispatcher compiles it */
     a64_patch_cbz(to_nofind, a64_label(b));
     (void)slot;
     a64_mov_imm64(b, 0, OCERZ_STEP_OK);
@@ -10778,7 +10191,6 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
     (*n_epi)++;
 }
 
-/* Load an indirect branch target operand (reg or mem) into JT1. */
 static int emit_branch_target(A64Buf *b, const X86Insn *insn, const X86Operand *o,
                               uint32_t **exit_sites, int *n_exits)
 {
@@ -10788,8 +10200,6 @@ static int emit_branch_target(A64Buf *b, const X86Insn *insn, const X86Operand *
             return 0;
         if (rsp_is_ptr() && o->reg == OCERZ_RSP)
             return 0;
-        /* a pinned target register is used directly by the site-cache lookup
-         * (no copy); rsp is not (a CALL's push moves it first) */
         if (pin_slot(o->reg) >= 0 && o->reg != OCERZ_RSP && !ENV_ON("OCERZ_NO_IND_TREG")) {
             g_ind_treg = pin_hreg(pin_slot(o->reg));
             return 1;
@@ -10800,8 +10210,6 @@ static int emit_branch_target(A64Buf *b, const X86Insn *insn, const X86Operand *
     if (o->kind == OCERZ_OPK_MEM) {
         if (o->size != 8)
             return 0;
-        /* same fast forms as an ordinary load (identity/hoisted bases, no
-         * commpage guard when the block is unmarked) */
         if (emit_plain_mem_fast(b, insn, o, 8, JT1, 0, 0))
             return 1;
         if (!emit_mem_ea(b, insn, o, JTA))
@@ -10844,7 +10252,6 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
     if (ENV_ON("OCERZ_EXP_MAT_IND")) emit_materialize(b);
     if (!emit_branch_target(b, insn, &insn->ops[0], exit_sites, n_exits))
         return 0;
-    /* push return address (target already in JT1) */
     uint64_t retaddr = insn->rip + insn->len;
     {
         static int no_blret_i = -1;
@@ -10858,15 +10265,14 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
             uint32_t *adr_site;
             if (host_ras_enabled()) {
                 adr_site = a64_label(b);
-                a64_emit32(b, 0x10000000u | (uint32_t)JT0);      /* adr JT0, cont */
-                a64_stp_pre(b, JT2, JT0, 31, -16);               /* host-stack shadow {retaddr, cont} */
+                a64_emit32(b, 0x10000000u | (uint32_t)JT0);
+                a64_stp_pre(b, JT2, JT0, 31, -16);
                 emit_push_pinned(b, hs, JT2);
             } else {
                 emit_push_pinned(b, hs, JT2);
-                /* RAS push: {retaddr, &cont} (ring: monotonic top, index top & (SIZE-1)) */
                 a64_ldr(b, 4, JTF, 20, RAS_TOP_OFF);
                 adr_site = a64_label(b);
-                a64_emit32(b, 0x10000000u | (uint32_t)JT0);      /* adr JT0, cont */
+                a64_emit32(b, 0x10000000u | (uint32_t)JT0);
                 a64_and_imm_or_mov(b, 0, JTU, JTF, OCERZ_RAS_SIZE - 1);
                 a64_add_reg(b, 1, JTA, 20, JTU, 4);
                 if (RAS_OFF <= 504) a64_stp_off(b, JT2, JT0, JTA, RAS_OFF);
@@ -10874,7 +10280,6 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
                 a64_add_imm(b, 0, JTF, JTF, 1);
                 a64_str(b, 4, JTF, 20, RAS_TOP_OFF);
             }
-            /* dispatch through the site cache / hash with a shared blr site */
             uint32_t *cont = NULL;
             g_ind_call_cont = &cont;
             g_ind_call_tocont = NULL;
@@ -10884,7 +10289,6 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
             if (cont && to_cont) {
                 patch_local_adr(adr_site, cont, JT0);
                 a64_patch_b(to_cont, a64_label(b));
-                /* continuation: chain into the return-address block */
                 uint32_t *pb_ret = emit_body_chain_tail(b, retaddr, 0, epi_sites, n_epi);
                 g_jcc_edge[0].target_rip = retaddr;
                 g_jcc_edge[0].patch_b = pb_ret;
@@ -10893,7 +10297,6 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
                 g_jcc_edge[0].pin_class = 3;
                 g_n_jcc_edges = 1;
             } else {
-                /* cannot happen (both paths emit the blr site) */
                 assert(0 && "indirect call: no continuation site");
             }
             return 1;
@@ -10909,7 +10312,6 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
     a64_sub_imm(b, 1, JT0, JT0, 8);
     emit_gpr_wr(b, JT0, OCERZ_RSP);
     patch_guard_skip(skip, a64_label(b));
-    /* RAS push so the matching ret predicts */
     if (!g_no_ras) {
         void **rslot = ras_slot_alloc();
         if (rslot) {
@@ -10941,8 +10343,6 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
 
-    /* inside an elided frame the retaddr slot is garbage; the interpreter
-     * (or an exit it requests) may expose it - write the address first */
     if (g_pe_insns && g_n_pe_real && pin_slot(OCERZ_RSP) >= 0) {
         int hsp = pin_hreg(pin_slot(OCERZ_RSP));
         for (int i = 0; i < g_n_pe_real; i++) {
@@ -10961,8 +10361,8 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
     emit_materialize(b);
 
-    l0_flush_all(b);                     /* deferred lane-0 results must reach the v regs */
-    emit_xmm_pin_spill_all(b);           /* interpreter reads/writes cpu->xmm */
+    l0_flush_all(b);
+    emit_xmm_pin_spill_all(b);
     emit_spill_pinned(b);
     a64_mov_reg(b, 1, 0, 19);
     a64_mov_reg(b, 1, 1, 20);
@@ -10983,12 +10383,11 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     a64_blr(b, 16);
     g_callout_seq++;
     emit_fill_pinned(b);
-    emit_xmm_pin_load_all(b);            /* BEFORE the exit test: exit_label spills V regs,
-                                            so they must equal memory on that path too */
+    emit_xmm_pin_load_all(b);
     exit_sites[*n_exits] = a64_label(b);
     a64_cbnz(b, 0, 0, 0);
     (*n_exits)++;
-    emit_reload_jgb(b);           /* JGB first: the hoisted bases derive from it */
+    emit_reload_jgb(b);
     emit_reload_mem_base(b);
     if (g_pe_insns && g_n_promo_real && pin_slot(OCERZ_RSP) >= 0) {
         int hsp = pin_hreg(pin_slot(OCERZ_RSP));
@@ -11111,20 +10510,18 @@ static void chain_batch_end(void)
     g_chain_batching = 0;
 }
 
-/* Retarget the conditional branch that feeds a chain trampoline straight at
- * the destination when it is in range (b.cond/cbz: +-1MB, tbz: +-32KB). */
 static void chain_cond_short(uint32_t *cond_site, void *dst)
 {
     if (!cond_site || !dst) return;
     chaincheck("chain_cond_short", dst);
-    if (g_xlat_jit && g_xlat_jit->stop_requested) return;   /* stop sites must stay reachable */
+    if (g_xlat_jit && g_xlat_jit->stop_requested) return;
     uint32_t w = *cond_site;
     ptrdiff_t off = (uint32_t *)dst - cond_site;
     uint32_t nw;
-    if ((w & 0xff000010u) == 0x54000000u || (w & 0x7e000000u) == 0x34000000u) {   /* b.cond / cbz / cbnz */
+    if ((w & 0xff000010u) == 0x54000000u || (w & 0x7e000000u) == 0x34000000u) {
         if (off < -(1 << 18) || off >= (1 << 18)) return;
         nw = (w & ~(0x7ffffu << 5)) | (((uint32_t)off & 0x7ffffu) << 5);
-    } else if ((w & 0x7e000000u) == 0x36000000u) {                                 /* tbz / tbnz */
+    } else if ((w & 0x7e000000u) == 0x36000000u) {
         if (off < -(1 << 13) || off >= (1 << 13)) return;
         nw = (w & ~(0x3fffu << 5)) | (((uint32_t)off & 0x3fffu) << 5);
     } else return;
@@ -11139,8 +10536,6 @@ static void chain_cond_short(uint32_t *cond_site, void *dst)
         sys_icache_invalidate(cond_site, 4);
     }
 }
-/* OCERZ_CHAINCHECK: validate every published jump target against the code
- * arena; a guest address or heap pointer here becomes a wild host jump. */
 static void chaincheck(const char *what, const void *dst)
 {
     static int en = -1;
@@ -11156,7 +10551,7 @@ static void chain_activate(uint32_t *patch_b, void *dst)
         return;
     chaincheck("chain_activate", dst);
     if (g_xlat_jit && g_xlat_jit->stop_requested)
-        return;                          /* stop sites must keep their stop branch */
+        return;
     int ok;
     if (g_chain_batching) {
         ok = a64_try_patch_b(patch_b, (uint32_t *)dst);
@@ -11179,12 +10574,12 @@ static void chain_activate(uint32_t *patch_b, void *dst)
 }
 
 typedef struct PendingChain {
-    uint64_t target_key;           /* jit_key(target rip, mode32) */
+    uint64_t target_key;
     uint32_t *patch_b;
     uint32_t *cond_site;
     void **ras_slot;
-    uint64_t src_sig;              /* source block's hoist signature (body edges) */
-    JitBlock *src;                 /* source block + edge index (predecessor record) */
+    uint64_t src_sig;
+    JitBlock *src;
     uint8_t edge;
     uint8_t kind;
     uint8_t pin_class;
@@ -11195,7 +10590,6 @@ typedef struct PendingChain {
 #define PEND_MASK (PEND_SIZE - 1)
 static PendingChain *g_pending[PEND_SIZE];
 
-/* Record that src's edge e is chained into target (see JitBlock.preds). */
 static void pred_add(JitBlock *target, JitBlock *src, int e)
 {
     if (!target || !src || target == src) return;
@@ -11272,12 +10666,9 @@ static void pending_add_ras(uint64_t target_key, void **ras_slot)
     g_pending[h] = e;
 }
 
-/* body entry for a chained predecessor: after the hoisted-base reload when
- * the predecessor left the same hoisted registers (same signature) */
 static void *body_entry_for(const JitBlock *t, uint64_t src_sig)
 {
     static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_HOIST_HANDOFF") ? 1 : 0;
-    /* never across a hoisted x30 (JMEMBASE3): a bl into the callee clobbers it */
     if (!dis && src_sig && t->hoist_sig == src_sig && t->body_noreload && ((src_sig >> 24) & 0xff) == 0)
         return (void *)t->body_noreload;
     return (void *)t->body_code;
@@ -11304,7 +10695,6 @@ static void pending_drain(uint64_t key, JitBlock *target)
                     pred_add(target, e->src, e->edge);
                 }
             } else {
-                /* no cond short-circuit: the full entry needs the tail's spill */
                 chain_activate(e->patch_b, (void *)target->code);
                 pred_add(target, e->src, e->edge);
             }
@@ -11323,7 +10713,7 @@ static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
     int extra_stop = poll && !patch_stop && g_n_stop_extra < 6;
     uint32_t *intr = NULL;
     if (!xmm_global_enabled())
-        emit_xmm_pin_spill_all(b);       /* per-block layouts: xmm state to memory */
+        emit_xmm_pin_spill_all(b);
     if (poll && !patch_stop && !extra_stop) {
         a64_ldr(b, 4, JT1, 20, INT_OFF);
         intr = a64_label(b);
@@ -11348,7 +10738,6 @@ static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
     emit_side_tag(b, 20);
     a64_mov_imm64(b, JT0, target_rip);
     a64_str(b, 8, JT0, 20, RIP_OFF);
-    /* a profiled exit must reach C: a nonzero status skips the arena dispatcher */
     a64_mov_imm64(b, 0, g_tag_blk ? OCERZ_STEP_PROFILE : OCERZ_STEP_OK);
     epilogue_sites[*n_epi] = a64_label(b);
     a64_b(b, 0);
@@ -11380,7 +10769,7 @@ static uint32_t *emit_chain_tail(A64Buf *b, int poll)
     a64_patch_b(patch_b, fallback);
     if (poll)
         a64_patch_cbz(intr, fallback);
-    emit_side_tag(b, 1);                 /* x1 = cpu here */
+    emit_side_tag(b, 1);
     a64_mov_imm64(b, 0, OCERZ_STEP_OK);
     a64_ret(b);
     return patch_b;
@@ -11398,9 +10787,6 @@ static uint32_t *emit_static_chain_tail(A64Buf *b, uint64_t target_rip,
     return emit_chain_tail(b, poll);
 }
 
-/* May `in` write general register `reg` (any width)?  Conservative: the
- * destination operand of everything, plus the implicit writers.  Used to
- * decide whether a hoisted (guest_base + base) stays valid across a block. */
 static int insn_may_write_gpr(const X86Insn *in, unsigned reg)
 {
     reg &= 15;
@@ -11432,7 +10818,7 @@ static int insn_may_write_gpr(const X86Insn *in, unsigned reg)
         if (reg == OCERZ_RSI || reg == OCERZ_RDI || reg == OCERZ_RCX || reg == OCERZ_RAX) return 1;
         break;
     case OCERZ_OP_SYSCALL: case OCERZ_OP_INT: case OCERZ_OP_INT3:
-        return 1;                       /* kernel/emulator side: rax, rdx (2nd result), rcx, r11, ... */
+        return 1;
     case OCERZ_OP_XCHG: case OCERZ_OP_XADD:
         for (int k = 0; k < in->nops; k++)
             if (in->ops[k].kind == OCERZ_OPK_REG && (in->ops[k].reg & 15) == reg) return 1;
@@ -11443,12 +10829,8 @@ static int insn_may_write_gpr(const X86Insn *in, unsigned reg)
     default:
         break;
     }
-    /* generic: the destination operand */
     if (in->nops > 0 && in->ops[0].kind == OCERZ_OPK_REG && (in->ops[0].reg & 15) == reg)
         return 1;
-    /* anything not classified above that touches memory implicitly or is
-     * exotic: be safe for the string/stack family already handled; the rest
-     * only writes ops[0] */
     return 0;
 }
 
@@ -11465,16 +10847,11 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
                      term->ops[0].imm == rip) ||
                     (term->op == OCERZ_OP_JMP && term->ops[0].kind == OCERZ_OPK_IMM &&
                      term->ops[0].imm == rip);
-    /* straight-line blocks hoist too when a base has >= 2 accesses: the
-     * reload at body entry (1 word) is paid once per entry and saves one add
-     * per access; identity mode needs none of this (bases are their own) */
     static int hoist_all = -1; if (hoist_all < 0) hoist_all = getenv("OCERZ_NO_HOIST_ALL") ? 0 : 1;
     if (!self_loop && (!hoist_all || ocerz_guest_base == 0)) return -1;
     static int mc = -1; if (mc < 0) { const char *e = getenv("OCERZ_HOIST_MIN"); mc = e ? atoi(e) : 2; }
     int min_count = self_loop ? 1 : mc;
 
-    /* candidate bases: every memory operand's base register; pick the one
-     * with the most accesses that no instruction in the block may write */
     int count[16] = {0};
     int aux[16] = {0};
     for (int i = 0; i < n; i++) {
@@ -11486,7 +10863,6 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
             if (pin_slot(mem->base) < 0) continue;
             unsigned bb = mem->base & 15;
             count[bb]++;
-            /* a scale-1 index is a base too ([b + i] == [i + b]) */
             if (mem->index != OCERZ_REG_NONE && (mem->scale & 3) == 0 && pin_slot(mem->index) >= 0 &&
                 !(rsp_is_ptr() && (mem->index == OCERZ_RSP || mem->base == OCERZ_RSP)))
                 count[mem->index & 15]++;
@@ -11518,9 +10894,6 @@ static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
     g_mem_hoist_greg2 = second;
     g_mem_hoist_greg3 = third;
     g_mem_hoist_aux_index = -1;
-    /* index aux: if the hoisted base's accesses mostly share one (index, scale)
-     * pair that no instruction writes before their last use, keep
-     * base + index<<scale in JMEMAUX (recomputed at the loop head) */
     {
         int icnt[16][4] = {{0}};
         int ilast[16][4] = {{0}};
@@ -11670,20 +11043,12 @@ static int code_index_append_locked(OcerzJit *jit, JitBlock *block)
     return 1;
 }
 
-/* Out-of-line interpreter fallbacks: an emitter's rare-case branch (cbz/cbnz/
- * b.cond) targets a stub emitted after the body that runs the instruction in
- * the interpreter and branches back, so the common path has no taken branch. */
 #define OOLSLOW_MAX 32
 static struct { uint32_t *sites[3]; int nsites; const X86Insn *insn; uint32_t *back; uint32_t pre; } g_oolslow[OOLSLOW_MAX];
 static int g_n_oolslow;
 static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32_t *back)
 {
     if (g_n_oolslow >= OOLSLOW_MAX || nsites > 3) return 0;
-    /* The arm runs the instruction out of line (a C call, temps clobbered)
-     * and comes back to `back`: whatever the address cache says JTA holds
-     * is gone on that path, and the next instruction must recompute.  A
-     * misaligned `lock add word [r8+rsi]` followed by `lock or word
-     * [r8+rsi]` reused a dead JTA and atomically or'ed address 0. */
     ea_cache_reset();
     for (int i = 0; i < nsites; i++) g_oolslow[g_n_oolslow].sites[i] = sites[i];
     g_oolslow[g_n_oolslow].nsites = nsites;
@@ -11697,15 +11062,14 @@ static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32
 static void patch_any_branch(uint32_t *site, uint32_t *target)
 {
     uint32_t w = *site;
-    if ((w & 0x7e000000u) == 0x34000000u) a64_patch_cbz(site, target);          /* cbz/cbnz */
-    else if ((w & 0x7e000000u) == 0x36000000u) a64_patch_tbz(site, target);     /* tbz/tbnz */
-    else if ((w & 0xff000010u) == 0x54000000u) a64_patch_bcond(site, target);   /* b.cond */
+    if ((w & 0x7e000000u) == 0x34000000u) a64_patch_cbz(site, target);
+    else if ((w & 0x7e000000u) == 0x36000000u) a64_patch_tbz(site, target);
+    else if ((w & 0xff000010u) == 0x54000000u) a64_patch_bcond(site, target);
     else a64_patch_b(site, target);
 }
 static void emit_oolslow_arms(A64Buf *b, uint32_t **exit_sites, int *n_exits)
 {
     for (int k = 0; k < g_n_oolslow; k++) {
-        /* every recorded pointer must lie in the block being emitted */
         int sane = g_oolslow[k].back >= g_push_entry && g_oolslow[k].back < b->p;
         for (int i = 0; sane && i < g_oolslow[k].nsites; i++)
             sane = g_oolslow[k].sites[i] >= g_push_entry && g_oolslow[k].sites[i] < b->p;
@@ -11723,7 +11087,6 @@ static void emit_oolslow_arms(A64Buf *b, uint32_t **exit_sites, int *n_exits)
     g_n_oolslow = 0;
 }
 
-/* Misaligned ordered access (the address crosses a 16-byte granule, so a single acquire/release */
 static void emit_misaligned_pieces_st(A64Buf *b, int psize, int n, int rv, int ra, int32_t disp, int s1)
 {
     a64_stlur(b, psize, rv, ra, disp);
@@ -11734,24 +11097,17 @@ static void emit_misaligned_pieces_st(A64Buf *b, int psize, int n, int rv, int r
 }
 static void emit_misaligned_arm(A64Buf *b, const OrderedSlowPend *o)
 {
-    /* scratch: JTF/JTT are never live across a guest memory access (JT0-JT2
-     * can be: rmw old/new values, bt indices; JTU: a vector store's second
-     * half); a host-stack spill instead costs 2-3x on the arm */
     int cand[3] = { JTF, JTT, JTU }, sc[2], n = 0;
     for (int i = 0; i < 3 && n < 2; i++)
         if (cand[i] != o->rv && cand[i] != o->ra) sc[n++] = cand[i];
     int s1 = sc[0], s2 = sc[1];
     int size = o->size;
     if (!o->store) {
-        /* loads: a plain load + dmb ishld.  Piece assembly (ldapur + bfi
-         * chain) is a serial dependency into the destination and measured
-         * 2.5x slower on memcpy; ldr + dmb ishld is 1x-2x a plain access. */
         if (o->vec) a64_ldr_v(b, size, o->rv, o->ra, (uint32_t)o->disp);
         else        a64_ldr(b, size, o->rv, o->ra, 0);
         a64_dmb_ishld(b);
         return;
     }
-    /* stores: the cost of dmb ish + plain store is the store-buffer drain, i.e. */
     if (o->vec && g_blk_ordered_loads) {
         a64_dmb_ish(b);
         a64_str_v(b, size, o->rv, o->ra, (uint32_t)o->disp);
@@ -11771,8 +11127,6 @@ static void emit_misaligned_arm(A64Buf *b, const OrderedSlowPend *o)
         }
         return;
     }
-    /* vector store pieces: halves in s1 (low) / s2 (high), shifted in place;
-     * 4-byte pieces when 4-aligned, 2-byte when 2-aligned, else bytes */
     int nh = size == 16 ? 2 : 1, hs = size == 4 ? 4 : 8;
     if (size == 4)  a64_fmov_x_from_v(b, 0, s1, o->rv); else a64_fmov_x_from_v(b, 1, s1, o->rv);
     if (nh == 2)    a64_umov_gpr(b, 8, s2, o->rv, 1);
@@ -11825,20 +11179,12 @@ static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *ent
     g_n_oslow = 0;
 }
 
-/* Call inlining: a small straight-line callee ending in a plain ret is
- * spliced into the caller's block.  The call becomes a return-address push,
- * the ret a compare-against-the-known-return-address pop; a mismatch (the
- * guest repointed its return slot) leaves at the ret's rip and re-enters
- * through the normal dispatcher, which executes the real ret. */
-static uint8_t  g_ic_kind[JIT_MAX_BLOCK_INSNS];      /* 0 none, 1 pushed call, 2 checked ret, 3 elided ret */
-static uint64_t g_ic_expect[JIT_MAX_BLOCK_INSNS];    /* kind 2: the return rip */
-static uint8_t  g_ic_pushelide[JIT_MAX_BLOCK_INSNS]; /* kind 1: retaddr push provably dead */
-static int32_t  g_ic_pair_rj[JIT_MAX_BLOCK_INSNS];   /* kind 1 with pushelide: the matching ret */
-static uint8_t  g_promo_reg[JIT_MAX_BLOCK_INSNS];    /* push/pop: promo host reg (0 = memory) */
-static int32_t  g_promo_mate[JIT_MAX_BLOCK_INSNS];   /* push: its matching pop */
-/* next insn emits only a register mov plus an rsp += 8 (promoted pop or
- * elided ret): safe to defer this insn's rsp add onto it - no fault, exit,
- * or rsp read can occur in between */
+static uint8_t  g_ic_kind[JIT_MAX_BLOCK_INSNS];
+static uint64_t g_ic_expect[JIT_MAX_BLOCK_INSNS];
+static uint8_t  g_ic_pushelide[JIT_MAX_BLOCK_INSNS];
+static int32_t  g_ic_pair_rj[JIT_MAX_BLOCK_INSNS];
+static uint8_t  g_promo_reg[JIT_MAX_BLOCK_INSNS];
+static int32_t  g_promo_mate[JIT_MAX_BLOCK_INSNS];
 static int rsp_run_member(const X86Insn *insns, int j, int n, int fast3)
 {
     if (j >= n) return 0;
@@ -11852,11 +11198,6 @@ static int inline_calls_off(void)
     if (off < 0) off = getenv("OCERZ_NO_INLINE_CALL") != NULL;
     return off;
 }
-/* Recursively splice callee(s) into scratch[] starting at *vn.  Appends the
- * callee's instructions, turning a nested direct call into another splice
- * (depth-limited) and the final ret into a checked-ret marker carrying
- * ret_rip.  Returns 1 and advances *vn on success; on failure *vn is
- * restored and nothing is marked. */
 static int splice_callee(uint64_t target, uint64_t ret_rip, uint64_t self_rip,
                          X86Insn *scratch, int *vn, int depth)
 {
@@ -11874,7 +11215,7 @@ static int splice_callee(uint64_t target, uint64_t ret_rip, uint64_t self_rip,
         unsigned op = in->op;
         if (op == OCERZ_OP_RET) {
             if (in->nops != 0)
-                goto fail;                          /* plain ret only */
+                goto fail;
             g_ic_kind[*vn] = 2;
             g_ic_expect[*vn] = ret_rip;
             (*vn)++;
@@ -11910,8 +11251,6 @@ static int ret_flags_live(void)
     if (v < 0) v = getenv("OCERZ_RET_FLAGS_LIVE") != NULL;
     return v;
 }
-/* Bisection aid: OCERZ_RETFL_LO/HI keep flags live across returns and
- * indirect calls whose instruction lies in [lo, hi) only. */
 static int ret_flags_live_at(uint64_t rip)
 {
     static int have = -1; static uint64_t lo, hi;
@@ -11924,14 +11263,6 @@ static int ret_flags_live_at(uint64_t rip)
     return ret_flags_live();
 }
 
-/* Flags across a return.  No ABI passes them, but clang's outliner does:
- * vImage's `cmpq $0, init_CGInterfaces(%rip); retq` helpers hand their
- * compare back in EFLAGS and the caller branches on it after the call
- * (found 2026-09-05: every Wine window painted black because CoreGraphics
- * concluded libCGInterfaces had not loaded).  A pure flag producer that
- * reaches the ret with nothing else writing flags is such a result, so
- * its flags stay live; a tail whose last flag writer is arithmetic
- * (xor eax,eax; ret) returns a value, and the dead seam keeps its win. */
 static uint64_t ret_seam_live(const X86Insn *insns, int n)
 {
     for (int i = n - 2; i >= 0; i--) {
@@ -11947,15 +11278,11 @@ static uint64_t ret_seam_live(const X86Insn *insns, int n)
             return 0;
         }
     }
-    return OCERZ_FL_ALL;                /* the writer is in an earlier block: unknown, keep them */
+    return OCERZ_FL_ALL;
 }
 
 static int churn_blacklisted(uint64_t rip);
 
-/* Drop the decoded array once the block is compiled.  A GUI Wine process
- * carried ~870 bytes of X86Insn per block across 215k blocks (180 MB); what
- * the block still needs at run time fits the 16-byte JitInsnRef plus full
- * copies of the slow-call and fault-flag-producer insns. */
 static void compact_block(JitBlock *blk)
 {
     int n = blk->n_insns;
@@ -11993,7 +11320,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_xlat_mode32 = mode32;
 
     if (ocerz_exc_trap_rip && rip == ocerz_exc_trap_rip)
-        return NULL;                 /* OCERZ_EXCLOG: keep the throw site interpreted */
+        return NULL;
     { extern uint64_t ocerz_cxa_throw_rip; if (ocerz_cxa_throw_rip && rip == ocerz_cxa_throw_rip) return NULL; }
 
     if (churn_blacklisted(rip)) {
@@ -12003,12 +11330,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (clog && (++refn & 0xfff) == 0)
             fprintf(stderr, "ocerz: CHURNREF[%d] n=%llu rip=%#llx\n", (int)getpid(),
                     (unsigned long long)refn, (unsigned long long)rip);
-        return NULL;                 /* invalidation-storm region: interpret */
+        return NULL;
     }
 
-    {   /* OCERZ_INTERP_LO/HI: never compile a block starting inside [lo,hi);
-         * the range runs in the interpreter.  Bisection tool for JIT
-         * miscompiles: shrink the range until the misbehaviour returns. */
+    {
         static uint64_t ilo = 0, ihi = 0, ilo2 = 0, ihi2 = 0; static int irng = -1;
         if (irng < 0) {
             const char *l = getenv("OCERZ_INTERP_LO"), *h = getenv("OCERZ_INTERP_HI");
@@ -12020,9 +11345,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (irng && ((rip >= ilo && rip < ihi) || (rip >= ilo2 && rip < ihi2)))
             return NULL;
     }
-    {   /* OCERZ_INTERP_RIP=a[,b,...]: never compile a block starting at these
-         * guest addresses - they fall back to the interpreter, where
-         * OCERZ_RIPTRAP can observe them even in an otherwise JIT run. */
+    {
         static uint64_t irips[8];
         static int n_irips = -1;
         if (n_irips < 0) {
@@ -12055,7 +11378,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         memset(g_ic_kind, 0, sizeof g_ic_kind);
         memset(g_ic_pushelide, 0, sizeof g_ic_pushelide);
         memset(g_promo_reg, 0, sizeof g_promo_reg);
-        if (sigsetjmp(db, 0) == 0) {   /* SA_NODEFER handlers: no mask to restore, no sigprocmask syscall */
+        if (sigsetjmp(db, 0) == 0) {
             ocerz_jit_decode_recover = &db;
             for (; vn < JIT_MAX_BLOCK_INSNS; ) {
                 const uint8_t *code = (const uint8_t *)ocerz_g2h(vpc);
@@ -12073,30 +11396,22 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                     if (splice_callee(scratch[at].ops[0].imm, vpc + len, rip,
                                       scratch, &vni, 1)) {
                         vn = vni;
-                        vpc += len;        /* resume at the return address */
+                        vpc += len;
                         continue;
                     }
                     g_ic_kind[at] = 0;
                 }
                 vn++;
                 if (is_terminator(op)) {
-                    /* superblock: continue past a forward jcc (taken side exits
-                     * out of line), up to SIDE_MAX times per block */
-                    /* No superblocks in a 32-bit block: extending past a Jcc puts a Jcc in the middle of the block */
                     if (op == OCERZ_OP_JCC && !mode32 && superblock_enabled() && !g_no_chain &&
                         vext < SIDE_MAX && vn < JIT_MAX_BLOCK_INSNS - 1 &&
                         scratch[vn - 1].ops[0].kind == OCERZ_OPK_IMM &&
                         (scratch[vn - 1].ops[0].imm > vpc + len ||
-                         /* backward jcc that is not this block's own back edge:
-                          * the taken side is a loop elsewhere, the fall-through
-                          * continues inline (no chained b for the not-taken path) */
                          (superblock_back_enabled() && scratch[vn - 1].ops[0].imm != rip &&
                           scratch[vn - 1].ops[0].imm < vpc))) {
                         vext++;
                         if (scratch[vn - 1].ops[0].imm > vpc + len &&
                             jcc_flip_wanted(scratch[vn - 1].rip)) {
-                            /* follow the taken edge: the side exit becomes the
-                             * complement branch to the old fall-through */
                             uint64_t tgt = scratch[vn - 1].ops[0].imm;
                             scratch[vn - 1].ops[0].imm = vpc + len;
                             scratch[vn - 1].cc ^= 1;
@@ -12178,7 +11493,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_rsp_lag = 0;
     g_pe_insns = blk->insns;
     g_n_call_edges = 0;
-    /* Out-of-line slow-arm and stop-site state MUST start clean: a translation that returns without */
     g_n_oolslow = 0;
     g_oolslow_pre = 0;
     g_n_stop_extra = 0;
@@ -12219,9 +11533,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             g_pin_min = 1;
     }
     const X86Insn *term = &blk->insns[n - 1];
-    /* pin class 2 (call region) keeps guest rsp as guest_base+rsp in a host
-     * register and speaks the 8-byte CALL/RET protocol; a 32-bit block uses
-     * neither, so it never qualifies. */
     int call_region = !g_no_regflags && !ocerz_low_base && !mode32 &&
         (term->op == OCERZ_OP_CALL || term->op == OCERZ_OP_RET);
     if (call_region && term->op == OCERZ_OP_CALL) {
@@ -12370,8 +11681,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 
     g_mem_hoist_greg = select_mem_base_hoist(blk->insns, n, rip);
 
-    /* XMM pin mask: every xmm register any instruction of the block touches
-     * (blendv also reads xmm0).  Slow ops are fine: callouts spill/reload. */
     g_xmm_pinned = 0;
     if (xmm_pinning_enabled() && sse_enabled() && xmm_global_enabled() && !g_no_regflags) {
         g_xmm_pinned = 0xffff;
@@ -12423,42 +11732,38 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     if (g_pin_class == 2)
         a64_add_imm(&b, 1, 29, 31, 0);
     if (g_pin_class == 3 && host_ras_enabled()) {
-        /* frame base for the exits; sentinel pair so an empty RAS pop misses */
-        a64_add_imm(&b, 1, JT0, 31, 0);            /* mov JT0, sp */
+        a64_add_imm(&b, 1, JT0, 31, 0);
         a64_str(&b, 8, JT0, 20, JIT_FP_OFF);
-        a64_stp_pre(&b, 31, 31, 31, -16);          /* stp xzr, xzr, [sp, #-16]! */
+        a64_stp_pre(&b, 31, 31, 31, -16);
     }
 
     uint32_t *loop_poll_exit = NULL;
     if (xmm_global_enabled())
-        emit_xmm_pin_load_all(&b);       /* function entry only: body edges keep V16-V31 live */
+        emit_xmm_pin_load_all(&b);
     uint32_t *body_noreload = NULL;
     if (!g_no_chain && !jit->stop_requested) {
         g_body_entry = a64_label(&b);
         emit_reload_mem_base(&b);
         body_noreload = a64_label(&b);
-        {   /* OCERZ_BTRACE: record this guest block entry.  Gated at translate
-             * time, so an unset env var costs exactly nothing.  JT0/JT2/JTT/JTA
-             * are scratch at body entry (the RAS pop uses the same set). */
+        {
             static int bt = -1;
             if (bt < 0) bt = getenv("OCERZ_BTRACE") ? 1 : 0;
             if (bt) {
                 a64_ldr(&b, 8, JTA, 20, (uint32_t)offsetof(OcerzCPU, btrace));
                 a64_ldr(&b, 4, JT2, 20, (uint32_t)offsetof(OcerzCPU, btrace_n));
                 a64_ldr(&b, 4, JTT, 20, (uint32_t)offsetof(OcerzCPU, btrace_mask));
-                a64_and_reg(&b, 0, JTT, JT2, JTT, 0);        /* idx = n & mask */
-                a64_add_reg(&b, 1, JTA, JTA, JTT, 3);        /* &ring[idx] */
+                a64_and_reg(&b, 0, JTT, JT2, JTT, 0);
+                a64_add_reg(&b, 1, JTA, JTA, JTT, 3);
                 a64_mov_imm64(&b, JT0, rip);
                 a64_str(&b, 8, JT0, JTA, 0);
                 a64_add_imm(&b, 0, JT2, JT2, 1);
                 a64_str(&b, 4, JT2, 20, (uint32_t)offsetof(OcerzCPU, btrace_n));
             }
         }
-        if (ENV_ON("OCERZ_JGB_CHECK") && jgb_usable()) {   /* debug trap: body entered with x0 != gbase */
+        if (ENV_ON("OCERZ_JGB_CHECK") && jgb_usable()) {
             a64_mov_imm64(&b, JTU, ocerz_guest_base);
             a64_subs_reg(&b, 1, A64_ZR, 0, JTU, 0);
             uint32_t *okl = a64_label(&b); a64_bcond(&b, A64_EQ, 0);
-            /* report: x0 (bad), this block rip, then abort */
             a64_mov_reg(&b, 1, 1, 0);
             a64_mov_imm64(&b, 0, rip);
             a64_mov_imm64(&b, 16, (uint64_t)(uintptr_t)&ocerz_jgb_trap);
@@ -12467,10 +11772,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
         if (!xmm_global_enabled())
             emit_xmm_pin_load_all(&b);
-        /* align the loop head (self-loop back-edge target) to a fetch boundary. */
         { static int la = -1; if (la < 0) { const char *e = getenv("OCERZ_LOOP_ALIGN"); la = e ? (int)strtol(e, NULL, 0) : 32; }
-          /* only blocks that loop to their own head (self back-edge): a pad
-           * on the prologue path costs every indirect/chained entry (vm -5%) */
           int self_loop = 0;
           { const X86Insn *t = &blk->insns[n - 1];
             if ((t->op == OCERZ_OP_JCC || t->op == OCERZ_OP_JMP) && t->nops == 1 && t->ops[0].kind == OCERZ_OPK_IMM && t->ops[0].imm == rip) self_loop = 1; }
@@ -12496,8 +11798,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
               l0_fixed_setup(&b, blk->insns, n);
         }
         g_loop_entry = a64_label(&b);
-        /* Interrupt poll at the loop head. */
-        if (g_mem_hoist_greg >= 0 && g_mem_hoist_aux_index >= 0)   /* index aux: refresh every iteration */
+        if (g_mem_hoist_greg >= 0 && g_mem_hoist_aux_index >= 0)
             a64_add_reg(&b, 1, JMEMAUX, JMEMBASE, pin_hreg(pin_slot(g_mem_hoist_aux_index)), g_mem_hoist_aux_scale);
         static int loop_poll = -1;
         if (loop_poll < 0) loop_poll = getenv("OCERZ_LOOP_POLL") ? 1 : 0;
@@ -12510,7 +11811,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (!xmm_global_enabled())
             emit_xmm_pin_load_all(&b);
     }
-    if (ocerz_perfstat > 0) {   /* after body entry: counts every entry (PERFSTAT only) */
+    if (ocerz_perfstat > 0) {
         a64_mov_imm64(&b, JT0, (uint64_t)(uintptr_t)&blk->exec_count);
         a64_ldr(&b, 8, JT1, JT0, 0);
         a64_add_imm(&b, 1, JT1, JT1, 1);
@@ -12545,19 +11846,14 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             break;
         }
         case OCERZ_OP_CALL:
-            /* direct call: execution continues at the callee entry */
             if (term->ops[0].kind == OCERZ_OPK_IMM)
                 seam_seed = xlive_succ_live(jit, term->ops[0].imm);
             else if (!ret_flags_live_at(term->rip) && !mode32)
-                seam_seed = 0;   /* indirect call: no callee reads entry flags */
+                seam_seed = 0;
             break;
         case OCERZ_OP_RET:
-            /* No ABI passes arithmetic flags across a return, and the
-             * interpreter side of the differential gate would catch any
-             * corpus case that does. OCERZ_RET_FLAGS_LIVE restores the
-             * conservative seam. */
             if (!ret_flags_live_at(term->rip) && !mode32) {
-                static int dead = -1;          /* OCERZ_RET_FLAGS_DEAD=1: the pre-e3d15d2 rule, for A/B and tests */
+                static int dead = -1;
                 if (dead < 0) dead = getenv("OCERZ_RET_FLAGS_DEAD") != NULL;
                 seam_seed = dead ? 0 : ret_seam_live(blk->insns, n);
             }
@@ -12569,7 +11865,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     }
 
     uint64_t fl_need[JIT_MAX_BLOCK_INSNS];
-    uint64_t jcc_fall_live[JIT_MAX_BLOCK_INSNS];   /* side-exit jcc: flags live on the fall-through continuation */
+    uint64_t jcc_fall_live[JIT_MAX_BLOCK_INSNS];
     uint64_t entry_all;
     {
         uint64_t live_seam = seam_seed;
@@ -12578,7 +11874,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             uint64_t def, use;
             jcc_fall_live[i] = 0;
             if (i < n - 1 && blk->insns[i].op == OCERZ_OP_JCC) {
-                /* side exit: flags live at its taken target must be recorded too */
                 uint64_t tl = (g_no_xlive || blk->insns[i].ops[0].kind != OCERZ_OPK_IMM)
                               ? OCERZ_FL_ALL : xlive_succ_live(jit, blk->insns[i].ops[0].imm);
                 jcc_fall_live[i] = live_seam;
@@ -12591,9 +11886,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 ocerz_flags_defuse_nofault(&blk->insns[i], &def, &use);
             else
                 ocerz_flags_defuse(&blk->insns[i], &def, &use);
-            /* a jcc/setcc/cmov that will re-derive its condition from fcmp
-             * (comis fusion) does not read RFLAGS: don't keep the comis's
-             * flag write alive on its account */
             if ((blk->insns[i].op == OCERZ_OP_JCC || blk->insns[i].op == OCERZ_OP_SETCC ||
                  blk->insns[i].op == OCERZ_OP_CMOVCC) &&
                 ((sse_enabled() && comis_fuse_producer(blk->insns, i) >= 0) ||
@@ -12603,9 +11895,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                  blk->insns[i].op == OCERZ_OP_ADC || blk->insns[i].op == OCERZ_OP_SBB ||
                  blk->insns[i].op == OCERZ_OP_JCC) &&
                 nzcv_fuse_producer(blk->insns, i) >= 0)
-                use &= ~(uint64_t)JIT_ARITH_FLAGS;   /* consumer reads NZCV, no record needed */
+                use &= ~(uint64_t)JIT_ARITH_FLAGS;
             if (side_fused)
-                use = 0;                          /* the fused side exit reads NZCV, not the record */
+                use = 0;
             fl_need[i] = def & live_seam;
             live_seam = (live_seam & ~def) | use;
             live_all = (live_all & ~def) | use;
@@ -12613,7 +11905,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             if (g_no_lazyflags)
                 fl_need[i] = def;
         }
-        /* Published entry liveness: what a predecessor must supply. */
         static int pub_all = -1;
         if (pub_all < 0) pub_all = getenv("OCERZ_XLIVE_ALL") ? 1 : 0;
         entry_all = pub_all ? live_all : live_seam;
@@ -12621,13 +11912,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 
     blk->entry_live = (uint16_t)entry_all;
 
-    /* Inlined-call return checks: if between the push and the check the
-     * stack pointer moves only by push/pop and nothing stores to memory,
-     * the pushed slot provably still holds the return address (pushes only
-     * write below it; a guest signal frame lands below live rsp too).  The
-     * check's reload of the slot is then dead - and it is a
-     * store-to-load-forwarding stall on the hottest path of call-dense
-     * code - so drop it and just pop. */
     for (int ci = 0; ci < n; ci++) {
         if (g_ic_kind[ci] != 1) continue;
         int64_t delta = 0;
@@ -12636,10 +11920,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             const X86Insn *m = &blk->insns[k];
             if (g_ic_kind[k] == 2 || g_ic_kind[k] == 3) {
                 if (nest == 0) { rj = k; break; }
-                nest--; delta += 8;                 /* the inner ret pops */
+                nest--; delta += 8;
                 continue;
             }
-            if (g_ic_kind[k] == 1) { nest++; delta -= 8; continue; }   /* the inner call pushes */
+            if (g_ic_kind[k] == 1) { nest++; delta -= 8; continue; }
             switch (m->op) {
             case OCERZ_OP_PUSH:
                 if (m->nops > 0 && (m->ops[0].kind == OCERZ_OPK_MEM || m->ops[0].size != 8)) { safe = 0; break; }
@@ -12667,14 +11951,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             g_ic_kind[rj] = 3;
     }
 
-    /* Second, stricter pass: when a frame is pure register work (only reg
-     * push/pop and reg-to-reg ops, no memory operands, no rsp writes), the
-     * pushed return address is never read - the matching ret is already
-     * elided - so the push itself can become a bare rsp -= 8.  rsp stays
-     * architectural throughout; only the slot's CONTENT is garbage, and a
-     * fault inside the region repairs it from blk->pushelide.  Innermost
-     * frames must qualify before their enclosers (3 sweeps cover the
-     * nesting depth the splicer allows). */
     for (int sweep = 0; sweep < 3; sweep++) {
         for (int ci = 0; ci < n; ci++) {
             if (g_ic_kind[ci] != 1 || g_ic_pushelide[ci] || blk->insns[ci].mode32)
@@ -12726,11 +12002,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
     }
 
-    /* Frame-save promotion: inside the accepted regions the slot of a
-     * matched reg push/pop pair is provably never read or written, so the
-     * round trip through memory - a loop-carried store-to-load chain in
-     * call-dense loops - becomes two register renames.  x16/x17/x30 serve
-     * when they are not hoisted memory bases this block. */
     static int no_promo = -1;
     if (no_promo < 0) no_promo = getenv("OCERZ_NO_PROMO") ? 1 : 0;
     if (!no_promo && g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
@@ -12821,44 +12092,33 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         g_cur_need = fl_need[i];
         g_cur_insns = blk->insns; g_cur_insns_n = n;
         g_cur_fpb = fpb_of[i];
-        if (g_scpend.valid && g_scpend.idx < i - 1) scalar_pend_flush(&b);   /* insurance: never unconsumed */
+        if (g_scpend.valid && g_scpend.idx < i - 1) scalar_pend_flush(&b);
         g_fpb_open = fpb_open;
-        g_fpb_fast = fpb_open >= 0 && g_fpb_member[i];   /* region non-members emit normally */
+        g_fpb_fast = fpb_open >= 0 && g_fpb_member[i];
         ea_cache_step(insn, i > 0 ? &blk->insns[i - 1] : NULL);
         g_nzcv_want = 0;
         for (int j = i + 1; j < n && j <= i + 1 + NZCV_GAP_MAX; j++)
             if (nzcv_fuse_producer(blk->insns, j) == i) { g_nzcv_want = 1; break; }
-        /* lane-0 caches: a callout since the last instruction clobbered V4-V7;
-         * an xmm writer that is not cache-aware invalidates its destination */
         if (g_callout_seq != l0_last_seq) { l0_flush_all(&b); l0_reset(); l0_last_seq = g_callout_seq; }
         if (!l0_aware_op(insn->op)) {
-            /* a cache-unaware op reads architectural registers directly:
-             * any lane it might read must be current first */
             for (int k = 0; k < insn->nops; k++)
                 if (insn->ops[k].kind == OCERZ_OPK_XMM)
                     l0_flush_reg(&b, insn->ops[k].reg);
             if (insn->op == OCERZ_OP_BLENDVPD || insn->op == OCERZ_OP_BLENDVPS ||
                 insn->op == OCERZ_OP_PBLENDVB)
-                l0_flush_reg(&b, 0);   /* implicit xmm0 mask */
+                l0_flush_reg(&b, 0);
             for (int k = 0; k < insn->nops; k++)
                 if (insn->ops[k].kind == OCERZ_OPK_XMM && (k == 0 || insn->op == OCERZ_OP_BLENDVPD ||
                     insn->op == OCERZ_OP_BLENDVPS || insn->op == OCERZ_OP_PBLENDVB))
                     l0_inval(insn->ops[k].reg);
             if (insn->op == OCERZ_OP_FXRSTOR || insn->op == OCERZ_OP_SYSCALL) { l0_flush_all(&b); l0_reset(); }
         }
-        /* Control-flow discipline for deferred lanes: any branch can leave the
-         * block, and a jcc is often emitted fused with the flag producer just
-         * before it, so flush ahead of the producer too. */
         if (is_terminator(insn->op) ||
             (i + 1 < n && (blk->insns[i + 1].op == OCERZ_OP_JMP ||
                            (blk->insns[i + 1].op == OCERZ_OP_JCC && i + 1 == n - 1))))
-            l0_flush_all(&b);      /* a mid-block jcc is a side exit: its stub flushes */
-        /* FP batch boundaries: close an open batch before the first non-member,
-         * open one (checkpoint) at its first member */
+            l0_flush_all(&b);
         if (fpb_open >= 0 && (fpb_of[i] != fpb_open)) {
             fpb_emit_check(&b, &g_fpb[fpb_open]);
-            /* the lane-0 caches stay alive across the check: the replay path
-             * re-establishes exactly this state before it rejoins */
             for (int r = 0; r < 16; r++) { g_fpb[fpb_open].l0[r] = g_l0[r]; g_fpb[fpb_open].l0_dbl[r] = g_l0_dbl[r]; }
             fpb_open = -1;
             g_fpb_open = -1;
@@ -12876,8 +12136,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
         g_flag_producer = last_flag_def >= 0 ? &blk->insns[last_flag_def] : NULL;
         {
-            /* operands intact: scan intervening insns for writes to the
-             * producer's xmm operands (dst operand of an SSE insn) */
             g_flag_producer_operands_intact = 1;
             if (g_flag_producer) {
                 for (int k = last_flag_def + 1; k < i; k++) {
@@ -12895,8 +12153,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             if (pdef & JIT_ARITH_FLAGS)
                 last_flag_def = i;
         }
-        /* superblock side exit fused with its cmp/test producer over one
-         * flag-neutral gap instruction: cmp ; lea|mov ; jcc */
         if (g_n_side < SIDE_MAX && side_gap_fuse_ok(blk->insns, i, n)) {
             uint32_t *jcc_label = NULL, *gap_label = NULL;
             if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
@@ -12917,7 +12173,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 continue;
             }
         }
-        /* superblock side exit fused with its cmp/test producer */
         if (g_n_side < SIDE_MAX && side_fuse_ok(blk->insns, i, n)) {
             uint32_t *jcc_label = NULL;
             if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
@@ -12934,10 +12189,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 continue;
             }
         }
-        /* superblock side exit: forward jcc in the middle of the block */
         if (i < n - 1 && insn->op == OCERZ_OP_JCC) {
-            if (fpb_open >= 0 && fpb_of[i] != fpb_open) {   /* a region's jcc keeps its batch open */
-                l0_flush_all(&b);                             /* the check reads architectural lanes */
+            if (fpb_open >= 0 && fpb_of[i] != fpb_open) {
+                l0_flush_all(&b);
                 fpb_emit_check(&b, &g_fpb[fpb_open]);
                 for (int r = 0; r < 16; r++) { g_fpb[fpb_open].l0[r] = g_l0[r]; g_fpb[fpb_open].l0_dbl[r] = g_l0_dbl[r]; }
                 fpb_open = -1; g_fpb_open = -1; g_fpb_fast = 0; l0_reset();
@@ -12957,18 +12211,18 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 g_side[g_n_side].fpb = fpb_open >= 0 && g_fpb_sidechk[i] ? fpb_open : -1;
                 g_side[g_n_side].fpb_chk = g_fpb_sidechk[i];
                 g_side[g_n_side].fpb_end = i - 1;
-                g_side[g_n_side].l0_dirty = g_l0_dirty;      /* the stub flushes what is dirty here */
+                g_side[g_n_side].l0_dirty = g_l0_dirty;
                 for (int r = 0; r < 16; r++) { g_side[g_n_side].l0[r] = g_l0[r]; g_side[g_n_side].l0_dbl[r] = g_l0_dbl[r]; }
                 g_side[g_n_side].jcc_rip = insn->rip;
                 g_side[g_n_side].ft_rip = insn->rip + insn->len;
                 g_side[g_n_side].ft_site = NULL;
                 g_side[g_n_side].probe = probe_wanted(insn->rip, insn->rip + insn->len);
-                if (g_cc_cbz_reg >= 0) {                     /* value-cond E/NE: one cbz/cbnz */
+                if (g_cc_cbz_reg >= 0) {
                     if (g_cc_cbz_nz) a64_cbnz(&b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
                     else             a64_cbz(&b, g_cc_cbz_sf, g_cc_cbz_reg, 0);
                 } else
-                a64_bcond(&b, cond, 0);                    /* patched to the OOL stub */
-                if (g_side[g_n_side].probe) {              /* fall-through probe detour (see g_flip) */
+                a64_bcond(&b, cond, 0);
+                if (g_side[g_n_side].probe) {
                     g_side[g_n_side].ft_site = a64_label(&b);
                     a64_b(&b, 0);
                 }
@@ -13054,7 +12308,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (n >= 3 && i == n - 3 && !g_no_jccfuse && g_defer &&
             (insn->op == OCERZ_OP_CMP || insn->op == OCERZ_OP_TEST) &&
             can_fuse_cmp_test_jcc(insn, &blk->insns[n - 1], rip)) {
-            /* gap fusion: cmp/test ; lea|mov ; jcc  (NZCV forwarded over the gap) */
             uint32_t *jcc_label = NULL, *gap_label = NULL;
             int fused = emit_cmp_test_jcc(&b, insn, &blk->insns[n - 1],
                                           epi_sites, &n_epi, &jcc_label,
@@ -13102,11 +12355,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
 
         if (g_promo_reg[i] != 0) {
-            /* load-promoted frame save: the push stays a real store (fault
-             * order and memory stay exact), but the value also rides in a
-             * shadow host register so the pop is a rename, not a
-             * store-to-load forward - the loop-carried chain of call-dense
-             * code.  Slots stay valid, so no fault repair is needed. */
             int hsp = pin_hreg(pin_slot(OCERZ_RSP));
             int pr = g_promo_reg[i];
             int gr = pin_hreg(pin_slot(insn->ops[0].reg));
@@ -13115,7 +12363,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 if (g_n_promo_real < PE_MAX)
                     g_promo_real[g_n_promo_real++] = (struct JitPromo){
                         (int32_t)i, g_promo_mate[i], (uint8_t)pr };
-                goto promo_push_fallthrough;   /* the normal push emitter stores it */
+                goto promo_push_fallthrough;
             } else {
                 int f3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
                          stack_plain_access_ok() && jgb_usable() && !stack_guard_needed();
@@ -13135,9 +12383,6 @@ promo_push_fallthrough:
             int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
                         stack_plain_access_ok() && jgb_usable() && !stack_guard_needed();
             if (!fast3) {
-                /* conservative: run the real call/ret in the interpreter; it
-                 * transfers control out of the block, the spliced remainder
-                 * is dead code */
                 emit_slowcall(&b, insn, exit_sites, &n_exits);
                 blk->n_slow++;
                 continue;
@@ -13146,7 +12391,6 @@ promo_push_fallthrough:
             if (g_ic_kind[i] == 1) {
                 if (g_ic_pushelide[i] && g_n_pe_real < PE_MAX &&
                     (stack_identity() || rsp_is_ptr())) {
-                    /* slot content dead until the elided ret: allocate only */
                     a64_sub_imm(&b, 1, hs, hs, 8);
                     g_pe_real[g_n_pe_real++] = (struct JitPushElide){
                         (int32_t)i, g_ic_pair_rj[i], insn->rip + insn->len };
@@ -13156,7 +12400,7 @@ promo_push_fallthrough:
                 }
             } else if (g_ic_kind[i] == 3) {
                 if (rsp_run_member(blk->insns, i + 1, n, fast3)) {
-                    g_rsp_lag += 8;              /* fold into the run's last add */
+                    g_rsp_lag += 8;
                 } else {
                     a64_add_imm(&b, 1, hs, hs, 8 + g_rsp_lag);
                     g_rsp_lag = 0;
@@ -13172,8 +12416,6 @@ promo_push_fallthrough:
                 a64_subs_reg(&b, 1, 31, JT0, JT1, 0);
                 uint32_t *ok = a64_label(&b);
                 a64_bcond(&b, A64_EQ, 0);
-                /* mismatch: leave at the ret itself with rsp restored; the
-                 * dispatcher runs the real ret */
                 a64_sub_imm(&b, 1, hs, hs, 8);
                 a64_mov_imm64(&b, JT0, insn->rip);
                 a64_str(&b, 8, JT0, 20, RIP_OFF);
@@ -13193,7 +12435,7 @@ promo_push_fallthrough:
                 continue;
             }
         }
-        if (g_mov_skip[i]) {                    /* sunk into the shift that follows */
+        if (g_mov_skip[i]) {
             if (blk->insn_off) blk->insn_off[i] = (uint32_t)(b.p - entry);
             blk->n_inlined++;
             continue;
@@ -13224,7 +12466,7 @@ promo_push_fallthrough:
         }
     }
 
-    l0_flush_all(&b);   /* fallthrough or leftovers: nothing stale may escape the block */
+    l0_flush_all(&b);
     if (!is_terminator(blk->insns[n - 1].op)) {
 
         emit_materialize(&b);
@@ -13238,13 +12480,10 @@ promo_push_fallthrough:
     emit_spill_pinned(&b);
     emit_frame_sp_reset(&b);
     emit_pin_epilogue_restore(&b);
-    /* A block that ends in a far transfer may leave in the OTHER guest mode, and the stub it would */
     uint32_t *dstub = mode32 ? jit->dispatch_stub32 : jit->dispatch_stub;
     if (term_may_switch_mode(blk->insns[n - 1].op))
         dstub = NULL;
     if (dstub) {
-        /* x0 = step code.  STEP_OK -> continue in the arena via the dispatch
-         * stub (needs x0=vm, x1=cpu, no frame); anything else -> ret to C. */
         a64_mov_reg(&b, 1, 1, 20);
         a64_mov_reg(&b, 1, JTT, 0);
         a64_mov_reg(&b, 1, 0, 19);
@@ -13256,7 +12495,6 @@ promo_push_fallthrough:
         if (soff >= -(ptrdiff_t)(1 << 25) && soff <= (ptrdiff_t)((1 << 25) - 1)) {
             a64_b(&b, (int32_t)soff);
         } else {
-            /* the stub sits at the arena start; once >128MB of code has been appended a direct b silently */
             a64_mov_imm64(&b, 16, (uint64_t)(uintptr_t)dstub);
             a64_br(&b, 16);
         }
@@ -13268,7 +12506,6 @@ promo_push_fallthrough:
         a64_ldp_post(&b, 29, 30, 31, 16);
         a64_ret(&b);
     }
-    /* superblock side exits: out-of-line chain stubs for the taken targets */
     int side_patch_oor = 0;
     for (int k = 0; k < g_n_side; k++)
         if (g_side[k].probe && !blk->prof) blk->prof = (JitProf *)calloc(SIDE_MAX, sizeof(JitProf));
@@ -13276,51 +12513,46 @@ promo_push_fallthrough:
         uint32_t *stub = a64_label(&b);
         uint32_t w = *g_side[k].site;
         if ((w & 0x7e000000u) == 0x36000000u) {
-            /* imm14: a big superblock can put the stub out of reach.  Never
-             * truncate the offset (that lands a wild branch in the arena);
-             * flag the block instead and let it run interpreted. */
             if (!a64_try_patch_tbz(g_side[k].site, stub))
                 side_patch_oor = 1;
         }
-        else if ((w & 0x7e000000u) == 0x34000000u) a64_patch_cbz(g_side[k].site, stub);   /* cbz/cbnz */
+        else if ((w & 0x7e000000u) == 0x34000000u) a64_patch_cbz(g_side[k].site, stub);
         else a64_patch_bcond(g_side[k].site, stub);
         int edge_class = body_edge_pin_class();
         int body_edge = edge_class >= 0;
         g_side[k].stub = stub;
-        for (int r = 0; r < 16; r++)                   /* lanes still in scratch at the branch */
+        for (int r = 0; r < 16; r++)
             if ((g_side[k].l0_dirty & (1u << r)) && g_side[k].l0[r] >= 0) {
                 if (g_side[k].l0_dbl[r]) a64_ins_d_d(&b, xmm_vreg((unsigned)r), 0, g_side[k].l0[r], 0);
                 else                     a64_ins_s_s(&b, xmm_vreg((unsigned)r), 0, g_side[k].l0[r], 0);
             }
-        if (g_side[k].fpb >= 0 && g_side[k].fpb_chk)   /* lanes the batch had not verified here */
+        if (g_side[k].fpb >= 0 && g_side[k].fpb_chk)
             fpb_emit_regs_check(&b, g_side[k].fpb_chk, g_side[k].fpb, g_side[k].fpb_end, g_side[k].l0, g_side[k].l0_dbl);
-        if (g_side[k].rec) {          /* the producer's flag record, only on this (taken) side */
+        if (g_side[k].rec) {
             if (g_side[k].rec_imm_pending) a64_mov_imm64(&b, JT1, g_side[k].rec_imm);
             emit_defer_flags(&b, g_side[k].rec_ccop, g_side[k].rec_src, g_side[k].rec_dst);
         }
         if (g_side[k].probe && blk->prof) {
             JitProf *pf = &blk->prof[k];
-            /* taken side: count; at the threshold trip through a tagged copy of the exit */
             emit_prof_count(&b, pf, 0);
             pf->tk_trip = a64_label(&b);
             a64_tbnz(&b, JT2, PROBE_BIT, 0);
             g_side[k].patch_b = emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);
             a64_patch_tbz(pf->tk_trip, a64_label(&b));
             g_tag_blk = blk; g_tag_idx = k;
-            emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);   /* never chained */
-            /* fall-through side: count, back inline below the threshold */
+            emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);
             a64_patch_b(g_side[k].ft_site, a64_label(&b));
             emit_prof_count(&b, pf, 4);
             a64_tbnz(&b, JT2, PROBE_BIT, 2);
             uint32_t *back = a64_label(&b);
             a64_b(&b, 0);
             a64_patch_b(back, g_side[k].ft_site + 1);
-            for (int r = 0; r < 16; r++)               /* this exit leaves mid-block too */
+            for (int r = 0; r < 16; r++)
                 if ((g_side[k].l0_dirty & (1u << r)) && g_side[k].l0[r] >= 0) {
                     if (g_side[k].l0_dbl[r]) a64_ins_d_d(&b, xmm_vreg((unsigned)r), 0, g_side[k].l0[r], 0);
                     else                     a64_ins_s_s(&b, xmm_vreg((unsigned)r), 0, g_side[k].l0[r], 0);
                 }
-            emit_static_chain_tail(&b, g_side[k].ft_rip, 0, body_edge, epi_sites, &n_epi);  /* never chained */
+            emit_static_chain_tail(&b, g_side[k].ft_rip, 0, body_edge, epi_sites, &n_epi);
             g_tag_blk = NULL;
             pf->ft_site = g_side[k].ft_site;
         } else {
@@ -13328,13 +12560,12 @@ promo_push_fallthrough:
             g_side[k].patch_b = emit_static_chain_tail(&b, g_side[k].taken, 0, body_edge, epi_sites, &n_epi);
         }
     }
-    /* FP batch replays: restore checkpoints, re-run the members exactly, return */
     for (int k = 0; k < g_n_fpb; k++) {
         FpBatch *fb = &g_fpb[k];
         if (!fb->site) continue;
         uint32_t *lbl = a64_label(&b);
         a64_patch_bcond(fb->site, lbl);
-        if (fb->gain) a64_patch_b(fb->site + fb->gain, lbl);   /* double-class trampoline */
+        if (fb->gain) a64_patch_b(fb->site + fb->gain, lbl);
         for (int r = 0; r < 16; r++)
             if (fb->ckpt & (1u << r))
                 a64_ldr_v(&b, 16, xmm_vreg((unsigned)r), 20, FPCKPT_OFF + (uint32_t)r * 16);
@@ -13343,7 +12574,7 @@ promo_push_fallthrough:
         l0_reset();
         ea_cache_reset();
         for (int m = fb->first; m <= fb->end; m++) {
-            if (blk->insns[m].op == OCERZ_OP_JCC) continue;   /* region branch: already decided */
+            if (blk->insns[m].op == OCERZ_OP_JCC) continue;
             g_cur_insn_idx = m;
             g_cur_need = fl_need[m];
             g_cur_fpb = -1;
@@ -13357,9 +12588,7 @@ promo_push_fallthrough:
                 g_n_fpbmap++;
             }
         }
-        /* replayed members may have deferred their lane writes */
         l0_flush_all(&b);
-        /* re-establish the fast path's lane-0 caches (one copy per temp) */
         for (int t = 4; t <= 7; t++) {
             for (int r = 0; r < 16; r++) {
                 if (fb->l0[r] != (int8_t)t) continue;
@@ -13373,7 +12602,6 @@ promo_push_fallthrough:
         uint32_t *here = a64_label(&b);
         a64_b(&b, (int32_t)(fb->back - here));
     }
-    /* deferred-check sites: same replay, cut at the site, the detector's compare redone */
     for (int k = 0; k < g_n_fpb_sites; k++) {
         FpbSite *st = &g_fpb_sites[k];
         FpBatch *fb = &g_fpb[st->batch];
@@ -13418,7 +12646,6 @@ promo_push_fallthrough:
     emit_ordered_slow_arms(&b, blk, entry);
     emit_nan_ool_arms(&b, blk, entry);
     if (loop_poll_exit) {
-        /* interrupt seen at the loop head: leave with RIP = this block (OOL) */
         uint32_t *poll_stub = a64_label(&b);
         a64_mov_imm64(&b, JT0, rip);
         a64_str(&b, 8, JT0, 20, RIP_OFF);
@@ -13434,7 +12661,6 @@ promo_push_fallthrough:
     if (!g_no_chain && g_chain_target) {
         chain_tail_lbl = a64_label(&b);
         if (g_pin_class == 3) {
-            /* every block shares the full layout: chain into the callee BODY (no leave/enter); fallback path */
             if (!g_chain_keeps_jgb) emit_reload_jgb(&b);
             chain_patch_b = emit_body_chain_tail(&b, g_chain_target, 0, epi_sites, &n_epi);
             chain_is_body = 1;
@@ -13448,16 +12674,14 @@ promo_push_fallthrough:
                 (unsigned long long)rip, (int)(b.p - entry), n,
                 (double)(b.p - entry) / (double)n);
 
-    /* RAS slot literal pool: 8-byte cells after the code, ldr sites patched */
     if (g_n_raslit && !b.overflow) {
-        if (((uintptr_t)b.p & 7) != 0) a64_emit32(&b, 0xd503201fu);   /* nop */
+        if (((uintptr_t)b.p & 7) != 0) a64_emit32(&b, 0xd503201fu);
         for (int i = 0; i < g_n_raslit; i++) {
             void **cell = (void **)b.p;
             a64_emit32(&b, 0); a64_emit32(&b, 0);
             if (b.overflow) break;
             int32_t off = (int32_t)((uint32_t *)cell - g_raslit[i].site);
             if (g_raslit[i].kind == 2) {
-                /* 16-byte vector constant: two more words, LDR (literal, SIMD&FP) Q form */
                 a64_emit32(&b, 0); a64_emit32(&b, 0);
                 if (b.overflow) break;
                 *g_raslit[i].site = 0x9c000000u | (((uint32_t)off & 0x7ffffu) << 5) | (uint32_t)(g_raslit[i].rt & 31);
@@ -13467,7 +12691,7 @@ promo_push_fallthrough:
             }
             *g_raslit[i].site = 0x58000000u | (((uint32_t)off & 0x7ffffu) << 5) | (uint32_t)(g_raslit[i].rt & 31);
             if (g_raslit[i].kind == 1) {
-                *cell = (void *)(uintptr_t)g_raslit[i].retaddr;      /* constant */
+                *cell = (void *)(uintptr_t)g_raslit[i].retaddr;
                 continue;
             }
             ras_cell_register(cell);
@@ -13491,7 +12715,6 @@ promo_push_fallthrough:
         if (g_stop_patch) {
             assert(g_stop_target);
             uint32_t running_insn = *g_stop_patch;
-            /* The stop replacement re-targets the site at stop_target while keeping its class and condition */
             blk->stop_patch = g_stop_patch;
             blk->stop_insn = stop_retarget(running_insn, g_stop_patch, g_stop_target);
             if (jit->stop_requested)
@@ -13522,7 +12745,6 @@ promo_push_fallthrough:
     pthread_jit_write_protect_np(1);
 
     if (side_patch_oor) {
-        /* A superblock side exit could not reach its stub with TBZ's imm14. */
         static int warned_oor;
         if (!warned_oor) {
             warned_oor = 1;
@@ -13609,12 +12831,10 @@ promo_push_fallthrough:
         int e = blk->n_edges++;
         blk->edges[e].target_rip = g_side[k].taken;
         blk->edges[e].patch_b = g_side[k].patch_b;
-        /* a stub that carries the producer's flag record must stay on the
-         * path: no short-circuit of the conditional branch to the target */
         blk->edges[e].cond_site = side_stub_has_work(k) ? NULL : g_side[k].site;
         blk->edges[e].kind = body_edge_pin_class() >= 0 ? EDGE_BODY : EDGE_XBLOCK;
         blk->edges[e].pin_class = body_edge_pin_class() >= 0 ? (uint8_t)body_edge_pin_class() : 0;
-        blk->edges[e].side = (uint8_t)(k + 1);          /* the stub reports side index k */
+        blk->edges[e].side = (uint8_t)(k + 1);
         blk->edges[e].jcc_rip = g_side[k].jcc_rip;
         blk->edges[e].probing = (uint8_t)(g_side[k].probe && blk->prof != NULL);
     }
@@ -13637,7 +12857,7 @@ promo_push_fallthrough:
                 char pb[1024];
                 snprintf(pb, sizeof pb, "%s.%d", p, (int)getpid());
                 g_jf = fopen(pb, "w");
-                if (g_jf) setvbuf(g_jf, NULL, _IOLBF, 0);   /* survive an abort() of the guest */
+                if (g_jf) setvbuf(g_jf, NULL, _IOLBF, 0);
             }
         }
         if (g_jitdis > 0 && g_jf && blk->insn_off && rip >= g_jd_lo && rip < g_jd_hi) {
@@ -13704,7 +12924,7 @@ promo_push_fallthrough:
             const uint32_t *cw = (const uint32_t *)blk->code;
             for (uint32_t w = 0; w < blk->code_words; w++) {
                 uint32_t v = cw[w];
-                if ((v & 0x7c000000u) != 0x14000000u) continue;   /* b/bl only */
+                if ((v & 0x7c000000u) != 0x14000000u) continue;
                 int64_t off = (int64_t)((int32_t)(v << 6) >> 6) * 4;
                 const uint32_t *tgt = (const uint32_t *)((const uint8_t *)(cw + w) + off);
                 if (tgt < jit->code_base || tgt > jit->code_cur + 4096) {
@@ -13826,15 +13046,6 @@ static const JitBlock *fault_block(const OcerzJit *jit, const uint32_t *pc)
 
 static int fault_insn_index(const JitBlock *b, const uint32_t *pc);
 
-/* The guest GPRs of a thread stopped at host_pc inside a translated block,
- * read-only: the register half of ocerz_jit_fault_recover_regs, written to
- * out[] instead of the cpu, whose gpr[] a thread that resumes in JIT code
- * may still fill from.  out[] comes in holding the cpu's spilled gpr[]; only
- * the block's pinned registers are replaced.  Returns 0 when host_pc is not
- * inside a published block (a stub, C code), where the host registers mean
- * nothing.  Around a C callout x1/x2 carry the call's arguments (x1 = cpu)
- * while r14/r15 sit spilled in gpr[] by emit_spill_pinned, so the spilled
- * values stand there. */
 int ocerz_jit_guest_gprs_at(const struct OcerzVM *vm, const void *host_pc,
                             const uint64_t *host_x, const OcerzCPU *cpu, uint64_t out[16])
 {
@@ -13872,16 +13083,11 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
             value -= ocerz_guest_base;
         cpu->gpr[b->host_holds[i]] = value;
     }
-    /* a push whose store faulted: the decrement already happened in the
-     * host register, but the guest instruction did not complete */
     if (b->n_push_fix && b->code) {
         uint32_t off = (uint32_t)((const uint32_t *)host_pc - (const uint32_t *)b->code);
         for (int i = 0; i < b->n_push_fix; i++)
             if (b->push_fix[i] == off) { cpu->gpr[OCERZ_RSP] += 8; break; }
     }
-    /* elided return-address slots: the interpreter resumes mid-frame, so the
-     * enclosing frames' slots must hold their addresses (rsp itself is
-     * architectural throughout - only the content was skipped) */
     if (b->n_pushelide && b->pushelide && (b->insns || b->iref)) {
         int k = fault_insn_index(b, (const uint32_t *)host_pc);
         for (int i = 0; k > 0 && i < b->n_pushelide; i++) {
@@ -13899,10 +13105,8 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
     }
 }
 
-/* XMM pins live in host V16-V31 while a block runs; on a fault the memory
- * copy is stale, so copy them back from the signal frame's NEON state. */
 void ocerz_jit_fault_recover_xmm(const struct OcerzVM *vm, const void *host_pc,
-                                 const void *host_v /* __uint128_t[32] */, OcerzCPU *cpu)
+                                 const void *host_v, OcerzCPU *cpu)
 {
     const OcerzJit *jit = vm ? vm->jit : NULL;
     const JitBlock *b = fault_block(jit, (const uint32_t *)host_pc);
@@ -14016,7 +13220,6 @@ void ocerz_jit_fault_recover_flags(const struct OcerzVM *vm,
     cpu->cc_op = cc_op;
 }
 
-/* A plain-form access in JIT code faulted on the (unmappable) commpage address range: mark the */
 int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint64_t fault_rip)
 {
     OcerzJit *jit = vm ? vm->jit : NULL;
@@ -14032,7 +13235,6 @@ int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint6
     return 1;
 }
 
-/* an ordered (ldapur/stlur) access in a translated block crossed a 16-byte boundary (Apple */
 int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t fault_rip)
 {
     OcerzJit *jit = vm ? vm->jit : NULL;
@@ -14047,14 +13249,13 @@ int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t
     return 1;
 }
 
-/* Alignment fault at an unguarded ordered access (ldapur/stlur crossing a 16-byte granule) */
 int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
 {
     OcerzJit *jit = vm ? vm->jit : NULL;
     uint32_t *site = (uint32_t *)(uintptr_t)host_pc;
     if (!jit || !ocerz_jit_pc_in_arena(vm, host_pc)) return 0;
     uint32_t w = *site;
-    if ((w & 0xfc000000u) == 0x14000000u) return 2;              /* b: already patched */
+    if ((w & 0xfc000000u) == 0x14000000u) return 2;
     int is_ld = (w & 0x3fe00c00u) == 0x19400000u;
     int is_st = (w & 0x3fe00c00u) == 0x19000000u;
     if (!is_ld && !is_st) return 0;
@@ -14063,24 +13264,15 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
     int32_t imm9 = (int32_t)((w >> 12) & 0x1ff); if (imm9 & 0x100) imm9 -= 0x200;
     int rn = (int)((w >> 5) & 31), rt = (int)(w & 31);
     if (rn == 31 || rt == 31) return 0;
-    /* a vector store's two halves (fmov JT0 / umov JTU, then stlur JT0 [rn,#d];
-     * stlur JTU [rn,#d+8]) are handled as one 16-byte access when the first
-     * half is the faulting site: one alignment test covers both */
     int pair = 0;
     if (is_st && size == 8 && rt == JT0 && imm9 <= 247) {
         uint32_t w2 = site[1];
         uint32_t want = (w & ~(0x1ffu << 12) & ~0x1fu) | (((uint32_t)(imm9 + 8) & 0x1ffu) << 12) | (uint32_t)JTU;
         if (w2 == want) pair = 1;
     }
-    /* address temp and piece scratch: JTF/JTT are never live across a guest
-     * memory access; JTU only as a last resort (a vector store's second half
-     * is held in JTU across the first half's stlur); never rt or rn */
     int cand[3] = { JTF, JTT, JTU }, sc[2], n = 0;
     for (int i = 0; i < 3 && n < 2; i++) if (cand[i] != rt && cand[i] != rn && !(pair && cand[i] == JTU)) sc[n++] = cand[i];
     int ta = sc[0], s1 = sc[1];
-    /* store arms: dmb ish + plain store when the block also does ordered
-     * loads (the drain is cheap then: memcpy 0.31s vs pieces 1.1s), else
-     * release-store pieces (store-only loops: memset 0.10s vs dmb 0.5-1.0s) */
     const JitBlock *blk = fault_block(jit, site);
     int use_dmb = blk && blk->ordered_loads;
 
@@ -14093,7 +13285,7 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
         if (imm9 > 0)      a64_add_imm(&b, 1, ta, rn, (uint32_t)imm9);
         else if (imm9 < 0) a64_sub_imm(&b, 1, ta, rn, (uint32_t)-imm9);
         else               a64_mov_reg(&b, 1, ta, rn);
-        if (pair) a64_try_ands_imm(&b, 1, A64_ZR, ta, 7);     /* two 8-byte halves: 8-aligned <=> neither crosses */
+        if (pair) a64_try_ands_imm(&b, 1, A64_ZR, ta, 7);
         else emit_granule_cross_test(&b, size, ta, s1);
         uint32_t *bne = a64_label(&b); a64_bcond(&b, A64_NE, 0);
         if (is_ld) a64_ldapur(&b, size, rt, ta, 0);
@@ -14125,14 +13317,14 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
         int ok = !b.overflow && a64_try_patch_b(back1, back) && a64_try_patch_b(back2, back);
         if (ok) {
             uint32_t saved = *site;
-            *site = 0x14000000u;                                    /* placeholder b */
+            *site = 0x14000000u;
             if (a64_try_patch_b(site, arm)) {
                 jit->code_cur = b.p;
                 sys_icache_invalidate(arm, (size_t)((uint8_t *)b.p - (uint8_t *)arm));
                 sys_icache_invalidate(site, 4);
                 rc = 1;
             } else {
-                *site = saved;                                      /* out of branch range: give the arm back */
+                *site = saved;
             }
         }
         pthread_jit_write_protect_np(1);
@@ -14198,11 +13390,6 @@ int ocerz_jit_owner_pid(struct OcerzVM *vm)
     return vm && vm->jit ? vm->jit->owner_pid : -1;
 }
 
-/* A fork child inherits the parent's MAP_JIT arena, whose pages fault when it
- * tries to execute them. Abandon the arena rather than free it (the fork may
- * have caught the allocator mid-update) and drop every global that points into
- * it; the exec loop builds a fresh one on the next step, so the child keeps the
- * JIT instead of interpreting for the rest of its life. */
 void ocerz_jit_forget(struct OcerzVM *vm)
 {
     pthread_mutex_init(&jit_lock, NULL);
@@ -14333,15 +13520,14 @@ static void stopcheck(const JitBlock *b, const uint32_t *site, uint32_t insn, co
     static int en = -1;
     if (en < 0) en = getenv("OCERZ_STOPCHECK") ? 1 : 0;
     if (!en || !site) return;
-    /* decode the offset by class: a stop insn is no longer always a `b` */
     int64_t off;
     if ((insn & 0xfc000000u) == 0x14000000u)
         off = (int64_t)((int32_t)(insn << 6) >> 6) * 4;
     else if ((insn & 0xff000010u) == 0x54000000u ||
              (insn & 0x7e000000u) == 0x34000000u)
-        off = (int64_t)((int32_t)(insn << 8) >> 13) * 4;     /* imm19 @ 23:5 */
+        off = (int64_t)((int32_t)(insn << 8) >> 13) * 4;
     else if ((insn & 0x7e000000u) == 0x36000000u)
-        off = (int64_t)((int32_t)(insn << 13) >> 18) * 4;    /* imm14 @ 18:5 */
+        off = (int64_t)((int32_t)(insn << 13) >> 18) * 4;
     else
         off = 0;
     const uint32_t *tgt = (const uint32_t *)((const uint8_t *)site + off);
@@ -14371,8 +13557,6 @@ static int force_stop_sites_writable(OcerzJit *jit)
                 __atomic_store_n(b->stop_extra[i].site, b->stop_extra[i].insn, __ATOMIC_RELEASE);
                 patched = 1;
             }
-        /* a conditional branch short-circuited past the trampoline would
-         * bypass the stop site: route it back through the trampoline */
         for (int i = 0; i < b->n_edges; i++) {
             uint32_t *cs = b->edges[i].cond_site;
             int is_stop = b->edges[i].patch_b == b->stop_patch;
@@ -14393,7 +13577,6 @@ static void invalidate_all_locked(OcerzJit *jit)
 
     pthread_jit_write_protect_np(0);
     patched |= force_stop_sites_writable(jit);
-    /* RAS pool cells (in JIT memory) must not keep retired code reachable */
     for (size_t i = 0; i < g_n_ras_cells; i++)
         __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
     for (size_t k = 0; k < jit->n_live; k++) {
@@ -14417,8 +13600,6 @@ static void invalidate_all_locked(OcerzJit *jit)
         sys_icache_invalidate(jit->code_base,
             (size_t)((uint8_t *)jit->code_cur - (uint8_t *)jit->code_base));
 
-    /* unlink every live block (its bucket head goes to NULL; chains are all
-     * in the live list too) and retire it */
     for (size_t k = 0; k < jit->n_live; k++) {
         JitBlock *b = jit->live[k];
         __atomic_store_n(&jit->buckets[hash_key(b->key)], (JitBlock *)NULL, __ATOMIC_RELEASE);
@@ -14438,7 +13619,6 @@ static void invalidate_all_locked(OcerzJit *jit)
     pending_clear();
     for (unsigned i = 0; i < g_ras_slot_n; i++)
         __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
-    /* inline caches of indirect branches must not keep retired code alive */
     psc_clear_all();
     for (unsigned i = 0; i < g_ic_next && i < JIT_IC_SLOTS; i++) {
         __atomic_store_n(&g_ic_slots[i].code, NULL, __ATOMIC_RELAXED);
@@ -14468,9 +13648,6 @@ static int ranges_overlap(uint64_t a, uint64_t alen,
     return a <= b ? b - a < alen : a - b < blen;
 }
 
-/* OCERZ_INVMAP_CHECK=1: assert the map's one invariant -- it may answer
- * "maybe" for code that is already gone, but never "no" for code that is
- * still live.  Runs the full walk the map exists to avoid, so it is slow. */
 static void invmap_check_reject(const OcerzJit *jit, uint64_t addr, uint64_t len)
 {
     for (size_t k = 0; k < jit->n_live; k++) {
@@ -14486,15 +13663,6 @@ static void invmap_check_reject(const OcerzJit *jit, uint64_t addr, uint64_t len
     }
 }
 
-/* 64KB regions whose translations keep getting invalidated (a browser JS
- * engine W^X-flipping its code space): after a few hits the region runs
- * interpreted - fresh decode every entry, nothing cached, nothing to
- * invalidate - and the flip storm stops touching the JIT entirely.
- * The sentence is not permanent: module-load fixups (relocations, import
- * patches) also retire blocks a few times and then never again, and a
- * permanent blacklist left the hottest DLL code interpreting forever.  A
- * region quiet for CHURN_QUIET_NS is re-probed; one further retire
- * re-blacklists it immediately. */
 #define CHURN_SLOTS 4096
 #define CHURN_LIMIT 3
 #define CHURN_QUIET_NS 1500000000ull
@@ -14545,16 +13713,15 @@ static int churn_blacklisted(uint64_t rip)
     return 0;
 }
 
-/* aarch64 direct-branch target of the word at `site`, or NULL */
 static uint32_t *branch_word_target(uint32_t *site, uint32_t w)
 {
     int64_t off;
-    if ((w & 0xFC000000u) == 0x14000000u) {                 /* B */
+    if ((w & 0xFC000000u) == 0x14000000u) {
         off = ((int64_t)(int32_t)(w << 6) >> 6) * 4;
         return (uint32_t *)((uint8_t *)site + off);
     }
-    if ((w & 0xFF000010u) == 0x54000000u ||                 /* B.cond */
-        (w & 0x7E000000u) == 0x34000000u) {                 /* CBZ/CBNZ */
+    if ((w & 0xFF000010u) == 0x54000000u ||
+        (w & 0x7E000000u) == 0x34000000u) {
         off = ((int64_t)(int32_t)(((w >> 5) & 0x7FFFFu) << 13) >> 13) * 4;
         return (uint32_t *)((uint8_t *)site + off);
     }
@@ -14567,7 +13734,6 @@ static int ptr_in_block_code(const JitBlock *b, const uint32_t *p)
     return p >= lo && p < lo + b->code_words;
 }
 
-/* hits are sorted by code address: binary-search the covering block */
 static int ptr_in_hits(JitBlock *const *hits, size_t n_hits, const uint32_t *p)
 {
     if (!p) return 0;
@@ -14589,12 +13755,6 @@ static int hit_code_cmp(const void *pa, const void *pb)
     return (uintptr_t)a->code > (uintptr_t)b->code;
 }
 
-/* Retire only the blocks marked inv_hit: force their stop sites (an
- * in-flight loop exits at its next back edge), unpatch every surviving
- * chained edge that branches into them, unlink them from the hash and the
- * live set, and drop the code-pointer caches (RAS, indirect-branch ICs).
- * Their code stays allocated on the retired list, so a thread still inside
- * runs to its next exit exactly as under invalidate_all. */
 static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hits)
 {
     int any_code = 0;
@@ -14604,8 +13764,6 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
             churn_bump(blk_insn_rip(hits[m], 0));
         }
     if (!any_code) {
-        /* interpreter-fallback blocks: nothing branches into them, no code
-         * pointers exist - unlink and retire, skip the patch/cache phases */
         size_t w0 = 0;
         for (size_t k = 0; k < jit->n_live; k++) {
             JitBlock *b = jit->live[k];
@@ -14649,7 +13807,6 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
             }
         }
     }
-    /* surviving blocks: cut any chain that lands inside a retired one */
     for (size_t k = 0; k < jit->n_live; k++) {
         JitBlock *sblk = jit->live[k];
         if (sblk->inv_hit) continue;
@@ -14670,7 +13827,6 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
         }
     }
     pthread_jit_write_protect_np(1);
-    /* unlink + retire, compacting the live array */
     size_t w = 0;
     for (size_t k = 0; k < jit->n_live; k++) {
         JitBlock *b = jit->live[k];
@@ -14685,7 +13841,6 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
         jit->retired = b;
     }
     jit->n_live = w;
-    /* code-pointer caches may hold entries into retired code */
     for (unsigned i = 0; i < g_ras_slot_n; i++)
         __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
     psc_clear_all();
@@ -14703,12 +13858,6 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     OcerzJit *jit = vm->jit;
     int invalidated = 0;
     pthread_mutex_lock(&jit_lock);
-    /* Callers hand us whole VM regions (vm_deallocate, vm_protect); almost none
-     * of them hold translated code.  The region map answers that in constant
-     * time.  When a region DOES hold code - a browser's JS engine W^X-flipping
-     * its own jitted pages, hundreds of times during startup - only the
-     * overlapping blocks are retired; dropping the whole cache per flip made
-     * CEF startup a full-cache retranslation storm. */
     if (!jit->code_hi || !ranges_overlap(addr, len, jit->code_lo,
                                          jit->code_hi - jit->code_lo)) {
         if (ENV_ON("OCERZ_INVMAP_CHECK"))
@@ -14716,13 +13865,8 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
         pthread_mutex_unlock(&jit_lock);
         return;
     }
-    /* clip to the translated span: a browser's multi-GB reservation must not
-     * defeat the region map's span limit */
     if (addr < jit->code_lo) { len -= jit->code_lo - addr; addr = jit->code_lo; }
     if (addr + len > jit->code_hi) len = jit->code_hi - addr;
-    /* widen to region-map granules: invalidating more is always safe, and a
-     * sub-granule flip (a JS engine W^X-flipping one page) can then actually
-     * clear its granule bit instead of rescanning the live set forever */
     {
         uint64_t g = 1ull << INVMAP_GSHIFT;
         uint64_t alo = addr & ~(g - 1);
@@ -14770,7 +13914,7 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
                 }
             if (n_hit == (size_t)-1) break;
         }
-        if (n_hit == (size_t)-1) {          /* allocation failed: the big hammer */
+        if (n_hit == (size_t)-1) {
             invalidated = 1;
             invalidate_all_locked(jit);
         } else if (n_hit > 0) {
@@ -14782,7 +13926,7 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
         }
         free(hits);
         if (n_hit != (size_t)-1)
-            invmap_clear_range(jit, addr, addr + len);   /* nothing lives there now */
+            invmap_clear_range(jit, addr, addr + len);
     }
     pthread_mutex_unlock(&jit_lock);
 
@@ -14850,7 +13994,7 @@ static int jit_interp_block(struct OcerzVM *vm, OcerzCPU *cpu, JitBlock *b)
 {
     static int lg = -1; if (lg < 0) lg = getenv("OCERZ_IBLOG") ? 1 : 0;
     if (lg) fprintf(stderr, "ocerz: INTERP-BLOCK rip=%#llx n=%d\n", (unsigned long long)blk_rip(b), b->n_insns);
-    if (!b->insns) return OCERZ_EUNSUP;   /* only code-less blocks are interpreted; they keep the array */
+    if (!b->insns) return OCERZ_EUNSUP;
     ocerz_jit_exec_state = 2;
     ocerz_flags_materialize(cpu);
     if (ocerz_perfstat > 0)
@@ -14862,9 +14006,6 @@ static int jit_interp_block(struct OcerzVM *vm, OcerzCPU *cpu, JitBlock *b)
             ocerz_jit_exec_state = 0;
             return r;
         }
-        /* a taken branch inside the block (superblock side exit, or a
-         * signal delivered by the instruction): the rest of the block is
-         * not on the path -- re-dispatch at the new rip */
         if (cpu->rip != in->rip + in->len || cpu->interp_once) {
             ocerz_jit_exec_state = 0;
             return OCERZ_STEP_OK;
@@ -14936,7 +14077,6 @@ static void ps_report(OcerzJit *jit)
         (double)nblocks / (double)JIT_HASH_SIZE, maxchain,
         blk_exec ? (double)probe_w / (double)blk_exec : 0.0);
 
-    /* HOTBLOCKS: top blocks by exec_count*code_words (static cost estimate) */
     {
         enum { HB = 12 };
         JitBlock *top[HB] = {0}; double topw[HB] = {0};
@@ -15000,7 +14140,6 @@ static void steplog(const OcerzCPU *cpu)
     for (int i = 0; i < 16; i++) fprintf(stderr, " %llx", (unsigned long long)cpu->gpr[i]);
     fprintf(stderr, "\n");
 }
-/* Chain one edge of a block now (the target may or may not exist yet). */
 static void chain_edge_now(OcerzJit *jit, JitBlock *blk, int e)
 {
     JitBlock *t = cache_lookup(jit, blk->edges[e].target_rip, blk_mode32(blk));
@@ -15025,8 +14164,6 @@ static void chain_edge_now(OcerzJit *jit, JitBlock *blk, int e)
                 blk->edges[e].pin_class, blk->edges[e].cond_site, blk->hoist_sig, blk, e);
 }
 
-/* Retire exactly one block so it retranslates (a flip): the precise path,
- * not the range invalidator, whose 64 KB granule would take neighbours too. */
 static uint64_t g_flip_ns_retire, g_flip_ns_hit, g_flip_n_retire, g_flip_n_hit;
 static OcerzJit *g_flip_atexit_jit;
 static void flip_report_atexit(void)
@@ -15037,10 +14174,6 @@ static void flip_report_atexit(void)
             (unsigned long long)(g_flip_atexit_jit ? g_flip_atexit_jit->blocks_translated : 0),
             g_flip_atexit_jit ? g_flip_atexit_jit->n_live : (size_t)0, g_n_probes);
 }
-/* Retire one block whose code stays valid (the arena is never reused): cut
- * only what points INTO it - incoming chains, return-address cells and the
- * indirect-branch caches - instead of the range invalidator's wholesale
- * purge, which would cost every call site its prediction on each flip. */
 static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
 {
     const uint32_t *lo = (const uint32_t *)blk->code, *hi = lo + blk->code_words;
@@ -15048,9 +14181,8 @@ static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
     size_t idx = jit->n_live;
     for (size_t k = 0; k < jit->n_live; k++)
         if (jit->live[k] == blk) { idx = k; break; }
-    if (idx == jit->n_live) return;                    /* already retired */
+    if (idx == jit->n_live) return;
     pthread_jit_write_protect_np(0);
-    /* a thread still inside it must leave through its stop sites */
     if (blk->stop_patch && blk->stop_insn && *blk->stop_patch != blk->stop_insn) {
         __atomic_store_n(blk->stop_patch, blk->stop_insn, __ATOMIC_RELEASE);
         sys_icache_invalidate(blk->stop_patch, 4);
@@ -15070,9 +14202,6 @@ static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
             sys_icache_invalidate(cs, 4);
         }
     }
-    /* incoming chains from the survivors: cut, and queued so the block's
-     * replacement picks them up again (an edge left on its fallback would
-     * pay a trip through C for the rest of the process) */
     for (uint32_t q = 0; q < blk->n_preds; q++) {
         JitBlock *sblk = blk->preds[q].pb;
         int i = blk->preds[q].e;
@@ -15104,7 +14233,6 @@ static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
         if (IN_BLK(*g_ras_cells[i]))
             __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
     pthread_jit_write_protect_np(1);
-    /* unlink + retire */
     unsigned h = hash_key(blk->key);
     JitBlock **pp = &jit->buckets[h];
     while (*pp && *pp != blk) pp = &(*pp)->hnext;
@@ -15115,7 +14243,6 @@ static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
     gran_block(blk, -1);
     blk->retired_next = jit->retired;
     jit->retired = blk;
-    /* code-pointer caches: only the entries into this block */
     for (unsigned i = 0; i < g_ras_slot_n; i++)
         if (IN_BLK(g_ras_slots[i]))
             __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
@@ -15145,13 +14272,12 @@ static void flip_retire_block(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
     g_flip_ns_retire += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
 }
 
-/* Decide one probed side exit from its counts.  Returns 1 to invert. */
 static int flip_decide_locked(JitBlock *blk, int e, int tk, int ft, int logit)
 {
     uint64_t jcc_rip = blk->edges[e].jcc_rip;
     int flip = tk >= 2 * ft && tk >= (1 << (PROBE_BIT - 1));
     int i = flip_find(jcc_rip, 1);
-    if (i < 0) flip = 0;                                  /* table full: keep the layout */
+    if (i < 0) flip = 0;
     else if (g_flip[i].state != FLIP_NONE) flip = g_flip[i].state == FLIP_DECIDED_INV;
     else g_flip[i].state = flip ? FLIP_DECIDED_INV : FLIP_DECIDED_ORIG;
     if (logit)
@@ -15159,8 +14285,6 @@ static int flip_decide_locked(JitBlock *blk, int e, int tk, int ft, int logit)
                 (unsigned long long)blk_rip(blk), (unsigned long long)jcc_rip, tk, ft, flip ? "invert" : "keep");
     blk->edges[e].probing = 0;
     if (!flip) {
-        /* probes out: the fall-through detour and the taken trip become nops,
-         * and the branch may now short-circuit to its target */
         JitProf *pf = &blk->prof[blk->edges[e].side - 1];
         pthread_jit_write_protect_np(0);
         __atomic_store_n(pf->ft_site, A64_NOP, __ATOMIC_RELEASE);
@@ -15172,10 +14296,6 @@ static int flip_decide_locked(JitBlock *blk, int e, int tk, int ft, int logit)
     return flip;
 }
 
-/* A probed side exit tripped: one side of its jcc reached the threshold.
- * The first window of a loop is often unlike its steady state (the setup
- * pass takes the rare path), so a verdict counts only when the next window
- * repeats it; the fourth window decides regardless. */
 static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
 {
     JitBlock *blk = (JitBlock *)cpu->side_blk;
@@ -15185,7 +14305,7 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     int e = -1;
     for (int i = 0; i < blk->n_edges; i++)
         if (blk->edges[i].side == k + 1) { e = i; break; }
-    if (e < 0 || !blk->edges[e].probing) return;      /* decided by an earlier trip */
+    if (e < 0 || !blk->edges[e].probing) return;
     static int fliplog = -1;
     if (fliplog < 0) {
         fliplog = getenv("OCERZ_FLIPLOG") ? 1 : 0;
@@ -15201,7 +14321,7 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     if (pf->windows == 0 || (pf->prev != verdict && pf->windows < 3)) {
         pf->prev = (uint8_t)verdict;
         pf->windows++;
-        pf->taken = pf->ft = 0;                       /* next window */
+        pf->taken = pf->ft = 0;
         pthread_mutex_unlock(&jit_lock);
         return;
     }
@@ -15216,7 +14336,6 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
 
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    /* Stage 9: i386 blocks are compiled. */
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
         return OCERZ_EUNSUP;
     { static int sl = -1; if (sl < 0) sl = getenv("OCERZ_STEPLOG") ? 1 : 0; if (sl) steplog(cpu); }

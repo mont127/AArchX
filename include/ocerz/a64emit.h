@@ -1,4 +1,6 @@
-/* arm64 instruction emitter: each call appends one instruction to an A64Buf. */
+/*
+ * arm64 instruction emitter: each call appends one instruction to an A64Buf.
+ */
 #ifndef OCERZ_A64EMIT_H
 #define OCERZ_A64EMIT_H
 
@@ -133,8 +135,6 @@ void a64_ldp_post(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_stp_off(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_ldp_off(A64Buf *b, int rt, int rt2, int rn, int imm);
 
-
-/* FP / SIMD */
 void a64_ldr_v(A64Buf *b, int size, int vt, int rn, uint32_t off);
 void a64_str_v(A64Buf *b, int size, int vt, int rn, uint32_t off);
 void a64_ldur(A64Buf *b, int size, int rt, int rn, int32_t simm9);
@@ -196,7 +196,7 @@ void a64_v_frint(A64Buf *b, int dbl, int mode, int vd, int vn);
 void a64_v_tbl1(A64Buf *b, int vd, int vn, int vm);
 void a64_v_ext(A64Buf *b, int vd, int vn, int vm, int idx);
 void a64_v_rev64_4s(A64Buf *b, int vd, int vn);
-void a64_ldop_al(A64Buf *b, int size, int opc, int rs, int rt, int rn);   /* 0 add 1 clr 2 eor 3 set */
+void a64_ldop_al(A64Buf *b, int size, int opc, int rs, int rt, int rn);
 void a64_swpal(A64Buf *b, int size, int rs, int rt, int rn);
 void a64_casal(A64Buf *b, int size, int rs, int rt, int rn);
 void a64_neg_reg(A64Buf *b, int sf, int rd, int rm);

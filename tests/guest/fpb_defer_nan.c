@@ -32,19 +32,19 @@ static g_u64 run(int n)
 int main(int argc, char **argv, char **envp)
 {
     const double inf = bits(0x7ff0000000000000ull), ninf = bits(0xfff0000000000000ull);
-    const double qa = bits(0x7ff8000000000aaaull);    /* quiet NaN, payload aaa */
-    const double sb = bits(0x7ff4000000000bbbull);    /* signalling NaN, payload bbb */
+    const double qa = bits(0x7ff8000000000aaaull);
+    const double sb = bits(0x7ff4000000000bbbull);
     for (int i = 0; i < 16; i++) { ps[i].x = i * 7; ps[i].y = -i * 9; ps[i].vx = 0.5; ps[i].vy = 0.25; ps[i].id = (g_u64)i; }
-    ps[1].x = ninf; ps[1].vx = inf;                 /* lane 0: generated NaN, no bounce */
-    ps[2].y = inf;  ps[2].vy = ninf;                /* lane 1: generated NaN, no bounce */
-    ps[3].x = ninf; ps[3].vx = inf; ps[3].y = inf; ps[3].vy = ninf;   /* both lanes */
-    ps[4].x = qa;   ps[4].vx = sb;                  /* qNaN + sNaN: x86 keeps the destination's */
-    ps[5].y = sb;   ps[5].vy = qa;                  /* sNaN + qNaN in lane 1 */
-    ps[6].x = 500;  ps[6].y = inf; ps[6].vy = ninf; /* x bounces (side exit) while y turns NaN */
-    ps[7].x = 500;  ps[7].y = qa;                   /* x bounces while y carries a NaN payload */
-    ps[8].y = -500; ps[8].x = ninf; ps[8].vx = inf; /* y bounces while x turns NaN */
-    ps[9].x = 500;  ps[9].y = -500;                 /* both bounce, no NaN */
-    ps[10].x = qa;  ps[10].vx = 0.5; ps[10].y = -500; ps[10].vy = sb;   /* propagated + generated */
+    ps[1].x = ninf; ps[1].vx = inf;
+    ps[2].y = inf;  ps[2].vy = ninf;
+    ps[3].x = ninf; ps[3].vx = inf; ps[3].y = inf; ps[3].vy = ninf;
+    ps[4].x = qa;   ps[4].vx = sb;
+    ps[5].y = sb;   ps[5].vy = qa;
+    ps[6].x = 500;  ps[6].y = inf; ps[6].vy = ninf;
+    ps[7].x = 500;  ps[7].y = qa;
+    ps[8].y = -500; ps[8].x = ninf; ps[8].vx = inf;
+    ps[9].x = 500;  ps[9].y = -500;
+    ps[10].x = qa;  ps[10].vx = 0.5; ps[10].y = -500; ps[10].vy = sb;
     g_u64 acc = run(v_n);
     g_puts("acc "); g_putu64(acc);
     for (int i = 0; i < 16; i++) {

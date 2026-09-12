@@ -1,69 +1,50 @@
-/* i386diff -- 32-bit (i386) decode conformance harness.
+/*
+ * i386diff -- 32-bit (i386) decode conformance harness.
  *
  * Sibling of tools/decodiff.c, and deliberately the opposite kind of gate:
- *
- *   decodiff  proves a decode.c patch changed NOTHING in 64-bit mode
- *             (self-comparison of two trees, no external truth needed).
- *   i386diff  measures how much of 32-bit mode ocerz decodes CORRECTLY,
- *             against an external oracle (capstone CS_MODE_32).
- *
- * Like decodiff this links against src/decode.o ALONE (that object needs only
- * libc), so it is native arm64 -- no Rosetta, no wine, no i386 toolchain.
+ * decodiff proves a decode.c patch changed NOTHING in 64-bit mode, by
+ * self-comparison of two trees with no external truth needed; i386diff
+ * measures how much of 32-bit mode ocerz decodes CORRECTLY, against an
+ * external oracle (capstone CS_MODE_32).  Like decodiff it links against
+ * src/decode.o alone, so it is native arm64.
  *
  * This C half only sweeps and records what ocerz's decoder says.  The oracle,
- * the comparison and the classified report live in tools/i386diff.py; the two
- * halves are wired together by tools/i386diff.sh.  The sweep parameters
- * (opening widths, tails, EIP) are printed by `i386diff params` so that python
+ * the comparison and the classified report live in tools/i386diff.py, and the
+ * two halves are wired together by tools/i386diff.sh.  The sweep parameters
+ * (opening widths, tails, EIP) are printed by `i386diff params` so python
  * reconstructs byte-for-byte the same probes from a single source of truth.
  *
  *   i386diff params              -- sweep parameters, key=value, for python
  *   i386diff names               -- "<id> <name>" for every OcerzOp
  *   i386diff sweep 32 <out.bin>  -- sweep in 32-bit mode, write records
- *                                  (trailing "quick" = 2-byte openings only)
+ *                                   (trailing "quick" = 2-byte openings only)
  *   i386diff sweep 64 <out.bin>  -- ditto in 64-bit mode (oracle calibration)
  *   i386diff probe <index>       -- print the 16 probe bytes for one index
  *   i386diff line 32 <index>     -- decode one probe, human readable
  *   i386diff bytes 32 <hex...>   -- decode an ad-hoc byte string
  *   i386diff selftest            -- the documented 32-bit oracle answers
  *
- * ---------------------------------------------------------------------------
- * ENTRY POINT
- * ---------------------------------------------------------------------------
- * ocerz has no 32-bit decode entry point yet; stage 3 adds one.  Rather than
- * guess silently, this file compiles against whichever of a small set of
- * candidate symbols actually exists in the decode.o under test.  The driver
- * script picks with nm(1) and passes -DI386DIFF_ENTRY=N:
- *
- *   1  int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
- *                            X86Insn *out, int mode32);      <- ASSUMED API
- *   2  int ocerz_decode32(const uint8_t *code, size_t avail, uint64_t eip,
- *                         X86Insn *out);
- *   0  no 32-bit entry point found: fall back to the 64-bit ocerz_decode() and
- *      feed it 32-bit input.  That is WRONG BY CONSTRUCTION and is exactly the
- *      stage-3 baseline this harness exists to measure.
- *
- * If stage 3 lands a third spelling, add a branch here and a case to the nm
- * probe in i386diff.sh -- nothing else in the harness cares.
+ * The harness compiles against whichever 32-bit decode entry point actually
+ * exists in the decode.o under test rather than guessing silently: the driver
+ * script picks with nm(1) and passes -DI386DIFF_ENTRY=N, where 1 is
+ * ocerz_decode_mode(), 2 is ocerz_decode32(), and 0 means no 32-bit entry
+ * point was found and the 64-bit decoder is being fed 32-bit input -- wrong by
+ * construction, and exactly the baseline this harness exists to measure.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include "ocerz/decode.h"
-#include "ocerz/cpu.h"   /* OCERZ_REG_NONE only */
-
-/* ---- sweep shape ------------------------------------------------------- */
+#include "ocerz/cpu.h"
 
 #define SWEEP3_BITS 24
-#define SWEEP3_N    (1u << SWEEP3_BITS)          /* every 3-byte opening      */
+#define SWEEP3_N    (1u << SWEEP3_BITS)
 #define SWEEP2_BITS 16
-#define SWEEP2_N    (1u << SWEEP2_BITS)          /* every 2-byte opening      */
+#define SWEEP2_N    (1u << SWEEP2_BITS)
 #define PROBE_N     (SWEEP3_N + SWEEP2_N)
-#define PROBE_LEN   16                           /* decoder's own max length  */
+#define PROBE_LEN   16
 
-/* Two different tails.  A single tail can accidentally mask a length bug
- * (e.g. an immediate read at the wrong width that happens to land on equal
- * bytes), so phase B repeats the 2-byte openings against unrelated filler. */
 static const uint8_t TAIL_A[13] = {
     0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd
 };
@@ -71,12 +52,8 @@ static const uint8_t TAIL_B[14] = {
     0x37,0xf1,0x2a,0x5c,0xd3,0x08,0xe6,0x9b,0x4f,0xa7,0x60,0x13,0xbe,0xc5
 };
 
-/* Nonzero and plausible: a classic i386 PE image base + .text offset, and the
- * 64-bit RIP decodiff uses.  Only affects riprel folding / branch targets. */
 #define EIP32 0x00401000ull
 #define RIP64 0x0000000140001000ull
-
-/* ---- entry point shim -------------------------------------------------- */
 
 #ifndef I386DIFF_ENTRY
 #define I386DIFF_ENTRY 0
@@ -105,17 +82,11 @@ static int decode_as(const uint8_t *c, size_t n, uint64_t ip, X86Insn *o, int m3
 #define ENTRY_IS_REAL 0
 static int decode_as(const uint8_t *c, size_t n, uint64_t ip, X86Insn *o, int m32)
 {
-    (void)m32;                    /* no 32-bit entry point: baseline mode */
+    (void)m32;
     return ocerz_decode(c, n, ip, o);
 }
 #endif
 
-/* ---- probes ------------------------------------------------------------ */
-
-/* Probe i < 2^24: opening = the three bytes of i (little endian) + TAIL_A.
- * Probe i >= 2^24: opening = the two bytes of (i - 2^24)         + TAIL_B.
- * Always exactly PROBE_LEN bytes, so "instruction too long" is the only
- * truncation either side can report and both report it on the same inputs. */
 static void build_probe(uint32_t i, uint8_t code[PROBE_LEN])
 {
     if (i < SWEEP3_N) {
@@ -131,11 +102,6 @@ static void build_probe(uint32_t i, uint8_t code[PROBE_LEN])
     }
 }
 
-/* ---- records ----------------------------------------------------------- */
-
-/* 8 bytes per probe.  status 1 = decoded, 0 = refused; on refusal `op` carries
- * the negated ocerz error code so python can separate "unknown opcode" from
- * "ran off the end", which are very different failures. */
 typedef struct Rec {
     uint8_t  status;
     uint8_t  len;
@@ -145,22 +111,6 @@ typedef struct Rec {
     uint16_t pad2;
 } Rec;
 
-/* Operand SHAPE.  Length and mnemonic agreement is not enough: the four
- * mode-dependent operand rules below all produce instructions of the SAME
- * length with the SAME mnemonic, so a stage-4 patch could decode
- * "mov eax,[0x18]" as RIP-relative and sail through a length-only gate.  These
- * four bits are recoverable from both X86Insn and capstone's operand text
- * without reimplementing either side's formatting.
- *
- *   1  RIP-relative memory operand     (32-bit: mod=00 rm=101 is ABSOLUTE)
- *   2  16-bit address registers        (32-bit + 0x67; a different ModRM table)
- *   4  64-bit register anywhere        (must never appear in a 32-bit decode)
- *   8  AH/CH/DH/BH high byte register  (cannot exist in 64-bit mode)
- *  16  has an explicit memory operand  (not a shape claim -- it tells python
- *      when ocerz models an address at all.  ocerz leaves string ops with no
- *      operands, so without this the 0xa4..0xaf block would report a bogus
- *      address-width difference against every disassembler on earth.)
- */
 static uint8_t shape_flags(const X86Insn *ins)
 {
     uint8_t f = 0;
@@ -174,11 +124,11 @@ static uint8_t shape_flags(const X86Insn *ins)
             continue;
         f |= 16;
         if (o->riprel) {
-            f |= 1;                       /* base/index are NONE when riprel */
+            f |= 1;
             continue;
         }
         if (o->base == OCERZ_REG_NONE && o->index == OCERZ_REG_NONE)
-            continue;                     /* displacement only: no reg width */
+            continue;
         if (ins->addrsize == 2)
             f |= 2;
         else if (ins->addrsize == 8)
@@ -213,8 +163,6 @@ static int sweep(int m32, const char *path, int quick)
     if (!out) { perror("malloc"); return 1; }
     uint64_t ip = m32 ? EIP32 : RIP64;
     uint8_t code[PROBE_LEN];
-    /* quick: two-byte openings only -- a ~1s inner-loop gate while working on
-     * a specific opcode.  Phase A stays zeroed and python skips it. */
     uint32_t from = quick ? SWEEP3_N : 0;
     for (uint32_t i = from; i < PROBE_N; i++) {
         build_probe(i, code);
@@ -231,8 +179,6 @@ static int sweep(int m32, const char *path, int quick)
             PROBE_N, m32 ? 32 : 64, path);
     return 0;
 }
-
-/* ---- human-readable single probe --------------------------------------- */
 
 static void show(const uint8_t *code, int nbytes, uint64_t ip, int m32)
 {
@@ -267,8 +213,6 @@ static int hexbytes(const char *s, uint8_t *out, int cap)
     }
     return n;
 }
-
-/* ---- selftest: the documented capstone answers ------------------------- */
 
 static const struct { const char *bytes; const char *want; } SELF[] = {
     { "60",             "pushal, len 1"          },

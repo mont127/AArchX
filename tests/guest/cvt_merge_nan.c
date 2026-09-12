@@ -28,14 +28,14 @@ int main(int argc, char **argv, char **envp)
 {
     const double inf = bits(0x7ff0000000000000ull);
     const double qa = bits(0x7ff8000000000aaaull), sb = bits(0x7ff4000000000bbbull);
-    one("gen  ", inf, inf);              /* inf - inf: generated NaN, x86 sign */
-    one("prop ", qa, 1.0);               /* propagated from the destination */
-    one("props", 1.0, sb);               /* propagated from the source, quieted */
-    one("both ", qa, sb);                /* qNaN dst + sNaN src: x86 keeps the destination's */
-    one("sat  ", 1e300, -1e300);         /* finite but out of range: saturation, value intact */
-    one("big  ", 9.3e18, 0.0);           /* > INT64_MAX: indefinite */
-    one("neg  ", -9.3e18, 0.0);          /* < INT64_MIN: indefinite */
-    one("norm ", 123456.75, 0.25);       /* ordinary */
-    one("zero ", 0.5, 0.5);              /* exact zero result */
+    one("gen  ", inf, inf);
+    one("prop ", qa, 1.0);
+    one("props", 1.0, sb);
+    one("both ", qa, sb);
+    one("sat  ", 1e300, -1e300);
+    one("big  ", 9.3e18, 0.0);
+    one("neg  ", -9.3e18, 0.0);
+    one("norm ", 123456.75, 0.25);
+    one("zero ", 0.5, 0.5);
     return 0;
 }

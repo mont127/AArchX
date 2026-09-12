@@ -1,4 +1,99 @@
-/* The master run loop and crash containment. */
+/*
+ * The master run loop and crash containment.
+ *
+ * ---- suspending a guest thread ----
+ * JavaScriptCore's garbage collector suspends each mutator, reads its
+ * registers with thread_get_state and scans its stack.  Handed to the host
+ * kernel, thread_suspend froze the ocerz thread wherever it happened to be:
+ * Safari's main thread stopped inside the translator holding jit_lock and
+ * every other cpu, the collector included, then blocked on that lock for good
+ * - and an x86 thread_get_state on an arm64 thread fails outright anyway.  So
+ * a suspend of a thread running guest code reports done only once the target
+ * holds no ocerz lock: parked at a safe point, inside a raw host wait, or
+ * stopped by the kernel with its pc in a translated block, where the pinned
+ * host registers are its guest registers.  Anywhere else - translator, C
+ * helper, interpreter - it is let go and caught a moment later.
+ *
+ * ---- signals ----
+ * ocerz emulates the guest's signal mask itself, so the HOST thread must never
+ * block asynchronous signals: wineserver suspends and APC-kicks guest threads
+ * with SIGUSR1 sent to the host thread, and a host mask that blocks it leaves
+ * the thread "suspended" server-side forever (Steam's CEF browser deadlocked
+ * that way, 2026-09-06).  XNU starts libdispatch workqueue threads with all
+ * asynchronous signals blocked, and a pthread created from one inherits that
+ * mask, so the mask is cleared whenever a host thread starts running guest
+ * code.  Guest sigaction() is also mirrored onto the host for plain
+ * asynchronous signals, because the HOST kernel decides what SIGPIPE does to
+ * the process and its default is to kill it silently: wineserver ignores
+ * SIGPIPE and relies on EPIPE, and without the mirror the whole server
+ * vanished the first time a client died with a reply in flight.
+ *
+ * ---- faults ----
+ * The fault handler is where most of the emulation's hard edges meet.  A first
+ * touch of a lazily-slid shared-cache data page unpacks it and retries.  A raw
+ * host pointer the guest was handed inline (IOSurface's per-client page,
+ * mapped into the task by the kernel) is aliased at its guest address and
+ * retried.  An alignment fault in translated code means an ordered access
+ * crossed a 16-byte boundary: the one access is hot-patched into an
+ * alignment-checked arm and re-executed.  A host-stack RAS overflow means the
+ * CALL's shadow push hit the stack guard before anything of the CALL ran, so
+ * the CALL is interpreted and the JIT frame abandoned.  A store into a page
+ * armed read-only because code was translated out of it IS the
+ * self-modifying-code notification: grant write, drop the stale translations,
+ * retry.  A plain-form access to the emulated commpage marks the block for
+ * guarded retranslation.
+ *
+ * What is not recognised is handed to the guest as an access violation at the
+ * faulting instruction rather than killing the thread: killing it leaves every
+ * lock it held taken forever, and a V8 background job died that way holding a
+ * JitPage mutex with its LocalHeap still Running, after which the renderer's GC
+ * safepoint waited on it until the end of time.  SIGILL/SIGTRAP/SIGSYS are
+ * routed through the crash reporter too - a jump to a garbage code pointer used
+ * to kill the process silently, with a macOS .ips file as the only trace.  A
+ * fatal in 32-bit guest code takes the whole process down on purpose: it
+ * usually lands on a WoW64 thread, and leaving the process half-alive wedges
+ * the guest's parent, which waits for the child forever.
+ *
+ * ---- the unstick monitor ----
+ * A guest thread parks in a blocking host wait whose wakeup was lost (waiter/
+ * waker alias, kevent edge), and an EINTR shake always revived the session by
+ * hand.  The monitor automates it: any cpu inside one blocking host call for
+ * more than 800 ms is kicked with a host signal deliberately installed without
+ * SA_RESTART.  Only waits whose callers already loop on a spurious return are
+ * kicked; a cpu in a read, recvmsg, poll or fcntl lock sets block_nokick and is
+ * left alone, because those never return EINTR on their own and apps rightly do
+ * not expect it.  OCERZ_UNSTICK_ALL=1 kicks those too.  The same no-op handler
+ * doubles as a context-synchronization event, so a thread spinning in JIT code
+ * observes the stop-site patches made by ocerz_jit_request_stop.
+ *
+ * ---- diagnostics ----
+ * SIGINFO is always armed and dumps every guest thread - host tid, rip/rsp, the
+ * syscall it is blocked in, and its Windows-side stack - so a hung Wine process
+ * can be inspected without attaching a debugger.  Reading that stack means
+ * knowing where Wine keeps things: the TEB is in pthread TSD slot 6 with
+ * NtTib.Self pointing back at it (the old test read it from rsp&~0xffff, which
+ * is only true near the start of a thread and mid-stack mistook a real Windows
+ * thread for a host worker), and the PE caller's registers sit in the syscall
+ * frame at TEB+0x378 because Wine runs unix-side code on a separate stack.
+ * OCERZ_PORTDUMP names the conversation behind a lost-wakeup wedge; the
+ * OCERZ_BTRACE freeze latch stops every block-entry ring once a cpu has entered
+ * no guest block for 5 s while others keep running, which is the only
+ * instrument that can see control flow that never leaves the code arena; and
+ * OCERZ_PEEK answers the first question worth asking when a guest assertion
+ * fires on a constant - was this global already wrong before the guest ran.
+ * Backtraces deliberately include the callee-saved registers: "a register the
+ * ABI says survives a call did not" is a whole class of emulation bug.
+ *
+ * ---- threads and fork ----
+ * The thread that runs this loop is a guest CPU like any other - for a dynamic
+ * binary it is where main() itself runs - so it registers in the cpu registry;
+ * without that, SIGINFO reported cpus=0 for a process whose main thread was
+ * wedged.  Its FPCR is set from the guest's MXCSR rounding mode before any JIT
+ * SSE op runs, because a worker inherits the host default.  The host mask is
+ * cleared before sigsetjmp captures it, since every fault recovery siglongjmps
+ * back and restores whatever was saved.  A fork child drops the inherited
+ * MAP_JIT arena: its pages read fine but executing them raises SIGBUS.
+ */
 #include "ocerz/vm.h"
 #include "ocerz/dyld.h"
 #include "ocerz/interp.h"
@@ -35,12 +130,8 @@ static OcerzCPU *g_cpus[OCERZ_MAX_CPUS];
 static pthread_t g_cpu_threads[OCERZ_MAX_CPUS];
 static int g_cpus_n;
 static pthread_mutex_t g_cpus_lock = PTHREAD_MUTEX_INITIALIZER;
-/* OCERZ_BTRACE: SIGUSR1 (ripdump) asks the monitor thread to latch and print
- * the block-entry rings.  The handler only sets a flag: printing 64K entries
- * is not async-signal-safe, and the stuck thread is never idle (it spins in a
- * kevent wait loop), so a quiet-based latch cannot see it. */
-uint64_t ocerz_exc_trap_rip;      /* OCERZ_EXCLOG: guest _objc_exception_throw entry */
-uint64_t ocerz_cxa_throw_rip;    /* OCERZ_EXCLOG: guest ___cxa_throw entry */
+uint64_t ocerz_exc_trap_rip;
+uint64_t ocerz_cxa_throw_rip;
 static volatile int g_btrace_req;
 static int g_btrace_on = -1;
 static OcerzCPU *g_fork_surviving_cpu;
@@ -50,7 +141,7 @@ static void ocerz_cpu_register(OcerzCPU *cpu)
 {
     if (g_btrace_on < 0) g_btrace_on = getenv("OCERZ_BTRACE") ? 1 : 0;
     if (!cpu->btrace && g_btrace_on > 0) {
-        unsigned n = 1u << 16;                       /* 64K entries = 512 KB */
+        unsigned n = 1u << 16;
         cpu->btrace = (uint64_t *)calloc(n, sizeof(uint64_t));
         if (cpu->btrace) {
             cpu->btrace_n = 0;
@@ -92,22 +183,6 @@ static void ocerz_cpu_unregister(OcerzCPU *cpu)
     pthread_mutex_unlock(&g_cpus_lock);
 }
 
-/* ---- guest thread_suspend / thread_resume / thread_get_state ----------
- * JavaScriptCore's garbage collector suspends each mutator, reads its
- * registers with thread_get_state and scans its stack.  Handed to the host
- * kernel, thread_suspend froze the ocerz thread wherever it happened to be:
- * Safari's main thread stopped inside the translator holding jit_lock, and
- * every other cpu, the collector included, then blocked on that lock for
- * good.  An x86 thread_get_state on an arm64 thread fails outright too.
- *
- * So a suspend of a thread running guest code only reports done once the
- * target holds no ocerz lock: parked at a safe point (the run loop, or a
- * syscall's return edge), inside a raw host wait (block_since_ns), or
- * stopped by the kernel with its pc in a translated block, whose pinned host
- * registers are its guest registers.  Anywhere else -- translator, C
- * helper, interpreter -- it is let go at once and caught a moment later.
- * A thread not running guest code goes to the kernel as before.  Pinned by
- * the dynamic test thread_suspend. */
 static pthread_mutex_t g_susp_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_susp_cv = PTHREAD_COND_INITIALIZER;
 
@@ -132,12 +207,10 @@ void ocerz_vm_suspend_point(OcerzCPU *cpu)
     pthread_mutex_unlock(&g_susp_lock);
 }
 
-/* t is stopped by the kernel: is it somewhere that holds no ocerz lock?
- * Nothing here may take a lock or allocate -- t might hold malloc's. */
 static int susp_stop_is_safe(OcerzCPU *t)
 {
     if (__atomic_load_n(&t->block_since_ns, __ATOMIC_ACQUIRE))
-        return 1;                           /* raw host wait: gpr[] is current */
+        return 1;
     arm_thread_state64_t hs;
     mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(t->host_kport, ARM_THREAD_STATE64, (thread_state_t)&hs, &n) != KERN_SUCCESS)
@@ -162,7 +235,6 @@ int ocerz_vm_thread_suspend(OcerzCPU *self, uint32_t port)
         }
         if (!counted) {
             counted = 1;
-            /* already stopped; or itself, which parks at this syscall's return edge */
             if (__atomic_add_fetch(&t->suspend_count, 1, __ATOMIC_ACQ_REL) > 1 || t == self) {
                 pthread_mutex_unlock(&g_cpus_lock);
                 return KERN_SUCCESS;
@@ -172,7 +244,7 @@ int ocerz_vm_thread_suspend(OcerzCPU *self, uint32_t port)
         if (!ok && thread_suspend(t->host_kport) == KERN_SUCCESS) {
             t->susp_have_gpr = 0;
             if (__atomic_load_n(&t->susp_parked, __ATOMIC_ACQUIRE)) {
-                thread_resume(t->host_kport);   /* it reached the park first and stays there */
+                thread_resume(t->host_kport);
                 ok = 1;
             } else if (susp_stop_is_safe(t)) {
                 t->susp_host = 1;
@@ -185,7 +257,6 @@ int ocerz_vm_thread_suspend(OcerzCPU *self, uint32_t port)
         pthread_mutex_unlock(&g_cpus_lock);
         if (ok)
             return KERN_SUCCESS;
-        /* let it run on to a safe point; t may be gone by the next look */
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 200 * 1000;
@@ -205,7 +276,7 @@ int ocerz_vm_thread_resume(uint32_t port)
     OcerzCPU *t = cpu_by_kport_locked(port);
     if (!t || __atomic_load_n(&t->suspend_count, __ATOMIC_ACQUIRE) <= 0) {
         pthread_mutex_unlock(&g_cpus_lock);
-        return -1;          /* not suspended by us: the kernel answers (KERN_FAILURE if running) */
+        return -1;
     }
     if (__atomic_sub_fetch(&t->suspend_count, 1, __ATOMIC_ACQ_REL) == 0) {
         if (t->susp_host) {
@@ -234,8 +305,6 @@ int ocerz_vm_thread_regs(uint32_t port, uint64_t gpr[16], uint64_t *rip, uint64_
     return t ? 0 : -1;
 }
 
-/* The JIT's RAS is a ring (index = top & (SIZE-1)): stale entries below the
- * top must not survive an invalidation, so purge clears the entries too. */
 static void ras_clear(OcerzCPU *cpu)
 {
     for (int i = 0; i < OCERZ_RAS_SIZE; i++) {
@@ -275,9 +344,6 @@ static __thread sigjmp_buf *g_sig_recover;
 #define OCERZ_SIG_MAX_REPEAT 16
 
 extern __thread int ocerz_jit_exec_state;
-/* per-thread ring of fault-recovery events (what unwound guest execution
- * mid-flight); dumped by the UD2 diagnostics to correlate aborts like the
- * libplatform os_unfair_lock recursion with a preceding recovery */
 static __thread struct { uint32_t n; struct { uint8_t kind; uint64_t rip; uint64_t icount; } e[16]; } g_recov_ring;
 static const char *const g_recov_names[] = { "?", "ras-overflow", "align-interp", "worker-term", "commpage-interp", "sig-deliver", "wild-term", "cache-patch" };
 void ocerz_recov_note(int kind, uint64_t rip)
@@ -341,15 +407,9 @@ void ocerz_vm_atfork_child(void)
     g_fork_surviving_cpu = NULL;
     g_pending_async_mask = 0;
     if (survivor)
-        survivor->sig_pending = 0;   /* fork clears pending signals in the child */
+        survivor->sig_pending = 0;
     g_riphist_n = 0;
     __atomic_store_n(&g_unstick_started, 0, __ATOMIC_RELEASE);
-    /* The MAP_JIT arena is inherited READ-ONLY-EXECUTABLE-WISE-BROKEN by a
-     * fork child on Apple silicon: the pages read fine but executing them
-     * raises SIGBUS (seen as the rare early-exit crash of wine's double-fork
-     * intermediate at icount ~0x6ce).  A fork child that does not exec only
-     * runs the fork-return + _exit()/execve() path, so drop it to the
-     * interpreter. */
     if (g_vm && g_vm->jit_enabled && g_fork_keepjit <= 0) {
         ocerz_jit_forget(g_vm);
         if (survivor) survivor->interp_once = 1;
@@ -476,15 +536,14 @@ static void arg_trap_report(const OcerzCPU *c)
     }
     if (ocerz_addr_readable(c->gpr[OCERZ_RSP])) {
         fprintf(stderr, " ra=%#llx", (unsigned long long)ocerz_ld(c->gpr[OCERZ_RSP], 8));
-        /* a few more return-address-looking stack words for context */
         for (uint64_t o = 8; o < 0x3000; o += 8) {
             if (!ocerz_addr_readable(c->gpr[OCERZ_RSP] + o)) break;
             uint64_t v = ocerz_ld(c->gpr[OCERZ_RSP] + o, 8);
-            int codey = (v >= 0x7ff800000000ull && v < 0x7ffb00000000ull) ||   /* shared cache */
-                        (v >= 0x700000000000ull && v < 0x710000000000ull) ||   /* wine .so images */
-                        (v >= 0x6fff00000000ull && v < 0x700000000000ull) ||   /* PE builtins */
-                        (v >= 0x140000000ull && v < 0x180000000ull) ||          /* PE exes */
-                        (v >= 0x7ff000000000ull && v < 0x7ff100000000ull);      /* relocated builtins */
+            int codey = (v >= 0x7ff800000000ull && v < 0x7ffb00000000ull) ||
+                        (v >= 0x700000000000ull && v < 0x710000000000ull) ||
+                        (v >= 0x6fff00000000ull && v < 0x700000000000ull) ||
+                        (v >= 0x140000000ull && v < 0x180000000ull) ||
+                        (v >= 0x7ff000000000ull && v < 0x7ff100000000ull);
             if (codey)
                 fprintf(stderr, " +%#llx:%#llx", (unsigned long long)o, (unsigned long long)v);
         }
@@ -596,17 +655,6 @@ static char *str_into(char *p, const char *s)
     return p;
 }
 
-
-/* ocerz emulates the guest's signal mask itself (cpu->sig_mask), so the HOST
- * thread must never block asynchronous signals: wineserver suspends and
- * APC-kicks guest threads with SIGUSR1 sent to the host thread, and a host
- * mask that blocks it leaves the thread "suspended" server-side forever
- * (every wait it makes then stays pending; Steam's CEF browser deadlocked
- * that way, 2026-09-06).  XNU starts libdispatch workqueue threads with all
- * asynchronous signals blocked (0xf7fdc04e), and a pthread created from such a
- * thread inherits that mask, so a guest thread created while a HOSTWQ worker
- * was running guest code came up unable to receive wine's signals.  Clear the
- * mask whenever a host thread starts running guest code. */
 static void ocerz_host_sigmask_clear(const char *where)
 {
     sigset_t cur, empty;
@@ -633,13 +681,6 @@ static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
     }
 }
 
-/* Mirror a guest sigaction() onto the host for plain asynchronous signals.
- * The guest table alone is not enough: the HOST kernel decides what SIGPIPE
- * (write to a closed pipe) does to the process, and its default is to kill
- * it silently.  wineserver ignores SIGPIPE and relies on EPIPE; without
- * this mirror the whole server vanished the first time a client died with
- * a reply in flight.  kind: 0 = SIG_DFL, 1 = SIG_IGN, 2 = guest handler
- * (delivered through the pending-async mask like SIGQUIT/SIGUSR1). */
 void ocerz_vm_mirror_host_signal(int sig, int kind)
 {
     if (sig == SIGUSR1 && getenv("OCERZ_PORTDUMP"))
@@ -651,11 +692,6 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
     case SIGTTOU: case SIGCONT: case SIGINFO:
         break;
     case SIGUSR1:
-        /* wine's ntdll delivers server APCs/suspend requests via SIGUSR1;
-         * without mirroring, a guest-directed SIGUSR1 either killed the
-         * process (default action) or was eaten by the ripdump handler.
-         * Keep SIGUSR1 for the ripdump diagnostics only when that env is
-         * set (those sessions accept the distortion). */
         if (getenv("OCERZ_RIPDUMP"))
             return;
         break;
@@ -667,7 +703,7 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
         }
         break;
     default:
-        return;  /* SEGV/BUS/QUIT/ILL/TRAP/FPE/ABRT: ocerz owns these */
+        return;
     }
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -676,9 +712,6 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
     else if (kind == 2) {
         sa.sa_sigaction = async_sig_handler;
         sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESTART;
-        /* wine's SIGUSR1 (server APC/suspend) must interrupt blocked
-         * syscalls: EINTR bubbles the thread out of its wait, the vm loop
-         * delivers the guest handler, then the guest retries the call. */
         if (sig == SIGUSR1 || sig == SIGUSR2)
             sa.sa_flags &= ~SA_RESTART;
     } else
@@ -686,13 +719,6 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
     sigaction(sig, &sa, NULL);
 }
 
-
-/* Host address of a page the guest owns: the low/top windows, or (identity
- * mode) a committed page of a registered region.  ocerz_host_in_guest_space
- * caps identity addresses at ocerz_arena_hi, but wine maps most of its
- * memory above that (0x6fff...), and V8's code pages live there: a write
- * into an armed page up there must still reach the SMC path below, not the
- * wild-fault path (which used to kill the thread). */
 static inline int host_addr_is_guest_page(const void *h)
 {
     return ocerz_host_in_guest_space(h) || ocerz_addr_committed(ocerz_h2g(h)) == 1;
@@ -703,7 +729,7 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
     (void)sig; (void)si; (void)ctx;
     if (g_btrace_on > 0)
         __atomic_store_n(&g_btrace_req, 1, __ATOMIC_RELEASE);
-    {   /* fan out to every cpu thread once per second at most */
+    {
         static _Atomic uint64_t last_fan;
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t prev = last_fan;
@@ -719,7 +745,7 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
         return;
     char b[640];
     char *p = b;
-    {   /* one thread also dumps every port set in the task */
+    {
         static _Atomic int once;
         int exp = 0;
         if (__c11_atomic_compare_exchange_strong(&once, &exp, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
@@ -795,7 +821,7 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
     p = str_into(p, " slot3=");
     p = hex_into(p, ocerz_addr_readable(g_cur_cpu->gs_base + 0x18)
                      ? ocerz_ld(g_cur_cpu->gs_base + 0x18, 8) : 0);
-    p = str_into(p, " ctid=");    /* cached thread_selfid at TSD[-1] */
+    p = str_into(p, " ctid=");
     p = hex_into(p, ocerz_addr_readable(g_cur_cpu->gs_base - 8)
                      ? ocerz_ld(g_cur_cpu->gs_base - 8, 8) : 0);
     p = str_into(p, " rip=");
@@ -822,9 +848,7 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
     *p++ = '\n';
     write(2, b, (size_t)(p - b));
 
-    {   /* OCERZ_MACDRVDUMP=<winemac.so base>: dump the WineApplicationController
-         * request machinery (singleton at +0x560f0; +0x8 requestsSource,
-         * +0x10 requests NSMutableArray, +0x18 requestsManipQueue). */
+    {
         static uint64_t mbase; static int minit;
         if (!minit) {
             const char *e = getenv("OCERZ_MACDRVDUMP");
@@ -872,9 +896,6 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                                 mq = hex_into(mq, ocerz_ld(obj + 0x10, 8));
                             }
                         }
-                        /* DEFINITIVE: NSMutableArray count (w4>>32), head (w3 low32),
-                         * and each live element (storage[head..head+count]) with its
-                         * block invoke pointer so enqueue-loss vs lost-wakeup is settled. */
                         {
                             uint64_t w3 = ocerz_ld(arr + 0x18, 8);
                             uint64_t w4 = ocerz_ld(arr + 0x20, 8);
@@ -904,9 +925,6 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
             mq = str_into(mq, "\n");
             write(2, mb, (size_t)(mq - mb));
             if (getenv("OCERZ_UNFREEZE") && ctrl && ocerz_addr_readable(ctrl + 8)) {
-                /* force-signal the macdrv request source: if a request is
-                 * still queued despite count==0, the next runloop pass will
-                 * perform it and the session unfreezes. */
                 uint64_t fsrc = ocerz_ld(ctrl + 8, 8);
                 if (fsrc && ocerz_addr_readable(fsrc + 0x58)) {
                     ocerz_st(fsrc + 0x58, 8, 0x123456789abull);
@@ -914,14 +932,10 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                     write(2, msg, strlen(msg));
                 }
             }
-            {   /* hunt live OnMainThread wrapper blocks (invoke = winemac
-                 * +0x11a50) and the thunk blocks (+0x1e770) in the guest
-                 * heap; print their captured words so the frozen request's
-                 * actual target queue/array can be identified. */
+            {
                 uint64_t inv1 = mbase + 0x11a50, inv2 = mbase + 0x1e770;
                 uint64_t ctrl_isa = 0;
-                {   /* count WineApplicationController instances: compare isa
-                     * words against the known singleton's isa */
+                {
                     uint64_t sl = mbase + 0x560f0;
                     uint64_t c0 = ocerz_addr_readable(sl) ? ocerz_ld(sl, 8) : 0;
                     if (c0 && ocerz_addr_readable(c0))
@@ -940,7 +954,6 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                         uint64_t a = page + off;
                         uint64_t w = ocerz_ld(a, 8);
                         if (ctrl_isa && w == ctrl_isa && off == 0 + (a & 0xff0) - (a & 0xff0)) {
-                            /* isa match at any 16-aligned slot: report */
                             char cb[80]; char *cq = cb;
                             cq = str_into(cq, "ocerz: CTRLOBJ ");
                             cq = hex_into(cq, a);
@@ -949,7 +962,6 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                         }
                         if (w != inv1 && w != inv2)
                             continue;
-                        /* candidate block: invoke at +0x10 => block base a-0x10 */
                         uint64_t blk = a - 0x10;
                         uint64_t isa = ocerz_ld(blk, 8);
                         uint64_t fl = ocerz_ld(blk + 8, 8);
@@ -970,8 +982,6 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
                         hq = str_into(hq, "\n");
                         write(2, hb, (size_t)(hq - hb));
                         if (w == inv1 && (uint32_t)fl == 0xc3000002u) {
-                            /* heap wrapper: find every holder of a pointer
-                             * to it (the array backing store that owns it) */
                             for (int rj = 0; rj < 2; rj++)
                             for (uint64_t p2 = ranges[rj][0]; p2 < ranges[rj][1];
                                  p2 += 0x1000) {
@@ -994,11 +1004,10 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
             monce = 0;
         }
     }
-    {   /* guest backtrace by rbp-chain walk (system frameworks keep
-         * frame pointers, so this is reliable through CF/AppKit/wine) */
+    {
         p = b;
         p = str_into(p, "ocerz:   gbt");
-        uint64_t fp = g_cur_cpu->gpr[5];   /* rbp */
+        uint64_t fp = g_cur_cpu->gpr[5];
         for (int i = 0; i < 24; i++) {
             if (!fp || (fp & 7) || !ocerz_addr_readable(fp) ||
                 !ocerz_addr_readable(fp + 15))
@@ -1007,8 +1016,7 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
             uint64_t nfp = ocerz_ld(fp, 8);
             if (!ra)
                 break;
-            {   /* OnMainThread frame (returns into the thunk at winemac
-                 * +0x1e763): dump the __block "finished" byref cell. */
+            {
                 static uint64_t wbase; static int winit;
                 if (!winit) {
                     const char *e = getenv("OCERZ_MACDRVDUMP");
@@ -1082,8 +1090,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
     static __thread volatile int depth;
 
-    /* first touch of a lazily-slid shared-cache data page (host or guest
-     * access alike): unpack it and retry the faulting instruction */
     int align_fault = 0;
     if (sig == SIGSEGV || sig == SIGBUS) {
         const ucontext_t *luc = (const ucontext_t *)ctx;
@@ -1092,12 +1098,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (!align_fault && ocerz_cache_lazy_fault((uintptr_t)si->si_addr))
             return;
     }
-    /* A raw host pointer the guest was handed inline (IOSurface's per-client
-     * page, mapped into the task by the kernel during io_connect_method and
-     * returned in the output struct; anything IOKit maps for a client): the
-     * guest address is unmapped in the shadow but the same numeric address
-     * is a live device/shared mapping in the host.  Alias it at that guest
-     * address and retry, the way the SkyLight universe pages are aliased. */
     if ((sig == SIGSEGV || sig == SIGBUS) && !align_fault && g_vm &&
         ocerz_host_in_guest_space(si->si_addr)) {
         static __thread uint64_t last_alias_page;
@@ -1126,15 +1126,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     if (ocerz_jit_decode_recover)
         siglongjmp(*ocerz_jit_decode_recover, 1);
 
-    /* Alignment fault in translated code: an ordered (acquire/release)
-     * access crossed a 16-byte boundary.  The address can be anything
-     * readable (shared-cache constants included), so this is handled before
-     * the guest-space test: mark the block for alignment-checked
-     * retranslation, run the instruction in the interpreter, resume. */
-    /* Host-stack RAS overflow: the CALL's shadow push (stp x, x, [sp, #-16]!)
-     * hit the host stack guard.  Nothing of the CALL has executed yet (the
-     * shadow push comes first), so run the CALL in the interpreter and
-     * abandon the JIT frame; the shadow restarts empty. */
     if ((sig == SIGSEGV || sig == SIGBUS) && depth == 0 && g_cur_cpu && g_sig_recover && ctx) {
         const ucontext_t *uc = (const ucontext_t *)ctx;
         const uint32_t *hpc = (const uint32_t *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
@@ -1167,8 +1158,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         const void *hpc = (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
         struct OcerzVM *fvm = g_cur_cpu->vm;
         if (fvm && ocerz_jit_pc_in_arena(fvm, hpc)) {
-            /* preferred: hot-patch the one access into an alignment-checked
-             * arm and re-execute it (nothing executed, nothing invalidated) */
             int hp = ocerz_jit_hotpatch_align(fvm, hpc);
             if (hp) {
                 if (getenv("OCERZ_ALFAULTLOG"))
@@ -1196,19 +1185,12 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
     }
 
-    /* Store into a shared-cache page the guest made writable to patch it.  The
-     * page is armed read-only once code has been translated out of it, so this
-     * fault IS the notification: grant write, drop the stale translations and
-     * restart the store. */
     if ((sig == SIGSEGV || sig == SIGBUS) && !align_fault && depth == 0 &&
         g_cur_cpu && g_sig_recover && ctx) {
         const ucontext_t *uc = (const ucontext_t *)ctx;
         uint64_t esr = uc->uc_mcontext->__es.__esr;
         uint32_t ec = (uint32_t)((esr >> 26) & 0x3f);
         int armed_hit = 0;
-        /* a "just retry" verdict (2) on the same address more than a few
-         * times in a row means the page is read-only for a reason this
-         * path does not know: let the fault through instead of spinning */
         static __thread uint64_t retry_addr;
         static __thread int retry_n;
         if (ec != 0x20 && ec != 0x21 && (esr & (1u << 6)) &&
@@ -1231,7 +1213,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 ocerz_jit_fault_recover_flags(fvm, hpc, g_cur_cpu);
                 ocerz_flags_materialize(g_cur_cpu);
             }
-            if (armed_hit != 2)      /* 2: raced another thread's unarm, nothing to drop */
+            if (armed_hit != 2)
                 ocerz_jit_invalidate_range(fvm, page, OCERZ_HOST_PAGE_SIZE);
             if (getenv("OCERZ_CACHEPATCHLOG"))
                 fprintf(stderr, "ocerz: CACHEPATCH[%d] rip=%#llx addr=%p injit=%d\n",
@@ -1243,13 +1225,10 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 depth = 0;
                 siglongjmp(*g_sig_recover, 1);
             }
-            return;              /* interpreter store: retrying it is enough */
+            return;
         }
     }
 
-    /* The same write-trap, hit by host code outside a CPU run loop (a unit
-     * test harness or a loader thread rewriting guest code it already ran):
-     * unarm, drop the translations, retry the host store. */
     if ((sig == SIGSEGV || sig == SIGBUS) && !align_fault && depth == 0 && ctx &&
         !(g_cur_cpu && g_sig_recover) && g_vm && host_addr_is_guest_page(si->si_addr)) {
         const ucontext_t *uc = (const ucontext_t *)ctx;
@@ -1416,11 +1395,9 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (in_jit && rip_exact && ocerz_commpage && ocerz_guest_base == 0 &&
             gaddr >= OCERZ_COMMPAGE_LO && gaddr < OCERZ_COMMPAGE_HI &&
             ocerz_jit_note_commpage_fault(fvm, hpc, fault_rip)) {
-            /* plain-form access to the emulated commpage: the block is now
-             * marked for guarded retranslation; resume at the instruction */
             g_cur_cpu->rip = fault_rip;
             g_cur_cpu->sig_repeat = 0;
-            g_cur_cpu->interp_once = 1;      /* this instruction: interpreter (exact commpage semantics) */
+            g_cur_cpu->interp_once = 1;
             if (getenv("OCERZ_CPFAULTLOG")) {
                 fprintf(stderr, "ocerz: CPFAULT rip=%#llx gaddr=%#llx\n", (unsigned long long)fault_rip, (unsigned long long)gaddr);
                 ocerz_cpu_dump(g_cur_cpu, stderr);
@@ -1430,8 +1407,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             siglongjmp(*g_sig_recover, 1);
         }
         uint64_t fault_rsp = g_cur_cpu->gpr[OCERZ_RSP];
-        /* OCERZ_FAULTDUMP=<gpr index>: that register's value before the
-         * delivery rewrites the guest state for the handler */
         static int fault_dreg = -2;
         if (fault_dreg == -2) { const char *e = getenv("OCERZ_FAULTDUMP"); fault_dreg = e ? atoi(e) : -1; }
         uint64_t fault_dumpval = (fault_dreg >= 0 && fault_dreg < 16) ? g_cur_cpu->gpr[fault_dreg] : 0;
@@ -1469,8 +1444,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             w = hex_into(w, ocerz_h2g((const void *)(uintptr_t)fault_rsp));
             w = str_into(w, "\n");
             write(2, wb, (size_t)(w - wb));
-            /* OCERZ_FAULTDUMP=<gpr index>: hexdump the guest memory around
-             * that register's value (the object a faulting copy reads from) */
             {
                 int dreg = fault_dreg;
                 if (dreg >= 0 && dreg < 16) {
@@ -1497,8 +1470,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     write(2, db, (size_t)(q - db));
                 }
             }
-            /* PE stack scan from the faulting rsp: return addresses into the
-             * guest's modules (symbolised later with the +server module map). */
             {
                 static char sb[2048];
                 char *q = sb;
@@ -1539,7 +1510,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             t = hex_into(t, g_vm ? g_vm->insn_count : 0);
             t = str_into(t, "\n");
             write(2, tb, (size_t)(t - tb));
-            {   /* frame-pointer chain and the images holding addr/rip */
+            {
                 char bb[640]; char *w = bb;
                 uint64_t ib = 0; const char *in = ocerz_dyld_name_for_addr(gaddr, &ib);
                 w = str_into(w, "ocerz:   addr-image=");
@@ -1646,11 +1617,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
 
     if (g_cur_cpu && g_sig_recover && depth == 0 &&
         !ocerz_host_in_guest_space(si->si_addr)) {
-        /* wine thread?  Its TEB sits in pthread TSD slot 6 (gs+0x30) and
-         * NtTib.Self points back at it.  (The old test read the TEB pointer
-         * from rsp&~0xffff, which is only the stack bottom near the start of
-         * a thread; mid-stack it read garbage and mistook a real Windows
-         * thread for a host-runtime worker.) */
         uint64_t wine_teb = 0;
         {
             uint64_t gs = g_cur_cpu->gs_base;
@@ -1662,11 +1628,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
         int no_teb = wine_teb == 0;
         if (!no_teb) {
-            /* Hand the fault to the guest as an access violation at the faulting
-             * instruction.  Killing the thread instead (the path below) leaves
-             * every lock it held taken forever: a V8 background job died this way
-             * holding a JitPage mutex with its LocalHeap still Running, and the
-             * renderer's GC safepoint then waited on it until the end of time. */
             const ucontext_t *uc = (const ucontext_t *)ctx;
             const void *hpc = uc ? (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc : NULL;
             struct OcerzVM *fvm = g_cur_cpu->vm;
@@ -1737,7 +1698,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 siglongjmp(*g_sig_recover, 1);
             }
             depth = 0;
-            no_teb = 1;     /* undeliverable: fall back to ending the thread */
+            no_teb = 1;
         }
         if (no_teb) {
             {
@@ -1751,7 +1712,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     t = hex_into(t, (uint64_t)getpid());
                     t = str_into(t, " cpu=");
                     t = hex_into(t, g_cur_cpu->cpu_number);
-                    {   /* wine TEB via pthread TSD slot 6, NtTib.Self check */
+                    {
                         uint64_t gs = g_cur_cpu->gs_base, teb = 0, wtid = 0;
                         if (gs && ocerz_addr_readable(gs + 0x30)) teb = ocerz_ld(gs + 0x30, 8);
                         if (teb && ocerz_addr_readable(teb + 0x48) && ocerz_ld(teb + 0x30, 8) == teb)
@@ -1860,8 +1821,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = hex_into(p, uc->uc_mcontext->__ss.__sp);
         write(2, buf, (size_t)(p - buf)); p = buf;
         if (sig == SIGILL) {
-            /* find who branched here: scan the arena for b/bl/b.cond/cbz/tbz
-             * words whose target is the fault pc */
             uint64_t pc0 = uc->uc_mcontext->__ss.__pc;
             const uint32_t *cb, *ce;
             if (g_vm && ocerz_jit_code_range(g_vm, &cb, &ce)) {
@@ -1880,8 +1839,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 for (const uint32_t *w = cb; w < ce && found < 8; w++) {
                     uint32_t v = *w;
                     int64_t off = 0; int is = 0;
-                    if ((v & 0x7c000000u) == 0x14000000u) { off = (int64_t)((int32_t)(v << 6) >> 6) * 4; is = 1; }          /* b/bl */
-                    else if ((v & 0xff000010u) == 0x54000000u || (v & 0x7e000000u) == 0x34000000u) { off = (int64_t)((int32_t)((v >> 5) << 13) >> 13) * 4; is = 1; }  /* b.cond / cbz */
+                    if ((v & 0x7c000000u) == 0x14000000u) { off = (int64_t)((int32_t)(v << 6) >> 6) * 4; is = 1; }
+                    else if ((v & 0xff000010u) == 0x54000000u || (v & 0x7e000000u) == 0x34000000u) { off = (int64_t)((int32_t)((v >> 5) << 13) >> 13) * 4; is = 1; }
                     if (is && (uint64_t)(uintptr_t)w + (uint64_t)off == pc0) {
                         p = str_into(p, " ");
                         p = hex_into(p, (uint64_t)(uintptr_t)w);
@@ -1928,7 +1887,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
         p = str_into(p, "  host-stack:");
         {
-            /* host sp is not guest memory: probe with mach instead */
             uint64_t a0 = uc->uc_mcontext->__ss.__sp;
             vm_size_t got = 0;
             uint64_t w[12];
@@ -1941,7 +1899,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
         p = str_into(p, "\n");
         write(2, buf, (size_t)(p - buf)); p = buf;
-        /* host frame-pointer chain (symbolize offline: atos -o ocerz -l <slide+0x100000000> addr...) */
         p = str_into(p, " host_bt=");
         uint64_t fp = uc->uc_mcontext->__ss.__fp;
         for (int i = 0; i < 8 && fp && (fp & 7) == 0 && ocerz_addr_readable(fp) && ocerz_addr_readable(fp + 8); i++) {
@@ -2111,7 +2068,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = buf;
         p = str_into(p, "  bt:");
         for (uint64_t a = sp; a < sp + 0x400 && shown < 14; a += 8) {
-            if (!ocerz_addr_readable(a)) break;         /* the report must not fault itself */
+            if (!ocerz_addr_readable(a)) break;
             uint64_t v = ocerz_ld(a, 8);
             if (v >= 0x7ff802000000ull && v < 0x7ff818000000ull) {
                 p = str_into(p, " ");
@@ -2183,9 +2140,6 @@ int ocerz_vm_init(OcerzVM *vm)
     return OCERZ_OK;
 }
 
-/* SIGINFO (kill -INFO <pid>): dump every guest thread - host tid, rip/rsp, the
- * syscall it is blocked in, and its Windows-side stack.  Always armed, so a
- * hung wine process can be inspected without a debugger attach. */
 void ocerz_pe_stack_dump(OcerzCPU *cpu, const char *tag);
 static void threaddump_handler(int sig, siginfo_t *si, void *ctx)
 {
@@ -2210,9 +2164,6 @@ static void threaddump_handler(int sig, siginfo_t *si, void *ctx)
     fprintf(stderr, "ocerz: THREADDUMP[%d] end\n", (int)getpid());
 }
 
-/* OCERZ_PORTDUMP=1 + SIGUSR2: dump every receive right with queued messages.
- * Diagnostic for lost-wakeup wedges: a port with a growing queue and no
- * receiver names the conversation whose delivery ocerz dropped. */
 static void portdump_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)sig; (void)si; (void)ctx;
@@ -2226,9 +2177,6 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
         ncnt = 0; names = NULL; types = NULL;
     }
     fprintf(stderr, "ocerz: PORTDUMP[%d] rights=%u\n", (int)getpid(), ncnt);
-    /* every guest thread: where it is, how long it has been inside a mach
-     * trap, the port it receives on and its last sends (recorded while
-     * OCERZ_PORTDUMP is set) - the blocked one names the conversation */
     {
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         for (int i = 0; i < g_cpus_n; i++) {
@@ -2246,11 +2194,6 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
                 fprintf(stderr, " [id=%u port=%#x sz=%u]", c->sendring_id[j], c->sendring_port[j], c->sendring_sz[j]);
             }
             fprintf(stderr, "\n");
-            /* Guest stack of a parked thread: the rbp chain first, then a
-             * scan for anything that looks like a code address.  Wine's PE
-             * modules sit at 0x6fff..-0x7ffc.., 64-bit images at 0x1_0000_0000
-             * and up, host dylibs in the shared cache at 0x7ff8..; the +loaddll
-             * channel turns the values into module+offset. */
             uint64_t sp = c->gpr[OCERZ_RSP], fp = c->gpr[OCERZ_RBP];
             fprintf(stderr, "ocerz: PORTDUMP[%d] cpu#%u rsp=%#llx rbp=%#llx ret-chain:",
                     (int)getpid(), c->cpu_number, (unsigned long long)sp, (unsigned long long)fp);
@@ -2270,18 +2213,13 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
                 if (codey) { fprintf(stderr, " +%llx:%#llx", (unsigned long long)o, (unsigned long long)v); printed++; }
             }
             fprintf(stderr, "\n");
-            /* Wine runs unix-side code on a separate stack; the PE caller's
-             * registers sit in the thread's syscall frame
-             * (TEB+0x2f0 GdiTebBatch = ntdll_thread_data; wine 11.0 keeps syscall_frame at
-             * TEB+0x378; frame: rip +0x70, cs +0x78, rsp +0x88,
-             * rbp +0x98).  cs==0x33 is the sanity check on the layout. */
             uint64_t teb = c->gs_base && ocerz_addr_readable(c->gs_base + 0x30)
                          ? ocerz_ld(c->gs_base + 0x30, 8) : 0;
             uint64_t frame = teb && ocerz_addr_readable(teb + 0x378) ? ocerz_ld(teb + 0x378, 8) : 0;
             if (frame && ocerz_addr_readable(frame) && ocerz_addr_readable(frame + 0xa0)) {
                 uint64_t urip = ocerz_ld(frame + 0x70, 8), ursp = ocerz_ld(frame + 0x88, 8);
                 uint64_t ucs = ocerz_ld(frame + 0x78, 8);
-                uint64_t wtid = ocerz_addr_readable(teb + 0x48) ? ocerz_ld(teb + 0x48, 8) : 0;   /* ClientId.UniqueThread */
+                uint64_t wtid = ocerz_addr_readable(teb + 0x48) ? ocerz_ld(teb + 0x48, 8) : 0;
                 fprintf(stderr, "ocerz: PORTDUMP[%d] cpu#%u teb=%#llx tid=%04llx cs=%#llx pe-rip=%#llx pe-rsp=%#llx pe-scan:",
                         (int)getpid(), c->cpu_number, (unsigned long long)teb, (unsigned long long)wtid,
                         (unsigned long long)ucs, (unsigned long long)urip, (unsigned long long)ursp);
@@ -2311,9 +2249,6 @@ static void portdump_handler(int sig, siginfo_t *si, void *ctx)
                     (int)getpid(), sigismember(&hm, SIGUSR1));
     }
     if (getenv("OCERZ_PORTDUMP_KICK")) {
-        /* Send every guest thread a real SIGUSR1 through its host thread and
-         * see whether the host handler counts it: a thread that cannot be
-         * reached this way has a host-level block on the signal. */
         uint32_t before[64] = {0}; int nb = g_cpus_n < 64 ? g_cpus_n : 64;
         for (int i = 0; i < nb; i++) if (g_cpus[i]) before[i] = g_cpus[i]->sig_host_rcvd[30];
         for (int i = 0; i < nb; i++) {
@@ -2416,11 +2351,6 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     sa.sa_flags = SA_SIGINFO | SA_NODEFER | (altss.ss_sp ? SA_ONSTACK : 0);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
-    /* SIGILL/SIGTRAP/SIGSYS have no default handler in ocerz, so a jump to a
-     * garbage code pointer used to kill the process SILENTLY (macOS .ips was
-     * the only trace; three of those on 2026-08-17: br to an mmap pool base /
-     * arena code_cur that was never written).  Route them through the crash
-     * reporter so the death is diagnosable in our own logs. */
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
     sigaction(SIGSYS, &sa, NULL);
@@ -2459,11 +2389,6 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
         vm->jit = ocerz_jit_create(vm);
 }
 
-/* OCERZ_PEEK=a[,b,...]: dump those guest words.  The crash handler has its
- * own async-signal-safe copy; this one serves the places that are not signal
- * context -- a guest UD2, and startup -- because "was this global already
- * wrong before the guest ran, or did something change it?" is the first
- * question worth asking when a guest assertion fires on a constant. */
 void ocerz_peek_dump(const char *tag)
 {
     const char *pk = getenv("OCERZ_PEEK");
@@ -2475,15 +2400,10 @@ void ocerz_peek_dump(const char *tag)
         if (*pk == ',')
             pk++;
         fprintf(stderr, " [%#llx]=", (unsigned long long)a);
-        /* the shared cache is readable guest memory too, and
-         * ocerz_addr_readable() only knows the arena */
         if (ocerz_addr_readable(a) || ocerz_cache_region((uintptr_t)a))
             fprintf(stderr, "%#llx", (unsigned long long)ocerz_ld(a, 8));
         else
             fprintf(stderr, "uncommitted");
-        /* the host mapping behind it too: a value that changed with no guest
-         * store is either an emulator-side write into the same mapping or a
-         * remap, and the region identity tells the two apart */
         mach_vm_address_t ra = a;
         mach_vm_size_t rs = 0;
         vm_region_basic_info_data_64_t bi;
@@ -2565,18 +2485,9 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     sigjmp_buf jb;
     sigjmp_buf *prev_recover = g_sig_recover;
     g_sig_recover = &jb;
-    /* Before the jump buffer captures the mask: every fault recovery
-     * siglongjmps here and restores it. */
     ocerz_host_sigmask_clear("callback");
     sigsetjmp(jb, 1);
     g_cur_cpu = &local;
-    /* The thread running here is a guest CPU like any other -- for a dynamic
-     * binary this is where main() itself runs -- so put it in the registry.
-     * Without it SIGINFO reported cpus=0 for a process whose main thread was
-     * wedged in a syscall, and the unstick monitor could not see it either.
-     * Registration is idempotent, so the siglongjmp back to the sigsetjmp
-     * above re-running it is harmless; the single normal return below
-     * unregisters, and the two _exit() paths take the process with them. */
     ocerz_cpu_register(&local);
     while (local.rip != sentinel && !vm->exited && !local.terminated) {
         g_riphist[g_riphist_n++ & 31] = local.rip;
@@ -2628,10 +2539,6 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
             _exit(126);
         }
         if (mtrace_lo && local.rip >= mtrace_lo && local.rip < mtrace_hi) {
-            /* The callee-saved set is here on purpose.  "a register the ABI
-             * says survives a call did not" is a whole class of emulation
-             * bug, and without rbx/rbp/r12-r15 in the trace there is no way
-             * to see which call lost one. */
             fprintf(stderr, "MT %#llx rax=%#llx rdi=%#llx rsi=%#llx rsp=%#llx [rsp]=%#llx"
                             " rbx=%#llx rbp=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
                     (unsigned long long)local.rip,
@@ -2706,9 +2613,6 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     return local.gpr[OCERZ_RAX];
 }
 
-/* Host-signal kick: a no-op handler whose return is a context-synchronization
- * event on the target core, so a thread spinning in JIT code observes the
- * stop-site patches made by ocerz_jit_request_stop. */
 static void ocerz_kick_handler(int sig, siginfo_t *si, void *uc)
 {
     (void)sig; (void)si; (void)uc;
@@ -2718,24 +2622,11 @@ static void ocerz_install_kick_handler(void)
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = ocerz_kick_handler;
-    /* deliberately NOT SA_RESTART: the unstick monitor uses this signal to
-     * EINTR guest threads out of lost-wakeup parks (the manual `sample`
-     * "shake" that always revived wedged wine sessions, automated).  It
-     * only kicks waits whose callers loop on a spurious return -- see
-     * unstick_kickable() in syscall.c. */
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGEMT, &sa, NULL);
 }
 
-/* ---- unstick monitor -------------------------------------------------
- * UPDATE #39 family: a guest thread parks in a blocking host wait whose
- * wakeup was lost (waiter/waker alias, kevent edge, ...); an EINTR shake
- * always revives the session.  Automate the shake: kick any cpu thread
- * that has been inside one blocking host call for >800ms.  Legitimate
- * long waits just retry -- but only where a spurious EINTR is part of the
- * wait's contract.  A cpu in a read/recvmsg/poll/fcntl sets block_nokick
- * and is left alone; OCERZ_UNSTICK_ALL=1 kicks those too, as before. */
 static void *ocerz_unstick_thread(void *arg)
 {
     (void)arg;
@@ -2755,15 +2646,13 @@ static void *ocerz_unstick_thread(void *arg)
         struct timespec ts = { 0, 250 * 1000 * 1000 };
         nanosleep(&ts, NULL);
         if (wauto == 1) {
-            /* auto-resolve the winemac requestSource signal word:
-             * base+0x560f0 -> controller; controller+8 -> source; +0x58. */
             uint64_t slot = wbase + 0x560f0;
             if (ocerz_addr_readable(slot)) {
                 uint64_t ctrl = ocerz_ld(slot, 8);
                 if (ctrl && ocerz_addr_readable(ctrl + 0x10)) {
-                    uint64_t src = ocerz_ld(ctrl + 0x10, 8);   /* requests array */
+                    uint64_t src = ocerz_ld(ctrl + 0x10, 8);
                     if (src && ocerz_addr_readable(src + 0x30)) {
-                        ocerz_watch_addr = src + 0x10;         /* storage/cap-head/count-mut */
+                        ocerz_watch_addr = src + 0x10;
                         ocerz_watch_len = 0x20;
                         fprintf(stderr, "ocerz: WATCH-AUTO[%d] resolved %#llx\n",
                                 (int)getpid(), (unsigned long long)ocerz_watch_addr);
@@ -2777,7 +2666,7 @@ static void *ocerz_unstick_thread(void *arg)
         for (int i = 0; i < g_cpus_n; i++) {
             uint64_t t0 = g_cpus[i]->block_since_ns;
             if (t0 && now - t0 > 800ull * 1000 * 1000 && (kick_all || !g_cpus[i]->block_nokick)) {
-                g_cpus[i]->block_since_ns = now;   /* re-arm: kick again in 800ms if still stuck */
+                g_cpus[i]->block_since_ns = now;
                 if (lg)
                     fprintf(stderr, "ocerz: UNSTICK[%d] kicking cpu#%u (blocked %llums) what=%d rip=%#llx\n",
                             (int)getpid(), g_cpus[i]->cpu_number,
@@ -2788,9 +2677,6 @@ static void *ocerz_unstick_thread(void *arg)
             }
             uint64_t bs = g_cpus[i]->block_started_ns;
             static uint64_t warned[OCERZ_MAX_CPUS];
-            /* `now` is sampled before the scan, so a cpu that enters a
-             * syscall mid-scan has bs > now: unsigned wrap made every such
-             * thread look blocked for 2^64ns. */
             if (bs && now > bs && now - bs > 5000000000ull && warned[i] != bs) {
                 warned[i] = bs;
                 fprintf(stderr, "ocerz: BLOCKED[%d] cpu#%u trap=%d for %llus rip=%#llx a0=%#llx a1=%#llx a2=%#llx",
@@ -2800,11 +2686,6 @@ static void *ocerz_unstick_thread(void *arg)
                         (unsigned long long)g_cpus[i]->gpr[OCERZ_RDI],
                         (unsigned long long)g_cpus[i]->gpr[OCERZ_RSI],
                         (unsigned long long)g_cpus[i]->gpr[OCERZ_RDX]);
-                /* Guest caller chain.  rbp is only a frame pointer by
-                 * convention, so every link is untrusted: require 8-byte
-                 * alignment and READABLE (committed alone is true for the
-                 * PROT_NONE identity reservations, where a load is a SIGBUS
-                 * this thread cannot attribute - it has no cpu). */
                 if (getenv("OCERZ_BLOCKBT")) {
                     uint64_t sp = g_cpus[i]->gpr[OCERZ_RSP], fp = g_cpus[i]->gpr[5];
                     if (sp && !(sp & 7) && ocerz_addr_readable(sp))
@@ -2818,11 +2699,7 @@ static void *ocerz_unstick_thread(void *arg)
                 fputc('\n', stderr);
             }
         }
-        {   /* OCERZ_BTRACE freeze latch: a cpu that has entered NO guest block
-             * for 20 polls (5 s) while others keep running is the stuck thread.
-             * Storing mask 0 stops every ring so the last 64K block entries
-             * survive, then dump them.  This is the only instrument that can
-             * see control flow which never leaves the code arena. */
+        {
             static unsigned bt_quiet[OCERZ_MAX_CPUS];
             static int bt_latched;
             if (!bt_latched && g_cpus_n > 0 && g_cpus[0]->btrace) {
@@ -2900,9 +2777,6 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     ocerz_cpu_register(cpu);
     pthread_threadid_np(NULL, &cpu->host_tid);
     cpu->cur_sys_class = -1;
-    /* Before sigsetjmp(jb, 1) captures the host mask: every fault recovery
-     * siglongjmps back here and restores whatever was saved, so a mask that
-     * is cleared only after this point comes back at the first guest fault. */
     ocerz_host_sigmask_clear("run_cpu");
     if (sigsetjmp(jb, 1) != 0 && getenv("OCERZ_CPUREG_LOG")) {
 
@@ -2913,9 +2787,6 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     g_cur_cpu = cpu;
     cpu->host_pthread = (void *)pthread_self();
     cpu->host_kport = pthread_mach_thread_np(pthread_self());
-    /* This host thread's FPCR must reflect the guest's MXCSR rounding mode
-     * before any JIT'd SSE op runs -- a worker inherits the host default, and
-     * a thread that set the mode elsewhere resumes here. */
     ocerz_apply_mxcsr_round(cpu->mxcsr);
 
     while (!vm->exited && !cpu->terminated && !cpu->interrupt) {
@@ -2933,7 +2804,7 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
         if (ocerz_bt_lo && cpu->rip >= ocerz_bt_lo && cpu->rip < ocerz_bt_hi)
             ocerz_bt_report(cpu);
         if (trace_lo && cpu->rip >= trace_lo && cpu->rip < trace_hi) {
-            {   /* OCERZ_TRACE_PEEK=<off>: also print [r13+off], [r13+off+8] and [rbp+8] (V8 handle scope + return slot) */
+            {
                 static long peek = -2;
                 if (peek == -2) { const char *e = getenv("OCERZ_TRACE_PEEK"); peek = e ? strtol(e, NULL, 0) : -1; }
                 if (peek >= 0) {
@@ -2988,13 +2859,6 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
             }
             fprintf(stderr, "\nocerz: %llu instructions executed\n",
                     (unsigned long long)vm->insn_count);
-            /* A fatal in 32-bit guest code usually lands on a WoW64 thread,
-             * and leaving the process half-alive wedges the guest's parent,
-             * which waits for the child forever.  Die as a process so wine can
-             * move on.  (This test used to mean "a 32-bit mode entry, which we
-             * could not execute, just happened"; now that the interpreter does
-             * execute 32-bit code, cpu->mode32 means the thread was IN 32-bit
-             * code when it died, and the same reasoning applies.) */
             if (cpu->mode32)
                 exit(125);
             g_sig_recover = prev_recover;

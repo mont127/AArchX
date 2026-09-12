@@ -4,7 +4,11 @@
  * variable to mark its one-time re-exec, so one variable too many made every
  * wine process re-exec itself forever.  The parent execs itself with 200
  * variables and 66 arguments; the child reports what it received.  Goldens
- * come from the native binary. */
+ * come from the native binary.
+ *
+ * The emulator appends MallocNanoZone=0 at exec when it is absent, so the test
+ * carries it through and the child sees exactly what the native run sees.
+ */
 #include "gsys.h"
 
 #define NENV 200
@@ -32,8 +36,6 @@ int main(int argc, char **argv, char **envp)
     static char *env[NENV + 1];
     static char abuf[NARG][8];
     static char *args[NARG + 2];
-    /* the emulator appends MallocNanoZone=0 at exec when it is absent; carry
-     * it so the child sees exactly what the native run sees */
     env[0] = "MallocNanoZone=0";
     for (int i = 1; i < NENV - 1; i++) {
         char *p = ebuf[i];

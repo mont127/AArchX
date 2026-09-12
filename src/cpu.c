@@ -1,4 +1,17 @@
-/* CPU reset state, plus the register dump used by fatal paths and -trace. */
+/*
+ * CPU reset state, plus the register dump used by the fatal paths and -trace.
+ *
+ * The guest MXCSR rounding-control bits are propagated to the host arm64 FPCR,
+ * which both the JIT's arm64 FP instructions and the interpreter's C-computed
+ * SSE ops honour.  x86 and arm64 disagree on the directed encodings - MXCSR 01
+ * rounds toward -inf while FPCR 01 rounds toward +inf - so the mapping goes
+ * through the fe* constants rather than copying the bits across.  Without it,
+ * divsd/sqrtsd and friends always rounded to nearest whatever mode a program
+ * selected with ldmxcsr or fesetround.
+ *
+ * Reset installs Darwin's flat 64-bit user selectors, which is what `mov %ss, r`
+ * reads out of reset.
+ */
 #include "ocerz/cpu.h"
 #include "ocerz/decode.h"
 #include "ocerz/mem.h"
@@ -6,13 +19,6 @@
 #include <fenv.h>
 #include <stdlib.h>
 
-/* Propagate the guest MXCSR rounding-control (bits 13-14) to the host arm64
- * FPCR, which both the JIT's arm64 FP instructions and the interpreter's
- * C-computed SSE ops honour.  x86 and arm64 disagree on the directed
- * encodings -- MXCSR 01 rounds toward -inf while FPCR 01 rounds toward +inf --
- * so this maps through the fe* constants rather than copying the bits.
- * Without it, divsd/sqrtsd/... always rounded to nearest whatever mode a
- * program selected with ldmxcsr or fesetround. */
 void ocerz_apply_mxcsr_round(uint32_t mxcsr)
 {
     static const int fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
@@ -27,10 +33,8 @@ void ocerz_cpu_reset(OcerzCPU *cpu)
     cpu->rflags = OCERZ_FLAG_FIXED1 | OCERZ_IF;
     cpu->fcw = 0x037f;
     cpu->mxcsr = 0x1f80;
-    /* Darwin's flat 64-bit user code selector. */
     cpu->cs_sel = 0x2b;
     cpu->seg_sel[OCERZ_SREG_CS] = 0x2b;
-    /* and its 64-bit user data selector: what `mov %ss, r` reads out of reset */
     cpu->seg_sel[OCERZ_SREG_SS] = 0x23;
 }
 
@@ -49,7 +53,7 @@ void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out)
         uint64_t v = cpu->gpr[i];
         char s[192];
         int n = 0;
-        if (v == 0 || !ocerz_addr_readable(v))     /* committed != host-readable (reserved cages) */
+        if (v == 0 || !ocerz_addr_readable(v))
             continue;
         for (; n < (int)sizeof s - 1; n++) {
             uint64_t a = v + (uint64_t)n;

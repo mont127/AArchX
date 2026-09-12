@@ -12,7 +12,7 @@ static g_u64 tsd[16];
 int main(int argc, char **argv, char **envp)
 {
     g_u64 base = (g_u64)tsd;
-    tsd[0] = 0x6d616368646570ull;              /* "machdep": what gs:0 must read afterwards */
+    tsd[0] = 0x6d616368646570ull;
 
     g_u64 rax = 0x3000003, rdx = 0x1234, fl;
     __asm__ __volatile__("syscall\n\tpushfq\n\tpopq %[fl]"
@@ -25,7 +25,6 @@ int main(int argc, char **argv, char **envp)
     __asm__ __volatile__("movq %%gs:0, %0" : "=r"(seen));
     g_puts("gs0 "); g_putu64(seen);
 
-    /* unix class for contrast: getpid with rdx preloaded */
     rax = 0x2000014; rdx = 0x5678;
     __asm__ __volatile__("syscall\n\tpushfq\n\tpopq %[fl]"
                          : "+a"(rax), "+d"(rdx), [fl] "=r"(fl) : : "rcx", "r11", "memory", "cc");

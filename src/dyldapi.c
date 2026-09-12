@@ -1,4 +1,28 @@
-/* The dyld API surface that libdyld's trampolines dispatch through. */
+/*
+ * The dyld API surface that libdyld's trampolines dispatch through.
+ *
+ * The part that carries the weight is the dependency closure: the set of images
+ * handed to libobjc's map_images in the initial batch.  An image left out of it
+ * is one whose categories never attach to the classes other images own, which
+ * surfaces as an unrecognized selector a long way from the cause.  The closure
+ * used to be walked through a separate fixed 1024-entry queue, which capped it
+ * well below the 3609 images this cache holds and, once full, dropped a
+ * dependency for good - and it filled early, because a dylib every image links
+ * was pushed once per dependent.  Safari died in SafariMain on -[NSBundle
+ * safari_version] that way; the guest test for it is that Safari reaches its
+ * first window.  Now the closure array is itself the work list, deduped through
+ * an open-addressed set of the same mach_headers so appending stays O(1), each
+ * image is appended and therefore walked exactly once, and the only bound left
+ * is the cache's own size (Safari's closure is about 1500 of 3609).
+ *
+ * A category an image adds to a class in ANOTHER cache image is honoured only
+ * if that image is known-loaded when the target class is realized, and a plain
+ * dlopen arrives far too late for that.  OCERZ_PRELOAD_OBJC adds named cache
+ * images' closures to the initial batch, which is the same position a linked
+ * framework has; naming frameworks one at a time is whack-a-mole (AppKit, then
+ * QuartzCore, then whatever dlopens next), so "@cat" preloads every image that
+ * defines categories at all - the only ones that can be affected.
+ */
 #include "ocerz/dyldapi.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
@@ -34,13 +58,6 @@ static uint64_t g_cache_size;
 uint64_t g_main_path;
 
 #define DYLDAPI_NOOP_OFF 0x2000
-/* The dependency closure, and an open-addressed set of the same mach_headers
- * so that adding to it stays O(1).  Both are sized from the cache in
- * ocerz_dyldapi_setup(), because a process can load every image the cache
- * has: Safari's closure is about 1500 of this cache's 3609.  They are NULL
- * until then -- ocerz_dyldapi_register_image() runs first for the main
- * image's disk dependencies, and compute_closure() picks those up from
- * g_disk_mh[] at the end. */
 static uint64_t *g_closure_mh;
 static int g_closure_n;
 static int g_closure_cap;
@@ -52,7 +69,7 @@ static uint64_t g_objc_mapped_cb;
 static uint64_t g_objc_init_cb;
 
 static uint64_t g_objc_init_info;
-static uint64_t *g_objc_dlopen_mapped;   /* cache-sized in ocerz_dyldapi_setup */
+static uint64_t *g_objc_dlopen_mapped;
 static int g_objc_dlopen_mapped_n;
 
 static uint32_t g_main_bv_platform, g_main_bv_minos, g_main_bv_sdk;
@@ -62,8 +79,6 @@ static void closure_add(uint64_t mh);
 static int hinfo_ro_index(uint64_t mh);
 static uint64_t objc_index_loaded(uint32_t idx);
 
-/* DIAG (OCERZ_METHDUMP="<clshex>:<sel>"): dump a cache class's baseMethods
- * sublists (and their owning image-index / isLoaded gate) at each map_images. */
 static void methdump_diag(const char *tag)
 {
     const char *spec = getenv("OCERZ_METHDUMP");
@@ -435,10 +450,6 @@ static const char *cache_path_for_mh(struct OcerzCache *cache, uint64_t mh)
     return NULL;
 }
 
-/* Append mh to out[] (n entries used, capacity cap) unless the open-addressed
- * set seen[] already holds it, keeping the append O(1).  Skips a mach_header
- * that does not look like one, so nothing bogus reaches libobjc.  Returns the
- * new count. */
 static int set_add(uint64_t *out, int n, int cap, uint64_t *seen, unsigned mask,
                    uint64_t mh)
 {
@@ -464,12 +475,6 @@ static void closure_add(uint64_t mh)
                           g_closure_hash, g_closure_hash_mask, mh);
 }
 
-/* Walk the LC_LOAD_DYLIB graph from root, appending every image reached to
- * out[] (which already holds n entries, capacity cap) and deduping through
- * the open-addressed set seen[] (mask + 1 entries, zeroed by the caller).
- * out[] doubles as the work list, so each image is appended -- and therefore
- * walked -- exactly once, and there is no second queue that can overflow and
- * drop a dependency for good.  Returns the new count. */
 static int image_closure_walk(struct OcerzCache *cache, uint64_t root,
                               uint64_t *out, int n, int cap,
                               uint64_t *seen, unsigned mask)
@@ -496,17 +501,6 @@ static int image_closure_walk(struct OcerzCache *cache, uint64_t root,
     return n;
 }
 
-/* Every image in the closure is handed to libobjc's map_images in the initial
- * batch, and an image left out is one whose categories never attach to classes
- * that other images own -- which surfaces as an unrecognized selector a long
- * way from the cause.  This used to walk a separate fixed 1024-entry queue
- * that (a) capped the closure well below the 3609 images the cache holds and
- * (b) dropped a dependency for good once it filled, which it did early because
- * a dylib every image links was pushed once per dependent.  The closure array
- * is the work list now: closure_add() dedupes, so each image is appended and
- * therefore walked exactly once, and the only bound left is the cache's own
- * size.  Safari died in SafariMain on -[NSBundle safari_version] under the old
- * cap; the guest test for this is that it reaches its first window. */
 static void compute_closure(struct OcerzCache *cache, uint64_t main_mh)
 {
     g_closure_n = 0;
@@ -515,7 +509,6 @@ static void compute_closure(struct OcerzCache *cache, uint64_t main_mh)
     g_closure_n = image_closure_walk(cache, main_mh, g_closure_mh, g_closure_n,
                                      g_closure_cap, g_closure_hash,
                                      g_closure_hash_mask);
-    /* disk images registered before the closure arrays existed */
     for (int i = 0; i < g_disk_n; i++)
         closure_add(g_disk_mh[i]);
 }
@@ -547,9 +540,6 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache)
     g_cache_start = cache->base;
     g_cache_size = 0x40000000000ull;
 
-    /* Bound the closure by the cache rather than by a constant, so a bigger
-     * cache cannot silently truncate it again.  +DYLDAPI_DISK_MAX for the
-     * images that came off disk instead. */
     g_closure_cap = (int)cache->images_cnt + DYLDAPI_DISK_MAX;
     unsigned hsz = 1;
     while (hsz < (unsigned)g_closure_cap * 2)
@@ -649,14 +639,6 @@ static int api_register_for_bulk_image_loads(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
-
-/* EXPERIMENT (OCERZ_PRELOAD_OBJC=<substr>[,<substr>...]): add the dependency
- * closure of the named shared-cache image(s) to the INITIAL objc map_images
- * batch, so libobjc sees them (and sets their headeropt_rw isLoaded bit)
- * before any class gets realized -- the same position a linked framework has.
- * Categories that such an image adds to classes in other cache images are only
- * visible if the image is known-loaded at the time the target class is
- * realized; a plain dlopen happens far too late for that. */
 static void objc_preload_append(uint64_t *mhs, uint64_t *paths, uint64_t *iis,
                                 int *np, int max)
 {
@@ -669,13 +651,6 @@ static void objc_preload_append(uint64_t *mhs, uint64_t *paths, uint64_t *iis,
     snprintf(buf, sizeof buf, "%s", spec);
     char *save = NULL;
     for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        /* "@cat": every cache image that defines ObjC categories.  A category
-         * an image adds to a class in ANOTHER cache image is only honoured if
-         * that image is known-loaded when the target class is realized, so a
-         * dlopen arrives far too late.  Naming frameworks one at a time is
-         * whack-a-mole (AppKit, then QuartzCore, then whatever dlopens next),
-         * and only images with a __objc_catlist can be affected - so preload
-         * exactly those. */
         int all_cats = (strcmp(tok, "@cat") == 0);
         for (uint32_t i = 0; i < g_cache->images_cnt && *np < max; i++) {
             const char *p = NULL;
@@ -812,8 +787,6 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
         fprintf(stderr, "ocerz: HINFO initial batch n=%d isLoaded-after=%d\n", n, loaded);
     }
     methdump_diag("post-initial");
-    /* DIAG (OCERZ_HINFO_PRESET=<substr>): mark matching cache images as
-     * "loaded" in libobjc's headeropt_rw BEFORE any class gets realized. */
     {
         const char *want = getenv("OCERZ_HINFO_PRESET");
         if (want && g_headeropt_ro && g_headeropt_rw) {
@@ -858,9 +831,6 @@ static int objc_image_already_loaded(uint64_t mh)
     return 0;
 }
 
-/* DIAG (OCERZ_HINFO=1): map a cache mach_header to its index in libobjc's
- * preoptimized headeropt_ro table and report the matching headeropt_rw
- * isLoaded bit -- the bit addHeader() uses to "weed out duplicates". */
 static uint64_t objc_index_loaded(uint32_t idx);
 
 static int hinfo_ro_index(uint64_t mh)
@@ -933,9 +903,6 @@ void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
                 mh ? objc_image_already_loaded(mh) : -1);
     if (!g_objc_mapped_cb || !mh || !g_cache || objc_image_already_loaded(mh))
         return;
-    /* The whole dependency closure of the dlopened image, then the subset
-     * libobjc has not seen: a dependency dropped here is a category that
-     * never attaches, the same failure compute_closure() guards against. */
     uint64_t *walk = (uint64_t *)calloc((size_t)g_closure_cap, sizeof *walk);
     uint64_t *seen = (uint64_t *)calloc((size_t)g_closure_hash_mask + 1, sizeof *seen);
     uint64_t *batch = (uint64_t *)calloc((size_t)g_closure_cap, sizeof *batch);
@@ -1511,16 +1478,6 @@ void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t sta
     const char *imgpath = g_cache ? cache_path_for_mh(g_cache, mh) : NULL;
     OCERZ_LOG("loadphase: image %s (mh=%#llx)\n", imgpath ? imgpath : "?", (unsigned long long)mh);
 
-    /* Native dyld map_images'es an image before load_images runs its +load
-     * methods.  ocerz only drove the static-closure batch and dlopens through
-     * map_images, so a cache framework pulled up purely as a transitive
-     * LC_LOAD_DYLIB dependency (ViewBridge, QuickLook, ...) reaches its +load
-     * notification here never having been map_images'd; libobjc then walks its
-     * classes off unbound superclass links and SIGSEGVs.  Map it first so map
-     * precedes load, as dyld does.  objc_map_one is idempotent -- it skips the
-     * startup batch and prior dlopens -- and walks the image's closure, so this
-     * is a no-op for every already-covered image (objbasic and the dynamic
-     * suite live entirely in the startup batch).  OCERZ_NO_LOADMAP opts out. */
     if (in_cache(mh) && !getenv("OCERZ_NO_LOADMAP"))
         ocerz_dyldapi_objc_map_one(vm, mh);
 
@@ -1570,7 +1527,6 @@ handrolled:;
     }
 }
 
-/* LC_UUID of a guest Mach-O header, into guest memory at out; 0 if none. */
 static int mh_copy_uuid(uint64_t mh, uint64_t out)
 {
     if (!mh || !out || !ocerz_addr_readable(mh + 32))
@@ -1581,7 +1537,7 @@ static int mh_copy_uuid(uint64_t mh, uint64_t out)
         uint32_t cmd = (uint32_t)ocerz_ld(lc, 4), cmdsize = (uint32_t)ocerz_ld(lc + 4, 4);
         if (cmdsize < 8 || lc + cmdsize > end)
             return 0;
-        if (cmd == 0x1b /* LC_UUID */ && cmdsize >= 24) {
+        if (cmd == 0x1b && cmdsize >= 24) {
             ocerz_st(out, 8, ocerz_ld(lc + 8, 8));
             ocerz_st(out + 8, 8, ocerz_ld(lc + 16, 8));
             return 1;
@@ -1610,40 +1566,35 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         api_return(cpu, build_version_at_least(g_main_bv_platform, g_main_bv_minos,
                                                cpu->gpr[OCERZ_RSI]));
         return OCERZ_STEP_OK;
-    /* dyld_get_program_sdk_version.  Answered 0 by the default below, which
-     * every "linked on or after" check reads as a pre-10.5 SDK: OpenGL then
-     * left the software renderer out of CGLChoosePixelFormat, any pixel
-     * format that did not say kCGLPFANoRecovery failed with 10002, and Photos
-     * asserted in +[PAOpenGLDevice _sharedPixelFormat:] and aborted. */
     case 0x188:
         api_return(cpu, g_main_bv_sdk);
         return OCERZ_STEP_OK;
-    case 0x218: {                           /* dyld_get_base_platform */
+    case 0x218: {
         uint64_t p = (uint32_t)cpu->gpr[OCERZ_RSI];
         static const uint8_t base[] = { 0, 1, 2, 3, 4, 5, 2, 2, 3, 4, 10, 11, 11 };
         api_return(cpu, p < sizeof base ? base[p] : p);
         return OCERZ_STEP_OK;
     }
-    case 0x1d8:                             /* _dyld_get_image_uuid(mh, uuid) */
+    case 0x1d8:
         api_return(cpu, mh_copy_uuid(cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX]));
         return OCERZ_STEP_OK;
-    case 0x1e0: {                           /* _dyld_get_shared_cache_uuid(uuid) */
+    case 0x1e0: {
         uint64_t out = cpu->gpr[OCERZ_RSI];
         int ok = g_cache && out;
         if (ok) {
-            ocerz_st(out, 8, ocerz_ld(g_cache->base + 0x58, 8));   /* dyld_cache_header.uuid */
+            ocerz_st(out, 8, ocerz_ld(g_cache->base + 0x58, 8));
             ocerz_st(out + 8, 8, ocerz_ld(g_cache->base + 0x60, 8));
         }
         api_return(cpu, ok);
         return OCERZ_STEP_OK;
     }
-    case 0x2d0: {                           /* _dyld_shared_cache_real_path(path) */
+    case 0x2d0: {
         uint64_t pathg = cpu->gpr[OCERZ_RSI];
         api_return(cpu, pathg && g_cache &&
                         cache_find_path(g_cache, (const char *)ocerz_g2h(pathg)) != 0 ? pathg : 0);
         return OCERZ_STEP_OK;
     }
-    case 0x278:                             /* dyld_has_inserted_or_interposing_libraries */
+    case 0x278:
         api_return(cpu, 0);
         return OCERZ_STEP_OK;
     case 0x228:

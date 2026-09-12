@@ -31,7 +31,7 @@ int main(int argc, char **argv, char **envp)
         y = y * c3 - x * c4;
         double z = x * x + y * y;
         acc += __builtin_sqrt(z) / (1.0 + (double)(i & 7));
-        if (x > lim) x = -x;                    /* flips sign at overflow: inf - inf next */
+        if (x > lim) x = -x;
         if (acc != acc && first_nan < 0) first_nan = i;
     }
     g_puts("first_nan "); g_putu64((g_u64)(long)first_nan);

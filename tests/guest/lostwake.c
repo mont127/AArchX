@@ -121,7 +121,6 @@ int main(void)
     g_puts("start\n");
     sys_write(sw, "g", 1);
 
-    /* No syscalls from here to the read: the signal must land in this loop. */
     for (g_u64 i = 0; i < 300000000ull; i++)
         acc += i;
 

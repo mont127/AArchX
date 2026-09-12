@@ -1,4 +1,17 @@
-/* Run-don't-read validation of the arm64 emitter. */
+/*
+ * Run-don't-read validation of the arm64 emitter: each encoding is executed
+ * rather than compared against an expected word, so a wrong field shows up as
+ * a wrong result.
+ *
+ * The UXTW forms get particular attention.  Their index register is given a
+ * nonzero HIGH half that the extend must discard; if the index were taken
+ * whole (option = LSL, as the plain register-offset forms use) the address
+ * would be astronomically out of range and the access would fault, so a pass
+ * here is the positive statement that those encodings really do zero-extend
+ * from 32 bits.  The ccmn cases likewise check both directions: with V clear
+ * the compare actually runs, and with V set the immediate nzcv is taken
+ * instead.
+ */
 #include "ocerz/a64emit.h"
 
 #include <sys/mman.h>
@@ -98,8 +111,6 @@ static void b_mul(A64Buf *b) { a64_mul(b, 1, 0, 0, 1); a64_ret(b); }
 static void b_umulh(A64Buf *b) { a64_umulh(b, 0, 0, 1); a64_ret(b); }
 static void b_smulh(A64Buf *b) { a64_smulh(b, 0, 0, 1); a64_ret(b); }
 static void b_csel(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_csel(b, 1, 0, 0, 1, A64_LT); a64_ret(b); }
-/* ccmn: with V clear (x1-x1) the compare runs, V := x0 + 1 overflows; with V
- * set (INT64_MAX+INT64_MAX) the immediate nzcv 0001 is taken instead */
 static void b_ccmn_vc(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmn_imm(b, 1, 0, 1, 1, A64_VC); a64_cset(b, 0, A64_VS); a64_ret(b); }
 static void b_ccmn_else(A64Buf *b) { a64_adds_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmn_imm(b, 1, 0, 1, 1, A64_VC); a64_cset(b, 0, A64_VS); a64_ret(b); }
 static void b_ccmp_w(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmp_imm(b, 0, 0, 7, 0, A64_EQ); a64_cset(b, 0, A64_EQ); a64_ret(b); }
@@ -114,11 +125,6 @@ static void b_ldrh(A64Buf *b) { a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)g_scrat
 static void b_ldr_regoff(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_mov_imm64(b, 3, 5); a64_ldr_regoff(b, 8, 0, 2, 3, 1); a64_ret(b); }
 static void b_str_regoff(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_mov_imm64(b, 3, 5); a64_str_regoff(b, 8, 0, 2, 3, 1); a64_ldr(b, 8, 0, 2, 8 * 5); a64_ret(b); }
 
-/* The UXTW forms: the index register carries a nonzero HIGH half that the
- * extend must discard.  If it were taken whole (option = LSL, as the plain
- * regoff forms use) the address would be astronomically out of range and the
- * access would fault, so a pass here is the positive statement that these
- * three encodings really do zero-extend from 32 bits. */
 static void b_add_ext_uxtw(A64Buf *b) { a64_add_ext_uxtw(b, 0, 0, 1, 0); a64_ret(b); }
 static void b_add_ext_uxtw_sh3(A64Buf *b) { a64_add_ext_uxtw(b, 0, 0, 1, 3); a64_ret(b); }
 static void b_ldr_regoff_uxtw(A64Buf *b) { a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_scratch); a64_str(b, 8, 1, 2, 8 * 5); a64_mov_imm64(b, 3, 0xdead000000000028ull); a64_ldr_regoff_uxtw(b, 8, 0, 2, 3); a64_ret(b); }

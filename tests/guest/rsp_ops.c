@@ -21,7 +21,6 @@ static void mix(g_u64 v) { acc = (acc ^ v) * 0x9E3779B97F4A7C15ULL; acc ^= acc >
     g_puts(seq); g_puts(" = "); mix(out_); g_putu64(acc);                    \
 } while (0)
 
-/* same, but also captures CF/ZF/SF right after the op */
 #define RSPF(seq) do {                                                       \
     g_u64 sv_, out_; g_u64 f1_ = 0, f2_ = 0, f3_ = 0;                        \
     __asm__ volatile(                                                        \
@@ -40,7 +39,6 @@ static void mix(g_u64 v) { acc = (acc ^ v) * 0x9E3779B97F4A7C15ULL; acc ^= acc >
     g_puts(seq); g_puts(" = "); mix(out_); mix(f1_ | (f2_ << 1) | (f3_ << 2)); g_putu64(acc); \
 } while (0)
 
-/* CF/OF only: imul leaves ZF/SF/PF undefined */
 #define RSPC(seq) do {                                                       \
     g_u64 sv_, out_; g_u64 f1_ = 0, f2_ = 0;                                 \
     __asm__ volatile(                                                        \
@@ -57,7 +55,6 @@ static void mix(g_u64 v) { acc = (acc ^ v) * 0x9E3779B97F4A7C15ULL; acc ^= acc >
     g_puts(seq); g_puts(" = "); mix(out_); mix(f1_ | (f2_ << 1)); g_putu64(acc); \
 } while (0)
 
-/* ZF only: bsf/bsr leave the rest undefined */
 #define RSPZ(seq) do {                                                       \
     g_u64 sv_, out_; g_u64 f1_ = 0;                                          \
     __asm__ volatile(                                                        \
@@ -120,7 +117,6 @@ int main(void)
         RSP1("leaq (%%rsp,%[b],2), %%rsp");
         RSP1("leaq 0x30(%%rsp), %%rsp");
 
-        /* xchg both directions observable */
         {
             g_u64 sv_, out_, aa = a;
             __asm__ volatile(
@@ -133,7 +129,6 @@ int main(void)
                 : [in]"r"(in) : "cc");
             mix(out_); g_putu64(acc); mix(aa); g_putu64(acc);
         }
-        /* cvttsd2si with rsp dest */
         {
             g_u64 sv_, out_;
             double d = (double)(g_i64)a * 1.5;
@@ -147,7 +142,6 @@ int main(void)
                 : [in]"r"(in), [d]"x"(d) : "cc");
             g_puts("cvt:"); g_putu64(out_); mix(out_); g_putu64(acc);
         }
-        /* rsp as a plain source */
         {
             g_u64 sv_, o1 = 0, o2 = 0;
             __asm__ volatile(

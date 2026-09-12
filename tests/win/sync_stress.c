@@ -1,11 +1,18 @@
-/* Win32 synchronization stress: the primitives Chromium/V8 park on
+/*
+ * Win32 synchronization stress: the primitives Chromium and V8 park on
  * (SleepConditionVariableSRW / WakeConditionVariable, WaitOnAddress /
- * WakeByAddress*, SRWLOCK, SleepConditionVariableCS, events), each hammered
- * by a pool of threads in producer/consumer handoffs.  On Windows/Wine these
- * never stall.  A watchdog thread reports "STALL <phase> at <n>" and exits 2
- * if a phase makes no progress for 8 s; "OK" and exit 0 otherwise.
+ * WakeByAddress*, SRWLOCK, SleepConditionVariableCS, events), each hammered by
+ * a pool of threads in producer/consumer handoffs.  On Windows and Wine these
+ * never stall.  A watchdog thread reports "STALL <phase> at <n>" and exits 2 if
+ * a phase makes no progress for 8 s; "OK" and exit 0 otherwise.
  *
  *   x86_64-w64-mingw32-gcc -O2 -o sync_stress.exe sync_stress.c -lsynchronization
+ *
+ * The phases are, in order: an SRWLOCK + CONDITION_VARIABLE queue
+ * (base::ConditionVariable), a WaitOnAddress/WakeByAddressSingle ping-pong
+ * (RtlWaitOnAddress), SRWLOCK exclusive/shared contention, CRITICAL_SECTION +
+ * SleepConditionVariableCS barrier rounds, and an auto-reset event chain
+ * (kernel objects).
  */
 #include <windows.h>
 #include <stdio.h>
@@ -14,11 +21,10 @@
 #define NTHREADS 8
 #define ITERS    150000
 
-static volatile LONG g_progress;      /* bumped by every handoff, read by the watchdog */
+static volatile LONG g_progress;
 static volatile LONG g_phase;
 static const char *g_phase_name = "start";
 
-/* ---- 1. SRWLOCK + CONDITION_VARIABLE queue (base::ConditionVariable) ---- */
 static SRWLOCK cv_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE cv_notempty = CONDITION_VARIABLE_INIT, cv_notfull = CONDITION_VARIABLE_INIT;
 static int cv_queue[64], cv_head, cv_tail, cv_count, cv_done;
@@ -50,8 +56,7 @@ static DWORD WINAPI cv_consumer(LPVOID arg)
     }
 }
 
-/* ---- 2. WaitOnAddress / WakeByAddressSingle ping-pong (RtlWaitOnAddress) ---- */
-static volatile LONG wa_turn;   /* whose turn: 0..NTHREADS-1 */
+static volatile LONG wa_turn;
 static DWORD WINAPI wa_worker(LPVOID arg)
 {
     LONG id = (LONG)(INT_PTR)arg;
@@ -65,7 +70,6 @@ static DWORD WINAPI wa_worker(LPVOID arg)
     return 0;
 }
 
-/* ---- 3. SRWLOCK exclusive/shared contention ---- */
 static SRWLOCK srw = SRWLOCK_INIT;
 static volatile LONGLONG srw_counter;
 static DWORD WINAPI srw_worker(LPVOID arg)
@@ -86,7 +90,6 @@ static DWORD WINAPI srw_worker(LPVOID arg)
     return 0;
 }
 
-/* ---- 4. CRITICAL_SECTION + SleepConditionVariableCS barrier rounds ---- */
 static CRITICAL_SECTION cs;
 static CONDITION_VARIABLE cs_cv = CONDITION_VARIABLE_INIT;
 static int cs_arrived, cs_round;
@@ -104,7 +107,6 @@ static DWORD WINAPI cs_worker(LPVOID arg)
     return 0;
 }
 
-/* ---- 5. auto-reset event chain (kernel objects) ---- */
 static HANDLE ev[NTHREADS];
 static DWORD WINAPI ev_worker(LPVOID arg)
 {
@@ -146,7 +148,6 @@ int main(void)
     CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
     InitializeCriticalSection(&cs);
 
-    /* 1: 4 producers + 4 consumers */
     {
         HANDLE th[NTHREADS]; LONG sum = 0;
         g_phase_name = "condvar-srw";

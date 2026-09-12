@@ -1,4 +1,7 @@
-/* Per-instruction flag liveness for the JIT: what each instruction defs and uses. */
+/*
+ * Per-instruction flag liveness for the JIT: what each instruction defs and
+ * uses.
+ */
 #ifndef OCERZ_FLAGS_LIVE_H
 #define OCERZ_FLAGS_LIVE_H
 

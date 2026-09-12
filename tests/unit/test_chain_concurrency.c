@@ -1,4 +1,7 @@
-/* Patching a chained block tail while another thread runs it. */
+/*
+ * Patching a chained block tail while another thread runs it: the race the
+ * chaining protocol has to be safe against.
+ */
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/jit.h"

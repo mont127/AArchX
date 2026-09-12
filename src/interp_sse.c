@@ -1,4 +1,24 @@
-/* The SSE through SSE4.1 interpreter tier. */
+/*
+ * The SSE through SSE4.1 interpreter tier, and the AVX forms layered on it.
+ *
+ * A VEX.128 instruction is the legacy SSE op with its first source taken from
+ * VEX.vvvv instead of the destination, and the upper half of the destination
+ * ymm zeroed - so the legacy implementations are reused with the first source
+ * chosen per encoding, and the merge forms take their untouched part from vvvv
+ * rather than from dst.  A VEX.256 instruction is executed twice: once on the
+ * low 128-bit halves, once with the involved registers swapped for their ymm
+ * upper halves and memory operands 16 bytes further on.  Ops that cross the
+ * 128-bit lanes - widening and narrowing converts, broadcasts, 128-bit
+ * insert/extract, mask and test - cannot be done that way and are written out
+ * in full.
+ *
+ * The pcmpXstrY string units follow the architectural imm8 layout directly
+ * ([1:0] element format, [3:2] aggregation, [5:4] polarity, [6] index/mask
+ * selection) rather than enumerating the named mnemonics, and the horizontal
+ * adds are summed in the pairwise order the SDM specifies.  The JIT does not
+ * translate VEX at all, so everything here is also the only implementation
+ * those instructions have.
+ */
 #include "ocerz/interp_common.h"
 
 #include <math.h>
@@ -36,8 +56,6 @@ static inline void vec_write(OcerzCPU *cpu, const X86Insn *insn, const X86Operan
     ocerz_write_op128(cpu, insn, op, v.q);
 }
 
-/* First source of a two-input op: the destination register for legacy SSE,
- * VEX.vvvv for the AVX three-operand (NDS) forms. */
 static inline vec src1_of(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *d)
 {
     return vec_of(cpu->xmm[(insn->vex & OCERZ_VEX_NDS) ? insn->vvvv : d->reg]);
@@ -216,7 +234,6 @@ static int do_moves(OcerzCPU *cpu, const X86Insn *insn)
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
     if ((insn->vex & OCERZ_VEX_NDS) && d->kind == OCERZ_OPK_XMM) {
-        /* AVX merge forms: the untouched part comes from vvvv, not from dst */
         Ocerz128 src = s->kind == OCERZ_OPK_XMM ? cpu->xmm[s->reg] : (Ocerz128){ 0, 0 };
         Ocerz128 r = cpu->xmm[insn->vvvv];
         switch (insn->op) {
@@ -591,16 +608,15 @@ static int do_convert(OcerzCPU *cpu, const X86Insn *insn)
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
     if ((insn->vex & OCERZ_VEX_NDS) && d->kind == OCERZ_OPK_XMM) {
-        /* AVX scalar converts merge into vvvv, not into the destination */
         Ocerz128 base = cpu->xmm[insn->vvvv];
         if (insn->op == OCERZ_OP_CVTSS2SD || insn->op == OCERZ_OP_CVTSD2SS) {
-            vec b = vec_read(cpu, insn, s);            /* read before dst may change */
+            vec b = vec_read(cpu, insn, s);
             if (insn->op == OCERZ_OP_CVTSS2SD) base.lo = d2bits((double)b.f[0]);
             else base.lo = (base.lo & ~(uint64_t)0xffffffff) | f2bits((float)b.d[0]);
             cpu->xmm[d->reg] = base;
             return OCERZ_STEP_OK;
         }
-        cpu->xmm[d->reg] = base;                       /* cvtsi2ss/sd: source is a gpr/memory */
+        cpu->xmm[d->reg] = base;
     }
     switch (insn->op) {
     case OP(OCERZ_OP_CVTSI2SS): {
@@ -1137,9 +1153,6 @@ static int do_insert_extract(OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
-/* pcmpXstrY string units.  a is the first (reg) operand, b the second.
- * The imm8 fields follow the architectural definition: [1:0] element format,
- * [3:2] aggregation, [5:4] polarity, [6] index/mask selection. */
 static int str_elem(const vec *v, int i, int words, int sgn, int32_t *out)
 {
     if (words)
@@ -1189,7 +1202,7 @@ static int do_pcmpstr(OcerzCPU *cpu, const X86Insn *insn)
         int bit = 0;
         int32_t ea, eb;
         switch (agg) {
-        case 0:                                   /* equal any: a is a set */
+        case 0:
             if (j < lb) {
                 str_elem(&b, j, words, sgn, &eb);
                 for (int i = 0; i < la; i++) {
@@ -1198,7 +1211,7 @@ static int do_pcmpstr(OcerzCPU *cpu, const X86Insn *insn)
                 }
             }
             break;
-        case 1:                                   /* ranges: a is lo/hi pairs */
+        case 1:
             if (j < lb) {
                 str_elem(&b, j, words, sgn, &eb);
                 for (int i = 0; i + 1 < la; i += 2) {
@@ -1209,7 +1222,7 @@ static int do_pcmpstr(OcerzCPU *cpu, const X86Insn *insn)
                 }
             }
             break;
-        case 2:                                   /* equal each */
+        case 2:
             if (j < la && j < lb) {
                 str_elem(&a, j, words, sgn, &ea);
                 str_elem(&b, j, words, sgn, &eb);
@@ -1218,7 +1231,7 @@ static int do_pcmpstr(OcerzCPU *cpu, const X86Insn *insn)
                 bit = 1;
             }
             break;
-        default:                                  /* equal ordered: substring */
+        default:
             bit = 1;
             for (int i = 0; i < la; i++) {
                 if (j + i >= lb) { bit = 0; break; }
@@ -1305,7 +1318,6 @@ static int do_sse41_misc(OcerzCPU *cpu, const X86Insn *insn)
         break;
     }
     case OP(OCERZ_OP_DPPS): {
-        /* the sum is specified pairwise: (t0+t1) + (t2+t3) */
         int imm = (int)(insn->ops[2].imm & 0xff);
         float t[4];
         for (int i = 0; i < 4; i++)
@@ -1337,7 +1349,7 @@ static int do_ptest_blend(OcerzCPU *cpu, const X86Insn *insn)
     const X86Operand *s = &insn->ops[1];
     switch (insn->op) {
     case OP(OCERZ_OP_PTEST): {
-        Ocerz128 a = cpu->xmm[d->reg];       /* ptest: no NDS form, ops[0] is a source */
+        Ocerz128 a = cpu->xmm[d->reg];
         Ocerz128 b = ocerz_read_op128(cpu, insn, s);
         int zf = ((a.lo & b.lo) == 0 && (a.hi & b.hi) == 0);
         int cf = ((~a.lo & b.lo) == 0 && (~a.hi & b.hi) == 0);
@@ -1811,28 +1823,18 @@ static int sse_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * AVX (VEX-encoded) execution.
- *
- * A VEX.128 instruction is the legacy SSE op with the first source taken from
- * vvvv (src1_of above) and the upper half of the destination ymm zeroed.  A
- * VEX.256 instruction is executed twice: once on the low 128-bit halves and
- * once with the involved registers swapped for their ymm upper halves (memory
- * operands 16 bytes further on).  Ops that cross the 128-bit lanes (widening
- * and narrowing converts, broadcasts, 128-bit insert/extract, mask/test) are
- * handled explicitly. */
 static uint16_t f2h(float f)
 {
     uint32_t x = f2bits(f);
     uint32_t sign = (x >> 16) & 0x8000;
     int32_t exp = (int32_t)((x >> 23) & 0xff) - 127 + 15;
     uint32_t mant = x & 0x7fffff;
-    if (((x >> 23) & 0xff) == 0xff)                       /* inf / nan */
+    if (((x >> 23) & 0xff) == 0xff)
         return (uint16_t)(sign | 0x7c00 | (mant ? 0x200 | (mant >> 13) : 0));
     if (exp >= 0x1f)
-        return (uint16_t)(sign | 0x7c00);                  /* overflow -> inf */
+        return (uint16_t)(sign | 0x7c00);
     if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;              /* underflow -> 0 */
+        if (exp < -10) return (uint16_t)sign;
         mant |= 0x800000;
         uint32_t shift = (uint32_t)(14 - exp);
         uint32_t hm = mant >> shift, rem = mant & ((1u << shift) - 1), half = 1u << (shift - 1);
@@ -1841,7 +1843,7 @@ static uint16_t f2h(float f)
     }
     uint32_t hm = mant >> 13, rem = mant & 0x1fff;
     uint32_t h = sign | ((uint32_t)exp << 10) | hm;
-    if (rem > 0x1000 || (rem == 0x1000 && (hm & 1))) h++;  /* may carry into exp: correct */
+    if (rem > 0x1000 || (rem == 0x1000 && (hm & 1))) h++;
     return (uint16_t)h;
 }
 
@@ -1851,7 +1853,7 @@ static float h2f(uint16_t h)
     if (exp == 0x1f) x = sign | 0x7f800000 | (mant << 13);
     else if (exp == 0) {
         if (mant == 0) x = sign;
-        else {                                             /* subnormal half -> normal float */
+        else {
             int e = -1;
             do { e++; mant <<= 1; } while (!(mant & 0x400));
             x = sign | ((uint32_t)(127 - 15 - e) << 23) | ((mant & 0x3ff) << 13);
@@ -1870,7 +1872,6 @@ static void mem_write16(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op
     X86Operand t = *op; t.disp += off; t.size = 16;
     ocerz_write_op128(cpu, insn, &t, v);
 }
-/* 256-bit source: {low, high} from a register pair or 32 bytes of memory */
 static void read256(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, vec *lo, vec *hi)
 {
     if (op->kind == OCERZ_OPK_XMM) { *lo = vec_of(cpu->xmm[op->reg]); *hi = vec_of(cpu->ymmh[op->reg]); }
@@ -1957,7 +1958,6 @@ static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OP(OCERZ_OP_VCVTPS2PH): {
-        /* ops[0] = xmm or memory destination, ops[1] = source register */
         vec alo = vec_of(cpu->xmm[s->reg]), ahi = vec_of(cpu->ymmh[s->reg]);
         for (int i = 0; i < 4; i++) r.u16[i] = f2h(alo.f[i]);
         if (L) for (int i = 0; i < 4; i++) r.u16[4 + i] = f2h(ahi.f[i]);
@@ -1973,7 +1973,6 @@ static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
     case OP(OCERZ_OP_VEXTRACTF128): {
-        /* ops[0] = xmm/m128 destination, ops[1] = ymm source */
         vec v = vec_of((insn->ops[2].imm & 1) ? cpu->ymmh[s->reg] : cpu->xmm[s->reg]);
         if (d->kind == OCERZ_OPK_XMM) write_xmm_zero_hi(cpu, d->reg, v);
         else mem_write16(cpu, insn, d, 0, v.q);
@@ -2002,7 +2001,6 @@ static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
-/* VEX.256 forms of legacy ops whose result does not stay within 128-bit lanes */
 static int do_avx256_cross(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
@@ -2062,8 +2060,8 @@ static int do_avx256_cross(OcerzCPU *cpu, const X86Insn *insn)
         case OCERZ_OP_PMOVZXWQ: in = 2; out = 8; sgn = 0; break;  case OCERZ_OP_PMOVSXWQ: in = 2; out = 8; sgn = 1; break;
         default:                in = 4; out = 8; sgn = insn->op == OCERZ_OP_PMOVSXDQ; break;
         }
-        int n = 32 / out;                                  /* elements in the ymm result */
-        int srcbytes = n * in;                             /* 16 / (out/in) * 2 */
+        int n = 32 / out;
+        int srcbytes = n * in;
         vec b;
         if (s->kind == OCERZ_OPK_XMM) b = vec_of(cpu->xmm[s->reg]);
         else { b.q.lo = ocerz_ld(ocerz_ea(cpu, insn, s), srcbytes > 8 ? 8 : srcbytes); b.q.hi = srcbytes > 8 ? ocerz_ld(ocerz_ea(cpu, insn, s) + 8, srcbytes - 8) : 0; }
@@ -2090,7 +2088,7 @@ static int vex_writes_xmm_dst(const X86Insn *insn)
     switch (insn->op) {
     case OCERZ_OP_COMISS: case OCERZ_OP_COMISD: case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD:
     case OCERZ_OP_PTEST: case OCERZ_OP_VTESTPS: case OCERZ_OP_VTESTPD:
-        return 0;                                          /* ops[0] is a source, only flags change */
+        return 0;
     default:
         return 1;
     }
@@ -2139,14 +2137,13 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     default:
         break;
     }
-    /* in-lane 256-bit op: low halves first, then the same op on the upper halves */
     int rc = sse_exec(vm, cpu, insn);
     if (rc != OCERZ_STEP_OK) return rc;
     X86Insn hi = *insn;
     int regs[5], nregs = 0;
     int shift = vex_is_shift(insn->op);
     for (int i = 0; i < insn->nops; i++) {
-        if (shift && i == 1) continue;                     /* the count operand is not per-lane */
+        if (shift && i == 1) continue;
         if (insn->ops[i].kind == OCERZ_OPK_XMM) {
             int r = insn->ops[i].reg, dup = 0;
             for (int k = 0; k < nregs; k++) if (regs[k] == r) dup = 1;
@@ -2160,7 +2157,6 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         for (int k = 0; k < nregs; k++) if (regs[k] == r) dup = 1;
         if (!dup) regs[nregs++] = r;
     }
-    /* per-lane immediates */
     if (insn->op == OCERZ_OP_BLENDPS) hi.ops[2].imm = (insn->ops[2].imm >> 4) & 0xf;
     else if (insn->op == OCERZ_OP_BLENDPD) hi.ops[2].imm = (insn->ops[2].imm >> 2) & 0x3;
     for (int k = 0; k < nregs; k++) { Ocerz128 t = cpu->xmm[regs[k]]; cpu->xmm[regs[k]] = cpu->ymmh[regs[k]]; cpu->ymmh[regs[k]] = t; }

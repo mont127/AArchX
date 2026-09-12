@@ -1,4 +1,6 @@
-/* Unit tests for the SSE interpreter tier. */
+/*
+ * Unit tests for the SSE interpreter tier.
+ */
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/mem.h"

@@ -1,4 +1,23 @@
-/* Command-line parsing and the entry point. */
+/*
+ * Command-line parsing and the entry point.
+ *
+ * Two startup decisions are made here rather than lazily.  Some shared-cache
+ * images' Objective-C categories must be visible before any class is realized,
+ * because a dlopen registers them too late for classes that already exist:
+ * CoreSpotlight adds encodeWithCSCoder: categories to Foundation's collection
+ * classes, and without them the indexing AppKit kicks off about 20 s into a
+ * session throws an unrecognized-selector NSException inside a dispatch block
+ * and takes the process down.  A default list is preloaded;
+ * OCERZ_PRELOAD_OBJC=@cat preloads every category-bearing image instead.
+ *
+ * The process also starts in the single-observer ("plain") memory model and
+ * only retires it when a second observer actually appears - a thread, a
+ * fork/spawn, a hostwq worker or a writable shared mapping - which the syscall
+ * layer does through ocerz_jit_require_ordered().  OCERZ_NOJIT_EXE interprets
+ * only the processes whose command line matches, and since the environment
+ * inherits through Wine's exec chain that singles one process out for the
+ * full-visibility interpreter while the rest stay on the JIT.
+ */
 #include <signal.h>
 #include <pthread.h>
 #include <string.h>
@@ -31,14 +50,6 @@ static int is_wine_loader(const char *path)
 
 static void apply_wine_defaults(const char *path)
 {
-    /* Shared-cache images whose Objective-C categories must be visible before
-     * any class is realized (a dlopen registers them too late for classes that
-     * already exist).  CoreSpotlight adds encodeWithCSCoder: categories to
-     * Foundation's collection classes; without it, the indexing that AppKit
-     * kicks off ~20 s into a session throws an unrecognized-selector
-     * NSException inside a dispatch block and takes the process down.
-     * OCERZ_PRELOAD_OBJC=@cat preloads every category-bearing image instead
-     * (about 3-4 s more per boot). */
     static const char objc_images[] =
         "/AppKit.framework/,/QuartzCore.framework/,/HIToolbox.framework/,/CoreSpotlight.framework/";
     if (!is_wine_loader(path))
@@ -134,10 +145,7 @@ int main(int argc, char **argv)
     vm.trace = trace;
     vm.strace = strace;
     vm.jit_enabled = !nojit && getenv("OCERZ_NOJIT") == NULL;
-    {   /* OCERZ_NOJIT_EXE=<substr>: interpret only processes whose command
-         * line matches (e.g. explorer.exe) - the env inherits through
-         * wine's exec chain, so one process can be singled out for the
-         * full-visibility interpreter while the rest stay on the JIT. */
+    {
         const char *nx = getenv("OCERZ_NOJIT_EXE");
         extern char ocerz_cmdline_summary[];
         if (nx && *nx && strstr(ocerz_cmdline_summary, nx)) {
@@ -152,9 +160,6 @@ int main(int argc, char **argv)
         OCERZ_FATAL("cannot read %s\n", load_path);
         return 65;
     }
-    /* single-observer ("plain") memory model until a second observer appears
-     * (thread, fork/spawn, hostwq worker, writable shared mapping, remap):
-     * the syscall layer retires it through ocerz_jit_require_ordered() */
     vm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;
 
     if (dynamic)

@@ -1,5 +1,7 @@
-/* preadv/pwritev: scattered positioned I/O.  Both were absent from the
- * syscall table and returned ENOSYS. */
+/*
+ * preadv/pwritev: scattered positioned I/O.  Both were absent from the syscall
+ * table and returned ENOSYS.  The offset must not move the file position.
+ */
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,7 +27,6 @@ int main(void)
         printf("BAD preadv a='%.5s' b='%.5s'\n", a, b);
         return 3;
     }
-    /* offset must not move the file position */
     char z;
     if (pread(fd, &z, 1, 0) != 1 || z != 0) {
         printf("BAD hole byte %d\n", z);

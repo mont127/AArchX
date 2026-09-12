@@ -1,5 +1,50 @@
+/*
+ * Maps the x86_64 dyld shared cache and resolves symbols out of it.
+ *
+ * ---- lazy rebasing ----
+ * The v2 slide info stores every pointer as offset|delta-chain bits, so the
+ * DATA and DATA_CONST regions - about 500 MB - need unpacking even at slide 0.
+ * Doing that eagerly touched and copy-on-wrote every page at process start,
+ * ~200 ms of it.  Instead those regions are mapped PROT_NONE and each 16 KB
+ * host page is unpacked on its first touch, from the SIGSEGV handler, then
+ * given its final protection.  A page is unpacked into a private scratch
+ * mapping and installed atomically: unpacking in place after an mprotect(RW)
+ * let every other thread read the raw pointer chains mid-unpack, and
+ * libswiftCore in steam.exe dereferenced one of those half-baked pointers.
+ * Kept PROT_NONE until the remap, a concurrent reader simply faults, waits on
+ * the lock and retries against the finished page.  A page this thread already
+ * retried once is not a lazy-unpack fault, so an alignment or protection fault
+ * on an unpacked page still reaches the real handler.  The unpack now holds its
+ * lock across a whole page rebuild, so fork takes that lock like the other
+ * emulator locks or the child inherits one nobody releases.
+ *
+ * ---- patched pages ----
+ * Some engines make a libsystem page writable to patch it in place, so every
+ * subcache mapping is recorded (which also tells an address in the cache apart
+ * from a wild one) along with write-watch state for the pages a guest has
+ * mprotect'ed writable.  A lazily-slid page must be unpacked before such an
+ * mprotect, because once it is accessible the fault that would have rebased it
+ * never comes.  PROT_EXEC is always dropped: guest code is never executed by
+ * the host.  When code has been translated out of a patched page, write is
+ * taken back off it so the next patch faults instead of going unseen.
+ *
+ * ---- symbol resolution ----
+ * Every import not satisfied by its own declared dependency falls back to a
+ * walk of all ~3000 cache images, and Wine's loaders resolve the same libsystem
+ * symbols for every module they map, so the answers are memoized - the cache's
+ * export tries do not change at runtime.
+ *
+ * Two-level namespace resolution looks up a symbol in the SPECIFIC dylib the
+ * binary named, following re-exports, rather than taking the flat walk: a
+ * binary that links /usr/lib/libcrypto.46.dylib (LibreSSL 3.3.6) must bind
+ * OpenSSL_version there even though the cache also carries libcrypto.44 (2.8.3)
+ * exporting the same name, and the flat walk bound it to whichever image came
+ * first, so openssl reported the wrong version.  The path-to-header lookup is
+ * memoized because resolving every import of a dependency would otherwise
+ * rescan all ~3600 images, and since the cache is static a negative answer is
+ * cached too.
+ */
 #include <stdlib.h>
-/* Maps the x86_64 dyld shared cache and resolves symbols out of it. */
 #include "ocerz/cache.h"
 
 #include <fcntl.h>
@@ -85,23 +130,16 @@ static void rebase_chain_v2(uint64_t page_base, uint64_t page_end, uint16_t star
     }
 }
 
-/* ---- lazy rebasing of the slid (pointer-chain) data regions ----
- * The v2 slide info stores every pointer as offset|delta-chain bits, so the
- * DATA/DATA_CONST regions (~500 MB) need unpacking even at slide 0.  Doing
- * that eagerly touched (and copy-on-wrote) every page at process start
- * (~200 ms).  Instead the regions are mapped PROT_NONE and each 16K host page
- * is unpacked on its first touch from the SIGSEGV handler
- * (ocerz_cache_lazy_fault), then given its final protection. */
 #define LAZY_MAX 16
 static struct {
-    uint64_t addr, size;          /* mapping */
-    uint32_t page_size;           /* slide-info page size (4096) */
-    const uint8_t *si;            /* slide info v2 */
+    uint64_t addr, size;
+    uint32_t page_size;
+    const uint8_t *si;
     uint64_t cache_base;
     int final_prot;
-    uint8_t *done;                /* one byte per host page */
-    int fd;                       /* the cache file, kept open: pages are rebuilt from it */
-    uint64_t foff;                /* file offset of the mapping */
+    uint8_t *done;
+    int fd;
+    uint64_t foff;
 } g_lazy[LAZY_MAX];
 static int g_n_lazy;
 static volatile int g_lazy_lock;
@@ -132,9 +170,6 @@ static void rebase_page_v2(uint64_t page_base, uint64_t page_size, uint32_t pg,
     }
 }
 
-/* Called from the SIGSEGV handler with the faulting host address.  Returns 1
- * when the address lies in a lazily-slid region: the containing host page has
- * been unpacked and made accessible, and the faulting access can be retried. */
 int ocerz_cache_lazy_fault(uintptr_t addr)
 {
     for (int i = 0; i < g_n_lazy; i++) {
@@ -142,10 +177,6 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
         uint64_t hp = 0x4000;
         uint64_t off = (addr - g_lazy[i].addr) & ~(hp - 1);
         size_t hidx = (size_t)(off / hp);
-        /* a page this thread already retried once (or that was unpacked
-         * before the fault) is not a lazy-unpack fault: an alignment or
-         * protection fault on an unpacked page must reach the real handler
-         * instead of retrying forever */
         static __thread uintptr_t last_retry;
         uintptr_t page = (uintptr_t)(g_lazy[i].addr + off);
         while (__atomic_exchange_n(&g_lazy_lock, 1, __ATOMIC_ACQUIRE)) { }
@@ -153,19 +184,12 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
             int again = last_retry == page;
             last_retry = page;
             __atomic_store_n(&g_lazy_lock, 0, __ATOMIC_RELEASE);
-            return again ? 0 : 1;      /* once: another thread may have just unpacked it */
+            return again ? 0 : 1;
         }
         last_retry = 0;
         {
             uint64_t base = g_lazy[i].addr + off;
             uint32_t per = (uint32_t)(hp / g_lazy[i].page_size);
-            /* Build the unpacked page in a private scratch mapping and install
-             * it atomically.  Unpacking in place after an mprotect(RW) let
-             * every other thread read the raw pointer chains during the
-             * unpack (libswiftCore in steam.exe dereferenced one of those
-             * half-baked pointers); with the page kept PROT_NONE until the
-             * remap, a concurrent reader faults, waits on the lock and
-             * retries against the finished page. */
             int installed = 0;
             static int no_remap = -1;
             if (no_remap < 0) no_remap = getenv("OCERZ_NO_LAZY_REMAP") ? 1 : 0;
@@ -194,8 +218,6 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
                         installed = 1;
                     }
                     if (getenv("OCERZ_LAZYCHECK") && kr == KERN_SUCCESS) {
-                        /* validation: rebuild the same page the old way from a fresh file
-                         * read and compare */
                         uint8_t *chk = (uint8_t *)mmap(NULL, (size_t)hp, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
                         if (chk != MAP_FAILED && pread(g_lazy[i].fd, chk, (size_t)hp, (off_t)(g_lazy[i].foff + off)) == got) {
                             for (uint32_t k = 0; k < per; k++) {
@@ -214,7 +236,6 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
                 munmap(tmp, (size_t)hp);
             }
             if (!installed) {
-                /* fallback: the old in-place unpack */
                 mprotect((void *)(uintptr_t)base, (size_t)hp, PROT_READ | PROT_WRITE);
                 for (uint32_t k = 0; k < per; k++) {
                     uint64_t pb = base + (uint64_t)k * g_lazy[i].page_size;
@@ -234,9 +255,6 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
     return 0;
 }
 
-/* fork: the lazy unpack holds g_lazy_lock for a whole page rebuild now, so a
- * fork landing inside it would hand the child a lock nobody releases; take
- * the lock across the fork like the other emulator locks. */
 void ocerz_cache_prefork(void)
 {
     while (__atomic_exchange_n(&g_lazy_lock, 1, __ATOMIC_ACQUIRE)) { }
@@ -254,15 +272,12 @@ int ocerz_cache_lazy_region(uintptr_t addr)
     return 0;
 }
 
-/* Every subcache mapping, so an address in the cache (TEXT included) can be
- * told apart from a wild one, plus write-watch state for the host pages a
- * guest has mprotect'ed writable in order to hot-patch them. */
 #define CMAP_MAX (CACHE_MAX_SUBCACHES * 8)
-#define WATCH_ARMED    1        /* watched, currently read-only */
+#define WATCH_ARMED    1
 #define WATCH_WRITABLE 2
 static struct {
     uint64_t addr, size;
-    uint8_t *watch;             /* one byte per host page */
+    uint8_t *watch;
 } g_cmap[CMAP_MAX];
 static int g_n_cmap;
 static uint64_t g_cmap_lo = ~0ull, g_cmap_hi;
@@ -281,7 +296,6 @@ int ocerz_cache_region(uintptr_t addr)
     return cmap_find(addr) >= 0;
 }
 
-/* alloc=0 is the signal-handler path and never allocates */
 static uint8_t *watch_slot(uintptr_t addr, int alloc)
 {
     int i = cmap_find(addr);
@@ -302,9 +316,6 @@ static uint8_t *watch_slot(uintptr_t addr, int alloc)
     return w + (addr - g_cmap[i].addr) / OCERZ_HOST_PAGE_SIZE;
 }
 
-/* Guest mprotect of a cache page.  A lazily-slid page must be unpacked first:
- * once it is accessible the fault that would have rebased it never comes.
- * PROT_EXEC is dropped, guest code is never executed by the host. */
 int ocerz_cache_protect(uintptr_t addr, uint64_t len, int prot)
 {
     uint64_t hp = OCERZ_HOST_PAGE_SIZE;
@@ -326,8 +337,6 @@ int ocerz_cache_protect(uintptr_t addr, uint64_t len, int prot)
     return 0;
 }
 
-/* Store fault on a page re-armed by ocerz_cache_arm_exec: grant write again.
- * The caller drops the translations that were made from it. */
 int ocerz_cache_write_fault(uintptr_t addr)
 {
     if (!__atomic_load_n(&g_any_watch, __ATOMIC_ACQUIRE)) return 0;
@@ -341,8 +350,6 @@ int ocerz_cache_write_fault(uintptr_t addr)
     return 1;
 }
 
-/* Code has been translated out of [lo,hi): take write back off any patched
- * page in it, so the next patch of those bytes faults instead of going unseen. */
 void ocerz_cache_arm_exec(uint64_t lo, uint64_t hi)
 {
     if (!__atomic_load_n(&g_any_watch, __ATOMIC_ACQUIRE)) return;
@@ -419,7 +426,7 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
         {
             const char *cml = getenv("OCERZ_CACHEMAPLOG");
             if (cml) {
-                uint64_t of = cml[0] ? strtoull(cml, NULL, 0) : 0;    /* optional address of interest */
+                uint64_t of = cml[0] ? strtoull(cml, NULL, 0) : 0;
                 fprintf(stderr, "ocerz: CMAP %s map%u addr=%#llx size=%#llx foff=%#llx slide_off=%#llx slide_size=%#llx initp=%#x %s\n",
                         is_main?"main":"sub", i, (unsigned long long)addr, (unsigned long long)size,
                         (unsigned long long)foff, (unsigned long long)slide_off, (unsigned long long)slide_size, initp,
@@ -478,7 +485,6 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
         if (rd32(si) != 2)
             continue;
         if (slide_regions[i][3]) {
-            /* lazy: remember the region; pages unpack on first touch */
             uint64_t hp = 0x4000;
             size_t npages = (size_t)((slide_regions[i][2] + hp - 1) / hp);
             g_lazy[g_n_lazy].addr = slide_regions[i][0];
@@ -487,11 +493,11 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
             g_lazy[g_n_lazy].si = si;
             g_lazy[g_n_lazy].cache_base = cache_base;
             g_lazy[g_n_lazy].final_prot = (int)slide_regions[i][4];
-            g_lazy[g_n_lazy].fd = dup(fd);             /* kept open for the page rebuilds */
+            g_lazy[g_n_lazy].fd = dup(fd);
             g_lazy[g_n_lazy].foff = slide_regions[i][5];
             g_lazy[g_n_lazy].done = (uint8_t *)calloc(npages, 1);
             if (g_lazy[g_n_lazy].done) g_n_lazy++;
-            else rebase_slide_v2(slide_regions[i][0], slide_regions[i][2], cache_base, si);   /* fallback: eager */
+            else rebase_slide_v2(slide_regions[i][0], slide_regions[i][2], cache_base, si);
         } else {
             rebase_slide_v2(slide_regions[i][0], slide_regions[i][2], cache_base, si);
         }
@@ -686,10 +692,6 @@ static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, in
     return resolve_in_dylib(c, tmh, want, depth + 1, found);
 }
 
-/* Every import that is not satisfied by its own declared dependency lands in
- * the walk below, which visits all ~3000 cache images.  Wine's loaders resolve
- * the same libsystem symbols for every module they map, so remember the
- * answers -- the cache's export tries do not change at runtime. */
 #define RMEMO_SLOTS 4096
 typedef struct { char *name; uint64_t val; int found; } ResolveMemo;
 static ResolveMemo g_rmemo[RMEMO_SLOTS];
@@ -707,7 +709,7 @@ static ResolveMemo *rmemo_find(const char *symbol)
     unsigned i = rmemo_hash(symbol);
     for (unsigned n = 0; n < 8; n++, i = (i + 1) & (RMEMO_SLOTS - 1)) {
         if (!g_rmemo[i].name)
-            return &g_rmemo[i];              /* free slot for the caller to fill */
+            return &g_rmemo[i];
         if (strcmp(g_rmemo[i].name, symbol) == 0)
             return &g_rmemo[i];
     }
@@ -751,17 +753,6 @@ uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found)
     return v;
 }
 
-/* Two-level namespace: resolve `symbol` in the SPECIFIC cache dylib named by
- * `path`, following re-exports, not by the flat walk over every cache image
- * that ocerz_cache_resolve_ex does.  A binary that links
- * /usr/lib/libcrypto.46.dylib (LibreSSL 3.3.6) must bind OpenSSL_version there,
- * even though the cache also carries libcrypto.44 (2.8.3) exporting the same
- * name; the flat walk bound it to whichever image came first and openssl
- * reported the wrong version.  The path->mh lookup is memoized because
- * resolving every import of a dependency would otherwise rescan all ~3600
- * cache images; the cache is static, so a negative (mh==0, not a cache image)
- * is cached too.  Returns 0 with *found==0 when the image or symbol is absent,
- * so the caller can fall back to its flat search. */
 uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
                                       const char *symbol, int *found)
 {

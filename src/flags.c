@@ -1,4 +1,13 @@
-/* Eager RFLAGS computation. The bit-for-bit x86 flag reference the JIT must match. */
+/*
+ * Eager RFLAGS computation: the bit-for-bit x86 flag reference the JIT's
+ * deferred-record paths must agree with, and the interpreter's flag source.
+ *
+ * Where the architecture says "undefined" this file follows Rosetta, since
+ * Rosetta is the golden oracle the guest tests are generated against.  MUL and
+ * IMUL define CF and OF only - SF, ZF, AF and PF are architecturally undefined,
+ * and Rosetta leaves all four clear regardless of the result or the flags going
+ * in (probed 2026-09-03), so that is what is produced here.
+ */
 #include "ocerz/flags.h"
 
 #define OCERZ_ARITH_FLAGS (OCERZ_CF | OCERZ_PF | OCERZ_AF | OCERZ_ZF | OCERZ_SF | OCERZ_OF)
@@ -129,9 +138,6 @@ void ocerz_flags_sar(OcerzCPU *cpu, int size, uint64_t val, unsigned cnt, uint64
     put_arith(cpu, f);
 }
 
-/* MUL/IMUL define CF and OF only; SF, ZF, AF and PF are architecturally
- * undefined, and Rosetta leaves all four clear regardless of the result or
- * the flags going in (probed 2026-09-03).  Follow it exactly. */
 void ocerz_flags_mul(OcerzCPU *cpu, int size, uint64_t lo, uint64_t hi)
 {
     (void)lo;

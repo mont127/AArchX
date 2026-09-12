@@ -11,11 +11,11 @@ static g_u64 iret_garbage(void)
     g_u64 cs;
     __asm__ __volatile__(
         "movq %%rsp, %%rax\n\t"
-        "movq $0xdead0023, %%rdx\n\tpushq %%rdx\n\t"       /* SS slot, junk above the selector */
-        "pushq %%rax\n\t"                                   /* RSP */
-        "pushfq\n\t"                                        /* RFLAGS */
-        "movq $0xbeef002b, %%rdx\n\tpushq %%rdx\n\t"       /* CS slot, junk above the selector */
-        "leaq 1f(%%rip), %%rdx\n\tpushq %%rdx\n\t"         /* RIP */
+        "movq $0xdead0023, %%rdx\n\tpushq %%rdx\n\t"
+        "pushq %%rax\n\t"
+        "pushfq\n\t"
+        "movq $0xbeef002b, %%rdx\n\tpushq %%rdx\n\t"
+        "leaq 1f(%%rip), %%rdx\n\tpushq %%rdx\n\t"
         "iretq\n"
         "1:\n\tmovl %%cs, %k0"
         : "=r"(cs) : : "rax", "rdx", "memory", "cc");
@@ -26,8 +26,8 @@ static g_u64 lret_garbage(void)
 {
     g_u64 cs;
     __asm__ __volatile__(
-        "movq $0xcafe002b, %%rdx\n\tpushq %%rdx\n\t"       /* CS slot */
-        "leaq 1f(%%rip), %%rdx\n\tpushq %%rdx\n\t"         /* RIP */
+        "movq $0xcafe002b, %%rdx\n\tpushq %%rdx\n\t"
+        "leaq 1f(%%rip), %%rdx\n\tpushq %%rdx\n\t"
         "lretq\n"
         "1:\n\tmovl %%cs, %k0"
         : "=r"(cs) : : "rdx", "memory", "cc");

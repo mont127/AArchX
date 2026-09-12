@@ -25,14 +25,13 @@ static void flags_line(const char *what, unsigned char z, unsigned char c, unsig
     g_putu64_nonl(z); g_puts(" "); g_putu64_nonl(c); g_puts(" "); g_putu64_nonl(s); g_puts(" "); g_putu64(o);
 }
 
-/* ---- 32-bit ---- */
 static void test32(const char *tag, unsigned char *p)
 {
     unsigned char z, c, s, o;
     unsigned old, r;
     g_puts("== dword "); g_puts(tag); g_puts("\n");
 
-    __builtin_memcpy(p, "\x78\x56\x34\x12", 4);              /* 0x12345678 */
+    __builtin_memcpy(p, "\x78\x56\x34\x12", 4);
     old = 0x12345678u; r = 0;
     __asm__ __volatile__("lock cmpxchgl %[n], (%[p])\n\t" FLAGS(z, c, s, o)
                          : "+a"(old), FLAGOUT(z, c, s, o) : [n] "r"(0xdeadbeefu), [p] "r"(p) : "memory", "cc");
@@ -74,7 +73,6 @@ static void test32(const char *tag, unsigned char *p)
     __builtin_memcpy(&r, p, 4); show("bts mem", r); show("bts carry", c);
 }
 
-/* ---- 64-bit ---- */
 static void test64(const char *tag, unsigned char *p)
 {
     unsigned char z, c, s, o;
@@ -107,7 +105,6 @@ static void test64(const char *tag, unsigned char *p)
     __asm__ __volatile__("lock negq (%[p])\n\t" FLAGS(z, c, s, o) : FLAGOUT(z, c, s, o) : [p] "r"(p) : "memory", "cc");
     __builtin_memcpy(&r, p, 8); show("neg mem", r); flags_line("neg", z, c, s, o);
 
-    /* cmpxchg8b: hit then miss */
     v = 0x1122334455667788ull; __builtin_memcpy(p, &v, 8);
     unsigned lo = 0x55667788u, hi = 0x11223344u;
     __asm__ __volatile__("lock cmpxchg8b (%[p])\n\tsetz %b[z]"
@@ -119,7 +116,6 @@ static void test64(const char *tag, unsigned char *p)
     __builtin_memcpy(&r, p, 8); show("cmpxchg8b-miss mem", r); show("cmpxchg8b-miss zf", z); show("cmpxchg8b-miss eax", lo); show("cmpxchg8b-miss edx", hi);
 }
 
-/* ---- 16-bit ---- */
 static void test16(const char *tag, unsigned char *p)
 {
     unsigned char z, c, s, o;
@@ -142,15 +138,14 @@ int main(int argc, char **argv, char **envp)
 {
     (void)argc; (void)argv; (void)envp;
     for (int i = 0; i < (int)sizeof buf; i++) buf[i] = (unsigned char)i;
-    test32("2 mod 4", buf + 0x446);                 /* the Steam shape */
+    test32("2 mod 4", buf + 0x446);
     test32("crosses 16-byte granule", buf + 0x10e);
     test32("crosses page", buf + 4096 - 2);
     test64("4 mod 8", buf + 0x104);
     test64("crosses 16-byte granule", buf + 0x10c);
     test64("crosses page", buf + 8192 - 3);
     test16("1 mod 2", buf + 0x201);
-    test16("crosses page", buf + 4095);              /* last byte of page 0 + first of page 1 */
-    /* the bytes around every site are untouched */
+    test16("crosses page", buf + 4095);
     g_u64 sum = 0;
     for (int i = 0; i < (int)sizeof buf; i++) sum = sum * 31 + buf[i];
     show("checksum", sum);

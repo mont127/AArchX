@@ -1,4 +1,42 @@
-/* Guest memory arena management. */
+/*
+ * Guest memory: the mapping tables, the 4 KB-guest-in-16 KB-host slot
+ * machinery, and the host protections that follow from them.
+ *
+ * A host page is shared by up to four guest pages, so its protection is the
+ * union of its slots' - minus write while the page is ARMED, which means
+ * translations were made from code in it.  Arming is how self-modifying code is
+ * caught: a later store (a guest JIT rewriting its own code, as V8 does with
+ * plain stores into RWX pages) faults, the translations are dropped, and the
+ * page is unarmed before the new bytes run.  Only code that itself sits in a
+ * guest-writable slot can be rewritten by a store - code in an RX slot changes
+ * only through mprotect/mmap, which invalidate on their own - so a page is
+ * armed only when a writable slot overlaps the translated bytes, which leaves
+ * Wine's PE images untouched where a .text tail shares a host page with a
+ * writable section.
+ *
+ * The reverse direction matters just as much: a kernel copyout that meets a
+ * read-only page does not fault, it fails, and a mach reply is destroyed with
+ * it.  So the syscall layer unarms every armed page overlapping a buffer the
+ * kernel is about to write, and retries once after unarming when a syscall
+ * comes back EFAULT with armed pages about.  A counter of currently-armed pages
+ * lets that whole check be skipped at zero.
+ *
+ * Wine's PE loader re-commits over live pages constantly, and the general path
+ * costs a memset plus two mprotects per 16 KB page, so a run of whole pages
+ * that all have to end up zeroed is replaced with one fresh anonymous mapping.
+ * Pages shared with another process are excluded, and so is one specific
+ * sibling slot: Wine's syscall-dispatcher slot at 0x7ffe1000, next to
+ * KUSER_SHARED_DATA, is physically the shared file every process of the prefix
+ * maps.  Zero-filling it for this process zeroes it for all of them, and until
+ * this process stores its pointer a few instructions later every syscall
+ * elsewhere calls NULL - Steam's CEF children died that way (2026-09-06).  The
+ * value is identical in every process, so the slot is left alone.
+ *
+ * A guest mmap(MAP_FIXED) that comes back ENOMEM is indistinguishable from real
+ * memory pressure inside the guest, and Chromium's allocator treats a refused
+ * 4 KB commit as out-of-memory, so OCERZ_MAPFAILLOG names which test in the
+ * fixed-mapping path refused instead of leaving it to guesswork.
+ */
 #include "ocerz/mem.h"
 
 #include <sys/mman.h>
@@ -102,13 +140,13 @@ typedef struct {
     uint64_t ghi;
     uint8_t *bm;
     uint8_t *shared;
-    uint8_t *armed;      /* per host page: write revoked because translations were made from it */
+    uint8_t *armed;
     uint32_t *slots;
 } MemRegion;
 
 #define MEM_REGION_MAX 128
 static MemRegion regions[MEM_REGION_MAX];
-static long g_armed_live;      /* armed pages right now: the syscall layer skips its buffer checks at 0 */
+static long g_armed_live;
 static int region_n;
 
 static MemOwner *owners;
@@ -167,9 +205,6 @@ static int host_prot(int prot)
         p |= PROT_READ;
     return p;
 }
-/* The host protection of one host page: the slots' union, minus write while
- * the page is armed (translations exist for code in it; the next guest
- * store faults, drops them and unarms - see ocerz_mem_arm_exec). */
 static int page_host_prot(const MemRegion *r, size_t i, int guest_prot)
 {
     int p = host_prot(guest_prot);
@@ -313,9 +348,6 @@ static int allocation_guard_end(uint64_t data_hi, uint64_t *guard_hi)
     return 1;
 }
 
-/* OCERZ_MAPFAILLOG: which test in the fixed-mapping path refused.  A guest
- * mmap(MAP_FIXED) that comes back ENOMEM is indistinguishable from real memory
- * pressure inside the guest, so name the branch instead of guessing. */
 static int map_refuse(int site, uint64_t lo, uint64_t hi, int rc)
 {
     static int lg = -1;
@@ -545,16 +577,11 @@ static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
         mprotect(ocerz_g2h(lo), (size_t)(hi - lo), hprot) == 0) {
         for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
             bit_set(r, pg_index(r, p));
-            if (r->armed && r->armed[pg_index(r, p)])      /* content kept: keep the write trap */
+            if (r->armed && r->armed[pg_index(r, p)])
                 mprotect(ocerz_g2h(p), (size_t)OCERZ_HOST_PAGE, hprot & ~PROT_WRITE);
         }
         return OCERZ_OK;
     }
-    /* Wine's PE loader re-commits over live pages constantly, and the loop
-     * below costs a memset plus two mprotects for every 16 KB page.  A run of
-     * whole pages that all have to end up zeroed is cheaper to replace with
-     * one fresh anonymous mapping.  Pages shared with another process are
-     * excluded: remapping them would break the sharing. */
     uint64_t blo = round_up(zlo > lo ? zlo : lo);
     uint64_t bhi = round_down(zhi < hi ? zhi : hi);
     if (ocerz_no_batch_vm())
@@ -571,7 +598,7 @@ static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
             return OCERZ_ENOMEM;
         for (uint64_t p = blo; p < bhi; p += OCERZ_HOST_PAGE) {
             bit_set(r, pg_index(r, p));
-            if (r->armed && r->armed[pg_index(r, p)]) {    /* fresh zero page: the code is gone */
+            if (r->armed && r->armed[pg_index(r, p)]) {
                 r->armed[pg_index(r, p)] = 0;
                 __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
             }
@@ -587,14 +614,6 @@ static int commit_range(const MemRegion *r, uint64_t lo, uint64_t hi, int hprot,
         int physical = (shared_load(r, i) & MEM_SHARED_PHYSICAL) != 0;
         uint64_t mlo = p > zlo ? p : zlo;
         uint64_t mhi = p + OCERZ_HOST_PAGE < zhi ? p + OCERZ_HOST_PAGE : zhi;
-        /* A sibling slot of a padded shared page (wine's syscall-dispatcher
-         * slot at 0x7ffe1000, next to KUSER_SHARED_DATA) is physically the
-         * shared file every process of the prefix maps.  Zero-filling it for
-         * this process's fresh anonymous mapping zeroes it for all of them,
-         * and until this process stores its pointer a few instructions
-         * later every syscall elsewhere calls NULL (Steam's CEF children
-         * died that way, 2026-09-06).  The value is the same in every
-         * process, so leave the slot as it is. */
         int padded = (shared_load(r, i) & MEM_SHARED_PADDED) != 0;
         if (committed && mlo < mhi && !padded) {
             if (physical
@@ -938,7 +957,6 @@ int ocerz_commit_fault_page(uint64_t gaddr)
     if (bit_test(r, i))
         return 1;
     void *hp = ocerz_g2h(p);
-    /* Publish backing first so a racing unmap will reset any page we activate. */
     bit_set(r, i);
     if (mprotect(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE) != 0 &&
         mmap(hp, (size_t)OCERZ_HOST_PAGE, PROT_READ | PROT_WRITE,
@@ -1159,8 +1177,7 @@ int ocerz_mem_register_range(uint64_t glo, uint64_t ghi)
         return OCERZ_ENOMEM;
     }
     int ok = region_add(lo, hi) != NULL;
-    if (!ok)   /* the reservation must not leak: the next overlapping attempt
-                * would fail KERN_NO_SPACE forever */
+    if (!ok)
         mach_vm_deallocate(mach_task_self(), lo, hi - lo);
     pthread_mutex_unlock(&map_lock);
     if (ok)
@@ -1604,11 +1621,6 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len)
     return rc;
 }
 
-/* Code was translated out of [lo,hi): revoke host write on every guest-
- * writable page in it, so a later store (a guest JIT rewriting its code,
- * as V8 does with plain stores into RWX pages) faults and the translations
- * are dropped before the new bytes run.  Pages with no writable slot need
- * nothing: writing them faults anyway. */
 static unsigned long g_armstat_armed, g_armstat_faults;
 int ocerz_mem_armed_any(void) { return __atomic_load_n(&g_armed_live, __ATOMIC_RELAXED) > 0; }
 static void armstat_dump(void)
@@ -1633,13 +1645,7 @@ int ocerz_mem_arm_exec(uint64_t lo, uint64_t hi)
             size_t i = pg_index(r, page);
             if (r->armed[i]) continue;
             if (!bit_test(r, i)) continue;
-            if (shared_load(r, i) & MEM_SHARED_PHYSICAL) continue;   /* another process's view: leave it */
-            /* Only code that itself sits in a guest-writable slot can be
-             * rewritten by a store; code in an RX slot changes only through
-             * mprotect/mmap, which invalidate on their own.  So a page is
-             * armed only when a writable slot overlaps the translated bytes -
-             * wine's PE images, whose .text tail shares a 16 KB host page
-             * with a writable section, stay untouched. */
+            if (shared_load(r, i) & MEM_SHARED_PHYSICAL) continue;
             int code_writable = 0;
             uint64_t slo = lo > page ? lo : page;
             uint64_t shi = hi < page + OCERZ_HOST_PAGE ? hi : page + OCERZ_HOST_PAGE;
@@ -1667,10 +1673,6 @@ int ocerz_mem_arm_exec(uint64_t lo, uint64_t hi)
     return n;
 }
 
-/* Unarm every armed page overlapping [lo,hi): a kernel copyout is about to
- * land there (a mach receive buffer, a read(2) buffer) and a copyout that
- * meets a read-only page does not fault - it fails, and a mach reply is
- * destroyed with it.  Fills pages[] for the caller to drop translations. */
 int ocerz_mem_disarm_range(uint64_t lo, uint64_t hi, uint64_t *pages, int max)
 {
     if (hi <= lo || __atomic_load_n(&g_armed_live, __ATOMIC_RELAXED) <= 0) return 0;
@@ -1695,10 +1697,6 @@ int ocerz_mem_disarm_range(uint64_t lo, uint64_t hi, uint64_t *pages, int max)
     return n;
 }
 
-/* Every armed page, unarmed: for a kernel copyout that hit one (EFAULT from
- * a syscall writing into guest memory).  Fills pages[] with the guest page
- * addresses (the caller drops their translations) and returns the count;
- * more than max armed pages means call again. */
 int ocerz_mem_disarm_all(uint64_t *pages, int max)
 {
     int n = 0;
@@ -1723,10 +1721,6 @@ int ocerz_mem_disarm_all(uint64_t *pages, int max)
     return n;
 }
 
-/* A write faulted on gaddr: if its page is armed, unarm it (write back on)
- * and report 1 so the caller drops the translations and retries the store.
- * 2: the page is guest-writable and not armed - another thread unarmed it
- * between this thread's fault and its handler; just retry the store. */
 int ocerz_mem_exec_write_fault(uint64_t gaddr)
 {
     if (gaddr == UINT64_MAX) return 0;

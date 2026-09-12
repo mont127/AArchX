@@ -1,4 +1,6 @@
-/* The JIT tier: basic blocks of guest x86_64 translated to native arm64. */
+/*
+ * The JIT tier: basic blocks of guest x86_64 translated to native arm64.
+ */
 #ifndef OCERZ_JIT_H
 #define OCERZ_JIT_H
 

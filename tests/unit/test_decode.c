@@ -1,4 +1,6 @@
-/* Unit tests for the x86_64 decoder. */
+/*
+ * Unit tests for the x86_64 decoder.
+ */
 #include "ocerz/decode.h"
 #include "ocerz/cpu.h"
 

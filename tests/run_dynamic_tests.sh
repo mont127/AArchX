@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# End-to-end tests for the mini-dyld: real dynamically-linked Mach-O programs against the shared cache.
+# End-to-end tests for the mini-dyld: real dynamically-linked Mach-O programs
+# against the shared cache. Unlike the static guest tests, these exercise the
+# dyld cache mapping, the initializer ordering and the host workqueue bridge.
+# Skipped, not failed, when there is no x86_64 clang toolchain or no mappable
+# shared cache.
 
 set -u
 cd "$(dirname "$0")/.."

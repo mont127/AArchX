@@ -1,4 +1,6 @@
-/* Unit tests for the Mach-O loader and the exec stack builder. */
+/*
+ * Unit tests for the Mach-O loader and the exec stack builder.
+ */
 #include "ocerz/loader.h"
 #include "ocerz/mem.h"
 #include "ocerz/vm.h"

@@ -1,4 +1,6 @@
-/* Mach-O image loading and process-image bootstrap. */
+/*
+ * Mach-O image loading and process-image bootstrap.
+ */
 #ifndef OCERZ_LOADER_H
 #define OCERZ_LOADER_H
 

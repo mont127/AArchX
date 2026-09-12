@@ -1,3 +1,9 @@
+/*
+ * Enumerates the Metal devices the host reports: registry ID and name for each,
+ * exiting non-zero when there are none.  Built native (not for the guest) to
+ * establish what Metal sees outside the emulator, as the baseline for what a
+ * translated process should get.
+ */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 

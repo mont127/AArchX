@@ -5,7 +5,14 @@
  * forms, is4 blends, merge moves, upper-half zeroing of VEX.128 writes,
  * two-lane 256-bit ops, the lane-crossing converts/broadcasts/inserts and
  * the AVX-only ops (vbroadcast, vpermilps, vtestps, vcvtph2ps, vzeroupper).
- * Self-checking: prints one "<name> OK" line per check. */
+ * Self-checking: prints one "<name> OK" line per check.
+ *
+ * Specific shapes worth naming: a VEX.128 write must zero the upper half (load
+ * ymm0 with a value, vandps the low lane, extract the high one); the scalar
+ * merges take their untouched part from vvvv, not from the destination; and
+ * vtestps must set ZF when no sign bit is in common and CF when src2's sign bits
+ * all lie inside src1.
+ */
 #include "gsys.h"
 
 typedef float f32;
@@ -47,32 +54,27 @@ int main(void)
     f32 E[8]; u32 UE[8];
     u64 g;
 
-    /* vaddps x, three operands, dst == src2 register */
     __asm__ volatile("vmovups (%0), %%xmm1\n\tvmovups (%1), %%xmm2\n\tvaddps %%xmm2, %%xmm1, %%xmm2\n\tvmovups %%xmm2, (%2)"
                      :: "r"(A), "r"(B), "r"(R) : "memory", "xmm1", "xmm2");
     for (int i = 0; i < 4; i++) E[i] = A[i] + B[i];
     chk("vaddps.x", eqf(R, E, 4), fb(R[0]), fb(E[0]));
 
-    /* vmulps y (two lanes) */
     __asm__ volatile("vmovaps (%0), %%ymm1\n\tvmovaps (%1), %%ymm2\n\tvmulps %%ymm2, %%ymm1, %%ymm0\n\tvmovaps %%ymm0, (%2)"
                      :: "r"(A), "r"(B), "r"(R) : "memory", "xmm0", "xmm1", "xmm2");
     for (int i = 0; i < 8; i++) E[i] = A[i] * B[i];
     chk("vmulps.y", eqf(R, E, 8), fb(R[7]), fb(E[7]));
 
-    /* vsubps y from memory source */
     __asm__ volatile("vmovaps (%0), %%ymm1\n\tvsubps (%1), %%ymm1, %%ymm0\n\tvmovups %%ymm0, (%2)"
                      :: "r"(A), "r"(B), "r"(R) : "memory", "xmm0", "xmm1");
     for (int i = 0; i < 8; i++) E[i] = A[i] - B[i];
     chk("vsubps.y.mem", eqf(R, E, 8), fb(R[5]), fb(E[5]));
 
-    /* VEX.128 write zeroes the upper half: load ymm0 with A, vandps x, extract high lane */
     __asm__ volatile("vmovaps (%0), %%ymm0\n\tvmovaps (%1), %%xmm1\n\tvandps %%xmm1, %%xmm0, %%xmm0\n\tvextractf128 $1, %%ymm0, (%2)\n\tvmovaps %%xmm0, 16(%2)"
                      :: "r"(A), "r"(B), "r"(R) : "memory", "xmm0", "xmm1");
     for (int i = 0; i < 4; i++) { E[i] = 0; u32 v = fb(A[i]) & fb(B[i]); __builtin_memcpy(&E[4 + i], &v, 4); }
     chk("vex128.zero-upper", eqf(R, E, 4), fb(R[0]) | fb(R[1]), 0);
     chk("vandps.x", eqf(R + 4, E + 4, 4), fb(R[4]), fb(E[4]));
 
-    /* vorps y, vxorps x */
     __asm__ volatile("vmovaps (%0), %%ymm1\n\tvorps (%1), %%ymm1, %%ymm0\n\tvmovaps %%ymm0, (%2)" :: "r"(UA), "r"(UB), "r"(UR) : "memory", "xmm0", "xmm1");
     for (int i = 0; i < 8; i++) UE[i] = UA[i] | UB[i];
     chk("vorps.y", equ(UR, UE, 8), UR[7], UE[7]);
@@ -80,7 +82,6 @@ int main(void)
     for (int i = 0; i < 4; i++) UE[i] = UA[i] ^ UB[i];
     chk("vpxor.x", equ(UR, UE, 4), UR[1], UE[1]);
 
-    /* integer: vpminud, vpmaxsd, vpcmpeqd, vpaddd, vpsubd, vpand */
     __asm__ volatile("vmovdqu (%0), %%xmm1\n\tvmovdqu (%1), %%xmm2\n\tvpminud %%xmm2, %%xmm1, %%xmm0\n\tvmovdqu %%xmm0, (%2)\n\t"
                      "vpmaxsd %%xmm2, %%xmm1, %%xmm0\n\tvmovdqu %%xmm0, 16(%2)"
                      :: "r"(UA), "r"(UB), "r"(UR) : "memory", "xmm0", "xmm1", "xmm2");
@@ -96,7 +97,6 @@ int main(void)
     for (int i = 0; i < 8; i++) UE[i] = UA[i] - UB[i];
     chk("vpsubd.y", equ(UR, UE, 8), UR[7], UE[7]);
 
-    /* shifts: NDD immediate form, register count form, byte shifts */
     __asm__ volatile("vmovdqu (%0), %%xmm1\n\tvpsrld $3, %%xmm1, %%xmm0\n\tvmovdqu %%xmm0, (%1)\n\tvpslld $5, %%xmm1, %%xmm0\n\tvmovdqu %%xmm0, 16(%1)"
                      :: "r"(UA), "r"(UR) : "memory", "xmm0", "xmm1");
     for (int i = 0; i < 4; i++) { UE[i] = UA[i] >> 3; UE[4 + i] = UA[i] << 5; }
@@ -111,7 +111,6 @@ int main(void)
         chk("vpsrldq.imm", equ(UR + 4, UE + 4, 4), UR[4], UE[4]);
     }
 
-    /* broadcasts */
     __asm__ volatile("vbroadcastss 4(%0), %%ymm0\n\tvmovaps %%ymm0, (%1)\n\tvmovss 8(%0), %%xmm2\n\tvbroadcastss %%xmm2, %%xmm1\n\tvmovaps %%xmm1, 32(%1)"
                      :: "r"(A), "r"(R) : "memory", "xmm0", "xmm1", "xmm2");
     { int g1 = 1; for (int i = 0; i < 8; i++) if (fb(R[i]) != fb(A[1])) g1 = 0; chk("vbroadcastss.y.mem", g1, fb(R[7]), fb(A[1])); }
@@ -124,7 +123,6 @@ int main(void)
     __asm__ volatile("vbroadcastsd 8(%0), %%ymm0\n\tvmovapd %%ymm0, (%1)" :: "r"(DA), "r"(DR) : "memory", "xmm0");
     chk("vbroadcastsd.y", db(DR[0]) == db(DA[1]) && db(DR[3]) == db(DA[1]), db(DR[3]), db(DA[1]));
 
-    /* 256-bit double ops and lane-crossing converts */
     __asm__ volatile("vmovapd (%0), %%ymm1\n\tvsubpd (%1), %%ymm1, %%ymm0\n\tvmovupd %%ymm0, (%2)" :: "r"(DA), "r"(DB), "r"(DR) : "memory", "xmm0", "xmm1");
     chk("vsubpd.y", db(DR[0]) == db(DA[0] - DB[0]) && db(DR[3]) == db(DA[3] - DB[3]), db(DR[3]), db(DA[3] - DB[3]));
     __asm__ volatile("vmovapd (%0), %%ymm1\n\tvmaxpd (%1), %%ymm1, %%ymm0\n\tvmovapd %%ymm0, (%2)\n\tvminpd (%1), %%ymm1, %%ymm0\n\tvmovapd %%ymm0, 32(%2)"
@@ -142,7 +140,6 @@ int main(void)
     __asm__ volatile("vmovdqu (%0), %%xmm1\n\tvcvtdq2pd %%xmm1, %%ymm0\n\tvmovapd %%ymm0, (%1)" :: "r"(UB), "r"(DR) : "memory", "xmm0", "xmm1");
     chk("vcvtdq2pd.y", db(DR[0]) == db((double)(int)UB[0]) && db(DR[3]) == db((double)(int)UB[3]), db(DR[3]), db((double)(int)UB[3]));
 
-    /* converts and rounding, 128-bit */
     __asm__ volatile("vmovups (%0), %%xmm1\n\tvcvttps2dq %%xmm1, %%xmm0\n\tvmovdqu %%xmm0, (%1)\n\tvroundps $9, %%xmm1, %%xmm0\n\tvmovups %%xmm0, 16(%1)\n\tvroundps $10, %%xmm1, %%xmm0\n\tvmovups %%xmm0, 32(%1)"
                      :: "r"(A), "r"(R) : "memory", "xmm0", "xmm1");
     { u32 want[4] = { 1, (u32)-2, 3, 4 }; chk("vcvttps2dq.x", equ((u32 *)R, want, 4), ((u32 *)R)[1], want[1]);
@@ -152,7 +149,6 @@ int main(void)
     for (int i = 0; i < 4; i++) E[i] = (f32)(int)UB[i];
     chk("vcvtdq2ps.x", eqf(R, E, 4), fb(R[3]), fb(E[3]));
 
-    /* compares with VEX predicates, blends */
     __asm__ volatile("vmovups (%0), %%xmm1\n\tvcmpltps (%1), %%xmm1, %%xmm0\n\tvmovups %%xmm0, (%2)\n\tvcmpnltps (%1), %%xmm1, %%xmm0\n\tvmovups %%xmm0, 16(%2)"
                      :: "r"(A), "r"(B), "r"(R) : "memory", "xmm0", "xmm1");
     for (int i = 0; i < 4; i++) { UE[i] = A[i] < B[i] ? 0xffffffffu : 0; UE[4 + i] = ~UE[i]; }
@@ -167,7 +163,6 @@ int main(void)
     for (int i = 0; i < 8; i++) E[i] = ((0xa5 >> i) & 1) ? B[i] : A[i];
     chk("vblendps.y", eqf(R, E, 8), fb(R[7]), fb(E[7]));
 
-    /* shuffles / inserts / extracts */
     __asm__ volatile("vmovdqu (%0), %%xmm1\n\tvpshufd $0x1b, %%xmm1, %%xmm0\n\tvmovdqu %%xmm0, (%1)\n\tvmovups (%2), %%xmm2\n\tvshufps $0x44, %%xmm2, %%xmm1, %%xmm0\n\tvmovups %%xmm0, 16(%1)"
                      :: "r"(UA), "r"(UR), "r"(B) : "memory", "xmm0", "xmm1", "xmm2");
     { u32 want[4] = { UA[3], UA[2], UA[1], UA[0] }; chk("vpshufd.x", equ(UR, want, 4), UR[0], want[0]);
@@ -192,7 +187,6 @@ int main(void)
     { f32 w[4] = { A[3], A[2], A[1], A[0] }; chk("vpermilps.imm", eqf(R, w, 4), fb(R[0]), fb(w[0]));
       f32 w2[4] = { A[UB[0] & 3], A[UB[1] & 3], A[UB[2] & 3], A[UB[3] & 3] }; chk("vpermilps.reg", eqf(R + 4, w2, 4), fb(R[4]), fb(w2[0])); }
 
-    /* pack / unpack / pshufb / pmovzx */
     __asm__ volatile("vmovdqu (%0), %%xmm1\n\tvmovdqu (%1), %%xmm2\n\tvpackssdw %%xmm2, %%xmm1, %%xmm0\n\tvmovdqu %%xmm0, (%2)\n\tvpunpckldq %%xmm2, %%xmm1, %%xmm0\n\tvmovdqu %%xmm0, 16(%2)"
                      :: "r"(UA), "r"(UB), "r"(UR) : "memory", "xmm0", "xmm1", "xmm2");
     { u16 w[8]; for (int i = 0; i < 4; i++) { int v = (int)UA[i]; w[i] = (u16)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); v = (int)UB[i]; w[4 + i] = (u16)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
@@ -209,7 +203,6 @@ int main(void)
         u16 ww[16]; for (int i = 0; i < 16; i++) ww[i] = idx[i]; chk("vpmovzxbw.y", __builtin_memcmp(UR + 8, ww, 32) == 0, UR[10], ((u32 *)ww)[2]);
     }
 
-    /* scalar merges: vmovss reg-reg keeps vvvv's upper, vcvtsi2ss, vmulss, vminss */
     __asm__ volatile("vmovups (%0), %%xmm1\n\tvmovups (%1), %%xmm2\n\tvmovss %%xmm2, %%xmm1, %%xmm0\n\tvmovups %%xmm0, (%2)\n\tvmulss %%xmm2, %%xmm1, %%xmm0\n\tvmovups %%xmm0, 16(%2)\n\tvminss %%xmm2, %%xmm1, %%xmm0\n\tvmovups %%xmm0, 32(%2)"
                      :: "r"(A), "r"(B), "r"(R) : "memory", "xmm0", "xmm1", "xmm2");
     { f32 w[4] = { B[0], A[1], A[2], A[3] }; chk("vmovss.merge", eqf(R, w, 4), fb(R[1]), fb(w[1]));
@@ -222,18 +215,14 @@ int main(void)
       __asm__ volatile("vmovq %1, %%xmm0\n\tvpaddd %%xmm0, %%xmm0, %%xmm0\n\tvmovq %%xmm0, %0" : "=r"(g) : "r"(q) : "xmm0");
       chk("vmovq.gpr", g == 0x22446688aaccef10ull, g, 0x22446688aaccef10ull); }
 
-    /* vtestps: ZF when no sign bit in common, CF when src2's sign bits are all inside src1 */
     { u64 fl;
       __asm__ volatile("vmovdqu (%1), %%xmm1\n\tvmovdqu (%2), %%xmm2\n\tvtestps %%xmm2, %%xmm1\n\tpushfq\n\tpopq %0" : "=r"(fl) : "r"(UA), "r"(UB) : "memory", "xmm1", "xmm2", "cc");
-      /* UA signs: 0,1,0,1 ; UB signs: 0,0,0,0 -> and=0 -> ZF=1 ; andn=0 -> CF=1 */
       chk("vtestps.flags", (fl & 0x40) && (fl & 1), fl & 0x41, 0x41); }
 
-    /* half floats */
     __asm__ volatile("vmovups (%0), %%xmm1\n\tvcvtps2ph $0, %%xmm1, %%xmm0\n\tvmovdqu %%xmm0, (%1)\n\tvcvtph2ps %%xmm0, %%xmm2\n\tvmovups %%xmm2, 16(%1)" :: "r"(A), "r"(R) : "memory", "xmm0", "xmm1", "xmm2");
     { u16 w[4] = { 0x3e00, 0xc080, 0x4200, 0x44c0 }; chk("vcvtps2ph.x", __builtin_memcmp(R, w, 8) == 0, ((u32 *)R)[0], ((u32 *)w)[0]);
       chk("vcvtph2ps.x", eqf(R + 4, A, 4), fb(R[7]), fb(A[3])); }
 
-    /* vzeroupper */
     __asm__ volatile("vmovaps (%0), %%ymm3\n\tvzeroupper\n\tvextractf128 $1, %%ymm3, (%1)\n\tvmovaps %%xmm3, 16(%1)" :: "r"(A), "r"(R) : "memory", "xmm3");
     chk("vzeroupper", fb(R[0]) == 0 && fb(R[3]) == 0 && eqf(R + 4, A, 4), fb(R[0]) | fb(R[3]), 0);
 

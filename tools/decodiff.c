@@ -1,12 +1,12 @@
-/* decodiff -- 64-bit decode differential harness.
+/*
+ * decodiff -- 64-bit decode differential harness.
  *
- * Links against src/decode.o ALONE (verified self-contained: it needs only
- * libc).  Native arm64, no Rosetta, no wine, no i386 toolchain.
- *
- * Purpose: prove that a patch to src/decode.c leaves 64-bit decoding
- * bit-for-bit identical.  Two rejected i386 proposals both shipped silent
- * 64-bit decode regressions that the entire existing test suite missed, so
- * this is the acceptance gate for every future decode.c change.
+ * Proves that a patch to src/decode.c leaves 64-bit decoding bit-for-bit
+ * identical.  Two rejected i386 proposals both shipped silent 64-bit decode
+ * regressions that the entire existing test suite missed, so this is the
+ * acceptance gate for every future decode.c change.  It links against
+ * src/decode.o ALONE (verified self-contained: it needs only libc), so it is
+ * native arm64 -- no Rosetta, no wine, no i386 toolchain.
  *
  *   decodiff digest <out.bin>   -- sweep, write one u64 record hash per input
  *   decodiff line <hexbytes>    -- print the canonical record for one input
@@ -16,11 +16,11 @@
  * maximum instruction length).  That covers every opcode, every prefix
  * combination up to three deep, and every ModRM/SIB pairing.
  *
- * Records are canonicalised as TEXT, and the opcode is recorded by NAME via
- * ocerz_op_name(), not by numeric value.  That deliberately makes the digest
- * immune to renumbering OcerzOp -- inserting new opcodes mid-enum is a
- * legitimate change that must not show up as a false positive, while a real
- * change of which operation a byte string decodes to still does.
+ * Records are canonicalised as TEXT and the opcode is recorded by NAME, not by
+ * numeric value.  That deliberately makes the digest immune to renumbering
+ * OcerzOp -- inserting new opcodes mid-enum is a legitimate change that must
+ * not show up as a false positive -- while a real change of which operation a
+ * byte string decodes to still does.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +30,7 @@
 
 #define SWEEP_BITS 24
 #define SWEEP_N    (1u << SWEEP_BITS)
-#define RIP        0x0000000140001000ull   /* nonzero, so riprel folding shows */
+#define RIP        0x0000000140001000ull
 
 static const uint8_t TAIL[13] = {
     0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd
