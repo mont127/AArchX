@@ -1,4 +1,14 @@
-/* Shared mappings across the guest 4K / host 16K page-size boundary. */
+/*
+ * Shared mappings across the guest 4K / host 16K page-size boundary.
+ *
+ * A read-only MAP_SHARED view that is not 16 KB-aligned maps the whole host
+ * page from the file, so the reader sees another process's writes - which is
+ * what Steam's UI ring buffer needs.  The price is the 4 KB siblings of that
+ * host page: a later mapping into one of them is refused, never silently
+ * turned into a private slot, because a private 4K sibling cannot coexist with
+ * a physical 16K shared backing and failing the MAP_FIXED is what preserves
+ * the requested shared semantics.
+ */
 #include "ocerz/cpu.h"
 #include "ocerz/interp.h"
 #include "ocerz/mem.h"
@@ -212,11 +222,6 @@ static void test_readonly_copy_and_writable_rejection(OcerzVM *vm, int fd,
           0x3333333344444444ull);
 }
 
-/* A read-only MAP_SHARED view that is not 16 KB-aligned maps the whole host
- * page from the file (81e6d9e): the reader sees another process's writes,
- * which Steam's UI ring buffer needs.  The price is the 4 KB siblings of
- * that host page: a later mapping into one of them is refused, never
- * silently turned into a private slot. */
 static void test_readonly_subpage_shared_refuses_sibling(OcerzVM *vm, int fd,
                                                          uint64_t base)
 {
@@ -263,8 +268,6 @@ static void test_shared_anon_stays_shared(OcerzVM *vm, uint64_t base)
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(ocerz_ld(base, 8) == 0x55aa55aa11223344ull);
 
-    /* A private 4K sibling cannot coexist with this physical 16K shared
-     * backing. Failing MAP_FIXED preserves the requested shared semantics. */
     uint64_t sibling = base + OCERZ_GUEST_PAGE_SIZE;
     set_args(&vm->cpu, bsd(197), sibling, OCERZ_GUEST_PAGE_SIZE,
              PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON,

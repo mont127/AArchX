@@ -1,4 +1,66 @@
-/* The x86_64 instruction decoder. */
+/*
+ * The x86_64 and i386 instruction decoder: bytes in, one X86Insn out.
+ *
+ * ---- the mode32 seam ----
+ * The i386 additions had to be made without moving 64-bit decode by a single
+ * bit, because the decodiff gate compares the two decoders' 64-bit output and
+ * must print IDENTICAL.  So rather than sprinkling `if (s->mode32)` through the
+ * one-byte map - where one misplaced test would silently change long-mode
+ * decode - the whole i386-only slice lives in one function that the main
+ * dispatcher calls only when mode32 is set.  Every byte it owns is UNDEFINED in
+ * long mode, and it sets *handled even for the architecturally invalid forms
+ * (BOUND/LES/LDS with a register r/m), which must report OCERZ_EUNDEF from
+ * there rather than fall through to a generic path.  Where a width differs
+ * between the modes, the 64-bit arm keeps the literal the decoder has always
+ * written and only the 32-bit arm is new.
+ *
+ * The widths themselves split three ways.  Ops with an EXPLICIT stack operand
+ * (PUSH/POP r, PUSH imm, PUSH/POP r/m) take 0x66 as the 16-bit form in both
+ * modes.  Ops whose stack traffic is IMPLICIT (RET, LEAVE, PUSHF/POPF) are
+ * unconditionally 8 in long mode: the RETW/PUSHFW forms are not implemented and
+ * the gate requires that stay so.  Near branches (JMP/CALL rel and r/m, Jcc,
+ * LOOP, JrCXZ) have their operand size FORCED to 64 in long mode with 0x66
+ * ignored, per the SDM, so only the 32-bit arm is live there.
+ *
+ * ---- things the reference tools get wrong ----
+ * With a 16-bit operand size the SDM has the near branch clear the upper two
+ * bytes of EIP outright, which capstone does not model; a target-level diff
+ * against it therefore disagrees for a 0x66-prefixed branch whose target
+ * crosses 64K, which is why the capstone-checked corpus rows sit below that
+ * boundary.  LES/LDS load a far pointer, so their memory operand is 2+opsize -
+ * 6 bytes for the 32-bit form - while capstone reports 4 for both and prints no
+ * size keyword, which is capstone declining to model m16:32 rather than a fact
+ * about the ISA.
+ *
+ * ---- prefixes and encodings ----
+ * 0x40-0x4f are REX only in long mode; in 32-bit mode they are INC/DEC r32 and
+ * the prefix loop must leave them intact.  0x67 swaps a mode's default address
+ * size for the other size that mode can name: 64<->32 in long mode, 32<->16 in
+ * 32-bit mode - and the 16-bit addressing table is nothing like the other one,
+ * with no SIB byte, a fixed set of BX/BP bases optionally paired with SI/DI,
+ * and the displacement-only form at mod=00 rm=110 instead of rm=101.  0x82 is
+ * the i386-only alias of 0x80.  VEX (C5 two-byte, C4 three-byte) is decoded
+ * onto the legacy SSE opcode maps and the result tagged, so the interpreter can
+ * apply the AVX semantics - non-destructive first source, upper zeroing,
+ * 256-bit forms - while the JIT simply declines every VEX instruction.
+ *
+ * ---- representation ----
+ * There is no OCERZ_OPK_SREG: MOVSEG already encodes its destination segment
+ * register as a size-1 immediate holding the sreg index, and PUSHSEG/POPSEG
+ * follow that convention, with the width actually moved on the stack recorded
+ * in insn.opsize.  `mov r/m, Sreg` used to fold the selector into an immediate
+ * (CS=0x2b, SS=0x23), which is only true in long mode: 32-bit code in a WoW64
+ * process has an LDT code selector, and Wine's RtlCaptureContext stores what it
+ * reads here into the context that later decides which mode an iretq returns
+ * to.  The direct far CALL/JMP ptr16:32 form is encoded offset-then-selector
+ * but recorded selector-first, matching how a far pointer reads as seg:off.
+ *
+ * A NULL code pointer here is an emulator bug upstream, since every caller goes
+ * through ocerz_g2h: say so once and fail the decode rather than fault.  And a
+ * missing opcode is not academic - LDDQU is just an unaligned 16-byte load, but
+ * Chromium's renderer uses it for SIMD UTF-8 scanning and failing to decode it
+ * killed every renderer Steam launched.
+ */
 #include <stdio.h>
 #include <unistd.h>
 #include "ocerz/decode.h"
@@ -24,9 +86,9 @@ typedef struct DecState {
     int rex_r;
     int rex_x;
     int rex_b;
-    int mode32;   /* 0: 64-bit long mode.  1: i386 compatibility mode. */
-    int addr16;   /* resolved 16-bit addressing (32-bit mode + 0x67 only) */
-    int vex;      /* VEX prefix seen: vex_l/vex_w/vex_vvvv valid */
+    int mode32;
+    int addr16;
+    int vex;
     int vex_l;
     int vex_w;
     int vex_vvvv;
@@ -213,16 +275,6 @@ typedef struct ModRM {
     X86Operand mem;
 } ModRM;
 
-/* 16-bit addressing.  Reachable only from 32-bit mode with a 0x67 prefix; in
- * 64-bit mode 0x67 selects 32-bit addressing and this table is never used.
- * The r/m encoding is nothing like the 32/64-bit one: no SIB byte, a fixed set
- * of BX/BP bases optionally paired with SI/DI, and the displacement-only form
- * sitting at mod=00 rm=110 instead of rm=101.  The caller has already zeroed
- * *mo and set base/index to OCERZ_REG_NONE.
- *
- * Displacements are sign-extended, as they are in the 32-bit table; the
- * effective address is only meaningful masked to 16 bits, which is the
- * consumer's job either way. */
 static int decode_modrm16(DecState *s, ModRM *m, int rm)
 {
     static const uint8_t base16[8] = {
@@ -320,7 +372,6 @@ static int decode_modrm(DecState *s, ModRM *m, int mem_size)
             base = sbase;
         }
     } else if (rm == 5 && m->mod == 0) {
-        /* RIP-relative in 64-bit mode; a plain absolute disp32 in 32-bit. */
         riprel = !s->mode32;
         has_disp32 = 1;
     } else {
@@ -417,10 +468,6 @@ static int opsize_default(DecState *s)
     return 4;
 }
 
-/* Stack width for the ops that carry an EXPLICIT stack operand: PUSH/POP r,
- * PUSH imm, PUSH/POP r/m.  0x66 selects the 16-bit form in both modes, which
- * is exactly what HEAD's opsize_branch() did, so the 64-bit arm here is
- * value-for-value the old function. */
 static int opsize_stack(DecState *s)
 {
     if (s->has_66)
@@ -428,11 +475,6 @@ static int opsize_stack(DecState *s)
     return s->mode32 ? 4 : 8;
 }
 
-/* Stack width for the ops whose stack traffic is IMPLICIT: RET, LEAVE,
- * PUSHF/POPF.  HEAD hard-codes 8 at each of those sites in 64-bit mode -- it
- * does not implement the RETW/PUSHFW 0x66 forms -- and the decodiff gate
- * requires that stay exactly so, hence the unconditional 8 below.  Only the
- * 32-bit arm is new. */
 static int opsize_stack_implicit(DecState *s)
 {
     if (!s->mode32)
@@ -440,11 +482,6 @@ static int opsize_stack_implicit(DecState *s)
     return s->has_66 ? 2 : 4;
 }
 
-/* Near branches: JMP/CALL rel and r/m, Jcc, LOOP, JrCXZ.  In 64-bit mode the
- * operand size is FORCED to 64 and 0x66 is ignored (SDM Vol.2, JMP/CALL: "In
- * 64-bit mode ... the operand size is forced to 64 bits"), which is why HEAD
- * writes a literal 8 at each of these sites.  That literal is preserved here;
- * only the 32-bit arm, where 0x66 does apply, is new. */
 static int opsize_nearbranch(DecState *s)
 {
     if (!s->mode32)
@@ -546,8 +583,6 @@ static int branch_rel(DecState *s, int op, int rel_size, int lo4_for_cc)
     if (rel_size == 1) {
         e = read_imm8s(s, &tmp, 8);
     } else if (osize == 2) {
-        /* 32-bit mode only: 0x66 turns rel32 into rel16 and the target wraps
-         * at 16 bits.  osize is 8 in 64-bit mode, so this arm is dead there. */
         uint16_t w;
         e = fetch16(s, &w);
         if (!e)
@@ -562,12 +597,6 @@ static int branch_rel(DecState *s, int op, int rel_size, int lo4_for_cc)
     if (lo4_for_cc >= 0)
         set_cc_from_low(s, lo4_for_cc);
     uint64_t target = s->rip + (uint64_t)cur_len(s) + tmp.imm;
-    /* EIP wraps at 32 bits, and with a 16-bit operand size the SDM clears the
-     * top half of EIP outright ("the upper two bytes of the EIP register are
-     * cleared", SDM Vol.2 JMP).  capstone does not model that second rule, so
-     * a target-level diff against it disagrees here -- only for a 0x66-
-     * prefixed near branch whose target crosses 64K, which is why the
-     * capstone-checked test rows sit below that boundary. */
     if (osize == 4)
         target &= 0xffffffffull;
     else if (osize == 2)
@@ -584,13 +613,6 @@ static int decode_x87(DecState *s, uint8_t op);
 
 static int decode_one_byte(DecState *s, uint8_t op);
 
-
-/* AVX: the VEX prefix (C5 = 2-byte, C4 = 3-byte) carries REX-like R/X/B/W,
- * the opcode map (0F, 0F38, 0F3A), the mandatory prefix (none/66/F3/F2), the
- * vector length L and an extra register vvvv.  It is decoded onto the legacy
- * SSE opcode maps and the result is tagged (X86Insn.vex/vvvv): the interpreter
- * applies the AVX semantics (non-destructive first source, upper zeroing,
- * 256-bit forms) and the JIT declines every VEX instruction. */
 static int vex_finish(DecState *s);
 
 static int decode_vex(DecState *s, uint8_t op)
@@ -650,7 +672,6 @@ static int vex_finish(DecState *s)
     o->vex = (uint8_t)(OCERZ_VEX_PRESENT | (s->vex_l ? OCERZ_VEX_L : 0) | (s->vex_w ? OCERZ_VEX_W : 0));
     o->vvvv = (uint8_t)s->vex_vvvv;
     switch (o->op) {
-    /* three-operand forms: dst = op(vvvv, rm) */
     case OCERZ_OP_ADDPS: case OCERZ_OP_ADDPD: case OCERZ_OP_ADDSS: case OCERZ_OP_ADDSD:
     case OCERZ_OP_SUBPS: case OCERZ_OP_SUBPD: case OCERZ_OP_SUBSS: case OCERZ_OP_SUBSD:
     case OCERZ_OP_MULPS: case OCERZ_OP_MULPD: case OCERZ_OP_MULSS: case OCERZ_OP_MULSD:
@@ -693,11 +714,9 @@ static int vex_finish(DecState *s)
         o->vex |= OCERZ_VEX_NDS;
         break;
     case OCERZ_OP_VPERMILPS: case OCERZ_OP_VPERMILPD:
-        if (o->ops[2].kind != OCERZ_OPK_IMM)      /* 0F38 form: control vector in rm, data in vvvv */
+        if (o->ops[2].kind != OCERZ_OPK_IMM)
             o->vex |= OCERZ_VEX_NDS;
         break;
-    /* scalar/partial moves merge into vvvv only in their register form; the
-     * memory forms are plain loads/stores */
     case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX:
         if (o->ops[0].kind == OCERZ_OPK_XMM && o->ops[1].kind == OCERZ_OPK_XMM)
             o->vex |= OCERZ_VEX_NDS;
@@ -706,8 +725,6 @@ static int vex_finish(DecState *s)
         if (o->ops[0].kind == OCERZ_OPK_XMM)
             o->vex |= OCERZ_VEX_NDS;
         break;
-    /* shifts: register/memory count is three-operand, an immediate count is
-     * the NDD form (vvvv is the destination, rm the source) */
     case OCERZ_OP_PSLLW: case OCERZ_OP_PSLLD: case OCERZ_OP_PSLLQ:
     case OCERZ_OP_PSRLW: case OCERZ_OP_PSRLD: case OCERZ_OP_PSRLQ:
     case OCERZ_OP_PSRAW: case OCERZ_OP_PSRAD:
@@ -724,7 +741,6 @@ static int vex_finish(DecState *s)
     case OCERZ_OP_BLENDVPS: case OCERZ_OP_BLENDVPD: case OCERZ_OP_PBLENDVB:
         o->vex |= OCERZ_VEX_NDS | OCERZ_VEX_IS4;
         break;
-    /* AVX-only two-operand forms with narrow memory sources */
     case OCERZ_OP_VBROADCASTSS:
         if (o->ops[1].kind == OCERZ_OPK_MEM) o->ops[1].size = 4;
         break;
@@ -747,9 +763,6 @@ int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
                       X86Insn *out, int mode32)
 {
     if (!code) {
-        /* A NULL code pointer is an emulator bug upstream (every caller goes
-         * through ocerz_g2h): say where once, and fail the decode instead of
-         * reading address 0. */
         static int said;
         if (!said) {
             said = 1;
@@ -799,8 +812,6 @@ int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
         if (s.p >= s.end)
             return avail >= 16 ? OCERZ_ETOOLONG : OCERZ_ETRUNC;
         uint8_t b = *s.p;
-        /* 0x40-0x4f are REX only in 64-bit mode; in 32-bit mode they are
-         * INC/DEC r32 opcodes and must fall through to the opcode decoder. */
         if (!s.mode32 && b >= 0x40 && b <= 0x4f) {
             s.rex_present = 1;
             s.rex = b;
@@ -859,8 +870,6 @@ int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
         s.p++;
     }
 prefixes_done:
-    /* 0x67 swaps the mode's default address size for the other size that mode
-     * can name: 64 <-> 32 in long mode, 32 <-> 16 in 32-bit mode. */
     out->addrsize = s.mode32 ? (s.has_67 ? 2 : 4) : (s.has_67 ? 4 : 8);
     s.addr16 = (out->addrsize == 2);
     out->seg = (uint8_t)s.seg;
@@ -908,8 +917,6 @@ prefixes_done:
 static int group1(DecState *s, uint8_t op)
 {
     ModRM m;
-    /* 0x82 is the i386-only alias of 0x80 and is byte-form for the same
-     * reason; it can only get here from the mode32-guarded i386 dispatch. */
     int byte_form = (op == 0x80 || op == 0x82);
     int size = byte_form ? 1 : opsize_default(s);
     int e = decode_modrm(s, &m, size);
@@ -1081,42 +1088,12 @@ static int group45(DecState *s, uint8_t op)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * The i386-only slice of the one-byte opcode map.
- *
- * Every byte handled here is UNDEFINED in long mode, where it falls out of one
- * of decode_one_byte's OCERZ_EUNDEF returns (0x06..0x37 from the ALU block's,
- * the rest from the one at the end).  Rather than sprinkle `if (s->mode32)`
- * through that function -- where a single misplaced test would silently change
- * 64-bit decode -- the whole i386 slice lives in one function that
- * decode_one_byte calls only when s->mode32 is set.  In 64-bit mode nothing
- * below runs at all, which is what makes the decodiff gate hold by
- * construction rather than by inspection.
- *
- * *handled is set for every byte this function owns, including the forms that
- * are architecturally invalid (BOUND/LES/LDS with a register r/m): those must
- * report OCERZ_EUNDEF from here, not fall through to a generic path.
- *
- * Two representational notes, both forced by the existing X86Operand vocabulary:
- *
- *  - There is no OCERZ_OPK_SREG.  OCERZ_OP_MOVSEG (0x8e) already encodes its
- *    destination segment register as an OCERZ_OPK_IMM of size 1 holding the
- *    sreg index, and PUSHSEG/POPSEG follow that exact convention.  The width
- *    actually moved on the stack is in insn.opsize, not in the operand.
- *
- *  - LES/LDS load a far pointer, so the memory operand is sized 2+opsize (6
- *    bytes for the 32-bit form, 4 for the 0x66 form).  capstone reports 4 for
- *    both and prints no size keyword at all, which is capstone declining to
- *    model m16:32 rather than a fact about the ISA; the SDM width is used here.
- * ------------------------------------------------------------------------- */
 static int decode_i386_only(DecState *s, uint8_t op, int *handled)
 {
     int e;
 
     *handled = 1;
 
-    /* 0x40-0x4f: INC/DEC r32.  These bytes are REX in long mode, and the
-     * prefix loop only strips them there, so they arrive here intact. */
     if (op >= 0x40 && op <= 0x4f) {
         int size = opsize_default(s);
         set_op(s, (op < 0x48) ? OCERZ_OP_INC : OCERZ_OP_DEC);
@@ -1128,8 +1105,6 @@ static int decode_i386_only(DecState *s, uint8_t op, int *handled)
 
     switch (op) {
 
-    /* Segment PUSH/POP.  0x0f is the two-byte escape, so there is no POP CS
-     * in the map; ES/SS/DS have both directions and CS only PUSH. */
     case 0x06: case 0x0e: case 0x16: case 0x1e:
     case 0x07:            case 0x17: case 0x1f: {
         static const uint8_t sreg_of[4] = {
@@ -1143,8 +1118,6 @@ static int decode_i386_only(DecState *s, uint8_t op, int *handled)
         return OCERZ_OK;
     }
 
-    /* Packed-BCD / ASCII adjust.  All operate implicitly on AL (DAA/DAS) or
-     * AX (AAA/AAS) and carry no encoded operand; opsize records which. */
     case 0x27:
         set_op(s, OCERZ_OP_DAA);
         s->out->opsize = 1;
@@ -1166,8 +1139,6 @@ static int decode_i386_only(DecState *s, uint8_t op, int *handled)
         s->out->nops = 0;
         return OCERZ_OK;
 
-    /* PUSHA/POPA.  No operands: the register set is implicit.  opsize is the
-     * per-register stack slot, so 0x66 gives the PUSHAW/POPAW forms. */
     case 0x60:
         set_op(s, OCERZ_OP_PUSHA);
         s->out->opsize = (uint8_t)opsize_stack(s);
@@ -1179,8 +1150,6 @@ static int decode_i386_only(DecState *s, uint8_t op, int *handled)
         s->out->nops = 0;
         return OCERZ_OK;
 
-    /* BOUND r32, m32&32.  The memory operand is the *pair* of bounds, so it is
-     * twice the operand size; a register r/m is undefined. */
     case 0x62: {
         ModRM m;
         int size = opsize_default(s);
@@ -1197,17 +1166,9 @@ static int decode_i386_only(DecState *s, uint8_t op, int *handled)
         return OCERZ_OK;
     }
 
-    /* 0x82 is an undocumented-but-real alias of 0x80: group-1 ALU on a byte
-     * r/m with an imm8.  group1() is told about it there rather than here so
-     * the two opcodes cannot drift apart. */
     case 0x82:
         return group1(s, op);
 
-    /* Direct far CALL/JMP, ptr16:32.  The encoding is offset-then-selector,
-     * but the operands are recorded selector-first to match how a far pointer
-     * reads (and prints) as seg:off.  This is the only CALLF/JMPF form with
-     * two operands -- the 0xff /3 and /5 forms carry a single memory operand
-     * -- so a consumer can tell them apart on nops alone. */
     case 0x9a:
     case 0xea: {
         int size = opsize_default(s);
@@ -1226,7 +1187,6 @@ static int decode_i386_only(DecState *s, uint8_t op, int *handled)
         return OCERZ_OK;
     }
 
-    /* LES/LDS r32, m16:32.  A register r/m is undefined. */
     case 0xc4:
     case 0xc5: {
         ModRM m;
@@ -1249,8 +1209,6 @@ static int decode_i386_only(DecState *s, uint8_t op, int *handled)
         s->out->nops = 0;
         return OCERZ_OK;
 
-    /* AAM/AAD take an imm8 base -- 10 in every encoding a compiler emits, but
-     * the byte is part of the instruction and any value is legal. */
     case 0xd4:
     case 0xd5: {
         set_op(s, (op == 0xd4) ? OCERZ_OP_AAM : OCERZ_OP_AAD);
@@ -1264,8 +1222,6 @@ static int decode_i386_only(DecState *s, uint8_t op, int *handled)
         return OCERZ_OK;
     }
 
-    /* SALC: set AL to 0xff if CF else 0.  Undocumented but universally
-     * implemented, and it does appear in hand-written 32-bit code. */
     case 0xd6:
         set_op(s, OCERZ_OP_SALC);
         s->out->opsize = 1;
@@ -1281,9 +1237,6 @@ static int decode_one_byte(DecState *s, uint8_t op)
 {
     int e;
 
-    /* The i386-only slice of the map.  Guarded so that in long mode not one
-     * byte of behaviour below is reachable through a different path than it
-     * was before. */
     if (s->mode32) {
         int handled = 0;
         e = decode_i386_only(s, op, &handled);
@@ -1460,12 +1413,6 @@ static int decode_one_byte(DecState *s, uint8_t op)
         return OCERZ_OK;
     }
     case 0x8c: {
-        /* mov r/m, Sreg.  This used to fold the selector into an immediate
-         * (CS=0x2b, SS=0x23), which is only true in long mode: 32-bit code in
-         * a WoW64 process has an LDT code selector, and wine's RtlCaptureContext
-         * stores what it reads here into the context that later decides which
-         * mode an iretq returns to.  A register destination takes the operand
-         * size, zero-extended; a memory destination takes 16 bits. */
         ModRM m;
         e = decode_modrm(s, &m, 2);
         if (e)
@@ -1958,11 +1905,6 @@ static int decode_0f(DecState *s, uint8_t op2)
         int grpreg = (modrm >> 3) & 7;
         if (modrm < 0xc0 && (grpreg == 0 || grpreg == 1)) {
             ModRM m;
-            /* The pseudo-descriptor SGDT/SIDT stores is 2 bytes of limit plus
-             * one base: 4 bytes of it in 32-bit mode, 8 in long mode.  So the
-             * destination is 6 bytes wide here and 10 there, and the operand
-             * size prefix does not change either (SDM Vol.2, SGDT).  The 10
-             * is HEAD's literal, kept as the 64-bit arm untouched. */
             int psize = s->mode32 ? 6 : 10;
             s->p -= 1;
             e = decode_modrm(s, &m, psize);
@@ -2352,7 +2294,7 @@ static int decode_0f(DecState *s, uint8_t op2)
         case 0x6a: op = OCERZ_OP_PUNPCKHDQ; break;
         case 0x6b: op = OCERZ_OP_PACKSSDW; break;
         case 0x6c: op = OCERZ_OP_PUNPCKLQDQ; break;
-        default:   op = OCERZ_OP_PUNPCKHQDQ; break;   /* 0x6d */
+        default:   op = OCERZ_OP_PUNPCKHQDQ; break;
         }
         return decode_pint(s, op, 1);
     }
@@ -2380,9 +2322,6 @@ static int decode_0f(DecState *s, uint8_t op2)
             return decode_sse_rr(s, OCERZ_OP_MOVDQU, 16, 1);
         return OCERZ_EUNDEF;
     case 0xf0:
-        /* LDDQU xmm, m128 (SSE3): an unaligned 16-byte load, same as MOVDQU
-         * for us.  Chromium's renderer (SIMD UTF-8 scanning) uses it; a
-         * decode failure there killed every renderer Steam launched. */
         if (mand == MAND_F2)
             return decode_sse_rr(s, OCERZ_OP_MOVDQU, 16, 1);
         return OCERZ_EUNDEF;
@@ -2438,8 +2377,6 @@ static int decode_0f(DecState *s, uint8_t op2)
     case 0x76:
         return decode_pint(s, OCERZ_OP_PCMPEQD, 1);
     case 0x2b: {
-        /* MOVNTPS/MOVNTPD m128, xmm: a non-temporal store; the cache hint has
-         * no observable effect here, so it is the plain unaligned store. */
         if (mand != MAND_NONE && mand != MAND_66)
             return OCERZ_EUNDEF;
         e = decode_sse_rr(s, OCERZ_OP_MOVUPS, 16, 0);
@@ -2949,7 +2886,6 @@ static int decode_0f38(DecState *s)
     if (e)
         return e;
     if (op3 == 0xf0 || op3 == 0xf1) {
-        /* crc32: F2-prefixed, GPR dest; 66 with F2 selects a 16-bit source */
         if (sse_prefix(s) != MAND_F2)
             return OCERZ_EUNDEF;
         int dsize = s->rex_w ? 8 : 4;
@@ -2985,7 +2921,6 @@ static int decode_0f38(DecState *s)
     case 0x09: op = OCERZ_OP_PSIGNW; break;
     case 0x0a: op = OCERZ_OP_PSIGND; break;
     case 0x0b: op = OCERZ_OP_PMULHRSW; break;
-    /* VEX-only (AVX): undefined without the VEX prefix */
     case 0x0c: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VPERMILPS; break;
     case 0x0d: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VPERMILPD; break;
     case 0x0e: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VTESTPS; break;
@@ -3048,7 +2983,6 @@ static int decode_0f3a(DecState *s)
         return OCERZ_EUNDEF;
 
     switch (op3) {
-    /* VEX-only (AVX) */
     case 0x04: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERMILPS);
     case 0x05: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERMILPD);
     case 0x06: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERM2F128);
@@ -3061,7 +2995,6 @@ static int decode_0f3a(DecState *s)
         e = decode_pint_imm(s, bop);
         if (e)
             return e;
-        /* is4: the mask register lives in imm8[7:4] */
         set_xmm(&s->out->ops[2], (int)((s->out->ops[2].imm >> 4) & 0xf), 16);
         return OCERZ_OK;
     }
@@ -3944,8 +3877,6 @@ static void init_op_names(void)
     op_names[OCERZ_OP_SALC] = "salc";
 }
 
-/* The 64-bit entry point.  Bit-for-bit what it has always been: every seam
- * above collapses to HEAD's constant when mode32 is 0. */
 int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out)
 {
     return ocerz_decode_mode(code, avail, rip, out, 0);
@@ -4028,9 +3959,6 @@ static void fmt_mem(char *b, size_t cap, size_t *n, const X86Insn *insn, const X
     written = snprintf(b + *n, cap > *n ? cap - *n : 0, "%s %s[", size_kw(op->size), seg);
     if (written > 0)
         *n += (size_t)written;
-    /* Address registers print at the address size, but only in 32-bit mode:
-     * 64-bit output stays exactly as it has always been, rax-names even under
-     * a 0x67 prefix. */
     int aw = insn->mode32 ? insn->addrsize : 8;
     int any = 0;
     if (op->base != OCERZ_REG_NONE) {

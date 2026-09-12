@@ -9,7 +9,13 @@
  * A block takes at most six side exits, so six never-taken jccs in front of
  * the producer make its jcc the block terminator (libcef's block had six).
  * Each shape runs over alternating inputs so a stale record from the
- * previous call gives a visibly wrong answer.  Golden from the native run. */
+ * previous call gives a visibly wrong answer.  Golden from the native run.
+ *
+ * Four producer/consumer pairs are covered, each with a three-way outcome so a
+ * stale record cannot pass by luck: an immediate compare whose taken target
+ * decides with jb; a reg/reg compare decided with je; a dec + jne decided with
+ * js; and a narrow test with a two-bit mask, also decided with js.
+ */
 #include "gsys.h"
 
 static volatile g_u64 g_zero = 0;
@@ -18,7 +24,6 @@ static volatile g_u64 vals_b[12][2] = { {3,9},{9,9},{12,9},{9,9},{3,9},{9,9},{9,
 static volatile g_u64 vals_c[12] = { 5, 1, 0, 5, 0, 1, 0, 5, 1, 0, 0, 5 };
 static volatile g_u64 vals_d[12] = { 0x10, 0x80, 0x01, 0x80, 0x10, 0x01, 0x80, 0x10, 0x80, 0x01, 0x10, 0x80 };
 
-/* imm compare; taken target decides with jb: 1 = below, 0 = equal, 2 = above */
 static __attribute__((noinline)) g_u64 shape_a(g_u64 v)
 {
     g_u64 r = 7;
@@ -53,7 +58,6 @@ static __attribute__((noinline)) g_u64 shape_a(g_u64 v)
     return r;
 }
 
-/* reg/reg compare; taken target decides with je: 0 = equal, 1 = below, 2 = above */
 static __attribute__((noinline)) g_u64 shape_b(g_u64 a, g_u64 b)
 {
     g_u64 r = 7;
@@ -88,7 +92,6 @@ static __attribute__((noinline)) g_u64 shape_b(g_u64 a, g_u64 b)
     return r;
 }
 
-/* dec + jne; taken target decides with js: 0 = hit zero, 1 = positive, 2 = negative */
 static __attribute__((noinline)) g_u64 shape_c(g_u64 v)
 {
     g_u64 r = 7;
@@ -123,8 +126,6 @@ static __attribute__((noinline)) g_u64 shape_c(g_u64 v)
     return r;
 }
 
-/* narrow test with a two-bit mask + jne; taken target decides with js:
- * 0 = no bit, 1 = bit 4 only, 2 = bit 7 set */
 static __attribute__((noinline)) g_u64 shape_d(g_u64 v)
 {
     g_u64 r = 7;

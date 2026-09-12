@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Dynamic-mode gate: every xbench kernel, built as an ordinary dynamically linked
-# x86_64 binary (tests/guest/benchbin/xbench_dyn), must print the same output
-# under Ocerz (OCERZ_HOSTWQ=1) as under Rosetta.  Skipped when the native run
-# is impossible (no Rosetta).
+# Dynamic-mode gate: every xbench kernel, built as an ordinary dynamically
+# linked x86_64 binary (tests/guest/benchbin/xbench_dyn), must print the same
+# output under Ocerz (OCERZ_HOSTWQ=1) as under Rosetta. Skipped when the native
+# run is impossible (no Rosetta).
 set -u
 cd "$(dirname "$0")/.."
 XB=tests/guest/benchbin/xbench_dyn

@@ -1,4 +1,23 @@
-/* The per-instruction flag def/use table behind flags_live.h. */
+/*
+ * The per-instruction flag def/use table behind flags_live.h.
+ *
+ * The table drives the JIT's decision to skip computing flags nothing reads, so
+ * every entry is a claim about what an instruction may do, and the safe
+ * direction is always "defines less, uses more".  DIV/IDIV leave the flags
+ * architecturally UNDEFINED, but undefined is not killed: ocerz's interpreter
+ * produces specific values there and the differential gate compares them, so
+ * they are treated as defined.  Variable shifts by %cl, the rotates and
+ * SHLD/SHRD are MAY-define, because a count that masks to zero preserves the
+ * flags while any other count writes them - a distinction that cannot be made
+ * statically.  SSE compares define everything (they write ZF/PF/CF and clear
+ * OF/SF/AF), bsf/bsr write only ZF and leave the rest, tzcnt/lzcnt write CF and
+ * ZF, popcnt writes all.  Outside the compare-into-RFLAGS forms, FCMOVcc and
+ * PTEST, the x87 and SSE regions are flag-neutral.
+ *
+ * Memory-touching instructions are fault barriers: every flag is forced live
+ * across them so a guest fault handler observes the flags the hardware would
+ * have left.
+ */
 #include "ocerz/flags_live.h"
 #include <stdlib.h>
 
@@ -8,7 +27,6 @@ static int insn_touches_memory(const X86Insn *insn)
     case OCERZ_OP_LEA: case OCERZ_OP_PREFETCH: case OCERZ_OP_CLFLUSH:
     case OCERZ_OP_NOP:
         return 0;
-    /* implicit stack / string memory */
     case OCERZ_OP_PUSH: case OCERZ_OP_POP: case OCERZ_OP_PUSHF: case OCERZ_OP_POPF:
     case OCERZ_OP_CALL: case OCERZ_OP_RET: case OCERZ_OP_LEAVE:
     case OCERZ_OP_MOVS: case OCERZ_OP_STOS: case OCERZ_OP_LODS:
@@ -23,7 +41,6 @@ static int insn_touches_memory(const X86Insn *insn)
     return 0;
 }
 
-/* Strict fault barrier: force every flag live across any memory-touching instruction so a guest */
 static int fault_barrier_enabled(void)
 {
     static int en = -1;
@@ -92,7 +109,6 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         u = 0;
         break;
 
-    /* DIV/IDIV leave the flags ARCHITECTURALLY UNDEFINED, but "undefined" is not "killed": ocerz has */
     case OCERZ_OP_DIV:
     case OCERZ_OP_IDIV:
         d = 0;
@@ -105,7 +121,6 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         u = OCERZ_CF;
         break;
 
-    /* SSE compares write ZF/PF/CF and clear OF/SF/AF: they define everything. */
     case OCERZ_OP_UCOMISS:
     case OCERZ_OP_UCOMISD:
     case OCERZ_OP_COMISS:
@@ -149,13 +164,11 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
                 u = 0;
             }
         } else {
-            /* %cl count: MAY define (count 0 architecturally preserves the flags, any other count writes */
             d = OCERZ_FL_ALL;
             u = OCERZ_FL_ALL;
         }
         break;
 
-    /* rotates: ROL/ROR write CF (and OF for count 1), RCL/RCR read and write CF. They were falling */
     case OCERZ_OP_ROL:
     case OCERZ_OP_ROR:
     case OCERZ_OP_RCL:
@@ -164,7 +177,6 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         u = OCERZ_FL_ALL;
         break;
 
-    /* string compares write the arithmetic flags (and rep/repne reads ZF) */
     case OCERZ_OP_SCAS:
     case OCERZ_OP_CMPS:
         d = OCERZ_FL_ALL;
@@ -198,9 +210,6 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         u = OCERZ_ZF;
         break;
 
-    /* x87 / SSE: only the compare-into-RFLAGS forms and PTEST touch the
-     * arithmetic flags; FCMOVcc reads CF/ZF/PF.  Everything else in those
-     * ranges is flag-neutral (memory forms stay fault barriers below). */
     case OCERZ_OP_FCOMI: case OCERZ_OP_FCOMIP:
     case OCERZ_OP_FUCOMI: case OCERZ_OP_FUCOMIP:
     case OCERZ_OP_PTEST:
@@ -212,8 +221,6 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         u = OCERZ_CF | OCERZ_ZF | OCERZ_PF;
         break;
 
-    /* bit scans: bsf/bsr write ZF and leave the rest (interpreter semantics,
-     * matches the goldens); tzcnt/lzcnt write CF and ZF; popcnt writes all */
     case OCERZ_OP_BSF: case OCERZ_OP_BSR:
         d = OCERZ_ZF; u = 0;
         break;
@@ -226,24 +233,21 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
     case OCERZ_OP_BT: case OCERZ_OP_BTS: case OCERZ_OP_BTR: case OCERZ_OP_BTC:
         d = OCERZ_CF; u = 0;
         break;
-    /* SHLD/SHRD are MAY-define, exactly like the variable shifts and the rotates above: src/interp.c */
     case OCERZ_OP_SHLD: case OCERZ_OP_SHRD:
         if (insn->nops >= 3 && insn->ops[2].kind == OCERZ_OPK_IMM) {
             unsigned scnt = (unsigned)(insn->ops[2].imm &
                                        (insn->ops[0].size == 8 ? 63u : 31u));
-            if (scnt == 0) { d = 0; u = 0; }          /* a complete no-op */
+            if (scnt == 0) { d = 0; u = 0; }
             else           { d = OCERZ_FL_ALL; u = 0; }
         } else {
-            d = OCERZ_FL_ALL; u = OCERZ_FL_ALL;       /* CL count: may-define */
+            d = OCERZ_FL_ALL; u = OCERZ_FL_ALL;
         }
         break;
-    /* xadd/cmpxchg set the arithmetic flags like add/cmp; xchg touches none */
     case OCERZ_OP_XADD: case OCERZ_OP_CMPXCHG:
         d = OCERZ_FL_ALL; u = 0;
         break;
 
     default:
-        /* The x87/SSE region is flag-neutral apart from the compare forms handled above. */
         if (insn->op >= OCERZ_OP_X87_FIRST && insn->op < OCERZ_OP_PUSHA) {
             d = 0;
             u = 0;

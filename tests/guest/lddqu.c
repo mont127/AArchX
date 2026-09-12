@@ -24,7 +24,6 @@ int main(int argc, char **argv, char **envp)
     load_show(buf + 15);
     load_show(buf + 4096 - 5);
     load_show(buf + 4096 - 1);
-    /* register form and a reg-indexed address, the shapes the scanner emits */
     g_u64 v;
     __asm__ __volatile__("mov $0x123, %%rax\n\tlddqu 5(%[p],%%rax,2), %%xmm2\n\tmovq %%xmm2, %[v]"
                          : [v] "=r"(v) : [p] "r"(buf) : "rax", "xmm2", "memory");

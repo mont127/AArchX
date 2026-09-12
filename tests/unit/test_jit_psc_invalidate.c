@@ -1,3 +1,12 @@
+/*
+ * Invalidating a block that an indirect branch's per-site cache points at.
+ *
+ * The fragment jumps through a register to a target block, which fills the
+ * jump site's direct-mapped {rip, body} cache entry.  The target is then
+ * invalidated, and the next entry must not reach the retired body: a code
+ * pointer cached at the branch site is exactly the kind of thing an
+ * invalidation can leave dangling.
+ */
 #include "ocerz/cpu.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"
@@ -19,8 +28,8 @@
 static void emit_source(void)
 {
     uint8_t code[] = {
-        0x48, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0, /* movabs TARGET_RIP,%rcx */
-        0xff, 0xe1,                         /* jmp *%rcx */
+        0x48, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xff, 0xe1,
     };
     memcpy(&code[2], &(uint64_t){ TARGET_RIP }, sizeof(uint64_t));
     memcpy(ocerz_g2h(SOURCE_RIP), code, sizeof code);
@@ -29,8 +38,8 @@ static void emit_source(void)
 static void emit_target(uint8_t addend)
 {
     uint8_t code[] = {
-        0x48, 0x83, 0xc0, addend,           /* add $addend,%rax */
-        0xe9, 0, 0, 0, 0,                  /* jmp DONE_RIP */
+        0x48, 0x83, 0xc0, addend,
+        0xe9, 0, 0, 0, 0,
     };
     int32_t rel = (int32_t)(DONE_RIP - (TARGET_RIP + sizeof code));
     memcpy(&code[5], &rel, sizeof rel);

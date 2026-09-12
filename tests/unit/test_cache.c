@@ -1,4 +1,8 @@
-/* Shared-cache mapper and symbol resolver against ground truth. */
+/*
+ * Shared-cache mapper and symbol resolver against ground truth.  The raw cache
+ * reads here run without the VM's lazy-fault handler installed, so they
+ * exercise the mapping itself rather than the fault path.
+ */
 #include "ocerz/cache.h"
 
 #include <stdio.h>
@@ -10,7 +14,6 @@ static int checks, fails;
 
 int main(void)
 {
-    /* Raw cache reads here run without the VM's lazy-fault handler. */
     setenv("OCERZ_EAGER_SLIDE", "1", 1);
 
     OcerzCache c;

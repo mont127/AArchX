@@ -1,4 +1,25 @@
-/* Decoder contract: X86Insn is the exchange format between decoder, interpreter and JIT. */
+/*
+ * Decoder contract: X86Insn is the exchange format between the decoder, the
+ * interpreter and the JIT.
+ *
+ * Two rules govern how this enum grows.  The i386-only one-byte opcodes are
+ * appended at the very END so every pre-existing OcerzOp keeps the numeric
+ * value it had and nothing is renumbered - none of them is reachable from
+ * 64-bit decode, where those bytes stay OCERZ_EUNDEF exactly as before.  The
+ * AVX-only operations (VEX encodings with no legacy SSE twin) are appended
+ * above OCERZ_OP_SSE_FIRST so the interpreter routes them to the SSE unit.
+ *
+ * There is no separate segment-register operand kind.  MOVSEG already encodes
+ * its destination sreg as a size-1 immediate holding the segment INDEX, and
+ * PUSHSEG/POPSEG follow that convention; the width actually moved on the stack
+ * lives in insn.opsize, not in the operand.
+ *
+ * ocerz_decode() is the 64-bit long-mode decoder and always has been;
+ * ocerz_decode_mode() takes the mode explicitly, with mode32=1 selecting i386
+ * semantics - 32-bit default operand and address size, no REX, AH..BH byte
+ * registers, an absolute rather than RIP-relative mod=00 rm=101, and 16-bit
+ * addressing under 0x67.
+ */
 #ifndef OCERZ_DECODE_H
 #define OCERZ_DECODE_H
 
@@ -457,10 +478,6 @@ enum OcerzOp {
     OCERZ_OP_AESKEYGENASSIST,
     OCERZ_OP_PCLMULQDQ,
 
-    /* i386-only one-byte opcodes.  Appended at the very END of the enum so
-     * that every pre-existing OcerzOp keeps the numeric value it had; nothing
-     * is renumbered.  None of these is reachable from 64-bit decode -- the
-     * opcode bytes stay OCERZ_EUNDEF in long mode exactly as before. */
     OCERZ_OP_PUSHA,
     OCERZ_OP_POPA,
     OCERZ_OP_PUSHSEG,
@@ -488,12 +505,8 @@ enum OcerzOp {
     OCERZ_OP_PCMPISTRM,
     OCERZ_OP_PCMPISTRI,
 
-    /* mov r/m16, Sreg: the selector is CPU state, read at run time. */
     OCERZ_OP_MOVFROMSEG,
 
-    /* AVX-only operations (VEX encodings without a legacy SSE twin).
-     * Appended after everything else, above OCERZ_OP_SSE_FIRST, so the
-     * interpreter routes them to the SSE unit. */
     OCERZ_OP_VBROADCASTSS,
     OCERZ_OP_VBROADCASTSD,
     OCERZ_OP_VBROADCASTF128,
@@ -511,12 +524,6 @@ enum OcerzOp {
     OCERZ_OP_COUNT,
 };
 
-/* Segment-register numbering as it appears in a ModRM reg field and in the
- * 0x06/0x07/0x0e/0x16/0x17/0x1e/0x1f opcodes.  OCERZ_OP_PUSHSEG/POPSEG carry
- * one of these in ops[0] as an OCERZ_OPK_IMM of size 1 -- the same convention
- * OCERZ_OP_MOVSEG already uses for its destination sreg: the immediate is a
- * segment *index*, not a value, and the width actually moved on the stack is
- * in insn.opsize. */
 enum OcerzSreg {
     OCERZ_SREG_ES = 0,
     OCERZ_SREG_CS = 1,
@@ -550,25 +557,19 @@ typedef struct X86Insn {
     uint8_t seg;
     uint8_t cc;
     uint8_t nops;
-    uint8_t mode32;   /* 1 if decoded in i386 (32-bit) mode, 0 in long mode */
-    uint8_t vex;      /* OCERZ_VEX_* flags: AVX (VEX-encoded) form of the op */
-    uint8_t vvvv;     /* VEX.vvvv register (already inverted): src1 for NDS ops */
+    uint8_t mode32;
+    uint8_t vex;
+    uint8_t vvvv;
     X86Operand ops[3];
 } X86Insn;
 
-/* X86Insn.vex */
 #define OCERZ_VEX_PRESENT 0x01
-#define OCERZ_VEX_L       0x02   /* 256-bit (ymm) form */
+#define OCERZ_VEX_L       0x02
 #define OCERZ_VEX_W       0x04
-#define OCERZ_VEX_NDS     0x08   /* dst = op(xmm[vvvv], rm): the first source is vvvv, not the destination */
-#define OCERZ_VEX_NDD     0x10   /* shift-by-immediate: ops[0] = xmm[vvvv] (dst), ops[2] = rm (src) */
-#define OCERZ_VEX_IS4     0x20   /* blendv: the mask register sits in ops[2] (imm8[7:4]) */
+#define OCERZ_VEX_NDS     0x08
+#define OCERZ_VEX_NDD     0x10
+#define OCERZ_VEX_IS4     0x20
 
-/* Decode one instruction.  ocerz_decode() is the 64-bit long-mode decoder and
- * always has been; ocerz_decode_mode() takes the mode explicitly, with
- * mode32=1 selecting i386 semantics (32-bit default operand and address size,
- * no REX, AH..BH byte registers, absolute rather than RIP-relative
- * mod=00 rm=101, 16-bit addressing under 0x67). */
 int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out);
 int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
                       X86Insn *out, int mode32);

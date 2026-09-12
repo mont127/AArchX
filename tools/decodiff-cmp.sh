@@ -1,12 +1,14 @@
 #!/bin/sh
 # decodiff-cmp.sh <pristine-tree> <patched-tree>
-# Builds the harness against each tree's src/decode.o and reports every
-# 64-bit decode difference.  Exit 0 iff there are none.
+#
+# Builds the harness against each tree's src/decode.o and reports every 64-bit
+# decode difference. Exit 0 iff there are none.
+#
+# ALWAYS rebuilds: a stale decode.o copied around by cp -R silently produces a
+# false "IDENTICAL", which is the worst possible failure mode for a gate.
 set -e
 A="$1"; B="$2"; W="${TMPDIR:-/tmp}/decodiff.$$"
 mkdir -p "$W"
-# ALWAYS rebuild: a stale decode.o copied around by cp -R silently produces a
-# false "IDENTICAL", which is the worst possible failure mode for a gate.
 for T in "$A" "$B"; do (cd "$T" && touch src/decode.c && make -s src/decode.o); done
 clang -arch arm64 -O2 -I"$A/include" -o "$W/da" "$(dirname "$0")/decodiff.c" "$A/src/decode.o"
 clang -arch arm64 -O2 -I"$B/include" -o "$W/db" "$(dirname "$0")/decodiff.c" "$B/src/decode.o"

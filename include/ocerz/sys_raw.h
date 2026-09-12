@@ -1,4 +1,6 @@
-/* Where Ocerz enters the arm64 kernel directly, bypassing libSystem. */
+/*
+ * Where Ocerz enters the arm64 kernel directly, bypassing libSystem.
+ */
 #ifndef OCERZ_SYS_RAW_H
 #define OCERZ_SYS_RAW_H
 

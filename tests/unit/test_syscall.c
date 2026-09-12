@@ -1,4 +1,12 @@
-/* Unit tests for the guest syscall boundary. */
+/*
+ * Unit tests for the guest syscall boundary.
+ *
+ * Two behaviours here are deliberate and easy to "fix" wrongly.  A machdep
+ * call hands the base back in rax, not a selector (probed under Rosetta
+ * 2026-09-04).  And an unknown syscall fails the call rather than killing the
+ * thread: aborting left Wine deadlocked when the thread died holding the
+ * loader lock.  OCERZ_STRICT_SYSCALL restores the abort for bring-up.
+ */
 #include "ocerz/vm.h"
 #include "ocerz/syscall.h"
 #include "ocerz/mem.h"
@@ -404,8 +412,6 @@ static void test_machdep_gs_base(void)
     CHECK(r == OCERZ_STEP_OK);
     CHECK(cf(cpu) == 0);
     CHECK(cpu->gs_base == tls);
-    /* XNU hands the base back in rax, not a selector (probed under Rosetta
-     * 2026-09-04; see machdep_ret). */
     CHECK(cpu->gpr[OCERZ_RAX] == tls);
 }
 
@@ -1551,9 +1557,6 @@ static void test_fork_dual_return(void)
 
 static void test_unknown_bsd(void)
 {
-    /* An unknown syscall fails the call rather than killing the thread:
-     * aborting left wine deadlocked when the thread died holding the
-     * loader lock. OCERZ_STRICT_SYSCALL restores the abort. */
     OcerzCPU *cpu = &vm.cpu;
     set_args(cpu, bsd(9999), 0, 0, 0, 0, 0, 0);
     int r = ocerz_handle_syscall(&vm, cpu);

@@ -1,4 +1,8 @@
-/* The plain-to-ordered JIT retire on the first shared mapping. */
+/*
+ * The plain-to-ordered JIT retire on the first shared mapping: a process runs
+ * in the single-observer memory model until a second observer appears, and
+ * this pins that the transition actually retires the plain-model code.
+ */
 #include "ocerz/cpu.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"

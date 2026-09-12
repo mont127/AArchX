@@ -1,4 +1,6 @@
-/* Project name and version, printed by `ocerz version`. */
+/*
+ * Project name and version, printed by `ocerz version`.
+ */
 #ifndef OCERZ_VERSION_H
 #define OCERZ_VERSION_H
 

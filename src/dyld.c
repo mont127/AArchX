@@ -1,4 +1,117 @@
-/* Mini-dyld: loads, links and launches a dynamic x86_64 executable against the shared cache. */
+/*
+ * Mini-dyld: loads, links and launches a dynamic x86_64 executable against the
+ * shared cache.
+ *
+ * ---- binding ----
+ * A cache dependency is bound in the SPECIFIC dylib the image linked, not by a
+ * flat search across every cache image: openssl links libcrypto.46.dylib
+ * (3.3.6) while the cache also holds libcrypto.44 (2.8.3) exporting the same
+ * names, and the flat fallback bound OpenSSL_version to .44 and reported the
+ * wrong version.  In the export trie, a terminal size of 0 with the name fully
+ * consumed is not a miss: the node carries an empty edge to the terminal child,
+ * which happens whenever a symbol is a strict prefix of others (_libiconv
+ * versus _libiconv_open), so the search falls through to the child.
+ *
+ * Real dyld maps each segment with its initprot; this one maps every image
+ * read-write so the copy and the fixups can land, then gives __TEXT its real
+ * protection once fixups are done.  Leaving it writable is not merely untidy:
+ * code sitting in a writable slot is treated as possibly self-modifying, and a
+ * write-trapped page costs a fault per store to its data neighbours.
+ *
+ * ---- the initial stack ----
+ * Every argument and environment entry goes onto the guest stack, counted first
+ * and sized to the real need.  The arrays were once fixed at 64 with the
+ * environment cut at 60, which silently dropped the last variables of a large
+ * environment - and Wine's loader marks its one-time re-exec by appending
+ * WINELOADERNOEXEC=1, so a launch with one variable too many re-exec'd every
+ * Wine process forever (2026-09-06, Steam).  The three vectors are one
+ * contiguous ascending run - argv NULL envp NULL apple NULL - because that is
+ * what XNU's exec path produces and libSystem relies on it: apple is not passed
+ * anywhere, it is found by walking off the end of envp.  Stacking them downward
+ * instead put the argv vector where apple belongs, so that walk ran past argv's
+ * terminator into the string area and handed strlen() the bytes of
+ * "th_port=0x..." as a pointer, and python3 died there.
+ *
+ * ---- initializers ----
+ * Getting this phase right is most of the file.  Whether a program pulls in
+ * CoreFoundation/Foundation/AppKit cannot be asked of the main executable's own
+ * load commands, because a .app is a small stub linking one umbrella framework
+ * and libSystem - Safari, a Cocoa app by any measure, read as "not a CF
+ * program" and skipped the dependency-ordered phase entirely.  But libSystem's
+ * own closure is deliberately not followed either: libxpc weak-links
+ * XPCSupport, which links Foundation, so descending there makes every
+ * dynamically linked program look like a Cocoa app, /usr/bin/sort included.
+ *
+ * The eager set is closed under dependencies as well as over data references,
+ * because the walk recurses into every dependency but only RUNS the
+ * initializers of images in the set - so an image in it whose dependency is
+ * missing gets initialized on top of an uninitialized library.  That is how
+ * Safari aborted in an Engram static initializer that called operator new
+ * before libc++abi's own initializer had run.
+ *
+ * The order is dyld's: per image and bottom-up, that image's objc load
+ * notification and then its own initializers, with every dependency already
+ * finished.  Neither global order works - all +load first runs SiriTTSService's
+ * ahead of libc++'s initializer, and all initializers first recurses
+ * libsystem_malloc into its own zone setup.  Pruning on the done flag is what
+ * keeps the walk small: libSystem's closure is marked done the moment
+ * libSystem_initializer returns, so a library whose only dependency is
+ * libSystem stops right there instead of descending through libxpc into
+ * Foundation and dragging the whole system into its subtree.  Its objc load
+ * notifications are therefore delivered before that prune can hide them.
+ * LC_LOAD_UPWARD_DYLIB is skipped on purpose: an upward link is how a library
+ * declares the back edge of a dependency cycle and is an ordering edge for
+ * nothing.  Following it made CoreFoundation's upward link to
+ * CoreServicesInternal a real edge, which put QuickLookThumbnailing, SiriTTS
+ * and CoreML inside libc++abi's subtree, and libc++abi then sat unfinished on
+ * the recursion stack while MLAssetIO's initializer called operator new into a
+ * libc++ that had not been initialized yet.
+ *
+ * ---- thread-local variables ----
+ * Two descriptor layouts share the same 24 bytes.  A static linker emits the
+ * classic tlv_descriptor { thunk, key:u64, offset:u64 }, so the offset is at
+ * +0x10; the shared cache ships the packed form dyld uses now - { thunk,
+ * key:u32, offset:u32, initialContentDelta:i32, initialContentSize:u32 } -
+ * where the offset is the u32 at +0xc and +0x10 is the delta.  We always WRITE
+ * the packed form, so reading +0x10 unconditionally took the delta (0) for a
+ * cache image and stored it over the real offset: every thread-local in the
+ * image collapsed onto offset 0 and they all aliased each other.  SwiftUI reads
+ * a thread-local holding its current PropertyList element that way, got the
+ * small integer living at block offset 0, and cast it unconditionally to a
+ * class - "Could not cast value of type 'NSIndirectTaggedPointerString'".  A
+ * key is small enough that a classic descriptor's u64 leaves +0xc zero, so a
+ * non-zero +0xc means the packed form is already there.
+ *
+ * ---- the hand-built main thread ----
+ * libpthread caches __thread_selfid() at TSD base - 8, and guest libpthread
+ * only fills it in _pthread_set_self_internal, which the hand-built main thread
+ * never runs - so pthread_threadid_np() returned 0 on it.  The pthread firstfit
+ * mutex protocol stores that tid as the lock owner, and owner 0 looks UNLOCKED,
+ * so any mutex taken by the main thread had no mutual exclusion at all against
+ * other threads (CFRunLoopSource locks among them): lost psynch wakes,
+ * corrupted signaled flags, and the explorer sync freeze.
+ *
+ * OCERZ_DLOPEN_PIGGYBACK loads a chosen dylib, guest initializers and all,
+ * right after the first dlopen whose path matches - a probe placed inside the
+ * real process, on the same thread, at the same point in its life.
+ *
+ * ---- the executable's own identity ----
+ * The main-executable path is realpath()'d so the guest always sees an
+ * ABSOLUTE exec path - it feeds executable_path=, the DynFrame exec_path and
+ * the host path used for matching.  Real macOS always resolves argv[0] to
+ * absolute, and without it a `./prog` launch gave a relative
+ * _dyld_get_image_name(0) and _NSGetExecutablePath: Steam's tier1 built
+ * "/../Steam.AppBundle/..." out of one and V_RemoveDotSlashes asserted.
+ * Pinned by the dynamic test exec_abspath.
+ *
+ * A dlopen of the main executable's own path returns the already-loaded main
+ * image rather than mapping a second copy, matched against that host path raw
+ * or realpath'd.  Native dyld never loads a second copy of the running
+ * executable; deduping only against the loaded-image list was not enough, so
+ * Steam's bootstrapper dlopening its own steam_osx mapped a duplicate, which
+ * gave duplicate GURLHelper and UpdateEventHandlers objc classes and crashed
+ * steamui on a null vtable.  Pinned by the dynamic test dlopen_self.
+ */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
@@ -145,8 +258,6 @@ uint64_t ocerz_main_mh;
 
 static OcerzCache *g_run_cache;
 
-/* OCERZ_EXCLOG: resolve a symbol in the guest's shared cache so a diagnostic
- * can trap it (e.g. _objc_exception_throw).  Returns 0 when unavailable. */
 uint64_t ocerz_dyld_resolve_guest_sym(const char *name)
 {
     if (!g_run_cache || !name) return 0;
@@ -381,10 +492,6 @@ static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int 
     const char *s = sym;
     while (p < end) {
         uint64_t term = self_uleb(&p, end);
-        /* term==0 with the name consumed is not a miss: the node carries an
-         * empty edge to the terminal child (happens when a symbol is a strict
-         * prefix of others, e.g. _libiconv vs _libiconv_open).  Fall through
-         * to the child search, where the empty edge matches. */
         if (*s == '\0' && term != 0) {
             const uint8_t *tp = p;
             uint64_t flags = self_uleb(&tp, end);
@@ -478,8 +585,6 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
             if (!dep)
                 dep = dimg_find_by_path(tgt);
             if (!dep && tgt[0] == '@') {
-                /* relocatable install name: the dep is recorded under its
-                 * resolved path, so expand against this image first */
                 char ex[1024];
                 if (expand_at_prefix(img, tgt, ex, sizeof ex)) {
                     dep = dimg_find_by_path(ex);
@@ -489,12 +594,6 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
             }
             if (dep)
                 value = ocerz_image_self_resolve_ex(dep, name, &found);
-            /* Two-level namespace for a CACHE dependency: bind the symbol in
-             * the specific linked dylib, not by a flat search across every
-             * cache image.  openssl links libcrypto.46.dylib (3.3.6) but the
-             * cache also holds libcrypto.44 (2.8.3) exporting the same names;
-             * the flat fallback below bound OpenSSL_version to .44 and reported
-             * the wrong version. */
             if (!found && !dep && tgt[0] != '@')
                 value = ocerz_cache_resolve_in_image(cache, tgt, name, &found);
         }
@@ -511,12 +610,6 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
     return value;
 }
 
-/* Real dyld maps each segment with its initprot; ours maps every image
- * read-write so the copy and the fixups can land.  Once fixups are done,
- * give __TEXT (any segment without write in its initprot) its real
- * protection: code that sits in a writable slot is treated as possibly
- * self-modifying by the JIT (ocerz_mem_arm_exec) and a write-trapped
- * page costs a fault per store to its data neighbours. */
 static void protect_ro_segments(DynImage *img)
 {
     static int dis = -1;
@@ -816,13 +909,6 @@ static uint64_t put_str(uint64_t *sp, const char *s)
 
 static int build_frame(const char *path, int argc, char **argv, char **envp, DynFrame *out)
 {
-    /* Every argument and environment entry goes onto the guest stack: the
-     * arrays were fixed at 64 and the environment cut at 60 entries, which
-     * silently dropped the last variables of a large environment.  Wine's
-     * loader marks its one-time re-exec by appending WINELOADERNOEXEC=1, so
-     * a launch with one variable too many re-exec'd every wine process
-     * forever (2026-09-06, Steam).  Count first, size the string area to
-     * the real need, allocate the pointer arrays by count. */
     int envc = 0;
     while (envp && envp[envc])
         envc++;
@@ -878,14 +964,6 @@ static int build_frame(const char *path, int argc, char **argv, char **envp, Dyn
 
     sp &= ~0xfull;
 
-    /* The three vectors are one contiguous ascending run --
-     * argv NULL envp NULL apple NULL -- because that is the layout XNU's
-     * exec path produces and libSystem relies on it: apple is not passed
-     * anywhere, it is found by walking off the end of envp
-     * (apple = &envp[envc + 1]).  Stacking them downward instead put the
-     * argv vector where apple belongs, so that walk ran past argv's
-     * terminator into the string area and handed strlen() the bytes of
-     * "th_port=0x..." as a pointer.  python3 died there. */
     uint64_t vec_bytes = ((uint64_t)argc + 1 + (uint64_t)envc + 1 +
                           (uint64_t)applec + 1) * 8;
     uint64_t argv_arr = (sp - vec_bytes) & ~0xfull;
@@ -960,8 +1038,6 @@ static uint64_t find_dylib_init(OcerzCache *cache, const char *substr)
     return 0;
 }
 
-/* image path -> mach header: hash table built once over the cache's image
- * table (thousands of images, looked up for every dependency of every image) */
 #define DEPMAP_BITS 13
 static struct { const char *path; uint64_t mh; } g_depmap[1u << DEPMAP_BITS];
 static int g_depmap_built;
@@ -979,7 +1055,7 @@ static void depmap_build(OcerzCache *cache)
         if (!mh || !p) continue;
         uint32_t h = depmap_hash(p) & ((1u << DEPMAP_BITS) - 1);
         while (g_depmap[h].path) {
-            if (strcmp(g_depmap[h].path, p) == 0) break;      /* first wins, like the linear scan */
+            if (strcmp(g_depmap[h].path, p) == 0) break;
             h = (h + 1) & ((1u << DEPMAP_BITS) - 1);
         }
         if (!g_depmap[h].path) { g_depmap[h].path = p; g_depmap[h].mh = mh; }
@@ -1144,19 +1220,6 @@ static void eager_add_direct_deps(OcerzCache *cache, uint64_t mh)
     }
 }
 
-/* Does this program pull in CoreFoundation / Foundation / AppKit through its
- * own frameworks?  img.links_cf asks the same question of the main
- * executable's own load commands, which is the wrong depth for an
- * application bundle: a .app is a small stub that links one umbrella
- * framework and libSystem and nothing else, so Safari -- a Cocoa app by any
- * measure -- read as "not a CF program" and skipped the dependency-ordered
- * initializer phase completely.
- *
- * libSystem's own closure is deliberately not followed.  libxpc weak-links
- * XPCSupport, which links Foundation, so descending there makes *every*
- * dynamically linked program look like a Cocoa app -- /usr/bin/sort included
- * -- and turns the initializer phase on for all of them.  Names only, no
- * section scanning: this runs before compute_eager_set(). */
 static int is_libsystem_path(const char *p)
 {
     return strstr(p, "/usr/lib/system/") != NULL ||
@@ -1218,15 +1281,6 @@ static void compute_eager_set(OcerzCache *cache, uint64_t main_mh)
             eager_add(mh);
     }
     int root_n = g_eager_n;
-    /* Close the set under dependencies as well as over data references.
-     * run_init_phase() recurses into every dependency but only *runs* the
-     * initializers of images in this set, so an image here whose dependency
-     * is missing gets initialized on top of an uninitialized library.  That
-     * is how Safari aborted in an Engram static initializer that called
-     * operator new before libc++abi's own initializer had run: libc++abi is
-     * not under /usr/lib/system/, is not a direct dependency of the stub, and
-     * no scanned pointer happened to land in it.  g_eager_n grows as this
-     * loop runs, so appending inside it walks the whole closure. */
     for (int i = 0; i < g_eager_n; i++) {
         eager_add_direct_deps(cache, g_eager[i]);
         scan_uses(g_eager[i]);
@@ -1324,21 +1378,6 @@ static void ocerz_tlv_register_image(OcerzVM *vm, OcerzCache *cache, uint64_t mh
     uint64_t descs_rt = (uint64_t)((int64_t)vars_addr + slide);
     for (uint64_t off = 0; off + 24 <= vars_size; off += 24) {
         uint64_t desc = descs_rt + off;
-        /* Two descriptor layouts share the same 24 bytes.  A static linker
-         * emits the classic tlv_descriptor { thunk, key:u64, offset:u64 },
-         * so the offset is the 8 bytes at +0x10.  The shared cache ships the
-         * packed form dyld uses now -- { thunk, key:u32, offset:u32,
-         * initialContentDelta:i32, initialContentSize:u32 } -- where the
-         * offset is the u32 at +0xc and +0x10 is the delta.  We always WRITE
-         * the packed form, so reading +0x10 unconditionally took the delta
-         * (0) for a cache image and then stored that over the real offset:
-         * every thread-local in the image collapsed onto offset 0 and they
-         * all aliased each other.  SwiftUI reads a thread-local holding its
-         * current PropertyList element that way, got the small integer that
-         * lives at block offset 0, and unconditionally cast it to a class --
-         * "Could not cast value of type 'NSIndirectTaggedPointerString'".
-         * A key is small enough that a classic descriptor's u64 leaves +0xc
-         * zero, so a non-zero +0xc means the packed form is already there. */
         uint32_t packed_off = (uint32_t)ocerz_ld(desc + 0xc, 4);
         uint32_t var_off = packed_off ? packed_off
                                       : (uint32_t)ocerz_ld(desc + 0x10, 8);
@@ -1625,12 +1664,6 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
     const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
     if (rd32(h) != MH_MAGIC_64)
         return;
-    /* Pruning on g_init_done is what keeps this walk small: the libSystem
-     * closure is marked done the moment libSystem_initializer returns, so a
-     * library whose only dependency is libSystem -- libc++abi, say -- stops
-     * right there and initializes early, instead of descending through
-     * libxpc into Foundation and dragging the whole system into its own
-     * subtree. */
     int idx = init_mark(mh);
     if (idx >= 0 && (g_init_done[idx] || g_init_gen[idx] == g_init_cur_gen)) {
         if (getenv("OCERZ_INITTRACE"))
@@ -1661,15 +1694,6 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
     }
     for (uint32_t j = 0; j < ncmds; j++) {
         uint32_t cmd = rd32(lc);
-        /* LC_LOAD_UPWARD_DYLIB is skipped on purpose.  An upward link is how a
-         * library declares the back edge of a dependency cycle -- "I need
-         * this, but it needs me, so do not wait for it" -- and it is an
-         * ordering edge for nothing.  Following it made CoreFoundation's
-         * upward link to CoreServicesInternal a real edge, which put all of
-         * QuickLookThumbnailing, SiriTTS and CoreML inside libc++abi's
-         * dependency subtree: libc++abi then sat unfinished on the recursion
-         * stack while MLAssetIO's initializer ran and called operator new
-         * into a libc++ that had not been initialized yet. */
         if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
             cmd == LC_REEXPORT_DYLIB) {
             uint32_t noff = rd32(lc + 8);
@@ -1690,12 +1714,6 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
     if (vm->exited)
         return;
     if (mh != skip_mh && (g_init_force || g_eager_n == 0 || eager_has(mh))) {
-        /* dyld's order, per image and bottom-up: this image's objc load
-         * notification (its +load methods) and then its own initializers,
-         * with every dependency already finished.  Neither global order
-         * works: all +load first runs SiriTTSService's ahead of libc++'s
-         * initializer, and all initializers first recurses libsystem_malloc
-         * into its own zone setup. */
         if (idx < 0 || !g_load_done[idx]) {
             ocerz_dyldapi_run_image_loads(vm, mh, stack_top);
             if (idx >= 0)
@@ -1707,8 +1725,6 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
         if (idx >= 0)
             g_init_done[idx] = 1;
     } else if (getenv("OCERZ_INITLOG")) {
-        /* an image with initializers that never runs them is the shape of an
-         * ordering bug: say so rather than leaving it silent */
         fprintf(stderr, "INITSKIP mh=%#llx eager=%d is_libsystem=%d\n",
                 (unsigned long long)mh, eager_has(mh), mh == skip_mh);
     }
@@ -1733,7 +1749,7 @@ static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t
     for (uint32_t j = 0; j < ncmds; j++) {
         uint32_t cmd = rd32(lc);
         if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
-            cmd == LC_REEXPORT_DYLIB) {   /* upward links are not ordering edges */
+            cmd == LC_REEXPORT_DYLIB) {
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4))
                 run_load_phase(vm, cache, dep_mh(cache, (const char *)(lc + noff)),
@@ -2260,10 +2276,6 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
     }
     if (g_dlerror_g)
         ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
-    /* diagnostic piggyback: OCERZ_DLOPEN_PIGGYBACK="<substr>:<dylib>" loads
-     * <dylib> (guest initializers and all) right after the first dlopen whose
-     * path contains <substr> -- puts a probe INSIDE the real process, on the
-     * same thread, at the same point in its life. */
     {
         static char pig_key[256], pig_lib[1024];
         static int pig = -1, pig_done;
@@ -2283,7 +2295,7 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
             pig_done = 1;
             fprintf(stderr, "ocerz: PIGGYBACK[%d] after \"%s\": dlopen \"%s\"\n",
                     (int)getpid(), loadpath, pig_lib);
-            uint64_t pb = ocerz_dlopen_inner(vm, pig_lib, 2 /* RTLD_NOW */);
+            uint64_t pb = ocerz_dlopen_inner(vm, pig_lib, 2);
             fprintf(stderr, "ocerz: PIGGYBACK[%d] -> %#llx\n", (int)getpid(), (unsigned long long)pb);
         }
     }
@@ -2494,15 +2506,6 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     vm->cpu.gs_base = gs;
     ocerz_st(gs, 8, self);
     {
-        /* libpthread caches __thread_selfid() at TSD base - 8
-         * (_PTHREAD_STRUCT_DIRECT_THREADID_OFFSET).  Guest libpthread only
-         * fills it in _pthread_set_self_internal, which the hand-built main
-         * thread never runs, so pthread_threadid_np()/_pthread_selfid_direct
-         * returned 0 on the main thread.  The pthread firstfit mutex protocol
-         * stores that tid as the lock owner: owner 0 looks UNLOCKED, so any
-         * mutex taken by the main thread had no mutual exclusion at all
-         * against other threads (CFRunLoopSource locks!) -> lost psynch
-         * wakes, corrupted signaled flags, the explorer sync freeze. */
         uint64_t htid = 0;
         pthread_threadid_np(NULL, &htid);
         ocerz_st(gs - 8, 8, htid);
@@ -2583,12 +2586,6 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
             ocerz_tlv_register_closure(vm, &cache, img.load_base, fr.stack_top);
             if (vm->exited)
                 return vm->exit_code;
-            /* The libSystem closure is already initialized -- its
-             * initializers ran inside libSystem_initializer and
-             * init_mark_done_closure() recorded that -- so the walk below
-             * prunes it.  Deliver its objc load notifications here, before
-             * that prune hides them; everything else gets its notification
-             * interleaved with its initializers, the way dyld does it. */
             g_init_cur_gen++;
             run_load_phase(vm, &cache, libsys, fr.stack_top, 0);
             if (vm->exited)

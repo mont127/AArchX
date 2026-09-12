@@ -1,4 +1,22 @@
-/* Shared inline operand machinery for the interpreter translation units. */
+/*
+ * Shared inline operand machinery for the interpreter translation units.
+ *
+ * The stack pointer is RSP in long mode and ESP in i386 mode, so in 32-bit mode
+ * every update wraps at 32 bits instead of 64, and the address is SS:ESP, which
+ * wraps the same way.  The mode always comes from the decoded instruction,
+ * never from a test inside the emitted code.  The plain push/pop entry points
+ * delegate with mode32 = 0, which is the identity, so no 64-bit behaviour
+ * changes; the JIT's 32-bit POP/RET express the same rule with a UXTW-indexed
+ * load at zero instruction cost.
+ *
+ * The absolute gs:[0x58] form is special-cased.  Wine on macOS runs 64-bit PE
+ * code with gs at the Darwin TSD and mirrors the TEB fields PE code reads into
+ * the wine-reserved slots, but ThreadLocalStoragePointer is the one field that
+ * changes after the mirror is taken - so a thread whose snapshot preceded its
+ * TLS setup reads 0 and MSVC __declspec(thread) code crashes.  Slot 6 holds the
+ * TEB self pointer on wine threads and is 0 on everything else, so indirecting
+ * through it yields the live field and is self-selecting.
+ */
 #ifndef OCERZ_INTERP_COMMON_H
 #define OCERZ_INTERP_COMMON_H
 
@@ -22,20 +40,12 @@ static inline uint64_t ocerz_ea(const OcerzCPU *cpu, const X86Insn *insn, const 
         if (insn->addrsize == 4)
             a = (uint32_t)a;
         else if (insn->addrsize == 2)
-            a = (uint16_t)a;   /* 32-bit mode + 0x67; addrsize is never 2 in long mode */
+            a = (uint16_t)a;
     }
     if (insn->seg == OCERZ_SEG_FS)
         a += cpu->fs_base;
     else if (insn->seg == OCERZ_SEG_GS) {
         a += cpu->gs_base;
-        /* Wine on macOS runs 64-bit PE code with gs at the darwin TSD and
-         * mirrors the TEB fields PE code reads into the wine-reserved slots.
-         * ThreadLocalStoragePointer (0x58) is the one of them that changes
-         * after the mirror is taken, so a thread whose snapshot preceded its
-         * TLS setup reads 0 and MSVC __declspec(thread) code crashes.  Slot 6
-         * (0x30) holds the TEB self pointer on wine threads and is 0 on
-         * everything else, so indirecting the exact gs:[0x58] absolute form
-         * through it yields the live field and is self-selecting. */
         if (op->disp == 0x58 && op->base == OCERZ_REG_NONE &&
             op->index == OCERZ_REG_NONE && !op->riprel &&
             insn->addrsize == 8 && (cpu->gs_base >> 32) != 0) {
@@ -122,12 +132,6 @@ static inline void ocerz_write_op128(OcerzCPU *cpu, const X86Insn *insn, const X
         ocerz_st(ocerz_ea(cpu, insn, op), op->size, v.lo);
 }
 
-/* The stack pointer is RSP in long mode and ESP in i386 mode, so in 32-bit
- * mode every update wraps at 32 bits instead of 64.  The mode comes from the
- * decoded instruction, never from a test inside the emitted code.
- *
- * ocerz_push()/ocerz_pop() keep their exact 64-bit behaviour by delegating
- * with mode32 = 0; nothing that calls them today changes. */
 static inline uint64_t ocerz_stack_wrap(uint64_t sp, int mode32)
 {
     return mode32 ? (uint32_t)sp : sp;
@@ -142,11 +146,6 @@ static inline void ocerz_push_mode(OcerzCPU *cpu, int size, uint64_t v, int mode
 
 static inline uint64_t ocerz_pop_mode(OcerzCPU *cpu, int size, int mode32)
 {
-    /* The address is SS:ESP, i.e. it wraps at 32 bits like every other i386
-     * address -- ocerz_push_mode already stored through a wrapped pointer, so
-     * only the load was reading an untruncated rsp.  mode32 = 0 is the
-     * identity, so no 64-bit behaviour changes; the JIT's 32-bit POP/RET use
-     * a UXTW-indexed load, which is the same rule at zero instruction cost. */
     uint64_t v = ocerz_ld(ocerz_stack_wrap(cpu->gpr[OCERZ_RSP], mode32), size);
     cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(cpu->gpr[OCERZ_RSP] + (uint64_t)size, mode32);
     return v;

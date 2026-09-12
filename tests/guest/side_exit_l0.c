@@ -8,17 +8,17 @@ __asm__(".text\n.globl _xk\n_xk:\n"
         "  pushq %rbp\n  movq %rsp, %rbp\n  pushq %rbx\n"
         "  xorpd %xmm7, %xmm7\n"
         "1:\n"
-        "  movsd (%rsi), %xmm1\n"        /* a */
-        "  movsd 8(%rsi), %xmm2\n"       /* b */
-        "  subsd %xmm1, %xmm2\n"         /* b - a: lane 0 lives in a scratch now */
-        "  movapd %xmm2, %xmm1\n"        /* shares the scratch */
-        "  movq 16(%rsi), %rax\n"        /* flag word, always 0 */
+        "  movsd (%rsi), %xmm1\n"
+        "  movsd 8(%rsi), %xmm2\n"
+        "  subsd %xmm1, %xmm2\n"
+        "  movapd %xmm2, %xmm1\n"
+        "  movq 16(%rsi), %rax\n"
         "  testq %rax, %rax\n"
-        "  je 2f\n"                      /* taken every time: side exit -> chained */
-        "  addsd %xmm7, %xmm7\n"         /* never runs */
+        "  je 2f\n"
+        "  addsd %xmm7, %xmm7\n"
         "  movq %rax, (%rdi)\n"
         "2:\n"
-        "  unpcklpd %xmm2, %xmm1\n"      /* {xmm1.lo, xmm2.lo} as packed */
+        "  unpcklpd %xmm2, %xmm1\n"
         "  addpd %xmm1, %xmm7\n"
         "  decq %rdx\n"
         "  jnz 1b\n"
@@ -33,7 +33,7 @@ int main(void){
         volatile double *vo = out; vo[0] = 0; vo[1] = 0;
         xk(out, in, 5000);
         g_u64 b0, b1; __builtin_memcpy(&b0, &out[0], 8); __builtin_memcpy(&b1, &out[1], 8);
-        put("sum lo ", b0); put("sum hi ", b1);      /* both 12500.0 = 0x40c86a0000000000 */
+        put("sum lo ", b0); put("sum hi ", b1);
     }
     g_puts("done\n");
     return 0;

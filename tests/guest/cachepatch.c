@@ -1,7 +1,12 @@
 /* Reproducer for hot-patching a dyld-shared-cache TEXT page, the way engines
  * that divert a libsystem entry point do it: run the victim first (so it is
  * translated), mprotect its page writable, drop a 6-byte indirect jmp into it,
- * then call it again and check the patch took effect. */
+ * then call it again and check the patch took effect.
+ *
+ * The victim is made hot first so the JIT really holds a translation of those
+ * bytes, and it is then written a second time after the page has been executed
+ * since the last patch - the write-after-translate case a one-shot fix misses.
+ */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -25,7 +30,6 @@ int main(void)
     if (!p_atoi) { printf("a  dlsym(atoi) FAILED\n"); return 1; }
     printf("a  dlsym(atoi) = %p\n", (void *)p_atoi);
 
-    /* make the victim hot so the JIT really has a translation of these bytes */
     long acc = 0;
     for (int i = 0; i < 200000; i++) acc += p_atoi("41");
     if (acc != 200000L * 41) { printf("b  pre-patch atoi wrong (acc=%ld) FAIL\n", acc); fails++; }
@@ -40,7 +44,6 @@ int main(void)
         printf("c  mprotect(%p, 0x2000, RWX) OK\n", (void *)page);
     }
 
-    /* ff 25 02 00 00 00 = jmp qword ptr [rip+2]; then the 8-byte target */
     uint64_t tramp = 0xcccc0000000225ffULL;
     uint64_t target = (uint64_t)(uintptr_t)my_atoi;
     volatile uint64_t *slot = (volatile uint64_t *)p_atoi;
@@ -64,8 +67,6 @@ int main(void)
         printf("f  post-patch call diverted (ret=%d hit=%d) OK\n", r, g_hit);
     }
 
-    /* write again, now that the page has been executed since the last patch:
-     * the write-after-translate case a plain one-shot fix would miss */
     slot[1] = (uint64_t)(uintptr_t)my_atoi;
     r = p_atoi("41");
     if (r != 4242 || g_hit != 2) {

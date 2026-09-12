@@ -12,7 +12,6 @@ __asm__(".text\n"
         "  movq %rsi, %r15\n"
         "  testq %rsi, %rsi\n"
         "  je 1f\n"
-        /* loop-ish path: xmm2 = {tx,ty} from [rsi], xmm1 = {a,b}, xmm3 = {c,d} */
         "  movupd (%rsi), %xmm2\n"
         "  movupd 16(%rsi), %xmm1\n"
         "  movupd 32(%rsi), %xmm3\n"

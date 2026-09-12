@@ -36,15 +36,12 @@ int main(void) {
         mixv4(pk(a, b, k)); mixv4(pk(a, a, k));
         v2d c = { dv[i], dv[j] }, d = { dv[(i+3)&7], k & 1 ? nan : 2.0 };
         mixv2(pkd(c, d, k)); mixv2(pkd(d, c, k));
-        /* compares & conversions */
         mixu(dv[i] < dv[j]); mixu(dv[i] <= dv[j]); mixu(dv[i] == dv[j]); mixu(dv[i] != nan); mixu(nan == nan);
         mixu(fv[i] > fv[j]); mixu(fv[i] >= fv[j]);
         mixu((g_u64)(long)dv[i]); mixu((g_u64)(int)fv[j]); mixd((double)(long)(i * 1000003 - j)); mixf((float)(i - j));
         mixd((double)fv[i]); mixf((float)dv[j]);
-        /* blend-style select (clang emits blendvpd/cmpsd) */
         double s = dv[i] > 1e6 ? 1.0 : dv[i]; mixd(s);
         double t = dv[j] < -1e6 ? 0.5 : dv[j]; mixd(t);
-        /* integer vectors */
         v4i ia = { i, j, i - j, i * j }, ib = { 3, -1, 7, j }; v4i ic = ia + ib, id = ia - ib, ie = ia & ib, ig = ia | ib, ih = ia ^ ib;
         for (int q = 0; q < 4; q++) { mixu((g_u32)ic[q]); mixu((g_u32)id[q]); mixu((g_u32)ie[q]); mixu((g_u32)ig[q]); mixu((g_u32)ih[q]); }
         v2i la = { (long long)i << 33, -(long long)j }, lb = { 1, 2 }; v2i lc = la + lb, ld = la - lb;
@@ -52,7 +49,6 @@ int main(void) {
         v4i eq = (v4i)(ia == ib), gt = (v4i)(ia > ib); mixu((g_u32)eq[0] ^ (g_u32)eq[3]); mixu((g_u32)gt[1] ^ (g_u32)gt[2]);
         v4f cvt = __builtin_convertvector(ia, v4f); mixv4(cvt);
     }
-    /* memcpy/memset lowering (movups/movaps/movdqu paths) */
     static unsigned char buf[4096], buf2[4096];
     for (int i = 0; i < 4096; i++) buf[i] = (unsigned char)(i * 7 + 3);
     for (int len = 1; len < 200; len += 7) { __builtin_memcpy(buf2 + (len & 15), buf + (len & 31), len); mixu(buf2[(len & 15) + len - 1]); }

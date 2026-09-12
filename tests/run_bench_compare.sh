@@ -1,5 +1,6 @@
 #!/bin/zsh
-# Ocerz-vs-Rosetta throughput gate for the benchmark kernels; engine order alternates between reps.
+# Ocerz-vs-Rosetta throughput gate for the benchmark kernels; engine order
+# alternates between reps so a warm-up or thermal drift cannot favour one side.
 
 set -u
 zmodload zsh/datetime || {

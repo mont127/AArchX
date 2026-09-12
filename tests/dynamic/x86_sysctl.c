@@ -1,7 +1,9 @@
-/* The x86 CPU sysctls an x86_64 process sees under Rosetta -- hw.optional.*
- * and machdep.cpu.*, by name and through sysctlnametomib() -- and they must
- * agree with CPUID.  The arm64 kernel has none of these nodes; passed
- * through, every one of them failed with ENOENT. */
+/*
+ * The x86 CPU sysctls an x86_64 process sees under Rosetta - hw.optional.* and
+ * machdep.cpu.*, by name and through sysctlnametomib() - which must agree with
+ * CPUID.  The arm64 kernel has none of these nodes, so passed through, every
+ * one of them failed with ENOENT.
+ */
 #include <cpuid.h>
 #include <stdio.h>
 #include <string.h>

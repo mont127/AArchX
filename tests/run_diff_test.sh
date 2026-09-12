@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Differential gate: every guest binary under -no-jit and under the JIT must match byte for byte.
+# Differential gate: every guest binary under -no-jit and under the JIT must
+# match byte for byte. The interpreter is the reference implementation, so any
+# divergence is a JIT bug by construction.
 
 set -u
 cd "$(dirname "$0")/.."

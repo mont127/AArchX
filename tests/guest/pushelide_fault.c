@@ -1,6 +1,12 @@
 /* Gate for the elided return-address push: a fault INSIDE a spliced leaf
  * frame must find the slot repaired (recovery writes the address back) and
- * unwind exactly. */
+ * unwind exactly.
+ *
+ * Pass 0 warms the block with a harmless stack; pass 1 puts the call push on the
+ * last mapped slot so the leaf's own push faults. What the handler observes in
+ * the slot mid-frame must be the return address - the instruction after the
+ * call.
+ */
 #include "gsys.h"
 
 #define SYS_sigaction   46
@@ -49,7 +55,6 @@ __asm__(
     "    movl  $0x20000b8, %eax\n"
     "    syscall\n"
     "    ud2\n"
-    /* the leaf the JIT splices: pure register frame, elidable */
     ".globl _pe_leaf\n"
     "_pe_leaf:\n"
     "    pushq %rbp\n"
@@ -70,7 +75,7 @@ static void handler(int signo, void *siginfo, void *ucontext)
 {
     (void)signo; (void)siginfo; (void)ucontext;
     g_nfault++;
-    g_slot_seen = *(volatile g_u64 *)g_slot_addr;   /* repaired retaddr? */
+    g_slot_seen = *(volatile g_u64 *)g_slot_addr;
     g_syscall3(SYS(SYS_mprotect), (g_i64)g_fix_lo, PG, PROT_READ | PROT_WRITE);
 }
 
@@ -102,8 +107,6 @@ int main(void)
     g_fix_lo = lo;
     g_slot_addr = hi;
 
-    /* pass 0 warms the block with a harmless stack; pass 1 puts the call
-     * push on the last mapped slot so the leaf's own push faults */
     for (int pass = 0; pass < 2; pass++) {
         g_u64 top = pass == 0 ? hi + 2048 : hi + 8;
         if (pass == 1) {
@@ -132,8 +135,6 @@ int main(void)
                 g_puts("frame fault: rsp WRONG\n");
             else
                 g_puts("frame fault: rsp exact\n");
-            /* the handler observed the slot content mid-frame: it must be
-             * the return address (the instruction after the call) */
             if (g_slot_seen != want)
                 g_puts("frame fault: slot WRONG\n");
             else

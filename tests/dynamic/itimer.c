@@ -1,6 +1,7 @@
-/* setitimer/getitimer: an ITIMER_REAL timer must fire into the guest's
- * SIGALRM handler, and getitimer must report the armed interval.  Both
- * calls came back ENOSYS. */
+/*
+ * setitimer/getitimer: an ITIMER_REAL timer must fire into the guest's SIGALRM
+ * handler, and getitimer must report the armed interval.
+ */
 #include <signal.h>
 #include <stdio.h>
 #include <sys/time.h>

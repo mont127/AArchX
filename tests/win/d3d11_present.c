@@ -1,16 +1,26 @@
-/* Standalone DXGI swap-chain probe: create a visible window, a D3D11 device and a
- * swap chain for that HWND (the path Chromium's ANGLE takes in Steam's GPU process),
- * clear + Present a run of frames, and report every HRESULT and the per-frame time.
- * Under DXMT (MacNCheese Wine) the swap chain needs the window's Metal layer from
- * winemac.drv via an ExtEscape; a failure there prints
- * "Failed to get metal layer via MACDRV_ESCAPE_GET_SURFACE" on stderr.
+/*
+ * Standalone DXGI swap-chain probe: create a visible window, a D3D11 device and
+ * a swap chain for that HWND (the path Chromium's ANGLE takes in Steam's GPU
+ * process), clear + Present a run of frames, and report every HRESULT and the
+ * per-frame time.
  *
- *   x86_64-w64-mingw32-gcc -O1 -o d3d11_present.exe d3d11_present.c -ld3d11 -ldxgi -ldxguid -luser32 -lgdi32
- *   d3d11_present.exe [frames] [flip]          single process (window + swap chain)
- *   d3d11_present.exe xproc [frames] [flip]    window in this process, swap chain in a child
- *                                              process (Steam: browser owns the HWND, the
- *                                              GPU process presents into it)
+ * Under DXMT (MacNCheese Wine) the swap chain needs the window's Metal layer
+ * from winemac.drv via an ExtEscape; a failure there prints "Failed to get
+ * metal layer via MACDRV_ESCAPE_GET_SURFACE" on stderr.
+ *
+ *   x86_64-w64-mingw32-gcc -O1 -o d3d11_present.exe d3d11_present.c \
+ *       -ld3d11 -ldxgi -ldxguid -luser32 -lgdi32
+ *
+ *   d3d11_present.exe [frames] [flip]        single process (window + swap chain)
+ *   d3d11_present.exe xproc [frames] [flip]  window in this process, swap chain
+ *                                            in a child process (Steam's shape:
+ *                                            the browser owns the HWND, the GPU
+ *                                            process presents into it)
  *   d3d11_present.exe client <hwnd> [frames] [flip]   (spawned by xproc)
+ *
+ * The no-D3D mode asks a simpler question - does a plain window keep the height
+ * it is given - and the xproc mode grows the window after a few seconds the way
+ * Steam's login window does (700x74 -> 700x440).
  */
 #define COBJMACROS
 #define INITGUID
@@ -47,7 +57,6 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
     int xproc = argc > 1 && !strcmp(argv[1], "xproc");
     if (argc > 1 && !strcmp(argv[1], "gdi")) {
-        /* no D3D at all: does a plain window keep the height it is given? */
         WNDCLASSW wc = {0};
         wc.lpfnWndProc = wndproc; wc.hInstance = GetModuleHandleW(NULL); wc.lpszClassName = L"gdi_resize";
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
@@ -83,9 +92,6 @@ int main(int argc, char **argv)
     printf("window %p client %ldx%ld visible=%d\n", hwnd, rc.right, rc.bottom, IsWindowVisible(hwnd));
     pump();
     if (xproc) {
-        /* Steam shape: the GPU process presents into a window it does not own.  Spawn
-         * ourselves as the "client" on this HWND and keep pumping the owner's messages;
-         * grow the window after a few seconds like Steam's login window (700x74->700x440). */
         char cmd[512]; STARTUPINFOA si = {0}; PROCESS_INFORMATION pi = {0};
         si.cb = sizeof si;
         snprintf(cmd, sizeof cmd, "\"%s\" client %p %d %s", argv[0], hwnd, frames, flip ? "flip" : "discard");
@@ -177,7 +183,6 @@ static int render_on(HWND hwnd, int frames, int flip, int foreign)
             fflush(stdout);
         }
     }
-    /* resize once (Steam grows the login window 700x74 -> 700x440 after the first frames) */
     if (!foreign) { SetWindowPos(hwnd, NULL, 0, 0, 700, 480, SWP_NOMOVE | SWP_NOZORDER); pump(); }
     else { RECT r2; DWORD tw = GetTickCount(); do { Sleep(50); GetClientRect(hwnd, &r2); } while (r2.bottom == rc.bottom && GetTickCount() - tw < 8000); }
     GetClientRect(hwnd, &rc);

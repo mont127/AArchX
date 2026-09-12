@@ -1,7 +1,9 @@
-// C++ exception unwinding across library boundaries: exceptions thrown from
-// libc++ (std::stoi, vector::at), a deep unwind through 50 frames, a nested
-// rethrow, plus virtual dispatch and STL algorithms.  Exercises the Itanium
-// unwinder, __cxa_throw/catch and RTTI type matching in translated code.
+/*
+ * C++ exception unwinding across library boundaries: exceptions thrown from
+ * libc++ (std::stoi, vector::at), a deep unwind through 50 frames, a nested
+ * rethrow, plus virtual dispatch and STL algorithms.  Exercises the Itanium
+ * unwinder, __cxa_throw/catch and RTTI type matching in translated code.
+ */
 #include <algorithm>
 #include <cstdio>
 #include <map>

@@ -1,4 +1,6 @@
-/* Unit tests for the core interpreter. */
+/*
+ * Unit tests for the core interpreter.
+ */
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/interp.h"

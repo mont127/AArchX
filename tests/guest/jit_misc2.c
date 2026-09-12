@@ -22,7 +22,6 @@ int main(void){
         r = v; __asm__ volatile("btrw %w2, %w0\n\tsetc %b1" : "+r"(r), "=r"(c) : "r"((g_u64)(i * 5 + 3)) : "cc"); put("btr16 rr r ", r); put("btr16 rr c ", c & 0xff);
         r = v; __asm__ volatile("btcq $40, %0\n\tjc 1f\n\tmovq $0x77, %0\n\t1:" : "+r"(r) :: "cc"); put("btc jc ", r);
         r = v; __asm__ volatile("xorl %%eax, %%eax\n\tbtsq $5, %0\n\tpushfq\n\tpopq %1" : "+r"(r), "=r"(f) :: "cc", "rax"); put("bts flags ", f & 0x8d5);
-        /* pinsr / pextr */
         g_u64 lo, hi;
         __asm__ volatile("pxor %%xmm1, %%xmm1\n\tpinsrq $1, %2, %%xmm1\n\tpinsrd $1, %k2, %%xmm1\n\tpinsrw $1, %k2, %%xmm1\n\tpinsrb $3, %k2, %%xmm1\n\tmovq %%xmm1, %0\n\tpextrq $1, %%xmm1, %1"
                          : "=r"(lo), "=r"(hi) : "r"(v) : "xmm1"); put("pinsr lo ", lo); put("pinsr hi ", hi);
@@ -30,14 +29,12 @@ int main(void){
         __asm__ volatile("movq %1, %%xmm2\n\tpextrd $1, %%xmm2, %k0" : "=r"(lo) : "r"(v) : "xmm2"); put("pextrd ", lo);
         volatile g_u32 m32 = 0; volatile unsigned short m16 = 0;
         __asm__ volatile("movq %2, %%xmm2\n\tpextrd $1, %%xmm2, %0\n\tpextrw $0, %%xmm2, %1" : "=m"(m32), "=m"(m16) : "r"(v) : "xmm2"); put("pextrd m ", m32); put("pextrw m ", m16);
-        /* pmovsx / pmovzx from register and memory */
         volatile g_u64 mm = v;
 #define PMOV(insn, tag) __asm__ volatile("movq %2, %%xmm3\n\t" insn " %%xmm3, %%xmm4\n\tmovq %%xmm4, %0\n\tpextrq $1, %%xmm4, %1" : "=r"(lo), "=r"(hi) : "r"(v) : "xmm3", "xmm4"); put(tag " lo ", lo); put(tag " hi ", hi);
 #define PMOVM(insn, tag) __asm__ volatile(insn " %2, %%xmm4\n\tmovq %%xmm4, %0\n\tpextrq $1, %%xmm4, %1" : "=r"(lo), "=r"(hi) : "m"(mm) : "xmm4"); put(tag " lo ", lo); put(tag " hi ", hi);
         PMOV("pmovsxbw", "sxbw") PMOV("pmovsxbd", "sxbd") PMOV("pmovsxbq", "sxbq") PMOV("pmovsxwd", "sxwd") PMOV("pmovsxwq", "sxwq") PMOV("pmovsxdq", "sxdq")
         PMOV("pmovzxbw", "zxbw") PMOV("pmovzxbd", "zxbd") PMOV("pmovzxbq", "zxbq") PMOV("pmovzxwd", "zxwd") PMOV("pmovzxwq", "zxwq") PMOV("pmovzxdq", "zxdq")
         PMOVM("pmovsxbd", "msxbd") PMOVM("pmovzxwq", "mzxwq") PMOVM("pmovsxbq", "msxbq") PMOVM("pmovzxbw", "mzxbw")
-        /* rounding */
         static const double ds[6] = { 2.5, -2.5, 3.7, -0.2, 1e18, -7.5 };
         for (int k = 0; k < 6; k++) {
             g_u64 out;
