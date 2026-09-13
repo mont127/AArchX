@@ -21,6 +21,7 @@ int ocerz_canon_dylib_path(const char *path, char *out, size_t outsz);
 
 void ocerz_dyld_dump_images(void);
 const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out);
+const char *ocerz_dyld_main_path(void);
 uint64_t ocerz_dyld_resolve_guest_sym(const char *name);
 extern uint64_t ocerz_exc_trap_rip;
 

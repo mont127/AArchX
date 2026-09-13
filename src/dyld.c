@@ -371,6 +371,11 @@ const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out)
     return best->install_name[0] ? best->install_name : best->path;
 }
 
+const char *ocerz_dyld_main_path(void)
+{
+    return g_main_hostpath[0] ? g_main_hostpath : NULL;
+}
+
 static int map_segments(DynImage *img, int is_main)
 {
     const uint8_t *mh = img->slice;
