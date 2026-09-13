@@ -2685,6 +2685,24 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                 return vm->exit_code;
             OCERZ_LOG("dynamic: initializer phase complete\n");
             { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("post-init-phase"); }
+        } else if (ran_init && !getenv("OCERZ_NOINITPHASE")) {
+            static uint64_t order[INIT_CLOSURE_CAP];
+            int n = 0;
+            init_collect(&cache, img.load_base, order, &n, INIT_CLOSURE_CAP);
+            for (int i = 0; i < n; i++) {
+                int idx = init_mark(order[i]);
+                if (idx >= 0)
+                    g_init_being[idx] = 0;
+            }
+            for (int i = 0; i < n && !vm->exited; i++)
+                ocerz_tlv_register_image(vm, &cache, order[i], fr.stack_top);
+            if (vm->exited)
+                return vm->exit_code;
+            g_init_cur_gen++;
+            OCERZ_LOG("dynamic: running dependency-ordered initializers for %d images\n", n);
+            run_init_phase(vm, &cache, img.load_base, ia, fr.stack_top, g_libsys_mh);
+            if (vm->exited)
+                return vm->exit_code;
         }
         if (ran_init)
             g_run_init_ready = 1;
