@@ -41,16 +41,16 @@ make -j
 | --- | --- |
 | arm64 emitter | encodings validated by execution |
 | instruction corpus | 511 instructions |
-| x86-64 decode | 216 / 216 cases |
+| x86-64 decode | 246 / 246 cases |
 | i386 decode | 102 cases, 26 rejects, 122 address cases |
-| extension / SSE suites | 233 / 0, 246 / 0, SSE4.2 differential against Rosetta |
+| extension / SSE suites | 237 / 0, 246 / 0, SSE4.2 differential against Rosetta |
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
 | x86-64 guest gate | 93 / 93 |
 | x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
 | i386 differential gate | 20,033 / 20,033 |
-| dynamic-mode tests | 81 / 81 |
+| dynamic-mode tests | 103 / 103 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -61,6 +61,7 @@ What is in the box:
 - Mach-O loader, x86 decoder, interpreter, arm64 JIT, mini-dyld and syscall layer, all written for this project.
 - Live `dyld_shared_cache_x86_64` mapping with fixups, initializers, Objective-C registration and `dlopen`/`dlsym`.
 - Native guest threads, libdispatch workqueue bridging, Mach messages, signals and x86-TSO memory ordering.
+- x86-64-v3 as Rosetta runs it on macOS 15 and later: AVX2, FMA, BMI1/BMI2, F16C, LZCNT, MOVBE and XSAVE, none of which CPUID advertises under either.
 - JIT cache invalidation on guest code writes and executable mapping changes.
 - Differential tests for both x86-64 and i386 execution.
 
@@ -88,6 +89,15 @@ Command-line tools match their native output byte for byte
 (`tools/apptest.sh cli`, 16 of 16): `uname`, `sw_vers`, `echo`, `ls`, `id`,
 `basename`, `wc`, `sort`, `uniq`, `head`, `grep`, `file`, `xxd`, `nm`,
 `plutil` and `openssl` (`version` and `dgst -sha256`).
+
+Ollama's command-line binary (`Contents/Resources/ollama`, Go with cgo) works as of 2026-09-13. `ollama --version` prints what it prints natively. `ollama serve` answers its HTTP API (`/api/version`, `/api/tags`, `/api/show`), and `llama-server --list-devices` lists the same devices as it does natively. Getting there took five fixes:
+- AVX2, because Go turns on its AVX2 paths under Rosetta without checking CPUID.
+- `sigaltstack` reporting `SS_DISABLE`.
+- `dlopen` refusing arm64-only dylibs.
+- Bare `@loader_path` rpaths.
+- Constructors in programs that do not link CoreFoundation.
+
+Nobody has yet run a model under AArchX. The Ollama menu-bar app starts its server and then stops within 10 seconds, when WebKit's allocator fails to suspend a thread (`thread_suspend` returns `MACH_SEND_INVALID_DEST` for a thread other than the main one).
 
 Not working yet:
 - **Safari** starts but never shows a window. In a run on 2026-09-13, WebKit's allocator failed to suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`) and stopped the process. AArchX emulates thread suspension for guest threads, but the main thread was missing from that emulation until the same day, and Safari has not been run again since.
@@ -241,7 +251,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | Component | Source | Responsibility |
 | --- | --- | --- |
 | Loader | `src/loader.c` | Mach-O parsing, mappings, initial stack |
-| Decoder | `src/decode.c` | x86-64/i386 to the 411-operation internal IR |
+| Decoder | `src/decode.c` | x86-64/i386 to the 548-operation internal IR |
 | Interpreter | `src/interp*.c`, `src/flags.c` | reference execution and x86 flag semantics |
 | JIT | `src/jit.c`, `src/a64emit.c` | arm64 code generation, block chaining, superblocks |
 | Mini-dyld | `src/dyld.c`, `src/cache.c`, `src/dyldapi.c` | shared cache, symbols, fixups, Objective-C |
@@ -253,6 +263,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 - Shared-cache Objective-C images loaded after startup get their categories, but `dyld_image_path_containing_address` still returns NULL for them.
 - `proc_pidpath` and `proc_name` name the guest executable only when a process asks about itself; other ocerz processes still appear as `ocerz`.
 - x87 uses 64-bit doubles rather than 80-bit extended precision.
+- AVX, AVX2, FMA and BMI instructions run only in the interpreter: the JIT declines every VEX-encoded instruction.
 - MMX instructions always run in the interpreter, and the MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry them.
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
