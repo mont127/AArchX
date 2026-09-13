@@ -47,8 +47,8 @@ make -j
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 93 / 93 |
-| x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
+| x86-64 guest gate | 97 / 97 |
+| x86-64 differential gate (interpreter vs JIT) | 88 / 88 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 107 / 107 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
@@ -197,6 +197,27 @@ xychart-beta
 
 The tall bars are the previous ordered-mode cost, the short bars the current one; the dark line at 1.0 would be Rosetta's speed.
 
+### AVX2, FMA and SSE4.1 kernels
+
+Every VEX-encoded instruction used to leave translated code for the interpreter, so AVX2 and FMA loops ran up to 100 times slower than under Rosetta. The JIT now translates the instructions these kernels spend their time in.
+
+Timings are best of 3 on an Apple M5 with macOS 26.6.2, taken 2026-09-13. "Before" is the build at `31bff03`.
+
+| Kernel | Before | Now | Rosetta |
+| --- | ---: | ---: | ---: |
+| `memclr` 32 MB, AVX2 `vmovdqu` | 24.12 ms | 0.59 ms | 0.59 ms |
+| `indexbyte` 32 MB, AVX2 | 71.98 ms | **0.90 ms** | 1.53 ms |
+| `memeq` 32 MB, AVX2 | 64.79 ms | **0.87 ms** | 1.70 ms |
+| int32 loop 4M, clang AVX2 | 135.35 ms | 1.62 ms | 1.25 ms |
+| int32 loop 4M, clang SSE4.1 | 29.48 ms | **0.56 ms** | 0.77 ms |
+| saxpy 4M, clang AVX2+FMA | 37.62 ms | 0.46 ms | 0.47 ms |
+| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | 165.26 ms | 9.23 ms |
+| mandelbrot 400x400, scalar AVX2 | 1171.68 ms | 396.86 ms | 16.12 ms |
+
+The first three kernels are hand-written loops shaped like Go's runtime routines. The rest are C loops, which clang vectorizes except for nbody and mandelbrot, which stay scalar.
+
+Scalar code built for x86-64-v3 is still far behind Rosetta. Its VEX.128 instructions often write a register that is also their second source, and those still go to the interpreter. So do `vmovddup` and `vshufpd`.
+
 ## CLI
 
 ```text
@@ -263,7 +284,18 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 - Shared-cache Objective-C images loaded after startup get their categories, but `dyld_image_path_containing_address` still returns NULL for them.
 - `proc_pidpath` and `proc_name` name the guest executable only when a process asks about itself; other ocerz processes still appear as `ocerz`.
 - x87 uses 64-bit doubles rather than 80-bit extended precision.
-- AVX, AVX2, FMA and BMI instructions run only in the interpreter: the JIT declines every VEX-encoded instruction.
+- The JIT translates most VEX code:
+  - moves, integer, bitwise and compare ops, and broadcasts
+  - `vpmovmskb`, most sign and zero extensions, and shifts by an immediate
+  - `vzeroupper`, FMA and 256-bit packed arithmetic
+  - the VEX.128 forms of the SSE instructions it already translates
+
+  Everything else that is VEX-encoded still runs in the interpreter. That includes:
+  - VEX.128 instructions whose destination is also their second source
+  - `vmovddup` and `vshufpd`
+  - 256-bit shuffles, permutes and lane inserts
+  - `vptest`, the blends, mask-producing compares and gathers
+  - every BMI instruction
 - MMX instructions always run in the interpreter, and the MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry them.
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
