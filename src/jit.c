@@ -8366,6 +8366,9 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
         (jcc->ops[0].imm != block_rip && g_no_jcclink) ||
         fused_jcc_cond(producer, jcc) < 0)
         return 0;
+    if (jcc->ops[0].imm == block_rip &&
+        (g_no_xlive || xlive_succ_live(g_xlat_jit, block_rip) != 0))
+        return 0;
     if (producer->op != OCERZ_OP_CMP && producer->op != OCERZ_OP_TEST)
         return 0;
 
