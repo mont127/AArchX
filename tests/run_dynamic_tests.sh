@@ -490,6 +490,7 @@ run_file_case dproc_self tests/dynamic/proc_self.c 'OK'
 run_file_case dmach_traps_extra tests/dynamic/mach_traps_extra.c 'OK'
 run_file_case dthread_act tests/dynamic/thread_act.c 'OK'
 run_file_case dwq_thread_exit tests/dynamic/wq_thread_exit.c 'OK'
+run_file_case dsleep_after_dispatch tests/dynamic/sleep_after_dispatch.c 'OK'
 run_file_case jsc tests/dynamic/jsc_context.m 'OK' -fobjc-arc -framework JavaScriptCore -framework Foundation
 run_file_case dobjc_late_category tests/dynamic/objc_late_category.c 'OK' -framework Foundation
 run_asm_case dcef_partition tests/dynamic/cef_partition.c tests/dynamic/cef_partition.s 'OK'
