@@ -4364,6 +4364,80 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [473] = { "readlinkat",  4, 0x06, 0, NULL },
     [475] = { "mkdirat",     3, 0x02, 0, NULL },
     [500] = { "getentropy",  2, 0x01, 0, NULL },
+    [56]  = { "revoke",      1, 0x01, 0, NULL },
+    [178] = { "kdebug_trace_string", 3, 0x04, 0, NULL },
+    [179] = { "kdebug_trace64", 5, 0x00, 0, NULL },
+    [186] = { "thread_selfcounts", 3, 0x02, 0, NULL },
+    [217] = { "fsgetpath_ext", 5, 0x05, 0, NULL },
+    [218] = { "openat_dprotected_np", 7, 0x02, 0, NULL },
+    [222] = { "getdirentriesattr", 8, 0x76, 0, NULL },
+    [223] = { "exchangedata", 3, 0x03, 0, NULL },
+    [226] = { "delete",      1, 0x01, 0, NULL },
+    [227] = { "copyfile",    4, 0x03, 0, NULL },
+    [242] = { "fsctl",       4, 0x05, 0, NULL },
+    [277] = { "open_extended", 6, 0x21, 0, NULL },
+    [278] = { "umask_extended", 2, 0x02, 0, NULL },
+    [279] = { "stat_extended", 4, 0x0f, 0, NULL },
+    [280] = { "lstat_extended", 4, 0x0f, 0, NULL },
+    [281] = { "fstat_extended", 4, 0x0e, 0, NULL },
+    [282] = { "chmod_extended", 5, 0x11, 0, NULL },
+    [284] = { "access_extended", 4, 0x05, 0, NULL },
+    [288] = { "getsgroups",  2, 0x03, 0, NULL },
+    [290] = { "getwgroups",  2, 0x03, 0, NULL },
+    [291] = { "mkfifo_extended", 5, 0x11, 0, NULL },
+    [292] = { "mkdir_extended", 5, 0x11, 0, NULL },
+    [314] = { "aio_return",  1, 0x01, 0, NULL },
+    [315] = { "aio_suspend", 3, 0x05, 0, NULL },
+    [316] = { "aio_cancel",  2, 0x02, 0, NULL },
+    [317] = { "aio_error",   1, 0x01, 0, NULL },
+    [318] = { "aio_read",    1, 0x01, 0, NULL },
+    [319] = { "aio_write",   1, 0x01, 0, NULL },
+    [320] = { "lio_listio",  4, 0x0a, 0, NULL },
+    [323] = { "process_policy", 7, 0x10, 0, NULL },
+    [348] = { "pthread_chdir", 1, 0x01, 0, NULL },
+    [349] = { "pthread_fchdir", 1, 0x00, 0, NULL },
+    [382] = { "mac_get_file", 2, 0x03, 0, NULL },
+    [384] = { "mac_get_link", 2, 0x03, 0, NULL },
+    [386] = { "mac_get_proc", 1, 0x01, 0, NULL },
+    [388] = { "mac_get_fd",  2, 0x02, 0, NULL },
+    [390] = { "mac_get_pid", 2, 0x02, 0, NULL },
+    [418] = { "msgsnd_nocancel", 4, 0x02, 0, NULL },
+    [419] = { "msgrcv_nocancel", 5, 0x02, 0, NULL },
+    [421] = { "aio_suspend_nocancel", 3, 0x05, 0, NULL },
+    [425] = { "mac_get_mount", 2, 0x03, 0, NULL },
+    [426] = { "mac_getfsstat", 5, 0x05, 0, NULL },
+    [429] = { "audit_session_join", 1, 0x00, 0, NULL },
+    [432] = { "audit_session_port", 2, 0x02, 0, NULL },
+    [440] = { "memorystatus_control", 5, 0x08, 0, NULL },
+    [446] = { "proc_rlimit_control", 3, 0x04, 0, NULL },
+    [450] = { "socket_delegate", 4, 0x00, 0, NULL },
+    [453] = { "memorystatus_get_level", 1, 0x01, 0, NULL },
+    [459] = { "coalition_info", 4, 0x0e, 0, NULL },
+    [460] = { "necp_match_policy", 3, 0x05, 0, NULL },
+    [462] = { "clonefileat", 5, 0x0a, 0, NULL },
+    [465] = { "renameat",    4, 0x0a, 0, NULL },
+    [467] = { "fchmodat",    4, 0x02, 0, NULL },
+    [468] = { "fchownat",    5, 0x02, 0, NULL },
+    [479] = { "openbyid_np", 3, 0x03, 0, NULL },
+    [482] = { "thread_selfusage", 0, 0x00, 0, NULL },
+    [485] = { "guarded_write_np", 4, 0x06, 0, NULL },
+    [487] = { "guarded_writev_np", 4, 0x06, 0, NULL },
+    [488] = { "renameatx_np", 5, 0x0a, 0, NULL },
+    [490] = { "netagent_trigger", 2, 0x01, 0, NULL },
+    [496] = { "mach_eventlink_signal", 2, 0x00, 0, NULL },
+    [497] = { "mach_eventlink_wait_until", 5, 0x00, 0, NULL },
+    [498] = { "mach_eventlink_signal_wait_until", 6, 0x00, 0, NULL },
+    [499] = { "work_interval_ctl", 4, 0x04, 0, NULL },
+    [517] = { "fclonefileat", 4, 0x04, 0, NULL },
+    [522] = { "necp_session_open", 1, 0x00, 0, NULL },
+    [523] = { "necp_session_action", 6, 0x14, 0, NULL },
+    [525] = { "net_qos_guideline", 2, 0x01, 0, NULL },
+    [527] = { "ntp_adjtime", 1, 0x01, 0, NULL },
+    [528] = { "ntp_gettime", 1, 0x01, 0, NULL },
+    [531] = { "mach_bridge_remote_time", 1, 0x00, 0, NULL },
+    [533] = { "log_data",    4, 0x04, 0, NULL },
+    [545] = { "proc_info_extended_id", 8, 0x40, 0, NULL },
+    [551] = { "freadlink",   3, 0x02, 0, NULL },
 };
 
 static void ocerz_sysfail_note(OcerzCPU *cpu, int num, int eno, const uint64_t *orig)
@@ -4425,7 +4499,14 @@ static void strace_bsd(OcerzVM *vm, const ocerz_bsd_entry *e, int num,
     (void)num;
 }
 
+static int dispatch_bsd_at(OcerzVM *vm, OcerzCPU *cpu, int num, uint64_t stack_skip);
+
 static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
+{
+    return dispatch_bsd_at(vm, cpu, num, 0);
+}
+
+static int dispatch_bsd_at(OcerzVM *vm, OcerzCPU *cpu, int num, uint64_t stack_skip)
 {
     if (num == 0) {
         int real = (int)(cpu->gpr[OCERZ_RDI] & 0xffffff);
@@ -4435,8 +4516,8 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
         cpu->gpr[OCERZ_RDX] = cpu->gpr[OCERZ_R10];
         cpu->gpr[OCERZ_R10] = cpu->gpr[OCERZ_R8];
         cpu->gpr[OCERZ_R8] = r9_save;
-        cpu->gpr[OCERZ_R9] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
-        return dispatch_bsd(vm, cpu, real);
+        cpu->gpr[OCERZ_R9] = ocerz_ld(cpu->gpr[OCERZ_RSP] + stack_skip + 8, 8);
+        return dispatch_bsd_at(vm, cpu, real, stack_skip + 8);
     }
 
     const ocerz_bsd_entry *e = NULL;
@@ -4475,7 +4556,7 @@ static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
     if (e->nargs > 6) {
         uint64_t rsp = cpu->gpr[OCERZ_RSP];
         for (int i = 6; i < e->nargs && i < 8; i++)
-            a[i] = ocerz_ld(rsp + 8 * (uint64_t)(i - 6 + 1), 8);
+            a[i] = ocerz_ld(rsp + stack_skip + 8 * (uint64_t)(i - 6 + 1), 8);
     }
 
     uint64_t orig[8];
