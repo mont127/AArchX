@@ -810,6 +810,9 @@ void a64_v_ushr_imm(A64Buf *b, int esz, int vd, int vn, int sh)
 { a64_emit32(b, 0x6f000400u | ((uint32_t)((16 << esz) - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_sshr_imm(A64Buf *b, int esz, int vd, int vn, int sh)
 { a64_emit32(b, 0x4f000400u | ((uint32_t)((16 << esz) - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_fneg(A64Buf *b, int dbl, int vd, int vn) { a64_emit32(b, (dbl ? 0x6ee0f800u : 0x6ea0f800u) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_fmla(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4e60cc00u : 0x4e20cc00u, vd, vn, vm); }
+void a64_v_fmls(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4ee0cc00u : 0x4ea0cc00u, vd, vn, vm); }
 void a64_frint_s(A64Buf *b, int dbl, int mode, int vd, int vn)
 {
     static const uint32_t opc[5] = { 0x1e244000u, 0x1e254000u, 0x1e24c000u, 0x1e25c000u, 0x1e27c000u };
