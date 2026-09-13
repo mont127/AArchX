@@ -6994,26 +6994,73 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     return 1;
 }
 
+enum { SIK_XOR = 1, SIK_AND, SIK_OR, SIK_ANDN, SIK_ADD, SIK_SUB, SIK_CMPEQ, SIK_CMPGT, SIK_UMIN, SIK_UMAX,
+       SIK_SMIN, SIK_SMAX, SIK_MUL, SIK_UQADD, SIK_UQSUB, SIK_SQADD, SIK_SQSUB, SIK_AVG };
+static int sse_int_kind(unsigned op, int *esz)
+{
+    *esz = 0;
+    switch (op) {
+    case OCERZ_OP_PXOR: case OCERZ_OP_XORPS: return SIK_XOR;
+    case OCERZ_OP_PAND: case OCERZ_OP_ANDPS: return SIK_AND;
+    case OCERZ_OP_POR:  case OCERZ_OP_ORPS:  return SIK_OR;
+    case OCERZ_OP_PANDN: case OCERZ_OP_ANDNPS: return SIK_ANDN;
+    case OCERZ_OP_PADDB: return SIK_ADD;   case OCERZ_OP_PADDW: *esz = 1; return SIK_ADD;
+    case OCERZ_OP_PADDD: *esz = 2; return SIK_ADD; case OCERZ_OP_PADDQ: *esz = 3; return SIK_ADD;
+    case OCERZ_OP_PSUBB: return SIK_SUB;   case OCERZ_OP_PSUBW: *esz = 1; return SIK_SUB;
+    case OCERZ_OP_PSUBD: *esz = 2; return SIK_SUB; case OCERZ_OP_PSUBQ: *esz = 3; return SIK_SUB;
+    case OCERZ_OP_PCMPEQB: return SIK_CMPEQ; case OCERZ_OP_PCMPEQW: *esz = 1; return SIK_CMPEQ;
+    case OCERZ_OP_PCMPEQD: *esz = 2; return SIK_CMPEQ; case OCERZ_OP_PCMPEQQ: *esz = 3; return SIK_CMPEQ;
+    case OCERZ_OP_PCMPGTB: return SIK_CMPGT; case OCERZ_OP_PCMPGTW: *esz = 1; return SIK_CMPGT;
+    case OCERZ_OP_PCMPGTD: *esz = 2; return SIK_CMPGT; case OCERZ_OP_PCMPGTQ: *esz = 3; return SIK_CMPGT;
+    case OCERZ_OP_PMINUB: return SIK_UMIN; case OCERZ_OP_PMINUW: *esz = 1; return SIK_UMIN; case OCERZ_OP_PMINUD: *esz = 2; return SIK_UMIN;
+    case OCERZ_OP_PMAXUB: return SIK_UMAX; case OCERZ_OP_PMAXUW: *esz = 1; return SIK_UMAX; case OCERZ_OP_PMAXUD: *esz = 2; return SIK_UMAX;
+    case OCERZ_OP_PMINSB: return SIK_SMIN; case OCERZ_OP_PMINSW: *esz = 1; return SIK_SMIN; case OCERZ_OP_PMINSD: *esz = 2; return SIK_SMIN;
+    case OCERZ_OP_PMAXSB: return SIK_SMAX; case OCERZ_OP_PMAXSW: *esz = 1; return SIK_SMAX; case OCERZ_OP_PMAXSD: *esz = 2; return SIK_SMAX;
+    case OCERZ_OP_PMULLW: *esz = 1; return SIK_MUL; case OCERZ_OP_PMULLD: *esz = 2; return SIK_MUL;
+    case OCERZ_OP_PADDUSB: return SIK_UQADD; case OCERZ_OP_PADDUSW: *esz = 1; return SIK_UQADD;
+    case OCERZ_OP_PSUBUSB: return SIK_UQSUB; case OCERZ_OP_PSUBUSW: *esz = 1; return SIK_UQSUB;
+    case OCERZ_OP_PADDSB: return SIK_SQADD;  case OCERZ_OP_PADDSW: *esz = 1; return SIK_SQADD;
+    case OCERZ_OP_PSUBSB: return SIK_SQSUB;  case OCERZ_OP_PSUBSW: *esz = 1; return SIK_SQSUB;
+    case OCERZ_OP_PAVGB: return SIK_AVG;     case OCERZ_OP_PAVGW: *esz = 1; return SIK_AVG;
+    default: return 0;
+    }
+}
+static int sse_int_self_zero(int kind)
+{
+    return kind == SIK_XOR || kind == SIK_ANDN || kind == SIK_SUB || kind == SIK_CMPGT ||
+           kind == SIK_UQSUB || kind == SIK_SQSUB;
+}
+static void emit_sse_int_op(A64Buf *b, int kind, int esz, int vd, int va, int vb)
+{
+    switch (kind) {
+    case SIK_XOR:   a64_v_eor(b, vd, va, vb); break;
+    case SIK_AND:   a64_v_and(b, vd, va, vb); break;
+    case SIK_OR:    a64_v_orr(b, vd, va, vb); break;
+    case SIK_ANDN:  a64_v_bic(b, vd, vb, va); break;
+    case SIK_ADD:   a64_v_add(b, esz, vd, va, vb); break;
+    case SIK_SUB:   a64_v_sub(b, esz, vd, va, vb); break;
+    case SIK_CMPEQ: a64_v_cmeq(b, esz, vd, va, vb); break;
+    case SIK_CMPGT: a64_v_cmgt(b, esz, vd, va, vb); break;
+    case SIK_UMIN:  a64_v_umin(b, esz, vd, va, vb); break;
+    case SIK_UMAX:  a64_v_umax(b, esz, vd, va, vb); break;
+    case SIK_SMIN:  a64_v_smin(b, esz, vd, va, vb); break;
+    case SIK_SMAX:  a64_v_smax(b, esz, vd, va, vb); break;
+    case SIK_MUL:   a64_v_mul(b, esz, vd, va, vb); break;
+    case SIK_UQADD: a64_v_uqadd(b, esz, vd, va, vb); break;
+    case SIK_UQSUB: a64_v_uqsub(b, esz, vd, va, vb); break;
+    case SIK_SQADD: a64_v_sqadd(b, esz, vd, va, vb); break;
+    case SIK_SQSUB: a64_v_sqsub(b, esz, vd, va, vb); break;
+    default:        a64_v_urhadd(b, esz, vd, va, vb); break;
+    }
+}
+
 static int emit_sse_bitwise(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_XMM) return 0;
-    int kind, esz = 0;
-    switch (insn->op) {
-    case OCERZ_OP_PXOR: case OCERZ_OP_XORPS: kind = 0; break;
-    case OCERZ_OP_PAND: case OCERZ_OP_ANDPS: kind = 1; break;
-    case OCERZ_OP_POR:  case OCERZ_OP_ORPS:  kind = 2; break;
-    case OCERZ_OP_PANDN: case OCERZ_OP_ANDNPS: kind = 3; break;
-    case OCERZ_OP_PADDB: kind = 4; esz = 0; break; case OCERZ_OP_PADDW: kind = 4; esz = 1; break;
-    case OCERZ_OP_PADDD: kind = 4; esz = 2; break; case OCERZ_OP_PADDQ: kind = 4; esz = 3; break;
-    case OCERZ_OP_PSUBB: kind = 5; esz = 0; break; case OCERZ_OP_PSUBW: kind = 5; esz = 1; break;
-    case OCERZ_OP_PSUBD: kind = 5; esz = 2; break; case OCERZ_OP_PSUBQ: kind = 5; esz = 3; break;
-    case OCERZ_OP_PCMPEQD: kind = 6; esz = 2; break; case OCERZ_OP_PCMPEQB: kind = 6; esz = 0; break;
-    case OCERZ_OP_PCMPEQW: kind = 6; esz = 1; break; case OCERZ_OP_PCMPEQQ: kind = 6; esz = 3; break;
-    case OCERZ_OP_PCMPGTD: kind = 7; esz = 2; break;
-    default: return 0;
-    }
-    if (kind == 0 && s->kind == OCERZ_OPK_XMM && s->reg == d->reg) {
+    int esz, kind = sse_int_kind(insn->op, &esz);
+    if (!kind) return 0;
+    if (s->kind == OCERZ_OPK_XMM && s->reg == d->reg && sse_int_self_zero(kind)) {
         int vd = xmm_dst_reg(d->reg, VX0);
         a64_v_zero(b, vd);
         if (vd == VX0) emit_xmm_st(b, VX0, d->reg);
@@ -7023,16 +7070,7 @@ static int emit_sse_bitwise(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     if (vb < 0) return 0;
     int vd = xmm_dst_reg(d->reg, VX0);
     if (vd == VX0) emit_xmm_ld(b, VX0, d->reg);
-    switch (kind) {
-    case 0: a64_v_eor(b, vd, vd, vb); break;
-    case 1: a64_v_and(b, vd, vd, vb); break;
-    case 2: a64_v_orr(b, vd, vd, vb); break;
-    case 3: a64_v_bic(b, vd, vb, vd); break;
-    case 4: a64_v_add(b, esz, vd, vd, vb); break;
-    case 5: a64_v_sub(b, esz, vd, vd, vb); break;
-    case 6: a64_v_cmeq(b, esz, vd, vd, vb); break;
-    case 7: a64_v_cmgt(b, esz, vd, vd, vb); break;
-    }
+    emit_sse_int_op(b, kind, esz, vd, vd, vb);
     if (vd == VX0) emit_xmm_st(b, VX0, d->reg);
     return 1;
 }
@@ -7492,7 +7530,12 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_PADDB: case OCERZ_OP_PADDW: case OCERZ_OP_PADDD: case OCERZ_OP_PADDQ:
     case OCERZ_OP_PSUBB: case OCERZ_OP_PSUBW: case OCERZ_OP_PSUBD: case OCERZ_OP_PSUBQ:
     case OCERZ_OP_PCMPEQB: case OCERZ_OP_PCMPEQW: case OCERZ_OP_PCMPEQD: case OCERZ_OP_PCMPEQQ:
-    case OCERZ_OP_PCMPGTD:
+    case OCERZ_OP_PCMPGTB: case OCERZ_OP_PCMPGTW: case OCERZ_OP_PCMPGTD: case OCERZ_OP_PCMPGTQ:
+    case OCERZ_OP_PMINUB: case OCERZ_OP_PMINUW: case OCERZ_OP_PMINUD: case OCERZ_OP_PMAXUB: case OCERZ_OP_PMAXUW: case OCERZ_OP_PMAXUD:
+    case OCERZ_OP_PMINSB: case OCERZ_OP_PMINSW: case OCERZ_OP_PMINSD: case OCERZ_OP_PMAXSB: case OCERZ_OP_PMAXSW: case OCERZ_OP_PMAXSD:
+    case OCERZ_OP_PMULLW: case OCERZ_OP_PMULLD: case OCERZ_OP_PAVGB: case OCERZ_OP_PAVGW:
+    case OCERZ_OP_PADDUSB: case OCERZ_OP_PADDUSW: case OCERZ_OP_PSUBUSB: case OCERZ_OP_PSUBUSW:
+    case OCERZ_OP_PADDSB: case OCERZ_OP_PADDSW: case OCERZ_OP_PSUBSB: case OCERZ_OP_PSUBSW:
         return emit_sse_bitwise(b, insn, exit_sites, n_exits);
     case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
         return emit_sse_comis(b, insn, exit_sites, n_exits);
@@ -7988,60 +8031,6 @@ static int emit_vex_mov(A64Buf *b, const X86Insn *insn, int L, uint32_t **exit_s
     return 1;
 }
 
-enum { VXK_XOR = 1, VXK_AND, VXK_OR, VXK_ANDN, VXK_ADD, VXK_SUB, VXK_CMPEQ, VXK_CMPGT, VXK_UMIN, VXK_UMAX,
-       VXK_SMIN, VXK_SMAX, VXK_MUL, VXK_UQADD, VXK_UQSUB, VXK_SQADD, VXK_SQSUB, VXK_AVG };
-static int vex_int_kind(unsigned op, int *esz)
-{
-    *esz = 0;
-    switch (op) {
-    case OCERZ_OP_PXOR: case OCERZ_OP_XORPS: return VXK_XOR;
-    case OCERZ_OP_PAND: case OCERZ_OP_ANDPS: return VXK_AND;
-    case OCERZ_OP_POR:  case OCERZ_OP_ORPS:  return VXK_OR;
-    case OCERZ_OP_PANDN: case OCERZ_OP_ANDNPS: return VXK_ANDN;
-    case OCERZ_OP_PADDB: return VXK_ADD;   case OCERZ_OP_PADDW: *esz = 1; return VXK_ADD;
-    case OCERZ_OP_PADDD: *esz = 2; return VXK_ADD; case OCERZ_OP_PADDQ: *esz = 3; return VXK_ADD;
-    case OCERZ_OP_PSUBB: return VXK_SUB;   case OCERZ_OP_PSUBW: *esz = 1; return VXK_SUB;
-    case OCERZ_OP_PSUBD: *esz = 2; return VXK_SUB; case OCERZ_OP_PSUBQ: *esz = 3; return VXK_SUB;
-    case OCERZ_OP_PCMPEQB: return VXK_CMPEQ; case OCERZ_OP_PCMPEQW: *esz = 1; return VXK_CMPEQ;
-    case OCERZ_OP_PCMPEQD: *esz = 2; return VXK_CMPEQ; case OCERZ_OP_PCMPEQQ: *esz = 3; return VXK_CMPEQ;
-    case OCERZ_OP_PCMPGTB: return VXK_CMPGT; case OCERZ_OP_PCMPGTW: *esz = 1; return VXK_CMPGT;
-    case OCERZ_OP_PCMPGTD: *esz = 2; return VXK_CMPGT; case OCERZ_OP_PCMPGTQ: *esz = 3; return VXK_CMPGT;
-    case OCERZ_OP_PMINUB: return VXK_UMIN; case OCERZ_OP_PMINUW: *esz = 1; return VXK_UMIN; case OCERZ_OP_PMINUD: *esz = 2; return VXK_UMIN;
-    case OCERZ_OP_PMAXUB: return VXK_UMAX; case OCERZ_OP_PMAXUW: *esz = 1; return VXK_UMAX; case OCERZ_OP_PMAXUD: *esz = 2; return VXK_UMAX;
-    case OCERZ_OP_PMINSB: return VXK_SMIN; case OCERZ_OP_PMINSW: *esz = 1; return VXK_SMIN; case OCERZ_OP_PMINSD: *esz = 2; return VXK_SMIN;
-    case OCERZ_OP_PMAXSB: return VXK_SMAX; case OCERZ_OP_PMAXSW: *esz = 1; return VXK_SMAX; case OCERZ_OP_PMAXSD: *esz = 2; return VXK_SMAX;
-    case OCERZ_OP_PMULLW: *esz = 1; return VXK_MUL; case OCERZ_OP_PMULLD: *esz = 2; return VXK_MUL;
-    case OCERZ_OP_PADDUSB: return VXK_UQADD; case OCERZ_OP_PADDUSW: *esz = 1; return VXK_UQADD;
-    case OCERZ_OP_PSUBUSB: return VXK_UQSUB; case OCERZ_OP_PSUBUSW: *esz = 1; return VXK_UQSUB;
-    case OCERZ_OP_PADDSB: return VXK_SQADD;  case OCERZ_OP_PADDSW: *esz = 1; return VXK_SQADD;
-    case OCERZ_OP_PSUBSB: return VXK_SQSUB;  case OCERZ_OP_PSUBSW: *esz = 1; return VXK_SQSUB;
-    case OCERZ_OP_PAVGB: return VXK_AVG;     case OCERZ_OP_PAVGW: *esz = 1; return VXK_AVG;
-    default: return 0;
-    }
-}
-static void emit_vex_int_op(A64Buf *b, int kind, int esz, int vd, int va, int vb)
-{
-    switch (kind) {
-    case VXK_XOR:   a64_v_eor(b, vd, va, vb); break;
-    case VXK_AND:   a64_v_and(b, vd, va, vb); break;
-    case VXK_OR:    a64_v_orr(b, vd, va, vb); break;
-    case VXK_ANDN:  a64_v_bic(b, vd, vb, va); break;
-    case VXK_ADD:   a64_v_add(b, esz, vd, va, vb); break;
-    case VXK_SUB:   a64_v_sub(b, esz, vd, va, vb); break;
-    case VXK_CMPEQ: a64_v_cmeq(b, esz, vd, va, vb); break;
-    case VXK_CMPGT: a64_v_cmgt(b, esz, vd, va, vb); break;
-    case VXK_UMIN:  a64_v_umin(b, esz, vd, va, vb); break;
-    case VXK_UMAX:  a64_v_umax(b, esz, vd, va, vb); break;
-    case VXK_SMIN:  a64_v_smin(b, esz, vd, va, vb); break;
-    case VXK_SMAX:  a64_v_smax(b, esz, vd, va, vb); break;
-    case VXK_MUL:   a64_v_mul(b, esz, vd, va, vb); break;
-    case VXK_UQADD: a64_v_uqadd(b, esz, vd, va, vb); break;
-    case VXK_UQSUB: a64_v_uqsub(b, esz, vd, va, vb); break;
-    case VXK_SQADD: a64_v_sqadd(b, esz, vd, va, vb); break;
-    case VXK_SQSUB: a64_v_sqsub(b, esz, vd, va, vb); break;
-    default:        a64_v_urhadd(b, esz, vd, va, vb); break;
-    }
-}
 static int emit_vex_int(A64Buf *b, const X86Insn *insn, int kind, int esz, int L,
                         uint32_t **exit_sites, int *n_exits)
 {
@@ -8050,9 +8039,7 @@ static int emit_vex_int(A64Buf *b, const X86Insn *insn, int kind, int esz, int L
     if (!xmm_is_pinned(d->reg) || !xmm_is_pinned(insn->vvvv)) return 0;
     if (s->kind == OCERZ_OPK_XMM ? !xmm_is_pinned(s->reg) : s->kind != OCERZ_OPK_MEM) return 0;
     int vd = xmm_vreg(d->reg), va = xmm_vreg(insn->vvvv), vb = VX0;
-    if (s->kind == OCERZ_OPK_XMM && s->reg == insn->vvvv &&
-        (kind == VXK_XOR || kind == VXK_ANDN || kind == VXK_SUB || kind == VXK_CMPGT ||
-         kind == VXK_UQSUB || kind == VXK_SQSUB)) {
+    if (s->kind == OCERZ_OPK_XMM && s->reg == insn->vvvv && sse_int_self_zero(kind)) {
         a64_v_zero(b, vd);
         emit_ymmh_clear(b, d->reg);
         return 1;
@@ -8070,9 +8057,9 @@ static int emit_vex_int(A64Buf *b, const X86Insn *insn, int kind, int esz, int L
     }
     if (L) {
         emit_ymmh_ld(b, VX2, insn->vvvv);
-        emit_vex_int_op(b, kind, esz, VX2, VX2, VX1);
+        emit_sse_int_op(b, kind, esz, VX2, VX2, VX1);
     }
-    emit_vex_int_op(b, kind, esz, vd, va, vb);
+    emit_sse_int_op(b, kind, esz, vd, va, vb);
     if (L) emit_ymmh_st(b, VX2, d->reg);
     else emit_ymmh_clear(b, d->reg);
     return 1;
@@ -8187,7 +8174,7 @@ static int emit_vex(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
 {
     if (!vex_inline_enabled() || !sse_enabled() || insn->mode32 || insn->seg != OCERZ_SEG_NONE) return 0;
     int L = (insn->vex & OCERZ_VEX_L) != 0, esz;
-    int kind = vex_int_kind(insn->op, &esz);
+    int kind = sse_int_kind(insn->op, &esz);
     if (kind) return emit_vex_int(b, insn, kind, esz, L, exit_sites, n_exits);
     switch (insn->op) {
     case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU:
@@ -8586,7 +8573,12 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_PADDB: case OCERZ_OP_PADDW: case OCERZ_OP_PADDD: case OCERZ_OP_PADDQ:
     case OCERZ_OP_PSUBB: case OCERZ_OP_PSUBW: case OCERZ_OP_PSUBD: case OCERZ_OP_PSUBQ:
     case OCERZ_OP_PCMPEQB: case OCERZ_OP_PCMPEQW: case OCERZ_OP_PCMPEQD: case OCERZ_OP_PCMPEQQ:
-    case OCERZ_OP_PCMPGTD:
+    case OCERZ_OP_PCMPGTB: case OCERZ_OP_PCMPGTW: case OCERZ_OP_PCMPGTD: case OCERZ_OP_PCMPGTQ:
+    case OCERZ_OP_PMINUB: case OCERZ_OP_PMINUW: case OCERZ_OP_PMINUD: case OCERZ_OP_PMAXUB: case OCERZ_OP_PMAXUW: case OCERZ_OP_PMAXUD:
+    case OCERZ_OP_PMINSB: case OCERZ_OP_PMINSW: case OCERZ_OP_PMINSD: case OCERZ_OP_PMAXSB: case OCERZ_OP_PMAXSW: case OCERZ_OP_PMAXSD:
+    case OCERZ_OP_PMULLW: case OCERZ_OP_PMULLD: case OCERZ_OP_PAVGB: case OCERZ_OP_PAVGW:
+    case OCERZ_OP_PADDUSB: case OCERZ_OP_PADDUSW: case OCERZ_OP_PSUBUSB: case OCERZ_OP_PSUBUSW:
+    case OCERZ_OP_PADDSB: case OCERZ_OP_PADDSW: case OCERZ_OP_PSUBSB: case OCERZ_OP_PSUBSW:
     case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
     case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTDQ2PS:
