@@ -134,7 +134,7 @@ static inline double maxd_x86(double a, double b)
 static int cmp_pred_f(float a, float b, int pred)
 {
     int unord = isnan(a) || isnan(b);
-    switch (pred & 7) {
+    switch (pred & 15) {
     case 0: return !unord && a == b;
     case 1: return !unord && a < b;
     case 2: return !unord && a <= b;
@@ -142,14 +142,22 @@ static int cmp_pred_f(float a, float b, int pred)
     case 4: return unord || a != b;
     case 5: return unord || !(a < b);
     case 6: return unord || !(a <= b);
-    default: return !unord;
+    case 7: return !unord;
+    case 8: return unord || a == b;
+    case 9: return unord || a < b;
+    case 10: return unord || a <= b;
+    case 11: return 0;
+    case 12: return !unord && a != b;
+    case 13: return !unord && a >= b;
+    case 14: return !unord && a > b;
+    default: return 1;
     }
 }
 
 static int cmp_pred_d(double a, double b, int pred)
 {
     int unord = isnan(a) || isnan(b);
-    switch (pred & 7) {
+    switch (pred & 15) {
     case 0: return !unord && a == b;
     case 1: return !unord && a < b;
     case 2: return !unord && a <= b;
@@ -157,7 +165,15 @@ static int cmp_pred_d(double a, double b, int pred)
     case 4: return unord || a != b;
     case 5: return unord || !(a < b);
     case 6: return unord || !(a <= b);
-    default: return !unord;
+    case 7: return !unord;
+    case 8: return unord || a == b;
+    case 9: return unord || a < b;
+    case 10: return unord || a <= b;
+    case 11: return 0;
+    case 12: return !unord && a != b;
+    case 13: return !unord && a >= b;
+    case 14: return !unord && a > b;
+    default: return 1;
     }
 }
 
@@ -534,7 +550,7 @@ static int do_cmpfp(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
-    int pred = (int)(insn->ops[2].imm & 7);
+    int pred = (int)(insn->ops[2].imm & (insn->vex ? 0x1f : 7));
     vec a = src1_of(cpu, insn, d);
     vec b = vec_read(cpu, insn, s);
     vec r = a;
@@ -1880,6 +1896,44 @@ static void read256(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, ve
 static void write_ymm(OcerzCPU *cpu, int reg, vec lo, vec hi) { cpu->xmm[reg] = lo.q; cpu->ymmh[reg] = hi.q; }
 static void write_xmm_zero_hi(OcerzCPU *cpu, int reg, vec v) { cpu->xmm[reg] = v.q; cpu->ymmh[reg].lo = cpu->ymmh[reg].hi = 0; }
 
+typedef union w256 {
+    uint8_t u8[32];
+    uint32_t u32[8];
+    int32_t i32[8];
+    uint64_t u64[4];
+    int64_t i64[4];
+} w256;
+
+static w256 reg256(const OcerzCPU *cpu, int reg)
+{
+    w256 w;
+    memcpy(w.u8, &cpu->xmm[reg], 16);
+    memcpy(w.u8 + 16, &cpu->ymmh[reg], 16);
+    return w;
+}
+
+static w256 src256(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, int L)
+{
+    if (op->kind == OCERZ_OPK_XMM)
+        return reg256(cpu, op->reg);
+    w256 w;
+    Ocerz128 lo = mem_read16(cpu, insn, op, 0), hi = { 0, 0 };
+    if (L)
+        hi = mem_read16(cpu, insn, op, 16);
+    memcpy(w.u8, &lo, 16);
+    memcpy(w.u8 + 16, &hi, 16);
+    return w;
+}
+
+static void put256(OcerzCPU *cpu, int reg, int L, const w256 *w)
+{
+    memcpy(&cpu->xmm[reg], w->u8, 16);
+    if (L)
+        memcpy(&cpu->ymmh[reg], w->u8 + 16, 16);
+    else
+        memset(&cpu->ymmh[reg], 0, 16);
+}
+
 static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
@@ -1900,7 +1954,7 @@ static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn)
         if (L) write_ymm(cpu, d->reg, r, r); else write_xmm_zero_hi(cpu, d->reg, r);
         return OCERZ_STEP_OK;
     }
-    case OP(OCERZ_OP_VBROADCASTF128): {
+    case OP(OCERZ_OP_VBROADCASTF128): case OP(OCERZ_OP_VBROADCASTI128): {
         r = vec_of(mem_read16(cpu, insn, s, 0));
         write_ymm(cpu, d->reg, r, r);
         return OCERZ_STEP_OK;
@@ -1965,20 +2019,20 @@ static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn)
         else { ocerz_st(ocerz_ea(cpu, insn, d), 8, r.q.lo); if (L) ocerz_st(ocerz_ea(cpu, insn, d) + 8, 8, r.q.hi); }
         return OCERZ_STEP_OK;
     }
-    case OP(OCERZ_OP_VINSERTF128): {
+    case OP(OCERZ_OP_VINSERTF128): case OP(OCERZ_OP_VINSERTI128): {
         vec base_lo = vec_of(cpu->xmm[insn->vvvv]), base_hi = vec_of(cpu->ymmh[insn->vvvv]);
         vec ins = vec_of(s->kind == OCERZ_OPK_XMM ? cpu->xmm[s->reg] : mem_read16(cpu, insn, s, 0));
         if (insn->ops[2].imm & 1) base_hi = ins; else base_lo = ins;
         write_ymm(cpu, d->reg, base_lo, base_hi);
         return OCERZ_STEP_OK;
     }
-    case OP(OCERZ_OP_VEXTRACTF128): {
+    case OP(OCERZ_OP_VEXTRACTF128): case OP(OCERZ_OP_VEXTRACTI128): {
         vec v = vec_of((insn->ops[2].imm & 1) ? cpu->ymmh[s->reg] : cpu->xmm[s->reg]);
         if (d->kind == OCERZ_OPK_XMM) write_xmm_zero_hi(cpu, d->reg, v);
         else mem_write16(cpu, insn, d, 0, v.q);
         return OCERZ_STEP_OK;
     }
-    case OP(OCERZ_OP_VPERM2F128): {
+    case OP(OCERZ_OP_VPERM2F128): case OP(OCERZ_OP_VPERM2I128): {
         vec s1lo = vec_of(cpu->xmm[insn->vvvv]), s1hi = vec_of(cpu->ymmh[insn->vvvv]), s2lo, s2hi;
         read256(cpu, insn, s, &s2lo, &s2hi);
         unsigned imm = (unsigned)insn->ops[2].imm;
@@ -1987,6 +2041,95 @@ static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn)
         if (imm & 0x08) memset(&lo, 0, sizeof lo);
         if (imm & 0x80) memset(&hi, 0, sizeof hi);
         write_ymm(cpu, d->reg, lo, hi);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPBROADCASTB): case OP(OCERZ_OP_VPBROADCASTW):
+    case OP(OCERZ_OP_VPBROADCASTD): case OP(OCERZ_OP_VPBROADCASTQ): {
+        int esz = insn->op == OCERZ_OP_VPBROADCASTB ? 1 : insn->op == OCERZ_OP_VPBROADCASTW ? 2
+                : insn->op == OCERZ_OP_VPBROADCASTD ? 4 : 8;
+        uint64_t v = s->kind == OCERZ_OPK_XMM ? cpu->xmm[s->reg].lo : ocerz_ld(ocerz_ea(cpu, insn, s), esz);
+        w256 w;
+        for (int i = 0; i < 32; i += esz) memcpy(w.u8 + i, &v, (size_t)esz);
+        put256(cpu, d->reg, L, &w);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPBLENDD): {
+        w256 a = reg256(cpu, insn->vvvv), b = src256(cpu, insn, s, L);
+        for (int i = 0; i < 8; i++) if ((insn->ops[2].imm >> i) & 1) a.u32[i] = b.u32[i];
+        put256(cpu, d->reg, L, &a);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPERMD): case OP(OCERZ_OP_VPERMPS): {
+        w256 ix = reg256(cpu, insn->vvvv), t = src256(cpu, insn, s, 1), w;
+        for (int i = 0; i < 8; i++) w.u32[i] = t.u32[ix.u32[i] & 7];
+        put256(cpu, d->reg, 1, &w);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPERMQ): case OP(OCERZ_OP_VPERMPD): {
+        w256 t = src256(cpu, insn, s, 1), w;
+        for (int i = 0; i < 4; i++) w.u64[i] = t.u64[(insn->ops[2].imm >> (2 * i)) & 3];
+        put256(cpu, d->reg, 1, &w);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPSLLVD): case OP(OCERZ_OP_VPSRLVD): case OP(OCERZ_OP_VPSRAVD): {
+        w256 a = reg256(cpu, insn->vvvv), c = src256(cpu, insn, s, L);
+        for (int i = 0; i < 8; i++) {
+            uint32_t n = c.u32[i];
+            if (insn->op == OCERZ_OP_VPSRAVD) a.i32[i] >>= n > 31 ? 31 : n;
+            else a.u32[i] = n > 31 ? 0 : insn->op == OCERZ_OP_VPSLLVD ? a.u32[i] << n : a.u32[i] >> n;
+        }
+        put256(cpu, d->reg, L, &a);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPSLLVQ): case OP(OCERZ_OP_VPSRLVQ): {
+        w256 a = reg256(cpu, insn->vvvv), c = src256(cpu, insn, s, L);
+        for (int i = 0; i < 4; i++)
+            a.u64[i] = c.u64[i] > 63 ? 0 : insn->op == OCERZ_OP_VPSLLVQ ? a.u64[i] << c.u64[i] : a.u64[i] >> c.u64[i];
+        put256(cpu, d->reg, L, &a);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPMASKMOVD): case OP(OCERZ_OP_VPMASKMOVQ):
+    case OP(OCERZ_OP_VMASKMOVPS): case OP(OCERZ_OP_VMASKMOVPD): {
+        int esz = (insn->op == OCERZ_OP_VPMASKMOVQ || insn->op == OCERZ_OP_VMASKMOVPD) ? 8 : 4;
+        int n = (L ? 32 : 16) / esz;
+        w256 m = reg256(cpu, insn->vvvv), w;
+        if (d->kind == OCERZ_OPK_MEM) {
+            w = reg256(cpu, s->reg);
+            uint64_t ea = ocerz_ea(cpu, insn, d);
+            for (int i = 0; i < n; i++)
+                if (esz == 8 ? m.u64[i] >> 63 : m.u32[i] >> 31)
+                    ocerz_st(ea + (uint64_t)(i * esz), esz, esz == 8 ? w.u64[i] : w.u32[i]);
+            return OCERZ_STEP_OK;
+        }
+        uint64_t ea = ocerz_ea(cpu, insn, s);
+        memset(&w, 0, sizeof w);
+        for (int i = 0; i < n; i++) {
+            if (!(esz == 8 ? m.u64[i] >> 63 : m.u32[i] >> 31)) continue;
+            if (esz == 8) w.u64[i] = ocerz_ld(ea + (uint64_t)(i * 8), 8);
+            else w.u32[i] = (uint32_t)ocerz_ld(ea + (uint64_t)(i * 4), 4);
+        }
+        put256(cpu, d->reg, L, &w);
+        return OCERZ_STEP_OK;
+    }
+    case OP(OCERZ_OP_VPGATHERDD): case OP(OCERZ_OP_VPGATHERDQ): case OP(OCERZ_OP_VPGATHERQD): case OP(OCERZ_OP_VPGATHERQQ):
+    case OP(OCERZ_OP_VGATHERDPS): case OP(OCERZ_OP_VGATHERDPD): case OP(OCERZ_OP_VGATHERQPS): case OP(OCERZ_OP_VGATHERQPD): {
+        int k = insn->op >= OCERZ_OP_VGATHERDPS ? insn->op - OCERZ_OP_VGATHERDPS : insn->op - OCERZ_OP_VPGATHERDD;
+        int q = k & 1, qidx = (k >> 1) & 1, esz = q ? 8 : 4;
+        int n = (q || qidx) ? (L ? 4 : 2) : (L ? 8 : 4);
+        w256 w = reg256(cpu, d->reg), m = reg256(cpu, insn->vvvv), ix = reg256(cpu, s->index);
+        uint64_t seg = insn->seg == OCERZ_SEG_FS ? cpu->fs_base : insn->seg == OCERZ_SEG_GS ? cpu->gs_base : 0;
+        uint64_t base = (uint64_t)s->disp + (s->base != OCERZ_REG_NONE ? cpu->gpr[s->base] : 0);
+        for (int i = 0; i < n; i++) {
+            if (!(q ? m.u64[i] >> 63 : m.u32[i] >> 31)) continue;
+            uint64_t a = base + ((uint64_t)(qidx ? ix.i64[i] : (int64_t)ix.i32[i]) << s->scale);
+            if (insn->addrsize == 4) a = (uint32_t)a;
+            uint64_t v = ocerz_ld(a + seg, esz);
+            if (q) w.u64[i] = v; else w.u32[i] = (uint32_t)v;
+        }
+        memset(w.u8 + n * esz, 0, (size_t)(32 - n * esz));
+        memset(&m, 0, sizeof m);
+        put256(cpu, d->reg, 1, &w);
+        put256(cpu, insn->vvvv, 1, &m);
         return OCERZ_STEP_OK;
     }
     case OP(OCERZ_OP_VZEROUPPER):
@@ -2079,6 +2222,86 @@ static int do_avx256_cross(OcerzCPU *cpu, const X86Insn *insn)
     }
     default:
         return OCERZ_EUNSUP;
+    }
+}
+
+static double fma_elem_d(double a, double b, double c, int negmul, int negadd)
+{
+    if (isnan(a) || isnan(b) || isnan(c)) {
+        double n = isnan(a) ? a : isnan(b) ? b : c;
+        return fixnan_d(n, n, n);
+    }
+    return fixnan_d(0, 0, fma(negmul ? -a : a, b, negadd ? -c : c));
+}
+
+static float fma_elem_f(float a, float b, float c, int negmul, int negadd)
+{
+    if (isnan(a) || isnan(b) || isnan(c)) {
+        float n = isnan(a) ? a : isnan(b) ? b : c;
+        return fixnan_f(n, n, n);
+    }
+    return fixnan_f(0, 0, fmaf(negmul ? -a : a, b, negadd ? -c : c));
+}
+
+static int do_fma(OcerzCPU *cpu, const X86Insn *insn)
+{
+    const X86Operand *d = &insn->ops[0];
+    const X86Operand *s = &insn->ops[1];
+    int idx = insn->op - OCERZ_OP_VFMA_FIRST;
+    int pd = idx & 1, kind = (idx >> 1) % 10, order = (idx >> 1) / 10;
+    int scalar = kind >= 3 && (kind & 1);
+    int L = !scalar && (insn->vex & OCERZ_VEX_L);
+    int n = scalar ? 1 : (L ? 4 : 2) * (pd ? 1 : 2);
+    w256 o1 = reg256(cpu, d->reg), o2 = reg256(cpu, insn->vvvv), o3;
+    if (scalar && s->kind == OCERZ_OPK_MEM) {
+        uint64_t v = ocerz_ld(ocerz_ea(cpu, insn, s), pd ? 8 : 4);
+        memset(&o3, 0, sizeof o3);
+        memcpy(o3.u8, &v, 8);
+    } else {
+        o3 = src256(cpu, insn, s, L);
+    }
+    const w256 *a = order == 0 ? &o1 : &o2;
+    const w256 *b = order == 1 ? &o1 : &o3;
+    const w256 *c = order == 0 ? &o2 : order == 1 ? &o3 : &o1;
+    int negmul = kind >= 6;
+    w256 r = o1;
+    for (int i = 0; i < n; i++) {
+        int negadd = kind == 0 ? !(i & 1) : kind == 1 ? (i & 1) : (kind == 4 || kind == 5 || kind >= 8);
+        if (pd) {
+            double x, y, z;
+            memcpy(&x, a->u8 + 8 * i, 8);
+            memcpy(&y, b->u8 + 8 * i, 8);
+            memcpy(&z, c->u8 + 8 * i, 8);
+            double v = fma_elem_d(x, y, z, negmul, negadd);
+            memcpy(r.u8 + 8 * i, &v, 8);
+        } else {
+            float x, y, z;
+            memcpy(&x, a->u8 + 4 * i, 4);
+            memcpy(&y, b->u8 + 4 * i, 4);
+            memcpy(&z, c->u8 + 4 * i, 4);
+            float v = fma_elem_f(x, y, z, negmul, negadd);
+            memcpy(r.u8 + 4 * i, &v, 4);
+        }
+    }
+    put256(cpu, d->reg, L, &r);
+    return OCERZ_STEP_OK;
+}
+
+static int vex_lig(int op)
+{
+    switch (op) {
+    case OCERZ_OP_ADDSS: case OCERZ_OP_ADDSD: case OCERZ_OP_SUBSS: case OCERZ_OP_SUBSD:
+    case OCERZ_OP_MULSS: case OCERZ_OP_MULSD: case OCERZ_OP_DIVSS: case OCERZ_OP_DIVSD:
+    case OCERZ_OP_MINSS: case OCERZ_OP_MINSD: case OCERZ_OP_MAXSS: case OCERZ_OP_MAXSD:
+    case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_RSQRTSS: case OCERZ_OP_RCPSS:
+    case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX: case OCERZ_OP_ROUNDSS: case OCERZ_OP_ROUNDSD:
+    case OCERZ_OP_COMISS: case OCERZ_OP_COMISD: case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD:
+    case OCERZ_OP_CVTSI2SS: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSS2SI: case OCERZ_OP_CVTSD2SI:
+    case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTSD2SS:
+    case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX:
+        return 1;
+    default:
+        return 0;
     }
 }
 
@@ -2247,11 +2470,20 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_VPERMILPS: case OCERZ_OP_VPERMILPD: case OCERZ_OP_VTESTPS: case OCERZ_OP_VTESTPD:
     case OCERZ_OP_VCVTPH2PS: case OCERZ_OP_VCVTPS2PH: case OCERZ_OP_VINSERTF128: case OCERZ_OP_VEXTRACTF128:
     case OCERZ_OP_VPERM2F128: case OCERZ_OP_VZEROUPPER: case OCERZ_OP_VZEROALL:
+    case OCERZ_OP_VPBROADCASTB: case OCERZ_OP_VPBROADCASTW: case OCERZ_OP_VPBROADCASTD: case OCERZ_OP_VPBROADCASTQ:
+    case OCERZ_OP_VBROADCASTI128: case OCERZ_OP_VINSERTI128: case OCERZ_OP_VEXTRACTI128: case OCERZ_OP_VPERM2I128:
+    case OCERZ_OP_VPBLENDD: case OCERZ_OP_VPERMD: case OCERZ_OP_VPERMPS: case OCERZ_OP_VPERMQ: case OCERZ_OP_VPERMPD:
+    case OCERZ_OP_VPSLLVD: case OCERZ_OP_VPSLLVQ: case OCERZ_OP_VPSRLVD: case OCERZ_OP_VPSRLVQ: case OCERZ_OP_VPSRAVD:
+    case OCERZ_OP_VPMASKMOVD: case OCERZ_OP_VPMASKMOVQ: case OCERZ_OP_VMASKMOVPS: case OCERZ_OP_VMASKMOVPD:
+    case OCERZ_OP_VPGATHERDD: case OCERZ_OP_VPGATHERDQ: case OCERZ_OP_VPGATHERQD: case OCERZ_OP_VPGATHERQQ:
+    case OCERZ_OP_VGATHERDPS: case OCERZ_OP_VGATHERDPD: case OCERZ_OP_VGATHERQPS: case OCERZ_OP_VGATHERQPD:
         return do_avx_only(cpu, insn);
     default:
         break;
     }
-    if (!(insn->vex & OCERZ_VEX_L)) {
+    if (insn->op >= OCERZ_OP_VFMA_FIRST && insn->op <= OCERZ_OP_VFMA_LAST)
+        return do_fma(cpu, insn);
+    if (!(insn->vex & OCERZ_VEX_L) || vex_lig(insn->op)) {
         int rc = sse_exec(vm, cpu, insn);
         if (rc != OCERZ_STEP_OK) return rc;
         if (vex_writes_xmm_dst(insn)) { cpu->ymmh[insn->ops[0].reg].lo = 0; cpu->ymmh[insn->ops[0].reg].hi = 0; }
@@ -2291,6 +2523,8 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     }
     if (insn->op == OCERZ_OP_BLENDPS) hi.ops[2].imm = (insn->ops[2].imm >> 4) & 0xf;
     else if (insn->op == OCERZ_OP_BLENDPD) hi.ops[2].imm = (insn->ops[2].imm >> 2) & 0x3;
+    else if (insn->op == OCERZ_OP_SHUFPD) hi.ops[2].imm = (insn->ops[2].imm >> 2) & 0x3;
+    else if (insn->op == OCERZ_OP_MPSADBW) hi.ops[2].imm = (insn->ops[2].imm >> 3) & 0x7;
     for (int k = 0; k < nregs; k++) { Ocerz128 t = cpu->xmm[regs[k]]; cpu->xmm[regs[k]] = cpu->ymmh[regs[k]]; cpu->ymmh[regs[k]] = t; }
     rc = sse_exec(vm, cpu, &hi);
     for (int k = 0; k < nregs; k++) { Ocerz128 t = cpu->xmm[regs[k]]; cpu->xmm[regs[k]] = cpu->ymmh[regs[k]]; cpu->ymmh[regs[k]] = t; }

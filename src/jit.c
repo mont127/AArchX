@@ -11463,7 +11463,8 @@ static int splice_callee(uint64_t target, uint64_t ret_rip, uint64_t self_rip,
             continue;
         }
         if (is_terminator(op) || op == OCERZ_OP_JCC || op == OCERZ_OP_SYSCALL ||
-            op == OCERZ_OP_FXSAVE || op == OCERZ_OP_FXRSTOR)
+            op == OCERZ_OP_FXSAVE || op == OCERZ_OP_FXRSTOR ||
+            op == OCERZ_OP_XSAVE || op == OCERZ_OP_XRSTOR)
             goto fail;
         (*vn)++;
         pc += in->len;

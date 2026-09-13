@@ -439,7 +439,7 @@ static void test_cpuid_rdtsc(OcerzVM *vm)
     c->gpr[OCERZ_RAX] = 0;
     X86Insn cid = mk(OCERZ_OP_CPUID, 4);
     check(ocerz_interp_ext(vm, c, &cid) == OCERZ_STEP_OK);
-    check((uint32_t)c->gpr[OCERZ_RAX] == 7);
+    check((uint32_t)c->gpr[OCERZ_RAX] == 0xd);
     check((uint32_t)c->gpr[OCERZ_RBX] == 0x756e6547);
     check((uint32_t)c->gpr[OCERZ_RDX] == 0x49656e69);
     check((uint32_t)c->gpr[OCERZ_RCX] == 0x6c65746e);
@@ -507,8 +507,22 @@ static void test_cpuid_rdtsc(OcerzVM *vm)
     c->gpr[OCERZ_RCX] = 0;
     X86Insn xg = mk(OCERZ_OP_XGETBV, 4);
     check(ocerz_interp_ext(vm, c, &xg) == OCERZ_STEP_OK);
-    check(c->gpr[OCERZ_RAX] == 3);
+    check(c->gpr[OCERZ_RAX] == 7);
     check(c->gpr[OCERZ_RDX] == 0);
+
+    setup(vm);
+    c->gpr[OCERZ_RAX] = 0xd;
+    c->gpr[OCERZ_RCX] = 0;
+    cid = mk(OCERZ_OP_CPUID, 4);
+    check(ocerz_interp_ext(vm, c, &cid) == OCERZ_STEP_OK);
+    check(c->gpr[OCERZ_RAX] == 7 && c->gpr[OCERZ_RBX] == 0x340 && c->gpr[OCERZ_RCX] == 0x340);
+
+    setup(vm);
+    c->gpr[OCERZ_RAX] = 0xd;
+    c->gpr[OCERZ_RCX] = 2;
+    cid = mk(OCERZ_OP_CPUID, 4);
+    check(ocerz_interp_ext(vm, c, &cid) == OCERZ_STEP_OK);
+    check(c->gpr[OCERZ_RAX] == 0x100 && c->gpr[OCERZ_RBX] == 0x240);
 }
 
 static void test_fxsave_xmm(OcerzVM *vm)

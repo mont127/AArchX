@@ -79,6 +79,9 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
     case OCERZ_OP_CPUID: case OCERZ_OP_RDTSC: case OCERZ_OP_RDTSCP:
     case OCERZ_OP_MOVSEG: case OCERZ_OP_FXSAVE: case OCERZ_OP_FXRSTOR:
     case OCERZ_OP_LDMXCSR: case OCERZ_OP_STMXCSR: case OCERZ_OP_XGETBV:
+    case OCERZ_OP_XSAVE: case OCERZ_OP_XRSTOR: case OCERZ_OP_MOVBE:
+    case OCERZ_OP_PDEP: case OCERZ_OP_PEXT: case OCERZ_OP_MULX:
+    case OCERZ_OP_RORX: case OCERZ_OP_SARX: case OCERZ_OP_SHLX: case OCERZ_OP_SHRX:
         d = 0;
         u = 0;
         break;
@@ -227,8 +230,14 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
     case OCERZ_OP_TZCNT: case OCERZ_OP_LZCNT:
         d = OCERZ_CF | OCERZ_ZF; u = 0;
         break;
-    case OCERZ_OP_POPCNT:
+    case OCERZ_OP_POPCNT: case OCERZ_OP_RDRAND:
         d = OCERZ_FL_ALL; u = 0;
+        break;
+    case OCERZ_OP_ANDN: case OCERZ_OP_BLSR: case OCERZ_OP_BLSMSK: case OCERZ_OP_BLSI: case OCERZ_OP_BZHI:
+        d = OCERZ_CF | OCERZ_ZF | OCERZ_SF | OCERZ_OF; u = 0;
+        break;
+    case OCERZ_OP_BEXTR:
+        d = OCERZ_CF | OCERZ_ZF | OCERZ_OF; u = 0;
         break;
     case OCERZ_OP_BT: case OCERZ_OP_BTS: case OCERZ_OP_BTR: case OCERZ_OP_BTC:
         d = OCERZ_CF; u = 0;

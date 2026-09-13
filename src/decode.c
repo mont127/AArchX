@@ -717,6 +717,10 @@ static int vex_finish(DecState *s)
     case OCERZ_OP_PCLMULQDQ: case OCERZ_OP_AESENC: case OCERZ_OP_AESENCLAST: case OCERZ_OP_AESDEC: case OCERZ_OP_AESDECLAST:
     case OCERZ_OP_MOVLHPS: case OCERZ_OP_MOVHLPS:
     case OCERZ_OP_VINSERTF128: case OCERZ_OP_VPERM2F128:
+    case OCERZ_OP_VINSERTI128: case OCERZ_OP_VPERM2I128: case OCERZ_OP_VPBLENDD:
+    case OCERZ_OP_VPERMD: case OCERZ_OP_VPERMPS:
+    case OCERZ_OP_VPSLLVD: case OCERZ_OP_VPSLLVQ: case OCERZ_OP_VPSRLVD: case OCERZ_OP_VPSRLVQ: case OCERZ_OP_VPSRAVD:
+    case OCERZ_OP_VPMASKMOVD: case OCERZ_OP_VPMASKMOVQ: case OCERZ_OP_VMASKMOVPS: case OCERZ_OP_VMASKMOVPD:
         o->vex |= OCERZ_VEX_NDS;
         break;
     case OCERZ_OP_VPERMILPS: case OCERZ_OP_VPERMILPD:
@@ -747,10 +751,16 @@ static int vex_finish(DecState *s)
     case OCERZ_OP_BLENDVPS: case OCERZ_OP_BLENDVPD: case OCERZ_OP_PBLENDVB:
         o->vex |= OCERZ_VEX_NDS | OCERZ_VEX_IS4;
         break;
-    case OCERZ_OP_VBROADCASTSS:
+    case OCERZ_OP_VPBROADCASTB:
+        if (o->ops[1].kind == OCERZ_OPK_MEM) o->ops[1].size = 1;
+        break;
+    case OCERZ_OP_VPBROADCASTW:
+        if (o->ops[1].kind == OCERZ_OPK_MEM) o->ops[1].size = 2;
+        break;
+    case OCERZ_OP_VBROADCASTSS: case OCERZ_OP_VPBROADCASTD:
         if (o->ops[1].kind == OCERZ_OPK_MEM) o->ops[1].size = 4;
         break;
-    case OCERZ_OP_VBROADCASTSD:
+    case OCERZ_OP_VBROADCASTSD: case OCERZ_OP_VPBROADCASTQ:
         if (o->ops[1].kind == OCERZ_OPK_MEM) o->ops[1].size = 8;
         break;
     case OCERZ_OP_VCVTPH2PS:
@@ -760,6 +770,8 @@ static int vex_finish(DecState *s)
         if (o->ops[0].kind == OCERZ_OPK_MEM) o->ops[0].size = (uint8_t)(s->vex_l ? 16 : 8);
         break;
     default:
+        if (o->op >= OCERZ_OP_VFMA_FIRST && o->op <= OCERZ_OP_VFMA_LAST)
+            o->vex |= OCERZ_VEX_NDS;
         break;
     }
     return OCERZ_OK;
@@ -2599,6 +2611,12 @@ static int decode_0f(DecState *s, uint8_t op2)
                 return OCERZ_EUNDEF;
             set_op(s, OCERZ_OP_STMXCSR);
             break;
+        case 4:
+        case 5:
+            if (mand != MAND_NONE || s->vex)
+                return OCERZ_EUNDEF;
+            set_op(s, idx == 4 ? OCERZ_OP_XSAVE : OCERZ_OP_XRSTOR);
+            break;
         case 7:
             set_op(s, OCERZ_OP_CLFLUSH);
             break;
@@ -2826,6 +2844,16 @@ static int decode_0f(DecState *s, uint8_t op2)
         if (e)
             return e;
         int idx = m.reg & 7;
+        if (idx == 6 && rm_is_reg(&m)) {
+            if (mand == MAND_F3 || mand == MAND_F2 || s->vex)
+                return OCERZ_EUNDEF;
+            int size = opsize_default(s);
+            set_op(s, OCERZ_OP_RDRAND);
+            s->out->opsize = (uint8_t)size;
+            s->out->nops = 1;
+            set_reg(&s->out->ops[0], m.rm, size);
+            return OCERZ_OK;
+        }
         if (idx != 1)
             return OCERZ_EUNDEF;
         if (rm_is_reg(&m))
@@ -2998,15 +3026,153 @@ static int decode_0f(DecState *s, uint8_t op2)
     return OCERZ_EUNDEF;
 }
 
+static int decode_bmi(DecState *s, uint8_t op3)
+{
+    if (s->vex_l)
+        return OCERZ_EUNDEF;
+    int mand = sse_prefix(s);
+    int size = s->vex_w ? 8 : 4;
+    int op = OCERZ_OP_INVALID, form = 0;
+    switch (op3) {
+    case 0xf2:
+        if (mand != MAND_NONE)
+            return OCERZ_EUNDEF;
+        op = OCERZ_OP_ANDN;
+        break;
+    case 0xf3:
+        if (mand != MAND_NONE)
+            return OCERZ_EUNDEF;
+        form = 1;
+        break;
+    case 0xf5:
+        if (mand == MAND_NONE) {
+            op = OCERZ_OP_BZHI;
+            form = 2;
+        } else if (mand == MAND_F2) {
+            op = OCERZ_OP_PDEP;
+        } else if (mand == MAND_F3) {
+            op = OCERZ_OP_PEXT;
+        } else {
+            return OCERZ_EUNDEF;
+        }
+        break;
+    case 0xf6:
+        if (mand != MAND_F2)
+            return OCERZ_EUNDEF;
+        op = OCERZ_OP_MULX;
+        break;
+    case 0xf7:
+        op = mand == MAND_NONE ? OCERZ_OP_BEXTR : mand == MAND_66 ? OCERZ_OP_SHLX
+           : mand == MAND_F3 ? OCERZ_OP_SARX : OCERZ_OP_SHRX;
+        form = 2;
+        break;
+    default:
+        return OCERZ_EUNDEF;
+    }
+    ModRM m;
+    int e = decode_modrm(s, &m, size);
+    if (e)
+        return e;
+    if (form == 1) {
+        switch (m.reg & 7) {
+        case 1: op = OCERZ_OP_BLSR; break;
+        case 2: op = OCERZ_OP_BLSMSK; break;
+        case 3: op = OCERZ_OP_BLSI; break;
+        default: return OCERZ_EUNDEF;
+        }
+    }
+    set_op(s, op);
+    s->out->opsize = (uint8_t)size;
+    if (form == 1) {
+        s->out->nops = 2;
+        set_reg(&s->out->ops[0], s->vex_vvvv, size);
+        place_rm(s, &m, &s->out->ops[1], size, 1);
+        return OCERZ_OK;
+    }
+    s->out->nops = 3;
+    set_reg(&s->out->ops[0], m.reg, size);
+    if (form == 0) {
+        set_reg(&s->out->ops[1], s->vex_vvvv, size);
+        place_rm(s, &m, &s->out->ops[2], size, 1);
+    } else {
+        place_rm(s, &m, &s->out->ops[1], size, 1);
+        set_reg(&s->out->ops[2], s->vex_vvvv, size);
+    }
+    return OCERZ_OK;
+}
+
+static int decode_movbe(DecState *s, uint8_t op3)
+{
+    if (sse_prefix(s) != MAND_NONE && sse_prefix(s) != MAND_66)
+        return OCERZ_EUNDEF;
+    int size = opsize_default(s);
+    ModRM m;
+    int e = decode_modrm(s, &m, size);
+    if (e)
+        return e;
+    if (rm_is_reg(&m))
+        return OCERZ_EUNDEF;
+    int load = op3 == 0xf0;
+    set_op(s, OCERZ_OP_MOVBE);
+    s->out->opsize = (uint8_t)size;
+    s->out->nops = 2;
+    set_reg(&s->out->ops[load ? 0 : 1], m.reg, size);
+    s->out->ops[load ? 1 : 0] = m.mem;
+    s->out->ops[load ? 1 : 0].size = (uint8_t)size;
+    return OCERZ_OK;
+}
+
+static int decode_maskmov(DecState *s, uint8_t op3)
+{
+    int op;
+    if (op3 == 0x8c || op3 == 0x8e)
+        op = s->vex_w ? OCERZ_OP_VPMASKMOVQ : OCERZ_OP_VPMASKMOVD;
+    else if (s->vex_w)
+        return OCERZ_EUNDEF;
+    else
+        op = (op3 & 1) ? OCERZ_OP_VMASKMOVPD : OCERZ_OP_VMASKMOVPS;
+    int store = op3 == 0x2e || op3 == 0x2f || op3 == 0x8e;
+    int e = decode_sse_rr(s, op, 16, !store);
+    if (e)
+        return e;
+    return s->out->ops[store ? 0 : 1].kind == OCERZ_OPK_MEM ? OCERZ_OK : OCERZ_EUNDEF;
+}
+
+static int decode_gather(DecState *s, uint8_t op3)
+{
+    static const int gather_ops[8] = {
+        OCERZ_OP_VPGATHERDD, OCERZ_OP_VPGATHERDQ, OCERZ_OP_VPGATHERQD, OCERZ_OP_VPGATHERQQ,
+        OCERZ_OP_VGATHERDPS, OCERZ_OP_VGATHERDPD, OCERZ_OP_VGATHERQPS, OCERZ_OP_VGATHERQPD,
+    };
+    if (s->end - s->p < 2)
+        return OCERZ_ETRUNC;
+    if ((s->p[0] >> 6) == 3 || (s->p[0] & 7) != 4)
+        return OCERZ_EUNDEF;
+    int index = ((s->p[1] >> 3) & 7) | (s->rex_x ? 8 : 0);
+    ModRM m;
+    int e = decode_modrm(s, &m, 16);
+    if (e)
+        return e;
+    set_op(s, gather_ops[(op3 - 0x90) * 2 + (s->vex_w ? 1 : 0)]);
+    s->out->opsize = 16;
+    s->out->nops = 2;
+    set_xmm(&s->out->ops[0], m.reg, 16);
+    s->out->ops[1] = m.mem;
+    s->out->ops[1].index = (uint8_t)index;
+    return OCERZ_OK;
+}
+
 static int decode_0f38(DecState *s)
 {
     uint8_t op3;
     int e = fetch8(s, &op3);
     if (e)
         return e;
+    if (s->vex && op3 >= 0xf0)
+        return decode_bmi(s, op3);
     if (op3 == 0xf0 || op3 == 0xf1) {
         if (sse_prefix(s) != MAND_F2)
-            return OCERZ_EUNDEF;
+            return decode_movbe(s, op3);
         int dsize = s->rex_w ? 8 : 4;
         int ssize = op3 == 0xf0 ? 1 : (s->rex_w ? 8 : (s->has_66 ? 2 : 4));
         ModRM m;
@@ -3049,6 +3215,22 @@ static int decode_0f38(DecState *s)
     case 0x18: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VBROADCASTSS; break;
     case 0x19: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VBROADCASTSD; break;
     case 0x1a: if (!s->vex) return OCERZ_EUNDEF; op = OCERZ_OP_VBROADCASTF128; break;
+    case 0x16: if (!s->vex || !s->vex_l || s->vex_w) return OCERZ_EUNDEF; op = OCERZ_OP_VPERMPS; break;
+    case 0x36: if (!s->vex || !s->vex_l || s->vex_w) return OCERZ_EUNDEF; op = OCERZ_OP_VPERMD; break;
+    case 0x45: if (!s->vex) return OCERZ_EUNDEF; op = s->vex_w ? OCERZ_OP_VPSRLVQ : OCERZ_OP_VPSRLVD; break;
+    case 0x46: if (!s->vex || s->vex_w) return OCERZ_EUNDEF; op = OCERZ_OP_VPSRAVD; break;
+    case 0x47: if (!s->vex) return OCERZ_EUNDEF; op = s->vex_w ? OCERZ_OP_VPSLLVQ : OCERZ_OP_VPSLLVD; break;
+    case 0x58: if (!s->vex || s->vex_w) return OCERZ_EUNDEF; op = OCERZ_OP_VPBROADCASTD; break;
+    case 0x59: if (!s->vex || s->vex_w) return OCERZ_EUNDEF; op = OCERZ_OP_VPBROADCASTQ; break;
+    case 0x5a: if (!s->vex || !s->vex_l || s->vex_w) return OCERZ_EUNDEF; op = OCERZ_OP_VBROADCASTI128; break;
+    case 0x78: if (!s->vex || s->vex_w) return OCERZ_EUNDEF; op = OCERZ_OP_VPBROADCASTB; break;
+    case 0x79: if (!s->vex || s->vex_w) return OCERZ_EUNDEF; op = OCERZ_OP_VPBROADCASTW; break;
+    case 0x2c: case 0x2d: case 0x2e: case 0x2f: case 0x8c: case 0x8e:
+        if (!s->vex) return OCERZ_EUNDEF;
+        return decode_maskmov(s, op3);
+    case 0x90: case 0x91: case 0x92: case 0x93:
+        if (!s->vex) return OCERZ_EUNDEF;
+        return decode_gather(s, op3);
     case 0x10: op = OCERZ_OP_PBLENDVB; break;
     case 0x14: op = OCERZ_OP_BLENDVPS; break;
     case 0x15: op = OCERZ_OP_BLENDVPD; break;
@@ -3088,7 +3270,13 @@ static int decode_0f38(DecState *s)
     case 0xdd: op = OCERZ_OP_AESENCLAST; break;
     case 0xde: op = OCERZ_OP_AESDEC; break;
     case 0xdf: op = OCERZ_OP_AESDECLAST; break;
-    default: return OCERZ_EUNDEF;
+    default:
+        if (s->vex && op3 >= 0x96 && op3 <= 0xbf && (op3 & 0x0f) >= 6) {
+            int lo = op3 & 0x0f;
+            op = OCERZ_OP_VFMA_FIRST + ((((op3 >> 4) - 9) * 10 + lo - 6) * 2 + (s->vex_w ? 1 : 0));
+            return decode_sse_rr(s, op, (lo >= 9 && (lo & 1)) ? (s->vex_w ? 8 : 4) : 16, 1);
+        }
+        return OCERZ_EUNDEF;
     }
     if (mmx)
         return decode_mmx_rr(s, op, 1);
@@ -3103,10 +3291,32 @@ static int decode_0f3a(DecState *s)
         return e;
     if (op3 == 0x0f && sse_prefix(s) == MAND_NONE && !s->vex)
         return decode_mmx_rri(s, OCERZ_OP_PALIGNR);
+    if (op3 == 0xf0 && s->vex) {
+        if (sse_prefix(s) != MAND_F2 || s->vex_l)
+            return OCERZ_EUNDEF;
+        int size = s->vex_w ? 8 : 4;
+        ModRM m;
+        e = decode_modrm(s, &m, size);
+        if (e)
+            return e;
+        set_op(s, OCERZ_OP_RORX);
+        s->out->opsize = (uint8_t)size;
+        s->out->nops = 3;
+        set_reg(&s->out->ops[0], m.reg, size);
+        place_rm(s, &m, &s->out->ops[1], size, 1);
+        return read_imm8s(s, &s->out->ops[2], 1);
+    }
     if (sse_prefix(s) != MAND_66)
         return OCERZ_EUNDEF;
 
     switch (op3) {
+    case 0x00: case 0x01:
+        if (!s->vex || !s->vex_l || !s->vex_w) return OCERZ_EUNDEF;
+        return decode_pint_imm(s, op3 ? OCERZ_OP_VPERMPD : OCERZ_OP_VPERMQ);
+    case 0x02: if (!s->vex || s->vex_w) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPBLENDD);
+    case 0x38: if (!s->vex || !s->vex_l || s->vex_w) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VINSERTI128);
+    case 0x39: if (!s->vex || !s->vex_l || s->vex_w) return OCERZ_EUNDEF; return decode_sse_rri(s, OCERZ_OP_VEXTRACTI128, 16, 0);
+    case 0x46: if (!s->vex || !s->vex_l || s->vex_w) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERM2I128);
     case 0x04: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERMILPS);
     case 0x05: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERMILPD);
     case 0x06: if (!s->vex) return OCERZ_EUNDEF; return decode_pint_imm(s, OCERZ_OP_VPERM2F128);
@@ -4005,6 +4215,63 @@ static void init_op_names(void)
     op_names[OCERZ_OP_CVTTPS2PI] = "cvttps2pi";
     op_names[OCERZ_OP_CVTPD2PI] = "cvtpd2pi";
     op_names[OCERZ_OP_CVTTPD2PI] = "cvttpd2pi";
+    op_names[OCERZ_OP_VPBROADCASTB] = "vpbroadcastb";
+    op_names[OCERZ_OP_VPBROADCASTW] = "vpbroadcastw";
+    op_names[OCERZ_OP_VPBROADCASTD] = "vpbroadcastd";
+    op_names[OCERZ_OP_VPBROADCASTQ] = "vpbroadcastq";
+    op_names[OCERZ_OP_VBROADCASTI128] = "vbroadcasti128";
+    op_names[OCERZ_OP_VINSERTI128] = "vinserti128";
+    op_names[OCERZ_OP_VEXTRACTI128] = "vextracti128";
+    op_names[OCERZ_OP_VPERM2I128] = "vperm2i128";
+    op_names[OCERZ_OP_VPBLENDD] = "vpblendd";
+    op_names[OCERZ_OP_VPERMD] = "vpermd";
+    op_names[OCERZ_OP_VPERMPS] = "vpermps";
+    op_names[OCERZ_OP_VPERMQ] = "vpermq";
+    op_names[OCERZ_OP_VPERMPD] = "vpermpd";
+    op_names[OCERZ_OP_VPSLLVD] = "vpsllvd";
+    op_names[OCERZ_OP_VPSLLVQ] = "vpsllvq";
+    op_names[OCERZ_OP_VPSRLVD] = "vpsrlvd";
+    op_names[OCERZ_OP_VPSRLVQ] = "vpsrlvq";
+    op_names[OCERZ_OP_VPSRAVD] = "vpsravd";
+    op_names[OCERZ_OP_VPMASKMOVD] = "vpmaskmovd";
+    op_names[OCERZ_OP_VPMASKMOVQ] = "vpmaskmovq";
+    op_names[OCERZ_OP_VMASKMOVPS] = "vmaskmovps";
+    op_names[OCERZ_OP_VMASKMOVPD] = "vmaskmovpd";
+    op_names[OCERZ_OP_VPGATHERDD] = "vpgatherdd";
+    op_names[OCERZ_OP_VPGATHERDQ] = "vpgatherdq";
+    op_names[OCERZ_OP_VPGATHERQD] = "vpgatherqd";
+    op_names[OCERZ_OP_VPGATHERQQ] = "vpgatherqq";
+    op_names[OCERZ_OP_VGATHERDPS] = "vgatherdps";
+    op_names[OCERZ_OP_VGATHERDPD] = "vgatherdpd";
+    op_names[OCERZ_OP_VGATHERQPS] = "vgatherqps";
+    op_names[OCERZ_OP_VGATHERQPD] = "vgatherqpd";
+    op_names[OCERZ_OP_ANDN] = "andn";
+    op_names[OCERZ_OP_BLSR] = "blsr";
+    op_names[OCERZ_OP_BLSMSK] = "blsmsk";
+    op_names[OCERZ_OP_BLSI] = "blsi";
+    op_names[OCERZ_OP_BZHI] = "bzhi";
+    op_names[OCERZ_OP_BEXTR] = "bextr";
+    op_names[OCERZ_OP_PDEP] = "pdep";
+    op_names[OCERZ_OP_PEXT] = "pext";
+    op_names[OCERZ_OP_MULX] = "mulx";
+    op_names[OCERZ_OP_RORX] = "rorx";
+    op_names[OCERZ_OP_SARX] = "sarx";
+    op_names[OCERZ_OP_SHLX] = "shlx";
+    op_names[OCERZ_OP_SHRX] = "shrx";
+    op_names[OCERZ_OP_MOVBE] = "movbe";
+    op_names[OCERZ_OP_XSAVE] = "xsave";
+    op_names[OCERZ_OP_XRSTOR] = "xrstor";
+    op_names[OCERZ_OP_RDRAND] = "rdrand";
+    static const char *const fma_kind[10] = { "fmaddsub", "fmsubadd", "fmadd", "fmadd", "fmsub",
+                                              "fmsub", "fnmadd", "fnmadd", "fnmsub", "fnmsub" };
+    static const int fma_order[3] = { 132, 213, 231 };
+    static char fma_names[60][16];
+    for (int i = 0; i < 60; i++) {
+        int k = (i >> 1) % 10;
+        snprintf(fma_names[i], sizeof fma_names[i], "v%s%d%c%c", fma_kind[k], fma_order[(i >> 1) / 10],
+                 (k >= 3 && (k & 1)) ? 's' : 'p', (i & 1) ? 'd' : 's');
+        op_names[OCERZ_OP_VFMA_FIRST + i] = fma_names[i];
+    }
 }
 
 int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out)
