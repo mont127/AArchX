@@ -210,19 +210,21 @@ int ocerz_peek_dynamic(const char *path)
     }
     uint32_t ncmds = rd32(slice + 16);
     const uint8_t *lc = slice + sizeof(struct mach_header_64);
-    int dynamic = -1;
+    int dynamic = -1, has_thread = 0, has_dylinker = 0;
     for (uint32_t i = 0; i < ncmds; i++) {
         uint32_t cmd = rd32(lc);
         if (cmd == 0x80000028) {
             dynamic = 1;
             break;
         }
-        if (cmd == LC_UNIXTHREAD) {
-            dynamic = 0;
-            break;
-        }
+        if (cmd == LC_UNIXTHREAD)
+            has_thread = 1;
+        if (cmd == LC_LOAD_DYLINKER)
+            has_dylinker = 1;
         lc += rd32(lc + 4);
     }
+    if (dynamic < 0 && has_thread)
+        dynamic = has_dylinker;
     free(buf);
     return dynamic;
 }
@@ -234,9 +236,11 @@ typedef struct DynImage {
     uint8_t *owned_buf;
     char path[1024];
     char install_name[1024];
+    char id_name[1024];
     uint64_t slide;
     uint64_t load_base;
     uint64_t main_entry;
+    uint64_t thread_entry;
     uint32_t cf_off;
     uint32_t cf_size;
     uint32_t rebase_off;
@@ -290,9 +294,27 @@ static DynImage *dimg_find_by_path(const char *path)
 static DynImage *dimg_find_by_install_name(const char *iname)
 {
     for (int i = 0; i < g_dimgs_n; i++)
-        if (g_dimgs[i].install_name[0] && strcmp(g_dimgs[i].install_name, iname) == 0)
+        if ((g_dimgs[i].install_name[0] && strcmp(g_dimgs[i].install_name, iname) == 0) ||
+            (g_dimgs[i].id_name[0] && strcmp(g_dimgs[i].id_name, iname) == 0))
             return &g_dimgs[i];
     return NULL;
+}
+
+static void dimg_record_id(DynImage *d)
+{
+    const uint8_t *mh = d->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t csize = rd32(lc + 4);
+        uint32_t noff = rd32(lc + 8);
+        if (rd32(lc) == LC_ID_DYLIB && noff < csize) {
+            snprintf(d->id_name, sizeof d->id_name, "%.*s", (int)(csize - noff),
+                     (const char *)(lc + noff));
+            return;
+        }
+        lc += csize;
+    }
 }
 
 static int file_identity(const char *path, uint64_t *dev, uint64_t *ino)
@@ -447,6 +469,8 @@ static int map_segments(DynImage *img, int is_main)
                 memcpy(ocerz_g2h(vmaddr + img->slide), img->slice + fileoff, (size_t)filesize);
         } else if (cmd == 0x80000028) {
             img->main_entry = text_vmaddr + rd64(lc + 8) + img->slide;
+        } else if (cmd == LC_UNIXTHREAD && csize >= 152 && rd32(lc + 8) == 4) {
+            img->thread_entry = rd64(lc + 144) + img->slide;
         } else if (cmd == 0x80000034) {
             img->cf_off = rd32(lc + 8);
             img->cf_size = rd32(lc + 12);
@@ -1942,6 +1966,9 @@ static void canonicalize_objc_selrefs(DynImage *img)
 static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, DynImage *loader,
                                  const RpathList *rpaths)
 {
+    DynImage *by_name = dimg_find_by_install_name(install_name);
+    if (by_name)
+        return by_name;
     char resolved[1024];
     if (!expand_install_name(loader, install_name, rpaths, resolved, sizeof resolved))
         return NULL;
@@ -1985,6 +2012,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     snprintf(d->install_name, sizeof d->install_name, "%s", install_name);
     d->file_dev = fdev;
     d->file_ino = fino;
+    dimg_record_id(d);
 
     if (map_segments(d, 0) != OCERZ_OK) {
         OCERZ_FATAL("cannot map segments of %s\n", resolved);
@@ -2079,6 +2107,7 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     snprintf(d->path, sizeof d->path, "%s", install_path);
     snprintf(d->install_name, sizeof d->install_name, "%s", install_path);
     file_identity(install_path, &d->file_dev, &d->file_ino);
+    dimg_record_id(d);
     if (map_segments(d, 0) != OCERZ_OK) {
         dlerror_set("dlopen(%s): cannot map segments", install_path);
         g_dimgs_n--;
@@ -2516,8 +2545,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         free(buf);
         return r;
     }
-    if (img.main_entry == 0) {
-        OCERZ_FATAL("%s has no LC_MAIN entry\n", path);
+    if (img.main_entry == 0 && img.thread_entry == 0) {
+        OCERZ_FATAL("%s has no LC_MAIN or LC_UNIXTHREAD entry\n", path);
         free(buf);
         return OCERZ_EFORMAT;
     }
@@ -2696,6 +2725,20 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         uint64_t cfa = 0x7ff8400964a8ULL;
         fprintf(stderr, "ZONEPROBE kCFAllocatorSystemDefault@%#llx -> %#llx\n",
                 (unsigned long long)cfa, (unsigned long long)ocerz_ld(cfa, 8));
+    }
+
+    if (!img.main_entry) {
+        uint64_t vec_end = fr.apple_arr;
+        while (ocerz_ld(vec_end, 8) != 0)
+            vec_end += 8;
+        vec_end += 8;
+        uint64_t vec_len = vec_end - fr.argv_arr;
+        uint64_t sp = (fr.stack_top - vec_len - 8) & ~0xfull;
+        ocerz_st(sp, 8, fr.argc);
+        memcpy(ocerz_g2h(sp + 8), ocerz_g2h(fr.argv_arr), (size_t)vec_len);
+        vm->cpu.gpr[OCERZ_RSP] = sp;
+        vm->cpu.rip = img.thread_entry;
+        return ocerz_vm_run(vm);
     }
 
     if (ran_init) {
