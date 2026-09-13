@@ -1603,6 +1603,20 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x188:
         api_return(cpu, g_main_bv_sdk);
         return OCERZ_STEP_OK;
+    case 0x190:
+        api_return(cpu, g_main_bv_minos);
+        return OCERZ_STEP_OK;
+    case 0x178:
+    case 0x180: {
+        uint32_t plat, minos, sdk;
+        parse_build_version(cpu->gpr[OCERZ_RSI], &plat, &minos, &sdk);
+        api_return(cpu, off == 0x178 ? sdk : minos);
+        return OCERZ_STEP_OK;
+    }
+    case 0x3d8:
+    case 0x3e0:
+        api_return(cpu, ((uint64_t)(off == 0x3d8 ? g_main_bv_sdk : g_main_bv_minos) << 32) | g_main_bv_platform);
+        return OCERZ_STEP_OK;
     case 0x218: {
         uint64_t p = (uint32_t)cpu->gpr[OCERZ_RSI];
         static const uint8_t base[] = { 0, 1, 2, 3, 4, 5, 2, 2, 3, 4, 10, 11, 11 };

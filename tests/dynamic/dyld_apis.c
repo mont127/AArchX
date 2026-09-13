@@ -13,6 +13,11 @@
 #include <string.h>
 
 extern uint32_t dyld_get_program_sdk_version(void);
+extern uint32_t dyld_get_program_min_os_version(void);
+extern uint32_t dyld_get_sdk_version(const struct mach_header *mh);
+extern uint32_t dyld_get_min_os_version(const struct mach_header *mh);
+extern uint64_t dyld_get_program_sdk_version_token(void);
+extern uint64_t dyld_get_program_minos_version_token(void);
 extern uint32_t dyld_get_base_platform(uint32_t platform);
 extern int _dyld_get_image_uuid(const struct mach_header *mh, unsigned char uuid[16]);
 extern int _dyld_get_shared_cache_uuid(unsigned char uuid[16]);
@@ -38,6 +43,22 @@ int main(void)
     if (!bv || sdk == 0 || sdk != bv->sdk) {
         printf("BAD program sdk %#x, LC_BUILD_VERSION says %#x\n", sdk, bv ? bv->sdk : 0);
         return 1;
+    }
+    const struct mach_header *h = (const struct mach_header *)mh;
+    uint32_t minos = dyld_get_program_min_os_version();
+    if (minos == 0 || minos != bv->minos || dyld_get_sdk_version(h) != bv->sdk ||
+        dyld_get_min_os_version(h) != bv->minos) {
+        printf("BAD versions minos=%#x sdk(mh)=%#x minos(mh)=%#x, LC_BUILD_VERSION minos %#x sdk %#x\n", minos,
+               dyld_get_sdk_version(h), dyld_get_min_os_version(h), bv->minos, bv->sdk);
+        return 6;
+    }
+    uint64_t sdk_token = dyld_get_program_sdk_version_token();
+    uint64_t minos_token = dyld_get_program_minos_version_token();
+    if (sdk_token != (((uint64_t)bv->sdk << 32) | bv->platform) ||
+        minos_token != (((uint64_t)bv->minos << 32) | bv->platform)) {
+        printf("BAD version tokens sdk=%#llx minos=%#llx\n", (unsigned long long)sdk_token,
+               (unsigned long long)minos_token);
+        return 7;
     }
     if (dyld_get_base_platform(PLATFORM_MACOS) != PLATFORM_MACOS ||
         dyld_get_base_platform(PLATFORM_IOSSIMULATOR) != PLATFORM_IOS) {
