@@ -50,7 +50,7 @@ make -j
 | x86-64 guest gate | 93 / 93 |
 | x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
 | i386 differential gate | 20,033 / 20,033 |
-| dynamic-mode tests | 103 / 103 |
+| dynamic-mode tests | 107 / 107 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -97,10 +97,10 @@ Ollama's command-line binary (`Contents/Resources/ollama`, Go with cgo) works as
 - Bare `@loader_path` rpaths.
 - Constructors in programs that do not link CoreFoundation.
 
-Nobody has yet run a model under AArchX. The Ollama menu-bar app starts its server and then stops within 10 seconds, when WebKit's allocator fails to suspend a thread (`thread_suspend` returns `MACH_SEND_INVALID_DEST` for a thread other than the main one).
+The Ollama menu-bar app runs too. In a 30-second run it started its own server, served its settings page to its window and shut down cleanly on SIGTERM. Before that, WebKit's allocator stopped it within 10 seconds because it could not suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`): workqueue threads that AArchX started ended without running the guest's thread-exit path. Nobody has yet run a model under AArchX.
 
 Not working yet:
-- **Safari** starts but never shows a window. In a run on 2026-09-13, WebKit's allocator failed to suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`) and stopped the process. AArchX emulates thread suspension for guest threads, but the main thread was missing from that emulation until the same day, and Safari has not been run again since.
+- **Safari** starts but never shows a window. In a run on 2026-09-13, WebKit's allocator failed to suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`) and stopped the process. Two causes of that failure were fixed the same day. The main thread was missing from AArchX's thread-suspension emulation, and workqueue threads that AArchX started ended without running the guest's thread-exit path. Safari has not been run again since.
 - **Photos** aborted in `+[PAOpenGLDevice _sharedPixelFormat:]` because `CGLChoosePixelFormat` returned 10002 for every attribute set. The cause was in AArchX's dyld, not the Rosetta-only `AppleMetalGLRenderer` IOKit service blamed earlier. `_dyld_shared_cache_contains_path` rejected the software renderer's plugin path, which runs through a symlink, and `dlsym` on a shared-cache image searched the whole cache. Both are fixed, and CGL now lists the same renderers and builds the same pixel formats as under Rosetta. Photos has not been run again since.
 
 ## Steam
