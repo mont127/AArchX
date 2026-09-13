@@ -392,6 +392,7 @@ run_alias_case ddlopen_alias 'OK'
 run_dlopen_cf_case ddlopen_cf 'OK'
 run_file_case ddlsym_cache_image tests/dynamic/dlsym_cache_image.c 'OK'
 run_file_case dsyscalls_extra tests/dynamic/syscalls_extra.c 'OK'
+run_file_case dproc_self tests/dynamic/proc_self.c 'OK'
 run_file_case dmach_traps_extra tests/dynamic/mach_traps_extra.c 'OK'
 run_file_case dobjc_late_category tests/dynamic/objc_late_category.c 'OK' -framework Foundation
 run_asm_case dcef_partition tests/dynamic/cef_partition.c tests/dynamic/cef_partition.s 'OK'

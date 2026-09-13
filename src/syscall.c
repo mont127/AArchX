@@ -4499,6 +4499,46 @@ static void strace_bsd(OcerzVM *vm, const ocerz_bsd_entry *e, int num,
     (void)num;
 }
 
+static void set_comm_field(uint64_t g, size_t cap, const char *name)
+{
+    char *d = (char *)ocerz_g2h(g);
+    size_t n = strlen(name);
+    memset(d, 0, cap);
+    memcpy(d, name, n < cap ? n : cap);
+}
+
+static void proc_info_self_fixup(int num, const uint64_t orig[8])
+{
+    const char *path = ocerz_dyld_main_path();
+    uint64_t buf = num == 545 ? orig[6] : orig[4];
+    uint64_t size = (uint32_t)(num == 545 ? orig[7] : orig[5]);
+    if (!path || (int32_t)orig[0] != 2 || (int32_t)orig[1] != getpid() || !buf)
+        return;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    switch ((uint32_t)orig[2]) {
+    case 11: {
+        size_t n = strlen(path) + 1;
+        if (n <= size)
+            memcpy(ocerz_g2h(buf), path, n);
+        break;
+    }
+    case 2:
+    case 3:
+        if (size >= 136) {
+            set_comm_field(buf + 48, 16, base);
+            set_comm_field(buf + 64, 32, base);
+        }
+        break;
+    case 13:
+        if (size >= 64)
+            set_comm_field(buf + 16, 16, base);
+        break;
+    default:
+        break;
+    }
+}
+
 static int dispatch_bsd_at(OcerzVM *vm, OcerzCPU *cpu, int num, uint64_t stack_skip);
 
 static int dispatch_bsd(OcerzVM *vm, OcerzCPU *cpu, int num)
@@ -4789,6 +4829,8 @@ static int dispatch_bsd_at(OcerzVM *vm, OcerzCPU *cpu, int num, uint64_t stack_s
     }
 
     ocerz_sysfail_note(cpu, num, err ? (int)r : 0, orig);
+    if (!err && (num == 336 || num == 545))
+        proc_info_self_fixup(num, orig);
 
     {
         static int robust = -1;
