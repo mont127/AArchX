@@ -3392,6 +3392,17 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                          signo == 10 || signo == 11 || signo == 3 || signo == 7);
             if (fatal) {
                 { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("guest-abort"); }
+                fprintf(stderr, "ocerz: guest self-signal %llu rip=%#llx bt:",
+                        (unsigned long long)signo, (unsigned long long)cpu->rip);
+                uint64_t fp = cpu->gpr[OCERZ_RBP];
+                for (int d = 0; d < 16 && fp > 0x1000 && ocerz_addr_readable(fp + 8); d++) {
+                    fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+                    uint64_t nf = ocerz_ld(fp, 8);
+                    if (nf <= fp)
+                        break;
+                    fp = nf;
+                }
+                fprintf(stderr, "\n");
                 fprintf(stderr, "ocerz: guest self-signal %llu, no handler; exiting %d\n",
                         (unsigned long long)signo, 128 + (int)signo);
                 fflush(stderr);
@@ -5700,9 +5711,11 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             fprintf(stderr, "ocerz: PORTLOG[%d] %s name=%#llx right=%#llx delta=%#llx\n",
                     (int)getpid(), mach_trap_name(num), (unsigned long long)a[1],
                     (unsigned long long)a[2], (unsigned long long)a[3]);
+        cpu->block_nokick = num == 36 || num == 37 || num == 38;
         cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t rg = ocerz_host_mach_trap(num, a);
         cpu->block_since_ns = 0;
+        cpu->block_nokick = 0;
         {
             static int klog3 = -1;
             if (klog3 < 0) klog3 = getenv("OCERZ_KICKLOG") ? 1 : 0;

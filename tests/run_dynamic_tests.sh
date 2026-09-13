@@ -393,6 +393,7 @@ run_asm_case dcef_partition tests/dynamic/cef_partition.c tests/dynamic/cef_part
 run_spawn_argv_case dspawn_mock_keychain
 run_legacy_entry_case dlegacy_entry 'OK'
 run_idname_case didname 'OK'
+run_file_case dsemaphore_wait tests/dynamic/semaphore_wait.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"
