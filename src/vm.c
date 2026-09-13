@@ -2463,6 +2463,14 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     OcerzCPU *prev_cpu = g_cur_cpu;
     OcerzCPU local = prev_cpu ? *prev_cpu : vm->cpu;
     local.terminated = 0;
+    local.suspend_count = 0;
+    local.susp_parked = 0;
+    local.susp_host = 0;
+    local.susp_have_gpr = 0;
+    local.host_pthread = (void *)pthread_self();
+    local.host_kport = pthread_mach_thread_np(pthread_self());
+    pthread_threadid_np(NULL, &local.host_tid);
+    uint32_t prev_kport = prev_cpu ? prev_cpu->host_kport : 0;
     for (int i = 0; i < nargs && i < 6; i++)
         local.gpr[ar[i]] = args[i];
     uint64_t sp = (stack_top & ~0xfull) - 8;
@@ -2507,8 +2515,14 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     ocerz_host_sigmask_clear("callback");
     sigsetjmp(jb, 1);
     g_cur_cpu = &local;
+    if (prev_cpu) {
+        pthread_mutex_lock(&g_cpus_lock);
+        prev_cpu->host_kport = 0;
+        pthread_mutex_unlock(&g_cpus_lock);
+    }
     ocerz_cpu_register(&local);
     while (local.rip != sentinel && !vm->exited && !local.terminated) {
+        ocerz_vm_suspend_point(&local);
         g_riphist[g_riphist_n++ & 31] = local.rip;
         int r;
         int mtrace_hit = 0;
@@ -2625,6 +2639,11 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
         }
     }
     ocerz_cpu_unregister(&local);
+    if (prev_cpu) {
+        pthread_mutex_lock(&g_cpus_lock);
+        prev_cpu->host_kport = prev_kport;
+        pthread_mutex_unlock(&g_cpus_lock);
+    }
     g_sig_recover = prev_recover;
     if (prev_cpu && vm->jit_ordered_required)
         __atomic_store_n(&prev_cpu->ras_top, 0, __ATOMIC_RELEASE);
