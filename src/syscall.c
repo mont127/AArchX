@@ -3450,7 +3450,8 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     if (oss != 0) {
         ocerz_st(oss + 0, 8, cpu->sig_altstack_sp);
         ocerz_st(oss + 8, 8, cpu->sig_altstack_size);
-        ocerz_st(oss + 16, 4, cpu->sig_on_stack ? 0x0001u : 0u);
+        ocerz_st(oss + 16, 4, (cpu->sig_on_stack ? 0x0001u : 0u) |
+                              (cpu->sig_altstack_sp == 0 && cpu->sig_altstack_size == 0 ? 0x0004u : 0u));
     }
     if (ss != 0) {
         uint32_t flags = (uint32_t)ocerz_ld(ss + 16, 4);
