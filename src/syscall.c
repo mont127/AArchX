@@ -1599,6 +1599,20 @@ static void spawn_rewrite_launchd(char *const *hargv, int n, const char *self)
     }
 }
 
+static int spawn_mock_keychain(char **hargv, int n, int at, const char *gpath)
+{
+    const char *base = strrchr(gpath, '/');
+    base = base ? base + 1 : gpath;
+    if (strcmp(base, "Steam Helper") != 0 || getenv("OCERZ_NO_MOCK_KEYCHAIN") || n >= 259 || at > n)
+        return n;
+    for (int k = at; k < n; k++)
+        if (hargv[k] && strcmp(hargv[k], "--use-mock-keychain") == 0)
+            return n;
+    memmove(&hargv[at + 1], &hargv[at], sizeof hargv[0] * (size_t)(n - at));
+    hargv[at] = (char *)"--use-mock-keychain";
+    return n + 1;
+}
+
 static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     const char *self = ocerz_self_path();
@@ -1621,6 +1635,7 @@ static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         for (uint64_t p = a[3] + 8; n < 258 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
             hargv[n++] = (char *)ocerz_g2h(gv);
     }
+    n = spawn_mock_keychain(hargv, n, 2, gpath);
     hargv[n] = NULL;
     spawn_rewrite_launchd(hargv, n, self);
     char *henv[514];
@@ -1732,6 +1747,7 @@ static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         uint64_t gv;
         for (uint64_t p = a[1]; n < 258 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
             hargv[n++] = (char *)ocerz_g2h(gv);
+        n = spawn_mock_keychain(hargv, n, 4, gpath);
     }
     hargv[n] = NULL;
 
