@@ -403,10 +403,12 @@ run_spawn_argv_case dspawn_mock_keychain
 run_legacy_entry_case dlegacy_entry 'OK'
 run_idname_case didname 'OK'
 run_file_case dsemaphore_wait tests/dynamic/semaphore_wait.c 'OK'
+run_file_case dsignal_redzone tests/dynamic/signal_redzone.c 'OK'
 run_file_case davx2_ops tests/dynamic/avx2_ops.c 'OK'
 run_file_case davx_fma tests/dynamic/avx_fma.c 'OK'
 run_file_case davx_fp tests/dynamic/avx_fp.c 'OK'
 run_file_case dbmi_ops tests/dynamic/bmi_ops.c 'OK'
+run_file_case dymm_state tests/dynamic/ymm_state.c 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"

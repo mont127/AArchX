@@ -3477,6 +3477,8 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 #define OCERZ_MCTX_FULL_DS_OFF 184u
 #define OCERZ_FP_MXCSR_OFF 32u
 #define OCERZ_FP_XMM_OFF 168u
+#define OCERZ_FP_YMMH_OFF 588u
+#define OCERZ_REDZONE 128u
 #define OCERZ_SEL_USER_CS64 0x2bu
 #define OCERZ_SEL_USER_DS64 0x23u
 #define OCERZ_UCTX_SIZE 768u
@@ -3521,8 +3523,8 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     uint32_t mcsize = full ? OCERZ_MCTX_FULL_SIZE : OCERZ_MCTX_SIZE;
     uint64_t fpoff = full ? OCERZ_MCTX_FULL_FP_OFF : OCERZ_MCTX_FP_OFF;
 
-    uint64_t top = use_alt ? (cpu->sig_altstack_sp + cpu->sig_altstack_size)
-                           : cpu->gpr[OCERZ_RSP];
+    uint64_t top = (use_alt ? (cpu->sig_altstack_sp + cpu->sig_altstack_size)
+                            : cpu->gpr[OCERZ_RSP]) - OCERZ_REDZONE;
     uint64_t mc = (top - mcsize) & ~15ull;
     uint64_t uc = (mc - OCERZ_UCTX_SIZE) & ~15ull;
     uint64_t si = (uc - OCERZ_SIGINFO_SIZE) & ~15ull;
@@ -3566,6 +3568,8 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     ocerz_st(mc + fpoff + OCERZ_FP_MXCSR_OFF, 4, cpu->mxcsr);
     for (int i = 0; i < 16; i++)
         ocerz_st128(mc + fpoff + OCERZ_FP_XMM_OFF + (uint64_t)i * 16, cpu->xmm[i]);
+    for (int i = 0; i < 16; i++)
+        ocerz_st128(mc + fpoff + OCERZ_FP_YMMH_OFF + (uint64_t)i * 16, cpu->ymmh[i]);
 
     uint64_t old_mask = cpu->sig_mask;
     ocerz_st(uc + 0, 4, old_on_stack ? 1u : 0u);
@@ -3685,6 +3689,9 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     cpu->rflags = ocerz_ld(mc + 152, 8) | 0x2;
     for (int i = 0; i < 16; i++)
         cpu->xmm[i] = ocerz_ld128(mc + fpoff + OCERZ_FP_XMM_OFF + (uint64_t)i * 16);
+    if (mcsize >= OCERZ_MCTX_SIZE)
+        for (int i = 0; i < 16; i++)
+            cpu->ymmh[i] = ocerz_ld128(mc + fpoff + OCERZ_FP_YMMH_OFF + (uint64_t)i * 16);
     cpu->mxcsr = (uint32_t)ocerz_ld(mc + fpoff + OCERZ_FP_MXCSR_OFF, 4);
     ocerz_apply_mxcsr_round(cpu->mxcsr);
     cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
