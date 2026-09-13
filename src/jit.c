@@ -6008,6 +6008,7 @@ static int scalar_cvt_follows(unsigned xreg, int dbl)
     if (!dbl || !g_cur_insns || g_cur_insn_idx < 0 || g_cur_insn_idx + 1 >= g_cur_insns_n) return 0;
     if (g_n_nanool + 2 > NANOOL_MAX || unsafe_nocheckbr()) return 0;
     const X86Insn *c = &g_cur_insns[g_cur_insn_idx + 1];
+    if (c->vex || g_cur_insns[g_cur_insn_idx].vex) return 0;
     if (c->op != OCERZ_OP_CVTTSD2SI || c->nops != 2) return 0;
     const X86Operand *d = &c->ops[0], *sr = &c->ops[1];
     if (sr->kind != OCERZ_OPK_XMM || sr->reg != xreg || !xmm_is_pinned(xreg)) return 0;
@@ -8170,6 +8171,60 @@ static int emit_vex_shift_imm(A64Buf *b, const X86Insn *insn, int kind, int esz,
     return 1;
 }
 
+static int vex_sse128_ok(const X86Insn *insn, int L)
+{
+    switch (insn->op) {
+    case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX:
+    case OCERZ_OP_ADDSS: case OCERZ_OP_ADDSD: case OCERZ_OP_SUBSS: case OCERZ_OP_SUBSD:
+    case OCERZ_OP_MULSS: case OCERZ_OP_MULSD: case OCERZ_OP_DIVSS: case OCERZ_OP_DIVSD:
+    case OCERZ_OP_MAXSS: case OCERZ_OP_MAXSD: case OCERZ_OP_MINSS: case OCERZ_OP_MINSD:
+    case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_ROUNDSS: case OCERZ_OP_ROUNDSD:
+    case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
+    case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
+    case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD:
+        return 1;
+    case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX:
+        return insn->nops >= 3 && insn->ops[2].kind == OCERZ_OPK_IMM && (insn->ops[2].imm & 0x1f) < 8;
+    case OCERZ_OP_MOVLPS: case OCERZ_OP_MOVHPS:
+    case OCERZ_OP_ADDPS: case OCERZ_OP_ADDPD: case OCERZ_OP_SUBPS: case OCERZ_OP_SUBPD:
+    case OCERZ_OP_MULPS: case OCERZ_OP_MULPD: case OCERZ_OP_DIVPS: case OCERZ_OP_DIVPD:
+    case OCERZ_OP_MAXPS: case OCERZ_OP_MAXPD: case OCERZ_OP_MINPS: case OCERZ_OP_MINPD:
+    case OCERZ_OP_SQRTPS: case OCERZ_OP_SQRTPD: case OCERZ_OP_CVTDQ2PS:
+    case OCERZ_OP_MOVD: case OCERZ_OP_MOVQX: case OCERZ_OP_PSHUFD: case OCERZ_OP_PSHUFB:
+    case OCERZ_OP_PINSRB: case OCERZ_OP_PINSRW: case OCERZ_OP_PINSRD: case OCERZ_OP_PINSRQ:
+    case OCERZ_OP_PEXTRB: case OCERZ_OP_PEXTRW: case OCERZ_OP_PEXTRD: case OCERZ_OP_PEXTRQ:
+    case OCERZ_OP_PMOVSXBD: case OCERZ_OP_PMOVSXBQ: case OCERZ_OP_PMOVSXWQ:
+    case OCERZ_OP_PMOVZXBD: case OCERZ_OP_PMOVZXBQ: case OCERZ_OP_PMOVZXWQ:
+    case OCERZ_OP_ROUNDPS: case OCERZ_OP_ROUNDPD:
+    case OCERZ_OP_PUNPCKLBW: case OCERZ_OP_PUNPCKLWD: case OCERZ_OP_PUNPCKLDQ: case OCERZ_OP_PUNPCKLQDQ:
+    case OCERZ_OP_PUNPCKHBW: case OCERZ_OP_PUNPCKHWD: case OCERZ_OP_PUNPCKHDQ: case OCERZ_OP_PUNPCKHQDQ:
+    case OCERZ_OP_UNPCKLPD: case OCERZ_OP_UNPCKHPD: case OCERZ_OP_UNPCKLPS: case OCERZ_OP_UNPCKHPS:
+    case OCERZ_OP_MOVLHPS: case OCERZ_OP_MOVHLPS:
+        return !L;
+    default:
+        return 0;
+    }
+}
+static int emit_vex_sse128(A64Buf *b, const X86Insn *insn, int L, uint32_t **exit_sites, int *n_exits)
+{
+    if (!vex_sse128_ok(insn, L)) return 0;
+    const X86Operand *d = &insn->ops[0];
+    int wx = d->kind == OCERZ_OPK_XMM && insn->op != OCERZ_OP_UCOMISS && insn->op != OCERZ_OP_UCOMISD &&
+             insn->op != OCERZ_OP_COMISS && insn->op != OCERZ_OP_COMISD;
+    if (wx && !xmm_is_pinned(d->reg)) return 0;
+    if (insn->vex & OCERZ_VEX_NDS) {
+        if (!wx || !xmm_is_pinned(insn->vvvv)) return 0;
+        if (insn->vvvv != d->reg) {
+            for (int k = 1; k < insn->nops; k++)
+                if (insn->ops[k].kind == OCERZ_OPK_XMM && insn->ops[k].reg == d->reg) return 0;
+            a64_v_mov(b, xmm_vreg(d->reg), xmm_vreg(insn->vvvv));
+        }
+    }
+    if (!emit_sse(b, insn, exit_sites, n_exits)) return 0;
+    if (wx) emit_ymmh_clear(b, d->reg);
+    return 1;
+}
+
 static int emit_vex(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (!vex_inline_enabled() || !sse_enabled() || insn->mode32 || insn->seg != OCERZ_SEG_NONE) return 0;
@@ -8203,7 +8258,7 @@ static int emit_vex(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_PSRLQ: return emit_vex_shift_imm(b, insn, 1, 3, L);
     case OCERZ_OP_PSRAW: return emit_vex_shift_imm(b, insn, 2, 1, L);
     case OCERZ_OP_PSRAD: return emit_vex_shift_imm(b, insn, 2, 2, L);
-    default: return 0;
+    default: return emit_vex_sse128(b, insn, L, exit_sites, n_exits);
     }
 }
 
