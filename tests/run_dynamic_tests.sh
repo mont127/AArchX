@@ -248,6 +248,66 @@ run_spawn_argv_case() {
     done
 }
 
+run_legacy_entry_case() {
+    local name="$1" want_out="$2"
+    if ! clang -arch x86_64 -mmacosx-version-min=10.6 -o "$TMP/$name" tests/dynamic/legacy_entry.c 2>/dev/null; then
+        echo "FAIL $name (compile)"; fail=$((fail+1)); return
+    fi
+    if ! otool -l "$TMP/$name" | grep -q LC_UNIXTHREAD; then
+        echo "FAIL $name (linker did not emit LC_UNIXTHREAD)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" env LEGACY_ENTRY_PROBE=yes "$OCERZ" -no-jit "$TMP/$name" one two
+        else
+            run_bounded "$out_file" "$err_file" env LEGACY_ENTRY_PROBE=yes "$OCERZ" "$TMP/$name" one two
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
+run_idname_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir/real" "$dir/decoy" "$dir/stub"
+    if ! clang -arch x86_64 -dynamiclib -install_name @rpath/libidname_base.dylib \
+            -o "$dir/real/libidname_base.dylib" tests/dynamic/idname_base.c 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name @rpath/libidname_decoy.dylib \
+            -o "$dir/decoy/libidname_decoy.dylib" tests/dynamic/idname_decoy.c 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name @rpath/libidname_user.dylib -Wl,-rpath,@loader_path/stub \
+            -o "$dir/libidname_user.dylib" tests/dynamic/idname_user.c "$dir/real/libidname_base.dylib" 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/idname_main.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    printf 'link libidname_base.dylib' > "$dir/stub/libidname_base.dylib"
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_case dret 'int main(void){return 42;}' '' 42
 run_case dwrite '
 int main(void){
@@ -331,6 +391,8 @@ run_alias_case ddlopen_alias 'OK'
 run_dlopen_cf_case ddlopen_cf 'OK'
 run_asm_case dcef_partition tests/dynamic/cef_partition.c tests/dynamic/cef_partition.s 'OK'
 run_spawn_argv_case dspawn_mock_keychain
+run_legacy_entry_case dlegacy_entry 'OK'
+run_idname_case didname 'OK'
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"
