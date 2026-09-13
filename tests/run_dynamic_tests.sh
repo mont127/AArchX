@@ -390,6 +390,7 @@ run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'
 run_dlopen_cf_case ddlopen_cf 'OK'
 run_asm_case dcef_partition tests/dynamic/cef_partition.c tests/dynamic/cef_partition.s 'OK'
+run_asm_case dmmx_ops tests/dynamic/mmx_ops.c tests/dynamic/mmx_ops.s 'OK'
 run_spawn_argv_case dspawn_mock_keychain
 run_legacy_entry_case dlegacy_entry 'OK'
 run_idname_case didname 'OK'

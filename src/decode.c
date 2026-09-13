@@ -188,6 +188,12 @@ static void set_xmm(X86Operand *op, int reg, int size)
     op->imm = 0;
 }
 
+static void set_mmx(X86Operand *op, int reg)
+{
+    set_xmm(op, reg & 7, 8);
+    op->kind = OCERZ_OPK_MMX;
+}
+
 static void set_st(X86Operand *op, int i)
 {
     op->kind = OCERZ_OPK_ST;
@@ -1839,6 +1845,36 @@ static int decode_sse_rri(DecState *s, int op, int size, int reg_is_dst)
     return read_imm8s(s, &s->out->ops[2], 1);
 }
 
+static int decode_mmx_rr(DecState *s, int op, int reg_is_dst)
+{
+    ModRM m;
+    int e = decode_modrm(s, &m, 8);
+    if (e)
+        return e;
+    set_op(s, op);
+    s->out->opsize = 8;
+    s->out->nops = 2;
+    X86Operand *r = &s->out->ops[reg_is_dst ? 0 : 1];
+    X86Operand *x = &s->out->ops[reg_is_dst ? 1 : 0];
+    set_mmx(r, m.reg);
+    if (rm_is_reg(&m)) {
+        set_mmx(x, m.rm);
+    } else {
+        *x = m.mem;
+        x->size = 8;
+    }
+    return OCERZ_OK;
+}
+
+static int decode_mmx_rri(DecState *s, int op)
+{
+    int e = decode_mmx_rr(s, op, 1);
+    if (e)
+        return e;
+    s->out->nops = 3;
+    return read_imm8s(s, &s->out->ops[2], 1);
+}
+
 static int select_packed(DecState *s, int ps, int pd, int ss, int sd)
 {
     switch (sse_prefix(s)) {
@@ -1869,6 +1905,8 @@ static int decode_arith_sse(DecState *s, int ps, int pd, int ss, int sd)
 
 static int decode_pint(DecState *s, int op, int reg_is_dst)
 {
+    if (sse_prefix(s) == MAND_NONE && !s->vex && op != OCERZ_OP_PUNPCKLQDQ && op != OCERZ_OP_PUNPCKHQDQ)
+        return decode_mmx_rr(s, op, reg_is_dst);
     if (sse_prefix(s) != MAND_66)
         return OCERZ_EUNDEF;
     return decode_sse_rr(s, op, 16, reg_is_dst);
@@ -2062,6 +2100,23 @@ static int decode_0f(DecState *s, uint8_t op2)
     case 0x29:
         return decode_sse_rr(s, OCERZ_OP_MOVAPS, 16, 0);
     case 0x2a: {
+        if ((mand == MAND_NONE || mand == MAND_66) && !s->vex) {
+            ModRM m;
+            e = decode_modrm(s, &m, 8);
+            if (e)
+                return e;
+            set_op(s, mand == MAND_NONE ? OCERZ_OP_CVTPI2PS : OCERZ_OP_CVTPI2PD);
+            s->out->opsize = 8;
+            s->out->nops = 2;
+            set_xmm(&s->out->ops[0], m.reg, 16);
+            if (rm_is_reg(&m)) {
+                set_mmx(&s->out->ops[1], m.rm);
+            } else {
+                s->out->ops[1] = m.mem;
+                s->out->ops[1].size = 8;
+            }
+            return OCERZ_OK;
+        }
         if (mand != MAND_F3 && mand != MAND_F2)
             return OCERZ_EUNDEF;
         ModRM m;
@@ -2078,6 +2133,22 @@ static int decode_0f(DecState *s, uint8_t op2)
     }
     case 0x2c:
     case 0x2d: {
+        if ((mand == MAND_NONE || mand == MAND_66) && !s->vex) {
+            ModRM m;
+            int msize = mand == MAND_NONE ? 8 : 16;
+            e = decode_modrm(s, &m, msize);
+            if (e)
+                return e;
+            if (op2 == 0x2c)
+                set_op(s, mand == MAND_NONE ? OCERZ_OP_CVTTPS2PI : OCERZ_OP_CVTTPD2PI);
+            else
+                set_op(s, mand == MAND_NONE ? OCERZ_OP_CVTPS2PI : OCERZ_OP_CVTPD2PI);
+            s->out->opsize = 8;
+            s->out->nops = 2;
+            set_mmx(&s->out->ops[0], m.reg);
+            place_rm(s, &m, &s->out->ops[1], msize, 0);
+            return OCERZ_OK;
+        }
         if (mand != MAND_F3 && mand != MAND_F2)
             return OCERZ_EUNDEF;
         ModRM m;
@@ -2301,7 +2372,7 @@ static int decode_0f(DecState *s, uint8_t op2)
 
     switch (op2) {
     case 0x6e: {
-        if (mand != MAND_66)
+        if (mand != MAND_66 && (mand != MAND_NONE || s->vex))
             return OCERZ_EUNDEF;
         ModRM m;
         int gsize = s->rex_w ? 8 : 4;
@@ -2311,7 +2382,10 @@ static int decode_0f(DecState *s, uint8_t op2)
         set_op(s, s->rex_w ? OCERZ_OP_MOVQX : OCERZ_OP_MOVD);
         s->out->opsize = (uint8_t)gsize;
         s->out->nops = 2;
-        set_xmm(&s->out->ops[0], m.reg, 16);
+        if (mand == MAND_NONE)
+            set_mmx(&s->out->ops[0], m.reg);
+        else
+            set_xmm(&s->out->ops[0], m.reg, 16);
         place_rm(s, &m, &s->out->ops[1], gsize, 1);
         return OCERZ_OK;
     }
@@ -2320,6 +2394,8 @@ static int decode_0f(DecState *s, uint8_t op2)
             return decode_sse_rr(s, OCERZ_OP_MOVDQA, 16, 1);
         if (mand == MAND_F3)
             return decode_sse_rr(s, OCERZ_OP_MOVDQU, 16, 1);
+        if (mand == MAND_NONE && !s->vex)
+            return decode_mmx_rr(s, OCERZ_OP_MOVQX, 1);
         return OCERZ_EUNDEF;
     case 0xf0:
         if (mand == MAND_F2)
@@ -2331,6 +2407,7 @@ static int decode_0f(DecState *s, uint8_t op2)
         case MAND_66: op = OCERZ_OP_PSHUFD; break;
         case MAND_F2: op = OCERZ_OP_PSHUFLW; break;
         case MAND_F3: op = OCERZ_OP_PSHUFHW; break;
+        case MAND_NONE: if (s->vex) return OCERZ_EUNDEF; return decode_mmx_rri(s, OCERZ_OP_PSHUFLW);
         default: return OCERZ_EUNDEF;
         }
         return decode_sse_rri(s, op, 16, 1);
@@ -2338,7 +2415,8 @@ static int decode_0f(DecState *s, uint8_t op2)
     case 0x71:
     case 0x72:
     case 0x73: {
-        if (mand != MAND_66)
+        int mmx = mand == MAND_NONE && !s->vex;
+        if (mand != MAND_66 && !mmx)
             return OCERZ_EUNDEF;
         ModRM m;
         e = decode_modrm(s, &m, 16);
@@ -2362,12 +2440,15 @@ static int decode_0f(DecState *s, uint8_t op2)
             else if (idx == 6) op = OCERZ_OP_PSLLQ;
             else if (idx == 7) op = OCERZ_OP_PSLLDQ;
         }
-        if (op == OCERZ_OP_INVALID)
+        if (op == OCERZ_OP_INVALID || (mmx && (op == OCERZ_OP_PSRLDQ || op == OCERZ_OP_PSLLDQ)))
             return OCERZ_EUNDEF;
         set_op(s, op);
-        s->out->opsize = 16;
+        s->out->opsize = (uint8_t)(mmx ? 8 : 16);
         s->out->nops = 2;
-        set_xmm(&s->out->ops[0], m.rm, 16);
+        if (mmx)
+            set_mmx(&s->out->ops[0], m.rm);
+        else
+            set_xmm(&s->out->ops[0], m.rm, 16);
         return read_imm8s(s, &s->out->ops[1], 1);
     }
     case 0x74:
@@ -2403,7 +2484,7 @@ static int decode_0f(DecState *s, uint8_t op2)
             place_rm(s, &m, &s->out->ops[1], 8, 0);
             return OCERZ_OK;
         }
-        if (mand == MAND_66) {
+        if (mand == MAND_66 || (mand == MAND_NONE && !s->vex)) {
             ModRM m;
             int gsize = s->rex_w ? 8 : 4;
             e = decode_modrm(s, &m, gsize);
@@ -2413,7 +2494,10 @@ static int decode_0f(DecState *s, uint8_t op2)
             s->out->opsize = (uint8_t)gsize;
             s->out->nops = 2;
             place_rm(s, &m, &s->out->ops[0], gsize, 1);
-            set_xmm(&s->out->ops[1], m.reg, 16);
+            if (mand == MAND_NONE)
+                set_mmx(&s->out->ops[1], m.reg);
+            else
+                set_xmm(&s->out->ops[1], m.reg, 16);
             return OCERZ_OK;
         }
         return OCERZ_EUNDEF;
@@ -2423,6 +2507,8 @@ static int decode_0f(DecState *s, uint8_t op2)
             return decode_sse_rr(s, OCERZ_OP_MOVDQA, 16, 0);
         if (mand == MAND_F3)
             return decode_sse_rr(s, OCERZ_OP_MOVDQU, 16, 0);
+        if (mand == MAND_NONE && !s->vex)
+            return decode_mmx_rr(s, OCERZ_OP_MOVQX, 0);
         return OCERZ_EUNDEF;
     case 0xa3: {
         ModRM m;
@@ -2692,16 +2778,19 @@ static int decode_0f(DecState *s, uint8_t op2)
         return OCERZ_OK;
     }
     case 0xc4: {
-        if (mand != MAND_66)
+        if (mand != MAND_66 && (mand != MAND_NONE || s->vex))
             return OCERZ_EUNDEF;
         ModRM m;
         e = decode_modrm(s, &m, 4);
         if (e)
             return e;
         set_op(s, OCERZ_OP_PINSRW);
-        s->out->opsize = 16;
+        s->out->opsize = (uint8_t)(mand == MAND_NONE ? 8 : 16);
         s->out->nops = 3;
-        set_xmm(&s->out->ops[0], m.reg, 16);
+        if (mand == MAND_NONE)
+            set_mmx(&s->out->ops[0], m.reg);
+        else
+            set_xmm(&s->out->ops[0], m.reg, 16);
         if (rm_is_reg(&m))
             set_reg(&s->out->ops[1], m.rm, 4);
         else {
@@ -2711,7 +2800,7 @@ static int decode_0f(DecState *s, uint8_t op2)
         return read_imm8s(s, &s->out->ops[2], 1);
     }
     case 0xc5: {
-        if (mand != MAND_66)
+        if (mand != MAND_66 && (mand != MAND_NONE || s->vex))
             return OCERZ_EUNDEF;
         ModRM m;
         e = decode_modrm(s, &m, 4);
@@ -2723,7 +2812,10 @@ static int decode_0f(DecState *s, uint8_t op2)
         s->out->opsize = 4;
         s->out->nops = 3;
         set_reg(&s->out->ops[0], m.reg, s->rex_w ? 8 : 4);
-        set_xmm(&s->out->ops[1], m.rm, 16);
+        if (mand == MAND_NONE)
+            set_mmx(&s->out->ops[1], m.rm);
+        else
+            set_xmm(&s->out->ops[1], m.rm, 16);
         return read_imm8s(s, &s->out->ops[2], 1);
     }
     case 0xc6:
@@ -2769,12 +2861,30 @@ static int decode_0f(DecState *s, uint8_t op2)
     case 0xd5:
         return decode_pint(s, OCERZ_OP_PMULLW, 1);
     case 0xd6: {
-        if (mand != MAND_66)
+        if (mand == MAND_66)
+            return decode_sse_rr(s, OCERZ_OP_MOVQX, 8, 0);
+        if ((mand != MAND_F3 && mand != MAND_F2) || s->vex)
             return OCERZ_EUNDEF;
-        return decode_sse_rr(s, OCERZ_OP_MOVQX, 8, 0);
+        ModRM m;
+        e = decode_modrm(s, &m, 8);
+        if (e)
+            return e;
+        if (!rm_is_reg(&m))
+            return OCERZ_EUNDEF;
+        set_op(s, OCERZ_OP_MOVQX);
+        s->out->opsize = 8;
+        s->out->nops = 2;
+        if (mand == MAND_F3) {
+            set_xmm(&s->out->ops[0], m.reg, 16);
+            set_mmx(&s->out->ops[1], m.rm);
+        } else {
+            set_mmx(&s->out->ops[0], m.reg);
+            set_xmm(&s->out->ops[1], m.rm, 16);
+        }
+        return OCERZ_OK;
     }
     case 0xd7: {
-        if (mand != MAND_66)
+        if (mand != MAND_66 && (mand != MAND_NONE || s->vex))
             return OCERZ_EUNDEF;
         ModRM m;
         e = decode_modrm(s, &m, 16);
@@ -2786,7 +2896,10 @@ static int decode_0f(DecState *s, uint8_t op2)
         s->out->opsize = 4;
         s->out->nops = 2;
         set_reg(&s->out->ops[0], m.reg, s->rex_w ? 8 : 4);
-        set_xmm(&s->out->ops[1], m.rm, 16);
+        if (mand == MAND_NONE)
+            set_mmx(&s->out->ops[1], m.rm);
+        else
+            set_xmm(&s->out->ops[1], m.rm, 16);
         return OCERZ_OK;
     }
     case 0xd8:
@@ -2828,6 +2941,12 @@ static int decode_0f(DecState *s, uint8_t op2)
         return decode_sse_rr(s, op, 16, 1);
     }
     case 0xe7: {
+        if (mand == MAND_NONE && !s->vex) {
+            e = decode_mmx_rr(s, OCERZ_OP_MOVQX, 0);
+            if (e)
+                return e;
+            return s->out->ops[0].kind == OCERZ_OPK_MEM ? OCERZ_OK : OCERZ_EUNDEF;
+        }
         if (mand != MAND_66)
             return OCERZ_EUNDEF;
         return decode_sse_rr(s, OCERZ_OP_MOVDQA, 16, 0);
@@ -2904,7 +3023,8 @@ static int decode_0f38(DecState *s)
             place_rm(s, &m, &s->out->ops[1], ssize, 1);
         return OCERZ_OK;
     }
-    if (sse_prefix(s) != MAND_66)
+    int mmx = sse_prefix(s) == MAND_NONE && !s->vex && (op3 <= 0x0b || (op3 >= 0x1c && op3 <= 0x1e));
+    if (sse_prefix(s) != MAND_66 && !mmx)
         return OCERZ_EUNDEF;
 
     int op;
@@ -2970,6 +3090,8 @@ static int decode_0f38(DecState *s)
     case 0xdf: op = OCERZ_OP_AESDECLAST; break;
     default: return OCERZ_EUNDEF;
     }
+    if (mmx)
+        return decode_mmx_rr(s, op, 1);
     return decode_sse_rr(s, op, 16, 1);
 }
 
@@ -2979,6 +3101,8 @@ static int decode_0f3a(DecState *s)
     int e = fetch8(s, &op3);
     if (e)
         return e;
+    if (op3 == 0x0f && sse_prefix(s) == MAND_NONE && !s->vex)
+        return decode_mmx_rri(s, OCERZ_OP_PALIGNR);
     if (sse_prefix(s) != MAND_66)
         return OCERZ_EUNDEF;
 
@@ -3875,6 +3999,12 @@ static void init_op_names(void)
     op_names[OCERZ_OP_LDS] = "lds";
     op_names[OCERZ_OP_INTO] = "into";
     op_names[OCERZ_OP_SALC] = "salc";
+    op_names[OCERZ_OP_CVTPI2PS] = "cvtpi2ps";
+    op_names[OCERZ_OP_CVTPI2PD] = "cvtpi2pd";
+    op_names[OCERZ_OP_CVTPS2PI] = "cvtps2pi";
+    op_names[OCERZ_OP_CVTTPS2PI] = "cvttps2pi";
+    op_names[OCERZ_OP_CVTPD2PI] = "cvtpd2pi";
+    op_names[OCERZ_OP_CVTTPD2PI] = "cvttpd2pi";
 }
 
 int ocerz_decode(const uint8_t *code, size_t avail, uint64_t rip, X86Insn *out)
@@ -3919,6 +4049,8 @@ static void fmt_reg(char *b, size_t cap, size_t *n, const X86Operand *op)
     int written;
     if (op->kind == OCERZ_OPK_XMM)
         written = snprintf(b + *n, cap > *n ? cap - *n : 0, "xmm%u", op->reg);
+    else if (op->kind == OCERZ_OPK_MMX)
+        written = snprintf(b + *n, cap > *n ? cap - *n : 0, "mm%u", op->reg);
     else if (op->kind == OCERZ_OPK_ST)
         written = snprintf(b + *n, cap > *n ? cap - *n : 0, "st%u", op->reg);
     else
@@ -3996,6 +4128,7 @@ static void fmt_operand(char *b, size_t cap, size_t *n, const X86Insn *insn, con
     case OCERZ_OPK_REG:
     case OCERZ_OPK_XMM:
     case OCERZ_OPK_ST:
+    case OCERZ_OPK_MMX:
         fmt_reg(b, cap, n, op);
         break;
     case OCERZ_OPK_MEM:

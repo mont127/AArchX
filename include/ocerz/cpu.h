@@ -147,6 +147,7 @@ typedef struct OcerzCPU {
     int susp_host;
     int susp_have_gpr;
     uint64_t susp_gpr[16];
+    uint64_t mmx[8];
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256

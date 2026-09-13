@@ -32,6 +32,7 @@ enum OcerzOpKind {
     OCERZ_OPK_ST = 3,
     OCERZ_OPK_MEM = 4,
     OCERZ_OPK_IMM = 5,
+    OCERZ_OPK_MMX = 6,
 };
 
 enum OcerzRep {
@@ -521,6 +522,12 @@ enum OcerzOp {
     OCERZ_OP_VPERM2F128,
     OCERZ_OP_VZEROUPPER,
     OCERZ_OP_VZEROALL,
+    OCERZ_OP_CVTPI2PS,
+    OCERZ_OP_CVTPI2PD,
+    OCERZ_OP_CVTPS2PI,
+    OCERZ_OP_CVTTPS2PI,
+    OCERZ_OP_CVTPD2PI,
+    OCERZ_OP_CVTTPD2PI,
     OCERZ_OP_COUNT,
 };
 
@@ -562,6 +569,14 @@ typedef struct X86Insn {
     uint8_t vvvv;
     X86Operand ops[3];
 } X86Insn;
+
+static inline int ocerz_insn_has_mmx(const X86Insn *insn)
+{
+    for (int i = 0; i < insn->nops; i++)
+        if (insn->ops[i].kind == OCERZ_OPK_MMX)
+            return 1;
+    return 0;
+}
 
 #define OCERZ_VEX_PRESENT 0x01
 #define OCERZ_VEX_L       0x02
