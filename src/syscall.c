@@ -184,6 +184,7 @@
 #define OCERZ_MACH_KERN_FAILURE 5
 #define OCERZ_MACH_KERN_NO_SPACE 3
 #define OCERZ_MACH_KERN_NOT_SUPPORTED 46
+#define OCERZ_MACH_KERN_INVALID_ARGUMENT 4
 
 #define OCERZ_F_PREALLOCATE 42
 #define OCERZ_F_GETPATH 50
@@ -5697,9 +5698,11 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 29:
     case 33:
     case 34:
+    case 35:
     case 36:
     case 37:
     case 38:
+    case 39:
     case 50:
     case 59:
     case 60:
@@ -5711,7 +5714,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
             fprintf(stderr, "ocerz: PORTLOG[%d] %s name=%#llx right=%#llx delta=%#llx\n",
                     (int)getpid(), mach_trap_name(num), (unsigned long long)a[1],
                     (unsigned long long)a[2], (unsigned long long)a[3]);
-        cpu->block_nokick = num == 36 || num == 37 || num == 38;
+        cpu->block_nokick = num == 36 || num == 37 || num == 38 || num == 39;
         cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t rg = ocerz_host_mach_trap(num, a);
         cpu->block_since_ns = 0;
@@ -6357,7 +6360,8 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
         break;
     }
-    case 41: {
+    case 41:
+    case 42: {
         if (a[2] != 0)
             a[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
         mach_ret(cpu, ocerz_host_mach_trap(num, a));
@@ -6377,13 +6381,56 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, iokr);
         break;
     }
+    case 13: {
+        if (a[0] != 0)
+            a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
+        if (a[1] != 0)
+            a[1] = (uint64_t)(uintptr_t)ocerz_g2h(a[1]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
+    case 62: {
+        if (a[4] != 0)
+            a[4] = (uint64_t)(uintptr_t)ocerz_g2h(a[4]);
+        cpu->block_nokick = 1;
+        cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint64_t rs = ocerz_host_mach_trap(num, a);
+        cpu->block_since_ns = 0;
+        cpu->block_nokick = 0;
+        mach_ret(cpu, rs);
+        break;
+    }
+    case 72: {
+        if (a[2] != 0)
+            a[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
+        if (a[3] != 0)
+            a[3] = (uint64_t)(uintptr_t)ocerz_g2h(a[3]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
+    case 96: {
+        if (a[2] != 0)
+            a[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
+        mach_ret(cpu, ocerz_host_mach_trap(num, a));
+        break;
+    }
     default: {
         const char *nm = mach_trap_name(num);
-        OCERZ_FATAL("unknown Mach trap: class=1 num=%d name=%s rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx ret=%#llx\n", num, nm ? nm : "?",
-                    (unsigned long long)cpu->rip, (unsigned long long)a[0], (unsigned long long)a[1],
-                    (unsigned long long)a[2], (unsigned long long)a[3],
-                    (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
-        return OCERZ_STEP_FATAL;
+        if (getenv("OCERZ_STRICT_SYSCALL")) {
+            OCERZ_FATAL("unknown Mach trap: class=1 num=%d name=%s rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx ret=%#llx\n", num, nm ? nm : "?",
+                        (unsigned long long)cpu->rip, (unsigned long long)a[0], (unsigned long long)a[1],
+                        (unsigned long long)a[2], (unsigned long long)a[3],
+                        (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
+            return OCERZ_STEP_FATAL;
+        }
+        static uint8_t probed[256];
+        if (num >= 0 && num < 256 && !probed[num]) {
+            probed[num] = 1;
+            fprintf(stderr, "ocerz: unimplemented Mach trap num=%d name=%s -> KERN_INVALID_ARGUMENT rip=%#llx\n",
+                    num, nm ? nm : "?", (unsigned long long)cpu->rip);
+        }
+        mach_ret(cpu, OCERZ_MACH_KERN_INVALID_ARGUMENT);
+        break;
     }
     }
 

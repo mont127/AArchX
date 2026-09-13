@@ -1271,6 +1271,12 @@ static void test_mach_unknown(void)
     OcerzCPU *cpu = &vm.cpu;
     set_args(cpu, mach(0x123456), 0, 0, 0, 0, 0, 0);
     int r = ocerz_handle_syscall(&vm, cpu);
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cpu->gpr[OCERZ_RAX] == 4);
+    setenv("OCERZ_STRICT_SYSCALL", "1", 1);
+    set_args(cpu, mach(0x123456), 0, 0, 0, 0, 0, 0);
+    r = ocerz_handle_syscall(&vm, cpu);
+    unsetenv("OCERZ_STRICT_SYSCALL");
     CHECK(r == OCERZ_STEP_FATAL);
 }
 
