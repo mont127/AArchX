@@ -202,6 +202,34 @@ run_dlopen_cf_case() {
     done
 }
 
+run_dlopen_arch_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    if ! clang -arch arm64 -dynamiclib -o "$dir/libarch_arm64.dylib" tests/dynamic/dlopen_arch_lib.c 2>/dev/null ||
+       ! clang -arch x86_64 -arch arm64 -dynamiclib -o "$dir/libarch_fat.dylib" tests/dynamic/dlopen_arch_lib.c 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/dlopen_arch.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name" "$dir/libarch_arm64.dylib" "$dir/libarch_fat.dylib"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name" "$dir/libarch_arm64.dylib" "$dir/libarch_fat.dylib"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_asm_case() {
     local name="$1" c_src="$2" s_src="$3" want_out="$4"
     if ! clang -arch x86_64 -O2 -o "$TMP/$name" "$c_src" "$s_src" 2>/dev/null; then
@@ -390,6 +418,7 @@ run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'
 run_dlopen_cf_case ddlopen_cf 'OK'
+run_dlopen_arch_case ddlopen_arch 'OK'
 run_file_case ddlsym_cache_image tests/dynamic/dlsym_cache_image.c 'OK'
 run_file_case dsyscalls_extra tests/dynamic/syscalls_extra.c 'OK'
 run_file_case dproc_self tests/dynamic/proc_self.c 'OK'
