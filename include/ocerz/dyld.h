@@ -17,6 +17,7 @@ uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode);
 uint64_t ocerz_dlsym(uint64_t handle, const char *sym);
 int ocerz_dlclose(uint64_t handle);
 uint64_t ocerz_dlerror(void);
+int ocerz_canon_dylib_path(const char *path, char *out, size_t outsz);
 
 void ocerz_dyld_dump_images(void);
 const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out);

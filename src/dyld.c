@@ -1929,7 +1929,6 @@ static int expand_install_name(DynImage *loader, const char *name,
 }
 
 static void load_disk_deps(OcerzCache *cache, DynImage *loader, const RpathList *rpaths);
-static int canon_dylib_path(const char *path, char *out, size_t outsz);
 
 static void canonicalize_objc_selrefs(DynImage *img)
 {
@@ -1978,7 +1977,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         return NULL;
 
     char canon[1024];
-    if (canon_dylib_path(resolved, canon, sizeof canon))
+    if (ocerz_canon_dylib_path(resolved, canon, sizeof canon))
         snprintf(resolved, sizeof resolved, "%s", canon);
     DynImage *existing = dimg_find_by_path(resolved);
     if (existing)
@@ -2133,7 +2132,7 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     return d;
 }
 
-static int canon_dylib_path(const char *path, char *out, size_t outsz)
+int ocerz_canon_dylib_path(const char *path, char *out, size_t outsz)
 {
     char cur[PATH_MAX];
     if (snprintf(cur, sizeof cur, "%s", path) >= (int)sizeof cur)
@@ -2272,7 +2271,7 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
         return cache_dlopen_hit(vm, cmh);
     char canon[PATH_MAX];
     const char *loadpath = hostpath;
-    if (canon_dylib_path(hostpath, canon, sizeof canon) &&
+    if (ocerz_canon_dylib_path(hostpath, canon, sizeof canon) &&
         strcmp(canon, hostpath) != 0) {
         already = dimg_find_by_path(canon);
         if (already) {
@@ -2478,6 +2477,8 @@ uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
             return v;
         }
     }
+    if (g_run_cache && ocerz_cache_has_image(g_run_cache, handle))
+        return ocerz_cache_resolve_from_image(g_run_cache, handle, buf, NULL);
     if (g_run_cache) {
         uint64_t v = ocerz_cache_resolve(g_run_cache, buf);
         if (v)
