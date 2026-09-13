@@ -50,7 +50,7 @@ make -j
 | x86-64 guest gate | 93 / 93 |
 | x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
 | i386 differential gate | 20,033 / 20,033 |
-| dynamic-mode tests | 67 / 67 |
+| dynamic-mode tests | 69 / 69 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -216,7 +216,8 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `OCERZ_NO_PLAIN_MEM=1` | ordered memory forms from the start |
 | `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |
 | `OCERZ_TSO_VECTOR=1` | order SSE loads and stores too |
-| `OCERZ_PRELOAD_OBJC=<paths>` | preload matching shared-cache Objective-C images so their categories attach; `@cat` preloads every image that defines categories (3-4 s more per boot) |
+| `OCERZ_PRELOAD_OBJC=<paths>` | put matching shared-cache Objective-C images into the startup batch; `@cat` does it for every image that defines categories (3-4 s more per boot) |
+| `OCERZ_NO_LATE_CATLIST=1` | do not report category lists for shared-cache images loaded after startup, so their categories miss classes that are already realized |
 | `OCERZ_NO_VMMAP_STEER=1` | let `mach_vm_map` place mappings anywhere in host space instead of at guest-visible addresses |
 | `OCERZ_EXCLOG=1` | print every Objective-C and C++ exception thrown, with the throw site |
 | `OCERZ_WILDLOG=1` | report indirect branches whose target lies outside the guest address space, with the source instruction and registers |
@@ -249,7 +250,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 ## Limitations
 
 - Application compatibility is incomplete; unsupported syscalls and framework behavior remain.
-- Late-loaded shared-cache Objective-C images are not fully registered in general. Wine uses a targeted preload.
+- Shared-cache Objective-C images loaded after startup get their categories, but `dyld_image_path_containing_address` still returns NULL for them.
 - x87 uses 64-bit doubles rather than 80-bit extended precision.
 - MMX instructions always run in the interpreter, and the MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry them.
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
