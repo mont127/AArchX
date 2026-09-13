@@ -3860,6 +3860,25 @@ static int unstick_kickable(int num)
            num == 515 || num == 544;
 }
 
+static uint64_t semwait_kick_retry(OcerzCPU *cpu, int num, uint64_t a[8], uint64_t *ret2, int *err, uint64_t t0)
+{
+    uint64_t r = EINTR;
+    int64_t total = (int64_t)a[4] * 1000000000LL + (int64_t)(int32_t)a[5];
+    while (*err && r == EINTR && !(cpu->sig_pending & ~cpu->sig_mask) && !ocerz_peek_pending_async_sig() &&
+           !__atomic_load_n(&cpu->suspend_count, __ATOMIC_ACQUIRE) && !cpu->interrupt && !cpu->vm->exited) {
+        if (a[3]) {
+            int64_t left = total - (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+            if (left <= 0)
+                return ETIMEDOUT;
+            a[4] = (uint64_t)(left / 1000000000LL);
+            a[5] = (uint64_t)(left % 1000000000LL);
+        }
+        cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        r = ocerz_host_syscall(num, a, ret2, err);
+    }
+    return r;
+}
+
 static int forward_with_scratch(OcerzCPU *cpu, int num, uint64_t a[8], int dual_ret)
 {
     int err = 0;
@@ -4868,6 +4887,8 @@ static int dispatch_bsd_at(OcerzVM *vm, OcerzCPU *cpu, int num, uint64_t stack_s
     uint64_t r = ocerz_host_syscall(num, a, &ret2, &err);
     if (err && r == EFAULT && efault_disarm_retry(cpu, num))
         r = ocerz_host_syscall(num, a, &ret2, &err);
+    if ((num == 334 || num == 423) && err && r == EINTR && a[2])
+        r = semwait_kick_retry(cpu, num, a, &ret2, &err, t0blk);
     cpu->block_since_ns = 0;
     cpu->block_nokick = 0;
     {
