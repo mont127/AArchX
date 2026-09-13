@@ -41,7 +41,7 @@ make -j
 | --- | --- |
 | arm64 emitter | encodings validated by execution |
 | instruction corpus | 511 instructions |
-| x86-64 decode | 199 / 199 cases |
+| x86-64 decode | 216 / 216 cases |
 | i386 decode | 102 cases, 26 rejects, 122 address cases |
 | extension / SSE suites | 233 / 0, 246 / 0, SSE4.2 differential against Rosetta |
 | loader / syscall suites | 54 / 0, 324 / 0 |
@@ -50,7 +50,7 @@ make -j
 | x86-64 guest gate | 93 / 93 |
 | x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
 | i386 differential gate | 20,033 / 20,033 |
-| dynamic-mode tests | 47 / 47 |
+| dynamic-mode tests | 67 / 67 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -251,6 +251,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 - Application compatibility is incomplete; unsupported syscalls and framework behavior remain.
 - Late-loaded shared-cache Objective-C images are not fully registered in general. Wine uses a targeted preload.
 - x87 uses 64-bit doubles rather than 80-bit extended precision.
+- MMX instructions always run in the interpreter, and the MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry them.
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
 
