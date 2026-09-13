@@ -8090,7 +8090,7 @@ static int m32_inline_ok(const X86Insn *insn)
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
-    if (insn->vex) return 0;
+    if (insn->vex || ocerz_insn_has_mmx(insn)) return 0;
     if (insn->mode32 && !m32_inline_ok(insn))
         return 0;
     if (insn->op == OCERZ_OP_NOP || insn->op == OCERZ_OP_PAUSE ||
