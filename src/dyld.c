@@ -173,7 +173,7 @@ static const uint8_t *select_slice(const uint8_t *buf, size_t len)
 {
     uint32_t magic = rd32(buf);
     if (magic == MH_MAGIC_64)
-        return buf;
+        return len >= 8 && rd32(buf + 4) == CPU_TYPE_X86_64 ? buf : NULL;
     if (magic == FAT_MAGIC || magic == FAT_CIGAM || magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64) {
         int swap = (magic == FAT_CIGAM || magic == FAT_CIGAM_64);
         int is64 = (magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64);
