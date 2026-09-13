@@ -753,6 +753,34 @@ uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found)
     return v;
 }
 
+static uint64_t cache_image_by_path_memo(OcerzCache *c, const char *path)
+{
+    static struct { char *path; uint64_t mh; } pmemo[512];
+    static pthread_mutex_t pmemo_lock = PTHREAD_MUTEX_INITIALIZER;
+    unsigned h = 2166136261u;
+    for (const char *s = path; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    unsigned slot = h & 511;
+
+    pthread_mutex_lock(&pmemo_lock);
+    if (pmemo[slot].path && strcmp(pmemo[slot].path, path) == 0) {
+        uint64_t mh = pmemo[slot].mh;
+        pthread_mutex_unlock(&pmemo_lock);
+        return mh;
+    }
+    pthread_mutex_unlock(&pmemo_lock);
+    uint64_t mh = cache_image_by_path(c, path);
+    char *dup = strdup(path);
+    if (dup) {
+        pthread_mutex_lock(&pmemo_lock);
+        free(pmemo[slot].path);
+        pmemo[slot].path = dup;
+        pmemo[slot].mh = mh;
+        pthread_mutex_unlock(&pmemo_lock);
+    }
+    return mh;
+}
+
 uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
                                       const char *symbol, int *found)
 {
@@ -763,32 +791,7 @@ uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
     if (!c->mapped || !path || !symbol)
         return 0;
 
-    static struct { char *path; uint64_t mh; } pmemo[512];
-    static pthread_mutex_t pmemo_lock = PTHREAD_MUTEX_INITIALIZER;
-    unsigned h = 2166136261u;
-    for (const char *s = path; *s; s++)
-        h = (h ^ (unsigned char)*s) * 16777619u;
-    unsigned slot = h & 511;
-
-    uint64_t mh = 0;
-    int have = 0;
-    pthread_mutex_lock(&pmemo_lock);
-    if (pmemo[slot].path && strcmp(pmemo[slot].path, path) == 0) {
-        mh = pmemo[slot].mh;
-        have = 1;
-    }
-    pthread_mutex_unlock(&pmemo_lock);
-    if (!have) {
-        mh = cache_image_by_path(c, path);
-        char *dup = strdup(path);
-        if (dup) {
-            pthread_mutex_lock(&pmemo_lock);
-            free(pmemo[slot].path);
-            pmemo[slot].path = dup;
-            pmemo[slot].mh = mh;
-            pthread_mutex_unlock(&pmemo_lock);
-        }
-    }
+    uint64_t mh = cache_image_by_path_memo(c, path);
     if (!mh)
         return 0;
 
@@ -796,6 +799,56 @@ uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
     uint64_t v = resolve_in_dylib(c, mh, symbol, 0, &f);
     *found = f;
     return v;
+}
+
+int ocerz_cache_has_image(OcerzCache *c, uint64_t mh)
+{
+    if (!c->mapped || !mh)
+        return 0;
+    for (uint32_t i = 0; i < c->images_cnt; i++)
+        if (ocerz_cache_image_addr(c, i, NULL) == mh)
+            return 1;
+    return 0;
+}
+
+uint64_t ocerz_cache_resolve_from_image(OcerzCache *c, uint64_t mh, const char *symbol, int *found)
+{
+    int dummy = 0;
+    if (!found)
+        found = &dummy;
+    *found = 0;
+    if (!c->mapped || !mh || !symbol)
+        return 0;
+
+    uint64_t order[1024];
+    uint32_t head = 0, tail = 0;
+    order[tail++] = mh;
+    while (head < tail) {
+        uint64_t cur = order[head++];
+        int f = 0;
+        uint64_t v = resolve_in_dylib(c, cur, symbol, 0, &f);
+        if (f) {
+            *found = 1;
+            return v;
+        }
+        const uint8_t *m = (const uint8_t *)(uintptr_t)cur;
+        uint32_t ncmds = rd32(m + 16);
+        const uint8_t *lc = m + sizeof(struct mach_header_64);
+        for (uint32_t i = 0; i < ncmds; i++) {
+            uint32_t cmd = rd32(lc);
+            if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+                cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+                uint64_t dep = cache_image_by_path_memo(c, (const char *)(lc + rd32(lc + 8)));
+                uint32_t k = 0;
+                while (k < tail && order[k] != dep)
+                    k++;
+                if (dep && k == tail && tail < sizeof order / sizeof order[0])
+                    order[tail++] = dep;
+            }
+            lc += rd32(lc + 4);
+        }
+    }
+    return 0;
 }
 
 static uint64_t cache_resolve_walk(OcerzCache *c, const char *symbol, int *found)

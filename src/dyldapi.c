@@ -333,6 +333,29 @@ static uint64_t cache_find_path(struct OcerzCache *cache, const char *path)
     return 0;
 }
 
+static uint64_t cache_find_canonical(const char *path, const char **cache_path)
+{
+    char canon[1024];
+    const char *want = path;
+    if (!g_cache || !path)
+        return 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint32_t i = 0; i < g_cache->images_cnt; i++) {
+            const char *p = NULL;
+            uint64_t mh = ocerz_cache_image_addr(g_cache, i, &p);
+            if (mh && p && strcmp(p, want) == 0) {
+                if (cache_path)
+                    *cache_path = p;
+                return mh;
+            }
+        }
+        if (pass || !ocerz_canon_dylib_path(path, canon, sizeof canon) || strcmp(canon, path) == 0)
+            break;
+        want = canon;
+    }
+    return 0;
+}
+
 static int image_covers(uint64_t mh, uint64_t addr)
 {
     const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
@@ -1601,8 +1624,9 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     }
     case 0x2d0: {
         uint64_t pathg = cpu->gpr[OCERZ_RSI];
-        api_return(cpu, pathg && g_cache &&
-                        cache_find_path(g_cache, (const char *)ocerz_g2h(pathg)) != 0 ? pathg : 0);
+        const char *real = NULL;
+        api_return(cpu, pathg && cache_find_canonical((const char *)ocerz_g2h(pathg), &real) && real
+                            ? ocerz_h2g(real) : 0);
         return OCERZ_STEP_OK;
     }
     case 0x278:
@@ -1642,8 +1666,8 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x2b0:
         return api_for_each_objc_protocol(vm, cpu);
     case 0x2d8:
-        api_return(cpu, cpu->gpr[OCERZ_RSI] && g_cache &&
-                        cache_find_path(g_cache, (const char *)ocerz_g2h(cpu->gpr[OCERZ_RSI])) != 0);
+        api_return(cpu, cpu->gpr[OCERZ_RSI] &&
+                        cache_find_canonical((const char *)ocerz_g2h(cpu->gpr[OCERZ_RSI]), NULL) != 0);
         return OCERZ_STEP_OK;
     case 0x68:
     case 0x2e0: {
@@ -1676,8 +1700,7 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         uint64_t ok = 0;
         if (pathg) {
             const char *host = (const char *)ocerz_g2h(pathg);
-            ok = (g_cache && cache_find_path(g_cache, host) != 0) ||
-                 access(host, R_OK) == 0;
+            ok = cache_find_canonical(host, NULL) != 0 || access(host, R_OK) == 0;
             if (getenv("OCERZ_DLPATH"))
                 fprintf(stderr, "ocerz: dlopen_preflight(\"%s\") -> %llu\n",
                         host, (unsigned long long)ok);
