@@ -1088,6 +1088,19 @@ static void ripdump_handler(int sig, siginfo_t *si, void *ctx)
     }
 }
 
+static void wild_dump(void)
+{
+    ocerz_cpu_dump(g_cur_cpu, stderr);
+    uint64_t rsp = g_cur_cpu->gpr[OCERZ_RSP];
+    fprintf(stderr, "ocerz: WILD-STACK rsp=%#llx:", (unsigned long long)rsp);
+    for (int i = 0; i < 24; i++)
+        fprintf(stderr, " %#llx", ocerz_addr_readable(rsp + 8 * (uint64_t)i) ? (unsigned long long)ocerz_ld(rsp + 8 * (uint64_t)i, 8) : 0ull);
+    fprintf(stderr, "\nocerz: WILD-RIPHIST:");
+    for (int i = 1; i <= 16; i++)
+        fprintf(stderr, " %#llx", (unsigned long long)g_riphist[(g_riphist_n - (unsigned)i) & 31]);
+    fprintf(stderr, "\n");
+}
+
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
     static __thread volatile int depth;
@@ -1683,17 +1696,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 a = str_into(a, "\n");
                 write(2, ab, (size_t)(a - ab));
             }
-            if (getenv("OCERZ_WILDDUMP")) {
-                ocerz_cpu_dump(g_cur_cpu, stderr);
-                uint64_t rsp = g_cur_cpu->gpr[OCERZ_RSP];
-                fprintf(stderr, "ocerz: WILD-STACK rsp=%#llx:", (unsigned long long)rsp);
-                for (int i = 0; i < 24; i++)
-                    fprintf(stderr, " %#llx", ocerz_addr_readable(rsp + 8 * (uint64_t)i) ? (unsigned long long)ocerz_ld(rsp + 8 * (uint64_t)i, 8) : 0ull);
-                fprintf(stderr, "\nocerz: WILD-RIPHIST:");
-                for (int i = 1; i <= 16; i++)
-                    fprintf(stderr, " %#llx", (unsigned long long)g_riphist[(g_riphist_n - (unsigned)i) & 31]);
-                fprintf(stderr, "\n");
-            }
+            if (getenv("OCERZ_WILDDUMP"))
+                wild_dump();
             if (ocerz_signal_deliver(g_cur_cpu, SIGSEGV, wgaddr, 1, werr)) {
                 ocerz_recov_note(5, g_cur_cpu->rip);
                 depth = 0;
@@ -1754,6 +1758,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     write(2, tb, (size_t)(t - tb));
                 }
             }
+            if (getenv("OCERZ_WILDDUMP"))
+                wild_dump();
             g_cur_cpu->terminated = 1;
             ocerz_recov_note(6, g_cur_cpu->rip);
             siglongjmp(*g_sig_recover, 1);
@@ -2161,6 +2167,17 @@ static void threaddump_handler(int sig, siginfo_t *si, void *ctx)
                 c->in_sighandler, c->block_since_ns ? (double)(now - c->block_since_ns) / 1e9 : 0.0,
                 (unsigned long long)c->sig_pending, (unsigned long long)c->sig_mask, c->host_mask_last,
                 c->sig_host_rcvd[SIGQUIT], c->sig_delivered[SIGQUIT], c->sig_host_rcvd[SIGUSR1], c->sig_delivered[SIGUSR1]);
+        uint64_t fp = c->gpr[OCERZ_RBP], sp = c->gpr[OCERZ_RSP];
+        fprintf(stderr, "ocerz: THREADDUMP[%d] cpu#%u bt: ret=%#llx", (int)getpid(), c->cpu_number,
+                (unsigned long long)(ocerz_addr_readable(sp) ? ocerz_ld(sp, 8) : 0));
+        for (int d = 0; d < 24 && fp > 0x1000 && !(fp & 7) && ocerz_addr_readable(fp + 8); d++) {
+            fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+            uint64_t nf = ocerz_ld(fp, 8);
+            if (nf <= fp)
+                break;
+            fp = nf;
+        }
+        fprintf(stderr, "\n");
         ocerz_pe_stack_dump(c, "THREADDUMP-PE");
     }
     fprintf(stderr, "ocerz: THREADDUMP[%d] end\n", (int)getpid());
