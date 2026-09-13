@@ -15,13 +15,13 @@
  * image is appended and therefore walked exactly once, and the only bound left
  * is the cache's own size (Safari's closure is about 1500 of 3609).
  *
- * A category an image adds to a class in ANOTHER cache image is honoured only
- * if that image is known-loaded when the target class is realized, and a plain
- * dlopen arrives far too late for that.  OCERZ_PRELOAD_OBJC adds named cache
- * images' closures to the initial batch, which is the same position a linked
- * framework has; naming frameworks one at a time is whack-a-mole (AppKit, then
- * QuartzCore, then whatever dlopens next), so "@cat" preloads every image that
- * defines categories at all - the only ones that can be affected.
+ * The cache has already merged every image's categories into the method lists
+ * of the classes they extend, and libobjc exposes them once the owning image is
+ * marked loaded, so startup images never report their category lists.  An image
+ * mapped after startup does report them, because the classes it extends may be
+ * realized by then with copied method lists that only a category list can reach.
+ * OCERZ_PRELOAD_OBJC still moves named cache images' closures into the initial
+ * batch, and "@cat" does that for every image that defines categories.
  */
 #include "ocerz/dyldapi.h"
 #include "ocerz/vm.h"
@@ -467,6 +467,17 @@ static int set_add(uint64_t *out, int n, int cap, uint64_t *seen, unsigned mask,
     seen[i] = mh;
     out[n++] = mh;
     return n;
+}
+
+static int set_has(const uint64_t *seen, unsigned mask, uint64_t mh)
+{
+    if (!mh || !seen)
+        return 0;
+    unsigned i = (unsigned)((mh * 0x9E3779B97F4A7C15ull) >> 40) & mask;
+    for (; seen[i]; i = (i + 1) & mask)
+        if (seen[i] == mh)
+            return 1;
+    return 0;
 }
 
 static void closure_add(uint64_t mh)
@@ -1866,7 +1877,10 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 
         int is_swift_kind = kind <= 5;
         int is_load_marker = (kind == 13 || kind == 17);
-        if (mh && (is_swift_kind || is_load_marker || mh < g_cache_start) &&
+        int is_late_catlist = (kind == 15 || kind == 16) && mh >= g_cache_start && g_closure_hash &&
+                              !set_has(g_closure_hash, g_closure_hash_mask, mh) &&
+                              !getenv("OCERZ_NO_LATE_CATLIST");
+        if (mh && (is_swift_kind || is_load_marker || is_late_catlist || mh < g_cache_start) &&
             kind < (sizeof kindsect / sizeof kindsect[0]) && kindsect[kind])
             addr = find_section_sz(mh, kindsect[kind], &size);
         if (getenv("OCERZ_SECLOG"))

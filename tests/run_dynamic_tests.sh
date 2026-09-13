@@ -79,7 +79,8 @@ run_case() {
 
 run_file_case() {
     local name="$1" src="$2" want_out="$3"
-    if ! clang -arch x86_64 -pthread -o "$TMP/$name" "$src" 2>/dev/null; then
+    shift 3
+    if ! clang -arch x86_64 -pthread -o "$TMP/$name" "$src" "$@" 2>/dev/null; then
         echo "FAIL $name (compile)"; fail=$((fail+1)); return
     fi
 
@@ -389,6 +390,7 @@ run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'
 run_dlopen_cf_case ddlopen_cf 'OK'
+run_file_case dobjc_late_category tests/dynamic/objc_late_category.c 'OK' -framework Foundation
 run_asm_case dcef_partition tests/dynamic/cef_partition.c tests/dynamic/cef_partition.s 'OK'
 run_asm_case dmmx_ops tests/dynamic/mmx_ops.c tests/dynamic/mmx_ops.s 'OK'
 run_spawn_argv_case dspawn_mock_keychain
