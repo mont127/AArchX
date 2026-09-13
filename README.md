@@ -50,7 +50,7 @@ make -j
 | x86-64 guest gate | 93 / 93 |
 | x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
 | i386 differential gate | 20,033 / 20,033 |
-| dynamic-mode tests | 69 / 69 |
+| dynamic-mode tests | 71 / 71 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -91,7 +91,7 @@ Command-line tools match their native output byte for byte
 
 Not working yet:
 - **Safari** starts but never shows a window. JavaScriptCore's `thread_suspend` reaches the host kernel and freezes a thread that holds the JIT lock.
-- **Photos** aborts in `+[PAOpenGLDevice _sharedPixelFormat:]`: `CGLChoosePixelFormat` returns 10002 for every attribute set. Root cause: `IOServiceGetMatchingServices("IOAccelerator")` yields the `AppleMetalGLRenderer` compatibility service only to genuinely Rosetta-translated x86 processes — a native arm64 process and ocerz both see only the one hardware accelerator, and CGL needs that compat renderer to build a pixel format. Metal itself works under ocerz (real device, identical feature sets); the gap is the Rosetta-only GL compatibility renderer, which would have to be synthesized in the IOKit layer.
+- **Photos** aborted in `+[PAOpenGLDevice _sharedPixelFormat:]` because `CGLChoosePixelFormat` returned 10002 for every attribute set. The cause was in AArchX's dyld, not the Rosetta-only `AppleMetalGLRenderer` IOKit service blamed earlier. `_dyld_shared_cache_contains_path` rejected the software renderer's plugin path, which runs through a symlink, and `dlsym` on a shared-cache image searched the whole cache. Both are fixed, and CGL now lists the same renderers and builds the same pixel formats as under Rosetta. Photos has not been run again since.
 
 ## Steam
 
@@ -105,7 +105,7 @@ Getting the client this far took SysV semaphores for Steam's tier0 threading, an
 
 `steam_osx` starts `ipcserver` with `launchctl load -S Background` on a plist it writes into Application Support, which would have launchd run it natively. AArchX rewrites that plist on the way through, putting itself in front of `ProgramArguments` and in `Program` (Steam's own plist only has `Program`, so the array is built from it), and enables the job's label first: a legacy `launchctl unload` leaves the label disabled, and every load after that fails with an I/O error while the client reports `ipcserver init failed`. The Mach service lookup itself was never the problem, since Mach traps go straight to the host kernel.
 
-CEF's GPU process initializes ANGLE through CGL, which fails for the same reason Photos does: the `AppleMetalGLRenderer` compatibility service is only offered to Rosetta-translated processes. With `-cef-disable-gpu` CEF renders through SwiftShader instead. That works, and it is slower.
+CEF's GPU process initializes ANGLE through CGL. Until the dyld fixes described under Photos above, every CGL pixel format failed, so CEF ran with `-cef-disable-gpu` and rendered through SwiftShader, which works and is slower. Steam has not been tried with GPU acceleration since those fixes.
 
 The client then waits for the web helper to report ready, polling every 50 ms for 120 s, and gives up on the UI if it does not. Three JIT problems kept the helper from making it:
 
