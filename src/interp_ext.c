@@ -20,6 +20,7 @@
 
 #include <fenv.h>
 #include <math.h>
+#include <stdlib.h>
 #include <mach/mach_time.h>
 
 static uint64_t ext_rcx_read(const OcerzCPU *cpu, const X86Insn *insn)
@@ -279,6 +280,121 @@ static int ext_scan(OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
+static uint64_t bmi_pdep(uint64_t v, uint64_t mask)
+{
+    uint64_t r = 0;
+    for (uint64_t bit = 1; mask; mask &= mask - 1, bit <<= 1)
+        if (v & bit)
+            r |= mask & (0 - mask);
+    return r;
+}
+
+static uint64_t bmi_pext(uint64_t v, uint64_t mask)
+{
+    uint64_t r = 0;
+    for (uint64_t bit = 1; mask; mask &= mask - 1, bit <<= 1)
+        if (v & mask & (0 - mask))
+            r |= bit;
+    return r;
+}
+
+static int ext_bmi(OcerzCPU *cpu, const X86Insn *insn)
+{
+    const X86Operand *o0 = &insn->ops[0];
+    const X86Operand *o1 = &insn->ops[1];
+    const X86Operand *o2 = &insn->ops[2];
+    int size = o0->size;
+    unsigned bits = (unsigned)size * 8;
+    uint64_t m = ocerz_mask(size);
+    uint64_t a = ocerz_read_op(cpu, insn, o1) & m;
+    uint64_t r;
+    int cf = 0;
+
+    switch (insn->op) {
+    case OCERZ_OP_ANDN:
+        r = ~a & ocerz_read_op(cpu, insn, o2) & m;
+        break;
+    case OCERZ_OP_BLSR:
+        r = a & (a - 1);
+        cf = a == 0;
+        break;
+    case OCERZ_OP_BLSMSK:
+        r = (a ^ (a - 1)) & m;
+        cf = a == 0;
+        break;
+    case OCERZ_OP_BLSI:
+        r = a & (0 - a);
+        cf = a != 0;
+        break;
+    case OCERZ_OP_BZHI: {
+        unsigned n = (unsigned)(ocerz_read_op(cpu, insn, o2) & 0xff);
+        r = n < bits ? a & ((1ull << n) - 1) : a;
+        cf = n > bits - 1;
+        break;
+    }
+    case OCERZ_OP_BEXTR: {
+        uint64_t ctl = ocerz_read_op(cpu, insn, o2);
+        unsigned start = (unsigned)(ctl & 0xff), len = (unsigned)((ctl >> 8) & 0xff);
+        r = start < bits ? a >> start : 0;
+        if (len < bits)
+            r &= (1ull << len) - 1;
+        ocerz_write_op(cpu, insn, o0, r);
+        ocerz_flag_assign(cpu, OCERZ_ZF, r == 0);
+        ocerz_flag_assign(cpu, OCERZ_CF, 0);
+        ocerz_flag_assign(cpu, OCERZ_OF, 0);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_PDEP:
+        ocerz_write_op(cpu, insn, o0, bmi_pdep(a, ocerz_read_op(cpu, insn, o2) & m));
+        return OCERZ_STEP_OK;
+    case OCERZ_OP_PEXT:
+        ocerz_write_op(cpu, insn, o0, bmi_pext(a, ocerz_read_op(cpu, insn, o2) & m));
+        return OCERZ_STEP_OK;
+    case OCERZ_OP_MULX: {
+        unsigned __int128 p = (unsigned __int128)(cpu->gpr[OCERZ_RDX] & m) * (ocerz_read_op(cpu, insn, o2) & m);
+        ocerz_write_op(cpu, insn, o1, (uint64_t)p & m);
+        ocerz_write_op(cpu, insn, o0, (uint64_t)(p >> bits) & m);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_RORX: {
+        unsigned c = (unsigned)(o2->imm & (bits - 1));
+        ocerz_write_op(cpu, insn, o0, c ? ((a >> c) | (a << (bits - c))) & m : a);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_SHLX:
+    case OCERZ_OP_SHRX:
+    case OCERZ_OP_SARX: {
+        unsigned c = (unsigned)(ocerz_read_op(cpu, insn, o2) & (bits - 1));
+        if (insn->op == OCERZ_OP_SHLX)
+            r = (a << c) & m;
+        else if (insn->op == OCERZ_OP_SHRX)
+            r = a >> c;
+        else
+            r = (uint64_t)(ocerz_sext(a, size) >> c) & m;
+        ocerz_write_op(cpu, insn, o0, r);
+        return OCERZ_STEP_OK;
+    }
+    case OCERZ_OP_MOVBE:
+        r = size == 2 ? __builtin_bswap16((uint16_t)a) : size == 4 ? __builtin_bswap32((uint32_t)a) : __builtin_bswap64(a);
+        ocerz_write_op(cpu, insn, o0, r);
+        return OCERZ_STEP_OK;
+    case OCERZ_OP_RDRAND:
+        arc4random_buf(&r, sizeof r);
+        ocerz_write_op(cpu, insn, o0, r & m);
+        cpu->rflags &= ~(uint64_t)(OCERZ_OF | OCERZ_SF | OCERZ_ZF | OCERZ_AF | OCERZ_PF);
+        cpu->rflags |= OCERZ_CF;
+        return OCERZ_STEP_OK;
+    default:
+        return OCERZ_EUNSUP;
+    }
+    ocerz_write_op(cpu, insn, o0, r);
+    ocerz_flag_assign(cpu, OCERZ_CF, cf);
+    ocerz_flag_assign(cpu, OCERZ_ZF, r == 0);
+    ocerz_flag_assign(cpu, OCERZ_SF, ocerz_msb(r, size));
+    ocerz_flag_assign(cpu, OCERZ_OF, 0);
+    return OCERZ_STEP_OK;
+}
+
 static void cpuid_brand(uint32_t leaf, uint32_t *regs)
 {
     static const char brand[48] = "Ocerz x86_64 Emulated CPU";
@@ -297,7 +413,7 @@ static int ext_cpuid(OcerzCPU *cpu)
     uint32_t r[4] = { 0, 0, 0, 0 };
 
     if (leaf == 0) {
-        r[0] = 7;
+        r[0] = 0xd;
         r[1] = 0x756e6547;
         r[2] = 0x6c65746e;
         r[3] = 0x49656e69;
@@ -306,6 +422,16 @@ static int ext_cpuid(OcerzCPU *cpu)
         r[1] = 0x00100800;
         r[2] = 0x00982201;
         r[3] = 0x078bfbff;
+    } else if (leaf == 0xd) {
+        uint32_t sub = (uint32_t)cpu->gpr[OCERZ_RCX];
+        if (sub == 0) {
+            r[0] = 7;
+            r[1] = 0x340;
+            r[2] = 0x340;
+        } else if (sub == 2) {
+            r[0] = 0x100;
+            r[1] = 0x240;
+        }
     } else if (leaf == 0x80000000u) {
         r[0] = 0x80000004;
     } else if (leaf == 0x80000001u) {
@@ -350,7 +476,7 @@ static int ext_xgetbv(OcerzCPU *cpu)
         OCERZ_FATAL("xgetbv with ecx=%u is unsupported\n", (unsigned)cpu->gpr[OCERZ_RCX]);
         return OCERZ_STEP_FATAL;
     }
-    cpu->gpr[OCERZ_RAX] = 3;
+    cpu->gpr[OCERZ_RAX] = 7;
     cpu->gpr[OCERZ_RDX] = 0;
     return OCERZ_STEP_OK;
 }
@@ -393,6 +519,78 @@ static int ext_fxrstor(OcerzCPU *cpu, const X86Insn *insn)
     return OCERZ_STEP_OK;
 }
 
+static int ext_xsave(OcerzCPU *cpu, const X86Insn *insn)
+{
+    uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
+    uint64_t rfbm = (uint32_t)cpu->gpr[OCERZ_RAX] & 7u;
+    if (rfbm & 1) {
+        ocerz_st(ea + 0, 2, cpu->fcw);
+        ocerz_st(ea + 2, 2, cpu->fsw);
+        ocerz_st(ea + 4, 1, cpu->ftw);
+        for (int i = 0; i < 8; i++) {
+            uint64_t bits;
+            memcpy(&bits, &cpu->fpr[i], 8);
+            ocerz_st(ea + 32 + i * 16 + 0, 8, bits);
+            ocerz_st(ea + 32 + i * 16 + 8, 8, 0);
+        }
+    }
+    if (rfbm & 6) {
+        ocerz_st(ea + 24, 4, cpu->mxcsr);
+        ocerz_st(ea + 28, 4, 0x0000ffffu);
+    }
+    if (rfbm & 2)
+        for (int i = 0; i < 16; i++)
+            ocerz_st128(ea + 160 + (uint64_t)i * 16, cpu->xmm[i]);
+    if (rfbm & 4)
+        for (int i = 0; i < 16; i++)
+            ocerz_st128(ea + 576 + (uint64_t)i * 16, cpu->ymmh[i]);
+    ocerz_st(ea + 512, 8, ((ocerz_ld(ea + 512, 8) & ~rfbm) | rfbm) & 7u);
+    return OCERZ_STEP_OK;
+}
+
+static int ext_xrstor(OcerzCPU *cpu, const X86Insn *insn)
+{
+    uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
+    uint64_t rfbm = (uint32_t)cpu->gpr[OCERZ_RAX] & 7u;
+    uint64_t bv = ocerz_ld(ea + 512, 8);
+    if (rfbm & 1) {
+        if (bv & 1) {
+            cpu->fcw = (uint16_t)ocerz_ld(ea + 0, 2);
+            cpu->fsw = (uint16_t)ocerz_ld(ea + 2, 2);
+            cpu->ftw = (uint8_t)ocerz_ld(ea + 4, 1);
+            for (int i = 0; i < 8; i++) {
+                uint64_t bits = ocerz_ld(ea + 32 + i * 16, 8);
+                memcpy(&cpu->fpr[i], &bits, 8);
+            }
+        } else {
+            cpu->fcw = 0x037f;
+            cpu->fsw = 0;
+            cpu->ftw = 0;
+            cpu->ftop = 0;
+            memset(cpu->fpr, 0, sizeof cpu->fpr);
+        }
+    }
+    if (rfbm & 6) {
+        cpu->mxcsr = (uint32_t)ocerz_ld(ea + 24, 4);
+        ocerz_apply_mxcsr_round(cpu->mxcsr);
+    }
+    for (int i = 0; i < 16; i++) {
+        if (rfbm & 2) {
+            if (bv & 2)
+                cpu->xmm[i] = ocerz_ld128(ea + 160 + (uint64_t)i * 16);
+            else
+                memset(&cpu->xmm[i], 0, sizeof cpu->xmm[i]);
+        }
+        if (rfbm & 4) {
+            if (bv & 4)
+                cpu->ymmh[i] = ocerz_ld128(ea + 576 + (uint64_t)i * 16);
+            else
+                memset(&cpu->ymmh[i], 0, sizeof cpu->ymmh[i]);
+        }
+    }
+    return OCERZ_STEP_OK;
+}
+
 static int ext_misc(OcerzCPU *cpu, const X86Insn *insn)
 {
     switch (insn->op) {
@@ -422,6 +620,10 @@ static int ext_misc(OcerzCPU *cpu, const X86Insn *insn)
         return ext_fxsave(cpu, insn);
     case OCERZ_OP_FXRSTOR:
         return ext_fxrstor(cpu, insn);
+    case OCERZ_OP_XSAVE:
+        return ext_xsave(cpu, insn);
+    case OCERZ_OP_XRSTOR:
+        return ext_xrstor(cpu, insn);
     case OCERZ_OP_EMMS:
         cpu->ftop = 0;
         cpu->ftw = 0;
@@ -966,8 +1168,27 @@ int ocerz_interp_ext(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_STMXCSR:
     case OCERZ_OP_FXSAVE:
     case OCERZ_OP_FXRSTOR:
+    case OCERZ_OP_XSAVE:
+    case OCERZ_OP_XRSTOR:
     case OCERZ_OP_EMMS:
         return ext_misc(cpu, insn);
+
+    case OCERZ_OP_ANDN:
+    case OCERZ_OP_BLSR:
+    case OCERZ_OP_BLSMSK:
+    case OCERZ_OP_BLSI:
+    case OCERZ_OP_BZHI:
+    case OCERZ_OP_BEXTR:
+    case OCERZ_OP_PDEP:
+    case OCERZ_OP_PEXT:
+    case OCERZ_OP_MULX:
+    case OCERZ_OP_RORX:
+    case OCERZ_OP_SARX:
+    case OCERZ_OP_SHLX:
+    case OCERZ_OP_SHRX:
+    case OCERZ_OP_MOVBE:
+    case OCERZ_OP_RDRAND:
+        return ext_bmi(cpu, insn);
 
     default:
         return OCERZ_EUNSUP;
