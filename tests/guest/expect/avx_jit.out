@@ -1,0 +1,139 @@
+vpxor OK
+vpand OK
+vpor OK
+vpandn OK
+vxorps OK
+vandps OK
+vorps OK
+vandnps OK
+vxorpd OK
+vandnpd OK
+vpaddb OK
+vpaddw OK
+vpaddd OK
+vpaddq OK
+vpsubb OK
+vpsubw OK
+vpsubd OK
+vpsubq OK
+vpcmpeqb OK
+vpcmpeqw OK
+vpcmpeqd OK
+vpcmpeqq OK
+vpcmpgtb OK
+vpcmpgtw OK
+vpcmpgtd OK
+vpcmpgtq OK
+vpminub OK
+vpminuw OK
+vpminud OK
+vpmaxub OK
+vpmaxuw OK
+vpmaxud OK
+vpminsb OK
+vpminsw OK
+vpminsd OK
+vpmaxsb OK
+vpmaxsw OK
+vpmaxsd OK
+vpmullw OK
+vpmulld OK
+vpaddusb OK
+vpaddusw OK
+vpsubusb OK
+vpsubusw OK
+vpaddsb OK
+vpaddsw OK
+vpsubsb OK
+vpsubsw OK
+vpavgb OK
+vpavgw OK
+vpsllw $0 OK
+vpsllw $3 OK
+vpsllw $15 OK
+vpsllw $16 OK
+vpsllw $31 OK
+vpsllw $33 OK
+vpsllw $64 OK
+vpsllw $255 OK
+vpslld $0 OK
+vpslld $3 OK
+vpslld $15 OK
+vpslld $16 OK
+vpslld $31 OK
+vpslld $33 OK
+vpslld $64 OK
+vpslld $255 OK
+vpsllq $0 OK
+vpsllq $3 OK
+vpsllq $15 OK
+vpsllq $16 OK
+vpsllq $31 OK
+vpsllq $33 OK
+vpsllq $64 OK
+vpsllq $255 OK
+vpsrlw $0 OK
+vpsrlw $3 OK
+vpsrlw $15 OK
+vpsrlw $16 OK
+vpsrlw $31 OK
+vpsrlw $33 OK
+vpsrlw $64 OK
+vpsrlw $255 OK
+vpsrld $0 OK
+vpsrld $3 OK
+vpsrld $15 OK
+vpsrld $16 OK
+vpsrld $31 OK
+vpsrld $33 OK
+vpsrld $64 OK
+vpsrld $255 OK
+vpsrlq $0 OK
+vpsrlq $3 OK
+vpsrlq $15 OK
+vpsrlq $16 OK
+vpsrlq $31 OK
+vpsrlq $33 OK
+vpsrlq $64 OK
+vpsrlq $255 OK
+vpsraw $0 OK
+vpsraw $3 OK
+vpsraw $15 OK
+vpsraw $16 OK
+vpsraw $31 OK
+vpsraw $33 OK
+vpsraw $64 OK
+vpsraw $255 OK
+vpsrad $0 OK
+vpsrad $3 OK
+vpsrad $15 OK
+vpsrad $16 OK
+vpsrad $31 OK
+vpsrad $33 OK
+vpsrad $64 OK
+vpsrad $255 OK
+vmovdqu.forms OK
+vmovdqu.addressing OK
+vpmovmskb.y OK
+vpmovmskb.x OK
+vpmovmskb.y.r64 OK
+vpcmpeqb.vpmovmskb OK
+vpbroadcast.forms OK
+vzeroupper.all OK
+vpmovsx.forms OK
+kernel.memclr OK
+kernel.index.hit OK
+kernel.index.miss OK
+kernel.memeq.same OK
+kernel.memeq.diff OK
+flags.cmp.vex.je.taken OK
+flags.cmp.vex.je.not OK
+flags.vtestps.zf1 OK
+flags.vtestps.zf0 OK
+flags.vpcmpistri.cf1 OK
+flags.vpcmpistri.cf0 OK
+loop.sum_i32.total OK
+loop.sum_i32.out OK
+loop.sat16 OK
+loop.minmax_u32 OK
+ALL OK
