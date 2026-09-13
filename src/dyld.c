@@ -136,7 +136,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
 
-#define DYN_ARENA_SIZE (96ull << 30)
+#define DYN_ARENA_SIZE (256ull << 30)
 #define DYN_STACK_SIZE (8ull << 20)
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
