@@ -230,6 +230,39 @@ run_dlopen_arch_case() {
     done
 }
 
+run_rpath_bare_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir/sub"
+    if ! clang -arch x86_64 -dynamiclib -install_name @rpath/libexe_dep.dylib \
+            -o "$dir/libexe_dep.dylib" tests/dynamic/rpath_bare_dep.c 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name @rpath/libuser_dep.dylib \
+            -o "$dir/sub/libuser_dep.dylib" tests/dynamic/rpath_bare_dep.c 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name @rpath/librpath_user.dylib -Wl,-rpath,@loader_path \
+            -o "$dir/sub/librpath_user.dylib" tests/dynamic/rpath_bare_user.c "$dir/sub/libuser_dep.dylib" 2>/dev/null ||
+       ! clang -arch x86_64 -Wl,-rpath,@executable_path -o "$dir/$name" \
+            tests/dynamic/rpath_bare_main.c "$dir/libexe_dep.dylib" 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name" "$dir"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name" "$dir"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_asm_case() {
     local name="$1" c_src="$2" s_src="$3" want_out="$4"
     if ! clang -arch x86_64 -O2 -o "$TMP/$name" "$c_src" "$s_src" 2>/dev/null; then
@@ -419,6 +452,7 @@ run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'
 run_dlopen_cf_case ddlopen_cf 'OK'
 run_dlopen_arch_case ddlopen_arch 'OK'
+run_rpath_bare_case drpath_bare 'OK'
 run_file_case ddlsym_cache_image tests/dynamic/dlsym_cache_image.c 'OK'
 run_file_case dsyscalls_extra tests/dynamic/syscalls_extra.c 'OK'
 run_file_case dproc_self tests/dynamic/proc_self.c 'OK'
