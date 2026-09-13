@@ -50,7 +50,7 @@ make -j
 | x86-64 guest gate | 93 / 93 |
 | x86-64 differential gate (interpreter vs JIT) | 84 / 84 |
 | i386 differential gate | 20,033 / 20,033 |
-| dynamic-mode tests | 77 / 77 |
+| dynamic-mode tests | 81 / 81 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -90,7 +90,7 @@ Command-line tools match their native output byte for byte
 `plutil` and `openssl` (`version` and `dgst -sha256`).
 
 Not working yet:
-- **Safari** starts but never shows a window. JavaScriptCore's `thread_suspend` reaches the host kernel and freezes a thread that holds the JIT lock.
+- **Safari** starts but never shows a window. In a run on 2026-09-13, WebKit's allocator failed to suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`) and stopped the process. AArchX emulates thread suspension for guest threads, but the main thread was missing from that emulation until the same day, and Safari has not been run again since.
 - **Photos** aborted in `+[PAOpenGLDevice _sharedPixelFormat:]` because `CGLChoosePixelFormat` returned 10002 for every attribute set. The cause was in AArchX's dyld, not the Rosetta-only `AppleMetalGLRenderer` IOKit service blamed earlier. `_dyld_shared_cache_contains_path` rejected the software renderer's plugin path, which runs through a symlink, and `dlsym` on a shared-cache image searched the whole cache. Both are fixed, and CGL now lists the same renderers and builds the same pixel formats as under Rosetta. Photos has not been run again since.
 
 ## Steam
@@ -101,7 +101,7 @@ The x86-64 macOS Steam client comes up with its full UI under AArchX, confirmed 
 ./ocerz "$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/steam_osx" -cef-disable-gpu
 ```
 
-Getting the client this far took SysV semaphores for Steam's tier0 threading, an absolute executable path (Steam derives its bundle root from it), `dlopen` of the executable returning the already loaded main image, C++ initializers run in dependency order, and a 96 GB guest arena, because Chromium's PartitionAlloc reserves a 32 GB region at startup.
+Getting the client this far took SysV semaphores for Steam's tier0 threading, an absolute executable path (Steam derives its bundle root from it), `dlopen` of the executable returning the already loaded main image, C++ initializers run in dependency order, and a guest arena big enough for Chromium's PartitionAlloc, which reserves a 32 GB region at startup. The arena is now 256 GB, because JavaScriptCore's Gigacage asks for a single 128 GB mapping.
 
 `steam_osx` starts `ipcserver` with `launchctl load -S Background` on a plist it writes into Application Support, which would have launchd run it natively. AArchX rewrites that plist on the way through, putting itself in front of `ProgramArguments` and in `Program` (Steam's own plist only has `Program`, so the array is built from it), and enables the job's label first: a legacy `launchctl unload` leaves the label disabled, and every load after that fails with an I/O error while the client reports `ipcserver init failed`. The Mach service lookup itself was never the problem, since Mach traps go straight to the host kernel.
 
