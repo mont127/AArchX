@@ -215,7 +215,8 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
 
     case OCERZ_OP_FCOMI: case OCERZ_OP_FCOMIP:
     case OCERZ_OP_FUCOMI: case OCERZ_OP_FUCOMIP:
-    case OCERZ_OP_PTEST:
+    case OCERZ_OP_PTEST: case OCERZ_OP_VTESTPS: case OCERZ_OP_VTESTPD:
+    case OCERZ_OP_PCMPESTRM: case OCERZ_OP_PCMPESTRI: case OCERZ_OP_PCMPISTRM: case OCERZ_OP_PCMPISTRI:
         d = OCERZ_FL_ALL;
         u = 0;
         break;
@@ -257,7 +258,7 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         break;
 
     default:
-        if (insn->op >= OCERZ_OP_X87_FIRST && insn->op < OCERZ_OP_PUSHA) {
+        if ((insn->op >= OCERZ_OP_X87_FIRST && insn->op < OCERZ_OP_PUSHA) || insn->vex) {
             d = 0;
             u = 0;
         }

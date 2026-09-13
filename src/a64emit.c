@@ -786,6 +786,30 @@ void a64_v_xtl(A64Buf *b, int is_signed, int from, int vd, int vn)
     uint32_t immh = from == 1 ? 0x08u : from == 2 ? 0x10u : 0x20u;
     a64_emit32(b, (is_signed ? 0x0f00a400u : 0x2f00a400u) | (immh << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
 }
+void a64_v_xtl2(A64Buf *b, int is_signed, int from, int vd, int vn)
+{
+    uint32_t immh = from == 1 ? 0x08u : from == 2 ? 0x10u : 0x20u;
+    a64_emit32(b, (is_signed ? 0x4f00a400u : 0x6f00a400u) | (immh << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
+}
+void a64_v_umin(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e206c00u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_umax(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e206400u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_smin(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e206c00u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_smax(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e206400u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_mul(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e209c00u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_uqadd(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e200c00u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_uqsub(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e202c00u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_sqadd(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e200c00u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_sqsub(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e202c00u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_urhadd(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e201400u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_dup_b(A64Buf *b, int vd, int vn, int idx) { a64_emit32(b, 0x4e010400u | ((uint32_t)(idx & 15) << 17) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_dup_h(A64Buf *b, int vd, int vn, int idx) { a64_emit32(b, 0x4e020400u | ((uint32_t)(idx & 7) << 18) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_dup_gpr(A64Buf *b, int esize, int vd, int rn) { a64_emit32(b, 0x4e000c00u | ((uint32_t)esize << 16) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_shl_imm(A64Buf *b, int esz, int vd, int vn, int sh)
+{ a64_emit32(b, 0x4f005400u | ((uint32_t)((8 << esz) + sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_ushr_imm(A64Buf *b, int esz, int vd, int vn, int sh)
+{ a64_emit32(b, 0x6f000400u | ((uint32_t)((16 << esz) - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_sshr_imm(A64Buf *b, int esz, int vd, int vn, int sh)
+{ a64_emit32(b, 0x4f000400u | ((uint32_t)((16 << esz) - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_frint_s(A64Buf *b, int dbl, int mode, int vd, int vn)
 {
     static const uint32_t opc[5] = { 0x1e244000u, 0x1e254000u, 0x1e24c000u, 0x1e25c000u, 0x1e27c000u };
