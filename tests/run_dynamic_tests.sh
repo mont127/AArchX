@@ -225,6 +225,29 @@ run_asm_case() {
     done
 }
 
+run_spawn_argv_case() {
+    local name="$1"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -o "$dir/Steam Helper" tests/dynamic/spawn_argv_child.c 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/Other Helper" tests/dynamic/spawn_argv_child.c 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/spawn_argv_parent.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local label child knob want got
+    for label in steam other optout; do
+        child="$dir/Steam Helper"; knob=""; want="--use-mock-keychain,--type=renderer"
+        [ "$label" = other ] && { child="$dir/Other Helper"; want="--type=renderer"; }
+        [ "$label" = optout ] && { knob="OCERZ_NO_MOCK_KEYCHAIN=1"; want="--type=renderer"; }
+        got=$(env $knob "$OCERZ_ABS" "$dir/$name" "$child" 2>/dev/null)
+        if [ "$got" = "$want" ]; then
+            echo "PASS $name-$label (out='$got')"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$label (got out='$got'; want out='$want')"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_case dret 'int main(void){return 42;}' '' 42
 run_case dwrite '
 int main(void){
@@ -307,6 +330,7 @@ run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'
 run_dlopen_cf_case ddlopen_cf 'OK'
 run_asm_case dcef_partition tests/dynamic/cef_partition.c tests/dynamic/cef_partition.s 'OK'
+run_spawn_argv_case dspawn_mock_keychain
 
 echo "----------------------------------------"
 echo "dynamic tests: $pass passed, $fail failed"
