@@ -1858,19 +1858,20 @@ static void path_dirname(const char *in, char *out, size_t n)
 
 static int expand_at_prefix(DynImage *loader, const char *name, char *out, size_t n)
 {
-    if (strncmp(name, "@executable_path/", 17) == 0) {
-        char dir[1024];
-        path_dirname(g_main_hostpath, dir, sizeof dir);
-        snprintf(out, n, "%s/%s", dir, name + 17);
-        return 1;
+    const char *base, *rest;
+    if (strncmp(name, "@executable_path", 16) == 0 && (name[16] == '/' || name[16] == '\0')) {
+        base = g_main_hostpath;
+        rest = name + 16;
+    } else if (strncmp(name, "@loader_path", 12) == 0 && (name[12] == '/' || name[12] == '\0')) {
+        base = loader ? loader->path : g_main_hostpath;
+        rest = name + 12;
+    } else {
+        return 0;
     }
-    if (strncmp(name, "@loader_path/", 13) == 0) {
-        char dir[1024];
-        path_dirname(loader ? loader->path : g_main_hostpath, dir, sizeof dir);
-        snprintf(out, n, "%s/%s", dir, name + 13);
-        return 1;
-    }
-    return 0;
+    char dir[1024];
+    path_dirname(base, dir, sizeof dir);
+    snprintf(out, n, "%s%s", dir, rest);
+    return 1;
 }
 
 static int expand_rpath_entry(const char *entry, DynImage *loader, char *out, size_t n)
