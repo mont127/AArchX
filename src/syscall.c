@@ -1134,6 +1134,8 @@ static int ocerz_next_cpu_number(void)
     return 1 + (idx % (ncpu > 1 ? ncpu - 1 : 1));
 }
 
+static int ocerz_wq_run_exit(OcerzVM *vm, OcerzCPU *t, uint64_t pth, mach_port_t kp);
+
 static void *ocerz_worker_entry(void *p)
 {
     struct ocerz_worker *w = (struct ocerz_worker *)p;
@@ -1163,6 +1165,14 @@ static void *ocerz_worker_entry(void *p)
         fprintf(stderr, "ocerz: fatal on guest thread cpu#%u; exiting process\n",
                 w->cpu.cpu_number);
         exit(125);
+    }
+    if (w->counts_wq && w->cpu.wq_returned && !w->vm->exited) {
+        wrc = ocerz_wq_run_exit(w->vm, &w->cpu, w->cpu.gs_base - 0xe0, kp);
+        if (wrc == 125) {
+            fprintf(stderr, "ocerz: fatal on guest thread cpu#%u; exiting process\n",
+                    w->cpu.cpu_number);
+            exit(125);
+        }
     }
     mach_port_deallocate(mach_task_self(), kp);
     if (w->counts_wq) {
@@ -1789,6 +1799,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t op = a[0];
     if (op == 0x4) {
+        cpu->wq_returned = 1;
         cpu->terminated = 1;
         ret_ok(cpu, 0);
         return OCERZ_STEP_OK;
@@ -1848,6 +1859,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             g_hostwq_tl_events = NULL;
             g_hostwq_tl_nevents = NULL;
         }
+        cpu->wq_returned = 1;
         cpu->terminated = 1;
         ret_ok(cpu, 0);
         return OCERZ_STEP_OK;
@@ -2038,6 +2050,21 @@ static OcerzVM *g_hostwq_vm;
 static __thread uint64_t g_hostwq_tl_region;
 
 static __thread int g_hostwq_tl_fatal;
+static pthread_key_t g_hostwq_exit_key;
+static pthread_once_t g_hostwq_exit_once = PTHREAD_ONCE_INIT;
+
+static void ocerz_hostwq_thread_exit(void *arg);
+
+static void ocerz_hostwq_exit_key_init(void)
+{
+    pthread_key_create(&g_hostwq_exit_key, ocerz_hostwq_thread_exit);
+}
+
+static void ocerz_hostwq_mark_region(uint64_t region)
+{
+    pthread_once(&g_hostwq_exit_once, ocerz_hostwq_exit_key_init);
+    pthread_setspecific(g_hostwq_exit_key, (void *)(uintptr_t)region);
+}
 
 static int ocerz_no_stackbounds(void)
 {
@@ -2637,6 +2664,7 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
         if (region == 0)
             return;
         g_hostwq_tl_region = region;
+        ocerz_hostwq_mark_region(region);
     }
     uint64_t pth = region + 0x1f0000;
     uint64_t evbuf = pth + 0x8000;
@@ -2789,6 +2817,7 @@ static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
         if (region == 0)
             return;
         g_hostwq_tl_region = region;
+        ocerz_hostwq_mark_region(region);
     }
     uint64_t pth = region + 0x1f0000;
 
@@ -2836,6 +2865,49 @@ static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
     ocerz_init_gate_wait();
     if (ocerz_vm_run_cpu(vm, &t) == 125)
         g_hostwq_tl_fatal = 1;
+    mach_port_deallocate(mach_task_self(), kp);
+}
+
+static int ocerz_wq_run_exit(OcerzVM *vm, OcerzCPU *t, uint64_t pth, mach_port_t kp)
+{
+    uint64_t wqthread_start = __atomic_load_n(&g_wqthread_start, __ATOMIC_ACQUIRE);
+    if (!wqthread_start || !pth)
+        return 0;
+    t->terminated = 0;
+    t->wq_returned = 0;
+    t->ras_top = 0;
+    memset(t->ras, 0, sizeof t->ras);
+    t->rip = wqthread_start;
+    t->gpr[OCERZ_RSP] = pth - 0x100;
+    t->gpr[OCERZ_RDI] = pth;
+    t->gpr[OCERZ_RSI] = kp;
+    t->gpr[OCERZ_RDX] = pth - 0x1f0000 + OCERZ_WQ_GUARD_SIZE;
+    t->gpr[OCERZ_RCX] = 0;
+    t->gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | 4u | OCERZ_WQ_FLAG_REUSE;
+    t->gpr[OCERZ_R9] = 0xffffffffull;
+    t->gs_base = pth + 0xe0;
+    ocerz_init_gate_wait();
+    return ocerz_vm_run_cpu(vm, t);
+}
+
+static void ocerz_hostwq_thread_exit(void *arg)
+{
+    uint64_t region = (uint64_t)(uintptr_t)arg;
+    OcerzVM *vm = g_hostwq_vm;
+    if (!vm || vm->exited || !region)
+        return;
+    uint64_t pth = region + 0x1f0000;
+    if (ocerz_ld(pth + 0xd8, 8) == 0)
+        return;
+    mach_port_t kp = mach_thread_self();
+    ocerz_st(pth + 0xf8, 4, (uint64_t)(uint32_t)kp);
+    OcerzCPU t;
+    memset(&t, 0, sizeof t);
+    t.vm = vm;
+    t.mxcsr = 0x1f80;
+    t.fcw = 0x037f;
+    t.cpu_number = ocerz_next_cpu_number();
+    ocerz_wq_run_exit(vm, &t, pth, kp);
     mach_port_deallocate(mach_task_self(), kp);
 }
 
