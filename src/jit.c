@@ -6818,6 +6818,22 @@ static void l0_share(unsigned dst, unsigned src)
     }
 }
 static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, int *sqrt_like);
+static int vex_cmps_blendv_pair(const X86Insn *c, const X86Insn *v)
+{
+    if (!c->vex || !v->vex || ((c->vex | v->vex) & OCERZ_VEX_L) || c->mode32 || v->mode32) return 0;
+    if (!((c->op == OCERZ_OP_CMPSDX && v->op == OCERZ_OP_BLENDVPD) ||
+          (c->op == OCERZ_OP_CMPSS && v->op == OCERZ_OP_BLENDVPS))) return 0;
+    if (!(c->vex & OCERZ_VEX_NDS) || c->nops != 3 || c->ops[0].kind != OCERZ_OPK_XMM ||
+        c->ops[1].kind != OCERZ_OPK_XMM || c->ops[2].kind != OCERZ_OPK_IMM || (c->ops[2].imm & 0x1f) >= 8) return 0;
+    if (!(v->vex & OCERZ_VEX_NDS) || !(v->vex & OCERZ_VEX_IS4) || v->nops != 3 || v->ops[0].kind != OCERZ_OPK_XMM ||
+        v->ops[1].kind != OCERZ_OPK_XMM || v->ops[2].kind != OCERZ_OPK_XMM) return 0;
+    if (c->seg != OCERZ_SEG_NONE || v->seg != OCERZ_SEG_NONE) return 0;
+    unsigned m = c->ops[0].reg, s1 = v->vvvv & 15, s2 = v->ops[1].reg;
+    if (v->ops[2].reg != m || s1 == m || s2 == m) return 0;
+    if (!xmm_is_pinned(m) || !xmm_is_pinned(c->vvvv & 15) || !xmm_is_pinned(c->ops[1].reg) ||
+        !xmm_is_pinned(v->ops[0].reg) || !xmm_is_pinned(s1) || !xmm_is_pinned(s2)) return 0;
+    return l0_enabled();
+}
 static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
 {
     int cnt[16] = {0}; int8_t firstdbl[16]; uint8_t wfirst[16];
@@ -6840,6 +6856,16 @@ static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
         int use = (c == 1 || c == 3) && !packed;
         if (!use && !insns[i].vex && (insns[i].op == OCERZ_OP_CVTSI2SD || insns[i].op == OCERZ_OP_CVTSI2SS)) {
             use = 1; dbl = insns[i].op == OCERZ_OP_CVTSI2SD;
+        }
+        if (!use && i + 1 < n && vex_cmps_blendv_pair(&insns[i], &insns[i + 1])) {
+            int pd = insns[i].op == OCERZ_OP_CMPSDX;
+            unsigned regs[5] = { insns[i].vvvv & 15, insns[i].ops[1].reg, insns[i + 1].ops[0].reg,
+                                 insns[i + 1].vvvv & 15, insns[i + 1].ops[1].reg };
+            for (int q = 0; q < 5; q++) {
+                cnt[regs[q]]++;
+                if (firstdbl[regs[q]] < 0) firstdbl[regs[q]] = (int8_t)pd;
+            }
+            continue;
         }
         if (!use) continue;
         for (int q = 0; q < insns[i].nops && q < 2; q++) {
@@ -6980,6 +7006,12 @@ static int cmps_blendv_fusable(int cmps_idx)
 static int vex_lane_aware(const X86Insn *insn)
 {
     if (!insn->vex || (insn->vex & OCERZ_VEX_L) || insn->mode32) return 0;
+    if (g_cur_insns && insn >= g_cur_insns && insn < g_cur_insns + g_cur_insns_n) {
+        if ((insn->op == OCERZ_OP_CMPSS || insn->op == OCERZ_OP_CMPSDX) && insn + 1 < g_cur_insns + g_cur_insns_n)
+            return vex_cmps_blendv_pair(insn, insn + 1);
+        if ((insn->op == OCERZ_OP_BLENDVPD || insn->op == OCERZ_OP_BLENDVPS) && insn > g_cur_insns)
+            return vex_cmps_blendv_pair(insn - 1, insn);
+    }
     if (insn->op >= OCERZ_OP_VFMA_FIRST && insn->op <= OCERZ_OP_VFMA_LAST) {
         int kind = ((insn->op - OCERZ_OP_VFMA_FIRST) >> 1) % 10;
         return kind >= 2 && (kind & 1);
@@ -8617,6 +8649,56 @@ static int emit_vex_blendv(A64Buf *b, const X86Insn *insn, int L, uint32_t **exi
     return 1;
 }
 
+static int emit_vex_cmps_fused(A64Buf *b, const X86Insn *insn)
+{
+    int dbl = insn->op == OCERZ_OP_CMPSDX;
+    int va = l0_src(insn->vvvv & 15, dbl), vb = l0_src(insn->ops[1].reg, dbl);
+    emit_cmps_pred(b, dbl, (unsigned)insn->ops[2].imm & 7, VX2, va, vb);
+    g_cmps_mask_idx = g_cur_insn_idx;
+    l0_inval(insn->ops[0].reg);
+    return 1;
+}
+static int emit_vex_blendv_fused(A64Buf *b, const X86Insn *insn, const X86Insn *c, uint32_t **exit_sites, int *n_exits)
+{
+    int dbl = insn->op == OCERZ_OP_BLENDVPD;
+    unsigned m = c->ops[0].reg, cv = c->vvvv & 15, d = insn->ops[0].reg, s1 = insn->vvvv & 15, s2 = insn->ops[1].reg;
+    int have = g_cmps_mask_idx == g_cur_insn_idx - 1;
+    g_cmps_mask_idx = -1;
+    if (!have) {
+        l0_flush_reg(b, s1); l0_flush_reg(b, s2); l0_flush_reg(b, d); l0_flush_reg(b, m);
+        l0_inval(d);
+        return emit_vex_blendv(b, insn, 0, exit_sites, n_exits);
+    }
+    if (m != d) {
+        if (m != cv) a64_v_mov(b, xmm_vreg(m), xmm_vreg(cv));
+        if (dbl) a64_ins_d_d(b, xmm_vreg(m), 0, VX2, 0); else a64_ins_s_s(b, xmm_vreg(m), 0, VX2, 0);
+        emit_ymmh_clear(b, m);
+    }
+    int vd_old = l0_src(d, dbl);
+    int t = l0_alloc(d, dbl);
+    if (t < 0) {
+        l0_flush_reg(b, s1); l0_flush_reg(b, s2);
+        if (m == d) {
+            if (d != cv) a64_v_mov(b, xmm_vreg(d), xmm_vreg(cv));
+            if (dbl) a64_ins_d_d(b, xmm_vreg(d), 0, VX2, 0); else a64_ins_s_s(b, xmm_vreg(d), 0, VX2, 0);
+        }
+        return emit_vex_blendv(b, insn, 0, exit_sites, n_exits);
+    }
+    int v1 = s1 == d ? vd_old : l0_src(s1, dbl), v2 = s2 == d ? vd_old : l0_src(s2, dbl);
+    if (v2 == t) {
+        a64_v_bif(b, t, v1, VX2);
+    } else {
+        if (v1 != t) { if (dbl) a64_fmov_d_d(b, t, v1); else a64_fmov_s_s(b, t, v1); }
+        a64_v_bit(b, t, v2, VX2);
+    }
+    if (dbl) a64_v_sshr_2d(b, VX3, xmm_vreg(cv), 63); else a64_v_sshr_4s(b, VX3, xmm_vreg(cv), 31);
+    a64_v_bsl(b, VX3, xmm_vreg(s2), xmm_vreg(s1));
+    a64_v_mov(b, xmm_vreg(d), VX3);
+    g_l0_dirty |= (uint16_t)(1u << d);
+    emit_ymmh_clear(b, d);
+    return 1;
+}
+
 static int bmi_src(A64Buf *b, const X86Insn *insn, const X86Operand *o, int size, int tmp)
 {
     if (o->kind == OCERZ_OPK_REG) {
@@ -8921,6 +9003,14 @@ static int emit_vex_sse128(A64Buf *b, const X86Insn *insn, int L, uint32_t **exi
 static int emit_vex(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (!vex_inline_enabled() || !sse_enabled() || insn->mode32 || insn->seg != OCERZ_SEG_NONE) return 0;
+    if (g_cur_insns && insn >= g_cur_insns && insn < g_cur_insns + g_cur_insns_n) {
+        if ((insn->op == OCERZ_OP_CMPSS || insn->op == OCERZ_OP_CMPSDX) && insn + 1 < g_cur_insns + g_cur_insns_n &&
+            vex_cmps_blendv_pair(insn, insn + 1))
+            return emit_vex_cmps_fused(b, insn);
+        if ((insn->op == OCERZ_OP_BLENDVPD || insn->op == OCERZ_OP_BLENDVPS) && insn > g_cur_insns &&
+            vex_cmps_blendv_pair(insn - 1, insn))
+            return emit_vex_blendv_fused(b, insn, insn - 1, exit_sites, n_exits);
+    }
     int L = (insn->vex & OCERZ_VEX_L) != 0, esz;
     if (insn->op >= OCERZ_OP_VFMA_FIRST && insn->op <= OCERZ_OP_VFMA_LAST)
         return emit_vex_fma(b, insn, exit_sites, n_exits);
