@@ -531,7 +531,7 @@ static struct { uint32_t *site; uint64_t taken; int idx; uint32_t *stub; uint32_
                 int rec; uint32_t rec_ccop; int rec_src, rec_dst, rec_imm_pending; uint64_t rec_imm;
                 uint64_t jcc_rip; int probe; uint32_t *ft_site; uint64_t ft_rip;
                 int fpb; uint16_t fpb_chk; int fpb_end; int8_t l0[16]; uint8_t l0_dbl[16];
-                uint16_t l0_dirty; } g_side[SIDE_MAX];
+                uint16_t l0_dirty; uint16_t yc_dirty; } g_side[SIDE_MAX];
 static int g_n_side;
 
 #define FLIP_N 4096
@@ -1602,6 +1602,7 @@ static int probe_wanted(uint64_t jcc_rip, uint64_t ft_rip)
 
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
 static void emit_slowcall_keep_lanes(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits);
+static void yc_reload_all(A64Buf *b);
 
 #define RF_OFF ((uint32_t)offsetof(OcerzCPU, rflags))
 #define RIP_OFF ((uint32_t)offsetof(OcerzCPU, rip))
@@ -1710,6 +1711,7 @@ static void emit_xmm_pin_load_all(A64Buf *b);
 static void emit_xmm_pin_spill_all(A64Buf *b);
 static void emit_spill_pinned_callersaved(A64Buf *b);
 static void emit_fill_pinned_callersaved(A64Buf *b);
+static uint16_t g_lane_used;
 static void emit_materialize(A64Buf *b)
 {
 
@@ -1720,10 +1722,16 @@ static void emit_materialize(A64Buf *b)
     a64_cbz(b, 0, JT0, 0);
     emit_xmm_pin_spill_all(b);
     emit_spill_pinned_callersaved(b);
+    for (int v = 4; v < 16; v += 2)
+        if (g_lane_used & (3u << (v - 4)))
+            a64_stp_q_pre(b, v, v + 1, 31, -32);
     a64_mov_reg(b, 1, 0, 20);
     a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_flags_materialize);
     a64_blr(b, 16);
     g_callout_seq++;
+    for (int v = 14; v >= 4; v -= 2)
+        if (g_lane_used & (3u << (v - 4)))
+            a64_ldp_q_post(b, v, v + 1, 31, 32);
     emit_fill_pinned_callersaved(b);
     emit_reload_jgb(b);
     emit_reload_mem_base(b);
@@ -6666,6 +6674,30 @@ static int l0_enabled(void)
     return en;
 }
 static uint16_t g_l0_dirty;
+#define YMMH_OFF ((uint32_t)offsetof(OcerzCPU, ymmh))
+_Static_assert(offsetof(OcerzCPU, ymmh) % 16 == 0 && offsetof(OcerzCPU, ymmh) + 256 <= 65520,
+               "ymmh must be q-addressable");
+static int8_t g_yc[16];
+static uint16_t g_yc_dirty;
+static void yc_flush_all(A64Buf *b)
+{
+    for (unsigned r = 0; r < 16; r++)
+        if ((g_yc_dirty & (1u << r)) && g_yc[r] >= 0)
+            a64_str_v(b, 16, g_yc[r], 20, YMMH_OFF + r * 16);
+    g_yc_dirty = 0;
+}
+static void yc_flush_from(A64Buf *b, uint16_t dirty)
+{
+    for (unsigned r = 0; r < 16; r++)
+        if ((dirty & (1u << r)) && g_yc[r] >= 0)
+            a64_str_v(b, 16, g_yc[r], 20, YMMH_OFF + r * 16);
+}
+static void yc_reload_all(A64Buf *b)
+{
+    for (unsigned r = 0; r < 16; r++)
+        if (g_yc[r] >= 0)
+            a64_ldr_v(b, 16, g_yc[r], 20, YMMH_OFF + r * 16);
+}
 static void l0_reset(void)
 {
     for (int i = 0; i < 16; i++) g_l0[i] = -1;
@@ -6692,6 +6724,7 @@ static void l0_flush_all(A64Buf *b)
 {
     while (g_l0_dirty)
         l0_flush_reg(b, (unsigned)__builtin_ctz(g_l0_dirty));
+    yc_flush_all(b);
 }
 static int l0_defer_take(int vs, unsigned xr, int size)
 {
@@ -6719,6 +6752,7 @@ static void l0_fixed_map(void)
         g_l0[r] = g_l0_fixed_lane[r];
         g_l0_dbl[r] = g_l0_fixed_dbl[r];
         g_l0_owners[g_l0_fixed_lane[r] - 4] = (uint16_t)(1u << r);
+        g_lane_used |= (uint16_t)(1u << (g_l0_fixed_lane[r] - 4));
         if (g_l0_fixed_dirty & (1u << r)) g_l0_dirty |= (uint16_t)(1u << r);
     }
 }
@@ -6755,6 +6789,7 @@ static int l0_alloc2(A64Buf *b, unsigned r, int dbl)
     }
     l0_inval(r);
     int t = 4 + (int)(g_l0_next++ % L0_NLANES);
+    g_lane_used |= (uint16_t)(1u << (t - 4));
     uint16_t own = g_l0_owners[t - 4];
     for (int i = 0; i < 16; i++) if (own & (1u << i)) {
         if (g_l0_dirty & (1u << i))
@@ -6836,6 +6871,44 @@ static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
         a64_v_mov(b, g_l0_fixed_lane[r], xmm_vreg(r));
     g_l0_fixed = 1;
     l0_fixed_map();
+    return 1;
+}
+
+static int yc_setup(A64Buf *b, const X86Insn *insns, int n)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_YMMH_CACHE") ? 1 : 0;
+    if (dis) return 0;
+    int cnt[16] = {0};
+    for (int i = 0; i < n; i++) {
+        const X86Insn *in = &insns[i];
+        if (!(in->vex & OCERZ_VEX_L) || in->mode32) continue;
+        for (int k = 0; k < in->nops; k++)
+            if (in->ops[k].kind == OCERZ_OPK_XMM && in->ops[k].reg < 16) cnt[in->ops[k].reg]++;
+        if (in->vex & OCERZ_VEX_NDS) cnt[in->vvvv & 15]++;
+    }
+    uint16_t used = 0;
+    for (int r = 0; r < 16; r++) if (g_l0_fixed_lane[r] >= 0) used |= (uint16_t)(1u << (g_l0_fixed_lane[r] - 4));
+    int got = 0;
+    for (;;) {
+        int best = -1;
+        for (int r = 0; r < 16; r++)
+            if (g_yc[r] < 0 && cnt[r] > 0 && (best < 0 || cnt[r] > cnt[best])) best = r;
+        if (best < 0) break;
+        int lane = -1;
+        for (int k = L0_NLANES - 1; k >= 0; k--) if (!(used & (1u << k))) { lane = k; break; }
+        if (lane < 0) break;
+        used |= (uint16_t)(1u << lane);
+        g_lane_used |= (uint16_t)(1u << lane);
+        g_yc[best] = (int8_t)(4 + lane);
+        got++;
+    }
+    if (!got) return 0;
+    for (int r = 0; r < 16; r++) if (g_yc[r] >= 0) {
+        a64_ldr_v(b, 16, g_yc[r], 20, YMMH_OFF + (uint32_t)r * 16);
+        g_yc_dirty |= (uint16_t)(1u << r);
+    }
+    g_l0_fixed = 1;
     return 1;
 }
 
@@ -8117,9 +8190,6 @@ static int emit_pmovmskb(A64Buf *b, const X86Insn *insn)
     return 1;
 }
 
-#define YMMH_OFF ((uint32_t)offsetof(OcerzCPU, ymmh))
-_Static_assert(offsetof(OcerzCPU, ymmh) % 16 == 0 && offsetof(OcerzCPU, ymmh) + 256 <= 65520,
-               "ymmh must be q-addressable");
 
 static int vex_inline_enabled(void)
 {
@@ -8128,17 +8198,39 @@ static int vex_inline_enabled(void)
     return on;
 }
 static uint16_t g_ymmh_zero;
-static void emit_ymmh_ld(A64Buf *b, int vd, unsigned xr) { a64_ldr_v(b, 16, vd, 20, YMMH_OFF + xr * 16); }
+static int ymmh_src(A64Buf *b, unsigned xr, int vtmp)
+{
+    if (g_yc[xr] >= 0) return g_yc[xr];
+    if (g_ymmh_zero & (1u << xr)) { a64_v_zero(b, vtmp); return vtmp; }
+    a64_ldr_v(b, 16, vtmp, 20, YMMH_OFF + xr * 16);
+    return vtmp;
+}
+static inline int ymmh_dst(unsigned xr, int vtmp) { return g_yc[xr] >= 0 ? g_yc[xr] : vtmp; }
+static void emit_ymmh_ld(A64Buf *b, int vd, unsigned xr)
+{
+    int v = ymmh_src(b, xr, vd);
+    if (v != vd) a64_v_mov(b, vd, v);
+}
 static void emit_ymmh_st(A64Buf *b, int vs, unsigned xr)
 {
-    a64_str_v(b, 16, vs, 20, YMMH_OFF + xr * 16);
     g_ymmh_zero &= (uint16_t)~(1u << xr);
+    if (g_yc[xr] >= 0) {
+        if (vs != g_yc[xr]) a64_v_mov(b, g_yc[xr], vs);
+        g_yc_dirty |= (uint16_t)(1u << xr);
+        return;
+    }
+    a64_str_v(b, 16, vs, 20, YMMH_OFF + xr * 16);
 }
 static void emit_ymmh_clear(A64Buf *b, unsigned xr)
 {
     if (g_ymmh_zero & (1u << xr)) return;
-    a64_str(b, 8, A64_ZR, 20, YMMH_OFF + xr * 16);
-    a64_str(b, 8, A64_ZR, 20, YMMH_OFF + xr * 16 + 8);
+    if (g_yc[xr] >= 0) {
+        a64_v_zero(b, g_yc[xr]);
+        g_yc_dirty |= (uint16_t)(1u << xr);
+    } else {
+        a64_str(b, 8, A64_ZR, 20, YMMH_OFF + xr * 16);
+        a64_str(b, 8, A64_ZR, 20, YMMH_OFF + xr * 16 + 8);
+    }
     g_ymmh_zero |= (uint16_t)(1u << xr);
 }
 
@@ -8191,7 +8283,7 @@ static int emit_vex_mov(A64Buf *b, const X86Insn *insn, int L, uint32_t **exit_s
             if (!xmm_is_pinned(s->reg)) return 0;
             if (s->reg != d->reg) {
                 a64_v_mov(b, vd, xmm_vreg(s->reg));
-                if (L) { emit_ymmh_ld(b, VX0, s->reg); emit_ymmh_st(b, VX0, d->reg); }
+                if (L) emit_ymmh_st(b, ymmh_src(b, s->reg, VX0), d->reg);
             }
             if (!L) emit_ymmh_clear(b, d->reg);
             return 1;
@@ -8203,10 +8295,11 @@ static int emit_vex_mov(A64Buf *b, const X86Insn *insn, int L, uint32_t **exit_s
             return 1;
         }
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
-        emit_vex_mem_acc(b, VX1, 16, 0);
+        int vh = ymmh_dst(d->reg, VX1);
+        emit_vex_mem_acc(b, vh, 16, 0);
         emit_vex_mem_acc(b, vd, 0, 0);
         emit_vex_mem_done(b);
-        emit_ymmh_st(b, VX1, d->reg);
+        emit_ymmh_st(b, vh, d->reg);
         return 1;
     }
     if (d->kind != OCERZ_OPK_MEM || s->kind != OCERZ_OPK_XMM || !xmm_is_pinned(s->reg)) return 0;
@@ -8220,9 +8313,9 @@ static int emit_vex_mov(A64Buf *b, const X86Insn *insn, int L, uint32_t **exit_s
         return 1;
     }
     if (!emit_vex_mem_addr(b, insn, d, exit_sites, n_exits)) return 0;
-    emit_ymmh_ld(b, VX1, s->reg);
+    int vh = ymmh_src(b, s->reg, VX1);
     emit_vex_mem_acc(b, vs, 0, 1);
-    emit_vex_mem_acc(b, VX1, 16, 1);
+    emit_vex_mem_acc(b, vh, 16, 1);
     emit_vex_mem_done(b);
     return 1;
 }
@@ -8240,9 +8333,10 @@ static int emit_vex_int(A64Buf *b, const X86Insn *insn, int kind, int esz, int L
         emit_ymmh_clear(b, d->reg);
         return 1;
     }
+    int vbh = VX1;
     if (s->kind == OCERZ_OPK_XMM) {
         vb = xmm_vreg(s->reg);
-        if (L) emit_ymmh_ld(b, VX1, s->reg);
+        if (L) vbh = ymmh_src(b, s->reg, VX1);
     } else if (L) {
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
         emit_vex_mem_acc(b, VX1, 16, 0);
@@ -8252,12 +8346,14 @@ static int emit_vex_int(A64Buf *b, const X86Insn *insn, int kind, int esz, int L
         return 0;
     }
     if (L) {
-        emit_ymmh_ld(b, VX2, insn->vvvv);
-        emit_sse_int_op(b, kind, esz, VX2, VX2, VX1);
+        int vah = ymmh_src(b, insn->vvvv, VX2), vdh = ymmh_dst(d->reg, VX2);
+        emit_sse_int_op(b, kind, esz, vdh, vah, vbh);
+        emit_sse_int_op(b, kind, esz, vd, va, vb);
+        emit_ymmh_st(b, vdh, d->reg);
+        return 1;
     }
     emit_sse_int_op(b, kind, esz, vd, va, vb);
-    if (L) emit_ymmh_st(b, VX2, d->reg);
-    else emit_ymmh_clear(b, d->reg);
+    emit_ymmh_clear(b, d->reg);
     return 1;
 }
 
@@ -8388,23 +8484,25 @@ static int emit_vex_fp256(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (insn->nops != 2 || d->kind != OCERZ_OPK_XMM || !xmm_is_pinned(d->reg)) return 0;
     if (!sq && (!(insn->vex & OCERZ_VEX_NDS) || !xmm_is_pinned(insn->vvvv))) return 0;
     if (s->kind == OCERZ_OPK_XMM ? !xmm_is_pinned(s->reg) : s->kind != OCERZ_OPK_MEM) return 0;
-    int mem = s->kind == OCERZ_OPK_MEM, lb = VX0;
+    int mem = s->kind == OCERZ_OPK_MEM, lb = VX0, sh = VX2, ah = VX1;
     if (mem) {
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
         emit_vex_mem_acc(b, VX2, 16, 0);
     } else {
-        emit_ymmh_ld(b, VX2, s->reg);
+        sh = ymmh_src(b, s->reg, VX2);
         lb = xmm_vreg(s->reg);
     }
-    if (!sq) emit_ymmh_ld(b, VX1, insn->vvvv);
-    emit_vex_fp_lane(b, kind, dbl, VX3, VX1, VX2, VX0);
+    if (!sq) ah = ymmh_src(b, insn->vvvv, VX1);
+    int dh = ymmh_dst(d->reg, VX3);
+    if (dh == ah || dh == sh) dh = VX3;
+    emit_vex_fp_lane(b, kind, dbl, dh, ah, sh, VX0);
     if (mem) {
         emit_vex_mem_acc(b, VX0, 0, 0);
         emit_vex_mem_done(b);
     }
     emit_vex_fp_lane(b, kind, dbl, VX1, sq ? lb : xmm_vreg(insn->vvvv), lb, VX2);
     a64_v_mov(b, xmm_vreg(d->reg), VX1);
-    emit_ymmh_st(b, VX3, d->reg);
+    emit_ymmh_st(b, dh, d->reg);
     return 1;
 }
 
@@ -8845,7 +8943,10 @@ static int emit_vex(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_VBROADCASTI128: case OCERZ_OP_VBROADCASTF128: return emit_vex_broadcast(b, insn, 16, L, exit_sites, n_exits);
     case OCERZ_OP_VZEROUPPER:
         a64_v_zero(b, VX0);
-        for (unsigned r = 0; r < 16; r++) emit_ymmh_st(b, VX0, r);
+        for (unsigned r = 0; r < 16; r++) {
+            if (g_yc[r] >= 0) { a64_v_zero(b, g_yc[r]); g_yc_dirty |= (uint16_t)(1u << r); }
+            else a64_str_v(b, 16, VX0, 20, YMMH_OFF + r * 16);
+        }
         g_ymmh_zero = 0xffff;
         return 1;
     case OCERZ_OP_PMOVSXBW: return emit_vex_pmovx(b, insn, 1, 1, L, exit_sites, n_exits);
@@ -9745,6 +9846,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         g_side[g_n_side].rec = rec_stub;
         g_side[g_n_side].fpb = -1; g_side[g_n_side].fpb_chk = 0;
         g_side[g_n_side].l0_dirty = g_l0_dirty;
+        g_side[g_n_side].yc_dirty = g_yc_dirty;
         for (int r = 0; r < 16; r++) { g_side[g_n_side].l0[r] = g_l0[r]; g_side[g_n_side].l0_dbl[r] = g_l0_dbl[r]; }
         g_side[g_n_side].jcc_rip = jcc->rip;
         g_side[g_n_side].ft_rip = jcc->rip + jcc->len;
@@ -11602,9 +11704,8 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         }
     }
 
-    emit_materialize(b);
-
     l0_flush_all(b);
+    emit_materialize(b);
     g_ymmh_zero = 0;
     emit_xmm_pin_spill_all(b);
     emit_spill_pinned(b);
@@ -11628,6 +11729,7 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     g_callout_seq++;
     emit_fill_pinned(b);
     emit_xmm_pin_load_all(b);
+    yc_reload_all(b);
     exit_sites[*n_exits] = a64_label(b);
     a64_cbnz(b, 0, 0, 0);
     (*n_exits)++;
@@ -12289,7 +12391,7 @@ static int code_index_append_locked(OcerzJit *jit, JitBlock *block)
 
 #define OOLSLOW_MAX 32
 static struct { uint32_t *sites[3]; int nsites; const X86Insn *insn; uint32_t *back; uint32_t pre;
-                int8_t l0[16]; uint8_t l0_dbl[16]; uint16_t l0_dirty; } g_oolslow[OOLSLOW_MAX];
+                int8_t l0[16]; uint8_t l0_dbl[16]; uint16_t l0_dirty; uint16_t yc_dirty; } g_oolslow[OOLSLOW_MAX];
 static int g_n_oolslow;
 static void emit_l0_flush_from(A64Buf *b, const int8_t *l0, const uint8_t *l0_dbl, uint16_t dirty)
 {
@@ -12325,6 +12427,7 @@ static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32
     g_oolslow[g_n_oolslow].pre = g_oolslow_pre;
     for (int r = 0; r < 16; r++) { g_oolslow[g_n_oolslow].l0[r] = g_l0[r]; g_oolslow[g_n_oolslow].l0_dbl[r] = g_l0_dbl[r]; }
     g_oolslow[g_n_oolslow].l0_dirty = g_l0_dirty;
+    g_oolslow[g_n_oolslow].yc_dirty = g_yc_dirty;
     g_oolslow_pre = 0;
     g_n_oolslow++;
     return 1;
@@ -12351,6 +12454,7 @@ static void emit_oolslow_arms(A64Buf *b, uint32_t **exit_sites, int *n_exits)
         for (int i = 0; i < g_oolslow[k].nsites; i++) patch_any_branch(g_oolslow[k].sites[i], lbl);
         if (g_oolslow[k].pre) a64_emit32(b, g_oolslow[k].pre);
         emit_l0_flush_from(b, g_oolslow[k].l0, g_oolslow[k].l0_dbl, g_oolslow[k].l0_dirty);
+        yc_flush_from(b, g_oolslow[k].yc_dirty);
         emit_slowcall(b, g_oolslow[k].insn, exit_sites, n_exits);
         emit_l0_reload_from(b, g_oolslow[k].l0, g_oolslow[k].l0_dbl);
         uint32_t *here = a64_label(b);
@@ -12776,6 +12880,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_body_entry = NULL;
     g_loop_entry = NULL;
     g_l0_fixed = 0;
+    g_lane_used = 0;
+    memset(g_yc, -1, sizeof g_yc);
+    g_yc_dirty = 0;
     memset(g_l0_fixed_lane, -1, sizeof g_l0_fixed_lane);
     g_stop_patch = NULL;
     g_n_stop_extra = 0;
@@ -13073,6 +13180,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
           if (!nofix && selfl && !g_no_chain && !g_xlat_mode32 && l0_enabled() &&
               sse_enabled() && xmm_global_enabled() && !g_no_regflags)
               l0_fixed_setup(&b, blk->insns, n);
+          if (!nofix && selfl && !g_no_chain && !g_xlat_mode32 && l0_enabled() &&
+              sse_enabled() && xmm_global_enabled() && !g_no_regflags)
+              yc_setup(&b, blk->insns, n);
         }
         g_loop_entry = a64_label(&b);
         if (g_mem_hoist_greg >= 0 && g_mem_hoist_aux_index >= 0)
@@ -13502,6 +13612,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 g_side[g_n_side].fpb_chk = g_fpb_sidechk[i];
                 g_side[g_n_side].fpb_end = i - 1;
                 g_side[g_n_side].l0_dirty = g_l0_dirty;
+                g_side[g_n_side].yc_dirty = g_yc_dirty;
                 for (int r = 0; r < 16; r++) { g_side[g_n_side].l0[r] = g_l0[r]; g_side[g_n_side].l0_dbl[r] = g_l0_dbl[r]; }
                 g_side[g_n_side].jcc_rip = insn->rip;
                 g_side[g_n_side].ft_rip = insn->rip + insn->len;
@@ -13816,6 +13927,7 @@ promo_push_fallthrough:
                 if (g_side[k].l0_dbl[r]) a64_ins_d_d(&b, xmm_vreg((unsigned)r), 0, g_side[k].l0[r], 0);
                 else                     a64_ins_s_s(&b, xmm_vreg((unsigned)r), 0, g_side[k].l0[r], 0);
             }
+        yc_flush_from(&b, g_side[k].yc_dirty);
         if (g_side[k].fpb >= 0 && g_side[k].fpb_chk)
             fpb_emit_regs_check(&b, g_side[k].fpb_chk, g_side[k].fpb, g_side[k].fpb_end, g_side[k].l0, g_side[k].l0_dbl);
         if (g_side[k].rec) {
@@ -13842,6 +13954,7 @@ promo_push_fallthrough:
                     if (g_side[k].l0_dbl[r]) a64_ins_d_d(&b, xmm_vreg((unsigned)r), 0, g_side[k].l0[r], 0);
                     else                     a64_ins_s_s(&b, xmm_vreg((unsigned)r), 0, g_side[k].l0[r], 0);
                 }
+            yc_flush_from(&b, g_side[k].yc_dirty);
             emit_static_chain_tail(&b, g_side[k].ft_rip, 0, body_edge, epi_sites, &n_epi);
             g_tag_blk = NULL;
             pf->ft_site = g_side[k].ft_site;
@@ -13857,6 +13970,8 @@ promo_push_fallthrough:
         a64_patch_bcond(fb->site, lbl);
         if (fb->gain) a64_patch_b(fb->site + fb->gain, lbl);
         fpb_replay_prelude(&b, fb, fb->l0, fb->l0_dbl);
+        yc_flush_from(&b, 0xffff);
+        g_yc_dirty = 0;
         g_fpb_fast = 0;
         g_fpb_open = -1;
         l0_reset();
@@ -13895,6 +14010,8 @@ promo_push_fallthrough:
         FpBatch *fb = &g_fpb[st->batch];
         a64_patch_bcond(st->site, a64_label(&b));
         fpb_replay_prelude(&b, fb, st->l0, st->l0_dbl);
+        yc_flush_from(&b, 0xffff);
+        g_yc_dirty = 0;
         g_fpb_fast = 0;
         g_fpb_open = -1;
         l0_reset();
