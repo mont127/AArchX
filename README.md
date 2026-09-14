@@ -47,8 +47,8 @@ make -j
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 99 / 99 |
-| x86-64 differential gate (interpreter vs JIT) | 90 / 90 |
+| x86-64 guest gate | 100 / 100 |
+| x86-64 differential gate (interpreter vs JIT) | 91 / 91 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 107 / 107 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
@@ -180,7 +180,7 @@ xychart-beta
 
 Apple M2 Max, 2026-09-04, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`. `hash` and `chase` are ties that no translation can move: `hash` is a chain of multiply, shift and or per step and both sides are bound by multiply latency; `chase` is a dependent-load chain and both sides wait on the cache. Anything within a couple of percent of 1.00x flips from run to run, and a busy machine moves every ratio by that much.
 
-The same suite built for x86-64-v3 (`clang -march=x86-64-v3`, so AVX2, FMA and BMI throughout) used to lose ten kernels, three of them by 4x to 13x, because its VEX and BMI instructions went to the interpreter. On 2026-09-14, on an Apple M5, every kernel is within 0.83x and 1.17x of Rosetta: eight wins, and `fpsse` at 1.17x is the largest loss.
+The same suite built for x86-64-v3 (`clang -march=x86-64-v3`, so AVX2, FMA and BMI throughout) used to lose ten kernels, three of them by 4x to 13x, because its VEX and BMI instructions went to the interpreter. On 2026-09-14, on an Apple M5, it wins ten of the fifteen (`vm` 0.75x, `fpsse` 0.83x, `jtab` 0.89x, `memcpy` 0.94x) and loses none by more than 7% (`str` 1.07x, `fpvec` 1.05x, `leafcall` 1.03x, `idiv` and `chase` at 1.00x). The same day's run of the SSE2 build on that machine: eleven wins, four losses, none above 1.10x.
 
 `mixed` was a 1.20x loss for a long time, and the whole gap was the price of bit-exact x86 NaN semantics: every packed FP result needed a check before anything could use it. The JIT now defers that check to the compares that read the value, and Rosetta-style hot paths that the compiler split with rare-case branches get retranslated with the hot side inline. Both are exact; the NaN tests in `tests/guest` compare bit patterns against the native binary.
 
@@ -203,21 +203,21 @@ The tall bars are the previous ordered-mode cost, the short bars the current one
 
 Every VEX-encoded instruction used to leave translated code for the interpreter, so AVX2 and FMA loops ran up to 100 times slower than under Rosetta. The JIT now translates the instructions these kernels spend their time in.
 
-Timings are best of 3 on an Apple M5 with macOS 26.6.2, taken 2026-09-13 and, for the scalar rows, 2026-09-14. "Before" is the build at `31bff03`.
+Timings are best of 5 on an Apple M5 with macOS 26.6.2, taken 2026-09-14 on an idle machine. "Before" is the build at `31bff03`.
 
 | Kernel | Before | Now | Rosetta |
 | --- | ---: | ---: | ---: |
-| `memclr` 32 MB, AVX2 `vmovdqu` | 24.12 ms | 0.59 ms | 0.59 ms |
-| `indexbyte` 32 MB, AVX2 | 71.98 ms | **0.90 ms** | 1.53 ms |
-| `memeq` 32 MB, AVX2 | 64.79 ms | **0.87 ms** | 1.70 ms |
-| int32 loop 4M, clang AVX2 | 135.35 ms | 1.62 ms | 1.25 ms |
-| int32 loop 4M, clang SSE4.1 | 29.48 ms | **0.56 ms** | 0.77 ms |
-| saxpy 4M, clang AVX2+FMA | 37.62 ms | 0.46 ms | 0.47 ms |
-| nbody 200k steps, scalar SSE2 | 72.55 ms | 8.56 ms | 5.80 ms |
-| nbody 200k steps, scalar AVX2 | 1122.18 ms | **10.25 ms** | 10.30 ms |
-| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.26 ms** | 9.24 ms |
-| mandelbrot 400x400, scalar SSE2 | 28.50 ms | 17.70 ms | 16.00 ms |
-| mandelbrot 400x400, scalar AVX2 | 1171.68 ms | 18.20 ms | 16.10 ms |
+| `memclr` 32 MB, AVX2 `vmovdqu` | 24.12 ms | 0.57 ms | 0.56 ms |
+| `indexbyte` 32 MB, AVX2 | 71.98 ms | **0.85 ms** | 1.48 ms |
+| `memeq` 32 MB, AVX2 | 64.79 ms | **0.86 ms** | 1.72 ms |
+| int32 loop 4M, clang AVX2 | 135.35 ms | **0.44 ms** | 1.30 ms |
+| int32 loop 4M, clang SSE4.1 | 29.48 ms | **0.56 ms** | 0.78 ms |
+| saxpy 4M, clang AVX2+FMA | 37.62 ms | **0.33 ms** | 0.48 ms |
+| nbody 200k steps, scalar SSE2 | 72.55 ms | 8.77 ms | 5.97 ms |
+| nbody 200k steps, scalar AVX2 | 1122.18 ms | **10.46 ms** | 10.61 ms |
+| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.53 ms** | 9.54 ms |
+| mandelbrot 400x400, scalar SSE2 | 28.50 ms | 18.25 ms | 16.47 ms |
+| mandelbrot 400x400, scalar AVX2 | 1171.68 ms | 18.82 ms | 16.50 ms |
 
 The first three kernels are hand-written loops shaped like Go's runtime routines. The rest are C loops, which clang vectorizes except for nbody and mandelbrot, which stay scalar.
 
