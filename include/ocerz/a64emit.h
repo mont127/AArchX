@@ -136,6 +136,8 @@ void a64_stp_off(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_ldp_off(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_stp_d_pre(A64Buf *b, int dt, int dt2, int rn, int imm);
 void a64_ldp_d_post(A64Buf *b, int dt, int dt2, int rn, int imm);
+void a64_stp_q_pre(A64Buf *b, int qt, int qt2, int rn, int imm);
+void a64_ldp_q_post(A64Buf *b, int qt, int qt2, int rn, int imm);
 
 void a64_ldr_v(A64Buf *b, int size, int vt, int rn, uint32_t off);
 void a64_str_v(A64Buf *b, int size, int vt, int rn, uint32_t off);

@@ -592,6 +592,14 @@ void a64_ldp_d_post(A64Buf *b, int dt, int dt2, int rn, int imm)
 {
     a64_emit32(b, 0x6cc00000u | (ldstp_imm7(imm) << 15) | ((uint32_t)(dt2 & 31) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(dt & 31));
 }
+void a64_stp_q_pre(A64Buf *b, int qt, int qt2, int rn, int imm)
+{
+    a64_emit32(b, 0xad800000u | ((uint32_t)((imm / 16) & 0x7f) << 15) | ((uint32_t)(qt2 & 31) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(qt & 31));
+}
+void a64_ldp_q_post(A64Buf *b, int qt, int qt2, int rn, int imm)
+{
+    a64_emit32(b, 0xacc00000u | ((uint32_t)((imm / 16) & 0x7f) << 15) | ((uint32_t)(qt2 & 31) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(qt & 31));
+}
 
 void a64_ldr_v(A64Buf *b, int size, int vt, int rn, uint32_t off)
 {
