@@ -584,6 +584,14 @@ void a64_ldp_off(A64Buf *b, int rt, int rt2, int rn, int imm)
 {
     a64_emit32(b, 0xa9400000u | (ldstp_imm7(imm) << 15) | ((uint32_t)(rt2 & 31) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
+void a64_stp_d_pre(A64Buf *b, int dt, int dt2, int rn, int imm)
+{
+    a64_emit32(b, 0x6d800000u | (ldstp_imm7(imm) << 15) | ((uint32_t)(dt2 & 31) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(dt & 31));
+}
+void a64_ldp_d_post(A64Buf *b, int dt, int dt2, int rn, int imm)
+{
+    a64_emit32(b, 0x6cc00000u | (ldstp_imm7(imm) << 15) | ((uint32_t)(dt2 & 31) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(dt & 31));
+}
 
 void a64_ldr_v(A64Buf *b, int size, int vt, int rn, uint32_t off)
 {
@@ -810,6 +818,11 @@ void a64_v_ushr_imm(A64Buf *b, int esz, int vd, int vn, int sh)
 { a64_emit32(b, 0x6f000400u | ((uint32_t)((16 << esz) - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_sshr_imm(A64Buf *b, int esz, int vd, int vn, int sh)
 { a64_emit32(b, 0x4f000400u | ((uint32_t)((16 << esz) - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_fmadd_s(A64Buf *b, int dbl, int neg_mul, int neg_add, int vd, int vn, int vm, int va)
+{
+    uint32_t base = (dbl ? 0x1f400000u : 0x1f000000u) | (neg_add ? 0x00200000u : 0) | ((neg_mul ^ neg_add) ? 0x00008000u : 0);
+    a64_emit32(b, base | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(va & 31) << 10) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31));
+}
 void a64_v_fneg(A64Buf *b, int dbl, int vd, int vn) { a64_emit32(b, (dbl ? 0x6ee0f800u : 0x6ea0f800u) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_fmla(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4e60cc00u : 0x4e20cc00u, vd, vn, vm); }
 void a64_v_fmls(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4ee0cc00u : 0x4ea0cc00u, vd, vn, vm); }

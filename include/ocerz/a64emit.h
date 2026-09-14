@@ -134,6 +134,8 @@ void a64_stp_pre(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_ldp_post(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_stp_off(A64Buf *b, int rt, int rt2, int rn, int imm);
 void a64_ldp_off(A64Buf *b, int rt, int rt2, int rn, int imm);
+void a64_stp_d_pre(A64Buf *b, int dt, int dt2, int rn, int imm);
+void a64_ldp_d_post(A64Buf *b, int dt, int dt2, int rn, int imm);
 
 void a64_ldr_v(A64Buf *b, int size, int vt, int rn, uint32_t off);
 void a64_str_v(A64Buf *b, int size, int vt, int rn, uint32_t off);
@@ -241,6 +243,7 @@ void a64_v_shl_imm(A64Buf *b, int esz, int vd, int vn, int sh);
 void a64_v_ushr_imm(A64Buf *b, int esz, int vd, int vn, int sh);
 void a64_v_sshr_imm(A64Buf *b, int esz, int vd, int vn, int sh);
 void a64_v_fneg(A64Buf *b, int dbl, int vd, int vn);
+void a64_fmadd_s(A64Buf *b, int dbl, int neg_mul, int neg_add, int vd, int vn, int vm, int va);
 void a64_v_fmla(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_v_fmls(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_cmn_imm(A64Buf *b, int sf, int rn, int imm12);
