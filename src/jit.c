@@ -5815,7 +5815,7 @@ static int emit_sse_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *o
                              uint32_t **exit_sites, int *n_exits, uint32_t **skip_out)
 {
     g_sse_mem_plainacc = mem_plain_access_ok(o);
-    if (emit_mem_ea_plain(b, insn, o, size, &g_sse_mem_ra, &g_sse_mem_disp)) {
+    if (emit_mem_ea_plain_ex(b, insn, o, size, &g_sse_mem_ra, &g_sse_mem_disp, 1)) {
         g_sse_mem_plain = 1;
         *skip_out = NULL;
         return 1;
@@ -5972,10 +5972,11 @@ static int emit_sse_movs(A64Buf *b, const X86Insn *insn, int size, uint32_t **ex
     if (d->kind == OCERZ_OPK_XMM && s->kind == OCERZ_OPK_MEM) {
         uint32_t *skip;
         l0_inval(d->reg);
+        int vd = xmm_is_pinned(d->reg) ? xmm_vreg(d->reg) : VX0;
         if (!emit_sse_mem_addr(b, insn, s, size, exit_sites, n_exits, &skip)) return 0;
-        emit_sse_mem_ld(b, size, VX0);
+        emit_sse_mem_ld(b, size, vd);
         patch_guard_skip(skip, a64_label(b));
-        emit_xmm_st(b, VX0, d->reg);
+        if (vd == VX0) emit_xmm_st(b, VX0, d->reg);
         return 1;
     }
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_XMM) {
@@ -8271,11 +8272,14 @@ static int emit_vex_mem_addr(A64Buf *b, const X86Insn *insn, const X86Operand *m
                              uint32_t **exit_sites, int *n_exits)
 {
     if (!emit_sse_mem_addr(b, insn, m, 16, exit_sites, n_exits, &g_vex_mem_skip)) return 0;
-    uint32_t dsp = g_sse_mem_disp;
+    int32_t dsp = (int32_t)g_sse_mem_disp, hi = dsp + 16;
     int plain = g_sse_mem_plainacc || vec_tso_relaxed();
-    if (dsp > 4094u * 16 || (!plain && dsp != 0)) {
-        if (dsp <= 4095) a64_add_imm(b, 1, JTA, g_sse_mem_ra, dsp);
-        else { a64_mov_imm64(b, JTU, dsp); a64_add_reg(b, 1, JTA, g_sse_mem_ra, JTU, 0); }
+    int lo_ok = (dsp >= 0 && (dsp & 15) == 0 && dsp / 16 <= 4095) || (dsp >= -256 && dsp <= 255);
+    int hi_ok = (hi >= 0 && (hi & 15) == 0 && hi / 16 <= 4095) || (hi >= -256 && hi <= 255);
+    if (!lo_ok || !hi_ok || (!plain && dsp != 0)) {
+        if (dsp > 0 && dsp <= 4095) a64_add_imm(b, 1, JTA, g_sse_mem_ra, (uint32_t)dsp);
+        else if (dsp < 0 && -dsp <= 4095) a64_sub_imm(b, 1, JTA, g_sse_mem_ra, (uint32_t)-dsp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)dsp); a64_add_reg(b, 1, JTA, g_sse_mem_ra, JTU, 0); }
         ea_cache_reset();
         g_sse_mem_ra = JTA;
         g_sse_mem_disp = 0;
