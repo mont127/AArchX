@@ -47,8 +47,8 @@ make -j
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 97 / 97 |
-| x86-64 differential gate (interpreter vs JIT) | 88 / 88 |
+| x86-64 guest gate | 99 / 99 |
+| x86-64 differential gate (interpreter vs JIT) | 90 / 90 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 107 / 107 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
@@ -180,6 +180,8 @@ xychart-beta
 
 Apple M2 Max, 2026-09-04, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`. `hash` and `chase` are ties that no translation can move: `hash` is a chain of multiply, shift and or per step and both sides are bound by multiply latency; `chase` is a dependent-load chain and both sides wait on the cache. Anything within a couple of percent of 1.00x flips from run to run, and a busy machine moves every ratio by that much.
 
+The same suite built for x86-64-v3 (`clang -march=x86-64-v3`, so AVX2, FMA and BMI throughout) used to lose ten kernels, three of them by 4x to 13x, because its VEX and BMI instructions went to the interpreter. On 2026-09-14, on an Apple M5, every kernel is within 0.83x and 1.17x of Rosetta: eight wins, and `fpsse` at 1.17x is the largest loss.
+
 `mixed` was a 1.20x loss for a long time, and the whole gap was the price of bit-exact x86 NaN semantics: every packed FP result needed a check before anything could use it. The JIT now defers that check to the compares that read the value, and Rosetta-style hot paths that the compiler split with rare-case branches get retranslated with the hot side inline. Both are exact; the NaN tests in `tests/guest` compare bit patterns against the native binary.
 
 These kernels never create a thread, fork or map shared memory, so they run in plain memory mode throughout. A program that does any of those retires plain mode for good (`ocerz_jit_require_ordered`) and pays for x86-TSO ordering on every scalar load and store; Wine is always in that mode. Under `OCERZ_NO_PLAIN_MEM=1` the same table reads 1.35x on `memcpy`, 0.99x on `fpvec`, 1.08x on `str`, 1.13x on `chase` and stays at parity elsewhere. Scalar accesses use acquire and release forms (flags, locks and atomics are scalar, and a release store orders every earlier vector store); SSE loads and stores are left plain, the default FEX ships too, because ordering them cost 3.3x on `memcpy` and 3.0x on `fpvec`. `OCERZ_TSO_VECTOR=1` orders them as well.
@@ -197,11 +199,11 @@ xychart-beta
 
 The tall bars are the previous ordered-mode cost, the short bars the current one; the dark line at 1.0 would be Rosetta's speed.
 
-### AVX2, FMA and SSE4.1 kernels
+### AVX2, FMA and SSE kernels
 
 Every VEX-encoded instruction used to leave translated code for the interpreter, so AVX2 and FMA loops ran up to 100 times slower than under Rosetta. The JIT now translates the instructions these kernels spend their time in.
 
-Timings are best of 3 on an Apple M5 with macOS 26.6.2, taken 2026-09-13. "Before" is the build at `31bff03`.
+Timings are best of 3 on an Apple M5 with macOS 26.6.2, taken 2026-09-13 and, for the scalar rows, 2026-09-14. "Before" is the build at `31bff03`.
 
 | Kernel | Before | Now | Rosetta |
 | --- | ---: | ---: | ---: |
@@ -211,12 +213,15 @@ Timings are best of 3 on an Apple M5 with macOS 26.6.2, taken 2026-09-13. "Befor
 | int32 loop 4M, clang AVX2 | 135.35 ms | 1.62 ms | 1.25 ms |
 | int32 loop 4M, clang SSE4.1 | 29.48 ms | **0.56 ms** | 0.77 ms |
 | saxpy 4M, clang AVX2+FMA | 37.62 ms | 0.46 ms | 0.47 ms |
-| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | 165.26 ms | 9.23 ms |
-| mandelbrot 400x400, scalar AVX2 | 1171.68 ms | 396.86 ms | 16.12 ms |
+| nbody 200k steps, scalar SSE2 | 72.55 ms | 8.56 ms | 5.80 ms |
+| nbody 200k steps, scalar AVX2 | 1122.18 ms | **10.25 ms** | 10.30 ms |
+| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.26 ms** | 9.24 ms |
+| mandelbrot 400x400, scalar SSE2 | 28.50 ms | 17.70 ms | 16.00 ms |
+| mandelbrot 400x400, scalar AVX2 | 1171.68 ms | 18.20 ms | 16.10 ms |
 
 The first three kernels are hand-written loops shaped like Go's runtime routines. The rest are C loops, which clang vectorizes except for nbody and mandelbrot, which stay scalar.
 
-Scalar code built for x86-64-v3 is still far behind Rosetta. Its VEX.128 instructions often write a register that is also their second source, and those still go to the interpreter. So do `vmovddup` and `vshufpd`.
+Scalar floating-point loops now take 0.9 to 1.5 times Rosetta's time, whether they were built for SSE2 or for x86-64-v3. The scalar results stay in host lane registers across a loop instead of being merged back into the guest register after every operation, and 256-bit loops keep the upper halves of their `ymm` registers in host registers too.
 
 ## CLI
 
@@ -287,15 +292,16 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 - The JIT translates most VEX code:
   - moves, integer, bitwise and compare ops, and broadcasts
   - `vpmovmskb`, most sign and zero extensions, and shifts by an immediate
-  - `vzeroupper`, FMA and 256-bit packed arithmetic
+  - `vzeroupper`, FMA, 256-bit packed arithmetic and the variable blends
+  - `vshufps`, `vshufpd`, `vinsertps` and `vmovddup`
   - the VEX.128 forms of the SSE instructions it already translates
+  - `rorx`, `shlx`, `shrx`, `sarx`, `mulx`, `andn`, and `blsr`, `blsmsk`, `blsi` and `bzhi` when their flags are dead
 
   Everything else that is VEX-encoded still runs in the interpreter. That includes:
-  - VEX.128 instructions whose destination is also their second source
-  - `vmovddup` and `vshufpd`
-  - 256-bit shuffles, permutes and lane inserts
-  - `vptest`, the blends, mask-producing compares and gathers
-  - every BMI instruction
+  - 256-bit byte and integer shuffles, unpacks, permutes and lane inserts
+  - `vptest`, the immediate blends, mask-producing compares and gathers
+  - `bextr`, `pdep` and `pext`
+- Inside a translated loop, scalar SSE results and the upper halves of the `ymm` registers live in host registers that fault recovery does not see. A guest that catches a fault raised in such a loop and continues past it can observe stale values in those registers. Both caches stay off in the guarded memory modes.
 - MMX instructions always run in the interpreter, and the MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry them.
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
