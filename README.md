@@ -47,8 +47,8 @@ make -j
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 100 / 100 |
-| x86-64 differential gate (interpreter vs JIT) | 91 / 91 |
+| x86-64 guest gate | 101 / 101 |
+| x86-64 differential gate (interpreter vs JIT) | 92 / 92 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 107 / 107 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
@@ -180,9 +180,11 @@ xychart-beta
 
 Apple M2 Max, 2026-09-04, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`. `hash` and `chase` are ties that no translation can move: `hash` is a chain of multiply, shift and or per step and both sides are bound by multiply latency; `chase` is a dependent-load chain and both sides wait on the cache. Anything within a couple of percent of 1.00x flips from run to run, and a busy machine moves every ratio by that much.
 
-The same suite built for x86-64-v3 (`clang -march=x86-64-v3`, so AVX2, FMA and BMI throughout) used to lose ten kernels, three of them by 4x to 13x, because its VEX and BMI instructions went to the interpreter. On 2026-09-14, on an Apple M5, it wins ten of the fifteen (`vm` 0.75x, `fpsse` 0.83x, `jtab` 0.89x, `memcpy` 0.94x) and loses none by more than 7% (`str` 1.07x, `fpvec` 1.05x, `leafcall` 1.03x, `idiv` and `chase` at 1.00x). The same day's run of the SSE2 build on that machine: eleven wins, four losses, none above 1.10x.
+The same suite built for x86-64-v3 (`clang -march=x86-64-v3`, so AVX2, FMA and BMI throughout) used to lose ten kernels, three of them by 4x to 13x, because its VEX and BMI instructions went to the interpreter. On 2026-09-14, on an Apple M5, it wins ten of the fifteen (`vm` 0.75x, `fpsse` 0.83x, `jtab` 0.89x, `memcpy` 0.94x) and loses none by more than 7% (`str` 1.07x, `fpvec` 1.05x, `leafcall` 1.03x, `idiv` and `chase` at 1.00x). The same day's run of the SSE2 build on that machine: ten wins, five losses, none above 1.06x.
 
 `mixed` was a 1.20x loss for a long time, and the whole gap was the price of bit-exact x86 NaN semantics: every packed FP result needed a check before anything could use it. The JIT now defers that check to the compares that read the value, and Rosetta-style hot paths that the compiler split with rare-case branches get retranslated with the hot side inline. Both are exact; the NaN tests in `tests/guest` compare bit patterns against the native binary.
+
+The deferred check has since become one batch per run of floating-point work: zeroing, unpacks, `movddup`, stores, and `ucomisd` with its branch all stay inside the batch, a stored value is checked right before the store, a branch out of the loop carries its check in the exit stub, and at the batch's end only the registers the loop still reads are checked. nbody's SSE2 pair loop went from 107 to 86 host instructions per iteration that way, 42 of which had been NaN bookkeeping.
 
 These kernels never create a thread, fork or map shared memory, so they run in plain memory mode throughout. A program that does any of those retires plain mode for good (`ocerz_jit_require_ordered`) and pays for x86-TSO ordering on every scalar load and store; Wine is always in that mode. Under `OCERZ_NO_PLAIN_MEM=1` the same table reads 1.35x on `memcpy`, 0.99x on `fpvec`, 1.08x on `str`, 1.13x on `chase` and stays at parity elsewhere. Scalar accesses use acquire and release forms (flags, locks and atomics are scalar, and a release store orders every earlier vector store); SSE loads and stores are left plain, the default FEX ships too, because ordering them cost 3.3x on `memcpy` and 3.0x on `fpvec`. `OCERZ_TSO_VECTOR=1` orders them as well.
 
@@ -213,15 +215,15 @@ Timings are best of 5 on an Apple M5 with macOS 26.6.2, taken 2026-09-14 on an i
 | int32 loop 4M, clang AVX2 | 135.35 ms | **0.44 ms** | 1.30 ms |
 | int32 loop 4M, clang SSE4.1 | 29.48 ms | **0.56 ms** | 0.78 ms |
 | saxpy 4M, clang AVX2+FMA | 37.62 ms | **0.33 ms** | 0.48 ms |
-| nbody 200k steps, scalar SSE2 | 72.55 ms | 8.77 ms | 5.97 ms |
+| nbody 200k steps, scalar SSE2 | 72.55 ms | 7.86 ms | 5.80 ms |
 | nbody 200k steps, scalar AVX2 | 1122.18 ms | **10.46 ms** | 10.61 ms |
 | nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.53 ms** | 9.54 ms |
-| mandelbrot 400x400, scalar SSE2 | 28.50 ms | 18.25 ms | 16.47 ms |
+| mandelbrot 400x400, scalar SSE2 | 28.50 ms | 16.93 ms | 16.03 ms |
 | mandelbrot 400x400, scalar AVX2 | 1171.68 ms | 18.82 ms | 16.50 ms |
 
 The first three kernels are hand-written loops shaped like Go's runtime routines. The rest are C loops, which clang vectorizes except for nbody and mandelbrot, which stay scalar.
 
-Scalar floating-point loops now take 0.9 to 1.5 times Rosetta's time, whether they were built for SSE2 or for x86-64-v3. The scalar results stay in host lane registers across a loop instead of being merged back into the guest register after every operation, and 256-bit loops keep the upper halves of their `ymm` registers in host registers too.
+Scalar floating-point loops now take 0.9 to 1.4 times Rosetta's time, whether they were built for SSE2 or for x86-64-v3. The scalar results stay in host lane registers across a loop instead of being merged back into the guest register after every operation, and 256-bit loops keep the upper halves of their `ymm` registers in host registers too.
 
 ## CLI
 
