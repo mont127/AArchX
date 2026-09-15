@@ -3229,6 +3229,10 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
     uint64_t fold = ea_fold();
     uint32_t *to_native = NULL, *is_low = NULL;
     int consts = guard_consts_ok();
+    if (consts && insn && insn->addrsize == 4 && insn->seg == OCERZ_SEG_NONE) {
+        a64_add_reg(b, 1, addr_reg, addr_reg, JMEMBASE, 0);
+        return NULL;
+    }
     if (consts) {
         a64_subs_reg(b, 1, A64_ZR, addr_reg, JMEMBASE2, 0);
         is_low = a64_label(b);
