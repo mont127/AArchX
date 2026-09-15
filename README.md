@@ -180,7 +180,7 @@ xychart-beta
 
 Apple M2 Max, 2026-09-04, `REPS=5`, paired delta `t(n) - t(n/2)`, byte-identical output. Reproduce with `python3 tests/xbench_compare.py`. `hash` and `chase` are ties that no translation can move: `hash` is a chain of multiply, shift and or per step and both sides are bound by multiply latency; `chase` is a dependent-load chain and both sides wait on the cache. Anything within a couple of percent of 1.00x flips from run to run, and a busy machine moves every ratio by that much.
 
-The same suite built for x86-64-v3 (`clang -march=x86-64-v3`, so AVX2, FMA and BMI throughout) used to lose ten kernels, three of them by 4x to 13x, because its VEX and BMI instructions went to the interpreter. On 2026-09-14, on an Apple M5, it wins ten of the fifteen (`vm` 0.75x, `fpsse` 0.83x, `jtab` 0.89x, `memcpy` 0.94x) and loses none by more than 7% (`str` 1.07x, `fpvec` 1.05x, `leafcall` 1.03x, `idiv` and `chase` at 1.00x). The same day's run of the SSE2 build on that machine: ten wins, five losses, none above 1.06x.
+The same suite built for x86-64-v3 (`clang -march=x86-64-v3`, so AVX2, FMA and BMI throughout) used to lose ten kernels, three of them by 4x to 13x, because its VEX and BMI instructions went to the interpreter. On 2026-09-15, on an Apple M5, it wins twelve of the fifteen (`vm` 0.73x, `fpsse` 0.77x, `jtab` 0.91x, `mixed` 0.93x, `memcpy` 0.94x, `fpvec` 0.96x) and loses none by more than 7% (`str` 1.06x, `leafcall` 1.03x, `idiv` 1.00x). The same day's run of the SSE2 build on that machine: ten wins, five losses, none above 1.06x.
 
 `mixed` was a 1.20x loss for a long time, and the whole gap was the price of bit-exact x86 NaN semantics: every packed FP result needed a check before anything could use it. The JIT now defers that check to the compares that read the value, and Rosetta-style hot paths that the compiler split with rare-case branches get retranslated with the hot side inline. Both are exact; the NaN tests in `tests/guest` compare bit patterns against the native binary.
 
@@ -217,7 +217,7 @@ Timings are best of 5 on an Apple M5 with macOS 26.6.2, taken 2026-09-14 on an i
 | saxpy 4M, clang AVX2+FMA | 37.62 ms | **0.33 ms** | 0.48 ms |
 | nbody 200k steps, scalar SSE2 | 72.55 ms | 6.77 ms | 5.80 ms |
 | nbody 200k steps, scalar AVX2 | 1122.18 ms | **9.80 ms** | 10.42 ms |
-| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.20 ms** | 9.31 ms |
+| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.52 ms** | 9.61 ms |
 | mandelbrot 400x400, scalar SSE2 | 28.50 ms | 16.93 ms | 16.03 ms |
 | mandelbrot 400x400, scalar AVX2 | 1171.68 ms | 18.82 ms | 16.50 ms |
 
