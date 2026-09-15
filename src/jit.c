@@ -8993,19 +8993,46 @@ static int inexact_nan_env(void)
     if (v < 0) v = getenv("OCERZ_INEXACT_NAN") ? 1 : 0;
     return v;
 }
-static void emit_vex_fp_lane(A64Buf *b, int kind, int dbl, int vr, int va, int vb, int t1)
+static int emit_vex_fp_op(A64Buf *b, int kind, int dbl, int vr, int va, int vb)
 {
     switch (kind) {
-    case 0: a64_v_fadd(b, dbl, vr, va, vb); break;
-    case 1: a64_v_fsub(b, dbl, vr, va, vb); break;
-    case 2: a64_v_fmul(b, dbl, vr, va, vb); break;
-    case 3: a64_v_fdiv(b, dbl, vr, va, vb); break;
-    case 4: a64_v_fcmgt(b, dbl, vr, va, vb); a64_v_bsl(b, vr, va, vb); return;
-    case 5: a64_v_fcmgt(b, dbl, vr, vb, va); a64_v_bsl(b, vr, va, vb); return;
-    default: a64_v_fsqrt(b, dbl, vr, vb); va = vb; break;
+    case 0: a64_v_fadd(b, dbl, vr, va, vb); return 1;
+    case 1: a64_v_fsub(b, dbl, vr, va, vb); return 1;
+    case 2: a64_v_fmul(b, dbl, vr, va, vb); return 1;
+    case 3: a64_v_fdiv(b, dbl, vr, va, vb); return 1;
+    case 4: a64_v_fcmgt(b, dbl, vr, va, vb); a64_v_bsl(b, vr, va, vb); return 0;
+    case 5: a64_v_fcmgt(b, dbl, vr, vb, va); a64_v_bsl(b, vr, va, vb); return 0;
+    default: a64_v_fsqrt(b, dbl, vr, vb); return 1;
     }
+}
+static void emit_vex_fp_lane(A64Buf *b, int kind, int dbl, int vr, int va, int vb, int t1)
+{
+    if (!emit_vex_fp_op(b, kind, dbl, vr, va, vb)) return;
+    if (kind == 6) va = vb;
     if (inexact_nan_env() || g_fpb_fast) return;
     emit_nan_fix_packed2(b, dbl, vr, va, vb, t1, t1);
+}
+static int emit_vex_cvtdq2ps256(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (insn->nops != 2 || d->kind != OCERZ_OPK_XMM || !xmm_is_pinned(d->reg)) return 0;
+    if (s->kind == OCERZ_OPK_XMM ? !xmm_is_pinned(s->reg) : s->kind != OCERZ_OPK_MEM) return 0;
+    int lo, hi;
+    if (s->kind == OCERZ_OPK_MEM) {
+        if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
+        emit_vex_mem_acc(b, VX2, 16, 0);
+        emit_vex_mem_acc(b, VX0, 0, 0);
+        emit_vex_mem_done(b);
+        lo = VX0; hi = VX2;
+    } else {
+        lo = xmm_vreg(s->reg);
+        hi = ymmh_src(b, s->reg, VX2);
+    }
+    int dh = ymmh_dst(d->reg, VX3);
+    a64_v_scvtf_4s(b, dh, hi);
+    a64_v_scvtf_4s(b, xmm_vreg(d->reg), lo);
+    emit_ymmh_st(b, dh, d->reg);
+    return 1;
 }
 static int emit_vex_fp256(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
@@ -9036,14 +9063,33 @@ static int emit_vex_fp256(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (!sq) ah = ymmh_src(b, insn->vvvv, VX1);
     int dh = ymmh_dst(d->reg, VX3);
     if (dh == ah || dh == sh) dh = VX3;
-    emit_vex_fp_lane(b, kind, dbl, dh, ah, sh, VX0);
+    int chk = emit_vex_fp_op(b, kind, dbl, dh, ah, sh) && !inexact_nan_env();
     if (mem) {
         emit_vex_mem_acc(b, VX0, 0, 0);
         emit_vex_mem_done(b);
     }
-    emit_vex_fp_lane(b, kind, dbl, VX1, sq ? lb : xmm_vreg(insn->vvvv), lb, VX2);
+    emit_vex_fp_op(b, kind, dbl, VX1, sq ? lb : xmm_vreg(insn->vvvv), lb);
+    if (!chk) {
+        a64_v_mov(b, xmm_vreg(d->reg), VX1);
+        emit_ymmh_st(b, dh, d->reg);
+        return 1;
+    }
+    a64_v_fcmeq(b, dbl, VX0, VX1, VX1);
+    a64_v_fcmeq(b, dbl, VX2, dh, dh);
+    a64_v_and(b, VX0, VX0, VX2);
+    a64_v_uminv_4s(b, VX0, VX0);
+    a64_fmov_x_from_v(b, 0, JT0, VX0);
+    uint32_t *site = a64_label(b);
+    a64_cbz(b, 0, JT0, 0);
     a64_v_mov(b, xmm_vreg(d->reg), VX1);
     emit_ymmh_st(b, dh, d->reg);
+    if (!oolslow_add(insn, &site, 1, a64_label(b))) {
+        uint32_t *done = a64_label(b);
+        a64_b(b, 0);
+        patch_any_branch(site, a64_label(b));
+        emit_slowcall_keep_lanes(b, insn, exit_sites, n_exits);
+        a64_patch_b(done, a64_label(b));
+    }
     return 1;
 }
 
@@ -9547,6 +9593,9 @@ static int emit_vex(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_VPBROADCASTD: case OCERZ_OP_VBROADCASTSS: return emit_vex_broadcast(b, insn, 4, L, exit_sites, n_exits);
     case OCERZ_OP_VPBROADCASTQ: case OCERZ_OP_VBROADCASTSD: return emit_vex_broadcast(b, insn, 8, L, exit_sites, n_exits);
     case OCERZ_OP_VBROADCASTI128: case OCERZ_OP_VBROADCASTF128: return emit_vex_broadcast(b, insn, 16, L, exit_sites, n_exits);
+    case OCERZ_OP_CVTDQ2PS:
+        if (L) return emit_vex_cvtdq2ps256(b, insn, exit_sites, n_exits);
+        return emit_vex_sse128(b, insn, L, exit_sites, n_exits);
     case OCERZ_OP_VZEROUPPER:
         a64_v_zero(b, VX0);
         for (unsigned r = 0; r < 16; r++) {
