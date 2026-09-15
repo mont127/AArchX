@@ -582,9 +582,10 @@ static int ext_xrstor(OcerzCPU *cpu, const X86Insn *insn)
                 memset(&cpu->xmm[i], 0, sizeof cpu->xmm[i]);
         }
         if (rfbm & 4) {
-            if (bv & 4)
+            if (bv & 4) {
                 cpu->ymmh[i] = ocerz_ld128(ea + 576 + (uint64_t)i * 16);
-            else
+                cpu->ymmh_all_zero = 0;
+            } else
                 memset(&cpu->ymmh[i], 0, sizeof cpu->ymmh[i]);
         }
     }

@@ -93,6 +93,8 @@ typedef struct OcerzCPU {
     Ocerz128 fp_ckpt[16] __attribute__((aligned(16)));
     uint64_t jit_scratch[2];
     uint64_t jit_fp;
+    uint32_t ymmh_all_zero;
+    uint32_t ymmh_pad;
     uint64_t *btrace;
     uint32_t btrace_n;
     uint32_t btrace_mask;

@@ -3534,6 +3534,8 @@ static void emit_v_acc_ordered_checked(A64Buf *b, int size, int vr, int ra, int3
 #define FPB_UNDO_MAX 8
 static int g_l0_nlanes = L0_NLANES;
 static int g_zero_vreg = -1;
+static int g_blk_ymm_write;
+#define YMMH_ALL_ZERO_OFF ((uint32_t)offsetof(OcerzCPU, ymmh_all_zero))
 static int8_t g_undo_vreg[FPB_UNDO_MAX];
 static int g_n_undo_lanes;
 static int g_undo_want_slot = -1, g_undo_want_size, g_undo_saved;
@@ -3616,7 +3618,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || m->riprel) return 0;
     if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
-    if (rsp_is_ptr() && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
+    if (rsp_is_ptr() && m->index == OCERZ_RSP) return 0;
     int plain = mem_plain_access_ok(m);
     X86Operand mview; m = mem_hoist_view(m, &mview);
     int hb = pin_hreg(pin_slot(m->base));
@@ -3626,6 +3628,14 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
                             else     { if (store) emit_gpr_st_at(b, size, reg, (ra), (int32_t)(d), plain); else emit_gpr_ld_at(b, size, reg, (ra), (int32_t)(d), plain); } } while (0)
 #define ACC_REGOFF(ra, ri, sc) do { if (vec) { if (store) emit_v_st_regoff(b, size, reg, (ra), (ri), (sc), plain); else emit_v_ld_regoff(b, size, reg, (ra), (ri), (sc), plain); } \
                                     else     { if (store) emit_gpr_st_regoff(b, size, reg, (ra), (ri), (sc), plain); else emit_gpr_ld_regoff(b, size, reg, (ra), (ri), (sc), plain); } } while (0)
+    if (rsp_is_ptr() && m->base == OCERZ_RSP) {
+        if (m->index != OCERZ_REG_NONE) return 0;
+        int scaled = m->disp >= 0 && (m->disp % size) == 0 && m->disp / size <= 4095;
+        int unscaled = !scaled && m->disp >= -256 && m->disp <= 255;
+        if (!scaled && !unscaled) return 0;
+        ACC_AT(pin_hreg(pin_slot(OCERZ_RSP)), m->disp);
+        return 1;
+    }
     if (m->index != OCERZ_REG_NONE) {
         if (pin_slot(m->index) < 0) return 0;
         int hi = pin_hreg(pin_slot(m->index));
@@ -3764,7 +3774,14 @@ static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand
 {
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
-    if (rsp_is_ptr() && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
+    if (rsp_is_ptr() && op->index == OCERZ_RSP) return 0;
+    if (rsp_is_ptr() && op->base == OCERZ_RSP) {
+        if (op->index != OCERZ_REG_NONE || op->riprel || pin_slot(OCERZ_RSP) < 0) return 0;
+        int64_t sd = op->disp;
+        if (!((sd >= 0 && (sd % size) == 0 && sd / size <= 4095) || (unscaled_ok && sd >= -256 && sd <= 255))) return 0;
+        *ra_out = pin_hreg(pin_slot(OCERZ_RSP)); *disp_out = (uint32_t)sd;
+        return 1;
+    }
     if (op->riprel) {
         uint64_t c = (uint64_t)op->disp + ocerz_guest_base;
         static int nolit = -1; if (nolit < 0) nolit = getenv("OCERZ_NO_RIPLIT") ? 1 : 0;
@@ -9821,14 +9838,29 @@ static int emit_vex(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_CVTDQ2PS:
         if (L) return emit_vex_cvtdq2ps256(b, insn, exit_sites, n_exits);
         return emit_vex_sse128(b, insn, L, exit_sites, n_exits);
-    case OCERZ_OP_VZEROUPPER:
-        a64_v_zero(b, VX0);
+    case OCERZ_OP_VZEROUPPER: {
+        static int noflag = -1;
+        if (noflag < 0) noflag = getenv("OCERZ_NO_YMMH_FLAG") ? 1 : 0;
+        uint32_t *skip = NULL;
+        if (!noflag && !g_blk_ymm_write) {
+            a64_ldr(b, 4, JT0, 20, YMMH_ALL_ZERO_OFF);
+            skip = a64_label(b);
+            a64_cbnz(b, 0, JT0, 0);
+        }
+        int vz = g_zero_vreg >= 0 ? g_zero_vreg : VX0;
+        if (vz == VX0) a64_v_zero(b, VX0);
         for (unsigned r = 0; r < 16; r++) {
             if (g_yc[r] >= 0) { a64_v_zero(b, g_yc[r]); g_yc_dirty |= (uint16_t)(1u << r); }
-            else a64_str_v(b, 16, VX0, 20, YMMH_OFF + r * 16);
+            else a64_str_v(b, 16, vz, 20, YMMH_OFF + r * 16);
+        }
+        if (skip) {
+            a64_mov_imm64(b, JT0, 1);
+            a64_str(b, 4, JT0, 20, YMMH_ALL_ZERO_OFF);
+            a64_patch_cbz(skip, a64_label(b));
         }
         g_ymmh_zero = 0xffff;
         return 1;
+    }
     case OCERZ_OP_PMOVSXBW: return emit_vex_pmovx(b, insn, 1, 1, L, exit_sites, n_exits);
     case OCERZ_OP_PMOVSXWD: return emit_vex_pmovx(b, insn, 1, 2, L, exit_sites, n_exits);
     case OCERZ_OP_PMOVSXDQ: return emit_vex_pmovx(b, insn, 1, 4, L, exit_sites, n_exits);
@@ -13776,9 +13808,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         static int nozero = -1;
         if (nozero < 0) nozero = getenv("OCERZ_NO_ZEROREG") ? 1 : 0;
         int nv = 0;
+        g_blk_ymm_write = 0;
         for (int i = 0; i < n; i++) {
             const X86Insn *in = &blk->insns[i];
             if (in->vex && !(in->vex & OCERZ_VEX_L) && !in->mode32 && in->nops > 0 && in->ops[0].kind == OCERZ_OPK_XMM) nv++;
+            if (in->vex && (in->vex & OCERZ_VEX_L) && in->op != OCERZ_OP_VZEROUPPER) g_blk_ymm_write = 1;
         }
         if (!nozero && nv >= 2 && !g_xlat_mode32) g_zero_vreg = lane_reserve();
     }
@@ -14076,6 +14110,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
           static int nofix = -1;
           if (nofix < 0) nofix = getenv("OCERZ_NO_L0FIXED") ? 1 : 0;
           if (g_zero_vreg >= 0) a64_v_zero(&b, g_zero_vreg);
+          if (g_blk_ymm_write) a64_str(&b, 4, A64_ZR, 20, YMMH_ALL_ZERO_OFF);
           if (!nofix && selfl && !g_no_chain && !g_xlat_mode32 && l0_enabled() &&
               sse_enabled() && xmm_global_enabled() && !g_no_regflags)
               l0_fixed_setup(&b, blk->insns, n);
