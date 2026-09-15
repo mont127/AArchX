@@ -1421,6 +1421,14 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             depth = 0;
             siglongjmp(*g_sig_recover, 1);
         }
+        if (in_jit && rip_exact && ocerz_jit_fault_pair(hpc)) {
+            g_cur_cpu->rip = fault_rip;
+            g_cur_cpu->sig_repeat = 0;
+            g_cur_cpu->interp_once = 1;
+            ocerz_recov_note(8, fault_rip);
+            depth = 0;
+            siglongjmp(*g_sig_recover, 1);
+        }
         uint64_t fault_rsp = g_cur_cpu->gpr[OCERZ_RSP];
         static int fault_dreg = -2;
         if (fault_dreg == -2) { const char *e = getenv("OCERZ_FAULTDUMP"); fault_dreg = e ? atoi(e) : -1; }

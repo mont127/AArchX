@@ -6683,6 +6683,7 @@ static uint16_t g_fpb_live[JIT_MAX_BLOCK_INSNS];
 static uint16_t g_fpb_stchk[JIT_MAX_BLOCK_INSNS];
 static uint8_t g_fpb_stlane[JIT_MAX_BLOCK_INSNS], g_fpb_stdbl[JIT_MAX_BLOCK_INSNS];
 static uint8_t g_fpb_undo[JIT_MAX_BLOCK_INSNS], g_fpb_undo_size[JIT_MAX_BLOCK_INSNS], g_fpb_undo_done[JIT_MAX_BLOCK_INSNS];
+static uint8_t g_fpb_mstore[JIT_MAX_BLOCK_INSNS];
 static uint8_t g_fpb_undo_ld[JIT_MAX_BLOCK_INSNS], g_fpb_undo_ldsz[JIT_MAX_BLOCK_INSNS];
 static int16_t g_fpb_undo_ldst[JIT_MAX_BLOCK_INSNS], g_fpb_undo_from[JIT_MAX_BLOCK_INSNS];
 static void fpb_undo_clear(int i)
@@ -6968,11 +6969,31 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
             ckpt |= (uint16_t)(reads & ~written);
             written |= writes;
             g_fpb_mrd[j] = reads; g_fpb_mwr[j] = writes;
-            g_fpb_mmem[j] = (uint8_t)is_mem; g_fpb_marith[j] = (uint8_t)(k == K2_ARITH);
+            g_fpb_mmem[j] = (uint8_t)is_mem; g_fpb_marith[j] = (uint8_t)(k == K2_ARITH); g_fpb_mstore[j] = (uint8_t)(k == K2_STORE);
             j++;
         }
         if (det_j >= 0) j = det_j;
         int end = j - 1;
+        while (end > i && g_fpb_mstore[end]) {
+            if (g_fpb_undo[end]) {
+                cost_extra -= g_fpb_undo_from[end] >= 0 ? 1 : 2;
+                if (g_fpb_undo_from[end] >= 0) fpb_undo_clear(g_fpb_undo_from[end]);
+                fpb_undo_clear(end);
+                nundo--;
+            }
+            if (g_fpb_stchk[end]) {
+                uint16_t sb = g_fpb_stchk[end];
+                cost_extra -= g_fpb_stlane[end] ? 2 : 3;
+                sites--;
+                g_fpb_stchk[end] = 0; g_fpb_stlane[end] = 0;
+                for (int q = 0; q < nst; q++) if (st_at[q] == end) {
+                    if (st_cls[q] == 1) full |= sb; else if (st_cls[q] == 3) d0 |= sb; else s0 |= sb;
+                    nst = q;
+                    break;
+                }
+            }
+            end--;
+        }
         if (end < i || n_arith < 1) {
             for (int q = i; q <= j - 1 && q < n; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; fpb_undo_clear(q); }
             i = j > i ? j : i + 1;
@@ -7406,6 +7427,53 @@ static void fpb_emit_undo_restore(A64Buf *b, const X86Insn *insns, int first, in
         emit_sse_mem_st(b, size, vr);
         patch_guard_skip(skip, a64_label(b));
     }
+}
+static void emit_ymmh_clear(A64Buf *b, unsigned xr);
+static int mov128_pair_kind(const X86Insn *a, const X86Insn *c)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_LDP_PAIR") ? 1 : 0;
+    if (dis || a->op != c->op || a->vex != c->vex || a->nops != 2 || c->nops != 2) return 0;
+    if (a->op != OCERZ_OP_MOVUPS && a->op != OCERZ_OP_MOVAPS && a->op != OCERZ_OP_MOVDQA && a->op != OCERZ_OP_MOVDQU) return 0;
+    if (a->vex & (OCERZ_VEX_L | OCERZ_VEX_NDS)) return 0;
+    if (a->mode32 || c->mode32 || a->seg != OCERZ_SEG_NONE || c->seg != OCERZ_SEG_NONE || a->addrsize != 8 || c->addrsize != 8) return 0;
+    const X86Operand *ad = &a->ops[0], *as = &a->ops[1], *cd = &c->ops[0], *cs = &c->ops[1];
+    int load = ad->kind == OCERZ_OPK_XMM && as->kind == OCERZ_OPK_MEM && cd->kind == OCERZ_OPK_XMM && cs->kind == OCERZ_OPK_MEM;
+    int store = ad->kind == OCERZ_OPK_MEM && as->kind == OCERZ_OPK_XMM && cd->kind == OCERZ_OPK_MEM && cs->kind == OCERZ_OPK_XMM;
+    if (!load && !store) return 0;
+    const X86Operand *am = load ? as : ad, *cm = load ? cs : cd;
+    unsigned ar = load ? ad->reg : as->reg, cr = load ? cd->reg : cs->reg;
+    if (!xmm_is_pinned(ar) || !xmm_is_pinned(cr) || (load && ar == cr)) return 0;
+    if (am->riprel || cm->riprel || am->base != cm->base || am->index != cm->index || am->scale != cm->scale) return 0;
+    if (cm->disp != am->disp + 16 || am->disp % 16 != 0 || am->disp < -1024 || am->disp > 1008) return 0;
+    if (!mem_plain_access_ok(am) || !mem_plain_access_ok(cm)) return 0;
+    return load ? 1 : 2;
+}
+static int emit_mov128_pair(A64Buf *b, const X86Insn *a, const X86Insn *c, int i)
+{
+    int kind = mov128_pair_kind(a, c);
+    if (!kind) return 0;
+    if (g_fpb_of && g_fpb_of[i] != g_fpb_of[i + 1]) return 0;
+    if (g_fpb_undo_ld[i] || g_fpb_undo_ld[i + 1] || g_fpb_undo[i] || g_fpb_undo[i + 1] || g_fpb_stchk[i + 1]) return 0;
+    const X86Operand *am = kind == 1 ? &a->ops[1] : &a->ops[0];
+    unsigned ar = kind == 1 ? a->ops[0].reg : a->ops[1].reg, cr = kind == 1 ? c->ops[0].reg : c->ops[1].reg;
+    int va = xmm_vreg(ar), vc = xmm_vreg(cr);
+    if (kind == 2) { l0_flush_reg(b, ar); l0_flush_reg(b, cr); }
+    int ra; uint32_t disp;
+    if (!emit_mem_ea_plain_ex(b, a, am, 16, &ra, &disp, 1)) return 0;
+    int32_t d = (int32_t)disp;
+    int pair = d % 16 == 0 && d >= -1024 && d <= 1008;
+    if (kind == 1) {
+        l0_inval(ar); l0_inval(cr);
+        if (pair) a64_ldp_q_off(b, va, vc, ra, d);
+        else { a64_ldr_v(b, 16, va, ra, disp); a64_ldr_v(b, 16, vc, ra, disp + 16); }
+        if (a->vex) { emit_ymmh_clear(b, ar); emit_ymmh_clear(b, cr); }
+    } else {
+        if (pair) a64_stp_q_off(b, va, vc, ra, d);
+        else { a64_str_v(b, 16, va, ra, disp); a64_str_v(b, 16, vc, ra, disp + 16); }
+    }
+    g_mov_skip[i + 1] = 1;
+    return 1;
 }
 static void fpb_emit_exit_check(A64Buf *b)
 {
@@ -14661,6 +14729,10 @@ promo_push_fallthrough:
         if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_stchk[i]) fpb_emit_store_check(&b, i, fpb_open);
         if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_undo[i] && !g_fpb_undo_done[i]) fpb_emit_undo_save(&b, insn, i, exit_sites, &n_exits);
         g_undo_want_slot = -1; g_undo_saved = 0;
+        if (i + 1 < n && !g_mov_skip[i + 1] && emit_mov128_pair(&b, insn, &blk->insns[i + 1], i)) {
+            blk->n_inlined++;
+            continue;
+        }
         if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_undo_ld[i]) { g_undo_want_slot = g_fpb_undo_ld[i] - 1; g_undo_want_size = g_fpb_undo_ldsz[i]; }
         if (!try_inline(&b, insn, fl_need[i], exit_sites, &n_exits)) {
             emit_slowcall(&b, insn, exit_sites, &n_exits);
@@ -15585,6 +15657,12 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
         fprintf(stderr, "\n");
     }
     return rc;
+}
+
+int ocerz_jit_fault_pair(const void *host_pc)
+{
+    uint32_t w = *(const uint32_t *)host_pc;
+    return (w & 0xffc00000u) == 0xad400000u || (w & 0xffc00000u) == 0xad000000u;
 }
 
 int ocerz_jit_fault_rip(const struct OcerzVM *vm, const void *host_pc, uint64_t *out_rip)
