@@ -6165,7 +6165,7 @@ static void emit_nan_ool_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
 typedef struct {
     int first, last;
     uint16_t ckpt, ckpt_emit, written, dirty_open;
-    uint16_t full, s0, d0;
+    uint16_t full, s0, d0, dblonly;
     int gain;
     uint32_t *site;
     uint32_t *back;
@@ -6311,7 +6311,9 @@ _Static_assert(offsetof(OcerzCPU, fp_ckpt) % 16 == 0 && offsetof(OcerzCPU, fp_ck
 static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, int *sqrt_like)
 {
     *packed = *dbl = *from_mem = *sqrt_like = 0;
-    if (in->vex || in->seg != OCERZ_SEG_NONE || in->nops < 2) return 0;
+    if (in->seg != OCERZ_SEG_NONE || in->nops < 2) return 0;
+    if (in->vex && ((in->vex & OCERZ_VEX_L) || in->mode32 || in->nops != 2 ||
+                    ((in->vex & OCERZ_VEX_NDS) && !xmm_is_pinned(in->vvvv & 15)))) return 0;
     const X86Operand *d = &in->ops[0], *sr = &in->ops[1];
     if (d->kind != OCERZ_OPK_XMM || !xmm_is_pinned(d->reg)) return 0;
     if (sr->kind == OCERZ_OPK_MEM) {
@@ -6319,6 +6321,12 @@ static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, in
         else if (in->addrsize != 8) return 0;
         else *from_mem = 1;
     } else if (sr->kind != OCERZ_OPK_XMM || !xmm_is_pinned(sr->reg)) return 0;
+    if (in->op >= OCERZ_OP_VFMA_FIRST && in->op <= OCERZ_OP_VFMA_LAST) {
+        int idx = (int)(in->op - OCERZ_OP_VFMA_FIRST), kind = (idx >> 1) % 10;
+        if (kind < 2 || !(kind & 1) || !(in->vex & OCERZ_VEX_NDS)) return 0;
+        *dbl = idx & 1;
+        return 1;
+    }
     switch (in->op) {
     case OCERZ_OP_ADDSS: case OCERZ_OP_SUBSS: case OCERZ_OP_MULSS: case OCERZ_OP_DIVSS:
     case OCERZ_OP_MAXSS: case OCERZ_OP_MINSS: return 1;
@@ -6333,9 +6341,9 @@ static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, in
     case OCERZ_OP_SQRTPS: *sqrt_like = 1; *packed = 1; return 1;
     case OCERZ_OP_SQRTPD: *sqrt_like = 1; *packed = 1; *dbl = 1; return 1;
     case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU:
-        return 2;
-    case OCERZ_OP_MOVSS: return 3;
-    case OCERZ_OP_MOVSDX: *dbl = 1; return 3;
+        return (in->vex & OCERZ_VEX_NDS) ? 0 : 2;
+    case OCERZ_OP_MOVSS: return (in->vex & OCERZ_VEX_NDS) ? 0 : 3;
+    case OCERZ_OP_MOVSDX: *dbl = 1; return (in->vex & OCERZ_VEX_NDS) ? 0 : 3;
     default: return 0;
     }
 }
@@ -6442,6 +6450,7 @@ static void fpb_scan_v1(const X86Insn *insns, int n, int8_t *bat)
         if (n_arith >= 1 && gain > cost && g_n_fpb < FPB_MAX && last >= i && (full | s0 | d0)) {
             FpBatch *fb = &g_fpb[g_n_fpb];
             fb->first = i; fb->last = last; fb->ckpt = ckpt; fb->ckpt_emit = ckpt; fb->written = written; fb->dirty_open = 0;
+            fb->dblonly = 0;
             fb->full = full; fb->s0 = s0; fb->d0 = d0; fb->gain = gain - cost;
             fb->site = NULL; fb->back = NULL;
             fb->end = last;
@@ -6554,11 +6563,26 @@ static int fpb2_kind(const X86Insn *in, int *packed, int *dbl, int *from_mem, in
     if (c == 1) return K2_ARITH;
     if (c == 2) return K2_MOVE;
     if (c == 3) return K2_LMOVE;
-    if (in->vex || in->seg != OCERZ_SEG_NONE || in->nops < 2) return K2_END;
+    if (in->seg != OCERZ_SEG_NONE || in->nops < 2) return K2_END;
     const X86Operand *d = &in->ops[0], *s = &in->ops[1];
     int dx = d->kind == OCERZ_OPK_XMM && xmm_is_pinned(d->reg);
     int sx = s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg);
     int dm = d->kind == OCERZ_OPK_MEM && in->addrsize == 8;
+    if (in->vex) {
+        if ((in->vex & OCERZ_VEX_L) || in->mode32 || in->nops != 2) return K2_END;
+        int nds = (in->vex & OCERZ_VEX_NDS) != 0;
+        switch (in->op) {
+        case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU:
+            return !nds && dm && sx ? K2_STORE : K2_END;
+        case OCERZ_OP_MOVSDX: *dbl = 1; *lane_only = 1; return !nds && dm && sx ? K2_STORE : K2_END;
+        case OCERZ_OP_MOVSS: *lane_only = 1; return !nds && dm && sx ? K2_STORE : K2_END;
+        case OCERZ_OP_XORPS: case OCERZ_OP_PXOR:
+            return nds && dx && sx && d->reg == s->reg && (in->vvvv & 15) == d->reg ? K2_ZERO : K2_END;
+        case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISD: case OCERZ_OP_UCOMISS: case OCERZ_OP_COMISS:
+            return !nds && dx && sx ? K2_DET : K2_END;
+        default: return K2_END;
+        }
+    }
     switch (in->op) {
     case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU:
         return dm && sx ? K2_STORE : K2_END;
@@ -6581,13 +6605,24 @@ static void fpb2_usedef(const X86Insn *in, uint16_t *use, uint16_t *kill)
     uint16_t u = 0, k = 0;
     for (int q = 0; q < in->nops; q++)
         if (in->ops[q].kind == OCERZ_OPK_XMM && in->ops[q].reg < 16) u |= (uint16_t)(1u << in->ops[q].reg);
-    if (in->vex) {
-        if (in->vex & OCERZ_VEX_NDS) u |= (uint16_t)(1u << (in->vvvv & 15));
-        *use = u; *kill = 0;
-        return;
-    }
     const X86Operand *d = &in->ops[0], *s = in->nops > 1 ? &in->ops[1] : NULL;
     int dx = in->nops > 0 && d->kind == OCERZ_OPK_XMM && d->reg < 16;
+    if (in->vex) {
+        int nds = (in->vex & OCERZ_VEX_NDS) != 0;
+        if (nds) u |= (uint16_t)(1u << (in->vvvv & 15));
+        int lk = 0;
+        if (!(in->vex & OCERZ_VEX_L) && !in->mode32 && in->nops == 2 && dx) {
+            switch (in->op) {
+            case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU: lk = !nds; break;
+            case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX: lk = !nds && s && s->kind == OCERZ_OPK_MEM; break;
+            case OCERZ_OP_XORPS: case OCERZ_OP_PXOR: lk = nds && s && s->kind == OCERZ_OPK_XMM && s->reg == d->reg && (in->vvvv & 15) == d->reg; break;
+            default: break;
+            }
+        }
+        if (lk) { k = (uint16_t)(1u << d->reg); u &= (uint16_t)~k; if (in->op == OCERZ_OP_XORPS || in->op == OCERZ_OP_PXOR) u = 0; }
+        *use = u; *kill = k;
+        return;
+    }
     switch (in->op) {
     case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU: case OCERZ_OP_MOVDDUP:
         if (dx) { k = (uint16_t)(1u << d->reg); u &= (uint16_t)~k; }
@@ -6664,7 +6699,7 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
         int k0 = fpb2_kind(&insns[i], &packed, &dbl, &from_mem, &sq, &lane_only);
         if (k0 != K2_ARITH && k0 != K2_MOVE && k0 != K2_LMOVE) { i++; continue; }
         int j = i;
-        uint16_t written = 0, ckpt = 0, full = 0, s0 = 0, d0 = 0, gprs = 0;
+        uint16_t written = 0, ckpt = 0, full = 0, s0 = 0, d0 = 0, gprs = 0, everf = 0;
         int gain = 0, n_arith = 0, cost_extra = 0, sites = 0;
         struct { uint8_t s, d, cls; int t; } edges[64]; int n_edges = 0;
         int lastw[16], lastbreak[16]; uint8_t taint_dbl[16];
@@ -6674,6 +6709,15 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
         while (j < n) {
             const X86Insn *in = &insns[j];
             int k = fpb2_kind(in, &packed, &dbl, &from_mem, &sq, &lane_only);
+            { static long dbg_rip = -1, dbg_max = -1, dbg_lo = 0, dbg_hi = 0;
+              if (dbg_rip < 0) { const char *e = getenv("OCERZ_FPB_DBGRIP"); dbg_rip = e ? (long)strtoull(e, NULL, 0) : 0;
+                                 e = getenv("OCERZ_FPB_DBGMAX"); dbg_max = e ? strtol(e, NULL, 0) : 100000;
+                                 e = getenv("OCERZ_FPB_DBGLO"); dbg_lo = e ? (long)strtoull(e, NULL, 0) : 0;
+                                 e = getenv("OCERZ_FPB_DBGHI"); dbg_hi = e ? (long)strtoull(e, NULL, 0) : 0; }
+              if (dbg_hi && insns[0].rip >= (uint64_t)dbg_lo && insns[0].rip <= (uint64_t)dbg_hi) {
+                  long lim = (dbg_rip && (uint64_t)dbg_rip == insns[0].rip) ? dbg_max : -1;
+                  if (j > lim) break;
+              } }
             if (det_j >= 0) {
                 if (in->op == OCERZ_OP_JCC && j < n - 1 && in->ops[0].kind == OCERZ_OPK_IMM &&
                     in->ops[0].imm != insns[0].rip && comis_fuse_producer(insns, j) == det_j) {
@@ -6704,8 +6748,8 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
                 uint16_t t = (uint16_t)((full | s0 | d0) & sbit);
                 if (t) {
                     g_fpb_stchk[j] = sbit;
-                    if (lane_only && !(full & sbit)) {
-                        g_fpb_stlane[j] = 1; g_fpb_stdbl[j] = (uint8_t)((d0 & sbit) != 0);
+                    if (lane_only) {
+                        g_fpb_stlane[j] = 1; g_fpb_stdbl[j] = (uint8_t)dbl;
                         cost_extra += 2;
                     } else {
                         cost_extra += 3;
@@ -6729,24 +6773,37 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
                 case K2_ARITH: {
                     int is_mm = in->op == OCERZ_OP_MAXSS || in->op == OCERZ_OP_MINSS || in->op == OCERZ_OP_MAXSD || in->op == OCERZ_OP_MINSD ||
                                 in->op == OCERZ_OP_MAXPS || in->op == OCERZ_OP_MINPS || in->op == OCERZ_OP_MAXPD || in->op == OCERZ_OP_MINPD;
-                    if (srr < 16 && srr != dr && !is_mm && n_edges < 64) {
-                        if (packed && (full & sbit) && taint_dbl[srr] == (uint8_t)dbl) { edges[n_edges].s = (uint8_t)srr; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 0; n_edges++; }
-                        if (!dbl && (s0 & sbit) && n_edges < 64) { edges[n_edges].s = (uint8_t)srr; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 1; n_edges++; }
-                        if (dbl && (d0 & sbit) && n_edges < 64)  { edges[n_edges].s = (uint8_t)srr; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 2; n_edges++; }
+                    int fma = in->op >= OCERZ_OP_VFMA_FIRST && in->op <= OCERZ_OP_VFMA_LAST;
+                    int nds = (in->vex & OCERZ_VEX_NDS) != 0 && !fma;
+                    unsigned vr = (in->vex & OCERZ_VEX_NDS) ? (in->vvvv & 15) : dr;
+                    uint16_t vbit = (uint16_t)(1u << vr);
+                    unsigned srcs[2] = { srr, (in->vex & OCERZ_VEX_NDS) ? vr : 16 };
+                    for (int q = 0; q < 2; q++) {
+                        unsigned sx = srcs[q];
+                        if (sx >= 16 || sx == dr || is_mm || n_edges >= 64) continue;
+                        uint16_t xb = (uint16_t)(1u << sx);
+                        if (packed && (full & xb) && taint_dbl[sx] == (uint8_t)dbl) { edges[n_edges].s = (uint8_t)sx; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 0; n_edges++; }
+                        if (!dbl && (s0 & xb) && n_edges < 64) { edges[n_edges].s = (uint8_t)sx; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 1; n_edges++; }
+                        if (dbl && (d0 & xb) && n_edges < 64)  { edges[n_edges].s = (uint8_t)sx; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 2; n_edges++; }
                     }
                     taint_dbl[dr] = (uint8_t)dbl;
+                    if (!dbl) everf |= dbit; else everf &= (uint16_t)~dbit;
                     if (is_mm || (sq && srr != dr)) lastbreak[dr] = j;
-                    reads = (uint16_t)(sbit | dbit); writes = dbit;
+                    reads = (uint16_t)(sbit | vbit | (fma ? dbit : 0)); writes = dbit;
                     if (packed) { full |= dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; }
-                    else if (dbl) { d0 |= dbit; s0 &= (uint16_t)~dbit; }
-                    else          { s0 |= dbit; d0 &= (uint16_t)~dbit; }
+                    else {
+                        if (nds) { if (full & vbit) full |= dbit; else full &= (uint16_t)~dbit; }
+                        if (dbl) { d0 |= dbit; s0 &= (uint16_t)~dbit; }
+                        else     { s0 |= dbit; d0 &= (uint16_t)~dbit; }
+                    }
                     if (!is_mm) { gain += packed ? 6 : 2; n_arith++; }
                     break;
                 }
                 case K2_MOVE:
                     reads = sbit; writes = dbit; lastbreak[dr] = j;
-                    if (from_mem) { full &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; }
+                    if (from_mem) { full &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; everf &= (uint16_t)~dbit; }
                     else {
+                        everf = (uint16_t)((everf & ~dbit) | ((everf & sbit) ? dbit : 0));
                         full = (uint16_t)((full & ~dbit) | ((full & sbit) ? dbit : 0));
                         s0   = (uint16_t)((s0   & ~dbit) | ((s0   & sbit) ? dbit : 0));
                         d0   = (uint16_t)((d0   & ~dbit) | ((d0   & sbit) ? dbit : 0));
@@ -6755,7 +6812,8 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
                     break;
                 case K2_LMOVE:
                     reads = (uint16_t)(sbit | (from_mem ? 0 : dbit)); writes = dbit; lastbreak[dr] = j;
-                    if (from_mem) { full &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; }
+                    if (!dbl || (everf & sbit)) everf |= dbit;
+                    if (from_mem) { full &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; if (dbl) everf &= (uint16_t)~dbit; }
                     else {
                         if (full & sbit) full |= dbit;
                         if (dbl) { if ((d0 | full) & sbit) d0 |= dbit; else d0 &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; }
@@ -6765,7 +6823,7 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
                     break;
                 case K2_ZERO:
                     writes = dbit; lastbreak[dr] = j;
-                    full &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit;
+                    full &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; everf &= (uint16_t)~dbit;
                     break;
                 case K2_UNPCKH:
                     reads = (uint16_t)(sbit | dbit); writes = dbit; lastbreak[dr] = j;
@@ -6778,6 +6836,7 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
                     break;
                 case K2_DUP:
                     reads = sbit; writes = dbit; lastbreak[dr] = j;
+                    everf = (uint16_t)((everf & ~dbit) | ((everf & sbit) ? dbit : 0));
                     if ((full | d0 | s0) & sbit) { full |= dbit; d0 &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; }
                     else { full &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; }
                     break;
@@ -6837,8 +6896,12 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
             fb->first = i; fb->last = end; fb->end = end;
             fb->ckpt = ckpt; fb->ckpt_emit = ckpt; fb->written = written; fb->dirty_open = 0;
             fb->full = Tf; fb->s0 = Ts; fb->d0 = Td; fb->gain = gain - cost;
+            fb->dblonly = (uint16_t)(written & ~everf);
             fb->site = NULL; fb->back = NULL;
             for (int q = i; q <= end; q++) { bat[q] = (int8_t)g_n_fpb; g_fpb_member[q] = g_fpb_marith[q]; }
+            if (getenv("OCERZ_FPB_DBGPRINT"))
+                fprintf(stderr, "FPB rip=%#llx batch %d [%d..%d] ckpt=%04x written=%04x Tf=%04x Ts=%04x Td=%04x exit=%04x tainted=%04x live=%04x\n",
+                        (unsigned long long)insns[0].rip, g_n_fpb, i, end, ckpt, written, Tf, Ts, Td, exitchk, tainted, live);
             if (exitchk) { g_fpb_exit_mask = exitchk; g_fpb_exit_batch = g_n_fpb; g_fpb_exit_end = end; sites++; }
             planned_sites += sites + 1;
             g_n_fpb++;
@@ -6890,9 +6953,23 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
     fb->fcmp_vreg = -1;
     g_fcmp_self_idx = -1;
     if (!(fb->full | fb->s0 | fb->d0)) { fb->site = NULL; fb->back = NULL; return; }
-    if (fb->full) {
+    uint16_t fullf = (uint16_t)(fb->full & ~fb->dblonly), fulld = (uint16_t)(fb->full & fb->dblonly);
+    int dcur = -1;
+    if (fulld) {
         int first = -1, acc = -1;
-        for (int r = 0; r < 16; r++) if (fb->full & (1u << r)) {
+        for (int r = 0; r < 16; r++) if (fulld & (1u << r)) {
+            l0_flush_reg(b, (unsigned)r);
+            int v = xmm_vreg((unsigned)r);
+            if (first < 0) first = v;
+            else if (acc < 0) { a64_v_fmax(b, 1, VX3, first, v); acc = VX3; }
+            else a64_v_fmax(b, 1, VX3, VX3, v);
+        }
+        a64_fmaxp_d(b, VX3, acc >= 0 ? acc : first);
+        dcur = VX3;
+    }
+    if (fullf) {
+        int first = -1, acc = -1;
+        for (int r = 0; r < 16; r++) if (fullf & (1u << r)) {
             l0_flush_reg(b, (unsigned)r);
             int v = xmm_vreg((unsigned)r);
             if (first < 0) first = v;
@@ -6912,8 +6989,8 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
         if (cur != VX1) { a64_fmax_s(b, 0, VX1, cur, cur); }
         have_f = 1;
     }
-    if (fb->d0) {
-        int cur = -1;
+    if (fb->d0 || dcur >= 0) {
+        int cur = dcur;
         for (int r = 0; r < 16; r++) if (fb->d0 & (1u << r)) {
             int v = l0_src2(b, (unsigned)r, 1);
             if (cur < 0) cur = v;
@@ -6925,10 +7002,13 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
         fb->fcmp_vreg = (int8_t)cur;
         have_d = 1;
     }
+    if (have_d && have_f && unsafe_nocheckbr()) { fb->site = NULL; fb->back = a64_label(b); fb->gain = 0; return; }
+    static int force = -1; if (force < 0) force = getenv("OCERZ_FPB_FORCEREPLAY") ? 1 : 0;
+    int vs = force ? A64_AL : A64_VS;
     if (have_d && have_f) {
-        uint32_t *dnan = a64_label(b); a64_bcond(b, A64_VS, 0);
+        uint32_t *dnan = a64_label(b); a64_bcond(b, vs, 0);
         a64_fcmp(b, 0, VX1, VX1);
-        fb->site = a64_label(b); a64_bcond(b, A64_VS, 0);
+        fb->site = a64_label(b); a64_bcond(b, vs, 0);
         uint32_t *skip = a64_label(b); a64_b(b, 0);
         a64_patch_bcond(dnan, a64_label(b));
         uint32_t *tramp = a64_label(b); a64_b(b, 0);
@@ -6937,13 +7017,13 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
         fb->gain = (int)(tramp - fb->site);
     } else if (have_d) {
         if (unsafe_nocheckbr()) fb->site = NULL;
-        else { fb->site = a64_label(b); a64_bcond(b, A64_VS, 0); }
+        else { fb->site = a64_label(b); a64_bcond(b, vs, 0); }
         fb->back = a64_label(b);
         fb->gain = 0;
     } else {
         a64_fcmp(b, 0, VX1, VX1);
         if (unsafe_nocheckbr()) fb->site = NULL;
-        else { fb->site = a64_label(b); a64_bcond(b, A64_VS, 0); }
+        else { fb->site = a64_label(b); a64_bcond(b, vs, 0); }
         fb->back = a64_label(b);
         fb->gain = 0;
     }
@@ -6973,15 +7053,29 @@ static int fpb_det_here(int idx)
 static void fpb_emit_regs_check(A64Buf *b, uint16_t regs, int batch, int end, const int8_t *l0, const uint8_t *l0_dbl)
 {
     if (!regs || g_n_fpb_sites >= FPB_SITES_MAX) return;
+    uint16_t dmask = (uint16_t)(regs & g_fpb[batch].dblonly), fmask = (uint16_t)(regs & ~dmask);
     int first = -1, acc = -1;
-    for (int r = 0; r < 16; r++) if (regs & (1u << r)) {
+    for (int r = 0; r < 16; r++) if (fmask & (1u << r)) {
         int v = xmm_vreg((unsigned)r);
         if (first < 0) first = v;
         else if (acc < 0) { a64_v_fmax(b, 0, VX0, first, v); acc = VX0; }
         else a64_v_fmax(b, 0, VX0, VX0, v);
     }
-    a64_fmaxv_4s(b, VX1, acc >= 0 ? acc : first);
-    a64_fcmp(b, 0, VX1, VX1);
+    int dfirst = -1, dacc = -1;
+    for (int r = 0; r < 16; r++) if (dmask & (1u << r)) {
+        int v = xmm_vreg((unsigned)r);
+        if (dfirst < 0) dfirst = v;
+        else if (dacc < 0) { a64_v_fmax(b, 1, VX3, dfirst, v); dacc = VX3; }
+        else a64_v_fmax(b, 1, VX3, VX3, v);
+    }
+    if (dmask) a64_fmaxp_d(b, VX3, dacc >= 0 ? dacc : dfirst);
+    if (fmask) {
+        a64_fmaxv_4s(b, VX1, acc >= 0 ? acc : first);
+        if (dmask) { a64_fcvt_d2s(b, VX2, VX3); a64_fmax_s(b, 0, VX1, VX1, VX2); }
+        a64_fcmp(b, 0, VX1, VX1);
+    } else {
+        a64_fcmp(b, 1, VX3, VX3);
+    }
     FpbSite *st = &g_fpb_sites[g_n_fpb_sites++];
     st->batch = batch; st->end = end;
     st->site = a64_label(b); a64_bcond(b, A64_VS, 0);
@@ -7221,6 +7315,11 @@ static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
                 if (firstdbl[o->reg] < 0) firstdbl[o->reg] = (int8_t)dbl;
             }
         }
+        if ((insns[i].vex & OCERZ_VEX_NDS) && xmm_is_pinned(insns[i].vvvv & 15)) {
+            unsigned v = insns[i].vvvv & 15;
+            cnt[v]++;
+            if (firstdbl[v] < 0) firstdbl[v] = (int8_t)dbl;
+        }
     }
     int key[16];
     for (int r = 0; r < 16; r++)
@@ -7375,6 +7474,24 @@ static int vex_lane_aware(const X86Insn *insn)
     }
 }
 
+static int l0_aware_op(unsigned op);
+static void l0_pre_insn(A64Buf *b, const X86Insn *insn)
+{
+    if (vex_lane_aware(insn) || !(insn->vex || !l0_aware_op(insn->op))) return;
+    for (int k = 0; k < insn->nops; k++)
+        if (insn->ops[k].kind == OCERZ_OPK_XMM)
+            l0_flush_reg(b, insn->ops[k].reg);
+    if (insn->vex & OCERZ_VEX_NDS)
+        l0_flush_reg(b, insn->vvvv);
+    if (insn->op == OCERZ_OP_BLENDVPD || insn->op == OCERZ_OP_BLENDVPS ||
+        insn->op == OCERZ_OP_PBLENDVB)
+        l0_flush_reg(b, 0);
+    for (int k = 0; k < insn->nops; k++)
+        if (insn->ops[k].kind == OCERZ_OPK_XMM && (k == 0 || insn->op == OCERZ_OP_BLENDVPD ||
+            insn->op == OCERZ_OP_BLENDVPS || insn->op == OCERZ_OP_PBLENDVB))
+            l0_inval(insn->ops[k].reg);
+    if (insn->op == OCERZ_OP_FXRSTOR || insn->op == OCERZ_OP_SYSCALL) { l0_flush_all(b); l0_reset(); }
+}
 static int l0_aware_op(unsigned op)
 {
     switch (op) {
@@ -8834,6 +8951,12 @@ static int emit_vex_shift_imm(A64Buf *b, const X86Insn *insn, int kind, int esz,
     return 1;
 }
 
+static int inexact_nan_env(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("OCERZ_INEXACT_NAN") ? 1 : 0;
+    return v;
+}
 static void emit_vex_fp_lane(A64Buf *b, int kind, int dbl, int vr, int va, int vb, int t1)
 {
     switch (kind) {
@@ -8845,6 +8968,7 @@ static void emit_vex_fp_lane(A64Buf *b, int kind, int dbl, int vr, int va, int v
     case 5: a64_v_fcmgt(b, dbl, vr, vb, va); a64_v_bsl(b, vr, va, vb); return;
     default: a64_v_fsqrt(b, dbl, vr, vb); va = vb; break;
     }
+    if (inexact_nan_env() || g_fpb_fast) return;
     emit_nan_fix_packed2(b, dbl, vr, va, vb, t1, t1);
 }
 static int emit_vex_fp256(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
@@ -8934,8 +9058,10 @@ static int emit_vex_fp128_alias(A64Buf *b, const X86Insn *insn)
         case 5: a64_fcmp(b, dbl, va, vb); a64_fcsel(b, dbl, t, va, vb, A64_MI); break;
         default: a64_fsqrt_s(b, dbl, t, vb); break;
         }
-        if (kind < 4) emit_nan_fix_scalar2(b, dbl, t, fa, fb);
-        else if (kind == 6) emit_nan_fix_scalar2(b, dbl, t, fb, fb);
+        if (!(inexact_nan_env() || g_fpb_fast)) {
+            if (kind < 4) emit_nan_fix_scalar2(b, dbl, t, fa, fb);
+            else if (kind == 6) emit_nan_fix_scalar2(b, dbl, t, fb, fb);
+        }
         g_fcmp_self_idx = -1;
         a64_v_mov(b, vd, xmm_vreg(insn->vvvv));
         emit_xmm_st_lo(b, dbl ? 8 : 4, t, d->reg);
@@ -9234,6 +9360,11 @@ static int emit_vex_fma(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         int t = l0_enabled() ? l0_alloc(d->reg, pd) : VX1;
         if (t < 0) t = VX1;
         a64_fmadd_s(b, pd, negmul, negadd, t, sa, sm, sc);
+        if (inexact_nan_env() || g_fpb_fast) {
+            emit_xmm_st_lo(b, pd ? 8 : 4, t, d->reg);
+            emit_ymmh_clear(b, d->reg);
+            return 1;
+        }
         a64_fcmp(b, pd, t, t);
         uint32_t *ssite = a64_label(b);
         a64_bcond(b, A64_VS, 0);
@@ -13933,21 +14064,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         for (int j = i + 1; j < n && j <= i + 1 + NZCV_GAP_MAX; j++)
             if (nzcv_fuse_producer(blk->insns, j) == i) { g_nzcv_want = 1; break; }
         if (g_callout_seq != l0_last_seq) { l0_flush_all(&b); l0_reset(); l0_last_seq = g_callout_seq; }
-        if (!vex_lane_aware(insn) && (insn->vex || !l0_aware_op(insn->op))) {
-            for (int k = 0; k < insn->nops; k++)
-                if (insn->ops[k].kind == OCERZ_OPK_XMM)
-                    l0_flush_reg(&b, insn->ops[k].reg);
-            if (insn->vex & OCERZ_VEX_NDS)
-                l0_flush_reg(&b, insn->vvvv);
-            if (insn->op == OCERZ_OP_BLENDVPD || insn->op == OCERZ_OP_BLENDVPS ||
-                insn->op == OCERZ_OP_PBLENDVB)
-                l0_flush_reg(&b, 0);
-            for (int k = 0; k < insn->nops; k++)
-                if (insn->ops[k].kind == OCERZ_OPK_XMM && (k == 0 || insn->op == OCERZ_OP_BLENDVPD ||
-                    insn->op == OCERZ_OP_BLENDVPS || insn->op == OCERZ_OP_PBLENDVB))
-                    l0_inval(insn->ops[k].reg);
-            if (insn->op == OCERZ_OP_FXRSTOR || insn->op == OCERZ_OP_SYSCALL) { l0_flush_all(&b); l0_reset(); }
-        }
+        l0_pre_insn(&b, insn);
         if (!(insn->op == OCERZ_OP_JCC && i < n - 1) &&
             !(g_l0_fixed && i >= n - 2) &&
             (is_terminator(insn->op) ||
@@ -14427,6 +14544,7 @@ promo_push_fallthrough:
             g_cur_need = fl_need[m];
             g_cur_fpb = -1;
             uint32_t *lo = a64_label(&b);
+            l0_pre_insn(&b, &blk->insns[m]);
             if (!try_inline(&b, &blk->insns[m], fl_need[m], exit_sites, &n_exits))
                 emit_slowcall(&b, &blk->insns[m], exit_sites, &n_exits);
             if (g_n_fpbmap < JIT_MAX_BLOCK_INSNS) {
@@ -14468,6 +14586,7 @@ promo_push_fallthrough:
             g_cur_need = fl_need[m];
             g_cur_fpb = -1;
             uint32_t *lo = a64_label(&b);
+            l0_pre_insn(&b, &blk->insns[m]);
             if (!try_inline(&b, &blk->insns[m], fl_need[m], exit_sites, &n_exits))
                 emit_slowcall(&b, &blk->insns[m], exit_sites, &n_exits);
             if (g_n_fpbmap < JIT_MAX_BLOCK_INSNS) {

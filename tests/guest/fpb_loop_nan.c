@@ -112,6 +112,79 @@ __attribute__((noinline)) static double mixed_loop(int n, double *o)
     return x + y + z;
 }
 
+__attribute__((noinline, target("avx2"))) static double rmw_loop_v(int n)
+{
+    double e = 0.0;
+    for (int i = 0; i < n; i++) {
+        double d = A[i] - B[i];
+        double m = d * d + C[i];
+        C[i] = m * 0.5 - A[i];
+        B[i] += d * 0.25;
+        e += __builtin_sqrt(m) / (1.0 + (double)(i & 3));
+    }
+    return e;
+}
+__attribute__((noinline, target("avx2"))) static double exit_loop_v(int n, double lim)
+{
+    double x = 0.0, y = 0.5;
+    int i;
+    for (i = 0; i < n; i++) {
+        double xx = x * x, yy = y * y;
+        if (xx + yy > lim) break;
+        y = 2.0 * x * y + B[i];
+        x = xx - yy + A[i];
+    }
+    return x + y * 3.0 + (double)i;
+}
+__attribute__((noinline, target("avx2"))) static double dead_loop_v(int n, double *out)
+{
+    double last = 0.0, s = 0.0, t = 1.0;
+    for (int i = 0; i < n; i++) {
+        last = A[i] * B[i] - C[i];
+        t = t * 0.999 + A[i];
+        s += A[i] * 0.5;
+    }
+    *out = last;
+    return s + t;
+}
+__attribute__((noinline, target("avx2"))) static void packed_loop_v(int n)
+{
+    for (int i = 0; i < n; i++) {
+        double p0 = P[2 * i], p1 = P[2 * i + 1];
+        double q0 = Q[2 * i], q1 = Q[2 * i + 1];
+        double m0 = p0 * q0, m1 = p1 * q1;
+        double sum = m0 + m1;
+        P[2 * i] = sum * p0;
+        P[2 * i + 1] = sum * p1;
+        Q[2 * i] = q0 - m1;
+        Q[2 * i + 1] = q1 - m0;
+    }
+}
+__attribute__((noinline, target("avx2"))) static double divsqrt_loop_v(int n)
+{
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        double r = __builtin_sqrt(A[i]) / B[i];
+        double q = (A[i] - A[i]) / (B[i] - B[i]);
+        C[i] = r + q * 0.0 + C[i];
+        acc += r;
+    }
+    return acc;
+}
+__attribute__((noinline, target("avx2"))) static double mixed_loop_v(int n, double *o)
+{
+    double x = S[0], y = S[6], z = S[7];
+    for (int i = 0; i < n; i++) {
+        x = x * A[i] + y;
+        y = y - z * B[i];
+        z = z * 0.5 + x;
+        if (z > 1e300) z = S[7];
+        if (y < -1e300) { y = S[6]; break; }
+    }
+    o[0] = x; o[1] = y; o[2] = z;
+    return x + y + z;
+}
+
 static void dumpd(const char *name, double d)
 {
     g_puts(name); g_puts(" "); g_puthex64(bits(d));
@@ -139,6 +212,20 @@ int main(void)
         dumpd("divsqrt", divsqrt_loop(N)); dumpa("C2", C, N);
         init(v);
         dumpd("mixed", mixed_loop(N, o)); dumpa("mixed.o", o, 3);
+        init(v);
+        dumpd("v.rmw", rmw_loop_v(N));
+        dumpa("v.C", C, N); dumpa("v.B", B, N);
+        init(v);
+        dumpd("v.exit", exit_loop_v(N, 4.0));
+        dumpd("v.exit2", exit_loop_v(N, 1e308));
+        init(v);
+        dumpd("v.dead", dead_loop_v(N, &o[0])); dumpd("v.dead.last", o[0]);
+        init(v);
+        packed_loop_v(N); dumpa("v.P", P, 2 * N); dumpa("v.Q", Q, 2 * N);
+        init(v);
+        dumpd("v.divsqrt", divsqrt_loop_v(N)); dumpa("v.C2", C, N);
+        init(v);
+        dumpd("v.mixed", mixed_loop_v(N, o)); dumpa("v.mixed.o", o, 3);
     }
     g_puts("DONE\n");
     return 0;
