@@ -267,6 +267,7 @@ typedef struct JitInsnRef {
     uint16_t pad;
 } JitInsnRef;
 
+struct JitLaneRec { uint32_t off; uint16_t dirty; uint8_t l0[16]; uint8_t yc[16]; };
 typedef struct JitBlock {
     uint64_t key;
     JitBlockFn code;
@@ -289,6 +290,8 @@ typedef struct JitBlock {
 
     struct JitOslowMap { uint32_t lo, hi; int32_t idx; } *oslow;
     int n_oslow;
+    struct JitLaneRec *lanerec;
+    int n_lanerec;
     JitFaultFlagRecipe *fault_flags;
     uint32_t code_words;
 
@@ -7267,7 +7270,7 @@ static void fpb_emit_regs_check(A64Buf *b, uint16_t regs, int batch, int end, co
 static int l0_enabled(void)
 {
     static int en = -1;
-    if (en < 0) en = (getenv("OCERZ_NO_L0CACHE") || mem_guard_needed()) ? 0 : 1;
+    if (en < 0) en = getenv("OCERZ_NO_L0CACHE") ? 0 : 1;
     return en;
 }
 static uint16_t g_l0_dirty;
@@ -7294,6 +7297,23 @@ static void yc_reload_all(A64Buf *b)
     for (unsigned r = 0; r < 16; r++)
         if (g_yc[r] >= 0)
             a64_ldr_v(b, 16, g_yc[r], 20, YMMH_OFF + r * 16);
+}
+static struct JitLaneRec g_lanerec[JIT_MAX_BLOCK_INSNS * 2];
+static int g_n_lanerec;
+static void lanerec_note(uint32_t off)
+{
+    struct JitLaneRec r;
+    r.off = off;
+    r.dirty = g_l0_dirty;
+    for (int i = 0; i < 16; i++) {
+        r.l0[i] = g_l0[i] < 0 ? 0xff : (uint8_t)((g_l0[i] - 4) | (g_l0_dbl[i] ? 0x10 : 0));
+        r.yc[i] = g_yc[i] < 0 ? 0xff : (uint8_t)(g_yc[i] - 4);
+    }
+    if (g_n_lanerec > 0) {
+        const struct JitLaneRec *l = &g_lanerec[g_n_lanerec - 1];
+        if (l->dirty == r.dirty && memcmp(l->l0, r.l0, 16) == 0 && memcmp(l->yc, r.yc, 16) == 0) return;
+    }
+    if (g_n_lanerec < (int)(sizeof g_lanerec / sizeof g_lanerec[0])) g_lanerec[g_n_lanerec++] = r;
 }
 static void l0_reset(void)
 {
@@ -9067,8 +9087,14 @@ static int emit_vex_mov(A64Buf *b, const X86Insn *insn, int L, uint32_t **exit_s
         }
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
         int vh = ymmh_dst(d->reg, VX1);
-        emit_vex_mem_acc(b, vh, 16, 0);
-        emit_vex_mem_acc(b, vd, 0, 0);
+        int32_t dl = (int32_t)g_sse_mem_disp;
+        if ((g_sse_mem_plainacc || vec_tso_relaxed()) && dl % 16 == 0 && dl >= -1024 && dl <= 1008) {
+            a64_ldp_q_off(b, VX0, vh, g_sse_mem_ra, dl);
+        } else {
+            emit_vex_mem_acc(b, VX0, 0, 0);
+            emit_vex_mem_acc(b, vh, 16, 0);
+        }
+        a64_v_mov(b, vd, VX0);
         emit_vex_mem_done(b);
         emit_ymmh_st(b, vh, d->reg);
         return 1;
@@ -9110,8 +9136,8 @@ static int emit_vex_int(A64Buf *b, const X86Insn *insn, int kind, int esz, int L
         if (L) vbh = ymmh_src(b, s->reg, VX1);
     } else if (L) {
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
-        emit_vex_mem_acc(b, VX1, 16, 0);
         emit_vex_mem_acc(b, VX0, 0, 0);
+        emit_vex_mem_acc(b, VX1, 16, 0);
         emit_vex_mem_done(b);
     } else if (!emit_vex_ld128(b, insn, s, 16, VX0, exit_sites, n_exits)) {
         return 0;
@@ -9257,8 +9283,8 @@ static int emit_vex_cvtdq2ps256(A64Buf *b, const X86Insn *insn, uint32_t **exit_
     int lo, hi;
     if (s->kind == OCERZ_OPK_MEM) {
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
-        emit_vex_mem_acc(b, VX2, 16, 0);
         emit_vex_mem_acc(b, VX0, 0, 0);
+        emit_vex_mem_acc(b, VX2, 16, 0);
         emit_vex_mem_done(b);
         lo = VX0; hi = VX2;
     } else {
@@ -9292,7 +9318,9 @@ static int emit_vex_fp256(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     int mem = s->kind == OCERZ_OPK_MEM, lb = VX0, sh = VX2, ah = VX1;
     if (mem) {
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
+        emit_vex_mem_acc(b, VX0, 0, 0);
         emit_vex_mem_acc(b, VX2, 16, 0);
+        emit_vex_mem_done(b);
     } else {
         sh = ymmh_src(b, s->reg, VX2);
         lb = xmm_vreg(s->reg);
@@ -9301,10 +9329,6 @@ static int emit_vex_fp256(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     int dh = ymmh_dst(d->reg, VX3);
     if (dh == ah || dh == sh) dh = VX3;
     int chk = emit_vex_fp_op(b, kind, dbl, dh, ah, sh) && !inexact_nan_env();
-    if (mem) {
-        emit_vex_mem_acc(b, VX0, 0, 0);
-        emit_vex_mem_done(b);
-    }
     emit_vex_fp_op(b, kind, dbl, VX1, sq ? lb : xmm_vreg(insn->vvvv), lb);
     if (!chk) {
         a64_v_mov(b, xmm_vreg(d->reg), VX1);
@@ -9421,8 +9445,8 @@ static int emit_vex_blendv(A64Buf *b, const X86Insn *insn, int L, uint32_t **exi
         if (L) emit_ymmh_ld(b, VX1, s->reg);
     } else if (L) {
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
-        emit_vex_mem_acc(b, VX1, 16, 0);
         emit_vex_mem_acc(b, VX0, 0, 0);
+        emit_vex_mem_acc(b, VX1, 16, 0);
         emit_vex_mem_done(b);
     } else if (!emit_vex_ld128(b, insn, s, 16, VX0, exit_sites, n_exits)) {
         return 0;
@@ -9603,8 +9627,8 @@ static int emit_vex_shufp(A64Buf *b, const X86Insn *insn, int L, uint32_t **exit
         if (L) emit_ymmh_ld(b, VX3, s->reg);
     } else if (L) {
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
-        emit_vex_mem_acc(b, VX3, 16, 0);
         emit_vex_mem_acc(b, VX0, 0, 0);
+        emit_vex_mem_acc(b, VX3, 16, 0);
         emit_vex_mem_done(b);
     } else if (!emit_vex_ld128(b, insn, s, 16, VX0, exit_sites, n_exits)) {
         return 0;
@@ -9641,8 +9665,8 @@ static int emit_vex_movddup256(A64Buf *b, const X86Insn *insn, uint32_t **exit_s
         vs = xmm_vreg(s->reg);
     } else if (s->kind == OCERZ_OPK_MEM) {
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
-        emit_vex_mem_acc(b, VX1, 16, 0);
         emit_vex_mem_acc(b, VX0, 0, 0);
+        emit_vex_mem_acc(b, VX1, 16, 0);
         emit_vex_mem_done(b);
     } else {
         return 0;
@@ -9666,8 +9690,8 @@ static int emit_vex_fma(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
     int mem = s->kind == OCERZ_OPK_MEM;
     if (mem && L) {
         if (!emit_vex_mem_addr(b, insn, s, exit_sites, n_exits)) return 0;
-        emit_vex_mem_acc(b, VX3, 16, 0);
         emit_vex_mem_acc(b, VX0, 0, 0);
+        emit_vex_mem_acc(b, VX3, 16, 0);
         emit_vex_mem_done(b);
     } else if (mem && !emit_vex_ld128(b, insn, s, scalar ? (pd ? 8 : 4) : 16, VX0, exit_sites, n_exits)) {
         return 0;
@@ -14404,6 +14428,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_ymmh_zero = 0;
     unsigned long long l0_last_seq = g_callout_seq;
     g_n_fpbmap = 0;
+    g_n_lanerec = 0;
     int fpb_open = -1;
 
     int last_flag_def = -1;
@@ -14412,6 +14437,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         const X86Insn *insn = &blk->insns[i];
         g_cur_insn_idx = i;
         g_cur_insn_start = b.p;
+        lanerec_note((uint32_t)(b.p - entry));
         g_cur_need = fl_need[i];
         g_cur_insns = blk->insns; g_cur_insns_n = n;
         g_cur_fpb = fpb_of[i];
@@ -14913,6 +14939,7 @@ promo_push_fallthrough:
             g_cur_need = fl_need[m];
             g_cur_fpb = -1;
             uint32_t *lo = a64_label(&b);
+            lanerec_note((uint32_t)(lo - entry));
             l0_pre_insn(&b, &blk->insns[m]);
             if (!try_inline(&b, &blk->insns[m], fl_need[m], exit_sites, &n_exits))
                 emit_slowcall(&b, &blk->insns[m], exit_sites, &n_exits);
@@ -14956,6 +14983,7 @@ promo_push_fallthrough:
             g_cur_need = fl_need[m];
             g_cur_fpb = -1;
             uint32_t *lo = a64_label(&b);
+            lanerec_note((uint32_t)(lo - entry));
             l0_pre_insn(&b, &blk->insns[m]);
             if (!try_inline(&b, &blk->insns[m], fl_need[m], exit_sites, &n_exits))
                 emit_slowcall(&b, &blk->insns[m], exit_sites, &n_exits);
@@ -15288,6 +15316,12 @@ promo_push_fallthrough:
             }
         }
     }
+    blk->lanerec = NULL; blk->n_lanerec = 0;
+    if (g_n_lanerec > 0) {
+        blk->lanerec = (struct JitLaneRec *)malloc((size_t)g_n_lanerec * sizeof *blk->lanerec);
+        if (blk->lanerec) { memcpy(blk->lanerec, g_lanerec, (size_t)g_n_lanerec * sizeof *blk->lanerec); blk->n_lanerec = g_n_lanerec; }
+    }
+    g_n_lanerec = 0;
     compact_block(blk);
     cache_insert(jit, blk);
 
@@ -15455,6 +15489,20 @@ void ocerz_jit_fault_recover_xmm(const struct OcerzVM *vm, const void *host_pc,
     for (unsigned r = 0; r < 16; r++)
         if ((b->xmm_pinned >> r) & 1)
             memcpy(&cpu->xmm[r], v + (16 + r) * 16, 16);
+    uint32_t off = (uint32_t)((const uint32_t *)host_pc - (const uint32_t *)b->code);
+    const struct JitLaneRec *rec = NULL;
+    for (int k = 0; k < b->n_lanerec; k++) {
+        if (b->lanerec[k].off > off) break;
+        rec = &b->lanerec[k];
+    }
+    if (!rec)
+        return;
+    for (unsigned r = 0; r < 16; r++) {
+        if (rec->l0[r] != 0xff && ((rec->dirty >> r) & 1))
+            memcpy(&cpu->xmm[r], v + (4 + (rec->l0[r] & 15)) * 16, (rec->l0[r] & 0x10) ? 8 : 4);
+        if (rec->yc[r] != 0xff)
+            memcpy(&cpu->ymmh[r], v + (4 + rec->yc[r]) * 16, 16);
+    }
 }
 
 static int fault_insn_index(const JitBlock *b, const uint32_t *pc)
@@ -15796,6 +15844,7 @@ static void block_destroy(JitBlock *b)
 {
     free(b->insn_off);
     free(b->oslow);
+    free(b->lanerec);
     free(b->fault_flags);
     free(b->push_fix);
     free(b->pushelide);
