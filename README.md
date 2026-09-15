@@ -215,9 +215,9 @@ Timings are best of 5 on an Apple M5 with macOS 26.6.2, taken 2026-09-14 on an i
 | int32 loop 4M, clang AVX2 | 135.35 ms | **0.44 ms** | 1.30 ms |
 | int32 loop 4M, clang SSE4.1 | 29.48 ms | **0.56 ms** | 0.78 ms |
 | saxpy 4M, clang AVX2+FMA | 37.62 ms | **0.33 ms** | 0.48 ms |
-| nbody 200k steps, scalar SSE2 | 72.55 ms | 6.80 ms | 5.80 ms |
-| nbody 200k steps, scalar AVX2 | 1122.18 ms | **10.46 ms** | 10.61 ms |
-| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.71 ms** | 9.31 ms |
+| nbody 200k steps, scalar SSE2 | 72.55 ms | 6.77 ms | 5.80 ms |
+| nbody 200k steps, scalar AVX2 | 1122.18 ms | **9.80 ms** | 10.42 ms |
+| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.20 ms** | 9.31 ms |
 | mandelbrot 400x400, scalar SSE2 | 28.50 ms | 16.93 ms | 16.03 ms |
 | mandelbrot 400x400, scalar AVX2 | 1171.68 ms | 18.82 ms | 16.50 ms |
 
