@@ -47,7 +47,7 @@ make -j
 | loader / syscall suites | 54 / 0, 324 / 0 |
 | memory / shared mappings | 2692 / 0, 91 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 101 / 101 |
+| x86-64 guest gate | 111 / 111 |
 | x86-64 differential gate (interpreter vs JIT) | 92 / 92 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 107 / 107 |
@@ -184,7 +184,7 @@ The same suite built for x86-64-v3 (`clang -march=x86-64-v3`, so AVX2, FMA and B
 
 `mixed` was a 1.20x loss for a long time, and the whole gap was the price of bit-exact x86 NaN semantics: every packed FP result needed a check before anything could use it. The JIT now defers that check to the compares that read the value, and Rosetta-style hot paths that the compiler split with rare-case branches get retranslated with the hot side inline. Both are exact; the NaN tests in `tests/guest` compare bit patterns against the native binary.
 
-The deferred check has since become one batch per run of floating-point work: zeroing, unpacks, `movddup`, stores, and `ucomisd` with its branch all stay inside the batch, a stored value is checked right before the store, a branch out of the loop carries its check in the exit stub, and at the batch's end only the registers the loop still reads are checked. nbody's SSE2 pair loop went from 107 to 86 host instructions per iteration that way, 42 of which had been NaN bookkeeping.
+The deferred check has since become one batch per run of floating-point work: zeroing, unpacks, `movddup`, stores, and `ucomisd` with its branch all stay inside the batch, a stored value is checked right before the store, a branch out of the loop carries its check in the exit stub, and at the batch's end only the registers the loop still reads are checked. nbody's SSE2 pair loop went from 107 to 86 host instructions per iteration that way, 42 of which had been NaN bookkeeping. The VEX.128 arithmetic and the scalar FMA forms are batch members too, registers that only ever hold doubles are reduced as doubles (a `fmaxv.4s` over a double reports a NaN for one value in 256), and `tests/run_guest_tests.sh` runs the NaN tests once more with every deferred check forced to take its replay arm.
 
 These kernels never create a thread, fork or map shared memory, so they run in plain memory mode throughout. A program that does any of those retires plain mode for good (`ocerz_jit_require_ordered`) and pays for x86-TSO ordering on every scalar load and store; Wine is always in that mode. Under `OCERZ_NO_PLAIN_MEM=1` the same table reads 1.35x on `memcpy`, 0.99x on `fpvec`, 1.08x on `str`, 1.13x on `chase` and stays at parity elsewhere. Scalar accesses use acquire and release forms (flags, locks and atomics are scalar, and a release store orders every earlier vector store); SSE loads and stores are left plain, the default FEX ships too, because ordering them cost 3.3x on `memcpy` and 3.0x on `fpvec`. `OCERZ_TSO_VECTOR=1` orders them as well.
 
@@ -215,15 +215,15 @@ Timings are best of 5 on an Apple M5 with macOS 26.6.2, taken 2026-09-14 on an i
 | int32 loop 4M, clang AVX2 | 135.35 ms | **0.44 ms** | 1.30 ms |
 | int32 loop 4M, clang SSE4.1 | 29.48 ms | **0.56 ms** | 0.78 ms |
 | saxpy 4M, clang AVX2+FMA | 37.62 ms | **0.33 ms** | 0.48 ms |
-| nbody 200k steps, scalar SSE2 | 72.55 ms | 7.86 ms | 5.80 ms |
+| nbody 200k steps, scalar SSE2 | 72.55 ms | 6.80 ms | 5.80 ms |
 | nbody 200k steps, scalar AVX2 | 1122.18 ms | **10.46 ms** | 10.61 ms |
-| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.53 ms** | 9.54 ms |
+| nbody 200k steps, scalar AVX2+FMA | 895.52 ms | **8.71 ms** | 9.31 ms |
 | mandelbrot 400x400, scalar SSE2 | 28.50 ms | 16.93 ms | 16.03 ms |
 | mandelbrot 400x400, scalar AVX2 | 1171.68 ms | 18.82 ms | 16.50 ms |
 
 The first three kernels are hand-written loops shaped like Go's runtime routines. The rest are C loops, which clang vectorizes except for nbody and mandelbrot, which stay scalar.
 
-Scalar floating-point loops now take 0.9 to 1.4 times Rosetta's time, whether they were built for SSE2 or for x86-64-v3. The scalar results stay in host lane registers across a loop instead of being merged back into the guest register after every operation, and 256-bit loops keep the upper halves of their `ymm` registers in host registers too.
+Scalar floating-point loops now take 0.9 to 1.2 times Rosetta's time, whether they were built for SSE2 or for x86-64-v3. The scalar results stay in host lane registers across a loop instead of being merged back into the guest register after every operation, and 256-bit loops keep the upper halves of their `ymm` registers in host registers too.
 
 ## CLI
 
