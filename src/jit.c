@@ -3530,7 +3530,27 @@ static void emit_v_acc_ordered_checked(A64Buf *b, int size, int vr, int ra, int3
     emit_v_st_ordered_fast(b, size, vr, ra, 0);
     a64_patch_b(to_done, a64_label(b));
 }
+#define L0_NLANES 12
+#define FPB_UNDO_MAX 8
+static int g_l0_nlanes = L0_NLANES;
+static int g_zero_vreg = -1;
+static int8_t g_undo_vreg[FPB_UNDO_MAX];
+static int g_n_undo_lanes;
+static int g_undo_want_slot = -1, g_undo_want_size, g_undo_saved;
+static void undo_save_hook(A64Buf *b, int size, int vd)
+{
+    if (g_undo_want_slot < 0 || size != g_undo_want_size) return;
+    a64_v_mov(b, g_undo_vreg[g_undo_want_slot], vd);
+    g_undo_want_slot = -1;
+    g_undo_saved = 1;
+}
+static void emit_v_ld_at_(A64Buf *b, int size, int vd, int ra, int32_t disp, int plain);
 static void emit_v_ld_at(A64Buf *b, int size, int vd, int ra, int32_t disp, int plain)
+{
+    emit_v_ld_at_(b, size, vd, ra, disp, plain);
+    undo_save_hook(b, size, vd);
+}
+static void emit_v_ld_at_(A64Buf *b, int size, int vd, int ra, int32_t disp, int plain)
 {
     int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
     if (!plain && vec_tso_relaxed()) plain = 1;
@@ -3570,7 +3590,7 @@ static void emit_v_st_at(A64Buf *b, int size, int vs, int ra, int32_t disp, int 
 }
 static void emit_v_ld_regoff(A64Buf *b, int size, int vd, int ra, int ri, int scaled, int plain)
 {
-    if (plain || vec_tso_relaxed()) { a64_ldr_v_regoff(b, size, vd, ra, ri, scaled); return; }
+    if (plain || vec_tso_relaxed()) { a64_ldr_v_regoff(b, size, vd, ra, ri, scaled); undo_save_hook(b, size, vd); return; }
     int sh = scaled ? (size == 16 ? 4 : size == 8 ? 3 : 2) : 0;
     a64_add_reg(b, 1, JTA, ra, ri, sh);
     emit_v_ld_at(b, size, vd, JTA, 0, 0);
@@ -6325,8 +6345,9 @@ static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, in
     } else if (sr->kind != OCERZ_OPK_XMM || !xmm_is_pinned(sr->reg)) return 0;
     if (in->op >= OCERZ_OP_VFMA_FIRST && in->op <= OCERZ_OP_VFMA_LAST) {
         int idx = (int)(in->op - OCERZ_OP_VFMA_FIRST), kind = (idx >> 1) % 10;
-        if (kind < 2 || !(kind & 1) || !(in->vex & OCERZ_VEX_NDS)) return 0;
+        if (kind < 2 || !(in->vex & OCERZ_VEX_NDS)) return 0;
         *dbl = idx & 1;
+        *packed = !(kind & 1);
         return 1;
     }
     switch (in->op) {
@@ -6661,6 +6682,19 @@ static int fpb2_gpr_after_ok(const X86Insn *in, uint16_t gprs)
 static uint16_t g_fpb_live[JIT_MAX_BLOCK_INSNS];
 static uint16_t g_fpb_stchk[JIT_MAX_BLOCK_INSNS];
 static uint8_t g_fpb_stlane[JIT_MAX_BLOCK_INSNS], g_fpb_stdbl[JIT_MAX_BLOCK_INSNS];
+static uint8_t g_fpb_undo[JIT_MAX_BLOCK_INSNS], g_fpb_undo_size[JIT_MAX_BLOCK_INSNS], g_fpb_undo_done[JIT_MAX_BLOCK_INSNS];
+static uint8_t g_fpb_undo_ld[JIT_MAX_BLOCK_INSNS], g_fpb_undo_ldsz[JIT_MAX_BLOCK_INSNS];
+static int16_t g_fpb_undo_ldst[JIT_MAX_BLOCK_INSNS], g_fpb_undo_from[JIT_MAX_BLOCK_INSNS];
+static void fpb_undo_clear(int i)
+{
+    g_fpb_undo[i] = 0; g_fpb_undo_size[i] = 0; g_fpb_undo_done[i] = 0;
+    g_fpb_undo_ld[i] = 0; g_fpb_undo_ldsz[i] = 0; g_fpb_undo_ldst[i] = -1; g_fpb_undo_from[i] = -1;
+}
+static int mem_same(const X86Operand *a, const X86Operand *b)
+{
+    return !a->riprel && !b->riprel && a->base == b->base && a->index == b->index &&
+           a->scale == b->scale && a->disp == b->disp;
+}
 static uint16_t g_fpb_exit_mask;
 static int g_fpb_exit_batch = -1, g_fpb_exit_end = -1;
 static inline uint16_t fpb2_membits(const X86Operand *m)
@@ -6670,6 +6704,41 @@ static inline uint16_t fpb2_membits(const X86Operand *m)
     if (m->index != OCERZ_REG_NONE) g |= (uint16_t)(1u << (m->index & 15));
     return g;
 }
+static int g_l0_fixed;
+static int lane_reserve(void)
+{
+    int lane = -1;
+    for (int k = L0_NLANES - 1; k >= 0; k--) if (!(g_lane_used & (1u << k))) { lane = k; break; }
+    if (lane < 0) return -1;
+    if (!g_l0_fixed) {
+        if (lane != g_l0_nlanes - 1 || g_l0_nlanes <= 4) return -1;
+        g_l0_nlanes--;
+    }
+    g_lane_used |= (uint16_t)(1u << lane);
+    return 4 + lane;
+}
+static int fpb_undo_lane(int slot)
+{
+    while (slot >= g_n_undo_lanes) {
+        if (g_n_undo_lanes >= FPB_UNDO_MAX) return -1;
+        int v = lane_reserve();
+        if (v < 0) return -1;
+        g_undo_vreg[g_n_undo_lanes++] = (int8_t)v;
+    }
+    return g_undo_vreg[slot];
+}
+static int fpb2_undo_ok(const X86Insn *in, const X86Operand *m, int size)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_FPB_NOUNDO") ? 1 : 0;
+    if (dis || !vec_tso_relaxed() || !mem_fast_forms_ok()) return 0;
+    if (in->seg != OCERZ_SEG_NONE || in->addrsize != 8 || m->riprel) return 0;
+    if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
+    if (m->index != OCERZ_REG_NONE && pin_slot(m->index) < 0) return 0;
+    if (rsp_is_ptr() && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
+    int64_t disp = m->disp;
+    return (disp >= 0 && (disp % size) == 0 && disp / size <= 4095) || (disp >= -256 && disp <= 255);
+}
 static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
 {
     g_n_fpb = 0;
@@ -6678,6 +6747,7 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
     for (int i = 0; i < n; i++) {
         bat[i] = -1; g_fpb_member[i] = 0; g_fpb_det[i] = 0; g_fpb_sidechk[i] = 0;
         g_fpb_stchk[i] = 0; g_fpb_stlane[i] = 0; g_fpb_stdbl[i] = 0; g_fpb_live[i] = 0xffff;
+        fpb_undo_clear(i);
     }
     if (g_fpb_disabled < 0) g_fpb_disabled = getenv("OCERZ_NO_FPBATCH") ? 1 : 0;
     if (g_fpb_disabled || !sse_enabled() || !xmm_global_enabled() || n <= 0) return;
@@ -6712,7 +6782,10 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
         struct { uint8_t s, d, cls; int t; } edges[64]; int n_edges = 0;
         int lastw[16], lastbreak[16]; uint8_t taint_dbl[16];
         for (int r = 0; r < 16; r++) { lastw[r] = -1; lastbreak[r] = -1; taint_dbl[r] = 0; }
-        int loads[64]; int nload = 0;
+        int loads[64], loadsz[64]; int nload = 0;
+        int stores[64]; int nstore = 0;
+        int nundo = 0;
+        int st_at[16], st_cls[16], nst = 0;
         int det_j = -1;
         while (j < n) {
             const X86Insn *in = &insns[j];
@@ -6750,11 +6823,40 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
                 int conflict = 0;
                 for (int q = 0; q < nload; q++)
                     if (mem_may_alias(&insns[loads[q]], &insns[loads[q]].ops[1], in, &in->ops[0])) conflict = 1;
-                if (conflict) break;
+                int usz = lane_only ? (dbl ? 8 : 4) : (in->op == OCERZ_OP_MOVHPS ? 8 : 16);
+                if (conflict) {
+                    if (nundo >= FPB_UNDO_MAX || nstore >= 64 || !fpb2_undo_ok(in, d, usz) || fpb_undo_lane(nundo) < 0) break;
+                    nundo++;
+                    g_fpb_undo[j] = (uint8_t)nundo; g_fpb_undo_size[j] = (uint8_t)usz;
+                    int reuse = -1;
+                    for (int q = nload - 1; q >= 0 && reuse < 0; q--) {
+                        int l = loads[q];
+                        if (loadsz[q] < usz || insns[l].seg != OCERZ_SEG_NONE || insns[l].addrsize != 8 || g_fpb_undo_ld[l]) continue;
+                        if (!mem_same(&insns[l].ops[1], d)) continue;
+                        int ok = 1;
+                        for (int t = 0; t < nstore && ok; t++)
+                            if (stores[t] > l && mem_may_alias(&insns[l], &insns[l].ops[1], &insns[stores[t]], &insns[stores[t]].ops[0])) ok = 0;
+                        if (ok) reuse = q;
+                    }
+                    if (reuse >= 0) {
+                        int l = loads[reuse];
+                        g_fpb_undo_ld[l] = (uint8_t)nundo; g_fpb_undo_ldsz[l] = (uint8_t)loadsz[reuse];
+                        g_fpb_undo_ldst[l] = (int16_t)j; g_fpb_undo_from[j] = (int16_t)l;
+                        cost_extra += 1;
+                    } else {
+                        cost_extra += 2;
+                    }
+                }
+                if (nstore < 64) stores[nstore++] = j;
                 gprs |= fpb2_membits(d);
                 reads = sbit;
                 uint16_t t = (uint16_t)((full | s0 | d0) & sbit);
                 if (t) {
+                    if (nst < 16) {
+                        st_at[nst] = j;
+                        st_cls[nst] = lane_only ? (dbl ? 3 : 2) : (full & sbit) ? 1 : (d0 & sbit) ? 3 : 2;
+                        nst++;
+                    }
                     g_fpb_stchk[j] = sbit;
                     if (lane_only) {
                         g_fpb_stlane[j] = 1; g_fpb_stdbl[j] = (uint8_t)dbl;
@@ -6773,6 +6875,8 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
             } else {
                 if (sr->kind == OCERZ_OPK_MEM) {
                     if (nload >= 64) break;
+                    loadsz[nload] = k == K2_MOVE || k == K2_SHUF ? 16 : k == K2_LMOVE ? (dbl ? 8 : 4) : k == K2_DUP ? 8 :
+                                    k == K2_ARITH ? (packed ? 16 : dbl ? 8 : 4) : 0;
                     loads[nload++] = j;
                     gprs |= fpb2_membits(sr);
                     is_mem = 1;
@@ -6870,11 +6974,11 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
         if (det_j >= 0) j = det_j;
         int end = j - 1;
         if (end < i || n_arith < 1) {
-            for (int q = i; q <= j - 1 && q < n; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; }
+            for (int q = i; q <= j - 1 && q < n; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; fpb_undo_clear(q); }
             i = j > i ? j : i + 1;
             continue;
         }
-        for (int q = end + 1; q < j; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; }
+        for (int q = end + 1; q < j; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; fpb_undo_clear(q); }
         ckpt &= written;
         uint16_t tainted = (uint16_t)(full | s0 | d0);
         uint16_t live = g_fpb_live[end];
@@ -6889,6 +6993,27 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
         uint16_t exitchk = 0;
         if (exit_ok) exitchk = rest; else T |= rest;
         uint16_t Tf = (uint16_t)(full & T), Ts = (uint16_t)(s0 & T), Td = (uint16_t)(d0 & T);
+        for (int q = 0; q < nst && st_at[q] <= end; q++) {
+            int sj = st_at[q];
+            uint16_t sb = g_fpb_stchk[sj];
+            int later = 0;
+            for (int m = sj + 1; m <= end; m++) if (g_fpb_mwr[m] & sb) { later = 1; break; }
+            if (later) continue;
+            if (sj == end && !(T | exitchk)) {
+                if (g_fpb_undo[sj]) {
+                    cost_extra -= g_fpb_undo_from[sj] >= 0 ? 1 : 2;
+                    if (g_fpb_undo_from[sj] >= 0) fpb_undo_clear(g_fpb_undo_from[sj]);
+                    fpb_undo_clear(sj);
+                    nundo--;
+                }
+                continue;
+            }
+            cost_extra -= g_fpb_stlane[sj] ? 2 : 3;
+            sites--;
+            g_fpb_stchk[sj] = 0; g_fpb_stlane[sj] = 0;
+            if (st_cls[q] == 1) Tf |= sb; else if (st_cls[q] == 3) Td |= sb; else Ts |= sb;
+            T |= sb;
+        }
         uint16_t U = (uint16_t)(T | exitchk);
         for (int changed = 1; changed;) {
             changed = 0;
@@ -6917,13 +7042,13 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
             fb->site = NULL; fb->back = NULL;
             for (int q = i; q <= end; q++) { bat[q] = (int8_t)g_n_fpb; g_fpb_member[q] = g_fpb_marith[q]; }
             if (getenv("OCERZ_FPB_DBGPRINT"))
-                fprintf(stderr, "FPB rip=%#llx batch %d [%d..%d] ckpt=%04x written=%04x Tf=%04x Ts=%04x Td=%04x exit=%04x tainted=%04x live=%04x\n",
-                        (unsigned long long)insns[0].rip, g_n_fpb, i, end, ckpt, written, Tf, Ts, Td, exitchk, tainted, live);
+                fprintf(stderr, "FPB rip=%#llx batch %d [%d..%d] ckpt=%04x written=%04x Tf=%04x Ts=%04x Td=%04x exit=%04x tainted=%04x live=%04x undo=%d\n",
+                        (unsigned long long)insns[0].rip, g_n_fpb, i, end, ckpt, written, Tf, Ts, Td, exitchk, tainted, live, nundo);
             if (exitchk) { g_fpb_exit_mask = exitchk; g_fpb_exit_batch = g_n_fpb; g_fpb_exit_end = end; sites++; }
             planned_sites += sites + 1;
             g_n_fpb++;
         } else {
-            for (int q = i; q <= end; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; }
+            for (int q = i; q <= end; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; fpb_undo_clear(q); }
         }
         i = end + 1;
     }
@@ -6938,7 +7063,7 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
 {
     if (fpb_v1() || g_xlat_mode32) {
         g_fpb_exit_mask = 0; g_fpb_exit_batch = -1;
-        for (int i = 0; i < n; i++) { g_fpb_stchk[i] = 0; g_fpb_stlane[i] = 0; }
+        for (int i = 0; i < n; i++) { g_fpb_stchk[i] = 0; g_fpb_stlane[i] = 0; fpb_undo_clear(i); }
         g_fpb_v1_active = 1;
         fpb_scan_v1(insns, n, bat);
         g_fpb_v1_active = 0;
@@ -7050,7 +7175,6 @@ static void fpb_emit_check(A64Buf *b, FpBatch *fb)
 
 static int8_t g_l0[16];
 static uint8_t g_l0_dbl[16];
-#define L0_NLANES 12
 static uint16_t g_l0_owners[L0_NLANES];
 static unsigned g_l0_next;
 
@@ -7223,7 +7347,7 @@ static int l0_alloc2(A64Buf *b, unsigned r, int dbl)
         return t;
     }
     l0_inval(r);
-    int t = 4 + (int)(g_l0_next++ % L0_NLANES);
+    int t = 4 + (int)(g_l0_next++ % g_l0_nlanes);
     g_lane_used |= (uint16_t)(1u << (t - 4));
     uint16_t own = g_l0_owners[t - 4];
     for (int i = 0; i < 16; i++) if (own & (1u << i)) {
@@ -7256,6 +7380,32 @@ static void fpb_emit_store_check(A64Buf *b, int i, int batch)
     }
     for (unsigned r = 0; r < 16; r++) if (m & (1u << r)) l0_flush_reg(b, r);
     fpb_emit_regs_check(b, m, batch, i - 1, g_l0, g_l0_dbl);
+}
+static void fpb_emit_undo_save(A64Buf *b, const X86Insn *insn, int i, uint32_t **exit_sites, int *n_exits)
+{
+    int size = g_fpb_undo_size[i];
+    int vr = g_undo_vreg[g_fpb_undo[i] - 1];
+    if (emit_plain_mem_fast(b, insn, &insn->ops[0], size, vr, 0, 1)) return;
+    uint32_t *skip;
+    if (!emit_sse_mem_addr(b, insn, &insn->ops[0], size, exit_sites, n_exits, &skip)) {
+        g_fpb_undo[i] = 0;
+        return;
+    }
+    emit_sse_mem_ld(b, size, vr);
+    patch_guard_skip(skip, a64_label(b));
+}
+static void fpb_emit_undo_restore(A64Buf *b, const X86Insn *insns, int first, int end, uint32_t **exit_sites, int *n_exits)
+{
+    for (int m = end; m >= first; m--) {
+        if (!g_fpb_undo[m]) continue;
+        int size = g_fpb_undo_size[m];
+        int vr = g_undo_vreg[g_fpb_undo[m] - 1];
+        if (emit_plain_mem_fast(b, &insns[m], &insns[m].ops[0], size, vr, 1, 1)) continue;
+        uint32_t *skip;
+        if (!emit_sse_mem_addr(b, &insns[m], &insns[m].ops[0], size, exit_sites, n_exits, &skip)) continue;
+        emit_sse_mem_st(b, size, vr);
+        patch_guard_skip(skip, a64_label(b));
+    }
 }
 static void fpb_emit_exit_check(A64Buf *b)
 {
@@ -7344,7 +7494,7 @@ static int l0_fixed_setup(A64Buf *b, const X86Insn *insns, int n)
     for (int r = 0; r < 16; r++)
         key[r] = cnt[r] >= 2 ? cnt[r] + (wfirst[r] == 2 ? 0 : 1000) : 0;
     int lanes = 0;
-    for (int k = 0; k < L0_NLANES; k++) {
+    for (int k = 0; k < g_l0_nlanes; k++) {
         int best = -1;
         for (int r = 0; r < 16; r++)
             if (g_l0_fixed_lane[r] < 0 && key[r] > 0 && (best < 0 || key[r] > key[best])) best = r;
@@ -7377,7 +7527,7 @@ static int yc_setup(A64Buf *b, const X86Insn *insns, int n)
             if (in->ops[k].kind == OCERZ_OPK_XMM && in->ops[k].reg < 16) cnt[in->ops[k].reg]++;
         if (in->vex & OCERZ_VEX_NDS) cnt[in->vvvv & 15]++;
     }
-    uint16_t used = 0;
+    uint16_t used = g_lane_used;
     for (int r = 0; r < 16; r++) if (g_l0_fixed_lane[r] >= 0) used |= (uint16_t)(1u << (g_l0_fixed_lane[r] - 4));
     int got = 0;
     for (;;) {
@@ -7386,7 +7536,7 @@ static int yc_setup(A64Buf *b, const X86Insn *insns, int n)
             if (g_yc[r] < 0 && cnt[r] > 0 && (best < 0 || cnt[r] > cnt[best])) best = r;
         if (best < 0) break;
         int lane = -1;
-        for (int k = L0_NLANES - 1; k >= 0; k--) if (!(used & (1u << k))) { lane = k; break; }
+        for (int k = g_l0_nlanes - 1; k >= 0; k--) if (!(used & (1u << k))) { lane = k; break; }
         if (lane < 0) break;
         used |= (uint16_t)(1u << lane);
         g_lane_used |= (uint16_t)(1u << lane);
@@ -8758,6 +8908,8 @@ static void emit_ymmh_clear(A64Buf *b, unsigned xr)
     if (g_yc[xr] >= 0) {
         a64_v_zero(b, g_yc[xr]);
         g_yc_dirty |= (uint16_t)(1u << xr);
+    } else if (g_zero_vreg >= 0) {
+        a64_str_v(b, 16, g_zero_vreg, 20, YMMH_OFF + xr * 16);
     } else {
         a64_str(b, 8, A64_ZR, 20, YMMH_OFF + xr * 16);
         a64_str(b, 8, A64_ZR, 20, YMMH_OFF + xr * 16 + 8);
@@ -9481,6 +9633,11 @@ static int emit_vex_fma(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
     }
     if (negadd) a64_v_fneg(b, pd, r, c); else a64_v_mov(b, r, c);
     if (negmul) a64_v_fmls(b, pd, r, a, m); else a64_v_fmla(b, pd, r, a, m);
+    if (!L && (inexact_nan_env() || g_fpb_fast)) {
+        a64_v_mov(b, o1, r);
+        emit_ymmh_clear(b, d->reg);
+        return 1;
+    }
     uint32_t *site;
     a64_v_fcmeq(b, pd, t, r, r);
     if (L) {
@@ -13541,9 +13698,22 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_loop_entry = NULL;
     g_l0_fixed = 0;
     g_lane_used = 0;
+    g_n_undo_lanes = 0;
+    g_l0_nlanes = L0_NLANES;
+    g_zero_vreg = -1;
     memset(g_yc, -1, sizeof g_yc);
     g_yc_dirty = 0;
     memset(g_l0_fixed_lane, -1, sizeof g_l0_fixed_lane);
+    {
+        static int nozero = -1;
+        if (nozero < 0) nozero = getenv("OCERZ_NO_ZEROREG") ? 1 : 0;
+        int nv = 0;
+        for (int i = 0; i < n; i++) {
+            const X86Insn *in = &blk->insns[i];
+            if (in->vex && !(in->vex & OCERZ_VEX_L) && !in->mode32 && in->nops > 0 && in->ops[0].kind == OCERZ_OPK_XMM) nv++;
+        }
+        if (!nozero && nv >= 2 && !g_xlat_mode32) g_zero_vreg = lane_reserve();
+    }
     g_stop_patch = NULL;
     g_n_stop_extra = 0;
     g_n_push_fix = 0;
@@ -13837,6 +14007,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                       t->nops == 1 && t->ops[0].kind == OCERZ_OPK_IMM && t->ops[0].imm == rip;
           static int nofix = -1;
           if (nofix < 0) nofix = getenv("OCERZ_NO_L0FIXED") ? 1 : 0;
+          if (g_zero_vreg >= 0) a64_v_zero(&b, g_zero_vreg);
           if (!nofix && selfl && !g_no_chain && !g_xlat_mode32 && l0_enabled() &&
               sse_enabled() && xmm_global_enabled() && !g_no_regflags)
               l0_fixed_setup(&b, blk->insns, n);
@@ -14488,12 +14659,17 @@ promo_push_fallthrough:
             continue;
         }
         if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_stchk[i]) fpb_emit_store_check(&b, i, fpb_open);
+        if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_undo[i] && !g_fpb_undo_done[i]) fpb_emit_undo_save(&b, insn, i, exit_sites, &n_exits);
+        g_undo_want_slot = -1; g_undo_saved = 0;
+        if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_undo_ld[i]) { g_undo_want_slot = g_fpb_undo_ld[i] - 1; g_undo_want_size = g_fpb_undo_ldsz[i]; }
         if (!try_inline(&b, insn, fl_need[i], exit_sites, &n_exits)) {
             emit_slowcall(&b, insn, exit_sites, &n_exits);
             blk->n_slow++;
         } else {
             blk->n_inlined++;
         }
+        if (g_undo_saved && g_fpb_undo_ldst[i] >= 0) g_fpb_undo_done[g_fpb_undo_ldst[i]] = 1;
+        g_undo_want_slot = -1; g_undo_saved = 0;
     }
 
     if (fpb_open >= 0) {
@@ -14623,6 +14799,7 @@ promo_push_fallthrough:
         g_fpb_open = -1;
         l0_reset();
         ea_cache_reset();
+        fpb_emit_undo_restore(&b, blk->insns, fb->first, fb->end, exit_sites, &n_exits);
         for (int m = fb->first; m <= fb->end; m++) {
             if (blk->insns[m].op == OCERZ_OP_JCC) continue;
             g_cur_insn_idx = m;
@@ -14665,6 +14842,7 @@ promo_push_fallthrough:
         g_fpb_open = -1;
         l0_reset();
         ea_cache_reset();
+        fpb_emit_undo_restore(&b, blk->insns, fb->first, st->end, exit_sites, &n_exits);
         for (int m = fb->first; m <= st->end; m++) {
             if (blk->insns[m].op == OCERZ_OP_JCC) continue;
             g_cur_insn_idx = m;
