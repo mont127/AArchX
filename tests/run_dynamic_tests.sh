@@ -459,6 +459,20 @@ run_file_case dthread_signal tests/dynamic/thread_signal.c 'OK'
 run_file_case dshmem_coherence tests/dynamic/shmem_coherence.c 'OK'
 run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
 run_file_case dlane_fault_guard tests/dynamic/lane_fault_guard.c 'OK' -Wl,-no_pie
+run_file_case dlow_avx2_ops tests/dynamic/avx2_ops.c 'OK' -Wl,-no_pie
+run_file_case dlow_avx_fma tests/dynamic/avx_fma.c 'OK' -Wl,-no_pie
+run_file_case dlow_avx_fp tests/dynamic/avx_fp.c 'OK' -Wl,-no_pie
+run_file_case dlow_bmi_ops tests/dynamic/bmi_ops.c 'OK' -Wl,-no_pie
+run_file_case dlow_ymm_state tests/dynamic/ymm_state.c 'OK' -Wl,-no_pie
+run_file_case dlow_atomic_counter tests/dynamic/atomic_counter.c 'OK' -Wl,-no_pie
+run_file_case dlow_byte_atomics tests/dynamic/byte_atomics.c 'OK' -Wl,-no_pie
+run_file_case dlow_fp_rounding tests/dynamic/fp_rounding.c 'OK' -Wl,-no_pie
+run_file_case dlow_thread_signal tests/dynamic/thread_signal.c 'OK' -Wl,-no_pie
+run_file_case dlow_signal_redzone tests/dynamic/signal_redzone.c 'OK' -Wl,-no_pie
+run_file_case dlow_unaligned_atomics tests/dynamic/unaligned_atomics.c 'OK' -Wl,-no_pie
+run_file_case dlow_smc_io tests/dynamic/smc_io.c 'OK' -Wl,-no_pie
+run_file_case dlow_rel_acq_order tests/dynamic/rel_acq_order.c 'OK' -Wl,-no_pie
+run_file_case dlow_fork_signal tests/dynamic/fork_signal.c 'fork signal ok' -Wl,-no_pie
 run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
 run_file_case dsmc_high tests/dynamic/smc_high.c 'OK'
 run_file_case dbyte_atomics tests/dynamic/byte_atomics.c 'OK'

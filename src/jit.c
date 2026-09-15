@@ -970,6 +970,7 @@ static void emit_reload_jgb(A64Buf *b)
         a64_mov_imm64(b, JGB, ocerz_guest_base);
 }
 static void emit_reload_mem_base(A64Buf *b);
+static void emit_guard_consts(A64Buf *b);
 
 static struct {
     uint64_t target_rip;
@@ -1738,6 +1739,7 @@ static void emit_materialize(A64Buf *b)
     emit_fill_pinned_callersaved(b);
     emit_reload_jgb(b);
     emit_reload_mem_base(b);
+    emit_guard_consts(b);
     emit_xmm_pin_load_all(b);
     a64_patch_cbz(skip, a64_label(b));
 }
@@ -3203,6 +3205,20 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     return 1;
 }
 
+static int guard_consts_ok(void)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_GUARD_CONSTS") ? 1 : 0;
+    return !dis && ocerz_low_base != 0 && g_mem_hoist_greg < 0 && g_mem_hoist_greg2 < 0 &&
+           g_mem_hoist_greg3 < 0 && g_mem_hoist_aux_index < 0;
+}
+static void emit_guard_consts(A64Buf *b)
+{
+    if (!guard_consts_ok()) return;
+    a64_mov_imm64(b, JMEMBASE2, OCERZ_LOW_LIMIT + ea_fold());
+    a64_mov_imm64(b, JMEMBASE, ocerz_low_base - ocerz_guest_base);
+    a64_mov_imm64(b, JMEMAUX, OCERZ_TOP_LO - OCERZ_LOW_LIMIT);
+}
 static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
                                      int addr_reg, uint32_t **exit_sites, int *n_exits)
 {
@@ -3211,8 +3227,17 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         return NULL;
 
     uint64_t fold = ea_fold();
-    uint32_t *to_native = NULL;
-    if (ocerz_low_base) {
+    uint32_t *to_native = NULL, *is_low = NULL;
+    int consts = guard_consts_ok();
+    if (consts) {
+        a64_subs_reg(b, 1, A64_ZR, addr_reg, JMEMBASE2, 0);
+        is_low = a64_label(b);
+        a64_bcond(b, A64_CC, 0);
+        a64_sub_reg(b, 1, JTT, addr_reg, JMEMBASE2, 0);
+        a64_subs_reg(b, 1, A64_ZR, JTT, JMEMAUX, 0);
+        to_native = a64_label(b);
+        a64_bcond(b, A64_CC, 0);
+    } else if (ocerz_low_base) {
         a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT + fold);
         a64_sub_reg(b, 1, JTT, addr_reg, JTU, 0);
         a64_mov_imm64(b, JTU, OCERZ_TOP_LO - OCERZ_LOW_LIMIT);
@@ -3234,16 +3259,24 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         a64_b(b, 0);
         a64_patch_bcond(not_cp, a64_label(b));
     }
-    if (ocerz_low_base) {
-        a64_mov_imm64(b, JTU, OCERZ_TOP_LO + fold);
-        a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
-        uint32_t *is_low = a64_label(b);
-        a64_bcond(b, A64_CC, 0);
+    if (consts) {
         a64_mov_imm64(b, JTU, ocerz_top_base - OCERZ_TOP_LO - ocerz_guest_base);
         a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
         uint32_t *done_top = a64_label(b);
         a64_b(b, 0);
         a64_patch_bcond(is_low, a64_label(b));
+        a64_add_reg(b, 1, addr_reg, addr_reg, JMEMBASE, 0);
+        a64_patch_b(done_top, a64_label(b));
+    } else if (ocerz_low_base) {
+        a64_mov_imm64(b, JTU, OCERZ_TOP_LO + fold);
+        a64_subs_reg(b, 1, A64_ZR, addr_reg, JTU, 0);
+        uint32_t *is_low2 = a64_label(b);
+        a64_bcond(b, A64_CC, 0);
+        a64_mov_imm64(b, JTU, ocerz_top_base - OCERZ_TOP_LO - ocerz_guest_base);
+        a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
+        uint32_t *done_top = a64_label(b);
+        a64_b(b, 0);
+        a64_patch_bcond(is_low2, a64_label(b));
         a64_mov_imm64(b, JTU, ocerz_low_base - ocerz_guest_base);
         a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
         a64_patch_b(done_top, a64_label(b));
@@ -12676,6 +12709,7 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     (*n_exits)++;
     emit_reload_jgb(b);
     emit_reload_mem_base(b);
+    emit_guard_consts(b);
     if (g_pe_insns && g_n_promo_real && pin_slot(OCERZ_RSP) >= 0) {
         int hsp = pin_hreg(pin_slot(OCERZ_RSP));
         for (int i = 0; i < g_n_promo_real; i++) {
@@ -14085,6 +14119,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         g_body_entry = a64_label(&b);
         emit_reload_mem_base(&b);
         body_noreload = a64_label(&b);
+        emit_guard_consts(&b);
         {
             static int bt = -1;
             if (bt < 0) bt = getenv("OCERZ_BTRACE") ? 1 : 0;
