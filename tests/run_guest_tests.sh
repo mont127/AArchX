@@ -178,6 +178,21 @@ for name in jit_rmw jit_scan jit_ops jit_bt jit_align jit_align2 jit_movq jit_ss
     fi
 done
 
+for name in fpb_loop_nan fp_loop_nan fpb_defer_nan cvt_nan_batch simd_misc_jit avx_fp_jit avx_cmpblend_jit jit_sse jit_sse2 nan_rules; do
+    bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
+    [ -x "$bin" ] && [ -f "$golden" ] || continue
+    export OCERZ_FPB_FORCEREPLAY=1
+    run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$bin"
+    rc=$?
+    unset OCERZ_FPB_FORCEREPLAY
+    if [ "$rc" -eq 0 ] && cmp -s "$ACTUAL_OUT" "$golden"; then
+        echo "PASS $name (forced replay)"; PASS=$((PASS + 1))
+    else
+        echo "FAIL $name (forced replay: rc=$rc)"; FAIL=$((FAIL + 1))
+        diff "$golden" "$ACTUAL_OUT" | head -20 | sed 's/^/  | /' >&2
+    fi
+done
+
 for name in branches jit_ops jit_misc2 fib strings; do
     bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
     [ -x "$bin" ] && [ -f "$golden" ] || continue
