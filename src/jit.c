@@ -6182,7 +6182,7 @@ typedef struct {
     int batch, end;
     uint32_t *site, *back;
     int8_t l0[16]; uint8_t l0_dbl[16];
-    int8_t fcmp_a, fcmp_b; uint8_t fcmp_dbl;
+    int8_t fcmp_a, fcmp_b; uint8_t fcmp_dbl; uint8_t keep_jt;
 } FpbSite;
 static FpbSite g_fpb_sites[FPB_SITES_MAX];
 static int g_n_fpb_sites;
@@ -6340,7 +6340,7 @@ static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, in
     }
 }
 
-static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
+static void fpb_scan_v1(const X86Insn *insns, int n, int8_t *bat)
 {
     g_n_fpb = 0;
     g_n_fpb_sites = 0;
@@ -6545,6 +6545,326 @@ static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
     }
 }
 
+
+enum { K2_END = 0, K2_ARITH, K2_MOVE, K2_LMOVE, K2_STORE, K2_ZERO, K2_UNPCKH, K2_UNPCKL, K2_DUP, K2_DET };
+static int fpb2_kind(const X86Insn *in, int *packed, int *dbl, int *from_mem, int *sq, int *lane_only)
+{
+    *lane_only = 0;
+    int c = fpb_class(in, packed, dbl, from_mem, sq);
+    if (c == 1) return K2_ARITH;
+    if (c == 2) return K2_MOVE;
+    if (c == 3) return K2_LMOVE;
+    if (in->vex || in->seg != OCERZ_SEG_NONE || in->nops < 2) return K2_END;
+    const X86Operand *d = &in->ops[0], *s = &in->ops[1];
+    int dx = d->kind == OCERZ_OPK_XMM && xmm_is_pinned(d->reg);
+    int sx = s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg);
+    int dm = d->kind == OCERZ_OPK_MEM && in->addrsize == 8;
+    switch (in->op) {
+    case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU:
+        return dm && sx ? K2_STORE : K2_END;
+    case OCERZ_OP_MOVSDX: *dbl = 1; *lane_only = 1; return dm && sx ? K2_STORE : K2_END;
+    case OCERZ_OP_MOVSS: *lane_only = 1; return dm && sx ? K2_STORE : K2_END;
+    case OCERZ_OP_MOVLPS: *dbl = 1; *lane_only = 1; return dm && sx ? K2_STORE : K2_END;
+    case OCERZ_OP_MOVHPS: return dm && sx ? K2_STORE : K2_END;
+    case OCERZ_OP_XORPS: case OCERZ_OP_PXOR:
+        return dx && sx && d->reg == s->reg ? K2_ZERO : K2_END;
+    case OCERZ_OP_UNPCKHPD: return dx && sx ? K2_UNPCKH : K2_END;
+    case OCERZ_OP_UNPCKLPD: return dx && sx ? K2_UNPCKL : K2_END;
+    case OCERZ_OP_MOVDDUP: return dx && sx ? K2_DUP : K2_END;
+    case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISD: case OCERZ_OP_UCOMISS: case OCERZ_OP_COMISS:
+        return dx && sx ? K2_DET : K2_END;
+    default: return K2_END;
+    }
+}
+static void fpb2_usedef(const X86Insn *in, uint16_t *use, uint16_t *kill)
+{
+    uint16_t u = 0, k = 0;
+    for (int q = 0; q < in->nops; q++)
+        if (in->ops[q].kind == OCERZ_OPK_XMM && in->ops[q].reg < 16) u |= (uint16_t)(1u << in->ops[q].reg);
+    if (in->vex) {
+        if (in->vex & OCERZ_VEX_NDS) u |= (uint16_t)(1u << (in->vvvv & 15));
+        *use = u; *kill = 0;
+        return;
+    }
+    const X86Operand *d = &in->ops[0], *s = in->nops > 1 ? &in->ops[1] : NULL;
+    int dx = in->nops > 0 && d->kind == OCERZ_OPK_XMM && d->reg < 16;
+    switch (in->op) {
+    case OCERZ_OP_MOVUPS: case OCERZ_OP_MOVAPS: case OCERZ_OP_MOVDQA: case OCERZ_OP_MOVDQU: case OCERZ_OP_MOVDDUP:
+        if (dx) { k = (uint16_t)(1u << d->reg); u &= (uint16_t)~k; }
+        break;
+    case OCERZ_OP_MOVSS: case OCERZ_OP_MOVSDX:
+        if (dx && s && s->kind == OCERZ_OPK_MEM) { k = (uint16_t)(1u << d->reg); u &= (uint16_t)~k; }
+        break;
+    case OCERZ_OP_XORPS: case OCERZ_OP_PXOR:
+        if (dx && s && s->kind == OCERZ_OPK_XMM && s->reg == d->reg) { k = (uint16_t)(1u << d->reg); u = 0; }
+        break;
+    default: break;
+    }
+    *use = u; *kill = k;
+}
+static int fpb2_gpr_after_ok(const X86Insn *in, uint16_t gprs)
+{
+    switch (in->op) {
+    case OCERZ_OP_JCC: case OCERZ_OP_JMP: case OCERZ_OP_NOP: case OCERZ_OP_CMP: case OCERZ_OP_TEST:
+        return in->nops == 0 || in->ops[0].kind != OCERZ_OPK_MEM || in->op == OCERZ_OP_CMP || in->op == OCERZ_OP_TEST;
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_INC: case OCERZ_OP_DEC: case OCERZ_OP_AND: case OCERZ_OP_OR:
+    case OCERZ_OP_XOR: case OCERZ_OP_LEA: case OCERZ_OP_MOV: case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR:
+    case OCERZ_OP_NEG: case OCERZ_OP_NOT: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: case OCERZ_OP_CMOVCC: case OCERZ_OP_SETCC:
+        if (in->nops < 1 || in->ops[0].kind != OCERZ_OPK_REG) return 0;
+        return !(gprs & (1u << (in->ops[0].reg & 15)));
+    default: return 0;
+    }
+}
+static uint16_t g_fpb_live[JIT_MAX_BLOCK_INSNS];
+static uint16_t g_fpb_stchk[JIT_MAX_BLOCK_INSNS];
+static uint8_t g_fpb_stlane[JIT_MAX_BLOCK_INSNS], g_fpb_stdbl[JIT_MAX_BLOCK_INSNS];
+static uint16_t g_fpb_exit_mask;
+static int g_fpb_exit_batch = -1, g_fpb_exit_end = -1;
+static inline uint16_t fpb2_membits(const X86Operand *m)
+{
+    uint16_t g = 0;
+    if (m->base != OCERZ_REG_NONE) g |= (uint16_t)(1u << (m->base & 15));
+    if (m->index != OCERZ_REG_NONE) g |= (uint16_t)(1u << (m->index & 15));
+    return g;
+}
+static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
+{
+    g_n_fpb = 0;
+    g_n_fpb_sites = 0;
+    g_fpb_exit_mask = 0; g_fpb_exit_batch = -1; g_fpb_exit_end = -1;
+    for (int i = 0; i < n; i++) {
+        bat[i] = -1; g_fpb_member[i] = 0; g_fpb_det[i] = 0; g_fpb_sidechk[i] = 0;
+        g_fpb_stchk[i] = 0; g_fpb_stlane[i] = 0; g_fpb_stdbl[i] = 0; g_fpb_live[i] = 0xffff;
+    }
+    if (g_fpb_disabled < 0) g_fpb_disabled = getenv("OCERZ_NO_FPBATCH") ? 1 : 0;
+    if (g_fpb_disabled || !sse_enabled() || !xmm_global_enabled() || n <= 0) return;
+    int selfloop = (insns[n - 1].op == OCERZ_OP_JCC || insns[n - 1].op == OCERZ_OP_JMP) && insns[n - 1].nops == 1 &&
+                   insns[n - 1].ops[0].kind == OCERZ_OPK_IMM && insns[n - 1].ops[0].imm == insns[0].rip;
+    static uint16_t use[JIT_MAX_BLOCK_INSNS], kill[JIT_MAX_BLOCK_INSNS], wr[JIT_MAX_BLOCK_INSNS];
+    for (int i = 0; i < n; i++) {
+        fpb2_usedef(&insns[i], &use[i], &kill[i]);
+        wr[i] = insns[i].nops > 0 && insns[i].ops[0].kind == OCERZ_OPK_XMM && insns[i].ops[0].reg < 16
+                ? (uint16_t)(1u << insns[i].ops[0].reg) : 0;
+        if (insns[i].op == OCERZ_OP_JCC && !(selfloop && i == n - 1)) use[i] = 0xffff;
+    }
+    uint16_t live_in0 = 0;
+    for (int pass = 0; pass < 4; pass++) {
+        uint16_t cur = selfloop ? live_in0 : 0xffff;
+        for (int i = n - 1; i >= 0; i--) {
+            g_fpb_live[i] = cur;
+            cur = (uint16_t)(use[i] | (cur & ~kill[i]));
+        }
+        if (!selfloop || cur == live_in0) break;
+        live_in0 = cur;
+    }
+    int planned_sites = 0;
+    int i = 0;
+    while (i < n) {
+        int packed, dbl, from_mem, sq, lane_only;
+        int k0 = fpb2_kind(&insns[i], &packed, &dbl, &from_mem, &sq, &lane_only);
+        if (k0 != K2_ARITH && k0 != K2_MOVE && k0 != K2_LMOVE) { i++; continue; }
+        int j = i;
+        uint16_t written = 0, ckpt = 0, full = 0, s0 = 0, d0 = 0, gprs = 0;
+        int gain = 0, n_arith = 0, cost_extra = 0, sites = 0;
+        struct { uint8_t s, d, cls; int t; } edges[64]; int n_edges = 0;
+        int lastw[16], lastbreak[16]; uint8_t taint_dbl[16];
+        for (int r = 0; r < 16; r++) { lastw[r] = -1; lastbreak[r] = -1; taint_dbl[r] = 0; }
+        int loads[64]; int nload = 0;
+        int det_j = -1;
+        while (j < n) {
+            const X86Insn *in = &insns[j];
+            int k = fpb2_kind(in, &packed, &dbl, &from_mem, &sq, &lane_only);
+            if (det_j >= 0) {
+                if (in->op == OCERZ_OP_JCC && j < n - 1 && in->ops[0].kind == OCERZ_OPK_IMM &&
+                    in->ops[0].imm != insns[0].rip && comis_fuse_producer(insns, j) == det_j) {
+                    g_fpb_det[det_j] = 1;
+                    g_fpb_sidechk[j] = (uint16_t)(full | s0 | d0);
+                    g_fpb_mrd[j] = 0; g_fpb_mwr[j] = 0; g_fpb_mmem[j] = 0; g_fpb_marith[j] = 0;
+                    sites += 2;
+                    det_j = -1; j++;
+                    continue;
+                }
+                j = det_j;
+                break;
+            }
+            if (k == K2_END) break;
+            if (planned_sites + sites + 4 >= FPB_SITES_MAX) break;
+            const X86Operand *d = &in->ops[0], *sr = &in->ops[1];
+            unsigned dr = d->kind == OCERZ_OPK_XMM ? d->reg : 16, srr = sr->kind == OCERZ_OPK_XMM ? sr->reg : 16;
+            uint16_t sbit = srr < 16 ? (uint16_t)(1u << srr) : 0, dbit = dr < 16 ? (uint16_t)(1u << dr) : 0;
+            uint16_t reads = 0, writes = 0;
+            int is_mem = 0;
+            if (k == K2_STORE) {
+                int conflict = 0;
+                for (int q = 0; q < nload; q++)
+                    if (mem_may_alias(&insns[loads[q]], &insns[loads[q]].ops[1], in, &in->ops[0])) conflict = 1;
+                if (conflict) break;
+                gprs |= fpb2_membits(d);
+                reads = sbit;
+                uint16_t t = (uint16_t)((full | s0 | d0) & sbit);
+                if (t) {
+                    g_fpb_stchk[j] = sbit;
+                    if (lane_only && !(full & sbit)) {
+                        g_fpb_stlane[j] = 1; g_fpb_stdbl[j] = (uint8_t)((d0 & sbit) != 0);
+                        cost_extra += 2;
+                    } else {
+                        cost_extra += 3;
+                        full &= (uint16_t)~sbit;
+                    }
+                    d0 &= (uint16_t)~sbit; s0 &= (uint16_t)~sbit;
+                    sites++;
+                }
+            } else if (k == K2_DET) {
+                if (j + 1 >= n) break;
+                reads = (uint16_t)(sbit | dbit);
+                det_j = j;
+            } else {
+                if (sr->kind == OCERZ_OPK_MEM) {
+                    if (nload >= 64) break;
+                    loads[nload++] = j;
+                    gprs |= fpb2_membits(sr);
+                    is_mem = 1;
+                }
+                switch (k) {
+                case K2_ARITH: {
+                    int is_mm = in->op == OCERZ_OP_MAXSS || in->op == OCERZ_OP_MINSS || in->op == OCERZ_OP_MAXSD || in->op == OCERZ_OP_MINSD ||
+                                in->op == OCERZ_OP_MAXPS || in->op == OCERZ_OP_MINPS || in->op == OCERZ_OP_MAXPD || in->op == OCERZ_OP_MINPD;
+                    if (srr < 16 && srr != dr && !is_mm && n_edges < 64) {
+                        if (packed && (full & sbit) && taint_dbl[srr] == (uint8_t)dbl) { edges[n_edges].s = (uint8_t)srr; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 0; n_edges++; }
+                        if (!dbl && (s0 & sbit) && n_edges < 64) { edges[n_edges].s = (uint8_t)srr; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 1; n_edges++; }
+                        if (dbl && (d0 & sbit) && n_edges < 64)  { edges[n_edges].s = (uint8_t)srr; edges[n_edges].d = (uint8_t)dr; edges[n_edges].t = j; edges[n_edges].cls = 2; n_edges++; }
+                    }
+                    taint_dbl[dr] = (uint8_t)dbl;
+                    if (is_mm || (sq && srr != dr)) lastbreak[dr] = j;
+                    reads = (uint16_t)(sbit | dbit); writes = dbit;
+                    if (packed) { full |= dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; }
+                    else if (dbl) { d0 |= dbit; s0 &= (uint16_t)~dbit; }
+                    else          { s0 |= dbit; d0 &= (uint16_t)~dbit; }
+                    if (!is_mm) { gain += packed ? 6 : 2; n_arith++; }
+                    break;
+                }
+                case K2_MOVE:
+                    reads = sbit; writes = dbit; lastbreak[dr] = j;
+                    if (from_mem) { full &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; }
+                    else {
+                        full = (uint16_t)((full & ~dbit) | ((full & sbit) ? dbit : 0));
+                        s0   = (uint16_t)((s0   & ~dbit) | ((s0   & sbit) ? dbit : 0));
+                        d0   = (uint16_t)((d0   & ~dbit) | ((d0   & sbit) ? dbit : 0));
+                        taint_dbl[dr] = taint_dbl[srr];
+                    }
+                    break;
+                case K2_LMOVE:
+                    reads = (uint16_t)(sbit | (from_mem ? 0 : dbit)); writes = dbit; lastbreak[dr] = j;
+                    if (from_mem) { full &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; }
+                    else {
+                        if (full & sbit) full |= dbit;
+                        if (dbl) { if ((d0 | full) & sbit) d0 |= dbit; else d0 &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; }
+                        else     { if ((s0 | full) & sbit) s0 |= dbit; else s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; }
+                        taint_dbl[dr] = (uint8_t)dbl;
+                    }
+                    break;
+                case K2_ZERO:
+                    writes = dbit; lastbreak[dr] = j;
+                    full &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit;
+                    break;
+                case K2_UNPCKH:
+                    reads = (uint16_t)(sbit | dbit); writes = dbit; lastbreak[dr] = j;
+                    if ((full & sbit) || (full & dbit)) { full |= dbit; d0 &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; }
+                    else { full &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; }
+                    break;
+                case K2_UNPCKL:
+                    reads = (uint16_t)(sbit | dbit); writes = dbit; lastbreak[dr] = j;
+                    if ((full | d0 | s0) & sbit) { full |= dbit; d0 &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; }
+                    break;
+                case K2_DUP:
+                    reads = sbit; writes = dbit; lastbreak[dr] = j;
+                    if ((full | d0 | s0) & sbit) { full |= dbit; d0 &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; }
+                    else { full &= (uint16_t)~dbit; d0 &= (uint16_t)~dbit; s0 &= (uint16_t)~dbit; }
+                    break;
+                default: break;
+                }
+                if (dr < 16) lastw[dr] = j;
+            }
+            ckpt |= (uint16_t)(reads & ~written);
+            written |= writes;
+            g_fpb_mrd[j] = reads; g_fpb_mwr[j] = writes;
+            g_fpb_mmem[j] = (uint8_t)is_mem; g_fpb_marith[j] = (uint8_t)(k == K2_ARITH);
+            j++;
+        }
+        if (det_j >= 0) j = det_j;
+        int end = j - 1;
+        if (end < i || n_arith < 1) {
+            for (int q = i; q <= j - 1 && q < n; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; }
+            i = j > i ? j : i + 1;
+            continue;
+        }
+        for (int q = end + 1; q < j; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; }
+        ckpt &= written;
+        uint16_t tainted = (uint16_t)(full | s0 | d0);
+        uint16_t live = g_fpb_live[end];
+        uint16_t wr_after = 0;
+        int exit_ok = selfloop;
+        for (int m = end + 1; m < n; m++) {
+            wr_after |= wr[m];
+            if (exit_ok && !fpb2_gpr_after_ok(&insns[m], gprs)) exit_ok = 0;
+        }
+        uint16_t T = (uint16_t)(tainted & live);
+        uint16_t rest = (uint16_t)(tainted & ~T & ~wr_after);
+        uint16_t exitchk = 0;
+        if (exit_ok) exitchk = rest; else T |= rest;
+        uint16_t Tf = (uint16_t)(full & T), Ts = (uint16_t)(s0 & T), Td = (uint16_t)(d0 & T);
+        uint16_t U = (uint16_t)(T | exitchk);
+        for (int changed = 1; changed;) {
+            changed = 0;
+            for (int e = 0; e < n_edges; e++) {
+                int S = edges[e].s, D = edges[e].d, t = edges[e].t;
+                if (S == D || t > end) continue;
+                if (lastbreak[D] > t || lastw[S] > t) continue;
+                if (!(U & (1u << D))) continue;
+                if (edges[e].cls == 0) { if (Tf & (1u << S)) { Tf &= (uint16_t)~(1u << S); changed = 1; } }
+                else if (edges[e].cls == 1) { if ((Ts & (1u << S)) && !(Tf & (1u << S))) { Ts &= (uint16_t)~(1u << S); changed = 1; } }
+                else { if ((Td & (1u << S)) && !(Tf & (1u << S))) { Td &= (uint16_t)~(1u << S); changed = 1; } }
+                if (exitchk & (1u << S)) {
+                    if (edges[e].cls == 0 || !(full & (1u << S))) { exitchk &= (uint16_t)~(1u << S); changed = 1; }
+                }
+                U = (uint16_t)(Tf | Ts | Td | exitchk);
+            }
+        }
+        int nregs = __builtin_popcount((unsigned)(Tf | Ts | Td));
+        int cost = __builtin_popcount((unsigned)ckpt) + (nregs ? 3 + nregs : 0) + cost_extra;
+        if (gain > cost && g_n_fpb < FPB_MAX && planned_sites + sites + 2 < FPB_SITES_MAX) {
+            FpBatch *fb = &g_fpb[g_n_fpb];
+            fb->first = i; fb->last = end; fb->end = end;
+            fb->ckpt = ckpt; fb->ckpt_emit = ckpt; fb->written = written; fb->dirty_open = 0;
+            fb->full = Tf; fb->s0 = Ts; fb->d0 = Td; fb->gain = gain - cost;
+            fb->site = NULL; fb->back = NULL;
+            for (int q = i; q <= end; q++) { bat[q] = (int8_t)g_n_fpb; g_fpb_member[q] = g_fpb_marith[q]; }
+            if (exitchk) { g_fpb_exit_mask = exitchk; g_fpb_exit_batch = g_n_fpb; g_fpb_exit_end = end; sites++; }
+            planned_sites += sites + 1;
+            g_n_fpb++;
+        } else {
+            for (int q = i; q <= end; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; }
+        }
+        i = end + 1;
+    }
+}
+static int fpb_v1(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("OCERZ_FPB_V1") ? 1 : 0;
+    return v;
+}
+static void fpb_scan(const X86Insn *insns, int n, int8_t *bat)
+{
+    if (fpb_v1() || g_xlat_mode32) {
+        g_fpb_exit_mask = 0; g_fpb_exit_batch = -1;
+        for (int i = 0; i < n; i++) { g_fpb_stchk[i] = 0; g_fpb_stlane[i] = 0; }
+        fpb_scan_v1(insns, n, bat);
+        return;
+    }
+    fpb_scan_v2(insns, n, bat);
+}
+
 static int unsafe_nocheckbr(void)
 {
     static int en = -1;
@@ -6644,6 +6964,7 @@ static void fpb_site_emit(A64Buf *b, int end, int va, int vb, int dbl)
     st->back = a64_label(b);
     for (int r = 0; r < 16; r++) { st->l0[r] = g_l0[r]; st->l0_dbl[r] = g_l0_dbl[r]; }
     st->fcmp_a = (int8_t)va; st->fcmp_b = (int8_t)vb; st->fcmp_dbl = (uint8_t)dbl;
+    st->keep_jt = 0;
 }
 static int fpb_det_here(int idx)
 {
@@ -6666,7 +6987,7 @@ static void fpb_emit_regs_check(A64Buf *b, uint16_t regs, int batch, int end, co
     st->site = a64_label(b); a64_bcond(b, A64_VS, 0);
     st->back = a64_label(b);
     for (int r = 0; r < 16; r++) { st->l0[r] = l0[r]; st->l0_dbl[r] = l0_dbl[r]; }
-    st->fcmp_a = -1; st->fcmp_b = -1; st->fcmp_dbl = 0;
+    st->fcmp_a = -1; st->fcmp_b = -1; st->fcmp_dbl = 0; st->keep_jt = 0;
 }
 static int l0_enabled(void)
 {
@@ -6807,6 +7128,30 @@ static int l0_src2(A64Buf *b, unsigned r, int dbl)
     if (l0_enabled() && g_l0[r] >= 0 && g_l0_dbl[r] == (uint8_t)dbl) return g_l0[r];
     l0_flush_reg(b, r);
     return xmm_vreg(r);
+}
+static void fpb_emit_store_check(A64Buf *b, int i, int batch)
+{
+    uint16_t m = g_fpb_stchk[i];
+    if (!m) return;
+    if (g_fpb_stlane[i]) {
+        unsigned r = (unsigned)__builtin_ctz(m);
+        int dbl = g_fpb_stdbl[i];
+        int v = l0_src2(b, r, dbl);
+        a64_fcmp(b, dbl, v, v);
+        fpb_site_emit(b, i - 1, -1, -1, dbl);
+        return;
+    }
+    for (unsigned r = 0; r < 16; r++) if (m & (1u << r)) l0_flush_reg(b, r);
+    fpb_emit_regs_check(b, m, batch, i - 1, g_l0, g_l0_dbl);
+}
+static void fpb_emit_exit_check(A64Buf *b)
+{
+    if (g_fpb_exit_batch < 0 || !g_fpb_exit_mask) return;
+    for (unsigned r = 0; r < 16; r++) if (g_fpb_exit_mask & (1u << r)) l0_flush_reg(b, r);
+    int before = g_n_fpb_sites;
+    fpb_emit_regs_check(b, g_fpb_exit_mask, g_fpb_exit_batch, g_fpb_exit_end, g_l0, g_l0_dbl);
+    if (g_n_fpb_sites > before) g_fpb_sites[g_n_fpb_sites - 1].keep_jt = 1;
+    g_fpb_exit_mask = 0;
 }
 static void l0_share(unsigned dst, unsigned src)
 {
@@ -10072,6 +10417,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     } else
         a64_bcond(b, taken_cond, (int32_t)(g_loop_entry - g_stop_patch));
     l0_fixed_fallthrough(b);
+    fpb_emit_exit_check(b);
 
     if (g_no_xlive || xlive_succ_live(g_xlat_jit, fall) != 0) {
         if (producer->op == OCERZ_OP_CMP) {
@@ -10714,6 +11060,7 @@ static int emit_ifconv_diamond(A64Buf *b, const X86Insn *test,
     g_stop_patch = a64_label(b);
     a64_bcond(b, self_cond, (int32_t)(g_loop_entry - g_stop_patch));
     l0_fixed_fallthrough(b);
+    fpb_emit_exit_check(b);
 
     int edge_class = body_edge_pin_class();
     int body_edge = edge_class >= 0;
@@ -10765,6 +11112,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         g_stop_patch = a64_label(b);
         a64_bcond(b, direct, (int32_t)(g_loop_entry - g_stop_patch));
         l0_fixed_fallthrough(b);
+        fpb_emit_exit_check(b);
         int edge_class = body_edge_pin_class();
         int body_edge = edge_class >= 0;
         uint32_t *pb_fall = emit_static_chain_tail(
@@ -10798,6 +11146,7 @@ static int emit_jcc(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         g_stop_patch = a64_label(b);
         a64_bcond(b, A64_EQ, (int32_t)(g_loop_entry - g_stop_patch));
         l0_fixed_fallthrough(b);
+        fpb_emit_exit_check(b);
         {
             int edge_class = body_edge_pin_class();
             int body_edge = edge_class >= 0;
@@ -10878,6 +11227,7 @@ static int emit_jmp(A64Buf *b, const X86Insn *insn, uint32_t **epilogue_sites, i
         g_stop_patch = a64_label(b);
         a64_b(b, (int32_t)(g_loop_entry - g_stop_patch));
         l0_fixed_fallthrough(b);
+        fpb_emit_exit_check(b);
         g_stop_target = a64_label(b);
         a64_mov_imm64(b, JT0, target);
         a64_str(b, 8, JT0, 20, RIP_OFF);
@@ -13935,6 +14285,7 @@ promo_push_fallthrough:
             blk->n_inlined++;
             continue;
         }
+        if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_stchk[i]) fpb_emit_store_check(&b, i, fpb_open);
         if (!try_inline(&b, insn, fl_need[i], exit_sites, &n_exits)) {
             emit_slowcall(&b, insn, exit_sites, &n_exits);
             blk->n_slow++;
@@ -14103,6 +14454,7 @@ promo_push_fallthrough:
         FpbSite *st = &g_fpb_sites[k];
         FpBatch *fb = &g_fpb[st->batch];
         a64_patch_bcond(st->site, a64_label(&b));
+        if (st->keep_jt) { a64_stp_pre(&b, 9, 10, 31, -32); a64_stp_off(&b, 11, 12, 31, 16); }
         fpb_replay_prelude(&b, fb, st->l0, st->l0_dbl);
         yc_flush_from(&b, 0xffff);
         g_yc_dirty = 0;
@@ -14136,6 +14488,7 @@ promo_push_fallthrough:
         }
         if (st->fcmp_a >= 0)
             a64_fcmp(&b, st->fcmp_dbl, st->fcmp_a, st->fcmp_b);
+        if (st->keep_jt) { a64_ldp_off(&b, 11, 12, 31, 16); a64_ldp_post(&b, 9, 10, 31, 32); }
         uint32_t *here = a64_label(&b);
         a64_b(&b, (int32_t)(st->back - here));
     }
