@@ -221,7 +221,7 @@ Timings are best of 5 on an Apple M5 with macOS 26.6.2, taken 2026-09-14 on an i
 | mandelbrot 400x400, scalar SSE2 | 19.97 ms | 12.07 ms | 11.26 ms |
 | mandelbrot 400x400, scalar AVX2 | 828.24 ms | **10.95 ms** | 11.44 ms |
 
-Wine runs in a third address map, the low shadow, where every memory access needs a range check because guest addresses below 12 GB and a strip at the top of the address space live at their own host bases. The same xbench suite built as a non-PIE dynamic binary lands in that map: on 2026-09-15 the range check was rewritten to test the low window first from constant registers, which took memcpy from 6.8x to 2.9x Rosetta's time, fpvec from 7.2x to 2.4x, mixed from 2.5x to 1.4x and vm from 1.3x to 0.9x. The kernels are still slower than Rosetta there because the fast memory forms, base hoisting, move pairs and the batch undo log are only used when a host address can be formed without a check.
+Wine runs in a third address map, the low shadow, where every memory access needs a range check because guest addresses below 12 GB and a strip at the top of the address space live at their own host bases. The scalar and 256-bit register caches run there now that fault recovery reconstructs them, but the fast memory forms, base hoisting, move pairs and the batch undo log still need a host address that can be formed without a check, so the suite is slower than Rosetta in that map.
 
 The first three kernels are hand-written loops shaped like Go's runtime routines. The rest are C loops, which clang vectorizes except for nbody and mandelbrot, which stay scalar.
 
