@@ -303,7 +303,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
   - 256-bit byte and integer shuffles, unpacks, permutes and lane inserts
   - `vptest`, the immediate blends, mask-producing compares and gathers
   - `bextr`, `pdep` and `pext`
-- Inside a translated loop, scalar SSE results and the upper halves of the `ymm` registers live in host registers that fault recovery does not see. A guest that catches a fault raised in such a loop and continues past it can observe stale values in those registers. Both caches stay off in the guarded memory modes.
+- Inside a translated loop, scalar SSE results and the upper halves of the `ymm` registers live in host lane registers. Each block records which registers sit in which lane at every instruction, and fault recovery folds those lanes back into the CPU state, so a guest that catches a fault raised in such a loop sees the right values and the caches run in the guarded memory modes too. A NaN produced inside a batch that faults before its check keeps the arm64 payload.
 - MMX instructions always run in the interpreter, and the MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry them.
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
