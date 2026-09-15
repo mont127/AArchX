@@ -1893,7 +1893,7 @@ static void read256(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, ve
     if (op->kind == OCERZ_OPK_XMM) { *lo = vec_of(cpu->xmm[op->reg]); *hi = vec_of(cpu->ymmh[op->reg]); }
     else { *lo = vec_of(mem_read16(cpu, insn, op, 0)); *hi = vec_of(mem_read16(cpu, insn, op, 16)); }
 }
-static void write_ymm(OcerzCPU *cpu, int reg, vec lo, vec hi) { cpu->xmm[reg] = lo.q; cpu->ymmh[reg] = hi.q; }
+static void write_ymm(OcerzCPU *cpu, int reg, vec lo, vec hi) { cpu->xmm[reg] = lo.q; cpu->ymmh[reg] = hi.q; cpu->ymmh_all_zero = 0; }
 static void write_xmm_zero_hi(OcerzCPU *cpu, int reg, vec v) { cpu->xmm[reg] = v.q; cpu->ymmh[reg].lo = cpu->ymmh[reg].hi = 0; }
 
 typedef union w256 {
@@ -1928,9 +1928,10 @@ static w256 src256(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, int
 static void put256(OcerzCPU *cpu, int reg, int L, const w256 *w)
 {
     memcpy(&cpu->xmm[reg], w->u8, 16);
-    if (L)
+    if (L) {
         memcpy(&cpu->ymmh[reg], w->u8 + 16, 16);
-    else
+        cpu->ymmh_all_zero = 0;
+    } else
         memset(&cpu->ymmh[reg], 0, 16);
 }
 
@@ -2134,10 +2135,12 @@ static int do_avx_only(OcerzCPU *cpu, const X86Insn *insn)
     }
     case OP(OCERZ_OP_VZEROUPPER):
         memset(cpu->ymmh, 0, sizeof cpu->ymmh);
+        cpu->ymmh_all_zero = 1;
         return OCERZ_STEP_OK;
     case OP(OCERZ_OP_VZEROALL):
         memset(cpu->ymmh, 0, sizeof cpu->ymmh);
         memset(cpu->xmm, 0, sizeof cpu->xmm);
+        cpu->ymmh_all_zero = 1;
         return OCERZ_STEP_OK;
     default:
         return OCERZ_EUNSUP;
@@ -2528,5 +2531,6 @@ int ocerz_interp_sse(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     for (int k = 0; k < nregs; k++) { Ocerz128 t = cpu->xmm[regs[k]]; cpu->xmm[regs[k]] = cpu->ymmh[regs[k]]; cpu->ymmh[regs[k]] = t; }
     rc = sse_exec(vm, cpu, &hi);
     for (int k = 0; k < nregs; k++) { Ocerz128 t = cpu->xmm[regs[k]]; cpu->xmm[regs[k]] = cpu->ymmh[regs[k]]; cpu->ymmh[regs[k]] = t; }
+    cpu->ymmh_all_zero = 0;
     return rc;
 }
