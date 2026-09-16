@@ -52,6 +52,7 @@ check: ocerz unit guest
 	bash tests/run_diff_test.sh
 	bash tests/run_diff32.sh .
 	bash tests/run_dynamic_tests.sh
+	bash tests/run_native_tests.sh
 
 diff32:
 	bash tests/run_diff32.sh .

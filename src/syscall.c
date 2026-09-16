@@ -72,7 +72,12 @@
  * box: AppKit and libdispatch hand work to workqueue threads and then wait for
  * it, so with nothing servicing those queues the first dispatch_sync parked the
  * main thread in __ulock_wait forever, and Calculator, TextEdit and Safari all
- * registered as foreground apps without ever reaching the WindowServer.
+ * registered as foreground apps without ever reaching the WindowServer.  Native
+ * mode turns the bridge off outright: registering it claims the process's single
+ * _pthread_workqueue_init_with_workloop slot, and there the host's own
+ * libdispatch is what needs that slot.  The mode itself travels to children as
+ * OCERZ_MODE in the environment the spawn and exec paths build, so a bundled
+ * helper comes up in the same universe as its parent.
  *
  * A new thread's cpu is a copy of its creator's taken inside the creator's
  * syscall, so nothing about the creator's own wait or suspension may come along
@@ -148,6 +153,7 @@
 #include "ocerz/sys_raw.h"
 #include "ocerz/interp.h"
 #include "ocerz/dyld.h"
+#include "ocerz/mode.h"
 
 #include <stddef.h>
 #include <sys/mman.h>
@@ -193,6 +199,8 @@ static void peekguard(OcerzCPU *cpu, int class, int num, const char *when);
 
 static int ocerz_hostwq_on(void)
 {
+    if (ocerz_mode == OCERZ_MODE_NATIVE)
+        return 0;
     static int on = -1;
     if (on < 0)
         on = getenv("OCERZ_NO_HOSTWQ") ? 0 : 1;
@@ -1301,7 +1309,8 @@ static int env_inject_lowbase(char **henv, int m, int cap)
 {
     static char lowbase_kv[40];
     static char topbase_kv[40];
-    int have_low = 0, have_top = 0, have_nano = 0;
+    static char mode_kv[] = "OCERZ_MODE=native";
+    int have_low = 0, have_top = 0, have_nano = 0, have_mode = 0;
     for (int i = 0; i < m; i++) {
         if (strncmp(henv[i], "OCERZ_LOWBASE=", 14) == 0)
             have_low = 1;
@@ -1309,9 +1318,13 @@ static int env_inject_lowbase(char **henv, int m, int cap)
             have_top = 1;
         if (strncmp(henv[i], "MallocNanoZone=", 15) == 0)
             have_nano = 1;
+        if (strncmp(henv[i], "OCERZ_MODE=", 11) == 0)
+            have_mode = 1;
     }
     if (!have_nano && m < cap)
         henv[m++] = (char *)"MallocNanoZone=0";
+    if (ocerz_mode == OCERZ_MODE_NATIVE && !have_mode && m < cap)
+        henv[m++] = mode_kv;
     if (!ocerz_low_base)
         return m;
     if (!have_low && m < cap) {
