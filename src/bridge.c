@@ -50,6 +50,41 @@
  * could read would be a wrong answer, so the two failures are not allowed to
  * differ.  Resolution and parsing both happen in the lookup, which runs once
  * per export, so nothing on the crossing path touches dlsym or a string.
+ *
+ * ---- a crossing says, for as long as it lasts, that it is happening ----
+ * Every fault a guest thread took before this layer existed was the guest's,
+ * because guest code was the only code such a thread ran.  A crossing ends
+ * that: for the length of one call the thread is running Apple's own arm64
+ * code, so a guest that hands strcpy a pointer it had no business handing it
+ * faults inside libSystem, at an instruction pointer belonging to nothing the
+ * translator emitted.  Nobody downstream can tell that from a translator bug
+ * unless this file writes down what the thread is in the middle of, so it does:
+ * a thread-local frame naming the library, the export, the signature and the
+ * host address, raised immediately before the call and lowered immediately
+ * after, with a depth counting nesting because a bridged function may in
+ * principle re-enter and it is the innermost crossing that describes the fault.
+ * The raise, the call and the lower are one small function with no other way
+ * out, which is what keeps the pair honest rather than anyone remembering to
+ * write the second half.  The three exports that are not a call raise nothing,
+ * _exit above all: a frame raised around a function that never returns would
+ * stay raised for the rest of the process.  A fault recovered by jumping out of
+ * a crossing instead of returning through it is the one exit the pair cannot
+ * see; nothing does that today, because the crash handler stops the process on a
+ * fault inside a crossing rather than jumping out of one, but the moment native
+ * code can call back into guest code a guest fault will recover by jumping past
+ * a live crossing, and the frame will have to be reset there or every later
+ * fault on that thread will be blamed on the bridge.
+ * is across nothing again.
+ *
+ * The frame is read from inside a signal handler, which may not allocate and
+ * may not take a lock, so it copies nothing: every string in it is a literal
+ * out of the table below and the address is the descriptor's own, all of static
+ * lifetime and all printable from a handler exactly as they are found.
+ * OCERZ_BRIDGELOG prints those same three names once per crossing, from a
+ * variable read once into a static so the hot path pays a predictable branch
+ * and never a getenv.  It prints no argument values: the signature already says
+ * what shape they were, and most of them are pointers into guest memory that a
+ * log line has no business dereferencing.
  */
 #include "ocerz/bridge.h"
 #include "ocerz/abi.h"
@@ -173,6 +208,36 @@ const struct OcerzBridgeFn *ocerz_bridge_lookup(const char *lib, const char *sym
     return NULL;
 }
 
+static __thread struct OcerzBridgeFrame g_br_frame;
+
+const struct OcerzBridgeFrame *ocerz_bridge_in_flight(void)
+{
+    return g_br_frame.depth > 0 ? &g_br_frame : NULL;
+}
+
+static int br_logging(void)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("OCERZ_BRIDGELOG") ? 1 : 0;
+    return en;
+}
+
+static int br_cross(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
+{
+    struct OcerzBridgeFrame outer = g_br_frame;
+
+    g_br_frame.lib = fn->lib;
+    g_br_frame.sym = fn->sym;
+    g_br_frame.sig = fn->sig;
+    g_br_frame.host_fn = fn->addr;
+    g_br_frame.depth = outer.depth + 1;
+
+    int rc = ocerz_abi_perform(&fn->parsed, fn->addr, cpu);
+
+    g_br_frame = outer;
+    return rc;
+}
+
 int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu, const struct OcerzBridgeFn *fn)
 {
     if (!fn)
@@ -180,10 +245,14 @@ int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu, const struct OcerzBri
 
     g_br_calls[fn - g_br_fns]++;
 
+    if (br_logging())
+        fprintf(stderr, "ocerz: BRIDGELOG[%d] %s %s %s\n", (int)getpid(),
+                fn->lib, fn->sym, fn->sig ? fn->sig : "(nothing)");
+
     if (fn->special)
         return fn->special(vm, cpu);
 
-    return ocerz_abi_perform(&fn->parsed, fn->addr, cpu);
+    return br_cross(fn, cpu);
 }
 
 typedef struct BrRow {

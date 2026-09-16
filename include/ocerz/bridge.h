@@ -37,6 +37,26 @@
  *
  * An export with no descriptor here is not an error: it falls back to naming
  * itself and stopping, which is what every export did before this layer existed.
+ *
+ * A crossing is also the only moment at which a thread the guest is driving is
+ * running native code, so a fault taken during one is not the guest's fault the
+ * way every fault before this layer was.  ocerz_bridge_in_flight is how a crash
+ * report asks what the thread was in the middle of: it answers NULL off the
+ * crossing path, and otherwise describes the innermost crossing, counted by a
+ * depth because a bridged function may in principle re-enter.  The frame holds
+ * pointers rather than copies because it is read from inside a signal handler,
+ * which may neither allocate nor take a lock; everything it points at is a
+ * string literal or a field of a descriptor, all of static lifetime, so reading
+ * it costs a load and nothing else.
+ *
+ * There is one exit a crossing cannot bracket itself: a fault handled by jumping
+ * out of the faulting call instead of returning through it, which skips the
+ * lower and strands the frame.  Nothing does that today, because a fault inside
+ * a crossing stops the process rather than jumping past it.  It becomes real the
+ * moment native code can call back into guest code, since a guest fault inside a
+ * callback recovers by jumping, and a stranded frame would invert this whole
+ * mechanism: every later fault on that thread would be blamed on a bridge that
+ * had already returned.
  */
 #ifndef OCERZ_BRIDGE_H
 #define OCERZ_BRIDGE_H
@@ -47,9 +67,19 @@
 struct OcerzVM;
 struct OcerzBridgeFn;
 
+struct OcerzBridgeFrame {
+    const char *lib;
+    const char *sym;
+    const char *sig;
+    const void *host_fn;
+    int depth;
+};
+
 const struct OcerzBridgeFn *ocerz_bridge_lookup(const char *lib, const char *sym);
 int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu,
                         const struct OcerzBridgeFn *fn);
 void ocerz_bridge_report(void);
+
+const struct OcerzBridgeFrame *ocerz_bridge_in_flight(void);
 
 #endif

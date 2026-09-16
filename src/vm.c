@@ -43,6 +43,28 @@
  * retry.  A plain-form access to the emulated commpage marks the block for
  * guarded retranslation.
  *
+ * None of that applies to a fault that arrives from inside a bridged call.  In
+ * native mode a guest call into a system library runs the host's own arm64 code
+ * on a guest thread, so a bad pointer the guest handed strcpy faults in Apple's
+ * code with no guest instruction to blame: delivering it to the guest would
+ * raise an access violation at whatever rip the crossing trapped from, and a
+ * JIT recovery would reconstruct guest state from a host pc that was never in
+ * the arena.  Neither is resumable in any case - the thread is several native
+ * frames deep in code ocerz can neither continue nor unwind - so a crossing in
+ * flight is looked for before anything attributes the fault, and the process
+ * stops there naming the library, symbol and signature, and which side of the
+ * guest boundary the fault address fell on, which is what separates a bad
+ * argument from the guest from a marshalling bug in ocerz.
+ *
+ * It is looked for after the recoveries that resume the faulting instruction,
+ * though, and that order is load-bearing rather than incidental.  A guest that
+ * writes into a page it has already executed faults on the write protection
+ * that guards a translation, and it makes no difference whether the store came
+ * from translated code or from a bridged memcpy: the page is invalidated and
+ * the faulting instruction runs again, which a native frame can do perfectly
+ * well since nothing has to be reconstructed.  Checking for a crossing first
+ * would turn every self-modifying guest in native mode into a crash report.
+ *
  * What is not recognised is handed to the guest as an access violation at the
  * faulting instruction rather than killing the thread: killing it leaves every
  * lock it held taken forever, and a V8 background job died that way holding a
@@ -103,6 +125,7 @@
 #include "ocerz/cache.h"
 #include "ocerz/syscall.h"
 #include "ocerz/dyldapi.h"
+#include "ocerz/bridge.h"
 
 #include <signal.h>
 #include <sys/stat.h>
@@ -1256,6 +1279,42 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 ocerz_jit_invalidate_range(g_vm, ga & ~(OCERZ_HOST_PAGE_SIZE - 1), OCERZ_HOST_PAGE_SIZE);
             if (h)
                 return;
+        }
+    }
+
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        const struct OcerzBridgeFrame *bf = ocerz_bridge_in_flight();
+        if (bf) {
+            const ucontext_t *buc = (const ucontext_t *)ctx;
+            uint64_t bpc = buc ? buc->uc_mcontext->__ss.__pc : 0;
+            const char *blib = bf->lib ? bf->lib : "?";
+            const char *bsym = bf->sym ? bf->sym : "?";
+            const char *bsig = bf->sig ? bf->sig : "?";
+            fprintf(stderr,
+                    "ocerz: BRIDGE-FAULT[%d] %s inside a bridged call, not in guest code\n",
+                    (int)getpid(), sig == SIGBUS ? "SIGBUS" : "SIGSEGV");
+            fprintf(stderr,
+                    "ocerz:   call=%s:%s sig='%s' host_fn=%p depth=%d\n",
+                    blib, bsym, bsig, (void *)(uintptr_t)bf->host_fn, bf->depth);
+            fprintf(stderr,
+                    "ocerz:   fault_addr=%p host_pc=%#llx guest_rip=%#llx\n",
+                    si->si_addr, (unsigned long long)bpc,
+                    (unsigned long long)(g_cur_cpu ? g_cur_cpu->cur_rip : 0));
+            if (ocerz_host_in_guest_space(si->si_addr))
+                fprintf(stderr,
+                        "ocerz:   cause: the fault address is in guest space, so the guest passed a bad"
+                        " pointer to %s (guest addr %#llx)\n"
+                        "ocerz:   note: in the identity map native mode uses that test is one upper bound,"
+                        " so it is strong evidence and not proof\n",
+                        bsym, (unsigned long long)ocerz_h2g(si->si_addr));
+            else
+                fprintf(stderr,
+                        "ocerz:   cause: the fault address is outside guest space, so ocerz marshalled"
+                        " this crossing wrong; the guest's arguments are not implicated\n");
+            fprintf(stderr,
+                    "ocerz:   a native frame cannot be resumed or unwound, so the process stops here\n");
+            fflush(stderr);
+            _exit(139);
         }
     }
 
