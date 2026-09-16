@@ -41,6 +41,30 @@
  * guest's, handled the ordinary way, and a strcmp the comparator makes raises
  * and lowers a frame of its own inside it.
  *
+ * ---- callbacks on threads the guest never created ----
+ * libdispatch's function-pointer entry points are bridged: dispatch_async_f,
+ * dispatch_sync_f and dispatch_apply_f, with the global queues, the semaphores
+ * and dispatch_release that a plain C program needs around them.  They are the
+ * first functions in this table that call guest code on threads the guest never
+ * created, and that is why they are here.  qsort runs its comparator on the
+ * thread that called qsort, a thread that already has a guest cpu to run it on.
+ * dispatch_async_f returns at once, and its work function runs later on one of
+ * libdispatch's own workers, a thread with no x86 register state, no guest stack
+ * and no bridge frame, after the crossing that handed the function over has
+ * ended.  dispatch_apply_f spreads its iterations over those workers and the
+ * calling thread together.  dispatch_sync_f normally runs its work on the
+ * calling thread, an optimization the header describes rather than promises,
+ * and runs it on the main thread instead when the queue is the main queue or
+ * targets it.  So these exports are the proof that a native framework's own
+ * threads can run guest callbacks, and their rows differ from qsort's in nothing
+ * but the notation: giving such a thread a guest cpu is the engine's business,
+ * not this table's.  A work function held past the call that received it is
+ * exactly the case for which an interned slot is never given back, and because
+ * one function under one notation interns to one slot, a program that submits
+ * the same work a million times uses one slot, not a million.
+ * dispatch_apply_f's DISPATCH_APPLY_AUTO is a null queue, which the pointer
+ * conversion passes through as null.
+ *
  * ---- why null has to survive the conversion ----
  * ocerz_g2h is affine: it adds a base.  Applied to a null guest pointer it
  * produces the base of the arena, which is a plausible-looking address that is
@@ -179,6 +203,15 @@ static struct OcerzBridgeFn g_br_fns[] = {
     { BR_LIBSYSTEM, "_clock",    "clock",   "L()",    NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "___error",  "__error", "p()",    NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
 
+    { BR_LIBSYSTEM, "_dispatch_get_global_queue", "dispatch_get_global_queue", "p(lL)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_dispatch_async_f",          "dispatch_async_f",          "v(ppc{v(p)})",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_dispatch_sync_f",           "dispatch_sync_f",           "v(ppc{v(p)})",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_dispatch_apply_f",          "dispatch_apply_f",          "v(Lppc{v(pL)})", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_dispatch_semaphore_create", "dispatch_semaphore_create", "p(l)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_dispatch_semaphore_wait",   "dispatch_semaphore_wait",   "l(pL)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_dispatch_semaphore_signal", "dispatch_semaphore_signal", "l(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_dispatch_release",          "dispatch_release",          "v(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+
     { BR_LIBSYSTEM, "_exit",             NULL, NULL, br_exit,            NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "_abort",            NULL, NULL, br_abort,           NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "___stack_chk_fail", NULL, NULL, br_stack_chk_fail,  NULL, { 0, { 0 }, { { 0 } }, 0 } },
@@ -305,7 +338,7 @@ void ocerz_bridge_report(void)
     fprintf(stderr, "ocerz: BRIDGESTAT[%d] crossings=%llu over %d of %d bridged export(s)\n",
             (int)getpid(), (unsigned long long)total, used, BR_FNS);
     for (int i = 0; i < used; i++)
-        fprintf(stderr, "ocerz: BRIDGESTAT[%d]   #%2d %-20s %14llu  %6.2f%%\n",
+        fprintf(stderr, "ocerz: BRIDGESTAT[%d]   #%2d %-26s %14llu  %6.2f%%\n",
                 (int)getpid(), i + 1, g_br_fns[rows[i].idx].sym,
                 (unsigned long long)rows[i].n,
                 total ? 100.0 * (double)rows[i].n / (double)total : 0.0);

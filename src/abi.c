@@ -129,9 +129,11 @@
  * render thread - and call function pointers they were handed earlier from
  * them.  Such a thread has no x86 register state and no guest stack to run on,
  * and borrowing another thread's cpu would overwrite the state of a guest
- * thread that is running.  Giving it a cpu of its own is attaching a thread,
- * which is a change of its own, so until then the call is refused by name.
- * Every refusal of the dispatcher's returns zero in both x0 and d0, so the
+ * thread that is running.  So the dispatcher gives it a cpu of its own, through
+ * ocerz_thread_attach, the first time such a thread calls a guest function, and
+ * the same cpu on every call after; it is refused by name only when no
+ * personality can be attached at all, which means there is no guest process to
+ * attach it to.  Every refusal of the dispatcher's returns zero in both x0 and d0, so the
  * native caller at least reads a defined value, and every one is printed
  * whatever the verbosity: a malformed notation is a bug in a table fixed when
  * ocerz is built, while a callback refused at run time is a wrong answer handed
@@ -578,11 +580,12 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
     const OcerzAbiSig *sig = &e->sig;
 
     OcerzCPU *cpu = ocerz_vm_current_cpu();
+    if (!cpu)
+        cpu = ocerz_thread_attach(ocerz_vm_process());
     if (!cpu) {
         fprintf(stderr,
                 "ocerz: abi: native code called guest function %#llx (callback slot %u, %s) on a thread"
-                " with no guest cpu, one a native framework created for itself; attaching such a"
-                " thread is not implemented\n",
+                " with no guest cpu, and no guest personality could be attached to it\n",
                 (unsigned long long)e->guest_fn, slot, e->notation);
         return;
     }

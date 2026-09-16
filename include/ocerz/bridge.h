@@ -30,9 +30,8 @@
  *   fixed-arity prototype puts every argument in the wrong place.  printf, open,
  *   fcntl and ioctl are therefore not bridged here; they need per-function
  *   veneers that know where the fixed arguments stop.
- * - A callback whose own signature takes a callback, or a callback held past
- *   the call that received it on a thread the guest does not own; abi.h
- *   describes what a callback argument can be and where it may run.
+ * - A callback whose own signature takes a callback; abi.h describes what a
+ *   callback argument can be and which threads it may run on.
  * - Structures passed or returned by value, which both ABIs split into pieces
  *   and classify differently; abi.h rejects a signature naming one.
  *

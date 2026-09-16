@@ -183,9 +183,68 @@
 # 139, the line after qsort never written -- under both engines, and fails on
 # any BRIDGE-FAULT line at all.
 #
-# The callback cases skip where there is no x86_64 clang, like the others, but a
-# callback fixture that fails to compile where a trivial x86_64 program compiles
-# fine is a failure: skipping it would hide a broken fixture indefinitely.
+# M6 lets native code call guest code on threads the guest never created. Every
+# M5 callback ran on the thread that made the crossing, a thread that already had
+# a guest cpu, but a native framework also calls back on threads of its own --
+# libdispatch's workers above all -- and such a thread has no guest cpu, no guest
+# stack and no thread block behind gs. The callback dispatcher now gives it a
+# personality the first time it calls a guest function, and the proof is
+# libdispatch itself: dispatch_async_f, dispatch_sync_f and dispatch_apply_f,
+# with the global queues, the semaphores and dispatch_release around them,
+# called from plain C. Four of the five attach_* fixtures are shaped like the
+# callback ones, a single status line "<name> ok ..." or "<name> bad:<hex> ..."
+# with the bits in source order, run under both engines and compared with cache
+# mode, where the real x86 libdispatch runs the same work functions on guest
+# worker threads.
+#
+# attach_async submits a work function to a global queue and waits on a
+# dispatch_semaphore the work function signals, twice, so the second submission
+# usually lands on a worker that already has a personality. The work function
+# records a value the main thread checks and the address __error() returns,
+# which is per thread in both modes, so a work function run on the calling
+# thread fails instead of passing on nothing. It is the first guest code in the
+# project to run on a thread the guest never created, and its failure message
+# says what that means. attach_apply runs dispatch_apply_f over 384 iterations,
+# each doing enough work that libdispatch spreads them over several workers and
+# the calling thread at once and each writing only its own slot: every slot must
+# be written exactly once with the value the main thread computes for it, and at
+# least one iteration must have run off the calling thread, or nothing was
+# attached and the case proved nothing. How many threads took part varies from
+# run to run, so the fixture writes that to stderr, where the PASS line picks it
+# up, and never to the stdout the comparisons read. attach_nested_bridge's work
+# function calls strlen and strcmp itself and then qsort with a guest comparator
+# that calls strcmp, so a worker's personality carries a crossing, a callback
+# inside it and a crossing inside that, and the comparator must run on the work
+# function's own thread. attach_sync calls dispatch_sync_f, which runs the work
+# on the calling thread, one that already has a guest cpu: the work function's
+# frame must sit just below its caller's on the caller's own guest stack, which
+# it would not if a second personality had been built for a thread that did not
+# need one, and the caller's own state must come through the call intact.
+#
+# attach_guest_fault is callback_guest_fault moved onto a worker. Its work
+# function writes a mark and then reads the same unmapped 0x6000000000, and the
+# process must end the way a guest fault ends everywhere else in this gate -- a
+# guest-crash report naming the address, status 139, nothing written after the
+# read and no BRIDGE-FAULT line -- under both engines. The worker is running
+# guest code when it faults, so a bridged-call report there means the attached
+# thread's bridge frame was not cleared while its callback ran. It is not
+# compared with cache mode, where the thread that faults is one ocerz started
+# for the guest and nothing is attached.
+#
+# The failure these cases are likeliest to meet is not a wrong answer but a wait
+# that never returns: a work function that never runs leaves the main thread in
+# dispatch_semaphore_wait forever, and an iteration that never comes back leaves
+# it in dispatch_apply_f. So every attach run is bounded at ATTACH_TIMEOUT
+# seconds, shorter than the gate's usual bound, and each fixture writes progress
+# notes to stderr -- calling a dispatch function, returning from it, the work
+# function entering guest code, signalling, the wait returning -- so a case that
+# times out says how far it got, and says first whether the callback dispatcher
+# reported that it could not attach a personality at all.
+#
+# The callback and attach cases skip where there is no x86_64 clang, like the
+# others, but a fixture of theirs that fails to compile where a trivial x86_64
+# program compiles fine is a failure: skipping it would hide a broken fixture
+# indefinitely.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -242,6 +301,17 @@ CB_RECURSION_BIN=""
 CB_FAULT_BIN=""
 CB_FAULT_MARK='cbfault enter'
 CB_FAULT_PAST='cbfault returned'
+AT_ASYNC_BIN=""
+AT_APPLY_BIN=""
+AT_NESTED_BIN=""
+AT_SYNC_BIN=""
+AT_FAULT_BIN=""
+AT_FAULT_MARK='attfault enter'
+AT_FAULT_WORKER='attfault worker'
+AT_FAULT_SURVIVED='attfault survived'
+AT_FAULT_PAST='attfault returned'
+ATTACH_TIMEOUT=30
+ATTACH_REFUSED='ocerz: abi: native code called guest function'
 
 unset OCERZ_MODE
 unset OCERZ_BRIDGE_PROBE_UNSET
@@ -1141,6 +1211,492 @@ EOC
     done
 }
 
+build_attach_fixtures() {
+    local name
+
+    cat > "$TMP/attach_common.h" <<'EOC'
+#include "cb_common.h"
+
+typedef void *at_queue;
+typedef void *at_sema;
+
+int *__error(void);
+cb_size strlen(const char *);
+at_queue dispatch_get_global_queue(long, unsigned long);
+void dispatch_async_f(at_queue, void *, void (*)(void *));
+void dispatch_sync_f(at_queue, void *, void (*)(void *));
+void dispatch_apply_f(cb_size, at_queue, void *, void (*)(void *, cb_size));
+at_sema dispatch_semaphore_create(long);
+long dispatch_semaphore_wait(at_sema, unsigned long long);
+long dispatch_semaphore_signal(at_sema);
+void dispatch_release(void *);
+
+#define AT_FOREVER (~0ull)
+
+static void at_note(const char *tag, const char *what)
+{
+    char b[96];
+    cb_size n = 0;
+
+    while (*tag && n < 40)
+        b[n++] = *tag++;
+    b[n++] = ':';
+    b[n++] = ' ';
+    while (*what && n < sizeof b - 1)
+        b[n++] = *what++;
+    b[n++] = '\n';
+    write(2, b, n);
+}
+
+static unsigned at_mix(unsigned v)
+{
+    v ^= v >> 16;
+    v *= 0x7feb352du;
+    v ^= v >> 15;
+    v *= 0x846ca68bu;
+    v ^= v >> 16;
+    return v;
+}
+EOC
+
+    cat > "$TMP/attach_async.c" <<'EOC'
+#include "attach_common.h"
+
+#define ROUNDS 2
+#define TAG "attach_async"
+
+struct job {
+    unsigned in;
+    unsigned out;
+    unsigned runs;
+    int *err;
+};
+
+static struct job g_job[ROUNDS];
+static at_sema g_done;
+static unsigned g_bad_ctx, g_skew;
+
+static void work(void *ctx)
+{
+    struct job *j = ctx;
+    int r;
+
+    at_note(TAG, "work entered");
+    if (CB_SKEWED())
+        g_skew++;
+    for (r = 0; r < ROUNDS; r++)
+        if (ctx == &g_job[r])
+            break;
+    if (r == ROUNDS) {
+        g_bad_ctx++;
+    } else {
+        j->runs++;
+        j->err = __error();
+        j->out = at_mix(j->in);
+    }
+    at_note(TAG, "signalling");
+    dispatch_semaphore_signal(g_done);
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, value = 0;
+    at_queue q = dispatch_get_global_queue(0, 0);
+    int *mine = __error();
+    int r, ok, waited = 1, runs_ok = 1, values_ok = 1, off_thread = 1;
+
+    g_done = dispatch_semaphore_create(0);
+    CK(q != 0 && g_done != 0);
+    if (q == 0 || g_done == 0) {
+        cb_begin(TAG, m);
+        cb_end();
+        return 1;
+    }
+    for (r = 0; r < ROUNDS; r++) {
+        g_job[r].in = 0x41545441u + (unsigned)r;
+        at_note(TAG, "calling dispatch_async_f");
+        dispatch_async_f(q, &g_job[r], work);
+        at_note(TAG, "returned from dispatch_async_f");
+        ok = dispatch_semaphore_wait(g_done, AT_FOREVER) == 0;
+        at_note(TAG, "wait returned");
+        if (!ok)
+            waited = 0;
+        if (g_job[r].runs != 1)
+            runs_ok = 0;
+        if (g_job[r].out != at_mix(g_job[r].in))
+            values_ok = 0;
+        if (g_job[r].err == 0 || g_job[r].err == mine)
+            off_thread = 0;
+        value = value * 31u + g_job[r].out;
+    }
+    CK(waited);
+    CK(runs_ok);
+    CK(g_bad_ctx == 0);
+    CK(values_ok);
+    CK(off_thread);
+    CK(g_skew == 0);
+    dispatch_release(g_done);
+
+    cb_begin(TAG, m);
+    cb_field("rounds", ROUNDS, 0);
+    cb_field("value", value, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/attach_apply.c" <<'EOC'
+#include "attach_common.h"
+
+#define N 384
+#define SPIN 1000
+#define TAG "attach_apply"
+
+static unsigned g_hits[N];
+static unsigned g_val[N];
+static int *g_err[N];
+static unsigned g_bad_ctx, g_bad_index, g_skew;
+static const char g_ctx[] = TAG;
+
+static unsigned spin(unsigned i)
+{
+    unsigned acc = i, k;
+    for (k = 0; k < SPIN; k++)
+        acc = at_mix(acc + k);
+    return acc;
+}
+
+static void iteration(void *ctx, cb_size i)
+{
+    if (ctx != g_ctx)
+        g_bad_ctx++;
+    if (CB_SKEWED())
+        g_skew++;
+    if (i >= N) {
+        g_bad_index++;
+        return;
+    }
+    g_val[i] = spin((unsigned)i);
+    g_err[i] = __error();
+    g_hits[i]++;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, sum = 0, want = 0, threads = 0, here = 0, s;
+    at_queue q = dispatch_get_global_queue(0, 0);
+    int *mine = __error();
+    int *seen[N];
+    int i, k, none = 0, twice = 0, wrong = 0;
+    char note[48];
+    cb_size n;
+
+    CK(q != 0);
+    if (q == 0) {
+        cb_begin(TAG, m);
+        cb_end();
+        return 1;
+    }
+    at_note(TAG, "calling dispatch_apply_f");
+    dispatch_apply_f(N, q, (void *)g_ctx, iteration);
+    at_note(TAG, "returned from dispatch_apply_f");
+
+    for (i = 0; i < N; i++) {
+        if (g_hits[i] == 0)
+            none++;
+        else if (g_hits[i] > 1)
+            twice++;
+        s = spin((unsigned)i);
+        if (g_hits[i] != 0 && g_val[i] != s)
+            wrong++;
+        sum = sum * 31u + g_val[i];
+        want = want * 31u + s;
+        if (g_err[i] == mine)
+            here++;
+        for (k = 0; k < (int)threads; k++)
+            if (seen[k] == g_err[i])
+                break;
+        if (k == (int)threads && g_err[i] != 0)
+            seen[threads++] = g_err[i];
+    }
+    CK(none == 0);
+    CK(twice == 0);
+    CK(wrong == 0 && sum == want);
+    CK(g_bad_ctx == 0);
+    CK(g_bad_index == 0);
+    CK(g_skew == 0);
+    CK(threads > (here ? 1u : 0u));
+
+    cb_len = 0;
+    cb_str("threads=");
+    cb_dec(threads);
+    cb_str(" calling=");
+    cb_dec(here);
+    for (n = 0; n < cb_len && n < sizeof note - 1; n++)
+        note[n] = cb_buf[n];
+    note[n] = 0;
+    at_note(TAG, note);
+
+    cb_begin(TAG, m);
+    cb_field("n", N, 0);
+    cb_field("sum", sum, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/attach_nested_bridge.c" <<'EOC'
+#include "attach_common.h"
+
+#define TAG "attach_nested"
+
+static const char *const g_words[] = {
+    "worker", "attach", "attached", "personality", "libdispatch", "guest",
+    "thread", "Thread", "callback", "crossing", "", "zeta", "alpha", "alp",
+    "nested", "queue", "semaphore", "strcmp", "strlen", "qsort", "x86", "arm64",
+};
+#define NW ((int)(sizeof g_words / sizeof g_words[0]))
+
+static const char *g_sorted[NW];
+static at_sema g_done;
+static const char g_token[] = TAG;
+static int *g_work_err;
+static unsigned g_runs, g_bad_ctx, g_skew, g_calls, g_wrong_thread;
+static unsigned g_len_sum, g_strcmp_bad;
+
+static int cmp_str(const void *a, const void *b)
+{
+    g_calls++;
+    if (CB_SKEWED())
+        g_skew++;
+    if (__error() != g_work_err)
+        g_wrong_thread++;
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static void work(void *ctx)
+{
+    int i;
+
+    at_note(TAG, "work entered");
+    g_runs++;
+    if (ctx != g_token)
+        g_bad_ctx++;
+    if (CB_SKEWED())
+        g_skew++;
+    g_work_err = __error();
+    for (i = 0; i < NW; i++) {
+        g_len_sum += (unsigned)strlen(g_words[i]);
+        g_sorted[i] = g_words[i];
+    }
+    if (!(strcmp("attach", "attached") < 0))
+        g_strcmp_bad |= 1;
+    if (!(strcmp("worker", "thread") > 0))
+        g_strcmp_bad |= 2;
+    if (strcmp(g_words[3], g_words[3]) != 0)
+        g_strcmp_bad |= 4;
+    qsort(g_sorted, NW, sizeof g_sorted[0], cmp_str);
+    at_note(TAG, "signalling");
+    dispatch_semaphore_signal(g_done);
+}
+
+static int own_cmp(const char *x, const char *y)
+{
+    while (*x && *x == *y) {
+        x++;
+        y++;
+    }
+    return (int)(unsigned char)*x - (int)(unsigned char)*y;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, len = 0, order = 17;
+    at_queue q = dispatch_get_global_queue(0, 0);
+    int *mine = __error();
+    char seen[NW];
+    int i, j, ok, waited;
+
+    g_done = dispatch_semaphore_create(0);
+    CK(q != 0 && g_done != 0);
+    if (q == 0 || g_done == 0) {
+        cb_begin(TAG, m);
+        cb_end();
+        return 1;
+    }
+    at_note(TAG, "calling dispatch_async_f");
+    dispatch_async_f(q, (void *)g_token, work);
+    at_note(TAG, "returned from dispatch_async_f");
+    waited = dispatch_semaphore_wait(g_done, AT_FOREVER) == 0;
+    at_note(TAG, "wait returned");
+
+    for (i = 0; i < NW; i++) {
+        for (j = 0; g_words[i][j]; j++)
+            len++;
+        seen[i] = 0;
+    }
+    CK(waited && g_runs == 1 && g_bad_ctx == 0);
+    CK(g_work_err != 0 && g_work_err != mine);
+    CK(g_len_sum == len);
+    CK(g_strcmp_bad == 0);
+    ok = 1;
+    for (i = 1; i < NW; i++)
+        if (g_sorted[i - 1] == 0 || g_sorted[i] == 0 || own_cmp(g_sorted[i - 1], g_sorted[i]) > 0)
+            ok = 0;
+    CK(ok);
+    ok = 1;
+    for (i = 0; i < NW; i++) {
+        for (j = 0; j < NW; j++)
+            if (!seen[j] && g_words[j] == g_sorted[i])
+                break;
+        if (j == NW)
+            ok = 0;
+        else
+            seen[j] = 1;
+    }
+    CK(ok);
+    CK(g_calls != 0);
+    CK(g_wrong_thread == 0);
+    CK(g_skew == 0);
+    dispatch_release(g_done);
+
+    for (i = 0; i < NW; i++)
+        for (j = 0; g_sorted[i] && g_sorted[i][j]; j++)
+            order = order * 31u + (unsigned char)g_sorted[i][j];
+
+    cb_begin(TAG, m);
+    cb_field("words", (unsigned)NW, 0);
+    cb_field("len", len, 0);
+    cb_field("order", order, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/attach_sync.c" <<'EOC'
+#include "attach_common.h"
+
+#define CALLS 3
+#define NEAR 0x40000u
+#define TAG "attach_sync"
+
+static const char g_token[] = TAG;
+static int *g_work_err[CALLS];
+static cb_uptr g_work_frame[CALLS], g_call_frame[CALLS];
+static unsigned g_runs, g_bad_ctx, g_skew, g_value;
+static int g_call;
+
+static void work(void *ctx)
+{
+    at_note(TAG, "work entered");
+    if (ctx != g_token)
+        g_bad_ctx++;
+    if (CB_SKEWED())
+        g_skew++;
+    if (g_call >= 0 && g_call < CALLS) {
+        g_work_err[g_call] = __error();
+        g_work_frame[g_call] = (cb_uptr)__builtin_frame_address(0);
+    }
+    g_runs++;
+    g_value = at_mix(g_value + (unsigned)g_call);
+}
+
+static __attribute__((noinline)) unsigned run_sync(at_queue q, int c, unsigned carry)
+{
+    unsigned before = at_mix(carry ^ 0x53594e43u);
+
+    g_call = c;
+    g_call_frame[c] = (cb_uptr)__builtin_frame_address(0);
+    at_note(TAG, "calling dispatch_sync_f");
+    dispatch_sync_f(q, (void *)g_token, work);
+    at_note(TAG, "returned from dispatch_sync_f");
+    return before ^ g_value;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, carry = 7, want = 7, value = 0;
+    at_queue q = dispatch_get_global_queue(0, 0);
+    int *mine = __error();
+    int c, same_thread = 1, near = 1, runs_ok = 1;
+
+    CK(q != 0);
+    if (q == 0) {
+        cb_begin(TAG, m);
+        cb_end();
+        return 1;
+    }
+    for (c = 0; c < CALLS; c++) {
+        unsigned runs = g_runs;
+        carry = run_sync(q, c, carry);
+        if (g_runs != runs + 1)
+            runs_ok = 0;
+        if (g_work_err[c] != mine)
+            same_thread = 0;
+        if (!(g_work_frame[c] < g_call_frame[c] && g_call_frame[c] - g_work_frame[c] < NEAR))
+            near = 0;
+    }
+    for (c = 0; c < CALLS; c++) {
+        value = at_mix(value + (unsigned)c);
+        want = at_mix(want ^ 0x53594e43u) ^ value;
+    }
+    CK(runs_ok);
+    CK(g_bad_ctx == 0);
+    CK(same_thread);
+    CK(near);
+    CK(carry == want);
+    CK(g_skew == 0);
+
+    cb_begin(TAG, m);
+    cb_field("calls", CALLS, 0);
+    cb_field("value", g_value, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/attach_guest_fault.c" <<EOC
+#include "attach_common.h"
+
+static const int *volatile g_bad = (const int *)${BAD_GUEST_ADDR}ull;
+static volatile int g_sink;
+static at_sema g_done;
+
+static void work(void *ctx)
+{
+    write(1, "attfault worker\n", 16);
+    g_sink = *g_bad;
+    write(1, "attfault survived\n", 18);
+    dispatch_semaphore_signal(g_done);
+}
+
+int main(void)
+{
+    at_queue q = dispatch_get_global_queue(0, 0);
+
+    g_done = dispatch_semaphore_create(0);
+    write(1, "attfault enter\n", 15);
+    dispatch_async_f(q, 0, work);
+    dispatch_semaphore_wait(g_done, AT_FOREVER);
+    write(1, "attfault returned\n", 18);
+    return 0;
+}
+EOC
+
+    for name in attach_async attach_apply attach_nested_bridge attach_sync \
+                attach_guest_fault; do
+        clang -arch x86_64 -std=c11 -O1 -fno-builtin -fno-stack-protector \
+                -o "$TMP/$name" "$TMP/$name.c" >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            attach_async) AT_ASYNC_BIN="$TMP/$name" ;;
+            attach_apply) AT_APPLY_BIN="$TMP/$name" ;;
+            attach_nested_bridge) AT_NESTED_BIN="$TMP/$name" ;;
+            attach_sync) AT_SYNC_BIN="$TMP/$name" ;;
+            attach_guest_fault) AT_FAULT_BIN="$TMP/$name" ;;
+        esac
+    done
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -1635,6 +2191,178 @@ case_callback_guest_fault() {
     record "$name" "$reason" "exit=$rc_jit no-jit exit=$rc_nojit"
 }
 
+attach_count() {
+    local n
+    n=$(grep -cE "$1" "$2" 2>/dev/null)
+    echo "${n:-0}"
+}
+
+attach_stall() {
+    local tag="$1" err="$2" call n_call n_back n_in n_sig n_wait
+    call="$(grep -hE "^$tag: calling " "$err" 2>/dev/null | tail -1 | sed "s/^$tag: calling //")"
+    n_call=$(attach_count "^$tag: calling " "$err")
+    n_back=$(attach_count "^$tag: returned from " "$err")
+    n_in=$(attach_count "^$tag: work entered$" "$err")
+    n_sig=$(attach_count "^$tag: signalling$" "$err")
+    n_wait=$(attach_count "^$tag: wait returned$" "$err")
+    if [ "$n_call" -eq 0 ]; then
+        echo "the guest never reached its first dispatch call"
+    elif [ "$n_back" -lt "$n_call" ]; then
+        case $call in
+            dispatch_apply_f)
+                echo "dispatch_apply_f never returned: it waits for every iteration, so an iteration it handed to a libdispatch worker never came back" ;;
+            dispatch_sync_f)
+                if [ "$n_in" -lt "$n_call" ]; then
+                    echo "dispatch_sync_f never returned, and its work function never entered guest code"
+                else
+                    echo "dispatch_sync_f never returned, although its work function entered guest code"
+                fi ;;
+            *)
+                echo "$call never returned" ;;
+        esac
+    elif [ "$call" != "dispatch_async_f" ]; then
+        echo "$call returned and the process still did not exit"
+    elif [ "$n_in" -lt "$n_call" ]; then
+        echo "the work function never entered guest code on the libdispatch worker, so the main thread waits in dispatch_semaphore_wait for a signal that cannot come"
+    elif [ "$n_sig" -lt "$n_in" ]; then
+        echo "the work function entered guest code on the worker but never reached its dispatch_semaphore_signal"
+    elif [ "$n_wait" -lt "$n_sig" ]; then
+        echo "the worker signalled, but the main thread's dispatch_semaphore_wait never returned"
+    else
+        echo "every dispatch call and every wait returned, and the process still did not exit"
+    fi
+}
+
+attach_run_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" reason
+    reason="$(callback_run_reason "$rc" "$out" "$err")"
+    if [ -z "$reason" ]; then
+        echo ""
+    elif grep -Fq "$ATTACH_REFUSED" "$out" "$err" 2>/dev/null; then
+        echo "$reason; the callback was refused rather than given a personality: $(grep -hF "$ATTACH_REFUSED" "$out" "$err" | head -1 | cut -c1-240)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "$reason; $(attach_stall "$tag" "$err")"
+    else
+        echo "$reason"
+    fi
+}
+
+case_attach() {
+    local name="$1" bin="$2" tag="$3" bits="$4" note="${5:-}"
+    local reason="" rc_jit rc_nojit rc_cache line threads cache_note=""
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$ATTACH_TIMEOUT
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin"
+    rc_nojit=$?
+    line="$(head -1 "$jo")"
+    threads="$(grep -hE "^$tag: threads=" "$je" 2>/dev/null | head -1 | sed "s/^$tag: //")"
+
+    reason="$(attach_run_reason "$rc_jit" "$tag" "$jo" "$je")"
+    if grep -q "^$tag bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed, where $bits"
+    elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+        reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+    fi
+
+    if [ -z "$reason" ]; then
+        reason="$(attach_run_reason "$rc_nojit" "$tag" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(head -1 "$no")': the guest's own checks failed, where $bits"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    if [ -n "$reason" ] && [ -n "$note" ]; then
+        reason="$reason. $note"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$bin"
+        rc_cache=$?
+        if [ "$rc_cache" -ne 0 ]; then
+            reason="cache-mode exit $rc_cache, want 0: '$(head -1 "$co")'"
+        elif ! cmp -s "$jo" "$co"; then
+            reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': a work function run on an attached thread computed something the real libdispatch's threads did not"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'${threads:+ $threads}$cache_note"
+}
+
+attach_fault_reason() {
+    local rc="$1" out="$2" err="$3" stopped
+    stopped="$(bridge_stopped_reason "$out" "$err")"
+    if [ -n "$stopped" ]; then
+        echo "$stopped"
+    elif ! grep -Fq "$AT_FAULT_MARK" "$out"; then
+        echo "the guest never reached its dispatch_async_f call"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err"; then
+        echo "the work function's own read of $BAD_GUEST_ADDR on a libdispatch worker was reported as a fault inside a bridged call ($(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1 | cut -c1-80)): the worker was running guest code when it faulted, so a bridged-call report means the attached thread's bridge frame was not cleared while its callback ran"
+    elif grep -Fq "$ATTACH_REFUSED" "$out" "$err"; then
+        echo "the work function was refused rather than given a personality: $(grep -hF "$ATTACH_REFUSED" "$out" "$err" | head -1 | cut -c1-240)"
+    elif ! grep -Fq "$AT_FAULT_WORKER" "$out"; then
+        if [ "$rc" -eq 124 ]; then
+            echo "still running after ${NATIVE_TIMEOUT}s, and the work function never entered guest code on the worker"
+        else
+            echo "exit $rc, and the work function never entered guest code on the worker"
+        fi
+    elif grep -Fq "$AT_FAULT_SURVIVED" "$out"; then
+        echo "the work function read $BAD_GUEST_ADDR on the worker without faulting"
+    elif grep -Fq "$AT_FAULT_PAST" "$out"; then
+        echo "the main thread carried on past a fault its work function took on the worker"
+    elif grep -qE "$WILD_RE" "$out" "$err"; then
+        echo "exit $rc: a recovery path took the worker's fault instead of reporting a guest crash: $(grep -hE "$WILD_RE" "$out" "$err" | head -1 | cut -c1-120)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "still running after ${NATIVE_TIMEOUT}s: the work function reached its read of $BAD_GUEST_ADDR on the worker and the process never stopped, so the fault was swallowed or only the worker was stopped, and the main thread waits forever for a signal the worker never sends"
+    elif ! grep -Fq "$GUEST_CRASH" "$out" "$err"; then
+        echo "no guest-crash report for a fault the guest took in its own work function on an attached thread"
+    elif ! grep -Fq "guest_addr=$BAD_GUEST_ADDR" "$out" "$err"; then
+        echo "the guest-crash report does not name $BAD_GUEST_ADDR, the address the work function read"
+    elif [ "$rc" -ne "$GUEST_FAULT_STATUS" ]; then
+        echo "exit $rc, want $GUEST_FAULT_STATUS"
+    else
+        echo ""
+    fi
+}
+
+case_attach_guest_fault() {
+    local name=attach_guest_fault reason="" rc_jit rc_nojit
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local NATIVE_TIMEOUT=$ATTACH_TIMEOUT
+
+    if callback_fixture_missing "$name" "$AT_FAULT_BIN"; then
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$AT_FAULT_BIN"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$AT_FAULT_BIN"
+    rc_nojit=$?
+    reason="$(attach_fault_reason "$rc_jit" "$jo" "$je")"
+    if [ -z "$reason" ]; then
+        reason="$(attach_fault_reason "$rc_nojit" "$no" "$ne")"
+        if [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit no-jit exit=$rc_nojit"
+}
+
 case_env_native() {
     local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
@@ -1789,6 +2517,7 @@ case_native_static() {
 
 build_fixtures
 build_callback_fixtures
+build_attach_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -1822,6 +2551,16 @@ case_callback callback_bsearch "$CB_BSEARCH_BIN" bsearch \
 case_callback callback_recursion "$CB_RECURSION_BIN" recursion \
     "bit 0 is a level not entered exactly once, 1 a level not left exactly once, 2 the nesting not reaching depth 24, 3 a level running the other comparator, 4 a caller's elements changing under a nested level, 5 a level's array coming back unsorted, 6 a comparator entered on a misaligned stack, 7 the levels entered or left out of order"
 case_callback_guest_fault
+case_attach attach_async "$AT_ASYNC_BIN" attach_async \
+    "bit 0 is a null global queue or semaphore, 1 a dispatch_semaphore_wait returning non-zero, 2 a work function not run exactly once for its submission, 3 a work function handed a context the guest never submitted, 4 a work function computing a value other than the main thread's, 5 a work function run on the calling thread instead of a libdispatch worker, 6 a work function entered on a misaligned stack" \
+    "attach_async is the first guest code in the project to run on a thread the guest never created: a libdispatch worker has no guest cpu until the callback dispatcher attaches a personality to it, so a failure here means native code cannot call guest code on any thread of its own"
+case_attach attach_apply "$AT_APPLY_BIN" attach_apply \
+    "bit 0 is a null global queue, 1 an iteration never run, 2 an iteration run more than once, 3 an iteration's value or the checksum differing from the main thread's, 4 an iteration handed the wrong context, 5 an iteration index past the end, 6 an iteration entered on a misaligned stack, 7 every iteration run on the calling thread, so no worker was attached and nothing was tested"
+case_attach attach_nested_bridge "$AT_NESTED_BIN" attach_nested \
+    "bit 0 is a null global queue or semaphore, 1 the work function not run exactly once with its own context or the wait failing, 2 the work function run on the calling thread, 3 a wrong total from bridged strlen on the worker, 4 a wrong answer from bridged strcmp on the worker, 5 strings out of order after qsort on the worker, 6 a result that is not a permutation, 7 a comparator that never ran, 8 a comparator run on a thread other than the work function's, 9 a work function or comparator entered on a misaligned stack"
+case_attach attach_sync "$AT_SYNC_BIN" attach_sync \
+    "bit 0 is a null global queue, 1 the work function not run exactly once before each dispatch_sync_f returned, 2 a wrong context, 3 the work run on a thread other than the caller's, so reusing the caller's cpu went untested, 4 the work function's frame not just below its caller's on the caller's own guest stack, which means a second personality was built for a thread that already had a cpu, 5 the caller's own state changing across dispatch_sync_f, 6 a work function entered on a misaligned stack"
+case_attach_guest_fault
 case_env_native
 case_flag_beats_env
 case_last_flag_native
