@@ -66,8 +66,28 @@
  * the image needs no rebases, no binds and no chained fixups: __TEXT and
  * __DATA slide together, and a displacement between them computed at build
  * time is still correct at every load address.
+ *
+ * ---- what happens after the trap ----
+ * The trap lands in ocerz_vdylib_dispatch, which turns the export id back into
+ * the library and symbol it was minted from and asks the bridge whether it
+ * knows how to perform that call for real.  If it does, the call is made there
+ * and the guest goes on with the result in the registers x86 code expects.  If
+ * it does not, the export names itself and the run stops, which is what every
+ * export did before the bridge existed and what most of them still do; an
+ * export the bridge has no descriptor for is not a failure, only one nobody
+ * has written the crossing for yet.
+ *
+ * The descriptor is cached in the export's own table entry, together with the
+ * fact that the lookup has been made at all.  The bridge resolves by comparing
+ * strings, and this dispatch is on the path of every call a guest makes into a
+ * virtual library, so resolving per call would put a string search in front of
+ * memcpy - a cost that hides in a microbenchmark and does not hide in a
+ * program that calls memcpy a million times.  A lookup that comes back empty is
+ * remembered as empty for the same reason, so a name the bridge has already
+ * said it does not have is never searched for twice.
  */
 #include "ocerz/vdylib.h"
+#include "ocerz/bridge.h"
 #include "ocerz/dyldapi.h"
 #include "ocerz/interp.h"
 
@@ -226,6 +246,8 @@ static const VdLib g_vd_libs[] = {
 typedef struct VdExport {
     const char *lib;
     const char *sym;
+    const struct OcerzBridgeFn *fn;
+    int resolved;
 } VdExport;
 
 static VdExport g_vd_exports[VD_EXPORT_MAX];
@@ -255,6 +277,8 @@ static int vd_export_id(const char *lib, const char *sym)
         return -1;
     g_vd_exports[g_vd_exports_n].lib = lib;
     g_vd_exports[g_vd_exports_n].sym = sym;
+    g_vd_exports[g_vd_exports_n].fn = NULL;
+    g_vd_exports[g_vd_exports_n].resolved = 0;
     return g_vd_exports_n++;
 }
 
@@ -624,14 +648,30 @@ fail:
 
 int ocerz_vdylib_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    static int hooked = -1;
+    if (hooked < 0) {
+        hooked = 0;
+        if (getenv("OCERZ_BRIDGESTAT"))
+            atexit(ocerz_bridge_report);
+    }
+
     uint64_t id = cpu->gpr[OCERZ_R11] & 0xffffffffull;
 
-    if (id >= (uint64_t)g_vd_exports_n)
+    if (id >= (uint64_t)g_vd_exports_n) {
         fprintf(stderr, "ocerz: bridge: export id %llu is not one of the %d synthesized exports\n",
                 (unsigned long long)id, g_vd_exports_n);
-    else
-        fprintf(stderr, "ocerz: bridge: %s %s not implemented\n",
-                g_vd_exports[id].lib, g_vd_exports[id].sym);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+
+    VdExport *e = &g_vd_exports[id];
+    if (!e->resolved) {
+        e->fn = ocerz_bridge_lookup(e->lib, e->sym);
+        e->resolved = 1;
+    }
+    if (e->fn)
+        return ocerz_bridge_invoke(vm, cpu, e->fn);
+
+    fprintf(stderr, "ocerz: bridge: %s %s not implemented\n", e->lib, e->sym);
 
     exit(OCERZ_BRIDGE_UNIMPL_EXIT);
     return OCERZ_STEP_OK;
