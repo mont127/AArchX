@@ -329,6 +329,16 @@ A crossing costs about 33 ns, measured as the difference between a guest loop ca
 
 Guest code that never crosses pays nothing, which is why the last two rows are at parity. Closing the gap on the first two is a JIT change: recognizing a call whose target is a known stub and spilling only the registers the descriptor names, instead of leaving the block and re-entering through the dispatcher.
 
+A bridged call is the first place a thread the guest is driving runs native code, so a fault during one is not the guest's fault the way every earlier fault was. ocerz records which crossing a thread is in, and a fault inside one is reported as such and stops the process, naming the library, symbol, signature and host function, and saying whether the faulting address was in guest space, meaning the guest passed a bad pointer, or outside it, meaning ocerz marshalled the call wrong:
+
+```text
+ocerz: BRIDGE-FAULT[35366] SIGBUS inside a bridged call, not in guest code
+ocerz:   call=/usr/lib/libSystem.B.dylib:_strlen sig='L(p)' host_fn=0x18980eac0 depth=1
+ocerz:   cause: the fault address is in guest space, so the guest passed a bad pointer to _strlen
+```
+
+It stops rather than delivering the fault because the thread is several native frames deep, in code that can be neither resumed nor unwound. The check runs after the recoveries that re-run the faulting instruction, so a guest writing into a page it has already executed still has its translation invalidated and carries on, whether the write came from translated code or from a bridged `memcpy`. `OCERZ_BRIDGELOG=1` names every crossing as it happens.
+
 The guest binds every import, reaches `main`, and runs. Exit status 72 means it reached an export with no bridge behind it; 71 means an import never bound at all. The two are kept distinct so a failure says which happened. The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once; children inherit it through `OCERZ_MODE`. A static image is refused, since native mode has no static loader path. `tests/unit/test_vdylib.c` pins the synthesized image's structure and resolves every export through the loader's own trie walker, and `tests/run_native_tests.sh` pins the selection rules, the absent cache, the bridge report and the exit statuses, and that cache mode is unchanged.
 
 ## Limitations
