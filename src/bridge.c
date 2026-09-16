@@ -27,10 +27,19 @@
  * while x86-64 passes them in registers, and a signature has nowhere to say
  * where a function's fixed arguments stop, so a bridged printf, open, fcntl or
  * ioctl would be quietly wrong rather than refused.  They stay out of the table
- * and fall back to naming themselves.  So does anything taking a callback,
- * qsort and bsearch above all, because calling back into guest code needs a
- * trampoline that does not exist yet.  A structure passed or returned by value
+ * and fall back to naming themselves.  A structure passed or returned by value
  * needs no rule here at all: the parser refuses the notation for one.
+ *
+ * ---- functions that call back ----
+ * qsort and bsearch take a comparator, which the guest supplies as x86 code.
+ * Their signatures name that argument with class c and the comparator's own
+ * signature in braces, and the engine interns the guest function to a native
+ * trampoline before the call, so this table needs nothing beyond the notation.
+ * While the comparator runs the thread is executing guest code again, not native
+ * code, so ocerz_bridge_guest_enter clears the frame for that stretch and
+ * ocerz_bridge_guest_leave restores it: a fault inside the comparator is the
+ * guest's, handled the ordinary way, and a strcmp the comparator makes raises
+ * and lowers a frame of its own inside it.
  *
  * ---- why null has to survive the conversion ----
  * ocerz_g2h is affine: it adds a base.  Applied to a null guest pointer it
@@ -69,12 +78,11 @@
  * _exit above all: a frame raised around a function that never returns would
  * stay raised for the rest of the process.  A fault recovered by jumping out of
  * a crossing instead of returning through it is the one exit the pair cannot
- * see; nothing does that today, because the crash handler stops the process on a
- * fault inside a crossing rather than jumping out of one, but the moment native
- * code can call back into guest code a guest fault will recover by jumping past
- * a live crossing, and the frame will have to be reset there or every later
- * fault on that thread will be blamed on the bridge.
- * is across nothing again.
+ * see, and nothing takes it.  The crash handler stops the process on a fault in
+ * native code rather than jumping out, and a guest fault inside a callback does
+ * not jump past the crossing either: the guest call installs its own recovery
+ * point, so the recovery lands inside the callback, below the saved frame, and
+ * the frame is put back when the callback returns.
  *
  * The frame is read from inside a signal handler, which may not allocate and
  * may not take a lock, so it copies nothing: every string in it is a literal
@@ -128,50 +136,52 @@ static int br_stack_chk_fail(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 
 static struct OcerzBridgeFn g_br_fns[] = {
-    { BR_LIBSYSTEM, "___bzero",  "bzero",   "v(pL)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_memcpy",   "memcpy",  "p(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_memmove",  "memmove", "p(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_memset",   "memset",  "p(piL)", NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_memcmp",   "memcmp",  "i(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_memchr",   "memchr",  "p(piL)", NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strlen",   "strlen",  "L(p)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strnlen",  "strnlen", "L(pL)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strcmp",   "strcmp",  "i(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strncmp",  "strncmp", "i(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strcpy",   "strcpy",  "p(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strncpy",  "strncpy", "p(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strcat",   "strcat",  "p(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strchr",   "strchr",  "p(pi)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strrchr",  "strrchr", "p(pi)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strstr",   "strstr",  "p(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strdup",   "strdup",  "p(p)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "___bzero",  "bzero",   "v(pL)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_memcpy",   "memcpy",  "p(ppL)", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_memmove",  "memmove", "p(ppL)", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_memset",   "memset",  "p(piL)", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_memcmp",   "memcmp",  "i(ppL)", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_memchr",   "memchr",  "p(piL)", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strlen",   "strlen",  "L(p)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strnlen",  "strnlen", "L(pL)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strcmp",   "strcmp",  "i(pp)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strncmp",  "strncmp", "i(ppL)", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strcpy",   "strcpy",  "p(pp)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strncpy",  "strncpy", "p(ppL)", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strcat",   "strcat",  "p(pp)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strchr",   "strchr",  "p(pi)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strrchr",  "strrchr", "p(pi)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strstr",   "strstr",  "p(pp)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strdup",   "strdup",  "p(p)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
 
-    { BR_LIBSYSTEM, "_malloc",   "malloc",  "p(L)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_calloc",   "calloc",  "p(LL)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_realloc",  "realloc", "p(pL)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_free",     "free",    "v(p)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_malloc",   "malloc",  "p(L)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_calloc",   "calloc",  "p(LL)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_realloc",  "realloc", "p(pL)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_free",     "free",    "v(p)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
 
-    { BR_LIBSYSTEM, "_write",    "write",   "l(ipL)", NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_read",     "read",    "l(ipL)", NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_close",    "close",   "i(i)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_puts",     "puts",    "i(p)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_putchar",  "putchar", "i(i)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_getenv",   "getenv",  "p(p)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_getpid",   "getpid",  "i()",    NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_isatty",   "isatty",  "i(i)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_abs",      "abs",     "i(i)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_labs",     "labs",    "l(l)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_atoi",     "atoi",    "i(p)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_atol",     "atol",    "l(p)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_atof",     "atof",    "d(p)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_strtod",   "strtod",  "d(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_time",     "time",    "l(p)",   NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_clock",    "clock",   "L()",    NULL, NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "___error",  "__error", "p()",    NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_write",    "write",   "l(ipL)", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_read",     "read",    "l(ipL)", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_close",    "close",   "i(i)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_puts",     "puts",    "i(p)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_putchar",  "putchar", "i(i)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_getenv",   "getenv",  "p(p)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_getpid",   "getpid",  "i()",    NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_isatty",   "isatty",  "i(i)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_abs",      "abs",     "i(i)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_labs",     "labs",    "l(l)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_atoi",     "atoi",    "i(p)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_atol",     "atol",    "l(p)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_atof",     "atof",    "d(p)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_strtod",   "strtod",  "d(pp)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_qsort",    "qsort",   "v(pLLc{i(pp)})",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_bsearch",  "bsearch", "p(ppLLc{i(pp)})", NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_time",     "time",    "l(p)",   NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_clock",    "clock",   "L()",    NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___error",  "__error", "p()",    NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
 
-    { BR_LIBSYSTEM, "_exit",             NULL, NULL, br_exit,            NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "_abort",            NULL, NULL, br_abort,           NULL, { 0, { 0 }, 0 } },
-    { BR_LIBSYSTEM, "___stack_chk_fail", NULL, NULL, br_stack_chk_fail,  NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_exit",             NULL, NULL, br_exit,            NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_abort",            NULL, NULL, br_abort,           NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___stack_chk_fail", NULL, NULL, br_stack_chk_fail,  NULL, { 0, { 0 }, { { 0 } }, 0 } },
 };
 
 #define BR_FNS ((int)(sizeof g_br_fns / sizeof g_br_fns[0]))
@@ -213,6 +223,17 @@ static __thread struct OcerzBridgeFrame g_br_frame;
 const struct OcerzBridgeFrame *ocerz_bridge_in_flight(void)
 {
     return g_br_frame.depth > 0 ? &g_br_frame : NULL;
+}
+
+void ocerz_bridge_guest_enter(struct OcerzBridgeFrame *saved)
+{
+    *saved = g_br_frame;
+    memset(&g_br_frame, 0, sizeof g_br_frame);
+}
+
+void ocerz_bridge_guest_leave(const struct OcerzBridgeFrame *saved)
+{
+    g_br_frame = *saved;
 }
 
 static int br_logging(void)

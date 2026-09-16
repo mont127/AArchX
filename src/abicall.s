@@ -50,6 +50,39 @@
  * A null result slot means the caller does not want that half of the result,
  * which is what a void return, and any return that touches only one bank, asks
  * for.
+ *
+ * ---- the callback bank ----
+ * The rest of the file runs the other way: native code calling guest code.  A
+ * native function such as qsort receives a function pointer and calls it, and
+ * when the guest supplied that pointer it names x86 code the native side cannot
+ * jump to.  So it is handed the address of one slot in a bank of arm64
+ * trampolines instead, and src/abi.c remembers which guest function and which
+ * signature that slot stands for.
+ *
+ * The bank is assembled, not generated while the process runs.  Writing a
+ * trampoline from inside a native callback would contend with the translator
+ * for the one writable JIT arena, a forked child abandons that arena while
+ * native code may still hold pointers into it, and an audio callback on a
+ * real-time thread cannot wait for any of it.  Every slot is the same two
+ * instructions, an adr of the slot's own address into x16 and a branch to the
+ * common entry, so the whole bank is one repeated block and a slot's index is
+ * its distance from the start of the bank divided by eight.  x16 is the
+ * intra-procedure-call scratch register a linker veneer is allowed to clobber,
+ * so borrowing it between the call and the common entry is legal.  The end
+ * symbol is an alternate entry of the same atom, because a separate atom could
+ * be placed anywhere by the linker and the distance between the two would stop
+ * meaning the bank's length.
+ *
+ * The common entry is an ordinary AAPCS64 function to whoever called the slot.
+ * It takes the incoming stack pointer before its own frame moves it, because
+ * that is where the caller's stacked arguments begin, then saves x0..x7 and the
+ * low 64 bits of v0..v7 in the same representation the forward caller loads, so
+ * a float is the low half of its word.  The dispatcher gets the slot index, the
+ * two arrays, the caller's stack and two words to write the result into, and
+ * the entry loads x0 and d0 from those words on the way out.  Its frame is
+ * exactly 160 bytes, a record plus sixteen argument words plus two result
+ * words, so sp is a multiple of sixteen at every instruction and not merely at
+ * the call.
  */
 .section __TEXT,__text,regular,pure_instructions
 .globl _ocerz_abi_call_native
@@ -124,6 +157,52 @@ Lnofp:
     ldr     x19, [sp, #32]
     ldp     x21, x20, [sp, #16]
     ldp     x23, x22, [sp], #64
+    ret
+    .cfi_endproc
+
+.p2align 2
+.globl _ocerz_abi_callback_bank
+_ocerz_abi_callback_bank:
+.rept 4096
+    adr     x16, .
+    b       _ocerz_abi_callback_common
+.endr
+.globl _ocerz_abi_callback_bank_end
+.alt_entry _ocerz_abi_callback_bank_end
+_ocerz_abi_callback_bank_end:
+
+.p2align 2
+_ocerz_abi_callback_common:
+    .cfi_startproc
+    mov     x17, sp
+    stp     x29, x30, [sp, #-160]!
+    .cfi_def_cfa_offset 160
+    .cfi_offset w30, -152
+    .cfi_offset w29, -160
+    mov     x29, sp
+    .cfi_def_cfa w29, 160
+    stp     x0, x1, [sp, #16]
+    stp     x2, x3, [sp, #32]
+    stp     x4, x5, [sp, #48]
+    stp     x6, x7, [sp, #64]
+    stp     d0, d1, [sp, #80]
+    stp     d2, d3, [sp, #96]
+    stp     d4, d5, [sp, #112]
+    stp     d6, d7, [sp, #128]
+    stp     xzr, xzr, [sp, #144]
+    adrp    x0, _ocerz_abi_callback_bank@PAGE
+    add     x0, x0, _ocerz_abi_callback_bank@PAGEOFF
+    sub     x0, x16, x0
+    lsr     x0, x0, #3
+    add     x1, sp, #16
+    add     x2, sp, #80
+    mov     x3, x17
+    add     x4, sp, #144
+    add     x5, sp, #152
+    bl      _ocerz_abi_callback_dispatch
+    ldr     x0, [sp, #144]
+    ldr     d0, [sp, #152]
+    ldp     x29, x30, [sp], #160
     ret
     .cfi_endproc
 
