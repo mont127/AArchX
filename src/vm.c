@@ -151,6 +151,20 @@
  * initializer enters guest code once, but a callback enters it once per
  * comparison, and a sort of a few thousand elements made tens of thousands of
  * entries that each called getenv twice.
+ *
+ * The sentinel return address is a page of int3 bytes at 0x500000000 when that
+ * address is free, and 0xdeadca11, which nothing maps, when it is not.  The page
+ * is asked for with the address as a hint and never with MAP_FIXED.  MAP_FIXED
+ * replaces whatever is already there without a word, and in roughly one dynamic
+ * run in five the host's own allocator had already put something at that
+ * address, so the fill wrote breakpoint bytes over live ocerz memory.  Most of
+ * the time the damage was silent.  When it landed on the JIT's block hash
+ * chains, a later lookup followed a pointer of 0xcccccccccccccccc, faulted
+ * inside the translator while it held the JIT lock, and the wild-fault path left
+ * with the lock still held, so the thread then waited on itself forever.  In a
+ * Wine process whose low-shadow block took 0x500000000 as its base, the same
+ * fill turned guest address zero into a readable page and a guest null
+ * dereference into a read of 0xcc.
  */
 #include "ocerz/vm.h"
 #include "ocerz/dyld.h"
@@ -2560,11 +2574,13 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     if (!sentinel) {
         void *want = (void *)(uintptr_t)0x500000000ull;
         void *p = mmap(want, 0x1000, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+                       MAP_PRIVATE | MAP_ANON, -1, 0);
         if (p == want) {
             memset(p, 0xcc, 0x1000);
             sentinel = 0x500000000ull;
         } else {
+            if (p != MAP_FAILED)
+                munmap(p, 0x1000);
             sentinel = OCERZ_CALL_SENTINEL;
         }
         OCERZ_LOG("vm: call sentinel page at %#llx\n", (unsigned long long)sentinel);
