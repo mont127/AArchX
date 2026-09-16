@@ -241,10 +241,105 @@
 # times out says how far it got, and says first whether the callback dispatcher
 # reported that it could not attach a personality at all.
 #
-# The callback and attach cases skip where there is no x86_64 clang, like the
-# others, but a fixture of theirs that fails to compile where a trivial x86_64
-# program compiles fine is a failure: skipping it would hide a broken fixture
-# indefinitely.
+# M7a gives native mode guest threads without a thread mechanism of its own.
+# pthread_create's start routine is a callback held past the call and run on a
+# thread the guest never created, which is M5 and M6 together, so pthread_create
+# is bridged as i(ppc{p(p)}p): the native pthread_create starts a host thread,
+# that thread enters the callback trampoline, is given a guest personality on the
+# way in and runs the start routine, and the value the start routine returns comes
+# back through pthread_join. pthread_self, pthread_detach and the mutex and
+# condition functions are forwarded as they are, which is sound only because
+# pthread_mutex_t, pthread_cond_t and their static initializers have the same
+# size, alignment and signature on x86_64 and arm64, so a mutex a guest
+# initialized statically is a valid native mutex. Four of the five thread_*
+# fixtures are shaped like the attach ones, a single status line with the bits in
+# source order and progress notes on stderr, run under both engines and compared
+# with cache mode, where the real x86 libpthread runs the same start routines on
+# threads ocerz creates for the guest.
+#
+# The thread fixtures are the only ones built without -fno-stack-protector, and
+# that is deliberate. clang emits the stack protector by default, and a protected
+# x86_64 function reads ___stack_chk_guard, which is a data symbol rather than a
+# function. Until M7a the virtual libSystem exported only functions, so a
+# protected program could not bind in native mode at all, which is to say nearly
+# no real program could, and every older fixture passes the flag because it was
+# written while that was true; they keep it, so that each still isolates the one
+# thing it was written for. M7a exports the guard and the thread fixtures prove
+# it. thread_bridged_work and thread_guest_fault keep buffers of their own on the
+# new thread's stack and the others the buffer of the progress note they write,
+# so the protector reads the guard on the new thread as well as in main, and each
+# case checks with nm that its fixture really imports ___stack_chk_guard, because
+# a toolchain that stopped emitting the protector would let the case pass without
+# proving anything. A guard that does not bind is an unresolved import like any
+# other, and the case names it as the missing data export. These fixtures also
+# include <pthread.h> where the older ones declare what they call by hand, because
+# the real x86_64 PTHREAD_MUTEX_INITIALIZER is the thing being forwarded.
+#
+# thread_create_join creates eight threads and joins them, then does it again, so
+# the second eight run on host threads created after the first eight were torn
+# down. Each start routine returns a value derived from its argument with bits
+# set above bit 32, so a result cut to 32 bits anywhere between the guest's RAX
+# and pthread_join reads as wrong, and records pthread_self(), which must equal
+# the pthread_t pthread_create handed back, differ from the main thread's, stay
+# the same across the routine and not be shared by two threads alive at once.
+#
+# thread_mutex runs eight threads that each take a PTHREAD_MUTEX_INITIALIZER mutex
+# 25000 times and, holding it, read a shared counter, add one and write it back;
+# the count must come out exactly 200000. The main thread holds the mutex while it
+# creates them, so all eight contend from the start. The count is sized so that a
+# mutex which did not exclude would almost certainly lose increments: a build of
+# this fixture with the lock and unlock replaced by calls that take time and
+# exclude nothing lost more than two thirds of the 200000 on every run under
+# Rosetta. The fixture also counts entries into the critical section that find
+# another thread already inside, and keeps a second tally under a mutex from
+# pthread_mutex_init.
+#
+# thread_cond hands a thousand values from a producer thread to a consumer thread
+# through one mutex and two condition variables, one statically initialized and
+# one from pthread_cond_init, and every wait sits in a loop that rechecks its
+# predicate, so a spurious wakeup costs a turn of the loop and nothing more. The
+# consumer asks for each value and looks for it without letting go of the mutex
+# it asked under, so the producer cannot have supplied it yet and the consumer
+# really blocks in pthread_cond_wait at least once per value: fewer waits than
+# values means the slot was filled while the consumer held the mutex. Each value
+# carries its sequence number and a payload derived from it, so a value lost,
+# repeated, reordered or corrupted each sets a bit of its own, and every thread
+# checks on taking the mutex, including on return from a wait, that no other
+# thread holds it. The main thread waits for the consumer to finish on the same
+# condition the producer waits on, which is why an ask is a
+# pthread_cond_broadcast: a signal could wake the main thread instead of the
+# producer and leave both waiting.
+#
+# thread_bridged_work runs six threads that make bridged calls from their start
+# routines -- strlen and memcpy into a buffer on the thread's stack, malloc,
+# memcpy and free on the heap, and qsort with a guest comparator that calls
+# pthread_self -- so each thread carries crossings, callbacks inside them and a
+# crossing inside those. The comparator must run on the thread that called qsort,
+# and each thread's checksum must equal the one the main thread computes
+# afterwards without a bridged call.
+#
+# thread_guest_fault is attach_guest_fault moved onto a guest thread. Its start
+# routine writes a mark and then reads the same unmapped 0x6000000000, and the
+# process must end the way a guest fault ends everywhere else in this gate -- a
+# guest-crash report naming the address, status 139, nothing written after the
+# read, pthread_join never returning and no BRIDGE-FAULT line -- under both
+# engines, with identical output. A bridged-call report there would mean the new
+# thread's bridge frame was raised while its start routine ran. It is not compared
+# with cache mode, for the reason attach_guest_fault is not.
+#
+# The thread runs are bounded at THREAD_TIMEOUT seconds, and their fixtures write
+# progress notes to stderr -- calling and returning from pthread_create and
+# pthread_join, a start routine entering and leaving guest code, the main
+# thread's own condition wait -- because the likeliest failure is again a wait
+# that never returns: a thread that never reaches its start routine leaves the
+# main thread in pthread_join forever, and a mutex or condition that never wakes
+# its waiter leaves a start routine blocked. A timeout says which it was, in
+# cache mode as well as native, since the notes are written in both.
+#
+# The callback, attach and thread cases skip where there is no x86_64 clang,
+# like the others, but a fixture of theirs that fails to compile where a trivial
+# x86_64 program compiles fine is a failure: skipping it would hide a broken
+# fixture indefinitely.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -312,6 +407,18 @@ AT_FAULT_SURVIVED='attfault survived'
 AT_FAULT_PAST='attfault returned'
 ATTACH_TIMEOUT=30
 ATTACH_REFUSED='ocerz: abi: native code called guest function'
+TH_CREATE_BIN=""
+TH_MUTEX_BIN=""
+TH_COND_BIN=""
+TH_WORK_BIN=""
+TH_FAULT_BIN=""
+TH_FAULT_MARK='thrfault enter'
+TH_FAULT_THREAD='thrfault thread'
+TH_FAULT_SURVIVED='thrfault survived'
+TH_FAULT_PAST='thrfault returned'
+TH_FAULT_NOCREATE='thrfault create failed'
+THREAD_TIMEOUT=30
+STACK_GUARD_SYM=___stack_chk_guard
 
 unset OCERZ_MODE
 unset OCERZ_BRIDGE_PROBE_UNSET
@@ -1697,6 +1804,688 @@ EOC
     done
 }
 
+build_thread_fixtures() {
+    local name
+
+    cat > "$TMP/thread_common.h" <<'EOC'
+#include <pthread.h>
+#include "attach_common.h"
+
+void *memcpy(void *, const void *, cb_size);
+void *malloc(cb_size);
+void free(void *);
+
+#define TH_IN(p, arr) ((cb_uptr)(p) - (cb_uptr)(arr) < sizeof (arr) && ((cb_uptr)(p) - (cb_uptr)(arr)) % sizeof (arr)[0] == 0)
+EOC
+
+    cat > "$TMP/thread_create_join.c" <<'EOC'
+#include "thread_common.h"
+
+#define WAVES 2
+#define PER_WAVE 8
+#define TOTAL (WAVES * PER_WAVE)
+#define TAG "thread_create_join"
+
+struct slot {
+    unsigned runs;
+    unsigned skew;
+    pthread_t self;
+    pthread_t self_again;
+};
+
+static struct slot g_slot[TOTAL];
+static unsigned g_bad_arg;
+
+static cb_uptr expect(unsigned k)
+{
+    return ((cb_uptr)(k + 1) << 36) | at_mix(k ^ 0x54485244u);
+}
+
+static void *start(void *arg)
+{
+    struct slot *s = arg;
+    unsigned k;
+
+    at_note(TAG, "thread entered");
+    if (!TH_IN(s, g_slot)) {
+        g_bad_arg++;
+        at_note(TAG, "thread leaving");
+        return 0;
+    }
+    k = (unsigned)(s - g_slot);
+    s->runs++;
+    if (CB_SKEWED())
+        s->skew++;
+    s->self = pthread_self();
+    s->self_again = pthread_self();
+    at_note(TAG, "thread leaving");
+    return (void *)expect(k);
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, value = 17;
+    pthread_t main_self = pthread_self();
+    pthread_t tid[PER_WAVE];
+    int ok_tid[PER_WAVE];
+    void *ret;
+    int w, i, j, k;
+    int created = 1, joined = 1, ran = 1, results = 1, match = 1, not_main = 1;
+    int stable = 1, distinct = 1, skew = 0;
+
+    for (w = 0; w < WAVES; w++) {
+        for (i = 0; i < PER_WAVE; i++) {
+            at_note(TAG, "calling pthread_create");
+            ok_tid[i] = pthread_create(&tid[i], 0, start, &g_slot[w * PER_WAVE + i]) == 0;
+            at_note(TAG, "returned from pthread_create");
+            if (!ok_tid[i])
+                created = 0;
+        }
+        for (i = 0; i < PER_WAVE; i++)
+            for (j = 0; j < i; j++)
+                if (ok_tid[i] && ok_tid[j] && tid[i] == tid[j])
+                    distinct = 0;
+        for (i = 0; i < PER_WAVE; i++) {
+            k = w * PER_WAVE + i;
+            ret = 0;
+            if (ok_tid[i]) {
+                at_note(TAG, "calling pthread_join");
+                if (pthread_join(tid[i], &ret) != 0)
+                    joined = 0;
+                at_note(TAG, "returned from pthread_join");
+            }
+            if ((cb_uptr)ret != expect((unsigned)k))
+                results = 0;
+            if (g_slot[k].runs != 1)
+                ran = 0;
+            if (!ok_tid[i] || g_slot[k].self != tid[i])
+                match = 0;
+            if (g_slot[k].self == main_self)
+                not_main = 0;
+            if (g_slot[k].self_again != g_slot[k].self)
+                stable = 0;
+            if (g_slot[k].skew)
+                skew = 1;
+            value = value * 31u + (unsigned)((cb_uptr)ret >> 32);
+            value = value * 31u + (unsigned)(cb_uptr)ret;
+        }
+    }
+    if (pthread_self() != main_self)
+        stable = 0;
+    CK(created);
+    CK(joined);
+    CK(ran && g_bad_arg == 0);
+    CK(results);
+    CK(match);
+    CK(not_main);
+    CK(stable);
+    CK(distinct);
+    CK(!skew);
+
+    cb_begin(TAG, m);
+    cb_field("threads", TOTAL, 0);
+    cb_field("value", value, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/thread_mutex.c" <<'EOC'
+#include "thread_common.h"
+
+#define THREADS 8
+#define ROUNDS 25000
+#define TAG "thread_mutex"
+
+struct worker {
+    unsigned long done;
+    unsigned lock_err;
+    unsigned skew;
+};
+
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_tally_lock;
+static struct worker g_w[THREADS];
+static volatile unsigned long g_count;
+static volatile int g_inside;
+static unsigned g_overlap, g_bad_arg, g_tally;
+
+static void *start(void *arg)
+{
+    struct worker *w = arg;
+    unsigned long v, r;
+
+    at_note(TAG, "thread entered");
+    if (!TH_IN(w, g_w)) {
+        g_bad_arg++;
+        at_note(TAG, "thread leaving");
+        return 0;
+    }
+    if (CB_SKEWED())
+        w->skew++;
+    for (r = 0; r < ROUNDS; r++) {
+        if (pthread_mutex_lock(&g_lock) != 0) {
+            w->lock_err++;
+            continue;
+        }
+        if (g_inside)
+            g_overlap++;
+        g_inside = 1;
+        v = g_count;
+        v += 1;
+        g_count = v;
+        g_inside = 0;
+        if (pthread_mutex_unlock(&g_lock) != 0)
+            w->lock_err++;
+        w->done++;
+    }
+    if (pthread_mutex_lock(&g_tally_lock) != 0)
+        w->lock_err++;
+    g_tally += (unsigned)(w - g_w) + 1u;
+    if (pthread_mutex_unlock(&g_tally_lock) != 0)
+        w->lock_err++;
+    at_note(TAG, "thread leaving");
+    return w;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, want_tally = 0;
+    pthread_t tid[THREADS];
+    int ok_tid[THREADS];
+    void *ret;
+    int i, created = 1, joined = 1, results = 1, done = 1, lock_err = 0, skew = 0;
+    int init_ok, gate_ok, destroy_ok;
+
+    init_ok = pthread_mutex_init(&g_tally_lock, 0) == 0;
+    gate_ok = pthread_mutex_lock(&g_lock) == 0;
+    for (i = 0; i < THREADS; i++) {
+        at_note(TAG, "calling pthread_create");
+        ok_tid[i] = pthread_create(&tid[i], 0, start, &g_w[i]) == 0;
+        at_note(TAG, "returned from pthread_create");
+        if (!ok_tid[i])
+            created = 0;
+    }
+    if (pthread_mutex_unlock(&g_lock) != 0)
+        gate_ok = 0;
+    for (i = 0; i < THREADS; i++) {
+        ret = 0;
+        if (ok_tid[i]) {
+            at_note(TAG, "calling pthread_join");
+            if (pthread_join(tid[i], &ret) != 0)
+                joined = 0;
+            at_note(TAG, "returned from pthread_join");
+        }
+        if (ret != &g_w[i])
+            results = 0;
+        if (g_w[i].done != ROUNDS)
+            done = 0;
+        if (g_w[i].lock_err)
+            lock_err = 1;
+        if (g_w[i].skew)
+            skew = 1;
+        want_tally += (unsigned)i + 1u;
+    }
+    destroy_ok = pthread_mutex_destroy(&g_lock) == 0 && pthread_mutex_destroy(&g_tally_lock) == 0;
+    CK(created && joined && results && g_bad_arg == 0);
+    CK(init_ok && gate_ok && !lock_err && destroy_ok);
+    CK(done);
+    CK(g_count == (unsigned long)THREADS * ROUNDS);
+    CK(g_overlap == 0);
+    CK(g_tally == want_tally);
+    CK(!skew);
+
+    cb_begin(TAG, m);
+    cb_field("threads", THREADS, 0);
+    cb_field("count", (unsigned)g_count, 0);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/thread_cond.c" <<'EOC'
+#include "thread_common.h"
+
+#define VALUES 1000
+#define TAG "thread_cond"
+
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_filled = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_asked;
+static unsigned g_requested, g_finished, g_full, g_holder;
+static unsigned long long g_slot;
+static unsigned g_prod_err, g_cons_err, g_main_err, g_excl, g_skew;
+static unsigned g_cons_waits, g_received, g_dup, g_order, g_payload, g_range;
+static unsigned g_sum = 17;
+static unsigned char g_seen[VALUES];
+static const char g_prod_token[] = "producer";
+static const char g_cons_token[] = "consumer";
+
+static unsigned long long value_of(unsigned k)
+{
+    return ((unsigned long long)k << 32) | at_mix(k + 0x434f4e44u);
+}
+
+static void hold(unsigned who)
+{
+    if (g_holder != 0)
+        g_excl++;
+    g_holder = who;
+}
+
+static void *producer(void *arg)
+{
+    unsigned k = 0;
+
+    at_note(TAG, "thread entered");
+    if (CB_SKEWED())
+        g_skew++;
+    if (arg != g_prod_token)
+        g_prod_err++;
+    if (pthread_mutex_lock(&g_lock) != 0)
+        g_prod_err++;
+    hold(1);
+    for (;;) {
+        while (g_requested == k && !g_finished) {
+            g_holder = 0;
+            if (pthread_cond_wait(&g_asked, &g_lock) != 0)
+                g_prod_err++;
+            hold(1);
+        }
+        if (g_requested == k)
+            break;
+        g_slot = value_of(k);
+        g_full = 1;
+        k++;
+        if (pthread_cond_signal(&g_filled) != 0)
+            g_prod_err++;
+    }
+    g_holder = 0;
+    if (pthread_mutex_unlock(&g_lock) != 0)
+        g_prod_err++;
+    at_note(TAG, "thread leaving");
+    return arg;
+}
+
+static void *consumer(void *arg)
+{
+    unsigned long long v;
+    unsigned k, got, next = 0;
+
+    at_note(TAG, "thread entered");
+    if (CB_SKEWED())
+        g_skew++;
+    if (arg != g_cons_token)
+        g_cons_err++;
+    for (k = 0; k < VALUES; k++) {
+        if (pthread_mutex_lock(&g_lock) != 0)
+            g_cons_err++;
+        hold(2);
+        g_requested = k + 1;
+        if (pthread_cond_broadcast(&g_asked) != 0)
+            g_cons_err++;
+        while (!g_full) {
+            g_cons_waits++;
+            g_holder = 0;
+            if (pthread_cond_wait(&g_filled, &g_lock) != 0)
+                g_cons_err++;
+            hold(2);
+        }
+        v = g_slot;
+        g_full = 0;
+        g_holder = 0;
+        if (pthread_mutex_unlock(&g_lock) != 0)
+            g_cons_err++;
+        got = (unsigned)(v >> 32);
+        if (got >= VALUES) {
+            g_range++;
+            continue;
+        }
+        if (g_seen[got]++)
+            g_dup++;
+        if (got != next)
+            g_order++;
+        next = got + 1;
+        if ((unsigned)v != at_mix(got + 0x434f4e44u))
+            g_payload++;
+        g_received++;
+        g_sum = g_sum * 31u + (unsigned)v;
+    }
+    if (pthread_mutex_lock(&g_lock) != 0)
+        g_cons_err++;
+    hold(2);
+    g_finished = 1;
+    if (pthread_cond_broadcast(&g_asked) != 0)
+        g_cons_err++;
+    g_holder = 0;
+    if (pthread_mutex_unlock(&g_lock) != 0)
+        g_cons_err++;
+    at_note(TAG, "thread leaving");
+    return arg;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, k, missing = 0;
+    pthread_t prod, cons;
+    int prod_ok, cons_ok, joined = 1;
+    void *ret = 0;
+
+    if (pthread_cond_init(&g_asked, 0) != 0)
+        g_main_err++;
+    at_note(TAG, "calling pthread_create");
+    cons_ok = pthread_create(&cons, 0, consumer, (void *)g_cons_token) == 0;
+    at_note(TAG, "returned from pthread_create");
+    at_note(TAG, "calling pthread_create");
+    prod_ok = pthread_create(&prod, 0, producer, (void *)g_prod_token) == 0;
+    at_note(TAG, "returned from pthread_create");
+
+    if (cons_ok) {
+        if (pthread_mutex_lock(&g_lock) != 0)
+            g_main_err++;
+        hold(3);
+        at_note(TAG, "waiting");
+        while (!g_finished) {
+            g_holder = 0;
+            if (pthread_cond_wait(&g_asked, &g_lock) != 0)
+                g_main_err++;
+            hold(3);
+        }
+        at_note(TAG, "wait returned");
+        g_holder = 0;
+        if (pthread_mutex_unlock(&g_lock) != 0)
+            g_main_err++;
+    }
+    if (prod_ok) {
+        at_note(TAG, "calling pthread_join");
+        if (pthread_join(prod, 0) != 0)
+            joined = 0;
+        at_note(TAG, "returned from pthread_join");
+    }
+    if (cons_ok) {
+        at_note(TAG, "calling pthread_join");
+        if (pthread_join(cons, &ret) != 0)
+            joined = 0;
+        at_note(TAG, "returned from pthread_join");
+    }
+    for (k = 0; k < VALUES; k++)
+        if (g_seen[k] == 0)
+            missing++;
+    if (pthread_mutex_destroy(&g_lock) != 0)
+        g_main_err++;
+
+    CK(prod_ok && cons_ok && joined && ret == g_cons_token);
+    CK(g_prod_err == 0 && g_cons_err == 0 && g_main_err == 0);
+    CK(g_received == VALUES && missing == 0 && g_range == 0);
+    CK(g_dup == 0);
+    CK(g_order == 0);
+    CK(g_payload == 0);
+    CK(g_excl == 0);
+    CK(g_cons_waits >= VALUES);
+    CK(g_skew == 0);
+
+    cb_begin(TAG, m);
+    cb_field("values", g_received, 0);
+    cb_field("sum", g_sum, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/thread_bridged_work.c" <<'EOC'
+#include "thread_common.h"
+
+#define THREADS 6
+#define ROUNDS 12
+#define N 96
+#define TAG "thread_bridged_work"
+
+static const char *const g_words[] = {
+    "pthread_create", "start routine", "trampoline", "personality", "guest",
+    "native", "strlen", "memcpy", "qsort", "comparator", "", "x86_64", "arm64",
+    "join", "mutex", "condition variable", "AArchX", "ocerz",
+};
+#define NW ((unsigned)(sizeof g_words / sizeof g_words[0]))
+
+struct job;
+
+struct item {
+    int key;
+    struct job *owner;
+};
+
+struct job {
+    pthread_t self;
+    unsigned runs;
+    unsigned calls;
+    unsigned wrong_thread;
+    unsigned skew;
+    unsigned copy_bad;
+    unsigned heap_bad;
+    unsigned sort_bad;
+    unsigned sum;
+};
+
+static struct job g_job[THREADS];
+static unsigned g_bad_arg, g_bad_owner;
+
+static int cmp_key(const void *a, const void *b)
+{
+    const struct item *x = a, *y = b;
+    struct job *j = x->owner;
+
+    if (!TH_IN(j, g_job)) {
+        g_bad_owner++;
+        return 0;
+    }
+    j->calls++;
+    if (y->owner != j || pthread_self() != j->self)
+        j->wrong_thread++;
+    if (CB_SKEWED())
+        j->skew++;
+    return x->key < y->key ? -65536 : (x->key > y->key ? 65536 : 0);
+}
+
+static unsigned own_len(const char *s)
+{
+    unsigned n = 0;
+    while (s[n])
+        n++;
+    return n;
+}
+
+static unsigned expect_sum(unsigned t)
+{
+    unsigned h = 17, r, i, n, c;
+    const char *w;
+
+    for (r = 0; r < ROUNDS; r++) {
+        for (i = 0; i < NW; i++) {
+            w = g_words[(i + t + r) % NW];
+            n = own_len(w);
+            h = h * 31u + n;
+            for (c = 0; c < n; c++)
+                h = h * 31u + (unsigned char)w[c];
+        }
+        for (i = 0; i < N; i++)
+            h = h * 31u + (unsigned)((int)i - N / 2);
+    }
+    return h;
+}
+
+static void *start(void *arg)
+{
+    struct job *j = arg;
+    struct item items[N];
+    char buf[48];
+    char *heap;
+    const char *w;
+    unsigned h = 17, r, i, c, t;
+    cb_size n;
+
+    at_note(TAG, "thread entered");
+    if (!TH_IN(j, g_job)) {
+        g_bad_arg++;
+        at_note(TAG, "thread leaving");
+        return 0;
+    }
+    t = (unsigned)(j - g_job);
+    j->runs++;
+    j->self = pthread_self();
+    if (CB_SKEWED())
+        j->skew++;
+    for (r = 0; r < ROUNDS; r++) {
+        heap = malloc(64);
+        if (heap == 0)
+            j->heap_bad++;
+        for (i = 0; i < NW; i++) {
+            w = g_words[(i + t + r) % NW];
+            n = strlen(w);
+            if (n != own_len(w) || n >= sizeof buf)
+                j->copy_bad++;
+            if (n >= sizeof buf)
+                continue;
+            buf[n] = 'x';
+            if (memcpy(buf, w, n + 1) != buf)
+                j->copy_bad++;
+            for (c = 0; c <= n; c++)
+                if (buf[c] != w[c])
+                    j->copy_bad++;
+            if (heap != 0) {
+                if (memcpy(heap, buf, n + 1) != heap)
+                    j->heap_bad++;
+                if (strlen(heap) != n)
+                    j->heap_bad++;
+            }
+            h = h * 31u + (unsigned)n;
+            for (c = 0; c < n; c++)
+                h = h * 31u + (unsigned char)buf[c];
+        }
+        free(heap);
+        for (i = 0; i < N; i++) {
+            items[i].key = (int)((i * 37u + t * 11u + r * 5u) % N) - N / 2;
+            items[i].owner = j;
+        }
+        qsort(items, N, sizeof items[0], cmp_key);
+        for (i = 0; i < N; i++) {
+            if (items[i].key != (int)i - N / 2 || items[i].owner != j)
+                j->sort_bad++;
+            h = h * 31u + (unsigned)items[i].key;
+        }
+    }
+    j->sum = h;
+    at_note(TAG, "thread leaving");
+    return j;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, total = 17;
+    pthread_t tid[THREADS];
+    int ok_tid[THREADS];
+    void *ret;
+    int i, created = 1, joined = 1, results = 1, ran = 1, sums = 1;
+    int calls = 1, wrong = 0, skew = 0, copy = 0, heap = 0, sorted = 1;
+
+    for (i = 0; i < THREADS; i++) {
+        at_note(TAG, "calling pthread_create");
+        ok_tid[i] = pthread_create(&tid[i], 0, start, &g_job[i]) == 0;
+        at_note(TAG, "returned from pthread_create");
+        if (!ok_tid[i])
+            created = 0;
+    }
+    for (i = 0; i < THREADS; i++) {
+        ret = 0;
+        if (ok_tid[i]) {
+            at_note(TAG, "calling pthread_join");
+            if (pthread_join(tid[i], &ret) != 0)
+                joined = 0;
+            at_note(TAG, "returned from pthread_join");
+        }
+        if (ret != &g_job[i])
+            results = 0;
+        if (g_job[i].runs != 1)
+            ran = 0;
+        if (g_job[i].sum != expect_sum((unsigned)i))
+            sums = 0;
+        if (g_job[i].calls == 0)
+            calls = 0;
+        if (g_job[i].wrong_thread)
+            wrong = 1;
+        if (g_job[i].skew)
+            skew = 1;
+        if (g_job[i].copy_bad)
+            copy = 1;
+        if (g_job[i].heap_bad)
+            heap = 1;
+        if (g_job[i].sort_bad)
+            sorted = 0;
+        total = total * 31u + g_job[i].sum;
+    }
+    CK(created && joined && results && ran && g_bad_arg == 0);
+    CK(!copy);
+    CK(!heap);
+    CK(sorted);
+    CK(calls && g_bad_owner == 0);
+    CK(!wrong);
+    CK(sums);
+    CK(!skew);
+
+    cb_begin(TAG, m);
+    cb_field("threads", THREADS, 0);
+    cb_field("sum", total, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/thread_guest_fault.c" <<EOC
+#include "thread_common.h"
+
+static const int *volatile g_bad = (const int *)${BAD_GUEST_ADDR}ull;
+static volatile int g_sink;
+static const char g_token[] = "thrfault";
+
+static void *start(void *arg)
+{
+    char mark[] = "thrfault thread\n";
+
+    write(1, mark, sizeof mark - 1);
+    g_sink = *g_bad;
+    write(1, "thrfault survived\n", 18);
+    return arg;
+}
+
+int main(void)
+{
+    pthread_t t;
+    void *ret = 0;
+
+    write(1, "thrfault enter\n", 15);
+    if (pthread_create(&t, 0, start, (void *)g_token) != 0) {
+        write(1, "thrfault create failed\n", 23);
+        return 2;
+    }
+    pthread_join(t, &ret);
+    write(1, "thrfault returned\n", 18);
+    return ret != g_token;
+}
+EOC
+
+    for name in thread_create_join thread_mutex thread_cond thread_bridged_work \
+                thread_guest_fault; do
+        clang -arch x86_64 -std=c11 -O1 -fno-builtin \
+                -o "$TMP/$name" "$TMP/$name.c" >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            thread_create_join) TH_CREATE_BIN="$TMP/$name" ;;
+            thread_mutex) TH_MUTEX_BIN="$TMP/$name" ;;
+            thread_cond) TH_COND_BIN="$TMP/$name" ;;
+            thread_bridged_work) TH_WORK_BIN="$TMP/$name" ;;
+            thread_guest_fault) TH_FAULT_BIN="$TMP/$name" ;;
+        esac
+    done
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -2363,6 +3152,192 @@ case_attach_guest_fault() {
     record "$name" "$reason" "exit=$rc_jit no-jit exit=$rc_nojit"
 }
 
+thread_guard_reason() {
+    local imports
+    imports="$(nm -u "$1" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+    if [ -n "$imports" ] && ! printf '%s\n' $imports | grep -Fqx "$STACK_GUARD_SYM"; then
+        echo "the fixture imports '${imports% }' and not $STACK_GUARD_SYM, so the stack protector was not emitted and the case proves nothing about the virtual libSystem's data export"
+    fi
+}
+
+thread_guard_hint() {
+    if grep -Fq "$NOBIND$STACK_GUARD_SYM " "$@" 2>/dev/null; then
+        echo ": the virtual libSystem does not export $STACK_GUARD_SYM, the data symbol every stack-protected x86_64 program imports"
+    fi
+}
+
+thread_stall() {
+    local tag="$1" err="$2" mode="${3:-native}" n_create n_created n_in n_out n_wait n_waited n_join n_joined
+    n_create=$(attach_count "^$tag: calling pthread_create$" "$err")
+    n_created=$(attach_count "^$tag: returned from pthread_create$" "$err")
+    n_in=$(attach_count "^$tag: thread entered$" "$err")
+    n_out=$(attach_count "^$tag: thread leaving$" "$err")
+    n_wait=$(attach_count "^$tag: waiting$" "$err")
+    n_waited=$(attach_count "^$tag: wait returned$" "$err")
+    n_join=$(attach_count "^$tag: calling pthread_join$" "$err")
+    n_joined=$(attach_count "^$tag: returned from pthread_join$" "$err")
+    if [ "$n_create" -eq 0 ]; then
+        echo "the guest never reached its first pthread_create"
+    elif [ "$n_created" -lt "$n_create" ]; then
+        echo "pthread_create never returned: $n_created of $n_create calls came back"
+    elif [ "$n_in" -lt "$n_created" ]; then
+        if [ "$mode" = cache ]; then
+            echo "only $n_in of the $n_created threads pthread_create started entered their start routine$( [ "$n_joined" -lt "$n_join" ] && echo ", and the main thread waits in pthread_join for one that never ran")"
+        else
+            echo "only $n_in of the $n_created threads pthread_create started entered their start routine, so a host thread never reached guest code through the callback trampoline$( [ "$n_joined" -lt "$n_join" ] && echo ", and the main thread waits in pthread_join for it")"
+        fi
+    elif [ "$n_out" -lt "$n_in" ]; then
+        echo "$((n_in - n_out)) of $n_in start routines entered guest code and never returned, so a guest thread is blocked, most likely in a mutex or condition wait that nothing wakes"
+    elif [ "$n_waited" -lt "$n_wait" ]; then
+        echo "every start routine returned, and the main thread's own condition wait never did"
+    elif [ "$n_joined" -lt "$n_join" ]; then
+        echo "pthread_join never returned although every start routine did, so a thread never finished leaving the trampoline and exiting"
+    else
+        echo "every thread was created, ran and was joined, and the process still did not exit"
+    fi
+}
+
+thread_run_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" reason
+    reason="$(callback_run_reason "$rc" "$out" "$err")"
+    if [ -z "$reason" ]; then
+        echo ""
+    elif grep -Fq "$NOBIND$STACK_GUARD_SYM " "$out" "$err" 2>/dev/null; then
+        echo "$reason$(thread_guard_hint "$out" "$err")"
+    elif grep -Fq "$ATTACH_REFUSED" "$out" "$err" 2>/dev/null; then
+        echo "$reason; a start routine was refused rather than given a personality: $(grep -hF "$ATTACH_REFUSED" "$out" "$err" | head -1 | cut -c1-240)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "$reason; $(thread_stall "$tag" "$err")"
+    else
+        echo "$reason"
+    fi
+}
+
+case_thread() {
+    local name="$1" bin="$2" tag="$3" bits="$4" note="${5:-}"
+    local reason="" rc_jit rc_nojit rc_cache line cache_note=""
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$THREAD_TIMEOUT
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin"
+    rc_nojit=$?
+    line="$(head -1 "$jo")"
+
+    reason="$(thread_guard_reason "$bin")"
+    if [ -z "$reason" ]; then
+        reason="$(thread_run_reason "$rc_jit" "$tag" "$jo" "$je")"
+        if grep -q "^$tag bad:" "$jo"; then
+            reason="'$line': the guest's own checks failed, where $bits"
+        elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+            reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+        fi
+    fi
+
+    if [ -z "$reason" ]; then
+        reason="$(thread_run_reason "$rc_nojit" "$tag" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(head -1 "$no")': the guest's own checks failed, where $bits"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    if [ -n "$reason" ] && [ -n "$note" ]; then
+        reason="$reason. $note"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$bin"
+        rc_cache=$?
+        if [ "$rc_cache" -eq 124 ]; then
+            reason="cache mode still running after ${NATIVE_TIMEOUT}s, which crosses no bridge and attaches nothing: $(thread_stall "$tag" "$ce" cache)"
+        elif [ "$rc_cache" -ne 0 ]; then
+            reason="cache-mode exit $rc_cache, want 0: '$(head -1 "$co")'"
+        elif ! cmp -s "$jo" "$co"; then
+            reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': a start routine run on a thread native pthread_create started computed something the guest's own threads did not in cache mode"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
+}
+
+thread_fault_reason() {
+    local rc="$1" out="$2" err="$3" stopped
+    stopped="$(bridge_stopped_reason "$out" "$err")"
+    if [ -n "$stopped" ]; then
+        echo "$stopped$(thread_guard_hint "$out" "$err")"
+    elif ! grep -Fq "$TH_FAULT_MARK" "$out"; then
+        echo "the guest never reached its pthread_create call"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err"; then
+        echo "the start routine's own read of $BAD_GUEST_ADDR was reported as a fault inside a bridged call ($(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1 | cut -c1-80)): the thread native pthread_create started was running guest code when it faulted, so a bridged-call report means that thread's bridge frame was raised while its start routine ran"
+    elif grep -Fq "$ATTACH_REFUSED" "$out" "$err"; then
+        echo "the start routine was refused rather than given a personality: $(grep -hF "$ATTACH_REFUSED" "$out" "$err" | head -1 | cut -c1-240)"
+    elif grep -Fq "$TH_FAULT_NOCREATE" "$out"; then
+        echo "pthread_create failed, so no thread ever ran the start routine"
+    elif ! grep -Fq "$TH_FAULT_THREAD" "$out"; then
+        if [ "$rc" -eq 124 ]; then
+            echo "still running after ${NATIVE_TIMEOUT}s, and the start routine never entered guest code on the new thread"
+        else
+            echo "exit $rc, and the start routine never entered guest code on the new thread"
+        fi
+    elif grep -Fq "$TH_FAULT_SURVIVED" "$out"; then
+        echo "the start routine read $BAD_GUEST_ADDR without faulting"
+    elif grep -Fq "$TH_FAULT_PAST" "$out"; then
+        echo "pthread_join returned and the main thread carried on past a fault its start routine took"
+    elif grep -qE "$WILD_RE" "$out" "$err"; then
+        echo "exit $rc: a recovery path took the thread's fault instead of reporting a guest crash: $(grep -hE "$WILD_RE" "$out" "$err" | head -1 | cut -c1-120)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "still running after ${NATIVE_TIMEOUT}s: the start routine reached its read of $BAD_GUEST_ADDR and the process never stopped, so the fault was swallowed or only the thread was stopped, and the main thread waits in pthread_join for a thread that will not finish"
+    elif ! grep -Fq "$GUEST_CRASH" "$out" "$err"; then
+        echo "no guest-crash report for a fault the guest took in its own start routine"
+    elif ! grep -Fq "guest_addr=$BAD_GUEST_ADDR" "$out" "$err"; then
+        echo "the guest-crash report does not name $BAD_GUEST_ADDR, the address the start routine read"
+    elif [ "$rc" -ne "$GUEST_FAULT_STATUS" ]; then
+        echo "exit $rc, want $GUEST_FAULT_STATUS"
+    else
+        echo ""
+    fi
+}
+
+case_thread_guest_fault() {
+    local name=thread_guest_fault reason="" rc_jit rc_nojit
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local NATIVE_TIMEOUT=$THREAD_TIMEOUT
+
+    if callback_fixture_missing "$name" "$TH_FAULT_BIN"; then
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$TH_FAULT_BIN"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$TH_FAULT_BIN"
+    rc_nojit=$?
+    reason="$(thread_guard_reason "$TH_FAULT_BIN")"
+    if [ -z "$reason" ]; then
+        reason="$(thread_fault_reason "$rc_jit" "$jo" "$je")"
+    fi
+    if [ -z "$reason" ]; then
+        reason="$(thread_fault_reason "$rc_nojit" "$no" "$ne")"
+        if [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit no-jit exit=$rc_nojit"
+}
+
 case_env_native() {
     local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
@@ -2518,6 +3493,7 @@ case_native_static() {
 build_fixtures
 build_callback_fixtures
 build_attach_fixtures
+build_thread_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -2561,6 +3537,16 @@ case_attach attach_nested_bridge "$AT_NESTED_BIN" attach_nested \
 case_attach attach_sync "$AT_SYNC_BIN" attach_sync \
     "bit 0 is a null global queue, 1 the work function not run exactly once before each dispatch_sync_f returned, 2 a wrong context, 3 the work run on a thread other than the caller's, so reusing the caller's cpu went untested, 4 the work function's frame not just below its caller's on the caller's own guest stack, which means a second personality was built for a thread that already had a cpu, 5 the caller's own state changing across dispatch_sync_f, 6 a work function entered on a misaligned stack"
 case_attach_guest_fault
+case_thread thread_create_join "$TH_CREATE_BIN" thread_create_join \
+    "bit 0 is a pthread_create returning non-zero, 1 a pthread_join returning non-zero, 2 a start routine not run exactly once or handed an argument the creator never passed, 3 a value from pthread_join other than the one its start routine returned, which has bits set above bit 32 so a result cut to 32 bits shows here, 4 pthread_self in a thread differing from the pthread_t pthread_create handed back, 5 pthread_self in a thread equal to the main thread's, 6 pthread_self changing within a thread or on the main thread, 7 two threads alive at once sharing a pthread_t, 8 a start routine entered on a misaligned stack" \
+    "thread_create_join is the plainest guest thread there is: native pthread_create starts a host thread that must enter the callback trampoline and be given a guest personality before the start routine runs, so a failure here means no guest program that creates a thread can run in native mode"
+case_thread thread_mutex "$TH_MUTEX_BIN" thread_mutex \
+    "bit 0 is a pthread_create or pthread_join failing or a thread's argument or result not its own, 1 pthread_mutex_init, a lock, an unlock or pthread_mutex_destroy returning non-zero, 2 a thread not completing all its rounds, 3 a final count other than 200000, so increments were lost and the statically initialized mutex did not exclude, 4 a thread finding another already inside the critical section, 5 the tally kept under the mutex from pthread_mutex_init coming out wrong, 6 a start routine entered on a misaligned stack"
+case_thread thread_cond "$TH_COND_BIN" thread_cond \
+    "bit 0 is a pthread_create or pthread_join failing or the consumer's result not its own argument, 1 a lock, unlock, wait, signal, broadcast or pthread_cond_init returning non-zero or a thread handed the wrong argument, 2 other than 1000 values received, one never received or one with a sequence number out of range, 3 a value received twice, 4 values received out of order, 5 a value whose payload does not match its sequence number, 6 a thread finding another holding the mutex when it took it, including on return from pthread_cond_wait, 7 the consumer waiting fewer times than it asked, so a value was in the slot before the producer could have been asked for it, 8 a start routine entered on a misaligned stack"
+case_thread thread_bridged_work "$TH_WORK_BIN" thread_bridged_work \
+    "bit 0 is a pthread_create or pthread_join failing, a thread not run exactly once or a thread's argument or result not its own, 1 bridged strlen or memcpy giving a wrong length or wrong bytes on a thread, 2 malloc failing or heap memory not reading back on a thread, 3 qsort on a thread leaving elements out of order or not the thread's own, 4 a comparator that never ran or one handed an element no thread owns, 5 a comparator run on a thread other than the one that called qsort or handed another thread's element, 6 a thread's checksum differing from the one the main thread computes without bridged calls, 7 a start routine or comparator entered on a misaligned stack"
+case_thread_guest_fault
 case_env_native
 case_flag_beats_env
 case_last_flag_native

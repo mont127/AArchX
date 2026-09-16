@@ -3,17 +3,18 @@
  *
  * ---- the file that is never a file ----
  * An image here is laid out exactly as a linker would lay it on disk: header,
- * load commands and stubs filling __TEXT from offset zero, then __DATA, then
- * the export trie past the end of both.  The loader never reopens anything -
- * map_segments memcpys out of DynImage.slice and the trie walker reads that
- * same buffer - so the buffer IS the file, and keeping the file layout honest
- * is what lets the image flow through mapping, binding, dlopen and dladdr with
- * no special case anywhere.  __TEXT has to be the segment with fileoff 0 and a
- * non-zero filesize, because that pair is how map_segments picks the text
- * segment out and derives the image's base from it.  __TEXT starts at vmaddr
- * zero and every segment is 4 KB aligned in both file and memory, so a
- * symbol's offset in the trie is also its offset in the buffer, and the
- * loader's slide is the whole of the image's load address.
+ * load commands and stubs filling __TEXT from offset zero, then __DATA with the
+ * jump slots and after them the data exports, then the export trie past the
+ * end of both.  The loader never reopens anything - map_segments memcpys out
+ * of DynImage.slice and the trie walker reads that same buffer - so the buffer
+ * IS the file, and keeping the file layout honest is what lets the image flow
+ * through mapping, binding, dlopen and dladdr with no special case anywhere.
+ * __TEXT has to be the segment with fileoff 0 and a non-zero filesize, because
+ * that pair is how map_segments picks the text segment out and derives the
+ * image's base from it.  __TEXT starts at vmaddr zero and every segment is 4 KB
+ * aligned in both file and memory, so a symbol's offset in the trie is also its
+ * offset in the buffer, and the loader's slide is the whole of the image's load
+ * address.
  *
  * __TEXT is emitted with read+execute in BOTH maxprot and initprot.  Only one
  * of the two is really consulted - protect_ro_segments reads the word at
@@ -67,6 +68,69 @@
  * __DATA slide together, and a displacement between them computed at build
  * time is still correct at every load address.
  *
+ * ---- the exports that are not functions ----
+ * Not every name a program imports from libSystem is one it calls.  A
+ * stack-protected function copies the value at ___stack_chk_guard onto its
+ * frame in the prologue and compares the copy against it again before it
+ * returns, and both are loads through the pointer the loader bound, not
+ * calls.  clang turns the protector on by default, so almost every ordinary
+ * program imports that symbol whether its author asked for it or not, and an
+ * image that lacks it refuses to bind the program at all.
+ *
+ * So there is a second kind of export: a name, a size and a way to fill it,
+ * given a slot in __DATA after the last jump slot, each slot starting on an
+ * 8-byte boundary, with __DATA's size taking the slots in and the trie moving
+ * past them.  Its trie terminal is the slot's offset from the image start, the
+ * same thing a function's terminal is for its stub, so the trie walker and the
+ * loader cannot tell the two kinds apart and neither needed a change: the
+ * guest's GOT entry is bound to the slot's address and the guest reads through
+ * it.  A data export has no stub and takes no export id, because nothing ever
+ * branches to it, and an id no trap can ever carry would only be a row in the
+ * dispatch table that means nothing.  A fill left empty means zeroes, which is
+ * what a calloc'd buffer already holds.
+ *
+ * ---- the canary ----
+ * ___stack_chk_guard is eight bytes filled from arc4random_buf every time an
+ * image is built.  It does not have to agree with the host's own guard or with
+ * anything else: the only thing a guest ever compares it with is the copy its
+ * own prologue took, and the bridge behind ___stack_chk_fail stops the run
+ * without comparing anything.  The loader builds a given install name once, so
+ * a running guest only ever sees one value.
+ *
+ * Its lowest byte is always zero.  x86 is little-endian and the copy sits above
+ * the locals it guards, so the lowest byte is the first one an overrun climbing
+ * out of a buffer reaches.  A string copy can write a zero only as its
+ * terminator, so it cannot rewrite that byte and carry on to the saved frame
+ * pointer and return address with the guard still matching; and a string read
+ * that runs off the end of an unterminated buffer, which is how a guard usually
+ * leaks into output, stops there before it has shown any of the other seven.
+ * The host's own guard zeroes its second byte instead, which stops a copy just
+ * as well, gives up one byte to a read, and in exchange notices an off-by-one
+ * that writes nothing but a terminator; either is sound, and nothing ever
+ * compares the two.  The other seven bytes are drawn again in the rare case
+ * they all come back zero, since an all-zero guard is reproduced exactly by
+ * any overrun that writes zeroes.
+ *
+ * ---- the data symbols deliberately left out ----
+ * libSystem has other data that compiled programs reach for directly: _environ,
+ * ___progname, __DefaultRuneLocale, and ___stdoutp and ___stderrp, which are
+ * what stdout and stderr expand to.  None of them is exported, and none should
+ * become a slot filled at build time, because each is a variable native code
+ * also reads or writes on its own account, and a guest slot beside it is a
+ * second copy that goes stale the first time either side writes.  _environ is
+ * what native getenv, setenv and execvp walk, and it points at the host's
+ * environment, not at the one on the guest's initial stack.  ___progname is
+ * what native getprogname, err and warn print, and it names ocerz.  ___stdoutp
+ * and ___stderrp are the streams native printf, puts and perror write through;
+ * a program that assigns stdout expects printf to follow it, and a slot holding
+ * anything but the native stream hands native stdio a FILE it never opened.
+ * __DefaultRuneLocale is a 3208-byte table that carries pointers into host
+ * memory and has to agree with native __maskrune, so a copy is wrong on both
+ * counts, and a zeroed one silently answers false to every ctype question.  A
+ * program importing any of them therefore still fails to bind and says which
+ * name it wanted, and a refusal that names itself is better than a value that
+ * is wrong without saying so.
+ *
  * ---- what happens after the trap ----
  * The trap lands in ocerz_vdylib_dispatch, which turns the export id back into
  * the library and symbol it was minted from and asks the bridge whether it
@@ -105,11 +169,23 @@
 #define VD_NODE_MAX (2 * VD_SYMS_MAX + 2)
 #define VD_EDGE_MAX 96
 #define VD_EXPORT_MAX 4096
+#define VD_VAR_BYTES_MAX (1u << 20)
 
 static const char *const vd_libsystem_syms[] = {
     "___bzero",
     "___error",
     "___stack_chk_fail",
+    "___memcpy_chk",
+    "___memmove_chk",
+    "___memset_chk",
+    "___strcpy_chk",
+    "___stpcpy_chk",
+    "___strcat_chk",
+    "___strncpy_chk",
+    "___stpncpy_chk",
+    "___strncat_chk",
+    "___strlcpy_chk",
+    "___strlcat_chk",
     "_memcpy",
     "_memcmp",
     "_memmove",
@@ -221,6 +297,7 @@ static const char *const vd_libsystem_syms[] = {
     "_pthread_cond_wait",
     "_pthread_cond_signal",
     "_pthread_cond_broadcast",
+    "_pthread_cond_destroy",
     "_dispatch_get_global_queue",
     "_dispatch_async_f",
     "_dispatch_sync_f",
@@ -240,15 +317,40 @@ static const char *const vd_libsystem_syms[] = {
     "_kill",
 };
 
+typedef struct VdVar {
+    const char *name;
+    uint32_t size;
+    void (*fill)(uint8_t *slot, uint32_t size);
+} VdVar;
+
+static void vd_fill_stack_guard(uint8_t *slot, uint32_t size)
+{
+    int live = 0;
+    while (!live && size > 1) {
+        arc4random_buf(slot + 1, size - 1);
+        for (uint32_t i = 1; i < size; i++)
+            live |= slot[i] != 0;
+    }
+    slot[0] = 0;
+}
+
+static const VdVar vd_libsystem_vars[] = {
+    { "___stack_chk_guard", 8, vd_fill_stack_guard },
+};
+
 typedef struct VdLib {
     const char *install_name;
     const char *const *syms;
     int nsyms;
+    const VdVar *vars;
+    int nvars;
 } VdLib;
 
 static const VdLib g_vd_libs[] = {
     { "/usr/lib/libSystem.B.dylib", vd_libsystem_syms,
-      (int)(sizeof vd_libsystem_syms / sizeof vd_libsystem_syms[0]) },
+      (int)(sizeof vd_libsystem_syms / sizeof vd_libsystem_syms[0]),
+      vd_libsystem_vars,
+      (int)(sizeof vd_libsystem_vars / sizeof vd_libsystem_vars[0]) },
 };
 
 typedef struct VdExport {
@@ -501,9 +603,10 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
         return NULL;
 
     int n = lib->nsyms;
-    if (n <= 0 || n > VD_SYMS_MAX) {
+    int nv = lib->nvars;
+    if (n <= 0 || nv < 0 || n > VD_SYMS_MAX - nv) {
         OCERZ_FATAL("virtual %s declares %d exports, the limit is %d\n",
-                    lib->install_name, n, VD_SYMS_MAX);
+                    lib->install_name, n + nv, VD_SYMS_MAX);
         return NULL;
     }
 
@@ -519,17 +622,39 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
     uint32_t text_size = vd_round_up(stubs_off + stubs_size, VD_PAGE);
     uint32_t slots_off = text_size;
     uint32_t slots_size = (uint32_t)n * VD_SLOT_BYTES;
-    uint32_t data_size = vd_round_up(slots_size, VD_PAGE);
-    uint32_t trie_off = slots_off + data_size;
+    uint32_t vars_off = vd_round_up(slots_off + slots_size, VD_SLOT_BYTES);
 
     uint32_t *ids = calloc((size_t)n, sizeof *ids);
-    VdSym *syms = calloc((size_t)n, sizeof *syms);
+    uint32_t *var_addr = calloc((size_t)nv + 1, sizeof *var_addr);
+    VdSym *syms = calloc((size_t)(n + nv), sizeof *syms);
     VdNode *nodes = calloc(VD_NODE_MAX, sizeof *nodes);
     uint8_t *buf = NULL;
-    if (!ids || !syms || !nodes) {
+    if (!ids || !var_addr || !syms || !nodes) {
         OCERZ_FATAL("out of memory building virtual %s\n", lib->install_name);
         goto fail;
     }
+
+    uint32_t vars_end = vars_off;
+    for (int j = 0; j < nv; j++) {
+        const VdVar *v = &lib->vars[j];
+        if (strlen(v->name) + 1 > VD_EDGE_MAX) {
+            OCERZ_FATAL("virtual export %s is longer than the %d-byte edge limit\n",
+                        v->name, VD_EDGE_MAX);
+            goto fail;
+        }
+        if (v->size == 0 || v->size > VD_VAR_BYTES_MAX) {
+            OCERZ_FATAL("virtual data export %s is %u bytes, it must be 1 to %u\n",
+                        v->name, (unsigned)v->size, (unsigned)VD_VAR_BYTES_MAX);
+            goto fail;
+        }
+        var_addr[j] = vars_end;
+        vars_end += vd_round_up(v->size, VD_SLOT_BYTES);
+        syms[n + j].name = v->name;
+        syms[n + j].addr = var_addr[j];
+    }
+    uint32_t data_used = vars_end - slots_off;
+    uint32_t data_size = vd_round_up(data_used, VD_PAGE);
+    uint32_t trie_off = slots_off + data_size;
 
     for (int i = 0; i < n; i++) {
         const char *sym = lib->syms[i];
@@ -549,8 +674,8 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
         syms[i].addr = stubs_off + (uint32_t)i * VD_STUB_STRIDE;
     }
 
-    qsort(syms, (size_t)n, sizeof *syms, vd_sym_cmp);
-    for (int i = 1; i < n; i++) {
+    qsort(syms, (size_t)(n + nv), sizeof *syms, vd_sym_cmp);
+    for (int i = 1; i < n + nv; i++) {
         if (strcmp(syms[i - 1].name, syms[i].name) == 0) {
             OCERZ_FATAL("virtual %s exports %s twice\n", lib->install_name, syms[i].name);
             goto fail;
@@ -562,7 +687,7 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
     trie.n = 0;
     trie.overflow = 0;
     trie.sym = syms;
-    if (vd_trie_build(&trie, 0, n, 0) != 0 || trie.overflow) {
+    if (vd_trie_build(&trie, 0, n + nv, 0) != 0 || trie.overflow) {
         OCERZ_FATAL("virtual %s does not fit the export trie limits\n", lib->install_name);
         goto fail;
     }
@@ -600,7 +725,7 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
     vd_write_segment(lc, seg_cmdsize, "__DATA", slots_off, data_size, slots_off, data_size,
                      VM_PROT_READ | VM_PROT_WRITE, 1);
     vd_write_section(lc + sizeof(struct segment_command_64), "__data", "__DATA",
-                     slots_off, slots_size, slots_off, 3, S_REGULAR);
+                     slots_off, data_used, slots_off, 3, S_REGULAR);
     lc += seg_cmdsize;
 
     wr32(lc + 0, LC_ID_DYLIB);
@@ -635,11 +760,17 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
         wr64(buf + slot_addr, OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF);
     }
 
-    OCERZ_LOG("vdylib: built %s with %d exports, %u bytes (text %u data %u trie %u at %u)\n",
-              lib->install_name, n, (unsigned)total, (unsigned)text_size,
+    for (int j = 0; j < nv; j++)
+        if (lib->vars[j].fill)
+            lib->vars[j].fill(buf + var_addr[j], lib->vars[j].size);
+
+    OCERZ_LOG("vdylib: built %s with %d exports (%d data), %u bytes "
+              "(text %u data %u trie %u at %u)\n",
+              lib->install_name, n + nv, nv, (unsigned)total, (unsigned)text_size,
               (unsigned)data_size, (unsigned)trie_size, (unsigned)trie_off);
 
     free(ids);
+    free(var_addr);
     free(syms);
     free(nodes);
     if (len_out)
@@ -648,6 +779,7 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
 
 fail:
     free(ids);
+    free(var_addr);
     free(syms);
     free(nodes);
     free(buf);

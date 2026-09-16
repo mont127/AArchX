@@ -20,8 +20,11 @@
  * that survives a casual test.  The export list carries five such
  * proper-prefix pairs on purpose; each is asserted to resolve at both lengths
  * and to reach two different stubs, so a reader that loses the longer name and
- * one that aliases it to the shorter are both caught.  _wri, _writ, _memcp,
- * _writev2 and _strlength are asserted to reach nothing at all.
+ * one that aliases it to the shorter are both caught.  A sixth pair,
+ * ___stack_chk_fail and ___stack_chk_guard, is no prefix of the other but
+ * shares thirteen characters across the two kinds of export, a stub and a data
+ * slot.  _wri, _writ, _memcp, _writev2, _strlength, ___stack_chk_ and
+ * ___stack_chk_guards are asserted to reach nothing at all.
  *
  * A resolved address is header-relative: the trie stores offsets from the mach
  * header, and __TEXT carries that header because its fileoff is zero, so a
@@ -39,6 +42,24 @@
  * stubs mapped writable if any of them is off.  An image that set only the
  * word the segment structure calls initprot would pass a reading of that code
  * and still not be re-protected.
+ *
+ * ___stack_chk_guard is the one export that is not a function, and every
+ * stack-protected guest reads it.  It has to resolve through the same trie to
+ * an 8-byte slot inside __DATA's file range and vm size, outside __TEXT, past
+ * every jump slot the stubs in __text read, on an 8-byte boundary, and ahead of
+ * the trie, which sits past __DATA's file range.  The value there has to be
+ * non-zero with its lowest byte zero.  The guaranteed functions are still
+ * checked stub by stub exactly as before, ___stack_chk_fail among them, all of
+ * them are counted, and __text still has room for at least that many stubs, so
+ * a data export that displaced a function or took a stub of its own is caught.
+ *
+ * A second image is built in the same process, and the test asserts the guard
+ * values of the two DIFFER.  The guard is drawn per build, so the only way two
+ * builds agree is a constant written into the source or a 56-bit collision,
+ * and a test that fails once in 2^56 runs is a price worth one line of proof
+ * that the value is not baked in.  Everything else in the two buffers is
+ * asserted byte-identical, so the second build re-interned the same export ids
+ * and laid out the same slot, and each image carries its guard in its own slot.
  */
 #include "ocerz/vdylib.h"
 #include "ocerz/dyld.h"
@@ -57,6 +78,8 @@
 #define MOV_LEN         6
 #define JMP_LEN         6
 #define STUB_LEN        (MOV_LEN + JMP_LEN)
+#define STUB_STRIDE     16
+#define SLOT_LEN        8
 #define LC_EXPORTS_TRIE 0x80000033u
 #define IMAGE_MAX       (16u * 1024u * 1024u)
 
@@ -81,6 +104,7 @@ static const char *const kExports[] = {
     "_write", "_writev", "_read", "_readv",
     "_open", "_opendir", "_close", "_closedir",
     "_time", "_times", "_exit", "_malloc", "_free",
+    "___stack_chk_fail",
 };
 #define NEXPORTS (sizeof kExports / sizeof kExports[0])
 
@@ -90,14 +114,18 @@ static const char *const kPrefixPairs[][2] = {
     { "_open",  "_opendir" },
     { "_close", "_closedir" },
     { "_time",  "_times" },
+    { "___stack_chk_fail", "___stack_chk_guard" },
 };
 #define NPAIRS (sizeof kPrefixPairs / sizeof kPrefixPairs[0])
 
 static const char *const kNotExported[] = {
     "_wri", "_writ", "_memcp", "_writev2", "_strlength",
+    "___stack_chk_", "___stack_chk_guards",
     "_ocerz_no_such_export_xyzzy",
 };
 #define NNOT (sizeof kNotExported / sizeof kNotExported[0])
+
+static const char *const kGuard = "___stack_chk_guard";
 
 typedef struct {
     int found;
@@ -107,6 +135,9 @@ typedef struct {
     uint64_t filesize;
     uint32_t maxprot;
     uint32_t initprot;
+    int sect_found;
+    uint64_t sect_addr;
+    uint64_t sect_size;
 } SegInfo;
 
 static uint32_t rd32(const uint8_t *p)
@@ -123,7 +154,7 @@ static uint64_t rd64(const uint8_t *p)
     return v;
 }
 
-static void seg_from(const uint8_t *lc, SegInfo *s)
+static void seg_from(const uint8_t *lc, uint32_t csize, SegInfo *s)
 {
     struct segment_command_64 sc;
     memcpy(&sc, lc, sizeof sc);
@@ -134,6 +165,18 @@ static void seg_from(const uint8_t *lc, SegInfo *s)
     s->filesize = sc.filesize;
     s->maxprot = (uint32_t)sc.maxprot;
     s->initprot = (uint32_t)sc.initprot;
+    if (sc.nsects >= 1 && csize >= sizeof sc + sizeof(struct section_64)) {
+        struct section_64 sect;
+        memcpy(&sect, lc + sizeof sc, sizeof sect);
+        s->sect_found = 1;
+        s->sect_addr = sect.addr;
+        s->sect_size = sect.size;
+    }
+}
+
+static int guard_shape_ok(uint64_t v)
+{
+    return v != 0 && (v & 0xff) == 0;
 }
 
 static void check_distinct(const char *what, const uint64_t *v, const int *ok, size_t n)
@@ -229,9 +272,9 @@ int main(void)
         }
         if (cmd == LC_SEGMENT_64 && csize >= sizeof(struct segment_command_64)) {
             if (memcmp(lc + 8, "__TEXT", 7) == 0)
-                seg_from(lc, &text);
+                seg_from(lc, csize, &text);
             else if (memcmp(lc + 8, "__DATA", 7) == 0)
-                seg_from(lc, &data);
+                seg_from(lc, csize, &data);
         } else if (cmd == LC_EXPORTS_TRIE && csize >= 16) {
             trie_found = 1;
             trie_off = rd32(lc + 8);
@@ -431,6 +474,112 @@ int main(void)
         CHECK(!(fs && fl) || as != al,
               "%s and %s both resolve to %#llx: the trie matched the shorter name by prefix",
               shorter, longer, (unsigned long long)as);
+    }
+
+    int stubs_ok = 0;
+    for (size_t i = 0; i < NEXPORTS; i++)
+        stubs_ok += ok[i];
+    CHECK(stubs_ok == (int)NEXPORTS,
+          "only %d of the %zu guaranteed function exports reach a stub that jumps through __DATA",
+          stubs_ok, NEXPORTS);
+
+    CHECK(text.sect_found, "__TEXT carries no section, so the stubs cannot be counted");
+    CHECK(data.sect_found, "__DATA carries no section, so the jump slots cannot be located");
+    if (!text.sect_found || !data.sect_found) {
+        free(img);
+        return report();
+    }
+    CHECK(text.sect_size % STUB_STRIDE == 0,
+          "__text is %llu bytes, not a whole number of %d-byte stubs",
+          (unsigned long long)text.sect_size, STUB_STRIDE);
+    const uint64_t nstubs = text.sect_size / STUB_STRIDE;
+    CHECK(nstubs >= NEXPORTS,
+          "__text holds %llu stubs, fewer than the %zu guaranteed function exports",
+          (unsigned long long)nstubs, NEXPORTS);
+
+    const uint64_t jslots_lo = LOAD_BASE + (data.sect_addr - text.vmaddr);
+    const uint64_t jslots_hi = jslots_lo + nstubs * SLOT_LEN;
+    int jslots_in = 0;
+    for (size_t i = 0; i < NEXPORTS; i++)
+        if (ok[i] && slots[i] >= jslots_lo && slots[i] + SLOT_LEN <= jslots_hi)
+            jslots_in++;
+    CHECK(jslots_in == stubs_ok,
+          "only %d of %d stubs read a slot inside the %llu jump slots at [%#llx,%#llx)",
+          jslots_in, stubs_ok, (unsigned long long)nstubs,
+          (unsigned long long)jslots_lo, (unsigned long long)jslots_hi);
+
+    int gfound = 0;
+    uint64_t guard = ocerz_dyld_trie_resolve(img, LOAD_BASE, kGuard, &gfound);
+    uint64_t guard_val = 0;
+    uint64_t guard_off = 0;
+    int guard_ok = 0;
+    CHECK(gfound, "%s does not resolve through the export trie", kGuard);
+    if (gfound) {
+        const uint64_t data_vm_hi = data_lo + data.vmsize;
+        CHECK(guard + SLOT_LEN <= text_lo || guard >= text_hi,
+              "%s resolved to %#llx, inside __TEXT [%#llx,%#llx)",
+              kGuard, (unsigned long long)guard, (unsigned long long)text_lo,
+              (unsigned long long)text_hi);
+        CHECK(guard >= data_lo && guard + SLOT_LEN <= data_vm_hi,
+              "%s resolved to %#llx, outside __DATA's vm range [%#llx,%#llx)",
+              kGuard, (unsigned long long)guard, (unsigned long long)data_lo,
+              (unsigned long long)data_vm_hi);
+        CHECK(guard >= data_lo && guard + SLOT_LEN <= data_hi,
+              "%s resolved to %#llx, outside __DATA's file range [%#llx,%#llx)",
+              kGuard, (unsigned long long)guard, (unsigned long long)data_lo,
+              (unsigned long long)data_hi);
+        CHECK(guard >= jslots_hi,
+              "%s resolved to %#llx, below the end of the jump slots at %#llx",
+              kGuard, (unsigned long long)guard, (unsigned long long)jslots_hi);
+        CHECK(((guard - LOAD_BASE) & (SLOT_LEN - 1)) == 0,
+              "%s resolved to %#llx, which is not on an 8-byte boundary",
+              kGuard, (unsigned long long)guard);
+        CHECK((uint64_t)trie_off >= data.fileoff + data.filesize,
+              "the export trie at %u starts inside __DATA's file range, which ends at %llu",
+              trie_off, (unsigned long long)(data.fileoff + data.filesize));
+
+        if (guard >= data_lo && guard + SLOT_LEN <= data_hi &&
+            guard + SLOT_LEN <= data_vm_hi) {
+            guard_off = data.fileoff + (guard - data_lo);
+            CHECK(guard_off + SLOT_LEN <= (uint64_t)len,
+                  "%s's slot at offset %llu runs past the %zu byte image",
+                  kGuard, (unsigned long long)guard_off, len);
+            if (guard_off + SLOT_LEN <= (uint64_t)len) {
+                guard_val = rd64(img + guard_off);
+                int has_zero = 0;
+                for (int b = 0; b < SLOT_LEN; b++)
+                    has_zero |= ((guard_val >> (8 * b)) & 0xff) == 0;
+                CHECK(guard_val != 0, "%s holds zero", kGuard);
+                CHECK(has_zero, "%s has no zero byte", kGuard);
+                CHECK((guard_val & 0xff) == 0,
+                      "%s's lowest byte is not zero, so a string copy can reproduce it", kGuard);
+                guard_ok = guard_shape_ok(guard_val);
+            }
+        }
+    }
+
+    size_t len2 = 0;
+    uint8_t *img2 = ocerz_vdylib_image(kLib, &len2);
+    CHECK(img2 != NULL, "a second ocerz_vdylib_image(\"%s\") returned no buffer", kLib);
+    if (img2) {
+        CHECK(len2 == len, "the second image is %zu bytes, the first %zu", len2, len);
+        int g2found = 0;
+        uint64_t guard2 = ocerz_dyld_trie_resolve(img2, LOAD_BASE, kGuard, &g2found);
+        CHECK(g2found && guard2 == guard,
+              "%s resolves to %#llx in the second image and %#llx in the first",
+              kGuard, (unsigned long long)guard2, (unsigned long long)guard);
+        if (guard_ok && len2 == len && g2found && guard2 == guard) {
+            uint64_t v2 = rd64(img2 + guard_off);
+            CHECK(guard_shape_ok(v2),
+                  "the second image's %s is zero or has a non-zero lowest byte", kGuard);
+            CHECK(v2 != guard_val,
+                  "both images carry the same %s, so it is not drawn per build", kGuard);
+            size_t tail = (size_t)guard_off + SLOT_LEN;
+            CHECK(memcmp(img, img2, (size_t)guard_off) == 0 &&
+                  memcmp(img + tail, img2 + tail, len - tail) == 0,
+                  "the two images differ outside %s's slot", kGuard);
+        }
+        free(img2);
     }
 
     for (size_t i = 0; i < NNOT; i++) {

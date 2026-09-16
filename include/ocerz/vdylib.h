@@ -11,7 +11,7 @@
  * through mapping, import resolution, dlopen and dladdr unchanged.  That is
  * the point of doing it this way rather than special-casing the resolvers.
  *
- * Every export is twelve bytes of real x86 in the image's own __TEXT:
+ * Every function export is twelve bytes of real x86 in the image's own __TEXT:
  *
  *     41 bb <id32>        mov r11d, <export id>
  *     ff 25 <rel32>       jmp qword [rip + rel32]
@@ -25,7 +25,13 @@
  * the trap address is a constant and the jump is rip-relative, so a synthesized
  * image needs no fixups at all.
  *
- * Until the bridges exist, dispatching one names the export and stops.
+ * The dispatcher hands the call to src/bridge.c, which performs it for real
+ * when the export has a descriptor and names the export and stops when it does
+ * not.
+ *
+ * Not every export is a stub.  A data symbol, such as the ___stack_chk_guard
+ * canary a stack-protected program reads in every function prologue, is a slot
+ * in __DATA holding its value, and the export trie points straight at it.
  */
 #ifndef OCERZ_VDYLIB_H
 #define OCERZ_VDYLIB_H
