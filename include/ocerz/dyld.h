@@ -1,10 +1,24 @@
 /*
  * Mini-dyld: runs a dynamically-linked x86_64 Mach-O without Apple's dyld.
+ *
+ * Thread-local variables in native mode.  A guest's __thread variable is reached
+ * through a descriptor whose first word is a thunk the compiler calls with the
+ * descriptor's address in RDI and which must return the variable's address in
+ * RAX while preserving every other register.  In cache mode dyld's own x86
+ * tlv_get_addr out of the shared cache is that thunk.  Native mode has no such
+ * code, so the thunk binds to the synthesized libSystem's __tlv_bootstrap export,
+ * whose trap preserves every register by construction, and
+ * ocerz_tlv_address answers it: the descriptor is rewritten at load time into
+ * the packed form, an ocerz key per image plus the variable's offset and the
+ * image's template, and each thread keeps a table of its per-image blocks in the
+ * guest thread block behind gs, allocated from the template on first touch.
+ * ocerz_tlv_release_thread frees one thread's blocks when that thread goes away.
  */
 #ifndef OCERZ_DYLD_H
 #define OCERZ_DYLD_H
 
 #include "ocerz/types.h"
+#include "ocerz/cpu.h"
 
 struct OcerzVM;
 
@@ -26,5 +40,10 @@ uint64_t ocerz_dyld_resolve_guest_sym(const char *name);
 uint64_t ocerz_dyld_trie_resolve(const uint8_t *slice, uint64_t load_base,
                                  const char *sym, int *found);
 extern uint64_t ocerz_exc_trap_rip;
+
+#define OCERZ_TLV_TABLE_SLOT 0x1808
+
+uint64_t ocerz_tlv_address(OcerzCPU *cpu, uint64_t desc);
+void ocerz_tlv_release_thread(uint64_t gs_base);
 
 #endif
