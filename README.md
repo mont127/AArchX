@@ -288,24 +288,29 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 | Interpreter | `src/interp*.c`, `src/flags.c` | reference execution and x86 flag semantics |
 | JIT | `src/jit.c`, `src/a64emit.c` | arm64 code generation, block chaining, superblocks |
 | Mini-dyld | `src/dyld.c`, `src/cache.c`, `src/dyldapi.c` | shared cache, symbols, fixups, Objective-C |
+| Virtual dylibs | `src/vdylib.c` | synthesized x86_64 system images and their bridge stubs, for native mode |
 | Syscalls | `src/syscall.c` | BSD, Mach, signals, threads and WoW64 host calls |
 
 ## Native mode
 
 Apple ends general-purpose Rosetta after macOS 27, and with it the `dyld_shared_cache_x86_64` that every guest here has bound against. Native mode is the answer to that: the guest keeps an x86_64 Darwin personality, but its system libraries become synthesized x86 images whose exports are bridge stubs into the host's own arm64 frameworks, so AppKit, CoreGraphics and Metal calls end up in the real native implementations rather than in translated Intel code. It is selected with `-native` and is not the default.
 
-What exists today is the switch and the failure report, not the bridges. In native mode no cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off because the host's own libdispatch needs the process's single workqueue slot. Every import a guest makes of a system library therefore goes unresolved, and rather than binding those to zero and starting a program that cannot run, the loader collects the misses by library and symbol and prints them:
+What exists today is the loader half, not the bridges. In native mode no cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off because the host's own libdispatch needs the process's single workqueue slot.
+
+A guest that links `/usr/lib/libSystem.B.dylib` finds nothing behind it, because on a current macOS there is no such file on disk; it exists only as a cache image. So ocerz builds one. `src/vdylib.c` assembles a real x86_64 Mach-O in memory, header and load commands and `__TEXT` and `__DATA` and an export trie, and the loader takes it as an ordinary image. Nothing in the loader ever reopens a file, so a buffer built in memory is indistinguishable from one read off disk, and import resolution, `dlopen` and `dladdr` all work on it unchanged.
+
+Every export is twelve bytes of real x86, a move of the export's id into `r11` followed by a jump through a slot holding one address for the whole process, inside the trap window the decoder and both engines already watch. So a call into a virtual framework costs no new instruction, no new range check and no widened window, and a synthesized image needs no fixups, since the trap address is a constant and the jump that reads it is rip-relative.
+
+Nothing is bridged yet, so reaching an export names it and stops:
 
 ```text
-$ ./ocerz -native tests/guest/benchbin/xbench_dyn str 1000
-ocerz: native: no bridge for ___bzero in /usr/lib/libSystem.B.dylib
-ocerz: native: no bridge for _memcpy in /usr/lib/libSystem.B.dylib
-ocerz: native: no bridge for _strcmp in /usr/lib/libSystem.B.dylib
-ocerz: native: no bridge for _strlen in /usr/lib/libSystem.B.dylib
-ocerz: native: 4 unresolved imports, no virtual frameworks are implemented yet
+$ ./ocerz -native tests/guest/benchbin/xbench_dyn depchain 1000
+ocerz: vdylib: built /usr/lib/libSystem.B.dylib with 123 exports, 10830 bytes
+ocerz: dynamic: registered virtual dylib /usr/lib/libSystem.B.dylib
+ocerz: bridge: /usr/lib/libSystem.B.dylib _strcmp not implemented
 ```
 
-Exit status 71 means exactly that. The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once; children inherit it through `OCERZ_MODE`. A static image is refused, since native mode has no static loader path. `tests/run_native_tests.sh` pins the selection rules, the absent cache, the report and the exit status, and that cache mode is unchanged.
+The guest binds every import, reaches `main`, and stops at its first system call. Exit status 72 means that; 71 means an import never bound at all, and the two are kept distinct so a failure says which happened. The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once; children inherit it through `OCERZ_MODE`. A static image is refused, since native mode has no static loader path. `tests/unit/test_vdylib.c` pins the synthesized image's structure and resolves every export through the loader's own trie walker, and `tests/run_native_tests.sh` pins the selection rules, the absent cache, the bridge report and the exit statuses, and that cache mode is unchanged.
 
 ## Limitations
 
