@@ -115,6 +115,42 @@
  * cleared before sigsetjmp captures it, since every fault recovery siglongjmps
  * back and restores whatever was saved.  A fork child drops the inherited
  * MAP_JIT arena: its pages read fine but executing them raises SIGBUS.
+ *
+ * ---- calling into guest code ----
+ * ocerz_vm_call runs guest code to completion from C: libSystem's initializer
+ * and every other one, +load methods, the callbacks objc registers with dyld,
+ * and main.  It runs a copy of the thread's current cpu, so a register it does
+ * not place keeps the caller's value, and it is done when the guest returns to
+ * the sentinel address it was handed as its return address.  The copy records
+ * the host pthread, port and thread id and starts with none of the suspend
+ * state of the cpu it was copied from, and the outer cpu's port is hidden until
+ * the call returns, because JavaScriptCore's collector finds a thread by its
+ * port and the main thread used to answer with port 0.  The copy registers in
+ * the cpu registry, the host mask is cleared, and the call installs its own
+ * recovery point.  On the way out it unregisters, gives the outer cpu its port
+ * back, and puts back the thread's previous recovery point and previous cpu, so
+ * calls nest to any depth: guest code inside a native callback can call a
+ * bridged function that calls another guest callback, and each level unwinds to
+ * the state the level above it left.
+ *
+ * ocerz_vm_call_abi is the same call with the whole System V placement, for
+ * native code calling a guest function, as native qsort calls a guest
+ * comparator.  Integer arguments go in RDI..R9, floating-point ones in the low
+ * half of XMM0..XMM7 with the high half zeroed, and stacked ones in an area
+ * built below the stack top, so that at entry [RSP] is the sentinel, [RSP+8] is
+ * the first stacked argument, and RSP is 8 modulo 16 as it is after a caller's
+ * call.  It hands back both RAX and XMM0, since only the callee's signature
+ * says which carries the result, and reports whether the guest actually
+ * returned or the process began exiting under it.  With nothing stacked that
+ * frame is exactly the one ocerz_vm_call has always built, which is why both
+ * are thin wrappers around one core rather than two copies of it: several of
+ * the steps above are there because a real program broke without them, and a
+ * second copy would be one fix behind the first the next time that happens.
+ *
+ * OCERZ_ICAP and OCERZ_PROFILE are read once, like the knobs beside them.  An
+ * initializer enters guest code once, but a callback enters it once per
+ * comparison, and a sort of a few thousand elements made tens of thousands of
+ * entries that each called getenv twice.
  */
 #include "ocerz/vm.h"
 #include "ocerz/dyld.h"
@@ -607,6 +643,11 @@ static void sel_trap_report(const OcerzCPU *c)
             g_vm ? (unsigned long long)g_vm->insn_count : 0);
     if (isa && getenv("OCERZ_METHDUMP"))
         ocerz_dyldapi_dump_method(isa, "allocWithZone:");
+}
+
+OcerzCPU *ocerz_vm_current_cpu(void)
+{
+    return g_cur_cpu;
 }
 
 uint64_t ocerz_current_guest_rip(void)
@@ -2511,7 +2552,8 @@ void ocerz_peek_dump(const char *tag)
 
 }
 
-uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top)
+static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ngpr, int nxmm,
+                        uint64_t stack_top)
 {
     static const int ar[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
     static uint64_t sentinel;
@@ -2538,15 +2580,30 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     local.host_kport = pthread_mach_thread_np(pthread_self());
     pthread_threadid_np(NULL, &local.host_tid);
     uint32_t prev_kport = prev_cpu ? prev_cpu->host_kport : 0;
-    for (int i = 0; i < nargs && i < 6; i++)
-        local.gpr[ar[i]] = args[i];
-    uint64_t sp = (stack_top & ~0xfull) - 8;
+    for (int i = 0; i < ngpr && i < 6; i++)
+        local.gpr[ar[i]] = call->gpr[i];
+    for (int i = 0; i < nxmm && i < 8; i++) {
+        local.xmm[i].lo = call->xmm[i];
+        local.xmm[i].hi = 0;
+    }
+    int nstack = call->nstack < 0 ? 0 : call->nstack > 16 ? 16 : call->nstack;
+    uint64_t argbase = ((stack_top & ~0xfull) - 8 * (uint64_t)nstack) & ~0xfull;
+    uint64_t sp = argbase - 8;
     ocerz_st(sp, 8, sentinel);
+    for (int i = 0; i < nstack; i++)
+        ocerz_st(argbase + 8 * (uint64_t)i, 8, call->stack[i]);
     local.gpr[OCERZ_RSP] = sp;
     local.rip = func;
     g_cur_cpu = &local;
-    const char *icap_s = getenv("OCERZ_ICAP");
-    unsigned long long icap = icap_s ? strtoull(icap_s, NULL, 0) : 0;
+    static unsigned long long icap, prof;
+    static int icap_prof_init;
+    if (!icap_prof_init) {
+        const char *icap_s = getenv("OCERZ_ICAP");
+        icap = icap_s ? strtoull(icap_s, NULL, 0) : 0;
+        const char *prof_s = getenv("OCERZ_PROFILE");
+        prof = prof_s ? strtoull(prof_s, NULL, 0) : 0;
+        icap_prof_init = 1;
+    }
     static uint64_t riptrap[16];
     static int riptrap_n = -1;
     static unsigned char riptrap_hit[16];
@@ -2558,8 +2615,6 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
             while (*rs == ',' || *rs == ' ') rs++;
         }
     }
-    const char *prof_s = getenv("OCERZ_PROFILE");
-    unsigned long long prof = prof_s ? strtoull(prof_s, NULL, 0) : 0;
     unsigned long long prof_next = prof ? vm->insn_count + prof : 0;
 
     static uint64_t mtrace_lo, mtrace_hi;
@@ -2715,7 +2770,24 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     if (prev_cpu && vm->jit_ordered_required)
         __atomic_store_n(&prev_cpu->ras_top, 0, __ATOMIC_RELEASE);
     g_cur_cpu = prev_cpu;
-    return local.gpr[OCERZ_RAX];
+    call->rax = local.gpr[OCERZ_RAX];
+    call->xmm0 = local.xmm[0].lo;
+    return (local.rip != sentinel || vm->exited) ? 1 : 0;
+}
+
+uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top)
+{
+    OcerzGuestCall call;
+    for (int i = 0; i < nargs && i < 6; i++)
+        call.gpr[i] = args[i];
+    call.nstack = 0;
+    vm_call_core(vm, func, &call, nargs, 0, stack_top);
+    return call.rax;
+}
+
+int ocerz_vm_call_abi(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, uint64_t stack_top)
+{
+    return vm_call_core(vm, func, call, 6, 8, stack_top);
 }
 
 static void ocerz_kick_handler(int sig, siginfo_t *si, void *uc)

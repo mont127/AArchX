@@ -47,6 +47,41 @@
  * tests rather than being smuggled in here.  A signature naming one is rejected
  * at parse time, which keeps an unsupported call an honest refusal instead of a
  * silently wrong one.
+ *
+ * ---- calls in the other direction ----
+ * Some native functions take a function pointer and call it: qsort calls its
+ * comparator, a run loop calls its observer.  When the guest supplies one, the
+ * pointer is x86 code, and native code cannot jump to it.  So an argument of
+ * class c is not converted like a pointer.  It carries its own signature in
+ * braces, as in v(pLLc{i(pp)}) for qsort, and it is interned: the guest function
+ * and that signature are bound to one slot of a fixed bank of arm64 trampolines,
+ * and the slot's address is what the native callee receives.  Interning the same
+ * function with the same signature twice returns the same address, so a native
+ * library that compares callback pointers still sees one function.  A null
+ * pointer stays null.  A nested signature may not itself name a callback.
+ *
+ * The bank is ordinary code assembled into ocerz, not code generated at run time.
+ * Generating a trampoline from inside a native callback would race the
+ * translator for the one writable JIT arena, a fork child abandons that arena
+ * while native code may still hold pointers into it, and a real-time audio
+ * callback cannot wait for code generation at all.  Each slot is two
+ * instructions and finds its own index from its own address, so the bank is one
+ * repeated block and exhausting it is a named refusal, never a silent reuse.
+ *
+ * When native code calls a slot, the dispatcher reads that signature against the
+ * native caller's x0..x7, v0..v7 and stacked arguments, packed the way Apple's
+ * arm64 packs them, places the values where the System V ABI puts them for the
+ * guest, and runs the guest function on the calling thread below its own stack
+ * pointer, past the red zone.  The guest runs with its own rounding mode, not
+ * the default the enclosing native call was given.  While it runs, the thread
+ * is executing guest code again, so it must not count as inside a bridged call:
+ * a guest fault there is an ordinary guest fault with an ordinary recovery, and
+ * reporting it as a native-code fault would kill a process that was fine.  The
+ * result is converted back and returned in x0 or v0.
+ *
+ * A callback that arrives on a thread with no guest personality at all, one a
+ * native framework created for itself, is refused by name here; attaching such
+ * a thread is a separate change.
  */
 #ifndef OCERZ_ABI_H
 #define OCERZ_ABI_H
@@ -56,10 +91,14 @@
 
 #define OCERZ_ABI_MAX_ARGS 16
 #define OCERZ_ABI_MAX_STACK 16
+#define OCERZ_ABI_CB_MAX 24
+#define OCERZ_ABI_CALLBACK_SLOTS 4096
+#define OCERZ_ABI_CALLBACK_STRIDE 8
 
 typedef struct OcerzAbiSig {
     char ret;
     char arg[OCERZ_ABI_MAX_ARGS];
+    char cb[OCERZ_ABI_MAX_ARGS][OCERZ_ABI_CB_MAX];
     int nargs;
 } OcerzAbiSig;
 
@@ -85,5 +124,14 @@ int ocerz_abi_perform(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu);
 void ocerz_abi_call_native(const void *fn, const uint64_t *x, const uint64_t *v,
                            const uint64_t *stack, uint64_t stackbytes,
                            uint64_t *out_x0, uint64_t *out_v0);
+
+void *ocerz_abi_callback_intern(uint64_t guest_fn, const char *notation);
+
+void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
+                                 const uint8_t *stack, uint64_t *out_x0,
+                                 uint64_t *out_v0);
+
+extern const char ocerz_abi_callback_bank[];
+extern const char ocerz_abi_callback_bank_end[];
 
 #endif

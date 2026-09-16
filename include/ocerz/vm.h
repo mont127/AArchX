@@ -4,6 +4,15 @@
  * The guest thread_suspend/thread_resume/thread_get_state entry points return
  * -1 to mean "not a thread running guest code", in which case the caller lets
  * the host kernel answer as it did before.
+ *
+ * ocerz_vm_call enters guest code with up to six integer arguments, which is all
+ * an initializer or a +load method needs.  ocerz_vm_call_abi is the general form
+ * native callbacks need: integer arguments in RDI..R9, floating-point ones in the
+ * low halves of XMM0..XMM7, the rest on the guest stack where the System V ABI
+ * puts them, and both RAX and XMM0 handed back, since the callee's signature and
+ * not the call site decides which one carries the result.  ocerz_vm_current_cpu
+ * is the guest cpu the calling thread is running, or NULL on a thread that has
+ * none.
  */
 #ifndef OCERZ_VM_H
 #define OCERZ_VM_H
@@ -36,6 +45,18 @@ void ocerz_vm_request_exit(OcerzVM *vm, int code);
 void ocerz_vm_mirror_host_signal(int sig, int kind);
 void ocerz_vm_install_handlers(OcerzVM *vm);
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top);
+
+typedef struct OcerzGuestCall {
+    uint64_t gpr[6];
+    uint64_t xmm[8];
+    uint64_t stack[16];
+    int nstack;
+    uint64_t rax;
+    uint64_t xmm0;
+} OcerzGuestCall;
+
+OcerzCPU *ocerz_vm_current_cpu(void);
+int ocerz_vm_call_abi(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, uint64_t stack_top);
 unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
 void ocerz_vm_purge_jit_ras(OcerzVM *vm);
 int ocerz_vm_thread_suspend(OcerzCPU *self, uint32_t port);

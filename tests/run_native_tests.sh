@@ -57,12 +57,17 @@
 # is deliberately outside the virtual library's export list. 72 means
 # everything bound and the guest ran, and what is missing is the bridge behind
 # one export rather than the export itself; xbench_dyn no longer reaches it, so
-# bridge_unimpl pins it with a program whose only import is qsort, which the
+# bridge_unimpl pins it with a program whose only import is printf, which the
 # virtual library exports and the bridge deliberately does not implement -- it
-# takes a callback, and there is no trampoline back into guest code yet. Being
-# the only import, it is also the only symbol the bridge line can name, so that
-# case pins the symbol as well as the shape of the line. Both fixtures skip
-# where there is no x86_64 clang, the way the dynamic gate does.
+# is variadic, Apple's arm64 passes variadic arguments on the stack where x86-64
+# passes them in registers, and no fixed signature can say where the named
+# arguments stop. That fixture's one import used to be qsort, until M5 gave a
+# callback a way back into guest code. Being the only import, it is also the
+# only symbol the bridge line can name, so that case pins the symbol as well as
+# the shape of the line, and it checks the fixture's import table with nm first
+# so that a toolchain which starts importing something else is reported as that
+# rather than as a bridge naming the wrong export. Both fixtures skip where
+# there is no x86_64 clang, the way the dynamic gate does.
 #
 # Cache mode must come out of all this untouched, and it is checked the way the
 # rest of the suite checks translation: the JIT and the interpreter running the
@@ -127,6 +132,61 @@
 # variable: a diagnostic that changes what it observes is worse than no
 # diagnostic.
 #
+# M5 adds calls in the other direction. Until M5 every crossing went from guest
+# code into native code, but qsort and bsearch take a function pointer and call
+# it, and when the guest supplies one it names x86 code native code cannot jump
+# to. Such an argument is now interned to a slot of a fixed bank of arm64
+# trampolines, and native code calling the slot runs the guest function on the
+# calling thread, below the native caller's stack pointer, and gets its result
+# back. Five fixtures cover that end to end, compiled at test time like
+# bridge_probe and importing only functions the bridge implements. The four that
+# are meant to succeed check their own work and write a status line first,
+# "<name> ok ..." or "<name> bad:<hex> ...", with the bits numbered in source
+# order the way the probe's are, and each case's failure message says what every
+# bit means.
+#
+# callback_qsort sorts three hundred distinct ints up, down and up again with
+# two guest comparators, so sorted and the right permutation are one check: the
+# result must be exactly -150..149. The comparators return plus or minus 65536
+# rather than one, so a result cut down to a byte or a word on the way back
+# reads as equality and the sort comes out wrong. callback_nested_bridge sorts
+# strings with a comparator that calls strcmp, which is a bridged crossing
+# inside a guest callback inside a bridged crossing, checks the order with a
+# comparison of its own rather than with the strcmp under test, and then puts
+# the sorted strings themselves, so the cache comparison sees the order too.
+# callback_bsearch looks up every present key and a set of absent ones through
+# a key whose layout differs from the element's, and its comparator checks that
+# the key pointer arrives unchanged and the element pointer lands on an element,
+# so arguments delivered in the wrong order or converted wrongly cannot find
+# anything. callback_recursion gives each comparator a qsort of its own over a
+# small local array, with the other comparator, twenty-four levels deep, so
+# native and guest frames alternate on one thread; every level must be entered
+# once and left once in order, run the comparator it was handed, sort its array,
+# and find its caller's elements unchanged when the level below returns, which
+# is what a guest stack placed on top of a live native frame would break. Every
+# comparator also checks that it was entered with the stack aligned the way the
+# System V ABI promises. All four run under the JIT and under -no-jit, which
+# must agree byte for byte, and native output must equal cache mode's, where the
+# same comparators are called by the real x86 libSystem.
+#
+# callback_guest_fault is the reason M5 clears the thread's bridge frame while
+# guest code runs. Its comparator dereferences the same unmapped guest address
+# the M4 fixtures use, 0x6000000000 and never 0x500000000, which is where
+# ocerz_vm_call maps its readable return sentinel, so a read there succeeds and
+# the case would fail for a reason unrelated to bridges. When the comparator
+# faults, native qsort is still live on the host stack, and a frame left
+# raised for that stretch would send the fault down M4's path: a BRIDGE-FAULT
+# report blaming _qsort and an immediate stop, for a fault that is entirely the
+# guest's, and one a guest with its own SIGSEGV handler is entitled to recover
+# from. So the case demands exactly what bridge_frame_lowered demands of a
+# fault in plain guest code -- a guest-crash report naming the address, status
+# 139, the line after qsort never written -- under both engines, and fails on
+# any BRIDGE-FAULT line at all.
+#
+# The callback cases skip where there is no x86_64 clang, like the others, but a
+# callback fixture that fails to compile where a trivial x86_64 program compiles
+# fine is a failure: skipping it would hide a broken fixture indefinitely.
+#
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
 # entire point of the mode -- but with nothing to compare against, the
@@ -146,7 +206,7 @@ KERNEL=depchain
 KERNELS="depchain memcpy"
 SCALE=1000
 LIB=/usr/lib/libSystem.B.dylib
-UNIMPL_SYM=_qsort
+UNIMPL_SYM=_printf
 BRIDGE_RE='^ocerz: bridge: [^ ]+ [^ ]+ not implemented$'
 NOBIND='ocerz: native: no bridge for '
 M0_SUMMARY='unresolved imports, no virtual frameworks are implemented yet'
@@ -174,6 +234,14 @@ BRIDGELOG_RE='^ocerz: BRIDGELOG\[[0-9]+\] [^ ]+ [^ ]+ [^ ]+$'
 BRIDGELOG_KERNEL=memcpy
 BRIDGELOG_SYM=_memcpy
 BRIDGELOG_SIG='p(ppL)'
+X86_CLANG=0
+CB_QSORT_BIN=""
+CB_NESTED_BIN=""
+CB_BSEARCH_BIN=""
+CB_RECURSION_BIN=""
+CB_FAULT_BIN=""
+CB_FAULT_MARK='cbfault enter'
+CB_FAULT_PAST='cbfault returned'
 
 unset OCERZ_MODE
 unset OCERZ_BRIDGE_PROBE_UNSET
@@ -549,18 +617,11 @@ int main(void)
 EOC
 
     cat > "$usrc" <<'EOC'
-typedef __SIZE_TYPE__ bp_size;
-void qsort(void *, bp_size, bp_size, int (*)(const void *, const void *));
-static int bp_cmp(const void *a, const void *b)
-{
-    int x = *(const int *)a, y = *(const int *)b;
-    return x < y ? -1 : (x > y);
-}
-static int v[4] = { 4, 2, 3, 1 };
+int printf(const char *, ...);
 int main(void)
 {
-    qsort(v, 4, sizeof v[0], bp_cmp);
-    return v[0] == 1 ? 0 : 1;
+    printf("unimpl %d\n", 72);
+    return 0;
 }
 EOC
 
@@ -622,6 +683,462 @@ EOC
             -o "$abin" "$asrc" >/dev/null 2>&1; then
         AFTER_BIN="$abin"
     fi
+}
+
+build_callback_fixtures() {
+    local name
+
+    printf 'int main(void) { return 0; }\n' > "$TMP/cb_trivial.c"
+    if clang -arch x86_64 -o "$TMP/cb_trivial" "$TMP/cb_trivial.c" >/dev/null 2>&1; then
+        X86_CLANG=1
+    fi
+
+    cat > "$TMP/cb_common.h" <<'EOC'
+typedef __SIZE_TYPE__ cb_size;
+typedef __UINTPTR_TYPE__ cb_uptr;
+
+long write(int, const void *, cb_size);
+int puts(const char *);
+int strcmp(const char *, const char *);
+void qsort(void *, cb_size, cb_size, int (*)(const void *, const void *));
+void *bsearch(const void *, const void *, cb_size, cb_size,
+              int (*)(const void *, const void *));
+
+#define CK(cond) do { if (!(cond)) m |= bit; bit <<= 1; } while (0)
+#define CB_SKEWED() (((cb_uptr)__builtin_frame_address(0) & 15) != 0)
+
+static char cb_buf[160];
+static cb_size cb_len;
+
+static void cb_str(const char *s)
+{
+    while (*s && cb_len < sizeof cb_buf - 1)
+        cb_buf[cb_len++] = *s++;
+}
+
+static void cb_hex(unsigned v)
+{
+    const char *d = "0123456789abcdef";
+    int i;
+    for (i = 0; i < 8; i++) {
+        char c[2] = { d[(v >> (28 - 4 * i)) & 15], 0 };
+        cb_str(c);
+    }
+}
+
+static void cb_dec(unsigned v)
+{
+    char t[11];
+    int n = 10;
+    t[10] = 0;
+    do {
+        t[--n] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    cb_str(t + n);
+}
+
+static void cb_begin(const char *name, unsigned mask)
+{
+    cb_len = 0;
+    cb_str(name);
+    if (mask == 0) {
+        cb_str(" ok");
+    } else {
+        cb_str(" bad:");
+        cb_hex(mask);
+    }
+}
+
+static void cb_field(const char *key, unsigned v, int hex)
+{
+    cb_str(" ");
+    cb_str(key);
+    cb_str("=");
+    if (hex)
+        cb_hex(v);
+    else
+        cb_dec(v);
+}
+
+static void cb_end(void)
+{
+    cb_buf[cb_len++] = '\n';
+    write(1, cb_buf, cb_len);
+}
+EOC
+
+    cat > "$TMP/callback_qsort.c" <<'EOC'
+#include "cb_common.h"
+
+#define N 300
+
+static int g_v[N];
+static unsigned g_up, g_down, g_skew;
+
+static int cmp_up(const void *a, const void *b)
+{
+    int x = *(const int *)a, y = *(const int *)b;
+
+    g_up++;
+    if (CB_SKEWED())
+        g_skew++;
+    return x < y ? -65536 : (x > y ? 65536 : 0);
+}
+
+static int cmp_down(const void *a, const void *b)
+{
+    int x = *(const int *)a, y = *(const int *)b;
+
+    g_down++;
+    if (CB_SKEWED())
+        g_skew++;
+    return x > y ? -65536 : (x < y ? 65536 : 0);
+}
+
+static int ascending(void)
+{
+    int i;
+    for (i = 0; i < N; i++)
+        if (g_v[i] != i - N / 2)
+            return 0;
+    return 1;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, sum = 0;
+    int i, ok;
+
+    for (i = 0; i < N; i++)
+        g_v[i] = (int)((unsigned)i * 7919u % N) - N / 2;
+
+    qsort(g_v, N, sizeof g_v[0], cmp_up);
+    CK(ascending());
+    qsort(g_v, N, sizeof g_v[0], cmp_down);
+    ok = 1;
+    for (i = 0; i < N; i++)
+        if (g_v[i] != N / 2 - 1 - i)
+            ok = 0;
+    CK(ok);
+    qsort(g_v, N, sizeof g_v[0], cmp_up);
+    CK(ascending());
+    CK(g_up != 0 && g_down != 0);
+    CK(g_skew == 0);
+
+    for (i = 0; i < N; i++)
+        sum = sum * 31u + (unsigned)g_v[i];
+    cb_begin("qsort", m);
+    cb_field("n", N, 0);
+    cb_field("sum", sum, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/callback_nested_bridge.c" <<'EOC'
+#include "cb_common.h"
+
+static const char *const g_words[] = {
+    "qsort", "strcmp", "bridge", "Bridge", "callback", "call", "", "zebra",
+    "alpha", "alphabet", "alp", "~tilde", "0zero", "ocerz", "call", "guest",
+    "x86", "arm64", "AArchX", "trampoline", "slot", "bank", "\xc3\xa9t\xc3\xa9",
+    "comparator", "nested", "crossing", "frame", "Zulu", "zulu", "b", "a", "aa",
+};
+#define NW ((int)(sizeof g_words / sizeof g_words[0]))
+
+static const char *g_sorted[NW];
+static unsigned g_calls;
+
+static int cmp_str(const void *a, const void *b)
+{
+    g_calls++;
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static int own_cmp(const char *x, const char *y)
+{
+    while (*x && *x == *y) {
+        x++;
+        y++;
+    }
+    return (int)(unsigned char)*x - (int)(unsigned char)*y;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1;
+    char seen[NW], line[512];
+    cb_size n = 0;
+    int i, j, ok;
+
+    for (i = 0; i < NW; i++) {
+        g_sorted[i] = g_words[i];
+        seen[i] = 0;
+    }
+    qsort(g_sorted, NW, sizeof g_sorted[0], cmp_str);
+
+    ok = 1;
+    for (i = 1; i < NW; i++)
+        if (own_cmp(g_sorted[i - 1], g_sorted[i]) > 0)
+            ok = 0;
+    CK(ok);
+    ok = 1;
+    for (i = 0; i < NW; i++) {
+        for (j = 0; j < NW; j++)
+            if (!seen[j] && g_words[j] == g_sorted[i])
+                break;
+        if (j == NW)
+            ok = 0;
+        else
+            seen[j] = 1;
+    }
+    CK(ok);
+    CK(g_calls != 0);
+
+    cb_begin("nested", m);
+    cb_field("words", (unsigned)NW, 0);
+    cb_end();
+    for (i = 0; i < NW; i++) {
+        if (i)
+            line[n++] = ',';
+        for (j = 0; g_sorted[i][j]; j++)
+            line[n++] = g_sorted[i][j];
+    }
+    line[n] = 0;
+    puts(line);
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/callback_bsearch.c" <<'EOC'
+#include "cb_common.h"
+
+#define N 200
+
+struct rec {
+    int key;
+    int val;
+};
+
+struct probe {
+    char tag[4];
+    int key;
+};
+
+static struct rec g_recs[N];
+static struct probe g_probe;
+static unsigned g_calls, g_bad_key, g_bad_elem, g_skew;
+
+static int cmp_key(const void *k, const void *e)
+{
+    const struct probe *p = k;
+    const struct rec *r = e;
+    cb_uptr lo = (cb_uptr)g_recs, off = (cb_uptr)e - lo;
+
+    g_calls++;
+    if (p != &g_probe)
+        g_bad_key++;
+    if ((cb_uptr)e < lo || off >= sizeof g_recs || off % sizeof g_recs[0] != 0)
+        g_bad_elem++;
+    if (CB_SKEWED())
+        g_skew++;
+    return p->key < r->key ? -65536 : (p->key > r->key ? 65536 : 0);
+}
+
+static const struct rec *find(int key, cb_size n)
+{
+    g_probe.key = key;
+    return bsearch(&g_probe, g_recs, n, sizeof g_recs[0], cmp_key);
+}
+
+int main(void)
+{
+    static const int kOutside[] = { -1000000, -251, 348, 1000000 };
+    unsigned m = 0, bit = 1, found = 0, absent = 0;
+    int i, ok;
+
+    g_probe.tag[0] = 'k';
+    g_probe.tag[1] = 'e';
+    g_probe.tag[2] = 'y';
+    for (i = 0; i < N; i++) {
+        g_recs[i].key = 3 * i - 250;
+        g_recs[i].val = i * 7 + 1;
+    }
+
+    ok = 1;
+    for (i = 0; i < N; i++) {
+        const struct rec *r = find(3 * i - 250, N);
+        if (r == &g_recs[i] && r->val == i * 7 + 1)
+            found++;
+        else
+            ok = 0;
+    }
+    CK(ok);
+
+    ok = 1;
+    for (i = 0; i < N; i++) {
+        if (find(3 * i - 249, N) == 0)
+            absent++;
+        else
+            ok = 0;
+    }
+    for (i = 0; i < 4; i++) {
+        if (find(kOutside[i], N) == 0)
+            absent++;
+        else
+            ok = 0;
+    }
+    CK(ok);
+    CK(find(-250, 0) == 0);
+    CK(g_calls != 0);
+    CK(g_bad_key == 0);
+    CK(g_bad_elem == 0);
+    CK(g_skew == 0);
+
+    cb_begin("bsearch", m);
+    cb_field("found", found, 0);
+    cb_field("absent", absent, 0);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/callback_recursion.c" <<'EOC'
+#include "cb_common.h"
+
+#define DEPTH 24
+
+static int g_level;
+static unsigned g_enter[DEPTH + 1], g_leave[DEPTH + 1];
+static unsigned g_deepest, g_wrong_cmp, g_moved, g_unsorted, g_skew;
+static unsigned g_trail = 17;
+
+static int cmp_up(const void *a, const void *b);
+static int cmp_down(const void *a, const void *b);
+
+static void descend(int d)
+{
+    int v[3];
+    int up = d & 1;
+
+    v[0] = 3 * d + 2;
+    v[1] = 3 * d;
+    v[2] = 3 * d + 1;
+    g_level = d;
+    qsort(v, 3, sizeof v[0], up ? cmp_up : cmp_down);
+    if (up ? !(v[0] < v[1] && v[1] < v[2]) : !(v[0] > v[1] && v[1] > v[2]))
+        g_unsorted++;
+    g_leave[d]++;
+    g_trail = g_trail * 37u + (unsigned)d;
+}
+
+static int step(const void *a, const void *b, int up)
+{
+    int d = g_level;
+    int x = *(const int *)a, y = *(const int *)b;
+
+    if ((d & 1) != up)
+        g_wrong_cmp++;
+    if (CB_SKEWED())
+        g_skew++;
+    if (d >= 1 && d <= DEPTH && g_enter[d] == 0) {
+        g_enter[d]++;
+        g_trail = g_trail * 31u + (unsigned)d;
+        if ((unsigned)d > g_deepest)
+            g_deepest = (unsigned)d;
+        if (d < DEPTH) {
+            descend(d + 1);
+            g_level = d;
+            if (*(const int *)a != x || *(const int *)b != y)
+                g_moved++;
+        }
+    }
+    if (up)
+        return x < y ? -65536 : (x > y ? 65536 : 0);
+    return x > y ? -65536 : (x < y ? 65536 : 0);
+}
+
+static int cmp_up(const void *a, const void *b)
+{
+    return step(a, b, 1);
+}
+
+static int cmp_down(const void *a, const void *b)
+{
+    return step(a, b, 0);
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, want = 17;
+    int d, ok;
+
+    descend(1);
+
+    ok = 1;
+    for (d = 1; d <= DEPTH; d++)
+        if (g_enter[d] != 1)
+            ok = 0;
+    CK(ok);
+    ok = 1;
+    for (d = 1; d <= DEPTH; d++)
+        if (g_leave[d] != 1)
+            ok = 0;
+    CK(ok);
+    CK(g_deepest == DEPTH);
+    CK(g_wrong_cmp == 0);
+    CK(g_moved == 0);
+    CK(g_unsorted == 0);
+    CK(g_skew == 0);
+    for (d = 1; d <= DEPTH; d++)
+        want = want * 31u + (unsigned)d;
+    for (d = DEPTH; d >= 1; d--)
+        want = want * 37u + (unsigned)d;
+    CK(g_trail == want);
+
+    cb_begin("recursion", m);
+    cb_field("depth", g_deepest, 0);
+    cb_field("trail", g_trail, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/callback_guest_fault.c" <<EOC
+#include "cb_common.h"
+
+static const int *volatile g_bad = (const int *)${BAD_GUEST_ADDR}ull;
+static volatile int g_sink;
+static int g_v[8] = { 5, 3, 7, 1, 8, 2, 6, 4 };
+
+static int cmp_fault(const void *a, const void *b)
+{
+    g_sink = *g_bad;
+    return *(const int *)a - *(const int *)b;
+}
+
+int main(void)
+{
+    write(1, "cbfault enter\n", 14);
+    qsort(g_v, 8, sizeof g_v[0], cmp_fault);
+    write(1, "cbfault returned\n", 17);
+    return 0;
+}
+EOC
+
+    for name in callback_qsort callback_nested_bridge callback_bsearch \
+                callback_recursion callback_guest_fault; do
+        clang -arch x86_64 -std=c11 -O1 -fno-builtin -fno-stack-protector \
+                -o "$TMP/$name" "$TMP/$name.c" >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            callback_qsort) CB_QSORT_BIN="$TMP/$name" ;;
+            callback_nested_bridge) CB_NESTED_BIN="$TMP/$name" ;;
+            callback_bsearch) CB_BSEARCH_BIN="$TMP/$name" ;;
+            callback_recursion) CB_RECURSION_BIN="$TMP/$name" ;;
+            callback_guest_fault) CB_FAULT_BIN="$TMP/$name" ;;
+        esac
+    done
 }
 
 run_probe() {
@@ -790,7 +1307,7 @@ case_bridge_probe_cache() {
 }
 
 case_bridge_unimpl() {
-    local name=bridge_unimpl rc reason="" sym
+    local name=bridge_unimpl rc reason="" sym imports
     local out="$TMP/bridge_unimpl.out" err="$TMP/bridge_unimpl.err"
 
     if [ -z "$UNIMPL_BIN" ]; then
@@ -799,7 +1316,10 @@ case_bridge_unimpl() {
     run_bounded "$out" "$err" "$OCERZ" -v -native "$UNIMPL_BIN"
     rc=$?
     sym=$(bridge_sym "$out" "$err")
-    if [ "$rc" -ne 72 ]; then
+    imports="$(nm -u "$UNIMPL_BIN" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+    if [ -n "$imports" ] && [ "$imports" != "$UNIMPL_SYM " ]; then
+        reason="the fixture imports '$imports' rather than $UNIMPL_SYM alone, so the symbol the bridge line names proves nothing"
+    elif [ "$rc" -ne 72 ]; then
         reason="exit $rc, want 72"
     elif grep -Fq "$NOBIND" "$out" "$err"; then
         reason="an import went unresolved: $(grep -hF "$NOBIND" "$out" "$err" | head -1)"
@@ -989,6 +1509,132 @@ case_bridgelog() {
     record "$name" "$reason" "exit=$rc lines=$n"
 }
 
+callback_fixture_missing() {
+    local name="$1" bin="$2"
+    if [ -n "$bin" ]; then
+        return 1
+    fi
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+    else
+        record "$name" "the fixture did not compile although x86_64 clang builds a trivial program: $( (grep -m1 -i 'error' "$TMP/$name.cc.log" || head -1 "$TMP/$name.cc.log") 2>/dev/null | cut -c1-160)"
+    fi
+    return 0
+}
+
+callback_run_reason() {
+    local rc="$1" reason
+    shift
+    reason="$(native_run_reason "$rc" "$@")"
+    if [ -z "$reason" ]; then
+        echo ""
+    elif grep -qE "$BRIDGE_FAULT_RE" "$@" 2>/dev/null; then
+        echo "$reason; $(grep -hE "$BRIDGE_FAULT_RE" "$@" | head -1 | cut -c1-120)"
+    elif grep -Fq "$GUEST_CRASH" "$@" 2>/dev/null; then
+        echo "$reason; $(grep -hF "$GUEST_CRASH" "$@" | head -1 | cut -c1-120)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "$reason: still running after ${NATIVE_TIMEOUT}s, so a callback never came back"
+    else
+        echo "$reason"
+    fi
+}
+
+case_callback() {
+    local name="$1" bin="$2" tag="$3" bits="$4" reason="" rc_jit rc_nojit rc_cache line
+    local cache_note=""
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin"
+    rc_nojit=$?
+    line="$(head -1 "$jo")"
+
+    reason="$(callback_run_reason "$rc_jit" "$jo" "$je")"
+    if grep -q "^$tag bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed, where $bits"
+    elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+        reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+    fi
+
+    if [ -z "$reason" ]; then
+        reason="$(callback_run_reason "$rc_nojit" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(head -1 "$no")': the guest's own checks failed, where $bits"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$bin"
+        rc_cache=$?
+        if [ "$rc_cache" -ne 0 ]; then
+            reason="cache-mode exit $rc_cache, want 0: '$(head -1 "$co")'"
+        elif ! cmp -s "$jo" "$co"; then
+            reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': a callback crossing changed what the guest computed"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
+}
+
+callback_fault_reason() {
+    local rc="$1" out="$2" err="$3" stopped
+    stopped="$(bridge_stopped_reason "$out" "$err")"
+    if [ -n "$stopped" ]; then
+        echo "$stopped"
+    elif ! grep -Fq "$CB_FAULT_MARK" "$out"; then
+        echo "the guest never reached its qsort call"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err"; then
+        echo "the comparator's own read of $BAD_GUEST_ADDR was reported as a fault inside a bridged call ($(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1 | cut -c1-80)): M5 clears the thread's bridge frame while guest code runs precisely so that a fault in a callback is the guest's, and the frame was still raised when the comparator faulted"
+    elif grep -Fq "$CB_FAULT_PAST" "$out"; then
+        echo "qsort returned without the comparator faulting, so the callback never ran the guest's comparator"
+    elif [ "$rc" -eq 124 ]; then
+        echo "still running after ${NATIVE_TIMEOUT}s: the fault inside the callback hung instead of stopping the process"
+    elif ! grep -Fq "$GUEST_CRASH" "$out" "$err"; then
+        echo "no guest-crash report for a fault the guest took in its own comparator"
+    elif ! grep -Fq "guest_addr=$BAD_GUEST_ADDR" "$out" "$err"; then
+        echo "the guest-crash report does not name $BAD_GUEST_ADDR, the address the comparator read"
+    elif [ "$rc" -ne "$GUEST_FAULT_STATUS" ]; then
+        echo "exit $rc, want $GUEST_FAULT_STATUS"
+    else
+        echo ""
+    fi
+}
+
+case_callback_guest_fault() {
+    local name=callback_guest_fault reason="" rc_jit rc_nojit
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+
+    if callback_fixture_missing "$name" "$CB_FAULT_BIN"; then
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$CB_FAULT_BIN"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$CB_FAULT_BIN"
+    rc_nojit=$?
+    reason="$(callback_fault_reason "$rc_jit" "$jo" "$je")"
+    if [ -z "$reason" ]; then
+        reason="$(callback_fault_reason "$rc_nojit" "$no" "$ne")"
+        if [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit no-jit exit=$rc_nojit"
+}
+
 case_env_native() {
     local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
@@ -1142,6 +1788,7 @@ case_native_static() {
 }
 
 build_fixtures
+build_callback_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -1166,6 +1813,15 @@ case_bridge_fault_not_guest
 case_bridge_fault_cache
 case_bridge_frame_lowered
 case_bridgelog
+case_callback callback_qsort "$CB_QSORT_BIN" qsort \
+    "bit 0 is the first ascending sort, 1 the descending sort and 2 the second ascending sort coming out other than -150..149 in order, 3 a comparator that never ran, 4 a comparator entered on a misaligned stack"
+case_callback callback_nested_bridge "$CB_NESTED_BIN" nested \
+    "bit 0 is strings out of order after a comparator built on bridged strcmp, 1 a result that is not a permutation of the input, 2 a comparator that never ran"
+case_callback callback_bsearch "$CB_BSEARCH_BIN" bsearch \
+    "bit 0 is a present key not found at its own element, 1 an absent key found, 2 a search of zero elements finding something, 3 a comparator that never ran, 4 the key pointer arriving changed, 5 an element pointer off an element boundary, 6 a comparator entered on a misaligned stack"
+case_callback callback_recursion "$CB_RECURSION_BIN" recursion \
+    "bit 0 is a level not entered exactly once, 1 a level not left exactly once, 2 the nesting not reaching depth 24, 3 a level running the other comparator, 4 a caller's elements changing under a nested level, 5 a level's array coming back unsorted, 6 a comparator entered on a misaligned stack, 7 the levels entered or left out of order"
+case_callback_guest_fault
 case_env_native
 case_flag_beats_env
 case_last_flag_native

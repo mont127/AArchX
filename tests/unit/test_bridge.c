@@ -9,11 +9,13 @@
  * modes would stop being distinguishable.  So each name is put through BOTH
  * readers - ocerz_bridge_lookup and the export trie of the image
  * ocerz_vdylib_image builds - rather than through a list written for the test.
- * The unbridged names here are not an arbitrary selection: they are the three
- * exclusions bridge.h states, variadic (printf, open, fcntl, ioctl),
- * floating-point (atof, strtod) and callback-taking (qsort, bsearch), so a
- * bridge that grows one of them has changed a documented rule rather than
- * broken a test.
+ * The unbridged names here are not an arbitrary selection: they are the
+ * variadic exclusion bridge.h states (printf, open, fcntl, ioctl), so a bridge
+ * that grows one of them has changed a documented rule rather than broken a
+ * test.  The list once also held atof and strtod, until signatures could name a
+ * double, and qsort and bsearch, until a callback argument had a trampoline
+ * back into guest code; qsort and bsearch are bridged names now, and their
+ * lookups succeeding is also what proves the table's callback notation parses.
  *
  * The second half drives ocerz_bridge_invoke against a hand-built CPU.  The
  * memory map is the identity one, ocerz_mem_init_identity, because that is the
@@ -75,6 +77,7 @@ static const char *const kBridged[] = {
     "_malloc", "_calloc", "_realloc", "_free",
     "_write", "_read", "_close", "_puts", "_putchar", "_getenv", "_getpid",
     "_isatty", "_abs", "_labs", "_atoi", "_atol", "_time", "_clock",
+    "_qsort", "_bsearch",
     "___error", "_exit", "_abort", "___stack_chk_fail",
 };
 #define NBRIDGED (sizeof kBridged / sizeof kBridged[0])
@@ -82,7 +85,6 @@ static const char *const kBridged[] = {
 static const char *const kUnbridged[] = {
     "_printf", "_fprintf", "_sprintf", "_snprintf",
     "_open", "_fcntl", "_ioctl",
-    "_qsort", "_bsearch",
 };
 #define NUNBRIDGED (sizeof kUnbridged / sizeof kUnbridged[0])
 

@@ -30,8 +30,9 @@
  *   fixed-arity prototype puts every argument in the wrong place.  printf, open,
  *   fcntl and ioctl are therefore not bridged here; they need per-function
  *   veneers that know where the fixed arguments stop.
- * - Anything taking a callback, which needs a trampoline back into guest code
- *   that does not exist yet.  qsort and bsearch are absent for that reason.
+ * - A callback whose own signature takes a callback, or a callback held past
+ *   the call that received it on a thread the guest does not own; abi.h
+ *   describes what a callback argument can be and where it may run.
  * - Structures passed or returned by value, which both ABIs split into pieces
  *   and classify differently; abi.h rejects a signature naming one.
  *
@@ -49,14 +50,16 @@
  * string literal or a field of a descriptor, all of static lifetime, so reading
  * it costs a load and nothing else.
  *
- * There is one exit a crossing cannot bracket itself: a fault handled by jumping
- * out of the faulting call instead of returning through it, which skips the
- * lower and strands the frame.  Nothing does that today, because a fault inside
- * a crossing stops the process rather than jumping past it.  It becomes real the
- * moment native code can call back into guest code, since a guest fault inside a
- * callback recovers by jumping, and a stranded frame would invert this whole
- * mechanism: every later fault on that thread would be blamed on a bridge that
- * had already returned.
+ * A native function may call back into guest code, as qsort calls its
+ * comparator, and for as long as that guest code runs the thread is not inside
+ * native code at all.  ocerz_bridge_guest_enter saves the thread's frame and
+ * clears it, so in_flight answers NULL and a guest fault there is handled as the
+ * ordinary guest fault it is; ocerz_bridge_guest_leave puts the frame back when
+ * the guest code returns.  A bridged call made from inside that guest code raises
+ * its own frame and lowers it again in the usual way.  The recovery point a guest
+ * fault jumps to is installed by the guest call itself, so a recovered fault
+ * lands inside the callback rather than past it, and the saved frame is still
+ * there to restore.
  */
 #ifndef OCERZ_BRIDGE_H
 #define OCERZ_BRIDGE_H
@@ -81,5 +84,7 @@ int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu,
 void ocerz_bridge_report(void);
 
 const struct OcerzBridgeFrame *ocerz_bridge_in_flight(void);
+void ocerz_bridge_guest_enter(struct OcerzBridgeFrame *saved);
+void ocerz_bridge_guest_leave(const struct OcerzBridgeFrame *saved);
 
 #endif

@@ -1056,13 +1056,13 @@ static void test_reject_parse(void)
 }
 
 static const OcerzAbiSig kBadCalls[] = {
-    { 'i', { 's' }, 1 },
-    { 's', { 0 }, 0 },
-    { 'S', { 'p' }, 1 },
-    { 'i', { 'v' }, 1 },
-    { 'v', { 'p', 'S' }, 2 },
-    { 'v', { '{' }, 1 },
-    { 'i', { 'p' }, OCERZ_ABI_MAX_ARGS + 1 },
+    { .ret = 'i', .arg = { 's' }, .nargs = 1 },
+    { .ret = 's', .arg = { 0 }, .nargs = 0 },
+    { .ret = 'S', .arg = { 'p' }, .nargs = 1 },
+    { .ret = 'i', .arg = { 'v' }, .nargs = 1 },
+    { .ret = 'v', .arg = { 'p', 'S' }, .nargs = 2 },
+    { .ret = 'v', .arg = { '{' }, .nargs = 1 },
+    { .ret = 'i', .arg = { 'p' }, .nargs = OCERZ_ABI_MAX_ARGS + 1 },
 };
 #define NBADCALLS (sizeof kBadCalls / sizeof kBadCalls[0])
 
