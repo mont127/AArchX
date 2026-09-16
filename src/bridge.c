@@ -1,71 +1,64 @@
 /*
  * The bridges themselves: what a virtual library's export actually does.
  *
- * A descriptor here is a shape, not a signature.  The guest arrives in the
- * middle of a System V call - arguments in rdi, rsi, rdx, rcx, r8, r9 and the
- * return address on the stack - and the shape says how many of those registers
- * are arguments, which of them are pointers, and what kind of thing comes back.
- * That is enough to move a call across, and deliberately not enough to move
- * every call across; see below for what is left out and why.
+ * A descriptor here is a name, a host symbol and a signature; src/abi.c owns
+ * everything the signature then implies.  The guest arrives in the middle of a
+ * System V call with the return address on the stack, the engine reads the
+ * arguments that signature describes out of wherever x86-64 left them, calls
+ * the real arm64 function linked into ocerz itself, and puts the result back
+ * where x86 code looks for it.  What is left here is the table saying which
+ * export is which host function under which signature, the three exports that
+ * are not a call at all, and the count of crossings.  The counting happens
+ * before that split, so _exit and its kind appear in the report like anything
+ * else.
  *
- * ---- why there is a case per arity ----
- * The resolved address is called through a prototype of exactly the right
- * arity, every parameter uint64_t, so the switch on the argument count has one
- * arm per count from zero to six.  The tempting single prototype - one
- * uint64_t (*)(uint64_t, ...) used for everything - is wrong on this machine
- * rather than merely untidy: Apple's arm64 ABI passes variadic arguments on the
- * stack, so every argument after the first would be written where a normal
- * callee never looks, and the callee would read whatever happened to be in
- * x1..x5.  A single fixed six-argument prototype avoids that but is a type
- * mismatch against every function of another arity, which is undefined even
- * where it happens to work.  One prototype per arity is the only form that is
- * both correct and honest, and it costs one switch on a path that is already
- * crossing an emulation boundary.
+ * ---- the signature is the declared one, not the convenient one ----
+ * Every notation below is read off the function's declaration in the SDK,
+ * because the engine acts on the distinctions that declaration makes: a 32-bit
+ * argument is re-extended on the way across and a 32-bit result on the way
+ * back, so writing L where the header says int is not a harmless rounding of
+ * the truth.  The table this replaced carried a three-class shape - void,
+ * integer, pointer - which could not tell an int from a long and passed every
+ * integer on as the full 64 bits it found, survivable only for as long as the
+ * guest happened to leave the upper half clean.
  *
  * ---- what is deliberately absent ----
- * Variadic functions, for the reason above turned around: a bridged printf,
- * open, fcntl or ioctl would take its arguments from the x86 registers the
- * guest filled and hand them to an arm64 callee that expects them on the
- * stack.  Those need per-function veneers that know where the fixed arguments
- * stop, so they are not in the table and fall back to naming themselves.
- * Floating-point arguments and results are absent too: they live in a
- * different register bank on each side, and getting them right wants the real
- * System V classifier rather than a one-byte shape code - which is why atof,
- * strtod and their kind are missing.  So is anything taking a callback, qsort
- * and bsearch above all, because calling back into guest code needs a
- * trampoline that does not exist yet.
+ * Variadic functions.  Apple's arm64 ABI passes variadic arguments on the stack
+ * while x86-64 passes them in registers, and a signature has nowhere to say
+ * where a function's fixed arguments stop, so a bridged printf, open, fcntl or
+ * ioctl would be quietly wrong rather than refused.  They stay out of the table
+ * and fall back to naming themselves.  So does anything taking a callback,
+ * qsort and bsearch above all, because calling back into guest code needs a
+ * trampoline that does not exist yet.  A structure passed or returned by value
+ * needs no rule here at all: the parser refuses the notation for one.
  *
  * ---- why null has to survive the conversion ----
  * ocerz_g2h is affine: it adds a base.  Applied to a null guest pointer it
  * produces the base of the arena, which is a plausible-looking address that is
  * not null, and free(NULL), time(NULL), a getenv that misses, a strstr that
  * does not match and a memchr that runs off the end all turn on the difference.
- * Both conversions therefore pass zero through untouched.  In native mode the
- * base is zero and every one of those cases works whether the check is there or
- * not, which is exactly why it is written down: the mode that hides the bug is
- * the mode this file was written for.
+ * The engine's conversions therefore pass zero through untouched in both
+ * directions.  In native mode the base is zero and every one of those cases
+ * works whether the check is there or not, which is exactly why it is written
+ * down: the mode that hides the bug is the mode this file was written for.
  *
- * An export with no descriptor, and one whose host symbol dlsym cannot find,
- * are the same thing to the caller: no descriptor, and the old behaviour of
- * naming the export and stopping.  Resolution happens in the lookup, which runs
- * once per export, so nothing on the crossing path touches dlsym.
+ * ---- a descriptor that does not hold up is no descriptor ----
+ * An export with no entry, one whose host symbol dlsym cannot find, and one
+ * whose signature does not parse are the same thing to the caller: no
+ * descriptor, and the old behaviour of naming the export and stopping.  A
+ * refusal is a bug report, while a crossing made through a signature nobody
+ * could read would be a wrong answer, so the two failures are not allowed to
+ * differ.  Resolution and parsing both happen in the lookup, which runs once
+ * per export, so nothing on the crossing path touches dlsym or a string.
  */
 #include "ocerz/bridge.h"
+#include "ocerz/abi.h"
 #include "ocerz/vm.h"
-#include "ocerz/mem.h"
 #include "ocerz/interp.h"
 
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <unistd.h>
-
-#define BR_ARGS_MAX 6
-
-enum {
-    BR_VOID = 0,
-    BR_INT = 1,
-    BR_PTR = 2,
-};
 
 #define BR_LIBSYSTEM "/usr/lib/libSystem.B.dylib"
 
@@ -73,26 +66,10 @@ struct OcerzBridgeFn {
     const char *lib;
     const char *sym;
     const char *host;
-    uint8_t res;
-    uint8_t nargs;
-    uint8_t arg[BR_ARGS_MAX];
+    const char *sig;
     int (*special)(struct OcerzVM *vm, OcerzCPU *cpu);
     void *addr;
-};
-
-typedef union BrCall {
-    void *addr;
-    uint64_t (*a0)(void);
-    uint64_t (*a1)(uint64_t);
-    uint64_t (*a2)(uint64_t, uint64_t);
-    uint64_t (*a3)(uint64_t, uint64_t, uint64_t);
-    uint64_t (*a4)(uint64_t, uint64_t, uint64_t, uint64_t);
-    uint64_t (*a5)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-    uint64_t (*a6)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-} BrCall;
-
-static const uint8_t br_arg_reg[BR_ARGS_MAX] = {
-    OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9,
+    OcerzAbiSig parsed;
 };
 
 static int br_exit(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -116,75 +93,55 @@ static int br_stack_chk_fail(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 
 static struct OcerzBridgeFn g_br_fns[] = {
-    { BR_LIBSYSTEM, "___bzero",  "bzero",   BR_VOID, 2, { BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_memcpy",   "memcpy",  BR_PTR,  3, { BR_PTR, BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_memmove",  "memmove", BR_PTR,  3, { BR_PTR, BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_memset",   "memset",  BR_PTR,  3, { BR_PTR, BR_INT, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_memcmp",   "memcmp",  BR_INT,  3, { BR_PTR, BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_memchr",   "memchr",  BR_PTR,  3, { BR_PTR, BR_INT, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strlen",   "strlen",  BR_INT,  1, { BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strnlen",  "strnlen", BR_INT,  2, { BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strcmp",   "strcmp",  BR_INT,  2, { BR_PTR, BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strncmp",  "strncmp", BR_INT,  3, { BR_PTR, BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strcpy",   "strcpy",  BR_PTR,  2, { BR_PTR, BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strncpy",  "strncpy", BR_PTR,  3, { BR_PTR, BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strcat",   "strcat",  BR_PTR,  2, { BR_PTR, BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strchr",   "strchr",  BR_PTR,  2, { BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strrchr",  "strrchr", BR_PTR,  2, { BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strstr",   "strstr",  BR_PTR,  2, { BR_PTR, BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_strdup",   "strdup",  BR_PTR,  1, { BR_PTR }, NULL, NULL },
+    { BR_LIBSYSTEM, "___bzero",  "bzero",   "v(pL)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_memcpy",   "memcpy",  "p(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_memmove",  "memmove", "p(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_memset",   "memset",  "p(piL)", NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_memcmp",   "memcmp",  "i(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_memchr",   "memchr",  "p(piL)", NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strlen",   "strlen",  "L(p)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strnlen",  "strnlen", "L(pL)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strcmp",   "strcmp",  "i(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strncmp",  "strncmp", "i(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strcpy",   "strcpy",  "p(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strncpy",  "strncpy", "p(ppL)", NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strcat",   "strcat",  "p(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strchr",   "strchr",  "p(pi)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strrchr",  "strrchr", "p(pi)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strstr",   "strstr",  "p(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strdup",   "strdup",  "p(p)",   NULL, NULL, { 0, { 0 }, 0 } },
 
-    { BR_LIBSYSTEM, "_malloc",   "malloc",  BR_PTR,  1, { BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_calloc",   "calloc",  BR_PTR,  2, { BR_INT, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_realloc",  "realloc", BR_PTR,  2, { BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_free",     "free",    BR_VOID, 1, { BR_PTR }, NULL, NULL },
+    { BR_LIBSYSTEM, "_malloc",   "malloc",  "p(L)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_calloc",   "calloc",  "p(LL)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_realloc",  "realloc", "p(pL)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_free",     "free",    "v(p)",   NULL, NULL, { 0, { 0 }, 0 } },
 
-    { BR_LIBSYSTEM, "_write",    "write",   BR_INT,  3, { BR_INT, BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_read",     "read",    BR_INT,  3, { BR_INT, BR_PTR, BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_close",    "close",   BR_INT,  1, { BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_puts",     "puts",    BR_INT,  1, { BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_putchar",  "putchar", BR_INT,  1, { BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_getenv",   "getenv",  BR_PTR,  1, { BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_getpid",   "getpid",  BR_INT,  0, { 0 }, NULL, NULL },
-    { BR_LIBSYSTEM, "_isatty",   "isatty",  BR_INT,  1, { BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_abs",      "abs",     BR_INT,  1, { BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_labs",     "labs",    BR_INT,  1, { BR_INT }, NULL, NULL },
-    { BR_LIBSYSTEM, "_atoi",     "atoi",    BR_INT,  1, { BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_atol",     "atol",    BR_INT,  1, { BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_time",     "time",    BR_INT,  1, { BR_PTR }, NULL, NULL },
-    { BR_LIBSYSTEM, "_clock",    "clock",   BR_INT,  0, { 0 }, NULL, NULL },
-    { BR_LIBSYSTEM, "___error",  "__error", BR_PTR,  0, { 0 }, NULL, NULL },
+    { BR_LIBSYSTEM, "_write",    "write",   "l(ipL)", NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_read",     "read",    "l(ipL)", NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_close",    "close",   "i(i)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_puts",     "puts",    "i(p)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_putchar",  "putchar", "i(i)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_getenv",   "getenv",  "p(p)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_getpid",   "getpid",  "i()",    NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_isatty",   "isatty",  "i(i)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_abs",      "abs",     "i(i)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_labs",     "labs",    "l(l)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_atoi",     "atoi",    "i(p)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_atol",     "atol",    "l(p)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_atof",     "atof",    "d(p)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_strtod",   "strtod",  "d(pp)",  NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_time",     "time",    "l(p)",   NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_clock",    "clock",   "L()",    NULL, NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "___error",  "__error", "p()",    NULL, NULL, { 0, { 0 }, 0 } },
 
-    { BR_LIBSYSTEM, "_exit",             NULL, BR_VOID, 0, { 0 }, br_exit, NULL },
-    { BR_LIBSYSTEM, "_abort",            NULL, BR_VOID, 0, { 0 }, br_abort, NULL },
-    { BR_LIBSYSTEM, "___stack_chk_fail", NULL, BR_VOID, 0, { 0 }, br_stack_chk_fail, NULL },
+    { BR_LIBSYSTEM, "_exit",             NULL, NULL, br_exit,            NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "_abort",            NULL, NULL, br_abort,           NULL, { 0, { 0 }, 0 } },
+    { BR_LIBSYSTEM, "___stack_chk_fail", NULL, NULL, br_stack_chk_fail,  NULL, { 0, { 0 }, 0 } },
 };
 
 #define BR_FNS ((int)(sizeof g_br_fns / sizeof g_br_fns[0]))
 
 static uint64_t g_br_calls[sizeof g_br_fns / sizeof g_br_fns[0]];
-
-static uint64_t br_g2h(uint64_t gaddr)
-{
-    if (!gaddr)
-        return 0;
-    return (uint64_t)(uintptr_t)ocerz_g2h(gaddr);
-}
-
-static uint64_t br_h2g(uint64_t haddr)
-{
-    if (!haddr)
-        return 0;
-    return ocerz_h2g((const void *)(uintptr_t)haddr);
-}
-
-static void br_return(OcerzCPU *cpu, uint64_t result)
-{
-    uint64_t rsp = cpu->gpr[OCERZ_RSP];
-    cpu->rip = ocerz_ld(rsp, 8);
-    cpu->gpr[OCERZ_RSP] = rsp + 8;
-    cpu->gpr[OCERZ_RAX] = result;
-}
 
 const struct OcerzBridgeFn *ocerz_bridge_lookup(const char *lib, const char *sym)
 {
@@ -198,12 +155,18 @@ const struct OcerzBridgeFn *ocerz_bridge_lookup(const char *lib, const char *sym
         if (fn->special)
             return fn;
         if (!fn->addr) {
-            fn->addr = dlsym(RTLD_DEFAULT, fn->host);
-            if (!fn->addr) {
+            void *addr = dlsym(RTLD_DEFAULT, fn->host);
+            if (!addr) {
                 OCERZ_LOG("bridge: %s wants host %s, which does not resolve\n",
                           fn->sym, fn->host);
                 return NULL;
             }
+            if (ocerz_abi_parse(fn->sig, &fn->parsed) != OCERZ_OK) {
+                OCERZ_LOG("bridge: %s is declared %s, which the abi engine will not take\n",
+                          fn->sym, fn->sig ? fn->sig : "(nothing)");
+                return NULL;
+            }
+            fn->addr = addr;
         }
         return fn;
     }
@@ -220,39 +183,7 @@ int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu, const struct OcerzBri
     if (fn->special)
         return fn->special(vm, cpu);
 
-    uint64_t a[BR_ARGS_MAX] = { 0, 0, 0, 0, 0, 0 };
-    for (int i = 0; i < fn->nargs; i++) {
-        uint64_t raw = cpu->gpr[br_arg_reg[i]];
-        a[i] = fn->arg[i] == BR_PTR ? br_g2h(raw) : raw;
-    }
-
-    BrCall call;
-    call.addr = fn->addr;
-
-    uint64_t r = 0;
-    switch (fn->nargs) {
-    case 0: r = call.a0(); break;
-    case 1: r = call.a1(a[0]); break;
-    case 2: r = call.a2(a[0], a[1]); break;
-    case 3: r = call.a3(a[0], a[1], a[2]); break;
-    case 4: r = call.a4(a[0], a[1], a[2], a[3]); break;
-    case 5: r = call.a5(a[0], a[1], a[2], a[3], a[4]); break;
-    case 6: r = call.a6(a[0], a[1], a[2], a[3], a[4], a[5]); break;
-    default:
-        OCERZ_FATAL("bridge: %s declares %u arguments, the limit is %d\n",
-                    fn->sym, (unsigned)fn->nargs, BR_ARGS_MAX);
-        return OCERZ_STEP_FATAL;
-    }
-
-    uint64_t result;
-    switch (fn->res) {
-    case BR_PTR:  result = br_h2g(r); break;
-    case BR_VOID: result = 0; break;
-    default:      result = r; break;
-    }
-
-    br_return(cpu, result);
-    return OCERZ_STEP_OK;
+    return ocerz_abi_perform(&fn->parsed, fn->addr, cpu);
 }
 
 typedef struct BrRow {

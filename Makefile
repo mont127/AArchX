@@ -23,8 +23,9 @@ CFLAGS := $(ARCHFLAGS) -std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Iinc
 LDFLAGS := $(ARCHFLAGS)
 
 SRCS := $(wildcard src/*.c)
-OBJS := $(SRCS:.c=.o)
-DEPS := $(OBJS:.o=.d)
+ASRCS := $(wildcard src/*.s)
+OBJS := $(SRCS:.c=.o) $(ASRCS:.s=.o)
+DEPS := $(SRCS:.c=.d)
 CORE_OBJS := $(filter-out src/main.o,$(OBJS))
 
 UNIT_SRCS := $(wildcard tests/unit/*.c)
@@ -35,6 +36,9 @@ ocerz: $(OBJS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/%.o: src/%.s
+	$(CC) $(ARCHFLAGS) -g -c -o $@ $<
 
 tests/unit/bin/%: tests/unit/%.c $(CORE_OBJS)
 	@mkdir -p tests/unit/bin
