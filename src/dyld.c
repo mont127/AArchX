@@ -147,6 +147,28 @@
  * native mode failing to read one is the ordinary case rather than a fault,
  * and it is logged rather than announced as fatal.  The collected import
  * report is what names the consequence, symbol by symbol.
+ *
+ * A name that ocerz synthesizes is answered rather than missed.  Before an
+ * install name is expanded at all, native mode asks ocerz_vdylib_have whether
+ * it has an image for it, and if it does the image is built in memory and
+ * registered as an ordinary DynImage whose slice points at that buffer instead
+ * of at the bytes of a file - which is the only difference, since every disk
+ * image is already mapped and read out of a host buffer, so the segment copy,
+ * the trie walker, the import resolver, dlopen and dladdr all carry on
+ * unchanged.  Asking before the expansion keeps @-resolution off a path that
+ * was never going to exist, and asking before the dep_find veto - which
+ * refuses anything the cache already owns - leaves that veto dead in native
+ * mode by position rather than by an exception written into it.
+ *
+ * A virtual image then returns right there instead of falling through the rest
+ * of the disk loader.  It names no dependencies, it is built needing no fixups
+ * because its one data slot holds a constant and its stubs reach that slot
+ * rip-relative, it carries no Objective-C, and the dyld-API image list is a
+ * cache-mode structure: ocerz_dyldapi_register_image ends in closure_add, and
+ * the closure is allocated by ocerz_dyldapi_setup, which native mode does not
+ * run.  Both of its call sites are therefore confined to cache mode, so that a
+ * registration that would do nothing is not made at all.  Mapping the segments
+ * and handing __TEXT back its protection is the whole of the work.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -154,6 +176,7 @@
 #include "ocerz/cache.h"
 #include "ocerz/dyldapi.h"
 #include "ocerz/mode.h"
+#include "ocerz/vdylib.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -291,7 +314,7 @@ typedef struct DynImage {
     uint64_t file_ino;
 } DynImage;
 
-#define DYN_DIMG_MAX 64
+#define DYN_DIMG_MAX 256
 static DynImage g_dimgs[DYN_DIMG_MAX];
 static int g_dimgs_n;
 static DynImage g_main_dimg;
@@ -547,9 +570,9 @@ static uint64_t self_uleb(const uint8_t **pp, const uint8_t *end)
     return r;
 }
 
-static uint64_t image_export_trie(DynImage *img, uint32_t *size_out)
+static uint64_t image_export_trie(const uint8_t *slice, uint32_t *size_out)
 {
-    const uint8_t *mh = img->slice;
+    const uint8_t *mh = slice;
     uint32_t ncmds = rd32(mh + 16);
     const uint8_t *lc = mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < ncmds; i++) {
@@ -568,17 +591,18 @@ static uint64_t image_export_trie(DynImage *img, uint32_t *size_out)
     return 0;
 }
 
-static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int *found)
+uint64_t ocerz_dyld_trie_resolve(const uint8_t *slice, uint64_t load_base,
+                                 const char *sym, int *found)
 {
     int dummy = 0;
     if (!found)
         found = &dummy;
     *found = 0;
     uint32_t tsize = 0;
-    uint64_t toff = image_export_trie(img, &tsize);
+    uint64_t toff = image_export_trie(slice, &tsize);
     if (!toff || !tsize)
         return 0;
-    const uint8_t *start = img->slice + toff;
+    const uint8_t *start = slice + toff;
     const uint8_t *end = start + tsize;
     const uint8_t *p = start;
     const char *s = sym;
@@ -593,7 +617,7 @@ static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int 
 
             if ((flags & 0x03) == 0x02)
                 return self_uleb(&tp, end);
-            return img->load_base + self_uleb(&tp, end);
+            return load_base + self_uleb(&tp, end);
         }
         p += term;
         if (p >= end)
@@ -615,6 +639,11 @@ static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int 
         p = next;
     }
     return 0;
+}
+
+static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int *found)
+{
+    return ocerz_dyld_trie_resolve(img->slice, img->load_base, sym, found);
 }
 
 static uint64_t ocerz_image_self_resolve(DynImage *img, const char *sym)
@@ -2028,6 +2057,37 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     DynImage *by_name = dimg_find_by_install_name(install_name);
     if (by_name)
         return by_name;
+    if (ocerz_mode == OCERZ_MODE_NATIVE && ocerz_vdylib_have(install_name)) {
+        if (g_dimgs_n >= DYN_DIMG_MAX) {
+            OCERZ_FATAL("too many disk dylibs to load (limit %d)\n", DYN_DIMG_MAX);
+            return NULL;
+        }
+        size_t vlen = 0;
+        uint8_t *vbuf = ocerz_vdylib_image(install_name, &vlen);
+        if (!vbuf || vlen == 0) {
+            OCERZ_FATAL("cannot synthesize %s\n", install_name);
+            free(vbuf);
+            return NULL;
+        }
+        DynImage *v = &g_dimgs[g_dimgs_n++];
+        memset(v, 0, sizeof *v);
+        v->slice = vbuf;
+        v->owned_buf = vbuf;
+        snprintf(v->path, sizeof v->path, "%s", install_name);
+        snprintf(v->install_name, sizeof v->install_name, "%s", install_name);
+        dimg_record_id(v);
+        if (map_segments(v, 0) != OCERZ_OK) {
+            OCERZ_FATAL("cannot map segments of virtual %s\n", install_name);
+            g_dimgs_n--;
+            free(vbuf);
+            return NULL;
+        }
+        protect_ro_segments(v);
+        OCERZ_LOG("dynamic: registered virtual dylib %s at load_base=%#llx slide=%#llx\n",
+                  install_name, (unsigned long long)v->load_base,
+                  (unsigned long long)v->slide);
+        return v;
+    }
     char resolved[1024];
     if (!expand_install_name(loader, install_name, rpaths, resolved, sizeof resolved))
         return NULL;
@@ -2096,7 +2156,8 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         apply_classic_fixups(d, cache);
     protect_ro_segments(d);
 
-    ocerz_dyldapi_register_image(d->load_base, d->path);
+    if (ocerz_mode == OCERZ_MODE_CACHE)
+        ocerz_dyldapi_register_image(d->load_base, d->path);
     canonicalize_objc_selrefs(d);
     if (getenv("OCERZ_DLPATH"))
         fprintf(stderr, "ocerz: DLPATH disk-dep load_base=%#llx install=%s path=%s\n",
@@ -2186,7 +2247,8 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     }
     if (d->cf_off == 0)
         apply_classic_fixups(d, cache);
-    ocerz_dyldapi_register_image(d->load_base, d->path);
+    if (ocerz_mode == OCERZ_MODE_CACHE)
+        ocerz_dyldapi_register_image(d->load_base, d->path);
     canonicalize_objc_selrefs(d);
     if (getenv("OCERZ_DLPATH"))
         fprintf(stderr, "ocerz: DLPATH dlopen load_base=%#llx install=%s path=%s\n",

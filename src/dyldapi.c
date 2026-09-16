@@ -24,6 +24,7 @@
  * batch, and "@cat" does that for every image that defines categories.
  */
 #include "ocerz/dyldapi.h"
+#include "ocerz/vdylib.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/cache.h"
@@ -221,7 +222,7 @@ static int32_t runtime_library_version(const char *library_name)
     return -1;
 }
 
-#define DYLDAPI_DISK_MAX 64
+#define DYLDAPI_DISK_MAX 256
 static uint64_t g_disk_mh[DYLDAPI_DISK_MAX];
 static uint64_t g_disk_path[DYLDAPI_DISK_MAX];
 static int g_disk_n;
@@ -1584,6 +1585,9 @@ static int mh_copy_uuid(uint64_t mh, uint64_t out)
 int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t off = cpu->rip - OCERZ_DYLDAPI_LO;
+
+    if (off == OCERZ_BRIDGE_OFF)
+        return ocerz_vdylib_dispatch(vm, cpu);
 
     switch (off) {
     case DYLDAPI_NOOP_OFF:
