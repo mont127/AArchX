@@ -9,6 +9,7 @@
 
 #define OCERZ_DYLDAPI_LO 0x00000000dda00000ull
 #define OCERZ_DYLDAPI_HI 0x00000000dda10000ull
+#define OCERZ_BRIDGE_OFF 0x8000
 
 struct OcerzVM;
 struct OcerzCache;

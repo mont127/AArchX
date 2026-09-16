@@ -1,23 +1,47 @@
 #!/usr/bin/env bash
-# Gate for the native execution mode (M0): the mode exists, it is selectable
+# Gate for the native execution mode (M1): the mode exists, it is selectable
 # from the command line and from the environment, and with the shared cache
-# switched off the imports nothing resolves turn into a named report instead of
-# a crash.
+# switched off a dynamically linked guest binds every one of its system imports
+# against a libSystem that ocerz synthesizes in memory, reaches main, and stops
+# at the first call that would need a bridge nobody has written yet.
 #
-# In native mode ocerz maps no shared cache at all, so nothing answers the
-# guest's libSystem imports yet -- the virtual frameworks that will answer them
-# are not written. M0 stops exactly at that boundary on purpose: every
-# unresolved import is collected at the end of the main image's fixups, printed
-# as an "ocerz: native: no bridge for <sym> in <dylib>" line, and the process
-# exits 71. So a native-mode run that exits 71 carrying the full list is the
-# pass here, and one that exits 0 would mean the cache leaked back in. The list
-# is the whole deliverable of the milestone, so each expected symbol is
-# asserted by name rather than by counting lines.
+# That last step is what M1 moved, and it is why the pass for the native cases
+# is now exit 72. Under M0 nothing answered a libSystem import at all: every
+# one was collected at the end of the main image's fixups, printed as an
+# "ocerz: native: no bridge for <sym> in <dylib>" line, and the process exited
+# 71 without the guest running an instruction of its own. Under M1 the imports
+# resolve to stubs inside a virtual /usr/lib/libSystem.B.dylib, so the guest
+# runs, and the first call through one of those stubs prints a single line and
+# exits 72:
+#
+#     ocerz: bridge: /usr/lib/libSystem.B.dylib _strcmp not implemented
+#
+# Keeping both codes is the point of keeping both messages. 71 means nothing
+# bound, so the loader never handed control to the guest at all; 72 means
+# everything bound, the guest ran, and what is missing is the bridge behind one
+# export rather than the export itself. After M1 a native run that came back 71
+# would be a binding regression wearing the same clothes as a pass, so the
+# native cases assert exit 72 AND that no "no bridge for" line was printed at
+# all -- either alone would let the other failure through. No committed fixture
+# still fails to bind, xbench_dyn's four imports all being exports the virtual
+# libSystem guarantees, so native_unbound compiles a two-line one at test time
+# that calls getpwnam, which is deliberately outside the export list, and
+# requires 71 with that symbol named. It skips where there is no x86_64 clang,
+# the way the dynamic gate does. Without it the whole 71 path would go
+# untested the moment M1 landed.
+#
+# Which symbol trips the bridge first is deliberately not pinned. It is
+# whichever system function the compiled code for main reaches first, so it
+# moves with the fixture's optimisation level and with what libc inlined into
+# it, and pinning it would make this gate fail for a reason that has nothing to
+# do with the mode. What is asserted instead is the shape of the line, the
+# library it names, and that the symbol it names is one the fixture imports.
 #
 # The fixture is tests/guest/benchbin/xbench_dyn: dynamically linked, LC_MAIN,
-# one dependency (/usr/lib/libSystem.B.dylib) and exactly four imports, so the
-# report is small enough to pin whole. It writes its checksum with a raw write
-# syscall rather than libc, so cache mode still gives deterministic stdout.
+# one dependency (/usr/lib/libSystem.B.dylib) and exactly four imports, all
+# four of them exports the virtual libSystem guarantees. It writes its checksum
+# with a raw write syscall rather than libc, so cache mode still gives
+# deterministic stdout.
 #
 # Cache mode must come out of all this untouched, and it is checked the way the
 # rest of the suite checks translation: the JIT and the interpreter running the
@@ -38,8 +62,11 @@ DYN=tests/guest/benchbin/xbench_dyn
 STATIC=tests/guest/bin/exit42
 KERNEL=depchain
 SCALE=1000
+LIB=/usr/lib/libSystem.B.dylib
 SYMS="___bzero _memcpy _strcmp _strlen"
-SUMMARY="ocerz: native: 4 unresolved imports, no virtual frameworks are implemented yet"
+BRIDGE_RE='^ocerz: bridge: [^ ]+ [^ ]+ not implemented$'
+NOBIND='ocerz: native: no bridge for '
+M0_SUMMARY='unresolved imports, no virtual frameworks are implemented yet'
 
 unset OCERZ_MODE
 
@@ -102,16 +129,32 @@ cache_line_seen() {
     grep -q 'shared cache mapped' "$@"
 }
 
-# empty on success, otherwise the first missing report line
-native_report_reason() {
-    local sym
-    for sym in $SYMS; do
-        if ! grep -Fq "ocerz: native: no bridge for $sym in " "$@"; then
-            echo "no 'no bridge for $sym' line in the report"
-            return
-        fi
-    done
-    echo ""
+bridge_sym() {
+    grep -hE "$BRIDGE_RE" "$@" 2>/dev/null | head -1 | awk '{print $4}'
+}
+
+# empty on success, otherwise what is wrong with the bridge report
+native_bridge_reason() {
+    local line lib sym
+    if grep -Fq "$NOBIND" "$@"; then
+        echo "an import went unresolved: $(grep -hF "$NOBIND" "$@" | head -1)"
+        return
+    fi
+    line=$(grep -hE "$BRIDGE_RE" "$@" | head -1)
+    if [ -z "$line" ]; then
+        echo "no 'ocerz: bridge: <dylib> <sym> not implemented' line"
+        return
+    fi
+    lib=$(printf '%s\n' "$line" | awk '{print $3}')
+    sym=$(printf '%s\n' "$line" | awk '{print $4}')
+    if [ "$lib" != "$LIB" ]; then
+        echo "bridge named library $lib, want $LIB"
+        return
+    fi
+    case " $SYMS " in
+        *" $sym "*) echo "" ;;
+        *) echo "bridge named $sym, which the fixture does not import" ;;
+    esac
 }
 
 CACHE_OK=1
@@ -125,25 +168,29 @@ NERR="$TMP/native_dyn.err"
 CACHE_OUT="$TMP/cache_dyn.jit.out"
 
 case_native_dyn() {
-    local name=native_dyn rc reason=""
+    local name=native_dyn rc reason="" sym
     run_bounded "$NOUT" "$NERR" "$OCERZ" -v -native "$DYN" "$KERNEL" "$SCALE"
     rc=$?
-    if [ "$rc" -ne 71 ]; then
-        reason="exit $rc, want 71"
+    if [ "$rc" -ne 72 ]; then
+        reason="exit $rc, want 72"
     elif cache_line_seen "$NOUT" "$NERR"; then
         reason="native mode mapped the shared cache"
     else
-        reason="$(native_report_reason "$NOUT" "$NERR")"
+        reason="$(native_bridge_reason "$NOUT" "$NERR")"
     fi
-    record "$name" "$reason" "exit=$rc"
+    sym=$(bridge_sym "$NOUT" "$NERR")
+    record "$name" "$reason" "exit=$rc${sym:+ sym=$sym}"
 }
 
-case_native_summary() {
-    local name=native_summary reason=""
-    if ! grep -Fq "$SUMMARY" "$NOUT" "$NERR"; then
-        reason="no '4 unresolved imports' summary line"
+case_native_bound() {
+    local name=native_bound reason="" n
+    n=$(grep -hF "$NOBIND" "$NOUT" "$NERR" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$n" != "0" ]; then
+        reason="$n imports did not bind against the virtual libSystem"
+    elif grep -Fq "$M0_SUMMARY" "$NOUT" "$NERR"; then
+        reason="the M0 unresolved-import summary is still printed"
     fi
-    record "$name" "$reason"
+    record "$name" "$reason" "unbound=$n"
 }
 
 case_cache_dyn() {
@@ -168,17 +215,18 @@ case_cache_dyn() {
 }
 
 case_env_native() {
-    local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
+    local name=env_native rc reason="" sym out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
     rc=$?
-    if [ "$rc" -ne 71 ]; then
-        reason="exit $rc, want 71"
+    if [ "$rc" -ne 72 ]; then
+        reason="exit $rc, want 72"
     elif cache_line_seen "$out" "$err"; then
         reason="OCERZ_MODE=native mapped the shared cache"
     else
-        reason="$(native_report_reason "$out" "$err")"
+        reason="$(native_bridge_reason "$out" "$err")"
     fi
-    record "$name" "$reason" "exit=$rc"
+    sym=$(bridge_sym "$out" "$err")
+    record "$name" "$reason" "exit=$rc${sym:+ sym=$sym}"
 }
 
 case_flag_beats_env() {
@@ -199,17 +247,18 @@ case_flag_beats_env() {
 }
 
 case_last_flag_native() {
-    local name=last_flag_native rc reason="" out="$TMP/last_flag_native.out" err="$TMP/last_flag_native.err"
+    local name=last_flag_native rc reason="" sym out="$TMP/last_flag_native.out" err="$TMP/last_flag_native.err"
     run_bounded "$out" "$err" "$OCERZ" -v -cache -native "$DYN" "$KERNEL" "$SCALE"
     rc=$?
-    if [ "$rc" -ne 71 ]; then
-        reason="'-cache -native' exit $rc, want 71"
+    if [ "$rc" -ne 72 ]; then
+        reason="'-cache -native' exit $rc, want 72"
     elif cache_line_seen "$out" "$err"; then
         reason="'-cache -native' mapped the shared cache"
     else
-        reason="$(native_report_reason "$out" "$err")"
+        reason="$(native_bridge_reason "$out" "$err")"
     fi
-    record "$name" "$reason" "exit=$rc"
+    sym=$(bridge_sym "$out" "$err")
+    record "$name" "$reason" "exit=$rc${sym:+ sym=$sym}"
 }
 
 case_last_flag_cache() {
@@ -254,12 +303,34 @@ case_empty_mode() {
     record "$name" "$reason" "exit=$rc"
 }
 
+case_native_unbound() {
+    local name=native_unbound rc reason="" src="$TMP/unbound.c" bin="$TMP/unbound"
+    local out="$TMP/native_unbound.out" err="$TMP/native_unbound.err"
+    cat > "$src" <<'EOC'
+#include <pwd.h>
+int main(void) { return getpwnam("root") != 0; }
+EOC
+    if ! clang -arch x86_64 -fno-stack-protector -o "$bin" "$src" >/dev/null 2>&1; then
+        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    fi
+    run_bounded "$out" "$err" "$OCERZ" -v -native "$bin"
+    rc=$?
+    if [ "$rc" -ne 71 ]; then
+        reason="exit $rc, want 71"
+    elif ! grep -Fq "${NOBIND}_getpwnam" "$out" "$err"; then
+        reason="no 'no bridge for _getpwnam' line"
+    elif ! grep -Fq "$M0_SUMMARY" "$out" "$err"; then
+        reason="no unresolved-import summary line"
+    fi
+    record "$name" "$reason" "exit=$rc"
+}
+
 case_native_static() {
     local name=native_static rc reason="" out="$TMP/native_static.out" err="$TMP/native_static.err"
     run_bounded "$out" "$err" "$OCERZ" -v -native "$STATIC"
     rc=$?
-    if [ "$rc" -eq 71 ]; then
-        reason="exit 71: reached the import fixups instead of refusing a static image"
+    if [ "$rc" -eq 71 ] || [ "$rc" -eq 72 ]; then
+        reason="exit $rc: reached the loader instead of refusing a static image"
     elif [ "$rc" -ne 64 ]; then
         reason="exit $rc, want 64"
     elif ! grep -q 'ocerz:' "$out" "$err"; then
@@ -269,7 +340,7 @@ case_native_static() {
 }
 
 case_native_dyn
-case_native_summary
+case_native_bound
 case_cache_dyn
 case_env_native
 case_flag_beats_env
@@ -278,6 +349,7 @@ case_last_flag_cache
 case_bad_mode
 case_empty_mode
 case_native_static
+case_native_unbound
 
 echo "----------------------------------------"
 echo "native tests: $pass passed, $fail failed"

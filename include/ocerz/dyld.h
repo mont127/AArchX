@@ -23,6 +23,8 @@ void ocerz_dyld_dump_images(void);
 const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out);
 const char *ocerz_dyld_main_path(void);
 uint64_t ocerz_dyld_resolve_guest_sym(const char *name);
+uint64_t ocerz_dyld_trie_resolve(const uint8_t *slice, uint64_t load_base,
+                                 const char *sym, int *found);
 extern uint64_t ocerz_exc_trap_rip;
 
 #endif
