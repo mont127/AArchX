@@ -312,7 +312,11 @@ ocerz: bridge: /usr/lib/libSystem.B.dylib _strcmp not implemented
 
 Those stubs now call the real thing. `src/bridge.c` reads the arguments out of the guest's x86 register state, calls the arm64 function already linked into ocerz, and puts the result back where x86 code looks for it. An Intel binary in native mode therefore does its work in native code. Every kernel of `xbench_dyn` produces byte-identical output in native mode and in cache mode, under both the JIT and the interpreter.
 
-Variadic functions are deliberately absent, because Apple's arm64 ABI passes variadic arguments on the stack while x86-64 passes them in registers, so `printf` and `open` through a fixed-arity prototype would read every argument from the wrong place. Floating-point arguments and callbacks are absent too, pending the real classifier and a way back into guest code. An export with no descriptor still names itself and stops.
+Where each argument goes is computed from the function's signature rather than assumed, because the two ABIs count their integer and floating-point arguments in separate sequences. One `double` in the middle of a signature shifts nothing on one side and everything on the other, so an argument's position tells you nothing about which register holds it on either. `src/abi.c` does that classification and `src/abicall.s` makes the call.
+
+Working from real signatures also made the integer widths honest. Apple's arm64 makes the caller extend a narrow argument, and an arm64 callee may leave the upper half of the return register dirty on a 32-bit result, neither of which a coarser scheme could express.
+
+Variadic functions are still absent, for a sharper reason than the rest. Apple's arm64 passes every variadic argument on the stack in eight-byte slots and uses no floating-point register at all, the opposite of its packing for an ordinary call, so `printf` and `open` need veneers that know where the named arguments stop. Structures passed by value are refused at parse time, since both ABIs split them into pieces and classify each piece differently. Anything taking a callback waits on a way back into guest code. An export with no descriptor still names itself and stops.
 
 A crossing costs about 33 ns, measured as the difference between a guest loop calling `getpid` three million times and the same loop without the call. That is a cliff rather than a constant factor, and it shows up exactly where the call is small and frequent:
 
