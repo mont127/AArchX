@@ -310,7 +310,22 @@ ocerz: dynamic: registered virtual dylib /usr/lib/libSystem.B.dylib
 ocerz: bridge: /usr/lib/libSystem.B.dylib _strcmp not implemented
 ```
 
-The guest binds every import, reaches `main`, and stops at its first system call. Exit status 72 means that; 71 means an import never bound at all, and the two are kept distinct so a failure says which happened. The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once; children inherit it through `OCERZ_MODE`. A static image is refused, since native mode has no static loader path. `tests/unit/test_vdylib.c` pins the synthesized image's structure and resolves every export through the loader's own trie walker, and `tests/run_native_tests.sh` pins the selection rules, the absent cache, the bridge report and the exit statuses, and that cache mode is unchanged.
+Those stubs now call the real thing. `src/bridge.c` reads the arguments out of the guest's x86 register state, calls the arm64 function already linked into ocerz, and puts the result back where x86 code looks for it. An Intel binary in native mode therefore does its work in native code. Every kernel of `xbench_dyn` produces byte-identical output in native mode and in cache mode, under both the JIT and the interpreter.
+
+Variadic functions are deliberately absent, because Apple's arm64 ABI passes variadic arguments on the stack while x86-64 passes them in registers, so `printf` and `open` through a fixed-arity prototype would read every argument from the wrong place. Floating-point arguments and callbacks are absent too, pending the real classifier and a way back into guest code. An export with no descriptor still names itself and stops.
+
+A crossing costs about 33 ns, measured as the difference between a guest loop calling `getpid` three million times and the same loop without the call. That is a cliff rather than a constant factor, and it shows up exactly where the call is small and frequent:
+
+| kernel | native vs cache | why |
+| --- | --- | --- |
+| `str` | 12.3x | `strlen` on short strings, one crossing per call |
+| `memcpy` | 1.59x | copies large enough to amortize the crossing |
+| `hash` | 1.00x | no bridged calls |
+| `depchain` | 1.02x | no bridged calls |
+
+Guest code that never crosses pays nothing, which is why the last two rows are at parity. Closing the gap on the first two is a JIT change: recognizing a call whose target is a known stub and spilling only the registers the descriptor names, instead of leaving the block and re-entering through the dispatcher.
+
+The guest binds every import, reaches `main`, and runs. Exit status 72 means it reached an export with no bridge behind it; 71 means an import never bound at all. The two are kept distinct so a failure says which happened. The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once; children inherit it through `OCERZ_MODE`. A static image is refused, since native mode has no static loader path. `tests/unit/test_vdylib.c` pins the synthesized image's structure and resolves every export through the loader's own trie walker, and `tests/run_native_tests.sh` pins the selection rules, the absent cache, the bridge report and the exit statuses, and that cache mode is unchanged.
 
 ## Limitations
 
