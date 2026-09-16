@@ -230,7 +230,7 @@ Scalar floating-point loops now take 0.9 to 1.2 times Rosetta's time, whether th
 ## CLI
 
 ```text
-usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]
+usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--] program [args...]
        ocerz version
 ```
 
@@ -240,12 +240,15 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | `-trace` | trace guest instructions |
 | `-strace` | trace guest syscalls |
 | `-no-jit` | interpret this process only |
+| `-native` | bind the guest against native arm64 frameworks instead of the x86 shared cache (see [Native mode](#native-mode)) |
+| `-cache` | bind the guest against Apple's x86_64 shared cache; the default |
 | `-path file` | load `file` but keep the following guest arguments as they are |
 | `--` | end of AArchX options |
 | `version` | print the name and version (`AArchX 0.1`) |
 
 | Environment | Effect |
 | --- | --- |
+| `OCERZ_MODE=native\|cache` | pick the mode when no flag does; this is how a spawned child inherits it, and an unrecognized value is refused rather than ignored |
 | `OCERZ_NOJIT=1` | interpret the whole process tree |
 | `OCERZ_NOJIT_EXE=<text>` | interpret processes whose command line matches |
 | `OCERZ_NO_HOSTWQ=1` | turn the host workqueue bridge off (it is on by default; `OCERZ_HOSTWQ=1` is still accepted and still means on) |
@@ -286,6 +289,23 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args..
 | JIT | `src/jit.c`, `src/a64emit.c` | arm64 code generation, block chaining, superblocks |
 | Mini-dyld | `src/dyld.c`, `src/cache.c`, `src/dyldapi.c` | shared cache, symbols, fixups, Objective-C |
 | Syscalls | `src/syscall.c` | BSD, Mach, signals, threads and WoW64 host calls |
+
+## Native mode
+
+Apple ends general-purpose Rosetta after macOS 27, and with it the `dyld_shared_cache_x86_64` that every guest here has bound against. Native mode is the answer to that: the guest keeps an x86_64 Darwin personality, but its system libraries become synthesized x86 images whose exports are bridge stubs into the host's own arm64 frameworks, so AppKit, CoreGraphics and Metal calls end up in the real native implementations rather than in translated Intel code. It is selected with `-native` and is not the default.
+
+What exists today is the switch and the failure report, not the bridges. In native mode no cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off because the host's own libdispatch needs the process's single workqueue slot. Every import a guest makes of a system library therefore goes unresolved, and rather than binding those to zero and starting a program that cannot run, the loader collects the misses by library and symbol and prints them:
+
+```text
+$ ./ocerz -native tests/guest/benchbin/xbench_dyn str 1000
+ocerz: native: no bridge for ___bzero in /usr/lib/libSystem.B.dylib
+ocerz: native: no bridge for _memcpy in /usr/lib/libSystem.B.dylib
+ocerz: native: no bridge for _strcmp in /usr/lib/libSystem.B.dylib
+ocerz: native: no bridge for _strlen in /usr/lib/libSystem.B.dylib
+ocerz: native: 4 unresolved imports, no virtual frameworks are implemented yet
+```
+
+Exit status 71 means exactly that. The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once; children inherit it through `OCERZ_MODE`. A static image is refused, since native mode has no static loader path. `tests/run_native_tests.sh` pins the selection rules, the absent cache, the report and the exit status, and that cache mode is unchanged.
 
 ## Limitations
 
