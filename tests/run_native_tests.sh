@@ -68,6 +68,65 @@
 # rest of the suite checks translation: the JIT and the interpreter running the
 # same command must agree byte for byte. That needs no Rosetta on the box.
 #
+# M4 adds the one fault the mode could not previously explain. A crossing runs
+# the host's own arm64 code on a thread the guest is driving, so a guest that
+# hands strlen a pointer it had no business handing it faults inside Apple's
+# code, at an instruction pointer belonging to nothing the translator emitted.
+# The crash handler used not to ask whether a crossing was in flight, so it
+# blamed the guest anyway: the fault was either delivered as an access
+# violation at whatever rip the crossing trapped from, which is an instruction
+# that did nothing wrong, or handed to a JIT recovery that tried to rebuild
+# guest state from a host pc that had never been in the arena. Both read as a
+# translator bug. A crossing is now looked for before anything else attributes
+# the fault, and one taken inside a crossing prints a report naming the library,
+# the export, its signature, the host function, the signal, the faulting
+# address and the host pc, says which side of the guest boundary that address
+# fell on -- inside means the guest passed a bad pointer, outside means ocerz
+# marshalled the crossing wrong -- and stops the process rather than delivering
+# or recovering, because the thread is several native frames deep in code ocerz
+# can neither resume nor unwind.
+#
+# bridge_fault_native pins that report, against a fixture whose only unusual
+# act is calling strlen on a page of guest space nobody mapped.
+# bridge_fault_not_guest pins the other half from a second run of the same
+# fixture with OCERZ_FAULTLOG and OCERZ_SIGTRACE set, which are the two knobs
+# that make the old attribution path say out loud that it ran: for the bad
+# address neither may print, no guest-crash report may appear, and the line the
+# fixture writes after the call must never be reached. A knob that had been
+# renamed would be silent for the wrong reason and the case would pass on
+# nothing, so it is paired with a control run of the frame-lowered fixture under
+# the same knobs, whose fault at the same address really is the guest's: both
+# knobs have to speak there before their silence over the crossing means
+# anything. Both halves are needed,
+# because a report that names the symbol correctly and then ALSO delivers the
+# fault to the guest would satisfy a test that only looked for the report. The
+# status is 139, which is what the misattributing path exited with too, so the
+# status distinguishes nothing here and the message carries the whole
+# difference.
+#
+# bridge_fault_cache is the regression guard that matters most, because cache
+# mode is what runs Steam and Wine today and M4 has to be purely additive. The
+# same fixture under -cache crosses no bridge at all -- strlen there is the real
+# libSystem's, translated like everything else -- so it must still be an
+# ordinary guest fault, reported as one at the address the guest actually
+# dereferenced, with the JIT and the interpreter agreeing on the status, and
+# with no bridged-call report anywhere in either.
+#
+# bridge_frame_lowered is the failure mode of a frame raised and not lowered. A
+# fixture that makes a bridged call, sees it return, and only then faults in its
+# own code has to be blamed the old way, because by then it is guest code
+# faulting again. A missing lower would not show up here as a wrong answer; it
+# would show up much later as some unrelated fault reported as being inside a
+# call that had returned long before, which is a miserable thing to diagnose
+# from the report alone.
+#
+# bridgelog covers OCERZ_BRIDGELOG, which prints one line per crossing naming
+# the library, the export and its signature. The case checks that the lines
+# appear, that they name the library and an export the fixture's own import
+# table lists, and that stdout is byte-identical to the same run without the
+# variable: a diagnostic that changes what it observes is worse than no
+# diagnostic.
+#
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
 # entire point of the mode -- but with nothing to compare against, the
@@ -95,9 +154,30 @@ PROBE_VAR=OCERZ_BRIDGE_PROBE
 PROBE_VAL=bridge-probe-42
 PROBE_BIN=""
 UNIMPL_BIN=""
+BADPTR_BIN=""
+AFTER_BIN=""
+BAD_GUEST_ADDR=0x6000000000
+BADPTR_SYM=_strlen
+BADPTR_SIG='L(p)'
+BADPTR_MARK='badptr enter'
+BADPTR_PAST='badptr returned'
+AFTER_MARK='after bridged'
+AFTER_PAST='after returned'
+BRIDGE_FAULT_RE='^ocerz: BRIDGE-FAULT\[[0-9]+\] (SIGSEGV|SIGBUS) inside a bridged call'
+BRIDGE_FAULT_STATUS=139
+GUEST_FAULT_STATUS=139
+GUEST_CRASH='ocerz: guest crash['
+WILD_RE='ocerz: (WILD-FAULT-AV|WILD-WORKER-TERMINATE|gs0x320 WORKER-TERMINATE)'
+FAULTLOG_MARK="FAULT-MAP addr=$BAD_GUEST_ADDR"
+SIGTRACE_MARK="deliver addr=$BAD_GUEST_ADDR"
+BRIDGELOG_RE='^ocerz: BRIDGELOG\[[0-9]+\] [^ ]+ [^ ]+ [^ ]+$'
+BRIDGELOG_KERNEL=memcpy
+BRIDGELOG_SYM=_memcpy
+BRIDGELOG_SIG='p(ppL)'
 
 unset OCERZ_MODE
 unset OCERZ_BRIDGE_PROBE_UNSET
+unset OCERZ_BRIDGELOG
 
 if [ ! -x "$OCERZ" ]; then
     echo "error: ocerz binary not found or not executable at $OCERZ" >&2
@@ -192,6 +272,8 @@ CACHE_OUT="$TMP/cache.$KERNEL.jit.out"
 build_fixtures() {
     local src="$TMP/bridge_probe.c" bin="$TMP/bridge_probe"
     local usrc="$TMP/unimpl.c" ubin="$TMP/unimpl"
+    local bsrc="$TMP/badptr.c" bbin="$TMP/badptr"
+    local asrc="$TMP/after.c" abin="$TMP/after"
 
     cat > "$src" <<'EOC'
 typedef __SIZE_TYPE__ bp_size;
@@ -482,6 +564,47 @@ int main(void)
 }
 EOC
 
+    cat > "$bsrc" <<EOC
+typedef __SIZE_TYPE__ bp_size;
+
+bp_size strlen(const char *);
+long write(int, const void *, bp_size);
+
+static const char *volatile bp_bad = (const char *)${BAD_GUEST_ADDR}ull;
+static volatile bp_size bp_len;
+
+int main(void)
+{
+    write(1, "badptr enter\n", 13);
+    bp_len = strlen(bp_bad);
+    write(1, "badptr returned\n", 16);
+    return bp_len != 0;
+}
+EOC
+
+    cat > "$asrc" <<EOC
+typedef __SIZE_TYPE__ bp_size;
+
+bp_size strlen(const char *);
+long write(int, const void *, bp_size);
+
+static const char *volatile ap_good = "after";
+static const unsigned char *volatile ap_bad = (const unsigned char *)${BAD_GUEST_ADDR}ull;
+static volatile bp_size ap_len;
+static volatile unsigned char ap_got;
+
+int main(void)
+{
+    write(1, "after enter\n", 12);
+    ap_len = strlen(ap_good);
+    if (ap_len == 5)
+        write(1, "after bridged\n", 14);
+    ap_got = *ap_bad;
+    write(1, "after returned\n", 15);
+    return ap_got != 0;
+}
+EOC
+
     if clang -arch x86_64 -std=c11 -O1 -fno-builtin -fno-stack-protector \
             -o "$bin" "$src" >/dev/null 2>&1; then
         PROBE_BIN="$bin"
@@ -490,6 +613,14 @@ EOC
     if clang -arch x86_64 -std=c11 -O1 -fno-builtin -fno-stack-protector \
             -o "$ubin" "$usrc" >/dev/null 2>&1; then
         UNIMPL_BIN="$ubin"
+    fi
+    if clang -arch x86_64 -std=c11 -O1 -fno-builtin -fno-stack-protector \
+            -o "$bbin" "$bsrc" >/dev/null 2>&1; then
+        BADPTR_BIN="$bbin"
+    fi
+    if clang -arch x86_64 -std=c11 -O1 -fno-builtin -fno-stack-protector \
+            -o "$abin" "$asrc" >/dev/null 2>&1; then
+        AFTER_BIN="$abin"
     fi
 }
 
@@ -682,6 +813,182 @@ case_bridge_unimpl() {
     record "$name" "$reason" "exit=$rc${sym:+ sym=$sym}"
 }
 
+bridge_stopped_reason() {
+    if grep -Fq "$NOBIND" "$@" 2>/dev/null; then
+        echo "an import went unresolved: $(grep -hF "$NOBIND" "$@" | head -1)"
+    elif grep -qE "$BRIDGE_RE" "$@" 2>/dev/null; then
+        echo "stopped at an unbridged export: $(grep -hE "$BRIDGE_RE" "$@" | head -1)"
+    else
+        echo ""
+    fi
+}
+
+case_bridge_fault_native() {
+    local name=bridge_fault_native rc reason=""
+    local out="$TMP/badptr_native.out" err="$TMP/badptr_native.err"
+
+    if [ -z "$BADPTR_BIN" ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    fi
+    run_bounded "$out" "$err" "$OCERZ" -v -native "$BADPTR_BIN"
+    rc=$?
+    reason="$(bridge_stopped_reason "$out" "$err")"
+    if [ -n "$reason" ]; then
+        :
+    elif ! grep -Fq "$BADPTR_MARK" "$out"; then
+        reason="the guest never reached the bad call"
+    elif ! grep -qE "$BRIDGE_FAULT_RE" "$out" "$err"; then
+        reason="no 'BRIDGE-FAULT ... inside a bridged call' report"
+    elif ! grep -Fq "call=$LIB:$BADPTR_SYM" "$out" "$err"; then
+        reason="the report does not name $LIB:$BADPTR_SYM"
+    elif ! grep -Fq "sig='$BADPTR_SIG'" "$out" "$err"; then
+        reason="the report does not name the signature $BADPTR_SIG"
+    elif ! grep -qE 'host_fn=0x[0-9a-f]+ depth=[1-9]' "$out" "$err"; then
+        reason="the report does not name the host function address and a crossing depth"
+    elif ! grep -Fq "fault_addr=$BAD_GUEST_ADDR" "$out" "$err"; then
+        reason="the report does not name $BAD_GUEST_ADDR as the faulting address"
+    elif ! grep -qE 'host_pc=0x[0-9a-f]+' "$out" "$err"; then
+        reason="the report does not name the host instruction pointer"
+    elif ! grep -Fq "the guest passed a bad pointer to $BADPTR_SYM (guest addr $BAD_GUEST_ADDR)" "$out" "$err"; then
+        reason="the report does not put $BAD_GUEST_ADDR in guest space and blame the guest's pointer"
+    elif [ "$rc" -ne "$BRIDGE_FAULT_STATUS" ]; then
+        reason="exit $rc, want $BRIDGE_FAULT_STATUS"
+    fi
+    record "$name" "$reason" "exit=$rc"
+}
+
+case_bridge_fault_not_guest() {
+    local name=bridge_fault_not_guest rc reason=""
+    local out="$TMP/badptr_knobs.out" err="$TMP/badptr_knobs.err"
+    local co="$TMP/after_knobs.out" ce="$TMP/after_knobs.err"
+
+    if [ -z "$BADPTR_BIN" ] || [ -z "$AFTER_BIN" ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    fi
+    run_bounded "$out" "$err" env OCERZ_FAULTLOG=1 OCERZ_SIGTRACE=1 \
+        "$OCERZ" -native "$BADPTR_BIN"
+    rc=$?
+    run_bounded "$co" "$ce" env OCERZ_FAULTLOG=1 OCERZ_SIGTRACE=1 \
+        "$OCERZ" -native "$AFTER_BIN"
+    reason="$(bridge_stopped_reason "$out" "$err")"
+    if [ -n "$reason" ]; then
+        :
+    elif ! grep -qE "$BRIDGE_FAULT_RE" "$out" "$err"; then
+        reason="the knobs changed the report away from a bridged-call fault"
+    elif ! grep -Fq "$FAULTLOG_MARK" "$co" "$ce" || ! grep -Fq "$SIGTRACE_MARK" "$co" "$ce"; then
+        reason="neither knob spoke for a plain guest fault at the same address, so their silence below proves nothing"
+    elif grep -Fq "$GUEST_CRASH" "$out" "$err"; then
+        reason="the fault is still reported as a guest crash at an unrelated rip: $(grep -hF "$GUEST_CRASH" "$out" "$err" | head -1 | cut -c1-120)"
+    elif grep -Fq "$FAULTLOG_MARK" "$out" "$err"; then
+        reason="OCERZ_FAULTLOG shows $BAD_GUEST_ADDR still went down the guest attribution path"
+    elif grep -Fq "$SIGTRACE_MARK" "$out" "$err"; then
+        reason="OCERZ_SIGTRACE shows the fault was still offered to the guest at $BAD_GUEST_ADDR"
+    elif grep -qE "$WILD_RE" "$out" "$err"; then
+        reason="a recovery path took the fault instead: $(grep -hE "$WILD_RE" "$out" "$err" | head -1 | cut -c1-120)"
+    elif grep -Fq "$BADPTR_PAST" "$out"; then
+        reason="the guest carried on past a fault taken inside a native frame"
+    elif [ "$rc" -ne "$BRIDGE_FAULT_STATUS" ]; then
+        reason="exit $rc, want $BRIDGE_FAULT_STATUS"
+    fi
+    record "$name" "$reason" "exit=$rc"
+}
+
+case_bridge_fault_cache() {
+    local name=bridge_fault_cache rc rc_nojit reason=""
+    local out="$TMP/badptr_cache.out" err="$TMP/badptr_cache.err"
+    local no="$TMP/badptr_cache.nojit.out" ne="$TMP/badptr_cache.nojit.err"
+
+    if [ -z "$BADPTR_BIN" ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    fi
+    if [ "$CACHE_OK" -ne 1 ]; then
+        echo "SKIP $name (shared cache not mappable here)"; return
+    fi
+    run_bounded "$out" "$err" "$OCERZ" -cache "$BADPTR_BIN"
+    rc=$?
+    run_bounded "$no" "$ne" "$OCERZ" -cache -no-jit "$BADPTR_BIN"
+    rc_nojit=$?
+    if grep -qE "$BRIDGE_FAULT_RE" "$out" "$err" "$no" "$ne"; then
+        reason="cache mode printed a bridged-call report, and cache mode crosses no bridge"
+    elif ! grep -Fq "$BADPTR_MARK" "$out"; then
+        reason="the guest never reached the bad call"
+    elif grep -Fq "$BADPTR_PAST" "$out"; then
+        reason="the guest carried on past its own fault"
+    elif ! grep -Fq "$GUEST_CRASH" "$out" "$err"; then
+        reason="no guest-crash report: a plain guest fault stopped being reported as one"
+    elif ! grep -Fq "guest_addr=$BAD_GUEST_ADDR" "$out" "$err"; then
+        reason="the guest-crash report does not name $BAD_GUEST_ADDR as the address the guest dereferenced"
+    elif [ "$rc" -ne "$GUEST_FAULT_STATUS" ]; then
+        reason="exit $rc, want $GUEST_FAULT_STATUS"
+    elif [ "$rc_nojit" -ne "$rc" ]; then
+        reason="no-jit exit $rc_nojit, jit exit $rc: the two engines no longer agree on a guest fault"
+    elif ! grep -Fq "$GUEST_CRASH" "$no" "$ne"; then
+        reason="no-jit printed no guest-crash report"
+    fi
+    record "$name" "$reason" "exit=$rc"
+}
+
+case_bridge_frame_lowered() {
+    local name=bridge_frame_lowered rc reason=""
+    local out="$TMP/after_native.out" err="$TMP/after_native.err"
+
+    if [ -z "$AFTER_BIN" ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    fi
+    run_bounded "$out" "$err" "$OCERZ" -v -native "$AFTER_BIN"
+    rc=$?
+    reason="$(bridge_stopped_reason "$out" "$err")"
+    if [ -n "$reason" ]; then
+        :
+    elif ! grep -Fq "$AFTER_MARK" "$out"; then
+        reason="the bridged call did not return the answer the fixture expected"
+    elif grep -Fq "$AFTER_PAST" "$out"; then
+        reason="the guest carried on past its own fault"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err"; then
+        reason="a fault in guest code was blamed on a crossing that had already returned: $(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1)"
+    elif ! grep -Fq "$GUEST_CRASH" "$out" "$err"; then
+        reason="no guest-crash report for a fault the guest took in its own code"
+    elif ! grep -Fq "guest_addr=$BAD_GUEST_ADDR" "$out" "$err"; then
+        reason="the guest-crash report does not name $BAD_GUEST_ADDR"
+    elif [ "$rc" -ne "$GUEST_FAULT_STATUS" ]; then
+        reason="exit $rc, want $GUEST_FAULT_STATUS"
+    fi
+    record "$name" "$reason" "exit=$rc"
+}
+
+case_bridgelog() {
+    local name=bridgelog rc rc_plain reason="" n sym
+    local lo="$TMP/bridgelog.out" le="$TMP/bridgelog.err"
+    local po="$TMP/bridgelog_plain.out" pe="$TMP/bridgelog_plain.err"
+
+    run_bounded "$po" "$pe" "$OCERZ" -v -native "$DYN" "$BRIDGELOG_KERNEL" "$SCALE"
+    rc_plain=$?
+    run_bounded "$lo" "$le" env OCERZ_BRIDGELOG=1 \
+        "$OCERZ" -v -native "$DYN" "$BRIDGELOG_KERNEL" "$SCALE"
+    rc=$?
+    n=$(grep -cE "$BRIDGELOG_RE" "$le" 2>/dev/null | tr -d ' ')
+    sym=$(grep -E "$BRIDGELOG_RE" "$le" 2>/dev/null | head -1 | awk '{print $4}')
+
+    reason="$(native_run_reason "$rc_plain" "$po" "$pe")"
+    if [ -n "$reason" ]; then
+        reason="without OCERZ_BRIDGELOG: $reason"
+    elif [ "$n" = "0" ]; then
+        reason="OCERZ_BRIDGELOG printed no 'ocerz: BRIDGELOG[pid] <lib> <sym> <sig>' line"
+    elif [ -n "$(grep -E "$BRIDGELOG_RE" "$le" | awk -v l="$LIB" '$3 != l' | head -1)" ]; then
+        reason="a log line names library $(grep -E "$BRIDGELOG_RE" "$le" | awk -v l="$LIB" '$3 != l' | head -1 | awk '{print $3}'), want $LIB"
+    elif [ -n "$(nm -u "$DYN" 2>/dev/null)" ] &&
+         ! nm -u "$DYN" 2>/dev/null | awk '{print $1}' | grep -Fqx "$sym"; then
+        reason="the log names $sym, which is not in the fixture's import table"
+    elif [ -z "$(grep -E "$BRIDGELOG_RE" "$le" | awk -v s="$BRIDGELOG_SYM" -v g="$BRIDGELOG_SIG" '$4 == s && $5 == g' | head -1)" ]; then
+        reason="no logged crossing is '$BRIDGELOG_SYM $BRIDGELOG_SIG', which the $BRIDGELOG_KERNEL kernel must make"
+    elif [ "$rc" -ne "$rc_plain" ]; then
+        reason="exit $rc with OCERZ_BRIDGELOG set, $rc_plain without"
+    elif ! cmp -s "$lo" "$po"; then
+        reason="stdout differs with OCERZ_BRIDGELOG set: the diagnostic changed what it was watching"
+    fi
+    record "$name" "$reason" "exit=$rc lines=$n"
+}
+
 case_env_native() {
     local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
@@ -854,6 +1161,11 @@ case_bridge_probe_env
 case_bridge_probe_native
 case_bridge_probe_cache
 case_bridge_unimpl
+case_bridge_fault_native
+case_bridge_fault_not_guest
+case_bridge_fault_cache
+case_bridge_frame_lowered
+case_bridgelog
 case_env_native
 case_flag_beats_env
 case_last_flag_native
