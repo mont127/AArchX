@@ -763,6 +763,41 @@ case_empty_mode() {
     record "$name" "$reason" "exit=$rc"
 }
 
+case_native_float() {
+    local name=native_float rc reason="" src="$TMP/fp.c" bin="$TMP/fp"
+    local out="$TMP/native_float.out" err="$TMP/native_float.err"
+    local cout="$TMP/cache_float.out"
+    cat > "$src" <<'EOC'
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(void)
+{
+    double a = atof("3.5");
+    double b = atof("-0.25");
+    char *end = 0;
+    double c = strtod("2.5e3xyz", &end);
+    int ok = (a == 3.5) && (b == -0.25) && (c == 2500.0) && end && strcmp(end, "xyz") == 0;
+    write(1, ok ? "fp ok\n" : "fp bad\n", ok ? 6 : 7);
+    return ok ? 0 : 1;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -fno-stack-protector -o "$bin" "$src" >/dev/null 2>&1; then
+        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    fi
+    run_bounded "$out" "$err" "$OCERZ" -native "$bin"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        reason="exit $rc, want 0; a double crossed the bridge wrongly"
+    elif ! grep -q 'fp ok' "$out"; then
+        reason="the guest computed the wrong value from a bridged double"
+    elif [ "$CACHE_OK" -eq 1 ]; then
+        run_bounded "$cout" "$TMP/cache_float.err" "$OCERZ" "$bin"
+        cmp -s "$out" "$cout" || reason="native and cache disagree on a bridged double"
+    fi
+    record "$name" "$reason" "exit=$rc"
+}
+
 case_native_unbound() {
     local name=native_unbound rc reason="" src="$TMP/unbound.c" bin="$TMP/unbound"
     local out="$TMP/native_unbound.out" err="$TMP/native_unbound.err"
@@ -827,6 +862,7 @@ case_bad_mode
 case_empty_mode
 case_native_static
 case_native_unbound
+case_native_float
 
 echo "----------------------------------------"
 echo "native tests: $pass passed, $fail failed"

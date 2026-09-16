@@ -83,7 +83,6 @@ static const char *const kUnbridged[] = {
     "_printf", "_fprintf", "_sprintf", "_snprintf",
     "_open", "_fcntl", "_ioctl",
     "_qsort", "_bsearch",
-    "_atof", "_strtod",
 };
 #define NUNBRIDGED (sizeof kUnbridged / sizeof kUnbridged[0])
 
