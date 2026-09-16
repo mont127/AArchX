@@ -44,13 +44,15 @@ make -j
 | x86-64 decode | 246 / 246 cases |
 | i386 decode | 102 cases, 26 rejects, 122 address cases |
 | extension / SSE suites | 237 / 0, 246 / 0, SSE4.2 differential against Rosetta |
-| loader / syscall suites | 54 / 0, 324 / 0 |
-| memory / shared mappings | 2692 / 0, 91 / 0 |
+| loader / syscall suites | 54 / 0, 326 / 0 |
+| memory / shared mappings | 2692 / 0, 105 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
-| x86-64 guest gate | 111 / 111 |
-| x86-64 differential gate (interpreter vs JIT) | 92 / 92 |
+| x86-64 guest gate | 116 / 116 |
+| x86-64 differential gate (interpreter vs JIT) | 96 / 96 |
 | i386 differential gate | 20,033 / 20,033 |
-| dynamic-mode tests | 107 / 107 |
+| dynamic-mode tests | 109 / 109 |
+| native-mode gate (`-native`) | 31 / 31 |
+| native-mode unit suites: image, bridge, ABI, callbacks | 478 / 0, 210 / 0, 1955 / 0, 8351 / 0 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -64,6 +66,7 @@ What is in the box:
 - x86-64-v3 as Rosetta runs it on macOS 15 and later: AVX2, FMA, BMI1/BMI2, F16C, LZCNT, MOVBE and XSAVE, none of which CPUID advertises under either.
 - JIT cache invalidation on guest code writes and executable mapping changes.
 - Differential tests for both x86-64 and i386 execution.
+- An opt-in native mode that runs Intel programs against synthesized x86 system images bridged to the host's own arm64 functions, in both directions, without the x86 shared cache.
 
 ## Application compatibility
 
@@ -249,6 +252,8 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 | Environment | Effect |
 | --- | --- |
 | `OCERZ_MODE=native\|cache` | pick the mode when no flag does; this is how a spawned child inherits it, and an unrecognized value is refused rather than ignored |
+| `OCERZ_BRIDGESTAT=1` | in native mode, print how many times each bridged function was called, at exit |
+| `OCERZ_BRIDGELOG=1` | in native mode, name every bridged call as it happens |
 | `OCERZ_NOJIT=1` | interpret the whole process tree |
 | `OCERZ_NOJIT_EXE=<text>` | interpret processes whose command line matches |
 | `OCERZ_NO_HOSTWQ=1` | turn the host workqueue bridge off (it is on by default; `OCERZ_HOSTWQ=1` is still accepted and still means on) |
@@ -289,36 +294,42 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 | JIT | `src/jit.c`, `src/a64emit.c` | arm64 code generation, block chaining, superblocks |
 | Mini-dyld | `src/dyld.c`, `src/cache.c`, `src/dyldapi.c` | shared cache, symbols, fixups, Objective-C |
 | Virtual dylibs | `src/vdylib.c` | synthesized x86_64 system images and their bridge stubs, for native mode |
+| Bridge | `src/bridge.c` | native mode's table of bridged functions and their signatures, and which call a thread is in when it faults |
+| ABI engine | `src/abi.c`, `src/abicall.s` | moving arguments and results between System V x86-64 and arm64 in both directions, and the callback trampoline bank |
 | Syscalls | `src/syscall.c` | BSD, Mach, signals, threads and WoW64 host calls |
 
 ## Native mode
 
-Apple ends general-purpose Rosetta after macOS 27, and with it the `dyld_shared_cache_x86_64` that every guest here has bound against. Native mode is the answer to that: the guest keeps an x86_64 Darwin personality, but its system libraries become synthesized x86 images whose exports are bridge stubs into the host's own arm64 frameworks, so AppKit, CoreGraphics and Metal calls end up in the real native implementations rather than in translated Intel code. It is selected with `-native` and is not the default.
+Apple ends general-purpose Rosetta after macOS 27, and with it the `dyld_shared_cache_x86_64` that every guest binds against by default. Native mode is the answer to that. The guest keeps its x86_64 Darwin personality, but its system libraries are synthesized x86 images whose exports lead into the host's own arm64 code, so a call into libSystem runs the real native implementation instead of translated Intel code. It is selected with `-native` or `OCERZ_MODE=native`, and cache mode stays the default.
 
-What exists today is the loader half, not the bridges. In native mode no cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off because the host's own libdispatch needs the process's single workqueue slot.
+Today native mode runs command-line programs whose system calls stay inside what is bridged: the common C string and memory functions, the heap, `read`, `write` and `close`, string-to-number conversion, `qsort` and `bsearch`. Nothing from Foundation or AppKit is available yet. Every kernel of `xbench_dyn` produces byte-identical output in native mode and cache mode, under both the JIT and the interpreter.
 
-A guest that links `/usr/lib/libSystem.B.dylib` finds nothing behind it, because on a current macOS there is no such file on disk; it exists only as a cache image. So ocerz builds one. `src/vdylib.c` assembles a real x86_64 Mach-O in memory, header and load commands and `__TEXT` and `__DATA` and an export trie, and the loader takes it as an ordinary image. Nothing in the loader ever reopens a file, so a buffer built in memory is indistinguishable from one read off disk, and import resolution, `dlopen` and `dladdr` all work on it unchanged.
+**System libraries without files.** A guest that links `/usr/lib/libSystem.B.dylib` finds nothing behind it, because on a current macOS that library exists only inside the cache. So ocerz builds one. `src/vdylib.c` assembles a real x86_64 Mach-O in memory, with load commands, `__TEXT`, `__DATA` and an export trie, and the loader takes it as an ordinary image. Nothing in the loader reopens a file, so import resolution, `dlopen` and `dladdr` work on it unchanged. No cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off, because the host's own libdispatch needs the process's single workqueue slot.
 
-Every export is twelve bytes of real x86, a move of the export's id into `r11` followed by a jump through a slot holding one address for the whole process, inside the trap window the decoder and both engines already watch. So a call into a virtual framework costs no new instruction, no new range check and no widened window, and a synthesized image needs no fixups, since the trap address is a constant and the jump that reads it is rip-relative.
+**Calls out.** Every export is twelve bytes of real x86: a move of the export's id into `r11`, then a jump through a slot that holds one address for the whole process, inside the trap window the decoder and both engines already watch. `src/bridge.c` catches the trap. `src/abi.c` reads the arguments out of the guest's register state according to the function's signature, and `src/abicall.s` loads them into the arm64 argument registers and calls the real function. The signature matters because the two ABIs count integer and floating-point arguments in separate sequences, so one `double` in the middle of a signature moves nothing on one side and everything on the other. It also keeps widths honest: arm64 makes the caller extend a narrow argument, and a 32-bit result can come back with the upper half of the register dirty.
 
-Nothing is bridged yet, so reaching an export names it and stops:
+**Calls back.** A native function that takes a function pointer calls it, and when the guest supplied that pointer it names x86 code native code cannot jump to. So a callback argument carries its own signature, `qsort` being `v(pLLc{i(pp)})`, and the guest function is bound to one slot in a fixed, assembled bank of 4096 arm64 trampolines. Native code receives the slot's address, and the same function always gets the same address. When native code calls the slot, the guest function runs on that thread with its arguments where System V expects them. A comparator can make bridged calls of its own, and nesting goes as deep as the guest's stack allows.
+
+**Faults.** A bridged call is the one place a thread the guest drives runs native code. A fault during one is reported as such, naming the call and saying whether the faulting address was in guest space, meaning the guest passed a bad pointer, or outside it, meaning ocerz marshalled the call wrong. The process stops there, because a native frame can be neither resumed nor unwound:
 
 ```text
-$ ./ocerz -native tests/guest/benchbin/xbench_dyn depchain 1000
-ocerz: vdylib: built /usr/lib/libSystem.B.dylib with 123 exports, 10830 bytes
-ocerz: dynamic: registered virtual dylib /usr/lib/libSystem.B.dylib
-ocerz: bridge: /usr/lib/libSystem.B.dylib _strcmp not implemented
+ocerz: BRIDGE-FAULT[35366] SIGBUS inside a bridged call, not in guest code
+ocerz:   call=/usr/lib/libSystem.B.dylib:_strlen sig='L(p)' host_fn=0x18980eac0 depth=1
+ocerz:   cause: the fault address is in guest space, so the guest passed a bad pointer to _strlen
 ```
 
-Those stubs now call the real thing. `src/bridge.c` reads the arguments out of the guest's x86 register state, calls the arm64 function already linked into ocerz, and puts the result back where x86 code looks for it. An Intel binary in native mode therefore does its work in native code. Every kernel of `xbench_dyn` produces byte-identical output in native mode and in cache mode, under both the JIT and the interpreter.
+A guest fault inside a callback is the guest's own and is handled the ordinary way. A guest writing into a page it has already executed still has its translation invalidated and carries on, even when the write came from a bridged `memcpy`.
 
-Where each argument goes is computed from the function's signature rather than assumed, because the two ABIs count their integer and floating-point arguments in separate sequences. One `double` in the middle of a signature shifts nothing on one side and everything on the other, so an argument's position tells you nothing about which register holds it on either. `src/abi.c` does that classification and `src/abicall.s` makes the call.
+**What is not bridged.** An export with no bridge behind it names itself and stops with exit status 72. An import that never bound at all stops the process with 71 before the guest runs, so the two failures stay distinguishable. A static image is refused outright.
 
-Working from real signatures also made the integer widths honest. Apple's arm64 makes the caller extend a narrow argument, and an arm64 callee may leave the upper half of the return register dirty on a 32-bit result, neither of which a coarser scheme could express.
+```text
+$ ./ocerz -native ./hello_printf
+ocerz: bridge: /usr/lib/libSystem.B.dylib _printf not implemented
+```
 
-Variadic functions are still absent, for a sharper reason than the rest. Apple's arm64 passes every variadic argument on the stack in eight-byte slots and uses no floating-point register at all, the opposite of its packing for an ordinary call, so `printf` and `open` need veneers that know where the named arguments stop. Structures passed by value are refused at parse time, since both ABIs split them into pieces and classify each piece differently. Anything taking a callback waits on a way back into guest code. An export with no descriptor still names itself and stops.
+Variadic functions stay out on purpose. Apple's arm64 passes every variadic argument on the stack in eight-byte slots and uses no floating-point register, the opposite of its packing for an ordinary call, so `printf` and `open` need veneers that know where the named arguments stop. Structures passed by value are refused when a signature is parsed, since both ABIs split them into pieces and classify each piece differently.
 
-A crossing costs about 33 ns, measured as the difference between a guest loop calling `getpid` three million times and the same loop without the call. That is a cliff rather than a constant factor, and it shows up exactly where the call is small and frequent:
+**What a crossing costs.** About 33 ns, measured as the difference between a guest loop calling `getpid` three million times and the same loop without the call. It is a cliff rather than a constant factor, and it shows up where calls are small and frequent:
 
 | kernel | native vs cache | why |
 | --- | --- | --- |
@@ -327,21 +338,9 @@ A crossing costs about 33 ns, measured as the difference between a guest loop ca
 | `hash` | 1.00x | no bridged calls |
 | `depchain` | 1.02x | no bridged calls |
 
-Guest code that never crosses pays nothing, which is why the last two rows are at parity. Closing the gap on the first two is a JIT change: recognizing a call whose target is a known stub and spilling only the registers the descriptor names, instead of leaving the block and re-entering through the dispatcher.
+Guest code that never crosses pays nothing, which is why the last two rows are at parity. Closing the gap on the first two is a JIT change: recognizing a call to a known stub and spilling only the registers its signature names, instead of leaving the block and re-entering through the dispatcher.
 
-A bridged call is the first place a thread the guest is driving runs native code, so a fault during one is not the guest's fault the way every earlier fault was. ocerz records which crossing a thread is in, and a fault inside one is reported as such and stops the process, naming the library, symbol, signature and host function, and saying whether the faulting address was in guest space, meaning the guest passed a bad pointer, or outside it, meaning ocerz marshalled the call wrong:
-
-```text
-ocerz: BRIDGE-FAULT[35366] SIGBUS inside a bridged call, not in guest code
-ocerz:   call=/usr/lib/libSystem.B.dylib:_strlen sig='L(p)' host_fn=0x18980eac0 depth=1
-ocerz:   cause: the fault address is in guest space, so the guest passed a bad pointer to _strlen
-```
-
-It stops rather than delivering the fault because the thread is several native frames deep, in code that can be neither resumed nor unwound. The check runs after the recoveries that re-run the faulting instruction, so a guest writing into a page it has already executed still has its translation invalidated and carries on, whether the write came from translated code or from a bridged `memcpy`. `OCERZ_BRIDGELOG=1` names every crossing as it happens.
-
-Calls also go the other way now. A native function that takes a function pointer calls it, and when the guest supplied that pointer it names x86 code the native side cannot jump to. So an argument that is a callback carries its own signature, `qsort` being `v(pLLc{i(pp)})`, and the guest function is bound to one slot in a fixed, assembled bank of 4096 arm64 trampolines. The slot's address is what native code receives, and the same function always gets the same address. When native code calls the slot, the guest function runs on the same thread with its arguments placed where System V expects them. A comparator can make bridged calls of its own, nesting goes as deep as the guest's stack allows, and a guest fault inside a callback is reported as the guest's own fault rather than as a fault in native code.
-
-The guest binds every import, reaches `main`, and runs. Exit status 72 means it reached an export with no bridge behind it; 71 means an import never bound at all. The two are kept distinct so a failure says which happened. The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once; children inherit it through `OCERZ_MODE`. A static image is refused, since native mode has no static loader path. `tests/unit/test_vdylib.c` pins the synthesized image's structure and resolves every export through the loader's own trie walker, and `tests/run_native_tests.sh` pins the selection rules, the absent cache, the bridge report and the exit statuses, and that cache mode is unchanged.
+The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once, and a spawned child inherits it through `OCERZ_MODE`. `tests/run_native_tests.sh` pins all of this end to end. `tests/unit/test_vdylib.c`, `test_bridge.c`, `test_abi.c` and `test_callback.c` pin the synthesized image, the bridge table, argument placement across the signature space, and the trampoline bank.
 
 ## Limitations
 
@@ -365,6 +364,7 @@ The guest binds every import, reaches `main`, and runs. Exit status 72 means it 
 - MMX instructions always run in the interpreter, and the MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry them.
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
+- Native mode runs only programs whose system calls stay inside the bridged part of libSystem. Nothing above libSystem is available there yet, Foundation and AppKit included, and variadic functions such as `printf` and `open` are not bridged.
 
 ## License
 
