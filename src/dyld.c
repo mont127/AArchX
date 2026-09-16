@@ -498,8 +498,7 @@ static int map_segments(DynImage *img, int is_main)
             uint64_t filesize = rd64(lc + 48);
             uint32_t initprot = rd32(lc + 56);
             if (img->seg_count < DYN_SEG_MAX)
-                img->seg_vmaddr[img->seg_count] = vmaddr;
-            img->seg_count++;
+                img->seg_vmaddr[img->seg_count++] = vmaddr;
             if (!(vmaddr == 0 && initprot == 0) && filesize)
                 memcpy(ocerz_g2h(vmaddr + img->slide), img->slice + fileoff, (size_t)filesize);
         } else if (cmd == 0x80000028) {
