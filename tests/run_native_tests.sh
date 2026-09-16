@@ -257,7 +257,7 @@
 # with cache mode, where the real x86 libpthread runs the same start routines on
 # threads ocerz creates for the guest.
 #
-# The thread fixtures are the only ones built without -fno-stack-protector, and
+# The thread and tlv_* fixtures alone are built without -fno-stack-protector, and
 # that is deliberate. clang emits the stack protector by default, and a protected
 # x86_64 function reads ___stack_chk_guard, which is a data symbol rather than a
 # function. Until M7a the virtual libSystem exported only functions, so a
@@ -336,10 +336,119 @@
 # its waiter leaves a start routine blocked. A timeout says which it was, in
 # cache mode as well as native, since the notes are written in both.
 #
-# The callback, attach and thread cases skip where there is no x86_64 clang,
-# like the others, but a fixture of theirs that fails to compile where a trivial
-# x86_64 program compiles fine is a failure: skipping it would hide a broken
-# fixture indefinitely.
+# M7b gives native mode thread-local variables. A __thread variable is reached
+# through a descriptor in its image's __thread_vars section, whose first word is
+# a thunk the compiler calls with the descriptor's address in RDI and which must
+# return the variable's address in RAX. In cache mode that thunk is dyld's own
+# x86 tlv_get_addr out of the shared cache. Native mode has no such code: the
+# thunk slot of every descriptor binds to __tlv_bootstrap, which the virtual
+# libSystem did not export, so a program with a single thread-local variable
+# exited 71 without running an instruction. The virtual libSystem now exports
+# it, the loader rewrites each image's descriptors with a key of ocerz's own,
+# and the trap behind the export answers from a table of per-image blocks that
+# each thread keeps in its guest thread block: a block is allocated from the
+# image's template the first time a thread touches one of that image's
+# variables, and a thread's blocks are freed when an attached thread, which
+# every pthread_create thread is, goes away. Six tlv_* fixtures cover it, shaped
+# like the thread ones -- a single status line with the bits in source order and
+# progress notes on stderr, run under both engines, which must agree byte for
+# byte, and compared with cache mode, where the real tlv_get_addr serves the
+# same descriptors. Each case checks with nm that its fixture imports
+# __tlv_bootstrap, which is what shows the variables were compiled as
+# descriptors bound to that thunk at all, and ___stack_chk_guard, and that it
+# imports nothing the bridge does not implement, so that a failure is about
+# thread-local variables and not about an import the fixture had no business
+# making. A run stopped by the unresolved thunk says so by name.
+#
+# tlv_main is the plainest of them: an int and a double with distinctive
+# initializers, read on first touch and then changed by forty-eight calls to a
+# function that adds to both, each round read back in main and through other
+# functions, with each variable's address the same whether taken in main or
+# returned from elsewhere. The thunk's convention is not the ordinary one: the
+# compiler may keep RSI, RDX, RCX, R8, R9 and R10 live across the call, and at -O1
+# it does. So the fixture also calls a function whose six 64-bit arguments are
+# still needed after a thread-local access in its body; a trap, or a translated
+# path, that disturbed one of them would otherwise go unnoticed until a program
+# computed something wrong with it.
+#
+# tlv_bss is about the part of a block the template does not supply. A 1 MB
+# thread-local array with no initializer lies in __thread_bss, after a 32-byte
+# initialized one in __thread_data, and every byte of it must read zero on first
+# touch, then read back a pattern written over all of it without the initialized
+# array or a second zero-initialized variable changing. Before that first touch
+# the fixture fills an ordinary global array of the same size, which the linker
+# lays out just past the thread-local sections, so a block copied from the wrong
+# range of the image reads non-zero, and a thread-local array that is really
+# ordinary data shows up as the ordinary array changing.
+#
+# tlv_layout gives one image fifteen thread-local variables of different sizes
+# and alignments -- char, short, int, signed char, long long, double, float, a
+# padded struct, an int array, a pointer, a 16-byte-aligned array and a trailing
+# char, with three that have no initializer placed among them -- so the linker
+# gives each an offset of its own. Every initializer reads back under a bit of
+# its own, so a wrong offset names its variable. The pointer is initialized with
+# the address of a string, which puts a rebase inside __thread_data: a block
+# copied from the file, or from the image before its fixups were applied, holds
+# something other than the string's address. Every address must sit on its
+# type's alignment, no two variables may overlap and all of them must fit in a
+# page; then every variable is written with a new value and each must read back
+# its own. That last check is the old descriptor bug as a guest sees it: every
+# variable in an image collapsed onto offset 0, so writing one wrote them all. A
+# copy of this fixture with every descriptor's offset patched to 0 sets fourteen
+# of its seventeen bits under Rosetta, and tlv_main and tlv_bss fail the same way.
+#
+# tlv_threads starts six threads one at a time, each only after the main thread
+# and every thread before it have replaced their own values, so a thread whose
+# first read is anything but the initializers, or whose thread-local array is not
+# zero, is reading a block that is not its own. Each thread then writes values of
+# its own, checks them, and waits until all six have done the same, so the
+# addresses they recorded belong to seven threads alive at once and must all
+# differ. Released, each checks that nothing the others wrote reached its copy,
+# and the main thread checks its own copy last.
+#
+# tlv_thread_churn creates and joins 320 threads one after another. Each must
+# start from the initializers and from a 2 MB thread-local array that is zero
+# where the thread before it wrote, and then writes values of its own and a mark
+# on every 4 KB page of the array. A thread's blocks are freed when it goes
+# away, so the memory a later thread is handed may be memory an earlier one
+# wrote: a block reused without being initialized again, or a table that
+# outlives its thread and is found by the next one, hands a thread its
+# predecessor's values, and the status line counts such threads as stale. A leak
+# shows nowhere in the output, so the case measures one. The JIT run happens
+# under /usr/bin/time -l, as does a second run of only 16 threads, and the
+# larger run's peak memory footprint may exceed the smaller's by no more than a
+# quarter of a block for each extra thread. Under Rosetta the two runs came out
+# 4 MB apart, and a copy of the fixture that also allocated and touched 2 MB per
+# thread without freeing it put the larger run 640 MB ahead. Both engines must
+# also finish inside TLV_CHURN_BUDGET seconds, half the bound on the run, so
+# that a cost that grows with every thread fails as a cost rather than as a
+# timeout. The measured runs are the only ones in this gate with a process
+# between the timeout and ocerz, so one that times out also kills whatever of
+# the fixture is still running, since the fallback timeout loop signals only its
+# own child.
+#
+# tlv_dylib moves thread-local variables into a disk dylib, built at test time
+# with the install name @executable_path/libtlvdep.dylib and written beside the
+# fixture, which links against it by path, so the loader has to register a second
+# image's descriptors under a key of their own. The dylib's imports are checked
+# the way a fixture's are. Its variables must read their initializers on the main
+# thread and on four threads alive at once, at distinct addresses, and must not
+# share a block with the main image's own thread-local int, which lies at offset
+# 0 of its image's block just as the dylib's first variable does in the dylib's.
+# The main image also reaches the dylib's int directly, through an import of the
+# thread-local symbol itself, and the address that yields must be the one the
+# dylib's own accessor returns. A dylib that never loaded leaves every import from
+# it unresolved, and the case then says the loader did not find it rather than
+# blaming thread-local variables.
+#
+# The thread-local runs are bounded at TLV_TIMEOUT seconds and write the same
+# progress notes as the thread fixtures, so a run that times out says how far it
+# got in the same terms.
+#
+# The callback, attach, thread and tlv_* cases skip where there is no x86_64
+# clang, like the others, but a fixture of theirs that fails to compile where a
+# trivial x86_64 program compiles fine is a failure: skipping it would hide a
+# broken fixture indefinitely.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -419,6 +528,23 @@ TH_FAULT_PAST='thrfault returned'
 TH_FAULT_NOCREATE='thrfault create failed'
 THREAD_TIMEOUT=30
 STACK_GUARD_SYM=___stack_chk_guard
+TLV_MAIN_BIN=""
+TLV_BSS_BIN=""
+TLV_LAYOUT_BIN=""
+TLV_THREADS_BIN=""
+TLV_CHURN_BIN=""
+TLV_DYLIB_BIN=""
+TLV_DYLIB_LIB=""
+TLV_DEP_NAME=libtlvdep.dylib
+TLV_TIMEOUT=30
+TLV_CHURN_THREADS=320
+TLV_CHURN_BASE=16
+TLV_CHURN_BLOCK=2097152
+TLV_CHURN_BUDGET=15
+TLV_BOOTSTRAP_SYM=__tlv_bootstrap
+TLV_BRIDGED='___stack_chk_fail _write _pthread_create _pthread_join _pthread_mutex_lock _pthread_mutex_unlock _pthread_cond_wait _pthread_cond_broadcast'
+TLV_UNRESOLVED='ocerz: bridge: thread-local variable descriptor '
+MEASURE_BIN=/usr/bin/time
 
 unset OCERZ_MODE
 unset OCERZ_BRIDGE_PROBE_UNSET
@@ -2486,6 +2612,1153 @@ EOC
     done
 }
 
+build_tlv_fixtures() {
+    local name
+
+    cat > "$TMP/tlv_common.h" <<'EOC'
+#include "thread_common.h"
+
+#define TLV_NOINL __attribute__((noinline))
+
+static unsigned tlv_nonzero(const unsigned char *p, cb_size n, cb_size step)
+{
+    unsigned bad = 0;
+    cb_size i;
+
+    for (i = 0; i < n; i += step)
+        if (p[i] != 0)
+            bad++;
+    if (n != 0 && p[n - 1] != 0)
+        bad++;
+    return bad;
+}
+
+static int tlv_same(const unsigned char *a, const unsigned char *b, cb_size n)
+{
+    cb_size i;
+
+    for (i = 0; i < n; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+EOC
+
+    cat > "$TMP/tlv_main.c" <<'EOC'
+#include "tlv_common.h"
+
+#define TAG "tlv_main"
+#define ROUNDS 48
+#define INT0 0x5eed1234
+#define DBL0 (-1234.0625)
+#define A1 0x0123456789abcdefull
+#define A2 0xfedcba9876543210ull
+#define A3 0x1111222233334444ull
+#define A4 0x8000000000000001ull
+#define A5 0x00000000ffffffffull
+#define A6 0x7fffffff00000000ull
+
+__thread int tv_int = INT0;
+__thread double tv_dbl = DBL0;
+
+TLV_NOINL int *int_addr(void)
+{
+    return &tv_int;
+}
+
+TLV_NOINL double *dbl_addr(void)
+{
+    return &tv_dbl;
+}
+
+TLV_NOINL int read_int(void)
+{
+    return tv_int;
+}
+
+TLV_NOINL double read_dbl(void)
+{
+    return tv_dbl;
+}
+
+TLV_NOINL void step(int by)
+{
+    tv_int += by;
+    tv_dbl += 0.5 * (double)by;
+}
+
+TLV_NOINL cb_uptr live_args(cb_uptr a, cb_uptr b, cb_uptr c, cb_uptr d, cb_uptr e, cb_uptr f)
+{
+    tv_int += 1;
+    return a * 3u + b * 5u + c * 7u + d * 11u + e * 13u + f * 17u + (cb_uptr)(unsigned)tv_int;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, value = 17;
+    int *ia;
+    double *da;
+    int i, first_int, sum = 0, stable = 1, ints = 1, dbls = 1, direct = 1;
+    double first_dbl;
+    cb_uptr got, want;
+
+    at_note(TAG, "first touch");
+    first_int = read_int();
+    first_dbl = read_dbl();
+    ia = int_addr();
+    da = dbl_addr();
+    at_note(TAG, "stepping");
+    for (i = 0; i < ROUNDS; i++) {
+        step(i + 1);
+        sum += i + 1;
+        if (int_addr() != ia || dbl_addr() != da || &tv_int != ia || &tv_dbl != da)
+            stable = 0;
+        if (read_int() != INT0 + sum || tv_int != INT0 + sum)
+            ints = 0;
+        if (read_dbl() != DBL0 + 0.5 * (double)sum || tv_dbl != DBL0 + 0.5 * (double)sum)
+            dbls = 0;
+        value = value * 31u + (unsigned)read_int();
+    }
+    *ia = 0x0badf00d;
+    *da = 0.125;
+    if (read_int() != 0x0badf00d || tv_int != 0x0badf00d || read_dbl() != 0.125 || tv_dbl != 0.125)
+        direct = 0;
+    tv_int = -99;
+    tv_dbl = 1e300;
+    if (*ia != -99 || read_int() != -99 || *da != 1e300 || read_dbl() != 1e300)
+        direct = 0;
+    got = live_args(A1, A2, A3, A4, A5, A6);
+    want = A1 * 3u + A2 * 5u + A3 * 7u + A4 * 11u + A5 * 13u + A6 * 17u + (cb_uptr)(unsigned)read_int();
+    value = value * 31u + (unsigned)(got >> 32);
+    value = value * 31u + (unsigned)got;
+
+    CK(first_int == INT0);
+    CK(first_dbl == DBL0);
+    CK(stable);
+    CK(ints);
+    CK(dbls);
+    CK(direct);
+    CK(read_int() == -98 && got == want);
+    CK((cb_uptr)ia != (cb_uptr)da && ((cb_uptr)ia & 3) == 0 && ((cb_uptr)da & 7) == 0);
+    at_note(TAG, "checked");
+
+    cb_begin(TAG, m);
+    cb_field("rounds", ROUNDS, 0);
+    cb_field("value", value, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/tlv_bss.c" <<'EOC'
+#include "tlv_common.h"
+
+#define TAG "tlv_bss"
+#define BIG (1u << 20)
+#define HEAD "tlv_bss initialized head bytes"
+#define PLAIN "ordinary initialized data bytes"
+
+__thread unsigned char tv_head[32] = HEAD;
+__thread unsigned char tv_big[BIG];
+__thread unsigned tv_tail;
+unsigned char g_plain[BIG];
+unsigned char g_plain_data[32] = PLAIN;
+
+static const unsigned char g_head0[32] = HEAD;
+static const unsigned char g_plain0[32] = PLAIN;
+
+TLV_NOINL unsigned char *big_addr(void)
+{
+    return tv_big;
+}
+
+TLV_NOINL unsigned char *head_addr(void)
+{
+    return tv_head;
+}
+
+TLV_NOINL unsigned *tail_addr(void)
+{
+    return &tv_tail;
+}
+
+static unsigned char pattern(cb_size i)
+{
+    return (unsigned char)((i * 131u + 7u) ^ (i >> 12));
+}
+
+static int apart(cb_uptr a, cb_size an, cb_uptr b, cb_size bn)
+{
+    return a + an <= b || b + bn <= a;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, sum = 2166136261u, nonzero = 0, direct_nonzero = 0, back_bad = 0, plain_bad = 0;
+    unsigned char *big, *head;
+    unsigned *tail;
+    cb_size i;
+    int tail_zero, head_ok, kept, stable, separate;
+
+    at_note(TAG, "writing ordinary globals");
+    for (i = 0; i < BIG; i++)
+        g_plain[i] = 0xa5;
+    for (i = 0; i < sizeof g_plain_data; i++)
+        g_plain_data[i] = (unsigned char)(g_plain_data[i] ^ 0x5a);
+
+    at_note(TAG, "first touch");
+    big = big_addr();
+    for (i = 0; i < BIG; i++)
+        if (big[i] != 0)
+            nonzero++;
+    for (i = 0; i < BIG; i += 4096)
+        if (tv_big[i + 4095] != 0)
+            direct_nonzero++;
+    tail = tail_addr();
+    tail_zero = *tail == 0 && tv_tail == 0;
+    head = head_addr();
+    head_ok = tlv_same(head, g_head0, sizeof g_head0);
+
+    at_note(TAG, "writing thread-local array");
+    for (i = 0; i < BIG; i++)
+        big[i] = pattern(i);
+    *tail = 0xfeedfaceu;
+    for (i = 0; i < BIG; i++) {
+        if (big[i] != pattern(i))
+            back_bad++;
+        sum = (sum ^ big[i]) * 16777619u;
+    }
+    for (i = 0; i < BIG; i += 4096)
+        if (tv_big[i + 17] != pattern(i + 17))
+            back_bad++;
+    kept = tlv_same(head_addr(), g_head0, sizeof g_head0) && *tail_addr() == 0xfeedfaceu &&
+           tv_tail == 0xfeedfaceu;
+    stable = big_addr() == big && head_addr() == head && tail_addr() == tail;
+    separate = apart((cb_uptr)big, BIG, (cb_uptr)head, sizeof tv_head) &&
+               apart((cb_uptr)big, BIG, (cb_uptr)tail, sizeof tv_tail) &&
+               apart((cb_uptr)head, sizeof tv_head, (cb_uptr)tail, sizeof tv_tail) &&
+               apart((cb_uptr)big, BIG, (cb_uptr)g_plain, BIG) &&
+               apart((cb_uptr)big, BIG, (cb_uptr)g_plain_data, sizeof g_plain_data);
+    for (i = 0; i < BIG; i++)
+        if (g_plain[i] != 0xa5)
+            plain_bad++;
+    for (i = 0; i < sizeof g_plain_data; i++)
+        if (g_plain_data[i] != (unsigned char)(g_plain0[i] ^ 0x5a))
+            plain_bad++;
+
+    CK(nonzero == 0 && direct_nonzero == 0);
+    CK(tail_zero);
+    CK(head_ok);
+    CK(back_bad == 0);
+    CK(kept);
+    CK(stable);
+    CK(separate);
+    CK(plain_bad == 0);
+    at_note(TAG, "checked");
+
+    cb_begin(TAG, m);
+    cb_field("bytes", BIG, 0);
+    cb_field("nonzero", nonzero, 0);
+    cb_field("sum", sum, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/tlv_layout.c" <<'EOC'
+#include "tlv_common.h"
+
+#define TAG "tlv_layout"
+#define NV 15
+
+struct small {
+    char c;
+    double d;
+    short s;
+};
+
+struct var {
+    cb_uptr at;
+    cb_size size;
+    cb_size align;
+};
+
+const char g_text[] = "thread-local pointer target";
+const char g_other[] = "another pointer target";
+
+__thread char tv_c = 'Q';
+__thread unsigned char tv_z1;
+__thread short tv_s = -12345;
+__thread int tv_i = 0x7a5b3c1d;
+__thread signed char tv_c2 = -7;
+__thread long long tv_ll = 0x0123456789abcdefLL;
+__thread short tv_z2[5];
+__thread double tv_d = 6.02214076e23;
+__thread float tv_f = -3.75f;
+__thread struct small tv_st = { 'z', -0.1875, 0x2bcd };
+__thread int tv_arr[7] = { 2, 3, 5, 7, 11, 13, 17 };
+__thread const char *tv_p = g_text;
+__thread double tv_z3;
+_Alignas(16) __thread unsigned char tv_a16[3] = { 0xa1, 0x16, 0x03 };
+__thread unsigned char tv_tail = 0xee;
+
+static struct var g_var[NV];
+
+TLV_NOINL void take_addresses(struct var *v)
+{
+    v[0] = (struct var){ (cb_uptr)&tv_c, sizeof tv_c, _Alignof(char) };
+    v[1] = (struct var){ (cb_uptr)&tv_z1, sizeof tv_z1, _Alignof(unsigned char) };
+    v[2] = (struct var){ (cb_uptr)&tv_s, sizeof tv_s, _Alignof(short) };
+    v[3] = (struct var){ (cb_uptr)&tv_i, sizeof tv_i, _Alignof(int) };
+    v[4] = (struct var){ (cb_uptr)&tv_c2, sizeof tv_c2, _Alignof(signed char) };
+    v[5] = (struct var){ (cb_uptr)&tv_ll, sizeof tv_ll, _Alignof(long long) };
+    v[6] = (struct var){ (cb_uptr)&tv_z2, sizeof tv_z2, _Alignof(short) };
+    v[7] = (struct var){ (cb_uptr)&tv_d, sizeof tv_d, _Alignof(double) };
+    v[8] = (struct var){ (cb_uptr)&tv_f, sizeof tv_f, _Alignof(float) };
+    v[9] = (struct var){ (cb_uptr)&tv_st, sizeof tv_st, _Alignof(struct small) };
+    v[10] = (struct var){ (cb_uptr)&tv_arr, sizeof tv_arr, _Alignof(int) };
+    v[11] = (struct var){ (cb_uptr)&tv_p, sizeof tv_p, _Alignof(const char *) };
+    v[12] = (struct var){ (cb_uptr)&tv_z3, sizeof tv_z3, _Alignof(double) };
+    v[13] = (struct var){ (cb_uptr)&tv_a16, sizeof tv_a16, 16 };
+    v[14] = (struct var){ (cb_uptr)&tv_tail, sizeof tv_tail, 1 };
+}
+
+TLV_NOINL void write_new(void)
+{
+    int k;
+
+    tv_c = 'r';
+    tv_z1 = 0x9b;
+    tv_s = 31000;
+    tv_i = -0x13572468;
+    tv_c2 = 99;
+    tv_ll = -0x0fedcba987654321LL;
+    for (k = 0; k < 5; k++)
+        tv_z2[k] = (short)(-1000 - k);
+    tv_d = -2.5e-10;
+    tv_f = 1024.5f;
+    tv_st.c = 'y';
+    tv_st.d = 12345.75;
+    tv_st.s = -0x1bcd;
+    for (k = 0; k < 7; k++)
+        tv_arr[k] = 1000 * (k + 1) + 1;
+    tv_p = g_other;
+    tv_z3 = 0.0078125;
+    tv_a16[0] = 0x5c;
+    tv_a16[1] = 0x6d;
+    tv_a16[2] = 0x7e;
+    tv_tail = 0x11;
+}
+
+TLV_NOINL int read_new(void)
+{
+    int k, ok = 1;
+
+    ok &= tv_c == 'r' && tv_z1 == 0x9b && tv_s == 31000 && tv_i == -0x13572468 && tv_c2 == 99;
+    ok &= tv_ll == -0x0fedcba987654321LL;
+    for (k = 0; k < 5; k++)
+        ok &= tv_z2[k] == (short)(-1000 - k);
+    ok &= tv_d == -2.5e-10 && tv_f == 1024.5f;
+    ok &= tv_st.c == 'y' && tv_st.d == 12345.75 && tv_st.s == -0x1bcd;
+    for (k = 0; k < 7; k++)
+        ok &= tv_arr[k] == 1000 * (k + 1) + 1;
+    ok &= tv_p == g_other && tv_z3 == 0.0078125;
+    ok &= tv_a16[0] == 0x5c && tv_a16[1] == 0x6d && tv_a16[2] == 0x7e && tv_tail == 0x11;
+    return ok;
+}
+
+int main(void)
+{
+    static const int primes[7] = { 2, 3, 5, 7, 11, 13, 17 };
+    unsigned m = 0, bit = 1, value = 17;
+    struct var again[NV];
+    cb_uptr lo = ~(cb_uptr)0, hi = 0;
+    int i, j, zeros = 1, arr = 1, aligned = 1, disjoint = 1, stable = 1;
+
+    at_note(TAG, "first touch");
+    take_addresses(g_var);
+    for (i = 0; i < 5; i++)
+        if (tv_z2[i] != 0)
+            zeros = 0;
+    if (tv_z1 != 0 || tv_z3 != 0.0)
+        zeros = 0;
+    for (i = 0; i < 7; i++)
+        if (tv_arr[i] != primes[i])
+            arr = 0;
+    CK(tv_c == 'Q');
+    CK(tv_s == -12345);
+    CK(tv_i == 0x7a5b3c1d);
+    CK(tv_c2 == -7);
+    CK(tv_ll == 0x0123456789abcdefLL);
+    CK(tv_d == 6.02214076e23);
+    CK(tv_f == -3.75f);
+    CK(tv_st.c == 'z' && tv_st.d == -0.1875 && tv_st.s == 0x2bcd);
+    CK(arr);
+    CK(tv_p == g_text && tv_p[0] == 't');
+    CK(tv_a16[0] == 0xa1 && tv_a16[1] == 0x16 && tv_a16[2] == 0x03);
+    CK(tv_tail == 0xee);
+    CK(zeros);
+
+    value = value * 31u + (unsigned)tv_c;
+    value = value * 31u + (unsigned)tv_s;
+    value = value * 31u + (unsigned)tv_i;
+    value = value * 31u + (unsigned)tv_c2;
+    value = value * 31u + (unsigned)(tv_ll >> 32);
+    value = value * 31u + (unsigned)tv_ll;
+    value = value * 31u + (unsigned)(int)(tv_d / 1e18);
+    value = value * 31u + (unsigned)(int)(tv_f * 4.0f);
+    value = value * 31u + (unsigned)tv_st.s;
+    for (i = 0; i < 7; i++)
+        value = value * 31u + (unsigned)tv_arr[i];
+    value = value * 31u + tv_a16[0] + tv_a16[1] + tv_a16[2] + tv_tail;
+
+    at_note(TAG, "checking addresses");
+    for (i = 0; i < NV; i++) {
+        if (g_var[i].at % g_var[i].align != 0)
+            aligned = 0;
+        if (g_var[i].at < lo)
+            lo = g_var[i].at;
+        if (g_var[i].at + g_var[i].size > hi)
+            hi = g_var[i].at + g_var[i].size;
+        for (j = 0; j < i; j++)
+            if (g_var[i].at < g_var[j].at + g_var[j].size && g_var[j].at < g_var[i].at + g_var[i].size)
+                disjoint = 0;
+    }
+    CK(aligned);
+    CK(disjoint && hi - lo <= 4096);
+
+    at_note(TAG, "writing every variable");
+    write_new();
+    CK(read_new());
+    take_addresses(again);
+    for (i = 0; i < NV; i++)
+        if (again[i].at != g_var[i].at)
+            stable = 0;
+    CK(stable);
+    at_note(TAG, "checked");
+
+    cb_begin(TAG, m);
+    cb_field("vars", NV, 0);
+    cb_field("value", value, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/tlv_threads.c" <<'EOC'
+#include "tlv_common.h"
+
+#define THREADS 6
+#define SEATS (THREADS + 1)
+#define BSS 8192
+#define TAG "tlv_threads"
+#define INT0 0x7157a11
+#define DBL0 3.140625
+#define NAME0 "tlv template"
+
+struct seat {
+    int *int_at;
+    double *dbl_at;
+    unsigned char *bss_at;
+    unsigned runs;
+    unsigned fresh_bad;
+    unsigned bss_bad;
+    unsigned own_bad;
+    unsigned kept_bad;
+    unsigned skew;
+    unsigned sum;
+};
+
+__thread int tv_int = INT0;
+__thread double tv_dbl = DBL0;
+__thread unsigned char tv_name[16] = NAME0;
+__thread unsigned char tv_bss[BSS];
+
+static const unsigned char g_name0[16] = NAME0;
+static struct seat g_seat[SEATS];
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+static unsigned g_ready, g_release, g_bad_arg, g_lock_err;
+
+static int want_int(unsigned k)
+{
+    return (int)(0x10000000u + k * 0x01010101u);
+}
+
+static double want_dbl(unsigned k)
+{
+    return -0.5 - 2.25 * (double)k;
+}
+
+static unsigned char want_byte(unsigned k, unsigned i)
+{
+    return (unsigned char)(k * 37u + i * 11u + 1u);
+}
+
+TLV_NOINL int *int_addr(void)
+{
+    return &tv_int;
+}
+
+TLV_NOINL double *dbl_addr(void)
+{
+    return &tv_dbl;
+}
+
+TLV_NOINL unsigned char *bss_addr(void)
+{
+    return tv_bss;
+}
+
+TLV_NOINL int fresh(void)
+{
+    return tv_int == INT0 && tv_dbl == DBL0 && tlv_same(tv_name, g_name0, sizeof g_name0);
+}
+
+TLV_NOINL void make_own(unsigned k)
+{
+    unsigned i;
+
+    tv_int = want_int(k);
+    tv_dbl = want_dbl(k);
+    for (i = 0; i < sizeof tv_name; i++)
+        tv_name[i] = want_byte(k, i);
+    for (i = 0; i < BSS; i++)
+        tv_bss[i] = want_byte(k, i + 16);
+}
+
+TLV_NOINL int still_own(unsigned k, struct seat *s)
+{
+    unsigned i;
+    int ok = int_addr() == s->int_at && dbl_addr() == s->dbl_at && bss_addr() == s->bss_at;
+
+    ok &= tv_int == want_int(k) && tv_dbl == want_dbl(k);
+    for (i = 0; i < sizeof tv_name; i++)
+        ok &= tv_name[i] == want_byte(k, i);
+    for (i = 0; i < BSS; i++)
+        ok &= s->bss_at[i] == want_byte(k, i + 16);
+    return ok;
+}
+
+static void enter(unsigned k, struct seat *s)
+{
+    s->runs++;
+    if (!fresh())
+        s->fresh_bad++;
+    s->bss_bad = tlv_nonzero(bss_addr(), BSS, 1);
+    s->int_at = int_addr();
+    s->dbl_at = dbl_addr();
+    s->bss_at = bss_addr();
+    make_own(k);
+    if (!still_own(k, s))
+        s->own_bad++;
+    s->sum = (unsigned)tv_int * 31u + (unsigned)tv_name[3] + s->bss_at[BSS - 1];
+}
+
+static void *start(void *arg)
+{
+    struct seat *s = arg;
+    unsigned k;
+
+    at_note(TAG, "thread entered");
+    if (!TH_IN(s, g_seat) || s == &g_seat[THREADS]) {
+        g_bad_arg++;
+        at_note(TAG, "thread leaving");
+        return 0;
+    }
+    k = (unsigned)(s - g_seat);
+    if (CB_SKEWED())
+        s->skew++;
+    enter(k, s);
+    if (pthread_mutex_lock(&g_lock) != 0)
+        g_lock_err++;
+    g_ready++;
+    if (pthread_cond_broadcast(&g_cond) != 0)
+        g_lock_err++;
+    while (!g_release)
+        if (pthread_cond_wait(&g_cond, &g_lock) != 0)
+            g_lock_err++;
+    if (pthread_mutex_unlock(&g_lock) != 0)
+        g_lock_err++;
+    if (!still_own(k, s))
+        s->kept_bad++;
+    at_note(TAG, "thread leaving");
+    return s;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, value = 17;
+    struct seat *main_seat = &g_seat[THREADS];
+    pthread_t tid[THREADS];
+    int ok_tid[THREADS];
+    void *ret;
+    int i, j, created = 1, joined = 1, results = 1, runs = 1, fresh_ok = 1, bss_ok = 1;
+    int own_ok = 1, kept_ok = 1, distinct = 1, skew = 0;
+
+    at_note(TAG, "first touch");
+    enter(THREADS, main_seat);
+    for (i = 0; i < THREADS; i++) {
+        at_note(TAG, "calling pthread_create");
+        ok_tid[i] = pthread_create(&tid[i], 0, start, &g_seat[i]) == 0;
+        at_note(TAG, "returned from pthread_create");
+        if (!ok_tid[i]) {
+            created = 0;
+            continue;
+        }
+        if (pthread_mutex_lock(&g_lock) != 0)
+            g_lock_err++;
+        at_note(TAG, "waiting");
+        while (g_ready < (unsigned)i + 1u)
+            if (pthread_cond_wait(&g_cond, &g_lock) != 0)
+                g_lock_err++;
+        at_note(TAG, "wait returned");
+        if (pthread_mutex_unlock(&g_lock) != 0)
+            g_lock_err++;
+    }
+    if (pthread_mutex_lock(&g_lock) != 0)
+        g_lock_err++;
+    g_release = 1;
+    if (pthread_cond_broadcast(&g_cond) != 0)
+        g_lock_err++;
+    if (pthread_mutex_unlock(&g_lock) != 0)
+        g_lock_err++;
+    for (i = 0; i < THREADS; i++) {
+        ret = 0;
+        if (ok_tid[i]) {
+            at_note(TAG, "calling pthread_join");
+            if (pthread_join(tid[i], &ret) != 0)
+                joined = 0;
+            at_note(TAG, "returned from pthread_join");
+        }
+        if (ret != &g_seat[i])
+            results = 0;
+    }
+    for (i = 0; i < SEATS; i++) {
+        if (g_seat[i].runs != 1)
+            runs = 0;
+        if (i < THREADS && g_seat[i].fresh_bad)
+            fresh_ok = 0;
+        if (i < THREADS && g_seat[i].bss_bad)
+            bss_ok = 0;
+        if (g_seat[i].own_bad)
+            own_ok = 0;
+        if (g_seat[i].kept_bad)
+            kept_ok = 0;
+        if (g_seat[i].skew)
+            skew = 1;
+        for (j = 0; j < i; j++)
+            if (g_seat[i].int_at == g_seat[j].int_at || g_seat[i].dbl_at == g_seat[j].dbl_at ||
+                g_seat[i].bss_at == g_seat[j].bss_at)
+                distinct = 0;
+        value = value * 31u + g_seat[i].sum;
+    }
+
+    CK(created && joined && results && runs && g_bad_arg == 0);
+    CK(main_seat->fresh_bad == 0 && main_seat->bss_bad == 0);
+    CK(fresh_ok);
+    CK(bss_ok);
+    CK(own_ok);
+    CK(kept_ok);
+    CK(distinct);
+    CK(still_own(THREADS, main_seat));
+    CK(g_lock_err == 0);
+    CK(!skew);
+
+    cb_begin(TAG, m);
+    cb_field("threads", THREADS, 0);
+    cb_field("value", value, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/tlv_thread_churn.c" <<EOC
+#include "tlv_common.h"
+
+#define THREADS ${TLV_CHURN_THREADS}
+#define MAX_THREADS 1024
+#define BIG ${TLV_CHURN_BLOCK}u
+#define PAGE 4096u
+#define TAG "tlv_thread_churn"
+#define SEQ0 0xc4012e5u
+#define DBL0 0.0625
+#define DATA0 "churn template bytes, 32 long.."
+
+struct run {
+    unsigned runs;
+    unsigned fresh_bad;
+    unsigned zero_bad;
+    unsigned own_bad;
+    unsigned skew;
+    unsigned sum;
+};
+
+__thread unsigned tv_seq = SEQ0;
+__thread double tv_dbl = DBL0;
+__thread unsigned char tv_data[32] = DATA0;
+__thread unsigned char tv_big[BIG];
+
+static const unsigned char g_data0[32] = DATA0;
+static struct run g_run[MAX_THREADS + 1];
+static unsigned g_bad_arg;
+
+static unsigned count_arg(int argc, char **argv)
+{
+    unsigned n = 0;
+    const char *s;
+
+    if (argc < 2)
+        return THREADS;
+    for (s = argv[1]; *s >= '0' && *s <= '9' && n <= MAX_THREADS; s++)
+        n = n * 10u + (unsigned)(*s - '0');
+    return (n == 0 || n > MAX_THREADS || *s != 0) ? THREADS : n;
+}
+
+static unsigned char mark(unsigned k, unsigned page)
+{
+    return (unsigned char)((k * 13u + page) | 1u);
+}
+
+TLV_NOINL unsigned char *big_addr(void)
+{
+    return tv_big;
+}
+
+TLV_NOINL int fresh(void)
+{
+    return tv_seq == SEQ0 && tv_dbl == DBL0 && tlv_same(tv_data, g_data0, sizeof g_data0);
+}
+
+TLV_NOINL void make_own(unsigned k)
+{
+    unsigned char *big = big_addr();
+    unsigned i;
+
+    tv_seq = SEQ0 ^ (k * 0x9e3779b9u);
+    tv_dbl = (double)k + 0.25;
+    for (i = 0; i < sizeof tv_data; i++)
+        tv_data[i] = (unsigned char)(k + i);
+    for (i = 0; i < BIG; i += PAGE)
+        big[i] = mark(k, i / PAGE);
+    big[BIG - 1] = mark(k, BIG / PAGE);
+}
+
+TLV_NOINL int still_own(unsigned k, unsigned char *at)
+{
+    unsigned char *big = big_addr();
+    unsigned i;
+    int ok = big == at && tv_seq == (SEQ0 ^ (k * 0x9e3779b9u)) && tv_dbl == (double)k + 0.25;
+
+    for (i = 0; i < sizeof tv_data; i++)
+        ok &= tv_data[i] == (unsigned char)(k + i);
+    for (i = 0; i < BIG; i += PAGE)
+        ok &= big[i] == mark(k, i / PAGE);
+    ok &= big[BIG - 1] == mark(k, BIG / PAGE);
+    return ok;
+}
+
+static void touch(unsigned k, struct run *r)
+{
+    unsigned char *at;
+
+    r->runs++;
+    if (!fresh())
+        r->fresh_bad++;
+    at = big_addr();
+    r->zero_bad = tlv_nonzero(at, BIG, PAGE);
+    make_own(k);
+    if (!still_own(k, at))
+        r->own_bad++;
+    r->sum = tv_seq * 31u + (unsigned)tv_data[k % 32u] + tv_big[(k * PAGE) % BIG];
+}
+
+static void *start(void *arg)
+{
+    struct run *r = arg;
+
+    at_note(TAG, "thread entered");
+    if ((cb_uptr)r - (cb_uptr)g_run >= MAX_THREADS * sizeof g_run[0] ||
+        ((cb_uptr)r - (cb_uptr)g_run) % sizeof g_run[0] != 0) {
+        g_bad_arg++;
+        at_note(TAG, "thread leaving");
+        return 0;
+    }
+    if (CB_SKEWED())
+        r->skew++;
+    touch((unsigned)(r - g_run), r);
+    at_note(TAG, "thread leaving");
+    return r;
+}
+
+int main(int argc, char **argv)
+{
+    unsigned m = 0, bit = 1, value = 17, n = count_arg(argc, argv), k;
+    unsigned fresh_bad = 0, zero_bad = 0, own_bad = 0;
+    struct run *mine = &g_run[MAX_THREADS];
+    unsigned char *main_at;
+    pthread_t t;
+    void *ret;
+    int created = 1, joined = 1, results = 1, runs = 1, skew = 0;
+
+    at_note(TAG, "first touch");
+    touch(MAX_THREADS, mine);
+    main_at = big_addr();
+    for (k = 0; k < n; k++) {
+        at_note(TAG, "calling pthread_create");
+        if (pthread_create(&t, 0, start, &g_run[k]) != 0) {
+            at_note(TAG, "returned from pthread_create");
+            created = 0;
+            break;
+        }
+        at_note(TAG, "returned from pthread_create");
+        ret = 0;
+        at_note(TAG, "calling pthread_join");
+        if (pthread_join(t, &ret) != 0)
+            joined = 0;
+        at_note(TAG, "returned from pthread_join");
+        if (ret != &g_run[k])
+            results = 0;
+        if (g_run[k].runs != 1)
+            runs = 0;
+        if (g_run[k].fresh_bad)
+            fresh_bad++;
+        if (g_run[k].zero_bad)
+            zero_bad++;
+        if (g_run[k].own_bad)
+            own_bad++;
+        if (g_run[k].skew)
+            skew = 1;
+        value = value * 31u + g_run[k].sum;
+    }
+
+    CK(created && joined && results && runs && g_bad_arg == 0);
+    CK(mine->fresh_bad == 0 && mine->zero_bad == 0 && mine->own_bad == 0);
+    CK(fresh_bad == 0);
+    CK(zero_bad == 0);
+    CK(own_bad == 0);
+    CK(still_own(MAX_THREADS, main_at));
+    CK(!skew);
+
+    cb_begin(TAG, m);
+    cb_field("threads", n, 0);
+    cb_field("stale", fresh_bad, 0);
+    cb_field("value", value, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/tlvdep.c" <<'EOC'
+typedef __SIZE_TYPE__ dep_size;
+
+long write(int, const void *, dep_size);
+
+#define DEP_BSS 4096
+
+__thread int tlvdep_counter = 0x0d11b0a7;
+__thread double tlvdep_scale = 0.75;
+__thread unsigned char tlvdep_bss[DEP_BSS];
+
+int *tlvdep_counter_addr(void)
+{
+    return &tlvdep_counter;
+}
+
+double *tlvdep_scale_addr(void)
+{
+    return &tlvdep_scale;
+}
+
+int tlvdep_counter_get(void)
+{
+    return tlvdep_counter;
+}
+
+int tlvdep_bump(int by)
+{
+    tlvdep_counter += by;
+    tlvdep_scale *= 2.0;
+    return tlvdep_counter;
+}
+
+unsigned tlvdep_bss_nonzero(void)
+{
+    unsigned n = 0;
+    int i;
+
+    for (i = 0; i < DEP_BSS; i++)
+        if (tlvdep_bss[i] != 0)
+            n++;
+    return n;
+}
+
+void tlvdep_bss_fill(unsigned char v)
+{
+    int i;
+
+    for (i = 0; i < DEP_BSS; i++)
+        tlvdep_bss[i] = (unsigned char)(v + i);
+}
+
+int tlvdep_bss_holds(unsigned char v)
+{
+    int i;
+
+    for (i = 0; i < DEP_BSS; i++)
+        if (tlvdep_bss[i] != (unsigned char)(v + i))
+            return 0;
+    return 1;
+}
+
+void tlvdep_note(const char *what)
+{
+    char b[64];
+    dep_size n = 0;
+
+    for (; n < 8; n++)
+        b[n] = "tlvdep: "[n];
+    while (*what && n < sizeof b - 1)
+        b[n++] = *what++;
+    b[n++] = '\n';
+    write(2, b, n);
+}
+EOC
+
+    cat > "$TMP/tlv_dylib.c" <<'EOC'
+#include "tlv_common.h"
+
+#define THREADS 4
+#define SEATS (THREADS + 1)
+#define TAG "tlv_dylib"
+#define DEP0 0x0d11b0a7
+#define MAIN0 0x3a1a3a1a
+
+extern __thread int tlvdep_counter;
+int *tlvdep_counter_addr(void);
+double *tlvdep_scale_addr(void);
+int tlvdep_counter_get(void);
+int tlvdep_bump(int);
+unsigned tlvdep_bss_nonzero(void);
+void tlvdep_bss_fill(unsigned char);
+int tlvdep_bss_holds(unsigned char);
+void tlvdep_note(const char *);
+
+struct seat {
+    int *dep_at;
+    int *main_at;
+    unsigned runs;
+    unsigned fresh_bad;
+    unsigned bss_bad;
+    unsigned cross_bad;
+    unsigned apart_bad;
+    unsigned own_bad;
+    unsigned kept_bad;
+    unsigned skew;
+    unsigned sum;
+};
+
+__thread int tv_main = MAIN0;
+
+static struct seat g_seat[SEATS];
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+static unsigned g_ready, g_release, g_bad_arg, g_lock_err;
+
+static int dep_want(unsigned k)
+{
+    return DEP0 + 100 * (int)k + 7;
+}
+
+static int main_want(unsigned k)
+{
+    return (int)(0x60000000u + k * 0x00110011u);
+}
+
+TLV_NOINL int *main_addr(void)
+{
+    return &tv_main;
+}
+
+TLV_NOINL int *dep_addr_here(void)
+{
+    return &tlvdep_counter;
+}
+
+static int own(unsigned k, struct seat *s)
+{
+    return tlvdep_counter_addr() == s->dep_at && dep_addr_here() == s->dep_at &&
+           main_addr() == s->main_at && tlvdep_counter_get() == dep_want(k) &&
+           tlvdep_counter == dep_want(k) && *tlvdep_scale_addr() == 1.5 &&
+           tv_main == main_want(k) && tlvdep_bss_holds((unsigned char)(k * 29u + 3u));
+}
+
+static void enter(unsigned k, struct seat *s)
+{
+    s->runs++;
+    s->dep_at = tlvdep_counter_addr();
+    s->main_at = main_addr();
+    if (tlvdep_counter_get() != DEP0 || *tlvdep_scale_addr() != 0.75 || tv_main != MAIN0)
+        s->fresh_bad++;
+    s->bss_bad = tlvdep_bss_nonzero();
+    if (dep_addr_here() != s->dep_at || tlvdep_counter != DEP0)
+        s->cross_bad++;
+    if ((cb_uptr)s->dep_at == (cb_uptr)s->main_at)
+        s->apart_bad++;
+    tv_main = main_want(k);
+    if (tlvdep_bump(100 * (int)k + 7) != dep_want(k) || tv_main != main_want(k))
+        s->apart_bad++;
+    tlvdep_bss_fill((unsigned char)(k * 29u + 3u));
+    if (!own(k, s))
+        s->own_bad++;
+    s->sum = (unsigned)tlvdep_counter * 31u + (unsigned)tv_main;
+}
+
+static void *start(void *arg)
+{
+    struct seat *s = arg;
+    unsigned k;
+
+    at_note(TAG, "thread entered");
+    if (!TH_IN(s, g_seat) || s == &g_seat[THREADS]) {
+        g_bad_arg++;
+        at_note(TAG, "thread leaving");
+        return 0;
+    }
+    k = (unsigned)(s - g_seat);
+    if (CB_SKEWED())
+        s->skew++;
+    enter(k, s);
+    if (pthread_mutex_lock(&g_lock) != 0)
+        g_lock_err++;
+    g_ready++;
+    if (pthread_cond_broadcast(&g_cond) != 0)
+        g_lock_err++;
+    while (!g_release)
+        if (pthread_cond_wait(&g_cond, &g_lock) != 0)
+            g_lock_err++;
+    if (pthread_mutex_unlock(&g_lock) != 0)
+        g_lock_err++;
+    if (!own(k, s))
+        s->kept_bad++;
+    at_note(TAG, "thread leaving");
+    return s;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, value = 17;
+    struct seat *main_seat = &g_seat[THREADS];
+    pthread_t tid[THREADS];
+    int ok_tid[THREADS];
+    void *ret;
+    int i, j, created = 1, joined = 1, results = 1, runs = 1, fresh_ok = 1, bss_ok = 1;
+    int cross_ok = 1, apart_ok = 1, own_ok = 1, kept_ok = 1, distinct = 1, skew = 0;
+
+    tlvdep_note("dylib code reached");
+    at_note(TAG, "first touch");
+    enter(THREADS, main_seat);
+    for (i = 0; i < THREADS; i++) {
+        at_note(TAG, "calling pthread_create");
+        ok_tid[i] = pthread_create(&tid[i], 0, start, &g_seat[i]) == 0;
+        at_note(TAG, "returned from pthread_create");
+        if (!ok_tid[i]) {
+            created = 0;
+            continue;
+        }
+        if (pthread_mutex_lock(&g_lock) != 0)
+            g_lock_err++;
+        at_note(TAG, "waiting");
+        while (g_ready < (unsigned)i + 1u)
+            if (pthread_cond_wait(&g_cond, &g_lock) != 0)
+                g_lock_err++;
+        at_note(TAG, "wait returned");
+        if (pthread_mutex_unlock(&g_lock) != 0)
+            g_lock_err++;
+    }
+    if (pthread_mutex_lock(&g_lock) != 0)
+        g_lock_err++;
+    g_release = 1;
+    if (pthread_cond_broadcast(&g_cond) != 0)
+        g_lock_err++;
+    if (pthread_mutex_unlock(&g_lock) != 0)
+        g_lock_err++;
+    for (i = 0; i < THREADS; i++) {
+        ret = 0;
+        if (ok_tid[i]) {
+            at_note(TAG, "calling pthread_join");
+            if (pthread_join(tid[i], &ret) != 0)
+                joined = 0;
+            at_note(TAG, "returned from pthread_join");
+        }
+        if (ret != &g_seat[i])
+            results = 0;
+    }
+    for (i = 0; i < SEATS; i++) {
+        if (g_seat[i].runs != 1)
+            runs = 0;
+        if (i < THREADS && g_seat[i].fresh_bad)
+            fresh_ok = 0;
+        if (i < THREADS && g_seat[i].bss_bad)
+            bss_ok = 0;
+        if (g_seat[i].cross_bad)
+            cross_ok = 0;
+        if (g_seat[i].apart_bad)
+            apart_ok = 0;
+        if (g_seat[i].own_bad)
+            own_ok = 0;
+        if (g_seat[i].kept_bad)
+            kept_ok = 0;
+        if (g_seat[i].skew)
+            skew = 1;
+        for (j = 0; j < i; j++)
+            if (g_seat[i].dep_at == g_seat[j].dep_at || g_seat[i].main_at == g_seat[j].main_at)
+                distinct = 0;
+        value = value * 31u + g_seat[i].sum;
+    }
+
+    CK(created && joined && results && runs && g_bad_arg == 0);
+    CK(main_seat->fresh_bad == 0 && main_seat->bss_bad == 0);
+    CK(fresh_ok);
+    CK(bss_ok);
+    CK(cross_ok);
+    CK(apart_ok);
+    CK(own_ok);
+    CK(kept_ok);
+    CK(distinct);
+    CK(own(THREADS, main_seat));
+    CK(g_lock_err == 0);
+    CK(!skew);
+
+    cb_begin(TAG, m);
+    cb_field("threads", THREADS, 0);
+    cb_field("value", value, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    for name in tlv_main tlv_bss tlv_layout tlv_threads tlv_thread_churn; do
+        clang -arch x86_64 -std=c11 -O1 -fno-builtin \
+                -o "$TMP/$name" "$TMP/$name.c" >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            tlv_main) TLV_MAIN_BIN="$TMP/$name" ;;
+            tlv_bss) TLV_BSS_BIN="$TMP/$name" ;;
+            tlv_layout) TLV_LAYOUT_BIN="$TMP/$name" ;;
+            tlv_threads) TLV_THREADS_BIN="$TMP/$name" ;;
+            tlv_thread_churn) TLV_CHURN_BIN="$TMP/$name" ;;
+        esac
+    done
+    if clang -arch x86_64 -std=c11 -O1 -fno-builtin -dynamiclib \
+            -install_name "@executable_path/$TLV_DEP_NAME" \
+            -o "$TMP/$TLV_DEP_NAME" "$TMP/tlvdep.c" >"$TMP/tlv_dylib.cc.log" 2>&1 &&
+       clang -arch x86_64 -std=c11 -O1 -fno-builtin \
+            -o "$TMP/tlv_dylib" "$TMP/tlv_dylib.c" "$TMP/$TLV_DEP_NAME" >>"$TMP/tlv_dylib.cc.log" 2>&1; then
+        TLV_DYLIB_BIN="$TMP/tlv_dylib"
+        TLV_DYLIB_LIB="$TMP/$TLV_DEP_NAME"
+    fi
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -3338,6 +4611,221 @@ case_thread_guest_fault() {
     record "$name" "$reason" "exit=$rc_jit no-jit exit=$rc_nojit"
 }
 
+tlv_import_reason() {
+    local bin="$1" lib="${2:-}" imports allowed sym stray=""
+    imports="$(nm -u "$bin" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+    if [ -z "$imports" ]; then
+        return
+    fi
+    allowed=" $TLV_BRIDGED $TLV_BOOTSTRAP_SYM $STACK_GUARD_SYM "
+    if [ -n "$lib" ]; then
+        allowed="$allowed$(nm -gU "$lib" 2>/dev/null | awk '{print $3}' | tr '\n' ' ')"
+    fi
+    for sym in $imports; do
+        case "$allowed" in
+            *" $sym "*) ;;
+            *) stray="$stray $sym" ;;
+        esac
+    done
+    case " $imports" in
+        *" $TLV_BOOTSTRAP_SYM "*) ;;
+        *)
+            echo "$(basename "$bin") imports '${imports% }' and not $TLV_BOOTSTRAP_SYM, so its thread-local variables were not compiled as descriptors bound to that thunk and the case proves nothing about them"
+            return ;;
+    esac
+    case " $imports" in
+        *" $STACK_GUARD_SYM "*) ;;
+        *)
+            echo "$(basename "$bin") imports '${imports% }' and not $STACK_GUARD_SYM, so the stack protector was not emitted and the fixture no longer binds the data export every real program imports beside its thread-local variables"
+            return ;;
+    esac
+    if [ -n "$stray" ]; then
+        echo "$(basename "$bin") imports$stray, which the bridge does not implement, so a failure would be about those imports and not about thread-local variables"
+    fi
+}
+
+tlv_run_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" reason
+    reason="$(native_run_reason "$rc" "$out" "$err")"
+    if [ -z "$reason" ]; then
+        echo ""
+    elif grep -Fq "$NOBIND$TLV_BOOTSTRAP_SYM " "$out" "$err" 2>/dev/null; then
+        echo "$reason: the virtual libSystem does not export $TLV_BOOTSTRAP_SYM, the thunk every thread-local descriptor is bound to, so the program never ran"
+    elif grep -Fq "${NOBIND}_tlvdep_" "$out" "$err" 2>/dev/null; then
+        echo "$reason: nothing bound from $TLV_DEP_NAME, so the loader never found the dylib the fixture links against, installed as @executable_path/$TLV_DEP_NAME beside it, and no thread-local variable was reached"
+    elif grep -Fq "$NOBIND$STACK_GUARD_SYM " "$out" "$err" 2>/dev/null; then
+        echo "$reason$(thread_guard_hint "$out" "$err")"
+    elif grep -Fq "$TLV_UNRESOLVED" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hF "$TLV_UNRESOLVED" "$out" "$err" | head -1 | cut -c1-160): ocerz could not answer the thunk for that descriptor, which is how a descriptor the loader never registered looks"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1 | cut -c1-120)"
+    elif grep -Fq "$GUEST_CRASH" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hF "$GUEST_CRASH" "$out" "$err" | head -1 | cut -c1-120)"
+    elif grep -Fq "$ATTACH_REFUSED" "$out" "$err" 2>/dev/null; then
+        echo "$reason; a start routine was refused rather than given a personality: $(grep -hF "$ATTACH_REFUSED" "$out" "$err" | head -1 | cut -c1-240)"
+    elif [ "$rc" -eq 124 ] && grep -q "^$tag: calling pthread_create$" "$err" 2>/dev/null; then
+        echo "$reason; $(thread_stall "$tag" "$err")"
+    elif [ "$rc" -eq 124 ]; then
+        echo "$reason: still running after ${NATIVE_TIMEOUT}s, and the last progress note was '$(grep -h "^$tag: " "$err" 2>/dev/null | tail -1)'"
+    else
+        echo "$reason"
+    fi
+}
+
+tlv_engines_reason() {
+    local rc_jit="$1" rc_nojit="$2" tag="$3" bits="$4" jo="$5" je="$6" no="$7" ne="$8" reason line
+    line="$(head -1 "$jo")"
+    reason="$(tlv_run_reason "$rc_jit" "$tag" "$jo" "$je")"
+    if grep -q "^$tag bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed, where $bits"
+    elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+        reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+    fi
+    if [ -z "$reason" ]; then
+        reason="$(tlv_run_reason "$rc_nojit" "$tag" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(head -1 "$no")': the guest's own checks failed, where $bits"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    echo "$reason"
+}
+
+tlv_cache_reason() {
+    local tag="$1" jo="$2" co="$3" ce="$4" rc
+    shift 4
+    run_bounded "$co" "$ce" "$OCERZ" -cache "$@"
+    rc=$?
+    if [ "$rc" -eq 124 ] && grep -q "^$tag: calling pthread_create$" "$ce" 2>/dev/null; then
+        echo "cache mode still running after ${NATIVE_TIMEOUT}s, which crosses no bridge: $(thread_stall "$tag" "$ce" cache)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "cache mode still running after ${NATIVE_TIMEOUT}s, which crosses no bridge"
+    elif [ "$rc" -ne 0 ]; then
+        echo "cache-mode exit $rc, want 0: '$(head -1 "$co")'"
+    elif ! cmp -s "$jo" "$co"; then
+        echo "native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': the blocks ocerz hands out gave the guest something the real tlv_get_addr did not"
+    fi
+}
+
+case_tlv() {
+    local name="$1" bin="$2" tag="$3" bits="$4" lib="${5:-}"
+    local reason="" rc_jit rc_nojit line cache_note=""
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$TLV_TIMEOUT
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin"
+    rc_nojit=$?
+    line="$(head -1 "$jo")"
+
+    reason="$(tlv_import_reason "$bin" "$lib")"
+    if [ -z "$reason" ] && [ -n "$lib" ]; then
+        reason="$(tlv_import_reason "$lib")"
+    fi
+    if [ -z "$reason" ]; then
+        reason="$(tlv_engines_reason "$rc_jit" "$rc_nojit" "$tag" "$bits" "$jo" "$je" "$no" "$ne")"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        reason="$(tlv_cache_reason "$tag" "$jo" "$co" "$ce" "$bin")"
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
+}
+
+tlv_measured() {
+    local out="$1" err="$2" rc
+    shift 2
+    if [ ! -x "$MEASURE_BIN" ]; then
+        run_bounded "$out" "$err" "$@"
+        return $?
+    fi
+    run_bounded "$out" "$err" "$MEASURE_BIN" -l "$@"
+    rc=$?
+    if [ "$rc" -eq 124 ]; then
+        pkill -KILL -f "$TLV_CHURN_BIN" 2>/dev/null
+    fi
+    return $rc
+}
+
+tlv_footprint() {
+    awk '/ peak memory footprint$/ { print $1; found = 1; exit }
+         / maximum resident set size$/ && rss == "" { rss = $1 }
+         END { if (!found && rss != "") print rss }' "$1" 2>/dev/null
+}
+
+case_tlv_churn() {
+    local name=tlv_thread_churn tag=tlv_thread_churn bits="$1"
+    local reason="" rc_jit rc_nojit rc_base line t0 secs_jit secs_nojit foot foot_base grew limit
+    local cache_note="" mem_note=""
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local bo="$TMP/$name.base.out" be="$TMP/$name.base.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$TLV_TIMEOUT
+
+    if callback_fixture_missing "$name" "$TLV_CHURN_BIN"; then
+        return
+    fi
+    t0=$SECONDS
+    tlv_measured "$jo" "$je" "$OCERZ" -v -native "$TLV_CHURN_BIN" "$TLV_CHURN_THREADS"
+    rc_jit=$?
+    secs_jit=$((SECONDS - t0))
+    t0=$SECONDS
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$TLV_CHURN_BIN" "$TLV_CHURN_THREADS"
+    rc_nojit=$?
+    secs_nojit=$((SECONDS - t0))
+    line="$(head -1 "$jo")"
+
+    reason="$(tlv_import_reason "$TLV_CHURN_BIN")"
+    if [ -z "$reason" ]; then
+        reason="$(tlv_engines_reason "$rc_jit" "$rc_nojit" "$tag" "$bits" "$jo" "$je" "$no" "$ne")"
+    fi
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$secs_jit" -gt "$TLV_CHURN_BUDGET" ] || [ "$secs_nojit" -gt "$TLV_CHURN_BUDGET" ]; then
+        reason="$TLV_CHURN_THREADS threads took ${secs_jit}s under the JIT and ${secs_nojit}s under -no-jit, over the ${TLV_CHURN_BUDGET}s budget that is half the run's ${TLV_TIMEOUT}s bound: a cost that grows with every thread created, such as blocks never freed or a table searched from the start of the process, looks like this before it looks like a timeout"
+    else
+        tlv_measured "$bo" "$be" "$OCERZ" -v -native "$TLV_CHURN_BIN" "$TLV_CHURN_BASE"
+        rc_base=$?
+        foot="$(tlv_footprint "$je")"
+        foot_base="$(tlv_footprint "$be")"
+        if [ "$rc_base" -ne 0 ] || ! grep -q "^$tag ok" "$bo"; then
+            reason="the $TLV_CHURN_BASE-thread run the footprint is measured against did not pass: exit $rc_base, '$(head -1 "$bo")'"
+        elif [ -z "$foot" ] || [ -z "$foot_base" ]; then
+            mem_note=" footprint=unmeasured"
+        else
+            grew=$((foot - foot_base))
+            limit=$(((TLV_CHURN_THREADS - TLV_CHURN_BASE) * TLV_CHURN_BLOCK / 4))
+            mem_note=" footprint=$((grew / 1048576))MB"
+            if [ "$grew" -gt "$limit" ]; then
+                reason="peak memory footprint $((foot / 1048576)) MB with $TLV_CHURN_THREADS threads against $((foot_base / 1048576)) MB with $TLV_CHURN_BASE, $((grew / 1048576)) MB more where $((limit / 1048576)) MB is allowed: more than a quarter of a $((TLV_CHURN_BLOCK / 1048576)) MB thread-local block is kept for every thread that has gone away, so a thread's blocks are not freed when it exits"
+            fi
+        fi
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        reason="$(tlv_cache_reason "$tag" "$jo" "$co" "$ce" "$TLV_CHURN_BIN" "$TLV_CHURN_THREADS")"
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line' secs=$secs_jit/$secs_nojit$mem_note$cache_note"
+}
+
 case_env_native() {
     local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
@@ -3494,6 +4982,7 @@ build_fixtures
 build_callback_fixtures
 build_attach_fixtures
 build_thread_fixtures
+build_tlv_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -3547,6 +5036,19 @@ case_thread thread_cond "$TH_COND_BIN" thread_cond \
 case_thread thread_bridged_work "$TH_WORK_BIN" thread_bridged_work \
     "bit 0 is a pthread_create or pthread_join failing, a thread not run exactly once or a thread's argument or result not its own, 1 bridged strlen or memcpy giving a wrong length or wrong bytes on a thread, 2 malloc failing or heap memory not reading back on a thread, 3 qsort on a thread leaving elements out of order or not the thread's own, 4 a comparator that never ran or one handed an element no thread owns, 5 a comparator run on a thread other than the one that called qsort or handed another thread's element, 6 a thread's checksum differing from the one the main thread computes without bridged calls, 7 a start routine or comparator entered on a misaligned stack"
 case_thread_guest_fault
+case_tlv tlv_main "$TLV_MAIN_BIN" tlv_main \
+    "bit 0 is the int's first read not its initializer, 1 the double's first read not its initializer, 2 an address differing between accesses, whether taken in main or returned from another function, 3 the int not holding what the calls added to it, read in main or through another function, 4 the same for the double, 5 a write through the address or made directly in main not seen the other way, 6 a thread-local access inside a function disturbing one of its six 64-bit argument registers or losing the increment it made, 7 the two variables sharing an address or off their alignment"
+case_tlv tlv_bss "$TLV_BSS_BIN" tlv_bss \
+    "bit 0 is a byte of the 1 MB array with no initializer reading non-zero on first touch, which nonzero= counts, 1 a second variable with no initializer reading non-zero on first touch, 2 the initialized array before them not holding its initializer, 3 a byte of the 1 MB array not reading back what was written, 4 writing the 1 MB array changing the initialized array or the second variable, 5 an address changing between accesses, 6 the thread-local variables overlapping each other or ordinary globals, 7 an ordinary global written before the first touch not reading back what was written"
+case_tlv tlv_layout "$TLV_LAYOUT_BIN" tlv_layout \
+    "bits 0 to 11 are the initializers of the char, short, int, signed char, long long, double, float, struct, int array, pointer, 16-byte-aligned array and trailing char, in that order, where a pointer not pointing at its string means the rebase inside __thread_data was lost, 12 a variable with no initializer reading non-zero, 13 a variable off its type's alignment, 14 two variables overlapping or all of them spanning more than a page, 15 a variable not reading back the new value written to it after every variable was written, so two of them share storage, 16 an address changing between accesses"
+case_tlv tlv_threads "$TLV_THREADS_BIN" tlv_threads \
+    "bit 0 is a pthread_create or pthread_join failing, a thread not run exactly once or handed another thread's argument, 1 the main thread's own first read not the initializers or its thread-local array not zero, 2 a thread's first read not the initializers, so it saw the main thread's or an earlier thread's values, 3 a thread's thread-local array not zero on first touch, 4 a thread, the main thread among them, not reading back the values it just wrote or seeing an address change, 5 a thread's values changing while it waited and the others wrote theirs, 6 two of the seven threads alive at once sharing the address of a thread-local variable, 7 the main thread's values changed by the threads, 8 a lock, unlock, wait or broadcast returning non-zero, 9 a start routine entered on a misaligned stack"
+case_tlv_churn \
+    "bit 0 is a pthread_create or pthread_join failing, a thread not run exactly once or handed another thread's argument, 1 the main thread's own first touch or read-back failing, 2 a thread starting from anything but the initializers, which stale= counts and which is a block reused without being initialized again or a table left behind by a thread that went away, 3 a thread's 2 MB thread-local array not zero where the thread before it marked it, 4 a thread not reading back its own values and page marks, 5 the main thread's values changed by the threads, 6 a start routine entered on a misaligned stack"
+case_tlv tlv_dylib "$TLV_DYLIB_BIN" tlv_dylib \
+    "bit 0 is a pthread_create or pthread_join failing, a thread not run exactly once or handed another thread's argument, 1 the main thread's first read of the dylib's variables or the main image's not the initializers or the dylib's thread-local array not zero, 2 a thread's first read of them not the initializers, 3 a thread's copy of the dylib's array not zero, 4 the main image reaching the dylib's int through its thread-local import at an address other than the one the dylib's accessor returns, or reading another value there, 5 the dylib's int and the main image's sharing an address or a write to one showing in the other, so the two images share a block, 6 a thread not reading back its own values in both images, 7 a thread's values changing while the others wrote theirs, 8 two threads alive at once sharing an address in either image, 9 the main thread's values changed by the threads, 10 a lock, unlock, wait or broadcast returning non-zero, 11 a start routine entered on a misaligned stack" \
+    "$TLV_DYLIB_LIB"
 case_env_native
 case_flag_beats_env
 case_last_flag_native

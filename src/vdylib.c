@@ -149,6 +149,17 @@
  * program that calls memcpy a million times.  A lookup that comes back empty is
  * remembered as empty for the same reason, so a name the bridge has already
  * said it does not have is never searched for twice.
+ *
+ * ---- the one stub that keeps r11 ----
+ * An ordinary export's stub loads its id into r11, which is free to do: r11 is
+ * a scratch register in the System V ABI and every linker stub on the platform
+ * clobbers it.  __tlv_bootstrap is not an ordinary function.  It is the thunk a
+ * thread-local variable's descriptor calls, and that calling convention keeps
+ * every register but rax, so clang does hold live values in r11 across a
+ * thread-local access; a program that loaded one thread-local into r11 and then
+ * touched another read back garbage.  Its stub therefore pushes r11 before
+ * loading the id, which still fits the sixteen-byte stride, and the bridge puts
+ * r11 back from the stack before it returns.
  */
 #include "ocerz/vdylib.h"
 #include "ocerz/bridge.h"
@@ -175,6 +186,7 @@ static const char *const vd_libsystem_syms[] = {
     "___bzero",
     "___error",
     "___stack_chk_fail",
+    "__tlv_bootstrap",
     "___memcpy_chk",
     "___memmove_chk",
     "___memset_chk",
@@ -747,15 +759,22 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
     for (int i = 0; i < n; i++) {
         uint32_t stub_addr = stubs_off + (uint32_t)i * VD_STUB_STRIDE;
         uint32_t slot_addr = slots_off + (uint32_t)i * VD_SLOT_BYTES;
-        int64_t rel = (int64_t)slot_addr - (int64_t)(stub_addr + VD_STUB_BYTES);
         uint8_t *s = buf + stub_addr;
-        s[0] = 0x41;
-        s[1] = 0xbb;
-        wr32(s + 2, ids[i]);
-        s[6] = 0xff;
-        s[7] = 0x25;
-        wr32(s + 8, (uint32_t)(int32_t)rel);
-        for (uint32_t k = VD_STUB_BYTES; k < VD_STUB_STRIDE; k++)
+        uint32_t at = 0;
+        if (strcmp(lib->syms[i], "__tlv_bootstrap") == 0) {
+            s[at++] = 0x41;
+            s[at++] = 0x53;
+        }
+        s[at++] = 0x41;
+        s[at++] = 0xbb;
+        wr32(s + at, ids[i]);
+        at += 4;
+        s[at++] = 0xff;
+        s[at++] = 0x25;
+        int64_t rel = (int64_t)slot_addr - (int64_t)(stub_addr + at + 4);
+        wr32(s + at, (uint32_t)(int32_t)rel);
+        at += 4;
+        for (uint32_t k = at; k < VD_STUB_STRIDE; k++)
             s[k] = 0xcc;
         wr64(buf + slot_addr, OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF);
     }

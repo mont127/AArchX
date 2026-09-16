@@ -591,6 +591,34 @@ int main(void)
               kNotExported[i], (unsigned long long)a);
     }
 
+    {
+        int tfound = 0;
+        uint64_t ta = ocerz_dyld_trie_resolve(img, LOAD_BASE, "__tlv_bootstrap", &tfound);
+        CHECK(tfound, "__tlv_bootstrap does not resolve through the export trie");
+        int tin = tfound && ta >= text_lo && ta + 16 <= text_hi;
+        CHECK(!tfound || tin, "__tlv_bootstrap resolved to %#llx, outside the mapped __TEXT",
+              (unsigned long long)ta);
+        if (tin) {
+            const uint8_t *t = img + text.fileoff + (ta - text_lo);
+            CHECK(t[0] == 0x41 && t[1] == 0x53,
+                  "__tlv_bootstrap stub does not start with push r11 (41 53), so a thread-local"
+                  " access would destroy a value the compiler keeps in r11");
+            CHECK(t[2] == 0x41 && t[3] == 0xbb, "__tlv_bootstrap stub does not load its id with mov r11d");
+            CHECK(t[8] == 0xff && t[9] == 0x25, "__tlv_bootstrap stub does not end with jmp [rip+disp]");
+            int32_t disp = (int32_t)((uint32_t)t[10] | (uint32_t)t[11] << 8 |
+                                     (uint32_t)t[12] << 16 | (uint32_t)t[13] << 24);
+            uint64_t slot = ta + 14 + (uint64_t)(int64_t)disp;
+            int sin = slot >= data_lo && slot + 8 <= data_hi;
+            CHECK(sin, "__tlv_bootstrap stub jumps through %#llx, outside __DATA", (unsigned long long)slot);
+            if (sin) {
+                uint64_t v = 0;
+                memcpy(&v, img + data.fileoff + (slot - data_lo), 8);
+                CHECK(v == want_slot, "__tlv_bootstrap slot holds %#llx, want the trap address %#llx",
+                      (unsigned long long)v, (unsigned long long)want_slot);
+            }
+        }
+    }
+
     free(img);
     return report();
 }

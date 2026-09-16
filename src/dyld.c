@@ -169,6 +169,60 @@
  * run.  Both of its call sites are therefore confined to cache mode, so that a
  * registration that would do nothing is not made at all.  Mapping the segments
  * and handing __TEXT back its protection is the whole of the work.
+ *
+ * ---- thread-local variables in native mode ----
+ * Descriptors are rewritten into the same packed form as in cache mode, but the
+ * thunk word is left exactly as the fixups bound it.  In cache mode the import
+ * binds to __tlv_bootstrap, which is not the code that answers, so the rewrite
+ * points the word at tlv_get_addr beside it; in native mode the same import binds
+ * to the synthesized libSystem's __tlv_bootstrap stub, which is itself the entry
+ * that answers, so the binding already says the right thing and resolving the stub
+ * a second time could only disagree with it.  The fixups have landed by the time
+ * registration looks: each disk dylib is bound inside its own load, and the main
+ * image before the unresolved-import report.
+ *
+ * The key is ocerz's own, a small integer per image counted from 1, not a pthread
+ * key.  Cache mode's key is read by the guest's tlv_get_addr through the guest's
+ * pthread_getspecific; here nothing reads it but ocerz_tlv_address, and there is no
+ * x86 libpthread to create one in.  A dense key makes each thread's table a flat
+ * array indexed by it, and leaves 0 to mean a descriptor registration never
+ * rewrote - a classic descriptor's key word is 0 on disk - so such a descriptor is
+ * refused instead of resolved into some other image's block.  The table has an
+ * entry for every image the loader can hold, DYN_DIMG_MAX dylibs and the main
+ * image, so no key can outgrow it and it never has to be reallocated under a
+ * thread that is reading it.
+ *
+ * The table lives in guest memory, found through the slot OCERZ_TLV_TABLE_SLOT
+ * past gs in the thread block ocerz built, and not in host thread-local storage.
+ * An attached thread is torn down by a pthread key destructor, and by then the
+ * host's own __thread storage has already been released and reads back as zero
+ * (see the attach section of vm.c): a table reached through a host thread variable
+ * would be invisible at the one moment it has to be freed, and every block behind
+ * it would leak.  The slot also travels with the cpu.  A guest call runs a copy of
+ * the thread's cpu and the copy carries the same gs, so a variable touched inside a
+ * native callback is the same variable as outside it.  Nothing else in ocerz
+ * writes that slot, and in native mode no x86 libpthread is there to use it.
+ *
+ * A thread's block for an image is made the first time that thread touches one of
+ * the image's variables - copied from the template when the image has initialized
+ * thread data, left zeroed when it has only __thread_bss - and from then on an
+ * access is the descriptor, the table pointer and one entry.  An attached thread's
+ * blocks and its table are freed when its personality is torn down, at thread exit
+ * or detach, before its region is unmapped.  Each block is unmapped by the length
+ * recorded when its key was given out, never by a length read back out of guest
+ * memory, and a descriptor whose size disagrees with its key's is refused for the
+ * same reason.  The main thread's blocks live as long as the process, and since
+ * dlclose unloads nothing, a key always names the image it was given to.
+ *
+ * Registration runs for the main image and everything loaded with it right after
+ * the unresolved-import report, before any guest code can run, and as soon as a
+ * dlopen has loaded, before anything in the new images runs, over every image the
+ * loader holds rather than only the new ones: a dependency
+ * mapped by a dlopen that then failed is handed out by path to the next dlopen
+ * without coming back through here.  An image already registered is skipped, and
+ * that is not a formality - once a descriptor for a variable at offset 0 has been
+ * packed it no longer reads as packed, so packing it again would store the
+ * template delta as its offset.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -1447,14 +1501,19 @@ static int tlv_is_registered(uint64_t mh)
     return 0;
 }
 
-static void ocerz_tlv_register_image(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
-                                     uint64_t stack_top)
+typedef struct TlvSections {
+    uint64_t descs;
+    uint64_t descs_size;
+    uint64_t tmpl;
+    uint64_t block_size;
+    int has_data;
+} TlvSections;
+
+static int tlv_find_sections(uint64_t mh, TlvSections *ts)
 {
-    if (!mh || tlv_is_registered(mh))
-        return;
     const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
     if (rd32(h) != MH_MAGIC_64)
-        return;
+        return 0;
     int64_t slide = image_slide_d(mh);
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
@@ -1483,9 +1542,44 @@ static void ocerz_tlv_register_image(OcerzVM *vm, OcerzCache *cache, uint64_t mh
         }
         lc += rd32(lc + 4);
     }
+    ts->descs = (uint64_t)((int64_t)vars_addr + slide);
+    ts->descs_size = vars_addr ? vars_size : 0;
+    ts->tmpl = (uint64_t)((int64_t)tmpl_lo + slide);
+    ts->block_size = (tmpl_hi > tmpl_lo) ? (tmpl_hi - tmpl_lo) : 0;
+    ts->has_data = (data_lo != ~0ull);
+    return 1;
+}
+
+static void tlv_pack_descriptors(const TlvSections *ts, uint64_t thunk, uint32_t key)
+{
+    for (uint64_t off = 0; off + 24 <= ts->descs_size; off += 24) {
+        uint64_t desc = ts->descs + off;
+        uint32_t packed_off = (uint32_t)ocerz_ld(desc + 0xc, 4);
+        uint32_t var_off = packed_off ? packed_off
+                                      : (uint32_t)ocerz_ld(desc + 0x10, 8);
+        int32_t self_rel = ts->has_data
+            ? (int32_t)((int64_t)ts->tmpl - (int64_t)(desc + 0x10))
+            : 0;
+        if (thunk)
+            ocerz_st(desc + 0, 8, thunk);
+        ocerz_st(desc + 8, 4, key);
+        ocerz_st(desc + 0xc, 4, var_off);
+        ocerz_st(desc + 0x10, 4, (uint32_t)self_rel);
+        ocerz_st(desc + 0x14, 4, (uint32_t)ts->block_size);
+    }
+}
+
+static void ocerz_tlv_register_image(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
+                                     uint64_t stack_top)
+{
+    if (!mh || tlv_is_registered(mh))
+        return;
+    TlvSections ts;
+    if (!tlv_find_sections(mh, &ts))
+        return;
     if (g_tlv_registered_n < TLV_REG_MAX)
         g_tlv_registered[g_tlv_registered_n++] = mh;
-    if (vars_addr == 0 || vars_size < 24)
+    if (ts.descs_size < 24)
         return;
 
     uint64_t boot = ocerz_cache_resolve(cache, "__tlv_bootstrap");
@@ -1517,28 +1611,112 @@ static void ocerz_tlv_register_image(OcerzVM *vm, OcerzCache *cache, uint64_t mh
         return;
     }
 
-    uint64_t block_size = (tmpl_hi > tmpl_lo) ? (tmpl_hi - tmpl_lo) : 0;
-    int has_data = (data_lo != ~0ull);
-    uint64_t tmpl_runtime = (uint64_t)((int64_t)tmpl_lo + slide);
-
-    uint64_t descs_rt = (uint64_t)((int64_t)vars_addr + slide);
-    for (uint64_t off = 0; off + 24 <= vars_size; off += 24) {
-        uint64_t desc = descs_rt + off;
-        uint32_t packed_off = (uint32_t)ocerz_ld(desc + 0xc, 4);
-        uint32_t var_off = packed_off ? packed_off
-                                      : (uint32_t)ocerz_ld(desc + 0x10, 8);
-        int32_t self_rel = has_data
-            ? (int32_t)((int64_t)tmpl_runtime - (int64_t)(desc + 0x10))
-            : 0;
-        ocerz_st(desc + 0, 8, tlv_get_addr);
-        ocerz_st(desc + 8, 4, key);
-        ocerz_st(desc + 0xc, 4, var_off);
-        ocerz_st(desc + 0x10, 4, (uint32_t)self_rel);
-        ocerz_st(desc + 0x14, 4, (uint32_t)block_size);
-    }
+    tlv_pack_descriptors(&ts, tlv_get_addr, key);
     OCERZ_LOG("dynamic: TLV: registered mh=%#llx key=%u block=%llu descs@%#llx size=%llu\n",
-              (unsigned long long)mh, key, (unsigned long long)block_size,
-              (unsigned long long)descs_rt, (unsigned long long)vars_size);
+              (unsigned long long)mh, key, (unsigned long long)ts.block_size,
+              (unsigned long long)ts.descs, (unsigned long long)ts.descs_size);
+}
+
+#define NATIVE_TLV_KEYS (DYN_DIMG_MAX + 1)
+#define NATIVE_TLV_TABLE_BYTES ((uint64_t)(NATIVE_TLV_KEYS + 1) * 8)
+
+static uint32_t g_native_tlv_size[NATIVE_TLV_KEYS + 1];
+static _Atomic uint32_t g_native_tlv_keys;
+
+static void native_tlv_register_image(uint64_t mh)
+{
+    if (!mh || tlv_is_registered(mh))
+        return;
+    TlvSections ts;
+    if (!tlv_find_sections(mh, &ts))
+        return;
+    if (g_tlv_registered_n < TLV_REG_MAX)
+        g_tlv_registered[g_tlv_registered_n++] = mh;
+    if (ts.descs_size < 24)
+        return;
+    uint32_t key = g_native_tlv_keys + 1;
+    if (key > NATIVE_TLV_KEYS) {
+        OCERZ_LOG("dynamic: TLV: no native key left for mh=%#llx\n", (unsigned long long)mh);
+        return;
+    }
+    g_native_tlv_size[key] = (uint32_t)ts.block_size;
+    g_native_tlv_keys = key;
+    tlv_pack_descriptors(&ts, 0, key);
+    OCERZ_LOG("dynamic: TLV: native mh=%#llx key=%u block=%llu descs@%#llx size=%llu\n",
+              (unsigned long long)mh, key, (unsigned long long)ts.block_size,
+              (unsigned long long)ts.descs, (unsigned long long)ts.descs_size);
+}
+
+static void native_tlv_register_loaded(uint64_t main_mh)
+{
+    native_tlv_register_image(main_mh);
+    for (int i = 0; i < g_dimgs_n; i++)
+        native_tlv_register_image(g_dimgs[i].load_base);
+}
+
+static uint64_t native_tlv_first_touch(uint64_t gs_base, uint64_t desc, uint32_t key,
+                                       uint32_t off, uint32_t size)
+{
+    if (key > g_native_tlv_keys || size != g_native_tlv_size[key]) {
+        OCERZ_LOG("dynamic: TLV: descriptor %#llx names key %u with a %u-byte block, which no registered image has\n",
+                  (unsigned long long)desc, key, size);
+        return 0;
+    }
+    uint64_t slot = gs_base + OCERZ_TLV_TABLE_SLOT;
+    uint64_t table = ocerz_ld(slot, 8);
+    if (!table) {
+        table = ocerz_map_anywhere(NATIVE_TLV_TABLE_BYTES, PROT_READ | PROT_WRITE);
+        if (!table) {
+            OCERZ_LOG("dynamic: TLV: no guest memory for the thread table of gs=%#llx\n",
+                      (unsigned long long)gs_base);
+            return 0;
+        }
+        ocerz_st(slot, 8, table);
+    }
+    uint64_t block = ocerz_map_anywhere(size, PROT_READ | PROT_WRITE);
+    if (!block) {
+        OCERZ_LOG("dynamic: TLV: no guest memory for a %u-byte block of key %u\n", size, key);
+        return 0;
+    }
+    int32_t delta = (int32_t)rd32((const uint8_t *)ocerz_g2h(desc + 0x10));
+    if (delta)
+        memcpy(ocerz_g2h(block), ocerz_g2h((uint64_t)((int64_t)desc + 0x10 + delta)), size);
+    ocerz_st(table + (uint64_t)key * 8, 8, block);
+    return block + off;
+}
+
+uint64_t ocerz_tlv_address(OcerzCPU *cpu, uint64_t desc)
+{
+    const uint8_t *d = (const uint8_t *)ocerz_g2h(desc);
+    uint32_t key = rd32(d + 8);
+    uint32_t off = rd32(d + 0xc);
+    uint32_t size = rd32(d + 0x14);
+    uint64_t gs_base = cpu->gs_base;
+    if (key == 0 || key > NATIVE_TLV_KEYS || size == 0 || off > size || gs_base == 0)
+        return 0;
+    uint64_t table = ocerz_ld(gs_base + OCERZ_TLV_TABLE_SLOT, 8);
+    uint64_t block = table ? ocerz_ld(table + (uint64_t)key * 8, 8) : 0;
+    if (block)
+        return block + off;
+    return native_tlv_first_touch(gs_base, desc, key, off, size);
+}
+
+void ocerz_tlv_release_thread(uint64_t gs_base)
+{
+    if (ocerz_mode != OCERZ_MODE_NATIVE || gs_base == 0)
+        return;
+    uint64_t slot = gs_base + OCERZ_TLV_TABLE_SLOT;
+    uint64_t table = ocerz_ld(slot, 8);
+    if (!table)
+        return;
+    ocerz_st(slot, 8, 0);
+    uint32_t keys = g_native_tlv_keys;
+    for (uint32_t key = 1; key <= keys && key <= NATIVE_TLV_KEYS; key++) {
+        uint64_t block = ocerz_ld(table + (uint64_t)key * 8, 8);
+        if (block && g_native_tlv_size[key])
+            ocerz_unmap(block, g_native_tlv_size[key]);
+    }
+    ocerz_unmap(table, NATIVE_TLV_TABLE_BYTES);
 }
 
 static void ocerz_tlv_register_closure(OcerzVM *vm, OcerzCache *cache, uint64_t main_mh,
@@ -2444,6 +2622,8 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
     }
     int before = g_dimgs_n;
     DynImage *d = dlopen_load_image(g_run_cache, loadpath);
+    if (ocerz_mode == OCERZ_MODE_NATIVE)
+        native_tlv_register_loaded(ocerz_main_mh);
     if (!d)
         return 0;
     if (!g_run_init_ready && g_run_vm && !vm->exited &&
@@ -2712,6 +2892,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         free(buf);
         return 71;
     }
+    if (ocerz_mode == OCERZ_MODE_NATIVE)
+        native_tlv_register_loaded(img.load_base);
 
     DynFrame fr;
     memset(&fr, 0, sizeof fr);

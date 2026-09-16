@@ -205,7 +205,11 @@
  * during the same exit, and teardown unregisters every cpu the dying thread
  * registered, not only the attached one, because a thread that leaves through
  * pthread_exit from inside a callback leaves the call's local copy registered with
- * nothing left to unregister it.
+ * nothing left to unregister it.  Teardown also frees the thread's thread-local
+ * variable blocks, and the table behind gs that holds them, before the region that
+ * table's slot sits in is unmapped: the slot is the only record of them, so a
+ * program that starts and ends threads over and over would otherwise leave a block
+ * per image behind every one.
  *
  * The sentinel return address is a page of int3 bytes at 0x500000000 when that
  * address is free, and 0xdeadca11, which nothing maps, when it is not.  The page
@@ -2897,6 +2901,7 @@ static void attach_release(AttachedThread *at)
     pthread_mutex_unlock(&g_cpus_lock);
     g_attached = NULL;
     g_cur_cpu = NULL;
+    ocerz_tlv_release_thread(at->cpu.gs_base);
     ocerz_unmap(at->region, OCERZ_ATTACH_REGION);
     free(at->cpu.btrace);
     free(at);

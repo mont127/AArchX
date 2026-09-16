@@ -139,10 +139,23 @@
  * and never a getenv.  It prints no argument values: the signature already says
  * what shape they were, and most of them are pointers into guest memory that a
  * log line has no business dereferencing.
+ *
+ * ---- thread-local variables ----
+ * __tlv_bootstrap is not a function any host library exports; it is the thunk
+ * a guest's thread-local variable descriptors are bound to, and it has to return
+ * the variable's address while preserving every register but RAX.  A trap into
+ * ocerz preserves them all by construction, so it is a special entry that asks
+ * ocerz_tlv_address for this thread's copy and returns that in RAX.  Its stub,
+ * unlike every other, saved the guest's r11 on the stack before trapping, since
+ * clang keeps live values in r11 across a thread-local access, so the entry
+ * restores r11 from there before returning.  It raises no bridge frame, because
+ * nothing it runs is native framework code.
  */
 #include "ocerz/bridge.h"
 #include "ocerz/abi.h"
 #include "ocerz/vm.h"
+#include "ocerz/dyld.h"
+#include "ocerz/mem.h"
 #include "ocerz/interp.h"
 
 #include <dlfcn.h>
@@ -179,6 +192,24 @@ static int br_stack_chk_fail(struct OcerzVM *vm, OcerzCPU *cpu)
     fprintf(stderr, "ocerz: bridge: the guest overran a stack guard (__stack_chk_fail)\n");
     ocerz_vm_request_exit(vm, 134);
     return OCERZ_STEP_EXIT;
+}
+
+static int br_tlv_bootstrap(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t desc = cpu->gpr[OCERZ_RDI];
+    uint64_t addr = ocerz_tlv_address(cpu, desc);
+    if (!addr) {
+        fprintf(stderr, "ocerz: bridge: thread-local variable descriptor %#llx could not be resolved\n",
+                (unsigned long long)desc);
+        ocerz_vm_request_exit(vm, 134);
+        return OCERZ_STEP_EXIT;
+    }
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    cpu->gpr[OCERZ_R11] = ocerz_ld(rsp, 8);
+    cpu->rip = ocerz_ld(rsp + 8, 8);
+    cpu->gpr[OCERZ_RSP] = rsp + 16;
+    cpu->gpr[OCERZ_RAX] = addr;
+    return OCERZ_STEP_OK;
 }
 
 static struct OcerzBridgeFn g_br_fns[] = {
@@ -260,6 +291,7 @@ static struct OcerzBridgeFn g_br_fns[] = {
 
     { BR_LIBSYSTEM, "_exit",             NULL, NULL, br_exit,            NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "_abort",            NULL, NULL, br_abort,           NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "__tlv_bootstrap",   NULL, NULL, br_tlv_bootstrap,   NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "___stack_chk_fail", NULL, NULL, br_stack_chk_fail,  NULL, { 0, { 0 }, { { 0 } }, 0 } },
 };
 
