@@ -6,7 +6,10 @@
  * without main.o, still resolve it.
  */
 #include "ocerz/types.h"
+#include "ocerz/mode.h"
 
 int ocerz_verbose;
+
+int ocerz_mode;
 
 char ocerz_cmdline_summary[256];

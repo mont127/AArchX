@@ -1,7 +1,7 @@
 /*
  * Command-line parsing and the entry point.
  *
- * Two startup decisions are made here rather than lazily.  Some shared-cache
+ * Three startup decisions are made here rather than lazily.  Some shared-cache
  * images' Objective-C categories must be visible before any class is realized,
  * because a dlopen registers them too late for classes that already exist:
  * CoreSpotlight adds encodeWithCSCoder: categories to Foundation's collection
@@ -17,6 +17,14 @@
  * only the processes whose command line matches, and since the environment
  * inherits through Wine's exec chain that singles one process out for the
  * full-visibility interpreter while the rest stay on the JIT.
+ *
+ * The third decision is which universe the guest binds against.  -native and
+ * -cache pick the mode outright and the last one on the command line wins;
+ * with neither, OCERZ_MODE decides, which is how a child inherits the mode
+ * across a spawn or an exec, so a value there that is neither native nor cache
+ * is refused rather than quietly ignored.  Native mode has no static loader
+ * path at all - a program that links against nothing has nothing to bridge
+ * into - so a non-dynamic image is refused before the VM starts.
  */
 #include <signal.h>
 #include <pthread.h>
@@ -25,6 +33,7 @@
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/dyld.h"
+#include "ocerz/mode.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -34,7 +43,7 @@ extern char **environ;
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-path file] [--] program [args...]\n"
+    fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--] program [args...]\n"
                     "       ocerz version\n");
 }
 
@@ -99,6 +108,7 @@ int main(int argc, char **argv)
     int trace = 0;
     int strace = 0;
     int nojit = 0;
+    int mode_from_flag = 0;
     const char *load_path = NULL;
     setenv("MallocNanoZone", "0", 1);
     int i = 1;
@@ -121,6 +131,12 @@ int main(int argc, char **argv)
             strace = 1;
         } else if (strcmp(argv[i], "-no-jit") == 0) {
             nojit = 1;
+        } else if (strcmp(argv[i], "-native") == 0) {
+            ocerz_mode = OCERZ_MODE_NATIVE;
+            mode_from_flag = 1;
+        } else if (strcmp(argv[i], "-cache") == 0) {
+            ocerz_mode = OCERZ_MODE_CACHE;
+            mode_from_flag = 1;
         } else if (strcmp(argv[i], "-path") == 0 && i + 1 < argc) {
             load_path = argv[++i];
         } else {
@@ -128,6 +144,20 @@ int main(int argc, char **argv)
             return 64;
         }
     }
+    if (!mode_from_flag) {
+        const char *mode_env = getenv("OCERZ_MODE");
+        if (mode_env && *mode_env) {
+            if (strcmp(mode_env, "native") == 0) {
+                ocerz_mode = OCERZ_MODE_NATIVE;
+            } else if (strcmp(mode_env, "cache") == 0) {
+                ocerz_mode = OCERZ_MODE_CACHE;
+            } else {
+                OCERZ_FATAL("unknown OCERZ_MODE value '%s', want native or cache\n", mode_env);
+                return 64;
+            }
+        }
+    }
+    OCERZ_LOG("mode: %s\n", ocerz_mode == OCERZ_MODE_NATIVE ? "native" : "cache");
     if (i >= argc) {
         usage();
         return 64;
@@ -159,6 +189,10 @@ int main(int argc, char **argv)
     if (dynamic < 0) {
         OCERZ_FATAL("cannot read %s\n", load_path);
         return 65;
+    }
+    if (!dynamic && ocerz_mode == OCERZ_MODE_NATIVE) {
+        OCERZ_FATAL("native mode cannot run the static image %s\n", load_path);
+        return 64;
     }
     vm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;
 

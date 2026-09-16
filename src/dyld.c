@@ -118,12 +118,42 @@
  * Steam's bootstrapper dlopening its own steam_osx mapped a duplicate, which
  * gave duplicate GURLHelper and UpdateEventHandlers objc classes and crashed
  * steamui on a null vtable.  Pinned by the dynamic test dlopen_self.
+ *
+ * ---- native mode ----
+ * OCERZ_MODE_NATIVE maps no shared cache at all: the guest's system libraries
+ * are to become synthesized x86 images whose exports bridge into the host's own
+ * arm64 frameworks, and until one of those exists there is nothing for a system
+ * import to bind to.  The loader is not forked for it.  Every consumer still
+ * receives the same static OcerzCache, simply left zeroed, because a zeroed
+ * cache already answers the way this mode needs: mapped is 0, so each resolve
+ * reports not-found and the has-image test says no, and images_cnt is 0, so the
+ * dependency map and the initializer search walk nothing, ran_init stays clear
+ * and control reaches the cache-free process start at the tail of
+ * ocerz_dyld_run.  A null pointer would say exactly the same thing at the price
+ * of a null check in every one of those callers and a second path to keep
+ * honest, so the zeroed struct is the one that travels.
+ *
+ * Unresolved imports are collected rather than announced one at a time.  In
+ * cache mode a miss is a real failure and prints where it happens; in native
+ * mode every system symbol misses until the bridges land, so a miss is recorded
+ * by (library, symbol) pair in a fixed table, deduplicated, and the set is
+ * reported once the main image's fixups are done - after which the process
+ * stops with 71 rather than running a program whose imports are all bound to
+ * zero.  The library is the two-level ordinal's target install name, or (flat)
+ * when the import names no ordinal.
+ *
+ * A system library that a dependency names is not on disk at all on a modern
+ * macOS - /usr/lib/libSystem.B.dylib exists only inside the cache - so in
+ * native mode failing to read one is the ordinary case rather than a fault,
+ * and it is logged rather than announced as fatal.  The collected import
+ * report is what names the consequence, symbol by symbol.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
 #include "ocerz/cache.h"
 #include "ocerz/dyldapi.h"
+#include "ocerz/mode.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -634,6 +664,27 @@ static uint64_t disk_flat_resolve(const char *name)
 
 static int expand_at_prefix(DynImage *loader, const char *name, char *out, size_t n);
 
+#define NATIVE_MISS_MAX 256
+struct native_miss { char lib[256]; char sym[256]; };
+static struct native_miss g_native_miss[NATIVE_MISS_MAX];
+static int g_native_miss_n;
+static int g_native_miss_dropped;
+
+static void native_miss_add(const char *lib, const char *sym)
+{
+    if (!lib || !lib[0])
+        lib = "(flat)";
+    for (int i = 0; i < g_native_miss_n; i++)
+        if (strcmp(g_native_miss[i].sym, sym) == 0 && strcmp(g_native_miss[i].lib, lib) == 0)
+            return;
+    if (g_native_miss_n >= NATIVE_MISS_MAX) {
+        g_native_miss_dropped++;
+        return;
+    }
+    snprintf(g_native_miss[g_native_miss_n].lib, sizeof g_native_miss[0].lib, "%s", lib);
+    snprintf(g_native_miss[g_native_miss_n].sym, sizeof g_native_miss[0].sym, "%s", sym);
+    g_native_miss_n++;
+}
 
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
                                int libord, int weak)
@@ -641,8 +692,9 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
 
     uint64_t value = 0;
     int found = 0;
+    const char *tgt = NULL;
     if (libord > 0) {
-        const char *tgt = dimg_ordinal_name(img, libord);
+        tgt = dimg_ordinal_name(img, libord);
         if (tgt) {
             DynImage *dep = dimg_find_by_install_name(tgt);
             if (!dep)
@@ -668,7 +720,10 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
     if (!found)
         value = disk_flat_resolve_ex(name, &found);
     if (!found && !weak) {
-        OCERZ_FATAL("unresolved import: %s\n", name);
+        if (ocerz_mode == OCERZ_MODE_NATIVE)
+            native_miss_add(tgt, name);
+        else
+            OCERZ_FATAL("unresolved import: %s\n", name);
     }
     return value;
 }
@@ -1999,7 +2054,11 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     size_t flen = 0;
     uint8_t *buf = read_file(resolved, &flen);
     if (!buf) {
-        OCERZ_FATAL("Library not loaded: %s (no such file)\n", resolved);
+        if (ocerz_mode == OCERZ_MODE_NATIVE)
+            OCERZ_LOG("dynamic: %s is not on disk, native mode has no image for it yet\n",
+                      resolved);
+        else
+            OCERZ_FATAL("Library not loaded: %s (no such file)\n", resolved);
         return NULL;
     }
     const uint8_t *slice = select_slice(buf, flen);
@@ -2515,9 +2574,13 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         return OCERZ_ENOMEM;
 
     static OcerzCache cache;
-    if (ocerz_cache_map(&cache) != OCERZ_OK) {
-        OCERZ_FATAL("cannot map shared cache for dynamic loading\n");
-        return OCERZ_EIO;
+    if (ocerz_mode == OCERZ_MODE_CACHE) {
+        if (ocerz_cache_map(&cache) != OCERZ_OK) {
+            OCERZ_FATAL("cannot map shared cache for dynamic loading\n");
+            return OCERZ_EIO;
+        }
+    } else {
+        OCERZ_LOG("dynamic: native mode, shared cache not mapped\n");
     }
     g_run_cache = &cache;
     g_run_vm = vm;
@@ -2576,6 +2639,19 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     }
     protect_ro_segments(&img);
 
+    if (ocerz_mode == OCERZ_MODE_NATIVE && g_native_miss_n > 0) {
+        for (int i = 0; i < g_native_miss_n; i++)
+            fprintf(stderr, "ocerz: native: no bridge for %s in %s\n",
+                    g_native_miss[i].sym, g_native_miss[i].lib);
+        if (g_native_miss_dropped)
+            fprintf(stderr, "ocerz: native: %d more unresolved imports not listed\n",
+                    g_native_miss_dropped);
+        fprintf(stderr, "ocerz: native: %d unresolved imports, no virtual frameworks are implemented yet\n",
+                g_native_miss_n + g_native_miss_dropped);
+        free(buf);
+        return 71;
+    }
+
     DynFrame fr;
     memset(&fr, 0, sizeof fr);
     if (build_frame(path, argc, argv, envp, &fr) != OCERZ_OK) {
@@ -2610,7 +2686,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     ocerz_vm_install_handlers(vm);
     ocerz_commpage_init();
     { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("cache-mapped"); }
-    if (ocerz_dyldapi_setup(&cache) != OCERZ_OK)
+    if (ocerz_mode == OCERZ_MODE_CACHE && ocerz_dyldapi_setup(&cache) != OCERZ_OK)
         OCERZ_LOG("dynamic: dyld API shim not installed\n");
 
     uint64_t environ_addr = ocerz_cache_resolve(&cache, "_environ");
