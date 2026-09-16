@@ -51,8 +51,8 @@ make -j
 | x86-64 differential gate (interpreter vs JIT) | 96 / 96 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 109 / 109 |
-| native-mode gate (`-native`) | 36 / 36 |
-| native-mode unit suites: image, bridge, ABI, callbacks, thread attach | 478 / 0, 210 / 0, 1955 / 0, 8351 / 0, 270 / 0 |
+| native-mode gate (`-native`) | 41 / 41 |
+| native-mode unit suites: image, bridge, ABI, callbacks, thread attach | 526 / 0, 210 / 0, 1955 / 0, 8351 / 0, 270 / 0 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -302,7 +302,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 
 Apple ends general-purpose Rosetta after macOS 27, and with it the `dyld_shared_cache_x86_64` that every guest binds against by default. Native mode is the answer to that. The guest keeps its x86_64 Darwin personality, but its system libraries are synthesized x86 images whose exports lead into the host's own arm64 code, so a call into libSystem runs the real native implementation instead of translated Intel code. It is selected with `-native` or `OCERZ_MODE=native`, and cache mode stays the default.
 
-Today native mode runs command-line programs whose system calls stay inside what is bridged: the common C string and memory functions, the heap, `read`, `write` and `close`, string-to-number conversion, `qsort` and `bsearch`, and libdispatch's function-pointer entry points, including its semaphores. Nothing from Foundation or AppKit is available yet. Every kernel of `xbench_dyn` produces byte-identical output in native mode and cache mode, under both the JIT and the interpreter.
+Today native mode runs command-line programs whose system calls stay inside what is bridged: the common C string and memory functions and their fortified `_chk` forms, the heap, `read`, `write` and `close`, string-to-number conversion, `qsort` and `bsearch`, POSIX threads with their mutexes and condition variables, and libdispatch's function-pointer entry points, including its semaphores. A program compiled normally, with optimization and clang's default stack protector, binds and runs. Nothing from Foundation or AppKit is available yet. Every kernel of `xbench_dyn` produces byte-identical output in native mode and cache mode, under both the JIT and the interpreter.
 
 **System libraries without files.** A guest that links `/usr/lib/libSystem.B.dylib` finds nothing behind it, because on a current macOS that library exists only inside the cache. So ocerz builds one. `src/vdylib.c` assembles a real x86_64 Mach-O in memory, with load commands, `__TEXT`, `__DATA` and an export trie, and the loader takes it as an ordinary image. Nothing in the loader reopens a file, so import resolution, `dlopen` and `dladdr` work on it unchanged. No cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off, because the host's own libdispatch needs the process's single workqueue slot.
 
@@ -311,6 +311,10 @@ Today native mode runs command-line programs whose system calls stay inside what
 **Calls back.** A native function that takes a function pointer calls it, and when the guest supplied that pointer it names x86 code native code cannot jump to. So a callback argument carries its own signature, `qsort` being `v(pLLc{i(pp)})`, and the guest function is bound to one slot in a fixed, assembled bank of 4096 arm64 trampolines. Native code receives the slot's address, and the same function always gets the same address. When native code calls the slot, the guest function runs on that thread with its arguments where System V expects them. A comparator can make bridged calls of its own, and nesting goes as deep as the guest's stack allows.
 
 **Threads the guest never created.** A framework calls back on threads of its own: libdispatch runs work on its workers, and a run loop or an audio device has a thread of its own too. Such a thread has no x86 registers and no guest stack. The first time one calls a guest function it is given a guest personality of its own: a cpu, a guest stack and a guest thread block behind `gs`, registered like any other guest thread and reused on every later call. Because a second thread running guest code is a second observer of guest memory, that also retires plain memory mode, as starting a guest thread already does. The personality is torn down when the host thread exits. `dispatch_async_f`, `dispatch_apply_f` spreading work across several workers at once, and guest work that makes bridged calls and nested callbacks of its own all run this way.
+
+**Guest threads.** `pthread_create`'s start routine is exactly such a callback, so guest threads need nothing further: the native `pthread_create` starts a host thread, that thread is given a guest personality on its way into the start routine, and the result comes back through `pthread_join`. Mutexes and condition variables are forwarded unchanged. That is sound because `pthread_mutex_t`, `pthread_cond_t` and the other pthread types have the same size, alignment and initializer values on x86_64 and arm64, so a mutex a guest initialized statically is already a valid native one.
+
+**Data exports.** Not every import is a function. A stack-protected program reads `___stack_chk_guard` in every function prologue, so the synthesized libSystem exports it as a data slot the export trie points at directly, holding a random canary drawn when the image is built. `_environ`, `___progname`, `__DefaultRuneLocale`, `___stdoutp` and `___stderrp` are data symbols too and are left out on purpose: each is tied to native state a constant would get wrong, and an import that fails to bind says so where a wrong value would not.
 
 **Faults.** A bridged call is the one place a thread the guest drives runs native code. A fault during one is reported as such, naming the call and saying whether the faulting address was in guest space, meaning the guest passed a bad pointer, or outside it, meaning ocerz marshalled the call wrong. The process stops there, because a native frame can be neither resumed nor unwound:
 
@@ -366,7 +370,7 @@ The mode is process-wide and fixed before the VM starts, because the JIT materia
 - MMX instructions always run in the interpreter, and the MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry them.
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
-- Native mode runs only programs whose system calls stay inside the bridged part of libSystem and libdispatch. Nothing above that is available there yet, Foundation and AppKit included; variadic functions such as `printf` and `open` are not bridged; and a thread-local variable, a signal handler or a `pthread_create` start routine does not work there yet.
+- Native mode runs only programs whose system calls stay inside the bridged part of libSystem and libdispatch. Nothing above that is available there yet, Foundation and AppKit included; variadic functions such as `printf` and `open` are not bridged; a thread-local variable or a signal handler does not work there yet; and a program reading `environ`, `stdout` or the ctype tables directly fails to bind.
 
 ## License
 
