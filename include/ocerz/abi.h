@@ -79,9 +79,11 @@
  * reporting it as a native-code fault would kill a process that was fine.  The
  * result is converted back and returned in x0 or v0.
  *
- * A callback that arrives on a thread with no guest personality at all, one a
- * native framework created for itself, is refused by name here; attaching such
- * a thread is a separate change.
+ * A callback can also arrive on a thread with no guest personality at all, one
+ * a native framework created for itself, such as a libdispatch worker.  The
+ * dispatcher gives that thread one through ocerz_thread_attach on its first
+ * callback and reuses it on every one after, and refuses by name only when
+ * there is no guest process to attach it to.
  */
 #ifndef OCERZ_ABI_H
 #define OCERZ_ABI_H

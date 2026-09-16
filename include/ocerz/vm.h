@@ -13,6 +13,20 @@
  * not the call site decides which one carries the result.  ocerz_vm_current_cpu
  * is the guest cpu the calling thread is running, or NULL on a thread that has
  * none.
+ *
+ * A native framework calls guest callbacks on threads it created for itself:
+ * libdispatch's workers, a run loop's thread, an audio device's real-time
+ * thread.  Such a thread has no guest cpu, so it cannot enter guest code until
+ * it is given one.  ocerz_thread_attach gives the calling host thread a guest
+ * personality of its own, a cpu with its own guest stack and its own guest
+ * thread block behind gs, registered like any other guest thread and returned
+ * again on every later call from the same thread.  It is torn down when the
+ * host thread exits, or earlier by ocerz_thread_detach, which only ever removes
+ * a personality attach created and never a thread ocerz started itself.  A
+ * second thread running guest code is a second observer of guest memory, so the
+ * first attach also retires plain memory mode, exactly as starting a guest
+ * thread does.  ocerz_vm_process is the process's VM, or NULL before one is
+ * running.
  */
 #ifndef OCERZ_VM_H
 #define OCERZ_VM_H
@@ -56,6 +70,9 @@ typedef struct OcerzGuestCall {
 } OcerzGuestCall;
 
 OcerzCPU *ocerz_vm_current_cpu(void);
+OcerzVM *ocerz_vm_process(void);
+OcerzCPU *ocerz_thread_attach(OcerzVM *vm);
+void ocerz_thread_detach(void);
 int ocerz_vm_call_abi(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, uint64_t stack_top);
 unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
 void ocerz_vm_purge_jit_ras(OcerzVM *vm);

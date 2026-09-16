@@ -152,6 +152,61 @@
  * comparison, and a sort of a few thousand elements made tens of thousands of
  * entries that each called getenv twice.
  *
+ * ---- attaching a native thread ----
+ * In native mode a guest function pointer is called on threads ocerz never
+ * started: libdispatch's workers, the thread a native pthread_create made for a
+ * guest start routine, a framework's own run loop thread.  Such a thread cannot
+ * enter guest code as it stands.  A guest call runs a copy of the thread's
+ * current cpu on the guest stack that cpu points at, and this thread has neither,
+ * while borrowing the main thread's cpu would put two threads' frames on one
+ * guest stack and hand both the same gs.  ocerz_thread_attach gives it a
+ * personality of its own the first time and the same one on every call after: a
+ * cpu in the state the main thread's starts in, a 2 MB guest region holding its
+ * stack and its thread block, and a place in the cpu registry, so a guest
+ * thread_suspend, the unstick monitor and SIGINFO see it as they see any guest
+ * thread.  All of it is allocated then, so a callback made once per comparison
+ * allocates nothing.
+ *
+ * The thread block is ocerz's own layout, not x86 libpthread's.  In native mode
+ * there is no x86 libpthread in the process: the guest's pthread calls are
+ * bridged to the host's, which keeps its thread state in arm64 structures, so
+ * nothing will ever read a pointer cookie or a TSD slot past gs, and writing them
+ * would only invent state for a library that is not there.  What is kept is what
+ * the main thread already gets from dyld.c: the word at gs points back at the
+ * start of the block that holds it, and the host thread id sits just below gs,
+ * so ocerz's own dumps and a guest reading its thread pointer off gs find every
+ * thread shaped alike.  The stack is the rest of the region, below the block, and
+ * RSP starts at its top on a 16-byte boundary.
+ *
+ * Every attach retires plain memory mode before its cpu runs a guest instruction,
+ * exactly as starting a guest thread does in cache mode, and only the first one
+ * finds anything to retire.  Plain forms are correct only while one thread
+ * observes guest memory, and a native thread running a guest callback is a second
+ * observer the JIT was never told about; missing it crashes nothing, it leaves two
+ * threads racing on guest memory through code translated for one.
+ *
+ * ocerz_thread_detach removes a personality attach created and nothing else; on
+ * the main thread, or on a thread ocerz started itself, it does nothing at all.
+ * Those cpus belong to the VM or to the worker running their loop, and are not
+ * attach's to unmap or free - freeing one would pull a cpu out from under a run
+ * loop still using it.  Nor does it act while guest code runs on the thread.  A
+ * guest call makes the thread's current cpu its own local copy until it returns,
+ * so the attached cpu is current exactly when no call is in flight; a detach that
+ * finds anything else current was made from inside a callback, is refused by
+ * name, and leaves the personality attached rather than freeing a cpu in use.
+ *
+ * Teardown at thread exit is a pthread key destructor, and it trusts only its
+ * argument.  A thread's __thread storage is freed by a key dyld created when the
+ * image loaded, and keys are destroyed in creation order, so by the time ocerz's
+ * later key runs, this file's thread variables read back as zero from a fresh
+ * block (checked with a standalone probe, 2026-09-16).  So the key's value is the
+ * record: attach looks there before building a second personality for a thread
+ * whose thread storage is already gone, as when a guest destructor is called back
+ * during the same exit, and teardown unregisters every cpu the dying thread
+ * registered, not only the attached one, because a thread that leaves through
+ * pthread_exit from inside a callback leaves the call's local copy registered with
+ * nothing left to unregister it.
+ *
  * The sentinel return address is a page of int3 bytes at 0x500000000 when that
  * address is free, and 0xdeadca11, which nothing maps, when it is not.  The page
  * is asked for with the address as a hint and never with MAP_FIXED.  MAP_FIXED
@@ -188,6 +243,7 @@
 #include <sched.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/sysctl.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -662,6 +718,11 @@ static void sel_trap_report(const OcerzCPU *c)
 OcerzCPU *ocerz_vm_current_cpu(void)
 {
     return g_cur_cpu;
+}
+
+OcerzVM *ocerz_vm_process(void)
+{
+    return g_vm;
 }
 
 uint64_t ocerz_current_guest_rip(void)
@@ -2804,6 +2865,166 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
 int ocerz_vm_call_abi(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, uint64_t stack_top)
 {
     return vm_call_core(vm, func, call, 6, 8, stack_top);
+}
+
+#define OCERZ_ATTACH_REGION 0x200000ull
+#define OCERZ_ATTACH_BLOCK 0x1f0000ull
+#define OCERZ_ATTACH_GS 0xe0ull
+
+typedef struct AttachedThread {
+    OcerzCPU cpu;
+    uint64_t region;
+} AttachedThread;
+
+static __thread AttachedThread *g_attached;
+static pthread_key_t g_attach_key;
+static _Atomic int g_attach_key_ok;
+static pthread_once_t g_attach_once = PTHREAD_ONCE_INIT;
+
+static void attach_release(AttachedThread *at)
+{
+    pthread_t self = pthread_self();
+    pthread_mutex_lock(&g_cpus_lock);
+    for (int i = 0; i < g_cpus_n; i++) {
+        if (g_cpus[i] == &at->cpu || pthread_equal(g_cpu_threads[i], self)) {
+            int last = --g_cpus_n;
+            g_cpus[i] = g_cpus[last];
+            g_cpu_threads[i] = g_cpu_threads[last];
+            g_cpus[last] = NULL;
+            i--;
+        }
+    }
+    pthread_mutex_unlock(&g_cpus_lock);
+    g_attached = NULL;
+    g_cur_cpu = NULL;
+    ocerz_unmap(at->region, OCERZ_ATTACH_REGION);
+    free(at->cpu.btrace);
+    free(at);
+}
+
+static void attach_thread_exit(void *arg)
+{
+    if (arg)
+        attach_release((AttachedThread *)arg);
+}
+
+static void attach_key_init(void)
+{
+    if (pthread_key_create(&g_attach_key, attach_thread_exit) == 0)
+        g_attach_key_ok = 1;
+}
+
+static AttachedThread *attach_record(void)
+{
+    if (g_attached)
+        return g_attached;
+    if (!g_attach_key_ok)
+        return NULL;
+    return (AttachedThread *)pthread_getspecific(g_attach_key);
+}
+
+static int attach_cpu_number(void)
+{
+    static _Atomic int seq;
+    static _Atomic int ncpu;
+    int n = ncpu;
+    if (!n) {
+        size_t sz = sizeof n;
+        if (sysctlbyname("hw.activecpu", &n, &sz, NULL, 0) != 0 || n < 1)
+            n = 1;
+        ncpu = n;
+    }
+    int idx = seq++;
+    return 1 + idx % (n > 1 ? n - 1 : 1);
+}
+
+OcerzCPU *ocerz_thread_attach(OcerzVM *vm)
+{
+    if (g_cur_cpu)
+        return g_cur_cpu;
+    if (!vm)
+        return NULL;
+    AttachedThread *at = attach_record();
+    if (at) {
+        g_attached = at;
+        g_cur_cpu = &at->cpu;
+        return &at->cpu;
+    }
+
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    pthread_once(&g_attach_once, attach_key_init);
+    if (!g_attach_key_ok) {
+        fprintf(stderr,
+                "ocerz: vm: cannot attach host thread %#llx: no pthread key could be created to"
+                " tear its guest personality down when it exits\n",
+                (unsigned long long)tid);
+        return NULL;
+    }
+    uint64_t region = ocerz_map_anywhere(OCERZ_ATTACH_REGION, PROT_READ | PROT_WRITE);
+    if (!region) {
+        fprintf(stderr,
+                "ocerz: vm: cannot attach host thread %#llx: no room in guest memory for its"
+                " %#llx-byte guest stack and thread block\n",
+                (unsigned long long)tid, (unsigned long long)OCERZ_ATTACH_REGION);
+        return NULL;
+    }
+    at = (AttachedThread *)calloc(1, sizeof *at);
+    if (!at) {
+        ocerz_unmap(region, OCERZ_ATTACH_REGION);
+        fprintf(stderr, "ocerz: vm: cannot attach host thread %#llx: no memory for its guest cpu\n",
+                (unsigned long long)tid);
+        return NULL;
+    }
+
+    at->region = region;
+    OcerzCPU *cpu = &at->cpu;
+    cpu->vm = vm;
+    ocerz_cpu_reset(cpu);
+    cpu->cpu_number = attach_cpu_number();
+    cpu->cur_sys_class = -1;
+    uint64_t block = region + OCERZ_ATTACH_BLOCK;
+    uint64_t gs = block + OCERZ_ATTACH_GS;
+    ocerz_st(gs, 8, block);
+    ocerz_st(gs - 8, 8, tid);
+    cpu->gs_base = gs;
+    cpu->gpr[OCERZ_RSP] = block & ~0xfull;
+    cpu->host_pthread = (void *)pthread_self();
+    cpu->host_kport = pthread_mach_thread_np(pthread_self());
+    cpu->host_tid = tid;
+
+    if (pthread_setspecific(g_attach_key, at) != 0) {
+        ocerz_unmap(region, OCERZ_ATTACH_REGION);
+        free(at);
+        fprintf(stderr,
+                "ocerz: vm: cannot attach host thread %#llx: its guest personality could not be"
+                " recorded for teardown\n",
+                (unsigned long long)tid);
+        return NULL;
+    }
+    ocerz_jit_require_ordered(vm);
+    ocerz_cpu_register(cpu);
+    g_attached = at;
+    g_cur_cpu = cpu;
+    return cpu;
+}
+
+void ocerz_thread_detach(void)
+{
+    AttachedThread *at = attach_record();
+    if (!at)
+        return;
+    if (g_cur_cpu && g_cur_cpu != &at->cpu) {
+        uint64_t tid = 0;
+        pthread_threadid_np(NULL, &tid);
+        fprintf(stderr,
+                "ocerz: vm: ocerz_thread_detach was called on host thread %#llx while guest code is"
+                " running on it; its guest personality, cpu#%d, stays attached\n",
+                (unsigned long long)tid, at->cpu.cpu_number);
+        return;
+    }
+    pthread_setspecific(g_attach_key, NULL);
+    attach_release(at);
 }
 
 static void ocerz_kick_handler(int sig, siginfo_t *si, void *uc)
