@@ -65,6 +65,28 @@
  * dispatch_apply_f's DISPATCH_APPLY_AUTO is a null queue, which the pointer
  * conversion passes through as null.
  *
+ * ---- guest threads ----
+ * pthread_create's start routine is a callback held past the call and run on a
+ * thread the guest never created, which is exactly what the two sections above
+ * already handle, so a guest thread needs no mechanism of its own: the native
+ * pthread_create starts a host thread, that thread calls the trampoline, is given
+ * a guest personality on the way in, and runs the start routine, whose result
+ * comes back through pthread_join.  The mutex and condition functions are
+ * forwarded as they are, which is sound only because pthread_mutex_t,
+ * pthread_cond_t and the rest have the same size and alignment on x86_64 and
+ * arm64 and the same initializer signatures, so a mutex a guest initialized
+ * statically is a valid native mutex; that was checked with sizeof and the
+ * initializer values compiled for both architectures, not assumed.
+ *
+ * ---- fortified string functions ----
+ * An optimizing build of ordinary C calls __memcpy_chk, __strcpy_chk and the
+ * rest instead of the plain functions whenever the compiler knows the size of
+ * the destination, so a program that only ever wrote strcpy imports
+ * ___strcpy_chk.  They are bridged exactly like their plain counterparts, with
+ * the destination size as one more integer argument; the native versions do the
+ * bounds check and abort on overflow.  The variadic ones, __sprintf_chk and
+ * __snprintf_chk, stay out for the same reason printf does.
+ *
  * ---- why null has to survive the conversion ----
  * ocerz_g2h is affine: it adds a base.  Applied to a null guest pointer it
  * produces the base of the arena, which is a plausible-looking address that is
@@ -211,6 +233,30 @@ static struct OcerzBridgeFn g_br_fns[] = {
     { BR_LIBSYSTEM, "_dispatch_semaphore_wait",   "dispatch_semaphore_wait",   "l(pL)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "_dispatch_semaphore_signal", "dispatch_semaphore_signal", "l(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "_dispatch_release",          "dispatch_release",          "v(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___memcpy_chk",              "__memcpy_chk",               "p(ppLL)",        NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___memmove_chk",             "__memmove_chk",              "p(ppLL)",        NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___memset_chk",              "__memset_chk",               "p(piLL)",        NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___strcpy_chk",              "__strcpy_chk",               "p(ppL)",         NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___stpcpy_chk",              "__stpcpy_chk",               "p(ppL)",         NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___strcat_chk",              "__strcat_chk",               "p(ppL)",         NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___strncpy_chk",             "__strncpy_chk",              "p(ppLL)",        NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___stpncpy_chk",             "__stpncpy_chk",              "p(ppLL)",        NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___strncat_chk",             "__strncat_chk",              "p(ppLL)",        NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___strlcpy_chk",             "__strlcpy_chk",              "L(ppLL)",        NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "___strlcat_chk",             "__strlcat_chk",              "L(ppLL)",        NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_create",            "pthread_create",            "i(ppc{p(p)}p)",  NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_join",              "pthread_join",              "i(pp)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_detach",            "pthread_detach",            "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_self",              "pthread_self",              "p()",            NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_mutex_init",        "pthread_mutex_init",        "i(pp)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_mutex_lock",        "pthread_mutex_lock",        "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_mutex_unlock",      "pthread_mutex_unlock",      "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_mutex_destroy",     "pthread_mutex_destroy",     "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_cond_init",         "pthread_cond_init",         "i(pp)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_cond_wait",         "pthread_cond_wait",         "i(pp)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_cond_signal",       "pthread_cond_signal",       "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_cond_broadcast",    "pthread_cond_broadcast",    "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_cond_destroy",      "pthread_cond_destroy",      "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
 
     { BR_LIBSYSTEM, "_exit",             NULL, NULL, br_exit,            NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "_abort",            NULL, NULL, br_abort,           NULL, { 0, { 0 }, { { 0 } }, 0 } },
