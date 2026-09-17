@@ -11,15 +11,27 @@
  * ---- the denominator ----
  * What the library exports comes from its .tbd, never from the headers.  Every
  * symbol, weak symbol and thread-local symbol listed for x86_64-macos counts,
- * together with those of each re-exported library that names a parent
- * umbrella; $ld$ pseudo-symbols are linker instructions, not exports, and are
- * skipped and counted.  The Objective-C classes, exception types and ivars a
- * .tbd lists apart from its symbols are exports as well, under the names the
- * linker gives them: _OBJC_CLASS_$_<class> and _OBJC_METACLASS_$_<class> for
- * a class, _OBJC_EHTYPE_$_<class> for an exception type and
- * _OBJC_IVAR_$_<class>.<ivar> for an ivar.  So the total in the coverage report
- * is the size of the real x86_64 library's export list, and an export no
- * header describes is still in it.
+ * together with those of each re-exported library a guest reaches through this
+ * one; $ld$ pseudo-symbols are linker instructions, not exports, and are
+ * skipped and counted.  Which re-exported libraries those are is the linker's
+ * rule.  ld links a re-exported library directly, with a load command of its
+ * own in the program, when its install name is in a public location: directly
+ * in /usr/lib, or the binary of a top-level framework in
+ * /System/Library/Frameworks.  Every other re-exported library's symbols are
+ * bound by the umbrella's ordinal, and the loader resolves an import in the
+ * library its ordinal names and nowhere else.  So a re-exported library is
+ * folded in when it names a parent umbrella, as the parts of libSystem under
+ * /usr/lib/system do, or when its install name is not public, as AppKit's
+ * UIFoundation and CollectionViewCore in /System/Library/PrivateFrameworks are:
+ * an x86_64 program that uses NSFontAttributeName or NSParagraphStyle imports
+ * it from AppKit.  CoreFoundation, libobjc, Foundation and ApplicationServices
+ * are public, so each keeps its exports in its own file.  The Objective-C
+ * classes, exception types and ivars a .tbd lists apart from its symbols are
+ * exports as well, under the names the linker gives them: _OBJC_CLASS_$_<class>
+ * and _OBJC_METACLASS_$_<class> for a class, _OBJC_EHTYPE_$_<class> for an
+ * exception type and _OBJC_IVAR_$_<class>.<ivar> for an ivar.  So the total in
+ * the coverage report is the size of the real x86_64 library's export list, and
+ * an export no header describes is still in it.
  *
  * ---- finding the declaration ----
  * Each pass in tools/sdkgen/libraries is an umbrella header parsed twice by
@@ -1631,13 +1643,30 @@ static const TbdDoc *find_doc(const TbdFile *main, const char *install, TbdFile 
     return d;
 }
 
+static int public_location(const char *install)
+{
+    if (strncmp(install, "/usr/lib/", 9) == 0)
+        return strchr(install + 9, '/') == NULL;
+    const char *fw = "/System/Library/Frameworks/";
+    size_t fwlen = strlen(fw);
+    if (strncmp(install, fw, fwlen) != 0)
+        return 0;
+    const char *name = install + fwlen;
+    const char *dot = strchr(name, '.');
+    if (!dot || strncmp(dot, ".framework/", 11) != 0)
+        return 0;
+    size_t nlen = (size_t)(dot - name);
+    size_t len = strlen(install);
+    return len > nlen && install[len - nlen - 1] == '/' && strncmp(install + len - nlen, name, nlen) == 0;
+}
+
 static void collect_doc(ExportSet *e, const TbdFile *main, const TbdDoc *doc, Map *seen,
                         TbdFile **extra, int *nextra, int top)
 {
     if (map_get(seen, doc->install_name) >= 0)
         return;
     map_set(seen, doc->install_name, 1);
-    if (!top && doc->parent_umbrella.n == 0)
+    if (!top && doc->parent_umbrella.n == 0 && public_location(doc->install_name))
         return;
     collect_section(e, &doc->exports);
     collect_section(e, &doc->reexports);

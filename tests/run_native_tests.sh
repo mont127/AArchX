@@ -262,7 +262,7 @@
 # with cache mode, where the real x86 libpthread runs the same start routines on
 # threads ocerz creates for the guest.
 #
-# The thread, tlv_*, signal_*, cf_* and M10 fixtures alone are built without
+# The thread, tlv_*, signal_*, cf_*, M10 and M11 fixtures alone are built without
 # -fno-stack-protector, and that is deliberate. clang emits the stack protector
 # by default, and a protected x86_64 function reads ___stack_chk_guard, which is
 # a data symbol rather than a function. Until M7a the virtual libSystem exported only functions, so a
@@ -877,6 +877,173 @@
 # record whose handler this build of ocerz does not have says that, rather than
 # only that an export was unimplemented.
 #
+# M11 lets a guest define Objective-C classes, categories and protocols of its
+# own and hand them to the host's frameworks. Everything M10 did ran one way:
+# the guest sent messages to native objects. A class of the guest's runs the
+# other way as well. Its metadata lies in the guest's image, compiled for
+# x86_64, and has to become a class the native runtime knows by name, with a
+# native superclass and a native root metaclass; its methods are x86 code that
+# native Foundation and AppKit reach through their own objc_msgSend, so every
+# implementation the runtime hands out has to enter the guest with the method's
+# arguments moved from where arm64 passes them to where x86-64 does, and its
+# result moved back; a category has to be attached to a native class that
+# already exists; a protocol the image carries has to be replaced by the one the
+# runtime registers under that name; and every +load method in the image has to
+# have run before main. Three fixtures cover it, compiled at test time and
+# shaped like the M10 ones: one status line per group, the bits in source
+# order, then "<name> ok" or "<name> bad:<hex>" with a bit per failed group, and
+# progress notes on stderr.
+#
+# Instance variables are where a class of the guest's is most easily wrong with
+# nothing crashing. The compiler lays a class's ivars out after the superclass's
+# size as the SDK's headers declare it and writes each offset into a variable of
+# its own, which every access in the guest's code reads; the runtime lays them
+# out again after the superclass's real size and rewrites those variables.
+# NSObject's size is 8 either way, so an NSObject subclass slides by nothing.
+# NSView's header declares no ivars, so the compiler starts a subclass's at
+# offset 8, and the native NSView is 536 bytes on macOS 26, so the runtime
+# slides every one of them by 528. A class realized without rewriting the
+# guest's variables leaves guest code reading and writing NSView's own ivars
+# while native code, key-value coding among it, uses the slid offsets. Both
+# kinds of class are covered, and in both the fixture compares what guest code
+# reads with what valueForKey: reads, since key-value coding finds an ivar that
+# has no accessor through the native runtime and reads it at the native offset.
+#
+# objc_classes defines, against Foundation alone, a protocol OcerzNamed, a class
+# OcerzShape : NSObject adopting it and NSCopying, a subclass OcerzSquare, and a
+# category on NSString, and uses them in ten groups. load checks what happened
+# before main: the +load methods of both classes and of the category ran once
+# each, in the order the runtime promises, the superclass's before the
+# subclass's although the subclass comes first in the image's list, and every
+# class's before any category's; and neither class's +initialize ran until the
+# first message to it, after which each ran exactly once, handed its own class.
+# object makes instances through a class method factory and through the
+# designated initializer, and reads the int, the double, the strong NSString and
+# the weak id back through the properties and directly from the ivars, which
+# must agree. The string's property is atomic, so its accessors are
+# objc_getProperty and objc_setProperty_atomic, native functions handed the
+# ivar's offset. The class must be the one NSClassFromString names, and
+# valueForKey: and setValue:forKey: must reach the guest's own accessors through
+# native Foundation, boxing and unboxing an int and a double on the way.
+# describe formats an instance with %@, which must call the guest's -description
+# exactly once, and takes -debugDescription and the description of an NSArray
+# holding two instances, which call it from native code; the strings are written
+# after the status line. equality gives the class -isEqual: and -hash and needs
+# NSSet to collapse two distinct equal instances into one, and
+# NSMutableDictionary to keep them as one key, which it copies through the
+# guest's -copyWithZone:. -hash folds the sides in above bit 32, and the line
+# prints a checksum of the order in which an NSMutableSet of twelve instances
+# enumerates them. That order follows the buckets the hashes select, as the key
+# order in cf_callbacks does, so a hash cut to 32 bits on its way back to native
+# code moves it: an arm64 build whose -hash makes that cut itself prints
+# bbfb12a4 where the fixture prints b206cbcc. sort sorts six instances with
+# sortedArrayUsingSelector:@selector(compare:), where every result of the
+# guest's -compare: is a 64-bit NSComparisonResult that must reach native code
+# as -1 rather than as 4294967295. subclass checks that OcerzSquare's
+# initializer reaches OcerzShape's through super, that the superclass's ivars
+# keep their values when the subclass writes its own and the other way round,
+# and that key-value coding reads and writes the subclass's accessor-less ivars
+# exactly where guest code does; its -description and -isEqual: override
+# OcerzShape's and call super. category sends the category's methods to an
+# @"..." literal, a string created at run time, a tagged one, a mutable one and
+# the class itself, one of them returning 64 bits, and asks respondsToSelector:
+# and instancesRespondToSelector: about them. protocol asks conformsToProtocol:
+# of the class, an instance and the subclass about OcerzNamed and about
+# NSCopying, NSObject and NSCoding, of which the image carries copies of its
+# own, and requires NSProtocolFromString to return the very object
+# @protocol(...) refers to for OcerzNamed and for NSCopying. lifetime lets the
+# last strong reference to an instance go inside an @autoreleasepool, after
+# which a weak reference to it must read nil, the guest's -dealloc must have run
+# once with the name still set, and a weak reference to that name must read nil
+# too, which only the ARC-generated .cxx_destruct releasing the ivar brings
+# about; a weak property must read nil once the object it held is gone, an
+# OcerzSquare must run its own -dealloc and then OcerzShape's, and an instance
+# held only by an NSMutableArray must live exactly until removeAllObjects.
+# perform sends performSelector:, performSelector:withObject: and
+# performSelector:withObject:withObject: to instances and to the class, so
+# native NSObject makes the call into guest methods on the guest's behalf.
+#
+# objc_view_render defines OcerzTestView : NSView against AppKit, overriding
+# -drawRect: and -isFlipped, and renders it with no window and no NSApplication:
+# bitmapImageRepForCachingDisplayInRect: gives a bitmap for the view's bounds and
+# cacheDisplayInRect:toBitmapImageRep: draws the view into it, and then into a
+# second, 32 by 24 pixel device RGB bitmap the fixture creates. -drawRect: calls
+# [super drawRect:], turns antialiasing off, fills the bounds and an integral
+# rect with NSRectFill in solid device colors, fills another integral rect
+# through CoreGraphics on the context's CGContext, and strokes an NSBezierPath
+# along half-pixel coordinates, so every pixel is exactly one of four colors.
+# view checks the class, the result of sending -isFlipped from guest code, and
+# the frame and bounds, which x86_64 gets back through objc_msgSend_stret. render
+# checks that AppKit called -drawRect: once per bitmap, on the view, with the
+# bounds as its dirty rect by value and a flipped current context holding a
+# CGContext, and that it called the -isFlipped override itself, and the line
+# prints the number of each and the backing scale. pixels probes the device
+# bitmap where every shape must be and where each would be if the view were not
+# flipped, checks that the cached bitmap is red where the red rect is, and
+# prints a checksum of each bitmap's bytes.
+#
+# The checksums are compared, so the bitmaps must come out the same on every
+# run. The device bitmap has no color management between the colors and the
+# bytes and no antialiased edge, and its probes ask for exact bytes. The cached
+# bitmap is Generic RGB at the main screen's backing scale, so its bytes pass
+# through a color conversion and its size depends on the display: 64 by 48 on a
+# Retina Mac, and 32 by 24 when a sandbox profile denies the process the window
+# server, where AppKit still draws. The scale is the same for every process in
+# one run of this gate, and the arm64 build and cache mode, with x86 AppKit and
+# CoreGraphics beneath it, wrote the same bytes into both bitmaps and counted the
+# same ten -isFlipped calls. The case still runs the arm64 build VIEW_RUNS times
+# and requires the same output every time before it compares anything, since a
+# bitmap that varied by itself would fail every comparison for a reason that has
+# nothing to do with native mode.
+#
+# objc_view_ivar is about ivars written in -initWithFrame: and read in
+# -drawRect:. OcerzIvarView : NSView declares an int, a double, a strong NSColor,
+# an NSRect and a trailing unsigned char, and -initWithFrame: sets all five
+# after [super initWithFrame:]; main then overwrites them in a second view.
+# layout checks that the first ivar lies at or past the native NSView's instance
+# size as class_getInstanceSize reports it, that the class's own size covers the
+# last, that the frame NSView keeps in ivars of its own survived the writes, and
+# that valueForKey: and setValue:forKey: see each view's values where guest code
+# put them. draw renders each view into a device RGB bitmap of its own and
+# checks that -drawRect: ran on the right view and saw every value that view was
+# given, and pixels finds each view's color filling its own box and nowhere
+# else. Both view fixtures draw with antialiasing off in device colors and are
+# held to VIEW_RUNS identical arm64 runs in the same way.
+#
+# A host where AppKit cannot draw offscreen at all is not a failure of native
+# mode. The view fixtures say so with a line "<name> unavailable <why>" in place
+# of their remaining status lines, and exit 2, when
+# bitmapImageRepForCachingDisplayInRect: returns nil, when no device RGB bitmap
+# can be made, or when cacheDisplayInRect:toBitmapImageRep: never calls
+# -drawRect:. That line from the arm64 build, or an arm64 build that fails
+# naming the window server on stderr, skips the case with the reason. The same
+# line from native mode, where the arm64 build drew, fails like any other
+# missing status line.
+#
+# Nothing these fixtures print differed between the arm64 build and cache mode,
+# and they are written so that nothing should. A description carries the
+# class's name and the instance's fields and no address; every hash is computed
+# by the fixture from its own fields and never printed, so no build of
+# Foundation hashes anything the output depends on; the NSSet order and the
+# -isFlipped count, which depend on the framework rather than on the fixture,
+# came out the same from both builds; and every BOOL is compared with YES or NO,
+# as in M10.
+#
+# The M11 cases check their imports the way the M10 ones do, against the M10
+# names and those the M11 fixtures add, AppKit's and the two CoreGraphics
+# functions among them for the view fixtures, and require the names without
+# which they would prove nothing: objc_msgSendSuper2, NSObject's metaclass and
+# _objc_empty_cache, which every class the guest defines binds, objc_storeWeak
+# and objc_loadWeakRetained, and objc_getProperty and objc_setProperty_atomic in
+# objc_classes; NSView's class and metaclass, NSRectFill, CGContextFillRect and
+# objc_msgSend_stret in objc_view_render; and NSView's metaclass and
+# class_getInstanceSize in objc_view_ivar. objc_classes also imports
+# _Unwind_Resume and __objc_personality_v0, because clang gives a function
+# holding a __weak local a cleanup to run if an exception unwinds through it.
+# The virtual libraries export both and nothing calls either, since the fixture
+# throws nothing. The M11 runs, the arm64 ones included, are bounded at
+# OBJC_TIMEOUT seconds, like the M10 ones.
+#
 # native_classic_bind pins the one import every older Intel binary makes. A
 # program linked for a macOS before 12 uses classic lazy binding, whose
 # __stub_helper entries jump to dyld_stub_binder, so it imports that symbol from
@@ -887,6 +1054,16 @@
 # for 10.14, checks with otool and nm that it really has classic binds and
 # really imports dyld_stub_binder, so a toolchain that stops producing either is
 # reported as that, and then requires it to run and agree with cache mode.
+#
+# native_constructors pins the initializers a guest image carries. Native mode
+# runs no libSystem initializer, and the initializer phase cache mode gates on it
+# used to be the only thing that ran a guest's own constructors, so for a while a
+# C constructor or a C++ static object was silently skipped. The fixture is a
+# C++ program linked against a guest dylib: the dylib's constructor must run
+# before the program's, the program's constructors must all run before main, and
+# main must see what each wrote. The order among the main image's own
+# constructors is the linker's, so the case accepts any of the orders it can
+# choose and relies on cache mode to agree on the exact one.
 #
 # native_exit pins the three ways a process ends. Returning from main and
 # calling exit must run the guest's atexit handlers, most recent first, after
@@ -899,12 +1076,12 @@
 # ocerz's own exit and so flushes host stdio. Each way is compared with cache
 # mode, status and output.
 #
-# The callback, attach, thread, tlv_*, signal_*, cf_* and M10 cases skip where
-# there is no x86_64 clang, like the others, but a fixture of theirs that fails
-# to compile where a trivial x86_64 program compiles fine is a failure: skipping
-# it would hide a broken fixture indefinitely. So is a cf_* or M10 fixture whose
-# arm64 build fails to compile where its x86_64 build did, since that leaves the
-# case without its host oracle.
+# The callback, attach, thread, tlv_*, signal_*, cf_*, M10 and M11 cases skip
+# where there is no x86_64 clang, like the others, but a fixture of theirs that
+# fails to compile where a trivial x86_64 program compiles fine is a failure:
+# skipping it would hide a broken fixture indefinitely. So is a cf_*, M10 or M11
+# fixture whose arm64 build fails to compile where its x86_64 build did, since
+# that leaves the case without its host oracle.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -1071,6 +1248,25 @@ OBJC_EXPORTS="$OBJC_EXPORTS _NSLog _NSClassFromString _NSStringFromRange _NSRang
 OBJC_EXPORTS="$OBJC_EXPORTS _OBJC_CLASS_\$_NSString _OBJC_CLASS_\$_NSMutableString _OBJC_CLASS_\$_NSNumber _OBJC_CLASS_\$_NSValue"
 OBJC_EXPORTS="$OBJC_EXPORTS _OBJC_CLASS_\$_NSConstantIntegerNumber _OBJC_CLASS_\$_NSConstantDoubleNumber _OBJC_CLASS_\$_NSArray _OBJC_CLASS_\$_NSDictionary"
 OBJC_EXPORTS="$OBJC_EXPORTS _CFStringCreateWithFormat _CFStringAppendFormat"
+OBJC_CLASSES_BIN=""
+OBJC_CLASSES_ARM64=""
+OBJC_VIEW_RENDER_BIN=""
+OBJC_VIEW_RENDER_ARM64=""
+OBJC_VIEW_IVAR_BIN=""
+OBJC_VIEW_IVAR_ARM64=""
+VIEW_RUNS=3
+APPKIT_FRAMEWORK=/System/Library/Frameworks/AppKit.framework
+CG_FRAMEWORK=/System/Library/Frameworks/CoreGraphics.framework
+VIEW_NO_SERVER_RE='WindowServer|window server|CGSConnection|CGS_REQUIRE_INIT'
+OBJC_CLASS_EXPORTS='_objc_msgSendSuper2 _objc_msgSend_stret __objc_empty_cache _objc_enumerationMutation _class_getInstanceSize'
+OBJC_CLASS_EXPORTS="$OBJC_CLASS_EXPORTS _OBJC_CLASS_\$_NSObject _OBJC_METACLASS_\$_NSObject"
+OBJC_CLASS_EXPORTS="$OBJC_CLASS_EXPORTS _objc_storeWeak _objc_initWeak _objc_loadWeakRetained _objc_destroyWeak _objc_getProperty _objc_setProperty_atomic"
+OBJC_CLASS_EXPORTS="$OBJC_CLASS_EXPORTS __Unwind_Resume ___objc_personality_v0"
+OBJC_CLASS_EXPORTS="$OBJC_CLASS_EXPORTS _NSStringFromClass _NSStringFromProtocol _NSProtocolFromString _NSSelectorFromString _NSStringFromRect"
+OBJC_CLASS_EXPORTS="$OBJC_CLASS_EXPORTS _OBJC_CLASS_\$_NSSet _OBJC_CLASS_\$_NSMutableSet _OBJC_CLASS_\$_NSMutableArray _OBJC_CLASS_\$_NSMutableDictionary"
+APPKIT_EXPORTS='_NSRectFill _NSDeviceRGBColorSpace _CGContextSetRGBFillColor _CGContextFillRect'
+APPKIT_EXPORTS="$APPKIT_EXPORTS _OBJC_CLASS_\$_NSView _OBJC_METACLASS_\$_NSView _OBJC_CLASS_\$_NSColor _OBJC_CLASS_\$_NSBezierPath"
+APPKIT_EXPORTS="$APPKIT_EXPORTS _OBJC_CLASS_\$_NSBitmapImageRep _OBJC_CLASS_\$_NSGraphicsContext"
 MEASURE_BIN=/usr/bin/time
 
 unset OCERZ_MODE
@@ -7204,6 +7400,1085 @@ EOC
     done
 }
 
+build_objc_class_fixtures() {
+    local name framework
+
+    cat > "$TMP/appkit_common.h" <<'EOC'
+#import <AppKit/AppKit.h>
+#include "objc_common.h"
+
+static int view_unavailable(const char *tag, const char *why)
+{
+    cb_len = 0;
+    cb_str(tag);
+    cb_str(" unavailable ");
+    cb_str(why);
+    cb_end();
+    return 2;
+}
+
+static NSBitmapImageRep *view_device_rep(long w, long h)
+{
+    return [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:w pixelsHigh:h bitsPerSample:8 samplesPerPixel:4
+                                                     hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace
+                                                  bytesPerRow:0 bitsPerPixel:0];
+}
+
+static unsigned view_checksum(NSBitmapImageRep *rep)
+{
+    unsigned char *d = rep != nil ? [rep bitmapData] : 0;
+    long bpp = [rep bitsPerPixel] / 8, row = [rep bytesPerRow], w = [rep pixelsWide], h = [rep pixelsHigh], x, y;
+    unsigned sum = 0x811c9dc5u;
+
+    if (d == 0 || bpp <= 0 || row < w * bpp)
+        return 0;
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w * bpp; x++) {
+            sum ^= d[y * row + x];
+            sum *= 0x01000193u;
+        }
+    }
+    return sum;
+}
+
+static unsigned view_pixel(NSBitmapImageRep *rep, long x, long y)
+{
+    unsigned char *d = rep != nil ? [rep bitmapData] : 0;
+    unsigned char *p;
+
+    if (d == 0 || [rep bitsPerPixel] != 32 || x < 0 || y < 0 || x >= [rep pixelsWide] || y >= [rep pixelsHigh])
+        return 1;
+    p = d + y * [rep bytesPerRow] + x * 4;
+    return (unsigned)p[0] << 24 | (unsigned)p[1] << 16 | (unsigned)p[2] << 8 | p[3];
+}
+
+static int view_rect_is(NSRect r, double x, double y, double w, double h)
+{
+    return r.origin.x == x && r.origin.y == y && r.size.width == w && r.size.height == h;
+}
+EOC
+
+    cat > "$TMP/objc_classes.m" <<'EOC'
+#include "objc_common.h"
+
+#define TAG "objc_classes"
+
+static char g_load_order[8];
+static int g_load_n;
+static unsigned g_loaded;
+static int g_init_shape, g_init_square, g_init_other;
+static int g_dealloc_shape, g_dealloc_square, g_dealloc_name_alive;
+static int g_copies, g_equal_calls, g_hash_calls, g_compare_calls, g_desc_calls, g_perform_calls, g_super_equal;
+
+@protocol OcerzNamed <NSObject>
+- (NSString *)name;
+@optional
+- (void)ocerzOptional;
+@end
+
+@interface OcerzShape : NSObject <OcerzNamed, NSCopying>
+{
+@public
+    int _sides;
+    double _area;
+    NSString *_name;
+    __weak id _owner;
+}
+@property (nonatomic) int sides;
+@property (nonatomic) double area;
+@property (strong) NSString *name;
+@property (nonatomic, weak) id owner;
++ (instancetype)shapeWithName:(NSString *)name sides:(int)sides area:(double)area;
++ (id)shapeNamed:(NSString *)name;
+- (instancetype)initWithName:(NSString *)name sides:(int)sides area:(double)area NS_DESIGNATED_INITIALIZER;
+- (instancetype)init NS_UNAVAILABLE;
+- (NSComparisonResult)compare:(OcerzShape *)other;
+- (id)scaledBy:(NSNumber *)factor;
+- (id)joinedWith:(id)a and:(id)b;
+@end
+
+@interface OcerzSquare : OcerzShape
+{
+@public
+    double _side;
+    int _tag;
+}
+- (instancetype)initWithSide:(double)side;
+@end
+
+@interface NSString (OcerzExtras)
++ (NSString *)ocerzGreeting;
+- (NSString *)ocerzReversed;
+- (long long)ocerzChecksum;
+@end
+
+static long long fnv64(const char *s)
+{
+    unsigned long long h = 0xcbf29ce484222325ull;
+
+    while (s != 0 && *s) {
+        h ^= (unsigned char)*s++;
+        h *= 0x100000001b3ull;
+    }
+    return (long long)h;
+}
+
+@implementation OcerzSquare
+
++ (void)load
+{
+    g_load_order[g_load_n++] = 'Q';
+}
+
++ (void)initialize
+{
+    if (self == [OcerzSquare class])
+        g_init_square++;
+    else
+        g_init_other++;
+}
+
+- (instancetype)initWithSide:(double)side
+{
+    self = [super initWithName:[NSString stringWithUTF8String:"square"] sides:4 area:side * side];
+    if (self != nil) {
+        _side = side;
+        _tag = 0x5a5a;
+    }
+    return self;
+}
+
+- (NSString *)description
+{
+    return [NSString stringWithFormat:@"%@ side=%.1f", [super description], _side];
+}
+
+- (BOOL)isEqual:(id)other
+{
+    int same = [super isEqual:other];
+
+    g_super_equal++;
+    return same == YES && [other isKindOfClass:[OcerzSquare class]] == YES && ((OcerzSquare *)other)->_side == _side;
+}
+
+- (void)dealloc
+{
+    g_dealloc_square++;
+}
+
+@end
+
+@implementation OcerzShape
+
+@synthesize sides = _sides, area = _area, name = _name, owner = _owner;
+
++ (void)load
+{
+    g_loaded = 0x10ad;
+    g_load_order[g_load_n++] = 'S';
+}
+
++ (void)initialize
+{
+    if (self == [OcerzShape class])
+        g_init_shape++;
+    else
+        g_init_other++;
+}
+
++ (instancetype)shapeWithName:(NSString *)name sides:(int)sides area:(double)area
+{
+    return [[self alloc] initWithName:name sides:sides area:area];
+}
+
++ (id)shapeNamed:(NSString *)name
+{
+    g_perform_calls++;
+    return [[self alloc] initWithName:name sides:6 area:6.5];
+}
+
+- (instancetype)initWithName:(NSString *)name sides:(int)sides area:(double)area
+{
+    self = [super init];
+    if (self != nil) {
+        _name = name;
+        _sides = sides;
+        _area = area;
+    }
+    return self;
+}
+
+- (id)copyWithZone:(NSZone *)zone
+{
+    OcerzShape *c = [[[self class] allocWithZone:zone] initWithName:_name sides:_sides area:_area];
+
+    g_copies++;
+    return c;
+}
+
+- (NSString *)description
+{
+    g_desc_calls++;
+    return [NSString stringWithFormat:@"<%@ %@ sides=%d area=%.2f>", NSStringFromClass([self class]), _name, _sides, _area];
+}
+
+- (BOOL)isEqual:(id)other
+{
+    OcerzShape *o;
+
+    g_equal_calls++;
+    if (other == self)
+        return YES;
+    if ([other isKindOfClass:[OcerzShape class]] != YES)
+        return NO;
+    o = other;
+    return o->_sides == _sides && o->_area == _area && [o->_name isEqualToString:_name] == YES;
+}
+
+- (NSUInteger)hash
+{
+    g_hash_calls++;
+    return (NSUInteger)fnv64([_name UTF8String]) ^ ((NSUInteger)_sides << 44) ^ (NSUInteger)(long long)(_area * 1000.0);
+}
+
+- (NSComparisonResult)compare:(OcerzShape *)other
+{
+    g_compare_calls++;
+    if (_area != other->_area)
+        return _area < other->_area ? NSOrderedAscending : NSOrderedDescending;
+    if (_sides != other->_sides)
+        return _sides < other->_sides ? NSOrderedAscending : NSOrderedDescending;
+    return NSOrderedSame;
+}
+
+- (id)scaledBy:(NSNumber *)factor
+{
+    g_perform_calls++;
+    return [[OcerzShape alloc] initWithName:_name sides:_sides area:_area * [factor doubleValue]];
+}
+
+- (id)joinedWith:(id)a and:(id)b
+{
+    g_perform_calls++;
+    return [NSString stringWithFormat:@"%@+%@+%@", _name, [a name], [b name]];
+}
+
+- (void)dealloc
+{
+    g_dealloc_shape++;
+    g_dealloc_name_alive = _name != nil && [_name length] > 0;
+}
+
+@end
+
+@implementation NSString (OcerzExtras)
+
++ (void)load
+{
+    g_load_order[g_load_n++] = 'C';
+}
+
++ (NSString *)ocerzGreeting
+{
+    return [NSString stringWithUTF8String:"hello from a category"];
+}
+
+- (NSString *)ocerzReversed
+{
+    NSMutableString *out = [NSMutableString stringWithCapacity:[self length]];
+    NSUInteger i = [self length];
+
+    while (i > 0) {
+        i--;
+        [out appendString:[self substringWithRange:NSMakeRange(i, 1)]];
+    }
+    return out;
+}
+
+- (long long)ocerzChecksum
+{
+    return fnv64([self UTF8String]);
+}
+
+@end
+
+static void objc_put(NSString *s)
+{
+    const char *text = s != nil ? [s UTF8String] : "(nil)";
+    cb_size n = 0;
+
+    while (text[n])
+        n++;
+    write(1, text, n);
+    write(1, "\n", 1);
+}
+
+static void cf_text(const char *key, const char *v)
+{
+    cb_str(" ");
+    cb_str(key);
+    cb_str("=");
+    cb_str(v);
+}
+
+static void group_load(void)
+{
+    unsigned m = 0, bit = 1;
+    int before_shape = g_init_shape, before_square = g_init_square;
+    OcerzShape *s;
+    OcerzSquare *q;
+    int after_shape, after_square;
+
+    CK(g_loaded == 0x10ad);
+    CK(g_load_n == 3 && g_load_order[0] == 'S' && g_load_order[1] == 'Q' && g_load_order[2] == 'C');
+    CK(before_shape == 0 && before_square == 0);
+    s = [OcerzShape shapeWithName:@"first" sides:3 area:1.0];
+    after_shape = g_init_shape;
+    after_square = g_init_square;
+    CK(s != nil && after_shape == 1 && after_square == 0);
+    q = [[OcerzSquare alloc] initWithSide:2.0];
+    CK(q != nil && g_init_shape == 1 && g_init_square == 1);
+    s = [OcerzShape shapeWithName:@"again" sides:5 area:2.0];
+    q = [[OcerzSquare alloc] initWithSide:3.0];
+    CK(g_init_shape == 1 && g_init_square == 1 && g_init_other == 0);
+
+    cf_begin(TAG, "load", m);
+    cf_text("order", g_load_order);
+    cf_long("init", g_init_shape + g_init_square + g_init_other);
+    cb_end();
+}
+
+static void group_object(void)
+{
+    unsigned m = 0, bit = 1;
+    OcerzShape *t = [OcerzShape shapeWithName:[NSString stringWithUTF8String:"triangle"] sides:3 area:1.5];
+    OcerzShape *q = [[OcerzShape alloc] initWithName:@"quad" sides:4 area:2.25];
+    NSString *pent = [NSString stringWithUTF8String:"pentagon with a name too long to be tagged"];
+
+    CK(t != nil && [t class] == [OcerzShape class] && [t superclass] == [NSObject class] && [OcerzShape superclass] == [NSObject class]);
+    CK([t isKindOfClass:[NSObject class]] == YES && [t isMemberOfClass:[OcerzShape class]] == YES && [t isKindOfClass:[NSString class]] == NO);
+    CK(objc_text_is(NSStringFromClass([t class]), "OcerzShape") && NSClassFromString(@"OcerzShape") == [OcerzShape class]);
+    CK(t.sides == 3 && t.area == 1.5 && objc_text_is(t.name, "triangle") && t->_sides == 3 && t->_area == 1.5);
+    t.sides = 5;
+    t.area = -0.75;
+    t.name = pent;
+    CK(t->_sides == 5 && [t sides] == 5 && t->_area == -0.75 && [t area] == -0.75);
+    CK(t->_name == pent && [t name] == pent);
+    t.owner = q;
+    CK(t.owner == q && t->_owner == q);
+    CK([[t valueForKey:@"sides"] intValue] == 5 && [[t valueForKey:@"area"] doubleValue] == -0.75 && [t valueForKey:@"name"] == pent);
+    [t setValue:[NSNumber numberWithInt:7] forKey:@"sides"];
+    [t setValue:[NSNumber numberWithDouble:12.5] forKey:@"area"];
+    CK(t->_sides == 7 && t->_area == 12.5 && t.owner == q);
+
+    cf_begin(TAG, "object", m);
+    cf_long("sides", t->_sides);
+    cf_long("area", (long)(t->_area * 100.0));
+    cb_end();
+}
+
+static void group_describe(void)
+{
+    unsigned m = 0, bit = 1;
+    OcerzShape *t = [OcerzShape shapeWithName:@"hexagon" sides:6 area:-0.75];
+    OcerzShape *q = [[OcerzShape alloc] initWithName:[NSString stringWithUTF8String:"quad"] sides:4 area:2.25];
+    int calls0 = g_desc_calls, calls1;
+    NSString *formatted = [NSString stringWithFormat:@"%@", t];
+    NSString *direct, *debug, *listed;
+
+    calls1 = g_desc_calls;
+    direct = [t description];
+    debug = [t debugDescription];
+    listed = [[NSArray arrayWithObjects:t, q, nil] description];
+
+    CK(objc_text_is(formatted, "<OcerzShape hexagon sides=6 area=-0.75>"));
+    CK(calls1 == calls0 + 1);
+    CK([formatted isEqualToString:direct] == YES && [debug isEqualToString:direct] == YES);
+    CK(listed != nil && [listed rangeOfString:@"<OcerzShape hexagon sides=6 area=-0.75>"].location != NSNotFound &&
+       [listed rangeOfString:@"<OcerzShape quad sides=4 area=2.25>"].location != NSNotFound);
+    CK(g_desc_calls == calls0 + 5);
+
+    cf_begin(TAG, "describe", m);
+    cf_long("len", formatted != nil ? (long)[formatted length] : -1);
+    cb_end();
+    objc_put(formatted);
+    objc_put(listed);
+}
+
+static void group_equality(void)
+{
+    unsigned m = 0, bit = 1;
+    OcerzShape *a = [[OcerzShape alloc] initWithName:[NSString stringWithUTF8String:"equal shape"] sides:4 area:1.0];
+    OcerzShape *b = [[OcerzShape alloc] initWithName:@"equal shape" sides:4 area:1.0];
+    OcerzShape *c = [[OcerzShape alloc] initWithName:@"equal shape" sides:5 area:1.0];
+    OcerzShape *probe = [[OcerzShape alloc] initWithName:[NSString stringWithUTF8String:"equal shape"] sides:4 area:1.0];
+    NSString *first = [NSString stringWithUTF8String:"the first value stored"];
+    NSString *second = [NSString stringWithUTF8String:"the second value stored"];
+    int e0 = g_equal_calls, h0 = g_hash_calls, c0, member_ok;
+    NSSet *set;
+    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+    NSMutableSet *many = [NSMutableSet set];
+    id key, member;
+    unsigned order = 0x811c9dc5u;
+    int i;
+
+    CK(a != b && [a isEqual:b] == YES && [b isEqual:a] == YES && [a isEqual:c] == NO && [a isEqual:@"equal shape"] == NO);
+    CK([a hash] == [b hash] && [a hash] == [probe hash] && [a hash] != [c hash]);
+    e0 = g_equal_calls;
+    h0 = g_hash_calls;
+    set = [NSSet setWithObjects:a, b, c, nil];
+    member = [set member:probe];
+    member_ok = member == a || member == b;
+    CK(set != nil && [set count] == 2 && [set containsObject:probe] == YES && member_ok);
+    CK(g_hash_calls > h0 && g_equal_calls > e0);
+    c0 = g_copies;
+    [dict setObject:first forKey:a];
+    [dict setObject:second forKey:b];
+    key = [[dict allKeys] firstObject];
+    CK([dict count] == 1 && [dict objectForKey:probe] == second && [dict objectForKey:c] == nil);
+    CK(g_copies > c0 && key != a && key != b && [key isEqual:a] == YES && [key class] == [OcerzShape class]);
+    for (i = 0; i < 12; i++) {
+        char nm[16] = "shape-";
+        nm[6] = (char)('a' + i);
+        [many addObject:[[OcerzShape alloc] initWithName:[NSString stringWithUTF8String:nm] sides:i + 3 area:i * 0.5]];
+    }
+    [many addObject:[[OcerzShape alloc] initWithName:@"shape-c" sides:5 area:1.0]];
+    for (OcerzShape *s in many)
+        order = cf_fold(order, (unsigned)s->_sides);
+    CK([many count] == 12);
+
+    cf_begin(TAG, "equality", m);
+    cf_long("set", (long)[set count]);
+    cb_str(" order=");
+    cb_hex(order);
+    cb_end();
+}
+
+static void group_sort(void)
+{
+    unsigned m = 0, bit = 1;
+    NSArray *shapes = [NSArray arrayWithObjects:
+                       [OcerzShape shapeWithName:@"e" sides:8 area:4.0],
+                       [OcerzShape shapeWithName:@"b" sides:4 area:-1.5],
+                       [OcerzShape shapeWithName:@"d" sides:3 area:2.5],
+                       [OcerzShape shapeWithName:@"a" sides:5 area:-2.0],
+                       [OcerzShape shapeWithName:@"c" sides:6 area:2.5],
+                       [OcerzShape shapeWithName:@"f" sides:7 area:100.0], nil];
+    int calls0 = g_compare_calls;
+    NSArray *sorted = [shapes sortedArrayUsingSelector:@selector(compare:)];
+    char seen[8] = { 0 };
+    int i, n = sorted != nil ? (int)[sorted count] : -1;
+
+    for (i = 0; i < n && i < 7; i++)
+        seen[i] = (char)('0' + ((OcerzShape *)[sorted objectAtIndex:(NSUInteger)i])->_sides);
+
+    CK(n == 6);
+    CK(seen[0] == '5' && seen[1] == '4' && seen[2] == '3' && seen[3] == '6' && seen[4] == '8' && seen[5] == '7');
+    CK(g_compare_calls > calls0);
+    CK(((OcerzShape *)[shapes objectAtIndex:0])->_sides == 8 && ((OcerzShape *)[shapes objectAtIndex:5])->_sides == 7);
+    CK([(OcerzShape *)[shapes objectAtIndex:1] compare:[shapes objectAtIndex:0]] == -1 && [(OcerzShape *)[shapes objectAtIndex:2] compare:[shapes objectAtIndex:4]] == -1 &&
+       [(OcerzShape *)[shapes objectAtIndex:4] compare:[shapes objectAtIndex:2]] == 1 && [(OcerzShape *)[shapes objectAtIndex:3] compare:[shapes objectAtIndex:3]] == 0);
+
+    cf_begin(TAG, "sort", m);
+    cf_text("order", seen);
+    cb_end();
+}
+
+static void group_subclass(void)
+{
+    unsigned m = 0, bit = 1;
+    OcerzSquare *sq = [[OcerzSquare alloc] initWithSide:1.5];
+    OcerzSquare *same = [[OcerzSquare alloc] initWithSide:9.0];
+    OcerzSquare *other = [[OcerzSquare alloc] initWithSide:9.0];
+    NSString *oct = [NSString stringWithUTF8String:"octagon"];
+    int eq0;
+
+    CK(sq != nil && [sq class] == [OcerzSquare class] && [sq superclass] == [OcerzShape class] && [OcerzSquare superclass] == [OcerzShape class]);
+    CK([sq isKindOfClass:[OcerzShape class]] == YES && [sq isMemberOfClass:[OcerzShape class]] == NO && NSClassFromString(@"OcerzSquare") == [OcerzSquare class]);
+    CK(sq->_sides == 4 && sq->_area == 2.25 && objc_text_is(sq->_name, "square") && sq->_side == 1.5 && sq->_tag == 0x5a5a);
+    sq->_side = 9.0;
+    sq->_tag = -1;
+    CK(sq.sides == 4 && sq.area == 2.25 && objc_text_is(sq.name, "square"));
+    sq.sides = 8;
+    sq.area = 3.0;
+    sq.name = oct;
+    CK(sq->_side == 9.0 && sq->_tag == -1 && sq->_sides == 8 && sq->_area == 3.0 && sq->_name == oct);
+    CK([[sq valueForKey:@"tag"] intValue] == -1 && [[sq valueForKey:@"side"] doubleValue] == 9.0 && [[sq valueForKey:@"sides"] intValue] == 8);
+    [sq setValue:[NSNumber numberWithInt:1234] forKey:@"tag"];
+    [sq setValue:[NSNumber numberWithDouble:-4.5] forKey:@"side"];
+    CK(sq->_tag == 1234 && sq->_side == -4.5 && sq->_sides == 8 && sq->_area == 3.0 && sq->_name == oct);
+    CK(objc_text_is([sq description], "<OcerzSquare octagon sides=8 area=3.00> side=-4.5"));
+    eq0 = g_super_equal;
+    CK([same isEqual:other] == YES && same != other && [same isEqual:sq] == NO && g_super_equal == eq0 + 2);
+    CK([sq respondsToSelector:@selector(compare:)] == YES && [sq respondsToSelector:@selector(initWithSide:)] == YES);
+
+    cf_begin(TAG, "subclass", m);
+    cf_long("tag", sq->_tag);
+    cb_end();
+    objc_put([NSString stringWithFormat:@"%@", sq]);
+}
+
+static void group_category(void)
+{
+    unsigned m = 0, bit = 1;
+    NSString *lit = @"Hello, world";
+    NSString *made = [NSString stringWithUTF8String:"a created string that lives on the heap"];
+    NSString *small = [NSString stringWithUTF8String:"abc"];
+    NSMutableString *mut = [NSMutableString stringWithString:@"xyz"];
+    NSString *rl = [lit ocerzReversed], *rm = [made ocerzReversed], *rs = [small ocerzReversed], *rx = [mut ocerzReversed];
+
+    CK(objc_text_is(rl, "dlrow ,olleH"));
+    CK(objc_text_is(rm, "paeh eht no sevil taht gnirts detaerc a"));
+    CK(objc_tagged(small) && objc_text_is(rs, "cba"));
+    CK(objc_text_is(rx, "zyx"));
+    CK([lit ocerzChecksum] == fnv64("Hello, world") && [made ocerzChecksum] == fnv64([made UTF8String]) && [small ocerzChecksum] == fnv64("abc"));
+    CK(objc_text_is([NSString ocerzGreeting], "hello from a category") && objc_text_is([NSMutableString ocerzGreeting], "hello from a category"));
+    CK([lit respondsToSelector:@selector(ocerzReversed)] == YES && [small respondsToSelector:@selector(ocerzChecksum)] == YES &&
+       [NSString instancesRespondToSelector:@selector(ocerzChecksum)] == YES && [NSNumber instancesRespondToSelector:@selector(ocerzChecksum)] == NO);
+
+    cf_begin(TAG, "category", m);
+    cf_text("lit", rl != nil ? [rl UTF8String] : "(nil)");
+    cb_end();
+}
+
+static void group_protocol(void)
+{
+    unsigned m = 0, bit = 1;
+    OcerzShape *t = [OcerzShape shapeWithName:@"protocol" sides:3 area:1.0];
+    OcerzSquare *sq = [[OcerzSquare alloc] initWithSide:1.0];
+    Protocol *named = @protocol(OcerzNamed);
+
+    CK(named != nil && [OcerzShape conformsToProtocol:named] == YES && [t conformsToProtocol:named] == YES);
+    CK([OcerzSquare conformsToProtocol:named] == YES && [sq conformsToProtocol:named] == YES);
+    CK([NSObject conformsToProtocol:named] == NO && [@"s" conformsToProtocol:named] == NO);
+    CK([OcerzShape conformsToProtocol:@protocol(NSCopying)] == YES && [OcerzShape conformsToProtocol:@protocol(NSObject)] == YES &&
+       [OcerzShape conformsToProtocol:@protocol(NSCoding)] == NO);
+    CK(objc_text_is(NSStringFromProtocol(named), "OcerzNamed") && NSProtocolFromString(@"OcerzNamed") == named);
+    CK(NSProtocolFromString(@"NSCopying") == @protocol(NSCopying));
+    CK([t respondsToSelector:@selector(name)] == YES && [t respondsToSelector:@selector(ocerzOptional)] == NO &&
+       [t respondsToSelector:@selector(copyWithZone:)] == YES && [t respondsToSelector:NSSelectorFromString(@"notAMethodAnywhere")] == NO);
+    CK([OcerzShape instancesRespondToSelector:@selector(scaledBy:)] == YES && [OcerzShape respondsToSelector:@selector(shapeNamed:)] == YES &&
+       [OcerzShape respondsToSelector:@selector(scaledBy:)] == NO);
+
+    cf_begin(TAG, "protocol", m);
+    cf_text("name", objc_text_is(NSStringFromProtocol(named), "OcerzNamed") ? "OcerzNamed" : "?");
+    cb_end();
+}
+
+static void group_lifetime(void)
+{
+    unsigned m = 0, bit = 1;
+    int d0 = g_dealloc_shape, s0 = g_dealloc_square;
+    __weak OcerzShape *weak_shape = nil;
+    __weak NSString *weak_name = nil;
+    __weak OcerzShape *weak_owned = nil;
+    __weak OcerzShape *weak_held = nil;
+    OcerzShape *holder = [[OcerzShape alloc] initWithName:@"holder" sides:1 area:1.0];
+    NSMutableArray *arr = [NSMutableArray array];
+    int alive_inside = 0, alive_held = 0, owner_inside = 0;
+
+    @autoreleasepool {
+        NSString *nm = [NSString stringWithUTF8String:"a transient name long enough for the heap"];
+        OcerzShape *s = [[OcerzShape alloc] initWithName:nm sides:9 area:9.0];
+
+        weak_shape = s;
+        weak_name = nm;
+        nm = nil;
+        alive_inside = weak_shape == s && weak_name != nil && g_dealloc_shape == d0;
+        s = nil;
+    }
+    CK(alive_inside);
+    CK(weak_shape == nil && g_dealloc_shape == d0 + 1);
+    CK(g_dealloc_name_alive && weak_name == nil);
+
+    @autoreleasepool {
+        OcerzShape *owned = [[OcerzShape alloc] initWithName:@"owned" sides:2 area:2.0];
+
+        holder.owner = owned;
+        weak_owned = owned;
+        owner_inside = holder.owner == owned;
+        owned = nil;
+    }
+    CK(owner_inside && weak_owned == nil && holder.owner == nil && holder->_owner == nil && g_dealloc_shape == d0 + 2);
+
+    @autoreleasepool {
+        OcerzSquare *sq = [[OcerzSquare alloc] initWithSide:2.0];
+
+        weak_shape = sq;
+        sq = nil;
+    }
+    CK(weak_shape == nil && g_dealloc_square == s0 + 1 && g_dealloc_shape == d0 + 3);
+
+    @autoreleasepool {
+        OcerzShape *h = [[OcerzShape alloc] initWithName:@"held" sides:3 area:3.0];
+
+        weak_held = h;
+        [arr addObject:h];
+        h = nil;
+    }
+    alive_held = weak_held != nil && g_dealloc_shape == d0 + 3;
+    [arr removeAllObjects];
+    CK(alive_held && weak_held == nil && g_dealloc_shape == d0 + 4);
+
+    cf_begin(TAG, "lifetime", m);
+    cf_long("dealloc", g_dealloc_shape - d0);
+    cf_long("square", g_dealloc_square - s0);
+    cb_end();
+}
+
+static void group_perform(void)
+{
+    unsigned m = 0, bit = 1;
+    OcerzShape *t = [OcerzShape shapeWithName:@"performer" sides:5 area:1.25];
+    OcerzShape *a = [OcerzShape shapeWithName:@"left" sides:1 area:1.0];
+    OcerzShape *b = [OcerzShape shapeWithName:@"right" sides:2 area:2.0];
+    OcerzSquare *sq = [[OcerzSquare alloc] initWithSide:0.5];
+    int calls0 = g_perform_calls;
+    OcerzShape *scaled = [t performSelector:@selector(scaledBy:) withObject:[NSNumber numberWithInt:2]];
+    id named = [t performSelector:@selector(name)];
+    id joined = [t performSelector:@selector(joinedWith:and:) withObject:a withObject:b];
+    id made = [OcerzShape performSelector:@selector(shapeNamed:) withObject:@"hexagon"];
+    id desc = [sq performSelector:@selector(description)];
+
+    CK(scaled != nil && [scaled class] == [OcerzShape class] && scaled->_area == 2.5 && scaled->_sides == 5 && scaled != t);
+    CK(named == t->_name);
+    CK(objc_text_is(joined, "performer+left+right"));
+    CK([made isKindOfClass:[OcerzShape class]] == YES && ((OcerzShape *)made)->_sides == 6 && objc_text_is(((OcerzShape *)made)->_name, "hexagon"));
+    CK(objc_text_is(desc, "<OcerzSquare square sides=4 area=0.25> side=0.5"));
+    CK(g_perform_calls == calls0 + 3);
+
+    cf_begin(TAG, "perform", m);
+    cf_long("calls", g_perform_calls - calls0);
+    cb_end();
+}
+
+int main(void)
+{
+    int rc;
+
+    @autoreleasepool {
+        cf_note(TAG, "load");
+        group_load();
+        cf_note(TAG, "object");
+        group_object();
+        cf_note(TAG, "describe");
+        group_describe();
+        cf_note(TAG, "equality");
+        group_equality();
+        cf_note(TAG, "sort");
+        group_sort();
+        cf_note(TAG, "subclass");
+        group_subclass();
+        cf_note(TAG, "category");
+        group_category();
+        cf_note(TAG, "protocol");
+        group_protocol();
+        cf_note(TAG, "lifetime");
+        group_lifetime();
+        cf_note(TAG, "perform");
+        group_perform();
+        rc = cf_summary(TAG);
+    }
+    return rc;
+}
+EOC
+
+    cat > "$TMP/objc_view_render.m" <<'EOC'
+#include "appkit_common.h"
+
+#define TAG "objc_view_render"
+#define VIEW_W 32
+#define VIEW_H 24
+#define BACKGROUND 0x204060ffu
+#define FILL 0xff0000ffu
+#define STROKE 0x0080ffffu
+#define CGFILL 0x00ff40ffu
+
+static int g_draw, g_flip;
+static NSRect g_dirty[3];
+static cb_uptr g_draw_self[3];
+static int g_ctx_ok[3], g_ctx_flipped[3], g_cg_ok[3];
+
+@interface OcerzTestView : NSView
+@end
+
+@implementation OcerzTestView
+
+- (BOOL)isFlipped
+{
+    g_flip++;
+    return YES;
+}
+
+- (void)drawRect:(NSRect)dirty
+{
+    NSGraphicsContext *ctx = [NSGraphicsContext currentContext];
+    CGContextRef cg = [ctx CGContext];
+    NSBezierPath *path;
+    int i = g_draw < 2 ? g_draw : 2;
+
+    g_draw++;
+    g_dirty[i] = dirty;
+    g_draw_self[i] = (cb_uptr)(__bridge void *)self;
+    g_ctx_ok[i] = ctx != nil;
+    g_ctx_flipped[i] = [ctx isFlipped];
+    g_cg_ok[i] = cg != 0;
+    [super drawRect:dirty];
+    [ctx setShouldAntialias:NO];
+    [[NSColor colorWithDeviceRed:32 / 255.0 green:64 / 255.0 blue:96 / 255.0 alpha:1.0] set];
+    NSRectFill([self bounds]);
+    [[NSColor colorWithDeviceRed:1.0 green:0.0 blue:0.0 alpha:1.0] set];
+    NSRectFill(NSMakeRect(2, 2, 10, 6));
+    if (cg != 0) {
+        CGContextSetRGBFillColor(cg, 0.0, 1.0, 64 / 255.0, 1.0);
+        CGContextFillRect(cg, CGRectMake(20, 2, 8, 4));
+    }
+    path = [NSBezierPath bezierPathWithRect:NSMakeRect(4.5, 12.5, 20, 8)];
+    [path setLineWidth:1.0];
+    [[NSColor colorWithDeviceRed:0.0 green:128 / 255.0 blue:1.0 alpha:1.0] set];
+    [path stroke];
+}
+
+@end
+
+static OcerzTestView *g_view;
+static NSBitmapImageRep *g_rep, *g_dev;
+static const char *g_unavailable;
+static int g_own_flips;
+static long g_scale;
+
+static void group_view(void)
+{
+    unsigned m = 0, bit = 1;
+    NSRect frame, bounds;
+    NSString *frame_text;
+    int flipped;
+
+    g_view = [[OcerzTestView alloc] initWithFrame:NSMakeRect(5, 7, VIEW_W, VIEW_H)];
+    flipped = [g_view isFlipped];
+    g_own_flips = g_flip;
+    frame = [g_view frame];
+    bounds = [g_view bounds];
+    frame_text = NSStringFromRect(frame);
+
+    CK(g_view != nil && [g_view class] == [OcerzTestView class] && [g_view superclass] == [NSView class] &&
+       [g_view isKindOfClass:[NSView class]] == YES && NSClassFromString(@"OcerzTestView") == [OcerzTestView class]);
+    CK(flipped == YES && g_own_flips == 1);
+    CK(view_rect_is(frame, 5, 7, VIEW_W, VIEW_H) && view_rect_is(bounds, 0, 0, VIEW_W, VIEW_H));
+    CK(objc_text_is(frame_text, "{{5, 7}, {32, 24}}"));
+    CK(g_draw == 0);
+
+    cf_begin(TAG, "view", m);
+    cb_str(" ");
+    cb_str(frame_text != nil ? [frame_text UTF8String] : "(nil)");
+    cb_end();
+}
+
+static void group_render(void)
+{
+    unsigned m = 0, bit = 1;
+    NSRect bounds = NSMakeRect(0, 0, VIEW_W, VIEW_H);
+    cb_uptr self_ptr = (cb_uptr)(__bridge void *)g_view;
+    int appkit_flips;
+
+    g_rep = [g_view bitmapImageRepForCachingDisplayInRect:bounds];
+    if (g_rep == nil) {
+        g_unavailable = "bitmapImageRepForCachingDisplayInRect: returned nil";
+        return;
+    }
+    [g_view cacheDisplayInRect:bounds toBitmapImageRep:g_rep];
+    if (g_draw == 0) {
+        g_unavailable = "cacheDisplayInRect:toBitmapImageRep: never called drawRect:";
+        return;
+    }
+    g_dev = view_device_rep(VIEW_W, VIEW_H);
+    [g_view cacheDisplayInRect:bounds toBitmapImageRep:g_dev];
+    appkit_flips = g_flip - g_own_flips;
+    if ([g_rep pixelsWide] % VIEW_W == 0)
+        g_scale = [g_rep pixelsWide] / VIEW_W;
+
+    CK(g_scale >= 1 && [g_rep pixelsHigh] == VIEW_H * g_scale && [g_rep size].width == VIEW_W && [g_rep size].height == VIEW_H);
+    CK(g_dev != nil && [g_dev pixelsWide] == VIEW_W && [g_dev pixelsHigh] == VIEW_H && [g_dev bitsPerPixel] == 32);
+    CK(g_draw == 2);
+    CK(view_rect_is(g_dirty[0], 0, 0, VIEW_W, VIEW_H) && view_rect_is(g_dirty[1], 0, 0, VIEW_W, VIEW_H));
+    CK(g_draw_self[0] == self_ptr && g_draw_self[1] == self_ptr);
+    CK(g_ctx_ok[0] && g_ctx_ok[1] && g_ctx_flipped[0] == YES && g_ctx_flipped[1] == YES && g_cg_ok[0] && g_cg_ok[1]);
+    CK(appkit_flips > 0);
+
+    cf_begin(TAG, "render", m);
+    cf_long("draws", g_draw);
+    cf_long("flips", appkit_flips);
+    cf_long("scale", g_scale);
+    cb_end();
+}
+
+static void group_pixels(void)
+{
+    unsigned m = 0, bit = 1;
+    unsigned red = g_scale >= 1 ? view_pixel(g_rep, 3 * g_scale, 3 * g_scale) : 1;
+    NSBitmapImageRep *dev = g_dev;
+
+    CK(view_pixel(dev, 0, 0) == BACKGROUND && view_pixel(dev, VIEW_W - 1, VIEW_H - 1) == BACKGROUND);
+    CK(view_pixel(dev, 2, 2) == FILL && view_pixel(dev, 11, 7) == FILL);
+    CK(view_pixel(dev, 12, 2) == BACKGROUND && view_pixel(dev, 2, 8) == BACKGROUND && view_pixel(dev, 1, 1) == BACKGROUND);
+    CK(view_pixel(dev, 2, 17) == BACKGROUND && view_pixel(dev, 11, 21) == BACKGROUND);
+    CK(view_pixel(dev, 4, 12) == STROKE && view_pixel(dev, 24, 12) == STROKE && view_pixel(dev, 4, 20) == STROKE &&
+       view_pixel(dev, 24, 20) == STROKE && view_pixel(dev, 14, 12) == STROKE && view_pixel(dev, 4, 16) == STROKE);
+    CK(view_pixel(dev, 14, 16) == BACKGROUND && view_pixel(dev, 25, 12) == BACKGROUND && view_pixel(dev, 4, 11) == BACKGROUND);
+    CK(view_pixel(dev, 20, 2) == CGFILL && view_pixel(dev, 27, 5) == CGFILL && view_pixel(dev, 19, 2) == BACKGROUND &&
+       view_pixel(dev, 20, 6) == BACKGROUND && view_pixel(dev, 20, 19) == BACKGROUND);
+    CK((red >> 24) > 0xc0 && ((red >> 16) & 0xff) < 0x40 && ((red >> 8) & 0xff) < 0x40 && (red & 0xff) == 0xff);
+
+    cf_begin(TAG, "pixels", m);
+    cb_str(" dev=");
+    cb_hex(view_checksum(dev));
+    cb_str(" rep=");
+    cb_hex(view_checksum(g_rep));
+    cb_end();
+}
+
+int main(void)
+{
+    int rc;
+
+    @autoreleasepool {
+        cf_note(TAG, "view");
+        group_view();
+        cf_note(TAG, "render");
+        group_render();
+        if (g_unavailable != 0)
+            return view_unavailable(TAG, g_unavailable);
+        cf_note(TAG, "pixels");
+        group_pixels();
+        rc = cf_summary(TAG);
+    }
+    return rc;
+}
+EOC
+
+    cat > "$TMP/objc_view_ivar.m" <<'EOC'
+#include "appkit_common.h"
+#include <objc/runtime.h>
+
+#define TAG "objc_view_ivar"
+#define VIEW_W 24
+#define VIEW_H 16
+#define WHITE 0xffffffffu
+#define FILL1 0x3090c0ffu
+#define FILL2 0xc06010ffu
+
+@interface OcerzIvarView : NSView
+{
+@public
+    int _marker;
+    double _scale;
+    NSColor *_fill;
+    NSRect _box;
+    unsigned char _tail;
+}
+@end
+
+static int g_init, g_draw;
+static NSRect g_init_frame[2];
+static cb_uptr g_seen_self[3];
+static int g_seen_marker[3];
+static double g_seen_scale[3];
+static cb_uptr g_seen_fill[3];
+static NSRect g_seen_box[3];
+static unsigned g_seen_tail[3];
+static NSRect g_seen_frame[3];
+
+@implementation OcerzIvarView
+
+- (instancetype)initWithFrame:(NSRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (self != nil) {
+        _marker = 0x5eed1234;
+        _scale = -1.0625;
+        _fill = [NSColor colorWithDeviceRed:48 / 255.0 green:144 / 255.0 blue:192 / 255.0 alpha:1.0];
+        _box = NSMakeRect(3, 4, 12, 9);
+        _tail = 0xa7;
+        g_init_frame[g_init < 1 ? g_init : 1] = [self frame];
+        g_init++;
+    }
+    return self;
+}
+
+- (BOOL)isFlipped
+{
+    return YES;
+}
+
+- (void)drawRect:(NSRect)dirty
+{
+    int i = g_draw < 2 ? g_draw : 2;
+
+    g_draw++;
+    g_seen_self[i] = (cb_uptr)(__bridge void *)self;
+    g_seen_marker[i] = _marker;
+    g_seen_scale[i] = _scale;
+    g_seen_fill[i] = (cb_uptr)(__bridge void *)_fill;
+    g_seen_box[i] = _box;
+    g_seen_tail[i] = _tail;
+    g_seen_frame[i] = [self frame];
+    [[NSGraphicsContext currentContext] setShouldAntialias:NO];
+    [[NSColor colorWithDeviceRed:1.0 green:1.0 blue:1.0 alpha:1.0] set];
+    NSRectFill([self bounds]);
+    [_fill set];
+    NSRectFill(_box);
+}
+
+@end
+
+static OcerzIvarView *g_v1, *g_v2;
+static NSBitmapImageRep *g_dev1, *g_dev2;
+static const char *g_unavailable;
+
+static cb_uptr view_offset(OcerzIvarView *v, void *field)
+{
+    return (cb_uptr)field - (cb_uptr)(__bridge void *)v;
+}
+
+static void group_layout(void)
+{
+    unsigned m = 0, bit = 1;
+    OcerzIvarView *v1, *v2;
+    size_t base, size;
+    cb_uptr off_marker, off_scale, off_fill, off_box, off_tail;
+    NSRect box;
+
+    g_v1 = [[OcerzIvarView alloc] initWithFrame:NSMakeRect(0, 0, VIEW_W, VIEW_H)];
+    g_v2 = [[OcerzIvarView alloc] initWithFrame:NSMakeRect(10, 20, VIEW_W, VIEW_H)];
+    v1 = g_v1;
+    v2 = g_v2;
+    if (v2 != nil) {
+        v2->_marker = 0x0badf00d;
+        v2->_scale = 2.5;
+        v2->_fill = [NSColor colorWithDeviceRed:192 / 255.0 green:96 / 255.0 blue:16 / 255.0 alpha:1.0];
+        v2->_box = NSMakeRect(8, 2, 6, 10);
+        v2->_tail = 0x3c;
+    }
+    base = class_getInstanceSize([NSView class]);
+    size = class_getInstanceSize([OcerzIvarView class]);
+    off_marker = view_offset(v1, &v1->_marker);
+    off_scale = view_offset(v1, &v1->_scale);
+    off_fill = view_offset(v1, &v1->_fill);
+    off_box = view_offset(v1, &v1->_box);
+    off_tail = view_offset(v1, &v1->_tail);
+    box = [[v1 valueForKey:@"box"] rectValue];
+
+    CK(v1 != nil && v2 != nil && g_init == 2 && [v1 class] == [OcerzIvarView class] && [OcerzIvarView superclass] == [NSView class]);
+    CK(base > 8 && off_marker >= base && off_scale > off_marker && off_fill > off_scale && off_box > off_fill && off_tail > off_box);
+    CK(size >= off_tail + 1 && size > base);
+    CK(view_rect_is(g_init_frame[0], 0, 0, VIEW_W, VIEW_H) && view_rect_is(g_init_frame[1], 10, 20, VIEW_W, VIEW_H));
+    CK(view_rect_is([v1 frame], 0, 0, VIEW_W, VIEW_H) && view_rect_is([v2 frame], 10, 20, VIEW_W, VIEW_H) &&
+       view_rect_is([v2 bounds], 0, 0, VIEW_W, VIEW_H));
+    CK([[v1 valueForKey:@"marker"] intValue] == 0x5eed1234 && [[v2 valueForKey:@"marker"] intValue] == 0x0badf00d);
+    CK([[v1 valueForKey:@"scale"] doubleValue] == -1.0625 && [v1 valueForKey:@"fill"] == v1->_fill && view_rect_is(box, 3, 4, 12, 9) &&
+       [[v1 valueForKey:@"tail"] unsignedCharValue] == 0xa7);
+    [v1 setValue:[NSNumber numberWithInt:0x7ead] forKey:@"marker"];
+    CK(v1->_marker == 0x7ead && v2->_marker == 0x0badf00d);
+    v1->_marker = 0x5eed1234;
+
+    cf_begin(TAG, "layout", m);
+    cf_long("views", g_init);
+    cb_end();
+}
+
+static void group_draw(void)
+{
+    unsigned m = 0, bit = 1;
+    OcerzIvarView *v1 = g_v1, *v2 = g_v2;
+    NSRect bounds = NSMakeRect(0, 0, VIEW_W, VIEW_H);
+
+    g_dev1 = view_device_rep(VIEW_W, VIEW_H);
+    g_dev2 = view_device_rep(VIEW_W, VIEW_H);
+    if (g_dev1 == nil || g_dev2 == nil) {
+        g_unavailable = "no device RGB bitmap could be created";
+        return;
+    }
+    [v1 cacheDisplayInRect:bounds toBitmapImageRep:g_dev1];
+    if (g_draw == 0) {
+        g_unavailable = "cacheDisplayInRect:toBitmapImageRep: never called drawRect:";
+        return;
+    }
+    [v2 cacheDisplayInRect:bounds toBitmapImageRep:g_dev2];
+
+    CK(g_draw == 2);
+    CK(g_seen_self[0] == (cb_uptr)(__bridge void *)v1 && g_seen_self[1] == (cb_uptr)(__bridge void *)v2);
+    CK(g_seen_marker[0] == 0x5eed1234 && g_seen_scale[0] == -1.0625);
+    CK(g_seen_fill[0] == (cb_uptr)(__bridge void *)v1->_fill && g_seen_fill[0] != 0);
+    CK(view_rect_is(g_seen_box[0], 3, 4, 12, 9) && g_seen_tail[0] == 0xa7);
+    CK(g_seen_marker[1] == 0x0badf00d && g_seen_scale[1] == 2.5 && g_seen_fill[1] == (cb_uptr)(__bridge void *)v2->_fill &&
+       view_rect_is(g_seen_box[1], 8, 2, 6, 10) && g_seen_tail[1] == 0x3c);
+    CK(view_rect_is(g_seen_frame[0], 0, 0, VIEW_W, VIEW_H) && view_rect_is(g_seen_frame[1], 10, 20, VIEW_W, VIEW_H));
+
+    cf_begin(TAG, "draw", m);
+    cf_long("draws", g_draw);
+    cb_end();
+}
+
+static void group_pixels(void)
+{
+    unsigned m = 0, bit = 1;
+    NSBitmapImageRep *d1 = g_dev1, *d2 = g_dev2;
+
+    CK(view_pixel(d1, 0, 0) == WHITE && view_pixel(d1, VIEW_W - 1, VIEW_H - 1) == WHITE);
+    CK(view_pixel(d1, 3, 4) == FILL1 && view_pixel(d1, 14, 12) == FILL1);
+    CK(view_pixel(d1, 2, 4) == WHITE && view_pixel(d1, 15, 12) == WHITE && view_pixel(d1, 3, 13) == WHITE && view_pixel(d1, 3, 3) == WHITE);
+    CK(view_pixel(d2, 8, 2) == FILL2 && view_pixel(d2, 13, 11) == FILL2 && view_pixel(d2, 3, 4) == WHITE);
+    CK(view_pixel(d2, 7, 2) == WHITE && view_pixel(d2, 14, 11) == WHITE && view_pixel(d2, 8, 12) == WHITE);
+
+    cf_begin(TAG, "pixels", m);
+    cb_str(" dev1=");
+    cb_hex(view_checksum(d1));
+    cb_str(" dev2=");
+    cb_hex(view_checksum(d2));
+    cb_end();
+}
+
+int main(void)
+{
+    int rc;
+
+    @autoreleasepool {
+        cf_note(TAG, "layout");
+        group_layout();
+        cf_note(TAG, "draw");
+        group_draw();
+        if (g_unavailable != 0)
+            return view_unavailable(TAG, g_unavailable);
+        cf_note(TAG, "pixels");
+        group_pixels();
+        rc = cf_summary(TAG);
+    }
+    return rc;
+}
+EOC
+
+    for name in objc_classes objc_view_render objc_view_ivar; do
+        framework=Foundation
+        case $name in
+            objc_view_*) framework=AppKit ;;
+        esac
+        clang -arch x86_64 -x objective-c -fobjc-arc -O1 -fno-builtin \
+                -o "$TMP/$name" "$TMP/$name.m" -framework "$framework" >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            objc_classes) OBJC_CLASSES_BIN="$TMP/$name" ;;
+            objc_view_render) OBJC_VIEW_RENDER_BIN="$TMP/$name" ;;
+            objc_view_ivar) OBJC_VIEW_IVAR_BIN="$TMP/$name" ;;
+        esac
+        clang -arch arm64 -x objective-c -fobjc-arc -O1 -fno-builtin \
+                -o "$TMP/$name.arm64" "$TMP/$name.m" -framework "$framework" >"$TMP/$name.arm64.cc.log" 2>&1 || continue
+        case $name in
+            objc_classes) OBJC_CLASSES_ARM64="$TMP/$name.arm64" ;;
+            objc_view_render) OBJC_VIEW_RENDER_ARM64="$TMP/$name.arm64" ;;
+            objc_view_ivar) OBJC_VIEW_IVAR_ARM64="$TMP/$name.arm64" ;;
+        esac
+    done
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -8648,13 +9923,23 @@ case_cf() {
 }
 
 objc_import_reason() {
-    local bin="$1" imports allowed sym stray="" missing="" why
-    shift
+    local bin="$1" kind="$2" imports allowed sym stray="" missing="" why
+    local libs="libobjc, Foundation and CoreFoundation" about="Objective-C or formatting"
+    shift 2
     imports="$(nm -u "$bin" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
     if [ -z "$imports" ]; then
         return
     fi
     allowed=" $CF_BRIDGED $CF_EXPORTS $OBJC_BRIDGED $OBJC_EXPORTS $STACK_GUARD_SYM "
+    case $kind in
+        classes)
+            allowed="$allowed$OBJC_CLASS_EXPORTS "
+            about="classes of the guest's" ;;
+        view)
+            allowed="$allowed$OBJC_CLASS_EXPORTS $APPKIT_EXPORTS "
+            libs="libobjc, AppKit, CoreGraphics, Foundation and CoreFoundation"
+            about="classes of the guest's or views" ;;
+    esac
     for sym in $imports; do
         case "$allowed" in
             *" $sym "*) ;;
@@ -8677,13 +9962,21 @@ objc_import_reason() {
             _CFStringCreateWithFormat|_CFStringAppendFormat) why="the CoreFoundation format functions were never called" ;;
             _NSLog) why="NSLog was never called" ;;
             ___sprintf_chk|___snprintf_chk) why="the fortified translation unit did not call the _chk entry points" ;;
+            _objc_msgSendSuper2) why="no message was sent to super" ;;
+            _OBJC_METACLASS_*_NSObject|__objc_empty_cache) why="the classes it defines were not laid down with a metaclass and a cache that bind to the native runtime's" ;;
+            _objc_storeWeak|_objc_loadWeakRetained) why="no weak reference was stored or read" ;;
+            _objc_getProperty|_objc_setProperty_atomic) why="the atomic property's accessors were not synthesized as calls handed the ivar's offset" ;;
+            _OBJC_CLASS_*_NSView|_OBJC_METACLASS_*_NSView) why="the view class was not compiled as a subclass of the host's NSView" ;;
+            _NSRectFill|_CGContextFillRect) why="-drawRect: did not fill through AppKit and CoreGraphics" ;;
+            _objc_msgSend_stret) why="no NSRect came back from a message as a returned structure" ;;
+            _class_getInstanceSize) why="the fixture never asked the runtime for an instance size" ;;
             *) why="the unfortified translation unit did not call the plain entry points" ;;
         esac
         echo "$(basename "$bin") imports '${imports% }' and not$missing, so $why, and the case proves nothing about it"
         return
     fi
     if [ -n "$stray" ]; then
-        echo "$(basename "$bin") imports$stray, which neither the virtual libobjc, Foundation and CoreFoundation export nor the bridge implements, so a failure would be about those imports and not about Objective-C or formatting"
+        echo "$(basename "$bin") imports$stray, which neither the virtual $libs export nor the bridge implements, so a failure would be about those imports and not about $about"
     fi
 }
 
@@ -8720,7 +10013,8 @@ objc_run_reason() {
     lib="$(grep -hF "$NOBIND" "$out" "$err" 2>/dev/null | head -1 | sed 's/.* in //')"
     if [ -z "$reason" ]; then
         echo ""
-    elif grep -hF "$NOBIND" "$out" "$err" 2>/dev/null | grep -Fq -e " in $OBJC_LIB" -e " in $FOUNDATION_FRAMEWORK" -e " in $CF_FRAMEWORK"; then
+    elif grep -hF "$NOBIND" "$out" "$err" 2>/dev/null | grep -Fq -e " in $OBJC_LIB" -e " in $FOUNDATION_FRAMEWORK" -e " in $CF_FRAMEWORK" \
+            -e " in $APPKIT_FRAMEWORK" -e " in $CG_FRAMEWORK"; then
         if grep -Fq "vdylib: built $lib " "$out" "$err" 2>/dev/null; then
             echo "$reason: the virtual library named there does not export that name, so the program never ran"
         else
@@ -8755,13 +10049,36 @@ objc_arm64_reason() {
         echo "the arm64 build, run directly on the host, was still running after ${NATIVE_TIMEOUT}s, so the fixture hangs against the real frameworks, and $(objc_stall "$tag" "$err" hang)"
     elif [ "$rc" -ne 0 ] || ! grep -q "^$tag ok" "$out" 2>/dev/null; then
         echo "the arm64 build, run directly on the host, exited $rc with '${line:-nothing}' and no '$tag ok' line, so the fixture itself is broken, and $(objc_stall "$tag" "$err")"
-    elif [ -n "$kind" ]; then
+    elif [ "$kind" = nslog ] || [ "$kind" = prefix ]; then
         want="$(grep -o ' lines=[0-9]*' "$out" 2>/dev/null | head -1 | cut -d= -f2)"
         got="$(objc_messages "$kind" "$tag" "$err" | wc -l | tr -d ' ')"
         if [ -z "$want" ] || [ "$got" != "$want" ]; then
             echo "the arm64 build, run directly on the host, left $got message lines on stderr where its status line says ${want:-nothing}, so the host is not writing them where the case looks, and every stderr comparison would pass on nothing"
         fi
     fi
+}
+
+objc_view_unavailable() {
+    local tag="$1" rc="$2" out="$3" err="$4" line
+    line="$(grep -m1 "^$tag unavailable " "$out" 2>/dev/null)"
+    if [ -n "$line" ]; then
+        echo "the arm64 build, run directly on the host, could not draw offscreen here: ${line#"$tag unavailable "}"
+    elif [ "$rc" -ne 0 ] && ! grep -q "^$tag ok" "$out" 2>/dev/null && grep -qE "$VIEW_NO_SERVER_RE" "$err" 2>/dev/null; then
+        echo "the arm64 build, run directly on the host, exited $rc naming the window server: $(grep -hE "$VIEW_NO_SERVER_RE" "$err" | head -1 | cut -c1-160)"
+    fi
+}
+
+objc_view_repeat_reason() {
+    local arm="$1" first="$2" run=2 rc
+    while [ "$run" -le "$VIEW_RUNS" ]; do
+        run_bounded "$first.$run" "$first.$run.err" "$arm"
+        rc=$?
+        if [ "$rc" -ne 0 ] || ! cmp -s "$first" "$first.$run"; then
+            echo "the arm64 build, run directly on the host, wrote '$(tr '\n' ' ' < "$first")' on its first run and '$(tr '\n' ' ' < "$first.$run")' with exit $rc on run $run of $VIEW_RUNS, so what it draws or counts is not deterministic on this host and no comparison with it can mean anything"
+            return
+        fi
+        run=$((run + 1))
+    done
 }
 
 case_objc() {
@@ -8785,14 +10102,24 @@ case_objc() {
         record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $( (grep -m1 -i 'error' "$TMP/$name.arm64.cc.log" || head -1 "$TMP/$name.arm64.cc.log") 2>/dev/null | cut -c1-160)"
         return
     fi
-    reason="$(objc_import_reason "$bin" $need)"
+    reason="$(objc_import_reason "$bin" "$kind" $need)"
     if [ -n "$reason" ]; then
         record "$name" "$reason"
         return
     fi
     run_bounded "$ao" "$ae" "$arm"
     rc_arm=$?
+    if [ "$kind" = view ]; then
+        reason="$(objc_view_unavailable "$tag" "$rc_arm" "$ao" "$ae")"
+        if [ -n "$reason" ]; then
+            echo "SKIP $name ($reason)"
+            return
+        fi
+    fi
     reason="$(objc_arm64_reason "$rc_arm" "$tag" "$ao" "$ae" "$kind" "$@")"
+    if [ -z "$reason" ] && [ "$kind" = view ]; then
+        reason="$(objc_view_repeat_reason "$arm" "$ao")"
+    fi
     if [ -n "$reason" ]; then
         record "$name" "$reason"
         return
@@ -9068,6 +10395,55 @@ EOC
     record "$name" "$reason" "exits:$detail"
 }
 
+case_native_constructors() {
+    local name=native_constructors reason="" dir="$TMP/ctors"
+    mkdir -p "$dir"
+    cat > "$dir/libdep.c" <<'EOC'
+#include <stdio.h>
+int dep_value;
+__attribute__((constructor)) static void dep_init(void) { dep_value = 7; fputs("dep ", stdout); }
+EOC
+    cat > "$dir/main.cc" <<'EOC'
+#include <cstdio>
+extern "C" int dep_value;
+struct Global {
+    int seen;
+    Global() : seen(dep_value) { std::fputs("static ", stdout); }
+};
+static Global g;
+__attribute__((constructor(200))) static void late(void) { std::fputs("late ", stdout); }
+__attribute__((constructor(101))) static void early(void) { std::fputs("early ", stdout); }
+int main()
+{
+    std::printf("main seen=%d dep=%d\n", g.seen, dep_value);
+    return 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -dynamiclib -install_name @rpath/libdep.dylib -o "$dir/libdep.dylib" "$dir/libdep.c" >/dev/null 2>&1 ||
+       ! clang++ -arch x86_64 -O1 -std=c++17 -fno-exceptions -Wl,-rpath,@loader_path -o "$dir/ctors" "$dir/main.cc" "$dir/libdep.dylib" >/dev/null 2>&1; then
+        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    fi
+    if nm -u "$dir/ctors" 2>/dev/null | grep -Eq '__ZNSt|__ZNKSt'; then
+        record "$name" "the fixture imports libc++, which native mode does not synthesize" ""
+        return
+    fi
+    local out="$TMP/native_ctors.out" cout="$TMP/cache_ctors.out" rc crc
+    run_bounded "$out" "$TMP/native_ctors.err" "$OCERZ" -native "$dir/ctors"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        reason="exit $rc, want 0: $(head -c 200 "$TMP/native_ctors.err")"
+    elif ! grep -Eqx 'dep (static early late|early late static|static late early|early static late) main seen=7 dep=7' "$out"; then
+        reason="native wrote '$(cat "$out")': the dylib's constructor must run first and main must see what every constructor wrote"
+    elif [ "$CACHE_OK" -eq 1 ]; then
+        run_bounded "$cout" "$TMP/cache_ctors.err" "$OCERZ" -cache "$dir/ctors"
+        crc=$?
+        if [ "$crc" -ne "$rc" ] || ! cmp -s "$out" "$cout"; then
+            reason="native wrote '$(cat "$out")' exit $rc, cache wrote '$(cat "$cout")' exit $crc"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc out='$(cat "$out" 2>/dev/null)'"
+}
+
 case_native_unbound() {
     local name=native_unbound rc reason="" src="$TMP/unbound.c" bin="$TMP/unbound"
     local out="$TMP/native_unbound.out" err="$TMP/native_unbound.err"
@@ -9112,6 +10488,7 @@ build_tlv_fixtures
 build_signal_fixtures
 build_cf_fixtures
 build_objc_fixtures
+build_objc_class_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -9243,6 +10620,31 @@ case_objc native_nslog "$NATIVE_NSLOG_BIN" "$NATIVE_NSLOG_ARM64" native_nslog \
     "_objc_msgSend _objc_autoreleasePoolPush _NSLog" nslog \
     "native_nslog is the one call nearly every Cocoa program makes, so a failure here means no such program can log in native mode" \
     log "bit 0 is the checksum of six 64-bit values and a double held across the four NSLog calls differing from one computed without them, so a callee-saved register or stack slot changed under a veneer, 1 the string or number passed as %@ changed by the calls"
+case_objc objc_classes "$OBJC_CLASSES_BIN" "$OBJC_CLASSES_ARM64" objc_classes \
+    "_objc_msgSend _objc_autoreleasePoolPush _objc_msgSendSuper2 _OBJC_METACLASS_\$_NSObject __objc_empty_cache _objc_storeWeak _objc_loadWeakRetained _objc_getProperty _objc_setProperty_atomic" classes \
+    "objc_classes is the plainest class a guest can define, a subclass of NSObject that only Foundation uses, so a failure here means no guest program that defines a class of its own can run in native mode" \
+    load "bit 0 is OcerzShape's +load not run before main, 1 the three +load methods not run once each in the order OcerzShape, OcerzSquare, then the NSString category, although OcerzSquare comes first in the image's list, 2 a +initialize run before the first message to its class, 3 the first message to OcerzShape failing, not running its +initialize exactly once or running OcerzSquare's, 4 the first OcerzSquare not running its own +initialize exactly once or running OcerzShape's again, 5 a later message running either +initialize again, or either one handed a class other than its own" \
+    object "bit 0 is the class method factory returning nil or an instance whose class is not OcerzShape, or whose superclass, or the class's, is not the native NSObject, 1 isKindOfClass: NSObject or isMemberOfClass: OcerzShape not exactly YES, or isKindOfClass: NSString not exactly NO, 2 NSStringFromClass not naming OcerzShape or NSClassFromString not finding the class, so it is not registered with the native runtime under its name, 3 the int, double or string the designated initializer set not reading back through the properties and from the ivars alike, 4 the int or double setter not writing what the getter and the ivar read back, 5 the atomic string property, whose accessors are objc_getProperty and objc_setProperty_atomic handed the ivar's offset, not storing and returning the very string set, 6 the weak property not returning the object assigned through it or the ivar under it not holding that object, 7 valueForKey: not reaching the guest's getters for the int, the double and the string, 8 setValue:forKey: not reaching the int and double setters with the unboxed values, or disturbing the weak property" \
+    describe "bit 0 is %@ not producing the text the guest's -description returns, 1 %@ not calling -description exactly once, 2 -description sent directly or -debugDescription, which native NSObject answers by calling it, giving other text, 3 the description of an NSArray of two instances not containing each element's own, 4 -description not called exactly five times over all of those, one per element for the array" \
+    equality "bit 0 is -isEqual: between two distinct instances with equal fields not exactly YES both ways, or against an unequal instance or a string not exactly NO, 1 -hash differing for equal instances or equal for instances differing only in a field folded in above bit 32, 2 NSSet not collapsing the equal instances into one, not finding a third equal one or member: handing back an object never put in, 3 NSSet never calling the guest's -hash or -isEqual:, 4 NSMutableDictionary not keeping the equal keys as one holding the second value, not finding it through a third equal instance or finding a value for an unequal key, 5 the dictionary's key not a copy made by the guest's -copyWithZone: that is an OcerzShape equal to the original, 6 an NSMutableSet of twelve distinct instances not holding twelve after an equal thirteenth was added; order= is the enumeration order, which a hash cut to 32 bits moves" \
+    sort "bit 0 is sortedArrayUsingSelector: not handing back six elements, 1 the order by sides not 543687, which is what a -compare: result read as 4294967295 instead of -1 looks like, 2 the guest's -compare: never called, 3 the unsorted array changed, 4 -compare: sent from guest code not returning exactly -1, 1 and 0" \
+    subclass "bit 0 is an OcerzSquare or its class not reporting OcerzShape as the superclass, 1 isKindOfClass: OcerzShape not exactly YES, isMemberOfClass: OcerzShape not exactly NO or NSClassFromString not finding OcerzSquare, 2 the ivars OcerzShape's initializer set through super, or OcerzSquare's own, not holding their values once both initializers ran, 3 writing OcerzSquare's ivars changing OcerzShape's, 4 writing OcerzShape's through its setters changing OcerzSquare's, 5 valueForKey: on the subclass's accessor-less ivars, read at the native runtime's offsets, or on an inherited getter, disagreeing with guest code, 6 setValue:forKey: on those ivars not seen by guest code reading them at the guest's offsets, or changing OcerzShape's, 7 the overriding -description not building on [super description], 8 the overriding -isEqual: not calling super once per call or not telling squares apart by side, 9 respondsToSelector: not exactly YES for an inherited and an own method" \
+    category "bit 0 is the category's method on an @\"...\" literal giving the wrong text, 1 the same on a string created at run time, 2 the three-letter string not tagged, or the method on it giving the wrong text, 3 the same on an NSMutableString, 4 the category's 64-bit result differing from a checksum computed without it on any of three strings, 5 the category's class method not reached through NSString or NSMutableString, 6 respondsToSelector: or instancesRespondToSelector: not exactly YES for the category's methods on strings or not exactly NO on NSNumber" \
+    protocol "bit 0 is @protocol(OcerzNamed) nil or conformsToProtocol: on OcerzShape or an instance not exactly YES, 1 the same for OcerzSquare, which inherits the conformance, 2 NSObject or a string conforming, 3 OcerzShape not conforming to NSCopying and NSObject or conforming to NSCoding, 4 NSStringFromProtocol not naming OcerzNamed or NSProtocolFromString not returning the very protocol @protocol(OcerzNamed) refers to, 5 NSProtocolFromString(@\"NSCopying\") not the very protocol @protocol(NSCopying) refers to, so the image's copy was not replaced by the runtime's, 6 respondsToSelector: on an instance not exactly YES for a required and an adopted method or not exactly NO for an unimplemented optional one and an unknown selector, 7 instancesRespondToSelector: and respondsToSelector: on the class not telling instance methods from class methods" \
+    lifetime "bit 0 is an instance, its name or a weak reference to either not alive while the strong reference was held, 1 the weak reference not nil once the last strong reference and the pool were gone, or the guest's -dealloc not run exactly once, 2 the name not still set inside -dealloc or still alive afterwards, so .cxx_destruct did not release the strong ivar, 3 a weak property not reading nil through the accessor and the ivar once the object it held was deallocated, 4 an OcerzSquare not running its own -dealloc and then OcerzShape's once each, 5 an instance held only by an NSMutableArray deallocated while held or not after removeAllObjects" \
+    perform "bit 0 is performSelector:withObject: not returning a new instance built by the guest's -scaledBy: from the boxed factor, 1 performSelector: not returning the atomic name property, 2 performSelector:withObject:withObject: not handing both objects to the guest's method, 3 performSelector:withObject: on the class not reaching the class method, 4 performSelector: on an OcerzSquare not reaching its overriding -description, 5 the three guest methods not called once each"
+case_objc objc_view_render "$OBJC_VIEW_RENDER_BIN" "$OBJC_VIEW_RENDER_ARM64" objc_view_render \
+    "_objc_msgSend _objc_msgSendSuper2 _OBJC_CLASS_\$_NSView _OBJC_METACLASS_\$_NSView _NSRectFill _CGContextFillRect _objc_msgSend_stret" view \
+    "objc_view_render is the first case in which a framework draws through guest code, AppKit calling a view's -drawRect: and -isFlipped overrides, so a failure here means no guest program with a view of its own can draw in native mode" \
+    view "bit 0 is the view nil or not an OcerzTestView whose superclass is the native NSView, or NSClassFromString not finding the class, 1 -isFlipped sent from guest code not exactly YES or not running the override once, 2 frame or bounds, which come back as NSRects, not {{5, 7}, {32, 24}} and {{0, 0}, {32, 24}}, 3 NSStringFromRect not giving {{5, 7}, {32, 24}}, 4 -drawRect: called before anything was rendered" \
+    render "bit 0 is the bitmap from bitmapImageRepForCachingDisplayInRect: not 32 by 24 points at a whole backing scale, 1 the device RGB bitmap not 32 by 24 pixels at 32 bits, 2 -drawRect: not called exactly once per cacheDisplayInRect:toBitmapImageRep:, 3 a dirty rect, handed to the guest by value, other than the bounds, 4 -drawRect: called on an object other than the view, 5 no current NSGraphicsContext or CGContext inside -drawRect:, or a context that is not flipped, 6 AppKit never calling the -isFlipped override" \
+    pixels "bit 0 is a corner of the device bitmap not the background color, 1 the NSRectFill rect not red at its corners, 2 red just outside that rect, 3 the background missing where the red rect would be if the view were not flipped, 4 the stroked path missing at a corner or an edge, 5 the stroke's color inside the path or just outside it, 6 the rect filled through CoreGraphics not at its flipped place or found where it would be unflipped, 7 the cached bitmap not red where the red rect is; dev= and rep= are checksums of the two bitmaps' bytes"
+case_objc objc_view_ivar "$OBJC_VIEW_IVAR_BIN" "$OBJC_VIEW_IVAR_ARM64" objc_view_ivar \
+    "_objc_msgSend _objc_msgSendSuper2 _OBJC_METACLASS_\$_NSView _class_getInstanceSize" view \
+    "objc_view_ivar is the first case whose class inherits from one whose native size the compiler did not know, so a failure here means a guest view's own state is not where its code and AppKit both look for it" \
+    layout "bit 0 is either view nil, -initWithFrame: not run once per view, or the class or its superclass wrong, 1 the first ivar not at or past the native NSView's instance size or the ivars out of declaration order, so the offsets guest code reads were not slid, 2 the class's instance size not covering its last ivar, 3 the frame read inside -initWithFrame: after the ivars were written not the one passed, 4 either view's frame or bounds wrong after main wrote the second view's ivars, 5 valueForKey:, reading at the native runtime's offset, not finding each view's own int, 6 valueForKey: not finding the double, the color, the NSRect and the trailing byte guest code wrote, 7 setValue:forKey: on one view not seen by guest code or changing the other view" \
+    draw "bit 0 is -drawRect: not called exactly once per view, 1 -drawRect: called on the wrong view, 2 the int or the double written in -initWithFrame: reading otherwise in -drawRect:, 3 the color written in -initWithFrame: not the very object -drawRect: read, 4 the NSRect or the trailing byte reading otherwise in -drawRect:, 5 the second view's -drawRect: not seeing every value main wrote into it, 6 -frame inside -drawRect: not each view's own" \
+    pixels "bit 0 is a corner of the first view's bitmap not white, 1 the first view's color not at the corners of its box, 2 that color outside its box, 3 the second view's color not at its own box, or the first view's box drawn in it, 4 the second view's color outside its box; dev1= and dev2= are checksums of the two bitmaps' bytes"
 case_env_native
 case_flag_beats_env
 case_last_flag_native
@@ -9254,6 +10656,7 @@ case_native_unbound
 case_native_float
 case_native_classic_bind
 case_native_exit
+case_native_constructors
 
 echo "----------------------------------------"
 echo "native tests: $pass passed, $fail failed"

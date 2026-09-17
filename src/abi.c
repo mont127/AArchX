@@ -130,11 +130,26 @@
  * remove exactly the function it was given - and every one of those breaks
  * quietly if each crossing mints a fresh address.  The same function under two
  * notations gets two addresses, because the two slots convert their arguments
- * differently and are, from the native side, two different functions.  The
- * notation is parsed once, when its entry is written, and one that does not
- * parse or that names a callback of its own gets no entry at all.  Its braces
- * are matched by depth rather than by the first closing brace, since a
+ * differently and are, from the native side, two different functions.  Its
+ * braces are matched by depth rather than by the first closing brace, since a
  * structure inside it closes its own.
+ *
+ * The bank has 65536 slots, because every method of every Objective-C class a
+ * guest defines is one (src/objcclass.c), and a real application has thousands.
+ * So an entry is small: the guest function, a pointer to a parsed signature, a
+ * hash chain link and the used flag, 24 bytes, where embedding the parsed
+ * signature made it 1464 and the table six megabytes at a sixteenth of the
+ * size.  A signature is parsed once per distinct notation, into a shape that
+ * holds the notation and its OcerzAbiSig, and every entry of that notation
+ * points at the same shape; methods share notations heavily, so a few hundred
+ * shapes serve tens of thousands of slots.  A notation that does not parse, or
+ * that names a callback of its own, gets no shape and no entry.  An interned
+ * notation may be up to OCERZ_ABI_CALLBACK_NOTATION_MAX characters, since a
+ * method's signature is often longer than a nested one may be.  The search is a
+ * hash of the function and the shape into 16384 chains of entry indices, so
+ * interning stays constant-time as the bank fills.  ocerz_abi_callback_sig
+ * answers the signature and guest function a slot address is bound to, and
+ * two slots of one notation answer the same signature.
  *
  * ---- a function pointer that is already native ----
  * ocerz_abi_is_guest_code asks the cheap questions first, because it runs on
@@ -162,14 +177,16 @@
  * happen, and the message says how many slots there were so the number can be
  * judged rather than guessed.
  *
- * The table is extended under a mutex, because two guest threads can intern at
- * once and must neither take the same entry nor bind one function twice.  It is
- * read without one, because the dispatcher runs on every call native code makes,
- * on whatever thread native code makes it from.  That is safe because an entry
- * is written completely - function, notation, parsed signature - before its
- * used flag is set, the flag is set before the entry's address leaves the
- * table, and an entry is never written again; a dispatcher that sees the flag
- * sees everything behind it.
+ * The table, its chains and the shapes are extended under a mutex, because two
+ * guest threads can intern at once and must neither take the same entry nor
+ * bind one function twice.  The table is read without one, because the
+ * dispatcher runs on every call native code makes, on whatever thread native
+ * code makes it from.  That is safe because an entry is written completely -
+ * function, shape, chain link - before its used flag is set, a shape is
+ * complete before any entry points at it and is never freed or written again,
+ * the flag is set before the entry's address leaves the table, and an entry is
+ * never written again; a dispatcher that sees the flag sees everything behind
+ * it.
  *
  * ---- running the guest from inside native code ----
  * The dispatcher is the forward crossing turned round.  It reads the slot's
@@ -228,6 +245,7 @@
 #include <dlfcn.h>
 #include <fenv.h>
 #include <pthread.h>
+#include <stdlib.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
@@ -993,15 +1011,26 @@ int ocerz_abi_perform(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+typedef struct AbiShape {
+    struct AbiShape *next;
+    OcerzAbiSig sig;
+    char notation[];
+} AbiShape;
+
 typedef struct AbiCallback {
     uint64_t guest_fn;
-    char notation[OCERZ_ABI_CB_MAX];
-    OcerzAbiSig sig;
+    const AbiShape *shape;
+    uint32_t next;
     _Atomic int used;
 } AbiCallback;
 
+#define ABI_SHAPE_BUCKETS 1024
+#define ABI_CB_BUCKETS 16384
+
 static AbiCallback g_abi_cb[OCERZ_ABI_CALLBACK_SLOTS];
 static unsigned g_abi_cb_n;
+static AbiShape *g_abi_shapes[ABI_SHAPE_BUCKETS];
+static uint32_t g_abi_cb_bucket[ABI_CB_BUCKETS];
 static pthread_mutex_t g_abi_cb_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static unsigned abi_callback_capacity(void)
@@ -1016,6 +1045,53 @@ static void *abi_callback_address(unsigned slot)
     return (void *)(ocerz_abi_callback_bank + (size_t)slot * OCERZ_ABI_CALLBACK_STRIDE);
 }
 
+static unsigned abi_notation_hash(const char *s)
+{
+    unsigned h = 2166136261u;
+    for (; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    return h;
+}
+
+static unsigned abi_callback_hash(uint64_t guest_fn, const AbiShape *shape)
+{
+    uint64_t k = guest_fn * 0x9e3779b97f4a7c15ull ^ ((uint64_t)(uintptr_t)shape >> 4) * 0xc2b2ae3d27d4eb4full;
+    return (unsigned)((k ^ (k >> 31)) & (ABI_CB_BUCKETS - 1));
+}
+
+static const AbiShape *abi_shape_locked(uint64_t guest_fn, const char *notation, size_t len)
+{
+    unsigned b = abi_notation_hash(notation) & (ABI_SHAPE_BUCKETS - 1);
+    for (const AbiShape *s = g_abi_shapes[b]; s; s = s->next)
+        if (strcmp(s->notation, notation) == 0)
+            return s;
+
+    AbiShape *made = calloc(1, sizeof *made + len + 1);
+    if (!made) {
+        OCERZ_LOG("abi: no memory to parse the signature %s of callback %#llx\n", notation,
+                  (unsigned long long)guest_fn);
+        return NULL;
+    }
+    memcpy(made->notation, notation, len + 1);
+    if (ocerz_abi_parse(made->notation, &made->sig) != OCERZ_OK) {
+        OCERZ_LOG("abi: callback %#llx is declared %s, which does not parse\n",
+                  (unsigned long long)guest_fn, notation);
+        free(made);
+        return NULL;
+    }
+    for (int i = 0; i < made->sig.nargs; i++) {
+        if (made->sig.arg[i] == 'c') {
+            OCERZ_LOG("abi: callback %#llx is declared %s, which takes a callback of its own\n",
+                      (unsigned long long)guest_fn, notation);
+            free(made);
+            return NULL;
+        }
+    }
+    made->next = g_abi_shapes[b];
+    g_abi_shapes[b] = made;
+    return made;
+}
+
 void *ocerz_abi_callback_intern(uint64_t guest_fn, const char *notation)
 {
     if (!guest_fn || !notation) {
@@ -1023,36 +1099,26 @@ void *ocerz_abi_callback_intern(uint64_t guest_fn, const char *notation)
         return NULL;
     }
 
-    size_t len = strnlen(notation, OCERZ_ABI_CB_MAX);
-    if (len >= OCERZ_ABI_CB_MAX) {
+    size_t len = strnlen(notation, OCERZ_ABI_CALLBACK_NOTATION_MAX);
+    if (len >= OCERZ_ABI_CALLBACK_NOTATION_MAX) {
         OCERZ_LOG("abi: callback %#llx has a signature longer than the %d characters one may have\n",
-                  (unsigned long long)guest_fn, OCERZ_ABI_CB_MAX - 1);
+                  (unsigned long long)guest_fn, OCERZ_ABI_CALLBACK_NOTATION_MAX - 1);
         return NULL;
     }
 
     pthread_mutex_lock(&g_abi_cb_lock);
 
-    for (unsigned n = 0; n < g_abi_cb_n; n++) {
-        const AbiCallback *e = &g_abi_cb[n];
-        if (e->guest_fn == guest_fn && strcmp(e->notation, notation) == 0) {
-            pthread_mutex_unlock(&g_abi_cb_lock);
-            return abi_callback_address(n);
-        }
-    }
-
-    OcerzAbiSig sig;
-    if (ocerz_abi_parse(notation, &sig) != OCERZ_OK) {
+    const AbiShape *shape = abi_shape_locked(guest_fn, notation, len);
+    if (!shape) {
         pthread_mutex_unlock(&g_abi_cb_lock);
-        OCERZ_LOG("abi: callback %#llx is declared %s, which does not parse\n",
-                  (unsigned long long)guest_fn, notation);
         return NULL;
     }
-    for (int i = 0; i < sig.nargs; i++) {
-        if (sig.arg[i] == 'c') {
+
+    unsigned b = abi_callback_hash(guest_fn, shape);
+    for (uint32_t k = g_abi_cb_bucket[b]; k; k = g_abi_cb[k - 1].next) {
+        if (g_abi_cb[k - 1].guest_fn == guest_fn && g_abi_cb[k - 1].shape == shape) {
             pthread_mutex_unlock(&g_abi_cb_lock);
-            OCERZ_LOG("abi: callback %#llx is declared %s, which takes a callback of its own\n",
-                      (unsigned long long)guest_fn, notation);
-            return NULL;
+            return abi_callback_address(k - 1);
         }
     }
 
@@ -1069,13 +1135,29 @@ void *ocerz_abi_callback_intern(uint64_t guest_fn, const char *notation)
     unsigned slot = g_abi_cb_n;
     AbiCallback *e = &g_abi_cb[slot];
     e->guest_fn = guest_fn;
-    memcpy(e->notation, notation, len + 1);
-    e->sig = sig;
+    e->shape = shape;
+    e->next = g_abi_cb_bucket[b];
     e->used = 1;
+    g_abi_cb_bucket[b] = slot + 1;
     g_abi_cb_n = slot + 1;
 
     pthread_mutex_unlock(&g_abi_cb_lock);
     return abi_callback_address(slot);
+}
+
+const OcerzAbiSig *ocerz_abi_callback_sig(const void *slot_address, uint64_t *guest_fn)
+{
+    uintptr_t a = (uintptr_t)slot_address, lo = (uintptr_t)ocerz_abi_callback_bank;
+    if (guest_fn)
+        *guest_fn = 0;
+    if (a < lo || (a - lo) % OCERZ_ABI_CALLBACK_STRIDE != 0)
+        return NULL;
+    uintptr_t slot = (a - lo) / OCERZ_ABI_CALLBACK_STRIDE;
+    if (slot >= abi_callback_capacity() || !g_abi_cb[slot].used)
+        return NULL;
+    if (guest_fn)
+        *guest_fn = g_abi_cb[slot].guest_fn;
+    return &g_abi_cb[slot].shape->sig;
 }
 
 int ocerz_abi_is_guest_code(uint64_t gptr)
@@ -1244,13 +1326,14 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
     }
 
     const AbiCallback *e = &g_abi_cb[slot];
-    const OcerzAbiSig *sig = &e->sig;
+    const OcerzAbiSig *sig = &e->shape->sig;
+    const char *notation = e->shape->notation;
 
     if (sig->ret == '{' && abi_host_indirect(&sig->ret_struct) && !x8) {
         fprintf(stderr,
                 "ocerz: abi: guest function %#llx (callback slot %u, %s) returns a structure through x8,"
                 " and its native caller passed no buffer there\n",
-                (unsigned long long)e->guest_fn, slot, e->notation);
+                (unsigned long long)e->guest_fn, slot, notation);
         return;
     }
 
@@ -1261,7 +1344,7 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
         fprintf(stderr,
                 "ocerz: abi: native code called guest function %#llx (callback slot %u, %s) on a thread"
                 " with no guest cpu, and no guest personality could be attached to it\n",
-                (unsigned long long)e->guest_fn, slot, e->notation);
+                (unsigned long long)e->guest_fn, slot, notation);
         return;
     }
 
@@ -1297,7 +1380,7 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
                 fprintf(stderr,
                         "ocerz: abi: guest function %#llx (callback slot %u, %s) takes structure argument"
                         " %d %s\n",
-                        (unsigned long long)e->guest_fn, slot, e->notation, i,
+                        (unsigned long long)e->guest_fn, slot, notation, i,
                         rc == OCERZ_EFORMAT ? "through a copy, and the native caller passed a null address"
                                             : "from the native caller's stack, and no stack was passed");
                 return;
@@ -1307,7 +1390,7 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
                 fprintf(stderr,
                         "ocerz: abi: guest function %#llx (callback slot %u, %s) stacks more than the %d"
                         " eightbytes a guest call carries\n",
-                        (unsigned long long)e->guest_fn, slot, e->notation, slots);
+                        (unsigned long long)e->guest_fn, slot, notation, slots);
                 return;
             }
             continue;
@@ -1323,7 +1406,7 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
             fprintf(stderr,
                     "ocerz: abi: guest function %#llx (callback slot %u, %s) takes argument %d from"
                     " the native caller's stack, and no stack was passed\n",
-                    (unsigned long long)e->guest_fn, slot, e->notation, i);
+                    (unsigned long long)e->guest_fn, slot, notation, i);
             return;
         }
 
@@ -1340,7 +1423,7 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
             fprintf(stderr,
                     "ocerz: abi: guest function %#llx (callback slot %u, %s) stacks more than the %d"
                     " eightbytes a guest call carries\n",
-                    (unsigned long long)e->guest_fn, slot, e->notation, slots);
+                    (unsigned long long)e->guest_fn, slot, notation, slots);
             return;
         }
     }

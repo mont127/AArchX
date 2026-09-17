@@ -7,7 +7,9 @@
 #   tools/sdkgen.sh --update-baseline libSystem    # accept the new coverage as the baseline
 #
 # The library names are the ones tools/sdkgen/libraries configures: libSystem,
-# CoreFoundation, libobjc and Foundation.
+# CoreFoundation, libobjc, Foundation, CoreGraphics and AppKit.  Each takes a
+# second or two, AppKit's twelve thousand exports and the sixteen hundred
+# headers its umbrella reaches included.
 #
 # The generator is tools/sdkgen/sdkgen.c and tbd.c, compiled here against the
 # Command Line Tools' libclang every run, because it takes a second and a stale

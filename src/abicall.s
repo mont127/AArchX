@@ -84,7 +84,8 @@
  * real-time thread cannot wait for any of it.  Every slot is the same two
  * instructions, an adr of the slot's own address into x16 and a branch to the
  * common entry, so the whole bank is one repeated block and a slot's index is
- * its distance from the start of the bank divided by eight.  x16 is the
+ * its distance from the start of the bank divided by eight.  It is 65536 slots,
+ * 512 kilobytes of text, every one within a branch's reach of the entry.  x16 is the
  * intra-procedure-call scratch register a linker veneer is allowed to clobber,
  * so borrowing it between the call and the common entry is legal.  The end
  * symbol is an alternate entry of the same atom, because a separate atom could
@@ -186,7 +187,7 @@ Lnofp:
 .p2align 2
 .globl _ocerz_abi_callback_bank
 _ocerz_abi_callback_bank:
-.rept 4096
+.rept 65536
     adr     x16, .
     b       _ocerz_abi_callback_common
 .endr

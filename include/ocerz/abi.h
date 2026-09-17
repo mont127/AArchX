@@ -192,13 +192,17 @@
  * pointer is x86 code, and native code cannot jump to it.  So an argument of
  * class c is not converted like a pointer.  It carries its own signature in
  * braces, as in v(pLLc{i(pp)}) for qsort, and it is interned: the guest function
- * and that signature are bound to one slot of a fixed bank of arm64 trampolines,
- * and the slot's address is what the native callee receives.  Interning the same
- * function with the same signature twice returns the same address, so a native
- * library that compares callback pointers still sees one function.  A null
- * pointer stays null.  A nested signature may not itself name a callback, and
- * is at most 47 characters, which leaves room for structures on both sides:
- * {{dd}{dd}}(pp{{dd}{dd}}p) is already 25.
+ * and that signature are bound to one slot of a fixed bank of 65536 arm64
+ * trampolines, and the slot's address is what the native callee receives.
+ * Interning the same function with the same signature twice returns the same
+ * address, so a native library that compares callback pointers still sees one
+ * function.  A null pointer stays null.  A nested signature may not itself name
+ * a callback, and is at most 47 characters, which leaves room for structures on
+ * both sides: {{dd}{dd}}(pp{{dd}{dd}}p) is already 25.  A signature interned
+ * directly, as an Objective-C method's is, may be up to 255 characters, and
+ * ocerz_abi_callback_sig answers the parsed signature and guest function a
+ * slot's address is bound to, the same signature for every slot of one
+ * notation.
  *
  * Not every function pointer a guest passes is guest code.  In native mode an
  * exported variable such as kCFTypeArrayCallBacks is CoreFoundation's own, so a
@@ -287,7 +291,8 @@
 #define OCERZ_ABI_MAX_ARGS 16
 #define OCERZ_ABI_MAX_STACK 64
 #define OCERZ_ABI_CB_MAX 48
-#define OCERZ_ABI_CALLBACK_SLOTS 4096
+#define OCERZ_ABI_CALLBACK_SLOTS 65536
+#define OCERZ_ABI_CALLBACK_NOTATION_MAX 256
 #define OCERZ_ABI_CALLBACK_STRIDE 8
 #define OCERZ_ABI_STRUCT_MEMBERS 16
 #define OCERZ_ABI_STRUCT_BYTES 256
@@ -349,6 +354,7 @@ void ocerz_abi_call_native(const void *fn, const uint64_t *x, const uint64_t *v,
                            uint64_t *out_x, uint64_t *out_v);
 
 void *ocerz_abi_callback_intern(uint64_t guest_fn, const char *notation);
+const OcerzAbiSig *ocerz_abi_callback_sig(const void *slot_address, uint64_t *guest_fn);
 
 int ocerz_abi_is_guest_code(uint64_t gptr);
 

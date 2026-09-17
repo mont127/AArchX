@@ -11,7 +11,11 @@
  * trampoline into whatever method implementation the selector finds, and the
  * arguments of that implementation are in x86 registers.  So every send is a
  * crossing whose signature is not known until the send arrives, and the runtime
- * that is about to run the method is asked for it.
+ * that is about to run the method is asked for it.  A class the guest itself
+ * defines is made the native runtime's own before any guest code runs
+ * (src/objcclass.c), so a send to a guest object is the same crossing, and the
+ * native objc_msgSend it ends in reaches the guest's method through a callback
+ * slot.
  *
  * ---- selectors ----
  * A selector is compared by address.  The guest's @selector(length) is a word in
@@ -119,14 +123,20 @@
  *
  * ---- forwarding ----
  * A selector with no method is forwarded natively, and forwarding still needs
- * the arguments where the signature puts them.  The signature is then the
- * receiver's own answer to methodSignatureForSelector:, called through native
- * objc_msgSend, with its methodReturnType and each getArgumentTypeAtIndex:
- * concatenated into an encoding.  That answer can depend on the instance, as a
- * proxy's does, so it is asked on every forwarded send and never cached.  A nil
- * answer is an unrecognized selector, which natively raises an exception that
- * nothing in the guest can catch, so it stops the send naming the class and the
- * selector.
+ * the arguments where the signature puts them.  The runtime first asks the
+ * receiver forwardingTargetForSelector:, and so does the send: a target that is
+ * neither nil nor the receiver itself is where the runtime will resend the
+ * message with the same arguments, so the signature is the target's method's,
+ * and a target with no method of that name is asked the same two questions in
+ * turn, up to eight targets deep.  The receiver therefore answers
+ * forwardingTargetForSelector: twice, once to the send and once to the
+ * runtime.  With no target, the signature is the receiver's own answer to
+ * methodSignatureForSelector:, called through native objc_msgSend, with its
+ * methodReturnType and each getArgumentTypeAtIndex: concatenated into an
+ * encoding.  Either answer can depend on the instance, as a proxy's does, so
+ * both are asked on every forwarded send and never cached.  A nil answer is an
+ * unrecognized selector, which natively raises an exception that nothing in
+ * the guest can catch, so it stops the send naming the class and the selector.
  *
  * ---- variadic methods ----
  * No encoding says a method is variadic, and Apple's arm64 puts every variadic
@@ -668,6 +678,11 @@ const char *ocerz_objc_refusal(int code)
     case OCERZ_OBJC_TOO_MANY_ARGS: return "more arguments than the ABI engine carries";
     case OCERZ_OBJC_TOO_LONG:      return "a notation longer than ocerz keeps";
     case OCERZ_OBJC_ENGINE:        return "a structure the ABI engine cannot lay out";
+    case OCERZ_OBJC_NOT_METHOD:    return "no self and _cmd as its first two arguments";
+    case OCERZ_OBJC_NULL:          return "a null address where a structure belongs";
+    case OCERZ_OBJC_SWIFT:         return "a Swift class";
+    case OCERZ_OBJC_BAD_LIST:      return "a list whose entry size ocerz cannot read";
+    case OCERZ_OBJC_CYCLE:         return "a class that is its own superclass";
     default:                       return "an encoding ocerz cannot parse";
     }
 }
@@ -1053,14 +1068,33 @@ static void ob_append(char *buf, size_t cap, const char *s, void *cls, void *sel
     memcpy(buf + have, s, add + 1);
 }
 
-static const ObSend *ob_forwarded(void *recv, void *cls, void *sel, ObSend *scratch)
+static const ObSend *ob_forwarded(void *recv, void *cls, void *sel, ObSend *scratch, int depth)
 {
+    void *send = ob_need(&g_ob_msgSend);
+    void *fts = ob_sel_registerName("forwardingTargetForSelector:");
+    if (depth < 8 && ob_class_respondsToSelector(cls, fts)) {
+        void *target = ((void *(*)(void *, void *, void *))send)(recv, fts, sel);
+        if (target && target != recv) {
+            void *tcls = ob_object_getClass(target);
+            const ObSend *e = ob_cached(tcls, sel);
+            if (!e) {
+                void *m = ob_class_getInstanceMethod(tcls, sel);
+                if (m) {
+                    ob_describe(tcls, sel, ob_method_getTypeEncoding(m), "forwarding target's", scratch);
+                    return scratch;
+                }
+                return ob_forwarded(target, tcls, sel, scratch, depth + 1);
+            }
+            *scratch = *e;
+            return scratch;
+        }
+    }
+
     void *msfs = ob_sel_registerName("methodSignatureForSelector:");
     if (!ob_class_respondsToSelector(cls, msfs))
         ob_refuse(cls, sel, "has no method, and the receiver does not answer methodSignatureForSelector:,"
                   " so there is no signature to forward it under");
 
-    void *send = ob_need(&g_ob_msgSend);
     void *ms = ((void *(*)(void *, void *, void *))send)(recv, msfs, sel);
     if (!ms)
         ob_refuse(cls, sel, "is not a selector the receiver recognizes: there is no method and"
@@ -1257,7 +1291,7 @@ static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
 
     send = ob_method(cls, sel, &scratch);
     if (!send)
-        send = ob_forwarded(recv, cls, sel, &scratch);
+        send = ob_forwarded(recv, cls, sel, &scratch, 0);
 
     const OcerzAbiSig *sig = &send->shape->sig;
     int memory = sig->ret == '{' && sig->ret_struct.size > OB_SMALL_STRUCT;

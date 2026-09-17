@@ -268,7 +268,11 @@
  * word of each version of it is, a shape record; the version is read out of the
  * structure's first word at every crossing, and a version no shape record
  * describes names itself and stops, because guessing at the layout of a context
- * would put a guest pointer where native code will call it.
+ * would put a guest pointer where native code will call it.  CoreFoundation's
+ * structures carry a CFIndex version, but CoreGraphics' start with a 32-bit
+ * unsigned int and four bytes of padding, which a structure filled field by field
+ * leaves as whatever was on the stack, so a word that matches no version whole is
+ * matched again on its low half.
  */
 #include "ocerz/bridge.h"
 #include "ocerz/apidb.h"
@@ -771,6 +775,9 @@ static void br_convert_structs(const struct OcerzBridgeFn *fn, OcerzCPU *cpu,
         const OcerzApiShape *shape = NULL;
         for (int i = 0; i < b->nversions && !shape; i++)
             if (b->versions[i]->version == version)
+                shape = b->versions[i];
+        for (int i = 0; i < b->nversions && !shape; i++)
+            if (b->versions[i]->version == (uint32_t)version)
                 shape = b->versions[i];
         if (!shape) {
             fprintf(stderr, "ocerz: bridge: %s was handed a %s of version %llu, which ocerz cannot convert\n",
