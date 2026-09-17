@@ -257,10 +257,10 @@
 # with cache mode, where the real x86 libpthread runs the same start routines on
 # threads ocerz creates for the guest.
 #
-# The thread and tlv_* fixtures alone are built without -fno-stack-protector, and
-# that is deliberate. clang emits the stack protector by default, and a protected
-# x86_64 function reads ___stack_chk_guard, which is a data symbol rather than a
-# function. Until M7a the virtual libSystem exported only functions, so a
+# The thread, tlv_* and signal_* fixtures alone are built without
+# -fno-stack-protector, and that is deliberate. clang emits the stack protector
+# by default, and a protected x86_64 function reads ___stack_chk_guard, which is
+# a data symbol rather than a function. Until M7a the virtual libSystem exported only functions, so a
 # protected program could not bind in native mode at all, which is to say nearly
 # no real program could, and every older fixture passes the flag because it was
 # written while that was true; they keep it, so that each still isolates the one
@@ -445,10 +445,129 @@
 # progress notes as the thread fixtures, so a run that times out says how far it
 # got in the same terms.
 #
-# The callback, attach, thread and tlv_* cases skip where there is no x86_64
-# clang, like the others, but a fixture of theirs that fails to compile where a
-# trivial x86_64 program compiles fine is a failure: skipping it would hide a
-# broken fixture indefinitely.
+# M7c gives native mode signals. With no x86 libc in front of them, sigaction,
+# signal, sigprocmask, pthread_sigmask, sigaltstack, raise, kill and pthread_kill
+# arrive as bridged calls, and the handler table, the mask and the alternate stack
+# they change are the ones the same syscalls change in cache mode. A handler is
+# guest code, so ocerz has to build its frame on the guest's stack, enter it and
+# take it back through sigreturn, just as it does for a signal delivered at a
+# syscall. Nine signal_* fixtures cover it. Eight are shaped like the thread ones
+# -- a status line "<name> ok ..." or "<name> bad:<hex> ..." with the bits in
+# source order and progress notes on stderr, run under both engines, which must
+# agree byte for byte, and compared with cache mode, where the real x86 libSystem
+# makes the same calls as syscalls. Each case checks with nm that its fixture
+# imports nothing the bridge does not implement, so that a failure is about
+# signals and not about an import the fixture had no business making.
+#
+# ocerz delivers a signal only at an edge where it has control again: in cache
+# mode a syscall, in native mode the return of a bridged call. A raise is its own
+# edge in both modes, so its handler has run by the time it returns, and the
+# fixtures rely on that. A guest spinning in its own code reaches no edge at all
+# and never sees a signal sent from anywhere else, in either mode, so every
+# fixture that waits for a handler calls getpid on each turn of the wait, a
+# syscall in cache mode and a crossing in native mode, and gives up after
+# SIGNAL_WAIT_SECS seconds with a bad status line rather than spinning into the
+# run's bound.
+#
+# signal_sigaction installs an SA_SIGINFO handler for SIGUSR1 and raises it from
+# a function holding six 64-bit values and a double read from volatile globals, a
+# 48-byte pattern on its own stack and a running checksum, every one of them still
+# needed after raise returns, so the compiler keeps them in callee-saved registers
+# and stack slots that the handler's frame and sigreturn must leave alone. The
+# handler must be handed SIGUSR1, a siginfo naming it and a non-null ucontext,
+# raise must return 0 with the handler already run, and the checksum must equal
+# one computed without a signal. A second sigaction must hand back the first
+# handler, its SA_SIGINFO flag and its mask as the old action, a query with no new
+# action must report the second, and a raise must then run the second handler and
+# not the first.
+#
+# signal_signal is the older interface. The first signal(SIGUSR2, h) must return
+# SIG_DFL and the second h, the handler must run on each of two raises and stay
+# installed between them, a SIGUSR1 set to SIG_IGN must be raised without ending
+# the process or running anything, and restoring both defaults must hand back
+# SIG_IGN and h.
+#
+# signal_mask blocks SIGUSR1 and raises it. The handler must not run, a query with
+# no new set must report SIGUSR1 blocked, and the handler must have run exactly
+# once by the time the call that unblocks it returns, which is where a pending
+# signal falls due. It does that with sigprocmask, with pthread_sigmask, and once
+# blocking with the first and querying and unblocking with the second, since the
+# two share one mask; the last query of each round passes how as 0, which the
+# kernel never looks at when there is no new set. Inside the handler a
+# pthread_sigmask query must find SIGUSR1 itself blocked, and SIGUSR2 too, which
+# the handler's sa_mask names, and both must be open again once it has returned.
+# The fixture also calls sigemptyset, sigaddset, sigdelset, sigfillset and
+# sigismember as functions rather than through the header's macros, which is the
+# only way a program comes to import them, and checks what they build against
+# what the macros build.
+#
+# signal_altstack queries sigaltstack before installing anything and must find
+# SS_DISABLE, installs a malloc'd alternate stack of four times SIGSTKSZ and must
+# read back the same ss_sp and ss_size, then raises one signal whose handler has
+# SA_ONSTACK, which must find the address of a local of its own inside that stack,
+# and one whose handler does not, which must not. Back from both, the thread must
+# no longer be on the alternate stack; once it is disabled again the query must
+# report SS_DISABLE and the SA_ONSTACK handler must run on the thread's own stack.
+# The handler deliberately does not query sigaltstack itself: macOS answers
+# SS_DISABLE there, natively and under Rosetta, and cache mode answers SS_ONSTACK,
+# so the answer would compare two things neither of which this gate is about.
+#
+# signal_pthread_kill first sends SIGUSR1 to the main thread with pthread_kill,
+# whose handler must have run on that thread before the call returns. It then
+# starts a worker that waits for the handler in the getpid loop, sends the worker
+# SIGUSR1 once it is running and joins it. The handler records pthread_self, and
+# it must have run exactly once, on the worker, before the worker gave up. A
+# signal aimed at another thread is the one delivery that cannot happen at the
+# sender's own edge: it has to reach the target by way of the host and be
+# delivered at the target's next crossing.
+#
+# signal_kill sends SIGUSR1 to the whole process with kill(getpid(), ...). Which
+# thread the host kernel hands a process-directed signal to is its own choice, and
+# in native mode it may pick a thread ocerz runs rather than the guest's, so the
+# fixture waits for the handler in the getpid loop rather than demanding it before
+# kill returns. The handler must still run exactly once, and on the main thread,
+# the only thread the guest has, and kill with signal 0 must succeed and deliver
+# nothing.
+#
+# signal_errors writes what its calls returned, not only whether they failed,
+# over two lines, so the comparison with cache mode judges the values themselves.
+# sigaction on SIGKILL, SIGSTOP, 0, 200 and NSIG, and a query of SIGKILL with no
+# new action, must each return -1 with errno EINVAL, and so must raise and kill of
+# signal 200; pthread_kill must return EINVAL for 200 and NSIG, and sigaltstack
+# must refuse a stack one byte short of MINSIGSTKSZ with ENOMEM. Signal 0 is the
+# other side of that line: raise, kill and pthread_kill of 0 ask only whether the
+# target exists and must succeed, so a range check that turned away 0 along with
+# the numbers past the end shows up there. Natively, under Rosetta and in cache
+# mode every one of these rows agrees.
+#
+# signal_default raises SIGWINCH and then SIGTERM with no handler installed for
+# either. SIGWINCH is ignored by default, so the process must carry on past it;
+# SIGTERM ends the process by default, so it must stop inside that raise, never
+# writing the line after it, with status 143, which is 128 plus SIGTERM's 15, and
+# cache mode must stop at the same place with the same status. bash reports a
+# child that a signal ended on its own stderr, so this case's runs are made with
+# the script's stderr sent to /dev/null.
+#
+# signal_handler_bridge's SIGUSR1 handler makes bridged calls while it runs:
+# strlen, memcpy into a buffer on the handler's own stack, strcmp, a write of a
+# line to stdout, and a raise of SIGUSR2, whose handler writes a line of its own
+# and must run nested inside the first, before that raise returns. The main
+# thread raises SIGUSR1 four times, so stdout holds eight handler lines in a fixed
+# order ahead of the status line, and cache mode must write the same lines in the
+# same order. A crossing inside a handler is a crossing made while a delivery is
+# still in progress, and the signal delivered at the return of the nested raise is
+# a signal delivered inside a handler.
+#
+# The signal runs are bounded at SIGNAL_TIMEOUT seconds, and a run that times out
+# names the last progress note its fixture wrote. A fixture whose handler was
+# never found usually does not time out at all: the signal takes its default
+# action and ends the process, with status 158 for SIGUSR1 or 159 for SIGUSR2, and
+# the case says that is what the status means.
+#
+# The callback, attach, thread, tlv_* and signal_* cases skip where there is no
+# x86_64 clang, like the others, but a fixture of theirs that fails to compile
+# where a trivial x86_64 program compiles fine is a failure: skipping it would
+# hide a broken fixture indefinitely.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -544,6 +663,22 @@ TLV_CHURN_BUDGET=15
 TLV_BOOTSTRAP_SYM=__tlv_bootstrap
 TLV_BRIDGED='___stack_chk_fail _write _pthread_create _pthread_join _pthread_mutex_lock _pthread_mutex_unlock _pthread_cond_wait _pthread_cond_broadcast'
 TLV_UNRESOLVED='ocerz: bridge: thread-local variable descriptor '
+SIG_ACTION_BIN=""
+SIG_SIGNAL_BIN=""
+SIG_MASK_BIN=""
+SIG_ALTSTACK_BIN=""
+SIG_PTKILL_BIN=""
+SIG_KILL_BIN=""
+SIG_ERRORS_BIN=""
+SIG_DEFAULT_BIN=""
+SIG_HANDLER_BIN=""
+SIGNAL_TIMEOUT=30
+SIGNAL_WAIT_SECS=10
+SIGNAL_BRIDGED='___stack_chk_fail ___error _write _strlen _strcmp _memcpy _malloc _free _getpid _time _pthread_create _pthread_join _pthread_self _signal _sigaction _raise _kill _sigprocmask _pthread_sigmask _sigaltstack _pthread_kill _sigemptyset _sigfillset _sigaddset _sigdelset _sigismember'
+SIG_DEFAULT_WINCH='signal_default raising SIGWINCH'
+SIG_DEFAULT_MARK='signal_default raising SIGTERM'
+SIG_DEFAULT_PAST='signal_default survived'
+SIG_DEFAULT_STATUS=143
 MEASURE_BIN=/usr/bin/time
 
 unset OCERZ_MODE
@@ -3759,6 +3894,887 @@ EOC
     fi
 }
 
+build_signal_fixtures() {
+    local name
+
+    cat > "$TMP/sig_common.h" <<EOC
+#include <errno.h>
+#include <signal.h>
+#include "thread_common.h"
+
+pid_t getpid(void);
+
+#define SIG_WAIT_SECS ${SIGNAL_WAIT_SECS}
+
+static int sig_wait(const volatile sig_atomic_t *flag)
+{
+    time_t end = time(0) + SIG_WAIT_SECS;
+    unsigned long n = 0;
+
+    while (!*flag) {
+        getpid();
+        if ((++n & 1023) == 0 && time(0) > end)
+            return 0;
+    }
+    return 1;
+}
+
+static int sig_inside(cb_uptr p, cb_uptr base, cb_size size)
+{
+    return base != 0 && p - base < size;
+}
+
+static void sig_int(const char *key, int v)
+{
+    cb_str(" ");
+    cb_str(key);
+    cb_str("=");
+    if (v < 0) {
+        cb_str("-");
+        cb_dec((unsigned)-(long)v);
+    } else {
+        cb_dec((unsigned)v);
+    }
+}
+EOC
+
+    cat > "$TMP/signal_sigaction.c" <<'EOC'
+#include "sig_common.h"
+
+#define TAG "signal_sigaction"
+#define PAD 48
+
+static volatile unsigned long long g_src[6];
+static volatile double g_srcd;
+static volatile sig_atomic_t g_info_hits, g_plain_hits;
+static volatile unsigned g_sig_bad, g_info_bad, g_uc_bad, g_plain_bad, g_skew;
+
+static void on_info(int sig, siginfo_t *info, void *uc)
+{
+    g_info_hits++;
+    if (sig != SIGUSR1)
+        g_sig_bad++;
+    if (info == 0 || info->si_signo != SIGUSR1)
+        g_info_bad++;
+    if (uc == 0)
+        g_uc_bad++;
+    if (CB_SKEWED())
+        g_skew++;
+}
+
+static void on_plain(int sig)
+{
+    g_plain_hits++;
+    if (sig != SIGUSR1)
+        g_plain_bad++;
+    if (CB_SKEWED())
+        g_skew++;
+}
+
+static unsigned fold(unsigned h, unsigned long long v)
+{
+    return (h * 31u + (unsigned)(v >> 32)) * 31u + (unsigned)v;
+}
+
+static unsigned combine(unsigned h, unsigned long long a, unsigned long long b,
+                        unsigned long long c, unsigned long long d,
+                        unsigned long long e, unsigned long long f, double g, int hits)
+{
+    h = fold(h, a + (unsigned)hits);
+    h = fold(h, b ^ (unsigned)hits);
+    h = fold(h, c - (unsigned)hits);
+    h = fold(h, d * (unsigned)(hits + 2));
+    h = fold(h, e | (unsigned)hits);
+    h = fold(h, f + 3u * (unsigned)hits);
+    return fold(h, (unsigned long long)(g * 8.0) + (unsigned)hits);
+}
+
+__attribute__((noinline)) static unsigned held(int *rc, int *seen, unsigned *pad_bad)
+{
+    unsigned long long a = g_src[0], b = g_src[1], c = g_src[2];
+    unsigned long long d = g_src[3], e = g_src[4], f = g_src[5];
+    double g = g_srcd;
+    unsigned char pad[PAD];
+    unsigned before = 17, i;
+
+    for (i = 0; i < PAD; i++)
+        pad[i] = (unsigned char)(a >> (i % 56)) ^ (unsigned char)i;
+    before = combine(before, a, b, c, d, e, f, g, 0);
+    at_note(TAG, "raising SIGUSR1");
+    *rc = raise(SIGUSR1);
+    at_note(TAG, "raise returned");
+    *seen = g_info_hits;
+    for (i = 0; i < PAD; i++)
+        if (pad[i] != ((unsigned char)(a >> (i % 56)) ^ (unsigned char)i))
+            (*pad_bad)++;
+    return combine(before, a, b, c, d, e, f, g, g_info_hits);
+}
+
+static unsigned want_held(void)
+{
+    unsigned h = combine(17, g_src[0], g_src[1], g_src[2], g_src[3], g_src[4], g_src[5], g_srcd, 0);
+
+    return combine(h, g_src[0], g_src[1], g_src[2], g_src[3], g_src[4], g_src[5], g_srcd, 1);
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, sum, pad_bad = 0;
+    struct sigaction act, again, old, query;
+    sigset_t want_mask;
+    int r_install, r_again, r_query, r_raise, r_plain, seen, i;
+
+    for (i = 0; i < 6; i++)
+        g_src[i] = ((unsigned long long)at_mix((unsigned)i + 1u) << 32) | at_mix((unsigned)i + 0x5349u);
+    g_srcd = 1234.625;
+
+    act.sa_sigaction = on_info;
+    sigemptyset(&act.sa_mask);
+    sigaddset(&act.sa_mask, SIGUSR2);
+    act.sa_flags = SA_SIGINFO;
+    want_mask = act.sa_mask;
+    r_install = sigaction(SIGUSR1, &act, 0);
+
+    r_raise = -7;
+    seen = -7;
+    sum = held(&r_raise, &seen, &pad_bad);
+
+    again.sa_handler = on_plain;
+    sigemptyset(&again.sa_mask);
+    again.sa_flags = 0;
+    old.sa_handler = 0;
+    old.sa_mask = 0;
+    old.sa_flags = 0;
+    r_again = sigaction(SIGUSR1, &again, &old);
+    query.sa_handler = 0;
+    query.sa_mask = 1;
+    query.sa_flags = SA_SIGINFO;
+    r_query = sigaction(SIGUSR1, 0, &query);
+    at_note(TAG, "raising SIGUSR1 again");
+    r_plain = raise(SIGUSR1);
+    at_note(TAG, "raise returned");
+
+    CK(r_install == 0 && r_again == 0 && r_query == 0);
+    CK(r_raise == 0);
+    CK(seen == 1 && g_info_hits == 1);
+    CK(g_sig_bad == 0);
+    CK(g_info_bad == 0);
+    CK(g_uc_bad == 0);
+    CK(sum == want_held());
+    CK(pad_bad == 0);
+    CK(old.sa_sigaction == on_info);
+    CK((old.sa_flags & SA_SIGINFO) != 0);
+    CK(old.sa_mask == want_mask);
+    CK(query.sa_handler == on_plain && (query.sa_flags & SA_SIGINFO) == 0 && query.sa_mask == 0);
+    CK(r_plain == 0 && g_plain_hits == 1 && g_plain_bad == 0 && g_info_hits == 1);
+    CK(g_skew == 0);
+
+    cb_begin(TAG, m);
+    cb_field("hits", (unsigned)(g_info_hits + g_plain_hits), 0);
+    cb_field("sum", sum, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/signal_signal.c" <<'EOC'
+#include "sig_common.h"
+
+#define TAG "signal_signal"
+
+typedef void (*sig_fn)(int);
+
+static volatile sig_atomic_t g_hits;
+static volatile unsigned g_bad, g_skew;
+
+static void on_usr2(int sig)
+{
+    g_hits++;
+    if (sig != SIGUSR2)
+        g_bad++;
+    if (CB_SKEWED())
+        g_skew++;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1;
+    sig_fn first, second, ignored, restored, last;
+    int r1, r2, r3, hits1, hits2;
+
+    first = signal(SIGUSR2, on_usr2);
+    second = signal(SIGUSR2, on_usr2);
+    at_note(TAG, "raising SIGUSR2");
+    r1 = raise(SIGUSR2);
+    hits1 = g_hits;
+    at_note(TAG, "raise returned");
+    at_note(TAG, "raising SIGUSR2 again");
+    r2 = raise(SIGUSR2);
+    hits2 = g_hits;
+    at_note(TAG, "raise returned");
+    ignored = signal(SIGUSR1, SIG_IGN);
+    at_note(TAG, "raising ignored SIGUSR1");
+    r3 = raise(SIGUSR1);
+    at_note(TAG, "raise returned");
+    restored = signal(SIGUSR1, SIG_DFL);
+    last = signal(SIGUSR2, SIG_DFL);
+
+    CK(first == SIG_DFL);
+    CK(second == on_usr2);
+    CK(r1 == 0 && hits1 == 1);
+    CK(r2 == 0 && hits2 == 2);
+    CK(g_bad == 0);
+    CK(ignored == SIG_DFL && r3 == 0 && g_hits == 2);
+    CK(restored == SIG_IGN && last == on_usr2);
+    CK(g_skew == 0);
+
+    cb_begin(TAG, m);
+    cb_field("hits", (unsigned)g_hits, 0);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/signal_mask.c" <<'EOC'
+#include "sig_common.h"
+
+#define TAG "signal_mask"
+#define ROUNDS 3
+
+struct round {
+    int block_rc, raise_rc, query_rc, unblock_rc, after_rc;
+    int open_before, blocked_now, open_after;
+    int hits_blocked, hits_queried, hits_unblocked;
+};
+
+static volatile sig_atomic_t g_hits;
+static volatile unsigned g_bad, g_own_open, g_extra_open, g_query_bad, g_skew;
+
+static void on_usr1(int sig)
+{
+    sigset_t in = 0;
+
+    g_hits++;
+    if (sig != SIGUSR1)
+        g_bad++;
+    if (pthread_sigmask(SIG_BLOCK, 0, &in) != 0) {
+        g_query_bad++;
+    } else {
+        if (!sigismember(&in, SIGUSR1))
+            g_own_open++;
+        if (!sigismember(&in, SIGUSR2))
+            g_extra_open++;
+    }
+    if (CB_SKEWED())
+        g_skew++;
+}
+
+static int mask_call(int api, int how, const sigset_t *set, sigset_t *old)
+{
+    if (api == 0)
+        return sigprocmask(how, set, old);
+    return pthread_sigmask(how, set, old);
+}
+
+static void run_round(int api, struct round *r)
+{
+    sigset_t one, old = ~(sigset_t)0, now = 0, after = ~(sigset_t)0;
+    int base = g_hits;
+
+    sigemptyset(&one);
+    sigaddset(&one, SIGUSR1);
+    at_note(TAG, "blocking SIGUSR1");
+    r->block_rc = mask_call(api == 2 ? 0 : api, SIG_BLOCK, &one, &old);
+    r->open_before = !sigismember(&old, SIGUSR1) && !sigismember(&old, SIGUSR2);
+    at_note(TAG, "raising blocked SIGUSR1");
+    r->raise_rc = raise(SIGUSR1);
+    r->hits_blocked = g_hits - base;
+    at_note(TAG, "raise returned");
+    r->query_rc = mask_call(api, SIG_BLOCK, 0, &now);
+    r->blocked_now = sigismember(&now, SIGUSR1);
+    r->hits_queried = g_hits - base;
+    at_note(TAG, "unblocking SIGUSR1");
+    r->unblock_rc = mask_call(api, SIG_UNBLOCK, &one, 0);
+    r->hits_unblocked = g_hits - base;
+    at_note(TAG, "unblock returned");
+    r->after_rc = mask_call(api, 0, 0, &after);
+    r->open_after = !sigismember(&after, SIGUSR1) && !sigismember(&after, SIGUSR2);
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, sum = 17;
+    struct sigaction act;
+    struct round r[ROUNDS];
+    sigset_t fn_set = ~(sigset_t)0, mac_set = 0, full = 0;
+    int i, install_rc, fn_rc, fn_bad_rc, member_one, member_two, member_full;
+    int rc_ok = 1, open_ok = 1, raise_ok = 1, held = 1, blocked_ok = 1, delivered = 1;
+
+    fn_rc = (sigemptyset)(&fn_set);
+    fn_rc |= (sigaddset)(&fn_set, SIGUSR1);
+    fn_rc |= (sigaddset)(&fn_set, SIGUSR2);
+    fn_rc |= (sigdelset)(&fn_set, SIGUSR2);
+    fn_rc |= (sigfillset)(&full);
+    fn_bad_rc = (sigaddset)(&mac_set, 99);
+    member_one = (sigismember)(&fn_set, SIGUSR1);
+    member_two = (sigismember)(&fn_set, SIGUSR2);
+    member_full = (sigismember)(&full, SIGTERM);
+    sigemptyset(&mac_set);
+    sigaddset(&mac_set, SIGUSR1);
+
+    act.sa_handler = on_usr1;
+    sigemptyset(&act.sa_mask);
+    sigaddset(&act.sa_mask, SIGUSR2);
+    act.sa_flags = 0;
+    install_rc = sigaction(SIGUSR1, &act, 0);
+
+    for (i = 0; i < ROUNDS; i++) {
+        run_round(i, &r[i]);
+        if (r[i].block_rc || r[i].query_rc || r[i].unblock_rc || r[i].after_rc)
+            rc_ok = 0;
+        if (!r[i].open_before || !r[i].open_after)
+            open_ok = 0;
+        if (r[i].raise_rc)
+            raise_ok = 0;
+        if (r[i].hits_blocked != 0 || r[i].hits_queried != 0)
+            held = 0;
+        if (!r[i].blocked_now)
+            blocked_ok = 0;
+        if (r[i].hits_unblocked != 1)
+            delivered = 0;
+        sum = sum * 31u + (unsigned)r[i].hits_blocked;
+        sum = sum * 31u + (unsigned)r[i].hits_unblocked;
+    }
+
+    CK(fn_rc == 0 && fn_set == mac_set && member_one == 1 && member_two == 0 && member_full == 1);
+    CK(fn_bad_rc == -1);
+    CK(install_rc == 0 && rc_ok);
+    CK(raise_ok);
+    CK(held);
+    CK(blocked_ok);
+    CK(delivered && g_hits == ROUNDS);
+    CK(open_ok);
+    CK(g_query_bad == 0 && g_own_open == 0 && g_extra_open == 0);
+    CK(g_bad == 0 && g_skew == 0);
+
+    cb_begin(TAG, m);
+    cb_field("hits", (unsigned)g_hits, 0);
+    cb_field("sum", sum, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/signal_altstack.c" <<'EOC'
+#include "sig_common.h"
+
+#define TAG "signal_altstack"
+#define ALT_SIZE ((cb_size)SIGSTKSZ * 4)
+
+static cb_uptr g_alt;
+static volatile sig_atomic_t g_on_hits, g_off_hits;
+static volatile cb_uptr g_on_at, g_off_at;
+static volatile unsigned g_skew;
+
+static void on_alt(int sig)
+{
+    char here = (char)sig;
+
+    g_on_at = (cb_uptr)&here;
+    if (CB_SKEWED())
+        g_skew++;
+    g_on_hits++;
+}
+
+static void on_thread_stack(int sig)
+{
+    char here = (char)sig;
+
+    g_off_at = (cb_uptr)&here;
+    if (CB_SKEWED())
+        g_skew++;
+    g_off_hits++;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1;
+    stack_t first, alt, back, after, off, gone;
+    struct sigaction on, plain;
+    int r_first, r_set, r_back, r_install, r_raise_on, r_raise_off, r_after, r_off, r_gone, r_raise_gone;
+    int on_inside, off_inside, gone_inside;
+
+    first.ss_flags = 0;
+    r_first = sigaltstack(0, &first);
+
+    g_alt = (cb_uptr)malloc(ALT_SIZE);
+    alt.ss_sp = (void *)g_alt;
+    alt.ss_size = ALT_SIZE;
+    alt.ss_flags = 0;
+    r_set = sigaltstack(&alt, 0);
+    back.ss_sp = 0;
+    back.ss_size = 0;
+    back.ss_flags = -1;
+    r_back = sigaltstack(0, &back);
+
+    on.sa_handler = on_alt;
+    sigemptyset(&on.sa_mask);
+    on.sa_flags = SA_ONSTACK;
+    plain.sa_handler = on_thread_stack;
+    sigemptyset(&plain.sa_mask);
+    plain.sa_flags = 0;
+    r_install = sigaction(SIGUSR1, &on, 0) | sigaction(SIGUSR2, &plain, 0);
+
+    at_note(TAG, "raising SIGUSR1 with SA_ONSTACK");
+    r_raise_on = raise(SIGUSR1);
+    at_note(TAG, "raise returned");
+    on_inside = sig_inside(g_on_at, g_alt, ALT_SIZE);
+    at_note(TAG, "raising SIGUSR2 without SA_ONSTACK");
+    r_raise_off = raise(SIGUSR2);
+    at_note(TAG, "raise returned");
+    off_inside = sig_inside(g_off_at, g_alt, ALT_SIZE);
+
+    after.ss_flags = -1;
+    r_after = sigaltstack(0, &after);
+    off.ss_sp = (void *)g_alt;
+    off.ss_size = ALT_SIZE;
+    off.ss_flags = SS_DISABLE;
+    r_off = sigaltstack(&off, 0);
+    gone.ss_flags = 0;
+    r_gone = sigaltstack(0, &gone);
+    at_note(TAG, "raising SIGUSR1 with the alternate stack disabled");
+    r_raise_gone = raise(SIGUSR1);
+    at_note(TAG, "raise returned");
+    gone_inside = sig_inside(g_on_at, g_alt, ALT_SIZE);
+
+    CK(r_first == 0 && (first.ss_flags & SS_DISABLE) != 0 && (first.ss_flags & SS_ONSTACK) == 0);
+    CK(g_alt != 0 && r_set == 0 && r_back == 0);
+    CK((cb_uptr)back.ss_sp == g_alt && back.ss_size == ALT_SIZE);
+    CK((back.ss_flags & (SS_DISABLE | SS_ONSTACK)) == 0);
+    CK(r_install == 0 && r_raise_on == 0 && r_raise_off == 0 && r_raise_gone == 0);
+    CK(g_on_hits == 2 && g_off_hits == 1);
+    CK(on_inside);
+    CK(!off_inside);
+    CK(r_after == 0 && (after.ss_flags & SS_ONSTACK) == 0);
+    CK(r_off == 0 && r_gone == 0 && (gone.ss_flags & SS_DISABLE) != 0);
+    CK(!gone_inside);
+    CK(g_skew == 0);
+    free((void *)g_alt);
+
+    cb_begin(TAG, m);
+    cb_field("hits", (unsigned)(g_on_hits + g_off_hits), 0);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/signal_pthread_kill.c" <<'EOC'
+#include "sig_common.h"
+
+#define TAG "signal_pthread_kill"
+
+static const char g_token[] = "worker";
+static volatile sig_atomic_t g_ready, g_hits;
+static volatile int g_worker_waited = -1;
+static pthread_t g_worker_self, g_handler_self;
+static volatile unsigned g_bad, g_skew;
+
+static void on_usr1(int sig)
+{
+    g_handler_self = pthread_self();
+    if (sig != SIGUSR1)
+        g_bad++;
+    if (CB_SKEWED())
+        g_skew++;
+    g_hits++;
+}
+
+static void *worker(void *arg)
+{
+    at_note(TAG, "thread entered");
+    g_worker_self = pthread_self();
+    g_ready = 1;
+    at_note(TAG, "worker waiting for the handler");
+    g_worker_waited = sig_wait(&g_hits);
+    at_note(TAG, "worker wait returned");
+    at_note(TAG, "thread leaving");
+    return arg;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1;
+    struct sigaction act;
+    pthread_t main_self = pthread_self(), main_handler, t;
+    void *ret = 0;
+    int install_rc, self_rc, self_hits, created, ready = 0, kill_rc = -7, join_rc = -7;
+
+    act.sa_handler = on_usr1;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    install_rc = sigaction(SIGUSR1, &act, 0);
+
+    at_note(TAG, "calling pthread_kill on the main thread");
+    self_rc = pthread_kill(main_self, SIGUSR1);
+    self_hits = g_hits;
+    main_handler = g_handler_self;
+    at_note(TAG, "returned from pthread_kill");
+    g_hits = 0;
+    g_handler_self = 0;
+
+    at_note(TAG, "calling pthread_create");
+    created = pthread_create(&t, 0, worker, (void *)g_token) == 0;
+    at_note(TAG, "returned from pthread_create");
+    if (created) {
+        at_note(TAG, "waiting for the worker");
+        ready = sig_wait(&g_ready);
+        at_note(TAG, "wait returned");
+        at_note(TAG, "calling pthread_kill on the worker");
+        kill_rc = pthread_kill(t, SIGUSR1);
+        at_note(TAG, "returned from pthread_kill");
+        at_note(TAG, "calling pthread_join");
+        join_rc = pthread_join(t, &ret);
+        at_note(TAG, "returned from pthread_join");
+    }
+
+    CK(install_rc == 0);
+    CK(self_rc == 0 && self_hits == 1 && main_handler == main_self);
+    CK(created && ready && join_rc == 0 && ret == g_token);
+    CK(kill_rc == 0);
+    CK(g_worker_waited == 1 && g_hits == 1);
+    CK(created && g_worker_self == t && g_handler_self == t);
+    CK(g_handler_self != main_self);
+    CK(g_bad == 0 && g_skew == 0);
+
+    cb_begin(TAG, m);
+    cb_field("hits", (unsigned)(self_hits + g_hits), 0);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/signal_kill.c" <<'EOC'
+#include "sig_common.h"
+
+#define TAG "signal_kill"
+
+static volatile sig_atomic_t g_hits;
+static pthread_t g_handler_self;
+static volatile unsigned g_bad, g_skew;
+
+static void on_usr1(int sig)
+{
+    g_handler_self = pthread_self();
+    if (sig != SIGUSR1)
+        g_bad++;
+    if (CB_SKEWED())
+        g_skew++;
+    g_hits++;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1;
+    struct sigaction act;
+    pthread_t main_self = pthread_self();
+    int install_rc, probe_rc, probe_hits, kill_rc, waited, settled;
+
+    act.sa_handler = on_usr1;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    install_rc = sigaction(SIGUSR1, &act, 0);
+
+    probe_rc = kill(getpid(), 0);
+    probe_hits = g_hits;
+    at_note(TAG, "calling kill");
+    kill_rc = kill(getpid(), SIGUSR1);
+    at_note(TAG, "returned from kill");
+    at_note(TAG, "waiting for the handler");
+    waited = sig_wait(&g_hits);
+    at_note(TAG, "wait returned");
+    getpid();
+    getpid();
+    settled = g_hits;
+
+    CK(install_rc == 0);
+    CK(probe_rc == 0 && probe_hits == 0);
+    CK(kill_rc == 0);
+    CK(waited && settled == 1);
+    CK(g_handler_self == main_self);
+    CK(g_bad == 0 && g_skew == 0);
+
+    cb_begin(TAG, m);
+    cb_field("hits", (unsigned)settled, 0);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/signal_errors.c" <<'EOC'
+#include "sig_common.h"
+
+#define TAG "signal_errors"
+#define NACT 6
+#define NRAISE 4
+
+struct attempt {
+    const char *key;
+    int sig;
+    int rc;
+    int err;
+};
+
+static volatile sig_atomic_t g_hits;
+static char g_small[MINSIGSTKSZ];
+
+static void on_any(int sig)
+{
+    (void)sig;
+    g_hits++;
+}
+
+static void sig_result(const struct attempt *a, int with_errno)
+{
+    sig_int(a->key, a->rc);
+    if (with_errno) {
+        cb_str("/");
+        cb_dec((unsigned)a->err);
+    }
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1;
+    struct sigaction act, old;
+    stack_t small;
+    struct attempt sa[NACT] = {
+        { "kill", SIGKILL, 0, 0 },
+        { "stop", SIGSTOP, 0, 0 },
+        { "zero", 0, 0, 0 },
+        { "big", 200, 0, 0 },
+        { "nsig", NSIG, 0, 0 },
+        { "query_kill", SIGKILL, 0, 0 },
+    };
+    struct attempt st = { "sigaltstack_small", 0, 0, 0 };
+    struct attempt ra[NRAISE] = {
+        { "raise_big", 200, 0, 0 },
+        { "kill_big", 200, 0, 0 },
+        { "raise_zero", 0, 0, 0 },
+        { "kill_zero", 0, 0, 0 },
+    };
+    struct attempt pk[3] = {
+        { "pthread_kill_big", 200, 0, 0 },
+        { "pthread_kill_nsig", NSIG, 0, 0 },
+        { "pthread_kill_zero", 0, 0, 0 },
+    };
+    int i;
+
+    act.sa_handler = on_any;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    for (i = 0; i < NACT; i++) {
+        *__error() = 0;
+        if (i == NACT - 1)
+            sa[i].rc = sigaction(sa[i].sig, 0, &old);
+        else
+            sa[i].rc = sigaction(sa[i].sig, &act, 0);
+        sa[i].err = *__error();
+    }
+    small.ss_sp = g_small;
+    small.ss_size = MINSIGSTKSZ - 1;
+    small.ss_flags = 0;
+    *__error() = 0;
+    st.rc = sigaltstack(&small, 0);
+    st.err = *__error();
+    for (i = 0; i < NRAISE; i++) {
+        *__error() = 0;
+        if (i % 2 == 0)
+            ra[i].rc = raise(ra[i].sig);
+        else
+            ra[i].rc = kill(getpid(), ra[i].sig);
+        ra[i].err = *__error();
+    }
+    for (i = 0; i < 3; i++)
+        pk[i].rc = pthread_kill(pthread_self(), pk[i].sig);
+
+    for (i = 0; i < NACT; i++)
+        CK(sa[i].rc == -1 && sa[i].err == EINVAL);
+    CK(st.rc == -1 && st.err == ENOMEM);
+    CK(ra[0].rc == -1 && ra[0].err == EINVAL && ra[1].rc == -1 && ra[1].err == EINVAL);
+    CK(ra[2].rc == 0 && ra[3].rc == 0);
+    CK(pk[0].rc == EINVAL && pk[1].rc == EINVAL);
+    CK(pk[2].rc == 0);
+    CK(g_hits == 0);
+
+    cb_begin(TAG, m);
+    for (i = 0; i < NACT; i++)
+        sig_result(&sa[i], 1);
+    sig_result(&st, 1);
+    cb_end();
+    cb_len = 0;
+    cb_str(TAG);
+    for (i = 0; i < NRAISE; i++)
+        sig_result(&ra[i], ra[i].rc != 0);
+    for (i = 0; i < 3; i++)
+        sig_result(&pk[i], 0);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    cat > "$TMP/signal_default.c" <<'EOC'
+#include "sig_common.h"
+
+int main(void)
+{
+    write(1, "signal_default raising SIGWINCH\n", 32);
+    raise(SIGWINCH);
+    write(1, "signal_default raising SIGTERM\n", 31);
+    raise(SIGTERM);
+    write(1, "signal_default survived\n", 24);
+    return 3;
+}
+EOC
+
+    cat > "$TMP/signal_handler_bridge.c" <<'EOC'
+#include "sig_common.h"
+
+#define TAG "signal_handler_bridge"
+#define RAISES 4
+
+static const char *const g_words[] = {
+    "handler", "bridged strlen", "write from a signal handler", "",
+};
+#define NW ((unsigned)(sizeof g_words / sizeof g_words[0]))
+
+static volatile sig_atomic_t g_usr1, g_usr2, g_depth;
+static volatile unsigned g_len_bad, g_copy_bad, g_cmp_bad, g_write_bad, g_nested_bad, g_bad, g_skew;
+static volatile unsigned g_sum = 17;
+
+static unsigned own_len(const char *s)
+{
+    unsigned n = 0;
+    while (s[n])
+        n++;
+    return n;
+}
+
+static void on_usr2(int sig)
+{
+    char line[] = "signal_handler_bridge nested\n";
+    cb_size n = strlen(line);
+
+    g_usr2++;
+    if (sig != SIGUSR2)
+        g_bad++;
+    if (g_depth != 1)
+        g_nested_bad++;
+    if (write(1, line, n) != (long)n)
+        g_write_bad++;
+    if (CB_SKEWED())
+        g_skew++;
+}
+
+static void on_usr1(int sig)
+{
+    char buf[64];
+    const char *w;
+    cb_size n;
+    unsigned k, c;
+    int before, rc;
+
+    g_depth++;
+    k = (unsigned)g_usr1++;
+    if (sig != SIGUSR1)
+        g_bad++;
+    if (CB_SKEWED())
+        g_skew++;
+    w = g_words[k % NW];
+    n = strlen(w);
+    if (n != own_len(w) || n > 40) {
+        g_len_bad++;
+        g_depth--;
+        return;
+    }
+    if (memcpy(buf, "handler ", 8) != buf || memcpy(buf + 8, w, n + 1) != buf + 8)
+        g_copy_bad++;
+    for (c = 0; c <= n; c++)
+        if (buf[8 + c] != w[c])
+            g_copy_bad++;
+    if (strcmp(buf + 8, w) != 0 || strcmp(buf, w) == 0)
+        g_cmp_bad++;
+    buf[8 + n] = '\n';
+    if (write(1, buf, 9 + n) != (long)(9 + n))
+        g_write_bad++;
+    for (c = 0; c < 9 + n; c++)
+        g_sum = g_sum * 31u + (unsigned char)buf[c];
+    before = g_usr2;
+    rc = raise(SIGUSR2);
+    if (rc != 0 || g_usr2 != before + 1)
+        g_nested_bad++;
+    g_depth--;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, i;
+    struct sigaction one, two;
+    int install_rc, rc_bad = 0, seen_bad = 0, rc;
+
+    one.sa_handler = on_usr1;
+    sigemptyset(&one.sa_mask);
+    one.sa_flags = 0;
+    two.sa_handler = on_usr2;
+    sigemptyset(&two.sa_mask);
+    two.sa_flags = 0;
+    install_rc = sigaction(SIGUSR1, &one, 0) | sigaction(SIGUSR2, &two, 0);
+
+    for (i = 0; i < RAISES; i++) {
+        at_note(TAG, "raising SIGUSR1");
+        rc = raise(SIGUSR1);
+        at_note(TAG, "raise returned");
+        if (rc != 0)
+            rc_bad++;
+        if (g_usr1 != (int)i + 1 || g_usr2 != (int)i + 1 || g_depth != 0)
+            seen_bad++;
+    }
+
+    CK(install_rc == 0 && rc_bad == 0);
+    CK(seen_bad == 0 && g_usr1 == RAISES && g_usr2 == RAISES);
+    CK(g_len_bad == 0);
+    CK(g_copy_bad == 0);
+    CK(g_cmp_bad == 0);
+    CK(g_write_bad == 0);
+    CK(g_nested_bad == 0);
+    CK(g_bad == 0 && g_skew == 0);
+
+    cb_begin(TAG, m);
+    cb_field("hits", (unsigned)(g_usr1 + g_usr2), 0);
+    cb_field("sum", g_sum, 1);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    for name in signal_sigaction signal_signal signal_mask signal_altstack \
+                signal_pthread_kill signal_kill signal_errors signal_default \
+                signal_handler_bridge; do
+        clang -arch x86_64 -std=c11 -O1 -fno-builtin \
+                -o "$TMP/$name" "$TMP/$name.c" >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            signal_sigaction) SIG_ACTION_BIN="$TMP/$name" ;;
+            signal_signal) SIG_SIGNAL_BIN="$TMP/$name" ;;
+            signal_mask) SIG_MASK_BIN="$TMP/$name" ;;
+            signal_altstack) SIG_ALTSTACK_BIN="$TMP/$name" ;;
+            signal_pthread_kill) SIG_PTKILL_BIN="$TMP/$name" ;;
+            signal_kill) SIG_KILL_BIN="$TMP/$name" ;;
+            signal_errors) SIG_ERRORS_BIN="$TMP/$name" ;;
+            signal_default) SIG_DEFAULT_BIN="$TMP/$name" ;;
+            signal_handler_bridge) SIG_HANDLER_BIN="$TMP/$name" ;;
+        esac
+    done
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -4826,6 +5842,194 @@ case_tlv_churn() {
     record "$name" "$reason" "exit=$rc_jit out='$line' secs=$secs_jit/$secs_nojit$mem_note$cache_note"
 }
 
+signal_import_reason() {
+    local bin="$1" imports allowed sym stray=""
+    imports="$(nm -u "$bin" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+    allowed=" $SIGNAL_BRIDGED $STACK_GUARD_SYM "
+    for sym in $imports; do
+        case "$allowed" in
+            *" $sym "*) ;;
+            *) stray="$stray $sym" ;;
+        esac
+    done
+    if [ -n "$stray" ]; then
+        echo "$(basename "$bin") imports$stray, which the bridge does not implement, so a failure would be about those imports and not about signals"
+    fi
+}
+
+signal_status() {
+    local tag="$1" file="$2" line
+    line="$(grep -E "^$tag (ok|bad:)" "$file" 2>/dev/null | head -1)"
+    if [ -z "$line" ]; then
+        line="$(head -1 "$file" 2>/dev/null)"
+    fi
+    echo "$line"
+}
+
+signal_stall() {
+    local tag="$1" err="$2" last
+    last="$(grep -h "^$tag: " "$err" 2>/dev/null | tail -1 | sed "s/^$tag: //")"
+    case $last in
+        "")
+            echo "the guest never wrote its first progress note" ;;
+        raising*|calling*|blocking*|unblocking*)
+            echo "the last progress note was '$last', so that call never returned: a handler entered at its return that never came back, or a delivery that repeats forever, looks like this" ;;
+        *)
+            echo "the last progress note was '$last'" ;;
+    esac
+}
+
+signal_run_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" reason
+    reason="$(native_run_reason "$rc" "$out" "$err")"
+    if [ -z "$reason" ]; then
+        echo ""
+    elif grep -Fq "$NOBIND$STACK_GUARD_SYM " "$out" "$err" 2>/dev/null; then
+        echo "$reason$(thread_guard_hint "$out" "$err")"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1 | cut -c1-120)"
+    elif grep -Fq "$GUEST_CRASH" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hF "$GUEST_CRASH" "$out" "$err" | head -1 | cut -c1-120)"
+    elif grep -Fq "$ATTACH_REFUSED" "$out" "$err" 2>/dev/null; then
+        echo "$reason; guest code was refused rather than given a personality: $(grep -hF "$ATTACH_REFUSED" "$out" "$err" | head -1 | cut -c1-240)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "$reason: still running after ${NATIVE_TIMEOUT}s, and $(signal_stall "$tag" "$err")"
+    elif [ "$rc" -eq 158 ] || [ "$rc" -eq 159 ]; then
+        echo "$reason: the process was ended by $([ "$rc" -eq 158 ] && echo SIGUSR1 || echo SIGUSR2)'s default action, so a signal the guest had a handler for was never handed to it; $(signal_stall "$tag" "$err")"
+    elif [ "$rc" -gt 128 ] && [ "$rc" -lt 160 ]; then
+        echo "$reason: the process was ended by signal $((rc - 128)); $(signal_stall "$tag" "$err")"
+    else
+        echo "$reason"
+    fi
+}
+
+case_signal() {
+    local name="$1" bin="$2" tag="$3" bits="$4" note="${5:-}"
+    local reason="" rc_jit rc_nojit rc_cache line cache_note=""
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$SIGNAL_TIMEOUT
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin" 2>/dev/null
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin" 2>/dev/null
+    rc_nojit=$?
+    line="$(signal_status "$tag" "$jo")"
+
+    reason="$(signal_import_reason "$bin")"
+    if [ -z "$reason" ]; then
+        reason="$(signal_run_reason "$rc_jit" "$tag" "$jo" "$je")"
+        if grep -q "^$tag bad:" "$jo"; then
+            reason="'$line': the guest's own checks failed, where $bits"
+        elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+            reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+        fi
+    fi
+
+    if [ -z "$reason" ]; then
+        reason="$(signal_run_reason "$rc_nojit" "$tag" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(signal_status "$tag" "$no")': the guest's own checks failed, where $bits"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    if [ -n "$reason" ] && [ -n "$note" ]; then
+        reason="$reason. $note"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$bin" 2>/dev/null
+        rc_cache=$?
+        if [ "$rc_cache" -eq 124 ]; then
+            reason="cache mode still running after ${NATIVE_TIMEOUT}s, which crosses no bridge, and $(signal_stall "$tag" "$ce")"
+        elif [ "$rc_cache" -ne 0 ]; then
+            reason="cache-mode exit $rc_cache, want 0: '$(signal_status "$tag" "$co")'"
+        elif ! cmp -s "$jo" "$co"; then
+            reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': a signal delivered at a crossing did something a signal delivered at a syscall did not"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
+}
+
+signal_default_reason() {
+    local rc="$1" out="$2" err="$3" stopped
+    stopped="$(bridge_stopped_reason "$out" "$err")"
+    if [ -n "$stopped" ]; then
+        echo "$stopped"
+    elif ! grep -Fq "$SIG_DEFAULT_WINCH" "$out"; then
+        echo "exit $rc, and the guest never reached its raise of SIGWINCH"
+    elif ! grep -Fq "$SIG_DEFAULT_MARK" "$out"; then
+        echo "exit $rc inside raise(SIGWINCH): SIGWINCH is ignored by default, so a signal with no handler was given the default action of one that ends the process"
+    elif grep -Fq "$SIG_DEFAULT_PAST" "$out"; then
+        echo "raise(SIGTERM) returned with no handler installed and the guest carried on to exit $rc: the default action, which ends the process, was never taken"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err"; then
+        echo "a bridged-call fault instead of the default action: $(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1 | cut -c1-120)"
+    elif grep -Fq "$GUEST_CRASH" "$out" "$err"; then
+        echo "a guest-crash report instead of the default action: $(grep -hF "$GUEST_CRASH" "$out" "$err" | head -1 | cut -c1-120)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "still running after ${NATIVE_TIMEOUT}s: raise(SIGTERM) neither returned nor ended the process"
+    elif [ "$rc" -ne "$SIG_DEFAULT_STATUS" ]; then
+        echo "exit $rc, want $SIG_DEFAULT_STATUS, the status of a process SIGTERM's default action ended"
+    else
+        echo ""
+    fi
+}
+
+case_signal_default() {
+    local name=signal_default reason="" rc_jit rc_nojit rc_cache cache_note=""
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$SIGNAL_TIMEOUT
+
+    if callback_fixture_missing "$name" "$SIG_DEFAULT_BIN"; then
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$SIG_DEFAULT_BIN" 2>/dev/null
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$SIG_DEFAULT_BIN" 2>/dev/null
+    rc_nojit=$?
+
+    reason="$(signal_import_reason "$SIG_DEFAULT_BIN")"
+    if [ -z "$reason" ]; then
+        reason="$(signal_default_reason "$rc_jit" "$jo" "$je")"
+    fi
+    if [ -z "$reason" ]; then
+        reason="$(signal_default_reason "$rc_nojit" "$no" "$ne")"
+        if [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$SIG_DEFAULT_BIN" 2>/dev/null
+        rc_cache=$?
+        if [ "$rc_cache" -ne "$rc_jit" ]; then
+            reason="cache-mode exit $rc_cache, native exit $rc_jit: the two modes no longer end a process the same way when a signal with no handler arrives"
+        elif ! cmp -s "$jo" "$co"; then
+            reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': the two modes stopped the guest at different places"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit no-jit exit=$rc_nojit$cache_note"
+}
+
 case_env_native() {
     local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
@@ -4983,6 +6187,7 @@ build_callback_fixtures
 build_attach_fixtures
 build_thread_fixtures
 build_tlv_fixtures
+build_signal_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -5049,6 +6254,25 @@ case_tlv_churn \
 case_tlv tlv_dylib "$TLV_DYLIB_BIN" tlv_dylib \
     "bit 0 is a pthread_create or pthread_join failing, a thread not run exactly once or handed another thread's argument, 1 the main thread's first read of the dylib's variables or the main image's not the initializers or the dylib's thread-local array not zero, 2 a thread's first read of them not the initializers, 3 a thread's copy of the dylib's array not zero, 4 the main image reaching the dylib's int through its thread-local import at an address other than the one the dylib's accessor returns, or reading another value there, 5 the dylib's int and the main image's sharing an address or a write to one showing in the other, so the two images share a block, 6 a thread not reading back its own values in both images, 7 a thread's values changing while the others wrote theirs, 8 two threads alive at once sharing an address in either image, 9 the main thread's values changed by the threads, 10 a lock, unlock, wait or broadcast returning non-zero, 11 a start routine entered on a misaligned stack" \
     "$TLV_DYLIB_LIB"
+case_signal signal_sigaction "$SIG_ACTION_BIN" signal_sigaction \
+    "bit 0 is a sigaction call returning non-zero, 1 raise returning other than 0, 2 the SA_SIGINFO handler not run exactly once by the time raise returned, 3 the handler handed a signal number other than SIGUSR1, 4 a null siginfo or one whose si_signo is not SIGUSR1, 5 a null ucontext, 6 the checksum over the values held across raise differing from one computed without a signal, so a callee-saved register or stack slot the caller kept live changed under the handler, 7 the pattern on the caller's own stack changing across raise, 8 the old action from the second sigaction not naming the first handler, 9 that old action without SA_SIGINFO, 10 that old action without the first handler's mask, 11 a query with no new action not reporting the second handler with an empty mask and no SA_SIGINFO, 12 the second raise not running the second handler exactly once, or running the first again, 13 a handler entered on a misaligned stack" \
+    "signal_sigaction is the plainest delivery there is: a handler installed with sigaction and raised on the same thread, so a failure here means no guest program that handles a signal can run in native mode"
+case_signal signal_signal "$SIG_SIGNAL_BIN" signal_signal \
+    "bit 0 is the first signal(SIGUSR2, h) returning other than SIG_DFL, 1 the second returning other than h, 2 the first raise not returning 0 with the handler run once, 3 the second raise not returning 0 with the handler run twice, so it did not stay installed, 4 the handler handed a signal number other than SIGUSR2, 5 signal(SIGUSR1, SIG_IGN) not returning SIG_DFL, or the raise of the ignored SIGUSR1 returning non-zero or running the handler, 6 restoring the defaults not handing back SIG_IGN and h, 7 the handler entered on a misaligned stack"
+case_signal signal_mask "$SIG_MASK_BIN" signal_mask \
+    "bit 0 is sigemptyset, sigaddset, sigdelset, sigfillset or sigismember called as a function failing or building a set other than the macros build, 1 sigaddset called as a function accepting signal 99, 2 sigaction or a sigprocmask or pthread_sigmask call returning non-zero, 3 a raise of the blocked SIGUSR1 returning non-zero, 4 the handler running while SIGUSR1 was blocked, on the raise or on the query after it, 5 a query not reporting SIGUSR1 blocked, 6 the handler not run exactly once by the time the unblocking call returned, or not three times in all, 7 SIGUSR1 or SIGUSR2 blocked before a round began or after it ended, so the mask was not put back when the handler returned, 8 the handler's own pthread_sigmask query failing or finding SIGUSR1 or its sa_mask's SIGUSR2 open while it ran, 9 the handler handed another signal or entered on a misaligned stack"
+case_signal signal_altstack "$SIG_ALTSTACK_BIN" signal_altstack \
+    "bit 0 is the first sigaltstack query failing, not reporting SS_DISABLE or reporting SS_ONSTACK, 1 malloc failing or installing or querying the alternate stack returning non-zero, 2 the query not reading back the installed ss_sp and ss_size, 3 the query of the installed stack reporting SS_DISABLE or SS_ONSTACK, 4 sigaction or a raise returning non-zero, 5 the SA_ONSTACK handler not run twice or the other not once, 6 the SA_ONSTACK handler's local outside the alternate stack, 7 the handler without SA_ONSTACK running on the alternate stack, 8 a query after both handlers returned failing or still reporting SS_ONSTACK, 9 disabling the alternate stack failing or the query after it not reporting SS_DISABLE, 10 the SA_ONSTACK handler running on the disabled alternate stack, 11 a handler entered on a misaligned stack"
+case_signal signal_pthread_kill "$SIG_PTKILL_BIN" signal_pthread_kill \
+    "bit 0 is sigaction returning non-zero, 1 pthread_kill on the main thread not returning 0 with the handler already run once on that thread, 2 pthread_create or pthread_join failing, the worker never reporting that it was running, or its result not its own argument, 3 pthread_kill on the worker returning non-zero, 4 the handler not run exactly once for the worker, or the worker giving up after SIGNAL_WAIT_SECS seconds without it, 5 the handler run on a thread other than the worker, or the worker's pthread_self differing from the pthread_t pthread_create handed back, 6 the handler for the worker's signal run on the main thread, 7 the handler handed another signal or entered on a misaligned stack" \
+    "signal_pthread_kill is the only signal case whose delivery cannot happen at the sender's own crossing: the signal has to reach the worker through the host and be delivered at the worker's next crossing, which the worker's wait makes by calling getpid on every turn"
+case_signal signal_kill "$SIG_KILL_BIN" signal_kill \
+    "bit 0 is sigaction returning non-zero, 1 kill with signal 0 failing or running the handler, 2 kill(getpid(), SIGUSR1) returning non-zero, 3 the handler not run within SIGNAL_WAIT_SECS seconds or run more than once, 4 the handler run on a thread other than the main thread, the only one the guest has, 5 the handler handed another signal or entered on a misaligned stack"
+case_signal signal_errors "$SIG_ERRORS_BIN" signal_errors \
+    "bits 0 to 5 are sigaction on SIGKILL, SIGSTOP, 0, 200 and NSIG and a query of SIGKILL with no new action, in that order, not returning -1 with errno EINVAL, 6 sigaltstack with a stack one byte short of MINSIGSTKSZ not returning -1 with errno ENOMEM, 7 raise or kill of signal 200 not returning -1 with EINVAL, 8 raise or kill of signal 0 failing, 9 pthread_kill of 200 or NSIG not returning EINVAL, 10 pthread_kill of signal 0 failing, 11 the handler run by any of them"
+case_signal_default
+case_signal signal_handler_bridge "$SIG_HANDLER_BIN" signal_handler_bridge \
+    "bit 0 is sigaction or a raise from main returning non-zero, 1 the two handlers not each run once per raise by the time it returned, or a raise returning with a handler still in progress, 2 bridged strlen inside the handler giving a wrong length, 3 bridged memcpy inside the handler returning the wrong pointer or copying the wrong bytes, 4 bridged strcmp inside the handler giving a wrong answer, 5 a write from inside a handler writing short, 6 the raise of SIGUSR2 inside the SIGUSR1 handler returning non-zero or not running its handler nested inside the first before it returned, 7 a handler handed another signal or entered on a misaligned stack"
 case_env_native
 case_flag_beats_env
 case_last_flag_native
