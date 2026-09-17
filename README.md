@@ -52,7 +52,7 @@ make -j
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 109 / 109 |
 | native-mode gate (`-native`) | 60 / 60 |
-| native-mode unit suites: image, bridge, ABI, callbacks, thread attach | 2696 / 0, 210 / 0, 3888 / 0, 8528 / 0, 270 / 0 |
+| native-mode unit suites: API database, image, bridge, ABI, callbacks, thread attach | 308 / 0, 38241 / 0, 693 / 0, 3888 / 0, 8528 / 0, 270 / 0 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -254,6 +254,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 | `OCERZ_MODE=native\|cache` | pick the mode when no flag does; this is how a spawned child inherits it, and an unrecognized value is refused rather than ignored |
 | `OCERZ_BRIDGESTAT=1` | in native mode, print how many times each bridged function was called, at exit |
 | `OCERZ_BRIDGELOG=1` | in native mode, name every bridged call as it happens |
+| `OCERZ_APIDB=dir` | in native mode, read the API database from `dir` instead of `runtime/apis` beside the ocerz executable |
 | `OCERZ_NOJIT=1` | interpret the whole process tree |
 | `OCERZ_NOJIT_EXE=<text>` | interpret processes whose command line matches |
 | `OCERZ_NO_HOSTWQ=1` | turn the host workqueue bridge off (it is on by default; `OCERZ_HOSTWQ=1` is still accepted and still means on) |
@@ -294,7 +295,8 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 | JIT | `src/jit.c`, `src/a64emit.c` | arm64 code generation, block chaining, superblocks |
 | Mini-dyld | `src/dyld.c`, `src/cache.c`, `src/dyldapi.c` | shared cache, symbols, fixups, Objective-C |
 | Virtual dylibs | `src/vdylib.c` | synthesized x86_64 system images and their bridge stubs, for native mode |
-| Bridge | `src/bridge.c` | native mode's table of bridged functions and their signatures, and which call a thread is in when it faults |
+| API database | `src/apidb.c`, `runtime/apis/` | native mode's per-library export lists and signatures, read from data files |
+| Bridge | `src/bridge.c` | native mode's crossings built from the API database, the functions ocerz answers itself, and which call a thread is in when it faults |
 | ABI engine | `src/abi.c`, `src/abicall.s` | moving arguments and results between System V x86-64 and arm64 in both directions, and the callback trampoline bank |
 | Syscalls | `src/syscall.c` | BSD, Mach, signals, threads and WoW64 host calls |
 
@@ -305,6 +307,8 @@ Apple ends general-purpose Rosetta after macOS 27, and with it the `dyld_shared_
 Today native mode runs command-line programs whose system calls stay inside what is bridged: the common C string and memory functions and their fortified `_chk` forms, the heap, `read`, `write` and `close`, string-to-number conversion, `qsort` and `bsearch`, POSIX threads with their mutexes and condition variables, thread-local variables, libdispatch's function-pointer entry points, including its semaphores, signal handlers with their masks and alternate stacks, and CoreFoundation's strings, arrays, dictionaries, numbers, data and run loop, including guest callbacks and run-loop timers, observers and sources. A program compiled normally, with optimization and clang's default stack protector, binds and runs, and so does one linked for a macOS older than 12 with classic lazy binding. Nothing from Foundation or AppKit is available yet. Every kernel of `xbench_dyn` produces byte-identical output in native mode and cache mode, under both the JIT and the interpreter.
 
 **System libraries without files.** A guest that links `/usr/lib/libSystem.B.dylib` finds nothing behind it, because on a current macOS that library exists only inside the cache. So ocerz builds one. `src/vdylib.c` assembles a real x86_64 Mach-O in memory, with load commands, `__TEXT`, `__DATA` and an export trie, and the loader takes it as an ordinary image. Nothing in the loader reopens a file, so import resolution, `dlopen` and `dladdr` work on it unchanged. No cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off, because the host's own libdispatch needs the process's single workqueue slot.
+
+**The API database.** What each synthesized library exports, and how each export crosses, is data rather than code: one text file per library under `runtime/apis/macos/<sdk version>/`, such as `libSystem.B.dylib.api` and `CoreFoundation.api`, with a record per export. A `fn` record names the host function and its signature, `data` a native variable the export resolves to, `special` a function ocerz answers itself, `stub` an export that binds but stops with a named message when called, with the reason, and `shape` and `struct` records describe the structures of function pointers the bridge converts. ocerz reads the files for the guest's minimum macOS version, beside its own executable or from `OCERZ_APIDB`, and refuses a malformed file whole, naming its line, rather than binding some imports to the wrong thing. Supporting another library is a data change, not a rebuild.
 
 **Calls out.** Every export is twelve bytes of real x86: a move of the export's id into `r11`, then a jump through a slot that holds one address for the whole process, inside the trap window the decoder and both engines already watch. `src/bridge.c` catches the trap. `src/abi.c` reads the arguments out of the guest's register state according to the function's signature, and `src/abicall.s` loads them into the arm64 argument registers and calls the real function. The signature matters because the two ABIs count integer and floating-point arguments in separate sequences, so one `double` in the middle of a signature moves nothing on one side and everything on the other. It also keeps widths honest: arm64 makes the caller extend a narrow argument, and a 32-bit result can come back with the upper half of the register dirty.
 
@@ -352,7 +356,7 @@ Variadic functions stay out on purpose. Apple's arm64 passes every variadic argu
 
 Guest code that never crosses pays nothing, which is why the last two rows are at parity. Closing the gap on the first two is a JIT change: recognizing a call to a known stub and spilling only the registers its signature names, instead of leaving the block and re-entering through the dispatcher.
 
-The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once, and a spawned child inherits it through `OCERZ_MODE`. `tests/run_native_tests.sh` pins all of this end to end. `tests/unit/test_vdylib.c`, `test_bridge.c`, `test_abi.c` and `test_callback.c` pin the synthesized image, the bridge table, argument placement across the signature space, and the trampoline bank.
+The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once, and a spawned child inherits it through `OCERZ_MODE`. `tests/run_native_tests.sh` pins all of this end to end. `tests/unit/test_apidb.c`, `test_vdylib.c`, `test_bridge.c`, `test_abi.c` and `test_callback.c` pin the database format and its refusals, the synthesized image, the crossings built from the database, argument placement across the signature space, and the trampoline bank.
 
 ## Limitations
 
