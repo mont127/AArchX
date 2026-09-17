@@ -120,6 +120,20 @@
  * wrong alignment, more than 256 bytes, more than sixteen members - are refused
  * before any call is made.
  *
+ * Every signature of scalars that fits System V's argument registers is run a
+ * second time through ocerz_abi_perform_registers directly, the path the bridge
+ * takes for such a descriptor, against the same second System V and the same
+ * callees, and ocerz_abi_register_only is compared on every signature with an
+ * answer worked out here from the classes alone.  The rounding checks run
+ * through that path too, and two more pin the half of the rounding contract a
+ * default-mode crossing could skip: a callee that sets its own rounding mode
+ * leaves the guest's in FPCR afterwards, both through the register path and
+ * through the general one, whether the guest's mode was the default or not.
+ * ocerz_abi_round_of_mxcsr is compared with the FPCR ocerz_apply_mxcsr_round
+ * produces, and ocerz_abi_xmm_contract with masks read off System V by hand for
+ * a table of signatures that includes floats after integers, a spilled ninth
+ * double, a structure argument and a structure result.
+ *
  * The map is the identity one, as in test_bridge.c, because that is the map
  * native mode runs in; under it a guest pointer and a host pointer are the
  * same number, so a pointer argument and a pointer result can be checked for
@@ -129,6 +143,7 @@
 #include "ocerz/cpu.h"
 #include "ocerz/mem.h"
 
+#include <fenv.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -180,6 +195,7 @@ static uint64_t g_stack_base;
 static uint32_t g_mxcsr = MXCSR_DEFAULT;
 static void *g_res_ptr;
 static OcerzCPU g_cpu;
+static int (*g_perform)(const OcerzAbiSig *, const void *, OcerzCPU *) = ocerz_abi_perform;
 
 static uint64_t rd_fpcr(void)
 {
@@ -1097,7 +1113,7 @@ static void run_case(const AbiCase *c)
     ocerz_apply_mxcsr_round(cpu->mxcsr);
     fpcr_before = rd_fpcr();
 
-    r = ocerz_abi_perform(&sig, fnptr(c->fn), cpu);
+    r = g_perform(&sig, fnptr(c->fn), cpu);
     CHECK(r == OCERZ_OK, "%s: ocerz_abi_perform returned %d, want OCERZ_OK",
           c->sig, r);
 
@@ -1591,6 +1607,148 @@ static void test_rounding(void)
 
     g_mxcsr = MXCSR_DEFAULT;
     ocerz_apply_mxcsr_round(g_mxcsr);
+}
+
+static int indep_register_only(const char *cls, int n, char ret)
+{
+    int ni = 0, nf = 0, i;
+
+    if (!ret || !strchr("vbBhHiulLpfd", ret))
+        return 0;
+    for (i = 0; i < n; i++) {
+        if (!strchr("bBhHiulLpfd", cls[i]))
+            return 0;
+        if (cls[i] == 'f' || cls[i] == 'd') {
+            if (++nf > 8)
+                return 0;
+        } else if (++ni > 6) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void fn_ROUNDZ(void)
+{
+    enter();
+    fesetround(FE_TOWARDZERO);
+}
+
+static void test_register_lane(void)
+{
+    static const AbiCase kSmall = { "d(dd)", FN(fn_D2), 0, 0 };
+    static const struct { const char *sig; uint16_t in, out; } kContracts[] = {
+        { "v()", 0x00, 0x0 },
+        { "i(pp)", 0x00, 0x0 },
+        { "d(d)", 0x01, 0x1 },
+        { "f(if)", 0x01, 0x1 },
+        { "d(dLdLd)", 0x07, 0x1 },
+        { "L(pLpdd)", 0x03, 0x0 },
+        { "v(ddddddddd)", 0xff, 0x0 },
+        { "v(p{dd})", 0xff, 0x0 },
+        { "{LL}(dL)", 0x01, 0x3 },
+        { "p(ppLLc{i(pp)})", 0x00, 0x0 },
+    };
+    static const char *const kRoundSigs[] = { "v()", "v(LLLLLLL)" };
+    OcerzCPU *cpu = &g_cpu;
+    uint64_t want[OCERZ_ABI_MAX_ARGS];
+    size_t i;
+    int lane = 0, rc;
+
+    for (i = 0; i < NCASES; i++) {
+        OcerzAbiSig sig;
+        char cls[OCERZ_ABI_MAX_ARGS + 1];
+        int n = sig_classes(kCases[i].sig, cls);
+        int expect;
+
+        memset(&sig, 0, sizeof sig);
+        if (n < 0 || ocerz_abi_parse(kCases[i].sig, &sig) != OCERZ_OK)
+            continue;
+        expect = indep_register_only(cls, n, kCases[i].sig[0]);
+        CHECK(ocerz_abi_register_only(&sig) == expect,
+              "%s: ocerz_abi_register_only answered %d, want %d", kCases[i].sig,
+              ocerz_abi_register_only(&sig), expect);
+        if (!expect)
+            continue;
+        g_perform = ocerz_abi_perform_registers;
+        run_case(&kCases[i]);
+        g_perform = ocerz_abi_perform;
+        lane++;
+    }
+    CHECK(lane >= 20, "only %d signatures took the register path, so it is barely tested", lane);
+
+    for (rc = 0; rc < 4; rc++) {
+        uint32_t mxcsr = MXCSR_DEFAULT | ((uint32_t)rc << 13);
+
+        ocerz_apply_mxcsr_round(mxcsr);
+        CHECK((rd_fpcr() & OCERZ_ABI_ROUND_MASK) == ocerz_abi_round_of_mxcsr(mxcsr),
+              "mxcsr rounding %d: ocerz_abi_round_of_mxcsr gives %#llx, the fpcr bits are %#llx", rc,
+              (unsigned long long)ocerz_abi_round_of_mxcsr(mxcsr),
+              (unsigned long long)(rd_fpcr() & OCERZ_ABI_ROUND_MASK));
+
+        uint64_t before = rd_fpcr();
+        uint64_t got = ocerz_abi_round_swap(OCERZ_ABI_ROUND_NEAREST);
+        CHECK(got == before, "mxcsr rounding %d: ocerz_abi_round_swap returned %#llx, want the fpcr %#llx",
+              rc, (unsigned long long)got, (unsigned long long)before);
+        CHECK(rd_fpcr() == (before & ~OCERZ_ABI_ROUND_MASK),
+              "mxcsr rounding %d: fpcr is %#llx inside the swap, want %#llx", rc,
+              (unsigned long long)rd_fpcr(), (unsigned long long)(before & ~OCERZ_ABI_ROUND_MASK));
+        ocerz_abi_round_swap(got & OCERZ_ABI_ROUND_MASK);
+        CHECK(rd_fpcr() == before, "mxcsr rounding %d: fpcr is %#llx after swapping back, want %#llx", rc,
+              (unsigned long long)rd_fpcr(), (unsigned long long)before);
+
+        g_mxcsr = mxcsr;
+        g_perform = ocerz_abi_perform_registers;
+        run_case(&kSmall);
+        g_perform = ocerz_abi_perform;
+
+        for (size_t k = 0; k < sizeof kRoundSigs / sizeof kRoundSigs[0]; k++) {
+            OcerzAbiSig sig;
+            char cls[OCERZ_ABI_MAX_ARGS + 1];
+            int n = sig_classes(kRoundSigs[k], cls);
+
+            memset(&sig, 0, sizeof sig);
+            if (n < 0 || ocerz_abi_parse(kRoundSigs[k], &sig) != OCERZ_OK) {
+                CHECK(0, "%s: the test's own rounding signature does not parse", kRoundSigs[k]);
+                continue;
+            }
+            g_entered = 0;
+            g_fpcr_in = ~0ull;
+            setup_call(cpu, cls, n, 0, want);
+            ocerz_apply_mxcsr_round(mxcsr);
+            before = rd_fpcr();
+            int r = ocerz_abi_perform(&sig, fnptr(FN(fn_ROUNDZ)), cpu);
+            CHECK(r == OCERZ_OK && g_entered == 1,
+                  "%s under mxcsr rounding %d: the crossing returned %d and ran the callee %d times",
+                  kRoundSigs[k], rc, r, g_entered);
+            CHECK(((g_fpcr_in >> 22) & 3) == 0,
+                  "%s under mxcsr rounding %d: the callee ran with fpcr rounding %llu, want 0",
+                  kRoundSigs[k], rc, (unsigned long long)((g_fpcr_in >> 22) & 3));
+            CHECK(rd_fpcr() == before,
+                  "%s under mxcsr rounding %d: a callee that set its own rounding left fpcr %#llx, want the"
+                  " guest's %#llx", kRoundSigs[k], rc, (unsigned long long)rd_fpcr(),
+                  (unsigned long long)before);
+            CHECK(cpu->rip == RET_ADDR, "%s under mxcsr rounding %d: rip is %#llx, want %#llx",
+                  kRoundSigs[k], rc, (unsigned long long)cpu->rip, (unsigned long long)RET_ADDR);
+        }
+    }
+    g_mxcsr = MXCSR_DEFAULT;
+    ocerz_apply_mxcsr_round(g_mxcsr);
+
+    for (i = 0; i < sizeof kContracts / sizeof kContracts[0]; i++) {
+        OcerzAbiSig sig;
+        uint16_t in = 0xeeee, out = 0xeeee;
+
+        memset(&sig, 0, sizeof sig);
+        if (ocerz_abi_parse(kContracts[i].sig, &sig) != OCERZ_OK) {
+            CHECK(0, "%s: the test's own contract signature does not parse", kContracts[i].sig);
+            continue;
+        }
+        ocerz_abi_xmm_contract(&sig, &in, &out);
+        CHECK(in == kContracts[i].in && out == kContracts[i].out,
+              "%s: ocerz_abi_xmm_contract gives read %#x written %#x, want read %#x written %#x",
+              kContracts[i].sig, in, out, kContracts[i].in, kContracts[i].out);
+    }
 }
 
 static const char *const kBadSigs[] = {
@@ -4855,6 +5013,7 @@ int main(void)
     test_narrow_native();
     test_accept_classes();
     test_rounding();
+    test_register_lane();
     test_reject_parse();
     test_reject_perform();
     test_structs();

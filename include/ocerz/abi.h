@@ -72,7 +72,23 @@
  * MXCSR, which the JIT honours by driving the host FPCR.  A host function
  * compiled for the default mode must not inherit that, so the crossing saves the
  * rounding mode, restores the default for the duration of the call, and puts the
- * guest's back afterwards.
+ * guest's back afterwards.  ocerz_abi_round_swap is that save and restore: it
+ * reads FPCR and writes it only when the rounding bits differ from the mode
+ * asked for, returning what it read, so the common crossing, made in the
+ * default mode by a callee that leaves the mode alone, never writes FPCR.
+ * ocerz_abi_round_of_mxcsr gives the FPCR rounding bits for an MXCSR, which is
+ * what a callback into guest code swaps in.
+ *
+ * Most crossings need none of the machinery below.  ocerz_abi_register_only
+ * answers whether a signature is scalars only, with no more integer arguments
+ * than System V's six registers and no more floating-point ones than its eight,
+ * which also fit Apple's eight and eight; ocerz_abi_perform_registers makes such
+ * a crossing straight from the guest's registers into the host's, with no stack
+ * block, and ocerz_abi_perform takes that path itself whenever it applies.
+ * ocerz_abi_xmm_contract names, as bit masks, the xmm registers a signature's
+ * arguments are read from and the ones its result is written to, counting a
+ * structure argument as all eight argument registers and a structure result as
+ * xmm0 and xmm1, which is what lets the JIT spill no others.
  *
  * ---- structures by value ----
  * Objective-C passes and returns structures by value all the time: -frame
@@ -288,6 +304,8 @@
 #include "ocerz/types.h"
 #include "ocerz/cpu.h"
 
+#include <arm_acle.h>
+
 #define OCERZ_ABI_MAX_ARGS 16
 #define OCERZ_ABI_MAX_STACK 64
 #define OCERZ_ABI_CB_MAX 48
@@ -348,6 +366,27 @@ void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu,
                             const OcerzAbiCall *call);
 
 int ocerz_abi_perform(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu);
+
+int ocerz_abi_register_only(const OcerzAbiSig *sig);
+int ocerz_abi_perform_registers(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu);
+void ocerz_abi_xmm_contract(const OcerzAbiSig *sig, uint16_t *in, uint16_t *out);
+
+#define OCERZ_ABI_ROUND_MASK 0xc00000ull
+#define OCERZ_ABI_ROUND_NEAREST 0ull
+
+static inline uint64_t ocerz_abi_round_swap(uint64_t mode)
+{
+    uint64_t fpcr = __arm_rsr64("fpcr");
+    if ((fpcr & OCERZ_ABI_ROUND_MASK) != mode)
+        __arm_wsr64("fpcr", (fpcr & ~OCERZ_ABI_ROUND_MASK) | mode);
+    return fpcr;
+}
+
+static inline uint64_t ocerz_abi_round_of_mxcsr(uint32_t mxcsr)
+{
+    static const uint64_t mode[4] = { 0ull, 0x800000ull, 0x400000ull, 0xc00000ull };
+    return mode[(mxcsr >> 13) & 3];
+}
 
 void ocerz_abi_call_native(const void *fn, const uint64_t *x, const uint64_t *v,
                            const uint64_t *stack, uint64_t stackbytes, void *x8,
