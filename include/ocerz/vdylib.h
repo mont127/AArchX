@@ -10,8 +10,10 @@
  * DynImage.slice, and the trie walker reads that same buffer - so a synthesized
  * image flows through mapping, import resolution, dlopen and dladdr unchanged.
  * That is the point of doing it this way rather than special-casing the
- * resolvers.  Each library is one row in a table naming its functions, its data
- * slots and its native data, and the builder treats every row alike.
+ * resolvers.  What a library exports is read from its file in the API database
+ * (apidb.h) rather than compiled in, so ocerz_vdylib_have answers yes exactly
+ * for the install names that have a file, and the builder treats every library
+ * alike, however many exports its file declares.
  *
  * Every function export is twelve bytes of real x86 in the image's own __TEXT:
  *
@@ -27,11 +29,14 @@
  * the trap address is a constant and the jump is rip-relative, so a synthesized
  * image needs no fixups at all.
  *
- * The dispatcher hands the call to src/bridge.c, which performs it for real
- * when the export has a descriptor and names the export and stops when it does
- * not.
+ * An export id is the library's position among the database's files in its top
+ * twelve bits and the export's index in that file in the low twenty, so the
+ * same database gives the same export the same id and the same stub bytes in
+ * every process, whichever library a guest happens to load first.  The
+ * dispatcher hands the call to src/bridge.c, which performs it for real when
+ * the export has a descriptor and names the export and stops when it does not.
  *
- * Not every export is a stub.  A data symbol, such as the ___stack_chk_guard
+ * Not every export is a stub.  A var record, such as the ___stack_chk_guard
  * canary a stack-protected program reads in every function prologue, is a slot
  * in __DATA holding its value, and the export trie points straight at it.
  *
@@ -40,10 +45,10 @@
  * ___CFConstantStringClassReference as its isa, and a guest hands
  * &kCFTypeArrayCallBacks to a CoreFoundation that may compare it with the
  * address of its own; a copy in __DATA would be a second object at a second
- * address that the native framework does not recognize.  So a native data
+ * address that the native framework does not recognize.  So a data record's
  * export is the host's variable itself: an absolute export trie entry whose
- * value is the address ocerz_bridge_host_symbol finds in the library the image
- * stands for.  Native mode runs in an identity address map, so that host
+ * value is the address ocerz_bridge_host_symbol finds for the record's host
+ * symbol in the library the image stands for.  Native mode runs in an identity address map, so that host
  * address is already a valid guest address, and the loader binds the guest's
  * GOT entry or isa word straight to it.  A name the host does not have is left
  * out of the trie, so a guest importing it fails to bind and says which name it
