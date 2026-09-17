@@ -1036,7 +1036,8 @@ static void check_database_stubs(const char *what, const uint8_t *img, size_t le
         uint64_t a = ocerz_dyld_trie_resolve(img, LOAD_BASE, e->export_name, &found);
         uint64_t off = a - LOAD_BASE;
         if (e->kind == OCERZ_API_FN || e->kind == OCERZ_API_SPECIAL || e->kind == OCERZ_API_STUB) {
-            int tlv = e->kind == OCERZ_API_SPECIAL && strcmp(e->handler, "tlv_bootstrap") == 0;
+            int tlv = e->kind == OCERZ_API_SPECIAL && (strcmp(e->handler, "tlv_bootstrap") == 0 ||
+                                                       strcmp(e->handler, "chkstk") == 0);
             want_ids++;
             uint32_t want = (uint32_t)ord << 20 | (uint32_t)i;
             int ok = found && off + STUB_STRIDE <= ly->text.filesize &&

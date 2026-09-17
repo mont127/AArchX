@@ -163,6 +163,30 @@
  * fn and special records the libraries the bridge was asked about declare, then
  * the crossed exports busiest first.
  *
+ * ---- leaving the process ----
+ * C's exit runs the atexit handlers, flushes stdio and ends the process; _exit
+ * and _Exit only end it.  In native mode a guest's atexit is the host's, so its
+ * handlers are callbacks on the host's list, and the host's stdio is the guest's
+ * stdio.  The exit handler therefore calls the host's exit while the guest is
+ * still running: each handler runs as the callback it is, stdio is flushed by the
+ * library that buffered it, and the process ends there.  Letting the VM wind down
+ * first would not do, because a callback into a VM that has exited is refused,
+ * and the handlers would silently never run.  exit_now is _exit's handler and
+ * calls the host's _exit, running nothing and flushing nothing: stdio a guest
+ * buffered and never flushed is lost, as it is on a real system, which it would
+ * not be if the VM wound down through ocerz's own exit, since that ends in the
+ * host's exit.
+ *
+ * ---- the stack probe ----
+ * clang calls ___chkstk_darwin from any x86_64 function whose frame is larger
+ * than a page, with the frame size in RAX and every register expected back
+ * unchanged, so that each page of the new frame is touched in order and a
+ * guard page is hit before anything below it.  A guest's stacks are mapped
+ * whole when ocerz creates them, so there is nothing to probe: the chkstk
+ * handler only returns.  Its stub, like __tlv_bootstrap's, pushes r11 before it
+ * spends that register on the export id, so the handler takes r11 back off the
+ * stack first and every register the guest had is the one it gets.
+ *
  * ---- thread-local variables ----
  * __tlv_bootstrap is not a function any host library exports; it is the thunk
  * a guest's thread-local variable descriptors are bound to, and it has to return
@@ -301,8 +325,12 @@ static pthread_mutex_t g_br_host_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int br_exit(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    ocerz_vm_request_exit(vm, (int)(cpu->gpr[OCERZ_RDI] & 0xff));
-    return OCERZ_STEP_EXIT;
+    exit((int)(cpu->gpr[OCERZ_RDI] & 0xff));
+}
+
+static int br_exit_now(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    _exit((int)(cpu->gpr[OCERZ_RDI] & 0xff));
 }
 
 static int br_abort(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -334,6 +362,15 @@ static int br_tlv_bootstrap(struct OcerzVM *vm, OcerzCPU *cpu)
     cpu->rip = ocerz_ld(rsp + 8, 8);
     cpu->gpr[OCERZ_RSP] = rsp + 16;
     cpu->gpr[OCERZ_RAX] = addr;
+    return OCERZ_STEP_OK;
+}
+
+static int br_chkstk(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    cpu->gpr[OCERZ_R11] = ocerz_ld(rsp, 8);
+    cpu->rip = ocerz_ld(rsp + 8, 8);
+    cpu->gpr[OCERZ_RSP] = rsp + 16;
     return OCERZ_STEP_OK;
 }
 
@@ -429,9 +466,11 @@ typedef struct BrHandler {
 
 static const BrHandler g_br_handlers[] = {
     { "exit",            br_exit },
+    { "exit_now",        br_exit_now },
     { "abort",           br_abort },
     { "tlv_bootstrap",   br_tlv_bootstrap },
     { "stack_chk_fail",  br_stack_chk_fail },
+    { "chkstk",          br_chkstk },
     { "sigaction",       br_sigaction },
     { "signal",          br_signal },
     { "sigprocmask",     br_sigprocmask },
