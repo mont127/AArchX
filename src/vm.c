@@ -224,6 +224,16 @@
  * Wine process whose low-shadow block took 0x500000000 as its base, the same
  * fill turned guest address zero into a readable page and a guest null
  * dereference into a read of 0xcc.
+ *
+ * The choice between the two is made once for the process, under pthread_once.
+ * It used to be a lazily set static, and two native callback threads making
+ * their first guest call together could each see it unset: the first mapped
+ * the page and chose 0x500000000, the second found that address taken and
+ * chose 0xdeadca11, and whichever wrote last decided what every call compared
+ * against.  A call that had pushed the other address as its return address then
+ * never saw its guest return, and ran on into int3 bytes at 0x500000000 or into
+ * the unmapped 0xdeadca11, a few times in a hundred runs of dispatch_apply_f
+ * under the interpreter.
  */
 #include "ocerz/vm.h"
 #include "ocerz/dyld.h"
@@ -2631,25 +2641,30 @@ void ocerz_peek_dump(const char *tag)
 
 }
 
+static uint64_t g_call_sentinel;
+static pthread_once_t g_call_sentinel_once = PTHREAD_ONCE_INIT;
+
+static void call_sentinel_init(void)
+{
+    void *want = (void *)(uintptr_t)0x500000000ull;
+    void *p = mmap(want, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == want) {
+        memset(p, 0xcc, 0x1000);
+        g_call_sentinel = 0x500000000ull;
+    } else {
+        if (p != MAP_FAILED)
+            munmap(p, 0x1000);
+        g_call_sentinel = OCERZ_CALL_SENTINEL;
+    }
+    OCERZ_LOG("vm: call sentinel page at %#llx\n", (unsigned long long)g_call_sentinel);
+}
+
 static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ngpr, int nxmm,
                         uint64_t stack_top)
 {
     static const int ar[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
-    static uint64_t sentinel;
-    if (!sentinel) {
-        void *want = (void *)(uintptr_t)0x500000000ull;
-        void *p = mmap(want, 0x1000, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (p == want) {
-            memset(p, 0xcc, 0x1000);
-            sentinel = 0x500000000ull;
-        } else {
-            if (p != MAP_FAILED)
-                munmap(p, 0x1000);
-            sentinel = OCERZ_CALL_SENTINEL;
-        }
-        OCERZ_LOG("vm: call sentinel page at %#llx\n", (unsigned long long)sentinel);
-    }
+    pthread_once(&g_call_sentinel_once, call_sentinel_init);
+    const uint64_t sentinel = g_call_sentinel;
     OcerzCPU *prev_cpu = g_cur_cpu;
     OcerzCPU local = prev_cpu ? *prev_cpu : vm->cpu;
     local.terminated = 0;
