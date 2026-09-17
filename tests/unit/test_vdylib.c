@@ -62,30 +62,38 @@
  * asserted byte-identical, so the second build re-interned the same export ids
  * and laid out the same slot, and each image carries its guard in its own slot.
  *
- * CoreFoundation is the second row of the same table, and it is checked against
- * its whole export list rather than a sample.  Every function name has to
+ * Both libraries are built from the committed API database, runtime/apis,
+ * unless the environment already names another, since make runs the unit
+ * binaries from the repository root.  The names every program linked against
+ * native mode could bind before the database existed are written out here, the
+ * whole of libSystem's list and the whole of CoreFoundation's, and every one of
+ * them has to still resolve: the database may grow, but a name dropped from it
+ * would turn a program that ran into one that stops with 71.  Beyond those,
+ * every function record of both files - fn, special and stub alike - has to
  * resolve to exactly 41 bb <id> ff 25 <rel32> with int3 padding, move with the
  * load base, jump through a slot holding the bridge trap address, and carry an
- * id that ocerz_vdylib_export_name turns back into CoreFoundation's install
- * name and that same symbol - which is also what proves no two names share an
- * id or a stub, and that CoreFoundation's ids did not collide with libSystem's
- * in the one id space the dispatcher reads.  __text and __data are asserted to
- * be exactly one stub and one slot per function, so a native export that took
- * either is caught.  No libSystem name resolves in CoreFoundation and no
- * CoreFoundation name resolves in libSystem, and names a character shorter or
- * longer than CoreFoundation's own reach nothing.
+ * id that ocerz_vdylib_export_name turns back into the file's install name and
+ * that same symbol - which is also what proves no two names share an id or a
+ * stub, and that CoreFoundation's ids did not collide with libSystem's in the
+ * one id space the dispatcher reads.  The id itself is asserted to be the
+ * library's position among the database's files shifted into the top twelve
+ * bits plus the record's index in its file, and every var record has to
+ * resolve to its slot in __DATA.  __text and __data are asserted to be exactly
+ * one stub and one slot per function record of CoreFoundation's file, so a
+ * native export that took either is caught.  No libSystem name resolves in
+ * CoreFoundation and no CoreFoundation name resolves in libSystem, and names a
+ * character shorter or longer than CoreFoundation's own reach nothing.
  *
- * Every native data name has to resolve to exactly what dlsym answers for it,
- * less its underscore, in a CoreFoundation this process dlopens itself, and to
- * the same value at two different load bases: a terminal written without the
- * absolute flag would come back shifted by the base, and the second base is
- * what catches it.
+ * Every data record has to resolve to exactly what dlsym answers for its host
+ * symbol in a CoreFoundation this process dlopens itself, and to the same value
+ * at two different load bases: a terminal written without the absolute flag
+ * would come back shifted by the base, and the second base is what catches it.
  *
  * The host's CoreFoundation is normally mapped below 2^35, so it cannot show
  * that a wider address survives, and it resolves every name, so it cannot show
  * what happens to one that does not.  ocerz_vdylib_image_with
  * builds the same image against a lookup the test supplies instead.  The first
- * answers every name with a value five ULEB bytes cannot hold - 2^35 exactly,
+ * answers every data record with a value five ULEB bytes cannot hold - 2^35 exactly,
  * bit 63 alone, all 64 bits set and others past 2^35 - and each has to come back
  * exact at both load bases.  That image has to be the same length as the real
  * one, with the same trie offset and size, and its stubs and __DATA the same
@@ -103,8 +111,22 @@
  * first, has to match it byte for byte: ids minted in build order would
  * renumber every libSystem stub.  The child uses the synthetic lookup, so it
  * never loads CoreFoundation into a forked process.
+ *
+ * And before that, a second child points OCERZ_APIDB at a database of its own
+ * holding a synthesized library of 6000 records - fn, special, stub, data and
+ * var mixed, names that nest as _synth_1, _synth_10, _synth_100 and
+ * _synth_1000 do, and names of several hundred characters - beside a small
+ * second library whose file sorts after it.  It builds the small one first.
+ * Every one of the 6000 exports has to resolve as its kind requires, the stubs
+ * through the same byte-level check as above, the data at two load bases and
+ * the missing data not at all, the var slots inside __DATA and filled, and
+ * __text and __data have to span many pages; the ids of both libraries have to
+ * follow the files' order in the directory rather than the order they were
+ * built in.  The child sends its counts back through a pipe, because the
+ * database a process reads is chosen once.
  */
 #include "ocerz/vdylib.h"
+#include "ocerz/apidb.h"
 #include "ocerz/bridge.h"
 #include "ocerz/dyld.h"
 #include "ocerz/dyldapi.h"
@@ -114,10 +136,13 @@
 #include <mach-o/loader.h>
 #include <mach/machine.h>
 
+#include <dirent.h>
 #include <dlfcn.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -155,6 +180,36 @@ static const char *const kExports[] = {
     "___stack_chk_fail",
 };
 #define NEXPORTS (sizeof kExports / sizeof kExports[0])
+
+static const char *const kM8LibSystem[] = {
+    "___bzero", "___error", "___stack_chk_fail", "__tlv_bootstrap", "___memcpy_chk",
+    "___memmove_chk", "___memset_chk", "___strcpy_chk", "___stpcpy_chk", "___strcat_chk",
+    "___strncpy_chk", "___stpncpy_chk", "___strncat_chk", "___strlcpy_chk", "___strlcat_chk",
+    "_memcpy", "_memcmp", "_memmove", "_memset", "_memchr", "_strcmp", "_strncmp", "_strcpy",
+    "_strncpy", "_strlen", "_strnlen", "_strcat", "_strncat", "_strchr", "_strrchr", "_strstr",
+    "_strdup", "_strndup", "_strtol", "_strtoul", "_strtod", "_strerror", "_fopen", "_fclose",
+    "_fread", "_fwrite", "_fflush", "_fprintf", "_fputs", "_fputc", "_fgets", "_printf",
+    "_puts", "_putchar", "_snprintf", "_sprintf", "_vsnprintf", "_vfprintf", "_perror",
+    "_malloc", "_calloc", "_realloc", "_free", "_exit", "_abort", "_atexit", "_getenv",
+    "_setenv", "_unsetenv", "_qsort", "_bsearch", "_abs", "_labs", "_atoi", "_atol", "_atof",
+    "_rand", "_srand", "_write", "_writev", "_read", "_readv", "_readdir", "_open", "_opendir",
+    "_close", "_closedir", "_lseek", "_unlink", "_mkdir", "_rmdir", "_rename", "_access",
+    "_dup", "_dup2", "_pipe", "_fcntl", "_ioctl", "_isatty", "_getpid", "_getppid", "_getuid",
+    "_geteuid", "_mmap", "_munmap", "_mprotect", "_madvise", "_time", "_times", "_clock",
+    "_clock_gettime", "_gettimeofday", "_nanosleep", "_sleep", "_usleep", "_mktime",
+    "_localtime", "_gmtime", "_strftime", "_pthread_create", "_pthread_join",
+    "_pthread_detach", "_pthread_self", "_pthread_mutex_init", "_pthread_mutex_lock",
+    "_pthread_mutex_unlock", "_pthread_mutex_destroy", "_pthread_cond_init",
+    "_pthread_cond_wait", "_pthread_cond_signal", "_pthread_cond_broadcast",
+    "_pthread_cond_destroy", "_dispatch_get_global_queue", "_dispatch_async_f",
+    "_dispatch_sync_f", "_dispatch_apply_f", "_dispatch_semaphore_create",
+    "_dispatch_semaphore_wait", "_dispatch_semaphore_signal", "_dispatch_release", "_dlopen",
+    "_dlsym", "_dlclose", "_dlerror", "_dladdr", "_signal", "_sigaction", "_raise", "_kill",
+    "_sigprocmask", "_pthread_sigmask", "_sigaltstack", "_pthread_kill", "_sigemptyset",
+    "_sigfillset", "_sigaddset", "_sigdelset", "_sigismember", "dyld_stub_binder",
+    "___stack_chk_guard",
+};
+#define NM8LIBSYSTEM (sizeof kM8LibSystem / sizeof kM8LibSystem[0])
 
 static const char *const kPrefixPairs[][2] = {
     { "_write", "_writev" },
@@ -936,6 +991,99 @@ static void check_function_stubs(const char *what, const uint8_t *img, size_t le
           "themselves", what, good, n);
 }
 
+static int db_ordinal(const OcerzApiLibrary *api)
+{
+    const char *dir = ocerz_apidb_dir();
+    DIR *d = dir ? opendir(dir) : NULL;
+    if (!d)
+        return -1;
+    const char *base = strrchr(api->path, '/');
+    base = base ? base + 1 : api->path;
+    int before = 0, found = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        size_t n = strlen(de->d_name);
+        if (de->d_name[0] == '.' || n <= 4 || strcmp(de->d_name + n - 4, ".api") != 0)
+            continue;
+        int c = strcmp(de->d_name, base);
+        before += c < 0;
+        found |= c == 0;
+    }
+    closedir(d);
+    return found ? before : -1;
+}
+
+static void check_database_stubs(const char *what, const uint8_t *img, size_t len,
+                                 const Layout *ly, const char *lib)
+{
+    const OcerzApiLibrary *api = ocerz_apidb_library(lib);
+    CHECK(api != NULL, "%s: the database has no file for %s", what, lib);
+    if (!api)
+        return;
+    int ord = db_ordinal(api);
+    CHECK(ord >= 0, "%s: %s is not among the database's files", what, api->path);
+    const char **names = calloc((size_t)api->nentries + 1, sizeof *names);
+    CHECK(names != NULL, "%s: out of memory", what);
+    if (!names || ord < 0) {
+        free(names);
+        return;
+    }
+    size_t n = 0, want_ids = 0, ids_ok = 0, want_vars = 0, vars_ok = 0;
+    const char *bad_id = NULL, *bad_var = NULL;
+    for (int i = 0; i < api->nentries; i++) {
+        const OcerzApiEntry *e = &api->entries[i];
+        int found = 0;
+        uint64_t a = ocerz_dyld_trie_resolve(img, LOAD_BASE, e->export_name, &found);
+        uint64_t off = a - LOAD_BASE;
+        if (e->kind == OCERZ_API_FN || e->kind == OCERZ_API_SPECIAL || e->kind == OCERZ_API_STUB) {
+            int tlv = e->kind == OCERZ_API_SPECIAL && strcmp(e->handler, "tlv_bootstrap") == 0;
+            want_ids++;
+            uint32_t want = (uint32_t)ord << 20 | (uint32_t)i;
+            int ok = found && off + STUB_STRIDE <= ly->text.filesize &&
+                     rd32(img + off + (tlv ? 4 : 2)) == want;
+            ids_ok += ok;
+            if (!ok && !bad_id)
+                bad_id = e->export_name;
+            if (!tlv)
+                names[n++] = e->export_name;
+        } else if (e->kind == OCERZ_API_VAR) {
+            want_vars++;
+            int ok = found && off >= ly->data.fileoff && (off & (SLOT_LEN - 1)) == 0 &&
+                     off + e->bytes <= ly->data.fileoff + ly->data.filesize &&
+                     off + e->bytes <= (uint64_t)len;
+            vars_ok += ok;
+            if (!ok && !bad_var)
+                bad_var = e->export_name;
+        }
+    }
+    CHECK(ids_ok == want_ids, "%s: only %zu of %zu function records carry the id of file %d, "
+          "entry index (first wrong: %s)", what, ids_ok, want_ids, ord, bad_id ? bad_id : "");
+    CHECK(vars_ok == want_vars, "%s: only %zu of %zu var records resolve to an aligned slot in "
+          "__DATA (first wrong: %s)", what, vars_ok, want_vars, bad_var ? bad_var : "");
+    check_function_stubs(what, img, len, ly, lib, names, n);
+    free(names);
+}
+
+static void check_libsystem_database(void)
+{
+    size_t len = 0;
+    uint8_t *img = ocerz_vdylib_image(kLib, &len);
+    CHECK(img != NULL, "ocerz_vdylib_image(\"%s\") returned no buffer", kLib);
+    if (!img)
+        return;
+    Layout ly;
+    if (layout_of("libSystem", img, len, kLib, &ly)) {
+        check_database_stubs("libSystem", img, len, &ly, kLib);
+        for (size_t i = 0; i < NM8LIBSYSTEM; i++) {
+            int found = 0;
+            ocerz_dyld_trie_resolve(img, LOAD_BASE, kM8LibSystem[i], &found);
+            CHECK(found, "libSystem no longer exports %s, which native mode exported before its "
+                  "exports came from the database", kM8LibSystem[i]);
+        }
+    }
+    free(img);
+}
+
 static void check_absent(const char *what, const uint8_t *img, const char *const *names,
                          size_t n)
 {
@@ -947,10 +1095,32 @@ static void check_absent(const char *what, const uint8_t *img, const char *const
     }
 }
 
+static const OcerzApiEntry **g_natives;
+static size_t g_nnatives;
+static size_t g_cf_functions;
+
+static int load_cf_records(void)
+{
+    const OcerzApiLibrary *api = ocerz_apidb_library(kCF);
+    if (!api)
+        return 0;
+    g_natives = calloc((size_t)api->nentries + 1, sizeof *g_natives);
+    if (!g_natives)
+        return 0;
+    for (int i = 0; i < api->nentries; i++) {
+        const OcerzApiEntry *e = &api->entries[i];
+        if (e->kind == OCERZ_API_DATA)
+            g_natives[g_nnatives++] = e;
+        else if (e->kind == OCERZ_API_FN || e->kind == OCERZ_API_SPECIAL || e->kind == OCERZ_API_STUB)
+            g_cf_functions++;
+    }
+    return 1;
+}
+
 static int native_index(const char *host_sym)
 {
-    for (size_t k = 0; k < NCFNATIVES; k++)
-        if (strcmp(kCFNatives[k] + 1, host_sym) == 0)
+    for (size_t k = 0; k < g_nnatives; k++)
+        if (strcmp(g_natives[k]->host, host_sym) == 0)
             return (int)k;
     return -1;
 }
@@ -989,8 +1159,8 @@ static void *fake_host_some(const char *install_name, const char *host_sym)
 
 static void check_natives_are(const char *what, const uint8_t *img, void *(*want)(size_t))
 {
-    for (size_t k = 0; k < NCFNATIVES; k++) {
-        const char *sym = kCFNatives[k];
+    for (size_t k = 0; k < g_nnatives; k++) {
+        const char *sym = g_natives[k]->export_name;
         uint64_t w = (uint64_t)(uintptr_t)want(k);
         int found = 0, found_alt = 0;
         uint64_t v = ocerz_dyld_trie_resolve(img, LOAD_BASE, sym, &found);
@@ -1019,7 +1189,7 @@ static void *g_cf_handle;
 
 static void *host_native(size_t k)
 {
-    return g_cf_handle ? dlsym(g_cf_handle, kCFNatives[k] + 1) : NULL;
+    return g_cf_handle ? dlsym(g_cf_handle, g_natives[k]->host) : NULL;
 }
 
 static void *fake_all_native(size_t k)
@@ -1081,23 +1251,33 @@ static void check_corefoundation(void)
         free(img);
         return;
     }
-    CHECK(ly.text.sect_found && ly.text.sect_size == NCFFUNCS * STUB_STRIDE,
-          "CoreFoundation's __text is %llu bytes, want one stub for each of the %zu functions "
-          "and none for its native data", (unsigned long long)ly.text.sect_size, NCFFUNCS);
-    CHECK(ly.data.sect_found && ly.data.sect_size == NCFFUNCS * SLOT_LEN,
+    CHECK(ly.text.sect_found && ly.text.sect_size == g_cf_functions * STUB_STRIDE,
+          "CoreFoundation's __text is %llu bytes, want one stub for each of the %zu function "
+          "records and none for its data", (unsigned long long)ly.text.sect_size, g_cf_functions);
+    CHECK(ly.data.sect_found && ly.data.sect_size == g_cf_functions * SLOT_LEN,
           "CoreFoundation's __data is %llu bytes, want one jump slot for each of the %zu "
-          "functions and nothing for its native data", (unsigned long long)ly.data.sect_size,
-          NCFFUNCS);
+          "function records and nothing for its data", (unsigned long long)ly.data.sect_size,
+          g_cf_functions);
 
     check_function_stubs("CoreFoundation", img, len, &ly, kCF, kCFFunctions, NCFFUNCS);
+    check_database_stubs("CoreFoundation", img, len, &ly, kCF);
+    for (size_t k = 0; k < NCFNATIVES; k++) {
+        const OcerzApiEntry *e = ocerz_apidb_find(ocerz_apidb_library(kCF), kCFNatives[k]);
+        CHECK(e && e->kind == OCERZ_API_DATA && strcmp(e->host, kCFNatives[k] + 1) == 0,
+              "CoreFoundation's database does not carry %s as data naming %s", kCFNatives[k],
+              kCFNatives[k] + 1);
+    }
 
     g_cf_handle = dlopen(kCF, RTLD_LAZY | RTLD_LOCAL);
     CHECK(g_cf_handle != NULL, "the host will not dlopen %s: %s", kCF, dlerror());
     size_t host_has = 0;
-    for (size_t k = 0; k < NCFNATIVES; k++)
+    for (size_t k = 0; k < g_nnatives; k++)
         host_has += host_native(k) != NULL;
-    CHECK(host_has == NCFNATIVES, "the host CoreFoundation has only %zu of the %zu native data "
-          "names", host_has, NCFNATIVES);
+    size_t m8_has = 0;
+    for (size_t k = 0; k < NCFNATIVES; k++)
+        m8_has += g_cf_handle && dlsym(g_cf_handle, kCFNatives[k] + 1) != NULL;
+    CHECK(m8_has == NCFNATIVES, "the host CoreFoundation has only %zu of the %zu native data "
+          "names", m8_has, NCFNATIVES);
     check_natives_are("CoreFoundation", img, host_native);
 
     size_t ls_len = 0;
@@ -1122,7 +1302,7 @@ static void check_corefoundation(void)
             check_natives_are("CoreFoundation (high)", all, fake_all_native);
             check_function_stubs("CoreFoundation (high)", all, all_len, &aly, kCF,
                                  kCFFunctions, NCFFUNCS);
-            if (host_has == NCFNATIVES) {
+            if (host_has == g_nnatives) {
                 CHECK(all_len == len && aly.trie_off == ly.trie_off &&
                       aly.trie_size == ly.trie_size,
                       "the image is %zu bytes (trie %u at %u) against high addresses and %zu "
@@ -1182,16 +1362,18 @@ static void check_corefoundation(void)
         char *log = read_all(fileno(cap), &log_len);
         CHECK(log != NULL, "cannot read the captured log back");
         if (log) {
-            for (size_t k = 0; k < NCFNATIVES; k++) {
-                char line[256];
-                snprintf(line, sizeof line, "does not export %s\n", kCFNatives[k]);
+            for (size_t k = 0; k < g_nnatives; k++) {
+                char line[512];
+                snprintf(line, sizeof line, "does not export %s\n", g_natives[k]->export_name);
                 size_t c = count_of(log, line);
+                if (!host_native(k))
+                    continue;
                 if (fake_misses(k))
                     CHECK(c == 1, "%s went missing in two builds and was logged %zu times, "
-                          "want once", kCFNatives[k], c);
+                          "want once", g_natives[k]->export_name, c);
                 else
                     CHECK(c == 0, "%s resolved but was logged missing %zu times",
-                          kCFNatives[k], c);
+                          g_natives[k]->export_name, c);
             }
             free(log);
         }
@@ -1258,12 +1440,223 @@ static uint8_t *libsystem_built_after_corefoundation(size_t *len_out)
     return img;
 }
 
+#define SYNTH_LIB  "/usr/lib/libocerzsynth.dylib"
+#define SYNTH_LIB2 "/usr/lib/libocerzsynth2.dylib"
+#define SYNTH_N    6000
+
+typedef struct {
+    int checks;
+    int failures;
+} Counts;
+
+static void in_child(const char *what, void (*fn)(void))
+{
+    int fds[2];
+    if (pipe(fds) != 0) {
+        CHECK(0, "%s: no pipe", what);
+        return;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        checks = 0;
+        failures = 0;
+        fn();
+        Counts c = { checks, failures };
+        _exit(write(fds[1], &c, sizeof c) == (ssize_t)sizeof c ? 0 : 1);
+    }
+    close(fds[1]);
+    Counts c = { 0, 0 };
+    ssize_t got = pid > 0 ? read(fds[0], &c, sizeof c) : -1;
+    close(fds[0]);
+    int status = 0;
+    int ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+             WEXITSTATUS(status) == 0 && got == (ssize_t)sizeof c;
+    CHECK(ok, "%s: the child did not report back (status %#x)", what, status);
+    if (ok) {
+        checks += c.checks;
+        failures += c.failures;
+    }
+}
+
+static void synth_name(char *out, size_t cap, int i)
+{
+    if (i % 500 == 7) {
+        int n = snprintf(out, cap, "_synth_long_%d_", i);
+        while (n < 400 && (size_t)n + 1 < cap) {
+            out[n] = (char)('a' + (i + n) % 26);
+            n++;
+        }
+        out[n] = '\0';
+        return;
+    }
+    snprintf(out, cap, "_synth_%d", i);
+}
+
+static int synth_misses(int i)
+{
+    return i % 40 == 18;
+}
+
+static uint64_t synth_value(int i)
+{
+    return 0x0000100000000000ull + ((uint64_t)i << 12) + (uint64_t)i;
+}
+
+static void *synth_host(const char *install_name, const char *host_sym)
+{
+    int i = 0;
+    if (strcmp(install_name, SYNTH_LIB) != 0 || sscanf(host_sym, "synthhost_%d", &i) != 1 ||
+        synth_misses(i))
+        return NULL;
+    return (void *)(uintptr_t)synth_value(i);
+}
+
+static OcerzApiKind synth_kind(int i)
+{
+    if (i == 3)
+        return OCERZ_API_SPECIAL;
+    switch (i % 10) {
+    case 6:
+    case 7: return OCERZ_API_STUB;
+    case 8: return OCERZ_API_DATA;
+    case 9: return OCERZ_API_VAR;
+    default: return OCERZ_API_FN;
+    }
+}
+
+static int write_synth(const char *dir)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/libocerzsynth.dylib.api", dir);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return 0;
+    fprintf(f, "# synthesized by test_vdylib\nocerz-apidb 1\nlibrary %s\nsdk macos 27.0\n", SYNTH_LIB);
+    for (int i = 0; i < SYNTH_N; i++) {
+        char name[512];
+        synth_name(name, sizeof name, i);
+        switch (synth_kind(i)) {
+        case OCERZ_API_SPECIAL: fprintf(f, "special %s exit\n", name); break;
+        case OCERZ_API_STUB: fprintf(f, "stub %s synthetic\n", name); break;
+        case OCERZ_API_DATA: fprintf(f, "data %s synthhost_%d\n", name, i); break;
+        case OCERZ_API_VAR: fprintf(f, "var %s %d stack_guard\n", name, i % 20 == 9 ? 24 : 8); break;
+        default: fprintf(f, "fn %s strlen L(p)\n", name); break;
+        }
+    }
+    if (fclose(f) != 0)
+        return 0;
+    snprintf(path, sizeof path, "%s/libocerzsynth2.dylib.api", dir);
+    f = fopen(path, "w");
+    if (!f)
+        return 0;
+    fprintf(f, "ocerz-apidb 1\nlibrary %s\nsdk macos 27.0\nfn _two_a strlen L(p)\n"
+            "stub _two_b synthetic\nfn _two_c strlen L(p)\n", SYNTH_LIB2);
+    return fclose(f) == 0;
+}
+
+static void synth_child(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    char root[PATH_MAX];
+    snprintf(root, sizeof root, "%s/ocerz-vdylib-XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+    CHECK(mkdtemp(root) != NULL, "cannot make a temporary database root");
+    char dir[PATH_MAX + 32];
+    snprintf(dir, sizeof dir, "%s/macos", root);
+    int made = mkdir(dir, 0755) == 0;
+    snprintf(dir, sizeof dir, "%s/macos/27.0", root);
+    made = made && mkdir(dir, 0755) == 0 && write_synth(dir);
+    CHECK(made, "cannot write the synthetic database under %s", root);
+    if (!made)
+        return;
+    setenv("OCERZ_APIDB", root, 1);
+
+    CHECK(ocerz_vdylib_have(SYNTH_LIB), "the synthetic library is not synthesized");
+    CHECK(!ocerz_vdylib_have(kLib), "libSystem is synthesized from a database with no file for it");
+
+    size_t len2 = 0, len = 0;
+    uint8_t *img2 = ocerz_vdylib_image_with(SYNTH_LIB2, synth_host, &len2);
+    uint8_t *img = ocerz_vdylib_image_with(SYNTH_LIB, synth_host, &len);
+    CHECK(img != NULL && img2 != NULL, "the synthetic libraries were not built");
+
+    Layout ly;
+    if (img && layout_of("synthetic", img, len, SYNTH_LIB, &ly)) {
+        size_t nfunc = 0, nvar = 0;
+        for (int i = 0; i < SYNTH_N; i++) {
+            OcerzApiKind k = synth_kind(i);
+            nfunc += k == OCERZ_API_FN || k == OCERZ_API_SPECIAL || k == OCERZ_API_STUB;
+            nvar += k == OCERZ_API_VAR;
+        }
+        CHECK(ly.text.sect_found && ly.text.sect_size == nfunc * STUB_STRIDE,
+              "synthetic __text is %llu bytes, want %zu stubs", (unsigned long long)ly.text.sect_size,
+              nfunc);
+        CHECK(ly.text.vmsize >= 16 * 4096 && ly.data.vmsize >= 4 * 4096,
+              "synthetic __TEXT is %llu bytes and __DATA %llu, which cannot hold %zu stubs",
+              (unsigned long long)ly.text.vmsize, (unsigned long long)ly.data.vmsize, nfunc);
+        check_database_stubs("synthetic", img, len, &ly, SYNTH_LIB);
+
+        size_t data_ok = 0, data_n = 0, var_ok = 0, long_ok = 0, long_n = 0;
+        for (int i = 0; i < SYNTH_N; i++) {
+            char name[512];
+            synth_name(name, sizeof name, i);
+            int found = 0, found_alt = 0;
+            uint64_t v = ocerz_dyld_trie_resolve(img, LOAD_BASE, name, &found);
+            uint64_t v_alt = ocerz_dyld_trie_resolve(img, LOAD_BASE_ALT, name, &found_alt);
+            if (strlen(name) > 300) {
+                long_n++;
+                long_ok += found;
+            }
+            if (synth_kind(i) == OCERZ_API_DATA) {
+                data_n++;
+                if (synth_misses(i))
+                    data_ok += !found && !found_alt;
+                else
+                    data_ok += found && found_alt && v == synth_value(i) && v_alt == synth_value(i);
+            } else if (synth_kind(i) == OCERZ_API_VAR && found) {
+                uint64_t off = v - LOAD_BASE;
+                uint64_t g = off + 8 <= len ? rd64(img + off) : 0;
+                var_ok += g != 0 && (g & 0xff) == 0;
+            }
+        }
+        CHECK(data_ok == data_n, "only %zu of %zu synthetic data records resolve absolute, or are "
+              "absent when the host has no such name", data_ok, data_n);
+        CHECK(var_ok == nvar, "only %zu of %zu synthetic var slots hold a filled canary", var_ok, nvar);
+        CHECK(long_n > 0 && long_ok == long_n, "only %zu of %zu names longer than 300 characters "
+              "resolve", long_ok, long_n);
+        check_absent("synthetic", img,
+                     (const char *const[]){ "_synth_6000", "_synth_", "_synth_long_7_", "_synth_10000",
+                                            "_synth_1a" }, 5);
+    }
+    Layout ly2;
+    if (img2 && layout_of("synthetic second", img2, len2, SYNTH_LIB2, &ly2))
+        check_database_stubs("synthetic second", img2, len2, &ly2, SYNTH_LIB2);
+    const OcerzApiLibrary *api2 = ocerz_apidb_library(SYNTH_LIB2);
+    CHECK(api2 && db_ordinal(api2) == 1 && ocerz_apidb_library(SYNTH_LIB) &&
+          db_ordinal(ocerz_apidb_library(SYNTH_LIB)) == 0,
+          "the synthetic files are not numbered 0 and 1 in directory order");
+    free(img);
+    free(img2);
+
+    char cmd[PATH_MAX + 32];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
+    if (strstr(root, "ocerz-vdylib-") && system(cmd) != 0)
+        fprintf(stderr, "test_vdylib: could not remove %s\n", root);
+}
+
 int main(void)
 {
+    setenv("OCERZ_APIDB", "runtime/apis", 0);
+    in_child("the 6000-export synthetic library", synth_child);
+    CHECK(load_cf_records(), "the database has no CoreFoundation records under %s",
+          getenv("OCERZ_APIDB"));
+
     size_t late_len = 0;
     uint8_t *late = libsystem_built_after_corefoundation(&late_len);
 
     check_libsystem();
+    check_libsystem_database();
     check_corefoundation();
 
     CHECK(late != NULL, "a child that built CoreFoundation before libSystem sent nothing back");

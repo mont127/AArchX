@@ -156,6 +156,15 @@
  * and it is logged rather than announced as fatal.  The collected import
  * report is what names the consequence, symbol by symbol.
  *
+ * Which libraries ocerz synthesizes, and what each exports, comes from the API
+ * database (apidb.h), whose version directory is chosen by the minimum macOS
+ * the main image declares.  So before any dependency is loaded, native mode
+ * reads that version out of the main image - the minos of an LC_BUILD_VERSION
+ * whose platform is macOS, or else the version of an LC_VERSION_MIN_MACOSX -
+ * and hands it to ocerz_apidb_set_minos; an image declaring neither, or only
+ * another platform's version, hands over zero, which chooses the newest
+ * directory.
+ *
  * A name that ocerz synthesizes is answered rather than missed.  Before an
  * install name is expanded at all, native mode asks ocerz_vdylib_have whether
  * it has an image for it, and if it does the image is built in memory and
@@ -239,6 +248,7 @@
 #include "ocerz/dyldapi.h"
 #include "ocerz/mode.h"
 #include "ocerz/vdylib.h"
+#include "ocerz/apidb.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -2820,6 +2830,29 @@ uint64_t ocerz_dlerror(void)
     return g_dlerror_g;
 }
 
+static uint32_t native_image_minos(const uint8_t *mh)
+{
+    if (rd32(mh) != MH_MAGIC_64)
+        return 0;
+    uint32_t ncmds = rd32(mh + 16);
+    uint32_t sizeofcmds = rd32(mh + 20);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    uint32_t walked = 0;
+    for (uint32_t i = 0; i < ncmds && walked + 16 <= sizeofcmds; i++) {
+        uint32_t cmd = rd32(lc);
+        uint32_t cmdsize = rd32(lc + 4);
+        if (cmdsize < 8 || walked + cmdsize > sizeofcmds)
+            break;
+        if (cmd == LC_BUILD_VERSION && cmdsize >= 16 && rd32(lc + 8) == PLATFORM_MACOS)
+            return rd32(lc + 12);
+        if (cmd == LC_VERSION_MIN_MACOSX && cmdsize >= 12)
+            return rd32(lc + 8);
+        lc += cmdsize;
+        walked += cmdsize;
+    }
+    return 0;
+}
+
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
 {
     if (ocerz_mem_init_identity(DYN_ARENA_SIZE) != OCERZ_OK)
@@ -2871,6 +2904,13 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         OCERZ_FATAL("%s has no LC_MAIN or LC_UNIXTHREAD entry\n", path);
         free(buf);
         return OCERZ_EFORMAT;
+    }
+
+    if (ocerz_mode == OCERZ_MODE_NATIVE) {
+        uint32_t minos = native_image_minos(slice);
+        OCERZ_LOG("dynamic: %s declares macOS %u.%u.%u\n", path, minos >> 16, (minos >> 8) & 0xff,
+                  minos & 0xff);
+        ocerz_apidb_set_minos(minos);
     }
 
     RpathList main_rpaths;

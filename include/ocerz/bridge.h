@@ -4,16 +4,19 @@
  * A virtual system library's exports are stubs that trap (see vdylib.h).  This
  * is what happens after the trap: the export is looked up, its arguments are
  * read out of the guest's x86 register state, converted where a conversion is
- * needed, handed to the real arm64 function linked into ocerz itself, and the
- * result is put back where x86 code expects to find it.
+ * needed, handed to the real arm64 function in the host library, and the result
+ * is put back where x86 code expects to find it.
  *
- * Floating-point arguments and results used to be excluded here too, because a
- * three-class shape could not say which register a double belongs in.  The ABI
- * engine in abi.h computes that from a signature instead, so this file now names
- * each function's real signature and hands the crossing to it.  That is also
- * what makes the integer widths honest: a 32-bit argument has to be extended by
- * the caller on arm64, and a 32-bit result comes back with the upper half of the
- * register dirty, neither of which the old shape could express.
+ * What an export crosses to, and how, is the export's record in the API
+ * database (apidb.h): a fn record names the host symbol and the function's real
+ * signature, which the ABI engine in abi.h turns into register and stack
+ * placement, including which register a double belongs in and how a 32-bit
+ * argument or result is extended; a special record names a handler ocerz
+ * answers the call with itself; struct and shape records say which pointer
+ * arguments carry structures of function pointers and what each word of them
+ * is.  ocerz_bridge_lookup makes a descriptor from those records the first
+ * time an export is asked for and returns the same one every time after, from
+ * any thread.
  *
  * Guest pointers need translating in principle and not at all in practice, at
  * least in the map native mode runs in: ocerz_g2h is identity there, so a guest
@@ -28,15 +31,15 @@
  * - Variadic functions.  Apple's arm64 ABI passes variadic arguments on the
  *   stack while x86-64 passes them in registers, so calling one through a
  *   fixed-arity prototype puts every argument in the wrong place.  printf, open,
- *   fcntl and ioctl are therefore not bridged here; they need per-function
- *   veneers that know where the fixed arguments stop.
+ *   fcntl and ioctl are therefore stub records, not bridged; they need
+ *   per-function veneers that know where the fixed arguments stop.
  * - A callback whose own signature takes a callback; abi.h describes what a
  *   callback argument can be and which threads it may run on.
  * - Structures passed or returned by value, which both ABIs split into pieces
  *   and classify differently; abi.h rejects a signature naming one.
  *
- * An export with no descriptor here is not an error: it falls back to naming
- * itself and stopping, which is what every export did before this layer existed.
+ * An export with no descriptor is not an error: it falls back to naming itself
+ * and stopping with OCERZ_BRIDGE_UNIMPL_EXIT.
  *
  * A crossing is also the only moment at which a thread the guest is driving is
  * running native code, so a fault taken during one is not the guest's fault the
@@ -61,16 +64,17 @@
  * there to restore.
  *
  * A virtual library stands for a native one, and the native one is found by the
- * install name they share.  ocerz_bridge_host_library opens it once and hands
- * back the handle, the process's default search scope for libSystem, and NULL for
- * an install name the bridge does not stand in for or a library that will not
- * open; ocerz_bridge_host_symbol looks a host symbol up inside it.  Both are safe
- * to call from any thread and cheap after the first call for a given library.
- * The virtual image builder uses the second for data exports that must be the
- * native variable itself rather than a copy of its value, and the bridge table
- * uses it for every function it resolves, so a function is always taken from the
- * library the guest named and never from whichever image happens to export the
- * name first.
+ * install name they share, and the bridge stands in for exactly the install
+ * names the API database has a file for.  ocerz_bridge_host_library opens the
+ * native library once and hands back the handle, the process's default search
+ * scope for libSystem, and NULL for an install name with no database file or a
+ * library that will not open; ocerz_bridge_host_symbol looks a host symbol up
+ * inside it.  Both are safe to call from any thread and cheap after the first
+ * call for a given library.  The virtual image builder uses the second for data
+ * records, whose export must be the native variable itself rather than a copy
+ * of its value, and the bridge uses it for every fn record it makes a descriptor
+ * from, so a function is always taken from the library the guest named and
+ * never from whichever image happens to export the name first.
  */
 #ifndef OCERZ_BRIDGE_H
 #define OCERZ_BRIDGE_H
