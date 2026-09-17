@@ -187,6 +187,18 @@
  * registration that would do nothing is not made at all.  Mapping the segments
  * and handing __TEXT back its protection is the whole of the work.
  *
+ * Native mode runs no libSystem initializer, so the initializer phase that
+ * cache mode gates on it never runs either, and for a while nothing ran a guest
+ * image's own initializers at all: a C constructor or a C++ static object's
+ * constructor was silently skipped.  Each guest image's __mod_init_func and
+ * __init_offsets entries now run just before main, after every +load, the
+ * dylibs in the reverse of the order they were loaded, so a library's
+ * dependencies are initialized before it, and the main image last.  dyld
+ * interleaves the two per image, +load then constructors, image by image; ocerz
+ * runs all +load methods first, a difference only a constructor that sends a
+ * message to a class in a later image could see.  Virtual images carry no
+ * initializers, so walking them costs a header scan.
+ *
  * A guest's main returns into a few bytes ocerz writes at the top of its stack.
  * In cache mode they make the exit syscall with main's result, since dyld's own
  * start has already been bypassed.  In native mode they call the virtual
@@ -196,14 +208,21 @@
  * taken if that export is missing.
  *
  * No x86 Objective-C runtime runs in native mode, so nothing canonicalizes a
- * guest image's selectors the way the translated runtime does in cache mode.
- * canonicalize_objc_selrefs hands each disk dylib, after its fixups, to
- * ocerz_objcbridge_fix_selrefs instead, which makes every selector reference the
- * host runtime's own SEL, and the main image gets the same pass right after the
- * unresolved-import report, before any guest code runs.  When the guest links
- * libobjc, ocerz's uncaught-exception handler is installed at that same point,
- * once every host framework the guest links has been opened and has installed
- * its own handler for ocerz's to chain to (objcbridge.h).
+ * guest image's selectors, or reads its classes, the way the translated runtime
+ * does in cache mode.  canonicalize_objc_selrefs hands each disk dylib, after
+ * its fixups, to ocerz_objcbridge_fix_selrefs instead, which makes every
+ * selector reference the host runtime's own SEL, and then to
+ * ocerz_objcbridge_define_image, which makes the image's protocols, classes and
+ * categories the host runtime's own and queues its +load methods; a dylib's
+ * dependencies are loaded, and so defined, before it.  The main image gets the
+ * same two passes right after the unresolved-import report, before any guest
+ * code runs.  When the guest links libobjc, ocerz's uncaught-exception handler
+ * is installed at that same point, once every host framework the guest links
+ * has been opened and has installed its own handler for ocerz's to chain to
+ * (objcbridge.h).  The queued +load methods run through
+ * ocerz_objcbridge_run_loads once the guest's thread block is in place and the
+ * handlers are installed, just before main, which is the first point guest code
+ * can run at all.
  *
  * ---- thread-local variables in native mode ----
  * Descriptors are rewritten into the same packed form as in cache mode, but the
@@ -2243,6 +2262,7 @@ static void canonicalize_objc_selrefs(DynImage *img)
     const uint8_t *h = (const uint8_t *)ocerz_g2h(img->load_base);
     if (ocerz_mode == OCERZ_MODE_NATIVE) {
         ocerz_objcbridge_fix_selrefs(h, slide);
+        ocerz_objcbridge_define_image(h, slide);
         return;
     }
     if (rd32(h) != MH_MAGIC_64)
@@ -2990,6 +3010,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     if (ocerz_mode == OCERZ_MODE_NATIVE) {
         native_tlv_register_loaded(img.load_base);
         ocerz_objcbridge_fix_selrefs((const uint8_t *)ocerz_g2h(img.load_base), img.slide);
+        ocerz_objcbridge_define_image((const uint8_t *)ocerz_g2h(img.load_base), img.slide);
         if (dimg_find_by_install_name(OCERZ_OBJC_LIBOBJC))
             ocerz_objcbridge_install_uncaught();
     }
@@ -3126,6 +3147,19 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         }
         if (ran_init)
             g_run_init_ready = 1;
+    }
+
+    if (ocerz_mode == OCERZ_MODE_NATIVE) {
+        ocerz_objcbridge_run_loads(vm, fr.stack_top);
+        if (vm->exited)
+            return vm->exit_code;
+        uint64_t nia[5] = { fr.argc, fr.argv_arr, fr.envp_arr, fr.apple_arr, fr.progvars };
+        for (int i = g_dimgs_n - 1; i >= 0 && !vm->exited; i--)
+            run_image_inits(vm, g_dimgs[i].load_base, nia, fr.stack_top);
+        if (!vm->exited)
+            run_image_inits(vm, img.load_base, nia, fr.stack_top);
+        if (vm->exited)
+            return vm->exit_code;
     }
 
     OCERZ_LOG("dynamic: load_base=%#llx slide=%#llx main=%#llx\n",

@@ -204,6 +204,72 @@
 # NSReturnAddress and NSCountFrames walk the calling thread's native frames,
 # which are ocerz's and not the guest's, so they name themselves the way the
 # unwinding calls in libSystem do.
+#
+# ---- CoreGraphics ----
+# Four constructors take a structure of callbacks and copy it when they create
+# the object: CGFunctionCreate, whose header says so in as many words ("the
+# contents of the callbacks structure is copied, so, for example, a pointer to
+# a structure on the stack can be passed to this function"), and
+# CGDataProviderCreateSequential, CGDataProviderCreateDirect and
+# CGPSConverterCreate, whose headers say nothing either way.  All four were
+# tested natively: a structure on the stack, rewritten with a second set of
+# functions right after the constructor returned, and the object then used -
+# drawing a shading, copying a provider's data, running a conversion - called
+# the first set every time.  So each has a shape and a struct record.  A
+# conversion produces no PDF on current macOS, which no longer reads
+# PostScript, but it still calls beginDocument and endDocument.
+#
+# The version word is not what CoreFoundation's is.  Every one of these
+# structures starts with an unsigned int version, four bytes, followed by four
+# bytes of padding before the first function pointer, and the bridge reads the
+# version as the whole first word.  clang zeroes that padding for a braced
+# initializer, and static storage starts zeroed, so either crosses.  A
+# structure filled in field by field on the stack is compiled to a four-byte
+# store into the version and nothing into the padding, so the high half holds
+# whatever the stack held, and the bridge then names the constructor and a
+# version it cannot convert and stops with 72.  That is a refusal, never a
+# wrong conversion: version 0 only matches when the high half is zero, and then
+# the structure really is version 0.
+#
+# Two callback structures stay stubbed.  CGDataConsumerCallbacks is copied too,
+# but it has no version word, so its first word is the putBytes pointer and no
+# shape can describe it.  CGPatternCreate copies its CGPatternCallbacks, and the
+# shape would be simple, but the structure pointer is its eighth argument,
+# behind a CGRect and a CGAffineTransform passed by value, and the bridge only
+# converts a structure argument it can find in an integer register with no
+# structure by value before it.
+#
+# ---- AppKit ----
+# AppKit's C functions are few, and most of them are drawing calls taking
+# rectangles by value, which cross by rule.  Two name themselves.
+#
+# NSApplicationMain is an application's whole launch.  Disassembled, it reads
+# NSPrincipalClass, NSMainNibFile and NSMainStoryboardFile out of the main
+# bundle's Info.plist, looks the principal class up by name, loads the main nib
+# or storyboard out of the main bundle, runs the application and ends the
+# process with a native exit.  The host's main bundle is ocerz's, a guest class
+# is not a name the native runtime can look up until a guest class is
+# registered with it, and a native exit skips the exit path ocerz ends the
+# guest through.  A guest that means to run has to set its application up by
+# messages until native mode gives it a main bundle of its own.
+# NSApplicationLoad crosses: disassembled, it only makes the shared
+# NSApplication, starts it and installs autorelease pools, the same messages a
+# guest can send itself.
+#
+# NSAccessibilityRaiseBadArgumentException exists to throw an Objective-C
+# exception, which cannot unwind through the guest frames between it and a
+# guest's @catch, so it names itself for the same reason objc_exception_throw
+# does.  The other NSAccessibility functions take and return objects, strings,
+# points and rectangles, and cross.
+#
+# Nothing else in AppKit's C interface hands native code a function pointer:
+# the delegate, selector and context of NSShowAnimationEffect are an object and
+# a selector like any target and action, the alert-sheet functions that also
+# take them are variadic and already stubs, and nothing takes a structure of
+# callbacks.  The private frameworks AppKit re-exports, UIFoundation and
+# CollectionViewCore, are folded into AppKit's exports and add classes,
+# constants and one declared function, UIFoundation's
+# NSConvertGlyphsToPackedGlyphs, which takes nothing but pointers and integers.
 
 library /usr/lib/libSystem.B.dylib
 
@@ -551,3 +617,20 @@ special _NSLog NSLog
 stub _NSFrameAddress override
 stub _NSReturnAddress override
 stub _NSCountFrames override
+
+library /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
+
+shape CGDataProviderDirectCallbacks 0 5 - p(p) v(pp) L(pplL) v(p)
+shape CGDataProviderSequentialCallbacks 0 5 - L(ppL) l(pl) v(p) v(p)
+shape CGFunctionCallbacks 0 3 - v(ppp) v(p)
+shape CGPSConverterCallbacks 0 8 - v(p) v(pB) v(pLp) v(pLp) v(p) v(pp) v(p)
+
+struct _CGDataProviderCreateDirect 2 CGDataProviderDirectCallbacks
+struct _CGDataProviderCreateSequential 1 CGDataProviderSequentialCallbacks
+struct _CGFunctionCreate 5 CGFunctionCallbacks
+struct _CGPSConverterCreate 1 CGPSConverterCallbacks
+
+library /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
+
+stub _NSApplicationMain override
+stub _NSAccessibilityRaiseBadArgumentException override

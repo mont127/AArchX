@@ -7,14 +7,21 @@
 # <name> is what tools/sdkgen.sh is given on its command line.  The database is
 # written for <install-name>, into the file named after its last component.
 # The .tbd is read for every document in it, and a library it re-exports is
-# folded into the export list when that library names a parent umbrella, which
-# is what marks the libraries under /usr/lib/system as parts of libSystem
-# rather than libraries of their own.  CoreFoundation re-exports libobjc, and
-# Foundation re-exports CoreFoundation and libobjc, none of which names an
-# umbrella, so each keeps its exports in its own file.
+# folded into the export list when a program linked against this one imports
+# that library's symbols by this one's ordinal: when it names a parent
+# umbrella, which is what marks the libraries under /usr/lib/system as parts of
+# libSystem rather than libraries of their own, or when its install name is
+# outside the public locations the linker links directly, which is what makes
+# UIFoundation and CollectionViewCore in /System/Library/PrivateFrameworks
+# parts of AppKit.  CoreFoundation re-exports libobjc, Foundation re-exports
+# CoreFoundation and libobjc, and AppKit re-exports Foundation and
+# ApplicationServices, all public, so each keeps its exports in its own file:
+# an x86_64 program linked against AppKit alone gets a load command of its own
+# for CoreGraphics, which ApplicationServices re-exports, and imports
+# CGContextFillRect from there.
 #
 # A library's headers are parsed as C unless it names objective-c, which
-# libobjc and Foundation do because their headers declare classes and
+# libobjc, Foundation and AppKit do because their headers declare classes and
 # protocols that plain C cannot parse.  The .layouts file records the language
 # so tools/sdkgen/layout_check.sh compiles its probe the same way.
 #
@@ -42,3 +49,10 @@ pass libobjc.h
 library Foundation /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation System/Library/Frameworks/Foundation.framework/Foundation.tbd
 language objective-c
 pass Foundation.h
+
+library CoreGraphics /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics System/Library/Frameworks/CoreGraphics.framework/CoreGraphics.tbd
+pass CoreGraphics.h
+
+library AppKit /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit System/Library/Frameworks/AppKit.framework/AppKit.tbd
+language objective-c
+pass AppKit.h

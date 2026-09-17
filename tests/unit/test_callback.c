@@ -3,7 +3,7 @@
  * function pointer needs to take it at all.
  *
  * Five things are asserted before any guest code runs.  The bank:
- * ocerz_abi_callback_bank to ocerz_abi_callback_bank_end is exactly 4096 slots
+ * ocerz_abi_callback_bank to ocerz_abi_callback_bank_end is exactly 65536 slots
  * of eight bytes, which is what lets a slot find its own index from its own
  * address.  The notation: an argument of class c carries its callback's own
  * signature in braces, stored against that argument's index with every other
@@ -102,7 +102,7 @@
  *
  * Exhaustion runs last among the interning checks because it cannot be undone.
  * Distinct functions are interned until the bank refuses, which must happen at
- * exactly 4096 slots counting the ones the earlier checks took, with no address
+ * exactly 65536 slots counting the ones the earlier checks took, with no address
  * handed out twice, and a pair interned before the bank filled must still get
  * its own address back afterwards.  A refused notation that quietly consumed a
  * slot shows up here as the bank running out early.  With the bank full,
@@ -139,7 +139,7 @@
 #include <sys/mman.h>
 
 #define ARENA       (4ull << 30)
-#define BANK_SLOTS  4096u
+#define BANK_SLOTS  65536u
 #define BANK_STRIDE 8u
 #define FN_A        0x0000000100004000ull
 #define FN_B        0x0000000100004010ull
@@ -245,11 +245,11 @@ static void test_bank(void)
     CHECK(bank_hi() > bank_lo(),
           "the bank ends at %p, which is not after its start %p",
           (void *)bank_hi(), (void *)bank_lo());
-    CHECK(span == 4096u * 8u,
-          "the bank spans %llu bytes, want 4096 slots of 8 bytes, %u",
-          (unsigned long long)span, 4096u * 8u);
-    CHECK(OCERZ_ABI_CALLBACK_SLOTS == 4096 && OCERZ_ABI_CALLBACK_STRIDE == 8,
-          "abi.h declares %d slots of %d bytes, want 4096 of 8",
+    CHECK(span == 65536u * 8u,
+          "the bank spans %llu bytes, want 65536 slots of 8 bytes, %u",
+          (unsigned long long)span, 65536u * 8u);
+    CHECK(OCERZ_ABI_CALLBACK_SLOTS == 65536 && OCERZ_ABI_CALLBACK_STRIDE == 8,
+          "abi.h declares %d slots of %d bytes, want 65536 of 8",
           (int)OCERZ_ABI_CALLBACK_SLOTS, (int)OCERZ_ABI_CALLBACK_STRIDE);
 }
 

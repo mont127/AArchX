@@ -32,7 +32,47 @@
  * guest stack, arguments where System V puts them.  Nil receivers must zero every
  * result register, a nil _stret send must leave its memory alone and a nil super
  * _stret send must zero exactly the structure.  Every refusal runs in a forked
- * child, whose status must be 72 and whose stderr must name the reason.
+ * child, whose status must be 72 and whose stderr must name the reason.  A
+ * native class whose forwardingTargetForSelector: answers a string, and a
+ * second whose target forwards again, must have their sends crossed under the
+ * signature of the object that finally has the method.
+ *
+ * Guest definitions start with the layout readers, run over structures written
+ * into guest memory: a class_ro_t whose every byte differs, so a field read at
+ * the wrong offset reads the wrong bytes; a class_t with each Swift bit; an
+ * absolute method list with its fixed-up bits set; a relative one whose
+ * implementation offset is negative, whose last implementation offset is zero,
+ * and whose selectors are then made direct; lists of entries too small for
+ * their kind; ivar, property and protocol lists; category_t with and without
+ * class properties; protocol_t of 96 bytes and of 72.  The x86 type converter
+ * is a table of what an x86 compiler writes, BOOL as c and long as q among it,
+ * and of what it refuses, types without self and _cmd included.  Property
+ * attributes are split, and too many or too long refused.  Superclass ordering
+ * runs over two chains listed subclass first, a loop, and a class that is its
+ * own superclass.
+ *
+ * A synthetic image then goes through ocerz_objcbridge_define_image against the
+ * real runtime.  It has guest copies of NSObject and NSCopying and a protocol of
+ * its own with a method and a property; a class whose instance start is 4, so
+ * its two ivar offset variables must be slid past NSObject's 8 bytes by an
+ * 8-aligned 8, and written in their low halves only, since the upper half of
+ * one is poisoned; its subclass, listed first; a method whose long double
+ * keeps its class but is bound to the named refusal; a category on NSString
+ * with an instance method, a class method, a property and the protocol; a
+ * category on the guest class replacing one of its methods; protocol
+ * references; and a +load in both classes and in the NSString category, each a
+ * few bytes of x86 that count and record the class they were called with.  The
+ * runtime must find both classes by name at the guest's own addresses with the
+ * guest's metaclasses, every implementation must be a slot bound to the guest's
+ * function under the converted notation, two slots of one notation must share
+ * one parsed signature, the protocols must be native and the references
+ * rewritten to them, a second definition of the image must define nothing, and
+ * the +load methods must run superclass first, then the class the non-lazy list
+ * names, then the category, each with its class in rdi.  Each class refusal
+ * runs in a forked child that must exit 72 naming it: a root class, a class
+ * with a null superclass, a superclass that is a guest class never defined, a Swift class, a loop, a
+ * category on an undefined guest class, a long double method called natively,
+ * and a method defined after the bank was filled, called natively.
  *
  * The database is a directory the test writes for itself, one file per library
  * naming nothing but the library, because the bridge opens a host library only
@@ -1289,6 +1329,885 @@ static void test_callables_allowed(void)
           "a block whose invoke is native code is not refused, and an empty array never calls it: %s", err);
 }
 
+static void *g_forward_target;
+
+static void *forward_target_imp(void *self, void *cmd, void *selector)
+{
+    return g_forward_target;
+}
+
+static void *chain_target_imp(void *self, void *cmd, void *selector)
+{
+    return nsstr("forwarded twice");
+}
+
+static void test_forwarding_target(void)
+{
+    void *(*allocate)(void *, const char *, size_t) = dlsym(RTLD_DEFAULT, "objc_allocateClassPair");
+    bool (*add_method)(void *, void *, void *, const char *) = dlsym(RTLD_DEFAULT, "class_addMethod");
+    void (*register_pair)(void *) = dlsym(RTLD_DEFAULT, "objc_registerClassPair");
+    void *nsobject = cls("NSObject");
+
+    void *fwd = allocate(nsobject, "OcerzForwarder", 0);
+    add_method(fwd, sel("forwardingTargetForSelector:"), (void *)forward_target_imp, "@24@0:8:16");
+    register_pair(fwd);
+    void *chain = allocate(nsobject, "OcerzForwarderChain", 0);
+    add_method(chain, sel("forwardingTargetForSelector:"), (void *)chain_target_imp, "@24@0:8:16");
+    register_pair(chain);
+
+    void *obj = ((void *(*)(void *, void *))objc_msgSend_)(fwd, sel("new"));
+    g_forward_target = nsstr("five!");
+    OcerzCPU *cpu = fresh_cpu();
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    cpu->gpr[OCERZ_RDI] = ocerz_h2g(obj);
+    cpu->gpr[OCERZ_RSI] = ocerz_h2g(sel("length"));
+    CHECK(ocerz_objc_msgSend(&vm, cpu) == OCERZ_STEP_OK && returned(cpu, rsp) && cpu->gpr[OCERZ_RAX] == 5,
+          "a send the receiver forwards to a target takes the target's signature: -length answers %llu",
+          (unsigned long long)cpu->gpr[OCERZ_RAX]);
+
+    g_forward_target = ((void *(*)(void *, void *))objc_msgSend_)(chain, sel("new"));
+    cpu = fresh_cpu();
+    cpu->gpr[OCERZ_RDI] = ocerz_h2g(obj);
+    cpu->gpr[OCERZ_RSI] = ocerz_h2g(sel("rangeOfString:"));
+    cpu->gpr[OCERZ_RDX] = ocerz_h2g(nsstr("twice"));
+    ocerz_objc_msgSend(&vm, cpu);
+    CHECK(cpu->gpr[OCERZ_RAX] == 10 && cpu->gpr[OCERZ_RDX] == 5,
+          "a target that forwards again is followed to the object with the method: {%llu, %llu}",
+          (unsigned long long)cpu->gpr[OCERZ_RAX], (unsigned long long)cpu->gpr[OCERZ_RDX]);
+}
+
+typedef struct Syn {
+    uint64_t base;
+    uint64_t at;
+    uint64_t size;
+    int nsect;
+    char sectname[16][17];
+    uint64_t sectaddr[16];
+    uint64_t sectsize[16];
+} Syn;
+
+#define SYN_SPAN 0x10000ull
+#define SYN_HEADER 0x800ull
+
+static void syn_init(Syn *s)
+{
+    memset(s, 0, sizeof *s);
+    s->base = ocerz_map_anywhere(SYN_SPAN, PROT_READ | PROT_WRITE);
+    if (!s->base) {
+        fprintf(stderr, "synthetic image alloc failed\n");
+        exit(2);
+    }
+    memset(ocerz_g2h(s->base), 0, SYN_SPAN);
+    s->size = SYN_SPAN;
+    s->at = SYN_HEADER;
+}
+
+static uint64_t syn_alloc(Syn *s, uint64_t n)
+{
+    uint64_t a = s->base + s->at;
+    s->at = (s->at + n + 7) & ~7ull;
+    if (s->at > s->size) {
+        fprintf(stderr, "synthetic image overflow\n");
+        exit(2);
+    }
+    return a;
+}
+
+static uint64_t syn_str(Syn *s, const char *str)
+{
+    uint64_t a = syn_alloc(s, strlen(str) + 1);
+    strcpy(ocerz_g2h(a), str);
+    return a;
+}
+
+static void syn_w(uint64_t addr, int size, uint64_t v)
+{
+    ocerz_st(addr, size, v);
+}
+
+typedef struct SynMethod {
+    const char *name;
+    const char *types;
+    uint64_t imp;
+} SynMethod;
+
+static uint64_t syn_methods(Syn *s, const SynMethod *m, int n)
+{
+    if (n == 0)
+        return 0;
+    uint64_t list = syn_alloc(s, 8 + 24 * (uint64_t)n);
+    syn_w(list, 4, 24);
+    syn_w(list + 4, 4, (uint64_t)n);
+    for (int i = 0; i < n; i++) {
+        syn_w(list + 8 + 24 * (uint64_t)i, 8, syn_str(s, m[i].name));
+        syn_w(list + 16 + 24 * (uint64_t)i, 8, m[i].types ? syn_str(s, m[i].types) : 0);
+        syn_w(list + 24 + 24 * (uint64_t)i, 8, m[i].imp);
+    }
+    return list;
+}
+
+static uint64_t syn_refs(Syn *s, const uint64_t *refs, int n)
+{
+    uint64_t list = syn_alloc(s, 8 + 8 * (uint64_t)n);
+    syn_w(list, 8, (uint64_t)n);
+    for (int i = 0; i < n; i++)
+        syn_w(list + 8 + 8 * (uint64_t)i, 8, refs[i]);
+    return list;
+}
+
+static uint64_t syn_props(Syn *s, const char *const *pairs, int n)
+{
+    uint64_t list = syn_alloc(s, 8 + 16 * (uint64_t)n);
+    syn_w(list, 4, 16);
+    syn_w(list + 4, 4, (uint64_t)n);
+    for (int i = 0; i < n; i++) {
+        syn_w(list + 8 + 16 * (uint64_t)i, 8, syn_str(s, pairs[2 * i]));
+        syn_w(list + 16 + 16 * (uint64_t)i, 8, syn_str(s, pairs[2 * i + 1]));
+    }
+    return list;
+}
+
+static uint64_t syn_protocol(Syn *s, const char *name, uint64_t adopted, uint64_t required, uint64_t props,
+                             uint32_t size)
+{
+    uint64_t p = syn_alloc(s, 96);
+    syn_w(p + 8, 8, syn_str(s, name));
+    syn_w(p + 16, 8, adopted);
+    syn_w(p + 24, 8, required);
+    syn_w(p + 56, 8, props);
+    syn_w(p + 64, 4, size);
+    return p;
+}
+
+typedef struct SynClass {
+    const char *name;
+    uint64_t super;
+    uint64_t supermeta;
+    uint32_t flags;
+    uint32_t start;
+    uint32_t size;
+    uint64_t imethods;
+    uint64_t cmethods;
+    uint64_t ivars;
+    uint64_t protocols;
+    uint64_t props;
+    uint64_t swift_bits;
+} SynClass;
+
+static uint64_t syn_class(Syn *s, const SynClass *c, uint64_t *meta_out)
+{
+    uint64_t name = syn_str(s, c->name);
+    uint64_t klass = syn_alloc(s, 40), meta = syn_alloc(s, 40);
+    uint64_t ro = syn_alloc(s, 72), mro = syn_alloc(s, 72);
+    syn_w(ro, 4, c->flags);
+    syn_w(ro + 4, 4, c->start);
+    syn_w(ro + 8, 4, c->size);
+    syn_w(ro + 24, 8, name);
+    syn_w(ro + 32, 8, c->imethods);
+    syn_w(ro + 40, 8, c->protocols);
+    syn_w(ro + 48, 8, c->ivars);
+    syn_w(ro + 64, 8, c->props);
+    syn_w(mro, 4, c->flags | 1);
+    syn_w(mro + 4, 4, 40);
+    syn_w(mro + 8, 4, 40);
+    syn_w(mro + 24, 8, name);
+    syn_w(mro + 32, 8, c->cmethods);
+    syn_w(mro + 40, 8, c->protocols);
+    syn_w(klass, 8, meta);
+    syn_w(klass + 8, 8, c->super);
+    syn_w(klass + 24, 8, 0x1122334455667788ull);
+    syn_w(klass + 32, 8, ro | c->swift_bits);
+    syn_w(meta, 8, ocerz_h2g(object_getClass_(cls("NSObject"))));
+    syn_w(meta + 8, 8, c->supermeta);
+    syn_w(meta + 32, 8, mro);
+    if (meta_out)
+        *meta_out = meta;
+    return klass;
+}
+
+static uint64_t syn_category(Syn *s, const char *name, uint64_t cls, uint64_t imethods, uint64_t cmethods,
+                             uint64_t protocols, uint64_t props)
+{
+    uint64_t cat = syn_alloc(s, 56);
+    syn_w(cat, 8, syn_str(s, name));
+    syn_w(cat + 8, 8, cls);
+    syn_w(cat + 16, 8, imethods);
+    syn_w(cat + 24, 8, cmethods);
+    syn_w(cat + 32, 8, protocols);
+    syn_w(cat + 40, 8, props);
+    return cat;
+}
+
+static void syn_section(Syn *s, const char *name, const uint64_t *words, int n)
+{
+    uint64_t addr = syn_alloc(s, 8 * (uint64_t)n);
+    for (int i = 0; i < n; i++)
+        syn_w(addr + 8 * (uint64_t)i, 8, words[i]);
+    snprintf(s->sectname[s->nsect], sizeof s->sectname[0], "%s", name);
+    s->sectaddr[s->nsect] = addr;
+    s->sectsize[s->nsect] = 8 * (uint64_t)n;
+    s->nsect++;
+}
+
+static const uint8_t *syn_header(Syn *s, const char *segname)
+{
+    uint8_t *img = ocerz_g2h(s->base);
+    struct mach_header_64 h = { .magic = MH_MAGIC_64, .filetype = MH_DYLIB, .ncmds = 1 };
+    struct segment_command_64 seg = { .cmd = LC_SEGMENT_64, .nsects = (uint32_t)s->nsect };
+    seg.cmdsize = (uint32_t)(sizeof seg + (size_t)s->nsect * sizeof(struct section_64));
+    snprintf(seg.segname, sizeof seg.segname, "%s", segname);
+    h.sizeofcmds = seg.cmdsize;
+    memcpy(img, &h, sizeof h);
+    memcpy(img + sizeof h, &seg, sizeof seg);
+    for (int i = 0; i < s->nsect; i++) {
+        struct section_64 sc = { .addr = s->sectaddr[i], .size = s->sectsize[i] };
+        memcpy(sc.sectname, s->sectname[i], strnlen(s->sectname[i], 16));
+        memcpy(sc.segname, segname, strlen(segname));
+        memcpy(img + sizeof h + sizeof seg + (size_t)i * sizeof sc, &sc, sizeof sc);
+    }
+    return img;
+}
+
+static void test_class_layouts(void)
+{
+    Syn s;
+    syn_init(&s);
+
+    uint64_t ro = syn_alloc(&s, 72);
+    for (int i = 0; i < 72; i++)
+        syn_w(ro + (uint64_t)i, 1, (uint64_t)(0x10 + i));
+    OcerzObjcRo r;
+    CHECK(ocerz_objc_read_ro(ro, &r) == OCERZ_OBJC_OK && r.flags == 0x13121110u && r.instance_start == 0x17161514u &&
+              r.instance_size == 0x1b1a1918u && r.reserved == 0x1f1e1d1cu &&
+              r.ivar_layout == 0x2726252423222120ull && r.name == 0x2f2e2d2c2b2a2928ull &&
+              r.base_methods == 0x3736353433323130ull && r.base_protocols == 0x3f3e3d3c3b3a3938ull &&
+              r.ivars == 0x4746454443424140ull && r.weak_ivar_layout == 0x4f4e4d4c4b4a4948ull &&
+              r.base_properties == 0x5756555453525150ull,
+          "class_ro_t is read field by field at its LP64 offsets");
+    syn_w(ro, 4, 0x40);
+    CHECK(ocerz_objc_read_ro(ro, &r) == OCERZ_OBJC_SWIFT,
+          "a class_ro_t with a Swift metadata initializer is a Swift class");
+    CHECK(ocerz_objc_read_ro(0, &r) == OCERZ_OBJC_NULL, "a null class_ro_t");
+
+    uint64_t cl = syn_alloc(&s, 40);
+    syn_w(cl, 8, 0x1111);
+    syn_w(cl + 8, 8, 0x2222);
+    syn_w(cl + 16, 8, 0x3333);
+    syn_w(cl + 24, 8, 0x4444);
+    syn_w(cl + 32, 8, ro);
+    OcerzObjcClass c;
+    CHECK(ocerz_objc_read_class(cl, &c) == OCERZ_OBJC_OK && c.isa == 0x1111 && c.superclass == 0x2222 &&
+              c.cache == 0x3333 && c.vtable == 0x4444 && c.ro == ro && c.swift == 0,
+          "class_t is isa, superclass, cache, vtable and bits");
+    syn_w(cl + 32, 8, ro | 1);
+    CHECK(ocerz_objc_read_class(cl, &c) == OCERZ_OBJC_SWIFT && c.ro == ro, "bits with the legacy Swift bit");
+    syn_w(cl + 32, 8, ro | 2);
+    CHECK(ocerz_objc_read_class(cl, &c) == OCERZ_OBJC_SWIFT && c.swift == 2, "bits with the stable Swift bit");
+    syn_w(cl + 32, 8, 0);
+    CHECK(ocerz_objc_read_class(cl, &c) == OCERZ_OBJC_NULL, "a class with no class_ro_t");
+
+    uint64_t n0 = syn_str(&s, "alpha"), n1 = syn_str(&s, "beta:"), t0 = syn_str(&s, "c24@0:8@16"),
+             t1 = syn_str(&s, "v16@0:8");
+    uint64_t abs = syn_alloc(&s, 8 + 2 * 24);
+    syn_w(abs, 4, 24 | 3);
+    syn_w(abs + 4, 4, 2);
+    syn_w(abs + 8, 8, n0);
+    syn_w(abs + 16, 8, t0);
+    syn_w(abs + 24, 8, 0xaaaa);
+    syn_w(abs + 32, 8, n1);
+    syn_w(abs + 40, 8, t1);
+    syn_w(abs + 48, 8, 0xbbbb);
+    OcerzObjcList l;
+    OcerzObjcMethod m;
+    CHECK(ocerz_objc_method_list(abs, &l) == OCERZ_OBJC_OK && l.count == 2 && l.entsize == 24 && l.flags == 3,
+          "an absolute method list with its fixed-up bits: entsize %u count %u flags %#x", l.entsize, l.count, l.flags);
+    CHECK(ocerz_objc_method_at(&l, 1, &m) == OCERZ_OBJC_OK && m.name == n1 && m.types == t1 && m.imp == 0xbbbb,
+          "an absolute method entry is name, types and imp words");
+    CHECK(ocerz_objc_method_at(&l, 2, &m) == OCERZ_OBJC_BAD_LIST, "an index past the count");
+    syn_w(abs, 4, 16);
+    CHECK(ocerz_objc_method_list(abs, &l) == OCERZ_OBJC_BAD_LIST, "an absolute list of 16-byte entries is refused");
+    CHECK(ocerz_objc_method_list(0, &l) == OCERZ_OBJC_OK && l.count == 0, "no list is an empty list");
+
+    uint64_t selref = syn_alloc(&s, 8);
+    syn_w(selref, 8, n0);
+    uint64_t imp_target = s.base + 0x40;
+    uint64_t rel = syn_alloc(&s, 8 + 2 * 12);
+    syn_w(rel, 4, 0x80000000u | 12);
+    syn_w(rel + 4, 4, 2);
+    syn_w(rel + 8, 4, (uint32_t)(int32_t)(selref - (rel + 8)));
+    syn_w(rel + 12, 4, (uint32_t)(int32_t)(t0 - (rel + 12)));
+    syn_w(rel + 16, 4, (uint32_t)(int32_t)(int64_t)(imp_target - (rel + 16)));
+    syn_w(rel + 20, 4, (uint32_t)(int32_t)(selref - (rel + 20)));
+    syn_w(rel + 24, 4, (uint32_t)(int32_t)(t1 - (rel + 24)));
+    syn_w(rel + 28, 4, 0);
+    CHECK(ocerz_objc_method_list(rel, &l) == OCERZ_OBJC_OK && l.entsize == 12 && l.count == 2,
+          "a relative method list");
+    CHECK(ocerz_objc_method_at(&l, 0, &m) == OCERZ_OBJC_OK && m.name == n0 && m.types == t0 && m.imp == imp_target,
+          "a relative entry's name goes through its selector reference, its types and imp are offsets, and the imp"
+          " offset is negative: name %#llx types %#llx imp %#llx", (unsigned long long)m.name,
+          (unsigned long long)m.types, (unsigned long long)m.imp);
+    CHECK(ocerz_objc_method_at(&l, 1, &m) == OCERZ_OBJC_OK && m.imp == 0, "a zero imp offset is no imp");
+    syn_w(rel, 4, 0xc0000000u | 12);
+    syn_w(rel + 8, 4, (uint32_t)(int32_t)(n1 - (rel + 8)));
+    CHECK(ocerz_objc_method_list(rel, &l) == OCERZ_OBJC_OK && ocerz_objc_method_at(&l, 0, &m) == OCERZ_OBJC_OK &&
+              m.name == n1, "a relative list with direct selectors names its string itself");
+    syn_w(rel, 4, 0x80000000u | 24);
+    CHECK(ocerz_objc_method_list(rel, &l) == OCERZ_OBJC_BAD_LIST, "a relative list of 24-byte entries is refused");
+
+    uint64_t off = syn_alloc(&s, 8), iname = syn_str(&s, "_count"), itype = syn_str(&s, "i");
+    uint64_t ivars = syn_alloc(&s, 8 + 32);
+    syn_w(ivars, 4, 32);
+    syn_w(ivars + 4, 4, 1);
+    syn_w(ivars + 8, 8, off);
+    syn_w(ivars + 16, 8, iname);
+    syn_w(ivars + 24, 8, itype);
+    syn_w(ivars + 32, 4, 2);
+    syn_w(ivars + 36, 4, 4);
+    OcerzObjcIvar iv;
+    CHECK(ocerz_objc_ivar_list(ivars, &l) == OCERZ_OBJC_OK && ocerz_objc_ivar_at(&l, 0, &iv) == OCERZ_OBJC_OK &&
+              iv.offset == off && iv.name == iname && iv.type == itype && iv.alignment == 2 && iv.size == 4,
+          "an ivar entry is offset pointer, name, type, alignment and size");
+    syn_w(ivars, 4, 24);
+    CHECK(ocerz_objc_ivar_list(ivars, &l) == OCERZ_OBJC_BAD_LIST, "an ivar list of 24-byte entries is refused");
+
+    static const char *const kProps[] = { "name", "T@\"NSString\",C,N,V_name" };
+    uint64_t props = syn_props(&s, kProps, 1);
+    OcerzObjcProperty pr;
+    CHECK(ocerz_objc_property_list(props, &l) == OCERZ_OBJC_OK && ocerz_objc_property_at(&l, 0, &pr) == OCERZ_OBJC_OK &&
+              strcmp(ocerz_g2h(pr.name), "name") == 0 && strcmp(ocerz_g2h(pr.attributes), kProps[1]) == 0,
+          "a property entry is name and attributes");
+
+    uint64_t refs[3] = { 0x10, 0x20, 0x30 };
+    uint64_t plist = syn_refs(&s, refs, 3);
+    CHECK(ocerz_objc_protocol_count(plist) == 3 && ocerz_objc_protocol_ref(plist, 2) == 0x30 &&
+              ocerz_objc_protocol_count(0) == 0, "a protocol list is a 64-bit count and its references");
+
+    uint64_t cat = syn_alloc(&s, 56);
+    for (int i = 0; i < 7; i++)
+        syn_w(cat + 8 * (uint64_t)i, 8, 0x100 + (uint64_t)i);
+    OcerzObjcCategory ct;
+    CHECK(ocerz_objc_read_category(cat, 1, &ct) == OCERZ_OBJC_OK && ct.name == 0x100 && ct.cls == 0x101 &&
+              ct.instance_methods == 0x102 && ct.class_methods == 0x103 && ct.protocols == 0x104 &&
+              ct.instance_properties == 0x105 && ct.class_properties == 0x106,
+          "category_t with class properties");
+    CHECK(ocerz_objc_read_category(cat, 0, &ct) == OCERZ_OBJC_OK && ct.class_properties == 0,
+          "category_t from an image whose info says it has no class properties");
+
+    uint64_t proto = syn_alloc(&s, 96);
+    for (int i = 0; i < 12; i++)
+        syn_w(proto + 8 * (uint64_t)i, 8, 0x200 + (uint64_t)i);
+    syn_w(proto + 64, 4, 96);
+    syn_w(proto + 68, 4, 5);
+    OcerzObjcProtocol pt;
+    CHECK(ocerz_objc_read_protocol(proto, &pt) == OCERZ_OBJC_OK && pt.name == 0x201 && pt.protocols == 0x202 &&
+              pt.instance_methods == 0x203 && pt.class_methods == 0x204 && pt.optional_instance_methods == 0x205 &&
+              pt.optional_class_methods == 0x206 && pt.instance_properties == 0x207 && pt.size == 96 &&
+              pt.flags == 5 && pt.extended_types == 0x209 && pt.demangled_name == 0x20a &&
+              pt.class_properties == 0x20b,
+          "protocol_t of 96 bytes");
+    syn_w(proto + 64, 4, 72);
+    CHECK(ocerz_objc_read_protocol(proto, &pt) == OCERZ_OBJC_OK && pt.extended_types == 0 && pt.class_properties == 0,
+          "protocol_t of 72 bytes has no fields past its size");
+}
+
+typedef struct GuestNotation {
+    const char *types;
+    int rc;
+    const char *notation;
+} GuestNotation;
+
+static const GuestNotation kGuestNotations[] = {
+    { "c24@0:8@16", OCERZ_OBJC_OK, "b(ppp)" },
+    { "v20@0:8c16", OCERZ_OBJC_OK, "v(ppb)" },
+    { "q16@0:8", OCERZ_OBJC_OK, "l(pp)" },
+    { "Q16@0:8", OCERZ_OBJC_OK, "L(pp)" },
+    { "v24@0:8q16", OCERZ_OBJC_OK, "v(ppl)" },
+    { "@24@0:8^{_NSZone=}16", OCERZ_OBJC_OK, "p(ppp)" },
+    { "c56@0:8q16{CGRect={CGPoint=dd}{CGSize=dd}}24", OCERZ_OBJC_OK, "b(ppl{{dd}{dd}})" },
+    { "v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16", OCERZ_OBJC_OK, "v(pp{{dd}{dd}})" },
+    { "{_NSRange=QQ}16@0:8", OCERZ_OBJC_OK, "{LL}(pp)" },
+    { "#16@0:8", OCERZ_OBJC_OK, "p(pp)" },
+    { "Vv16@0:8", OCERZ_OBJC_OK, "v(pp)" },
+    { "v24@0:8@?16", OCERZ_OBJC_OK, "v(ppp)" },
+    { "i20@0:8i16", OCERZ_OBJC_OK, "i(ppi)" },
+    { "D16@0:8", OCERZ_OBJC_LONG_DOUBLE, NULL },
+    { "v32@0:8D16", OCERZ_OBJC_LONG_DOUBLE, NULL },
+    { "i8i0i4", OCERZ_OBJC_NOT_METHOD, NULL },
+    { "v8@0", OCERZ_OBJC_NOT_METHOD, NULL },
+    { "v24@0:8(?=iq)16", OCERZ_OBJC_UNION, NULL },
+    { "", OCERZ_OBJC_MALFORMED, NULL },
+};
+
+static void test_guest_notation(void)
+{
+    for (size_t i = 0; i < sizeof kGuestNotations / sizeof kGuestNotations[0]; i++) {
+        const GuestNotation *g = &kGuestNotations[i];
+        char out[OCERZ_OBJC_NOTATION_MAX];
+        int rc = ocerz_objc_method_notation(g->types, out, sizeof out);
+        CHECK(rc == g->rc, "x86 types %s: %s, want %s", g->types, ocerz_objc_refusal(rc), ocerz_objc_refusal(g->rc));
+        if (rc == OCERZ_OBJC_OK && g->notation)
+            CHECK(strcmp(out, g->notation) == 0, "x86 types %s give %s, want %s", g->types, out, g->notation);
+    }
+    for (int i = OCERZ_OBJC_NOT_METHOD; i <= OCERZ_OBJC_CYCLE; i++)
+        CHECK(ocerz_objc_refusal(i) && *ocerz_objc_refusal(i) &&
+                  strcmp(ocerz_objc_refusal(i), ocerz_objc_refusal(99)) != 0,
+              "class refusal %d has words of its own", i);
+
+    OcerzObjcAttribute a[8];
+    char storage[128];
+    int n = ocerz_objc_property_attributes("T@\"NSString\",C,N,V_name", a, 8, storage, sizeof storage);
+    CHECK(n == 4 && strcmp(a[0].name, "T") == 0 && strcmp(a[0].value, "@\"NSString\"") == 0 &&
+              strcmp(a[1].name, "C") == 0 && strcmp(a[1].value, "") == 0 && strcmp(a[2].name, "N") == 0 &&
+              strcmp(a[3].name, "V") == 0 && strcmp(a[3].value, "_name") == 0,
+          "property attributes split at commas, one letter of name each, got %d", n);
+    n = ocerz_objc_property_attributes("T{CGRect={CGPoint=dd}{CGSize=dd}},R", a, 8, storage, sizeof storage);
+    CHECK(n == 2 && strcmp(a[0].value, "{CGRect={CGPoint=dd}{CGSize=dd}}") == 0 && strcmp(a[1].name, "R") == 0,
+          "a structure type attribute");
+    CHECK(ocerz_objc_property_attributes("", a, 8, storage, sizeof storage) == 0 &&
+              ocerz_objc_property_attributes(NULL, a, 8, storage, sizeof storage) == 0,
+          "no attributes");
+    CHECK(ocerz_objc_property_attributes("Ti,N,R,C,&,W,D,P,G_g,S_s:", a, 4, storage, sizeof storage) == -1,
+          "more attributes than the caller has room for");
+    CHECK(ocerz_objc_property_attributes("T@\"AVeryLongClassNameThatDoesNotFit\"", a, 8, storage, 16) == -1,
+          "attributes longer than the storage");
+}
+
+static void test_class_order(void)
+{
+    uint64_t classes[6] = { 0x60, 0x50, 0x40, 0x30, 0x20, 0x10 };
+    uint64_t supers[6] = { 0x50, 0x40, 0x9000, 0x20, 0x10, 0x9000 };
+    int order[6], culprit;
+    CHECK(ocerz_objc_class_order(classes, supers, 6, order, &culprit) == OCERZ_OBJC_OK && culprit == -1,
+          "two chains listed subclass first order");
+    int pos[6];
+    for (int i = 0; i < 6; i++)
+        pos[order[i]] = i;
+    int ok = 1, seen[6] = { 0 };
+    for (int i = 0; i < 6; i++) {
+        seen[order[i]]++;
+        for (int j = 0; j < 6; j++)
+            if (supers[i] == classes[j] && pos[j] > pos[i])
+                ok = 0;
+    }
+    for (int i = 0; i < 6; i++)
+        ok = ok && seen[i] == 1;
+    CHECK(ok, "every class comes after its superclass and exactly once: %d %d %d %d %d %d", order[0], order[1],
+          order[2], order[3], order[4], order[5]);
+    CHECK(order[0] == 2 && order[1] == 1 && order[2] == 0,
+          "a chain whose root is native starts at the class nearest the root");
+
+    uint64_t cyc[3] = { 0x10, 0x20, 0x30 }, cycs[3] = { 0x20, 0x30, 0x10 };
+    CHECK(ocerz_objc_class_order(cyc, cycs, 3, order, &culprit) == OCERZ_OBJC_CYCLE && culprit >= 0 && culprit < 3,
+          "a chain of superclasses that comes back to itself");
+    uint64_t self_c[2] = { 0x10, 0x20 }, self_s[2] = { 0, 0x20 };
+    CHECK(ocerz_objc_class_order(self_c, self_s, 2, order, &culprit) == OCERZ_OBJC_CYCLE && culprit == 1,
+          "a class that is its own superclass");
+    CHECK(ocerz_objc_class_order(NULL, NULL, 0, order, &culprit) == OCERZ_OBJC_OK, "no classes");
+}
+
+static uint64_t load_stub(Syn *s, uint64_t counter, uint64_t slot, uint64_t who)
+{
+    static const uint8_t kStub[] = {
+        0x48, 0x8b, 0x05, 0, 0, 0, 0,
+        0x48, 0xff, 0xc0,
+        0x48, 0x89, 0x05, 0, 0, 0, 0,
+        0x48, 0x89, 0x05, 0, 0, 0, 0,
+        0x48, 0x89, 0x3d, 0, 0, 0, 0,
+        0xc3,
+    };
+    uint64_t code = syn_alloc(s, sizeof kStub);
+    uint8_t *p = ocerz_g2h(code);
+    memcpy(p, kStub, sizeof kStub);
+    int32_t d;
+    d = (int32_t)(counter - (code + 7));
+    memcpy(p + 3, &d, 4);
+    d = (int32_t)(counter - (code + 17));
+    memcpy(p + 13, &d, 4);
+    d = (int32_t)(slot - (code + 24));
+    memcpy(p + 20, &d, 4);
+    d = (int32_t)(who - (code + 31));
+    memcpy(p + 27, &d, 4);
+    return code;
+}
+
+typedef struct DefinedImage {
+    Syn s;
+    uint64_t base, base_meta, sub, sub_meta;
+    uint64_t off_count, off_obj;
+    uint64_t guest_proto, guest_copying, protoref_proto, protoref_copying;
+    uint64_t imp_count, imp_sub_count, imp_cat_count, imp_equal, imp_long_double, imp_make, imp_reverse;
+    uint64_t counter, slot[3], who[3];
+} DefinedImage;
+
+static void build_defined_image(DefinedImage *d)
+{
+    Syn *s = &d->s;
+    syn_init(s);
+    uint64_t guest = s->base + 0x100;
+    d->imp_count = guest + 0x10;
+    d->imp_sub_count = guest + 0x20;
+    d->imp_cat_count = guest + 0x30;
+    d->imp_equal = guest + 0x40;
+    d->imp_long_double = guest + 0x50;
+    d->imp_make = guest + 0x60;
+    d->imp_reverse = guest + 0x70;
+    d->counter = syn_alloc(s, 8);
+    for (int i = 0; i < 3; i++) {
+        d->slot[i] = syn_alloc(s, 8);
+        d->who[i] = syn_alloc(s, 8);
+    }
+
+    static const SynMethod kProtoMethods[] = { { "ocerzM11Count", "i16@0:8", 0 } };
+    static const char *const kProtoProps[] = { "ocerzM11Count", "Ti,R" };
+    uint64_t guest_nsobject = syn_protocol(s, "NSObject", 0, 0, 0, 96);
+    uint64_t adopted[1] = { guest_nsobject };
+    d->guest_proto = syn_protocol(s, "OcerzM11Proto", syn_refs(s, adopted, 1), syn_methods(s, kProtoMethods, 1),
+                                  syn_props(s, kProtoProps, 1), 96);
+    d->guest_copying = syn_protocol(s, "NSCopying", 0, 0, 0, 96);
+    uint64_t class_protos[2] = { d->guest_proto, d->guest_copying };
+    uint64_t protos = syn_refs(s, class_protos, 2);
+
+    d->off_count = syn_alloc(s, 8);
+    d->off_obj = syn_alloc(s, 8);
+    syn_w(d->off_count, 8, 4);
+    syn_w(d->off_obj, 8, 0xaaaaaaaa00000010ull);
+    uint64_t ivars = syn_alloc(s, 8 + 2 * 32);
+    syn_w(ivars, 4, 32);
+    syn_w(ivars + 4, 4, 2);
+    syn_w(ivars + 8, 8, d->off_count);
+    syn_w(ivars + 16, 8, syn_str(s, "_count"));
+    syn_w(ivars + 24, 8, syn_str(s, "i"));
+    syn_w(ivars + 32, 4, 2);
+    syn_w(ivars + 36, 4, 4);
+    syn_w(ivars + 40, 8, d->off_obj);
+    syn_w(ivars + 48, 8, syn_str(s, "_obj"));
+    syn_w(ivars + 56, 8, syn_str(s, "@"));
+    syn_w(ivars + 64, 4, 3);
+    syn_w(ivars + 68, 4, 8);
+
+    SynMethod base_i[] = {
+        { "ocerzM11Count", "i16@0:8", d->imp_count },
+        { "isEqual:", "c24@0:8@16", d->imp_equal },
+        { "ocerzM11LongDouble", "D16@0:8", d->imp_long_double },
+        { "ocerzM11Replaced", "i16@0:8", guest + 0x80 },
+    };
+    SynMethod base_c[] = {
+        { "load", "v16@0:8", load_stub(s, d->counter, d->slot[0], d->who[0]) },
+        { "ocerzM11Make", "@16@0:8", d->imp_make },
+    };
+    static const char *const kBaseProps[] = { "ocerzM11Count", "Ti,R,V_count" };
+    SynMethod sub_i[] = { { "ocerzM11Count", "i16@0:8", d->imp_sub_count } };
+    SynMethod sub_c[] = { { "load", "v16@0:8", load_stub(s, d->counter, d->slot[1], d->who[1]) } };
+
+    void *nsobject = cls("NSObject");
+    SynClass base = { "OcerzM11Base", ocerz_h2g(nsobject), ocerz_h2g(object_getClass_(nsobject)), 0x80, 4, 24,
+                      syn_methods(s, base_i, 4), syn_methods(s, base_c, 2), ivars, protos,
+                      syn_props(s, kBaseProps, 1), 0 };
+    d->base = syn_class(s, &base, &d->base_meta);
+    SynClass sub = { "OcerzM11Sub", d->base, d->base_meta, 0x80, 24, 24, syn_methods(s, sub_i, 1),
+                     syn_methods(s, sub_c, 1), 0, 0, 0, 0 };
+    d->sub = syn_class(s, &sub, &d->sub_meta);
+
+    SynMethod str_i[] = { { "ocerzM11Reverse", "@16@0:8", d->imp_reverse } };
+    SynMethod str_c[] = {
+        { "ocerzM11StringCount", "Q16@0:8", guest + 0x90 },
+        { "load", "v16@0:8", load_stub(s, d->counter, d->slot[2], d->who[2]) },
+    };
+    static const char *const kStrProps[] = { "ocerzM11Reversed", "T@\"NSString\",R" };
+    uint64_t cat_protos[1] = { d->guest_proto };
+    uint64_t strcat = syn_category(s, "OcerzM11", ocerz_h2g(cls("NSString")), syn_methods(s, str_i, 1),
+                                   syn_methods(s, str_c, 2), syn_refs(s, cat_protos, 1), syn_props(s, kStrProps, 1));
+    SynMethod basecat_i[] = { { "ocerzM11Replaced", "i16@0:8", d->imp_cat_count } };
+    uint64_t basecat = syn_category(s, "OcerzM11Own", d->base, syn_methods(s, basecat_i, 1), 0, 0, 0);
+
+    uint64_t classlist[2] = { d->sub, d->base };
+    uint64_t nlclslist[1] = { d->sub };
+    uint64_t catlist[2] = { strcat, basecat };
+    uint64_t nlcatlist[1] = { strcat };
+    uint64_t protolist[3] = { d->guest_proto, guest_nsobject, d->guest_copying };
+    uint64_t protorefs[2] = { d->guest_proto, d->guest_copying };
+    syn_section(s, "__objc_classlist", classlist, 2);
+    syn_section(s, "__objc_nlclslist", nlclslist, 1);
+    syn_section(s, "__objc_catlist", catlist, 2);
+    syn_section(s, "__objc_nlcatlist", nlcatlist, 1);
+    syn_section(s, "__objc_protolist", protolist, 3);
+    syn_section(s, "__objc_protorefs", protorefs, 2);
+    uint64_t info[1] = { 0x40ull << 32 };
+    syn_section(s, "__objc_imageinfo", info, 1);
+    d->protoref_proto = s->sectaddr[5];
+    d->protoref_copying = s->sectaddr[5] + 8;
+}
+
+static void *imp_of(void *k, const char *selname)
+{
+    void *(*getm)(void *, void *) = dlsym(RTLD_DEFAULT, "class_getInstanceMethod");
+    void *(*getimp)(void *) = dlsym(RTLD_DEFAULT, "method_getImplementation");
+    void *m = getm(k, sel(selname));
+    return m ? getimp(m) : NULL;
+}
+
+static int slot_notation(void *imp, const char *want_ret_args, uint64_t want_fn)
+{
+    uint64_t fn = 0;
+    const OcerzAbiSig *sig = ocerz_abi_callback_sig(imp, &fn);
+    if (!sig || fn != want_fn)
+        return 0;
+    char got[OCERZ_ABI_MAX_ARGS + 2];
+    got[0] = sig->ret;
+    for (int i = 0; i < sig->nargs; i++)
+        got[1 + i] = sig->arg[i];
+    got[1 + sig->nargs] = '\0';
+    return strcmp(got, want_ret_args) == 0;
+}
+
+static void test_define_image(void)
+{
+    DefinedImage d;
+    build_defined_image(&d);
+    const uint8_t *img = syn_header(&d.s, "__DATA_CONST");
+
+    int n = ocerz_objcbridge_define_image(img, 0);
+    CHECK(n == 4, "two classes and two categories defined, got %d", n);
+
+    void *base = ocerz_g2h(d.base), *sub = ocerz_g2h(d.sub);
+    void *(*superclass)(void *) = dlsym(RTLD_DEFAULT, "class_getSuperclass");
+    size_t (*instance_size)(void *) = dlsym(RTLD_DEFAULT, "class_getInstanceSize");
+    void *(*get_protocol)(const char *) = dlsym(RTLD_DEFAULT, "objc_getProtocol");
+    bool (*conforms)(void *, void *) = dlsym(RTLD_DEFAULT, "class_conformsToProtocol");
+    void *(*get_property)(void *, const char *) = dlsym(RTLD_DEFAULT, "class_getProperty");
+    const char *(*property_attrs)(void *) = dlsym(RTLD_DEFAULT, "property_getAttributes");
+    bool (*responds)(void *, void *) = dlsym(RTLD_DEFAULT, "class_respondsToSelector");
+
+    CHECK(cls("OcerzM11Base") == base && cls("OcerzM11Sub") == sub,
+          "the native runtime finds both classes by name at the guest's own addresses");
+    CHECK(superclass(sub) == base && superclass(base) == cls("NSObject"),
+          "the subclass, listed first, was defined after its superclass");
+    CHECK(object_getClass_(base) == ocerz_g2h(d.base_meta) && object_getClass_(sub) == ocerz_g2h(d.sub_meta),
+          "each class's metaclass is the guest's own");
+    CHECK(ocerz_objcbridge_is_defined(d.base) && ocerz_objcbridge_is_defined(d.sub) &&
+              !ocerz_objcbridge_is_defined(ocerz_h2g(cls("NSObject"))),
+          "ocerz records the two guest classes and not the native one");
+    CHECK(ocerz_ld(d.base + 16, 8) == ocerz_h2g(dlsym(RTLD_DEFAULT, "_objc_empty_cache")),
+          "the cache word is the native empty cache");
+
+    CHECK(ocerz_ld(d.off_count, 8) == 12 && ocerz_ld(d.off_obj, 8) == 0xaaaaaaaa00000018ull,
+          "the runtime slid the ivars past NSObject's 8 bytes by an 8-aligned 8 and wrote the low 32 bits of each"
+          " offset variable: %#llx %#llx", (unsigned long long)ocerz_ld(d.off_count, 8),
+          (unsigned long long)ocerz_ld(d.off_obj, 8));
+    CHECK(instance_size(base) == 32 && instance_size(sub) == 32, "instance sizes after the slide: %zu %zu",
+          instance_size(base), instance_size(sub));
+
+    void *count_imp = imp_of(base, "ocerzM11Count");
+    void *sub_imp = imp_of(sub, "ocerzM11Count");
+    CHECK(slot_notation(count_imp, "ipp", d.imp_count), "-[OcerzM11Base ocerzM11Count] is a slot bound to its guest"
+          " IMP under i(pp)");
+    CHECK(slot_notation(sub_imp, "ipp", d.imp_sub_count) && sub_imp != count_imp,
+          "the override in the subclass is a slot of its own bound to its own IMP");
+    CHECK(ocerz_abi_callback_sig(count_imp, NULL) == ocerz_abi_callback_sig(sub_imp, NULL),
+          "two slots of one notation share one parsed signature");
+    CHECK(slot_notation(imp_of(base, "isEqual:"), "bppp", d.imp_equal), "an x86 BOOL result is b");
+    CHECK(imp_of(base, "ocerzM11LongDouble") == ocerz_objcbridge_dead_imp(),
+          "a long double method is bound to the named refusal, not left out and not refused whole");
+    CHECK(slot_notation(imp_of(object_getClass_(base), "ocerzM11Make"), "ppp", d.imp_make),
+          "a class method is bound on the metaclass");
+    CHECK(slot_notation(imp_of(base, "ocerzM11Replaced"), "ipp", d.imp_cat_count),
+          "a category on a guest class replaces the class's own method");
+
+    void *proto = get_protocol("OcerzM11Proto");
+    void *copying = get_protocol("NSCopying");
+    CHECK(proto && (uint64_t)(uintptr_t)proto != d.guest_proto, "the guest-only protocol is registered natively");
+    CHECK(conforms(base, proto) && conforms(base, copying) && !conforms(sub, proto) &&
+              ((bool (*)(void *, void *, void *))objc_msgSend_)(sub, sel("conformsToProtocol:"), proto),
+          "the class conforms to the native protocols itself, and its subclass through it");
+    CHECK(ocerz_ld(d.protoref_proto, 8) == ocerz_h2g(proto) && ocerz_ld(d.protoref_copying, 8) == ocerz_h2g(copying),
+          "protocol references hold the native protocols");
+    bool (*proto_conforms)(void *, void *) = dlsym(RTLD_DEFAULT, "protocol_conformsToProtocol");
+    CHECK(proto_conforms(proto, get_protocol("NSObject")), "the registered protocol adopts the native NSObject");
+    struct { void *name; const char *types; } (*describe)(void *, void *, bool, bool) =
+        dlsym(RTLD_DEFAULT, "protocol_getMethodDescription");
+    CHECK(describe(proto, sel("ocerzM11Count"), true, true).types &&
+              strcmp(describe(proto, sel("ocerzM11Count"), true, true).types, "i16@0:8") == 0,
+          "the registered protocol has its required method");
+    void *(*proto_prop)(void *, const char *, bool, bool) = dlsym(RTLD_DEFAULT, "protocol_getProperty");
+    CHECK(proto_prop(proto, "ocerzM11Count", true, true) != NULL, "and its property");
+    void *bp = get_property(base, "ocerzM11Count");
+    CHECK(bp && strcmp(property_attrs(bp), "Ti,R,V_count") == 0, "the class property list is the guest's own");
+
+    void *nsstring = cls("NSString");
+    CHECK(responds(nsstring, sel("ocerzM11Reverse")) &&
+              slot_notation(imp_of(nsstring, "ocerzM11Reverse"), "ppp", d.imp_reverse),
+          "a category on a native class adds its instance method as a slot");
+    CHECK(slot_notation(imp_of(object_getClass_(nsstring), "ocerzM11StringCount"), "Lpp", d.s.base + 0x190),
+          "and its class method");
+    void *sp = get_property(nsstring, "ocerzM11Reversed");
+    CHECK(sp && strcmp(property_attrs(sp), "T@\"NSString\",R") == 0, "and its property");
+    CHECK(conforms(nsstring, proto), "and its protocol");
+
+    CHECK(ocerz_objcbridge_define_image(img, 0) == 0 && cls("OcerzM11Base") == base,
+          "defining the same image again defines nothing");
+
+    int saved = vm.jit_enabled;
+    vm.jit_enabled = 0;
+    int ran = ocerz_objcbridge_run_loads(&vm, stack_top);
+    vm.jit_enabled = saved;
+    CHECK(ran == 3, "three +load methods ran, got %d", ran);
+    CHECK(ocerz_ld(d.slot[0], 8) == 1 && ocerz_ld(d.slot[1], 8) == 2 && ocerz_ld(d.slot[2], 8) == 3,
+          "+load order is the superclass, the class the non-lazy list names, then the category: %llu %llu %llu",
+          (unsigned long long)ocerz_ld(d.slot[0], 8), (unsigned long long)ocerz_ld(d.slot[1], 8),
+          (unsigned long long)ocerz_ld(d.slot[2], 8));
+    CHECK(ocerz_ld(d.who[0], 8) == d.base && ocerz_ld(d.who[1], 8) == d.sub &&
+              ocerz_ld(d.who[2], 8) == ocerz_h2g(nsstring),
+          "each +load receives its class in rdi");
+    CHECK(ocerz_objcbridge_run_loads(&vm, stack_top) == 0, "the queue is empty afterwards");
+}
+
+typedef struct ClassRefusal {
+    const char *what;
+    void (*build)(Syn *s);
+    const char *message;
+} ClassRefusal;
+
+static void cr_root(Syn *s)
+{
+    SynClass c = { "OcerzM11Root", 0, 0, 0x82, 8, 8, 0, 0, 0, 0, 0, 0 };
+    uint64_t list[1] = { syn_class(s, &c, NULL) };
+    syn_section(s, "__objc_classlist", list, 1);
+}
+
+static void cr_unknown_super(Syn *s)
+{
+    void *nsobject = cls("NSObject");
+    SynClass p = { "OcerzM11NotListed", ocerz_h2g(nsobject), ocerz_h2g(object_getClass_(nsobject)), 0x80, 8, 8,
+                   0, 0, 0, 0, 0, 0 };
+    uint64_t meta;
+    uint64_t parent = syn_class(s, &p, &meta);
+    SynClass c = { "OcerzM11Orphan", parent, meta, 0x80, 8, 8, 0, 0, 0, 0, 0, 0 };
+    uint64_t list[1] = { syn_class(s, &c, NULL) };
+    syn_section(s, "__objc_classlist", list, 1);
+}
+
+static void cr_null_super(Syn *s)
+{
+    SynClass c = { "OcerzM11WeakSuper", 0, 0, 0x80, 8, 8, 0, 0, 0, 0, 0, 0 };
+    uint64_t list[1] = { syn_class(s, &c, NULL) };
+    syn_section(s, "__objc_classlist", list, 1);
+}
+
+static void cr_swift(Syn *s)
+{
+    void *nsobject = cls("NSObject");
+    SynClass c = { "OcerzM11Swift", ocerz_h2g(nsobject), ocerz_h2g(object_getClass_(nsobject)), 0x80, 8, 8,
+                   0, 0, 0, 0, 0, 2 };
+    uint64_t list[1] = { syn_class(s, &c, NULL) };
+    syn_section(s, "__objc_classlist", list, 1);
+}
+
+static void cr_cycle(Syn *s)
+{
+    SynClass a = { "OcerzM11CycleA", 0, 0, 0x80, 8, 8, 0, 0, 0, 0, 0, 0 };
+    SynClass b = { "OcerzM11CycleB", 0, 0, 0x80, 8, 8, 0, 0, 0, 0, 0, 0 };
+    uint64_t am, bm;
+    uint64_t ca = syn_class(s, &a, &am), cb = syn_class(s, &b, &bm);
+    syn_w(ca + 8, 8, cb);
+    syn_w(cb + 8, 8, ca);
+    uint64_t list[2] = { ca, cb };
+    syn_section(s, "__objc_classlist", list, 2);
+}
+
+static void cr_category(Syn *s)
+{
+    void *nsobject = cls("NSObject");
+    SynClass p = { "OcerzM11NotDefined", ocerz_h2g(nsobject), ocerz_h2g(object_getClass_(nsobject)), 0x80, 8, 8,
+                   0, 0, 0, 0, 0, 0 };
+    uint64_t list[1] = { syn_category(s, "Stray", syn_class(s, &p, NULL), 0, 0, 0, 0) };
+    syn_section(s, "__objc_catlist", list, 1);
+}
+
+static void cr_call_dead(Syn *s)
+{
+    void *nsobject = cls("NSObject");
+    SynMethod m[] = { { "ocerzM11Wide", "D16@0:8", s->base + 0x100 } };
+    SynClass c = { "OcerzM11Dead", ocerz_h2g(nsobject), ocerz_h2g(object_getClass_(nsobject)), 0x80, 8, 8,
+                   syn_methods(s, m, 1), 0, 0, 0, 0, 0 };
+    uint64_t list[1] = { syn_class(s, &c, NULL) };
+    syn_section(s, "__objc_classlist", list, 1);
+}
+
+static void cr_full_bank(Syn *s)
+{
+    for (uint64_t k = 0; k < OCERZ_ABI_CALLBACK_SLOTS; k++)
+        if (!ocerz_abi_callback_intern(s->base + 0x1000 + k, "v(pp)"))
+            break;
+    void *nsobject = cls("NSObject");
+    SynMethod m[] = { { "ocerzM11Wide", "v16@0:8", s->base + 0x100 } };
+    SynClass c = { "OcerzM11Dead", ocerz_h2g(nsobject), ocerz_h2g(object_getClass_(nsobject)), 0x80, 8, 8,
+                   syn_methods(s, m, 1), 0, 0, 0, 0, 0 };
+    uint64_t list[1] = { syn_class(s, &c, NULL) };
+    syn_section(s, "__objc_classlist", list, 1);
+}
+
+static const ClassRefusal kClassRefusals[] = {
+    { "a guest root class", cr_root, "guest class OcerzM11Root is a root class" },
+    { "a null superclass", cr_null_super, "guest class OcerzM11WeakSuper has a null superclass, as a class whose"
+      " weak-linked superclass the host lacks does" },
+    { "a superclass ocerz never defined", cr_unknown_super,
+      "guest class OcerzM11Orphan has the superclass OcerzM11NotListed at" },
+    { "a Swift class", cr_swift, "is a Swift class, and Swift classes do not cross" },
+    { "a superclass cycle", cr_cycle, "is its own superclass, through a chain of superclasses" },
+    { "a category on an undefined guest class", cr_category,
+      "guest category Stray is on the class OcerzM11NotDefined at" },
+    { "calling a method whose types do not cross", cr_call_dead,
+      "-[OcerzM11Dead ocerzM11Wide] is guest code native code cannot call: its type encoding D16@0:8 has a long"
+      " double" },
+    { "calling a method the full bank had no slot for", cr_full_bank,
+      "-[OcerzM11Dead ocerzM11Wide] is guest code native code cannot call: its type encoding v16@0:8 has no slot"
+      " left in the callback bank" },
+};
+
+static int class_child(const ClassRefusal *r, char *err, size_t errlen, int *status)
+{
+    int fds[2];
+    if (pipe(fds) != 0)
+        return 0;
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], 2);
+        Syn s;
+        syn_init(&s);
+        r->build(&s);
+        ocerz_objcbridge_define_image(syn_header(&s, "__DATA"), 0);
+        void *k = cls("OcerzM11Dead");
+        if (k) {
+            void *obj = ((void *(*)(void *, void *))objc_msgSend_)(k, sel("new"));
+            ((void (*)(void *, void *))objc_msgSend_)(obj, sel("ocerzM11Wide"));
+        }
+        _exit(0);
+    }
+    close(fds[1]);
+    size_t have = 0;
+    ssize_t rd;
+    while (have + 1 < errlen && (rd = read(fds[0], err + have, errlen - 1 - have)) > 0)
+        have += (size_t)rd;
+    err[have] = '\0';
+    close(fds[0]);
+    return pid > 0 && waitpid(pid, status, 0) == pid;
+}
+
+static void test_class_refusals(void)
+{
+    for (size_t i = 0; i < sizeof kClassRefusals / sizeof kClassRefusals[0]; i++) {
+        const ClassRefusal *r = &kClassRefusals[i];
+        char err[4096];
+        int status = 0;
+        CHECK(class_child(r, err, sizeof err, &status), "%s: child ran", r->what);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 72, "%s: exits 72, status %#x: %s", r->what, status, err);
+        CHECK(strstr(err, "ocerz: bridge: ") && strstr(err, r->message), "%s: stderr names it: %s", r->what, err);
+    }
+}
+
 static int report(void)
 {
     if (failures) {
@@ -1352,6 +2271,12 @@ int main(void)
     test_sends();
     test_refusals();
     test_callables_allowed();
+    test_forwarding_target();
+    test_class_layouts();
+    test_guest_notation();
+    test_class_order();
+    test_define_image();
+    test_class_refusals();
     test_encoding_sweep();
 
     ((void (*)(void *))need(objc, "objc_autoreleasePoolPop"))(pool);
