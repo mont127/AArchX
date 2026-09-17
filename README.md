@@ -22,7 +22,7 @@
 
 AArchX loads and runs x86-64 Mach-O programs on Apple Silicon with its own decoder, interpreter, JIT, dynamic linker and syscall layer. It also runs i386 PE code inside Wine's WoW64 process.
 
-The Rosetta package still has to be installed, because it is what ships the x86-64 shared cache. AArchX maps that cache itself and never calls Rosetta's translator.
+AArchX has two modes. Cache mode, the default, binds guests against the x86-64 shared cache, and for it the Rosetta package still has to be installed, because it is what ships that cache; AArchX maps the cache itself and never calls Rosetta's translator. Native mode (`-native`) binds guests against the Mac's own arm64 frameworks instead and needs no x86 system libraries at all, but it runs a narrower set of programs so far (see [Native mode](#native-mode)). Every application below was run in cache mode.
 
 ## Build and run
 
@@ -33,7 +33,13 @@ make -j
 ./ocerz /Applications/SomeApp.app/Contents/MacOS/SomeApp
 ```
 
-`make check` builds the unit and guest tests and runs every gate: the guest suite under the interpreter and under the JIT, the x86-64 differential gate (each guest binary under `-no-jit` and under the JIT must match byte for byte), the i386 differential gate and the dynamic-linking tests. The i386 gate needs the Python `capstone` package.
+`make check` builds the unit and guest tests and runs every gate: the guest suite under the interpreter and under the JIT, the x86-64 differential gate (each guest binary under `-no-jit` and under the JIT must match byte for byte), the i386 differential gate, the dynamic-linking tests and the native-mode tests. The i386 gate needs the Python `capstone` package, and the dynamic and native gates build x86_64 fixtures with the Command Line Tools' clang.
+
+Native mode reads its API database from `runtime/apis` beside the `ocerz` binary, so run it from the source tree or keep that directory next to a copied binary:
+
+```sh
+./ocerz -native ./some_x86_64_tool
+```
 
 ## Status
 
@@ -66,9 +72,11 @@ What is in the box:
 - x86-64-v3 as Rosetta runs it on macOS 15 and later: AVX2, FMA, BMI1/BMI2, F16C, LZCNT, MOVBE and XSAVE, none of which CPUID advertises under either.
 - JIT cache invalidation on guest code writes and executable mapping changes.
 - Differential tests for both x86-64 and i386 execution.
-- An opt-in native mode that runs Intel programs against synthesized x86 system images bridged to the host's own arm64 functions, in both directions, without the x86 shared cache.
+- An opt-in native mode that runs Intel programs against synthesized x86 system images bridged to the host's own arm64 libSystem, CoreFoundation, CoreGraphics, Objective-C runtime, Foundation and AppKit, in both directions, without the x86 shared cache. It runs command-line C and Objective-C programs today, not yet full applications.
 
 ## Application compatibility
+
+Everything in this section runs in cache mode; no application has run in native mode yet.
 
 Confirmed on 2026-09-11 on an Apple silicon MacBook Air with macOS 26.6.
 Each app's x86-64 slice was launched straight from its bundle, for example
@@ -103,7 +111,7 @@ Ollama's command-line binary (`Contents/Resources/ollama`, Go with cgo) works as
 The Ollama menu-bar app runs too. In a 30-second run it started its own server, served its settings page to its window and shut down cleanly on SIGTERM. Before that, WebKit's allocator stopped it within 10 seconds because it could not suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`): workqueue threads that AArchX started ended without running the guest's thread-exit path. Nobody has yet run a model under AArchX.
 
 Not working yet:
-- **Safari** starts but never shows a window. In a run on 2026-09-13, WebKit's allocator failed to suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`) and stopped the process. Two causes of that failure were fixed the same day. The main thread was missing from AArchX's thread-suspension emulation, and workqueue threads that AArchX started ended without running the guest's thread-exit path. Safari has not been run again since.
+- **Safari** used to start and never show a window: in a run on 2026-09-13, WebKit's allocator failed to suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`) and stopped the process. Two causes of that failure were fixed the same day. The main thread was missing from AArchX's thread-suspension emulation, and workqueue threads that AArchX started ended without running the guest's thread-exit path. Safari was reported running under AArchX on 2026-09-16; it is not part of any gate and has not been measured beyond that.
 - **Photos** aborted in `+[PAOpenGLDevice _sharedPixelFormat:]` because `CGLChoosePixelFormat` returned 10002 for every attribute set. The cause was in AArchX's dyld, not the Rosetta-only `AppleMetalGLRenderer` IOKit service blamed earlier. `_dyld_shared_cache_contains_path` rejected the software renderer's plugin path, which runs through a symlink, and `dlsym` on a shared-cache image searched the whole cache. Both are fixed, and CGL now lists the same renderers and builds the same pixel formats as under Rosetta. Photos has not been run again since.
 
 ## Steam
@@ -308,7 +316,7 @@ Apple ends general-purpose Rosetta after macOS 27, and with it the `dyld_shared_
 
 Today native mode runs command-line programs whose calls stay inside what is bridged, which is most of libSystem: 2669 of its functions cross to the host, among them the C string, memory, stdio, file, time, locale and user-database functions and their fortified `_chk` forms, the heap, POSIX threads with their mutexes and condition variables, libdispatch's function-pointer entry points, including its semaphores, and `atexit`; thread-local variables and signal handlers with their masks and alternate stacks are answered by ocerz itself; 777 CoreFoundation functions cross, among them CoreFoundation's strings, arrays, dictionaries, numbers, data and run loop, including guest callbacks and run-loop timers, observers and sources. Objective-C programs that use Foundation's strings, numbers, collections, values and formatted output run against the native Objective-C runtime, and so do their own classes, categories and protocols, including `NSView` subclasses that AppKit draws. A program compiled normally, with optimization and clang's default stack protector, binds and runs, and so does one linked for a macOS older than 12 with classic lazy binding. AppKit and CoreGraphics are synthesized from the SDK like the rest, but a full application has not run yet. Every kernel of `xbench_dyn` produces byte-identical output in native mode and cache mode, under both the JIT and the interpreter.
 
-**System libraries without files.** A guest that links `/usr/lib/libSystem.B.dylib` finds nothing behind it, because on a current macOS that library exists only inside the cache. So ocerz builds one. `src/vdylib.c` assembles a real x86_64 Mach-O in memory, with load commands, `__TEXT`, `__DATA` and an export trie, and the loader takes it as an ordinary image. Nothing in the loader reopens a file, so import resolution, `dlopen` and `dladdr` work on it unchanged. No cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off, because the host's own libdispatch needs the process's single workqueue slot.
+**System libraries without files.** A guest that links `/usr/lib/libSystem.B.dylib` finds nothing behind it, because on a current macOS that library exists only inside the cache. So ocerz builds one, and one for each other library native mode covers. `src/vdylib.c` assembles a real x86_64 Mach-O in memory, with load commands, `__TEXT`, `__DATA` and an export trie, and the loader takes it as an ordinary image. Nothing in the loader reopens a file, so import resolution and the loader's own symbol lookups work on it unchanged. No cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off, because the host's own libdispatch needs the process's single workqueue slot.
 
 **The API database.** What each synthesized library exports, and how each export crosses, is data rather than code: one text file per library under `runtime/apis/macos/<sdk version>/`, such as `libSystem.B.dylib.api` and `CoreFoundation.api`, with a record per export. A `fn` record names the host function and its signature, `data` a native variable the export resolves to, `special` a function ocerz answers itself, `stub` an export that binds but stops with a named message when called, with the reason, and `shape` and `struct` records describe the structures of function pointers the bridge converts. ocerz reads the files for the guest's minimum macOS version, beside its own executable or from `OCERZ_APIDB`, and refuses a malformed file whole, naming its line, rather than binding some imports to the wrong thing. Supporting another library is a data change, not a rebuild.
 
@@ -332,7 +340,7 @@ The files are generated. `tools/sdkgen.sh <library>`, for libSystem, CoreFoundat
 
 **Signals.** A signal handler is x86 code, so a native `sigaction` cannot be handed one. `sigaction`, `signal`, `sigprocmask`, `pthread_sigmask`, `sigaltstack`, `raise`, `kill` and `pthread_kill` are answered by ocerz itself, against the same handler table, masks and alternate stacks the syscalls change in cache mode, and a handler is entered through a small x86 trampoline ocerz writes into guest memory in place of the `_sigtramp` an x86 libc would supply. A handler runs on the state after the call that raised it, so `raise` returns with its handler already run, and a signal unblocked by `sigprocmask` is delivered before that call returns. A signal from outside, or from another thread, is delivered when the receiving thread's next bridged call returns, the way cache mode delivers one at the next syscall; a thread spinning in its own code without calls does not see it in either mode.
 
-**Data exports.** Not every import is a function. A stack-protected program reads `___stack_chk_guard` in every function prologue, so the synthesized libSystem exports it as a data slot the export trie points at directly, holding a random canary drawn when the image is built. `_environ`, `___progname`, `__DefaultRuneLocale`, `___stdoutp` and `___stderrp` are data symbols too and are left out on purpose: each is tied to native state a constant would get wrong, and an import that fails to bind says so where a wrong value would not.
+**Data exports.** Not every import is a function. A stack-protected program reads `___stack_chk_guard` in every function prologue, so the synthesized libSystem exports it as a slot of its own holding a random canary drawn when the image is built. Every other variable is exported as the native variable itself, an absolute address in the export trie: `___stdoutp` and `___stderrp` are the host's `FILE`s, so the x86 `getc` and `putc` macros read the native buffers, whose layout is the same on both architectures; `__DefaultRuneLocale` is the host's table the `ctype` macros read; `_environ` is the host's environment, which is the guest's. A variable that holds a function pointer the guest could overwrite, such as `_vprintf_stderr_func`, is left out, because native code would call whatever x86 address the guest stored there.
 
 **Faults.** A bridged call is the one place a thread the guest drives runs native code. A fault during one is reported as such, naming the call and saying whether the faulting address was in guest space, meaning the guest passed a bad pointer, or outside it, meaning ocerz marshalled the call wrong. The process stops there, because a native frame can be neither resumed nor unwound:
 
@@ -347,8 +355,8 @@ A guest fault inside a callback is the guest's own and is handled the ordinary w
 **What is not bridged.** An export with no bridge behind it names itself and stops with exit status 72. An import that never bound at all stops the process with 71 before the guest runs, so the two failures stay distinguishable. An import is looked for only in the library it names: a CoreFoundation import CoreFoundation does not export is reported as missing rather than bound to a libSystem export of the same name. A static image is refused outright.
 
 ```text
-$ ./ocerz -native ./hello_printf
-ocerz: bridge: /usr/lib/libSystem.B.dylib _printf not implemented
+$ ./ocerz -native ./read_number
+ocerz: bridge: /usr/lib/libSystem.B.dylib _scanf not implemented
 ```
 
 A variadic function crosses only through a veneer that knows where its named arguments stop and what the rest are. Apple's arm64 passes every variadic argument on the stack in eight-byte slots and uses no floating-point register, the opposite of its packing for an ordinary call, so a fixed signature would be wrong. The printf family, `NSLog`, CoreFoundation's format functions and Foundation's variadic methods have veneers; `open`, `fcntl`, `ioctl`, `scanf` and the rest do not yet. A structure passed or returned by value is written with its members in braces, `{LL}` for `NSRange` and `{{dd}{dd}}` for `CGRect`, and crosses as bytes gathered from wherever one ABI put it and scattered to wherever the other wants it: System V classifies a small structure eightbyte by eightbyte and returns anything over sixteen bytes through a pointer in RDI, while Apple's arm64 passes up to four floats or doubles in vector registers, any other structure over sixteen bytes as a pointer to a copy, and returns the largest through x8.
@@ -377,7 +385,19 @@ Against cache mode, the cost shows only in code that crosses in a tight loop. Ea
 
 Guest code that never crosses pays nothing, which is why the last two rows are at parity.
 
-The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once, and a spawned child inherits it through `OCERZ_MODE`. `tests/run_native_tests.sh` pins all of this end to end. `tests/unit/test_apidb.c`, `test_vdylib.c`, `test_bridge.c`, `test_abi.c` and `test_callback.c` pin the database format and its refusals, the synthesized image, the crossings built from the database, argument placement across the signature space, and the trampoline bank.
+The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once, and a spawned child inherits it through `OCERZ_MODE`. `tests/run_native_tests.sh` pins all of this end to end. `tests/unit/test_apidb.c`, `test_vdylib.c`, `test_bridge.c`, `test_abi.c`, `test_callback.c` and `test_objcbridge.c` pin the database format and its refusals, the synthesized image, the crossings built from the database, argument placement across the signature space, the trampoline bank, and the Objective-C encodings, formats, sends and class realization.
+
+**What native mode cannot run yet.** Each of these stops a program with a named message, exit 71 when an import cannot bind or 72 when a bound export has no crossing, rather than running it wrongly:
+
+- **Applications.** `NSApplicationMain` is a stub, because it would load the main nib from ocerz's own bundle, and native Foundation's main bundle is ocerz's, not the app's, so an app finds neither its `Info.plist` nor its resources. No `.app` has run in native mode.
+- **Blocks.** A block written in x86 code cannot be handed to native code, so `dispatch_async`, completion handlers and `enumerateObjectsUsingBlock:` stop. The `_f` function-pointer forms of libdispatch work.
+- **C++.** No x86 `libc++` or `libc++abi` is synthesized, so a program linking them fails to bind.
+- **Exceptions.** A native Objective-C exception cannot be caught by a guest `@try`, a guest cannot throw one, and nothing unwinds through guest frames.
+- **Loading code at run time.** `dlopen`, `dlsym` and the rest of the dynamic-loading API are stubs.
+- **Processes and memory.** `fork`, `exec`, `posix_spawn`, `system`, `popen`, `mmap`, `mprotect`, `setjmp` and `longjmp` need ocerz's own implementations and are stubs.
+- **Variadic calls without a veneer.** `open`, `openat`, `fcntl`, `ioctl` and the `scanf` family are stubs; the printf family, `NSLog`, CoreFoundation's format functions and Foundation's variadic methods work.
+- **Building classes at run time.** `class_addMethod`, `class_replaceMethod`, `method_setImplementation`, `objc_allocateClassPair` and `imp_implementationWithBlock` are stubs, so `+resolveInstanceMethod:` does not work, and a guest calling an `IMP` it got back from the native runtime crashes, because that `IMP` is arm64 code.
+- **Swift.** Swift classes and the frameworks' Swift overlays are refused.
 
 ## Limitations
 
@@ -402,7 +422,15 @@ The mode is process-wide and fixed before the VM starts, because the JIT materia
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
 - An asynchronous signal reaches a guest thread only when that thread next makes a syscall, or in native mode a bridged call, so a thread spinning in its own code never sees one. A signal aimed at another thread reaches its guest handler only for the signals ocerz mirrors onto the host, such as `SIGUSR1`, `SIGTERM` and `SIGALRM`, not for fault signals such as `SIGSEGV`.
-- Native mode runs only programs whose calls stay inside the bridged part of libSystem, libdispatch, CoreFoundation, CoreGraphics, libobjc, Foundation and AppKit. `NSApplicationMain` stops with a named message, because it would load the main nib from ocerz's own bundle, and no `.app` has run end to end; a guest that builds classes at run time (`class_addMethod`, `objc_allocateClassPair`, `+resolveInstanceMethod:`) or calls an `IMP` it got back from the native runtime does not work yet, and a guest class whose superclass the host lacks, a Swift class and a root class are refused by name; variadic functions without a veneer, such as `open`, `fcntl`, `ioctl` and `scanf`, are not bridged, nor are functions taking a `long double`, `va_list`, union or bitfield structure; a block or function pointer written in x86 code cannot be handed to a native method or function, so `enumerateObjectsUsingBlock:` or `sortedArrayUsingFunction:context:` stops with a named message; an Objective-C exception thrown by native code cannot be caught by a guest `@try`, because nothing unwinds through guest frames yet, and a guest cannot throw one; `NSLog` names the process `ocerz`; `fork`, `exec`, `posix_spawn`, `setjmp`, `longjmp`, `mmap`, `mprotect` and `dlopen` stop with a named message, because each needs ocerz's own implementation rather than the host's; `getpagesize` and `vm_page_size` report the host's 16 KB page where Rosetta reports 4 KB; a guest that reads function pointers out of a structure a native call filled in, as the `XDR_*` macros do, would call arm64 code; a guest that is not position-independent runs with its low addresses shadowed, so a structure it hands CoreFoundation holding pointers into its own image would carry addresses native code cannot read; a C++ program fails to bind, because no x86 `libc++` is synthesized; and `environ` and `_NSGetEnviron` are not available.
+- Native mode runs command-line programs, not applications yet; the list under [What native mode cannot run yet](#native-mode) says what stops the rest. Beyond that list:
+  - functions taking a `long double`, a `va_list`, or a union or bitfield structure by value are stubs, as is a function taking a guest function pointer inside a structure the bridge has no shape for;
+  - a guest class whose superclass the host lacks, and a root class, are refused by name;
+  - a call from native code back into guest code costs about 430 ns, against about 14 ns for a call from guest code into native code;
+  - `NSLog` names the process `ocerz`, and `_NSGetEnviron` and `_NSGetArgv` are stubs;
+  - `getpagesize` and `vm_page_size` report the host's 16 KB page where Rosetta reports 4 KB;
+  - a guest that reads function pointers out of a structure a native call filled in, as the `XDR_*` macros do, would call arm64 code;
+  - a guest that is not position-independent runs with its low addresses shadowed, so a structure it hands native code holding pointers into its own image would carry addresses native code cannot read;
+  - after a bridged call from translated code, the xmm registers the call's signature does not use hold what native code left in them, which System V allows; under `-no-jit` they keep their values.
 
 ## License
 
