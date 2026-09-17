@@ -1,0 +1,348 @@
+# Records that replace what tools/sdkgen's rules would write, in the database's
+# own syntax: special, var, data, stub and fn records for one export each, and
+# the shape and struct records that let a structure of callbacks cross.  Two
+# kinds exist only here.  omit <export> leaves the export out of the database,
+# so a guest importing it fails to bind with 71 and the name.  opaque <record>
+# names a structure the guest never builds itself: the rule that refuses a
+# pointer to a structure holding function pointers ignores it, because the
+# function pointers in it were put there by native code, while the layout rule
+# still holds it to the same size, alignment and field offsets on both
+# architectures.  A record applies to the library named by the library line
+# above it.  A stub may name its exports with a fnmatch pattern, which only
+# reaches exports the rules would have made fn or stub, never a variable; a
+# stub that names one export exactly also covers that export's $-suffixed
+# variants, such as _sigsuspend$NOCANCEL.  A record that matches nothing in its
+# library stops the generator, so a name that leaves the SDK is noticed rather
+# than kept.
+#
+# ---- libSystem ----
+# Exports ocerz answers itself.  exit and abort end the guest, not the host
+# thread; __stack_chk_fail reports the overrun; __tlv_bootstrap returns the
+# guest's own thread-local storage and must keep every register but rax; the
+# signal calls work on the guest's handler table, masks and alternate stacks,
+# which the host's never see.  ___stack_chk_guard is a slot of the image's own
+# with a random canary.  ___chkstk_darwin is the stack probe clang calls from a
+# function with a frame larger than a page, with the size in rax and every
+# register to come back unchanged; guest stacks are mapped whole, so its
+# handler only returns.  Current clang imports it as ____chkstk_darwin, one
+# underscore longer, which libSystem exports beside the older spelling.  exit
+# takes the exit handler, which calls the host's exit while the guest is still
+# running, so the guest's atexit handlers run as the callbacks they are.  _exit
+# and _Exit end the process without atexit handlers, and native ones would end
+# it without ocerz's own exit path either, so they take exit_now, which ends
+# the process with the status and flushes nothing; quick_exit would have to run
+# at_quick_exit handlers first, which neither handler does, so it names itself
+# instead.
+#
+# Stdio.  A FILE is a struct __sFILE that only native fopen, fdopen, funopen and
+# their relatives create, and the _close, _read, _seek and _write pointers in
+# it are native code or, for funopen, callbacks that crossed as ordinary c
+# arguments.  So __sFILE is opaque.  Its layout still has to agree, and does,
+# because the x86 getc and putc macros read _p, _r and _w out of the native
+# FILE inline.
+#
+# Writable variables that native code calls through.  vprintf_stderr_func is the
+# function Mach's fprintf_stderr writes its error messages with, and mach_init.h
+# invites applications to point it at their own; a guest that does would have
+# native code jump to x86, so it is left out.  _DefaultRuneLocale is the only
+# other variable the SDK declares writably with a function pointer in its type,
+# its __sgetrune and __sputrune words, and it stays a native data export: x86
+# ctype macros read __runetype out of it inline, so leaving it out would refuse
+# every program that calls isspace, and nothing but native setlocale ever writes
+# it.
+#
+# Fortified string calls.  A compiler that knows a buffer's size calls
+# __memcpy_chk and its siblings instead of memcpy, but the SDK only declares
+# the builtins that expand to them, so no header gives a signature; these are
+# the builtins' own, the plain function's arguments plus the destination size.
+# __bzero is libsystem_platform's entry for bzero, at the same address.
+#
+# Process creation and replacement: fork, vfork and forkpty would duplicate
+# ocerz's translator state with no guest-side bookkeeping, and the exec family,
+# posix_spawn and everything that configures it, system, popen and pclose,
+# daemon and wordexp, which runs a shell, would start an x86 image with no
+# translator under it.  ocerz has to launch those through itself.
+#
+# Thread exit and cancellation: pthread_exit, pthread_cancel, pthread_testcancel
+# and dispatch_main, which parks the main thread with pthread_exit, unwind a
+# host thread through ocerz's own frames.  __tlv_atexit and __tlv_exit belong to
+# the thread-local storage ocerz keeps for the guest, not to host dyld's.
+#
+# Non-local jumps and contexts: setjmp and longjmp in every spelling, and the
+# ucontext calls, save or restore arm64 host registers where the guest meant
+# its own x86 ones.  Unwinding is the same problem for C++: _Unwind_*, the unw_*
+# cursor API and frame registration walk host frames, not guest frames.
+#
+# Dynamic loading: dlopen and its relatives, every _dyld_* and dyld_* call, and
+# the NSModule-era dyld API answer from host dyld, which has never heard of any
+# image ocerz's loader mapped.  The getsect and get_end family read the host's
+# main executable, which is ocerz.  dyld_stub_binder is only reached by a lazy
+# bind the loader failed to make, so a stub that names it is the honest answer.
+#
+# Process identity: _NSGetArgv, _NSGetEnviron, _NSGetExecutablePath and the rest
+# of crt_externs, and getprogname and setprogname, describe ocerz's own
+# invocation rather than the guest's.
+#
+# Memory mapping and protection: mmap, munmap, mprotect, madvise and the Mach
+# vm allocate, deallocate, protect, map and remap calls change the address
+# space ocerz tracks for the guest, including the pages it translated code
+# from, without ocerz hearing of it.
+#
+# Raw syscalls: syscall and __syscall would reach the host kernel with x86
+# system call numbers.
+#
+# The rest of the signal interface: sigsuspend, sigwait, sigpending, pause,
+# sigvec, sigblock, sigsetmask, the System V sigset, sighold, sigrelse,
+# sigignore, sigpause and siginterrupt, bsd_signal, and the private
+# double-underscore entries behind them all read or wait on the host's signal
+# state, which is not the guest's.
+#
+# Machine state and exception ports: thread_get_state, thread_set_state and
+# their act_ and task_ spellings take x86 thread-state flavors the arm64 kernel
+# refuses or answers with arm64 registers, and thread_create_running starts a
+# host thread from x86 state.  Exception ports set by the guest would take
+# EXC_BAD_ACCESS away from the signal handlers ocerz recovers translated code
+# with.
+#
+# The printf and scanf families are variadic, and their v forms take a
+# va_list, so the rules already refuse nearly all of them; naming the family
+# keeps the extensible-printf domain calls and the _l, wide and _chk forms with
+# them.
+#
+# ---- CoreFoundation ----
+# __CFConstantStringClassReference is the isa every CFSTR literal is compiled
+# against and no header declares it, so it is bound to the native variable by
+# name.  CFBundleGetMainBundle would answer with the bundle of the host
+# executable, which is ocerz.  The shapes describe the callback structures the
+# collection and run loop constructors copy, word by word, with the version
+# the first word must hold; the generator checks every word against the
+# structure the header declares, and version 1 against CFRunLoopSourceContext1.
+# The struct records name the argument each constructor takes one in.
+
+library /usr/lib/libSystem.B.dylib
+
+special _exit exit
+special __exit exit_now
+special __Exit exit_now
+special _abort abort
+special __tlv_bootstrap tlv_bootstrap
+special ___stack_chk_fail stack_chk_fail
+special _sigaction sigaction
+special _signal signal
+special _sigprocmask sigprocmask
+special _pthread_sigmask pthread_sigmask
+special _sigaltstack sigaltstack
+special _raise raise
+special _kill kill
+special _pthread_kill pthread_kill
+special ___chkstk_darwin chkstk
+special ____chkstk_darwin chkstk
+var ___stack_chk_guard 8 stack_guard
+stub _quick_exit override
+
+opaque __sFILE
+
+omit _vprintf_stderr_func
+
+fn ___bzero bzero v(pL)
+fn ___memccpy_chk __memccpy_chk p(ppiLL)
+fn ___memcpy_chk __memcpy_chk p(ppLL)
+fn ___memmove_chk __memmove_chk p(ppLL)
+fn ___memset_chk __memset_chk p(piLL)
+fn ___stpcpy_chk __stpcpy_chk p(ppL)
+fn ___stpncpy_chk __stpncpy_chk p(ppLL)
+fn ___strcat_chk __strcat_chk p(ppL)
+fn ___strcpy_chk __strcpy_chk p(ppL)
+fn ___strlcat_chk __strlcat_chk L(ppLL)
+fn ___strlcpy_chk __strlcpy_chk L(ppLL)
+fn ___strncat_chk __strncat_chk p(ppLL)
+fn ___strncpy_chk __strncpy_chk p(ppLL)
+
+stub _fork override
+stub ___fork override
+stub _vfork override
+stub ___vfork override
+stub _forkpty override
+stub _daemon override
+stub _execl override
+stub _execle override
+stub _execlp override
+stub _execv override
+stub _execvP override
+stub _execve override
+stub ___execve override
+stub _execvp override
+stub _posix_spawn* override
+stub ___posix_spawn override
+stub _system override
+stub _popen override
+stub _pclose override
+stub _wordexp override
+
+stub _pthread_exit override
+stub _pthread_cancel override
+stub _pthread_testcancel override
+stub _dispatch_main override
+stub __tlv_atexit override
+stub __tlv_exit override
+
+stub _setjmp override
+stub __setjmp override
+stub _sigsetjmp override
+stub _longjmp override
+stub __longjmp override
+stub _siglongjmp override
+stub _longjmperror override
+stub _getcontext override
+stub _setcontext override
+stub _makecontext override
+stub _swapcontext override
+stub __Unwind_* override
+stub _unw_* override
+stub ___unw_* override
+stub ___register_frame override
+stub ___deregister_frame override
+
+stub _dlopen override
+stub _dlopen_preflight override
+stub _dlopen_from override
+stub _dlopen_audited override
+stub _dlsym override
+stub _dladdr override
+stub _dlclose override
+stub _dlerror override
+stub _dyld_* override
+stub __dyld_* override
+stub _NSAddImage override
+stub _NSAddLibrary override
+stub _NSAddLibraryWithSearching override
+stub _NSAddressOfSymbol override
+stub _NSCreateObjectFileImageFromFile override
+stub _NSCreateObjectFileImageFromMemory override
+stub _NSDestroyObjectFileImage override
+stub _NSGetSectionDataInObjectFileImage override
+stub _NSIsSymbolDefinedInObjectFileImage override
+stub _NSIsSymbolNameDefined override
+stub _NSIsSymbolNameDefinedInImage override
+stub _NSIsSymbolNameDefinedWithHint override
+stub _NSLibraryNameForModule override
+stub _NSLinkEditError override
+stub _NSLinkModule override
+stub _NSLookupAndBindSymbol override
+stub _NSLookupAndBindSymbolWithHint override
+stub _NSLookupSymbolInImage override
+stub _NSLookupSymbolInModule override
+stub _NSModuleForSymbol override
+stub _NSNameOfModule override
+stub _NSUnLinkModule override
+stub _NSVersionOfLinkTimeLibrary override
+stub _NSVersionOfRunTimeLibrary override
+stub _getsectdata override
+stub _getsectdatafromFramework override
+stub _getsectbyname override
+stub _getsegbyname override
+stub _get_end override
+stub _get_etext override
+stub _get_edata override
+stub dyld_stub_binder override
+
+stub __NSGetArgc override
+stub __NSGetArgv override
+stub __NSGetEnviron override
+stub __NSGetProgname override
+stub __NSGetExecutablePath override
+stub __NSGetMachExecuteHeader override
+stub _getprogname override
+stub _setprogname override
+
+stub _mmap override
+stub ___mmap override
+stub _munmap override
+stub ___munmap override
+stub _mprotect override
+stub ___mprotect override
+stub _madvise override
+stub _mach_vm_allocate override
+stub _mach_vm_deallocate override
+stub _mach_vm_protect override
+stub _mach_vm_map override
+stub _mach_vm_remap override
+stub _mach_vm_remap_new override
+stub _vm_allocate override
+stub _vm_deallocate override
+stub _vm_protect override
+stub _vm_map override
+stub _vm_remap override
+stub _vm_remap_new override
+
+stub _syscall override
+stub ___syscall override
+
+stub _sigsuspend override
+stub ___sigsuspend override
+stub ___sigsuspend_nocancel override
+stub _sigwait override
+stub ___sigwait override
+stub _____sigwait_nocancel override
+stub _sigpending override
+stub _pause override
+stub _sigvec override
+stub _sigblock override
+stub _sigsetmask override
+stub _sigset override
+stub _sighold override
+stub _sigrelse override
+stub _sigignore override
+stub _sigpause override
+stub _siginterrupt override
+stub _bsd_signal override
+stub ___sigaction override
+stub ___sigaltstack override
+stub ___sigreturn override
+stub ___kill override
+stub ___pthread_kill override
+stub ___pthread_sigmask override
+stub __sigaction_nobind override
+stub __signal_nobind override
+stub __sigvec_nobind override
+
+stub _thread_get_state override
+stub _thread_set_state override
+stub _act_get_state override
+stub _act_set_state override
+stub _task_get_state override
+stub _task_set_state override
+stub _thread_create_running override
+stub _task_set_exception_ports override
+stub _task_swap_exception_ports override
+stub _thread_set_exception_ports override
+stub _thread_swap_exception_ports override
+stub _thread_adopt_exception_handler override
+stub _host_set_exception_ports override
+stub _host_swap_exception_ports override
+
+stub _*printf* override
+stub _*scanf* override
+
+library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+
+data ___CFConstantStringClassReference __CFConstantStringClassReference
+stub _CFBundleGetMainBundle override
+
+shape CFArrayCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
+shape CFDictionaryKeyCallBacks 0 6 - p(pp) v(pp) p(p) B(pp) L(p)
+shape CFDictionaryValueCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
+shape CFRunLoopTimerContext 0 5 - - p(p) v(p) p(p)
+shape CFRunLoopObserverContext 0 5 - - p(p) v(p) p(p)
+shape CFRunLoopSourceContext 0 10 - - p(p) v(p) p(p) B(pp) L(p) v(ppp) v(ppp) v(p)
+shape CFRunLoopSourceContext 1 9 - - p(p) v(p) p(p) B(pp) L(p) u(p) p(plpp)
+
+struct _CFArrayCreate 3 CFArrayCallBacks
+struct _CFArrayCreateMutable 2 CFArrayCallBacks
+struct _CFDictionaryCreate 4 CFDictionaryKeyCallBacks
+struct _CFDictionaryCreate 5 CFDictionaryValueCallBacks
+struct _CFDictionaryCreateMutable 2 CFDictionaryKeyCallBacks
+struct _CFDictionaryCreateMutable 3 CFDictionaryValueCallBacks
+struct _CFRunLoopTimerCreate 6 CFRunLoopTimerContext
+struct _CFRunLoopObserverCreate 5 CFRunLoopObserverContext
+struct _CFRunLoopSourceCreate 2 CFRunLoopSourceContext

@@ -1,0 +1,29 @@
+# The libraries sdkgen knows how to generate, and how to read each one.
+#
+#     library <name> <install-name> <tbd path inside the SDK>
+#     pass <umbrella header in tools/sdkgen/headers> [-D<macro>=<value>]...
+#
+# <name> is what tools/sdkgen.sh is given on its command line.  The database is
+# written for <install-name>, into the file named after its last component.
+# The .tbd is read for every document in it, and a library it re-exports is
+# folded into the export list when that library names a parent umbrella, which
+# is what marks the libraries under /usr/lib/system as parts of libSystem
+# rather than libraries of their own.  CoreFoundation re-exports libobjc, which
+# names no umbrella, so libobjc's exports stay out of CoreFoundation's file.
+#
+# Each pass is parsed twice, for x86_64 and for arm64, and an export takes its
+# declaration from the first pass whose x86_64 parse spells it.  libSystem needs
+# four, because two families of variant entry points are declared only under a
+# macro that would rename the plain entry point if it were set in the first
+# pass: the $NOCANCEL variants of the cancellation points want
+# __DARWIN_NON_CANCELABLE, and the $DARWIN_EXTSN variants of fopen, fdopen,
+# popen, getgroups, select and pselect want _DARWIN_C_SOURCE, and pselect and
+# select have a variant with both suffixes.
+library libSystem /usr/lib/libSystem.B.dylib usr/lib/libSystem.B.tbd
+pass libSystem.h
+pass libSystem.h -D__DARWIN_NON_CANCELABLE=1
+pass libSystem.h -D_DARWIN_C_SOURCE
+pass libSystem.h -D_DARWIN_C_SOURCE -D__DARWIN_NON_CANCELABLE=1
+
+library CoreFoundation /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd
+pass CoreFoundation.h

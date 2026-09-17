@@ -53,8 +53,10 @@
 #
 # Keeping 71 and 72 alive still matters, and both now need their own fixture.
 # 71 means nothing bound, so the loader never handed control to the guest at
-# all; native_unbound pins it with a two-line program calling getpwnam, which
-# is deliberately outside the virtual library's export list. 72 means
+# all; native_unbound pins it with a two-line program calling zlibVersion from
+# libz, a library native mode synthesizes no image for. It used to call
+# getpwnam, until the generated libSystem database exported every function the
+# real libSystem does and getpwnam bound. 72 means
 # everything bound and the guest ran, and what is missing is the bridge behind
 # one export rather than the export itself; xbench_dyn no longer reaches it, so
 # bridge_unimpl pins it with a program whose only import is printf, which the
@@ -728,6 +730,17 @@
 # for 10.14, checks with otool and nm that it really has classic binds and
 # really imports dyld_stub_binder, so a toolchain that stops producing either is
 # reported as that, and then requires it to run and agree with cache mode.
+#
+# native_exit pins the three ways a process ends. Returning from main and
+# calling exit must run the guest's atexit handlers, most recent first, after
+# flushing nothing early, so stdout reads "buffered second first"; _exit must run
+# no handler and flush nothing, so a line the guest buffered and never flushed
+# is lost, exactly as it is on a real system. In native mode a guest's atexit and
+# stdio are the host's, so this is the case that fails if main's return takes
+# the raw exit syscall, if exit lets the VM wind down before the handlers run,
+# since a callback into an exited VM is refused, or if _exit ends through
+# ocerz's own exit and so flushes host stdio. Each way is compared with cache
+# mode, status and output.
 #
 # The callback, attach, thread, tlv_*, signal_* and cf_* cases skip where there
 # is no x86_64 clang, like the others, but a fixture of theirs that fails to
@@ -7951,22 +7964,76 @@ EOC
     record "$name" "$reason" "exit=$rc"
 }
 
+case_native_exit() {
+    local name=native_exit reason="" src="$TMP/exit_paths.c" bin="$TMP/exit_paths"
+    cat > "$src" <<'EOC'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static void first(void) { fputs(" first", stdout); }
+static void second(void) { fputs(" second", stdout); }
+int main(int argc, char **argv)
+{
+    atexit(first);
+    atexit(second);
+    fputs("buffered", stdout);
+    if (argc > 1 && argv[1][0] == 'e')
+        exit(3);
+    if (argc > 1 && argv[1][0] == 'u')
+        _exit(4);
+    return 2;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -o "$bin" "$src" >/dev/null 2>&1; then
+        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    fi
+    local how rc crc detail=""
+    for how in return e u; do
+        local out="$TMP/native_exit.$how.out" cout="$TMP/cache_exit.$how.out"
+        run_bounded "$out" "$TMP/native_exit.$how.err" "$OCERZ" -native "$bin" "$how"
+        rc=$?
+        detail="$detail $how=$rc"
+        if [ -n "$reason" ]; then
+            continue
+        fi
+        if [ "$CACHE_OK" -eq 1 ]; then
+            run_bounded "$cout" "$TMP/cache_exit.$how.err" "$OCERZ" -cache "$bin" "$how"
+            crc=$?
+            if [ "$rc" -ne "$crc" ]; then
+                reason="$how: native exit $rc, cache exit $crc"
+            elif ! cmp -s "$out" "$cout"; then
+                reason="$how: native wrote '$(cat "$out")', cache wrote '$(cat "$cout")'"
+            fi
+        fi
+    done
+    if [ -z "$reason" ]; then
+        if ! grep -qx 'buffered second first' "$TMP/native_exit.return.out"; then
+            reason="returning from main wrote '$(cat "$TMP/native_exit.return.out")', want the buffered text then both atexit handlers in reverse order"
+        elif ! grep -qx 'buffered second first' "$TMP/native_exit.e.out"; then
+            reason="exit wrote '$(cat "$TMP/native_exit.e.out")', want the buffered text then both atexit handlers in reverse order"
+        elif [ -s "$TMP/native_exit.u.out" ]; then
+            reason="_exit wrote '$(cat "$TMP/native_exit.u.out")', want nothing: it runs no handlers and flushes nothing"
+        fi
+    fi
+    record "$name" "$reason" "exits:$detail"
+}
+
 case_native_unbound() {
     local name=native_unbound rc reason="" src="$TMP/unbound.c" bin="$TMP/unbound"
     local out="$TMP/native_unbound.out" err="$TMP/native_unbound.err"
     cat > "$src" <<'EOC'
-#include <pwd.h>
-int main(void) { return getpwnam("root") != 0; }
+#include <zlib.h>
+int main(void) { return zlibVersion()[0] == 0; }
 EOC
-    if ! clang -arch x86_64 -fno-stack-protector -o "$bin" "$src" >/dev/null 2>&1; then
+    if ! clang -arch x86_64 -fno-stack-protector -o "$bin" "$src" -lz >/dev/null 2>&1; then
         echo "SKIP $name (no x86_64 clang toolchain)"; return
     fi
     run_bounded "$out" "$err" "$OCERZ" -v -native "$bin"
     rc=$?
     if [ "$rc" -ne 71 ]; then
         reason="exit $rc, want 71"
-    elif ! grep -Fq "${NOBIND}_getpwnam" "$out" "$err"; then
-        reason="no 'no bridge for _getpwnam' line"
+    elif ! grep -Fq "${NOBIND}_zlibVersion" "$out" "$err"; then
+        reason="no 'no bridge for _zlibVersion' line"
     elif ! grep -Fq "$M0_SUMMARY" "$out" "$err"; then
         reason="no unresolved-import summary line"
     fi
@@ -8108,6 +8175,7 @@ case_native_static
 case_native_unbound
 case_native_float
 case_native_classic_bind
+case_native_exit
 
 echo "----------------------------------------"
 echo "native tests: $pass passed, $fail failed"

@@ -149,7 +149,7 @@ static const char *const kCFBridged[] = {
 static const char *const kNoDescriptor[][2] = {
     { "/usr/lib/libSystem.B.dylib", "dyld_stub_binder" },
     { "/usr/lib/libSystem.B.dylib", "_dlopen" },
-    { "/usr/lib/libSystem.B.dylib", "_lseek" },
+    { "/usr/lib/libSystem.B.dylib", "_fork" },
     { "/usr/lib/libSystem.B.dylib", "___stack_chk_guard" },
     { OCERZ_BRIDGE_COREFOUNDATION, "_kCFAllocatorDefault" },
     { OCERZ_BRIDGE_COREFOUNDATION, "_kCFTypeArrayCallBacks" },

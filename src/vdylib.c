@@ -227,17 +227,19 @@
  * memcpy a million times.  Two threads that race to fill the same word store
  * the same pointer, because the bridge makes each descriptor once.
  *
- * ---- the one stub that keeps r11 ----
+ * ---- the stubs that keep r11 ----
  * An ordinary export's stub loads its id into r11, which is free to do: r11 is
  * a scratch register in the System V ABI and every linker stub on the platform
  * clobbers it.  __tlv_bootstrap is not an ordinary function.  It is the thunk a
  * thread-local variable's descriptor calls, and that calling convention keeps
  * every register but rax, so clang does hold live values in r11 across a
  * thread-local access; a program that loaded one thread-local into r11 and then
- * touched another read back garbage.  The stub of a special record whose
- * handler is tlv_bootstrap therefore pushes r11 before loading the id, which
- * still fits the sixteen-byte stride, and that handler puts r11 back from the
- * stack before it returns.  Keying the push on the handler rather than on the
+ * touched another read back garbage.  The stack probe ___chkstk_darwin has the
+ * same contract for the same reason: clang calls it from a function prologue
+ * and expects every register back.  The stub of a special record whose handler
+ * is tlv_bootstrap or chkstk therefore pushes r11 before loading the id, which
+ * still fits the sixteen-byte stride, and those handlers put r11 back from the
+ * stack before they return.  Keying the push on the handler rather than on the
  * export's name keeps the two halves of that convention in one record.
  *
  * ---- dyld_stub_binder ----
@@ -662,9 +664,10 @@ static void vd_write_section(uint8_t *p, const char *sect, const char *seg,
     wr32(p + 76, 0);
 }
 
-static int vd_is_tlv_bootstrap(const OcerzApiEntry *e)
+static int vd_keeps_r11(const OcerzApiEntry *e)
 {
-    return e->kind == OCERZ_API_SPECIAL && e->handler && strcmp(e->handler, "tlv_bootstrap") == 0;
+    return e->kind == OCERZ_API_SPECIAL && e->handler &&
+           (strcmp(e->handler, "tlv_bootstrap") == 0 || strcmp(e->handler, "chkstk") == 0);
 }
 
 uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym host_sym,
@@ -847,7 +850,7 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
         stub_index++;
         uint8_t *s = buf + stub_addr;
         uint32_t at = 0;
-        if (vd_is_tlv_bootstrap(e)) {
+        if (vd_keeps_r11(e)) {
             s[at++] = 0x41;
             s[at++] = 0x53;
         }

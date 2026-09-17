@@ -187,6 +187,14 @@
  * registration that would do nothing is not made at all.  Mapping the segments
  * and handing __TEXT back its protection is the whole of the work.
  *
+ * A guest's main returns into a few bytes ocerz writes at the top of its stack.
+ * In cache mode they make the exit syscall with main's result, since dyld's own
+ * start has already been bypassed.  In native mode they call the virtual
+ * libSystem's _exit export instead, the C library's exit, because that is what
+ * start does on a real system and it is what runs the guest's atexit handlers
+ * and flushes its stdio; the exit syscall stays behind the call only as the path
+ * taken if that export is missing.
+ *
  * ---- thread-local variables in native mode ----
  * Descriptors are rewritten into the same packed form as in cache mode, but the
  * thunk word is left exactly as the fixups bound it.  In cache mode the import
@@ -2853,6 +2861,27 @@ static uint32_t native_image_minos(const uint8_t *mh)
     return 0;
 }
 
+static void native_exit_through_libsystem(const DynFrame *fr)
+{
+    DynImage *libsys = dimg_find_by_install_name("/usr/lib/libSystem.B.dylib");
+    int found = 0;
+    uint64_t exit_fn = libsys ? ocerz_image_self_resolve_ex(libsys, "_exit", &found) : 0;
+    if (!found || !exit_fn)
+        return;
+    uint8_t code[] = {
+        0x89, 0xc3,
+        0x48, 0x83, 0xec, 0x08,
+        0x89, 0xc7,
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xff, 0xd0,
+        0x89, 0xdf,
+        0xb8, 0x01, 0x00, 0x00, 0x02,
+        0x0f, 0x05,
+    };
+    memcpy(code + 10, &exit_fn, sizeof exit_fn);
+    memcpy(ocerz_g2h(fr->exit_stub), code, sizeof code);
+}
+
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
 {
     if (ocerz_mem_init_identity(DYN_ARENA_SIZE) != OCERZ_OK)
@@ -2953,6 +2982,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         free(buf);
         return OCERZ_ENOMEM;
     }
+    if (ocerz_mode == OCERZ_MODE_NATIVE)
+        native_exit_through_libsystem(&fr);
 
     uint64_t tsd = ocerz_map_anywhere(0x8000, PROT_READ | PROT_WRITE);
     if (tsd == 0) {
