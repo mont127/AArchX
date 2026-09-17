@@ -119,6 +119,57 @@
  * Wine has a handler for these anyway, which is both the faithful emulation and
  * free of ReportCrash.
  *
+ * ---- signals in native mode ----
+ * Native mode has no x86 libc in front of these calls, so sigaction, signal,
+ * sigprocmask, sigaltstack, raise and pthread_kill arrive as bridged calls with
+ * plain arguments and hand back 0 or a positive errno.  Each is built from the
+ * syscall's own body with the register plumbing peeled off - the table install
+ * and its host mirror, the oldact writer, the mask and altstack updates, the
+ * decision a self-directed kill makes between pending, delivered, fatal and
+ * forwarded - so a program that mixes a raw syscall with a bridged call sees one
+ * handler table and one mask, and a fix to either path is a fix to both.  The
+ * argument checks are the native side's alone, so the syscall path goes on
+ * accepting exactly what it always has: a signal outside 1..31 is EINVAL, and so
+ * is any sigaction on SIGKILL or SIGSTOP, a pure query included, which is what
+ * the host kernel answers under Rosetta and natively alike.  One check is
+ * shared: an alternate stack smaller than MINSIGSTKSZ is refused with ENOMEM on
+ * both paths, as the kernel refuses it, after the old stack has been written
+ * back; the syscall path used to install it.
+ * signal() installs with an empty mask and SA_RESTART, as Apple's x86 libc does
+ * for any signal siginterrupt() has not been told about.
+ *
+ * What native mode lacks is the trampoline.  libc's sigaction hands the kernel
+ * _sigtramp as sa_tramp, and ocerz_signal_deliver enters it with the handler in
+ * rdi, the signal in edx, the siginfo in rcx, the ucontext in r8 and the
+ * sigreturn token in r9, on a stack 8 bytes below a 16-byte boundary as though a
+ * call had just pushed a return address.  The stand-in is Apple's routine
+ * reassembled without its __in_sigtramp counter: the same frame push, the
+ * arguments moved into (sig, siginfo, ucontext), which a one-argument handler
+ * receives as harmlessly as an SA_SIGINFO one does, the ucontext and token held
+ * in callee-saved rbx and r12 across the handler, then sigreturn(ucontext,
+ * UC_FLAVOR, token) made as a syscall in place rather than through a stub.  It
+ * realigns the stack before the call whatever it was entered with, and a ud2
+ * follows the syscall, so a sigreturn that fails can only stop the thread and
+ * never runs into whatever lies beyond.  It is written once into a guest page
+ * of its own that is then made read-execute; the host never runs guest bytes,
+ * only their translations, so the host page is simply read-only.
+ *
+ * A bridged raise does not deliver.  The handler's frame has to sit on the state
+ * that follows the call, and that state only exists once the crossing has
+ * returned, so a signal that has a handler is left pending and the bridge hands
+ * it to ocerz_guest_deliver_pending afterwards; one without a handler takes the
+ * syscall path's default action on the spot.  The syscall path meets the same
+ * rule from the other side: its self-directed kill does build the frame at once,
+ * so it writes the syscall's result first, since the frame records the state
+ * the handler returns to, and a frame built before the result was written used
+ * to hand the program back a raise that had run its handler and then reported
+ * failure.  pthread_kill aimed at another
+ * thread is forwarded to the host just as the syscall forwards it: the real
+ * signal lands on the target, whose mirrored handler records it exactly as it
+ * records one sent from outside the process, and that thread delivers it at its
+ * own next syscall or crossing.  Only a thread running a guest cpu can be named,
+ * and any other is ESRCH.
+ *
  * ---- pointers the kernel will write through ----
  * Before a syscall whose buffer the kernel writes (a read, a mach receive), any
  * page of that buffer carrying translations is unarmed: a copyout onto a
@@ -261,7 +312,10 @@ int ocerz_is_wqthread_exit(uint64_t rip)
     return start != 0 && rip == start + 0xf;
 }
 
+#define DARWIN_NSIG 32
+#define DARWIN_MINSIGSTKSZ 32768u
 #define DARWIN_SA_ONSTACK 0x0001u
+#define DARWIN_SA_RESTART 0x0002u
 #define DARWIN_SA_RESETHAND 0x0004u
 #define DARWIN_SA_NODEFER 0x0010u
 #define DARWIN_SA_SIGINFO 0x0040u
@@ -3410,27 +3464,104 @@ static int sys_bsdthread_terminate(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+static void guest_sigact_store_user(uint64_t oact, const GuestSigact *sa)
+{
+    ocerz_st(oact + 0, 8, sa->handler);
+    ocerz_st(oact + 8, 4, (uint32_t)sa->mask);
+    ocerz_st(oact + 12, 4, sa->flags);
+}
+
+static void guest_sigact_install(int sig, uint64_t handler, uint64_t tramp, uint32_t mask,
+                                 uint32_t flags)
+{
+    guest_sigact[sig].handler = handler;
+    guest_sigact[sig].tramp = tramp;
+    guest_sigact[sig].mask = mask;
+    guest_sigact[sig].flags = flags;
+    ocerz_vm_mirror_host_signal(sig, handler == 0 ? 0 : handler == 1 ? 1 : 2);
+}
+
+static int guest_sig_catchable(int sig)
+{
+    return sig > 0 && sig < OCERZ_NSIG && guest_sigact[sig].handler > 1 &&
+           guest_sigact[sig].tramp != 0;
+}
+
 static int sys_sigaction(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
     int sig = (int)a[0];
     uint64_t act = a[1];
     uint64_t oact = a[2];
-    if (oact != 0 && sig >= 0 && sig < OCERZ_NSIG) {
-        ocerz_st(oact + 0, 8, guest_sigact[sig].handler);
-        ocerz_st(oact + 8, 4, (uint32_t)guest_sigact[sig].mask);
-        ocerz_st(oact + 12, 4, guest_sigact[sig].flags);
-    }
+    if (oact != 0 && sig >= 0 && sig < OCERZ_NSIG)
+        guest_sigact_store_user(oact, &guest_sigact[sig]);
     if (act != 0 && sig >= 0 && sig < OCERZ_NSIG) {
-        guest_sigact[sig].handler = ocerz_ld(act, 8);
-        guest_sigact[sig].tramp = ocerz_ld(act + 8, 8);
-        guest_sigact[sig].mask = (uint32_t)ocerz_ld(act + 16, 4);
-        guest_sigact[sig].flags = (uint32_t)ocerz_ld(act + 20, 4);
-        uint64_t h = guest_sigact[sig].handler;
-        ocerz_vm_mirror_host_signal(sig, h == 0 ? 0 : h == 1 ? 1 : 2);
+        uint64_t handler = ocerz_ld(act, 8);
+        uint64_t tramp = ocerz_ld(act + 8, 8);
+        uint32_t mask = (uint32_t)ocerz_ld(act + 16, 4);
+        uint32_t flags = (uint32_t)ocerz_ld(act + 20, 4);
+        guest_sigact_install(sig, handler, tramp, mask, flags);
     }
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
+}
+
+#define GUEST_SELFSIG_HOST 0
+#define GUEST_SELFSIG_PENDING 1
+#define GUEST_SELFSIG_DELIVERED 2
+
+static int guest_selfkill_routed(void)
+{
+    static int route = -1;
+    if (route < 0) route = getenv("OCERZ_NO_GUEST_SELFKILL") ? 0 : 1;
+    return route;
+}
+
+static void guest_abort_note(OcerzCPU *cpu)
+{
+    fprintf(stderr, "ocerz: GUEST-ABORT[%d] cpu#%u rip=%#llx bt:",
+            (int)getpid(), cpu->cpu_number, (unsigned long long)cpu->rip);
+    uint64_t fp = cpu->gpr[OCERZ_RBP];
+    for (int d = 0; d < 10 && fp > 0x1000 && ocerz_addr_readable(fp + 8); d++) {
+        fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+        uint64_t nf = ocerz_ld(fp, 8);
+        if (nf <= fp) break;
+        fp = nf;
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+static int guest_self_signal(OcerzCPU *cpu, int signo, int defer)
+{
+    uint64_t bit = 1ull << (signo - 1);
+    if ((cpu->sig_mask & bit) || (defer && guest_sig_catchable(signo))) {
+        cpu->sig_pending |= bit;
+        return GUEST_SELFSIG_PENDING;
+    }
+    if (!defer && ocerz_signal_deliver(cpu, signo, 0, 0, 0))
+        return GUEST_SELFSIG_DELIVERED;
+    int fatal = (signo == 4 || signo == 5 || signo == 6 || signo == 8 ||
+                 signo == 10 || signo == 11 || signo == 3 || signo == 7);
+    if (fatal) {
+        { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("guest-abort"); }
+        fprintf(stderr, "ocerz: guest self-signal %llu rip=%#llx bt:",
+                (unsigned long long)signo, (unsigned long long)cpu->rip);
+        uint64_t fp = cpu->gpr[OCERZ_RBP];
+        for (int d = 0; d < 16 && fp > 0x1000 && ocerz_addr_readable(fp + 8); d++) {
+            fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+            uint64_t nf = ocerz_ld(fp, 8);
+            if (nf <= fp)
+                break;
+            fp = nf;
+        }
+        fprintf(stderr, "\n");
+        fprintf(stderr, "ocerz: guest self-signal %llu, no handler; exiting %d\n",
+                (unsigned long long)signo, 128 + signo);
+        fflush(stderr);
+        _exit(128 + signo);
+    }
+    return GUEST_SELFSIG_HOST;
 }
 
 static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
@@ -3445,55 +3576,19 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 (unsigned long long)(signo < OCERZ_NSIG ? guest_sigact[signo].handler : 0));
     }
     (void)vm; (void)signo;
-    if (signo == 6) {
-        fprintf(stderr, "ocerz: GUEST-ABORT[%d] cpu#%u rip=%#llx bt:",
-                (int)getpid(), cpu->cpu_number, (unsigned long long)cpu->rip);
-        uint64_t fp = cpu->gpr[OCERZ_RBP];
-        for (int d = 0; d < 10 && fp > 0x1000 && ocerz_addr_readable(fp + 8); d++) {
-            fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
-            uint64_t nf = ocerz_ld(fp, 8);
-            if (nf <= fp) break;
-            fp = nf;
-        }
-        fprintf(stderr, "\n");
-        fflush(stderr);
-    }
+    if (signo == 6)
+        guest_abort_note(cpu);
 
     {
-        static int route = -1;
-        if (route < 0) route = getenv("OCERZ_NO_GUEST_SELFKILL") ? 0 : 1;
+        int route = guest_selfkill_routed();
         mach_port_t self = mach_thread_self();
         int is_self = (a[0] == 0 || a[0] == (uint64_t)self);
         if (self) mach_port_deallocate(mach_task_self(), self);
-        if (route && is_self && signo > 0 && signo < OCERZ_NSIG &&
-            (cpu->sig_mask & (1ull << (signo - 1)))) {
-            cpu->sig_pending |= 1ull << (signo - 1);
-            ret_ok(cpu, 0);
-            return OCERZ_STEP_OK;
-        }
         if (route && is_self && signo > 0 && signo < OCERZ_NSIG) {
-            if (ocerz_signal_deliver(cpu, (int)signo, 0, 0, 0))
+            ret_ok(cpu, 0);
+            int how = guest_self_signal(cpu, (int)signo, 0);
+            if (how == GUEST_SELFSIG_PENDING || how == GUEST_SELFSIG_DELIVERED)
                 return OCERZ_STEP_OK;
-            int fatal = (signo == 4 || signo == 5 || signo == 6 || signo == 8 ||
-                         signo == 10 || signo == 11 || signo == 3 || signo == 7);
-            if (fatal) {
-                { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("guest-abort"); }
-                fprintf(stderr, "ocerz: guest self-signal %llu rip=%#llx bt:",
-                        (unsigned long long)signo, (unsigned long long)cpu->rip);
-                uint64_t fp = cpu->gpr[OCERZ_RBP];
-                for (int d = 0; d < 16 && fp > 0x1000 && ocerz_addr_readable(fp + 8); d++) {
-                    fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
-                    uint64_t nf = ocerz_ld(fp, 8);
-                    if (nf <= fp)
-                        break;
-                    fp = nf;
-                }
-                fprintf(stderr, "\n");
-                fprintf(stderr, "ocerz: guest self-signal %llu, no handler; exiting %d\n",
-                        (unsigned long long)signo, 128 + (int)signo);
-                fflush(stderr);
-                _exit(128 + (int)signo);
-            }
         }
     }
 
@@ -3506,12 +3601,8 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
-static int sys_sigprocmask(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+static void guest_sigmask_apply(OcerzCPU *cpu, int how, uint64_t set, uint64_t oset)
 {
-    (void)vm;
-    int how = (int)a[0];
-    uint64_t set = a[1];
-    uint64_t oset = a[2];
     if (oset != 0)
         ocerz_st(oset, 4, (uint32_t)cpu->sig_mask);
     if (set != 0) {
@@ -3523,15 +3614,18 @@ static int sys_sigprocmask(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         else
             cpu->sig_mask = v;
     }
+}
+
+static int sys_sigprocmask(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    guest_sigmask_apply(cpu, (int)a[0], a[1], a[2]);
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
 }
 
-static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+static int guest_sigaltstack_apply(OcerzCPU *cpu, uint64_t ss, uint64_t oss)
 {
-    (void)vm;
-    uint64_t ss = a[0];
-    uint64_t oss = a[1];
     if (oss != 0) {
         ocerz_st(oss + 0, 8, cpu->sig_altstack_sp);
         ocerz_st(oss + 8, 8, cpu->sig_altstack_size);
@@ -3544,6 +3638,8 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             cpu->sig_altstack_sp = 0;
             cpu->sig_altstack_size = 0;
         } else {
+            if (ocerz_ld(ss + 8, 8) < DARWIN_MINSIGSTKSZ)
+                return ENOMEM;
             cpu->sig_altstack_sp = ocerz_ld(ss + 0, 8);
             cpu->sig_altstack_size = ocerz_ld(ss + 8, 8);
 
@@ -3552,7 +3648,17 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                               3 );
         }
     }
-    ret_ok(cpu, 0);
+    return 0;
+}
+
+static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    int err = guest_sigaltstack_apply(cpu, a[0], a[1]);
+    if (err)
+        ret_err(cpu, (uint64_t)err);
+    else
+        ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
 }
 
@@ -3576,11 +3682,9 @@ __thread int g_ocerz_deliver_src;
 int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_code,
                          uint32_t err)
 {
-    if (sig <= 0 || sig >= OCERZ_NSIG)
+    if (!guest_sig_catchable(sig))
         return 0;
     GuestSigact *sa = &guest_sigact[sig];
-    if (sa->handler <= 1 || sa->tramp == 0)
-        return 0;
     {
         int src = g_ocerz_deliver_src;
         g_ocerz_deliver_src = 0;
@@ -3721,9 +3825,14 @@ static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
     return n;
 }
 
+static int guest_signal_ready(OcerzCPU *cpu)
+{
+    return ocerz_peek_pending_async_sig() || (cpu->sig_pending & ~cpu->sig_mask);
+}
+
 int ocerz_signal_before_syscall(OcerzCPU *cpu, uint64_t insn_rip)
 {
-    if (!ocerz_peek_pending_async_sig() && !(cpu->sig_pending & ~cpu->sig_mask))
+    if (!guest_signal_ready(cpu))
         return 0;
     uint64_t resume = cpu->rip;
     cpu->rip = insn_rip;
@@ -3813,6 +3922,148 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 restore_segbases ? " (restored)" : " (unchanged)");
     cpu->sig_on_stack = (uint32_t)ocerz_ld(uc + 0, 4) != 0;
     return OCERZ_STEP_OK;
+}
+
+static const uint8_t native_sigtramp_code[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xe4, 0xf0, 0x48, 0x89, 0xf8, 0x4c,
+    0x89, 0xc3, 0x4d, 0x89, 0xcc, 0x89, 0xd7, 0x48, 0x89, 0xce, 0x4c, 0x89,
+    0xc2, 0xff, 0xd0, 0x48, 0x89, 0xdf, 0xbe, 0x1e, 0x00, 0x00, 0x00, 0x4c,
+    0x89, 0xe2, 0xb8, 0xb8, 0x00, 0x00, 0x02, 0x0f, 0x05, 0x0f, 0x0b
+};
+
+static uint64_t g_native_sigtramp;
+static pthread_mutex_t g_native_sigtramp_lock = PTHREAD_MUTEX_INITIALIZER;
+
+uint64_t ocerz_native_sigtramp(struct OcerzVM *vm)
+{
+    (void)vm;
+    uint64_t tramp = __atomic_load_n(&g_native_sigtramp, __ATOMIC_ACQUIRE);
+    if (tramp)
+        return tramp;
+    pthread_mutex_lock(&g_native_sigtramp_lock);
+    tramp = __atomic_load_n(&g_native_sigtramp, __ATOMIC_ACQUIRE);
+    if (!tramp) {
+        uint64_t page = ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE);
+        if (page) {
+            memset(ocerz_g2h(page), 0xcc, OCERZ_GUEST_PAGE_SIZE);
+            memcpy(ocerz_g2h(page), native_sigtramp_code, sizeof native_sigtramp_code);
+            if (ocerz_protect(page, OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_EXEC) == OCERZ_OK) {
+                tramp = page;
+                __atomic_store_n(&g_native_sigtramp, tramp, __ATOMIC_RELEASE);
+            } else {
+                ocerz_unmap(page, OCERZ_GUEST_PAGE_SIZE);
+            }
+        }
+        if (!tramp)
+            fprintf(stderr,
+                    "ocerz: syscall: no read-only guest page could be set up for the native"
+                    " signal trampoline, so no signal handler can be installed\n");
+    }
+    pthread_mutex_unlock(&g_native_sigtramp_lock);
+    return tramp;
+}
+
+static int native_sig_settable(int sig)
+{
+    return sig > 0 && sig < DARWIN_NSIG && sig != SIGKILL && sig != SIGSTOP;
+}
+
+static int native_sigaction(OcerzVM *vm, int sig, const GuestSigact *nsa, uint64_t oact,
+                            uint64_t *old_handler)
+{
+    uint64_t tramp = 0;
+    if (nsa && !(tramp = ocerz_native_sigtramp(vm)))
+        return ENOMEM;
+    if (oact != 0)
+        guest_sigact_store_user(oact, &guest_sigact[sig]);
+    if (old_handler)
+        *old_handler = guest_sigact[sig].handler;
+    if (nsa)
+        guest_sigact_install(sig, nsa->handler, tramp, (uint32_t)nsa->mask, nsa->flags);
+    return 0;
+}
+
+int ocerz_guest_sigaction_user(struct OcerzVM *vm, OcerzCPU *cpu, int sig, uint64_t act,
+                               uint64_t oact)
+{
+    if (!native_sig_settable(sig))
+        return EINVAL;
+    GuestSigact nsa = { .handler = 0, .tramp = 0, .mask = 0, .flags = 0 };
+    if (act != 0) {
+        nsa.handler = ocerz_ld(act, 8);
+        nsa.mask = (uint32_t)ocerz_ld(act + 8, 4);
+        nsa.flags = (uint32_t)ocerz_ld(act + 12, 4);
+    }
+    return native_sigaction(vm, sig, act != 0 ? &nsa : NULL, oact, NULL);
+}
+
+int ocerz_guest_signal(struct OcerzVM *vm, OcerzCPU *cpu, int sig, uint64_t handler,
+                       uint64_t *old_handler)
+{
+    if (!native_sig_settable(sig))
+        return EINVAL;
+    GuestSigact nsa = { .handler = handler, .tramp = 0, .mask = 0, .flags = DARWIN_SA_RESTART };
+    return native_sigaction(vm, sig, &nsa, 0, old_handler);
+}
+
+int ocerz_guest_sigprocmask(struct OcerzVM *vm, OcerzCPU *cpu, int how, uint64_t set,
+                            uint64_t oset)
+{
+    guest_sigmask_apply(cpu, how, set, oset);
+    return 0;
+}
+
+int ocerz_guest_sigaltstack(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t ss, uint64_t oss)
+{
+    return guest_sigaltstack_apply(cpu, ss, oss);
+}
+
+static int native_kill_host(mach_port_t port, int sig)
+{
+    uint64_t a[8] = { port, (uint64_t)sig, 0, 0, 0, 0, 0, 0 };
+    int err = 0;
+    uint64_t r = ocerz_host_syscall(328, a, NULL, &err);
+    return err ? (int)r : 0;
+}
+
+int ocerz_guest_raise(struct OcerzVM *vm, OcerzCPU *cpu, int sig)
+{
+    if (sig < 0 || sig >= DARWIN_NSIG)
+        return EINVAL;
+    if (sig == 0)
+        return 0;
+    if (sig == 6)
+        guest_abort_note(cpu);
+    if (guest_selfkill_routed() && guest_self_signal(cpu, sig, 1) != GUEST_SELFSIG_HOST)
+        return 0;
+    return native_kill_host(pthread_mach_thread_np(pthread_self()), sig);
+}
+
+int ocerz_guest_pthread_kill(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t thread, int sig)
+{
+    if (sig < 0 || sig > DARWIN_NSIG)
+        return EINVAL;
+    pthread_t target = (pthread_t)(uintptr_t)thread;
+    if (target != NULL && pthread_equal(target, pthread_self()))
+        return ocerz_guest_raise(vm, cpu, sig);
+    mach_port_t port = target != NULL ? pthread_mach_thread_np(target) : MACH_PORT_NULL;
+    uint64_t gpr[16], rip, rflags;
+    if (port == MACH_PORT_NULL || ocerz_vm_thread_regs(port, gpr, &rip, &rflags) != 0)
+        return ESRCH;
+    if (sig == DARWIN_NSIG)
+        return EINVAL;
+    if (sig == 0)
+        return 0;
+    if (sig == 6)
+        guest_abort_note(cpu);
+    return native_kill_host(port, sig);
+}
+
+int ocerz_guest_deliver_pending(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    if (!guest_signal_ready(cpu))
+        return 0;
+    return deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig()) > 0;
 }
 
 static int sys_sigpending(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])

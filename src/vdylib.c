@@ -327,6 +327,15 @@ static const char *const vd_libsystem_syms[] = {
     "_sigaction",
     "_raise",
     "_kill",
+    "_sigprocmask",
+    "_pthread_sigmask",
+    "_sigaltstack",
+    "_pthread_kill",
+    "_sigemptyset",
+    "_sigfillset",
+    "_sigaddset",
+    "_sigdelset",
+    "_sigismember",
 };
 
 typedef struct VdVar {

@@ -57,6 +57,8 @@ int ocerz_vm_run(OcerzVM *vm);
 int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu);
 void ocerz_vm_request_exit(OcerzVM *vm, int code);
 void ocerz_vm_mirror_host_signal(int sig, int kind);
+uint32_t ocerz_peek_pending_async_sig(void);
+uint32_t ocerz_take_pending_async_sig(void);
 void ocerz_vm_install_handlers(OcerzVM *vm);
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top);
 

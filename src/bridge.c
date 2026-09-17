@@ -150,6 +150,34 @@
  * clang keeps live values in r11 across a thread-local access, so the entry
  * restores r11 from there before returning.  It raises no bridge frame, because
  * nothing it runs is native framework code.
+ *
+ * ---- signals ----
+ * A guest's signal handlers are x86 code, and a native sigaction cannot be
+ * handed one: the host kernel would jump into guest bytes.  So sigaction,
+ * signal, sigprocmask, pthread_sigmask, sigaltstack, raise, kill and
+ * pthread_kill are special entries that go to the same guest signal table,
+ * masks and alternate stacks the syscall path keeps, through the entry points
+ * src/syscall.c exports for exactly this, with a trampoline in guest memory
+ * standing in for the _sigtramp an x86 libc would have supplied.  Those entry
+ * points answer 0 or an errno, and the entries here turn that into the shape the
+ * guest's declaration promises: -1 with errno set for the POSIX calls, the errno
+ * itself for pthread_sigmask and pthread_kill, SIG_ERR for signal.  errno is the
+ * host's own, since ___error is bridged to the host's __error.  kill aimed at
+ * this process is raise, so that it runs its handler on the calling thread
+ * before returning; aimed anywhere else it is the host's kill.  The sigset
+ * helpers are plain crossings, since a sigset_t is the same 32 bits on both
+ * sides.
+ *
+ * A handler runs on the state after the call that raised it, so no entry builds
+ * a signal frame itself.  Each finishes its call first - result in RAX, return
+ * address popped - and only then asks whether anything is pending and unmasked,
+ * and delivers it on top of that finished state.  Every ordinary crossing asks
+ * the same question on its way out, and that is the delivery policy for native
+ * mode: a signal that arrives while a thread is inside native code, or one sent
+ * from another thread, reaches its handler when that thread's crossing returns,
+ * the way a cache-mode thread takes it at its next syscall.  The question is two
+ * loads and a branch, which a crossing already costing tens of nanoseconds does
+ * not notice.
  */
 #include "ocerz/bridge.h"
 #include "ocerz/abi.h"
@@ -157,8 +185,11 @@
 #include "ocerz/dyld.h"
 #include "ocerz/mem.h"
 #include "ocerz/interp.h"
+#include "ocerz/syscall.h"
 
 #include <dlfcn.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -210,6 +241,91 @@ static int br_tlv_bootstrap(struct OcerzVM *vm, OcerzCPU *cpu)
     cpu->gpr[OCERZ_RSP] = rsp + 16;
     cpu->gpr[OCERZ_RAX] = addr;
     return OCERZ_STEP_OK;
+}
+
+static void br_return(OcerzCPU *cpu, uint64_t rax)
+{
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    cpu->rip = ocerz_ld(rsp, 8);
+    cpu->gpr[OCERZ_RSP] = rsp + 8;
+    cpu->gpr[OCERZ_RAX] = rax;
+}
+
+static int br_settle(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    if (ocerz_peek_pending_async_sig() || (cpu->sig_pending & ~cpu->sig_mask))
+        ocerz_guest_deliver_pending(vm, cpu);
+    return OCERZ_STEP_OK;
+}
+
+static int br_posix(struct OcerzVM *vm, OcerzCPU *cpu, int err)
+{
+    if (err) {
+        errno = err;
+        br_return(cpu, (uint64_t)-1);
+    } else {
+        br_return(cpu, 0);
+    }
+    return br_settle(vm, cpu);
+}
+
+static int br_sigaction(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_posix(vm, cpu, ocerz_guest_sigaction_user(vm, cpu, (int)cpu->gpr[OCERZ_RDI],
+                                                        cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX]));
+}
+
+static int br_signal(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t old = 0;
+    int err = ocerz_guest_signal(vm, cpu, (int)cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI], &old);
+    if (err) {
+        errno = err;
+        old = (uint64_t)-1;
+    }
+    br_return(cpu, old);
+    return br_settle(vm, cpu);
+}
+
+static int br_sigprocmask(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_posix(vm, cpu, ocerz_guest_sigprocmask(vm, cpu, (int)cpu->gpr[OCERZ_RDI],
+                                                     cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX]));
+}
+
+static int br_pthread_sigmask(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int err = ocerz_guest_sigprocmask(vm, cpu, (int)cpu->gpr[OCERZ_RDI],
+                                      cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX]);
+    br_return(cpu, (uint64_t)(uint32_t)err);
+    return br_settle(vm, cpu);
+}
+
+static int br_sigaltstack(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_posix(vm, cpu, ocerz_guest_sigaltstack(vm, cpu, cpu->gpr[OCERZ_RDI],
+                                                     cpu->gpr[OCERZ_RSI]));
+}
+
+static int br_raise(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_posix(vm, cpu, ocerz_guest_raise(vm, cpu, (int)cpu->gpr[OCERZ_RDI]));
+}
+
+static int br_kill(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int pid = (int)cpu->gpr[OCERZ_RDI];
+    int sig = (int)cpu->gpr[OCERZ_RSI];
+    if (pid == getpid() && sig != 0)
+        return br_posix(vm, cpu, ocerz_guest_raise(vm, cpu, sig));
+    return br_posix(vm, cpu, kill(pid, sig) == 0 ? 0 : errno);
+}
+
+static int br_pthread_kill(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int err = ocerz_guest_pthread_kill(vm, cpu, cpu->gpr[OCERZ_RDI], (int)cpu->gpr[OCERZ_RSI]);
+    br_return(cpu, (uint64_t)(uint32_t)err);
+    return br_settle(vm, cpu);
 }
 
 static struct OcerzBridgeFn g_br_fns[] = {
@@ -288,11 +404,24 @@ static struct OcerzBridgeFn g_br_fns[] = {
     { BR_LIBSYSTEM, "_pthread_cond_signal",       "pthread_cond_signal",       "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "_pthread_cond_broadcast",    "pthread_cond_broadcast",    "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "_pthread_cond_destroy",      "pthread_cond_destroy",      "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_sigemptyset",               "sigemptyset",               "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_sigfillset",                "sigfillset",                "i(p)",           NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_sigaddset",                 "sigaddset",                 "i(pi)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_sigdelset",                 "sigdelset",                 "i(pi)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_sigismember",               "sigismember",               "i(pi)",          NULL, NULL, { 0, { 0 }, { { 0 } }, 0 } },
 
     { BR_LIBSYSTEM, "_exit",             NULL, NULL, br_exit,            NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "_abort",            NULL, NULL, br_abort,           NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "__tlv_bootstrap",   NULL, NULL, br_tlv_bootstrap,   NULL, { 0, { 0 }, { { 0 } }, 0 } },
     { BR_LIBSYSTEM, "___stack_chk_fail", NULL, NULL, br_stack_chk_fail,  NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_sigaction",        NULL, NULL, br_sigaction,       NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_signal",           NULL, NULL, br_signal,          NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_sigprocmask",      NULL, NULL, br_sigprocmask,     NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_sigmask",  NULL, NULL, br_pthread_sigmask, NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_sigaltstack",      NULL, NULL, br_sigaltstack,     NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_raise",            NULL, NULL, br_raise,           NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_kill",             NULL, NULL, br_kill,            NULL, { 0, { 0 }, { { 0 } }, 0 } },
+    { BR_LIBSYSTEM, "_pthread_kill",     NULL, NULL, br_pthread_kill,    NULL, { 0, { 0 }, { { 0 } }, 0 } },
 };
 
 #define BR_FNS ((int)(sizeof g_br_fns / sizeof g_br_fns[0]))
@@ -384,7 +513,10 @@ int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu, const struct OcerzBri
     if (fn->special)
         return fn->special(vm, cpu);
 
-    return br_cross(fn, cpu);
+    int rc = br_cross(fn, cpu);
+    if (rc != OCERZ_STEP_OK)
+        return rc;
+    return br_settle(vm, cpu);
 }
 
 typedef struct BrRow {

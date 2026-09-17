@@ -6,6 +6,11 @@
  * 2026-09-04).  And an unknown syscall fails the call rather than killing the
  * thread: aborting left Wine deadlocked when the thread died holding the
  * loader lock.  OCERZ_STRICT_SYSCALL restores the abort for bring-up.
+ *
+ * An alternate signal stack smaller than MINSIGSTKSZ is refused with ENOMEM,
+ * which is what the kernel answers natively and under Rosetta; the syscall path
+ * used to install it, so the nested-delivery test now uses a stack of legal
+ * size rather than the 16 KB one it was written with.
  */
 #include "ocerz/vm.h"
 #include "ocerz/syscall.h"
@@ -1342,9 +1347,9 @@ static void test_nested_signal_altstack_state(void)
     CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
 
     uint64_t gstack = scratch + 0x5280;
-    uint64_t alt = scratch + 0x9000;
+    uint64_t alt = scratch + 0x8000;
     ocerz_st(gstack + 0, 8, alt);
-    ocerz_st(gstack + 8, 8, 0x4000);
+    ocerz_st(gstack + 8, 8, 0x8000);
     ocerz_st(gstack + 16, 4, 0);
     set_args(cpu, bsd(53), gstack, 0, 0, 0, 0, 0);
     CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
@@ -1355,7 +1360,7 @@ static void test_nested_signal_altstack_state(void)
     CHECK(ocerz_signal_deliver(cpu, SIGUSR2, 0, 0, 0) == 1);
     uint64_t outer_uc = cpu->gpr[OCERZ_R8];
     CHECK(cpu->gpr[OCERZ_RSP] >= alt);
-    CHECK(cpu->gpr[OCERZ_RSP] < alt + 0x4000);
+    CHECK(cpu->gpr[OCERZ_RSP] < alt + 0x8000);
     CHECK(ocerz_ld(outer_uc + 0, 4) == 0);
     CHECK(cpu->sig_on_stack == 1);
 
@@ -1371,6 +1376,44 @@ static void test_nested_signal_altstack_state(void)
     set_args(cpu, bsd(184), outer_uc, 0, 0, 0, 0, 0);
     CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
     CHECK(cpu->sig_on_stack == 0);
+}
+
+static void test_sigaltstack_too_small(void)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    uint64_t gstack = scratch + 0x5280;
+    uint64_t gold = scratch + 0x52a0;
+    cpu->sig_altstack_sp = 0;
+    cpu->sig_altstack_size = 0;
+    cpu->sig_on_stack = 0;
+
+    ocerz_st(gstack + 0, 8, scratch + 0x8000);
+    ocerz_st(gstack + 8, 8, 32767);
+    ocerz_st(gstack + 16, 4, 0);
+    memset(ocerz_g2h(gold), 0xee, 24);
+    set_args(cpu, bsd(53), gstack, gold, 0, 0, 0, 0);
+    CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 1);
+    CHECK(cpu->gpr[OCERZ_RAX] == ENOMEM);
+    CHECK(cpu->sig_altstack_sp == 0);
+    CHECK(cpu->sig_altstack_size == 0);
+    CHECK(ocerz_ld(gold + 0, 8) == 0);
+    CHECK(ocerz_ld(gold + 8, 8) == 0);
+    CHECK(ocerz_ld(gold + 16, 4) == 0x0004u);
+
+    ocerz_st(gstack + 8, 8, 32768);
+    set_args(cpu, bsd(53), gstack, 0, 0, 0, 0, 0);
+    CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    CHECK(cpu->sig_altstack_sp == scratch + 0x8000);
+    CHECK(cpu->sig_altstack_size == 32768);
+
+    ocerz_st(gstack + 8, 8, 0);
+    ocerz_st(gstack + 16, 4, 0x0004u);
+    set_args(cpu, bsd(53), gstack, 0, 0, 0, 0, 0);
+    CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    CHECK(cpu->sig_altstack_sp == 0);
 }
 
 static void test_execve_bad_args(void)
@@ -1639,6 +1682,7 @@ int main(void)
     test_sigaction();
     test_sigreturn_restores_only_ocerz_segment_bases();
     test_nested_signal_altstack_state();
+    test_sigaltstack_too_small();
     test_machdep_gs_base();
     test_machdep_unknown();
     test_mach_task_self();
