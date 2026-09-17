@@ -139,8 +139,8 @@
  * half of XMM0..XMM7 with the high half zeroed, and stacked ones in an area
  * built below the stack top, so that at entry [RSP] is the sentinel, [RSP+8] is
  * the first stacked argument, and RSP is 8 modulo 16 as it is after a caller's
- * call.  It hands back both RAX and XMM0, since only the callee's signature
- * says which carries the result, and reports whether the guest actually
+ * call.  It hands back RAX, RDX, XMM0 and XMM1, since only the callee's
+ * signature says which carry the result, and reports whether the guest actually
  * returned or the process began exiting under it.  With nothing stacked that
  * frame is exactly the one ocerz_vm_call has always built, which is why both
  * are thin wrappers around one core rather than two copies of it: several of
@@ -2853,6 +2853,8 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     g_cur_cpu = prev_cpu;
     call->rax = local.gpr[OCERZ_RAX];
     call->xmm0 = local.xmm[0].lo;
+    call->rdx = local.gpr[OCERZ_RDX];
+    call->xmm1 = local.xmm[1].lo;
     return (local.rip != sentinel || vm->exited) ? 1 : 0;
 }
 

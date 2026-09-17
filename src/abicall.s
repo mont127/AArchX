@@ -4,21 +4,29 @@
  * This is the last step of a bridged call.  src/abi.c has already decided, from
  * the signature, which host register every guest argument belongs in, and hands
  * the answer over as two arrays of eight words plus a block of bytes for
- * whatever overflowed.  All that is left is to put those arrays into the real
- * registers and branch, which no C prototype can express and so lives here.
+ * whatever overflowed, an address for x8, and two arrays to put the result in.
+ * All that is left is to put those arrays into the real registers and branch,
+ * which no C prototype can express and so lives here.
  *
  * ---- why the incoming arguments move before the outgoing ones load ----
  * The registers to be loaded are the registers the call arrives in.  fn is in
- * x0, the two arrays in x1 and x2, the overflow block in x3 and x4, the two
- * result slots in x5 and x6.  Loading x0 from the array destroys fn; loading x1
- * destroys the array still being read; loading x5 and x6 destroys where the
- * result has to go.  So everything still needed is relocated into x19 to x23,
- * which a callee must preserve, before a single outgoing register is touched,
- * and the eight pairs then load in one run with nothing live in x0 to x7.  Done
- * by halves instead - load some arguments, then reach for another incoming
- * pointer - the call is correct for the arities whose registers happen not to
- * overlap and quietly wrong for the rest, which is the failure this shape
- * exists to rule out rather than to test for.
+ * x0, the two arrays in x1 and x2, the overflow block in x3 and x4, the x8
+ * address in x5, the two result arrays in x6 and x7.  Loading x0 from the array
+ * destroys fn; loading x1 destroys the array still being read; loading x5
+ * destroys the x8 address, and x6 and x7 where the result has to go.  So
+ * everything still needed is relocated into x19 to x23, which a callee must
+ * preserve, and the x8 address straight into x8, which nothing between here and
+ * the call touches, before a single argument register is loaded, and the eight
+ * pairs then load in one run with nothing live in x0 to x7.  Done by halves
+ * instead - load some arguments, then reach for another incoming pointer - the
+ * call is correct for the arities whose registers happen not to overlap and
+ * quietly wrong for the rest, which is the failure this shape exists to rule
+ * out rather than to test for.
+ *
+ * x8 is the indirect result register.  A callee returning a structure of more
+ * than sixteen bytes that is not an aggregate of floats or doubles writes it
+ * through x8, and a callee returning anything else ignores it, so the address
+ * src/abi.c passes, its own result buffer or zero, is loaded for every call.
  *
  * ---- the stack ----
  * Overflow arguments sit at sp and upwards as the callee is entered, so the
@@ -30,12 +38,13 @@
  * same arithmetic.  The size is a byte count and is copied as one, tail
  * included: Apple gives a stacked argument only as much room as its type needs
  * rather than the eight bytes the generic AArch64 standard reserves, so a lone
- * stacked float or int is four bytes and the block need not be a multiple of
- * eight.  That packing rule is for an ordinary callee only.  A variadic callee
- * on this platform is the opposite case: everything past the named arguments
- * goes on the stack in eight-byte slots with the floating-point registers
- * untouched, which is a different layout entirely and not one the caller above
- * can describe, so a variadic function is refused rather than called from here.
+ * stacked float or int is four bytes, a stacked aggregate of three floats is
+ * twelve, and the block need not be a multiple of eight.  That packing rule is
+ * for an ordinary callee only.  A variadic callee on this platform is the
+ * opposite case: everything past the named arguments goes on the stack in
+ * eight-byte slots with the floating-point registers untouched, which is a
+ * different layout entirely and not one the caller above can describe, so a
+ * variadic function is refused rather than called from here.
  *
  * ---- why the v registers take a 64-bit load ----
  * Each word of the second array is loaded with an ldp of d registers, which
@@ -47,9 +56,15 @@
  * ever occupies and leaving the odd-numbered registers holding whatever lies
  * eight words past the end of the array.
  *
- * A null result slot means the caller does not want that half of the result,
- * which is what a void return, and any return that touches only one bank, asks
- * for.
+ * ---- the result ----
+ * After the call x0 and x1 are stored into the first result array and the low
+ * 64 bits of v0 to v3 into the second, as d0 to d3.  That is every register a
+ * result can come back in: a scalar in x0 or v0, a structure of sixteen bytes or
+ * less in x0 and x1, and an aggregate of up to four floats or doubles in v0 to
+ * v3, a float member being the low half of its word as it is on the way in.
+ * Storing registers the callee did not set costs four instructions and leaves
+ * the choice of which to read to the signature.  A null result array means the
+ * caller does not want that half of the result.
  *
  * ---- the callback bank ----
  * The rest of the file runs the other way: native code calling guest code.  A
@@ -77,12 +92,16 @@
  * It takes the incoming stack pointer before its own frame moves it, because
  * that is where the caller's stacked arguments begin, then saves x0..x7 and the
  * low 64 bits of v0..v7 in the same representation the forward caller loads, so
- * a float is the low half of its word.  The dispatcher gets the slot index, the
- * two arrays, the caller's stack and two words to write the result into, and
- * the entry loads x0 and d0 from those words on the way out.  Its frame is
- * exactly 160 bytes, a record plus sixteen argument words plus two result
- * words, so sp is a multiple of sixteen at every instruction and not merely at
- * the call.
+ * a float is the low half of its word.  x8 is saved by handing it straight to
+ * the dispatcher as an argument, which is safe because neither a slot nor the
+ * entry writes x8 before the call; a native caller expecting a large structure
+ * back has put the address of its buffer there, and the dispatcher writes the
+ * structure through it.  The dispatcher gets the slot index, the two arrays,
+ * the caller's stack, x8, and six zeroed words to write the result into, two
+ * for x0 and x1 and four for d0 to d3, and the entry loads all six on the way
+ * out.  Its frame is exactly 192 bytes, a record plus sixteen argument words
+ * plus six result words, so sp is a multiple of sixteen at every instruction
+ * and not merely at the call.
  */
 .section __TEXT,__text,regular,pure_instructions
 .globl _ocerz_abi_call_native
@@ -108,8 +127,9 @@ _ocerz_abi_call_native:
     mov     x19, x0
     mov     x20, x1
     mov     x21, x2
-    mov     x22, x5
-    mov     x23, x6
+    mov     x22, x6
+    mov     x23, x7
+    mov     x8, x5
 
     mov     x9, x3
     mov     x10, x4
@@ -143,14 +163,14 @@ Largs:
     ldp     x2, x3, [x20, #16]
     ldp     x4, x5, [x20, #32]
     ldp     x6, x7, [x20, #48]
-    mov     x8, #0
     blr     x19
 
     cbz     x22, Lnoint
-    str     x0, [x22]
+    stp     x0, x1, [x22]
 Lnoint:
     cbz     x23, Lnofp
-    str     d0, [x23]
+    stp     d0, d1, [x23]
+    stp     d2, d3, [x23, #16]
 Lnofp:
     sub     sp, x29, #48
     ldp     x29, x30, [sp, #48]
@@ -175,12 +195,12 @@ _ocerz_abi_callback_bank_end:
 _ocerz_abi_callback_common:
     .cfi_startproc
     mov     x17, sp
-    stp     x29, x30, [sp, #-160]!
-    .cfi_def_cfa_offset 160
-    .cfi_offset w30, -152
-    .cfi_offset w29, -160
+    stp     x29, x30, [sp, #-192]!
+    .cfi_def_cfa_offset 192
+    .cfi_offset w30, -184
+    .cfi_offset w29, -192
     mov     x29, sp
-    .cfi_def_cfa w29, 160
+    .cfi_def_cfa w29, 192
     stp     x0, x1, [sp, #16]
     stp     x2, x3, [sp, #32]
     stp     x4, x5, [sp, #48]
@@ -190,6 +210,9 @@ _ocerz_abi_callback_common:
     stp     d4, d5, [sp, #112]
     stp     d6, d7, [sp, #128]
     stp     xzr, xzr, [sp, #144]
+    stp     xzr, xzr, [sp, #160]
+    stp     xzr, xzr, [sp, #176]
+    mov     x4, x8
     adrp    x0, _ocerz_abi_callback_bank@PAGE
     add     x0, x0, _ocerz_abi_callback_bank@PAGEOFF
     sub     x0, x16, x0
@@ -197,12 +220,13 @@ _ocerz_abi_callback_common:
     add     x1, sp, #16
     add     x2, sp, #80
     mov     x3, x17
-    add     x4, sp, #144
-    add     x5, sp, #152
+    add     x5, sp, #144
+    add     x6, sp, #160
     bl      _ocerz_abi_callback_dispatch
-    ldr     x0, [sp, #144]
-    ldr     d0, [sp, #152]
-    ldp     x29, x30, [sp], #160
+    ldp     x0, x1, [sp, #144]
+    ldp     d0, d1, [sp, #160]
+    ldp     d2, d3, [sp, #176]
+    ldp     x29, x30, [sp], #192
     ret
     .cfi_endproc
 

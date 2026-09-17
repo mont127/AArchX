@@ -22,6 +22,7 @@
  *     l  64-bit signed         L  64-bit unsigned
  *     p  pointer, converted between the guest and host views
  *     f  32-bit float          d  64-bit double
+ *     {...}  a structure by value, described below
  *
  * Reading the guest side means walking the arguments in order, handing each to
  * the next free integer register of RDI, RSI, RDX, RCX, R8, R9 or the next free
@@ -73,12 +74,117 @@
  * rounding mode, restores the default for the duration of the call, and puts the
  * guest's back afterwards.
  *
- * Structures passed or returned by value are deliberately not handled yet.  Both
- * ABIs split a small structure into pieces and classify each piece, and they
- * disagree about how, so that belongs in its own change with its own generated
- * tests rather than being smuggled in here.  A signature naming one is rejected
- * at parse time, which keeps an unsupported call an honest refusal instead of a
- * silently wrong one.
+ * ---- structures by value ----
+ * Objective-C passes and returns structures by value all the time: -frame
+ * returns a CGRect, -rangeOfString: an NSRange, and CGPoint, CGSize,
+ * NSEdgeInsets and CGAffineTransform travel the same way.  A structure is
+ * written in braces holding its members' classes in order, a member being one
+ * of the scalar classes b B h H i u l L p f d or another structure, so CGPoint
+ * is {dd}, CGRect {{dd}{dd}}, NSRange {LL}, CGAffineTransform {dddddd}, and
+ * -[NSView convertRect:toView:] is {{dd}{dd}}(pp{{dd}{dd}}p).  A structure may
+ * be a result or an argument, including inside a callback's signature.  v, c
+ * and an empty pair of braces are refused inside one, as is a structure with
+ * more than sixteen scalar members once its nesting is flattened, which is
+ * CATransform3D's count, or one nested more than eight deep.  A union has no
+ * notation.  The layout is the natural C one: each member at the next multiple
+ * of its alignment, which for every scalar class is its size, a nested
+ * structure aligned to its largest member, and the whole rounded up to its own
+ * alignment.  {bd} is sixteen bytes with d at 8, {bhb} six with h at 2 and the
+ * last b at 4, {{db}b} twenty-four with the last b at 16, and no two members
+ * ever share bytes or straddle an eightbyte boundary.
+ *
+ * Parsed, a structure's class is '{', in OcerzAbiSig.ret or arg[i], and its
+ * layout is beside it in ret_struct or arg_struct[i]: size, alignment, and the
+ * flattened scalar members, each with its class and its offset from the start
+ * of the outermost structure.  Nesting survives only in those offsets, and the
+ * offsets are all either ABI looks at.  A signature built by hand rather than
+ * parsed is checked before any call is made from it, and a '{' whose layout
+ * has no members, members that overlap, sit off their alignment or run past
+ * its end, or an eightbyte of a structure of sixteen bytes or less that no
+ * member starts in, is refused.
+ *
+ * A structure crosses as bytes.  It is gathered from wherever one ABI put it
+ * into a buffer laid out as the structure, a p member is converted between the
+ * guest and host views in place, and the buffer is scattered to wherever the
+ * other ABI wants it.  Neither ABI extends a narrow member: clang's arm64 caller
+ * passes {h} holding -3 as w0 = 0xfffd and the callee does its own sxth, and
+ * the x86 callee of {B} reads %dil with movzbl.  So a member is never extended,
+ * and the bytes of a register word or stack eightbyte past the structure's end
+ * are written as zero on either side, never passed on.
+ *
+ * On the x86-64 side a structure of more than sixteen bytes is class MEMORY,
+ * as one with unaligned fields would be, which the notation cannot describe.
+ * As an argument it is copied onto the stack, its eightbytes taking their place
+ * in order among the other stacked arguments; as a result the caller passes a
+ * pointer to space for it in rdi, ahead of every integer argument, and the
+ * callee hands the same pointer back in rax.  A smaller structure is one or two
+ * eightbytes, each INTEGER if any member starting in it is an integer or a
+ * pointer and SSE otherwise.  If the free integer and SSE registers do not
+ * cover all of its eightbytes, the whole structure goes on the stack and the
+ * registers stay free for the arguments after it.  A result puts its INTEGER
+ * eightbytes in rax then rdx and its SSE ones in xmm0 then xmm1, in order, so
+ * {dL} comes back in xmm0 and rax and {Ld} in rax and xmm0.  clang -arch x86_64
+ * shows all of it.  {B} is edi = 0x81 and {h} edi = 0xfffd.  {LL} is rdi and
+ * rsi, returned in rax and rdx.  {ff} is both floats in the low eight bytes of
+ * xmm0, read back with movshdup; {fff} is two in xmm0 and the third in xmm1;
+ * {fi} is one INTEGER eightbyte, rdi = 0x93fc00000 for {1.5f, 9}.  {df} is
+ * xmm0 and xmm1.  {fffff}, {ddd}, {dddd}, {ddddd}, {{dd}{dd}}, {LLL} and {pdi}
+ * are MEMORY: {LLL}(LLLLLL) takes rdi as its result pointer, the first five
+ * longs in rsi to r9 and the sixth at stack 0; LLLLLLL{LLL}L puts the seventh
+ * long at 0, the structure at 8 to 31 and the last long at 32.  LLLLL{LL}L
+ * stacks {LL} at 0 and 8 and still passes the last long in r9.
+ * ddddddd{dd}d stacks {dd} and passes the last double in xmm7, and six doubles
+ * then {fff} then f put {fff} in xmm6 and xmm7 and f at 0.  {dL} after five
+ * longs is xmm0 and r9 with the following long at 0, and after six longs is
+ * stacked at 0 and 8 with a following double in xmm0.  Eight longs then {B},
+ * {h}, {i}, {B}, a char, {bhb}, {fi} and {BBB} put the last two longs at 0 and 8
+ * and the rest at 16, 24, 32, 40, 48, 56, 64 and 72, one eightbyte each.
+ *
+ * On Apple's arm64 side a homogeneous floating-point aggregate, a structure
+ * whose flattened members are one to four and all f or all d, goes in
+ * consecutive v registers, one member each, if that many are free, and
+ * otherwise on the stack, after which no argument uses a v register.  Any
+ * other structure of more than sixteen bytes is copied by the caller into
+ * memory the caller owns, and a pointer to the copy is passed as an integer
+ * argument.  Any other structure of sixteen bytes or less takes one or two x
+ * registers if that many are free, and otherwise goes on the stack, after which
+ * no argument uses an x register.  A result that is such an aggregate comes
+ * back in d0 to d3 or s0 to s3, one of sixteen bytes or less in x0 and x1, and
+ * a larger one through a buffer the caller passes in x8; the callee need not
+ * return the buffer's address.  On the stack a small non-aggregate structure is
+ * a block of eight or sixteen bytes aligned to 8 whatever its own size and
+ * alignment, the caller writing whole words, while an aggregate is its members
+ * at their own size, aligned to its member's alignment.  clang -arch arm64
+ * shows all of it.  {ff}, {fff} and {ffff} are s0 to s3, {ddd}, {dddd} and
+ * {{dd}{dd}} d0 to d3, both as arguments and as results.  {fffff}, {ddddd},
+ * {LLL} and {pdi} are copied to the caller's frame with the address in x0,
+ * which the callee reads through, and are returned through x8.  {df} is not an
+ * aggregate and is x0 holding the double's bits and w1 the float's, returned
+ * the same way.  Seven longs then {LL} then a long stack {LL} at 0 and 8 and the
+ * long at 16, leaving x7 unused; seven longs then {iL} then an int put the int
+ * at 16.  Seven doubles then {dd} then a double stack {dd} at 0 and 8 and the
+ * double at 16, leaving d7 unused; six doubles then {fff} then a float put
+ * {fff} at 0, 4 and 8 and the float at 12.  Seven longs then {LLL} then a long
+ * pass the pointer in x7 and the long at 0; eight longs, a char, {LLL} and a
+ * char put the char at 0, the pointer at 8 and the char at 16.  Eight longs then
+ * {B}, {h}, {i}, {B}, a char, {bhb}, {fi} and {BBB} put them at 0, 8, 16, 24,
+ * 32, 40, 48 and 56, {bhb} after the char being aligned to 8 and not to its
+ * own 2.  Eight doubles then {ff}, {f}, {dd}, a float, {fff}, a char and {d} put
+ * them at 0, 8, 16, 32, 36, w0 and 48.  Eight longs then an int, {Li}, a char,
+ * {fff}, a char and {df} put the int at 0, {Li} at 8, the chars at 24 and 25,
+ * {fff} in s0 to s2 and {df} at 32.  Eight longs, eight doubles, then a char,
+ * {ff}, a char, {dd} and a float put them at 0, 4, 12, 16 and 32.
+ *
+ * The two classifications disagree often enough that nothing may be assumed.
+ * {ddd}, {dddd} and {{dd}{dd}} are MEMORY on x86 and three or four registers on
+ * arm64; {ff} is one xmm on x86 and two v registers on arm64; {df} is two xmm on
+ * x86 and two x registers on arm64; {fffff} is MEMORY on x86 and a pointer to a
+ * copy on arm64; and a spilled structure leaves the registers free for later
+ * arguments on x86 while on arm64 it closes them.  A copy made for an arm64
+ * callee lives in the OcerzAbiCall that ocerz_abi_read_guest fills, whose x
+ * words then point into it, so the call must be made from that same
+ * OcerzAbiCall without moving it.  A native result returned through x8 lands in
+ * the OcerzAbiCall too and is copied to the guest's result pointer afterwards.
  *
  * ---- calls in the other direction ----
  * Some native functions take a function pointer and call it: qsort calls its
@@ -90,7 +196,9 @@
  * and the slot's address is what the native callee receives.  Interning the same
  * function with the same signature twice returns the same address, so a native
  * library that compares callback pointers still sees one function.  A null
- * pointer stays null.  A nested signature may not itself name a callback.
+ * pointer stays null.  A nested signature may not itself name a callback, and
+ * is at most 47 characters, which leaves room for structures on both sides:
+ * {{dd}{dd}}(pp{{dd}{dd}}p) is already 25.
  *
  * Not every function pointer a guest passes is guest code.  In native mode an
  * exported variable such as kCFTypeArrayCallBacks is CoreFoundation's own, so a
@@ -119,15 +227,22 @@
  * repeated block and exhausting it is a named refusal, never a silent reuse.
  *
  * When native code calls a slot, the dispatcher reads that signature against the
- * native caller's x0..x7, v0..v7 and stacked arguments, packed the way Apple's
- * arm64 packs them, places the values where the System V ABI puts them for the
- * guest, and runs the guest function on the calling thread below its own stack
- * pointer, past the red zone.  The guest runs with its own rounding mode, not
- * the default the enclosing native call was given.  While it runs, the thread
- * is executing guest code again, so it must not count as inside a bridged call:
- * a guest fault there is an ordinary guest fault with an ordinary recovery, and
- * reporting it as a native-code fault would kill a process that was fine.  The
- * result is converted back and returned in x0 or v0.
+ * native caller's x0..x7, v0..v7, x8 and stacked arguments, packed the way
+ * Apple's arm64 packs them, places the values where the System V ABI puts them
+ * for the guest, and runs the guest function on the calling thread below its
+ * own stack pointer, past the red zone.  A structure argument is read from x
+ * registers, v registers, stack bytes or the copy an x word points at, and
+ * placed in guest registers or guest stack eightbytes; a MEMORY one is copied
+ * into the guest's stacked arguments.  A guest function returning a MEMORY
+ * structure is given space for it just below the dispatcher's stack top, the
+ * guest stack region the call runs on, and a pointer to that space in rdi.  The
+ * guest runs with its own rounding mode, not the default the enclosing native
+ * call was given.  While it runs, the thread is executing guest code again, so
+ * it must not count as inside a bridged call: a guest fault there is an
+ * ordinary guest fault with an ordinary recovery, and reporting it as a
+ * native-code fault would kill a process that was fine.  The result is
+ * converted back and returned in x0 or v0, a structure result in x0 and x1, in
+ * d0 to d3, or copied into the buffer the native caller passed in x8.
  *
  * A callback can also arrive on a thread with no guest personality at all, one
  * a native framework created for itself, such as a libdispatch worker.  The
@@ -142,16 +257,28 @@
 #include "ocerz/cpu.h"
 
 #define OCERZ_ABI_MAX_ARGS 16
-#define OCERZ_ABI_MAX_STACK 16
-#define OCERZ_ABI_CB_MAX 24
+#define OCERZ_ABI_MAX_STACK 64
+#define OCERZ_ABI_CB_MAX 48
 #define OCERZ_ABI_CALLBACK_SLOTS 4096
 #define OCERZ_ABI_CALLBACK_STRIDE 8
+#define OCERZ_ABI_STRUCT_MEMBERS 16
+#define OCERZ_ABI_STRUCT_BYTES 256
+
+typedef struct OcerzAbiStruct {
+    uint16_t size;
+    uint8_t align;
+    uint8_t nmember;
+    char member[OCERZ_ABI_STRUCT_MEMBERS];
+    uint8_t offset[OCERZ_ABI_STRUCT_MEMBERS];
+} OcerzAbiStruct;
 
 typedef struct OcerzAbiSig {
     char ret;
     char arg[OCERZ_ABI_MAX_ARGS];
     char cb[OCERZ_ABI_MAX_ARGS][OCERZ_ABI_CB_MAX];
     int nargs;
+    OcerzAbiStruct ret_struct;
+    OcerzAbiStruct arg_struct[OCERZ_ABI_MAX_ARGS];
 } OcerzAbiSig;
 
 typedef struct OcerzAbiCall {
@@ -161,6 +288,13 @@ typedef struct OcerzAbiCall {
     int nx;
     int nv;
     int nstack;
+    int nmem;
+    void *x8;
+    uint64_t guest_ret;
+    uint64_t rx[2];
+    uint64_t rv[4];
+    uint64_t ret[OCERZ_ABI_STRUCT_BYTES / 8];
+    uint64_t mem[OCERZ_ABI_MAX_ARGS * OCERZ_ABI_STRUCT_BYTES / 8];
 } OcerzAbiCall;
 
 int ocerz_abi_parse(const char *notation, OcerzAbiSig *out);
@@ -169,13 +303,13 @@ int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu,
                          OcerzAbiCall *call);
 
 void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu,
-                            uint64_t rx, uint64_t rv);
+                            const OcerzAbiCall *call);
 
 int ocerz_abi_perform(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu);
 
 void ocerz_abi_call_native(const void *fn, const uint64_t *x, const uint64_t *v,
-                           const uint64_t *stack, uint64_t stackbytes,
-                           uint64_t *out_x0, uint64_t *out_v0);
+                           const uint64_t *stack, uint64_t stackbytes, void *x8,
+                           uint64_t *out_x, uint64_t *out_v);
 
 void *ocerz_abi_callback_intern(uint64_t guest_fn, const char *notation);
 
@@ -184,8 +318,8 @@ int ocerz_abi_is_guest_code(uint64_t gptr);
 int ocerz_abi_callback_convert(uint64_t gptr, const char *notation, uint64_t *out);
 
 void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
-                                 const uint8_t *stack, uint64_t *out_x0,
-                                 uint64_t *out_v0);
+                                 const uint8_t *stack, void *x8, uint64_t *out_x,
+                                 uint64_t *out_v);
 
 extern const char ocerz_abi_callback_bank[];
 extern const char ocerz_abi_callback_bank_end[];

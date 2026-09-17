@@ -9,8 +9,9 @@
  * an initializer or a +load method needs.  ocerz_vm_call_abi is the general form
  * native callbacks need: integer arguments in RDI..R9, floating-point ones in the
  * low halves of XMM0..XMM7, the rest on the guest stack where the System V ABI
- * puts them, and both RAX and XMM0 handed back, since the callee's signature and
- * not the call site decides which one carries the result.  ocerz_vm_current_cpu
+ * puts them, and RAX, RDX, XMM0 and XMM1 handed back, since the callee's
+ * signature and not the call site decides which carry the result, a structure
+ * of two eightbytes taking two of them.  ocerz_vm_current_cpu
  * is the guest cpu the calling thread is running, or NULL on a thread that has
  * none.
  *
@@ -69,6 +70,8 @@ typedef struct OcerzGuestCall {
     int nstack;
     uint64_t rax;
     uint64_t xmm0;
+    uint64_t rdx;
+    uint64_t xmm1;
 } OcerzGuestCall;
 
 OcerzCPU *ocerz_vm_current_cpu(void);
