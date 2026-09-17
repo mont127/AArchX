@@ -52,7 +52,7 @@ make -j
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 109 / 109 |
 | native-mode gate (`-native`) | 61 / 61 |
-| native-mode unit suites: API database, image, bridge, ABI, callbacks, thread attach | 308 / 0, 110865 / 0, 693 / 0, 3888 / 0, 8528 / 0, 270 / 0 |
+| native-mode unit suites: API database, image, bridge, ABI, callbacks, thread attach | 308 / 0, 110865 / 0, 693 / 0, 27088 / 0, 9094 / 0, 270 / 0 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -345,7 +345,7 @@ $ ./ocerz -native ./hello_printf
 ocerz: bridge: /usr/lib/libSystem.B.dylib _printf not implemented
 ```
 
-Variadic functions stay out on purpose. Apple's arm64 passes every variadic argument on the stack in eight-byte slots and uses no floating-point register, the opposite of its packing for an ordinary call, so `printf` and `open` need veneers that know where the named arguments stop. Structures passed by value are refused when a signature is parsed, since both ABIs split them into pieces and classify each piece differently.
+Variadic functions stay out on purpose. Apple's arm64 passes every variadic argument on the stack in eight-byte slots and uses no floating-point register, the opposite of its packing for an ordinary call, so `printf` and `open` need veneers that know where the named arguments stop. A structure passed or returned by value is written with its members in braces, `{LL}` for `NSRange` and `{{dd}{dd}}` for `CGRect`, and crosses as bytes gathered from wherever one ABI put it and scattered to wherever the other wants it: System V classifies a small structure eightbyte by eightbyte and returns anything over sixteen bytes through a pointer in RDI, while Apple's arm64 passes up to four floats or doubles in vector registers, any other structure over sixteen bytes as a pointer to a copy, and returns the largest through x8.
 
 **What a crossing costs.** About 33 ns, measured as the difference between a guest loop calling `getpid` three million times and the same loop without the call. It is a cliff rather than a constant factor, and it shows up where calls are small and frequent:
 
