@@ -257,7 +257,7 @@
 # with cache mode, where the real x86 libpthread runs the same start routines on
 # threads ocerz creates for the guest.
 #
-# The thread, tlv_* and signal_* fixtures alone are built without
+# The thread, tlv_*, signal_* and cf_* fixtures alone are built without
 # -fno-stack-protector, and that is deliberate. clang emits the stack protector
 # by default, and a protected x86_64 function reads ___stack_chk_guard, which is
 # a data symbol rather than a function. Until M7a the virtual libSystem exported only functions, so a
@@ -564,10 +564,177 @@
 # action and ends the process, with status 158 for SIGUSR1 or 159 for SIGUSR2, and
 # the case says that is what the status means.
 #
-# The callback, attach, thread, tlv_* and signal_* cases skip where there is no
-# x86_64 clang, like the others, but a fixture of theirs that fails to compile
-# where a trivial x86_64 program compiles fine is a failure: skipping it would
-# hide a broken fixture indefinitely.
+# M8 gives native mode its first framework. A program linking CoreFoundation
+# binds its imports to a second virtual library, whose functions are crossings
+# into the host's own arm64 CoreFoundation and whose data exports are the host's
+# own variables: ___CFConstantStringClassReference, which every CFSTR literal in
+# the guest's __cfstring section carries as its isa, kCFTypeArrayCallBacks and
+# its dictionary siblings, which CoreFoundation may recognize by address, the
+# allocators, the booleans, kCFNull, the run loop modes and the three special
+# numbers. A CFTypeRef crosses unchanged in both directions, because native mode
+# runs in the identity map, where the object CoreFoundation returns is an
+# address the guest can hold, compare and hand back. What the bridge does
+# convert is a structure of function pointers passed by address -- an array's or
+# a dictionary's callbacks, a timer's, observer's or source's context -- whose
+# guest words it replaces with callback trampolines in a copy it passes instead.
+# Three cf_* fixtures cover it, compiled at test time against the SDK's own
+# CoreFoundation headers. Each writes one status line per group of checks,
+# "<name> <group> ok ..." or "<name> <group> bad:<hex> ...", with the bits
+# numbered in source order within the group, and then a last line, "<name> ok"
+# or "<name> bad:<hex>", whose bits are the groups that failed, in the same
+# order, so a failure names its group before its check. Progress notes go to
+# stderr, as in the signal fixtures. The fixtures run under both engines, which
+# must agree byte for byte, and are compared with cache mode, where the x86
+# CoreFoundation out of the shared cache makes the same calls.
+#
+# These cases have an oracle no earlier case had. Native mode calls the arm64
+# CoreFoundation and cache mode the x86 one, which is the same source built for
+# the other architecture, so each fixture is also built for arm64 and run
+# directly on the host, and its stdout must match the native run's as well. That
+# run is made first, because an arm64 build failing its own checks means the
+# fixture expects something CoreFoundation does not do, and then nothing about
+# the bridge can be read from the native run at all. Every line is written so
+# that both builds of CoreFoundation give the same answer: retain counts are
+# compared and printed only as deltas, since a constant or tagged object's
+# absolute count is whatever the framework says it is; hashes and pointers are
+# compared only with each other; and a description is searched for the text the
+# fixture put into it rather than printed, since it is full of addresses. Each
+# case checks with nm that its fixture imports nothing but names the virtual
+# CoreFoundation exports and libSystem functions the bridge implements, so that
+# a failure is about CoreFoundation and not about an import the fixture had no
+# business making. None of them is variadic, which rules out
+# CFStringCreateWithFormat, and none takes a structure by value, which rules out
+# every function taking a CFRange.
+#
+# Boolean and UniChar results are where the two conventions part. arm64 extends
+# them to 32 bits and x86 leaves everything above AL or AX undefined, so the
+# fixtures store every Boolean CoreFoundation returns in an int and compare it
+# with true or false rather than test it for zero, where a result of 2 would
+# pass, and read back characters above 0xff, where a result cut to a byte
+# changes.
+#
+# cf_basic makes the calls that take no guest code, in eight groups. string
+# creates a string from UTF-8 holding ASCII, Czech letters, a euro sign and a
+# character outside the BMP, and must read back its twenty UTF-16 units one by
+# one, its bytes through CFStringGetCString, and false from CFStringGetCString
+# into a buffer too small and into ASCII; CFStringCreateWithBytes must build the
+# same strings from UTF-16LE bytes and from a prefix of the UTF-8 ones, and must
+# read the same four kCFStringEncodingUnicode bytes in host order when
+# isExternalRepresentation is false and big-endian when it is true, which is the
+# one place a Boolean argument shows whether it arrived. literal is about CFSTR
+# literals themselves: an ASCII one and one the compiler lays down as UTF-16
+# must be strings, equal to and hashing like the same text created at run time,
+# with CFRetain handing the literal back unchanged, and the case checks that the
+# fixture imports ___CFConstantStringClassReference, without which it would
+# prove nothing about the isa. mutable appends to a mutable string and asks
+# CFStringCompare, which must answer exactly -1 where a CFComparisonResult cut
+# to 32 bits would not, CFStringHasPrefix, CFStringHasSuffix and the integer and
+# double values of strings. split separates a string with an empty field and
+# combines it back. array holds three objects in a CFArray with
+# kCFTypeArrayCallBacks, each of which must come back as the very pointer that
+# went in, the same pointer on every read, retained exactly once while it is
+# held, and a mutable array must keep its order and its references through an
+# append, an insert, a set, a remove and a remove-all. dict looks values up
+# through keys created separately from the ones stored, checks that
+# CFDictionaryGetKeysAndValues pairs every key with its own value, and uses
+# kCFCopyStringDictionaryKeyCallBacks to show that a mutable key was copied on
+# the way in. number round-trips SInt32, SInt64 and Float64 values through
+# CFNumber, compares them and reads kCFBooleanTrue, kCFBooleanFalse and the
+# special numbers, and data creates a CFData and watches its retain count move
+# by one and back.
+#
+# cf_callbacks puts guest code where CoreFoundation calls it, in four groups.
+# array gives a mutable array retain, release, copyDescription and equal
+# callbacks that are all guest functions, and counts their calls through
+# appends, a remove, a set, an insert, a CFEqual against an array of equal
+# elements and against one differing at its fourth element, a CFCopyDescription
+# and a mutable copy, down to the last release, when every element's own count
+# must be back at zero. One element's retain callback hands back a stand-in
+# instead of the element, and the array must hold the stand-in, which is the
+# proof that a guest callback's pointer result reached CoreFoundation. Every
+# array in the group is created with kCFAllocatorMalloc and every callback must
+# be handed that allocator, because CFArrayCreate passes a retain callback the
+# allocator its own caller passed while the mutable paths pass the array's, so a
+# null allocator would reach the guest as two different pointers. mixed copies
+# kCFTypeArrayCallBacks and replaces only equal with a guest function that
+# compares case-insensitively through a bridged CFStringCompare, so one
+# structure holds native retain, release and copyDescription words beside one
+# guest word: the native words must still retain and release, CFEqual must call
+# the guest word, and an array with the unmodified callbacks must not compare
+# equal at all, since CoreFoundation compares the two equal pointers before it
+# calls either. dict gives a dictionary guest hash and equal callbacks over
+# C-string keys and looks every key up through a copy at another address, so
+# equal has to run, and apply walks two dictionaries with
+# CFDictionaryApplyFunction and a guest applier that checks its context and sums
+# what it is handed, making bridged CFNumber calls from inside the applier for
+# one of them.
+#
+# Two things in cf_callbacks are there to catch a trampoline rather than a
+# CoreFoundation call. On x86_64 its three equal callbacks are declared to
+# return 64 bits and return their Boolean in the low byte with bits set above
+# it, which the x86 convention permits and a caller reading AL never sees, while
+# the arm64 CoreFoundation reads all of w0, so a trampoline that hands back RAX
+# without narrowing it turns every false into true. The arm64 build returns a
+# plain Boolean, as its own convention requires; an arm64 build given the x86
+# return instead fails every group. And the dict line prints a checksum of the
+# order in which CFDictionaryGetKeysAndValues hands the keys back. That order
+# follows the bucket each key's hash selects, so it comes out the same from
+# either CoreFoundation given the same 64-bit hashes, and a hash cut to 32 bits
+# on its way back from the guest moves keys between buckets: an arm64 build that
+# makes that cut itself passes its own checks and prints a different order.
+#
+# cf_runloop runs the main thread's run loop with a guest timer, observer and
+# version-0 source in the default mode, all with context retain and release
+# callbacks that count. The timer is created far in the future and moved to
+# 10 ms from now with CFRunLoopTimerSetNextFireDate, which
+# CFRunLoopTimerGetNextFireDate must then report exactly, and it repeats every
+# 10 ms; its first two callouts signal the source and wake the run loop, its
+# third calls CFRunLoopStop, and CFRunLoopRunInMode, bounded at CF_RUN_SECS
+# seconds, must return kCFRunLoopRunStopped. The source's perform callout must
+# have run once between each pair of fires, which is where the run loop services
+# a signalled source, and its schedule and cancel callouts once each, handed the
+# main run loop and the default mode, when it is added and when it is removed,
+# with the invalidation after the removal cancelling nothing more. The observer
+# asks for kCFRunLoopEntry and kCFRunLoopBeforeWaiting and must see exactly one
+# entry, first, and at least one wait. A wait before the first fire is certain,
+# because until a callout has signalled the source nothing lets the run loop
+# poll instead of sleeping. Later ones are not: after each of the first two
+# fires the run loop polls for the signalled source, and a next fire that has
+# already fallen due by then, which a thread preempted for longer than the
+# interval would find, is taken without a wait between. On an idle machine there
+# are three, but the count is checked only for that first wait and never
+# printed. Once the run is over every object is removed, invalidated and
+# released, and the context callbacks must balance. CoreFoundation retains a
+# timer's info around every callout and releases the last of it when the timer
+# is invalidated rather than when it is freed, so the timer's context sees four
+# retains and four releases by the time CFRunLoopTimerInvalidate returns, and
+# the observer's and the source's one of each.
+#
+# The cf runs, the arm64 ones included, are bounded at CF_TIMEOUT seconds, and a
+# run that times out names the last progress note its fixture wrote: the group
+# it was in, or for cf_runloop how far the run loop got. A fault inside a
+# crossing is reported as the BRIDGE-FAULT it is, and in the two fixtures that
+# hand CoreFoundation guest functions the case adds that native code jumping to
+# a guest function pointer left unconverted in a structure looks exactly like
+# that.
+#
+# native_classic_bind pins the one import every older Intel binary makes. A
+# program linked for a macOS before 12 uses classic lazy binding, whose
+# __stub_helper entries jump to dyld_stub_binder, so it imports that symbol from
+# libSystem even though the loader binds every lazy pointer before the guest
+# runs and no helper is ever reached. Without an export of that name, spelled
+# without the leading underscore every C symbol carries, such a program was
+# refused with 71 before its first instruction. The case links a small program
+# for 10.14, checks with otool and nm that it really has classic binds and
+# really imports dyld_stub_binder, so a toolchain that stops producing either is
+# reported as that, and then requires it to run and agree with cache mode.
+#
+# The callback, attach, thread, tlv_*, signal_* and cf_* cases skip where there
+# is no x86_64 clang, like the others, but a fixture of theirs that fails to
+# compile where a trivial x86_64 program compiles fine is a failure: skipping it
+# would hide a broken fixture indefinitely. So is a cf_* fixture whose arm64
+# build fails to compile where its x86_64 build did, since that leaves the case
+# without its host oracle.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -591,7 +758,7 @@ LIB=/usr/lib/libSystem.B.dylib
 UNIMPL_SYM=_printf
 BRIDGE_RE='^ocerz: bridge: [^ ]+ [^ ]+ not implemented$'
 NOBIND='ocerz: native: no bridge for '
-M0_SUMMARY='unresolved imports, no virtual frameworks are implemented yet'
+M0_SUMMARY='unresolved imports, which no virtual library exports'
 PROBE_VAR=OCERZ_BRIDGE_PROBE
 PROBE_VAL=bridge-probe-42
 PROBE_BIN=""
@@ -679,6 +846,39 @@ SIG_DEFAULT_WINCH='signal_default raising SIGWINCH'
 SIG_DEFAULT_MARK='signal_default raising SIGTERM'
 SIG_DEFAULT_PAST='signal_default survived'
 SIG_DEFAULT_STATUS=143
+CF_BASIC_BIN=""
+CF_BASIC_ARM64=""
+CF_CALLBACKS_BIN=""
+CF_CALLBACKS_ARM64=""
+CF_RUNLOOP_BIN=""
+CF_RUNLOOP_ARM64=""
+CF_TIMEOUT=30
+CF_RUN_SECS=5
+CF_FRAMEWORK=/System/Library/Frameworks/CoreFoundation.framework
+CF_CLASS_SYM=___CFConstantStringClassReference
+CF_STRUCT_RE='^ocerz: bridge: [^ ]+ (was handed a .* of version [0-9]+, which ocerz cannot convert|could not bind guest function )'
+CF_BRIDGED='___stack_chk_fail ___error _write _puts _putchar _strlen _strcmp _memcmp _memcpy _memset _malloc _free _getpid _time'
+CF_EXPORTS='_CFRetain _CFRelease _CFGetRetainCount _CFEqual _CFHash _CFGetTypeID _CFCopyDescription _CFGetAllocator'
+CF_EXPORTS="$CF_EXPORTS _CFStringGetTypeID _CFArrayGetTypeID _CFDictionaryGetTypeID _CFNumberGetTypeID _CFBooleanGetTypeID _CFDataGetTypeID"
+CF_EXPORTS="$CF_EXPORTS _CFStringCreateWithCString _CFStringCreateWithBytes _CFStringCreateCopy _CFStringCreateMutable _CFStringCreateMutableCopy"
+CF_EXPORTS="$CF_EXPORTS _CFStringAppendCString _CFStringAppend _CFStringGetLength _CFStringGetCharacterAtIndex _CFStringGetCString _CFStringGetCStringPtr"
+CF_EXPORTS="$CF_EXPORTS _CFStringGetMaximumSizeForEncoding _CFStringCompare _CFStringHasPrefix _CFStringHasSuffix _CFStringGetIntValue _CFStringGetDoubleValue"
+CF_EXPORTS="$CF_EXPORTS _CFStringCreateArrayBySeparatingStrings _CFStringCreateByCombiningStrings ___CFStringMakeConstantString"
+CF_EXPORTS="$CF_EXPORTS _CFArrayCreate _CFArrayCreateMutable _CFArrayCreateCopy _CFArrayCreateMutableCopy _CFArrayGetCount _CFArrayGetValueAtIndex"
+CF_EXPORTS="$CF_EXPORTS _CFArrayAppendValue _CFArrayInsertValueAtIndex _CFArraySetValueAtIndex _CFArrayRemoveValueAtIndex _CFArrayRemoveAllValues"
+CF_EXPORTS="$CF_EXPORTS _CFDictionaryCreate _CFDictionaryCreateMutable _CFDictionaryCreateCopy _CFDictionaryCreateMutableCopy _CFDictionaryGetCount"
+CF_EXPORTS="$CF_EXPORTS _CFDictionaryGetValue _CFDictionaryGetValueIfPresent _CFDictionaryContainsKey _CFDictionaryAddValue _CFDictionarySetValue"
+CF_EXPORTS="$CF_EXPORTS _CFDictionaryRemoveValue _CFDictionaryGetKeysAndValues _CFDictionaryApplyFunction"
+CF_EXPORTS="$CF_EXPORTS _CFNumberCreate _CFNumberGetValue _CFNumberGetType _CFNumberCompare _CFBooleanGetValue _CFDataCreate _CFDataGetLength _CFDataGetBytePtr"
+CF_EXPORTS="$CF_EXPORTS _CFAbsoluteTimeGetCurrent _CFRunLoopGetCurrent _CFRunLoopGetMain _CFRunLoopRun _CFRunLoopRunInMode _CFRunLoopStop _CFRunLoopWakeUp"
+CF_EXPORTS="$CF_EXPORTS _CFRunLoopAddTimer _CFRunLoopRemoveTimer _CFRunLoopTimerCreate _CFRunLoopTimerInvalidate _CFRunLoopTimerIsValid"
+CF_EXPORTS="$CF_EXPORTS _CFRunLoopTimerGetNextFireDate _CFRunLoopTimerSetNextFireDate _CFRunLoopObserverCreate _CFRunLoopAddObserver"
+CF_EXPORTS="$CF_EXPORTS _CFRunLoopRemoveObserver _CFRunLoopObserverInvalidate _CFRunLoopSourceCreate _CFRunLoopAddSource _CFRunLoopRemoveSource"
+CF_EXPORTS="$CF_EXPORTS _CFRunLoopSourceSignal _CFRunLoopSourceInvalidate"
+CF_EXPORTS="$CF_EXPORTS ___CFConstantStringClassReference _kCFAllocatorDefault _kCFAllocatorSystemDefault _kCFAllocatorMalloc _kCFAllocatorNull"
+CF_EXPORTS="$CF_EXPORTS _kCFTypeArrayCallBacks _kCFTypeDictionaryKeyCallBacks _kCFTypeDictionaryValueCallBacks _kCFCopyStringDictionaryKeyCallBacks"
+CF_EXPORTS="$CF_EXPORTS _kCFBooleanTrue _kCFBooleanFalse _kCFNull _kCFRunLoopDefaultMode _kCFRunLoopCommonModes"
+CF_EXPORTS="$CF_EXPORTS _kCFNumberPositiveInfinity _kCFNumberNegativeInfinity _kCFNumberNaN"
 MEASURE_BIN=/usr/bin/time
 
 unset OCERZ_MODE
@@ -4775,6 +4975,1381 @@ EOC
     done
 }
 
+build_cf_fixtures() {
+    local name
+
+    cat > "$TMP/cf_common.h" <<EOC
+#include <CoreFoundation/CoreFoundation.h>
+#include "cb_common.h"
+
+#define CF_RUN_SECS ${CF_RUN_SECS}
+
+static unsigned cf_failed, cf_group;
+
+static void cf_note(const char *tag, const char *what)
+{
+    char b[96];
+    cb_size n = 0;
+
+    while (*tag && n < 40)
+        b[n++] = *tag++;
+    b[n++] = ':';
+    b[n++] = ' ';
+    while (*what && n < sizeof b - 1)
+        b[n++] = *what++;
+    b[n++] = '\n';
+    write(2, b, n);
+}
+
+static unsigned cf_fold(unsigned h, unsigned v)
+{
+    h ^= v;
+    h *= 0x01000193u;
+    return h ^ (h >> 15);
+}
+
+static CFStringRef cf_make(const char *utf8)
+{
+    return CFStringCreateWithCString(kCFAllocatorDefault, utf8, kCFStringEncodingUTF8);
+}
+
+static int cf_text_is(CFStringRef s, const char *want)
+{
+    char buf[256];
+    int got;
+
+    if (s == 0)
+        return 0;
+    got = CFStringGetCString(s, buf, sizeof buf, kCFStringEncodingUTF8);
+    return got == true && strcmp(buf, want) == 0;
+}
+
+static int cf_equals_text(CFTypeRef v, const char *utf8)
+{
+    CFStringRef t = cf_make(utf8);
+    int eq;
+
+    if (t == 0)
+        return 0;
+    eq = v != 0 ? CFEqual(v, t) : -1;
+    CFRelease(t);
+    return eq == true;
+}
+
+static void cf_begin(const char *tag, const char *group, unsigned mask)
+{
+    cb_len = 0;
+    cb_str(tag);
+    cb_str(" ");
+    cb_str(group);
+    if (mask == 0) {
+        cb_str(" ok");
+    } else {
+        cb_str(" bad:");
+        cb_hex(mask);
+        cf_failed |= 1u << cf_group;
+    }
+    cf_group++;
+}
+
+static void cf_long(const char *key, long v)
+{
+    cb_str(" ");
+    cb_str(key);
+    cb_str("=");
+    if (v < 0) {
+        cb_str("-");
+        cb_dec((unsigned)-v);
+    } else {
+        cb_dec((unsigned)v);
+    }
+}
+
+static int cf_summary(const char *tag)
+{
+    cb_begin(tag, cf_failed);
+    cb_end();
+    return cf_failed != 0;
+}
+EOC
+
+    cat > "$TMP/cf_basic.c" <<'EOC'
+#include "cf_common.h"
+
+#define TAG "cf_basic"
+
+static const char k_text[] = "Hello \xc5\xbdlu\xc5\xa5ou\xc4\x8dk\xc3\xbd \xe2\x82\xac \xf0\x9f\x98\x80";
+static const unsigned k_units[] = {
+    0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x17d, 0x6c, 0x75, 0x165,
+    0x6f, 0x75, 0x10d, 0x6b, 0xfd, 0x20, 0x20ac, 0x20, 0xd83d, 0xde00
+};
+#define N_UNITS (long)(sizeof k_units / sizeof k_units[0])
+static const unsigned char k_utf16le[] = {
+    0x7d, 0x01, 0x6c, 0x00, 0x75, 0x00, 0x65, 0x01, 0x6f, 0x00,
+    0x75, 0x00, 0x0d, 0x01, 0x6b, 0x00, 0xfd, 0x00
+};
+static const unsigned char k_order[] = { 0x7d, 0x01, 0x6c, 0x00 };
+
+static void group_string(void)
+{
+    unsigned m = 0, bit = 1, units = 0;
+    CFStringRef s = CFStringCreateWithCString(kCFAllocatorDefault, k_text, kCFStringEncodingUTF8);
+    CFStringRef w, h, host, wire;
+    char buf[64], tiny[8];
+    long len = -1, i, units_bad = 0;
+    int got_all = -1, got_tiny = -1, got_ascii = -1, eq_w = -1, eq_h = -1;
+    long len_w = -1, len_h = -1, len_host = -1, len_wire = -1;
+    unsigned c_host = 0, c_wire = 0;
+
+    if (s != 0) {
+        len = CFStringGetLength(s);
+        for (i = 0; i < N_UNITS && i < len; i++) {
+            unsigned c = CFStringGetCharacterAtIndex(s, i);
+            units = cf_fold(units, c);
+            if (c != k_units[i])
+                units_bad++;
+        }
+        got_all = CFStringGetCString(s, buf, sizeof buf, kCFStringEncodingUTF8);
+        got_tiny = CFStringGetCString(s, tiny, sizeof tiny, kCFStringEncodingUTF8);
+        got_ascii = CFStringGetCString(s, buf + 32, 32, kCFStringEncodingASCII);
+    }
+    w = CFStringCreateWithBytes(0, k_utf16le, sizeof k_utf16le, kCFStringEncodingUTF16LE, false);
+    if (w != 0) {
+        len_w = CFStringGetLength(w);
+        eq_w = CFEqual(w, CFSTR("\xc5\xbdlu\xc5\xa5ou\xc4\x8dk\xc3\xbd"));
+    }
+    h = CFStringCreateWithBytes(kCFAllocatorDefault, (const UInt8 *)k_text, 5, kCFStringEncodingUTF8, false);
+    if (h != 0) {
+        len_h = CFStringGetLength(h);
+        eq_h = CFEqual(h, CFSTR("Hello"));
+    }
+    host = CFStringCreateWithBytes(0, k_order, sizeof k_order, kCFStringEncodingUnicode, false);
+    wire = CFStringCreateWithBytes(0, k_order, sizeof k_order, kCFStringEncodingUnicode, true);
+    if (host != 0) {
+        len_host = CFStringGetLength(host);
+        c_host = CFStringGetCharacterAtIndex(host, 0);
+    }
+    if (wire != 0) {
+        len_wire = CFStringGetLength(wire);
+        c_wire = CFStringGetCharacterAtIndex(wire, 0);
+    }
+
+    CK(s != 0 && CFGetTypeID(s) == CFStringGetTypeID());
+    CK(len == N_UNITS);
+    CK(units_bad == 0);
+    CK(got_all == true && strcmp(buf, k_text) == 0);
+    CK(got_tiny == false);
+    CK(got_ascii == false);
+    CK(eq_w == true && len_w == 9);
+    CK(eq_h == true && len_h == 5);
+    CK(len_host == 2 && c_host == 0x17d && len_wire == 2 && c_wire == 0x7d01);
+
+    cf_begin(TAG, "string", m);
+    cf_long("len", len);
+    cb_field("units", units, 1);
+    cb_end();
+    if (s)
+        CFRelease(s);
+    if (w)
+        CFRelease(w);
+    if (h)
+        CFRelease(h);
+    if (host)
+        CFRelease(host);
+    if (wire)
+        CFRelease(wire);
+}
+
+static void group_literal(void)
+{
+    unsigned m = 0, bit = 1;
+    CFStringRef lit = CFSTR("Hello");
+    CFStringRef wide = CFSTR("\xc5\xbdlu\xc5\xa5ou\xc4\x8dk\xc3\xbd");
+    CFStringRef made = cf_make("Hello");
+    CFStringRef made_wide = cf_make("\xc5\xbdlu\xc5\xa5ou\xc4\x8dk\xc3\xbd");
+    CFStringRef copy = CFStringCreateCopy(0, lit);
+    CFTypeRef again;
+    const char *ptr;
+    int eq1, eq2, eq_case, eq_wide, eq_copy;
+    unsigned c0, c8;
+    long wlen;
+
+    eq1 = CFEqual(lit, made);
+    eq2 = CFEqual(made, lit);
+    eq_case = CFEqual(lit, CFSTR("hello"));
+    eq_wide = CFEqual(wide, made_wide);
+    eq_copy = CFEqual(copy, lit);
+    again = CFRetain(lit);
+    CFRelease(lit);
+    wlen = CFStringGetLength(wide);
+    c0 = CFStringGetCharacterAtIndex(wide, 0);
+    c8 = CFStringGetCharacterAtIndex(wide, 8);
+    ptr = CFStringGetCStringPtr(lit, kCFStringEncodingUTF8);
+
+    CK(CFGetTypeID(lit) == CFStringGetTypeID() && CFGetTypeID(wide) == CFStringGetTypeID());
+    CK(made != 0 && eq1 == true && eq2 == true);
+    CK(CFHash(lit) == CFHash(made));
+    CK(eq_case == false);
+    CK(again == lit);
+    CK(wlen == 9 && c0 == 0x17d && c8 == 0xfd);
+    CK(made_wide != 0 && eq_wide == true && CFHash(wide) == CFHash(made_wide));
+    CK(ptr == 0 || strcmp(ptr, "Hello") == 0);
+    CK(copy != 0 && eq_copy == true && CFGetTypeID(copy) == CFStringGetTypeID());
+
+    cf_begin(TAG, "literal", m);
+    cb_end();
+    if (made)
+        CFRelease(made);
+    if (made_wide)
+        CFRelease(made_wide);
+    if (copy)
+        CFRelease(copy);
+}
+
+static void group_mutable(void)
+{
+    unsigned m = 0, bit = 1;
+    CFMutableStringRef ms = CFStringCreateMutable(0, 0);
+    CFMutableStringRef mc = CFStringCreateMutableCopy(kCFAllocatorDefault, 0, CFSTR("Hello"));
+    CFStringRef suffix = cf_make("lo\xc3\xbd");
+    long len = -1, c_lt, c_gt, c_ci, c_cs, c_num, c_lex, maxlen;
+    unsigned last = 0;
+    int pre_yes = -1, pre_no = -1, suf_yes = -1, suf_no = -1;
+    int iv_neg, iv_max, iv_space;
+    double dv, dv_exp;
+
+    if (ms != 0) {
+        CFStringAppendCString(ms, "abc", kCFStringEncodingUTF8);
+        CFStringAppend(ms, CFSTR("Hello"));
+        CFStringAppendCString(ms, "\xc3\xbd", kCFStringEncodingUTF8);
+        len = CFStringGetLength(ms);
+        last = CFStringGetCharacterAtIndex(ms, 8);
+        pre_yes = CFStringHasPrefix(ms, CFSTR("abcH"));
+        pre_no = CFStringHasPrefix(ms, CFSTR("Hello"));
+        suf_yes = CFStringHasSuffix(ms, suffix);
+        suf_no = CFStringHasSuffix(ms, CFSTR("abc"));
+    }
+    if (mc != 0)
+        CFStringAppendCString(mc, " world", kCFStringEncodingUTF8);
+    c_lt = CFStringCompare(CFSTR("apple"), CFSTR("banana"), 0);
+    c_gt = CFStringCompare(CFSTR("banana"), CFSTR("apple"), 0);
+    c_ci = CFStringCompare(CFSTR("HELLO"), CFSTR("hello"), kCFCompareCaseInsensitive);
+    c_cs = CFStringCompare(CFSTR("HELLO"), CFSTR("hello"), 0);
+    c_num = CFStringCompare(CFSTR("file10"), CFSTR("file9"), kCFCompareNumerically);
+    c_lex = CFStringCompare(CFSTR("file10"), CFSTR("file9"), 0);
+    iv_neg = CFStringGetIntValue(CFSTR("-123456"));
+    iv_max = CFStringGetIntValue(CFSTR("2147483647"));
+    iv_space = CFStringGetIntValue(CFSTR("  42"));
+    dv = CFStringGetDoubleValue(CFSTR("3.25"));
+    dv_exp = CFStringGetDoubleValue(CFSTR("-0.5e3"));
+    maxlen = CFStringGetMaximumSizeForEncoding(10, kCFStringEncodingUTF8);
+
+    CK(ms != 0 && len == 9);
+    CK(last == 0xfd && cf_equals_text(ms, "abcHello\xc3\xbd"));
+    CK(c_lt == kCFCompareLessThan && c_lt == -1 && c_gt == kCFCompareGreaterThan);
+    CK(c_ci == kCFCompareEqualTo && c_cs == -1);
+    CK(c_num == 1 && c_lex == -1);
+    CK(pre_yes == true && pre_no == false);
+    CK(suffix != 0 && suf_yes == true && suf_no == false);
+    CK(iv_neg == -123456 && iv_max == 2147483647 && iv_space == 42);
+    CK(dv == 3.25 && dv_exp == -500.0);
+    CK(mc != 0 && cf_text_is(mc, "Hello world") && cf_text_is(CFSTR("Hello"), "Hello"));
+    CK(maxlen >= 30);
+
+    cf_begin(TAG, "mutable", m);
+    cf_long("len", len);
+    cf_long("max", maxlen);
+    cb_end();
+    if (ms)
+        CFRelease(ms);
+    if (mc)
+        CFRelease(mc);
+    if (suffix)
+        CFRelease(suffix);
+}
+
+static void group_split(void)
+{
+    unsigned m = 0, bit = 1;
+    CFArrayRef parts = CFStringCreateArrayBySeparatingStrings(0, CFSTR("a,bb,,ccc"), CFSTR(","));
+    CFArrayRef whole = CFStringCreateArrayBySeparatingStrings(0, CFSTR("a,bb"), CFSTR(";"));
+    CFStringRef joined = 0;
+    long n = -1, n_whole = -1;
+
+    if (parts != 0) {
+        n = CFArrayGetCount(parts);
+        joined = CFStringCreateByCombiningStrings(0, parts, CFSTR("::"));
+    }
+    if (whole != 0)
+        n_whole = CFArrayGetCount(whole);
+
+    CK(parts != 0 && CFGetTypeID(parts) == CFArrayGetTypeID() && n == 4);
+    CK(n == 4 && cf_equals_text(CFArrayGetValueAtIndex(parts, 0), "a") &&
+       cf_equals_text(CFArrayGetValueAtIndex(parts, 1), "bb") &&
+       cf_equals_text(CFArrayGetValueAtIndex(parts, 2), "") &&
+       cf_equals_text(CFArrayGetValueAtIndex(parts, 3), "ccc"));
+    CK(joined != 0 && cf_text_is(joined, "a::bb::::ccc"));
+    CK(n_whole == 1 && cf_equals_text(CFArrayGetValueAtIndex(whole, 0), "a,bb"));
+
+    cf_begin(TAG, "split", m);
+    cf_long("n", n);
+    cb_end();
+    if (parts)
+        CFRelease(parts);
+    if (whole)
+        CFRelease(whole);
+    if (joined)
+        CFRelease(joined);
+}
+
+static void group_array(void)
+{
+    unsigned m = 0, bit = 1;
+    static const UInt8 bytes[4] = { 1, 2, 3, 4 };
+    long long big = 0x1234567890abcdefll;
+    CFTypeRef v[3];
+    CFArrayRef arr, copy;
+    CFMutableArrayRef mut, mcopy;
+    long rc0, rc1, rc0_in, rc1_in, rc0_back, rc1_back, n = -1, i, n_mut, n_mcopy;
+    long rc0_mut, rc1_mut, rc0_clear, rc1_clear;
+    int identity = 1, twice = 1, order = 1, eq_copy, eq_mcopy, eq_other;
+    const void *p, *q;
+
+    v[0] = CFStringCreateMutableCopy(0, 0, CFSTR("zero"));
+    v[1] = CFDataCreate(0, bytes, sizeof bytes);
+    v[2] = CFNumberCreate(0, kCFNumberSInt64Type, &big);
+    rc0 = CFGetRetainCount(v[0]);
+    rc1 = CFGetRetainCount(v[1]);
+    arr = CFArrayCreate(kCFAllocatorDefault, v, 3, &kCFTypeArrayCallBacks);
+    rc0_in = CFGetRetainCount(v[0]);
+    rc1_in = CFGetRetainCount(v[1]);
+    if (arr != 0) {
+        n = CFArrayGetCount(arr);
+        for (i = 0; i < 3 && i < n; i++) {
+            p = CFArrayGetValueAtIndex(arr, i);
+            q = CFArrayGetValueAtIndex(arr, i);
+            if (p != v[i])
+                identity = 0;
+            if (p != q)
+                twice = 0;
+        }
+    }
+
+    mut = CFArrayCreateMutable(0, 0, &kCFTypeArrayCallBacks);
+    CFArrayAppendValue(mut, v[0]);
+    CFArrayAppendValue(mut, v[1]);
+    CFArrayInsertValueAtIndex(mut, 0, v[2]);
+    if (CFArrayGetValueAtIndex(mut, 0) != v[2] || CFArrayGetValueAtIndex(mut, 1) != v[0] ||
+        CFArrayGetValueAtIndex(mut, 2) != v[1])
+        order = 0;
+    CFArraySetValueAtIndex(mut, 1, v[1]);
+    CFArrayRemoveValueAtIndex(mut, 0);
+    n_mut = CFArrayGetCount(mut);
+    if (n_mut != 2 || CFArrayGetValueAtIndex(mut, 0) != v[1] || CFArrayGetValueAtIndex(mut, 1) != v[1])
+        order = 0;
+    rc0_mut = CFGetRetainCount(v[0]) - rc0_in;
+    rc1_mut = CFGetRetainCount(v[1]) - rc1_in;
+    CFArrayRemoveAllValues(mut);
+    rc0_clear = CFGetRetainCount(v[0]) - rc0_in;
+    rc1_clear = CFGetRetainCount(v[1]) - rc1_in;
+
+    copy = CFArrayCreateCopy(0, arr);
+    mcopy = CFArrayCreateMutableCopy(0, 0, arr);
+    eq_copy = CFEqual(copy, arr);
+    CFArrayAppendValue(mcopy, v[0]);
+    n_mcopy = CFArrayGetCount(mcopy);
+    eq_mcopy = CFEqual(mcopy, arr);
+    CFArrayRemoveValueAtIndex(mcopy, 3);
+    CFArraySetValueAtIndex(mcopy, 2, v[0]);
+    eq_other = CFEqual(mcopy, arr);
+
+    CK(arr != 0 && CFGetTypeID(arr) == CFArrayGetTypeID() && n == 3);
+    CK(identity);
+    CK(twice);
+    CK(rc0_in - rc0 == 1 && rc1_in - rc1 == 1);
+    CK(mut != 0 && order && n_mut == 2 && CFArrayGetCount(mut) == 0);
+    CK(rc0_mut == 0 && rc1_mut == 2 && rc0_clear == 0 && rc1_clear == 0);
+    CK(copy != 0 && mcopy != 0 && eq_copy == true && n_mcopy == 4 && eq_mcopy == false && eq_other == false);
+    CFRelease(copy);
+    CFRelease(mcopy);
+    CFRelease(arr);
+    rc0_back = CFGetRetainCount(v[0]);
+    rc1_back = CFGetRetainCount(v[1]);
+    CK(rc0_back == rc0 && rc1_back == rc1);
+
+    cf_begin(TAG, "array", m);
+    cf_long("n", n);
+    cf_long("held", rc1_in - rc1);
+    cb_end();
+    CFRelease(mut);
+    CFRelease(v[0]);
+    CFRelease(v[1]);
+    CFRelease(v[2]);
+}
+
+static void group_dict(void)
+{
+    unsigned m = 0, bit = 1;
+    static const UInt8 bytes[3] = { 9, 8, 7 };
+    long long raw[3] = { 0x100000001ll, 0x200000002ll, 0x300000003ll };
+    CFTypeRef keys[3] = { CFSTR("one"), CFSTR("two"), CFSTR("three") };
+    CFTypeRef vals[3], kbuf[3], vbuf[3];
+    CFDictionaryRef d, dcopy;
+    CFMutableDictionaryRef md, mdcopy;
+    CFMutableStringRef key;
+    CFStringRef two;
+    CFDataRef data;
+    CFTypeRef out;
+    long n = -1, n_md_after, n_md_empty, rc_data, rc_in, rc_out, n_mdcopy, i, j;
+    int has_one, has_four, present, absent, pairs = 1, eq_dcopy, eq_mdcopy;
+    const void *got_two, *got_key, *got_changed, *after_add, *after_set;
+
+    for (i = 0; i < 3; i++)
+        vals[i] = CFNumberCreate(0, kCFNumberSInt64Type, &raw[i]);
+    d = CFDictionaryCreate(kCFAllocatorDefault, keys, vals, 3,
+                           &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    two = cf_make("two");
+    n = CFDictionaryGetCount(d);
+    got_two = CFDictionaryGetValue(d, two);
+    has_one = CFDictionaryContainsKey(d, CFSTR("one"));
+    has_four = CFDictionaryContainsKey(d, CFSTR("four"));
+    out = 0;
+    present = CFDictionaryGetValueIfPresent(d, CFSTR("three"), &out);
+    CK(d != 0 && CFGetTypeID(d) == CFDictionaryGetTypeID() && n == 3);
+    CK(two != 0 && got_two == vals[1]);
+    CK(has_one == true && has_four == false);
+    CK(present == true && out == vals[2]);
+    out = kCFNull;
+    absent = CFDictionaryGetValueIfPresent(d, CFSTR("four"), &out);
+    CK(absent == false && out == kCFNull);
+
+    CFDictionaryGetKeysAndValues(d, kbuf, vbuf);
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++)
+            if (CFEqual(kbuf[i], keys[j]) == true)
+                break;
+        if (j == 3 || vbuf[i] != vals[j])
+            pairs = 0;
+    }
+    CK(pairs);
+
+    md = CFDictionaryCreateMutable(0, 0, &kCFCopyStringDictionaryKeyCallBacks,
+                                   &kCFTypeDictionaryValueCallBacks);
+    key = CFStringCreateMutableCopy(0, 0, CFSTR("key"));
+    CFDictionarySetValue(md, key, vals[0]);
+    CFStringAppendCString(key, "-changed", kCFStringEncodingUTF8);
+    got_key = CFDictionaryGetValue(md, CFSTR("key"));
+    got_changed = CFDictionaryGetValue(md, key);
+    CFDictionaryAddValue(md, CFSTR("key"), vals[1]);
+    after_add = CFDictionaryGetValue(md, CFSTR("key"));
+    CFDictionarySetValue(md, CFSTR("key"), vals[1]);
+    after_set = CFDictionaryGetValue(md, CFSTR("key"));
+    CK(md != 0 && key != 0 && got_key == vals[0] && got_changed == 0);
+    CK(after_add == vals[0] && after_set == vals[1]);
+
+    data = CFDataCreate(0, bytes, sizeof bytes);
+    rc_data = CFGetRetainCount(data);
+    CFDictionarySetValue(md, CFSTR("data"), data);
+    rc_in = CFGetRetainCount(data);
+    n_md_after = CFDictionaryGetCount(md);
+    CFDictionaryRemoveValue(md, CFSTR("data"));
+    CFDictionaryRemoveValue(md, CFSTR("key"));
+    rc_out = CFGetRetainCount(data);
+    n_md_empty = CFDictionaryGetCount(md);
+    CK(rc_in - rc_data == 1 && rc_out == rc_data && n_md_after == 2 && n_md_empty == 0);
+
+    dcopy = CFDictionaryCreateCopy(0, d);
+    mdcopy = CFDictionaryCreateMutableCopy(0, 0, d);
+    eq_dcopy = CFEqual(dcopy, d);
+    CFDictionarySetValue(mdcopy, CFSTR("four"), vals[0]);
+    n_mdcopy = CFDictionaryGetCount(mdcopy);
+    eq_mdcopy = CFEqual(mdcopy, d);
+    CK(dcopy != 0 && mdcopy != 0 && eq_dcopy == true && n_mdcopy == 4 && eq_mdcopy == false);
+
+    cf_begin(TAG, "dict", m);
+    cf_long("n", n);
+    cf_long("held", rc_in - rc_data);
+    cb_end();
+    CFRelease(dcopy);
+    CFRelease(mdcopy);
+    CFRelease(md);
+    CFRelease(key);
+    CFRelease(data);
+    CFRelease(two);
+    CFRelease(d);
+    for (i = 0; i < 3; i++)
+        CFRelease(vals[i]);
+}
+
+static void group_number(void)
+{
+    unsigned m = 0, bit = 1;
+    SInt32 i32 = -123456789, o32 = 0, lossy = 0;
+    SInt64 i64 = -0x123456789abcdefll, o64 = 0;
+    Float64 f64 = -2.718281828459045, of64 = 0, same = -2.718281828459045, qnan = 0, pinf = 0, ninf = 0;
+    CFNumberRef n32 = CFNumberCreate(0, kCFNumberSInt32Type, &i32);
+    CFNumberRef n64 = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &i64);
+    CFNumberRef nd = CFNumberCreate(0, kCFNumberFloat64Type, &f64);
+    CFNumberRef nd2 = CFNumberCreate(0, kCFNumberFloat64Type, &same);
+    int g32, g64, gd, glossy, gnan, gpinf, gninf, bt, bf;
+    long t32, t64, td, c_gt, c_lt, c_eq, c_inf;
+
+    g32 = CFNumberGetValue(n32, kCFNumberSInt32Type, &o32);
+    g64 = CFNumberGetValue(n64, kCFNumberSInt64Type, &o64);
+    gd = CFNumberGetValue(nd, kCFNumberFloat64Type, &of64);
+    glossy = CFNumberGetValue(n64, kCFNumberSInt32Type, &lossy);
+    t32 = CFNumberGetType(n32);
+    t64 = CFNumberGetType(n64);
+    td = CFNumberGetType(nd);
+    c_gt = CFNumberCompare(n32, n64, 0);
+    c_lt = CFNumberCompare(n64, n32, 0);
+    c_eq = CFNumberCompare(nd, nd2, 0);
+    c_inf = CFNumberCompare(kCFNumberPositiveInfinity, nd, 0);
+    gnan = CFNumberGetValue(kCFNumberNaN, kCFNumberFloat64Type, &qnan);
+    gpinf = CFNumberGetValue(kCFNumberPositiveInfinity, kCFNumberFloat64Type, &pinf);
+    gninf = CFNumberGetValue(kCFNumberNegativeInfinity, kCFNumberFloat64Type, &ninf);
+    bt = CFBooleanGetValue(kCFBooleanTrue);
+    bf = CFBooleanGetValue(kCFBooleanFalse);
+
+    CK(n32 != 0 && g32 == true && o32 == i32 && CFGetTypeID(n32) == CFNumberGetTypeID());
+    CK(n64 != 0 && g64 == true && o64 == i64);
+    CK(nd != 0 && gd == true && of64 == f64);
+    CK(t32 == kCFNumberSInt32Type && t64 == kCFNumberSInt64Type && td == kCFNumberFloat64Type);
+    CK(glossy == false);
+    CK(c_gt == kCFCompareGreaterThan && c_lt == -1 && c_eq == kCFCompareEqualTo && c_inf == 1);
+    CK(gnan == true && qnan != qnan && gpinf == true && pinf > 1e308 && gninf == true && ninf < -1e308);
+    CK(bt == true && bf == false);
+    CK(kCFBooleanTrue != kCFBooleanFalse && CFGetTypeID(kCFBooleanTrue) == CFBooleanGetTypeID() &&
+       CFBooleanGetTypeID() != CFNumberGetTypeID());
+    CK(kCFNull != 0 && CFEqual(kCFNull, kCFNull) == true && CFGetTypeID(kCFNull) != CFBooleanGetTypeID());
+
+    cf_begin(TAG, "number", m);
+    cf_long("types", t32 * 100 + t64 * 10 + td);
+    cb_field("lo", (unsigned)o64, 1);
+    cb_end();
+    if (n32)
+        CFRelease(n32);
+    if (n64)
+        CFRelease(n64);
+    if (nd)
+        CFRelease(nd);
+    if (nd2)
+        CFRelease(nd2);
+}
+
+static void group_data(void)
+{
+    unsigned m = 0, bit = 1, sum = 0;
+    UInt8 bytes[64];
+    CFDataRef d, empty;
+    CFStringRef desc;
+    const UInt8 *p;
+    CFTypeRef again;
+    long len = -1, rc0, rc1, rc2, i, diff = 0, empty_len = -1;
+
+    for (i = 0; i < 64; i++)
+        bytes[i] = (UInt8)(i * 37 + 11);
+    d = CFDataCreate(kCFAllocatorDefault, bytes, sizeof bytes);
+    empty = CFDataCreate(0, 0, 0);
+    len = CFDataGetLength(d);
+    p = CFDataGetBytePtr(d);
+    for (i = 0; p != 0 && i < 64 && i < len; i++) {
+        if (p[i] != bytes[i])
+            diff++;
+        sum = cf_fold(sum, p[i]);
+    }
+    rc0 = CFGetRetainCount(d);
+    again = CFRetain(d);
+    rc1 = CFGetRetainCount(d);
+    CFRelease(d);
+    rc2 = CFGetRetainCount(d);
+    if (empty != 0)
+        empty_len = CFDataGetLength(empty);
+    desc = CFCopyDescription(d);
+
+    CK(d != 0 && CFGetTypeID(d) == CFDataGetTypeID() && len == 64);
+    CK(p != 0 && p != bytes && diff == 0);
+    CK(again == d && rc1 - rc0 == 1 && rc2 == rc0);
+    CK(empty != 0 && empty_len == 0);
+    CK(CFGetAllocator(d) == kCFAllocatorSystemDefault);
+    CK(desc != 0 && CFGetTypeID(desc) == CFStringGetTypeID() && CFStringGetLength(desc) > 0);
+
+    cf_begin(TAG, "data", m);
+    cf_long("len", len);
+    cb_field("sum", sum, 1);
+    cb_end();
+    if (desc)
+        CFRelease(desc);
+    if (empty)
+        CFRelease(empty);
+    if (d)
+        CFRelease(d);
+}
+
+int main(void)
+{
+    cf_note(TAG, "string");
+    group_string();
+    cf_note(TAG, "literal");
+    group_literal();
+    cf_note(TAG, "mutable");
+    group_mutable();
+    cf_note(TAG, "split");
+    group_split();
+    cf_note(TAG, "array");
+    group_array();
+    cf_note(TAG, "dict");
+    group_dict();
+    cf_note(TAG, "number");
+    group_number();
+    cf_note(TAG, "data");
+    group_data();
+    return cf_summary(TAG);
+}
+EOC
+
+    cat > "$TMP/cf_callbacks.c" <<'EOC'
+#include "cf_common.h"
+
+#define TAG "cf_callbacks"
+#define N_ITEMS 8
+#define N_HELD 6
+#define N_KEYS 8
+#define IN(p, arr) ((cb_uptr)(p) - (cb_uptr)(arr) < sizeof (arr) && ((cb_uptr)(p) - (cb_uptr)(arr)) % sizeof (arr)[0] == 0)
+
+#if defined(__x86_64__)
+typedef unsigned long long wide_bool;
+#define WIDE_BOOL(v) ((wide_bool)0x5a00000000ull | 0xdeadbe00u | (wide_bool)((v) != 0))
+#else
+typedef Boolean wide_bool;
+#define WIDE_BOOL(v) ((Boolean)((v) != 0))
+#endif
+
+struct item {
+    unsigned key;
+    int refs;
+    struct item *stand_in;
+};
+
+static struct item g_items[N_ITEMS], g_twins[N_HELD], g_proxy[1];
+static unsigned g_retain, g_release, g_equal, g_desc, g_fold, g_hash, g_key_equal;
+static unsigned g_skew, g_bad_value, g_bad_order, g_bad_alloc;
+static CFAllocatorRef g_alloc;
+static int g_alloc_set;
+
+static int is_item(const void *p)
+{
+    return IN(p, g_items) || IN(p, g_twins) || IN(p, g_proxy);
+}
+
+static void seen_alloc(CFAllocatorRef alloc)
+{
+    if (!g_alloc_set) {
+        g_alloc = alloc;
+        g_alloc_set = 1;
+    } else if (alloc != g_alloc) {
+        g_bad_alloc++;
+    }
+}
+
+static const void *item_retain(CFAllocatorRef alloc, const void *value)
+{
+    struct item *it = (struct item *)value;
+    struct item *out;
+
+    g_retain++;
+    if (CB_SKEWED())
+        g_skew++;
+    seen_alloc(alloc);
+    if (!is_item(value)) {
+        g_bad_value++;
+        return value;
+    }
+    out = it->stand_in ? it->stand_in : it;
+    out->refs++;
+    return out;
+}
+
+static void item_release(CFAllocatorRef alloc, const void *value)
+{
+    g_release++;
+    if (CB_SKEWED())
+        g_skew++;
+    seen_alloc(alloc);
+    if (!is_item(value)) {
+        g_bad_value++;
+        return;
+    }
+    ((struct item *)value)->refs--;
+}
+
+static CFStringRef item_desc(const void *value)
+{
+    char text[16] = "item-";
+    unsigned key;
+
+    g_desc++;
+    if (CB_SKEWED())
+        g_skew++;
+    if (!is_item(value)) {
+        g_bad_value++;
+        return 0;
+    }
+    key = ((const struct item *)value)->key;
+    text[5] = (char)('0' + key / 10 % 10);
+    text[6] = (char)('0' + key % 10);
+    text[7] = 0;
+    return CFStringCreateWithCString(0, text, kCFStringEncodingUTF8);
+}
+
+static wide_bool item_equal(const void *a, const void *b)
+{
+    g_equal++;
+    if (CB_SKEWED())
+        g_skew++;
+    if (!is_item(a) || !is_item(b)) {
+        g_bad_value++;
+        return WIDE_BOOL(0);
+    }
+    if (IN(a, g_twins) || !IN(b, g_twins))
+        g_bad_order++;
+    return WIDE_BOOL(((const struct item *)a)->key == ((const struct item *)b)->key);
+}
+
+static int contains(const char *hay, const char *needle)
+{
+    const char *h, *n;
+
+    for (; *hay; hay++) {
+        for (h = hay, n = needle; *n && *h == *n; h++, n++)
+            ;
+        if (*n == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void group_array(void)
+{
+    unsigned m = 0, bit = 1;
+    CFArrayCallBacks cb = { 0, item_retain, item_release, item_desc, (CFArrayEqualCallBack)item_equal };
+    CFMutableArrayRef a, mcopy;
+    CFArrayRef twins, odd;
+    CFStringRef desc;
+    const void *tv[N_HELD], *ov[N_HELD];
+    static const unsigned want_keys[N_HELD] = { 16, 17, 102, 13, 14, 15 };
+    char text[1024];
+    long n_after = -1, n_copy = -1, i;
+    int keys_ok = 1, proxy_seen = 0, refs_mid = 1, refs_end = 1, eq_twins, eq_odd, got_text = 0;
+    int refs_copy = 1;
+    unsigned equal_twins, equal_odd, retain_app, release_app, retain_mid, release_mid, desc_calls, freed;
+    CFAllocatorRef alloc = 0;
+
+    for (i = 0; i < N_ITEMS; i++)
+        g_items[i].key = 10 + (unsigned)i;
+    g_proxy[0].key = 102;
+    g_items[2].stand_in = g_proxy;
+
+    a = CFArrayCreateMutable(kCFAllocatorMalloc, 0, &cb);
+    for (i = 0; i < N_HELD; i++)
+        CFArrayAppendValue(a, &g_items[i]);
+    retain_app = g_retain;
+    release_app = g_release;
+    if (CFArrayGetValueAtIndex(a, 2) == g_proxy && g_proxy[0].refs == 1 && g_items[2].refs == 0)
+        proxy_seen = 1;
+    CFArrayRemoveValueAtIndex(a, 1);
+    CFArraySetValueAtIndex(a, 0, &g_items[6]);
+    CFArrayInsertValueAtIndex(a, 1, &g_items[7]);
+    n_after = CFArrayGetCount(a);
+    for (i = 0; i < N_HELD && i < n_after; i++) {
+        const struct item *it = CFArrayGetValueAtIndex(a, i);
+        if (!is_item(it) || it->key != want_keys[i] || CFArrayGetValueAtIndex(a, i) != it)
+            keys_ok = 0;
+    }
+    retain_mid = g_retain;
+    release_mid = g_release;
+    if (g_items[0].refs != 0 || g_items[1].refs != 0 || g_items[2].refs != 0 || g_proxy[0].refs != 1)
+        refs_mid = 0;
+    for (i = 3; i < N_ITEMS; i++)
+        if (g_items[i].refs != 1)
+            refs_mid = 0;
+    alloc = CFGetAllocator(a);
+
+    for (i = 0; i < N_HELD; i++) {
+        g_twins[i].key = want_keys[i];
+        tv[i] = &g_twins[i];
+        ov[i] = &g_twins[i];
+    }
+    twins = CFArrayCreate(kCFAllocatorMalloc, tv, N_HELD, &cb);
+    g_equal = 0;
+    eq_twins = CFEqual(a, twins);
+    equal_twins = g_equal;
+    g_twins[3].key = 99;
+    odd = CFArrayCreate(kCFAllocatorMalloc, ov, N_HELD, &cb);
+    g_equal = 0;
+    eq_odd = CFEqual(a, odd);
+    equal_odd = g_equal;
+    g_twins[3].key = want_keys[3];
+
+    desc = CFCopyDescription(a);
+    desc_calls = g_desc;
+    if (desc != 0)
+        got_text = CFStringGetCString(desc, text, sizeof text, kCFStringEncodingUTF8);
+
+    mcopy = CFArrayCreateMutableCopy(kCFAllocatorMalloc, 0, a);
+    if (mcopy != 0)
+        n_copy = CFArrayGetCount(mcopy);
+    if (g_proxy[0].refs != 2 || g_items[3].refs != 2 || g_items[7].refs != 2)
+        refs_copy = 0;
+
+    CK(a != 0 && n_after == N_HELD && keys_ok);
+    CK(proxy_seen);
+    CK(retain_app == N_HELD && release_app == 0 && retain_mid == N_HELD + 2 && release_mid == 2 && refs_mid);
+    CK(g_alloc_set && g_alloc == kCFAllocatorMalloc && alloc == kCFAllocatorMalloc && g_bad_alloc == 0);
+    CK(twins != 0 && eq_twins == true && equal_twins == N_HELD);
+    CK(odd != 0 && eq_odd == false && equal_odd == 4);
+    CK(g_bad_order == 0);
+    CK(desc != 0 && desc_calls == N_HELD && got_text == true &&
+       contains(text, "item-16") && contains(text, "item-02") && contains(text, "item-15"));
+    CK(mcopy != 0 && n_copy == N_HELD && refs_copy);
+
+    if (desc)
+        CFRelease(desc);
+    CFRelease(mcopy);
+    CFRelease(odd);
+    CFRelease(twins);
+    CFArrayRemoveValueAtIndex(a, 0);
+    freed = g_release;
+    CFRelease(a);
+    freed = g_release - freed;
+    for (i = 0; i < N_ITEMS; i++)
+        if (g_items[i].refs != 0)
+            refs_end = 0;
+    for (i = 0; i < N_HELD; i++)
+        if (g_twins[i].refs != 0)
+            refs_end = 0;
+    if (g_proxy[0].refs != 0)
+        refs_end = 0;
+    CK(refs_end && freed == N_HELD - 1 && g_retain == g_release && g_bad_value == 0 && g_bad_alloc == 0 &&
+       g_skew == 0);
+
+    cf_begin(TAG, "array", m);
+    cb_field("retain", g_retain, 0);
+    cb_field("release", g_release, 0);
+    cb_field("equal", equal_twins + equal_odd, 0);
+    cb_field("desc", desc_calls, 0);
+    cb_end();
+}
+
+static wide_bool fold_equal(const void *a, const void *b)
+{
+    g_fold++;
+    if (CB_SKEWED())
+        g_skew++;
+    return WIDE_BOOL(CFStringCompare(a, b, kCFCompareCaseInsensitive) == kCFCompareEqualTo);
+}
+
+static void group_mixed(void)
+{
+    unsigned m = 0, bit = 1;
+    CFArrayCallBacks mixed = kCFTypeArrayCallBacks;
+    CFMutableStringRef s[4];
+    CFTypeRef xv[2], zv[2];
+    CFArrayRef x, z;
+    CFMutableArrayRef y;
+    CFStringRef desc;
+    long rc[4], rc_in[4], rc_out[4], i;
+    int eq_xy, eq_xz, eq_other, standard, got_text = 0, held = 1, back = 1;
+    unsigned fold_xy, fold_xz, skew0 = g_skew;
+    char text[512];
+
+    standard = mixed.version == 0 && mixed.retain != 0 && mixed.release != 0 &&
+               mixed.copyDescription != 0 && mixed.equal != 0;
+    mixed.equal = (CFArrayEqualCallBack)fold_equal;
+    s[0] = CFStringCreateMutableCopy(0, 0, CFSTR("Alpha"));
+    s[1] = CFStringCreateMutableCopy(0, 0, CFSTR("beta"));
+    s[2] = CFStringCreateMutableCopy(0, 0, CFSTR("ALPHA"));
+    s[3] = CFStringCreateMutableCopy(0, 0, CFSTR("BETA"));
+    for (i = 0; i < 4; i++)
+        rc[i] = CFGetRetainCount(s[i]);
+    xv[0] = s[0];
+    xv[1] = s[1];
+    zv[0] = s[2];
+    zv[1] = s[3];
+    x = CFArrayCreate(0, xv, 2, &mixed);
+    y = CFArrayCreateMutable(0, 0, &mixed);
+    CFArrayAppendValue(y, s[2]);
+    CFArrayAppendValue(y, s[3]);
+    z = CFArrayCreate(0, zv, 2, &kCFTypeArrayCallBacks);
+    for (i = 0; i < 4; i++) {
+        rc_in[i] = CFGetRetainCount(s[i]);
+        if (rc_in[i] - rc[i] != (i < 2 ? 1 : 2))
+            held = 0;
+    }
+    g_fold = 0;
+    eq_xy = CFEqual(x, y);
+    fold_xy = g_fold;
+    eq_xz = CFEqual(x, z);
+    fold_xz = g_fold - fold_xy;
+    CFStringAppendCString(s[3], "x", kCFStringEncodingUTF8);
+    eq_other = CFEqual(y, x);
+    desc = CFCopyDescription(x);
+    if (desc != 0)
+        got_text = CFStringGetCString(desc, text, sizeof text, kCFStringEncodingUTF8);
+
+    CK(standard);
+    CK(x != 0 && y != 0 && z != 0 && CFArrayGetCount(x) == 2 && CFArrayGetCount(y) == 2 &&
+       CFArrayGetValueAtIndex(x, 0) == s[0] && CFArrayGetValueAtIndex(y, 1) == s[3]);
+    CK(held);
+    CK(eq_xy == true && fold_xy == 2);
+    CK(eq_xz == false && fold_xz == 0);
+    CK(eq_other == false);
+    CK(desc != 0 && got_text == true && contains(text, "Alpha") && contains(text, "beta"));
+
+    if (desc)
+        CFRelease(desc);
+    CFRelease(x);
+    CFRelease(y);
+    CFRelease(z);
+    for (i = 0; i < 4; i++) {
+        rc_out[i] = CFGetRetainCount(s[i]);
+        if (rc_out[i] != rc[i])
+            back = 0;
+    }
+    CK(back && g_skew == skew0);
+
+    cf_begin(TAG, "mixed", m);
+    cb_field("equal", g_fold, 0);
+    cb_end();
+    for (i = 0; i < 4; i++)
+        CFRelease(s[i]);
+}
+
+static const char *const k_names[N_KEYS] = {
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"
+};
+
+static int key_index(const void *key)
+{
+    int i;
+
+    for (i = 0; i < N_KEYS; i++)
+        if (strcmp(key, k_names[i]) == 0)
+            return i;
+    return -1;
+}
+
+static CFHashCode cstr_hash_value(const char *s)
+{
+    unsigned long long h = 0xcbf29ce484222325ull;
+
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 0x100000001b3ull;
+    }
+    return (CFHashCode)h;
+}
+
+static CFHashCode cstr_hash(const void *key)
+{
+    g_hash++;
+    if (CB_SKEWED())
+        g_skew++;
+    return cstr_hash_value(key);
+}
+
+static wide_bool cstr_equal(const void *a, const void *b)
+{
+    const char *x = a, *y = b;
+
+    g_key_equal++;
+    if (CB_SKEWED())
+        g_skew++;
+    while (*x && *x == *y) {
+        x++;
+        y++;
+    }
+    return WIDE_BOOL(*x == *y);
+}
+
+static const void *value_for(int i)
+{
+    return (const void *)(cb_uptr)(((cb_uptr)(i + 1) << 36) | (cb_uptr)(0x1000u + (unsigned)i));
+}
+
+struct tally {
+    unsigned calls;
+    unsigned sum;
+    unsigned bad;
+    unsigned skew;
+    struct tally *self;
+};
+
+static void apply_cstr(const void *key, const void *value, void *context)
+{
+    struct tally *t = context;
+    int i = key_index(key);
+
+    if (CB_SKEWED())
+        t->skew++;
+    if (t->self != t || i < 0 || value != value_for(i)) {
+        t->bad++;
+        return;
+    }
+    t->calls++;
+    t->sum += cf_fold((unsigned)(cstr_hash_value(key) >> 32), (unsigned)((cb_uptr)value >> 36));
+}
+
+static void apply_cf(const void *key, const void *value, void *context)
+{
+    struct tally *t = context;
+    SInt64 v = 0;
+    int got;
+
+    if (CB_SKEWED())
+        t->skew++;
+    got = CFNumberGetValue(value, kCFNumberSInt64Type, &v);
+    if (t->self != t || got != true || CFGetTypeID(key) != CFStringGetTypeID()) {
+        t->bad++;
+        return;
+    }
+    t->calls++;
+    t->sum += cf_fold((unsigned)CFStringGetLength(key), (unsigned)(v >> 32) ^ (unsigned)v);
+}
+
+static void group_dict(void)
+{
+    unsigned m = 0, bit = 1, order = 0;
+    CFDictionaryKeyCallBacks kcb = { 0, 0, 0, 0, (CFDictionaryEqualCallBack)cstr_equal, cstr_hash };
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(0, 0, &kcb, 0);
+    const void *keys[N_KEYS], *vals[N_KEYS];
+    const void *out;
+    char probe[16];
+    long n_full = -1, n_after = -1, i, j;
+    int found = 1, has_zulu, present, gone, pairs = 1;
+    unsigned hashes, key_equals, skew0 = g_skew;
+
+    for (i = 0; i < N_KEYS; i++)
+        CFDictionaryAddValue(d, k_names[i], value_for((int)i));
+    n_full = CFDictionaryGetCount(d);
+    g_key_equal = 0;
+    for (i = 0; i < N_KEYS; i++) {
+        for (j = 0; k_names[i][j]; j++)
+            probe[j] = k_names[i][j];
+        probe[j] = 0;
+        if (CFDictionaryGetValue(d, probe) != value_for((int)i))
+            found = 0;
+    }
+    key_equals = g_key_equal;
+    has_zulu = CFDictionaryContainsKey(d, "zulu");
+    out = 0;
+    present = CFDictionaryGetValueIfPresent(d, "echo", &out);
+    CFDictionaryRemoveValue(d, "bravo");
+    n_after = CFDictionaryGetCount(d);
+    gone = CFDictionaryContainsKey(d, "bravo");
+    hashes = g_hash;
+
+    CFDictionaryGetKeysAndValues(d, keys, vals);
+    for (i = 0; i < n_after && i < N_KEYS; i++) {
+        j = key_index(keys[i]);
+        if (j < 0 || j == 1 || keys[i] != k_names[j] || vals[i] != value_for((int)j))
+            pairs = 0;
+        order = cf_fold(order, (unsigned)j);
+    }
+
+    CK(d != 0 && n_full == N_KEYS);
+    CK(found && key_equals >= N_KEYS);
+    CK(has_zulu == false);
+    CK(present == true && out == value_for(4));
+    CK(n_after == N_KEYS - 1 && gone == false);
+    CK(pairs && hashes >= N_KEYS);
+    CK(g_skew == skew0);
+
+    cf_begin(TAG, "dict", m);
+    cf_long("n", n_after);
+    cb_field("order", order, 1);
+    cb_end();
+    CFRelease(d);
+}
+
+static void group_apply(void)
+{
+    unsigned m = 0, bit = 1, want_cstr = 0, want_cf = 0, skew0 = g_skew;
+    CFDictionaryKeyCallBacks kcb = { 0, 0, 0, 0, (CFDictionaryEqualCallBack)cstr_equal, cstr_hash };
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(0, 0, &kcb, 0);
+    CFMutableDictionaryRef nd = CFDictionaryCreateMutable(0, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                          &kCFTypeDictionaryValueCallBacks);
+    struct tally t_cstr = { 0, 0, 0, 0, 0 }, t_cf = { 0, 0, 0, 0, 0 };
+    SInt64 v;
+    CFStringRef key;
+    CFNumberRef num;
+    int i;
+
+    t_cstr.self = &t_cstr;
+    t_cf.self = &t_cf;
+    for (i = 0; i < N_KEYS; i++) {
+        CFDictionarySetValue(d, k_names[i], value_for(i));
+        want_cstr += cf_fold((unsigned)(cstr_hash_value(k_names[i]) >> 32), (unsigned)i + 1);
+        v = ((SInt64)(i + 3) << 40) | (SInt64)(i * 7 + 1);
+        key = cf_make(k_names[i]);
+        num = CFNumberCreate(0, kCFNumberSInt64Type, &v);
+        CFDictionarySetValue(nd, key, num);
+        want_cf += cf_fold((unsigned)CFStringGetLength(key), (unsigned)(v >> 32) ^ (unsigned)v);
+        CFRelease(key);
+        CFRelease(num);
+    }
+    CFDictionaryApplyFunction(d, apply_cstr, &t_cstr);
+    CFDictionaryApplyFunction(nd, apply_cf, &t_cf);
+
+    CK(d != 0 && t_cstr.calls == N_KEYS && t_cstr.bad == 0);
+    CK(t_cstr.sum == want_cstr);
+    CK(nd != 0 && t_cf.calls == N_KEYS && t_cf.bad == 0);
+    CK(t_cf.sum == want_cf);
+    CK(t_cstr.skew == 0 && t_cf.skew == 0 && g_skew == skew0);
+
+    cf_begin(TAG, "apply", m);
+    cb_field("calls", t_cstr.calls + t_cf.calls, 0);
+    cb_field("sum", t_cstr.sum ^ t_cf.sum, 1);
+    cb_end();
+    CFRelease(d);
+    CFRelease(nd);
+}
+
+int main(void)
+{
+    cf_note(TAG, "array");
+    group_array();
+    cf_note(TAG, "mixed");
+    group_mixed();
+    cf_note(TAG, "dict");
+    group_dict();
+    cf_note(TAG, "apply");
+    group_apply();
+    return cf_summary(TAG);
+}
+EOC
+
+    cat > "$TMP/cf_runloop.c" <<'EOC'
+#include "cf_common.h"
+
+#define TAG "cf_runloop"
+#define FIRES 3
+#define INTERVAL 0.01
+
+struct counts {
+    unsigned retain;
+    unsigned release;
+    unsigned bad;
+};
+
+static struct counts g_timer_info, g_observer_info, g_source_info;
+static CFRunLoopRef g_rl;
+static CFRunLoopTimerRef g_timer;
+static CFRunLoopObserverRef g_observer;
+static CFRunLoopSourceRef g_source;
+static unsigned g_fires, g_performs, g_schedules, g_cancels, g_entries, g_waits, g_other;
+static unsigned g_skew, g_bad_info, g_bad_timer, g_bad_observer, g_bad_source, g_bad_rl, g_bad_mode;
+static unsigned g_perform_lag, g_first_activity;
+static unsigned g_invalid_in_callout;
+
+static const void *info_retain(const void *info)
+{
+    struct counts *c = (struct counts *)info;
+
+    if (CB_SKEWED())
+        g_skew++;
+    if (c == &g_timer_info || c == &g_observer_info || c == &g_source_info)
+        c->retain++;
+    else
+        g_bad_info++;
+    return info;
+}
+
+static void info_release(const void *info)
+{
+    struct counts *c = (struct counts *)info;
+
+    if (CB_SKEWED())
+        g_skew++;
+    if (c == &g_timer_info || c == &g_observer_info || c == &g_source_info)
+        c->release++;
+    else
+        g_bad_info++;
+}
+
+static void on_timer(CFRunLoopTimerRef timer, void *info)
+{
+    int valid;
+
+    g_fires++;
+    cf_note(TAG, "timer fired");
+    if (CB_SKEWED())
+        g_skew++;
+    if (timer != g_timer || info != &g_timer_info)
+        g_bad_timer++;
+    if (CFRunLoopGetCurrent() != g_rl)
+        g_bad_rl++;
+    if (g_performs != g_fires - 1)
+        g_perform_lag++;
+    if (g_fires < FIRES) {
+        valid = CFRunLoopTimerIsValid(timer);
+        if (valid != true)
+            g_invalid_in_callout++;
+        CFRunLoopSourceSignal(g_source);
+        CFRunLoopWakeUp(g_rl);
+    } else if (g_fires == FIRES) {
+        cf_note(TAG, "stopping");
+        CFRunLoopStop(g_rl);
+    }
+}
+
+static void on_observer(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info)
+{
+    if (CB_SKEWED())
+        g_skew++;
+    if (observer != g_observer || info != &g_observer_info)
+        g_bad_observer++;
+    if (g_entries + g_waits + g_other == 0)
+        g_first_activity = (unsigned)activity;
+    if (activity == kCFRunLoopEntry)
+        g_entries++;
+    else if (activity == kCFRunLoopBeforeWaiting)
+        g_waits++;
+    else
+        g_other++;
+}
+
+static void on_schedule(void *info, CFRunLoopRef rl, CFStringRef mode)
+{
+    if (CB_SKEWED())
+        g_skew++;
+    g_schedules++;
+    if (info != &g_source_info)
+        g_bad_source++;
+    if (rl != g_rl)
+        g_bad_rl++;
+    if (mode == 0 || CFEqual(mode, kCFRunLoopDefaultMode) != true)
+        g_bad_mode++;
+}
+
+static void on_cancel(void *info, CFRunLoopRef rl, CFStringRef mode)
+{
+    if (CB_SKEWED())
+        g_skew++;
+    g_cancels++;
+    if (info != &g_source_info)
+        g_bad_source++;
+    if (rl != g_rl)
+        g_bad_rl++;
+    if (mode == 0 || CFEqual(mode, kCFRunLoopDefaultMode) != true)
+        g_bad_mode++;
+}
+
+static void on_perform(void *info)
+{
+    if (CB_SKEWED())
+        g_skew++;
+    g_performs++;
+    cf_note(TAG, "source performed");
+    if (info != &g_source_info)
+        g_bad_source++;
+    if (CFRunLoopGetCurrent() != g_rl)
+        g_bad_rl++;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1;
+    CFRunLoopTimerContext tctx = { 0, &g_timer_info, info_retain, info_release, 0 };
+    CFRunLoopObserverContext octx = { 0, &g_observer_info, info_retain, info_release, 0 };
+    CFRunLoopSourceContext sctx = { 0, &g_source_info, info_retain, info_release, 0, 0, 0,
+                                    on_schedule, on_cancel, on_perform };
+    CFAbsoluteTime now, fire, next;
+    int rc, valid_before, valid_removed, valid_after, retained_early;
+    unsigned schedules_added, cancels_removed, cancels_invalidated, timer_released;
+
+    g_rl = CFRunLoopGetCurrent();
+    now = CFAbsoluteTimeGetCurrent();
+    g_timer = CFRunLoopTimerCreate(0, now + 1000.0, INTERVAL, 0, 0, on_timer, &tctx);
+    g_observer = CFRunLoopObserverCreate(0, kCFRunLoopEntry | kCFRunLoopBeforeWaiting, true, 0,
+                                         on_observer, &octx);
+    g_source = CFRunLoopSourceCreate(0, 0, &sctx);
+    retained_early = g_timer_info.retain == 1 && g_observer_info.retain == 1 && g_source_info.retain == 1 &&
+                     g_timer_info.release == 0 && g_observer_info.release == 0 && g_source_info.release == 0;
+
+    CFRunLoopAddObserver(g_rl, g_observer, kCFRunLoopDefaultMode);
+    CFRunLoopAddSource(g_rl, g_source, kCFRunLoopDefaultMode);
+    schedules_added = g_schedules;
+    CFRunLoopAddTimer(g_rl, g_timer, kCFRunLoopDefaultMode);
+    fire = CFAbsoluteTimeGetCurrent() + INTERVAL;
+    CFRunLoopTimerSetNextFireDate(g_timer, fire);
+    next = CFRunLoopTimerGetNextFireDate(g_timer);
+
+    cf_note(TAG, "calling CFRunLoopRunInMode");
+    rc = CFRunLoopRunInMode(kCFRunLoopDefaultMode, CF_RUN_SECS, false);
+    cf_note(TAG, "returned from CFRunLoopRunInMode");
+
+    valid_before = CFRunLoopTimerIsValid(g_timer);
+    CFRunLoopRemoveTimer(g_rl, g_timer, kCFRunLoopDefaultMode);
+    valid_removed = CFRunLoopTimerIsValid(g_timer);
+    CFRunLoopTimerInvalidate(g_timer);
+    valid_after = CFRunLoopTimerIsValid(g_timer);
+    timer_released = g_timer_info.release;
+    CFRunLoopRemoveObserver(g_rl, g_observer, kCFRunLoopDefaultMode);
+    CFRunLoopObserverInvalidate(g_observer);
+    CFRunLoopRemoveSource(g_rl, g_source, kCFRunLoopDefaultMode);
+    cancels_removed = g_cancels;
+    CFRunLoopSourceInvalidate(g_source);
+    cancels_invalidated = g_cancels;
+    CFRelease(g_timer);
+    CFRelease(g_observer);
+    CFRelease(g_source);
+
+    CK(g_rl != 0 && g_rl == CFRunLoopGetMain());
+    CK(g_timer != 0 && g_observer != 0 && g_source != 0 && retained_early);
+    CK(next == fire);
+    CK(rc == kCFRunLoopRunStopped);
+    CK(g_fires == FIRES && g_bad_timer == 0 && g_invalid_in_callout == 0);
+    CK(g_performs == FIRES - 1 && g_perform_lag == 0);
+    CK(g_entries == 1 && g_first_activity == kCFRunLoopEntry && g_waits >= 1 && g_other == 0 &&
+       g_bad_observer == 0);
+    CK(schedules_added == 1 && g_schedules == 1 && cancels_removed == 1 && cancels_invalidated == 1);
+    CK(g_bad_source == 0 && g_bad_rl == 0 && g_bad_mode == 0);
+    CK(valid_before == true && valid_removed == true && valid_after == false);
+    CK(g_timer_info.retain == FIRES + 1 && g_timer_info.release == FIRES + 1 && timer_released == FIRES + 1);
+    CK(g_observer_info.retain == 1 && g_observer_info.release == 1);
+    CK(g_source_info.retain == 1 && g_source_info.release == 1 && g_bad_info == 0);
+    CK(g_skew == 0);
+
+    cf_begin(TAG, "loop", m);
+    cf_long("rc", rc);
+    cb_field("fires", g_fires, 0);
+    cb_field("performs", g_performs, 0);
+    cb_field("entries", g_entries, 0);
+    cb_field("retains", g_timer_info.retain + g_observer_info.retain + g_source_info.retain, 0);
+    cb_end();
+    return cf_summary(TAG);
+}
+EOC
+
+    for name in cf_basic cf_callbacks cf_runloop; do
+        clang -arch x86_64 -std=c11 -O1 -fno-builtin \
+                -o "$TMP/$name" "$TMP/$name.c" -framework CoreFoundation >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            cf_basic) CF_BASIC_BIN="$TMP/$name" ;;
+            cf_callbacks) CF_CALLBACKS_BIN="$TMP/$name" ;;
+            cf_runloop) CF_RUNLOOP_BIN="$TMP/$name" ;;
+        esac
+        clang -arch arm64 -std=c11 -O1 -fno-builtin \
+                -o "$TMP/$name.arm64" "$TMP/$name.c" -framework CoreFoundation >"$TMP/$name.arm64.cc.log" 2>&1 || continue
+        case $name in
+            cf_basic) CF_BASIC_ARM64="$TMP/$name.arm64" ;;
+            cf_callbacks) CF_CALLBACKS_ARM64="$TMP/$name.arm64" ;;
+            cf_runloop) CF_RUNLOOP_ARM64="$TMP/$name.arm64" ;;
+        esac
+    done
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -6030,6 +7605,194 @@ case_signal_default() {
     record "$name" "$reason" "exit=$rc_jit no-jit exit=$rc_nojit$cache_note"
 }
 
+cf_import_reason() {
+    local bin="$1" need="${2:-}" imports allowed sym stray=""
+    imports="$(nm -u "$bin" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+    if [ -z "$imports" ]; then
+        return
+    fi
+    allowed=" $CF_BRIDGED $CF_EXPORTS $STACK_GUARD_SYM "
+    for sym in $imports; do
+        case "$allowed" in
+            *" $sym "*) ;;
+            *) stray="$stray $sym" ;;
+        esac
+    done
+    if [ -n "$need" ]; then
+        case " $imports" in
+            *" $need "*) ;;
+            *)
+                echo "$(basename "$bin") imports '${imports% }' and not $need, so its CFSTR literals were not compiled as constant strings whose isa binds to that data export, and the case proves nothing about it"
+                return ;;
+        esac
+    fi
+    if [ -n "$stray" ]; then
+        echo "$(basename "$bin") imports$stray, which neither the virtual CoreFoundation exports nor the bridge implements, so a failure would be about those imports and not about CoreFoundation"
+    fi
+}
+
+cf_status() {
+    local tag="$1" file="$2" line
+    line="$(grep -E "^$tag (ok|bad:)" "$file" 2>/dev/null | head -1)"
+    if [ -z "$line" ]; then
+        line="$(tail -1 "$file" 2>/dev/null)"
+    fi
+    echo "$line"
+}
+
+cf_bits() {
+    local tag="$1" file="$2" group line out=""
+    shift 2
+    while [ $# -ge 2 ]; do
+        group="$1"
+        line="$(grep -E "^$tag $group bad:" "$file" 2>/dev/null | head -1)"
+        if [ -n "$line" ]; then
+            out="$out${out:+; }'$line', where $2"
+        fi
+        shift 2
+    done
+    if [ -z "$out" ]; then
+        out="no group line reports a failure although the last line does, so the bookkeeping in the fixture is wrong"
+    fi
+    echo "$out"
+}
+
+cf_stall() {
+    local tag="$1" err="$2" hang="${3:-}" last
+    last="$(grep -h "^$tag: " "$err" 2>/dev/null | tail -1 | sed "s/^$tag: //")"
+    case $last in
+        "")
+            echo "the fixture never wrote its first progress note" ;;
+        "calling CFRunLoopRunInMode"|"timer fired"|"source performed"|stopping)
+            if [ -n "$hang" ]; then
+                echo "the last progress note was '$last', so CFRunLoopRunInMode never returned although the fixture bounds it at ${CF_RUN_SECS}s: the main thread is stuck in native code or in a callout that never came back"
+            else
+                echo "the last progress note was '$last', so it stopped inside CFRunLoopRunInMode"
+            fi ;;
+        "returned from CFRunLoopRunInMode")
+            echo "the last progress note was '$last', so the run loop returned and the fixture stopped while removing, invalidating or releasing what it had added" ;;
+        *)
+            echo "the last progress note was '$last', so the fixture stopped inside that group of checks" ;;
+    esac
+}
+
+cf_run_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" reason
+    reason="$(native_run_reason "$rc" "$out" "$err")"
+    if [ -z "$reason" ]; then
+        echo ""
+    elif grep -hF "$NOBIND" "$out" "$err" 2>/dev/null | grep -Fq " in $CF_FRAMEWORK"; then
+        echo "$reason: the virtual CoreFoundation does not export that name, so the program never ran"
+    elif grep -Fq "$NOBIND$STACK_GUARD_SYM " "$out" "$err" 2>/dev/null; then
+        echo "$reason$(thread_guard_hint "$out" "$err")"
+    elif grep -qE "$CF_STRUCT_RE" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hE "$CF_STRUCT_RE" "$out" "$err" | head -1 | cut -c1-200): the bridge refused a structure of function pointers rather than hand native code a word it could not convert"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1 | cut -c1-120)$([ "$tag" != cf_basic ] && echo ", which is also what native code jumping to a guest function pointer left unconverted in a callbacks structure or a context looks like"); $(cf_stall "$tag" "$err")"
+    elif grep -Fq "$GUEST_CRASH" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hF "$GUEST_CRASH" "$out" "$err" | head -1 | cut -c1-120); $(cf_stall "$tag" "$err")"
+    elif grep -q "^ocerz: abi: " "$out" "$err" 2>/dev/null; then
+        echo "$reason; a callback crossing was refused: $(grep -h "^ocerz: abi: " "$out" "$err" | head -1 | cut -c1-240)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "$reason: still running after ${NATIVE_TIMEOUT}s, and $(cf_stall "$tag" "$err" hang)"
+    elif [ "$rc" -gt 128 ] && [ "$rc" -lt 160 ]; then
+        echo "$reason: the process was ended by signal $((rc - 128)); $(cf_stall "$tag" "$err")"
+    else
+        echo "$reason"
+    fi
+}
+
+cf_arm64_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" line
+    shift 4
+    line="$(cf_status "$tag" "$out")"
+    if grep -q "^$tag bad:" "$out" 2>/dev/null; then
+        echo "the arm64 build, run directly against the host's own CoreFoundation, fails its own checks, so the fixture expects something CoreFoundation does not do and the native run can prove nothing either way: $(cf_bits "$tag" "$out" "$@")"
+    elif [ "$rc" -eq 124 ]; then
+        echo "the arm64 build, run directly on the host, was still running after ${NATIVE_TIMEOUT}s, so the fixture hangs against the real CoreFoundation, and $(cf_stall "$tag" "$err" hang)"
+    elif [ "$rc" -ne 0 ] || ! grep -q "^$tag ok" "$out" 2>/dev/null; then
+        echo "the arm64 build, run directly on the host, exited $rc with '${line:-nothing}' and no '$tag ok' line, so the fixture itself is broken, and $(cf_stall "$tag" "$err")"
+    fi
+}
+
+case_cf() {
+    local name="$1" bin="$2" arm="$3" tag="$4" need="$5" note="$6"
+    local reason="" rc_arm rc_jit rc_nojit rc_cache line cache_note=""
+    local ao="$TMP/$name.arm64.out" ae="$TMP/$name.arm64.err"
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$CF_TIMEOUT
+    shift 6
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    if [ -z "$arm" ]; then
+        record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $( (grep -m1 -i 'error' "$TMP/$name.arm64.cc.log" || head -1 "$TMP/$name.arm64.cc.log") 2>/dev/null | cut -c1-160)"
+        return
+    fi
+    reason="$(cf_import_reason "$bin" "$need")"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+    run_bounded "$ao" "$ae" "$arm"
+    rc_arm=$?
+    reason="$(cf_arm64_reason "$rc_arm" "$tag" "$ao" "$ae" "$@")"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin"
+    rc_nojit=$?
+    line="$(cf_status "$tag" "$jo")"
+
+    reason="$(cf_run_reason "$rc_jit" "$tag" "$jo" "$je")"
+    if grep -q "^$tag bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed: $(cf_bits "$tag" "$jo" "$@")"
+    elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+        reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+    fi
+
+    if [ -z "$reason" ]; then
+        reason="$(cf_run_reason "$rc_nojit" "$tag" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(cf_status "$tag" "$no")': the guest's own checks failed: $(cf_bits "$tag" "$no" "$@")"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    if [ -z "$reason" ] && ! cmp -s "$jo" "$ao"; then
+        reason="native '$(tr '\n' ' ' < "$jo")' != arm64 '$(tr '\n' ' ' < "$ao")': the guest got answers from the host's own CoreFoundation that a native program calling it directly does not"
+    fi
+    if [ -n "$reason" ] && [ -n "$note" ]; then
+        reason="$reason. $note"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$bin"
+        rc_cache=$?
+        if [ "$rc_cache" -eq 124 ]; then
+            reason="cache mode still running after ${NATIVE_TIMEOUT}s, which crosses no bridge, and $(cf_stall "$tag" "$ce" hang)"
+        elif [ "$rc_cache" -ne 0 ]; then
+            reason="cache-mode exit $rc_cache, want 0: '$(cf_status "$tag" "$co")'"
+        elif ! cmp -s "$jo" "$co"; then
+            reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': native mode agrees with the arm64 build and the x86 CoreFoundation in the shared cache answers otherwise, so either the translator ran that framework wrong or the fixture prints something the two builds of CoreFoundation really disagree about"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
+}
+
 case_env_native() {
     local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
@@ -6146,6 +7909,48 @@ EOC
     record "$name" "$reason" "exit=$rc"
 }
 
+case_native_classic_bind() {
+    local name=native_classic_bind rc reason="" src="$TMP/classic.c" bin="$TMP/classic"
+    local out="$TMP/native_classic.out" err="$TMP/native_classic.err"
+    local cout="$TMP/cache_classic.out"
+    cat > "$src" <<'EOC'
+#include <string.h>
+#include <unistd.h>
+static const char *pick(int k) { return k ? "classic" : "chained"; }
+int main(int argc, char **argv)
+{
+    const char *s = pick(argc > 0);
+    int ok = strlen(s) == 7 && strcmp(s, "classic") == 0;
+    write(1, ok ? "classic ok\n" : "classic bad\n", ok ? 11 : 12);
+    return ok ? 0 : 1;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -mmacosx-version-min=10.14 -o "$bin" "$src" >/dev/null 2>&1; then
+        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    fi
+    if ! otool -l "$bin" 2>/dev/null | grep -q 'LC_DYLD_INFO'; then
+        record "$name" "the toolchain linked the fixture with chained fixups rather than classic binds, so it no longer tests dyld_stub_binder" ""
+        return
+    fi
+    if ! nm -u "$bin" 2>/dev/null | grep -qx 'dyld_stub_binder'; then
+        record "$name" "the fixture does not import dyld_stub_binder, so it no longer tests the export" ""
+        return
+    fi
+    run_bounded "$out" "$err" "$OCERZ" -native "$bin"
+    rc=$?
+    if grep -Fq "$NOBIND" "$out" "$err"; then
+        reason="exit $rc: $(grep -hF "$NOBIND" "$out" "$err" | head -1)"
+    elif [ "$rc" -ne 0 ]; then
+        reason="exit $rc, want 0"
+    elif ! grep -q 'classic ok' "$out"; then
+        reason="the classic-bind guest ran but computed the wrong answer"
+    elif [ "$CACHE_OK" -eq 1 ]; then
+        run_bounded "$cout" "$TMP/cache_classic.err" "$OCERZ" -cache "$bin"
+        cmp -s "$out" "$cout" || reason="native and cache disagree on a classic-bind guest"
+    fi
+    record "$name" "$reason" "exit=$rc"
+}
+
 case_native_unbound() {
     local name=native_unbound rc reason="" src="$TMP/unbound.c" bin="$TMP/unbound"
     local out="$TMP/native_unbound.out" err="$TMP/native_unbound.err"
@@ -6188,6 +7993,7 @@ build_attach_fixtures
 build_thread_fixtures
 build_tlv_fixtures
 build_signal_fixtures
+build_cf_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -6273,6 +8079,25 @@ case_signal signal_errors "$SIG_ERRORS_BIN" signal_errors \
 case_signal_default
 case_signal signal_handler_bridge "$SIG_HANDLER_BIN" signal_handler_bridge \
     "bit 0 is sigaction or a raise from main returning non-zero, 1 the two handlers not each run once per raise by the time it returned, or a raise returning with a handler still in progress, 2 bridged strlen inside the handler giving a wrong length, 3 bridged memcpy inside the handler returning the wrong pointer or copying the wrong bytes, 4 bridged strcmp inside the handler giving a wrong answer, 5 a write from inside a handler writing short, 6 the raise of SIGUSR2 inside the SIGUSR1 handler returning non-zero or not running its handler nested inside the first before it returned, 7 a handler handed another signal or entered on a misaligned stack"
+case_cf cf_basic "$CF_BASIC_BIN" "$CF_BASIC_ARM64" cf_basic "$CF_CLASS_SYM" \
+    "cf_basic is the plainest use of a framework there is, with no guest code for CoreFoundation to call, so a failure here means no guest program that uses CoreFoundation at all can run in native mode" \
+    string "bit 0 is CFStringCreateWithCString failing or handing back something whose type is not CFStringGetTypeID, 1 CFStringGetLength other than the 20 UTF-16 units of the text, 2 a CFStringGetCharacterAtIndex result other than the expected UniChar, where several lie above 0xff and two are a surrogate pair, 3 CFStringGetCString into a large buffer not returning exactly true or not reproducing the UTF-8 bytes, 4 CFStringGetCString into an 8-byte buffer not returning exactly false, 5 CFStringGetCString into ASCII not returning exactly false, 6 CFStringCreateWithBytes over UTF-16LE bytes not exactly equal to the matching CFSTR literal, 7 CFStringCreateWithBytes over the first five UTF-8 bytes not exactly equal to the literal Hello, 8 kCFStringEncodingUnicode bytes not read in host order with isExternalRepresentation false and big-endian with it true, which is a Boolean argument that did not arrive" \
+    literal "bit 0 is an ASCII or a UTF-16 CFSTR literal whose type is not CFStringGetTypeID, which is an isa not bound to the native $CF_CLASS_SYM, 1 CFEqual between the literal and the same text created at run time not exactly true in either order, 2 their CFHash values differing, 3 CFEqual against a literal differing only in case not exactly false, 4 CFRetain of a literal handing back another pointer, 5 the UTF-16 literal not 9 units long or its first or last character wrong, 6 the UTF-16 literal not exactly equal to, or hashing differently from, the same text created at run time, 7 CFStringGetCStringPtr on the literal returning a pointer to other text, 8 CFStringCreateCopy of the literal failing or not exactly equal to it" \
+    mutable "bit 0 is CFStringCreateMutable failing or the string not 9 units long after three appends, 1 its last character or its text wrong, 2 CFStringCompare not returning exactly -1 and 1 for strings in and out of order, which a CFComparisonResult cut to 32 bits does not, 3 a case-insensitive compare not 0 or a case-sensitive one not -1, 4 kCFCompareNumerically not putting file10 after file9 or a plain compare not putting it before, 5 CFStringHasPrefix not exactly true and false, 6 CFStringHasSuffix not exactly true and false, 7 CFStringGetIntValue wrong for -123456, 2147483647 or a number after spaces, 8 CFStringGetDoubleValue wrong for 3.25 or -0.5e3, 9 a CFStringCreateMutableCopy of a literal not reading Hello world after an append, or the literal changing with it, 10 CFStringGetMaximumSizeForEncoding under 30 bytes for ten units of UTF-8" \
+    split "bit 0 is CFStringCreateArrayBySeparatingStrings not handing back an array of four, 1 an element other than a, bb, the empty string and ccc in that order, 2 CFStringCreateByCombiningStrings not producing a::bb::::ccc, 3 a separator that does not occur not giving an array holding only the whole string" \
+    array "bit 0 is CFArrayCreate with kCFTypeArrayCallBacks not handing back an array of three, 1 CFArrayGetValueAtIndex handing back a pointer other than the object inserted, 2 two reads of the same index handing back different pointers, 3 an element not retained exactly once by the array, 4 a mutable array's order wrong after an append, an insert, a set and a remove, or the array not empty after CFArrayRemoveAllValues, 5 the references the mutable array holds not what those edits leave, 6 CFArrayCreateCopy not exactly equal to the original, or a mutable copy changed by an append or a set still equal to it, 7 an element's retain count not back where it started once every array was released" \
+    dict "bit 0 is CFDictionaryCreate not handing back a dictionary of three, 1 a lookup through a separately created key not handing back the very value stored, 2 CFDictionaryContainsKey not exactly true and false, 3 CFDictionaryGetValueIfPresent not exactly true with the stored value, 4 the same call for an absent key not exactly false or writing its out pointer, 5 CFDictionaryGetKeysAndValues pairing a key with a value other than its own, 6 a dictionary with kCFCopyStringDictionaryKeyCallBacks not finding its value under a mutable key's old text, or finding it under the new, once the key was changed, so the key was not copied, 7 CFDictionaryAddValue replacing an existing value or CFDictionarySetValue not replacing it, 8 a value not retained exactly once while held or not released on removal, or the dictionary's count wrong, 9 CFDictionaryCreateCopy not exactly equal to the original, or a mutable copy with an extra key still equal" \
+    number "bit 0 is an SInt32 CFNumber not reading back -123456789 with exactly true or not of CFNumberGetTypeID, 1 an SInt64 CFNumber not reading back all 64 bits with exactly true, 2 a Float64 CFNumber not reading back exactly, 3 CFNumberGetType not answering kCFNumberSInt32Type, kCFNumberSInt64Type and kCFNumberFloat64Type, 4 a lossy read of the SInt64 into an SInt32 not returning exactly false, 5 CFNumberCompare not returning exactly 1, -1, 0 and 1, 6 kCFNumberNaN, kCFNumberPositiveInfinity or kCFNumberNegativeInfinity not reading back as NaN and the two infinities, 7 CFBooleanGetValue not exactly true for kCFBooleanTrue and false for kCFBooleanFalse, 8 the two booleans the same object or not of CFBooleanGetTypeID, 9 kCFNull null, not exactly equal to itself or of the boolean type" \
+    data "bit 0 is CFDataCreate not handing back 64 bytes of CFDataGetTypeID, 1 CFDataGetBytePtr null, the caller's own buffer or other bytes, 2 CFRetain handing back another pointer, the retain count not one higher after it or not back after CFRelease, 3 an empty CFData not zero bytes long, 4 CFGetAllocator not kCFAllocatorSystemDefault for data created with kCFAllocatorDefault, 5 CFCopyDescription not handing back a non-empty string"
+case_cf cf_callbacks "$CF_CALLBACKS_BIN" "$CF_CALLBACKS_ARM64" cf_callbacks "" \
+    "cf_callbacks is the first case in which the bridge converts function pointers held in a structure rather than passed in a register, so a failure here means no guest program that gives a collection callbacks of its own can run in native mode" \
+    array "bit 0 is the mutable array not holding six elements with the keys its edits leave, in order, and the same pointer on every read, 1 the array not holding the stand-in a retain callback handed back, so a guest callback's pointer result did not reach CoreFoundation, 2 retain and release not called exactly six and zero times by the appends and eight and two times after the remove, set and insert, or an element's own count wrong after them, 3 a callback handed an allocator other than kCFAllocatorMalloc, 4 CFEqual against an array of equal elements not exactly true after exactly six calls of equal, 5 CFEqual against an array differing at its fourth element not exactly false after exactly four, which is also what a guest Boolean handed back without being narrowed looks like, 6 equal handed its arguments in the wrong order, 7 CFCopyDescription not calling copyDescription once per element or not containing the text those calls returned, 8 CFArrayCreateMutableCopy not holding six elements or not retaining each of them once more, 9 an element's count not back at zero after the last release, release not called once per remaining element when the array was freed, retains and releases not balancing, a callback handed a value that is no element, or a callback entered on a misaligned stack" \
+    mixed "bit 0 is kCFTypeArrayCallBacks not a version-0 structure with all four words set, 1 the arrays not holding what was put in them, 2 the native retain word in a structure with a guest equal word not retaining each string once per array holding it, 3 CFEqual between two arrays with the mixed callbacks not exactly true after exactly two calls of the guest equal, 4 CFEqual against an array with the unmodified callbacks not exactly false or calling the guest equal, 5 CFEqual not exactly false once one string was changed, 6 CFCopyDescription through the native copyDescription word not containing the strings, 7 a string's retain count not back after the arrays were released, or a callback entered on a misaligned stack" \
+    dict "bit 0 is a dictionary with guest key callbacks not holding eight entries, 1 a key looked up through a copy at another address not finding its value, or the guest equal not called for it, 2 an absent key reported present, 3 CFDictionaryGetValueIfPresent not exactly true with the stored value, 4 a removed key still counted or present, 5 CFDictionaryGetKeysAndValues handing back a key pointer other than the one stored or a value other than its own, or the guest hash called fewer times than there are keys, 6 a hash or equal callback entered on a misaligned stack" \
+    apply "bit 0 is CFDictionaryApplyFunction over the C-string dictionary not calling the applier once per entry with its own context and each key's own value, 1 the checksum over those calls wrong, 2 the same over a dictionary of CFString keys and CFNumber values, whose applier makes bridged calls, 3 that checksum wrong, 4 an applier, hash or equal callback entered on a misaligned stack"
+case_cf cf_runloop "$CF_RUNLOOP_BIN" "$CF_RUNLOOP_ARM64" cf_runloop "" \
+    "cf_runloop is the first case whose guest code is called from a framework's event loop rather than from a call made for the purpose, which is how every event reaches an application, so a failure here means no event-driven guest program can run in native mode" \
+    loop "bit 0 is CFRunLoopGetCurrent not the main run loop on the main thread, 1 creating the timer, observer or source failing, or a context not retained exactly once on creation, 2 CFRunLoopTimerGetNextFireDate not the date CFRunLoopTimerSetNextFireDate set, 3 CFRunLoopRunInMode not returning kCFRunLoopRunStopped, 4 the timer not firing exactly three times with its own timer and info, or found invalid inside its callout, 5 the source's perform not run exactly once between each pair of fires, 6 the observer not seeing exactly one entry, first, at least one wait and nothing else, or handed another observer or info, 7 schedule not called once when the source was added, or cancel not once when it was removed and not again on invalidation, 8 a source callout handed another info, run loop or mode, or a callout run on another run loop, 9 CFRunLoopTimerIsValid not exactly true before and after the timer's removal and exactly false after its invalidation, 10 the timer's context not retained and released four times, once per callout and once for the timer, by the time it was invalidated, 11 the observer's context not retained and released exactly once, 12 the source's context the same, or a context callback handed an info the fixture never gave, 13 a callback entered on a misaligned stack"
 case_env_native
 case_flag_beats_env
 case_last_flag_native
@@ -6282,6 +8107,7 @@ case_empty_mode
 case_native_static
 case_native_unbound
 case_native_float
+case_native_classic_bind
 
 echo "----------------------------------------"
 echo "native tests: $pass passed, $fail failed"

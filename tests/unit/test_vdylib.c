@@ -1,5 +1,6 @@
 /*
- * The synthesized libSystem, checked as the loader will actually read it.
+ * The synthesized system libraries, checked as the loader will actually read
+ * them.
  *
  * Native mode maps no shared cache, so ocerz_vdylib_image builds an x86_64
  * Mach-O for /usr/lib/libSystem.B.dylib in a malloc buffer and the ordinary
@@ -60,8 +61,51 @@
  * that the value is not baked in.  Everything else in the two buffers is
  * asserted byte-identical, so the second build re-interned the same export ids
  * and laid out the same slot, and each image carries its guard in its own slot.
+ *
+ * CoreFoundation is the second row of the same table, and it is checked against
+ * its whole export list rather than a sample.  Every function name has to
+ * resolve to exactly 41 bb <id> ff 25 <rel32> with int3 padding, move with the
+ * load base, jump through a slot holding the bridge trap address, and carry an
+ * id that ocerz_vdylib_export_name turns back into CoreFoundation's install
+ * name and that same symbol - which is also what proves no two names share an
+ * id or a stub, and that CoreFoundation's ids did not collide with libSystem's
+ * in the one id space the dispatcher reads.  __text and __data are asserted to
+ * be exactly one stub and one slot per function, so a native export that took
+ * either is caught.  No libSystem name resolves in CoreFoundation and no
+ * CoreFoundation name resolves in libSystem, and names a character shorter or
+ * longer than CoreFoundation's own reach nothing.
+ *
+ * Every native data name has to resolve to exactly what dlsym answers for it,
+ * less its underscore, in a CoreFoundation this process dlopens itself, and to
+ * the same value at two different load bases: a terminal written without the
+ * absolute flag would come back shifted by the base, and the second base is
+ * what catches it.
+ *
+ * The host's CoreFoundation is normally mapped below 2^35, so it cannot show
+ * that a wider address survives, and it resolves every name, so it cannot show
+ * what happens to one that does not.  ocerz_vdylib_image_with
+ * builds the same image against a lookup the test supplies instead.  The first
+ * answers every name with a value five ULEB bytes cannot hold - 2^35 exactly,
+ * bit 63 alone, all 64 bits set and others past 2^35 - and each has to come back
+ * exact at both load bases.  That image has to be the same length as the real
+ * one, with the same trie offset and size, and its stubs and __DATA the same
+ * bytes, so a terminal's width is shown not to depend on its value and a native
+ * export not to occupy a segment.  The second lookup answers nothing for every
+ * third name, those names have to be absent from the trie rather than exported
+ * as zero while every other export still resolves, and two builds against it
+ * are captured with ocerz_verbose raised: each missing name has to be logged
+ * exactly once across both, and no present name at all.
+ *
+ * Before any of that, a forked child builds CoreFoundation and only then
+ * libSystem, and sends libSystem's bytes back with the guard slot zeroed.  A
+ * program that links CoreFoundation names it ahead of libSystem, so that is the
+ * order the loader really builds them in, and the parent's libSystem, built
+ * first, has to match it byte for byte: ids minted in build order would
+ * renumber every libSystem stub.  The child uses the synthetic lookup, so it
+ * never loads CoreFoundation into a forked process.
  */
 #include "ocerz/vdylib.h"
+#include "ocerz/bridge.h"
 #include "ocerz/dyld.h"
 #include "ocerz/dyldapi.h"
 #include "ocerz/decode.h"
@@ -70,11 +114,15 @@
 #include <mach-o/loader.h>
 #include <mach/machine.h>
 
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #define LOAD_BASE       0x0000000210000000ull
+#define LOAD_BASE_ALT   0x0000000c47000000ull
 #define MOV_LEN         6
 #define JMP_LEN         6
 #define STUB_LEN        (MOV_LEN + JMP_LEN)
@@ -126,6 +174,141 @@ static const char *const kNotExported[] = {
 #define NNOT (sizeof kNotExported / sizeof kNotExported[0])
 
 static const char *const kGuard = "___stack_chk_guard";
+
+static const char *const kCF = OCERZ_BRIDGE_COREFOUNDATION;
+
+static const char *const kCFFunctions[] = {
+    "_CFRetain",
+    "_CFRelease",
+    "_CFGetRetainCount",
+    "_CFEqual",
+    "_CFHash",
+    "_CFGetTypeID",
+    "_CFStringGetTypeID",
+    "_CFArrayGetTypeID",
+    "_CFDictionaryGetTypeID",
+    "_CFNumberGetTypeID",
+    "_CFBooleanGetTypeID",
+    "_CFDataGetTypeID",
+    "_CFCopyDescription",
+    "_CFGetAllocator",
+    "_CFStringCreateWithCString",
+    "_CFStringCreateWithBytes",
+    "_CFStringCreateCopy",
+    "_CFStringCreateMutable",
+    "_CFStringCreateMutableCopy",
+    "_CFStringAppendCString",
+    "_CFStringAppend",
+    "_CFStringGetLength",
+    "_CFStringGetCharacterAtIndex",
+    "_CFStringGetCString",
+    "_CFStringGetCStringPtr",
+    "_CFStringGetMaximumSizeForEncoding",
+    "_CFStringCompare",
+    "_CFStringHasPrefix",
+    "_CFStringHasSuffix",
+    "_CFStringGetIntValue",
+    "_CFStringGetDoubleValue",
+    "_CFStringCreateArrayBySeparatingStrings",
+    "_CFStringCreateByCombiningStrings",
+    "___CFStringMakeConstantString",
+    "_CFArrayCreate",
+    "_CFArrayCreateMutable",
+    "_CFArrayCreateCopy",
+    "_CFArrayCreateMutableCopy",
+    "_CFArrayGetCount",
+    "_CFArrayGetValueAtIndex",
+    "_CFArrayAppendValue",
+    "_CFArrayInsertValueAtIndex",
+    "_CFArraySetValueAtIndex",
+    "_CFArrayRemoveValueAtIndex",
+    "_CFArrayRemoveAllValues",
+    "_CFDictionaryCreate",
+    "_CFDictionaryCreateMutable",
+    "_CFDictionaryCreateCopy",
+    "_CFDictionaryCreateMutableCopy",
+    "_CFDictionaryGetCount",
+    "_CFDictionaryGetValue",
+    "_CFDictionaryGetValueIfPresent",
+    "_CFDictionaryContainsKey",
+    "_CFDictionaryAddValue",
+    "_CFDictionarySetValue",
+    "_CFDictionaryRemoveValue",
+    "_CFDictionaryGetKeysAndValues",
+    "_CFDictionaryApplyFunction",
+    "_CFNumberCreate",
+    "_CFNumberGetValue",
+    "_CFNumberGetType",
+    "_CFNumberCompare",
+    "_CFBooleanGetValue",
+    "_CFDataCreate",
+    "_CFDataGetLength",
+    "_CFDataGetBytePtr",
+    "_CFAbsoluteTimeGetCurrent",
+    "_CFRunLoopGetCurrent",
+    "_CFRunLoopGetMain",
+    "_CFRunLoopRun",
+    "_CFRunLoopRunInMode",
+    "_CFRunLoopStop",
+    "_CFRunLoopWakeUp",
+    "_CFRunLoopAddTimer",
+    "_CFRunLoopRemoveTimer",
+    "_CFRunLoopTimerCreate",
+    "_CFRunLoopTimerInvalidate",
+    "_CFRunLoopTimerIsValid",
+    "_CFRunLoopTimerGetNextFireDate",
+    "_CFRunLoopTimerSetNextFireDate",
+    "_CFRunLoopObserverCreate",
+    "_CFRunLoopAddObserver",
+    "_CFRunLoopRemoveObserver",
+    "_CFRunLoopObserverInvalidate",
+    "_CFRunLoopSourceCreate",
+    "_CFRunLoopAddSource",
+    "_CFRunLoopRemoveSource",
+    "_CFRunLoopSourceSignal",
+    "_CFRunLoopSourceInvalidate",
+};
+#define NCFFUNCS (sizeof kCFFunctions / sizeof kCFFunctions[0])
+
+static const char *const kCFNatives[] = {
+    "___CFConstantStringClassReference",
+    "_kCFAllocatorDefault",
+    "_kCFAllocatorSystemDefault",
+    "_kCFAllocatorMalloc",
+    "_kCFAllocatorNull",
+    "_kCFTypeArrayCallBacks",
+    "_kCFTypeDictionaryKeyCallBacks",
+    "_kCFTypeDictionaryValueCallBacks",
+    "_kCFCopyStringDictionaryKeyCallBacks",
+    "_kCFBooleanTrue",
+    "_kCFBooleanFalse",
+    "_kCFNull",
+    "_kCFRunLoopDefaultMode",
+    "_kCFRunLoopCommonModes",
+    "_kCFNumberPositiveInfinity",
+    "_kCFNumberNegativeInfinity",
+    "_kCFNumberNaN",
+};
+#define NCFNATIVES (sizeof kCFNatives / sizeof kCFNatives[0])
+
+static const char *const kCFNotExported[] = {
+    "_CFRetai", "_CFRetainX", "_CFArrayCreateMutableCop", "_CFRunLoopRu",
+    "_CFRunLoopRunInModes", "_kCFBoolean", "_kCFBooleanTru",
+    "___CFConstantStringClassReferences", "___CF", "_CF", "_kCF",
+};
+#define NCFNOT (sizeof kCFNotExported / sizeof kCFNotExported[0])
+
+static const uint64_t kFakeHost[] = {
+    0x0000000800000000ull,
+    0x00000007ffffffffull,
+    0x0000000800000008ull,
+    0x00007ffffffff000ull,
+    0x8000000000000000ull,
+    0xffffffffffffffffull,
+    0x0123456789abcdefull,
+    0xfedcba9876543210ull,
+};
+#define NFAKE (sizeof kFakeHost / sizeof kFakeHost[0])
 
 typedef struct {
     int found;
@@ -210,7 +393,7 @@ static int report(void)
     return failures ? 1 : 0;
 }
 
-int main(void)
+static void check_libsystem(void)
 {
     CHECK(ocerz_vdylib_have(kLib) != 0,
           "ocerz_vdylib_have(\"%s\") says no", kLib);
@@ -223,14 +406,14 @@ int main(void)
     uint8_t *img = ocerz_vdylib_image(kLib, &len);
     CHECK(img != NULL, "ocerz_vdylib_image(\"%s\") returned no buffer", kLib);
     if (!img)
-        return report();
+        return;
 
     CHECK(len > sizeof(struct mach_header_64),
           "image is %zu bytes, too small to hold a mach header", len);
     CHECK(len < IMAGE_MAX, "image is %zu bytes, which is implausible", len);
     if (len <= sizeof(struct mach_header_64) || len >= IMAGE_MAX) {
         free(img);
-        return report();
+        return;
     }
 
     struct mach_header_64 mh;
@@ -247,7 +430,7 @@ int main(void)
     if (mh.magic != MH_MAGIC_64 || mh.ncmds == 0 ||
         (uint64_t)sizeof mh + mh.sizeofcmds > (uint64_t)len) {
         free(img);
-        return report();
+        return;
     }
 
     SegInfo text, data;
@@ -312,7 +495,7 @@ int main(void)
     CHECK(data.found, "no __DATA segment");
     if (!text.found || !data.found) {
         free(img);
-        return report();
+        return;
     }
 
     CHECK(text.fileoff == 0,
@@ -347,7 +530,7 @@ int main(void)
           (unsigned long long)data.vmaddr, (unsigned long long)text.vmaddr);
     if (data.vmaddr < text.vmaddr || data.filesize == 0) {
         free(img);
-        return report();
+        return;
     }
 
     const uint64_t text_lo = LOAD_BASE;
@@ -487,7 +670,7 @@ int main(void)
     CHECK(data.sect_found, "__DATA carries no section, so the jump slots cannot be located");
     if (!text.sect_found || !data.sect_found) {
         free(img);
-        return report();
+        return;
     }
     CHECK(text.sect_size % STUB_STRIDE == 0,
           "__text is %llu bytes, not a whole number of %d-byte stubs",
@@ -620,5 +803,478 @@ int main(void)
     }
 
     free(img);
+}
+
+typedef struct {
+    SegInfo text;
+    SegInfo data;
+    uint32_t trie_off;
+    uint32_t trie_size;
+} Layout;
+
+static int layout_of(const char *what, const uint8_t *img, size_t len, const char *install,
+                     Layout *ly)
+{
+    memset(ly, 0, sizeof *ly);
+    struct mach_header_64 mh;
+    if (len <= sizeof mh) {
+        CHECK(0, "%s: image is %zu bytes, too small to hold a mach header", what, len);
+        return 0;
+    }
+    memcpy(&mh, img, sizeof mh);
+    int shape = mh.magic == MH_MAGIC_64 && mh.cputype == CPU_TYPE_X86_64 &&
+                mh.filetype == MH_DYLIB && mh.ncmds > 0 &&
+                (uint64_t)sizeof mh + mh.sizeofcmds <= (uint64_t)len;
+    CHECK(shape, "%s: not an x86_64 MH_DYLIB whose load commands fit the image", what);
+    if (!shape)
+        return 0;
+
+    int trie_found = 0, id_named = 0, malformed = 0;
+    uint32_t walked = 0;
+    const uint8_t *lc = img + sizeof mh;
+    for (uint32_t i = 0; i < mh.ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        uint32_t csize = rd32(lc + 4);
+        if (csize < 8 || (uint64_t)walked + csize > mh.sizeofcmds) {
+            malformed = 1;
+            break;
+        }
+        if (cmd == LC_SEGMENT_64 && csize >= sizeof(struct segment_command_64)) {
+            if (memcmp(lc + 8, "__TEXT", 7) == 0)
+                seg_from(lc, csize, &ly->text);
+            else if (memcmp(lc + 8, "__DATA", 7) == 0)
+                seg_from(lc, csize, &ly->data);
+        } else if (cmd == LC_EXPORTS_TRIE && csize >= 16) {
+            trie_found = 1;
+            ly->trie_off = rd32(lc + 8);
+            ly->trie_size = rd32(lc + 12);
+        } else if (cmd == LC_ID_DYLIB && csize >= 24) {
+            uint32_t noff = rd32(lc + 8);
+            if (noff >= 24 && noff < csize) {
+                const char *nm = (const char *)(lc + noff);
+                size_t room = csize - noff;
+                id_named = strnlen(nm, room) < room && strcmp(nm, install) == 0;
+            }
+        }
+        lc += csize;
+        walked += csize;
+    }
+    CHECK(!malformed, "%s: a load command is malformed", what);
+    CHECK(id_named, "%s: LC_ID_DYLIB does not name \"%s\"", what, install);
+    int placed = trie_found && ly->trie_size != 0 &&
+                 (uint64_t)ly->trie_off + ly->trie_size <= (uint64_t)len;
+    CHECK(placed, "%s: no export trie inside the image", what);
+    int segs = ly->text.found && ly->data.found && ly->text.fileoff == 0 &&
+               ly->text.vmaddr == 0 && ly->data.filesize != 0 &&
+               ly->data.fileoff + ly->data.filesize <= (uint64_t)len &&
+               ly->data.vmaddr == ly->data.fileoff &&
+               (uint64_t)ly->trie_off >= ly->data.fileoff + ly->data.filesize;
+    CHECK(segs, "%s: __TEXT and __DATA are not laid out file-equals-memory ahead of the trie",
+          what);
+    return !malformed && id_named && placed && segs;
+}
+
+static void check_function_stubs(const char *what, const uint8_t *img, size_t len,
+                                 const Layout *ly, const char *lib,
+                                 const char *const *names, size_t n)
+{
+    const uint64_t want_slot = OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF;
+    size_t good = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        const char *sym = names[i];
+        int found = 0, found_alt = 0;
+        uint64_t a = ocerz_dyld_trie_resolve(img, LOAD_BASE, sym, &found);
+        uint64_t a_alt = ocerz_dyld_trie_resolve(img, LOAD_BASE_ALT, sym, &found_alt);
+        CHECK(found && found_alt, "%s: %s does not resolve through the export trie", what, sym);
+        if (!found || !found_alt)
+            continue;
+        CHECK(a_alt - a == LOAD_BASE_ALT - LOAD_BASE,
+              "%s: %s resolves to %#llx at one load base and %#llx at another, "
+              "so its stub does not move with the image",
+              what, sym, (unsigned long long)a, (unsigned long long)a_alt);
+
+        uint64_t off = a - LOAD_BASE;
+        int in_text = a >= LOAD_BASE && off + STUB_STRIDE <= ly->text.filesize &&
+                      off + STUB_STRIDE <= (uint64_t)len;
+        CHECK(in_text, "%s: %s resolved to offset %#llx, outside __TEXT", what, sym,
+              (unsigned long long)off);
+        if (!in_text)
+            continue;
+
+        const uint8_t *st = img + off;
+        int shape = st[0] == 0x41 && st[1] == 0xbb && st[6] == 0xff && st[7] == 0x25 &&
+                    st[12] == 0xcc && st[13] == 0xcc && st[14] == 0xcc && st[15] == 0xcc;
+        CHECK(shape, "%s: %s stub is %02x %02x .. %02x %02x, want 41 bb <id> ff 25 <rel32> "
+              "and int3 padding", what, sym, st[0], st[1], st[6], st[7]);
+        if (!shape)
+            continue;
+
+        uint32_t id = rd32(st + 2);
+        int32_t rel = (int32_t)rd32(st + 8);
+        int64_t slot = (int64_t)off + STUB_LEN + rel;
+        int in_data = slot >= (int64_t)ly->data.fileoff &&
+                      (uint64_t)slot + SLOT_LEN <= ly->data.fileoff + ly->data.filesize;
+        CHECK(in_data, "%s: %s stub jumps through offset %#llx, outside __DATA", what, sym,
+              (unsigned long long)slot);
+        if (!in_data)
+            continue;
+        uint64_t held = rd64(img + slot);
+        CHECK(held == want_slot, "%s: %s stub's slot holds %#llx, want %#llx", what, sym,
+              (unsigned long long)held, (unsigned long long)want_slot);
+
+        const char *got_lib = NULL, *got_sym = NULL;
+        int named = ocerz_vdylib_export_name(id, &got_lib, &got_sym);
+        int back = named && got_lib && got_sym && strcmp(got_lib, lib) == 0 &&
+                   strcmp(got_sym, sym) == 0;
+        CHECK(back, "%s: %s stub carries id %u, which dispatches to %s %s", what, sym, id,
+              named && got_lib ? got_lib : "(no library)",
+              named && got_sym ? got_sym : "(no symbol)");
+        good += held == want_slot && back;
+    }
+    CHECK(good == n, "%s: only %zu of the %zu function exports reach a stub that traps as "
+          "themselves", what, good, n);
+}
+
+static void check_absent(const char *what, const uint8_t *img, const char *const *names,
+                         size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        int found = 1;
+        uint64_t v = ocerz_dyld_trie_resolve(img, LOAD_BASE, names[i], &found);
+        CHECK(!found && v == 0, "%s: %s resolved to %#llx, but it is not exported there", what,
+              names[i], (unsigned long long)v);
+    }
+}
+
+static int native_index(const char *host_sym)
+{
+    for (size_t k = 0; k < NCFNATIVES; k++)
+        if (strcmp(kCFNatives[k] + 1, host_sym) == 0)
+            return (int)k;
+    return -1;
+}
+
+static uint64_t fake_host_value(size_t k)
+{
+    if (k < NFAKE)
+        return kFakeHost[k];
+    return 0x0000100000000000ull + ((uint64_t)k << 40);
+}
+
+static int fake_misses(size_t k)
+{
+    return k % 3 == 0;
+}
+
+static int g_fake_wrong_lib;
+
+static void *fake_host_all(const char *install_name, const char *host_sym)
+{
+    if (!install_name || strcmp(install_name, kCF) != 0)
+        g_fake_wrong_lib++;
+    int k = native_index(host_sym);
+    return k < 0 ? NULL : (void *)(uintptr_t)fake_host_value((size_t)k);
+}
+
+static void *fake_host_some(const char *install_name, const char *host_sym)
+{
+    if (!install_name || strcmp(install_name, kCF) != 0)
+        g_fake_wrong_lib++;
+    int k = native_index(host_sym);
+    if (k < 0 || fake_misses((size_t)k))
+        return NULL;
+    return (void *)(uintptr_t)fake_host_value((size_t)k);
+}
+
+static void check_natives_are(const char *what, const uint8_t *img, void *(*want)(size_t))
+{
+    for (size_t k = 0; k < NCFNATIVES; k++) {
+        const char *sym = kCFNatives[k];
+        uint64_t w = (uint64_t)(uintptr_t)want(k);
+        int found = 0, found_alt = 0;
+        uint64_t v = ocerz_dyld_trie_resolve(img, LOAD_BASE, sym, &found);
+        uint64_t v_alt = ocerz_dyld_trie_resolve(img, LOAD_BASE_ALT, sym, &found_alt);
+        if (w == 0) {
+            CHECK(!found && !found_alt && v == 0,
+                  "%s: %s has no host address but resolved to %#llx", what, sym,
+                  (unsigned long long)v);
+            continue;
+        }
+        CHECK(found && v == w, "%s: %s resolved to %#llx (found %d), want exactly %#llx", what,
+              sym, (unsigned long long)v, found, (unsigned long long)w);
+        CHECK(found_alt && v_alt == w,
+              "%s: %s resolved to %#llx at a second load base, want %#llx: the value is not "
+              "absolute", what, sym, (unsigned long long)v_alt, (unsigned long long)w);
+    }
+}
+
+static int same_segments(const uint8_t *a, const uint8_t *b, const Layout *ly)
+{
+    uint64_t lo = ly->text.sect_addr;
+    return lo < ly->trie_off && memcmp(a + lo, b + lo, ly->trie_off - lo) == 0;
+}
+
+static void *g_cf_handle;
+
+static void *host_native(size_t k)
+{
+    return g_cf_handle ? dlsym(g_cf_handle, kCFNatives[k] + 1) : NULL;
+}
+
+static void *fake_all_native(size_t k)
+{
+    return (void *)(uintptr_t)fake_host_value(k);
+}
+
+static void *fake_some_native(size_t k)
+{
+    return fake_misses(k) ? NULL : (void *)(uintptr_t)fake_host_value(k);
+}
+
+static char *read_all(int fd, size_t *len_out)
+{
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap + 1);
+    if (!buf)
+        return NULL;
+    lseek(fd, 0, SEEK_SET);
+    for (;;) {
+        if (len == cap) {
+            char *nb = realloc(buf, cap * 2 + 1);
+            if (!nb)
+                break;
+            buf = nb;
+            cap *= 2;
+        }
+        ssize_t r = read(fd, buf + len, cap - len);
+        if (r <= 0)
+            break;
+        len += (size_t)r;
+    }
+    buf[len] = '\0';
+    *len_out = len;
+    return buf;
+}
+
+static size_t count_of(const char *hay, const char *needle)
+{
+    size_t c = 0, nl = strlen(needle);
+    for (const char *p = strstr(hay, needle); p; p = strstr(p + nl, needle))
+        c++;
+    return c;
+}
+
+static void check_corefoundation(void)
+{
+    CHECK(ocerz_vdylib_have(kCF) != 0, "ocerz_vdylib_have(\"%s\") says no", kCF);
+
+    size_t len = 0;
+    uint8_t *img = ocerz_vdylib_image(kCF, &len);
+    CHECK(img != NULL, "ocerz_vdylib_image(\"%s\") returned no buffer", kCF);
+    if (!img)
+        return;
+    CHECK(len < IMAGE_MAX, "CoreFoundation image is %zu bytes, which is implausible", len);
+
+    Layout ly;
+    if (!layout_of("CoreFoundation", img, len, kCF, &ly)) {
+        free(img);
+        return;
+    }
+    CHECK(ly.text.sect_found && ly.text.sect_size == NCFFUNCS * STUB_STRIDE,
+          "CoreFoundation's __text is %llu bytes, want one stub for each of the %zu functions "
+          "and none for its native data", (unsigned long long)ly.text.sect_size, NCFFUNCS);
+    CHECK(ly.data.sect_found && ly.data.sect_size == NCFFUNCS * SLOT_LEN,
+          "CoreFoundation's __data is %llu bytes, want one jump slot for each of the %zu "
+          "functions and nothing for its native data", (unsigned long long)ly.data.sect_size,
+          NCFFUNCS);
+
+    check_function_stubs("CoreFoundation", img, len, &ly, kCF, kCFFunctions, NCFFUNCS);
+
+    g_cf_handle = dlopen(kCF, RTLD_LAZY | RTLD_LOCAL);
+    CHECK(g_cf_handle != NULL, "the host will not dlopen %s: %s", kCF, dlerror());
+    size_t host_has = 0;
+    for (size_t k = 0; k < NCFNATIVES; k++)
+        host_has += host_native(k) != NULL;
+    CHECK(host_has == NCFNATIVES, "the host CoreFoundation has only %zu of the %zu native data "
+          "names", host_has, NCFNATIVES);
+    check_natives_are("CoreFoundation", img, host_native);
+
+    size_t ls_len = 0;
+    uint8_t *ls = ocerz_vdylib_image(kLib, &ls_len);
+    CHECK(ls != NULL, "ocerz_vdylib_image(\"%s\") returned no buffer", kLib);
+    if (ls) {
+        check_absent("libSystem", ls, kCFFunctions, NCFFUNCS);
+        check_absent("libSystem", ls, kCFNatives, NCFNATIVES);
+        free(ls);
+    }
+    check_absent("CoreFoundation", img, kExports, NEXPORTS);
+    check_absent("CoreFoundation", img, (const char *const[]){ kGuard, "__tlv_bootstrap" }, 2);
+    check_absent("CoreFoundation", img, kCFNotExported, NCFNOT);
+
+    g_fake_wrong_lib = 0;
+    size_t all_len = 0;
+    uint8_t *all = ocerz_vdylib_image_with(kCF, fake_host_all, &all_len);
+    CHECK(all != NULL, "CoreFoundation built against high host addresses returned no buffer");
+    if (all) {
+        Layout aly;
+        if (layout_of("CoreFoundation (high)", all, all_len, kCF, &aly)) {
+            check_natives_are("CoreFoundation (high)", all, fake_all_native);
+            check_function_stubs("CoreFoundation (high)", all, all_len, &aly, kCF,
+                                 kCFFunctions, NCFFUNCS);
+            if (host_has == NCFNATIVES) {
+                CHECK(all_len == len && aly.trie_off == ly.trie_off &&
+                      aly.trie_size == ly.trie_size,
+                      "the image is %zu bytes (trie %u at %u) against high addresses and %zu "
+                      "(trie %u at %u) against the host's, so a terminal's width depends on "
+                      "its value", all_len, aly.trie_size, aly.trie_off, len, ly.trie_size,
+                      ly.trie_off);
+            }
+            CHECK(aly.trie_off == ly.trie_off && same_segments(all, img, &ly),
+                  "the stubs or __DATA differ when only native addresses change, so a native "
+                  "export took bytes in a segment");
+        }
+        free(all);
+    }
+
+    int saved = dup(2);
+    FILE *cap = tmpfile();
+    int prev_verbose = ocerz_verbose;
+    size_t some_len = 0, again_len = 0;
+    uint8_t *some = NULL, *again = NULL;
+    if (saved >= 0 && cap) {
+        fflush(stderr);
+        dup2(fileno(cap), 2);
+        ocerz_verbose = 1;
+        some = ocerz_vdylib_image_with(kCF, fake_host_some, &some_len);
+        again = ocerz_vdylib_image_with(kCF, fake_host_some, &again_len);
+        ocerz_verbose = prev_verbose;
+        fflush(stderr);
+        dup2(saved, 2);
+    }
+    if (saved >= 0)
+        close(saved);
+    CHECK(cap != NULL && saved >= 0, "cannot capture stderr to check the missing-name log");
+    CHECK(g_fake_wrong_lib == 0,
+          "the host lookup was asked %d times about a library other than %s",
+          g_fake_wrong_lib, kCF);
+
+    CHECK(some != NULL, "CoreFoundation built with missing host names returned no buffer");
+    if (some) {
+        Layout sly;
+        if (layout_of("CoreFoundation (missing)", some, some_len, kCF, &sly)) {
+            check_natives_are("CoreFoundation (missing)", some, fake_some_native);
+            check_function_stubs("CoreFoundation (missing)", some, some_len, &sly, kCF,
+                                 kCFFunctions, NCFFUNCS);
+            CHECK(some_len < len, "leaving native names out did not shrink the trie (%zu vs %zu)",
+                  some_len, len);
+            CHECK(sly.trie_off == ly.trie_off && same_segments(some, img, &ly),
+                  "the stubs or __DATA differ when native names are missing, so a native "
+                  "export took bytes in a segment");
+        }
+    }
+    CHECK(again != NULL && some != NULL && again_len == some_len &&
+          memcmp(again, some, some_len) == 0,
+          "two builds against the same missing names are not identical");
+
+    if (cap) {
+        size_t log_len = 0;
+        char *log = read_all(fileno(cap), &log_len);
+        CHECK(log != NULL, "cannot read the captured log back");
+        if (log) {
+            for (size_t k = 0; k < NCFNATIVES; k++) {
+                char line[256];
+                snprintf(line, sizeof line, "does not export %s\n", kCFNatives[k]);
+                size_t c = count_of(log, line);
+                if (fake_misses(k))
+                    CHECK(c == 1, "%s went missing in two builds and was logged %zu times, "
+                          "want once", kCFNatives[k], c);
+                else
+                    CHECK(c == 0, "%s resolved but was logged missing %zu times",
+                          kCFNatives[k], c);
+            }
+            free(log);
+        }
+        fclose(cap);
+    }
+    free(some);
+    free(again);
+    free(img);
+}
+
+static uint8_t *libsystem_unguarded(size_t *len_out)
+{
+    size_t len = 0;
+    uint8_t *img = ocerz_vdylib_image(kLib, &len);
+    int found = 0;
+    uint64_t guard = img ? ocerz_dyld_trie_resolve(img, 0, kGuard, &found) : 0;
+    if (!img || !found || guard + SLOT_LEN > len) {
+        free(img);
+        return NULL;
+    }
+    memset(img + guard, 0, SLOT_LEN);
+    *len_out = len;
+    return img;
+}
+
+static uint8_t *libsystem_built_after_corefoundation(size_t *len_out)
+{
+    int fds[2];
+    if (pipe(fds) != 0)
+        return NULL;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return NULL;
+    }
+    if (pid == 0) {
+        close(fds[0]);
+        size_t cf_len = 0, len = 0;
+        uint8_t *cf = ocerz_vdylib_image_with(kCF, fake_host_all, &cf_len);
+        uint8_t *img = cf ? libsystem_unguarded(&len) : NULL;
+        if (!img)
+            _exit(1);
+        for (size_t at = 0; at < len;) {
+            ssize_t w = write(fds[1], img + at, len - at);
+            if (w <= 0)
+                _exit(1);
+            at += (size_t)w;
+        }
+        _exit(0);
+    }
+    close(fds[1]);
+    size_t len = 0;
+    uint8_t *img = (uint8_t *)read_all(fds[0], &len);
+    close(fds[0]);
+    int status = 0;
+    int reaped = waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+                 WEXITSTATUS(status) == 0;
+    if (!img || !reaped || len == 0) {
+        free(img);
+        return NULL;
+    }
+    *len_out = len;
+    return img;
+}
+
+int main(void)
+{
+    size_t late_len = 0;
+    uint8_t *late = libsystem_built_after_corefoundation(&late_len);
+
+    check_libsystem();
+    check_corefoundation();
+
+    CHECK(late != NULL, "a child that built CoreFoundation before libSystem sent nothing back");
+    size_t early_len = 0;
+    uint8_t *early = libsystem_unguarded(&early_len);
+    CHECK(early != NULL, "cannot rebuild libSystem to compare against the child's");
+    if (late && early)
+        CHECK(late_len == early_len && memcmp(late, early, early_len) == 0,
+              "libSystem built after CoreFoundation differs from libSystem built first, so "
+              "its export ids depend on which library a guest names first");
+    free(late);
+    free(early);
     return report();
 }

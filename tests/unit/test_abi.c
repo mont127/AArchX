@@ -21,18 +21,32 @@
  * l(LLLLLLLLiiL) hands the host two 32-bit arguments sharing one eight-byte
  * word.  An engine that copied the guest's spilled words straight through
  * would pass every signature whose two walks happen to agree and fail exactly
- * these.
+ * these.  The narrow classes push the same point further: l(iiiiiiiibhBHi)
+ * leaves b, h, B, H and i one eightbyte each on the guest stack and packs them
+ * into twelve bytes on the host's, and h(bhBHbhBHbhBHbhBH) and
+ * L(LLLLLLLLbiBlhL) do the same with every narrow width and with gaps that
+ * only alignment explains.  A callee reading its own stack never looks at the
+ * bytes between its arguments, so the host frame is also checked byte for
+ * byte, straight out of ocerz_abi_read_guest, against the layout clang was
+ * seen to use, with every byte between the arguments required to be zero.
  *
  * Where an ABI leaves bits undefined this test writes nonsense into them and
  * expects the crossing to ignore it.  The excess bits of an INTEGER value
  * narrower than its register are unspecified, so a 32-bit argument is placed
  * with a distinct garbage word in the upper half of its register or stack slot
- * and a 32-bit result is compared only over eax; the upper half of an xmm
- * holding a double, and the upper half of an eight-byte slot holding a float,
- * are filled the same way, because a guest reaches such a slot with movss and
- * leaves whatever was there.  For the same reason a void result asserts
- * nothing whatever about rax: the ABI does not define it, and demanding a
- * value would be demanding an invention.
+ * and a 32-bit result is compared only over eax.  An 8- or 16-bit argument gets
+ * garbage in every bit above its width, and is expected to arrive extended from
+ * its own low bits to 64, by sign for b and h and by zero for B and H.  That is
+ * observable from inside a real callee because clang's arm64 callee trusts its
+ * caller to have extended a char or short to 32 bits and turns it into a 64-bit
+ * value with a bare sxtw, so a crossing that left garbage between bit 8 and bit
+ * 31 is recorded as garbage.  A narrow result is compared over all of rax,
+ * since the crossing extends it to 64, and 0x80 must come back as -128 for b
+ * and 128 for B.  The upper half of an xmm holding a double, and the upper half
+ * of an eight-byte slot holding a float, are filled the same way, because a
+ * guest reaches such a slot with movss and leaves whatever was there.  For the
+ * same reason a void result asserts nothing whatever about rax: the ABI does
+ * not define it, and demanding a value would be demanding an invention.
  *
  * Floating-point arguments are bit patterns rather than numbers, so one pass
  * over the floating-point signatures uses quiet and signalling NaNs, both
@@ -46,6 +60,18 @@
  * the default mode, FPCR comes back bit-identical, and cpu->mxcsr is untouched.
  * FPCR is read with mrs rather than through fegetround so that the middle one
  * is bit-identical and not merely equal in the rounding field.
+ *
+ * Some narrow checks need a callee that does something other than record.  A
+ * host function returning its own argument shows the result extension and the
+ * sign on its own: 0xdeadbeefcafe12ff in rdi comes back as 0xff for B(B) and as
+ * all ones for b(b).  Checksums over narrow registers and over narrow stack
+ * slots, each full of garbage above the low bits, show the argument side in
+ * arithmetic the callee does itself.  A host function declared to return a
+ * full word, 0xdeadbeefcafe8080, called under b(), B(), h() and H(), shows that
+ * the crossing reads only the low bits of x0 rather than trusting the callee to
+ * have extended them.  Every scalar class is also parsed as both a result and
+ * an argument, and malformed notations built from the narrow letters are
+ * refused alongside the rest.
  *
  * The map is the identity one, as in test_bridge.c, because that is the map
  * native mode runs in; under it a guest pointer and a host pointer are the
@@ -74,6 +100,10 @@
 #define RES_U  ((uint32_t)0xdec0de22u)
 #define RES_L  ((int64_t)0x51de0033f00dba11ll)
 #define RES_LU ((uint64_t)0xa11ce044badf00d5ull)
+#define RES_I8  ((int8_t)-128)
+#define RES_U8  ((uint8_t)0x80)
+#define RES_I16 ((int16_t)-32768)
+#define RES_U16 ((uint16_t)0x8000)
 
 static const uint32_t kResFBits = 0x4caffee1u;
 static const uint64_t kResDBits = 0x41deface0badf00dull;
@@ -137,6 +167,26 @@ static void rec_d(double d)
     uint64_t b;
     memcpy(&b, &d, sizeof b);
     rec(b);
+}
+
+static void rec_s8(int8_t v)
+{
+    rec((uint64_t)(int64_t)v);
+}
+
+static void rec_u8(uint8_t v)
+{
+    rec((uint64_t)v);
+}
+
+static void rec_s16(int16_t v)
+{
+    rec((uint64_t)(int64_t)v);
+}
+
+static void rec_u16(uint16_t v)
+{
+    rec((uint64_t)v);
 }
 
 static float res_f(void)
@@ -517,6 +567,109 @@ static void fn_F10I2(float a0, float a1, float a2, float a3, float a4,
     rec((uint32_t)a10); rec((uint32_t)a11);
 }
 
+static int8_t fn_b1(int8_t a0)
+{
+    enter();
+    rec_s8(a0);
+    return RES_I8;
+}
+
+static uint8_t fn_B1(uint8_t a0)
+{
+    enter();
+    rec_u8(a0);
+    return RES_U8;
+}
+
+static int16_t fn_h1(int16_t a0)
+{
+    enter();
+    rec_s16(a0);
+    return RES_I16;
+}
+
+static uint16_t fn_H1(uint16_t a0)
+{
+    enter();
+    rec_u16(a0);
+    return RES_U16;
+}
+
+static uint8_t fn_B4(int8_t a0, uint8_t a1, int16_t a2, uint16_t a3)
+{
+    enter();
+    rec_s8(a0); rec_u8(a1); rec_s16(a2); rec_u16(a3);
+    return RES_U8;
+}
+
+static uint64_t fn_bBhH8(int8_t a0, uint8_t a1, int16_t a2, uint16_t a3,
+                         int8_t a4, uint8_t a5, int16_t a6, uint16_t a7)
+{
+    enter();
+    rec_s8(a0); rec_u8(a1); rec_s16(a2); rec_u16(a3);
+    rec_s8(a4); rec_u8(a5); rec_s16(a6); rec_u16(a7);
+    return RES_LU;
+}
+
+static int64_t fn_i8bhBHi(int32_t a0, int32_t a1, int32_t a2, int32_t a3,
+                          int32_t a4, int32_t a5, int32_t a6, int32_t a7,
+                          int8_t a8, int16_t a9, uint8_t a10, uint16_t a11,
+                          int32_t a12)
+{
+    enter();
+    rec((uint32_t)a0); rec((uint32_t)a1); rec((uint32_t)a2); rec((uint32_t)a3);
+    rec((uint32_t)a4); rec((uint32_t)a5); rec((uint32_t)a6); rec((uint32_t)a7);
+    rec_s8(a8); rec_s16(a9); rec_u8(a10); rec_u16(a11); rec((uint32_t)a12);
+    return RES_L;
+}
+
+static int16_t fn_n16(int8_t a0, int16_t a1, uint8_t a2, uint16_t a3,
+                      int8_t a4, int16_t a5, uint8_t a6, uint16_t a7,
+                      int8_t a8, int16_t a9, uint8_t a10, uint16_t a11,
+                      int8_t a12, int16_t a13, uint8_t a14, uint16_t a15)
+{
+    enter();
+    rec_s8(a0); rec_s16(a1); rec_u8(a2); rec_u16(a3);
+    rec_s8(a4); rec_s16(a5); rec_u8(a6); rec_u16(a7);
+    rec_s8(a8); rec_s16(a9); rec_u8(a10); rec_u16(a11);
+    rec_s8(a12); rec_s16(a13); rec_u8(a14); rec_u16(a15);
+    return RES_I16;
+}
+
+static uint64_t fn_align(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,
+                         int8_t a8, int32_t a9, uint8_t a10, int64_t a11,
+                         int16_t a12, uint64_t a13)
+{
+    enter();
+    rec(a0); rec(a1); rec(a2); rec(a3); rec(a4); rec(a5); rec(a6); rec(a7);
+    rec_s8(a8); rec((uint32_t)a9); rec_u8(a10); rec((uint64_t)a11);
+    rec_s16(a12); rec(a13);
+    return RES_LU;
+}
+
+static double fn_nfp(int8_t a0, double a1, uint8_t a2, double a3, int16_t a4,
+                     float a5, uint16_t a6, float a7)
+{
+    enter();
+    rec_s8(a0); rec_d(a1); rec_u8(a2); rec_d(a3); rec_s16(a4); rec_f(a5);
+    rec_u16(a6); rec_f(a7);
+    return res_d();
+}
+
+static uint16_t fn_F9h(float a0, float a1, float a2, float a3, float a4,
+                       float a5, float a6, float a7, float a8, int16_t a9,
+                       uint8_t a10, int8_t a11, uint16_t a12, int64_t a13,
+                       uint8_t a14, int16_t a15)
+{
+    enter();
+    rec_f(a0); rec_f(a1); rec_f(a2); rec_f(a3); rec_f(a4); rec_f(a5);
+    rec_f(a6); rec_f(a7); rec_f(a8);
+    rec_s16(a9); rec_u8(a10); rec_s8(a11); rec_u16(a12); rec((uint64_t)a13);
+    rec_u8(a14); rec_s16(a15);
+    return RES_U16;
+}
+
 static void fn_V(void *a0, uint64_t a1, double a2)
 {
     enter();
@@ -640,6 +793,42 @@ static uint64_t garbage64(int i)
     return 0xc0ffee00badc0de0ull + (uint64_t)i;
 }
 
+static const uint8_t kEdge8[8] = {
+    0x80, 0xff, 0x7f, 0x00, 0x01, 0xfe, 0x81, 0x40,
+};
+
+static const uint16_t kEdge16[8] = {
+    0x8000, 0xffff, 0x7fff, 0x0000, 0x00ff, 0xff80, 0x8001, 0x0080,
+};
+
+static uint8_t arg_bits8(int i)
+{
+    return (i & 1) ? (uint8_t)(0x7f - i) : (uint8_t)(0x80 + 3 * i);
+}
+
+static uint16_t arg_bits16(int i)
+{
+    return (i & 1) ? (uint16_t)(0x7fff - 0x0101 * i)
+                   : (uint16_t)(0x8000 + 0x0203 * i);
+}
+
+static uint64_t garbage_above(int i, unsigned bits)
+{
+    uint64_t g = 0xdeadbeefcafe1234ull ^ ((uint64_t)(i + 1) * 0x0101010101010101ull);
+    return (g >> bits) << bits;
+}
+
+static uint64_t extend(char c, uint64_t v)
+{
+    switch (c) {
+    case 'b': return (uint64_t)(int64_t)(int8_t)v;
+    case 'B': return (uint8_t)v;
+    case 'h': return (uint64_t)(int64_t)(int16_t)v;
+    case 'H': return (uint16_t)v;
+    default:  return v;
+    }
+}
+
 static int sig_classes(const char *s, char *out)
 {
     const char *p;
@@ -664,7 +853,7 @@ static uint64_t g_slot[OCERZ_ABI_MAX_STACK];
 static uint64_t setup_call(OcerzCPU *cpu, const char *cls, int n, int edge,
                            uint64_t *want)
 {
-    int ni = 0, nf = 0, i;
+    int ni = 0, nf = 0, nn = 0, i;
     uint64_t sp;
 
     ocerz_cpu_reset(cpu);
@@ -692,6 +881,14 @@ static uint64_t setup_call(OcerzCPU *cpu, const char *cls, int n, int edge,
             uint32_t b = arg_bits32(i);
             want[i] = b;
             raw = (garbage32(i) << 32) | b;
+        } else if (c == 'b' || c == 'B') {
+            uint8_t b = edge ? kEdge8[nn++ & 7] : arg_bits8(i);
+            want[i] = extend(c, b);
+            raw = garbage_above(i, 8) | b;
+        } else if (c == 'h' || c == 'H') {
+            uint16_t b = edge ? kEdge16[nn++ & 7] : arg_bits16(i);
+            want[i] = extend(c, b);
+            raw = garbage_above(i, 16) | b;
         } else if (c == 'p') {
             uint64_t b = (edge && (i & 1) == 0)
                              ? 0
@@ -752,6 +949,28 @@ static void check_result(const AbiCase *c, const OcerzCPU *cpu)
         CHECK((uint32_t)rax == RES_U,
               "%s: eax is %#x after the crossing, want %#x", c->sig,
               (unsigned)(uint32_t)rax, (unsigned)RES_U);
+        break;
+    case 'b':
+        CHECK(rax == (uint64_t)(int64_t)RES_I8,
+              "%s: rax is %#llx after the crossing, want the int8_t %d "
+              "sign-extended, %#llx", c->sig, (unsigned long long)rax, RES_I8,
+              (unsigned long long)(int64_t)RES_I8);
+        break;
+    case 'B':
+        CHECK(rax == (uint64_t)RES_U8,
+              "%s: rax is %#llx after the crossing, want the uint8_t %u "
+              "zero-extended", c->sig, (unsigned long long)rax, RES_U8);
+        break;
+    case 'h':
+        CHECK(rax == (uint64_t)(int64_t)RES_I16,
+              "%s: rax is %#llx after the crossing, want the int16_t %d "
+              "sign-extended, %#llx", c->sig, (unsigned long long)rax, RES_I16,
+              (unsigned long long)(int64_t)RES_I16);
+        break;
+    case 'H':
+        CHECK(rax == (uint64_t)RES_U16,
+              "%s: rax is %#llx after the crossing, want the uint16_t %u "
+              "zero-extended", c->sig, (unsigned long long)rax, RES_U16);
         break;
     case 'l':
         CHECK(rax == (uint64_t)RES_L,
@@ -930,6 +1149,29 @@ static const AbiCase kCases[] = {
     { "d(ddddddddifi)", FN(fn_D8IFI), 0, 0 },
     { "v(ffffffffffii)", FN(fn_F10I2), 0, 0 },
 
+    { "b(b)", FN(fn_b1), 0, 0 },
+    { "b(b)", FN(fn_b1), 1, 0 },
+    { "B(B)", FN(fn_B1), 0, 0 },
+    { "B(B)", FN(fn_B1), 1, 0 },
+    { "h(h)", FN(fn_h1), 0, 0 },
+    { "h(h)", FN(fn_h1), 1, 0 },
+    { "H(H)", FN(fn_H1), 0, 0 },
+    { "H(H)", FN(fn_H1), 1, 0 },
+    { "B(bBhH)", FN(fn_B4), 0, 0 },
+    { "B(bBhH)", FN(fn_B4), 1, 0 },
+    { "L(bBhHbBhH)", FN(fn_bBhH8), 0, 0 },
+    { "L(bBhHbBhH)", FN(fn_bBhH8), 1, 0 },
+    { "l(iiiiiiiibhBHi)", FN(fn_i8bhBHi), 0, 0 },
+    { "l(iiiiiiiibhBHi)", FN(fn_i8bhBHi), 1, 0 },
+    { "h(bhBHbhBHbhBHbhBH)", FN(fn_n16), 0, 0 },
+    { "h(bhBHbhBHbhBHbhBH)", FN(fn_n16), 1, 0 },
+    { "L(LLLLLLLLbiBlhL)", FN(fn_align), 0, 0 },
+    { "L(LLLLLLLLbiBlhL)", FN(fn_align), 1, 0 },
+    { "d(bdBdhfHf)", FN(fn_nfp), 0, 0 },
+    { "d(bdBdhfHf)", FN(fn_nfp), 1, 0 },
+    { "H(fffffffffhBbHlBh)", FN(fn_F9h), 0, 0 },
+    { "H(fffffffffhBbHlBh)", FN(fn_F9h), 1, 0 },
+
     { "v()", FN(fn_V0), 0, 0 },
     { "v(pLd)", FN(fn_V), 0, 0 },
     { "i(pp)", FN(fn_I), 0, 0 },
@@ -1001,6 +1243,282 @@ static void test_host_registers(void)
     check_host_map("d(dddddddd)", NULL, 0, vb, 8);
     check_host_map("L(LdLdLdLd)", xc, 4, vc, 4);
     check_host_map("L(ddddLLLLLLLL)", xd, 8, vd, 4);
+    check_host_map("L(bBhHbBhH)", vb, 8, NULL, 0);
+    check_host_map("B(dbdBdhdH)", vc, 4, xc, 4);
+}
+
+typedef struct StackPlace {
+    int arg;
+    int at;
+    int size;
+} StackPlace;
+
+static void check_host_stack(const char *notation, const StackPlace *place,
+                             int nplace, int nstack)
+{
+    OcerzCPU *cpu = &g_cpu;
+    OcerzAbiSig sig;
+    OcerzAbiCall call;
+    char cls[OCERZ_ABI_MAX_ARGS + 1];
+    uint64_t want[OCERZ_ABI_MAX_ARGS];
+    uint8_t expect[sizeof call.stack];
+    const uint8_t *got;
+    int n, r, i, k;
+
+    n = sig_classes(notation, cls);
+    r = n < 0 ? OCERZ_EFORMAT : ocerz_abi_parse(notation, &sig);
+    CHECK(r == OCERZ_OK, "%s: ocerz_abi_parse returned %d, want OCERZ_OK",
+          notation, r);
+    if (r != OCERZ_OK)
+        return;
+
+    for (i = 0; i < 2; i++) {
+        setup_call(cpu, cls, n, i, want);
+        memset(&call, 0x5a, sizeof call);
+        r = ocerz_abi_read_guest(&sig, cpu, &call);
+        CHECK(r == OCERZ_OK,
+              "%s: ocerz_abi_read_guest returned %d, want OCERZ_OK", notation, r);
+        if (r != OCERZ_OK)
+            return;
+
+        memset(expect, 0, sizeof expect);
+        for (k = 0; k < nplace; k++) {
+            uint64_t v = want[place[k].arg];
+            memcpy(expect + place[k].at, &v, (size_t)place[k].size);
+        }
+
+        CHECK(call.nstack == nstack,
+              "%s: the host side spilled %d eightbytes, want %d", notation,
+              call.nstack, nstack);
+        got = (const uint8_t *)call.stack;
+        for (k = 0; k < (int)sizeof expect; k++)
+            CHECK(got[k] == expect[k],
+                  "%s%s: host stack byte %d is %#x, want %#x (clang packs "
+                  "this signature's stacked arguments at their own size and "
+                  "alignment)", notation, i ? " with edge values" : "", k,
+                  got[k], expect[k]);
+    }
+}
+
+static void test_host_stack(void)
+{
+    static const StackPlace kMix[] = {
+        { 8, 0, 1 }, { 9, 2, 2 }, { 10, 4, 1 }, { 11, 6, 2 }, { 12, 8, 4 },
+    };
+    static const StackPlace kAlign[] = {
+        { 8, 0, 1 }, { 9, 4, 4 }, { 10, 8, 1 }, { 11, 16, 8 }, { 12, 24, 2 },
+        { 13, 32, 8 },
+    };
+    static const StackPlace kAll[] = {
+        { 8, 0, 1 }, { 9, 2, 2 }, { 10, 4, 1 }, { 11, 6, 2 },
+        { 12, 8, 1 }, { 13, 10, 2 }, { 14, 12, 1 }, { 15, 14, 2 },
+    };
+    static const StackPlace kFloat[] = {
+        { 8, 0, 4 },
+    };
+
+    check_host_stack("l(iiiiiiiibhBHi)", kMix, 5, 2);
+    check_host_stack("L(LLLLLLLLbiBlhL)", kAlign, 6, 5);
+    check_host_stack("h(bhBHbhBHbhBHbhBH)", kAll, 8, 2);
+    check_host_stack("H(fffffffffhBbHlBh)", kFloat, 1, 1);
+}
+
+static int8_t echo_b(int8_t a)
+{
+    enter();
+    return a;
+}
+
+static uint8_t echo_B(uint8_t a)
+{
+    enter();
+    return a;
+}
+
+static int16_t echo_h(int16_t a)
+{
+    enter();
+    return a;
+}
+
+static uint16_t echo_H(uint16_t a)
+{
+    enter();
+    return a;
+}
+
+static int64_t sum_bhBH(int8_t b, int16_t h, uint8_t B, uint16_t H)
+{
+    enter();
+    return (int64_t)b + 3 * (int64_t)h + 5 * (int64_t)B + 7 * (int64_t)H;
+}
+
+static int64_t sum_spill(int32_t a0, int32_t a1, int32_t a2, int32_t a3,
+                         int32_t a4, int32_t a5, int32_t a6, int32_t a7,
+                         int8_t b, int16_t h, uint8_t B, uint16_t H, int32_t i)
+{
+    enter();
+    return (int64_t)a0 + 2 * (int64_t)a1 + 3 * (int64_t)a2 + 4 * (int64_t)a3 +
+           5 * (int64_t)a4 + 6 * (int64_t)a5 + 7 * (int64_t)a6 +
+           8 * (int64_t)a7 + 11 * (int64_t)b + 13 * (int64_t)h +
+           17 * (int64_t)B + 19 * (int64_t)H + 23 * (int64_t)i;
+}
+
+static uint64_t garbage_result(void)
+{
+    enter();
+    return 0xdeadbeefcafe8080ull;
+}
+
+static uint64_t narrow_call(const char *notation, void (*fn)(void),
+                            const uint64_t *reg, int nreg,
+                            const uint64_t *slot, int nslot)
+{
+    OcerzCPU *cpu = &g_cpu;
+    OcerzAbiSig sig;
+    uint64_t sp;
+    int r, i;
+
+    r = ocerz_abi_parse(notation, &sig);
+    CHECK(r == OCERZ_OK, "%s: ocerz_abi_parse returned %d, want OCERZ_OK",
+          notation, r);
+    if (r != OCERZ_OK)
+        return RAX_POISON;
+
+    ocerz_cpu_reset(cpu);
+    cpu->mxcsr = MXCSR_DEFAULT;
+    cpu->gpr[OCERZ_RAX] = RAX_POISON;
+    for (i = 0; i < nreg && i < 6; i++)
+        cpu->gpr[kIntReg[i]] = reg[i];
+    sp = g_stack_base - 8;
+    ocerz_st(sp, 8, RET_ADDR);
+    for (i = 0; i < nslot; i++)
+        ocerz_st(sp + 8 + 8ull * (uint64_t)i, 8, slot[i]);
+    cpu->gpr[OCERZ_RSP] = sp;
+    cpu->rip = TRAP_RIP;
+
+    g_entered = 0;
+    r = ocerz_abi_perform(&sig, fnptr(fn), cpu);
+    CHECK(r == OCERZ_OK && g_entered == 1,
+          "%s: ocerz_abi_perform returned %d and ran the host function %d "
+          "times, want OCERZ_OK and once", notation, r, g_entered);
+    CHECK(cpu->rip == RET_ADDR && cpu->gpr[OCERZ_RSP] == sp + 8,
+          "%s: rip %#llx rsp %#llx after the crossing, want %#llx and %#llx",
+          notation, (unsigned long long)cpu->rip,
+          (unsigned long long)cpu->gpr[OCERZ_RSP], (unsigned long long)RET_ADDR,
+          (unsigned long long)(sp + 8));
+    return cpu->gpr[OCERZ_RAX];
+}
+
+static void test_narrow_native(void)
+{
+    static const struct {
+        const char *sig;
+        void (*fn)(void);
+        uint64_t in;
+        uint64_t out;
+    } kEcho[] = {
+        { "B(B)", FN(echo_B), 0xdeadbeefcafe12ffull, 0xffull },
+        { "b(b)", FN(echo_b), 0xdeadbeefcafe12ffull, 0xffffffffffffffffull },
+        { "B(B)", FN(echo_B), 0xdeadbeefcafe1280ull, 0x80ull },
+        { "b(b)", FN(echo_b), 0xdeadbeefcafe1280ull, 0xffffffffffffff80ull },
+        { "b(b)", FN(echo_b), 0xdeadbeefcafe807full, 0x7full },
+        { "H(H)", FN(echo_H), 0xdeadbeefcafe80ffull, 0x80ffull },
+        { "h(h)", FN(echo_h), 0xdeadbeefcafe80ffull, 0xffffffffffff80ffull },
+        { "H(H)", FN(echo_H), 0xdeadbeef00008000ull, 0x8000ull },
+        { "h(h)", FN(echo_h), 0xdeadbeef00008000ull, 0xffffffffffff8000ull },
+        { "h(h)", FN(echo_h), 0xdeadbeefcaff7fffull, 0x7fffull },
+    };
+    static const struct {
+        const char *sig;
+        uint64_t out;
+    } kGarbage[] = {
+        { "b()", 0xffffffffffffff80ull },
+        { "B()", 0x80ull },
+        { "h()", 0xffffffffffff8080ull },
+        { "H()", 0x8080ull },
+    };
+    static const uint64_t kSumReg[4] = {
+        0xdeadbeefcafe12ffull, 0xdeadbeefcafe8001ull, 0x0123456789abcdfeull,
+        0xfedcba9876548001ull,
+    };
+    static const uint64_t kSpillReg[6] = {
+        0xdeadbeef80000001ull, 0x0123456700000002ull, 0xffffffff7ffffffdull,
+        0x00000001fffffffcull, 0xa5a5a5a580000005ull, 0x5a5a5a5a00000006ull,
+    };
+    static const uint64_t kSpillSlot[7] = {
+        0xdeadbeef80000007ull, 0xfeedfacefffffff8ull, 0xdeadbeefcafe12feull,
+        0xdeadbeefcafe8002ull, 0xdeadbeefcafe12feull, 0xdeadbeefcafe8002ull,
+        0xdeadbeef80000009ull,
+    };
+    size_t i;
+    uint64_t got;
+    int64_t want;
+
+    for (i = 0; i < sizeof kEcho / sizeof kEcho[0]; i++) {
+        got = narrow_call(kEcho[i].sig, kEcho[i].fn, &kEcho[i].in, 1, NULL, 0);
+        CHECK(got == kEcho[i].out,
+              "%s: a host function returning its argument, passed %#llx in "
+              "rdi, left rax %#llx, want %#llx", kEcho[i].sig,
+              (unsigned long long)kEcho[i].in, (unsigned long long)got,
+              (unsigned long long)kEcho[i].out);
+    }
+
+    for (i = 0; i < sizeof kGarbage / sizeof kGarbage[0]; i++) {
+        got = narrow_call(kGarbage[i].sig, FN(garbage_result), NULL, 0, NULL, 0);
+        CHECK(got == kGarbage[i].out,
+              "%s: a host function leaving 0xdeadbeefcafe8080 in x0 left rax "
+              "%#llx, want only its low bits extended, %#llx", kGarbage[i].sig,
+              (unsigned long long)got, (unsigned long long)kGarbage[i].out);
+    }
+
+    want = (int64_t)(int8_t)kSumReg[0] + 3 * (int64_t)(int16_t)kSumReg[1] +
+           5 * (int64_t)(uint8_t)kSumReg[2] + 7 * (int64_t)(uint16_t)kSumReg[3];
+    got = narrow_call("l(bhBH)", FN(sum_bhBH), kSumReg, 4, NULL, 0);
+    CHECK(got == (uint64_t)want,
+          "l(bhBH): a host checksum of registers holding garbage above their "
+          "low bits returned %lld, want %lld", (long long)got, (long long)want);
+
+    want = 0;
+    for (i = 0; i < 6; i++)
+        want += (int64_t)(i + 1) * (int64_t)(int32_t)kSpillReg[i];
+    want += 7 * (int64_t)(int32_t)kSpillSlot[0] + 8 * (int64_t)(int32_t)kSpillSlot[1] +
+            11 * (int64_t)(int8_t)kSpillSlot[2] + 13 * (int64_t)(int16_t)kSpillSlot[3] +
+            17 * (int64_t)(uint8_t)kSpillSlot[4] + 19 * (int64_t)(uint16_t)kSpillSlot[5] +
+            23 * (int64_t)(int32_t)kSpillSlot[6];
+    got = narrow_call("l(iiiiiiiibhBHi)", FN(sum_spill), kSpillReg, 6,
+                      kSpillSlot, 7);
+    CHECK(got == (uint64_t)want,
+          "l(iiiiiiiibhBHi): a host checksum of eight ints and b, h, B, H, i "
+          "spilled from garbage-filled guest slots returned %lld, want %lld",
+          (long long)got, (long long)want);
+}
+
+static void test_accept_classes(void)
+{
+    static const char kScalar[] = "bBhHiulLpfd";
+    char notation[8];
+    size_t r, a;
+
+    for (r = 0; r < sizeof kScalar; r++) {
+        for (a = 0; a < sizeof kScalar - 1; a++) {
+            OcerzAbiSig sig;
+            int rc;
+
+            notation[0] = r < sizeof kScalar - 1 ? kScalar[r] : 'v';
+            notation[1] = '(';
+            notation[2] = kScalar[a];
+            notation[3] = ')';
+            notation[4] = 0;
+            memset(&sig, 0xa5, sizeof sig);
+            rc = ocerz_abi_parse(notation, &sig);
+            CHECK(rc == OCERZ_OK && sig.ret == notation[0] && sig.nargs == 1 &&
+                      sig.arg[0] == notation[2],
+                  "ocerz_abi_parse(\"%s\") returned %d with result '%c' and "
+                  "%d argument(s), want OCERZ_OK, '%c' and one '%c'", notation,
+                  rc, sig.ret, sig.nargs, notation[0], notation[2]);
+        }
+    }
 }
 
 static void test_rounding(void)
@@ -1036,6 +1554,9 @@ static const char *const kBadSigs[] = {
     "s()", "s(s)", "S(i)", "i(s)", "i(S)", "{}()", "i({ii})", "{ii}(i)",
     "i(t)", "i(0)", "i(p,p)", "i(p p)", " i(p)", "i (p)",
     "L(LLLLLLLLLLLLLLLLL)",
+    "b(", "B(bB", "h(hH))", "H(H)x", "b(s)", "i(bv)", "v(Hh", "bh(i)",
+    "(bBhH)", "b()h", "B(b h)", "H(b,h)", "g()", "i(k)", "c(b)", "C()",
+    "h(bBhHbBhHbBhHbBhHb)",
 };
 #define NBAD (sizeof kBadSigs / sizeof kBadSigs[0])
 
@@ -1148,6 +1669,9 @@ int main(void)
           (unsigned long long)kDerefWord);
 
     test_host_registers();
+    test_host_stack();
+    test_narrow_native();
+    test_accept_classes();
     test_rounding();
     test_reject_parse();
     test_reject_perform();

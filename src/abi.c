@@ -23,22 +23,35 @@
  * address, and a stacked float sits in the low half of a full slot.  Apple's
  * arm64 deliberately drops that rule: a stacked argument consumes exactly its
  * own size at its own alignment, so two stacked ints occupy eight bytes
- * together and a stacked float after a stacked double lands at offset 8, not
- * 16.  clang bears this out on both sides - it emits `pushq $101; pushq $102`
+ * together, a stacked float after a stacked double lands at offset 8, not 16,
+ * and a char, a short and a char after eight integer arguments sit at 0, 2 and
+ * 4.  clang bears this out on both sides - it emits `pushq $101; pushq $102`
  * for the x86 pair and `mov x8,#101; movk x8,#102,lsl #32; str x8,[sp]` for the
- * arm64 one.  OcerzAbiCall.stack is therefore filled as a byte buffer under its
- * uint64_t type; nstack is how many eightbytes of it the assembly must copy,
- * and keeping sp 16-byte aligned is the assembly's business, not this file's.
+ * arm64 one, and strb, strh, strb for the narrow three, which the callee reads
+ * back with ldrsb and ldrsh at the same offsets; ocerz/abi.h lists the layouts
+ * that were checked.  Size and alignment are the same number for every class,
+ * so abi_host_stack_at takes only the one.  OcerzAbiCall.stack is therefore
+ * filled as a byte buffer under its uint64_t type; nstack is how many
+ * eightbytes of it the assembly must copy, and keeping sp 16-byte aligned is
+ * the assembly's business, not this file's.
  *
  * ---- bit patterns, and who extends ----
  * A float or double is moved as the raw 64 bits of its slot, a float being the
  * low 32 of them, which is both where x86 leaves a float in an xmm and where
  * arm64 reads s0 out of v0; nothing is converted, so a signalling NaN or an
  * unnormal crosses unchanged.  Integers narrower than 64 bits are a different
- * matter: x86-64 leaves the upper bits of a 32-bit argument register
- * unspecified and Apple's arm64 makes the CALLER responsible for extending, so
- * a 32-bit class is taken from the low half of the guest's slot and re-extended
- * here, signed for i and unsigned for u, rather than passed on as it was found.
+ * matter: x86-64 leaves the bits of an argument register above the argument's
+ * width unspecified and Apple's arm64 makes the CALLER responsible for
+ * extending, so a 32-, 16- or 8-bit class is taken from the low bits of the
+ * guest's slot and re-extended here to 64, signed for i, h and b and unsigned
+ * for u, H and B, rather than passed on as it was found.  abi_narrow is the one
+ * place that extends, and every narrow value goes through it on every path: a
+ * guest argument on its way to x or the host stack, a native callee's x0 on its
+ * way to rax, a native caller's x register or stack bytes on their way to a
+ * guest register or eightbyte, and a guest's rax on its way to x0.  Extending
+ * only as far as the receiving ABI promises would do for a receiver that keeps
+ * its promise; extending to 64 makes the value the same whichever width the
+ * other side reads it at.
  *
  * ---- the rounding mode ----
  * The guest's MXCSR rounding control is mirrored into the host FPCR, by
@@ -79,6 +92,21 @@
  * differently and are, from the native side, two different functions.  The
  * notation is parsed once, when its entry is written, and one that does not
  * parse or that names a callback of its own gets no entry at all.
+ *
+ * ---- a function pointer that is already native ----
+ * ocerz_abi_is_guest_code asks the cheap questions first, because it runs on
+ * every crossing that carries a callback.  The guest reservation is a range
+ * compare and covers what ocerz maps for the guest, its images and stacks
+ * among it, so the common case never leaves it.  The host shared cache is one
+ * more range compare and covers CoreFoundation and everything else a guest
+ * could have copied a native function pointer out of.  Only what is in neither
+ * goes to dladdr, a lookup through dyld's image list; it answers correctly for
+ * the cache as well, so the cache test changes nothing but the cost.  An
+ * address dladdr does not know counts as guest code, since an image mapped by
+ * ocerz's own loader is one dyld has never heard of, and erring that way leaves
+ * such a pointer interned exactly as every c argument was before the question
+ * was asked.  The trampoline bank is inside ocerz's image, so a slot address
+ * comes back from the converter as itself and is never bound to a second slot.
  *
  * ---- a slot is never given back ----
  * Nothing says when native code has let go of a function pointer.  qsort has by
@@ -145,8 +173,11 @@
 #include "ocerz/interp.h"
 #include "ocerz/vm.h"
 
+#include <dlfcn.h>
 #include <fenv.h>
 #include <pthread.h>
+
+extern const void *_dyld_get_shared_cache_range(size_t *length);
 
 #define ABI_GUEST_INT_REGS 6
 #define ABI_GUEST_FP_REGS 8
@@ -157,7 +188,7 @@ static const uint8_t abi_guest_int_reg[ABI_GUEST_INT_REGS] = {
     OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9,
 };
 
-static const char abi_scalar_classes[] = "iulLpfd";
+static const char abi_scalar_classes[] = "bBhHiulLpfd";
 
 static int abi_is_scalar_class(char c)
 {
@@ -181,7 +212,16 @@ static int abi_is_fp(char c)
 
 static int abi_class_size(char c)
 {
-    return (c == 'i' || c == 'u' || c == 'f') ? 4 : 8;
+    switch (c) {
+    case 'b':
+    case 'B': return 1;
+    case 'h':
+    case 'H': return 2;
+    case 'i':
+    case 'u':
+    case 'f': return 4;
+    default:  return 8;
+    }
 }
 
 static int abi_is_struct_class(char c)
@@ -312,6 +352,10 @@ int ocerz_abi_parse(const char *notation, OcerzAbiSig *out)
 static uint64_t abi_narrow(char c, uint64_t raw)
 {
     switch (c) {
+    case 'b': return (uint64_t)(int64_t)(int8_t)raw;
+    case 'B': return (uint64_t)(uint8_t)raw;
+    case 'h': return (uint64_t)(int64_t)(int16_t)raw;
+    case 'H': return (uint64_t)(uint16_t)raw;
     case 'i': return (uint64_t)(int64_t)(int32_t)raw;
     case 'u':
     case 'f': return (uint64_t)(uint32_t)raw;
@@ -387,18 +431,15 @@ int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCa
         if (c == 'p') {
             val = raw ? (uint64_t)(uintptr_t)ocerz_g2h(raw) : 0;
         } else if (c == 'c') {
-            val = 0;
-            if (raw) {
-                void *tramp = ocerz_abi_callback_intern(raw, sig->cb[i]);
-                if (!tramp) {
-                    fprintf(stderr,
-                            "ocerz: abi: argument %d is guest function %#llx, which could not be bound to"
-                            " a callback trampoline, so the call is refused\n",
-                            i, (unsigned long long)raw);
-                    return OCERZ_EUNSUP;
-                }
-                val = (uint64_t)(uintptr_t)tramp;
+            uint64_t fn;
+            if (ocerz_abi_callback_convert(raw, sig->cb[i], &fn) != OCERZ_OK) {
+                fprintf(stderr,
+                        "ocerz: abi: argument %d is guest function %#llx, which could not be bound to"
+                        " a callback trampoline, so the call is refused\n",
+                        i, (unsigned long long)raw);
+                return OCERZ_EUNSUP;
             }
+            val = fn ? (uint64_t)(uintptr_t)ocerz_g2h(fn) : 0;
         } else {
             val = abi_narrow(c, raw);
         }
@@ -554,6 +595,41 @@ void *ocerz_abi_callback_intern(uint64_t guest_fn, const char *notation)
 
     pthread_mutex_unlock(&g_abi_cb_lock);
     return abi_callback_address(slot);
+}
+
+int ocerz_abi_is_guest_code(uint64_t gptr)
+{
+    const void *host = ocerz_g2h(gptr);
+
+    if (ocerz_host_in_guest_reservation(host))
+        return 1;
+
+    size_t cache_len = 0;
+    const void *cache = _dyld_get_shared_cache_range(&cache_len);
+    if (cache && (uintptr_t)host - (uintptr_t)cache < cache_len)
+        return 0;
+
+    Dl_info info;
+    return dladdr(host, &info) ? 0 : 1;
+}
+
+int ocerz_abi_callback_convert(uint64_t gptr, const char *notation, uint64_t *out)
+{
+    if (!out)
+        return OCERZ_EUNDEF;
+    *out = 0;
+    if (!gptr)
+        return OCERZ_OK;
+    if (!ocerz_abi_is_guest_code(gptr)) {
+        *out = gptr;
+        return OCERZ_OK;
+    }
+
+    void *tramp = ocerz_abi_callback_intern(gptr, notation);
+    if (!tramp)
+        return OCERZ_EUNSUP;
+    *out = ocerz_h2g(tramp);
+    return OCERZ_OK;
 }
 
 void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
