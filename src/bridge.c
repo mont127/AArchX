@@ -577,12 +577,15 @@ void *ocerz_bridge_host_symbol(const char *install_name, const char *host_sym)
 static int br_int_register(const OcerzAbiSig *sig, int argpos)
 {
     static const int regs[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
-    if (argpos < 0 || argpos >= sig->nargs || sig->arg[argpos] != 'p')
+    if (argpos < 0 || argpos >= sig->nargs || sig->arg[argpos] != 'p' || sig->ret == '{')
         return -1;
     int n = 0;
-    for (int i = 0; i < argpos; i++)
+    for (int i = 0; i < argpos; i++) {
+        if (sig->arg[i] == '{')
+            return -1;
         if (sig->arg[i] != 'f' && sig->arg[i] != 'd')
             n++;
+    }
     return n < 6 ? regs[n] : -1;
 }
 

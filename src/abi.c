@@ -17,6 +17,15 @@
  * the host's eight, so a seventh integer argument is on the guest's stack and
  * still in a host register.  Everything here is a consequence of that.
  *
+ * A structure moves the counters by more than one and moves them differently
+ * on each side.  System V asks for all of a structure's eightbytes at once and,
+ * when they are not all free, stacks the structure and leaves both counters
+ * where they were.  Apple's arm64 does the same test against its own registers
+ * but, on failure, sets the counter it failed on to eight, so every later
+ * argument of that kind is stacked too.  The guest counters are therefore
+ * passed by address into the structure helpers and only ever advanced there,
+ * and the host counters live in OcerzAbiCall, where a spill writes the eight.
+ *
  * ---- the two stacks are not laid out alike ----
  * The x86-64 psABI rounds every stacked argument up to an eightbyte, so the
  * guest's overflow is a plain array of 8-byte slots starting above the return
@@ -29,11 +38,15 @@
  * for the x86 pair and `mov x8,#101; movk x8,#102,lsl #32; str x8,[sp]` for the
  * arm64 one, and strb, strh, strb for the narrow three, which the callee reads
  * back with ldrsb and ldrsh at the same offsets; ocerz/abi.h lists the layouts
- * that were checked.  Size and alignment are the same number for every class,
- * so abi_host_stack_at takes only the one.  OcerzAbiCall.stack is therefore
- * filled as a byte buffer under its uint64_t type; nstack is how many
- * eightbytes of it the assembly must copy, and keeping sp 16-byte aligned is
- * the assembly's business, not this file's.
+ * that were checked.  Size and alignment are the same number for every scalar
+ * class, so abi_host_stack_at takes only the one.  A stacked structure is a
+ * block with its own two numbers: an aggregate of floats or doubles is its
+ * bytes at its member's size, a small structure of any other kind is one or
+ * two whole words at 8, and a large one is not stacked at all, only the pointer
+ * to its copy.  OcerzAbiCall.stack is therefore filled as a byte buffer under
+ * its uint64_t type; nstack is how many eightbytes of it the assembly must
+ * copy, and keeping sp 16-byte aligned is the assembly's business, not this
+ * file's.
  *
  * ---- bit patterns, and who extends ----
  * A float or double is moved as the raw 64 bits of its slot, a float being the
@@ -53,6 +66,26 @@
  * its promise; extending to 64 makes the value the same whichever width the
  * other side reads it at.
  *
+ * ---- structures are bytes ----
+ * A structure never passes through abi_narrow.  Each path gathers it into a
+ * buffer laid out exactly as the structure, whole words at a time from
+ * registers and stack eightbytes or bytes from Apple's packed stack, converts
+ * its p members in place, and scatters the buffer again.  The buffer's tail past
+ * the structure's size, up to the next eightbyte, is zeroed after every gather,
+ * so a register word or stack eightbyte written from it holds zero above the
+ * structure rather than whatever the other side left there.  Classification is
+ * recomputed from the layout on every crossing, a loop over at most sixteen
+ * members, rather than cached in the signature, so a hand-built signature
+ * cannot carry a classification that disagrees with its own layout, and
+ * abi_struct_valid is the gate that layout passes first.  Sixteen members
+ * cannot reach 256 bytes: each member starts at most fifteen bytes past the
+ * start of the one before, since it is at most eight bytes long and every
+ * rounding in between is to a power of two no greater than eight, so a layout
+ * ends by 240 and a byte fits every offset.  The copies an arm64 callee is
+ * given for a structure over sixteen bytes are whole words of
+ * OcerzAbiCall.mem, which holds sixteen copies of a 256-byte structure, one for
+ * every argument a signature can have, so it cannot run out.
+ *
  * ---- the rounding mode ----
  * The guest's MXCSR rounding control is mirrored into the host FPCR, by
  * ocerz_apply_mxcsr_round, so that emulated SSE rounds the way the guest asked.
@@ -70,12 +103,20 @@
  * classes, the low bits of xmm0 for f and d, with xmm0's upper bits cleared so
  * the value is deterministic rather than whatever the last emulated SSE op
  * left.  A v result zeroes rax, so a guest that wrongly reads a result gets a
- * stable zero instead of a host register's leftovers.  Pointers convert in both
+ * stable zero instead of a host register's leftovers.  A structure result is
+ * gathered from x0 and x1, from v0 to v3, or from the x8 buffer inside
+ * OcerzAbiCall, and scattered to rax, rdx, xmm0 and xmm1 by class, with an xmm's
+ * upper half cleared the same way, or written through the result pointer the
+ * guest passed in rdi, which is what rax then holds.  The guest's pointer is
+ * never handed to native code as x8: the native callee writes into ocerz's own
+ * buffer, and only the copy touches guest memory.  Pointers convert in both
  * directions with null passing through untouched, for the reasons src/bridge.c
  * sets out.  ocerz_abi_parse and ocerz_abi_read_guest report OCERZ_OK or a
  * negative OCERZ_E*, while ocerz_abi_perform is on the dispatch path and
  * reports an OCERZ_STEP_* the way ocerz_bridge_invoke does; the two agree that
- * success is zero.
+ * success is zero.  ocerz_abi_read_guest zeroes OcerzAbiCall only up to the
+ * result buffer, because the two buffers are most of its size and every byte
+ * of them that is read has been written first.
  *
  * ---- a callback's address is its identity ----
  * An argument of class c is interned rather than converted: the guest function
@@ -91,7 +132,9 @@
  * notations gets two addresses, because the two slots convert their arguments
  * differently and are, from the native side, two different functions.  The
  * notation is parsed once, when its entry is written, and one that does not
- * parse or that names a callback of its own gets no entry at all.
+ * parse or that names a callback of its own gets no entry at all.  Its braces
+ * are matched by depth rather than by the first closing brace, since a
+ * structure inside it closes its own.
  *
  * ---- a function pointer that is already native ----
  * ocerz_abi_is_guest_code asks the cheap questions first, because it runs on
@@ -142,6 +185,14 @@
  * running, whatever the callback left is dropped: native code is only finishing
  * its loop, and a zero is as good an answer as any.
  *
+ * A guest function returning a MEMORY structure is handed space for it carved
+ * from the top of that same region, the stack top moving down past it before
+ * the arguments are laid out below, so the space outlives the call and nothing
+ * the call pushes can reach it.  The result is read back from that space rather
+ * than through whatever the guest left in rax.  A native caller expecting its
+ * result through x8 and passing none is refused before the guest runs, because
+ * the result would have nowhere to go.
+ *
  * While the guest runs, the thread's bridge frame is saved and cleared.  That
  * frame is what the crash handler reads to decide that a fault belongs to
  * native code, and for this stretch the thread is executing guest code again: a
@@ -161,11 +212,12 @@
  * ocerz_thread_attach, the first time such a thread calls a guest function, and
  * the same cpu on every call after; it is refused by name only when no
  * personality can be attached at all, which means there is no guest process to
- * attach it to.  Every refusal of the dispatcher's returns zero in both x0 and d0, so the
- * native caller at least reads a defined value, and every one is printed
- * whatever the verbosity: a malformed notation is a bug in a table fixed when
- * ocerz is built, while a callback refused at run time is a wrong answer handed
- * to native code that carries on regardless.
+ * attach it to.  Every refusal of the dispatcher's returns zero in x0, x1 and
+ * d0 to d3 and writes nothing through x8, so the native caller at least reads a
+ * defined value, and every one is printed whatever the verbosity: a malformed
+ * notation is a bug in a table fixed when ocerz is built, while a callback
+ * refused at run time is a wrong answer handed to native code that carries on
+ * regardless.
  */
 #include "ocerz/abi.h"
 #include "ocerz/bridge.h"
@@ -183,6 +235,9 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 #define ABI_GUEST_FP_REGS 8
 #define ABI_HOST_INT_REGS 8
 #define ABI_HOST_FP_REGS 8
+#define ABI_HOST_HFA_MAX 4
+#define ABI_STRUCT_DEPTH 8
+#define ABI_SMALL_STRUCT 16
 
 static const uint8_t abi_guest_int_reg[ABI_GUEST_INT_REGS] = {
     OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9,
@@ -197,12 +252,12 @@ static int abi_is_scalar_class(char c)
 
 static int abi_is_arg_class(char c)
 {
-    return c == 'c' || abi_is_scalar_class(c);
+    return c == 'c' || c == '{' || abi_is_scalar_class(c);
 }
 
 static int abi_is_ret_class(char c)
 {
-    return c == 'v' || abi_is_scalar_class(c);
+    return c == 'v' || c == '{' || abi_is_scalar_class(c);
 }
 
 static int abi_is_fp(char c)
@@ -224,16 +279,15 @@ static int abi_class_size(char c)
     }
 }
 
-static int abi_is_struct_class(char c)
+static size_t abi_align_up(size_t n, size_t align)
 {
-    return c == 's' || c == 'S' || c == '{' || c == '}' || c == '[' || c == ']';
+    return (n + align - 1) & ~(align - 1);
 }
 
 static void abi_reject(const char *notation, char c)
 {
-    if (abi_is_struct_class(c))
-        OCERZ_LOG("abi: %s passes or returns a structure by value, which this engine does not do\n",
-                  notation);
+    if (c == '}')
+        OCERZ_LOG("abi: %s closes a structure it never opened\n", notation);
     else if (c == 'v')
         OCERZ_LOG("abi: %s uses v as an argument class, which is a result class only\n", notation);
     else if (c == 'c')
@@ -242,6 +296,91 @@ static void abi_reject(const char *notation, char c)
         OCERZ_LOG("abi: %s names a class '%c' that does not exist\n", notation, c);
     else
         OCERZ_LOG("abi: %s ends where a class was expected\n", notation);
+}
+
+static int abi_parse_struct(const char *notation, const char **cursor, int depth,
+                            OcerzAbiStruct *st, size_t *size_out, size_t *align_out)
+{
+    const char *p = *cursor + 1;
+    size_t off = 0, align = 1;
+    int count = 0;
+
+    if (depth > ABI_STRUCT_DEPTH) {
+        OCERZ_LOG("abi: %s nests structures more than %d deep\n", notation, ABI_STRUCT_DEPTH);
+        return OCERZ_EUNSUP;
+    }
+
+    while (*p != '}') {
+        char c = *p;
+
+        if (c == '{') {
+            int first = st->nmember;
+            size_t nsize = 0, nalign = 1;
+            int rc = abi_parse_struct(notation, &p, depth + 1, st, &nsize, &nalign);
+            if (rc != OCERZ_OK)
+                return rc;
+            off = abi_align_up(off, nalign);
+            for (int k = first; k < st->nmember; k++)
+                st->offset[k] = (uint8_t)(st->offset[k] + off);
+            off += nsize;
+            if (nalign > align)
+                align = nalign;
+        } else if (abi_is_scalar_class(c)) {
+            size_t size = (size_t)abi_class_size(c);
+            if (st->nmember >= OCERZ_ABI_STRUCT_MEMBERS) {
+                OCERZ_LOG("abi: %s has a structure with more than the %d members one may have\n",
+                          notation, OCERZ_ABI_STRUCT_MEMBERS);
+                return OCERZ_ETOOLONG;
+            }
+            off = abi_align_up(off, size);
+            st->member[st->nmember] = c;
+            st->offset[st->nmember] = (uint8_t)off;
+            st->nmember++;
+            off += size;
+            if (size > align)
+                align = size;
+            p++;
+        } else if (c == 'v') {
+            OCERZ_LOG("abi: %s puts v inside a structure, where only a result may be void\n", notation);
+            return OCERZ_EUNSUP;
+        } else if (c == 'c') {
+            OCERZ_LOG("abi: %s puts a callback inside a structure, which this engine does not carry\n",
+                      notation);
+            return OCERZ_EUNSUP;
+        } else if (c == '\0') {
+            OCERZ_LOG("abi: %s opens a structure and never closes it\n", notation);
+            return OCERZ_EFORMAT;
+        } else {
+            OCERZ_LOG("abi: %s has '%c' inside a structure, which is no member class\n", notation, c);
+            return OCERZ_EFORMAT;
+        }
+        count++;
+    }
+
+    if (count == 0) {
+        OCERZ_LOG("abi: %s has a structure with no members\n", notation);
+        return OCERZ_EFORMAT;
+    }
+
+    *cursor = p + 1;
+    *size_out = abi_align_up(off, align);
+    *align_out = align;
+    return OCERZ_OK;
+}
+
+static int abi_parse_layout(const char *notation, const char **cursor, OcerzAbiStruct *out)
+{
+    OcerzAbiStruct st;
+    size_t size = 0, align = 1;
+
+    memset(&st, 0, sizeof st);
+    int rc = abi_parse_struct(notation, cursor, 1, &st, &size, &align);
+    if (rc != OCERZ_OK)
+        return rc;
+    st.size = (uint16_t)size;
+    st.align = (uint8_t)align;
+    *out = st;
+    return OCERZ_OK;
 }
 
 static int abi_parse_callback(const char *notation, int index, const char **cursor, char *out)
@@ -255,8 +394,18 @@ static int abi_parse_callback(const char *notation, int index, const char **curs
     }
     open++;
 
-    const char *close = strchr(open, '}');
-    if (!close) {
+    const char *close = open;
+    int depth = 0;
+    for (; *close; close++) {
+        if (*close == '{') {
+            depth++;
+        } else if (*close == '}') {
+            if (depth == 0)
+                break;
+            depth--;
+        }
+    }
+    if (*close != '}') {
         OCERZ_LOG("abi: %s opens a callback signature for argument %d and never closes it\n",
                   notation, index);
         return OCERZ_EFORMAT;
@@ -307,7 +456,13 @@ int ocerz_abi_parse(const char *notation, OcerzAbiSig *out)
         return OCERZ_EUNSUP;
     }
     sig.ret = ret;
-    p++;
+    if (ret == '{') {
+        int rc = abi_parse_layout(notation, &p, &sig.ret_struct);
+        if (rc != OCERZ_OK)
+            return rc;
+    } else {
+        p++;
+    }
 
     if (*p != '(') {
         OCERZ_LOG("abi: %s has no argument list\n", notation);
@@ -316,7 +471,7 @@ int ocerz_abi_parse(const char *notation, OcerzAbiSig *out)
     p++;
 
     while (*p != '\0' && *p != ')') {
-        char c = *p++;
+        char c = *p;
         if (!abi_is_arg_class(c)) {
             abi_reject(notation, c);
             return OCERZ_EUNSUP;
@@ -326,10 +481,17 @@ int ocerz_abi_parse(const char *notation, OcerzAbiSig *out)
                       notation, OCERZ_ABI_MAX_ARGS);
             return OCERZ_ETOOLONG;
         }
-        if (c == 'c') {
-            int rc = abi_parse_callback(notation, sig.nargs, &p, sig.cb[sig.nargs]);
+        if (c == '{') {
+            int rc = abi_parse_layout(notation, &p, &sig.arg_struct[sig.nargs]);
             if (rc != OCERZ_OK)
                 return rc;
+        } else {
+            p++;
+            if (c == 'c') {
+                int rc = abi_parse_callback(notation, sig.nargs, &p, sig.cb[sig.nargs]);
+                if (rc != OCERZ_OK)
+                    return rc;
+            }
         }
         sig.arg[sig.nargs++] = c;
     }
@@ -349,6 +511,128 @@ int ocerz_abi_parse(const char *notation, OcerzAbiSig *out)
     return OCERZ_OK;
 }
 
+static int abi_struct_valid(const OcerzAbiStruct *st)
+{
+    size_t align = 1, end = 0;
+    unsigned starts = 0;
+
+    if (st->nmember < 1 || st->nmember > OCERZ_ABI_STRUCT_MEMBERS)
+        return 0;
+    if (st->size == 0 || st->size > OCERZ_ABI_STRUCT_BYTES)
+        return 0;
+
+    for (int k = 0; k < st->nmember; k++) {
+        char c = st->member[k];
+        if (!abi_is_scalar_class(c))
+            return 0;
+        size_t size = (size_t)abi_class_size(c);
+        size_t at = st->offset[k];
+        if (at % size != 0 || at < end)
+            return 0;
+        end = at + size;
+        if (size > align)
+            align = size;
+        starts |= 1u << (at / 8);
+    }
+
+    if (end > st->size || st->align != align || st->size % align != 0)
+        return 0;
+    if (st->size <= ABI_SMALL_STRUCT && starts != (st->size > 8 ? 3u : 1u))
+        return 0;
+    return 1;
+}
+
+static char abi_hfa(const OcerzAbiStruct *st)
+{
+    char c = st->member[0];
+
+    if (st->nmember > ABI_HOST_HFA_MAX || !abi_is_fp(c))
+        return 0;
+    for (int k = 1; k < st->nmember; k++)
+        if (st->member[k] != c)
+            return 0;
+    return c;
+}
+
+static int abi_host_indirect(const OcerzAbiStruct *st)
+{
+    return st->size > ABI_SMALL_STRUCT && !abi_hfa(st);
+}
+
+static int abi_sysv_classify(const OcerzAbiStruct *st, char cls[2], int *nint, int *nsse)
+{
+    *nint = 0;
+    *nsse = 0;
+    if (st->size > ABI_SMALL_STRUCT)
+        return 0;
+
+    int n = (st->size + 7) / 8;
+    cls[0] = 'S';
+    cls[1] = 'S';
+    for (int k = 0; k < st->nmember; k++)
+        if (!abi_is_fp(st->member[k]))
+            cls[st->offset[k] / 8] = 'I';
+    for (int k = 0; k < n; k++) {
+        if (cls[k] == 'I')
+            (*nint)++;
+        else
+            (*nsse)++;
+    }
+    return n;
+}
+
+static size_t abi_struct_words(const OcerzAbiStruct *st)
+{
+    return ((size_t)st->size + 7) / 8;
+}
+
+static uint64_t abi_word(const uint8_t *buf, size_t at, size_t len)
+{
+    uint64_t w = 0;
+    memcpy(&w, buf + at, len);
+    return w;
+}
+
+static void abi_put_word(uint8_t *buf, size_t at, uint64_t w, size_t len)
+{
+    memcpy(buf + at, &w, len);
+}
+
+static void abi_zero_tail(const OcerzAbiStruct *st, uint8_t *buf)
+{
+    memset(buf + st->size, 0, abi_struct_words(st) * 8 - st->size);
+}
+
+static void abi_struct_pointers(const OcerzAbiStruct *st, uint8_t *buf, int to_host)
+{
+    for (int k = 0; k < st->nmember; k++) {
+        if (st->member[k] != 'p')
+            continue;
+        uint64_t w = abi_word(buf, st->offset[k], 8);
+        if (w)
+            w = to_host ? (uint64_t)(uintptr_t)ocerz_g2h(w) : ocerz_h2g((const void *)(uintptr_t)w);
+        abi_put_word(buf, st->offset[k], w, 8);
+    }
+}
+
+static void abi_guest_read(uint64_t gaddr, uint8_t *buf, size_t len)
+{
+    size_t at = 0;
+    for (; at + 8 <= len; at += 8)
+        abi_put_word(buf, at, ocerz_ld(gaddr + at, 8), 8);
+    for (; at < len; at++)
+        buf[at] = (uint8_t)ocerz_ld(gaddr + at, 1);
+}
+
+static void abi_guest_write(uint64_t gaddr, const uint8_t *buf, size_t len)
+{
+    size_t at = 0;
+    for (; at + 8 <= len; at += 8)
+        ocerz_st(gaddr + at, 8, abi_word(buf, at, 8));
+    for (; at < len; at++)
+        ocerz_st(gaddr + at, 1, buf[at]);
+}
+
 static uint64_t abi_narrow(char c, uint64_t raw)
 {
     switch (c) {
@@ -365,21 +649,28 @@ static uint64_t abi_narrow(char c, uint64_t raw)
 
 static size_t abi_host_stack_at(size_t off, int size)
 {
-    size_t step = (size_t)size;
-    return (off + step - 1) & ~(step - 1);
+    return abi_align_up(off, (size_t)size);
+}
+
+static int abi_push_host_bytes(OcerzAbiCall *call, size_t *off, const uint8_t *bytes, size_t len,
+                               size_t align)
+{
+    size_t at = abi_align_up(*off, align);
+
+    if (at + len > sizeof call->stack)
+        return OCERZ_ETOOLONG;
+
+    memcpy((unsigned char *)call->stack + at, bytes, len);
+    *off = at + len;
+    return OCERZ_OK;
 }
 
 static int abi_push_host_stack(OcerzAbiCall *call, size_t *off, uint64_t val, int size)
 {
-    size_t step = (size_t)size;
-    size_t at = abi_host_stack_at(*off, size);
+    uint8_t bytes[8];
 
-    if (at + step > sizeof call->stack)
-        return OCERZ_ETOOLONG;
-
-    memcpy((unsigned char *)call->stack + at, &val, step);
-    *off = at + step;
-    return OCERZ_OK;
+    memcpy(bytes, &val, sizeof bytes);
+    return abi_push_host_bytes(call, off, bytes, (size_t)size, (size_t)size);
 }
 
 static uint64_t abi_pull_host_stack(const uint8_t *stack, size_t *off, int size)
@@ -393,6 +684,76 @@ static uint64_t abi_pull_host_stack(const uint8_t *stack, size_t *off, int size)
     return val;
 }
 
+static void abi_pull_host_bytes(const uint8_t *stack, size_t *off, uint8_t *bytes, size_t len,
+                                size_t align)
+{
+    size_t at = abi_align_up(*off, align);
+
+    memcpy(bytes, stack + at, len);
+    *off = at + len;
+}
+
+static void abi_guest_struct_in(const OcerzAbiStruct *st, const OcerzCPU *cpu, int *gi, int *gf,
+                                int *gslot, uint8_t *buf)
+{
+    char cls[2];
+    int nint, nsse;
+    int n = abi_sysv_classify(st, cls, &nint, &nsse);
+
+    if (n && *gi + nint <= ABI_GUEST_INT_REGS && *gf + nsse <= ABI_GUEST_FP_REGS) {
+        for (int k = 0; k < n; k++) {
+            uint64_t w = cls[k] == 'I' ? cpu->gpr[abi_guest_int_reg[(*gi)++]]
+                                       : cpu->xmm[(*gf)++].lo;
+            abi_put_word(buf, 8 * (size_t)k, w, 8);
+        }
+    } else {
+        uint64_t rsp = cpu->gpr[OCERZ_RSP];
+        size_t words = abi_struct_words(st);
+        for (size_t k = 0; k < words; k++)
+            abi_put_word(buf, 8 * k, ocerz_ld(rsp + 8 + 8 * (uint64_t)(*gslot)++, 8), 8);
+    }
+    abi_zero_tail(st, buf);
+}
+
+static int abi_host_struct_out(const OcerzAbiStruct *st, const uint8_t *buf, OcerzAbiCall *call,
+                               size_t *off)
+{
+    char hfa = abi_hfa(st);
+    size_t words = abi_struct_words(st);
+
+    if (hfa) {
+        size_t step = (size_t)abi_class_size(hfa);
+        if (call->nv + st->nmember <= ABI_HOST_FP_REGS) {
+            for (int k = 0; k < st->nmember; k++)
+                call->v[call->nv++] = abi_word(buf, (size_t)k * step, step);
+            return OCERZ_OK;
+        }
+        call->nv = ABI_HOST_FP_REGS;
+        return abi_push_host_bytes(call, off, buf, st->size, step);
+    }
+
+    if (st->size > ABI_SMALL_STRUCT) {
+        uint64_t *copy = call->mem + call->nmem;
+        call->nmem += (int)words;
+        copy[words - 1] = 0;
+        memcpy(copy, buf, st->size);
+        uint64_t ptr = (uint64_t)(uintptr_t)copy;
+        if (call->nx < ABI_HOST_INT_REGS) {
+            call->x[call->nx++] = ptr;
+            return OCERZ_OK;
+        }
+        return abi_push_host_stack(call, off, ptr, 8);
+    }
+
+    if (call->nx + (int)words <= ABI_HOST_INT_REGS) {
+        for (size_t k = 0; k < words; k++)
+            call->x[call->nx++] = abi_word(buf, 8 * k, 8);
+        return OCERZ_OK;
+    }
+    call->nx = ABI_HOST_INT_REGS;
+    return abi_push_host_bytes(call, off, buf, words * 8, 8);
+}
+
 int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCall *call)
 {
     if (!sig || !cpu || !call)
@@ -403,12 +764,22 @@ int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCa
         OCERZ_LOG("abi: result has class '%c', which no signature can name\n", sig->ret);
         return OCERZ_EUNSUP;
     }
+    if (sig->ret == '{' && !abi_struct_valid(&sig->ret_struct)) {
+        OCERZ_LOG("abi: the result structure has a layout no notation describes\n");
+        return OCERZ_EUNSUP;
+    }
 
-    memset(call, 0, sizeof *call);
+    memset(call, 0, offsetof(OcerzAbiCall, ret));
 
-    uint64_t rsp = cpu->gpr[OCERZ_RSP];
     int guest_int = 0, guest_fp = 0, guest_slot = 0;
     size_t host_off = 0;
+
+    if (sig->ret == '{') {
+        if (sig->ret_struct.size > ABI_SMALL_STRUCT)
+            call->guest_ret = cpu->gpr[abi_guest_int_reg[guest_int++]];
+        if (abi_host_indirect(&sig->ret_struct))
+            call->x8 = call->ret;
+    }
 
     for (int i = 0; i < sig->nargs; i++) {
         char c = sig->arg[i];
@@ -420,12 +791,29 @@ int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCa
             return OCERZ_EUNSUP;
         }
 
+        if (c == '{') {
+            const OcerzAbiStruct *st = &sig->arg_struct[i];
+            uint8_t buf[OCERZ_ABI_STRUCT_BYTES];
+            if (!abi_struct_valid(st)) {
+                OCERZ_LOG("abi: argument %d is a structure with a layout no notation describes\n", i);
+                return OCERZ_EUNSUP;
+            }
+            abi_guest_struct_in(st, cpu, &guest_int, &guest_fp, &guest_slot, buf);
+            abi_struct_pointers(st, buf, 1);
+            if (abi_host_struct_out(st, buf, call, &host_off) != OCERZ_OK) {
+                OCERZ_LOG("abi: argument %d spills past the %d-byte host argument window\n",
+                          i, (int)sizeof call->stack);
+                return OCERZ_ETOOLONG;
+            }
+            continue;
+        }
+
         if (fp && guest_fp < ABI_GUEST_FP_REGS)
             raw = cpu->xmm[guest_fp++].lo;
         else if (!fp && guest_int < ABI_GUEST_INT_REGS)
             raw = cpu->gpr[abi_guest_int_reg[guest_int++]];
         else
-            raw = ocerz_ld(rsp + 8 + 8 * (uint64_t)guest_slot++, 8);
+            raw = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8 + 8 * (uint64_t)guest_slot++, 8);
 
         uint64_t val;
         if (c == 'p') {
@@ -459,28 +847,71 @@ int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCa
     return OCERZ_OK;
 }
 
-void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, uint64_t rx, uint64_t rv)
+static void abi_guest_struct_result(const OcerzAbiStruct *st, OcerzCPU *cpu, const OcerzAbiCall *call)
 {
-    if (!sig || !cpu)
+    static const uint8_t reg[2] = { OCERZ_RAX, OCERZ_RDX };
+    uint8_t buf[OCERZ_ABI_STRUCT_BYTES];
+    char hfa = abi_hfa(st);
+
+    memset(buf, 0, abi_struct_words(st) * 8);
+    if (hfa) {
+        size_t step = (size_t)abi_class_size(hfa);
+        for (int k = 0; k < st->nmember; k++)
+            abi_put_word(buf, (size_t)k * step, call->rv[k], step);
+    } else if (st->size > ABI_SMALL_STRUCT) {
+        memcpy(buf, call->ret, st->size);
+    } else {
+        memcpy(buf, call->rx, st->size);
+    }
+    abi_struct_pointers(st, buf, 0);
+
+    char cls[2];
+    int nint, nsse;
+    int n = abi_sysv_classify(st, cls, &nint, &nsse);
+    if (!n) {
+        abi_guest_write(call->guest_ret, buf, st->size);
+        cpu->gpr[OCERZ_RAX] = call->guest_ret;
+        return;
+    }
+
+    int ri = 0, si = 0;
+    for (int k = 0; k < n; k++) {
+        uint64_t w = abi_word(buf, 8 * (size_t)k, 8);
+        if (cls[k] == 'I') {
+            cpu->gpr[reg[ri++]] = w;
+        } else {
+            cpu->xmm[si].lo = w;
+            cpu->xmm[si].hi = 0;
+            si++;
+        }
+    }
+}
+
+void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, const OcerzAbiCall *call)
+{
+    if (!sig || !cpu || !call)
         return;
 
     switch (sig->ret) {
+    case '{':
+        abi_guest_struct_result(&sig->ret_struct, cpu, call);
+        break;
     case 'v':
         cpu->gpr[OCERZ_RAX] = 0;
         break;
     case 'p':
-        cpu->gpr[OCERZ_RAX] = rx ? ocerz_h2g((const void *)(uintptr_t)rx) : 0;
+        cpu->gpr[OCERZ_RAX] = call->rx[0] ? ocerz_h2g((const void *)(uintptr_t)call->rx[0]) : 0;
         break;
     case 'f':
-        cpu->xmm[0].lo = (uint64_t)(uint32_t)rv;
+        cpu->xmm[0].lo = (uint64_t)(uint32_t)call->rv[0];
         cpu->xmm[0].hi = 0;
         break;
     case 'd':
-        cpu->xmm[0].lo = rv;
+        cpu->xmm[0].lo = call->rv[0];
         cpu->xmm[0].hi = 0;
         break;
     default:
-        cpu->gpr[OCERZ_RAX] = abi_narrow(sig->ret, rx);
+        cpu->gpr[OCERZ_RAX] = abi_narrow(sig->ret, call->rx[0]);
         break;
     }
 
@@ -500,15 +931,14 @@ int ocerz_abi_perform(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu)
     if (ocerz_abi_read_guest(sig, cpu, &call) != OCERZ_OK)
         return OCERZ_STEP_FATAL;
 
-    uint64_t rx = 0, rv = 0;
     int guest_round = fegetround();
 
     fesetround(FE_TONEAREST);
-    ocerz_abi_call_native(fn, call.x, call.v, call.stack,
-                          (uint64_t)call.nstack * 8, &rx, &rv);
+    ocerz_abi_call_native(fn, call.x, call.v, call.stack, (uint64_t)call.nstack * 8, call.x8,
+                          call.rx, call.rv);
     fesetround(guest_round);
 
-    ocerz_abi_write_result(sig, cpu, rx, rv);
+    ocerz_abi_write_result(sig, cpu, &call);
     return OCERZ_STEP_OK;
 }
 
@@ -632,14 +1062,124 @@ int ocerz_abi_callback_convert(uint64_t gptr, const char *notation, uint64_t *ou
     return OCERZ_OK;
 }
 
-void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
-                                 const uint8_t *stack, uint64_t *out_x0, uint64_t *out_v0)
+static int abi_host_struct_in(const OcerzAbiStruct *st, const uint64_t *x, const uint64_t *v,
+                              const uint8_t *stack, int *nx, int *nv, size_t *off, uint8_t *buf)
 {
-    if (out_x0)
-        *out_x0 = 0;
-    if (out_v0)
-        *out_v0 = 0;
-    if (!x || !v || !out_x0 || !out_v0) {
+    char hfa = abi_hfa(st);
+    size_t words = abi_struct_words(st);
+
+    memset(buf, 0, words * 8);
+
+    if (hfa) {
+        size_t step = (size_t)abi_class_size(hfa);
+        if (*nv + st->nmember <= ABI_HOST_FP_REGS) {
+            for (int k = 0; k < st->nmember; k++)
+                abi_put_word(buf, (size_t)k * step, v[(*nv)++], step);
+            return OCERZ_OK;
+        }
+        *nv = ABI_HOST_FP_REGS;
+        if (!stack)
+            return OCERZ_EUNDEF;
+        abi_pull_host_bytes(stack, off, buf, st->size, step);
+        return OCERZ_OK;
+    }
+
+    if (st->size > ABI_SMALL_STRUCT) {
+        uint64_t ptr;
+        if (*nx < ABI_HOST_INT_REGS)
+            ptr = x[(*nx)++];
+        else if (stack)
+            ptr = abi_pull_host_stack(stack, off, 8);
+        else
+            return OCERZ_EUNDEF;
+        if (!ptr)
+            return OCERZ_EFORMAT;
+        memcpy(buf, (const void *)(uintptr_t)ptr, st->size);
+        return OCERZ_OK;
+    }
+
+    if (*nx + (int)words <= ABI_HOST_INT_REGS) {
+        for (size_t k = 0; k < words; k++)
+            abi_put_word(buf, 8 * k, x[(*nx)++], 8);
+    } else {
+        *nx = ABI_HOST_INT_REGS;
+        if (!stack)
+            return OCERZ_EUNDEF;
+        abi_pull_host_bytes(stack, off, buf, words * 8, 8);
+    }
+    abi_zero_tail(st, buf);
+    return OCERZ_OK;
+}
+
+static int abi_guest_struct_out(const OcerzAbiStruct *st, const uint8_t *buf, OcerzGuestCall *call,
+                                int *gi, int *gf)
+{
+    const int slots = (int)(sizeof call->stack / sizeof call->stack[0]);
+    char cls[2];
+    int nint, nsse;
+    int n = abi_sysv_classify(st, cls, &nint, &nsse);
+
+    if (n && *gi + nint <= ABI_GUEST_INT_REGS && *gf + nsse <= ABI_GUEST_FP_REGS) {
+        for (int k = 0; k < n; k++) {
+            uint64_t w = abi_word(buf, 8 * (size_t)k, 8);
+            if (cls[k] == 'I')
+                call->gpr[(*gi)++] = w;
+            else
+                call->xmm[(*gf)++] = w;
+        }
+        return 1;
+    }
+
+    int words = (int)abi_struct_words(st);
+    if (call->nstack + words > slots)
+        return 0;
+    for (int k = 0; k < words; k++)
+        call->stack[call->nstack++] = abi_word(buf, 8 * (size_t)k, 8);
+    return 1;
+}
+
+static void abi_host_struct_result(const OcerzAbiStruct *st, const OcerzGuestCall *call,
+                                   uint64_t guest_ret, void *x8, uint64_t *out_x, uint64_t *out_v)
+{
+    uint8_t buf[OCERZ_ABI_STRUCT_BYTES + 16];
+    char cls[2];
+    int nint, nsse;
+    int n = abi_sysv_classify(st, cls, &nint, &nsse);
+
+    memset(buf, 0, abi_struct_words(st) * 8 + 16);
+    if (!n) {
+        abi_guest_read(guest_ret, buf, st->size);
+    } else {
+        const uint64_t ireg[2] = { call->rax, call->rdx };
+        const uint64_t sreg[2] = { call->xmm0, call->xmm1 };
+        int ri = 0, si = 0;
+        for (int k = 0; k < n; k++)
+            abi_put_word(buf, 8 * (size_t)k, cls[k] == 'I' ? ireg[ri++] : sreg[si++], 8);
+        abi_zero_tail(st, buf);
+    }
+    abi_struct_pointers(st, buf, 1);
+
+    char hfa = abi_hfa(st);
+    if (hfa) {
+        size_t step = (size_t)abi_class_size(hfa);
+        for (int k = 0; k < st->nmember; k++)
+            out_v[k] = abi_word(buf, (size_t)k * step, step);
+    } else if (st->size > ABI_SMALL_STRUCT) {
+        memcpy(x8, buf, st->size);
+    } else {
+        out_x[0] = abi_word(buf, 0, 8);
+        out_x[1] = abi_word(buf, 8, 8);
+    }
+}
+
+void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
+                                 const uint8_t *stack, void *x8, uint64_t *out_x, uint64_t *out_v)
+{
+    if (out_x)
+        memset(out_x, 0, 2 * sizeof *out_x);
+    if (out_v)
+        memset(out_v, 0, 4 * sizeof *out_v);
+    if (!x || !v || !out_x || !out_v) {
         fprintf(stderr, "ocerz: abi: callback slot %u was dispatched without its argument or result words\n",
                 slot);
         return;
@@ -654,6 +1194,14 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
 
     const AbiCallback *e = &g_abi_cb[slot];
     const OcerzAbiSig *sig = &e->sig;
+
+    if (sig->ret == '{' && abi_host_indirect(&sig->ret_struct) && !x8) {
+        fprintf(stderr,
+                "ocerz: abi: guest function %#llx (callback slot %u, %s) returns a structure through x8,"
+                " and its native caller passed no buffer there\n",
+                (unsigned long long)e->guest_fn, slot, e->notation);
+        return;
+    }
 
     OcerzCPU *cpu = ocerz_vm_current_cpu();
     if (!cpu)
@@ -673,13 +1221,46 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
     OcerzGuestCall call;
     memset(&call, 0, sizeof call);
 
+    const int slots = (int)(sizeof call.stack / sizeof call.stack[0]);
     int nx = 0, nv = 0, gi = 0, gf = 0;
     size_t off = 0;
+    uint64_t stack_top = (cpu->gpr[OCERZ_RSP] - 128) & ~0xfull;
+    uint64_t guest_ret = 0;
+
+    if (sig->ret == '{' && sig->ret_struct.size > ABI_SMALL_STRUCT) {
+        stack_top = (stack_top - sig->ret_struct.size) & ~0xfull;
+        guest_ret = stack_top;
+        call.gpr[gi++] = guest_ret;
+    }
 
     for (int i = 0; i < sig->nargs; i++) {
         char c = sig->arg[i];
         int fp = abi_is_fp(c);
         uint64_t raw;
+
+        if (c == '{') {
+            const OcerzAbiStruct *st = &sig->arg_struct[i];
+            uint8_t buf[OCERZ_ABI_STRUCT_BYTES];
+            int rc = abi_host_struct_in(st, x, v, stack, &nx, &nv, &off, buf);
+            if (rc != OCERZ_OK) {
+                fprintf(stderr,
+                        "ocerz: abi: guest function %#llx (callback slot %u, %s) takes structure argument"
+                        " %d %s\n",
+                        (unsigned long long)e->guest_fn, slot, e->notation, i,
+                        rc == OCERZ_EFORMAT ? "through a copy, and the native caller passed a null address"
+                                            : "from the native caller's stack, and no stack was passed");
+                return;
+            }
+            abi_struct_pointers(st, buf, 0);
+            if (!abi_guest_struct_out(st, buf, &call, &gi, &gf)) {
+                fprintf(stderr,
+                        "ocerz: abi: guest function %#llx (callback slot %u, %s) stacks more than the %d"
+                        " eightbytes a guest call carries\n",
+                        (unsigned long long)e->guest_fn, slot, e->notation, slots);
+                return;
+            }
+            continue;
+        }
 
         if (fp && nv < ABI_HOST_FP_REGS) {
             raw = v[nv++];
@@ -702,19 +1283,16 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
             call.xmm[gf++] = val;
         } else if (!fp && gi < ABI_GUEST_INT_REGS) {
             call.gpr[gi++] = val;
-        } else if (call.nstack < (int)(sizeof call.stack / sizeof call.stack[0])) {
+        } else if (call.nstack < slots) {
             call.stack[call.nstack++] = val;
         } else {
             fprintf(stderr,
                     "ocerz: abi: guest function %#llx (callback slot %u, %s) stacks more than the %d"
-                    " arguments a guest call carries\n",
-                    (unsigned long long)e->guest_fn, slot, e->notation,
-                    (int)(sizeof call.stack / sizeof call.stack[0]));
+                    " eightbytes a guest call carries\n",
+                    (unsigned long long)e->guest_fn, slot, e->notation, slots);
             return;
         }
     }
-
-    uint64_t stack_top = (cpu->gpr[OCERZ_RSP] - 128) & ~0xfull;
 
     struct OcerzBridgeFrame saved;
     ocerz_bridge_guest_enter(&saved);
@@ -730,17 +1308,20 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
     switch (sig->ret) {
     case 'v':
         break;
+    case '{':
+        abi_host_struct_result(&sig->ret_struct, &call, guest_ret, x8, out_x, out_v);
+        break;
     case 'p':
-        *out_x0 = call.rax ? (uint64_t)(uintptr_t)ocerz_g2h(call.rax) : 0;
+        out_x[0] = call.rax ? (uint64_t)(uintptr_t)ocerz_g2h(call.rax) : 0;
         break;
     case 'f':
-        *out_v0 = (uint64_t)(uint32_t)call.xmm0;
+        out_v[0] = (uint64_t)(uint32_t)call.xmm0;
         break;
     case 'd':
-        *out_v0 = call.xmm0;
+        out_v[0] = call.xmm0;
         break;
     default:
-        *out_x0 = abi_narrow(sig->ret, call.rax);
+        out_x[0] = abi_narrow(sig->ret, call.rax);
         break;
     }
 }
