@@ -59,6 +59,18 @@
  * fault jumps to is installed by the guest call itself, so a recovered fault
  * lands inside the callback rather than past it, and the saved frame is still
  * there to restore.
+ *
+ * A virtual library stands for a native one, and the native one is found by the
+ * install name they share.  ocerz_bridge_host_library opens it once and hands
+ * back the handle, the process's default search scope for libSystem, and NULL for
+ * an install name the bridge does not stand in for or a library that will not
+ * open; ocerz_bridge_host_symbol looks a host symbol up inside it.  Both are safe
+ * to call from any thread and cheap after the first call for a given library.
+ * The virtual image builder uses the second for data exports that must be the
+ * native variable itself rather than a copy of its value, and the bridge table
+ * uses it for every function it resolves, so a function is always taken from the
+ * library the guest named and never from whichever image happens to export the
+ * name first.
  */
 #ifndef OCERZ_BRIDGE_H
 #define OCERZ_BRIDGE_H
@@ -85,5 +97,12 @@ void ocerz_bridge_report(void);
 const struct OcerzBridgeFrame *ocerz_bridge_in_flight(void);
 void ocerz_bridge_guest_enter(struct OcerzBridgeFrame *saved);
 void ocerz_bridge_guest_leave(const struct OcerzBridgeFrame *saved);
+
+#define OCERZ_BRIDGE_LIBSYSTEM "/usr/lib/libSystem.B.dylib"
+#define OCERZ_BRIDGE_COREFOUNDATION \
+    "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation"
+
+void *ocerz_bridge_host_library(const char *install_name);
+void *ocerz_bridge_host_symbol(const char *install_name, const char *host_sym);
 
 #endif

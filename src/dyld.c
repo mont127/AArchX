@@ -135,12 +135,20 @@
  *
  * Unresolved imports are collected rather than announced one at a time.  In
  * cache mode a miss is a real failure and prints where it happens; in native
- * mode every system symbol misses until the bridges land, so a miss is recorded
- * by (library, symbol) pair in a fixed table, deduplicated, and the set is
- * reported once the main image's fixups are done - after which the process
- * stops with 71 rather than running a program whose imports are all bound to
- * zero.  The library is the two-level ordinal's target install name, or (flat)
- * when the import names no ordinal.
+ * mode a program commonly imports several things no virtual library exports
+ * yet, and the report is only useful if it names all of them, so a miss is
+ * recorded by (library, symbol) pair in a fixed table, deduplicated, and the set
+ * is reported once the main image's fixups are done - after which the process
+ * stops with 71 rather than running a program with imports bound to zero.  The
+ * library is the two-level ordinal's target install name, or (flat) when the
+ * import names no ordinal.
+ *
+ * An import whose ordinal names a virtual image is resolved in that image and
+ * nowhere else.  The flat search over every loaded image that follows a
+ * two-level miss is there for disk dylibs whose re-exports the resolver does not
+ * follow, and a virtual image re-exports nothing, so falling back would only let
+ * a CoreFoundation import CoreFoundation does not export bind silently to a
+ * libSystem export of the same name.
  *
  * A system library that a dependency names is not on disk at all on a modern
  * macOS - /usr/lib/libSystem.B.dylib exists only inside the cache - so in
@@ -774,6 +782,7 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
 
     uint64_t value = 0;
     int found = 0;
+    int virtual_dep = 0;
     const char *tgt = NULL;
     if (libord > 0) {
         tgt = dimg_ordinal_name(img, libord);
@@ -789,8 +798,10 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
                         dep = dimg_find_by_install_name(ex);
                 }
             }
-            if (dep)
+            if (dep) {
                 value = ocerz_image_self_resolve_ex(dep, name, &found);
+                virtual_dep = ocerz_mode == OCERZ_MODE_NATIVE && ocerz_vdylib_have(tgt);
+            }
             if (!found && !dep && tgt[0] != '@')
                 value = ocerz_cache_resolve_in_image(cache, tgt, name, &found);
         }
@@ -799,7 +810,7 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
         value = ocerz_cache_resolve_ex(cache, name, &found);
     if (!found && (libord == -3 || libord == 0 || libord == -2))
         value = ocerz_image_self_resolve_ex(img, name, &found);
-    if (!found)
+    if (!found && !virtual_dep)
         value = disk_flat_resolve_ex(name, &found);
     if (!found && !weak) {
         if (ocerz_mode == OCERZ_MODE_NATIVE)
@@ -2887,7 +2898,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         if (g_native_miss_dropped)
             fprintf(stderr, "ocerz: native: %d more unresolved imports not listed\n",
                     g_native_miss_dropped);
-        fprintf(stderr, "ocerz: native: %d unresolved imports, no virtual frameworks are implemented yet\n",
+        fprintf(stderr, "ocerz: native: %d unresolved imports, which no virtual library exports\n",
                 g_native_miss_n + g_native_miss_dropped);
         free(buf);
         return 71;

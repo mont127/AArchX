@@ -25,6 +25,18 @@
  * is refused rather than quietly ignored.  Native mode has no static loader
  * path at all - a program that links against nothing has nothing to bridge
  * into - so a non-dynamic image is refused before the VM starts.
+ *
+ * The loader is handed a copy of the environment, not environ itself.  Loading
+ * a guest in native mode opens the host's own frameworks, and their
+ * initializers run then: CoreFoundation's calls setenv for
+ * __CF_USER_TEXT_ENCODING, which reallocates environ and frees the array a
+ * pointer taken earlier still names.  The guest's initial stack is built from
+ * that pointer only after loading, so it read freed memory, and whether that
+ * crashed depended on whether the block had been reused yet - which it was when
+ * the environment happened to be the size bash passes and not the size zsh
+ * passes.  The copy is taken once, owns its strings, and lives as long as the
+ * process, so no framework the guest makes ocerz open can pull the guest's
+ * environment out from under it.
  */
 #include <signal.h>
 #include <pthread.h>
@@ -38,6 +50,22 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+static char **env_snapshot(char **env)
+{
+    size_t n = 0;
+    while (env && env[n])
+        n++;
+    char **copy = calloc(n + 1, sizeof *copy);
+    if (!copy)
+        return env;
+    for (size_t k = 0; k < n; k++) {
+        copy[k] = strdup(env[k]);
+        if (!copy[k])
+            return env;
+    }
+    return copy;
+}
 
 extern char **environ;
 
@@ -197,7 +225,7 @@ int main(int argc, char **argv)
     vm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;
 
     if (dynamic)
-        return ocerz_dyld_run(&vm, load_path, argc - i, argv + i, environ);
+        return ocerz_dyld_run(&vm, load_path, argc - i, argv + i, env_snapshot(environ));
 
     if (ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK)
         return 70;

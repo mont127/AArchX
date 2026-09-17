@@ -35,15 +35,24 @@
  * children's offsets encode, and those offsets depend on the sizes of the
  * nodes before them.  Encoding offsets minimally therefore means iterating to
  * a fixed point that is not guaranteed to settle.  Instead every offset
- * and every terminal address is emitted as a padded five-byte ULEB128, high
- * bit set on the first four bytes: redundant padding is legal ULEB and the
- * walker decodes it correctly because it keeps shifting while the high bit is
- * set.  Five bytes carry 35 bits, more than any image this file will ever
- * build.  With every width known up front a node's size is known before
+ * and every terminal address is emitted as a padded ULEB128 of fixed width,
+ * high bit set on every byte but the last: redundant padding is legal ULEB and
+ * the walker decodes it correctly because it keeps shifting while the high bit
+ * is set.  Offsets, and the terminals of stubs and data slots, are five bytes,
+ * which carry 35 bits, more than any image this file will ever build.  A native
+ * data terminal carries a host address instead, and the image's size puts no
+ * bound on that: the host's libraries sit wherever the kernel mapped them, and
+ * an address past 2^35 written into five bytes would lose its top bits without
+ * a word of complaint.  Those terminals are ten bytes, which is every bit a
+ * 64-bit value has, the tenth byte holding bit 63 alone.  With every width
+ * known up front - a terminal's kind comes from the table, and no width
+ * depends on the value written into it - a node's size is known before
  * anything is placed, so layout is one pass over the nodes and emission is a
- * second, with no back-patching at all.  The same choice fixes the terminal at
- * one flags byte plus five address bytes, which is why terminal_size is always
- * the constant 6.
+ * second, with no back-patching at all.  The same choice fixes a terminal at
+ * one flags byte plus its address bytes, so the terminal size a node declares
+ * is 6 for a stub or a slot and 11 for native data, a single ULEB byte either
+ * way, and an image's layout does not move whatever addresses the host hands
+ * back.
  *
  * The trie is a real radix trie, not a flat list of full names.  The walker
  * takes the FIRST child whose edge matches under strncmp, so with a flat root
@@ -131,6 +140,51 @@
  * name it wanted, and a refusal that names itself is better than a value that
  * is wrong without saying so.
  *
+ * ---- the exports that are the host's own variables ----
+ * CoreFoundation exports data a guest reaches by address, and the address is
+ * the part that matters.  A CFSTR literal is a structure the compiler lays down
+ * in the guest's own __cfstring section, and its first word is bound to
+ * ___CFConstantStringClassReference: that word is the isa by which native
+ * CoreFoundation and the Objective-C runtime recognize the literal as a string
+ * at all.  kCFTypeArrayCallBacks and its dictionary siblings are handed over by
+ * address, and CoreFoundation may compare the pointer it is given against the
+ * address of its own.  A slot here holding a copy of either is a second object
+ * at a second address: an isa naming a class nobody registered, and a callbacks
+ * structure whose address nothing recognizes.  Some names on the list would
+ * survive a copy - kCFBooleanTrue and kCFRunLoopDefaultMode are constant
+ * pointers to objects that never move - but one rule for every native name is
+ * simpler than deciding name by name, and costs nothing.
+ *
+ * So there is a third kind of export, native data, and its trie terminal is the
+ * host variable's own address with EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE set.  The
+ * address is what the host lookup, ocerz_bridge_host_symbol unless the caller
+ * supplies another, answers for the name without its leading underscore in the
+ * library whose install name the row carries.  The trie walker returns an
+ * absolute terminal's value as it stands instead of adding the load address,
+ * so every bind path that asks it - bind opcodes and chained fixups alike -
+ * writes the native address into the guest's GOT entry or isa word.  That
+ * address is usable from guest code only because the loader asks for a
+ * virtual image in native mode alone, and native mode runs in the identity
+ * map, where a host address is a guest address.  A native export takes no
+ * stub, no slot, no export id and no byte of either segment: its trie entry is
+ * all of it.
+ *
+ * A name the host lookup does not find is left out of the trie, and said once
+ * per process through OCERZ_LOG however many times the image is built.  An
+ * absolute export of zero would bind the guest's reference to a null pointer
+ * that faults somewhere far from the import that caused it; an export that is
+ * absent puts the name in the loader's unresolved-import report, and the run
+ * stops with 71 before the guest has executed an instruction.
+ *
+ * ---- export ids ----
+ * The first image built mints an id for every function of every row, in table
+ * order, and later builds only look them up.  Minting as each image is built
+ * would number a library's exports by whichever library a guest happened to
+ * name first - a program linking CoreFoundation lists it ahead of libSystem -
+ * so the same libSystem would carry different ids, and be different bytes,
+ * from one guest to the next.  Minted up front, libSystem's stubs are the same
+ * in every process and an id means the same export in every run.
+ *
  * ---- what happens after the trap ----
  * The trap lands in ocerz_vdylib_dispatch, which turns the export id back into
  * the library and symbol it was minted from and asks the bridge whether it
@@ -160,6 +214,18 @@
  * touched another read back garbage.  Its stub therefore pushes r11 before
  * loading the id, which still fits the sixteen-byte stride, and the bridge puts
  * r11 back from the stack before it returns.
+ *
+ * ---- dyld_stub_binder ----
+ * A binary linked with classic lazy binding, which is every Intel binary built
+ * for a macOS older than 12, imports dyld_stub_binder from libSystem whether or
+ * not it ever reaches it: its __stub_helper entries jump there to bind a lazy
+ * pointer on first call.  The loader applies lazy binds eagerly, so no helper
+ * ever runs, but the import still has to bind or the whole program is refused
+ * with 71 before its first instruction.  Its name is the one symbol here with
+ * no leading underscore, because dyld defines it in assembly rather than in C.
+ * So libSystem exports it as an ordinary
+ * stub with no bridge behind it; a guest that did reach it would name it and
+ * stop, which is the honest answer to a lazy bind the loader failed to make.
  */
 #include "ocerz/vdylib.h"
 #include "ocerz/bridge.h"
@@ -174,7 +240,7 @@
 #define VD_STUB_BYTES 12u
 #define VD_SLOT_BYTES 8u
 #define VD_ULEB_WIDTH 5u
-#define VD_TERM_BYTES (1u + VD_ULEB_WIDTH)
+#define VD_ULEB_ABS_WIDTH 10u
 
 #define VD_SYMS_MAX 512
 #define VD_NODE_MAX (2 * VD_SYMS_MAX + 2)
@@ -336,6 +402,7 @@ static const char *const vd_libsystem_syms[] = {
     "_sigaddset",
     "_sigdelset",
     "_sigismember",
+    "dyld_stub_binder",
 };
 
 typedef struct VdVar {
@@ -359,20 +426,144 @@ static const VdVar vd_libsystem_vars[] = {
     { "___stack_chk_guard", 8, vd_fill_stack_guard },
 };
 
+static const char *const vd_corefoundation_syms[] = {
+    "_CFRetain",
+    "_CFRelease",
+    "_CFGetRetainCount",
+    "_CFEqual",
+    "_CFHash",
+    "_CFGetTypeID",
+    "_CFStringGetTypeID",
+    "_CFArrayGetTypeID",
+    "_CFDictionaryGetTypeID",
+    "_CFNumberGetTypeID",
+    "_CFBooleanGetTypeID",
+    "_CFDataGetTypeID",
+    "_CFCopyDescription",
+    "_CFGetAllocator",
+    "_CFStringCreateWithCString",
+    "_CFStringCreateWithBytes",
+    "_CFStringCreateCopy",
+    "_CFStringCreateMutable",
+    "_CFStringCreateMutableCopy",
+    "_CFStringAppendCString",
+    "_CFStringAppend",
+    "_CFStringGetLength",
+    "_CFStringGetCharacterAtIndex",
+    "_CFStringGetCString",
+    "_CFStringGetCStringPtr",
+    "_CFStringGetMaximumSizeForEncoding",
+    "_CFStringCompare",
+    "_CFStringHasPrefix",
+    "_CFStringHasSuffix",
+    "_CFStringGetIntValue",
+    "_CFStringGetDoubleValue",
+    "_CFStringCreateArrayBySeparatingStrings",
+    "_CFStringCreateByCombiningStrings",
+    "___CFStringMakeConstantString",
+    "_CFArrayCreate",
+    "_CFArrayCreateMutable",
+    "_CFArrayCreateCopy",
+    "_CFArrayCreateMutableCopy",
+    "_CFArrayGetCount",
+    "_CFArrayGetValueAtIndex",
+    "_CFArrayAppendValue",
+    "_CFArrayInsertValueAtIndex",
+    "_CFArraySetValueAtIndex",
+    "_CFArrayRemoveValueAtIndex",
+    "_CFArrayRemoveAllValues",
+    "_CFDictionaryCreate",
+    "_CFDictionaryCreateMutable",
+    "_CFDictionaryCreateCopy",
+    "_CFDictionaryCreateMutableCopy",
+    "_CFDictionaryGetCount",
+    "_CFDictionaryGetValue",
+    "_CFDictionaryGetValueIfPresent",
+    "_CFDictionaryContainsKey",
+    "_CFDictionaryAddValue",
+    "_CFDictionarySetValue",
+    "_CFDictionaryRemoveValue",
+    "_CFDictionaryGetKeysAndValues",
+    "_CFDictionaryApplyFunction",
+    "_CFNumberCreate",
+    "_CFNumberGetValue",
+    "_CFNumberGetType",
+    "_CFNumberCompare",
+    "_CFBooleanGetValue",
+    "_CFDataCreate",
+    "_CFDataGetLength",
+    "_CFDataGetBytePtr",
+    "_CFAbsoluteTimeGetCurrent",
+    "_CFRunLoopGetCurrent",
+    "_CFRunLoopGetMain",
+    "_CFRunLoopRun",
+    "_CFRunLoopRunInMode",
+    "_CFRunLoopStop",
+    "_CFRunLoopWakeUp",
+    "_CFRunLoopAddTimer",
+    "_CFRunLoopRemoveTimer",
+    "_CFRunLoopTimerCreate",
+    "_CFRunLoopTimerInvalidate",
+    "_CFRunLoopTimerIsValid",
+    "_CFRunLoopTimerGetNextFireDate",
+    "_CFRunLoopTimerSetNextFireDate",
+    "_CFRunLoopObserverCreate",
+    "_CFRunLoopAddObserver",
+    "_CFRunLoopRemoveObserver",
+    "_CFRunLoopObserverInvalidate",
+    "_CFRunLoopSourceCreate",
+    "_CFRunLoopAddSource",
+    "_CFRunLoopRemoveSource",
+    "_CFRunLoopSourceSignal",
+    "_CFRunLoopSourceInvalidate",
+};
+
+static const char *const vd_corefoundation_natives[] = {
+    "___CFConstantStringClassReference",
+    "_kCFAllocatorDefault",
+    "_kCFAllocatorSystemDefault",
+    "_kCFAllocatorMalloc",
+    "_kCFAllocatorNull",
+    "_kCFTypeArrayCallBacks",
+    "_kCFTypeDictionaryKeyCallBacks",
+    "_kCFTypeDictionaryValueCallBacks",
+    "_kCFCopyStringDictionaryKeyCallBacks",
+    "_kCFBooleanTrue",
+    "_kCFBooleanFalse",
+    "_kCFNull",
+    "_kCFRunLoopDefaultMode",
+    "_kCFRunLoopCommonModes",
+    "_kCFNumberPositiveInfinity",
+    "_kCFNumberNegativeInfinity",
+    "_kCFNumberNaN",
+};
+
 typedef struct VdLib {
     const char *install_name;
     const char *const *syms;
     int nsyms;
     const VdVar *vars;
     int nvars;
+    const char *const *natives;
+    int nnatives;
 } VdLib;
 
+#define VD_COUNT(a) ((int)(sizeof (a) / sizeof (a)[0]))
+
 static const VdLib g_vd_libs[] = {
-    { "/usr/lib/libSystem.B.dylib", vd_libsystem_syms,
-      (int)(sizeof vd_libsystem_syms / sizeof vd_libsystem_syms[0]),
-      vd_libsystem_vars,
-      (int)(sizeof vd_libsystem_vars / sizeof vd_libsystem_vars[0]) },
+    { OCERZ_BRIDGE_LIBSYSTEM,
+      vd_libsystem_syms, VD_COUNT(vd_libsystem_syms),
+      vd_libsystem_vars, VD_COUNT(vd_libsystem_vars),
+      NULL, 0 },
+    { OCERZ_BRIDGE_COREFOUNDATION,
+      vd_corefoundation_syms, VD_COUNT(vd_corefoundation_syms),
+      NULL, 0,
+      vd_corefoundation_natives, VD_COUNT(vd_corefoundation_natives) },
 };
+
+#define VD_LIBS_N VD_COUNT(g_vd_libs)
+
+static uint8_t g_vd_native_missed[VD_LIBS_N][VD_SYMS_MAX];
 
 typedef struct VdExport {
     const char *lib;
@@ -388,7 +579,7 @@ static const VdLib *vd_lib_for(const char *install_name)
 {
     if (!install_name)
         return NULL;
-    for (size_t i = 0; i < sizeof g_vd_libs / sizeof g_vd_libs[0]; i++)
+    for (int i = 0; i < VD_LIBS_N; i++)
         if (strcmp(g_vd_libs[i].install_name, install_name) == 0)
             return &g_vd_libs[i];
     return NULL;
@@ -413,6 +604,30 @@ static int vd_export_id(const char *lib, const char *sym)
     return g_vd_exports_n++;
 }
 
+static int vd_mint_ids(void)
+{
+    static int minted;
+    if (minted)
+        return 1;
+    for (int l = 0; l < VD_LIBS_N; l++)
+        for (int i = 0; i < g_vd_libs[l].nsyms; i++)
+            if (vd_export_id(g_vd_libs[l].install_name, g_vd_libs[l].syms[i]) < 0)
+                return 0;
+    minted = 1;
+    return 1;
+}
+
+int ocerz_vdylib_export_name(uint64_t id, const char **lib_out, const char **sym_out)
+{
+    if (id >= (uint64_t)g_vd_exports_n)
+        return 0;
+    if (lib_out)
+        *lib_out = g_vd_exports[id].lib;
+    if (sym_out)
+        *sym_out = g_vd_exports[id].sym;
+    return 1;
+}
+
 static void wr32(uint8_t *p, uint32_t v)
 {
     p[0] = (uint8_t)v;
@@ -432,16 +647,22 @@ static uint32_t vd_round_up(uint32_t v, uint32_t align)
     return (v + align - 1) & ~(align - 1);
 }
 
-static void vd_uleb_fixed(uint8_t *p, uint64_t v)
+static void vd_uleb_fixed(uint8_t *p, uint64_t v, uint32_t width)
 {
-    for (uint32_t i = 0; i + 1 < VD_ULEB_WIDTH; i++)
+    for (uint32_t i = 0; i + 1 < width; i++)
         p[i] = (uint8_t)(((v >> (7 * i)) & 0x7f) | 0x80);
-    p[VD_ULEB_WIDTH - 1] = (uint8_t)((v >> (7 * (VD_ULEB_WIDTH - 1))) & 0x7f);
+    p[width - 1] = (uint8_t)((v >> (7 * (width - 1))) & 0x7f);
+}
+
+static uint32_t vd_term_width(int absolute)
+{
+    return absolute ? VD_ULEB_ABS_WIDTH : VD_ULEB_WIDTH;
 }
 
 typedef struct VdSym {
     const char *name;
-    uint32_t addr;
+    uint64_t addr;
+    int absolute;
 } VdSym;
 
 typedef struct VdNode {
@@ -449,7 +670,8 @@ typedef struct VdNode {
     int first_child;
     int next_sibling;
     int terminal;
-    uint32_t addr;
+    int absolute;
+    uint64_t addr;
     uint32_t off;
     uint32_t size;
 } VdNode;
@@ -480,6 +702,7 @@ static int vd_node_new(VdTrie *t)
     nd->first_child = -1;
     nd->next_sibling = -1;
     nd->terminal = 0;
+    nd->absolute = 0;
     nd->addr = 0;
     nd->off = 0;
     nd->size = 0;
@@ -495,6 +718,7 @@ static int vd_trie_build(VdTrie *t, int lo, int hi, size_t depth)
     int i = lo;
     if (strlen(t->sym[lo].name) == depth) {
         t->node[me].terminal = 1;
+        t->node[me].absolute = t->sym[lo].absolute;
         t->node[me].addr = t->sym[lo].addr;
         i = lo + 1;
     }
@@ -535,7 +759,7 @@ static uint32_t vd_trie_layout(VdTrie *t)
         uint32_t sz = 1;
         int kids = 0;
         if (t->node[i].terminal)
-            sz += VD_TERM_BYTES;
+            sz += 1u + vd_term_width(t->node[i].absolute);
         sz += 1;
         for (int c = t->node[i].first_child; c >= 0; c = t->node[c].next_sibling) {
             sz += (uint32_t)strlen(t->node[c].edge) + 1 + VD_ULEB_WIDTH;
@@ -561,10 +785,11 @@ static void vd_trie_emit(const VdTrie *t, uint8_t *out)
         const VdNode *nd = &t->node[i];
         uint8_t *p = out + nd->off;
         if (nd->terminal) {
-            *p++ = (uint8_t)VD_TERM_BYTES;
-            *p++ = 0;
-            vd_uleb_fixed(p, nd->addr);
-            p += VD_ULEB_WIDTH;
+            uint32_t w = vd_term_width(nd->absolute);
+            *p++ = (uint8_t)(1u + w);
+            *p++ = nd->absolute ? EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE : 0;
+            vd_uleb_fixed(p, nd->addr, w);
+            p += w;
         } else {
             *p++ = 0;
         }
@@ -576,7 +801,7 @@ static void vd_trie_emit(const VdTrie *t, uint8_t *out)
             size_t elen = strlen(t->node[c].edge);
             memcpy(p, t->node[c].edge, elen + 1);
             p += elen + 1;
-            vd_uleb_fixed(p, t->node[c].off);
+            vd_uleb_fixed(p, t->node[c].off, VD_ULEB_WIDTH);
             p += VD_ULEB_WIDTH;
         }
     }
@@ -617,17 +842,25 @@ static void vd_write_section(uint8_t *p, const char *sect, const char *seg,
     wr32(p + 76, 0);
 }
 
-uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
+uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym host_sym,
+                                 size_t *len_out)
 {
     const VdLib *lib = vd_lib_for(install_name);
     if (!lib)
         return NULL;
+    if (!host_sym)
+        host_sym = ocerz_bridge_host_symbol;
+    if (!vd_mint_ids()) {
+        OCERZ_FATAL("virtual export table is full at %d entries\n", VD_EXPORT_MAX);
+        return NULL;
+    }
 
     int n = lib->nsyms;
     int nv = lib->nvars;
-    if (n <= 0 || nv < 0 || n > VD_SYMS_MAX - nv) {
+    int nn = lib->nnatives;
+    if (n <= 0 || nv < 0 || nn < 0 || n > VD_SYMS_MAX - nv - nn) {
         OCERZ_FATAL("virtual %s declares %d exports, the limit is %d\n",
-                    lib->install_name, n + nv, VD_SYMS_MAX);
+                    lib->install_name, n + nv + nn, VD_SYMS_MAX);
         return NULL;
     }
 
@@ -647,7 +880,7 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
 
     uint32_t *ids = calloc((size_t)n, sizeof *ids);
     uint32_t *var_addr = calloc((size_t)nv + 1, sizeof *var_addr);
-    VdSym *syms = calloc((size_t)(n + nv), sizeof *syms);
+    VdSym *syms = calloc((size_t)(n + nv + nn), sizeof *syms);
     VdNode *nodes = calloc(VD_NODE_MAX, sizeof *nodes);
     uint8_t *buf = NULL;
     if (!ids || !var_addr || !syms || !nodes) {
@@ -672,6 +905,7 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
         vars_end += vd_round_up(v->size, VD_SLOT_BYTES);
         syms[n + j].name = v->name;
         syms[n + j].addr = var_addr[j];
+        syms[n + j].absolute = 0;
     }
     uint32_t data_used = vars_end - slots_off;
     uint32_t data_size = vd_round_up(data_used, VD_PAGE);
@@ -693,10 +927,37 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
         ids[i] = (uint32_t)id;
         syms[i].name = sym;
         syms[i].addr = stubs_off + (uint32_t)i * VD_STUB_STRIDE;
+        syms[i].absolute = 0;
     }
 
-    qsort(syms, (size_t)(n + nv), sizeof *syms, vd_sym_cmp);
-    for (int i = 1; i < n + nv; i++) {
+    int m = n + nv;
+    int missed = 0;
+    for (int k = 0; k < nn; k++) {
+        const char *sym = lib->natives[k];
+        if (sym[0] != '_' || sym[1] == '\0' || strlen(sym) + 1 > VD_EDGE_MAX) {
+            OCERZ_FATAL("virtual native export %s is not an underscored name under the %d-byte "
+                        "edge limit\n", sym, VD_EDGE_MAX);
+            goto fail;
+        }
+        void *host = host_sym(lib->install_name, sym + 1);
+        if (!host) {
+            uint8_t *seen = &g_vd_native_missed[lib - g_vd_libs][k];
+            if (!*seen) {
+                *seen = 1;
+                OCERZ_LOG("vdylib: host %s has no %s, so virtual %s does not export %s\n",
+                          lib->install_name, sym + 1, lib->install_name, sym);
+            }
+            missed++;
+            continue;
+        }
+        syms[m].name = sym;
+        syms[m].addr = (uint64_t)(uintptr_t)host;
+        syms[m].absolute = 1;
+        m++;
+    }
+
+    qsort(syms, (size_t)m, sizeof *syms, vd_sym_cmp);
+    for (int i = 1; i < m; i++) {
         if (strcmp(syms[i - 1].name, syms[i].name) == 0) {
             OCERZ_FATAL("virtual %s exports %s twice\n", lib->install_name, syms[i].name);
             goto fail;
@@ -708,7 +969,7 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
     trie.n = 0;
     trie.overflow = 0;
     trie.sym = syms;
-    if (vd_trie_build(&trie, 0, n + nv, 0) != 0 || trie.overflow) {
+    if (vd_trie_build(&trie, 0, m, 0) != 0 || trie.overflow) {
         OCERZ_FATAL("virtual %s does not fit the export trie limits\n", lib->install_name);
         goto fail;
     }
@@ -792,10 +1053,11 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
         if (lib->vars[j].fill)
             lib->vars[j].fill(buf + var_addr[j], lib->vars[j].size);
 
-    OCERZ_LOG("vdylib: built %s with %d exports (%d data), %u bytes "
-              "(text %u data %u trie %u at %u)\n",
-              lib->install_name, n + nv, nv, (unsigned)total, (unsigned)text_size,
-              (unsigned)data_size, (unsigned)trie_size, (unsigned)trie_off);
+    OCERZ_LOG("vdylib: built %s with %d exports (%d data, %d native, %d native missing), "
+              "%u bytes (text %u data %u trie %u at %u)\n",
+              lib->install_name, m, nv, m - n - nv, missed, (unsigned)total,
+              (unsigned)text_size, (unsigned)data_size, (unsigned)trie_size,
+              (unsigned)trie_off);
 
     free(ids);
     free(var_addr);
@@ -812,6 +1074,11 @@ fail:
     free(nodes);
     free(buf);
     return NULL;
+}
+
+uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
+{
+    return ocerz_vdylib_image_with(install_name, ocerz_bridge_host_symbol, len_out);
 }
 
 int ocerz_vdylib_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
