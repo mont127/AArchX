@@ -52,7 +52,7 @@ make -j
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 109 / 109 |
 | native-mode gate (`-native`) | 69 / 69 |
-| native-mode unit suites: API database, image, bridge, ABI, callbacks, thread attach, Objective-C | 308 / 0, 116552 / 0, 691 / 0, 27088 / 0, 131974 / 0, 270 / 0, 123713 / 0 |
+| native-mode unit suites: API database, image, bridge, ABI, callbacks, thread attach, Objective-C | 308 / 0, 116566 / 0, 691 / 0, 28028 / 0, 131974 / 0, 270 / 0, 123713 / 0 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | 13 wins, 2 ties (table below) |
@@ -254,6 +254,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 | `OCERZ_MODE=native\|cache` | pick the mode when no flag does; this is how a spawned child inherits it, and an unrecognized value is refused rather than ignored |
 | `OCERZ_BRIDGESTAT=1` | in native mode, print how many times each bridged function was called, at exit |
 | `OCERZ_BRIDGELOG=1` | in native mode, name every bridged call as it happens |
+| `OCERZ_NO_BRIDGE_FASTCALL=1` | in native mode, have translated code reach every bridged call through the trap and the dispatcher instead of calling the bridge from inside the block |
 | `OCERZ_APIDB=dir` | in native mode, read the API database from `dir` instead of `runtime/apis` beside the ocerz executable |
 | `OCERZ_NOJIT=1` | interpret the whole process tree |
 | `OCERZ_NOJIT_EXE=<text>` | interpret processes whose command line matches |
@@ -313,9 +314,9 @@ Today native mode runs command-line programs whose calls stay inside what is bri
 
 The files are generated. `tools/sdkgen.sh <library>`, for libSystem, CoreFoundation, CoreGraphics, libobjc, Foundation and AppKit, reads the library's `.tbd` for the exact list of x86_64 exports and parses its headers with the Command Line Tools' libclang once for x86_64 and once for arm64. An export whose declaration maps onto the engine's classes on both architectures crosses; one that cannot cross correctly, because it is variadic, takes a structure by value or a `long double`, `va_list` or block, or points at a structure whose layout differs between the architectures, binds as a stub that names itself when called. `tools/sdkgen/overrides` holds what no header can say: the functions ocerz answers itself, the shapes of callback structures, and the calls a generic crossing would get wrong inside an emulator, such as `fork`, `exec`, `setjmp`, `dlopen` and `mmap`. Each run writes its coverage to `tools/sdkgen/baseline` and fails if a crossing was lost, and `tools/sdkgen/layout_check.sh` checks the generator's structure layouts against clang's own.
 
-**Calls out.** Every export is twelve bytes of real x86: a move of the export's id into `r11`, then a jump through a slot that holds one address for the whole process, inside the trap window the decoder and both engines already watch. `src/bridge.c` catches the trap. `src/abi.c` reads the arguments out of the guest's register state according to the function's signature, and `src/abicall.s` loads them into the arm64 argument registers and calls the real function. The signature matters because the two ABIs count integer and floating-point arguments in separate sequences, so one `double` in the middle of a signature moves nothing on one side and everything on the other. It also keeps widths honest: arm64 makes the caller extend a narrow argument, and a 32-bit result can come back with the upper half of the register dirty.
+**Calls out.** Every export is twelve bytes of real x86: a move of the export's id into `r11`, then a jump through a slot that holds one address for the whole process, inside the trap window the decoder and both engines already watch. `src/bridge.c` catches the trap, or, from translated code, is called directly from inside the block that jumps to it. `src/abi.c` reads the arguments out of the guest's register state according to the function's signature, and `src/abicall.s` loads them into the arm64 argument registers and calls the real function. The signature matters because the two ABIs count integer and floating-point arguments in separate sequences, so one `double` in the middle of a signature moves nothing on one side and everything on the other. It also keeps widths honest: arm64 makes the caller extend a narrow argument, and a 32-bit result can come back with the upper half of the register dirty.
 
-**Calls back.** A native function that takes a function pointer calls it, and when the guest supplied that pointer it names x86 code native code cannot jump to. So a callback argument carries its own signature, `qsort` being `v(pLLc{i(pp)})`, and the guest function is bound to one slot in a fixed, assembled bank of 4096 arm64 trampolines. Native code receives the slot's address, and the same function always gets the same address. When native code calls the slot, the guest function runs on that thread with its arguments where System V expects them. A comparator can make bridged calls of its own, and nesting goes as deep as the guest's stack allows.
+**Calls back.** A native function that takes a function pointer calls it, and when the guest supplied that pointer it names x86 code native code cannot jump to. So a callback argument carries its own signature, `qsort` being `v(pLLc{i(pp)})`, and the guest function is bound to one slot in a fixed, assembled bank of 65536 arm64 trampolines. Native code receives the slot's address, and the same function always gets the same address. When native code calls the slot, the guest function runs on that thread with its arguments where System V expects them. A comparator can make bridged calls of its own, and nesting goes as deep as the guest's stack allows.
 
 **Threads the guest never created.** A framework calls back on threads of its own: libdispatch runs work on its workers, and a run loop or an audio device has a thread of its own too. Such a thread has no x86 registers and no guest stack. The first time one calls a guest function it is given a guest personality of its own: a cpu, a guest stack and a guest thread block behind `gs`, registered like any other guest thread and reused on every later call. Because a second thread running guest code is a second observer of guest memory, that also retires plain memory mode, as starting a guest thread already does. The personality is torn down when the host thread exits. `dispatch_async_f`, `dispatch_apply_f` spreading work across several workers at once, and guest work that makes bridged calls and nested callbacks of its own all run this way.
 
@@ -352,16 +353,29 @@ ocerz: bridge: /usr/lib/libSystem.B.dylib _printf not implemented
 
 A variadic function crosses only through a veneer that knows where its named arguments stop and what the rest are. Apple's arm64 passes every variadic argument on the stack in eight-byte slots and uses no floating-point register, the opposite of its packing for an ordinary call, so a fixed signature would be wrong. The printf family, `NSLog`, CoreFoundation's format functions and Foundation's variadic methods have veneers; `open`, `fcntl`, `ioctl`, `scanf` and the rest do not yet. A structure passed or returned by value is written with its members in braces, `{LL}` for `NSRange` and `{{dd}{dd}}` for `CGRect`, and crosses as bytes gathered from wherever one ABI put it and scattered to wherever the other wants it: System V classifies a small structure eightbyte by eightbyte and returns anything over sixteen bytes through a pointer in RDI, while Apple's arm64 passes up to four floats or doubles in vector registers, any other structure over sixteen bytes as a pointer to a copy, and returns the largest through x8.
 
-**What a crossing costs.** About 33 ns, measured as the difference between a guest loop calling `getpid` three million times and the same loop without the call. It is a cliff rather than a constant factor, and it shows up where calls are small and frequent:
+**What a crossing costs.** A `getpid` crossing costs about 13 ns and a short `strlen` about 17 ns on an Apple M5, measured as a guest loop making ten million calls and timing itself, against 0.3 ns per iteration for the same loop with no call. An Objective-C send, `-[NSString length]`, costs about 28 ns. The arm64 builds of the same loops take 0.7, 0.9 and 3.6 ns.
 
-| kernel | native vs cache | why |
-| --- | --- | --- |
-| `str` | 12.3x | `strlen` on short strings, one crossing per call |
-| `memcpy` | 1.59x | copies large enough to amortize the crossing |
-| `hash` | 1.00x | no bridged calls |
-| `depchain` | 1.02x | no bridged calls |
+| guest loop, ns per iteration | trap path (`OCERZ_NO_BRIDGE_FASTCALL=1`) | default | arm64 build |
+| --- | --- | --- | --- |
+| `getpid` | 37.5 | 13.5 | 0.7 |
+| `strlen` of a 12-byte string | 39.4 | 16.7 | 0.9 |
+| `-[NSString length]` | 51.3 | 28.3 | 3.6 |
+| `qsort` comparator, per call back into guest code | 426 | 430 | 3.1 |
 
-Guest code that never crosses pays nothing, which is why the last two rows are at parity. Closing the gap on the first two is a JIT change: recognizing a call to a known stub and spilling only the registers its signature names, instead of leaving the block and re-entering through the dispatcher.
+Translated code does not take the trap. When the JIT translates a stub it calls the bridge from inside the block and then returns to the caller with a real `ret`, so the host return predictor stays in step with the guest's calls, where the trap path left the block, reached the bridge through the run loop and came back through the dispatcher. Only the xmm registers an export's signature reads or writes are spilled around the call, because System V leaves every xmm register volatile across a call; `__tlv_bootstrap` and `___chkstk_darwin`, whose callers rely on every register surviving, spill all sixteen. A signature whose arguments all fit in registers crosses without building a stack block, and FPCR is written only when the guest's rounding mode is not already the default. A crossing that delivers a signal, retires translated code or has to stop the thread goes back through the dispatcher.
+
+A call back into guest code is the expensive direction: about 430 ns, most of it three system calls that save and clear the signal mask and the alternate-stack state for the callback's fault recovery point, and a copy of the 6 KB cpu.
+
+Against cache mode, the cost shows only in code that crosses in a tight loop. Each ratio is the paired delta over the kernel at its default size and at half of it, on an Apple M5:
+
+| kernel | native vs cache | trap path vs cache | why |
+| --- | --- | --- | --- |
+| `str` | 5.05x | 12.1x | `strlen` on short strings, one crossing per call |
+| `memcpy` | 0.97x | 1.67x | copies large enough to amortize the crossing |
+| `hash` | 0.99x | 0.99x | no bridged calls |
+| `depchain` | 1.01x | 1.00x | no bridged calls |
+
+Guest code that never crosses pays nothing, which is why the last two rows are at parity.
 
 The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once, and a spawned child inherits it through `OCERZ_MODE`. `tests/run_native_tests.sh` pins all of this end to end. `tests/unit/test_apidb.c`, `test_vdylib.c`, `test_bridge.c`, `test_abi.c` and `test_callback.c` pin the database format and its refusals, the synthesized image, the crossings built from the database, argument placement across the signature space, and the trampoline bank.
 
