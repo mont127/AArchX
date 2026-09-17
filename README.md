@@ -44,14 +44,14 @@ make -j
 | x86-64 decode | 246 / 246 cases |
 | i386 decode | 102 cases, 26 rejects, 122 address cases |
 | extension / SSE suites | 237 / 0, 246 / 0, SSE4.2 differential against Rosetta |
-| loader / syscall suites | 54 / 0, 326 / 0 |
+| loader / syscall suites | 54 / 0, 341 / 0 |
 | memory / shared mappings | 2692 / 0, 105 / 0 |
 | i386 interpreter / JIT / WoW64 | passing |
 | x86-64 guest gate | 116 / 116 |
 | x86-64 differential gate (interpreter vs JIT) | 96 / 96 |
 | i386 differential gate | 20,033 / 20,033 |
 | dynamic-mode tests | 109 / 109 |
-| native-mode gate (`-native`) | 47 / 47 |
+| native-mode gate (`-native`) | 56 / 56 |
 | native-mode unit suites: image, bridge, ABI, callbacks, thread attach | 533 / 0, 210 / 0, 1955 / 0, 8351 / 0, 270 / 0 |
 | real macOS apps opening their main window | 9 (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
@@ -302,7 +302,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 
 Apple ends general-purpose Rosetta after macOS 27, and with it the `dyld_shared_cache_x86_64` that every guest binds against by default. Native mode is the answer to that. The guest keeps its x86_64 Darwin personality, but its system libraries are synthesized x86 images whose exports lead into the host's own arm64 code, so a call into libSystem runs the real native implementation instead of translated Intel code. It is selected with `-native` or `OCERZ_MODE=native`, and cache mode stays the default.
 
-Today native mode runs command-line programs whose system calls stay inside what is bridged: the common C string and memory functions and their fortified `_chk` forms, the heap, `read`, `write` and `close`, string-to-number conversion, `qsort` and `bsearch`, POSIX threads with their mutexes and condition variables, thread-local variables, and libdispatch's function-pointer entry points, including its semaphores. A program compiled normally, with optimization and clang's default stack protector, binds and runs. Nothing from Foundation or AppKit is available yet. Every kernel of `xbench_dyn` produces byte-identical output in native mode and cache mode, under both the JIT and the interpreter.
+Today native mode runs command-line programs whose system calls stay inside what is bridged: the common C string and memory functions and their fortified `_chk` forms, the heap, `read`, `write` and `close`, string-to-number conversion, `qsort` and `bsearch`, POSIX threads with their mutexes and condition variables, thread-local variables, libdispatch's function-pointer entry points, including its semaphores, and signal handlers with their masks and alternate stacks. A program compiled normally, with optimization and clang's default stack protector, binds and runs. Nothing from Foundation or AppKit is available yet. Every kernel of `xbench_dyn` produces byte-identical output in native mode and cache mode, under both the JIT and the interpreter.
 
 **System libraries without files.** A guest that links `/usr/lib/libSystem.B.dylib` finds nothing behind it, because on a current macOS that library exists only inside the cache. So ocerz builds one. `src/vdylib.c` assembles a real x86_64 Mach-O in memory, with load commands, `__TEXT`, `__DATA` and an export trie, and the loader takes it as an ordinary image. Nothing in the loader reopens a file, so import resolution, `dlopen` and `dladdr` work on it unchanged. No cache is mapped, the dyld API shim is not installed, and the host workqueue bridge stays off, because the host's own libdispatch needs the process's single workqueue slot.
 
@@ -315,6 +315,8 @@ Today native mode runs command-line programs whose system calls stay inside what
 **Guest threads.** `pthread_create`'s start routine is exactly such a callback, so guest threads need nothing further: the native `pthread_create` starts a host thread, that thread is given a guest personality on its way into the start routine, and the result comes back through `pthread_join`. Mutexes and condition variables are forwarded unchanged. That is sound because `pthread_mutex_t`, `pthread_cond_t` and the other pthread types have the same size, alignment and initializer values on x86_64 and arm64, so a mutex a guest initialized statically is already a valid native one.
 
 **Thread-local variables.** A `__thread` variable is reached through a descriptor whose first word is a thunk the compiler calls with the descriptor in RDI, expecting the variable's address back in RAX. In cache mode that thunk is dyld's own x86 code from the shared cache. In native mode the synthesized libSystem exports `__tlv_bootstrap` and ocerz answers it: each image's descriptors are rewritten at load time with an ocerz key per image, and each thread keeps a table of its per-image blocks in its guest thread block, filled from the image's template on first touch and freed when the thread goes away. The thunk's convention preserves every register except RAX, and compilers rely on that, so its stub, unlike every other, saves `r11` across the trap.
+
+**Signals.** A signal handler is x86 code, so a native `sigaction` cannot be handed one. `sigaction`, `signal`, `sigprocmask`, `pthread_sigmask`, `sigaltstack`, `raise`, `kill` and `pthread_kill` are answered by ocerz itself, against the same handler table, masks and alternate stacks the syscalls change in cache mode, and a handler is entered through a small x86 trampoline ocerz writes into guest memory in place of the `_sigtramp` an x86 libc would supply. A handler runs on the state after the call that raised it, so `raise` returns with its handler already run, and a signal unblocked by `sigprocmask` is delivered before that call returns. A signal from outside, or from another thread, is delivered when the receiving thread's next bridged call returns, the way cache mode delivers one at the next syscall; a thread spinning in its own code without calls does not see it in either mode.
 
 **Data exports.** Not every import is a function. A stack-protected program reads `___stack_chk_guard` in every function prologue, so the synthesized libSystem exports it as a data slot the export trie points at directly, holding a random canary drawn when the image is built. `_environ`, `___progname`, `__DefaultRuneLocale`, `___stdoutp` and `___stderrp` are data symbols too and are left out on purpose: each is tied to native state a constant would get wrong, and an import that fails to bind says so where a wrong value would not.
 
@@ -372,7 +374,8 @@ The mode is process-wide and fixed before the VM starts, because the JIT materia
 - MMX instructions always run in the interpreter, and the MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry them.
 - The approximate `RCP`/`RSQRT` results are not implemented. (SSE rounding modes are: the guest's MXCSR rounding control drives the host FP rounding.)
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
-- Native mode runs only programs whose system calls stay inside the bridged part of libSystem and libdispatch. Nothing above that is available there yet, Foundation and AppKit included; variadic functions such as `printf` and `open` are not bridged; a signal handler does not work there yet; `dlopen` is not available there; a C++ program fails to bind, because no x86 `libc++` is synthesized; and a program reading `environ`, `stdout` or the ctype tables directly fails to bind.
+- An asynchronous signal reaches a guest thread only when that thread next makes a syscall, or in native mode a bridged call, so a thread spinning in its own code never sees one. A signal aimed at another thread reaches its guest handler only for the signals ocerz mirrors onto the host, such as `SIGUSR1`, `SIGTERM` and `SIGALRM`, not for fault signals such as `SIGSEGV`.
+- Native mode runs only programs whose system calls stay inside the bridged part of libSystem and libdispatch. Nothing above that is available there yet, Foundation and AppKit included; variadic functions such as `printf` and `open` are not bridged; `dlopen` is not available there; a C++ program fails to bind, because no x86 `libc++` is synthesized; and a program reading `environ`, `stdout` or the ctype tables directly fails to bind.
 
 ## License
 
