@@ -59,6 +59,18 @@
  * image is built and checked against addresses the host does not have.
  * ocerz_vdylib_export_name turns an export id back into the library and symbol
  * it was minted for, the same pair the dispatcher hands the bridge.
+ *
+ * Translated code need not trap at all.  The JIT recognizes a block ending in
+ * a stub's two instructions and calls ocerz_vdylib_fastcall from inside the
+ * block instead (src/jit.c), with every guest register already in the cpu.  It
+ * performs the crossing ocerz_vdylib_dispatch performs, with rip set to the
+ * trap address first so that anything reading the cpu mid-crossing sees what
+ * the trap path shows it, and answers zero when the crossing returned the way a
+ * function returns, so translated code may run the ret itself, or the step
+ * code plus one when the dispatcher has to take over.
+ * ocerz_vdylib_xmm_contract tells the translator which xmm registers an
+ * export's crossing reads and which it writes, or answers zero when the export
+ * promises every register back or has no signature to go by.
  */
 #ifndef OCERZ_VDYLIB_H
 #define OCERZ_VDYLIB_H
@@ -78,5 +90,7 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
                                  size_t *len_out);
 int ocerz_vdylib_export_name(uint64_t id, const char **lib_out, const char **sym_out);
 int ocerz_vdylib_dispatch(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_vdylib_fastcall(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_vdylib_xmm_contract(uint64_t id, uint16_t *in, uint16_t *out);
 
 #endif

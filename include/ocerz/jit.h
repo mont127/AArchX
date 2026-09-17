@@ -1,5 +1,12 @@
 /*
  * The JIT tier: basic blocks of guest x86_64 translated to native arm64.
+ *
+ * ocerz_jit_retire_count goes up every time an invalidation retires
+ * translations, whether a range was hit or everything was, before any code is
+ * patched.  A caller that runs code which may invalidate, a bridged call from
+ * inside a block above all, reads it before and after, and an unchanged count
+ * means the translated continuation it is about to return to is still the
+ * translation of the bytes that are there.
  */
 #ifndef OCERZ_JIT_H
 #define OCERZ_JIT_H
@@ -38,6 +45,11 @@ void ocerz_jit_request_stop(struct OcerzVM *vm);
 void ocerz_jit_require_ordered(struct OcerzVM *vm);
 void ocerz_jit_invalidate_all(struct OcerzVM *vm);
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len);
+extern uint64_t ocerz_jit_retire_count;
+static inline uint64_t ocerz_jit_retire_epoch(void)
+{
+    return __atomic_load_n(&ocerz_jit_retire_count, __ATOMIC_ACQUIRE);
+}
 void ocerz_jit_forget(struct OcerzVM *vm);
 
 int ocerz_jit_code_range(struct OcerzVM *vm, const uint32_t **lo, const uint32_t **hi);

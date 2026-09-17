@@ -98,6 +98,27 @@
  * it was running in either way.  A bridged fesetround, whose whole purpose is
  * to change the mode, would need its own handling and does not have it.
  *
+ * The mode is read from FPCR directly and written back only when its rounding
+ * bits are not already the ones wanted, before the call and again after it.
+ * Reading FPCR costs nothing measurable; writing it cost about four
+ * nanoseconds, and fegetround with two fesetround calls around every crossing
+ * came to about ten, a fifth of a crossing, for a mode that is almost always
+ * already round-to-nearest.  A callback into guest code swaps the guest's mode
+ * in and the host's back out the same way.
+ *
+ * ---- a crossing of registers only ----
+ * A signature of scalars that fit System V's argument registers fits Apple's
+ * too, since arm64 has two more integer registers and as many floating-point
+ * ones, and nothing about it touches either stack.  ocerz_abi_perform_registers
+ * makes that crossing with eight words for each register bank and nothing else:
+ * no OcerzAbiCall, which at over five kilobytes costs a stack probe on every
+ * call, no zeroing of it, and no class checks, which the signature passed when
+ * it was parsed.  Every narrowing, pointer conversion and result rule is the
+ * general path's, through the same abi_narrow and the same result writer.
+ * ocerz_abi_perform chooses between the two paths on every call and the bridge
+ * chooses once per descriptor; the general path lives in its own function so
+ * that its frame is not paid for by the register path.
+ *
  * ---- results and return codes ----
  * A result goes back where x86 looks for it: rax for the integer and pointer
  * classes, the low bits of xmm0 for f and d, with xmm0's upper bits cleared so
@@ -243,7 +264,6 @@
 #include "ocerz/vm.h"
 
 #include <dlfcn.h>
-#include <fenv.h>
 #include <pthread.h>
 #include <stdlib.h>
 
@@ -261,11 +281,15 @@ static const uint8_t abi_guest_int_reg[ABI_GUEST_INT_REGS] = {
     OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9,
 };
 
-static const char abi_scalar_classes[] = "bBhHiulLpfd";
-
 static int abi_is_scalar_class(char c)
 {
-    return c != '\0' && strchr(abi_scalar_classes, c) != NULL;
+    switch (c) {
+    case 'b': case 'B': case 'h': case 'H': case 'i': case 'u':
+    case 'l': case 'L': case 'p': case 'f': case 'd':
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 static int abi_is_arg_class(char c)
@@ -956,31 +980,25 @@ static void abi_guest_struct_result(const OcerzAbiStruct *st, OcerzCPU *cpu, con
     }
 }
 
-void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, const OcerzAbiCall *call)
+static inline __attribute__((always_inline)) void abi_write_scalar_result(char ret, OcerzCPU *cpu, uint64_t rx0, uint64_t rv0)
 {
-    if (!sig || !cpu || !call)
-        return;
-
-    switch (sig->ret) {
-    case '{':
-        abi_guest_struct_result(&sig->ret_struct, cpu, call);
-        break;
+    switch (ret) {
     case 'v':
         cpu->gpr[OCERZ_RAX] = 0;
         break;
     case 'p':
-        cpu->gpr[OCERZ_RAX] = call->rx[0] ? ocerz_h2g((const void *)(uintptr_t)call->rx[0]) : 0;
+        cpu->gpr[OCERZ_RAX] = rx0 ? ocerz_h2g((const void *)(uintptr_t)rx0) : 0;
         break;
     case 'f':
-        cpu->xmm[0].lo = (uint64_t)(uint32_t)call->rv[0];
+        cpu->xmm[0].lo = (uint64_t)(uint32_t)rv0;
         cpu->xmm[0].hi = 0;
         break;
     case 'd':
-        cpu->xmm[0].lo = call->rv[0];
+        cpu->xmm[0].lo = rv0;
         cpu->xmm[0].hi = 0;
         break;
     default:
-        cpu->gpr[OCERZ_RAX] = abi_narrow(sig->ret, call->rx[0]);
+        cpu->gpr[OCERZ_RAX] = abi_narrow(ret, rx0);
         break;
     }
 
@@ -989,26 +1007,111 @@ void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, const OcerzAb
     cpu->gpr[OCERZ_RSP] = rsp + 8;
 }
 
+void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, const OcerzAbiCall *call)
+{
+    if (!sig || !cpu || !call)
+        return;
+
+    if (sig->ret != '{') {
+        abi_write_scalar_result(sig->ret, cpu, call->rx[0], call->rv[0]);
+        return;
+    }
+    abi_guest_struct_result(&sig->ret_struct, cpu, call);
+
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    cpu->rip = ocerz_ld(rsp, 8);
+    cpu->gpr[OCERZ_RSP] = rsp + 8;
+}
+
+int ocerz_abi_register_only(const OcerzAbiSig *sig)
+{
+    if (!sig || sig->nargs < 0 || sig->nargs > OCERZ_ABI_MAX_ARGS)
+        return 0;
+    if (sig->ret != 'v' && !abi_is_scalar_class(sig->ret))
+        return 0;
+    int ni = 0, nf = 0;
+    for (int i = 0; i < sig->nargs; i++) {
+        char c = sig->arg[i];
+        if (!abi_is_scalar_class(c))
+            return 0;
+        if (abi_is_fp(c) ? ++nf > ABI_GUEST_FP_REGS : ++ni > ABI_GUEST_INT_REGS)
+            return 0;
+    }
+    return 1;
+}
+
+void ocerz_abi_xmm_contract(const OcerzAbiSig *sig, uint16_t *in, uint16_t *out)
+{
+    uint16_t read = 0, written = 0;
+    int nf = 0;
+    for (int i = 0; sig && i < sig->nargs && i < OCERZ_ABI_MAX_ARGS; i++) {
+        char c = sig->arg[i];
+        if (c == '{') {
+            read = (1u << ABI_GUEST_FP_REGS) - 1;
+            nf = ABI_GUEST_FP_REGS;
+        } else if (abi_is_fp(c) && nf < ABI_GUEST_FP_REGS) {
+            read |= (uint16_t)(1u << nf++);
+        }
+    }
+    if (sig && (sig->ret == 'f' || sig->ret == 'd'))
+        written = 1;
+    else if (sig && sig->ret == '{')
+        written = 3;
+    *in = read;
+    *out = written;
+}
+
+__attribute__((no_stack_protector))
+int ocerz_abi_perform_registers(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu)
+{
+    uint64_t x[ABI_HOST_INT_REGS] = { 0 };
+    uint64_t v[ABI_HOST_FP_REGS] = { 0 };
+    uint64_t rx[2], rv[4];
+    int gi = 0, gf = 0, nx = 0, nv = 0;
+
+    for (int i = 0; i < sig->nargs; i++) {
+        char c = sig->arg[i];
+        if (abi_is_fp(c)) {
+            v[nv++] = abi_narrow(c, cpu->xmm[gf++].lo);
+        } else {
+            uint64_t raw = cpu->gpr[abi_guest_int_reg[gi++]];
+            x[nx++] = c == 'p' ? (raw ? (uint64_t)(uintptr_t)ocerz_g2h(raw) : 0) : abi_narrow(c, raw);
+        }
+    }
+
+    uint64_t fpcr = ocerz_abi_round_swap(OCERZ_ABI_ROUND_NEAREST);
+    ocerz_abi_call_native(fn, x, v, NULL, 0, NULL, rx, rv);
+    ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
+
+    abi_write_scalar_result(sig->ret, cpu, rx[0], rv[0]);
+    return OCERZ_STEP_OK;
+}
+
+__attribute__((noinline))
+static int abi_perform_general(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu)
+{
+    OcerzAbiCall call;
+    if (ocerz_abi_read_guest(sig, cpu, &call) != OCERZ_OK)
+        return OCERZ_STEP_FATAL;
+
+    uint64_t fpcr = ocerz_abi_round_swap(OCERZ_ABI_ROUND_NEAREST);
+    ocerz_abi_call_native(fn, call.x, call.v, call.stack, (uint64_t)call.nstack * 8, call.x8,
+                          call.rx, call.rv);
+    ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
+
+    ocerz_abi_write_result(sig, cpu, &call);
+    return OCERZ_STEP_OK;
+}
+
 int ocerz_abi_perform(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu)
 {
     if (!sig || !fn || !cpu) {
         OCERZ_FATAL("abi: a crossing with no signature, no address or no cpu\n");
         return OCERZ_STEP_FATAL;
     }
-
-    OcerzAbiCall call;
-    if (ocerz_abi_read_guest(sig, cpu, &call) != OCERZ_OK)
-        return OCERZ_STEP_FATAL;
-
-    int guest_round = fegetround();
-
-    fesetround(FE_TONEAREST);
-    ocerz_abi_call_native(fn, call.x, call.v, call.stack, (uint64_t)call.nstack * 8, call.x8,
-                          call.rx, call.rv);
-    fesetround(guest_round);
-
-    ocerz_abi_write_result(sig, cpu, &call);
-    return OCERZ_STEP_OK;
+    if (ocerz_abi_register_only(sig))
+        return ocerz_abi_perform_registers(sig, fn, cpu);
+    return abi_perform_general(sig, fn, cpu);
 }
 
 typedef struct AbiShape {
@@ -1430,10 +1533,9 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
 
     struct OcerzBridgeFrame saved;
     ocerz_bridge_guest_enter(&saved);
-    int host_round = fegetround();
-    ocerz_apply_mxcsr_round(cpu->mxcsr);
+    uint64_t fpcr = ocerz_abi_round_swap(ocerz_abi_round_of_mxcsr(cpu->mxcsr));
     int rc = ocerz_vm_call_abi(vm, e->guest_fn, &call, stack_top);
-    fesetround(host_round);
+    ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
     ocerz_bridge_guest_leave(&saved);
 
     if (rc != OCERZ_OK || vm->exited)

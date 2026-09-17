@@ -138,6 +138,47 @@
  * become register renames - the loop-carried store-to-load chain of call-dense
  * code.
  *
+ * ---- bridged calls ----
+ * In native mode a guest call into a system library lands on a synthesized
+ * stub, `mov r11d, <export id>` then `jmp qword [rip + slot]`, whose slot holds
+ * the one trap address every export shares (vdylib.h).  Taken as an ordinary
+ * indirect jump, that address has no translation: the block leaves, the run
+ * loop finds the rip in the trap window, the interpreter's trap check hands it
+ * to the bridge, and the return address comes back in through the dispatcher
+ * with the host shadow stack abandoned, so the caller's own ret leaves once
+ * more.  When a block ends in that pair and the slot holds the trap address as
+ * the block is translated, the jump becomes a call to ocerz_vdylib_fastcall made
+ * from inside the block, followed by the ret the export's own code would have
+ * ended with.
+ *
+ * The emitted code loads the slot again and compares it with the trap address,
+ * so a guest that rewrote its slot takes the plain indirect jump emitted right
+ * after.  It also measures the host stack below the frame base and takes the
+ * plain jump past 64 KB, because the native call now runs underneath the shadow
+ * of every guest call still open, where the trap path ran it from the top of
+ * the run loop.  Then every guest register is spilled, the helper performs the
+ * crossing the trap would have performed, the registers are filled again, and a
+ * zero answer runs the ret: the shadow's return address is compared with the
+ * rip the crossing left, and a match returns into the caller's continuation
+ * with a real ret, which keeps the return predictor aligned.  Any other answer
+ * is the step code plus one and leaves through the epilogue.  The helper
+ * answers zero only when the crossing returned the way a function does - rip
+ * equal to the word just popped, rsp eight or sixteen higher - with no exit,
+ * interrupt, suspension or interp_once pending and no translation retired
+ * while it ran, since a retired continuation may be translated from bytes the
+ * crossing just rewrote.  A delivered signal fails the first test.
+ *
+ * XMM registers are spilled by contract rather than wholesale.  System V makes
+ * every xmm register volatile across a call, so for an ordinary export only the
+ * argument registers its signature reads are stored first and only the result
+ * registers are loaded afterwards; the rest keep whatever the host left in
+ * their pinned registers, which an x86 callee was equally free to leave.
+ * __tlv_bootstrap and ___chkstk_darwin promise every register back, and so
+ * does an export whose record gives no usable signature, and those store and
+ * load all sixteen.  A crossing that leaves loads all sixteen from the cpu,
+ * where a signal frame may have replaced them.  OCERZ_NO_BRIDGE_FASTCALL=1
+ * keeps the trap path everywhere.
+ *
  * ---- invalidation ----
  * Every guest mmap/mprotect/munmap asks the JIT to drop code in a range.  A
  * global min/max cannot answer that under Wine, where the live set spans PE
@@ -190,6 +231,8 @@
 #include "ocerz/a64emit.h"
 #include "ocerz/dyldapi.h"
 #include "ocerz/cache.h"
+#include "ocerz/mode.h"
+#include "ocerz/vdylib.h"
 
 #include <sys/mman.h>
 #include <mach/thread_act.h>
@@ -12525,6 +12568,113 @@ static int emit_indirect_jmp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
     return 1;
 }
 
+#define BRIDGE_FAST_DEPTH_MAX_K 16
+
+static int bridge_fastcall_enabled(void)
+{
+    static int en = -1;
+    if (en < 0)
+        en = ocerz_mode == OCERZ_MODE_NATIVE && !getenv("OCERZ_NO_BRIDGE_FASTCALL");
+    return en;
+}
+
+static void emit_bridge_fastcall(A64Buf *b, const X86Insn *insns, int i,
+                                 uint32_t **epi_sites, int *n_epi)
+{
+    const X86Insn *insn = &insns[i];
+    if (!bridge_fastcall_enabled() || g_xlat_mode32 || i < 1)
+        return;
+    if (insn->op != OCERZ_OP_JMP || insn->nops != 1 || insn->seg != OCERZ_SEG_NONE)
+        return;
+    const X86Operand *o = &insn->ops[0];
+    if (o->kind != OCERZ_OPK_MEM || !o->riprel || o->size != 8)
+        return;
+    const X86Insn *mv = &insns[i - 1];
+    if (mv->op != OCERZ_OP_MOV || mv->nops != 2 || mv->seg != OCERZ_SEG_NONE ||
+        mv->ops[0].kind != OCERZ_OPK_REG || mv->ops[0].reg != OCERZ_R11 ||
+        mv->ops[0].size != 4 || mv->ops[0].high8 || mv->ops[1].kind != OCERZ_OPK_IMM)
+        return;
+    const uint64_t trap = OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF;
+    uint64_t slot = (uint64_t)o->disp;
+    if (!ocerz_addr_readable(slot) || !ocerz_addr_readable(slot + 7) || ocerz_ld(slot, 8) != trap)
+        return;
+    uint64_t id = (uint32_t)mv->ops[1].imm;
+    if (!ocerz_vdylib_export_name(id, NULL, NULL))
+        return;
+    uint16_t xin = 0xffff, xout = 0xffff;
+    if (!xmm_global_enabled() || !ocerz_vdylib_xmm_contract(id, &xin, &xout))
+        xin = xout = 0xffff;
+    static int no_blret = -1;
+    if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
+    int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
+                jgb_usable() && !stack_guard_needed();
+    if (!fast3 || !ras_body_only() || !host_ras_enabled() || no_blret)
+        return;
+
+    l0_flush_all(b);
+    a64_mov_imm64(b, JT1, slot + ocerz_guest_base);
+    a64_ldr(b, 8, JT1, JT1, 0);
+    a64_mov_imm64(b, JT2, trap);
+    a64_subs_reg(b, 1, A64_ZR, JT1, JT2, 0);
+    uint32_t *to_plain = a64_label(b); a64_bcond(b, A64_NE, 0);
+    a64_ldr(b, 8, JT0, 20, JIT_FP_OFF);
+    a64_add_imm(b, 1, JTT, 31, 0);
+    a64_sub_reg(b, 1, JT0, JT0, JTT, 0);
+    a64_subs_imm_sh12(b, 1, A64_ZR, JT0, BRIDGE_FAST_DEPTH_MAX_K);
+    uint32_t *to_deep = a64_label(b); a64_bcond(b, A64_HI, 0);
+
+    g_ymmh_zero = 0;
+    for (unsigned r = 0; r < 16; r++)
+        if (xmm_is_pinned(r) && (xin >> r & 1))
+            a64_str_v(b, 16, xmm_vreg(r), 20, XMM_BASE_OFF + r * 16);
+    emit_spill_pinned(b);
+    a64_mov_reg(b, 1, 0, 19);
+    a64_mov_reg(b, 1, 1, 20);
+    a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_vdylib_fastcall);
+    a64_blr(b, 16);
+    g_callout_seq++;
+    a64_mov_reg(b, 0, JT0, 0);
+    emit_fill_pinned(b);
+    uint32_t *to_leave = a64_label(b); a64_cbnz(b, 0, JT0, 0);
+    for (unsigned r = 0; r < 16; r++)
+        if (xmm_is_pinned(r) && (xout >> r & 1))
+            a64_ldr_v(b, 16, xmm_vreg(r), 20, XMM_BASE_OFF + r * 16);
+    emit_pk_consts_load(b);
+    yc_reload_all(b);
+    emit_reload_jgb(b);
+    emit_reload_mem_base(b);
+
+    a64_ldr(b, 8, JT1, 20, RIP_OFF);
+    a64_ldp_post(b, JTF, 30, 31, 16);
+    a64_subs_reg(b, 1, A64_ZR, JTF, JT1, 0);
+    uint32_t *miss_ne = a64_label(b); a64_bcond(b, A64_NE, 0);
+    uint32_t *miss_z = a64_label(b); a64_cbz(b, 1, 30, 0);
+    if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
+    a64_ret(b);
+
+    uint32_t *miss = a64_label(b);
+    a64_patch_bcond(miss_ne, miss);
+    a64_patch_cbz(miss_z, miss);
+    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+    epi_sites[*n_epi] = a64_label(b);
+    a64_b(b, 0);
+    (*n_epi)++;
+
+    a64_patch_cbz(to_leave, a64_label(b));
+    emit_xmm_pin_load_all(b);
+    yc_reload_all(b);
+    emit_reload_jgb(b);
+    emit_reload_mem_base(b);
+    a64_sub_imm(b, 0, 0, JT0, 1);
+    epi_sites[*n_epi] = a64_label(b);
+    a64_b(b, 0);
+    (*n_epi)++;
+
+    uint32_t *plain = a64_label(b);
+    a64_patch_bcond(to_plain, plain);
+    a64_patch_bcond(to_deep, plain);
+}
+
 static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                               int *n_exits, uint32_t **epi_sites, int *n_epi)
 {
@@ -14694,6 +14844,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
 
         if (i == n - 1 && insn->op == OCERZ_OP_JMP) {
+            emit_bridge_fastcall(&b, blk->insns, i, epi_sites, &n_epi);
             if (emit_jmp(&b, insn, epi_sites, &n_epi) ||
                 emit_indirect_jmp(&b, insn, exit_sites, &n_exits, epi_sites, &n_epi)) {
                 blk->n_inlined++;
@@ -15977,9 +16128,12 @@ static int force_stop_sites_writable(OcerzJit *jit)
     return patched;
 }
 
+uint64_t ocerz_jit_retire_count;
+
 static void invalidate_all_locked(OcerzJit *jit)
 {
     int patched = 0;
+    __atomic_add_fetch(&ocerz_jit_retire_count, 1, __ATOMIC_RELEASE);
 
     pthread_jit_write_protect_np(0);
     patched |= force_stop_sites_writable(jit);
@@ -16251,6 +16405,7 @@ static int hit_code_cmp(const void *pa, const void *pb)
 
 static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hits)
 {
+    __atomic_add_fetch(&ocerz_jit_retire_count, 1, __ATOMIC_RELEASE);
     invsrc_note(0, 1);
     int any_code = 0;
     for (size_t m = 0; m < n_hits; m++)

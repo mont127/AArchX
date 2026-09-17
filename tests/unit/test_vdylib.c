@@ -84,6 +84,13 @@
  * CoreFoundation and no CoreFoundation name resolves in libSystem, and names a
  * character shorter or longer than CoreFoundation's own reach nothing.
  *
+ * ocerz_vdylib_xmm_contract is asserted for libSystem exports of each kind the
+ * JIT treats differently: __tlv_bootstrap and ___chkstk_darwin have no contract,
+ * since their callers keep every register, strlen reads and writes no xmm
+ * register, strtod writes xmm0, printf's special reads all eight argument
+ * registers and writes two, scanf's stub record has no contract, and neither has
+ * an id no library minted.
+ *
  * Every data record has to resolve to exactly what dlsym answers for its host
  * symbol in a CoreFoundation this process dlopens itself, and to the same value
  * at two different load bases: a terminal written without the absolute flag
@@ -1013,6 +1020,42 @@ static int db_ordinal(const OcerzApiLibrary *api)
     return found ? before : -1;
 }
 
+static void check_xmm_contracts(void)
+{
+    static const struct {
+        const char *sym;
+        int known;
+        uint16_t in, out;
+    } kWant[] = {
+        { "__tlv_bootstrap", 0, 0, 0 },
+        { "___chkstk_darwin", 0, 0, 0 },
+        { "_strlen", 1, 0x00, 0x0 },
+        { "_strtod", 1, 0x00, 0x1 },
+        { "_printf", 1, 0xff, 0x3 },
+        { "_scanf", 0, 0, 0 },
+    };
+    const OcerzApiLibrary *api = ocerz_apidb_library(kLib);
+    int ord = api ? db_ordinal(api) : -1;
+    CHECK(api != NULL && ord >= 0, "xmm contracts: the database has no numbered file for %s", kLib);
+    if (!api || ord < 0)
+        return;
+    for (size_t i = 0; i < sizeof kWant / sizeof kWant[0]; i++) {
+        const OcerzApiEntry *e = ocerz_apidb_find(api, kWant[i].sym);
+        CHECK(e != NULL, "xmm contracts: %s has no record", kWant[i].sym);
+        if (!e)
+            continue;
+        uint64_t id = ((uint64_t)ord << 20) | (uint64_t)(e - api->entries);
+        uint16_t in = 0xeeee, out = 0xeeee;
+        int known = ocerz_vdylib_xmm_contract(id, &in, &out);
+        CHECK(known == kWant[i].known && (!known || (in == kWant[i].in && out == kWant[i].out)),
+              "xmm contracts: %s answers %d with read %#x written %#x, want %d with read %#x written %#x",
+              kWant[i].sym, known, in, out, kWant[i].known, kWant[i].in, kWant[i].out);
+    }
+    uint16_t in = 0, out = 0;
+    CHECK(ocerz_vdylib_xmm_contract(((uint64_t)0xfff << 20) | 7, &in, &out) == 0,
+          "xmm contracts: an id no library minted has a contract");
+}
+
 static void check_database_stubs(const char *what, const uint8_t *img, size_t len,
                                  const Layout *ly, const char *lib)
 {
@@ -1657,6 +1700,7 @@ int main(void)
     uint8_t *late = libsystem_built_after_corefoundation(&late_len);
 
     check_libsystem();
+    check_xmm_contracts();
     check_libsystem_database();
     check_corefoundation();
 

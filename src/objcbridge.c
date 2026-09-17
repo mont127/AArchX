@@ -224,7 +224,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fenv.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -1175,8 +1174,9 @@ static int ob_gather_format(const char *what, const char *text, int dialect, con
     return n;
 }
 
-static int ob_perform(OcerzCPU *cpu, const OcerzAbiSig *sig, const void *fn, const uint64_t *slots,
-                      int nslots, int as_va_list, const char *what)
+__attribute__((noinline))
+static int ob_perform_general(OcerzCPU *cpu, const OcerzAbiSig *sig, const void *fn, const uint64_t *slots,
+                              int nslots, int as_va_list, const char *what)
 {
     OcerzAbiCall call;
     uint64_t stack[OCERZ_ABI_MAX_STACK + OCERZ_OBJC_VARIADIC_MAX];
@@ -1197,14 +1197,23 @@ static int ob_perform(OcerzCPU *cpu, const OcerzAbiSig *sig, const void *fn, con
         words += (size_t)nslots;
     }
 
-    int round = fegetround();
-    fesetround(FE_TONEAREST);
+    uint64_t fpcr = ocerz_abi_round_swap(OCERZ_ABI_ROUND_NEAREST);
     ocerz_abi_call_native(fn, call.x, call.v, stack, words * 8, call.x8, call.rx, call.rv);
     int err = errno;
-    fesetround(round);
+    ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
 
     ocerz_abi_write_result(sig, cpu, &call);
     return err;
+}
+
+static int ob_perform(OcerzCPU *cpu, const OcerzAbiSig *sig, const void *fn, const uint64_t *slots,
+                      int nslots, int as_va_list, const char *what)
+{
+    if (nslots <= 0 && !as_va_list && ocerz_abi_register_only(sig)) {
+        ocerz_abi_perform_registers(sig, fn, cpu);
+        return errno;
+    }
+    return ob_perform_general(cpu, sig, fn, slots, nslots, as_va_list, what);
 }
 
 typedef enum { OB_PLAIN, OB_SUPER, OB_SUPER2 } ObKind;

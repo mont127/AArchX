@@ -227,6 +227,21 @@
  * memcpy a million times.  Two threads that race to fill the same word store
  * the same pointer, because the bridge makes each descriptor once.
  *
+ * Translated code reaches the same dispatch without the trap, through
+ * ocerz_vdylib_fastcall.  What it has to decide on top is whether translated
+ * code may carry on as though a function had returned.  It notes rsp and the
+ * JIT's retirement count, performs the dispatch, and answers zero only if the
+ * result is an ordinary step, rip is the word just below the new rsp and rsp
+ * rose by eight or, for the r11-keeping stubs, sixteen, nothing asks the thread
+ * to stop or to interpret its next instruction, and no translation was retired
+ * in the meantime.  Everything else, a delivered signal among it, goes back
+ * through the dispatcher exactly as the trap path would have.  The xmm contract
+ * the translator asks for comes from the same database record: a fn record's
+ * signature names the argument and result registers, a special reads the eight
+ * argument registers and writes the two result ones, and __tlv_bootstrap and
+ * ___chkstk_darwin, whose callers rely on every register surviving, have no
+ * contract.
+ *
  * ---- the stubs that keep r11 ----
  * An ordinary export's stub loads its id into r11, which is free to do: r11 is
  * a scratch register in the System V ABI and every linker stub on the platform
@@ -255,10 +270,15 @@
  * failed to make.
  */
 #include "ocerz/vdylib.h"
+#include "ocerz/abi.h"
 #include "ocerz/apidb.h"
 #include "ocerz/bridge.h"
 #include "ocerz/dyldapi.h"
+#include "ocerz/flags.h"
 #include "ocerz/interp.h"
+#include "ocerz/jit.h"
+#include "ocerz/mem.h"
+#include "ocerz/vm.h"
 
 #include <dirent.h>
 #include <pthread.h>
@@ -894,7 +914,7 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
     return ocerz_vdylib_image_with(install_name, ocerz_bridge_host_symbol, len_out);
 }
 
-int ocerz_vdylib_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
+static inline __attribute__((always_inline)) int vd_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     static int hooked = -1;
     if (hooked < 0) {
@@ -928,4 +948,48 @@ int ocerz_vdylib_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 
     exit(OCERZ_BRIDGE_UNIMPL_EXIT);
     return OCERZ_STEP_OK;
+}
+
+int ocerz_vdylib_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return vd_dispatch(vm, cpu);
+}
+
+int ocerz_vdylib_xmm_contract(uint64_t id, uint16_t *in, uint16_t *out)
+{
+    const OcerzApiEntry *e = NULL;
+    if (!in || !out || !vd_lib_of_id(id, &e))
+        return 0;
+    if (e->kind == OCERZ_API_FN) {
+        OcerzAbiSig sig;
+        if (!e->sig || ocerz_abi_parse(e->sig, &sig) != OCERZ_OK)
+            return 0;
+        ocerz_abi_xmm_contract(&sig, in, out);
+        return 1;
+    }
+    if (e->kind == OCERZ_API_SPECIAL && e->handler && strcmp(e->handler, "tlv_bootstrap") != 0 &&
+        strcmp(e->handler, "chkstk") != 0) {
+        *in = 0xff;
+        *out = 0x3;
+        return 1;
+    }
+    return 0;
+}
+
+int ocerz_vdylib_fastcall(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t epoch = ocerz_jit_retire_epoch();
+    uint64_t rsp0 = cpu->gpr[OCERZ_RSP];
+    cpu->rip = OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF;
+    if (cpu->cc_op != OCERZ_CC_NONE)
+        ocerz_flags_materialize(cpu);
+    int rc = vd_dispatch(vm, cpu);
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    if (rc == OCERZ_STEP_OK && rsp - rsp0 - 8 <= 8 && cpu->rip == ocerz_ld(rsp - 8, 8) &&
+        !cpu->interrupt && !cpu->terminated && !vm->exited && !cpu->suspend_count &&
+        !cpu->interp_once && ocerz_jit_retire_epoch() == epoch)
+        return 0;
+    if (rc == OCERZ_STEP_EXIT || rc == OCERZ_STEP_FATAL)
+        return rc + 1;
+    return OCERZ_STEP_OK + 1;
 }

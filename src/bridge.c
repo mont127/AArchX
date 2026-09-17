@@ -26,7 +26,11 @@
  * made under one lock with the word checked again inside it, so two threads
  * that race to look an export up receive the same pointer and nothing is made
  * twice.  Descriptors are never freed, and every string a descriptor holds
- * points into the parsed database, which is never freed either.
+ * points into the parsed database, which is never freed either.  Making one
+ * also records whether its signature fits the argument registers of both ABIs,
+ * scalars only and no more of them than System V has registers for, because
+ * such a crossing goes through ocerz_abi_perform_registers and builds no
+ * stack block or structure buffer at all.
  *
  * ---- the signature is the declared one, not the convenient one ----
  * A signature is read off the function's declaration in the SDK, because the
@@ -137,7 +141,9 @@
  * principle re-enter and it is the innermost crossing that describes the fault.
  * The raise, the call and the lower are one small function with no other way
  * out, which is what keeps the pair honest rather than anyone remembering to
- * write the second half.  The special exports raise nothing, _exit above all: a
+ * write the second half.  It looks the thread's frame up once and raises and
+ * lowers through that address, since every thread-local lookup is a call of
+ * its own on this platform.  The special exports raise nothing, _exit above all: a
  * frame raised around a function that never returns would stay raised for the
  * rest of the process.  A fault recovered by jumping out of a crossing instead
  * of returning through it is the one exit the pair cannot see, and nothing takes
@@ -224,8 +230,8 @@
  * policy for native mode: a signal that arrives while a thread is inside native
  * code, or one sent from another thread, reaches its handler when that thread's
  * crossing returns, the way a cache-mode thread takes it at its next syscall.
- * The question is two loads and a branch, which a crossing already costing tens
- * of nanoseconds does not notice.
+ * The question is a thread-local load and two loads and a branch, which a
+ * crossing does not notice.
  *
  * ---- the host libraries ----
  * A virtual library stands for the host library of the same install name, and
@@ -310,6 +316,7 @@ struct OcerzBridgeFn {
     int (*special)(struct OcerzVM *vm, OcerzCPU *cpu);
     void *addr;
     OcerzAbiSig parsed;
+    int register_only;
     int nstructs;
     BrStructBinding structs[OCERZ_APIDB_STRUCT_ARGS];
     uint64_t calls;
@@ -688,6 +695,7 @@ static struct OcerzBridgeFn *br_make(const OcerzApiLibrary *api, const OcerzApiE
             free(fn);
             return NULL;
         }
+        fn->register_only = ocerz_abi_register_only(&fn->parsed);
     }
     fn->next = g_br_made;
     g_br_made = fn;
@@ -797,16 +805,34 @@ static void br_convert_structs(const struct OcerzBridgeFn *fn, OcerzCPU *cpu,
     }
 }
 
-static int br_cross(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
+__attribute__((noinline))
+static int br_cross_structs(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
 {
     struct OcerzBridgeFrame outer;
     uint64_t copies[OCERZ_APIDB_STRUCT_ARGS][OCERZ_APIDB_SHAPE_WORDS];
 
     ocerz_bridge_raise(&outer, fn->lib, fn->sym, fn->sig, fn->addr);
-    if (fn->nstructs)
-        br_convert_structs(fn, cpu, copies);
+    br_convert_structs(fn, cpu, copies);
     int rc = ocerz_abi_perform(&fn->parsed, fn->addr, cpu);
     ocerz_bridge_lower(&outer);
+    return rc;
+}
+
+static int br_cross(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
+{
+    if (fn->nstructs)
+        return br_cross_structs(fn, cpu);
+
+    struct OcerzBridgeFrame *frame = &g_br_frame;
+    struct OcerzBridgeFrame outer = *frame;
+    frame->lib = fn->lib;
+    frame->sym = fn->sym;
+    frame->sig = fn->sig;
+    frame->host_fn = fn->addr;
+    frame->depth = outer.depth + 1;
+    int rc = fn->register_only ? ocerz_abi_perform_registers(&fn->parsed, fn->addr, cpu)
+                               : ocerz_abi_perform(&fn->parsed, fn->addr, cpu);
+    *frame = outer;
     return rc;
 }
 
