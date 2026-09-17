@@ -42,9 +42,12 @@
  * twelve, and the block need not be a multiple of eight.  That packing rule is
  * for an ordinary callee only.  A variadic callee on this platform is the
  * opposite case: everything past the named arguments goes on the stack in
- * eight-byte slots with the floating-point registers untouched, which is a
- * different layout entirely and not one the caller above can describe, so a
- * variadic function is refused rather than called from here.
+ * eight-byte slots with the floating-point registers untouched.  The caller
+ * needs nothing new for that: whoever builds the call places the named
+ * arguments in their registers and packs the variadic ones into the eight-byte
+ * stack words it passes, which is how the Objective-C variadic sends in
+ * src/objcbridge.c use it.  The printf veneers call the v forms instead, handing
+ * over a pointer to those same words as the va_list.
  *
  * ---- why the v registers take a 64-bit load ----
  * Each word of the second array is loaded with an ldp of d registers, which

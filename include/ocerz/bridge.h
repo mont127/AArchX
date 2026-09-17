@@ -28,15 +28,14 @@
  * What this layer deliberately cannot do yet, so that what it does do is
  * trustworthy:
  *
- * - Variadic functions.  Apple's arm64 ABI passes variadic arguments on the
- *   stack while x86-64 passes them in registers, so calling one through a
- *   fixed-arity prototype puts every argument in the wrong place.  printf, open,
- *   fcntl and ioctl are therefore stub records, not bridged; they need
- *   per-function veneers that know where the fixed arguments stop.
+ * - Variadic functions in general.  Apple's arm64 ABI passes variadic arguments
+ *   on the stack while x86-64 passes them in registers, so calling one through
+ *   a fixed-arity prototype puts every argument in the wrong place.  The ones
+ *   whose format string says what follows - the printf family, NSLog and
+ *   CoreFoundation's format functions - are special records answered by
+ *   veneers in objcbridge.h; open, fcntl, ioctl and the rest are stub records.
  * - A callback whose own signature takes a callback; abi.h describes what a
  *   callback argument can be and which threads it may run on.
- * - Structures passed or returned by value, which both ABIs split into pieces
- *   and classify differently; abi.h rejects a signature naming one.
  *
  * An export with no descriptor is not an error: it falls back to naming itself
  * and stopping with OCERZ_BRIDGE_UNIMPL_EXIT.
@@ -51,6 +50,13 @@
  * which may neither allocate nor take a lock; everything it points at is a
  * string literal or a field of a descriptor, all of static lifetime, so reading
  * it costs a load and nothing else.
+ *
+ * ocerz_bridge_raise and ocerz_bridge_lower are the same bracket for a
+ * crossing that is not a descriptor's, such as a message send or a formatted
+ * print (objcbridge.h), whose names and signature are known only once the
+ * call has arrived.  The strings handed to raise must outlive the crossing,
+ * which a selector name, a notation interned for the process, or a buffer on
+ * the stack of the function that lowers the frame all do.
  *
  * A native function may call back into guest code, as qsort calls its
  * comparator, and for as long as that guest code runs the thread is not inside
@@ -101,6 +107,9 @@ void ocerz_bridge_report(void);
 const struct OcerzBridgeFrame *ocerz_bridge_in_flight(void);
 void ocerz_bridge_guest_enter(struct OcerzBridgeFrame *saved);
 void ocerz_bridge_guest_leave(const struct OcerzBridgeFrame *saved);
+void ocerz_bridge_raise(struct OcerzBridgeFrame *outer, const char *lib, const char *sym,
+                        const char *sig, const void *host_fn);
+void ocerz_bridge_lower(const struct OcerzBridgeFrame *outer);
 
 #define OCERZ_BRIDGE_LIBSYSTEM "/usr/lib/libSystem.B.dylib"
 #define OCERZ_BRIDGE_COREFOUNDATION \

@@ -249,6 +249,34 @@
  * dispatcher gives that thread one through ocerz_thread_attach on its first
  * callback and reuses it on every one after, and refuses by name only when
  * there is no guest process to attach it to.
+ *
+ * ---- variadic calls ----
+ * A signature has nowhere to say where a function's named arguments stop, and
+ * the two ABIs part company exactly there.  System V does not: a variadic
+ * argument is wherever a fixed one of its class would be, the next integer
+ * register or the next xmm and then the next stack eightbyte, so a variadic
+ * callee's arguments are found by continuing the walk over the named ones.
+ * Apple's arm64 does: the named arguments go where a fixed callee's would, and
+ * every variadic one after them goes on the stack in an eight-byte slot of its
+ * own, in order, a double included, with no floating-point register used.  An
+ * arm64 va_list is nothing but a pointer to such slots.  clang -arch arm64 shows
+ * all of it: sink("x", 1, 2.5, 3, 4.5) puts "x" in x0 and the rest at sp, sp+8,
+ * sp+16 and sp+24, where a fixed-arity callee takes x0, x1, x2, d0 and d1.
+ *
+ * So what the engine offers a variadic crossing is the guest half as a cursor,
+ * and the caller, which alone knows from a format string or a sentinel what the
+ * variadic arguments are, builds the slots.  ocerz_abi_va_start walks the named
+ * signature the way ocerz_abi_read_guest does, a MEMORY result's pointer and
+ * each structure's eightbytes included, and leaves the cursor at the first
+ * variadic argument.  ocerz_abi_va_arg takes the next one of class i, u, l, L,
+ * p or d, which are all the default argument promotions leave, and gives it as
+ * a whole slot: i and u extended from their low 32 bits, p converted to the host
+ * view with null kept null, d as its raw bits.  A variadic argument is never a
+ * float, a narrow integer or a structure, so any other class is refused.  The
+ * slots then go to a v-form function as its va_list, or, for a variadic callee
+ * called directly, after the named arguments' own stacked bytes, which end on an
+ * eight-byte boundary since nstack counts whole eightbytes;
+ * ocerz_abi_call_native copies a stack block of any length.
  */
 #ifndef OCERZ_ABI_H
 #define OCERZ_ABI_H
@@ -297,10 +325,19 @@ typedef struct OcerzAbiCall {
     uint64_t mem[OCERZ_ABI_MAX_ARGS * OCERZ_ABI_STRUCT_BYTES / 8];
 } OcerzAbiCall;
 
+typedef struct OcerzAbiVaList {
+    int gi;
+    int gf;
+    int gslot;
+} OcerzAbiVaList;
+
 int ocerz_abi_parse(const char *notation, OcerzAbiSig *out);
 
 int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu,
                          OcerzAbiCall *call);
+
+int ocerz_abi_va_start(const OcerzAbiSig *named, const OcerzCPU *cpu, OcerzAbiVaList *va);
+int ocerz_abi_va_arg(OcerzAbiVaList *va, const OcerzCPU *cpu, char cls, uint64_t *out);
 
 void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu,
                             const OcerzAbiCall *call);

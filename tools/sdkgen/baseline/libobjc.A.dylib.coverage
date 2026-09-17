@@ -1,0 +1,23 @@
+library /usr/lib/libobjc.A.dylib
+sdk macos 27.0
+exports 414
+fn 173
+data 60
+var 0
+special 9
+stub block 1
+stub callback-result 2
+stub no-declaration 107
+stub override 52
+stub struct-callback 2
+omit no-declaration-missing 6
+omit objc-ivar 2
+host-missing 2
+objc-classes 3
+objc-eh-types 0
+objc-ivars 2
+ld-pseudo-skipped 9
+overrides 104
+override-shapes 0
+override-structs 0
+override-opaque 0

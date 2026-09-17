@@ -38,13 +38,14 @@
  * only for as long as the guest happened to leave the upper half clean.
  *
  * ---- what is deliberately absent ----
- * Variadic functions.  Apple's arm64 ABI passes variadic arguments on the stack
- * while x86-64 passes them in registers, and a signature has nowhere to say
- * where a function's fixed arguments stop, so a bridged printf, open, fcntl or
- * ioctl would be quietly wrong rather than refused.  The database carries them
- * as stub records, and they fall back to naming themselves.  A structure passed
- * or returned by value needs no rule here at all: the parser refuses the
- * notation for one.
+ * Variadic functions as fn records.  Apple's arm64 ABI passes variadic
+ * arguments on the stack while x86-64 passes them in registers, and a signature
+ * has nowhere to say where a function's fixed arguments stop, so a bridged open,
+ * fcntl or ioctl would be quietly wrong rather than refused.  The database
+ * carries them as stub records, and they fall back to naming themselves.  The
+ * variadic functions a format string describes are special records instead,
+ * and so are the Objective-C message sends, whose signature is the method's:
+ * the handler table names the functions src/objcbridge.c answers them with.
  *
  * ---- functions that call back ----
  * qsort and bsearch take a comparator, which the guest supplies as x86 code.
@@ -100,7 +101,7 @@
  * ___strcpy_chk.  They are bridged exactly like their plain counterparts, with
  * the destination size as one more integer argument; the native versions do the
  * bounds check and abort on overflow.  The variadic ones, __sprintf_chk and
- * __snprintf_chk, are refused for the same reason printf is.
+ * __snprintf_chk, are special records answered the way printf is.
  *
  * ---- why null has to survive the conversion ----
  * ocerz_g2h is affine: it adds a base.  Applied to a null guest pointer it
@@ -278,6 +279,7 @@
 #include "ocerz/interp.h"
 #include "ocerz/syscall.h"
 #include "ocerz/vdylib.h"
+#include "ocerz/objcbridge.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -479,6 +481,26 @@ static const BrHandler g_br_handlers[] = {
     { "raise",           br_raise },
     { "kill",            br_kill },
     { "pthread_kill",    br_pthread_kill },
+    { "objc_msgSend",              ocerz_objc_msgSend },
+    { "objc_msgSendSuper",         ocerz_objc_msgSendSuper },
+    { "objc_msgSendSuper2",        ocerz_objc_msgSendSuper2 },
+    { "objc_msgSend_stret",        ocerz_objc_msgSend_stret },
+    { "objc_msgSendSuper_stret",   ocerz_objc_msgSendSuper_stret },
+    { "objc_msgSendSuper2_stret",  ocerz_objc_msgSendSuper2_stret },
+    { "objc_msgSend_fpret",        ocerz_objc_msgSend_fpret },
+    { "objc_msgSend_fp2ret",       ocerz_objc_msgSend_fp2ret },
+    { "objc_setUncaughtExceptionHandler", ocerz_objc_setUncaughtExceptionHandler },
+    { "NSLog",                     ocerz_fmt_NSLog },
+    { "printf",                    ocerz_fmt_printf },
+    { "fprintf",                   ocerz_fmt_fprintf },
+    { "sprintf",                   ocerz_fmt_sprintf },
+    { "snprintf",                  ocerz_fmt_snprintf },
+    { "asprintf",                  ocerz_fmt_asprintf },
+    { "dprintf",                   ocerz_fmt_dprintf },
+    { "sprintf_chk",               ocerz_fmt_sprintf_chk },
+    { "snprintf_chk",              ocerz_fmt_snprintf_chk },
+    { "CFStringCreateWithFormat",  ocerz_fmt_CFStringCreateWithFormat },
+    { "CFStringAppendFormat",      ocerz_fmt_CFStringAppendFormat },
 };
 
 static int (*br_handler(const char *name))(struct OcerzVM *, OcerzCPU *)
@@ -714,6 +736,22 @@ void ocerz_bridge_guest_leave(const struct OcerzBridgeFrame *saved)
     g_br_frame = *saved;
 }
 
+void ocerz_bridge_raise(struct OcerzBridgeFrame *outer, const char *lib, const char *sym,
+                        const char *sig, const void *host_fn)
+{
+    *outer = g_br_frame;
+    g_br_frame.lib = lib;
+    g_br_frame.sym = sym;
+    g_br_frame.sig = sig;
+    g_br_frame.host_fn = host_fn;
+    g_br_frame.depth = outer->depth + 1;
+}
+
+void ocerz_bridge_lower(const struct OcerzBridgeFrame *outer)
+{
+    g_br_frame = *outer;
+}
+
 static int br_logging(void)
 {
     static int en = -1;
@@ -754,20 +792,14 @@ static void br_convert_structs(const struct OcerzBridgeFn *fn, OcerzCPU *cpu,
 
 static int br_cross(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
 {
-    struct OcerzBridgeFrame outer = g_br_frame;
+    struct OcerzBridgeFrame outer;
     uint64_t copies[OCERZ_APIDB_STRUCT_ARGS][OCERZ_APIDB_SHAPE_WORDS];
 
-    g_br_frame.lib = fn->lib;
-    g_br_frame.sym = fn->sym;
-    g_br_frame.sig = fn->sig;
-    g_br_frame.host_fn = fn->addr;
-    g_br_frame.depth = outer.depth + 1;
-
+    ocerz_bridge_raise(&outer, fn->lib, fn->sym, fn->sig, fn->addr);
     if (fn->nstructs)
         br_convert_structs(fn, cpu, copies);
     int rc = ocerz_abi_perform(&fn->parsed, fn->addr, cpu);
-
-    g_br_frame = outer;
+    ocerz_bridge_lower(&outer);
     return rc;
 }
 

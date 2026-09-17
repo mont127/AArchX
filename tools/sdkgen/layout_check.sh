@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # layout_check.sh -- prove sdkgen's record layouts against clang's own.
 #
-#   tools/sdkgen.sh libSystem /tmp/apis && tools/sdkgen.sh CoreFoundation /tmp/apis
+#   tools/sdkgen.sh libSystem /tmp/apis     # and CoreFoundation, libobjc, Foundation
 #   tools/sdkgen/layout_check.sh            # 200 records from every build/*.layouts
 #   tools/sdkgen/layout_check.sh 50         # a smaller sample
 #
@@ -17,19 +17,25 @@
 # spelling clang gives the type on that architecture, which is what the dump
 # is keyed by.  The two differ for a typedef of a qualified anonymous struct,
 # such as OSQueueHead, which clang dumps as a struct unnamed at its line in the
-# header, and that line is not the same for the two architectures.  The script pools every
-# such file, sorts the names, and takes the requested number of them at even
-# intervals through the sorted list, so the sample is the same on every run
-# and spread across the alphabet rather than bunched at its start.
+# header, and that line is not the same for the two architectures.
+#
+# The sample is drawn from every such file, so that a library measuring six
+# records is checked beside one measuring hundreds.  The requested number is
+# shared out by water-filling: the files are taken from the fewest records to
+# the most, each is given an equal share of what is left or all of its records
+# if it has fewer, and the largest file takes whatever the smaller ones did not
+# use.  Within a file the names are sorted and its share is taken at even
+# intervals through them, so the sample is the same on every run and spread
+# across the alphabet rather than bunched at its start.
 #
 # For each library it writes one translation unit that includes the umbrella
-# header the generator parsed, with the same defines, and a sizeof of every
-# sampled type, and compiles it for x86_64 and for arm64 with
-# -Xclang -fdump-record-layouts-simple.  The dump gives each record's Size,
-# Alignment and FieldOffsets in bits, and all three must equal what the
-# generator wrote for that architecture.  A record the dump never mentions is a
-# mismatch too.  Every mismatch is printed, and any at all makes the exit
-# status non-zero.
+# header the generator parsed, with the same defines and in the same language,
+# C or Objective-C, and a sizeof of every sampled type, and compiles it for
+# x86_64 and for arm64 with -Xclang -fdump-record-layouts-simple.  The dump
+# gives each record's Size, Alignment and FieldOffsets in bits, and all three
+# must equal what the generator wrote for that architecture.  A record the dump
+# never mentions is a mismatch too.  Every mismatch is printed, and any at all
+# makes the exit status non-zero.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -48,18 +54,30 @@ for f in "${files[@]}"; do
     awk -v file="$f" '$1 == "record" && $2 == "x86_64" {
         name = $0; sub(/^record [^ ]+ [^ ]+ [^ ]+ [^ ]+ /, "", name); sub(/\t.*$/, "", name)
         print file "\t" name
-    }' "$f"
-done | LC_ALL=C sort -t "$(printf '\t')" -k2,2 -k1,1 | LC_ALL=C sort -s -u -t "$(printf '\t')" -k2,2 > "$work/all"
+    }' "$f" | LC_ALL=C sort -u
+done > "$work/all"
 
 total=$(wc -l < "$work/all" | tr -d ' ')
-awk -v n="$total" -v want="$count" '
-    { line[NR] = $0 }
+awk -F '\t' -v want="$count" '
+    { if (!($1 in size)) order[nf++] = $1; name[$1, size[$1]++] = $2 }
     END {
-        if (want >= n) { for (i = 1; i <= n; i++) print line[i]; exit }
-        for (i = 0; i < want; i++) print line[int(i * n / want) + 1]
+        for (i = 0; i < nf; i++)
+            for (j = i + 1; j < nf; j++)
+                if (size[order[j]] < size[order[i]] || (size[order[j]] == size[order[i]] && order[j] < order[i])) {
+                    t = order[i]; order[i] = order[j]; order[j] = t
+                }
+        left = want
+        for (i = 0; i < nf; i++) {
+            f = order[i]; n = size[f]
+            q = (i == nf - 1) ? left : int(left / (nf - i))
+            if (q > n) q = n
+            left -= q
+            for (k = 0; k < q; k++) print f "\t" name[f, int(k * n / q)]
+        }
     }' "$work/all" > "$work/sample"
 sampled=$(wc -l < "$work/sample" | tr -d ' ')
-echo "layout_check.sh: checking $sampled of $total measured record types"
+libs=$(cut -f1 "$work/sample" | LC_ALL=C sort -u | wc -l | tr -d ' ')
+echo "layout_check.sh: checking $sampled of $total measured record types, from $libs of ${#files[@]} libraries"
 
 mismatches=0
 for f in "${files[@]}"; do
@@ -67,11 +85,14 @@ for f in "${files[@]}"; do
     [ -s "$work/names" ] || continue
     header=$(awk '$1 == "header" { sub(/^header /, ""); print; exit }' "$f")
     defines=$(awk '$1 == "define" { printf "%s ", $2 }' "$f")
+    language=$(awk '$1 == "language" { print $2; exit }' "$f")
+    language=${language:-c}
     probe=$work/probe.c
+    [ "$language" = objective-c ] && probe=$work/probe.m
     printf '#include "%s"\n' "$header" > "$probe"
     awk '{ printf "typedef char sdkgen_probe_%d[sizeof(%s)];\n", NR, $0 }' "$work/names" >> "$probe"
     for arch in x86_64 arm64; do
-        clang -target "$arch-apple-macos$ver" -isysroot "$sdk" -std=gnu17 -w $defines -fsyntax-only \
+        clang -x "$language" -target "$arch-apple-macos$ver" -isysroot "$sdk" -std=gnu17 -w $defines -fsyntax-only \
             -Xclang -fdump-record-layouts-simple "$probe" > "$work/dump" 2>&1 || {
             echo "layout_check.sh: clang failed on the probe for $f ($arch):" >&2
             grep -m 20 error "$work/dump" >&2 || true

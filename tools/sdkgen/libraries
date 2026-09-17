@@ -1,6 +1,7 @@
 # The libraries sdkgen knows how to generate, and how to read each one.
 #
 #     library <name> <install-name> <tbd path inside the SDK>
+#     language c | objective-c
 #     pass <umbrella header in tools/sdkgen/headers> [-D<macro>=<value>]...
 #
 # <name> is what tools/sdkgen.sh is given on its command line.  The database is
@@ -8,8 +9,14 @@
 # The .tbd is read for every document in it, and a library it re-exports is
 # folded into the export list when that library names a parent umbrella, which
 # is what marks the libraries under /usr/lib/system as parts of libSystem
-# rather than libraries of their own.  CoreFoundation re-exports libobjc, which
-# names no umbrella, so libobjc's exports stay out of CoreFoundation's file.
+# rather than libraries of their own.  CoreFoundation re-exports libobjc, and
+# Foundation re-exports CoreFoundation and libobjc, none of which names an
+# umbrella, so each keeps its exports in its own file.
+#
+# A library's headers are parsed as C unless it names objective-c, which
+# libobjc and Foundation do because their headers declare classes and
+# protocols that plain C cannot parse.  The .layouts file records the language
+# so tools/sdkgen/layout_check.sh compiles its probe the same way.
 #
 # Each pass is parsed twice, for x86_64 and for arm64, and an export takes its
 # declaration from the first pass whose x86_64 parse spells it.  libSystem needs
@@ -27,3 +34,11 @@ pass libSystem.h -D_DARWIN_C_SOURCE -D__DARWIN_NON_CANCELABLE=1
 
 library CoreFoundation /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd
 pass CoreFoundation.h
+
+library libobjc /usr/lib/libobjc.A.dylib usr/lib/libobjc.A.tbd
+language objective-c
+pass libobjc.h
+
+library Foundation /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation System/Library/Frameworks/Foundation.framework/Foundation.tbd
+language objective-c
+pass Foundation.h

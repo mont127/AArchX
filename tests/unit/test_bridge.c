@@ -107,7 +107,7 @@ static const char *const kBridged[] = {
 #define NBRIDGED (sizeof kBridged / sizeof kBridged[0])
 
 static const char *const kUnbridged[] = {
-    "_printf", "_fprintf", "_sprintf", "_snprintf",
+    "_scanf", "_sscanf", "_syslog",
     "_open", "_fcntl", "_ioctl",
 };
 #define NUNBRIDGED (sizeof kUnbridged / sizeof kUnbridged[0])

@@ -195,6 +195,16 @@
  * and flushes its stdio; the exit syscall stays behind the call only as the path
  * taken if that export is missing.
  *
+ * No x86 Objective-C runtime runs in native mode, so nothing canonicalizes a
+ * guest image's selectors the way the translated runtime does in cache mode.
+ * canonicalize_objc_selrefs hands each disk dylib, after its fixups, to
+ * ocerz_objcbridge_fix_selrefs instead, which makes every selector reference the
+ * host runtime's own SEL, and the main image gets the same pass right after the
+ * unresolved-import report, before any guest code runs.  When the guest links
+ * libobjc, ocerz's uncaught-exception handler is installed at that same point,
+ * once every host framework the guest links has been opened and has installed
+ * its own handler for ocerz's to chain to (objcbridge.h).
+ *
  * ---- thread-local variables in native mode ----
  * Descriptors are rewritten into the same packed form as in cache mode, but the
  * thunk word is left exactly as the fixups bound it.  In cache mode the import
@@ -257,6 +267,7 @@
 #include "ocerz/mode.h"
 #include "ocerz/vdylib.h"
 #include "ocerz/apidb.h"
+#include "ocerz/objcbridge.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -2230,6 +2241,10 @@ static void canonicalize_objc_selrefs(DynImage *img)
 {
     int64_t slide = img->slide;
     const uint8_t *h = (const uint8_t *)ocerz_g2h(img->load_base);
+    if (ocerz_mode == OCERZ_MODE_NATIVE) {
+        ocerz_objcbridge_fix_selrefs(h, slide);
+        return;
+    }
     if (rd32(h) != MH_MAGIC_64)
         return;
     uint32_t ncmds = rd32(h + 16);
@@ -2972,8 +2987,12 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         free(buf);
         return 71;
     }
-    if (ocerz_mode == OCERZ_MODE_NATIVE)
+    if (ocerz_mode == OCERZ_MODE_NATIVE) {
         native_tlv_register_loaded(img.load_base);
+        ocerz_objcbridge_fix_selrefs((const uint8_t *)ocerz_g2h(img.load_base), img.slide);
+        if (dimg_find_by_install_name(OCERZ_OBJC_LIBOBJC))
+            ocerz_objcbridge_install_uncaught();
+    }
 
     DynFrame fr;
     memset(&fr, 0, sizeof fr);
