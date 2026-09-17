@@ -11,7 +11,11 @@
  * bracket closes outside quotes.  That is the whole grammar Apple's tapi tool
  * writes, and a line that does not fit it is reported with its number rather
  * than skipped, because a silently dropped section would shrink the export
- * list the generator is supposed to account for in full.
+ * list the generator is supposed to account for in full.  The search for the
+ * closing bracket resumes where the previous line left it instead of starting
+ * over, because Foundation's symbol list runs for tens of thousands of lines
+ * and rescanning it from the opening bracket on every line took a minute and a
+ * half.
  *
  * Quoting is YAML's: single quotes double an embedded quote, double quotes take
  * a backslash escape.  Both are stripped so a symbol reads as the linker spells
@@ -85,31 +89,49 @@ static int tbd_fail(char *err, size_t errlen, const char *path, int line, const 
     return -1;
 }
 
-static int tbd_flow_closed(const char *s, size_t len)
+typedef struct TbdScan {
+    size_t pos;
+    int depth;
+    char q;
+} TbdScan;
+
+static int tbd_flow_scan(TbdScan *st, const char *s, size_t len)
 {
-    int depth = 0;
-    char q = 0;
-    for (size_t i = 0; i < len; i++) {
+    size_t i = st->pos;
+    for (; i < len; i++) {
         char c = s[i];
-        if (q) {
-            if (c == q) {
-                if (q == '\'' && i + 1 < len && s[i + 1] == '\'')
+        if (st->q) {
+            if (c == st->q) {
+                if (st->q == '\'' && i + 1 >= len)
+                    break;
+                if (st->q == '\'' && s[i + 1] == '\'')
                     i++;
                 else
-                    q = 0;
-            } else if (q == '"' && c == '\\') {
+                    st->q = 0;
+            } else if (st->q == '"' && c == '\\') {
+                if (i + 1 >= len)
+                    break;
                 i++;
             }
             continue;
         }
-        if (c == '\'' || c == '"')
-            q = c;
-        else if (c == '[')
-            depth++;
-        else if (c == ']' && --depth == 0)
+        if (c == '\'' || c == '"') {
+            st->q = c;
+        } else if (c == '[') {
+            st->depth++;
+        } else if (c == ']' && --st->depth == 0) {
+            st->pos = i + 1;
             return 1;
+        }
     }
+    st->pos = i;
     return 0;
+}
+
+static int tbd_flow_closed(const char *s, size_t len)
+{
+    TbdScan st = { 0, 0, 0 };
+    return tbd_flow_scan(&st, s, len);
 }
 
 static char *tbd_unquote(const char *s, size_t len)
@@ -308,7 +330,8 @@ int tbd_read(const char *path, TbdFile *out, char *err, size_t errlen)
             }
             memcpy(acc, val, vlen);
             size_t alen = vlen;
-            while (!tbd_flow_closed(acc, alen)) {
+            TbdScan scan = { 0, 0, 0 };
+            while (!tbd_flow_scan(&scan, acc, alen)) {
                 if (!*p) {
                     free(text);
                     free(acc);

@@ -715,6 +715,15 @@ static void abi_guest_struct_in(const OcerzAbiStruct *st, const OcerzCPU *cpu, i
     abi_zero_tail(st, buf);
 }
 
+static uint64_t abi_guest_next(const OcerzCPU *cpu, int fp, int *gi, int *gf, int *gslot)
+{
+    if (fp && *gf < ABI_GUEST_FP_REGS)
+        return cpu->xmm[(*gf)++].lo;
+    if (!fp && *gi < ABI_GUEST_INT_REGS)
+        return cpu->gpr[abi_guest_int_reg[(*gi)++]];
+    return ocerz_ld(cpu->gpr[OCERZ_RSP] + 8 + 8 * (uint64_t)(*gslot)++, 8);
+}
+
 static int abi_host_struct_out(const OcerzAbiStruct *st, const uint8_t *buf, OcerzAbiCall *call,
                                size_t *off)
 {
@@ -808,12 +817,7 @@ int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCa
             continue;
         }
 
-        if (fp && guest_fp < ABI_GUEST_FP_REGS)
-            raw = cpu->xmm[guest_fp++].lo;
-        else if (!fp && guest_int < ABI_GUEST_INT_REGS)
-            raw = cpu->gpr[abi_guest_int_reg[guest_int++]];
-        else
-            raw = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8 + 8 * (uint64_t)guest_slot++, 8);
+        raw = abi_guest_next(cpu, fp, &guest_int, &guest_fp, &guest_slot);
 
         uint64_t val;
         if (c == 'p') {
@@ -844,6 +848,53 @@ int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCa
     }
 
     call->nstack = (int)((host_off + 7) / 8);
+    return OCERZ_OK;
+}
+
+int ocerz_abi_va_start(const OcerzAbiSig *named, const OcerzCPU *cpu, OcerzAbiVaList *va)
+{
+    if (!named || !cpu || !va)
+        return OCERZ_EUNDEF;
+    if (named->nargs < 0 || named->nargs > OCERZ_ABI_MAX_ARGS)
+        return OCERZ_ETOOLONG;
+
+    memset(va, 0, sizeof *va);
+    if (named->ret == '{') {
+        if (!abi_struct_valid(&named->ret_struct))
+            return OCERZ_EUNSUP;
+        if (named->ret_struct.size > ABI_SMALL_STRUCT)
+            va->gi++;
+    }
+
+    for (int i = 0; i < named->nargs; i++) {
+        char c = named->arg[i];
+        if (c == '{') {
+            uint8_t buf[OCERZ_ABI_STRUCT_BYTES];
+            if (!abi_struct_valid(&named->arg_struct[i]))
+                return OCERZ_EUNSUP;
+            abi_guest_struct_in(&named->arg_struct[i], cpu, &va->gi, &va->gf, &va->gslot, buf);
+        } else if (abi_is_arg_class(c)) {
+            abi_guest_next(cpu, abi_is_fp(c), &va->gi, &va->gf, &va->gslot);
+        } else {
+            return OCERZ_EUNSUP;
+        }
+    }
+    return OCERZ_OK;
+}
+
+int ocerz_abi_va_arg(OcerzAbiVaList *va, const OcerzCPU *cpu, char cls, uint64_t *out)
+{
+    if (!va || !cpu || !out)
+        return OCERZ_EUNDEF;
+    *out = 0;
+    if (cls != 'i' && cls != 'u' && cls != 'l' && cls != 'L' && cls != 'p' && cls != 'd')
+        return OCERZ_EUNSUP;
+
+    uint64_t raw = abi_guest_next(cpu, cls == 'd', &va->gi, &va->gf, &va->gslot);
+    if (cls == 'p')
+        *out = raw ? (uint64_t)(uintptr_t)ocerz_g2h(raw) : 0;
+    else
+        *out = abi_narrow(cls, raw);
     return OCERZ_OK;
 }
 

@@ -1,0 +1,24 @@
+library /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
+sdk macos 27.0
+exports 16755
+fn 117
+data 1548
+var 0
+special 1
+stub callback-result 1
+stub no-declaration 7148
+stub override 3
+stub struct-callback 4
+stub va-list 1
+omit no-declaration-missing 1278
+omit objc-ivar 98
+omit swift 6556
+host-missing 2
+objc-classes 398
+objc-eh-types 0
+objc-ivars 98
+ld-pseudo-skipped 25801
+overrides 4
+override-shapes 0
+override-structs 0
+override-opaque 0

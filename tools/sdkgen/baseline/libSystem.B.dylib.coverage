@@ -1,13 +1,13 @@
 library /usr/lib/libSystem.B.dylib
 sdk macos 27.0
-exports 9599
-fn 2637
-data 120
+exports 9653
+fn 2669
+data 497
 var 1
-special 16
+special 24
 stub block 63
 stub callback-result 1
-stub callback-struct 56
+stub callback-struct 58
 stub complex 62
 stub float-width 13
 stub layout 4
@@ -15,13 +15,12 @@ stub long-double 73
 stub no-arm64-declaration 26
 stub no-declaration 4883
 stub no-prototype 2
-stub override 538
-stub struct-value 36
+stub override 530
+stub struct-too-many-members 2
 stub va-list 10
 stub variadic 32
 omit layout 1
 omit no-arm64-declaration 1
-omit no-declaration-data 323
 omit no-declaration-missing 700
 omit override 1
 host-missing 7

@@ -11,9 +11,26 @@
 # above it.  A stub may name its exports with a fnmatch pattern, which only
 # reaches exports the rules would have made fn or stub, never a variable; a
 # stub that names one export exactly also covers that export's $-suffixed
-# variants, such as _sigsuspend$NOCANCEL.  A record that matches nothing in its
-# library stops the generator, so a name that leaves the SDK is noticed rather
-# than kept.
+# variants, such as _sigsuspend$NOCANCEL.  An exact name beats a pattern, so a
+# special for one member of a family survives a stub that names the rest.  A
+# record that matches nothing in its library stops the generator, so a name
+# that leaves the SDK is noticed rather than kept.
+#
+# ---- format veneers ----
+# A variadic function cannot cross by signature: Apple's arm64 passes every
+# variadic argument on the stack while x86-64 passes the first ones in
+# registers, and nothing in the declaration says how many there are or of which
+# class.  A formatting function says it anyway, in its format string.  So the
+# few that programs call all the time are special records whose handlers ocerz
+# implements as format veneers: the handler reads the format string out of
+# guest memory, walks its conversions to learn the class of each argument that
+# follows, gathers them from the x86 registers and stack in that order, and
+# makes the native call with them where arm64 wants them.  The group is printf,
+# fprintf, sprintf, snprintf, asprintf, dprintf and the fortified __sprintf_chk
+# and __snprintf_chk in libSystem, CFStringCreateWithFormat and
+# CFStringAppendFormat in CoreFoundation, and NSLog in Foundation, whose %@
+# conversions are object pointers like any other.  Every other variadic
+# function, and every v form taking a va_list, stays a stub.
 #
 # ---- libSystem ----
 # Exports ocerz answers itself.  exit and abort end the guest, not the host
@@ -107,7 +124,7 @@
 # The printf and scanf families are variadic, and their v forms take a
 # va_list, so the rules already refuse nearly all of them; naming the family
 # keeps the extensible-printf domain calls and the _l, wide and _chk forms with
-# them.
+# them.  The eight format veneers are named exactly, so they beat the pattern.
 #
 # ---- CoreFoundation ----
 # __CFConstantStringClassReference is the isa every CFSTR literal is compiled
@@ -118,6 +135,75 @@
 # the first word must hold; the generator checks every word against the
 # structure the header declares, and version 1 against CFRunLoopSourceContext1.
 # The struct records name the argument each constructor takes one in.
+# CFStringCreateWithFormat and CFStringAppendFormat are format veneers.
+#
+# ---- libobjc ----
+# Message sending.  objc_msgSend and its relatives take whatever arguments the
+# method they reach takes, so no signature describes them; they are special
+# records whose handlers dispatch the message in ocerz.  The _stret, _fpret and
+# _fp2ret forms exist only in x86_64 libobjc, and the arm64 library the host
+# runs has none of them, but a guest imports them all the same.  The other
+# entry points of the same shape name themselves:
+# the _debug and _noarg sends, the objc_msgLookup family, which hands back an
+# IMP to jump to with the arguments still in place, method_invoke and
+# _objc_msgForward, which continue a send in progress, and
+# objc_setForwardHandler, whose handlers are entered the way a send is.  A
+# pattern only reaches exports the rules made fn or stub, and the _fixup,
+# stret _debug and fpret lookup entries that only x86_64 libobjc has were
+# omitted as undeclared and missing on the host, so those are named one by one.
+#
+# Exceptions.  Throwing an Objective-C exception unwinds through the frames
+# between the throw and the catch, and those are translated guest frames and
+# ocerz's own, which the native unwinder cannot walk.  So objc_exception_throw
+# and objc_exception_rethrow, objc_begin_catch and objc_end_catch,
+# objc_terminate, the __objc_personality_v0 personality routine and the legacy
+# objc_addExceptionHandler and objc_removeExceptionHandler all name themselves.
+# objc_setUncaughtExceptionHandler is special, because it hands back the
+# handler it replaces, which the rules refuse as a function pointer returned to
+# the guest.
+# _OBJC_EHTYPE_id is bound as data like every class's exception type, because a
+# guest with an @catch (id) clause references it from its type table whether or
+# not anything is ever thrown, and objc_ehtype_vtable for the same reason: the
+# compiler points the exception type it emits for a guest's own class at it.
+#
+# Class metadata.  Every class a guest defines has its method cache pointing at
+# _objc_empty_cache, so a program with a single class of its own fails to bind
+# unless that variable is a data export, although no header declares it.
+# _objc_empty_vtable, which older toolchains put in the vtable word beside it,
+# exists only in x86_64 libobjc and stays omitted.
+#
+# Runtime hooks.  objc_setHook_* and _objc_setHook_* install functions the
+# runtime calls from inside class lookup and method caching, and
+# objc_addLoadImageFunc and objc_addLoadImageFunc2 one it calls for every image
+# host dyld loads, none of which is a guest image.  _objc_init, _objc_map_images
+# and _objc_load_image are dyld's own entry points into the runtime.  The SDK's
+# libobjc exports no map_images, load_images or unmap_image under those names.
+# objc_setEnumerationMutationHandler takes a function the rules can carry as a
+# callback, so it crosses.
+#
+# Building classes out of guest code.  class_addMethod, class_replaceMethod,
+# the bulk forms of both, method_setImplementation and its raw form,
+# imp_implementationWithBlock, class_addIvar, objc_allocateClassPair and
+# objc_registerClassPair would hand the native runtime an x86 IMP, and a native
+# class holding one crashes the first time the method is sent.  A later
+# milestone gives guest classes trampolines; until then these name themselves.
+# An IMP is otherwise an opaque pointer in both directions, so
+# method_getImplementation crosses and hands back native code the guest may
+# compare but not call.
+#
+# Entry points the compiler calls.  ARC, property accessors, object allocation
+# and the retain and release fast paths call objc_retain,
+# objc_retainAutoreleasedReturnValue, objc_storeStrong, objc_alloc_init,
+# objc_opt_class, objc_getProperty and the rest on a program's behalf, and no
+# public header declares any of them.  Their fn records carry objc4's own
+# signatures, with BOOL written b because it is signed char on x86_64.
+# objc_retainBlock copies a block exactly as libSystem's _Block_copy does.
+#
+# ---- Foundation ----
+# NSLog is a format veneer and NSLogv stays a stub.  NSFrameAddress,
+# NSReturnAddress and NSCountFrames walk the calling thread's native frames,
+# which are ocerz's and not the guest's, so they name themselves the way the
+# unwinding calls in libSystem do.
 
 library /usr/lib/libSystem.B.dylib
 
@@ -137,6 +223,14 @@ special _kill kill
 special _pthread_kill pthread_kill
 special ___chkstk_darwin chkstk
 special ____chkstk_darwin chkstk
+special _printf printf
+special _fprintf fprintf
+special _sprintf sprintf
+special _snprintf snprintf
+special _asprintf asprintf
+special _dprintf dprintf
+special ___sprintf_chk sprintf_chk
+special ___snprintf_chk snprintf_chk
 var ___stack_chk_guard 8 stack_guard
 stub _quick_exit override
 
@@ -328,6 +422,8 @@ library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFound
 
 data ___CFConstantStringClassReference __CFConstantStringClassReference
 stub _CFBundleGetMainBundle override
+special _CFStringCreateWithFormat CFStringCreateWithFormat
+special _CFStringAppendFormat CFStringAppendFormat
 
 shape CFArrayCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
 shape CFDictionaryKeyCallBacks 0 6 - p(pp) v(pp) p(p) B(pp) L(p)
@@ -346,3 +442,112 @@ struct _CFDictionaryCreateMutable 3 CFDictionaryValueCallBacks
 struct _CFRunLoopTimerCreate 6 CFRunLoopTimerContext
 struct _CFRunLoopObserverCreate 5 CFRunLoopObserverContext
 struct _CFRunLoopSourceCreate 2 CFRunLoopSourceContext
+
+library /usr/lib/libobjc.A.dylib
+
+special _objc_msgSend objc_msgSend
+special _objc_msgSendSuper objc_msgSendSuper
+special _objc_msgSendSuper2 objc_msgSendSuper2
+special _objc_msgSend_stret objc_msgSend_stret
+special _objc_msgSendSuper_stret objc_msgSendSuper_stret
+special _objc_msgSendSuper2_stret objc_msgSendSuper2_stret
+special _objc_msgSend_fpret objc_msgSend_fpret
+special _objc_msgSend_fp2ret objc_msgSend_fp2ret
+special _objc_setUncaughtExceptionHandler objc_setUncaughtExceptionHandler
+
+stub _objc_msgSend* override
+stub _objc_msgLookup* override
+stub _method_invoke* override
+stub __objc_msgForward* override
+stub _objc_setForwardHandler override
+stub _objc_msgLookupSuper2_stret override
+stub _objc_msgLookup_fp2ret override
+stub _objc_msgLookup_fpret override
+stub _objc_msgLookup_stret override
+stub _objc_msgSendSuper2_fixup override
+stub _objc_msgSendSuper2_stret_debug override
+stub _objc_msgSendSuper2_stret_fixup override
+stub _objc_msgSend_fixup override
+stub _objc_msgSend_fp2ret_debug override
+stub _objc_msgSend_fp2ret_fixup override
+stub _objc_msgSend_fpret_debug override
+stub _objc_msgSend_fpret_fixup override
+stub _objc_msgSend_stret_debug override
+stub _objc_msgSend_stret_fixup override
+
+stub _objc_exception_* override
+stub ___objc_personality* override
+stub _objc_begin_catch override
+stub _objc_end_catch override
+stub _objc_terminate override
+stub _objc_addExceptionHandler override
+stub _objc_removeExceptionHandler override
+data _OBJC_EHTYPE_id OBJC_EHTYPE_id
+data _objc_ehtype_vtable objc_ehtype_vtable
+data __objc_empty_cache _objc_empty_cache
+
+stub _objc_setHook_* override
+stub __objc_setHook_* override
+stub _objc_addLoadImageFunc* override
+stub __objc_init override
+stub __objc_map_images override
+stub __objc_load_image override
+
+stub _class_addMethod override
+stub _class_addMethodsBulk override
+stub _class_replaceMethod override
+stub _class_replaceMethodsBulk override
+stub _method_setImplementation override
+stub __method_setImplementationRawUnsafe override
+stub _imp_implementationWithBlock override
+stub _class_addIvar override
+stub _objc_allocateClassPair override
+stub _objc_registerClassPair override
+
+fn __objc_autoreleasePoolPop _objc_autoreleasePoolPop v(p)
+fn __objc_autoreleasePoolPrint _objc_autoreleasePoolPrint v()
+fn __objc_autoreleasePoolPush _objc_autoreleasePoolPush p()
+fn _objc_alloc objc_alloc p(p)
+fn _objc_allocWithZone objc_allocWithZone p(p)
+fn _objc_alloc_init objc_alloc_init p(p)
+fn _objc_autorelease objc_autorelease p(p)
+fn _objc_autoreleasePoolPop objc_autoreleasePoolPop v(p)
+fn _objc_autoreleasePoolPush objc_autoreleasePoolPush p()
+fn _objc_autoreleaseReturnValue objc_autoreleaseReturnValue p(p)
+fn _objc_claimAutoreleasedReturnValue objc_claimAutoreleasedReturnValue p(p)
+fn _objc_copyCppObjectAtomic objc_copyCppObjectAtomic v(ppc{v(pp)})
+fn _objc_copyStruct objc_copyStruct v(pplbb)
+fn _objc_copyWeak objc_copyWeak v(pp)
+fn _objc_destroyWeak objc_destroyWeak v(p)
+fn _objc_getProperty objc_getProperty p(pplb)
+fn _objc_initWeak objc_initWeak p(pp)
+fn _objc_initWeakOrNil objc_initWeakOrNil p(pp)
+fn _objc_loadWeakRetained objc_loadWeakRetained p(p)
+fn _objc_moveWeak objc_moveWeak v(pp)
+fn _objc_opt_class objc_opt_class p(p)
+fn _objc_opt_isKindOfClass objc_opt_isKindOfClass b(pp)
+fn _objc_opt_new objc_opt_new p(p)
+fn _objc_opt_respondsToSelector objc_opt_respondsToSelector b(pp)
+fn _objc_opt_self objc_opt_self p(p)
+fn _objc_release objc_release v(p)
+fn _objc_retain objc_retain p(p)
+fn _objc_retainAutorelease objc_retainAutorelease p(p)
+fn _objc_retainAutoreleaseReturnValue objc_retainAutoreleaseReturnValue p(p)
+fn _objc_retainAutoreleasedReturnValue objc_retainAutoreleasedReturnValue p(p)
+fn _objc_retainBlock objc_retainBlock p(p)
+fn _objc_retain_autorelease objc_retain_autorelease p(p)
+fn _objc_setProperty objc_setProperty v(pplpbb)
+fn _objc_setProperty_atomic objc_setProperty_atomic v(pppl)
+fn _objc_setProperty_atomic_copy objc_setProperty_atomic_copy v(pppl)
+fn _objc_setProperty_nonatomic objc_setProperty_nonatomic v(pppl)
+fn _objc_setProperty_nonatomic_copy objc_setProperty_nonatomic_copy v(pppl)
+fn _objc_storeStrong objc_storeStrong v(pp)
+fn _objc_storeWeakOrNil objc_storeWeakOrNil p(pp)
+fn _objc_unsafeClaimAutoreleasedReturnValue objc_unsafeClaimAutoreleasedReturnValue p(p)
+
+library /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
+
+special _NSLog NSLog
+stub _NSFrameAddress override
+stub _NSReturnAddress override
+stub _NSCountFrames override

@@ -13,15 +13,19 @@
  * symbol, weak symbol and thread-local symbol listed for x86_64-macos counts,
  * together with those of each re-exported library that names a parent
  * umbrella; $ld$ pseudo-symbols are linker instructions, not exports, and are
- * skipped and counted.  Objective-C classes, ivars and exception types are not
- * exported in this milestone and are only counted.  So the total in the
- * coverage report is the size of the real x86_64 library's export list, and an
- * export no header describes is still in it.
+ * skipped and counted.  The Objective-C classes, exception types and ivars a
+ * .tbd lists apart from its symbols are exports as well, under the names the
+ * linker gives them: _OBJC_CLASS_$_<class> and _OBJC_METACLASS_$_<class> for
+ * a class, _OBJC_EHTYPE_$_<class> for an exception type and
+ * _OBJC_IVAR_$_<class>.<ivar> for an ivar.  So the total in the coverage report
+ * is the size of the real x86_64 library's export list, and an export no
+ * header describes is still in it.
  *
  * ---- finding the declaration ----
  * Each pass in tools/sdkgen/libraries is an umbrella header parsed twice by
  * libclang, once for x86_64-apple-macos<version> and once for arm64, with the
- * SDK as sysroot and any defines the pass names, and an export takes its
+ * SDK as sysroot and any defines the pass names, as C or, for a library the
+ * configuration marks objective-c, as Objective-C, and an export takes its
  * declaration from the first pass that has one.  An export is matched by the
  * x86_64 parse's mangled name, which is the linker's name for it after every
  * asm label, so _opendir$INODE64 finds opendir and plain _opendir, the old
@@ -42,41 +46,71 @@
  * the notation in include/ocerz/abi.h, the x86_64 and arm64 declarations give
  * the same notation, and no pointer in the signature leads somewhere the two
  * architectures disagree about.  Integers take their class from the canonical
- * type's size and signedness, an enum from its underlying integer, any data
- * pointer is p, and a pointer to a function becomes c with the pointee's own
- * notation, which may not itself contain a callback and must fit the 23
+ * type's size and signedness, an enum from its underlying integer, and any
+ * data pointer is p, as are an Objective-C object pointer, id, Class and SEL.
+ * So is IMP, found by its typedef: a method implementation is a function
+ * pointer, but one a program passes around, stores and compares, and making it
+ * a callback would hand native code a trampoline in place of the address the
+ * runtime knows.  A pointer to any other function becomes c with the pointee's
+ * own notation, which may not itself contain a callback and must fit the 47
  * characters the engine keeps for one.  A union declared transparent_union is
  * passed as its first member by both ABIs, so dispatch_object_t is p, and every
- * member is walked as a pointer below; as a result it is an ordinary union.
- * The refusals, each a stub reason: variadic; struct-value for a structure or
- * union by value; long-double, which is 80 bits on one side and 64 on the
- * other; va-list, spotted as a pointer to x86_64's __va_list_tag; block;
- * too-many-args past sixteen; nested-callback; callback-too-long;
- * callback-result for a function pointer handed back to the guest, which would
- * be arm64 code; callback-pointer for a pointer to a function pointer;
- * no-prototype; complex, vector, int128, float-width, atomic and
- * unexposed-type for the rarer kinds; and arch-mismatch when the two
+ * member is walked as a pointer below.
+ *
+ * A structure passed or returned by value becomes braces around its members'
+ * classes, flattened: a nested structure is braces inside braces, and an array
+ * is its elements one after another, scalars or structures alike.  The engine
+ * computes the layout of such a notation itself, the natural C one abi.h
+ * describes, so the notation is only written when that layout is the real
+ * one.  At every level of nesting the offset of each field, and the size and
+ * alignment of the structure, are computed the way the engine will and compared
+ * with clang's, and any difference is struct-layout, which is what a packed
+ * structure or an explicitly aligned field becomes.  The two architectures then
+ * have to agree as they do for any notation.  A structure that cannot be
+ * written at all is refused under the first reason met while walking it:
+ * union-value for a union, by value or as a member; struct-bitfield;
+ * struct-flexible-array for an incomplete, variable-length or zero-length
+ * array; struct-too-many-members past sixteen flattened members;
+ * struct-too-deep past eight levels; struct-empty; struct-incomplete for a
+ * record clang cannot size; struct-callback for a function pointer member,
+ * since a callback cannot be carried inside braces; and a member's own reason,
+ * such as long-double or block, for a member no class describes.  A structure
+ * inside a callback's notation follows the same rules and counts toward its
+ * length.
+ *
+ * The other refusals, each a stub reason: variadic; long-double, which is 80
+ * bits on one side and 64 on the other; va-list, spotted as a pointer to
+ * x86_64's __va_list_tag; block; too-many-args past sixteen; nested-callback;
+ * callback-too-long; callback-result for a function pointer handed back to the
+ * guest, which would be arm64 code; callback-pointer for a pointer to a
+ * function pointer; no-prototype; complex, vector, int128, float-width, atomic
+ * and unexposed-type for the rarer kinds; and arch-mismatch when the two
  * declarations of one function give different notations.  Two notations that
  * differ only between i and u, or l and L, are not a mismatch: boolean_t is
  * unsigned int on x86_64 and int on arm64, and at 32 and 64 bits neither
- * callee reads more than the value's own width, so the x86_64 notation is
- * written and the difference is printed as a note.
+ * callee reads more than the value's own width.  Nor is b on x86_64 where
+ * arm64 has B, which is Objective-C's BOOL, a signed char on x86_64 and a bool
+ * on arm64: its values are 0 and 1, which extend alike either way.  In both
+ * cases the x86_64 notation is written and the difference is printed as a
+ * note.
  *
  * Pointers are then walked on both architectures in step.  A pointer whose
  * target has a different layout on the two - size, alignment, any field's
- * offset, size or bit width, compared through embedded records, arrays and
- * the targets of pointer fields - is layout; an incomplete record is opaque
- * and fine, and two scalars of different kinds but one size and alignment,
- * such as unsigned long and unsigned long long, are the same bytes.  A pointer
- * to a record holding a function pointer or a block in its own storage is
- * callback-struct, because native code would call guest code through it,
- * unless the overrides give that argument a struct record.  The same checks
- * run on a pointer result and on the parameters of a callback.  The walk
- * through pointer fields can meet a cycle, so a record found again while its
- * own comparison is under way is assumed equal for that moment, and a record
- * whose answer depended on such an assumption about a record further up is
- * not remembered: "different" never rests on an assumption, "equal" is cached
- * only once its whole cycle is settled.
+ * offset, size or bit width, compared through embedded records, arrays and the
+ * targets of pointer fields - is layout; an incomplete record is opaque and
+ * fine, and two scalars of different kinds but one size and alignment, such as
+ * unsigned long and unsigned long long, are the same bytes.  A pointer to a
+ * record holding a function pointer or a block in its own storage is
+ * callback-struct, because native code would call guest code through it, unless
+ * the overrides give that argument a struct record.  The same checks run on a
+ * pointer result, on the parameters of a callback, on every pointer member of a
+ * structure passed or returned by value, and on a parameter declared as an
+ * array, which is a pointer to its first element however the header spells
+ * it.  The walk through pointer fields can meet a cycle, so a record found
+ * again while its own comparison is under way is assumed equal for that moment,
+ * and a record whose answer depended on such an assumption about a record
+ * further up is not remembered: "different" never rests on an assumption,
+ * "equal" is cached only once its whole cycle is settled.
  *
  * ---- variables and the undeclared ----
  * A variable becomes data when its type has the same layout on both
@@ -86,10 +120,23 @@
  * stores its own function there hands native code x86 to call.  An export with
  * no declaration is looked up on the host: a symbol inside a section marked as
  * holding instructions is a function nobody declared and becomes stub
- * no-declaration, while one in any other section is omitted as
- * no-declaration-data and one the host lacks as no-declaration-missing, since
- * binding a variable's name to a stub would hand the guest code where it
- * expects data.
+ * no-declaration, one in any other section becomes data bound to the native
+ * variable of the same name, and one the host lacks is omitted as
+ * no-declaration-missing.  Binding a variable's name to a stub would hand the
+ * guest code where it expects data; binding it to the native variable hands it
+ * the variable itself, which is what the compiler-emitted references need:
+ * __kCFBooleanTrue behind @YES, __NSArray0__struct behind an empty @[] literal,
+ * and the calendar identifiers.  No header describes its layout, so nothing
+ * checks that the two architectures agree on it; every such variable seen in
+ * practice is an object or a pointer.  Swift's mangled symbols are the
+ * exception and are omitted as swift: they are type metadata and witness tables
+ * for the frameworks' Swift overlays, and an Intel Swift program bound to arm64
+ * metadata would fail somewhere deep inside instead of refusing to load.  An Objective-C class, metaclass or exception type becomes data
+ * bound to the same name in the host library, checked with dlsym like any other
+ * host symbol, so a guest's class references and superclass pointers reach the
+ * native classes.  An ivar is omitted as objc-ivar: its export is the offset a
+ * guest subclass compiles its field accesses against, which belongs with the
+ * guest classes a later milestone builds.
  *
  * ---- overrides ----
  * tools/sdkgen/overrides holds records in the database's own syntax that
@@ -101,19 +148,21 @@
  * so a record the guest reads through inline macros must still agree field by
  * field.  A stub override names an export exactly, and then also covers its
  * $-suffixed variants, or with a fnmatch pattern, which only reaches exports
- * the rules made fn or stub.  An override scoped to a library that matches
- * nothing there is an error, as is an opaque record no pointer ever reaches, a
- * struct record whose export does not come out fn, a struct record whose
- * argument is not a pointer to the named structure, and a shape whose words
- * disagree with the structure the header declares.
+ * the rules made fn or stub; an exact name wins over a variant and a variant
+ * over a pattern.  An override scoped to a library that matches nothing there
+ * is an error, as is an opaque record no pointer ever reaches, a struct record
+ * whose export does not come out fn, a struct record whose argument is not a
+ * pointer to the named structure, and a shape whose words disagree with the
+ * structure the header declares.
  *
  * ---- output ----
  * The database goes to <out>/macos/<version>/<leaf>.api, records sorted by
  * export name, then shapes, then struct records, then the omitted exports as
  * comments, with nothing in it that varies between runs.  The coverage counts
  * go to <build>/<leaf>.coverage and to standard output, and every record type
- * whose layout was measured goes to <build>/<leaf>.layouts, for
- * tools/sdkgen/layout_check.sh to hold against clang's own record dumps.
+ * whose layout was measured goes to <build>/<leaf>.layouts, with the header,
+ * defines and language it was parsed with, for tools/sdkgen/layout_check.sh to
+ * hold against clang's own record dumps.
  */
 #include "clang_api.h"
 #include "tbd.h"
@@ -132,7 +181,9 @@
 #define ARCH_X86 0
 #define ARCH_ARM 1
 #define SIG_MAX_ARGS 16
-#define SIG_CB_MAX 24
+#define SIG_CB_MAX 48
+#define SIG_STRUCT_MEMBERS 16
+#define SIG_STRUCT_DEPTH 8
 #define MAX_PASSES 8
 #define MAX_DEFINES 8
 #define MAX_FIELDS 4096
@@ -371,6 +422,7 @@ typedef struct LibConfig {
     char *name;
     char *install;
     char *tbd;
+    char *language;
     Pass passes[MAX_PASSES];
     int npasses;
 } LibConfig;
@@ -397,6 +449,7 @@ typedef struct Rec {
     char *filler;
     char *bytes;
     int override;
+    int objc;
     int functionish;
     int host_missing;
     char *note;
@@ -582,11 +635,152 @@ static CXType first_field_type(CXType rec)
     return clang_getCursorType(f);
 }
 
+typedef struct FieldList {
+    CXCursor *v;
+    int n;
+} FieldList;
+
+static int field_visit(CXCursor c, CXClientData d)
+{
+    FieldList *fl = d;
+    if (fl->n < MAX_FIELDS)
+        fl->v[fl->n++] = c;
+    return CXVisit_Continue;
+}
+
+static void fields_of(CXType rec, FieldList *fl)
+{
+    fl->v = xalloc(NULL, MAX_FIELDS * sizeof *fl->v);
+    fl->n = 0;
+    clang_Type_visitFields(rec, field_visit, fl);
+    if (fl->n >= MAX_FIELDS)
+        die("a record has more than %d fields", MAX_FIELDS);
+}
+
+typedef struct Flat {
+    Buf *out;
+    int members;
+    int layout_bad;
+} Flat;
+
+static long long align_up(long long n, long long align)
+{
+    return (n + align - 1) / align * align;
+}
+
+static const char *type_class(CXType t, int depth, int is_result, Buf *out);
+
+static const char *flat_record(Flat *f, CXType rec, int depth, int level, long long *size,
+                               long long *align);
+
+static int is_imp(CXType t)
+{
+    return typedef_chain_has(t, "IMP");
+}
+
+static const char *flat_type(Flat *f, CXType t, int depth, int level, long long *size,
+                             long long *align)
+{
+    CXType c = canon(t);
+    if (c.kind == TK.Record) {
+        if (is_va_list_tag(c))
+            return "va-list";
+        return flat_record(f, c, depth, level + 1, size, align);
+    }
+    if (c.kind == TK.ConstantArray) {
+        long long n = clang_getArraySize(c);
+        if (n <= 0)
+            return "struct-flexible-array";
+        Buf one = { 0 };
+        Flat g = { &one, 0, 0 };
+        long long esize = 0, ealign = 1;
+        const char *r = flat_type(&g, clang_getArrayElementType(c), depth, level, &esize, &ealign);
+        if (!r && (n > SIG_STRUCT_MEMBERS || f->members + g.members * n > SIG_STRUCT_MEMBERS))
+            r = "struct-too-many-members";
+        if (!r) {
+            for (long long i = 0; i < n; i++)
+                buf_add(f->out, buf_str(&one));
+            f->members += (int)(g.members * n);
+            f->layout_bad |= g.layout_bad;
+            *size = esize * n;
+            *align = ealign;
+        }
+        free(one.s);
+        return r;
+    }
+    if (c.kind == TK.IncompleteArray || c.kind == TK.VariableArray)
+        return "struct-flexible-array";
+    if (c.kind == TK.Pointer && is_fn_kind(canon(clang_getPointeeType(c)).kind) && !is_imp(t))
+        return "struct-callback";
+    Buf one = { 0 };
+    const char *r = type_class(t, depth, 0, &one);
+    if (!r) {
+        if (++f->members > SIG_STRUCT_MEMBERS) {
+            r = "struct-too-many-members";
+        } else {
+            char k = buf_str(&one)[0];
+            *size = strchr("bB", k) ? 1 : strchr("hH", k) ? 2 : strchr("iuf", k) ? 4 : 8;
+            *align = *size;
+            if (clang_Type_getSizeOf(c) != *size)
+                f->layout_bad = 1;
+            buf_add(f->out, buf_str(&one));
+        }
+    }
+    free(one.s);
+    return r;
+}
+
+static const char *flat_record(Flat *f, CXType rec, int depth, int level, long long *size,
+                               long long *align)
+{
+    if (level > SIG_STRUCT_DEPTH)
+        return "struct-too-deep";
+    if (clang_getTypeDeclaration(rec).kind == CK.UnionDecl)
+        return "union-value";
+    long long real_size = clang_Type_getSizeOf(rec), real_align = clang_Type_getAlignOf(rec);
+    if (real_size < 0 || real_align < 0)
+        return "struct-incomplete";
+    FieldList fl;
+    fields_of(rec, &fl);
+    const char *r = fl.n == 0 ? "struct-empty" : NULL;
+    long long off = 0, al = 1;
+    buf_addc(f->out, '{');
+    for (int i = 0; !r && i < fl.n; i++) {
+        if (clang_Cursor_isBitField(fl.v[i])) {
+            r = "struct-bitfield";
+            break;
+        }
+        long long msize = 0, malign = 1;
+        r = flat_type(f, clang_getCursorType(fl.v[i]), depth, level, &msize, &malign);
+        if (r)
+            break;
+        off = align_up(off, malign);
+        if (clang_Cursor_getOffsetOfField(fl.v[i]) != off * 8)
+            f->layout_bad = 1;
+        off += msize;
+        if (malign > al)
+            al = malign;
+    }
+    free(fl.v);
+    if (r)
+        return r;
+    buf_addc(f->out, '}');
+    *size = align_up(off, al);
+    *align = al;
+    if (*size != real_size || *align != real_align)
+        f->layout_bad = 1;
+    return NULL;
+}
+
 static const char *type_class(CXType t, int depth, int is_result, Buf *out)
 {
     CXType c = canon(t);
     int k = c.kind;
     int sign;
+    if (k == TK.Pointer && is_imp(t)) {
+        buf_addc(out, 'p');
+        return NULL;
+    }
     if (k == TK.Void) {
         if (!is_result)
             return "void-argument";
@@ -667,7 +861,16 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
             return "va-list";
         if (!is_result && transparent_union(c))
             return type_class(first_field_type(c), depth, is_result, out);
-        return "struct-value";
+        Buf sb = { 0 };
+        Flat f = { &sb, 0, 0 };
+        long long size = 0, align = 1;
+        const char *r = flat_record(&f, c, depth, 1, &size, &align);
+        if (!r && f.layout_bad)
+            r = "struct-layout";
+        if (!r)
+            buf_add(out, buf_str(&sb));
+        free(sb.s);
+        return r;
     }
     if (k == TK.Complex)
         return "complex";
@@ -682,23 +885,26 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
 
 static const char *fn_notation(CXType fnc, int depth, Buf *out)
 {
-    if (fnc.kind == TK.FunctionNoProto)
+    CXType fc = canon(fnc);
+    if (fc.kind == TK.FunctionNoProto)
         return "no-prototype";
-    if (fnc.kind != TK.FunctionProto)
+    if (fc.kind != TK.FunctionProto)
         return "unsupported-type";
-    if (clang_isFunctionTypeVariadic(fnc))
+    if (clang_isFunctionTypeVariadic(fc))
         return "variadic";
-    int n = clang_getNumArgTypes(fnc);
+    int n = clang_getNumArgTypes(fc);
     if (n < 0)
         return "no-prototype";
     if (n > SIG_MAX_ARGS)
         return "too-many-args";
-    const char *r = type_class(clang_getResultType(fnc), depth, 1, out);
+    CXType rs = clang_getResultType(fnc);
+    const char *r = type_class(is_imp(rs) ? rs : clang_getResultType(fc), depth, 1, out);
     if (r)
         return r;
     buf_addc(out, '(');
     for (int i = 0; i < n; i++) {
-        r = type_class(clang_getArgType(fnc, (unsigned)i), depth, 0, out);
+        CXType as = fnc.kind == TK.FunctionProto ? clang_getArgType(fnc, (unsigned)i) : fc;
+        r = type_class(is_imp(as) ? as : clang_getArgType(fc, (unsigned)i), depth, 0, out);
         if (r)
             return r;
     }
@@ -706,60 +912,87 @@ static const char *fn_notation(CXType fnc, int depth, Buf *out)
     return NULL;
 }
 
+static int sig_valid(const char *s, int allow_cb);
+
+static int sig_struct_valid(const char **sp, int level, int *members)
+{
+    const char *s = *sp + 1;
+    int count = 0;
+    if (level > SIG_STRUCT_DEPTH)
+        return 0;
+    while (*s != '}') {
+        if (*s == '{') {
+            if (!sig_struct_valid(&s, level + 1, members))
+                return 0;
+        } else if (*s && strchr("bBhHiulLpfd", *s)) {
+            if (++*members > SIG_STRUCT_MEMBERS)
+                return 0;
+            s++;
+        } else {
+            return 0;
+        }
+        count++;
+    }
+    if (count == 0)
+        return 0;
+    *sp = s + 1;
+    return 1;
+}
+
+static int sig_class_valid(const char **sp, int allow_cb, int is_result)
+{
+    const char *s = *sp;
+    if (*s == '{') {
+        int members = 0;
+        if (!sig_struct_valid(&s, 1, &members))
+            return 0;
+        *sp = s;
+        return 1;
+    }
+    if (*s == 'c' && !is_result) {
+        if (!allow_cb || s[1] != '{')
+            return 0;
+        const char *open = s + 2, *close = open;
+        int level = 0;
+        for (; *close; close++) {
+            if (*close == '{')
+                level++;
+            else if (*close == '}' && level-- == 0)
+                break;
+        }
+        if (*close != '}')
+            return 0;
+        size_t len = (size_t)(close - open);
+        if (len >= SIG_CB_MAX || memchr(open, 'c', len))
+            return 0;
+        char inner[SIG_CB_MAX];
+        memcpy(inner, open, len);
+        inner[len] = '\0';
+        if (!sig_valid(inner, 0))
+            return 0;
+        *sp = close + 1;
+        return 1;
+    }
+    if (!*s || !strchr(is_result ? "vbBhHiulLpfd" : "bBhHiulLpfd", *s))
+        return 0;
+    *sp = s + 1;
+    return 1;
+}
+
 static int sig_valid(const char *s, int allow_cb)
 {
-    if (!strchr("vbBhHiulLpfd", *s) || !*s)
+    if (!sig_class_valid(&s, allow_cb, 1))
         return 0;
-    s++;
     if (*s++ != '(')
         return 0;
     int n = 0;
     while (*s && *s != ')') {
-        char c = *s++;
-        if (c == 'c') {
-            if (!allow_cb || *s != '{')
-                return 0;
-            const char *close = strchr(s, '}');
-            if (!close)
-                return 0;
-            size_t len = (size_t)(close - s - 1);
-            if (len >= SIG_CB_MAX || memchr(s + 1, 'c', len))
-                return 0;
-            char inner[SIG_CB_MAX];
-            memcpy(inner, s + 1, len);
-            inner[len] = '\0';
-            if (!sig_valid(inner, 0))
-                return 0;
-            s = close + 1;
-        } else if (!strchr("bBhHiulLpfd", c)) {
+        if (!sig_class_valid(&s, allow_cb, 0))
             return 0;
-        }
         if (++n > SIG_MAX_ARGS)
             return 0;
     }
     return *s == ')' && s[1] == '\0';
-}
-
-typedef struct FieldList {
-    CXCursor *v;
-    int n;
-} FieldList;
-
-static int field_visit(CXCursor c, CXClientData d)
-{
-    FieldList *fl = d;
-    if (fl->n < MAX_FIELDS)
-        fl->v[fl->n++] = c;
-    return CXVisit_Continue;
-}
-
-static void fields_of(CXType rec, FieldList *fl)
-{
-    fl->v = xalloc(NULL, MAX_FIELDS * sizeof *fl->v);
-    fl->n = 0;
-    clang_Type_visitFields(rec, field_visit, fl);
-    if (fl->n >= MAX_FIELDS)
-        die("a record has more than %d fields", MAX_FIELDS);
 }
 
 static int nameable(const char *spelling)
@@ -1014,6 +1247,36 @@ static const char *pointer_checks(CXType tx, CXType ta, int waived)
     return NULL;
 }
 
+static const char *member_checks(CXType tx, CXType ta)
+{
+    CXType x = canon(tx), a = canon(ta);
+    if (x.kind == TK.ConstantArray && a.kind == TK.ConstantArray)
+        return member_checks(clang_getArrayElementType(x), clang_getArrayElementType(a));
+    if (x.kind == TK.Pointer && a.kind == TK.Pointer) {
+        if (is_imp(tx))
+            return NULL;
+        return pointer_checks(tx, ta, 0);
+    }
+    if (x.kind != TK.Record || a.kind != TK.Record)
+        return NULL;
+    FieldList fx, fa;
+    fields_of(x, &fx);
+    fields_of(a, &fa);
+    const char *r = fx.n == fa.n ? NULL : "layout";
+    for (int i = 0; !r && i < fx.n; i++)
+        r = member_checks(clang_getCursorType(fx.v[i]), clang_getCursorType(fa.v[i]));
+    free(fx.v);
+    free(fa.v);
+    return r;
+}
+
+static const char *value_checks(CXType tx, CXType ta)
+{
+    if (!layout_same(canon(tx), canon(ta), tx))
+        return "layout";
+    return member_checks(tx, ta);
+}
+
 static const char *pair_checks(CXType fx, CXType fa, int depth, const Waiver *w, int nw)
 {
     fx = desugar_to(fx, TK.FunctionProto, TK.FunctionNoProto);
@@ -1022,6 +1285,9 @@ static const char *pair_checks(CXType fx, CXType fa, int depth, const Waiver *w,
     for (int i = -1; i < n; i++) {
         CXType tx = i < 0 ? clang_getResultType(fx) : clang_getArgType(fx, (unsigned)i);
         CXType ta = i < 0 ? clang_getResultType(fa) : clang_getArgType(fa, (unsigned)i);
+        int kx = canon(tx).kind;
+        if (kx == TK.ConstantArray || kx == TK.IncompleteArray || kx == TK.VariableArray)
+            tx = clang_getArgType(canon(fx), (unsigned)i);
         if (i >= 0 && canon(tx).kind == TK.Record && transparent_union(canon(tx))) {
             FieldList ux, ua;
             fields_of(canon(tx), &ux);
@@ -1042,7 +1308,13 @@ static const char *pair_checks(CXType fx, CXType fa, int depth, const Waiver *w,
                 return r;
             continue;
         }
-        if (canon(tx).kind != TK.Pointer || canon(ta).kind != TK.Pointer)
+        if (canon(tx).kind == TK.Record && canon(ta).kind == TK.Record) {
+            const char *r = value_checks(tx, ta);
+            if (r)
+                return r;
+            continue;
+        }
+        if (canon(tx).kind != TK.Pointer || canon(ta).kind != TK.Pointer || is_imp(tx))
             continue;
         CXType pxs = clang_getPointeeType(desugar_to(tx, TK.Pointer, TK.Pointer));
         if (is_fn_kind(canon(pxs).kind)) {
@@ -1122,6 +1394,10 @@ static void parse_pass(CXIndex index, Pass *p)
         snprintf(target, sizeof target, "%s-apple-macos%s", g_arch_name[arch], g_version);
         const char *args[16 + MAX_DEFINES];
         int n = 0;
+        int objc = strcmp(g_lib.language, "objective-c") == 0;
+        const char *file = objc ? "sdkgen-umbrella.m" : "sdkgen-umbrella.c";
+        args[n++] = "-x";
+        args[n++] = g_lib.language;
         args[n++] = "-target";
         args[n++] = target;
         args[n++] = "-isysroot";
@@ -1131,9 +1407,9 @@ static void parse_pass(CXIndex index, Pass *p)
         for (int i = 0; i < p->ndefines; i++)
             args[n++] = p->defines[i];
         char *src = xprintf("#include \"%s\"\n", p->header);
-        struct CXUnsavedFile uf = { "sdkgen-umbrella.c", src, strlen(src) };
+        struct CXUnsavedFile uf = { file, src, strlen(src) };
         CXTranslationUnit tu = NULL;
-        int rc = clang_parseTranslationUnit2(index, "sdkgen-umbrella.c", args, n, &uf, 1,
+        int rc = clang_parseTranslationUnit2(index, file, args, n, &uf, 1,
                                              CXTranslationUnit_SkipFunctionBodies, &tu);
         if (rc != 0 || !tu)
             die("libclang could not parse %s for %s (error %d)", p->header, g_arch_name[arch], rc);
@@ -1226,6 +1502,14 @@ static void load_config(const char *name)
                 g_lib.install = xstrdup(w[2]);
                 g_lib.tbd = xstrdup(w[3]);
             }
+        } else if (strcmp(w[0], "language") == 0) {
+            if (n != 2 || (strcmp(w[1], "c") != 0 && strcmp(w[1], "objective-c") != 0))
+                die("%s: language wants c or objective-c", path);
+            if (!in)
+                continue;
+            if (g_lib.language)
+                die("%s names a language for %s twice", path, name);
+            g_lib.language = xstrdup(w[1]);
         } else if (strcmp(w[0], "pass") == 0) {
             if (!in)
                 continue;
@@ -1245,6 +1529,8 @@ static void load_config(const char *name)
         die("%s has no library named %s", path, name);
     if (!g_lib.npasses)
         die("%s gives library %s no pass", path, name);
+    if (!g_lib.language)
+        g_lib.language = xstrdup("c");
     free(text);
     free(path);
 }
@@ -1255,6 +1541,8 @@ static const char *leaf_of(const char *install)
     return s ? s + 1 : install;
 }
 
+enum { OBJC_NONE, OBJC_DATA, OBJC_IVAR };
+
 typedef struct ExportSet {
     Map names;
     char **v;
@@ -1262,6 +1550,7 @@ typedef struct ExportSet {
     int cap;
     int ld_pseudo;
     Map objc[3];
+    Map objc_kind;
 } ExportSet;
 
 static void export_add(ExportSet *e, const char *name)
@@ -1291,9 +1580,24 @@ static void collect_section(ExportSet *e, const TbdSection *sec)
             for (int j = 0; j < lists[l]->n; j++)
                 export_add(e, lists[l]->v[j]);
         const TbdList *objc[3] = { &it->objc_classes, &it->objc_eh_types, &it->objc_ivars };
-        for (int l = 0; l < 3; l++)
-            for (int j = 0; j < objc[l]->n; j++)
-                map_set(&e->objc[l], objc[l]->v[j], 1);
+        for (int l = 0; l < 3; l++) {
+            for (int j = 0; j < objc[l]->n; j++) {
+                const char *v = objc[l]->v[j];
+                map_set(&e->objc[l], v, 1);
+                char *names[2] = { NULL, NULL };
+                if (l == 0) {
+                    names[0] = xprintf("_OBJC_CLASS_$_%s", v);
+                    names[1] = xprintf("_OBJC_METACLASS_$_%s", v);
+                } else {
+                    names[0] = xprintf(l == 1 ? "_OBJC_EHTYPE_$_%s" : "_OBJC_IVAR_$_%s", v);
+                }
+                for (int k = 0; k < 2 && names[k]; k++) {
+                    export_add(e, names[k]);
+                    map_set(&e->objc_kind, names[k], l == 2 ? OBJC_IVAR : OBJC_DATA);
+                    free(names[k]);
+                }
+            }
+        }
     }
 }
 
@@ -1538,7 +1842,7 @@ static int same_but_signedness(const char *x, const char *a)
     for (; *x; x++, a++) {
         char cx = *x == 'u' ? 'i' : *x == 'L' ? 'l' : *x;
         char ca = *a == 'u' ? 'i' : *a == 'L' ? 'l' : *a;
-        if (cx != ca)
+        if (cx != ca && !(*x == 'b' && *a == 'B'))
             return 0;
     }
     return 1;
@@ -1546,6 +1850,16 @@ static int same_but_signedness(const char *x, const char *a)
 
 static void classify(Rec *r)
 {
+    if (r->objc == OBJC_DATA) {
+        r->kind = R_DATA;
+        r->host = host_name(r->name);
+        r->host_missing = !host_has(r->host);
+        return;
+    }
+    if (r->objc == OBJC_IVAR) {
+        set_omit(r, "objc-ivar");
+        return;
+    }
     Pass *p = NULL;
     CXCursor x = { 0 }, a = { 0 };
     int have_arm = 0;
@@ -1575,8 +1889,13 @@ static void classify(Rec *r)
             set_omit(r, "no-declaration-missing");
         else if (host_is_code(addr))
             set_stub(r, "no-declaration");
-        else
-            set_omit(r, "no-declaration-data");
+        else if (strncmp(r->name, "_$s", 3) == 0 || strncmp(r->name, "_$S", 3) == 0)
+            set_omit(r, "swift");
+        else {
+            r->kind = R_DATA;
+            r->host = xstrdup(r->name + 1);
+            r->host_missing = 0;
+        }
         return;
     }
 
@@ -1628,15 +1947,15 @@ static void classify(Rec *r)
 
     CXType tx = clang_getCursorType(x), ta = clang_getCursorType(a);
     Buf sx = { 0 }, sa = { 0 };
-    const char *rx = fn_notation(canon(tx), 0, &sx);
+    const char *rx = fn_notation(desugar_to(tx, TK.FunctionProto, TK.FunctionNoProto), 0, &sx);
     if (rx) {
         set_stub(r, rx);
     } else {
-        const char *ra = fn_notation(canon(ta), 0, &sa);
+        const char *ra = fn_notation(desugar_to(ta, TK.FunctionProto, TK.FunctionNoProto), 0, &sa);
         int same = !ra && strcmp(buf_str(&sx), buf_str(&sa)) == 0;
         if (!ra && !same && same_but_signedness(buf_str(&sx), buf_str(&sa))) {
             same = 1;
-            r->note = xprintf("only the signedness of a 32- or 64-bit class differs: x86_64 %s, arm64 %s",
+            r->note = xprintf("only the signedness of a class differs: x86_64 %s, arm64 %s",
                               buf_str(&sx), buf_str(&sa));
         }
         if (!same) {
@@ -1863,6 +2182,7 @@ int main(int argc, char **argv)
         die("out of memory");
     for (int i = 0; i < ex.n; i++) {
         recs[i].name = ex.v[i];
+        recs[i].objc = map_get(&ex.objc_kind, ex.v[i]) > 0 ? map_get(&ex.objc_kind, ex.v[i]) : OBJC_NONE;
         classify(&recs[i]);
     }
     for (int i = 0; i < ex.n; i++)
@@ -2002,6 +2322,7 @@ int main(int argc, char **argv)
     char *lay_path = xprintf("%s/%s.layouts", build, leaf);
     FILE *lf = open_out(lay_path);
     fprintf(lf, "header %s\n", g_lib.passes[0].header);
+    fprintf(lf, "language %s\n", g_lib.language);
     for (int i = 0; i < g_lib.passes[0].ndefines; i++)
         fprintf(lf, "define %s\n", g_lib.passes[0].defines[i]);
     char **names = xalloc(NULL, (size_t)(g_nmeas + 1) * sizeof *names);

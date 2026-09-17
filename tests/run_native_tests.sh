@@ -59,12 +59,15 @@
 # real libSystem does and getpwnam bound. 72 means
 # everything bound and the guest ran, and what is missing is the bridge behind
 # one export rather than the export itself; xbench_dyn no longer reaches it, so
-# bridge_unimpl pins it with a program whose only import is printf, which the
+# bridge_unimpl pins it with a program whose only import is scanf, which the
 # virtual library exports and the bridge deliberately does not implement -- it
 # is variadic, Apple's arm64 passes variadic arguments on the stack where x86-64
 # passes them in registers, and no fixed signature can say where the named
 # arguments stop. That fixture's one import used to be qsort, until M5 gave a
-# callback a way back into guest code. Being the only import, it is also the
+# callback a way back into guest code, and then printf, until M10 put a format
+# veneer in front of it that reads the format string to learn what every
+# argument is. No veneer stands in front of scanf, and the generated database
+# keeps every member of its family a stub. Being the only import, it is also the
 # only symbol the bridge line can name, so that case pins the symbol as well as
 # the shape of the line, and it checks the fixture's import table with nm first
 # so that a toolchain which starts importing something else is reported as that
@@ -259,7 +262,7 @@
 # with cache mode, where the real x86 libpthread runs the same start routines on
 # threads ocerz creates for the guest.
 #
-# The thread, tlv_*, signal_* and cf_* fixtures alone are built without
+# The thread, tlv_*, signal_*, cf_* and M10 fixtures alone are built without
 # -fno-stack-protector, and that is deliberate. clang emits the stack protector
 # by default, and a protected x86_64 function reads ___stack_chk_guard, which is
 # a data symbol rather than a function. Until M7a the virtual libSystem exported only functions, so a
@@ -720,6 +723,160 @@
 # a guest function pointer left unconverted in a structure looks exactly like
 # that.
 #
+# M10 gives native mode Objective-C and Foundation, and the variadic functions
+# nearly every program calls. A program linking Foundation binds its imports to
+# two more virtual libraries, libobjc and Foundation, generated from the SDK
+# like the others, whose class references are the host's own class objects, so
+# the guest holds arm64 objects the way it holds CoreFoundation's. objc_msgSend
+# has no signature a database could give it, since it takes whatever the method
+# it reaches takes, so its stub goes to a handler that canonicalizes the
+# selector the guest's image holds, looks the method up in the native runtime
+# and takes the argument classes from the method's own signature there. A
+# variadic function has no complete signature either, and Apple's arm64 passes
+# every variadic argument on the stack where x86-64 passes the first ones in
+# registers, so printf and its relatives in libSystem, CFStringCreateWithFormat
+# and CFStringAppendFormat, and NSLog are format veneers: the handler walks the
+# format string to learn the class of each argument that follows, gathers them
+# from the x86 registers and stack in that order, and makes the native call with
+# them where arm64 wants them. A variadic selector, stringWithFormat: or
+# arrayWithObjects:, has the same problem inside a message send, and its
+# arguments have to be moved the same way. Four fixtures cover it, compiled at
+# test time. Three are Objective-C, built with -fobjc-arc against the SDK's
+# Foundation, and define no class or category of their own, which is M11's. All
+# four are shaped like the cf_* ones: one status line per group of checks,
+# "<name> <group> ok ..." or "<name> <group> bad:<hex> ...", with the bits
+# numbered in source order within the group, then "<name> ok" or
+# "<name> bad:<hex>" with a bit per failed group, and progress notes on stderr.
+#
+# objc_foundation sends the messages that give Foundation no guest code to call,
+# in six groups, all inside @autoreleasepool, so the pool's push and pop cross
+# too. string creates a string holding Czech letters and a euro sign with
+# stringWithUTF8String:, which must read back its fifteen UTF-16 units, three
+# characters above 0xff and its UTF-8 bytes; it must be isEqual: to the @"..."
+# literal of the same text in both directions and hash like it, and
+# uppercaseString, substringWithRange:, which takes an NSRange by value, and
+# rangeOfString:, which returns one, must give the right text and ranges, with a
+# string that is not there found at exactly NSNotFound, which a location cut to
+# 32 bits is not. tagged puts a five-letter ASCII string, which Foundation hands
+# back as a tagged pointer with no isa to read, and one too long to be tagged
+# through the same length, character, equality, hash and range messages, and
+# appends one to the other. number reads back numberWithInt:, numberWithDouble:
+# and numberWithLongLong:, and the @42 and @3.5 literals, which clang lays down
+# as constant objects whose isa is Foundation's NSConstantIntegerNumber and
+# NSConstantDoubleNumber, so their class must be the one NSClassFromString
+# names; compare: must answer exactly -1, 0 or 1. collection builds @[...] and
+# @{...} literals from objects created at run time, which clang compiles to
+# arrayWithObjects:count: and dictionaryWithObjects:forKeys:count: over arrays
+# on the guest's stack, and every element must come back as the very pointer
+# that went in, the same pointer on every read, whether fetched by index, by
+# subscript or by a key created separately at another address, and
+# containsObject: must find an equal string at another address. describe takes
+# the description of an array of strings and numbers, and the fixture puts its
+# UTF8String after the summary line, so the one buffered write is last in
+# program order. range crosses NSRange by value through Foundation: rangeValue
+# on a valueWithRange: whose location lies above 32 bits, since NSMakeRange is
+# inline and never crosses, and NSStringFromRange, NSRangeFromString,
+# NSIntersectionRange and NSUnionRange, which are C functions taking or
+# returning the structure; the line carries the text NSStringFromRange produced.
+#
+# objc_variadic makes the variadic calls, in four groups, and writes every
+# string it builds on a line of its own after its group's status line, as well
+# as comparing it with the text it must hold. format sends stringWithFormat: a
+# format mixing %d, %@, %.2f, %s, %ld, %u, %lld, %x, %e, %g, %c, %zu, %hhd and
+# %hd over sixteen integer-class arguments and nine doubles, so on x86-64 the
+# first few of each class arrive in registers and the rest on the stack,
+# interleaved there in argument order, and then sends initWithFormat: to an
+# allocated string and stringByAppendingFormat: to the result. objects sends
+# arrayWithObjects: with three objects and with seven before the nil, and
+# dictionaryWithObjectsAndKeys: with three pairs and with one, and every element
+# must come back as the very pointer passed. append sends appendFormat: to a
+# mutable string three times, once with ten doubles. cfformat calls
+# CFStringCreateWithFormat, which no cf_* fixture could, with a %@ among seven
+# integer-class and ten double arguments, and CFStringAppendFormat with a %@ of
+# its own.
+#
+# native_printf is plain C, two translation units linked together. The first is
+# built with _FORTIFY_SOURCE=0, because the SDK turns sprintf into __sprintf_chk
+# at any optimization level otherwise, and calls printf, fprintf to stdout and
+# to stderr, snprintf into a buffer and into one too small, sprintf, asprintf,
+# and dprintf to both descriptors, with %d %u %ld %lld %zu %x %c %s %p %f %e %g
+# and * widths and precisions, and with more than six integer-class and more
+# than eight double arguments in the calls that allow it. The second is built at
+# -O2 with _FORTIFY_SOURCE=2 and makes the same kind of calls into buffers whose
+# size the compiler knows, so it calls __sprintf_chk and __snprintf_chk. Both
+# are built with -fno-builtin like the cf_* fixtures, which matters more than
+# usual here: without it clang turns a bounded __snprintf_chk back into
+# snprintf. Every return value goes on a status line, every buffer is written to
+# stdout, where the comparisons see it, and all but the two _chk ones are also
+# compared with the text they must hold; a %p is checked only for being 0x
+# followed by something other than 0, since the address changes from run to run,
+# while a null %p must read exactly 0x0. stdout is flushed before the dprintf to
+# it, so its buffered lines come first in every mode. The two lines the fixture
+# writes to stderr begin "native_printf stderr ", and the case compares those
+# lines across runs the way it compares stdout, leaving out ocerz's own lines
+# and the progress notes.
+#
+# native_nslog calls NSLog four times from one function: the x=%d y=%@ call, one
+# with eight integer-class and ten double arguments, one with a non-ASCII %@ and
+# a %C, and one with no arguments at all. Its %s arguments are ASCII, because
+# NSLog reads a C string in the system encoding, which is a setting of the user
+# rather than of either architecture. NSLog writes each message to stderr behind
+# a prefix of the date, the time to the millisecond, the process name, the pid
+# and the thread id, and none of that can agree between two runs, let alone the
+# arm64 build, native mode and cache mode, which do not even share a process
+# name. So the case normalizes before it compares: a stderr line counts as a
+# message only if it begins with that prefix, the prefix is removed, and the
+# text left over must be identical, line for line, in every run. That also
+# leaves out ocerz's own lines and the progress notes, which carry no such
+# prefix, and it is why every message is a single line: a continuation line has
+# no prefix to find. The function making the calls holds six 64-bit values and a
+# double across them, and their checksum must equal one computed without NSLog,
+# since a veneer is code that could disturb a callee-saved register as easily as
+# a trap could.
+#
+# native_printf and native_nslog each say on a status line how many message
+# lines they wrote to stderr, and the arm64 run must show exactly that many
+# after normalization; any other count means the host is not putting them where
+# the case looks, and every stderr comparison would then pass on nothing.
+#
+# These cases take both of M8's oracles. Each fixture is also built for arm64
+# and run directly on the host first, where a build failing its own checks means
+# the fixture expects something the frameworks do not do, and then its stdout,
+# and its normalized stderr, must match native mode's under both engines and
+# cache mode's, where the x86 libobjc, Foundation, CoreFoundation and libSystem
+# out of the shared cache make the same calls. Two things really do differ
+# between the builds, and the fixtures are written so that neither reaches the
+# output. A tagged pointer carries its tag in the top bit on arm64 and in the
+# bottom bit on x86_64, and both runtimes scramble the payload, so the short
+# string's pointer looks different to each build, and different again to the x86
+# build in native mode, which holds the arm64 runtime's pointers. The fixture
+# therefore asks only whether a pointer is tagged in either convention, which a
+# heap object, aligned and below the top of the address space, never is. And
+# BOOL is a signed char on x86_64 and a bool on arm64, so every BOOL a message
+# returns is stored in an int and compared with YES or NO rather than tested for
+# being non-zero. Nothing else the fixtures print differed: the array's
+# description, the formatted numbers and every NSLog message came out byte for
+# byte the same from the arm64 build and from cache mode. Hashes are still
+# compared only with each other and never printed, since nothing obliges two
+# builds of Foundation to hash alike.
+#
+# Each case checks with nm that its fixture imports nothing but names the
+# virtual libobjc, Foundation and CoreFoundation export and libSystem functions
+# the bridge implements or veneers, so that a failure is about Objective-C and
+# formatting and not about an import the fixture had no business making, and
+# that it imports the names without which it would prove nothing: objc_msgSend
+# and the pool push in every Objective-C fixture,
+# ___CFConstantStringClassReference and the two constant number classes in
+# objc_foundation, the two CoreFoundation format functions in objc_variadic,
+# NSLog in native_nslog, and sprintf, snprintf, __sprintf_chk and __snprintf_chk
+# in native_printf.
+#
+# The M10 runs, the arm64 ones included, are bounded at OBJC_TIMEOUT seconds,
+# and a run that times out names the last progress note its fixture wrote. The
+# database and the binary are built separately, so a run stopped at a special
+# record whose handler this build of ocerz does not have says that, rather than
+# only that an export was unimplemented.
+#
 # native_classic_bind pins the one import every older Intel binary makes. A
 # program linked for a macOS before 12 uses classic lazy binding, whose
 # __stub_helper entries jump to dyld_stub_binder, so it imports that symbol from
@@ -742,12 +899,12 @@
 # ocerz's own exit and so flushes host stdio. Each way is compared with cache
 # mode, status and output.
 #
-# The callback, attach, thread, tlv_*, signal_* and cf_* cases skip where there
-# is no x86_64 clang, like the others, but a fixture of theirs that fails to
-# compile where a trivial x86_64 program compiles fine is a failure: skipping it
-# would hide a broken fixture indefinitely. So is a cf_* fixture whose arm64
-# build fails to compile where its x86_64 build did, since that leaves the case
-# without its host oracle.
+# The callback, attach, thread, tlv_*, signal_*, cf_* and M10 cases skip where
+# there is no x86_64 clang, like the others, but a fixture of theirs that fails
+# to compile where a trivial x86_64 program compiles fine is a failure: skipping
+# it would hide a broken fixture indefinitely. So is a cf_* or M10 fixture whose
+# arm64 build fails to compile where its x86_64 build did, since that leaves the
+# case without its host oracle.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -768,7 +925,7 @@ KERNEL=depchain
 KERNELS="depchain memcpy"
 SCALE=1000
 LIB=/usr/lib/libSystem.B.dylib
-UNIMPL_SYM=_printf
+UNIMPL_SYM=_scanf
 BRIDGE_RE='^ocerz: bridge: [^ ]+ [^ ]+ not implemented$'
 NOBIND='ocerz: native: no bridge for '
 M0_SUMMARY='unresolved imports, which no virtual library exports'
@@ -892,6 +1049,28 @@ CF_EXPORTS="$CF_EXPORTS ___CFConstantStringClassReference _kCFAllocatorDefault _
 CF_EXPORTS="$CF_EXPORTS _kCFTypeArrayCallBacks _kCFTypeDictionaryKeyCallBacks _kCFTypeDictionaryValueCallBacks _kCFCopyStringDictionaryKeyCallBacks"
 CF_EXPORTS="$CF_EXPORTS _kCFBooleanTrue _kCFBooleanFalse _kCFNull _kCFRunLoopDefaultMode _kCFRunLoopCommonModes"
 CF_EXPORTS="$CF_EXPORTS _kCFNumberPositiveInfinity _kCFNumberNegativeInfinity _kCFNumberNaN"
+OBJC_FOUNDATION_BIN=""
+OBJC_FOUNDATION_ARM64=""
+OBJC_VARIADIC_BIN=""
+OBJC_VARIADIC_ARM64=""
+NATIVE_PRINTF_BIN=""
+NATIVE_PRINTF_ARM64=""
+NATIVE_NSLOG_BIN=""
+NATIVE_NSLOG_ARM64=""
+OBJC_TIMEOUT=30
+OBJC_LIB=/usr/lib/libobjc.A.dylib
+FOUNDATION_FRAMEWORK=/System/Library/Frameworks/Foundation.framework
+OBJC_HANDLER_RE='^ocerz: bridge: [^ ]+ asks for the handler [^ ]+, which ocerz does not have$'
+NSLOG_PREFIX_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3} [^[]+\[[0-9]+:[0-9a-fx]+\] '
+OBJC_BRIDGED='_printf _fprintf _sprintf _snprintf _asprintf _dprintf ___sprintf_chk ___snprintf_chk _fflush ___stdoutp ___stderrp'
+OBJC_EXPORTS='_objc_msgSend _objc_alloc _objc_alloc_init _objc_opt_new _objc_opt_class _objc_opt_self _objc_opt_isKindOfClass _objc_opt_respondsToSelector'
+OBJC_EXPORTS="$OBJC_EXPORTS _objc_retain _objc_release _objc_autorelease _objc_retainAutorelease _objc_storeStrong"
+OBJC_EXPORTS="$OBJC_EXPORTS _objc_retainAutoreleasedReturnValue _objc_claimAutoreleasedReturnValue _objc_autoreleaseReturnValue _objc_retainAutoreleaseReturnValue"
+OBJC_EXPORTS="$OBJC_EXPORTS _objc_autoreleasePoolPush _objc_autoreleasePoolPop"
+OBJC_EXPORTS="$OBJC_EXPORTS _NSLog _NSClassFromString _NSStringFromRange _NSRangeFromString _NSIntersectionRange _NSUnionRange"
+OBJC_EXPORTS="$OBJC_EXPORTS _OBJC_CLASS_\$_NSString _OBJC_CLASS_\$_NSMutableString _OBJC_CLASS_\$_NSNumber _OBJC_CLASS_\$_NSValue"
+OBJC_EXPORTS="$OBJC_EXPORTS _OBJC_CLASS_\$_NSConstantIntegerNumber _OBJC_CLASS_\$_NSConstantDoubleNumber _OBJC_CLASS_\$_NSArray _OBJC_CLASS_\$_NSDictionary"
+OBJC_EXPORTS="$OBJC_EXPORTS _CFStringCreateWithFormat _CFStringAppendFormat"
 MEASURE_BIN=/usr/bin/time
 
 unset OCERZ_MODE
@@ -1268,11 +1447,11 @@ int main(void)
 EOC
 
     cat > "$usrc" <<'EOC'
-int printf(const char *, ...);
+int scanf(const char *, ...);
 int main(void)
 {
-    printf("unimpl %d\n", 72);
-    return 0;
+    int v = 0;
+    return scanf("%d", &v) == 1 ? v : 0;
 }
 EOC
 
@@ -6363,6 +6542,668 @@ EOC
     done
 }
 
+build_objc_fixtures() {
+    local name arch sfx
+
+    cat > "$TMP/objc_common.h" <<'EOC'
+#import <Foundation/Foundation.h>
+#include "cf_common.h"
+
+static int objc_tagged(id o)
+{
+    cb_uptr p = (cb_uptr)(__bridge void *)o;
+
+    return (p & 1) != 0 || (p >> 63) != 0;
+}
+
+static int objc_text_is(NSString *s, const char *want)
+{
+    const char *got = s != nil ? [s UTF8String] : 0;
+
+    return got != 0 && strcmp(got, want) == 0;
+}
+EOC
+
+    cat > "$TMP/objc_foundation.m" <<'EOC'
+#include "objc_common.h"
+
+#define TAG "objc_foundation"
+
+static const char k_text[] = "\xc5\xbdlu\xc5\xa5ou\xc4\x8dk\xc3\xbd k\xc5\xaf\xc5\x88 \xe2\x82\xac";
+static const char k_upper[] = "\xc5\xbdLU\xc5\xa4OU\xc4\x8cK\xc3\x9d K\xc5\xae\xc5\x87 \xe2\x82\xac";
+static const char k_word[] = "k\xc5\xaf\xc5\x88";
+static const char k_long[] = "a string far too long to fit in a tagged pointer";
+
+static void group_string(void)
+{
+    unsigned m = 0, bit = 1;
+    NSString *s = [NSString stringWithUTF8String:k_text];
+    NSString *lit = @"\xc5\xbdlu\xc5\xa5ou\xc4\x8dk\xc3\xbd k\xc5\xaf\xc5\x88 \xe2\x82\xac";
+    NSString *word = [NSString stringWithUTF8String:k_word];
+    NSString *sub;
+    NSRange found = { 1, 1 }, missing = { 1, 1 };
+    unsigned c0 = 0, c11 = 0, c14 = 0;
+    long len = -1;
+    int eq_made = -1, eq_lit = -1, eq_other = -1;
+
+    if (s != nil) {
+        len = (long)[s length];
+        c0 = [s characterAtIndex:0];
+        c11 = [s characterAtIndex:11];
+        c14 = [s characterAtIndex:14];
+        eq_made = [s isEqual:lit];
+        eq_lit = [lit isEqual:s];
+        eq_other = [s isEqual:word];
+    }
+    sub = [s substringWithRange:NSMakeRange(10, 3)];
+    found = [s rangeOfString:word];
+    missing = [s rangeOfString:@"xyz"];
+
+    CK(s != nil && len == 15);
+    CK(c0 == 0x17d && c11 == 0x16f && c14 == 0x20ac);
+    CK(objc_text_is(s, k_text));
+    CK(eq_made == YES && eq_lit == YES && eq_other == NO);
+    CK([s hash] == [lit hash] && [lit length] == 15);
+    CK(objc_text_is([s uppercaseString], k_upper) && objc_text_is(s, k_text));
+    CK(objc_text_is(sub, k_word) && [sub isEqual:word] == YES && [sub length] == 3);
+    CK(found.location == 10 && found.length == 3);
+    CK(missing.location == NSNotFound && missing.length == 0);
+
+    cf_begin(TAG, "string", m);
+    cf_long("len", len);
+    cf_long("at", (long)found.location);
+    cb_end();
+}
+
+static void group_tagged(void)
+{
+    unsigned m = 0, bit = 1;
+    NSString *t = [NSString stringWithUTF8String:"short"];
+    NSString *l = [NSString stringWithUTF8String:k_long];
+    NSString *tu = [t uppercaseString];
+    NSString *joined = [t stringByAppendingString:l];
+    NSRange rt = [t rangeOfString:@"or"], rl = [l rangeOfString:@"tagged"];
+
+    CK(t != nil && objc_tagged(t));
+    CK(l != nil && !objc_tagged(l));
+    CK([t length] == 5 && [t characterAtIndex:4] == 't' && objc_text_is(t, "short"));
+    CK([t isEqual:@"short"] == YES && [@"short" isEqual:t] == YES && [t hash] == [@"short" hash]);
+    CK(objc_text_is(tu, "SHORT") && [tu isEqual:@"SHORT"] == YES);
+    CK(rt.location == 2 && rt.length == 2);
+    CK([l length] == sizeof k_long - 1 && objc_text_is(l, k_long));
+    CK([l isEqual:@"a string far too long to fit in a tagged pointer"] == YES &&
+       [l hash] == [@"a string far too long to fit in a tagged pointer" hash]);
+    CK(rl.location == 34 && rl.length == 6);
+    CK(joined != nil && !objc_tagged(joined) && [joined length] == 5 + sizeof k_long - 1 &&
+       [joined hasPrefix:t] == YES && [joined hasSuffix:l] == YES);
+
+    cf_begin(TAG, "tagged", m);
+    cf_long("short", (long)[t length]);
+    cf_long("long", (long)[l length]);
+    cb_end();
+}
+
+static void group_number(void)
+{
+    unsigned m = 0, bit = 1;
+    NSNumber *i = [NSNumber numberWithInt:-123456];
+    NSNumber *d = [NSNumber numberWithDouble:-2.75];
+    NSNumber *big = [NSNumber numberWithLongLong:0x123456789abcdefll];
+    NSNumber *lit_i = @42;
+    NSNumber *lit_d = @3.5;
+    NSComparisonResult lt = [i compare:lit_i], gt = [lit_i compare:i], same = [lit_d compare:[NSNumber numberWithDouble:3.5]];
+    NSComparisonResult mixed = [lit_i compare:lit_d];
+
+    CK(i != nil && [i intValue] == -123456 && [i doubleValue] == -123456.0);
+    CK(d != nil && [d doubleValue] == -2.75 && [d intValue] == -2);
+    CK(big != nil && [big longLongValue] == 0x123456789abcdefll);
+    CK([lit_i intValue] == 42 && [lit_i doubleValue] == 42.0);
+    CK([lit_d doubleValue] == 3.5 && [lit_d intValue] == 3);
+    CK([lit_i class] == NSClassFromString(@"NSConstantIntegerNumber") &&
+       [lit_d class] == NSClassFromString(@"NSConstantDoubleNumber"));
+    CK([lit_i isKindOfClass:[NSNumber class]] == YES && [lit_d isKindOfClass:[NSNumber class]] == YES);
+    CK([lit_i isEqual:[NSNumber numberWithInt:42]] == YES && [[NSNumber numberWithInt:42] isEqual:lit_i] == YES);
+    CK(lt == NSOrderedAscending && lt == -1 && gt == NSOrderedDescending && gt == 1);
+    CK(same == NSOrderedSame && mixed == NSOrderedDescending);
+
+    cf_begin(TAG, "number", m);
+    cf_long("int", [lit_i intValue]);
+    cf_long("cmp", (long)lt);
+    cb_end();
+}
+
+static void group_collection(void)
+{
+    unsigned m = 0, bit = 1;
+    NSString *e0 = [NSString stringWithUTF8String:"alpha"];
+    NSNumber *e1 = [NSNumber numberWithInt:7];
+    NSString *e2 = [NSString stringWithUTF8String:k_long];
+    NSString *k1 = [NSString stringWithUTF8String:"key-one"];
+    NSArray *arr = @[e0, e1, e2];
+    NSDictionary *dict = @{ @"k0" : e0, k1 : e1, @"a longer key for the third value" : e2 };
+    NSString *probe = [NSString stringWithUTF8String:k_long];
+    id first, second, a0, a2;
+    long n = -1, nd = -1;
+
+    if (arr != nil)
+        n = (long)[arr count];
+    if (dict != nil)
+        nd = (long)[dict count];
+    a0 = [arr objectAtIndex:0];
+    a2 = [arr objectAtIndex:2];
+    first = [dict objectForKey:[NSString stringWithUTF8String:"a longer key for the third value"]];
+    second = [dict objectForKey:@"a longer key for the third value"];
+
+    CK(arr != nil && n == 3);
+    CK(a0 == e0 && [arr objectAtIndex:1] == e1 && a2 == e2);
+    CK([arr objectAtIndex:2] == a2 && arr[0] == a0 && [a2 isEqual:e2] == YES);
+    CK([arr containsObject:probe] == YES && probe != e2 && [arr containsObject:@"absent"] == NO);
+    CK([arr indexOfObject:e1] == 1 && [arr indexOfObject:@"absent"] == NSNotFound);
+    CK(dict != nil && nd == 3);
+    CK([dict objectForKey:@"k0"] == e0 && [dict objectForKey:[NSString stringWithUTF8String:"key-one"]] == e1);
+    CK(first == e2 && second == e2 && [first isEqual:probe] == YES);
+    CK([dict objectForKey:@"absent"] == nil && dict[k1] == e1);
+
+    cf_begin(TAG, "collection", m);
+    cf_long("n", n);
+    cf_long("nd", nd);
+    cb_end();
+}
+
+static NSString *g_desc;
+
+static void group_describe(void)
+{
+    unsigned m = 0, bit = 1;
+    NSArray *arr = @[[NSString stringWithUTF8String:"alpha"], [NSNumber numberWithInt:7],
+                     [NSString stringWithUTF8String:"two words"], [NSNumber numberWithDouble:3.5]];
+    NSString *desc = [arr description];
+    const char *text = desc != nil ? [desc UTF8String] : 0;
+
+    CK(desc != nil && text != 0 && [desc length] > 0);
+    CK([desc rangeOfString:@"two words"].location != NSNotFound);
+    g_desc = desc;
+
+    cf_begin(TAG, "describe", m);
+    cf_long("len", desc != nil ? (long)[desc length] : -1);
+    cb_end();
+}
+
+static void group_range(void)
+{
+    unsigned m = 0, bit = 1;
+    NSRange in = NSMakeRange(123456789012ul, 42);
+    NSValue *v = [NSValue valueWithRange:in];
+    NSRange out = [v rangeValue];
+    NSString *text = NSStringFromRange(out);
+    NSRange parsed = NSRangeFromString(@"{7, 9}");
+    NSRange cut = NSIntersectionRange(NSMakeRange(10, 20), NSMakeRange(25, 30));
+    NSRange both = NSUnionRange(NSMakeRange(10, 20), NSMakeRange(25, 30));
+
+    CK(v != nil && out.location == 123456789012ul && out.length == 42);
+    CK(objc_text_is(text, "{123456789012, 42}"));
+    CK(parsed.location == 7 && parsed.length == 9);
+    CK(cut.location == 25 && cut.length == 5 && both.location == 10 && both.length == 45);
+
+    cf_begin(TAG, "range", m);
+    cb_str(" ");
+    if (text != nil)
+        cb_str([text UTF8String]);
+    cb_end();
+}
+
+int main(void)
+{
+    int rc;
+
+    @autoreleasepool {
+        cf_note(TAG, "string");
+        group_string();
+        cf_note(TAG, "tagged");
+        group_tagged();
+        cf_note(TAG, "number");
+        group_number();
+        cf_note(TAG, "collection");
+        group_collection();
+        cf_note(TAG, "describe");
+        group_describe();
+        cf_note(TAG, "range");
+        group_range();
+        rc = cf_summary(TAG);
+        if (g_desc != nil)
+            puts([g_desc UTF8String]);
+    }
+    return rc;
+}
+EOC
+
+    cat > "$TMP/objc_variadic.m" <<'EOC'
+#include "objc_common.h"
+
+#define TAG "objc_variadic"
+
+static void objc_put(NSString *s)
+{
+    const char *text = s != nil ? [s UTF8String] : "(nil)";
+    cb_size n = 0;
+
+    while (text[n])
+        n++;
+    write(1, text, n);
+    write(1, "\n", 1);
+}
+
+static void group_format(void)
+{
+    unsigned m = 0, bit = 1;
+    NSString *obj = [NSString stringWithUTF8String:"obj"];
+    NSNumber *num = [NSNumber numberWithInt:17];
+    NSString *wide = [NSString stringWithUTF8String:"k\xc5\xaf\xc5\x88"];
+    NSString *s, *init, *appended;
+
+    s = [NSString stringWithFormat:@"%d %@ %.2f %s %ld|%u %@ %.3f %s %lld|%x %e %g %c %.1f|%.4f %@ %.0f %zu %g|%hhd %hd %.2f %@ %lu",
+                                   -12, obj, 1.25, "cstr", 1234567890123L,
+                                   4000000000u, num, 2.5, "two", -9876543210LL,
+                                   0xbeef, 12345.678, 0.0001, 'Z', 3.25,
+                                   -6.125, wide, 1e10, (size_t)77, 9.5,
+                                   (char)-7, (short)-300, -0.75, @"lit", 18446744073709551615ul];
+    init = [[NSString alloc] initWithFormat:@"%@:%d:%.1f:%s:%ld:%@:%.2e:%x:%g:%d",
+                                            obj, 1, 1.5, "c", -2L, num, 314.159, 255u, 0.5, -3];
+    appended = [s stringByAppendingFormat:@"|%@ %d %.1f", @"tail", 8, 8.5];
+
+    CK(s != nil && objc_text_is(s, "-12 obj 1.25 cstr 1234567890123|4000000000 17 2.500 two -9876543210|beef 1.234568e+04 0.0001 Z 3.2|-6.1250 k\xc5\xaf\xc5\x88 10000000000 77 9.5|-7 -300 -0.75 lit 18446744073709551615"));
+    CK(init != nil && objc_text_is(init, "obj:1:1.5:c:-2:17:3.14e+02:ff:0.5:-3"));
+    CK(appended != nil && [appended hasPrefix:s] == YES && [appended hasSuffix:@"|tail 8 8.5"] == YES);
+
+    cf_begin(TAG, "format", m);
+    cf_long("len", s != nil ? (long)[s length] : -1);
+    cb_end();
+    objc_put(s);
+    objc_put(init);
+}
+
+static void group_objects(void)
+{
+    unsigned m = 0, bit = 1;
+    NSString *a = [NSString stringWithUTF8String:"a"];
+    NSNumber *b = [NSNumber numberWithDouble:2.5];
+    NSString *c = [NSString stringWithUTF8String:"a string long enough to live on the heap"];
+    NSNumber *d = [NSNumber numberWithLongLong:-4];
+    NSString *e = @"e";
+    NSString *f = [NSString stringWithUTF8String:"f"];
+    NSString *g = [NSString stringWithUTF8String:"g"];
+    NSString *k1 = [NSString stringWithUTF8String:"k1"];
+    NSString *k2 = @"k2";
+    NSString *k3 = [NSString stringWithUTF8String:"a key long enough to live on the heap"];
+    NSArray *three = [NSArray arrayWithObjects:a, b, c, nil];
+    NSArray *seven = [NSArray arrayWithObjects:a, b, c, d, e, f, g, nil];
+    NSDictionary *dict = [NSDictionary dictionaryWithObjectsAndKeys:a, k1, c, k2, d, k3, nil];
+    NSDictionary *one = [NSDictionary dictionaryWithObjectsAndKeys:b, k1, nil];
+    long n3 = -1, n7 = -1, nd = -1;
+
+    if (three != nil)
+        n3 = (long)[three count];
+    if (seven != nil)
+        n7 = (long)[seven count];
+    if (dict != nil)
+        nd = (long)[dict count];
+
+    CK(three != nil && n3 == 3 && [three objectAtIndex:0] == a && [three objectAtIndex:1] == b &&
+       [three objectAtIndex:2] == c);
+    CK(seven != nil && n7 == 7 && [seven objectAtIndex:3] == d && [seven objectAtIndex:4] == e &&
+       [seven objectAtIndex:5] == f && [seven objectAtIndex:6] == g && [seven objectAtIndex:0] == a);
+    CK(dict != nil && nd == 3 && [dict objectForKey:@"k1"] == a && [dict objectForKey:k2] == c &&
+       [dict objectForKey:[NSString stringWithUTF8String:"a key long enough to live on the heap"]] == d);
+    CK(one != nil && [one count] == 1 && [one objectForKey:k1] == b);
+
+    cf_begin(TAG, "objects", m);
+    cf_long("n3", n3);
+    cf_long("n7", n7);
+    cf_long("nd", nd);
+    cb_end();
+}
+
+static void group_append(void)
+{
+    unsigned m = 0, bit = 1;
+    NSMutableString *ms = [NSMutableString stringWithString:@"start"];
+    NSString *key = [NSString stringWithUTF8String:"key"];
+
+    [ms appendFormat:@" %@=%d", key, 5];
+    [ms appendFormat:@" %.2f/%s/%lu/%@/%d/%d/%d/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f",
+                     0.5, "c", 99ul, @"obj", 1, 2, 3, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5];
+    [ms appendFormat:@"%@", @""];
+
+    CK(objc_text_is(ms, "start key=5 0.50/c/99/obj/1/2/3/1.5/2.5/3.5/4.5/5.5/6.5/7.5/8.5/9.5"));
+
+    cf_begin(TAG, "append", m);
+    cf_long("len", (long)[ms length]);
+    cb_end();
+    objc_put(ms);
+}
+
+static void group_cfformat(void)
+{
+    unsigned m = 0, bit = 1;
+    NSString *obj = [NSString stringWithUTF8String:"obj"];
+    CFStringRef s = CFStringCreateWithFormat(kCFAllocatorDefault, NULL, CFSTR("%d %@ %.2f %s %ld %x %c %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %d"),
+                                             -1, (__bridge CFTypeRef)obj, 0.25, "cf", 9876543210L, 0xabcu, 'q',
+                                             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10);
+    CFMutableStringRef ms = CFStringCreateMutable(kCFAllocatorDefault, 0);
+
+    CFStringAppendFormat(ms, NULL, CFSTR("%@|%d|%.3f|%s|%d|%d|%d|%d"), CFSTR("lit"), 1, 0.125, "s", 2, 3, 4, 5);
+
+    CK(s != 0 && objc_text_is((__bridge NSString *)s, "-1 obj 0.25 cf 9876543210 abc q 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 10"));
+    CK(ms != 0 && objc_text_is((__bridge NSString *)ms, "lit|1|0.125|s|2|3|4|5"));
+
+    cf_begin(TAG, "cfformat", m);
+    cb_end();
+    objc_put((__bridge NSString *)s);
+    objc_put((__bridge NSString *)ms);
+    if (s)
+        CFRelease(s);
+    if (ms)
+        CFRelease(ms);
+}
+
+int main(void)
+{
+    int rc;
+
+    @autoreleasepool {
+        cf_note(TAG, "format");
+        group_format();
+        cf_note(TAG, "objects");
+        group_objects();
+        cf_note(TAG, "append");
+        group_append();
+        cf_note(TAG, "cfformat");
+        group_cfformat();
+        rc = cf_summary(TAG);
+    }
+    return rc;
+}
+EOC
+
+    cat > "$TMP/native_nslog.m" <<'EOC'
+#include "objc_common.h"
+
+#define TAG "native_nslog"
+
+static volatile long g_v[6] = { 0x1111111111111111l, -2, 0x3333333333l, 4, -0x5555555555l, 6 };
+static volatile double g_d = -1.25;
+
+static unsigned kept_sum(long a, long b, long c, long d, long e, long f, double x)
+{
+    unsigned h = 0x811c9dc5u;
+
+    h = cf_fold(h, (unsigned)a);
+    h = cf_fold(h, (unsigned)(b >> 32));
+    h = cf_fold(h, (unsigned)c);
+    h = cf_fold(h, (unsigned)(d * 3));
+    h = cf_fold(h, (unsigned)(e >> 20));
+    h = cf_fold(h, (unsigned)f);
+    return cf_fold(h, (unsigned)(x * 1000.0));
+}
+
+__attribute__((noinline))
+static unsigned log_all(NSString *obj, NSNumber *num, NSString *wide)
+{
+    long a = g_v[0], b = g_v[1], c = g_v[2], d = g_v[3], e = g_v[4], f = g_v[5];
+    double x = g_d;
+
+    NSLog(@"x=%d y=%@", 42, obj);
+    NSLog(@"many %d %@ %.2f %s %ld %u %c %x %@|%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f",
+          -7, num, x, "cstr", a, 4000000000u, 'N', 0xbeefu, @"lit",
+          1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5);
+    NSLog(@"%@ %s %C", wide, "ascii", (unichar)0x17d);
+    NSLog(@"plain message with no arguments");
+    return kept_sum(a, b, c, d, e, f, x);
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, want, got;
+    int rc;
+
+    @autoreleasepool {
+        NSString *obj = [NSString stringWithUTF8String:"hello"];
+        NSNumber *num = [NSNumber numberWithDouble:0.5];
+        NSString *wide = [NSString stringWithUTF8String:"\xc5\xbdlu\xc5\xa5ou\xc4\x8dk\xc3\xbd k\xc5\xaf\xc5\x88 \xe2\x82\xac"];
+
+        want = kept_sum(g_v[0], g_v[1], g_v[2], g_v[3], g_v[4], g_v[5], g_d);
+        cf_note(TAG, "calling NSLog");
+        got = log_all(obj, num, wide);
+        cf_note(TAG, "returned from NSLog");
+
+        CK(got == want);
+        CK(objc_text_is(obj, "hello") && [num doubleValue] == 0.5);
+
+        cf_begin(TAG, "log", m);
+        cb_field("lines", 4, 0);
+        cb_end();
+        rc = cf_summary(TAG);
+    }
+    return rc;
+}
+EOC
+
+    cat > "$TMP/native_printf.c" <<'EOC'
+#include <stdio.h>
+#include <stdlib.h>
+#include "cb_common.h"
+
+#define TAG "native_printf"
+
+int native_printf_chk(char *big, char *small, int *ret, int v, double d);
+int dprintf(int, const char *, ...);
+int asprintf(char **, const char *, ...);
+cb_size strlen(const char *);
+
+static unsigned np_failed, np_group;
+
+static void np_note(const char *what)
+{
+    write(2, TAG ": ", sizeof TAG + 1);
+    write(2, what, strlen(what));
+    write(2, "\n", 1);
+}
+
+static void np_begin(const char *group, unsigned mask)
+{
+    cb_len = 0;
+    cb_str(TAG " ");
+    cb_str(group);
+    if (mask == 0) {
+        cb_str(" ok");
+    } else {
+        cb_str(" bad:");
+        cb_hex(mask);
+        np_failed |= 1u << np_group;
+    }
+    np_group++;
+}
+
+static void np_int(const char *key, int v)
+{
+    cb_str(" ");
+    cb_str(key);
+    cb_str("=");
+    if (v < 0) {
+        cb_str("-");
+        cb_dec((unsigned)-v);
+    } else {
+        cb_dec((unsigned)v);
+    }
+}
+
+static volatile int g_i = -42;
+static volatile double g_d = 3.14159;
+
+int main(void)
+{
+    unsigned m1 = 0, m2 = 0, m3 = 0, m4 = 0, m, bit;
+    int r_printf, r_star, r_out, r_err, r_snprintf, r_trunc, r_sprintf, r_asprintf, r_null, r_ptr;
+    int r_dout, r_derr, r_chk[2] = { -1, -1 };
+    char buf[256], small[12], sbuf[96], pbuf[32], nbuf[8], cbig[160], csmall[12];
+    char *heap = 0;
+    int local = 0;
+
+    np_note("printf");
+    r_printf = printf("printf %d %u %ld %lld %zu %x %c %s|%f %e %g %.3f|%d %d|%g %g %g %g %g\n",
+                      g_i, 4000000000u, -1234567890123L, 9223372036854775807LL, (cb_size)12345,
+                      0xdeadbeefu, 'Q', "str", g_d, -2.5e-7, 1e21, 2.0 / 3, -7, 99,
+                      0.1, 100.0, 1.5e300, -0.0, 5e-324);
+    r_star = printf("star [%*d] [%-*d] [%*.*f] [%.*s] [%0*x] [%-*.*e]\n",
+                    6, 42, 5, -3, 10, 3, g_d, 4, "truncate", 8, 0xbeef, 12, 2, -g_d);
+    r_out = fprintf(stdout, "fprintf %s %d %.2f %ld %d %d %d %d|%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f\n",
+                    "out", 1, 0.125, 1L << 40, 2, 3, 4, 5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5);
+    r_err = fprintf(stderr, TAG " stderr %s %d %.3e %lu %d %d %d %d %d|%g %g %g %g %g %g %g %g %g\n",
+                    "err", -1, 6.02214076e23, 18446744073709551615ul, 6, 7, 8, 9, 10,
+                    0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0.00390625, 0.001953125);
+
+    bit = 1;
+    m = 0;
+    CK(r_printf == 152);
+    CK(r_star == 68);
+    CK(r_out == 77);
+    CK(r_err == 141);
+    m1 = m;
+
+    np_note("buffers");
+    r_snprintf = snprintf(buf, sizeof buf, "snprintf %d %s %.4f %lld %x %c %d %d|%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f",
+                          g_i, "s", g_d, -1LL, 255u, 'c', 7, 8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);
+    r_trunc = snprintf(small, sizeof small, "%s-%d", "truncated-text", 12345);
+    r_sprintf = sprintf(sbuf, "sprintf %+d %05d %-6s| %#x %#o %e %u %ld %d %d", 17, -42, "ab", 255u, 8u, 1e-3, 1u, 2L, 3, 4);
+    r_asprintf = asprintf(&heap, "asprintf %s %d %.3f %ld %d %d %d %d|%g %g %g %g %g %g %g %g %g",
+                          "heap", g_i, g_d, 123456789012L, 5, 6, 7, 8, 1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8, 9.9);
+    r_ptr = snprintf(pbuf, sizeof pbuf, "%p", (void *)&local);
+    r_null = snprintf(nbuf, sizeof nbuf, "%p", (void *)0);
+    puts(buf);
+    puts(small);
+    puts(sbuf);
+    if (heap != 0)
+        puts(heap);
+
+    bit = 1;
+    m = 0;
+    CK(r_snprintf == (int)strlen(buf) && strcmp(buf, "snprintf -42 s 3.1416 -1 ff c 7 8|1.00 2.00 3.00 4.00 5.00 6.00 7.00 8.00 9.00") == 0);
+    CK(r_trunc == 20 && strcmp(small, "truncated-t") == 0);
+    CK(r_sprintf == (int)strlen(sbuf) && strcmp(sbuf, "sprintf +17 -0042 ab    | 0xff 010 1.000000e-03 1 2 3 4") == 0);
+    CK(heap != 0 && r_asprintf == (int)strlen(heap) &&
+       strcmp(heap, "asprintf heap -42 3.142 123456789012 5 6 7 8|1.1 2.2 3.3 4.4 5.5 6.6 7.7 8.8 9.9") == 0);
+    CK(r_ptr > 2 && pbuf[0] == '0' && pbuf[1] == 'x' && strcmp(pbuf, "0x0") != 0);
+    CK(r_null == 3 && strcmp(nbuf, "0x0") == 0);
+    m2 = m;
+    free(heap);
+
+    np_note("chk");
+    native_printf_chk(cbig, csmall, r_chk, g_i, g_d);
+    puts(cbig);
+    puts(csmall);
+    bit = 1;
+    m = 0;
+    CK(r_chk[0] == (int)strlen(cbig));
+    CK(r_chk[1] > 11 && strlen(csmall) == 11);
+    m3 = m;
+
+    fflush(stdout);
+    np_note("dprintf");
+    r_dout = dprintf(1, "dprintf %d %s %.2f %ld %d %d %d %d|%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f\n",
+                     g_i, "fd", g_d, -5L, 1, 2, 3, 4, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5);
+    r_derr = dprintf(2, TAG " stderr dprintf %d %s %x\n", 2, "fd", 0xfdu);
+    bit = 1;
+    m = 0;
+    CK(r_dout == 67);
+    CK(r_derr == 37);
+    m4 = m;
+
+    np_begin("stdio", m1);
+    np_int("printf", r_printf);
+    np_int("star", r_star);
+    np_int("fprintf", r_out);
+    np_int("stderr", r_err);
+    cb_end();
+    np_begin("buffers", m2);
+    np_int("snprintf", r_snprintf);
+    np_int("trunc", r_trunc);
+    np_int("sprintf", r_sprintf);
+    np_int("asprintf", r_asprintf);
+    np_int("null", r_null);
+    cb_end();
+    np_begin("chk", m3);
+    np_int("sprintf_chk", r_chk[0]);
+    np_int("snprintf_chk", r_chk[1]);
+    cb_end();
+    np_begin("fd", m4);
+    np_int("out", r_dout);
+    np_int("err", r_derr);
+    np_int("lines", 2);
+    cb_end();
+    cb_begin(TAG, np_failed);
+    cb_end();
+    return np_failed != 0;
+}
+EOC
+
+    cat > "$TMP/native_printf_chk.c" <<'EOC'
+#include <stdio.h>
+
+int native_printf_chk(char *big, char *small, int *ret, int v, double d)
+{
+    char b[160], s[12];
+    int i;
+
+    ret[0] = sprintf(b, "sprintf_chk %d %s %lld %x %c %u %d|%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f",
+                     v, "chk", 1LL << 50, 0xabcu, 'k', 3000000000u, -v, d, d * 2, d * 3, d * 4, d * 5, d * 6, d * 7, d * 8, d * 9);
+    ret[1] = snprintf(s, sizeof s, "snprintf_chk %d %s %d %d %d %d %d|%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f",
+                      v, "chk", 1, 2, 3, 4, 5, d, d, d, d, d, d, d, d, d);
+    for (i = 0; i < 159 && b[i] != 0; i++)
+        big[i] = b[i];
+    big[i] = 0;
+    for (i = 0; i < 11 && s[i] != 0; i++)
+        small[i] = s[i];
+    small[i] = 0;
+    return 0;
+}
+EOC
+
+    for name in objc_foundation objc_variadic native_nslog; do
+        clang -arch x86_64 -x objective-c -fobjc-arc -O1 -fno-builtin \
+                -o "$TMP/$name" "$TMP/$name.m" -framework Foundation >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            objc_foundation) OBJC_FOUNDATION_BIN="$TMP/$name" ;;
+            objc_variadic) OBJC_VARIADIC_BIN="$TMP/$name" ;;
+            native_nslog) NATIVE_NSLOG_BIN="$TMP/$name" ;;
+        esac
+        clang -arch arm64 -x objective-c -fobjc-arc -O1 -fno-builtin \
+                -o "$TMP/$name.arm64" "$TMP/$name.m" -framework Foundation >"$TMP/$name.arm64.cc.log" 2>&1 || continue
+        case $name in
+            objc_foundation) OBJC_FOUNDATION_ARM64="$TMP/$name.arm64" ;;
+            objc_variadic) OBJC_VARIADIC_ARM64="$TMP/$name.arm64" ;;
+            native_nslog) NATIVE_NSLOG_ARM64="$TMP/$name.arm64" ;;
+        esac
+    done
+
+    for arch in x86_64 arm64; do
+        sfx=""
+        if [ "$arch" = arm64 ]; then
+            sfx=".arm64"
+        fi
+        clang -arch "$arch" -std=c11 -O1 -fno-builtin -D_FORTIFY_SOURCE=0 -c \
+                -o "$TMP/native_printf$sfx.o" "$TMP/native_printf.c" >"$TMP/native_printf$sfx.cc.log" 2>&1 || return
+        clang -arch "$arch" -std=c11 -O2 -fno-builtin -D_FORTIFY_SOURCE=2 -c \
+                -o "$TMP/native_printf_chk$sfx.o" "$TMP/native_printf_chk.c" >>"$TMP/native_printf$sfx.cc.log" 2>&1 || return
+        clang -arch "$arch" -o "$TMP/native_printf$sfx" "$TMP/native_printf$sfx.o" "$TMP/native_printf_chk$sfx.o" \
+                >>"$TMP/native_printf$sfx.cc.log" 2>&1 || return
+        if [ "$arch" = arm64 ]; then
+            NATIVE_PRINTF_ARM64="$TMP/native_printf$sfx"
+        else
+            NATIVE_PRINTF_BIN="$TMP/native_printf$sfx"
+        fi
+    done
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -7806,6 +8647,215 @@ case_cf() {
     record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
 }
 
+objc_import_reason() {
+    local bin="$1" imports allowed sym stray="" missing="" why
+    shift
+    imports="$(nm -u "$bin" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+    if [ -z "$imports" ]; then
+        return
+    fi
+    allowed=" $CF_BRIDGED $CF_EXPORTS $OBJC_BRIDGED $OBJC_EXPORTS $STACK_GUARD_SYM "
+    for sym in $imports; do
+        case "$allowed" in
+            *" $sym "*) ;;
+            *) stray="$stray $sym" ;;
+        esac
+    done
+    for sym in "$@"; do
+        case " $imports" in
+            *" $sym "*) ;;
+            *) missing="$missing $sym" ;;
+        esac
+    done
+    if [ -n "$missing" ]; then
+        set -- $missing
+        case $1 in
+            _objc_msgSend) why="no message was sent through objc_msgSend at all" ;;
+            _objc_autoreleasePoolPush) why="@autoreleasepool was not compiled into calls to the pool" ;;
+            "$CF_CLASS_SYM") why="its @\"...\" literals were not compiled as constant strings whose isa binds to that data export" ;;
+            _OBJC_CLASS_*_NSConstant*) why="its @42 and @3.5 literals were not compiled as constant objects whose isa binds to Foundation's constant number classes" ;;
+            _CFStringCreateWithFormat|_CFStringAppendFormat) why="the CoreFoundation format functions were never called" ;;
+            _NSLog) why="NSLog was never called" ;;
+            ___sprintf_chk|___snprintf_chk) why="the fortified translation unit did not call the _chk entry points" ;;
+            *) why="the unfortified translation unit did not call the plain entry points" ;;
+        esac
+        echo "$(basename "$bin") imports '${imports% }' and not$missing, so $why, and the case proves nothing about it"
+        return
+    fi
+    if [ -n "$stray" ]; then
+        echo "$(basename "$bin") imports$stray, which neither the virtual libobjc, Foundation and CoreFoundation export nor the bridge implements, so a failure would be about those imports and not about Objective-C or formatting"
+    fi
+}
+
+objc_messages() {
+    local kind="$1" tag="$2" file="$3"
+    case $kind in
+        nslog) sed -nE "s/$NSLOG_PREFIX_RE//p" "$file" 2>/dev/null ;;
+        prefix) grep "^$tag stderr " "$file" 2>/dev/null ;;
+    esac
+}
+
+objc_stall() {
+    local tag="$1" err="$2" hang="${3:-}" last
+    last="$(grep -h "^$tag: " "$err" 2>/dev/null | tail -1 | sed "s/^$tag: //")"
+    case $last in
+        "")
+            echo "the fixture never wrote its first progress note" ;;
+        "calling NSLog")
+            if [ -n "$hang" ]; then
+                echo "the last progress note was '$last', so one of the four NSLog calls never returned"
+            else
+                echo "the last progress note was '$last', so it stopped inside one of the four NSLog calls"
+            fi ;;
+        "returned from NSLog")
+            echo "the last progress note was '$last', so every NSLog call returned and the fixture stopped while checking what they left behind" ;;
+        *)
+            echo "the last progress note was '$last', so the fixture stopped inside that group of calls" ;;
+    esac
+}
+
+objc_run_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" reason lib
+    reason="$(native_run_reason "$rc" "$out" "$err")"
+    lib="$(grep -hF "$NOBIND" "$out" "$err" 2>/dev/null | head -1 | sed 's/.* in //')"
+    if [ -z "$reason" ]; then
+        echo ""
+    elif grep -hF "$NOBIND" "$out" "$err" 2>/dev/null | grep -Fq -e " in $OBJC_LIB" -e " in $FOUNDATION_FRAMEWORK" -e " in $CF_FRAMEWORK"; then
+        if grep -Fq "vdylib: built $lib " "$out" "$err" 2>/dev/null; then
+            echo "$reason: the virtual library named there does not export that name, so the program never ran"
+        else
+            echo "$reason: native mode synthesized no $lib at all, which is what an API database without a file for it looks like, so the program never ran"
+        fi
+    elif grep -Fq "$NOBIND$STACK_GUARD_SYM " "$out" "$err" 2>/dev/null; then
+        echo "$reason$(thread_guard_hint "$out" "$err")"
+    elif grep -qE "$OBJC_HANDLER_RE" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hE "$OBJC_HANDLER_RE" "$out" "$err" | head -1 | cut -c1-160): the database makes that export a special record and this build of ocerz has no handler of that name, so the two are out of step; $(objc_stall "$tag" "$err")"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1 | cut -c1-120); $(objc_stall "$tag" "$err")"
+    elif grep -Fq "$GUEST_CRASH" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hF "$GUEST_CRASH" "$out" "$err" | head -1 | cut -c1-120); $(objc_stall "$tag" "$err")"
+    elif grep -q "^ocerz: abi: " "$out" "$err" 2>/dev/null; then
+        echo "$reason; a crossing was refused: $(grep -h "^ocerz: abi: " "$out" "$err" | head -1 | cut -c1-240)"
+    elif [ "$rc" -eq 124 ]; then
+        echo "$reason: still running after ${NATIVE_TIMEOUT}s, and $(objc_stall "$tag" "$err" hang)"
+    elif [ "$rc" -gt 128 ] && [ "$rc" -lt 160 ]; then
+        echo "$reason: the process was ended by signal $((rc - 128)); $(objc_stall "$tag" "$err")"
+    else
+        echo "$reason; $(objc_stall "$tag" "$err")"
+    fi
+}
+
+objc_arm64_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" kind="$5" line want got
+    shift 5
+    line="$(cf_status "$tag" "$out")"
+    if grep -q "^$tag bad:" "$out" 2>/dev/null; then
+        echo "the arm64 build, run directly against the host's own frameworks, fails its own checks, so the fixture expects something they do not do and the native run can prove nothing either way: $(cf_bits "$tag" "$out" "$@")"
+    elif [ "$rc" -eq 124 ]; then
+        echo "the arm64 build, run directly on the host, was still running after ${NATIVE_TIMEOUT}s, so the fixture hangs against the real frameworks, and $(objc_stall "$tag" "$err" hang)"
+    elif [ "$rc" -ne 0 ] || ! grep -q "^$tag ok" "$out" 2>/dev/null; then
+        echo "the arm64 build, run directly on the host, exited $rc with '${line:-nothing}' and no '$tag ok' line, so the fixture itself is broken, and $(objc_stall "$tag" "$err")"
+    elif [ -n "$kind" ]; then
+        want="$(grep -o ' lines=[0-9]*' "$out" 2>/dev/null | head -1 | cut -d= -f2)"
+        got="$(objc_messages "$kind" "$tag" "$err" | wc -l | tr -d ' ')"
+        if [ -z "$want" ] || [ "$got" != "$want" ]; then
+            echo "the arm64 build, run directly on the host, left $got message lines on stderr where its status line says ${want:-nothing}, so the host is not writing them where the case looks, and every stderr comparison would pass on nothing"
+        fi
+    fi
+}
+
+case_objc() {
+    local name="$1" bin="$2" arm="$3" tag="$4" need="$5" kind="$6" note="$7"
+    local reason="" rc_arm rc_jit rc_nojit rc_cache line cache_note=""
+    local ao="$TMP/$name.arm64.out" ae="$TMP/$name.arm64.err"
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local what="stderr lines"
+    local NATIVE_TIMEOUT=$OBJC_TIMEOUT
+    shift 7
+
+    if [ "$kind" = nslog ]; then
+        what="NSLog messages with the prefix removed"
+    fi
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    if [ -z "$arm" ]; then
+        record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $( (grep -m1 -i 'error' "$TMP/$name.arm64.cc.log" || head -1 "$TMP/$name.arm64.cc.log") 2>/dev/null | cut -c1-160)"
+        return
+    fi
+    reason="$(objc_import_reason "$bin" $need)"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+    run_bounded "$ao" "$ae" "$arm"
+    rc_arm=$?
+    reason="$(objc_arm64_reason "$rc_arm" "$tag" "$ao" "$ae" "$kind" "$@")"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+    objc_messages "$kind" "$tag" "$ae" > "$ae.msg"
+
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin"
+    rc_nojit=$?
+    line="$(cf_status "$tag" "$jo")"
+    objc_messages "$kind" "$tag" "$je" > "$je.msg"
+    objc_messages "$kind" "$tag" "$ne" > "$ne.msg"
+
+    reason="$(objc_run_reason "$rc_jit" "$tag" "$jo" "$je")"
+    if grep -q "^$tag bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed: $(cf_bits "$tag" "$jo" "$@")"
+    elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+        reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+    fi
+
+    if [ -z "$reason" ]; then
+        reason="$(objc_run_reason "$rc_nojit" "$tag" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(cf_status "$tag" "$no")': the guest's own checks failed: $(cf_bits "$tag" "$no" "$@")"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        elif ! cmp -s "$je.msg" "$ne.msg"; then
+            reason="native jit '$(tr '\n' '|' < "$je.msg")' and no-jit '$(tr '\n' '|' < "$ne.msg")' $what differ"
+        fi
+    fi
+    if [ -z "$reason" ] && ! cmp -s "$jo" "$ao"; then
+        reason="native '$(tr '\n' ' ' < "$jo")' != arm64 '$(tr '\n' ' ' < "$ao")': the guest got answers from the host's own frameworks that a native program calling them directly does not"
+    elif [ -z "$reason" ] && ! cmp -s "$je.msg" "$ae.msg"; then
+        reason="native '$(tr '\n' '|' < "$je.msg")' != arm64 '$(tr '\n' '|' < "$ae.msg")' in the $what: the host's frameworks were handed arguments a native program calling them directly does not hand them"
+    fi
+    if [ -n "$reason" ] && [ -n "$note" ]; then
+        reason="$reason. $note"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$bin"
+        rc_cache=$?
+        objc_messages "$kind" "$tag" "$ce" > "$ce.msg"
+        if [ "$rc_cache" -eq 124 ]; then
+            reason="cache mode still running after ${NATIVE_TIMEOUT}s, which crosses no bridge, and $(objc_stall "$tag" "$ce" hang)"
+        elif [ "$rc_cache" -ne 0 ]; then
+            reason="cache-mode exit $rc_cache, want 0: '$(cf_status "$tag" "$co")'"
+        elif ! cmp -s "$jo" "$co"; then
+            reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': native mode agrees with the arm64 build and the x86 frameworks in the shared cache answer otherwise, so either the translator ran them wrong or the fixture prints something the two builds really disagree about"
+        elif ! cmp -s "$je.msg" "$ce.msg"; then
+            reason="native '$(tr '\n' '|' < "$je.msg")' != cache '$(tr '\n' '|' < "$ce.msg")' in the $what: native mode agrees with the arm64 build and the x86 frameworks in the shared cache write otherwise"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
+}
+
 case_env_native() {
     local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
@@ -8061,6 +9111,7 @@ build_thread_fixtures
 build_tlv_fixtures
 build_signal_fixtures
 build_cf_fixtures
+build_objc_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -8165,6 +9216,33 @@ case_cf cf_callbacks "$CF_CALLBACKS_BIN" "$CF_CALLBACKS_ARM64" cf_callbacks "" \
 case_cf cf_runloop "$CF_RUNLOOP_BIN" "$CF_RUNLOOP_ARM64" cf_runloop "" \
     "cf_runloop is the first case whose guest code is called from a framework's event loop rather than from a call made for the purpose, which is how every event reaches an application, so a failure here means no event-driven guest program can run in native mode" \
     loop "bit 0 is CFRunLoopGetCurrent not the main run loop on the main thread, 1 creating the timer, observer or source failing, or a context not retained exactly once on creation, 2 CFRunLoopTimerGetNextFireDate not the date CFRunLoopTimerSetNextFireDate set, 3 CFRunLoopRunInMode not returning kCFRunLoopRunStopped, 4 the timer not firing exactly three times with its own timer and info, or found invalid inside its callout, 5 the source's perform not run exactly once between each pair of fires, 6 the observer not seeing exactly one entry, first, at least one wait and nothing else, or handed another observer or info, 7 schedule not called once when the source was added, or cancel not once when it was removed and not again on invalidation, 8 a source callout handed another info, run loop or mode, or a callout run on another run loop, 9 CFRunLoopTimerIsValid not exactly true before and after the timer's removal and exactly false after its invalidation, 10 the timer's context not retained and released four times, once per callout and once for the timer, by the time it was invalidated, 11 the observer's context not retained and released exactly once, 12 the source's context the same, or a context callback handed an info the fixture never gave, 13 a callback entered on a misaligned stack"
+case_objc objc_foundation "$OBJC_FOUNDATION_BIN" "$OBJC_FOUNDATION_ARM64" objc_foundation \
+    "_objc_msgSend _objc_autoreleasePoolPush $CF_CLASS_SYM _OBJC_CLASS_\$_NSConstantIntegerNumber _OBJC_CLASS_\$_NSConstantDoubleNumber" "" \
+    "objc_foundation is the plainest use of Objective-C there is, messages to Foundation's own classes with no class of the guest's, so a failure here means no guest program that sends a message can run in native mode" \
+    string "bit 0 is stringWithUTF8String: returning nil or a string other than 15 UTF-16 units long, 1 a characterAtIndex: result other than the expected unichar, all three of which lie above 0xff, 2 UTF8String not reproducing the UTF-8 bytes, 3 isEqual: between the created string and the @\"...\" literal of the same text not exactly YES in both directions, or against another string not exactly NO, 4 the two hashing differently or the literal not 15 units long, 5 uppercaseString giving other text or changing the original, 6 substringWithRange:, which takes an NSRange by value, not giving the three-letter word, equal to the same word created separately, 7 rangeOfString: not returning {10, 3}, 8 rangeOfString: for absent text not returning exactly {NSNotFound, 0}, which a location cut to 32 bits does not" \
+    tagged "bit 0 is the five-letter string nil or not a tagged pointer in either convention, so the fixture no longer tests one, 1 the long string nil or tagged, 2 the tagged string's length, last character or UTF8String wrong, 3 isEqual: between the tagged string and its literal not exactly YES both ways, or their hashes differing, 4 uppercaseString of the tagged string wrong, 5 rangeOfString: on the tagged string not {2, 2}, 6 the long string's length or UTF8String wrong, 7 isEqual: or the hash between the long string and its literal disagreeing, 8 rangeOfString: on the long string not {34, 6}, 9 stringByAppendingString: of the two not an untagged string holding both, with hasPrefix: and hasSuffix: exactly YES" \
+    number "bit 0 is numberWithInt: not reading back -123456 as an int and as a double, 1 numberWithDouble: not reading back -2.75 or its intValue not -2, 2 numberWithLongLong: not reading back all 64 bits, 3 the @42 literal not reading back 42 as an int and as a double, 4 the @3.5 literal not reading back 3.5 or its intValue not 3, 5 the literals' classes not the NSConstantIntegerNumber and NSConstantDoubleNumber NSClassFromString names, which is an isa not bound to Foundation's own class, 6 isKindOfClass: NSNumber not exactly YES for either literal, 7 isEqual: between @42 and a created 42 not exactly YES both ways, 8 compare: not returning exactly -1 and 1 for numbers out of and in order, 9 compare: not NSOrderedSame for equal doubles or not NSOrderedDescending for 42 against 3.5" \
+    collection "bit 0 is the @[...] literal nil or not holding three elements, 1 objectAtIndex: handing back a pointer other than the object inserted, 2 a second read or a subscript handing back another pointer, or the element not isEqual: to the object inserted, 3 containsObject: not exactly YES for an equal string at another address or not exactly NO for an absent one, 4 indexOfObject: not 1 for the number or not NSNotFound for an absent object, 5 the @{...} literal nil or not holding three entries, 6 objectForKey: through a literal key or a key created separately not handing back the very value stored, 7 two lookups of the long key, one through a key at another address, not both handing back the very value stored, or that value not isEqual: to an equal string, 8 an absent key found or a subscript lookup handing back another pointer" \
+    describe "bit 0 is description nil or empty or its UTF8String null, 1 the description not containing the text of one of the elements" \
+    range "bit 0 is rangeValue on valueWithRange: not handing back the location above 32 bits and the length, 1 NSStringFromRange not giving {123456789012, 42}, 2 NSRangeFromString not giving {7, 9}, 3 NSIntersectionRange or NSUnionRange, which take two NSRanges by value and return one, giving the wrong range"
+case_objc objc_variadic "$OBJC_VARIADIC_BIN" "$OBJC_VARIADIC_ARM64" objc_variadic \
+    "_objc_msgSend _objc_autoreleasePoolPush _CFStringCreateWithFormat _CFStringAppendFormat" "" \
+    "objc_variadic is the first case whose calls have no signature at all past their format or their first object, so a failure here means no guest program that formats a string or builds a collection from a list can run in native mode" \
+    format "bit 0 is stringWithFormat: with sixteen integer-class and nine double arguments not giving the text it must, which is what an argument taken from the wrong register or stack slot looks like, 1 initWithFormat: on an allocated string giving the wrong text, 2 stringByAppendingFormat: not keeping the original and adding the formatted tail" \
+    objects "bit 0 is arrayWithObjects: with three objects not holding them in order as the very pointers passed, 1 the same with seven objects, most of which x86-64 passes on the stack, 2 dictionaryWithObjectsAndKeys: with three pairs not holding each value under its own key as the very pointer passed, 3 the same with one pair" \
+    append "bit 0 is the mutable string not holding the text of all three appendFormat: calls, one of them with ten doubles" \
+    cfformat "bit 0 is CFStringCreateWithFormat with a %@ among seven integer-class and ten double arguments giving the wrong text, 1 CFStringAppendFormat giving the wrong text"
+case_objc native_printf "$NATIVE_PRINTF_BIN" "$NATIVE_PRINTF_ARM64" native_printf \
+    "_sprintf _snprintf ___sprintf_chk ___snprintf_chk" prefix \
+    "native_printf is printf itself, so a failure here means no guest program that prints a formatted line can run in native mode" \
+    stdio "bit 0 is printf with ten integer-class and nine double arguments not returning 152, 1 printf with * widths and precisions not returning 68, 2 fprintf to stdout not returning 77, 3 fprintf to stderr not returning 141; the text of those lines is compared rather than checked" \
+    buffers "bit 0 is snprintf not writing the text it must or not returning its length, 1 snprintf into a 12-byte buffer not returning the 20 the whole text needs or not truncating to 11 characters, 2 sprintf not writing the text it must or not returning its length, 3 asprintf failing, writing other text or not returning its length, 4 %p of an address not 0x followed by something other than 0, 5 %p of a null pointer not 0x0" \
+    chk "bit 0 is __sprintf_chk not returning the length of the text it wrote, 1 __snprintf_chk not returning more than its 12-byte buffer holds or not truncating to 11 characters; the text of both is compared rather than checked" \
+    fd "bit 0 is dprintf to stdout not returning 67, 1 dprintf to stderr not returning 37"
+case_objc native_nslog "$NATIVE_NSLOG_BIN" "$NATIVE_NSLOG_ARM64" native_nslog \
+    "_objc_msgSend _objc_autoreleasePoolPush _NSLog" nslog \
+    "native_nslog is the one call nearly every Cocoa program makes, so a failure here means no such program can log in native mode" \
+    log "bit 0 is the checksum of six 64-bit values and a double held across the four NSLog calls differing from one computed without them, so a callee-saved register or stack slot changed under a veneer, 1 the string or number passed as %@ changed by the calls"
 case_env_native
 case_flag_beats_env
 case_last_flag_native
