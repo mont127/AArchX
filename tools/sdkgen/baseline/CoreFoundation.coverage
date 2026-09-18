@@ -1,7 +1,7 @@
 library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
 sdk macos 27.0
 exports 3098
-fn 777
+fn 778
 data 1230
 var 0
 special 2
@@ -9,7 +9,6 @@ stub block 3
 stub callback-result 2
 stub callback-struct 31
 stub no-declaration 999
-stub override 1
 stub too-many-args 2
 stub va-list 3
 stub variadic 5
@@ -20,7 +19,7 @@ objc-classes 41
 objc-eh-types 1
 objc-ivars 15
 ld-pseudo-skipped 17
-overrides 4
+overrides 3
 override-shapes 7
 override-structs 9
 override-opaque 0

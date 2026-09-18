@@ -36,7 +36,11 @@
  * the environment happened to be the size bash passes and not the size zsh
  * passes.  The copy is taken once, owns its strings, and lives as long as the
  * process, so no framework the guest makes ocerz open can pull the guest's
- * environment out from under it.
+ * environment out from under it.  It is also older than the CFProcessPath
+ * variable bridge.c sets for the length of CoreFoundation's initializer to give
+ * native CoreFoundation the guest's executable as the process path, so the
+ * guest's initial stack never carries that variable, and the host environment,
+ * which the guest's environ names, holds it only while that initializer runs.
  */
 #include <signal.h>
 #include <pthread.h>

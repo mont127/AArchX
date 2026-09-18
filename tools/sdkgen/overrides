@@ -96,9 +96,13 @@
 # main executable, which is ocerz.  dyld_stub_binder is only reached by a lazy
 # bind the loader failed to make, so a stub that names it is the honest answer.
 #
-# Process identity: _NSGetArgv, _NSGetEnviron, _NSGetExecutablePath and the rest
-# of crt_externs, and getprogname and setprogname, describe ocerz's own
-# invocation rather than the guest's.
+# Process identity: host dyld's _NSGetExecutablePath names ocerz's executable and
+# _NSGetMachExecuteHeader ocerz's header, so both are specials answering the
+# guest's.  The rest of crt_externs, _NSGetArgc, _NSGetArgv, _NSGetEnviron and
+# _NSGetProgname, and getprogname and setprogname cross by rule: ocerz points the
+# host's argc, argv and program name at the guest's before any framework opens,
+# and they answer the same variables the _NXArgc, _NXArgv, _environ and
+# ___progname data exports name.
 #
 # Memory mapping and protection: mmap, munmap, mprotect, madvise and the Mach
 # vm allocate, deallocate, protect, map and remap calls change the address
@@ -129,8 +133,9 @@
 # ---- CoreFoundation ----
 # __CFConstantStringClassReference is the isa every CFSTR literal is compiled
 # against and no header declares it, so it is bound to the native variable by
-# name.  CFBundleGetMainBundle would answer with the bundle of the host
-# executable, which is ocerz.  The shapes describe the callback structures the
+# name.  CFBundleGetMainBundle crosses by rule, because ocerz opens
+# CoreFoundation with CFProcessPath naming the guest's executable, so the main
+# bundle native CoreFoundation answers with is the guest's.  The shapes describe the callback structures the
 # collection and run loop constructors copy, word by word, with the version
 # the first word must hold; the generator checks every word against the
 # structure the header declares, and version 1 against CFRunLoopSourceContext1.
@@ -241,20 +246,20 @@
 #
 # ---- AppKit ----
 # AppKit's C functions are few, and most of them are drawing calls taking
-# rectangles by value, which cross by rule.  Two name themselves.
+# rectangles by value, which cross by rule.  One names itself.
 #
-# NSApplicationMain is an application's whole launch.  Disassembled, it reads
-# NSPrincipalClass, NSMainNibFile and NSMainStoryboardFile out of the main
-# bundle's Info.plist, looks the principal class up by name, loads the main nib
-# or storyboard out of the main bundle, runs the application and ends the
-# process with a native exit.  The host's main bundle is ocerz's, a guest class
-# is not a name the native runtime can look up until a guest class is
-# registered with it, and a native exit skips the exit path ocerz ends the
-# guest through.  A guest that means to run has to set its application up by
-# messages until native mode gives it a main bundle of its own.
-# NSApplicationLoad crosses: disassembled, it only makes the shared
-# NSApplication, starts it and installs autorelease pools, the same messages a
-# guest can send itself.
+# NSApplicationMain is an application's whole launch, and it crosses by rule.
+# Disassembled, it reads NSPrincipalClass, NSMainNibFile and
+# NSMainStoryboardFile out of the main bundle's Info.plist, looks the principal
+# class up by name, loads the main nib or storyboard out of the main bundle,
+# runs the application and ends the process with a native exit.  The main
+# bundle is the guest's, because ocerz gives native CoreFoundation the guest's
+# executable as the process path; a guest class is a name the native runtime
+# can look up once ocerz has registered it, which it has before main; and the
+# native exit runs the guest's atexit handlers, which are on the host's list,
+# and flushes the host's stdio, which is the guest's.  NSApplicationLoad
+# crosses too: disassembled, it only makes the shared NSApplication, starts it
+# and installs autorelease pools.
 #
 # NSAccessibilityRaiseBadArgumentException exists to throw an Objective-C
 # exception, which cannot unwind through the guest frames between it and a
@@ -406,14 +411,8 @@ stub _get_etext override
 stub _get_edata override
 stub dyld_stub_binder override
 
-stub __NSGetArgc override
-stub __NSGetArgv override
-stub __NSGetEnviron override
-stub __NSGetProgname override
-stub __NSGetExecutablePath override
-stub __NSGetMachExecuteHeader override
-stub _getprogname override
-stub _setprogname override
+special __NSGetExecutablePath NSGetExecutablePath
+special __NSGetMachExecuteHeader NSGetMachExecuteHeader
 
 stub _mmap override
 stub ___mmap override
@@ -487,7 +486,6 @@ stub _*scanf* override
 library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
 
 data ___CFConstantStringClassReference __CFConstantStringClassReference
-stub _CFBundleGetMainBundle override
 special _CFStringCreateWithFormat CFStringCreateWithFormat
 special _CFStringAppendFormat CFStringAppendFormat
 
@@ -632,5 +630,4 @@ struct _CGPSConverterCreate 1 CGPSConverterCallbacks
 
 library /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
 
-stub _NSApplicationMain override
 stub _NSAccessibilityRaiseBadArgumentException override

@@ -150,8 +150,10 @@
  * a guest slot beside it is a second copy that goes stale the first time either
  * side writes.  _environ is what native getenv, setenv and execvp walk, and it
  * points at the host's environment, not at the one on the guest's initial
- * stack.  ___progname is what native getprogname, err and warn print, and it
- * names ocerz.  ___stdoutp and ___stderrp are the streams native printf, puts
+ * stack.  ___progname is what native getprogname, err and warn print, and ocerz
+ * points it at the last component of the guest's argv[0] before the guest runs,
+ * as it does NXArgv and NXArgc (bridge.c).  ___stdoutp and ___stderrp are the
+ * streams native printf, puts
  * and perror write through; a program that assigns stdout expects printf to
  * follow it, and a slot holding anything but the native stream hands native
  * stdio a FILE it never opened.  __DefaultRuneLocale is a 3208-byte table that

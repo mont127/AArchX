@@ -81,6 +81,16 @@
  * of its value, and the bridge uses it for every fn record it makes a descriptor
  * from, so a function is always taken from the library the guest named and
  * never from whichever image happens to export the name first.
+ *
+ * The host process is ocerz, and native frameworks ask the process who it is.
+ * ocerz_bridge_set_process_args points the host's own argc, argv and program
+ * name, the variables _NSGetArgc, _NSGetArgv and _NSGetProgname answer, at the
+ * guest's; the loader calls it once with the guest's arguments before any
+ * framework opens and again with the guest's own stack vectors once they are
+ * built.  The first framework opened opens CoreFoundation first, with
+ * OCERZ_BRIDGE_PROCESS_PATH_VAR naming the guest executable for exactly the
+ * length of CoreFoundation's initializer, which is when CoreFoundation fixes the
+ * main bundle, the process name and the arguments NSProcessInfo reports.
  */
 #ifndef OCERZ_BRIDGE_H
 #define OCERZ_BRIDGE_H
@@ -115,7 +125,10 @@ void ocerz_bridge_lower(const struct OcerzBridgeFrame *outer);
 #define OCERZ_BRIDGE_COREFOUNDATION \
     "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation"
 
+#define OCERZ_BRIDGE_PROCESS_PATH_VAR "CFProcessPath"
+
 void *ocerz_bridge_host_library(const char *install_name);
 void *ocerz_bridge_host_symbol(const char *install_name, const char *host_sym);
+void ocerz_bridge_set_process_args(int argc, char **argv);
 
 #endif
