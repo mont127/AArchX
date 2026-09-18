@@ -30,7 +30,9 @@
 # and __snprintf_chk in libSystem, CFStringCreateWithFormat and
 # CFStringAppendFormat in CoreFoundation, and NSLog in Foundation, whose %@
 # conversions are object pointers like any other.  Every other variadic
-# function, and every v form taking a va_list, stays a stub.
+# function, and every v form taking a va_list, stays a stub, apart from the few
+# whose ellipsis stands for one fixed argument, which the libSystem section
+# below makes special records of their own.
 #
 # ---- libSystem ----
 # Exports ocerz answers itself.  exit and abort end the guest, not the host
@@ -151,6 +153,46 @@
 # va_list, so the rules already refuse nearly all of them; naming the family
 # keeps the extensible-printf domain calls and the _l, wide and _chk forms with
 # them.  The eight format veneers are named exactly, so they beat the pattern.
+#
+# What ocerz does instead, for the calls above that have to go through it.
+# Process creation, memory mapping and non-local jumps are no longer stubs but
+# special records, whose handlers are in src/sysbridge.c.  fork and vfork,
+# execve, execv, execvp, execvP, execl, execle and execlp, posix_spawn and
+# posix_spawnp, system and system$NOCANCEL, popen and popen$DARWIN_EXTSN, and
+# pclose go through ocerz's own fork, exec and spawn, the ones the syscalls take
+# in cache mode, so every program a guest starts runs under ocerz in native mode;
+# the functions that build posix_spawn's file actions and attributes cross by
+# rule, because the objects they fill are the host's and the spawn handler reads
+# them with the host's own getters.  mmap, munmap, mprotect and madvise, and
+# mach_vm_allocate, mach_vm_deallocate and mach_vm_protect with their vm_
+# spellings, go through the code the cache-mode syscalls and Mach traps run, so
+# ocerz hears of every change to the address space it tracks; msync, mlock,
+# munlock, minherit and mincore cross by rule, because the syscall layer only
+# forwards them with the pointer translated, which in native mode's identity map
+# is the crossing itself.  setjmp, _setjmp, sigsetjmp, longjmp, _longjmp and
+# siglongjmp save and restore the guest's own registers, signal mask and
+# floating-point control in Apple's x86_64 jmp_buf layout, and refuse by name a
+# jump out of a native function's callback to a setjmp taken outside that call.
+# forkpty, daemon and wordexp, which fork or run a shell inside native code, the
+# raw ___fork, ___vfork, ___execve, ___posix_spawn, ___mmap, ___munmap and
+# ___mprotect entries, the map and remap calls, longjmperror and the ucontext
+# calls still name themselves.
+#
+# The variadic functions whose ellipsis stands for one fixed argument are
+# special records too: open, openat and their $NOCANCEL forms,
+# open_dprotected_np and openat_dprotected_np take a mode with O_CREAT, fcntl
+# and fcntl$NOCANCEL an int or a pointer by command, ioctl a pointer-sized word,
+# sem_open a mode and a value and shm_open a mode with O_CREAT, semctl a union
+# semun and ulimit a new limit.  Their handlers read that argument where x86-64
+# left it, only when the call uses it, and call the host function through its
+# real variadic prototype.
+#
+# csops asks the kernel about the code signature of a process, and no public
+# header declares it.  bash asks it about itself as it starts, so a native-mode
+# system or popen, which runs the command under /bin/sh and so under bash,
+# stopped there.  It crosses with the syscall's own arguments, and the answer
+# is about the ocerz process, which is what the syscall layer forwards a
+# cache-mode guest's csops to as well.
 #
 # ---- CoreFoundation ----
 # __CFConstantStringClassReference is the isa every CFSTR literal is compiled
@@ -345,25 +387,12 @@ fn ___strlcpy_chk __strlcpy_chk L(ppLL)
 fn ___strncat_chk __strncat_chk p(ppLL)
 fn ___strncpy_chk __strncpy_chk p(ppLL)
 
-stub _fork override
 stub ___fork override
-stub _vfork override
 stub ___vfork override
 stub _forkpty override
 stub _daemon override
-stub _execl override
-stub _execle override
-stub _execlp override
-stub _execv override
-stub _execvP override
-stub _execve override
 stub ___execve override
-stub _execvp override
-stub _posix_spawn* override
 stub ___posix_spawn override
-stub _system override
-stub _popen override
-stub _pclose override
 stub _wordexp override
 
 stub _pthread_exit override
@@ -373,12 +402,6 @@ stub _dispatch_main override
 stub __tlv_atexit override
 stub __tlv_exit override
 
-stub _setjmp override
-stub __setjmp override
-stub _sigsetjmp override
-stub _longjmp override
-stub __longjmp override
-stub _siglongjmp override
 stub _longjmperror override
 stub _getcontext override
 stub _setcontext override
@@ -460,22 +483,12 @@ stub dyld_stub_binder override
 special __NSGetExecutablePath NSGetExecutablePath
 special __NSGetMachExecuteHeader NSGetMachExecuteHeader
 
-stub _mmap override
 stub ___mmap override
-stub _munmap override
 stub ___munmap override
-stub _mprotect override
 stub ___mprotect override
-stub _madvise override
-stub _mach_vm_allocate override
-stub _mach_vm_deallocate override
-stub _mach_vm_protect override
 stub _mach_vm_map override
 stub _mach_vm_remap override
 stub _mach_vm_remap_new override
-stub _vm_allocate override
-stub _vm_deallocate override
-stub _vm_protect override
 stub _vm_map override
 stub _vm_remap override
 stub _vm_remap_new override
@@ -528,6 +541,53 @@ stub _host_swap_exception_ports override
 
 stub _*printf* override
 stub _*scanf* override
+
+special _fork fork
+special _vfork fork
+special _execve execve
+special _execv execv
+special _execvp execvp
+special _execvP execvP
+special _execl execl
+special _execle execle
+special _execlp execlp
+special _posix_spawn posix_spawn
+special _posix_spawnp posix_spawnp
+special _system system
+special _system$NOCANCEL system
+special _popen popen
+special _popen$DARWIN_EXTSN popen
+special _pclose pclose
+special _mmap mmap
+special _munmap munmap
+special _mprotect mprotect
+special _madvise madvise
+special _mach_vm_allocate vm_allocate
+special _mach_vm_deallocate vm_deallocate
+special _mach_vm_protect vm_protect
+special _vm_allocate vm_allocate
+special _vm_deallocate vm_deallocate
+special _vm_protect vm_protect
+special _setjmp setjmp
+special __setjmp _setjmp
+special _sigsetjmp sigsetjmp
+special _longjmp longjmp
+special __longjmp _longjmp
+special _siglongjmp siglongjmp
+special _open open
+special _open$NOCANCEL open_nocancel
+special _openat openat
+special _openat$NOCANCEL openat_nocancel
+special _open_dprotected_np open_dprotected_np
+special _openat_dprotected_np openat_dprotected_np
+special _fcntl fcntl
+special _fcntl$NOCANCEL fcntl_nocancel
+special _ioctl ioctl
+special _sem_open sem_open
+special _shm_open shm_open
+special _semctl semctl
+special _ulimit ulimit
+fn _csops csops i(iupL)
 
 library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
 

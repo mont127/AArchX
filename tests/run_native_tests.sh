@@ -1169,12 +1169,58 @@
 # framework's symlink as a synthesized image under its Versions/A install name.
 # The failure messages are printed and each is checked for its reason.
 #
-# The callback, attach, thread, tlv_*, signal_*, cf_*, M10, M11, app_bundle and
-# dl_* cases skip where there is no x86_64 clang, like the others, but a fixture
-# of theirs that fails to compile where a trivial x86_64 program compiles fine is
-# a failure: skipping it would hide a broken fixture indefinitely. So is a cf_*,
-# M10, M11, app_bundle or dl_basic fixture whose arm64 build fails to compile
-# where its x86_64 build did, since that leaves the case without its host oracle.
+# The callback, attach, thread, tlv_*, signal_*, cf_*, M10, M11, app_bundle,
+# dl_* and sys_* cases skip where there is no x86_64 clang, like the others, but
+# a fixture of theirs that fails to compile where a trivial x86_64 program
+# compiles fine is a failure: skipping it would hide a broken fixture
+# indefinitely. So is a cf_*, M10, M11, app_bundle, dl_basic or sys_* fixture
+# whose arm64 build fails to compile where its x86_64 build did, since that
+# leaves the case without its host oracle.
+#
+# The sys_* cases pin the libSystem calls native mode answers with ocerz's own
+# implementations rather than a crossing (src/sysbridge.c). sys_files calls the
+# variadic file and IPC functions whose optional argument is fixed -- open,
+# openat and their $NOCANCEL forms with and without O_CREAT, fcntl across int
+# and pointer commands including the record and open-file-description locks,
+# ioctl on a pipe and on a pseudo-terminal, sem_open, shm_open, semctl and
+# ulimit. sys_mmap maps anonymous and file-backed memory, private and shared,
+# writes x86 code into a mapping, makes it executable and calls it, rewrites it
+# and calls it again, which is only right if the JIT dropped what it translated
+# the first time, catches a fault on a page protected to nothing with a handler
+# that leaves by siglongjmp, and drives the Mach vm calls, including a
+# protection change on a posix_memalign page and a vm_deallocate of the thread
+# list task_threads returns, both memory ocerz never mapped. sys_jmp covers
+# setjmp and longjmp in every spelling: the value, the mask each form does and
+# does not restore, jumps out of signal handlers, out of a handler running on an
+# alternate stack twice, which is only right if the jump took the thread off the
+# alternate stack again, and a jump inside a qsort comparator. sys_proc forks,
+# vforks, execs in all seven spellings, spawns with file actions, attributes,
+# a PATH search and a #! script whose interpreter is the fixture, and runs
+# commands through system and popen for reading, writing and both; the children
+# are the fixture itself, and each reports what it was handed.
+#
+# Each is compiled for x86_64 and for arm64, and the arm64 build run directly
+# against the host is the oracle: the native run under the JIT and under -no-jit
+# must print what it prints, apart from sys_jmp's x86 line, which checks the
+# MXCSR, the x87 control word and the direction flag that only an x86 longjmp
+# restores, and which cache mode, whose longjmp is Apple's x86 routine
+# translated, answers for instead. Cache mode must print the same as native
+# mode. nm must show that each fixture imports the functions it exists to
+# exercise, and nothing the libSystem database still stubs. sys_proc's children
+# also write the mode they came up in and the executable the kernel says they
+# are into a side log during the native run, and every one must say native and
+# ocerz: a child that came up in cache mode, or ran under Rosetta, would print
+# the same report, so the report alone could not tell.
+#
+# sys_jmp_refused and sys_fork_callback are the two refusals. The first longjmps
+# from a qsort comparator to a setjmp taken before the qsort, which would leave
+# qsort's native frames behind; both engines must refuse it by name with 72,
+# and cache mode, where qsort is translated x86 code, performs it. The second
+# forks inside the comparator. Under the JIT a translated block's frame lies
+# beneath the comparator on the host stack, and the child would return into it,
+# so the fork is refused by name with 72; the interpreter leaves no such frame,
+# so there the fork is performed and must print what cache mode and the arm64
+# build print.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -1386,6 +1432,27 @@ DL_NEED='_dlopen _dlsym _dladdr _dlclose _dlerror __dyld_register_func_for_add_i
 DL_CACHE_GROUPS='images|load|sym|path|strlen|dladdr|plugin|version'
 DL_REFUSED='native library without an API database'
 MEASURE_BIN=/usr/bin/time
+SYS_FILES_BIN=""
+SYS_FILES_ARM64=""
+SYS_MMAP_BIN=""
+SYS_MMAP_ARM64=""
+SYS_JMP_BIN=""
+SYS_JMP_ARM64=""
+SYS_PROC_BIN=""
+SYS_PROC_ARM64=""
+SYS_REFUSE_BIN=""
+SYS_FORKCB_BIN=""
+SYS_FORKCB_ARM64=""
+SYS_TIMEOUT=120
+SYS_WORK="$TMP/sysw"
+SYS_FILES_NEED='_open _open$NOCANCEL _openat _openat$NOCANCEL _fcntl _fcntl$NOCANCEL _ioctl _sem_open _shm_open _semctl _ulimit'
+SYS_MMAP_NEED='_mmap _munmap _mprotect _madvise _mach_vm_allocate _mach_vm_deallocate _mach_vm_protect _vm_allocate _vm_deallocate _vm_protect _sigsetjmp _siglongjmp'
+SYS_JMP_NEED='_setjmp __setjmp _sigsetjmp _longjmp __longjmp _siglongjmp'
+SYS_PROC_NEED='_fork _vfork _execv _execve _execvp _execvP _execl _execle _execlp _posix_spawn _posix_spawnp _system _popen _pclose'
+SYS_PROC_KINDS='spawn spawn-attr spawnp sys_proc_script execv execve execvp execvP execl execle execlp many system popen'
+SYS_REFUSE_MSG='ocerz: bridge: /usr/lib/libSystem.B.dylib _longjmp from inside a callback _qsort made, to a setjmp taken outside that call, would skip the native frames of _qsort; refused'
+SYS_FORKCB_MSG='ocerz: bridge: /usr/lib/libSystem.B.dylib _fork was called inside a callback _qsort made from translated code, and the child would return into a translation it does not inherit; refused'
+SYS_REFUSED_STATUS=72
 
 unset OCERZ_MODE
 unset OCERZ_BRIDGE_PROBE_UNSET
@@ -9494,6 +9561,1426 @@ EOC
     fi
 }
 
+build_sys_fixtures() {
+    local name
+
+    mkdir -p "$SYS_WORK"
+    cat > "$TMP/sys_common.h" <<'EOC'
+#include "cb_common.h"
+
+static unsigned sys_failed, sys_group;
+
+static void sys_note(const char *tag, const char *what)
+{
+    char b[128];
+    cb_size n = 0;
+
+    while (*tag && n < 40)
+        b[n++] = *tag++;
+    b[n++] = ':';
+    b[n++] = ' ';
+    while (*what && n < sizeof b - 1)
+        b[n++] = *what++;
+    b[n++] = '\n';
+    write(2, b, n);
+}
+
+static void sys_begin(const char *tag, const char *group, unsigned mask)
+{
+    cb_len = 0;
+    cb_str(tag);
+    cb_str(" ");
+    cb_str(group);
+    if (mask == 0) {
+        cb_str(" ok");
+    } else {
+        cb_str(" bad:");
+        cb_hex(mask);
+        sys_failed |= 1u << sys_group;
+    }
+    sys_group++;
+}
+
+static void sys_int(const char *key, long v)
+{
+    cb_str(" ");
+    cb_str(key);
+    cb_str("=");
+    if (v < 0) {
+        cb_str("-");
+        cb_dec((unsigned)-v);
+    } else {
+        cb_dec((unsigned)v);
+    }
+}
+
+static int sys_summary(const char *tag)
+{
+    cb_begin(tag, sys_failed);
+    cb_end();
+    return sys_failed != 0;
+}
+EOC
+
+    cat > "$TMP/sys_files.c" <<'EOC'
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <semaphore.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/ipc.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/sem.h>
+#include <sys/stat.h>
+#include <termios.h>
+#include <ulimit.h>
+#include <unistd.h>
+#include "sys_common.h"
+
+#define TAG "sys_files"
+
+int open_nc(const char *path, int flags, ...) __asm__("_open$NOCANCEL");
+int openat_nc(int fd, const char *path, int flags, ...) __asm__("_openat$NOCANCEL");
+int fcntl_nc(int fd, int cmd, ...) __asm__("_fcntl$NOCANCEL");
+
+static char g_path[PATH_MAX], g_at[64], g_sem[40], g_shm[40];
+
+static int mode_is(int fd, int want)
+{
+    struct stat st;
+    return fd >= 0 && fstat(fd, &st) == 0 && (int)(st.st_mode & 0777) == want;
+}
+
+static int reads(int fd, const char *want, int n)
+{
+    char buf[32];
+    return fd >= 0 && read(fd, buf, (size_t)n) == n && memcmp(buf, want, (size_t)n) == 0;
+}
+
+static unsigned t_open(void)
+{
+    unsigned m = 0, bit = 1;
+    struct stat st;
+    int fd = open(g_path, O_CREAT | O_EXCL | O_RDWR, 0640);
+    CK(fd >= 0);
+    CK(mode_is(fd, 0640));
+    CK(fd >= 0 && write(fd, "0123456789abcdef", 16) == 16);
+    if (fd >= 0)
+        close(fd);
+    errno = 0;
+    CK(open(g_path, O_CREAT | O_EXCL | O_RDWR, 0600) == -1 && errno == EEXIST);
+    int ro = open(g_path, O_RDONLY);
+    CK(reads(ro, "0123", 4));
+    if (ro >= 0)
+        close(ro);
+    int nc = open_nc(g_path, O_RDONLY);
+    CK(reads(nc, "01", 2));
+    if (nc >= 0)
+        close(nc);
+    int tr = open(g_path, O_WRONLY | O_TRUNC);
+    CK(tr >= 0 && fstat(tr, &st) == 0 && st.st_size == 0 && write(tr, "0123456789abcdef", 16) == 16);
+    if (tr >= 0)
+        close(tr);
+    errno = 0;
+    CK(open("/nonexistent-dir/sys_files", O_RDONLY) == -1 && errno == ENOENT);
+    errno = 0;
+    CK(open_nc("/nonexistent-dir/sys_files", O_CREAT | O_WRONLY, 0644) == -1 && errno == ENOENT);
+    return m;
+}
+
+static unsigned t_openat(const char *dir)
+{
+    unsigned m = 0, bit = 1;
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    CK(dfd >= 0);
+    int afd = openat(dfd, g_at, O_CREAT | O_EXCL | O_WRONLY, 0604);
+    CK(mode_is(afd, 0604));
+    CK(afd >= 0 && write(afd, "wxyz", 4) == 4);
+    if (afd >= 0)
+        close(afd);
+    int rfd = openat_nc(dfd, g_at, O_RDONLY);
+    CK(reads(rfd, "wxyz", 4));
+    if (rfd >= 0)
+        close(rfd);
+    errno = 0;
+    CK(openat(dfd, g_at, O_CREAT | O_EXCL | O_WRONLY, 0600) == -1 && errno == EEXIST);
+    CK(unlinkat(dfd, g_at, 0) == 0);
+    if (dfd >= 0)
+        close(dfd);
+    return m;
+}
+
+static unsigned t_fcntl(void)
+{
+    unsigned m = 0, bit = 1;
+    char real[PATH_MAX], got[PATH_MAX];
+    int fd = open(g_path, O_RDWR);
+    CK(fd >= 0);
+    int fl = fcntl(fd, F_GETFL);
+    CK((fl & O_ACCMODE) == O_RDWR && !(fl & O_NONBLOCK));
+    CK(fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0 && (fcntl(fd, F_GETFL) & O_NONBLOCK));
+    CK(fcntl_nc(fd, F_SETFL, fl) == 0 && !(fcntl_nc(fd, F_GETFL) & O_NONBLOCK));
+    CK(fcntl(fd, F_GETFD) == 0 && fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 && fcntl(fd, F_GETFD) == FD_CLOEXEC);
+    int d = fcntl(fd, F_DUPFD, 50);
+    CK(d >= 50 && fcntl(d, F_GETFD) == 0);
+    if (d >= 0)
+        close(d);
+    int dc = fcntl(fd, F_DUPFD_CLOEXEC, 60);
+    CK(dc >= 60 && fcntl(dc, F_GETFD) == FD_CLOEXEC);
+    if (dc >= 0)
+        close(dc);
+    memset(got, 0, sizeof got);
+    CK(fcntl(fd, F_GETPATH, got) == 0 && realpath(g_path, real) && strcmp(got, real) == 0);
+    fstore_t fst = { F_ALLOCATEALL, F_PEOFPOSMODE, 0, 65536, 0 };
+    CK(fcntl(fd, F_PREALLOCATE, &fst) == 0 && fst.fst_bytesalloc >= 65536);
+    CK(fcntl(fd, F_NOCACHE, 1) == 0 && fcntl(fd, F_NOCACHE, 0) == 0);
+    CK(fcntl(fd, F_FULLFSYNC) == 0);
+    errno = 0;
+    CK(fcntl(-1, F_GETFL) == -1 && errno == EBADF);
+    if (fd >= 0)
+        close(fd);
+    return m;
+}
+
+static unsigned t_lock(void)
+{
+    unsigned m = 0, bit = 1;
+    int fd = open(g_path, O_RDWR);
+    int fd2 = open(g_path, O_RDWR);
+    CK(fd >= 0 && fd2 >= 0);
+    struct flock lk = { .l_start = 0, .l_len = 100, .l_pid = 0, .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    CK(fcntl(fd, F_SETLK, &lk) == 0);
+    struct flock q = { .l_start = 0, .l_len = 100, .l_pid = 0, .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    CK(fcntl(fd, F_GETLK, &q) == 0 && q.l_type == F_UNLCK);
+    struct flock o = { .l_start = 200, .l_len = 10, .l_pid = 0, .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    CK(fcntl(fd, F_OFD_SETLK, &o) == 0);
+    struct flock oq = { .l_start = 200, .l_len = 10, .l_pid = 0, .l_type = F_RDLCK, .l_whence = SEEK_SET };
+    CK(fcntl(fd2, F_OFD_GETLK, &oq) == 0 && oq.l_type == F_WRLCK && oq.l_start == 200 && oq.l_len == 10);
+    struct flock oc = { .l_start = 205, .l_len = 1, .l_pid = 0, .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    errno = 0;
+    CK(fcntl(fd2, F_OFD_SETLK, &oc) == -1 && (errno == EAGAIN || errno == EACCES));
+    o.l_type = F_UNLCK;
+    CK(fcntl(fd, F_OFD_SETLK, &o) == 0 && fcntl(fd2, F_OFD_SETLK, &oc) == 0);
+    lk.l_type = F_UNLCK;
+    CK(fcntl(fd, F_SETLK, &lk) == 0);
+    if (fd2 >= 0)
+        close(fd2);
+    if (fd >= 0)
+        close(fd);
+    return m;
+}
+
+static unsigned t_ioctl(void)
+{
+    unsigned m = 0, bit = 1;
+    int p[2] = { -1, -1 };
+    CK(pipe(p) == 0 && write(p[1], "abcdefg", 7) == 7);
+    int avail = -1;
+    CK(ioctl(p[0], FIONREAD, &avail) == 0 && avail == 7);
+    int on = 1;
+    char buf[16];
+    CK(ioctl(p[0], FIONBIO, &on) == 0 && read(p[0], buf, sizeof buf) == 7);
+    errno = 0;
+    CK(read(p[0], buf, sizeof buf) == -1 && errno == EAGAIN);
+    CK(ioctl(p[1], FIOCLEX) == 0 && fcntl(p[1], F_GETFD) == FD_CLOEXEC);
+    CK(ioctl(p[1], FIONCLEX) == 0 && fcntl(p[1], F_GETFD) == 0);
+    close(p[0]);
+    close(p[1]);
+
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    CK(master >= 0 && grantpt(master) == 0 && unlockpt(master) == 0);
+    const char *name = master >= 0 ? ptsname(master) : NULL;
+    int slave = name ? open(name, O_RDWR | O_NOCTTY) : -1;
+    CK(slave >= 0);
+    struct winsize set = { 33, 101, 0, 0 }, got = { 0, 0, 0, 0 };
+    CK(ioctl(master, TIOCSWINSZ, &set) == 0);
+    CK(ioctl(slave, TIOCGWINSZ, &got) == 0 && got.ws_row == 33 && got.ws_col == 101);
+    struct termios tio;
+    CK(ioctl(slave, TIOCGETA, &tio) == 0 && tcgetattr(slave, &tio) == 0);
+    errno = 0;
+    CK(ioctl(-1, TIOCGWINSZ, &got) == -1 && errno == EBADF);
+    if (slave >= 0)
+        close(slave);
+    if (master >= 0)
+        close(master);
+    return m;
+}
+
+static unsigned t_sem(void)
+{
+    unsigned m = 0, bit = 1;
+    sem_unlink(g_sem);
+    sem_t *s = sem_open(g_sem, O_CREAT | O_EXCL, 0600, 3);
+    int ok = s != SEM_FAILED;
+    CK(ok);
+    CK(ok && sem_trywait(s) == 0 && sem_trywait(s) == 0 && sem_trywait(s) == 0);
+    errno = 0;
+    CK(ok && sem_trywait(s) == -1 && errno == EAGAIN);
+    CK(ok && sem_post(s) == 0 && sem_trywait(s) == 0);
+    errno = 0;
+    CK(sem_open(g_sem, O_CREAT | O_EXCL, 0600, 1) == SEM_FAILED && errno == EEXIST);
+    sem_t *again = sem_open(g_sem, 0);
+    CK(again != SEM_FAILED);
+    if (again != SEM_FAILED)
+        sem_close(again);
+    CK(ok && sem_close(s) == 0);
+    CK(sem_unlink(g_sem) == 0);
+    errno = 0;
+    CK(sem_open(g_sem, 0) == SEM_FAILED && errno == ENOENT);
+    return m;
+}
+
+static unsigned t_shm(void)
+{
+    unsigned m = 0, bit = 1;
+    struct stat st;
+    shm_unlink(g_shm);
+    int fd = shm_open(g_shm, O_CREAT | O_EXCL | O_RDWR, 0600);
+    CK(fd >= 0);
+    CK(fd >= 0 && ftruncate(fd, 16384) == 0);
+    CK(fd >= 0 && fstat(fd, &st) == 0 && st.st_size == 16384 && (st.st_mode & 0777) == 0600);
+    errno = 0;
+    CK(shm_open(g_shm, O_CREAT | O_EXCL | O_RDWR, 0600) == -1 && errno == EEXIST);
+    int again = shm_open(g_shm, O_RDONLY);
+    CK(again >= 0);
+    if (again >= 0)
+        close(again);
+    if (fd >= 0)
+        close(fd);
+    CK(shm_unlink(g_shm) == 0);
+    errno = 0;
+    CK(shm_open(g_shm, O_RDWR) == -1 && errno == ENOENT);
+    return m;
+}
+
+static unsigned t_semctl(int *ran)
+{
+    unsigned m = 0, bit = 1;
+    int id = semget(IPC_PRIVATE, 2, IPC_CREAT | 0600);
+    *ran = id >= 0;
+    if (id < 0)
+        return 0;
+    union semun arg;
+    arg.val = 5;
+    CK(semctl(id, 0, SETVAL, arg) == 0 && semctl(id, 0, GETVAL) == 5);
+    unsigned short vals[2] = { 7, 9 }, out[2] = { 0, 0 };
+    arg.array = vals;
+    CK(semctl(id, 0, SETALL, arg) == 0);
+    arg.array = out;
+    CK(semctl(id, 0, GETALL, arg) == 0 && out[0] == 7 && out[1] == 9);
+    struct semid_ds ds;
+    memset(&ds, 0, sizeof ds);
+    arg.buf = &ds;
+    CK(semctl(id, 0, IPC_STAT, arg) == 0 && ds.sem_nsems == 2 && (ds.sem_perm.mode & 0777) == 0600);
+    ds.sem_perm.mode = 0640;
+    CK(semctl(id, 0, IPC_SET, arg) == 0);
+    memset(&ds, 0, sizeof ds);
+    CK(semctl(id, 0, IPC_STAT, arg) == 0 && (ds.sem_perm.mode & 0777) == 0640);
+    CK(semctl(id, 1, GETVAL) == 9 && semctl(id, 0, GETNCNT) == 0);
+    CK(semctl(id, 0, IPC_RMID) == 0);
+    CK(semctl(id, 0, GETVAL) == -1);
+    return m;
+}
+
+static unsigned t_ulimit(void)
+{
+    unsigned m = 0, bit = 1;
+    long cur = ulimit(UL_GETFSIZE);
+    CK(cur > 0);
+    struct rlimit rl;
+    CK(getrlimit(RLIMIT_FSIZE, &rl) == 0 && (rl.rlim_cur == RLIM_INFINITY || cur == (long)(rl.rlim_cur / 512)));
+    long lower = 1L << 30;
+    CK(ulimit(UL_SETFSIZE, lower) == lower && ulimit(UL_GETFSIZE) == lower);
+    errno = 0;
+    CK(ulimit(1234) == -1 && errno == EINVAL);
+    return m;
+}
+
+int main(int argc, char **argv)
+{
+    const char *dir = argc > 1 ? argv[1] : "/tmp";
+    int pid = (int)getpid(), sem_ran = 0;
+    snprintf(g_path, sizeof g_path, "%s/sys_files.%d", dir, pid);
+    snprintf(g_at, sizeof g_at, "sys_files_at.%d", pid);
+    snprintf(g_sem, sizeof g_sem, "/sysf.%d", pid);
+    snprintf(g_shm, sizeof g_shm, "/sysf-shm.%d", pid);
+    unlink(g_path);
+    umask(022);
+
+    sys_note(TAG, "open");
+    sys_begin(TAG, "open", t_open());
+    cb_end();
+    sys_note(TAG, "openat");
+    sys_begin(TAG, "openat", t_openat(dir));
+    cb_end();
+    sys_note(TAG, "fcntl");
+    sys_begin(TAG, "fcntl", t_fcntl());
+    cb_end();
+    sys_note(TAG, "lock");
+    sys_begin(TAG, "lock", t_lock());
+    cb_end();
+    sys_note(TAG, "ioctl");
+    sys_begin(TAG, "ioctl", t_ioctl());
+    cb_end();
+    sys_note(TAG, "sem_open");
+    sys_begin(TAG, "sem_open", t_sem());
+    cb_end();
+    sys_note(TAG, "shm_open");
+    sys_begin(TAG, "shm_open", t_shm());
+    cb_end();
+    sys_note(TAG, "semctl");
+    unsigned sm = t_semctl(&sem_ran);
+    sys_begin(TAG, "semctl", sm);
+    sys_int("ran", sem_ran);
+    cb_end();
+    sys_note(TAG, "ulimit");
+    sys_begin(TAG, "ulimit", t_ulimit());
+    cb_end();
+    unlink(g_path);
+    return sys_summary(TAG);
+}
+EOC
+
+    cat > "$TMP/sys_mmap.c" <<'EOC'
+#include <errno.h>
+#include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#if defined(__aarch64__)
+#include <libkern/OSCacheControl.h>
+#endif
+#include "sys_common.h"
+
+#define TAG "sys_mmap"
+#define PAGE 16384
+
+static char g_path[1024];
+static sigjmp_buf g_fault_env;
+static volatile sig_atomic_t g_faults;
+static unsigned char g_file[3 * PAGE];
+
+static int all_pattern(const unsigned char *p, int n)
+{
+    unsigned bad = 0;
+    for (int i = 0; i < n; i++)
+        bad += p[i] != (unsigned char)(i * 7);
+    return bad == 0;
+}
+
+static unsigned t_anon(void)
+{
+    unsigned m = 0, bit = 1;
+    unsigned char *p = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    int ok = p != MAP_FAILED;
+    CK(ok && ((uintptr_t)p & (PAGE - 1)) == 0);
+    unsigned zero = 0;
+    for (int i = 0; ok && i < 4 * PAGE; i++)
+        zero |= p[i];
+    CK(ok && zero == 0);
+    for (int i = 0; ok && i < 4 * PAGE; i++)
+        p[i] = (unsigned char)(i * 7);
+    CK(ok && all_pattern(p, 4 * PAGE));
+    unsigned char *q = ok ? mmap(p + PAGE, PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED,
+                                 -1, 0) : MAP_FAILED;
+    CK(ok && q == p + PAGE && q[0] == 0 && q[PAGE - 1] == 0 && p[1] == 7 &&
+       p[2 * PAGE] == (unsigned char)(2 * PAGE * 7));
+    CK(ok && madvise(p, 4 * PAGE, MADV_WILLNEED) == 0 && madvise(p, PAGE, MADV_DONTNEED) == 0);
+    CK(ok && munmap(p, 4 * PAGE) == 0);
+    return m;
+}
+
+static unsigned t_file(void)
+{
+    unsigned m = 0, bit = 1;
+    int fd = open(g_path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    for (int i = 0; i < 3 * PAGE; i++)
+        g_file[i] = (unsigned char)(i * 13 + 5);
+    CK(fd >= 0 && write(fd, g_file, sizeof g_file) == (ssize_t)sizeof g_file);
+    unsigned char *r = mmap(NULL, 2 * PAGE, PROT_READ, MAP_PRIVATE, fd, PAGE);
+    CK(r != MAP_FAILED && memcmp(r, g_file + PAGE, 2 * PAGE) == 0);
+    CK(r != MAP_FAILED && munmap(r, 2 * PAGE) == 0);
+    unsigned char *w = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    unsigned char b0 = 0;
+    if (w != MAP_FAILED)
+        w[0] = 0xaa;
+    CK(w != MAP_FAILED && pread(fd, &b0, 1, 0) == 1 && b0 == g_file[0] && w[0] == 0xaa && w[1] == g_file[1]);
+    CK(w != MAP_FAILED && munmap(w, PAGE) == 0);
+    unsigned char *s = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, PAGE);
+    if (s != MAP_FAILED)
+        memcpy(s + 100, "shared-write", 12);
+    CK(s != MAP_FAILED && msync(s, PAGE, MS_SYNC) == 0);
+    char back[12] = { 0 };
+    CK(s != MAP_FAILED && pread(fd, back, 12, PAGE + 100) == 12 && memcmp(back, "shared-write", 12) == 0);
+    CK(s != MAP_FAILED && mlock(s, PAGE) == 0 && munlock(s, PAGE) == 0);
+    CK(s != MAP_FAILED && munmap(s, PAGE) == 0);
+    if (fd >= 0)
+        close(fd);
+    unlink(g_path);
+    return m;
+}
+
+static unsigned code_put(unsigned char *p, unsigned value)
+{
+#if defined(__x86_64__)
+    p[0] = 0xb8;
+    memcpy(p + 1, &value, 4);
+    p[5] = 0xc3;
+#else
+    unsigned lo = (0x52800000u | ((value & 0xffffu) << 5));
+    unsigned hi = (0x72a00000u | ((value >> 16) << 5));
+    unsigned ret = 0xd65f03c0u;
+    memcpy(p, &lo, 4);
+    memcpy(p + 4, &hi, 4);
+    memcpy(p + 8, &ret, 4);
+#endif
+    return value;
+}
+
+static unsigned code_run(unsigned char *p)
+{
+#if defined(__aarch64__)
+    sys_icache_invalidate(p, PAGE);
+#endif
+    return ((unsigned (*)(void))(void *)p)();
+}
+
+static int code_cycle(unsigned char *p, unsigned value)
+{
+    unsigned want;
+    if (mprotect(p, PAGE, PROT_READ | PROT_WRITE) != 0)
+        return 0;
+    want = code_put(p, value);
+    if (mprotect(p, PAGE, PROT_READ | PROT_EXEC) != 0)
+        return 0;
+    return code_run(p) == want;
+}
+
+static unsigned t_code(void)
+{
+    unsigned m = 0, bit = 1;
+    unsigned char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    int ok = p != MAP_FAILED;
+    CK(ok);
+    CK(ok && code_cycle(p, 0x12345678u));
+    CK(ok && code_cycle(p, 0x0badcafeu));
+    int all = ok;
+    for (unsigned i = 0; ok && i < 5; i++)
+        all &= code_cycle(p, 1000u + i);
+    CK(all);
+    CK(ok && munmap(p, PAGE) == 0);
+    unsigned char *q = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    CK(q != MAP_FAILED && code_cycle(q, 0x600dd00du) && munmap(q, PAGE) == 0);
+    return m;
+}
+
+static void on_fault(int sig)
+{
+    (void)sig;
+    g_faults++;
+    siglongjmp(g_fault_env, 1);
+}
+
+static unsigned t_fault(void)
+{
+    unsigned m = 0, bit = 1;
+    struct sigaction sa, old_segv, old_bus;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_fault;
+    sigemptyset(&sa.sa_mask);
+    CK(sigaction(SIGSEGV, &sa, &old_segv) == 0 && sigaction(SIGBUS, &sa, &old_bus) == 0);
+    volatile unsigned char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    int ok = p != MAP_FAILED;
+    if (ok)
+        p[10] = 42;
+    CK(ok && mprotect((void *)p, PAGE, PROT_NONE) == 0);
+    volatile int reached = 0;
+    volatile unsigned char got = 0;
+    if (ok && sigsetjmp(g_fault_env, 1) == 0) {
+        got = p[10];
+        reached = 1;
+    }
+    CK(ok && reached == 0 && g_faults == 1);
+    CK(ok && mprotect((void *)p, PAGE, PROT_READ) == 0 && p[10] == 42);
+    if (ok && sigsetjmp(g_fault_env, 1) == 0) {
+        p[11] = 1;
+        reached = 1;
+    }
+    CK(ok && reached == 0 && g_faults == 2);
+    CK(ok && mprotect((void *)p, PAGE, PROT_READ | PROT_WRITE) == 0);
+    if (ok)
+        p[11] = 7;
+    CK(ok && p[11] == 7 && got == 0);
+    CK(ok && munmap((void *)p, PAGE) == 0);
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS, &old_bus, NULL);
+    return m;
+}
+
+static unsigned t_mach(void)
+{
+    unsigned m = 0, bit = 1;
+    mach_vm_address_t a = 0;
+    CK(mach_vm_allocate(mach_task_self(), &a, 3 * PAGE, VM_FLAGS_ANYWHERE) == KERN_SUCCESS && a != 0);
+    volatile unsigned char *p = (volatile unsigned char *)(uintptr_t)a;
+    CK(a != 0 && p[0] == 0 && p[3 * PAGE - 1] == 0);
+    if (a)
+        p[5] = 9;
+    CK(a != 0 && mach_vm_protect(mach_task_self(), a, PAGE, FALSE, VM_PROT_READ) == KERN_SUCCESS && p[5] == 9);
+    CK(a != 0 && mach_vm_protect(mach_task_self(), a, PAGE, FALSE, VM_PROT_READ | VM_PROT_WRITE) == KERN_SUCCESS);
+    if (a)
+        p[6] = 8;
+    CK(a != 0 && mach_vm_deallocate(mach_task_self(), a, 3 * PAGE) == KERN_SUCCESS);
+    vm_address_t v = 0;
+    CK(vm_allocate(mach_task_self(), &v, PAGE, VM_FLAGS_ANYWHERE) == KERN_SUCCESS && v != 0);
+    if (v)
+        ((volatile char *)v)[1] = 3;
+    CK(v != 0 && vm_protect(mach_task_self(), v, PAGE, FALSE, VM_PROT_READ) == KERN_SUCCESS);
+    CK(v != 0 && vm_deallocate(mach_task_self(), v, PAGE) == KERN_SUCCESS);
+    return m;
+}
+
+static unsigned t_host(void)
+{
+    unsigned m = 0, bit = 1;
+    void *h = NULL;
+    CK(posix_memalign(&h, PAGE, PAGE) == 0 && h != NULL);
+    if (h)
+        memset(h, 0x11, PAGE);
+    CK(h != NULL && mprotect(h, PAGE, PROT_READ) == 0 && ((volatile unsigned char *)h)[100] == 0x11);
+    CK(h != NULL && mprotect(h, PAGE, PROT_READ | PROT_WRITE) == 0);
+    if (h)
+        ((volatile unsigned char *)h)[100] = 0x22;
+    CK(h != NULL && madvise(h, PAGE, MADV_WILLNEED) == 0);
+    free(h);
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t count = 0;
+    CK(task_threads(mach_task_self(), &threads, &count) == KERN_SUCCESS && count >= 1 && threads != NULL);
+    for (mach_msg_type_number_t i = 0; threads && i < count; i++)
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    CK(threads != NULL &&
+       vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof threads[0]) == KERN_SUCCESS);
+    return m;
+}
+
+int main(int argc, char **argv)
+{
+    const char *dir = argc > 1 ? argv[1] : "/tmp";
+    snprintf(g_path, sizeof g_path, "%s/sys_mmap.%d", dir, (int)getpid());
+    sys_note(TAG, "anon");
+    sys_begin(TAG, "anon", t_anon());
+    cb_end();
+    sys_note(TAG, "file");
+    sys_begin(TAG, "file", t_file());
+    cb_end();
+    sys_note(TAG, "code");
+    sys_begin(TAG, "code", t_code());
+    cb_end();
+    sys_note(TAG, "fault");
+    sys_begin(TAG, "fault", t_fault());
+    cb_end();
+    sys_note(TAG, "mach");
+    sys_begin(TAG, "mach", t_mach());
+    cb_end();
+    sys_note(TAG, "host");
+    sys_begin(TAG, "host", t_host());
+    cb_end();
+    return sys_summary(TAG);
+}
+EOC
+
+    cat > "$TMP/sys_jmp.c" <<'EOC'
+#include <fenv.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "sys_common.h"
+
+#define TAG "sys_jmp"
+#define ALT_BYTES 65536
+
+static jmp_buf g_jb;
+static sigjmp_buf g_sjb;
+static volatile sig_atomic_t g_hits, g_on_alt;
+static char *g_alt;
+static volatile unsigned g_depth_reached;
+
+__attribute__((noinline)) static void dive(int n, int value)
+{
+    volatile char pad[64];
+    pad[n & 63] = (char)n;
+    g_depth_reached = (unsigned)n;
+    if (n == 0)
+        longjmp(g_jb, value);
+    dive(n - 1, value + pad[n & 63] * 0);
+}
+
+static unsigned t_value(void)
+{
+    unsigned m = 0, bit = 1;
+    volatile int round = 0, first = -1, second = -1, third = -1;
+    volatile unsigned long long keep = 0x1122334455667788ull;
+    int r = setjmp(g_jb);
+    round++;
+    if (round == 1) {
+        first = r;
+        dive(40, 42);
+    }
+    if (round == 2) {
+        second = r;
+        longjmp(g_jb, 0);
+    }
+    if (round == 3) {
+        third = r;
+        longjmp(g_jb, -7);
+    }
+    CK(first == 0);
+    CK(second == 42 && g_depth_reached == 0);
+    CK(third == 1);
+    CK(round == 4 && r == -7 && keep == 0x1122334455667788ull);
+    jmp_buf copy;
+    volatile int copied = 0;
+    if (setjmp(g_jb) == 0) {
+        memcpy(copy, g_jb, sizeof copy);
+        copied = 1;
+        longjmp(copy, 3);
+    }
+    CK(copied == 1);
+    return m;
+}
+
+static int blocked(int sig)
+{
+    sigset_t cur;
+    sigprocmask(SIG_BLOCK, NULL, &cur);
+    return sigismember(&cur, sig);
+}
+
+static void block(int sig, int how)
+{
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, sig);
+    sigprocmask(how, &s, NULL);
+}
+
+static unsigned t_mask(void)
+{
+    unsigned m = 0, bit = 1;
+    volatile int step = 0;
+    block(SIGUSR2, SIG_UNBLOCK);
+    if (setjmp(g_jb) == 0) {
+        block(SIGUSR2, SIG_BLOCK);
+        step = 1;
+        longjmp(g_jb, 1);
+    }
+    CK(step == 1 && !blocked(SIGUSR2));
+    if (_setjmp(g_jb) == 0) {
+        block(SIGUSR2, SIG_BLOCK);
+        step = 2;
+        _longjmp(g_jb, 1);
+    }
+    CK(step == 2 && blocked(SIGUSR2));
+    block(SIGUSR2, SIG_UNBLOCK);
+    if (sigsetjmp(g_sjb, 1) == 0) {
+        block(SIGUSR2, SIG_BLOCK);
+        step = 3;
+        siglongjmp(g_sjb, 1);
+    }
+    CK(step == 3 && !blocked(SIGUSR2));
+    if (sigsetjmp(g_sjb, 0) == 0) {
+        block(SIGUSR2, SIG_BLOCK);
+        step = 4;
+        siglongjmp(g_sjb, 1);
+    }
+    CK(step == 4 && blocked(SIGUSR2));
+    block(SIGUSR2, SIG_UNBLOCK);
+    if (sigsetjmp(g_sjb, 1) == 0) {
+        block(SIGUSR2, SIG_BLOCK);
+        step = 5;
+        longjmp(g_sjb, 1);
+    }
+    CK(step == 5 && !blocked(SIGUSR2));
+    return m;
+}
+
+static void on_usr1(int sig)
+{
+    g_hits++;
+    siglongjmp(g_sjb, sig);
+}
+
+static void on_usr1_bsd(int sig)
+{
+    g_hits++;
+    longjmp(g_jb, sig + 100);
+}
+
+static unsigned t_handler(void)
+{
+    unsigned m = 0, bit = 1;
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;
+    sigemptyset(&sa.sa_mask);
+    CK(sigaction(SIGUSR1, &sa, &old) == 0);
+    g_hits = 0;
+    volatile int rounds = 0, wrong = 0;
+    int r = sigsetjmp(g_sjb, 1);
+    if (r != 0 && (r != SIGUSR1 || blocked(SIGUSR1)))
+        wrong++;
+    if (rounds++ < 3)
+        raise(SIGUSR1);
+    CK(rounds == 4 && g_hits == 3 && wrong == 0);
+    sa.sa_handler = on_usr1_bsd;
+    CK(sigaction(SIGUSR1, &sa, NULL) == 0);
+    rounds = 0;
+    r = setjmp(g_jb);
+    if (r != 0 && (r != SIGUSR1 + 100 || blocked(SIGUSR1)))
+        wrong++;
+    if (rounds++ < 2)
+        kill(getpid(), SIGUSR1);
+    CK(rounds == 3 && g_hits == 5 && wrong == 0);
+    sa.sa_handler = on_usr1;
+    CK(sigaction(SIGUSR1, &sa, NULL) == 0);
+    if (sigsetjmp(g_sjb, 0) == 0)
+        raise(SIGUSR1);
+    CK(g_hits == 6 && blocked(SIGUSR1));
+    block(SIGUSR1, SIG_UNBLOCK);
+    sigaction(SIGUSR1, &old, NULL);
+    return m;
+}
+
+static void on_alt(int sig)
+{
+    char here;
+    g_hits++;
+    g_on_alt += (uintptr_t)&here - (uintptr_t)g_alt < ALT_BYTES;
+    siglongjmp(g_sjb, sig);
+}
+
+static unsigned t_altstack(void)
+{
+    unsigned m = 0, bit = 1;
+    g_alt = malloc(ALT_BYTES);
+    stack_t ss = { .ss_sp = g_alt, .ss_size = ALT_BYTES, .ss_flags = 0 }, got;
+    CK(g_alt != NULL && sigaltstack(&ss, NULL) == 0);
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alt;
+    sa.sa_flags = SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    CK(sigaction(SIGUSR2, &sa, &old) == 0);
+    g_hits = 0;
+    g_on_alt = 0;
+    volatile int rounds = 0, still_on = 0;
+    if (sigsetjmp(g_sjb, 1) != 0 && (sigaltstack(NULL, &got) != 0 || (got.ss_flags & SS_ONSTACK)))
+        still_on++;
+    if (rounds++ < 3)
+        raise(SIGUSR2);
+    CK(rounds == 4 && g_hits == 3);
+    CK(g_on_alt == 3);
+    CK(still_on == 0);
+    sigaction(SIGUSR2, &old, NULL);
+    ss.ss_flags = SS_DISABLE;
+    CK(sigaltstack(&ss, NULL) == 0);
+    free(g_alt);
+    return m;
+}
+
+static int g_cmp_calls, g_cmp_bad;
+
+static int cmp_jump(const void *a, const void *b)
+{
+    jmp_buf inner;
+    volatile int once = 0;
+    g_cmp_calls++;
+    if (setjmp(inner) == 0) {
+        once = 1;
+        longjmp(inner, 1);
+    }
+    if (once != 1)
+        g_cmp_bad++;
+    return *(const int *)a - *(const int *)b;
+}
+
+static unsigned t_callback(void)
+{
+    unsigned m = 0, bit = 1;
+    int v[16];
+    for (int i = 0; i < 16; i++)
+        v[i] = (i * 7) % 16;
+    g_cmp_calls = 0;
+    qsort(v, 16, sizeof v[0], cmp_jump);
+    int sorted = 1;
+    for (int i = 0; i < 16; i++)
+        sorted &= v[i] == i;
+    CK(sorted && g_cmp_calls > 0 && g_cmp_bad == 0);
+    return m;
+}
+
+#if defined(__x86_64__)
+static unsigned t_x86(void)
+{
+    unsigned m = 0, bit = 1;
+    unsigned short cw_before = 0, cw_after = 0;
+    unsigned mx_after = 0;
+    fesetround(FE_TONEAREST);
+    __asm__ volatile("fnstcw %0" : "=m"(cw_before));
+    if (setjmp(g_jb) == 0) {
+        unsigned short cw = (unsigned short)((cw_before & ~0x0c00u) | 0x0400u);
+        fesetround(FE_UPWARD);
+        __asm__ volatile("fldcw %0" : : "m"(cw));
+        longjmp(g_jb, 1);
+    }
+    __asm__ volatile("fnstcw %0" : "=m"(cw_after));
+    __asm__ volatile("stmxcsr %0" : "=m"(mx_after));
+    CK(fegetround() == FE_TONEAREST && ((mx_after >> 13) & 3) == 0);
+    CK(cw_after == cw_before);
+    volatile double x = 1.0, third = 3.0;
+    CK(x / third < 0.33333333333333338 && x / third > 0.33333333333333326);
+    if (setjmp(g_jb) == 0) {
+        __asm__ volatile("std");
+        longjmp(g_jb, 1);
+    }
+    unsigned long long fl;
+    __asm__ volatile("pushfq; popq %0" : "=r"(fl));
+    CK(((fl >> 10) & 1) == 0);
+    return m;
+}
+#endif
+
+int main(void)
+{
+    sys_note(TAG, "value");
+    sys_begin(TAG, "value", t_value());
+    cb_end();
+    sys_note(TAG, "mask");
+    sys_begin(TAG, "mask", t_mask());
+    cb_end();
+    sys_note(TAG, "handler");
+    sys_begin(TAG, "handler", t_handler());
+    cb_end();
+    sys_note(TAG, "altstack");
+    sys_begin(TAG, "altstack", t_altstack());
+    cb_end();
+    sys_note(TAG, "callback");
+    sys_begin(TAG, "callback", t_callback());
+    cb_end();
+#if defined(__x86_64__)
+    sys_note(TAG, "x86");
+    sys_begin(TAG, "x86", t_x86());
+    cb_end();
+#endif
+    return sys_summary(TAG);
+}
+EOC
+
+    cat > "$TMP/sys_proc.c" <<'EOC'
+#include <errno.h>
+#include <fcntl.h>
+#include <libproc.h>
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include "sys_common.h"
+
+#define TAG "sys_proc"
+
+extern char **environ;
+
+static char g_self[PATH_MAX], g_dir[PATH_MAX], g_base[256], g_quoted[PATH_MAX + 2];
+
+static const char *base_of(const char *p)
+{
+    const char *b = p ? strrchr(p, '/') : NULL;
+    b = b ? b + 1 : (p ? p : "(null)");
+    return strncmp(b, "sys_proc", 8) == 0 && (b[8] == '\0' || strcmp(b + 8, ".arm64") == 0) ? "sys_proc" : b;
+}
+
+static void line(const char *a, const char *b, const char *c)
+{
+    cb_len = 0;
+    cb_str(a);
+    if (b)
+        cb_str(b);
+    if (c)
+        cb_str(c);
+    cb_end();
+}
+
+static int child_report(int argc, char **argv)
+{
+    const char *kind = argc > 2 ? argv[2] : "none";
+    const char *mark = getenv("SYS_MARK");
+    char exe[PROC_PIDPATHINFO_MAXSIZE];
+    if (proc_pidpath(getpid(), exe, sizeof exe) <= 0)
+        strcpy(exe, "?");
+    const char *log = getenv("SYS_MODE_LOG");
+    if (log) {
+        const char *mode = getenv("OCERZ_MODE");
+        int fd = open(log, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        char b[512];
+        int n = snprintf(b, sizeof b, "%s mode=%s exe=%s\n", base_of(kind), mode ? mode : "none",
+                         base_of(exe));
+        if (fd >= 0) {
+            write(fd, b, (size_t)n);
+            close(fd);
+        }
+    }
+    cb_len = 0;
+    cb_str("report ");
+    cb_str(base_of(kind));
+    cb_str(" a0=");
+    cb_str(base_of(argv[0]));
+    sys_int("argc", argc);
+    cb_str(" mark=");
+    cb_str(mark ? mark : "none");
+    cb_str(" path=");
+    cb_str(getenv("PATH") ? "set" : "none");
+    for (int i = 3; i < argc && i < 12; i++) {
+        cb_str(" ");
+        cb_str(base_of(argv[i]));
+    }
+    cb_end();
+    return 20 + argc;
+}
+
+static int child_sink(void)
+{
+    char b[256];
+    long total = 0;
+    ssize_t n;
+    while ((n = read(0, b, sizeof b)) > 0)
+        total += n;
+    return (int)(total % 200);
+}
+
+pid_t sys_vfork(void) __asm__("_vfork");
+
+static int status_code(int st)
+{
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 200 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+}
+
+static int wait_code(pid_t pid)
+{
+    int st = 0;
+    pid_t w;
+    do {
+        w = waitpid(pid, &st, 0);
+    } while (w == -1 && errno == EINTR);
+    return w == pid ? status_code(st) : -1;
+}
+
+static int cmp_int(const void *a, const void *b)
+{
+    return *(const int *)a - *(const int *)b;
+}
+
+static void *thread_body(void *arg)
+{
+    return (void *)((long)arg * 3);
+}
+
+static unsigned t_fork(void)
+{
+    unsigned m = 0, bit = 1;
+    pid_t parent = getpid();
+    int p[2];
+    CK(pipe(p) == 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        unsigned cm = 0, cbit = 1;
+        close(p[0]);
+#define CCK(c) do { if (!(c)) cm |= cbit; cbit <<= 1; } while (0)
+        CCK(getpid() != parent && getppid() == parent);
+        int v[32];
+        for (int i = 0; i < 32; i++)
+            v[i] = (i * 11) % 32;
+        qsort(v, 32, sizeof v[0], cmp_int);
+        int sorted = 1;
+        for (int i = 0; i < 32; i++)
+            sorted &= v[i] == i;
+        CCK(sorted);
+        pthread_t th;
+        void *ret = NULL;
+        CCK(pthread_create(&th, NULL, thread_body, (void *)14) == 0 && pthread_join(th, &ret) == 0 &&
+            (long)ret == 42);
+        char *heap = malloc(64);
+        CCK(heap != NULL);
+        if (heap)
+            strcpy(heap, "child-heap");
+        CCK(write(p[1], "child-ok", 8) == 8);
+        free(heap);
+        _exit((int)cm);
+    }
+    CK(pid > 0);
+    close(p[1]);
+    char buf[16] = { 0 };
+    CK(read(p[0], buf, sizeof buf - 1) == 8 && strcmp(buf, "child-ok") == 0);
+    close(p[0]);
+    CK(wait_code(pid) == 0);
+    pid_t again = fork();
+    if (again == 0)
+        _exit(17);
+    int st = 0;
+    struct rusage ru;
+    CK(again > 0 && wait4(again, &st, 0, &ru) == again && status_code(st) == 17);
+    pid_t vp = sys_vfork();
+    if (vp == 0)
+        _exit(7);
+    CK(vp > 0 && wait_code(vp) == 7);
+    errno = 0;
+    CK(waitpid(-1, &st, WNOHANG) == -1 && errno == ECHILD);
+    return m;
+}
+
+static unsigned t_spawn(void)
+{
+    unsigned m = 0, bit = 1;
+    int p[2];
+    CK(pipe(p) == 0);
+    posix_spawn_file_actions_t fa;
+    CK(posix_spawn_file_actions_init(&fa) == 0);
+    CK(posix_spawn_file_actions_adddup2(&fa, p[1], 1) == 0);
+    CK(posix_spawn_file_actions_addclose(&fa, p[0]) == 0 && posix_spawn_file_actions_addclose(&fa, p[1]) == 0);
+    char *argv[] = { (char *)"-sys-child", (char *)"child-report", (char *)"spawn", (char *)"x", NULL };
+    char logkv[PATH_MAX + 16];
+    char *envp[] = { (char *)"SYS_MARK=spawn", NULL, NULL };
+    if (getenv("SYS_MODE_LOG")) {
+        snprintf(logkv, sizeof logkv, "SYS_MODE_LOG=%s", getenv("SYS_MODE_LOG"));
+        envp[1] = logkv;
+    }
+    pid_t pid = 0;
+    CK(posix_spawn(&pid, g_self, &fa, NULL, argv, envp) == 0 && pid > 0);
+    posix_spawn_file_actions_destroy(&fa);
+    close(p[1]);
+    char buf[256] = { 0 };
+    ssize_t n = read(p[0], buf, sizeof buf - 1);
+    close(p[0]);
+    CK(n > 0);
+    if (n > 0 && buf[n - 1] == '\n')
+        buf[n - 1] = 0;
+    line("spawn got '", buf, "'");
+    CK(pid > 0 && wait_code(pid) == 24);
+
+    posix_spawnattr_t at;
+    CK(posix_spawnattr_init(&at) == 0);
+    CK(posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP) == 0 && posix_spawnattr_setpgroup(&at, 0) == 0);
+    char *argv2[] = { (char *)"attr-child", (char *)"child-report", (char *)"spawn-attr", NULL };
+    pid = 0;
+    CK(posix_spawn(&pid, g_self, NULL, &at, argv2, environ) == 0 && pid > 0);
+    CK(pid > 0 && wait_code(pid) == 23);
+    posix_spawnattr_destroy(&at);
+
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof path, "%s:/usr/bin:/bin", g_dir);
+    char *old_path = getenv("PATH") ? strdup(getenv("PATH")) : NULL;
+    setenv("PATH", path, 1);
+    char *argv3[] = { g_base, (char *)"child-report", (char *)"spawnp", NULL };
+    pid = 0;
+    CK(posix_spawnp(&pid, g_base, NULL, NULL, argv3, environ) == 0 && pid > 0);
+    CK(pid > 0 && wait_code(pid) == 23);
+    CK(posix_spawnp(&pid, "sys-proc-no-such-program", NULL, NULL, argv3, environ) == ENOENT);
+    if (old_path) {
+        setenv("PATH", old_path, 1);
+        free(old_path);
+    }
+    CK(posix_spawn(&pid, "/nonexistent/sys-proc", NULL, NULL, argv3, environ) == ENOENT);
+
+    char script[PATH_MAX + 32];
+    snprintf(script, sizeof script, "%s/sys_proc_script", g_dir);
+    FILE *f = fopen(script, "w");
+    if (f) {
+        fprintf(f, "#!%s child-report\n", g_self);
+        fclose(f);
+        chmod(script, 0755);
+    }
+    char *argv4[] = { (char *)"script-argv0", (char *)"extra", NULL };
+    pid = 0;
+    CK(f != NULL && posix_spawn(&pid, script, NULL, NULL, argv4, environ) == 0 && pid > 0);
+    CK(pid > 0 && wait_code(pid) == 24);
+    unlink(script);
+    return m;
+}
+
+static int fork_exec(int how)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *argv[] = { (char *)"-exec-child", (char *)"child-report", NULL, NULL };
+        char *envp[] = { (char *)"SYS_MARK=exec", NULL, NULL };
+        char logkv[PATH_MAX + 16];
+        if (getenv("SYS_MODE_LOG")) {
+            snprintf(logkv, sizeof logkv, "SYS_MODE_LOG=%s", getenv("SYS_MODE_LOG"));
+            envp[1] = logkv;
+        }
+        switch (how) {
+        case 0:
+            argv[2] = (char *)"execv";
+            execv(g_self, argv);
+            break;
+        case 1:
+            argv[2] = (char *)"execve";
+            execve(g_self, argv, envp);
+            break;
+        case 2:
+            argv[2] = (char *)"execve-null";
+            execve(g_self, argv, NULL);
+            break;
+        case 3:
+            argv[0] = g_base;
+            argv[2] = (char *)"execvp";
+            execvp(g_base, argv);
+            break;
+        case 4:
+            argv[2] = (char *)"execvP";
+            execvP(g_base, g_dir, argv);
+            break;
+        case 5:
+            execl(g_self, "-l", "child-report", "execl", (char *)0);
+            break;
+        case 6:
+            execle(g_self, "-le", "child-report", "execle", (char *)0, envp);
+            break;
+        case 7:
+            execlp(g_base, "-lp", "child-report", "execlp", (char *)0);
+            break;
+        case 8:
+            execl(g_self, "-many", "child-report", "many", "a", "b", "c", "d", "e", "f", (char *)0);
+            break;
+        }
+        _exit(99);
+    }
+    return pid > 0 ? wait_code(pid) : -1;
+}
+
+static unsigned t_exec(void)
+{
+    unsigned m = 0, bit = 1;
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof path, "%s:/usr/bin:/bin", g_dir);
+    char *old_path = getenv("PATH") ? strdup(getenv("PATH")) : NULL;
+    setenv("PATH", path, 1);
+    CK(fork_exec(0) == 23);
+    CK(fork_exec(1) == 23);
+    CK(fork_exec(2) == 23);
+    CK(fork_exec(3) == 23);
+    CK(fork_exec(4) == 23);
+    CK(fork_exec(5) == 23);
+    CK(fork_exec(6) == 23);
+    CK(fork_exec(7) == 23);
+    CK(fork_exec(8) == 29);
+    if (old_path) {
+        setenv("PATH", old_path, 1);
+        free(old_path);
+    }
+    errno = 0;
+    char *argv[] = { (char *)"x", NULL };
+    CK(execv("/nonexistent/sys-proc", argv) == -1 && errno == ENOENT);
+    errno = 0;
+    CK(execvp("sys-proc-no-such-program", argv) == -1 && errno == ENOENT);
+    return m;
+}
+
+static unsigned t_shell(void)
+{
+    unsigned m = 0, bit = 1;
+    CK(system(NULL) != 0);
+    int st = system("exit 3");
+    CK(WIFEXITED(st) && WEXITSTATUS(st) == 3);
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof cmd, "%s child-report system y z", g_quoted);
+    st = system(cmd);
+    CK(WIFEXITED(st) && WEXITSTATUS(st) == 25);
+    st = system("x=sh; for i in 1 2; do echo \"line-$x-$i\"; done; (exit 4)");
+    CK(WIFEXITED(st) && WEXITSTATUS(st) == 4);
+    snprintf(cmd, sizeof cmd, "%s child-report popen", g_quoted);
+    FILE *f = popen(cmd, "r");
+    char buf[256] = { 0 };
+    CK(f != NULL && fgets(buf, sizeof buf, f) != NULL);
+    buf[strcspn(buf, "\n")] = 0;
+    line("popen got '", buf, "'");
+    st = f ? pclose(f) : -1;
+    CK(WIFEXITED(st) && WEXITSTATUS(st) == 23);
+    snprintf(cmd, sizeof cmd, "%s child-sink", g_quoted);
+    f = popen(cmd, "w");
+    CK(f != NULL && fputs("forty-two bytes of text for the sink ....\n", f) >= 0);
+    st = f ? pclose(f) : -1;
+    CK(WIFEXITED(st) && WEXITSTATUS(st) == 42);
+    f = popen("read a; echo \"back:$a\"", "r+");
+    memset(buf, 0, sizeof buf);
+    CK(f != NULL && fputs("ping\n", f) >= 0 && fflush(f) == 0);
+    CK(f != NULL && fgets(buf, sizeof buf, f) != NULL && strcmp(buf, "back:ping\n") == 0);
+    CK(f != NULL && pclose(f) == 0);
+    errno = 0;
+    CK(popen("true", "x") == NULL && errno == EINVAL);
+    CK(pclose(stdin) == -1);
+    return m;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "child-report") == 0)
+        return child_report(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "child-sink") == 0)
+        return child_sink();
+    if (!realpath(argv[0], g_self))
+        return 2;
+    snprintf(g_dir, sizeof g_dir, "%s", g_self);
+    *strrchr(g_dir, '/') = 0;
+    snprintf(g_base, sizeof g_base, "%s", base_of(g_self));
+    snprintf(g_quoted, sizeof g_quoted, "'%s'", g_self);
+
+    sys_note(TAG, "fork");
+    sys_begin(TAG, "fork", t_fork());
+    cb_end();
+    sys_note(TAG, "spawn");
+    sys_begin(TAG, "spawn", t_spawn());
+    cb_end();
+    sys_note(TAG, "exec");
+    sys_begin(TAG, "exec", t_exec());
+    cb_end();
+    sys_note(TAG, "shell");
+    sys_begin(TAG, "shell", t_shell());
+    cb_end();
+    return sys_summary(TAG);
+}
+EOC
+
+    cat > "$TMP/sys_jmp_refused.c" <<'EOC'
+#include <setjmp.h>
+#include <stdlib.h>
+#include "sys_common.h"
+
+#define TAG "sys_jmp_refused"
+
+static jmp_buf g_outer;
+static int g_calls;
+
+static int cmp_leave(const void *a, const void *b)
+{
+    if (++g_calls == 3)
+        longjmp(g_outer, 5);
+    return *(const int *)a - *(const int *)b;
+}
+
+int main(void)
+{
+    int v[8] = { 5, 3, 7, 1, 8, 2, 6, 4 };
+    cb_len = 0;
+    cb_str(TAG " start");
+    cb_end();
+    int r = setjmp(g_outer);
+    if (r != 0) {
+        cb_len = 0;
+        cb_str(TAG " jumped");
+        sys_int("r", r);
+        sys_int("calls", g_calls);
+        cb_end();
+        return 0;
+    }
+    qsort(v, 8, sizeof v[0], cmp_leave);
+    cb_len = 0;
+    cb_str(TAG " returned");
+    cb_end();
+    return 1;
+}
+EOC
+
+    cat > "$TMP/sys_fork_callback.c" <<'EOC'
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include "sys_common.h"
+
+#define TAG "sys_fork_callback"
+
+static int g_calls, g_status = -1;
+
+static int cmp_fork(const void *a, const void *b)
+{
+    if (++g_calls == 3) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            cb_len = 0;
+            cb_str(TAG " child");
+            cb_end();
+            _exit(8);
+        }
+        int st = 0;
+        if (pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st))
+            g_status = WEXITSTATUS(st);
+    }
+    return *(const int *)a - *(const int *)b;
+}
+
+int main(void)
+{
+    int v[8] = { 5, 3, 7, 1, 8, 2, 6, 4 };
+    cb_len = 0;
+    cb_str(TAG " start");
+    cb_end();
+    qsort(v, 8, sizeof v[0], cmp_fork);
+    int sorted = 1;
+    for (int i = 0; i < 8; i++)
+        sorted &= v[i] == i + 1;
+    cb_len = 0;
+    cb_str(TAG " parent");
+    sys_int("saw", g_status);
+    sys_int("sorted", sorted);
+    cb_end();
+    return 0;
+}
+EOC
+
+    for name in sys_files sys_mmap sys_jmp sys_proc sys_jmp_refused sys_fork_callback; do
+        clang -arch x86_64 -std=c11 -O1 -fno-builtin \
+                -o "$TMP/$name" "$TMP/$name.c" >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            sys_files) SYS_FILES_BIN="$TMP/$name" ;;
+            sys_mmap) SYS_MMAP_BIN="$TMP/$name" ;;
+            sys_jmp) SYS_JMP_BIN="$TMP/$name" ;;
+            sys_proc) SYS_PROC_BIN="$TMP/$name" ;;
+            sys_jmp_refused) SYS_REFUSE_BIN="$TMP/$name"; continue ;;
+            sys_fork_callback) SYS_FORKCB_BIN="$TMP/$name" ;;
+        esac
+        clang -arch arm64 -std=c11 -O1 -fno-builtin \
+                -o "$TMP/$name.arm64" "$TMP/$name.c" >"$TMP/$name.arm64.cc.log" 2>&1 || continue
+        case $name in
+            sys_files) SYS_FILES_ARM64="$TMP/$name.arm64" ;;
+            sys_mmap) SYS_MMAP_ARM64="$TMP/$name.arm64" ;;
+            sys_jmp) SYS_JMP_ARM64="$TMP/$name.arm64" ;;
+            sys_proc) SYS_PROC_ARM64="$TMP/$name.arm64" ;;
+            sys_fork_callback) SYS_FORKCB_ARM64="$TMP/$name.arm64" ;;
+        esac
+    done
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -11779,6 +13266,315 @@ case_native_static() {
     record "$name" "$reason" "exit=$rc"
 }
 
+sys_api_file() {
+    ls runtime/apis/macos/*/libSystem.B.dylib.api 2>/dev/null | tail -1
+}
+
+sys_import_reason() {
+    local bin="$1" need="$2" imports sym stray="" missing="" api kind
+    api="$(sys_api_file)"
+    if [ -z "$api" ]; then
+        echo "no libSystem database under runtime/apis to check the imports of $(basename "$bin") against"
+        return
+    fi
+    imports=" $(nm -u "$bin" 2>/dev/null | awk '{print $1}' | tr '\n' ' ') "
+    for sym in $need; do
+        case "$imports" in
+            *" $sym "*) ;;
+            *) missing="$missing $sym" ;;
+        esac
+    done
+    if [ -n "$missing" ]; then
+        echo "$(basename "$bin") does not import$missing, so the case would not exercise what it is for"
+        return
+    fi
+    for sym in $imports; do
+        kind="$(awk -v s="$sym" '$2 == s { print $1; exit }' "$api")"
+        if [ "$kind" = stub ]; then
+            stray="$stray $sym"
+        fi
+    done
+    if [ -n "$stray" ]; then
+        echo "$(basename "$bin") imports$stray, which $(basename "$api") still stubs, so a failure would be about those imports and not about what the case is for"
+    fi
+}
+
+sys_status() {
+    local tag="$1" file="$2" line
+    line="$(grep -E "^$tag (ok|bad:)" "$file" 2>/dev/null | head -1)"
+    if [ -z "$line" ]; then
+        line="$(tail -1 "$file" 2>/dev/null)"
+    fi
+    echo "$line"
+}
+
+sys_bits() {
+    local tag="$1" file="$2" group line out=""
+    shift 2
+    while [ $# -ge 2 ]; do
+        group="$1"
+        line="$(grep -E "^$tag $group bad:" "$file" 2>/dev/null | head -1)"
+        if [ -n "$line" ]; then
+            out="$out${out:+; }'$line', where $2"
+        fi
+        shift 2
+    done
+    if [ -z "$out" ]; then
+        out="no group line reports a failure although the last line does, so the bookkeeping in the fixture is wrong"
+    fi
+    echo "$out"
+}
+
+sys_stall() {
+    local tag="$1" err="$2" last
+    last="$(grep -h "^$tag: " "$err" 2>/dev/null | tail -1 | sed "s/^$tag: //")"
+    if [ -z "$last" ]; then
+        echo "the fixture never wrote its first progress note"
+    else
+        echo "the last progress note was '$last', so it stopped inside that group of checks"
+    fi
+}
+
+sys_run_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" reason
+    reason="$(native_run_reason "$rc" "$out" "$err")"
+    if [ -z "$reason" ]; then
+        echo ""
+    elif grep -q '^ocerz: bridge: .* refused$' "$out" "$err" 2>/dev/null; then
+        echo "$reason; ocerz refused a call: $(grep -h '^ocerz: bridge: .* refused$' "$out" "$err" | head -1 | cut -c1-240)"
+    elif grep -qE "$BRIDGE_FAULT_RE" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hE "$BRIDGE_FAULT_RE" "$out" "$err" | head -1 | cut -c1-120); $(sys_stall "$tag" "$err")"
+    elif grep -Fq "$GUEST_CRASH" "$out" "$err" 2>/dev/null; then
+        echo "$reason; $(grep -hF "$GUEST_CRASH" "$out" "$err" | head -1 | cut -c1-120); $(sys_stall "$tag" "$err")"
+    elif [ "$rc" -eq 124 ]; then
+        echo "$reason: still running after ${NATIVE_TIMEOUT}s, and $(sys_stall "$tag" "$err")"
+    elif [ "$rc" -gt 128 ] && [ "$rc" -lt 160 ]; then
+        echo "$reason: the process was ended by signal $((rc - 128)); $(sys_stall "$tag" "$err")"
+    else
+        echo "$reason; $(sys_stall "$tag" "$err")"
+    fi
+}
+
+sys_arm64_reason() {
+    local rc="$1" tag="$2" out="$3" err="$4" line
+    shift 4
+    line="$(sys_status "$tag" "$out")"
+    if grep -q "^$tag bad:" "$out" 2>/dev/null; then
+        echo "the arm64 build, run directly on the host, fails its own checks, so the fixture expects something the host does not do and the native run can prove nothing either way: $(sys_bits "$tag" "$out" "$@")"
+    elif [ "$rc" -eq 124 ]; then
+        echo "the arm64 build, run directly on the host, was still running after ${NATIVE_TIMEOUT}s, and $(sys_stall "$tag" "$err")"
+    elif [ "$rc" -ne 0 ] || ! grep -q "^$tag ok" "$out" 2>/dev/null; then
+        echo "the arm64 build, run directly on the host, exited $rc with '${line:-nothing}' and no '$tag ok' line, so the fixture itself is broken, and $(sys_stall "$tag" "$err")"
+    fi
+}
+
+sys_modes_reason() {
+    local log="$1" kinds="$2" kind lines bad
+    if [ -z "$kinds" ]; then
+        return
+    fi
+    if [ ! -s "$log" ]; then
+        echo "no child wrote to the mode log, so nothing shows the children ran under ocerz in native mode"
+        return
+    fi
+    bad="$(grep -v ' mode=native exe=ocerz$' "$log" | head -1)"
+    if [ -n "$bad" ]; then
+        echo "a child reported '$bad': it did not come up under ocerz in native mode"
+        return
+    fi
+    for kind in $kinds; do
+        lines="$(grep -c "^$kind mode=" "$log")"
+        if [ "$lines" -ne 1 ]; then
+            echo "the mode log holds $lines lines for the $kind child, want exactly one"
+            return
+        fi
+    done
+}
+
+case_sys() {
+    local name="$1" bin="$2" arm="$3" tag="$4" need="$5" kinds="$6" note="$7"
+    local reason="" rc_arm rc_jit rc_nojit rc_cache line cache_note=""
+    local ao="$TMP/$name.arm64.out" ae="$TMP/$name.arm64.err"
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local log="$TMP/$name.modes"
+    local NATIVE_TIMEOUT=$SYS_TIMEOUT
+    shift 7
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    if [ -z "$arm" ]; then
+        record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $( (grep -m1 -i 'error' "$TMP/$name.arm64.cc.log" || head -1 "$TMP/$name.arm64.cc.log") 2>/dev/null | cut -c1-160)"
+        return
+    fi
+    reason="$(sys_import_reason "$bin" "$need")"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+    run_bounded "$ao" "$ae" "$arm" "$SYS_WORK"
+    rc_arm=$?
+    reason="$(sys_arm64_reason "$rc_arm" "$tag" "$ao" "$ae" "$@")"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+
+    rm -f "$log"
+    run_bounded "$jo" "$je" env SYS_MODE_LOG="$log" "$OCERZ" -v -native "$bin" "$SYS_WORK"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin" "$SYS_WORK"
+    rc_nojit=$?
+    line="$(sys_status "$tag" "$jo")"
+
+    reason="$(sys_run_reason "$rc_jit" "$tag" "$jo" "$je")"
+    if grep -q "^$tag bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed: $(sys_bits "$tag" "$jo" "$@")"
+    elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+        reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+    fi
+    if [ -z "$reason" ]; then
+        reason="$(sys_run_reason "$rc_nojit" "$tag" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(sys_status "$tag" "$no")': the guest's own checks failed: $(sys_bits "$tag" "$no" "$@")"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    if [ -z "$reason" ] && ! grep -v "^$tag x86 " "$jo" | cmp -s - "$ao"; then
+        reason="native '$(grep -v "^$tag x86 " "$jo" | tr '\n' ' ')' != arm64 '$(tr '\n' ' ' < "$ao")': the guest got answers a native program making the same calls does not"
+    fi
+    if [ -z "$reason" ]; then
+        reason="$(sys_modes_reason "$log" "$kinds")"
+    fi
+    if [ -n "$reason" ] && [ -n "$note" ]; then
+        reason="$reason. $note"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$bin" "$SYS_WORK"
+        rc_cache=$?
+        if [ "$rc_cache" -eq 124 ]; then
+            reason="cache mode still running after ${NATIVE_TIMEOUT}s, and $(sys_stall "$tag" "$ce")"
+        elif [ "$rc_cache" -ne 0 ]; then
+            reason="cache-mode exit $rc_cache, want 0: '$(sys_status "$tag" "$co")'"
+        elif ! cmp -s "$jo" "$co"; then
+            reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': native mode agrees with the arm64 build and cache mode, where the same calls go through the x86 libc to the syscall layer, answers otherwise"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
+}
+
+sys_refused_reason() {
+    local rc="$1" out="$2" err="$3" msg="$4" past="$5"
+    if ! grep -q " start$" "$out" 2>/dev/null; then
+        echo "exit $rc before the fixture's first line"
+    elif grep -q "$past" "$out" 2>/dev/null; then
+        echo "exit $rc, and the fixture printed '$(grep "$past" "$out" | head -1)': the call was performed rather than refused"
+    elif ! grep -Fxq "$msg" "$err" 2>/dev/null; then
+        echo "exit $rc without the refusal line '$msg': got '$(grep -h '^ocerz: ' "$err" 2>/dev/null | grep -v '^ocerz: [a-z]*: ' | head -1 | cut -c1-200)'"
+    elif [ "$rc" -ne "$SYS_REFUSED_STATUS" ]; then
+        echo "exit $rc, want $SYS_REFUSED_STATUS after the refusal line"
+    fi
+}
+
+case_sys_jmp_refused() {
+    local name=sys_jmp_refused reason="" rc_jit rc_nojit rc_cache cache_note=""
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$SYS_TIMEOUT
+
+    if callback_fixture_missing "$name" "$SYS_REFUSE_BIN"; then
+        return
+    fi
+    reason="$(sys_import_reason "$SYS_REFUSE_BIN" '_setjmp _longjmp _qsort')"
+    if [ -z "$reason" ]; then
+        run_bounded "$jo" "$je" "$OCERZ" -native "$SYS_REFUSE_BIN"
+        rc_jit=$?
+        reason="$(sys_refused_reason "$rc_jit" "$jo" "$je" "$SYS_REFUSE_MSG" " jumped")"
+    fi
+    if [ -z "$reason" ]; then
+        run_bounded "$no" "$ne" "$OCERZ" -native -no-jit "$SYS_REFUSE_BIN"
+        rc_nojit=$?
+        reason="$(sys_refused_reason "$rc_nojit" "$no" "$ne" "$SYS_REFUSE_MSG" " jumped")"
+        if [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$SYS_REFUSE_BIN"
+        rc_cache=$?
+        if [ "$rc_cache" -ne 0 ] || ! grep -qx 'sys_jmp_refused jumped r=5 calls=3' "$co"; then
+            reason="cache mode, where qsort is translated x86 code and the jump skips nothing native, exited $rc_cache with '$(tr '\n' ' ' < "$co")', want the jump performed"
+        fi
+    fi
+    record "$name" "$reason" "exit=${rc_jit:-} no-jit exit=${rc_nojit:-}$cache_note"
+}
+
+case_sys_fork_callback() {
+    local name=sys_fork_callback reason="" rc_arm rc_jit rc_nojit rc_cache cache_note=""
+    local ao="$TMP/$name.arm64.out" ae="$TMP/$name.arm64.err"
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$SYS_TIMEOUT
+
+    if callback_fixture_missing "$name" "$SYS_FORKCB_BIN"; then
+        return
+    fi
+    if [ -z "$SYS_FORKCB_ARM64" ]; then
+        record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle"
+        return
+    fi
+    reason="$(sys_import_reason "$SYS_FORKCB_BIN" '_fork _qsort')"
+    if [ -z "$reason" ]; then
+        run_bounded "$ao" "$ae" "$SYS_FORKCB_ARM64"
+        rc_arm=$?
+        if [ "$rc_arm" -ne 0 ] || ! grep -qx 'sys_fork_callback parent saw=8 sorted=1' "$ao"; then
+            reason="the arm64 build, run directly on the host, exited $rc_arm with '$(tr '\n' ' ' < "$ao")', so the fixture itself is broken"
+        fi
+    fi
+    if [ -z "$reason" ]; then
+        run_bounded "$jo" "$je" "$OCERZ" -native "$SYS_FORKCB_BIN"
+        rc_jit=$?
+        reason="$(sys_refused_reason "$rc_jit" "$jo" "$je" "$SYS_FORKCB_MSG" " parent ")"
+    fi
+    if [ -z "$reason" ]; then
+        run_bounded "$no" "$ne" "$OCERZ" -native -no-jit "$SYS_FORKCB_BIN"
+        rc_nojit=$?
+        if [ "$rc_nojit" -ne 0 ] || ! cmp -s "$no" "$ao"; then
+            reason="no-jit, where no translated frame lies beneath the comparator, exited $rc_nojit with '$(tr '\n' ' ' < "$no")', want the fork performed and arm64's '$(tr '\n' ' ' < "$ao")'"
+        fi
+    fi
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$SYS_FORKCB_BIN"
+        rc_cache=$?
+        if [ "$rc_cache" -ne 0 ] || ! cmp -s "$co" "$ao"; then
+            reason="cache mode exited $rc_cache with '$(tr '\n' ' ' < "$co")', want arm64's '$(tr '\n' ' ' < "$ao")'"
+        fi
+    fi
+    record "$name" "$reason" "exit=${rc_jit:-} no-jit exit=${rc_nojit:-}$cache_note"
+}
+
 build_fixtures
 build_callback_fixtures
 build_attach_fixtures
@@ -11790,6 +13586,7 @@ build_objc_fixtures
 build_objc_class_fixtures
 build_app_fixtures
 build_dl_fixtures
+build_sys_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -11976,6 +13773,41 @@ case_native_float
 case_native_classic_bind
 case_native_exit
 case_native_constructors
+case_sys sys_files "$SYS_FILES_BIN" "$SYS_FILES_ARM64" sys_files "$SYS_FILES_NEED" "" \
+    "sys_files is the first case in which a guest's open, fcntl or ioctl crosses at all, so a failure here means native mode cannot open a file with a mode or read a descriptor's flags" \
+    open "bit 0 is open with O_CREAT and O_EXCL failing, 1 the file not created with the mode 0640 the optional argument carried, 2 the write to it failing, 3 a second O_EXCL open not failing with EEXIST, 4 open without O_CREAT not reading the file back, 5 open\$NOCANCEL not reading it back, 6 O_TRUNC not emptying it or the rewrite failing, 7 open of a missing path not failing with ENOENT, 8 open\$NOCANCEL with O_CREAT in a missing directory not failing with ENOENT" \
+    openat "bit 0 is the directory not opening, 1 openat with O_CREAT not creating the file with mode 0604, 2 the write to it failing, 3 openat\$NOCANCEL not reading it back, 4 a second O_EXCL openat not failing with EEXIST, 5 unlinkat failing" \
+    fcntl "bit 0 is the file not reopening, 1 F_GETFL not answering O_RDWR without O_NONBLOCK, 2 F_SETFL not setting O_NONBLOCK, 3 fcntl\$NOCANCEL not clearing it again, 4 F_SETFD not setting FD_CLOEXEC, 5 F_DUPFD not handing out a descriptor at or above 50 without FD_CLOEXEC, 6 F_DUPFD_CLOEXEC not handing out one at or above 60 with it, 7 F_GETPATH, a pointer command, not writing the file's real path, 8 F_PREALLOCATE not filling in fst_bytesalloc, 9 F_NOCACHE failing, 10 F_FULLFSYNC, which takes no argument, failing, 11 fcntl on descriptor -1 not failing with EBADF" \
+    lock "bit 0 is the file not opening twice, 1 F_SETLK failing, 2 F_GETLK against the process's own lock not answering F_UNLCK, 3 F_OFD_SETLK failing, 4 F_OFD_GETLK through the second open file description not seeing the first one's lock where it is, 5 a conflicting F_OFD_SETLK not failing with EAGAIN, 6 unlocking not letting it through, 7 F_SETLK not unlocking" \
+    ioctl "bit 0 is the pipe or the write to it failing, 1 FIONREAD not answering 7, 2 FIONBIO not making the read end non-blocking, 3 the drained read end not failing with EAGAIN, 4 FIOCLEX, a request carrying no argument, not setting FD_CLOEXEC, 5 FIONCLEX not clearing it, 6 posix_openpt, grantpt or unlockpt failing, 7 the slave not opening, 8 TIOCSWINSZ failing, 9 TIOCGWINSZ not reading back 33 by 101, 10 TIOCGETA or tcgetattr failing, 11 ioctl on descriptor -1 not failing with EBADF" \
+    sem_open "bit 0 is sem_open with O_CREAT failing, 1 the semaphore not starting at the value 3 its fourth argument carried, 2 a fourth trywait not failing with EAGAIN, 3 sem_post not raising it, 4 a second O_EXCL sem_open not failing with EEXIST, 5 sem_open without O_CREAT not finding the existing one, 6 sem_close failing, 7 sem_unlink failing, 8 sem_open of the unlinked name not failing with ENOENT" \
+    shm_open "bit 0 is shm_open with O_CREAT failing, 1 ftruncate failing, 2 the object not 16384 bytes with the mode 0600 its third argument carried, 3 a second O_EXCL shm_open not failing with EEXIST, 4 shm_open without O_CREAT not finding it, 5 shm_unlink failing, 6 shm_open of the unlinked name not failing with ENOENT" \
+    semctl "bit 0 is SETVAL, whose union carries an int, or GETVAL failing, 1 SETALL, whose union carries a pointer, failing, 2 GETALL not reading 7 and 9 back, 3 IPC_STAT not filling in two semaphores and the mode 0600, 4 IPC_SET failing, 5 IPC_STAT not seeing the new mode, 6 GETVAL on the second semaphore or GETNCNT wrong, 7 IPC_RMID failing, 8 GETVAL on the removed set not failing; ran=0 means semget itself failed on every side" \
+    ulimit "bit 0 is UL_GETFSIZE not positive, 1 it disagreeing with RLIMIT_FSIZE in 512-byte blocks, 2 UL_SETFSIZE, whose second argument carries the new limit, not setting it, 3 an unknown command not failing with EINVAL"
+case_sys sys_mmap "$SYS_MMAP_BIN" "$SYS_MMAP_ARM64" sys_mmap "$SYS_MMAP_NEED" "" \
+    "sys_mmap is the case that fails if a guest's mapping escapes the memory ocerz tracks, or if code written into a mapping is not retranslated after the guest changes it" \
+    anon "bit 0 is an anonymous mapping failing or not page-aligned, 1 it not zeroed, 2 a pattern not reading back, 3 a MAP_FIXED mapping over its second page not replacing exactly that page with zeros, 4 madvise failing, 5 munmap failing" \
+    file "bit 0 is the file not written, 1 a private read-only mapping at an offset not showing the file's bytes, 2 its munmap failing, 3 a store into a private writable mapping reaching the file or not reading back, 4 its munmap failing, 5 msync of a shared mapping failing, 6 the shared store not reaching the file, 7 mlock or munlock failing, 8 its munmap failing" \
+    code "bit 0 is the mapping failing, 1 code written into it, made executable and called not returning its value, 2 rewritten code not returning the new value, which is what a translation kept past the protection change looks like, 3 one of five more rewrites returning a stale value, 4 munmap failing, 5 code in a fresh mapping not returning its value" \
+    fault "bit 0 is installing the SIGSEGV and SIGBUS handlers failing, 1 mprotect to PROT_NONE failing, 2 a read of the page not caught by the handler, which leaves by siglongjmp, 3 the page not readable again after mprotect, 4 a write to the read-only page not caught, 5 mprotect back to read-write failing, 6 the write not landing afterwards, 7 munmap failing" \
+    mach "bit 0 is mach_vm_allocate failing, 1 its memory not zeroed, 2 mach_vm_protect to read-only failing or losing the data, 3 mach_vm_protect back to read-write failing, 4 mach_vm_deallocate failing, 5 vm_allocate failing, 6 vm_protect failing, 7 vm_deallocate failing" \
+    host "bit 0 is posix_memalign failing, 1 mprotect of the host heap page to read-only failing, 2 mprotect back to read-write failing, 3 madvise of it failing, 4 task_threads failing, 5 vm_deallocate of the thread list it returned failing"
+case_sys sys_jmp "$SYS_JMP_BIN" "$SYS_JMP_ARM64" sys_jmp "$SYS_JMP_NEED" "" \
+    "sys_jmp is the case every interpreter and error-recovery library that uses setjmp depends on" \
+    value "bit 0 is setjmp's first return not 0, 1 a longjmp from forty frames down not returning 42 there, 2 longjmp with 0 not returning 1, 3 longjmp with -7 not returning it or a volatile local not surviving, 4 a longjmp through a copy of the jmp_buf not arriving" \
+    mask "bit 0 is longjmp not restoring the mask setjmp saved, 1 _longjmp restoring one, 2 siglongjmp not restoring the mask sigsetjmp(env, 1) saved, 3 siglongjmp restoring one sigsetjmp(env, 0) did not save, 4 longjmp through a sigjmp_buf that saved a mask not restoring it" \
+    handler "bit 0 is sigaction failing, 1 three siglongjmps out of a SIGUSR1 handler not each arriving with the signal unblocked again, 2 two longjmps out of a handler for kill's SIGUSR1 not arriving with it unblocked, 3 sigaction failing, 4 siglongjmp of a buffer that saved no mask not leaving SIGUSR1 blocked as the handler had it" \
+    altstack "bit 0 is sigaltstack failing, 1 sigaction failing, 2 three raises not each leaving the handler by siglongjmp, 3 the second or third handler not running on the alternate stack, which is what a jump that left the thread marked as still on it looks like, 4 sigaltstack after a jump still reporting SS_ONSTACK, 5 disabling the stack failing" \
+    callback "bit 0 is a setjmp and longjmp inside a qsort comparator, within the same callback, not performed or the sort wrong" \
+    x86 "bit 0 is longjmp not restoring MXCSR's rounding control, 1 the x87 control word, 2 division not rounding to nearest afterwards, 3 the direction flag not cleared"
+case_sys sys_proc "$SYS_PROC_BIN" "$SYS_PROC_ARM64" sys_proc "$SYS_PROC_NEED" "$SYS_PROC_KINDS" \
+    "sys_proc is the case that fails if a program native mode starts does not run under ocerz, or does not get the argv and environment the guest built" \
+    fork "bit 0 is the pipe failing, 1 fork failing, 2 the child's line not arriving, 3 the child's own checks - getppid, qsort with a guest comparator, a pthread in the child, the heap - failing, 4 a second fork's child not exiting 17 to wait4, 5 vfork's child not exiting 7, 6 waitpid with no children left not failing with ECHILD" \
+    spawn "bit 0 is the pipe failing, 1 posix_spawn_file_actions_init failing, 2 adddup2 failing, 3 addclose failing, 4 posix_spawn with file actions and an environment failing, 5 nothing arriving on the child's stdout, 6 the child not exiting 24, 7 posix_spawnattr_init failing, 8 setflags or setpgroup failing, 9 posix_spawn with attributes failing, 10 that child not exiting 23, 11 posix_spawnp not finding the fixture on PATH, 12 that child not exiting 23, 13 posix_spawnp of a missing name not answering ENOENT, 14 posix_spawn of a missing path not answering ENOENT, 15 posix_spawn of a #! script whose interpreter is the fixture failing, 16 the interpreter not exiting 24" \
+    exec "bit 0 is execv, 1 execve with an environment, 2 execve with none, 3 execvp, 4 execvP, 5 execl, 6 execle, 7 execlp and 8 execl with ten arguments, six of them on the stack, not starting the child with the argv the report line shows, 9 execv of a missing path not failing with ENOENT, 10 execvp of a missing name not failing with ENOENT" \
+    shell "bit 0 is system(NULL) not reporting a shell, 1 system(\"exit 3\") not returning 3, 2 system running the fixture not returning its exit 25, 3 a shell loop not returning 4, 4 popen for reading not delivering the child's line, 5 pclose not returning its exit 23, 6 popen for writing failing, 7 the sink child not counting 42 bytes, 8 popen r+ not accepting a line, 9 the shell not echoing it back, 10 pclose of it failing, 11 popen with a bad type not failing with EINVAL, 12 pclose of a stream popen never made not failing"
+case_sys_jmp_refused
+case_sys_fork_callback
 
 echo "----------------------------------------"
 echo "native tests: $pass passed, $fail failed"

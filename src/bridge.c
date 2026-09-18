@@ -44,12 +44,15 @@
  * ---- what is deliberately absent ----
  * Variadic functions as fn records.  Apple's arm64 ABI passes variadic
  * arguments on the stack while x86-64 passes them in registers, and a signature
- * has nowhere to say where a function's fixed arguments stop, so a bridged open,
- * fcntl or ioctl would be quietly wrong rather than refused.  The database
- * carries them as stub records, and they fall back to naming themselves.  The
- * variadic functions a format string describes are special records instead,
- * and so are the Objective-C message sends, whose signature is the method's:
- * the handler table names the functions src/objcbridge.c answers them with.
+ * has nowhere to say where a function's fixed arguments stop, so a variadic
+ * function bridged by its signature would be quietly wrong rather than refused.
+ * The database carries them as stub records, and they fall back to naming
+ * themselves.  The variadic functions a format string describes are special
+ * records instead, and so are the Objective-C message sends, whose signature is
+ * the method's: the handler table names the functions src/objcbridge.c answers
+ * them with.  So are open, fcntl, ioctl and the other functions whose ellipsis
+ * stands for one fixed argument, answered by src/sysbridge.c along with the
+ * memory, non-local jump and process calls a crossing cannot make.
  *
  * ---- functions that call back ----
  * qsort and bsearch take a comparator, which the guest supplies as x86 code.
@@ -364,9 +367,11 @@
 #include "ocerz/syscall.h"
 #include "ocerz/vdylib.h"
 #include "ocerz/objcbridge.h"
+#include "ocerz/sysbridge.h"
 
 #include <crt_externs.h>
 #include <dlfcn.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <mach-o/loader.h>
 #include <pthread.h>
@@ -476,6 +481,16 @@ static int br_settle(struct OcerzVM *vm, OcerzCPU *cpu)
     if (ocerz_peek_pending_async_sig() || (cpu->sig_pending & ~cpu->sig_mask))
         ocerz_guest_deliver_pending(vm, cpu);
     return OCERZ_STEP_OK;
+}
+
+void ocerz_bridge_return(OcerzCPU *cpu, uint64_t rax)
+{
+    br_return(cpu, rax);
+}
+
+int ocerz_bridge_settle(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_settle(vm, cpu);
 }
 
 static int br_posix(struct OcerzVM *vm, OcerzCPU *cpu, int err)
@@ -891,6 +906,45 @@ static const BrHandler g_br_handlers[] = {
     { "snprintf_chk",              ocerz_fmt_snprintf_chk },
     { "CFStringCreateWithFormat",  ocerz_fmt_CFStringCreateWithFormat },
     { "CFStringAppendFormat",      ocerz_fmt_CFStringAppendFormat },
+    { "open",            ocerz_sys_open },
+    { "open_nocancel",   ocerz_sys_open_nocancel },
+    { "openat",          ocerz_sys_openat },
+    { "openat_nocancel", ocerz_sys_openat_nocancel },
+    { "open_dprotected_np",   ocerz_sys_open_dprotected_np },
+    { "openat_dprotected_np", ocerz_sys_openat_dprotected_np },
+    { "fcntl",           ocerz_sys_fcntl },
+    { "fcntl_nocancel",  ocerz_sys_fcntl_nocancel },
+    { "ioctl",           ocerz_sys_ioctl },
+    { "sem_open",        ocerz_sys_sem_open },
+    { "shm_open",        ocerz_sys_shm_open },
+    { "semctl",          ocerz_sys_semctl },
+    { "ulimit",          ocerz_sys_ulimit },
+    { "mmap",            ocerz_sys_mmap },
+    { "munmap",          ocerz_sys_munmap },
+    { "mprotect",        ocerz_sys_mprotect },
+    { "madvise",         ocerz_sys_madvise },
+    { "vm_allocate",     ocerz_sys_vm_allocate },
+    { "vm_deallocate",   ocerz_sys_vm_deallocate },
+    { "vm_protect",      ocerz_sys_vm_protect },
+    { "setjmp",          ocerz_sys_setjmp },
+    { "_setjmp",         ocerz_sys__setjmp },
+    { "sigsetjmp",       ocerz_sys_sigsetjmp },
+    { "longjmp",         ocerz_sys_longjmp },
+    { "_longjmp",        ocerz_sys__longjmp },
+    { "siglongjmp",      ocerz_sys_siglongjmp },
+    { "fork",            ocerz_sys_fork },
+    { "execve",          ocerz_sys_execve },
+    { "execv",           ocerz_sys_execv },
+    { "execvp",          ocerz_sys_execvp },
+    { "execvP",          ocerz_sys_execvP },
+    { "execl",           ocerz_sys_execl },
+    { "execle",          ocerz_sys_execle },
+    { "execlp",          ocerz_sys_execlp },
+    { "posix_spawn",     ocerz_sys_posix_spawn },
+    { "posix_spawnp",    ocerz_sys_posix_spawnp },
+    { "system",          ocerz_sys_system },
+    { "popen",           ocerz_sys_popen },
+    { "pclose",          ocerz_sys_pclose },
 };
 
 static int (*br_handler(const char *name))(struct OcerzVM *, OcerzCPU *)
@@ -1118,10 +1172,41 @@ const struct OcerzBridgeFrame *ocerz_bridge_in_flight(void)
     return g_br_frame.depth > 0 ? &g_br_frame : NULL;
 }
 
+static _Atomic uint64_t g_br_levels;
+
+static uint64_t br_new_level(void)
+{
+    return atomic_fetch_add(&g_br_levels, 1) + 1;
+}
+
 void ocerz_bridge_guest_enter(struct OcerzBridgeFrame *saved)
 {
-    *saved = g_br_frame;
-    memset(&g_br_frame, 0, sizeof g_br_frame);
+    struct OcerzBridgeFrame *frame = &g_br_frame;
+    *saved = *frame;
+    memset(frame, 0, sizeof *frame);
+    frame->around = saved;
+    frame->level = br_new_level();
+}
+
+uint64_t ocerz_bridge_level(void)
+{
+    struct OcerzBridgeFrame *frame = &g_br_frame;
+    if (frame->level == 0)
+        frame->level = br_new_level();
+    return frame->level;
+}
+
+const struct OcerzBridgeFrame *ocerz_bridge_callback_frame(void)
+{
+    return g_br_frame.around;
+}
+
+void ocerz_bridge_postfork_child(void)
+{
+    pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+    g_br_libs_lock = fresh;
+    g_br_fn_lock = fresh;
+    g_br_host_lock = fresh;
 }
 
 void ocerz_bridge_guest_leave(const struct OcerzBridgeFrame *saved)

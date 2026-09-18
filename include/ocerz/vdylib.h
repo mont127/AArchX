@@ -71,6 +71,12 @@
  * ocerz_vdylib_xmm_contract tells the translator which xmm registers an
  * export's crossing reads and which it writes, or answers zero when the export
  * promises every register back or has no signature to go by.
+ * ocerz_vdylib_trap_only names the exports translated code must not call from
+ * inside a block at all: fork and vfork, whose child starts life without the
+ * parent's translations and would return into a block that is gone.  Their
+ * stubs are left to trap, so the child comes back through the dispatcher.
+ * ocerz_vdylib_postfork_child puts the image builder's lock back to its initial
+ * state in a fork child.
  */
 #ifndef OCERZ_VDYLIB_H
 #define OCERZ_VDYLIB_H
@@ -92,5 +98,7 @@ int ocerz_vdylib_export_name(uint64_t id, const char **lib_out, const char **sym
 int ocerz_vdylib_dispatch(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_vdylib_fastcall(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_vdylib_xmm_contract(uint64_t id, uint16_t *in, uint16_t *out);
+int ocerz_vdylib_trap_only(uint64_t id);
+void ocerz_vdylib_postfork_child(void);
 
 #endif

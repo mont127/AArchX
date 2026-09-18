@@ -647,6 +647,12 @@ static _Atomic int g_ad_chosen;
 static uint32_t g_ad_minos;
 static char g_ad_dir[PATH_MAX];
 
+void ocerz_apidb_postfork_child(void)
+{
+    pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+    g_ad_lock = fresh;
+}
+
 static int ad_default_root(char *out, size_t outlen)
 {
     char small[PATH_MAX];

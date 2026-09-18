@@ -205,6 +205,10 @@
 #include "ocerz/interp.h"
 #include "ocerz/dyld.h"
 #include "ocerz/mode.h"
+#include "ocerz/bridge.h"
+#include "ocerz/abi.h"
+#include "ocerz/apidb.h"
+#include "ocerz/vdylib.h"
 
 #include <stddef.h>
 #include <sys/mman.h>
@@ -570,14 +574,9 @@ static int private_file_backing(uint64_t gaddr, uint64_t len, int fd, uint64_t p
     return pread_range(fd, gaddr, lo, hi, pos);
 }
 
-static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+static int guest_mmap_apply(OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot,
+                            int flags, int fd, uint64_t pos, uint64_t *out)
 {
-    uint64_t addr = a[0];
-    uint64_t len = a[1];
-    int prot = (int)a[2];
-    int flags = (int)a[3];
-    int fd = (int)(int32_t)a[4];
-    uint64_t pos = a[5];
     int anon = (flags & MAP_ANON) != 0 || fd < 0;
     int fixed = (flags & MAP_FIXED) != 0;
     uint64_t gaddr;
@@ -595,21 +594,19 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                 rc = ocerz_map_fixed(addr, len, prot);
             if (rc != OCERZ_OK) {
                 mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
-            ret_err(cpu, OCERZ_ENOMEM_V);
-                return OCERZ_STEP_OK;
+                return OCERZ_ENOMEM_V;
             }
             if ((flags & MAP_SHARED) &&
                 ocerz_map_shared_anon(addr, len, prot) != OCERZ_OK) {
                 ocerz_unmap(addr, len);
                 mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
-            ret_err(cpu, OCERZ_ENOMEM_V);
-                return OCERZ_STEP_OK;
+                return OCERZ_ENOMEM_V;
             }
             if (prot == PROT_NONE && addr <= 0x10000ull &&
                 len >= 0x100000000ull - addr)
                 ocerz_init_gate_release();
-            ret_ok(cpu, addr);
-            return OCERZ_STEP_OK;
+            *out = addr;
+            return 0;
         }
 
         gaddr = 0;
@@ -620,19 +617,17 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             gaddr = ocerz_map_anywhere(len, prot);
         if (gaddr == 0) {
             mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
-            ret_err(cpu, OCERZ_ENOMEM_V);
-            return OCERZ_STEP_OK;
+            return OCERZ_ENOMEM_V;
         }
         invalidate_guest_mapping(vm, gaddr, len);
         if ((flags & MAP_SHARED) &&
             ocerz_map_shared_anon(gaddr, len, prot) != OCERZ_OK) {
             ocerz_unmap(gaddr, len);
             mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
-            ret_err(cpu, OCERZ_ENOMEM_V);
-            return OCERZ_STEP_OK;
+            return OCERZ_ENOMEM_V;
         }
-        ret_ok(cpu, gaddr);
-        return OCERZ_STEP_OK;
+        *out = gaddr;
+        return 0;
     }
 
     if (fixed) {
@@ -643,16 +638,14 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             rc = ocerz_map_fixed(addr, len, PROT_READ | PROT_WRITE);
         if (rc != OCERZ_OK) {
             mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
-            ret_err(cpu, OCERZ_ENOMEM_V);
-            return OCERZ_STEP_OK;
+            return OCERZ_ENOMEM_V;
         }
         gaddr = addr;
     } else {
         gaddr = ocerz_map_anywhere(len, PROT_READ | PROT_WRITE);
         if (gaddr == 0) {
             mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
-            ret_err(cpu, OCERZ_ENOMEM_V);
-            return OCERZ_STEP_OK;
+            return OCERZ_ENOMEM_V;
         }
         invalidate_guest_mapping(vm, gaddr, len);
     }
@@ -690,37 +683,45 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         if (src == OCERZ_OK) {
             if (!(prot & PROT_WRITE)) shared_ro_record(gaddr, len);
             if (padded_kuser) ocerz_jit_require_ordered(vm);
-            ret_ok(cpu, gaddr);
-            return OCERZ_STEP_OK;
+            *out = gaddr;
+            return 0;
         }
         if (padded_kuser) {
             ocerz_unmap(gaddr, len);
             mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
-            ret_err(cpu, src == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V);
-            return OCERZ_STEP_OK;
+            return src == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V;
         }
         if (prot & PROT_WRITE) {
             ocerz_unmap(gaddr, len);
             mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
-            ret_err(cpu, src == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V);
-            return OCERZ_STEP_OK;
+            return src == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V;
         }
     }
     {
         int e = private_file_backing(gaddr, len, fd, pos);
         if (e) {
             ocerz_unmap(gaddr, len);
-            ret_err(cpu, (uint64_t)e);
-            return OCERZ_STEP_OK;
+            return e;
         }
     }
     if (ocerz_protect(gaddr, len, prot) != OCERZ_OK) {
         ocerz_unmap(gaddr, len);
         mmap_fail_log(cpu, addr, len, prot, flags, fd, pos);
-        ret_err(cpu, OCERZ_ENOMEM_V);
-        return OCERZ_STEP_OK;
+        return OCERZ_ENOMEM_V;
     }
-    ret_ok(cpu, gaddr);
+    *out = gaddr;
+    return 0;
+}
+
+static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    uint64_t gaddr = 0;
+    int e = guest_mmap_apply(vm, cpu, a[0], a[1], (int)a[2], (int)a[3], (int)(int32_t)a[4], a[5],
+                             &gaddr);
+    if (e)
+        ret_err(cpu, (uint64_t)e);
+    else
+        ret_ok(cpu, gaddr);
     return OCERZ_STEP_OK;
 }
 
@@ -732,30 +733,35 @@ static int sys_munmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
-static int sys_mprotect(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+static int guest_mprotect_apply(OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot)
 {
-    memtrace("mprotect", a[0], a[1], (int)a[2], 0);
-    if (ocerz_cache_region((uintptr_t)a[0])) {
-        int e = ocerz_cache_protect((uintptr_t)a[0], a[1], (int)a[2]);
-        if (e) {
-            ret_err(cpu, e);
-        } else {
-            if ((int)a[2] & PROT_WRITE) invalidate_guest_mapping(vm, a[0], a[1]);
-            ret_ok(cpu, 0);
-        }
-        return OCERZ_STEP_OK;
+    memtrace("mprotect", addr, len, prot, 0);
+    if (ocerz_cache_region((uintptr_t)addr)) {
+        int e = ocerz_cache_protect((uintptr_t)addr, len, prot);
+        if (e)
+            return e;
+        if (prot & PROT_WRITE) invalidate_guest_mapping(vm, addr, len);
+        return 0;
     }
-    if (((int)a[2] & PROT_WRITE) && shared_ro_overlaps(a[0], a[1]))
+    if ((prot & PROT_WRITE) && shared_ro_overlaps(addr, len))
         ocerz_jit_require_ordered(vm);
-    invalidate_guest_mapping(vm, a[0], a[1]);
-    int rc = ocerz_protect(a[0], a[1], (int)a[2]);
+    invalidate_guest_mapping(vm, addr, len);
+    int rc = ocerz_protect(addr, len, prot);
     if (rc != OCERZ_OK && getenv("OCERZ_MAPFAILLOG"))
         fprintf(stderr, "ocerz: PROTFAIL[%d] addr=%#llx len=%#llx prot=%#x rc=%d rip=%#llx\n", (int)getpid(),
-                (unsigned long long)a[0], (unsigned long long)a[1], (unsigned)a[2], rc, (unsigned long long)cpu->rip);
+                (unsigned long long)addr, (unsigned long long)len, (unsigned)prot, rc, (unsigned long long)cpu->rip);
     if (rc == OCERZ_OK)
-        ret_ok(cpu, 0);
+        return 0;
+    return rc == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V;
+}
+
+static int sys_mprotect(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    int e = guest_mprotect_apply(vm, cpu, a[0], a[1], (int)a[2]);
+    if (e)
+        ret_err(cpu, (uint64_t)e);
     else
-        ret_err(cpu, rc == OCERZ_EUNSUP ? EINVAL : OCERZ_ENOMEM_V);
+        ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
 }
 
@@ -765,6 +771,36 @@ static int sys_madvise(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     (void)a;
     ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
+}
+
+int ocerz_guest_mmap(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot,
+                     int flags, int fd, uint64_t off, uint64_t *out)
+{
+    return guest_mmap_apply(vm, cpu, addr, len, prot, flags, fd, off, out);
+}
+
+int ocerz_guest_munmap(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len)
+{
+    invalidate_guest_mapping(vm, addr, len);
+    if (!ocerz_mem_overlaps(addr, len))
+        return munmap(ocerz_g2h(addr), (size_t)len) == 0 ? 0 : errno;
+    ocerz_unmap(addr, len);
+    return 0;
+}
+
+int ocerz_guest_mprotect(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot)
+{
+    if (ocerz_mem_overlaps(addr, len))
+        return guest_mprotect_apply(vm, cpu, addr, len, prot);
+    invalidate_guest_mapping(vm, addr, len);
+    return mprotect(ocerz_g2h(addr), (size_t)len, prot) == 0 ? 0 : errno;
+}
+
+int ocerz_guest_madvise(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len, int advice)
+{
+    if (ocerz_mem_overlaps(addr, len))
+        return 0;
+    return madvise(ocerz_g2h(addr), (size_t)len, advice) == 0 ? 0 : errno;
 }
 
 static int sys_shared_region_check_np(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
@@ -1301,6 +1337,10 @@ static void ocerz_fork_child(void)
 {
     ocerz_mem_postfork();
     ocerz_jit_postfork();
+    ocerz_bridge_postfork_child();
+    ocerz_abi_postfork_child();
+    ocerz_apidb_postfork_child();
+    ocerz_vdylib_postfork_child();
     memset(g_active_wl, 0, sizeof g_active_wl);
     pthread_mutex_unlock(&g_wl_lock);
     ocerz_vm_atfork_child();
@@ -1318,15 +1358,17 @@ static void ocerz_fork_register_atfork(void)
         ocerz_fork_prepare, ocerz_fork_parent, ocerz_fork_child);
 }
 
-static int sys_fork(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+void ocerz_fork_register(void)
 {
-    (void)a;
+    pthread_once(&g_fork_atfork_once, ocerz_fork_register_atfork);
+}
+
+static int guest_fork_apply(OcerzVM *vm, pid_t *out)
+{
     ocerz_jit_require_ordered(vm);
     int once_error = pthread_once(&g_fork_atfork_once, ocerz_fork_register_atfork);
-    if (once_error != 0 || g_fork_atfork_error != 0) {
-        ret_err(cpu, (uint64_t)(once_error ? once_error : g_fork_atfork_error));
-        return OCERZ_STEP_OK;
-    }
+    if (once_error != 0 || g_fork_atfork_error != 0)
+        return once_error ? once_error : g_fork_atfork_error;
     pid_t pid = fork();
     if (pid == 0) {
     if (getenv("OCERZ_HOSTMASKLOG")) {
@@ -1336,8 +1378,19 @@ static int sys_fork(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         fprintf(stderr, "ocerz: HOSTMASK-FORKCHILD[%d] mask=%#x\n", (int)getpid(), hv_);
     }
     }
-    if (pid < 0) {
-        ret_err(cpu, (uint64_t)errno);
+    if (pid < 0)
+        return errno;
+    *out = pid;
+    return 0;
+}
+
+static int sys_fork(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)a;
+    pid_t pid = 0;
+    int e = guest_fork_apply(vm, &pid);
+    if (e) {
+        ret_err(cpu, (uint64_t)e);
         return OCERZ_STEP_OK;
     }
     if (pid == 0) {
@@ -1346,6 +1399,16 @@ static int sys_fork(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     ret_ok2(cpu, (uint64_t)pid, 0);
     return OCERZ_STEP_OK;
+}
+
+int ocerz_guest_fork(struct OcerzVM *vm, OcerzCPU *cpu, int *pid_out)
+{
+    (void)cpu;
+    pid_t pid = 0;
+    int e = guest_fork_apply(vm, &pid);
+    if (!e)
+        *pid_out = pid;
+    return e;
 }
 
 static const char *ocerz_self_path(void)
@@ -1404,6 +1467,19 @@ static const char *spawn_guest_path(uint64_t g)
     return memchr(p, 0, PATH_MAX) ? p : NULL;
 }
 
+static void spawn_attr_sanitized(posix_spawnattr_t *at, short flags, const sigset_t *def,
+                                 sigset_t mask, pid_t pgroup)
+{
+    static const int keep[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE, SIGUSR1, SIGEMT };
+    for (size_t i = 0; i < sizeof keep / sizeof keep[0]; i++)
+        sigdelset(&mask, keep[i]);
+    posix_spawnattr_init(at);
+    posix_spawnattr_setflags(at, (short)(flags & SPAWN_FLAGS_PUBLIC));
+    posix_spawnattr_setsigdefault(at, def);
+    posix_spawnattr_setsigmask(at, &mask);
+    posix_spawnattr_setpgroup(at, pgroup);
+}
+
 static int spawn_guest_args(uint64_t adesc, posix_spawnattr_t *at, int *have_at,
                             posix_spawn_file_actions_t *fa, int *have_fa)
 {
@@ -1415,15 +1491,9 @@ static int spawn_guest_args(uint64_t adesc, posix_spawnattr_t *at, int *have_at,
     if (attrp && attr_size >= 16) {
         sigset_t def = (sigset_t)ocerz_ld(attrp + 4, 4);
         sigset_t mask = (sigset_t)ocerz_ld(attrp + 8, 4);
-        static const int keep[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE, SIGUSR1, SIGEMT };
-        for (size_t i = 0; i < sizeof keep / sizeof keep[0]; i++)
-            sigdelset(&mask, keep[i]);
-        posix_spawnattr_init(at);
+        spawn_attr_sanitized(at, (short)ocerz_ld(attrp, 2), &def, mask,
+                             (pid_t)ocerz_ld(attrp + 12, 4));
         *have_at = 1;
-        posix_spawnattr_setflags(at, (short)(ocerz_ld(attrp, 2) & SPAWN_FLAGS_PUBLIC));
-        posix_spawnattr_setsigdefault(at, &def);
-        posix_spawnattr_setsigmask(at, &mask);
-        posix_spawnattr_setpgroup(at, (pid_t)ocerz_ld(attrp + 12, 4));
     }
     if (!fap || fa_size < 8)
         return 0;
@@ -1691,64 +1761,6 @@ static int spawn_mock_keychain(char **hargv, int n, int at, const char *gpath)
     return n + 1;
 }
 
-static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
-{
-    const char *self = ocerz_self_path();
-    if (!self || !a[1]) {
-        ret_err(cpu, EINVAL);
-        return OCERZ_STEP_OK;
-    }
-
-    const char *gpath = (const char *)ocerz_g2h(a[1]);
-    if (access(gpath, X_OK) != 0) {
-        ret_err(cpu, (uint64_t)errno);
-        return OCERZ_STEP_OK;
-    }
-    char *hargv[260];
-    int n = 0;
-    hargv[n++] = (char *)(uintptr_t)self;
-    hargv[n++] = (char *)gpath;
-    if (a[3]) {
-        uint64_t gv;
-        for (uint64_t p = a[3] + 8; n < 258 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
-            hargv[n++] = (char *)ocerz_g2h(gv);
-    }
-    n = spawn_mock_keychain(hargv, n, 2, gpath);
-    hargv[n] = NULL;
-    spawn_rewrite_launchd(hargv, n, self);
-    char *henv[514];
-    int m = 0;
-    if (a[4]) {
-        uint64_t gv;
-        for (uint64_t p = a[4]; m < 512 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
-            henv[m++] = (char *)ocerz_g2h(gv);
-        m = env_inject_lowbase(henv, m, 512);
-    }
-    henv[m] = NULL;
-    posix_spawnattr_t at;
-    posix_spawn_file_actions_t fa;
-    int have_at, have_fa;
-    int rc = spawn_guest_args(a[2], &at, &have_at, &fa, &have_fa);
-    pid_t hpid = 0;
-    if (rc == 0) {
-        ocerz_jit_require_ordered(vm);
-        rc = posix_spawn(&hpid, self, have_fa ? &fa : NULL, have_at ? &at : NULL,
-                         hargv, a[4] ? henv : NULL);
-    }
-    if (have_fa)
-        posix_spawn_file_actions_destroy(&fa);
-    if (have_at)
-        posix_spawnattr_destroy(&at);
-    if (rc != 0) {
-        ret_err(cpu, (uint64_t)rc);
-        return OCERZ_STEP_OK;
-    }
-    if (a[0])
-        ocerz_st(a[0], 4, (uint64_t)(uint32_t)hpid);
-    ret_ok(cpu, 0);
-    return OCERZ_STEP_OK;
-}
-
 static int shebang_split(const char *path, char *line, size_t cap,
                          const char **interp, const char **arg)
 {
@@ -1783,75 +1795,190 @@ static int shebang_split(const char *path, char *line, size_t cap,
     return 1;
 }
 
-static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+static int guest_child_argv(char **hargv, int cap, const char *self, const char *path,
+                            char *const *argv, char *shline, size_t shcap)
 {
-    (void)vm;
-    const char *self = ocerz_self_path();
-    if (!self || !a[0] || !a[1]) {
-        ret_err(cpu, EINVAL);
-        return OCERZ_STEP_OK;
+    int n = 0;
+    hargv[n++] = (char *)(uintptr_t)self;
+    hargv[n++] = (char *)"-path";
+    const char *interp = NULL, *iarg = NULL;
+    if (shebang_split(path, shline, shcap, &interp, &iarg)) {
+        hargv[n++] = (char *)interp;
+        hargv[n++] = (char *)"--";
+        hargv[n++] = (char *)interp;
+        if (iarg)
+            hargv[n++] = (char *)iarg;
+        hargv[n++] = (char *)path;
+        for (int k = 1; argv && argv[0] && argv[k] && n < cap - 2; k++)
+            hargv[n++] = argv[k];
+    } else {
+        hargv[n++] = (char *)path;
+        hargv[n++] = (char *)"--";
+        int first = n;
+        for (int k = 0; argv && argv[k] && n < cap - 2; k++)
+            hargv[n++] = argv[k];
+        if (n == first)
+            hargv[n++] = (char *)path;
+        n = spawn_mock_keychain(hargv, n, first + 1, path);
     }
-    const char *gpath = (const char *)ocerz_g2h(a[0]);
+    hargv[n] = NULL;
+    return n;
+}
+
+static void guest_child_env(char **henv, int cap, char *const *envp)
+{
+    int m = 0;
+    for (int k = 0; envp && envp[k] && m < cap - 2; k++)
+        henv[m++] = envp[k];
+    m = env_inject_lowbase(henv, m, cap - 2);
+    henv[m] = NULL;
+}
+
+static int guest_vector(uint64_t gv, char **out, int cap)
+{
+    int n = 0;
+    uint64_t p;
+    for (uint64_t at = gv; gv && n < cap - 1 && (p = ocerz_ld(at, 8)) != 0; at += 8)
+        out[n++] = (char *)ocerz_g2h(p);
+    out[n] = NULL;
+    return n;
+}
+
+#define GUEST_ARGV_MAX 256
+#define GUEST_ENV_MAX 512
+
+static int guest_spawn_apply(OcerzVM *vm, pid_t *pid, const char *path,
+                             const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *at,
+                             char *const *argv, char *const *envp)
+{
+    const char *self = ocerz_self_path();
+    if (!self || !path)
+        return EINVAL;
+    if (access(path, X_OK) != 0)
+        return errno;
+    char *hargv[GUEST_ARGV_MAX + 12];
+    char shline[1024];
+    int n = guest_child_argv(hargv, GUEST_ARGV_MAX + 12, self, path, argv, shline, sizeof shline);
+    spawn_rewrite_launchd(hargv, n, self);
+    char *henv[GUEST_ENV_MAX + 8];
+    guest_child_env(henv, GUEST_ENV_MAX + 8, envp);
+    ocerz_jit_require_ordered(vm);
+    return posix_spawn(pid, self, fa, at, hargv, henv);
+}
+
+static int guest_exec_apply(const char *path, char *const *argv, char *const *envp)
+{
+    const char *self = ocerz_self_path();
+    if (!self || !path || !argv)
+        return EINVAL;
     if (getenv("OCERZ_HOSTMASKLOG")) {
         sigset_t hm_; unsigned hv_ = 0;
         if (pthread_sigmask(SIG_BLOCK, NULL, &hm_) == 0)
             for (int sg_ = 1; sg_ < 32; sg_++) if (sigismember(&hm_, sg_)) hv_ |= 1u << sg_;
-        fprintf(stderr, "ocerz: HOSTMASK-EXEC[%d] mask=%#x path=%s\n", (int)getpid(), hv_, gpath);
+        fprintf(stderr, "ocerz: HOSTMASK-EXEC[%d] mask=%#x path=%s\n", (int)getpid(), hv_, path);
     }
-
-    if (access(gpath, X_OK) != 0) {
-        ret_err(cpu, errno);
-        return OCERZ_STEP_OK;
-    }
-
-    char *hargv[260];
-    int n = 0;
-    hargv[n++] = (char *)(uintptr_t)self;
-    hargv[n++] = (char *)"-path";
-
-    static char shline[1024];
-    const char *interp = NULL, *iarg = NULL;
-    if (shebang_split(gpath, shline, sizeof shline, &interp, &iarg)) {
-        hargv[n++] = (char *)interp;
-        hargv[n++] = (char *)interp;
-        if (iarg)
-            hargv[n++] = (char *)iarg;
-        hargv[n++] = (char *)gpath;
-        uint64_t gv;
-        for (uint64_t p = a[1] + 8; n < 258 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
-            hargv[n++] = (char *)ocerz_g2h(gv);
-    } else {
-        hargv[n++] = (char *)gpath;
-        uint64_t gv;
-        for (uint64_t p = a[1]; n < 258 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
-            hargv[n++] = (char *)ocerz_g2h(gv);
-        n = spawn_mock_keychain(hargv, n, 4, gpath);
-    }
-    hargv[n] = NULL;
-
-    char *henv[514];
-    int m = 0;
-    if (a[2]) {
-        uint64_t gv;
-        for (uint64_t p = a[2]; m < 512 && (gv = ocerz_ld(p, 8)) != 0; p += 8)
-            henv[m++] = (char *)ocerz_g2h(gv);
-        m = env_inject_lowbase(henv, m, 512);
-    }
-    henv[m] = NULL;
-
+    if (access(path, X_OK) != 0)
+        return errno;
+    char *hargv[GUEST_ARGV_MAX + 12];
+    char shline[1024];
+    int n = guest_child_argv(hargv, GUEST_ARGV_MAX + 12, self, path, argv, shline, sizeof shline);
+    char *henv[GUEST_ENV_MAX + 8];
+    guest_child_env(henv, GUEST_ENV_MAX + 8, envp);
     if (getenv("OCERZ_EXECLOG")) {
         fprintf(stderr, "ocerz: EXECLOG ->");
         for (int k = 0; k < n; k++)
             fprintf(stderr, " %s", hargv[k] ? hargv[k] : "(null)");
         fprintf(stderr, "\n");
     }
-    execve(self, hargv, a[2] ? henv : NULL);
+    execve(self, hargv, henv);
     int exec_errno = errno;
     if (getenv("OCERZ_EXECLOG"))
         fprintf(stderr, "ocerz: EXECFAIL[%d] %s: %s (%d)\n",
                 (int)getpid(), self, strerror(exec_errno), exec_errno);
-    ret_err(cpu, (uint64_t)exec_errno);
+    return exec_errno;
+}
+
+static int sys_posix_spawn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    if (!a[1]) {
+        ret_err(cpu, EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    char *argv[GUEST_ARGV_MAX], *envp[GUEST_ENV_MAX];
+    guest_vector(a[3], argv, GUEST_ARGV_MAX);
+    guest_vector(a[4], envp, GUEST_ENV_MAX);
+    posix_spawnattr_t at;
+    posix_spawn_file_actions_t fa;
+    int have_at, have_fa;
+    pid_t hpid = 0;
+    int rc = spawn_guest_args(a[2], &at, &have_at, &fa, &have_fa);
+    if (rc == 0)
+        rc = guest_spawn_apply(vm, &hpid, (const char *)ocerz_g2h(a[1]), have_fa ? &fa : NULL,
+                               have_at ? &at : NULL, a[3] ? argv : NULL, a[4] ? envp : NULL);
+    if (have_fa)
+        posix_spawn_file_actions_destroy(&fa);
+    if (have_at)
+        posix_spawnattr_destroy(&at);
+    if (rc != 0) {
+        ret_err(cpu, (uint64_t)rc);
+        return OCERZ_STEP_OK;
+    }
+    if (a[0])
+        ocerz_st(a[0], 4, (uint64_t)(uint32_t)hpid);
+    ret_ok(cpu, 0);
     return OCERZ_STEP_OK;
+}
+
+static int sys_execve(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    if (!a[0] || !a[1]) {
+        ret_err(cpu, EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    char *argv[GUEST_ARGV_MAX], *envp[GUEST_ENV_MAX];
+    guest_vector(a[1], argv, GUEST_ARGV_MAX);
+    guest_vector(a[2], envp, GUEST_ENV_MAX);
+    ret_err(cpu, (uint64_t)guest_exec_apply((const char *)ocerz_g2h(a[0]), argv, a[2] ? envp : NULL));
+    return OCERZ_STEP_OK;
+}
+
+int ocerz_guest_execve(struct OcerzVM *vm, OcerzCPU *cpu, const char *path, char *const *argv,
+                       char *const *envp)
+{
+    (void)vm;
+    (void)cpu;
+    return guest_exec_apply(path, argv, envp);
+}
+
+int ocerz_guest_posix_spawn(struct OcerzVM *vm, OcerzCPU *cpu, int *pid, const char *path,
+                            const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
+                            char *const *argv, char *const *envp)
+{
+    (void)cpu;
+    posix_spawnattr_t at;
+    int have_at = 0;
+    if (attr && *attr) {
+        short flags = 0;
+        sigset_t def, mask;
+        pid_t pgroup = 0;
+        sigemptyset(&def);
+        sigemptyset(&mask);
+        posix_spawnattr_getflags(attr, &flags);
+        posix_spawnattr_getsigdefault(attr, &def);
+        posix_spawnattr_getsigmask(attr, &mask);
+        posix_spawnattr_getpgroup(attr, &pgroup);
+        spawn_attr_sanitized(&at, flags, &def, mask, pgroup);
+        have_at = 1;
+    }
+    pid_t hpid = 0;
+    int rc = guest_spawn_apply(vm, &hpid, path, fa && *fa ? fa : NULL, have_at ? &at : NULL, argv,
+                               envp);
+    if (have_at)
+        posix_spawnattr_destroy(&at);
+    if (rc == 0 && pid)
+        *pid = hpid;
+    return rc;
 }
 
 #define OCERZ_PTHREAD_COOKIE 0x7ff8436bd690ull
@@ -3624,13 +3751,18 @@ static int sys_sigprocmask(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+static uint32_t guest_altstack_flags(const OcerzCPU *cpu)
+{
+    return (cpu->sig_on_stack ? 0x0001u : 0u) |
+           (cpu->sig_altstack_sp == 0 && cpu->sig_altstack_size == 0 ? 0x0004u : 0u);
+}
+
 static int guest_sigaltstack_apply(OcerzCPU *cpu, uint64_t ss, uint64_t oss)
 {
     if (oss != 0) {
         ocerz_st(oss + 0, 8, cpu->sig_altstack_sp);
         ocerz_st(oss + 8, 8, cpu->sig_altstack_size);
-        ocerz_st(oss + 16, 4, (cpu->sig_on_stack ? 0x0001u : 0u) |
-                              (cpu->sig_altstack_sp == 0 && cpu->sig_altstack_size == 0 ? 0x0004u : 0u));
+        ocerz_st(oss + 16, 4, guest_altstack_flags(cpu));
     }
     if (ss != 0) {
         uint32_t flags = (uint32_t)ocerz_ld(ss + 16, 4);
@@ -3676,6 +3808,8 @@ static int sys_sigaltstack(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 #define OCERZ_UCTX_SIZE 768u
 #define OCERZ_SIGINFO_SIZE 104u
 #define OCERZ_UCTX_SEGBASE_COOKIE 0x4f4345525a534547ull
+#define OCERZ_UC_SET_ALT_STACK 0x40000000u
+#define OCERZ_UC_RESET_ALT_STACK 0x80000000u
 
 __thread int g_ocerz_deliver_src;
 
@@ -3846,6 +3980,11 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
     uint64_t uc = a[0];
+    if ((uint32_t)a[1] == OCERZ_UC_SET_ALT_STACK || (uint32_t)a[1] == OCERZ_UC_RESET_ALT_STACK) {
+        cpu->sig_on_stack = (uint32_t)a[1] == OCERZ_UC_SET_ALT_STACK;
+        ret_ok(cpu, 0);
+        return OCERZ_STEP_OK;
+    }
     if (!uc) {
         ret_err(cpu, EINVAL);
         return OCERZ_STEP_OK;
@@ -4016,6 +4155,16 @@ int ocerz_guest_sigprocmask(struct OcerzVM *vm, OcerzCPU *cpu, int how, uint64_t
 int ocerz_guest_sigaltstack(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t ss, uint64_t oss)
 {
     return guest_sigaltstack_apply(cpu, ss, oss);
+}
+
+uint32_t ocerz_guest_altstack_flags(const OcerzCPU *cpu)
+{
+    return guest_altstack_flags(cpu);
+}
+
+void ocerz_guest_set_onstack(OcerzCPU *cpu, int on)
+{
+    cpu->sig_on_stack = on != 0;
 }
 
 static int native_kill_host(mach_port_t port, int sig)
@@ -5991,6 +6140,86 @@ static int thread_act_emulate(OcerzCPU *cpu, uint64_t buf, uint32_t id, uint32_t
     return 1;
 }
 
+static int guest_vm_allocate_apply(OcerzVM *vm, uint64_t addrp, uint64_t size, uint64_t flags)
+{
+    if (!(flags & 1)) {
+        uint64_t want = addrp ? ocerz_ld(addrp, 8) : 0;
+        memtrace("vm_alloc", want, size, 0, (int)flags);
+        invalidate_guest_mapping(vm, want, size);
+        if (want == 0 ||
+            (ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
+             ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
+             (ocerz_mem_register_range(want, want + size) != OCERZ_OK ||
+              ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK))) {
+            if (vm->strace)
+                fprintf(stderr, "ocerz: mach_vm_allocate FIXED denied want=%#llx size=%#llx flags=%#llx\n",
+                        (unsigned long long)want, (unsigned long long)size,
+                        (unsigned long long)flags);
+            return OCERZ_MACH_KERN_NO_SPACE;
+        }
+        return OCERZ_MACH_KERN_SUCCESS;
+    }
+    uint64_t gaddr = ocerz_map_anywhere(size, PROT_READ | PROT_WRITE);
+    if (gaddr == 0)
+        return OCERZ_MACH_KERN_NO_SPACE;
+    invalidate_guest_mapping(vm, gaddr, size);
+    if (addrp != 0)
+        ocerz_st(addrp, 8, gaddr);
+    return OCERZ_MACH_KERN_SUCCESS;
+}
+
+static int guest_vm_deallocate_apply(OcerzVM *vm, uint64_t addr, uint64_t size)
+{
+    memtrace("vm_dealloc", addr, size, 0, 0);
+    invalidate_guest_mapping(vm, addr, size);
+    ocerz_unmap(addr, size);
+    return OCERZ_MACH_KERN_SUCCESS;
+}
+
+static int guest_vm_protect_apply(OcerzVM *vm, uint64_t addr, uint64_t size, int prot)
+{
+    memtrace("vm_protect", addr, size, prot, 0);
+    invalidate_guest_mapping(vm, addr, size);
+    ocerz_protect(addr, size, prot);
+    return OCERZ_MACH_KERN_SUCCESS;
+}
+
+int ocerz_guest_vm_allocate(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t task, uint64_t addrp,
+                            uint64_t size, int flags)
+{
+    (void)cpu;
+    if (task != mach_task_self())
+        return mach_vm_allocate((vm_map_t)task, (mach_vm_address_t *)ocerz_g2h(addrp), size, flags);
+    return guest_vm_allocate_apply(vm, addrp, size, (uint64_t)(uint32_t)flags);
+}
+
+int ocerz_guest_vm_deallocate(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t task, uint64_t addr,
+                              uint64_t size)
+{
+    (void)cpu;
+    if (task != mach_task_self())
+        return mach_vm_deallocate((vm_map_t)task, addr, size);
+    if (!ocerz_mem_overlaps(addr, size)) {
+        invalidate_guest_mapping(vm, addr, size);
+        return mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)ocerz_g2h(addr), size);
+    }
+    return guest_vm_deallocate_apply(vm, addr, size);
+}
+
+int ocerz_guest_vm_protect(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t task, uint64_t addr,
+                           uint64_t size, int set_maximum, int prot)
+{
+    (void)cpu;
+    if (task != mach_task_self())
+        return mach_vm_protect((vm_map_t)task, addr, size, set_maximum, prot);
+    if (!ocerz_mem_overlaps(addr, size)) {
+        invalidate_guest_mapping(vm, addr, size);
+        return mach_vm_protect(mach_task_self(), (mach_vm_address_t)(uintptr_t)ocerz_g2h(addr), size,
+                               set_maximum, prot);
+    }
+    return guest_vm_protect_apply(vm, addr, size, prot);
+}
+
 static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 {
     {
@@ -6030,39 +6259,9 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                 (unsigned long long)cpu->rip);
 
     switch (num) {
-    case 10: {
-        uint64_t size = a[2];
-        uint64_t flags = a[3];
-        if (!(flags & 1)) {
-            uint64_t want = a[1] ? ocerz_ld(a[1], 8) : 0;
-            memtrace("vm_alloc", want, size, 0, (int)flags);
-            invalidate_guest_mapping(vm, want, size);
-            if (want == 0 ||
-                (ocerz_map_claim_fixed(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
-                 ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK &&
-                 (ocerz_mem_register_range(want, want + size) != OCERZ_OK ||
-                  ocerz_map_claim_region(want, size, PROT_READ | PROT_WRITE) != OCERZ_OK))) {
-                if (vm->strace)
-                    fprintf(stderr, "ocerz: mach_vm_allocate FIXED denied want=%#llx size=%#llx flags=%#llx\n",
-                            (unsigned long long)want, (unsigned long long)size,
-                            (unsigned long long)flags);
-                mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
-                break;
-            }
-            mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
-            break;
-        }
-        uint64_t gaddr = ocerz_map_anywhere(size, PROT_READ | PROT_WRITE);
-        if (gaddr == 0) {
-            mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE);
-            break;
-        }
-        invalidate_guest_mapping(vm, gaddr, size);
-        if (a[1] != 0)
-            ocerz_st(a[1], 8, gaddr);
-        mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
+    case 10:
+        mach_ret(cpu, (uint64_t)guest_vm_allocate_apply(vm, a[1], a[2], a[3]));
         break;
-    }
     case 11: {
 
         if (a[3] != 0)
@@ -6070,20 +6269,12 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
         break;
     }
-    case 12: {
-        memtrace("vm_dealloc", a[1], a[2], 0, 0);
-        invalidate_guest_mapping(vm, a[1], a[2]);
-        ocerz_unmap(a[1], a[2]);
-        mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
+    case 12:
+        mach_ret(cpu, (uint64_t)guest_vm_deallocate_apply(vm, a[1], a[2]));
         break;
-    }
-    case 14: {
-        memtrace("vm_protect", a[1], a[2], (int)a[4], 0);
-        invalidate_guest_mapping(vm, a[1], a[2]);
-        ocerz_protect(a[1], a[2], (int)a[4]);
-        mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS);
+    case 14:
+        mach_ret(cpu, (uint64_t)guest_vm_protect_apply(vm, a[1], a[2], (int)a[4]));
         break;
-    }
     case 15: {
         uint64_t size = a[2];
         uint64_t mask = a[3];

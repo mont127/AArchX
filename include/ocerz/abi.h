@@ -297,6 +297,11 @@
  * called directly, after the named arguments' own stacked bytes, which end on an
  * eight-byte boundary since nstack counts whole eightbytes;
  * ocerz_abi_call_native copies a stack block of any length.
+ *
+ * ocerz_abi_postfork_child puts the interning lock back to its initial state in
+ * a fork child.  Interned slots are complete before their address escapes, so
+ * a slot another thread was halfway through interning at the fork is one the
+ * child never saw, and the child interns it again if it needs it.
  */
 #ifndef OCERZ_ABI_H
 #define OCERZ_ABI_H
@@ -402,6 +407,8 @@ int ocerz_abi_callback_convert(uint64_t gptr, const char *notation, uint64_t *ou
 void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
                                  const uint8_t *stack, void *x8, uint64_t *out_x,
                                  uint64_t *out_v);
+
+void ocerz_abi_postfork_child(void);
 
 extern const char ocerz_abi_callback_bank[];
 extern const char ocerz_abi_callback_bank_end[];

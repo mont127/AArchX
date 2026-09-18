@@ -33,6 +33,10 @@
 # __DARWIN_NON_CANCELABLE, and the $DARWIN_EXTSN variants of fopen, fdopen,
 # popen, getgroups, select and pselect want _DARWIN_C_SOURCE, and pselect and
 # select have a variant with both suffixes.
+#
+# libncurses is here for the shell rather than for curses programs: /bin/sh
+# execs bash, which links it for readline's terminal handling, and system and
+# popen start their command under /bin/sh.
 library libSystem /usr/lib/libSystem.B.dylib usr/lib/libSystem.B.tbd
 pass libSystem.h
 pass libSystem.h -D__DARWIN_NON_CANCELABLE=1
@@ -56,3 +60,6 @@ pass CoreGraphics.h
 library AppKit /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit System/Library/Frameworks/AppKit.framework/AppKit.tbd
 language objective-c
 pass AppKit.h
+
+library libncurses /usr/lib/libncurses.5.4.dylib usr/lib/libncurses.5.4.tbd
+pass libncurses.h

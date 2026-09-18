@@ -33,7 +33,9 @@
  *   a fixed-arity prototype puts every argument in the wrong place.  The ones
  *   whose format string says what follows - the printf family, NSLog and
  *   CoreFoundation's format functions - are special records answered by
- *   veneers in objcbridge.h; open, fcntl, ioctl and the rest are stub records.
+ *   veneers in objcbridge.h.  Those whose ellipsis stands for one fixed
+ *   argument, open, fcntl and ioctl among them, are special records answered
+ *   in sysbridge.h, and the rest are stub records.
  * - A callback whose own signature takes a callback; abi.h describes what a
  *   callback argument can be and which threads it may run on.
  *
@@ -68,6 +70,24 @@
  * fault jumps to is installed by the guest call itself, so a recovered fault
  * lands inside the callback rather than past it, and the saved frame is still
  * there to restore.
+ *
+ * The frame guest_enter clears is not left empty: it names the saved one as the
+ * crossing it is around, and carries a level, a number no other stretch of guest
+ * code in the process is given, so guest code can ask which stretch it is
+ * running in.  ocerz_bridge_level answers that for the calling thread,
+ * numbering a thread's outermost stretch the first time it is asked, and
+ * ocerz_bridge_callback_frame answers the frame of the crossing whose callback
+ * is running, or NULL at the outermost stretch; following around from there
+ * walks outward through every crossing still open on the thread.  A setjmp
+ * records the level, and a longjmp that finds a different one would leave the
+ * stretch it was made in, which is how it knows it would skip native frames.
+ *
+ * ocerz_bridge_return and ocerz_bridge_settle are the two halves of how every
+ * export ocerz answers itself ends: the first consumes the return address as a
+ * ret would and puts the result in rax, the second delivers any guest signal
+ * that became pending and unmasked, on top of that finished state.
+ * ocerz_bridge_postfork_child puts this file's locks back to their initial
+ * state in a fork child, where a thread that held one no longer exists.
  *
  * A virtual library stands for a native one, and the native one is found by the
  * install name they share, and the bridge stands in for exactly the install
@@ -107,6 +127,8 @@ struct OcerzBridgeFrame {
     const char *sig;
     const void *host_fn;
     int depth;
+    uint64_t level;
+    const struct OcerzBridgeFrame *around;
 };
 
 const struct OcerzBridgeFn *ocerz_bridge_lookup(const char *lib, const char *sym);
@@ -120,6 +142,11 @@ void ocerz_bridge_guest_leave(const struct OcerzBridgeFrame *saved);
 void ocerz_bridge_raise(struct OcerzBridgeFrame *outer, const char *lib, const char *sym,
                         const char *sig, const void *host_fn);
 void ocerz_bridge_lower(const struct OcerzBridgeFrame *outer);
+uint64_t ocerz_bridge_level(void);
+const struct OcerzBridgeFrame *ocerz_bridge_callback_frame(void);
+void ocerz_bridge_return(OcerzCPU *cpu, uint64_t rax);
+int ocerz_bridge_settle(struct OcerzVM *vm, OcerzCPU *cpu);
+void ocerz_bridge_postfork_child(void);
 
 #define OCERZ_BRIDGE_LIBSYSTEM "/usr/lib/libSystem.B.dylib"
 #define OCERZ_BRIDGE_COREFOUNDATION \

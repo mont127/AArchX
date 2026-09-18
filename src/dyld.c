@@ -396,6 +396,7 @@
 #include "ocerz/objcbridge.h"
 #include "ocerz/bridge.h"
 #include "ocerz/abi.h"
+#include "ocerz/syscall.h"
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -4444,6 +4445,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     free(buf);
 
     ocerz_vm_install_handlers(vm);
+    if (ocerz_mode == OCERZ_MODE_NATIVE)
+        ocerz_fork_register();
     ocerz_commpage_init();
     { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("cache-mapped"); }
     if (ocerz_mode == OCERZ_MODE_CACHE && ocerz_dyldapi_setup(&cache) != OCERZ_OK)
