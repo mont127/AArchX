@@ -1136,6 +1136,12 @@ static AbiShape *g_abi_shapes[ABI_SHAPE_BUCKETS];
 static uint32_t g_abi_cb_bucket[ABI_CB_BUCKETS];
 static pthread_mutex_t g_abi_cb_lock = PTHREAD_MUTEX_INITIALIZER;
 
+void ocerz_abi_postfork_child(void)
+{
+    pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+    g_abi_cb_lock = fresh;
+}
+
 static unsigned abi_callback_capacity(void)
 {
     uintptr_t len = (uintptr_t)ocerz_abi_callback_bank_end - (uintptr_t)ocerz_abi_callback_bank;

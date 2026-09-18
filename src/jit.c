@@ -177,7 +177,11 @@
  * does an export whose record gives no usable signature, and those store and
  * load all sixteen.  A crossing that leaves loads all sixteen from the cpu,
  * where a signal frame may have replaced them.  OCERZ_NO_BRIDGE_FASTCALL=1
- * keeps the trap path everywhere.
+ * keeps the trap path everywhere.  fork and vfork keep it always
+ * (ocerz_vdylib_trap_only): the fork child starts without the parent's
+ * translations, and a crossing made from inside a block would return into code
+ * the child no longer has, so their stubs leave the block and trap from the
+ * dispatcher, the way the fork syscall does.
  *
  * ---- invalidation ----
  * Every guest mmap/mprotect/munmap asks the JIT to drop code in a range.  A
@@ -12599,7 +12603,7 @@ static void emit_bridge_fastcall(A64Buf *b, const X86Insn *insns, int i,
     if (!ocerz_addr_readable(slot) || !ocerz_addr_readable(slot + 7) || ocerz_ld(slot, 8) != trap)
         return;
     uint64_t id = (uint32_t)mv->ops[1].imm;
-    if (!ocerz_vdylib_export_name(id, NULL, NULL))
+    if (!ocerz_vdylib_export_name(id, NULL, NULL) || ocerz_vdylib_trap_only(id))
         return;
     uint16_t xin = 0xffff, xout = 0xffff;
     if (!xmm_global_enabled() || !ocerz_vdylib_xmm_contract(id, &xin, &xout))

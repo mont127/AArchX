@@ -36,6 +36,13 @@
  * memory pressure inside the guest, and Chromium's allocator treats a refused
  * 4 KB commit as out-of-memory, so OCERZ_MAPFAILLOG names which test in the
  * fixed-mapping path refused instead of leaving it to guesswork.
+ *
+ * ocerz_mem_overlaps answers whether any part of a range lies in memory these
+ * tables describe.  In cache mode every page a guest can name is here, but in
+ * native mode the guest's heap is the host's, so a guest that unmaps or
+ * protects a buffer native malloc or a native Mach call handed it names memory
+ * no table here has ever seen, and native mode passes such a range to the host
+ * kernel instead of refusing it.
  */
 #include "ocerz/mem.h"
 
@@ -1790,6 +1797,18 @@ int ocerz_addr_readable(uint64_t gaddr)
 {
     int prot = ocerz_addr_prot(gaddr);
     return prot >= 0 && (prot & PROT_READ) != 0;
+}
+
+int ocerz_mem_overlaps(uint64_t gaddr, uint64_t len)
+{
+    if (len == 0 || gaddr > UINT64_MAX - len)
+        return 0;
+    uint64_t lo = round_down(gaddr), hi = gaddr + len;
+    int n = __atomic_load_n(&region_n, __ATOMIC_ACQUIRE);
+    for (int k = 0; k < n; k++)
+        if (lo < regions[k].ghi && hi > regions[k].glo)
+            return 1;
+    return 0;
 }
 
 unsigned ocerz_host_region_prot(uint64_t gaddr, uint64_t *base, uint64_t *size)

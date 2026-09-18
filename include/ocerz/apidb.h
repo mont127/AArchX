@@ -82,6 +82,9 @@
  * ocerz_apidb_parse is the parser on its own, for tests.  ocerz_apidb_set_minos
  * is called by the loader with the main image's minimum OS version, packed as
  * Mach-O packs it (xxxx.yy.zz in nibbles), before anything asks for a library.
+ * ocerz_apidb_postfork_child puts the loading lock back to its initial state in
+ * a fork child; a library is published only once it is parsed whole, so one
+ * another thread was loading at the fork is simply loaded again.
  */
 #ifndef OCERZ_APIDB_H
 #define OCERZ_APIDB_H
@@ -142,5 +145,6 @@ const OcerzApiShape *ocerz_apidb_shape(const OcerzApiLibrary *lib, const char *n
                                        uint64_t version);
 void ocerz_apidb_set_minos(uint32_t minos);
 const char *ocerz_apidb_dir(void);
+void ocerz_apidb_postfork_child(void);
 
 #endif

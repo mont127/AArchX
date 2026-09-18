@@ -22,12 +22,40 @@
  * unmasked pending signal on the given cpu, as the syscall entry edge does, and
  * returns 1 when it built one; that is how a signal raised during a bridged
  * call, or one that arrived while the thread sat in native code, reaches its
- * handler when the crossing returns.
+ * handler when the crossing returns.  ocerz_guest_altstack_flags is the ss_flags
+ * word sigaltstack would report, and ocerz_guest_set_onstack is what
+ * sigreturn(NULL, UC_SET_ALT_STACK or UC_RESET_ALT_STACK) does, the call a
+ * longjmp out of a handler uses to say the thread has left its alternate stack.
+ *
+ * Memory and processes reach ocerz's own implementations the same way.  In
+ * cache mode an x86 libc turns mmap, fork, execve and posix_spawn into syscalls
+ * and mach_vm_allocate into a Mach trap; native mode has no x86 libc, so the
+ * bridge calls these entry points instead, and each is the syscall's or trap's
+ * body with the register plumbing peeled off.  The memory entries keep guest
+ * memory accounting, translation invalidation and the 4 KB guest page exactly as
+ * the syscall path keeps them, for every range that touches memory ocerz
+ * tracks; a range that lies wholly outside it is the host's own memory, a buffer
+ * native malloc or a native Mach call handed the guest, and goes to the host
+ * kernel after any translations of it are dropped.  The Mach entries answer a
+ * kern_return_t and go to the host outright for a task other than this one.
+ * ocerz_guest_fork is the fork syscall's body and answers the child 0 and the
+ * parent the child's pid through pid_out; ocerz_fork_register installs ocerz's
+ * own fork handlers, which native mode does before any guest code can register
+ * one of its own, so that ocerz's prepare handler runs after every guest one
+ * and its child handler before every guest one.  ocerz_guest_execve and
+ * ocerz_guest_posix_spawn take host argument and environment vectors and start
+ * the program under ocerz exactly as the syscalls do; execve returns only on
+ * failure.  posix_spawn's attributes are read through the host's own getters,
+ * since in native mode the guest built them with the host's
+ * posix_spawnattr_init.  All of these answer 0 or an errno, as the signal
+ * entries do.
  */
 #ifndef OCERZ_SYSCALL_H
 #define OCERZ_SYSCALL_H
 
 #include "ocerz/cpu.h"
+
+#include <spawn.h>
 
 struct OcerzVM;
 
@@ -55,6 +83,28 @@ int ocerz_guest_sigaltstack(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t ss, uint
 int ocerz_guest_raise(struct OcerzVM *vm, OcerzCPU *cpu, int sig);
 int ocerz_guest_pthread_kill(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t thread, int sig);
 int ocerz_guest_deliver_pending(struct OcerzVM *vm, OcerzCPU *cpu);
+uint32_t ocerz_guest_altstack_flags(const OcerzCPU *cpu);
+void ocerz_guest_set_onstack(OcerzCPU *cpu, int on);
+
+int ocerz_guest_mmap(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot,
+                     int flags, int fd, uint64_t off, uint64_t *out);
+int ocerz_guest_munmap(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len);
+int ocerz_guest_mprotect(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot);
+int ocerz_guest_madvise(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len, int advice);
+int ocerz_guest_vm_allocate(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t task, uint64_t addrp,
+                            uint64_t size, int flags);
+int ocerz_guest_vm_deallocate(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t task, uint64_t addr,
+                              uint64_t size);
+int ocerz_guest_vm_protect(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t task, uint64_t addr,
+                           uint64_t size, int set_maximum, int prot);
+
+void ocerz_fork_register(void);
+int ocerz_guest_fork(struct OcerzVM *vm, OcerzCPU *cpu, int *pid_out);
+int ocerz_guest_execve(struct OcerzVM *vm, OcerzCPU *cpu, const char *path, char *const *argv,
+                       char *const *envp);
+int ocerz_guest_posix_spawn(struct OcerzVM *vm, OcerzCPU *cpu, int *pid, const char *path,
+                            const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
+                            char *const *argv, char *const *envp);
 
 uint64_t ocerz_ldt_base(uint32_t sel);
 int ocerz_ldt_is_big(uint32_t sel);

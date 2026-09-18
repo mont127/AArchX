@@ -115,6 +115,7 @@ int ocerz_mem_disarm_range(uint64_t lo, uint64_t hi, uint64_t *pages, int max);
 int ocerz_mem_armed_any(void);
 int ocerz_addr_prot(uint64_t gaddr);
 int ocerz_addr_readable(uint64_t gaddr);
+int ocerz_mem_overlaps(uint64_t gaddr, uint64_t len);
 int ocerz_commit_fault_page(uint64_t gaddr);
 unsigned ocerz_host_region_prot(uint64_t gaddr, uint64_t *base, uint64_t *size);
 int ocerz_guest_vm_region(uint64_t *addr, uint64_t *size, unsigned *prot,

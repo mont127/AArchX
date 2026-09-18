@@ -10,12 +10,15 @@
  * readers - ocerz_bridge_lookup and the export trie of the image
  * ocerz_vdylib_image builds - rather than through a list written for the test.
  * The unbridged names here are not an arbitrary selection: they are the
- * variadic exclusion bridge.h states (printf, open, fcntl, ioctl), so a bridge
+ * variadic exclusion bridge.h states, the functions whose ellipsis stands for a
+ * list no format veneer reads (scanf, sscanf, syslog, err, warn), so a bridge
  * that grows one of them has changed a documented rule rather than broken a
  * test.  The list once also held atof and strtod, until signatures could name a
  * double, and qsort and bsearch, until a callback argument had a trampoline
  * back into guest code; qsort and bsearch are bridged names now, and their
- * lookups succeeding is also what proves the callback notation parses.
+ * lookups succeeding is also what proves the callback notation parses.  open,
+ * fcntl and ioctl stood there too, until src/sysbridge.c gave the variadic
+ * functions whose optional argument is fixed handlers of their own.
  *
  * The bridged names are the whole of what native mode bridged before its
  * descriptors were made from the API database, libSystem's fn and special
@@ -62,6 +65,19 @@
  * it exactly as a RET would, rip from [rsp] and rsp forward by eight, with the
  * result in rax.  rax is poisoned before every call so a bridge that returns
  * without writing it fails rather than inheriting whatever was there.
+ *
+ * The handlers src/sysbridge.c adds are driven the same way, after the report
+ * has been checked so their crossings do not change its counts.  The variadic
+ * ones are handed an optional argument where System V leaves it, with garbage in
+ * the upper half of a register that carries an int, and the file they touch is
+ * checked through the host's own calls.  The memory ones must hand out arena
+ * memory, keep ocerz's page table in step, and pass a range ocerz never mapped,
+ * a posix_memalign page or a region the test allocated with the host's own Mach
+ * call, to the host kernel.  The jump ones must lay the jmp_buf out as Apple's
+ * x86_64 libplatform does, restore exactly what they saved and the mask only
+ * when they saved one, and refuse a jump from inside a callback to a setjmp
+ * taken outside it; the refusal ends the process, so that case runs in a fork
+ * child whose status and message are read back.
  */
 #include "ocerz/bridge.h"
 #include "ocerz/vdylib.h"
@@ -74,11 +90,22 @@
 
 #include <sys/mman.h>
 #include <dlfcn.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ulimit.h>
 #include <unistd.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 #define LOAD_BASE  0x0000000210000000ull
 #define RET_ADDR   0x0000000044332200ull
@@ -119,12 +146,19 @@ static const char *const kBridged[] = {
     "_dispatch_semaphore_signal", "_dispatch_release", "_signal", "_sigaction", "_raise",
     "_kill", "_sigprocmask", "_pthread_sigmask", "_sigaltstack", "_pthread_kill",
     "_sigemptyset", "_sigfillset", "_sigaddset", "_sigdelset", "_sigismember",
+    "_open", "_open$NOCANCEL", "_openat", "_openat$NOCANCEL", "_fcntl", "_fcntl$NOCANCEL",
+    "_ioctl", "_sem_open", "_shm_open", "_semctl", "_ulimit", "_mmap", "_munmap", "_mprotect",
+    "_madvise", "_mach_vm_allocate", "_mach_vm_deallocate", "_mach_vm_protect",
+    "_vm_allocate", "_vm_deallocate", "_vm_protect", "_setjmp", "__setjmp", "_sigsetjmp",
+    "_longjmp", "__longjmp", "_siglongjmp", "_fork", "_vfork", "_execve", "_execv",
+    "_execvp", "_execvP", "_execl", "_execle", "_execlp", "_posix_spawn", "_posix_spawnp",
+    "_posix_spawnattr_init", "_posix_spawn_file_actions_adddup2", "_system", "_popen",
+    "_pclose",
 };
 #define NBRIDGED (sizeof kBridged / sizeof kBridged[0])
 
 static const char *const kUnbridged[] = {
-    "_scanf", "_sscanf", "_syslog",
-    "_open", "_fcntl", "_ioctl",
+    "_scanf", "_sscanf", "_syslog", "_err", "_warn",
 };
 #define NUNBRIDGED (sizeof kUnbridged / sizeof kUnbridged[0])
 
@@ -165,7 +199,7 @@ static const char *const kCFBridged[] = {
 static const char *const kNoDescriptor[][2] = {
     { "/usr/lib/libSystem.B.dylib", "dyld_stub_binder" },
     { "/usr/lib/libSystem.B.dylib", "__dyld_get_image_uuid" },
-    { "/usr/lib/libSystem.B.dylib", "_fork" },
+    { "/usr/lib/libSystem.B.dylib", "_forkpty" },
     { "/usr/lib/libSystem.B.dylib", "___stack_chk_guard" },
     { OCERZ_BRIDGE_COREFOUNDATION, "_kCFAllocatorDefault" },
     { OCERZ_BRIDGE_COREFOUNDATION, "_kCFTypeArrayCallBacks" },
@@ -568,6 +602,370 @@ static void test_invoke_heap(void)
     check_return("_free", cpu, sp);
 }
 
+
+static uint64_t arm_call6(OcerzCPU *cpu, const uint64_t a[6])
+{
+    uint64_t sp = arm_call(cpu, a[0], a[1], a[2]);
+    cpu->gpr[OCERZ_RCX] = a[3];
+    cpu->gpr[OCERZ_R8] = a[4];
+    cpu->gpr[OCERZ_R9] = a[5];
+    return sp;
+}
+
+static int64_t sys_call(const char *sym, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                        uint64_t a4, uint64_t a5)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    const struct OcerzBridgeFn *fn = ocerz_bridge_lookup(kLib, sym);
+    CHECK(fn != NULL, "%s has no bridge descriptor", sym);
+    if (!fn)
+        return INT64_MIN;
+    const uint64_t a[6] = { a0, a1, a2, a3, a4, a5 };
+    uint64_t sp = arm_call6(cpu, a);
+    int r = ocerz_bridge_invoke(&vm, cpu, fn);
+    CHECK(r == OCERZ_STEP_OK, "%s: invoke returned %d, want OCERZ_STEP_OK", sym, r);
+    check_return(sym, cpu, sp);
+    return (int64_t)cpu->gpr[OCERZ_RAX];
+}
+
+static void test_sys_files(void)
+{
+    const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+    char path[512], other[512], real[PATH_MAX];
+    snprintf(path, sizeof path, "%s/ocerz-test-bridge-%d", tmp, (int)getpid());
+    snprintf(other, sizeof other, "%s/ocerz-test-bridge-%d.at", tmp, (int)getpid());
+    unlink(path);
+    unlink(other);
+    mode_t old_mask = umask(022);
+    uint64_t gpath = put_str(scratch + 0x400, path);
+    uint64_t gother = put_str(scratch + 0x600, other);
+    struct stat st;
+
+    int64_t fd = sys_call("_open", gpath, O_CREAT | O_EXCL | O_RDWR, 0xdeadbeef00000000ull | 0640, 0, 0, 0);
+    CHECK((int32_t)fd >= 0, "_open with O_CREAT returned %lld", (long long)fd);
+    CHECK(fstat((int)fd, &st) == 0 && (st.st_mode & 0777) == 0640,
+          "_open created the file with mode %o, want 0640 from the low half of rdx",
+          (unsigned)(st.st_mode & 0777));
+
+    int64_t rd = sys_call("_open$NOCANCEL", gpath, O_RDONLY, 0xffffffffffffffffull, 0, 0, 0);
+    CHECK((int32_t)rd >= 0, "_open$NOCANCEL without O_CREAT returned %lld", (long long)rd);
+    if ((int32_t)rd >= 0)
+        close((int)rd);
+    errno = 0;
+    int64_t miss = sys_call("_open", put_str(scratch + 0x800, "/ocerz/no/such/file"), O_RDONLY, 0, 0,
+                            0, 0);
+    CHECK(miss == -1 && errno == ENOENT, "_open of a missing file gave %lld errno %d, want -1 ENOENT",
+          (long long)miss, errno);
+
+    int64_t at = sys_call("_openat", (uint64_t)(int64_t)AT_FDCWD, gother, O_CREAT | O_WRONLY, 0600, 0, 0);
+    CHECK((int32_t)at >= 0 && fstat((int)at, &st) == 0 && (st.st_mode & 0777) == 0600,
+          "_openat with O_CREAT gave fd %lld mode %o, want mode 0600 from rcx", (long long)at,
+          (unsigned)(st.st_mode & 0777));
+    if ((int32_t)at >= 0)
+        close((int)at);
+
+    int64_t fl = sys_call("_fcntl", (uint64_t)fd, F_GETFL, 0, 0, 0, 0);
+    CHECK((fl & O_ACCMODE) == O_RDWR, "_fcntl F_GETFL gave %#llx", (long long)fl);
+    CHECK(sys_call("_fcntl", (uint64_t)fd, F_SETFL, 0x7777777700000000ull | (uint64_t)(fl | O_NONBLOCK),
+                   0, 0, 0) == 0, "_fcntl F_SETFL with a dirty upper half failed");
+    CHECK(fcntl((int)fd, F_GETFL) & O_NONBLOCK, "F_SETFL did not set O_NONBLOCK");
+    CHECK(sys_call("_fcntl$NOCANCEL", (uint64_t)fd, F_SETFD, 0xabcdef0000000000ull | FD_CLOEXEC, 0, 0,
+                   0) == 0 && (fcntl((int)fd, F_GETFD) & FD_CLOEXEC),
+          "_fcntl$NOCANCEL F_SETFD did not set FD_CLOEXEC");
+    uint64_t gbuf = scratch + 0x1000;
+    memset(ocerz_g2h(gbuf), 0, PATH_MAX);
+    CHECK(sys_call("_fcntl", (uint64_t)fd, F_GETPATH, gbuf, 0, 0, 0) == 0 &&
+              realpath(path, real) && strcmp(ocerz_g2h(gbuf), real) == 0,
+          "_fcntl F_GETPATH wrote '%s', want '%s'", (const char *)ocerz_g2h(gbuf), real);
+    struct flock lk = { .l_start = 0, .l_len = 16, .l_pid = 0, .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    uint64_t glk = scratch + 0x2000;
+    memcpy(ocerz_g2h(glk), &lk, sizeof lk);
+    CHECK(sys_call("_fcntl", (uint64_t)fd, F_SETLK, glk, 0, 0, 0) == 0, "_fcntl F_SETLK failed");
+    CHECK(sys_call("_fcntl", (uint64_t)fd, F_GETLK, glk, 0, 0, 0) == 0 &&
+              ((struct flock *)ocerz_g2h(glk))->l_type == F_UNLCK,
+          "_fcntl F_GETLK on the owner's own lock did not answer F_UNLCK");
+    close((int)fd);
+
+    int p[2];
+    CHECK(pipe(p) == 0, "pipe failed");
+    CHECK(write(p[1], "hello", 5) == 5, "pipe write failed");
+    uint64_t gint = scratch + 0x2100;
+    ocerz_st(gint, 4, 0);
+    CHECK(sys_call("_ioctl", (uint64_t)p[0], FIONREAD, gint, 0, 0, 0) == 0 && ocerz_ld(gint, 4) == 5,
+          "_ioctl FIONREAD gave %u, want 5", (unsigned)ocerz_ld(gint, 4));
+    CHECK(sys_call("_ioctl", (uint64_t)p[1], FIOCLEX, 0x1234, 0, 0, 0) == 0 &&
+              (fcntl(p[1], F_GETFD) & FD_CLOEXEC),
+          "_ioctl FIOCLEX, a request that carries no pointer, did not set FD_CLOEXEC");
+    close(p[0]);
+    close(p[1]);
+
+    char name[64];
+    snprintf(name, sizeof name, "/ocz-tb-%d", (int)getpid());
+    sem_unlink(name);
+    uint64_t gname = put_str(scratch + 0x2200, name);
+    int64_t sem = sys_call("_sem_open", gname, O_CREAT | O_EXCL, 0600, 2, 0, 0);
+    CHECK(sem != -1 && sem != 0, "_sem_open with O_CREAT returned %lld", (long long)sem);
+    if (sem != -1 && sem != 0) {
+        sem_t *h = (sem_t *)(uintptr_t)sem;
+        CHECK(sem_trywait(h) == 0 && sem_trywait(h) == 0 && sem_trywait(h) == -1,
+              "the semaphore _sem_open made did not start at the value 2 in rcx");
+        sem_close(h);
+    }
+    sem_unlink(name);
+    errno = 0;
+    CHECK(sys_call("_sem_open", gname, 0, 0, 0, 0, 0) == -1 && errno == ENOENT,
+          "_sem_open of an unlinked name did not fail with ENOENT");
+
+    snprintf(name, sizeof name, "/ocz-tb-shm-%d", (int)getpid());
+    shm_unlink(name);
+    gname = put_str(scratch + 0x2200, name);
+    int64_t shm = sys_call("_shm_open", gname, O_CREAT | O_RDWR, 0600, 0, 0, 0);
+    CHECK((int32_t)shm >= 0 && fstat((int)shm, &st) == 0 && (st.st_mode & 0777) == 0600,
+          "_shm_open with O_CREAT gave %lld mode %o", (long long)shm, (unsigned)(st.st_mode & 0777));
+    if ((int32_t)shm >= 0)
+        close((int)shm);
+    shm_unlink(name);
+
+    struct rlimit rl;
+    CHECK(getrlimit(RLIMIT_FSIZE, &rl) == 0, "getrlimit failed");
+    int64_t ul = sys_call("_ulimit", UL_GETFSIZE, 0, 0, 0, 0, 0);
+    CHECK(rl.rlim_cur == RLIM_INFINITY || ul == (int64_t)(rl.rlim_cur / 512),
+          "_ulimit UL_GETFSIZE gave %lld", (long long)ul);
+
+    unlink(path);
+    unlink(other);
+    umask(old_mask);
+}
+
+static unsigned host_prot(uint64_t addr, uint64_t *base)
+{
+    mach_vm_address_t a = addr;
+    mach_vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt,
+                       &obj) != KERN_SUCCESS)
+        return ~0u;
+    *base = a;
+    return (unsigned)info.protection;
+}
+
+static void test_sys_memory(void)
+{
+    const uint64_t len = 0x8000;
+    int64_t m = sys_call("_mmap", 0, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,
+                         0xffffffffull, 0);
+    CHECK(m != -1 && ocerz_mem_overlaps((uint64_t)m, len) && (m & 0xfff) == 0,
+          "_mmap handed out %#llx, which is not a page of the guest arena", (long long)m);
+    if (m == -1)
+        return;
+    memset(ocerz_g2h((uint64_t)m), 0x6b, len);
+    CHECK(ocerz_addr_prot((uint64_t)m) == (PROT_READ | PROT_WRITE),
+          "the page table says %d for fresh mmap memory", ocerz_addr_prot((uint64_t)m));
+    CHECK(sys_call("_mprotect", (uint64_t)m, 0x1000, PROT_READ, 0, 0, 0) == 0 &&
+              ocerz_addr_prot((uint64_t)m) == PROT_READ &&
+              ocerz_addr_prot((uint64_t)m + 0x1000) == (PROT_READ | PROT_WRITE),
+          "_mprotect of one 4 KB guest page did not change exactly that page");
+    CHECK(sys_call("_madvise", (uint64_t)m, len, MADV_WILLNEED, 0, 0, 0) == 0, "_madvise failed");
+    CHECK(sys_call("_munmap", (uint64_t)m, len, 0, 0, 0, 0) == 0 && ocerz_addr_prot((uint64_t)m) == -1,
+          "_munmap left the pages in the table");
+
+    void *host = NULL;
+    CHECK(posix_memalign(&host, 0x4000, 0x4000) == 0, "posix_memalign failed");
+    uint64_t base = 0;
+    if (host) {
+        uint64_t h = (uint64_t)(uintptr_t)host;
+        CHECK(!ocerz_mem_overlaps(h, 0x4000), "a host heap page is inside the guest arena");
+        CHECK(sys_call("_mprotect", h, 0x4000, PROT_READ, 0, 0, 0) == 0 &&
+                  host_prot(h, &base) == PROT_READ && base <= h,
+              "_mprotect of a host heap page did not reach the host kernel");
+        CHECK(sys_call("_mprotect", h, 0x4000, PROT_READ | PROT_WRITE, 0, 0, 0) == 0,
+              "_mprotect could not give a host heap page its write access back");
+        ((volatile char *)host)[0] = 1;
+        free(host);
+    }
+
+    uint64_t gaddr = scratch + 0x2300;
+    ocerz_st(gaddr, 8, 0);
+    CHECK(sys_call("_mach_vm_allocate", mach_task_self(), gaddr, 0x3000, VM_FLAGS_ANYWHERE, 0, 0) ==
+              KERN_SUCCESS && ocerz_mem_overlaps(ocerz_ld(gaddr, 8), 0x3000),
+          "_mach_vm_allocate did not hand out arena memory");
+    uint64_t va = ocerz_ld(gaddr, 8);
+    if (va) {
+        CHECK(*(volatile uint64_t *)ocerz_g2h(va) == 0, "_mach_vm_allocate memory is not zeroed");
+        CHECK(sys_call("_vm_protect", mach_task_self(), va, 0x1000, 0, VM_PROT_READ, 0) == KERN_SUCCESS &&
+                  ocerz_addr_prot(va) == PROT_READ,
+              "_vm_protect did not change the guest page");
+        CHECK(sys_call("_vm_deallocate", mach_task_self(), va, 0x3000, 0, 0, 0) == KERN_SUCCESS &&
+                  ocerz_addr_prot(va) == -1,
+              "_vm_deallocate left the pages in the table");
+    }
+
+    mach_vm_address_t hv = 0;
+    CHECK(mach_vm_allocate(mach_task_self(), &hv, 0x4000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS,
+          "the host would not allocate");
+    if (hv) {
+        CHECK(!ocerz_mem_overlaps(hv, 0x4000), "host Mach memory is inside the guest arena");
+        CHECK(sys_call("_mach_vm_protect", mach_task_self(), hv, 0x4000, 0, VM_PROT_READ, 0) ==
+                  KERN_SUCCESS && host_prot(hv, &base) == VM_PROT_READ,
+              "_mach_vm_protect of host memory did not reach the host kernel");
+        CHECK(sys_call("_mach_vm_deallocate", mach_task_self(), hv, 0x4000, 0, 0, 0) == KERN_SUCCESS &&
+                  (host_prot(hv, &base) == ~0u || base > hv),
+              "_mach_vm_deallocate of host memory left it mapped");
+    }
+}
+
+#define JB_BYTES 152
+
+static void test_sys_jmp(void)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    uint64_t env = scratch + 0x3000;
+    memset(ocerz_g2h(env), 0xee, JB_BYTES);
+    const struct OcerzBridgeFn *sj = ocerz_bridge_lookup(kLib, "_setjmp");
+    const struct OcerzBridgeFn *lj = ocerz_bridge_lookup(kLib, "_longjmp");
+    const struct OcerzBridgeFn *usj = ocerz_bridge_lookup(kLib, "__setjmp");
+    const struct OcerzBridgeFn *ulj = ocerz_bridge_lookup(kLib, "__longjmp");
+    const struct OcerzBridgeFn *ssj = ocerz_bridge_lookup(kLib, "_sigsetjmp");
+    const struct OcerzBridgeFn *slj = ocerz_bridge_lookup(kLib, "_siglongjmp");
+    CHECK(sj && lj && usj && ulj && ssj && slj, "a setjmp or longjmp export has no descriptor");
+    if (!sj || !lj || !usj || !ulj || !ssj || !slj)
+        return;
+
+    uint64_t sp = arm_call(cpu, env, 0, 0);
+    cpu->gpr[OCERZ_RBX] = 0x1111;
+    cpu->gpr[OCERZ_RBP] = 0x2222;
+    cpu->gpr[OCERZ_R12] = 0x3333;
+    cpu->gpr[OCERZ_R13] = 0x4444;
+    cpu->gpr[OCERZ_R14] = 0x5555;
+    cpu->gpr[OCERZ_R15] = 0x6666;
+    cpu->mxcsr = 0x3fa0;
+    cpu->fcw = 0x027f;
+    cpu->sig_mask = 0x5;
+    CHECK(ocerz_bridge_invoke(&vm, cpu, sj) == OCERZ_STEP_OK, "_setjmp did not step");
+    check_return("_setjmp", cpu, sp);
+    CHECK(cpu->gpr[OCERZ_RAX] == 0, "_setjmp returned %#llx, want 0",
+          (unsigned long long)cpu->gpr[OCERZ_RAX]);
+    CHECK(ocerz_ld(env + 0, 8) == 0x1111 && ocerz_ld(env + 8, 8) == 0x2222 &&
+              ocerz_ld(env + 16, 8) == sp + 8 && ocerz_ld(env + 24, 8) == 0x3333 &&
+              ocerz_ld(env + 32, 8) == 0x4444 && ocerz_ld(env + 40, 8) == 0x5555 &&
+              ocerz_ld(env + 48, 8) == 0x6666 && ocerz_ld(env + 56, 8) == RET_ADDR,
+          "_setjmp did not lay rbx, rbp, rsp, r12-r15 and rip out at 0..56");
+    CHECK(ocerz_ld(env + 64, 8) == 0xeeeeeeeeeeeeeeeeull, "_setjmp wrote the unused rflags word");
+    CHECK(ocerz_ld(env + 72, 4) == 0x3fa0 && ocerz_ld(env + 76, 2) == 0x027f,
+          "_setjmp did not save MXCSR at 72 and the x87 control word at 76");
+    CHECK(ocerz_ld(env + 80, 4) == 0x5 && ocerz_ld(env + 88, 4) == 0x4,
+          "_setjmp saved mask %#llx and alternate-stack flags %#llx at 80 and 88, want 5 and "
+          "SS_DISABLE", (unsigned long long)ocerz_ld(env + 80, 4),
+          (unsigned long long)ocerz_ld(env + 88, 4));
+    CHECK(ocerz_ld(env + 84, 4) == 0xeeeeeeee, "_setjmp wrote sigsetjmp's savemask word");
+
+    arm_call(cpu, env, 0xffffffff00000000ull, 0);
+    cpu->mxcsr = 0x1f80;
+    cpu->fcw = 0x037f;
+    cpu->sig_mask = 0;
+    cpu->rflags |= OCERZ_DF;
+    CHECK(ocerz_bridge_invoke(&vm, cpu, lj) == OCERZ_STEP_OK, "_longjmp did not step");
+    CHECK(cpu->rip == RET_ADDR && cpu->gpr[OCERZ_RSP] == sp + 8,
+          "_longjmp went to rip %#llx rsp %#llx, want the setjmp's return",
+          (unsigned long long)cpu->rip, (unsigned long long)cpu->gpr[OCERZ_RSP]);
+    CHECK(cpu->gpr[OCERZ_RAX] == 1, "_longjmp with a value whose low half is 0 returned %#llx, want 1",
+          (unsigned long long)cpu->gpr[OCERZ_RAX]);
+    CHECK(cpu->gpr[OCERZ_RBX] == 0x1111 && cpu->gpr[OCERZ_RBP] == 0x2222 &&
+              cpu->gpr[OCERZ_R12] == 0x3333 && cpu->gpr[OCERZ_R15] == 0x6666,
+          "_longjmp did not restore the callee-saved registers");
+    CHECK(cpu->mxcsr == 0x3fa0 && cpu->fcw == 0x027f && !(cpu->rflags & OCERZ_DF),
+          "_longjmp did not restore MXCSR and the x87 control word and clear DF");
+    CHECK(cpu->sig_mask == 0x5, "_longjmp did not restore the signal mask setjmp saved");
+    ocerz_apply_mxcsr_round(0x1f80);
+    cpu->mxcsr = 0x1f80;
+
+    memset(ocerz_g2h(env), 0xee, JB_BYTES);
+    sp = arm_call(cpu, env, 0, 0);
+    cpu->sig_mask = 0x3;
+    CHECK(ocerz_bridge_invoke(&vm, cpu, usj) == OCERZ_STEP_OK, "__setjmp did not step");
+    CHECK(ocerz_ld(env + 80, 4) == 0xeeeeeeee, "__setjmp saved a signal mask");
+    arm_call(cpu, env, 7, 0);
+    cpu->sig_mask = 0x9;
+    CHECK(ocerz_bridge_invoke(&vm, cpu, ulj) == OCERZ_STEP_OK, "__longjmp did not step");
+    CHECK(cpu->gpr[OCERZ_RAX] == 7 && cpu->sig_mask == 0x9 && cpu->rip == RET_ADDR,
+          "__longjmp returned %#llx with mask %#llx, want 7 and the mask left alone",
+          (unsigned long long)cpu->gpr[OCERZ_RAX], (unsigned long long)cpu->sig_mask);
+
+    memset(ocerz_g2h(env), 0xee, JB_BYTES);
+    arm_call(cpu, env, 1, 0);
+    cpu->sig_mask = 0x10;
+    CHECK(ocerz_bridge_invoke(&vm, cpu, ssj) == OCERZ_STEP_OK, "_sigsetjmp did not step");
+    CHECK(ocerz_ld(env + 84, 4) == 1 && ocerz_ld(env + 80, 4) == 0x10,
+          "_sigsetjmp(env, 1) did not record savemask and the mask");
+    arm_call(cpu, env, 3, 0);
+    cpu->sig_mask = 0;
+    CHECK(ocerz_bridge_invoke(&vm, cpu, slj) == OCERZ_STEP_OK && cpu->sig_mask == 0x10 &&
+              cpu->gpr[OCERZ_RAX] == 3,
+          "_siglongjmp of a buffer that saved its mask did not restore it");
+    arm_call(cpu, env, 0, 0);
+    cpu->sig_mask = 0x10;
+    CHECK(ocerz_bridge_invoke(&vm, cpu, ssj) == OCERZ_STEP_OK && ocerz_ld(env + 84, 4) == 0,
+          "_sigsetjmp(env, 0) did not record a zero savemask");
+    arm_call(cpu, env, 3, 0);
+    cpu->sig_mask = 0x20;
+    CHECK(ocerz_bridge_invoke(&vm, cpu, slj) == OCERZ_STEP_OK && cpu->sig_mask == 0x20,
+          "_siglongjmp of a buffer that saved no mask changed the mask");
+    cpu->sig_mask = 0;
+}
+
+static void test_sys_jmp_refused(void)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    uint64_t env = scratch + 0x3200;
+    const struct OcerzBridgeFn *sj = ocerz_bridge_lookup(kLib, "__setjmp");
+    const struct OcerzBridgeFn *lj = ocerz_bridge_lookup(kLib, "__longjmp");
+    if (!sj || !lj)
+        return;
+    arm_call(cpu, env, 0, 0);
+    CHECK(ocerz_bridge_invoke(&vm, cpu, sj) == OCERZ_STEP_OK, "__setjmp did not step");
+
+    struct OcerzBridgeFrame outer, saved;
+    ocerz_bridge_raise(&outer, kLib, "_qsort", "v(pLLc{i(pp)})", NULL);
+    ocerz_bridge_guest_enter(&saved);
+    uint64_t inner = scratch + 0x3400;
+    arm_call(cpu, inner, 0, 0);
+    CHECK(ocerz_bridge_invoke(&vm, cpu, sj) == OCERZ_STEP_OK, "__setjmp inside a callback did not step");
+    arm_call(cpu, inner, 5, 0);
+    CHECK(ocerz_bridge_invoke(&vm, cpu, lj) == OCERZ_STEP_OK && cpu->gpr[OCERZ_RAX] == 5,
+          "a __longjmp inside a callback to a setjmp in the same callback was not performed");
+
+    int p[2];
+    CHECK(pipe(p) == 0, "pipe failed");
+    fflush(stderr);
+    pid_t child = fork();
+    if (child == 0) {
+        dup2(p[1], 2);
+        arm_call(cpu, env, 1, 0);
+        ocerz_bridge_invoke(&vm, cpu, lj);
+        _exit(0);
+    }
+    close(p[1]);
+    char msg[512] = { 0 };
+    ssize_t n = read(p[0], msg, sizeof msg - 1);
+    (void)n;
+    close(p[0]);
+    int status = 0;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child, "the refusal child could not be waited for");
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == OCERZ_BRIDGE_UNIMPL_EXIT,
+          "a __longjmp out of a callback to a setjmp taken outside it ended with status %#x, want exit %d",
+          status, OCERZ_BRIDGE_UNIMPL_EXIT);
+    CHECK(strstr(msg, "__longjmp") && strstr(msg, "native frames of _qsort"),
+          "the refusal did not name the jump and the call it would skip: '%s'", msg);
+
+    ocerz_bridge_guest_leave(&saved);
+    ocerz_bridge_lower(&outer);
+    arm_call(cpu, env, 9, 0);
+    CHECK(ocerz_bridge_invoke(&vm, cpu, lj) == OCERZ_STEP_OK && cpu->gpr[OCERZ_RAX] == 9,
+          "once the callback returned, a __longjmp to the setjmp outside it was not performed");
+}
+
 static int report(void)
 {
     printf("test_bridge: %d checks, %d failed\n", checks, failures);
@@ -599,6 +997,10 @@ int main(void)
     test_race();
     test_report();
     test_dl_specials();
+    test_sys_files();
+    test_sys_memory();
+    test_sys_jmp();
+    test_sys_jmp_refused();
 
     return report();
 }

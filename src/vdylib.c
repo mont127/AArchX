@@ -338,6 +338,12 @@ typedef struct VdLib {
 
 static VdLib *_Atomic g_vd_libs[VD_LIBS_MAX];
 static pthread_mutex_t g_vd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void ocerz_vdylib_postfork_child(void)
+{
+    pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+    g_vd_lock = fresh;
+}
 static char **g_vd_files;
 static int g_vd_nfiles;
 static _Atomic int g_vd_listed;
@@ -976,6 +982,13 @@ int ocerz_vdylib_xmm_contract(uint64_t id, uint16_t *in, uint16_t *out)
         return 1;
     }
     return 0;
+}
+
+int ocerz_vdylib_trap_only(uint64_t id)
+{
+    const OcerzApiEntry *e = NULL;
+    return vd_lib_of_id(id, &e) && e->kind == OCERZ_API_SPECIAL && e->handler &&
+           strcmp(e->handler, "fork") == 0;
 }
 
 int ocerz_vdylib_fastcall(struct OcerzVM *vm, OcerzCPU *cpu)

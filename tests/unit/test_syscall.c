@@ -11,6 +11,24 @@
  * which is what the kernel answers natively and under Rosetta; the syscall path
  * used to install it, so the nested-delivery test now uses a stack of legal
  * size rather than the 16 KB one it was written with.
+ *
+ * posix_spawn and execve start the new program under ocerz, and ocerz here is
+ * this test binary, so the child they start is this binary again, which knows
+ * it is one by the vector the parent put in its environment, or by the last
+ * argument of the one child given no environment, rather than by the layout
+ * under test, so that a broken layout fails the check instead of running the
+ * suite again: it compares the argument vector it was handed with the one it
+ * was told to expect and exits 0 only on a match.  That
+ * pins the vector both calls build: -path and the image, then a -- so that an
+ * argv[0] starting with a dash is not taken for an option, then the guest's
+ * own argv from argv[0] on.  posix_spawn used to drop argv[0] and pass the path
+ * in its place, where execve kept it.  A script is started as its #! line's
+ * interpreter, with the interpreter's argument and the script's path first, on
+ * both paths; posix_spawn used to hand ocerz the script itself.  A child given
+ * no environment still receives the variables ocerz injects, and nothing else.
+ * sigreturn with a null context and UC_SET_ALT_STACK or UC_RESET_ALT_STACK is
+ * how an x86 longjmp tells the kernel the thread left its alternate stack, and
+ * the syscall path used to refuse it.
  */
 #include "ocerz/vm.h"
 #include "ocerz/syscall.h"
@@ -33,6 +51,9 @@
 #include <mach/mach.h>
 #include <mach/mig.h>
 #include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
+#include <limits.h>
+#include <sys/stat.h>
 
 static int tests_run;
 static int tests_failed;
@@ -1642,8 +1663,173 @@ static void test_exit(void)
     CHECK(vm.exit_code == 42);
 }
 
-int main(void)
+
+#define CHILD_SEP "\x1f"
+
+static int child_check(int argc, char **argv)
 {
+    const char *want = getenv("OCZT_ARGV");
+    if (!want) {
+        const char *nano = getenv("MallocNanoZone");
+        return nano && strcmp(nano, "0") == 0 && getenv("PATH") == NULL ? 0 : 4;
+    }
+    char got[4096];
+    size_t n = 0;
+    for (int i = 1; i < argc; i++) {
+        size_t len = strlen(argv[i]);
+        if (n + len + 2 > sizeof got)
+            return 5;
+        if (i > 1)
+            got[n++] = CHILD_SEP[0];
+        memcpy(got + n, argv[i], len);
+        n += len;
+    }
+    got[n] = '\0';
+    return strcmp(got, want) == 0 ? 0 : 3;
+}
+
+static const char *self_path(void)
+{
+    static char buf[PATH_MAX];
+    uint32_t size = sizeof buf;
+    if (!buf[0] && _NSGetExecutablePath(buf, &size) != 0)
+        buf[0] = '\0';
+    return buf;
+}
+
+static uint64_t put_vector(uint64_t at, uint64_t strings, const char *const *v)
+{
+    uint64_t p = strings;
+    int i = 0;
+    for (; v && v[i]; i++) {
+        size_t len = strlen(v[i]) + 1;
+        memcpy(ocerz_g2h(p), v[i], len);
+        ocerz_st(at + 8 * (uint64_t)i, 8, p);
+        p += (len + 7) & ~(size_t)7;
+    }
+    ocerz_st(at + 8 * (uint64_t)i, 8, 0);
+    return p;
+}
+
+static int spawn_status(const char *path, const char *const *argv, const char *const *envp)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    uint64_t gpid = scratch + 0x9000;
+    uint64_t gpath = scratch + 0x9010;
+    uint64_t gargv = scratch + 0x9400;
+    uint64_t genv = scratch + 0x9500;
+    uint64_t strings = scratch + 0x9600;
+    memcpy(ocerz_g2h(gpath), path, strlen(path) + 1);
+    strings = put_vector(gargv, strings, argv);
+    if (envp)
+        put_vector(genv, strings, envp);
+    ocerz_st(gpid, 4, 0);
+    set_args(cpu, bsd(244), gpid, gpath, 0, gargv, envp ? genv : 0, 0);
+    int r = ocerz_handle_syscall(&vm, cpu);
+    CHECK(r == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    if (r != OCERZ_STEP_OK || cf(cpu))
+        return -1;
+    pid_t child = (pid_t)ocerz_ld(gpid, 4);
+    int status = 0;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+static void test_posix_spawn_keeps_argv0(void)
+{
+    const char *self = self_path();
+    char want[2048];
+    snprintf(want, sizeof want, "-path" CHILD_SEP "%s" CHILD_SEP "--" CHILD_SEP "-dash-argv0"
+             CHILD_SEP "one", self);
+    char env[2100];
+    snprintf(env, sizeof env, "OCZT_ARGV=%s", want);
+    const char *argv[] = { "-dash-argv0", "one", NULL };
+    const char *envp[] = { env, NULL };
+    CHECK(spawn_status(self, argv, envp) == 0);
+}
+
+static void test_posix_spawn_script(void)
+{
+    const char *self = self_path();
+    char script[512];
+    snprintf(script, sizeof script, "%s/ocerz-test-syscall-%d.sh",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
+    FILE *f = fopen(script, "w");
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    fprintf(f, "#!%s script-arg\n", self);
+    fclose(f);
+    chmod(script, 0755);
+    char want[2048];
+    snprintf(want, sizeof want, "-path" CHILD_SEP "%s" CHILD_SEP "--" CHILD_SEP "%s" CHILD_SEP
+             "script-arg" CHILD_SEP "%s" CHILD_SEP "x", self, self, script);
+    char env[2100];
+    snprintf(env, sizeof env, "OCZT_ARGV=%s", want);
+    const char *argv[] = { "s0", "x", NULL };
+    const char *envp[] = { env, NULL };
+    CHECK(spawn_status(script, argv, envp) == 0);
+    unlink(script);
+}
+
+static void test_posix_spawn_null_env(void)
+{
+    const char *argv[] = { "null-env", "null-env", NULL };
+    CHECK(spawn_status(self_path(), argv, NULL) == 0);
+}
+
+static void test_execve_keeps_argv0(void)
+{
+    const char *self = self_path();
+    char want[2048];
+    snprintf(want, sizeof want, "-path" CHILD_SEP "%s" CHILD_SEP "--" CHILD_SEP "-exec-argv0"
+             CHILD_SEP "two", self);
+    char env[2100];
+    snprintf(env, sizeof env, "OCZT_ARGV=%s", want);
+    const char *argv[] = { "-exec-argv0", "two", NULL };
+    const char *envp[] = { env, NULL };
+    uint64_t gpath = scratch + 0x9010;
+    uint64_t gargv = scratch + 0x9400;
+    uint64_t genv = scratch + 0x9500;
+    uint64_t strings = scratch + 0x9600;
+    memcpy(ocerz_g2h(gpath), self, strlen(self) + 1);
+    strings = put_vector(gargv, strings, argv);
+    put_vector(genv, strings, envp);
+    fflush(stderr);
+    pid_t child = fork();
+    if (child == 0) {
+        set_args(&vm.cpu, bsd(59), gpath, gargv, genv, 0, 0, 0);
+        ocerz_handle_syscall(&vm, &vm.cpu);
+        _exit(96);
+    }
+    int status = 0;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+static void test_sigreturn_alt_stack_flags(void)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    cpu->sig_on_stack = 0;
+    set_args(cpu, bsd(184), 0, 0x40000000u, 0, 0, 0, 0);
+    CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    CHECK(cpu->sig_on_stack == 1);
+    set_args(cpu, bsd(184), 0, 0x80000000u, 0, 0, 0, 0);
+    CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 0);
+    CHECK(cpu->sig_on_stack == 0);
+    set_args(cpu, bsd(184), 0, 30, 0, 0, 0, 0);
+    CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
+    CHECK(cf(cpu) == 1);
+    CHECK(cpu->gpr[OCERZ_RAX] == 22);
+}
+
+int main(int argc, char **argv)
+{
+    if (getenv("OCZT_ARGV") || (argc > 1 && strcmp(argv[argc - 1], "null-env") == 0))
+        return child_check(argc, argv);
     if (ocerz_mem_init(0x100000000ull, 0x700000000ull) != OCERZ_OK) {
         fprintf(stderr, "mem init failed\n");
         return 2;
@@ -1696,6 +1882,11 @@ int main(void)
     test_mach_timebase();
     test_mach_unknown();
     test_execve_bad_args();
+    test_posix_spawn_keeps_argv0();
+    test_posix_spawn_script();
+    test_posix_spawn_null_env();
+    test_execve_keeps_argv0();
+    test_sigreturn_alt_stack_flags();
     test_sem_wait_nocancel_blocks();
     test_bsdthread_terminate_wakes_ulock();
     test_bsdthread_terminate_signals_semaphore();
