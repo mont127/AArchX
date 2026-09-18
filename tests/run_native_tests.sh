@@ -1076,12 +1076,58 @@
 # ocerz's own exit and so flushes host stdio. Each way is compared with cache
 # mode, status and output.
 #
-# The callback, attach, thread, tlv_*, signal_*, cf_*, M10 and M11 cases skip
-# where there is no x86_64 clang, like the others, but a fixture of theirs that
-# fails to compile where a trivial x86_64 program compiles fine is a failure:
-# skipping it would hide a broken fixture indefinitely. So is a cf_*, M10 or M11
-# fixture whose arm64 build fails to compile where its x86_64 build did, since
-# that leaves the case without its host oracle.
+# app_bundle is the first case that runs an application rather than a program.
+# Native Foundation decides which bundle is the main one, what the process is
+# called and what its arguments were from the process itself, and the process is
+# ocerz, so until the guest's identity reached the host's frameworks every
+# NSBundle answer came from ocerz's directory and NSApplicationMain could not
+# cross at all. The fixture is a real .app bundle built in the test's temporary
+# directory: an Info.plist naming the bundle identifier, NSPrincipalClass
+# NSApplication, LSUIElement, so no Dock icon appears, and a key of the test's
+# own, a text file under Resources, and one executable holding an x86_64 and an
+# arm64 slice, so the arm64 oracle, native mode and cache mode all run the same
+# path inside the same bundle and print the same thing. The bundle is built under
+# the temporary directory's real path, so that no run depends on how it resolves
+# the symbolic links /var and /tmp are, since ocerz hands the guest the real path
+# of its executable. There is no nib, since
+# the Command Line Tools have no ibtool: main makes the shared application, gives
+# it a delegate of the guest's own class and calls NSApplicationMain, which
+# reads the Info.plist, starts the application and delivers
+# applicationWillFinishLaunching: and applicationDidFinishLaunching: to the
+# guest. The checks run there, in four groups. bundle asks NSBundle and
+# CFBundle for the main bundle's path, identifier, Info.plist key, principal
+# class and resource, whose text is printed. crt calls _NSGetExecutablePath with
+# a buffer that fits, which must leave the size alone, and one that does not,
+# which must return -1 and say how much it needs; requires _NSGetArgc and
+# _NSGetArgv to answer the very argument vector main was handed, _NSGetEnviron
+# the very environ variable, with a setenv visible through both, and
+# _NSGetProgname the pointer getprogname returns; and requires
+# _NSGetMachExecuteHeader to be the guest's own _mh_execute_header. process asks
+# NSProcessInfo for the process name and the arguments, getprogname for the
+# program name, NSRunningApplication for the bundle identifier LaunchServices
+# registered, requires CFProcessPath to be absent from the guest's environment,
+# and logs one NSLog line. app requires NSApp to be the application main made,
+# with the guest's delegate, running, with the accessory activation policy that
+# LSUIElement asks for, and the two launch notifications to have arrived once
+# each in order. The delegate then writes the summary, buffers one more line
+# with printf and sends -terminate:, after which applicationWillTerminate: and
+# an atexit handler write a line each and exit must flush the buffered one, with
+# status 0. NSLog's prefix carries the process name, which is the one thing the
+# NSLog comparison of the M10 cases throws away, so this case reads it back and
+# requires the application's name in every run. A host without a window server
+# session has no application to run: the fixture asks CGSessionCopyCurrentDictionary
+# first and writes "app_bundle unavailable" with status 2 when there is none,
+# and that line from the arm64 build, or an arm64 build that fails naming the
+# window server, skips the case. The native runs are bounded at OBJC_TIMEOUT
+# seconds, and a run that stops names the last progress note, which says
+# whether NSApplicationMain ever reached the delegate.
+#
+# The callback, attach, thread, tlv_*, signal_*, cf_*, M10, M11 and app_bundle
+# cases skip where there is no x86_64 clang, like the others, but a fixture of
+# theirs that fails to compile where a trivial x86_64 program compiles fine is a
+# failure: skipping it would hide a broken fixture indefinitely. So is a cf_*,
+# M10, M11 or app_bundle fixture whose arm64 build fails to compile where its
+# x86_64 build did, since that leaves the case without its host oracle.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -1267,11 +1313,25 @@ OBJC_CLASS_EXPORTS="$OBJC_CLASS_EXPORTS _OBJC_CLASS_\$_NSSet _OBJC_CLASS_\$_NSMu
 APPKIT_EXPORTS='_NSRectFill _NSDeviceRGBColorSpace _CGContextSetRGBFillColor _CGContextFillRect'
 APPKIT_EXPORTS="$APPKIT_EXPORTS _OBJC_CLASS_\$_NSView _OBJC_METACLASS_\$_NSView _OBJC_CLASS_\$_NSColor _OBJC_CLASS_\$_NSBezierPath"
 APPKIT_EXPORTS="$APPKIT_EXPORTS _OBJC_CLASS_\$_NSBitmapImageRep _OBJC_CLASS_\$_NSGraphicsContext"
+APP_BUNDLE_BIN=""
+APP_BUNDLE_ARM64=""
+APP_BUNDLE_EXE=""
+APP_NAME=OcerzApp
+APP_ID=org.aarchx.ocerz.appbundle
+APP_ARG=extra-argument
+APP_KEY=OcerzPlanted
+APP_VALUE=from-info-plist
+APP_TEXT=read-through-nsbundle
+APP_EXPORTS='_NSApplicationMain _NSApp _CGSessionCopyCurrentDictionary _CFBundleGetMainBundle _CFBundleGetIdentifier _CFBundleGetValueForInfoDictionaryKey'
+APP_EXPORTS="$APP_EXPORTS _OBJC_CLASS_\$_NSApplication _OBJC_CLASS_\$_NSBundle _OBJC_CLASS_\$_NSProcessInfo _OBJC_CLASS_\$_NSRunningApplication"
+APP_EXPORTS="$APP_EXPORTS __NSGetArgc __NSGetArgv __NSGetEnviron __NSGetExecutablePath __NSGetMachExecuteHeader __NSGetProgname"
+APP_EXPORTS="$APP_EXPORTS _getprogname _getenv _setenv _atexit _environ _strrchr _objc_unsafeClaimAutoreleasedReturnValue"
 MEASURE_BIN=/usr/bin/time
 
 unset OCERZ_MODE
 unset OCERZ_BRIDGE_PROBE_UNSET
 unset OCERZ_BRIDGELOG
+unset CFProcessPath
 
 if [ ! -x "$OCERZ" ]; then
     echo "error: ocerz binary not found or not executable at $OCERZ" >&2
@@ -8479,6 +8539,244 @@ EOC
     done
 }
 
+build_app_fixtures() {
+    local root bundle
+    local defs=(-DAPP_ID="\"$APP_ID\"" -DAPP_KEY="\"$APP_KEY\"" -DAPP_VALUE="\"$APP_VALUE\""
+                -DAPP_TEXT="\"$APP_TEXT\"" -DAPP_ARG="\"$APP_ARG\"")
+
+    cat > "$TMP/app_bundle.m" <<'EOC'
+#include "appkit_common.h"
+#include <crt_externs.h>
+#include <mach-o/dyld.h>
+#include <mach-o/ldsyms.h>
+
+#define TAG "app_bundle"
+#define APP_VAR "OCERZ_APP_BUNDLE_VAR"
+#define APP_PATH_MAX 1024
+
+extern char **environ;
+
+static int g_argc;
+static const char **g_argv;
+static int g_will_finish, g_did_finish, g_order_ok;
+static id g_delegate;
+static char g_exe[APP_PATH_MAX];
+
+static const char *app_leaf(const char *path)
+{
+    const char *slash = path != 0 ? strrchr(path, '/') : 0;
+
+    return slash != 0 ? slash + 1 : path;
+}
+
+static void app_line(const char *what, const char *text)
+{
+    cb_len = 0;
+    cb_str(TAG);
+    cb_str(" ");
+    cb_str(what);
+    if (text != 0) {
+        cb_str(" ");
+        cb_str(text);
+    }
+    cb_end();
+}
+
+static void group_bundle(void)
+{
+    unsigned m = 0, bit = 1;
+    NSBundle *b = [NSBundle mainBundle];
+    NSString *exe = [b executablePath];
+    NSString *root = [[[exe stringByDeletingLastPathComponent] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+    NSString *rp = [b pathForResource:@"greeting" ofType:@"txt"];
+    NSString *text = rp != nil ? [NSString stringWithContentsOfFile:rp encoding:NSUTF8StringEncoding error:NULL] : nil;
+    CFBundleRef cb = CFBundleGetMainBundle();
+    CFTypeRef cv = cb != 0 ? CFBundleGetValueForInfoDictionaryKey(cb, CFSTR(APP_KEY)) : 0;
+
+    CK(b != nil && objc_text_is([b bundleIdentifier], APP_ID));
+    CK(objc_text_is([b objectForInfoDictionaryKey:@APP_KEY], APP_VALUE));
+    CK([[b bundlePath] isEqual:root] == YES && [[[b bundlePath] pathExtension] isEqual:@"app"] == YES);
+    CK(rp != nil && [rp hasPrefix:[[b resourcePath] stringByAppendingString:@"/"]] == YES && objc_text_is(text, APP_TEXT));
+    CK(cb != 0 && cf_text_is(CFBundleGetIdentifier(cb), APP_ID) && cv != 0 && cf_equals_text(cv, APP_VALUE));
+    CK([b principalClass] == [NSApplication class]);
+
+    cf_begin(TAG, "bundle", m);
+    cb_str(" ");
+    cb_str([[[b bundlePath] lastPathComponent] UTF8String] ?: "(nil)");
+    cb_str(" ");
+    cb_str([[b bundleIdentifier] UTF8String] ?: "(nil)");
+    cb_end();
+    app_line("resource", text != nil ? [text UTF8String] : "(nil)");
+}
+
+static void group_process(void)
+{
+    unsigned m = 0, bit = 1;
+    NSProcessInfo *pi = [NSProcessInfo processInfo];
+    NSArray *args = [pi arguments];
+    NSRunningApplication *me = [NSRunningApplication currentApplication];
+    const char *leaf = app_leaf(g_exe);
+
+    CK(objc_text_is([pi processName], leaf));
+    CK(getprogname() != 0 && strcmp(getprogname(), app_leaf(g_argv[0])) == 0);
+    CK([args count] == (NSUInteger)g_argc && objc_text_is([args lastObject], APP_ARG) && objc_text_is([[args objectAtIndex:0] lastPathComponent], app_leaf(g_argv[0])));
+    CK(getenv("CFProcessPath") == 0);
+    CK(me != nil && objc_text_is([me bundleIdentifier], APP_ID) && [me processIdentifier] == [pi processIdentifier]);
+    NSLog(@"%s process %s", TAG, leaf);
+
+    cf_begin(TAG, "process", m);
+    cb_str(" ");
+    cb_str([[pi processName] UTF8String] ?: "(nil)");
+    cf_long("args", (long)[args count]);
+    cb_end();
+}
+
+static void group_crt(void)
+{
+    unsigned m = 0, bit = 1;
+    char small[4];
+    uint32_t size = APP_PATH_MAX, tiny = sizeof small;
+    int rc_small = _NSGetExecutablePath(small, &tiny);
+    char **env;
+    int seen = 0;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)_NSGetMachExecuteHeader();
+
+    CK(_NSGetExecutablePath(g_exe, &size) == 0 && size == APP_PATH_MAX);
+    CK(strcmp(g_exe, [[[NSBundle mainBundle] executablePath] fileSystemRepresentation]) == 0);
+    CK(rc_small == -1 && tiny == strlen(g_exe) + 1);
+    CK(*_NSGetArgc() == g_argc && *_NSGetArgv() == (char **)g_argv && strcmp((*_NSGetArgv())[g_argc - 1], APP_ARG) == 0);
+    setenv(APP_VAR, "set", 1);
+    for (env = *_NSGetEnviron(); env != 0 && *env != 0; env++)
+        seen += strcmp(*env, APP_VAR "=set") == 0;
+    CK(*_NSGetEnviron() == environ && seen == 1);
+    CK(*_NSGetProgname() == getprogname());
+    CK(mh == &_mh_execute_header && mh->magic == MH_MAGIC_64 && mh->filetype == MH_EXECUTE);
+
+    cf_begin(TAG, "crt", m);
+    cb_str(" ");
+    cb_str(app_leaf(g_exe));
+    cf_long("argc", *_NSGetArgc());
+    cb_end();
+}
+
+static void group_app(void)
+{
+    unsigned m = 0, bit = 1;
+
+    CK(g_will_finish == 1 && g_did_finish == 1 && g_order_ok);
+    CK(NSApp != nil && NSApp == [NSApplication sharedApplication] && [NSApp class] == [NSApplication class]);
+    CK([NSApp delegate] == g_delegate);
+    CK([NSApp isRunning] == YES);
+    CK([NSApp activationPolicy] == NSApplicationActivationPolicyAccessory);
+
+    cf_begin(TAG, "app", m);
+    cf_long("policy", (long)[NSApp activationPolicy]);
+    cb_end();
+}
+
+@interface OcerzAppDelegate : NSObject <NSApplicationDelegate>
+@end
+
+@implementation OcerzAppDelegate
+
+- (void)applicationWillFinishLaunching:(NSNotification *)note
+{
+    g_will_finish++;
+}
+
+- (void)applicationDidFinishLaunching:(NSNotification *)note
+{
+    g_did_finish++;
+    g_order_ok = g_will_finish == 1 && [note object] == NSApp;
+    cf_note(TAG, "bundle");
+    group_bundle();
+    cf_note(TAG, "crt");
+    group_crt();
+    cf_note(TAG, "process");
+    group_process();
+    cf_note(TAG, "app");
+    group_app();
+    cf_summary(TAG);
+    printf("%s buffered until exit\n", TAG);
+    cf_note(TAG, "terminating");
+    [NSApp terminate:nil];
+}
+
+- (void)applicationWillTerminate:(NSNotification *)note
+{
+    app_line("will-terminate", 0);
+}
+
+@end
+
+static void app_atexit(void)
+{
+    app_line("atexit", 0);
+}
+
+int main(int argc, const char *argv[])
+{
+    CFDictionaryRef session = CGSessionCopyCurrentDictionary();
+
+    g_argc = argc;
+    g_argv = argv;
+    if (session == 0)
+        return view_unavailable(TAG, "no window server session");
+    CFRelease(session);
+    atexit(app_atexit);
+    @autoreleasepool {
+        cf_note(TAG, "setting up");
+        [NSApplication sharedApplication];
+        g_delegate = [OcerzAppDelegate new];
+        [NSApp setDelegate:g_delegate];
+        cf_note(TAG, "calling NSApplicationMain");
+    }
+    NSApplicationMain(argc, argv);
+    app_line("returned from NSApplicationMain", 0);
+    return 3;
+}
+EOC
+
+    clang -arch x86_64 -x objective-c -fobjc-arc -O1 -fno-builtin "${defs[@]}" \
+            -o "$TMP/app_bundle" "$TMP/app_bundle.m" -framework AppKit >"$TMP/app_bundle.cc.log" 2>&1 || return
+    APP_BUNDLE_BIN="$TMP/app_bundle"
+    clang -arch arm64 -x objective-c -fobjc-arc -O1 -fno-builtin "${defs[@]}" \
+            -o "$TMP/app_bundle.arm64" "$TMP/app_bundle.m" -framework AppKit >"$TMP/app_bundle.arm64.cc.log" 2>&1 || return
+    APP_BUNDLE_ARM64="$TMP/app_bundle.arm64"
+
+    root="$(cd "$TMP" && pwd -P)"
+    bundle="$root/$APP_NAME.app"
+    mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+    printf '%s' "$APP_TEXT" > "$bundle/Contents/Resources/greeting.txt"
+    cat > "$bundle/Contents/Info.plist" <<EOC
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>$APP_NAME</string>
+	<key>CFBundleIdentifier</key>
+	<string>$APP_ID</string>
+	<key>CFBundleName</key>
+	<string>$APP_NAME</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>$APP_KEY</key>
+	<string>$APP_VALUE</string>
+</dict>
+</plist>
+EOC
+    lipo -create -output "$bundle/Contents/MacOS/$APP_NAME" "$APP_BUNDLE_BIN" "$APP_BUNDLE_ARM64" \
+            >"$TMP/app_bundle.lipo.log" 2>&1 || return
+    APP_BUNDLE_EXE="$bundle/Contents/MacOS/$APP_NAME"
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -9939,6 +10237,10 @@ objc_import_reason() {
             allowed="$allowed$OBJC_CLASS_EXPORTS $APPKIT_EXPORTS "
             libs="libobjc, AppKit, CoreGraphics, Foundation and CoreFoundation"
             about="classes of the guest's or views" ;;
+        app)
+            allowed="$allowed$OBJC_CLASS_EXPORTS $APPKIT_EXPORTS $APP_EXPORTS "
+            libs="libobjc, AppKit, CoreGraphics, Foundation and CoreFoundation"
+            about="the application's identity" ;;
     esac
     for sym in $imports; do
         case "$allowed" in
@@ -9970,6 +10272,9 @@ objc_import_reason() {
             _NSRectFill|_CGContextFillRect) why="-drawRect: did not fill through AppKit and CoreGraphics" ;;
             _objc_msgSend_stret) why="no NSRect came back from a message as a returned structure" ;;
             _class_getInstanceSize) why="the fixture never asked the runtime for an instance size" ;;
+            _NSApplicationMain) why="the application was not started through NSApplicationMain" ;;
+            _CFBundleGetMainBundle|_OBJC_CLASS_*_NSBundle) why="the main bundle was never asked for through CoreFoundation and Foundation both" ;;
+            __NSGet*) why="the crt_externs functions were never called" ;;
             *) why="the unfortified translation unit did not call the plain entry points" ;;
         esac
         echo "$(basename "$bin") imports '${imports% }' and not$missing, so $why, and the case proves nothing about it"
@@ -10002,6 +10307,10 @@ objc_stall() {
             fi ;;
         "returned from NSLog")
             echo "the last progress note was '$last', so every NSLog call returned and the fixture stopped while checking what they left behind" ;;
+        "calling NSApplicationMain")
+            echo "the last progress note was '$last', so NSApplicationMain never delivered applicationDidFinishLaunching: to the guest's delegate" ;;
+        terminating)
+            echo "the last progress note was '$last', so every check ran and the process did not end through -terminate: and exit" ;;
         *)
             echo "the last progress note was '$last', so the fixture stopped inside that group of calls" ;;
     esac
@@ -10178,6 +10487,131 @@ case_objc() {
             reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': native mode agrees with the arm64 build and the x86 frameworks in the shared cache answer otherwise, so either the translator ran them wrong or the fixture prints something the two builds really disagree about"
         elif ! cmp -s "$je.msg" "$ce.msg"; then
             reason="native '$(tr '\n' '|' < "$je.msg")' != cache '$(tr '\n' '|' < "$ce.msg")' in the $what: native mode agrees with the arm64 build and the x86 frameworks in the shared cache write otherwise"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
+}
+
+app_nslog_name() {
+    grep -E "$NSLOG_PREFIX_RE" "$1" 2>/dev/null | head -1 | sed -E 's/^[0-9-]+ [0-9:.]+ (.*)\[[0-9]+:[0-9a-fx]+\] .*/\1/'
+}
+
+app_unavailable() {
+    local rc="$1" out="$2" err="$3" line
+    line="$(grep -m1 "^app_bundle unavailable " "$out" 2>/dev/null)"
+    if [ -n "$line" ]; then
+        echo "the arm64 build, run directly on the host, has no application to run here: ${line#app_bundle unavailable }"
+    elif [ "$rc" -ne 0 ] && ! grep -q "^app_bundle ok" "$out" 2>/dev/null && grep -qE "$VIEW_NO_SERVER_RE" "$err" 2>/dev/null; then
+        echo "the arm64 build, run directly on the host, exited $rc naming the window server: $(grep -hE "$VIEW_NO_SERVER_RE" "$err" | head -1 | cut -c1-160)"
+    fi
+}
+
+case_app_bundle() {
+    local name=app_bundle tag=app_bundle reason="" rc_arm rc_jit rc_nojit rc_cache line cache_note="" got f
+    local ao="$TMP/$name.arm64.out" ae="$TMP/$name.arm64.err"
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$OBJC_TIMEOUT
+    local what="NSLog messages with the prefix removed"
+    local bits=(
+        bundle "bit 0 is NSBundle's main bundle nil or its bundleIdentifier not the Info.plist's, 1 objectForInfoDictionaryKey: not reading the test's own key, 2 bundlePath not the .app holding the executable, 3 pathForResource:ofType: not finding greeting.txt under the bundle's Resources or its text wrong, 4 CFBundleGetMainBundle not the same bundle by identifier and key, 5 principalClass not NSApplication"
+        crt "bit 0 is _NSGetExecutablePath failing with a buffer that fits or changing the size it was handed, 1 the path not NSBundle's executablePath, 2 a buffer too small not returning -1 with the size the path needs, 3 _NSGetArgc or _NSGetArgv not the argc and the very argv main was handed, 4 *_NSGetEnviron() not the environ variable or a setenv not seen through it exactly once, 5 *_NSGetProgname() not the pointer getprogname returns, 6 _NSGetMachExecuteHeader not the guest's own _mh_execute_header"
+        process "bit 0 is NSProcessInfo's processName not the executable's name, 1 getprogname not the last component of argv[0], 2 NSProcessInfo's arguments not argc long, ending in the extra argument and starting with the executable, 3 CFProcessPath present in the guest's environment, 4 NSRunningApplication's currentApplication not registered under the bundle identifier or not this process"
+        app "bit 0 is applicationWillFinishLaunching: and applicationDidFinishLaunching: not delivered once each and in order with NSApp as the notification's object, 1 NSApp not the shared NSApplication main made, 2 the delegate not the guest's, 3 NSApp not running, 4 the activation policy not the accessory one LSUIElement asks for"
+    )
+
+    if callback_fixture_missing "$name" "$APP_BUNDLE_BIN"; then
+        return
+    fi
+    if [ -z "$APP_BUNDLE_ARM64" ]; then
+        record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $( (grep -m1 -i 'error' "$TMP/$name.arm64.cc.log" || head -1 "$TMP/$name.arm64.cc.log") 2>/dev/null | cut -c1-160)"
+        return
+    fi
+    if [ -z "$APP_BUNDLE_EXE" ]; then
+        record "$name" "lipo would not join the two builds into the bundle's one executable: $(head -1 "$TMP/$name.lipo.log" 2>/dev/null | cut -c1-160)"
+        return
+    fi
+    reason="$(objc_import_reason "$APP_BUNDLE_BIN" app _NSApplicationMain _CFBundleGetMainBundle "_OBJC_CLASS_\$_NSBundle" \
+        __NSGetExecutablePath __NSGetArgv __NSGetEnviron __NSGetMachExecuteHeader)"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+
+    run_bounded "$ao" "$ae" "$APP_BUNDLE_EXE" "$APP_ARG"
+    rc_arm=$?
+    reason="$(app_unavailable "$rc_arm" "$ao" "$ae")"
+    if [ -n "$reason" ]; then
+        echo "SKIP $name ($reason)"
+        return
+    fi
+    reason="$(objc_arm64_reason "$rc_arm" "$tag" "$ao" "$ae" "" "${bits[@]}")"
+    got="$(app_nslog_name "$ae")"
+    if [ -z "$reason" ] && [ "$got" != "$APP_NAME" ]; then
+        reason="the arm64 build, run directly on the host, logged under '${got:-nothing}' rather than '$APP_NAME', so the host does not name an application after its executable the way this case expects, and the process-name check would pass or fail on nothing"
+    fi
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+    objc_messages nslog "$tag" "$ae" > "$ae.msg"
+
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$APP_BUNDLE_EXE" "$APP_ARG"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$APP_BUNDLE_EXE" "$APP_ARG"
+    rc_nojit=$?
+    line="$(cf_status "$tag" "$jo")"
+    objc_messages nslog "$tag" "$je" > "$je.msg"
+    objc_messages nslog "$tag" "$ne" > "$ne.msg"
+
+    reason="$(objc_run_reason "$rc_jit" "$tag" "$jo" "$je")"
+    if grep -q "^$tag bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed: $(cf_bits "$tag" "$jo" "${bits[@]}")"
+    elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+        reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+    fi
+    if [ -z "$reason" ]; then
+        reason="$(objc_run_reason "$rc_nojit" "$tag" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(cf_status "$tag" "$no")': the guest's own checks failed: $(cf_bits "$tag" "$no" "${bits[@]}")"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        elif ! cmp -s "$je.msg" "$ne.msg"; then
+            reason="native jit '$(tr '\n' '|' < "$je.msg")' and no-jit '$(tr '\n' '|' < "$ne.msg")' $what differ"
+        fi
+    fi
+    for f in "$je" "$ne"; do
+        got="$(app_nslog_name "$f")"
+        if [ -z "$reason" ] && [ "$got" != "$APP_NAME" ]; then
+            reason="NSLog in native mode named the process '${got:-nothing}' where the arm64 build's named it '$APP_NAME', so the host's frameworks took the name of the process ocerz is and not of the application it runs"
+        fi
+    done
+    if [ -z "$reason" ] && ! cmp -s "$jo" "$ao"; then
+        reason="native '$(tr '\n' ' ' < "$jo")' != arm64 '$(tr '\n' ' ' < "$ao")': the guest got answers from the host's own frameworks that a native application asking them directly does not"
+    elif [ -z "$reason" ] && ! cmp -s "$je.msg" "$ae.msg"; then
+        reason="native '$(tr '\n' '|' < "$je.msg")' != arm64 '$(tr '\n' '|' < "$ae.msg")' in the $what"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$APP_BUNDLE_EXE" "$APP_ARG"
+        rc_cache=$?
+        objc_messages nslog "$tag" "$ce" > "$ce.msg"
+        got="$(app_nslog_name "$ce")"
+        if [ "$rc_cache" -eq 124 ]; then
+            reason="cache mode still running after ${NATIVE_TIMEOUT}s, which crosses no bridge, and $(objc_stall "$tag" "$ce" hang)"
+        elif [ "$rc_cache" -ne 0 ]; then
+            reason="cache-mode exit $rc_cache, want 0: '$(cf_status "$tag" "$co")'"
+        elif ! cmp -s "$jo" "$co"; then
+            reason="native '$(tr '\n' ' ' < "$jo")' != cache '$(tr '\n' ' ' < "$co")': native mode agrees with the arm64 build and the x86 frameworks in the shared cache answer otherwise"
+        elif ! cmp -s "$je.msg" "$ce.msg" || [ "$got" != "$APP_NAME" ]; then
+            reason="native '$(tr '\n' '|' < "$je.msg")' != cache '$(tr '\n' '|' < "$ce.msg")' logged under '${got:-nothing}': native mode agrees with the arm64 build and cache mode logs otherwise"
         fi
     fi
     record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
@@ -10489,6 +10923,7 @@ build_signal_fixtures
 build_cf_fixtures
 build_objc_fixtures
 build_objc_class_fixtures
+build_app_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -10645,6 +11080,7 @@ case_objc objc_view_ivar "$OBJC_VIEW_IVAR_BIN" "$OBJC_VIEW_IVAR_ARM64" objc_view
     layout "bit 0 is either view nil, -initWithFrame: not run once per view, or the class or its superclass wrong, 1 the first ivar not at or past the native NSView's instance size or the ivars out of declaration order, so the offsets guest code reads were not slid, 2 the class's instance size not covering its last ivar, 3 the frame read inside -initWithFrame: after the ivars were written not the one passed, 4 either view's frame or bounds wrong after main wrote the second view's ivars, 5 valueForKey:, reading at the native runtime's offset, not finding each view's own int, 6 valueForKey: not finding the double, the color, the NSRect and the trailing byte guest code wrote, 7 setValue:forKey: on one view not seen by guest code or changing the other view" \
     draw "bit 0 is -drawRect: not called exactly once per view, 1 -drawRect: called on the wrong view, 2 the int or the double written in -initWithFrame: reading otherwise in -drawRect:, 3 the color written in -initWithFrame: not the very object -drawRect: read, 4 the NSRect or the trailing byte reading otherwise in -drawRect:, 5 the second view's -drawRect: not seeing every value main wrote into it, 6 -frame inside -drawRect: not each view's own" \
     pixels "bit 0 is a corner of the first view's bitmap not white, 1 the first view's color not at the corners of its box, 2 that color outside its box, 3 the second view's color not at its own box, or the first view's box drawn in it, 4 the second view's color outside its box; dev1= and dev2= are checksums of the two bitmaps' bytes"
+case_app_bundle
 case_env_native
 case_flag_beats_env
 case_last_flag_native

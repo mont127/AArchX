@@ -32,6 +32,17 @@
  * terminator into the string area and handed strlen() the bytes of
  * "th_port=0x..." as a pointer, and python3 died there.
  *
+ * The ProgramVars block handed to libSystem's initializer and to every image
+ * initializer points at the real NXArgc, NXArgv, environ and __progname -
+ * libdyld's in cache mode, the host's in native mode - and not at cells of its
+ * own beside the vectors.  libc's _NSGetEnviron and _NSGetArgv answer whatever
+ * that block points at, while the environ a program reads is libdyld's variable,
+ * so with cells of their own the two came apart at the first setenv: setenv moved
+ * *_NSGetEnviron() to a new array and environ went on naming the old one, and a
+ * program that called setenv and then execve with environ handed its child an
+ * environment without the variable.  On a real system they are one variable,
+ * which the app_bundle native case checks against an arm64 build and cache mode.
+ *
  * ---- initializers ----
  * Getting this phase right is most of the file.  Whether a program pulls in
  * CoreFoundation/Foundation/AppKit cannot be asked of the main executable's own
@@ -165,6 +176,16 @@
  * another platform's version, hands over zero, which chooses the newest
  * directory.
  *
+ * At the same point, before any framework can be opened and run its
+ * initializers, native mode hands the guest's arguments to
+ * ocerz_bridge_set_process_args, which makes them the host's own argv, argc and
+ * program name, and it hands over the vectors on the guest's stack once the
+ * frame is built, so that the host's variables name the argv main is given.  The
+ * process path CoreFoundation takes the main bundle from is the main image's real
+ * path, the one ocerz_dyld_main_path answers, which is set before the first
+ * dependency is looked at; bridge.c hands it to CoreFoundation when it first opens
+ * a framework.
+ *
  * A name that ocerz synthesizes is answered rather than missed.  Before an
  * install name is expanded at all, native mode asks ocerz_vdylib_have whether
  * it has an image for it, and if it does the image is built in memory and
@@ -287,6 +308,7 @@
 #include "ocerz/vdylib.h"
 #include "ocerz/apidb.h"
 #include "ocerz/objcbridge.h"
+#include "ocerz/bridge.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -298,6 +320,7 @@
 #include <mach/mach.h>
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
+#include <crt_externs.h>
 
 #define DYN_ARENA_SIZE (256ull << 30)
 #define DYN_STACK_SIZE (8ull << 20)
@@ -2896,6 +2919,15 @@ static uint32_t native_image_minos(const uint8_t *mh)
     return 0;
 }
 
+static void progvars_point_at(const DynFrame *fr, uint64_t argc_at, uint64_t argv_at,
+                              uint64_t environ_at, uint64_t progname_at)
+{
+    const uint64_t at[4] = { argc_at, argv_at, environ_at, progname_at };
+    for (int i = 0; i < 4; i++)
+        if (at[i])
+            ocerz_st(fr->progvars + 8 + 8 * (uint64_t)i, 8, at[i]);
+}
+
 static void native_exit_through_libsystem(const DynFrame *fr)
 {
     DynImage *libsys = dimg_find_by_install_name("/usr/lib/libSystem.B.dylib");
@@ -2975,6 +3007,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         OCERZ_LOG("dynamic: %s declares macOS %u.%u.%u\n", path, minos >> 16, (minos >> 8) & 0xff,
                   minos & 0xff);
         ocerz_apidb_set_minos(minos);
+        ocerz_bridge_set_process_args(argc, argv);
     }
 
     RpathList main_rpaths;
@@ -3022,8 +3055,10 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         free(buf);
         return OCERZ_ENOMEM;
     }
-    if (ocerz_mode == OCERZ_MODE_NATIVE)
+    if (ocerz_mode == OCERZ_MODE_NATIVE) {
         native_exit_through_libsystem(&fr);
+        ocerz_bridge_set_process_args((int)fr.argc, (char **)ocerz_g2h(fr.argv_arr));
+    }
 
     uint64_t tsd = ocerz_map_anywhere(0x8000, PROT_READ | PROT_WRITE);
     if (tsd == 0) {
@@ -3076,6 +3111,19 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
             ocerz_st(progname_addr, 8, leaf);
         OCERZ_LOG("dynamic: libdyld __progname=%#llx set to %#llx\n",
                   (unsigned long long)progname_addr, (unsigned long long)leaf);
+    }
+
+    if (ocerz_mode == OCERZ_MODE_CACHE) {
+        uint64_t argc_addr = ocerz_cache_resolve(&cache, "_NXArgc");
+        uint64_t argv_addr = ocerz_cache_resolve(&cache, "_NXArgv");
+        if (argc_addr)
+            ocerz_st(argc_addr, 4, fr.argc);
+        if (argv_addr)
+            ocerz_st(argv_addr, 8, fr.argv_arr);
+        progvars_point_at(&fr, argc_addr, argv_addr, environ_addr, progname_addr);
+    } else {
+        progvars_point_at(&fr, ocerz_h2g(_NSGetArgc()), ocerz_h2g(_NSGetArgv()),
+                          ocerz_h2g(_NSGetEnviron()), ocerz_h2g(_NSGetProgname()));
     }
 
     extern uint64_t g_main_path;

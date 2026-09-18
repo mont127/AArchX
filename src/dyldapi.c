@@ -22,6 +22,13 @@
  * realized by then with copied method lists that only a category list can reach.
  * OCERZ_PRELOAD_OBJC still moves named cache images' closures into the initial
  * batch, and "@cat" does that for every image that defines categories.
+ *
+ * _NSGetExecutablePath behaves as dyld's does: a buffer the path fits in gets
+ * the path and a size left exactly as the caller set it, and only a buffer too
+ * small has the size rewritten, to the length the path needs, with -1 returned.
+ * The slot used to write the length back on success as well, which an arm64
+ * build of the same program never sees; the app_bundle native case compares the
+ * two.
  */
 #include "ocerz/dyldapi.h"
 #include "ocerz/vdylib.h"
@@ -1792,8 +1799,6 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         uint32_t have = szp ? (uint32_t)ocerz_ld(szp, 4) : 0;
         if (buf && have >= need) {
             memcpy(ocerz_g2h(buf), host, need);
-            if (szp)
-                ocerz_st(szp, 4, need);
             api_return(cpu, 0);
         } else {
             if (szp)

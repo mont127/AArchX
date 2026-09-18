@@ -246,6 +246,55 @@
  * changed is named, and the guest's environment is a copy main.c took before
  * loading began, because __CFInitialize calls setenv.
  *
+ * ---- the guest's identity ----
+ * The process native frameworks run in is ocerz's, and they ask the process
+ * who it is.  CoreFoundation takes the main bundle, the process name NSProcessInfo
+ * and NSLog report and the arguments NSProcessInfo hands out from the process
+ * path and the crt_externs variables, and it takes them once, in __CFInitialize.
+ * Left alone those are ocerz's path and ocerz's argv, so an application's
+ * NSBundle answers came from the directory ocerz sits in, its Info.plist and
+ * resources were never found, and NSApplicationMain had nothing to launch.  Two
+ * things change that.  ocerz_bridge_set_process_args points the host's NXArgc,
+ * NXArgv and __progname, the variables _NSGetArgc, _NSGetArgv and _NSGetProgname
+ * hand out, at the guest's argument count, vector and program name: dyld.c calls
+ * it once with the guest's arguments before any library is loaded, and again
+ * with the vectors on the guest's own stack once they are built, so that
+ * *_NSGetArgv() is the very argv main receives, as it is on a real system.  And
+ * the first framework opened opens CoreFoundation first, with CFProcessPath
+ * naming the guest's executable, which CoreFoundation honours in a process that
+ * is not restricted; the variable is taken out again, or put back as it was, the
+ * moment that open returns.  CoreFoundation keeps what it read, so the bundle,
+ * the name and the arguments stay the guest's, while neither the guest's
+ * environment nor a child it spawns ever sees the variable: a native child that
+ * inherited it would take its parent's bundle for its own.  A framework's
+ * initializer can reach CoreFoundation's, so none may run first; libSystem and
+ * libobjc cannot, and opening them initializes nothing of CoreFoundation's.  The
+ * environment copy main.c took is older than all of this and never holds the
+ * variable either.
+ *
+ * _NSGetArgc, _NSGetArgv, _NSGetEnviron, _NSGetProgname, getprogname and
+ * setprogname then cross like any other function.  They answer the host's
+ * variables, which now hold the guest's values, and those are the very
+ * variables the _NXArgc, _NXArgv, _environ and ___progname data exports name,
+ * so what a guest writes through one it reads back through the other; a special
+ * answering from slots of its own would be a second copy that goes stale at the
+ * first setenv.  Two answers cannot come from the host, because host dyld's
+ * _NSGetExecutablePath names ocerz and _NSGetMachExecuteHeader ocerz's own
+ * header.  Those are specials: the first copies the guest executable's real path
+ * and leaves the size alone when it fits, or returns -1 with the size the path
+ * needs, as dyld does, and the second returns the guest main image's header.
+ *
+ * With the identity in place NSApplicationMain and CFBundleGetMainBundle cross
+ * as ordinary functions.  NSApplicationMain reads the guest's Info.plist, looks
+ * the principal class up by name, which a guest class registered with the native
+ * runtime satisfies, loads the main nib out of the guest's bundle, whose objects
+ * name guest classes and reach guest outlets and actions through the native
+ * runtime, and runs the application on the thread that called it, the main
+ * thread, with every delegate method and action a callback into guest code.  It
+ * never returns: -terminate: ends the process through the host's exit, which runs
+ * the guest's atexit handlers, since they are on the host's list, and flushes the
+ * host's stdio, which is the guest's.
+ *
  * ---- CoreFoundation ----
  * CoreFoundation's functions are ordinary crossings resolved inside the native
  * framework through ocerz_bridge_host_symbol, never through the process-wide
@@ -291,6 +340,7 @@
 #include "ocerz/vdylib.h"
 #include "ocerz/objcbridge.h"
 
+#include <crt_externs.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
@@ -472,6 +522,65 @@ static int br_pthread_kill(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_settle(vm, cpu);
 }
 
+static int br_nsgetexecutablepath(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    const char *path = ocerz_dyld_main_path();
+    uint64_t buf = cpu->gpr[OCERZ_RDI];
+    uint64_t size_at = cpu->gpr[OCERZ_RSI];
+    if (!path || !size_at) {
+        br_return(cpu, (uint64_t)(uint32_t)-1);
+        return br_settle(vm, cpu);
+    }
+    uint32_t need = (uint32_t)strlen(path) + 1;
+    if ((uint32_t)ocerz_ld(size_at, 4) < need) {
+        ocerz_st(size_at, 4, need);
+        br_return(cpu, (uint64_t)(uint32_t)-1);
+    } else {
+        memcpy(ocerz_g2h(buf), path, need);
+        br_return(cpu, 0);
+    }
+    return br_settle(vm, cpu);
+}
+
+static int br_nsgetmachexecuteheader(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    br_return(cpu, ocerz_main_mh);
+    return br_settle(vm, cpu);
+}
+
+void ocerz_bridge_set_process_args(int argc, char **argv)
+{
+    *_NSGetArgc() = argc;
+    *_NSGetArgv() = argv;
+    if (argc > 0 && argv && argv[0])
+        setprogname(argv[0]);
+}
+
+static int g_br_cf_identified;
+
+static void br_identify_corefoundation(void)
+{
+    const char *path = ocerz_dyld_main_path();
+    if (g_br_cf_identified || !path)
+        return;
+    g_br_cf_identified = 1;
+    const char *prev = getenv(OCERZ_BRIDGE_PROCESS_PATH_VAR);
+    char *saved = prev ? strdup(prev) : NULL;
+    setenv(OCERZ_BRIDGE_PROCESS_PATH_VAR, path, 1);
+    void *h = dlopen(OCERZ_BRIDGE_COREFOUNDATION, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
+    if (!h)
+        h = dlopen(OCERZ_BRIDGE_COREFOUNDATION, RTLD_LAZY | RTLD_LOCAL);
+    if (saved)
+        setenv(OCERZ_BRIDGE_PROCESS_PATH_VAR, saved, 1);
+    else
+        unsetenv(OCERZ_BRIDGE_PROCESS_PATH_VAR);
+    free(saved);
+    if (h)
+        OCERZ_LOG("bridge: CoreFoundation initialized with the process path %s\n", path);
+    else
+        OCERZ_LOG("bridge: CoreFoundation will not open to take the guest's identity: %s\n", dlerror());
+}
+
 typedef struct BrHandler {
     const char *name;
     int (*fn)(struct OcerzVM *vm, OcerzCPU *cpu);
@@ -492,6 +601,8 @@ static const BrHandler g_br_handlers[] = {
     { "raise",           br_raise },
     { "kill",            br_kill },
     { "pthread_kill",    br_pthread_kill },
+    { "NSGetExecutablePath",    br_nsgetexecutablepath },
+    { "NSGetMachExecuteHeader", br_nsgetmachexecuteheader },
     { "objc_msgSend",              ocerz_objc_msgSend },
     { "objc_msgSendSuper",         ocerz_objc_msgSendSuper },
     { "objc_msgSendSuper2",        ocerz_objc_msgSendSuper2 },
@@ -584,6 +695,8 @@ void *ocerz_bridge_host_library(const char *install_name)
             static struct sigaction before[NSIG];
             for (int sig = 1; sig < NSIG; sig++)
                 sigaction(sig, NULL, &before[sig]);
+            if (strstr(install_name, ".framework/"))
+                br_identify_corefoundation();
             h = dlopen(install_name, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
             if (!h)
                 h = dlopen(install_name, RTLD_LAZY | RTLD_LOCAL);
