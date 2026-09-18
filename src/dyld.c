@@ -243,7 +243,9 @@
  * (objcbridge.h).  The queued +load methods run through
  * ocerz_objcbridge_run_loads once the guest's thread block is in place and the
  * handlers are installed, just before main, which is the first point guest code
- * can run at all.
+ * can run at all.  A dlopen defines its images the same way, but only once the
+ * whole closure has bound, and runs each image's own +load methods just before
+ * that image's initializers.
  *
  * ---- thread-local variables in native mode ----
  * Descriptors are rewritten into the same packed form as in cache mode, but the
@@ -291,13 +293,97 @@
  *
  * Registration runs for the main image and everything loaded with it right after
  * the unresolved-import report, before any guest code can run, and as soon as a
- * dlopen has loaded, before anything in the new images runs, over every image the
- * loader holds rather than only the new ones: a dependency
- * mapped by a dlopen that then failed is handed out by path to the next dlopen
- * without coming back through here.  An image already registered is skipped, and
- * that is not a formality - once a descriptor for a variable at offset 0 has been
- * packed it no longer reads as packed, so packing it again would store the
- * template delta as its offset.
+ * dlopen has bound, before anything in the new images runs.  The dlopen pass
+ * walks every image the loader holds rather than only the new ones, which costs
+ * a scan per image and spares it knowing which those are.  An image already
+ * registered is skipped, and that is not a formality - once a descriptor for a
+ * variable at offset 0 has been packed it no longer reads as packed, so packing
+ * it again would store the template delta as its offset.  A dlopen that fails
+ * registers nothing, because it unmaps everything it mapped before this pass.
+ *
+ * ---- loading code at run time in native mode ----
+ * Native mode's dlopen family is answered here, reached from special exports in
+ * src/bridge.c, and it is not cache mode's ocerz_dlopen: that one resolves
+ * against the x86 shared cache and leaves Objective-C, thread-local variables
+ * and the image list to the translated libobjc and libdyld, which native mode
+ * does not have.
+ *
+ * A handle is the mach header of the image, which is also what dladdr and the
+ * image list answer with, so a header obtained either way can be handed to
+ * dlsym.  Its low bit, never set in a page-aligned header, marks a handle that
+ * RTLD_FIRST asked for.  dlopen(NULL) answers RTLD_DEFAULT, or RTLD_MAIN_ONLY
+ * under RTLD_FIRST, because that is what dyld answers: an arm64 program on the
+ * host printed 0xfffffffffffffffe and 0xfffffffffffffffb for them.
+ *
+ * A path is resolved the way dyld resolves one: @executable_path against the
+ * main executable, @loader_path against the image holding the caller's return
+ * address, @rpath through that image's LC_RPATHs and then the main
+ * executable's, and a bare name through DYLD_LIBRARY_PATH, the working
+ * directory and the fallback path.  Each candidate is asked, in order, whether
+ * it is the main executable, an image already loaded by path, install name or
+ * file identity, an install name a database describes, the same once its
+ * symlinks are resolved, a file on disk, or a library the host's shared cache
+ * holds, whose real path the host's _dyld_shared_cache_real_path answers
+ * without loading anything.  That last is how /usr/lib/libc.dylib, libz.dylib or
+ * a framework's top-level symlink turn into the install name a database is
+ * filed under.  A file with no x86_64 slice and a host library no database
+ * describes are both refused as a native library without an API database, since
+ * native mode runs x86 code only and reaches native code only through one.
+ *
+ * A load binds its whole closure before anything in it runs.  The loader's
+ * usual path defines an image's Objective-C as soon as that image's fixups are
+ * bound, which is harmless at startup, where a failed bind ends the process; a
+ * dlopen that fails must leave nothing behind, and a class handed to the native
+ * runtime cannot be taken back, so while a dlopen loads, those passes wait.
+ * Misses are counted against the collected-import table and a non-weak
+ * dependency that did not load is recorded, and either fails the dlopen with
+ * dyld's wording, Symbol not found or Library not loaded, naming the image that
+ * referenced it.  Every image the attempt mapped is then unmapped and dropped
+ * and the table put back as it was, so a second attempt fails the same way.
+ * Only a closure that bound completely is published into the image list - one
+ * release store of the count, which readers load with acquire, so no reader
+ * sees an image half built and none takes a lock - and then, in dyld's order,
+ * its thread-local descriptors are registered, every add-image callback is
+ * called for each new image, every new image's selectors are rewritten and its
+ * classes, categories and protocols defined, dependencies first by the order
+ * their loads completed, and then image by image, again dependencies first,
+ * that image's +load methods and its initializers run on the calling thread
+ * below the caller's stack pointer.  RTLD_LOCAL marks the image it loaded, not
+ * its dependencies, which hides it from RTLD_DEFAULT, RTLD_NEXT and flat lookups
+ * until a dlopen without it; RTLD_NOLOAD answers only what is already loaded.
+ * Nothing is ever unloaded, so dlclose checks its handle and answers 0, and a
+ * mach header never comes to name a second image.
+ *
+ * dlsym takes the C name and searches for it with a leading underscore, as
+ * dyld does.  RTLD_DEFAULT searches the main executable and then every global
+ * image in load order, RTLD_MAIN_ONLY the main executable alone, RTLD_NEXT the
+ * images after the one holding the caller's return address and RTLD_SELF that
+ * image first; a handle searches its image and then its dependencies breadth
+ * first, or its image alone under RTLD_FIRST.  A plug-in bundle's imports from
+ * the executable that loaded it carry the main-executable ordinal, and the
+ * resolver answers those from the main image once every other place has
+ * missed, as it does for a flat or weak lookup nothing else answered; before
+ * that, no other image's import could bind to the main image at all.
+ *
+ * dladdr names a guest image's symbol from its symbol table, read out of the
+ * mapped __LINKEDIT so that the name is guest memory, and an image with none -
+ * every synthesized one - from its export trie, walked once into a sorted
+ * table.  An address in no guest image is native memory, a data export's target
+ * or a host framework's code, and the host's own dladdr answers it, with
+ * strings and a base that are host addresses the identity map makes guest ones.
+ *
+ * dlerror is per thread, as POSIX and dyld make it.  Each thread keeps a buffer
+ * in guest memory behind a pthread key whose destructor unmaps it; a message
+ * stays readable until that thread's next failure, and dlerror answers it once.
+ *
+ * The image list is the main executable and then every image the loader holds,
+ * synthesized libraries included, in load order.  x86 code walks it expecting
+ * the libraries it links to be in it - a crash reporter naming libSystem, a
+ * framework looking for its own header by name - and those libraries are the
+ * synthesized images, so a list of guest dylibs alone would hide what the guest
+ * believes it has linked, while listing the host's images would hand x86 code
+ * arm64 headers.  An add-image callback registered late is called at once for
+ * every image already listed, and then for each image a dlopen adds.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -309,10 +395,15 @@
 #include "ocerz/apidb.h"
 #include "ocerz/objcbridge.h"
 #include "ocerz/bridge.h"
+#include "ocerz/abi.h"
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -443,6 +534,11 @@ typedef struct DynImage {
     int is_pie;
     int links_dylib;
     int links_cf;
+    int is_virtual;
+    int local;
+    uint32_t seq;
+    uint64_t map_base;
+    uint64_t map_size;
     uint64_t file_dev;
     uint64_t file_ino;
 } DynImage;
@@ -638,6 +734,8 @@ static int map_segments(DynImage *img, int is_main)
         uint64_t region = ocerz_map_anywhere(vmhi - vmlo, PROT_READ | PROT_WRITE);
         if (region == 0)
             return OCERZ_ENOMEM;
+        img->map_base = region;
+        img->map_size = vmhi - vmlo;
         img->slide = region - vmlo;
         img->load_base = text_vmaddr + img->slide;
     }
@@ -774,6 +872,80 @@ uint64_t ocerz_dyld_trie_resolve(const uint8_t *slice, uint64_t load_base,
     return 0;
 }
 
+typedef struct TrieWalk {
+    const uint8_t *start;
+    const uint8_t *end;
+    uint64_t load_base;
+    OcerzTrieVisit visit;
+    void *ctx;
+    int count;
+    int stopped;
+    char name[4096];
+} TrieWalk;
+
+static int trie_walk(TrieWalk *w, uint64_t off, size_t len, int depth)
+{
+    if (depth > 512 || off >= (uint64_t)(w->end - w->start))
+        return -1;
+    const uint8_t *p = w->start + off;
+    uint64_t term = self_uleb(&p, w->end);
+    if (p >= w->end || term >= (uint64_t)(w->end - p))
+        return -1;
+    const uint8_t *after = p + term;
+    if (term) {
+        const uint8_t *tp = p;
+        uint64_t flags = self_uleb(&tp, after);
+        uint64_t value = 0;
+        if (!(flags & 0x08)) {
+            uint64_t raw = self_uleb(&tp, after);
+            value = (flags & 0x03) == 0x02 ? raw : w->load_base + raw;
+        }
+        w->name[len] = '\0';
+        w->count++;
+        if (w->visit && w->visit(w->ctx, w->name, value, flags)) {
+            w->stopped = 1;
+            return 0;
+        }
+    }
+    p = after;
+    uint8_t children = *p++;
+    for (uint8_t i = 0; i < children; i++) {
+        if (p >= w->end)
+            return -1;
+        size_t elen = strnlen((const char *)p, (size_t)(w->end - p));
+        if (elen == (size_t)(w->end - p) || len + elen >= sizeof w->name)
+            return -1;
+        memcpy(w->name + len, p, elen);
+        p += elen + 1;
+        uint64_t child = self_uleb(&p, w->end);
+        if (trie_walk(w, child, len + elen, depth + 1) < 0)
+            return -1;
+        if (w->stopped)
+            return 0;
+    }
+    return 0;
+}
+
+int ocerz_dyld_trie_each(const uint8_t *slice, uint64_t load_base, OcerzTrieVisit visit, void *ctx)
+{
+    uint32_t tsize = 0;
+    uint64_t toff = slice ? image_export_trie(slice, &tsize) : 0;
+    if (!toff || !tsize)
+        return 0;
+    TrieWalk *w = calloc(1, sizeof *w);
+    if (!w)
+        return -1;
+    w->start = slice + toff;
+    w->end = w->start + tsize;
+    w->load_base = load_base;
+    w->visit = visit;
+    w->ctx = ctx;
+    int rc = trie_walk(w, 0, 0, 0);
+    int n = w->count;
+    free(w);
+    return rc < 0 ? -1 : n;
+}
+
 static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int *found)
 {
     return ocerz_dyld_trie_resolve(img->slice, img->load_base, sym, found);
@@ -807,6 +979,8 @@ static const char *dimg_ordinal_name(DynImage *img, int ord)
 static uint64_t disk_flat_resolve_ex(const char *name, int *found)
 {
     for (int i = 0; i < g_dimgs_n; i++) {
+        if (g_dimgs[i].local)
+            continue;
         int f = 0;
         uint64_t v = ocerz_image_self_resolve_ex(&g_dimgs[i], name, &f);
         if (f) {
@@ -826,12 +1000,12 @@ static uint64_t disk_flat_resolve(const char *name)
 static int expand_at_prefix(DynImage *loader, const char *name, char *out, size_t n);
 
 #define NATIVE_MISS_MAX 256
-struct native_miss { char lib[256]; char sym[256]; };
+struct native_miss { char lib[256]; char sym[256]; char from[256]; };
 static struct native_miss g_native_miss[NATIVE_MISS_MAX];
 static int g_native_miss_n;
 static int g_native_miss_dropped;
 
-static void native_miss_add(const char *lib, const char *sym)
+static void native_miss_add(const char *lib, const char *sym, const char *from)
 {
     if (!lib || !lib[0])
         lib = "(flat)";
@@ -844,8 +1018,11 @@ static void native_miss_add(const char *lib, const char *sym)
     }
     snprintf(g_native_miss[g_native_miss_n].lib, sizeof g_native_miss[0].lib, "%s", lib);
     snprintf(g_native_miss[g_native_miss_n].sym, sizeof g_native_miss[0].sym, "%s", sym);
+    snprintf(g_native_miss[g_native_miss_n].from, sizeof g_native_miss[0].from, "%s", from ? from : "");
     g_native_miss_n++;
 }
+
+static uint64_t main_image_resolve_ex(const char *sym, int *found);
 
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
                                int libord, int weak)
@@ -883,9 +1060,11 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
         value = ocerz_image_self_resolve_ex(img, name, &found);
     if (!found && !virtual_dep)
         value = disk_flat_resolve_ex(name, &found);
+    if (!found && (libord == -1 || libord == -2 || libord == -3))
+        value = main_image_resolve_ex(name, &found);
     if (!found && !weak) {
         if (ocerz_mode == OCERZ_MODE_NATIVE)
-            native_miss_add(tgt, name);
+            native_miss_add(libord == -1 ? "(main executable)" : tgt, name, img->path);
         else
             OCERZ_FATAL("unresolved import: %s\n", name);
     }
@@ -2316,6 +2495,38 @@ static void canonicalize_objc_selrefs(DynImage *img)
     }
 }
 
+typedef struct NativeDlLoad {
+    int active;
+    char missing[1024];
+    char missing_from[1024];
+    char reason[256];
+} NativeDlLoad;
+
+static NativeDlLoad g_ndl;
+static uint32_t g_dimg_seq;
+
+static const char *(*g_host_cache_real_path)(const char *);
+static pthread_once_t g_host_cache_real_path_once = PTHREAD_ONCE_INIT;
+
+static void host_cache_real_path_init(void)
+{
+    g_host_cache_real_path =
+        (const char *(*)(const char *))dlsym(RTLD_DEFAULT, "_dyld_shared_cache_real_path");
+}
+
+static const char *host_cache_real_path(const char *path)
+{
+    pthread_once(&g_host_cache_real_path_once, host_cache_real_path_init);
+    return g_host_cache_real_path && path ? g_host_cache_real_path(path) : NULL;
+}
+
+static void native_dl_reason(const char *what, const char *path)
+{
+    if (!g_ndl.active || g_ndl.reason[0])
+        return;
+    snprintf(g_ndl.reason, sizeof g_ndl.reason, what, path ? path : "");
+}
+
 static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, DynImage *loader,
                                  const RpathList *rpaths)
 {
@@ -2325,12 +2536,14 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     if (ocerz_mode == OCERZ_MODE_NATIVE && ocerz_vdylib_have(install_name)) {
         if (g_dimgs_n >= DYN_DIMG_MAX) {
             OCERZ_FATAL("too many disk dylibs to load (limit %d)\n", DYN_DIMG_MAX);
+            native_dl_reason("the loader holds as many images as it can", NULL);
             return NULL;
         }
         size_t vlen = 0;
         uint8_t *vbuf = ocerz_vdylib_image(install_name, &vlen);
         if (!vbuf || vlen == 0) {
             OCERZ_FATAL("cannot synthesize %s\n", install_name);
+            native_dl_reason("its API database would not build an image", NULL);
             free(vbuf);
             return NULL;
         }
@@ -2338,26 +2551,30 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         memset(v, 0, sizeof *v);
         v->slice = vbuf;
         v->owned_buf = vbuf;
+        v->is_virtual = 1;
         snprintf(v->path, sizeof v->path, "%s", install_name);
         snprintf(v->install_name, sizeof v->install_name, "%s", install_name);
         dimg_record_id(v);
         if (map_segments(v, 0) != OCERZ_OK) {
             OCERZ_FATAL("cannot map segments of virtual %s\n", install_name);
+            native_dl_reason("its synthesized image could not be mapped", NULL);
             g_dimgs_n--;
             free(vbuf);
             return NULL;
         }
         protect_ro_segments(v);
+        v->seq = ++g_dimg_seq;
         OCERZ_LOG("dynamic: registered virtual dylib %s at load_base=%#llx slide=%#llx\n",
                   install_name, (unsigned long long)v->load_base,
                   (unsigned long long)v->slide);
         return v;
     }
     char resolved[1024];
-    if (!expand_install_name(loader, install_name, rpaths, resolved, sizeof resolved))
+    if (!expand_install_name(loader, install_name, rpaths, resolved, sizeof resolved) ||
+        resolved[0] == '@') {
+        native_dl_reason("it is in no LC_RPATH directory of the images that load it", NULL);
         return NULL;
-    if (resolved[0] == '@')
-        return NULL;
+    }
     if (dep_find(cache, resolved) != 0)
         return NULL;
 
@@ -2372,6 +2589,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         return existing;
     if (g_dimgs_n >= DYN_DIMG_MAX) {
         OCERZ_FATAL("too many disk dylibs to load (limit %d)\n", DYN_DIMG_MAX);
+        native_dl_reason("the loader holds as many images as it can", NULL);
         return NULL;
     }
 
@@ -2383,11 +2601,22 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
                       resolved);
         else
             OCERZ_FATAL("Library not loaded: %s (no such file)\n", resolved);
+        if (g_ndl.active) {
+            const char *real = host_cache_real_path(resolved);
+            if (real)
+                native_dl_reason("%s is a native library without an API database", real);
+            else
+                native_dl_reason("no such file", NULL);
+        }
         return NULL;
     }
     const uint8_t *slice = select_slice(buf, flen);
     if (!slice) {
-        OCERZ_FATAL("incompatible architecture: %s has no x86_64 slice\n", resolved);
+        if (g_ndl.active)
+            OCERZ_LOG("dynamic: %s has no x86_64 slice\n", resolved);
+        else
+            OCERZ_FATAL("incompatible architecture: %s has no x86_64 slice\n", resolved);
+        native_dl_reason("%s has no x86_64 slice, so it is a native library without an API database", resolved);
         free(buf);
         return NULL;
     }
@@ -2404,14 +2633,20 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
 
     if (map_segments(d, 0) != OCERZ_OK) {
         OCERZ_FATAL("cannot map segments of %s\n", resolved);
+        native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
         free(buf);
         return NULL;
     }
 
-    RpathList merged;
-    collect_rpaths(d, rpaths, &merged);
-    load_disk_deps(cache, d, &merged);
+    RpathList *merged = malloc(sizeof *merged);
+    if (!merged) {
+        OCERZ_FATAL("no memory for the rpaths of %s\n", resolved);
+        return NULL;
+    }
+    collect_rpaths(d, rpaths, merged);
+    load_disk_deps(cache, d, merged);
+    free(merged);
 
     if (apply_fixups(d, cache) != OCERZ_OK) {
         OCERZ_FATAL("cannot apply fixups of %s\n", resolved);
@@ -2420,10 +2655,12 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     if (d->cf_off == 0)
         apply_classic_fixups(d, cache);
     protect_ro_segments(d);
+    d->seq = ++g_dimg_seq;
 
     if (ocerz_mode == OCERZ_MODE_CACHE)
         ocerz_dyldapi_register_image(d->load_base, d->path);
-    canonicalize_objc_selrefs(d);
+    if (!g_ndl.active)
+        canonicalize_objc_selrefs(d);
     if (getenv("OCERZ_DLPATH"))
         fprintf(stderr, "ocerz: DLPATH disk-dep load_base=%#llx install=%s path=%s\n",
                 (unsigned long long)d->load_base, d->install_name, resolved);
@@ -2442,8 +2679,18 @@ static void load_disk_deps(OcerzCache *cache, DynImage *loader, const RpathList 
         if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
             cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
             uint32_t noff = rd32(lc + 8);
-            if (noff < rd32(lc + 4))
-                load_disk_dylib(cache, (const char *)(lc + noff), loader, rpaths);
+            if (noff < rd32(lc + 4)) {
+                const char *name = (const char *)(lc + noff);
+                DynImage *dep = load_disk_dylib(cache, name, loader, rpaths);
+                if (!dep && g_ndl.active && cmd != LC_LOAD_WEAK_DYLIB && !g_ndl.missing[0]) {
+                    snprintf(g_ndl.missing, sizeof g_ndl.missing, "%s", name);
+                    snprintf(g_ndl.missing_from, sizeof g_ndl.missing_from, "%s", loader->path);
+                    if (!g_ndl.reason[0])
+                        snprintf(g_ndl.reason, sizeof g_ndl.reason, "it could not be loaded");
+                }
+                if (g_ndl.active && !g_ndl.missing[0])
+                    g_ndl.reason[0] = '\0';
+            }
         }
         lc += rd32(lc + 4);
     }
@@ -2503,9 +2750,14 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
         free(buf);
         return NULL;
     }
-    RpathList merged;
-    collect_rpaths(d, NULL, &merged);
-    load_disk_deps(cache, d, &merged);
+    RpathList *merged = malloc(sizeof *merged);
+    if (!merged) {
+        dlerror_set("dlopen(%s): no memory for its rpaths", install_path);
+        return NULL;
+    }
+    collect_rpaths(d, NULL, merged);
+    load_disk_deps(cache, d, merged);
+    free(merged);
     if (apply_fixups(d, cache) != OCERZ_OK) {
         dlerror_set("dlopen(%s): cannot apply fixups", install_path);
         return NULL;
@@ -2709,8 +2961,6 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
     }
     int before = g_dimgs_n;
     DynImage *d = dlopen_load_image(g_run_cache, loadpath);
-    if (ocerz_mode == OCERZ_MODE_NATIVE)
-        native_tlv_register_loaded(ocerz_main_mh);
     if (!d)
         return 0;
     if (!g_run_init_ready && g_run_vm && !vm->exited &&
@@ -2829,6 +3079,19 @@ static uint64_t main_image_resolve(const char *sym)
     return value ? value : image_symtab_resolve(&g_main_dimg, sym);
 }
 
+static uint64_t main_image_resolve_ex(const char *sym, int *found)
+{
+    *found = 0;
+    if (!g_main_dimg_valid)
+        return 0;
+    uint64_t value = ocerz_image_self_resolve_ex(&g_main_dimg, sym, found);
+    if (*found)
+        return value;
+    value = image_symtab_resolve(&g_main_dimg, sym);
+    *found = value != 0;
+    return value;
+}
+
 uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
 {
     if (!sym || !sym[0])
@@ -2894,6 +3157,1102 @@ uint64_t ocerz_dlerror(void)
     if (s[0] == '\0')
         return 0;
     return g_dlerror_g;
+}
+
+#define NDL_RTLD_LOCAL 0x4
+#define NDL_RTLD_NOLOAD 0x10
+#define NDL_RTLD_FIRST 0x100
+#define NDL_NEXT ((uint64_t)-1)
+#define NDL_DEFAULT ((uint64_t)-2)
+#define NDL_SELF ((uint64_t)-3)
+#define NDL_MAIN_ONLY ((uint64_t)-5)
+#define NDL_ERR_BYTES 2048
+#define NDL_TRIED_BYTES 1536
+
+extern uint64_t g_main_path;
+
+static _Atomic int g_dimgs_pub;
+static uint64_t g_native_init_args[5];
+
+static void native_publish(void)
+{
+    atomic_store_explicit(&g_dimgs_pub, g_dimgs_n, memory_order_release);
+}
+
+static int ndl_pub(void)
+{
+    return atomic_load_explicit(&g_dimgs_pub, memory_order_acquire);
+}
+
+typedef struct NdlErr {
+    uint64_t buf;
+    int pending;
+} NdlErr;
+
+static pthread_key_t g_ndl_err_key;
+static pthread_once_t g_ndl_err_once = PTHREAD_ONCE_INIT;
+
+static void ndl_err_release(void *p)
+{
+    NdlErr *e = p;
+    if (!e)
+        return;
+    if (e->buf)
+        ocerz_unmap(e->buf, NDL_ERR_BYTES);
+    free(e);
+}
+
+static void ndl_err_init(void)
+{
+    pthread_key_create(&g_ndl_err_key, ndl_err_release);
+}
+
+static NdlErr *ndl_err_self(int make)
+{
+    pthread_once(&g_ndl_err_once, ndl_err_init);
+    NdlErr *e = pthread_getspecific(g_ndl_err_key);
+    if (e || !make)
+        return e;
+    e = calloc(1, sizeof *e);
+    if (!e)
+        return NULL;
+    e->buf = ocerz_map_anywhere(NDL_ERR_BYTES, PROT_READ | PROT_WRITE);
+    if (!e->buf || pthread_setspecific(g_ndl_err_key, e) != 0) {
+        if (e->buf)
+            ocerz_unmap(e->buf, NDL_ERR_BYTES);
+        free(e);
+        return NULL;
+    }
+    return e;
+}
+
+static void ndl_err_clear(void)
+{
+    NdlErr *e = ndl_err_self(0);
+    if (e)
+        e->pending = 0;
+}
+
+__attribute__((format(printf, 1, 2)))
+static void ndl_err(const char *fmt, ...)
+{
+    char msg[NDL_ERR_BYTES];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    if (getenv("OCERZ_DLPATH"))
+        fprintf(stderr, "ocerz: DLERR %s\n", msg);
+    NdlErr *e = ndl_err_self(1);
+    if (!e)
+        return;
+    memcpy(ocerz_g2h(e->buf), msg, strlen(msg) + 1);
+    e->pending = 1;
+}
+
+uint64_t ocerz_dyld_native_dlerror(void)
+{
+    NdlErr *e = ndl_err_self(0);
+    if (!e || !e->pending)
+        return 0;
+    e->pending = 0;
+    return e->buf;
+}
+
+typedef struct NdlImage {
+    uint64_t mh;
+    int64_t slide;
+    uint64_t name;
+    DynImage *d;
+} NdlImage;
+
+uint32_t ocerz_dyld_image_count(void)
+{
+    return ocerz_main_mh ? 1u + (uint32_t)ndl_pub() : 0;
+}
+
+static int ndl_image(uint32_t index, NdlImage *out)
+{
+    memset(out, 0, sizeof *out);
+    if (!ocerz_main_mh)
+        return 0;
+    if (index == 0) {
+        out->mh = ocerz_main_mh;
+        out->slide = image_slide_d(ocerz_main_mh);
+        out->name = g_main_path ? g_main_path : ocerz_h2g(g_main_hostpath);
+        out->d = g_main_dimg_valid ? &g_main_dimg : NULL;
+        return 1;
+    }
+    if (index - 1 >= (uint32_t)ndl_pub())
+        return 0;
+    DynImage *d = &g_dimgs[index - 1];
+    out->mh = d->load_base;
+    out->slide = (int64_t)d->slide;
+    out->name = ocerz_h2g(d->path);
+    out->d = d;
+    return 1;
+}
+
+static int ndl_covers(uint64_t mh, uint64_t addr, uint64_t len, int *readonly)
+{
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+    if (!mh || rd32(h) != MH_MAGIC_64)
+        return 0;
+    int64_t slide = image_slide_d(mh);
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (rd32(lc) == LC_SEGMENT_64) {
+            uint64_t vmaddr = rd64(lc + 24), vmsize = rd64(lc + 32);
+            uint32_t initprot = rd32(lc + 60);
+            uint64_t lo = (uint64_t)((int64_t)vmaddr + slide);
+            if (vmsize && !(vmaddr == 0 && initprot == 0) && addr >= lo && addr - lo < vmsize) {
+                if (readonly)
+                    *readonly = !(initprot & VM_PROT_WRITE) && len <= vmsize - (addr - lo);
+                return 1;
+            }
+        }
+        lc += rd32(lc + 4);
+    }
+    return 0;
+}
+
+static int ndl_containing(uint64_t addr, NdlImage *out, uint32_t *index_out)
+{
+    uint32_t n = ocerz_dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        if (ndl_image(i, out) && ndl_covers(out->mh, addr, 1, NULL)) {
+            if (index_out)
+                *index_out = i;
+            return 1;
+        }
+    }
+    memset(out, 0, sizeof *out);
+    return 0;
+}
+
+int ocerz_dyld_image_at(uint32_t index, uint64_t *mh, uint64_t *slide, uint64_t *name)
+{
+    NdlImage im;
+    int ok = ndl_image(index, &im);
+    if (mh)
+        *mh = im.mh;
+    if (slide)
+        *slide = (uint64_t)im.slide;
+    if (name)
+        *name = im.name;
+    return ok;
+}
+
+int ocerz_dyld_image_containing(uint64_t addr, uint64_t *mh, uint64_t *name)
+{
+    NdlImage im;
+    int ok = ndl_containing(addr, &im, NULL);
+    if (mh)
+        *mh = im.mh;
+    if (name)
+        *name = im.name;
+    return ok;
+}
+
+int ocerz_dyld_image_slide(uint64_t mh, uint64_t *slide)
+{
+    uint32_t n = ocerz_dyld_image_count();
+    NdlImage im;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ndl_image(i, &im) && im.mh == mh) {
+            *slide = (uint64_t)im.slide;
+            return 1;
+        }
+    }
+    *slide = 0;
+    return 0;
+}
+
+static DynImage *ndl_dimg_for_mh(uint64_t mh)
+{
+    if (!mh)
+        return NULL;
+    if (mh == ocerz_main_mh)
+        return g_main_dimg_valid ? &g_main_dimg : NULL;
+    int pub = ndl_pub();
+    for (int i = 0; i < pub; i++)
+        if (g_dimgs[i].load_base == mh)
+            return &g_dimgs[i];
+    return NULL;
+}
+
+static uint64_t ndl_lookup_in(DynImage *d, const char *usym, int *found)
+{
+    uint64_t v = ocerz_image_self_resolve_ex(d, usym, found);
+    if (*found)
+        return v;
+    v = image_symtab_resolve(d, usym);
+    *found = v != 0;
+    return v;
+}
+
+static DynImage *ndl_dep_of(DynImage *img, const char *name, int pub)
+{
+    char ex[1024];
+    const char *alt = NULL;
+    if (name[0] == '@' && expand_at_prefix(img, name, ex, sizeof ex))
+        alt = ex;
+    for (int i = 0; i < pub; i++) {
+        DynImage *d = &g_dimgs[i];
+        if (strcmp(d->install_name, name) == 0 || strcmp(d->id_name, name) == 0 ||
+            strcmp(d->path, name) == 0)
+            return d;
+        if (alt && (strcmp(d->path, alt) == 0 || strcmp(d->install_name, alt) == 0))
+            return d;
+    }
+    return NULL;
+}
+
+static uint64_t ndl_search_deps(DynImage *root, const char *usym, int *found)
+{
+    int pub = ndl_pub();
+    DynImage *queue[DYN_DIMG_MAX + 1];
+    int qn = 0;
+    queue[qn++] = root;
+    for (int qi = 0; qi < qn; qi++) {
+        DynImage *d = queue[qi];
+        uint64_t v = ndl_lookup_in(d, usym, found);
+        if (*found)
+            return v;
+        const uint8_t *mh = d->slice;
+        uint32_t ncmds = rd32(mh + 16);
+        const uint8_t *lc = mh + sizeof(struct mach_header_64);
+        for (uint32_t i = 0; i < ncmds; i++) {
+            uint32_t cmd = rd32(lc);
+            uint32_t noff = rd32(lc + 8);
+            if ((cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB || cmd == LC_REEXPORT_DYLIB ||
+                 cmd == LC_LOAD_UPWARD_DYLIB) && noff < rd32(lc + 4)) {
+                DynImage *dep = ndl_dep_of(d, (const char *)(lc + noff), pub);
+                int seen = !dep;
+                for (int k = 0; k < qn && !seen; k++)
+                    seen = queue[k] == dep;
+                if (!seen && qn < DYN_DIMG_MAX + 1)
+                    queue[qn++] = dep;
+            }
+            lc += rd32(lc + 4);
+        }
+    }
+    *found = 0;
+    return 0;
+}
+
+static uint64_t ndl_search_from(uint32_t start, uint32_t own, const char *usym, int *found)
+{
+    uint32_t n = ocerz_dyld_image_count();
+    NdlImage im;
+    for (uint32_t i = start; i < n; i++) {
+        if (!ndl_image(i, &im) || !im.d || (im.d->local && i != own))
+            continue;
+        uint64_t v = ndl_lookup_in(im.d, usym, found);
+        if (*found)
+            return v;
+    }
+    *found = 0;
+    return 0;
+}
+
+static void ndl_handle_text(uint64_t handle, char *out, size_t n)
+{
+    if (handle == NDL_DEFAULT)
+        snprintf(out, n, "RTLD_DEFAULT");
+    else if (handle == NDL_NEXT)
+        snprintf(out, n, "RTLD_NEXT");
+    else if (handle == NDL_SELF)
+        snprintf(out, n, "RTLD_SELF");
+    else if (handle == NDL_MAIN_ONLY)
+        snprintf(out, n, "RTLD_MAIN_ONLY");
+    else
+        snprintf(out, n, "%#llx", (unsigned long long)handle);
+}
+
+uint64_t ocerz_dyld_native_dlsym(uint64_t handle, const char *name, uint64_t caller)
+{
+    char htext[32];
+    char usym[1024];
+    int found = 0;
+    uint64_t v = 0;
+
+    ndl_err_clear();
+    ndl_handle_text(handle, htext, sizeof htext);
+    if (!name || snprintf(usym, sizeof usym, "_%s", name) >= (int)sizeof usym) {
+        ndl_err("dlsym(%s, %s): symbol not found", htext, name ? name : "(null)");
+        return 0;
+    }
+    if (handle == NDL_DEFAULT) {
+        v = ndl_search_from(0, UINT32_MAX, usym, &found);
+    } else if (handle == NDL_MAIN_ONLY) {
+        if (g_main_dimg_valid)
+            v = ndl_lookup_in(&g_main_dimg, usym, &found);
+    } else if (handle == NDL_NEXT || handle == NDL_SELF) {
+        NdlImage im;
+        uint32_t ci = 0, start = 0, own = UINT32_MAX;
+        if (ndl_containing(caller, &im, &ci)) {
+            start = handle == NDL_NEXT ? ci + 1 : ci;
+            own = handle == NDL_SELF ? ci : UINT32_MAX;
+        }
+        v = ndl_search_from(start, own, usym, &found);
+    } else {
+        DynImage *d = ndl_dimg_for_mh(handle & ~1ull);
+        if (!d) {
+            ndl_err("dlsym(%s, %s): invalid handle", htext, name);
+            return 0;
+        }
+        v = (handle & 1) ? ndl_lookup_in(d, usym, &found) : ndl_search_deps(d, usym, &found);
+    }
+    if (!found) {
+        ndl_err("dlsym(%s, %s): symbol not found", htext, name);
+        return 0;
+    }
+    return v;
+}
+
+int ocerz_dyld_native_dlclose(uint64_t handle)
+{
+    ndl_err_clear();
+    if (handle == NDL_DEFAULT || handle == NDL_MAIN_ONLY || ndl_dimg_for_mh(handle & ~1ull))
+        return 0;
+    ndl_err("dlclose(%#llx): invalid handle", (unsigned long long)handle);
+    return -1;
+}
+
+typedef struct NdlSym {
+    uint64_t addr;
+    char *name;
+} NdlSym;
+
+typedef struct NdlSyms {
+    NdlSym *v;
+    int n;
+    int cap;
+    uint64_t lo;
+    uint64_t hi;
+} NdlSyms;
+
+static NdlSyms *_Atomic g_ndl_syms[DYN_DIMG_MAX];
+static pthread_mutex_t g_ndl_syms_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int ndl_syms_add(void *ctx, const char *name, uint64_t value, uint64_t flags)
+{
+    NdlSyms *s = ctx;
+    if ((flags & 0x08) || (flags & 0x03) == 0x02 || value < s->lo || value >= s->hi)
+        return 0;
+    if (s->n == s->cap) {
+        int cap = s->cap ? s->cap * 2 : 256;
+        NdlSym *grown = realloc(s->v, (size_t)cap * sizeof *grown);
+        if (!grown)
+            return 1;
+        s->v = grown;
+        s->cap = cap;
+    }
+    char *copy = strdup(name);
+    if (!copy)
+        return 1;
+    s->v[s->n].addr = value;
+    s->v[s->n].name = copy;
+    s->n++;
+    return 0;
+}
+
+static int ndl_sym_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const NdlSym *)a)->addr, y = ((const NdlSym *)b)->addr;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static NdlSyms *ndl_syms_of(DynImage *d)
+{
+    long idx = d - g_dimgs;
+    if (idx < 0 || idx >= DYN_DIMG_MAX)
+        return NULL;
+    NdlSyms *s = g_ndl_syms[idx];
+    if (s)
+        return s;
+    pthread_mutex_lock(&g_ndl_syms_lock);
+    s = g_ndl_syms[idx];
+    if (!s) {
+        s = calloc(1, sizeof *s);
+        if (s) {
+            s->lo = d->map_base;
+            s->hi = d->map_base + d->map_size;
+            ocerz_dyld_trie_each(d->slice, d->load_base, ndl_syms_add, s);
+            if (s->n > 1)
+                qsort(s->v, (size_t)s->n, sizeof s->v[0], ndl_sym_cmp);
+            g_ndl_syms[idx] = s;
+        }
+    }
+    pthread_mutex_unlock(&g_ndl_syms_lock);
+    return s;
+}
+
+static int ndl_trie_nearest(DynImage *d, uint64_t addr, uint64_t *sname, uint64_t *saddr)
+{
+    NdlSyms *s = ndl_syms_of(d);
+    if (!s || !s->n || addr < s->v[0].addr)
+        return 0;
+    int lo = 0, hi = s->n - 1;
+    while (lo < hi) {
+        int mid = lo + (hi - lo + 1) / 2;
+        if (s->v[mid].addr <= addr)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    const char *nm = s->v[lo].name;
+    *sname = ocerz_h2g(nm[0] == '_' ? nm + 1 : nm);
+    *saddr = s->v[lo].addr;
+    return 1;
+}
+
+static int ndl_symtab_nearest(uint64_t mh, int64_t slide, uint64_t addr, uint64_t *sname,
+                              uint64_t *saddr)
+{
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
+    uint64_t le_vmaddr = 0, le_fileoff = 0, le_filesize = 0;
+    int have_le = 0;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_SYMTAB) {
+            symoff = rd32(lc + 8);
+            nsyms = rd32(lc + 12);
+            stroff = rd32(lc + 16);
+            strsize = rd32(lc + 20);
+        } else if (cmd == LC_SEGMENT_64 && strncmp((const char *)(lc + 8), "__LINKEDIT", 16) == 0) {
+            le_vmaddr = rd64(lc + 24);
+            le_fileoff = rd64(lc + 40);
+            le_filesize = rd64(lc + 48);
+            have_le = 1;
+        }
+        lc += rd32(lc + 4);
+    }
+    if (!have_le || !nsyms || symoff < le_fileoff || stroff < le_fileoff ||
+        symoff + (uint64_t)nsyms * 16 > le_fileoff + le_filesize ||
+        (uint64_t)stroff + strsize > le_fileoff + le_filesize)
+        return 0;
+    uint64_t symtab = (uint64_t)((int64_t)le_vmaddr + slide) + (symoff - le_fileoff);
+    uint64_t strtab = (uint64_t)((int64_t)le_vmaddr + slide) + (stroff - le_fileoff);
+    uint64_t best = 0, best_strx = 0;
+    int have = 0;
+    for (uint32_t i = 0; i < nsyms; i++) {
+        const uint8_t *e = (const uint8_t *)ocerz_g2h(symtab + (uint64_t)i * 16);
+        uint32_t strx = rd32(e);
+        uint8_t type = e[4];
+        if ((type & 0xe0) || (type & 0x0e) != 0x0e || strx == 0 || strx >= strsize)
+            continue;
+        uint64_t val = (uint64_t)((int64_t)rd64(e + 8) + slide);
+        if (val > addr || (have && val <= best))
+            continue;
+        best = val;
+        best_strx = strx;
+        have = 1;
+    }
+    if (!have)
+        return 0;
+    uint64_t namep = strtab + best_strx;
+    if (*(const char *)ocerz_g2h(namep) == '_')
+        namep++;
+    *sname = namep;
+    *saddr = best;
+    return 1;
+}
+
+static int ndl_host_dladdr(uint64_t addr, uint64_t info)
+{
+    const void *h = ocerz_g2h(addr);
+    Dl_info di;
+    if (ocerz_host_in_guest_reservation(h) || !dladdr(h, &di))
+        return 0;
+    ocerz_st(info + 0x00, 8, di.dli_fname ? ocerz_h2g(di.dli_fname) : 0);
+    ocerz_st(info + 0x08, 8, di.dli_fbase ? ocerz_h2g(di.dli_fbase) : 0);
+    ocerz_st(info + 0x10, 8, di.dli_sname ? ocerz_h2g(di.dli_sname) : 0);
+    ocerz_st(info + 0x18, 8, di.dli_saddr ? ocerz_h2g(di.dli_saddr) : 0);
+    return 1;
+}
+
+int ocerz_dyld_native_dladdr(uint64_t addr, uint64_t info)
+{
+    NdlImage im;
+    if (!info)
+        return 0;
+    if (!ndl_containing(addr, &im, NULL))
+        return ndl_host_dladdr(addr, info);
+    uint64_t sname = 0, saddr = 0;
+    if (!ndl_symtab_nearest(im.mh, im.slide, addr, &sname, &saddr) && im.d && im.d != &g_main_dimg)
+        ndl_trie_nearest(im.d, addr, &sname, &saddr);
+    ocerz_st(info + 0x00, 8, im.name);
+    ocerz_st(info + 0x08, 8, im.mh);
+    ocerz_st(info + 0x10, 8, sname);
+    ocerz_st(info + 0x18, 8, saddr);
+    return 1;
+}
+
+typedef enum NdlKind {
+    NDL_NONE,
+    NDL_MAIN,
+    NDL_LOADED,
+    NDL_VIRTUAL,
+    NDL_FILE,
+    NDL_NATIVE_ONLY,
+    NDL_BAD_FILE,
+} NdlKind;
+
+typedef struct NdlTarget {
+    NdlKind kind;
+    DynImage *img;
+    uint8_t *buf;
+    size_t len;
+    char path[PATH_MAX];
+    char why[PATH_MAX + 128];
+    char tried[NDL_TRIED_BYTES];
+    size_t tried_len;
+} NdlTarget;
+
+static void ndl_tried(NdlTarget *t, const char *cand)
+{
+    size_t room = sizeof t->tried - t->tried_len;
+    int n = snprintf(t->tried + t->tried_len, room, "%s'%s' (no such file)", t->tried_len ? ", " : "", cand);
+    if (n > 0)
+        t->tried_len += (size_t)n < room ? (size_t)n : room - 1;
+}
+
+static int ndl_is_main_path(const char *p)
+{
+    char rp[PATH_MAX];
+    return g_main_hostpath[0] &&
+           (strcmp(p, g_main_hostpath) == 0 || (realpath(p, rp) && strcmp(rp, g_main_hostpath) == 0));
+}
+
+static int ndl_known(const char *p, NdlTarget *t)
+{
+    if (ndl_is_main_path(p)) {
+        t->kind = NDL_MAIN;
+        return 1;
+    }
+    t->img = dimg_find_by_path(p);
+    if (!t->img)
+        t->img = dimg_find_by_install_name(p);
+    if (t->img) {
+        t->kind = NDL_LOADED;
+        return 1;
+    }
+    if (ocerz_vdylib_have(p)) {
+        t->kind = NDL_VIRTUAL;
+        snprintf(t->path, sizeof t->path, "%s", p);
+        return 1;
+    }
+    return 0;
+}
+
+static int ndl_try(const char *cand, NdlTarget *t)
+{
+    char canon[PATH_MAX];
+    const char *c = cand;
+    if (ndl_known(cand, t))
+        return 1;
+    if (ocerz_canon_dylib_path(cand, canon, sizeof canon) && strcmp(canon, cand) != 0) {
+        c = canon;
+        if (ndl_known(c, t))
+            return 1;
+    }
+    uint64_t dev = 0, ino = 0;
+    if (file_identity(c, &dev, &ino)) {
+        if (ocerz_main_mh && dev == g_main_dev && ino == g_main_ino) {
+            t->kind = NDL_MAIN;
+            return 1;
+        }
+        if ((t->img = dimg_find_by_identity(dev, ino))) {
+            t->kind = NDL_LOADED;
+            return 1;
+        }
+        char abs[PATH_MAX];
+        if (!realpath(c, abs))
+            snprintf(abs, sizeof abs, "%s", c);
+        size_t len = 0;
+        uint8_t *buf = read_file(abs, &len);
+        if (!buf) {
+            t->kind = NDL_BAD_FILE;
+            snprintf(t->why, sizeof t->why, "'%s' could not be read", abs);
+            return 1;
+        }
+        uint32_t magic = len >= 4 ? rd32(buf) : 0;
+        if (select_slice(buf, len)) {
+            t->kind = NDL_FILE;
+            t->buf = buf;
+            t->len = len;
+            snprintf(t->path, sizeof t->path, "%s", abs);
+            return 1;
+        }
+        free(buf);
+        if (magic == MH_MAGIC_64 || magic == MH_MAGIC || magic == FAT_MAGIC || magic == FAT_CIGAM ||
+            magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64) {
+            t->kind = NDL_NATIVE_ONLY;
+            snprintf(t->why, sizeof t->why, "'%s' has no x86_64 slice", abs);
+        } else {
+            t->kind = NDL_BAD_FILE;
+            snprintf(t->why, sizeof t->why, "'%s' is not a Mach-O file", abs);
+        }
+        return 1;
+    }
+    const char *real = host_cache_real_path(cand);
+    if (real) {
+        if (ndl_known(real, t))
+            return 1;
+        t->kind = NDL_NATIVE_ONLY;
+        snprintf(t->why, sizeof t->why, "'%s' is in the host's shared cache", real);
+        return 1;
+    }
+    ndl_tried(t, cand);
+    return 0;
+}
+
+static int ndl_try_dirs(const char *list, const char *leaf, NdlTarget *t)
+{
+    for (const char *p = list; p && *p;) {
+        const char *colon = strchr(p, ':');
+        size_t len = colon ? (size_t)(colon - p) : strlen(p);
+        char cand[PATH_MAX];
+        if (len > 0 && snprintf(cand, sizeof cand, "%.*s/%s", (int)len, p, leaf) < (int)sizeof cand &&
+            ndl_try(cand, t))
+            return 1;
+        p += len;
+        if (*p == ':')
+            p++;
+    }
+    return 0;
+}
+
+static RpathList *ndl_rpaths(DynImage *caller)
+{
+    RpathList *own = calloc(1, sizeof *own), *all = calloc(1, sizeof *all);
+    if (!own || !all) {
+        free(own);
+        free(all);
+        return NULL;
+    }
+    if (caller && caller != &g_main_dimg)
+        collect_rpaths(caller, NULL, own);
+    if (g_main_dimg_valid)
+        collect_rpaths(&g_main_dimg, own, all);
+    else
+        memcpy(all, own, sizeof *all);
+    free(own);
+    return all;
+}
+
+static int ndl_resolve(const char *p, DynImage *caller, NdlTarget *t)
+{
+    char cand[PATH_MAX];
+    if (strncmp(p, "@rpath/", 7) == 0) {
+        RpathList *rp = ndl_rpaths(caller);
+        int ok = 0;
+        for (int i = 0; rp && i < rp->n && !ok; i++)
+            if (snprintf(cand, sizeof cand, "%s/%s", rp->entry[i], p + 7) < (int)sizeof cand)
+                ok = ndl_try(cand, t);
+        free(rp);
+        if (!ok && !t->tried_len)
+            ndl_tried(t, p);
+        return ok;
+    }
+    if (p[0] == '@') {
+        if (expand_at_prefix(caller, p, cand, sizeof cand))
+            return ndl_try(cand, t);
+        ndl_tried(t, p);
+        return 0;
+    }
+    if (strchr(p, '/'))
+        return ndl_try(p, t);
+    if (ndl_try_dirs(getenv("DYLD_LIBRARY_PATH"), p, t) || ndl_try(p, t))
+        return 1;
+    const char *fb = getenv("DYLD_FALLBACK_LIBRARY_PATH");
+    return ndl_try_dirs(fb && fb[0] ? fb : "/usr/local/lib:/usr/lib", p, t);
+}
+
+static void rpaths_append(RpathList *dst, const RpathList *src)
+{
+    for (int i = 0; src && i < src->n && dst->n < RPATH_MAX; i++)
+        snprintf(dst->entry[dst->n++], sizeof dst->entry[0], "%s", src->entry[i]);
+}
+
+static DynImage *ndl_load_file(NdlTarget *t, const RpathList *chain)
+{
+    if (g_dimgs_n >= DYN_DIMG_MAX) {
+        native_dl_reason("the loader holds as many images as it can", NULL);
+        return NULL;
+    }
+    DynImage *d = &g_dimgs[g_dimgs_n++];
+    memset(d, 0, sizeof *d);
+    d->slice = select_slice(t->buf, t->len);
+    d->owned_buf = t->buf;
+    t->buf = NULL;
+    snprintf(d->path, sizeof d->path, "%s", t->path);
+    snprintf(d->install_name, sizeof d->install_name, "%s", t->path);
+    file_identity(t->path, &d->file_dev, &d->file_ino);
+    dimg_record_id(d);
+    if (map_segments(d, 0) != OCERZ_OK) {
+        native_dl_reason("its segments could not be mapped", NULL);
+        g_dimgs_n--;
+        free(d->owned_buf);
+        memset(d, 0, sizeof *d);
+        return NULL;
+    }
+    RpathList *rp = calloc(1, sizeof *rp);
+    if (!rp) {
+        native_dl_reason("no memory for its rpaths", NULL);
+        return NULL;
+    }
+    collect_rpaths(d, NULL, rp);
+    rpaths_append(rp, chain);
+    load_disk_deps(g_run_cache, d, rp);
+    free(rp);
+    if (apply_fixups(d, g_run_cache) != OCERZ_OK) {
+        native_dl_reason("its chained fixups use a pointer format ocerz does not apply", NULL);
+        return NULL;
+    }
+    if (d->cf_off == 0)
+        apply_classic_fixups(d, g_run_cache);
+    protect_ro_segments(d);
+    d->seq = ++g_dimg_seq;
+    OCERZ_LOG("dynamic: native dlopen loaded %s at load_base=%#llx slide=%#llx\n", d->path,
+              (unsigned long long)d->load_base, (unsigned long long)d->slide);
+    return d;
+}
+
+static void ndl_rollback(int before)
+{
+    for (int i = g_dimgs_n - 1; i >= before; i--) {
+        DynImage *d = &g_dimgs[i];
+        if (d->map_size)
+            ocerz_unmap(d->map_base, d->map_size);
+        free(d->owned_buf);
+        memset(d, 0, sizeof *d);
+    }
+    g_dimgs_n = before;
+}
+
+static uint64_t *g_ndl_add_funcs;
+static int g_ndl_add_n, g_ndl_add_cap;
+static uint64_t *g_ndl_remove_funcs;
+static int g_ndl_remove_n, g_ndl_remove_cap;
+
+static int ndl_append_func(uint64_t **arr, int *n, int *cap, uint64_t fn)
+{
+    if (*n == *cap) {
+        int c = *cap ? *cap * 2 : 16;
+        uint64_t *grown = realloc(*arr, (size_t)c * sizeof *grown);
+        if (!grown)
+            return 0;
+        *arr = grown;
+        *cap = c;
+    }
+    (*arr)[(*n)++] = fn;
+    return 1;
+}
+
+static void ndl_call_add(struct OcerzVM *vm, uint64_t fn, uint64_t mh, int64_t slide,
+                         uint64_t stack_top)
+{
+    uint64_t args[2] = { mh, (uint64_t)slide };
+    ocerz_vm_call(vm, fn, args, 2, stack_top);
+}
+
+int ocerz_dyld_native_add_image_func(struct OcerzVM *vm, uint64_t func, uint64_t stack_top)
+{
+    if (!func)
+        return 0;
+    pthread_mutex_lock(&g_load_lock);
+    int ok = ndl_append_func(&g_ndl_add_funcs, &g_ndl_add_n, &g_ndl_add_cap, func);
+    uint32_t n = ok ? ocerz_dyld_image_count() : 0;
+    NdlImage im;
+    for (uint32_t i = 0; i < n && !vm->exited; i++)
+        if (ndl_image(i, &im))
+            ndl_call_add(vm, func, im.mh, im.slide, stack_top);
+    pthread_mutex_unlock(&g_load_lock);
+    return ok;
+}
+
+int ocerz_dyld_native_remove_image_func(uint64_t func)
+{
+    if (!func)
+        return 0;
+    pthread_mutex_lock(&g_load_lock);
+    int ok = ndl_append_func(&g_ndl_remove_funcs, &g_ndl_remove_n, &g_ndl_remove_cap, func);
+    pthread_mutex_unlock(&g_load_lock);
+    return ok;
+}
+
+static int ndl_seq_cmp(const void *a, const void *b)
+{
+    uint32_t x = (*(DynImage *const *)a)->seq, y = (*(DynImage *const *)b)->seq;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static void ndl_fail_load(const char *path, int mode, DynImage *top, int miss_before)
+{
+    if (!top) {
+        ndl_err("dlopen(%s, 0x%04x): %s", path, mode,
+                g_ndl.reason[0] ? g_ndl.reason : "it could not be loaded");
+    } else if (g_ndl.missing[0]) {
+        ndl_err("dlopen(%s, 0x%04x): Library not loaded: %s\n  Referenced from: %s\n  Reason: %s", path,
+                mode, g_ndl.missing, g_ndl.missing_from, g_ndl.reason);
+    } else if (g_native_miss_n > miss_before) {
+        const struct native_miss *m = &g_native_miss[miss_before];
+        ndl_err("dlopen(%s, 0x%04x): Symbol not found: %s\n  Referenced from: %s\n  Expected in: %s", path,
+                mode, m->sym, m->from, m->lib);
+    } else {
+        ndl_err("dlopen(%s, 0x%04x): more symbols were not found than ocerz keeps a record of", path, mode);
+    }
+}
+
+static uint64_t ndl_dlopen_locked(struct OcerzVM *vm, const char *path, int mode, uint64_t caller,
+                                  uint64_t stack_top)
+{
+    ndl_err_clear();
+    if (!path)
+        return (mode & NDL_RTLD_FIRST) ? NDL_MAIN_ONLY : NDL_DEFAULT;
+
+    NdlImage cim;
+    DynImage *caller_d = ndl_containing(caller, &cim, NULL) ? cim.d : NULL;
+    NdlTarget *t = calloc(1, sizeof *t);
+    if (!t) {
+        ndl_err("dlopen(%s, 0x%04x): no memory", path, mode);
+        return 0;
+    }
+    uint64_t first = (mode & NDL_RTLD_FIRST) ? 1 : 0;
+    int load = 0;
+    uint64_t handle = 0;
+    if (!ndl_resolve(path, caller_d, t)) {
+        ndl_err("dlopen(%s, 0x%04x): tried: %s", path, mode, t->tried);
+    } else if (t->kind == NDL_MAIN) {
+        handle = ocerz_main_mh | first;
+    } else if (t->kind == NDL_LOADED) {
+        if (!(mode & NDL_RTLD_LOCAL))
+            t->img->local = 0;
+        handle = t->img->load_base | first;
+    } else if (t->kind == NDL_NATIVE_ONLY) {
+        ndl_err("dlopen(%s, 0x%04x): native library without an API database: %s", path, mode, t->why);
+    } else if (t->kind == NDL_BAD_FILE) {
+        ndl_err("dlopen(%s, 0x%04x): %s", path, mode, t->why);
+    } else if (mode & NDL_RTLD_NOLOAD) {
+        ndl_err("dlopen(%s, 0x%04x): not loaded, and RTLD_NOLOAD forbids loading it", path, mode);
+    } else {
+        load = 1;
+    }
+    if (!load) {
+        free(t->buf);
+        free(t);
+        return handle;
+    }
+
+    int before = g_dimgs_n;
+    int miss_before = g_native_miss_n, dropped_before = g_native_miss_dropped;
+    memset(&g_ndl, 0, sizeof g_ndl);
+    g_ndl.active = 1;
+    DynImage *top;
+    if (t->kind == NDL_VIRTUAL) {
+        top = load_disk_dylib(g_run_cache, t->path, NULL, NULL);
+    } else {
+        RpathList *chain = ndl_rpaths(caller_d);
+        top = ndl_load_file(t, chain);
+        free(chain);
+    }
+    g_ndl.active = 0;
+    free(t->buf);
+    free(t);
+    if (!top || g_ndl.missing[0] || g_native_miss_n > miss_before ||
+        g_native_miss_dropped > dropped_before) {
+        ndl_fail_load(path, mode, top, miss_before);
+        g_native_miss_n = miss_before;
+        g_native_miss_dropped = dropped_before;
+        ndl_rollback(before);
+        return 0;
+    }
+
+    int after = g_dimgs_n;
+    if (mode & NDL_RTLD_LOCAL)
+        top->local = 1;
+    native_publish();
+    native_tlv_register_loaded(ocerz_main_mh);
+
+    int nf = g_ndl_add_n;
+    for (int f = 0; f < nf && !vm->exited; f++)
+        for (int i = before; i < after && !vm->exited; i++)
+            ndl_call_add(vm, g_ndl_add_funcs[f], g_dimgs[i].load_base, (int64_t)g_dimgs[i].slide,
+                         stack_top);
+
+    DynImage *order[DYN_DIMG_MAX];
+    int n = 0;
+    for (int i = before; i < after; i++)
+        if (!g_dimgs[i].is_virtual)
+            order[n++] = &g_dimgs[i];
+    if (n > 1)
+        qsort(order, (size_t)n, sizeof order[0], ndl_seq_cmp);
+    for (int i = 0; i < n; i++) {
+        const uint8_t *h = (const uint8_t *)ocerz_g2h(order[i]->load_base);
+        ocerz_objcbridge_fix_selrefs(h, (int64_t)order[i]->slide);
+        ocerz_objcbridge_define_image(h, (int64_t)order[i]->slide);
+    }
+    if (dimg_find_by_install_name(OCERZ_OBJC_LIBOBJC))
+        ocerz_objcbridge_install_uncaught();
+    for (int i = 0; i < n && !vm->exited; i++) {
+        ocerz_objcbridge_run_image_loads(vm, (const uint8_t *)ocerz_g2h(order[i]->load_base), stack_top);
+        if (!vm->exited)
+            run_image_inits(vm, order[i]->load_base, g_native_init_args, stack_top);
+    }
+    return top->load_base | first;
+}
+
+uint64_t ocerz_dyld_native_dlopen(struct OcerzVM *vm, const char *path, int mode, uint64_t caller,
+                                  uint64_t stack_top)
+{
+    int log = getenv("OCERZ_DLOPENLOG") != NULL;
+    if (log)
+        fprintf(stderr, "ocerz: DLOPEN \"%s\" mode=%#x\n", path ? path : "(null)", mode);
+    pthread_mutex_lock(&g_load_lock);
+    uint64_t h = ndl_dlopen_locked(vm, path, mode, caller, stack_top);
+    pthread_mutex_unlock(&g_load_lock);
+    if (log)
+        fprintf(stderr, "ocerz: DLOPEN \"%s\" -> %#llx\n", path ? path : "(null)", (unsigned long long)h);
+    return h;
+}
+
+int ocerz_dyld_native_dlopen_preflight(const char *path, uint64_t caller)
+{
+    int ok = 0;
+    pthread_mutex_lock(&g_load_lock);
+    ndl_err_clear();
+    NdlImage cim;
+    DynImage *caller_d = ndl_containing(caller, &cim, NULL) ? cim.d : NULL;
+    NdlTarget *t = path ? calloc(1, sizeof *t) : NULL;
+    if (!path) {
+        ok = 1;
+    } else if (!t) {
+        ndl_err("dlopen_preflight(%s): no memory", path);
+    } else if (!ndl_resolve(path, caller_d, t)) {
+        ndl_err("dlopen_preflight(%s): tried: %s", path, t->tried);
+    } else if (t->kind == NDL_NATIVE_ONLY) {
+        ndl_err("dlopen_preflight(%s): native library without an API database: %s", path, t->why);
+    } else if (t->kind == NDL_BAD_FILE) {
+        ndl_err("dlopen_preflight(%s): %s", path, t->why);
+    } else {
+        ok = 1;
+    }
+    if (t)
+        free(t->buf);
+    free(t);
+    pthread_mutex_unlock(&g_load_lock);
+    return ok;
+}
+
+int ocerz_dyld_native_names_library(const char *path)
+{
+    char canon[PATH_MAX];
+    if (!path || !path[0])
+        return 0;
+    if (ocerz_vdylib_have(path))
+        return 1;
+    if (ocerz_canon_dylib_path(path, canon, sizeof canon) && strcmp(canon, path) != 0 &&
+        ocerz_vdylib_have(canon))
+        return 1;
+    const char *real = host_cache_real_path(path);
+    return real && ocerz_vdylib_have(real);
+}
+
+typedef struct NdlBuildVersion {
+    uint32_t platform;
+    uint32_t version;
+} NdlBuildVersion;
+
+typedef struct NdlHostDyld {
+    bool (*immutable)(const void *addr, size_t len);
+    bool (*sdk_at_least)(const void *mh, NdlBuildVersion v);
+    bool (*minos_at_least)(const void *mh, NdlBuildVersion v);
+} NdlHostDyld;
+
+static NdlHostDyld g_ndl_host;
+static pthread_once_t g_ndl_host_once = PTHREAD_ONCE_INIT;
+
+static void ndl_host_init(void)
+{
+    g_ndl_host.immutable = (bool (*)(const void *, size_t))dlsym(RTLD_DEFAULT, "_dyld_is_memory_immutable");
+    g_ndl_host.sdk_at_least = (bool (*)(const void *, NdlBuildVersion))dlsym(RTLD_DEFAULT, "dyld_sdk_at_least");
+    g_ndl_host.minos_at_least =
+        (bool (*)(const void *, NdlBuildVersion))dlsym(RTLD_DEFAULT, "dyld_minos_at_least");
+}
+
+static const NdlHostDyld *ndl_host(void)
+{
+    pthread_once(&g_ndl_host_once, ndl_host_init);
+    return &g_ndl_host;
+}
+
+int ocerz_dyld_is_memory_immutable(uint64_t addr, uint64_t len)
+{
+    uint32_t n = ocerz_dyld_image_count();
+    NdlImage im;
+    for (uint32_t i = 0; i < n; i++) {
+        int ro = 0;
+        if (ndl_image(i, &im) && ndl_covers(im.mh, addr, len, &ro))
+            return ro;
+    }
+    const void *h = ocerz_g2h(addr);
+    if (ocerz_host_in_guest_reservation(h) || !ndl_host()->immutable)
+        return 0;
+    return ndl_host()->immutable(h, (size_t)len) ? 1 : 0;
+}
+
+static int ndl_is_image(uint64_t mh)
+{
+    uint64_t slide;
+    return mh && ocerz_dyld_image_slide(mh, &slide);
+}
+
+int ocerz_dyld_build_version(uint64_t mh, uint32_t *platform, uint32_t *minos, uint32_t *sdk)
+{
+    *platform = *minos = *sdk = 0;
+    if (!ndl_is_image(mh))
+        return 0;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_BUILD_VERSION) {
+            *platform = rd32(lc + 8);
+            *minos = rd32(lc + 12);
+            *sdk = rd32(lc + 16);
+            return 1;
+        }
+        if (cmd == LC_VERSION_MIN_MACOSX) {
+            *platform = PLATFORM_MACOS;
+            *minos = rd32(lc + 8);
+            *sdk = rd32(lc + 12);
+            return 1;
+        }
+        lc += rd32(lc + 4);
+    }
+    return 0;
+}
+
+int ocerz_dyld_version_at_least(uint64_t mh, uint64_t version, int sdk)
+{
+    NdlBuildVersion v = { (uint32_t)version, (uint32_t)(version >> 32) };
+    uint32_t platform, minos, have;
+    if (!ocerz_dyld_build_version(mh, &platform, &minos, &have))
+        return 0;
+    bool (*host)(const void *, NdlBuildVersion) = sdk ? ndl_host()->sdk_at_least : ndl_host()->minos_at_least;
+    if (host)
+        return host(ocerz_g2h(mh), v) ? 1 : 0;
+    if (v.platform == 0xffffffffu)
+        return 1;
+    return v.platform == platform && (sdk ? have : minos) >= v.version;
 }
 
 static uint32_t native_image_minos(const uint8_t *mh)
@@ -3041,6 +4400,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         return 71;
     }
     if (ocerz_mode == OCERZ_MODE_NATIVE) {
+        native_publish();
         native_tlv_register_loaded(img.load_base);
         ocerz_objcbridge_fix_selrefs((const uint8_t *)ocerz_g2h(img.load_base), img.slide);
         ocerz_objcbridge_define_image((const uint8_t *)ocerz_g2h(img.load_base), img.slide);
@@ -3198,11 +4558,13 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     }
 
     if (ocerz_mode == OCERZ_MODE_NATIVE) {
+        uint64_t nia[5] = { fr.argc, fr.argv_arr, fr.envp_arr, fr.apple_arr, fr.progvars };
+        memcpy(g_native_init_args, nia, sizeof nia);
+        int loaded = g_dimgs_n;
         ocerz_objcbridge_run_loads(vm, fr.stack_top);
         if (vm->exited)
             return vm->exit_code;
-        uint64_t nia[5] = { fr.argc, fr.argv_arr, fr.envp_arr, fr.apple_arr, fr.progvars };
-        for (int i = g_dimgs_n - 1; i >= 0 && !vm->exited; i--)
+        for (int i = loaded - 1; i >= 0 && !vm->exited; i--)
             run_image_inits(vm, g_dimgs[i].load_base, nia, fr.stack_top);
         if (!vm->exited)
             run_image_inits(vm, img.load_base, nia, fr.stack_top);

@@ -78,8 +78,11 @@
  * code on the calling thread below stack_top, inside a native autorelease pool,
  * and answers how many ran; the queue is empty afterwards.  The loader calls it
  * in native mode once, after the guest's thread state is set up and before
- * main.  ocerz_objcbridge_is_defined answers whether ocerz defined a guest class
- * at that address.
+ * main.  ocerz_objcbridge_run_image_loads runs, the same way, only the queued
+ * +load methods that defining the image at mh queued, and leaves the rest
+ * queued; a dlopen calls it for each image it loaded, just before that image's
+ * initializers.  ocerz_objcbridge_is_defined answers whether ocerz defined a
+ * guest class at that address.
  *
  * ---- guest layouts ----
  * The readers take guest addresses and read the LP64 layouts both
@@ -249,6 +252,7 @@ int ocerz_objcbridge_fix_selrefs(const uint8_t *mh, int64_t slide);
 void ocerz_objcbridge_install_uncaught(void);
 int ocerz_objcbridge_define_image(const uint8_t *mh, int64_t slide);
 int ocerz_objcbridge_run_loads(struct OcerzVM *vm, uint64_t stack_top);
+int ocerz_objcbridge_run_image_loads(struct OcerzVM *vm, const uint8_t *mh, uint64_t stack_top);
 int ocerz_objcbridge_is_defined(uint64_t cls);
 void *ocerz_objcbridge_dead_imp(void);
 

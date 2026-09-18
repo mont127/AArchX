@@ -4,7 +4,7 @@ exports 9653
 fn 2675
 data 497
 var 1
-special 26
+special 58
 stub block 63
 stub callback-result 1
 stub callback-struct 58
@@ -15,7 +15,7 @@ stub long-double 73
 stub no-arm64-declaration 26
 stub no-declaration 4883
 stub no-prototype 2
-stub override 522
+stub override 490
 stub struct-too-many-members 2
 stub va-list 10
 stub variadic 32

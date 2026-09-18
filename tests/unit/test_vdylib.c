@@ -131,6 +131,14 @@
  * follow the files' order in the directory rather than the order they were
  * built in.  The child sends its counts back through a pipe, because the
  * database a process reads is chosen once.
+ *
+ * ocerz_dyld_trie_each, which dladdr uses to name an address inside a
+ * synthesized image, is walked over both real images and held to the resolver:
+ * it has to visit exactly the names ocerz_dyld_trie_resolve finds among the
+ * database's records, each once, each at the value the resolver answers at the
+ * same load base, absolute terminals unshifted.  A visitor that asks to stop is
+ * obeyed at once, and a trie whose declared size ends inside its root node is
+ * refused with -1 rather than walked past its end.
  */
 #include "ocerz/vdylib.h"
 #include "ocerz/apidb.h"
@@ -1689,6 +1697,81 @@ static void synth_child(void)
         fprintf(stderr, "test_vdylib: could not remove %s\n", root);
 }
 
+typedef struct TrieSeen {
+    const uint8_t *img;
+    const OcerzApiLibrary *api;
+    const char *what;
+    int visited;
+    int stop_at;
+} TrieSeen;
+
+static int trie_seen_visit(void *ctx, const char *name, uint64_t value, uint64_t flags)
+{
+    TrieSeen *t = ctx;
+    int found = 0;
+    uint64_t want = ocerz_dyld_trie_resolve(t->img, LOAD_BASE, name, &found);
+    t->visited++;
+    CHECK(found && want == value, "%s: the trie walk visits %s at %#llx (flags %#llx), where the "
+          "resolver answers %s%#llx", t->what, name, (unsigned long long)value,
+          (unsigned long long)flags, found ? "" : "nothing, not ", (unsigned long long)want);
+    CHECK(ocerz_apidb_find(t->api, name) != NULL, "%s: the trie walk visits %s, which the database "
+          "does not name", t->what, name);
+    return t->stop_at && t->visited == t->stop_at;
+}
+
+static void check_trie_each_of(const char *what, const char *install_name)
+{
+    size_t len = 0;
+    uint8_t *img = ocerz_vdylib_image(install_name, &len);
+    const OcerzApiLibrary *api = ocerz_apidb_library(install_name);
+    CHECK(img != NULL && api != NULL, "%s: no image or no database to walk", what);
+    if (!img || !api) {
+        free(img);
+        return;
+    }
+    int expected = 0;
+    for (int i = 0; i < api->nentries; i++) {
+        int found = 0;
+        ocerz_dyld_trie_resolve(img, LOAD_BASE, api->entries[i].export_name, &found);
+        expected += found;
+    }
+    TrieSeen t = { img, api, what, 0, 0 };
+    int n = ocerz_dyld_trie_each(img, LOAD_BASE, trie_seen_visit, &t);
+    CHECK(n == expected && t.visited == expected, "%s: the trie walk answered %d and visited %d "
+          "terminals, where the resolver finds %d of the database's names", what, n, t.visited,
+          expected);
+
+    TrieSeen early = { img, api, what, 0, 10 };
+    ocerz_dyld_trie_each(img, LOAD_BASE, trie_seen_visit, &early);
+    CHECK(early.visited == 10, "%s: a visitor that asked to stop at 10 was called %d times", what,
+          early.visited);
+
+    uint32_t ncmds = 0;
+    memcpy(&ncmds, img + 16, 4);
+    uint8_t *lc = img + 32;
+    int cut = 0;
+    for (uint32_t i = 0; i < ncmds && !cut; i++) {
+        uint32_t cmd = 0, size = 0, two = 2;
+        memcpy(&cmd, lc, 4);
+        memcpy(&size, lc + 4, 4);
+        if (cmd == 0x80000033) {
+            memcpy(lc + 12, &two, 4);
+            cut = 1;
+        }
+        lc += size;
+    }
+    CHECK(cut, "%s: the image has no LC_DYLD_EXPORTS_TRIE to cut short", what);
+    CHECK(ocerz_dyld_trie_each(img, LOAD_BASE, NULL, NULL) == -1,
+          "%s: a trie cut to two bytes was walked instead of refused", what);
+    free(img);
+}
+
+static void check_trie_each(void)
+{
+    check_trie_each_of("libSystem", kLib);
+    check_trie_each_of("CoreFoundation", kCF);
+}
+
 int main(void)
 {
     setenv("OCERZ_APIDB", "runtime/apis", 0);
@@ -1703,6 +1786,7 @@ int main(void)
     check_xmm_contracts();
     check_libsystem_database();
     check_corefoundation();
+    check_trie_each();
 
     CHECK(late != NULL, "a child that built CoreFoundation before libSystem sent nothing back");
     size_t early_len = 0;

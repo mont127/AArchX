@@ -90,11 +90,33 @@
 # its own x86 ones.  Unwinding is the same problem for C++: _Unwind_*, the unw_*
 # cursor API and frame registration walk host frames, not guest frames.
 #
-# Dynamic loading: dlopen and its relatives, every _dyld_* and dyld_* call, and
-# the NSModule-era dyld API answer from host dyld, which has never heard of any
-# image ocerz's loader mapped.  The getsect and get_end family read the host's
-# main executable, which is ocerz.  dyld_stub_binder is only reached by a lazy
-# bind the loader failed to make, so a stub that names it is the honest answer.
+# Dynamic loading.  Host dyld has never heard of an image ocerz's loader
+# mapped, and the host's dlopen would load arm64 code, so none of this family
+# can cross.  dlopen, dlopen_audited, dlopen_from, dlopen_preflight, dlsym,
+# dladdr, dlclose and dlerror are special records ocerz answers from its own
+# loader: a guest x86_64 dylib or bundle is loaded, bound and initialized the
+# way one linked at launch is, a library a database describes answers with its
+# synthesized image, and an arm64 library with no database is refused by name.
+# So is the half of the dyld API a program walks its images with: the count,
+# the header, name and slide of an index, the slide of a header, the add-image
+# and remove-image registrations, the image containing an address as a header,
+# a path or a yes or no, and the program's own header.  The program's SDK,
+# minimum OS and platform and their at-least forms are answered from the guest
+# main image's LC_BUILD_VERSION, and the per-image forms for any image the
+# loader holds.  _dyld_is_memory_immutable answers from a guest image's segment
+# protection and asks host dyld about native memory.  Native mode has no x86
+# shared cache, so dyld_shared_cache_some_image_overridden answers no, and
+# _dyld_shared_cache_contains_path answers yes exactly for the libraries a
+# database describes, which stand where the cache's did and are no more on disk
+# than those were: a caller that asks before it dlopens, as ctypes does, finds
+# them.  Every other _dyld_* and dyld_* call stays a stub - the UUID and
+# section queries, process info, the shared-cache iterators, the Objective-C
+# and Swift preoptimization hooks, pseudo-dylibs, the fork hooks and the old
+# lookup-and-bind calls describe host dyld's own images and tables, none of
+# which is the guest's - and so does the NSModule-era API.  The getsect and
+# get_end family read the host's main executable, which is ocerz.
+# dyld_stub_binder is only reached by a lazy bind the loader failed to make, so
+# a stub that names it is the honest answer.
 #
 # Process identity: host dyld's _NSGetExecutablePath names ocerz's executable and
 # _NSGetMachExecuteHeader ocerz's header, so both are specials answering the
@@ -368,14 +390,38 @@ stub ___unw_* override
 stub ___register_frame override
 stub ___deregister_frame override
 
-stub _dlopen override
-stub _dlopen_preflight override
-stub _dlopen_from override
-stub _dlopen_audited override
-stub _dlsym override
-stub _dladdr override
-stub _dlclose override
-stub _dlerror override
+special _dlopen dlopen
+special _dlopen_audited dlopen
+special _dlopen_from dlopen_from
+special _dlopen_preflight dlopen_preflight
+special _dlsym dlsym
+special _dladdr dladdr
+special _dlclose dlclose
+special _dlerror dlerror
+special __dyld_image_count dyld_image_count
+special __dyld_get_image_header dyld_image_header
+special __dyld_get_image_name dyld_image_name
+special __dyld_get_image_vmaddr_slide dyld_image_vmaddr_slide
+special __dyld_get_image_slide dyld_image_slide
+special __dyld_register_func_for_add_image dyld_register_add_image
+special __dyld_register_func_for_remove_image dyld_register_remove_image
+special __dyld_get_image_header_containing_address dyld_image_header_containing
+special _dyld_image_header_containing_address dyld_image_header_containing
+special _dyld_image_path_containing_address dyld_image_path_containing
+special __dyld_image_containing_address dyld_image_containing
+special __dyld_get_prog_image_header dyld_prog_image_header
+special _dyld_get_program_sdk_version dyld_program_sdk_version
+special _dyld_get_program_min_os_version dyld_program_min_os_version
+special _dyld_get_sdk_version dyld_sdk_version
+special _dyld_get_min_os_version dyld_min_os_version
+special _dyld_get_active_platform dyld_active_platform
+special _dyld_program_sdk_at_least dyld_program_sdk_at_least
+special _dyld_program_minos_at_least dyld_program_minos_at_least
+special _dyld_sdk_at_least dyld_sdk_at_least
+special _dyld_minos_at_least dyld_minos_at_least
+special __dyld_is_memory_immutable dyld_is_memory_immutable
+special _dyld_shared_cache_some_image_overridden dyld_cache_some_image_overridden
+special __dyld_shared_cache_contains_path dyld_cache_contains_path
 stub _dyld_* override
 stub __dyld_* override
 stub _NSAddImage override

@@ -41,6 +41,21 @@
  * pinned here as well, because a process gets one map and malloc's return is
  * only expressible as a guest address in this one.
  *
+ * The dynamic-loading exports are special records, and each one has to have a
+ * descriptor and be exported, since a guest that loads code at run time stops
+ * on the first that does not.  Driven the same way, with no image loaded, which
+ * is where a unit test stands: dlerror answers null until something fails and
+ * then the message once, a dlsym that misses names the handle as dyld prints it
+ * and the symbol, dlopen(NULL) answers RTLD_DEFAULT and under RTLD_FIRST
+ * RTLD_MAIN_ONLY, a path nothing provides fails with the paths it tried, a
+ * library the host's shared cache has but no database describes fails as a
+ * native library without one, dlclose answers 0 for RTLD_DEFAULT and -1 with a
+ * message for a handle no image has, the image list is empty, no cache image is
+ * overridden, _dyld_shared_cache_contains_path answers for exactly the libraries
+ * a database describes, reached by install name or through the framework's
+ * symlink, and dladdr on a host function answers what the host's dladdr does.
+ * Those run after the report, so they do not move its counts.
+ *
  * The register contract asserted is the one the stub implies.  A guest calls
  * an export with a CALL, so the return address is already on the stack when
  * the stub's jump reaches the trap window; the bridge therefore has to consume
@@ -58,6 +73,7 @@
 #include "ocerz/interp.h"
 
 #include <sys/mman.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,7 +164,7 @@ static const char *const kCFBridged[] = {
 
 static const char *const kNoDescriptor[][2] = {
     { "/usr/lib/libSystem.B.dylib", "dyld_stub_binder" },
-    { "/usr/lib/libSystem.B.dylib", "_dlopen" },
+    { "/usr/lib/libSystem.B.dylib", "__dyld_get_image_uuid" },
     { "/usr/lib/libSystem.B.dylib", "_fork" },
     { "/usr/lib/libSystem.B.dylib", "___stack_chk_guard" },
     { OCERZ_BRIDGE_COREFOUNDATION, "_kCFAllocatorDefault" },
@@ -157,6 +173,21 @@ static const char *const kNoDescriptor[][2] = {
     { "/usr/lib/libSystem.B.dylib", "_CFRetain" },
 };
 #define NNODESC (sizeof kNoDescriptor / sizeof kNoDescriptor[0])
+
+static const char *const kDlSpecials[] = {
+    "_dlopen", "_dlopen_audited", "_dlopen_from", "_dlopen_preflight", "_dlsym", "_dladdr",
+    "_dlclose", "_dlerror", "__dyld_image_count", "__dyld_get_image_header",
+    "__dyld_get_image_name", "__dyld_get_image_vmaddr_slide", "__dyld_get_image_slide",
+    "__dyld_register_func_for_add_image", "__dyld_register_func_for_remove_image",
+    "__dyld_get_image_header_containing_address", "_dyld_image_header_containing_address",
+    "_dyld_image_path_containing_address", "__dyld_image_containing_address",
+    "__dyld_get_prog_image_header", "_dyld_get_program_sdk_version",
+    "_dyld_get_program_min_os_version", "_dyld_get_sdk_version", "_dyld_get_min_os_version",
+    "_dyld_get_active_platform", "_dyld_program_sdk_at_least", "_dyld_program_minos_at_least",
+    "_dyld_sdk_at_least", "_dyld_minos_at_least", "__dyld_is_memory_immutable",
+    "_dyld_shared_cache_some_image_overridden", "__dyld_shared_cache_contains_path",
+};
+#define NDLSPECIALS (sizeof kDlSpecials / sizeof kDlSpecials[0])
 
 static OcerzVM vm;
 static uint64_t scratch;
@@ -347,6 +378,101 @@ static void test_report(void)
     CHECK(strstr(text, first) != NULL, "the busiest export in the report is not _strlen or _strchr");
 }
 
+static uint64_t dl_call(const char *sym, uint64_t a0, uint64_t a1, uint64_t a2)
+{
+    OcerzCPU *cpu = &vm.cpu;
+    const struct OcerzBridgeFn *fn = ocerz_bridge_lookup(kLib, sym);
+    CHECK(fn != NULL, "%s has no bridge descriptor", sym);
+    if (!fn)
+        return RAX_POISON;
+    uint64_t sp = arm_call(cpu, a0, a1, a2);
+    int r = ocerz_bridge_invoke(&vm, cpu, fn);
+    CHECK(r == OCERZ_STEP_OK, "%s: invoke returned %d, want OCERZ_STEP_OK", sym, r);
+    check_return(sym, cpu, sp);
+    return cpu->gpr[OCERZ_RAX];
+}
+
+static const char *dl_text(uint64_t g)
+{
+    return g ? (const char *)ocerz_g2h(g) : "(null)";
+}
+
+static void test_dl_specials(void)
+{
+    size_t len = 0;
+    uint8_t *img = ocerz_vdylib_image(kLib, &len);
+    for (size_t i = 0; i < NDLSPECIALS; i++) {
+        int found = 0;
+        CHECK(ocerz_bridge_lookup(kLib, kDlSpecials[i]) != NULL, "%s has no descriptor", kDlSpecials[i]);
+        if (img)
+            ocerz_dyld_trie_resolve(img, LOAD_BASE, kDlSpecials[i], &found);
+        CHECK(found, "%s is not exported by %s", kDlSpecials[i], kLib);
+    }
+    free(img);
+
+    CHECK(dl_call("_dlerror", 0, 0, 0) == 0, "dlerror answered something before any call failed");
+    CHECK(dl_call("_dlsym", (uint64_t)-2, put_str(scratch + 256, "ocerz_no_such_symbol"), 0) == 0,
+          "dlsym(RTLD_DEFAULT) found a symbol no image exports");
+    uint64_t e = dl_call("_dlerror", 0, 0, 0);
+    CHECK(e && strcmp(dl_text(e), "dlsym(RTLD_DEFAULT, ocerz_no_such_symbol): symbol not found") == 0,
+          "dlerror after a missed dlsym answered '%s'", dl_text(e));
+    CHECK(dl_call("_dlerror", 0, 0, 0) == 0, "dlerror answered a second time for one failure");
+
+    CHECK(dl_call("_dlopen", 0, 2, 0) == (uint64_t)-2, "dlopen(NULL) is not RTLD_DEFAULT");
+    CHECK(dl_call("_dlopen", 0, 0x102, 0) == (uint64_t)-5, "dlopen(NULL, RTLD_FIRST) is not RTLD_MAIN_ONLY");
+    CHECK(dl_call("_dlerror", 0, 0, 0) == 0, "dlerror answered after dlopen(NULL) succeeded");
+
+    CHECK(dl_call("_dlopen", put_str(scratch + 256, "/nonexistent/ocerz/libnope.dylib"), 2, 0) == 0,
+          "dlopen of a path nothing provides answered a handle");
+    e = dl_call("_dlerror", 0, 0, 0);
+    CHECK(e && strstr(dl_text(e), "tried: '/nonexistent/ocerz/libnope.dylib' (no such file)") != NULL,
+          "dlopen of a missing path left '%s'", dl_text(e));
+
+    CHECK(dl_call("_dlopen", put_str(scratch + 256, "/usr/lib/libz.1.dylib"), 2, 0) == 0,
+          "dlopen of a native library with no database answered a handle");
+    e = dl_call("_dlerror", 0, 0, 0);
+    CHECK(e && strstr(dl_text(e), "native library without an API database") != NULL,
+          "dlopen of libz left '%s'", dl_text(e));
+
+    CHECK(dl_call("_dlclose", (uint64_t)-2, 0, 0) == 0, "dlclose(RTLD_DEFAULT) failed");
+    CHECK((uint32_t)dl_call("_dlclose", 0x1234, 0, 0) == 0xffffffffu, "dlclose of a bogus handle did not fail");
+    e = dl_call("_dlerror", 0, 0, 0);
+    CHECK(e && strcmp(dl_text(e), "dlclose(0x1234): invalid handle") == 0,
+          "dlclose of a bogus handle left '%s'", dl_text(e));
+    CHECK(dl_call("_dlsym", 0x1234, put_str(scratch + 256, "strlen"), 0) == 0,
+          "dlsym on a bogus handle found something");
+    e = dl_call("_dlerror", 0, 0, 0);
+    CHECK(e && strcmp(dl_text(e), "dlsym(0x1234, strlen): invalid handle") == 0,
+          "dlsym on a bogus handle left '%s'", dl_text(e));
+
+    CHECK((uint32_t)dl_call("__dyld_image_count", 0, 0, 0) == 0, "an image list with nothing loaded is not empty");
+    CHECK(dl_call("__dyld_get_image_header", 0, 0, 0) == 0, "image 0 has a header with nothing loaded");
+    CHECK(dl_call("_dyld_shared_cache_some_image_overridden", 0, 0, 0) == 0,
+          "an image of a cache native mode does not have is overridden");
+    CHECK(dl_call("__dyld_shared_cache_contains_path", put_str(scratch + 256, kLib), 0, 0) == 1,
+          "libSystem, which a database describes, is not a library the cache contains");
+    CHECK(dl_call("__dyld_shared_cache_contains_path",
+                  put_str(scratch + 256, "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"),
+                  0, 0) == 1,
+          "CoreFoundation reached through its framework symlink is not a library the cache contains");
+    CHECK(dl_call("__dyld_shared_cache_contains_path", put_str(scratch + 256, "/usr/lib/libz.1.dylib"), 0, 0) == 0,
+          "libz, which no database describes, is a library the cache contains");
+
+    uint64_t info = scratch + 512;
+    Dl_info host;
+    memset(ocerz_g2h(info), 0, 32);
+    CHECK(dladdr((const void *)strlen, &host) != 0, "the host's dladdr does not know strlen");
+    CHECK(dl_call("_dladdr", ocerz_h2g((const void *)strlen), info, 0) == 1,
+          "dladdr on the host's strlen answered nothing");
+    CHECK(ocerz_ld(info + 0x08, 8) == ocerz_h2g(host.dli_fbase) &&
+          ocerz_ld(info + 0x18, 8) == ocerz_h2g(host.dli_saddr) &&
+          strcmp(dl_text(ocerz_ld(info + 0x10, 8)), host.dli_sname) == 0,
+          "dladdr on the host's strlen answered base %#llx symbol %s, where the host says %p %s",
+          (unsigned long long)ocerz_ld(info + 0x08, 8), dl_text(ocerz_ld(info + 0x10, 8)), host.dli_fbase,
+          host.dli_sname);
+    CHECK(dl_call("_dladdr", scratch, info, 0) == 0, "dladdr on guest memory no image holds answered something");
+}
+
 static void test_invoke_int(void)
 {
     OcerzCPU *cpu = &vm.cpu;
@@ -472,6 +598,7 @@ int main(void)
     test_invoke_heap();
     test_race();
     test_report();
+    test_dl_specials();
 
     return report();
 }
