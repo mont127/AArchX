@@ -1122,12 +1122,59 @@
 # seconds, and a run that stops names the last progress note, which says
 # whether NSApplicationMain ever reached the delegate.
 #
-# The callback, attach, thread, tlv_*, signal_*, cf_*, M10, M11 and app_bundle
-# cases skip where there is no x86_64 clang, like the others, but a fixture of
-# theirs that fails to compile where a trivial x86_64 program compiles fine is a
-# failure: skipping it would hide a broken fixture indefinitely. So is a cf_*,
-# M10, M11 or app_bundle fixture whose arm64 build fails to compile where its
-# x86_64 build did, since that leaves the case without its host oracle.
+# Native mode loads code at run time the way dyld does, and dl_basic pins it
+# against the host's own dyld. The fixture is an Objective-C program that
+# registers an add-image callback before it loads anything, then dlopens a
+# guest dylib it was never linked against. That dylib has a class with a +load
+# method, a category on NSString, a C constructor that calls getpid so clang
+# cannot fold it into static data, an exported function, an exported int and a
+# thread-local variable, and it is reached by absolute path, @executable_path,
+# @rpath and @loader_path, all of which must answer the same handle. The
+# program then dlopens a bundle linked with -bundle_loader against the program
+# itself, whose class subclasses a class the program defines and calls super
+# through it, which is the plug-in shape: its import of the host class is bound
+# to the main executable. Around those it checks dlsym on the handle, on
+# RTLD_DEFAULT, RTLD_NEXT, RTLD_SELF and RTLD_MAIN_ONLY and on an RTLD_FIRST
+# handle, dlsym(RTLD_DEFAULT, "strlen") called through the pointer it answers,
+# RTLD_NOLOAD, RTLD_LOCAL and a later RTLD_GLOBAL, dlclose, dlopen_preflight,
+# dladdr on the dylib's function and one byte into it, dlerror's text, its
+# once-only answer and its being per thread, the image list, the callback's
+# count and the images it saw, and the program's SDK and platform. Each group
+# prints one status line with a bitmask, the way the M10 cases do, and the same
+# source is compiled for arm64 and run directly on the host, with its dylib,
+# bundle and second dylib built for arm64 beside it, so the host's dyld is the
+# oracle: native mode's stdout under the JIT and under -no-jit must equal it
+# byte for byte. Cache mode is compared only on the groups it answers the same
+# way, images, load, sym, path, strlen, dladdr, plugin and version. Its dlopen
+# expands no @executable_path, @loader_path or @rpath; its dlsym on a handle
+# searches that image alone, finds none of the program's symbols through the
+# handle dlopen(NULL) answers, finds the program's own through RTLD_NEXT from the
+# program, and answers through a handle nothing issued, which dlclose accepts;
+# its dlerror answers the same message twice and records none for a missed
+# dlsym; it ignores RTLD_LOCAL; it calls no add-image callback; and a guest
+# dylib it dlopens gets its classes but never its +load methods, which Rosetta
+# runs. So the order, dlerror, rpath, handles, local and callbacks groups would
+# fail there for reasons that belong to cache mode.
+#
+# dl_refusals is native mode's own: every dlopen it makes must fail, and fail
+# with a message that says why, the image count unchanged afterwards and a
+# second dlerror answering nothing. An arm64-only dylib on disk, a library the
+# host's shared cache has but no API database describes, reached by path and by
+# the bare name libz.dylib, a guest dylib whose dependency has been deleted,
+# and one whose dependency no longer exports a symbol it imports, twice, with
+# the same message both times, which is what a load that was not rolled back
+# would change. After them a plain guest dylib still loads, libc.dylib answers
+# the synthesized libSystem, whose strlen is the program's own, and
+# CoreFoundation, which the program does not link, loads through its
+# framework's symlink as a synthesized image under its Versions/A install name.
+# The failure messages are printed and each is checked for its reason.
+#
+# The callback, attach, thread, tlv_*, signal_*, cf_*, M10, M11, app_bundle and
+# dl_* cases skip where there is no x86_64 clang, like the others, but a fixture
+# of theirs that fails to compile where a trivial x86_64 program compiles fine is
+# a failure: skipping it would hide a broken fixture indefinitely. So is a cf_*,
+# M10, M11, app_bundle or dl_basic fixture whose arm64 build fails to compile
+# where its x86_64 build did, since that leaves the case without its host oracle.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -1326,6 +1373,18 @@ APP_EXPORTS='_NSApplicationMain _NSApp _CGSessionCopyCurrentDictionary _CFBundle
 APP_EXPORTS="$APP_EXPORTS _OBJC_CLASS_\$_NSApplication _OBJC_CLASS_\$_NSBundle _OBJC_CLASS_\$_NSProcessInfo _OBJC_CLASS_\$_NSRunningApplication"
 APP_EXPORTS="$APP_EXPORTS __NSGetArgc __NSGetArgv __NSGetEnviron __NSGetExecutablePath __NSGetMachExecuteHeader __NSGetProgname"
 APP_EXPORTS="$APP_EXPORTS _getprogname _getenv _setenv _atexit _environ _strrchr _objc_unsafeClaimAutoreleasedReturnValue"
+DL_BASIC_BIN=""
+DL_BASIC_ARM64=""
+DL_REFUSALS_BIN=""
+DL_TIMEOUT=60
+DL_EXPORTS='_dlopen _dlsym _dladdr _dlclose _dlerror _dlopen_preflight __dyld_image_count __dyld_get_image_header __dyld_get_image_name'
+DL_EXPORTS="$DL_EXPORTS __dyld_get_image_vmaddr_slide __dyld_get_image_header_containing_address __dyld_get_prog_image_header __dyld_register_func_for_add_image"
+DL_EXPORTS="$DL_EXPORTS __dyld_is_memory_immutable __dyld_shared_cache_contains_path _dyld_image_path_containing_address _dyld_get_active_platform"
+DL_EXPORTS="$DL_EXPORTS _dyld_get_program_min_os_version _dyld_get_program_sdk_version _dyld_program_sdk_at_least"
+DL_BRIDGED='___stack_chk_fail ___snprintf_chk ____chkstk_darwin _free _malloc _pthread_create _pthread_join _strcmp _strlen _strrchr _strstr _write dyld_stub_binder'
+DL_NEED='_dlopen _dlsym _dladdr _dlclose _dlerror __dyld_register_func_for_add_image _objc_msgSend'
+DL_CACHE_GROUPS='images|load|sym|path|strlen|dladdr|plugin|version'
+DL_REFUSED='native library without an API database'
 MEASURE_BIN=/usr/bin/time
 
 unset OCERZ_MODE
@@ -8777,6 +8836,664 @@ EOC
     APP_BUNDLE_EXE="$bundle/Contents/MacOS/$APP_NAME"
 }
 
+build_dl_fixtures() {
+    local arch dir
+
+    cat > "$TMP/dl_basic.m" <<'EOC'
+#include "objc_common.h"
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <pthread.h>
+#include <stdlib.h>
+
+#define TAG "dl_basic"
+
+typedef struct { unsigned platform, version; } dl_version;
+extern unsigned dyld_get_program_sdk_version(void);
+extern unsigned dyld_get_program_min_os_version(void);
+extern unsigned dyld_get_active_platform(void);
+extern bool dyld_program_sdk_at_least(dl_version);
+extern const char *dyld_image_path_containing_address(const void *);
+extern bool _dyld_is_memory_immutable(const void *, size_t);
+extern const struct mach_header *_dyld_get_prog_image_header(void);
+
+@interface DLHostBase : NSObject
+- (int)hostValue;
+- (NSString *)describe;
+@end
+
+@implementation DLHostBase
+- (int)hostValue
+{
+    return 40;
+}
+- (NSString *)describe
+{
+    return @"host";
+}
+@end
+
+@interface NSString (DLPlug)
+- (NSString *)dlplugShout;
+@end
+
+@interface NSObject (DLPlugThing)
+- (int)thingValue;
+@end
+
+int dl_main_marker(int x)
+{
+    return x * 3;
+}
+
+static char g_dir[1024];
+static unsigned g_adds, g_adds_at_register, g_count_at_register;
+static const void *g_seen[1024];
+static void *g_plug, *g_plug_add;
+static const void *g_plug_hdr, *g_bundle_hdr;
+
+static void on_add(const struct mach_header *mh, intptr_t slide)
+{
+    (void)slide;
+    if (g_adds < 1024)
+        g_seen[g_adds] = mh;
+    g_adds++;
+}
+
+static int saw(const void *mh)
+{
+    unsigned i;
+    for (i = 0; mh && i < g_adds && i < 1024; i++)
+        if (g_seen[i] == mh)
+            return 1;
+    return 0;
+}
+
+static int ends_with(const char *s, const char *tail)
+{
+    cb_size a = s ? strlen(s) : 0, b = strlen(tail);
+    return s && a >= b && strcmp(s + a - b, tail) == 0;
+}
+
+static const char *path_of(const char *leaf, char *buf, cb_size n)
+{
+    snprintf(buf, n, "%s/%s", g_dir, leaf);
+    return buf;
+}
+
+static void group_images(void)
+{
+    unsigned m = 0, bit = 1, n = _dyld_image_count(), i, all = 1;
+    const struct mach_header *h0 = _dyld_get_image_header(0);
+    Dl_info info;
+
+    memset(&info, 0, sizeof info);
+    for (i = 1; i < n; i++)
+        if (!_dyld_get_image_header(i) || !_dyld_get_image_name(i))
+            all = 0;
+    CK(n > 1 && h0 != 0);
+    CK(dladdr((void *)dl_main_marker, &info) && info.dli_fbase == h0);
+    CK(_dyld_get_prog_image_header() == h0);
+    CK(ends_with(_dyld_get_image_name(0), "/" TAG));
+    CK(_dyld_get_image_header_containing_address((void *)dl_main_marker) == h0);
+    CK(_dyld_get_image_header(n) == 0 && _dyld_get_image_name(n) == 0);
+    CK(all);
+    CK(ends_with(dyld_image_path_containing_address((void *)dl_main_marker), "/" TAG));
+    CK(_dyld_get_image_vmaddr_slide(0) == (intptr_t)h0 - (intptr_t)0x100000000);
+    cf_begin(TAG, "images", m);
+    cb_end();
+}
+
+static void *tls_thread(void *arg)
+{
+    int *(*addr)(void) = (int *(*)(void))arg;
+    int first = *addr();
+
+    *addr() = 9;
+    return (void *)(long)(first == 7 && *addr() == 9);
+}
+
+static void group_load(void)
+{
+    unsigned m = 0, bit = 1;
+    char path[1200];
+    Class thing;
+    int *(*tls)(void);
+    pthread_t t;
+    void *r = 0;
+    int joined = 0;
+
+    g_plug = dlopen(path_of("libdlplug.dylib", path, sizeof path), RTLD_NOW);
+    thing = NSClassFromString(@"DLPlugThing");
+    tls = g_plug ? (int *(*)(void))dlsym(g_plug, "dlplug_tls_addr") : 0;
+    CK(g_plug != 0);
+    CK(thing != nil && [[thing new] thingValue] == 99);
+    CK([[@"abc" dlplugShout] isEqualToString:@"ABC!"]);
+    CK([[[NSString stringWithUTF8String:"xyz"] dlplugShout] isEqualToString:@"XYZ!"]);
+    CK(tls != 0 && *tls() == 7);
+    if (tls != 0) {
+        *tls() = 8;
+        joined = pthread_create(&t, 0, tls_thread, (void *)tls) == 0 && pthread_join(t, &r) == 0;
+    }
+    CK(joined && r != 0);
+    CK(tls != 0 && *tls() == 8);
+    cf_begin(TAG, "load", m);
+    cb_end();
+}
+
+static void group_order(void)
+{
+    unsigned m = 0, bit = 1;
+    const char *(*order)(void) = g_plug ? (const char *(*)(void))dlsym(g_plug, "dlplug_order") : 0;
+
+    CK(order != 0 && strcmp(order(), "LC") == 0);
+    cf_begin(TAG, "order", m);
+    cb_end();
+}
+
+static void group_sym(void)
+{
+    unsigned m = 0, bit = 1;
+    int (*add)(int, int) = g_plug ? (int (*)(int, int))dlsym(g_plug, "dlplug_add") : 0;
+    int *data = g_plug ? (int *)dlsym(g_plug, "dlplug_data") : 0;
+    int (*get)(void) = g_plug ? (int (*)(void))dlsym(g_plug, "dlplug_get_data") : 0;
+
+    g_plug_add = (void *)add;
+    CK(add != 0 && add(2, 3) == 5);
+    CK(data != 0 && *data == 1234);
+    if (data != 0)
+        *data = 4321;
+    CK(get != 0 && get() == 4321);
+    CK(g_plug != 0 && dlsym(g_plug, "dlplug_nope") == 0);
+    CK(add != 0 && dlsym(RTLD_DEFAULT, "dlplug_add") == (void *)add);
+    CK(dlsym(RTLD_SELF, "dl_main_marker") == (void *)dl_main_marker);
+    CK(dlsym(RTLD_MAIN_ONLY, "dl_main_marker") == (void *)dl_main_marker);
+    CK(dlsym(RTLD_MAIN_ONLY, "dlplug_add") == 0);
+    CK(dlsym(RTLD_DEFAULT, "dl_no_such_symbol_anywhere") == 0);
+    dlerror();
+    cf_begin(TAG, "sym", m);
+    cb_end();
+}
+
+static void *dlerror_thread(void *arg)
+{
+    const char *before = dlerror(), *mine;
+    unsigned ok;
+
+    (void)arg;
+    dlsym(RTLD_DEFAULT, "dl_thread_nope");
+    mine = dlerror();
+    ok = before == 0 && mine != 0 && strstr(mine, "dl_thread_nope") != 0 && dlerror() == 0;
+    return (void *)(long)ok;
+}
+
+static void group_dlerror(void)
+{
+    unsigned m = 0, bit = 1;
+    char path[1200];
+    const char *e;
+    pthread_t t;
+    void *r = 0;
+    int joined;
+
+    dlerror();
+    CK(dlerror() == 0);
+    dlsym(g_plug, "dlplug_nope");
+    e = dlerror();
+    CK(e != 0 && strstr(e, "dlplug_nope") != 0);
+    CK(dlerror() == 0);
+    CK(dlopen(path_of("libdlnope.dylib", path, sizeof path), RTLD_NOW) == 0);
+    e = dlerror();
+    CK(e != 0 && strstr(e, "libdlnope.dylib") != 0);
+    CK(dlerror() == 0);
+    dlsym(g_plug, "dlplug_nope2");
+    joined = pthread_create(&t, 0, dlerror_thread, 0) == 0 && pthread_join(t, &r) == 0;
+    CK(joined && r != 0);
+    e = dlerror();
+    CK(e != 0 && strstr(e, "dlplug_nope2") != 0 && strstr(e, "dl_thread_nope") == 0);
+    cf_begin(TAG, "dlerror", m);
+    cb_end();
+}
+
+static void group_path(void)
+{
+    unsigned m = 0, bit = 1;
+    char path[1200], other[1200], nope[1200];
+
+    path_of("libdlplug.dylib", path, sizeof path);
+    path_of("libdlother.dylib", other, sizeof other);
+    path_of("libdlnope.dylib", nope, sizeof nope);
+    CK(g_plug != 0 && dlopen(path, RTLD_NOW) == g_plug);
+    CK(g_plug != 0 && dlopen(path, RTLD_NOLOAD) == g_plug);
+    CK(dlopen(other, RTLD_NOLOAD) == 0);
+    CK(dlopen(nope, RTLD_NOW) == 0);
+    CK(dlopen_preflight(path) && !dlopen_preflight(nope));
+    CK(g_plug != 0 && dlclose(g_plug) == 0 && dlclose(g_plug) == 0);
+    CK(g_plug != 0 && dlsym(g_plug, "dlplug_add") == g_plug_add);
+    dlerror();
+    cf_begin(TAG, "path", m);
+    cb_end();
+}
+
+static void group_rpath(void)
+{
+    unsigned m = 0, bit = 1;
+
+    CK(g_plug != 0 && dlopen("@executable_path/libdlplug.dylib", RTLD_NOW) == g_plug);
+    CK(g_plug != 0 && dlopen("@rpath/libdlplug.dylib", RTLD_NOW) == g_plug);
+    CK(g_plug != 0 && dlopen("@loader_path/libdlplug.dylib", RTLD_NOW) == g_plug);
+    CK(dlopen("@rpath/libdlnope.dylib", RTLD_NOW) == 0);
+    dlerror();
+    cf_begin(TAG, "rpath", m);
+    cb_end();
+}
+
+static void group_handles(void)
+{
+    unsigned m = 0, bit = 1;
+    char path[1200];
+    void *self = dlopen(0, RTLD_NOW);
+    void *first = dlopen(path_of("libdlplug.dylib", path, sizeof path), RTLD_NOW | RTLD_FIRST);
+
+    CK(self != 0 && dlsym(self, "dl_main_marker") == (void *)dl_main_marker);
+    CK(self != 0 && g_plug_add != 0 && dlsym(self, "dlplug_add") == g_plug_add);
+    CK(first != 0 && g_plug_add != 0 && dlsym(first, "dlplug_add") == g_plug_add);
+    CK(first != 0 && dlsym(first, "strlen") == 0);
+    CK(g_plug != 0 && dlsym(g_plug, "strlen") == (void *)strlen);
+    CK(dlsym(RTLD_NEXT, "dl_main_marker") == 0);
+    CK(dlsym(RTLD_NEXT, "strlen") == (void *)strlen);
+    CK(first != 0 && self != 0 && dlclose(first) == 0 && dlclose(self) == 0);
+    dlerror();
+    CK(dlclose((void *)0x1234) == -1 && dlerror() != 0);
+    CK(dlsym((void *)0x1234, "strlen") == 0 && dlerror() != 0);
+    cf_begin(TAG, "handles", m);
+    cb_end();
+}
+
+static void group_local(void)
+{
+    unsigned m = 0, bit = 1;
+    char path[1200];
+    void *o = dlopen(path_of("libdlother.dylib", path, sizeof path), RTLD_NOW | RTLD_LOCAL);
+    void *fn = o != 0 ? dlsym(o, "dlother") : 0;
+    void *hidden = dlsym(RTLD_DEFAULT, "dlother");
+    void *o2 = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+
+    CK(o != 0);
+    CK(fn != 0);
+    CK(hidden == 0);
+    CK(o2 == o);
+    CK(fn != 0 && dlsym(RTLD_DEFAULT, "dlother") == fn);
+    dlerror();
+    cf_begin(TAG, "local", m);
+    cb_end();
+}
+
+static void group_strlen(void)
+{
+    unsigned m = 0, bit = 1;
+    cb_size (*len)(const char *) = (cb_size (*)(const char *))dlsym(RTLD_DEFAULT, "strlen");
+
+    CK(len != 0);
+    CK(len != 0 && len("twelve chars") == 12);
+    CK((void *)len == (void *)strlen);
+    cf_begin(TAG, "strlen", m);
+    cb_end();
+}
+
+static void group_dladdr(void)
+{
+    unsigned m = 0, bit = 1, n = _dyld_image_count(), i, idx = 0;
+    Dl_info info;
+
+    memset(&info, 0, sizeof info);
+    CK(g_plug_add != 0 && dladdr(g_plug_add, &info));
+    CK(info.dli_sname != 0 && strcmp(info.dli_sname, "dlplug_add") == 0 && info.dli_saddr == g_plug_add);
+    CK(ends_with(info.dli_fname, "/libdlplug.dylib"));
+    g_plug_hdr = info.dli_fbase;
+    CK(g_plug_hdr != 0 && _dyld_get_image_header_containing_address(g_plug_add) == g_plug_hdr);
+    CK(ends_with(dyld_image_path_containing_address(g_plug_add), "/libdlplug.dylib"));
+    memset(&info, 0, sizeof info);
+    CK(g_plug_add != 0 && dladdr((char *)g_plug_add + 1, &info) && info.dli_saddr == g_plug_add);
+    memset(&info, 0, sizeof info);
+    CK(dladdr((void *)dl_main_marker, &info) && info.dli_sname != 0 &&
+       strcmp(info.dli_sname, "dl_main_marker") == 0);
+    for (i = 1; i < n && !idx; i++)
+        if (g_plug_hdr != 0 && (const void *)_dyld_get_image_header(i) == g_plug_hdr)
+            idx = i;
+    CK(idx != 0 && ends_with(_dyld_get_image_name(idx), "/libdlplug.dylib") &&
+       _dyld_get_image_vmaddr_slide(idx) == (intptr_t)g_plug_hdr);
+    cf_begin(TAG, "dladdr", m);
+    cb_end();
+}
+
+static void group_plugin(void)
+{
+    unsigned m = 0, bit = 1;
+    char path[1200];
+    void *b = dlopen(path_of("dlbundle.bundle", path, sizeof path), RTLD_NOW);
+    Class p = NSClassFromString(@"DLPlugin");
+    id o = p != nil ? [p new] : nil;
+    void *cls = b != 0 ? dlsym(b, "OBJC_CLASS_$_DLPlugin") : 0;
+
+    g_bundle_hdr = cls != 0 ? _dyld_get_image_header_containing_address(cls) : 0;
+    CK(b != 0);
+    CK(p != nil && [p superclass] == [DLHostBase class]);
+    CK(o != nil && [o hostValue] == 42);
+    CK(o != nil && [[o describe] isEqualToString:@"plugin<host>"]);
+    CK(o != nil && [o isKindOfClass:[DLHostBase class]]);
+    CK(cls != 0 && cls == (__bridge void *)p);
+    cf_begin(TAG, "plugin", m);
+    cb_end();
+}
+
+static void group_callbacks(void)
+{
+    unsigned m = 0, bit = 1, n = _dyld_image_count(), i, all = 1;
+
+    for (i = 0; i < n; i++)
+        if (!saw(_dyld_get_image_header(i)))
+            all = 0;
+    CK(g_adds_at_register == g_count_at_register);
+    CK(saw(_dyld_get_image_header(0)));
+    CK(saw(g_plug_hdr));
+    CK(saw(g_bundle_hdr));
+    CK(g_adds == n);
+    CK(all);
+    cf_begin(TAG, "callbacks", m);
+    cb_end();
+}
+
+static void group_version(void)
+{
+    unsigned m = 0, bit = 1;
+    char path[1200];
+    dl_version old = { 1, 0x000a0e00 }, future = { 1, 0x007f0000 };
+    void *heap = malloc(64);
+
+    CK(dyld_get_active_platform() == 1);
+    CK(dyld_get_program_min_os_version() == 0x000c0000);
+    CK(dyld_get_program_sdk_version() >= 0x000c0000);
+    CK(dyld_program_sdk_at_least(old) && !dyld_program_sdk_at_least(future));
+    CK(_dyld_shared_cache_contains_path("/usr/lib/libSystem.B.dylib"));
+    CK(!_dyld_shared_cache_contains_path(path_of("libdlplug.dylib", path, sizeof path)));
+    CK(heap != 0 && !_dyld_is_memory_immutable(heap, 16));
+    free(heap);
+    cf_begin(TAG, "version", m);
+    cb_field("sdk", dyld_get_program_sdk_version(), 1);
+    cb_end();
+}
+
+int main(void)
+{
+    int rc;
+    char *slash;
+
+    @autoreleasepool {
+        snprintf(g_dir, sizeof g_dir, "%s", _dyld_get_image_name(0));
+        slash = strrchr(g_dir, '/');
+        if (slash != 0)
+            *slash = 0;
+        g_count_at_register = _dyld_image_count();
+        _dyld_register_func_for_add_image(on_add);
+        g_adds_at_register = g_adds;
+        cf_note(TAG, "images");
+        group_images();
+        cf_note(TAG, "load");
+        group_load();
+        cf_note(TAG, "order");
+        group_order();
+        cf_note(TAG, "sym");
+        group_sym();
+        cf_note(TAG, "dlerror");
+        group_dlerror();
+        cf_note(TAG, "path");
+        group_path();
+        cf_note(TAG, "rpath");
+        group_rpath();
+        cf_note(TAG, "handles");
+        group_handles();
+        cf_note(TAG, "local");
+        group_local();
+        cf_note(TAG, "strlen");
+        group_strlen();
+        cf_note(TAG, "dladdr");
+        group_dladdr();
+        cf_note(TAG, "plugin");
+        group_plugin();
+        cf_note(TAG, "callbacks");
+        group_callbacks();
+        cf_note(TAG, "version");
+        group_version();
+        rc = cf_summary(TAG);
+    }
+    return rc;
+}
+EOC
+
+    cat > "$TMP/libdlplug.m" <<'EOC'
+#import <Foundation/Foundation.h>
+#include <unistd.h>
+
+static char g_order[8];
+static int g_order_n;
+
+static void note(char c)
+{
+    if (g_order_n < 7)
+        g_order[g_order_n++] = c;
+}
+
+int dlplug_data = 1234;
+__thread int dlplug_tls = 7;
+
+@interface DLPlugThing : NSObject
+- (int)thingValue;
+@end
+
+@implementation DLPlugThing
++ (void)load
+{
+    note('L');
+}
+- (int)thingValue
+{
+    return 99;
+}
+@end
+
+@implementation NSString (DLPlug)
+- (NSString *)dlplugShout
+{
+    return [[self uppercaseString] stringByAppendingString:@"!"];
+}
+@end
+
+__attribute__((constructor)) static void dlplug_ctor(void)
+{
+    note(getpid() > 0 ? 'C' : 'c');
+}
+
+int dlplug_add(int a, int b)
+{
+    return a + b;
+}
+
+int dlplug_get_data(void)
+{
+    return dlplug_data;
+}
+
+int *dlplug_tls_addr(void)
+{
+    return &dlplug_tls;
+}
+
+const char *dlplug_order(void)
+{
+    return g_order;
+}
+EOC
+
+    cat > "$TMP/dlbundle.m" <<'EOC'
+#import <Foundation/Foundation.h>
+
+@interface DLHostBase : NSObject
+- (int)hostValue;
+- (NSString *)describe;
+@end
+
+@interface DLPlugin : DLHostBase
+@end
+
+@implementation DLPlugin
+- (int)hostValue
+{
+    return [super hostValue] + 2;
+}
+- (NSString *)describe
+{
+    return [NSString stringWithFormat:@"plugin<%@>", [super describe]];
+}
+@end
+EOC
+
+    cat > "$TMP/dl_refusals.c" <<'EOC'
+#include "cb_common.h"
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <stdio.h>
+#include <string.h>
+
+#define TAG "dl_refusals"
+
+static char g_dir[1024];
+
+static const char *path_of(const char *leaf, char *buf, cb_size n)
+{
+    snprintf(buf, n, "%s/%s", g_dir, leaf);
+    return buf;
+}
+
+static void text(const char *label, const char *e)
+{
+    char line[2400];
+    cb_size i, n;
+
+    n = (cb_size)snprintf(line, 64, "%s text %s ", TAG, label);
+    if (!e)
+        e = "(null)";
+    for (i = 0; e[i] && n < sizeof line - 2; i++)
+        line[n++] = e[i] == '\n' ? '|' : e[i];
+    line[n++] = '\n';
+    write(1, line, n);
+}
+
+static int refused(const char *label, const char *path, char *first, cb_size n)
+{
+    unsigned before = _dyld_image_count();
+    void *h = dlopen(path, RTLD_NOW);
+    const char *e = dlerror();
+    int ok = h == 0 && e != 0 && _dyld_image_count() == before && dlerror() == 0;
+
+    text(label, e);
+    if (first)
+        snprintf(first, n, "%s", e ? e : "");
+    return ok;
+}
+
+int main(void)
+{
+    unsigned m = 0, bit = 1, before;
+    char path[1200], first[2048], second[2048];
+    void *h, *cf;
+    char *slash;
+
+    snprintf(g_dir, sizeof g_dir, "%s", _dyld_get_image_name(0));
+    slash = strrchr(g_dir, '/');
+    if (slash)
+        *slash = 0;
+
+    CK(refused("arm64", path_of("libdlarm.dylib", path, sizeof path), 0, 0));
+    CK(refused("hostlib", "/usr/lib/libz.1.dylib", 0, 0));
+    CK(refused("bare", "libz.dylib", 0, 0));
+    CK(refused("missingdep", path_of("libdlneedsgone.dylib", path, sizeof path), first, sizeof first));
+    CK(refused("missingsym", path_of("libdlneedsym.dylib", path, sizeof path), second, sizeof second));
+    CK(refused("missingsym", path_of("libdlneedsym.dylib", path, sizeof path), first, sizeof first) &&
+       strcmp(first, second) == 0);
+
+    before = _dyld_image_count();
+    h = dlopen(path_of("libdlother.dylib", path, sizeof path), RTLD_NOW);
+    CK(h != 0 && dlsym(h, "dlother") != 0 && _dyld_image_count() == before + 1);
+
+    h = dlopen("libc.dylib", RTLD_NOW);
+    CK(h != 0 && dlsym(h, "strlen") == (void *)strlen);
+    CK(dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD) == h);
+
+    before = _dyld_image_count();
+    CK(dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOLOAD) == 0);
+    dlerror();
+    cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
+    CK(cf != 0 && dlsym(cf, "CFStringGetLength") != 0 && _dyld_image_count() == before + 1);
+    CK(cf != 0 && strcmp(_dyld_get_image_name(before),
+                         "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation") == 0);
+    CK(dlopen_preflight("/usr/lib/libSystem.B.dylib") && !dlopen_preflight("/usr/lib/libz.1.dylib"));
+    text("preflight", dlerror());
+
+    cb_begin(TAG, m);
+    cb_end();
+    return m != 0;
+}
+EOC
+
+    printf 'int dlother(void) { return 1; }\n' > "$TMP/dlother.c"
+    printf 'int dl_arm(void) { return 1; }\n' > "$TMP/dlarm.c"
+    printf 'int dl_gone(void) { return 2; }\n' > "$TMP/dlgone.c"
+    printf 'extern int dl_gone(void);\nint dl_needs_gone(void) { return dl_gone(); }\n' > "$TMP/dlneedsgone.c"
+    printf 'int dl_vanishing(void) { return 3; }\nint dl_staying(void) { return 4; }\n' > "$TMP/dlweak1.c"
+    printf 'int dl_staying(void) { return 4; }\n' > "$TMP/dlweak2.c"
+    printf 'extern int dl_vanishing(void);\nint dl_needs_sym(void) { return dl_vanishing(); }\n' > "$TMP/dlneedsym.c"
+
+    for arch in x86_64 arm64; do
+        dir="$TMP/dl.$arch"
+        mkdir -p "$dir"
+        if {
+            clang -arch $arch -mmacosx-version-min=12.0 -dynamiclib -install_name @rpath/libdlother.dylib \
+                -o "$dir/libdlother.dylib" "$TMP/dlother.c" &&
+            clang -arch $arch -x objective-c -fobjc-arc -O1 -mmacosx-version-min=12.0 -dynamiclib \
+                -install_name @rpath/libdlplug.dylib -o "$dir/libdlplug.dylib" "$TMP/libdlplug.m" -framework Foundation &&
+            clang -arch $arch -x objective-c -fobjc-arc -O1 -fno-builtin -Wno-deprecated-declarations \
+                -mmacosx-version-min=12.0 -I"$TMP" -Wl,-rpath,@executable_path \
+                -o "$dir/dl_basic" "$TMP/dl_basic.m" -framework Foundation &&
+            clang -arch $arch -x objective-c -fobjc-arc -O1 -mmacosx-version-min=12.0 -bundle \
+                -bundle_loader "$dir/dl_basic" -o "$dir/dlbundle.bundle" "$TMP/dlbundle.m" -framework Foundation
+        } >"$TMP/dl_basic.$arch.cc.log" 2>&1; then
+            case $arch in
+                x86_64) DL_BASIC_BIN="$dir/dl_basic" ;;
+                arm64) DL_BASIC_ARM64="$dir/dl_basic" ;;
+            esac
+        fi
+    done
+    cp "$TMP/dl_basic.x86_64.cc.log" "$TMP/dl_basic.cc.log" 2>/dev/null
+
+    dir="$TMP/dl.x86_64"
+    if {
+        clang -arch arm64 -dynamiclib -o "$dir/libdlarm.dylib" "$TMP/dlarm.c" &&
+        clang -arch x86_64 -dynamiclib -install_name @rpath/libdlgone.dylib -o "$dir/libdlgone.dylib" "$TMP/dlgone.c" &&
+        clang -arch x86_64 -dynamiclib -install_name @rpath/libdlneedsgone.dylib -Wl,-rpath,@loader_path \
+            -o "$dir/libdlneedsgone.dylib" "$TMP/dlneedsgone.c" "$dir/libdlgone.dylib" &&
+        rm -f "$dir/libdlgone.dylib" &&
+        clang -arch x86_64 -dynamiclib -install_name @rpath/libdlweak.dylib -o "$dir/libdlweak.dylib" "$TMP/dlweak1.c" &&
+        clang -arch x86_64 -dynamiclib -install_name @rpath/libdlneedsym.dylib -Wl,-rpath,@loader_path \
+            -o "$dir/libdlneedsym.dylib" "$TMP/dlneedsym.c" "$dir/libdlweak.dylib" &&
+        clang -arch x86_64 -dynamiclib -install_name @rpath/libdlweak.dylib -o "$dir/libdlweak.dylib" "$TMP/dlweak2.c" &&
+        [ -f "$dir/libdlother.dylib" ] &&
+        clang -arch x86_64 -O1 -fno-builtin -I"$TMP" -o "$dir/dl_refusals" "$TMP/dl_refusals.c"
+    } >"$TMP/dl_refusals.cc.log" 2>&1; then
+        DL_REFUSALS_BIN="$dir/dl_refusals"
+    fi
+}
+
 run_probe() {
     local out="$1" err="$2"
     shift 2
@@ -10241,6 +10958,10 @@ objc_import_reason() {
             allowed="$allowed$OBJC_CLASS_EXPORTS $APPKIT_EXPORTS $APP_EXPORTS "
             libs="libobjc, AppKit, CoreGraphics, Foundation and CoreFoundation"
             about="the application's identity" ;;
+        dl)
+            allowed="$allowed$OBJC_CLASS_EXPORTS $DL_EXPORTS $DL_BRIDGED "
+            libs="libSystem, libobjc, Foundation and CoreFoundation"
+            about="loading code at run time" ;;
     esac
     for sym in $imports; do
         case "$allowed" in
@@ -10275,6 +10996,7 @@ objc_import_reason() {
             _NSApplicationMain) why="the application was not started through NSApplicationMain" ;;
             _CFBundleGetMainBundle|_OBJC_CLASS_*_NSBundle) why="the main bundle was never asked for through CoreFoundation and Foundation both" ;;
             __NSGet*) why="the crt_externs functions were never called" ;;
+            _dl*|__dyld_*) why="the dynamic-loading API was not called through the virtual libSystem's exports" ;;
             *) why="the unfortified translation unit did not call the plain entry points" ;;
         esac
         echo "$(basename "$bin") imports '${imports% }' and not$missing, so $why, and the case proves nothing about it"
@@ -10617,6 +11339,149 @@ case_app_bundle() {
     record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
 }
 
+dl_cache_lines() {
+    grep -E "^dl_basic ($DL_CACHE_GROUPS) " "$1" 2>/dev/null
+}
+
+case_dl_basic() {
+    local name=dl_basic tag=dl_basic bin="$DL_BASIC_BIN" arm="$DL_BASIC_ARM64"
+    local reason="" rc_arm rc_jit rc_nojit rc_cache line cache_note=""
+    local ao="$TMP/$name.arm64.out" ae="$TMP/$name.arm64.err"
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$DL_TIMEOUT
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    if [ -z "$arm" ]; then
+        record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $( (grep -m1 -i 'error' "$TMP/$name.arm64.cc.log" || head -1 "$TMP/$name.arm64.cc.log") 2>/dev/null | cut -c1-160)"
+        return
+    fi
+    reason="$(objc_import_reason "$bin" dl $DL_NEED)"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+    run_bounded "$ao" "$ae" "$arm"
+    rc_arm=$?
+    reason="$(objc_arm64_reason "$rc_arm" "$tag" "$ao" "$ae" dl "$@")"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin"
+    rc_nojit=$?
+    line="$(cf_status "$tag" "$jo")"
+
+    reason="$(objc_run_reason "$rc_jit" "$tag" "$jo" "$je")"
+    if grep -q "^$tag bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed: $(cf_bits "$tag" "$jo" "$@")"
+    elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+        reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+    fi
+    if [ -z "$reason" ]; then
+        reason="$(objc_run_reason "$rc_nojit" "$tag" "$no" "$ne")"
+        if grep -q "^$tag bad:" "$no"; then
+            reason="no-jit: '$(cf_status "$tag" "$no")': the guest's own checks failed: $(cf_bits "$tag" "$no" "$@")"
+        elif [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit '$(tr '\n' ' ' < "$jo")' and no-jit '$(tr '\n' ' ' < "$no")' stdout differ"
+        fi
+    fi
+    if [ -z "$reason" ] && ! cmp -s "$jo" "$ao"; then
+        reason="native '$(tr '\n' ' ' < "$jo")' != arm64 '$(tr '\n' ' ' < "$ao")': the guest's loads, lookups and image list answered otherwise than the host's own dyld answers the same program"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$bin"
+        rc_cache=$?
+        if [ "$rc_cache" -eq 124 ]; then
+            reason="cache mode still running after ${NATIVE_TIMEOUT}s, and $(objc_stall "$tag" "$ce" hang)"
+        elif [ "$(dl_cache_lines "$jo")" != "$(dl_cache_lines "$co")" ]; then
+            reason="native '$(dl_cache_lines "$jo" | tr '\n' ' ')' != cache '$(dl_cache_lines "$co" | tr '\n' ' ')' on the groups cache mode answers the way dyld does, exit $rc_cache there"
+        fi
+        cache_note=" cache=$(dl_cache_lines "$co" | wc -l | tr -d ' ') groups"
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'$cache_note"
+}
+
+dl_refusal_reason() {
+    local out="$1" label want
+    shift
+    while [ $# -ge 2 ]; do
+        label="$1"
+        want="$2"
+        if ! grep "^dl_refusals text $label " "$out" 2>/dev/null | grep -Fq -- "$want"; then
+            echo "the $label refusal read '$(grep -m1 "^dl_refusals text $label " "$out" 2>/dev/null | cut -d' ' -f4- | cut -c1-240)', which does not say '$want'"
+            return
+        fi
+        shift 2
+    done
+}
+
+case_dl_refusals() {
+    local name=dl_refusals tag=dl_refusals bin="$DL_REFUSALS_BIN" bits="$1"
+    local reason="" rc_jit rc_nojit line imports sym stray="" dir
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local no="$TMP/$name.nojit.out" ne="$TMP/$name.nojit.err"
+    local NATIVE_TIMEOUT=$DL_TIMEOUT
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    dir="$(cd "$(dirname "$bin")" && pwd -P)"
+    imports="$(nm -u "$bin" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+    for sym in $imports; do
+        case " $DL_EXPORTS $DL_BRIDGED $STACK_GUARD_SYM " in
+            *" $sym "*) ;;
+            *) stray="$stray $sym" ;;
+        esac
+    done
+    if [ -n "$stray" ]; then
+        record "$name" "$(basename "$bin") imports$stray, which neither the virtual libSystem exports nor the bridge implements, so a failure would be about those imports and not about loading code"
+        return
+    fi
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin"
+    rc_jit=$?
+    run_bounded "$no" "$ne" "$OCERZ" -v -native -no-jit "$bin"
+    rc_nojit=$?
+    line="$(cf_status "$tag" "$jo")"
+    reason="$(native_run_reason "$rc_jit" "$jo" "$je")"
+    if grep -q "^$tag bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed, where $bits"
+    elif [ -z "$reason" ] && ! grep -q "^$tag ok" "$jo"; then
+        reason="exit 0 without a '$tag ok' status line: got '${line:-nothing}'"
+    elif [ -z "$reason" ]; then
+        reason="$(dl_refusal_reason "$jo" \
+            arm64 "$DL_REFUSED" arm64 "has no x86_64 slice" \
+            hostlib "$DL_REFUSED" hostlib "'/usr/lib/libz.1.dylib' is in the host's shared cache" \
+            bare "$DL_REFUSED" bare "'/usr/lib/libz.1.dylib'" \
+            missingdep "Library not loaded: @rpath/libdlgone.dylib" missingdep "Referenced from: $dir/libdlneedsgone.dylib" \
+            missingsym "Symbol not found: _dl_vanishing" missingsym "Referenced from: $dir/libdlneedsym.dylib" \
+            missingsym "Expected in: @rpath/libdlweak.dylib" \
+            preflight "$DL_REFUSED")"
+    fi
+    if [ -z "$reason" ]; then
+        reason="$(native_run_reason "$rc_nojit" "$no" "$ne")"
+        if [ -n "$reason" ]; then
+            reason="no-jit: $reason"
+        elif ! cmp -s "$jo" "$no"; then
+            reason="native jit and no-jit stdout differ: '$(tr '\n' ' ' < "$jo" | cut -c1-200)' against '$(tr '\n' ' ' < "$no" | cut -c1-200)'"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line'"
+}
+
 case_env_native() {
     local name=env_native rc reason="" out="$TMP/env_native.out" err="$TMP/env_native.err"
     run_bounded "$out" "$err" env OCERZ_MODE=native "$OCERZ" -v "$DYN" "$KERNEL" "$SCALE"
@@ -10924,6 +11789,7 @@ build_cf_fixtures
 build_objc_fixtures
 build_objc_class_fixtures
 build_app_fixtures
+build_dl_fixtures
 
 if [ -n "$PROBE_BIN" ]; then
     run_probe "$TMP/probe_native.jit.out" "$TMP/probe_native.jit.err" -v -native
@@ -11081,6 +11947,23 @@ case_objc objc_view_ivar "$OBJC_VIEW_IVAR_BIN" "$OBJC_VIEW_IVAR_ARM64" objc_view
     draw "bit 0 is -drawRect: not called exactly once per view, 1 -drawRect: called on the wrong view, 2 the int or the double written in -initWithFrame: reading otherwise in -drawRect:, 3 the color written in -initWithFrame: not the very object -drawRect: read, 4 the NSRect or the trailing byte reading otherwise in -drawRect:, 5 the second view's -drawRect: not seeing every value main wrote into it, 6 -frame inside -drawRect: not each view's own" \
     pixels "bit 0 is a corner of the first view's bitmap not white, 1 the first view's color not at the corners of its box, 2 that color outside its box, 3 the second view's color not at its own box, or the first view's box drawn in it, 4 the second view's color outside its box; dev1= and dev2= are checksums of the two bitmaps' bytes"
 case_app_bundle
+case_dl_basic \
+    images "bit 0 is _dyld_image_count not above 1 or image 0 without a header, 1 dladdr on a main-image function not naming image 0's header, 2 _dyld_get_prog_image_header not image 0's, 3 image 0's name not the fixture's path, 4 _dyld_get_image_header_containing_address on a main-image function not image 0, 5 an index one past the end answering a header or a name, 6 an image in the list without a header or a name, 7 dyld_image_path_containing_address on a main-image function not the fixture's path, 8 image 0's slide not its header less the 0x100000000 it was linked at" \
+    load "bit 0 is dlopen of the guest dylib by absolute path failing, 1 its class not found by NSClassFromString or not answering 99, 2 its NSString category not answering on a literal, 3 nor on a string made at run time, 4 its thread-local variable not reading its initializer 7, 5 a second thread not seeing a fresh 7 or not keeping its own write, 6 the main thread's 8 lost to the other thread's write" \
+    order "bit 0 is the dylib's +load and C constructor not each run once, +load first, by the time dlopen returned" \
+    sym "bit 0 is dlsym of a function or calling it failing, 1 dlsym of an int not pointing at its initializer 1234, 2 a write through that pointer not seen by the dylib's own code, 3 dlsym of a name the dylib does not export answering something, 4 RTLD_DEFAULT not finding the dylib's function at the address its handle gave, 5 RTLD_SELF from main not finding main's function, 6 RTLD_MAIN_ONLY not finding it, 7 RTLD_MAIN_ONLY finding the dylib's function, 8 RTLD_DEFAULT finding a name nothing exports" \
+    dlerror "bit 0 is dlerror answering with nothing failed, 1 dlerror after a missed dlsym not naming the symbol, 2 a second dlerror answering again, 3 dlerror after a failed dlopen not naming the path, 4 a second dlerror answering again, 5 another thread seeing this thread's error or not getting its own, 6 this thread's error lost or replaced by the other's" \
+    path "bit 0 is a second dlopen of the same path answering another handle, 1 RTLD_NOLOAD not answering the loaded dylib's handle, 2 RTLD_NOLOAD loading a dylib that was not loaded, 3 dlopen of a missing path answering a handle, 4 dlopen_preflight wrong for a loadable or a missing path, 5 dlclose not answering 0, 6 the dylib gone after dlclose while other opens still held it" \
+    rpath "bit 0 is @executable_path, 1 @rpath through the program's LC_RPATH and 2 @loader_path relative to the calling image not reaching the loaded dylib's handle, 3 @rpath to a missing dylib answering a handle" \
+    handles "bit 0 is dlsym on dlopen(NULL) not finding main's function, 1 nor the dylib's, which it searches as RTLD_DEFAULT does, 2 an RTLD_FIRST handle not finding the dylib's own function, 3 an RTLD_FIRST handle finding strlen in the dylib's dependencies, 4 an ordinary handle not finding strlen in them, 5 RTLD_NEXT from main finding main's own function, 6 RTLD_NEXT not finding strlen in a later image, 7 dlclose of those handles failing, 8 dlclose of a bogus handle not answering -1 with an error, 9 dlsym on a bogus handle not answering NULL with an error" \
+    local "bit 0 is dlopen with RTLD_LOCAL failing, 1 dlsym through its handle failing, 2 RTLD_DEFAULT finding a symbol of an RTLD_LOCAL image, 3 dlopen of it again with RTLD_GLOBAL answering another handle, 4 RTLD_DEFAULT still not finding its symbol after that" \
+    strlen "bit 0 is dlsym(RTLD_DEFAULT, strlen) failing, 1 calling it through the pointer not answering 12, 2 the pointer not the address the program's own strlen import was bound to" \
+    dladdr "bit 0 is dladdr on the dylib's function failing, 1 its symbol name or address wrong, 2 its file not the dylib's path, 3 _dyld_get_image_header_containing_address disagreeing with dladdr's base, 4 dyld_image_path_containing_address not the dylib's path, 5 dladdr one byte into the function not naming the function's start, 6 dladdr on main's function not naming it, 7 the dylib's image-list entry not named for it or its slide not its header" \
+    plugin "bit 0 is dlopen of the bundle failing, 1 its class not found or its superclass not the program's DLHostBase, 2 its override calling super not answering 42, 3 its -describe calling super through a format not answering plugin<host>, 4 isKindOfClass: DLHostBase not YES, 5 dlsym of its class symbol not the class NSClassFromString found" \
+    callbacks "bit 0 is the add-image callback not called once per image already loaded when it was registered, 1 not called for the main executable, 2 nor for the dlopened dylib, 3 nor for the bundle, 4 called other than once per image in the list, 5 an image in the list the callback never saw" \
+    version "bit 0 is dyld_get_active_platform not macOS, 1 dyld_get_program_min_os_version not the 12.0 the fixture was linked for, 2 dyld_get_program_sdk_version below it, 3 dyld_program_sdk_at_least wrong for 10.14 or 127.0, 4 _dyld_shared_cache_contains_path not true for libSystem, 5 true for the fixture's own dylib, 6 _dyld_is_memory_immutable true for heap memory"
+case_dl_refusals \
+    "bit 0 is the arm64-only dylib, 1 libz by path, 2 libz by bare name, 3 the dylib with a deleted dependency and 4 the dylib missing a symbol not refused with an error and the image count unchanged, 5 the second attempt at the last not failing with the same message, 6 a plain dylib not loading after those failures, 7 libc.dylib not answering libSystem with the program's own strlen, 8 RTLD_NOLOAD of libSystem not the same handle, 9 CoreFoundation loaded before anything asked, 10 CoreFoundation through its framework symlink not loading as one more image, 11 that image not named for its Versions/A install name, 12 dlopen_preflight wrong for libSystem or libz"
 case_env_native
 case_flag_beats_env
 case_last_flag_native

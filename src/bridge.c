@@ -233,6 +233,31 @@
  * The question is a thread-local load and two loads and a branch, which a
  * crossing does not notice.
  *
+ * ---- loading code at run time ----
+ * Host dyld has never heard of an image ocerz's loader mapped, and the host's
+ * dlopen would load arm64 code, so neither dlopen nor any question about the
+ * guest's images can cross.  dlopen and its relatives, dlsym, dladdr, dlclose,
+ * dlerror and the image-list half of the dyld API are special exports whose
+ * handlers read the arguments out of the registers and hand them to the native
+ * loader in src/dyld.c, which owns the answers.  What only a handler knows is
+ * where the call came from: the caller's return address is the word at rsp
+ * when the stub traps, so it is what RTLD_NEXT, RTLD_SELF, @loader_path and
+ * @rpath are resolved against, except for dlopen_from, whose caller names
+ * itself in its third argument.  A dlopen runs guest code - add-image callbacks,
+ * +load methods and initializers - and it runs it on the calling thread below
+ * the guest's stack pointer less the red zone, the same place a callback from
+ * native code lands, so a dylib is initialized on the thread that asked for it,
+ * as dyld initializes it.  A path is copied out of guest memory first, so the
+ * loader never reads a string the guest could change underneath it.
+ *
+ * The questions about the program's own build are answered from the guest main
+ * image's LC_BUILD_VERSION, and the at-least forms, whose argument is a
+ * dyld_build_version_t passed by value in one register on both architectures,
+ * are handed with that image's header to the host's own dyld_sdk_at_least and
+ * dyld_minos_at_least, which read load commands and know the yearly version
+ * sets; an x86_64 header reads the same to them.  dyld_get_active_platform
+ * answers the main image's platform, which for a program ocerz runs is macOS.
+ *
  * ---- the host libraries ----
  * A virtual library stands for the host library of the same install name, and
  * the bridge stands in for exactly the install names the database has a file
@@ -343,6 +368,7 @@
 #include <crt_externs.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <mach-o/loader.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -581,6 +607,218 @@ static void br_identify_corefoundation(void)
         OCERZ_LOG("bridge: CoreFoundation will not open to take the guest's identity: %s\n", dlerror());
 }
 
+static uint64_t br_stack_below(const OcerzCPU *cpu)
+{
+    return (cpu->gpr[OCERZ_RSP] - 128) & ~15ull;
+}
+
+static uint64_t br_caller(const OcerzCPU *cpu)
+{
+    return ocerz_ld(cpu->gpr[OCERZ_RSP], 8);
+}
+
+static const char *br_guest_path(uint64_t g, char *buf, size_t n)
+{
+    if (!g)
+        return NULL;
+    snprintf(buf, n, "%s", (const char *)ocerz_g2h(g));
+    return buf;
+}
+
+static int br_answer(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t rax)
+{
+    br_return(cpu, rax);
+    return br_settle(vm, cpu);
+}
+
+static int br_dlopen_at(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t caller)
+{
+    char path[4096];
+    const char *p = br_guest_path(cpu->gpr[OCERZ_RDI], path, sizeof path);
+    uint64_t h = ocerz_dyld_native_dlopen(vm, p, (int)cpu->gpr[OCERZ_RSI], caller, br_stack_below(cpu));
+    return br_answer(vm, cpu, h);
+}
+
+static int br_dlopen(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_dlopen_at(vm, cpu, br_caller(cpu));
+}
+
+static int br_dlopen_from(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_dlopen_at(vm, cpu, cpu->gpr[OCERZ_RDX]);
+}
+
+static int br_dlopen_preflight(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    char path[4096];
+    const char *p = br_guest_path(cpu->gpr[OCERZ_RDI], path, sizeof path);
+    return br_answer(vm, cpu, (uint64_t)ocerz_dyld_native_dlopen_preflight(p, br_caller(cpu)));
+}
+
+static int br_dlsym(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t name = cpu->gpr[OCERZ_RSI];
+    return br_answer(vm, cpu, ocerz_dyld_native_dlsym(cpu->gpr[OCERZ_RDI],
+                                                      name ? (const char *)ocerz_g2h(name) : NULL,
+                                                      br_caller(cpu)));
+}
+
+static int br_dladdr(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, (uint64_t)ocerz_dyld_native_dladdr(cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI]));
+}
+
+static int br_dlclose(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, (uint64_t)(uint32_t)ocerz_dyld_native_dlclose(cpu->gpr[OCERZ_RDI]));
+}
+
+static int br_dlerror(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, ocerz_dyld_native_dlerror());
+}
+
+static int br_dyld_image_count(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, ocerz_dyld_image_count());
+}
+
+static int br_dyld_image_header(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t mh = 0;
+    ocerz_dyld_image_at((uint32_t)cpu->gpr[OCERZ_RDI], &mh, NULL, NULL);
+    return br_answer(vm, cpu, mh);
+}
+
+static int br_dyld_image_name(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t name = 0;
+    ocerz_dyld_image_at((uint32_t)cpu->gpr[OCERZ_RDI], NULL, NULL, &name);
+    return br_answer(vm, cpu, name);
+}
+
+static int br_dyld_image_vmaddr_slide(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t slide = 0;
+    ocerz_dyld_image_at((uint32_t)cpu->gpr[OCERZ_RDI], NULL, &slide, NULL);
+    return br_answer(vm, cpu, slide);
+}
+
+static int br_dyld_image_slide(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t slide = 0;
+    ocerz_dyld_image_slide(cpu->gpr[OCERZ_RDI], &slide);
+    return br_answer(vm, cpu, slide);
+}
+
+static int br_dyld_register_add_image(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    ocerz_dyld_native_add_image_func(vm, cpu->gpr[OCERZ_RDI], br_stack_below(cpu));
+    return br_answer(vm, cpu, 0);
+}
+
+static int br_dyld_register_remove_image(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    ocerz_dyld_native_remove_image_func(cpu->gpr[OCERZ_RDI]);
+    return br_answer(vm, cpu, 0);
+}
+
+static int br_dyld_image_header_containing(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t mh = 0;
+    ocerz_dyld_image_containing(cpu->gpr[OCERZ_RDI], &mh, NULL);
+    return br_answer(vm, cpu, mh);
+}
+
+static int br_dyld_image_path_containing(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t name = 0;
+    ocerz_dyld_image_containing(cpu->gpr[OCERZ_RDI], NULL, &name);
+    return br_answer(vm, cpu, name);
+}
+
+static int br_dyld_image_containing(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, (uint64_t)ocerz_dyld_image_containing(cpu->gpr[OCERZ_RDI], NULL, NULL));
+}
+
+static int br_dyld_prog_image_header(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, ocerz_main_mh);
+}
+
+static int br_dyld_build_field(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t mh, int field)
+{
+    uint32_t v[3] = { 0, 0, 0 };
+    ocerz_dyld_build_version(mh, &v[0], &v[1], &v[2]);
+    return br_answer(vm, cpu, v[field]);
+}
+
+static int br_dyld_program_sdk_version(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_dyld_build_field(vm, cpu, ocerz_main_mh, 2);
+}
+
+static int br_dyld_program_min_os_version(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_dyld_build_field(vm, cpu, ocerz_main_mh, 1);
+}
+
+static int br_dyld_sdk_version(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_dyld_build_field(vm, cpu, cpu->gpr[OCERZ_RDI], 2);
+}
+
+static int br_dyld_min_os_version(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_dyld_build_field(vm, cpu, cpu->gpr[OCERZ_RDI], 1);
+}
+
+static int br_dyld_active_platform(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t platform = 0, minos, sdk;
+    ocerz_dyld_build_version(ocerz_main_mh, &platform, &minos, &sdk);
+    return br_answer(vm, cpu, platform ? platform : PLATFORM_MACOS);
+}
+
+static int br_dyld_program_sdk_at_least(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, (uint64_t)ocerz_dyld_version_at_least(ocerz_main_mh, cpu->gpr[OCERZ_RDI], 1));
+}
+
+static int br_dyld_program_minos_at_least(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, (uint64_t)ocerz_dyld_version_at_least(ocerz_main_mh, cpu->gpr[OCERZ_RDI], 0));
+}
+
+static int br_dyld_sdk_at_least(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, (uint64_t)ocerz_dyld_version_at_least(cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI], 1));
+}
+
+static int br_dyld_minos_at_least(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, (uint64_t)ocerz_dyld_version_at_least(cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI], 0));
+}
+
+static int br_dyld_is_memory_immutable(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, (uint64_t)ocerz_dyld_is_memory_immutable(cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI]));
+}
+
+static int br_dyld_cache_some_image_overridden(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, 0);
+}
+
+static int br_dyld_cache_contains_path(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    char path[4096];
+    const char *p = br_guest_path(cpu->gpr[OCERZ_RDI], path, sizeof path);
+    return br_answer(vm, cpu, (uint64_t)ocerz_dyld_native_names_library(p));
+}
+
 typedef struct BrHandler {
     const char *name;
     int (*fn)(struct OcerzVM *vm, OcerzCPU *cpu);
@@ -603,6 +841,36 @@ static const BrHandler g_br_handlers[] = {
     { "pthread_kill",    br_pthread_kill },
     { "NSGetExecutablePath",    br_nsgetexecutablepath },
     { "NSGetMachExecuteHeader", br_nsgetmachexecuteheader },
+    { "dlopen",          br_dlopen },
+    { "dlopen_from",     br_dlopen_from },
+    { "dlopen_preflight", br_dlopen_preflight },
+    { "dlsym",           br_dlsym },
+    { "dladdr",          br_dladdr },
+    { "dlclose",         br_dlclose },
+    { "dlerror",         br_dlerror },
+    { "dyld_image_count",            br_dyld_image_count },
+    { "dyld_image_header",           br_dyld_image_header },
+    { "dyld_image_name",             br_dyld_image_name },
+    { "dyld_image_vmaddr_slide",     br_dyld_image_vmaddr_slide },
+    { "dyld_image_slide",            br_dyld_image_slide },
+    { "dyld_register_add_image",     br_dyld_register_add_image },
+    { "dyld_register_remove_image",  br_dyld_register_remove_image },
+    { "dyld_image_header_containing", br_dyld_image_header_containing },
+    { "dyld_image_path_containing",  br_dyld_image_path_containing },
+    { "dyld_image_containing",       br_dyld_image_containing },
+    { "dyld_prog_image_header",      br_dyld_prog_image_header },
+    { "dyld_program_sdk_version",    br_dyld_program_sdk_version },
+    { "dyld_program_min_os_version", br_dyld_program_min_os_version },
+    { "dyld_sdk_version",            br_dyld_sdk_version },
+    { "dyld_min_os_version",         br_dyld_min_os_version },
+    { "dyld_active_platform",        br_dyld_active_platform },
+    { "dyld_program_sdk_at_least",   br_dyld_program_sdk_at_least },
+    { "dyld_program_minos_at_least", br_dyld_program_minos_at_least },
+    { "dyld_sdk_at_least",           br_dyld_sdk_at_least },
+    { "dyld_minos_at_least",         br_dyld_minos_at_least },
+    { "dyld_is_memory_immutable",    br_dyld_is_memory_immutable },
+    { "dyld_cache_some_image_overridden", br_dyld_cache_some_image_overridden },
+    { "dyld_cache_contains_path",    br_dyld_cache_contains_path },
     { "objc_msgSend",              ocerz_objc_msgSend },
     { "objc_msgSendSuper",         ocerz_objc_msgSendSuper },
     { "objc_msgSendSuper2",        ocerz_objc_msgSendSuper2 },

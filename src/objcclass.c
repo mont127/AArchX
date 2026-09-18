@@ -145,11 +145,15 @@
  * is the life of the process.  The tables are guarded by one mutex, since only
  * the loader defines.  .cxx_construct and .cxx_destruct are ordinary methods;
  * the runtime calls them with the object as the only argument, so the slot hands
- * the guest whatever x1 held as _cmd, which neither reads.  The loader's dlopen
- * path defines an image the same way, but nothing runs the +load methods it
- * queues once main has started; native mode's dlopen is still a stub record, so
- * no guest reaches that path, and every defined image is a load-time one.
- * OCERZ_OBJCLOG prints each class, category, protocol and method as it is
+ * the guest whatever x1 held as _cmd, which neither reads.  An image a dlopen
+ * loads is defined the same way, after all of its fixups have bound, and every
+ * +load its definition queues is tagged with that image, so
+ * ocerz_objcbridge_run_image_loads can run one image's +load methods just before
+ * that image's initializers and leave any other image's queued, which is dyld's
+ * order: every new image mapped into the runtime first, then each one's +load
+ * and initializers, dependencies first.  A plug-in whose class subclasses a class
+ * of the main executable finds it defined, because the main image was defined
+ * before main ran.  OCERZ_OBJCLOG prints each class, category, protocol and method as it is
  * defined, each method that cannot cross, and each +load as it runs.
  */
 #include "ocerz/objcbridge.h"
@@ -662,6 +666,7 @@ typedef struct OcDefined {
 typedef struct OcLoad {
     uint64_t cls;
     uint64_t imp;
+    uint64_t image;
     int category;
 } OcLoad;
 
@@ -679,6 +684,7 @@ static OcMap g_oc_classes;
 static OcMap g_oc_protocols;
 static OcLoad *g_oc_loads;
 static size_t g_oc_loads_n, g_oc_loads_cap;
+static uint64_t g_oc_defining;
 static OcDead *_Atomic g_oc_dead;
 
 static OcDefined *oc_defined(uint64_t cls)
@@ -1165,6 +1171,7 @@ static void oc_queue_load(uint64_t cls, uint64_t imp, int category)
     }
     g_oc_loads[g_oc_loads_n].cls = cls;
     g_oc_loads[g_oc_loads_n].imp = imp;
+    g_oc_loads[g_oc_loads_n].image = g_oc_defining;
     g_oc_loads[g_oc_loads_n].category = category;
     g_oc_loads_n++;
 }
@@ -1215,6 +1222,7 @@ int ocerz_objcbridge_define_image(const uint8_t *mh, int64_t slide)
         return 0;
     }
     oc_map_put(&g_oc_images, key, 1);
+    g_oc_defining = key;
     uint32_t flags = im.imageinfo.size >= 8 ? oc_u32(im.imageinfo.addr + 4) : 0;
     int defined = 0;
 
@@ -1238,8 +1246,28 @@ int ocerz_objcbridge_define_image(const uint8_t *mh, int64_t slide)
         oc_schedule_class(oc_word(im.nlclslist.addr + off));
     for (uint64_t off = 0; off + 8 <= im.nlcatlist.size; off += 8)
         oc_schedule_category(oc_word(im.nlcatlist.addr + off), flags);
+    g_oc_defining = 0;
     pthread_mutex_unlock(&g_oc_lock);
     return defined;
+}
+
+static int oc_run_load_list(struct OcerzVM *vm, const OcLoad *loads, size_t n, uint64_t stack_top)
+{
+    int ran = 0;
+    void *pool = ((void *(*)(void))oc_need(&g_oc_pool_push))();
+    uint64_t sel = ocerz_h2g(oc_sel("load"));
+    for (size_t i = 0; i < n && !vm->exited; i++) {
+        if (oc_logging())
+            fprintf(stderr, "ocerz: OBJCLOG[%d] +[%s load]%s at %#llx\n", (int)getpid(),
+                    oc_class_name(ocerz_g2h(loads[i].cls)), loads[i].category ? " (category)" : "",
+                    (unsigned long long)loads[i].imp);
+        uint64_t args[2] = { loads[i].cls, sel };
+        ocerz_vm_call(vm, loads[i].imp, args, 2, stack_top);
+        ran++;
+    }
+    if (!vm->exited)
+        ((void (*)(void *))oc_need(&g_oc_pool_pop))(pool);
+    return ran;
 }
 
 int ocerz_objcbridge_run_loads(struct OcerzVM *vm, uint64_t stack_top)
@@ -1256,21 +1284,28 @@ int ocerz_objcbridge_run_loads(struct OcerzVM *vm, uint64_t stack_top)
             free(loads);
             return ran;
         }
-        void *pool = ((void *(*)(void))oc_need(&g_oc_pool_push))();
-        uint64_t sel = ocerz_h2g(oc_sel("load"));
-        for (size_t i = 0; i < n && !vm->exited; i++) {
-            if (oc_logging())
-                fprintf(stderr, "ocerz: OBJCLOG[%d] +[%s load]%s at %#llx\n", (int)getpid(),
-                        oc_class_name(ocerz_g2h(loads[i].cls)), loads[i].category ? " (category)" : "",
-                        (unsigned long long)loads[i].imp);
-            uint64_t args[2] = { loads[i].cls, sel };
-            ocerz_vm_call(vm, loads[i].imp, args, 2, stack_top);
-            ran++;
-        }
-        if (!vm->exited)
-            ((void (*)(void *))oc_need(&g_oc_pool_pop))(pool);
+        ran += oc_run_load_list(vm, loads, n, stack_top);
         free(loads);
         if (vm->exited)
             return ran;
     }
+}
+
+int ocerz_objcbridge_run_image_loads(struct OcerzVM *vm, const uint8_t *mh, uint64_t stack_top)
+{
+    uint64_t key = (uint64_t)(uintptr_t)mh;
+    pthread_mutex_lock(&g_oc_lock);
+    size_t n = 0, kept = 0;
+    OcLoad *mine = g_oc_loads_n ? malloc(g_oc_loads_n * sizeof *mine) : NULL;
+    for (size_t i = 0; i < g_oc_loads_n; i++) {
+        if (g_oc_loads[i].image == key && mine)
+            mine[n++] = g_oc_loads[i];
+        else
+            g_oc_loads[kept++] = g_oc_loads[i];
+    }
+    g_oc_loads_n = kept;
+    pthread_mutex_unlock(&g_oc_lock);
+    int ran = n ? oc_run_load_list(vm, mine, n, stack_top) : 0;
+    free(mine);
+    return ran;
 }
