@@ -259,6 +259,17 @@
  * stack before they return.  Keying the push on the handler rather than on the
  * export's name keeps the two halves of that convention in one record.
  *
+ * ---- ocerz's own trampolines ----
+ * A native block the guest holds needs an invoke word the guest can call, and
+ * that has to be x86 code that traps, with nothing any library exports behind
+ * it.  So the last library ordinal belongs to no file: vd_lib refuses a
+ * database file that would take it, and its entry indices name handlers in a
+ * table here.  ocerz_vdylib_trampoline writes one page of guest memory the
+ * first time it is asked, a stub of an export's shape per handler with its
+ * jump slot at the page's middle, and makes the page read-only and executable,
+ * so the dispatcher, the JIT's fast call and the xmm contract meet an id they
+ * know how to treat, the contract being a special's.
+ *
  * ---- dyld_stub_binder ----
  * A binary linked with classic lazy binding, which is every Intel binary built
  * for a macOS older than 12, imports dyld_stub_binder from libSystem whether or
@@ -274,6 +285,7 @@
 #include "ocerz/vdylib.h"
 #include "ocerz/abi.h"
 #include "ocerz/apidb.h"
+#include "ocerz/blocks.h"
 #include "ocerz/bridge.h"
 #include "ocerz/dyldapi.h"
 #include "ocerz/flags.h"
@@ -286,6 +298,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include <mach-o/loader.h>
 
 #define VD_PAGE 4096u
@@ -300,6 +313,22 @@
 #define VD_LIBS_MAX (1u << (32 - VD_INDEX_BITS))
 
 #define VD_NONE ((const struct OcerzBridgeFn *)(uintptr_t)1)
+#define VD_INTERNAL_ORD (VD_LIBS_MAX - 1)
+#define VD_TRAMP_SLOTS 0x800u
+
+typedef struct VdInternal {
+    const char *name;
+    int (*handler)(struct OcerzVM *vm, OcerzCPU *cpu);
+} VdInternal;
+
+static const VdInternal g_vd_internal[] = {
+    { "(native block invoke)", ocerz_block_invoke_trap },
+};
+
+#define VD_NINTERNAL ((uint32_t)(sizeof g_vd_internal / sizeof g_vd_internal[0]))
+
+static _Atomic uint64_t g_vd_tramp_page;
+static pthread_mutex_t g_vd_tramp_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct VdFiller {
     const char *name;
@@ -406,9 +435,9 @@ static VdLib *vd_lib(const char *install_name)
     if (!api)
         return NULL;
     int ord = vd_ordinal(api);
-    if (ord < 0 || (uint32_t)ord >= VD_LIBS_MAX) {
+    if (ord < 0 || (uint32_t)ord >= VD_INTERNAL_ORD) {
         OCERZ_FATAL("virtual %s: %s is not one of the first %u files of %s\n", install_name,
-                    api->path, (unsigned)VD_LIBS_MAX, ocerz_apidb_dir() ? ocerz_apidb_dir() : "(none)");
+                    api->path, (unsigned)VD_INTERNAL_ORD, ocerz_apidb_dir() ? ocerz_apidb_dir() : "(none)");
         return NULL;
     }
     if ((uint64_t)api->nentries > (uint64_t)VD_INDEX_MASK + 1) {
@@ -468,8 +497,24 @@ static VdLib *vd_lib_of_id(uint64_t id, const OcerzApiEntry **entry_out)
     return lib;
 }
 
+static const VdInternal *vd_internal_of_id(uint64_t id)
+{
+    if (id > UINT32_MAX || ((uint32_t)id >> VD_INDEX_BITS) != VD_INTERNAL_ORD)
+        return NULL;
+    uint32_t idx = (uint32_t)id & VD_INDEX_MASK;
+    return idx < VD_NINTERNAL ? &g_vd_internal[idx] : NULL;
+}
+
 int ocerz_vdylib_export_name(uint64_t id, const char **lib_out, const char **sym_out)
 {
+    const VdInternal *in = vd_internal_of_id(id);
+    if (in) {
+        if (lib_out)
+            *lib_out = "ocerz";
+        if (sym_out)
+            *sym_out = in->name;
+        return 1;
+    }
     const OcerzApiEntry *e = NULL;
     VdLib *lib = vd_lib_of_id(id, &e);
     if (!lib)
@@ -932,6 +977,9 @@ static inline __attribute__((always_inline)) int vd_dispatch(struct OcerzVM *vm,
     }
 
     uint64_t id = cpu->gpr[OCERZ_R11] & 0xffffffffull;
+    const VdInternal *in = vd_internal_of_id(id);
+    if (in)
+        return in->handler(vm, cpu);
     const OcerzApiEntry *e = NULL;
     VdLib *lib = vd_lib_of_id(id, &e);
     if (!lib) {
@@ -966,6 +1014,11 @@ int ocerz_vdylib_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 int ocerz_vdylib_xmm_contract(uint64_t id, uint16_t *in, uint16_t *out)
 {
     const OcerzApiEntry *e = NULL;
+    if (in && out && vd_internal_of_id(id)) {
+        *in = 0xff;
+        *out = 0x3;
+        return 1;
+    }
     if (!in || !out || !vd_lib_of_id(id, &e))
         return 0;
     if (e->kind == OCERZ_API_FN) {
@@ -1007,4 +1060,45 @@ int ocerz_vdylib_fastcall(struct OcerzVM *vm, OcerzCPU *cpu)
     if (rc == OCERZ_STEP_EXIT || rc == OCERZ_STEP_FATAL)
         return rc + 1;
     return OCERZ_STEP_OK + 1;
+}
+
+uint64_t ocerz_vdylib_trampoline(unsigned which)
+{
+    if (which >= VD_NINTERNAL)
+        return 0;
+    uint64_t page = atomic_load(&g_vd_tramp_page);
+    if (page)
+        return page + (uint64_t)which * VD_STUB_STRIDE;
+
+    pthread_mutex_lock(&g_vd_tramp_lock);
+    page = atomic_load(&g_vd_tramp_page);
+    if (!page) {
+        uint64_t made = ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE);
+        if (made) {
+            uint8_t *buf = ocerz_g2h(made);
+            memset(buf, 0xcc, OCERZ_GUEST_PAGE_SIZE);
+            for (uint32_t k = 0; k < VD_NINTERNAL; k++) {
+                uint8_t *s = buf + (size_t)k * VD_STUB_STRIDE;
+                uint64_t slot = VD_TRAMP_SLOTS + (uint64_t)k * VD_SLOT_BYTES;
+                s[0] = 0x41;
+                s[1] = 0xbb;
+                wr32(s + 2, (VD_INTERNAL_ORD << VD_INDEX_BITS) | k);
+                s[6] = 0xff;
+                s[7] = 0x25;
+                wr32(s + 8, (uint32_t)(int32_t)((int64_t)slot - (int64_t)((uint64_t)k * VD_STUB_STRIDE + 12)));
+                wr64(buf + slot, OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF);
+            }
+            if (ocerz_protect(made, OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_EXEC) == OCERZ_OK) {
+                page = made;
+                atomic_store(&g_vd_tramp_page, page);
+            } else {
+                ocerz_unmap(made, OCERZ_GUEST_PAGE_SIZE);
+            }
+        }
+        if (!page)
+            fprintf(stderr, "ocerz: vdylib: no read-only guest page could be set up for ocerz's own"
+                    " trampolines\n");
+    }
+    pthread_mutex_unlock(&g_vd_tramp_lock);
+    return page ? page + (uint64_t)which * VD_STUB_STRIDE : 0;
 }

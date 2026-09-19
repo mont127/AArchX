@@ -4970,6 +4970,70 @@ static void test_struct_parse(void)
     }
 }
 
+static void test_block_parse(void)
+{
+    static const struct {
+        const char *notation;
+        char ret;
+        const char *ret_cb;
+        int nargs;
+        int karg;
+        const char *cb;
+    } kAccept[] = {
+        { "v(pk{v()})", 'v', "", 2, 1, "v()" },
+        { "v(Lpk{v(L)})", 'v', "", 3, 2, "v(L)" },
+        { "k{v()}(Lk{v()})", 'k', "v()", 2, 1, "v()" },
+        { "v(k{})", 'v', "", 1, 0, "" },
+        { "k{}(pp)", 'k', "", 2, -1, NULL },
+        { "v(k{v(k{})})", 'v', "", 1, 0, "v(k{})" },
+        { "v(k{v(k{v(L)})})", 'v', "", 1, 0, "v(k{v(L)})" },
+        { "v(k{{dd}(p{dd})}d)", 'v', "", 2, 0, "{dd}(p{dd})" },
+        { "v(pLLk{i(pp)})", 'v', "", 4, 3, "i(pp)" },
+        { "p(pLBlk{v(pL)})", 'p', "", 5, 4, "v(pL)" },
+        { "v(c{v(k{v()})})", 'v', "", 1, -1, NULL },
+        { "v(k{v()}{dd})", 'v', "", 2, 0, "v()" },
+    };
+    static const char *const kReject[] = {
+        "v(k)", "v(kp)", "k(p)", "k()", "v(k{v()}", "v(k{", "v(k{x})", "v(k{v(v)})",
+        "v(k{v(c{v()})})", "v({k})", "v({dk{}})", "{k{}}()", "v(k{v()})x", "v(k{v(pppppppppppppppppppppppppppppppppppppppppppp)})",
+        "v(k{i})", "v(k{()})", "v(k{v(k)})", "v(k})", "v(k{{}})",
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof kAccept / sizeof kAccept[0]; i++) {
+        OcerzAbiSig sig;
+        int r;
+
+        memset(&sig, 0xa5, sizeof sig);
+        r = ocerz_abi_parse(kAccept[i].notation, &sig);
+        CHECK(r == OCERZ_OK && sig.ret == kAccept[i].ret && sig.nargs == kAccept[i].nargs &&
+                  strcmp(sig.ret == 'k' ? sig.ret_cb : "", kAccept[i].ret_cb) == 0,
+              "ocerz_abi_parse(\"%s\") returned %d with result '%c', %d argument(s) and result block %s",
+              kAccept[i].notation, r, sig.ret, sig.nargs, sig.ret == 'k' ? sig.ret_cb : "-");
+        if (r == OCERZ_OK && kAccept[i].karg >= 0)
+            CHECK(sig.arg[kAccept[i].karg] == 'k' && strcmp(sig.cb[kAccept[i].karg], kAccept[i].cb) == 0,
+                  "ocerz_abi_parse(\"%s\") gave argument %d class '%c' declared %s, want k declared %s",
+                  kAccept[i].notation, kAccept[i].karg, sig.arg[kAccept[i].karg], sig.cb[kAccept[i].karg],
+                  kAccept[i].cb);
+    }
+    for (i = 0; i < sizeof kReject / sizeof kReject[0]; i++) {
+        OcerzAbiSig sig;
+        int r;
+
+        memset(&sig, 0xa5, sizeof sig);
+        r = ocerz_abi_parse(kReject[i], &sig);
+        CHECK(r != OCERZ_OK, "ocerz_abi_parse(\"%s\") accepted a block notation that is not well formed",
+              kReject[i]);
+    }
+
+    OcerzAbiSig sig;
+    uint16_t in = 0xffff, out = 0xffff;
+    CHECK(ocerz_abi_parse("k{v()}(dk{v()}d)", &sig) == OCERZ_OK && !ocerz_abi_register_only(&sig),
+          "a signature with a block argument is taken for a register-only crossing");
+    ocerz_abi_xmm_contract(&sig, &in, &out);
+    CHECK(in == 0x3 && out == 0, "k{v()}(dk{v()}d) reads xmm mask %#x and writes %#x, want 0x3 and 0", in, out);
+}
+
 static int report(void)
 {
     printf("test_abi: %d checks, %d failed\n", checks, failures);
@@ -5019,6 +5083,7 @@ int main(void)
     test_structs();
     test_struct_frames();
     test_struct_parse();
+    test_block_parse();
 
     return report();
 }

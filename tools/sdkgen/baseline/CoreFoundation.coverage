@@ -1,11 +1,10 @@
 library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
 sdk macos 27.0
 exports 3098
-fn 778
+fn 781
 data 1230
 var 0
 special 2
-stub block 3
 stub callback-result 2
 stub callback-struct 31
 stub no-declaration 999

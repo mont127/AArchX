@@ -360,6 +360,7 @@
 #include "ocerz/bridge.h"
 #include "ocerz/apidb.h"
 #include "ocerz/abi.h"
+#include "ocerz/blocks.h"
 #include "ocerz/vm.h"
 #include "ocerz/dyld.h"
 #include "ocerz/mem.h"
@@ -945,6 +946,8 @@ static const BrHandler g_br_handlers[] = {
     { "system",          ocerz_sys_system },
     { "popen",           ocerz_sys_popen },
     { "pclose",          ocerz_sys_pclose },
+    { "Block_copy",                ocerz_block_special_copy },
+    { "Block_object_assign",       ocerz_block_special_object_assign },
 };
 
 static int (*br_handler(const char *name))(struct OcerzVM *, OcerzCPU *)

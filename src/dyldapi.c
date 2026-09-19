@@ -86,6 +86,7 @@ static void hinfo_diag(const char *tag, uint64_t mh);
 static void closure_add(uint64_t mh);
 static int hinfo_ro_index(uint64_t mh);
 static uint64_t objc_index_loaded(uint32_t idx);
+static void api_return(OcerzCPU *cpu, uint64_t result);
 
 static void methdump_diag(const char *tag)
 {
@@ -553,6 +554,93 @@ static void compute_closure(struct OcerzCache *cache, uint64_t main_mh)
                                      g_closure_hash_mask);
     for (int i = 0; i < g_disk_n; i++)
         closure_add(g_disk_mh[i]);
+}
+
+static const char *lazy_load_path(uint64_t mh, uint64_t flag, int *weak)
+{
+    const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
+    if (!h || h->magic != MH_MAGIC_64 || !flag)
+        return NULL;
+    uint64_t slide = image_slide(mh), le_addr = 0, le_fileoff = 0, le_size = 0;
+    const uint8_t *lc = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *s = (const void *)lc;
+            if (strcmp(s->segname, "__LINKEDIT") == 0) {
+                le_addr = s->vmaddr + slide;
+                le_fileoff = s->fileoff;
+                le_size = s->filesize;
+            }
+        }
+        lc += l->cmdsize;
+    }
+    if (!le_addr)
+        return NULL;
+    lc = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_LAZY_LOAD_DYLIB_INFO && l->cmdsize >= sizeof(struct linkedit_data_command)) {
+            uint32_t dataoff, datasize;
+            memcpy(&dataoff, lc + 8, 4);
+            memcpy(&datasize, lc + 12, 4);
+            if (dataoff >= le_fileoff && dataoff - le_fileoff <= le_size &&
+                datasize >= 24 && datasize <= le_size - (dataoff - le_fileoff)) {
+                const uint8_t *info = (const uint8_t *)(uintptr_t)(le_addr + dataoff - le_fileoff);
+                uint32_t pathoff, flagoff, flags, chainoff, symcount;
+                uint16_t ptrfmt;
+                memcpy(&pathoff, info, 4);
+                memcpy(&flagoff, info + 4, 4);
+                memcpy(&flags, info + 8, 2);
+                memcpy(&ptrfmt, info + 10, 2);
+                memcpy(&chainoff, info + 12, 4);
+                memcpy(&symcount, info + 16, 4);
+                if (mh + flagoff == flag && pathoff < datasize) {
+                    const char *path = (const char *)info + pathoff;
+                    if (memchr(path, '\0', datasize - pathoff)) {
+                        if (getenv("OCERZ_LAZYLOADLOG"))
+                            fprintf(stderr, "ocerz: LAZYLOAD path=%s flag=%#llx fmt=%u chain=%#x symbols=%u\n",
+                                    path, (unsigned long long)flag, (unsigned)ptrfmt,
+                                    (unsigned)chainoff, (unsigned)symcount);
+                        if (weak)
+                            *weak = flags & 1;
+                        return path;
+                    }
+                }
+            }
+        }
+        lc += l->cmdsize;
+    }
+    return NULL;
+}
+
+static int api_lazy_load(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t flag = cpu->gpr[OCERZ_RSI];
+    uint64_t mh = cpu->gpr[OCERZ_RDX];
+    int weak = 0;
+    const char *path = lazy_load_path(mh, flag, &weak);
+    if (!path) {
+        OCERZ_LOG("dyldapi: lazy_load flag=%#llx mh=%#llx has no matching metadata\n",
+                  (unsigned long long)flag, (unsigned long long)mh);
+        api_return(cpu, 0);
+        return OCERZ_STEP_OK;
+    }
+    if (ocerz_ld(flag, 4) == 0) {
+        OcerzCPU saved = *cpu;
+        uint64_t handle = ocerz_dlopen(vm, path, 0x100);
+        *cpu = saved;
+        if (vm->jit_ordered_required)
+            cpu->ras_top = 0;
+        if (vm->exited)
+            return OCERZ_STEP_OK;
+        if (handle)
+            ocerz_st(flag, 4, 1);
+        else if (!weak)
+            OCERZ_LOG("dyldapi: lazy_load failed for %s\n", path);
+    }
+    api_return(cpu, 0);
+    return OCERZ_STEP_OK;
 }
 
 int ocerz_dyldapi_setup(struct OcerzCache *cache)
@@ -1959,6 +2047,8 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x3b0:
         api_return(cpu, g_headeropt_ro);
         return OCERZ_STEP_OK;
+    case 0x438:
+        return api_lazy_load(vm, cpu);
     default:
         OCERZ_LOG("dyldapi: unimplemented vtable slot +%#llx (this=%#llx a0=%#llx a1=%#llx a2=%#llx caller=%#llx)\n",
                   (unsigned long long)off, (unsigned long long)cpu->gpr[OCERZ_RDI],

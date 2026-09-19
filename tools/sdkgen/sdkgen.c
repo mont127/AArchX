@@ -69,6 +69,17 @@
  * passed as its first member by both ABIs, so dispatch_object_t is p, and every
  * member is walked as a pointer below.
  *
+ * A block pointer becomes k with the notation of the block's function type in
+ * braces, the block itself, which every block function takes first, left
+ * implicit: dispatch_block_t is k{v()} and dispatch_apply's block k{v(L)}.
+ * That notation follows a callback's rules - at most 47 characters and no
+ * function pointer in it - but may name blocks of its own, and a structure
+ * holding a block is still refused, as block, since a block cannot be carried
+ * inside braces.  A block result hands the guest a reference it has to know it
+ * owns, so a function returning one crosses only when its declaration says the
+ * reference is the caller's with ns_returns_retained, which is what libdispatch's
+ * DISPATCH_RETURNS_RETAINED_BLOCK expands to, and is block-result otherwise.
+ *
  * A structure passed or returned by value becomes braces around its members'
  * classes, flattened: a nested structure is braces inside braces, and an array
  * is its elements one after another, scalars or structures alike.  The engine
@@ -92,8 +103,8 @@
  *
  * The other refusals, each a stub reason: variadic; long-double, which is 80
  * bits on one side and 64 on the other; va-list, spotted as a pointer to
- * x86_64's __va_list_tag; block; too-many-args past sixteen; nested-callback;
- * callback-too-long; callback-result for a function pointer handed back to the
+ * x86_64's __va_list_tag; block-too-long; block-result; too-many-args past
+ * sixteen; nested-callback; callback-too-long; callback-result for a function pointer handed back to the
  * guest, which would be arm64 code; callback-pointer for a pointer to a
  * function pointer; no-prototype; complex, vector, int128, float-width, atomic
  * and unexposed-type for the rarer kinds; and arch-mismatch when the two
@@ -115,7 +126,7 @@
  * record holding a function pointer or a block in its own storage is
  * callback-struct, because native code would call guest code through it, unless
  * the overrides give that argument a struct record.  The same checks run on a
- * pointer result, on the parameters of a callback, on every pointer member of a
+ * pointer result, on the parameters of a callback or a block, on every pointer member of a
  * structure passed or returned by value, and on a parameter declared as an
  * array, which is a pointer to its first element however the header spells
  * it.  The walk through pointer fields can meet a cycle, so a record found
@@ -604,6 +615,16 @@ static Map g_tu_memo;
 static int *g_tu_val;
 static int g_tu_cap;
 
+static int returns_retained(CXCursor decl)
+{
+    void *policy = clang_getCursorPrintingPolicy(decl);
+    char *text = cx(clang_getCursorPrettyPrinted(decl, policy));
+    clang_PrintingPolicy_dispose(policy);
+    int hit = strstr(text, "ns_returns_retained") != NULL;
+    free(text);
+    return hit;
+}
+
 static int transparent_union(CXType c)
 {
     CXCursor decl = clang_getTypeDeclaration(c);
@@ -724,6 +745,8 @@ static const char *flat_type(Flat *f, CXType t, int depth, int level, long long 
         return "struct-flexible-array";
     if (c.kind == TK.Pointer && is_fn_kind(canon(clang_getPointeeType(c)).kind) && !is_imp(t))
         return "struct-callback";
+    if (c.kind == TK.BlockPointer)
+        return "block";
     Buf one = { 0 };
     const char *r = type_class(t, depth, 0, &one);
     if (!r) {
@@ -862,8 +885,19 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
         buf_addc(out, 'p');
         return NULL;
     }
-    if (k == TK.BlockPointer)
-        return "block";
+    if (k == TK.BlockPointer) {
+        Buf bb = { 0 };
+        const char *r = fn_notation(canon(clang_getPointeeType(c)), depth + 1, &bb);
+        if (!r && bb.n >= SIG_CB_MAX)
+            r = "block-too-long";
+        if (!r) {
+            buf_add(out, "k{");
+            buf_add(out, bb.s);
+            buf_addc(out, '}');
+        }
+        free(bb.s);
+        return r;
+    }
     if (k == TK.ObjCObjectPointer || k == TK.ObjCId || k == TK.ObjCClass || k == TK.ObjCSel) {
         buf_addc(out, 'p');
         return NULL;
@@ -951,9 +985,40 @@ static int sig_struct_valid(const char **sp, int level, int *members)
     return 1;
 }
 
+static int sig_block_valid(const char **sp)
+{
+    const char *open = *sp + 2, *close = open;
+    int level = 0;
+    for (; *close; close++) {
+        if (*close == '{')
+            level++;
+        else if (*close == '}' && level-- == 0)
+            break;
+    }
+    if (*close != '}')
+        return 0;
+    size_t len = (size_t)(close - open);
+    if (len >= SIG_CB_MAX || memchr(open, 'c', len))
+        return 0;
+    if (len > 0) {
+        char inner[SIG_CB_MAX];
+        memcpy(inner, open, len);
+        inner[len] = 0;
+        if (!sig_valid(inner, 0))
+            return 0;
+    }
+    *sp = close + 1;
+    return 1;
+}
+
 static int sig_class_valid(const char **sp, int allow_cb, int is_result)
 {
     const char *s = *sp;
+    if (*s == 'k') {
+        if (s[1] != '{')
+            return 0;
+        return sig_block_valid(sp);
+    }
     if (*s == '{') {
         int members = 0;
         if (!sig_struct_valid(&s, 1, &members))
@@ -1322,6 +1387,13 @@ static const char *pair_checks(CXType fx, CXType fa, int depth, const Waiver *w,
         }
         if (canon(tx).kind == TK.Record && canon(ta).kind == TK.Record) {
             const char *r = value_checks(tx, ta);
+            if (r)
+                return r;
+            continue;
+        }
+        if (canon(tx).kind == TK.BlockPointer && canon(ta).kind == TK.BlockPointer) {
+            CXType bxs = clang_getPointeeType(desugar_to(tx, TK.BlockPointer, TK.BlockPointer));
+            const char *r = pair_checks(bxs, clang_getPointeeType(canon(ta)), depth + 1, NULL, 0);
             if (r)
                 return r;
             continue;
@@ -2007,6 +2079,8 @@ static void classify(Rec *r)
                     die("overrides:%d: no shape %s version 0", w[j].line, w[j].shape);
             }
             const char *rc = pair_checks(tx, ta, 0, w, nw);
+            if (!rc && buf_str(&sx)[0] == 'k' && !returns_retained(x))
+                rc = "block-result";
             if (rc) {
                 set_stub(r, rc);
             } else {

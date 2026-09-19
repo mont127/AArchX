@@ -258,6 +258,7 @@
  * regardless.
  */
 #include "ocerz/abi.h"
+#include "ocerz/blocks.h"
 #include "ocerz/bridge.h"
 #include "ocerz/mem.h"
 #include "ocerz/interp.h"
@@ -294,12 +295,12 @@ static int abi_is_scalar_class(char c)
 
 static int abi_is_arg_class(char c)
 {
-    return c == 'c' || c == '{' || abi_is_scalar_class(c);
+    return c == 'c' || c == 'k' || c == '{' || abi_is_scalar_class(c);
 }
 
 static int abi_is_ret_class(char c)
 {
-    return c == 'v' || c == '{' || abi_is_scalar_class(c);
+    return c == 'v' || c == 'k' || c == '{' || abi_is_scalar_class(c);
 }
 
 static int abi_is_fp(char c)
@@ -387,6 +388,10 @@ static int abi_parse_struct(const char *notation, const char **cursor, int depth
             return OCERZ_EUNSUP;
         } else if (c == 'c') {
             OCERZ_LOG("abi: %s puts a callback inside a structure, which this engine does not carry\n",
+                      notation);
+            return OCERZ_EUNSUP;
+        } else if (c == 'k') {
+            OCERZ_LOG("abi: %s puts a block inside a structure, which this engine does not carry\n",
                       notation);
             return OCERZ_EUNSUP;
         } else if (c == '\0') {
@@ -482,6 +487,68 @@ static int abi_parse_callback(const char *notation, int index, const char **curs
     return OCERZ_OK;
 }
 
+static int abi_parse_block(const char *notation, int index, const char **cursor, char *out)
+{
+    const char *open = *cursor;
+    char where[32];
+
+    if (index < 0)
+        snprintf(where, sizeof where, "its result");
+    else
+        snprintf(where, sizeof where, "argument %d", index);
+
+    if (*open != '{') {
+        OCERZ_LOG("abi: %s gives %s class k with no signature in braces after it\n", notation, where);
+        return OCERZ_EFORMAT;
+    }
+    open++;
+
+    const char *close = open;
+    int depth = 0;
+    for (; *close; close++) {
+        if (*close == '{') {
+            depth++;
+        } else if (*close == '}') {
+            if (depth == 0)
+                break;
+            depth--;
+        }
+    }
+    if (*close != '}') {
+        OCERZ_LOG("abi: %s opens a block signature for %s and never closes it\n", notation, where);
+        return OCERZ_EFORMAT;
+    }
+
+    size_t len = (size_t)(close - open);
+    if (memchr(open, 'c', len)) {
+        OCERZ_LOG("abi: %s gives the block in %s a signature that takes a callback\n", notation, where);
+        return OCERZ_EUNSUP;
+    }
+    if (len >= OCERZ_ABI_CB_MAX) {
+        OCERZ_LOG("abi: %s gives the block in %s a signature longer than the %d characters one may have\n",
+                  notation, where, OCERZ_ABI_CB_MAX - 1);
+        return OCERZ_ETOOLONG;
+    }
+
+    char nested[OCERZ_ABI_CB_MAX];
+    memcpy(nested, open, len);
+    nested[len] = '\0';
+
+    if (len > 0) {
+        OcerzAbiSig inner;
+        int rc = ocerz_abi_parse(nested, &inner);
+        if (rc != OCERZ_OK) {
+            OCERZ_LOG("abi: %s gives the block in %s the signature %s, which does not parse\n",
+                      notation, where, nested);
+            return rc;
+        }
+    }
+
+    memcpy(out, nested, len + 1);
+    *cursor = close + 1;
+    return OCERZ_OK;
+}
+
 int ocerz_abi_parse(const char *notation, OcerzAbiSig *out)
 {
     if (!notation || !out)
@@ -504,6 +571,11 @@ int ocerz_abi_parse(const char *notation, OcerzAbiSig *out)
             return rc;
     } else {
         p++;
+        if (ret == 'k') {
+            int rc = abi_parse_block(notation, -1, &p, sig.ret_cb);
+            if (rc != OCERZ_OK)
+                return rc;
+        }
     }
 
     if (*p != '(') {
@@ -531,6 +603,10 @@ int ocerz_abi_parse(const char *notation, OcerzAbiSig *out)
             p++;
             if (c == 'c') {
                 int rc = abi_parse_callback(notation, sig.nargs, &p, sig.cb[sig.nargs]);
+                if (rc != OCERZ_OK)
+                    return rc;
+            } else if (c == 'k') {
+                int rc = abi_parse_block(notation, sig.nargs, &p, sig.cb[sig.nargs]);
                 if (rc != OCERZ_OK)
                     return rc;
             }
@@ -805,10 +881,8 @@ static int abi_host_struct_out(const OcerzAbiStruct *st, const uint8_t *buf, Oce
     return abi_push_host_bytes(call, off, buf, words * 8, 8);
 }
 
-int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCall *call)
+static int abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCall *call)
 {
-    if (!sig || !cpu || !call)
-        return OCERZ_EUNDEF;
     if (sig->nargs < 0 || sig->nargs > OCERZ_ABI_MAX_ARGS)
         return OCERZ_ETOOLONG;
     if (!abi_is_ret_class(sig->ret)) {
@@ -874,6 +948,17 @@ int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCa
                 return OCERZ_EUNSUP;
             }
             val = fn ? (uint64_t)(uintptr_t)ocerz_g2h(fn) : 0;
+        } else if (c == 'k') {
+            uint64_t owned = 0;
+            if (ocerz_block_to_native(raw, sig->cb[i], &val, &owned) != OCERZ_OK) {
+                fprintf(stderr,
+                        "ocerz: abi: argument %d is block %#llx, which could not be made a block native"
+                        " code can call, so the call is refused\n",
+                        i, (unsigned long long)raw);
+                return OCERZ_EUNSUP;
+            }
+            if (owned)
+                call->owned[call->nowned++] = owned;
         } else {
             val = abi_narrow(c, raw);
         }
@@ -891,6 +976,26 @@ int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCa
 
     call->nstack = (int)((host_off + 7) / 8);
     return OCERZ_OK;
+}
+
+int ocerz_abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiCall *call)
+{
+    if (!sig || !cpu || !call)
+        return OCERZ_EUNDEF;
+    call->nowned = 0;
+    int rc = abi_read_guest(sig, cpu, call);
+    if (rc != OCERZ_OK)
+        ocerz_abi_release_owned(call);
+    return rc;
+}
+
+void ocerz_abi_release_owned(OcerzAbiCall *call)
+{
+    if (!call)
+        return;
+    for (int k = call->nowned - 1; k >= 0; k--)
+        ocerz_block_release(call->owned[k]);
+    call->nowned = 0;
 }
 
 int ocerz_abi_va_start(const OcerzAbiSig *named, const OcerzCPU *cpu, OcerzAbiVaList *va)
@@ -1012,6 +1117,18 @@ void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, const OcerzAb
     if (!sig || !cpu || !call)
         return;
 
+    if (sig->ret == 'k') {
+        uint64_t g = 0;
+        if (ocerz_block_result_to_guest(call->rx[0], sig->ret_cb, call->borrowed, &g) != OCERZ_OK)
+            fprintf(stderr, "ocerz: abi: native code returned block %#llx, which could not be made a block"
+                    " guest code can call, so the guest is handed null\n", (unsigned long long)call->rx[0]);
+        cpu->gpr[OCERZ_RAX] = g;
+        uint64_t rsp = cpu->gpr[OCERZ_RSP];
+        cpu->rip = ocerz_ld(rsp, 8);
+        cpu->gpr[OCERZ_RSP] = rsp + 8;
+        return;
+    }
+
     if (sig->ret != '{') {
         abi_write_scalar_result(sig->ret, cpu, call->rx[0], call->rv[0]);
         return;
@@ -1088,11 +1205,12 @@ int ocerz_abi_perform_registers(const OcerzAbiSig *sig, const void *fn, OcerzCPU
 }
 
 __attribute__((noinline))
-static int abi_perform_general(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu)
+static int abi_perform_general(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu, int borrowed)
 {
     OcerzAbiCall call;
     if (ocerz_abi_read_guest(sig, cpu, &call) != OCERZ_OK)
         return OCERZ_STEP_FATAL;
+    call.borrowed = borrowed;
 
     uint64_t fpcr = ocerz_abi_round_swap(OCERZ_ABI_ROUND_NEAREST);
     ocerz_abi_call_native(fn, call.x, call.v, call.stack, (uint64_t)call.nstack * 8, call.x8,
@@ -1100,6 +1218,7 @@ static int abi_perform_general(const OcerzAbiSig *sig, const void *fn, OcerzCPU 
     ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
 
     ocerz_abi_write_result(sig, cpu, &call);
+    ocerz_abi_release_owned(&call);
     return OCERZ_STEP_OK;
 }
 
@@ -1111,7 +1230,18 @@ int ocerz_abi_perform(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu)
     }
     if (ocerz_abi_register_only(sig))
         return ocerz_abi_perform_registers(sig, fn, cpu);
-    return abi_perform_general(sig, fn, cpu);
+    return abi_perform_general(sig, fn, cpu, 0);
+}
+
+int ocerz_abi_perform_borrowed(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu)
+{
+    if (!sig || !fn || !cpu) {
+        OCERZ_FATAL("abi: a crossing with no signature, no address or no cpu\n");
+        return OCERZ_STEP_FATAL;
+    }
+    if (ocerz_abi_register_only(sig))
+        return ocerz_abi_perform_registers(sig, fn, cpu);
+    return abi_perform_general(sig, fn, cpu, 1);
 }
 
 typedef struct AbiShape {
@@ -1463,6 +1593,8 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
 
     OcerzGuestCall call;
     memset(&call, 0, sizeof call);
+    uint64_t owned[OCERZ_ABI_MAX_ARGS];
+    int nowned = 0;
 
     const int slots = (int)(sizeof call.stack / sizeof call.stack[0]);
     int nx = 0, nv = 0, gi = 0, gf = 0;
@@ -1492,7 +1624,7 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
                         (unsigned long long)e->guest_fn, slot, notation, i,
                         rc == OCERZ_EFORMAT ? "through a copy, and the native caller passed a null address"
                                             : "from the native caller's stack, and no stack was passed");
-                return;
+                goto out;
             }
             abi_struct_pointers(st, buf, 0);
             if (!abi_guest_struct_out(st, buf, &call, &gi, &gf)) {
@@ -1500,7 +1632,7 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
                         "ocerz: abi: guest function %#llx (callback slot %u, %s) stacks more than the %d"
                         " eightbytes a guest call carries\n",
                         (unsigned long long)e->guest_fn, slot, notation, slots);
-                return;
+                goto out;
             }
             continue;
         }
@@ -1516,11 +1648,26 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
                     "ocerz: abi: guest function %#llx (callback slot %u, %s) takes argument %d from"
                     " the native caller's stack, and no stack was passed\n",
                     (unsigned long long)e->guest_fn, slot, notation, i);
-            return;
+            goto out;
         }
 
-        uint64_t val = c == 'p' ? (raw ? ocerz_h2g((const void *)(uintptr_t)raw) : 0)
-                                : abi_narrow(c, raw);
+        uint64_t val;
+        if (c == 'p') {
+            val = raw ? ocerz_h2g((const void *)(uintptr_t)raw) : 0;
+        } else if (c == 'k') {
+            uint64_t made = 0;
+            if (ocerz_block_to_guest(raw, sig->cb[i], &val, &made) != OCERZ_OK) {
+                fprintf(stderr,
+                        "ocerz: abi: guest function %#llx (callback slot %u, %s) is handed native block"
+                        " %#llx as argument %d, which could not be made a block guest code can call\n",
+                        (unsigned long long)e->guest_fn, slot, notation, (unsigned long long)raw, i);
+                goto out;
+            }
+            if (made)
+                owned[nowned++] = made;
+        } else {
+            val = abi_narrow(c, raw);
+        }
 
         if (fp && gf < ABI_GUEST_FP_REGS) {
             call.xmm[gf++] = val;
@@ -1533,7 +1680,7 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
                     "ocerz: abi: guest function %#llx (callback slot %u, %s) stacks more than the %d"
                     " eightbytes a guest call carries\n",
                     (unsigned long long)e->guest_fn, slot, notation, slots);
-            return;
+            goto out;
         }
     }
 
@@ -1545,10 +1692,17 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
     ocerz_bridge_guest_leave(&saved);
 
     if (rc != OCERZ_OK || vm->exited)
-        return;
+        goto out;
 
     switch (sig->ret) {
     case 'v':
+        break;
+    case 'k':
+        if (ocerz_block_result_to_native(call.rax, sig->ret_cb, &out_x[0]) != OCERZ_OK)
+            fprintf(stderr,
+                    "ocerz: abi: guest function %#llx (callback slot %u, %s) returned block %#llx, which"
+                    " could not be made a block native code can call, so native code is handed null\n",
+                    (unsigned long long)e->guest_fn, slot, notation, (unsigned long long)call.rax);
         break;
     case '{':
         abi_host_struct_result(&sig->ret_struct, &call, guest_ret, x8, out_x, out_v);
@@ -1566,4 +1720,8 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
         out_x[0] = abi_narrow(sig->ret, call.rax);
         break;
     }
+
+out:
+    while (nowned > 0)
+        ocerz_block_release(owned[--nowned]);
 }

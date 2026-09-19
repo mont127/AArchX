@@ -266,7 +266,8 @@
 # objc_opt_class, objc_getProperty and the rest on a program's behalf, and no
 # public header declares any of them.  Their fn records carry objc4's own
 # signatures, with BOOL written b because it is signed char on x86_64.
-# objc_retainBlock copies a block exactly as libSystem's _Block_copy does.
+# objc_retainBlock is _Block_copy by another name, and is answered with it
+# under Blocks below.
 #
 # ---- Foundation ----
 # NSLog is a format veneer and NSLogv stays a stub.  NSFrameAddress,
@@ -704,7 +705,6 @@ fn _objc_retain objc_retain p(p)
 fn _objc_retainAutorelease objc_retainAutorelease p(p)
 fn _objc_retainAutoreleaseReturnValue objc_retainAutoreleaseReturnValue p(p)
 fn _objc_retainAutoreleasedReturnValue objc_retainAutoreleasedReturnValue p(p)
-fn _objc_retainBlock objc_retainBlock p(p)
 fn _objc_retain_autorelease objc_retain_autorelease p(p)
 fn _objc_setProperty objc_setProperty v(pplpbb)
 fn _objc_setProperty_atomic objc_setProperty_atomic v(pppl)
@@ -737,3 +737,32 @@ struct _CGPSConverterCreate 1 CGPSConverterCallbacks
 library /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
 
 stub _NSAccessibilityRaiseBadArgumentException override
+
+# ---- Blocks ----
+# A block a guest compiled has x86 code in its invoke word and in its
+# descriptor's copy and dispose helpers, and in native mode its isa is the
+# native class, because __NSConcreteStackBlock and its siblings bind to the
+# host's own variables.  A block parameter or result of a function crosses as
+# class k, with the block type's own signature in the braces, and src/blocks.c
+# wraps the block for the other side.  The runtime functions a guest imports
+# are libclosure's, and the native ones are right for every block but one: a
+# guest stack block, whose copy helper _Block_copy would call as arm64 code, and
+# a __block variable still on the stack whose keep helper _Block_object_assign
+# would.  So _Block_copy, and objc_retainBlock, which is the same function,
+# are special records whose handler copies a guest stack block guest-side and
+# gives the heap copy a descriptor whose helpers are callback slots, and
+# _Block_object_assign is one that does the same for its block and __block
+# cases and hands every other case to the native function.  _Block_release and
+# _Block_object_dispose cross by rule: the heap blocks and __block variables
+# they free have helpers native code can call, whichever side made them.
+# _NSConcreteStackBlock and the other classes stay data bound to the native
+# variables, so a guest block is a native object that native code can retain.
+
+library /usr/lib/libSystem.B.dylib
+
+special __Block_copy Block_copy
+special __Block_object_assign Block_object_assign
+
+library /usr/lib/libobjc.A.dylib
+
+special _objc_retainBlock Block_copy

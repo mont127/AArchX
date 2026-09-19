@@ -59,7 +59,7 @@
 
 #include "ocerz/mem.h"
 
-#define CACHE_DIR "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/"
+#define CACHE_DIR "/System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld/"
 #define CACHE_STEM "dyld_shared_cache_x86_64"
 #define CACHE_MAX_SUBCACHES 16
 #define EXPORT_FLAGS_REEXPORT 0x08

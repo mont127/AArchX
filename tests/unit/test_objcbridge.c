@@ -53,7 +53,7 @@
  *
  * A synthetic image then goes through ocerz_objcbridge_define_image against the
  * real runtime.  It has guest copies of NSObject and NSCopying and a protocol of
- * its own with a method and a property; a class whose instance start is 4, so
+ * its own with a method, its extended type and a property; a class whose instance start is 4, so
  * its two ivar offset variables must be slid past NSObject's 8 bytes by an
  * 8-aligned 8, and written in their low halves only, since the upper half of
  * one is poisoned; its subclass, listed first; a method whose long double
@@ -65,7 +65,8 @@
  * runtime must find both classes by name at the guest's own addresses with the
  * guest's metaclasses, every implementation must be a slot bound to the guest's
  * function under the converted notation, two slots of one notation must share
- * one parsed signature, the protocols must be native and the references
+ * one parsed signature, the protocols must be native, the guest-only one
+ * answering its extended type from the guest's own string, and the references
  * rewritten to them, a second definition of the image must define nothing, and
  * the +load methods must run superclass first, then the class the non-lazy list
  * names, then the category, each with its class in rdi.  Each class refusal
@@ -86,6 +87,7 @@
 #include "ocerz/mem.h"
 #include "ocerz/vm.h"
 
+#include <Block.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -286,11 +288,11 @@ static const Expect kEncodings[] = {
     { "{s=[2{p=dd}]c}16@0:8", OCERZ_OBJC_OK, "{{dd}{dd}b}(pp)", 0, 0 },
     { "{u=^{x=(y=i)}@?#}16@0:8", OCERZ_OBJC_OK, "{ppp}(pp)", 0, 0 },
     { "v32@0:8[4i]16", OCERZ_OBJC_OK, "v(ppp)", 0, 0 },
-    { "v24@0:8@?16", OCERZ_OBJC_OK, "v(ppp)", 1u << 2, 0 },
-    { "v24@0:8@?<v@?@\"NSError\">16", OCERZ_OBJC_OK, "v(ppp)", 1u << 2, 0 },
+    { "v24@0:8@?16", OCERZ_OBJC_OK, "v(ppk{})", 1u << 2, 0 },
+    { "v24@0:8@?<v@?@\"NSError\">16", OCERZ_OBJC_OK, "v(ppk{})", 1u << 2, 0 },
     { "q32@0:8^?16^v24", OCERZ_OBJC_OK, "l(pppp)", 0, 1u << 2 },
-    { "v40@0:8@16@?24^?32", OCERZ_OBJC_OK, "v(ppppp)", 1u << 3, 1u << 4 },
-    { "@?16@0:8", OCERZ_OBJC_OK, "p(pp)", 0, 0 },
+    { "v40@0:8@16@?24^?32", OCERZ_OBJC_OK, "v(pppk{}p)", 1u << 3, 1u << 4 },
+    { "@?16@0:8", OCERZ_OBJC_OK, "k{}(pp)", 0, 0 },
     { "v24@0:8B16", OCERZ_OBJC_OK, "v(ppb)", 0, 0 },
     { "v@:", OCERZ_OBJC_OK, "v(pp)", 0, 0 },
     { "{?=b8b4b1b1b18[8S]}16@0:8", OCERZ_OBJC_BITFIELD, NULL, 0, 0 },
@@ -1186,13 +1188,15 @@ static void r_unrecognized(OcerzCPU *cpu)
     cpu->gpr[OCERZ_RSI] = ocerz_h2g(sel("ocerzNoSuchMethod"));
 }
 
+static const struct { unsigned long reserved, size; } kUnsignedDescriptor = { 0, 32 };
+
 static void r_guest_block(OcerzCPU *cpu)
 {
     uint64_t block = scratch + 0x700;
-    ocerz_st(block, 8, 0);
-    ocerz_st(block + 8, 8, 0);
+    ocerz_st(block, 8, (uint64_t)(uintptr_t)_NSConcreteGlobalBlock);
+    ocerz_st(block + 8, 8, 0x10000000);
     ocerz_st(block + 16, 8, scratch + 0x800);
-    ocerz_st(block + 24, 8, 0);
+    ocerz_st(block + 24, 8, ocerz_h2g(&kUnsignedDescriptor));
     void *a = ((void *(*)(void *, void *, void *))objc_msgSend_)(cls("NSArray"), sel("arrayWithObject:"), nsstr("x"));
     cpu->gpr[OCERZ_RDI] = ocerz_h2g(a);
     cpu->gpr[OCERZ_RSI] = ocerz_h2g(sel("enumerateObjectsUsingBlock:"));
@@ -1243,8 +1247,8 @@ static const Refusal kRefusals[] = {
     { "objc_msgSend_fp2ret", r_fpret, ocerz_objc_msgSend_fp2ret, "long double _Complex result" },
     { "an unrecognized selector", r_unrecognized, ocerz_objc_msgSend,
       "ocerzNoSuchMethod] is not a selector the receiver recognizes" },
-    { "a guest block", r_guest_block, ocerz_objc_msgSend,
-      "enumerateObjectsUsingBlock:] cannot cross: argument 0 is a block whose code is x86" },
+    { "a guest block with no signature", r_guest_block, ocerz_objc_msgSend,
+      "a guest block handed to native code was called, and it cannot be: it has no signature" },
     { "a guest function pointer", r_guest_fnptr, ocerz_objc_msgSend,
       "sortedArrayUsingFunction:context:] cannot cross: argument 0 is an x86 function pointer" },
     { "a bitfield result", r_bitfield, ocerz_objc_msgSend_stret, "decimalValue] cannot cross: its method type"
@@ -1291,7 +1295,8 @@ static void test_refusals(void)
         int status = 0;
         CHECK(run_child(r->setup, r->handler, err, sizeof err, &status), "%s: child ran", r->what);
         CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 72, "%s: exits 72, status %#x", r->what, status);
-        CHECK(strstr(err, "ocerz: bridge: ") && strstr(err, r->message), "%s: stderr names it: %s", r->what, err);
+        CHECK((strstr(err, "ocerz: bridge: ") || strstr(err, "ocerz: blocks: ")) && strstr(err, r->message),
+              "%s: stderr names it: %s", r->what, err);
     }
 }
 
@@ -1728,7 +1733,7 @@ static const GuestNotation kGuestNotations[] = {
     { "{_NSRange=QQ}16@0:8", OCERZ_OBJC_OK, "{LL}(pp)" },
     { "#16@0:8", OCERZ_OBJC_OK, "p(pp)" },
     { "Vv16@0:8", OCERZ_OBJC_OK, "v(pp)" },
-    { "v24@0:8@?16", OCERZ_OBJC_OK, "v(ppp)" },
+    { "v24@0:8@?16", OCERZ_OBJC_OK, "v(ppk{})" },
     { "i20@0:8i16", OCERZ_OBJC_OK, "i(ppi)" },
     { "D16@0:8", OCERZ_OBJC_LONG_DOUBLE, NULL },
     { "v32@0:8D16", OCERZ_OBJC_LONG_DOUBLE, NULL },
@@ -1863,6 +1868,9 @@ static void build_defined_image(DefinedImage *d)
     uint64_t adopted[1] = { guest_nsobject };
     d->guest_proto = syn_protocol(s, "OcerzM11Proto", syn_refs(s, adopted, 1), syn_methods(s, kProtoMethods, 1),
                                   syn_props(s, kProtoProps, 1), 96);
+    uint64_t extended = syn_alloc(s, 8);
+    syn_w(extended, 8, syn_str(s, "i16@0:8"));
+    syn_w(d->guest_proto + 72, 8, extended);
     d->guest_copying = syn_protocol(s, "NSCopying", 0, 0, 0, 96);
     uint64_t class_protos[2] = { d->guest_proto, d->guest_copying };
     uint64_t protos = syn_refs(s, class_protos, 2);
@@ -2028,6 +2036,10 @@ static void test_define_image(void)
     CHECK(describe(proto, sel("ocerzM11Count"), true, true).types &&
               strcmp(describe(proto, sel("ocerzM11Count"), true, true).types, "i16@0:8") == 0,
           "the registered protocol has its required method");
+    const char *(*extended_types)(void *, void *, bool, bool) = dlsym(RTLD_DEFAULT, "_protocol_getMethodTypeEncoding");
+    const char *ext = extended_types ? extended_types(proto, sel("ocerzM11Count"), true, true) : NULL;
+    CHECK(ext && strcmp(ext, "i16@0:8") == 0 && ext != describe(proto, sel("ocerzM11Count"), true, true).types,
+          "the registered protocol's extended method types are the guest's own: %s", ext ? ext : "(none)");
     void *(*proto_prop)(void *, const char *, bool, bool) = dlsym(RTLD_DEFAULT, "protocol_getProperty");
     CHECK(proto_prop(proto, "ocerzM11Count", true, true) != NULL, "and its property");
     void *bp = get_property(base, "ocerzM11Count");
@@ -2204,7 +2216,8 @@ static void test_class_refusals(void)
         int status = 0;
         CHECK(class_child(r, err, sizeof err, &status), "%s: child ran", r->what);
         CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 72, "%s: exits 72, status %#x: %s", r->what, status, err);
-        CHECK(strstr(err, "ocerz: bridge: ") && strstr(err, r->message), "%s: stderr names it: %s", r->what, err);
+        CHECK((strstr(err, "ocerz: bridge: ") || strstr(err, "ocerz: blocks: ")) && strstr(err, r->message),
+              "%s: stderr names it: %s", r->what, err);
     }
 }
 

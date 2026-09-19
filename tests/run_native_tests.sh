@@ -1122,6 +1122,48 @@
 # seconds, and a run that stops names the last progress note, which says
 # whether NSApplicationMain ever reached the delegate.
 #
+# The block_* cases are the proof that a block crosses in both directions.
+# Each fixture is built for x86_64 and arm64 and runs under the arm64 oracle,
+# native mode under the JIT and the interpreter, and cache mode, and all four
+# must print the same lines, exactly as the M10 cases do. block_dispatch drives
+# libdispatch's block entry points from plain C: dispatch_once with a global
+# block run once across three calls and a capturing stack block, dispatch_sync
+# to a global queue and a serial one with a dispatch_sync nested inside a block
+# native code is running and a barrier, eight dispatch_async blocks counted home
+# through a semaphore, ten dispatch_group_async blocks and a group wait and
+# notify, a dispatch_after that must not have run when the call returns and must
+# have run by the time its semaphore is signalled, a __block variable mutated by
+# blocks native code runs on its own threads and read back through its
+# forwarding pointer by the frame that owns it, and dispatch_apply over a
+# global queue and DISPATCH_APPLY_AUTO, last, because async work submitted after
+# a dispatch_apply never runs under cache mode's host workqueue bridge, which is
+# the oracle. block_runtime calls the runtime directly: Block_copy of a stack
+# block and of a heap one, which must hand back the same pointer, a block
+# capturing another block, which runs _Block_object_assign from the guest's copy
+# helper, two heap blocks sharing one __block variable the frame keeps writing
+# to, a __block variable holding a block, whose keep helper the runtime runs,
+# qsort_b and bsearch_b with block comparators, and dispatch_block_create, whose
+# result is a native block the guest calls directly, hands back to
+# dispatch_async and waits on, with a cancelled one that must not run.
+# block_foundation is the Objective-C half: enumerateObjectsUsingBlock: with
+# *stop, enumerateKeysAndObjectsUsingBlock:, indexesOfObjectsPassingTest:, which
+# returns a BOOL from the block, a concurrent enumeration on libdispatch's
+# workers, sortedArrayUsingComparator: both ways and sortUsingComparator:, an
+# NSNotificationCenter observer block that holds a guest object alive until the
+# observer is removed, a block capturing a guest object handed to dispatch_sync,
+# an NSMutableArray and dispatch_group_async, after which the object must be
+# gone, a guest class conforming to NSItemProviderWriting whose method native
+# NSItemProvider calls with a completion block of its own, which the guest calls
+# with the data, NSBlockOperation and NSOperationQueue with a completion
+# block read back through the property's getter and called by the guest, and an
+# in-process NSXPCConnection to an anonymous listener whose exported object is a
+# guest class: NSXPCInterface has to find the extended method types of the
+# guest's own protocol, the proxy's method, whose encoding says @ for the reply
+# block, has to cross it as a block anyway, and the guest's exported method is
+# handed NSXPC's own reply block and calls it. Like
+# the other cases these skip without an x86_64 clang and fail when a fixture
+# does not compile, and a stop names the group its last progress note names.
+#
 # Native mode loads code at run time the way dyld does, and dl_basic pins it
 # against the host's own dyld. The fixture is an Objective-C program that
 # registers an add-image callback before it loads anything, then dlopens a
@@ -1170,12 +1212,12 @@
 # The failure messages are printed and each is checked for its reason.
 #
 # The callback, attach, thread, tlv_*, signal_*, cf_*, M10, M11, app_bundle,
-# dl_* and sys_* cases skip where there is no x86_64 clang, like the others, but
-# a fixture of theirs that fails to compile where a trivial x86_64 program
-# compiles fine is a failure: skipping it would hide a broken fixture
-# indefinitely. So is a cf_*, M10, M11, app_bundle, dl_basic or sys_* fixture
-# whose arm64 build fails to compile where its x86_64 build did, since that
-# leaves the case without its host oracle.
+# block_*, dl_* and sys_* cases skip where there is no x86_64 clang, like the
+# others, but a fixture of theirs that fails to compile where a trivial x86_64
+# program compiles fine is a failure: skipping it would hide a broken fixture
+# indefinitely. So is a cf_*, M10, M11, app_bundle, block_*, dl_basic or sys_*
+# fixture whose arm64 build fails to compile where its x86_64 build did, since
+# that leaves the case without its host oracle.
 #
 # The sys_* cases pin the libSystem calls native mode answers with ocerz's own
 # implementations rather than a crossing (src/sysbridge.c). sys_files calls the
@@ -8903,6 +8945,712 @@ EOC
     APP_BUNDLE_EXE="$bundle/Contents/MacOS/$APP_NAME"
 }
 
+build_block_fixtures() {
+    local name flags
+
+    BLOCK_EXPORTS='__Block_copy __Block_release __Block_object_assign __Block_object_dispose __NSConcreteGlobalBlock __NSConcreteStackBlock'
+    BLOCK_EXPORTS="$BLOCK_EXPORTS _objc_retainBlock _objc_unsafeClaimAutoreleasedReturnValue _qsort_b _bsearch_b"
+    BLOCK_EXPORTS="$BLOCK_EXPORTS _dispatch_once _dispatch_sync _dispatch_barrier_sync _dispatch_async _dispatch_after _dispatch_apply"
+    BLOCK_EXPORTS="$BLOCK_EXPORTS _dispatch_group_async _dispatch_group_notify _dispatch_group_wait _dispatch_group_create"
+    BLOCK_EXPORTS="$BLOCK_EXPORTS _dispatch_get_global_queue _dispatch_queue_create _dispatch_release _dispatch_time"
+    BLOCK_EXPORTS="$BLOCK_EXPORTS _dispatch_semaphore_create _dispatch_semaphore_signal _dispatch_semaphore_wait"
+    BLOCK_EXPORTS="$BLOCK_EXPORTS _dispatch_block_create _dispatch_block_perform _dispatch_block_wait _dispatch_block_cancel _dispatch_block_testcancel"
+    BLOCK_EXPORTS="$BLOCK_EXPORTS _OBJC_CLASS_\$_NSBlockOperation _OBJC_CLASS_\$_NSOperationQueue _OBJC_CLASS_\$_NSItemProvider"
+    BLOCK_EXPORTS="$BLOCK_EXPORTS _OBJC_CLASS_\$_NSNotificationCenter _OBJC_CLASS_\$_NSConstantArray _OBJC_CLASS_\$_NSConstantDictionary"
+    BLOCK_EXPORTS="$BLOCK_EXPORTS _OBJC_CLASS_\$_NSXPCListener _OBJC_CLASS_\$_NSXPCConnection _OBJC_CLASS_\$_NSXPCInterface _OBJC_CLASS_\$_NSNumber"
+    BLOCK_DISPATCH_BIN=""
+    BLOCK_DISPATCH_ARM64=""
+    BLOCK_RUNTIME_BIN=""
+    BLOCK_RUNTIME_ARM64=""
+    BLOCK_FOUNDATION_BIN=""
+    BLOCK_FOUNDATION_ARM64=""
+
+    cat > "$TMP/block_dispatch.c" <<'EOC'
+#include <dispatch/dispatch.h>
+#include "cf_common.h"
+
+#define TAG "block_dispatch"
+#define WAIT_SECS 20
+
+static int g_once_runs;
+static long g_once_value;
+
+static dispatch_time_t bj_deadline(void)
+{
+    return dispatch_time(DISPATCH_TIME_NOW, (int64_t)WAIT_SECS * (int64_t)NSEC_PER_SEC);
+}
+
+static void group_once(void)
+{
+    unsigned m = 0, bit = 1;
+    static dispatch_once_t pred;
+    static dispatch_once_t pred2;
+    long local = 7;
+    int i;
+
+    for (i = 0; i < 3; i++)
+        dispatch_once(&pred, ^{ g_once_runs++; g_once_value = 42; });
+    dispatch_once(&pred2, ^{ g_once_value += local; });
+    dispatch_once(&pred2, ^{ g_once_value += 1000; });
+
+    CK(g_once_runs == 1);
+    CK(g_once_value == 49);
+
+    cf_begin(TAG, "once", m);
+    cf_long("value", g_once_value);
+    cb_end();
+}
+
+static void group_sync(void)
+{
+    unsigned m = 0, bit = 1;
+    dispatch_queue_t q = dispatch_get_global_queue(0, 0);
+    dispatch_queue_t serial = dispatch_queue_create("ocerz.blocks.serial", 0);
+    __block int counter = 0;
+    int add = 5;
+
+    dispatch_sync(q, ^{ counter += add; });
+    CK(counter == 5);
+    dispatch_sync(serial, ^{ counter *= 3; });
+    CK(counter == 15);
+    dispatch_sync(serial, ^{ dispatch_sync(q, ^{ counter += 1; }); });
+    CK(counter == 16);
+    dispatch_barrier_sync(serial, ^{ counter -= 2; });
+    CK(counter == 14);
+    dispatch_release(serial);
+
+    cf_begin(TAG, "sync", m);
+    cf_long("counter", counter);
+    cb_end();
+}
+
+static void group_async(void)
+{
+    unsigned m = 0, bit = 1;
+    dispatch_queue_t q = dispatch_get_global_queue(0, 0);
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_group_t g = dispatch_group_create();
+    __block int hits = 0;
+    __block long gsum = 0;
+    __block int notified = 0;
+    long waited = 0;
+    int i;
+
+    for (i = 0; i < 8; i++)
+        dispatch_async(q, ^{ __sync_fetch_and_add(&hits, i + 1); dispatch_semaphore_signal(sem); });
+    for (i = 0; i < 8; i++)
+        waited |= dispatch_semaphore_wait(sem, bj_deadline());
+    CK(waited == 0 && hits == 36);
+
+    for (i = 0; i < 10; i++)
+        dispatch_group_async(g, q, ^{ __sync_fetch_and_add(&gsum, (long)i * 10); });
+    CK(dispatch_group_wait(g, bj_deadline()) == 0);
+    CK(gsum == 450);
+
+    dispatch_group_notify(g, q, ^{ notified = 1; dispatch_semaphore_signal(sem); });
+    CK(dispatch_semaphore_wait(sem, bj_deadline()) == 0 && notified == 1);
+
+    dispatch_release(g);
+    dispatch_release(sem);
+
+    cf_begin(TAG, "async", m);
+    cf_long("hits", hits);
+    cf_long("sum", gsum);
+    cb_end();
+}
+
+static void group_after(void)
+{
+    unsigned m = 0, bit = 1;
+    dispatch_queue_t q = dispatch_get_global_queue(0, 0);
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block int fired = 0;
+    int early;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * (int64_t)NSEC_PER_MSEC), q,
+                   ^{ fired = 1; dispatch_semaphore_signal(sem); });
+    early = fired;
+    CK(early == 0);
+    CK(dispatch_semaphore_wait(sem, bj_deadline()) == 0 && fired == 1);
+    dispatch_release(sem);
+
+    cf_begin(TAG, "after", m);
+    cf_long("fired", fired);
+    cb_end();
+}
+
+static void group_byref(void)
+{
+    unsigned m = 0, bit = 1;
+    dispatch_queue_t q = dispatch_get_global_queue(0, 0);
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block long acc = 1;
+    long mult = 3;
+    int i;
+
+    for (i = 0; i < 4; i++)
+        dispatch_sync(q, ^{ acc = acc * mult + i; });
+    CK(acc == 99);
+    dispatch_async(q, ^{ acc += 1; dispatch_semaphore_signal(sem); });
+    CK(dispatch_semaphore_wait(sem, bj_deadline()) == 0);
+    CK(acc == 100);
+    acc += 5;
+    dispatch_sync(q, ^{ acc *= 2; });
+    CK(acc == 210);
+    dispatch_release(sem);
+
+    cf_begin(TAG, "byref", m);
+    cf_long("acc", acc);
+    cb_end();
+}
+
+static void group_apply(void)
+{
+    unsigned m = 0, bit = 1;
+    dispatch_queue_t q = dispatch_get_global_queue(0, 0);
+    static long squares[256];
+    __block long sum = 0;
+    long total = 0;
+    long base = 3;
+    int i;
+
+    dispatch_apply(1000, q, ^(size_t k) { __sync_fetch_and_add(&sum, (long)k); });
+    CK(sum == 499500);
+    dispatch_apply(256, DISPATCH_APPLY_AUTO, ^(size_t k) { squares[k] = (long)(k * k) + base; });
+    for (i = 0; i < 256; i++)
+        total += squares[i];
+    CK(total == 5559680 + 256 * 3);
+
+    cf_begin(TAG, "apply", m);
+    cf_long("sum", sum);
+    cf_long("squares", total);
+    cb_end();
+}
+
+int main(void)
+{
+    cf_note(TAG, "once");
+    group_once();
+    cf_note(TAG, "sync");
+    group_sync();
+    cf_note(TAG, "async");
+    group_async();
+    cf_note(TAG, "after");
+    group_after();
+    cf_note(TAG, "byref");
+    group_byref();
+    cf_note(TAG, "apply");
+    group_apply();
+    return cf_summary(TAG);
+}
+EOC
+
+    cat > "$TMP/block_runtime.c" <<'EOC'
+#include <Block.h>
+#include <dispatch/dispatch.h>
+#include <stdlib.h>
+#include "cf_common.h"
+
+#define TAG "block_runtime"
+
+typedef int (^IntFn)(int);
+
+static IntFn make_adder(int n)
+{
+    return Block_copy(^(int x) { return x + n; });
+}
+
+static void group_copy(void)
+{
+    unsigned m = 0, bit = 1;
+    IntFn a = make_adder(10), b = make_adder(20), a2, g, inner, outer_stack, outer;
+    int r1, r2, r3, r4;
+
+    CK(a != 0 && b != 0 && a != b);
+    r1 = a(1);
+    r2 = b(2);
+    CK(r1 == 11 && r2 == 22);
+    a2 = Block_copy(a);
+    CK(a2 == a);
+    Block_release(a2);
+    r3 = a(5);
+    CK(r3 == 15);
+    Block_release(a);
+    Block_release(b);
+
+    g = ^(int x) { return x * 2; };
+    CK(Block_copy(g) == g);
+    Block_release(g);
+
+    inner = make_adder(3);
+    outer_stack = ^(int x) { return inner(x) * 2; };
+    outer = Block_copy(outer_stack);
+    CK(outer != outer_stack);
+    Block_release(inner);
+    r4 = outer(4);
+    CK(r4 == 14);
+    Block_release(outer);
+
+    cf_begin(TAG, "copy", m);
+    cf_long("sum", r1 + r2 + r3 + r4);
+    cb_end();
+}
+
+static void group_byref(void)
+{
+    unsigned m = 0, bit = 1;
+    __block int shared = 0;
+    __block IntFn slot = make_adder(100);
+    void (^inc)(void) = Block_copy(^{ shared += 1; });
+    void (^dbl)(void) = Block_copy(^{ shared *= 2; });
+    void (^swap)(void) = Block_copy(^{ IntFn old = slot; slot = make_adder(200); Block_release(old); });
+    int got;
+
+    inc();
+    dbl();
+    inc();
+    CK(shared == 3);
+    shared += 10;
+    dbl();
+    CK(shared == 26);
+    Block_release(inc);
+    Block_release(dbl);
+
+    swap();
+    got = slot(1);
+    CK(got == 201);
+    Block_release(swap);
+    Block_release(slot);
+
+    cf_begin(TAG, "byref", m);
+    cf_long("shared", shared);
+    cf_long("slot", got);
+    cb_end();
+}
+
+static void group_sort(void)
+{
+    unsigned m = 0, bit = 1;
+    static int v[64];
+    __block int compares = 0;
+    int i, sorted = 1, found = 0;
+    unsigned seed = 12345;
+
+    for (i = 0; i < 64; i++) {
+        seed = seed * 1103515245u + 12345u;
+        v[i] = (int)((seed >> 8) % 100000u) * 64 + i;
+    }
+    qsort_b(v, 64, sizeof v[0], ^int(const void *x, const void *y) {
+        int p = *(const int *)x, q = *(const int *)y;
+        compares++;
+        return p < q ? -65536 : p > q ? 65536 : 0;
+    });
+    for (i = 1; i < 64; i++)
+        sorted &= v[i - 1] < v[i];
+    CK(sorted && compares > 0);
+    for (i = 0; i < 64; i++) {
+        int key = v[i];
+        int *hit = bsearch_b(&key, v, 64, sizeof v[0], ^int(const void *x, const void *y) {
+            int p = *(const int *)x, q = *(const int *)y;
+            return p < q ? -1 : p > q ? 1 : 0;
+        });
+        found += hit == &v[i];
+    }
+    CK(found == 64);
+
+    cf_begin(TAG, "sort", m);
+    cf_long("first", v[0]);
+    cf_long("last", v[63]);
+    cb_end();
+}
+
+static void group_result(void)
+{
+    unsigned m = 0, bit = 1;
+    dispatch_queue_t q = dispatch_get_global_queue(0, 0);
+    __block int ran = 0;
+    int add = 4;
+    dispatch_block_t db = dispatch_block_create(0, ^{ ran += add; });
+    dispatch_block_t dw = dispatch_block_create(0, ^{ ran += add * 2; });
+    dispatch_block_t dc = dispatch_block_create(0, ^{ ran += 1000; });
+
+    CK(db != 0 && dw != 0 && dc != 0);
+    db();
+    CK(ran == 4);
+    db();
+    CK(ran == 8);
+    dispatch_async(q, dw);
+    CK(dispatch_block_wait(dw, dispatch_time(DISPATCH_TIME_NOW, 20 * (int64_t)NSEC_PER_SEC)) == 0);
+    CK(ran == 16);
+    dispatch_block_perform(0, ^{ ran += 100; });
+    CK(ran == 116);
+    dispatch_block_cancel(dc);
+    CK(dispatch_block_testcancel(dc) != 0 && dispatch_block_testcancel(db) == 0);
+    dispatch_sync(q, dc);
+    CK(ran == 116);
+    Block_release(db);
+    Block_release(dw);
+    Block_release(dc);
+
+    cf_begin(TAG, "result", m);
+    cf_long("ran", ran);
+    cb_end();
+}
+
+int main(void)
+{
+    cf_note(TAG, "copy");
+    group_copy();
+    cf_note(TAG, "byref");
+    group_byref();
+    cf_note(TAG, "sort");
+    group_sort();
+    cf_note(TAG, "result");
+    group_result();
+    return cf_summary(TAG);
+}
+EOC
+
+    cat > "$TMP/block_foundation.m" <<'EOC'
+#include "objc_common.h"
+
+#define TAG "block_foundation"
+
+static int g_live;
+
+@interface OcerzTracked : NSObject
+@property (nonatomic) long value;
+@end
+
+@implementation OcerzTracked
+- (instancetype)init
+{
+    if ((self = [super init]))
+        g_live++;
+    return self;
+}
+- (void)dealloc
+{
+    g_live--;
+}
+@end
+
+static int g_writer_calls;
+
+@interface OcerzWriter : NSObject <NSItemProviderWriting>
+@end
+
+@implementation OcerzWriter
++ (NSArray<NSString *> *)writableTypeIdentifiersForItemProvider
+{
+    return @[ @"public.utf8-plain-text" ];
+}
+- (NSProgress *)loadDataWithTypeIdentifier:(NSString *)typeIdentifier
+          forItemProviderCompletionHandler:(void (^)(NSData *, NSError *))completionHandler
+{
+    g_writer_calls++;
+    completionHandler([@"written by the guest" dataUsingEncoding:NSUTF8StringEncoding], nil);
+    return nil;
+}
+@end
+
+static dispatch_time_t bf_deadline(void)
+{
+    return dispatch_time(DISPATCH_TIME_NOW, 20 * (int64_t)NSEC_PER_SEC);
+}
+
+static void group_enumerate(void)
+{
+    unsigned m = 0, bit = 1;
+    NSArray *a = @[ @5, @3, @9, @1, @7 ];
+    NSDictionary *d = @{ @"a" : @1, @"b" : @2, @"c" : @4 };
+    __block long total = 0, dsum = 0, csum = 0;
+    __block unsigned long seen = 0;
+    NSIndexSet *big;
+
+    [a enumerateObjectsUsingBlock:^(id o, NSUInteger i, BOOL *stop) {
+        total += [o longValue];
+        seen++;
+        if (i == 2)
+            *stop = YES;
+    }];
+    CK(total == 17 && seen == 3);
+    [d enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+        dsum += [v longValue] * (long)[k length];
+    }];
+    CK(dsum == 7);
+    big = [a indexesOfObjectsPassingTest:^BOOL(id o, NSUInteger i, BOOL *stop) {
+        return [o intValue] > 4;
+    }];
+    CK(big.count == 3 && [big containsIndex:0] && [big containsIndex:2] && [big containsIndex:4]);
+    [a enumerateObjectsWithOptions:NSEnumerationConcurrent usingBlock:^(id o, NSUInteger i, BOOL *stop) {
+        __sync_fetch_and_add(&csum, [o longValue]);
+    }];
+    CK(csum == 25);
+
+    cf_begin(TAG, "enumerate", m);
+    cf_long("total", total);
+    cf_long("seen", (long)seen);
+    cf_long("concurrent", csum);
+    cb_end();
+}
+
+static void group_sort(void)
+{
+    unsigned m = 0, bit = 1;
+    NSArray *a = @[ @5, @3, @9, @1, @7 ];
+    NSMutableArray *mut = [a mutableCopy];
+    __block int calls = 0;
+    NSArray *up = [a sortedArrayUsingComparator:^NSComparisonResult(id x, id y) {
+        calls++;
+        return [x compare:y];
+    }];
+    NSArray *down = [a sortedArrayUsingComparator:^NSComparisonResult(id x, id y) {
+        return [y compare:x];
+    }];
+
+    [mut sortUsingComparator:^NSComparisonResult(id x, id y) {
+        long p = [x longValue] % 3, q = [y longValue] % 3;
+        return p < q ? NSOrderedAscending : p > q ? NSOrderedDescending : [x compare:y];
+    }];
+    CK(objc_text_is([up componentsJoinedByString:@","], "1,3,5,7,9") && calls > 0);
+    CK(objc_text_is([down componentsJoinedByString:@","], "9,7,5,3,1"));
+    CK(objc_text_is([mut componentsJoinedByString:@","], "3,9,1,7,5"));
+
+    cf_begin(TAG, "sort", m);
+    cb_end();
+    printf("%s|%s\n", [[up componentsJoinedByString:@","] UTF8String], [[mut componentsJoinedByString:@","] UTF8String]);
+    fflush(stdout);
+}
+
+static void group_notify(void)
+{
+    unsigned m = 0, bit = 1;
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    __block int notes = 0;
+    __block int wrong = 0;
+    id token;
+
+    @autoreleasepool {
+        OcerzTracked *t = [OcerzTracked new];
+        t.value = 1;
+        token = [nc addObserverForName:@"OcerzBlockNote" object:nil queue:nil usingBlock:^(NSNotification *n) {
+            notes += [n.userInfo[@"k"] intValue] * (int)t.value;
+            if (![n.name isEqualToString:@"OcerzBlockNote"])
+                wrong++;
+        }];
+    }
+    [nc postNotificationName:@"OcerzBlockNote" object:nil userInfo:@{ @"k" : @3 }];
+    [nc postNotificationName:@"OcerzBlockNote" object:nil userInfo:@{ @"k" : @4 }];
+    CK(notes == 7 && wrong == 0);
+    CK(g_live == 1);
+    [nc removeObserver:token];
+    token = nil;
+    [nc postNotificationName:@"OcerzBlockNote" object:nil userInfo:@{ @"k" : @100 }];
+    CK(notes == 7);
+
+    cf_begin(TAG, "notify", m);
+    cf_long("notes", notes);
+    cb_end();
+}
+
+static void group_lifetime(void)
+{
+    unsigned m = 0, bit = 1;
+    long seen = 0;
+
+    @autoreleasepool {
+        OcerzTracked *t = [OcerzTracked new];
+        NSMutableArray *keep = [NSMutableArray array];
+        t.value = 11;
+        void (^bump)(void) = ^{ t.value += 1; };
+        dispatch_sync(dispatch_get_global_queue(0, 0), bump);
+        [keep addObject:bump];
+        void (^back)(void) = keep[0];
+        back();
+        dispatch_group_t g = dispatch_group_create();
+        dispatch_group_async(g, dispatch_get_global_queue(0, 0), bump);
+        CK(dispatch_group_wait(g, bf_deadline()) == 0);
+        [keep removeAllObjects];
+        seen = t.value;
+        CK(seen == 14);
+        CK(g_live == 1);
+    }
+    CK(g_live == 0);
+
+    cf_begin(TAG, "lifetime", m);
+    cf_long("value", seen);
+    cf_long("live", g_live);
+    cb_end();
+}
+
+static void group_provider(void)
+{
+    unsigned m = 0, bit = 1;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSString *got = nil;
+    __block int completions = 0;
+
+    @autoreleasepool {
+        NSItemProvider *p = [[NSItemProvider alloc] initWithObject:[OcerzWriter new]];
+        [p loadDataRepresentationForTypeIdentifier:@"public.utf8-plain-text"
+                                 completionHandler:^(NSData *d, NSError *e) {
+            got = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+            completions++;
+            dispatch_semaphore_signal(sem);
+        }];
+    }
+    CK(dispatch_semaphore_wait(sem, bf_deadline()) == 0);
+    CK(g_writer_calls == 1 && completions == 1);
+    CK(objc_text_is(got, "written by the guest"));
+
+    cf_begin(TAG, "provider", m);
+    cf_long("calls", g_writer_calls);
+    cb_end();
+}
+
+static void group_operation(void)
+{
+    unsigned m = 0, bit = 1;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSOperationQueue *queue = [NSOperationQueue new];
+    __block long work = 0;
+    __block int completed = 0;
+    NSBlockOperation *op = [NSBlockOperation blockOperationWithBlock:^{ __sync_fetch_and_add(&work, 1); }];
+    void (^done)(void) = ^{ completed++; dispatch_semaphore_signal(sem); };
+
+    [op addExecutionBlock:^{ __sync_fetch_and_add(&work, 10); }];
+    op.completionBlock = done;
+    [queue addOperation:op];
+    [queue addOperationWithBlock:^{ __sync_fetch_and_add(&work, 100); }];
+    [queue waitUntilAllOperationsAreFinished];
+    CK(dispatch_semaphore_wait(sem, bf_deadline()) == 0);
+    CK(work == 111 && completed == 1);
+    NSBlockOperation *idle = [NSBlockOperation new];
+    idle.completionBlock = done;
+    void (^again)(void) = idle.completionBlock;
+    CK(again != nil);
+    if (again)
+        again();
+    CK(completed == 2);
+    idle.completionBlock = nil;
+    CK(idle.completionBlock == nil);
+
+    cf_begin(TAG, "operation", m);
+    cf_long("work", work);
+    cf_long("completed", completed);
+    cb_end();
+}
+
+@protocol OcerzDoubler
+- (void)doubleAll:(NSArray *)values reply:(void (^)(NSArray *doubled, long count))reply;
+@end
+
+static int g_served;
+
+@interface OcerzDoublerService : NSObject <OcerzDoubler, NSXPCListenerDelegate>
+@end
+
+@implementation OcerzDoublerService
+- (BOOL)listener:(NSXPCListener *)listener shouldAcceptNewConnection:(NSXPCConnection *)connection
+{
+    connection.exportedInterface = [NSXPCInterface interfaceWithProtocol:@protocol(OcerzDoubler)];
+    connection.exportedObject = self;
+    [connection resume];
+    return YES;
+}
+- (void)doubleAll:(NSArray *)values reply:(void (^)(NSArray *, long))reply
+{
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSNumber *n in values)
+        [out addObject:@([n longValue] * 2)];
+    g_served++;
+    reply(out, (long)out.count);
+}
+@end
+
+static void group_xpc(void)
+{
+    unsigned m = 0, bit = 1;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSString *got = nil;
+    __block long count = -1;
+    __block int errors = 0;
+    OcerzDoublerService *service = [OcerzDoublerService new];
+    NSXPCListener *listener = [NSXPCListener anonymousListener];
+    NSXPCConnection *c;
+
+    listener.delegate = service;
+    [listener resume];
+    c = [[NSXPCConnection alloc] initWithListenerEndpoint:listener.endpoint];
+    c.remoteObjectInterface = [NSXPCInterface interfaceWithProtocol:@protocol(OcerzDoubler)];
+    [c resume];
+    id proxy = [c remoteObjectProxyWithErrorHandler:^(NSError *e) {
+        errors++;
+        dispatch_semaphore_signal(sem);
+    }];
+    [proxy doubleAll:@[ @1, @2, @21 ] reply:^(NSArray *doubled, long n) {
+        got = [doubled componentsJoinedByString:@","];
+        count = n;
+        dispatch_semaphore_signal(sem);
+    }];
+    CK(dispatch_semaphore_wait(sem, bf_deadline()) == 0);
+    CK(errors == 0 && g_served == 1);
+    CK(objc_text_is(got, "2,4,42") && count == 3);
+    [c invalidate];
+    [listener invalidate];
+
+    cf_begin(TAG, "xpc", m);
+    cf_long("count", count);
+    cb_end();
+}
+
+int main(void)
+{
+    int rc;
+
+    @autoreleasepool {
+        cf_note(TAG, "enumerate");
+        group_enumerate();
+        cf_note(TAG, "sort");
+        group_sort();
+        cf_note(TAG, "notify");
+        group_notify();
+        cf_note(TAG, "lifetime");
+        group_lifetime();
+        cf_note(TAG, "provider");
+        group_provider();
+        cf_note(TAG, "operation");
+        group_operation();
+        cf_note(TAG, "xpc");
+        group_xpc();
+        rc = cf_summary(TAG);
+    }
+    return rc;
+}
+EOC
+
+    for name in block_dispatch block_runtime block_foundation; do
+        if [ "$name" = block_foundation ]; then
+            flags="-x objective-c -fobjc-arc -O1 -fno-builtin $TMP/$name.m -framework Foundation"
+        else
+            flags="-std=c11 -O1 -fno-builtin $TMP/$name.c"
+        fi
+        clang -arch x86_64 -o "$TMP/$name" $flags >"$TMP/$name.cc.log" 2>&1 || continue
+        case $name in
+            block_dispatch) BLOCK_DISPATCH_BIN="$TMP/$name" ;;
+            block_runtime) BLOCK_RUNTIME_BIN="$TMP/$name" ;;
+            block_foundation) BLOCK_FOUNDATION_BIN="$TMP/$name" ;;
+        esac
+        clang -arch arm64 -o "$TMP/$name.arm64" $flags >"$TMP/$name.arm64.cc.log" 2>&1 || continue
+        case $name in
+            block_dispatch) BLOCK_DISPATCH_ARM64="$TMP/$name.arm64" ;;
+            block_runtime) BLOCK_RUNTIME_ARM64="$TMP/$name.arm64" ;;
+            block_foundation) BLOCK_FOUNDATION_ARM64="$TMP/$name.arm64" ;;
+        esac
+    done
+}
+
 build_dl_fixtures() {
     local arch dir
 
@@ -12445,6 +13193,10 @@ objc_import_reason() {
             allowed="$allowed$OBJC_CLASS_EXPORTS $APPKIT_EXPORTS $APP_EXPORTS "
             libs="libobjc, AppKit, CoreGraphics, Foundation and CoreFoundation"
             about="the application's identity" ;;
+        blocks)
+            allowed="$allowed$OBJC_CLASS_EXPORTS $BLOCK_EXPORTS "
+            libs="libSystem, libobjc, Foundation and CoreFoundation"
+            about="blocks" ;;
         dl)
             allowed="$allowed$OBJC_CLASS_EXPORTS $DL_EXPORTS $DL_BRIDGED "
             libs="libSystem, libobjc, Foundation and CoreFoundation"
@@ -12483,6 +13235,9 @@ objc_import_reason() {
             _NSApplicationMain) why="the application was not started through NSApplicationMain" ;;
             _CFBundleGetMainBundle|_OBJC_CLASS_*_NSBundle) why="the main bundle was never asked for through CoreFoundation and Foundation both" ;;
             __NSGet*) why="the crt_externs functions were never called" ;;
+            __Block_*|__NSConcrete*Block|_objc_retainBlock) why="no block was copied, captured or laid down on the stack through the block runtime" ;;
+            _dispatch_*|_qsort_b|_bsearch_b) why="the block entry points it names were never called" ;;
+            _OBJC_CLASS_*_NSItemProvider|_OBJC_CLASS_*_NSBlockOperation) why="the Foundation classes that call blocks were never used" ;;
             _dl*|__dyld_*) why="the dynamic-loading API was not called through the virtual libSystem's exports" ;;
             *) why="the unfortified translation unit did not call the plain entry points" ;;
         esac
@@ -13585,6 +14340,7 @@ build_cf_fixtures
 build_objc_fixtures
 build_objc_class_fixtures
 build_app_fixtures
+build_block_fixtures
 build_dl_fixtures
 build_sys_fixtures
 
@@ -13743,6 +14499,32 @@ case_objc objc_view_ivar "$OBJC_VIEW_IVAR_BIN" "$OBJC_VIEW_IVAR_ARM64" objc_view
     layout "bit 0 is either view nil, -initWithFrame: not run once per view, or the class or its superclass wrong, 1 the first ivar not at or past the native NSView's instance size or the ivars out of declaration order, so the offsets guest code reads were not slid, 2 the class's instance size not covering its last ivar, 3 the frame read inside -initWithFrame: after the ivars were written not the one passed, 4 either view's frame or bounds wrong after main wrote the second view's ivars, 5 valueForKey:, reading at the native runtime's offset, not finding each view's own int, 6 valueForKey: not finding the double, the color, the NSRect and the trailing byte guest code wrote, 7 setValue:forKey: on one view not seen by guest code or changing the other view" \
     draw "bit 0 is -drawRect: not called exactly once per view, 1 -drawRect: called on the wrong view, 2 the int or the double written in -initWithFrame: reading otherwise in -drawRect:, 3 the color written in -initWithFrame: not the very object -drawRect: read, 4 the NSRect or the trailing byte reading otherwise in -drawRect:, 5 the second view's -drawRect: not seeing every value main wrote into it, 6 -frame inside -drawRect: not each view's own" \
     pixels "bit 0 is a corner of the first view's bitmap not white, 1 the first view's color not at the corners of its box, 2 that color outside its box, 3 the second view's color not at its own box, or the first view's box drawn in it, 4 the second view's color outside its box; dev1= and dev2= are checksums of the two bitmaps' bytes"
+case_objc block_dispatch "$BLOCK_DISPATCH_BIN" "$BLOCK_DISPATCH_ARM64" block_dispatch \
+    "_dispatch_once _dispatch_sync _dispatch_async _dispatch_after _dispatch_apply __NSConcreteStackBlock __NSConcreteGlobalBlock" blocks \
+    "block_dispatch hands libdispatch x86 blocks, so a failure here means no guest program that uses Grand Central Dispatch's block interface can run in native mode" \
+    once "bit 0 is a dispatch_once block run other than once across three calls with one predicate, 1 the value it and a capturing block under a second predicate leave not 49, which is also what a second block run under a spent predicate looks like" \
+    sync "bit 0 is dispatch_sync to a global queue not running the block with its captured addend before returning, 1 dispatch_sync to a serial queue not running it, 2 a dispatch_sync nested inside a block native code is running not running before the outer one returns, 3 dispatch_barrier_sync not running" \
+    async "bit 0 is eight dispatch_async blocks not all signalling the semaphore within the deadline or not each adding its own captured index, 1 a dispatch_group_wait timing out, 2 the ten group blocks not adding up to 450, 3 dispatch_group_notify's block not running" \
+    after "bit 0 is the dispatch_after block having run before the call returned, 1 it not running within the deadline" \
+    byref "bit 0 is four dispatch_sync blocks updating one __block variable not leaving 99, 1 the dispatch_async block not signalling within the deadline, 2 its update not reaching the variable, 3 the frame's own update through the forwarding pointer lost to a later block" \
+    apply "bit 0 is dispatch_apply over a global queue not summing its indices to 499500, 1 dispatch_apply with DISPATCH_APPLY_AUTO not filling every slot of the captured array"
+case_objc block_runtime "$BLOCK_RUNTIME_BIN" "$BLOCK_RUNTIME_ARM64" block_runtime \
+    "__Block_copy __Block_release __Block_object_assign __Block_object_dispose _qsort_b _bsearch_b _dispatch_block_create" blocks \
+    "block_runtime calls libclosure's functions on x86 blocks directly, so a failure here means a guest's own Block_copy and Block_release are wrong in native mode" \
+    copy "bit 0 is Block_copy of a stack block failing or handing two blocks one copy, 1 a copied block giving a wrong answer, 2 Block_copy of a heap block not handing back the same pointer, 3 a heap block dead after one of two releases, 4 Block_copy of a global block not the block itself, 5 a block capturing a block not copied to a new address, 6 it giving a wrong answer once the captured block's own reference is gone, which is what a captured block the copy helper did not copy looks like" \
+    byref "bit 0 is two heap blocks sharing a __block int not seeing each other's updates, 1 the frame's own update through the forwarding pointer not seen by them, 2 a __block variable holding a block not replaced by the block that swaps it, which is a keep helper that did not run" \
+    sort "bit 0 is qsort_b with a block comparator not sorting or never calling it, 1 bsearch_b with a block comparator not finding every element at its own address" \
+    result "bit 0 is dispatch_block_create handing back null, 1 the guest calling the native block directly not running it, 2 a second direct call not running it, 3 dispatch_block_wait timing out on it after dispatch_async, 4 the block not having run by then, 5 dispatch_block_perform not running its block, 6 dispatch_block_testcancel wrong for a cancelled and a live block, 7 a cancelled block running when dispatched"
+case_objc block_foundation "$BLOCK_FOUNDATION_BIN" "$BLOCK_FOUNDATION_ARM64" block_foundation \
+    "_objc_msgSend __Block_object_assign _objc_retainBlock _OBJC_CLASS_\$_NSItemProvider _OBJC_CLASS_\$_NSBlockOperation" blocks \
+    "block_foundation hands Foundation x86 blocks and a guest method a native one, so a failure here means no Objective-C program that passes a block to Foundation can run in native mode" \
+    enumerate "bit 0 is enumerateObjectsUsingBlock: not stopping after the index where the block set *stop, 1 enumerateKeysAndObjectsUsingBlock: not visiting every pair, 2 indexesOfObjectsPassingTest: not selecting by the BOOL the block returns, 3 a concurrent enumeration on libdispatch's workers not visiting every element once" \
+    sort "bit 0 is sortedArrayUsingComparator: not sorting ascending or never calling the block, 1 a descending comparator not sorting descending, which is what an NSComparisonResult read from the wrong width looks like, 2 sortUsingComparator: not sorting by remainder then value" \
+    notify "bit 0 is the observer block not run once per post with the notification it was posted with, 1 the guest object it captured dead while the observer lived, 2 the block still run after removeObserver:" \
+    lifetime "bit 0 is dispatch_group_wait timing out on the block, 1 the block's three runs through dispatch_sync, the array's copy and dispatch_group_async not all reaching the captured object, 2 the object dead while the block was held, 3 the object alive after the block and the pool were gone, which is a reference a wrapper never gave back" \
+    provider "bit 0 is NSItemProvider's completion block not called within the deadline, 1 the guest's -loadDataWithTypeIdentifier:forItemProviderCompletionHandler: not called once or its completion handler, a native block, not reaching the guest's block once, 2 the data not the text the guest's method handed the native block" \
+    operation "bit 0 is the operation's completion block not signalling within the deadline, 1 the execution blocks not adding up to 111 or the completion block not run once, 2 the completionBlock getter handing back nil, 3 the block it handed back not the guest's own when called, 4 the property not cleared" \
+    xpc "bit 0 is the reply block, or the proxy's error handler, not called within the deadline, 1 the error handler called or the guest's exported object not called once, 2 the reply not the doubled values and their count, which is what a reply block NSXPC could not describe, or one native code was handed as a plain pointer, looks like"
 case_app_bundle
 case_dl_basic \
     images "bit 0 is _dyld_image_count not above 1 or image 0 without a header, 1 dladdr on a main-image function not naming image 0's header, 2 _dyld_get_prog_image_header not image 0's, 3 image 0's name not the fixture's path, 4 _dyld_get_image_header_containing_address on a main-image function not image 0, 5 an index one past the end answering a header or a name, 6 an image in the list without a header or a name, 7 dyld_image_path_containing_address on a main-image function not the fixture's path, 8 image 0's slide not its header less the 0x100000000 it was linked at" \

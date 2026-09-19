@@ -120,7 +120,15 @@
  * it, and otherwise objc_allocateProtocol, with the protocols it adopts
  * resolved and registered first - protocol_addProtocol refuses one still under
  * construction - its four method description lists added with the guest's
- * types, its instance and class properties, and objc_registerProtocol.  Every
+ * types, its instance and class properties, and objc_registerProtocol.  The
+ * runtime has no call that sets a protocol's extended method types, the
+ * encodings that spell out a block argument's own arguments and which
+ * NSXPCInterface refuses a protocol without, so before the protocol is
+ * registered the guest's array of them is copied, as host pointers, into the
+ * word the runtime's own protocol_t keeps them in, at offset 72 when the
+ * protocol's size says it has that word.  The runtime indexes that array by
+ * position across the four method lists in the order they were added, which is
+ * the order the compiler lays them down in.  Every
  * word of __objc_protorefs, which is what @protocol compiles to, is rewritten to
  * the native protocol, and a class's protocol list is copied with native
  * protocols in it.
@@ -841,6 +849,29 @@ static void oc_protocol_properties(void *proto, uint64_t list, int instance, con
     }
 }
 
+static void oc_protocol_extended_types(void *proto, const OcerzObjcProtocol *gp, const char *name)
+{
+    const uint64_t lists[4] = { gp->instance_methods, gp->class_methods, gp->optional_instance_methods,
+                                gp->optional_class_methods };
+    uint64_t n = 0;
+    uint32_t size;
+
+    if (!gp->extended_types)
+        return;
+    for (int k = 0; k < 4; k++) {
+        OcerzObjcList l;
+        if (lists[k] && ocerz_objc_method_list(lists[k], &l) == OCERZ_OBJC_OK)
+            n += l.count;
+    }
+    memcpy(&size, (const char *)proto + OC_PROTOCOL_BASE - 8, sizeof size);
+    if (!n || size < OC_PROTOCOL_BASE + 8)
+        return;
+    const char **types = oc_alloc((size_t)n * sizeof *types, "extended method types", name);
+    for (uint64_t i = 0; i < n; i++)
+        types[i] = oc_str(oc_word(gp->extended_types + 8 * i));
+    memcpy((char *)proto + OC_PROTOCOL_BASE, &types, sizeof types);
+}
+
 static void *oc_protocol(uint64_t ref, int depth)
 {
     if (!ref)
@@ -878,6 +909,7 @@ static void *oc_protocol(uint64_t ref, int depth)
     oc_protocol_methods(made, gp.optional_class_methods, 0, 0, name);
     oc_protocol_properties(made, gp.instance_properties, 1, name);
     oc_protocol_properties(made, gp.class_properties, 0, name);
+    oc_protocol_extended_types(made, &gp, name);
     ((void (*)(void *))oc_need(&g_oc_objc_registerProtocol))(made);
     if (oc_logging())
         fprintf(stderr, "ocerz: OBJCLOG[%d] define protocol %s\n", (int)getpid(), name);
