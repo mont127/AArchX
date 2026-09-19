@@ -587,8 +587,8 @@ static const char *lazy_load_path(uint64_t mh, uint64_t flag, int *weak)
             if (dataoff >= le_fileoff && dataoff - le_fileoff <= le_size &&
                 datasize >= 24 && datasize <= le_size - (dataoff - le_fileoff)) {
                 const uint8_t *info = (const uint8_t *)(uintptr_t)(le_addr + dataoff - le_fileoff);
-                uint32_t pathoff, flagoff, flags, chainoff, symcount;
-                uint16_t ptrfmt;
+                uint32_t pathoff, flagoff, chainoff, symcount;
+                uint16_t flags, ptrfmt;
                 memcpy(&pathoff, info, 4);
                 memcpy(&flagoff, info + 4, 4);
                 memcpy(&flags, info + 8, 2);
