@@ -77,12 +77,20 @@
  * a structure of more than sixteen members, stop the send with the class, the
  * selector, the encoding and the reason, and OCERZ_BRIDGE_UNIMPL_EXIT.
  *
- * A block argument, @?, and a function pointer, ^?, cross as pointers when they
- * are null or native.  A block is native when its invoke function, the word at
- * offset 16, is not guest code by ocerz_abi_is_guest_code, which a block a native
- * API made is not.  A guest block's invoke is x86 code, and a guest function
- * pointer is x86 code with no signature an encoding could give it, so either
- * stops the send by name: native code calling it would jump into x86 bytes.
+ * A block, @? as an argument or a result, becomes class k with empty braces,
+ * k{}, because an encoding says nothing about a block's own arguments and the
+ * block carries its signature itself; the ABI engine hands native code a
+ * wrapper of a guest block and guest code a view of a native one
+ * (ocerz/blocks.h), and the same notation is what a guest method's
+ * implementation is bound under, so a native caller's block reaches a guest
+ * method as a block the guest can call.  A @? inside a structure stays a
+ * pointer.  A block result of a send is borrowed, as a getter's is.  A function
+ * pointer, ^?, crosses as a pointer when it is null or native; a guest one is
+ * x86 code with no signature an encoding could give it, so it stops the send by
+ * name, since native code calling it would jump into x86 bytes.  A guest stack
+ * block sent -copy, which manual reference counting does, is copied the way
+ * _Block_copy copies one, guest-side, since the native method would run its
+ * x86 copy helper.
  *
  * ---- results the two ABIs return differently ----
  * System V returns a structure of more than sixteen bytes in memory the caller
@@ -215,6 +223,7 @@
  */
 #include "ocerz/objcbridge.h"
 #include "ocerz/abi.h"
+#include "ocerz/blocks.h"
 #include "ocerz/bridge.h"
 #include "ocerz/interp.h"
 #include "ocerz/mem.h"
@@ -222,6 +231,7 @@
 #include "ocerz/vdylib.h"
 #include "ocerz/vm.h"
 
+#include <Block.h>
 #include <ctype.h>
 #include <errno.h>
 #include <pthread.h>
@@ -237,6 +247,7 @@
 #define OB_UTF8 0x08000100u
 #define OB_BLOCK 1
 #define OB_FNPTR 2
+#define OB_OBJECT 3
 
 typedef struct ObSym {
     const char *lib;
@@ -503,8 +514,18 @@ static const char *ob_conv(const char *p, ObOut *o, int where, int *rc, int *spe
             *rc = OCERZ_OBJC_MALFORMED;
             return NULL;
         }
+        if (*p == '@' && p[1] == '?' && where != OB_MEMBER) {
+            if (special)
+                *special = OB_BLOCK;
+            ob_put(o, 'k');
+            ob_put(o, '{');
+            ob_put(o, '}');
+            return q;
+        }
         if (special && p[1] == '?')
             *special = *p == '@' ? OB_BLOCK : OB_FNPTR;
+        else if (special && *p == '@')
+            *special = OB_OBJECT;
         ob_put(o, 'p');
         return q;
     }
@@ -611,13 +632,13 @@ static const char *ob_conv(const char *p, ObOut *o, int where, int *rc, int *spe
     }
 }
 
-int ocerz_objc_notation(const char *encoding, char *out, size_t outlen, int *nargs,
-                        uint32_t *blocks, uint32_t *fnptrs)
+static int ob_notation(const char *encoding, char *out, size_t outlen, int *nargs, uint32_t *blocks,
+                       uint32_t *fnptrs, uint32_t *objects)
 {
     char local[OCERZ_OBJC_NOTATION_MAX];
     ObOut o = { out ? out : local, out ? outlen : sizeof local, 0, 0 };
     int rc = OCERZ_OBJC_OK, n = 0;
-    uint32_t bmask = 0, fmask = 0;
+    uint32_t bmask = 0, fmask = 0, omask = 0;
 
     if (o.cap == 0)
         return OCERZ_OBJC_TOO_LONG;
@@ -641,6 +662,8 @@ int ocerz_objc_notation(const char *encoding, char *out, size_t outlen, int *nar
             bmask |= 1u << n;
         else if (special == OB_FNPTR)
             fmask |= 1u << n;
+        else if (special == OB_OBJECT)
+            omask |= 1u << n;
         p = ob_offset(p);
         n++;
         if (o.overflow)
@@ -659,7 +682,15 @@ int ocerz_objc_notation(const char *encoding, char *out, size_t outlen, int *nar
         *blocks = bmask;
     if (fnptrs)
         *fnptrs = fmask;
+    if (objects)
+        *objects = omask;
     return OCERZ_OBJC_OK;
+}
+
+int ocerz_objc_notation(const char *encoding, char *out, size_t outlen, int *nargs,
+                        uint32_t *blocks, uint32_t *fnptrs)
+{
+    return ob_notation(encoding, out, outlen, nargs, blocks, fnptrs, NULL);
 }
 
 const char *ocerz_objc_refusal(int code)
@@ -930,6 +961,7 @@ typedef struct ObSend {
     const OcerzObjcVariadic *variadic;
     uint32_t blocks;
     uint32_t fnptrs;
+    uint32_t objects;
 } ObSend;
 
 static ObShape *_Atomic g_ob_shapes[OB_SHAPE_BUCKETS];
@@ -1019,8 +1051,8 @@ static void ob_describe(void *cls, void *sel, const char *enc, const char *sourc
 {
     char notation[OCERZ_OBJC_NOTATION_MAX];
     int nargs = 0;
-    uint32_t blocks = 0, fnptrs = 0;
-    int rc = ocerz_objc_notation(enc, notation, sizeof notation, &nargs, &blocks, &fnptrs);
+    uint32_t blocks = 0, fnptrs = 0, objects = 0;
+    int rc = ob_notation(enc, notation, sizeof notation, &nargs, &blocks, &fnptrs, &objects);
     if (rc != OCERZ_OBJC_OK)
         ob_refuse(cls, sel, "cannot cross: its %s type encoding %s has %s", source,
                   enc ? enc : "(none)", ocerz_objc_refusal(rc));
@@ -1045,6 +1077,7 @@ static void ob_describe(void *cls, void *sel, const char *enc, const char *sourc
     out->variadic = v;
     out->blocks = blocks;
     out->fnptrs = fnptrs;
+    out->objects = objects;
 }
 
 static const ObSend *ob_method(void *cls, void *sel, ObSend *scratch)
@@ -1202,7 +1235,10 @@ static int ob_perform_general(OcerzCPU *cpu, const OcerzAbiSig *sig, const void 
     int err = errno;
     ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
 
+    call.borrowed = 1;
     ocerz_abi_write_result(sig, cpu, &call);
+    ocerz_abi_release_owned(&call);
+    errno = err;
     return err;
 }
 
@@ -1243,21 +1279,104 @@ static void ob_check_callables(void *cls, void *sel, const ObSend *send, const O
     const OcerzAbiSig *sig = &send->shape->sig;
     for (int k = 0; k < sig->nargs && k < 32; k++) {
         uint32_t bit = 1u << k;
-        if (!((send->blocks | send->fnptrs) & bit))
+        if (!(send->fnptrs & bit))
             continue;
         uint64_t v = ob_named(sig, cpu, k, 'L');
-        if (!v)
-            continue;
-        if (send->blocks & bit) {
-            uint64_t invoke = ocerz_ld(v + 16, 8);
-            if (ocerz_abi_is_guest_code(invoke))
-                ob_refuse(cls, sel, "cannot cross: argument %d is a block whose code is x86 (%#llx), and"
-                          " blocks do not cross yet", k - 2, (unsigned long long)invoke);
-        } else if (ocerz_abi_is_guest_code(v)) {
+        if (v && ocerz_abi_is_guest_code(v))
             ob_refuse(cls, sel, "cannot cross: argument %d is an x86 function pointer (%#llx), which native"
                       " code cannot call and no encoding gives a signature for", k - 2, (unsigned long long)v);
+    }
+}
+
+static const char *ob_arg_at(const char *notation, int index)
+{
+    const char *p = strchr(notation, '(');
+    if (!p)
+        return NULL;
+    p++;
+    for (int k = 0; *p && *p != ')'; k++) {
+        if (k == index)
+            return p;
+        if (*p == 'c' || *p == 'k')
+            p++;
+        if (*p == '{') {
+            int depth = 0;
+            do {
+                if (*p == '{')
+                    depth++;
+                else if (*p == '}')
+                    depth--;
+                p++;
+            } while (*p && depth > 0);
+        } else {
+            p++;
         }
     }
+    return NULL;
+}
+
+static const ObSend *ob_object_blocks(void *recv, void *cls, void *sel, const ObSend *send, const OcerzCPU *cpu,
+                                      ObSend *scratch)
+{
+    const OcerzAbiSig *sig = &send->shape->sig;
+    uint32_t found = 0;
+    for (int k = 2; k < sig->nargs && k < 32; k++) {
+        if (!(send->objects & (1u << k)) || sig->arg[k] != 'p')
+            continue;
+        uint64_t v = ob_named(sig, cpu, k, 'L');
+        if (v && !(v >> 63) && ocerz_block_is_guest_object(v))
+            found |= 1u << k;
+    }
+    if (!found)
+        return send;
+
+    void *msend = ob_need(&g_ob_msgSend);
+    void *msfs = ob_sel_registerName("methodSignatureForSelector:");
+    if (!ob_class_respondsToSelector(cls, msfs))
+        return send;
+    void *ms = ((void *(*)(void *, void *, void *))msend)(recv, msfs, sel);
+    if (!ms)
+        return send;
+    void *at = ob_sel_registerName("getArgumentTypeAtIndex:");
+    unsigned long n = ((unsigned long (*)(void *, void *))msend)(ms, ob_sel_registerName("numberOfArguments"));
+    for (int k = 2; k < 32; k++) {
+        if (!(found & (1u << k)))
+            continue;
+        const char *t = (unsigned long)k < n ? ((const char *(*)(void *, void *, unsigned long))msend)(ms, at, (unsigned long)k)
+                                             : NULL;
+        if (!t || t[0] != '@' || t[1] != '?')
+            found &= ~(1u << k);
+    }
+    if (!found)
+        return send;
+
+    char notation[OCERZ_OBJC_NOTATION_MAX];
+    size_t len = 0;
+    const char *src = send->shape->notation;
+    const char *mark[32] = { 0 };
+    for (int k = 2; k < 32; k++)
+        if (found & (1u << k))
+            mark[k] = ob_arg_at(src, k);
+    for (const char *p = src; *p; p++) {
+        int hit = 0;
+        for (int k = 2; k < 32 && !hit; k++)
+            hit = mark[k] == p;
+        if (len + 4 >= sizeof notation)
+            return send;
+        if (hit) {
+            memcpy(notation + len, "k{}", 3);
+            len += 3;
+        } else {
+            notation[len++] = *p;
+        }
+    }
+    notation[len] = '\0';
+    const ObShape *shape = ob_shape(notation);
+    if (!shape)
+        return send;
+    *scratch = *send;
+    scratch->shape = shape;
+    return scratch;
 }
 
 static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
@@ -1298,9 +1417,22 @@ static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
     if (!cls)
         ob_stop("%s: a super send names no class to start its lookup at", export);
 
+    if (kind == OB_PLAIN && cls == (void *)_NSConcreteStackBlock && ocerz_block_is_guest(first)) {
+        const char *name = ob_sel_getName(sel);
+        if (strcmp(name, "copy") == 0 || strcmp(name, "copyWithZone:") == 0) {
+            uint64_t copy = ocerz_block_copy_guest(first);
+            ocerz_bridge_lower(&outer);
+            ob_return(cpu, copy);
+            return ob_settle(vm, cpu);
+        }
+    }
+
     send = ob_method(cls, sel, &scratch);
     if (!send)
         send = ob_forwarded(recv, cls, sel, &scratch, 0);
+    ObSend typed;
+    if (send->objects)
+        send = ob_object_blocks(recv, cls, sel, send, cpu, &typed);
 
     const OcerzAbiSig *sig = &send->shape->sig;
     int memory = sig->ret == '{' && sig->ret_struct.size > OB_SMALL_STRUCT;
@@ -1310,7 +1442,7 @@ static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
     if (!stret && memory)
         ob_refuse(cls, sel, "returns a structure System V returns in memory (%s), and the guest sent it"
                   " with %s, which passes no result pointer", send->shape->notation, export + 1);
-    if (send->blocks | send->fnptrs)
+    if (send->fnptrs)
         ob_check_callables(cls, sel, send, cpu);
 
     const char *selname = ob_sel_getName(sel);

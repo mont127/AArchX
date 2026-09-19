@@ -77,6 +77,17 @@
  * stubs are left to trap, so the child comes back through the dispatcher.
  * ocerz_vdylib_postfork_child puts the image builder's lock back to its initial
  * state in a fork child.
+ *
+ * Some x86 code guest code calls belongs to no library: a native block the
+ * guest holds has an invoke word, and it has to be x86 code the guest can call
+ * through.  ocerz_vdylib_trampoline answers the guest address of such a
+ * trampoline, a stub of the same twelve bytes as an export's, in one page of
+ * guest memory written the first time any is asked for and read-only and
+ * executable after that.  Its id carries the last library ordinal, which no
+ * database file may have, and the index of a handler ocerz keeps for itself,
+ * so the dispatcher, the fast call and the xmm contract treat it as they treat
+ * a special export, and ocerz_vdylib_export_name names it as a library called
+ * ocerz.  OCERZ_VDYLIB_TRAMP_BLOCK_INVOKE is the one that calls a native block.
  */
 #ifndef OCERZ_VDYLIB_H
 #define OCERZ_VDYLIB_H
@@ -100,5 +111,8 @@ int ocerz_vdylib_fastcall(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_vdylib_xmm_contract(uint64_t id, uint16_t *in, uint16_t *out);
 int ocerz_vdylib_trap_only(uint64_t id);
 void ocerz_vdylib_postfork_child(void);
+
+enum { OCERZ_VDYLIB_TRAMP_BLOCK_INVOKE = 0 };
+uint64_t ocerz_vdylib_trampoline(unsigned which);
 
 #endif

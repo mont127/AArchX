@@ -270,6 +270,40 @@
  * callback and reuses it on every one after, and refuses by name only when
  * there is no guest process to attach it to.
  *
+ * ---- blocks ----
+ * A block is a pointer to a structure whose third word is the function that
+ * runs it, and the structure is laid out the same on both architectures, so a
+ * block crosses as a pointer that has to be converted rather than copied: a
+ * guest block's function is x86 code, and a native block's is arm64 code the
+ * guest cannot call.  An argument or result of class k is a block.  It is always
+ * followed by braces, which hold the block's declared signature without its
+ * implicit first argument, the block itself: dispatch_async is v(pk{v()}),
+ * dispatch_apply v(Lpk{v(L)}), and a comparator block returning a long from two
+ * pointers k{l(pp)}.  Empty braces, k{}, say that the declaration gives no
+ * signature, which is what an Objective-C type encoding's @? says.  A block
+ * carries a signature of its own, an Objective-C type encoding in its
+ * descriptor, and that is what a conversion uses; the braces are the fallback
+ * for a block compiled without one.  A declared signature follows a callback's
+ * rules, at most 47 characters and no c anywhere in it, since native code
+ * cannot be handed a guest function pointer from inside a block's arguments any
+ * more than from inside a callback's, but it may name blocks of its own.  A k
+ * without braces, or whose braces do not parse, is refused.
+ *
+ * A k argument of a call into native code goes through
+ * ocerz_block_to_native, and one native code passes to a guest callback through
+ * ocerz_block_to_guest; a k result goes the other way.  include/ocerz/blocks.h
+ * says what either conversion builds.  A conversion can make a wrapper whose
+ * only reference belongs to the crossing: ocerz_abi_read_guest records those in
+ * OcerzAbiCall, and whoever made the call hands the OcerzAbiCall to
+ * ocerz_abi_release_owned once the result has been written, so a block the
+ * native callee did not keep is gone when the call returns and one it copied
+ * lives on.  A k result from a function is the caller's own reference, as
+ * DISPATCH_RETURNS_RETAINED_BLOCK says it is for the only functions that return
+ * one; a k result of a message or of a block's own function is borrowed, the
+ * way a getter's is, which a caller says by setting OcerzAbiCall.borrowed
+ * before the result is written.  ocerz_abi_perform_borrowed is
+ * ocerz_abi_perform for such a call.
+ *
  * ---- variadic calls ----
  * A signature has nowhere to say where a function's named arguments stop, and
  * the two ABIs part company exactly there.  System V does not: a variadic
@@ -335,6 +369,7 @@ typedef struct OcerzAbiSig {
     int nargs;
     OcerzAbiStruct ret_struct;
     OcerzAbiStruct arg_struct[OCERZ_ABI_MAX_ARGS];
+    char ret_cb[OCERZ_ABI_CB_MAX];
 } OcerzAbiSig;
 
 typedef struct OcerzAbiCall {
@@ -347,6 +382,9 @@ typedef struct OcerzAbiCall {
     int nmem;
     void *x8;
     uint64_t guest_ret;
+    uint64_t owned[OCERZ_ABI_MAX_ARGS];
+    int nowned;
+    int borrowed;
     uint64_t rx[2];
     uint64_t rv[4];
     uint64_t ret[OCERZ_ABI_STRUCT_BYTES / 8];
@@ -371,6 +409,8 @@ void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu,
                             const OcerzAbiCall *call);
 
 int ocerz_abi_perform(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu);
+int ocerz_abi_perform_borrowed(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu);
+void ocerz_abi_release_owned(OcerzAbiCall *call);
 
 int ocerz_abi_register_only(const OcerzAbiSig *sig);
 int ocerz_abi_perform_registers(const OcerzAbiSig *sig, const void *fn, OcerzCPU *cpu);

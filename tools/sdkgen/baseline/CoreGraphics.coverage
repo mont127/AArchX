@@ -1,11 +1,10 @@
 library /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
 sdk macos 27.0
 exports 5407
-fn 730
+fn 737
 data 538
 var 0
 special 0
-stub block 7
 stub callback-struct 2
 stub no-declaration 3561
 stub va-list 1

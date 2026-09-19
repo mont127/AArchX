@@ -4,8 +4,7 @@ exports 414
 fn 173
 data 60
 var 0
-special 9
-stub block 1
+special 10
 stub callback-result 2
 stub no-declaration 107
 stub override 52
