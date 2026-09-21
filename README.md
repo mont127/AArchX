@@ -99,9 +99,20 @@ means the app drew its main window on screen and stayed up.
 | Steam (x86-64 client) | works with `-cef-disable-gpu` (2026-09-12): bootstrapper, `ipcserver`, client and the CEF web helper with GPU, utility and renderer processes; the window draws with software rendering. Some launches still stall before the web UI starts. See [Steam](#steam). |
 
 Command-line tools match their native output byte for byte
-(`tools/apptest.sh cli`, 16 of 16): `uname`, `sw_vers`, `echo`, `ls`, `id`,
+(`tools/apptest.sh cli`, 15 of 16 on macOS 27): `uname`, `echo`, `ls`, `id`,
 `basename`, `wc`, `sort`, `uniq`, `head`, `grep`, `file`, `xxd`, `nm`,
-`plutil` and `openssl` (`version` and `dgst -sha256`).
+`plutil` and `openssl` (`version` and `dgst -sha256`). A wider sweep of 74
+system tools run with read-only arguments, against the same x86-64 slice under
+Rosetta, agrees on every one of them; the only disagreements are the tools whose
+output is expected to differ between two runs, such as `ps` and `vm_stat`.
+
+The sixteenth is `sw_vers`, which fails on macOS 27 and passed before: Apple
+rewrote it in Swift, and under AArchX it loads `libswiftCore.dylib` and then
+faults at the bottom of its stack with a repeating frame pattern, which is what
+unbounded recursion looks like. It fails the same way under the interpreter, so
+it is not a translation bug, and the cause is not yet known. Swift is the
+largest single thing AArchX does not handle, and Apple is moving system tools
+onto it.
 
 Ollama's command-line binary (`Contents/Resources/ollama`, Go with cgo) works as of 2026-09-13. `ollama --version` prints what it prints natively. `ollama serve` answers its HTTP API (`/api/version`, `/api/tags`, `/api/show`), and `llama-server --list-devices` lists the same devices as it does natively. Getting there took five fixes:
 - AVX2, because Go turns on its AVX2 paths under Rosetta without checking CPUID.
