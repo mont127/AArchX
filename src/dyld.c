@@ -411,6 +411,7 @@
 #include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach-o/loader.h>
+#include <mach-o/dyld.h>
 #include <mach-o/fat.h>
 #include <crt_externs.h>
 
@@ -949,6 +950,21 @@ int ocerz_dyld_trie_each(const uint8_t *slice, uint64_t load_base, OcerzTrieVisi
 
 static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int *found)
 {
+    if (ocerz_mode == OCERZ_MODE_NATIVE && img->is_virtual &&
+        strcmp(img->install_name, "/usr/lib/libSystem.B.dylib") == 0 &&
+        (strncmp(sym, "__Unwind_", 9) == 0 || strncmp(sym, "_unw_", 5) == 0 ||
+         strcmp(sym, "___register_frame") == 0 || strcmp(sym, "___deregister_frame") == 0)) {
+        DynImage *unwind = dimg_find_by_install_name("/usr/lib/libunwind.1.dylib");
+        if (unwind && !unwind->is_virtual) {
+            int present = 0;
+            uint64_t addr = ocerz_dyld_trie_resolve(unwind->slice, unwind->load_base, sym, &present);
+            if (present) {
+                if (found)
+                    *found = 1;
+                return addr;
+            }
+        }
+    }
     return ocerz_dyld_trie_resolve(img->slice, img->load_base, sym, found);
 }
 
@@ -996,6 +1012,55 @@ static uint64_t disk_flat_resolve(const char *name)
 {
     int f = 0;
     return disk_flat_resolve_ex(name, &f);
+}
+
+typedef struct RpathList RpathList;
+static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, DynImage *loader,
+                                 const RpathList *rpaths);
+
+static uint64_t virt_flat_resolve_ex(const char *name, const char *want, int *found, const char **hit)
+{
+    for (int i = 0; i < g_dimgs_n; i++) {
+        if (!g_dimgs[i].is_virtual)
+            continue;
+        if (want && strcmp(g_dimgs[i].install_name, want) == 0)
+            continue;
+        int f = 0;
+        uint64_t v = ocerz_image_self_resolve_ex(&g_dimgs[i], name, &f);
+        if (f) {
+            *found = 1;
+            if (hit)
+                *hit = g_dimgs[i].install_name;
+            return v;
+        }
+    }
+    return 0;
+}
+
+static uint64_t virt_ondemand_resolve_ex(OcerzCache *cache, DynImage *img, const char *name, int *found,
+                                         const char **hit)
+{
+    int n = 0;
+    const char **names = ocerz_apidb_install_names(&n);
+    for (int i = 0; i < n; i++) {
+        if (dimg_find_by_install_name(names[i]))
+            continue;
+        const OcerzApiLibrary *lib = ocerz_apidb_library(names[i]);
+        if (!lib || !ocerz_apidb_find(lib, name))
+            continue;
+        DynImage *dep = load_disk_dylib(cache, names[i], img, NULL);
+        if (!dep)
+            continue;
+        int f = 0;
+        uint64_t v = ocerz_image_self_resolve_ex(dep, name, &f);
+        if (f) {
+            *found = 1;
+            if (hit)
+                *hit = dep->install_name;
+            return v;
+        }
+    }
+    return 0;
 }
 
 static int expand_at_prefix(DynImage *loader, const char *name, char *out, size_t n);
@@ -1059,10 +1124,24 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
         value = ocerz_cache_resolve_ex(cache, name, &found);
     if (!found && (libord == -3 || libord == 0 || libord == -2))
         value = ocerz_image_self_resolve_ex(img, name, &found);
+    if (!found && virtual_dep) {
+        const char *hit = NULL;
+        value = virt_flat_resolve_ex(name, tgt, &found, &hit);
+        if (found)
+            OCERZ_LOG("dynamic: %s in %s bound in %s instead\n", name, tgt ? tgt : "(flat)",
+                      hit ? hit : "?");
+    }
     if (!found && !virtual_dep)
         value = disk_flat_resolve_ex(name, &found);
     if (!found && (libord == -1 || libord == -2 || libord == -3))
         value = main_image_resolve_ex(name, &found);
+    if (!found && ocerz_mode == OCERZ_MODE_NATIVE) {
+        const char *hit = NULL;
+        value = virt_ondemand_resolve_ex(cache, img, name, &found, &hit);
+        if (found)
+            OCERZ_LOG("dynamic: %s in %s bound in %s instead\n", name, tgt ? tgt : "(flat)",
+                      hit ? hit : "?");
+    }
     if (!found && !weak) {
         if (ocerz_mode == OCERZ_MODE_NATIVE)
             native_miss_add(libord == -1 ? "(main executable)" : tgt, name, img->path);
@@ -1389,6 +1468,7 @@ static int build_frame(const char *path, int argc, char **argv, char **envp, Dyn
     uint64_t stack = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
     if (aux == 0 || stack == 0)
         return OCERZ_ENOMEM;
+    ocerz_vm_set_main_stack(stack, stack + DYN_STACK_SIZE);
     uint64_t *argv_g = (uint64_t *)calloc((size_t)argc + 1, sizeof *argv_g);
     uint64_t *envp_g = (uint64_t *)calloc((size_t)envc + 1, sizeof *envp_g);
     if (!argv_g || !envp_g) {
@@ -1599,7 +1679,7 @@ static void build_segs(OcerzCache *cache)
     }
     qsort(g_segs, g_segs_n, sizeof(struct seg_ent), seg_cmp);
 }
-static uint64_t seg_owner(uint64_t addr)
+static int seg_index(uint64_t addr)
 {
     int lo = 0, hi = g_segs_n - 1, best = -1;
     while (lo <= hi) {
@@ -1607,24 +1687,42 @@ static uint64_t seg_owner(uint64_t addr)
         if (g_segs[mid].lo <= addr) { best = mid; lo = mid + 1; }
         else hi = mid - 1;
     }
-    if (best >= 0 && addr < g_segs[best].hi)
-        return g_segs[best].mh;
-    return 0;
+    return best >= 0 && addr < g_segs[best].hi ? best : -1;
 }
+
 
 #define EAGER_MAX 4096
 static uint64_t g_eager[EAGER_MAX];
 static int g_eager_n;
+#define EAGER_SET (EAGER_MAX * 2)
+static uint64_t g_eager_set[EAGER_SET];
+static int g_eager_set_n;
+
+static unsigned eager_slot(uint64_t mh)
+{
+    unsigned at = (unsigned)((mh * 0x9e3779b97f4a7c15ull) >> 40) & (EAGER_SET - 1);
+    while (g_eager_set[at] && g_eager_set[at] != mh)
+        at = (at + 1) & (EAGER_SET - 1);
+    return at;
+}
+
 static int eager_has(uint64_t mh)
 {
-    for (int i = 0; i < g_eager_n; i++)
-        if (g_eager[i] == mh) return 1;
-    return 0;
+    if (g_eager_set_n != g_eager_n) {
+        memset(g_eager_set, 0, sizeof g_eager_set);
+        for (int i = 0; i < g_eager_n; i++)
+            g_eager_set[eager_slot(g_eager[i])] = g_eager[i];
+        g_eager_set_n = g_eager_n;
+    }
+    return g_eager_set[eager_slot(mh)] == mh;
 }
 static void eager_add(uint64_t mh)
 {
-    if (mh && !eager_has(mh) && g_eager_n < EAGER_MAX)
+    if (mh && !eager_has(mh) && g_eager_n < EAGER_MAX) {
         g_eager[g_eager_n++] = mh;
+        g_eager_set[eager_slot(mh)] = mh;
+        g_eager_set_n = g_eager_n;
+    }
 }
 static void scan_uses(uint64_t mh)
 {
@@ -1652,10 +1750,17 @@ static void scan_uses(uint64_t mh)
                             strncmp(sc[j].sectname, "__objc_classlist", 16) == 0;
                 if (isptr) {
                     uint64_t a = sc[j].addr + slide, e = a + sc[j].size;
+                    uint64_t last_lo = 1, last_hi = 0;
                     for (uint64_t pp = a; pp + 8 <= e; pp += 8) {
                         uint64_t v = rd64((const uint8_t *)ocerz_g2h(pp));
-                        uint64_t o = seg_owner(v);
-                        if (o && o != mh) eager_add(o);
+                        if (v >= last_lo && v < last_hi)
+                            continue;
+                        int at = seg_index(v);
+                        if (at < 0)
+                            continue;
+                        last_lo = g_segs[at].lo;
+                        last_hi = g_segs[at].hi;
+                        if (g_segs[at].mh != mh) eager_add(g_segs[at].mh);
                     }
                 }
             }
@@ -2528,13 +2633,42 @@ static void native_dl_reason(const char *what, const char *path)
     snprintf(g_ndl.reason, sizeof g_ndl.reason, what, path ? path : "");
 }
 
+static int native_guest_path(const char *name, char *out, size_t n)
+{
+    const char *root = getenv("OCERZ_GUEST_ROOT");
+    if (ocerz_mode != OCERZ_MODE_NATIVE || !name || name[0] != '/')
+        return 0;
+    char default_root[PATH_MAX];
+    if (!root) {
+        char exe[PATH_MAX];
+        uint32_t size = sizeof exe;
+        if (_NSGetExecutablePath(exe, &size) != 0 || !realpath(exe, default_root))
+            return 0;
+        char *slash = strrchr(default_root, '/');
+        if (!slash || (size_t)(slash - default_root) + sizeof "/runtime/guest" > sizeof default_root)
+            return 0;
+        strcpy(slash, "/runtime/guest");
+        root = default_root;
+    }
+    if (!root[0])
+        return 0;
+    static const char cryptex[] = "/System/Volumes/Preboot/Cryptexes/OS";
+    if (strncmp(name, cryptex, sizeof cryptex - 1) == 0 && name[sizeof cryptex - 1] == '/')
+        name += sizeof cryptex - 1;
+    int len = snprintf(out, n, "%s%s", root, name);
+    struct stat st;
+    return len > 0 && (size_t)len < n && lstat(out, &st) == 0;
+}
+
 static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, DynImage *loader,
                                  const RpathList *rpaths)
 {
     DynImage *by_name = dimg_find_by_install_name(install_name);
     if (by_name)
         return by_name;
-    if (ocerz_mode == OCERZ_MODE_NATIVE && ocerz_vdylib_have(install_name)) {
+    char guest_path[1024];
+    int guest_override = native_guest_path(install_name, guest_path, sizeof guest_path);
+    if (!guest_override && ocerz_mode == OCERZ_MODE_NATIVE && ocerz_vdylib_have(install_name)) {
         if (g_dimgs_n >= DYN_DIMG_MAX) {
             OCERZ_FATAL("too many disk dylibs to load (limit %d)\n", DYN_DIMG_MAX);
             native_dl_reason("the loader holds as many images as it can", NULL);
@@ -2571,7 +2705,10 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         return v;
     }
     char resolved[1024];
-    if (!expand_install_name(loader, install_name, rpaths, resolved, sizeof resolved) ||
+    if (guest_override) {
+        snprintf(resolved, sizeof resolved, "%s", guest_path);
+        OCERZ_LOG("dynamic: guest override %s -> %s\n", install_name, resolved);
+    } else if (!expand_install_name(loader, install_name, rpaths, resolved, sizeof resolved) ||
         resolved[0] == '@') {
         native_dl_reason("it is in no LC_RPATH directory of the images that load it", NULL);
         return NULL;
@@ -3345,6 +3482,48 @@ int ocerz_dyld_image_at(uint32_t index, uint64_t *mh, uint64_t *slide, uint64_t 
     return ok;
 }
 
+int ocerz_dyld_unwind_sections(uint64_t addr, uint64_t sections)
+{
+    NdlImage im;
+    if (!sections)
+        return 0;
+    uint64_t result[5] = {0};
+    if (!ndl_containing(addr, &im, NULL) || (im.d && im.d->is_virtual)) {
+        memcpy(ocerz_g2h(sections), result, sizeof result);
+        return 0;
+    }
+    result[0] = im.mh;
+    const struct mach_header_64 *mh = ocerz_g2h(im.mh);
+    const uint8_t *lc = (const uint8_t *)(mh + 1);
+    const uint8_t *end = lc + mh->sizeofcmds;
+    for (uint32_t i = 0; i < mh->ncmds && (size_t)(end - lc) >= sizeof(struct load_command); i++) {
+        const struct load_command *cmd = (const void *)lc;
+        if (cmd->cmdsize < sizeof *cmd || cmd->cmdsize > (size_t)(end - lc))
+            break;
+        if (cmd->cmd == LC_SEGMENT_64 && cmd->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *seg = (const void *)lc;
+            const struct section_64 *sec = (const void *)(seg + 1);
+            uint32_t count = (cmd->cmdsize - sizeof *seg) / sizeof *sec;
+            for (uint32_t j = 0; j < seg->nsects && j < count; j++) {
+                int slot = 0;
+                if (strncmp(sec[j].segname, "__TEXT", 16) != 0)
+                    continue;
+                if (strncmp(sec[j].sectname, "__eh_frame", 16) == 0)
+                    slot = 1;
+                else if (strncmp(sec[j].sectname, "__unwind_info", 16) == 0)
+                    slot = 3;
+                if (slot && sec[j].size) {
+                    result[slot] = sec[j].addr + im.slide;
+                    result[slot + 1] = sec[j].size;
+                }
+            }
+        }
+        lc += cmd->cmdsize;
+    }
+    memcpy(ocerz_g2h(sections), result, sizeof result);
+    return 1;
+}
+
 int ocerz_dyld_image_containing(uint64_t addr, uint64_t *mh, uint64_t *name)
 {
     NdlImage im;
@@ -3744,7 +3923,8 @@ static int ndl_known(const char *p, NdlTarget *t)
         t->kind = NDL_LOADED;
         return 1;
     }
-    if (ocerz_vdylib_have(p)) {
+    char guest_path[PATH_MAX];
+    if (!native_guest_path(p, guest_path, sizeof guest_path) && ocerz_vdylib_have(p)) {
         t->kind = NDL_VIRTUAL;
         snprintf(t->path, sizeof t->path, "%s", p);
         return 1;
@@ -3755,10 +3935,14 @@ static int ndl_known(const char *p, NdlTarget *t)
 static int ndl_try(const char *cand, NdlTarget *t)
 {
     char canon[PATH_MAX];
+    char guest_path[PATH_MAX];
     const char *c = cand;
     if (ndl_known(cand, t))
         return 1;
-    if (ocerz_canon_dylib_path(cand, canon, sizeof canon) && strcmp(canon, cand) != 0) {
+    int guest_override = native_guest_path(cand, guest_path, sizeof guest_path);
+    if (guest_override) {
+        c = guest_path;
+    } else if (ocerz_canon_dylib_path(cand, canon, sizeof canon) && strcmp(canon, cand) != 0) {
         c = canon;
         if (ndl_known(c, t))
             return 1;
@@ -3800,6 +3984,11 @@ static int ndl_try(const char *cand, NdlTarget *t)
             t->kind = NDL_BAD_FILE;
             snprintf(t->why, sizeof t->why, "'%s' is not a Mach-O file", abs);
         }
+        return 1;
+    }
+    if (guest_override) {
+        t->kind = NDL_BAD_FILE;
+        snprintf(t->why, sizeof t->why, "guest override '%s' could not be read", c);
         return 1;
     }
     const char *real = host_cache_real_path(cand);
@@ -4322,6 +4511,10 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         }
     } else {
         OCERZ_LOG("dynamic: native mode, shared cache not mapped\n");
+        OCERZ_LOG("dynamic: native mode is Rosetta-independent: x86 code runs JIT-translated, system calls bridge to arm64\n");
+        OCERZ_LOG("dynamic: native JIT %s, bridge fastcall %s\n",
+                  vm->jit_enabled ? "enabled" : "disabled (-no-jit)",
+                  getenv("OCERZ_NO_BRIDGE_FASTCALL") ? "disabled (trap path)" : "enabled");
     }
     g_run_cache = &cache;
     g_run_vm = vm;
@@ -4397,6 +4590,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                     g_native_miss_dropped);
         fprintf(stderr, "ocerz: native: %d unresolved imports, which no virtual library exports\n",
                 g_native_miss_n + g_native_miss_dropped);
+        fprintf(stderr, "ocerz: native: to run it translated instead, supply an x86_64 build at $OCERZ_GUEST_ROOT%s (JIT, no Rosetta needed)\n",
+                " or runtime/guest beside ocerz");
         free(buf);
         return 71;
     }

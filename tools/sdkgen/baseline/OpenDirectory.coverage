@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/OpenDirectory.framework/Versions/A/OpenDirectory
+sdk macos 27.0
+exports 603
+fn 76
+data 432
+var 0
+special 0
+stub no-declaration 50
+omit objc-ivar 45
+host-missing 0
+objc-classes 10
+objc-eh-types 0
+objc-ivars 45
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

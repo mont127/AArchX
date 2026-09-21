@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
+sdk macos 27.0
+exports 628
+fn 45
+data 53
+var 0
+special 0
+stub callback-pointer 2
+stub no-declaration 528
+host-missing 0
+objc-classes 1
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

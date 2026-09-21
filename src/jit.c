@@ -104,6 +104,20 @@
  * register.  A generated NaN kept arm64's sign until the exact arm was given an
  * off-chain copy of the operand the result overwrites (found by fp_loop_nan).
  *
+ * All of that is what a processor without FPCR.AH needs.  With the bit set
+ * (ocerz_afp, src/cpu.c) arm64's add, subtract, multiply, divide and square
+ * root give x86's NaN results themselves as long as the x86 destination is the
+ * first arm64 operand, which is how they were already emitted, so they go out
+ * bare, and a batch made only of those, moves, shuffles, compares and stores
+ * keeps its members' fast emission and drops its checkpoint, its checks, its
+ * undo log and its replay arms.  In a packed loop the end-of-batch check was
+ * three vector operations on top of the eight that did the work, and the four
+ * vector pipelines were what bounded it: fpvec went from 1.06x of Rosetta's
+ * time to 0.82x.  min and max were exact already, being a compare and a
+ * select.  Fused multiply-add is not covered: its negated forms negate a NaN
+ * operand where x86 returns it as it came, so a batch holding one keeps the
+ * whole apparatus, and outside a batch it keeps its own check.
+ *
  * ---- control flow ----
  * A block may run past a FORWARD conditional branch, continuing inline and
  * putting the taken side in an out-of-line chain stub (a superblock).  When the
@@ -167,6 +181,37 @@
  * interrupt, suspension or interp_once pending and no translation retired
  * while it ran, since a retired continuation may be translated from bytes the
  * crossing just rewrote.  A delivered signal fails the first test.
+ *
+ * Eleven libSystem exports do not cross at all.  strlen, strnlen, strcmp,
+ * strncmp, memcmp, bcmp, strchr, memchr, memcpy, memmove and memset are called
+ * constantly, do very little, and cost several times their own work to reach
+ * through a crossing, so src/leaf.s holds arm64 versions that read rdi, rsi and
+ * rdx from the registers full pinning keeps them in and leave rax in its own
+ * (ocerz_vdylib_leaf names the routine for an export id).  The block checks its
+ * slot as before, branches to the routine with nothing spilled, pops the return
+ * address and runs the same ret.  A routine that writes guest memory is only
+ * used for lengths up to the limit the lookup gives, may decline in x9, and has
+ * the retire count read before and after it, a change sending the return through
+ * the dispatcher for the reason the helper's own check gives; any of the three
+ * falls through to the ordinary fast call emitted next.  A fault inside a
+ * routine is attributed to the branch that reached it (ocerz_leaf_site), so the
+ * guest sees a fault at the stub with its registers exact, where a fault inside
+ * a crossing ends the process.  The routines are reached through a copy made
+ * at the start of the code arena, so the branch is a direct one.
+ *
+ * Cache mode uses the same routines from the other side.  There the guest's
+ * strlen is Apple's x86 code, and when a block starts at the exported entry of
+ * one of ten of those functions (ocerz_dyldapi_leaf_entry) the same call and
+ * ret are emitted ahead of its first instruction, with the translation of the
+ * x86 code following as what runs when the routine declines.  No length limit
+ * applies, since what it would fall back to is slower at every length.  A
+ * fault inside a routine is not delivered from there: src/vm.c makes the
+ * routine decline, and the x86 code takes the same fault with every detail
+ * right.  A block with a branch back to its own start is left alone, since
+ * its lanes may be live where the call would leave.
+ * OCERZ_NO_LEAF_INPLACE=1 turns the routines off in both modes, and so do
+ * OCERZ_BRIDGESTAT and OCERZ_BRIDGELOG, whose counts and lines come from the
+ * crossing.
  *
  * XMM registers are spilled by contract rather than wholesale.  System V makes
  * every xmm register volatile across a call, so for an ordinary export only the
@@ -237,6 +282,7 @@
 #include "ocerz/cache.h"
 #include "ocerz/mode.h"
 #include "ocerz/vdylib.h"
+#include "ocerz/leaf.h"
 
 #include <sys/mman.h>
 #include <mach/thread_act.h>
@@ -416,6 +462,7 @@ struct OcerzJit {
     int owner_pid;
     struct OcerzVM *vm;
     uint32_t *code_base;
+    const char *leaf_near;
     uint32_t *code_cur;
     uint32_t *code_end;
     size_t code_bytes;
@@ -698,6 +745,11 @@ int ocerz_jit_lock_held_self(void)
     return jl_held;
 }
 
+const int *ocerz_jit_lock_depth_ptr(void)
+{
+    return &ocerz_critical_depth;
+}
+
 struct OcerzCPU *ocerz_jit_lock_owner_cpu(void)
 {
     return (struct OcerzCPU *)g_jl_owner_cpu;
@@ -766,6 +818,7 @@ static void jl_dump(const char *tag, uint64_t wait_ns)
 
 static void jl_acquire(int site)
 {
+    ocerz_critical_depth++;
     if (g_jl_log < 0)
         g_jl_log = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
     if (jl_held)
@@ -811,6 +864,7 @@ static void jl_release(void)
     }
     jl_held--;
     pthread_mutex_unlock(&jit_lock);
+    ocerz_critical_depth--;
 }
 
 static int g_xlp_log = -1;
@@ -841,6 +895,7 @@ static void xlatpage_note(uint64_t rip)
 
 static void jl_lock_step(uint64_t rip)
 {
+    ocerz_critical_depth++;
     if (g_jl_log < 0)
         g_jl_log = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
     if (jl_held)
@@ -883,6 +938,7 @@ static void jl_unlock_step(void)
         __atomic_store_n(&g_jl_phase, 3, __ATOMIC_RELAXED);
     jl_held--;
     pthread_mutex_unlock(&jit_lock);
+    ocerz_critical_depth--;
     if (g_jl_log > 0) {
         __atomic_store_n(&g_jl_phase, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&g_jl_owner, 0, __ATOMIC_RELAXED);
@@ -3342,6 +3398,8 @@ static void emit_reload_mem_base(A64Buf *b)
 
 static void emit_gpr_ld_at(A64Buf *b, int size, int rd, int ra, int32_t disp, int plain);
 static void emit_gpr_st_at(A64Buf *b, int size, int rs, int ra, int32_t disp, int plain);
+static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand *op,
+                                int size, int *ra_out, uint32_t *disp_out, int unscaled_ok);
 static void emit_gpr_ld_regoff(A64Buf *b, int size, int rd, int ra, int ri, int scaled, int plain);
 static void emit_gpr_st_regoff(A64Buf *b, int size, int rs, int ra, int ri, int scaled, int plain);
 static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
@@ -3376,6 +3434,14 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
     if (is < 0 || (mem->scale & 3) != want_scale ||
         disp < -4095 || disp > 4095)
         return 0;
+    if (!plain) {
+        int ra; uint32_t d;
+        if (emit_mem_ea_plain_ex(b, insn, mem, size, &ra, &d, 1)) {
+            if (store) emit_gpr_st_at(b, size, value_reg, ra, (int32_t)d, 0);
+            else       emit_gpr_ld_at(b, size, value_reg, ra, (int32_t)d, 0);
+            return 1;
+        }
+    }
     int base = hbase;
     if (hbase == JMEMBASE && g_mem_hoist_aux_index >= 0 && mem->index == (unsigned)g_mem_hoist_aux_index &&
         (mem->scale & 3) == g_mem_hoist_aux_scale) {
@@ -3498,6 +3564,24 @@ static void emit_gpr_ld_at(A64Buf *b, int size, int rd, int ra, int32_t disp, in
     else if (disp < 0 && -disp <= 4095) a64_sub_imm(b, 1, JTA, ra, (uint32_t)-disp);
     else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
     emit_guest_load_ordered(b, size, rd, JTA, JTU);
+}
+static void emit_gpr_lds_at(A64Buf *b, int size, int sf, int rd, int ra, int32_t disp)
+{
+    if (g_no_ldapr || (g_align_guard && size != 1)) {
+        emit_gpr_ld_at(b, size, JT1, ra, disp, 0);
+        if (size == 1)      a64_sxtb(b, sf, rd, JT1);
+        else if (size == 2) a64_sxth(b, sf, rd, JT1);
+        else                a64_sxtw(b, rd, JT1);
+        return;
+    }
+    g_blk_ordered_loads = 1;
+    if (!(disp >= -256 && disp <= 255)) {
+        if (disp > 0 && disp <= 4095) a64_add_imm(b, 1, JTA, ra, (uint32_t)disp);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
+        ra = JTA;
+        disp = 0;
+    }
+    a64_ldapurs(b, size, sf, rd, ra, disp);
 }
 static void emit_gpr_st_at(A64Buf *b, int size, int rv, int ra, int32_t disp, int plain)
 {
@@ -4095,9 +4179,7 @@ static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
                     if (s->size == 1) a64_ldrsb(b, sf, pin_hreg(ds), ra, disp);
                     else              a64_ldrsh(b, sf, pin_hreg(ds), ra, disp);
                 } else {
-                    emit_gpr_ld_at(b, s->size, JT1, ra, (int32_t)disp, 0);
-                    if (s->size == 1) a64_sxtb(b, sf, pin_hreg(ds), JT1);
-                    else              a64_sxth(b, sf, pin_hreg(ds), JT1);
+                    emit_gpr_lds_at(b, s->size, sf, pin_hreg(ds), ra, (int32_t)disp);
                 }
                 return 1;
             }
@@ -4380,7 +4462,7 @@ static int emit_movsxd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, in
         int ra; uint32_t disp;
         if (ds >= 0 && emit_mem_ea_plain(b, insn, s, 4, &ra, &disp)) {
             if (mem_plain_access_ok(s)) a64_ldrsw(b, pin_hreg(ds), ra, disp);
-            else { emit_gpr_ld_at(b, 4, JT1, ra, (int32_t)disp, 0); a64_sxtw(b, pin_hreg(ds), JT1); }
+            else emit_gpr_lds_at(b, 4, 1, pin_hreg(ds), ra, (int32_t)disp);
             return 1;
         }
         if (!emit_mem_ea(b, insn, s, JTA))
@@ -6855,6 +6937,7 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
         int nundo = 0;
         int st_at[16], st_cls[16], nst = 0;
         int det_j = -1;
+        int n_fma = 0;
         while (j < n) {
             const X86Insn *in = &insns[j];
             int k = fpb2_kind(in, &packed, &dbl, &from_mem, &sq, &lane_only);
@@ -6954,6 +7037,7 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
                     int is_mm = in->op == OCERZ_OP_MAXSS || in->op == OCERZ_OP_MINSS || in->op == OCERZ_OP_MAXSD || in->op == OCERZ_OP_MINSD ||
                                 in->op == OCERZ_OP_MAXPS || in->op == OCERZ_OP_MINPS || in->op == OCERZ_OP_MAXPD || in->op == OCERZ_OP_MINPD;
                     int fma = in->op >= OCERZ_OP_VFMA_FIRST && in->op <= OCERZ_OP_VFMA_LAST;
+                    n_fma += fma;
                     int nds = (in->vex & OCERZ_VEX_NDS) != 0 && !fma;
                     unsigned vr = (in->vex & OCERZ_VEX_NDS) ? (in->vvvv & 15) : dr;
                     uint16_t vbit = (uint16_t)(1u << vr);
@@ -7101,6 +7185,10 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
             g_fpb_stchk[sj] = 0; g_fpb_stlane[sj] = 0;
             if (st_cls[q] == 1) Tf |= sb; else if (st_cls[q] == 3) Td |= sb; else Ts |= sb;
             T |= sb;
+        }
+        if (ocerz_afp() && n_fma == 0) {
+            for (int q = i; q <= end; q++) { g_fpb_stchk[q] = 0; g_fpb_stlane[q] = 0; g_fpb_det[q] = 0; g_fpb_sidechk[q] = 0; fpb_undo_clear(q); }
+            T = 0; Tf = 0; Ts = 0; Td = 0; exitchk = 0; ckpt = 0; sites = 0; cost_extra = 0; nundo = 0;
         }
         uint16_t U = (uint16_t)(T | exitchk);
         for (int changed = 1; changed;) {
@@ -7530,7 +7618,7 @@ static int mov128_pair_kind(const X86Insn *a, const X86Insn *c)
     if (!xmm_is_pinned(ar) || !xmm_is_pinned(cr) || (load && ar == cr)) return 0;
     if (am->riprel || cm->riprel || am->base != cm->base || am->index != cm->index || am->scale != cm->scale) return 0;
     if (cm->disp != am->disp + 16 || am->disp % 16 != 0 || am->disp < -1024 || am->disp > 1008) return 0;
-    if (!mem_plain_access_ok(am) || !mem_plain_access_ok(cm)) return 0;
+    if (!vec_tso_relaxed() && (!mem_plain_access_ok(am) || !mem_plain_access_ok(cm))) return 0;
     return load ? 1 : 2;
 }
 static int emit_mov128_pair(A64Buf *b, const X86Insn *a, const X86Insn *c, int i)
@@ -7858,7 +7946,7 @@ static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_site
     int esz = dbl ? 8 : 4;
     static int inexact_env = -1;
     if (inexact_env < 0) inexact_env = getenv("OCERZ_INEXACT_NAN") ? 1 : 0;
-    int inexact_nan = inexact_env || g_fpb_fast;
+    int inexact_nan = inexact_env || g_fpb_fast || ocerz_afp();
     int vb;
     int dst_pinned = xmm_is_pinned(d->reg);
     if (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) vb = packed ? xmm_vreg(s->reg) : l0_src(s->reg, dbl);
@@ -9319,7 +9407,7 @@ static void emit_vex_fp_lane(A64Buf *b, int kind, int dbl, int vr, int va, int v
 {
     if (!emit_vex_fp_op(b, kind, dbl, vr, va, vb)) return;
     if (kind == 6) va = vb;
-    if (inexact_nan_env() || g_fpb_fast) return;
+    if (inexact_nan_env() || g_fpb_fast || ocerz_afp()) return;
     emit_nan_fix_packed2(b, dbl, vr, va, vb, t1, t1);
 }
 static int emit_vex_cvtdq2ps256(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
@@ -9375,7 +9463,7 @@ static int emit_vex_fp256(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     if (!sq) ah = ymmh_src(b, insn->vvvv, VX1);
     int dh = ymmh_dst(d->reg, VX3);
     if (dh == ah || dh == sh) dh = VX3;
-    int chk = emit_vex_fp_op(b, kind, dbl, dh, ah, sh) && !inexact_nan_env();
+    int chk = emit_vex_fp_op(b, kind, dbl, dh, ah, sh) && !inexact_nan_env() && !ocerz_afp();
     emit_vex_fp_op(b, kind, dbl, VX1, sq ? lb : xmm_vreg(insn->vvvv), lb);
     if (!chk) {
         a64_v_mov(b, xmm_vreg(d->reg), VX1);
@@ -9448,7 +9536,7 @@ static int emit_vex_fp128_alias(A64Buf *b, const X86Insn *insn)
         case 5: a64_fcmp(b, dbl, va, vb); a64_fcsel(b, dbl, t, va, vb, A64_MI); break;
         default: a64_fsqrt_s(b, dbl, t, vb); break;
         }
-        if (!(inexact_nan_env() || g_fpb_fast)) {
+        if (!(inexact_nan_env() || g_fpb_fast || ocerz_afp())) {
             if (kind < 4) emit_nan_fix_scalar2(b, dbl, t, fa, fb);
             else if (kind == 6) emit_nan_fix_scalar2(b, dbl, t, fb, fb);
         }
@@ -12582,6 +12670,78 @@ static int bridge_fastcall_enabled(void)
     return en;
 }
 
+#define LEAF_EPOCH_OFF ((uint32_t)offsetof(OcerzCPU, jit_scratch) + 8)
+
+static int leaf_inplace_enabled(void)
+{
+    static int en = -1;
+    if (en < 0)
+        en = !getenv("OCERZ_NO_LEAF_INPLACE") && !getenv("OCERZ_BRIDGESTAT") &&
+             !getenv("OCERZ_BRIDGELOG");
+    return en;
+}
+
+static uint32_t *emit_leaf_call_ret(A64Buf *b, const void *leaf, int writes, uint32_t **epi_sites,
+                                    int *n_epi)
+{
+    if (writes) {
+        a64_mov_imm64(b, JT0, (uint64_t)(uintptr_t)&ocerz_jit_retire_count);
+        a64_ldr(b, 8, JT0, JT0, 0);
+        a64_str(b, 8, JT0, 20, LEAF_EPOCH_OFF);
+    }
+    const char *leaf_at = g_xlat_jit && g_xlat_jit->leaf_near
+                              ? g_xlat_jit->leaf_near + ((const char *)leaf - ocerz_leaf_lo)
+                              : (const char *)leaf;
+    int64_t leaf_words = ((const char *)leaf_at - (const char *)b->p) / 4;
+    if (leaf_words > -(1 << 25) && leaf_words < (1 << 25)) {
+        a64_emit32(b, 0x94000000u | ((uint32_t)leaf_words & 0x03ffffffu));
+    } else {
+        a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)leaf_at);
+        a64_blr(b, 16);
+    }
+    g_callout_seq++;
+    uint32_t *declined = a64_label(b); a64_cbnz(b, 1, JT0, 0);
+    emit_reload_mem_base(b);
+    a64_ldr_post64(b, JT1, pin_hreg(pin_slot(OCERZ_RSP)), 8);
+    uint32_t *retired = NULL;
+    if (writes) {
+        a64_ldr(b, 8, JT2, 20, LEAF_EPOCH_OFF);
+        a64_mov_imm64(b, JT0, (uint64_t)(uintptr_t)&ocerz_jit_retire_count);
+        a64_ldr(b, 8, JT0, JT0, 0);
+        a64_subs_reg(b, 1, A64_ZR, JT0, JT2, 0);
+        retired = a64_label(b); a64_bcond(b, A64_NE, 0);
+    }
+    a64_ldp_post(b, JTF, 30, 31, 16);
+    a64_subs_reg(b, 1, A64_ZR, JTF, JT1, 0);
+    uint32_t *miss_ne = a64_label(b); a64_bcond(b, A64_NE, 0);
+    uint32_t *miss_z = a64_label(b); a64_cbz(b, 1, 30, 0);
+    if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
+    a64_ret(b);
+    uint32_t *miss = a64_label(b);
+    a64_patch_bcond(miss_ne, miss);
+    a64_patch_cbz(miss_z, miss);
+    if (retired) a64_patch_bcond(retired, miss);
+    a64_str(b, 8, JT1, 20, RIP_OFF);
+    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+    epi_sites[*n_epi] = a64_label(b);
+    a64_b(b, 0);
+    (*n_epi)++;
+    return declined;
+}
+
+static int leaf_layout_ok(void)
+{
+    static int no_blret = -1;
+    if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
+    int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
+                jgb_usable() && !stack_guard_needed();
+    return fast3 && ras_body_only() && host_ras_enabled() && !no_blret && !g_xlat_mode32 &&
+           leaf_inplace_enabled() && ocerz_guest_base == 0 && pin_slot(OCERZ_RAX) >= 0 &&
+           pin_slot(OCERZ_RDI) >= 0 && pin_slot(OCERZ_RSI) >= 0 && pin_slot(OCERZ_RDX) >= 0 &&
+           pin_hreg(pin_slot(OCERZ_RAX)) == 21 && pin_hreg(pin_slot(OCERZ_RDI)) == 28 &&
+           pin_hreg(pin_slot(OCERZ_RSI)) == 27 && pin_hreg(pin_slot(OCERZ_RDX)) == 23;
+}
+
 static void emit_bridge_fastcall(A64Buf *b, const X86Insn *insns, int i,
                                  uint32_t **epi_sites, int *n_epi)
 {
@@ -12615,7 +12775,35 @@ static void emit_bridge_fastcall(A64Buf *b, const X86Insn *insns, int i,
     if (!fast3 || !ras_body_only() || !host_ras_enabled() || no_blret)
         return;
 
+    uint64_t leaf_limit = 0;
+    const void *leaf = leaf_layout_ok() ? ocerz_vdylib_leaf(id, &leaf_limit) : NULL;
+
     l0_flush_all(b);
+    if (leaf) {
+        const char *leaf_sym = NULL;
+        if (ocerz_verbose >= 1 && ocerz_vdylib_export_name(id, NULL, &leaf_sym))
+            OCERZ_LOG("jit: %s is answered in place at %#llx by %p from %p\n", leaf_sym,
+                      (unsigned long long)insn->rip, leaf, (void *)b->p);
+        uint32_t *leaf_out[3];
+        uint8_t leaf_out_cb[3] = { 0, 0, 0 };
+        int n_leaf_out = 0;
+        a64_mov_imm64(b, JT1, slot + ocerz_guest_base);
+        a64_ldr(b, 8, JT1, JT1, 0);
+        a64_mov_imm64(b, JT2, trap);
+        a64_subs_reg(b, 1, A64_ZR, JT1, JT2, 0);
+        leaf_out[n_leaf_out++] = a64_label(b); a64_bcond(b, A64_NE, 0);
+        if (leaf_limit) {
+            a64_mov_imm64(b, JT0, leaf_limit);
+            a64_subs_reg(b, 1, A64_ZR, 23, JT0, 0);
+            leaf_out[n_leaf_out++] = a64_label(b); a64_bcond(b, A64_HI, 0);
+        }
+        leaf_out_cb[n_leaf_out] = 1;
+        leaf_out[n_leaf_out++] = emit_leaf_call_ret(b, leaf, leaf_limit != 0, epi_sites, n_epi);
+        for (int k = 0; k < n_leaf_out; k++) {
+            if (leaf_out_cb[k]) a64_patch_cbz(leaf_out[k], a64_label(b));
+            else a64_patch_bcond(leaf_out[k], a64_label(b));
+        }
+    }
     a64_mov_imm64(b, JT1, slot + ocerz_guest_base);
     a64_ldr(b, 8, JT1, JT1, 0);
     a64_mov_imm64(b, JT2, trap);
@@ -13026,7 +13214,7 @@ typedef struct PendingChain {
     uint8_t pin_class;
     struct PendingChain *next;
 } PendingChain;
-#define PEND_BITS 12
+#define PEND_BITS 18
 #define PEND_SIZE (1u << PEND_BITS)
 #define PEND_MASK (PEND_SIZE - 1)
 static PendingChain *g_pending[PEND_SIZE];
@@ -14587,11 +14775,28 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 
     int last_flag_def = -1;
     ea_cache_reset();
+    int leaf_entry_writes = 0;
+    const void *leaf_entry = NULL;
+    if (ocerz_mode != OCERZ_MODE_NATIVE && !g_l0_fixed && leaf_layout_ok()) {
+        leaf_entry = ocerz_dyldapi_leaf_entry(rip, &leaf_entry_writes);
+        for (int k = 0; leaf_entry && k < n; k++) {
+            const X86Insn *t = &blk->insns[k];
+            if (t->op != OCERZ_OP_CALL && t->nops == 1 && t->ops[0].kind == OCERZ_OPK_IMM &&
+                (uint64_t)t->ops[0].imm == rip)
+                leaf_entry = NULL;
+        }
+    }
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
         g_cur_insn_idx = i;
         g_cur_insn_start = b.p;
         lanerec_note((uint32_t)(b.p - entry));
+        if (i == 0 && leaf_entry) {
+            OCERZ_LOG("jit: the routine at %#llx is answered in place\n", (unsigned long long)rip);
+            uint32_t *declined = emit_leaf_call_ret(&b, leaf_entry, leaf_entry_writes, epi_sites, &n_epi);
+            a64_patch_cbz(declined, a64_label(&b));
+            ea_cache_reset();
+        }
         g_cur_need = fl_need[i];
         g_cur_insns = blk->insns; g_cur_insns_n = n;
         g_cur_fpb = fpb_of[i];
@@ -15810,11 +16015,15 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
     if (!jit || !ocerz_jit_pc_in_arena(vm, host_pc)) return 0;
     uint32_t w = *site;
     if ((w & 0xfc000000u) == 0x14000000u) return 2;
-    int is_ld = (w & 0x3fe00c00u) == 0x19400000u;
-    int is_st = (w & 0x3fe00c00u) == 0x19000000u;
+    uint32_t opc = (w >> 22) & 3;
+    int is_acc = (w & 0x3f200c00u) == 0x19000000u;
+    int is_lds = is_acc && opc >= 2;
+    int lds_sf = opc == 2;
+    int is_ld = is_acc && opc != 0;
+    int is_st = is_acc && opc == 0;
     if (!is_ld && !is_st) return 0;
     int size = 1 << (w >> 30);
-    if (size < 2) return 0;
+    if (size < 2 || (is_lds && size == 8)) return 0;
     int32_t imm9 = (int32_t)((w >> 12) & 0x1ff); if (imm9 & 0x100) imm9 -= 0x200;
     int rn = (int)((w >> 5) & 31), rt = (int)(w & 31);
     if (rn == 31 || rt == 31) return 0;
@@ -15842,12 +16051,15 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
         if (pair) a64_try_ands_imm(&b, 1, A64_ZR, ta, 7);
         else emit_granule_cross_test(&b, size, ta, s1);
         uint32_t *bne = a64_label(&b); a64_bcond(&b, A64_NE, 0);
-        if (is_ld) a64_ldapur(&b, size, rt, ta, 0);
+        if (is_lds) a64_ldapurs(&b, size, lds_sf, rt, ta, 0);
+        else if (is_ld) a64_ldapur(&b, size, rt, ta, 0);
         else { a64_stlur(&b, size, rt, ta, 0); if (pair) a64_stlur(&b, 8, JTU, ta, 8); }
         uint32_t *back1 = a64_label(&b); a64_b(&b, 0);
         a64_patch_bcond(bne, a64_label(&b));
         if (is_ld) {
-            a64_ldr(&b, size, rt, ta, 0);
+            if (!is_lds)        a64_ldr(&b, size, rt, ta, 0);
+            else if (size == 2) a64_ldrsh(&b, lds_sf, rt, ta, 0);
+            else                a64_ldrsw(&b, rt, ta, 0);
             a64_dmb_ishld(&b);
         } else if (use_dmb) {
             a64_dmb_ish(&b);
@@ -15980,6 +16192,17 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
     jit->owner_pid = (int)getpid();
     jit->code_base = (uint32_t *)p;
     jit->code_cur = (uint32_t *)p;
+    size_t leaf_bytes = (size_t)(ocerz_leaf_hi - ocerz_leaf_lo);
+    if (leaf_bytes && leaf_bytes + 64 < bytes) {
+        pthread_jit_write_protect_np(0);
+        memcpy(p, ocerz_leaf_lo, leaf_bytes);
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(p, leaf_bytes);
+        jit->leaf_near = (const char *)p;
+        jit->code_cur = (uint32_t *)((uint8_t *)p + ((leaf_bytes + 63) & ~(size_t)63));
+        __atomic_store_n(&ocerz_leaf_near_hi, (uint64_t)(uintptr_t)p + leaf_bytes, __ATOMIC_RELEASE);
+        __atomic_store_n(&ocerz_leaf_near_lo, (uint64_t)(uintptr_t)p, __ATOMIC_RELEASE);
+    }
     jit->code_end = (uint32_t *)((uint8_t *)p + bytes);
     jit->code_bytes = bytes;
     OCERZ_LOG("JIT code arena %zu MB reserved at [%p,%p)\n",
@@ -16133,6 +16356,7 @@ static int force_stop_sites_writable(OcerzJit *jit)
 }
 
 uint64_t ocerz_jit_retire_count;
+uint64_t ocerz_leaf_near_lo, ocerz_leaf_near_hi;
 
 static void invalidate_all_locked(OcerzJit *jit)
 {
@@ -17062,7 +17286,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
         b = cache_lookup(jit, cpu->rip, cpu->mode32);
         if (!b) {
             if (ocerz_jitstat > 0) js_xlat++;
-            g_plain_mem = jit->plain_mem;
+            g_plain_mem = jit->plain_mem || (!cpu->mode32 && ocerz_dyldapi_memfn(cpu->rip));
             if (g_jl_log > 0)
                 __atomic_store_n(&g_jl_phase, 2, __ATOMIC_RELAXED);
             b = translate(jit, cpu->rip, cpu->mode32);

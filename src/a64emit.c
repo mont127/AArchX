@@ -18,7 +18,9 @@
  * forms of LDR/STR cover only non-negative multiples of the access size, which
  * is why the unscaled LDUR/STUR forms (signed 9-bit) are here too.  LDAPUR and
  * STLUR are the FEAT_LRCPC2 acquire-load and release-store with that same
- * unscaled offset, and they are what the JIT's ordered accesses are built from.
+ * unscaled offset, and they are what the JIT's ordered accesses are built from;
+ * LDAPURSB, LDAPURSH and LDAPURSW are the acquire-loads that sign-extend, so an
+ * ordered movsx from memory is one instruction as a plain one is.
  */
 #include "ocerz/a64emit.h"
 
@@ -860,6 +862,12 @@ void a64_ldapur(A64Buf *b, int size, int rt, int rn, int32_t simm9)
 {
     uint32_t sz = ldst_size_bits(size);
     a64_emit32(b, 0x19400000u | (sz << 30) | (((uint32_t)simm9 & 0x1ffu) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+}
+void a64_ldapurs(A64Buf *b, int size, int sf, int rt, int rn, int32_t simm9)
+{
+    uint32_t sz = ldst_size_bits(size);
+    uint32_t opc = (size == 4 || sf) ? 2u : 3u;
+    a64_emit32(b, 0x19000000u | (sz << 30) | (opc << 22) | (((uint32_t)simm9 & 0x1ffu) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
 }
 void a64_stlur(A64Buf *b, int size, int rt, int rn, int32_t simm9)
 {

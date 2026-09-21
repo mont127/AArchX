@@ -27,6 +27,7 @@ enum {
 };
 
 extern int ocerz_verbose;
+extern __thread int ocerz_critical_depth;
 
 #define OCERZ_LOG(...) do { if (ocerz_verbose >= 1) fprintf(stderr, "ocerz: " __VA_ARGS__); } while (0)
 #define OCERZ_TRACE(...) do { if (ocerz_verbose >= 2) fprintf(stderr, "ocerz: " __VA_ARGS__); } while (0)

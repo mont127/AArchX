@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo
+sdk macos 27.0
+exports 2194
+fn 118
+data 272
+var 0
+special 0
+stub no-declaration 984
+omit no-declaration-missing 7
+omit swift 813
+host-missing 0
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

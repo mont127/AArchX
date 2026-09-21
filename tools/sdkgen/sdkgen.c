@@ -1793,6 +1793,7 @@ static void load_overrides(void)
                  (strcmp(k, "special") == 0 && n == 3) ||
                  (strcmp(k, "stub") == 0 && n == 3) ||
                  (strcmp(k, "struct") == 0 && n == 4) ||
+                 (strcmp(k, "inplace") == 0 && n == 5 && sig_valid(w[4], 0)) ||
                  (strcmp(k, "shape") == 0 && n >= 4 && atoi(w[3]) > 0 && n == 4 + atoi(w[3]));
         if (!ok)
             die("%s:%d: malformed %s record", path, lineno, k);
@@ -2036,12 +2037,13 @@ static void classify(Rec *r)
     int nw = 0;
     for (int i = 0; i < g_novr; i++) {
         Override *o = &g_ovr[i];
-        if (strcmp(o->kind, "struct") != 0 || strcmp(o->f[1], r->name) != 0)
+        if ((strcmp(o->kind, "struct") != 0 && strcmp(o->kind, "inplace") != 0) ||
+            strcmp(o->f[1], r->name) != 0)
             continue;
         if (nw == 8)
-            die("overrides:%d: too many struct records for %s", o->line, r->name);
+            die("overrides:%d: too many struct and inplace records for %s", o->line, r->name);
         w[nw].argpos = atoi(o->f[2]);
-        w[nw].shape = o->f[3];
+        w[nw].shape = strcmp(o->kind, "inplace") == 0 ? NULL : o->f[3];
         w[nw].line = o->line;
         nw++;
     }
@@ -2072,10 +2074,10 @@ static void classify(Rec *r)
                 if (canon(at).kind != TK.Pointer)
                     die("overrides:%d: argument %d of %s is not a pointer", w[j].line, w[j].argpos, r->name);
                 CXType pt = clang_getPointeeType(desugar_to(at, TK.Pointer, TK.Pointer));
-                if (!typedef_chain_has(pt, w[j].shape))
+                if (w[j].shape && !typedef_chain_has(pt, w[j].shape))
                     die("overrides:%d: argument %d of %s does not point at a %s", w[j].line,
                         w[j].argpos, r->name, w[j].shape);
-                if (!find_shape(w[j].shape, "0"))
+                if (w[j].shape && !find_shape(w[j].shape, "0"))
                     die("overrides:%d: no shape %s version 0", w[j].line, w[j].shape);
             }
             const char *rc = pair_checks(tx, ta, 0, w, nw);
@@ -2145,7 +2147,8 @@ static void overrides_for(Rec *r)
     for (int i = 0; i < g_novr; i++) {
         Override *o = &g_ovr[i];
         const char *k = o->kind;
-        if (strcmp(k, "shape") == 0 || strcmp(k, "struct") == 0 || strcmp(k, "opaque") == 0)
+        if (strcmp(k, "shape") == 0 || strcmp(k, "struct") == 0 || strcmp(k, "inplace") == 0 ||
+            strcmp(k, "opaque") == 0)
             continue;
         const char *pat = o->f[1];
         if (o->glob) {
@@ -2292,13 +2295,13 @@ int main(int argc, char **argv)
         overrides_for(&recs[i]);
     for (int i = 0; i < g_novr; i++) {
         Override *o = &g_ovr[i];
-        if (strcmp(o->kind, "struct") == 0) {
+        if (strcmp(o->kind, "struct") == 0 || strcmp(o->kind, "inplace") == 0) {
             int idx = map_get(&ex.names, o->f[1]);
             if (idx < 0)
                 die("overrides:%d: %s does not export %s", o->line, g_lib.install, o->f[1]);
             for (int j = 0; j < ex.n; j++)
                 if (strcmp(recs[j].name, o->f[1]) == 0 && recs[j].kind != R_FN)
-                    die("overrides:%d: struct record for %s, which is not fn", o->line, o->f[1]);
+                    die("overrides:%d: %s record for %s, which is not fn", o->line, o->kind, o->f[1]);
             o->used = 1;
         }
         if (!o->used && o->scope && strcmp(o->kind, "opaque") == 0)
@@ -2382,6 +2385,10 @@ int main(int argc, char **argv)
     }
     for (int i = 0; i < nstructs; i++)
         fprintf(api, "struct %s %s %s\n", structs[i]->f[1], structs[i]->f[2], structs[i]->f[3]);
+    for (int i = 0; i < g_novr; i++)
+        if (strcmp(g_ovr[i].kind, "inplace") == 0 && g_ovr[i].used)
+            fprintf(api, "inplace %s %s %s %s\n", g_ovr[i].f[1], g_ovr[i].f[2], g_ovr[i].f[3],
+                    g_ovr[i].f[4]);
     int header_done = 0;
     for (int i = 0; i < ex.n; i++) {
         if (recs[i].kind != R_OMIT)

@@ -9,6 +9,23 @@
  * divsd/sqrtsd and friends always rounded to nearest whatever mode a program
  * selected with ldmxcsr or fesetround.
  *
+ * The same call sets FPCR.AH where the processor reports FEAT_AFP, as the M5
+ * this was written on does.  With that bit set the arm64 floating-point
+ * instructions handle NaNs the way SSE does: an invalid operation produces the
+ * negative default NaN x86 calls the real indefinite, and when both operands
+ * are NaNs the first one is returned, quieted, whichever of them was
+ * signalling, where arm64 otherwise lets a signalling NaN win and answers with
+ * a positive default.  src/jit.c
+ * then emits add, subtract, multiply, divide and square root bare, with none of
+ * the checks and replays that keep those results exact on a processor without
+ * the bit.  ocerz_afp_enable decides once, from main, so a unit harness that
+ * runs translated code on a thread nothing prepared never gets translations
+ * that rely on it, and ocerz_afp answers what it decided.  Native mode leaves
+ * the bit alone: the host's own code runs on guest threads there, a crossing
+ * would have to clear the bit and set it again, and two FPCR writes cost about
+ * fourteen nanoseconds, as much as the rest of the crossing.  OCERZ_NO_AFP=1
+ * keeps the software path everywhere.
+ *
  * Reset installs Darwin's flat 64-bit user selectors, which is what `mov %ss, r`
  * reads out of reset.
  */
@@ -16,13 +33,40 @@
 #include "ocerz/decode.h"
 #include "ocerz/mem.h"
 
+#include "ocerz/mode.h"
+
+#include <arm_acle.h>
 #include <fenv.h>
 #include <stdlib.h>
+#include <sys/sysctl.h>
+
+#define CPU_FPCR_AH 0x2ull
+
+static int g_afp;
+
+void ocerz_afp_enable(void)
+{
+    int have = 0;
+    size_t len = sizeof have;
+    g_afp = !getenv("OCERZ_NO_AFP") && ocerz_mode != OCERZ_MODE_NATIVE &&
+            sysctlbyname("hw.optional.arm.FEAT_AFP", &have, &len, NULL, 0) == 0 && have == 1;
+    OCERZ_LOG("cpu: NaN results come from %s\n", g_afp ? "the processor (FPCR.AH)" : "translated checks");
+}
+
+int ocerz_afp(void)
+{
+    return g_afp;
+}
 
 void ocerz_apply_mxcsr_round(uint32_t mxcsr)
 {
     static const int fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
     fesetround(fe[(mxcsr >> 13) & 3]);
+    if (g_afp) {
+        uint64_t fpcr = __arm_rsr64("fpcr");
+        if (!(fpcr & CPU_FPCR_AH))
+            __arm_wsr64("fpcr", fpcr | CPU_FPCR_AH);
+    }
 }
 
 void ocerz_cpu_reset(OcerzCPU *cpu)

@@ -68,9 +68,16 @@
  *         Argument <argpos>, counted from 0, of the fn record <export> points
  *         at a structure described by the shapes named <shape-name>, which the
  *         bridge copies and converts for the length of the call.
+ *     inplace <export> <argpos> <offset> <signature>
+ *         Argument <argpos> of the fn record <export> points at a structure the
+ *         guest owns and the native function reads and writes where it lies, so
+ *         it cannot be copied: a zlib stream is one.  The eight bytes <offset>
+ *         bytes into it may hold a guest function of <signature>, which the
+ *         bridge converts there for the length of the call and puts back
+ *         afterwards, unless the native function stored something else.
  *
  * An export name appears in exactly one of fn, data, var, special and stub.
- * struct records may come before or after the records they name.  A file that
+ * struct and inplace records may come before or after the records they name.  A file that
  * breaks any of these rules is refused whole, with its path, line number and
  * the rule, rather than loaded partly: a library half-described would bind
  * some imports to the wrong thing.
@@ -78,13 +85,21 @@
  * ---- the interface ----
  * ocerz_apidb_library loads and parses the file for an install name the first
  * time it is asked and returns the same pointer every time after, or NULL when
- * there is no file.  The parsed library owns its strings and is never freed.
+ * there is no file.  The file is chosen by the last component alone and is
+ * read once: when it describes another install name than the one asked for - a
+ * framework asked for without its Versions/A - the asker gets NULL, and the
+ * parsed library is kept under the name it does describe, for whoever asks
+ * with that one.  The parsed library owns its strings and is never freed.
  * ocerz_apidb_parse is the parser on its own, for tests.  ocerz_apidb_set_minos
  * is called by the loader with the main image's minimum OS version, packed as
  * Mach-O packs it (xxxx.yy.zz in nibbles), before anything asks for a library.
  * ocerz_apidb_postfork_child puts the loading lock back to its initial state in
  * a fork child; a library is published only once it is parsed whole, so one
  * another thread was loading at the fork is simply loaded again.
+ * ocerz_apidb_preload loads every library the version directory has.  It is
+ * called when the guest is about to put itself in a sandbox: from then on the
+ * kernel may refuse ocerz the read of its own data files, and a library the
+ * guest opens later still has to be synthesized.
  */
 #ifndef OCERZ_APIDB_H
 #define OCERZ_APIDB_H
@@ -93,6 +108,8 @@
 
 #define OCERZ_APIDB_SHAPE_WORDS 16
 #define OCERZ_APIDB_STRUCT_ARGS 2
+#define OCERZ_APIDB_INPLACE 4
+#define OCERZ_APIDB_INPLACE_MAX_OFFSET 4088
 
 typedef enum OcerzApiKind {
     OCERZ_API_FN = 1,
@@ -114,6 +131,12 @@ typedef struct OcerzApiStructArg {
     const char *shape;
 } OcerzApiStructArg;
 
+typedef struct OcerzApiInplace {
+    int argpos;
+    uint32_t offset;
+    const char *sig;
+} OcerzApiInplace;
+
 typedef struct OcerzApiEntry {
     OcerzApiKind kind;
     const char *export_name;
@@ -125,6 +148,8 @@ typedef struct OcerzApiEntry {
     const char *reason;
     int nstructs;
     OcerzApiStructArg structs[OCERZ_APIDB_STRUCT_ARGS];
+    int ninplace;
+    OcerzApiInplace inplace[OCERZ_APIDB_INPLACE];
 } OcerzApiEntry;
 
 typedef struct OcerzApiLibrary {
@@ -138,6 +163,7 @@ typedef struct OcerzApiLibrary {
 } OcerzApiLibrary;
 
 const OcerzApiLibrary *ocerz_apidb_library(const char *install_name);
+const char **ocerz_apidb_install_names(int *count);
 const OcerzApiLibrary *ocerz_apidb_parse(const char *path, const char *text, size_t len,
                                          char *err, size_t errlen);
 const OcerzApiEntry *ocerz_apidb_find(const OcerzApiLibrary *lib, const char *export_name);
@@ -145,6 +171,7 @@ const OcerzApiShape *ocerz_apidb_shape(const OcerzApiLibrary *lib, const char *n
                                        uint64_t version);
 void ocerz_apidb_set_minos(uint32_t minos);
 const char *ocerz_apidb_dir(void);
+void ocerz_apidb_preload(void);
 void ocerz_apidb_postfork_child(void);
 
 #endif

@@ -11,14 +11,16 @@
  * ocerz_vdylib_image builds - rather than through a list written for the test.
  * The unbridged names here are not an arbitrary selection: they are the
  * variadic exclusion bridge.h states, the functions whose ellipsis stands for a
- * list no format veneer reads (scanf, sscanf, syslog, err, warn), so a bridge
+ * list no format veneer reads (syslog, err, warn), so a bridge
  * that grows one of them has changed a documented rule rather than broken a
  * test.  The list once also held atof and strtod, until signatures could name a
  * double, and qsort and bsearch, until a callback argument had a trampoline
  * back into guest code; qsort and bsearch are bridged names now, and their
  * lookups succeeding is also what proves the callback notation parses.  open,
  * fcntl and ioctl stood there too, until src/sysbridge.c gave the variadic
- * functions whose optional argument is fixed handlers of their own.
+ * functions whose optional argument is fixed handlers of their own, and scanf
+ * and sscanf stood there until the scanf family grew veneers that count their
+ * pointer arguments from the format string.
  *
  * The bridged names are the whole of what native mode bridged before its
  * descriptors were made from the API database, libSystem's fn and special
@@ -153,12 +155,12 @@ static const char *const kBridged[] = {
     "_longjmp", "__longjmp", "_siglongjmp", "_fork", "_vfork", "_execve", "_execv",
     "_execvp", "_execvP", "_execl", "_execle", "_execlp", "_posix_spawn", "_posix_spawnp",
     "_posix_spawnattr_init", "_posix_spawn_file_actions_adddup2", "_system", "_popen",
-    "_pclose",
+    "_pclose", "_syslog", "_vsyslog", "_warn", "_warnx", "_swprintf", "_vswprintf",
 };
 #define NBRIDGED (sizeof kBridged / sizeof kBridged[0])
 
 static const char *const kUnbridged[] = {
-    "_scanf", "_sscanf", "_syslog", "_err", "_warn",
+    "_err", "_errx", "_asl_log",
 };
 #define NUNBRIDGED (sizeof kUnbridged / sizeof kUnbridged[0])
 
@@ -462,11 +464,11 @@ static void test_dl_specials(void)
     CHECK(e && strstr(dl_text(e), "tried: '/nonexistent/ocerz/libnope.dylib' (no such file)") != NULL,
           "dlopen of a missing path left '%s'", dl_text(e));
 
-    CHECK(dl_call("_dlopen", put_str(scratch + 256, "/usr/lib/libz.1.dylib"), 2, 0) == 0,
+    CHECK(dl_call("_dlopen", put_str(scratch + 256, "/usr/lib/libsqlite3.dylib"), 2, 0) == 0,
           "dlopen of a native library with no database answered a handle");
     e = dl_call("_dlerror", 0, 0, 0);
     CHECK(e && strstr(dl_text(e), "native library without an API database") != NULL,
-          "dlopen of libz left '%s'", dl_text(e));
+          "dlopen of sqlite3 left '%s'", dl_text(e));
 
     CHECK(dl_call("_dlclose", (uint64_t)-2, 0, 0) == 0, "dlclose(RTLD_DEFAULT) failed");
     CHECK((uint32_t)dl_call("_dlclose", 0x1234, 0, 0) == 0xffffffffu, "dlclose of a bogus handle did not fail");
@@ -489,8 +491,8 @@ static void test_dl_specials(void)
                   put_str(scratch + 256, "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"),
                   0, 0) == 1,
           "CoreFoundation reached through its framework symlink is not a library the cache contains");
-    CHECK(dl_call("__dyld_shared_cache_contains_path", put_str(scratch + 256, "/usr/lib/libz.1.dylib"), 0, 0) == 0,
-          "libz, which no database describes, is a library the cache contains");
+    CHECK(dl_call("__dyld_shared_cache_contains_path", put_str(scratch + 256, "/usr/lib/libsqlite3.dylib"), 0, 0) == 0,
+          "sqlite3, which no database describes, is a library the cache contains");
 
     uint64_t info = scratch + 512;
     Dl_info host;

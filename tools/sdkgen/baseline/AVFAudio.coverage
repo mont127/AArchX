@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/AVFAudio.framework/Versions/A/AVFAudio
+sdk macos 27.0
+exports 612
+fn 0
+data 444
+var 0
+special 0
+stub no-declaration 83
+omit no-declaration-missing 4
+omit objc-ivar 7
+omit swift 74
+host-missing 0
+objc-classes 95
+objc-eh-types 0
+objc-ivars 7
+ld-pseudo-skipped 11
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

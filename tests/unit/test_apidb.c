@@ -87,7 +87,10 @@ static void test_records(void)
         "shape ThingCallBacks 1 4 - p(p) v(p) B(pp)\n"
         "fn _Other Other d(dp)\n"
         "struct _MakeThing 3 ThingCallBacks\n"
-        "struct _Other 1 ThingCallBacks";
+        "struct _Other 1 ThingCallBacks\n"
+        "inplace _Stream 0 64 p(puu)\n"
+        "fn _Stream Stream i(pi)\n"
+        "inplace _Stream 0 72 v(pp)";
 
     char err[256] = "untouched";
     const OcerzApiLibrary *lib = parse(text, err, sizeof err);
@@ -100,15 +103,16 @@ static void test_records(void)
     CHECK(strcmp(lib->install_name, "/System/Library/Frameworks/Test.framework/Versions/A/Test") == 0,
           "install name is %s", lib->install_name);
     CHECK(strcmp(lib->sdk_version, "26.6.1") == 0, "sdk version is %s", lib->sdk_version);
-    CHECK(lib->nentries == 7, "%d entries, want 7", lib->nentries);
+    CHECK(lib->nentries == 8, "%d entries, want 8", lib->nentries);
     CHECK(lib->nshapes == 2, "%d shapes, want 2", lib->nshapes);
-    if (lib->nentries != 7 || lib->nshapes != 2)
+    if (lib->nentries != 8 || lib->nshapes != 2)
         return;
 
     static const char *const order[] = {
         "_MakeThing", "_kThingDefault", "___guard", "_exit", "_printf", "dyld_stub_binder", "_Other",
+        "_Stream",
     };
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 8; i++) {
         CHECK(strcmp(lib->entries[i].export_name, order[i]) == 0,
               "entry %d is %s, want %s: entries are not in file order", i,
               lib->entries[i].export_name, order[i]);
@@ -143,6 +147,13 @@ static void test_records(void)
     e = ocerz_apidb_find(lib, "_Other");
     CHECK(e && e->kind == OCERZ_API_FN && e->nstructs == 1 && e->structs[0].argpos == 1,
           "_Other's struct record after the shapes is not bound");
+    CHECK(e && e->ninplace == 0, "_Other has %d inplace records, want none", e ? e->ninplace : -1);
+    e = ocerz_apidb_find(lib, "_Stream");
+    CHECK(e && e->kind == OCERZ_API_FN && e->nstructs == 0 && e->ninplace == 2 &&
+          e->inplace[0].argpos == 0 && e->inplace[0].offset == 64 &&
+          strcmp(e->inplace[0].sig, "p(puu)") == 0 && e->inplace[1].argpos == 0 &&
+          e->inplace[1].offset == 72 && strcmp(e->inplace[1].sig, "v(pp)") == 0,
+          "_Stream's inplace records, one before it and one after, are not bound in order");
 
     const OcerzApiShape *s0 = ocerz_apidb_shape(lib, "ThingCallBacks", 0);
     const OcerzApiShape *s1 = ocerz_apidb_shape(lib, "ThingCallBacks", 1);
@@ -254,7 +265,26 @@ static const Refusal kRefusals[] = {
     { HEAD "data _a a\nvar _a 8 stack_guard\n", 5, "export _a is already declared, as data, on line 4" },
     { HEAD "stub _a x\nstub _a y\n", 5, "export _a is already declared, as stub, on line 4" },
     { HEAD "special _a exit\nfn _a a v()\n", 5, "export _a is already declared, as special, on line 4" },
-    { HEAD "func _a a v()\n", 4, "func is not a record kind; want fn, data, var, special, stub, shape or struct" },
+    { HEAD "func _a a v()\n", 4,
+      "func is not a record kind; want fn, data, var, special, stub, shape, struct or inplace" },
+    { HEAD "inplace _a 0 64\n", 4,
+      "an inplace record has 4 fields, want 5: inplace <export> <argpos> <offset> <signature>" },
+    { HEAD "inplace _a x 64 v(p)\n", 4, "inplace _a names argument x, want a decimal position from 0 to 15" },
+    { HEAD "inplace _a 0 5 v(p)\n", 4, "inplace _a names offset 5, want a multiple of 8 from 0 to 4088" },
+    { HEAD "inplace _a 0 4096 v(p)\n", 4, "inplace _a names offset 4096, want a multiple of 8 from 0 to 4088" },
+    { HEAD "inplace _a 0 64 nope\n", 4, "inplace _a gives the signature nope, which is not notation" },
+    { HEAD "inplace _a 0 64 v(p)\n", 4, "inplace names _a, which no fn record declares" },
+    { HEAD "stub _a x\ninplace _a 0 64 v(p)\n", 5,
+      "inplace names _a, which is a stub record on line 4, not a fn record" },
+    { HEAD "fn _a a v(ip)\ninplace _a 0 64 v(p)\n", 5,
+      "inplace binds argument 0 of _a, which its signature v(ip) does not declare as a pointer" },
+    { HEAD "fn _a a v(p)\ninplace _a 0 64 v(p)\ninplace _a 0 64 v(pp)\n", 6,
+      "offset 64 of argument 0 of _a is already converted in place" },
+    { HEAD "fn _a a v(p)\nshape S 0 1 -\nstruct _a 0 S\ninplace _a 0 64 v(p)\n", 7,
+      "argument 0 of _a is bound to a shape, which copies it, and cannot also be converted in place" },
+    { HEAD "fn _a a v(p)\ninplace _a 0 0 v(p)\ninplace _a 0 8 v(p)\ninplace _a 0 16 v(p)\n"
+           "inplace _a 0 24 v(p)\ninplace _a 0 32 v(p)\n", 9,
+      "_a already has the 4 inplace records one fn may have" },
     { HEAD "library /y\n", 4, "a library record may appear only once, in the header" },
     { HEAD "sdk macos 26.0\n", 4, "a sdk record may appear only once, in the header" },
     { HEAD "ocerz-apidb 1\n", 4, "a ocerz-apidb record may appear only once, in the header" },

@@ -57,6 +57,22 @@ check: ocerz unit guest
 	bash tests/run_diff32.sh .
 	bash tests/run_dynamic_tests.sh
 	bash tests/run_native_tests.sh
+	bash tests/run_guest_library_tests.sh
+	bash tests/run_native_cxx_tests.sh
+	bash tests/run_native_framework_tests.sh
+	bash tests/run_native_format_tests.sh
+
+guest-cxx:
+	bash tools/build_guest_cxx.sh
+
+native-cxx: ocerz
+	bash tests/run_native_cxx_tests.sh
+
+native-frameworks: ocerz
+	bash tests/run_native_framework_tests.sh
+
+native-formats: ocerz
+	bash tests/run_native_format_tests.sh
 
 diff32:
 	bash tests/run_diff32.sh .
@@ -71,4 +87,4 @@ clean:
 
 -include $(DEPS)
 
-.PHONY: unit guest check clean i386diff diff32
+.PHONY: unit guest check clean i386diff diff32 guest-cxx native-cxx native-frameworks native-formats

@@ -1,0 +1,17 @@
+library /System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork
+sdk macos 27.0
+exports 952
+fn 97
+data 488
+var 0
+special 0
+stub no-declaration 367
+host-missing 0
+objc-classes 50
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 3
+override-structs 6
+override-opaque 0

@@ -9,8 +9,11 @@
  * above the return address, and the handler consumes that return address and
  * leaves its result in rax through ocerz_bridge_return, then lets any pending
  * guest signal in through ocerz_bridge_settle.  The functions that can fail the
- * POSIX way leave errno as the host call they made left it, and errno is the
- * host's, since ___error is bridged to the host's __error.
+ * POSIX way leave the host's errno as the call they made left it.  The guest
+ * does not read that variable: its errno lives in a slot of its own thread
+ * block (OCERZ_ERRNO_SLOT, dyld.h), because ocerz's own code changes the host's
+ * between any two guest instructions, and src/vdylib.c copies the slot into
+ * the host's errno on the way into every handler and back out on the way out.
  *
  * src/sysbridge.c says what each group does, where it takes ocerz's own
  * implementation rather than the host's, and what it refuses.
@@ -65,6 +68,26 @@ int ocerz_sys_posix_spawnp(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_system(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_popen(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pclose(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_key_create(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_key_delete(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_setspecific(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_getspecific(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_exit(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_mach_vm_map(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_mach_vm_remap(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_get_stackaddr_np(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_get_stacksize_np(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_getpagesize(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_sysconf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_host_page_size(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_sysctl(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_sysctlbyname(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_sandbox_check(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_sandbox_init(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_sandbox_init_with_parameters(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_sandbox_apply(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_sandbox_ms(struct OcerzVM *vm, OcerzCPU *cpu);
 
 #define OCERZ_JB_MASK 80
 #define OCERZ_JB_SAVEMASK 84

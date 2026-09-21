@@ -1,0 +1,21 @@
+library /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
+sdk macos 27.0
+exports 2192
+fn 318
+data 126
+var 0
+special 0
+stub arch-mismatch 2
+stub callback-struct 2
+stub no-declaration 1736
+stub variadic 1
+omit objc-ivar 7
+host-missing 0
+objc-classes 7
+objc-eh-types 0
+objc-ivars 7
+ld-pseudo-skipped 20
+overrides 1
+override-shapes 1
+override-structs 1
+override-opaque 0

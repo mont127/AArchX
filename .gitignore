@@ -10,3 +10,5 @@ notes/
 MacNdCheese-WineEngine-PRIVATE/
 /ocerz
 tests/__pycache__/
+tools/cxx/build/
+runtime/guest/

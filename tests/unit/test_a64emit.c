@@ -394,6 +394,33 @@ static void b_tbnz(A64Buf *b)
     a64_ret(b);
 }
 
+static void b_ldapursb64(A64Buf *b) { a64_ldapurs(b, 1, 1, 0, 1, 7); a64_ret(b); }
+static void b_ldapursb32(A64Buf *b) { a64_ldapurs(b, 1, 0, 0, 1, 7); a64_ret(b); }
+static void b_ldapursh64(A64Buf *b) { a64_ldapurs(b, 2, 1, 0, 1, 6); a64_ret(b); }
+static void b_ldapursh32(A64Buf *b) { a64_ldapurs(b, 2, 0, 0, 1, 6); a64_ret(b); }
+static void b_ldapursw(A64Buf *b) { a64_ldapurs(b, 4, 1, 0, 1, 4); a64_ret(b); }
+static void b_ldapursw_neg(A64Buf *b) { a64_ldapurs(b, 4, 1, 0, 1, -4); a64_ret(b); }
+
+static void test_ldapurs(void)
+{
+    static uint64_t cells[2] __attribute__((aligned(8)));
+    cells[0] = 0x80a1b2c3d4e5f607ull;
+    cells[1] = 0x0102030405060708ull;
+    uint64_t a = (uint64_t)(uintptr_t)&cells[0];
+    CHECK(run2(b_ldapursb64, 0, a) == 0xffffffffffffff80ull, "ldapursb x got %#llx",
+          (unsigned long long)run2(b_ldapursb64, 0, a));
+    CHECK(run2(b_ldapursb32, 0, a) == 0x00000000ffffff80ull, "ldapursb w got %#llx",
+          (unsigned long long)run2(b_ldapursb32, 0, a));
+    CHECK(run2(b_ldapursh64, 0, a) == 0xffffffffffff80a1ull, "ldapursh x got %#llx",
+          (unsigned long long)run2(b_ldapursh64, 0, a));
+    CHECK(run2(b_ldapursh32, 0, a) == 0x00000000ffff80a1ull, "ldapursh w got %#llx",
+          (unsigned long long)run2(b_ldapursh32, 0, a));
+    CHECK(run2(b_ldapursw, 0, a) == 0xffffffff80a1b2c3ull, "ldapursw got %#llx",
+          (unsigned long long)run2(b_ldapursw, 0, a));
+    CHECK(run2(b_ldapursw_neg, 0, a + 8) == 0xffffffff80a1b2c3ull, "ldapursw at -4 got %#llx",
+          (unsigned long long)run2(b_ldapursw_neg, 0, a + 8));
+}
+
 static void test_ldapr(void)
 {
     static uint64_t cell __attribute__((aligned(8)));
@@ -524,6 +551,7 @@ int main(void)
     test_try_patch_b_range();
     test_logical_imm_encodings();
     test_ldapr();
+    test_ldapurs();
     test_all_logical_immediates();
     CHECK(run_br(16) == 222, "a64_br x16");
     CHECK(run_br(9) == 222, "a64_br x9");

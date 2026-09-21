@@ -23,6 +23,26 @@
  * OCERZ_PRELOAD_OBJC still moves named cache images' closures into the initial
  * batch, and "@cat" does that for every image that defines categories.
  *
+ * libsystem_platform's string and memory routines get two kinds of special
+ * treatment from the translator, and this file is where it learns which code
+ * they are.  The image's function starts are read once, and the exported names
+ * of memmove, strlen and the rest are resolved in it.  Some of those exports
+ * are the routine itself; others are a six-byte jump through a pointer the
+ * library fills in with the variant it chose for the processor, and for those
+ * the pointer is read when the question is asked, never the stub's enclosing
+ * function, which is eight kilobytes of unrelated stubs.  ocerz_dyldapi_memfn
+ * answers whether an address lies inside one of those routines, which are
+ * translated with plain accesses even where ordered accesses are required:
+ * they move bytes at arbitrary alignments, nearly half of their eight-byte
+ * accesses straddle a sixteen-byte boundary at random offsets, and each one
+ * that does costs a barrier, which made a copy four and a half times slower
+ * than Rosetta's.  OCERZ_NO_MEMFN_PLAIN=1 turns that off.
+ * ocerz_dyldapi_leaf_entry answers, for an address that is exactly the
+ * exported entry of one of ten of them, the routine in src/leaf.s that does
+ * the same work with the guest's registers in place, and whether it writes;
+ * the translator puts a call to it at the head of that block, ahead of the
+ * x86 code it keeps translating for the cases the routine declines.
+ *
  * _NSGetExecutablePath behaves as dyld's does: a buffer the path fits in gets
  * the path and a size left exactly as the caller set it, and only a buffer too
  * small has the size rewritten, to the length the path needs, with -1 returned.
@@ -31,6 +51,7 @@
  * two.
  */
 #include "ocerz/dyldapi.h"
+#include "ocerz/leaf.h"
 #include "ocerz/vdylib.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
@@ -44,6 +65,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
@@ -331,15 +353,96 @@ static uint64_t image_slide(uint64_t mh)
     return 0;
 }
 
-static uint64_t cache_find_path(struct OcerzCache *cache, const char *path)
+#define CACHE_HDR_OBJC_OPTS 0x1d0
+#define OBJC_OPTS_SEL_TABLE 0x18
+#define OBJC_OPTS_SEL_BASE 0x30
+
+typedef struct CachePathSlot {
+    const char *path;
+    uint64_t mh;
+} CachePathSlot;
+
+static CachePathSlot *_Atomic g_cache_paths;
+static uint32_t g_cache_paths_mask;
+static struct OcerzCache *g_cache_paths_of;
+static pthread_mutex_t g_cache_paths_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t cache_path_hash(const char *s)
 {
-    for (uint32_t i = 0; i < cache->images_cnt; i++) {
-        const char *p = NULL;
-        uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
-        if (mh && p && strcmp(p, path) == 0)
-            return mh;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (; *s; s++) {
+        h ^= (uint8_t)*s;
+        h *= 0x100000001b3ull;
+    }
+    return (uint32_t)(h ^ (h >> 32));
+}
+
+static CachePathSlot *cache_paths_index(struct OcerzCache *cache)
+{
+    CachePathSlot *have = atomic_load(&g_cache_paths);
+    if (have && g_cache_paths_of == cache)
+        return have;
+    pthread_mutex_lock(&g_cache_paths_lock);
+    have = atomic_load(&g_cache_paths);
+    if (!have || g_cache_paths_of != cache) {
+        uint32_t cap = 16;
+        while (cap < cache->images_cnt * 2 + 16)
+            cap <<= 1;
+        CachePathSlot *made = calloc(cap, sizeof *made);
+        if (made) {
+            for (uint32_t i = 0; i < cache->images_cnt; i++) {
+                const char *p = NULL;
+                uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
+                if (!mh || !p)
+                    continue;
+                uint32_t at = cache_path_hash(p) & (cap - 1);
+                while (made[at].path && strcmp(made[at].path, p) != 0)
+                    at = (at + 1) & (cap - 1);
+                if (!made[at].path) {
+                    made[at].path = p;
+                    made[at].mh = mh;
+                }
+            }
+            g_cache_paths_mask = cap - 1;
+            g_cache_paths_of = cache;
+            atomic_store(&g_cache_paths, made);
+            have = made;
+        }
+    }
+    pthread_mutex_unlock(&g_cache_paths_lock);
+    return have;
+}
+
+static uint64_t cache_find_path_ex(struct OcerzCache *cache, const char *path, const char **cache_path)
+{
+    CachePathSlot *index = cache_paths_index(cache);
+    if (!index) {
+        for (uint32_t i = 0; i < cache->images_cnt; i++) {
+            const char *p = NULL;
+            uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
+            if (mh && p && strcmp(p, path) == 0) {
+                if (cache_path)
+                    *cache_path = p;
+                return mh;
+            }
+        }
+        return 0;
+    }
+    uint32_t at = cache_path_hash(path) & g_cache_paths_mask;
+    while (index[at].path) {
+        if (strcmp(index[at].path, path) == 0) {
+            if (cache_path)
+                *cache_path = index[at].path;
+            return index[at].mh;
+        }
+        at = (at + 1) & g_cache_paths_mask;
     }
     return 0;
+}
+
+static uint64_t cache_find_path(struct OcerzCache *cache, const char *path)
+{
+    return cache_find_path_ex(cache, path, NULL);
 }
 
 static uint64_t cache_find_canonical(const char *path, const char **cache_path)
@@ -349,15 +452,9 @@ static uint64_t cache_find_canonical(const char *path, const char **cache_path)
     if (!g_cache || !path)
         return 0;
     for (int pass = 0; pass < 2; pass++) {
-        for (uint32_t i = 0; i < g_cache->images_cnt; i++) {
-            const char *p = NULL;
-            uint64_t mh = ocerz_cache_image_addr(g_cache, i, &p);
-            if (mh && p && strcmp(p, want) == 0) {
-                if (cache_path)
-                    *cache_path = p;
-                return mh;
-            }
-        }
+        uint64_t mh = cache_find_path_ex(g_cache, want, cache_path);
+        if (mh)
+            return mh;
         if (pass || !ocerz_canon_dylib_path(path, canon, sizeof canon) || strcmp(canon, path) == 0)
             break;
         want = canon;
@@ -711,6 +808,26 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache)
         g_clsopt = cls_off ? opt + (int64_t)cls_off : 0;
         g_protoopt = proto_off ? opt + (int64_t)proto_off : 0;
         g_sel_pool = sel_off ? opt + sel_off : 0;
+    }
+    if (!g_selopt && g_sel_pool) {
+        const uint8_t *hd = (const uint8_t *)ocerz_g2h(cache->base);
+        uint32_t mapping_off = 0;
+        uint64_t opts_off = 0, opts_size = 0;
+        memcpy(&mapping_off, hd + 0x10, 4);
+        if (mapping_off >= CACHE_HDR_OBJC_OPTS + 16) {
+            memcpy(&opts_off, hd + CACHE_HDR_OBJC_OPTS, 8);
+            memcpy(&opts_size, hd + CACHE_HDR_OBJC_OPTS + 8, 8);
+        }
+        if (opts_off && opts_size >= OBJC_OPTS_SEL_BASE + 8) {
+            const uint8_t *ob = hd + opts_off;
+            uint64_t table_off = 0, sel_base = 0;
+            memcpy(&table_off, ob + OBJC_OPTS_SEL_TABLE, 8);
+            memcpy(&sel_base, ob + OBJC_OPTS_SEL_BASE, 8);
+            if (table_off && cache->base + sel_base == g_sel_pool)
+                g_selopt = cache->base + table_off;
+        }
+        OCERZ_LOG("dyldapi: selector table %s the cache header's objc optimizations\n",
+                  g_selopt ? "taken from" : "not found in");
     }
 
     parse_build_version(ocerz_main_mh, &g_main_bv_platform, &g_main_bv_minos, &g_main_bv_sdk);
@@ -1192,14 +1309,21 @@ static const char **g_selidx;
 static uint32_t g_selidx_cap;
 static pthread_mutex_t g_selidx_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static uint64_t fnv1a(const char *s, size_t n)
+static uint64_t selhash(const char *s, size_t n)
 {
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (size_t i = 0; i < n; i++) {
-        h ^= (uint8_t)s[i];
-        h *= 0x100000001b3ull;
+    uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t)n;
+    while (n >= 8) {
+        uint64_t w;
+        memcpy(&w, s, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdull;
+        h ^= h >> 32;
+        s += 8;
+        n -= 8;
     }
-    return h;
+    uint64_t w = 0;
+    memcpy(&w, s, n);
+    h = (h ^ w) * 0xc4ceb9fe1a85ec53ull;
+    return h ^ (h >> 29);
 }
 
 static void selpool_build(void)
@@ -1243,13 +1367,20 @@ static void selpool_build(void)
             continue;
         }
         size_t l = strlen(p);
-        uint32_t h = (uint32_t)(fnv1a(p, l) & (cap - 1));
+        uint32_t h = (uint32_t)(selhash(p, l) & (cap - 1));
         uint32_t probes = 0;
-        while (idx[h] && ++probes < cap)
+        while (idx[h] && ++probes < cap) {
+            if (idx[h][0] == p[0] && strcmp(idx[h], p) == 0)
+                break;
             h = (h + 1) & (cap - 1);
-        idx[h] = p;
+        }
+        if (!idx[h])
+            idx[h] = p;
         p += l + 1;
     }
+    if (getenv("OCERZ_SELPOOLLOG"))
+        fprintf(stderr, "ocerz: SELPOOL base=%p bytes=%llu strings=%llu cap=%u\n", (void *)base,
+                (unsigned long long)(pool_end - base), (unsigned long long)count, cap);
     g_selidx_cap = cap;
     g_selidx = idx;
     pthread_mutex_unlock(&g_selidx_lock);
@@ -1302,7 +1433,7 @@ static uint64_t selpool_canonical(const char *want)
             uint64_t b = 0;
             if (g_selidx) {
                 size_t wl = strlen(want);
-                uint32_t hh = (uint32_t)(fnv1a(want, wl) & (g_selidx_cap - 1));
+                uint32_t hh = (uint32_t)(selhash(want, wl) & (g_selidx_cap - 1));
                 while (g_selidx[hh]) {
                     if (strcmp(g_selidx[hh], want) == 0) { b = (uint64_t)(uintptr_t)g_selidx[hh]; break; }
                     hh = (hh + 1) & (g_selidx_cap - 1);
@@ -1321,11 +1452,226 @@ static uint64_t selpool_canonical(const char *want)
     if (!g_selidx)
         return 0;
     size_t wl = strlen(want);
-    uint32_t h = (uint32_t)(fnv1a(want, wl) & (g_selidx_cap - 1));
+    uint32_t h = (uint32_t)(selhash(want, wl) & (g_selidx_cap - 1));
     while (g_selidx[h]) {
         if (strcmp(g_selidx[h], want) == 0)
             return (uint64_t)(uintptr_t)g_selidx[h];
         h = (h + 1) & (g_selidx_cap - 1);
+    }
+    return 0;
+}
+
+#define MEMFN_MAX 128
+#define MEMFN_BYTES_MAX 0x4000u
+
+static struct {
+    uint64_t lo, hi;
+} g_memfn[MEMFN_MAX];
+static _Atomic int g_memfn_n;
+static uint64_t g_memfn_slot[MEMFN_MAX];
+static int g_memfn_slots;
+static uint64_t *g_memfn_starts;
+static size_t g_memfn_nstarts;
+static uint64_t g_memfn_text_lo, g_memfn_text_hi;
+static _Atomic int g_memfn_built;
+static pthread_mutex_t g_memfn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const struct {
+    const char *name;
+    void (*routine)(void);
+    int writes;
+} g_leaf_names[] = {
+    { "_strlen", ocerz_leaf_strlen, 0 },   { "_strnlen", ocerz_leaf_strnlen, 0 },
+    { "_strcmp", ocerz_leaf_strcmp, 0 },   { "_strncmp", ocerz_leaf_strncmp, 0 },
+    { "_memcmp", ocerz_leaf_memcmp, 0 },   { "_strchr", ocerz_leaf_strchr, 0 },
+    { "_memchr", ocerz_leaf_memchr, 0 },   { "_memcpy", ocerz_leaf_memmove, 1 },
+    { "_memmove", ocerz_leaf_memmove, 1 }, { "_memset", ocerz_leaf_memset, 1 },
+};
+#define LEAF_ENTRY_MAX 16
+static struct {
+    uint64_t entry;
+    void (*routine)(void);
+    int writes;
+} g_leaf_entry[LEAF_ENTRY_MAX];
+static int g_leaf_entries;
+
+static const char *const g_memfn_names[] = {
+    "_memmove", "_memcpy", "_memset", "_bzero", "___bzero", "_memset_pattern4", "_memset_pattern8",
+    "_memset_pattern16", "_memccpy", "_memchr", "_memcmp", "_strchr", "_strcmp", "_strncmp",
+    "_strcpy", "_strlcpy", "_strlcat", "_strlen", "_strncpy", "_strnlen", "_strstr",
+};
+
+static int memfn_function(uint64_t addr, uint64_t *lo_out, uint64_t *hi_out)
+{
+    size_t n = g_memfn_nstarts;
+    const uint64_t *starts = g_memfn_starts;
+    if (!n || addr < starts[0] || addr >= g_memfn_text_hi)
+        return 0;
+    size_t lo = 0, hi = n;
+    while (hi - lo > 1) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (starts[mid] <= addr)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    uint64_t end = lo + 1 < n ? starts[lo + 1] : g_memfn_text_hi;
+    if (end - starts[lo] > MEMFN_BYTES_MAX)
+        return 0;
+    *lo_out = starts[lo];
+    *hi_out = end;
+    return 1;
+}
+
+static void memfn_confirm_locked(uint64_t lo, uint64_t hi)
+{
+    int n = atomic_load(&g_memfn_n);
+    for (int k = 0; k < n; k++)
+        if (g_memfn[k].lo == lo)
+            return;
+    if (n < MEMFN_MAX) {
+        g_memfn[n].lo = lo;
+        g_memfn[n].hi = hi;
+        atomic_store(&g_memfn_n, n + 1);
+    }
+}
+
+static void memfn_build(void)
+{
+    uint64_t mh = cache_find_path(g_cache, "/usr/lib/system/libsystem_platform.dylib");
+    const struct mach_header_64 *h = mh ? (const struct mach_header_64 *)ocerz_g2h(mh) : NULL;
+    if (!h || h->magic != MH_MAGIC_64)
+        return;
+    uint64_t slide = image_slide(mh), le_addr = 0, le_fileoff = 0, fs_off = 0, fs_size = 0;
+    const uint8_t *lc = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const void *)lc;
+            if (strcmp(sg->segname, "__TEXT") == 0) {
+                g_memfn_text_lo = sg->vmaddr + slide;
+                g_memfn_text_hi = g_memfn_text_lo + sg->vmsize;
+            } else if (strcmp(sg->segname, "__LINKEDIT") == 0) {
+                le_addr = sg->vmaddr + slide;
+                le_fileoff = sg->fileoff;
+            }
+        } else if (l->cmd == LC_FUNCTION_STARTS) {
+            const struct linkedit_data_command *d = (const void *)lc;
+            fs_off = d->dataoff;
+            fs_size = d->datasize;
+        }
+        lc += l->cmdsize;
+    }
+    if (!g_memfn_text_hi || !le_addr || !fs_size || fs_off < le_fileoff) {
+        g_memfn_text_hi = 0;
+        return;
+    }
+    const uint8_t *p = (const uint8_t *)ocerz_g2h(le_addr + (fs_off - le_fileoff)), *end = p + fs_size;
+    size_t cap = 4096, n = 0;
+    uint64_t *starts = malloc(cap * sizeof *starts), at = g_memfn_text_lo;
+    while (starts && p < end && *p) {
+        uint64_t delta = 0;
+        unsigned shift = 0;
+        while (p < end) {
+            uint8_t byte = *p++;
+            delta |= (uint64_t)(byte & 0x7f) << shift;
+            shift += 7;
+            if (!(byte & 0x80) || shift > 63)
+                break;
+        }
+        at += delta;
+        if (n == cap) {
+            uint64_t *grown = realloc(starts, cap * 2 * sizeof *starts);
+            if (!grown)
+                break;
+            starts = grown;
+            cap *= 2;
+        }
+        starts[n++] = at;
+    }
+    g_memfn_starts = starts;
+    g_memfn_nstarts = starts ? n : 0;
+    for (size_t k = 0; g_memfn_nstarts && k < sizeof g_memfn_names / sizeof g_memfn_names[0]; k++) {
+        int found = 0;
+        uint64_t a = ocerz_cache_resolve_from_image(g_cache, mh, g_memfn_names[k], &found);
+        if (!found || a < g_memfn_text_lo || a + 6 > g_memfn_text_hi)
+            continue;
+        for (size_t q = 0; q < sizeof g_leaf_names / sizeof g_leaf_names[0]; q++)
+            if (strcmp(g_leaf_names[q].name, g_memfn_names[k]) == 0 && g_leaf_entries < LEAF_ENTRY_MAX) {
+                g_leaf_entry[g_leaf_entries].entry = a;
+                g_leaf_entry[g_leaf_entries].routine = g_leaf_names[q].routine;
+                g_leaf_entry[g_leaf_entries].writes = g_leaf_names[q].writes;
+                g_leaf_entries++;
+            }
+        const uint8_t *code = (const uint8_t *)ocerz_g2h(a);
+        if (code[0] == 0xff && code[1] == 0x25) {
+            int32_t rel;
+            memcpy(&rel, code + 2, 4);
+            if (g_memfn_slots < MEMFN_MAX)
+                g_memfn_slot[g_memfn_slots++] = a + 6 + (uint64_t)(int64_t)rel;
+        } else {
+            uint64_t lo, hi;
+            if (memfn_function(a, &lo, &hi))
+                memfn_confirm_locked(lo, hi);
+        }
+    }
+    OCERZ_LOG("dyldapi: libsystem_platform has %d string and memory routines of its own and %d chosen"
+              " through a pointer; both kinds are translated with plain accesses\n",
+              atomic_load(&g_memfn_n), g_memfn_slots);
+}
+
+static void memfn_ensure(void)
+{
+    if (atomic_load(&g_memfn_built))
+        return;
+    pthread_mutex_lock(&g_memfn_lock);
+    if (!atomic_load(&g_memfn_built)) {
+        memfn_build();
+        atomic_store(&g_memfn_built, 1);
+    }
+    pthread_mutex_unlock(&g_memfn_lock);
+}
+
+const void *ocerz_dyldapi_leaf_entry(uint64_t rip, int *writes)
+{
+    if (!g_cache || !writes)
+        return NULL;
+    memfn_ensure();
+    if (rip < g_memfn_text_lo || rip >= g_memfn_text_hi)
+        return NULL;
+    for (int k = 0; k < g_leaf_entries; k++)
+        if (g_leaf_entry[k].entry == rip) {
+            *writes = g_leaf_entry[k].writes;
+            return (const void *)(uintptr_t)g_leaf_entry[k].routine;
+        }
+    return NULL;
+}
+
+int ocerz_dyldapi_memfn(uint64_t rip)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_MEMFN_PLAIN") ? 1 : 0;
+    if (off || !g_cache)
+        return 0;
+    memfn_ensure();
+    if (rip < g_memfn_text_lo || rip >= g_memfn_text_hi)
+        return 0;
+    int n = atomic_load(&g_memfn_n);
+    for (int k = 0; k < n; k++)
+        if (rip >= g_memfn[k].lo && rip < g_memfn[k].hi)
+            return 1;
+    uint64_t lo, hi;
+    if (!memfn_function(rip, &lo, &hi))
+        return 0;
+    for (int k = 0; k < g_memfn_slots; k++) {
+        uint64_t target = ocerz_ld(g_memfn_slot[k], 8);
+        if (target >= lo && target < hi) {
+            pthread_mutex_lock(&g_memfn_lock);
+            memfn_confirm_locked(lo, hi);
+            pthread_mutex_unlock(&g_memfn_lock);
+            return 1;
+        }
     }
     return 0;
 }

@@ -103,6 +103,29 @@ static void apply_wine_defaults(const char *path)
 
 extern char ocerz_cmdline_summary[256];
 
+#define MOCK_KEYCHAIN_ARGS 512
+
+static char **mock_keychain_argv(const char *path, int *argc, char **argv)
+{
+    static char *out[MOCK_KEYCHAIN_ARGS + 2];
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if (strcmp(base, "Steam Helper") != 0 || getenv("OCERZ_NO_MOCK_KEYCHAIN") || *argc < 1 ||
+        *argc >= MOCK_KEYCHAIN_ARGS)
+        return argv;
+    for (int k = 1; k < *argc; k++)
+        if (strcmp(argv[k], "--use-mock-keychain") == 0 ||
+            strncmp(argv[k], "--type=crashpad-handler", 23) == 0)
+            return argv;
+    out[0] = argv[0];
+    out[1] = (char *)"--use-mock-keychain";
+    for (int k = 1; k < *argc; k++)
+        out[k + 1] = argv[k];
+    out[*argc + 1] = NULL;
+    (*argc)++;
+    return out;
+}
+
 int main(int argc, char **argv)
 {
     if (getenv("OCERZ_HOSTMASKLOG")) {
@@ -190,6 +213,7 @@ int main(int argc, char **argv)
         }
     }
     OCERZ_LOG("mode: %s\n", ocerz_mode == OCERZ_MODE_NATIVE ? "native" : "cache");
+    ocerz_afp_enable();
     if (i >= argc) {
         usage();
         return 64;
@@ -228,8 +252,11 @@ int main(int argc, char **argv)
     }
     vm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;
 
-    if (dynamic)
-        return ocerz_dyld_run(&vm, load_path, argc - i, argv + i, env_snapshot(environ));
+    if (dynamic) {
+        int gargc = argc - i;
+        char **gargv = mock_keychain_argv(load_path, &gargc, argv + i);
+        return ocerz_dyld_run(&vm, load_path, gargc, gargv, env_snapshot(environ));
+    }
 
     if (ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK)
         return 70;

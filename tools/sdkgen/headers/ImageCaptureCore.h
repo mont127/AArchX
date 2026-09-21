@@ -1,0 +1,1 @@
+#include <ImageCaptureCore/ImageCaptureCore.h>

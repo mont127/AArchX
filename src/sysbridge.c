@@ -165,6 +165,8 @@
  * every other popen'd stream in the child, as Apple's do.
  */
 #include "ocerz/sysbridge.h"
+#include "ocerz/abi.h"
+#include "ocerz/apidb.h"
 #include "ocerz/bridge.h"
 #include "ocerz/syscall.h"
 #include "ocerz/vdylib.h"
@@ -173,6 +175,7 @@
 #include "ocerz/jit.h"
 #include "ocerz/interp.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -189,11 +192,13 @@
 #include <sys/sem.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <ulimit.h>
 #include <unistd.h>
 #include <wchar.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 extern char **environ;
 
@@ -1125,3 +1130,359 @@ int ocerz_sys_pclose(struct OcerzVM *vm, OcerzCPU *cpu)
     free(cur);
     return sb_ret(vm, cpu, pid == -1 ? -1 : pstat);
 }
+
+#define SB_KEY_FIRST 256u
+#define SB_KEY_END 768u
+#define SB_KEY_ROUNDS 4
+
+typedef struct SbKey {
+    _Atomic int used;
+    _Atomic uint64_t destructor;
+} SbKey;
+
+static SbKey g_sb_keys[SB_KEY_END - SB_KEY_FIRST];
+static unsigned g_sb_key_next;
+static pthread_mutex_t g_sb_key_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static SbKey *sb_key(uint64_t key)
+{
+    if (key < SB_KEY_FIRST || key >= SB_KEY_END)
+        return NULL;
+    SbKey *k = &g_sb_keys[key - SB_KEY_FIRST];
+    return k->used ? k : NULL;
+}
+
+int ocerz_sys_pthread_key_create(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t out = sb_arg(cpu, 0), destructor = sb_arg(cpu, 1);
+    unsigned n = SB_KEY_END - SB_KEY_FIRST, got = n;
+    pthread_mutex_lock(&g_sb_key_lock);
+    for (unsigned i = 0; i < n && got == n; i++) {
+        unsigned at = (g_sb_key_next + i) % n;
+        if (!g_sb_keys[at].used)
+            got = at;
+    }
+    if (got != n) {
+        g_sb_keys[got].destructor = destructor;
+        g_sb_keys[got].used = 1;
+        g_sb_key_next = got + 1;
+    }
+    pthread_mutex_unlock(&g_sb_key_lock);
+    if (got == n)
+        return sb_ret(vm, cpu, EAGAIN);
+    if (cpu->gs_base)
+        ocerz_st(cpu->gs_base + 8 * (uint64_t)(SB_KEY_FIRST + got), 8, 0);
+    ocerz_st(out, 8, SB_KEY_FIRST + got);
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_pthread_key_delete(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    SbKey *k = sb_key(sb_arg(cpu, 0));
+    if (!k)
+        return sb_ret(vm, cpu, EINVAL);
+    k->used = 0;
+    k->destructor = 0;
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_pthread_setspecific(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t key = sb_arg(cpu, 0);
+    if (!sb_key(key) || !cpu->gs_base)
+        return sb_ret(vm, cpu, EINVAL);
+    ocerz_st(cpu->gs_base + 8 * key, 8, sb_arg(cpu, 1));
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_pthread_getspecific(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t key = sb_arg(cpu, 0);
+    uint64_t v = sb_key(key) && cpu->gs_base ? ocerz_ld(cpu->gs_base + 8 * key, 8) : 0;
+    return sb_ret(vm, cpu, (int64_t)v);
+}
+
+static void sb_key_destructors(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_TSD_DTORS") ? 1 : 0;
+    if (off || !vm || !cpu || !cpu->gs_base)
+        return;
+    for (int round = 0; round < SB_KEY_ROUNDS; round++) {
+        int ran = 0;
+        for (unsigned i = 0; i < SB_KEY_END - SB_KEY_FIRST && !vm->exited; i++) {
+            uint64_t destructor = g_sb_keys[i].used ? g_sb_keys[i].destructor : 0;
+            uint64_t slot = cpu->gs_base + 8 * (uint64_t)(SB_KEY_FIRST + i);
+            uint64_t value = ocerz_ld(slot, 8);
+            if (!value)
+                continue;
+            ocerz_st(slot, 8, 0);
+            if (!destructor)
+                continue;
+            uint64_t args[1] = { value };
+            ocerz_vm_call(vm, destructor, args, 1, (cpu->gpr[OCERZ_RSP] - 256) & ~0xfull);
+            ran = 1;
+        }
+        if (!ran)
+            break;
+    }
+}
+
+typedef struct SbThreadStart {
+    void *(*entry)(void *);
+    void *arg;
+} SbThreadStart;
+
+static void *sb_thread_main(void *p)
+{
+    SbThreadStart start = *(SbThreadStart *)p;
+    free(p);
+    void *result = start.entry(start.arg);
+    OcerzCPU *cpu = ocerz_vm_current_cpu();
+    if (!cpu)
+        cpu = ocerz_thread_attach(ocerz_vm_process());
+    if (cpu)
+        sb_key_destructors(cpu->vm, cpu);
+    return result;
+}
+
+int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t out = sb_arg(cpu, 0), attr = sb_arg(cpu, 1), routine = sb_arg(cpu, 2), arg = sb_arg(cpu, 3);
+    SbThreadStart *start = malloc(sizeof *start);
+    void *entry = routine ? ocerz_abi_callback_intern(routine, "p(p)") : NULL;
+    if (!start || !entry) {
+        free(start);
+        return sb_ret(vm, cpu, routine ? EAGAIN : EINVAL);
+    }
+    start->entry = (void *(*)(void *))entry;
+    start->arg = sb_ptr(arg);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_pthread_create", "i(ppc{p(p)}p)", (const void *)pthread_create);
+    pthread_t made = NULL;
+    int rc = pthread_create(&made, (const pthread_attr_t *)sb_ptr(attr), sb_thread_main, start);
+    ocerz_bridge_lower(&outer);
+    if (rc)
+        free(start);
+    else if (out)
+        ocerz_st(out, 8, (uint64_t)(uintptr_t)made);
+    return sb_ret(vm, cpu, rc);
+}
+
+int ocerz_sys_pthread_exit(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *value = sb_ptr(sb_arg(cpu, 0));
+    sb_key_destructors(vm, cpu);
+    pthread_exit(value);
+}
+
+int ocerz_sys_mach_vm_map(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    mach_port_t target = (mach_port_t)sb_arg(cpu, 0);
+    uint64_t addrp = sb_arg(cpu, 1);
+    mach_vm_size_t size = sb_arg(cpu, 2);
+    int flags = (int)sb_arg(cpu, 4);
+    mach_vm_address_t addr = addrp ? ocerz_ld(addrp, 8) : 0;
+    if (target == mach_task_self() && !(flags & VM_FLAGS_ANYWHERE) && size)
+        ocerz_jit_invalidate_range(vm, addr, size);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_mach_vm_map", "i(upLLiuLiiiu)", (const void *)mach_vm_map);
+    kern_return_t kr = mach_vm_map(target, &addr, size, sb_arg(cpu, 3), flags, (mach_port_t)sb_arg(cpu, 5),
+                                   sb_arg(cpu, 6), (boolean_t)sb_arg(cpu, 7),
+                                   (vm_prot_t)sb_arg(cpu, 8) & ~VM_PROT_EXECUTE,
+                                   (vm_prot_t)sb_arg(cpu, 9), (vm_inherit_t)sb_arg(cpu, 10));
+    ocerz_bridge_lower(&outer);
+    if (kr == KERN_SUCCESS && addrp)
+        ocerz_st(addrp, 8, addr);
+    return sb_ret(vm, cpu, kr);
+}
+
+int ocerz_sys_mach_vm_remap(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    mach_port_t target = (mach_port_t)sb_arg(cpu, 0);
+    uint64_t addrp = sb_arg(cpu, 1), curp = sb_arg(cpu, 8), maxp = sb_arg(cpu, 9);
+    mach_vm_size_t size = sb_arg(cpu, 2);
+    int flags = (int)sb_arg(cpu, 4);
+    mach_vm_address_t addr = addrp ? ocerz_ld(addrp, 8) : 0;
+    vm_prot_t cur = 0, max = 0;
+    if (target == mach_task_self() && !(flags & VM_FLAGS_ANYWHERE) && size)
+        ocerz_jit_invalidate_range(vm, addr, size);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_mach_vm_remap", "i(upLLiuLippu)", (const void *)mach_vm_remap);
+    kern_return_t kr = mach_vm_remap(target, &addr, size, sb_arg(cpu, 3), flags, (mach_port_t)sb_arg(cpu, 5),
+                                     sb_arg(cpu, 6), (boolean_t)sb_arg(cpu, 7), &cur, &max,
+                                     (vm_inherit_t)sb_arg(cpu, 10));
+    ocerz_bridge_lower(&outer);
+    if (kr == KERN_SUCCESS) {
+        if (addrp)
+            ocerz_st(addrp, 8, addr);
+        if (curp)
+            ocerz_st(curp, 4, (uint32_t)cur);
+        if (maxp)
+            ocerz_st(maxp, 4, (uint32_t)max);
+    }
+    return sb_ret(vm, cpu, kr);
+}
+
+int ocerz_sys_pthread_get_stackaddr_np(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *thread = sb_ptr(sb_arg(cpu, 0));
+    uint64_t lo = 0, hi = 0;
+    if (ocerz_vm_guest_stack(vm, thread, &lo, &hi))
+        return sb_ret(vm, cpu, (int64_t)hi);
+    return sb_ret(vm, cpu, (int64_t)ocerz_h2g(pthread_get_stackaddr_np((pthread_t)thread)));
+}
+
+int ocerz_sys_pthread_get_stacksize_np(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *thread = sb_ptr(sb_arg(cpu, 0));
+    uint64_t lo = 0, hi = 0;
+    if (ocerz_vm_guest_stack(vm, thread, &lo, &hi))
+        return sb_ret(vm, cpu, (int64_t)(hi - lo));
+    return sb_ret(vm, cpu, (int64_t)pthread_get_stacksize_np((pthread_t)thread));
+}
+
+int ocerz_sys_getpagesize(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_ret(vm, cpu, (int64_t)OCERZ_GUEST_PAGE_SIZE);
+}
+
+int ocerz_sys_sysconf(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int name = (int)sb_arg(cpu, 0);
+    if (name == _SC_PAGESIZE)
+        return sb_ret(vm, cpu, (int64_t)OCERZ_GUEST_PAGE_SIZE);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_sysconf", "l(i)", (const void *)sysconf);
+    long r = sysconf(name);
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+
+int ocerz_sys_host_page_size(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t out = sb_arg(cpu, 1);
+    if (out)
+        ocerz_st(out, 8, OCERZ_GUEST_PAGE_SIZE);
+    return sb_ret(vm, cpu, KERN_SUCCESS);
+}
+
+static void sb_sysctl_page_size(int is_page_size, uint64_t oldp, uint64_t oldlenp, int r)
+{
+    if (!is_page_size || r != 0 || !oldp || !oldlenp)
+        return;
+    uint64_t len = ocerz_ld(oldlenp, 8);
+    if (len == 4 || len == 8)
+        ocerz_st(oldp, (int)len, OCERZ_GUEST_PAGE_SIZE);
+}
+
+int ocerz_sys_sysctl(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int *mib = sb_ptr(sb_arg(cpu, 0));
+    unsigned n = (unsigned)sb_arg(cpu, 1);
+    uint64_t oldp = sb_arg(cpu, 2), oldlenp = sb_arg(cpu, 3);
+    int page = mib && n == 2 && mib[0] == CTL_HW && mib[1] == HW_PAGESIZE;
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_sysctl", "i(pupppL)", (const void *)sysctl);
+    int r = sysctl(mib, n, sb_ptr(oldp), sb_ptr(oldlenp), sb_ptr(sb_arg(cpu, 4)), (size_t)sb_arg(cpu, 5));
+    ocerz_bridge_lower(&outer);
+    sb_sysctl_page_size(page, oldp, oldlenp, r);
+    return sb_ret(vm, cpu, r);
+}
+
+int ocerz_sys_sysctlbyname(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    const char *name = sb_ptr(sb_arg(cpu, 0));
+    uint64_t oldp = sb_arg(cpu, 1), oldlenp = sb_arg(cpu, 2);
+    int page = name && (strcmp(name, "hw.pagesize") == 0 || strcmp(name, "hw.pagesize32") == 0 ||
+                        strcmp(name, "vm.pagesize") == 0);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_sysctlbyname", "i(ppppL)", (const void *)sysctlbyname);
+    int r = sysctlbyname(name, sb_ptr(oldp), sb_ptr(oldlenp), sb_ptr(sb_arg(cpu, 3)), (size_t)sb_arg(cpu, 4));
+    ocerz_bridge_lower(&outer);
+    sb_sysctl_page_size(page, oldp, oldlenp, r);
+    return sb_ret(vm, cpu, r);
+}
+
+#define SB_SANDBOX_FILTER_MASK 0x3fffffff
+
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+
+int ocerz_sys_sandbox_check(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    pid_t pid = (pid_t)sb_arg(cpu, 0);
+    const char *operation = sb_ptr(sb_arg(cpu, 1));
+    int type = (int)sb_arg(cpu, 2);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_sandbox_check", "i(ipi)", (const void *)sandbox_check);
+    int r = (type & SB_SANDBOX_FILTER_MASK) ? sandbox_check(pid, operation, type, sb_ptr(sb_arg(cpu, 3)))
+                                            : sandbox_check(pid, operation, type);
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+
+#define SB_SANDBOX_LIB "/usr/lib/libsandbox.1.dylib"
+
+static void *sb_sandbox_sym(const char *lib, const char *name)
+{
+    void *h = lib ? dlopen(lib, RTLD_LAZY) : RTLD_DEFAULT;
+    return h ? dlsym(h, name) : NULL;
+}
+
+int ocerz_sys_sandbox_init(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int (*fn)(const char *, uint64_t, char **) =
+        (int (*)(const char *, uint64_t, char **))sb_sandbox_sym(NULL, "sandbox_init");
+    struct OcerzBridgeFrame outer;
+    int r = -1;
+    ocerz_apidb_preload();
+    ocerz_bridge_raise(&outer, SB_LIB, "_sandbox_init", "i(pLp)", (const void *)fn);
+    if (fn)
+        r = fn(sb_ptr(sb_arg(cpu, 0)), sb_arg(cpu, 1), sb_ptr(sb_arg(cpu, 2)));
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+
+int ocerz_sys_sandbox_init_with_parameters(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int (*fn)(const char *, uint64_t, const char *const *, char **) =
+        (int (*)(const char *, uint64_t, const char *const *, char **))sb_sandbox_sym(
+            NULL, "sandbox_init_with_parameters");
+    struct OcerzBridgeFrame outer;
+    int r = -1;
+    ocerz_apidb_preload();
+    ocerz_bridge_raise(&outer, SB_LIB, "_sandbox_init_with_parameters", "i(pLpp)", (const void *)fn);
+    if (fn)
+        r = fn(sb_ptr(sb_arg(cpu, 0)), sb_arg(cpu, 1), sb_ptr(sb_arg(cpu, 2)), sb_ptr(sb_arg(cpu, 3)));
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+
+int ocerz_sys_sandbox_ms(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int (*fn)(const char *, int, void *) =
+        (int (*)(const char *, int, void *))sb_sandbox_sym(NULL, "__sandbox_ms");
+    struct OcerzBridgeFrame outer;
+    int r = -1;
+    ocerz_apidb_preload();
+    ocerz_bridge_raise(&outer, SB_LIB, "___sandbox_ms", "i(pip)", (const void *)fn);
+    if (fn)
+        r = fn(sb_ptr(sb_arg(cpu, 0)), (int)sb_arg(cpu, 1), sb_ptr(sb_arg(cpu, 2)));
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+
+int ocerz_sys_sandbox_apply(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int (*fn)(void *) = (int (*)(void *))sb_sandbox_sym(SB_SANDBOX_LIB, "sandbox_apply");
+    struct OcerzBridgeFrame outer;
+    int r = -1;
+    ocerz_apidb_preload();
+    ocerz_bridge_raise(&outer, SB_SANDBOX_LIB, "_sandbox_apply", "i(p)", (const void *)fn);
+    if (fn)
+        r = fn(sb_ptr(sb_arg(cpu, 0)));
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+

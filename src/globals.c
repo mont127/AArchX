@@ -9,6 +9,7 @@
 #include "ocerz/mode.h"
 
 int ocerz_verbose;
+__thread int ocerz_critical_depth;
 
 int ocerz_mode;
 

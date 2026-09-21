@@ -239,6 +239,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <mach-o/loader.h>
 
 #define OB_SMALL_STRUCT 16
@@ -270,6 +271,15 @@ static ObSym g_ob_class_isMetaClass = OB_SYM(OCERZ_OBJC_LIBOBJC, "class_isMetaCl
 static ObSym g_ob_class_getSuperclass = OB_SYM(OCERZ_OBJC_LIBOBJC, "class_getSuperclass");
 static ObSym g_ob_class_respondsToSelector = OB_SYM(OCERZ_OBJC_LIBOBJC, "class_respondsToSelector");
 static ObSym g_ob_setUncaught = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_setUncaughtExceptionHandler");
+static ObSym g_ob_class_addMethod = OB_SYM(OCERZ_OBJC_LIBOBJC, "class_addMethod");
+static ObSym g_ob_allocateClassPair = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_allocateClassPair");
+static ObSym g_ob_class_copyMethodList = OB_SYM(OCERZ_OBJC_LIBOBJC, "class_copyMethodList");
+static ObSym g_ob_method_getName = OB_SYM(OCERZ_OBJC_LIBOBJC, "method_getName");
+static ObSym g_ob_method_setImplementation = OB_SYM(OCERZ_OBJC_LIBOBJC, "method_setImplementation");
+static ObSym g_ob_method_getImplementation = OB_SYM(OCERZ_OBJC_LIBOBJC, "method_getImplementation");
+static ObSym g_ob_setExceptionPreprocessor = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_setExceptionPreprocessor");
+static ObSym g_ob_class_replaceMethod = OB_SYM(OCERZ_OBJC_LIBOBJC, "class_replaceMethod");
+static ObSym g_ob_class_getMethodImplementation = OB_SYM(OCERZ_OBJC_LIBOBJC, "class_getMethodImplementation");
 static ObSym g_ob_CFStringGetLength = OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStringGetLength");
 static ObSym g_ob_CFStringGetMaximumSizeForEncoding =
     OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStringGetMaximumSizeForEncoding");
@@ -962,11 +972,13 @@ typedef struct ObSend {
     uint32_t blocks;
     uint32_t fnptrs;
     uint32_t objects;
+    uint64_t generation;
 } ObSend;
 
 static ObShape *_Atomic g_ob_shapes[OB_SHAPE_BUCKETS];
 static ObSend *_Atomic g_ob_sends[OB_SEND_BUCKETS];
 static pthread_mutex_t g_ob_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_ob_generation;
 
 static unsigned ob_str_hash(const char *s)
 {
@@ -1017,8 +1029,9 @@ static const ObShape *ob_shape(const char *notation)
 
 static const ObSend *ob_cached(void *cls, void *sel)
 {
+    uint64_t generation = atomic_load(&g_ob_generation);
     for (const ObSend *e = g_ob_sends[ob_send_hash(cls, sel)]; e; e = e->next)
-        if (e->cls == cls && e->sel == sel)
+        if (e->cls == cls && e->sel == sel && e->generation == generation)
             return e;
     return NULL;
 }
@@ -1034,7 +1047,8 @@ static const ObSend *ob_remember(const ObSend *scratch)
     pthread_mutex_lock(&g_ob_lock);
     ObSend *found = NULL;
     for (ObSend *e = g_ob_sends[b]; e && !found; e = e->next)
-        if (e->cls == scratch->cls && e->sel == scratch->sel)
+        if (e->cls == scratch->cls && e->sel == scratch->sel &&
+            e->generation == scratch->generation)
             found = e;
     if (!found) {
         made->next = g_ob_sends[b];
@@ -1085,11 +1099,158 @@ static const ObSend *ob_method(void *cls, void *sel, ObSend *scratch)
     const ObSend *e = ob_cached(cls, sel);
     if (e)
         return e;
+    uint64_t generation = atomic_load(&g_ob_generation);
     void *m = ob_class_getInstanceMethod(cls, sel);
     if (!m)
         return NULL;
     ob_describe(cls, sel, ob_method_getTypeEncoding(m), "method", scratch);
+    scratch->generation = generation;
     return ob_remember(scratch);
+}
+
+int ocerz_objc_allocateClassPair(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *fn = ob_need(&g_ob_allocateClassPair);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "_objc_allocateClassPair", "p(ppL)", fn);
+    void *cls = ((void *(*)(void *, const char *, size_t))fn)(
+        cpu->gpr[OCERZ_RDI] ? ocerz_g2h(cpu->gpr[OCERZ_RDI]) : NULL,
+        ocerz_g2h(cpu->gpr[OCERZ_RSI]), (size_t)cpu->gpr[OCERZ_RDX]);
+    if (cls)
+        atomic_fetch_add(&g_ob_generation, 1);
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, cls ? ocerz_h2g(cls) : 0);
+    return ob_settle(vm, cpu);
+}
+
+static void *ob_imp_from_guest_or_bind(uint64_t imp, const char *notation, void *cls, void *sel,
+                                       const char *who)
+{
+    void *back = ocerz_objc_imp_from_guest(imp);
+    if (back)
+        return back;
+    uint64_t native = 0;
+    if (ocerz_abi_callback_convert(imp, notation, &native) != OCERZ_OK || !native)
+        ob_refuse(cls, sel, "%s could not bind implementation %#llx", who, (unsigned long long)imp);
+    return ocerz_g2h(native);
+}
+
+int ocerz_objc_class_addMethod(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *cls = cpu->gpr[OCERZ_RDI] ? ocerz_g2h(cpu->gpr[OCERZ_RDI]) : NULL;
+    void *sel = cpu->gpr[OCERZ_RSI] ? ocerz_g2h(cpu->gpr[OCERZ_RSI]) : NULL;
+    uint64_t imp = cpu->gpr[OCERZ_RDX];
+    const char *types = cpu->gpr[OCERZ_RCX] ? ocerz_g2h(cpu->gpr[OCERZ_RCX]) : NULL;
+    void *fn = ob_need(&g_ob_class_addMethod);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "_class_addMethod", NULL, fn);
+    bool added = false;
+    if (cls && sel && imp) {
+        unsigned count = 0;
+        void **methods = ((void **(*)(void *, unsigned *))ob_need(&g_ob_class_copyMethodList))(cls, &count);
+        bool exists = false;
+        for (unsigned i = 0; i < count && !exists; i++)
+            exists = ((void *(*)(void *))ob_need(&g_ob_method_getName))(methods[i]) == sel;
+        free(methods);
+        if (exists) {
+            ocerz_bridge_lower(&outer);
+            ob_return(cpu, 0);
+            return ob_settle(vm, cpu);
+        }
+        char notation[OCERZ_OBJC_NOTATION_MAX];
+        int rc = ocerz_objc_method_notation(types, notation, sizeof notation);
+        if (rc != OCERZ_OBJC_OK)
+            ob_refuse(cls, sel, "class_addMethod cannot cross: %s", ocerz_objc_refusal(rc));
+        void *native = ob_imp_from_guest_or_bind(imp, notation, cls, sel, "class_addMethod");
+        added = ((bool (*)(void *, void *, void *, const char *))fn)(cls, sel, native, types);
+        if (added)
+            atomic_fetch_add(&g_ob_generation, 1);
+    }
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, added);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_methodSetImplementation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *m = cpu->gpr[OCERZ_RDI] ? ocerz_g2h(cpu->gpr[OCERZ_RDI]) : NULL;
+    uint64_t imp = cpu->gpr[OCERZ_RSI];
+    void *fn = ob_need(&g_ob_method_setImplementation);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "_method_setImplementation", NULL, fn);
+    void *old = NULL;
+    if (m) {
+        const char *types = ob_method_getTypeEncoding(m);
+        char notation[OCERZ_OBJC_NOTATION_MAX];
+        int rc = ocerz_objc_method_notation(types, notation, sizeof notation);
+        if (rc != OCERZ_OBJC_OK)
+            ob_refuse(NULL, NULL, "method_setImplementation cannot cross: %s", ocerz_objc_refusal(rc));
+        void *native = imp ? ob_imp_from_guest_or_bind(imp, notation, NULL, NULL, "method_setImplementation")
+                           : NULL;
+        old = ((void *(*)(void *, void *))fn)(m, native);
+        atomic_fetch_add(&g_ob_generation, 1);
+        ocerz_bridge_lower(&outer);
+        ob_return(cpu, ocerz_objc_imp_for_guest(old, types));
+        return ob_settle(vm, cpu);
+    }
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, 0);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_class_replaceMethod(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *cls = cpu->gpr[OCERZ_RDI] ? ocerz_g2h(cpu->gpr[OCERZ_RDI]) : NULL;
+    void *sel = cpu->gpr[OCERZ_RSI] ? ocerz_g2h(cpu->gpr[OCERZ_RSI]) : NULL;
+    uint64_t imp = cpu->gpr[OCERZ_RDX];
+    const char *types = cpu->gpr[OCERZ_RCX] ? ocerz_g2h(cpu->gpr[OCERZ_RCX]) : NULL;
+    void *fn = ob_need(&g_ob_class_replaceMethod);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "_class_replaceMethod", NULL, fn);
+    uint64_t answer = 0;
+    if (cls && sel && imp) {
+        void *was = ob_class_getInstanceMethod(cls, sel);
+        const char *was_types = was ? ob_method_getTypeEncoding(was) : NULL;
+        char notation[OCERZ_OBJC_NOTATION_MAX];
+        int rc = ocerz_objc_method_notation(types, notation, sizeof notation);
+        if (rc != OCERZ_OBJC_OK)
+            ob_refuse(cls, sel, "class_replaceMethod cannot cross: %s", ocerz_objc_refusal(rc));
+        void *native = ob_imp_from_guest_or_bind(imp, notation, cls, sel, "class_replaceMethod");
+        void *old = ((void *(*)(void *, void *, void *, const char *))fn)(cls, sel, native, types);
+        atomic_fetch_add(&g_ob_generation, 1);
+        answer = ocerz_objc_imp_for_guest(old, was_types);
+    }
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, answer);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_method_getImplementation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *m = cpu->gpr[OCERZ_RDI] ? ocerz_g2h(cpu->gpr[OCERZ_RDI]) : NULL;
+    void *fn = ob_need(&g_ob_method_getImplementation);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "_method_getImplementation", NULL, fn);
+    void *imp = m ? ((void *(*)(void *))fn)(m) : NULL;
+    uint64_t answer = ocerz_objc_imp_for_guest(imp, m ? ob_method_getTypeEncoding(m) : NULL);
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, answer);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_class_getMethodImplementation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *cls = cpu->gpr[OCERZ_RDI] ? ocerz_g2h(cpu->gpr[OCERZ_RDI]) : NULL;
+    void *sel = cpu->gpr[OCERZ_RSI] ? ocerz_g2h(cpu->gpr[OCERZ_RSI]) : NULL;
+    void *fn = ob_need(&g_ob_class_getMethodImplementation);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "_class_getMethodImplementation", NULL, fn);
+    void *imp = cls && sel ? ((void *(*)(void *, void *))fn)(cls, sel) : NULL;
+    void *m = cls && sel ? ob_class_getInstanceMethod(cls, sel) : NULL;
+    uint64_t answer = ocerz_objc_imp_for_guest(imp, m ? ob_method_getTypeEncoding(m) : NULL);
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, answer);
+    return ob_settle(vm, cpu);
 }
 
 static void ob_append(char *buf, size_t cap, const char *s, void *cls, void *sel)
@@ -1184,6 +1345,24 @@ static void ob_text(void *str, ObText *t, const char *what)
     t->s = buf;
 }
 
+static void ob_text_wide(const wchar_t *wide, ObText *t, const char *what)
+{
+    size_t n = 0;
+    while (wide && wide[n])
+        n++;
+    char *buf = t->local;
+    t->heap = NULL;
+    if (n >= sizeof t->local) {
+        buf = t->heap = malloc(n + 1);
+        if (!buf)
+            ob_stop("%s has a format of %zu wide characters and there is no memory to read it into", what, n);
+    }
+    for (size_t i = 0; i < n; i++)
+        buf[i] = wide[i] > 0 && wide[i] < 0x80 ? (char)wide[i] : '?';
+    buf[n] = '\0';
+    t->s = buf;
+}
+
 static void ob_text_free(ObText *t)
 {
     free(t->heap);
@@ -1204,6 +1383,54 @@ static int ob_gather_format(const char *what, const char *text, int dialect, con
         ob_stop("%s: the ABI engine cannot find where the variadic arguments begin", what);
     for (int k = 0; k < n; k++)
         ocerz_abi_va_arg(&va, cpu, classes[k], &slots[k]);
+    return n;
+}
+
+static int ob_gather_va_format(const char *what, const char *text, int dialect,
+                              uint64_t address, uint64_t *slots)
+{
+    char classes[OCERZ_OBJC_VARIADIC_MAX + 1];
+    const char *why = NULL;
+    int n = ocerz_objc_format_classes(text, dialect, classes, sizeof classes, &why);
+    if (n < 0)
+        ob_stop("%s refuses the format \"%.200s\": it has %s", what, text, why);
+    if (n == 0)
+        return 0;
+    if (!address)
+        ob_stop("%s: null guest va_list", what);
+    uint32_t gp = (uint32_t)ocerz_ld(address, 4);
+    uint32_t fp = (uint32_t)ocerz_ld(address + 4, 4);
+    uint64_t overflow = ocerz_ld(address + 8, 8);
+    uint64_t saved = ocerz_ld(address + 16, 8);
+    if (gp > 48 || (gp & 7) || fp < 48 || fp > 176 || ((fp - 48) & 15))
+        ob_stop("%s: invalid guest va_list offsets (gp=%u fp=%u)", what, gp, fp);
+    for (int k = 0; k < n; k++) {
+        uint64_t from;
+        if (classes[k] == 'd' && fp < 176) {
+            if (!saved)
+                ob_stop("%s: null guest va_list register save area", what);
+            from = saved + fp;
+            fp += 16;
+        } else if (classes[k] != 'd' && gp < 48) {
+            if (!saved)
+                ob_stop("%s: null guest va_list register save area", what);
+            from = saved + gp;
+            gp += 8;
+        } else {
+            if (!overflow)
+                ob_stop("%s: null guest va_list overflow area", what);
+            from = overflow;
+            overflow += 8;
+        }
+        uint64_t raw = ocerz_ld(from, 8);
+        if (classes[k] == 'p')
+            raw = raw ? (uint64_t)(uintptr_t)ocerz_g2h(raw) : 0;
+        else if (classes[k] == 'i')
+            raw = (uint64_t)(int64_t)(int32_t)raw;
+        else if (classes[k] == 'u')
+            raw = (uint32_t)raw;
+        slots[k] = raw;
+    }
     return n;
 }
 
@@ -1379,14 +1606,146 @@ static const ObSend *ob_object_blocks(void *recv, void *cls, void *sel, const Ob
     return scratch;
 }
 
-static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
+#define OB_IMP_PER_PAGE 128u
+#define OB_IMP_PAGES 64u
+#define OB_IMP_MAX (OB_IMP_PER_PAGE * OB_IMP_PAGES)
+#define OB_IMP_STRIDE 16u
+#define OB_IMP_SLOT 0x800u
+
+typedef struct ObImp {
+    void *imp;
+    char *types;
+    int stret;
+} ObImp;
+
+static ObImp g_ob_imps[OB_IMP_MAX];
+static _Atomic unsigned g_ob_imps_n;
+static _Atomic uint64_t g_ob_imp_pages[OB_IMP_PAGES];
+static pthread_mutex_t g_ob_imp_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *_Atomic g_ob_sel_methodFor;
+static void *_Atomic g_ob_sel_instanceMethodFor;
+
+static int ob_answers_imp(void *sel)
 {
-    const char *export = g_ob_export[kind][stret];
+    void *a = atomic_load(&g_ob_sel_methodFor);
+    if (!a) {
+        atomic_store(&g_ob_sel_instanceMethodFor, ob_sel_registerName("instanceMethodForSelector:"));
+        a = ob_sel_registerName("methodForSelector:");
+        atomic_store(&g_ob_sel_methodFor, a);
+    }
+    return sel == a || sel == atomic_load(&g_ob_sel_instanceMethodFor);
+}
+
+static int ob_types_stret(const char *types)
+{
+    char notation[OCERZ_OBJC_NOTATION_MAX];
+    int nargs = 0;
+    uint32_t blocks = 0, fnptrs = 0;
+    static _Thread_local OcerzAbiSig sig;
+    if (!types ||
+        ocerz_objc_notation(types, notation, sizeof notation, &nargs, &blocks, &fnptrs) != OCERZ_OBJC_OK ||
+        ocerz_abi_parse(notation, &sig) != OCERZ_OK)
+        return 0;
+    return sig.ret == '{' && sig.ret_struct.size > OB_SMALL_STRUCT;
+}
+
+static uint64_t ob_imp_page(unsigned page)
+{
+    uint64_t have = atomic_load(&g_ob_imp_pages[page]);
+    if (have)
+        return have;
+    uint64_t tramp = ocerz_vdylib_trampoline(OCERZ_VDYLIB_TRAMP_NATIVE_IMP);
+    uint64_t made = tramp ? ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE) : 0;
+    if (!made)
+        return 0;
+    uint8_t *buf = ocerz_g2h(made);
+    memset(buf, 0xcc, OCERZ_GUEST_PAGE_SIZE);
+    for (unsigned k = 0; k < OB_IMP_PER_PAGE; k++) {
+        uint8_t *t = buf + (size_t)k * OB_IMP_STRIDE;
+        uint32_t number = page * OB_IMP_PER_PAGE + k;
+        int32_t rel = (int32_t)((int64_t)OB_IMP_SLOT - (int64_t)(k * OB_IMP_STRIDE + 12));
+        t[0] = 0x41;
+        t[1] = 0xba;
+        memcpy(t + 2, &number, 4);
+        t[6] = 0xff;
+        t[7] = 0x25;
+        memcpy(t + 8, &rel, 4);
+    }
+    memcpy(buf + OB_IMP_SLOT, &tramp, 8);
+    if (ocerz_protect(made, OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_EXEC) != OCERZ_OK) {
+        ocerz_unmap(made, OCERZ_GUEST_PAGE_SIZE);
+        return 0;
+    }
+    atomic_store(&g_ob_imp_pages[page], made);
+    return made;
+}
+
+uint64_t ocerz_objc_imp_for_guest(void *native_imp, const char *types)
+{
+    if (!native_imp)
+        return 0;
+    uint64_t guest_fn = 0;
+    if (ocerz_abi_callback_sig(native_imp, &guest_fn) && guest_fn)
+        return guest_fn;
+    uint64_t as_guest = ocerz_h2g(native_imp);
+    if (ocerz_abi_is_guest_code(as_guest))
+        return as_guest;
+
+    uint64_t answer = 0;
+    pthread_mutex_lock(&g_ob_imp_lock);
+    unsigned n = atomic_load(&g_ob_imps_n), k;
+    for (k = 0; k < n; k++)
+        if (g_ob_imps[k].imp == native_imp)
+            break;
+    if (k == n && n < OB_IMP_MAX) {
+        g_ob_imps[n].imp = native_imp;
+        g_ob_imps[n].types = types ? strdup(types) : NULL;
+        g_ob_imps[n].stret = ob_types_stret(types);
+        atomic_store(&g_ob_imps_n, n + 1);
+    }
+    if (k < OB_IMP_MAX) {
+        if (!g_ob_imps[k].types && types) {
+            g_ob_imps[k].types = strdup(types);
+            g_ob_imps[k].stret = ob_types_stret(types);
+        }
+        uint64_t page = ob_imp_page(k / OB_IMP_PER_PAGE);
+        if (page)
+            answer = page + (uint64_t)(k % OB_IMP_PER_PAGE) * OB_IMP_STRIDE;
+    }
+    pthread_mutex_unlock(&g_ob_imp_lock);
+    if (!answer)
+        ob_stop("no thunk is left for native implementation %p: all %u are bound, or no guest page"
+                " could be made for them", native_imp, OB_IMP_MAX);
+    return answer;
+}
+
+void *ocerz_objc_imp_from_guest(uint64_t guest_imp)
+{
+    if (!guest_imp)
+        return NULL;
+    for (unsigned p = 0; p < OB_IMP_PAGES; p++) {
+        uint64_t page = atomic_load(&g_ob_imp_pages[p]);
+        if (!page)
+            break;
+        uint64_t off = guest_imp - page;
+        if (off >= (uint64_t)OB_IMP_PER_PAGE * OB_IMP_STRIDE || off % OB_IMP_STRIDE)
+            continue;
+        unsigned k = p * OB_IMP_PER_PAGE + (unsigned)(off / OB_IMP_STRIDE);
+        return k < atomic_load(&g_ob_imps_n) ? g_ob_imps[k].imp : NULL;
+    }
+    return NULL;
+}
+
+static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret, void *imp,
+                       const char *imp_types)
+{
+    const char *export = imp ? "_(native IMP)" : g_ob_export[kind][stret];
     uint64_t first = cpu->gpr[stret ? OCERZ_RSI : OCERZ_RDI];
     void *sel = (void *)(uintptr_t)cpu->gpr[stret ? OCERZ_RDX : OCERZ_RSI];
     ObSym *host = kind == OB_PLAIN ? &g_ob_msgSend : kind == OB_SUPER ? &g_ob_msgSendSuper
                                                                       : &g_ob_msgSendSuper2;
-    void *fn = ob_need(host);
+    void *fn = imp ? imp : ob_need(host);
     struct OcerzBridgeFrame outer;
     void *recv, *cls;
     ObSend scratch;
@@ -1428,6 +1787,10 @@ static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
     }
 
     send = ob_method(cls, sel, &scratch);
+    if (!send && imp && imp_types) {
+        ob_describe(cls, sel, imp_types, "implementation", &scratch);
+        send = &scratch;
+    }
     if (!send)
         send = ob_forwarded(recv, cls, sel, &scratch, 0);
     ObSend typed;
@@ -1488,9 +1851,51 @@ static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
         ob_text_free(&text);
     }
 
+    void *asked = NULL;
+    int answers_imp = sig->ret == 'p' && sig->nargs == 3 && ob_answers_imp(sel);
+    if (answers_imp)
+        asked = (void *)(uintptr_t)ob_named(sig, cpu, 2, 'p');
     ob_perform(cpu, sig, fn, slots, nslots, 0, selname);
+    if (answers_imp && cpu->gpr[OCERZ_RAX]) {
+        void *of = sel == atomic_load(&g_ob_sel_instanceMethodFor) ? recv : cls;
+        void *m = asked && of ? ob_class_getInstanceMethod(of, asked) : NULL;
+        cpu->gpr[OCERZ_RAX] = ocerz_objc_imp_for_guest(ocerz_g2h(cpu->gpr[OCERZ_RAX]),
+                                                      m ? ob_method_getTypeEncoding(m) : NULL);
+    }
     ocerz_bridge_lower(&outer);
     return ob_settle(vm, cpu);
+}
+
+static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
+{
+    return ob_send_via(vm, cpu, kind, stret, NULL, NULL);
+}
+
+int ocerz_objc_setExceptionPreprocessor(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static _Atomic uint64_t installed;
+    uint64_t wanted = cpu->gpr[OCERZ_RDI];
+    void *fn = ob_need(&g_ob_setExceptionPreprocessor);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "_objc_setExceptionPreprocessor", "p(c{p(p)})", fn);
+    uint64_t native = 0;
+    if (wanted && (ocerz_abi_callback_convert(wanted, "p(p)", &native) != OCERZ_OK || !native))
+        ob_stop("objc_setExceptionPreprocessor could not bind preprocessor %#llx",
+                (unsigned long long)wanted);
+    ((void *(*)(void *))fn)(native ? ocerz_g2h(native) : NULL);
+    uint64_t before = atomic_exchange(&installed, wanted);
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, before);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_imp_trap(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    unsigned k = (unsigned)(cpu->gpr[OCERZ_R10] & 0xffffffffu);
+    if (k >= atomic_load(&g_ob_imps_n))
+        ob_stop("a thunk numbered %u for a native implementation was called, and ocerz made no such thunk", k);
+    const ObImp *e = &g_ob_imps[k];
+    return ob_send_via(vm, cpu, OB_PLAIN, e->stret, e->imp, e->types);
 }
 
 int ocerz_objc_msgSend(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -1564,11 +1969,32 @@ static ObVeneer g_ob_sprintf = {
 static ObVeneer g_ob_snprintf = {
     "_snprintf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vsnprintf"), "i(pLp)", "i(pLpp)", 2, OCERZ_OBJC_FMT_C,
 };
+static ObVeneer g_ob_snprintf_l = {
+    "_snprintf_l", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vsnprintf_l"), "i(pLpp)", "i(pLppp)", 3, OCERZ_OBJC_FMT_C,
+};
 static ObVeneer g_ob_asprintf = {
     "_asprintf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vasprintf"), "i(pp)", "i(ppp)", 1, OCERZ_OBJC_FMT_C,
 };
 static ObVeneer g_ob_dprintf = {
     "_dprintf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vdprintf"), "i(ip)", "i(ipp)", 1, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_syslog = {
+    "_syslog", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vsyslog"), "v(ip)", "v(ipp)", 1, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_warn = {
+    "_warn", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vwarn"), "v(p)", "v(pp)", 0, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_warnx = {
+    "_warnx", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vwarnx"), "v(p)", "v(pp)", 0, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_swprintf = {
+    "_swprintf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vswprintf"), "i(pLp)", "i(pLpp)", 2, OCERZ_OBJC_FMT_WIDE,
+};
+static ObVeneer g_ob_wprintf = {
+    "_wprintf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vwprintf"), "i(p)", "i(pp)", 0, OCERZ_OBJC_FMT_WIDE,
+};
+static ObVeneer g_ob_fwprintf = {
+    "_fwprintf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vfwprintf"), "i(pp)", "i(ppp)", 1, OCERZ_OBJC_FMT_WIDE,
 };
 static ObVeneer g_ob_sprintf_chk = {
     "___sprintf_chk", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "__vsprintf_chk"), "i(piLp)", "i(piLpp)", 3,
@@ -1577,6 +2003,15 @@ static ObVeneer g_ob_sprintf_chk = {
 static ObVeneer g_ob_snprintf_chk = {
     "___snprintf_chk", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "__vsnprintf_chk"), "i(pLiLp)", "i(pLiLpp)", 4,
     OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_sscanf = {
+    "_sscanf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vsscanf"), "i(pp)", "i(ppp)", 1, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_scanf = {
+    "_scanf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vscanf"), "i(p)", "i(pp)", 0, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_fscanf = {
+    "_fscanf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vfscanf"), "i(pp)", "i(ppp)", 1, OCERZ_OBJC_FMT_C,
 };
 static ObVeneer g_ob_NSLog = {
     "_NSLog", OB_SYM(OCERZ_OBJC_FOUNDATION, "NSLogv"), "v(p)", "v(pp)", 0, OCERZ_OBJC_FMT_CF,
@@ -1590,44 +2025,250 @@ static ObVeneer g_ob_CFStringAppendFormat = {
     "v(ppp)", "v(pppp)", 2, OCERZ_OBJC_FMT_CF,
 };
 
-static int ob_veneer(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *vn)
+static int ob_veneer_call(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *vn, int guest_va, const char *sym)
 {
     OcerzAbiSig named;
     if (ocerz_abi_parse(vn->named, &named) != OCERZ_OK)
-        ob_stop("%s is declared %s, which the ABI engine refuses", vn->sym, vn->named);
+        ob_stop("%s is declared %s, which the ABI engine refuses", sym, vn->named);
     void *vfn = ob_need(&vn->vform);
 
     struct OcerzBridgeFrame outer;
-    ocerz_bridge_raise(&outer, vn->vform.lib, vn->sym, vn->sig, vfn);
+    ocerz_bridge_raise(&outer, vn->vform.lib, sym, vn->sig, vfn);
 
     uint64_t fmt = ob_named(&named, cpu, vn->fmt, 'p');
     ObText text;
-    if (vn->dialect == OCERZ_OBJC_FMT_C) {
+    int dialect = vn->dialect;
+    if (dialect == OCERZ_OBJC_FMT_C) {
         text.heap = NULL;
         text.s = fmt ? (const char *)(uintptr_t)fmt : "";
+    } else if (dialect == OCERZ_OBJC_FMT_WIDE) {
+        ob_text_wide((const wchar_t *)(uintptr_t)fmt, &text, sym);
+        dialect = OCERZ_OBJC_FMT_C;
     } else {
-        ob_text((void *)(uintptr_t)fmt, &text, vn->sym);
+        ob_text((void *)(uintptr_t)fmt, &text, sym);
     }
 
     uint64_t slots[OCERZ_OBJC_VARIADIC_MAX];
-    int n = ob_gather_format(vn->sym, text.s, vn->dialect, &named, cpu, slots);
+    int n;
+    if (guest_va) {
+        uint64_t address = ob_named(&named, cpu, named.nargs, 'p');
+        n = ob_gather_va_format(sym, text.s, dialect,
+                               address ? ocerz_h2g((void *)(uintptr_t)address) : 0, slots);
+    } else {
+        n = ob_gather_format(sym, text.s, dialect, &named, cpu, slots);
+    }
     ob_text_free(&text);
 
-    int err = ob_perform(cpu, &named, vfn, slots, n, 1, vn->sym);
+    int err = ob_perform(cpu, &named, vfn, slots, n, 1, sym);
     ocerz_bridge_lower(&outer);
     errno = err;
     return ob_settle(vm, cpu);
+}
+
+static int ob_scan_count(const char *what, const char *text)
+{
+    int n = 0;
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        if (*p != '%') {
+            p++;
+            continue;
+        }
+        p++;
+        if (*p == '%') {
+            p++;
+            continue;
+        }
+        if (*p == '\0')
+            ob_stop("%s refuses the format \"%.200s\": it ends in a lone percent", what, text);
+        int suppress = 0;
+        if (*p == '*') {
+            suppress = 1;
+            p++;
+        }
+        while (*p >= '0' && *p <= '9')
+            p++;
+        if (*p == '$')
+            ob_stop("%s refuses the format \"%.200s\": it has positional arguments", what, text);
+        int is_L = 0;
+        if (p[0] == 'h' && p[1] == 'h')
+            p += 2;
+        else if (p[0] == 'l' && p[1] == 'l')
+            p += 2;
+        else if (*p == 'h' || *p == 'l' || *p == 'j' || *p == 'z' || *p == 't')
+            p += 1;
+        else if (*p == 'L') {
+            is_L = 1;
+            p += 1;
+        }
+        if (*p == '\0')
+            ob_stop("%s refuses the format \"%.200s\": it ends inside a conversion", what, text);
+        unsigned char c = *p;
+        if (c == '[') {
+            if (is_L)
+                ob_stop("%s refuses the format \"%.200s\": it reads a long double", what, text);
+            p++;
+            if (*p == '^')
+                p++;
+            if (*p == ']')
+                p++;
+            while (*p && *p != ']')
+                p++;
+            if (*p != ']')
+                ob_stop("%s refuses the format \"%.200s\": it ends inside a scanset", what, text);
+            if (!suppress)
+                n++;
+            p++;
+            continue;
+        }
+        switch (c) {
+        case 'd':
+        case 'i':
+        case 'o':
+        case 'u':
+        case 'x':
+        case 'X':
+        case 'f':
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G':
+        case 'a':
+        case 'A':
+        case 'c':
+        case 's':
+        case 'p':
+        case 'n':
+            break;
+        default:
+            ob_stop("%s refuses the format \"%.200s\": it has an unsupported conversion", what, text);
+        }
+        if (is_L)
+            ob_stop("%s refuses the format \"%.200s\": it reads a long double", what, text);
+        if (!suppress)
+            n++;
+        p++;
+    }
+    if (n > OCERZ_OBJC_VARIADIC_MAX)
+        ob_stop("%s refuses the format \"%.200s\": it takes more arguments than cross", what, text);
+    return n;
+}
+
+static int ob_scan_veneer_call(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *vn, int guest_va,
+                               const char *sym)
+{
+    OcerzAbiSig named;
+    if (ocerz_abi_parse(vn->named, &named) != OCERZ_OK)
+        ob_stop("%s is declared %s, which the ABI engine refuses", sym, vn->named);
+    void *vfn = ob_need(&vn->vform);
+
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, vn->vform.lib, sym, vn->sig, vfn);
+
+    uint64_t fmt = ob_named(&named, cpu, vn->fmt, 'p');
+    const char *text = fmt ? (const char *)(uintptr_t)fmt : "";
+    int n = ob_scan_count(sym, text);
+
+    uint64_t slots[OCERZ_OBJC_VARIADIC_MAX];
+    if (guest_va) {
+        uint64_t address = ob_named(&named, cpu, named.nargs, 'p');
+        if (n > 0) {
+            if (!address)
+                ob_stop("%s: null guest va_list", sym);
+            uint32_t gp = (uint32_t)ocerz_ld(address, 4);
+            uint64_t overflow = ocerz_ld(address + 8, 8);
+            uint64_t saved = ocerz_ld(address + 16, 8);
+            if (gp > 48 || (gp & 7))
+                ob_stop("%s: invalid guest va_list offsets (gp=%u)", sym, gp);
+            for (int k = 0; k < n; k++) {
+                uint64_t from;
+                if (gp < 48) {
+                    if (!saved)
+                        ob_stop("%s: null guest va_list register save area", sym);
+                    from = saved + gp;
+                    gp += 8;
+                } else {
+                    if (!overflow)
+                        ob_stop("%s: null guest va_list overflow area", sym);
+                    from = overflow;
+                    overflow += 8;
+                }
+                uint64_t raw = ocerz_ld(from, 8);
+                slots[k] = raw ? (uint64_t)(uintptr_t)ocerz_g2h(raw) : 0;
+            }
+        }
+    } else {
+        OcerzAbiVaList va;
+        if (ocerz_abi_va_start(&named, cpu, &va) != OCERZ_OK)
+            ob_stop("%s: the ABI engine cannot find where the variadic arguments begin", sym);
+        for (int k = 0; k < n; k++)
+            ocerz_abi_va_arg(&va, cpu, 'p', &slots[k]);
+    }
+
+    int err = ob_perform(cpu, &named, vfn, slots, n, 1, sym);
+    ocerz_bridge_lower(&outer);
+    errno = err;
+    return ob_settle(vm, cpu);
+}
+
+static int ob_scan_veneer(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *vn, const char *sym)
+{
+    return ob_scan_veneer_call(vm, cpu, vn, 0, sym);
+}
+
+static int ob_scan_va_veneer(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *vn, const char *sym)
+{
+    return ob_scan_veneer_call(vm, cpu, vn, 1, sym);
+}
+
+static int ob_veneer(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *vn)
+{
+    return ob_veneer_call(vm, cpu, vn, 0, vn->sym);
+}
+
+static int ob_va_veneer(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *base, const char *sym)
+{
+    return ob_veneer_call(vm, cpu, base, 1, sym);
 }
 
 int ocerz_fmt_printf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_printf); }
 int ocerz_fmt_fprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_fprintf); }
 int ocerz_fmt_sprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_sprintf); }
 int ocerz_fmt_snprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_snprintf); }
+int ocerz_fmt_snprintf_l(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_snprintf_l); }
 int ocerz_fmt_asprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_asprintf); }
 int ocerz_fmt_dprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_dprintf); }
+int ocerz_fmt_syslog(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_syslog); }
+int ocerz_fmt_warn(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_warn); }
+int ocerz_fmt_warnx(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_warnx); }
+int ocerz_fmt_swprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_swprintf); }
+int ocerz_fmt_wprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_wprintf); }
+int ocerz_fmt_fwprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_fwprintf); }
+int ocerz_fmt_vswprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_swprintf, "_vswprintf"); }
+int ocerz_fmt_vwprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_wprintf, "_vwprintf"); }
+int ocerz_fmt_vfwprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_fwprintf, "_vfwprintf"); }
 int ocerz_fmt_sprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_sprintf_chk); }
 int ocerz_fmt_snprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_snprintf_chk); }
 int ocerz_fmt_NSLog(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_NSLog); }
+
+int ocerz_fmt_vprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_printf, "_vprintf"); }
+int ocerz_fmt_vfprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_fprintf, "_vfprintf"); }
+int ocerz_fmt_vsprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_sprintf, "_vsprintf"); }
+int ocerz_fmt_vsnprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_snprintf, "_vsnprintf"); }
+int ocerz_fmt_vsnprintf_l(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_snprintf_l, "_vsnprintf_l"); }
+int ocerz_fmt_vasprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_asprintf, "_vasprintf"); }
+int ocerz_fmt_vdprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_dprintf, "_vdprintf"); }
+int ocerz_fmt_vsyslog(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_syslog, "_vsyslog"); }
+int ocerz_fmt_vwarn(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_warn, "_vwarn"); }
+int ocerz_fmt_vwarnx(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_warnx, "_vwarnx"); }
+int ocerz_fmt_vsprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_sprintf_chk, "___vsprintf_chk"); }
+int ocerz_fmt_vsnprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_snprintf_chk, "___vsnprintf_chk"); }
+int ocerz_fmt_sscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_veneer(vm, cpu, &g_ob_sscanf, "_sscanf"); }
+int ocerz_fmt_scanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_veneer(vm, cpu, &g_ob_scanf, "_scanf"); }
+int ocerz_fmt_fscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_veneer(vm, cpu, &g_ob_fscanf, "_fscanf"); }
+int ocerz_fmt_vsscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_va_veneer(vm, cpu, &g_ob_sscanf, "_vsscanf"); }
+int ocerz_fmt_vscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_va_veneer(vm, cpu, &g_ob_scanf, "_vscanf"); }
+int ocerz_fmt_vfscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_va_veneer(vm, cpu, &g_ob_fscanf, "_vfscanf"); }
 
 int ocerz_fmt_CFStringCreateWithFormat(struct OcerzVM *vm, OcerzCPU *cpu)
 {

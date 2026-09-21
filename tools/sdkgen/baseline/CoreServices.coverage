@@ -1,0 +1,26 @@
+library /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
+sdk macos 27.0
+exports 5372
+fn 1182
+data 1900
+var 0
+special 0
+stub callback-pointer 6
+stub callback-result 44
+stub callback-struct 96
+stub layout 4
+stub long-double 3
+stub no-declaration 2108
+stub process-launch 7
+stub struct-layout 15
+stub va-list 3
+stub variadic 4
+host-missing 2
+objc-classes 93
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 12
+override-shapes 1
+override-structs 2
+override-opaque 0

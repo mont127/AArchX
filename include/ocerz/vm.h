@@ -56,6 +56,8 @@ typedef struct OcerzVM {
 int ocerz_vm_init(OcerzVM *vm);
 int ocerz_vm_run(OcerzVM *vm);
 int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu);
+void ocerz_vm_set_main_stack(uint64_t lo, uint64_t hi);
+int ocerz_vm_guest_stack(OcerzVM *vm, void *host_pthread, uint64_t *lo, uint64_t *hi);
 void ocerz_vm_request_exit(OcerzVM *vm, int code);
 void ocerz_vm_mirror_host_signal(int sig, int kind);
 uint32_t ocerz_peek_pending_async_sig(void);
@@ -83,6 +85,8 @@ unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
 void ocerz_vm_purge_jit_ras(OcerzVM *vm);
 int ocerz_vm_thread_suspend(OcerzCPU *self, uint32_t port);
 int ocerz_vm_thread_resume(uint32_t port);
+int ocerz_vm_thread_suspend_native(uint32_t port);
+int ocerz_vm_thread_resume_native(uint32_t port);
 int ocerz_vm_thread_regs(uint32_t port, uint64_t gpr[16], uint64_t *rip, uint64_t *rflags);
 void ocerz_vm_suspend_point(OcerzCPU *cpu);
 extern int ocerz_init_tolerant;

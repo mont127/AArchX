@@ -1,0 +1,21 @@
+library /System/Library/Frameworks/IOBluetooth.framework/Versions/A/IOBluetooth
+sdk macos 27.0
+exports 821
+fn 58
+data 195
+var 0
+special 0
+stub no-declaration 180
+stub too-many-args 2
+stub va-list 2
+stub variadic 2
+omit objc-ivar 382
+host-missing 0
+objc-classes 57
+objc-eh-types 0
+objc-ivars 382
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

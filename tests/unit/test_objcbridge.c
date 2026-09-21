@@ -69,9 +69,11 @@
  * answering its extended type from the guest's own string, and the references
  * rewritten to them, a second definition of the image must define nothing, and
  * the +load methods must run superclass first, then the class the non-lazy list
- * names, then the category, each with its class in rdi.  Each class refusal
- * runs in a forked child that must exit 72 naming it: a root class, a class
- * with a null superclass, a superclass that is a guest class never defined, a Swift class, a loop, a
+ * names, then the category, each with its class in rdi.  A root class and a
+ * class with a null superclass are left out instead, verified by a forked
+ * child that must find no class under either name.  Each remaining class refusal
+ * runs in a forked child that must exit 72 naming it: a superclass that is a
+ * guest class never defined, a Swift class, a loop, a
  * category on an undefined guest class, a long double method called natively,
  * and a method defined after the bank was filled, called natively.
  *
@@ -1066,6 +1068,30 @@ static void test_sends(void)
     CHECK(strcmp(ocerz_g2h(guest_buf), "tru") == 0 && cpu->gpr[OCERZ_RAX] == 9,
           "snprintf truncates and answers the full length");
 
+    uint64_t guest_va = scratch + 0x800;
+    uint64_t va_saved = scratch + 0x840;
+    uint64_t va_overflow = scratch + 0x940;
+    ocerz_st(guest_va, 4, 40);
+    ocerz_st(guest_va + 4, 4, 160);
+    ocerz_st(guest_va + 8, 8, va_overflow);
+    ocerz_st(guest_va + 16, 8, va_saved);
+    ocerz_st(va_saved + 40, 8, 0xdeadbeef00000000ull | (uint32_t)-7);
+    ocerz_st(va_saved + 160, 8, 0x400c000000000000ull);
+    ocerz_st(va_overflow, 8, ocerz_h2g("str"));
+    ocerz_st(va_overflow + 8, 8, 0x4004000000000000ull);
+    ocerz_st(va_overflow + 16, 8, (uint64_t)-5);
+    cpu = fresh_cpu();
+    rsp = cpu->gpr[OCERZ_RSP];
+    cpu->gpr[OCERZ_RDI] = guest_buf;
+    cpu->gpr[OCERZ_RSI] = 64;
+    cpu->gpr[OCERZ_RDX] = ocerz_h2g("%d %s %.2f %.2f %ld");
+    cpu->gpr[OCERZ_RCX] = guest_va;
+    CHECK(ocerz_fmt_vsnprintf(&vm, cpu) == OCERZ_STEP_OK && returned(cpu, rsp), "vsnprintf crosses");
+    CHECK(strcmp(ocerz_g2h(guest_buf), "-7 str 3.50 2.50 -5") == 0 && cpu->gpr[OCERZ_RAX] == 19,
+          "vsnprintf gathers the last GP and FP save slots and interleaved overflow arguments");
+    CHECK(ocerz_ld(guest_va, 4) == 40 && ocerz_ld(guest_va + 4, 4) == 160 &&
+          ocerz_ld(guest_va + 8, 8) == va_overflow, "vsnprintf preserves the supplied va_list storage");
+
     cpu = fresh_cpu();
     uint64_t strp = scratch + 0x600;
     cpu->gpr[OCERZ_RDI] = strp;
@@ -1227,6 +1253,43 @@ static void r_printf_n(OcerzCPU *cpu)
     cpu->gpr[OCERZ_RSI] = scratch + 0x100;
 }
 
+static void r_va_null(OcerzCPU *cpu)
+{
+    cpu->gpr[OCERZ_RDI] = scratch + 0x100;
+    cpu->gpr[OCERZ_RSI] = 64;
+    cpu->gpr[OCERZ_RDX] = ocerz_h2g("%d");
+    cpu->gpr[OCERZ_RCX] = 0;
+}
+
+static void r_va_offsets(OcerzCPU *cpu)
+{
+    r_va_null(cpu);
+    uint64_t address = scratch + 0x800;
+    memset(ocerz_g2h(address), 0, 24);
+    ocerz_st(address, 4, 49);
+    ocerz_st(address + 4, 4, 48);
+    cpu->gpr[OCERZ_RCX] = address;
+}
+
+static void r_va_fp_offset(OcerzCPU *cpu)
+{
+    r_va_offsets(cpu);
+    ocerz_st(cpu->gpr[OCERZ_RCX], 4, 0);
+    ocerz_st(cpu->gpr[OCERZ_RCX] + 4, 4, 49);
+}
+
+static void r_va_saved(OcerzCPU *cpu)
+{
+    r_va_offsets(cpu);
+    ocerz_st(cpu->gpr[OCERZ_RCX], 4, 0);
+}
+
+static void r_va_overflow(OcerzCPU *cpu)
+{
+    r_va_offsets(cpu);
+    ocerz_st(cpu->gpr[OCERZ_RCX], 4, 48);
+}
+
 static void r_nslog_positional(OcerzCPU *cpu)
 {
     cpu->gpr[OCERZ_RDI] = ocerz_h2g(nsstr("%2$@ %1$@"));
@@ -1254,6 +1317,11 @@ static const Refusal kRefusals[] = {
     { "a bitfield result", r_bitfield, ocerz_objc_msgSend_stret, "decimalValue] cannot cross: its method type"
       " encoding {" },
     { "printf %n", r_printf_n, ocerz_fmt_printf, "_printf refuses the format \"count %n\": it has %n" },
+    { "a null va_list", r_va_null, ocerz_fmt_vsnprintf, "_vsnprintf: null guest va_list" },
+    { "invalid va_list GP offsets", r_va_offsets, ocerz_fmt_vsnprintf, "invalid guest va_list offsets" },
+    { "invalid va_list FP offsets", r_va_fp_offset, ocerz_fmt_vsnprintf, "invalid guest va_list offsets" },
+    { "a null va_list save area", r_va_saved, ocerz_fmt_vsnprintf, "null guest va_list register save area" },
+    { "a null va_list overflow area", r_va_overflow, ocerz_fmt_vsnprintf, "null guest va_list overflow area" },
     { "NSLog positional", r_nslog_positional, ocerz_fmt_NSLog, "_NSLog refuses the format \"%2$@ %1$@\": it has"
       " a positional argument" },
     { "a null objc_super", r_null_super, ocerz_objc_msgSendSuper, "_objc_msgSendSuper was handed a null struct"
@@ -1379,6 +1447,46 @@ static void test_forwarding_target(void)
     CHECK(cpu->gpr[OCERZ_RAX] == 10 && cpu->gpr[OCERZ_RDX] == 5,
           "a target that forwards again is followed to the object with the method: {%llu, %llu}",
           (unsigned long long)cpu->gpr[OCERZ_RAX], (unsigned long long)cpu->gpr[OCERZ_RDX]);
+}
+
+static long runtime_native_imp(void *self, void *command)
+{
+    return 42;
+}
+
+static void test_runtime_classes(void)
+{
+    OcerzCPU *cpu = fresh_cpu();
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    cpu->gpr[OCERZ_RDI] = ocerz_h2g(cls("NSObject"));
+    cpu->gpr[OCERZ_RSI] = ocerz_h2g("OcerzRuntimeUnit");
+    cpu->gpr[OCERZ_RDX] = 0;
+    CHECK(ocerz_objc_allocateClassPair(&vm, cpu) == OCERZ_STEP_OK && returned(cpu, rsp),
+          "runtime class allocation returns through the guest call frame");
+    uint64_t created = cpu->gpr[OCERZ_RAX];
+    CHECK(created != 0, "runtime class allocation creates a class");
+    if (!created)
+        return;
+
+    for (int i = 0; i < 3; i++) {
+        cpu = fresh_cpu();
+        rsp = cpu->gpr[OCERZ_RSP];
+        cpu->gpr[OCERZ_RDI] = i == 2 ? 0 : created;
+        cpu->gpr[OCERZ_RSI] = ocerz_h2g(sel("runtimeUnitValue"));
+        cpu->gpr[OCERZ_RDX] = ocerz_h2g((void *)runtime_native_imp);
+        cpu->gpr[OCERZ_RCX] = i == 1 ? 0 : ocerz_h2g("q@:");
+        CHECK(ocerz_objc_class_addMethod(&vm, cpu) == OCERZ_STEP_OK && returned(cpu, rsp) &&
+              cpu->gpr[OCERZ_RAX] == (uint64_t)(i == 0),
+              "class_addMethod succeeds once, refuses duplicates and accepts a null class (%d)", i);
+    }
+    void (*register_pair)(void *) = dlsym(RTLD_DEFAULT, "objc_registerClassPair");
+    void (*dispose_pair)(void *) = dlsym(RTLD_DEFAULT, "objc_disposeClassPair");
+    register_pair(ocerz_g2h(created));
+    void *obj = ((void *(*)(void *, void *))objc_msgSend_)(ocerz_g2h(created), sel("new"));
+    CHECK(((long (*)(void *, void *))objc_msgSend_)(obj, sel("runtimeUnitValue")) == 42,
+          "a native implementation passes through class_addMethod without an x86 callback wrapper");
+    ((void (*)(void *, void *))objc_msgSend_)(obj, sel("release"));
+    dispose_pair(ocerz_g2h(created));
 }
 
 typedef struct Syn {
@@ -2159,9 +2267,6 @@ static void cr_full_bank(Syn *s)
 }
 
 static const ClassRefusal kClassRefusals[] = {
-    { "a guest root class", cr_root, "guest class OcerzM11Root is a root class" },
-    { "a null superclass", cr_null_super, "guest class OcerzM11WeakSuper has a null superclass, as a class whose"
-      " weak-linked superclass the host lacks does" },
     { "a superclass ocerz never defined", cr_unknown_super,
       "guest class OcerzM11Orphan has the superclass OcerzM11NotListed at" },
     { "a Swift class", cr_swift, "is a Swift class, and Swift classes do not cross" },
@@ -2218,6 +2323,53 @@ static void test_class_refusals(void)
         CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 72, "%s: exits 72, status %#x: %s", r->what, status, err);
         CHECK((strstr(err, "ocerz: bridge: ") || strstr(err, "ocerz: blocks: ")) && strstr(err, r->message),
               "%s: stderr names it: %s", r->what, err);
+    }
+}
+
+typedef struct ClassLeftOut {
+    const char *what;
+    void (*build)(Syn *s);
+    const char *name;
+} ClassLeftOut;
+
+static const ClassLeftOut kClassLeftOut[] = {
+    { "a guest root class", cr_root, "OcerzM11Root" },
+    { "a null superclass", cr_null_super, "OcerzM11WeakSuper" },
+};
+
+static void test_class_left_out(void)
+{
+    for (size_t i = 0; i < sizeof kClassLeftOut / sizeof kClassLeftOut[0]; i++) {
+        const ClassLeftOut *r = &kClassLeftOut[i];
+        int fds[2];
+        if (pipe(fds) != 0) {
+            CHECK(0, "%s: pipe ran", r->what);
+            continue;
+        }
+        fflush(stdout);
+        fflush(stderr);
+        pid_t pid = fork();
+        int status = 0;
+        if (pid == 0) {
+            close(fds[0]);
+            dup2(fds[1], 2);
+            Syn s;
+            syn_init(&s);
+            r->build(&s);
+            ocerz_objcbridge_define_image(syn_header(&s, "__DATA"), 0);
+            _exit(cls(r->name) == NULL ? 0 : 1);
+        }
+        close(fds[1]);
+        char err[4096];
+        size_t have = 0;
+        ssize_t rd;
+        while (have + 1 < sizeof err && (rd = read(fds[0], err + have, sizeof err - 1 - have)) > 0)
+            have += (size_t)rd;
+        err[have] = '\0';
+        close(fds[0]);
+        CHECK(pid > 0 && waitpid(pid, &status, 0) == pid, "%s: child ran", r->what);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "%s: exits 0, status %#x: %s", r->what,
+              status, err);
     }
 }
 
@@ -2285,11 +2437,13 @@ int main(void)
     test_refusals();
     test_callables_allowed();
     test_forwarding_target();
+    test_runtime_classes();
     test_class_layouts();
     test_guest_notation();
     test_class_order();
     test_define_image();
     test_class_refusals();
+    test_class_left_out();
     test_encoding_sweep();
 
     ((void (*)(void *))need(objc, "objc_autoreleasePoolPop"))(pool);

@@ -375,9 +375,15 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <mach-o/loader.h>
+#include <mach/kern_return.h>
+#include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #define BR_NONE ((struct OcerzBridgeFn *)(uintptr_t)1)
@@ -390,6 +396,12 @@ typedef struct BrStructBinding {
     int nversions;
 } BrStructBinding;
 
+typedef struct BrInplaceBinding {
+    int reg;
+    uint32_t offset;
+    const char *sig;
+} BrInplaceBinding;
+
 struct OcerzBridgeFn {
     const char *lib;
     const char *sym;
@@ -401,6 +413,8 @@ struct OcerzBridgeFn {
     int register_only;
     int nstructs;
     BrStructBinding structs[OCERZ_APIDB_STRUCT_ARGS];
+    int ninplace;
+    BrInplaceBinding inplace[OCERZ_APIDB_INPLACE];
     uint64_t calls;
     struct OcerzBridgeFn *next;
 };
@@ -426,6 +440,29 @@ static int br_exit(struct OcerzVM *vm, OcerzCPU *cpu)
 static int br_exit_now(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     _exit((int)(cpu->gpr[OCERZ_RDI] & 0xff));
+}
+
+static int br_error(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    cpu->rip = ocerz_ld(rsp, 8);
+    cpu->gpr[OCERZ_RSP] = rsp + 8;
+    cpu->gpr[OCERZ_RAX] = cpu->gs_base ? cpu->gs_base + OCERZ_ERRNO_SLOT
+                                       : ocerz_h2g(__error());
+    return OCERZ_STEP_OK;
+}
+
+static int br_answer(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t rax);
+
+static int br_bzero(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t dst = cpu->gpr[OCERZ_RDI];
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_BRIDGE_LIBSYSTEM, "___bzero", "p(pL)", (const void *)bzero);
+    if (dst)
+        bzero(ocerz_g2h(dst), (size_t)cpu->gpr[OCERZ_RSI]);
+    ocerz_bridge_lower(&outer);
+    return br_answer(vm, cpu, dst);
 }
 
 static int br_abort(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -467,6 +504,694 @@ static int br_chkstk(struct OcerzVM *vm, OcerzCPU *cpu)
     cpu->rip = ocerz_ld(rsp + 8, 8);
     cpu->gpr[OCERZ_RSP] = rsp + 16;
     return OCERZ_STEP_OK;
+}
+
+static int br_answer(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t rax);
+
+static int br_settle(struct OcerzVM *vm, OcerzCPU *cpu);
+
+#define BR_THUNK_MAX 128u
+#define BR_THUNK_STRIDE 16u
+#define BR_THUNK_SLOT 0x800u
+
+typedef struct BrThunk {
+    const void *fn;
+    const char *name;
+    const char *notation;
+    OcerzAbiSig *sig;
+} BrThunk;
+
+static BrThunk g_br_thunks[BR_THUNK_MAX];
+static _Atomic unsigned g_br_thunks_n;
+static _Atomic uint64_t g_br_thunk_page;
+static pthread_mutex_t g_br_thunk_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t br_thunk_page_locked(void)
+{
+    uint64_t have = atomic_load(&g_br_thunk_page);
+    if (have)
+        return have;
+    uint64_t tramp = ocerz_vdylib_trampoline(OCERZ_VDYLIB_TRAMP_NATIVE_FN);
+    uint64_t made = tramp ? ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE) : 0;
+    if (!made)
+        return 0;
+    uint8_t *buf = ocerz_g2h(made);
+    memset(buf, 0xcc, OCERZ_GUEST_PAGE_SIZE);
+    for (unsigned k = 0; k < BR_THUNK_MAX; k++) {
+        uint8_t *t = buf + (size_t)k * BR_THUNK_STRIDE;
+        uint32_t number = k;
+        int32_t rel = (int32_t)((int64_t)BR_THUNK_SLOT - (int64_t)(k * BR_THUNK_STRIDE + 12));
+        t[0] = 0x41;
+        t[1] = 0xba;
+        memcpy(t + 2, &number, 4);
+        t[6] = 0xff;
+        t[7] = 0x25;
+        memcpy(t + 8, &rel, 4);
+    }
+    memcpy(buf + BR_THUNK_SLOT, &tramp, 8);
+    if (ocerz_protect(made, OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_EXEC) != OCERZ_OK) {
+        ocerz_unmap(made, OCERZ_GUEST_PAGE_SIZE);
+        return 0;
+    }
+    atomic_store(&g_br_thunk_page, made);
+    return made;
+}
+
+uint64_t ocerz_bridge_native_thunk(const void *fn, const char *name, const char *notation)
+{
+    if (!fn || !notation)
+        return 0;
+    uint64_t answer = 0;
+    pthread_mutex_lock(&g_br_thunk_lock);
+    unsigned n = atomic_load(&g_br_thunks_n), k;
+    for (k = 0; k < n; k++)
+        if (g_br_thunks[k].fn == fn)
+            break;
+    if (k == n && n < BR_THUNK_MAX) {
+        OcerzAbiSig *sig = calloc(1, sizeof *sig);
+        if (sig && ocerz_abi_parse(notation, sig) == OCERZ_OK) {
+            g_br_thunks[n].fn = fn;
+            g_br_thunks[n].name = name ? name : "(native function)";
+            g_br_thunks[n].notation = notation;
+            g_br_thunks[n].sig = sig;
+            atomic_store(&g_br_thunks_n, n + 1);
+        } else {
+            free(sig);
+            k = BR_THUNK_MAX;
+        }
+    }
+    if (k < BR_THUNK_MAX) {
+        uint64_t page = br_thunk_page_locked();
+        if (page)
+            answer = page + (uint64_t)k * BR_THUNK_STRIDE;
+    }
+    pthread_mutex_unlock(&g_br_thunk_lock);
+    return answer;
+}
+
+int ocerz_bridge_thunk_trap(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    unsigned k = (unsigned)(cpu->gpr[OCERZ_R10] & 0xffffffffu);
+    if (k >= atomic_load(&g_br_thunks_n)) {
+        OCERZ_FATAL("bridge: a thunk numbered %u for a native function was called, and ocerz made no such thunk\n", k);
+        return OCERZ_STEP_FATAL;
+    }
+    const BrThunk *t = &g_br_thunks[k];
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, "ocerz", t->name, t->notation, t->fn);
+    int rc = ocerz_abi_perform(t->sig, t->fn, cpu);
+    ocerz_bridge_lower(&outer);
+    if (rc != OCERZ_STEP_OK)
+        return rc;
+    return br_settle(vm, cpu);
+}
+
+#define BR_ZONE_WORDS 25
+#define BR_ZONE_VERSION_WORD 13
+#define BR_ZONE_VERSION_CAP 13u
+#define BR_ZONE_VIEWS 32u
+
+typedef struct BrZoneView {
+    uint64_t view;
+    malloc_zone_t *native;
+    uint64_t made[BR_ZONE_WORDS];
+} BrZoneView;
+
+static BrZoneView g_br_views[BR_ZONE_VIEWS];
+static _Atomic unsigned g_br_views_n;
+static pthread_mutex_t g_br_views_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const BrZoneView *br_view_find(uint64_t view)
+{
+    unsigned n = atomic_load(&g_br_views_n);
+    for (unsigned k = 0; view && k < n; k++)
+        if (g_br_views[k].view == view)
+            return &g_br_views[k];
+    return NULL;
+}
+
+static malloc_zone_t *brz_native(malloc_zone_t *given)
+{
+    const BrZoneView *v = br_view_find(ocerz_h2g(given));
+    return v ? v->native : given;
+}
+
+static size_t brz_size(malloc_zone_t *g, const void *p)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->size ? z->size(z, p) : 0;
+}
+
+static void *brz_malloc(malloc_zone_t *g, size_t n)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->malloc(z, n);
+}
+
+static void *brz_calloc(malloc_zone_t *g, size_t a, size_t b)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->calloc(z, a, b);
+}
+
+static void *brz_valloc(malloc_zone_t *g, size_t n)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->valloc(z, n);
+}
+
+static void brz_free(malloc_zone_t *g, void *p)
+{
+    malloc_zone_t *z = brz_native(g);
+    z->free(z, p);
+}
+
+static void *brz_realloc(malloc_zone_t *g, void *p, size_t n)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->realloc(z, p, n);
+}
+
+static void brz_destroy(malloc_zone_t *g)
+{
+    malloc_destroy_zone(brz_native(g));
+}
+
+static unsigned brz_batch_malloc(malloc_zone_t *g, size_t size, void **results, unsigned n)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->batch_malloc ? z->batch_malloc(z, size, results, n) : 0;
+}
+
+static void brz_batch_free(malloc_zone_t *g, void **ptrs, unsigned n)
+{
+    malloc_zone_t *z = brz_native(g);
+    if (z->batch_free) {
+        z->batch_free(z, ptrs, n);
+        return;
+    }
+    for (unsigned k = 0; k < n; k++)
+        if (ptrs[k])
+            z->free(z, ptrs[k]);
+}
+
+static void *brz_memalign(malloc_zone_t *g, size_t align, size_t n)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->memalign ? z->memalign(z, align, n) : NULL;
+}
+
+static void brz_free_definite_size(malloc_zone_t *g, void *p, size_t n)
+{
+    malloc_zone_t *z = brz_native(g);
+    if (z->version >= 6 && z->free_definite_size)
+        z->free_definite_size(z, p, n);
+    else
+        z->free(z, p);
+}
+
+static size_t brz_pressure_relief(malloc_zone_t *g, size_t goal)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->version >= 8 && z->pressure_relief ? z->pressure_relief(z, goal) : 0;
+}
+
+static boolean_t brz_claimed_address(malloc_zone_t *g, void *p)
+{
+    malloc_zone_t *z = brz_native(g);
+    if (z->version >= 10 && z->claimed_address)
+        return z->claimed_address(z, p);
+    return z->size && z->size(z, p) != 0;
+}
+
+static void brz_try_free_default(malloc_zone_t *g, void *p)
+{
+    malloc_zone_t *z = brz_native(g);
+    if (z->version >= 13 && z->try_free_default)
+        z->try_free_default(z, p);
+    else
+        free(p);
+}
+
+static size_t brz_good_size(malloc_zone_t *g, size_t n)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->introspect && z->introspect->good_size ? z->introspect->good_size(z, n) : malloc_good_size(n);
+}
+
+static boolean_t brz_check(malloc_zone_t *g)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->introspect && z->introspect->check ? z->introspect->check(z) : 1;
+}
+
+static void brz_print(malloc_zone_t *g, boolean_t verbose)
+{
+    malloc_zone_t *z = brz_native(g);
+    if (z->introspect && z->introspect->print)
+        z->introspect->print(z, verbose);
+}
+
+static void brz_log(malloc_zone_t *g, void *address)
+{
+    malloc_zone_t *z = brz_native(g);
+    if (z->introspect && z->introspect->log)
+        z->introspect->log(z, address);
+}
+
+static void brz_force_lock(malloc_zone_t *g)
+{
+    malloc_zone_t *z = brz_native(g);
+    if (z->introspect && z->introspect->force_lock)
+        z->introspect->force_lock(z);
+}
+
+static void brz_force_unlock(malloc_zone_t *g)
+{
+    malloc_zone_t *z = brz_native(g);
+    if (z->introspect && z->introspect->force_unlock)
+        z->introspect->force_unlock(z);
+}
+
+static void brz_statistics(malloc_zone_t *g, malloc_statistics_t *stats)
+{
+    malloc_zone_statistics(brz_native(g), stats);
+}
+
+static boolean_t brz_zone_locked(malloc_zone_t *g)
+{
+    malloc_zone_t *z = brz_native(g);
+    return z->introspect && z->introspect->zone_locked ? z->introspect->zone_locked(z) : 0;
+}
+
+static void brz_reinit_lock(malloc_zone_t *g)
+{
+    malloc_zone_t *z = brz_native(g);
+    if (z->version >= 9 && z->introspect && z->introspect->reinit_lock)
+        z->introspect->reinit_lock(z);
+}
+
+#define BR_ZONE_INTROSPECT_WORD 12
+#define BR_ZONE_INTROSPECT_AT 0x400u
+#define BR_ZONE_INTROSPECT_WORDS 17
+
+static const struct {
+    int word;
+    const void *fn;
+    const char *name;
+    const char *notation;
+} g_br_introspect_fns[] = {
+    { 1, brz_good_size, "(zone good_size)", "L(pL)" },
+    { 2, brz_check, "(zone check)", "i(p)" },
+    { 3, brz_print, "(zone print)", "v(pi)" },
+    { 4, brz_log, "(zone log)", "v(pp)" },
+    { 5, brz_force_lock, "(zone force_lock)", "v(p)" },
+    { 6, brz_force_unlock, "(zone force_unlock)", "v(p)" },
+    { 7, brz_statistics, "(zone statistics)", "v(pp)" },
+    { 8, brz_zone_locked, "(zone zone_locked)", "i(p)" },
+    { 13, brz_reinit_lock, "(zone reinit_lock)", "v(p)" },
+};
+
+static const struct {
+    int word;
+    const void *fn;
+    const char *name;
+    const char *notation;
+} g_br_zone_fns[] = {
+    { 2, brz_size, "(zone size)", "L(pp)" },
+    { 3, brz_malloc, "(zone malloc)", "p(pL)" },
+    { 4, brz_calloc, "(zone calloc)", "p(pLL)" },
+    { 5, brz_valloc, "(zone valloc)", "p(pL)" },
+    { 6, brz_free, "(zone free)", "v(pp)" },
+    { 7, brz_realloc, "(zone realloc)", "p(ppL)" },
+    { 8, brz_destroy, "(zone destroy)", "v(p)" },
+    { 10, brz_batch_malloc, "(zone batch_malloc)", "u(pLpu)" },
+    { 11, brz_batch_free, "(zone batch_free)", "v(ppu)" },
+    { 14, brz_memalign, "(zone memalign)", "p(pLL)" },
+    { 15, brz_free_definite_size, "(zone free_definite_size)", "v(ppL)" },
+    { 16, brz_pressure_relief, "(zone pressure_relief)", "L(pL)" },
+    { 17, brz_claimed_address, "(zone claimed_address)", "i(pp)" },
+    { 18, brz_try_free_default, "(zone try_free_default)", "v(pp)" },
+};
+
+static uint64_t br_zone_view(void *native_zone)
+{
+    if (!native_zone)
+        return 0;
+    malloc_zone_t *z = native_zone;
+    pthread_mutex_lock(&g_br_views_lock);
+    unsigned n = atomic_load(&g_br_views_n), k;
+    for (k = 0; k < n; k++)
+        if (g_br_views[k].native == z)
+            break;
+    uint64_t answer = k < n ? g_br_views[k].view : 0;
+    if (!answer && n < BR_ZONE_VIEWS) {
+        uint64_t page = ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE);
+        BrZoneView *v = &g_br_views[n];
+        int ok = page != 0;
+        memset(v->made, 0, sizeof v->made);
+        for (size_t f = 0; ok && f < sizeof g_br_zone_fns / sizeof g_br_zone_fns[0]; f++) {
+            v->made[g_br_zone_fns[f].word] = ocerz_bridge_native_thunk(
+                g_br_zone_fns[f].fn, g_br_zone_fns[f].name, g_br_zone_fns[f].notation);
+            ok = v->made[g_br_zone_fns[f].word] != 0;
+        }
+        uint64_t introspect[BR_ZONE_INTROSPECT_WORDS] = { 0 };
+        for (size_t f = 0; ok && f < sizeof g_br_introspect_fns / sizeof g_br_introspect_fns[0]; f++) {
+            introspect[g_br_introspect_fns[f].word] = ocerz_bridge_native_thunk(
+                g_br_introspect_fns[f].fn, g_br_introspect_fns[f].name, g_br_introspect_fns[f].notation);
+            ok = introspect[g_br_introspect_fns[f].word] != 0;
+        }
+        if (ok) {
+            uint32_t version = z->version < BR_ZONE_VERSION_CAP ? z->version : BR_ZONE_VERSION_CAP;
+            v->made[BR_ZONE_INTROSPECT_WORD] = page + BR_ZONE_INTROSPECT_AT;
+            for (int w = 0; w < BR_ZONE_INTROSPECT_WORDS; w++)
+                ocerz_st(page + BR_ZONE_INTROSPECT_AT + 8u * (unsigned)w, 8, introspect[w]);
+            v->made[9] = z->zone_name ? ocerz_h2g((void *)(uintptr_t)z->zone_name) : 0;
+            v->made[BR_ZONE_VERSION_WORD] = version;
+            for (int w = 0; w < BR_ZONE_WORDS; w++)
+                ocerz_st(page + 8u * (unsigned)w, 8, v->made[w]);
+            v->view = page;
+            v->native = z;
+            atomic_store(&g_br_views_n, n + 1);
+            answer = page;
+        } else if (page) {
+            ocerz_unmap(page, OCERZ_GUEST_PAGE_SIZE);
+        }
+    }
+    pthread_mutex_unlock(&g_br_views_lock);
+    return answer;
+}
+
+#define BR_ZONE_SLOTS 64
+
+static uint64_t g_br_eff[BR_ZONE_SLOTS];
+static int g_br_eff_n;
+static int g_br_eff_seeded;
+static pthread_mutex_t g_br_zones_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void br_zone_seed_locked(void)
+{
+    if (g_br_eff_seeded)
+        return;
+    g_br_eff_seeded = 1;
+    void *fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_LIBSYSTEM, "malloc_get_all_zones");
+    if (!fn)
+        return;
+    uint64_t addrs = 0;
+    uint32_t count = 0;
+    kern_return_t kr = ((kern_return_t (*)(uint32_t, void *, uint64_t, uint64_t))fn)(
+        (uint32_t)mach_task_self(), NULL, (uint64_t)(uintptr_t)&addrs, (uint64_t)(uintptr_t)&count);
+    if (kr != 0)
+        return;
+    uint64_t *list = addrs ? (uint64_t *)(uintptr_t)addrs : NULL;
+    for (uint32_t k = 0; k < count && g_br_eff_n < BR_ZONE_SLOTS; k++) {
+        uint64_t view = br_zone_view((void *)(uintptr_t)list[k]);
+        if (view)
+            g_br_eff[g_br_eff_n++] = view;
+    }
+}
+
+static void br_zone_add(uint64_t zone)
+{
+    if (!zone)
+        return;
+    pthread_mutex_lock(&g_br_zones_lock);
+    br_zone_seed_locked();
+    if (g_br_eff_n < BR_ZONE_SLOTS)
+        g_br_eff[g_br_eff_n++] = zone;
+    pthread_mutex_unlock(&g_br_zones_lock);
+}
+
+static void br_zone_remove(uint64_t zone)
+{
+    if (!zone)
+        return;
+    pthread_mutex_lock(&g_br_zones_lock);
+    br_zone_seed_locked();
+    for (int k = 0; k < g_br_eff_n; k++) {
+        if (g_br_eff[k] == zone) {
+            g_br_eff[k] = g_br_eff[--g_br_eff_n];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_br_zones_lock);
+}
+
+static int br_malloc_zone_register_tracked(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t zone = cpu->gpr[OCERZ_RDI];
+    OCERZ_LOG("bridge: malloc zone register takes zone %#llx, tracked for guest queries\n",
+              (unsigned long long)zone);
+    br_zone_add(zone);
+    return br_answer(vm, cpu, 0);
+}
+
+static int br_malloc_zone_unregister_tracked(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t zone = cpu->gpr[OCERZ_RDI];
+    OCERZ_LOG("bridge: malloc zone unregister takes zone %#llx\n", (unsigned long long)zone);
+    br_zone_remove(zone);
+    return br_answer(vm, cpu, 0);
+}
+
+static int br_malloc_default_zone_tracked(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t first = 0;
+    pthread_mutex_lock(&g_br_zones_lock);
+    br_zone_seed_locked();
+    if (g_br_eff_n > 0)
+        first = g_br_eff[0];
+    pthread_mutex_unlock(&g_br_zones_lock);
+    if (first)
+        return br_answer(vm, cpu, first);
+    static void *_Atomic cached = NULL;
+    void *fn = cached;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_LIBSYSTEM, "malloc_default_zone");
+        if (!fn)
+            return br_answer(vm, cpu, 0);
+        cached = fn;
+    }
+    void *r = ((void *(*)(void))fn)();
+    return br_answer(vm, cpu, br_zone_view(r));
+}
+
+static int br_malloc_default_purgeable_zone(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_LIBSYSTEM, "malloc_default_purgeable_zone");
+    if (!fn)
+        return br_answer(vm, cpu, 0);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_BRIDGE_LIBSYSTEM, "_malloc_default_purgeable_zone", "p()", fn);
+    void *r = ((void *(*)(void))fn)();
+    ocerz_bridge_lower(&outer);
+    uint64_t view = br_zone_view(r);
+    int known = 0;
+    pthread_mutex_lock(&g_br_zones_lock);
+    br_zone_seed_locked();
+    for (int k = 0; k < g_br_eff_n; k++)
+        known |= g_br_eff[k] == view;
+    pthread_mutex_unlock(&g_br_zones_lock);
+    if (!known)
+        br_zone_add(view);
+    return br_answer(vm, cpu, view);
+}
+
+static int br_malloc_get_all_zones_tracked(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t reader = cpu->gpr[OCERZ_RSI];
+    void *native_reader = NULL;
+    if (reader) {
+        native_reader = ocerz_abi_callback_intern(reader, "i(uLLp)");
+        if (!native_reader)
+            return br_answer(vm, cpu, (uint64_t)(uint32_t)KERN_FAILURE);
+    }
+    static void *_Atomic cached = NULL;
+    void *fn = cached;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_LIBSYSTEM, "malloc_get_all_zones");
+        if (!fn)
+            return br_answer(vm, cpu, (uint64_t)(uint32_t)KERN_FAILURE);
+        cached = fn;
+    }
+    uint64_t task = cpu->gpr[OCERZ_RDI];
+    uint64_t addresses = cpu->gpr[OCERZ_RDX];
+    uint64_t countp = cpu->gpr[OCERZ_RCX];
+    kern_return_t kr = ((kern_return_t (*)(uint32_t, void *, uint64_t, uint64_t))fn)(
+        (uint32_t)task, native_reader, addresses, countp);
+    if (kr != 0 || !addresses || !countp)
+        return br_answer(vm, cpu, (uint64_t)(uint32_t)kr);
+    uint64_t eff[BR_ZONE_SLOTS];
+    int neff = 0;
+    pthread_mutex_lock(&g_br_zones_lock);
+    br_zone_seed_locked();
+    for (int k = 0; k < g_br_eff_n && neff < BR_ZONE_SLOTS; k++)
+        eff[neff++] = g_br_eff[k];
+    pthread_mutex_unlock(&g_br_zones_lock);
+    if (neff == 0)
+        return br_answer(vm, cpu, (uint64_t)(uint32_t)kr);
+    uint64_t *out = malloc((size_t)neff * 8);
+    if (!out)
+        return br_answer(vm, cpu, (uint64_t)(uint32_t)kr);
+    for (int k = 0; k < neff; k++)
+        out[k] = eff[k];
+    ocerz_st(addresses, 8, (uint64_t)(uintptr_t)out);
+    ocerz_st(countp, 4, (uint64_t)neff);
+    return br_answer(vm, cpu, (uint64_t)(uint32_t)kr);
+}
+
+#define BR_ZONE_SIZE 16
+#define BR_ZONE_MALLOC 24
+#define BR_ZONE_CALLOC 32
+#define BR_ZONE_VALLOC 40
+#define BR_ZONE_FREE 48
+#define BR_ZONE_REALLOC 56
+#define BR_ZONE_DESTROY 64
+#define BR_ZONE_NAME 72
+#define BR_ZONE_MEMALIGN 112
+#define BR_ZONE_PRESSURE_RELIEF 128
+
+static int br_zone_is_guest(uint64_t zone)
+{
+    if (!zone)
+        return 0;
+    uint64_t fn = ocerz_ld(zone + BR_ZONE_MALLOC, 8);
+    return fn && ocerz_abi_is_guest_code(fn);
+}
+
+static int br_zone_forward(struct OcerzVM *vm, OcerzCPU *cpu, const char *export_name,
+                           const char *sig, unsigned slot)
+{
+    uint64_t zone = cpu->gpr[OCERZ_RDI];
+    const BrZoneView *view = br_view_find(zone);
+    uint64_t target = zone ? ocerz_ld(zone + slot, 8) : 0;
+    if (view ? target != view->made[slot / 8] : br_zone_is_guest(zone)) {
+        if (!target)
+            return br_answer(vm, cpu, 0);
+        cpu->rip = target;
+        return OCERZ_STEP_OK;
+    }
+    void *fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_LIBSYSTEM, export_name + 1);
+    if (!fn)
+        return br_answer(vm, cpu, 0);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_BRIDGE_LIBSYSTEM, export_name, sig, fn);
+    uint64_t r = ((uint64_t (*)(uint64_t, uint64_t, uint64_t))fn)(
+        view ? (uint64_t)(uintptr_t)view->native : zone, cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX]);
+    ocerz_bridge_lower(&outer);
+    return br_answer(vm, cpu, r);
+}
+
+static int br_malloc_zone_malloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_zone_malloc", "p(pL)", BR_ZONE_MALLOC);
+}
+
+static int br_malloc_zone_calloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_zone_calloc", "p(pLL)", BR_ZONE_CALLOC);
+}
+
+static int br_malloc_zone_valloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_zone_valloc", "p(pL)", BR_ZONE_VALLOC);
+}
+
+static int br_malloc_zone_free(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_zone_free", "v(pp)", BR_ZONE_FREE);
+}
+
+static int br_malloc_zone_realloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_zone_realloc", "p(ppL)", BR_ZONE_REALLOC);
+}
+
+static int br_malloc_zone_memalign(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_zone_memalign", "p(pLL)", BR_ZONE_MEMALIGN);
+}
+
+static int br_malloc_zone_pressure_relief(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_zone_pressure_relief", "L(pL)",
+                           BR_ZONE_PRESSURE_RELIEF);
+}
+
+static int br_malloc_destroy_zone(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    br_zone_remove(cpu->gpr[OCERZ_RDI]);
+    return br_zone_forward(vm, cpu, "_malloc_destroy_zone", "v(p)", BR_ZONE_DESTROY);
+}
+
+static int br_malloc_create_zone(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_LIBSYSTEM, "malloc_create_zone");
+    if (!fn)
+        return br_answer(vm, cpu, 0);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_BRIDGE_LIBSYSTEM, "_malloc_create_zone", "p(Lu)", fn);
+    void *zone = ((void *(*)(uint64_t, unsigned))fn)(cpu->gpr[OCERZ_RDI],
+                                                     (unsigned)cpu->gpr[OCERZ_RSI]);
+    ocerz_bridge_lower(&outer);
+    uint64_t g = br_zone_view(zone);
+    br_zone_add(g);
+    return br_answer(vm, cpu, g);
+}
+
+static int br_malloc_zone_from_ptr(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t ptr = cpu->gpr[OCERZ_RDI];
+    void *fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_LIBSYSTEM, "malloc_zone_from_ptr");
+    void *zone = NULL;
+    if (fn) {
+        struct OcerzBridgeFrame outer;
+        ocerz_bridge_raise(&outer, OCERZ_BRIDGE_LIBSYSTEM, "_malloc_zone_from_ptr", "p(p)", fn);
+        zone = ((void *(*)(const void *))fn)(ptr ? ocerz_g2h(ptr) : NULL);
+        ocerz_bridge_lower(&outer);
+    }
+    if (zone)
+        return br_answer(vm, cpu, br_zone_view(zone));
+    uint64_t eff[BR_ZONE_SLOTS];
+    int neff = 0;
+    pthread_mutex_lock(&g_br_zones_lock);
+    br_zone_seed_locked();
+    for (int k = 0; k < g_br_eff_n; k++)
+        eff[neff++] = g_br_eff[k];
+    pthread_mutex_unlock(&g_br_zones_lock);
+    for (int k = 0; k < neff; k++) {
+        if (br_view_find(eff[k]) || !br_zone_is_guest(eff[k]))
+            continue;
+        uint64_t size_fn = ocerz_ld(eff[k] + BR_ZONE_SIZE, 8);
+        if (!size_fn)
+            continue;
+        uint64_t args[2] = { eff[k], ptr };
+        if (ocerz_vm_call(vm, size_fn, args, 2, (cpu->gpr[OCERZ_RSP] - 256) & ~0xfull))
+            return br_answer(vm, cpu, eff[k]);
+    }
+    return br_answer(vm, cpu, 0);
+}
+
+static int br_malloc_get_zone_name(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t zone = cpu->gpr[OCERZ_RDI];
+    return br_answer(vm, cpu, zone ? ocerz_ld(zone + BR_ZONE_NAME, 8) : 0);
+}
+
+static int br_malloc_set_zone_name(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t zone = cpu->gpr[OCERZ_RDI];
+    uint64_t name = cpu->gpr[OCERZ_RSI];
+    const BrZoneView *view = br_view_find(zone);
+    if (view || br_zone_is_guest(zone)) {
+        char *copy = name ? strdup((const char *)ocerz_g2h(name)) : NULL;
+        ocerz_st(zone + BR_ZONE_NAME, 8, copy ? ocerz_h2g(copy) : 0);
+        if (view)
+            malloc_set_zone_name(view->native, copy);
+        return br_answer(vm, cpu, 0);
+    }
+    malloc_set_zone_name((malloc_zone_t *)ocerz_g2h(zone), name ? (const char *)ocerz_g2h(name) : NULL);
+    return br_answer(vm, cpu, 0);
 }
 
 static void br_return(OcerzCPU *cpu, uint64_t rax)
@@ -685,6 +1410,173 @@ static int br_dladdr(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_answer(vm, cpu, (uint64_t)ocerz_dyld_native_dladdr(cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI]));
 }
 
+static int br_dyld_unwind_sections(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, ocerz_dyld_unwind_sections(cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI]));
+}
+
+static struct {
+    uint32_t task;
+    uint32_t mask;
+    uint32_t port;
+    int behavior;
+    int flavor;
+    int valid;
+} g_br_exc_ports[8];
+
+static int br_task_set_exception_ports(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t task = (uint32_t)cpu->gpr[OCERZ_RDI];
+    uint32_t mask = (uint32_t)cpu->gpr[OCERZ_RSI];
+    uint32_t port = (uint32_t)cpu->gpr[OCERZ_RDX];
+    int behavior = (int)cpu->gpr[OCERZ_RCX];
+    int flavor = (int)cpu->gpr[OCERZ_R8];
+    OCERZ_LOG("bridge: task_set_exception_ports task=%u mask=%#x port=%u behavior=%d flavor=%d recorded, faults stay with translated code\n",
+              task, mask, port, behavior, flavor);
+    int slot = -1;
+    for (int k = 0; k < 8; k++)
+        if (g_br_exc_ports[k].valid && g_br_exc_ports[k].task == task)
+            slot = k;
+    if (slot < 0)
+        for (int k = 0; k < 8 && slot < 0; k++)
+            if (!g_br_exc_ports[k].valid)
+                slot = k;
+    if (slot < 0)
+        slot = 0;
+    g_br_exc_ports[slot].task = task;
+    g_br_exc_ports[slot].mask = mask;
+    g_br_exc_ports[slot].port = port;
+    g_br_exc_ports[slot].behavior = behavior;
+    g_br_exc_ports[slot].flavor = flavor;
+    g_br_exc_ports[slot].valid = 1;
+    return br_answer(vm, cpu, 0);
+}
+
+static int br_swap_exception_ports(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t count_at = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
+    if (count_at)
+        ocerz_st(count_at, 4, 0);
+    return br_task_set_exception_ports(vm, cpu);
+}
+
+static int br_abort_report(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    const char *fmt = cpu->gpr[OCERZ_RDI] ? ocerz_g2h(cpu->gpr[OCERZ_RDI]) : "(no message)";
+    fprintf(stderr, "ocerz: bridge: the guest called abort_report_np: %s\n", fmt);
+    return br_abort(vm, cpu);
+}
+
+static int br_susp_logging(void)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("OCERZ_SUSPLOG") ? 1 : 0;
+    return en;
+}
+
+static int br_thread_suspend(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t port = (uint32_t)cpu->gpr[OCERZ_RDI];
+    int kr = ocerz_vm_thread_suspend_native(port);
+    if (br_susp_logging())
+        fprintf(stderr, "ocerz: SUSPLOG[%d] suspend port=%#x answer=%d\n", (int)getpid(), port, kr);
+    return br_answer(vm, cpu, (uint64_t)(uint32_t)kr);
+}
+
+static int br_thread_resume(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t port = (uint32_t)cpu->gpr[OCERZ_RDI];
+    int kr = ocerz_vm_thread_resume_native(port);
+    if (br_susp_logging())
+        fprintf(stderr, "ocerz: SUSPLOG[%d] resume port=%#x answer=%d\n", (int)getpid(), port, kr);
+    return br_answer(vm, cpu, (uint64_t)(uint32_t)kr);
+}
+
+static int br_thread_get_state(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t port = (uint32_t)cpu->gpr[OCERZ_RDI];
+    uint32_t flavor = (uint32_t)cpu->gpr[OCERZ_RSI];
+    uint64_t state = cpu->gpr[OCERZ_RDX];
+    uint64_t countp = cpu->gpr[OCERZ_RCX];
+    if (flavor != 4) {
+        fprintf(stderr, "ocerz: bridge: _thread_get_state takes flavor %u, which has no x86 register mapping here\n",
+                flavor);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    if (!state || !countp)
+        return br_answer(vm, cpu, KERN_FAILURE);
+    uint64_t g[16], rip, rfl;
+    if (ocerz_vm_thread_regs(port, g, &rip, &rfl) < 0)
+        return br_answer(vm, cpu, KERN_INVALID_ARGUMENT);
+    uint32_t want = (uint32_t)ocerz_ld(countp, 4);
+    if (want < 42)
+        return br_answer(vm, cpu, KERN_INVALID_ARGUMENT);
+    uint64_t s[21] = { g[OCERZ_RAX], g[OCERZ_RBX], g[OCERZ_RCX], g[OCERZ_RDX],
+                       g[OCERZ_RDI], g[OCERZ_RSI], g[OCERZ_RBP], g[OCERZ_RSP],
+                       g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15],
+                       rip, rfl | OCERZ_FLAG_FIXED1, 0x2b, 0, 0 };
+    for (int k = 0; k < 21; k++)
+        ocerz_st(state + 8 * (uint64_t)k, 8, s[k]);
+    ocerz_st(countp, 4, 42);
+    return br_answer(vm, cpu, 0);
+}
+
+typedef const void *(*BrCFUUIDFn)(const void *, unsigned, unsigned, unsigned, unsigned, unsigned,
+                                  unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
+                                  unsigned, unsigned, unsigned, unsigned, unsigned);
+
+static int br_cfuuid_constant(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    void *fn = cached;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_COREFOUNDATION, "CFUUIDGetConstantUUIDWithBytes");
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _CFUUIDGetConstantUUIDWithBytes has no host symbol\n");
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        cached = fn;
+    }
+    OcerzAbiSig named;
+    if (ocerz_abi_parse("p", &named) != OCERZ_OK)
+        return br_answer(vm, cpu, 0);
+    OcerzAbiVaList va;
+    if (ocerz_abi_va_start(&named, cpu, &va) != OCERZ_OK)
+        return br_answer(vm, cpu, 0);
+    uint64_t raw = cpu->gpr[OCERZ_RDI];
+    const void *alloc = raw ? ocerz_g2h(raw) : NULL;
+    unsigned b[16];
+    for (int k = 0; k < 16; k++) {
+        uint64_t v = 0;
+        if (ocerz_abi_va_arg(&va, cpu, 'u', &v) != OCERZ_OK)
+            return br_answer(vm, cpu, 0);
+        b[k] = (unsigned)(v & 0xffu);
+    }
+    const void *r = ((BrCFUUIDFn)fn)(alloc, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                                     b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    return br_answer(vm, cpu, r ? ocerz_h2g(r) : 0);
+}
+
+static int br_availability_version_check(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t want = (uint32_t)cpu->gpr[OCERZ_RDI];
+    char buf[32];
+    size_t len = sizeof buf;
+    uint32_t have = 0;
+    if (sysctlbyname("kern.osproductversion", buf, &len, NULL, 0) == 0 && len > 0 && len < sizeof buf) {
+        unsigned maj = 0, min = 0, pat = 0;
+        sscanf(buf, "%u.%u.%u", &maj, &min, &pat);
+        if (maj > 0xffffu)
+            maj = 0xffffu;
+        if (min > 0xffu)
+            min = 0xffu;
+        if (pat > 0xffu)
+            pat = 0xffu;
+        have = (uint32_t)(maj << 16) | (uint32_t)(min << 8) | (uint32_t)pat;
+    }
+    return br_answer(vm, cpu, have >= want ? 1 : 0);
+}
+
 static int br_dlclose(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     return br_answer(vm, cpu, (uint64_t)(uint32_t)ocerz_dyld_native_dlclose(cpu->gpr[OCERZ_RDI]));
@@ -844,6 +1736,8 @@ static const BrHandler g_br_handlers[] = {
     { "exit",            br_exit },
     { "exit_now",        br_exit_now },
     { "abort",           br_abort },
+    { "error",           br_error },
+    { "bzero",           br_bzero },
     { "tlv_bootstrap",   br_tlv_bootstrap },
     { "stack_chk_fail",  br_stack_chk_fail },
     { "chkstk",          br_chkstk },
@@ -862,6 +1756,46 @@ static const BrHandler g_br_handlers[] = {
     { "dlopen_preflight", br_dlopen_preflight },
     { "dlsym",           br_dlsym },
     { "dladdr",          br_dladdr },
+    { "dyld_unwind_sections", br_dyld_unwind_sections },
+    { "task_set_exception_ports", br_task_set_exception_ports },
+    { "swap_exception_ports",     br_swap_exception_ports },
+    { "abort_report",             br_abort_report },
+    { "mach_vm_map",              ocerz_sys_mach_vm_map },
+    { "mach_vm_remap",            ocerz_sys_mach_vm_remap },
+    { "pthread_get_stackaddr_np", ocerz_sys_pthread_get_stackaddr_np },
+    { "pthread_get_stacksize_np", ocerz_sys_pthread_get_stacksize_np },
+    { "getpagesize", ocerz_sys_getpagesize },
+    { "sysconf", ocerz_sys_sysconf },
+    { "host_page_size", ocerz_sys_host_page_size },
+    { "sysctl", ocerz_sys_sysctl },
+    { "sysctlbyname", ocerz_sys_sysctlbyname },
+    { "sandbox_check",            ocerz_sys_sandbox_check },
+    { "sandbox_init",             ocerz_sys_sandbox_init },
+    { "sandbox_init_with_parameters", ocerz_sys_sandbox_init_with_parameters },
+    { "sandbox_apply",            ocerz_sys_sandbox_apply },
+    { "sandbox_ms",               ocerz_sys_sandbox_ms },
+    { "malloc_zone_register", br_malloc_zone_register_tracked },
+    { "malloc_zone_unregister", br_malloc_zone_unregister_tracked },
+    { "malloc_default_zone", br_malloc_default_zone_tracked },
+    { "malloc_default_purgeable_zone", br_malloc_default_purgeable_zone },
+    { "malloc_zone_malloc", br_malloc_zone_malloc },
+    { "malloc_zone_calloc", br_malloc_zone_calloc },
+    { "malloc_zone_valloc", br_malloc_zone_valloc },
+    { "malloc_zone_free", br_malloc_zone_free },
+    { "malloc_zone_realloc", br_malloc_zone_realloc },
+    { "malloc_zone_memalign", br_malloc_zone_memalign },
+    { "malloc_zone_pressure_relief", br_malloc_zone_pressure_relief },
+    { "malloc_destroy_zone", br_malloc_destroy_zone },
+    { "malloc_create_zone", br_malloc_create_zone },
+    { "malloc_zone_from_ptr", br_malloc_zone_from_ptr },
+    { "malloc_get_zone_name", br_malloc_get_zone_name },
+    { "malloc_set_zone_name", br_malloc_set_zone_name },
+    { "malloc_get_all_zones", br_malloc_get_all_zones_tracked },
+    { "thread_get_state", br_thread_get_state },
+    { "thread_suspend", br_thread_suspend },
+    { "thread_resume", br_thread_resume },
+    { "cfuuid_constant", br_cfuuid_constant },
+    { "availability_version_check", br_availability_version_check },
     { "dlclose",         br_dlclose },
     { "dlerror",         br_dlerror },
     { "dyld_image_count",            br_dyld_image_count },
@@ -896,15 +1830,50 @@ static const BrHandler g_br_handlers[] = {
     { "objc_msgSend_fpret",        ocerz_objc_msgSend_fpret },
     { "objc_msgSend_fp2ret",       ocerz_objc_msgSend_fp2ret },
     { "objc_setUncaughtExceptionHandler", ocerz_objc_setUncaughtExceptionHandler },
+    { "objc_allocateClassPair",     ocerz_objc_allocateClassPair },
+    { "class_addMethod",            ocerz_objc_class_addMethod },
+    { "method_setImplementation",   ocerz_objc_methodSetImplementation },
+    { "class_replaceMethod",        ocerz_objc_class_replaceMethod },
+    { "objc_setExceptionPreprocessor", ocerz_objc_setExceptionPreprocessor },
+    { "method_getImplementation",   ocerz_objc_method_getImplementation },
+    { "class_getMethodImplementation", ocerz_objc_class_getMethodImplementation },
     { "NSLog",                     ocerz_fmt_NSLog },
     { "printf",                    ocerz_fmt_printf },
     { "fprintf",                   ocerz_fmt_fprintf },
     { "sprintf",                   ocerz_fmt_sprintf },
     { "snprintf",                  ocerz_fmt_snprintf },
+    { "snprintf_l",                ocerz_fmt_snprintf_l },
     { "asprintf",                  ocerz_fmt_asprintf },
     { "dprintf",                   ocerz_fmt_dprintf },
+    { "swprintf", ocerz_fmt_swprintf },
+    { "wprintf", ocerz_fmt_wprintf },
+    { "fwprintf", ocerz_fmt_fwprintf },
+    { "vswprintf", ocerz_fmt_vswprintf },
+    { "vwprintf", ocerz_fmt_vwprintf },
+    { "vfwprintf", ocerz_fmt_vfwprintf },
+    { "syslog", ocerz_fmt_syslog },
+    { "vsyslog", ocerz_fmt_vsyslog },
+    { "warn", ocerz_fmt_warn },
+    { "warnx", ocerz_fmt_warnx },
+    { "vwarn", ocerz_fmt_vwarn },
+    { "vwarnx", ocerz_fmt_vwarnx },
     { "sprintf_chk",               ocerz_fmt_sprintf_chk },
     { "snprintf_chk",              ocerz_fmt_snprintf_chk },
+    { "vprintf",                   ocerz_fmt_vprintf },
+    { "vfprintf",                  ocerz_fmt_vfprintf },
+    { "vsprintf",                  ocerz_fmt_vsprintf },
+    { "vsnprintf",                 ocerz_fmt_vsnprintf },
+    { "vsnprintf_l",               ocerz_fmt_vsnprintf_l },
+    { "vasprintf",                 ocerz_fmt_vasprintf },
+    { "vdprintf",                  ocerz_fmt_vdprintf },
+    { "vsprintf_chk",              ocerz_fmt_vsprintf_chk },
+    { "vsnprintf_chk",             ocerz_fmt_vsnprintf_chk },
+    { "sscanf",                    ocerz_fmt_sscanf },
+    { "scanf",                     ocerz_fmt_scanf },
+    { "fscanf",                    ocerz_fmt_fscanf },
+    { "vsscanf",                   ocerz_fmt_vsscanf },
+    { "vscanf",                    ocerz_fmt_vscanf },
+    { "vfscanf",                   ocerz_fmt_vfscanf },
     { "CFStringCreateWithFormat",  ocerz_fmt_CFStringCreateWithFormat },
     { "CFStringAppendFormat",      ocerz_fmt_CFStringAppendFormat },
     { "open",            ocerz_sys_open },
@@ -946,6 +1915,12 @@ static const BrHandler g_br_handlers[] = {
     { "system",          ocerz_sys_system },
     { "popen",           ocerz_sys_popen },
     { "pclose",          ocerz_sys_pclose },
+    { "pthread_key_create",  ocerz_sys_pthread_key_create },
+    { "pthread_key_delete",  ocerz_sys_pthread_key_delete },
+    { "pthread_setspecific", ocerz_sys_pthread_setspecific },
+    { "pthread_getspecific", ocerz_sys_pthread_getspecific },
+    { "pthread_create",      ocerz_sys_pthread_create },
+    { "pthread_exit",        ocerz_sys_pthread_exit },
     { "Block_copy",                ocerz_block_special_copy },
     { "Block_object_assign",       ocerz_block_special_object_assign },
 };
@@ -1096,6 +2071,23 @@ static int br_bind_structs(const OcerzApiLibrary *api, const OcerzApiEntry *e,
     return 1;
 }
 
+static int br_bind_inplace(const OcerzApiEntry *e, struct OcerzBridgeFn *fn)
+{
+    for (int k = 0; k < e->ninplace && k < OCERZ_APIDB_INPLACE; k++) {
+        BrInplaceBinding *b = &fn->inplace[k];
+        b->reg = br_int_register(&fn->parsed, e->inplace[k].argpos);
+        b->offset = e->inplace[k].offset;
+        b->sig = e->inplace[k].sig;
+        if (b->reg < 0) {
+            OCERZ_LOG("bridge: %s converts a function in argument %d in place, which its signature %s"
+                      " does not place in a register\n", fn->sym, e->inplace[k].argpos, fn->sig);
+            return 0;
+        }
+        fn->ninplace = k + 1;
+    }
+    return 1;
+}
+
 static struct OcerzBridgeFn *br_make(const OcerzApiLibrary *api, const OcerzApiEntry *e)
 {
     struct OcerzBridgeFn *fn = calloc(1, sizeof *fn);
@@ -1127,7 +2119,7 @@ static struct OcerzBridgeFn *br_make(const OcerzApiLibrary *api, const OcerzApiE
             free(fn);
             return NULL;
         }
-        if (!br_bind_structs(api, e, fn)) {
+        if (!br_bind_structs(api, e, fn) || !br_bind_inplace(e, fn)) {
             for (int k = 0; k < OCERZ_APIDB_STRUCT_ARGS; k++)
                 free((void *)fn->structs[k].versions);
             free(fn);
@@ -1233,6 +2225,11 @@ void ocerz_bridge_lower(const struct OcerzBridgeFrame *outer)
     g_br_frame = *outer;
 }
 
+const int *ocerz_bridge_depth_ptr(void)
+{
+    return &g_br_frame.depth;
+}
+
 static int br_logging(void)
 {
     static int en = -1;
@@ -1274,22 +2271,61 @@ static void br_convert_structs(const struct OcerzBridgeFn *fn, OcerzCPU *cpu,
     }
 }
 
+typedef struct BrInplaceSwap {
+    uint64_t at;
+    uint64_t guest;
+    uint64_t native;
+} BrInplaceSwap;
+
+static int br_convert_inplace(const struct OcerzBridgeFn *fn, OcerzCPU *cpu,
+                              BrInplaceSwap swaps[OCERZ_APIDB_INPLACE])
+{
+    int n = 0;
+    for (int k = 0; k < fn->ninplace; k++) {
+        const BrInplaceBinding *b = &fn->inplace[k];
+        uint64_t base = cpu->gpr[b->reg];
+        if (!base)
+            continue;
+        uint64_t at = base + b->offset;
+        uint64_t guest = ocerz_ld(at, 8);
+        uint64_t native = guest;
+        if (!guest || !ocerz_abi_is_guest_code(guest))
+            continue;
+        if (ocerz_abi_callback_convert(guest, b->sig, &native) != OCERZ_OK) {
+            fprintf(stderr, "ocerz: bridge: %s could not bind guest function %#llx, %u bytes into its"
+                    " argument\n", fn->sym, (unsigned long long)guest, b->offset);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        ocerz_st(at, 8, native);
+        swaps[n].at = at;
+        swaps[n].guest = guest;
+        swaps[n].native = native;
+        n++;
+    }
+    return n;
+}
+
 __attribute__((noinline))
 static int br_cross_structs(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
 {
     struct OcerzBridgeFrame outer;
     uint64_t copies[OCERZ_APIDB_STRUCT_ARGS][OCERZ_APIDB_SHAPE_WORDS];
+    BrInplaceSwap swaps[OCERZ_APIDB_INPLACE];
 
     ocerz_bridge_raise(&outer, fn->lib, fn->sym, fn->sig, fn->addr);
     br_convert_structs(fn, cpu, copies);
+    int nswaps = br_convert_inplace(fn, cpu, swaps);
     int rc = ocerz_abi_perform(&fn->parsed, fn->addr, cpu);
+    for (int k = 0; k < nswaps; k++)
+        if (ocerz_ld(swaps[k].at, 8) == swaps[k].native)
+            ocerz_st(swaps[k].at, 8, swaps[k].guest);
     ocerz_bridge_lower(&outer);
     return rc;
 }
 
 static int br_cross(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
 {
-    if (fn->nstructs)
+    if (fn->nstructs || fn->ninplace)
         return br_cross_structs(fn, cpu);
 
     struct OcerzBridgeFrame *frame = &g_br_frame;

@@ -81,16 +81,15 @@
  * a lock.
  *
  * ---- what is refused ----
- * A class is refused by name, and the process stopped, when it is a root class,
- * because a guest root would need retain, release and every NSObject method in
- * guest code; when its superclass is null without its class_ro_t saying it is a
- * root, which is what a weak-linked superclass the host lacks leaves, and which
- * the native runtime would answer by leaving the class out and every reference
- * to it nil; when it is a Swift class, marked in the low bits of its data word
- * or by a Swift metadata initializer; when its class_ro_t already carries the
- * flags only a running runtime sets; when its metaclass is not a guest class
- * marked as one; and when its superclass is a guest class ocerz has not defined,
- * including one in a chain of superclasses that comes back to itself.  Within an image the class
+ * A class is refused by name, and the process stopped, when it is a Swift class,
+ * marked in the low bits of its data word or by a Swift metadata initializer;
+ * when its class_ro_t already carries the flags only a running runtime sets;
+ * when its metaclass is not a guest class marked as one; and when its
+ * superclass is a guest class ocerz has not defined, including one in a chain
+ * of superclasses that comes back to itself. A root class, and a class whose
+ * superclass is null without its class_ro_t saying it is a root, which is what
+ * a weak-linked superclass the host lacks leaves, are left out with a log line
+ * the way the native runtime leaves them unrealized.  Within an image the class
  * list is put in superclass order first: the classes are sorted by address and
  * each chain is walked to the first superclass outside the list, so a subclass
  * listed before its superclass waits for it.  A superclass in another guest
@@ -690,6 +689,7 @@ static pthread_mutex_t g_oc_lock = PTHREAD_MUTEX_INITIALIZER;
 static OcMap g_oc_images;
 static OcMap g_oc_classes;
 static OcMap g_oc_protocols;
+static OcMap g_oc_skipped;
 static OcLoad *g_oc_loads;
 static size_t g_oc_loads_n, g_oc_loads_cap;
 static uint64_t g_oc_defining;
@@ -1038,15 +1038,29 @@ static void oc_define_class(uint64_t addr, uint32_t image_flags)
     const char *name = oc_ro_name(c.ro);
     if (ro.flags & (OC_RO_FUTURE | OC_RO_REALIZED))
         oc_stop("guest class %s carries class_ro_t flags %#x that only a running runtime sets", name, ro.flags);
-    if (ro.flags & OC_RO_ROOT)
-        oc_stop("guest class %s is a root class, with no superclass, and ocerz defines guest classes only"
-                " under a native root such as NSObject", name);
-    if (!c.superclass)
-        oc_stop("guest class %s has a null superclass, as a class whose weak-linked superclass the host lacks"
-                " does, and ocerz does not leave such a class out the way the native runtime would", name);
-    if (oc_is_guest(c.superclass) && !oc_defined(c.superclass))
+    if (ro.flags & OC_RO_ROOT) {
+        OCERZ_LOG("objc: guest class %s at %#llx is a root class, with no superclass, and is left out\n",
+                  name, (unsigned long long)addr);
+        oc_map_put(&g_oc_skipped, addr, 1);
+        return;
+    }
+    if (!c.superclass) {
+        OCERZ_LOG("objc: guest class %s at %#llx has a null superclass, as a class whose weak-linked superclass the host lacks does,"
+                  " and is left out\n", name, (unsigned long long)addr);
+        oc_map_put(&g_oc_skipped, addr, 1);
+        return;
+    }
+    if (oc_is_guest(c.superclass) && !oc_defined(c.superclass)) {
+        if (oc_map_find(&g_oc_skipped, c.superclass)) {
+            OCERZ_LOG("objc: guest class %s at %#llx has the superclass %s at %#llx, which was left out,"
+                      " and is left out\n", name, (unsigned long long)addr,
+                      oc_class_label(c.superclass), (unsigned long long)c.superclass);
+            oc_map_put(&g_oc_skipped, addr, 1);
+            return;
+        }
         oc_stop("guest class %s has the superclass %s at %#llx, which is not a class ocerz has defined", name,
                 oc_class_label(c.superclass), (unsigned long long)c.superclass);
+    }
     if (!oc_is_guest(c.isa) || ocerz_objc_read_class(c.isa, &mc) != OCERZ_OBJC_OK ||
         ocerz_objc_read_ro(mc.ro, &mro) != OCERZ_OBJC_OK || !(mro.flags & OC_RO_META))
         oc_stop("guest class %s has no guest metaclass at %#llx", name, (unsigned long long)c.isa);

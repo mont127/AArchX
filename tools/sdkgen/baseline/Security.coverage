@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/Security.framework/Versions/A/Security
+sdk macos 27.0
+exports 4700
+fn 632
+data 2262
+var 0
+special 0
+stub arch-mismatch 2
+stub callback-struct 37
+stub layout 4
+stub no-declaration 1763
+host-missing 0
+objc-classes 57
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

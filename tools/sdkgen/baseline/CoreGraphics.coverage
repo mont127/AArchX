@@ -1,22 +1,22 @@
 library /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
 sdk macos 27.0
 exports 5407
-fn 737
-data 538
+fn 751
+data 569
 var 0
 special 0
 stub callback-struct 2
-stub no-declaration 3561
+stub no-declaration 3655
 stub va-list 1
 stub variadic 4
-omit no-declaration-missing 203
-omit swift 361
-host-missing 1
+omit no-declaration-missing 9
+omit swift 416
+host-missing 0
 objc-classes 8
 objc-eh-types 0
 objc-ivars 0
 ld-pseudo-skipped 868
-overrides 0
+overrides 14
 override-shapes 4
 override-structs 4
 override-opaque 0

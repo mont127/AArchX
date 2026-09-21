@@ -87,9 +87,8 @@
  * ocerz_vdylib_xmm_contract is asserted for libSystem exports of each kind the
  * JIT treats differently: __tlv_bootstrap and ___chkstk_darwin have no contract,
  * since their callers keep every register, strlen reads and writes no xmm
- * register, strtod writes xmm0, printf's special reads all eight argument
- * registers and writes two, scanf's stub record has no contract, and neither has
- * an id no library minted.
+ * register, strtod writes xmm0, the printf and scanf specials read all eight
+ * argument registers and write two, and neither has an id no library minted.
  *
  * Every data record has to resolve to exactly what dlsym answers for its host
  * symbol in a CoreFoundation this process dlopens itself, and to the same value
@@ -1040,7 +1039,7 @@ static void check_xmm_contracts(void)
         { "_strlen", 1, 0x00, 0x0 },
         { "_strtod", 1, 0x00, 0x1 },
         { "_printf", 1, 0xff, 0x3 },
-        { "_scanf", 0, 0, 0 },
+        { "_scanf", 1, 0xff, 0x3 },
     };
     const OcerzApiLibrary *api = ocerz_apidb_library(kLib);
     int ord = api ? db_ordinal(api) : -1;

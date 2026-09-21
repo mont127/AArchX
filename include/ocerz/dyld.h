@@ -61,6 +61,7 @@ uint64_t ocerz_dyld_trie_resolve(const uint8_t *slice, uint64_t load_base,
 extern uint64_t ocerz_exc_trap_rip;
 
 #define OCERZ_TLV_TABLE_SLOT 0x1808
+#define OCERZ_ERRNO_SLOT 0x1810
 
 uint64_t ocerz_tlv_address(OcerzCPU *cpu, uint64_t desc);
 void ocerz_tlv_release_thread(uint64_t gs_base);
@@ -79,6 +80,7 @@ uint64_t ocerz_dyld_native_dlerror(void);
 uint32_t ocerz_dyld_image_count(void);
 int ocerz_dyld_image_at(uint32_t index, uint64_t *mh, uint64_t *slide, uint64_t *name);
 int ocerz_dyld_image_containing(uint64_t addr, uint64_t *mh, uint64_t *name);
+int ocerz_dyld_unwind_sections(uint64_t addr, uint64_t sections);
 int ocerz_dyld_image_slide(uint64_t mh, uint64_t *slide);
 int ocerz_dyld_native_add_image_func(struct OcerzVM *vm, uint64_t func, uint64_t stack_top);
 int ocerz_dyld_native_remove_image_func(uint64_t func);

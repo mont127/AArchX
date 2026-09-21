@@ -89,9 +89,20 @@ for f in "${files[@]}"; do
     language=${language:-c}
     probe=$work/probe.c
     [ "$language" = objective-c ] && probe=$work/probe.m
-    printf '#include "%s"\n' "$header" > "$probe"
-    awk '{ printf "typedef char sdkgen_probe_%d[sizeof(%s)];\n", NR, $0 }' "$work/names" >> "$probe"
     for arch in x86_64 arm64; do
+        awk -v arch="$arch" '$1 == "record" && $2 == arch {
+            rest = $0; sub(/^record [^ ]+ [^ ]+ [^ ]+ [^ ]+ /, "", rest)
+            split(rest, part, "\t")
+            print part[1] "\t" part[2] "\t" $3 "\t" $4 "\t" $5
+        }' "$f" > "$work/gen.$arch"
+        printf '#include "%s"\n' "$header" > "$probe"
+        awk -F '\t' '
+            NR == FNR { want[$0] = 1; next }
+            $1 in want {
+                type = index($2, "(") ? $1 : $2
+                printf "typedef char sdkgen_probe_%d[sizeof(%s)];\n", ++n, type
+            }
+        ' "$work/names" "$work/gen.$arch" >> "$probe"
         clang -x "$language" -target "$arch-apple-macos$ver" -isysroot "$sdk" -std=gnu17 -w $defines -fsyntax-only \
             -Xclang -fdump-record-layouts-simple "$probe" > "$work/dump" 2>&1 || {
             echo "layout_check.sh: clang failed on the probe for $f ($arch):" >&2
@@ -111,11 +122,6 @@ for f in "${files[@]}"; do
                     name = ""; inoffs = 0
                 }
             }' "$work/dump" > "$work/clang.$arch"
-        awk -v arch="$arch" '$1 == "record" && $2 == arch {
-            rest = $0; sub(/^record [^ ]+ [^ ]+ [^ ]+ [^ ]+ /, "", rest)
-            split(rest, part, "\t")
-            print part[1] "\t" part[2] "\t" $3 "\t" $4 "\t" $5
-        }' "$f" > "$work/gen.$arch"
         result=$(awk -F '\t' -v arch="$arch" -v file="$f" '
             FILENAME == ARGV[1] { want[$0] = 1; next }
             FILENAME == ARGV[2] { if (!($1 in clang)) clang[$1] = $2 "\t" $3 "\t" $4; next }

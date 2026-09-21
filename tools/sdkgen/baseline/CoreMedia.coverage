@@ -1,0 +1,21 @@
+library /System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia
+sdk macos 27.0
+exports 9081
+fn 290
+data 2843
+var 0
+special 0
+stub callback-struct 7
+stub no-declaration 4039
+stub struct-layout 74
+omit no-declaration-missing 11
+omit swift 1817
+host-missing 0
+objc-classes 1
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 5618
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

@@ -66,6 +66,7 @@ extern int ocerz_jit_lock_held_self(void);
 
 static void map_lock_acquire(void)
 {
+    ocerz_critical_depth++;
     static int lg = -1;
     if (lg < 0) lg = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
     if (lg && ocerz_jit_lock_held_self()) {
@@ -75,6 +76,12 @@ static void map_lock_acquire(void)
                     (int)getpid());
     }
     pthread_mutex_lock(&map_lock);
+}
+
+static void map_lock_release(void)
+{
+    pthread_mutex_unlock(&map_lock);
+    ocerz_critical_depth--;
 }
 
 static pthread_mutex_t g_initgate_m = PTHREAD_MUTEX_INITIALIZER;
@@ -722,6 +729,28 @@ static int sync_host_page_locked(const MemRegion *r, uint64_t page)
     return OCERZ_OK;
 }
 
+static int sync_host_gap_locked(const MemRegion *r, uint64_t lo, uint64_t hi)
+{
+    if (hi - lo > OCERZ_HOST_PAGE &&
+        mmap(ocerz_g2h(lo), (size_t)(hi - lo), PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) ==
+            ocerz_g2h(lo)) {
+        for (uint64_t q = lo; q < hi; q += OCERZ_HOST_PAGE) {
+            size_t i = pg_index(r, q);
+            if (r->armed && r->armed[i]) {
+                r->armed[i] = 0;
+                __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
+            }
+            bit_clr(r, i);
+        }
+        return OCERZ_OK;
+    }
+    int rc = OCERZ_OK;
+    for (uint64_t q = lo; q < hi; q += OCERZ_HOST_PAGE)
+        if (sync_host_page_locked(r, q) != OCERZ_OK)
+            rc = OCERZ_ENOMEM;
+    return rc;
+}
+
 static int sync_host_range_locked(const MemRegion *r, uint64_t lo, uint64_t hi)
 {
     if (lo >= hi)
@@ -739,11 +768,19 @@ static int sync_host_range_locked(const MemRegion *r, uint64_t lo, uint64_t hi)
     uint64_t run_lo = 0;
     int run_prot = 0;
     int have_run = 0;
+    uint64_t gap_lo = 0;
+    int have_gap = 0;
     for (uint64_t p = lo; p <= hi; p += OCERZ_HOST_PAGE) {
         int has_data = 0;
         int prot = 0;
         if (p < hi)
             prot = page_host_prot(r, pg_index(r, p), host_page_guest_prot(r, p, &has_data));
+        int in_gap = p < hi && !has_data && bit_test(r, pg_index(r, p));
+        if (have_gap && !in_gap) {
+            if (sync_host_gap_locked(r, gap_lo, p) != OCERZ_OK)
+                rc = OCERZ_ENOMEM;
+            have_gap = 0;
+        }
         if (have_run && (p == hi || !has_data || prot != run_prot)) {
             if (mprotect(ocerz_g2h(run_lo), (size_t)(p - run_lo),
                          run_prot) == 0) {
@@ -766,9 +803,10 @@ static int sync_host_range_locked(const MemRegion *r, uint64_t lo, uint64_t hi)
             }
             continue;
         }
-        if (bit_test(r, pg_index(r, p)) &&
-            sync_host_page_locked(r, p) != OCERZ_OK)
-            rc = OCERZ_ENOMEM;
+        if (in_gap && !have_gap) {
+            gap_lo = p;
+            have_gap = 1;
+        }
     }
     return rc;
 }
@@ -1144,7 +1182,7 @@ int ocerz_mem_init_low_shadow(void)
     uint64_t blocksz = OCERZ_LOW_LIMIT + topsz;
     map_lock_acquire();
     if (ocerz_low_base) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_OK;
     }
     uint64_t base = 0;
@@ -1153,7 +1191,7 @@ int ocerz_mem_init_low_shadow(void)
         uint64_t want = strtoull(env, NULL, 0);
         base = reserve_host_fixed(want, blocksz);
         if (base != want) {
-            pthread_mutex_unlock(&map_lock);
+            map_lock_release();
             OCERZ_FATAL("cannot reserve inherited low-shadow base %#llx\n",
                         (unsigned long long)want);
             return OCERZ_ENOMEM;
@@ -1162,7 +1200,7 @@ int ocerz_mem_init_low_shadow(void)
         for (size_t k = 0; k < sizeof candidates / sizeof candidates[0] && !base; k++)
             base = reserve_host_fixed(candidates[k], blocksz);
         if (!base) {
-            pthread_mutex_unlock(&map_lock);
+            map_lock_release();
             OCERZ_FATAL("no host base accepts the %#llx-byte shadow block\n",
                         (unsigned long long)blocksz);
             return OCERZ_ENOMEM;
@@ -1172,12 +1210,12 @@ int ocerz_mem_init_low_shadow(void)
         setenv("OCERZ_LOWBASE", buf, 1);
     }
     if (!region_add(0, OCERZ_LOW_LIMIT) || !region_add(OCERZ_TOP_LO, OCERZ_TOP_HI)) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     ocerz_top_base = base + OCERZ_LOW_LIMIT;
     ocerz_low_base = base;
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     OCERZ_LOG("low shadow window guest [0, %#llx) -> host %#llx; top strip [%#llx, %#llx) -> host %#llx\n",
               (unsigned long long)OCERZ_LOW_LIMIT, (unsigned long long)base,
               (unsigned long long)OCERZ_TOP_LO, (unsigned long long)OCERZ_TOP_HI,
@@ -1191,17 +1229,17 @@ int ocerz_mem_register_range(uint64_t glo, uint64_t ghi)
     uint64_t hi = round_up(ghi);
     map_lock_acquire();
     if (region_for_range(lo, hi)) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_OK;
     }
     if (lo < OCERZ_LOW_LIMIT || reserve_host_fixed(lo, hi - lo) != lo) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     int ok = region_add(lo, hi) != NULL;
     if (!ok)
         mach_vm_deallocate(mach_task_self(), lo, hi - lo);
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     if (ok)
         OCERZ_LOG("registered identity guest range [%#llx, %#llx)\n",
                   (unsigned long long)lo, (unsigned long long)hi);
@@ -1263,7 +1301,7 @@ int ocerz_guest_vm_region(uint64_t *addr, uint64_t *size, unsigned *prot,
                 *size = end - base;
                 *prot = run_prot;
                 *max_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-                pthread_mutex_unlock(&map_lock);
+                map_lock_release();
                 return 1;
             }
             query = cls->ghi;
@@ -1275,7 +1313,7 @@ int ocerz_guest_vm_region(uint64_t *addr, uint64_t *size, unsigned *prot,
         }
         break;
     }
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     *addr = query;
     *size = query < tail_end ? tail_end - query : OCERZ_HOST_PAGE;
     *prot = 0;
@@ -1300,7 +1338,7 @@ int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot)
 {
     map_lock_acquire();
     int rc = map_fixed_locked(gaddr, len, prot, 1);
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     memlog(prot == 0 ? "reserve" : "commit", gaddr, len, prot);
     return rc;
 }
@@ -1328,18 +1366,18 @@ static int map_shared_overlay(uint64_t gaddr, uint64_t len, int prot,
     map_lock_acquire();
     MemRegion *r = region_for_range(lo, hi);
     if (!r) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     for (uint64_t p = data_lo; p < data_hi; p += OCERZ_GUEST_PAGE) {
         if (!slot_is_data(slot_load(r, slot_index(r, p)))) {
-            pthread_mutex_unlock(&map_lock);
+            map_lock_release();
             return OCERZ_ENOMEM;
         }
     }
     for (uint64_t page = lo; page < hi; page += OCERZ_HOST_PAGE) {
         if (shared_load(r, pg_index(r, page)) & MEM_SHARED_PHYSICAL) {
-            pthread_mutex_unlock(&map_lock);
+            map_lock_release();
             return OCERZ_EUNSUP;
         }
         for (uint64_t p = page; p < page + OCERZ_HOST_PAGE;
@@ -1350,7 +1388,7 @@ static int map_shared_overlay(uint64_t gaddr, uint64_t len, int prot,
             unsigned sibling_prot =
                 (state & MEM_SLOT_PROT_MASK) >> MEM_SLOT_PROT_SHIFT;
             if (slot_is_data(state) && sibling_prot != PROT_NONE) {
-                pthread_mutex_unlock(&map_lock);
+                map_lock_release();
                 return OCERZ_EUNSUP;
             }
         }
@@ -1362,13 +1400,13 @@ static int map_shared_overlay(uint64_t gaddr, uint64_t len, int prot,
         if (fd < 0 || fd_flags < 0 || (fd_flags & O_ACCMODE) == O_RDONLY ||
             map_off > INT64_MAX - map_len || fstat(fd, &st) != 0 ||
             st.st_size < 0) {
-            pthread_mutex_unlock(&map_lock);
+            map_lock_release();
             return OCERZ_EUNSUP;
         }
         uint64_t need = map_off + map_len;
         if ((uint64_t)st.st_size < need &&
             ftruncate(fd, (off_t)need) != 0) {
-            pthread_mutex_unlock(&map_lock);
+            map_lock_release();
             return OCERZ_EUNSUP;
         }
     }
@@ -1377,7 +1415,7 @@ static int map_shared_overlay(uint64_t gaddr, uint64_t len, int prot,
     void *got = mmap(want, (size_t)(hi - lo), host_prot(prot),
                      flags, fd, (off_t)map_off);
     if (got == MAP_FAILED || got != want) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     for (uint64_t page = lo; page < hi; page += OCERZ_HOST_PAGE) {
@@ -1398,7 +1436,7 @@ static int map_shared_overlay(uint64_t gaddr, uint64_t len, int prot,
         slot_store(r, i, slot_data_state(slot_owner(state), prot));
     }
     int rc = sync_host_range_locked(r, lo, hi);
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     memlog(op, gaddr, len, prot);
     return rc;
 }
@@ -1435,7 +1473,7 @@ uint64_t ocerz_map_anywhere(uint64_t len, int prot)
                     (unsigned long long)ocerz_arena_lo, (unsigned long long)ocerz_arena_hi,
                     (unsigned long long)(ocerz_arena_hi - bump_next));
         }
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return 0;
     }
     uint64_t data_hi = gaddr + glen;
@@ -1447,7 +1485,7 @@ uint64_t ocerz_map_anywhere(uint64_t len, int prot)
         : OCERZ_ENOMEM;
     if (rc == OCERZ_OK)
         bump_next = guard_hi;
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return rc == OCERZ_OK ? gaddr : 0;
 }
 
@@ -1462,7 +1500,7 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
     map_lock_acquire();
     uint64_t gaddr = find_anywhere_locked(glen, align);
     if (!gaddr) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return 0;
     }
     uint64_t data_hi = gaddr + glen;
@@ -1474,7 +1512,7 @@ uint64_t ocerz_map_anywhere_aligned(uint64_t len, int prot, uint64_t align)
         : OCERZ_ENOMEM;
     if (rc == OCERZ_OK)
         bump_next = guard_hi;
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return rc == OCERZ_OK ? gaddr : 0;
 }
 
@@ -1485,7 +1523,7 @@ void ocerz_mem_prefork(void)
 
 void ocerz_mem_postfork(void)
 {
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
 }
 
 int ocerz_map_hint(uint64_t gaddr, uint64_t len, int prot)
@@ -1499,19 +1537,19 @@ int ocerz_map_hint(uint64_t gaddr, uint64_t len, int prot)
         return OCERZ_ENOMEM;
     map_lock_acquire();
     if (region_for_range(lo, hi)) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     if (reserve_host_fixed(lo, hi - lo) != lo) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     if (!region_add(lo, hi)) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     int rc = map_fixed_locked(lo, hi - lo, prot, 0);
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return rc;
 }
 
@@ -1526,14 +1564,14 @@ int ocerz_map_claim_fixed(uint64_t gaddr, uint64_t len, int prot)
     map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), guard_hi);
     if (!r || lo < alloc_floor || guard_hi > ocerz_arena_hi) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     int rc = install_mapping_locked(r, lo, hi, guard_hi, prot, 0,
                                     lo, hi, NULL);
     if (rc == OCERZ_OK && lo == bump_next)
         bump_next = guard_hi;
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return rc;
 }
 
@@ -1545,7 +1583,7 @@ uint64_t ocerz_map_donate(uint64_t len)
     map_lock_acquire();
     uint64_t gaddr = find_anywhere_locked(glen, OCERZ_HOST_PAGE);
     if (!gaddr) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return 0;
     }
     uint64_t data_hi = gaddr + glen;
@@ -1561,13 +1599,13 @@ uint64_t ocerz_map_donate(uint64_t len)
                                        &affected_lo, &affected_hi);
     }
     if (!owner) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return 0;
     }
     bump_next = guard_hi;
     for (uint64_t p = gaddr; p < data_hi; p += OCERZ_HOST_PAGE)
         bit_set(r, pg_index(r, p));
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return gaddr;
 }
 
@@ -1579,12 +1617,12 @@ int ocerz_map_claim_region(uint64_t gaddr, uint64_t len, int prot)
     map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     if (!r || (r->glo == ocerz_arena_lo && r->ghi == ocerz_arena_hi)) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     int rc = install_mapping_locked(r, lo, hi, hi, prot, 0,
                                     lo, hi, NULL);
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return rc;
 }
 
@@ -1614,7 +1652,7 @@ int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
         }
         rc = sync_host_range_locked(r, lo, hi);
     }
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     memlog(host_prot(prot) == (PROT_READ | PROT_WRITE) ? "prot-rw" : "prot-ro",
            gaddr, len, prot);
     return rc;
@@ -1628,14 +1666,14 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len)
     map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     if (!r) {
-        pthread_mutex_unlock(&map_lock);
+        map_lock_release();
         return OCERZ_ENOMEM;
     }
     uint64_t affected_lo = UINT64_MAX, affected_hi = 0;
     for (uint64_t p = lo; p < hi; p += OCERZ_GUEST_PAGE)
         release_slot_locked(r, p, &affected_lo, &affected_hi);
     int rc = sync_host_range_locked(r, affected_lo, affected_hi);
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     memlog("unmap", gaddr, len, 0);
 
     if (gaddr <= 0x10000ull && hi >= 0x100000000ull)
@@ -1691,7 +1729,7 @@ int ocerz_mem_arm_exec(uint64_t lo, uint64_t hi)
             }
         }
     }
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return n;
 }
 
@@ -1715,7 +1753,7 @@ int ocerz_mem_disarm_range(uint64_t lo, uint64_t hi, uint64_t *pages, int max)
             pages[n++] = page;
         }
     }
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return n;
 }
 
@@ -1739,7 +1777,7 @@ int ocerz_mem_disarm_all(uint64_t *pages, int max)
             pages[n++] = page;
         }
     }
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return n;
 }
 
@@ -1765,7 +1803,7 @@ int ocerz_mem_exec_write_fault(uint64_t gaddr)
             hit = 2;
         }
     }
-    pthread_mutex_unlock(&map_lock);
+    map_lock_release();
     return hit;
 }
 
