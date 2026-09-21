@@ -60,7 +60,7 @@ Native mode reads its API database from `runtime/apis` beside the `ocerz` binary
 | native-mode gate (`-native`) | 87 / 87 (macOS 27, 2026-09-21) |
 | native-mode unit suites: API database, image, bridge, ABI, callbacks, thread attach, Objective-C, blocks | 334 / 0, 140626 / 0, 1247 / 0, 28071 / 0, 131974 / 0, 270 / 0, 125400 / 0, 107 / 0 |
 | in-place string and memory routines against the host's | 6,736,902 / 0 |
-| real macOS apps opening their main window | 9 in cache mode, 3 in native mode (see [Application compatibility](#application-compatibility)) |
+| real macOS apps opening their main window | 10 in cache mode, 3 in native mode (see [Application compatibility](#application-compatibility)) |
 | xbench output vs native | 15 / 15 kernels bit-identical |
 | xbench speed vs Rosetta | static build 11 wins and 4 losses of at most 5%; dynamically linked build 14 wins, 1 loss of 3% (tables below) |
 | Wine boot (MacNdCheese build, `cmd /c ver`) | 14 s |
@@ -95,6 +95,7 @@ means the app drew its main window on screen and stayed up.
 | Activity Monitor | window on screen; its force-quit support library is not in the x86-64 shared cache |
 | Console | window on screen; logs a missing optional library |
 | TextEdit / Preview / Script Editor | run; open a document window when given a file to open |
+| Safari | works (2026-09-21, owner-confirmed): the browser runs and browses. It is not part of any gate, and its startup has not been timed. |
 | Steam (x86-64 client) | works with `-cef-disable-gpu` (2026-09-12): bootstrapper, `ipcserver`, client and the CEF web helper with GPU, utility and renderer processes; the window draws with software rendering. Some launches still stall before the web UI starts. See [Steam](#steam). |
 
 Command-line tools match their native output byte for byte
@@ -111,8 +112,9 @@ Ollama's command-line binary (`Contents/Resources/ollama`, Go with cgo) works as
 
 The Ollama menu-bar app runs too. In a 30-second run it started its own server, served its settings page to its window and shut down cleanly on SIGTERM. Before that, WebKit's allocator stopped it within 10 seconds because it could not suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`): workqueue threads that AArchX started ended without running the guest's thread-exit path. Nobody has yet run a model under AArchX.
 
+Safari took the longest to get there. It used to start and never show a window: in a run on 2026-09-13, WebKit's allocator failed to suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`) and stopped the process. The main thread was missing from AArchX's thread-suspension emulation, and workqueue threads that AArchX started ended without running the guest's thread-exit path; both were fixed that day, and the WebKit work continued through macOS 27.
+
 Not working yet:
-- **Safari** used to start and never show a window: in a run on 2026-09-13, WebKit's allocator failed to suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`) and stopped the process. Two causes of that failure were fixed the same day. The main thread was missing from AArchX's thread-suspension emulation, and workqueue threads that AArchX started ended without running the guest's thread-exit path. Safari was reported running under AArchX on 2026-09-16; it is not part of any gate and has not been measured beyond that.
 - **Photos** aborted in `+[PAOpenGLDevice _sharedPixelFormat:]` because `CGLChoosePixelFormat` returned 10002 for every attribute set. The cause was in AArchX's dyld, not the Rosetta-only `AppleMetalGLRenderer` IOKit service blamed earlier. `_dyld_shared_cache_contains_path` rejected the software renderer's plugin path, which runs through a symlink, and `dlsym` on a shared-cache image searched the whole cache. Both are fixed, and CGL now lists the same renderers and builds the same pixel formats as under Rosetta. Photos has not been run again since.
 
 ## Steam
