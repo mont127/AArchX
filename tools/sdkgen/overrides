@@ -16,6 +16,16 @@
 # record that matches nothing in its library stops the generator, so a name
 # that leaves the SDK is noticed rather than kept.
 #
+# inplace <export> <argpos> <offset> <signature> is for a structure the guest
+# owns and the native function works in, a compression stream above all: zlib
+# reads its input and writes its progress in the z_stream the caller holds, so
+# the structure cannot be copied as a shape is, and two of its words are the
+# caller's allocation functions.  The record names one such word, which the
+# bridge converts where it lies for the length of the call and puts back
+# afterwards unless the native function stored something of its own there, as
+# zlib does when it finds the word empty.  It also lifts the rule that would
+# have stubbed the export for taking such a structure.
+#
 # ---- format veneers ----
 # A variadic function cannot cross by signature: Apple's arm64 passes every
 # variadic argument on the stack while x86-64 passes the first ones in
@@ -26,8 +36,10 @@
 # guest memory, walks its conversions to learn the class of each argument that
 # follows, gathers them from the x86 registers and stack in that order, and
 # makes the native call with them where arm64 wants them.  The group is printf,
-# fprintf, sprintf, snprintf, asprintf, dprintf and the fortified __sprintf_chk
-# and __snprintf_chk in libSystem, CFStringCreateWithFormat and
+# fprintf, sprintf, snprintf, asprintf, dprintf, syslog, warn, warnx, the wide
+# swprintf, wprintf and fwprintf, whose format is read a wchar_t at a time, and
+# the fortified __sprintf_chk and __snprintf_chk in libSystem,
+# CFStringCreateWithFormat and
 # CFStringAppendFormat in CoreFoundation, and NSLog in Foundation, whose %@
 # conversions are object pointers like any other.  Every other variadic
 # function, and every v form taking a va_list, stays a stub, apart from the few
@@ -74,7 +86,13 @@
 # __memcpy_chk and its siblings instead of memcpy, but the SDK only declares
 # the builtins that expand to them, so no header gives a signature; these are
 # the builtins' own, the plain function's arguments plus the destination size.
-# __bzero is libsystem_platform's entry for bzero, at the same address.
+# __bzero is libsystem_platform's entry for bzero, at the same address.  It is
+# declared void, but on x86_64 it shares its body with memset and leaves the
+# destination in rax, and compiled code relies on that: clang turns a function
+# that clears a buffer and returns it into a tail call to __bzero and lets the
+# callee's rax be the result.  A crossing under v(pL) writes no result, so the
+# caller read whatever rax last held.  bzero and __bzero are therefore special,
+# and their handler answers the destination.
 #
 # Process creation and replacement: fork, vfork and forkpty would duplicate
 # ocerz's translator state with no guest-side bookkeeping, and the exec family,
@@ -82,10 +100,96 @@
 # daemon and wordexp, which runs a shell, would start an x86 image with no
 # translator under it.  ocerz has to launch those through itself.
 #
-# Thread exit and cancellation: pthread_exit, pthread_cancel, pthread_testcancel
-# and dispatch_main, which parks the main thread with pthread_exit, unwind a
-# host thread through ocerz's own frames.  __tlv_atexit and __tlv_exit belong to
-# the thread-local storage ocerz keeps for the guest, not to host dyld's.
+# Thread cancellation: pthread_cancel, pthread_testcancel and dispatch_main,
+# which parks the main thread for good, unwind a host thread through ocerz's own
+# frames.  __tlv_atexit and __tlv_exit belong to the thread-local storage ocerz
+# keeps for the guest, not to host dyld's.
+#
+# Private entry points.  The compiler's out-of-line atomics, the guarded file
+# descriptor calls Chromium wraps every descriptor in, the responsibility and
+# sandbox calls and proc_get_wakemon_params are in no SDK header, so the rules
+# can only stub them, but their signatures are fixed and public in Apple's open
+# sources, and they cross under those.  sandbox_check is variadic with at most
+# one pointer after its filter type, and abort_report_np takes a format; each
+# has a handler.  sandbox_init, sandbox_init_with_parameters, libsandbox's
+# sandbox_apply and __sandbox_ms, which Chromium calls itself to apply a profile
+# its browser process compiled, confine ocerz along with the guest, and a
+# profile that denies reading outside the program's own files denies ocerz its
+# databases, so their handlers load every database before the native call is
+# made.  The exception-port calls are recorded and answered with success
+# and no previous handlers, never installed: a fault in translated code has to
+# reach ocerz's own handler, which a port set on the task would take first.
+# mach_vm_map and mach_vm_remap, and their vm_ spellings, reach the host kernel:
+# native mode runs in the identity map, where an address the kernel chooses is
+# one the guest can use, and a fixed address first loses whatever translations
+# were made from it.  IOKit still exports the SCDynamicStore and SCPreferences
+# calls it held before SystemConfiguration took them, and a program linked
+# against an old SDK binds them there: IOKit's header pass reads
+# SystemConfiguration's headers so they cross under the same signatures, and the
+# store's context structure is recorded for IOKit as well.
+#
+# Thread-specific data.  On x86_64 macOS pthread_getspecific is one instruction,
+# a load from gs at eight times the key, and compilers and libraries inline it:
+# Chromium reads its thread-local slots that way eighty times over.  A key made
+# by the host's pthread_key_create names a slot in the host thread's storage,
+# which no gs-relative load in guest code can reach, so a value stored through
+# the function read back as null through the inline load.  pthread_key_create,
+# pthread_key_delete, pthread_setspecific and pthread_getspecific are special:
+# the keys are ocerz's own, numbered 256 to 767 as the dynamic keys of the real
+# library are, and their values live at those slots of the guest thread block
+# gs points into, where both the function and the instruction find them.
+# pthread_create is special so that the start routine runs inside a frame of
+# ocerz's that calls the keys' destructors, as guest code, when the routine
+# returns, and pthread_exit is special so that it runs them too before it ends
+# the host thread.  errno is thread-specific data of the same kind: ___error
+# answers a slot of the guest thread block, which ocerz copies to and from the
+# host's errno at the edges of every native call, because between two guest
+# instructions ocerz's own code runs on the same host thread and leaves its own
+# errors behind.
+#
+# The page size.  This host's pages are 16 KB and an Intel Mac's are 4 KB, which
+# x86 programs are compiled knowing: Chromium's allocator works in 4 KB pages by
+# constant while V8 beside it asks sysconf, and stops when the two disagree.
+# ocerz's memory layer gives the guest 4 KB pages over the host's, so everything
+# that tells the guest the page size tells it 4096: getpagesize, sysconf for
+# _SC_PAGESIZE, host_page_size, the hw.pagesize and vm.pagesize sysctls, and
+# vm_page_size, vm_kernel_page_size and their masks and shifts, which are
+# variables of the image's own rather than the host's.
+#
+# Stopping a thread.  thread_suspend and thread_resume go through ocerz's own
+# suspension, as thread_get_state already does: a guest thread stopped by the
+# kernel wherever it happens to be may be holding the translator's lock, and
+# then the thread that stopped it waits for that lock the first time it needs a
+# block translated, which is a program's sampling profiler freezing the whole
+# process.  ocerz stops a thread only outside the translator, and takes one that
+# is inside a native call as it is, with the guest registers it crossed with.
+#
+# The stack.  Guest code runs on a stack ocerz made for it, not on its host
+# thread's, so pthread_get_stackaddr_np and pthread_get_stacksize_np answer that
+# stack for a thread that has one: a collector that scans from its stack pointer
+# up to the address the first gives, as V8's does, would otherwise be handed a
+# top below where it stands.
+#
+# Malloc zones.  A zone is a structure of function pointers, and a program may
+# do more than call through one: Chromium saves the default zone's pointers and
+# writes its own over them, so that every allocation passes its out-of-memory
+# check.  Written into the host's zone those x86 pointers are the next thing the
+# host's own calloc jumps to.  The guest therefore never holds a host zone: each
+# call that answers one - malloc_default_zone, malloc_default_purgeable_zone,
+# malloc_create_zone, malloc_get_all_zones, malloc_zone_from_ptr - answers a
+# view of it, a zone structure in a page of the guest's own, the same view every
+# time, whose pointers are thunks the guest can call and which reach the host
+# zone's functions with the host zone in place of the view.  What the guest
+# writes into a view changes what the guest's own malloc_zone_ calls do and
+# nothing else.  A zone the guest registers is recorded and never registered
+# with the host's allocator, which would call it.  The malloc_zone_ calls look
+# at the zone they are given: where its pointer is the guest's, in a zone of its
+# own or written over a view's, the call becomes a jump to that function with
+# the arguments where they already are, and otherwise it is the host call on the
+# host zone.  malloc_zone_from_ptr asks the host, and then each guest zone's own
+# size function.  malloc_set_zone_name writes the name into a guest zone or a
+# view itself, because the host's would leave the zone's page read-only, and a
+# host page is four guest pages.
 #
 # Non-local jumps and contexts: setjmp and longjmp in every spelling, and the
 # ucontext calls, save or restore arm64 host registers where the guest meant
@@ -235,6 +339,15 @@
 # not anything is ever thrown, and objc_ehtype_vtable for the same reason: the
 # compiler points the exception type it emits for a guest's own class at it.
 #
+# Implementations handed to the guest.  method_getImplementation and
+# class_getMethodImplementation answer an IMP, and class_replaceMethod and
+# method_setImplementation the one they displaced, and a guest calls what it is
+# given: Chromium replaces +[NSObject allocWithZone:] and calls the original on
+# every allocation.  A native IMP is arm64 code, so under a plain signature these
+# would hand x86 code an address it cannot run.  They are special, and their
+# handlers answer the guest's own function when the IMP is one of ocerz's
+# trampolines onto it, and a thunk the guest can call for any other.
+#
 # Class metadata.  Every class a guest defines has its method cache pointing at
 # _objc_empty_cache, so a program with a single class of its own fails to bind
 # unless that variable is a data export, although no header declares it.
@@ -249,16 +362,6 @@
 # libobjc exports no map_images, load_images or unmap_image under those names.
 # objc_setEnumerationMutationHandler takes a function the rules can carry as a
 # callback, so it crosses.
-#
-# Building classes out of guest code.  class_addMethod, class_replaceMethod,
-# the bulk forms of both, method_setImplementation and its raw form,
-# imp_implementationWithBlock, class_addIvar, objc_allocateClassPair and
-# objc_registerClassPair would hand the native runtime an x86 IMP, and a native
-# class holding one crashes the first time the method is sent.  A later
-# milestone gives guest classes trampolines; until then these name themselves.
-# An IMP is otherwise an opaque pointer in both directions, so
-# method_getImplementation crosses and hands back native code the guest may
-# compare but not call.
 #
 # Entry points the compiler calls.  ARC, property accessors, object allocation
 # and the retain and release fast paths call objc_retain,
@@ -344,6 +447,7 @@
 library /usr/lib/libSystem.B.dylib
 
 special _exit exit
+special ___error error
 special __exit exit_now
 special __Exit exit_now
 special _abort abort
@@ -363,18 +467,80 @@ special _printf printf
 special _fprintf fprintf
 special _sprintf sprintf
 special _snprintf snprintf
+special _snprintf_l snprintf_l
 special _asprintf asprintf
 special _dprintf dprintf
 special ___sprintf_chk sprintf_chk
 special ___snprintf_chk snprintf_chk
+special _vprintf vprintf
+special _vfprintf vfprintf
+special _vsprintf vsprintf
+special _vsnprintf vsnprintf
+special _vsnprintf_l vsnprintf_l
+special _vasprintf vasprintf
+special _vdprintf vdprintf
+special _swprintf swprintf
+special _wprintf wprintf
+special _fwprintf fwprintf
+special _vswprintf vswprintf
+special _vwprintf vwprintf
+special _vfwprintf vfwprintf
+special _syslog syslog
+special _syslog$DARWIN_EXTSN syslog
+special _vsyslog vsyslog
+special _warn warn
+special _warnx warnx
+special _vwarn vwarn
+special _vwarnx vwarnx
+special ___vsprintf_chk vsprintf_chk
+special ___vsnprintf_chk vsnprintf_chk
+special _sscanf sscanf
+special _scanf scanf
+special _fscanf fscanf
+special _vsscanf vsscanf
+special _vscanf vscanf
+special _vfscanf vfscanf
 var ___stack_chk_guard 8 stack_guard
+var _vm_page_size 8 page_size
+var _vm_page_mask 8 page_mask
+var _vm_page_shift 4 page_shift
+var _vm_kernel_page_size 8 page_size
+var _vm_kernel_page_mask 8 page_mask
+var _vm_kernel_page_shift 4 page_shift
+special _pthread_get_stackaddr_np pthread_get_stackaddr_np
+special _pthread_get_stacksize_np pthread_get_stacksize_np
+special _thread_suspend thread_suspend
+special _thread_resume thread_resume
+special _getpagesize getpagesize
+special _sysconf sysconf
+special _host_page_size host_page_size
+special _sysctl sysctl
+special _sysctlbyname sysctlbyname
 stub _quick_exit override
 
 opaque __sFILE
 
 omit _vprintf_stderr_func
 
-fn ___bzero bzero v(pL)
+special ___bzero bzero
+special _bzero bzero
+special _malloc_default_zone malloc_default_zone
+special _malloc_default_purgeable_zone malloc_default_purgeable_zone
+special _malloc_get_all_zones malloc_get_all_zones
+special _malloc_zone_register malloc_zone_register
+special _malloc_zone_unregister malloc_zone_unregister
+special _malloc_zone_malloc malloc_zone_malloc
+special _malloc_zone_calloc malloc_zone_calloc
+special _malloc_zone_valloc malloc_zone_valloc
+special _malloc_zone_free malloc_zone_free
+special _malloc_zone_realloc malloc_zone_realloc
+special _malloc_zone_memalign malloc_zone_memalign
+special _malloc_zone_pressure_relief malloc_zone_pressure_relief
+special _malloc_destroy_zone malloc_destroy_zone
+special _malloc_create_zone malloc_create_zone
+special _malloc_zone_from_ptr malloc_zone_from_ptr
+special _malloc_get_zone_name malloc_get_zone_name
+special _malloc_set_zone_name malloc_set_zone_name
 fn ___memccpy_chk __memccpy_chk p(ppiLL)
 fn ___memcpy_chk __memcpy_chk p(ppLL)
 fn ___memmove_chk __memmove_chk p(ppLL)
@@ -387,6 +553,11 @@ fn ___strlcat_chk __strlcat_chk L(ppLL)
 fn ___strlcpy_chk __strlcpy_chk L(ppLL)
 fn ___strncat_chk __strncat_chk p(ppLL)
 fn ___strncpy_chk __strncpy_chk p(ppLL)
+fn _fts_children$INODE64 fts_children p(pi)
+fn _fts_close$INODE64 fts_close i(p)
+fn _fts_open$INODE64 fts_open p(pic{i(pp)})
+fn _fts_read$INODE64 fts_read p(p)
+fn _fts_set$INODE64 fts_set i(ppi)
 
 stub ___fork override
 stub ___vfork override
@@ -396,11 +567,16 @@ stub ___execve override
 stub ___posix_spawn override
 stub _wordexp override
 
-stub _pthread_exit override
+special _pthread_exit pthread_exit
+special _pthread_create pthread_create
+special _pthread_key_create pthread_key_create
+special _pthread_key_delete pthread_key_delete
+special _pthread_setspecific pthread_setspecific
+special _pthread_getspecific pthread_getspecific
 stub _pthread_cancel override
 stub _pthread_testcancel override
 stub _dispatch_main override
-stub __tlv_atexit override
+fn __tlv_atexit _tlv_atexit v(c{v(p)}p)
 stub __tlv_exit override
 
 stub _longjmperror override
@@ -418,8 +594,11 @@ special _dlopen dlopen
 special _dlopen_audited dlopen
 special _dlopen_from dlopen_from
 special _dlopen_preflight dlopen_preflight
+special __availability_version_check availability_version_check
 special _dlsym dlsym
 special _dladdr dladdr
+special __dyld_find_unwind_sections dyld_unwind_sections
+fn ___cxa_atexit __cxa_atexit i(c{v(p)}pp)
 special _dlclose dlclose
 special _dlerror dlerror
 special __dyld_image_count dyld_image_count
@@ -487,11 +666,11 @@ special __NSGetMachExecuteHeader NSGetMachExecuteHeader
 stub ___mmap override
 stub ___munmap override
 stub ___mprotect override
-stub _mach_vm_map override
-stub _mach_vm_remap override
+special _mach_vm_map mach_vm_map
+special _mach_vm_remap mach_vm_remap
 stub _mach_vm_remap_new override
-stub _vm_map override
-stub _vm_remap override
+special _vm_map mach_vm_map
+special _vm_remap mach_vm_remap
 stub _vm_remap_new override
 
 stub _syscall override
@@ -525,20 +704,46 @@ stub __sigaction_nobind override
 stub __signal_nobind override
 stub __sigvec_nobind override
 
-stub _thread_get_state override
+special _thread_get_state thread_get_state
 stub _thread_set_state override
 stub _act_get_state override
 stub _act_set_state override
 stub _task_get_state override
 stub _task_set_state override
 stub _thread_create_running override
-stub _task_set_exception_ports override
-stub _task_swap_exception_ports override
-stub _thread_set_exception_ports override
-stub _thread_swap_exception_ports override
+special _task_set_exception_ports task_set_exception_ports
+special _task_swap_exception_ports swap_exception_ports
+special _thread_set_exception_ports task_set_exception_ports
+special _thread_swap_exception_ports swap_exception_ports
 stub _thread_adopt_exception_handler override
-stub _host_set_exception_ports override
-stub _host_swap_exception_ports override
+special _host_set_exception_ports task_set_exception_ports
+special _host_swap_exception_ports swap_exception_ports
+
+fn ___atomic_load __atomic_load v(Lppi)
+fn ___atomic_store __atomic_store v(Lppi)
+fn ___atomic_exchange __atomic_exchange v(Lpppi)
+fn ___atomic_compare_exchange __atomic_compare_exchange B(Lpppii)
+fn ___atomic_is_lock_free __atomic_is_lock_free B(Lp)
+fn _change_fdguard_np change_fdguard_np i(ipupup)
+fn _guarded_close_np guarded_close_np i(ip)
+fn _guarded_write_np guarded_write_np l(ippL)
+fn _guarded_pwrite_np guarded_pwrite_np l(ippLl)
+fn _guarded_writev_np guarded_writev_np l(ippi)
+fn _guarded_kqueue_np guarded_kqueue_np i(pu)
+fn _proc_get_wakemon_params proc_get_wakemon_params i(ipp)
+fn _responsibility_spawnattrs_setdisclaim responsibility_spawnattrs_setdisclaim i(pi)
+fn _responsibility_get_pid_responsible_for_pid responsibility_get_pid_responsible_for_pid i(i)
+special _sandbox_init sandbox_init
+special _sandbox_init_with_parameters sandbox_init_with_parameters
+fn _sandbox_extension_consume sandbox_extension_consume l(p)
+fn _sandbox_extension_issue_file sandbox_extension_issue_file p(ppu)
+fn _sandbox_extension_release sandbox_extension_release i(l)
+special ___sandbox_ms sandbox_ms
+special _sandbox_check sandbox_check
+fn _dns_configuration_notify_key dns_configuration_notify_key p()
+fn _dns_configuration_copy dns_configuration_copy p()
+fn _dns_configuration_free dns_configuration_free v(p)
+special _abort_report_np abort_report
 
 stub _*printf* override
 stub _*scanf* override
@@ -595,10 +800,12 @@ library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFound
 data ___CFConstantStringClassReference __CFConstantStringClassReference
 special _CFStringCreateWithFormat CFStringCreateWithFormat
 special _CFStringAppendFormat CFStringAppendFormat
+special _CFUUIDGetConstantUUIDWithBytes cfuuid_constant
 
 shape CFArrayCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
 shape CFDictionaryKeyCallBacks 0 6 - p(pp) v(pp) p(p) B(pp) L(p)
 shape CFDictionaryValueCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
+shape CFAllocatorContext 0 9 - - p(p) v(p) p(p) p(lLp) p(plLp) v(pp) l(lLp)
 shape CFRunLoopTimerContext 0 5 - - p(p) v(p) p(p)
 shape CFRunLoopObserverContext 0 5 - - p(p) v(p) p(p)
 shape CFRunLoopSourceContext 0 10 - - p(p) v(p) p(p) B(pp) L(p) v(ppp) v(ppp) v(p)
@@ -610,6 +817,7 @@ struct _CFDictionaryCreate 4 CFDictionaryKeyCallBacks
 struct _CFDictionaryCreate 5 CFDictionaryValueCallBacks
 struct _CFDictionaryCreateMutable 2 CFDictionaryKeyCallBacks
 struct _CFDictionaryCreateMutable 3 CFDictionaryValueCallBacks
+struct _CFAllocatorCreate 1 CFAllocatorContext
 struct _CFRunLoopTimerCreate 6 CFRunLoopTimerContext
 struct _CFRunLoopObserverCreate 5 CFRunLoopObserverContext
 struct _CFRunLoopSourceCreate 2 CFRunLoopSourceContext
@@ -664,16 +872,18 @@ stub __objc_init override
 stub __objc_map_images override
 stub __objc_load_image override
 
-stub _class_addMethod override
+special _class_addMethod class_addMethod
 stub _class_addMethodsBulk override
-stub _class_replaceMethod override
+special _class_replaceMethod class_replaceMethod
+special _class_getMethodImplementation class_getMethodImplementation
+special _method_getImplementation method_getImplementation
 stub _class_replaceMethodsBulk override
-stub _method_setImplementation override
+special _method_setImplementation method_setImplementation
 stub __method_setImplementationRawUnsafe override
 stub _imp_implementationWithBlock override
-stub _class_addIvar override
-stub _objc_allocateClassPair override
-stub _objc_registerClassPair override
+fn _class_addIvar class_addIvar b(ppLBp)
+special _objc_allocateClassPair objc_allocateClassPair
+fn _objc_registerClassPair objc_registerClassPair v(p)
 
 fn __objc_autoreleasePoolPop _objc_autoreleasePoolPop v(p)
 fn __objc_autoreleasePoolPrint _objc_autoreleasePoolPrint v()
@@ -766,3 +976,209 @@ special __Block_object_assign Block_object_assign
 library /usr/lib/libobjc.A.dylib
 
 special _objc_retainBlock Block_copy
+
+library /System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork
+
+shape CFHostClientContext 0 5 - - p(p) v(p) p(p)
+shape CFNetServiceClientContext 0 5 - - p(p) v(p) p(p)
+shape CFStreamClientContext 0 5 - - p(p) v(p) p(p)
+
+struct _CFHostSetClient 2 CFHostClientContext
+struct _CFNetServiceBrowserCreate 2 CFNetServiceClientContext
+struct _CFNetServiceMonitorCreate 3 CFNetServiceClientContext
+struct _CFNetServiceSetClient 2 CFNetServiceClientContext
+struct _CFNetworkExecuteProxyAutoConfigurationScript 3 CFStreamClientContext
+struct _CFNetworkExecuteProxyAutoConfigurationURL 3 CFStreamClientContext
+
+library /System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration
+
+shape SCDynamicStoreContext 0 5 - - p(p) v(p) p(p)
+shape SCNetworkConnectionContext 0 5 - - p(p) v(p) p(p)
+shape SCNetworkReachabilityContext 0 5 - - p(p) v(p) p(p)
+shape SCPreferencesContext 0 5 - - p(p) v(p) p(p)
+
+struct _SCDynamicStoreCreate 3 SCDynamicStoreContext
+struct _SCDynamicStoreCreateWithOptions 4 SCDynamicStoreContext
+struct _SCNetworkConnectionCreateWithServiceID 3 SCNetworkConnectionContext
+struct _SCNetworkReachabilitySetCallback 2 SCNetworkReachabilityContext
+struct _SCPreferencesSetCallback 2 SCPreferencesContext
+
+library /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
+
+stub _LSOpen* process-launch
+
+library /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
+
+fn __CGSDefaultConnection _CGSDefaultConnection i()
+fn _CGDisplayBitsPerPixel CGDisplayBitsPerPixel L(u)
+fn _CGDisplayBitsPerSample CGDisplayBitsPerSample L(u)
+fn _CGDisplaySamplesPerPixel CGDisplaySamplesPerPixel L(u)
+fn _CGDisplayBytesPerRow CGDisplayBytesPerRow L(u)
+fn _CGDisplayBaseAddress CGDisplayBaseAddress p(u)
+fn _CGSMainConnectionID CGSMainConnectionID i()
+fn _CGDisplayUsesForceToGray CGDisplayUsesForceToGray B()
+fn _CGFontRenderingGetFontSmoothingDisabled CGFontRenderingGetFontSmoothingDisabled B()
+fn _CGSSetDenyWindowServerConnections CGSSetDenyWindowServerConnections i(B)
+fn _CGSSetWindowAlpha CGSSetWindowAlpha i(iuf)
+fn _CGSSetWindowTransform CGSSetWindowTransform i(iu{dddddd})
+fn _CGSSetWindowWarp CGSSetWindowWarp i(iuiip)
+fn _CGDirectDisplayCopyCurrentMetalDevice CGDirectDisplayCopyCurrentMetalDevice p(u)
+
+library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+
+fn __CFCopySystemVersionDictionary _CFCopySystemVersionDictionary p()
+fn __CFURLCopyPropertyListRepresentation _CFURLCopyPropertyListRepresentation p(p)
+fn __CFURLCreateFromPropertyListRepresentation _CFURLCreateFromPropertyListRepresentation p(pp)
+fn _CFStringGetRangeOfCharacterClusterAtIndex CFStringGetRangeOfCharacterClusterAtIndex {ll}(pll)
+
+library /System/Library/Frameworks/CoreText.framework/Versions/A/CoreText
+
+fn _CTFontDescriptorIsSystemUIFont CTFontDescriptorIsSystemUIFont B(p)
+
+library /System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices
+
+fn _AXValueGetTypeID AXValueGetTypeID L()
+fn _SetApplicationIsDaemon SetApplicationIsDaemon h(B)
+
+library /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
+
+fn __NSInitializeKillRing _NSInitializeKillRing v()
+fn __NSNewKillRingSequence _NSNewKillRingSequence v()
+fn __NSSetKillRingToYankedState _NSSetKillRingToYankedState v()
+fn __NSAppendToKillRing _NSAppendToKillRing v(p)
+fn __NSYankFromKillRing _NSYankFromKillRing p()
+
+library /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
+
+fn __LSSetApplicationLaunchServicesServerConnectionStatus _LSSetApplicationLaunchServicesServerConnectionStatus p(Lk{B(p)})
+fn _MDItemSetAttribute MDItemSetAttribute B(ppp)
+fn __CSCheckFixDisable _CSCheckFixDisable B(i)
+fn _FSEventStreamCreate FSEventStreamCreate p(pc{v(ppLppp)}ppLdu)
+fn _FSEventStreamCreateRelativeToDevice FSEventStreamCreateRelativeToDevice p(pc{v(ppLppp)}pippLdu)
+
+shape FSEventStreamContext 0 5 - - p(p) v(p) p(p)
+
+struct _FSEventStreamCreate 2 FSEventStreamContext
+struct _FSEventStreamCreateRelativeToDevice 2 FSEventStreamContext
+
+library /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
+
+fn _IODisplayCreateInfoDictionary IODisplayCreateInfoDictionary p(uu)
+
+shape SCDynamicStoreContext 0 5 - - p(p) v(p) p(p)
+
+struct _SCDynamicStoreCreate 3 SCDynamicStoreContext
+
+library /usr/lib/libsandbox.1.dylib
+
+fn _sandbox_create_params sandbox_create_params p()
+fn _sandbox_set_param sandbox_set_param i(ppp)
+fn _sandbox_free_params sandbox_free_params v(p)
+fn _sandbox_compile_string sandbox_compile_string p(ppp)
+special _sandbox_apply sandbox_apply
+fn _sandbox_free_profile sandbox_free_profile v(p)
+
+library /usr/lib/libobjc.A.dylib
+
+special _objc_setExceptionPreprocessor objc_setExceptionPreprocessor
+
+library /usr/lib/libresolv.9.dylib
+
+fn _res_9_ninit res_9_ninit i(p)
+fn _res_9_ndestroy res_9_ndestroy v(p)
+fn _res_9_nclose res_9_nclose v(p)
+fn _res_9_getservers res_9_getservers i(ppi)
+
+library /usr/lib/libz.1.dylib
+
+inplace _deflate 0 64 p(puu)
+inplace _deflate 0 72 v(pp)
+inplace _deflateBound 0 64 p(puu)
+inplace _deflateBound 0 72 v(pp)
+inplace _deflateCopy 0 64 p(puu)
+inplace _deflateCopy 0 72 v(pp)
+inplace _deflateCopy 1 64 p(puu)
+inplace _deflateCopy 1 72 v(pp)
+inplace _deflateEnd 0 64 p(puu)
+inplace _deflateEnd 0 72 v(pp)
+inplace _deflateGetDictionary 0 64 p(puu)
+inplace _deflateGetDictionary 0 72 v(pp)
+inplace _deflateInit2_ 0 64 p(puu)
+inplace _deflateInit2_ 0 72 v(pp)
+inplace _deflateInit_ 0 64 p(puu)
+inplace _deflateInit_ 0 72 v(pp)
+inplace _deflateParams 0 64 p(puu)
+inplace _deflateParams 0 72 v(pp)
+inplace _deflatePending 0 64 p(puu)
+inplace _deflatePending 0 72 v(pp)
+inplace _deflatePrime 0 64 p(puu)
+inplace _deflatePrime 0 72 v(pp)
+inplace _deflateReset 0 64 p(puu)
+inplace _deflateReset 0 72 v(pp)
+inplace _deflateResetKeep 0 64 p(puu)
+inplace _deflateResetKeep 0 72 v(pp)
+inplace _deflateSetDictionary 0 64 p(puu)
+inplace _deflateSetDictionary 0 72 v(pp)
+inplace _deflateSetHeader 0 64 p(puu)
+inplace _deflateSetHeader 0 72 v(pp)
+inplace _deflateTune 0 64 p(puu)
+inplace _deflateTune 0 72 v(pp)
+inplace _inflate 0 64 p(puu)
+inplace _inflate 0 72 v(pp)
+inplace _inflateBack 0 64 p(puu)
+inplace _inflateBack 0 72 v(pp)
+inplace _inflateBackEnd 0 64 p(puu)
+inplace _inflateBackEnd 0 72 v(pp)
+inplace _inflateBackInit_ 0 64 p(puu)
+inplace _inflateBackInit_ 0 72 v(pp)
+inplace _inflateCodesUsed 0 64 p(puu)
+inplace _inflateCodesUsed 0 72 v(pp)
+inplace _inflateCopy 0 64 p(puu)
+inplace _inflateCopy 0 72 v(pp)
+inplace _inflateCopy 1 64 p(puu)
+inplace _inflateCopy 1 72 v(pp)
+inplace _inflateEnd 0 64 p(puu)
+inplace _inflateEnd 0 72 v(pp)
+inplace _inflateGetDictionary 0 64 p(puu)
+inplace _inflateGetDictionary 0 72 v(pp)
+inplace _inflateGetHeader 0 64 p(puu)
+inplace _inflateGetHeader 0 72 v(pp)
+inplace _inflateInit2_ 0 64 p(puu)
+inplace _inflateInit2_ 0 72 v(pp)
+inplace _inflateInit_ 0 64 p(puu)
+inplace _inflateInit_ 0 72 v(pp)
+inplace _inflateMark 0 64 p(puu)
+inplace _inflateMark 0 72 v(pp)
+inplace _inflatePrime 0 64 p(puu)
+inplace _inflatePrime 0 72 v(pp)
+inplace _inflateReset 0 64 p(puu)
+inplace _inflateReset 0 72 v(pp)
+inplace _inflateReset2 0 64 p(puu)
+inplace _inflateReset2 0 72 v(pp)
+inplace _inflateResetKeep 0 64 p(puu)
+inplace _inflateResetKeep 0 72 v(pp)
+inplace _inflateSetDictionary 0 64 p(puu)
+inplace _inflateSetDictionary 0 72 v(pp)
+inplace _inflateSync 0 64 p(puu)
+inplace _inflateSync 0 72 v(pp)
+inplace _inflateSyncPoint 0 64 p(puu)
+inplace _inflateSyncPoint 0 72 v(pp)
+inplace _inflateUndermine 0 64 p(puu)
+inplace _inflateUndermine 0 72 v(pp)
+inplace _inflateValidate 0 64 p(puu)
+inplace _inflateValidate 0 72 v(pp)
+
+library /usr/lib/libbz2.1.0.dylib
+
+inplace _BZ2_bzCompress 0 56 p(pii)
+inplace _BZ2_bzCompress 0 64 v(pp)
+inplace _BZ2_bzCompressEnd 0 56 p(pii)
+inplace _BZ2_bzCompressEnd 0 64 v(pp)
+inplace _BZ2_bzCompressInit 0 56 p(pii)
+inplace _BZ2_bzCompressInit 0 64 v(pp)
+inplace _BZ2_bzDecompress 0 56 p(pii)
+inplace _BZ2_bzDecompress 0 64 v(pp)
+inplace _BZ2_bzDecompressEnd 0 56 p(pii)
+inplace _BZ2_bzDecompressEnd 0 64 v(pp)
+inplace _BZ2_bzDecompressInit 0 56 p(pii)
+inplace _BZ2_bzDecompressInit 0 64 v(pp)

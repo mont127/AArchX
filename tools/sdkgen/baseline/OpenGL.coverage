@@ -1,0 +1,17 @@
+library /System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL
+sdk macos 27.0
+exports 1438
+fn 52
+data 1
+var 0
+special 0
+stub no-declaration 1385
+host-missing 0
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

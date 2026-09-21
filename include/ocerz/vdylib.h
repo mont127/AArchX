@@ -75,6 +75,15 @@
  * inside a block at all: fork and vfork, whose child starts life without the
  * parent's translations and would return into a block that is gone.  Their
  * stubs are left to trap, so the child comes back through the dispatcher.
+ * ocerz_vdylib_leaf answers, for an export id, the routine in src/leaf.s that
+ * does the export's work with the guest's registers in place, or null.  It
+ * answers only for a libSystem export whose record is still the plain function
+ * the routine stands in for, same host symbol and same signature, so an
+ * override that turns strlen into anything else also turns the routine off.
+ * The limit it fills in is zero for a routine that only reads.  For one that
+ * writes guest memory it is the largest third argument the routine is meant
+ * for: past it the host's own memmove or memset is worth its crossing, and the
+ * translator has to treat the call as one that may have rewritten code.
  * ocerz_vdylib_postfork_child puts the image builder's lock back to its initial
  * state in a fork child.
  *
@@ -87,7 +96,10 @@
  * database file may have, and the index of a handler ocerz keeps for itself,
  * so the dispatcher, the fast call and the xmm contract treat it as they treat
  * a special export, and ocerz_vdylib_export_name names it as a library called
- * ocerz.  OCERZ_VDYLIB_TRAMP_BLOCK_INVOKE is the one that calls a native block.
+ * ocerz.  OCERZ_VDYLIB_TRAMP_BLOCK_INVOKE is the one that calls a native block,
+ * OCERZ_VDYLIB_TRAMP_NATIVE_IMP the one every thunk for a native Objective-C
+ * implementation jumps to, and OCERZ_VDYLIB_TRAMP_NATIVE_FN the one every thunk
+ * for a native C function jumps to, each with the thunk's number in r10.
  */
 #ifndef OCERZ_VDYLIB_H
 #define OCERZ_VDYLIB_H
@@ -110,9 +122,14 @@ int ocerz_vdylib_dispatch(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_vdylib_fastcall(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_vdylib_xmm_contract(uint64_t id, uint16_t *in, uint16_t *out);
 int ocerz_vdylib_trap_only(uint64_t id);
+const void *ocerz_vdylib_leaf(uint64_t id, uint64_t *rdx_limit);
 void ocerz_vdylib_postfork_child(void);
 
-enum { OCERZ_VDYLIB_TRAMP_BLOCK_INVOKE = 0 };
+enum {
+    OCERZ_VDYLIB_TRAMP_BLOCK_INVOKE = 0,
+    OCERZ_VDYLIB_TRAMP_NATIVE_IMP = 1,
+    OCERZ_VDYLIB_TRAMP_NATIVE_FN = 2,
+};
 uint64_t ocerz_vdylib_trampoline(unsigned which);
 
 #endif

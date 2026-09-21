@@ -1,0 +1,17 @@
+library /usr/lib/libsandbox.1.dylib
+sdk macos 27.0
+exports 36
+fn 5
+data 1
+var 0
+special 1
+stub no-declaration 29
+host-missing 0
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 6
+override-shapes 0
+override-structs 0
+override-opaque 0

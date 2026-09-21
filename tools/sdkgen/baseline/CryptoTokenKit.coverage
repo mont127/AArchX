@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/CryptoTokenKit.framework/Versions/A/CryptoTokenKit
+sdk macos 27.0
+exports 223
+fn 0
+data 173
+var 0
+special 0
+stub no-declaration 28
+omit swift 22
+host-missing 0
+objc-classes 64
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 12
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

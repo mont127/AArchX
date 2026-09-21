@@ -1,0 +1,17 @@
+library /System/Library/Frameworks/CoreBluetooth.framework/Versions/A/CoreBluetooth
+sdk macos 27.0
+exports 821
+fn 0
+data 767
+var 0
+special 0
+stub no-declaration 54
+host-missing 0
+objc-classes 77
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

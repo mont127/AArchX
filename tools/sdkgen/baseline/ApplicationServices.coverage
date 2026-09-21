@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices
+sdk macos 27.0
+exports 2117
+fn 368
+data 265
+var 0
+special 0
+stub callback-result 8
+stub callback-struct 5
+stub no-declaration 1468
+omit objc-ivar 3
+host-missing 0
+objc-classes 9
+objc-eh-types 0
+objc-ivars 3
+ld-pseudo-skipped 645
+overrides 2
+override-shapes 0
+override-structs 0
+override-opaque 0

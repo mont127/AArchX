@@ -63,3 +63,184 @@ pass AppKit.h
 
 library libncurses /usr/lib/libncurses.5.4.dylib usr/lib/libncurses.5.4.tbd
 pass libncurses.h
+
+library libutil /usr/lib/libutil.dylib usr/lib/libutil.tbd
+pass libutil.h
+
+library libz /usr/lib/libz.1.dylib usr/lib/libz.tbd
+pass libz.h
+
+library CFNetwork /System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork System/Library/Frameworks/CFNetwork.framework/CFNetwork.tbd
+pass CFNetwork.h
+
+library SystemConfiguration /System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration.tbd
+pass SystemConfiguration.h
+
+library Security /System/Library/Frameworks/Security.framework/Versions/A/Security System/Library/Frameworks/Security.framework/Security.tbd
+pass Security.h
+
+library CoreServices /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices System/Library/Frameworks/CoreServices.framework/CoreServices.tbd
+pass CoreServices.h
+
+library CoreMedia /System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia System/Library/Frameworks/CoreMedia.framework/CoreMedia.tbd
+pass CoreMedia.h
+
+library CoreVideo /System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo System/Library/Frameworks/CoreVideo.framework/CoreVideo.tbd
+pass CoreVideo.h
+
+library VideoToolbox /System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox System/Library/Frameworks/VideoToolbox.framework/VideoToolbox.tbd
+pass VideoToolbox.h
+
+library libiconv /usr/lib/libiconv.2.dylib usr/lib/libiconv.tbd
+pass libiconv.h
+
+library IOKit /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit System/Library/Frameworks/IOKit.framework/IOKit.tbd
+pass IOKit.h
+
+library DiskArbitration /System/Library/Frameworks/DiskArbitration.framework/Versions/A/DiskArbitration System/Library/Frameworks/DiskArbitration.framework/DiskArbitration.tbd
+pass DiskArbitration.h
+
+library Carbon /System/Library/Frameworks/Carbon.framework/Versions/A/Carbon System/Library/Frameworks/Carbon.framework/Carbon.tbd
+pass Carbon.h
+
+library Cocoa /System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa System/Library/Frameworks/Cocoa.framework/Cocoa.tbd
+language objective-c
+pass Cocoa.h
+
+library AudioToolbox /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox System/Library/Frameworks/AudioToolbox.framework/AudioToolbox.tbd
+pass AudioToolbox.h
+
+library libbz2 /usr/lib/libbz2.1.0.dylib usr/lib/libbz2.tbd
+pass libbz2.h
+
+library CoreAudio /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio System/Library/Frameworks/CoreAudio.framework/CoreAudio.tbd
+pass CoreAudio.h
+
+library CoreHaptics /System/Library/Frameworks/CoreHaptics.framework/Versions/A/CoreHaptics System/Library/Frameworks/CoreHaptics.framework/CoreHaptics.tbd
+language objective-c
+pass CoreHaptics.h
+
+library ForceFeedback /System/Library/Frameworks/ForceFeedback.framework/Versions/A/ForceFeedback System/Library/Frameworks/ForceFeedback.framework/ForceFeedback.tbd
+pass ForceFeedback.h
+
+library GameController /System/Library/Frameworks/GameController.framework/Versions/A/GameController System/Library/Frameworks/GameController.framework/GameController.tbd
+language objective-c
+pass GameController.h
+
+library Metal /System/Library/Frameworks/Metal.framework/Versions/A/Metal System/Library/Frameworks/Metal.framework/Metal.tbd
+language objective-c
+pass Metal.h
+
+library QuartzCore /System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore System/Library/Frameworks/QuartzCore.framework/QuartzCore.tbd
+language objective-c
+pass QuartzCore.h
+
+library UserNotifications /System/Library/Frameworks/UserNotifications.framework/Versions/A/UserNotifications System/Library/Frameworks/UserNotifications.framework/UserNotifications.tbd
+language objective-c
+pass UserNotifications.h
+
+library OpenGL /System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL System/Library/Frameworks/OpenGL.framework/OpenGL.tbd
+pass OpenGL.h
+
+library libGL /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.tbd
+pass libGL.h
+pass libGL3.h
+
+library IOSurface /System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface System/Library/Frameworks/IOSurface.framework/IOSurface.tbd
+pass IOSurface.h
+
+library Accelerate /System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate System/Library/Frameworks/Accelerate.framework/Accelerate.tbd
+pass Accelerate.h
+
+library ApplicationServices /System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices System/Library/Frameworks/ApplicationServices.framework/ApplicationServices.tbd
+pass ApplicationServices.h
+
+library CoreText /System/Library/Frameworks/CoreText.framework/Versions/A/CoreText System/Library/Frameworks/CoreText.framework/CoreText.tbd
+pass CoreText.h
+
+library OpenAL /System/Library/Frameworks/OpenAL.framework/Versions/A/OpenAL System/Library/Frameworks/OpenAL.framework/OpenAL.tbd
+pass OpenAL.h
+
+library IOBluetooth /System/Library/Frameworks/IOBluetooth.framework/Versions/A/IOBluetooth System/Library/Frameworks/IOBluetooth.framework/IOBluetooth.tbd
+language objective-c
+pass IOBluetooth.h
+
+library AVFoundation /System/Library/Frameworks/AVFoundation.framework/Versions/A/AVFoundation System/Library/Frameworks/AVFoundation.framework/AVFoundation.tbd
+language objective-c
+pass AVFoundation.h
+
+library AVFAudio /System/Library/Frameworks/AVFAudio.framework/Versions/A/AVFAudio System/Library/Frameworks/AVFAudio.framework/AVFAudio.tbd
+language objective-c
+pass AVFAudio.h
+
+library CoreImage /System/Library/Frameworks/CoreImage.framework/Versions/A/CoreImage System/Library/Frameworks/CoreImage.framework/CoreImage.tbd
+language objective-c
+pass CoreImage.h
+
+library Vision /System/Library/Frameworks/Vision.framework/Versions/A/Vision System/Library/Frameworks/Vision.framework/Vision.tbd
+language objective-c
+pass Vision.h
+
+library OpenDirectory /System/Library/Frameworks/OpenDirectory.framework/Versions/A/OpenDirectory System/Library/Frameworks/OpenDirectory.framework/OpenDirectory.tbd
+language objective-c
+pass OpenDirectory.h
+
+library CoreBluetooth /System/Library/Frameworks/CoreBluetooth.framework/Versions/A/CoreBluetooth System/Library/Frameworks/CoreBluetooth.framework/CoreBluetooth.tbd
+language objective-c
+pass CoreBluetooth.h
+
+library CoreMIDI /System/Library/Frameworks/CoreMIDI.framework/Versions/A/CoreMIDI System/Library/Frameworks/CoreMIDI.framework/CoreMIDI.tbd
+language objective-c
+pass CoreMIDI.h
+
+library CoreML /System/Library/Frameworks/CoreML.framework/Versions/A/CoreML System/Library/Frameworks/CoreML.framework/CoreML.tbd
+language objective-c
+pass CoreML.h
+
+library CoreWLAN /System/Library/Frameworks/CoreWLAN.framework/Versions/A/CoreWLAN System/Library/Frameworks/CoreWLAN.framework/CoreWLAN.tbd
+language objective-c
+pass CoreWLAN.h
+
+library CryptoTokenKit /System/Library/Frameworks/CryptoTokenKit.framework/Versions/A/CryptoTokenKit System/Library/Frameworks/CryptoTokenKit.framework/CryptoTokenKit.tbd
+language objective-c
+pass CryptoTokenKit.h
+
+library ImageCaptureCore /System/Library/Frameworks/ImageCaptureCore.framework/Versions/A/ImageCaptureCore System/Library/Frameworks/ImageCaptureCore.framework/ImageCaptureCore.tbd
+language objective-c
+pass ImageCaptureCore.h
+
+library LocalAuthentication /System/Library/Frameworks/LocalAuthentication.framework/Versions/A/LocalAuthentication System/Library/Frameworks/LocalAuthentication.framework/LocalAuthentication.tbd
+language objective-c
+pass LocalAuthentication.h
+
+library MediaAccessibility /System/Library/Frameworks/MediaAccessibility.framework/Versions/A/MediaAccessibility System/Library/Frameworks/MediaAccessibility.framework/MediaAccessibility.tbd
+language objective-c
+pass MediaAccessibility.h
+
+library SafariServices /System/Library/Frameworks/SafariServices.framework/Versions/A/SafariServices System/Library/Frameworks/SafariServices.framework/SafariServices.tbd
+language objective-c
+pass SafariServices.h
+
+library SecurityInterface /System/Library/Frameworks/SecurityInterface.framework/Versions/A/SecurityInterface System/Library/Frameworks/SecurityInterface.framework/SecurityInterface.tbd
+language objective-c
+pass SecurityInterface.h
+
+library libbsm /usr/lib/libbsm.0.dylib usr/lib/libbsm.tbd
+pass libbsm.h
+
+library libcups /usr/lib/libcups.2.dylib usr/lib/libcups.tbd
+pass libcups.h
+
+library libresolv /usr/lib/libresolv.9.dylib usr/lib/libresolv.tbd
+pass libresolv.h
+
+library libsandbox /usr/lib/libsandbox.1.dylib usr/lib/libsandbox.tbd
+pass libsandbox.h
+
+library AuthenticationServices /System/Library/Frameworks/AuthenticationServices.framework/Versions/A/AuthenticationServices System/Library/Frameworks/AuthenticationServices.framework/AuthenticationServices.tbd
+language objective-c
+pass AuthenticationServices.h
+
+library CoreLocation /System/Library/Frameworks/CoreLocation.framework/Versions/A/CoreLocation System/Library/Frameworks/CoreLocation.framework/CoreLocation.tbd
+language objective-c
+pass CoreLocation.h

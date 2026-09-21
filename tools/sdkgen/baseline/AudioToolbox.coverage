@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox
+sdk macos 27.0
+exports 2071
+fn 354
+data 300
+var 0
+special 0
+stub callback-struct 5
+stub no-declaration 1388
+omit no-declaration-missing 24
+host-missing 2
+objc-classes 34
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 315
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

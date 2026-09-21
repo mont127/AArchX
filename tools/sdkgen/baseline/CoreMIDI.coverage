@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/CoreMIDI.framework/Versions/A/CoreMIDI
+sdk macos 27.0
+exports 248
+fn 88
+data 112
+var 0
+special 0
+stub callback-struct 6
+stub no-declaration 41
+stub union-value 1
+host-missing 0
+objc-classes 22
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

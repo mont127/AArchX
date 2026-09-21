@@ -1559,7 +1559,7 @@ static int spawn_guest_args(uint64_t adesc, posix_spawnattr_t *at, int *have_at,
     return 0;
 }
 
-static int file_has_x86_slice(const char *path)
+static int file_has_slice(const char *path, uint32_t cputype)
 {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
@@ -1571,18 +1571,51 @@ static int file_has_x86_slice(const char *path)
     if (m == 0xcafebabe || m == 0xcafebabf) {
         uint32_t nf = ((uint32_t)h[4] << 24) | ((uint32_t)h[5] << 16) | ((uint32_t)h[6] << 8) | h[7];
         int is64 = m == 0xcafebabf;
-        size_t off = 8, esz = is64 ? 20 : 8;
+        size_t off = 8, esz = is64 ? 32 : 20;
         for (uint32_t i = 0; i < nf && off + esz <= (size_t)n; i++, off += esz) {
             uint32_t ct = ((uint32_t)h[off] << 24) | ((uint32_t)h[off+1] << 16) |
                           ((uint32_t)h[off+2] << 8) | h[off+3];
-            if (ct == 0x01000007) return 1;
+            if (ct == cputype) return 1;
         }
         return 0;
     }
     if (m == 0xcffaedfe)
         return ((uint32_t)h[4] | ((uint32_t)h[5] << 8) | ((uint32_t)h[6] << 16) |
-                ((uint32_t)h[7] << 24)) == 0x01000007;
+                ((uint32_t)h[7] << 24)) == cputype;
     return 0;
+}
+
+static int file_has_x86_slice(const char *path)
+{
+    return file_has_slice(path, 0x01000007);
+}
+
+static int guest_child_runs_native(const char *path)
+{
+    static const char *const roots[] = { "/usr/", "/bin/", "/sbin/", "/System/", "/Library/Apple/" };
+    static const char *const launchers[] = {
+        "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "env", "xargs", "nohup", "nice", "time",
+        "script", "sudo", "arch", "caffeinate", "perl", "python3", "ruby", "osascript",
+    };
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_NATIVE_CHILDREN") ? 1 : 0;
+    if (off || ocerz_mode != OCERZ_MODE_NATIVE || !path)
+        return 0;
+    char real[PATH_MAX];
+    if (!realpath(path, real) || strncmp(real, "/usr/local/", 11) == 0)
+        return 0;
+    int system_path = 0;
+    for (size_t i = 0; i < sizeof roots / sizeof roots[0] && !system_path; i++)
+        system_path = strncmp(real, roots[i], strlen(roots[i])) == 0;
+    if (!system_path)
+        return 0;
+    const char *leaf = strrchr(real, '/');
+    leaf = leaf ? leaf + 1 : real;
+    for (size_t i = 0; i < sizeof launchers / sizeof launchers[0]; i++)
+        if (strcmp(leaf, launchers[i]) == 0)
+            return 0;
+    return file_has_slice(real, 0x0100000c);
 }
 
 static int extract_plist_path(const char *cmd, char *out, size_t outsz)
@@ -1697,13 +1730,31 @@ static int file_contains(const char *path, const char *needle)
     return found;
 }
 
+static void launchd_plist_mode(const char *path)
+{
+    char cur[64];
+    int has = plistbuddy(path, "Print :EnvironmentVariables:OCERZ_MODE", cur, sizeof cur) && cur[0];
+    if (ocerz_mode != OCERZ_MODE_NATIVE) {
+        if (has)
+            plistbuddy(path, "Delete :EnvironmentVariables:OCERZ_MODE", NULL, 0);
+        return;
+    }
+    if (has && strcmp(cur, "native") == 0)
+        return;
+    plistbuddy(path, "Add :EnvironmentVariables dict", NULL, 0);
+    if (!plistbuddy(path, "Add :EnvironmentVariables:OCERZ_MODE string native", NULL, 0))
+        plistbuddy(path, "Set :EnvironmentVariables:OCERZ_MODE native", NULL, 0);
+}
+
 static void rewrite_launchd_plist_for_ocerz(const char *path, const char *self)
 {
     char label[256];
     if (plistbuddy(path, "Print :Label", label, sizeof label))
         launchctl_enable_label(label);
-    if (file_contains(path, self))
+    if (file_contains(path, self)) {
+        launchd_plist_mode(path);
         return;
+    }
     char exe[1024];
     int had_args = plistbuddy(path, "Print :ProgramArguments:0", exe, sizeof exe) && exe[0];
     if (!had_args && (!plistbuddy(path, "Print :Program", exe, sizeof exe) || !exe[0]))
@@ -1727,6 +1778,7 @@ static void rewrite_launchd_plist_for_ocerz(const char *path, const char *self)
     plistbuddy(path, cmd, NULL, 0);
     snprintf(cmd, sizeof cmd, "Set :Program %s", self);
     plistbuddy(path, cmd, NULL, 0);
+    launchd_plist_mode(path);
     if (getenv("OCERZ_IPCLOG")) {
         plistbuddy(path, "Add :StandardErrorPath string /tmp/ocerz_ipcserver.err", NULL, 0);
         plistbuddy(path, "Set :StandardErrorPath /tmp/ocerz_ipcserver.err", NULL, 0);
@@ -1754,7 +1806,8 @@ static int spawn_mock_keychain(char **hargv, int n, int at, const char *gpath)
     if (strcmp(base, "Steam Helper") != 0 || getenv("OCERZ_NO_MOCK_KEYCHAIN") || n >= 259 || at > n)
         return n;
     for (int k = at; k < n; k++)
-        if (hargv[k] && strcmp(hargv[k], "--use-mock-keychain") == 0)
+        if (hargv[k] && (strcmp(hargv[k], "--use-mock-keychain") == 0 ||
+                         strncmp(hargv[k], "--type=crashpad-handler", 23) == 0))
             return n;
     memmove(&hargv[at + 1], &hargv[at], sizeof hargv[0] * (size_t)(n - at));
     hargv[at] = (char *)"--use-mock-keychain";
@@ -1856,6 +1909,13 @@ static int guest_spawn_apply(OcerzVM *vm, pid_t *pid, const char *path,
         return EINVAL;
     if (access(path, X_OK) != 0)
         return errno;
+    if (guest_child_runs_native(path)) {
+        int count = 0;
+        while (argv && argv[count])
+            count++;
+        spawn_rewrite_launchd(argv, count, self);
+        return posix_spawn(pid, path, fa, at, argv, envp);
+    }
     char *hargv[GUEST_ARGV_MAX + 12];
     char shline[1024];
     int n = guest_child_argv(hargv, GUEST_ARGV_MAX + 12, self, path, argv, shline, sizeof shline);
@@ -1879,6 +1939,10 @@ static int guest_exec_apply(const char *path, char *const *argv, char *const *en
     }
     if (access(path, X_OK) != 0)
         return errno;
+    if (guest_child_runs_native(path)) {
+        execve(path, argv, envp);
+        return errno;
+    }
     char *hargv[GUEST_ARGV_MAX + 12];
     char shline[1024];
     int n = guest_child_argv(hargv, GUEST_ARGV_MAX + 12, self, path, argv, shline, sizeof shline);

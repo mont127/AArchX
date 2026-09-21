@@ -53,21 +53,23 @@
 #
 # Keeping 71 and 72 alive still matters, and both now need their own fixture.
 # 71 means nothing bound, so the loader never handed control to the guest at
-# all; native_unbound pins it with a two-line program calling zlibVersion from
-# libz, a library native mode synthesizes no image for. It used to call
+# all; native_unbound pins it with a two-line program calling sqlite3_libversion
+# from libsqlite3, a library native mode synthesizes no image for. It used to
 # getpwnam, until the generated libSystem database exported every function the
 # real libSystem does and getpwnam bound. 72 means
 # everything bound and the guest ran, and what is missing is the bridge behind
 # one export rather than the export itself; xbench_dyn no longer reaches it, so
-# bridge_unimpl pins it with a program whose only import is scanf, which the
+# bridge_unimpl pins it with a program whose only import is asl_log, which the
 # virtual library exports and the bridge deliberately does not implement -- it
 # is variadic, Apple's arm64 passes variadic arguments on the stack where x86-64
 # passes them in registers, and no fixed signature can say where the named
 # arguments stop. That fixture's one import used to be qsort, until M5 gave a
 # callback a way back into guest code, and then printf, until M10 put a format
 # veneer in front of it that reads the format string to learn what every
-# argument is. No veneer stands in front of scanf, and the generated database
-# keeps every member of its family a stub. Being the only import, it is also the
+# argument is, and then scanf, until the scanf family grew the same kind of
+# veneer, and then syslog, until Steam's ipcserver needed one for it too. No
+# veneer stands in front of asl_log, and the generated database
+# keeps it a stub. Being the only import, it is also the
 # only symbol the bridge line can name, so that case pins the symbol as well as
 # the shape of the line, and it checks the fixture's import table with nm first
 # so that a toolchain which starts importing something else is reported as that
@@ -80,7 +82,7 @@
 #
 # M4 adds the one fault the mode could not previously explain. A crossing runs
 # the host's own arm64 code on a thread the guest is driving, so a guest that
-# hands strlen a pointer it had no business handing it faults inside Apple's
+# hands strrchr a pointer it had no business handing it faults inside Apple's
 # code, at an instruction pointer belonging to nothing the translator emitted.
 # The crash handler used not to ask whether a crossing was in flight, so it
 # blamed the guest anyway: the fault was either delivered as an access
@@ -97,7 +99,10 @@
 # can neither resume nor unwind.
 #
 # bridge_fault_native pins that report, against a fixture whose only unusual
-# act is calling strlen on a page of guest space nobody mapped.
+# act is calling strrchr on a page of guest space nobody mapped. It used to call
+# strlen, which no longer crosses: translated code answers it in place, and a
+# fault there is the guest's own (sys_strings_fault, below). strrchr still
+# crosses, and so does nearly everything else.
 # bridge_fault_not_guest pins the other half from a second run of the same
 # fixture with OCERZ_FAULTLOG and OCERZ_SIGTRACE set, which are the two knobs
 # that make the old attribution path say out loud that it ran: for the bad
@@ -116,7 +121,7 @@
 #
 # bridge_fault_cache is the regression guard that matters most, because cache
 # mode is what runs Steam and Wine today and M4 has to be purely additive. The
-# same fixture under -cache crosses no bridge at all -- strlen there is the real
+# same fixture under -cache crosses no bridge at all -- strrchr there is the real
 # libSystem's, translated like everything else -- so it must still be an
 # ordinary guest fault, reported as one at the address the guest actually
 # dereferenced, with the JIT and the interpreter agreeing on the status, and
@@ -1202,7 +1207,7 @@
 # with a message that says why, the image count unchanged afterwards and a
 # second dlerror answering nothing. An arm64-only dylib on disk, a library the
 # host's shared cache has but no API database describes, reached by path and by
-# the bare name libz.dylib, a guest dylib whose dependency has been deleted,
+# the bare name libsqlite3.dylib, a guest dylib whose dependency has been deleted,
 # and one whose dependency no longer exports a symbol it imports, twice, with
 # the same message both times, which is what a load that was not rolled back
 # would change. After them a plain guest dylib still loads, libc.dylib answers
@@ -1254,6 +1259,31 @@
 # ocerz: a child that came up in cache mode, or ran under Rosetta, would print
 # the same report, so the report alone could not tell.
 #
+# sys_strings is for the routines of src/leaf.s, which translated code runs in
+# place of libSystem's strlen, strnlen, strcmp, strncmp, memcmp, bcmp, strchr,
+# memchr, memcpy, memmove and memset without crossing. It is an ordinary case_sys
+# fixture, so the arm64 build, the JIT, -no-jit, where the same calls take the
+# ordinary crossing, and cache mode must all print the same; what it adds is
+# where the strings lie, against an inaccessible page at every alignment, and
+# lengths on both sides of the limit past which the writing routines hand over
+# to the host's. Its x86 line rewrites a translated function with memcpy and
+# with memset and calls it again. sys_strings_inplace then reads the -v log of
+# that JIT run and fails unless the translator said, for each of the eleven
+# exports, that it answers it in place: without that the fixture would pass on
+# the ordinary crossing and prove nothing about the routines. It then runs the
+# fixture once more under -v -cache and counts the blocks the translator said
+# it put a routine at the head of, which must be the ten entries
+# libsystem_platform exports, for the same reason. sys_strings_fault
+# runs each routine into a page it may not touch, from a caller that first puts
+# known values in rbx and r12 to r15, with a handler that leaves by siglongjmp.
+# It has no -no-jit run, because there the call crosses and a fault inside a
+# native frame still ends the process. The x86 line counts the faults whose
+# context showed those five registers intact, and the native run must show all
+# twelve: the routine was running with the guest's registers in host registers,
+# and only recovering them from the faulting thread gets that right. Cache mode
+# must agree on everything but that line, where Apple's own memmove is free to
+# use rbx.
+#
 # sys_jmp_refused and sys_fork_callback are the two refusals. The first longjmps
 # from a qsort comparator to a setjmp taken before the qsort, which would leave
 # qsort's native frames behind; both engines must refuse it by name with 72,
@@ -1283,7 +1313,7 @@ KERNEL=depchain
 KERNELS="depchain memcpy"
 SCALE=1000
 LIB=/usr/lib/libSystem.B.dylib
-UNIMPL_SYM=_scanf
+UNIMPL_SYM=_asl_log
 BRIDGE_RE='^ocerz: bridge: [^ ]+ [^ ]+ not implemented$'
 NOBIND='ocerz: native: no bridge for '
 M0_SUMMARY='unresolved imports, which no virtual library exports'
@@ -1294,8 +1324,8 @@ UNIMPL_BIN=""
 BADPTR_BIN=""
 AFTER_BIN=""
 BAD_GUEST_ADDR=0x6000000000
-BADPTR_SYM=_strlen
-BADPTR_SIG='L(p)'
+BADPTR_SYM=_strrchr
+BADPTR_SIG='p(pi)'
 BADPTR_MARK='badptr enter'
 BADPTR_PAST='badptr returned'
 AFTER_MARK='after bridged'
@@ -1485,6 +1515,10 @@ SYS_PROC_ARM64=""
 SYS_REFUSE_BIN=""
 SYS_FORKCB_BIN=""
 SYS_FORKCB_ARM64=""
+SYS_STRINGS_BIN=""
+SYS_STRINGS_ARM64=""
+SYS_STRFAULT_BIN=""
+SYS_STRFAULT_ARM64=""
 SYS_TIMEOUT=120
 SYS_WORK="$TMP/sysw"
 SYS_FILES_NEED='_open _open$NOCANCEL _openat _openat$NOCANCEL _fcntl _fcntl$NOCANCEL _ioctl _sem_open _shm_open _semctl _ulimit'
@@ -1492,6 +1526,7 @@ SYS_MMAP_NEED='_mmap _munmap _mprotect _madvise _mach_vm_allocate _mach_vm_deall
 SYS_JMP_NEED='_setjmp __setjmp _sigsetjmp _longjmp __longjmp _siglongjmp'
 SYS_PROC_NEED='_fork _vfork _execv _execve _execvp _execvP _execl _execle _execlp _posix_spawn _posix_spawnp _system _popen _pclose'
 SYS_PROC_KINDS='spawn spawn-attr spawnp sys_proc_script execv execve execvp execvP execl execle execlp many system popen'
+SYS_STRINGS_NEED='_strlen _strnlen _strcmp _strncmp _memcmp _bcmp _strchr _memchr _memcpy _memmove _memset'
 SYS_REFUSE_MSG='ocerz: bridge: /usr/lib/libSystem.B.dylib _longjmp from inside a callback _qsort made, to a setjmp taken outside that call, would skip the native frames of _qsort; refused'
 SYS_FORKCB_MSG='ocerz: bridge: /usr/lib/libSystem.B.dylib _fork was called inside a callback _qsort made from translated code, and the child would return into a translation it does not inherit; refused'
 SYS_REFUSED_STATUS=72
@@ -1871,18 +1906,18 @@ int main(void)
 EOC
 
     cat > "$usrc" <<'EOC'
-int scanf(const char *, ...);
+int asl_log(void *, void *, int, const char *, ...);
 int main(void)
 {
-    int v = 0;
-    return scanf("%d", &v) == 1 ? v : 0;
+    asl_log(0, 0, 7, "ocerz-unimpl %d", 1);
+    return 0;
 }
 EOC
 
     cat > "$bsrc" <<EOC
 typedef __SIZE_TYPE__ bp_size;
 
-bp_size strlen(const char *);
+char *strrchr(const char *, int);
 long write(int, const void *, bp_size);
 
 static const char *volatile bp_bad = (const char *)${BAD_GUEST_ADDR}ull;
@@ -1891,7 +1926,7 @@ static volatile bp_size bp_len;
 int main(void)
 {
     write(1, "badptr enter\n", 13);
-    bp_len = strlen(bp_bad);
+    bp_len = (bp_size)strrchr(bp_bad, 'x');
     write(1, "badptr returned\n", 16);
     return bp_len != 0;
 }
@@ -10230,8 +10265,8 @@ int main(void)
         *slash = 0;
 
     CK(refused("arm64", path_of("libdlarm.dylib", path, sizeof path), 0, 0));
-    CK(refused("hostlib", "/usr/lib/libz.1.dylib", 0, 0));
-    CK(refused("bare", "libz.dylib", 0, 0));
+    CK(refused("hostlib", "/usr/lib/libsqlite3.dylib", 0, 0));
+    CK(refused("bare", "libsqlite3.dylib", 0, 0));
     CK(refused("missingdep", path_of("libdlneedsgone.dylib", path, sizeof path), first, sizeof first));
     CK(refused("missingsym", path_of("libdlneedsym.dylib", path, sizeof path), second, sizeof second));
     CK(refused("missingsym", path_of("libdlneedsym.dylib", path, sizeof path), first, sizeof first) &&
@@ -10252,7 +10287,7 @@ int main(void)
     CK(cf != 0 && dlsym(cf, "CFStringGetLength") != 0 && _dyld_image_count() == before + 1);
     CK(cf != 0 && strcmp(_dyld_get_image_name(before),
                          "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation") == 0);
-    CK(dlopen_preflight("/usr/lib/libSystem.B.dylib") && !dlopen_preflight("/usr/lib/libz.1.dylib"));
+    CK(dlopen_preflight("/usr/lib/libSystem.B.dylib") && !dlopen_preflight("/usr/lib/libsqlite3.dylib"));
     text("preflight", dlerror());
 
     cb_begin(TAG, m);
@@ -11706,10 +11741,500 @@ int main(void)
 }
 EOC
 
-    for name in sys_files sys_mmap sys_jmp sys_proc sys_jmp_refused sys_fork_callback; do
+    cat > "$TMP/sys_strings.c" <<'EOC'
+#define _FORTIFY_SOURCE 0
+#include <signal.h>
+#include <setjmp.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include "sys_common.h"
+
+#define TAG "sys_strings"
+#define EDGE_PAGE 16384u
+#define EDGE_SPAN (2u * EDGE_PAGE)
+#define TAILS 20u
+#define MAXLEN 40u
+#define ARENA 704u
+#define BIG 24000u
+
+static unsigned char *g_ra, *g_rb;
+static unsigned g_sum;
+
+static unsigned char *edge_region(void)
+{
+    unsigned char *p = mmap(NULL, EDGE_SPAN + EDGE_PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (p == MAP_FAILED || mprotect(p + EDGE_SPAN, EDGE_PAGE, PROT_NONE) != 0)
+        return NULL;
+    for (unsigned i = 0; i < EDGE_SPAN; i++)
+        p[i] = 0x5a;
+    return p;
+}
+
+static unsigned char *place(unsigned char *region, unsigned tail, unsigned bytes)
+{
+    return region + EDGE_SPAN - tail - bytes;
+}
+
+static void fill_text(unsigned char *s, unsigned len, unsigned seed)
+{
+    for (unsigned i = 0; i < len; i++)
+        s[i] = (unsigned char)(1 + (seed * 7 + i * 13) % 250);
+    s[len] = 0;
+}
+
+static unsigned long ref_len(const unsigned char *s, unsigned long lim)
+{
+    unsigned long n = 0;
+    while (n < lim && s[n])
+        n++;
+    return n;
+}
+
+static const unsigned char *ref_find(const unsigned char *s, int c, unsigned long lim, int stop_at_nul)
+{
+    for (unsigned long i = 0; i < lim; i++) {
+        if (s[i] == (unsigned char)c)
+            return s + i;
+        if (stop_at_nul && !s[i])
+            return NULL;
+    }
+    return NULL;
+}
+
+static int ref_cmp(const unsigned char *a, const unsigned char *b, unsigned long lim, int stop_at_nul)
+{
+    for (unsigned long i = 0; i < lim; i++) {
+        if (a[i] != b[i])
+            return a[i] < b[i] ? -1 : 1;
+        if (stop_at_nul && !a[i])
+            return 0;
+    }
+    return 0;
+}
+
+static int sgn(int v)
+{
+    return v < 0 ? -1 : v > 0 ? 1 : 0;
+}
+
+static unsigned t_scan(void)
+{
+    unsigned m = 0, bit = 1;
+    int len_ok = 1, nlen_ok = 1, chr_ok = 1, mchr_ok = 1;
+    static const unsigned long limits[] = { 0, 1, 15, 16, 17, 33, 64, 200 };
+    for (unsigned tail = 0; tail < TAILS; tail++)
+        for (unsigned len = 0; len < MAXLEN; len++) {
+            unsigned char *s = place(g_ra, tail, len + 1);
+            for (unsigned i = 1; i <= 16; i++)
+                s[-(int)i] = 0;
+            fill_text(s, len, tail + len);
+            unsigned long got = strlen((char *)s);
+            len_ok &= got == len;
+            g_sum += (unsigned)got;
+            for (unsigned k = 0; k < sizeof limits / sizeof limits[0]; k++) {
+                unsigned long lim = limits[k] > len + 1 ? len + 1 : limits[k];
+                nlen_ok &= strnlen((char *)s, lim) == ref_len(s, lim);
+                nlen_ok &= strnlen((char *)s, limits[k] + 100000) == len;
+            }
+            nlen_ok &= strnlen((char *)s, ~0ul) == len;
+            for (unsigned i = 1; i <= 16; i++)
+                s[-(int)i] = 0xee;
+            for (unsigned at = 0; at <= len; at += 1 + len / 9) {
+                unsigned char saved = s[at];
+                if (at < len)
+                    s[at] = 0xee;
+                static const int wanted[] = { 0xee, 0, 0xfb, 0x1ee };
+                for (unsigned w = 0; w < 4; w++) {
+                    int c = wanted[w];
+                    const unsigned char *r = (const unsigned char *)strchr((char *)s, c);
+                    chr_ok &= r == ref_find(s, c, len + 1, 1);
+                    g_sum += r ? (unsigned)(r - s) + 1 : 0;
+                    for (unsigned k = 0; k < sizeof limits / sizeof limits[0]; k++) {
+                        unsigned long lim = limits[k] > len + 1 ? len + 1 : limits[k];
+                        mchr_ok &= memchr(s, c, lim) == ref_find(s, c, lim, 0);
+                    }
+                    if (ref_find(s, c, len + 1, 0))
+                        mchr_ok &= memchr(s, c, ~0ul) == ref_find(s, c, len + 1, 0);
+                }
+                s[at] = saved;
+            }
+        }
+    CK(len_ok);
+    CK(nlen_ok);
+    CK(chr_ok);
+    CK(mchr_ok);
+    return m;
+}
+
+static unsigned t_compare(void)
+{
+    unsigned m = 0, bit = 1;
+    int cmp_ok = 1, ncmp_ok = 1, mcmp_ok = 1, bcmp_ok = 1;
+    static const unsigned char pairs[][2] = { { 0x01, 0x02 }, { 0x7f, 0x80 }, { 0xff, 0x01 }, { 0x80, 0x7f } };
+    static const unsigned long limits[] = { 0, 1, 15, 16, 17, 40, ~0ul };
+    for (unsigned ta = 0; ta < TAILS; ta += 3)
+        for (unsigned tb = 0; tb < TAILS; tb += 5)
+            for (unsigned len = 0; len < MAXLEN; len += 1 + len / 24) {
+                unsigned char *a = place(g_ra, ta, len + 1);
+                unsigned char *b = place(g_rb, tb, len + 1);
+                for (unsigned at = 0; at <= len + 1; at += 1 + len / 7)
+                    for (unsigned v = 0; v < 4; v++) {
+                        fill_text(a, len, ta + tb);
+                        fill_text(b, len, ta + tb);
+                        if (at < len) {
+                            a[at] = pairs[v][0];
+                            b[at] = pairs[v][1];
+                        }
+                        int r = strcmp((char *)a, (char *)b);
+                        cmp_ok &= sgn(r) == ref_cmp(a, b, ~0ul, 1);
+                        g_sum += (unsigned)(sgn(r) + 1);
+                        for (unsigned k = 0; k < sizeof limits / sizeof limits[0]; k++)
+                            ncmp_ok &= sgn(strncmp((char *)a, (char *)b, limits[k])) ==
+                                       ref_cmp(a, b, limits[k], 1);
+                        for (unsigned long lim = 0; lim <= len + 1; lim += 1 + lim / 5) {
+                            mcmp_ok &= sgn(memcmp(a, b, lim)) == ref_cmp(a, b, lim, 0);
+                            bcmp_ok &= (bcmp(a, b, lim) != 0) == (ref_cmp(a, b, lim, 0) != 0);
+                        }
+                    }
+                fill_text(a, len, 1);
+                fill_text(b, len, 1);
+                a[len] = 0x33;
+                b[len] = 0x99;
+                mcmp_ok &= memcmp(a, b, len + 1) < 0 && memcmp(b, a, len + 1) > 0;
+            }
+    CK(cmp_ok);
+    CK(ncmp_ok);
+    CK(mcmp_ok);
+    CK(bcmp_ok);
+    return m;
+}
+
+static void fill_arena(unsigned char *p, unsigned n, unsigned seed)
+{
+    for (unsigned i = 0; i < n; i++)
+        p[i] = (unsigned char)(seed + i * 37 + (i >> 3));
+}
+
+static int same(const unsigned char *a, const unsigned char *b, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
+static void ref_move(unsigned char *d, const unsigned char *s, unsigned n)
+{
+    if (d < s)
+        for (unsigned i = 0; i < n; i++)
+            d[i] = s[i];
+    else
+        for (unsigned i = n; i > 0; i--)
+            d[i - 1] = s[i - 1];
+}
+
+static unsigned t_move(void)
+{
+    unsigned m = 0, bit = 1;
+    static unsigned char mine[ARENA], want[ARENA], from[ARENA];
+    static unsigned char bigs[BIG + 64], bigd[BIG + 64], bigw[BIG + 64];
+    int cpy_ok = 1, ret_ok = 1, ovl_ok = 1, set_ok = 1, big_ok = 1, edge_ok = 1;
+    for (unsigned len = 0; len <= 300; len += len < 136 ? 1 : 11)
+        for (unsigned da = 0; da < 16; da += 3)
+            for (unsigned sa = (len + da) & 3; sa < 16; sa += 4) {
+                fill_arena(mine, ARENA, len);
+                fill_arena(want, ARENA, len);
+                fill_arena(from, ARENA, len + 91);
+                ret_ok &= memcpy(mine + 64 + da, from + 32 + sa, len) == mine + 64 + da;
+                ref_move(want + 64 + da, from + 32 + sa, len);
+                cpy_ok &= same(mine, want, ARENA);
+            }
+    for (unsigned len = 0; len <= 300; len += len < 72 ? 1 : 19)
+        for (int dist = -100; dist <= 100; dist += dist > -20 && dist < 20 ? 1 : 9) {
+            fill_arena(mine, ARENA, len * 3);
+            fill_arena(want, ARENA, len * 3);
+            unsigned src = 200 + (len & 15), dst = (unsigned)((int)src + dist);
+            ret_ok &= memmove(mine + dst, mine + src, len) == mine + dst;
+            ref_move(want + dst, want + src, len);
+            ovl_ok &= same(mine, want, ARENA);
+        }
+    for (unsigned len = 0; len <= 300; len += len < 136 ? 1 : 11)
+        for (unsigned da = len & 1; da < 16; da += 2) {
+            fill_arena(mine, ARENA, len);
+            fill_arena(want, ARENA, len);
+            int c = (int)(0xffffff00u | (len * 5 + da));
+            ret_ok &= memset(mine + 64 + da, c, len) == mine + 64 + da;
+            for (unsigned i = 0; i < len; i++)
+                want[64 + da + i] = (unsigned char)c;
+            set_ok &= same(mine, want, ARENA);
+        }
+    static const unsigned bigs_n[] = { 4096, 16384, 16385, BIG };
+    for (unsigned k = 0; k < sizeof bigs_n / sizeof bigs_n[0]; k++) {
+        unsigned n = bigs_n[k];
+        fill_arena(bigs, BIG + 64, n);
+        fill_arena(bigd, BIG + 64, n + 5);
+        fill_arena(bigw, BIG + 64, n + 5);
+        big_ok &= memcpy(bigd + 3, bigs + 9, n) == bigd + 3;
+        ref_move(bigw + 3, bigs + 9, n);
+        big_ok &= same(bigd, bigw, BIG + 64);
+        big_ok &= memmove(bigd + 11, bigd + 3, n) == bigd + 11;
+        ref_move(bigw + 11, bigw + 3, n);
+        big_ok &= same(bigd, bigw, BIG + 64);
+        big_ok &= memset(bigd + 5, (int)n, n) == bigd + 5;
+        for (unsigned i = 0; i < n; i++)
+            bigw[5 + i] = (unsigned char)n;
+        big_ok &= same(bigd, bigw, BIG + 64);
+        g_sum += bigd[n / 2];
+    }
+    for (unsigned len = 0; len <= 300; len += 1 + len / 40)
+        for (unsigned tail = 0; tail < 3; tail++) {
+            unsigned char *d = place(g_ra, tail, len), *f = place(g_rb, 0, len);
+            fill_arena(f, len, len);
+            memset(d, 0, len);
+            memcpy(d, f, len);
+            edge_ok &= same(d, f, len);
+            memset(d, 0xa5, len);
+            for (unsigned i = 0; i < len; i++)
+                edge_ok &= d[i] == 0xa5;
+        }
+    CK(cpy_ok);
+    CK(ret_ok);
+    CK(ovl_ok);
+    CK(set_ok);
+    CK(big_ok);
+    CK(edge_ok);
+    return m;
+}
+
+#if defined(__x86_64__)
+static unsigned t_x86(void)
+{
+    unsigned m = 0, bit = 1;
+    unsigned char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+    int ok = p != MAP_FAILED;
+    CK(ok);
+    int all = ok;
+    for (unsigned i = 0; ok && i < 8; i++) {
+        unsigned char code[6] = { 0xb8, 0, 0, 0, 0, 0xc3 };
+        unsigned value = 0x51510000u + i * 0x01010101u;
+        memcpy(code + 1, &value, 4);
+        memcpy(p + 64, code, sizeof code);
+        all &= ((unsigned (*)(void))(void *)(p + 64))() == value;
+    }
+    CK(all);
+    all = ok;
+    for (unsigned i = 0; ok && i < 8; i++) {
+        memset(p + 64 + 1, (int)(0x30 + i), 4);
+        all &= ((unsigned (*)(void))(void *)(p + 64))() == (0x30 + i) * 0x01010101u;
+    }
+    CK(all);
+    CK(ok && munmap(p, 4096) == 0);
+    return m;
+}
+#endif
+
+int main(void)
+{
+    g_ra = edge_region();
+    g_rb = edge_region();
+    if (!g_ra || !g_rb)
+        return 2;
+    sys_note(TAG, "scan");
+    sys_begin(TAG, "scan", t_scan());
+    sys_int("sum", (long)(g_sum & 0xffffff));
+    cb_end();
+    sys_note(TAG, "compare");
+    sys_begin(TAG, "compare", t_compare());
+    sys_int("sum", (long)(g_sum & 0xffffff));
+    cb_end();
+    sys_note(TAG, "move");
+    sys_begin(TAG, "move", t_move());
+    sys_int("sum", (long)(g_sum & 0xffffff));
+    cb_end();
+#if defined(__x86_64__)
+    sys_note(TAG, "x86");
+    sys_begin(TAG, "x86", t_x86());
+    cb_end();
+#endif
+    return sys_summary(TAG);
+}
+EOC
+
+    cat > "$TMP/sys_strings_fault.c" <<'EOC'
+#define _FORTIFY_SOURCE 0
+#include <signal.h>
+#include <setjmp.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
+#include "sys_common.h"
+
+#define TAG "sys_strings_fault"
+#define FPAGE 16384u
+#define S_RBX 0x1111222233334444ul
+#define S_R12 0x5555666677778888ul
+#define S_R13 0x9999aaaabbbbccccul
+#define S_R14 0xddddeeeeffff0001ul
+#define S_R15 0x0123456789abcdeful
+
+static sigjmp_buf g_env;
+static volatile unsigned g_faults, g_marked, g_marked_total;
+static volatile uintptr_t g_addr;
+
+static void on_fault(int sig, siginfo_t *si, void *ctx)
+{
+    (void)sig;
+    g_faults++;
+    g_addr = (uintptr_t)si->si_addr;
+#if defined(__x86_64__)
+    const ucontext_t *uc = ctx;
+    g_marked = uc->uc_mcontext->__ss.__rbx == S_RBX && uc->uc_mcontext->__ss.__r12 == S_R12 &&
+               uc->uc_mcontext->__ss.__r13 == S_R13 && uc->uc_mcontext->__ss.__r14 == S_R14 &&
+               uc->uc_mcontext->__ss.__r15 == S_R15;
+#else
+    (void)ctx;
+    g_marked = 1;
+#endif
+    siglongjmp(g_env, 1);
+}
+
+#if defined(__x86_64__)
+__attribute__((naked, noinline)) static unsigned long call_marked(void *fn, unsigned long a,
+                                                                  unsigned long b, unsigned long c)
+{
+    __asm__("pushq %rbp\n"
+            "movq %rsp, %rbp\n"
+            "pushq %rbx\n"
+            "pushq %r12\n"
+            "pushq %r13\n"
+            "pushq %r14\n"
+            "pushq %r15\n"
+            "subq $8, %rsp\n"
+            "movq %rdi, %rax\n"
+            "movq %rsi, %rdi\n"
+            "movq %rdx, %rsi\n"
+            "movq %rcx, %rdx\n"
+            "movabsq $0x1111222233334444, %rbx\n"
+            "movabsq $0x5555666677778888, %r12\n"
+            "movabsq $0x9999aaaabbbbcccc, %r13\n"
+            "movabsq $0xddddeeeeffff0001, %r14\n"
+            "movabsq $0x0123456789abcdef, %r15\n"
+            "callq *%rax\n"
+            "addq $8, %rsp\n"
+            "popq %r15\n"
+            "popq %r14\n"
+            "popq %r13\n"
+            "popq %r12\n"
+            "popq %rbx\n"
+            "popq %rbp\n"
+            "retq\n");
+}
+#else
+static unsigned long call_marked(void *fn, unsigned long a, unsigned long b, unsigned long c)
+{
+    return ((unsigned long (*)(unsigned long, unsigned long, unsigned long))fn)(a, b, c);
+}
+#endif
+
+static int faults_once(void *fn, unsigned long a, unsigned long b, unsigned long c, uintptr_t lo,
+                       uintptr_t hi)
+{
+    volatile int returned = 0;
+    unsigned before = g_faults;
+    g_marked = 0;
+    g_addr = 0;
+    if (sigsetjmp(g_env, 1) == 0) {
+        call_marked(fn, a, b, c);
+        returned = 1;
+    }
+    g_marked_total += g_marked;
+    return !returned && g_faults == before + 1 && g_addr >= lo && g_addr < hi;
+}
+
+static unsigned char *g_good, *g_bad, *g_ro;
+
+static unsigned t_read(void)
+{
+    unsigned m = 0, bit = 1;
+    uintptr_t lo = (uintptr_t)g_bad, hi = lo + FPAGE;
+    unsigned char *open_end = g_bad - 5;
+    memset(open_end, 'q', 5);
+    CK(faults_once((void *)strlen, (unsigned long)open_end, 0, 0, lo, hi));
+    CK(faults_once((void *)strchr, (unsigned long)open_end, 'z', 0, lo, hi));
+    CK(faults_once((void *)memchr, (unsigned long)open_end, 'z', 64, lo, hi));
+    CK(faults_once((void *)strnlen, (unsigned long)open_end, 64, 0, lo, hi));
+    memset(g_good, 'q', 64);
+    g_good[5] = 'q';
+    CK(faults_once((void *)strcmp, (unsigned long)g_good, (unsigned long)open_end, 0, lo, hi));
+    CK(faults_once((void *)strncmp, (unsigned long)open_end, (unsigned long)g_good, 64, lo, hi));
+    CK(faults_once((void *)memcmp, (unsigned long)g_good, (unsigned long)open_end, 64, lo, hi));
+    CK(faults_once((void *)memcpy, (unsigned long)g_good, (unsigned long)open_end, 200, lo, hi));
+    CK(strlen("still here") == 10 && memcmp(g_good, "qqqqq", 5) == 0);
+    return m;
+}
+
+static unsigned t_write(void)
+{
+    unsigned m = 0, bit = 1;
+    uintptr_t lo = (uintptr_t)g_ro, hi = lo + FPAGE;
+    CK(faults_once((void *)memcpy, (unsigned long)(g_ro + 100), (unsigned long)g_good, 48, lo, hi));
+    CK(faults_once((void *)memmove, (unsigned long)(g_ro + 7), (unsigned long)g_good, 300, lo, hi));
+    CK(faults_once((void *)memset, (unsigned long)(g_ro + 33), 0x77, 9, lo, hi));
+    CK(faults_once((void *)memset, (unsigned long)(g_ro + 1), 0x77, 1000, lo, hi));
+    int clean = 1;
+    for (unsigned i = 0; i < 2048; i++)
+        clean &= g_ro[i] == 0x11;
+    CK(clean);
+    return m;
+}
+
+int main(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, NULL) != 0 || sigaction(SIGBUS, &sa, NULL) != 0)
+        return 2;
+    unsigned char *p = mmap(NULL, 3 * FPAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (p == MAP_FAILED)
+        return 2;
+    g_good = p;
+    g_bad = p + FPAGE;
+    g_ro = p + 2 * FPAGE;
+    memset(g_ro, 0x11, FPAGE);
+    if (mprotect(g_bad, FPAGE, PROT_NONE) != 0 || mprotect(g_ro, FPAGE, PROT_READ) != 0)
+        return 2;
+    sys_note(TAG, "read");
+    sys_begin(TAG, "read", t_read());
+    sys_int("faults", (long)g_faults);
+    cb_end();
+    sys_note(TAG, "write");
+    sys_begin(TAG, "write", t_write());
+    sys_int("faults", (long)g_faults);
+    cb_end();
+#if defined(__x86_64__)
+    cb_len = 0;
+    cb_str(TAG " x86");
+    sys_int("marked", (long)g_marked_total);
+    sys_int("of", (long)g_faults);
+    cb_end();
+#endif
+    return sys_summary(TAG);
+}
+EOC
+
+    for name in sys_files sys_mmap sys_jmp sys_proc sys_jmp_refused sys_fork_callback sys_strings sys_strings_fault; do
         clang -arch x86_64 -std=c11 -O1 -fno-builtin \
                 -o "$TMP/$name" "$TMP/$name.c" >"$TMP/$name.cc.log" 2>&1 || continue
         case $name in
+            sys_strings) SYS_STRINGS_BIN="$TMP/$name" ;;
+            sys_strings_fault) SYS_STRFAULT_BIN="$TMP/$name" ;;
             sys_files) SYS_FILES_BIN="$TMP/$name" ;;
             sys_mmap) SYS_MMAP_BIN="$TMP/$name" ;;
             sys_jmp) SYS_JMP_BIN="$TMP/$name" ;;
@@ -11720,6 +12245,8 @@ EOC
         clang -arch arm64 -std=c11 -O1 -fno-builtin \
                 -o "$TMP/$name.arm64" "$TMP/$name.c" >"$TMP/$name.arm64.cc.log" 2>&1 || continue
         case $name in
+            sys_strings) SYS_STRINGS_ARM64="$TMP/$name.arm64" ;;
+            sys_strings_fault) SYS_STRFAULT_ARM64="$TMP/$name.arm64" ;;
             sys_files) SYS_FILES_ARM64="$TMP/$name.arm64" ;;
             sys_mmap) SYS_MMAP_ARM64="$TMP/$name.arm64" ;;
             sys_jmp) SYS_JMP_ARM64="$TMP/$name.arm64" ;;
@@ -13182,6 +13709,9 @@ objc_import_reason() {
     fi
     allowed=" $CF_BRIDGED $CF_EXPORTS $OBJC_BRIDGED $OBJC_EXPORTS $STACK_GUARD_SYM "
     case $kind in
+        runtime)
+            allowed="$allowed$OBJC_CLASS_EXPORTS _objc_allocateClassPair _class_addIvar _class_addMethod _objc_registerClassPair _objc_disposeClassPair _class_getInstanceVariable _ivar_getOffset _object_getClass _sel_registerName _NSEqualRects "
+            about="runtime-created classes" ;;
         classes)
             allowed="$allowed$OBJC_CLASS_EXPORTS "
             about="classes of the guest's" ;;
@@ -13706,8 +14236,8 @@ case_dl_refusals() {
     elif [ -z "$reason" ]; then
         reason="$(dl_refusal_reason "$jo" \
             arm64 "$DL_REFUSED" arm64 "has no x86_64 slice" \
-            hostlib "$DL_REFUSED" hostlib "'/usr/lib/libz.1.dylib' is in the host's shared cache" \
-            bare "$DL_REFUSED" bare "'/usr/lib/libz.1.dylib'" \
+            hostlib "$DL_REFUSED" hostlib "'/usr/lib/libsqlite3.dylib' is in the host's shared cache" \
+            bare "$DL_REFUSED" bare "'/usr/lib/libsqlite3.dylib'" \
             missingdep "Library not loaded: @rpath/libdlgone.dylib" missingdep "Referenced from: $dir/libdlneedsgone.dylib" \
             missingsym "Symbol not found: _dl_vanishing" missingsym "Referenced from: $dir/libdlneedsym.dylib" \
             missingsym "Expected in: @rpath/libdlweak.dylib" \
@@ -13989,18 +14519,18 @@ case_native_unbound() {
     local name=native_unbound rc reason="" src="$TMP/unbound.c" bin="$TMP/unbound"
     local out="$TMP/native_unbound.out" err="$TMP/native_unbound.err"
     cat > "$src" <<'EOC'
-#include <zlib.h>
-int main(void) { return zlibVersion()[0] == 0; }
+#include <sqlite3.h>
+int main(void) { return sqlite3_libversion()[0] == 0; }
 EOC
-    if ! clang -arch x86_64 -fno-stack-protector -o "$bin" "$src" -lz >/dev/null 2>&1; then
+    if ! clang -arch x86_64 -fno-stack-protector -o "$bin" "$src" -lsqlite3 >/dev/null 2>&1; then
         echo "SKIP $name (no x86_64 clang toolchain)"; return
     fi
     run_bounded "$out" "$err" "$OCERZ" -v -native "$bin"
     rc=$?
     if [ "$rc" -ne 71 ]; then
         reason="exit $rc, want 71"
-    elif ! grep -Fq "${NOBIND}_zlibVersion" "$out" "$err"; then
-        reason="no 'no bridge for _zlibVersion' line"
+    elif ! grep -Fq "${NOBIND}_sqlite3_libversion" "$out" "$err"; then
+        reason="no 'no bridge for _sqlite3_libversion' line"
     elif ! grep -Fq "$M0_SUMMARY" "$out" "$err"; then
         reason="no unresolved-import summary line"
     fi
@@ -14241,6 +14771,86 @@ sys_refused_reason() {
     fi
 }
 
+case_sys_strings_inplace() {
+    local name=sys_strings_inplace reason="" sym missing="" entries=0 detail=""
+    local je="$TMP/sys_strings.jit.err"
+    if [ -z "$SYS_STRINGS_BIN" ] || [ ! -f "$je" ]; then
+        echo "SKIP $name (sys_strings did not run)"; return
+    fi
+    for sym in $SYS_STRINGS_NEED; do
+        if ! grep -q "^ocerz: jit: $sym is answered in place at " "$je"; then
+            missing="$missing $sym"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        reason="the translator did not answer$missing in place, so sys_strings passed on the ordinary crossing and says nothing about the routines in src/leaf.s"
+    elif [ "$CACHE_OK" -eq 1 ]; then
+        run_bounded "$TMP/$name.cache.out" "$TMP/$name.cache.err" "$OCERZ" -v -cache "$SYS_STRINGS_BIN"
+        entries="$(grep -c '^ocerz: jit: the routine at 0x[0-9a-f]* is answered in place$' "$TMP/$name.cache.err")"
+        if [ "$entries" -lt 10 ]; then
+            reason="cache mode answered $entries of libsystem_platform's ten routines in place, so its sys_strings run exercised Apple's x86 code and not src/leaf.s"
+        elif ! cmp -s "$TMP/$name.cache.out" "$TMP/sys_strings.jit.out"; then
+            reason="cache mode under -v printed '$(tr '\n' ' ' < "$TMP/$name.cache.out")', not what the native run printed"
+        fi
+        detail="cache=$entries"
+    fi
+    record "$name" "$reason" "${detail:-cache=skipped}"
+}
+
+case_sys_strings_fault() {
+    local name=sys_strings_fault reason="" rc_arm rc_jit rc_cache line xline cache_note=""
+    local bin="$SYS_STRFAULT_BIN" arm="$SYS_STRFAULT_ARM64"
+    local ao="$TMP/$name.arm64.out" ae="$TMP/$name.arm64.err"
+    local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
+    local co="$TMP/$name.cache.out" ce="$TMP/$name.cache.err"
+    local NATIVE_TIMEOUT=$SYS_TIMEOUT
+    local read_bits="bit 0 is strlen, 1 strchr, 2 memchr, 3 strnlen, 4 strcmp, 5 strncmp, 6 memcmp and 7 memcpy running into an inaccessible page without exactly one fault, at an address in that page, reaching the guest's handler, or returning as if nothing happened, 8 the routines not working afterwards"
+    local write_bits="bit 0 is a short memcpy, 1 a long memmove, 2 a short memset and 3 a long memset onto a read-only page without exactly one fault, in that page, reaching the handler, 4 the page not still holding what it held"
+
+    if callback_fixture_missing "$name" "$bin"; then
+        return
+    fi
+    if [ -z "$arm" ]; then
+        record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $( (grep -m1 -i 'error' "$TMP/$name.arm64.cc.log" || head -1 "$TMP/$name.arm64.cc.log") 2>/dev/null | cut -c1-160)"
+        return
+    fi
+    run_bounded "$ao" "$ae" "$arm"
+    rc_arm=$?
+    reason="$(sys_arm64_reason "$rc_arm" "$name" "$ao" "$ae" read "$read_bits" write "$write_bits")"
+    if [ -n "$reason" ]; then
+        record "$name" "$reason"
+        return
+    fi
+
+    run_bounded "$jo" "$je" "$OCERZ" -v -native "$bin"
+    rc_jit=$?
+    line="$(sys_status "$name" "$jo")"
+    xline="$(grep "^$name x86 " "$jo" | head -1)"
+    reason="$(sys_run_reason "$rc_jit" "$name" "$jo" "$je")"
+    if grep -q "^$name bad:" "$jo"; then
+        reason="'$line': the guest's own checks failed: $(sys_bits "$name" "$jo" read "$read_bits" write "$write_bits")"
+    elif [ -z "$reason" ] && ! grep -v "^$name x86 " "$jo" | cmp -s - "$ao"; then
+        reason="native '$(grep -v "^$name x86 " "$jo" | tr '\n' ' ')' != arm64 '$(tr '\n' ' ' < "$ao")'"
+    elif [ -z "$reason" ] && [ "$xline" != "$name x86 marked=12 of=12" ]; then
+        reason="'${xline:-no x86 line}': a fault inside a routine reached the handler with rbx or r12 to r15 not holding what the caller put there, so the guest's registers were not recovered from the faulting thread"
+    fi
+
+    if [ -n "$reason" ]; then
+        :
+    elif [ "$CACHE_OK" -ne 1 ]; then
+        cache_note=" cache=skipped"
+    else
+        run_bounded "$co" "$ce" "$OCERZ" -cache "$bin"
+        rc_cache=$?
+        if [ "$rc_cache" -ne 0 ]; then
+            reason="cache-mode exit $rc_cache, want 0: '$(sys_status "$name" "$co")'"
+        elif ! grep -v "^$name x86 " "$co" | cmp -s - "$ao"; then
+            reason="cache '$(grep -v "^$name x86 " "$co" | tr '\n' ' ')' != arm64 '$(tr '\n' ' ' < "$ao")'"
+        fi
+    fi
+    record "$name" "$reason" "exit=$rc_jit out='$line' ${xline#"$name "}$cache_note"
+}
+
 case_sys_jmp_refused() {
     local name=sys_jmp_refused reason="" rc_jit rc_nojit rc_cache cache_note=""
     local jo="$TMP/$name.jit.out" je="$TMP/$name.jit.err"
@@ -14330,6 +14940,47 @@ case_sys_fork_callback() {
     record "$name" "$reason" "exit=${rc_jit:-} no-jit exit=${rc_nojit:-}$cache_note"
 }
 
+build_runtime_class_fixture() {
+    OBJC_RUNTIME_BIN=""
+    OBJC_RUNTIME_ARM64=""
+    local arch out
+    for arch in x86_64 arm64; do
+        out="$TMP/native_objc_runtime.$arch"
+        if clang -arch "$arch" -O2 -framework Foundation \
+            tests/dynamic/native_objc_runtime.m -o "$out" \
+            >"$TMP/native_objc_runtime.$arch.cc.log" 2>&1; then
+            if [ "$arch" = x86_64 ]; then
+                OBJC_RUNTIME_BIN="$out"
+            else
+                OBJC_RUNTIME_ARM64="$out"
+            fi
+        fi
+    done
+}
+
+case_runtime_class_refusal() {
+    local mode rc reason out err
+    if callback_fixture_missing native_objc_runtime_refusal "$OBJC_RUNTIME_BIN"; then
+        return
+    fi
+    for mode in jit no-jit; do
+        out="$TMP/native_objc_runtime.refusal.$mode.out"
+        err="$TMP/native_objc_runtime.refusal.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out" "$err" "$OCERZ" -native -no-jit "$OBJC_RUNTIME_BIN" unsupported
+        else
+            run_bounded "$out" "$err" "$OCERZ" -native "$OBJC_RUNTIME_BIN" unsupported
+        fi
+        rc=$?
+        reason=""
+        if [ "$rc" -ne 72 ] || ! grep -q 'class_addMethod cannot cross: a long double' "$err"; then
+            reason="exit=$rc; expected a named refusal for the long-double method"
+        fi
+        record "native_objc_runtime_refusal_$mode" "$reason"
+    done
+}
+
+build_runtime_class_fixture
 build_fixtures
 build_callback_fixtures
 build_attach_fixtures
@@ -14447,6 +15098,10 @@ case_cf cf_callbacks "$CF_CALLBACKS_BIN" "$CF_CALLBACKS_ARM64" cf_callbacks "" \
 case_cf cf_runloop "$CF_RUNLOOP_BIN" "$CF_RUNLOOP_ARM64" cf_runloop "" \
     "cf_runloop is the first case whose guest code is called from a framework's event loop rather than from a call made for the purpose, which is how every event reaches an application, so a failure here means no event-driven guest program can run in native mode" \
     loop "bit 0 is CFRunLoopGetCurrent not the main run loop on the main thread, 1 creating the timer, observer or source failing, or a context not retained exactly once on creation, 2 CFRunLoopTimerGetNextFireDate not the date CFRunLoopTimerSetNextFireDate set, 3 CFRunLoopRunInMode not returning kCFRunLoopRunStopped, 4 the timer not firing exactly three times with its own timer and info, or found invalid inside its callout, 5 the source's perform not run exactly once between each pair of fires, 6 the observer not seeing exactly one entry, first, at least one wait and nothing else, or handed another observer or info, 7 schedule not called once when the source was added, or cancel not once when it was removed and not again on invalidation, 8 a source callout handed another info, run loop or mode, or a callout run on another run loop, 9 CFRunLoopTimerIsValid not exactly true before and after the timer's removal and exactly false after its invalidation, 10 the timer's context not retained and released four times, once per callout and once for the timer, by the time it was invalidated, 11 the observer's context not retained and released exactly once, 12 the source's context the same, or a context callback handed an info the fixture never gave, 13 a callback entered on a misaligned stack"
+case_objc native_objc_runtime "$OBJC_RUNTIME_BIN" "$OBJC_RUNTIME_ARM64" native_objc_runtime \
+    "_objc_allocateClassPair _class_addMethod _class_addIvar _objc_registerClassPair" runtime \
+    "Runtime-created methods must invoke guest code through the native Objective-C runtime."
+case_runtime_class_refusal
 case_objc objc_foundation "$OBJC_FOUNDATION_BIN" "$OBJC_FOUNDATION_ARM64" objc_foundation \
     "_objc_msgSend _objc_autoreleasePoolPush $CF_CLASS_SYM _OBJC_CLASS_\$_NSConstantIntegerNumber _OBJC_CLASS_\$_NSConstantDoubleNumber" "" \
     "objc_foundation is the plainest use of Objective-C there is, messages to Foundation's own classes with no class of the guest's, so a failure here means no guest program that sends a message can run in native mode" \
@@ -14542,7 +15197,7 @@ case_dl_basic \
     callbacks "bit 0 is the add-image callback not called once per image already loaded when it was registered, 1 not called for the main executable, 2 nor for the dlopened dylib, 3 nor for the bundle, 4 called other than once per image in the list, 5 an image in the list the callback never saw" \
     version "bit 0 is dyld_get_active_platform not macOS, 1 dyld_get_program_min_os_version not the 12.0 the fixture was linked for, 2 dyld_get_program_sdk_version below it, 3 dyld_program_sdk_at_least wrong for 10.14 or 127.0, 4 _dyld_shared_cache_contains_path not true for libSystem, 5 true for the fixture's own dylib, 6 _dyld_is_memory_immutable true for heap memory"
 case_dl_refusals \
-    "bit 0 is the arm64-only dylib, 1 libz by path, 2 libz by bare name, 3 the dylib with a deleted dependency and 4 the dylib missing a symbol not refused with an error and the image count unchanged, 5 the second attempt at the last not failing with the same message, 6 a plain dylib not loading after those failures, 7 libc.dylib not answering libSystem with the program's own strlen, 8 RTLD_NOLOAD of libSystem not the same handle, 9 CoreFoundation loaded before anything asked, 10 CoreFoundation through its framework symlink not loading as one more image, 11 that image not named for its Versions/A install name, 12 dlopen_preflight wrong for libSystem or libz"
+    "bit 0 is the arm64-only dylib, 1 sqlite3 by path, 2 sqlite3 by bare name, 3 the dylib with a deleted dependency and 4 the dylib missing a symbol not refused with an error and the image count unchanged, 5 the second attempt at the last not failing with the same message, 6 a plain dylib not loading after those failures, 7 libc.dylib not answering libSystem with the program's own strlen, 8 RTLD_NOLOAD of libSystem not the same handle, 9 CoreFoundation loaded before anything asked, 10 CoreFoundation through its framework symlink not loading as one more image, 11 that image not named for its Versions/A install name, 12 dlopen_preflight wrong for libSystem or sqlite3"
 case_env_native
 case_flag_beats_env
 case_last_flag_native
@@ -14590,6 +15245,14 @@ case_sys sys_proc "$SYS_PROC_BIN" "$SYS_PROC_ARM64" sys_proc "$SYS_PROC_NEED" "$
     shell "bit 0 is system(NULL) not reporting a shell, 1 system(\"exit 3\") not returning 3, 2 system running the fixture not returning its exit 25, 3 a shell loop not returning 4, 4 popen for reading not delivering the child's line, 5 pclose not returning its exit 23, 6 popen for writing failing, 7 the sink child not counting 42 bytes, 8 popen r+ not accepting a line, 9 the shell not echoing it back, 10 pclose of it failing, 11 popen with a bad type not failing with EINVAL, 12 pclose of a stream popen never made not failing"
 case_sys_jmp_refused
 case_sys_fork_callback
+case_sys sys_strings "$SYS_STRINGS_BIN" "$SYS_STRINGS_ARM64" sys_strings "$SYS_STRINGS_NEED" "" \
+    "sys_strings is the case that fails if a routine translated code runs in place of libSystem's own reads past a page end, stores outside its destination or answers otherwise than the host's" \
+    scan "bit 0 is strlen, 1 strnlen, 2 strchr and 3 memchr disagreeing with a byte loop for a string at some alignment whose last byte is up to twenty bytes before an inaccessible page, with limits on both sides of the length and one that wraps the address space" \
+    compare "bit 0 is strcmp, 1 strncmp and 2 memcmp not having the sign a byte loop finds, for two strings each against its own inaccessible page that differ at one position by bytes on either side of 0x80, 3 bcmp not zero exactly when the bytes are equal" \
+    move "bit 0 is memcpy leaving anything in a 704-byte arena other than what a byte loop leaves, 1 memcpy, memmove or memset not returning its destination, 2 memmove wrong at some distance from a hundred bytes below its source to a hundred above, 3 memset wrong, 4 a length on either side of the 16384 bytes past which the host's own routine is called wrong, 5 a copy or a fill that ends at an inaccessible page wrong" \
+    x86 "bit 0 is the writable and executable mapping failing, 1 a function memcpy wrote over code already translated not being what runs next, 2 the same for memset, 3 munmap failing"
+case_sys_strings_inplace
+case_sys_strings_fault
 
 echo "----------------------------------------"
 echo "native tests: $pass passed, $fail failed"

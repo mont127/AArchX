@@ -1,0 +1,18 @@
+library /usr/lib/libresolv.9.dylib
+sdk macos 27.0
+exports 155
+fn 90
+data 6
+var 0
+special 0
+stub callback-struct 27
+stub no-declaration 32
+host-missing 0
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 4
+override-shapes 0
+override-structs 0
+override-opaque 0

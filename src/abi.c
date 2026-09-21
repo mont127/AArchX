@@ -257,6 +257,7 @@
  * refused at run time is a wrong answer handed to native code that carries on
  * regardless.
  */
+#include "ocerz/dyld.h"
 #include "ocerz/abi.h"
 #include "ocerz/blocks.h"
 #include "ocerz/bridge.h"
@@ -264,6 +265,7 @@
 #include "ocerz/interp.h"
 #include "ocerz/vm.h"
 
+#include <errno.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -1544,8 +1546,9 @@ static void abi_host_struct_result(const OcerzAbiStruct *st, const OcerzGuestCal
     }
 }
 
-void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
-                                 const uint8_t *stack, void *x8, uint64_t *out_x, uint64_t *out_v)
+static void abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
+                                  const uint8_t *stack, void *x8, uint64_t *out_x, uint64_t *out_v,
+                                  int entered_errno, uint64_t *gs_out)
 {
     if (out_x)
         memset(out_x, 0, 2 * sizeof *out_x);
@@ -1590,6 +1593,11 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
     OcerzVM *vm = cpu->vm;
     if (!vm || vm->exited)
         return;
+
+    if (cpu->gs_base) {
+        *gs_out = cpu->gs_base;
+        ocerz_st(cpu->gs_base + OCERZ_ERRNO_SLOT, 4, (uint32_t)entered_errno);
+    }
 
     OcerzGuestCall call;
     memset(&call, 0, sizeof call);
@@ -1724,4 +1732,13 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
 out:
     while (nowned > 0)
         ocerz_block_release(owned[--nowned]);
+}
+
+void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
+                                 const uint8_t *stack, void *x8, uint64_t *out_x, uint64_t *out_v)
+{
+    int entered = errno;
+    uint64_t gs = 0;
+    abi_callback_dispatch(slot, x, v, stack, x8, out_x, out_v, entered, &gs);
+    errno = gs ? (int)ocerz_ld(gs + OCERZ_ERRNO_SLOT, 4) : entered;
 }

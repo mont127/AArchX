@@ -142,6 +142,7 @@ void ocerz_bridge_guest_leave(const struct OcerzBridgeFrame *saved);
 void ocerz_bridge_raise(struct OcerzBridgeFrame *outer, const char *lib, const char *sym,
                         const char *sig, const void *host_fn);
 void ocerz_bridge_lower(const struct OcerzBridgeFrame *outer);
+const int *ocerz_bridge_depth_ptr(void);
 uint64_t ocerz_bridge_level(void);
 const struct OcerzBridgeFrame *ocerz_bridge_callback_frame(void);
 void ocerz_bridge_return(OcerzCPU *cpu, uint64_t rax);
@@ -156,6 +157,8 @@ void ocerz_bridge_postfork_child(void);
 
 void *ocerz_bridge_host_library(const char *install_name);
 void *ocerz_bridge_host_symbol(const char *install_name, const char *host_sym);
+uint64_t ocerz_bridge_native_thunk(const void *fn, const char *name, const char *notation);
+int ocerz_bridge_thunk_trap(struct OcerzVM *vm, OcerzCPU *cpu);
 void ocerz_bridge_set_process_args(int argc, char **argv);
 
 #endif

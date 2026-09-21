@@ -94,6 +94,14 @@ typedef struct AdStructRec {
     const char *shape;
 } AdStructRec;
 
+typedef struct AdInplaceRec {
+    int line;
+    const char *export_name;
+    int argpos;
+    uint32_t offset;
+    const char *sig;
+} AdInplaceRec;
+
 typedef struct AdParse {
     const char *path;
     char *err;
@@ -110,6 +118,9 @@ typedef struct AdParse {
     AdStructRec *structs;
     int nstructs;
     int cstructs;
+    AdInplaceRec *inplace;
+    int ninplace;
+    int cinplace;
 } AdParse;
 
 static int ad_refuse(AdParse *p, int line, const char *fmt, ...)
@@ -410,11 +421,73 @@ static int ad_record(AdParse *p, int line, char **f, int nf)
         r->shape = f[3];
         return 1;
     }
+    if (strcmp(kind, "inplace") == 0) {
+        uint64_t off = 0;
+        OcerzAbiSig sig;
+        if (nf != 5)
+            return ad_refuse(p, line, "an inplace record has %d fields, want 5: inplace <export> "
+                             "<argpos> <offset> <signature>", nf);
+        if (!ad_decimal(f[2], OCERZ_ABI_MAX_ARGS - 1, &num))
+            return ad_refuse(p, line, "inplace %s names argument %s, want a decimal position from 0 "
+                             "to %d", f[1], f[2], OCERZ_ABI_MAX_ARGS - 1);
+        if (!ad_decimal(f[3], OCERZ_APIDB_INPLACE_MAX_OFFSET, &off) || (off & 7))
+            return ad_refuse(p, line, "inplace %s names offset %s, want a multiple of 8 from 0 to %d",
+                             f[1], f[3], OCERZ_APIDB_INPLACE_MAX_OFFSET);
+        if (ocerz_abi_parse(f[4], &sig) != OCERZ_OK)
+            return ad_refuse(p, line, "inplace %s gives the signature %s, which is not notation", f[1],
+                             f[4]);
+        if (!ad_grow((void **)&p->inplace, &p->cinplace, p->ninplace + 1, sizeof *p->inplace))
+            return ad_refuse(p, line, "out of memory");
+        AdInplaceRec *r = &p->inplace[p->ninplace++];
+        r->line = line;
+        r->export_name = f[1];
+        r->argpos = (int)num;
+        r->offset = (uint32_t)off;
+        r->sig = f[4];
+        return 1;
+    }
     if (strcmp(kind, "ocerz-apidb") == 0 || strcmp(kind, "library") == 0 ||
         strcmp(kind, "sdk") == 0)
         return ad_refuse(p, line, "a %s record may appear only once, in the header", kind);
-    return ad_refuse(p, line, "%s is not a record kind; want fn, data, var, special, stub, shape or "
-                     "struct", kind);
+    return ad_refuse(p, line, "%s is not a record kind; want fn, data, var, special, stub, shape, "
+                     "struct or inplace", kind);
+}
+
+static int ad_resolve_inplace(AdParse *p)
+{
+    for (int i = 0; i < p->ninplace; i++) {
+        AdInplaceRec *r = &p->inplace[i];
+        int k = ad_hash_find(p->lib, p->entries, r->export_name);
+        if (k < 0)
+            return ad_refuse(p, r->line, "inplace names %s, which no fn record declares",
+                             r->export_name);
+        OcerzApiEntry *e = &p->entries[k];
+        if (e->kind != OCERZ_API_FN)
+            return ad_refuse(p, r->line, "inplace names %s, which is a %s record on line %d, not a "
+                             "fn record", r->export_name, ad_kind_name(e->kind),
+                             p->entry_line[k]);
+        OcerzAbiSig sig;
+        if (ocerz_abi_parse(e->sig, &sig) != OCERZ_OK || r->argpos >= sig.nargs ||
+            sig.arg[r->argpos] != 'p')
+            return ad_refuse(p, r->line, "inplace binds argument %d of %s, which its signature %s "
+                             "does not declare as a pointer", r->argpos, r->export_name, e->sig);
+        for (int j = 0; j < e->ninplace; j++)
+            if (e->inplace[j].argpos == r->argpos && e->inplace[j].offset == r->offset)
+                return ad_refuse(p, r->line, "offset %u of argument %d of %s is already converted in "
+                                 "place", r->offset, r->argpos, r->export_name);
+        for (int j = 0; j < e->nstructs; j++)
+            if (e->structs[j].argpos == r->argpos)
+                return ad_refuse(p, r->line, "argument %d of %s is bound to a shape, which copies it, "
+                                 "and cannot also be converted in place", r->argpos, r->export_name);
+        if (e->ninplace >= OCERZ_APIDB_INPLACE)
+            return ad_refuse(p, r->line, "%s already has the %d inplace records one fn may have",
+                             r->export_name, OCERZ_APIDB_INPLACE);
+        e->inplace[e->ninplace].argpos = r->argpos;
+        e->inplace[e->ninplace].offset = r->offset;
+        e->inplace[e->ninplace].sig = r->sig;
+        e->ninplace++;
+    }
+    return 1;
 }
 
 static int ad_resolve_structs(AdParse *p)
@@ -464,6 +537,7 @@ static void ad_free_parse(AdParse *p)
     free(p->shapes);
     free(p->shape_line);
     free(p->structs);
+    free(p->inplace);
     if (p->lib) {
         free(p->lib->hash);
         free(p->lib->text);
@@ -597,7 +671,7 @@ const OcerzApiLibrary *ocerz_apidb_parse(const char *path, const char *text, siz
                   stage == 0 ? "ocerz-apidb header" : stage == 1 ? "library" : "sdk");
         goto refuse;
     }
-    if (!ad_resolve_structs(&p))
+    if (!ad_resolve_structs(&p) || !ad_resolve_inplace(&p))
         goto refuse;
 
     p.lib->pub.path = p.lib->path;
@@ -608,6 +682,7 @@ const OcerzApiLibrary *ocerz_apidb_parse(const char *path, const char *text, siz
     free(p.entry_line);
     free(p.shape_line);
     free(p.structs);
+    free(p.inplace);
     return &p.lib->pub;
 
 refuse:
@@ -646,6 +721,20 @@ static AdSlot *_Atomic g_ad_slots;
 static _Atomic int g_ad_chosen;
 static uint32_t g_ad_minos;
 static char g_ad_dir[PATH_MAX];
+
+static void ad_preload_once(void)
+{
+    int n = 0;
+    const char **names = ocerz_apidb_install_names(&n);
+    for (int i = 0; i < n; i++)
+        ocerz_apidb_library(names[i]);
+}
+
+void ocerz_apidb_preload(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, ad_preload_once);
+}
 
 void ocerz_apidb_postfork_child(void)
 {
@@ -819,6 +908,37 @@ static char *ad_read_file(const char *path, size_t *len_out, int *missing)
     return buf;
 }
 
+static const char *ad_leaf(const char *install_name)
+{
+    const char *leaf = strrchr(install_name, '/');
+    return leaf ? leaf + 1 : install_name;
+}
+
+static AdSlot *ad_find_leaf_locked(const char *install_name)
+{
+    const char *leaf = ad_leaf(install_name);
+    for (AdSlot *s = g_ad_slots; s; s = s->next)
+        if (strcmp(ad_leaf(s->install_name), leaf) == 0)
+            return s;
+    return NULL;
+}
+
+static AdSlot *ad_publish_locked(const char *install_name, const OcerzApiLibrary *lib)
+{
+    AdSlot *s = calloc(1, sizeof *s);
+    char *name = strdup(install_name);
+    if (!s || !name) {
+        free(s);
+        free(name);
+        return NULL;
+    }
+    s->install_name = name;
+    s->lib = lib;
+    s->next = g_ad_slots;
+    g_ad_slots = s;
+    return s;
+}
+
 static const OcerzApiLibrary *ad_load_locked(const char *install_name)
 {
     ad_choose_locked();
@@ -837,8 +957,9 @@ static const OcerzApiLibrary *ad_load_locked(const char *install_name)
     int missing = 0;
     char *text = ad_read_file(path, &len, &missing);
     if (!text) {
+        int why = errno;
         if (!missing)
-            fprintf(stderr, "ocerz: apidb: cannot read %s\n", path);
+            fprintf(stderr, "ocerz: apidb: cannot read %s: %s\n", path, strerror(why));
         return NULL;
     }
     char err[512];
@@ -850,13 +971,7 @@ static const OcerzApiLibrary *ad_load_locked(const char *install_name)
     }
     if (strcmp(lib->install_name, install_name) != 0) {
         OCERZ_LOG("apidb: %s describes %s, not %s\n", path, lib->install_name, install_name);
-        AdLibrary *al = (AdLibrary *)lib;
-        free(al->hash);
-        free(al->text);
-        free(al->path);
-        free((void *)lib->entries);
-        free((void *)lib->shapes);
-        free(al);
+        ad_publish_locked(lib->install_name, lib);
         return NULL;
     }
     OCERZ_LOG("apidb: loaded %s, %d exports and %d shapes\n", path, lib->nentries, lib->nshapes);
@@ -882,21 +997,112 @@ const OcerzApiLibrary *ocerz_apidb_library(const char *install_name)
     pthread_mutex_lock(&g_ad_lock);
     s = ad_find_slot(install_name);
     if (!s) {
-        const OcerzApiLibrary *lib = ad_load_locked(install_name);
-        s = calloc(1, sizeof *s);
-        char *name = strdup(install_name);
-        if (s && name) {
-            s->install_name = name;
-            s->lib = lib;
-            s->next = g_ad_slots;
-            g_ad_slots = s;
-        } else {
-            free(s);
-            free(name);
+        const OcerzApiLibrary *lib =
+            ad_find_leaf_locked(install_name) ? NULL : ad_load_locked(install_name);
+        s = ad_publish_locked(install_name, lib);
+        if (!s) {
             pthread_mutex_unlock(&g_ad_lock);
             return lib;
         }
     }
     pthread_mutex_unlock(&g_ad_lock);
     return s->lib;
+}
+
+static char **g_ad_names;
+static int g_ad_names_n;
+
+const char **ocerz_apidb_install_names(int *count)
+{
+    if (count)
+        *count = 0;
+    pthread_mutex_lock(&g_ad_lock);
+    ad_choose_locked();
+    if (!g_ad_names && g_ad_dir[0]) {
+        DIR *d = opendir(g_ad_dir);
+        if (d) {
+            struct dirent *de;
+            char **names = NULL;
+            int cap = 0, n = 0;
+            static const char header[] = "ocerz-apidb 1";
+            static const char prefix[] = "library ";
+            while ((de = readdir(d)) != NULL) {
+                size_t L = strlen(de->d_name);
+                char path[PATH_MAX];
+                size_t len = 0;
+                int missing = 0;
+                char *text;
+                char *nl, *second, *send;
+                size_t ilen;
+                char *name;
+                if (L < 5 || strcmp(de->d_name + L - 4, ".api") != 0)
+                    continue;
+                int m = snprintf(path, sizeof path, "%s/%s", g_ad_dir, de->d_name);
+                if (m <= 0 || (size_t)m >= sizeof path)
+                    continue;
+                text = ad_read_file(path, &len, &missing);
+                if (!text)
+                    continue;
+                nl = NULL;
+                second = NULL;
+                send = NULL;
+                {
+                    char *line = text;
+                    char *lend = NULL;
+                    char *first = NULL;
+                    int records = 0;
+                    while ((size_t)(line - text) < len && records < 2) {
+                        lend = memchr(line, '\n', len - (size_t)(line - text));
+                        if (!lend)
+                            lend = text + len;
+                        if (lend != line && line[0] != '#') {
+                            records++;
+                            if (records == 1) {
+                                first = line;
+                                nl = lend;
+                            } else {
+                                second = line;
+                                send = lend;
+                            }
+                        }
+                        line = lend + 1;
+                    }
+                    if (records < 2 || (size_t)(nl - first) != sizeof header - 1 ||
+                        memcmp(first, header, sizeof header - 1) != 0) {
+                        free(text);
+                        continue;
+                    }
+                }
+                if (second && (size_t)(send - second) > sizeof prefix &&
+                    memcmp(second, prefix, sizeof prefix - 1) == 0) {
+                    ilen = (size_t)(send - second) - (sizeof prefix - 1);
+                    name = malloc(ilen + 1);
+                    if (name) {
+                        memcpy(name, second + sizeof prefix - 1, ilen);
+                        name[ilen] = '\0';
+                        if (n >= cap) {
+                            int nc = cap ? cap * 2 : 32;
+                            char **nn = realloc(names, (size_t)nc * sizeof *nn);
+                            if (!nn) {
+                                free(name);
+                                free(text);
+                                break;
+                            }
+                            names = nn;
+                            cap = nc;
+                        }
+                        names[n++] = name;
+                    }
+                }
+                free(text);
+            }
+            closedir(d);
+            g_ad_names = names;
+            g_ad_names_n = n;
+        }
+    }
+    if (count)
+        *count = g_ad_names_n;
+    pthread_mutex_unlock(&g_ad_lock);
+    return (const char **)g_ad_names;
 }

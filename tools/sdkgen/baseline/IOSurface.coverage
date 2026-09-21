@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface
+sdk macos 27.0
+exports 392
+fn 51
+data 233
+var 0
+special 0
+stub no-declaration 100
+omit objc-ivar 8
+host-missing 0
+objc-classes 8
+objc-eh-types 0
+objc-ivars 8
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

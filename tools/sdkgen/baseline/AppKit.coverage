@@ -1,22 +1,22 @@
 library /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
 sdk macos 27.0
 exports 12438
-fn 77
-data 3991
+fn 82
+data 4033
 var 0
 special 0
-stub no-declaration 2945
+stub no-declaration 4349
 stub override 1
 stub variadic 12
-omit no-declaration-missing 2687
+omit no-declaration-missing 179
 omit objc-ivar 581
-omit swift 2144
-host-missing 69
+omit swift 3201
+host-missing 0
 objc-classes 837
 objc-eh-types 0
 objc-ivars 581
 ld-pseudo-skipped 2163
-overrides 1
+overrides 6
 override-shapes 0
 override-structs 0
 override-opaque 0

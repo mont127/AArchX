@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/CoreText.framework/Versions/A/CoreText
+sdk macos 27.0
+exports 1031
+fn 204
+data 474
+var 0
+special 0
+stub callback-struct 1
+stub no-declaration 297
+omit objc-ivar 7
+omit swift 48
+host-missing 0
+objc-classes 8
+objc-eh-types 0
+objc-ivars 7
+ld-pseudo-skipped 0
+overrides 1
+override-shapes 0
+override-structs 0
+override-opaque 0

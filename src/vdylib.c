@@ -128,6 +128,14 @@
  * the run without comparing anything.  The loader builds a given install name
  * once, so a running guest only ever sees one value.
  *
+ * ---- the page size ----
+ * The page_size, page_mask and page_shift fillers write 4096, 4095 and 12.
+ * They stand behind vm_page_size and its relatives, which on this host hold
+ * 16384: an Intel Mac has 4 KB pages, x86 programs are compiled knowing it, and
+ * one that reads the host's value in one place and its own constant in another
+ * fails its own consistency checks.  ocerz's memory layer already gives the
+ * guest 4 KB pages over the host's.
+ *
  * Its lowest byte is always zero.  x86 is little-endian and the copy sits above
  * the locals it guards, so the lowest byte is the first one an overrun climbing
  * out of a buffer reaches.  A string copy can write a zero only as its
@@ -286,17 +294,21 @@
 #include "ocerz/abi.h"
 #include "ocerz/apidb.h"
 #include "ocerz/blocks.h"
+#include "ocerz/dyld.h"
+#include "ocerz/objcbridge.h"
 #include "ocerz/bridge.h"
 #include "ocerz/dyldapi.h"
 #include "ocerz/flags.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"
+#include "ocerz/leaf.h"
 #include "ocerz/mem.h"
 #include "ocerz/vm.h"
 
 #include <dirent.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <mach-o/loader.h>
@@ -315,6 +327,8 @@
 #define VD_NONE ((const struct OcerzBridgeFn *)(uintptr_t)1)
 #define VD_INTERNAL_ORD (VD_LIBS_MAX - 1)
 #define VD_TRAMP_SLOTS 0x800u
+#define VD_LEAF_LIBRARY "/usr/lib/libSystem.B.dylib"
+#define VD_LEAF_WRITE_MAX 16384u
 
 typedef struct VdInternal {
     const char *name;
@@ -323,6 +337,8 @@ typedef struct VdInternal {
 
 static const VdInternal g_vd_internal[] = {
     { "(native block invoke)", ocerz_block_invoke_trap },
+    { "(native IMP)", ocerz_objc_imp_trap },
+    { "(native function)", ocerz_bridge_thunk_trap },
 };
 
 #define VD_NINTERNAL ((uint32_t)(sizeof g_vd_internal / sizeof g_vd_internal[0]))
@@ -346,8 +362,32 @@ static void vd_fill_stack_guard(uint8_t *slot, uint32_t size)
     slot[0] = 0;
 }
 
+static void vd_fill_value(uint8_t *slot, uint32_t size, uint64_t value)
+{
+    for (uint32_t i = 0; i < size; i++)
+        slot[i] = i < 8 ? (uint8_t)(value >> (8 * i)) : 0;
+}
+
+static void vd_fill_page_size(uint8_t *slot, uint32_t size)
+{
+    vd_fill_value(slot, size, OCERZ_GUEST_PAGE_SIZE);
+}
+
+static void vd_fill_page_mask(uint8_t *slot, uint32_t size)
+{
+    vd_fill_value(slot, size, OCERZ_GUEST_PAGE_SIZE - 1);
+}
+
+static void vd_fill_page_shift(uint8_t *slot, uint32_t size)
+{
+    vd_fill_value(slot, size, 12);
+}
+
 static const VdFiller g_vd_fillers[] = {
     { "stack_guard", vd_fill_stack_guard },
+    { "page_size", vd_fill_page_size },
+    { "page_mask", vd_fill_page_mask },
+    { "page_shift", vd_fill_page_shift },
 };
 
 static const VdFiller *vd_filler(const char *name)
@@ -357,6 +397,19 @@ static const VdFiller *vd_filler(const char *name)
             return &g_vd_fillers[i];
     return NULL;
 }
+
+#define VD_LEGACY_MAX 8
+
+static const struct {
+    const char *lib;
+    const char *export_name;
+    const char *host;
+} g_vd_legacy[] = {
+    { "/System/Library/Frameworks/CoreLocation.framework/Versions/A/CoreLocation",
+      "_kCLLocationAccuracyBest", "kCLLocationAccuracyBest" },
+    { "/System/Library/Frameworks/CoreLocation.framework/Versions/A/CoreLocation",
+      "_kCLLocationAccuracyHundredMeters", "kCLLocationAccuracyHundredMeters" },
+};
 
 typedef struct VdLib {
     const OcerzApiLibrary *api;
@@ -777,8 +830,8 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
     uint64_t vars_off = vd_round_up(slots_off + slots_size, VD_SLOT_BYTES);
 
     uint64_t *var_addr = calloc((size_t)ne + 1, sizeof *var_addr);
-    VdSym *syms = calloc((size_t)ne + 1, sizeof *syms);
-    VdNode *nodes = calloc(2 * (size_t)ne + 2, sizeof *nodes);
+    VdSym *syms = calloc((size_t)ne + 1 + VD_LEGACY_MAX, sizeof *syms);
+    VdNode *nodes = calloc(2 * ((size_t)ne + VD_LEGACY_MAX) + 2, sizeof *nodes);
     uint8_t *buf = NULL;
     if (!var_addr || !syms || !nodes) {
         OCERZ_FATAL("out of memory building virtual %s\n", name);
@@ -827,6 +880,20 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
             m++;
         }
     }
+    for (size_t li = 0; li < sizeof g_vd_legacy / sizeof g_vd_legacy[0]; li++) {
+        if (strcmp(g_vd_legacy[li].lib, name) != 0)
+            continue;
+        void *host = host_sym(name, g_vd_legacy[li].host);
+        if (!host) {
+            OCERZ_LOG("vdylib: host %s has no %s, so virtual %s does not export %s\n",
+                      name, g_vd_legacy[li].host, name, g_vd_legacy[li].export_name);
+            continue;
+        }
+        syms[m].name = g_vd_legacy[li].export_name;
+        syms[m].addr = (uint64_t)(uintptr_t)host;
+        syms[m].absolute = 1;
+        m++;
+    }
 
     uint64_t data_used = vars_end - slots_off;
     uint64_t data_size = vd_round_up(data_used ? data_used : 1, VD_PAGE);
@@ -843,7 +910,7 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
     VdTrie trie;
     trie.node = nodes;
     trie.n = 0;
-    trie.cap = 2 * ne + 2;
+    trie.cap = 2 * ((size_t)ne + VD_LEGACY_MAX) + 2;
     trie.overflow = 0;
     trie.sym = syms;
     if (vd_trie_build(&trie, 0, m, 0) != 0 || trie.overflow) {
@@ -967,6 +1034,18 @@ uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
     return ocerz_vdylib_image_with(install_name, ocerz_bridge_host_symbol, len_out);
 }
 
+static inline void vd_errno_enter(const OcerzCPU *cpu)
+{
+    if (cpu->gs_base)
+        errno = (int)ocerz_ld(cpu->gs_base + OCERZ_ERRNO_SLOT, 4);
+}
+
+static inline void vd_errno_leave(const OcerzCPU *cpu)
+{
+    if (cpu->gs_base)
+        ocerz_st(cpu->gs_base + OCERZ_ERRNO_SLOT, 4, (uint32_t)errno);
+}
+
 static inline __attribute__((always_inline)) int vd_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     static int hooked = -1;
@@ -978,8 +1057,12 @@ static inline __attribute__((always_inline)) int vd_dispatch(struct OcerzVM *vm,
 
     uint64_t id = cpu->gpr[OCERZ_R11] & 0xffffffffull;
     const VdInternal *in = vd_internal_of_id(id);
-    if (in)
-        return in->handler(vm, cpu);
+    if (in) {
+        vd_errno_enter(cpu);
+        int irc = in->handler(vm, cpu);
+        vd_errno_leave(cpu);
+        return irc;
+    }
     const OcerzApiEntry *e = NULL;
     VdLib *lib = vd_lib_of_id(id, &e);
     if (!lib) {
@@ -996,8 +1079,12 @@ static inline __attribute__((always_inline)) int vd_dispatch(struct OcerzVM *vm,
             fn = VD_NONE;
         *slot = fn;
     }
-    if (fn != VD_NONE)
-        return ocerz_bridge_invoke(vm, cpu, fn);
+    if (fn != VD_NONE) {
+        vd_errno_enter(cpu);
+        int frc = ocerz_bridge_invoke(vm, cpu, fn);
+        vd_errno_leave(cpu);
+        return frc;
+    }
 
     fprintf(stderr, "ocerz: bridge: %s %s not implemented\n", lib->api->install_name,
             e->export_name);
@@ -1035,6 +1122,43 @@ int ocerz_vdylib_xmm_contract(uint64_t id, uint16_t *in, uint16_t *out)
         return 1;
     }
     return 0;
+}
+
+static const struct {
+    const char *export_name;
+    const char *host;
+    const char *sig;
+    void (*routine)(void);
+    uint64_t rdx_limit;
+} g_vd_leaf[] = {
+    { "_strlen", "strlen", "L(p)", ocerz_leaf_strlen, 0 },
+    { "_strnlen", "strnlen", "L(pL)", ocerz_leaf_strnlen, 0 },
+    { "_strcmp", "strcmp", "i(pp)", ocerz_leaf_strcmp, 0 },
+    { "_strncmp", "strncmp", "i(ppL)", ocerz_leaf_strncmp, 0 },
+    { "_memcmp", "memcmp", "i(ppL)", ocerz_leaf_memcmp, 0 },
+    { "_bcmp", "bcmp", "i(ppL)", ocerz_leaf_memcmp, 0 },
+    { "_strchr", "strchr", "p(pi)", ocerz_leaf_strchr, 0 },
+    { "_memchr", "memchr", "p(piL)", ocerz_leaf_memchr, 0 },
+    { "_memcpy", "memcpy", "p(ppL)", ocerz_leaf_memmove, VD_LEAF_WRITE_MAX },
+    { "_memmove", "memmove", "p(ppL)", ocerz_leaf_memmove, VD_LEAF_WRITE_MAX },
+    { "_memset", "memset", "p(piL)", ocerz_leaf_memset, VD_LEAF_WRITE_MAX },
+};
+
+const void *ocerz_vdylib_leaf(uint64_t id, uint64_t *rdx_limit)
+{
+    const OcerzApiEntry *e = NULL;
+    VdLib *lib = vd_lib_of_id(id, &e);
+    if (!lib || !rdx_limit || e->kind != OCERZ_API_FN || !e->host || !e->sig || e->nstructs ||
+        e->ninplace || strcmp(lib->api->install_name, VD_LEAF_LIBRARY) != 0)
+        return NULL;
+    for (size_t k = 0; k < sizeof g_vd_leaf / sizeof g_vd_leaf[0]; k++)
+        if (strcmp(e->export_name, g_vd_leaf[k].export_name) == 0) {
+            if (strcmp(e->host, g_vd_leaf[k].host) != 0 || strcmp(e->sig, g_vd_leaf[k].sig) != 0)
+                return NULL;
+            *rdx_limit = g_vd_leaf[k].rdx_limit;
+            return (const void *)(uintptr_t)g_vd_leaf[k].routine;
+        }
+    return NULL;
 }
 
 int ocerz_vdylib_trap_only(uint64_t id)

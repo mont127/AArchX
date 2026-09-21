@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore
+sdk macos 27.0
+exports 2071
+fn 16
+data 1090
+var 0
+special 0
+stub no-declaration 956
+omit objc-ivar 9
+host-missing 0
+objc-classes 118
+objc-eh-types 0
+objc-ivars 9
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

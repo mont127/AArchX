@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/Vision.framework/Versions/A/Vision
+sdk macos 27.0
+exports 11193
+fn 10
+data 853
+var 0
+special 0
+stub no-declaration 4769
+stub unsupported-type 2
+omit no-declaration-missing 27
+omit swift 5532
+host-missing 0
+objc-classes 232
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 147
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

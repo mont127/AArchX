@@ -2,21 +2,21 @@ library /usr/lib/libobjc.A.dylib
 sdk macos 27.0
 exports 414
 fn 173
-data 60
+data 62
 var 0
-special 10
-stub callback-result 2
-stub no-declaration 107
-stub override 52
+special 17
+stub callback-result 1
+stub no-declaration 109
+stub override 46
 stub struct-callback 2
-omit no-declaration-missing 6
+omit no-declaration-missing 2
 omit objc-ivar 2
-host-missing 2
+host-missing 1
 objc-classes 3
 objc-eh-types 0
 objc-ivars 2
 ld-pseudo-skipped 9
-overrides 104
+overrides 107
 override-shapes 0
 override-structs 0
 override-opaque 0

@@ -239,6 +239,8 @@
 #include "ocerz/dyld.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"
+#include "ocerz/leaf.h"
+#include "ocerz/mode.h"
 #include "ocerz/flags.h"
 #include "ocerz/mem.h"
 #include "ocerz/cache.h"
@@ -246,6 +248,7 @@
 #include "ocerz/dyldapi.h"
 #include "ocerz/bridge.h"
 
+#include <dlfcn.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -259,6 +262,8 @@
 #include <time.h>
 #include <sys/sysctl.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <malloc/malloc.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 
@@ -356,6 +361,7 @@ static int susp_stop_is_safe(OcerzCPU *t)
         return 0;
     if (__atomic_load_n(&t->block_since_ns, __ATOMIC_ACQUIRE))
         return 1;
+
     arm_thread_state64_t hs;
     mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(t->host_kport, ARM_THREAD_STATE64, (thread_state_t)&hs, &n) != KERN_SUCCESS)
@@ -435,6 +441,108 @@ int ocerz_vm_thread_resume(uint32_t port)
     }
     pthread_mutex_unlock(&g_cpus_lock);
     return KERN_SUCCESS;
+}
+
+#define SUSP_NATIVE_TRIES 50000
+#define SUSP_FRAMES 12
+
+static uint64_t g_malloc_lo, g_malloc_hi;
+static pthread_once_t g_malloc_range_once = PTHREAD_ONCE_INIT;
+
+static void susp_malloc_range(void)
+{
+    Dl_info di;
+    if (!dladdr((void *)(uintptr_t)malloc_zone_malloc, &di) || !di.dli_fbase)
+        return;
+    const struct mach_header_64 *mh = di.dli_fbase;
+    const uint8_t *lc = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *l = (const void *)lc;
+        if (l->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const void *)lc;
+            if (strcmp(sg->segname, "__TEXT") == 0) {
+                g_malloc_lo = (uint64_t)(uintptr_t)mh;
+                g_malloc_hi = g_malloc_lo + sg->vmsize;
+                return;
+            }
+        }
+        lc += l->cmdsize;
+    }
+}
+
+static int susp_in_allocator(uint32_t port)
+{
+    arm_thread_state64_t hs;
+    mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+    if (!g_malloc_hi || thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&hs, &n) != KERN_SUCCESS)
+        return 0;
+    uint64_t pcs[SUSP_FRAMES + 2];
+    int np = 0;
+    pcs[np++] = arm_thread_state64_get_pc(hs);
+    pcs[np++] = arm_thread_state64_get_lr(hs);
+    uint64_t fp = arm_thread_state64_get_fp(hs), sp = arm_thread_state64_get_sp(hs);
+    for (int k = 0; k < SUSP_FRAMES && fp >= sp && fp - sp < (64u << 20) && !(fp & 7); k++) {
+        uint64_t next, ret;
+        memcpy(&next, (const void *)(uintptr_t)fp, 8);
+        memcpy(&ret, (const void *)(uintptr_t)(fp + 8), 8);
+        pcs[np++] = ret;
+        if (next <= fp)
+            break;
+        fp = next;
+    }
+    for (int k = 0; k < np; k++) {
+        uint64_t a = pcs[k] & 0x0000ffffffffffffull;
+        if (a >= g_malloc_lo && a < g_malloc_hi)
+            return 1;
+    }
+    return 0;
+}
+
+int ocerz_vm_thread_suspend_native(uint32_t port)
+{
+    pthread_once(&g_malloc_range_once, susp_malloc_range);
+    for (int tries = 0;; tries++) {
+        int safe = 1;
+        pthread_mutex_lock(&g_cpus_lock);
+        kern_return_t kr = thread_suspend(port);
+        if (kr != KERN_SUCCESS) {
+            pthread_mutex_unlock(&g_cpus_lock);
+            return kr;
+        }
+        OcerzCPU *t = cpu_by_kport_locked(port);
+        if (t) {
+            t->susp_have_gpr = 0;
+            if ((t->jit_lock_depth && *t->jit_lock_depth > 0) || susp_in_allocator(port)) {
+                safe = 0;
+            } else if (!(t->bridge_depth && *t->bridge_depth > 0)) {
+                arm_thread_state64_t hs;
+                mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+                memcpy(t->susp_gpr, t->gpr, sizeof t->susp_gpr);
+                if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&hs, &n) == KERN_SUCCESS &&
+                    ocerz_jit_guest_gprs_at(t->vm,
+                                            (const void *)(uintptr_t)ocerz_leaf_site(
+                                                arm_thread_state64_get_pc(hs), arm_thread_state64_get_lr(hs)),
+                                            hs.__x, t, t->susp_gpr))
+                    t->susp_have_gpr = 1;
+            }
+        }
+        pthread_mutex_unlock(&g_cpus_lock);
+        if (safe || tries >= SUSP_NATIVE_TRIES)
+            return KERN_SUCCESS;
+        thread_resume(port);
+        struct timespec ts = { 0, 100000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+int ocerz_vm_thread_resume_native(uint32_t port)
+{
+    pthread_mutex_lock(&g_cpus_lock);
+    OcerzCPU *t = cpu_by_kport_locked(port);
+    if (t)
+        t->susp_have_gpr = 0;
+    pthread_mutex_unlock(&g_cpus_lock);
+    return thread_resume(port);
 }
 
 int ocerz_vm_thread_regs(uint32_t port, uint64_t gpr[16], uint64_t *rip, uint64_t *rflags)
@@ -1412,6 +1520,16 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
     }
 
+    if ((sig == SIGSEGV || sig == SIGBUS) && ctx && ocerz_mode != OCERZ_MODE_NATIVE) {
+        ucontext_t *luc = (ucontext_t *)ctx;
+        uint64_t lpc = luc->uc_mcontext->__ss.__pc, llr = luc->uc_mcontext->__ss.__lr;
+        if (ocerz_leaf_site(lpc, llr) != lpc) {
+            luc->uc_mcontext->__ss.__x[9] = 1;
+            luc->uc_mcontext->__ss.__pc = llr & 0x0000ffffffffffffull;
+            return;
+        }
+    }
+
     if (sig == SIGSEGV || sig == SIGBUS) {
         const struct OcerzBridgeFrame *bf = ocerz_bridge_in_flight();
         if (bf) {
@@ -1430,7 +1548,34 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     "ocerz:   fault_addr=%p host_pc=%#llx guest_rip=%#llx\n",
                     si->si_addr, (unsigned long long)bpc,
                     (unsigned long long)(g_cur_cpu ? g_cur_cpu->cur_rip : 0));
-            if (ocerz_host_in_guest_space(si->si_addr))
+            {
+                uint64_t rip = g_cur_cpu ? g_cur_cpu->cur_rip : 0;
+                uint64_t rbase = 0, fbase = 0;
+                const char *rname = rip ? ocerz_dyld_name_for_addr(rip, &rbase) : NULL;
+                uint64_t fga = ocerz_host_in_guest_space(si->si_addr) ? ocerz_h2g(si->si_addr) : 0;
+                const char *fname = fga ? ocerz_dyld_name_for_addr(fga, &fbase) : NULL;
+                if (rname)
+                    fprintf(stderr, "ocerz:   guest_rip is %s+%#llx\n", rname,
+                            (unsigned long long)(rip - rbase));
+                if (fname)
+                    fprintf(stderr, "ocerz:   fault_addr is %s+%#llx\n", fname,
+                            (unsigned long long)(fga - fbase));
+                if (buc) {
+                    Dl_info di;
+                    uint64_t lr = buc->uc_mcontext->__ss.__lr;
+                    if (dladdr((void *)(uintptr_t)lr, &di) && di.dli_sname)
+                        fprintf(stderr, "ocerz:   host_lr=%#llx %s in %s\n", (unsigned long long)lr,
+                                di.dli_sname, di.dli_fname ? di.dli_fname : "?");
+                    else
+                        fprintf(stderr, "ocerz:   host_lr=%#llx\n", (unsigned long long)lr);
+                }
+            }
+            if (bpc && (void *)(uintptr_t)bpc == si->si_addr && ocerz_host_in_guest_space(si->si_addr))
+                fprintf(stderr,
+                        "ocerz:   cause: native code jumped to %#llx, which is guest memory: it was handed"
+                        " an x86 function pointer no crossing converted\n",
+                        (unsigned long long)ocerz_h2g(si->si_addr));
+            else if (ocerz_host_in_guest_space(si->si_addr))
                 fprintf(stderr,
                         "ocerz:   cause: the fault address is in guest space, so the guest passed a bad"
                         " pointer to %s (guest addr %#llx)\n"
@@ -1452,7 +1597,9 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         ocerz_host_in_guest_space(si->si_addr)) {
         depth = 1;
         const ucontext_t *uc = (const ucontext_t *)ctx;
-        const void *hpc = uc ? (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc : NULL;
+        const void *hpc = uc ? (const void *)(uintptr_t)ocerz_leaf_site(uc->uc_mcontext->__ss.__pc,
+                                                                       uc->uc_mcontext->__ss.__lr)
+                             : NULL;
         struct OcerzVM *fvm = g_cur_cpu->vm;
         int in_jit = hpc && fvm && ocerz_jit_pc_in_arena(fvm, hpc);
         if (in_jit) {
@@ -2674,6 +2821,8 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     local.susp_have_gpr = 0;
     local.host_pthread = (void *)pthread_self();
     local.host_kport = pthread_mach_thread_np(pthread_self());
+    local.bridge_depth = ocerz_bridge_depth_ptr();
+    local.jit_lock_depth = ocerz_jit_lock_depth_ptr();
     pthread_threadid_np(NULL, &local.host_tid);
     uint32_t prev_kport = prev_cpu ? prev_cpu->host_kport : 0;
     for (int i = 0; i < ngpr && i < 6; i++)
@@ -2733,6 +2882,7 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     ocerz_host_sigmask_clear("callback");
     sigsetjmp(jb, 1);
     g_cur_cpu = &local;
+    ocerz_apply_mxcsr_round(local.mxcsr);
     if (prev_cpu) {
         pthread_mutex_lock(&g_cpus_lock);
         prev_cpu->host_kport = 0;
@@ -2897,7 +3047,14 @@ typedef struct AttachedThread {
     uint64_t region;
 } AttachedThread;
 
+#define OCERZ_ATTACH_MAX 1024
+
 static __thread AttachedThread *g_attached;
+static struct {
+    pthread_t thread;
+    uint64_t region;
+} g_attach_stacks[OCERZ_ATTACH_MAX];
+static int g_attach_stacks_n;
 static pthread_key_t g_attach_key;
 static _Atomic int g_attach_key_ok;
 static pthread_once_t g_attach_once = PTHREAD_ONCE_INIT;
@@ -2913,6 +3070,12 @@ static void attach_release(AttachedThread *at)
             g_cpu_threads[i] = g_cpu_threads[last];
             g_cpus[last] = NULL;
             i--;
+        }
+    }
+    for (int i = 0; i < g_attach_stacks_n; i++) {
+        if (g_attach_stacks[i].region == at->region) {
+            g_attach_stacks[i] = g_attach_stacks[--g_attach_stacks_n];
+            break;
         }
     }
     pthread_mutex_unlock(&g_cpus_lock);
@@ -3013,6 +3176,8 @@ OcerzCPU *ocerz_thread_attach(OcerzVM *vm)
     cpu->gpr[OCERZ_RSP] = block & ~0xfull;
     cpu->host_pthread = (void *)pthread_self();
     cpu->host_kport = pthread_mach_thread_np(pthread_self());
+    cpu->bridge_depth = ocerz_bridge_depth_ptr();
+    cpu->jit_lock_depth = ocerz_jit_lock_depth_ptr();
     cpu->host_tid = tid;
 
     if (pthread_setspecific(g_attach_key, at) != 0) {
@@ -3026,9 +3191,48 @@ OcerzCPU *ocerz_thread_attach(OcerzVM *vm)
     }
     ocerz_jit_require_ordered(vm);
     ocerz_cpu_register(cpu);
+    pthread_mutex_lock(&g_cpus_lock);
+    if (g_attach_stacks_n < OCERZ_ATTACH_MAX) {
+        g_attach_stacks[g_attach_stacks_n].thread = pthread_self();
+        g_attach_stacks[g_attach_stacks_n].region = region;
+        g_attach_stacks_n++;
+    }
+    pthread_mutex_unlock(&g_cpus_lock);
     g_attached = at;
     g_cur_cpu = cpu;
     return cpu;
+}
+
+static uint64_t g_main_stack_lo, g_main_stack_hi;
+
+void ocerz_vm_set_main_stack(uint64_t lo, uint64_t hi)
+{
+    g_main_stack_lo = lo;
+    g_main_stack_hi = hi;
+}
+
+int ocerz_vm_guest_stack(OcerzVM *vm, void *host_pthread, uint64_t *lo, uint64_t *hi)
+{
+    pthread_t thread = (pthread_t)host_pthread;
+    int found = 0;
+    pthread_mutex_lock(&g_cpus_lock);
+    for (int i = 0; i < g_attach_stacks_n && !found; i++) {
+        if (pthread_equal(g_attach_stacks[i].thread, thread)) {
+            *lo = g_attach_stacks[i].region;
+            *hi = g_attach_stacks[i].region + OCERZ_ATTACH_BLOCK;
+            found = 1;
+        }
+    }
+    for (int i = 0; i < g_cpus_n && !found; i++) {
+        uint64_t main_hi = g_main_stack_hi ? g_main_stack_hi : vm ? vm->stack_hi : 0;
+        if (g_cpus[i] && main_hi && pthread_equal(g_cpu_threads[i], thread)) {
+            *lo = g_main_stack_hi ? g_main_stack_lo : vm->stack_lo;
+            *hi = main_hi;
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_cpus_lock);
+    return found;
 }
 
 void ocerz_thread_detach(void)
@@ -3199,6 +3403,32 @@ void ocerz_vm_request_exit(OcerzVM *vm, int code)
     pthread_mutex_unlock(&g_cpus_lock);
 }
 
+static void vm_fatal_where(const OcerzCPU *cpu)
+{
+    uint64_t at[13];
+    int n = 0;
+    at[n++] = cpu->rip;
+    uint64_t fp = cpu->gpr[OCERZ_RBP];
+    while (n < 13 && fp >= 0x300000000ull) {
+        at[n++] = ocerz_ld(fp + 8, 8);
+        uint64_t nf = ocerz_ld(fp, 8);
+        if (nf <= fp)
+            break;
+        fp = nf;
+    }
+    fprintf(stderr, "ocerz: where:");
+    for (int k = 0; k < n; k++) {
+        uint64_t base = 0;
+        const char *name = ocerz_dyld_name_for_addr(at[k], &base);
+        const char *leaf = name ? strrchr(name, '/') : NULL;
+        if (name)
+            fprintf(stderr, " %s+%#llx", leaf ? leaf + 1 : name, (unsigned long long)(at[k] - base));
+        else
+            fprintf(stderr, " ?");
+    }
+    fprintf(stderr, "\n");
+}
+
 int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
 {
     const char *tlo = getenv("OCERZ_TRACE_LO");
@@ -3223,6 +3453,8 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     g_cur_cpu = cpu;
     cpu->host_pthread = (void *)pthread_self();
     cpu->host_kport = pthread_mach_thread_np(pthread_self());
+    cpu->bridge_depth = ocerz_bridge_depth_ptr();
+    cpu->jit_lock_depth = ocerz_jit_lock_depth_ptr();
     ocerz_apply_mxcsr_round(cpu->mxcsr);
 
     while (!vm->exited && !cpu->terminated && !cpu->interrupt) {
@@ -3293,7 +3525,9 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
                 if (nf <= fp) break;
                 fp = nf;
             }
-            fprintf(stderr, "\nocerz: %llu instructions executed\n",
+            fprintf(stderr, "\n");
+            vm_fatal_where(cpu);
+            fprintf(stderr, "ocerz: %llu instructions executed\n",
                     (unsigned long long)vm->insn_count);
             if (cpu->mode32)
                 exit(125);

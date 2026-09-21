@@ -151,6 +151,8 @@ typedef struct OcerzCPU {
     uint64_t susp_gpr[16];
     uint64_t mmx[8];
     int wq_returned;
+    const int *bridge_depth;
+    const int *jit_lock_depth;
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256
@@ -163,5 +165,7 @@ static inline int ocerz_gs_is_teb_band(uint64_t gs)
 void ocerz_cpu_reset(OcerzCPU *cpu);
 void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out);
 void ocerz_apply_mxcsr_round(uint32_t mxcsr);
+void ocerz_afp_enable(void);
+int ocerz_afp(void);
 
 #endif

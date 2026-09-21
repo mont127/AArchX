@@ -12,6 +12,15 @@
 # crashing roughly 1 in 150 wine runs. A 512 KB arena puts ~650k blocks through
 # that path.
 #
+# Exact x86 NaN results come from two different places. On a processor with
+# FPCR.AH the JIT emits SSE arithmetic bare and the hardware produces them; on
+# one without, the JIT checks results and replays a batch through the
+# interpreter when a NaN appears. The main pass runs whichever the machine
+# selects, so where sysctl reports FEAT_AFP it is the hardware the goldens judge. The
+# NaN tests are therefore run twice more with OCERZ_NO_AFP=1, once as they are
+# and once with OCERZ_FPB_FORCEREPLAY=1 making every check take its replay arm,
+# so the translated checks stay covered on a machine that no longer needs them.
+#
 # The dynamic-mode case is a real Mach-O from the x86_64 shared cache world:
 # the synthetic guests all run in plain/static mode, so it is the only test
 # here that exercises the commpage guard, dyld-cache-sized block counts and the
@@ -74,7 +83,7 @@ run_with_timeout() {
     return $?
 }
 
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order fork_exec shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq jit_narrow jit_misc2 jit_misc3 jit_align jit_align2 jit_nanabs jit_divtrap sigmask_test int3_test sse42_test rsp_ops fcntl_locks cvt_nan_batch fp_loop_nan fpb_defer_nan cvt_merge_nan machdep_rdx ret_flags mov_sreg far_sel_bits filemap_private bigenv stack_align jcc_chain_rec atomic_unaligned lddqu jcc_gap_fuse smc pop_rsp_mem avx_basic avx_jit sse_int_jit avx_sse128 avx_fp_jit simd_misc_jit bmi_jit avx_cmpblend_jit fpb_loop_nan fpb_undo_nan fault_xmm_pair vzeroupper_flag fault_lane movnt_stores punpck_qdq movhlpd side_exit_l0 xorpd_movhpd xf_epilogue)
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order fork_exec shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq jit_narrow jit_misc2 jit_misc3 jit_align jit_align2 jit_nanabs jit_divtrap sigmask_test int3_test sse42_test rsp_ops fcntl_locks cvt_nan_batch fp_loop_nan fpb_defer_nan cvt_merge_nan machdep_rdx ret_flags mov_sreg far_sel_bits filemap_private bigenv stack_align jcc_chain_rec atomic_unaligned lddqu jcc_gap_fuse smc pop_rsp_mem avx_basic avx_jit sse_int_jit avx_sse128 avx_fp_jit simd_misc_jit bmi_jit avx_cmpblend_jit fpb_loop_nan fpb_undo_nan fault_xmm_pair vzeroupper_flag fault_lane movnt_stores punpck_qdq movhlpd side_exit_l0 xorpd_movhpd xf_epilogue tso_forms)
 
 expected_exit() {
     case "$1" in
@@ -163,7 +172,7 @@ for name in "${NAMES[@]}"; do
     fi
 done
 
-for name in jit_rmw jit_scan jit_ops jit_bt jit_align jit_align2 jit_movq jit_sse jit_misc2 unaligned_order; do
+for name in jit_rmw jit_scan jit_ops jit_bt jit_align jit_align2 jit_movq jit_sse jit_misc2 unaligned_order tso_forms; do
     bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
     [ -x "$bin" ] && [ -f "$golden" ] || continue
     export OCERZ_NO_PLAIN_MEM=1
@@ -178,13 +187,30 @@ for name in jit_rmw jit_scan jit_ops jit_bt jit_align jit_align2 jit_movq jit_ss
     fi
 done
 
-for name in fpb_loop_nan fpb_undo_nan fp_loop_nan fpb_defer_nan cvt_nan_batch simd_misc_jit avx_fp_jit avx_cmpblend_jit jit_sse jit_sse2 nan_rules; do
+NAN_TESTS="fpb_loop_nan fpb_undo_nan fp_loop_nan fpb_defer_nan cvt_nan_batch cvt_merge_nan simd_misc_jit avx_fp_jit avx_cmpblend_jit jit_sse jit_sse2 nan_rules"
+
+for name in $NAN_TESTS; do
     bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
     [ -x "$bin" ] && [ -f "$golden" ] || continue
-    export OCERZ_FPB_FORCEREPLAY=1
+    export OCERZ_NO_AFP=1
     run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$bin"
     rc=$?
-    unset OCERZ_FPB_FORCEREPLAY
+    unset OCERZ_NO_AFP
+    if [ "$rc" -eq 0 ] && cmp -s "$ACTUAL_OUT" "$golden"; then
+        echo "PASS $name (translated NaN checks)"; PASS=$((PASS + 1))
+    else
+        echo "FAIL $name (translated NaN checks: rc=$rc)"; FAIL=$((FAIL + 1))
+        diff "$golden" "$ACTUAL_OUT" | head -20 | sed 's/^/  | /' >&2
+    fi
+done
+
+for name in $NAN_TESTS; do
+    bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
+    [ -x "$bin" ] && [ -f "$golden" ] || continue
+    export OCERZ_FPB_FORCEREPLAY=1 OCERZ_NO_AFP=1
+    run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$bin"
+    rc=$?
+    unset OCERZ_FPB_FORCEREPLAY OCERZ_NO_AFP
     if [ "$rc" -eq 0 ] && cmp -s "$ACTUAL_OUT" "$golden"; then
         echo "PASS $name (forced replay)"; PASS=$((PASS + 1))
     else

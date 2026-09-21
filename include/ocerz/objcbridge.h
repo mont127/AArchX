@@ -84,6 +84,31 @@
  * initializers.  ocerz_objcbridge_is_defined answers whether ocerz defined a
  * guest class at that address.
  *
+ * ---- implementations the guest holds ----
+ * The runtime hands out IMPs: method_setImplementation and class_replaceMethod
+ * answer the implementation they displaced, method_getImplementation,
+ * class_getMethodImplementation, -methodForSelector: and
+ * +instanceMethodForSelector: the one in place.  A guest keeps such a pointer
+ * and calls it, which is how every method swap that chains to the original
+ * works: Chromium replaces +[NSObject allocWithZone:] and calls the one it
+ * displaced on every allocation.  A native IMP is arm64 code, so handing its
+ * address to x86 code is handing it a jump into the wrong instruction set.
+ * ocerz_objc_imp_for_guest answers what the guest may call instead.  An IMP
+ * that is one of ocerz's callback slots is the guest's own function wearing a
+ * trampoline, and the answer is that function.  Any other is given a thunk: a
+ * few bytes of x86 in a page of guest memory that load the thunk's number into
+ * r10, which no calling convention a method uses reads, and jump to the one
+ * trampoline ocerz_objc_imp_trap answers.  That trap is a message send in every
+ * respect but its last step, which calls the native IMP where a send would call
+ * objc_msgSend, so the receiver's class and the selector choose the signature
+ * exactly as they do for a send, with the type encoding the thunk was made with
+ * standing in when the class no longer answers the selector.  One native IMP
+ * has one thunk for the life of the process, and the pages are written whole
+ * before anything runs from them, so no page the guest executes is ever written
+ * again.  ocerz_objc_imp_from_guest is the way back: a guest that hands a
+ * thunk to the runtime, putting an implementation back where it found it, hands
+ * over the native IMP the thunk stands for and not a trampoline onto a thunk.
+ *
  * ---- guest layouts ----
  * The readers take guest addresses and read the LP64 layouts both
  * architectures share.  ocerz_objc_read_class splits a class_t into its words,
@@ -154,6 +179,7 @@ enum {
     OCERZ_OBJC_FMT_CF,
     OCERZ_OBJC_FMT_PREDICATE,
     OCERZ_OBJC_FMT_TYPES,
+    OCERZ_OBJC_FMT_WIDE,
 };
 
 enum {
@@ -289,16 +315,55 @@ int ocerz_objc_msgSendSuper2_stret(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_msgSend_fpret(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_msgSend_fp2ret(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_setUncaughtExceptionHandler(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_allocateClassPair(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_class_addMethod(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_methodSetImplementation(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_class_replaceMethod(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_method_getImplementation(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_class_getMethodImplementation(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_imp_trap(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_setExceptionPreprocessor(struct OcerzVM *vm, OcerzCPU *cpu);
+
+uint64_t ocerz_objc_imp_for_guest(void *native_imp, const char *types);
+void *ocerz_objc_imp_from_guest(uint64_t guest_imp);
 
 int ocerz_fmt_NSLog(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_printf(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_fprintf(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_sprintf(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_snprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_snprintf_l(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_asprintf(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_dprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_swprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_wprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_fwprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vswprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vwprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vfwprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_syslog(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vsyslog(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_warn(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_warnx(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vwarn(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vwarnx(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_sprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_snprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vfprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vsprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vsnprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vsnprintf_l(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vasprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vdprintf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vsprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vsnprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_sscanf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_scanf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_fscanf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vsscanf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vscanf(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vfscanf(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_CFStringCreateWithFormat(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_CFStringAppendFormat(struct OcerzVM *vm, OcerzCPU *cpu);
 
