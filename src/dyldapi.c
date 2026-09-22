@@ -664,6 +664,19 @@ static void compute_closure(struct OcerzCache *cache, uint64_t main_mh)
         closure_add(g_disk_mh[i]);
 }
 
+void ocerz_dyldapi_register_cache_image(uint64_t mh)
+{
+    if (!mh || !g_cache || !g_closure_mh ||
+        set_has(g_closure_hash, g_closure_hash_mask, mh))
+        return;
+    g_closure_n = image_closure_walk(g_cache, mh, g_closure_mh, g_closure_n,
+                                     g_closure_cap, g_closure_hash,
+                                     g_closure_hash_mask);
+    if (getenv("OCERZ_IMGLOG"))
+        fprintf(stderr, "ocerz: IMGREG cache mh=%#llx closure now %d\n",
+                (unsigned long long)mh, g_closure_n);
+}
+
 static const char *lazy_load_path(uint64_t mh, uint64_t flag, int *weak)
 {
     const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);

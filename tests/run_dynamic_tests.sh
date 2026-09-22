@@ -479,6 +479,7 @@ run_file_case dnan_contexts tests/dynamic/nan_contexts.c 'OK'
 run_file_case dupward_init tests/dynamic/upward_init.c 'OK' -framework CoreFoundation
 run_file_case dcache_symlink_dep tests/dynamic/cache_symlink_dep.c 'OK'
 run_file_case dsysv_shm tests/dynamic/sysv_shm.c 'OK'
+run_file_case ddlopen_image_list tests/dynamic/dlopen_image_list.c 'OK'
 run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
 run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
 run_cpp_file_case dcpp_global_ctor tests/dynamic/cpp_global_ctor.cpp 'OK'
