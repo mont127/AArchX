@@ -182,6 +182,20 @@
  * while it ran, since a retired continuation may be translated from bytes the
  * crossing just rewrote.  A delivered signal fails the first test.
  *
+ * A host-stack RAS entry lives only until the next trip out of translated
+ * code, because every exit resets sp to the frame base, and a return whose
+ * entry was lost that way used to leave the frame through the epilogue: the
+ * dispatcher, the prologue, and the reset discarding every remaining entry, so
+ * the whole call chain then missed on its way up.  C++ engine code makes a call
+ * every ten instructions and takes a trip every few hundred thousand blocks,
+ * which put Adobe AIR's main thread at 36 million misses a second, one return
+ * in seven.  A miss now stays in the body: the popped return address goes to
+ * the same per-site cache and inline hash probe an indirect call uses, and only
+ * an address no block answers to leaves the frame.  A pop that finds the
+ * sentinel pair pushes it back first, since the saved frame registers sit right
+ * above it.  Brawlhalla's translated throughput rose by a third; the kernels the
+ * host RAS was built for (memcpy, str, leafcall, icall) measure the same.
+ *
  * Eleven libSystem exports do not cross at all.  strlen, strnlen, strcmp,
  * strncmp, memcmp, bcmp, strchr, memchr, memcpy, memmove and memset are called
  * constantly, do very little, and cost several times their own work to reach
@@ -1137,7 +1151,7 @@ static const char *ps_shape_name[9] = { "push", "pop", "test", "movsxd", "call",
                                         "jmp", "jmpind", "jmpmem" };
 
 static _Atomic unsigned long long ps_chain_ok, ps_chain_far;
-static unsigned long long ps_ras_miss, ps_ras_stale;
+static unsigned long long ps_ras_miss, ps_ras_stale, ps_ras_noslot;
 static uint64_t ps_t0;
 
 static __attribute__((noinline, cold, preserve_most)) void jit_trace_one(const X86Insn *insn)
@@ -11936,6 +11950,9 @@ void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
 
 static void **ras_slot_alloc(void);
 static void pending_add_ras(uint64_t target_key, void **ras_slot);
+static uint32_t **g_ind_call_cont;
+static int g_ind_treg;
+static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot, uint32_t **epi_sites, int *n_epi);
 static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
                                       uint32_t **epilogue_sites, int *n_epi);
 
@@ -12390,6 +12407,16 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                     a64_patch_bcond(ras_stale[i], miss_pop);
                 else
                     a64_patch_cbz(ras_stale[i], miss_pop);
+            }
+            if (hostras) {
+                uint32_t *keep = a64_label(b); a64_cbnz(b, 1, JTF, 0);
+                a64_sub_imm(b, 1, 31, 31, 16);
+                a64_patch_cbz(keep, a64_label(b));
+                if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
+                g_ind_call_cont = NULL;
+                g_ind_treg = JT1;
+                emit_indirect_tail(b, ic_slot_alloc(), epi_sites, n_epi);
+                return 1;
             }
         }
     } else {
@@ -13270,8 +13297,10 @@ static void **ras_slot_alloc(void)
             return NULL;
         g_ras_slots = (void **)p;
     }
-    if (g_ras_slot_n >= RAS_SLOT_CAP)
+    if (g_ras_slot_n >= RAS_SLOT_CAP) {
+        ps_ras_noslot++;
         return NULL;
+    }
     void **s = &g_ras_slots[g_ras_slot_n++];
     *s = NULL;
     return s;
@@ -16997,7 +17026,7 @@ static void ps_report(OcerzJit *jit)
                 ps_shapes[rows[i].op][0], ps_shapes[rows[i].op][1], ps_shapes[rows[i].op][2]);
     }
     {
-        fprintf(stderr, "ocerz: PERFSTAT[%d]   RAS misses=%llu (stale=%llu)  align-hotpatches=%llu\n", (int)getpid(), ps_ras_miss, ps_ras_stale, ps_align_patches);
+        fprintf(stderr, "ocerz: PERFSTAT[%d]   RAS misses=%llu (stale=%llu)  align-hotpatches=%llu  ras_slots=%u/%u call-sites-without-slot=%llu\n", (int)getpid(), ps_ras_miss, ps_ras_stale, ps_align_patches, g_ras_slot_n, (unsigned)RAS_SLOT_CAP, ps_ras_noslot);
         unsigned long long cok = ps_chain_ok, cfar = ps_chain_far, ctot = cok + cfar;
         if (ctot)
             fprintf(stderr,
