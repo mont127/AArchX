@@ -43,6 +43,17 @@
  * the translator puts a call to it at the head of that block, ahead of the
  * x86 code it keeps translating for the cases the routine declines.
  *
+ * An API ocerz does not implement answers zero in RAX and zero in RDX.  RDX
+ * matters because a dyld API may return a pair, and leaving the guest's own RDX
+ * in place hands the caller a count it never computed.  _dyld_get_lib_msg_send
+ * _offsets, slot +0x450, is exactly that shape: libobjc's _objc_init calls it
+ * for a table and a count, takes its fallback path when the count is below two,
+ * and otherwise reads the table.  With RDX left alone the count was whatever
+ * happened to be in the register, so libobjc walked a table at address zero,
+ * and the damage surfaced much later as os_unfair_lock_recursive_abort inside
+ * class realization.  That slot is answered explicitly as well, since it is a
+ * real question with a real answer here: ocerz has no such table to offer.
+ *
  * _NSGetExecutablePath behaves as dyld's does: a buffer the path fits in gets
  * the path and a size left exactly as the caller set it, and only a buffer too
  * small has the size rewritten, to the length the path needs, with -1 returned.
@@ -2395,12 +2406,17 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         return OCERZ_STEP_OK;
     case 0x438:
         return api_lazy_load(vm, cpu);
+    case 0x450:
+        cpu->gpr[OCERZ_RDX] = 0;
+        api_return(cpu, 0);
+        return OCERZ_STEP_OK;
     default:
         OCERZ_LOG("dyldapi: unimplemented vtable slot +%#llx (this=%#llx a0=%#llx a1=%#llx a2=%#llx caller=%#llx)\n",
                   (unsigned long long)off, (unsigned long long)cpu->gpr[OCERZ_RDI],
                   (unsigned long long)cpu->gpr[OCERZ_RSI], (unsigned long long)cpu->gpr[OCERZ_RDX],
                   (unsigned long long)cpu->gpr[OCERZ_RCX],
                   (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8));
+        cpu->gpr[OCERZ_RDX] = 0;
         api_return(cpu, 0);
         return OCERZ_STEP_OK;
     }

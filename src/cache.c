@@ -506,6 +506,8 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
     return 0;
 }
 
+static const OcerzCache *g_named_cache;
+
 int ocerz_cache_map(OcerzCache *c)
 {
     memset(c, 0, sizeof *c);
@@ -527,9 +529,32 @@ int ocerz_cache_map(OcerzCache *c)
         return OCERZ_EFORMAT;
     }
     c->mapped = 1;
+    g_named_cache = c;
     OCERZ_LOG("shared cache mapped at %#llx, %u images\n",
               (unsigned long long)c->base, c->images_cnt);
     return OCERZ_OK;
+}
+
+const char *ocerz_cache_name_for_addr(uint64_t addr, uint64_t *base_out)
+{
+    const OcerzCache *c = g_named_cache;
+    if (!c || !c->mapped || !c->images_cnt)
+        return NULL;
+    uint64_t best = 0;
+    const char *best_path = NULL;
+    for (uint32_t i = 0; i < c->images_cnt; i++) {
+        const uint8_t *e = c->hdr + c->images_off + (size_t)i * 32;
+        uint64_t a = rd64(e);
+        if (a <= addr && a > best) {
+            best = a;
+            best_path = (const char *)(c->hdr + rd32(e + 0x18));
+        }
+    }
+    if (!best_path)
+        return NULL;
+    if (base_out)
+        *base_out = best;
+    return best_path;
 }
 
 uint64_t ocerz_cache_image_addr(OcerzCache *c, uint32_t i, const char **path_out)
