@@ -229,6 +229,24 @@
  * registration that would do nothing is not made at all.  Mapping the segments
  * and handing __TEXT back its protection is the whole of the work.
  *
+ * A cache image reached by dlopen has to join that same list, and this was the
+ * one kind of image that never did.  dlopen of a disk dylib registered; dlopen
+ * of a cache image returned the mach header and appended nothing, so the
+ * library was loaded, its symbols resolved and dladdr knew where they lived,
+ * while every walk of the image list said it was absent.  libobjc keys its
+ * per-image queries off that list, and Metal loads its GPU driver through
+ * them, so MTLCreateSystemDefaultDevice returned nil, MTLCopyAllDevices found
+ * no device, OpenGL had no accelerated renderer left to offer and
+ * CGLChoosePixelFormat failed for every accelerated attribute set.  Brawlhalla
+ * put a window on screen and never drew into it.
+ *
+ * The registration happens at the end of cache_dlopen_hit, after the objc
+ * mapping and the initializer phase, and the order is the whole of it.  libobjc
+ * calls back into the dyld APIs while it maps an image, and an image already
+ * standing in the list when that callback arrives is one it takes as handled:
+ * registering first cost the newly loaded image its categories, which is
+ * exactly what a late-loaded framework is usually dlopened for.
+ *
  * Native mode runs no libSystem initializer, so the initializer phase that
  * cache mode gates on it never runs either, and for a while nothing ran a guest
  * image's own initializers at all: a C constructor or a C++ static object's
@@ -3270,6 +3288,7 @@ static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
             g_init_dlopen_restricted = prev;
         }
     }
+    ocerz_dyldapi_register_cache_image(cmh);
     return cmh;
 }
 

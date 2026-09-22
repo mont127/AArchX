@@ -18,6 +18,7 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache);
 int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu);
 void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t stack_top);
 void ocerz_dyldapi_register_image(uint64_t mh, const char *path);
+void ocerz_dyldapi_register_cache_image(uint64_t mh);
 void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh);
 uint64_t ocerz_dyldapi_canonical_selector(const char *name);
 int ocerz_dyldapi_memfn(uint64_t rip);
