@@ -196,6 +196,20 @@
  * above it.  Brawlhalla's translated throughput rose by a third; the kernels the
  * host RAS was built for (memcpy, str, leafcall, icall) measure the same.
  *
+ * A chain is a b patched into the exiting block, and a b reaches 128 MB.  The
+ * arena is 1 GB and filled front to back, so a caller translated late chains
+ * to a callee translated early only if fewer than 128 MB of code came between
+ * them; past that the patch was dropped and the edge left through the epilogue
+ * on every execution.  That is the shape of a game: the engine's runtime
+ * helpers are translated in the first minute and the script code that calls
+ * them keeps being generated afterwards, so its hottest edges were exactly the
+ * ones dropped.  A 256 KB veneer pool is carved out of the arena every 64 MB,
+ * and a patch that does not reach is pointed at a veneer in the nearest pool
+ * instead: ldr x15 from the literal that follows, br x15, which reaches
+ * anything.  x15 is the computed-address temp, never live across a block edge.
+ * Brawlhalla's main thread fell from a saturated core to 71%, while doing more
+ * work per second than before.
+ *
  * Eleven libSystem exports do not cross at all.  strlen, strnlen, strcmp,
  * strncmp, memcmp, bcmp, strchr, memchr, memcpy, memmove and memset are called
  * constantly, do very little, and cost several times their own work to reach
@@ -480,6 +494,10 @@ struct OcerzJit {
     uint32_t *code_cur;
     uint32_t *code_end;
     size_t code_bytes;
+    uint32_t *veneer_pool[16];
+    unsigned veneer_used[16];
+    unsigned veneer_n;
+    uint8_t *veneer_next_mark;
     int code_full;
     JitBlock *buckets[JIT_HASH_SIZE];
     JitBlock *retired;
@@ -1152,6 +1170,7 @@ static const char *ps_shape_name[9] = { "push", "pop", "test", "movsxd", "call",
 
 static _Atomic unsigned long long ps_chain_ok, ps_chain_far;
 static unsigned long long ps_ras_miss, ps_ras_stale, ps_ras_noslot;
+static unsigned long long ps_chain_veneer;
 static uint64_t ps_t0;
 
 static __attribute__((noinline, cold, preserve_most)) void jit_trace_one(const X86Insn *insn)
@@ -11950,6 +11969,7 @@ void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
 
 static void **ras_slot_alloc(void);
 static void pending_add_ras(uint64_t target_key, void **ras_slot);
+static void veneer_pool_check(OcerzJit *jit);
 static uint32_t **g_ind_call_cont;
 static int g_ind_treg;
 static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot, uint32_t **epi_sites, int *n_epi);
@@ -12439,6 +12459,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
 static void emit_dispatch_stub(OcerzJit *jit, int mode32)
 {
+    veneer_pool_check(jit);
     A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
     uint32_t *entry = b.p;
     uint32_t *to_ret[12]; int nr = 0;
@@ -13201,6 +13222,51 @@ static void chaincheck(const char *what, const void *dst)
         fprintf(stderr, "ocerz: CHAINCHECK[%d] %s target %p OUTSIDE arena [%p,%p)\n",
                 (int)getpid(), what, dst, (void *)g_xlat_jit->code_base, (void *)g_xlat_jit->code_cur);
 }
+#define VENEER_WINDOW_BYTES (64u << 20)
+#define VENEER_POOL_BYTES (256u << 10)
+#define VENEER_BYTES 16u
+#define VENEER_REACH ((ptrdiff_t)(120u << 20))
+
+static void veneer_pool_check(OcerzJit *jit)
+{
+    if (!jit->veneer_next_mark)
+        jit->veneer_next_mark = (uint8_t *)jit->code_base;
+    while (jit->veneer_n < 16 && (uint8_t *)jit->code_cur >= jit->veneer_next_mark) {
+        if ((size_t)((uint8_t *)jit->code_end - (uint8_t *)jit->code_cur) < VENEER_POOL_BYTES + 65536)
+            return;
+        jit->veneer_pool[jit->veneer_n] = jit->code_cur;
+        jit->veneer_used[jit->veneer_n] = 0;
+        jit->veneer_n++;
+        jit->code_cur = (uint32_t *)((uint8_t *)jit->code_cur + VENEER_POOL_BYTES);
+        jit->veneer_next_mark += VENEER_WINDOW_BYTES;
+    }
+}
+
+static uint32_t *veneer_make(OcerzJit *jit, const uint32_t *site, const void *dst, int batching)
+{
+    int best = -1;
+    ptrdiff_t best_d = VENEER_REACH;
+    for (unsigned i = 0; i < jit->veneer_n; i++) {
+        if ((jit->veneer_used[i] + 1) * VENEER_BYTES > VENEER_POOL_BYTES)
+            continue;
+        ptrdiff_t d = (const uint8_t *)jit->veneer_pool[i] - (const uint8_t *)site;
+        if (d < 0) d = -d;
+        if (d < best_d) { best_d = d; best = (int)i; }
+    }
+    if (best < 0)
+        return NULL;
+    uint32_t *v = (uint32_t *)((uint8_t *)jit->veneer_pool[best] + jit->veneer_used[best] * VENEER_BYTES);
+    uint64_t target = (uint64_t)(uintptr_t)dst;
+    if (!batching) pthread_jit_write_protect_np(0);
+    v[0] = 0x58000040u | (uint32_t)JTA;
+    v[1] = 0xd61f0000u | ((uint32_t)JTA << 5);
+    memcpy(&v[2], &target, 8);
+    if (!batching) pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(v, VENEER_BYTES);
+    jit->veneer_used[best]++;
+    return v;
+}
+
 static void chain_activate(uint32_t *patch_b, void *dst)
 {
     if (!patch_b || !dst)
@@ -13209,8 +13275,13 @@ static void chain_activate(uint32_t *patch_b, void *dst)
     if (g_xlat_jit && g_xlat_jit->stop_requested)
         return;
     int ok;
+    int veneered = 0;
     if (g_chain_batching) {
         ok = a64_try_patch_b(patch_b, (uint32_t *)dst);
+        if (!ok && g_xlat_jit) {
+            uint32_t *v = veneer_make(g_xlat_jit, patch_b, dst, 1);
+            if (v) { ok = a64_try_patch_b(patch_b, v); veneered = ok; }
+        }
         if (g_chain_npatched < CHAIN_BATCH_MAX)
             g_chain_patched[g_chain_npatched++] = patch_b;
         else
@@ -13219,10 +13290,21 @@ static void chain_activate(uint32_t *patch_b, void *dst)
         pthread_jit_write_protect_np(0);
         ok = a64_try_patch_b(patch_b, (uint32_t *)dst);
         pthread_jit_write_protect_np(1);
+        if (!ok && g_xlat_jit) {
+            uint32_t *v = veneer_make(g_xlat_jit, patch_b, dst, 0);
+            if (v) {
+                pthread_jit_write_protect_np(0);
+                ok = a64_try_patch_b(patch_b, v);
+                pthread_jit_write_protect_np(1);
+                veneered = ok;
+            }
+        }
         sys_icache_invalidate(patch_b, 4);
     }
     if (ocerz_perfstat > 0) {
-        if (ok)
+        if (veneered)
+            ps_chain_veneer++;
+        else if (ok)
             ps_chain_ok++;
         else
             ps_chain_far++;
@@ -14421,6 +14503,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (mode32) { if (!jit->dispatch_stub32) emit_dispatch_stub(jit, 1); }
         else        { if (!jit->dispatch_stub)   emit_dispatch_stub(jit, 0); }
     }
+    veneer_pool_check(jit);
     A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
     uint32_t *entry = b.p;
     g_push_entry = entry;
@@ -16072,7 +16155,8 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
     int rc = 0;
     if ((size_t)(jit->code_end - jit->code_cur) > 128) {
         pthread_jit_write_protect_np(0);
-        A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
+        veneer_pool_check(jit);
+    A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
         uint32_t *arm = b.p;
         if (imm9 > 0)      a64_add_imm(&b, 1, ta, rn, (uint32_t)imm9);
         else if (imm9 < 0) a64_sub_imm(&b, 1, ta, rn, (uint32_t)-imm9);
@@ -17027,11 +17111,11 @@ static void ps_report(OcerzJit *jit)
     }
     {
         fprintf(stderr, "ocerz: PERFSTAT[%d]   RAS misses=%llu (stale=%llu)  align-hotpatches=%llu  ras_slots=%u/%u call-sites-without-slot=%llu\n", (int)getpid(), ps_ras_miss, ps_ras_stale, ps_align_patches, g_ras_slot_n, (unsigned)RAS_SLOT_CAP, ps_ras_noslot);
-        unsigned long long cok = ps_chain_ok, cfar = ps_chain_far, ctot = cok + cfar;
+        unsigned long long cok = ps_chain_ok, cfar = ps_chain_far, ctot = cok + cfar + ps_chain_veneer;
         if (ctot)
             fprintf(stderr,
-                    "ocerz: PERFSTAT[%d]   CHAIN activated=%llu out_of_range=%llu (%.2f%% dropped)\n",
-                    (int)getpid(), cok, cfar, 100.0 * (double)cfar / (double)ctot);
+                    "ocerz: PERFSTAT[%d]   CHAIN activated=%llu veneered=%llu out_of_range=%llu (%.2f%% dropped)\n",
+                    (int)getpid(), cok, ps_chain_veneer, cfar, 100.0 * (double)cfar / (double)ctot);
     }
     for (int i = 0; i < (int)(sizeof ps_shape / sizeof ps_shape[0]); i++) {
         unsigned long long easy = ps_shape[i][0], hard = ps_shape[i][1], s = easy + hard;
