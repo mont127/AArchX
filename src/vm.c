@@ -3002,18 +3002,33 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
             }
 
             {
+                uint64_t frames[24];
+                int nframes = 0;
                 fprintf(stderr, "ocerz: initabort-bt rip=%#llx", (unsigned long long)local.rip);
                 uint64_t fp = local.gpr[OCERZ_RBP];
                 for (int d = 0; d < 24 && fp >= 0x10000; d++) {
                     uint64_t ra = ocerz_addr_readable(fp + 8)
                                 ? ocerz_ld(fp + 8, 8) : 0;
                     fprintf(stderr, " %#llx", (unsigned long long)ra);
+                    frames[nframes++] = ra;
                     uint64_t nf = ocerz_addr_readable(fp)
                                 ? ocerz_ld(fp, 8) : 0;
                     if (nf <= fp) break;
                     fp = nf;
                 }
                 fprintf(stderr, "\n");
+                uint64_t rb = 0;
+                const char *rn = ocerz_dyld_name_for_addr(local.rip, &rb);
+                if (rn)
+                    fprintf(stderr, "    frame %#llx %s+%#llx\n",
+                            (unsigned long long)local.rip, rn, (unsigned long long)(local.rip - rb));
+                for (int d = 0; d < nframes; d++) {
+                    uint64_t b = 0;
+                    const char *n = ocerz_dyld_name_for_addr(frames[d], &b);
+                    if (n)
+                        fprintf(stderr, "    frame %#llx %s+%#llx\n",
+                                (unsigned long long)frames[d], n, (unsigned long long)(frames[d] - b));
+                }
             }
             ocerz_cpu_dump(&local, stderr);
             ocerz_peek_dump("fatal");
