@@ -192,6 +192,16 @@
  * Discord's renderers.  A guest address ocerz has no mapping for still falls
  * through to the host reply, because that is the only answer left to give.
  *
+ * ---- System V shared memory ----
+ * shmat cannot be told where to land: the kernel refuses a fixed address even
+ * over ground the arena already reserves.  So the segment is attached wherever
+ * the host wants it and mach_vm_remap carries that mapping into guest space,
+ * which shares the pages rather than copying them - a write from another
+ * process still shows through.  The host attachment is kept, not detached, so
+ * shm_nattch counts this process once, and shmdt reverses both halves.  A
+ * segment two processes share also makes their ordering visible, so attaching
+ * puts the jit in ordered mode for the rest of the run.
+ *
  * ---- failure policy ----
  * An unimplemented call reports once and returns ENOSYS rather than aborting:
  * aborting kills the guest thread where it stands, and under Wine that is often
@@ -241,6 +251,8 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/mach_vm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <mach-o/dyld.h>
 #include <time.h>
 
@@ -4524,6 +4536,161 @@ static int sys_semctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+#define OCERZ_SHM_ATTACH_MAX 64
+
+static struct {
+    uint64_t gaddr;
+    uint64_t size;
+    void *host;
+} g_shm_attach[OCERZ_SHM_ATTACH_MAX];
+static pthread_mutex_t g_shm_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int shm_slot_reserve(void)
+{
+    pthread_mutex_lock(&g_shm_lock);
+    for (int i = 0; i < OCERZ_SHM_ATTACH_MAX; i++) {
+        if (!g_shm_attach[i].host && !g_shm_attach[i].size) {
+            g_shm_attach[i].size = 1;
+            pthread_mutex_unlock(&g_shm_lock);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&g_shm_lock);
+    return -1;
+}
+
+static void shm_slot_release(int slot)
+{
+    pthread_mutex_lock(&g_shm_lock);
+    g_shm_attach[slot].gaddr = 0;
+    g_shm_attach[slot].size = 0;
+    g_shm_attach[slot].host = NULL;
+    pthread_mutex_unlock(&g_shm_lock);
+}
+
+static int sys_shmat(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    int shmid = (int)a[0];
+    uint64_t want = a[1];
+    int flags = (int)a[2];
+
+    struct shmid_ds ds;
+    memset(&ds, 0, sizeof ds);
+    if (shmctl(shmid, IPC_STAT, &ds) != 0) {
+        ret_err(cpu, (uint64_t)errno);
+        return OCERZ_STEP_OK;
+    }
+    uint64_t size = ((uint64_t)ds.shm_segsz + OCERZ_HOST_PAGE_SIZE - 1) &
+                    ~(OCERZ_HOST_PAGE_SIZE - 1);
+    if (size == 0) {
+        ret_err(cpu, (uint64_t)EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    if (want) {
+        if (flags & SHM_RND)
+            want &= ~(OCERZ_HOST_PAGE_SIZE - 1);
+        if (want & (OCERZ_HOST_PAGE_SIZE - 1)) {
+            ret_err(cpu, (uint64_t)EINVAL);
+            return OCERZ_STEP_OK;
+        }
+    }
+
+    int slot = shm_slot_reserve();
+    if (slot < 0) {
+        ret_err(cpu, (uint64_t)EMFILE);
+        return OCERZ_STEP_OK;
+    }
+    void *host = shmat(shmid, NULL, flags & SHM_RDONLY);
+    if (host == (void *)-1) {
+        int e = errno;
+        shm_slot_release(slot);
+        ret_err(cpu, (uint64_t)e);
+        return OCERZ_STEP_OK;
+    }
+
+    int prot = (flags & SHM_RDONLY) ? PROT_READ : (PROT_READ | PROT_WRITE);
+    uint64_t gaddr;
+    if (want) {
+        invalidate_guest_mapping(vm, want, size);
+        if (ocerz_map_claim_region(want, size, prot) != OCERZ_OK) {
+            shmdt(host);
+            shm_slot_release(slot);
+            ret_err(cpu, (uint64_t)ENOMEM);
+            return OCERZ_STEP_OK;
+        }
+        gaddr = want;
+    } else {
+        gaddr = ocerz_map_donate(size);
+        if (!gaddr) {
+            shmdt(host);
+            shm_slot_release(slot);
+            ret_err(cpu, (uint64_t)ENOMEM);
+            return OCERZ_STEP_OK;
+        }
+        invalidate_guest_mapping(vm, gaddr, size);
+    }
+
+    mach_vm_address_t host_dst = (mach_vm_address_t)(uintptr_t)ocerz_g2h(gaddr);
+    mach_vm_address_t dst = host_dst;
+    vm_prot_t curp = 0, maxp = 0;
+    ocerz_jit_require_ordered(vm);
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &dst, size, 0,
+                                     VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                     mach_task_self(),
+                                     (mach_vm_address_t)(uintptr_t)host, FALSE,
+                                     &curp, &maxp, VM_INHERIT_SHARE);
+    if (kr != KERN_SUCCESS || dst != host_dst) {
+        ocerz_unmap(gaddr, size);
+        shmdt(host);
+        shm_slot_release(slot);
+        ret_err(cpu, (uint64_t)ENOMEM);
+        return OCERZ_STEP_OK;
+    }
+    if (prot == PROT_READ)
+        ocerz_protect(gaddr, size, PROT_READ);
+
+    pthread_mutex_lock(&g_shm_lock);
+    g_shm_attach[slot].gaddr = gaddr;
+    g_shm_attach[slot].size = size;
+    g_shm_attach[slot].host = host;
+    pthread_mutex_unlock(&g_shm_lock);
+
+    if (vm->strace)
+        fprintf(stderr, "ocerz: shmat id=%d size=%#llx host=%p -> guest=%#llx\n",
+                shmid, (unsigned long long)size, host,
+                (unsigned long long)gaddr);
+    ret_ok(cpu, gaddr);
+    return OCERZ_STEP_OK;
+}
+
+static int sys_shmdt(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    uint64_t gaddr = a[0];
+    void *host = NULL;
+    uint64_t size = 0;
+    pthread_mutex_lock(&g_shm_lock);
+    for (int i = 0; i < OCERZ_SHM_ATTACH_MAX; i++) {
+        if (g_shm_attach[i].host && g_shm_attach[i].gaddr == gaddr) {
+            host = g_shm_attach[i].host;
+            size = g_shm_attach[i].size;
+            g_shm_attach[i].gaddr = 0;
+            g_shm_attach[i].size = 0;
+            g_shm_attach[i].host = NULL;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_shm_lock);
+    if (!host) {
+        ret_err(cpu, (uint64_t)EINVAL);
+        return OCERZ_STEP_OK;
+    }
+    invalidate_guest_mapping(vm, gaddr, size);
+    ocerz_unmap(gaddr, size);
+    shmdt(host);
+    ret_ok(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+
 static int sys_readv(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     return sys_iov(vm, cpu, a, 120);
@@ -4928,6 +5095,8 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [256] = { "semop",       3, 0x02, 0, NULL },
     [254] = { "semctl",      4, 0x00, 0, sys_semctl },
     [265] = { "shmget",      3, 0x00, 0, NULL },
+    [262] = { "shmat",       3, 0x00, 0, sys_shmat },
+    [264] = { "shmdt",       1, 0x00, 0, sys_shmdt },
     [263] = { "shmctl",      3, 0x04, 0, NULL },
     [259] = { "msgget",      2, 0x00, 0, NULL },
     [258] = { "msgctl",      3, 0x04, 0, NULL },
