@@ -2417,6 +2417,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
         uint64_t sp = c->gpr[OCERZ_RSP];
         int shown = 0;
+        uint64_t frames[14];
         p = buf;
         p = str_into(p, "  bt:");
         for (uint64_t a = sp; a < sp + 0x400 && shown < 14; a += 8) {
@@ -2425,11 +2426,26 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             if (v >= 0x7ff802000000ull && v < 0x7ff818000000ull) {
                 p = str_into(p, " ");
                 p = hex_into(p, v);
+                frames[shown] = v;
                 shown++;
             }
         }
         p = str_into(p, "\n");
         write(2, buf, (size_t)(p - buf));
+        for (int k = 0; k < shown; k++) {
+            uint64_t fb = 0;
+            const char *fn = ocerz_dyld_name_for_addr(frames[k], &fb);
+            if (!fn) continue;
+            p = buf;
+            p = str_into(p, "    frame ");
+            p = hex_into(p, frames[k]);
+            p = str_into(p, " ");
+            p = str_into(p, fn);
+            p = str_into(p, "+");
+            p = hex_into(p, frames[k] - fb);
+            p = str_into(p, "\n");
+            write(2, buf, (size_t)(p - buf));
+        }
         if (g_crash_stack) {
             static const char *const an[] = { "r9", "r10", "r11", "r12",
                                               "r13", "r14", "r15", "rsp" };

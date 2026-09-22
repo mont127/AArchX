@@ -70,13 +70,26 @@
  * libSystem stops right there instead of descending through libxpc into
  * Foundation and dragging the whole system into its subtree.  Its objc load
  * notifications are therefore delivered before that prune can hide them.
- * LC_LOAD_UPWARD_DYLIB is skipped on purpose: an upward link is how a library
- * declares the back edge of a dependency cycle and is an ordering edge for
- * nothing.  Following it made CoreFoundation's upward link to
- * CoreServicesInternal a real edge, which put QuickLookThumbnailing, SiriTTS
- * and CoreML inside libc++abi's subtree, and libc++abi then sat unfinished on
- * the recursion stack while MLAssetIO's initializer called operator new into a
- * libc++ that had not been initialized yet.
+ * An upward link is how a library declares the back edge of a dependency cycle,
+ * and it is an ordering edge for nothing: the library that declares it may be
+ * initialized first.  So it is not followed on the way DOWN.  Following it
+ * there made CoreFoundation's upward link to CoreServicesInternal a real edge,
+ * which put QuickLookThumbnailing, SiriTTS and CoreML inside libc++abi's
+ * subtree, and libc++abi then sat unfinished on the recursion stack while
+ * MLAssetIO's initializer called operator new into a libc++ that had not been
+ * initialized yet.
+ *
+ * It is followed afterwards instead, once the image that declares it has been
+ * initialized, because the target still has to be initialized at some point -
+ * dyld loads and initializes an upward dependency like any other, it only
+ * declines to order it first.  Leaving it out entirely is what broke sw_vers:
+ * CoreFoundation links Foundation upward, so Foundation's code was reachable,
+ * the whole cache being mapped, and its classes were registered, but its
+ * initializer never ran.  NSString therefore stayed an abstract class cluster,
+ * and the first +[NSString stringWithFormat:] fell into
+ * _NSRequestConcreteObject, whose complaint is itself built with
+ * +[NSString stringWithFormat:].  That recursion ran the 8 MB guest stack out.
+ * OCERZ_NO_UPWARD_INIT=1 restores the old behaviour.
  *
  * The dlopen closure (init_closure) collects its images in dependency
  * post-order and runs them in that order, never sorted by load address: a
@@ -411,12 +424,17 @@
 #include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <mach-o/dyld.h>
 #include <mach-o/fat.h>
 #include <crt_externs.h>
 
 #define DYN_ARENA_SIZE (256ull << 30)
 #define DYN_STACK_SIZE (8ull << 20)
+#define MISS_LIST_MAX 24
+#define BIND_ORDINAL_FLAT_LOOKUP (-2)
+
+static unsigned long g_dynlookup_miss;
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
@@ -543,6 +561,7 @@ typedef struct DynImage {
     uint64_t map_size;
     uint64_t file_dev;
     uint64_t file_ino;
+    struct SymIndex *symidx;
 } DynImage;
 
 #define DYN_DIMG_MAX 256
@@ -649,6 +668,12 @@ const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out)
         if (g_dimgs[i].load_base <= addr &&
             (!best || g_dimgs[i].load_base > best->load_base))
             best = &g_dimgs[i];
+    }
+    uint64_t cbase = 0;
+    const char *cname = ocerz_cache_name_for_addr(addr, &cbase);
+    if (cname && (!best || cbase > best->load_base)) {
+        if (base_out) *base_out = cbase;
+        return cname;
     }
     if (!best) return NULL;
     if (base_out) *base_out = best->load_base;
@@ -824,6 +849,126 @@ static uint64_t image_export_trie(const uint8_t *slice, uint32_t *size_out)
     return 0;
 }
 
+/*
+ * Exports of an image that has no export trie.
+ *
+ * A dylib built by an old enough toolchain, or linked without one, carries its
+ * exports only in the classic symbol table that LC_SYMTAB points at, and says
+ * nothing in LC_DYLD_INFO or LC_DYLD_EXPORTS_TRIE.  Resolving through the trie
+ * alone therefore finds nothing in it at all, and every import naming it goes
+ * unresolved - twenty-one of the sixty dylibs Photoshop ships are of that kind,
+ * which is how its OpenCV could not find a single Intel IPP entry point.
+ *
+ * The table is read once per image and turned into an open-addressed index of
+ * the external symbols it defines, which is what an export trie holds.
+ * LC_DYSYMTAB names the run of them, so the scan touches those and not the
+ * image's local symbols.  Only an image with no trie is indexed: where there is
+ * one it is the whole truth about what the image exports, and a miss in it is
+ * a real miss rather than a reason to go looking somewhere slower.
+ */
+typedef struct SymIndex {
+    uint32_t cap;
+    uint32_t n;
+    const char *strtab;
+    struct { uint32_t stroff; uint64_t value; } *ent;
+} SymIndex;
+
+static uint32_t symidx_hash(const char *s)
+{
+    uint32_t h = 2166136261u;
+    while (*s)
+        h = (h ^ (uint8_t)*s++) * 16777619u;
+    return h;
+}
+
+static SymIndex *symidx_build(const uint8_t *slice, uint64_t text_vmaddr)
+{
+    uint32_t ncmds = rd32(slice + 16);
+    const uint8_t *lc = slice + sizeof(struct mach_header_64);
+    uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
+    uint32_t iextdef = 0, nextdef = 0;
+    int have_dysym = 0;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_SYMTAB) {
+            symoff = rd32(lc + 8); nsyms = rd32(lc + 12);
+            stroff = rd32(lc + 16); strsize = rd32(lc + 20);
+        } else if (cmd == LC_DYSYMTAB) {
+            iextdef = rd32(lc + 8 + 3 * 4); nextdef = rd32(lc + 8 + 4 * 4);
+            have_dysym = 1;
+        }
+        lc += rd32(lc + 4);
+    }
+    if (!symoff || !nsyms || !stroff || !strsize)
+        return NULL;
+    uint32_t first = 0, count = nsyms;
+    if (have_dysym && nextdef && iextdef + nextdef <= nsyms) {
+        first = iextdef;
+        count = nextdef;
+    }
+    SymIndex *ix = (SymIndex *)calloc(1, sizeof *ix);
+    if (!ix)
+        return NULL;
+    uint32_t cap = 64;
+    while (cap < count * 2u)
+        cap <<= 1;
+    ix->ent = calloc(cap, sizeof *ix->ent);
+    if (!ix->ent) {
+        free(ix);
+        return NULL;
+    }
+    ix->cap = cap;
+    ix->strtab = (const char *)(slice + stroff);
+    for (uint32_t k = 0; k < count; k++) {
+        const uint8_t *nl = slice + symoff + (size_t)(first + k) * 16;
+        uint32_t strx = rd32(nl);
+        uint8_t type = nl[4];
+        if (strx == 0 || strx >= strsize)
+            continue;
+        if (!(type & N_EXT) || (type & N_TYPE) != N_SECT)
+            continue;
+        uint64_t value = rd64(nl + 8);
+        if (!value)
+            continue;
+        const char *name = ix->strtab + strx;
+        uint32_t h = symidx_hash(name) & (cap - 1);
+        while (ix->ent[h].stroff)
+            h = (h + 1) & (cap - 1);
+        ix->ent[h].stroff = strx;
+        ix->ent[h].value = value - text_vmaddr;
+        ix->n++;
+    }
+    return ix;
+}
+
+static uint64_t symtab_export_resolve(DynImage *img, const char *sym, int *found)
+{
+    if (!img->symidx) {
+        uint32_t tsize = 0;
+        if (image_export_trie(img->slice, &tsize) && tsize)
+            return 0;
+        uint64_t text = img->seg_count > 0 ? img->seg_vmaddr[0] : 0;
+        img->symidx = symidx_build(img->slice, text);
+        if (!img->symidx)
+            return 0;
+        OCERZ_LOG("dynamic: %s has no export trie; indexed %u exports from its symbol table\n",
+                  img->install_name[0] ? img->install_name : img->path, img->symidx->n);
+    }
+    SymIndex *ix = img->symidx;
+    if (!ix->cap)
+        return 0;
+    uint32_t h = symidx_hash(sym) & (ix->cap - 1);
+    while (ix->ent[h].stroff) {
+        if (strcmp(ix->strtab + ix->ent[h].stroff, sym) == 0) {
+            if (found)
+                *found = 1;
+            return img->load_base + ix->ent[h].value;
+        }
+        h = (h + 1) & (ix->cap - 1);
+    }
+    return 0;
+}
+
 uint64_t ocerz_dyld_trie_resolve(const uint8_t *slice, uint64_t load_base,
                                  const char *sym, int *found)
 {
@@ -965,7 +1110,14 @@ static uint64_t ocerz_image_self_resolve_ex(DynImage *img, const char *sym, int 
             }
         }
     }
-    return ocerz_dyld_trie_resolve(img->slice, img->load_base, sym, found);
+    int f = 0;
+    uint64_t v = ocerz_dyld_trie_resolve(img->slice, img->load_base, sym, &f);
+    if (f) {
+        if (found)
+            *found = 1;
+        return v;
+    }
+    return symtab_export_resolve(img, sym, found);
 }
 
 static uint64_t ocerz_image_self_resolve(DynImage *img, const char *sym)
@@ -1143,10 +1295,26 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
                       hit ? hit : "?");
     }
     if (!found && !weak) {
-        if (ocerz_mode == OCERZ_MODE_NATIVE)
+        if (ocerz_mode == OCERZ_MODE_NATIVE) {
             native_miss_add(libord == -1 ? "(main executable)" : tgt, name, img->path);
-        else
-            OCERZ_FATAL("unresolved import: %s\n", name);
+        } else if (libord == BIND_ORDINAL_FLAT_LOOKUP) {
+            g_dynlookup_miss++;
+            if (getenv("OCERZ_DYNLOOKUPLOG"))
+                fprintf(stderr, "ocerz: dynamic-lookup miss: %s, wanted by %s\n", name,
+                        img->install_name[0] ? img->install_name : img->path);
+        } else {
+            static int shown, all = -1;
+            if (all < 0)
+                all = getenv("OCERZ_ALLMISS") ? 1 : 0;
+            if (all || shown < MISS_LIST_MAX)
+                OCERZ_FATAL("unresolved import: %s, wanted by %s from %s\n", name,
+                            img->install_name[0] ? img->install_name : img->path,
+                            tgt && tgt[0] ? tgt : "the flat namespace");
+            else if (shown == MISS_LIST_MAX)
+                OCERZ_FATAL("unresolved import: further ones are not listed;"
+                            " OCERZ_ALLMISS=1 lists them all\n");
+            shown++;
+        }
     }
     return value;
 }
@@ -2268,6 +2436,13 @@ static void init_mark_done_closure(OcerzCache *cache, uint64_t mh)
     g_init_done[idx] = 1;
 }
 
+static int upward_init_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_UPWARD_INIT") ? 0 : 1;
+    return on;
+}
+
 static int dylib_lc_is_init_dep(const uint8_t *lc)
 {
     uint32_t cmd = rd32(lc);
@@ -2277,6 +2452,18 @@ static int dylib_lc_is_init_dep(const uint8_t *lc)
         rd32(lc + 8) == sizeof(struct dylib_use_command) && rd32(lc + 12) == DYLIB_USE_MARKER)
         return (rd32(lc + 24) & DYLIB_USE_UPWARD) == 0;
     return 1;
+}
+
+static int dylib_lc_is_upward_dep(const uint8_t *lc)
+{
+    uint32_t cmd = rd32(lc);
+    if (cmd == LC_LOAD_UPWARD_DYLIB)
+        return 1;
+    if ((cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB) &&
+        rd32(lc + 4) >= sizeof(struct dylib_use_command) &&
+        rd32(lc + 8) == sizeof(struct dylib_use_command) && rd32(lc + 12) == DYLIB_USE_MARKER)
+        return (rd32(lc + 24) & DYLIB_USE_UPWARD) != 0;
+    return 0;
 }
 
 static void init_collect(OcerzCache *cache, uint64_t mh, uint64_t *list, int *n, int cap)
@@ -2418,6 +2605,23 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
     } else if (getenv("OCERZ_INITLOG")) {
         fprintf(stderr, "INITSKIP mh=%#llx eager=%d is_libsystem=%d\n",
                 (unsigned long long)mh, eager_has(mh), mh == skip_mh);
+    }
+    if (!upward_init_enabled() || vm->exited)
+        return;
+    lc = h + sizeof(struct mach_header_64);
+    for (uint32_t j = 0; j < ncmds; j++) {
+        if (dylib_lc_is_upward_dep(lc)) {
+            uint32_t noff = rd32(lc + 8);
+            if (noff < rd32(lc + 4)) {
+                uint64_t umh = dep_mh(cache, (const char *)(lc + noff));
+                if (getenv("OCERZ_INITEDGE"))
+                    fprintf(stderr, "INITEDGE-UPWARD %#llx -> %#llx \"%s\"\n",
+                            (unsigned long long)mh, (unsigned long long)umh,
+                            (const char *)(lc + noff));
+                run_init_phase(vm, cache, umh, ia, stack_top, skip_mh);
+            }
+        }
+        lc += rd32(lc + 4);
     }
 }
 
