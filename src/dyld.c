@@ -1327,11 +1327,42 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
     return value;
 }
 
-static void protect_ro_segments(DynImage *img)
+/*
+ * The protections an image's segments are meant to have, applied once its
+ * fixups and ocerz's own writes into it are done.
+ *
+ * A segment is mapped writable while it is being bound, and dyld then puts each
+ * one at its initprot; a segment carrying SG_READ_ONLY, which is what
+ * __DATA_CONST is, ends up read-only rather than at the read-write initprot it
+ * declares.  ocerz used to do this for __TEXT alone, so everything else stayed
+ * writable and said so: mach_vm_region reported read-write for __DATA_CONST and
+ * __LINKEDIT where the same query on a real system reports read-only.  That is
+ * not a cosmetic difference.  Electron asks mach_vm_region about a region it
+ * expects to be read-only and executes an int3 when the answer is anything
+ * else, which is why Discord's renderers died on startup.
+ *
+ * The word read here is initprot at offset 60, not maxprot at 56.  The two
+ * agree in everything a modern linker emits, so the distinction only shows up
+ * in an older image whose __TEXT is writable in maxprot and not in initprot -
+ * which would previously have been left unprotected.
+ *
+ * This runs after canonicalize_objc_selrefs, because the selector references it
+ * rewrites live in __DATA_CONST, and after the fixups for the same reason.
+ * Native mode has a third writer to wait for: there the objc bridge builds the
+ * image's classes itself, and ocerz_objcbridge_define_image writes them into
+ * the same read-only segment long after the image is loaded.  So native mode
+ * queues each image and protects the batch once the bridge has defined it -
+ * protecting at load time bus-errored ocerz itself, inside its own loader,
+ * before the guest ran a single instruction.
+ * OCERZ_NO_TEXT_RO=1 leaves every segment as it was mapped.
+ */
+#define SEG_FLAG_READ_ONLY 0x10u
+
+static DynImage *g_ro_pending[DYN_DIMG_MAX];
+static int g_ro_pending_n;
+
+static void apply_seg_prots(DynImage *img)
 {
-    static int dis = -1;
-    if (dis < 0) dis = getenv("OCERZ_NO_TEXT_RO") ? 1 : 0;
-    if (dis || !img->slice) return;
     const uint8_t *mh = img->slice;
     uint32_t ncmds = rd32(mh + 16);
     const uint8_t *lc = mh + sizeof(struct mach_header_64);
@@ -1340,13 +1371,58 @@ static void protect_ro_segments(DynImage *img)
         if (cmd == LC_SEGMENT_64) {
             uint64_t vmaddr = rd64(lc + 24);
             uint64_t vmsize = rd64(lc + 32);
-            uint32_t initprot = rd32(lc + 56);
-            if (vmsize && !(vmaddr == 0 && initprot == 0) && !(initprot & 2) && (initprot & 4) &&
-                memcmp(lc + 8, "__TEXT", 7) == 0)
-                ocerz_protect(vmaddr + img->slide, vmsize, PROT_READ | PROT_EXEC);
+            uint32_t initprot = rd32(lc + 60);
+            uint32_t flags = rd32(lc + 68);
+            if (!vmsize || (vmaddr == 0 && initprot == 0)) {
+                lc += rd32(lc + 4);
+                continue;
+            }
+            int want;
+            if (flags & SEG_FLAG_READ_ONLY)
+                want = PROT_READ;
+            else if (initprot & VM_PROT_WRITE)
+                want = -1;
+            else
+                want = ((initprot & VM_PROT_READ) ? PROT_READ : 0) |
+                       ((initprot & VM_PROT_EXECUTE) ? PROT_EXEC : 0);
+            if (want > 0)
+                ocerz_protect(vmaddr + img->slide, vmsize, want);
         }
         lc += rd32(lc + 4);
     }
+}
+
+static void protect_ro_segments(DynImage *img)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_TEXT_RO") ? 1 : 0;
+    if (dis || !img->slice)
+        return;
+    for (int i = 0; i < g_ro_pending_n; i++)
+        if (g_ro_pending[i] == img)
+            return;
+    if (g_ro_pending_n < DYN_DIMG_MAX) {
+        g_ro_pending[g_ro_pending_n++] = img;
+        return;
+    }
+    apply_seg_prots(img);
+}
+
+static void protect_ro_flush(void)
+{
+    int n = g_ro_pending_n;
+    g_ro_pending_n = 0;
+    for (int i = 0; i < n; i++)
+        apply_seg_prots(g_ro_pending[i]);
+}
+
+static void protect_ro_drop(const DynImage *img)
+{
+    int n = 0;
+    for (int i = 0; i < g_ro_pending_n; i++)
+        if (g_ro_pending[i] != img)
+            g_ro_pending[n++] = g_ro_pending[i];
+    g_ro_pending_n = n;
 }
 
 static int apply_fixups(DynImage *img, OcerzCache *cache)
@@ -3007,13 +3083,13 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     }
     if (d->cf_off == 0)
         apply_classic_fixups(d, cache);
-    protect_ro_segments(d);
     d->seq = ++g_dimg_seq;
 
     if (ocerz_mode == OCERZ_MODE_CACHE)
         ocerz_dyldapi_register_image(d->load_base, d->path);
     if (!g_ndl.active)
         canonicalize_objc_selrefs(d);
+    protect_ro_segments(d);
     if (getenv("OCERZ_DLPATH"))
         fprintf(stderr, "ocerz: DLPATH disk-dep load_base=%#llx install=%s path=%s\n",
                 (unsigned long long)d->load_base, d->install_name, resolved);
@@ -3120,6 +3196,7 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     if (ocerz_mode == OCERZ_MODE_CACHE)
         ocerz_dyldapi_register_image(d->load_base, d->path);
     canonicalize_objc_selrefs(d);
+    protect_ro_segments(d);
     if (getenv("OCERZ_DLPATH"))
         fprintf(stderr, "ocerz: DLPATH dlopen load_base=%#llx install=%s path=%s\n",
                 (unsigned long long)d->load_base, d->install_name, install_path);
@@ -3383,6 +3460,7 @@ uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
         fprintf(stderr, "ocerz: DLOPEN \"%s\" mode=%#x\n", hostpath ? hostpath : "(null)", mode);
     pthread_mutex_lock(&g_load_lock);
     uint64_t r = ocerz_dlopen_inner(vm, hostpath, mode);
+    protect_ro_flush();
     pthread_mutex_unlock(&g_load_lock);
     if (getenv("OCERZ_DLOPENLOG"))
         fprintf(stderr, "ocerz: DLOPEN \"%s\" -> %#llx%s%s\n", hostpath ? hostpath : "(null)", (unsigned long long)r,
@@ -4334,6 +4412,7 @@ static void ndl_rollback(int before)
 {
     for (int i = g_dimgs_n - 1; i >= before; i--) {
         DynImage *d = &g_dimgs[i];
+        protect_ro_drop(d);
         if (d->map_size)
             ocerz_unmap(d->map_base, d->map_size);
         free(d->owned_buf);
@@ -4506,6 +4585,7 @@ static uint64_t ndl_dlopen_locked(struct OcerzVM *vm, const char *path, int mode
     }
     if (dimg_find_by_install_name(OCERZ_OBJC_LIBOBJC))
         ocerz_objcbridge_install_uncaught();
+    protect_ro_flush();
     for (int i = 0; i < n && !vm->exited; i++) {
         ocerz_objcbridge_run_image_loads(vm, (const uint8_t *)ocerz_g2h(order[i]->load_base), stack_top);
         if (!vm->exited)
@@ -4817,6 +4897,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         ocerz_objcbridge_define_image((const uint8_t *)ocerz_g2h(img.load_base), img.slide);
         if (dimg_find_by_install_name(OCERZ_OBJC_LIBOBJC))
             ocerz_objcbridge_install_uncaught();
+        protect_ro_flush();
     }
 
     DynFrame fr;
@@ -4968,6 +5049,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         }
         if (ran_init)
             g_run_init_ready = 1;
+        protect_ro_flush();
     }
 
     if (ocerz_mode == OCERZ_MODE_NATIVE) {

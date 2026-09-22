@@ -181,6 +181,17 @@
  * address, so outside identity mode they return ENOSYS rather than let the
  * kernel read or write the wrong memory.
  *
+ * ---- what a vm_region query answers with ----
+ * A guest asking mach_vm_region about its own memory is asking about the guest
+ * address space, not about the host arena that happens to hold it, so the reply
+ * is rewritten from ocerz's own map of the guest.  Only the low-shadow map used
+ * to get this; every other map handed back the host's view, where a whole arena
+ * is one read-write-execute region and an image's __DATA_CONST is therefore
+ * read-write.  Electron asks about a region it expects to be read-only and
+ * executes an int3 when the answer is anything else, which is what killed
+ * Discord's renderers.  A guest address ocerz has no mapping for still falls
+ * through to the host reply, because that is the only answer left to give.
+ *
  * ---- failure policy ----
  * An unimplemented call reports once and returns ENOSYS rather than aborting:
  * aborting kills the guest thread where it stands, and under Wine that is often
@@ -2832,10 +2843,12 @@ static void ocerz_reply_xlate_vm_region(uint64_t reply_buf, uint32_t recv_size,
         return;
     }
 
-    if (ocerz_low_base && req_addr != (uint64_t)-1) {
+    if (req_addr != (uint64_t)-1) {
         uint64_t ga = req_addr, gsz = 0;
         unsigned prot = 0, maxprot = 0;
         ocerz_guest_vm_region(&ga, &gsz, &prot, &maxprot);
+        if (!ocerz_low_base && !prot && !maxprot)
+            goto host_reply;
         ocerz_st(reply_buf + address_off, 8, ga);
         ocerz_st(reply_buf + address_off + 8, 8, gsz);
         if (reply_id == 4915 && size >= 0x44) {
@@ -2849,6 +2862,7 @@ static void ocerz_reply_xlate_vm_region(uint64_t reply_buf, uint32_t recv_size,
         return;
     }
 
+host_reply:;
     uint64_t haddr = ocerz_ld(reply_buf + address_off, 8);
     if (ocerz_host_in_guest_space((const void *)(uintptr_t)haddr))
         ocerz_st(reply_buf + address_off, 8,
