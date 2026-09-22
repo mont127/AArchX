@@ -14,7 +14,7 @@
   <img alt="license" src="https://img.shields.io/badge/license-Non--commercial-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
-  <img alt="version" src="https://img.shields.io/badge/version-0.2--dev-green.svg">
+  <img alt="version" src="https://img.shields.io/badge/version-0.3--dev-green.svg">
 </p>
 
 > [!WARNING]
@@ -97,6 +97,8 @@ means the app drew its main window on screen and stayed up.
 | TextEdit / Preview / Script Editor | run; open a document window when given a file to open |
 | Safari | works (2026-09-21, owner-confirmed): the browser runs and browses. It is not part of any gate, and its startup has not been timed. |
 | Steam (x86-64 client) | works with `-cef-disable-gpu` (2026-09-12): bootstrapper, `ipcserver`, client and the CEF web helper with GPU, utility and renderer processes; the window draws with software rendering. Some launches still stall before the web UI starts. See [Steam](#steam). |
+| Discord | works (2026-09-22, owner-confirmed): the Electron client reaches its signed-in app view in a 1280 by 720 window, seven processes as under Rosetta, nothing reported by ocerz. Its renderers used to die at startup until `mach_vm_region` began answering from the guest's own map. |
+| Brawlhalla | works (2026-09-22, owner-confirmed): the Adobe AIR game reaches its menus against a running Steam client. Needs the System V shared memory calls Steam's IPC uses and a working GPU, both new that day. Owner reports it is laggy; that has not been measured. |
 
 Command-line tools match their native output byte for byte
 (`tools/apptest.sh cli`, 16 of 16): `uname`, `sw_vers`, `echo`, `ls`, `id`,
@@ -132,7 +134,17 @@ The Ollama menu-bar app runs too. In a 30-second run it started its own server, 
 Safari took the longest to get there. It used to start and never show a window: in a run on 2026-09-13, WebKit's allocator failed to suspend a thread (`thread_suspend` returned `MACH_SEND_INVALID_DEST`) and stopped the process. The main thread was missing from AArchX's thread-suspension emulation, and workqueue threads that AArchX started ended without running the guest's thread-exit path; both were fixed that day, and the WebKit work continued through macOS 27.
 
 Not working yet:
-- **Photos** aborted in `+[PAOpenGLDevice _sharedPixelFormat:]` because `CGLChoosePixelFormat` returned 10002 for every attribute set. The cause was in AArchX's dyld, not the Rosetta-only `AppleMetalGLRenderer` IOKit service blamed earlier. `_dyld_shared_cache_contains_path` rejected the software renderer's plugin path, which runs through a symlink, and `dlsym` on a shared-cache image searched the whole cache. Both are fixed, and CGL now lists the same renderers and builds the same pixel formats as under Rosetta. Photos has not been run again since.
+- **Photos** aborted in `+[PAOpenGLDevice _sharedPixelFormat:]` because `CGLChoosePixelFormat` returned 10002 for every attribute set. The cause was in AArchX's dyld, not the Rosetta-only `AppleMetalGLRenderer` IOKit service blamed earlier. `_dyld_shared_cache_contains_path` rejected the software renderer's plugin path, which runs through a symlink, and `dlsym` on a shared-cache image searched the whole cache. Both were fixed on 2026-09-13, and a third cause behind the same error was found on 2026-09-22 and is described under [The GPU](#the-gpu). Photos has not been run again since.
+
+## The GPU
+
+Until 2026-09-22 a translated program saw no GPU at all. `MTLCreateSystemDefaultDevice` returned nil and `MTLCopyAllDevices` returned no devices, where Rosetta and a native arm64 build both report `Apple M5`. OpenGL then had only its software renderer to offer: `CGLQueryRendererInfo` listed `0x1020400` and not the accelerated `0x1027f00`, so `CGLChoosePixelFormat` failed for every accelerated attribute set.
+
+One bug caused all of it. In cache mode the dyld APIs answer `_dyld_image_count`, `_dyld_get_image_name` and `_dyld_get_image_header` from the image closure AArchX computes at startup. `dlopen` of a dylib on disk added to that closure; `dlopen` of an image in the shared cache returned its mach header and added nothing. The library was loaded, its symbols resolved and `dladdr` knew where they lived, while every walk of the loaded-image list said it was not there. libobjc keys its per-image queries off that list, so `objc_copyClassNamesForImage` returned nothing for a bundle whose classes `objc_getClass` could already find, and Metal, which loads its GPU driver that way, concluded there was no device.
+
+A cache image is now registered along with its dependency closure, at the end of the `dlopen`, after the Objective-C mapping and the initializer phase. That order matters: libobjc calls back into the dyld APIs while it maps an image, and an image already standing in the list when the callback arrives is one it takes as already handled, which costs the newly loaded framework its categories. `tests/dynamic/dlopen_image_list.c` holds the check.
+
+Metal, `CGLQueryRendererInfo`, `CGLChoosePixelFormat` and `CGLCreateContext` now return what they return under Rosetta, with `GL_RENDERER` reading `Apple M5` and `GL_VERSION` `2.1 Metal - 91.7`. Steam and CEF have not been retried with GPU acceleration since.
 
 ## Steam
 
@@ -307,7 +319,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 | `-cache` | bind the guest against Apple's x86_64 shared cache; the default |
 | `-path file` | load `file` but keep the following guest arguments as they are |
 | `--` | end of AArchX options |
-| `version` | print the name and version (`AArchX 0.2-dev`) |
+| `version` | print the name and version (`AArchX 0.3-dev`) |
 
 | Environment | Effect |
 | --- | --- |
