@@ -5,6 +5,6 @@
 #define OCERZ_VERSION_H
 
 #define OCERZ_PROJECT "AArchX"
-#define OCERZ_VERSION "0.2-dev"
+#define OCERZ_VERSION "0.3-dev"
 
 #endif
