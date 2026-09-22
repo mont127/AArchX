@@ -351,6 +351,8 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 | `OCERZ_NO_NATIVE_CHILDREN=1` | in native mode, run the system tools a guest starts under ocerz as well; by default one outside the shells and launchers that has an arm64 slice runs as itself |
 | `OCERZ_NO_TSD_DTORS=1` | in native mode, do not run the destructors of the guest's thread-specific data keys at thread exit |
 | `OCERZ_DLPATH=1` | print every `dlopen` and `dlsym` failure with the reason; inherited by child processes, which `-v` is not |
+| `OCERZ_ALLMISS=1` | list every unresolved import rather than the first two dozen |
+| `OCERZ_DYNLOOKUPLOG=1` | name each symbol imported with `-undefined dynamic_lookup` that nothing defines, which is allowed and is not otherwise reported |
 | `OCERZ_SUSPLOG=1` | in native mode, log each `thread_suspend` and `thread_resume` a guest makes, with the thread port and the answer |
 | `OCERZ_SELPOOLLOG=1` | when the shared cache's selector strings have to be indexed by hand, print the pool's address, size, string count and table capacity; `OCERZ_SELVERIFY=1` checks every answer of the cache's own selector table against that index |
 | `OCERZ_NO_MOCK_KEYCHAIN=1` | launch `Steam Helper` without `--use-mock-keychain`, so CEF reads the real "Steam Safe Storage" keychain item and macOS asks for the login password |

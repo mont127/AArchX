@@ -70,6 +70,14 @@
  * libSystem stops right there instead of descending through libxpc into
  * Foundation and dragging the whole system into its subtree.  Its objc load
  * notifications are therefore delivered before that prune can hide them.
+ *
+ * A dependency is looked for in the shared cache both before and after its
+ * symlinks are followed.  Only the first lookup used to happen, so a path that
+ * named the cache under a different spelling was followed to a target that is
+ * not on disk and the load failed as a missing file.  Eleven of the twelve
+ * dylibs in /usr/lib/swift are symlinks into frameworks whose binaries exist
+ * only in the cache, which is how Tailscale lost Network.framework through
+ * Sparkle, naming a path the cache was holding all along.
  * An upward link is how a library declares the back edge of a dependency cycle,
  * and it is an ordering edge for nothing: the library that declares it may be
  * initialized first.  So it is not followed on the way DOWN.  Following it
@@ -2921,8 +2929,11 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         return NULL;
 
     char canon[1024];
-    if (ocerz_canon_dylib_path(resolved, canon, sizeof canon))
+    if (ocerz_canon_dylib_path(resolved, canon, sizeof canon) && strcmp(canon, resolved) != 0) {
         snprintf(resolved, sizeof resolved, "%s", canon);
+        if (dep_find(cache, resolved) != 0)
+            return NULL;
+    }
     DynImage *existing = dimg_find_by_path(resolved);
     if (existing)
         return existing;
