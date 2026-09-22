@@ -210,6 +210,21 @@
  * Brawlhalla's main thread fell from a saturated core to 71%, while doing more
  * work per second than before.
  *
+ * A memory access whose address is not a known stack slot pays a commpage
+ * guard before it - the commpage lives elsewhere on the host, so the address
+ * is compared against that range and redirected if it falls inside - and, in
+ * ordered mode, a granule test before the ldapr or stlr, since those fault on
+ * an access that crosses a granule.  For a rip-relative or absolute operand the
+ * address is a constant of the translation, so both questions are answered
+ * when the block is built: the guard is skipped or becomes the plain
+ * redirect, and an aligned constant address goes straight to the ordered
+ * load or store.  A global load or store costs four host words instead of
+ * fourteen in plain mode and eighteen in ordered mode; it is the most common
+ * form there is in compiled code.  The known-address note is set by the guard
+ * and consumed by the very next ordered access, and building any other
+ * effective address clears it, so it can never describe an address other than
+ * the one just guarded.
+ *
  * Eleven libSystem exports do not cross at all.  strlen, strnlen, strcmp,
  * strncmp, memcmp, bcmp, strchr, memchr, memcpy, memmove and memset are called
  * constantly, do very little, and cost several times their own work to reach
@@ -528,6 +543,8 @@ static int g_no_ldapr;
 
 static int g_no_oolslow;
 static void ea_cache_reset(void);
+static int g_const_ea_valid;
+static uint64_t g_const_ea;
 
 typedef struct {
     uint32_t *bne;
@@ -3254,6 +3271,7 @@ static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, i
 
 static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int addr_reg)
 {
+    g_const_ea_valid = 0;
     uint64_t fold = ea_fold();
     int seg = insn->seg;
     if (seg != OCERZ_SEG_NONE) {
@@ -3339,12 +3357,42 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     return 1;
 }
 
+static int insn_const_addr(const X86Insn *insn, uint64_t *ga)
+{
+    if (!insn || insn->seg != OCERZ_SEG_NONE)
+        return 0;
+    for (int i = 0; i < insn->nops; i++) {
+        const X86Operand *o = &insn->ops[i];
+        if (o->kind != OCERZ_OPK_MEM)
+            continue;
+        if (o->riprel) { *ga = (uint64_t)o->disp; return 1; }
+        if (insn->addrsize == 8 && o->base == OCERZ_REG_NONE && o->index == OCERZ_REG_NONE) {
+            *ga = (uint64_t)o->disp;
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
                                      int addr_reg, uint32_t **exit_sites, int *n_exits)
 {
-    (void)insn; (void)exit_sites; (void)n_exits;
+    (void)exit_sites; (void)n_exits;
+    g_const_ea_valid = 0;
     if (!ocerz_commpage && !ocerz_low_base)
         return NULL;
+    uint64_t ga;
+    if (!ocerz_low_base && insn_const_addr(insn, &ga)) {
+        if (ga >= OCERZ_COMMPAGE_LO && ga < OCERZ_COMMPAGE_HI) {
+            a64_mov_imm64(b, JTU, (uint64_t)(uintptr_t)ocerz_commpage - OCERZ_COMMPAGE_LO - ocerz_guest_base);
+            a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
+            return NULL;
+        }
+        g_const_ea = ga;
+        g_const_ea_valid = 1;
+        return NULL;
+    }
 
     uint64_t fold = ea_fold();
     uint32_t *to_native = NULL;
@@ -3516,6 +3564,14 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
         a64_stlr(b, 1, rv, ra);
         return;
     }
+    if (g_const_ea_valid) {
+        int aligned = (g_const_ea & (uint64_t)(size - 1)) == 0;
+        g_const_ea_valid = 0;
+        if (aligned) {
+            a64_stlr(b, size, rv, ra);
+            return;
+        }
+    }
     emit_granule_cross_test(b, size, ra, scratch);
     if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
         uint32_t *bne = a64_label(b);
@@ -3549,6 +3605,15 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
         if (g_no_ldapr) a64_ldar(b, 1, rd, ra);
         else            a64_ldapr(b, 1, rd, ra);
         return;
+    }
+    if (g_const_ea_valid) {
+        int aligned = (g_const_ea & (uint64_t)(size - 1)) == 0;
+        g_const_ea_valid = 0;
+        if (aligned) {
+            if (g_no_ldapr) a64_ldar(b, size, rd, ra);
+            else            a64_ldapr(b, size, rd, ra);
+            return;
+        }
     }
     emit_granule_cross_test(b, size, ra, scratch);
     if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
@@ -15686,7 +15751,9 @@ promo_push_fallthrough:
         static int g_jitdis = -1;
         static FILE *g_jf;
         static uint64_t g_jd_lo, g_jd_hi;
+        static int g_jd_brief;
         if (g_jitdis < 0) {
+            g_jd_brief = getenv("OCERZ_JITDIS_BRIEF") ? 1 : 0;
             const char *p = getenv("OCERZ_JITDIS");
             g_jitdis = p ? 1 : 0;
             const char *lo = getenv("OCERZ_JITDIS_LO"), *hi = getenv("OCERZ_JITDIS_HI");
@@ -15696,7 +15763,7 @@ promo_push_fallthrough:
                 char pb[1024];
                 snprintf(pb, sizeof pb, "%s.%d", p, (int)getpid());
                 g_jf = fopen(pb, "w");
-                if (g_jf) setvbuf(g_jf, NULL, _IOLBF, 0);
+                if (g_jf) setvbuf(g_jf, NULL, _IOFBF, 1u << 20);
             }
         }
         if (g_jitdis > 0 && g_jf && blk->insn_off && rip >= g_jd_lo && rip < g_jd_hi) {
@@ -15720,7 +15787,7 @@ promo_push_fallthrough:
                         blk->edges[e].cond_site ? (long)(blk->edges[e].cond_site - entry) : -1L);
             if (n > 0 && blk->insn_off[0] > 0) {
                 fprintf(g_jf, "  PRO off=0 words=%u\n", blk->insn_off[0]);
-                for (uint32_t w = 0; w < blk->insn_off[0]; w++)
+                for (uint32_t w = 0; !g_jd_brief && w < blk->insn_off[0]; w++)
                     fprintf(g_jf, "    %08x\n", entry[w]);
             }
             for (int i = 0; i < n; i++) {
@@ -15729,11 +15796,11 @@ promo_push_fallthrough:
                 ocerz_format_insn(&blk->insns[i], tb, sizeof tb);
                 fprintf(g_jf, "  INSN %d off=%u words=%u  %s\n", i, s,
                         e > s ? e - s : 0, tb);
-                for (uint32_t w = s; w < e; w++)
+                for (uint32_t w = s; !g_jd_brief && w < e; w++)
                     fprintf(g_jf, "    %08x\n", entry[w]);
             }
             fprintf(g_jf, "  EPI off=%u words=%u\n", epi, blk->code_words - epi);
-            for (uint32_t w = epi; w < blk->code_words; w++)
+            for (uint32_t w = epi; !g_jd_brief && w < blk->code_words; w++)
                 fprintf(g_jf, "    %08x\n", entry[w]);
             fflush(g_jf);
         }
