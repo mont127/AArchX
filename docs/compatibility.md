@@ -95,7 +95,7 @@ yet known. This gap grows on its own as Apple moves more system software onto
 Swift.
 
 **Both modes** are limited by the same two things: this is experimental software
-of version 0.2-dev, and only what someone has actually run is known to run.
+of version 0.3-dev, and only what someone has actually run is known to run.
 
 ## Reporting something that does not work
 

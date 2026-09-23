@@ -22,7 +22,7 @@ x86_64` for the fixtures the dynamic and native gates build.
 
 ```sh
 make -j
-./ocerz version        # AArchX 0.2-dev
+./ocerz version        # AArchX 0.3-dev
 ```
 
 The build is C11 with `-arch arm64 -O2`, takes well under a minute, and has no
