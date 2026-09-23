@@ -436,6 +436,20 @@
  * performance HUD, and nothing exists there on disk.  In cache mode a dlopen
  * of an absolute path found neither in the cache nor on disk retries the same
  * path under /System/Volumes/Preboot/Cryptexes/Rosetta.
+ *
+ * A dylib built for macOS 10.5 or earlier has no compressed fixup information:
+ * its pointers are fixed through local relocations, which are rebased by the
+ * slide, external relocations, which add a symbol's address to the value in
+ * place, and the indirect symbol table behind its lazy and non-lazy symbol
+ * pointer sections.  On x86_64 a relocation's address counts from the first
+ * writable segment.  ocerz applied none of this, so such a library kept every
+ * pointer unslid and unbound, and Steam's steamloader.dylib, which Steam
+ * injects into every game it launches, jumped to zero in its first call.
+ *
+ * DYLD_INSERT_LIBRARIES is honoured in cache mode: once the startup
+ * initializers have run, each library it names is opened as the guest's dlopen
+ * would, before the program's entry point.  src/main.c keeps the host's dyld
+ * from acting on the same variable.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -1720,10 +1734,124 @@ static void classic_bind_stream(DynImage *img, OcerzCache *cache,
     }
 }
 
+static int legacy_ordinal(const DynImage *img, uint16_t n_desc)
+{
+    uint32_t flags = rd32(img->slice + 24);
+    int ord = (n_desc >> 8) & 0xff;
+    if (!(flags & MH_TWOLEVEL) || ord == 0xff)
+        return BIND_ORDINAL_FLAT_LOOKUP;
+    if (ord == 0xfe)
+        return -1;
+    return ord;
+}
+
+static uint64_t legacy_symbol(DynImage *img, OcerzCache *cache, const uint8_t *syms,
+                              uint32_t nsyms, const char *strs, uint32_t strsize,
+                              uint32_t index)
+{
+    if (index >= nsyms)
+        return 0;
+    const uint8_t *n = syms + (size_t)index * 16;
+    uint32_t strx = rd32(n);
+    uint8_t type = n[4];
+    uint16_t desc = (uint16_t)(n[6] | (n[7] << 8));
+    uint64_t value = rd64(n + 8);
+    if ((type & N_TYPE) == N_SECT)
+        return value + img->slide;
+    if ((type & N_TYPE) == N_ABS)
+        return value;
+    if (strx >= strsize)
+        return 0;
+    return resolve_import(cache, img, strs + strx, legacy_ordinal(img, desc),
+                          (desc & N_WEAK_REF) != 0);
+}
+
+static int apply_legacy_relocations(DynImage *img, OcerzCache *cache)
+{
+    const uint8_t *h = img->slice;
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    const uint8_t *symtab = NULL, *dysymtab = NULL;
+    uint64_t reloc_base = 0;
+    int have_writable = 0;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc), size = rd32(lc + 4);
+        if (size < 8)
+            return OCERZ_OK;
+        if (cmd == LC_SYMTAB)
+            symtab = lc;
+        else if (cmd == LC_DYSYMTAB)
+            dysymtab = lc;
+        else if (cmd == LC_SEGMENT_64 && !have_writable && (rd32(lc + 60) & VM_PROT_WRITE)) {
+            reloc_base = rd64(lc + 24) + img->slide;
+            have_writable = 1;
+        }
+        lc += size;
+    }
+    if (!symtab || !dysymtab)
+        return OCERZ_OK;
+    const uint8_t *syms = h + rd32(symtab + 8);
+    uint32_t nsyms = rd32(symtab + 12);
+    const char *strs = (const char *)h + rd32(symtab + 16);
+    uint32_t strsize = rd32(symtab + 20);
+    const uint8_t *indirect = h + rd32(dysymtab + 0x38);
+    uint32_t nindirect = rd32(dysymtab + 0x3c);
+    const uint8_t *extrel = h + rd32(dysymtab + 0x40);
+    uint32_t nextrel = rd32(dysymtab + 0x44);
+    const uint8_t *locrel = h + rd32(dysymtab + 0x48);
+    uint32_t nlocrel = rd32(dysymtab + 0x4c);
+
+    for (uint32_t i = 0; have_writable && img->slide && i < nlocrel; i++) {
+        int32_t addr = (int32_t)rd32(locrel + i * 8);
+        uint32_t info = rd32(locrel + i * 8 + 4);
+        if (((info >> 25) & 3) != 3 || ((info >> 24) & 1) || ((info >> 27) & 1) || (info >> 28))
+            continue;
+        uint64_t at = reloc_base + (int64_t)addr;
+        ocerz_st(at, 8, ocerz_ld(at, 8) + img->slide);
+    }
+    for (uint32_t i = 0; have_writable && i < nextrel; i++) {
+        int32_t addr = (int32_t)rd32(extrel + i * 8);
+        uint32_t info = rd32(extrel + i * 8 + 4);
+        if (((info >> 25) & 3) != 3 || ((info >> 24) & 1) || !((info >> 27) & 1) || (info >> 28))
+            continue;
+        uint64_t at = reloc_base + (int64_t)addr;
+        uint64_t target = legacy_symbol(img, cache, syms, nsyms, strs, strsize, info & 0xffffff);
+        ocerz_st(at, 8, ocerz_ld(at, 8) + target);
+    }
+    lc = h + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc), size = rd32(lc + 4);
+        if (cmd == LC_SEGMENT_64) {
+            uint32_t nsects = rd32(lc + 64);
+            for (uint32_t k = 0; k < nsects && 72 + (k + 1) * 80 <= size; k++) {
+                const uint8_t *sc = lc + 72 + k * 80;
+                uint32_t type = rd32(sc + 64) & SECTION_TYPE;
+                if (type != S_NON_LAZY_SYMBOL_POINTERS && type != S_LAZY_SYMBOL_POINTERS)
+                    continue;
+                uint64_t addr = rd64(sc + 32) + img->slide;
+                uint64_t count = rd64(sc + 40) / 8;
+                uint32_t first = rd32(sc + 68);
+                for (uint64_t j = 0; j < count && first + j < nindirect; j++) {
+                    uint32_t index = rd32(indirect + (first + j) * 4);
+                    uint64_t at = addr + j * 8;
+                    if (index == INDIRECT_SYMBOL_ABS || index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS))
+                        continue;
+                    if (index == INDIRECT_SYMBOL_LOCAL)
+                        ocerz_st(at, 8, ocerz_ld(at, 8) + img->slide);
+                    else
+                        ocerz_st(at, 8, legacy_symbol(img, cache, syms, nsyms, strs, strsize, index));
+                }
+            }
+        }
+        lc += size;
+    }
+    return OCERZ_OK;
+}
+
 static int apply_classic_fixups(DynImage *img, OcerzCache *cache)
 {
     if (!img->has_dyld_info)
-        return OCERZ_OK;
+        return apply_legacy_relocations(img, cache);
     classic_rebase(img);
     if (img->bind_size)
         classic_bind_stream(img, cache, img->slice + img->bind_off,
@@ -1920,7 +2048,7 @@ static uint64_t dep_find(OcerzCache *cache, const char *path)
         if (strcmp(g_depmap[h].path, path) == 0) return g_depmap[h].mh;
         h = (h + 1) & ((1u << DEPMAP_BITS) - 1);
     }
-    return 0;
+    return ocerz_cache_find_alias(cache, path);
 }
 
 static uint64_t dep_mh(OcerzCache *cache, const char *path)
@@ -4864,6 +4992,20 @@ static void native_exit_through_libsystem(const DynFrame *fr)
     memcpy(ocerz_g2h(fr->exit_stub), code, sizeof code);
 }
 
+static void load_inserted_libraries(struct OcerzVM *vm)
+{
+    const char *list = getenv("DYLD_INSERT_LIBRARIES");
+    if (!list || !list[0])
+        return;
+    char *copy = strdup(list);
+    for (char *save = NULL, *p = copy ? strtok_r(copy, ":", &save) : NULL; p && !vm->exited;
+         p = strtok_r(NULL, ":", &save)) {
+        if (!ocerz_dlopen(vm, p, RTLD_NOW | RTLD_GLOBAL))
+            fprintf(stderr, "ocerz: DYLD_INSERT_LIBRARIES: could not load %s\n", p);
+    }
+    free(copy);
+}
+
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
 {
     if (ocerz_mem_init_identity(DYN_ARENA_SIZE) != OCERZ_OK)
@@ -5121,6 +5263,11 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         if (ran_init)
             g_run_init_ready = 1;
         protect_ro_flush();
+        if (ran_init) {
+            load_inserted_libraries(vm);
+            if (vm->exited)
+                return vm->exit_code;
+        }
     }
 
     if (ocerz_mode == OCERZ_MODE_NATIVE) {

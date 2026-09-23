@@ -41,6 +41,23 @@
  * native CoreFoundation the guest's executable as the process path, so the
  * guest's initial stack never carries that variable, and the host environment,
  * which the guest's environ names, holds it only while that initializer runs.
+ *
+ * A program named by its application bundle runs the bundle's executable:
+ * CFBundleExecutable from Contents/Info.plist, or, when that cannot be read
+ * as XML, the bundle's own name, under Contents/MacOS.  Steam's launch
+ * options substitute the bundle for %command%, so without this a game
+ * launched from Steam as "ocerz %command%" ended at once with "cannot read".
+ * The guest's argv[0] becomes the executable's path, as it is for a bundle
+ * started by the system.
+ *
+ * DYLD_INSERT_LIBRARIES names libraries for the guest, but the host's dyld
+ * reads it first and loads their arm64 slices into ocerz itself.  Steam sets
+ * it to its loader and overlay for every game it launches, and inside ocerz
+ * they broke startup within half a second.  So ocerz started with the variable
+ * set moves it to OCERZ_GUEST_DYLD_INSERT_LIBRARIES, removes it and re-executes
+ * itself, which keeps the process ID Steam tracks; the clean copy puts the
+ * variable back before the guest's environment is taken, so the guest sees it
+ * as it was set and the loader inserts the libraries into the guest alone.
  */
 #include <signal.h>
 #include <pthread.h>
@@ -52,6 +69,9 @@
 #include "ocerz/mode.h"
 
 #include <limits.h>
+#include <mach-o/dyld.h>
+#include <sys/stat.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -126,8 +146,75 @@ static char **mock_keychain_argv(const char *path, int *argc, char **argv)
     return out;
 }
 
+static int bundle_executable(const char *dir, char *out, size_t n)
+{
+    struct stat st;
+    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
+        return 0;
+    char plist[PATH_MAX];
+    char name[PATH_MAX] = "";
+    snprintf(plist, sizeof plist, "%s/Contents/Info.plist", dir);
+    FILE *f = fopen(plist, "rb");
+    if (f) {
+        static char buf[1 << 20];
+        size_t len = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[len] = '\0';
+        const char *k = strstr(buf, "<key>CFBundleExecutable</key>");
+        const char *v = k ? strstr(k, "<string>") : NULL;
+        const char *e = v ? strstr(v, "</string>") : NULL;
+        if (e && (size_t)(e - v - 8) < sizeof name) {
+            memcpy(name, v + 8, (size_t)(e - v - 8));
+            name[e - v - 8] = '\0';
+        }
+    }
+    if (!name[0]) {
+        const char *b = strrchr(dir, '/');
+        b = b ? b + 1 : dir;
+        size_t bl = strlen(b);
+        while (bl > 0 && b[bl - 1] == '/')
+            bl--;
+        if (bl > 4 && strncmp(b + bl - 4, ".app", 4) == 0)
+            bl -= 4;
+        if (bl == 0 || bl >= sizeof name)
+            return 0;
+        memcpy(name, b, bl);
+        name[bl] = '\0';
+    }
+    int len = snprintf(out, n, "%s/Contents/MacOS/%s", dir, name);
+    return len > 0 && (size_t)len < n && stat(out, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static void reexec_without_host_insertion(char **argv)
+{
+    const char *list = getenv("DYLD_INSERT_LIBRARIES");
+    if (!list || !list[0] || getenv("OCERZ_GUEST_DYLD_INSERT_LIBRARIES"))
+        return;
+    char self[PATH_MAX];
+    uint32_t size = sizeof self;
+    if (_NSGetExecutablePath(self, &size) != 0)
+        return;
+    if (setenv("OCERZ_GUEST_DYLD_INSERT_LIBRARIES", list, 1) != 0)
+        return;
+    unsetenv("DYLD_INSERT_LIBRARIES");
+    execv(self, argv);
+    setenv("DYLD_INSERT_LIBRARIES", getenv("OCERZ_GUEST_DYLD_INSERT_LIBRARIES"), 1);
+    unsetenv("OCERZ_GUEST_DYLD_INSERT_LIBRARIES");
+}
+
+static void restore_guest_insertion(void)
+{
+    const char *list = getenv("OCERZ_GUEST_DYLD_INSERT_LIBRARIES");
+    if (!list)
+        return;
+    setenv("DYLD_INSERT_LIBRARIES", list, 1);
+    unsetenv("OCERZ_GUEST_DYLD_INSERT_LIBRARIES");
+}
+
 int main(int argc, char **argv)
 {
+    reexec_without_host_insertion(argv);
+    restore_guest_insertion();
     if (getenv("OCERZ_HOSTMASKLOG")) {
         sigset_t hm_; unsigned hv_ = 0;
         if (pthread_sigmask(SIG_BLOCK, NULL, &hm_) == 0)
@@ -220,6 +307,12 @@ int main(int argc, char **argv)
     }
     if (!load_path)
         load_path = argv[i];
+    static char bundle_exe[PATH_MAX];
+    if (bundle_executable(load_path, bundle_exe, sizeof bundle_exe)) {
+        if (load_path == argv[i])
+            argv[i] = bundle_exe;
+        load_path = bundle_exe;
+    }
 
     apply_wine_defaults(load_path);
 
