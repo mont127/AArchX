@@ -1,0 +1,57 @@
+# AArchX documentation
+
+**New here?** Start with the [Atlas](atlas/) — a guided mental model of the source for contributors: the vocabulary from zero, then how a program flows through the translator, why each mechanism exists, and how to read the diagnostics. No C required.
+
+AArchX runs x86-64 macOS programs on Apple Silicon. It is a userspace binary
+translator written from scratch: its own Mach-O loader, x86 decoder,
+interpreter, arm64 JIT, dynamic linker and syscall layer. It does not call
+Rosetta's translator, and on the benchmark suite it is faster than Rosetta on
+most kernels.
+
+These pages describe what it does, how to run it, and how it works.
+
+| Page | What it covers |
+| --- | --- |
+| [Getting started](getting-started.md) | What you need, how to build it, how to run your first program |
+| [Modes](modes.md) | Cache mode and native mode: what each binds against, what each needs, which to pick |
+| [Reference](reference.md) | Every command-line option and every environment variable that is meant to be used |
+| [Architecture](architecture.md) | How a guest program is loaded, decoded, translated and run |
+| [Performance](performance.md) | Measured results against Rosetta, how to reproduce them, and where the remaining costs are |
+| [Compatibility](compatibility.md) | What runs today and what does not |
+| [Troubleshooting](troubleshooting.md) | Reading a failure, the diagnostic switches, and what each kind of report means |
+| [Testing](testing.md) | The gates, what each one proves, and how to run them |
+
+## In one paragraph
+
+An x86-64 program is loaded by AArchX's own Mach-O loader into a reserved guest
+arena. Its instructions are decoded into an internal representation and
+translated to arm64 a block at a time; blocks are cached, chained to each other
+and joined into superblocks along the paths a program actually takes. Guest
+system calls are serviced by AArchX rather than passed through. What the guest
+links against depends on the mode: in **cache mode** it is Apple's x86-64 shared
+cache, mapped and fixed up by AArchX itself, and in **native mode** it is the
+Mac's own arm64 frameworks, reached through generated x86 stubs and an ABI
+engine that moves arguments between the two calling conventions.
+
+## Status
+
+AArchX is experimental and version 0.2-dev. It runs real applications, the
+x86-64 Steam client among them, and it passes a gate of roughly twenty thousand
+differential cases plus several hundred behavioural ones on every commit. It is
+not a supported product, it has no stability guarantees, and it should not be
+used for production workloads.
+
+## Project layout
+
+```
+src/            the translator: loader, decoder, interpreter, JIT, dyld, bridge, syscalls
+include/ocerz/  headers; each one opens with a prose block describing its part
+runtime/apis/   native mode's API databases, one per system library
+tools/sdkgen/   the generator that builds those databases from the macOS SDK
+tests/          the gates: unit harnesses, guest binaries, differential and dynamic suites
+docs/           these pages
+```
+
+Every source file opens with a prose block explaining what it does and why it is
+shaped the way it is. Those blocks are the deepest documentation in the project;
+these pages are the map to them.

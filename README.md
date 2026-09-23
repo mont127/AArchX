@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img alt="license" src="https://img.shields.io/badge/license-Non--commercial-blue.svg">
+  <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
   <img alt="version" src="https://img.shields.io/badge/version-0.3--dev-green.svg">
@@ -23,6 +23,8 @@
 AArchX loads and runs x86-64 Mach-O programs on Apple Silicon with its own decoder, interpreter, JIT, dynamic linker and syscall layer. It also runs i386 PE code inside Wine's WoW64 process.
 
 AArchX has two modes. Cache mode, the default, binds guests against the x86-64 shared cache, and for it the Rosetta package still has to be installed, because it is what ships that cache; AArchX maps the cache itself and never calls Rosetta's translator. Native mode (`-native`) binds guests against the Mac's own arm64 frameworks instead and needs no x86 system libraries at all, but it runs a narrower set of programs so far (see [Native mode](#native-mode)). Every application below was run in cache mode.
+
+Documentation lives in [docs/](docs/README.md): getting started, the two modes, the CLI and environment reference, architecture, performance, compatibility, troubleshooting, testing, and the [Atlas](docs/atlas/index.html), a guided tour of the source for contributors (also published at https://mont127.github.io/AArchX-Public/atlas/).
 
 ## Build and run
 
@@ -548,4 +550,8 @@ The mode is process-wide and fixed before the VM starts, because the JIT materia
 
 ## License
 
-[AArchX Proprietary License](LICENSE). Source-available, not open source: anyone may run it, build it from source and patch it for their own personal, educational, academic or research use, free of charge, with the notices kept. Forking on GitHub to read the code or send changes back is fine. Nobody, individual or company, may bundle it into other software, ship a modified version, or turn a copy into their own version, and companies may not use it at all without written permission. Commits before the license change remain available under the LGPL-2.1 they were published with.
+AArchX is free software: you may redistribute it and modify it under the terms of the [GNU Lesser General Public License, version 2.1](LICENSE), or, at your option, any later version. Copyright (c) 2026 mont127.
+
+In one paragraph: anyone may use, build, run, study and redistribute it, and ship it beside their own software, provided the notices stay and the source of this program, including any change made to it, is offered under the same license. Running Intel software through ocerz, or launching ocerz from another program, does not make that program a derivative work; it keeps its own license. Modifying ocerz itself and distributing the result without publishing the modifications is not permitted. The name AArchX is not covered by this license: do not use it to name a modified version or to suggest endorsement. The guest C++ runtime under `runtime/guest` is LLVM's, under its own license (`LICENSE.libcxx.txt`, `LICENSE.libcxxabi.txt`, `LICENSE.libunwind.txt`). Earlier commits carry the license they were published with.
+
+Contributions are accepted under the same license; see [CONTRIBUTING.md](CONTRIBUTING.md).

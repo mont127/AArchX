@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="A guided tour of the AArchX (ocerz) source for contributors.">
+<title>AArchX Atlas</title>
+<style>
+:root{ --bg:#ffffff; --bg2:#f6f8fa; --fg:#1f2328; --fg2:#59636e; --border:#d0d7de; --link:#0969da; --code:#f6f8fa; --ok:#1a7f37; color-scheme:light; }
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){ --bg:#0d1117; --bg2:#161b22; --fg:#e6edf3; --fg2:#8d96a0; --border:#30363d; --link:#4493f8; --code:#161b22; --ok:#3fb950; color-scheme:dark; } }
+:root[data-theme="dark"]{ --bg:#0d1117; --bg2:#161b22; --fg:#e6edf3; --fg2:#8d96a0; --border:#30363d; --link:#4493f8; --code:#161b22; --ok:#3fb950; color-scheme:dark; }
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Helvetica,Arial,sans-serif;padding-inline:16px;padding-block:0 48px}
+h1,h2,h3{margin:0;font-weight:600;line-height:1.25}
+h1{font-size:2em;margin:0 0 6px}
+h2{font-size:1.5em;padding-bottom:.3em;border-bottom:1px solid var(--border);margin-bottom:12px}
+h3{font-size:1.15em;margin-top:26px;margin-bottom:6px}
+p{margin:0 0 14px;max-width:80ch}
+li{max-width:78ch;margin:.25em 0}
+ol,ul{padding-left:2em;margin:0 0 14px}
+code,pre,.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;font-size:.9em}
+code{background:var(--code);padding:.15em .4em;border-radius:6px}
+pre{background:var(--code);padding:14px 16px;border-radius:6px;overflow-x:auto;line-height:1.45;margin:0 0 14px;border:1px solid var(--border)}
+pre code{background:none;padding:0}
+a{color:var(--link)}
+.wrap{max-width:1100px;margin:0 auto}
+header.top{padding:22px 0 16px;border-bottom:1px solid var(--border)}
+.eyebrow{display:none}
+.lede{color:var(--fg2);max-width:80ch;margin:0}
+.legend{display:none}
+.crumb{font-size:14px;color:var(--fg2);margin-bottom:10px}
+.crumb a{color:var(--fg2)}
+.layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:32px;padding-top:20px}
+@media (max-width:820px){.layout{grid-template-columns:1fr;gap:12px}}
+nav.stages{position:sticky;top:env(safe-area-inset-top,0px);align-self:start;max-height:calc(100vh - 12px);overflow:auto;font-size:14px}
+@media (max-width:820px){nav.stages{position:static;max-height:none;border-bottom:1px solid var(--border);padding-bottom:10px}}
+.prog{margin:0 0 10px;color:var(--fg2);font-size:13px}
+.bar{height:4px;background:var(--border);border-radius:2px;margin-top:6px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--ok)}
+.stage-list{list-style:none;margin:0;padding:0}
+.stage-list button{width:100%;text-align:left;background:none;border:0;padding:5px 8px;color:var(--fg);font:inherit;cursor:pointer;display:grid;grid-template-columns:26px 1fr;gap:6px;align-items:baseline;border-radius:6px;line-height:1.35}
+.stage-list button:hover{background:var(--bg2)}
+.stage-list button[aria-current="true"]{background:var(--bg2);font-weight:600}
+.stage-list button:focus-visible,button:focus-visible,summary:focus-visible,input:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+.num{color:var(--fg2);font-variant-numeric:tabular-nums}
+.done .num{color:var(--ok)}
+main{min-width:0}
+section.stage{display:none}
+section.stage.active{display:block}
+.stage-head{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline;justify-content:space-between}
+.stage-head h2{flex:1 1 auto}
+.stage-head .small{font-size:13px;color:var(--fg2)}
+.remember{margin:18px 0;padding:10px 16px;border-left:4px solid var(--border);background:var(--bg2);max-width:80ch}
+.remember b{display:inline;font-weight:600}
+.remember b::after{content:":"}
+.grid2{display:block;margin:0}
+.card{margin:0 0 6px}
+.card h3{margin-top:18px}
+.card ul{padding-left:2em;margin:.3em 0}
+table{border-collapse:collapse;width:100%;font-size:14.5px}
+.tbl{overflow-x:auto;margin:0 0 16px}
+th,td{text-align:left;padding:6px 12px;border:1px solid var(--border);vertical-align:top}
+th{background:var(--bg2);font-weight:600}
+tr:nth-child(even) td{background:var(--bg2)}
+td.n{font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;font-size:13px}
+.tag{display:inline-block;font-size:12px;padding:0 6px;border:1px solid var(--border);border-radius:10px;color:var(--fg2)}
+.diagram{border:1px solid var(--border);border-radius:6px;padding:12px;margin:0 0 16px;overflow-x:auto;background:var(--bg)}
+.diagram svg{display:block;width:100%;height:auto;max-width:100%;min-width:640px}
+.diagram figcaption{font-size:13.5px;color:var(--fg2);margin-top:8px;max-width:80ch}
+.analogy{margin:0 0 14px;max-width:80ch;color:var(--fg);font-size:16px}
+.analogy b{font-weight:600}
+details.check{margin:0 0 14px;max-width:80ch}
+details.check summary{cursor:pointer;font-weight:600}
+details.check summary::before{content:"Self-check: ";font-weight:600}
+details.check p{margin-top:8px;color:var(--fg2)}
+.checkrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:22px 0 8px;padding:10px 0;border-top:1px solid var(--border)}
+.checkrow label{display:flex;gap:8px;align-items:center;cursor:pointer;font-size:15px}
+.checkrow input{width:16px;height:16px;accent-color:var(--ok)}
+.nextprev{display:flex;justify-content:space-between;gap:10px;margin-top:10px}
+.btn{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 12px;color:var(--fg);font:inherit;font-size:14px;cursor:pointer}
+.btn:hover{border-color:var(--fg2)}
+.pointers{font-size:15.5px}
+.g,.h{font-weight:600}
+.small{font-size:14px;color:var(--fg2)}
+.gloss dt{font-weight:600;margin-top:12px}.gloss dd{margin:2px 0 0 0;color:var(--fg);max-width:80ch}
+.toast{position:fixed;left:50%;bottom:calc(16px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:6px 12px;border-radius:6px;font-size:13px;opacity:0;pointer-events:none;transition:opacity .2s}
+.toast.show{opacity:1}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:13px;fill:var(--fg)}
+svg .mono{font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+svg .gbox,svg .hbox,svg .nbox{fill:var(--bg2);stroke:var(--border);stroke-width:1}
+svg .abox{fill:var(--bg);stroke:var(--fg2);stroke-width:1.2}
+svg .arrow{stroke:var(--fg2);stroke-width:1.3;fill:none;marker-end:url(#ah)}
+svg .dim{fill:var(--fg2)}
+</style>
+<style>[hidden]{display:none!important}img{max-width:100%}</style>
+</head>
+<body>
+
+
+<div class="wrap">
+<header class="top">
+  <div class="crumb"><a href="https://github.com/mont127/AArchX">AArchX</a> / <a href="../">docs</a> / Atlas</div>
+  <h1>AArchX Atlas</h1>
+  <p class="lede">A guided tour of the ocerz source for contributors. It starts with the vocabulary and builds up how a program flows through the translator, why each mechanism exists, and how to read the diagnostics. No C knowledge is assumed. Each section ends with a short summary and a self-check; tick a section when you can explain it in your own words and the page remembers your progress in this browser.</p>
+</header>
+
+<div class="layout">
+<nav class="stages" aria-label="Stages">
+  <div class="prog"><span id="progtext">0 of 12 stages marked understood</span><div class="bar"><i id="progbar"></i></div></div>
+  <ol class="stage-list" id="stagelist"></ol>
+</nav>
+
+<main id="main">
+
+<!-- ===================== PRIMER ===================== -->
+<section class="stage" id="sp" data-title="Before you start: the words" data-num="A">
+<div class="stage-head"><h2>Before you start: the words</h2><span class="small">Primer · read once, come back when a term bites</span></div><div class="stage-body">
+<p>This page uses about twenty words that every systems programmer takes for granted and nobody else has a reason to know. Here they are, in the order they build on each other. If you know Python or JavaScript and have used a Linux shell, you have everything you need.</p>
+
+<h3>What a program actually is</h3>
+<dl class="gloss">
+<dt>machine code, instruction</dt><dd>A program on disk is not the source you wrote; it is a long list of <em>instructions</em> — tiny operations the chip performs directly: "add these two numbers", "copy 8 bytes from this address", "jump to that spot if the last result was zero". Each is a few bytes. Your Python code is turned into these by the interpreter as it runs; a compiled C or Go program is turned into them once, ahead of time, and the file <em>is</em> the instructions.</dd>
+<dt>CPU, x86-64, arm64</dt><dd>The chip that executes instructions. Different chip families understand different instruction languages. Intel Macs (2006–2020) speak <b>x86-64</b>; Apple silicon (M1 and later) speaks <b>arm64</b>. They are as different as two human languages — an x86-64 program is gibberish to an arm64 chip. That single fact is the reason this project exists.</dd>
+<dt>register</dt><dd>A CPU has a handful of named, ultra-fast storage cells — sixteen general ones on x86-64 (<code>rax</code>, <code>rdi</code>, <code>rsp</code>…), thirty-one on arm64 (<code>x0</code>–<code>x30</code>). Nearly every instruction reads or writes registers; memory is where data lives when it is not being worked on. Think of them as the variables the chip can touch without a memory access.</dd>
+<dt>flags</dt><dd>A few bits the CPU sets after arithmetic — was the result zero, negative, did it overflow — that the next conditional jump reads. x86 sets six of them after almost every instruction; arm64 sets four and only when asked. Faking x86 flags cheaply on arm64 is a recurring theme.</dd>
+</dl>
+
+<h3>How a program lives in memory</h3>
+<dl class="gloss">
+<dt>process, thread</dt><dd>A <em>process</em> is one running program with its own memory. A <em>thread</em> is one line of execution inside it; a process can have many threads working at once on the same memory. In Go terms, roughly a program versus its goroutines — except OS threads really do run in parallel.</dd>
+<dt>address, address space</dt><dd>To a process, memory is one enormous numbered byte array, and an <em>address</em> is an index into it — <code>0x7ff8033d7000</code> is just a big number naming one byte. Each process has its own private numbering, its <em>address space</em>; the same number means different bytes in different processes.</dd>
+<dt>page</dt><dd>The operating system hands out and protects memory in fixed-size chunks called pages. Intel Macs used 4 KB pages; Apple silicon uses 16 KB. A program built for 4 KB pages asks for things a 16 KB machine cannot literally do, which is a whole stage of this atlas.</dd>
+<dt>stack, heap</dt><dd>Two regions of a process's memory. The <em>stack</em> grows and shrinks with function calls — each call pushes its return address and local variables, each return pops them. The <em>heap</em> is where <code>malloc</code> hands out long-lived memory.</dd>
+<dt>fault, signal</dt><dd>Touching an address you may not touch (unmapped, or read-only) makes the CPU stop the instruction and tell the operating system, which tells the process through a <em>signal</em> (<code>SIGSEGV</code>, <code>SIGBUS</code>). Programs can catch signals. ocerz relies on this constantly: it deliberately protects memory so that a fault tells it something happened.</dd>
+</dl>
+
+<h3>The operating system's side</h3>
+<dl class="gloss">
+<dt>kernel, syscall</dt><dd>The <em>kernel</em> is the core of the operating system: it owns files, memory, processes and devices. A program cannot touch those directly; it asks, using a special instruction called a <em>system call</em> (syscall) — "open this file", "give me 1 MB", "start a thread". On macOS there are two families: the Unix-style BSD calls, and <b>Mach</b>, an older message-passing interface where you send a message to a <em>port</em> and get a reply. Both appear in this tree.</dd>
+<dt>executable file, Mach-O</dt><dd>The file format of a macOS program or library (Linux has ELF, Windows has PE). It holds the instructions, the data, and a table of <em>load commands</em> that tell the loader what it needs — including which libraries. A <em>fat</em> or <em>universal</em> file holds one copy per chip type, called <em>slices</em>; on macOS 27 most Apple-supplied files carry only an arm64 slice.</dd>
+<dt>library, linking, loader</dt><dd>A <em>library</em> is code shared by many programs — <code>libSystem</code> is macOS's C library plus threads, sockets and more. <em>Linking</em> is connecting a program's references ("call <code>printf</code>") to the library's actual code. When that happens at run time, the program is <em>dynamically linked</em> and the piece of the operating system that does it is the <em>loader</em> — <b>dyld</b> on macOS, <code>ld.so</code> on Linux. On macOS, every real program is dynamically linked.</dd>
+<dt>shared cache</dt><dd>Apple pre-combines every system library into one enormous file at fixed addresses, so the loader maps one file instead of hundreds. The x86-64 version of it is what cache mode uses — and it ships as part of Rosetta.</dd>
+<dt>framework, Objective-C</dt><dd>macOS's libraries above the C level — Foundation, AppKit, Metal — are called <em>frameworks</em>, and most are written in <b>Objective-C</b>: an object-oriented language whose method calls are <em>messages</em> looked up by name (a <em>selector</em>) at run time. Its <em>runtime</em> (<code>libobjc</code>) keeps the tables of classes and methods, and it talks to the loader constantly. Newer frameworks are in <b>Swift</b>, which is the project's biggest coverage gap.</dd>
+</dl>
+
+<h3>Running one machine's programs on another</h3>
+<dl class="gloss">
+<dt>emulation, interpretation</dt><dd>Reading the foreign program's instructions one at a time and doing, in your own code, what each one would have done. Simple, exact, and about thirty times slower than the real chip. ocerz's <em>interpreter</em> is this.</dd>
+<dt>translation, JIT</dt><dd>Converting a run of foreign instructions into equivalent native instructions and then running <em>those</em>. Done ahead of time it is a compiler; done while the program runs, on demand, it is a <em>JIT</em> ("just in time"). ocerz's JIT translates x86-64 into arm64 a block at a time and caches the result.</dd>
+<dt>guest, host</dt><dd>The words this whole page hangs on. The <b>guest</b> is the Intel program and everything it believes: its addresses, its registers, its idea of the kernel. The <b>host</b> is the real arm64 machine ocerz runs on. Every mechanism in ocerz is a place where guest and host disagree and something has to give — a guest address becomes a host address, a guest syscall becomes a host syscall with translated arguments, a guest register lives in a host register. Whenever a sentence here says "guest", read "what the program thinks"; "host", read "what is actually there".</dd>
+<dt>Rosetta 2</dt><dd>Apple's own translator, built into macOS since 2020, and the thing ocerz stands beside and — once Apple removes it — in for.</dd>
+<dt>byte for byte, bit for bit</dt><dd>Exactly equal output, compared as raw bytes. Used here about the tests: the interpreter and the JIT must produce identical bytes, not "the same answer".</dd>
+</dl>
+<div class="remember"><b>Summary</b> a program is a list of instructions in one chip's language; the guest is the Intel program's world, the host is the arm64 machine's; and ocerz is the layer where every difference between the two is resolved.</div>
+<details class="check"><summary>Self-check: in the sentence "the guest asks for 4 KB at a guest address the host maps in 16 KB pages", which words describe belief and which describe reality?</summary><p>"Guest asks", "4 KB", "guest address" are the program's beliefs — what an Intel Mac would have done. "Host maps in 16 KB pages" is reality. The mechanism that reconciles them is the slot table in <code>mem.c</code> (Stage 4).</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 0 ===================== -->
+<section class="stage" id="s0" data-num="0" data-title="What ocerz is">
+<div class="stage-head"><h2>What ocerz is</h2><span class="small">Stage 0 · orientation</span></div><div class="stage-body">
+<p class="small">New to words like <em>instruction</em>, <em>syscall</em> or <em>guest</em>? The primer before this stage defines each one in a paragraph.</p>
+<p>An Intel Mac program is a Mach-O file full of x86-64 instructions that expects three things from the machine: a CPU that executes those instructions, a kernel that answers its system calls, and a loader that puts the system libraries it links against into its address space. On Apple silicon none of the three exist for it. <code>ocerz</code> fakes all three, in one process, so the program cannot tell.</p>
+<figure class="diagram"><svg viewBox="0 0 900 250" role="img" aria-label="An x86 program above, ocerz in the middle faking CPU, kernel boundary and loader, the arm64 machine below">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5 0 10z" fill="var(--fg2)"/></marker></defs>
+<rect x="20" y="16" width="860" height="52" class="gbox"/>
+<text x="450" y="38" text-anchor="middle" font-weight="600">the Intel program: x86-64 instructions · syscalls it expects Darwin to answer · libraries it expects at fixed addresses</text>
+<text x="450" y="57" text-anchor="middle" class="dim">unchanged bytes, unmodified on disk</text>
+<rect x="20" y="92" width="270" height="70" class="abox"/><text x="155" y="118" text-anchor="middle" font-weight="600">a CPU</text><text x="155" y="138" text-anchor="middle" class="mono">decode.c · interp*.c · jit.c</text>
+<rect x="315" y="92" width="270" height="70" class="abox"/><text x="450" y="118" text-anchor="middle" font-weight="600">a kernel boundary</text><text x="450" y="138" text-anchor="middle" class="mono">syscall.c · vm.c · mem.c</text>
+<rect x="610" y="92" width="270" height="70" class="abox"/><text x="745" y="118" text-anchor="middle" font-weight="600">a loader</text><text x="745" y="138" text-anchor="middle" class="mono">dyld.c · cache.c · dyldapi.c · vdylib.c</text>
+<rect x="20" y="186" width="860" height="48" class="hbox"/>
+<text x="450" y="207" text-anchor="middle" font-weight="600">the arm64 machine: Apple silicon core · XNU kernel · arm64 frameworks</text>
+<text x="450" y="225" text-anchor="middle" class="dim">what really runs</text>
+<path class="arrow" d="M155 68 V90"/><path class="arrow" d="M450 68 V90"/><path class="arrow" d="M745 68 V90"/>
+<path class="arrow" d="M155 162 V184"/><path class="arrow" d="M450 162 V184"/><path class="arrow" d="M745 162 V184"/>
+</svg><figcaption>The three fakes. The top row is the Intel program, the bottom row is the arm64 machine, and the middle row is ocerz. Everything in the tree belongs to one of the three middle boxes; the rest is glue, tests and diagnostics.</figcaption></figure>
+<p class="analogy"><b>If you know Linux:</b> this is the job <code>qemu-user</code> does for foreign binaries (with <code>binfmt_misc</code>), and the job Apple's Rosetta 2 does on macOS. ocerz is the open one, and the one whose native mode is designed for the day Rosetta is gone.</p>
+<h3>Two axes you will see everywhere</h3>
+<div class="grid2">
+<div class="card"><h3>Engine: interpreter or JIT</h3><p>The interpreter executes one x86 instruction at a time in C, exactly. The JIT translates whole basic blocks into arm64 machine code, once, and runs that. Same program, same results, one is ~30× faster. <code>-no-jit</code> picks the interpreter; the differential gates prove the two agree byte for byte.</p></div>
+<div class="card"><h3>Mode: cache or native</h3><p><b>Cache mode</b> (the default) maps Apple's x86-64 <em>dyld shared cache</em> — one prelinked blob holding every Intel system library — and translates those libraries like any other x86 code. <b>Native mode</b> (<code>-native</code>) maps no cache at all: it synthesizes fake x86 system libraries whose every export is a doorway into the host's real arm64 framework. Cache mode needs Rosetta's files to exist on the Mac; native mode does not.</p></div>
+</div>
+<p class="analogy"><b>Think of the two engines as two ways to follow a recipe.</b> The interpreter reads each line aloud and does it — slow, but it never skips a step, so it is the reference. The JIT reads the whole recipe once, writes it out in the cook's own shorthand, and from then on cooks from the shorthand. The differential gate is two cooks who must produce the identical dish from both versions.</p>
+<p class="analogy"><b>Cache mode vs native mode is a hotel.</b> An Intel program packs a list of what it needs from the hotel — libSystem, Foundation, AppKit. Cache mode is a hotel that still stocks the Intel versions of everything (Apple's shared cache). Native mode is a hotel that stocks only arm64 versions and puts an interpreter at every counter: the guest asks in x86, the interpreter relays it to the arm64 staff, and hands back the answer. Apple is about to stop stocking the Intel versions.</p>
+<h3>The shape of the tree</h3>
+<p>65,305 lines of C and assembly in 29 files, flat, one directory, a 60-line Makefile. Sizes matter: <code>jit.c</code> alone is 17,509 lines, a quarter of everything. That is a chosen cost, not drift.</p>
+<div class="tbl"><table>
+<tr><th>File</th><th>Lines</th><th>Fake</th><th>Owns (the file's own words, shortened)</th></tr>
+<tr><td><code>jit.c</code></td><td class="n">17509</td><td><span class="tag g">CPU</span></td><td>guest basic blocks translated to native arm64, the interpreter as fallback</td></tr>
+<tr><td><code>syscall.c</code></td><td class="n">7868</td><td><span class="tag h">kernel</span></td><td>the guest-to-host syscall boundary: x86-64 syscalls onto the arm64 kernel</td></tr>
+<tr><td><code>dyld.c</code></td><td class="n">5172</td><td><span class="tag h">loader</span></td><td>mini-dyld: loads, links and launches a dynamic executable against the shared cache</td></tr>
+<tr><td><code>decode.c</code></td><td class="n">4440</td><td><span class="tag g">CPU</span></td><td>x86-64 and i386 decoder: bytes in, one <code>X86Insn</code> out</td></tr>
+<tr><td><code>vm.c</code></td><td class="n">3632</td><td><span class="tag h">kernel</span></td><td>the master run loop and crash containment</td></tr>
+<tr><td><code>interp_sse.c</code> / <code>interp.c</code> / <code>interp_ext.c</code></td><td class="n">2536 / 1893 / 1197</td><td><span class="tag g">CPU</span></td><td>the reference interpreter: SSE/AVX, core integer, the long tail</td></tr>
+<tr><td><code>dyldapi.c</code></td><td class="n">2436</td><td><span class="tag h">loader</span></td><td>the dyld API surface libdyld's trampolines dispatch through</td></tr>
+<tr><td><code>objcbridge.c</code> / <code>objcclass.c</code></td><td class="n">2421 / 1357</td><td><span class="tag h">native</span></td><td>Objective-C messages crossed into the native runtime; guest-defined classes made native</td></tr>
+<tr><td><code>bridge.c</code> / <code>sysbridge.c</code> / <code>abi.c</code></td><td class="n">2402 / 1488 / 1744</td><td><span class="tag h">native</span></td><td>what a synthesized export does; the libSystem calls only ocerz can answer; the ABI crossing itself</td></tr>
+<tr><td><code>mem.c</code></td><td class="n">1867</td><td><span class="tag h">kernel</span></td><td>guest memory: mapping tables, 4 KB-in-16 KB slots, host protections</td></tr>
+<tr><td><code>vdylib.c</code> / <code>apidb.c</code></td><td class="n">1228 / 1108</td><td><span class="tag h">native</span></td><td>building the synthesized x86 libraries; reading the API database that describes them</td></tr>
+<tr><td><code>cache.c</code></td><td class="n">898</td><td><span class="tag h">loader</span></td><td>maps the x86-64 shared cache and resolves symbols out of it</td></tr>
+<tr><td><code>a64emit.c</code></td><td class="n">878</td><td><span class="tag g">CPU</span></td><td>arm64 encoder: one function per instruction, no scheduling, no allocation</td></tr>
+<tr><td><code>blocks.c</code> · <code>leaf.s</code> · <code>loader.c</code> · <code>flags_live.c</code> · <code>flags.c</code> · <code>main.c</code> · <code>stack.c</code> · <code>cpu.c</code></td><td class="n">909 · 598 · 378 · 283 · 230 · 280 · 137 · 163</td><td></td><td>blocks both ways · in-place string routines · static Mach-O loading · flag def/use table · the bit-exact flag spec · CLI · the initial stack · CPU reset and dumps</td></tr>
+</table></div>
+<div class="remember"><b>Summary</b> ocerz is three fakes in one process — a CPU, a kernel boundary, a loader — and every file serves one of them. The two big switches are <em>interpreter vs JIT</em> and <em>cache vs native</em>.</div>
+<details class="check"><summary>Self-check: which fake does <code>mem.c</code> belong to, and why isn't it part of the CPU?</summary><p>The kernel boundary. The CPU fake only needs to load and store bytes at guest addresses; <em>which host memory</em> a guest address means, and what protection it has, is the operating system's business. <code>mem.c</code> is ocerz's virtual-memory manager: it decides how a guest address becomes a host address and keeps the 4 KB/16 KB bookkeeping the kernel will not do for it.</p></details>
+<details class="check"><summary>Self-check: what does "the same program gives byte-identical output under <code>-no-jit</code> and under the JIT" buy the project?</summary><p>An oracle. The interpreter is simple enough to be right by inspection; the JIT is fast and complicated. Because every guest test must produce identical bytes under both, any JIT bug shows up as a difference, with the interpreter as the reference — that is what the differential gates in <code>make check</code> are.</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 1 ===================== -->
+<section class="stage" id="s1" data-num="1" data-title="The life of a process">
+<div class="stage-head"><h2>The life of a process</h2><span class="small">Stage 1 · from <code>./ocerz app</code> to a window</span></div><div class="stage-body">
+<p>The best way to hold the whole system in your head is to follow one launch from the shell to the first frame on screen. Every stage after this one zooms into a step of this path.</p>
+<figure class="diagram"><svg viewBox="0 0 900 300" role="img" aria-label="The launch path from main.c through dyld.c to the run loop">
+<rect x="18" y="18" width="200" height="56" class="abox"/><text x="118" y="41" text-anchor="middle" font-weight="600">1 · main.c</text><text x="118" y="60" text-anchor="middle" class="mono">flags, mode, static or dynamic?</text>
+<rect x="248" y="18" width="200" height="56" class="abox"/><text x="348" y="41" text-anchor="middle" font-weight="600">2 · dyld.c ocerz_dyld_run</text><text x="348" y="60" text-anchor="middle" class="mono">memory arena, map the cache</text>
+<rect x="478" y="18" width="200" height="56" class="abox"/><text x="578" y="41" text-anchor="middle" font-weight="600">3 · load the main image</text><text x="578" y="60" text-anchor="middle" class="mono">select_slice, segments, deps</text>
+<rect x="708" y="18" width="174" height="56" class="abox"/><text x="795" y="41" text-anchor="middle" font-weight="600">4 · fix up</text><text x="795" y="60" text-anchor="middle" class="mono">binds, rebases, TLV</text>
+<path class="arrow" d="M218 46H246"/><path class="arrow" d="M448 46H476"/><path class="arrow" d="M678 46H706"/>
+<path class="arrow" d="M795 74 V110 H118 V126"/>
+<rect x="18" y="128" width="200" height="56" class="abox"/><text x="118" y="151" text-anchor="middle" font-weight="600">5 · stack.c build the stack</text><text x="118" y="170" text-anchor="middle" class="mono">argc argv envp apple[]</text>
+<rect x="248" y="128" width="200" height="56" class="abox"/><text x="348" y="151" text-anchor="middle" font-weight="600">6 · initializer phase</text><text x="348" y="170" text-anchor="middle" class="mono">libSystem init, +load, ctors</text>
+<rect x="478" y="128" width="200" height="56" class="abox"/><text x="578" y="151" text-anchor="middle" font-weight="600">7 · vm.c ocerz_vm_call main</text><text x="578" y="170" text-anchor="middle" class="mono">the guest owns the thread now</text>
+<rect x="708" y="128" width="174" height="56" class="gbox"/><text x="795" y="151" text-anchor="middle" font-weight="600">8 · the program runs</text><text x="795" y="170" text-anchor="middle" class="mono">blocks, syscalls, windows</text>
+<path class="arrow" d="M218 156H246"/><path class="arrow" d="M448 156H476"/><path class="arrow" d="M678 156H706"/>
+<rect x="18" y="220" width="864" height="60" class="nbox"/>
+<text x="450" y="244" text-anchor="middle">Every arrow after 2 runs <tspan font-weight="600">guest x86 code</tspan> for part of its work: initializers and +load are Intel code in the libraries, executed through the engine before main ever starts.</text>
+<text x="450" y="266" text-anchor="middle" class="dim">so the CPU fake must already be fully working while the loader fake is still setting the process up</text>
+</svg><figcaption>Eight steps. Steps 1–6 are ocerz being a loader; step 7 hands the thread to the program; step 8 is the run loop of Stage 3.</figcaption></figure>
+<h3>What happens at each step</h3>
+<ol>
+<li><b>main.c</b> parses flags (<code>-native</code>, <code>-cache</code>, <code>-no-jit</code>, <code>-path</code>), applies Wine defaults, and asks <code>ocerz_peek_dynamic</code> one question: does this binary link libraries at all? A static binary (the guest test programs) goes to <code>loader.c</code> and a plain offset arena; everything real is dynamic and goes to <code>dyld.c</code>. Since 2026-09-23 a binary with no x86-64 slice is told apart here — "it is not an Intel program" — instead of dying as unreadable.</li>
+<li><b><code>ocerz_dyld_run</code></b> reserves the guest address space (identity mode: guest addresses <em>are</em> host addresses, Stage 4) and, in cache mode, maps the shared cache (<code>cache.c</code>). On macOS 27 that cache lives inside the Rosetta cryptex.</li>
+<li><b>Loading the image.</b> <code>select_slice</code> picks the x86-64 slice of a fat file; segments are copied into the arena; each <code>LC_LOAD_DYLIB</code> is resolved — a hit in the cache costs nothing (the cache is already mapped), a dylib on disk becomes a <code>DynImage</code> in <code>g_dimgs</code>.</li>
+<li><b>Fixups.</b> Chained fixups or classic binds: every pointer the linker left symbolic is written with a real address. Thread-local variables get their descriptors rewritten (two layouts exist; Stage 6).</li>
+<li><b>The initial stack</b> is laid out exactly as XNU's exec path does it, because libSystem finds <code>apple[]</code> by walking off the end of <code>envp</code> — a contract, not a convenience.</li>
+<li><b>The initializer phase</b> runs libSystem's initializer, then every library's <code>+load</code> and constructors in dependency order. This is the most invariant-laden code in the tree (Stage 6); getting the order wrong fails far away from the cause.</li>
+<li><b><code>ocerz_vm_call</code></b> builds a guest frame and enters <code>main</code>. From here the thread runs guest code and only comes back to C at syscalls, faults, and untranslated instructions.</li>
+</ol>
+<p class="analogy"><b>If you know Linux:</b> steps 2–6 are what <code>ld.so</code> does for a dynamic ELF binary, and step 5 is what <code>execve</code> does before it. ocerz has to be both, because the real dyld is an x86 program too and there is nobody to run it.</p>
+<p class="analogy"><b>Picture the loader as a stage crew before a play.</b> Step 3 carries the set pieces onto the stage (segments into memory). Steps 3–4 fetch the props the script names from the prop house (libraries) and tape the cue sheet to every entrance so each actor knows where to go (fixups: rebase = "we're on stage B tonight, shift every mark", bind = "the prop the script calls <em>sword</em> is on that table"). Step 5 lays out the programme exactly as the audience expects it (the initial stack). Step 6 is the warm-up, in a strict order — the orchestra tunes before the singers rehearse. Only then does the curtain rise (step 7, <code>main</code>).</p>
+<p class="analogy"><b>Static vs dynamic is packing for a trip.</b> Static: you packed everything, the suitcase is heavy, you need nothing from the hotel — that is a Go binary, and it is ocerz's guest test programs. Dynamic: you packed a list and are counting on the hotel to have a hair dryer — that is a Python script and its <code>import</code>s, and it is every real macOS program.</p>
+<h3>Where to look</h3>
+<ul class="pointers">
+<li><code>src/main.c</code> — 280 lines, read all of it; it is the table of contents of a launch.</li>
+<li><code>src/dyld.c</code> prose block, then <code>ocerz_dyld_run</code> top to bottom; skim the calls, not their bodies.</li>
+<li><code>src/stack.c</code> — 137 lines; the contract is the comment block.</li>
+</ul>
+<div class="remember"><b>Summary</b> before <code>main</code> runs, ocerz has already executed a great deal of Intel code — every library initializer — so the loader and the CPU are not phases, they are two fakes working at once.</div>
+<details class="check"><summary>Self-check: a program prints nothing and dies with an unrecognized selector inside Foundation before its own <code>main</code>. Which step is suspect?</summary><p>Step 6, the initializer order. An unrecognized selector or a "static initializer ran before its library" message is the classic fingerprint of an initializer running before something it depends on — see the five invariants in Stage 6. The bytes and the syscalls are probably fine.</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 2 ===================== -->
+<section class="stage" id="s2" data-num="2" data-title="Executing x86: decode, interpret, translate">
+<div class="stage-head"><h2>Executing x86: decode, interpret, translate</h2><span class="small">Stage 2 · the CPU fake</span></div><div class="stage-body">
+<p>Three layers, and the contract between them is one struct.</p>
+<figure class="diagram"><svg viewBox="0 0 900 230" role="img" aria-label="Bytes decoded into X86Insn, consumed by the interpreter or the JIT">
+<rect x="18" y="30" width="190" height="64" class="gbox"/><text x="113" y="56" text-anchor="middle" font-weight="600">x86 bytes in memory</text><text x="113" y="76" text-anchor="middle" class="mono">48 8b 45 f8 …</text>
+<rect x="248" y="30" width="190" height="64" class="abox"/><text x="343" y="56" text-anchor="middle" font-weight="600">decode.c</text><text x="343" y="76" text-anchor="middle" class="mono">ocerz_decode → X86Insn</text>
+<rect x="500" y="8" width="380" height="50" class="abox"/><text x="690" y="29" text-anchor="middle" font-weight="600">interp.c · interp_sse.c · interp_ext.c</text><text x="690" y="47" text-anchor="middle" class="mono">execute one X86Insn exactly · the reference</text>
+<rect x="500" y="76" width="380" height="50" class="abox"/><text x="690" y="97" text-anchor="middle" font-weight="600">jit.c + a64emit.c</text><text x="690" y="115" text-anchor="middle" class="mono">translate a block of X86Insn → arm64, cache it, run it</text>
+<path class="arrow" d="M208 62H246"/><path class="arrow" d="M438 52 L498 33"/><path class="arrow" d="M438 72 L498 101"/>
+<rect x="18" y="150" width="862" height="64" class="nbox"/>
+<text x="449" y="174" text-anchor="middle"><tspan font-weight="600">X86Insn</tspan> (decode.h): the opcode, its operands (register / immediate / memory with base, index, scale, displacement, riprel), sizes, prefixes, the address it came from.</text>
+<text x="449" y="196" text-anchor="middle" class="dim">The decoder never executes; the executors never look at bytes. That seam is why 32-bit (i386) decoding could be added without touching either executor.</text>
+</svg><figcaption>Decode once, execute two ways. The struct is the seam.</figcaption></figure>
+<p class="analogy"><b>If you know Python:</b> <code>decode.c</code> is the parser producing an AST node; <code>interp.c</code> is CPython's eval loop, a big switch that does exactly what each node says; <code>jit.c</code> is PyPy — it compiles hot straight-line runs to machine code and keeps them in a cache keyed by where they came from.</p>
+<h3>The interpreter (the oracle)</h3>
+<p>One function, <code>ocerz_interp_step</code>, executes one instruction against an <code>OcerzCPU</code> — the struct holding all sixteen general registers, the flags, the xmm registers, the instruction pointer (<code>cpu.h</code>; its field order is load-bearing because the JIT reaches into it at fixed offsets). It is slow and it is right. <code>flags.c</code> is the bit-exact specification of the x86 flags; the JIT's cleverer flag handling must agree with it, and the differential gates check that it does.</p>
+<h3>The JIT (the engine)</h3>
+<p>A <em>block</em> is a straight run of instructions ending in a branch, call or return. The JIT translates a block into arm64 words appended to a 1 GB <code>MAP_JIT</code> arena, records it in a hash keyed by guest address, and jumps into it. The next time the guest reaches that address, no translation happens. The tricks that make the translated code fast are Stage 3's subject; three ideas belong here:</p>
+<ul>
+<li><b>Register pinning.</b> In pin class 3 (the default) every one of the sixteen x86 registers lives permanently in an arm64 register — <code>rdi</code> in <code>x28</code>, <code>rsi</code> in <code>x27</code>, and so on — and <code>xmm0–15</code> live in <code>v16–v31</code>. Nothing is loaded or stored just to execute an instruction. Because every block shares this one layout, blocks can jump directly into each other's bodies.</li>
+<li class="small"><em>Analogy:</em> a chef's mise en place. Every ingredient is already in a bowl within arm's reach, so no step of the recipe begins with a walk to the pantry. And because every station in the kitchen is laid out the same way, a cook can move from one station to the next mid-recipe without looking.</li>
+<li><b>Lazy flags.</b> x86 sets six flags after almost every instruction; computing them costs more than the instruction. <code>flags_live.c</code> knows which flags each instruction reads, so the JIT computes only what a later instruction will consume, and fuses <code>cmp</code>+<code>jcc</code> into one arm64 compare-and-branch.</li>
+<li class="small"><em>Analogy:</em> a restaurant that only totals the bill when someone asks for it. Every dish "sets the flags" — but if nobody looks at the total before the next round, why add it up? The JIT keeps the receipts (a deferred-flags record) only when it cannot prove the next block will never ask.</li>
+<li><b>Fault recovery.</b> When translated code faults (a guest bug, or a page ocerz deliberately protected), the fault happens at an arm64 address, but the guest must see exact x86 state at an x86 address. <code>vm.c</code>'s <code>crash_handler</code> and the JIT's recovery recipes reconstruct it. This is the subtle part of the whole tree.</li>
+<li class="small"><em>Analogy:</em> a flight recorder. The plane (translated arm64) crashed at some GPS point; the report must say exactly which line of the flight plan (x86 instruction) it was on and what every gauge read. The recipes are how the recorder reconstructs the gauges from the wreckage.</li>
+</ul>
+<div class="remember"><b>Summary</b> decoder → <code>X86Insn</code> → either the exact interpreter or the fast JIT; the two must agree byte for byte, and that agreement is tested, not assumed.</div>
+<details class="check"><summary>Self-check: you suspect the JIT mistranslates one instruction. What is the cheapest experiment, before reading any code?</summary><p>Run the program with <code>-no-jit</code>. If the symptom vanishes, it is the JIT; if it persists, the interpreter has it too and the bug is in the decoder, memory, syscalls or the loader — anything but translation. Then bisect the JIT with its <code>OCERZ_NO_*</code> switches (Stage 9).</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 3 ===================== -->
+<section class="stage" id="s3" data-num="3" data-title="The run loop: blocks, chains, trips">
+<div class="stage-head"><h2>The run loop: blocks, chains, trips</h2><span class="small">Stage 3 · where the time goes</span></div><div class="stage-body">
+<p>Once <code>main</code> starts, a thread lives inside translated blocks and comes out only when it must. Coming out is called a <em>trip</em>, and most of the performance work is about avoiding trips or making them cheap.</p>
+<figure class="diagram"><svg viewBox="0 0 900 330" role="img" aria-label="The dispatcher in C, translated blocks chained to each other, and the trips back">
+<rect x="18" y="20" width="250" height="88" class="abox"/><text x="143" y="46" text-anchor="middle" font-weight="600">dispatcher (C)</text><text x="143" y="66" text-anchor="middle" class="mono">vm.c ocerz_vm_run_cpu</text><text x="143" y="84" text-anchor="middle" class="mono">jit.c ocerz_jit_exec_one</text><text x="143" y="100" text-anchor="middle" class="dim">look up rip → block, or translate</text>
+<rect x="330" y="20" width="150" height="60" class="hbox"/><text x="405" y="44" text-anchor="middle" font-weight="600">block A</text><text x="405" y="64" text-anchor="middle" class="mono">prologue · body · exits</text>
+<rect x="520" y="20" width="150" height="60" class="hbox"/><text x="595" y="44" text-anchor="middle" font-weight="600">block B</text><text x="595" y="64" text-anchor="middle" class="mono">body</text>
+<rect x="710" y="20" width="150" height="60" class="hbox"/><text x="785" y="44" text-anchor="middle" font-weight="600">block C</text><text x="785" y="64" text-anchor="middle" class="mono">body</text>
+<path class="arrow" d="M268 50H328"/><path class="arrow" d="M480 50H518"/><path class="arrow" d="M670 50H708"/>
+<text x="499" y="14" text-anchor="middle" class="dim">chains: a patched b straight into the next body, no C in between</text>
+<path class="arrow" d="M785 80 C785 150 400 150 143 110" stroke-dasharray="5 4"/>
+<text x="470" y="146" text-anchor="middle" class="dim">a trip: epilogue → C → prologue (hundreds of instructions, and it wipes the host return stack)</text>
+<rect x="18" y="190" width="862" height="120" class="nbox"/>
+<text x="34" y="214" font-weight="600">What causes a trip</text>
+<text x="34" y="236">· a system call (the kernel boundary, Stage 5)</text>
+<text x="34" y="256">· an edge with no chain: target not translated yet, an indirect jump that missed its per-site cache, a return that missed the RAS</text>
+<text x="34" y="276">· an instruction the JIT will not encode (it runs one step in the interpreter — "slow ops")</text>
+<text x="34" y="296">· a fault, a signal, an interrupt request from another thread</text>
+</svg><figcaption>Blocks chain to blocks; trips go through C. Both the cost and the fix live in the arrows.</figcaption></figure>
+<h3>The mechanisms, each with the problem it solves</h3>
+<div class="grid2">
+<div class="card"><h3>Chaining</h3><p>A block's exit is a <code>b</code> patched to the successor's body once that exists. arm64's <code>b</code> reaches ±128 MB; the arena is 1 GB, so a late-translated caller could not reach an early callee and the edge was silently dropped. Since 2026-09-22 a <em>veneer</em> pool every 64 MB (<code>ldr x15, literal; br x15</code>) makes every chain activate.</p><p class="small"><em>Analogy:</em> connecting doors between hotel rooms, so you walk room to room without going down to the lobby (the dispatcher) each time. A veneer is a relay runner for a door that is too far to reach in one stride: you hand the message to someone standing halfway, who carries it the rest of the way.</p></div>
+<div class="card"><h3>Return-address stack (RAS)</h3><p>A guest <code>ret</code> needs the arm64 address of the block after the call. Calls push {guest return, host continuation} on the host machine stack and use real <code>bl</code>/<code>ret</code>, so the hardware predictor works. Every trip resets the stack and loses the entries; a miss used to exit through the epilogue and cascade. Now a miss resolves in-body through the same per-site cache indirect calls use.</p><p class="small"><em>Analogy:</em> a stack of bookmarks. Every time you open a chapter you drop a bookmark so you can flip straight back. A trip is someone bumping the table: all the bookmarks fall off, and until you have re-placed them every "go back" means searching the index. The fix stopped each search from also bumping the table again.</p></div>
+<div class="card"><h3>Per-site caches (PSC / IC)</h3><p>An indirect <code>jmp</code>/<code>call</code> keeps a small {target, body} cache at the site, then an inline hash probe, before ever tripping. In the game profile these missed zero times.</p><p class="small"><em>Analogy:</em> speed-dial on a phone. An indirect call is "dial whoever is in this variable"; the per-site cache remembers the last few numbers this exact phone dialed, so the common case never opens the phone book (the hash), let alone calls the operator (the dispatcher).</p></div>
+<div class="card"><h3>Superblocks and flipping</h3><p>Translation continues past a forward conditional branch, up to six side exits. If the <em>taken</em> side turns out hot, the block is retired and retranslated following that edge. Decisions are per branch, counted in the arena.</p><p class="small"><em>Analogy:</em> a road built along the route the planner assumed people take. Superblocks keep paving past the fork. Flipping is noticing, from the counters, that traffic actually turns left at that fork, and rebuilding the road so left is the straight-through direction.</p></div>
+<div class="card"><h3>Invalidation</h3><p>Programs write code (JITs inside the guest, like Adobe AIR's ActionScript engine). Pages holding translations are "armed"; a write faults, the blocks are retired, and regions that thrash are blacklisted to run interpreted.</p><p class="small"><em>Analogy:</em> cooking from a recipe you memorized while someone keeps editing the recipe card. Arming the page is putting a bell on the card: any edit rings it, you throw away what you memorized and re-read. A card edited every minute is not worth memorizing — read it aloud each time instead (interpret).</p></div>
+<div class="card"><h3>In-place leaf routines</h3><p><code>strlen</code>, <code>memcpy</code> and friends are called constantly and do almost nothing. <code>leaf.s</code> holds arm64 versions under a private register contract, reached with one branch; a fault inside declines and the x86 code takes the same fault, so handlers see what they would have seen.</p><p class="small"><em>Analogy:</em> a vending machine beside the kitchen door for the ten things people ask for a hundred times a minute. If the machine jams (a fault), it hands you nothing and you walk into the kitchen and order the normal way, so the kitchen sees the same order it always would have.</p></div>
+</div>
+<p class="analogy"><b>If you know Go:</b> a trip is a goroutine switch that also throws away the CPU's branch history. Chains are direct calls the compiler resolved; a RAS miss or a dropped chain is an interface call through a lookup table where a direct call would do.</p>
+<h3>The numbers from 2026-09-22, as a worked example</h3>
+<p>Brawlhalla's main thread was pegged at 100.8% of a core. The attributed profile said: 42% in instruction bodies, <b>26% in prologues and epilogues</b> (trips), 11% <code>jcc</code>, 8% returns. Three fixes, in order: return misses no longer exit through the epilogue (+33–48% throughput); veneers made every chain activate (prologue+epilogue fell to 9%, the core dropped to 71% while doing 60% more work); constant-address memory accesses lost a 7-word guard (+13% work per second). Each one was found by measurement, and each one is a mechanism in this stage.</p>
+<div class="remember"><b>Summary</b> a thread lives in chained blocks and pays for every trip back to C. Chaining, veneers, the RAS and the per-site caches all exist to keep it inside.</div>
+<details class="check"><summary>Self-check: PERFSTAT reports <code>jit_step/cache_lookup = 1.2 M/s</code>. Is that good or bad, and what would you compare it with?</summary><p>It is the rate of C-level dispatches — trips that reached the slowest path. Bad in absolute terms if the code should be chained; but compare it with <code>block_execs</code>: 1.2 M trips against 460 M block executions a second is one trip per ~380 blocks, which is fine. The ratio is the number, not the count.</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 4 ===================== -->
+<section class="stage" id="s4" data-num="4" data-title="Memory: two address spaces">
+<div class="stage-head"><h2>Memory: two address spaces</h2><span class="small">Stage 4 · <code>mem.c</code> and the guards in <code>jit.c</code></span></div><div class="stage-body">
+<p>The guest has addresses; the host has addresses; they are not the same space. Everything about memory in this tree follows from how one maps to the other.</p>
+<figure class="diagram"><svg viewBox="0 0 900 300" role="img" aria-label="Guest address space mapped affinely onto host memory, with the shared cache and commpage as special regions">
+<text x="20" y="24" font-weight="600" class="g">guest address space (what the program believes)</text>
+<rect x="20" y="34" width="860" height="44" class="gbox"/>
+<rect x="60" y="40" width="200" height="32" fill="var(--bg)" stroke="var(--fg2)"/><text x="160" y="61" text-anchor="middle" class="mono">program + heap + stacks</text>
+<rect x="300" y="40" width="330" height="32" fill="var(--bg)" stroke="var(--fg2)"/><text x="465" y="61" text-anchor="middle" class="mono">shared cache 0x7ff8… (every system library)</text>
+<rect x="660" y="40" width="120" height="32" fill="var(--bg)" stroke="var(--fg2)"/><text x="720" y="61" text-anchor="middle" class="mono">commpage</text>
+<text x="20" y="118" font-weight="600" class="h">host memory (what actually exists)</text>
+<rect x="20" y="128" width="860" height="44" class="hbox"/>
+<rect x="60" y="134" width="200" height="32" fill="var(--bg)" stroke="var(--fg2)"/><text x="160" y="155" text-anchor="middle" class="mono">arena (identity: same addresses)</text>
+<rect x="300" y="134" width="330" height="32" fill="var(--bg)" stroke="var(--fg2)"/><text x="465" y="155" text-anchor="middle" class="mono">the cache file, mapped at its own address</text>
+<rect x="740" y="134" width="120" height="32" fill="var(--bg)" stroke="var(--fg2)"/><text x="800" y="155" text-anchor="middle" class="mono">ocerz's own buffer</text>
+<path class="arrow" d="M160 78V126"/><path class="arrow" d="M465 78V126"/><path class="arrow" d="M720 78 L800 126"/>
+<text x="722" y="105" class="dim">relocated: the guard</text>
+<rect x="20" y="196" width="860" height="90" class="nbox"/>
+<text x="34" y="220" font-weight="600">g2h: guest → host is one affine map, chosen once at startup</text>
+<text x="34" y="242">· <tspan class="mono">identity</tspan> (dynamic programs): host = guest. The JIT drops the base add entirely.</text>
+<text x="34" y="262">· <tspan class="mono">offset arena</tspan> (static test programs): host = guest + base, base kept in x0.</text>
+<text x="34" y="282">· <tspan class="mono">low shadow</tspan> (Wine, which needs addresses below 12 GB): two extra bases, every access range-checked. The expensive one.</text>
+</svg><figcaption>Which map is in force decides what the JIT may emit; you will see it in <code>jgb_usable()</code>, <code>mem_guard_needed()</code> and <code>stack_identity()</code>.</figcaption></figure>
+<p class="analogy"><b>The address map is a hotel's room numbers versus the building's floor plan.</b> The guest knows rooms by number (guest addresses); the building has physical positions (host addresses). Identity mode: the room number <em>is</em> the position — no lookup at all. Offset mode: every room is on a floor that starts at some fixed offset — one addition. Low shadow: two wings with their own numbering, and every visit first checks which wing you meant — the expensive one. The arena is renting the whole floor up front so nobody else's luggage ever ends up in the guest's rooms.</p>
+<h3>The 4 KB / 16 KB problem</h3>
+<p>Intel Macs used 4 KB pages; Apple silicon uses 16 KB. A guest may protect, map or unmap a 4 KB range that is a quarter of a host page. <code>mem.c</code> therefore tracks <em>slots</em> — 4 KB pieces inside each 16 KB host page — with their own owner and protection, and the host page's real protection is the union of its four slots. Consequences: guest protection changes resolve on 16 KB boundaries; a file is mapped directly only when its offset and guest address agree modulo 16 KB; and any path that hands a guest address straight to the kernel (a forwarded Mach <code>vm_map</code>) can destroy the neighbouring 12 KB unless the fragments are saved and restored around the call. That last one cost Safari a Swift precondition failure nineteen million instructions after the damage.</p>
+<p class="analogy"><b>Slots: one key per room, but the locks are per floor.</b> The guest wants to lock a single room (a 4 KB page); the building can only lock a whole floor of four rooms (a 16 KB host page). So <code>mem.c</code> keeps its own ledger of which of the four rooms are meant to be locked and sets the floor lock to the strictest of them — and any request that bypasses the ledger and talks to the building directly can lock, or wipe, the neighbours by accident.</p>
+<h3>Two guards the JIT emits around a memory access</h3>
+<ul>
+<li><b>The commpage guard.</b> The x86 commpage — a kernel-provided page of timers and feature bits at <code>0x7fffffe00000</code> — cannot exist there on an arm64 kernel, so ocerz keeps its own and redirects accesses to it. Every access whose address is not provably a stack slot used to compare against that range at run time (7 words). For a rip-relative or absolute operand the address is a constant, so since 2026-09-22 that is decided at translation time.</li>
+<li class="small"><em>Analogy for the commpage guard:</em> mail forwarding for one address that moved. Every letter used to be checked against the forwarding card at the post office. If the address is printed on the envelope (a constant), you can check it once, when the envelope is written.</li>
+<li><b>Ordered mode.</b> An x86 CPU promises stronger memory ordering (TSO) than arm64. A single-threaded program runs in <em>plain</em> mode; the first thread, fork or shared mapping switches the process to <em>ordered</em> mode for good, where scalar loads and stores use acquire/release forms — and those fault on an access crossing a 16-byte granule, hence a small alignment test before each. Measured cost on the game: about 5%.</li>
+<li class="small"><em>Analogy for ordered mode:</em> a shared kitchen. With one cook, put dishes down wherever, whenever. The moment a second cook walks in, a house rule applies to everyone for the rest of the night: tap the counter before you set anything down, so nobody grabs a half-plated dish. It slows every cook a little, and you cannot revoke a rule some cooks have already stopped following.</li>
+</ul>
+<p class="analogy"><b>If you know Linux:</b> <code>mem.c</code> is a tiny <code>mm/</code>: it keeps the VMA-like region table and decides what to <code>mmap</code>/<code>mprotect</code> on the host. The slot table is what you would need if the kernel's page size were four times your process's.</p>
+<div class="remember"><b>Summary</b> one affine map from guest to host, chosen at startup; a slot table because pages differ by 4×; and two guards — commpage and ordering — that the JIT pays on every non-stack access unless it can prove them away.</div>
+<details class="check"><summary>Self-check: why does a program that creates a thread get slightly slower on every load and store for the rest of its life?</summary><p>Because ordering only matters when another thread can observe it. With one thread, plain loads and stores are correct; with two, x86 programs rely on TSO, so ocerz switches the process to ordered mode and emits acquire/release accesses (with their granule test) from then on. It never switches back, because a block translated in plain mode would be wrong once a second thread exists.</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 5 ===================== -->
+<section class="stage" id="s5" data-num="5" data-title="The kernel boundary">
+<div class="stage-head"><h2>The kernel boundary</h2><span class="small">Stage 5 · <code>syscall.c</code>, 7,868 lines</span></div><div class="stage-body">
+<p>When guest code executes <code>syscall</code>, the JIT trips to <code>ocerz_handle_syscall</code>. Three classes arrive: BSD calls (class 2: files, sockets, memory, processes), Mach traps (class 1: ports, messages, threads), and machdep. Most are forwarded to the real kernel — but not blindly.</p>
+<figure class="diagram"><svg viewBox="0 0 900 250" role="img" aria-label="A guest syscall entering the table and either passing through with pointer translation, being intercepted, or forwarded as a Mach message">
+<rect x="18" y="20" width="200" height="56" class="gbox"/><text x="118" y="44" text-anchor="middle" font-weight="600">guest: syscall</text><text x="118" y="64" text-anchor="middle" class="mono">rax = class | number</text>
+<rect x="258" y="20" width="220" height="56" class="abox"/><text x="368" y="44" text-anchor="middle" font-weight="600">bsd_table[number]</text><text x="368" y="64" text-anchor="middle" class="mono">{name, nargs, ptr_mask, dual_ret, intercept}</text>
+<path class="arrow" d="M218 48H256"/>
+<rect x="520" y="8" width="360" height="42" class="hbox"/><text x="700" y="34" text-anchor="middle">passthrough: masked pointer args translated with g2h, then the host kernel</text>
+<rect x="520" y="60" width="360" height="42" class="abox"/><text x="700" y="86" text-anchor="middle">intercept: ocerz answers it (mmap, spawn, signals, shmat, threads…)</text>
+<rect x="520" y="112" width="360" height="42" class="abox"/><text x="700" y="138" text-anchor="middle">Mach message: forwarded, replies rewritten (vm_region, port names)</text>
+<path class="arrow" d="M478 40 L518 29"/><path class="arrow" d="M478 52 L518 81"/><path class="arrow" d="M478 64 L518 133"/>
+<rect x="18" y="176" width="862" height="60" class="nbox"/>
+<text x="449" y="200" text-anchor="middle">The rule for a new call: take <tspan class="mono">nargs</tspan> and which arguments are pointers from the SDK's <tspan class="mono">sysproto.h</tspan>, never guess; a wrong mask hides in identity mode and corrupts memory in the others.</text>
+<text x="449" y="222" text-anchor="middle" class="dim">a call that cannot be passed through — one that creates a mapping ocerz's map would not know — gets an intercept or ENOSYS, never a blind forward</text>
+</svg><figcaption>The table is the spine of the file; the intercepts are where the fakery lives.</figcaption></figure>
+<p class="analogy"><b>The syscall table is a switchboard operator with an index card per extension.</b> A card says how many arguments the call takes and which of them are addresses the guest wrote down in <em>its</em> room numbers, so the operator can translate them to the building's before putting the call through (passthrough). Some cards say "the concierge answers this one himself" (intercept) — because the building's honest answer would be wrong for this guest, as with <code>vm_region</code>. And a Mach message is a letter the operator opens on the way back, rewriting the reply into the guest's room numbers before handing it over.</p>
+<p class="analogy"><b>Spawning a child is hiring an interpreter for the new arrival</b> — unless the new arrival already speaks arm64, in which case sending an interpreter along would only get in the way. That is the rule that landed on 2026-09-23.</p>
+<h3>What the intercepts have to fake</h3>
+<ul>
+<li><b>Memory calls</b> (<code>mmap</code>, <code>mprotect</code>, <code>shmat</code>) go through <code>mem.c</code>, because the host kernel's view of ocerz's arena is not the guest's view. A Mach <code>vm_region</code> reply is rewritten to say what the guest declared, not what the host has — Electron checks that and executes <code>int3</code> if <code>__DATA_CONST</code> is not read-only, which is why Discord's renderers died until 2026-09-22.</li>
+<li><b>Processes.</b> <code>posix_spawn</code> and <code>execve</code> of an Intel binary rewrite the child to <code>ocerz -path child -- argv…</code> with the mode and bases inherited through the environment. A child with no x86-64 slice runs natively, as Rosetta would run it.</li>
+<li><b>Signals</b> are delivered at guest instruction boundaries with an exact x86 frame; the sigaction struct has different in and out layouts (a real bug once).</li>
+<li><b>Threads and workqueues.</b> Each guest thread is a host thread running its own <code>OcerzCPU</code>. libdispatch's workqueue threads are bridged to the host's — without that, the first <code>dispatch_sync</code> in any Cocoa app parked its main thread forever.</li>
+<li><b>Identity.</b> <code>proc_pidpath</code> of the own pid answers the program, not <code>ocerz</code>; <code>sysctl.proc_translated</code> answers 1, so programs take the same compatibility paths they take under Rosetta.</li>
+</ul>
+<p class="analogy"><b>If you know Linux:</b> read this file the way you read <code>strace</code> output. <code>OCERZ_SYSFAIL=1</code> prints the failures a healthy program almost never earns (ENOMEM, EFAULT), and <code>-strace</code> prints everything.</p>
+<div class="remember"><b>Summary</b> a syscall is a table lookup; passthroughs translate pointers, intercepts fake what the host would answer wrongly, and every rewritten reply exists because a real program checked it.</div>
+<details class="check"><summary>Self-check: the guest calls a syscall ocerz has never seen. What happens, and why not abort?</summary><p>It logs once and returns ENOSYS. Aborting kills the guest thread where it stands, and under Wine that is often inside the loader with the loader lock held, deadlocking every other thread. <code>OCERZ_STRICT_SYSCALL</code> restores the abort for bring-up work.</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 6 ===================== -->
+<section class="stage" id="s6" data-num="6" data-title="Cache mode: the loader and the dyld shim">
+<div class="stage-head"><h2>Cache mode: the loader and the dyld shim</h2><span class="small">Stage 6 · <code>dyld.c</code>, <code>cache.c</code>, <code>dyldapi.c</code></span></div><div class="stage-body">
+<p>Apple ships every Intel system library prelinked into one file, the dyld shared cache, with every library at a fixed address inside it. ocerz maps that file and the libraries simply exist. What it must still do is everything the real dyld would have done around them — and answer the questions the libraries ask dyld at run time.</p>
+<figure class="diagram"><svg viewBox="0 0 900 260" role="img" aria-label="The shared cache mapped, disk images loaded beside it, and libdyld calling back into ocerz's dyld API object">
+<rect x="18" y="18" width="420" height="64" class="gbox"/><text x="228" y="42" text-anchor="middle" font-weight="600">shared cache (~3,600 libraries, fixed addresses)</text><text x="228" y="62" text-anchor="middle" class="mono">cache.c: map, resolve exports, lazy slide</text>
+<rect x="460" y="18" width="420" height="64" class="gbox"/><text x="670" y="42" text-anchor="middle" font-weight="600">disk images: the app, its frameworks, plug-ins</text><text x="670" y="62" text-anchor="middle" class="mono">dyld.c: DynImage in g_dimgs, fixups, dedupe by dev/inode</text>
+<rect x="18" y="112" width="862" height="60" class="abox"/><text x="449" y="136" text-anchor="middle" font-weight="600">dyldapi.c — the dyld API object</text><text x="449" y="156" text-anchor="middle" class="mono">libdyld's functions dispatch through a vtable; ocerz supplies the object, one case per slot (+0x10 image count, +0x28 image name, +0x438 lazy load…)</text>
+<path class="arrow" d="M228 82V110"/><path class="arrow" d="M670 82V110"/>
+<rect x="18" y="200" width="862" height="48" class="nbox"/><text x="449" y="222" text-anchor="middle">libobjc, CoreFoundation and every framework ask dyld things: how many images, which image holds this address, run this callback when an image maps.</text><text x="449" y="241" text-anchor="middle" class="dim">an answer that is merely incomplete — an image loaded but not listed — is how Metal found no GPU for two weeks</text>
+</svg><figcaption>Three sources of truth: the cache, the disk images, and the object the libraries talk to. They must agree.</figcaption></figure>
+<p class="analogy"><b>The shared cache is a library whose books were all pre-shelved on one floor, in fixed positions.</b> Cache mode does not fetch books one at a time; it opens the floor and every book is already where its catalogue number says. <code>dyldapi.c</code> is the librarian's desk — the books themselves walk up and ask "how many books are on the floor?", "which book is this page from?", "tell me when a new one arrives". A librarian who forgets to list a book that is plainly on the shelf is exactly the GPU bug: Metal asked for the driver's book and was told there was none.</p>
+<h3>The initializer phase and its five invariants</h3>
+<p>After libSystem's initializer, <code>run_init_phase</code> walks the dependency graph bottom-up and, per image, delivers the Objective-C load notification and runs the constructors. Each rule below was learned from a real failure, and each failure surfaced far from its cause:</p>
+<ol>
+<li><b>Upward links are not ordering edges</b> — they declare the back edge of a cycle. Follow them for membership, never for order (and still initialize them, at the end).</li>
+<li><b>Prune on already-done images</b>, or libc++abi's walk descends through libxpc into Foundation.</li>
+<li><b>Load notifications and initializers interleave per image</b>; two global phases put the wrong things first and blew the stack inside malloc.</li>
+<li><b>The eager set is closed under dependencies.</b></li>
+<li><b>Decode the new <code>dylib_use_command</code> flags</b>, where upward and delay-init live now; reading only the command type pulled 532 images into CoreFoundation's subtree.</li>
+</ol>
+<p class="analogy"><b>The initializer order is seating a dinner party where some guests must be seated before others.</b> Dependencies sit first. An upward link is a guest saying "I know her, but do not make me wait for her" — you follow the acquaintance to decide who is invited, never to decide who sits first. Interleaving means each guest is introduced (<code>+load</code>) and then seated (initializer) before the next, not everyone introduced and then everyone seated. Every one of the five rules was learned from a party that went wrong.</p>
+<h3>Thread-locals and Objective-C</h3>
+<p>Thread-local variables have two descriptor layouts (classic on disk, packed in the cache); reading the wrong one aliased every thread-local in an image. Objective-C needs categories attached to classes in late-loaded images, and — the 2026-09-22 lesson — an image dlopened out of the cache must join the image list <em>after</em> libobjc has mapped it, or libobjc treats it as already handled and drops its categories.</p>
+<p class="small"><em>Analogy for TLV:</em> a coat check ticket per guest — every thread gets its own coat, and the ticket says where it hangs. Two ticket formats exist; read a packed ticket as a classic one and every guest is handed the same coat.</p>
+<p class="analogy"><b>If you know Linux:</b> the shared cache is <code>prelink</code> taken to its conclusion; <code>dyldapi.c</code> is the part of <code>ld.so</code> that answers <code>dl_iterate_phdr</code>, <code>dladdr</code> and the loading hooks — except here the libraries were built to talk to Apple's dyld through an object, and ocerz has to be that object.</p>
+<div class="remember"><b>Summary</b> cache mode maps the libraries for free and then pays in fidelity — order of initialization, the answers dyld gives at run time, and the two thread-local layouts. The failures here are always far from their cause.</div>
+<details class="check"><summary>Self-check: <code>_dyld_image_count()</code> returns 45 under ocerz and 348 under Rosetta after the same <code>dlopen</code>. Name the class of bug and what it breaks.</summary><p>A dyld-API answer that is incomplete: the library is loaded, its symbols resolve, but it is absent from the list. It breaks anything that walks the list — libobjc's per-image class queries, CFBundle, plug-in hosts. That exact gap made Metal report no GPU device, which took OpenGL's accelerated renderer with it.</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 7 ===================== -->
+<section class="stage" id="s7" data-num="7" data-title="Native mode: the bridge">
+<div class="stage-head"><h2>Native mode: the bridge</h2><span class="small">Stage 7 · <code>-native</code>, the future default</span></div><div class="stage-body">
+<p>Native mode maps no shared cache. The program still links <code>/usr/lib/libSystem.B.dylib</code>, Foundation, AppKit — so ocerz builds each of them, on demand, as a real x86-64 Mach-O in memory whose every export is twelve bytes: <em>load my id, jump to the bridge</em>. The program's own code runs through the same decoder and JIT as always; only the universe it binds against has changed.</p>
+<figure class="diagram"><svg viewBox="0 0 900 290" role="img" aria-label="Guest calls a synthesized export, crosses through the ABI layer to the real arm64 framework, and callbacks come back through a trampoline bank">
+<rect x="18" y="20" width="230" height="64" class="gbox"/><text x="133" y="44" text-anchor="middle" font-weight="600">guest calls CFStringCreate…</text><text x="133" y="64" text-anchor="middle" class="mono">x86 code, translated as usual</text>
+<rect x="278" y="20" width="230" height="64" class="gbox"/><text x="393" y="44" text-anchor="middle" font-weight="600">synthesized CoreFoundation</text><text x="393" y="64" text-anchor="middle" class="mono">vdylib.c: mov r11d,id · jmp [slot]</text>
+<rect x="538" y="20" width="342" height="64" class="abox"/><text x="709" y="44" text-anchor="middle" font-weight="600">the crossing</text><text x="709" y="64" text-anchor="middle" class="mono">abi.c: SysV x86-64 regs → Apple arm64 frame · bridge.c</text>
+<path class="arrow" d="M248 52H276"/><path class="arrow" d="M508 52H536"/>
+<rect x="538" y="112" width="342" height="52" class="hbox"/><text x="709" y="134" text-anchor="middle" font-weight="600">real arm64 CoreFoundation</text><text x="709" y="154" text-anchor="middle" class="mono">the host's own framework, in-process</text>
+<path class="arrow" d="M709 84V110"/>
+<rect x="18" y="112" width="490" height="52" class="abox"/><text x="263" y="134" text-anchor="middle" font-weight="600">apidb.c — runtime/apis/macos/27.0/*.api</text><text x="263" y="154" text-anchor="middle" class="mono">one record per export: fn · data · var · special · stub · shape · struct · inplace</text>
+<path class="arrow" d="M393 84V110"/>
+<rect x="18" y="192" width="862" height="84" class="nbox"/>
+<text x="34" y="216" font-weight="600">Calls back the other way</text>
+<text x="34" y="238">A native function given a guest function pointer (qsort's comparator, a run-loop source) cannot jump to x86. Each guest function is bound to one of 65,536 assembled arm64 trampolines;</text>
+<text x="34" y="258">native code calls the trampoline, which runs the guest function on that thread through ocerz_vm_call_abi. Blocks cross both ways too (blocks.c). Nesting goes as deep as the guest stack allows.</text>
+</svg><figcaption>Every export of every synthesized library is data (the API database), not code; supporting another library is a data change.</figcaption></figure>
+<p class="analogy"><b>Native mode is an embassy.</b> The guest walks up to what looks like the Intel library's front desk (the synthesized library: a facade, every door leads to a booth). Behind each door sits an interpreter with a phrasebook (the API database: how this exact request translates), who rearranges the sentence into the other language's grammar (<code>abi.c</code>: registers to a frame, structs reshaped) and relays it to the real arm64 official (the host framework). A "stub" is a door with a sign reading <em>not yet staffed</em>. Callbacks are the guest leaving a phone number: the official cannot speak x86, so the embassy keeps 65,536 numbers that all ring an interpreter who fetches the guest.</p>
+<h3>The parts</h3>
+<div class="grid2">
+<div class="card"><h3>vdylib.c</h3><p>Builds the fake library as a real Mach-O with a real export trie (a prefix trie — a flat one made <code>_writev</code> consume the <code>_write</code> edge). The loader takes it as an ordinary image; the decoder and JIT were never touched.</p></div>
+<div class="card"><h3>apidb.c + the .api files</h3><p>Fifty-nine libraries have a database. A record says how an export crosses: a plain function with a signature, a native variable, a variable ocerz fills itself (page size, stack bounds — answers the guest must not see as they are), a function ocerz answers itself, a stub that stops with a named message.</p></div>
+<div class="card"><h3>abi.c + abicall.s</h3><p>The ABIs differ: System V passes variadic doubles in registers, Apple arm64 puts every variadic argument on the stack; small structs are classified by eightbyte on one side and by float count on the other. Signatures drive the move in both directions.</p></div>
+<div class="card"><h3>objcbridge.c + objcclass.c</h3><p><code>objc_msgSend</code> from the guest is answered by asking the native runtime for the method's type encoding and crossing under that signature. Classes the guest defines are built in the native runtime as themselves, so AppKit can draw a guest <code>NSView</code> subclass.</p></div>
+<div class="card"><h3>sysbridge.c</h3><p>The libSystem calls a generic crossing cannot make: variadic file calls, memory mapping, non-local jumps, process and thread state the guest must own.</p></div>
+<div class="card"><h3>Why it exists</h3><p>Rosetta is scheduled to leave; macOS 27's bundled apps already ship no Intel code and the x86 cache lives inside Rosetta's cryptex. Native mode is the path that survives that. Steam's UI ran in native mode on 2026-09-21.</p></div>
+</div>
+<p class="analogy"><b>If you know Python or Go:</b> this is an FFI — <code>ctypes</code>, or <code>cgo</code> — built at the scale of an entire operating system's frameworks, with the bindings written as data files instead of code, and with the extra twist that the "foreign" side is the process's own frameworks.</p>
+<div class="remember"><b>Summary</b> native mode keeps the same CPU fake and replaces the loader fake's universe: synthesized x86 libraries whose exports are doorways, described by a database, crossing through an ABI layer into the real arm64 frameworks — and back through trampolines.</div>
+<details class="check"><summary>Self-check: a program in native mode exits with code 72 and names one symbol. What happened, and how is it different from exit 71?</summary><p>72: everything bound and the program reached <code>main</code>, then called an export whose record is a stub — the bridge behind that one function is missing. 71: nothing bound because an import had no record at all, and the guest never ran. They are kept distinct on purpose so a log says which kind of gap to fill.</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 8 ===================== -->
+<section class="stage" id="s8" data-num="8" data-title="How it stays correct">
+<div class="stage-head"><h2>How it stays correct</h2><span class="small">Stage 8 · the gates and the rules</span></div><div class="stage-body">
+<p>The tree is kept honest by one command and a few rules. <code>make check</code> runs the gates in order and takes about twenty minutes; nothing is committed until it is green.</p>
+<div class="tbl"><table>
+<tr><th>Gate</th><th>What it proves</th></tr>
+<tr><td><code>make unit</code></td><td>the C-level harnesses in <code>tests/unit</code>, one per subsystem, driving functions directly</td></tr>
+<tr><td>guest tests, interpreted</td><td>~100 freestanding x86 programs against golden outputs, under <code>-no-jit</code></td></tr>
+<tr><td>guest tests, JIT</td><td>the same under the JIT</td></tr>
+<tr><td>x86-64 differential</td><td>every guest binary: interpreter output and JIT output must match byte for byte</td></tr>
+<tr><td>i386 differential</td><td>32-bit sequences run interpreted and translated, comparing every register, flag and touched byte</td></tr>
+<tr><td>dynamic tests</td><td>real dylib-linked programs against the shared cache — where the compatibility fixes get their tests</td></tr>
+<tr><td>native tests</td><td>the bridge: C, Objective-C, Cocoa fixtures in native mode, most compared against an arm64 build of the same source</td></tr>
+</table></div>
+<p class="analogy"><b>The gates are two accountants who must produce the same totals.</b> One (the interpreter) works slowly with a pencil and a printed rulebook; the other (the JIT) uses every shortcut she knows. The goldens are the answer key from a real Intel machine. If the pencil matches the key and the shortcuts match the pencil, the shortcuts are right — for every ledger you gave them. A ledger you never gave them proves nothing, which is why real programs keep being added.</p>
+<p class="analogy"><b>If you know git:</b> "gate before every commit" is a pre-commit hook that takes twenty minutes; "a test that pins every change" is refusing to merge a fix without the regression test in the same commit; and the commit subject stating the rule is writing the message for the person running <code>git blame</code> in a year.</p>
+<h3>The rules, and why each one exists</h3>
+<ul>
+<li><b>Every behavioural change gets a test that pins it</b>, named in the commit message. A fix without a test is a fix that can silently return.</li>
+<li><b>Gate before every commit</b>, then commit code and tests, then a separate <code>tests: rebuild unit binaries</code> commit, because the test binaries are tracked.</li>
+<li><b>No inline comments; one prose block per file, present tense.</b> The <em>why</em> goes in the commit message and the file's prose. For a reader without C, that prose block is the whole point: each file explains itself in paragraphs before the first line of code.</li>
+<li><b>Commit subjects state the rule, not the activity</b>: "jit: a chain that cannot reach goes through a veneer instead of being dropped" tells you the new law of the system.</li>
+<li><b>The README must stay wholly true.</b> A row measured on an older macOS says so.</li>
+</ul>
+<h3>Ways a gate can lie</h3>
+<p>macOS has no <code>timeout</code>, so a sweep that used it "passed" everything; a benchmark binary in the wrong directory becomes a slow extra test case; a stale object file turns the i386 gate into a measurement of an older tree; the dynamic suite flakes under load, so nothing else runs while a gate runs. Each of these was found by being burned.</p>
+<div class="remember"><b>Summary</b> interpreter and JIT must agree; every change carries the test that pins it; the gate runs before every commit; and the prose at the top of each file is where the reasons live.</div>
+<details class="check"><summary>Self-check: a change passes the whole gate, and Photoshop still crashes. What does that tell you about the gate?</summary><p>That the gate proves what it tests and nothing more. It covers ocerz's own programs and a set of real dynamic ones; it does not run Photoshop. The right response is the one used for every compatibility fix this month: reproduce the failure in the smallest program that shows it, add that program to the dynamic tests, then fix it.</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 9 ===================== -->
+<section class="stage" id="s9" data-num="9" data-title="Reading a debugging session">
+<div class="stage-head"><h2>Reading a debugging session</h2><span class="small">Stage 9 · the knobs and the numbers I quote at you</span></div><div class="stage-body">
+<p>About 290 <code>OCERZ_*</code> environment variables exist. They are not ad hoc; there are three families, and they are how this codebase is debugged.</p>
+<div class="grid2">
+<div class="card"><h3>1 · <code>OCERZ_NO_&lt;FEATURE&gt;</code></h3><p>One switch per optimization: <code>NO_CHAIN</code>, <code>NO_RAS</code>, <code>NO_HOST_RAS</code>, <code>NO_FULLPIN</code>, <code>NO_SUPERBLOCK</code>, <code>NO_LAZYFLAGS</code>, <code>NO_LEAF_INPLACE</code>, <code>NO_UPWARD_INIT</code>… The workflow: a wrong result under the JIT is bisected by turning transforms off one at a time until it goes away. Yesterday <code>NO_HOST_RAS=1</code> was the experiment that proved the return-stack hypothesis.</p></div>
+<div class="card"><h3>2 · <code>OCERZ_&lt;AREA&gt;LOG</code> / <code>STAT</code> / <code>DUMP</code></h3><p>Diagnostics: <code>DLOPENLOG</code> (every dlopen and its answer), <code>SYSFAIL</code> (syscall failures a healthy program rarely earns), <code>MACHMSG</code>, <code>OBJCLOG</code>, <code>PERFSTAT</code> (the JIT's report at exit), <code>JITDIS</code> (+<code>_BRIEF</code>: dump every translated block), <code>ALLMISS</code>, <code>IMGLOG</code>.</p></div>
+<div class="card"><h3>3 · range selectors</h3><p><code>INTERP_LO/HI</code> force an address range to run interpreted; <code>NOJIT_EXE=&lt;substr&gt;</code> interprets one process out of Steam's nineteen; <code>JIT_CODE_KB</code> shrinks the arena to force the fallback paths.</p></div>
+<div class="card"><h3>Read once, at first use</h3><p>Nearly all are cached in a static on first read, so changing one mid-process does nothing, and one that guards a translation decision must be set before that code is translated.</p></div>
+</div>
+<p class="analogy"><b>The <code>NO_*</code> switches are <code>git bisect</code> over features instead of commits.</b> Turn one optimization off; if the symptom vanishes, the bug is inside that optimization. PERFSTAT is the car's dashboard — it will not tell you why the engine is loud, but it tells you the RPM, the temperature and the gear, and the gear is usually the answer. <code>sample</code> is walking the factory floor: count only the people with tools in their hands, not the ones standing around holding a clipboard (parked threads). <code>kill -INFO</code> two hundred times is asking every worker "what are you doing right now?" every tenth of a second.</p>
+<h3>PERFSTAT, line by line</h3>
+<pre>PERFSTAT t=60.1s blocks=372106 static_insns/blk=8.51
+  block_execs=27796591150 (462166628/s)  jit_step/cache_lookup=87149024 (1449004/s)
+  avg EXECUTED insns per block = 11.89   insns/s = 5496038395
+  HOTBLOCK # 1 rip=0x8027f67d10 execs=255960085 insns=20 words=209 …
+  SLOWOP # 1 imul  3975959  23.23% of slow  (0.01% of ALL)
+  RAS misses=883386978 (stale=883385785)  align-hotpatches=2832  ras_slots=0/262144
+  CHAIN activated=635725 veneered=40697 out_of_range=0 (0.00% dropped)</pre>
+<ul class="pointers">
+<li><b>blocks</b> translated so far; <b>static_insns/blk</b> their average length.</li>
+<li><b>block_execs/s</b> how many blocks ran per second — the "work" rate; <b>insns/s</b> the same in guest instructions. At a saturated core these are the throughput; once the thread has headroom they measure how much the program chose to do.</li>
+<li><b>jit_step/cache_lookup</b> trips that reached the C dispatcher. Judge it as a ratio to block_execs.</li>
+<li><b>HOTBLOCK</b> the busiest blocks: address, executions, length, and <em>words</em> — arm64 instructions emitted, whose static count includes miss paths that rarely run.</li>
+<li><b>SLOWOP</b> instructions the JIT hands to the interpreter, ranked. "% of ALL" is what matters; 0.01% is nothing.</li>
+<li><b>RAS misses</b> returns that missed the host return stack (stale = the entry was there but wrong or gone). 36 million a second was the game's problem; 11 million after the fixes, and now cheap.</li>
+<li><b>CHAIN</b> edges patched, edges patched through a veneer, edges dropped for distance. Dropped must read 0.</li>
+</ul>
+<h3>The other three instruments</h3>
+<ul>
+<li><b><code>sample &lt;pid&gt;</code></b> — the host profiler. It counts parked threads as fully as running ones, so keep only <em>leaf</em> frames and drop the blocking syscalls; ocerz's own <code>dispatch_bsd_at</code>/<code>dispatch_mach</code> leaves are parked threads, not hot code. Leaf addresses in JIT code map onto <code>JITDIS_BRIEF</code>'s block table to give cycles per prologue, epilogue, instruction and miss path.</li>
+<li><b><code>kill -INFO &lt;pid&gt;</code></b> — ocerz dumps every guest thread: its x86 rip, the syscall it is blocked in, a return-address chain. Two hundred of them at 0.1 s is a guest-level PC sampler for free.</li>
+<li><b>The probe ladder</b> — for a compatibility failure, write the smallest C program that asks the next question down: which CGL call fails → which renderer is missing → does Metal see a device → does IOKit answer the same as native → does the driver bundle load and its symbols resolve → does objc list its classes → is the image in the dyld list. Each step halves the search; the native arm64 control, not just Rosetta, is what rules out red herrings.</li>
+</ul>
+<div class="remember"><b>Summary</b> three families of knobs; bisect with <code>NO_*</code>; read PERFSTAT as ratios; profile leaves, not stacks; and reproduce in the smallest program before touching the code.</div>
+<details class="check"><summary>Self-check: PERFSTAT says <code>RAS misses=3.2 G, stale=3.2 G</code> and <code>ras_slots=0/262144</code>. Which of two hypotheses does the second number kill?</summary><p>Slot exhaustion. If the software slot pool were the problem it would be used; zero used means every call takes the host-stack path, so the misses come from that path losing its entries — which is what a trip does to it. Reading one more field on the line saved an evening.</p></details>
+</div>
+</section>
+
+<!-- ===================== STAGE 10 ===================== -->
+<section class="stage" id="s10" data-num="10" data-title="Case files: seven fixes, one method">
+<div class="stage-head"><h2>Case files: seven fixes, one method</h2><span class="small">Stage 10 · 2026-09-22, mapped onto the model</span></div><div class="stage-body">
+<p>Every fix that landed on 2026-09-22 followed the same shape — symptom, measurement, mechanism, fix, test — and each one lives in a stage of this atlas. Read them as the model in motion.</p>
+<div class="tbl"><table>
+<tr><th>Symptom</th><th>Measurement that named it</th><th>Mechanism (stage)</th><th>Fix · test</th></tr>
+<tr><td>Discord: renderers "gone" at startup</td><td>Electron asks <code>mach_vm_region</code> about <code>__DATA_CONST</code> and executes <code>int3</code> unless it is read-only</td><td>a rewritten Mach reply answered from the host's view, not the guest's (5)</td><td>reply from ocerz's own map in every mode; every segment's declared protection applied, after objc is done with the image (6)</td></tr>
+<tr><td>Brawlhalla: SIGSEGV at 0 after Steam init</td><td><code>unimplemented BSD syscall num=262</code> — <code>shmat</code></td><td>System V shared memory absent from the table (5)</td><td>attach where the host wants, <code>mach_vm_remap</code> into guest space — sharing, proven by a child process · <code>sysv_shm</code></td></tr>
+<tr><td>No GPU: Metal nil, GL software only, the game draws nothing</td><td>7-step probe ladder → <code>_dyld_image_count</code> 45 vs 348</td><td>a dlopened cache image never joined the image list (6)</td><td>register it after the objc mapping — order matters, or categories vanish · <code>dlopen_image_list</code></td></tr>
+<tr><td>Main thread pegged at 100.8%</td><td>PERFSTAT: 36 M RAS misses/s, all stale, slots unused; <code>NO_HOST_RAS</code> A/B</td><td>host return stack wiped by every trip; a miss exited through the epilogue and cascaded (3)</td><td>a miss resolves in-body through the per-site cache · xbench unchanged</td></tr>
+<tr><td>Still 26% in prologues/epilogues</td><td>attributed profile: entries are function starts; exits are direct calls with unpatched chain edges; <code>CHAIN 5% dropped</code></td><td><code>b</code> reaches 128 MB in a 1 GB arena (3)</td><td>veneer pools every 64 MB; dropped = 0; core 100.8% → 71%</td></tr>
+<tr><td>Global loads cost 18 host words</td><td>JITDIS statistics over the engine: <code>mov r,[rip+…]</code> = 18 words</td><td>commpage guard + granule test paid at run time for a constant address (4)</td><td>decide both at translation time; 18 → 4 words; +13% work/s</td></tr>
+<tr><td><code>cannot read /usr/bin/open</code>, three times a Steam launch</td><td><code>file</code>: arm64e only</td><td>a spawned child with no Intel code run under ocerz anyway (5)</td><td>such a child runs natively, as under Rosetta · <code>spawn_arm64_only</code></td></tr>
+</table></div>
+<h3>The method, stated once</h3>
+<ol>
+<li>Reproduce in the smallest program that shows it, under ocerz <em>and</em> under Rosetta or native — the control is what turns a guess into a fact.</li>
+<li>Measure with the instrument that names the mechanism (Stage 9), never with a hypothesis.</li>
+<li>Fix the mechanism, not the symptom; document the why in the file's prose and the commit message.</li>
+<li>Pin it with a test that would have failed before; gate; commit.</li>
+</ol>
+<div class="remember"><b>Summary</b> you now hold the whole loop — three fakes, two switches, the run loop, the memory map, the boundary, the two loaders, the gates, the instruments. Any future report I give you is a walk through this map; ask which stage a claim lives in, and whether it was measured.</div>
+<details class="check"><summary>Self-check: I tell you "the thread is saturated inside translated code, and ocerz's own runtime is under 1%". Which stage's mechanisms are the only candidates, and what would you ask me for next?</summary><p>Stage 3 (how blocks chain, return and trip) and Stage 4 (what a memory access costs) — the cost is in the emitted code or between blocks, not in C. Ask for the attributed profile: cycles by prologue, epilogue, instruction bodies and miss paths. That single table is what turned "codegen is slow" into three specific fixes.</p></details>
+</div>
+</section>
+
+<!-- ===================== GLOSSARY ===================== -->
+<section class="stage" id="s11" data-num="∗" data-title="Glossary">
+<div class="stage-head"><h2>Glossary</h2><span class="small">the words that recur</span></div><div class="stage-body">
+<dl class="gloss">
+<dt>guest / host</dt><dd>The x86 program and its view of the world / the arm64 machine and ocerz's view. <code>g2h</code> maps one to the other. <span class="small">≈ the traveller and the country: the traveller's expectations versus what is actually there.</span></dd>
+<dt>block</dt><dd>A straight run of x86 instructions ending in a branch, translated as one unit and cached by its address. <span class="small">≈ one paragraph of a recipe, up to the next "then go to…".</span></dd>
+<dt>chain</dt><dd>A patched direct branch from one block's exit into the next block's body, so no C runs between them. <span class="small">≈ a connecting door between two hotel rooms.</span></dd>
+<dt>trip</dt><dd>Any exit from translated code back to the C dispatcher: syscall, unchained edge, slow op, fault, interrupt. Costs the epilogue, the dispatcher and the prologue, and wipes the host return stack. <span class="small">≈ going back down to the lobby between rooms — and the bump that knocks the bookmarks off the table.</span></dd>
+<dt>dispatcher</dt><dd>The C loop (<code>ocerz_vm_run_cpu</code> → <code>ocerz_jit_exec_one</code>) that finds or translates the block for the current rip. <span class="small">≈ the lobby desk that finds your next room, or has it built if it does not exist yet.</span></dd>
+<dt>pin class</dt><dd>The register-assignment convention a block was built under. Class 3 pins all sixteen guest registers permanently, which is what makes body-to-body chaining legal. <span class="small">≈ the kitchen's station layout; class 3 means every station is laid out identically.</span></dd>
+<dt>RAS</dt><dd>Return-address stack: {guest return, host continuation} pairs pushed at a call so a <code>ret</code> can branch straight to the right body. Kept on the host machine stack with real <code>bl</code>/<code>ret</code>. <span class="small">≈ the stack of bookmarks for "go back to where I was".</span></dd>
+<dt>PSC / IC</dt><dd>Per-site cache / inline cache: a few {target, body} entries kept next to an indirect branch site, then an inline hash probe, before tripping. <span class="small">≈ speed-dial at one phone.</span></dd>
+<dt>veneer</dt><dd>A 16-byte <code>ldr; br; address</code> stub in a pool near the source block, used when a chain's <code>b</code> cannot reach its target. <span class="small">≈ a relay runner for a door too far to reach in one stride.</span></dd>
+<dt>superblock / flip</dt><dd>A block translated past forward branches with side exits; flipping retranslates it following a taken side that proved hot. <span class="small">≈ paving past the fork; rebuilding the road when traffic turns the other way.</span></dd>
+<dt>lazy flags</dt><dd>Computing only the x86 flags a later instruction will read, using the def/use table in <code>flags_live.c</code>. A deferred-flags <em>record</em> is stored at a block edge when the next block might read them. <span class="small">≈ totalling the bill only when someone asks for it.</span></dd>
+<dt>slow op</dt><dd>An instruction the JIT declines to encode; the block trips and the interpreter executes that one step. <span class="small">≈ a step the shorthand cannot express, so the cook reads that one line aloud.</span></dd>
+<dt>arena</dt><dd>Either the guest memory reservation (<code>mem.c</code>) or the 1 GB <code>MAP_JIT</code> region holding translated code (<code>jit.c</code>); context tells which. <span class="small">≈ renting the whole floor up front and handing out rooms yourself.</span></dd>
+<dt>slot</dt><dd>A 4 KB guest page inside a 16 KB host page; the unit <code>mem.c</code> tracks ownership and protection in. <span class="small">≈ one room of the four behind a single floor lock.</span></dd>
+<dt>identity / offset / low shadow</dt><dd>The three guest→host maps (Stage 4). <span class="small">≈ room number equals position / one fixed offset per floor / two wings, check which first.</span></dd>
+<dt>commpage</dt><dd>The kernel-provided page of timers and feature bits at a fixed x86 address; ocerz keeps its own and redirects accesses to it, hence the guard. <span class="small">≈ the notice board that moved; every visit is forwarded.</span></dd>
+<dt>ordered mode / TSO</dt><dd>The memory model x86 programs rely on; entered for good at the first thread, fork or shared mapping; loads and stores then use acquire/release forms. <span class="small">≈ the shared-kitchen rule that applies to everyone once a second cook arrives.</span></dd>
+<dt>shared cache</dt><dd>Apple's single prelinked file of every x86-64 system library at fixed addresses; on macOS 27 it lives inside the Rosetta cryptex. <span class="small">≈ a library floor with every book pre-shelved at a fixed position.</span></dd>
+<dt>closure</dt><dd>The set of images reachable from the main executable through its load commands — also the list the dyld API reports as "loaded images". <span class="small">≈ the catalogue of what is on the floor.</span></dd>
+<dt>upward dependency</dt><dd>A load command declaring the back edge of a dependency cycle; followed for membership, never for initialization order. <span class="small">≈ "I know her, but do not make me wait for her" at the dinner party.</span></dd>
+<dt>init phase</dt><dd>The dependency-ordered run of every image's <code>+load</code> and constructors before <code>main</code>. <span class="small">≈ the seating order.</span></dd>
+<dt>TLV</dt><dd>Thread-local variable; its descriptor has two layouts (classic on disk, packed in the cache). <span class="small">≈ each guest's coat-check ticket.</span></dd>
+<dt>DynImage</dt><dd>The loader's record of an image loaded from disk (or synthesized); the cache's images have no DynImage. <span class="small">≈ a book brought in from outside the library and given a card of its own.</span></dd>
+<dt>vdylib</dt><dd>A synthesized x86-64 system library whose exports are doorways into the bridge (native mode). <span class="small">≈ the embassy's facade of the Intel library: every door is a booth.</span></dd>
+<dt>API database</dt><dd>The <code>.api</code> files describing how each synthesized export crosses: function, data, var, special, stub, shape, struct, inplace. <span class="small">≈ the interpreter's phrasebook.</span></dd>
+<dt>bridge / crossing</dt><dd>The path from a guest call of a synthesized export to the real arm64 function and back, including argument placement between the two ABIs. <span class="small">≈ the interpreter relaying a request to the arm64 official and back.</span></dd>
+<dt>trampoline bank</dt><dd>65,536 assembled arm64 entry points, one per guest function that native code must be able to call. <span class="small">≈ the 65,536 phone numbers the guest can leave for a call back.</span></dd>
+<dt>MIG reply</dt><dd>The reply half of a Mach message; several are rewritten so the guest sees its own memory map and port names. <span class="small">≈ the letter the operator opens and rewrites on the way back.</span></dd>
+<dt>ulock</dt><dd>Darwin's futex; a wait on a stack address means "waiting for a dispatch block to run elsewhere". <span class="small">≈ waiting by a mailbox for a note that another thread will drop in.</span></dd>
+<dt>unstick</dt><dd>The watchdog that nudges a thread blocked too long in a kickable syscall so it re-checks for signals and suspend requests. <span class="small">≈ the supervisor who taps a worker who has been waiting too long: "check your messages".</span></dd>
+<dt>gate</dt><dd>One of the test suites <code>make check</code> runs; green before every commit. <span class="small">≈ the twenty-minute pre-commit hook.</span></dd>
+</dl>
+</div>
+</section>
+
+</main>
+</div>
+</div>
+<div class="toast" id="toast">Saved</div>
+
+<script>
+(function(){
+  var stages = Array.prototype.slice.call(document.querySelectorAll('section.stage'));
+  var list = document.getElementById('stagelist');
+  var KEY = 'aarchx-atlas-v1';
+  var state = {done:{}, current:'s0'};
+  try { var raw = localStorage.getItem(KEY); if (raw) state = Object.assign(state, JSON.parse(raw)); } catch(e){}
+  function save(){ try { localStorage.setItem(KEY, JSON.stringify(state)); } catch(e){} }
+  function toast(t){ var el=document.getElementById('toast'); el.textContent=t; el.classList.add('show'); setTimeout(function(){el.classList.remove('show');},1200); }
+  function total(){ return stages.filter(function(s){ return s.id!=='s11'; }).length; }
+  function doneCount(){ return stages.filter(function(s){ return s.id!=='s11' && state.done[s.id]; }).length; }
+  function renderNav(){
+    list.innerHTML='';
+    stages.forEach(function(s,i){
+      var li=document.createElement('li'); if(state.done[s.id]) li.className='done';
+      var b=document.createElement('button'); b.type='button';
+      b.setAttribute('aria-current', state.current===s.id ? 'true':'false');
+      var num=document.createElement('span'); num.className='num'; num.textContent = state.done[s.id] ? '✓' : (s.dataset.num || String(i));
+      var t=document.createElement('span'); t.textContent=s.dataset.title;
+      b.appendChild(num); b.appendChild(t);
+      b.addEventListener('click', function(){ show(s.id); });
+      li.appendChild(b); list.appendChild(li);
+    });
+    var n=doneCount(), t=total(); document.getElementById('progtext').textContent = n+' of '+t+' stages marked understood';
+    document.getElementById('progbar').style.width = Math.round(n/t*100)+'%';
+  }
+  function ensureControls(s){
+    if (s.querySelector('.checkrow')) return;
+    var idx = stages.indexOf(s);
+    if (s.id!=='s11'){
+      var row=document.createElement('div'); row.className='checkrow';
+      var lab=document.createElement('label'); var cb=document.createElement('input'); cb.type='checkbox'; cb.id='done-'+s.id; cb.checked=!!state.done[s.id];
+      cb.addEventListener('change', function(){ state.done[s.id]=cb.checked; save(); renderNav(); toast(cb.checked?'Marked understood':'Unmarked'); });
+      lab.appendChild(cb); lab.appendChild(document.createTextNode('I can explain this stage in my own words'));
+      row.appendChild(lab); s.appendChild(row);
+    }
+    var np=document.createElement('div'); np.className='nextprev';
+    var prev=document.createElement('button'); prev.className='btn'; prev.type='button'; prev.textContent = idx>0 ? '← '+stages[idx-1].dataset.title : ''; prev.disabled = idx===0; if(idx===0) prev.style.visibility='hidden';
+    prev.addEventListener('click', function(){ show(stages[idx-1].id); });
+    var next=document.createElement('button'); next.className='btn'; next.type='button'; next.textContent = idx<stages.length-1 ? stages[idx+1].dataset.title+' →' : ''; if(idx===stages.length-1) next.style.visibility='hidden';
+    next.addEventListener('click', function(){ show(stages[idx+1].id); });
+    np.appendChild(prev); np.appendChild(next); s.appendChild(np);
+  }
+  function show(id){
+    stages.forEach(function(s){ s.classList.toggle('active', s.id===id); });
+    state.current=id; save(); renderNav();
+    var s=document.getElementById(id); if(s){ ensureControls(s); }
+    try { history.replaceState(null,'','#'+id); } catch(e){}
+    window.scrollTo({top:0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto':'smooth'});
+  }
+  stages.forEach(ensureControls);
+  var h=(location.hash||'').replace('#','');
+  show(document.getElementById(h) ? h : (state.current||'sp'));
+})();
+</script>
+
+</body>
+</html>
