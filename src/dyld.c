@@ -529,7 +529,7 @@ int ocerz_peek_dynamic(const char *path)
     const uint8_t *slice = select_slice(buf, flen);
     if (!slice) {
         free(buf);
-        return -1;
+        return -2;
     }
     uint32_t ncmds = rd32(slice + 16);
     const uint8_t *lc = slice + sizeof(struct mach_header_64);

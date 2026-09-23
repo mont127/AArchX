@@ -242,6 +242,10 @@ int main(int argc, char **argv)
     }
 
     int dynamic = ocerz_peek_dynamic(load_path);
+    if (dynamic == -2) {
+        OCERZ_FATAL("%s has no x86_64 slice: it is not an Intel program, so there is nothing to translate\n", load_path);
+        return 64;
+    }
     if (dynamic < 0) {
         OCERZ_FATAL("cannot read %s\n", load_path);
         return 65;

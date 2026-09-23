@@ -202,6 +202,14 @@
  * segment two processes share also makes their ordering visible, so attaching
  * puts the jit in ordered mode for the rest of the run.
  *
+ * ---- a child with nothing to translate ----
+ * A spawned or exec'd binary that carries an arm64 slice and no x86_64 slice
+ * runs natively in every mode, the way Rosetta runs it.  There is nothing in
+ * it for ocerz to translate, and running it under ocerz anyway ended with the
+ * child dying on "cannot read": Steam spawns /usr/bin/open, which on macOS 27
+ * ships as arm64 only, three times a launch.  The native-mode rules for system
+ * binaries that do have Intel code are unchanged.
+ *
  * ---- failure policy ----
  * An unimplemented call reports once and returns ENOSYS rather than aborting:
  * aborting kills the guest thread where it stands, and under Wine that is often
@@ -1623,10 +1631,14 @@ static int guest_child_runs_native(const char *path)
     static int off = -1;
     if (off < 0)
         off = getenv("OCERZ_NO_NATIVE_CHILDREN") ? 1 : 0;
-    if (off || ocerz_mode != OCERZ_MODE_NATIVE || !path)
+    if (off || !path)
         return 0;
     char real[PATH_MAX];
-    if (!realpath(path, real) || strncmp(real, "/usr/local/", 11) == 0)
+    if (!realpath(path, real))
+        return 0;
+    if (!file_has_x86_slice(real) && file_has_slice(real, 0x0100000c))
+        return 1;
+    if (ocerz_mode != OCERZ_MODE_NATIVE || strncmp(real, "/usr/local/", 11) == 0)
         return 0;
     int system_path = 0;
     for (size_t i = 0; i < sizeof roots / sizeof roots[0] && !system_path; i++)
