@@ -581,6 +581,12 @@ run_file_case ddlopen_cache_alias tests/dynamic/dlopen_cache_alias.c 'OK'
 run_legacy_format_case dlegacy_format 'OK'
 run_app_bundle_case dapp_bundle 'MacOS probe_exe'
 run_insert_case dinsert_libraries "$(printf 'inserted\nmain env=kept carrier=gone')"
+dyldslots_out=$(tools/dyldslots.sh --check 2>&1)
+case "$dyldslots_out" in
+    PASS*) echo "$dyldslots_out"; pass=$((pass+1)) ;;
+    SKIP*) echo "$dyldslots_out" ;;
+    *) echo "$dyldslots_out"; fail=$((fail+1)) ;;
+esac
 run_file_case dspawn_arm64_only tests/dynamic/spawn_arm64_only.c 'OK'
 run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
 run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'

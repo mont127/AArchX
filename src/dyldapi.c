@@ -46,13 +46,21 @@
  * An API ocerz does not implement answers zero in RAX and zero in RDX.  RDX
  * matters because a dyld API may return a pair, and leaving the guest's own RDX
  * in place hands the caller a count it never computed.  _dyld_get_lib_msg_send
- * _offsets, slot +0x450, is exactly that shape: libobjc's _objc_init calls it
- * for a table and a count, takes its fallback path when the count is below two,
- * and otherwise reads the table.  With RDX left alone the count was whatever
- * happened to be in the register, so libobjc walked a table at address zero,
- * and the damage surfaced much later as os_unfair_lock_recursive_abort inside
- * class realization.  That slot is answered explicitly as well, since it is a
- * real question with a real answer here: ocerz has no such table to offer.
+ * _offsets, slot +0x450, is exactly that shape: it answers a table and a count.
+ * With RDX left alone the count was whatever happened to be in the register,
+ * and a process died much later in os_unfair_lock_recursive_abort inside class
+ * realization; answering an empty table with a count of zero ends that.  The
+ * slot is answered explicitly as well, since ocerz has no such table to offer.
+ *
+ * What each slot is, is known by running code, never by reading Apple's.
+ * tools/dyldslots.sh calls every name the SDK's libdyld.tbd exports, with
+ * zero arguments, under OCERZ_DYLDAPI_TRACE=1, which prints each arrival in
+ * this table with its arguments and caller, so a public name is paired with
+ * the slot its call reaches first.  A slot no export reaches first is named by
+ * its caller in a traced run, through dladdr: +0x358 is called from
+ * _dyld_objc_register_callbacks.  tools/dyldslots.sh --check, part of the
+ * dynamic tests, fails for any slot answered here that has no such witness,
+ * and for any change in the pinned pairs in tools/dyldslots.pinned.
  *
  * _NSGetExecutablePath behaves as dyld's does: a buffer the path fits in gets
  * the path and a size left exactly as the caller set it, and only a buffer too
@@ -2064,6 +2072,29 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 
     if (off == OCERZ_BRIDGE_OFF)
         return ocerz_vdylib_dispatch(vm, cpu);
+    static int trace = -1;
+    if (trace < 0)
+        trace = getenv("OCERZ_DYLDAPI_TRACE") ? 1 : 0;
+    if (trace) {
+        uint64_t a1 = cpu->gpr[OCERZ_RSI];
+        char str[96] = "";
+        for (size_t k = 0; k + 1 < sizeof str && a1 && ocerz_addr_readable(a1 + k); k++) {
+            char ch = (char)ocerz_ld(a1 + k, 1);
+            if (ch < 0x20 || ch > 0x7e) {
+                if (ch != 0)
+                    str[0] = '\0';
+                break;
+            }
+            str[k] = ch;
+            str[k + 1] = '\0';
+        }
+        uint64_t sp = cpu->gpr[OCERZ_RSP];
+        fprintf(stderr, "ocerz: DYLDAPI +%#llx a1=%#llx a2=%#llx caller=%#llx%s%s\n",
+                (unsigned long long)off, (unsigned long long)a1,
+                (unsigned long long)cpu->gpr[OCERZ_RDX],
+                (unsigned long long)(ocerz_addr_readable(sp) ? ocerz_ld(sp, 8) : 0),
+                str[0] ? " a1-string=" : "", str);
+    }
 
     switch (off) {
     case DYLDAPI_NOOP_OFF:
