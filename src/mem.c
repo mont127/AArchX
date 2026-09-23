@@ -43,6 +43,18 @@
  * protects a buffer native malloc or a native Mach call handed it names memory
  * no table here has ever seen, and native mode passes such a range to the host
  * kernel instead of refusing it.
+ *
+ * The general mapping path walks the range a 4 KB slot at a time, several
+ * times over, and V8 reserves and releases gigabytes at startup, so 1 GB cost
+ * 1.8 ms where Rosetta pays nothing.  A mapping onto slots that are all free,
+ * starting on a host page, with no shared or armed page in its reach and its
+ * guard-only pages uncommitted, ends in exactly the state one host mmap of the
+ * data pages gives - zeroed, at the final protection, committed - so it takes
+ * that mmap and fills the slot array directly.  A replacing mapping over
+ * nothing qualifies too, which is every mapping at an address hint, since that
+ * region was created a moment before.  Unmapping releases slots in runs of one
+ * owner, and a fully free unshared range is made inaccessible with one mmap.
+ * 1 GB reserve and release costs 0.45 ms that way.
  */
 #include "ocerz/mem.h"
 
@@ -490,12 +502,145 @@ static void release_slot_locked(MemRegion *r, uint64_t gaddr,
     }
 }
 
+static void release_owner_run_locked(uint32_t id, uint64_t n, uint64_t *affected_lo,
+                                     uint64_t *affected_hi)
+{
+    if (!id || id > owner_n)
+        return;
+    MemOwner *owner = &owners[id - 1];
+    if (!owner->active || !owner->live_slots)
+        return;
+    owner->live_slots = n >= owner->live_slots ? 0 : owner->live_slots - (uint32_t)n;
+    if (owner->live_slots == 0)
+        owner_retire_locked(id, affected_lo, affected_hi);
+}
+
+static void release_range_locked(MemRegion *r, uint64_t lo, uint64_t hi,
+                                 uint64_t *affected_lo, uint64_t *affected_hi)
+{
+    if (!r->slots) {
+        for (uint64_t p = lo; p < hi; p += OCERZ_GUEST_PAGE)
+            release_slot_locked(r, p, affected_lo, affected_hi);
+        return;
+    }
+    uint32_t *slots = r->slots + slot_index(r, lo);
+    uint64_t n = (hi - lo) / OCERZ_GUEST_PAGE;
+    uint32_t run_id = 0;
+    uint64_t run_n = 0, first = UINT64_MAX, last = 0;
+    for (uint64_t k = 0; k < n; k++) {
+        uint32_t state = slots[k];
+        uint32_t id = slot_owner(state);
+        if (!id || (state & MEM_SLOT_GUARD))
+            continue;
+        uint64_t p = lo + k * OCERZ_GUEST_PAGE;
+        if (r->shared) {
+            size_t page_i = pg_index(r, p);
+            uint8_t shared = r->shared[page_i];
+            if (shared & shared_slot_bit(p))
+                shared_store(r, page_i, (uint8_t)(shared & ~shared_slot_bit(p)));
+        }
+        slots[k] = 0;
+        if (first == UINT64_MAX)
+            first = p;
+        last = p + OCERZ_GUEST_PAGE;
+        if (id != run_id) {
+            release_owner_run_locked(run_id, run_n, affected_lo, affected_hi);
+            run_id = id;
+            run_n = 0;
+        }
+        run_n++;
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    if (first < last)
+        affected_include(first, last, affected_lo, affected_hi);
+    release_owner_run_locked(run_id, run_n, affected_lo, affected_hi);
+}
+
 static int slots_are_free(const MemRegion *r, uint64_t lo, uint64_t hi)
 {
-    for (uint64_t p = lo; p < hi; p += OCERZ_GUEST_PAGE)
-        if (slot_load(r, slot_index(r, p)) != 0)
-            return 0;
-    return 1;
+    if (!r->slots || hi <= lo)
+        return 1;
+    const uint32_t *s = r->slots + slot_index(r, lo);
+    size_t n = (size_t)((guest_round_up(hi) - guest_round_down(lo)) / OCERZ_GUEST_PAGE);
+    uint32_t any = 0;
+    for (size_t k = 0; k < n; k++)
+        any |= s[k];
+    return any == 0;
+}
+
+static int host_pages_plain_locked(const MemRegion *r, uint64_t lo, uint64_t hi)
+{
+    size_t i0 = pg_index(r, lo), i1 = pg_index(r, hi);
+    uint8_t any = 0;
+    if (r->shared)
+        for (size_t i = i0; i < i1; i++)
+            any |= r->shared[i];
+    if (r->armed)
+        for (size_t i = i0; i < i1; i++)
+            any |= r->armed[i];
+    return any == 0;
+}
+
+static void bits_set_range(const MemRegion *r, size_t i0, size_t i1)
+{
+    if (!r->bm)
+        return;
+    size_t i = i0;
+    for (; i < i1 && (i & 7); i++)
+        bit_set(r, i);
+    for (; i + 8 <= i1; i += 8)
+        __atomic_store_n(&r->bm[i >> 3], (uint8_t)0xff, __ATOMIC_RELEASE);
+    for (; i < i1; i++)
+        bit_set(r, i);
+}
+
+static void bits_clr_range(const MemRegion *r, size_t i0, size_t i1)
+{
+    if (!r->bm)
+        return;
+    size_t i = i0;
+    for (; i < i1 && (i & 7); i++)
+        bit_clr(r, i);
+    for (; i + 8 <= i1; i += 8)
+        __atomic_store_n(&r->bm[i >> 3], (uint8_t)0, __ATOMIC_RELEASE);
+    for (; i < i1; i++)
+        bit_clr(r, i);
+}
+
+static int install_fresh_locked(MemRegion *r, uint64_t lo, uint64_t hi, uint64_t guard_hi,
+                                int prot, uint32_t *owner_out)
+{
+    uint64_t dhi = round_up(hi);
+    if (lo != round_down(lo) || guard_hi != round_down(guard_hi) || dhi > guard_hi ||
+        !host_pages_plain_locked(r, lo, guard_hi))
+        return -1;
+    for (uint64_t p = dhi; p < guard_hi; p += OCERZ_HOST_PAGE)
+        if (bit_test(r, pg_index(r, p)))
+            return -1;
+    uint64_t nslots = (hi - lo) / OCERZ_GUEST_PAGE;
+    uint32_t owner = owner_create_locked(r, (uint32_t)nslots, hi, guard_hi);
+    if (!owner)
+        return -1;
+    void *hp = ocerz_g2h(lo);
+    if (mmap(hp, (size_t)(dhi - lo), host_prot(prot), MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1,
+             0) != hp) {
+        owner_cancel_locked(owner);
+        return -1;
+    }
+    bits_set_range(r, pg_index(r, lo), pg_index(r, dhi));
+    if (r->slots) {
+        uint32_t *s = r->slots + slot_index(r, lo);
+        uint32_t v = slot_data_state(owner, prot);
+        for (uint64_t k = 0; k < nslots; k++)
+            s[k] = v;
+        uint64_t ng = (guard_hi - hi) / OCERZ_GUEST_PAGE;
+        for (uint64_t k = 0; k < ng; k++)
+            s[nslots + k] = owner | MEM_SLOT_GUARD;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+    }
+    if (owner_out)
+        *owner_out = owner;
+    return 0;
 }
 
 static uint32_t claim_slots_locked(MemRegion *r, uint64_t lo, uint64_t hi,
@@ -757,6 +902,13 @@ static int sync_host_range_locked(const MemRegion *r, uint64_t lo, uint64_t hi)
         return OCERZ_OK;
     lo = round_down(lo);
     hi = round_up(hi);
+    if (hi - lo > 2 * OCERZ_HOST_PAGE && slots_are_free(r, lo, hi) &&
+        host_pages_plain_locked(r, lo, hi) &&
+        mmap(ocerz_g2h(lo), (size_t)(hi - lo), PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1,
+             0) == ocerz_g2h(lo)) {
+        bits_clr_range(r, pg_index(r, lo), pg_index(r, hi));
+        return OCERZ_OK;
+    }
     int rc = OCERZ_OK;
     for (uint64_t p = lo; p < hi; p += OCERZ_HOST_PAGE) {
         uint8_t shared = shared_load(r, pg_index(r, p));
@@ -904,6 +1056,9 @@ static int install_mapping_locked(MemRegion *r, uint64_t lo, uint64_t hi,
         return map_refuse(5, lo, hi, OCERZ_ENOMEM);
     if (!shared_replacement_allowed_locked(r, lo, hi))
         return map_refuse(6, lo, hi, OCERZ_EUNSUP);
+    if ((!replace || slots_are_free(r, lo, guard_hi)) &&
+        install_fresh_locked(r, lo, hi, guard_hi, prot, owner_out) == 0)
+        return OCERZ_OK;
 
     uint32_t *old_states = NULL;
     if (replace) {
@@ -1670,8 +1825,7 @@ int ocerz_unmap(uint64_t gaddr, uint64_t len)
         return OCERZ_ENOMEM;
     }
     uint64_t affected_lo = UINT64_MAX, affected_hi = 0;
-    for (uint64_t p = lo; p < hi; p += OCERZ_GUEST_PAGE)
-        release_slot_locked(r, p, &affected_lo, &affected_hi);
+    release_range_locked(r, lo, hi, &affected_lo, &affected_hi);
     int rc = sync_host_range_locked(r, affected_lo, affected_hi);
     map_lock_release();
     memlog("unmap", gaddr, len, 0);
