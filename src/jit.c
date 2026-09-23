@@ -210,6 +210,23 @@
  * Brawlhalla's main thread fell from a saturated core to 71%, while doing more
  * work per second than before.
  *
+ * The same distance limit applies to an alignment hotpatch, which puts a
+ * branch at the faulting access and a stub at the end of the arena.  When the
+ * end is out of reach the stub goes into the nearest veneer pool instead, so
+ * the patch never falls back to retranslating the block.  A store whose data
+ * register is 31 is patched as well: in store and shift encodings that is the
+ * zero register, and it is how a guest store of an immediate zero comes out.
+ * Refusing both sent Discord's V8 through 5,391 retranslations in its first
+ * ten seconds, most of them the same few stores; it now takes none.
+ *
+ * A first commpage or alignment fault in a block retires only that block, and
+ * a block starting at the faulting instruction, through the predecessor lists
+ * the branch-flip retire already trusts.  A range invalidation scans every
+ * live block and every chain edge, about 140,000 blocks at Electron's startup,
+ * and one per fault made retiring the largest cost on Discord's main thread.
+ * A repeat fault still takes the range invalidation, which feeds the churn
+ * accounting, and OCERZ_FAULT_INV_RANGE=1 restores it for the first fault too.
+ *
  * A memory access whose address is not a known stack slot pays a commpage
  * guard before it - the commpage lives elsewhere on the host, so the address
  * is compared against that range and redirected if it falls inside - and, in
@@ -13291,6 +13308,7 @@ static void chaincheck(const char *what, const void *dst)
 #define VENEER_POOL_BYTES (256u << 10)
 #define VENEER_BYTES 16u
 #define VENEER_REACH ((ptrdiff_t)(120u << 20))
+#define ALIGN_ARM_BYTES 512u
 
 static void veneer_pool_check(OcerzJit *jit)
 {
@@ -16146,6 +16164,24 @@ void ocerz_jit_fault_recover_flags(const struct OcerzVM *vm,
     cpu->cc_op = cc_op;
 }
 
+static void flip_retire_locked(OcerzJit *jit, JitBlock *blk);
+
+static void retire_fault_blocks(struct OcerzVM *vm, OcerzJit *jit, uint64_t block_rip,
+                                uint64_t fault_rip, int mode32)
+{
+    jl_acquire(__LINE__);
+    JitBlock *b = cache_lookup(jit, block_rip, mode32);
+    if (b && b->code)
+        flip_retire_locked(jit, b);
+    if (fault_rip != block_rip) {
+        JitBlock *f = cache_lookup(jit, fault_rip, mode32);
+        if (f && f->code)
+            flip_retire_locked(jit, f);
+    }
+    jl_release();
+    ocerz_vm_purge_jit_ras(vm);
+}
+
 int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint64_t fault_rip)
 {
     OcerzJit *jit = vm ? vm->jit : NULL;
@@ -16159,6 +16195,10 @@ int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint6
     if (ENV_ON("OCERZ_CP_NOINVAL")) return 1;
     if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL"))
         return 1;
+    if (fresh && !ENV_ON("OCERZ_FAULT_INV_RANGE")) {
+        retire_fault_blocks(vm, jit, block_rip, fault_rip, blk_mode32(b));
+        return 1;
+    }
     int prev = g_churn_suppress;
     if (fresh) g_churn_suppress = 1;
     ocerz_jit_invalidate_range(vm, block_rip, 1);
@@ -16179,6 +16219,10 @@ int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t
     al_mark(jit_key(fault_rip, blk_mode32(b)));
     if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL"))
         return 1;
+    if (fresh && !ENV_ON("OCERZ_FAULT_INV_RANGE")) {
+        retire_fault_blocks(vm, jit, block_rip, fault_rip, blk_mode32(b));
+        return 1;
+    }
     int prev = g_churn_suppress;
     if (fresh) g_churn_suppress = 1;
     ocerz_jit_invalidate_range(vm, block_rip, 1);
@@ -16205,7 +16249,7 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
     if (size < 2 || (is_lds && size == 8)) return 0;
     int32_t imm9 = (int32_t)((w >> 12) & 0x1ff); if (imm9 & 0x100) imm9 -= 0x200;
     int rn = (int)((w >> 5) & 31), rt = (int)(w & 31);
-    if (rn == 31 || rt == 31) return 0;
+    if (rn == 31 || (rt == 31 && !is_st)) return 0;
     int pair = 0;
     if (is_st && size == 8 && rt == JT0 && imm9 <= 247) {
         uint32_t w2 = site[1];
@@ -16223,7 +16267,25 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
     if ((size_t)(jit->code_end - jit->code_cur) > 128) {
         pthread_jit_write_protect_np(0);
         veneer_pool_check(jit);
-    A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
+        int pool = -1;
+        uint32_t *start = jit->code_cur, *lim = jit->code_end;
+        ptrdiff_t reach = (uint8_t *)start - (uint8_t *)site;
+        if (reach > VENEER_REACH || reach < -VENEER_REACH) {
+            ptrdiff_t best_d = VENEER_REACH;
+            for (unsigned i = 0; i < jit->veneer_n; i++) {
+                if (jit->veneer_used[i] * VENEER_BYTES + ALIGN_ARM_BYTES > VENEER_POOL_BYTES)
+                    continue;
+                ptrdiff_t d = (const uint8_t *)jit->veneer_pool[i] - (const uint8_t *)site;
+                if (d < 0) d = -d;
+                if (d < best_d) { best_d = d; pool = (int)i; }
+            }
+            if (pool >= 0) {
+                start = (uint32_t *)((uint8_t *)jit->veneer_pool[pool] +
+                                     jit->veneer_used[pool] * VENEER_BYTES);
+                lim = start + ALIGN_ARM_BYTES / 4;
+            }
+        }
+        A64Buf b = { start, start, lim, 0, 0 };
         uint32_t *arm = b.p;
         if (imm9 > 0)      a64_add_imm(&b, 1, ta, rn, (uint32_t)imm9);
         else if (imm9 < 0) a64_sub_imm(&b, 1, ta, rn, (uint32_t)-imm9);
@@ -16265,7 +16327,11 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
             uint32_t saved = *site;
             *site = 0x14000000u;
             if (a64_try_patch_b(site, arm)) {
-                jit->code_cur = b.p;
+                if (pool >= 0)
+                    jit->veneer_used[pool] += (unsigned)(((uint8_t *)b.p - (uint8_t *)arm +
+                                                          VENEER_BYTES - 1) / VENEER_BYTES);
+                else
+                    jit->code_cur = b.p;
                 sys_icache_invalidate(arm, (size_t)((uint8_t *)b.p - (uint8_t *)arm));
                 sys_icache_invalidate(site, 4);
                 rc = 1;
