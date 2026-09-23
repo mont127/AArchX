@@ -796,6 +796,7 @@ special _ulimit ulimit
 fn _csops csops i(iupL)
 
 library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+fn __CFCopySupplementalVersionDictionary _CFCopySupplementalVersionDictionary p()
 
 data ___CFConstantStringClassReference __CFConstantStringClassReference
 special _CFStringCreateWithFormat CFStringCreateWithFormat
