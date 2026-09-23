@@ -74,7 +74,9 @@
  * to kill the process silently, with a macOS .ips file as the only trace.  A
  * fatal in 32-bit guest code takes the whole process down on purpose: it
  * usually lands on a WoW64 thread, and leaving the process half-alive wedges
- * the guest's parent, which waits for the child forever.
+ * the guest's parent, which waits for the child forever.  The report's first
+ * line names ocerz's own load address, so a host program counter in it can be
+ * handed to atos -l and read as a function in ocerz.
  *
  * ---- the unstick monitor ----
  * A guest thread parks in a blocking host wait whose wakeup was lost (waiter/
@@ -2159,6 +2161,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = hex_into(p, uc->uc_mcontext->__ss.__lr);
         p = str_into(p, " slide=");
         p = hex_into(p, g_image_slide);
+        p = str_into(p, " ocerz_base=");
+        p = hex_into(p, (uint64_t)(uintptr_t)_dyld_get_image_header(0));
         write(2, buf, (size_t)(p - buf)); p = buf;
         p = str_into(p, "\n  host-x:");
         for (int i = 0; i < 29; i++) {

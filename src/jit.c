@@ -227,6 +227,12 @@
  * A repeat fault still takes the range invalidation, which feeds the churn
  * accounting, and OCERZ_FAULT_INV_RANGE=1 restores it for the first fault too.
  *
+ * OCERZ_FPS=1 counts frames in cache mode: the block that begins at the Intel
+ * cache's CGLFlushDrawable gets four instructions at its head that increment a
+ * counter, and a thread prints the rate to stderr once a second.  The guest
+ * sees nothing of it.  It is how a game's frame rate under ocerz is measured
+ * when Steam's overlay counter, which relies on dyld interposing, is not there.
+ *
  * A memory access whose address is not a known stack slot pays a commpage
  * guard before it - the commpage lives elsewhere on the host, so the address
  * is compared against that range and redirected if it falls inside - and, in
@@ -12051,6 +12057,43 @@ void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
 
 static void **ras_slot_alloc(void);
 static void pending_add_ras(uint64_t target_key, void **ras_slot);
+static uint64_t g_fps_frames;
+
+static void *fps_report(void *arg)
+{
+    uint64_t last = __atomic_load_n(&g_fps_frames, __ATOMIC_RELAXED);
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (;;) {
+        usleep(1000000);
+        uint64_t now = __atomic_load_n(&g_fps_frames, __ATOMIC_RELAXED);
+        uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (now != last)
+            fprintf(stderr, "ocerz: FPS[%d] %.1f\n", (int)getpid(),
+                    (double)(now - last) * 1e9 / (double)(t1 - t0));
+        last = now;
+        t0 = t1;
+    }
+    return arg;
+}
+
+static int fps_watch(uint64_t rip)
+{
+    static int state = -1;
+    static uint64_t target;
+    if (state < 0) {
+        state = 0;
+        if (getenv("OCERZ_FPS") && ocerz_mode == OCERZ_MODE_CACHE) {
+            target = ocerz_dyld_resolve_guest_sym("_CGLFlushDrawable");
+            pthread_t t;
+            if (target && pthread_create(&t, NULL, fps_report, NULL) == 0) {
+                pthread_detach(t);
+                state = 1;
+            }
+        }
+    }
+    return state == 1 && rip == target;
+}
+
 static void veneer_pool_check(OcerzJit *jit);
 static uint32_t **g_ind_call_cont;
 static int g_ind_treg;
@@ -14986,6 +15029,12 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         g_cur_insn_idx = i;
         g_cur_insn_start = b.p;
         lanerec_note((uint32_t)(b.p - entry));
+        if (i == 0 && fps_watch(rip)) {
+            a64_mov_imm64(&b, JT0, (uint64_t)(uintptr_t)&g_fps_frames);
+            a64_ldr(&b, 8, JT1, JT0, 0);
+            a64_add_imm(&b, 1, JT1, JT1, 1);
+            a64_str(&b, 8, JT1, JT0, 0);
+        }
         if (i == 0 && leaf_entry) {
             OCERZ_LOG("jit: the routine at %#llx is answered in place\n", (unsigned long long)rip);
             uint32_t *declined = emit_leaf_call_ret(&b, leaf_entry, leaf_entry_writes, epi_sites, &n_epi);
