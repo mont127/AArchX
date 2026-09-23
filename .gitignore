@@ -12,3 +12,4 @@ MacNdCheese-WineEngine-PRIVATE/
 tests/__pycache__/
 tools/cxx/build/
 runtime/guest/
+runtime/apis/

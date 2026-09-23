@@ -44,7 +44,7 @@ jumps to a trap address, and AArchX turns that into a call to the host's real
 arm64 function, moving arguments and results between the System V x86-64 and
 Apple arm64 calling conventions on the way. What every export's signature is
 comes from an API database under `runtime/apis`, one text file per library,
-generated from the macOS SDK by `tools/sdkgen`.
+generated from your own macOS SDK by `tools/sdkgen` when you run `make apis`.
 
 Crossings go both ways. Native code calls guest code through a bank of
 trampolines, so `qsort` can call an x86 comparator and Foundation can call an

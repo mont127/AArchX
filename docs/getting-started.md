@@ -54,12 +54,14 @@ the program with `-path`:
 ## Run something in native mode
 
 ```sh
+make apis
 ./ocerz -native ./some_x86_64_tool
 ```
 
 Native mode reads its API databases from `runtime/apis` next to the `ocerz`
-binary, so run it from the source tree, or keep that directory beside a copied
-binary. See [Modes](modes.md) for what native mode is and when to choose it.
+binary. They are derived from the macOS SDK, so they are not in the
+repository; `make apis` generates them from your own SDK. Run native mode from
+the source tree, or keep that directory beside a copied binary. See [Modes](modes.md) for what native mode is and when to choose it.
 
 ## Check that everything works
 

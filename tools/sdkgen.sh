@@ -13,12 +13,14 @@
 #
 # The generator is tools/sdkgen/sdkgen.c and tbd.c, compiled here against the
 # Command Line Tools' libclang every run, because it takes a second and a stale
-# binary is a worse failure than a slow one.  It is deliberately not part of
-# make or make check: it needs the SDK and libclang, it reads the host's own
-# libraries through dlopen, and its output is data the lead commits, not
-# something a test should regenerate behind anyone's back.  The SDK and its
-# version come from xcrun, so the database lands in the directory for the SDK
-# it describes.
+# binary is a worse failure than a slow one.  The databases are derived from
+# the SDK, so they are not committed: `make apis` runs this script for every
+# library with --no-baseline, on the machine that builds ocerz and from that
+# machine's own SDK, and `make check` depends on it.  The SDK and its version
+# come from xcrun, so the database lands in the directory for the SDK it
+# describes.
+#
+#   tools/sdkgen.sh --no-baseline libSystem        # generate without the coverage check
 #
 # The coverage the generator prints is compared with
 # tools/sdkgen/baseline/<leaf>.coverage.  The run fails if the fn or data count
@@ -41,12 +43,16 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 update=0
+nobase=0
 if [ "${1:-}" = "--update-baseline" ]; then
     update=1
     shift
+elif [ "${1:-}" = "--no-baseline" ]; then
+    nobase=1
+    shift
 fi
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-    echo "usage: tools/sdkgen.sh [--update-baseline] <library> [output-root]" >&2
+    echo "usage: tools/sdkgen.sh [--update-baseline | --no-baseline] <library> [output-root]" >&2
     exit 2
 fi
 lib=$1
@@ -72,7 +78,9 @@ clang -std=c11 -O2 -Wall -Wextra -Werror -o "$build/sdkgen" $tool/sdkgen.c $tool
 
 new=$build/$leaf.coverage
 base=$tool/baseline/$leaf.coverage
-if [ $update = 1 ]; then
+if [ $nobase = 1 ]; then
+    exit_code=0
+elif [ $update = 1 ]; then
     mkdir -p "$(dirname "$base")"
     cp "$new" "$base"
     echo "sdkgen.sh: baseline $base updated"
