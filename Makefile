@@ -13,6 +13,12 @@
 # --jit-required so a JIT that stops translating 32-bit blocks fails the gate
 # rather than quietly degrading into a second interpreter run that passes.
 #
+# `apis` generates native mode's API databases under runtime/apis from this
+# machine's own macOS SDK, with tools/sdkgen.sh; they are derived from the SDK
+# and so are never committed.  `check` depends on it, and a stamp named for the
+# SDK version keeps it from running again until the generator or its inputs
+# change.
+#
 # `i386diff` is 32-bit decode conformance against capstone CS_MODE_32. It
 # reports a coverage percentage and is deliberately NOT part of `check`,
 # because i386 support is being built up in stages and the number is a progress
@@ -50,7 +56,21 @@ unit: $(UNIT_BINS)
 guest:
 	$(MAKE) -C tests/guest
 
-check: ocerz unit guest
+APIS_VER := $(shell xcrun --show-sdk-version 2>/dev/null)
+APIS_STAMP := runtime/apis/.generated-$(APIS_VER)
+APIS_INPUTS := tools/sdkgen.sh tools/sdkgen/libraries tools/sdkgen/overrides tools/sdkgen/sdkgen.c \
+	tools/sdkgen/tbd.c tools/sdkgen/tbd.h tools/sdkgen/clang_api.h $(wildcard tools/sdkgen/headers/*.h)
+
+apis: $(APIS_STAMP)
+
+$(APIS_STAMP): $(APIS_INPUTS)
+	@echo "generating native-mode API databases from the macOS $(APIS_VER) SDK"
+	@for l in $$(awk '$$1 == "library" { print $$2 }' tools/sdkgen/libraries); do \
+		out=$$(tools/sdkgen.sh --no-baseline $$l 2>&1) || { echo "$$out" >&2; echo "sdkgen failed for $$l" >&2; exit 1; }; \
+	done
+	@touch $@
+
+check: ocerz unit guest apis
 	bash tests/run_guest_tests.sh --no-jit
 	bash tests/run_guest_tests.sh
 	bash tests/run_diff_test.sh
@@ -87,4 +107,4 @@ clean:
 
 -include $(DEPS)
 
-.PHONY: unit guest check clean i386diff diff32 guest-cxx native-cxx native-frameworks native-formats
+.PHONY: unit guest check apis clean i386diff diff32 guest-cxx native-cxx native-frameworks native-formats

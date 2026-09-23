@@ -15,7 +15,7 @@ AArchX (the binary is called `ocerz`) runs x86-64 Mac programs on Apple silicon.
     ./ocerz tests/guest/bin/hello
     ./ocerz /Applications/SomeApp.app/Contents/MacOS/SomeApp
 
-`make check` runs every gate: the unit harnesses, the guest programs under the interpreter and under the JIT, the x86-64 and i386 differential gates (interpreter and JIT must agree byte for byte), the dynamic tests against the shared cache, and the native-mode tests. It takes about twenty minutes and must be green before a change is sent. Do not build or run other ocerz work beside it while it runs; the dynamic suite is timing-sensitive under load.
+`make apis` generates native mode's API databases under `runtime/apis` from your own macOS SDK; they are derived from the SDK, so they are never committed. `make check` runs it first, then every gate: the unit harnesses, the guest programs under the interpreter and under the JIT, the x86-64 and i386 differential gates (interpreter and JIT must agree byte for byte), the dynamic tests against the shared cache, and the native-mode tests. It takes about twenty minutes and must be green before a change is sent. Do not build or run other ocerz work beside it while it runs; the dynamic suite is timing-sensitive under load.
 
 ## What a change needs
 
