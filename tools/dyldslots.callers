@@ -1,0 +1,3 @@
+# Slots no libdyld export reaches first, and the function a traced run shows
+# calling each, named with dladdr.  See tools/dyldslots.sh.
+0x358 _dyld_objc_register_callbacks

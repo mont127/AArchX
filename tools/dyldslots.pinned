@@ -1,0 +1,14 @@
+# Export -> the dyld API slot its call reaches first, as tools/dyldslots.sh
+# observes it.  Every line must still hold; see that script.
+__dyld_image_count 0x10
+__dyld_get_image_header 0x18
+__dyld_get_image_vmaddr_slide 0x20
+__dyld_get_image_name 0x28
+__dyld_register_func_for_add_image 0x30
+__NSGetExecutablePath 0x50
+_dladdr 0x60
+_dlopen 0x68
+_dlclose 0x70
+_dlerror 0x78
+_dlsym 0x80
+_dyld_image_path_containing_address 0x168
