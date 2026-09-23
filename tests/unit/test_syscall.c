@@ -29,6 +29,13 @@
  * sigreturn with a null context and UC_SET_ALT_STACK or UC_RESET_ALT_STACK is
  * how an x86 longjmp tells the kernel the thread left its alternate stack, and
  * the syscall path used to refuse it.
+ *
+ * The spawn and exec tests use this test binary as the guest program a child
+ * is spawned from, and check that the child was handed to ocerz with its argv
+ * kept, so they set OCERZ_NO_NATIVE_CHILDREN before the first spawn: this
+ * binary is arm64 with no x86_64 slice, and a real guest spawning such a
+ * binary now gets it run natively, which is right for a program and wrong for
+ * a stand-in whose whole point is the wrapper.
  */
 #include "ocerz/vm.h"
 #include "ocerz/syscall.h"
@@ -1828,6 +1835,7 @@ static void test_sigreturn_alt_stack_flags(void)
 
 int main(int argc, char **argv)
 {
+    setenv("OCERZ_NO_NATIVE_CHILDREN", "1", 1);
     if (getenv("OCZT_ARGV") || (argc > 1 && strcmp(argv[argc - 1], "null-env") == 0))
         return child_check(argc, argv);
     if (ocerz_mem_init(0x100000000ull, 0x700000000ull) != OCERZ_OK) {
