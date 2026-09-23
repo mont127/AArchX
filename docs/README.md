@@ -35,7 +35,7 @@ engine that moves arguments between the two calling conventions.
 
 ## Status
 
-AArchX is experimental and version 0.2-dev. It runs real applications, the
+AArchX is experimental and version 0.3-dev. It runs real applications, the
 x86-64 Steam client among them, and it passes a gate of roughly twenty thousand
 differential cases plus several hundred behavioural ones on every commit. It is
 not a supported product, it has no stability guarantees, and it should not be
