@@ -339,6 +339,102 @@ run_spawn_argv_case() {
     done
 }
 
+run_legacy_format_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -mmacosx-version-min=10.5 -dynamiclib -o "$dir/liblegacy.dylib" \
+            tests/dynamic/legacy_format_lib.c 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/legacy_format.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    if otool -l "$dir/liblegacy.dylib" | grep -qE 'LC_DYLD_INFO|LC_DYLD_CHAINED_FIXUPS'; then
+        echo "FAIL $name (the linker emitted compressed fixups, so the case tests nothing)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name" "$dir/liblegacy.dylib"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name" "$dir/liblegacy.dylib"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
+run_app_bundle_case() {
+    local name="$1" want_out="$2"
+    local app="$TMP/$name/Probe.app"
+    mkdir -p "$app/Contents/MacOS"
+    if ! clang -arch x86_64 -o "$app/Contents/MacOS/probe_exe" tests/dynamic/app_bundle.c 2>/dev/null; then
+        echo "FAIL $name (compile)"; fail=$((fail+1)); return
+    fi
+    cat > "$app/Contents/Info.plist" <<'EOP'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>probe_exe</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.aarchx.probe</string>
+</dict>
+</plist>
+EOP
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$app"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$app"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
+run_insert_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -arch arm64 -dynamiclib -o "$dir/libinsert.dylib" tests/dynamic/insert_lib.c 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/insert_main.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" env DYLD_INSERT_LIBRARIES="$dir/libinsert.dylib" "$OCERZ" -no-jit "$dir/$name"
+        else
+            run_bounded "$out_file" "$err_file" env DYLD_INSERT_LIBRARIES="$dir/libinsert.dylib" "$OCERZ" "$dir/$name"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_legacy_entry_case() {
     local name="$1" want_out="$2"
     if ! clang -arch x86_64 -mmacosx-version-min=10.6 -o "$TMP/$name" tests/dynamic/legacy_entry.c 2>/dev/null; then
@@ -481,6 +577,10 @@ run_file_case dcache_symlink_dep tests/dynamic/cache_symlink_dep.c 'OK'
 run_file_case dsysv_shm tests/dynamic/sysv_shm.c 'OK'
 run_file_case ddlopen_image_list tests/dynamic/dlopen_image_list.c 'OK'
 run_file_case ddlopen_cryptex tests/dynamic/dlopen_cryptex.c 'OK'
+run_file_case ddlopen_cache_alias tests/dynamic/dlopen_cache_alias.c 'OK'
+run_legacy_format_case dlegacy_format 'OK'
+run_app_bundle_case dapp_bundle 'MacOS probe_exe'
+run_insert_case dinsert_libraries "$(printf 'inserted\nmain env=kept carrier=gone')"
 run_file_case dspawn_arm64_only tests/dynamic/spawn_arm64_only.c 'OK'
 run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
 run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
