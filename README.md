@@ -84,7 +84,7 @@ Each app's x86-64 slice was launched straight from its bundle, for example
 `./ocerz /System/Applications/Chess.app/Contents/MacOS/Chess`. Here "works"
 means the app drew its main window on screen and stayed up.
 
-On macOS 27 the bundled applications below - Chess, Calculator, Dictionary, Font Book, Grapher, Digital Color Meter, Activity Monitor, Console, TextEdit, Preview and Script Editor - ship as arm64 only, with no x86_64 slice, so there is nothing for a translator to run and `ocerz` refuses them with "cannot read". Their rows record the macOS they were measured on. Safari, Steam, Discord and Brawlhalla still carry Intel code and are the rows that can be reproduced on macOS 27.
+On macOS 27 the bundled applications below - Chess, Calculator, Dictionary, Font Book, Grapher, Digital Color Meter, Activity Monitor, Console, TextEdit, Preview and Script Editor - ship as arm64 only, with no x86_64 slice, so there is nothing for a translator to run: `ocerz` says so and exits, and a program running under it that spawns one of them gets the native binary, as it would under Rosetta. Their rows record the macOS they were measured on. Safari, Steam, Discord and Brawlhalla still carry Intel code and are the rows that can be reproduced on macOS 27.
 
 | Application | Result under AArchX |
 | --- | --- |
