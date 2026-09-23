@@ -42,7 +42,21 @@
  * first, so openssl reported the wrong version.  The path-to-header lookup is
  * memoized because resolving every import of a dependency would otherwise
  * rescan all ~3600 images, and since the cache is static a negative answer is
- * cached too.
+ * cached too.  A dylib lookup follows LC_REEXPORT_DYLIB as well as re-exports
+ * in the trie, because an umbrella such as libSystem answers for its members
+ * only through those load commands.
+ *
+ * A weak-coalescing bind (ordinal -3) asks whether any image already defines
+ * the name, and dyld answers it only from images that define weak symbols,
+ * MH_WEAK_DEFINES.  Walking the whole cache instead cost Electron Framework
+ * about 2,560 misses of 1.8 ms each, 4.6 s per process, because its weak names
+ * are its own C++ and no system library has them.  Those binds walk the ~300
+ * weak-defining images only, and after 128 of them a 1 MB bloom filter of
+ * every name those images and their re-exports export turns a miss into one
+ * probe.  The names are hashed along the trie edges rather than rebuilt, which
+ * keeps the build near 40 ms, and a program with a handful of weak binds never
+ * pays it.  The filter is built privately and published with a release store,
+ * because readers test it without the lock.
  */
 #include <stdlib.h>
 #include "ocerz/cache.h"
@@ -684,6 +698,8 @@ static const char *dylib_ordinal_name(uint64_t mh, uint64_t ord)
     return NULL;
 }
 
+static uint64_t cache_image_by_path_memo(OcerzCache *c, const char *path);
+
 static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, int depth,
                                  int *found)
 {
@@ -698,8 +714,32 @@ static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, in
     int lfound = 0;
     uint64_t lflags = 0;
     uint64_t off = trie_lookup(ts, te, sym, &reexp, &ord, &imp, &lfound, &lflags);
-    if (!lfound)
+    if (!lfound) {
+        const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+        uint32_t ncmds = rd32(h + 16);
+        const uint8_t *lc = h + 32;
+        for (uint32_t i = 0; i < ncmds; i++) {
+            uint32_t cmd = rd32(lc), size = rd32(lc + 4);
+            if (size < 8)
+                break;
+            if (cmd == LC_REEXPORT_DYLIB) {
+                uint32_t noff = rd32(lc + 8);
+                if (noff < size) {
+                    uint64_t tmh = cache_image_by_path_memo(c, (const char *)lc + noff);
+                    if (tmh && tmh != mh) {
+                        int f = 0;
+                        uint64_t v = resolve_in_dylib(c, tmh, sym, depth + 1, &f);
+                        if (f) {
+                            *found = 1;
+                            return v;
+                        }
+                    }
+                }
+            }
+            lc += size;
+        }
         return 0;
+    }
     if (!reexp) {
         *found = 1;
 
@@ -717,7 +757,7 @@ static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, in
     return resolve_in_dylib(c, tmh, want, depth + 1, found);
 }
 
-#define RMEMO_SLOTS 4096
+#define RMEMO_SLOTS (1u << 16)
 typedef struct { char *name; uint64_t val; int found; } ResolveMemo;
 static ResolveMemo g_rmemo[RMEMO_SLOTS];
 static pthread_mutex_t g_rmemo_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -732,7 +772,7 @@ static unsigned rmemo_hash(const char *s)
 static ResolveMemo *rmemo_find(const char *symbol)
 {
     unsigned i = rmemo_hash(symbol);
-    for (unsigned n = 0; n < 8; n++, i = (i + 1) & (RMEMO_SLOTS - 1)) {
+    for (unsigned n = 0; n < 32; n++, i = (i + 1) & (RMEMO_SLOTS - 1)) {
         if (!g_rmemo[i].name)
             return &g_rmemo[i];
         if (strcmp(g_rmemo[i].name, symbol) == 0)
@@ -887,6 +927,167 @@ static uint64_t cache_resolve_walk(OcerzCache *c, const char *symbol, int *found
         if (f) {
             *found = 1;
             return r;
+        }
+    }
+    return 0;
+}
+
+#define FNV64_BASIS 14695981039346656037ull
+#define FNV64_PRIME 1099511628211ull
+#define NAMEBLOOM_BITS (1u << 23)
+#define WEAK_FILTER_AFTER 128
+
+static uint64_t fnv64_extend(uint64_t h, const char *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ (unsigned char)s[i]) * FNV64_PRIME;
+    return h;
+}
+
+static void bloom_probe_bits(uint64_t h, uint32_t bits[4])
+{
+    h ^= h >> 29;
+    h *= 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 32;
+    uint32_t a = (uint32_t)h, b = (uint32_t)(h >> 32) | 1;
+    for (int k = 0; k < 4; k++)
+        bits[k] = (a + (uint32_t)k * b) & (NAMEBLOOM_BITS - 1);
+}
+
+static void bloom_add(uint8_t *bloom, uint64_t h)
+{
+    uint32_t bits[4];
+    bloom_probe_bits(h, bits);
+    for (int k = 0; k < 4; k++)
+        bloom[bits[k] >> 3] |= (uint8_t)(1u << (bits[k] & 7));
+}
+
+static int bloom_has(const uint8_t *bloom, uint64_t h)
+{
+    uint32_t bits[4];
+    bloom_probe_bits(h, bits);
+    for (int k = 0; k < 4; k++)
+        if (!(bloom[bits[k] >> 3] & (1u << (bits[k] & 7))))
+            return 0;
+    return 1;
+}
+
+static int trie_collect(const uint8_t *start, const uint8_t *end, const uint8_t *node,
+                        uint64_t h, int depth, uint8_t *bloom, uint64_t *count)
+{
+    if (depth > 256 || node < start || node >= end)
+        return -1;
+    const uint8_t *p = node;
+    uint64_t term = uleb(&p, end);
+    if (term) {
+        bloom_add(bloom, h);
+        (*count)++;
+    }
+    if (term > (uint64_t)(end - p))
+        return -1;
+    p += term;
+    if (p >= end)
+        return 0;
+    uint8_t children = *p++;
+    for (uint8_t i = 0; i < children; i++) {
+        const char *edge = (const char *)p;
+        size_t elen = strnlen(edge, (size_t)(end - p));
+        if (p + elen >= end)
+            return -1;
+        p += elen + 1;
+        uint64_t child_off = uleb(&p, end);
+        if (trie_collect(start, end, start + child_off, fnv64_extend(h, edge, elen), depth + 1,
+                         bloom, count) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int collect_image_exports(OcerzCache *c, uint64_t mh, uint8_t *bloom, uint64_t *count,
+                                 uint64_t *seen, uint32_t *nseen, uint32_t cap, int depth)
+{
+    if (depth > 16)
+        return -1;
+    for (uint32_t i = 0; i < *nseen; i++)
+        if (seen[i] == mh)
+            return 0;
+    if (*nseen >= cap)
+        return -1;
+    seen[(*nseen)++] = mh;
+    const uint8_t *ts, *te;
+    if (dylib_export_region(mh, &ts, &te) == 0 &&
+        trie_collect(ts, te, ts, FNV64_BASIS, 0, bloom, count) != 0)
+        return -1;
+    const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + 32;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc), size = rd32(lc + 4);
+        if (size < 8)
+            break;
+        if (cmd == LC_REEXPORT_DYLIB && rd32(lc + 8) < size) {
+            uint64_t tmh = cache_image_by_path_memo(c, (const char *)lc + rd32(lc + 8));
+            if (!tmh)
+                return -1;
+            if (collect_image_exports(c, tmh, bloom, count, seen, nseen, cap, depth + 1) != 0)
+                return -1;
+        }
+        lc += size;
+    }
+    return 0;
+}
+
+uint64_t ocerz_cache_resolve_weak_ex(OcerzCache *c, const char *symbol, int *found)
+{
+    static uint64_t *weak;
+    static uint32_t nweak;
+    static uint8_t *bloom;
+    static int built, bloom_built;
+    static uint32_t lookups;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    int dummy = 0;
+    if (!found)
+        found = &dummy;
+    *found = 0;
+    if (!c->mapped || !symbol)
+        return 0;
+    pthread_mutex_lock(&lock);
+    uint32_t cap = c->images_cnt ? c->images_cnt : 1;
+    if (!built) {
+        weak = calloc(cap, sizeof *weak);
+        for (uint32_t i = 0; weak && i < c->images_cnt; i++) {
+            uint64_t mh = ocerz_cache_image_addr(c, i, NULL);
+            const uint8_t *h = (const uint8_t *)(uintptr_t)mh;
+            if (mh && rd32(h) == MH_MAGIC_64 && (rd32(h + 24) & MH_WEAK_DEFINES))
+                weak[nweak++] = mh;
+        }
+        built = 1;
+    }
+    if (!bloom_built && ++lookups > WEAK_FILTER_AFTER) {
+        uint64_t *seen = calloc(cap, sizeof *seen);
+        uint32_t nseen = 0;
+        uint64_t count = 0;
+        uint8_t *fresh = seen ? calloc(NAMEBLOOM_BITS / 8, 1) : NULL;
+        for (uint32_t i = 0; fresh && i < nweak; i++) {
+            if (collect_image_exports(c, weak[i], fresh, &count, seen, &nseen, cap, 0) != 0) {
+                free(fresh);
+                fresh = NULL;
+            }
+        }
+        free(seen);
+        __atomic_store_n(&bloom, fresh, __ATOMIC_RELEASE);
+        bloom_built = 1;
+    }
+    pthread_mutex_unlock(&lock);
+    const uint8_t *bl = __atomic_load_n(&bloom, __ATOMIC_ACQUIRE);
+    if (bl && !bloom_has(bl, fnv64_extend(FNV64_BASIS, symbol, strlen(symbol))))
+        return 0;
+    for (uint32_t i = 0; i < nweak; i++) {
+        int f = 0;
+        uint64_t v = resolve_in_dylib(c, weak[i], symbol, 0, &f);
+        if (f) {
+            *found = 1;
+            return v;
         }
     }
     return 0;
