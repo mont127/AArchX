@@ -423,6 +423,13 @@
  * believes it has linked, while listing the host's images would hand x86 code
  * arm64 headers.  An add-image callback registered late is called at once for
  * every image already listed, and then for each image a dlopen adds.
+ *
+ * Chained fixups name an import by ordinal at every location that uses it, so
+ * apply_fixups resolves each ordinal once and reuses the answer, and the
+ * classic bind opcodes, which repeat a symbol across consecutive locations,
+ * reuse the last answer when the symbol, library and weakness are unchanged.
+ * A weak-coalescing bind is answered only from cache images that define weak
+ * symbols, as dyld does; see src/cache.c.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -1298,7 +1305,9 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
                 value = ocerz_cache_resolve_in_image(cache, tgt, name, &found);
         }
     }
-    if (!found)
+    if (!found && libord == -3)
+        value = ocerz_cache_resolve_weak_ex(cache, name, &found);
+    else if (!found)
         value = ocerz_cache_resolve_ex(cache, name, &found);
     if (!found && (libord == -3 || libord == 0 || libord == -2))
         value = ocerz_image_self_resolve_ex(img, name, &found);
@@ -1452,6 +1461,9 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
     uint32_t imports_off = rd32(cf + 8);
     uint32_t symbols_off = rd32(cf + 12);
     uint32_t imports_cnt = rd32(cf + 16);
+    uint64_t *ivals = imports_cnt && imports_cnt < (1u << 24) ? (uint64_t *)calloc(imports_cnt, sizeof *ivals) : NULL;
+    uint8_t *idone = ivals ? (uint8_t *)calloc(imports_cnt, 1) : NULL;
+    if (ivals && !idone) { free(ivals); ivals = NULL; }
 
     const uint8_t *sii = cf + starts_off;
     uint32_t seg_count = rd32(sii);
@@ -1467,7 +1479,7 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
         const uint8_t *page_start = sis + 0x16;
         if (ptr_format != 2 && ptr_format != 6) {
             OCERZ_FATAL("unsupported chained pointer format %u\n", ptr_format);
-            return OCERZ_EUNSUP;
+            { free(ivals); free(idone); return OCERZ_EUNSUP; }
         }
         for (uint16_t pg = 0; pg < page_count; pg++) {
             uint16_t start = rd16(page_start + pg * 2);
@@ -1488,7 +1500,12 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
                         int libord = (int8_t)(imp & 0xff);
                         int weakimp = (imp >> 8) & 1;
                         const char *name = (const char *)(cf + symbols_off + noff);
-                        value = resolve_import(cache, img, name, libord, weakimp);
+                        if (idone && idone[ordinal]) {
+                            value = ivals[ordinal];
+                        } else {
+                            value = resolve_import(cache, img, name, libord, weakimp);
+                            if (idone) { ivals[ordinal] = value; idone[ordinal] = 1; }
+                        }
                     }
                     ocerz_st(addr, 8, value + addend);
                 } else {
@@ -1506,7 +1523,7 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
             }
         }
     }
-    return OCERZ_OK;
+    { free(ivals); free(idone); return OCERZ_OK; }
 }
 
 static int64_t self_sleb(const uint8_t **pp, const uint8_t *end)
@@ -1526,10 +1543,24 @@ static int64_t self_sleb(const uint8_t **pp, const uint8_t *end)
     return r;
 }
 
+typedef struct {
+    const char *name;
+    int libord, weak, valid;
+    uint64_t value;
+} ClassicMemo;
+
 static uint64_t classic_resolve(DynImage *img, OcerzCache *cache, const char *name,
-                                int libord, int weak)
+                                int libord, int weak, ClassicMemo *m)
 {
-    return resolve_import(cache, img, name, libord, weak);
+    if (m->valid && name == m->name && libord == m->libord && weak == m->weak)
+        return m->value;
+    uint64_t v = resolve_import(cache, img, name, libord, weak);
+    m->name = name;
+    m->libord = libord;
+    m->weak = weak;
+    m->value = v;
+    m->valid = 1;
+    return v;
 }
 
 static void classic_rebase(DynImage *img)
@@ -1599,6 +1630,7 @@ static void classic_rebase(DynImage *img)
 static void classic_bind_stream(DynImage *img, OcerzCache *cache,
                                 const uint8_t *p, const uint8_t *end, int is_lazy)
 {
+    ClassicMemo memo = { 0 };
     uint64_t addr = 0;
     const char *name = "";
     int64_t addend = 0;
@@ -1648,19 +1680,19 @@ static void classic_bind_stream(DynImage *img, OcerzCache *cache,
             addr += self_uleb(&p, end);
             break;
         case 0x90: {
-            uint64_t v = classic_resolve(img, cache, name, libord, weak);
+            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
             ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
             addr += 8;
             break;
         }
         case 0xa0: {
-            uint64_t v = classic_resolve(img, cache, name, libord, weak);
+            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
             ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
             addr += 8 + self_uleb(&p, end);
             break;
         }
         case 0xb0: {
-            uint64_t v = classic_resolve(img, cache, name, libord, weak);
+            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
             ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
             addr += 8 + (uint64_t)imm * 8;
             break;
@@ -1669,7 +1701,7 @@ static void classic_bind_stream(DynImage *img, OcerzCache *cache,
             uint64_t cnt = self_uleb(&p, end);
             uint64_t skip = self_uleb(&p, end);
             for (uint64_t i = 0; i < cnt; i++) {
-                uint64_t v = classic_resolve(img, cache, name, libord, weak);
+                uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
                 ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
                 addr += 8 + skip;
             }

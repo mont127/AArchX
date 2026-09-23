@@ -33,6 +33,7 @@ void ocerz_cache_arm_exec(uint64_t lo, uint64_t hi);
 uint64_t ocerz_cache_resolve(OcerzCache *c, const char *symbol);
 
 uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found);
+uint64_t ocerz_cache_resolve_weak_ex(OcerzCache *c, const char *symbol, int *found);
 uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
                                       const char *symbol, int *found);
 int ocerz_cache_has_image(OcerzCache *c, uint64_t mh);
