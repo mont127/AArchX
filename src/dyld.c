@@ -430,6 +430,12 @@
  * reuse the last answer when the symbol, library and weakness are unchanged.
  * A weak-coalescing bind is answered only from cache images that define weak
  * symbols, as dyld does; see src/cache.c.
+ *
+ * Some x86_64 libraries ship only in the Rosetta cryptex, and Intel code names
+ * them by their system path: Metal opens /usr/lib/libMTLHud.dylib for its
+ * performance HUD, and nothing exists there on disk.  In cache mode a dlopen
+ * of an absolute path found neither in the cache nor on disk retries the same
+ * path under /System/Volumes/Preboot/Cryptexes/Rosetta.
  */
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -3364,6 +3370,8 @@ static int resolve_bare_soname(const char *name, char *out, size_t n)
     return try_soname_in_pathlist(def, name, out, n);
 }
 
+#define ROSETTA_CRYPTEX "/System/Volumes/Preboot/Cryptexes/Rosetta"
+
 static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int mode)
 {
     if (!g_run_cache) {
@@ -3422,6 +3430,18 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
         if (cmh)
             return cache_dlopen_hit(vm, cmh);
         loadpath = sopath;
+    }
+    char cxpath[PATH_MAX];
+    if (ocerz_mode != OCERZ_MODE_NATIVE && loadpath[0] == '/' && access(loadpath, F_OK) != 0 &&
+        snprintf(cxpath, sizeof cxpath, "%s%s", ROSETTA_CRYPTEX, loadpath) < (int)sizeof cxpath &&
+        access(cxpath, F_OK) == 0) {
+        already = dimg_find_by_path(cxpath);
+        if (already) {
+            if (g_dlerror_g)
+                ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+            return already->load_base;
+        }
+        loadpath = cxpath;
     }
     if (mode & 0x10) {
         dlerror_set("dlopen(%s): not already loaded (RTLD_NOLOAD)", hostpath);
