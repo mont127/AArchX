@@ -1271,9 +1271,11 @@
 # that JIT run and fails unless the translator said, for each of the eleven
 # exports, that it answers it in place: without that the fixture would pass on
 # the ordinary crossing and prove nothing about the routines. It then runs the
-# fixture once more under -v -cache and counts the blocks the translator said
-# it put a routine at the head of, which must be the ten entries
-# libsystem_platform exports, for the same reason. sys_strings_fault
+# fixture once more under -v -cache and counts the distinct addresses the
+# translator said it put a routine at the head of, which must be the nine
+# entries behind libsystem_platform's ten names, for the same reason: memcpy
+# and memmove are one routine at one address there. Counting log lines instead
+# passed only while something retranslated one of them. sys_strings_fault
 # runs each routine into a page it may not touch, from a caller that first puts
 # known values in rbx and r12 to r15, with a handler that leaves by siglongjmp.
 # It has no -no-jit run, because there the call crosses and a fault inside a
@@ -14786,9 +14788,9 @@ case_sys_strings_inplace() {
         reason="the translator did not answer$missing in place, so sys_strings passed on the ordinary crossing and says nothing about the routines in src/leaf.s"
     elif [ "$CACHE_OK" -eq 1 ]; then
         run_bounded "$TMP/$name.cache.out" "$TMP/$name.cache.err" "$OCERZ" -v -cache "$SYS_STRINGS_BIN"
-        entries="$(grep -c '^ocerz: jit: the routine at 0x[0-9a-f]* is answered in place$' "$TMP/$name.cache.err")"
-        if [ "$entries" -lt 10 ]; then
-            reason="cache mode answered $entries of libsystem_platform's ten routines in place, so its sys_strings run exercised Apple's x86 code and not src/leaf.s"
+        entries="$(grep '^ocerz: jit: the routine at 0x[0-9a-f]* is answered in place$' "$TMP/$name.cache.err" | sort -u | wc -l | tr -d ' ')"
+        if [ "$entries" -lt 9 ]; then
+            reason="cache mode answered $entries of the nine entries behind libsystem_platform's ten routines in place, so its sys_strings run exercised Apple's x86 code and not src/leaf.s"
         elif ! cmp -s "$TMP/$name.cache.out" "$TMP/sys_strings.jit.out"; then
             reason="cache mode under -v printed '$(tr '\n' ' ' < "$TMP/$name.cache.out")', not what the native run printed"
         fi
