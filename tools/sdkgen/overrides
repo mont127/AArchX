@@ -417,17 +417,12 @@
 # rectangles by value, which cross by rule.  One names itself.
 #
 # NSApplicationMain is an application's whole launch, and it crosses by rule.
-# Disassembled, it reads NSPrincipalClass, NSMainNibFile and
-# NSMainStoryboardFile out of the main bundle's Info.plist, looks the principal
-# class up by name, loads the main nib or storyboard out of the main bundle,
-# runs the application and ends the process with a native exit.  The main
-# bundle is the guest's, because ocerz gives native CoreFoundation the guest's
-# executable as the process path; a guest class is a name the native runtime
-# can look up once ocerz has registered it, which it has before main; and the
-# native exit runs the guest's atexit handlers, which are on the host's list,
-# and flushes the host's stdio, which is the guest's.  NSApplicationLoad
-# crosses too: disassembled, it only makes the shared NSApplication, starts it
-# and installs autorelease pools.
+# The main bundle it launches from is the guest's, because ocerz gives native
+# CoreFoundation the guest's executable as the process path; a guest class is a
+# name the native runtime can look up once ocerz has registered it, which it has
+# before main; and a native exit runs the guest's atexit handlers, which are on
+# the host's list, and flushes the host's stdio, which is the guest's.
+# NSApplicationLoad crosses too.
 #
 # NSAccessibilityRaiseBadArgumentException exists to throw an Objective-C
 # exception, which cannot unwind through the guest frames between it and a
