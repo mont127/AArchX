@@ -448,7 +448,18 @@ static uint64_t cache_find_path_ex(struct OcerzCache *cache, const char *path, c
         }
         at = (at + 1) & g_cache_paths_mask;
     }
-    return 0;
+    uint64_t alias = ocerz_cache_find_alias(cache, path);
+    if (alias && cache_path) {
+        *cache_path = NULL;
+        for (uint32_t i = 0; i < cache->images_cnt && !*cache_path; i++) {
+            const char *p = NULL;
+            if (ocerz_cache_image_addr(cache, i, &p) == alias)
+                *cache_path = p;
+        }
+        if (!*cache_path)
+            return 0;
+    }
+    return alias;
 }
 
 static uint64_t cache_find_path(struct OcerzCache *cache, const char *path)
