@@ -24,7 +24,7 @@ AArchX loads and runs x86-64 Mach-O programs on Apple Silicon with its own decod
 
 AArchX has two modes. Cache mode, the default, binds guests against the x86-64 shared cache, and for it the Rosetta package still has to be installed, because it is what ships that cache; AArchX maps the cache itself and never calls Rosetta's translator. Native mode (`-native`) binds guests against the Mac's own arm64 frameworks instead and needs no x86 system libraries at all, but it runs a narrower set of programs so far (see [Native mode](#native-mode)). Every application below was run in cache mode.
 
-Documentation lives in [docs/](docs/README.md): getting started, the two modes, the CLI and environment reference, architecture, performance, compatibility, troubleshooting, testing, and the [Atlas](docs/atlas/index.html), a guided tour of the source for contributors (also published at https://mont127.github.io/AArchX-Public/atlas/).
+Documentation lives in [docs/](docs/README.md): getting started, the two modes, the CLI and environment reference, architecture, performance, compatibility, troubleshooting, testing, and the [Atlas](docs/atlas/index.html), a guided tour of the source for contributors (also published at https://mont127.github.io/AArchX/atlas/).
 
 ## Build and run
 
