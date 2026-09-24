@@ -1,0 +1,20 @@
+name: Feature request
+description: Something ocerz should do that it does not.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The program or task, and where ocerz falls short today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: The behaviour you would like. If you know how Rosetta or a native run behaves here, say so.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Anything you tried instead

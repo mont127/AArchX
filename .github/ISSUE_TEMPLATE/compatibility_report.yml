@@ -1,0 +1,48 @@
+name: Compatibility report
+description: Tell us a program works, partly works, or does not start under ocerz.
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports like this build the list in [docs/compatibility.md](https://github.com/mont127/AArchX/blob/main/docs/compatibility.md). Only x86-64 programs count: one that also ships an arm64 build runs natively and says nothing about ocerz.
+  - type: input
+    id: program
+    attributes:
+      label: Program and version
+      placeholder: "Discord 0.0.3xx, x86-64 slice"
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: How well does it run?
+      options:
+        - works
+        - works with problems
+        - starts but is unusable
+        - does not start
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - cache (the default)
+        - native (-native)
+        - both
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: ocerz version, macOS version and Mac
+      placeholder: "AArchX 0.3-dev 5ca9b30, macOS 27.0, MacBook Air M5"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Details
+      description: What works and what does not, how it compares with Rosetta (speed, frame rate, launch time), and any `ocerz:` messages.

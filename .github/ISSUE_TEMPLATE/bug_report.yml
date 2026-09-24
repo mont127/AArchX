@@ -1,0 +1,74 @@
+name: Bug report
+description: A program crashes, hangs or behaves differently under ocerz than under Rosetta.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting. Please read [docs/troubleshooting.md](https://github.com/mont127/AArchX/blob/main/docs/troubleshooting.md) first; it explains every `ocerz:` message.
+        Security problems do not belong here. Report them privately, as [SECURITY.md](https://github.com/mont127/AArchX/blob/main/SECURITY.md) describes.
+  - type: input
+    id: version
+    attributes:
+      label: ocerz version and commit
+      description: The output of `./ocerz version`, and `git rev-parse --short HEAD` if you built it.
+      placeholder: "AArchX 0.3-dev, 5ca9b30"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac
+      placeholder: "macOS 27.0, MacBook Air M5"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - cache (the default)
+        - native (-native)
+        - both
+    validations:
+      required: true
+  - type: input
+    id: program
+    attributes:
+      label: Program
+      description: Name, version, and where it comes from. Only programs with an x86-64 build are in scope; a program that also ships an arm64 build should run natively instead.
+      placeholder: "Brawlhalla 9.x from Steam"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      render: sh
+      placeholder: "./ocerz /Applications/SomeApp.app/Contents/MacOS/SomeApp"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: What the program does under Rosetta or natively, and what it does under ocerz.
+    validations:
+      required: true
+  - type: dropdown
+    id: nojit
+    attributes:
+      label: Does it also happen with -no-jit?
+      description: Run the same command with `-no-jit` added after `ocerz`. This says whether the translator is at fault.
+      options:
+        - "yes, it also happens with -no-jit"
+        - "no, -no-jit works"
+        - "not tried"
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: ocerz output
+      description: The `ocerz:` lines from standard error, especially the first one. `./ocerz -v ... 2> log.txt` gives the full picture; attach the file if it is long.
+      render: text
