@@ -2,6 +2,10 @@
 
 AArchX (the binary is called `ocerz`) runs x86-64 Mac programs on Apple silicon. This page says how the tree is worked on, so that a change fits in on the first try.
 
+## Conduct and security
+
+Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md). Security problems are reported privately, as [SECURITY.md](SECURITY.md) describes, never in a public issue. Issues use the templates under `.github/ISSUE_TEMPLATE`, and a pull request fills in `.github/pull_request_template.md`.
+
 ## Read first
 
 - [docs/atlas](docs/atlas/index.html) is a guided tour of the source for someone who has never seen it: what each piece is, how a program flows through it, why each mechanism exists, and how to read its diagnostics. No C is assumed.
