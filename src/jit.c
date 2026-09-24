@@ -233,6 +233,13 @@
  * sees nothing of it.  It is how a game's frame rate under ocerz is measured
  * when Steam's overlay counter, which relies on dyld interposing, is not there.
  *
+ * OCERZ_TRIPSTAT=1 counts the times translated code leaves to the dispatcher,
+ * which ocerz_jit_step sees once each, and samples one in 64 of their guest
+ * destinations; every ten seconds a thread prints trips per second and the
+ * twenty commonest destinations with the state of the block at each.  At
+ * Brawlhalla's menu it showed 6.6 million trips a second, ten destinations
+ * making 92% of them.  It costs one atomic increment per trip.
+ *
  * A memory access whose address is not a known stack slot pays a commpage
  * guard before it - the commpage lives elsewhere on the host, so the address
  * is compared against that range and redirected if it falls inside - and, in
@@ -17508,8 +17515,83 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     if (flip && !noretire) flip_retire_block(vm, jit, blk);
 }
 
+#define TRIP_SLOTS 4096
+static struct { uint64_t rip; uint64_t n; } g_trip_tab[TRIP_SLOTS];
+static uint64_t g_trip_count;
+static OcerzJit *g_trip_jit;
+
+static void *trip_report(void *arg)
+{
+    uint64_t last = 0;
+    for (;;) {
+        usleep(10000000);
+        uint64_t now = __atomic_load_n(&g_trip_count, __ATOMIC_RELAXED);
+        fprintf(stderr, "ocerz: TRIPSTAT[%d] trips/s=%.0f\n", (int)getpid(), (double)(now - last) / 10.0);
+        last = now;
+        int top[20];
+        int nt = 0;
+        for (int k = 0; k < 20; k++) {
+            int best = -1;
+            for (int i = 0; i < TRIP_SLOTS; i++) {
+                int used = 0;
+                for (int j = 0; j < nt; j++)
+                    used |= top[j] == i;
+                if (!used && g_trip_tab[i].n && (best < 0 || g_trip_tab[i].n > g_trip_tab[best].n))
+                    best = i;
+            }
+            if (best < 0)
+                break;
+            top[nt++] = best;
+        }
+        uint64_t sampled = 0;
+        for (int i = 0; i < TRIP_SLOTS; i++)
+            sampled += g_trip_tab[i].n;
+        for (int j = 0; j < nt; j++) {
+            JitBlock *tb = g_trip_jit ? cache_lookup(g_trip_jit, g_trip_tab[top[j]].rip, 0) : NULL;
+            fprintf(stderr, "ocerz: TRIPSTAT[%d]   %#llx %.1f%% blk=%d code=%d body=%d pin_class=%d n_pinned=%d insns=%d preds=%u execs=%llu\n",
+                    (int)getpid(), (unsigned long long)g_trip_tab[top[j]].rip,
+                    100.0 * (double)g_trip_tab[top[j]].n / (double)(sampled ? sampled : 1),
+                    tb != NULL, tb && tb->code, tb && tb->body_code, tb ? tb->pin_class : -1,
+                    tb ? tb->n_pinned : -1, tb ? tb->n_insns : -1, tb ? tb->n_preds : 0,
+                    tb ? (unsigned long long)tb->exec_count : 0ull);
+        }
+        memset(g_trip_tab, 0, sizeof g_trip_tab);
+    }
+    return arg;
+}
+
+static void trip_note(uint64_t rip)
+{
+    static int state = -1;
+    if (state < 0) {
+        state = 0;
+        if (getenv("OCERZ_TRIPSTAT")) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, trip_report, NULL) == 0) {
+                pthread_detach(t);
+                state = 1;
+            }
+        }
+    }
+    if (state != 1)
+        return;
+    uint64_t c = __atomic_add_fetch(&g_trip_count, 1, __ATOMIC_RELAXED);
+    if (c & 63)
+        return;
+    unsigned h = (unsigned)((rip * 0x9E3779B97F4A7C15ull) >> 52) & (TRIP_SLOTS - 1);
+    for (int k = 0; k < 8; k++, h = (h + 1) & (TRIP_SLOTS - 1)) {
+        if (g_trip_tab[h].rip == rip || g_trip_tab[h].n == 0) {
+            g_trip_tab[h].rip = rip;
+            g_trip_tab[h].n++;
+            return;
+        }
+    }
+}
+
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    g_trip_jit = vm->jit;
+    trip_note(cpu->rip);
     if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
         return OCERZ_EUNSUP;
     { static int sl = -1; if (sl < 0) sl = getenv("OCERZ_STEPLOG") ? 1 : 0; if (sl) steplog(cpu); }
