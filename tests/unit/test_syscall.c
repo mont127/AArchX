@@ -36,6 +36,13 @@
  * binary is arm64 with no x86_64 slice, and a real guest spawning such a
  * binary now gets it run natively, which is right for a program and wrong for
  * a stand-in whose whole point is the wrapper.
+ *
+ * The mach_vm_remap test checks that the untranslated guest address of the
+ * remapped page does not hold its contents.  It reads that raw host address
+ * through mach_vm_read_overwrite, because whatever the host has there is
+ * outside the test's control: on 2026-09-24 it was a region mach_vm_region
+ * reported readable that still faulted when read directly, and the harness
+ * died with a bus error.
  */
 #include "ocerz/vm.h"
 #include "ocerz/syscall.h"
@@ -1262,15 +1269,17 @@ static void test_mach_vm_remap_mig_relocation(void)
 
         int raw_has_contents = 0;
         if (raw_readable) {
-            uint64_t got_first;
-            uint64_t got_last;
-            memcpy(&got_first, (const void *)(uintptr_t)guest_address,
-                   sizeof got_first);
-            memcpy(&got_last,
-                   (const void *)(uintptr_t)
-                       (guest_address + page_size - sizeof got_last),
-                   sizeof got_last);
-            raw_has_contents = got_first == first && got_last == last;
+            uint64_t got_first = 0;
+            uint64_t got_last = 0;
+            mach_vm_size_t got = 0;
+            kern_return_t r1 = mach_vm_read_overwrite(
+                mach_task_self(), guest_address, sizeof got_first,
+                (mach_vm_address_t)(uintptr_t)&got_first, &got);
+            kern_return_t r2 = mach_vm_read_overwrite(
+                mach_task_self(), guest_address + page_size - sizeof got_last,
+                sizeof got_last, (mach_vm_address_t)(uintptr_t)&got_last, &got);
+            raw_has_contents = r1 == KERN_SUCCESS && r2 == KERN_SUCCESS &&
+                               got_first == first && got_last == last;
         }
         CHECK(!raw_has_contents);
         if (raw_has_contents)
