@@ -106,6 +106,27 @@
  * libtier0_s, and its first CUtlMemory growth called through g_pMemAlloc while
  * tier0's allocator singleton still had a null vtable.
  *
+ * Each image in that closure has its +load methods run before its
+ * initializers, as dyld does and as the startup phase always did.  The closure
+ * used to run initializers only, so a cache framework first pulled in by a
+ * dlopen - Foundation under Wine's ntdll.so - never had its +load run, and
+ * +[NSString alloc] and +[NSMutableString alloc] kept handing out the abstract
+ * classes instead of their placeholders.  Wine's mountmgr then answered
+ * Steam's DHCP query through SystemConfiguration, CFBundle built a string on an
+ * abstract NSMutableString, and the same _NSRequestConcreteObject recursion
+ * ran winedevice's stack out; Steam saw no network adapters.  The dynamic test
+ * dlopen_load_phase pins it; OCERZ_NO_CLOSURE_LOADS=1 restores the old
+ * behaviour.
+ *
+ * The dlopen closure and the dlopen load phase follow an upward link only when
+ * it points at Foundation, CoreFoundation or libobjc, so a program that
+ * dlopens SystemConfiguration still gets Foundation's +load and initializer
+ * through CoreFoundation's upward link.  Following every upward link there
+ * brings in CoreServicesInternal's subtree - some 360 more initializers in
+ * every Wine process, SkyLight and CoreML among them - and Steam's CEF browser
+ * process then died in objc_msgSend.  The dynamic test dlopen_objc_core pins
+ * it; OCERZ_NO_DLOPEN_UPWARD=1 turns it off.
+ *
  * ---- thread-local variables ----
  * Two descriptor layouts share the same 24 bytes.  A static linker emits the
  * classic tlv_descriptor { thunk, key:u64, offset:u64 }, so the offset is at
@@ -2736,6 +2757,13 @@ static int upward_init_enabled(void)
     return on;
 }
 
+static int dlopen_upward_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = upward_init_enabled() && !getenv("OCERZ_NO_DLOPEN_UPWARD");
+    return on;
+}
+
 static int dylib_lc_is_init_dep(const uint8_t *lc)
 {
     uint32_t cmd = rd32(lc);
@@ -2782,6 +2810,18 @@ static void init_collect(OcerzCache *cache, uint64_t mh, uint64_t *list, int *n,
     }
     if (*n < cap)
         list[(*n)++] = mh;
+    if (!dlopen_upward_enabled())
+        return;
+    lc = h + sizeof(struct mach_header_64);
+    for (uint32_t j = 0; j < ncmds; j++) {
+        if (dylib_lc_is_upward_dep(lc)) {
+            uint32_t noff = rd32(lc + 8);
+            uint64_t umh = noff < rd32(lc + 4) ? dep_mh(cache, (const char *)(lc + noff)) : 0;
+            if (umh && image_is_objc_core(umh))
+                init_collect(cache, umh, list, n, cap);
+        }
+        lc += rd32(lc + 4);
+    }
 }
 
 #define INIT_CLOSURE_CAP 4096
@@ -2817,9 +2857,18 @@ static void init_closure(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
             continue;
         }
         if (getenv("OCERZ_INITTRACE"))
-            fprintf(stderr, "INITCLOSURE run mh=%#llx\n", (unsigned long long)m);
+            fprintf(stderr, "INITCLOSURE[%d] run mh=%#llx %s\n", (int)getpid(), (unsigned long long)m,
+                    image_id_name(m) ? image_id_name(m) : "?");
         int prev_tol = ocerz_init_tolerant;
         ocerz_init_tolerant = 1;
+        if (!g_load_done[idx] && !getenv("OCERZ_NO_CLOSURE_LOADS")) {
+            ocerz_dyldapi_run_image_loads(vm, m, stack_top);
+            g_load_done[idx] = 1;
+            if (vm->exited) {
+                ocerz_init_tolerant = prev_tol;
+                break;
+            }
+        }
         run_image_inits(vm, m, ia, stack_top);
         ocerz_init_tolerant = prev_tol;
         g_init_done[idx] = 1;
@@ -2949,6 +2998,18 @@ static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t
         ocerz_dyldapi_run_image_loads(vm, mh, stack_top);
         if (idx >= 0)
             g_load_done[idx] = 1;
+    }
+    if (!dlopen_upward_enabled() || !g_init_force || vm->exited)
+        return;
+    lc = h + sizeof(struct mach_header_64);
+    for (uint32_t j = 0; j < ncmds; j++) {
+        if (dylib_lc_is_upward_dep(lc)) {
+            uint32_t noff = rd32(lc + 8);
+            uint64_t umh = noff < rd32(lc + 4) ? dep_mh(cache, (const char *)(lc + noff)) : 0;
+            if (umh && image_is_objc_core(umh))
+                run_load_phase(vm, cache, umh, stack_top, skip_mh);
+        }
+        lc += rd32(lc + 4);
     }
 }
 
