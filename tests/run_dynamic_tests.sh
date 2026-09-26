@@ -260,6 +260,35 @@ run_caller_rpath_case() {
     done
 }
 
+run_mac_syscall_low_stack_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -dynamiclib -install_name @executable_path/libmac_syscall_low_stack.dylib \
+            -o "$dir/libmac_syscall_low_stack.dylib" tests/dynamic/mac_syscall_low_stack_lib.c 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/mac_syscall_low_stack.c \
+            -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_dlopen_arch_case() {
     local name="$1" want_out="$2"
     local dir="$TMP/$name"
@@ -656,6 +685,7 @@ run_dlopen_cf_case ddlopen_cf 'OK'
 run_load_phase_case ddlopen_load_phase 'OK'
 run_file_case ddlopen_objc_core tests/dynamic/dlopen_objc_core.c 'OK'
 run_caller_rpath_case ddlopen_caller_rpath 'OK'
+run_mac_syscall_low_stack_case dmac_syscall_low_stack 'OK'
 run_dlopen_arch_case ddlopen_arch 'OK'
 run_rpath_bare_case drpath_bare 'OK'
 run_init_order_case dinit_order 'OK'

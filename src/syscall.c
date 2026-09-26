@@ -190,6 +190,22 @@
  * address, so outside identity mode they return ENOSYS rather than let the
  * kernel read or write the wrong memory.
  *
+ * __mac_syscall is one of those, and too common to refuse: every sandbox_check
+ * and quarantine query goes through it, with an argument struct whose layout
+ * belongs to the policy.  What goes wrong in practice is the caller's own
+ * stack - out-structures and locals the struct points at - and under Wine
+ * that stack is a Unix-side kernel stack in the low-shadow window, where a
+ * guest address is not the host's.  So each word of the first twelve that
+ * points within 64 KB below to 1 MB above the caller's rsp is rewritten to its
+ * host address for the call and put back before the guest runs again; a word
+ * pointing anywhere else is left alone, because an integer that happens to
+ * look like a low address must not be rewritten.  The sandbox check failed with
+ * EFAULT, the Metal OpenGL renderer took that as no access to the GPU, and
+ * every CGLChoosePixelFormat from a Wine thread returned 10002 - wined3d found
+ * no GL adapter and Counter-Strike 2 stopped at an error box.  The dynamic test
+ * mac_syscall_low_stack pins it; OCERZ_NO_MACSYS_XLATE=1 turns it off and
+ * OCERZ_MACSYSLOG=1 prints the policy, call and first words of each argument.
+ *
  * ---- what a vm_region query answers with ----
  * A guest asking mach_vm_region about its own memory is asking about the guest
  * address space, not about the host arena that happens to hold it, so the reply
@@ -232,7 +248,9 @@
  * and EFAULT are what a missing pointer translation looks like from inside),
  * and the OCERZ_*LOG family - STRACE_CPU, FDOPLOG, FDLOG, MSGLOG, SOCKLOG,
  * PIPELOG, ULOCKLOG, PREADLOG, EXITLOG, MAPFAILLOG - each exist because one
- * real failure needed exactly that view.  IMAGE-CLOBBER is printed, always,
+ * real failure needed exactly that view.  OCERZ_MACHMSG also prints each
+ * mach_msg2 result with the id it received, which is what a diff of two runs
+ * needs to see where an exchange first goes differently.  IMAGE-CLOBBER is printed, always,
  * when a guest fixed-address mmap or a munmap lands on a segment of a loaded
  * image, or an mprotect takes read or execute away from an executable one; a
  * library unmapped under running code otherwise shows up only as a wild jump
@@ -1094,6 +1112,63 @@ static int sys_sysctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int err = 0;
     uint64_t ret2 = 0;
     uint64_t r = ocerz_host_syscall(202, fa, &ret2, &err);
+    if (err)
+        ret_err(cpu, r);
+    else
+        ret_ok(cpu, r);
+    return OCERZ_STEP_OK;
+}
+
+static void sys_mac_syscall_log(OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)cpu;
+    char pol[32] = "";
+    for (int i = 0; a[0] && i < 31; i++) {
+        pol[i] = (char)ocerz_ld(a[0] + (uint64_t)i, 1);
+        if (!pol[i]) break;
+    }
+    fprintf(stderr, "ocerz: MACSYS[%d] policy=%s call=%#llx arg=%#llx:", (int)getpid(), pol,
+            (unsigned long long)a[1], (unsigned long long)a[2]);
+    for (int i = 0; a[2] && i < 8 && ocerz_addr_readable(a[2] + (uint64_t)i * 8); i++)
+        fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(a[2] + (uint64_t)i * 8, 8));
+    fprintf(stderr, "\n");
+}
+
+static int sys_mac_syscall(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    (void)vm;
+    static int log = -1;
+    if (log < 0) log = getenv("OCERZ_MACSYSLOG") ? 1 : 0;
+    if (log)
+        sys_mac_syscall_log(cpu, a);
+    uint64_t fa[8];
+    memcpy(fa, a, sizeof fa);
+    if (fa[0])
+        fa[0] = (uint64_t)(uintptr_t)ocerz_g2h(fa[0]);
+    uint64_t slot[12], orig[12];
+    int ns = 0;
+    if (a[2]) {
+        uint64_t sp = cpu->gpr[OCERZ_RSP];
+        uint64_t lo = sp > 0x10000 ? sp - 0x10000 : 0, hi = sp + 0x100000;
+        static int off = -1;
+        if (off < 0) off = getenv("OCERZ_NO_MACSYS_XLATE") ? 1 : 0;
+        for (int i = 0; !off && i < 12 && ocerz_addr_readable(a[2] + (uint64_t)i * 8 + 7); i++) {
+            uint64_t at = a[2] + (uint64_t)i * 8, w = ocerz_ld(at, 8);
+            uint64_t hw = w >= lo && w < hi ? (uint64_t)(uintptr_t)ocerz_g2h(w) : w;
+            if (hw != w) {
+                slot[ns] = at;
+                orig[ns] = w;
+                ns++;
+                ocerz_st(at, 8, hw);
+            }
+        }
+        fa[2] = (uint64_t)(uintptr_t)ocerz_g2h(a[2]);
+    }
+    int err = 0;
+    uint64_t ret2 = 0;
+    uint64_t r = ocerz_host_syscall(381, fa, &ret2, &err);
+    for (int k = ns - 1; k >= 0; k--)
+        ocerz_st(slot[k], 8, orig[k]);
     if (err)
         ret_err(cpu, r);
     else
@@ -4980,7 +5055,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [272] = { "sem_trywait", 1, 0x00, 0, NULL },
     [273] = { "sem_post",    1, 0x00, 0, NULL },
     [274] = { "sysctlbyname",6, 0x1d, 0, sys_sysctlbyname },
-    [381] = { "__mac_syscall", 3, 0x05, 0, NULL },
+    [381] = { "__mac_syscall", 3, 0x05, 0, sys_mac_syscall },
     [483] = { "csrctl", 3, 0x02, 0, NULL },
     [441] = { "guarded_open_np", 5, 0x03, 0, NULL },
     [442] = { "guarded_close_np", 2, 0x02, 0, NULL },
@@ -6933,6 +7008,13 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         uint64_t r47 = ocerz_host_mach_trap(num, a);
         cpu->block_since_ns = 0;
+        if (OCERZ_ENV_ON("OCERZ_MACHMSG")) {
+            uint64_t rb = vector_mode && reply_buf ? ocerz_ld(reply_buf + 8, 8) : reply_buf;
+            fprintf(stderr, "ocerz: MACHMSG-EXIT[%d] opts=%#llx kr=%#llx sent_id=%u rcv_id=%u rcv_size=%#x\n",
+                    (int)getpid(), (unsigned long long)a[1], (unsigned long long)r47, msgh_id,
+                    (a[1] & 0x2) && r47 == 0 && rb ? (uint32_t)ocerz_ld(rb + 0x14, 4) : 0,
+                    (a[1] & 0x2) && r47 == 0 && rb ? (uint32_t)ocerz_ld(rb + 4, 4) : 0);
+        }
         {
             static int msl = -1;
             static _Atomic unsigned long long msn;
