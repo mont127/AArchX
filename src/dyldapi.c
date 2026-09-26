@@ -56,7 +56,8 @@
  * tools/dyldslots.sh calls every name the SDK's libdyld.tbd exports, with
  * zero arguments, under OCERZ_DYLDAPI_TRACE=1, which prints each arrival in
  * this table with its arguments and caller, so a public name is paired with
- * the slot its call reaches first.  A slot no export reaches first is named by
+ * the slot its call reaches first; OCERZ_DLSYMLOG=1 prints every dlsym with its
+ * handle, result and caller.  A slot no export reaches first is named by
  * its caller in a traced run, through dladdr: +0x358 is called from
  * _dyld_objc_register_callbacks.  tools/dyldslots.sh --check, part of the
  * dynamic tests, fails for any slot answered here that has no such witness,
@@ -2289,8 +2290,10 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
             }
             fprintf(stderr, "\n");
         }
+        uint64_t caller = off == 0x2e0 ? cpu->gpr[OCERZ_RCX]
+                        : ocerz_addr_readable(cpu->gpr[OCERZ_RSP]) ? ocerz_ld(cpu->gpr[OCERZ_RSP], 8) : 0;
         OcerzCPU saved = *cpu;
-        uint64_t h = ocerz_dlopen(vm, host, (int)mode);
+        uint64_t h = ocerz_dlopen_from(vm, host, (int)mode, caller);
         *cpu = saved;
         if (vm->jit_ordered_required)
             cpu->ras_top = 0;
@@ -2318,6 +2321,11 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         uint64_t addr = 0;
         if (symg)
             addr = ocerz_dlsym(handle, (const char *)ocerz_g2h(symg));
+        if (getenv("OCERZ_DLSYMLOG"))
+            fprintf(stderr, "ocerz: DLSYM[%d] handle=%#llx \"%s\" -> %#llx caller=%#llx\n", (int)getpid(),
+                    (unsigned long long)handle, symg ? (const char *)ocerz_g2h(symg) : "(null)",
+                    (unsigned long long)addr,
+                    (unsigned long long)(ocerz_addr_readable(cpu->gpr[OCERZ_RSP]) ? ocerz_ld(cpu->gpr[OCERZ_RSP], 8) : 0));
         api_return(cpu, addr);
         return OCERZ_STEP_OK;
     }
