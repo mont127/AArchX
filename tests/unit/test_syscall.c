@@ -1338,7 +1338,7 @@ static void test_sigaction(void)
     CHECK(ocerz_ld(goact + 8, 8) == 0);
 }
 
-static void test_sigreturn_restores_only_ocerz_segment_bases(void)
+static void test_sigreturn_keeps_handler_gs_restores_ocerz_fs(void)
 {
     OcerzCPU *cpu = &vm.cpu;
     uint64_t gact = scratch + 0x5000;
@@ -1361,7 +1361,8 @@ static void test_sigreturn_restores_only_ocerz_segment_bases(void)
     cpu->fs_base = 0x170000160ull;
     set_args(cpu, bsd(184), uc, 0, 0, 0, 0, 0);
     CHECK(ocerz_handle_syscall(&vm, cpu) == OCERZ_STEP_OK);
-    CHECK(cpu->gs_base == interrupted_gs);
+    CHECK(cpu->gs_base == 0x1700000e0ull);
+    CHECK(cpu->gs_base != interrupted_gs);
     CHECK(cpu->fs_base == interrupted_fs);
 
     cpu->gs_base = 0x170000260ull;
@@ -1883,7 +1884,7 @@ int main(int argc, char **argv)
     test_getentropy();
     test_writev();
     test_sigaction();
-    test_sigreturn_restores_only_ocerz_segment_bases();
+    test_sigreturn_keeps_handler_gs_restores_ocerz_fs();
     test_nested_signal_altstack_state();
     test_sigaltstack_too_small();
     test_machdep_gs_base();

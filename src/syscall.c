@@ -119,6 +119,15 @@
  * Wine has a handler for these anyway, which is both the faithful emulation and
  * free of ReportCrash.
  *
+ * sigreturn leaves the gs base alone.  The real kernel saves and restores it
+ * only for a task with an LDT, so a base set inside a handler survives the
+ * return - measured with a probe when b5279e8 first made this rule - and Wine's
+ * leave_handler depends on exactly that, installing the TEB before it goes
+ * back to PE code.  ocerz stashes the interrupted bases past the 56-byte
+ * ucontext of the frames it builds itself, behind a cookie; only fs is taken
+ * back from there.  Putting gs back as well undid leave_handler, and PE code
+ * ran on the pthread base until something read %gs:0x30.
+ *
  * ---- signals in native mode ----
  * Native mode has no x86 libc in front of these calls, so sigaction, signal,
  * sigprocmask, sigaltstack, raise and pthread_kill arrive as bridged calls with
@@ -4142,11 +4151,8 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     int restore_segbases =
         ocerz_ld(uc + 72, 8) == OCERZ_UCTX_SEGBASE_COOKIE;
     if (restore_segbases) {
-        cpu->gs_base = ocerz_ld(uc + 56, 8);
         cpu->fs_base = ocerz_ld(uc + 64, 8);
         ocerz_st(uc + 72, 8, 0);
-        if (ocerz_gs_is_teb_band(cpu->gs_base))
-            cpu->wine_teb_base = cpu->gs_base;
     }
     if (getenv("OCERZ_GSTRACE"))
         fprintf(stderr,
