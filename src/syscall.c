@@ -232,7 +232,12 @@
  * and EFAULT are what a missing pointer translation looks like from inside),
  * and the OCERZ_*LOG family - STRACE_CPU, FDOPLOG, FDLOG, MSGLOG, SOCKLOG,
  * PIPELOG, ULOCKLOG, PREADLOG, EXITLOG, MAPFAILLOG - each exist because one
- * real failure needed exactly that view.
+ * real failure needed exactly that view.  IMAGE-CLOBBER is printed, always,
+ * when a guest fixed-address mmap or a munmap lands on a segment of a loaded
+ * image, or an mprotect takes read or execute away from an executable one; a
+ * library unmapped under running code otherwise shows up only as a wild jump
+ * much later.  A fatal guest thread names its process's pid and command line,
+ * because under Wine a dozen processes share one stderr.
  */
 #include "ocerz/syscall.h"
 #include "ocerz/cache.h"
@@ -523,6 +528,18 @@ static void memtrace(const char *op, uint64_t a, uint64_t l, int prot, int flags
                 ocerz_addr_committed(a));
 }
 
+static void image_clobber_check(const char *op, OcerzCPU *cpu, uint64_t addr, uint64_t len, int exec_only)
+{
+    if (!len || addr + len < addr)
+        return;
+    uint64_t base = 0;
+    const char *img = ocerz_dyld_image_overlapping(addr, addr + len, exec_only, &base);
+    if (img)
+        fprintf(stderr, "ocerz: IMAGE-CLOBBER[%d] guest %s addr=%#llx len=%#llx lands on %s (base %#llx) rip=%#llx\n",
+                (int)getpid(), op, (unsigned long long)addr, (unsigned long long)len, img,
+                (unsigned long long)base, (unsigned long long)cpu->rip);
+}
+
 static void invalidate_guest_mapping(OcerzVM *vm, uint64_t addr, uint64_t len)
 {
     ocerz_jit_invalidate_range(vm, addr, len);
@@ -625,6 +642,8 @@ static int guest_mmap_apply(OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t 
         ocerz_jit_require_ordered(vm);
 
     memtrace(anon ? "mmap-anon" : "mmap-file", addr, len, prot, flags);
+    if (fixed)
+        image_clobber_check(anon ? "mmap-fixed-anon" : "mmap-fixed-file", cpu, addr, len, 0);
     if (anon) {
         if (fixed) {
             invalidate_guest_mapping(vm, addr, len);
@@ -767,6 +786,7 @@ static int sys_mmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 
 static int sys_munmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
+    image_clobber_check("munmap", cpu, a[0], a[1], 0);
     invalidate_guest_mapping(vm, a[0], a[1]);
     ocerz_unmap(a[0], a[1]);
     ret_ok(cpu, 0);
@@ -776,6 +796,8 @@ static int sys_munmap(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 static int guest_mprotect_apply(OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t len, int prot)
 {
     memtrace("mprotect", addr, len, prot, 0);
+    if ((prot & (PROT_READ | PROT_EXEC)) != (PROT_READ | PROT_EXEC))
+        image_clobber_check(prot & PROT_READ ? "mprotect-noexec" : "mprotect-noread", cpu, addr, len, 1);
     if (ocerz_cache_region((uintptr_t)addr)) {
         int e = ocerz_cache_protect((uintptr_t)addr, len, prot);
         if (e)
@@ -1299,16 +1321,17 @@ static void *ocerz_worker_entry(void *p)
     if (getenv("OCERZ_THREADLOG"))
         fprintf(stderr, "ocerz: THREADDONE[%d] cpu#%u rip=%#llx rc=%d\n",
                 (int)getpid(), w->cpu.cpu_number, (unsigned long long)w->cpu.rip, wrc);
+    extern char ocerz_cmdline_summary[];
     if (wrc == 125) {
-        fprintf(stderr, "ocerz: fatal on guest thread cpu#%u; exiting process\n",
-                w->cpu.cpu_number);
+        fprintf(stderr, "ocerz: fatal on guest thread cpu#%u; exiting process %d \"%s\"\n",
+                w->cpu.cpu_number, (int)getpid(), ocerz_cmdline_summary);
         exit(125);
     }
     if (w->counts_wq && w->cpu.wq_returned && !w->vm->exited) {
         wrc = ocerz_wq_run_exit(w->vm, &w->cpu, w->cpu.gs_base - 0xe0, kp);
         if (wrc == 125) {
-            fprintf(stderr, "ocerz: fatal on guest thread cpu#%u; exiting process\n",
-                    w->cpu.cpu_number);
+            fprintf(stderr, "ocerz: fatal on guest thread cpu#%u; exiting process %d \"%s\"\n",
+                    w->cpu.cpu_number, (int)getpid(), ocerz_cmdline_summary);
             exit(125);
         }
     }
@@ -6922,11 +6945,17 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                 }
                 if (!sdst)
                     sdst = (uint32_t)a[3];
-                fprintf(stderr, "ocerz: MSGSPIN[%d] n=%llu cpu#%u opt=%#llx kr=%#llx rcvname=%#llx rcvsz=%#llx timeout=%llu sid=%u sdst=%#x",
+                uint32_t rid = 0;
+                if ((a[1] & 0x2) && r47 == 0 && reply_buf) {
+                    uint64_t rb = vector_mode ? ocerz_ld(reply_buf + 8, 8) : reply_buf;
+                    if (rb && ocerz_addr_readable(rb + 0x14))
+                        rid = (uint32_t)ocerz_ld(rb + 0x14, 4);
+                }
+                fprintf(stderr, "ocerz: MSGSPIN[%d] n=%llu cpu#%u opt=%#llx kr=%#llx rcvname=%#llx rcvsz=%#llx timeout=%llu sid=%u sdst=%#x rid=%u",
                         (int)getpid(), (unsigned long long)msn, cpu->cpu_number,
                         (unsigned long long)a[1], (unsigned long long)r47,
                         (unsigned long long)a[5], (unsigned long long)a[6],
-                        (unsigned long long)a[7], sid, sdst);
+                        (unsigned long long)a[7], sid, sdst, rid);
                 uint64_t sp = cpu->gpr[OCERZ_RSP], fp = cpu->gpr[5];
                 if (sp && ocerz_addr_committed(sp) == 1)
                     fprintf(stderr, " bt=%#llx", (unsigned long long)ocerz_ld(sp, 8));

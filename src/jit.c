@@ -12065,18 +12065,21 @@ void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
 static void **ras_slot_alloc(void);
 static void pending_add_ras(uint64_t target_key, void **ras_slot);
 static uint64_t g_fps_frames;
+static uint64_t g_fps_start;
 
 static void *fps_report(void *arg)
 {
     uint64_t last = __atomic_load_n(&g_fps_frames, __ATOMIC_RELAXED);
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    g_fps_start = t0;
     for (;;) {
         usleep(1000000);
         uint64_t now = __atomic_load_n(&g_fps_frames, __ATOMIC_RELAXED);
         uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (now != last)
-            fprintf(stderr, "ocerz: FPS[%d] %.1f\n", (int)getpid(),
-                    (double)(now - last) * 1e9 / (double)(t1 - t0));
+            fprintf(stderr, "ocerz: FPS[%d] %.1f t=%.1f\n", (int)getpid(),
+                    (double)(now - last) * 1e9 / (double)(t1 - t0),
+                    (double)(t1 - g_fps_start) / 1e9);
         last = now;
         t0 = t1;
     }
