@@ -24,5 +24,21 @@ int main(void) {
             "pcmpistri $0x0c, %%xmm2, %%xmm1; movq %%rcx, %0"
             : "=r"(idx) : "m"(nee), "m"(hay) : "rcx", "xmm1", "xmm2");
     g_puts("substr "); g_putu64(idx); g_puts("\n");
+
+    __attribute__((aligned(16))) char pat[16] = "%language%";
+    __attribute__((aligned(16))) char blk[16] = {'0','1','2','3','4','5','6','7','8','9','a','%','l','a','n','g'};
+    __asm__("movdqa %1, %%xmm1; movdqa %2, %%xmm2;"
+            "pcmpistri $0x0c, %%xmm2, %%xmm1; movq %%rcx, %0"
+            : "=r"(idx) : "m"(pat), "m"(blk) : "rcx", "xmm1", "xmm2");
+    g_puts("tail "); g_putu64(idx); g_puts("\n");
+    __asm__("movdqa %1, %%xmm1; movdqa %2, %%xmm2; movl $10, %%eax; movl $16, %%edx;"
+            "pcmpestri $0x0c, %%xmm2, %%xmm1; movq %%rcx, %0"
+            : "=r"(idx) : "m"(pat), "m"(blk) : "rax", "rcx", "rdx", "xmm1", "xmm2");
+    g_puts("tail explicit "); g_putu64(idx); g_puts("\n");
+    __attribute__((aligned(16))) char none[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
+    __asm__("movdqa %1, %%xmm1; movdqa %2, %%xmm2;"
+            "pcmpistri $0x0c, %%xmm2, %%xmm1; movq %%rcx, %0"
+            : "=r"(idx) : "m"(pat), "m"(none) : "rcx", "xmm1", "xmm2");
+    g_puts("absent "); g_putu64(idx); g_puts("\n");
     return 0;
 }

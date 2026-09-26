@@ -15,9 +15,15 @@
  * The pcmpXstrY string units follow the architectural imm8 layout directly
  * ([1:0] element format, [3:2] aggregation, [5:4] polarity, [6] index/mask
  * selection) rather than enumerating the named mnemonics, and the horizontal
- * adds are summed in the pairwise order the SDM specifies.  The JIT does not
- * translate VEX at all, so everything here is also the only implementation
- * those instructions have.
+ * adds are summed in the pairwise order the SDM specifies.  Equal-ordered
+ * aggregation compares the needle only as far as the end of the 16-byte block,
+ * so a match that starts near the end counts as a partial match there - SSE4.2
+ * strstr relies on it to find a needle that straddles two blocks.  ocerz used to
+ * call that a mismatch, so Steam never found "%language%" in the path
+ * "public\\steambootstrapper_%language%.txt", loaded no localization and
+ * stopped on an assert right after logging in; sse42_test's "tail" cases pin
+ * it.  The JIT does not translate VEX at all, so everything here is also the
+ * only implementation those instructions have.
  */
 #include "ocerz/interp_common.h"
 
@@ -1249,7 +1255,7 @@ static int do_pcmpstr(OcerzCPU *cpu, const X86Insn *insn)
             break;
         default:
             bit = 1;
-            for (int i = 0; i < la; i++) {
+            for (int i = 0; i < la && j + i < n; i++) {
                 if (j + i >= lb) { bit = 0; break; }
                 str_elem(&a, i, words, sgn, &ea);
                 str_elem(&b, j + i, words, sgn, &eb);
