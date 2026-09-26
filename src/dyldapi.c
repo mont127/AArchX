@@ -68,6 +68,15 @@
  * The slot used to write the length back on success as well, which an arm64
  * build of the same program never sees; the app_bundle native case compares the
  * two.
+ *
+ * Which image holds an address - asked by _dyld_find_unwind_sections once for
+ * every frame an exception unwinds through, and by the image-containing-address
+ * slots - is answered from a sorted table of every mapped segment of the
+ * closure and the cache, searched by bisection, with a running maximum of the
+ * segment ends so overlapping ranges are still found.  It used to walk the load
+ * commands of each closure image and then of all 3609 cache images per call.
+ * The table is rebuilt when the closure changes, and a segment with no
+ * protection at all, __PAGEZERO, is left out of it.
  */
 #include "ocerz/dyldapi.h"
 #include "ocerz/leaf.h"
@@ -492,37 +501,107 @@ static uint64_t cache_find_canonical(const char *path, const char **cache_path)
     return 0;
 }
 
-static int image_covers(uint64_t mh, uint64_t addr)
+typedef struct {
+    uint64_t lo, hi, mh;
+} PcRange;
+
+typedef struct {
+    PcRange *r;
+    uint64_t *maxhi;
+    size_t n;
+    int closure_n;
+    uint64_t *closure_mh;
+} PcIndex;
+
+static PcIndex *g_pcidx;
+static pthread_mutex_t g_pcidx_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int pcrange_cmp(const void *a, const void *b)
+{
+    const PcRange *x = a, *y = b;
+    return x->lo < y->lo ? -1 : x->lo > y->lo;
+}
+
+static size_t pcidx_add_image(PcRange **r, size_t n, size_t *cap, uint64_t mh)
 {
     const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
     if (!mh || h->magic != MH_MAGIC_64)
-        return 0;
+        return n;
     uint64_t slide = image_slide(mh);
     const uint8_t *lc = (const uint8_t *)(h + 1);
     for (uint32_t i = 0; i < h->ncmds; i++) {
         const struct load_command *l = (const void *)lc;
         if (l->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *s = (const void *)lc;
-            uint64_t lo = s->vmaddr + slide;
-            if (s->vmsize && addr >= lo && addr < lo + s->vmsize)
-                return 1;
+            const struct segment_command_64 *sg = (const void *)lc;
+            if (sg->vmsize && (sg->initprot || sg->maxprot)) {
+                if (n == *cap) {
+                    *cap = *cap ? *cap * 2 : 16384;
+                    PcRange *nr = realloc(*r, *cap * sizeof **r);
+                    if (!nr)
+                        return n;
+                    *r = nr;
+                }
+                (*r)[n].lo = sg->vmaddr + slide;
+                (*r)[n].hi = sg->vmaddr + slide + sg->vmsize;
+                (*r)[n].mh = mh;
+                n++;
+            }
         }
         lc += l->cmdsize;
     }
-    return 0;
+    return n;
+}
+
+static const PcIndex *pcidx_current(void)
+{
+    PcIndex *cur = __atomic_load_n(&g_pcidx, __ATOMIC_ACQUIRE);
+    if (cur && cur->closure_n == g_closure_n && cur->closure_mh == g_closure_mh)
+        return cur;
+    pthread_mutex_lock(&g_pcidx_lock);
+    cur = g_pcidx;
+    if (!cur || cur->closure_n != g_closure_n || cur->closure_mh != g_closure_mh) {
+        PcIndex *ni = calloc(1, sizeof *ni);
+        if (ni) {
+            size_t n = 0, cap = 0;
+            PcRange *r = NULL;
+            ni->closure_n = g_closure_n;
+            ni->closure_mh = g_closure_mh;
+            for (int i = 0; i < g_closure_n; i++)
+                n = pcidx_add_image(&r, n, &cap, g_closure_mh[i]);
+            if (g_cache)
+                for (uint32_t i = 0; i < g_cache->images_cnt; i++)
+                    n = pcidx_add_image(&r, n, &cap, ocerz_cache_image_addr(g_cache, i, NULL));
+            if (n)
+                qsort(r, n, sizeof *r, pcrange_cmp);
+            ni->maxhi = n ? malloc(n * sizeof *ni->maxhi) : NULL;
+            for (size_t i = 0; ni->maxhi && i < n; i++)
+                ni->maxhi[i] = i && ni->maxhi[i - 1] > r[i].hi ? ni->maxhi[i - 1] : r[i].hi;
+            ni->r = r;
+            ni->n = ni->maxhi || !n ? n : 0;
+            __atomic_store_n(&g_pcidx, ni, __ATOMIC_RELEASE);
+            cur = ni;
+        }
+    }
+    pthread_mutex_unlock(&g_pcidx_lock);
+    return cur;
 }
 
 static uint64_t image_for_pc(uint64_t pc)
 {
-    for (int i = 0; i < g_closure_n; i++)
-        if (image_covers(g_closure_mh[i], pc))
-            return g_closure_mh[i];
-    if (g_cache)
-        for (uint32_t i = 0; i < g_cache->images_cnt; i++) {
-            uint64_t mh = ocerz_cache_image_addr(g_cache, i, NULL);
-            if (mh && image_covers(mh, pc))
-                return mh;
-        }
+    const PcIndex *ix = pcidx_current();
+    if (!ix || !ix->n)
+        return 0;
+    size_t lo = 0, hi = ix->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (ix->r[mid].lo <= pc)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    for (size_t k = lo; k > 0 && ix->maxhi[k - 1] > pc; k--)
+        if (pc < ix->r[k - 1].hi)
+            return ix->r[k - 1].mh;
     return 0;
 }
 
