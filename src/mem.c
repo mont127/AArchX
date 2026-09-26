@@ -32,6 +32,15 @@
  * elsewhere calls NULL - Steam's CEF children died that way (2026-09-06).  The
  * value is identical in every process, so the slot is left alone.
  *
+ * That holds only while ntdll.so loads at the same address everywhere, so a
+ * Wine process reserves its identity arena at the fixed base
+ * OCERZ_WINE_ARENA_BASE, falling back to the usual placement only if that
+ * range is taken.  With the arena wherever the host put it, each process
+ * stored a dispatcher address the others had never mapped, and whichever
+ * process wrote the shared slot last sent every other one's syscalls into
+ * unmapped memory - Wine's notepad died that way while wineboot was still
+ * starting services.
+ *
  * A guest mmap(MAP_FIXED) that comes back ENOMEM is indistinguishable from real
  * memory pressure inside the guest, and Chromium's allocator treats a refused
  * 4 KB commit as out-of-memory, so OCERZ_MAPFAILLOG names which test in the
@@ -1219,10 +1228,20 @@ int ocerz_mem_init(uint64_t lo, uint64_t hi)
     return OCERZ_OK;
 }
 
+int ocerz_wine_process;
+
 int ocerz_mem_init_identity(uint64_t size)
 {
-
-    void *p = mmap((void *)OCERZ_LOW_LIMIT, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *p = MAP_FAILED;
+    if (ocerz_wine_process) {
+        p = mmap((void *)OCERZ_WINE_ARENA_BASE, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p != MAP_FAILED && (uint64_t)(uintptr_t)p != OCERZ_WINE_ARENA_BASE) {
+            munmap(p, (size_t)size);
+            p = MAP_FAILED;
+        }
+    }
+    if (p == MAP_FAILED)
+        p = mmap((void *)OCERZ_LOW_LIMIT, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) {
         OCERZ_FATAL("could not reserve a %#llx-byte identity arena\n", (unsigned long long)size);
         return OCERZ_ENOMEM;

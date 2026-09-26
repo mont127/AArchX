@@ -17,6 +17,9 @@
  * only the processes whose command line matches, and since the environment
  * inherits through Wine's exec chain that singles one process out for the
  * full-visibility interpreter while the rest stay on the JIT.
+ * OCERZ_STRACE_EXE turns on the syscall trace the same way, for one process of
+ * Wine's tree instead of all of them.  A process whose loader is named wine is
+ * marked as one of Wine's, which fixes the base of its memory arena (see mem.c).
  *
  * The third decision is which universe the guest binds against.  -native and
  * -cache pick the mode outright and the last one on the command line wins;
@@ -115,6 +118,7 @@ static void apply_wine_defaults(const char *path)
         "/AppKit.framework/,/QuartzCore.framework/,/HIToolbox.framework/,/CoreSpotlight.framework/";
     if (!is_wine_loader(path))
         return;
+    ocerz_wine_process = 1;
     const char *preload = getenv("OCERZ_PRELOAD_OBJC");
     if (!preload || strcmp(preload, "1") == 0)
         setenv("OCERZ_PRELOAD_OBJC", objc_images, 1);
@@ -324,6 +328,12 @@ int main(int argc, char **argv)
     vm.trace = trace;
     vm.strace = strace;
     vm.jit_enabled = !nojit && getenv("OCERZ_NOJIT") == NULL;
+    {
+        const char *sx = getenv("OCERZ_STRACE_EXE");
+        extern char ocerz_cmdline_summary[];
+        if (sx && *sx && strstr(ocerz_cmdline_summary, sx))
+            vm.strace = 1;
+    }
     {
         const char *nx = getenv("OCERZ_NOJIT_EXE");
         extern char ocerz_cmdline_summary[];
