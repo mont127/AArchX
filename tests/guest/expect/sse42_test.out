@@ -4,3 +4,9 @@ mismatch 14
 
 substr 12
 
+tail 11
+
+tail explicit 11
+
+absent 16
+
