@@ -733,6 +733,31 @@ const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out)
     return best->install_name[0] ? best->install_name : best->path;
 }
 
+const char *ocerz_dyld_image_overlapping(uint64_t lo, uint64_t hi, int exec_only, uint64_t *base_out)
+{
+    for (int i = 0; i < g_dimgs_n; i++) {
+        const DynImage *d = &g_dimgs[i];
+        if (!d->slice || d->is_virtual)
+            continue;
+        const uint8_t *mh = d->slice;
+        uint32_t ncmds = rd32(mh + 16);
+        const uint8_t *lc = mh + sizeof(struct mach_header_64);
+        for (uint32_t k = 0; k < ncmds; k++) {
+            if (rd32(lc) == LC_SEGMENT_64 && rd64(lc + 32) && rd32(lc + 60) &&
+                (!exec_only || (rd32(lc + 60) & VM_PROT_EXECUTE))) {
+                uint64_t slo = rd64(lc + 24) + d->slide, shi = slo + rd64(lc + 32);
+                if (lo < shi && hi > slo) {
+                    if (base_out)
+                        *base_out = d->load_base;
+                    return d->install_name[0] ? d->install_name : d->path;
+                }
+            }
+            lc += rd32(lc + 4);
+        }
+    }
+    return NULL;
+}
+
 const char *ocerz_dyld_main_path(void)
 {
     return g_main_hostpath[0] ? g_main_hostpath : NULL;
@@ -3662,7 +3687,7 @@ uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
     protect_ro_flush();
     pthread_mutex_unlock(&g_load_lock);
     if (getenv("OCERZ_DLOPENLOG"))
-        fprintf(stderr, "ocerz: DLOPEN \"%s\" -> %#llx%s%s\n", hostpath ? hostpath : "(null)", (unsigned long long)r,
+        fprintf(stderr, "ocerz: DLOPEN[%d] \"%s\" -> %#llx%s%s\n", (int)getpid(), hostpath ? hostpath : "(null)", (unsigned long long)r,
                 (!r && g_dlerror_g) ? " err=" : "", (!r && g_dlerror_g) ? (const char *)ocerz_g2h(g_dlerror_g) : "");
     return r;
 }

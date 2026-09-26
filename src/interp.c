@@ -54,9 +54,12 @@
  * exception name, reason and throw-site chain straight out of guest memory,
  * falling back to raw words so an unfamiliar string class is still decodable by
  * hand rather than lost.  OCERZ_REGTRAP dumps every register at chosen guest
- * addresses (with OCERZ_REGTRAP_DEREF for the memory behind them, because a
- * heap address is never the same twice and a watch cannot be aimed at it in a
- * later run), OCERZ_RIPTRAP is the older fixed-field form, and OCERZ_V8DUMP
+ * addresses, prefixed by the frame-pointer return chain that got there (with
+ * OCERZ_REGTRAP_DEREF for the memory behind them, because a heap address is
+ * never the same twice and a watch cannot be aimed at it in a later run, and
+ * OCERZ_REGTRAP_MAX to stop after that many hits, since a trap on a recursing
+ * function otherwise prints until the stack runs out), OCERZ_RIPTRAP is the
+ * older fixed-field form, and OCERZ_V8DUMP
  * reads V8's Ignition dispatch table and bytecode header.  These are interpreter
  * only, so they are paired with OCERZ_INTERP_LO/HI to bring chosen code here.
  */
@@ -1488,8 +1491,11 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
     {
         static uint64_t rtr[8];
         static int nrtr = -1;
+        static long rtr_left = -1;
         if (nrtr < 0) {
             const char *e = getenv("OCERZ_REGTRAP");
+            const char *mx = getenv("OCERZ_REGTRAP_MAX");
+            rtr_left = mx ? strtol(mx, NULL, 0) : -1;
             nrtr = 0;
             while (e && *e && nrtr < 8) {
                 rtr[nrtr++] = strtoull(e, NULL, 0);
@@ -1497,9 +1503,23 @@ int ocerz_interp_step(struct OcerzVM *vm, OcerzCPU *cpu)
                 if (e) e++;
             }
         }
-        for (int ti = 0; ti < nrtr; ti++)
+        for (int ti = 0; ti < nrtr && rtr_left != 0; ti++)
             if (rtr[ti] && cpu->rip == rtr[ti]) {
-                fprintf(stderr, "ocerz: REGTRAP rip=%#llx\n", (unsigned long long)cpu->rip);
+                if (rtr_left > 0)
+                    rtr_left--;
+                fprintf(stderr, "ocerz: REGTRAP[%d] rip=%#llx ret-chain: %#llx", (int)getpid(),
+                        (unsigned long long)cpu->rip,
+                        (unsigned long long)(ocerz_addr_readable(cpu->gpr[OCERZ_RSP])
+                                             ? ocerz_ld(cpu->gpr[OCERZ_RSP], 8) : 0));
+                for (uint64_t fp = cpu->gpr[OCERZ_RBP], d = 0;
+                     d < 40 && fp >= 0x10000 && ocerz_addr_readable(fp) && ocerz_addr_readable(fp + 8); d++) {
+                    fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+                    uint64_t nf = ocerz_ld(fp, 8);
+                    if (nf <= fp)
+                        break;
+                    fp = nf;
+                }
+                fprintf(stderr, "\n");
                 ocerz_cpu_dump(cpu, stderr);
                 if (getenv("OCERZ_REGTRAP_DEREF")) {
                     static const char *const rn[16] = {
