@@ -47,6 +47,7 @@ int ocerz_peek_dynamic(const char *path);
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp);
 
 uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode);
+uint64_t ocerz_dlopen_from(struct OcerzVM *vm, const char *hostpath, int mode, uint64_t caller);
 uint64_t ocerz_dlsym(uint64_t handle, const char *sym);
 int ocerz_dlclose(uint64_t handle);
 uint64_t ocerz_dlerror(void);

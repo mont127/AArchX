@@ -127,6 +127,17 @@
  * process then died in objc_msgSend.  The dynamic test dlopen_objc_core pins
  * it; OCERZ_NO_DLOPEN_UPWARD=1 turns it off.
  *
+ * A dlopen path that begins with @ is resolved against the image that called
+ * dlopen, as dyld does: @rpath through that image's LC_RPATHs and then the
+ * main executable's, @loader_path against its directory.  The caller is the
+ * return address of the dlopen slot, or dlopen_from's third argument.  The
+ * path used to go to the loader as written, so it only ever worked relative to
+ * nothing; the Game Porting Toolkit's libd3dshared.dylib dlopens
+ * @rpath/D3DMetal.framework through its own @loader_path rpath, failed, and
+ * aborted every D3DMetal game at its first Direct3D call.  The dynamic test
+ * dlopen_caller_rpath pins it; OCERZ_NO_DLOPEN_CALLER_RPATH=1 restores the old
+ * behaviour.
+ *
  * ---- thread-local variables ----
  * Two descriptor layouts share the same 24 bytes.  A static linker emits the
  * classic tlv_descriptor { thunk, key:u64, offset:u64 }, so the offset is at
@@ -152,8 +163,11 @@
  * corrupted signaled flags, and the explorer sync freeze.
  *
  * OCERZ_DLOPEN_PIGGYBACK loads a chosen dylib, guest initializers and all,
- * right after the first dlopen whose path matches - a probe placed inside the
- * real process, on the same thread, at the same point in its life.
+ * right after the first successful dlopen whose path, as the caller wrote it,
+ * matches - a probe placed inside the real process, on the same thread, at the
+ * same point in its life.  It fires for shared-cache images too, which is how
+ * a CGL probe was walked through Wine's process start to show that the only
+ * thing that mattered was the stack CGL first ran on.
  *
  * ---- the executable's own identity ----
  * The main-executable path is realpath()'d so the guest always sees an
@@ -754,28 +768,47 @@ const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out)
     return best->install_name[0] ? best->install_name : best->path;
 }
 
+static int dimg_segments_overlap(const DynImage *d, uint64_t lo, uint64_t hi, int exec_only)
+{
+    if (!d->slice || d->is_virtual)
+        return 0;
+    const uint8_t *mh = d->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t k = 0; k < ncmds; k++) {
+        if (rd32(lc) == LC_SEGMENT_64 && rd64(lc + 32) && rd32(lc + 60) &&
+            (!exec_only || (rd32(lc + 60) & VM_PROT_EXECUTE))) {
+            uint64_t slo = rd64(lc + 24) + d->slide, shi = slo + rd64(lc + 32);
+            if (lo < shi && hi > slo)
+                return 1;
+        }
+        lc += rd32(lc + 4);
+    }
+    return 0;
+}
+
 const char *ocerz_dyld_image_overlapping(uint64_t lo, uint64_t hi, int exec_only, uint64_t *base_out)
 {
     for (int i = 0; i < g_dimgs_n; i++) {
         const DynImage *d = &g_dimgs[i];
-        if (!d->slice || d->is_virtual)
-            continue;
-        const uint8_t *mh = d->slice;
-        uint32_t ncmds = rd32(mh + 16);
-        const uint8_t *lc = mh + sizeof(struct mach_header_64);
-        for (uint32_t k = 0; k < ncmds; k++) {
-            if (rd32(lc) == LC_SEGMENT_64 && rd64(lc + 32) && rd32(lc + 60) &&
-                (!exec_only || (rd32(lc + 60) & VM_PROT_EXECUTE))) {
-                uint64_t slo = rd64(lc + 24) + d->slide, shi = slo + rd64(lc + 32);
-                if (lo < shi && hi > slo) {
-                    if (base_out)
-                        *base_out = d->load_base;
-                    return d->install_name[0] ? d->install_name : d->path;
-                }
-            }
-            lc += rd32(lc + 4);
+        if (dimg_segments_overlap(d, lo, hi, exec_only)) {
+            if (base_out)
+                *base_out = d->load_base;
+            return d->install_name[0] ? d->install_name : d->path;
         }
     }
+    return NULL;
+}
+
+static DynImage *dimg_containing(uint64_t addr)
+{
+    if (!addr)
+        return NULL;
+    for (int i = 0; i < g_dimgs_n; i++)
+        if (dimg_segments_overlap(&g_dimgs[i], addr, addr + 1, 0))
+            return &g_dimgs[i];
+    if (g_main_dimg_valid && dimg_segments_overlap(&g_main_dimg, addr, addr + 1, 0))
+        return &g_main_dimg;
     return NULL;
 }
 
@@ -3586,8 +3619,31 @@ static int resolve_bare_soname(const char *name, char *out, size_t n)
 
 #define ROSETTA_CRYPTEX "/System/Volumes/Preboot/Cryptexes/Rosetta"
 
-static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int mode)
+static RpathList *ndl_rpaths(DynImage *caller);
+
+static const char *dlopen_expand_at(const char *p, uint64_t caller, char *out, size_t n)
 {
+    DynImage *c = dimg_containing(caller);
+    if (strncmp(p, "@rpath/", 7) == 0) {
+        RpathList *rp = ndl_rpaths(c);
+        const char *hit = NULL;
+        for (int i = 0; rp && i < rp->n && !hit; i++) {
+            if (snprintf(out, n, "%s/%s", rp->entry[i], p + 7) >= (int)n)
+                continue;
+            if (access(out, F_OK) == 0 || dimg_find_by_path(out) || dep_find(g_run_cache, out))
+                hit = out;
+        }
+        free(rp);
+        return hit ? hit : p;
+    }
+    return expand_at_prefix(c, p, out, n) ? out : p;
+}
+
+static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int mode, uint64_t caller)
+{
+    char atpath[PATH_MAX];
+    if (hostpath && hostpath[0] == '@' && !getenv("OCERZ_NO_DLOPEN_CALLER_RPATH"))
+        hostpath = dlopen_expand_at(hostpath, caller, atpath, sizeof atpath);
     if (!g_run_cache) {
         dlerror_set("dlopen: runtime loader not initialized", NULL);
         return 0;
@@ -3713,38 +3769,48 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
     }
     if (g_dlerror_g)
         ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
-    {
-        static char pig_key[256], pig_lib[1024];
-        static int pig = -1, pig_done;
-        if (pig < 0) {
-            const char *e = getenv("OCERZ_DLOPEN_PIGGYBACK");
-            pig = 0;
-            if (e) {
-                const char *c = strchr(e, ':');
-                if (c && (size_t)(c - e) < sizeof pig_key && strlen(c + 1) < sizeof pig_lib) {
-                    memcpy(pig_key, e, (size_t)(c - e)); pig_key[c - e] = '\0';
-                    strcpy(pig_lib, c + 1);
-                    pig = 1;
-                }
+    return d->load_base;
+}
+
+static void dlopen_piggyback(struct OcerzVM *vm, const char *path)
+{
+    static char pig_key[256], pig_lib[1024];
+    static int pig = -1, pig_done;
+    if (pig < 0) {
+        const char *e = getenv("OCERZ_DLOPEN_PIGGYBACK");
+        pig = 0;
+        if (e) {
+            const char *c = strchr(e, ':');
+            if (c && (size_t)(c - e) < sizeof pig_key && strlen(c + 1) < sizeof pig_lib) {
+                memcpy(pig_key, e, (size_t)(c - e)); pig_key[c - e] = '\0';
+                strcpy(pig_lib, c + 1);
+                pig = 1;
             }
         }
-        if (pig && !pig_done && loadpath && strstr(loadpath, pig_key)) {
-            pig_done = 1;
-            fprintf(stderr, "ocerz: PIGGYBACK[%d] after \"%s\": dlopen \"%s\"\n",
-                    (int)getpid(), loadpath, pig_lib);
-            uint64_t pb = ocerz_dlopen_inner(vm, pig_lib, 2);
-            fprintf(stderr, "ocerz: PIGGYBACK[%d] -> %#llx\n", (int)getpid(), (unsigned long long)pb);
-        }
     }
-    return d->load_base;
+    if (pig && !pig_done && path && strstr(path, pig_key)) {
+        pig_done = 1;
+        fprintf(stderr, "ocerz: PIGGYBACK[%d] after \"%s\": dlopen \"%s\"\n",
+                (int)getpid(), path, pig_lib);
+        uint64_t pb = ocerz_dlopen_inner(vm, pig_lib, 2, 0);
+        fprintf(stderr, "ocerz: PIGGYBACK[%d] -> %#llx\n", (int)getpid(), (unsigned long long)pb);
+    }
 }
 
 uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode)
 {
+    return ocerz_dlopen_from(vm, hostpath, mode, 0);
+}
+
+uint64_t ocerz_dlopen_from(struct OcerzVM *vm, const char *hostpath, int mode, uint64_t caller)
+{
     if (getenv("OCERZ_DLOPENLOG"))
-        fprintf(stderr, "ocerz: DLOPEN \"%s\" mode=%#x\n", hostpath ? hostpath : "(null)", mode);
+        fprintf(stderr, "ocerz: DLOPEN \"%s\" mode=%#x caller=%#llx\n", hostpath ? hostpath : "(null)", mode,
+                (unsigned long long)caller);
     pthread_mutex_lock(&g_load_lock);
-    uint64_t r = ocerz_dlopen_inner(vm, hostpath, mode);
+    uint64_t r = ocerz_dlopen_inner(vm, hostpath, mode, caller);
+    if (r && !vm->exited)
+        dlopen_piggyback(vm, hostpath);
     protect_ro_flush();
     pthread_mutex_unlock(&g_load_lock);
     if (getenv("OCERZ_DLOPENLOG"))
