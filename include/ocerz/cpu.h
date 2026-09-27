@@ -153,6 +153,7 @@ typedef struct OcerzCPU {
     int wq_returned;
     const int *bridge_depth;
     const int *jit_lock_depth;
+    uint64_t slow_op;
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256
