@@ -38,7 +38,7 @@ trap 'rm -rf "$W"' EXIT
 OBJS=$(ls "$TREE"/src/*.o | grep -v '/main\.o$')
 
 clang -arch arm64 -std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter \
-      -I"$TREE/include" -o "$W/diff32" "$HERE/diff32.c" $OBJS
+      -I"$TREE/include" -o "$W/diff32" "$HERE/diff32.c" $OBJS -lcompression
 
 case " $* " in
     *" --selftest "*|*" --list "*|*" --help "*) ;;

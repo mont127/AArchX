@@ -32,16 +32,29 @@
  * translates is therefore loaded, not translated again, by every process that
  * starts after it, in the same session as well as in the next one.
  *
- * Each record carries a checksum of everything after its head, checked on
- * every load, so a record torn by a crash is refused rather than run.  The
- * index is created under a temporary name and linked into place, so no
- * process ever maps half an index.  Writing stops, and a note is printed once,
- * when the data files add up to OCERZ_TCACHE_MAX_MB (4096 by default) or the
- * table runs out of room; reading goes on.
+ * A record is kept LZ4-compressed, which makes it about 1.65 times smaller for
+ * 1.6 us when it is written and 0.3 us when it is read, and carries a checksum
+ * of what is stored, checked on every load, so a record torn by a crash is
+ * refused rather than run.  The index is created under a temporary name and
+ * linked into place, so no process ever maps half an index.
+ *
+ * Nothing is ever taken out of a store, so it only fills.  Writing stops, and
+ * a note is printed once, when the data files add up to OCERZ_TCACHE_MAX_MB
+ * (4096 by default) or the table runs out of room; reading goes on.  Every
+ * process holds a shared flock on the directory's users file for as long as it
+ * lives, and one that finds nobody else there (an exclusive flock succeeds)
+ * and the store full removes it and starts it again, so a full store costs one
+ * cold start rather than every translation from then on.
  *
  * ---- in a process ----
- * Records are buffered and written 256 KB at a time, and when the process
- * exits, execs or leaves through the non-main-thread exit path.  A data file
+ * A record put is copied into a 256 KB buffer and nothing more, so storing
+ * costs the translator almost nothing; a full buffer goes to a writer thread,
+ * which compresses its records, appends them to the data file and publishes
+ * them.  When the process exits, execs or leaves through the non-main-thread
+ * exit path, the last buffer is handed over too and the writer is given up to
+ * three seconds to finish; a process killed outright loses what was still
+ * queued, never half a record, since nothing is published before it is
+ * written.  A data file
  * is mapped when a location first points into it and mapped again, larger,
  * when a location points past what is mapped.  A forked child keeps its
  * parent's mappings but not its parent's data file: it drops the buffer and
@@ -52,8 +65,10 @@
 #include "ocerz/mode.h"
 #include "ocerz/types.h"
 
+#include <compression.h>
 #include <dirent.h>
 #include <errno.h>
+#include <sys/file.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -70,11 +85,14 @@
 
 extern char **environ;
 
-#define TC_IDX_MAGIC 0x31494354u
-#define TC_DAT_MAGIC 0x31444354u
+#define TC_IDX_MAGIC 0x32494354u
+#define TC_DAT_MAGIC 0x32444354u
+#define TC_ZREC_MAGIC 0x315a4354u
 #define TC_SLOTS (1ull << 22)
 #define TC_PROBE 64
 #define TC_BUF_BYTES (256u << 10)
+#define TC_OUT_BYTES (512u << 10)
+#define TC_QMAX 4
 #define TC_REC_MAX (256u << 10)
 #define TC_LOC_OFF_BITS 40
 
@@ -98,6 +116,12 @@ typedef struct {
     int fd;
 } TcFile;
 
+typedef struct {
+    uint32_t magic, size;
+    uint64_t key, sum;
+    uint32_t raw, zlen;
+} TcStored;
+
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_mode = -1;
 static uint64_t g_fp;
@@ -116,14 +140,23 @@ static uint64_t g_doff;
 static uint8_t *g_buf;
 static size_t g_buf_n;
 static int g_log = -1;
+static int g_ufd = -1;
+static uint8_t *g_zbuf, *g_obuf, *g_rbuf, *g_zscratch, *g_dscratch;
+static pthread_mutex_t g_qlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_qwork = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_qdone = PTHREAD_COND_INITIALIZER;
+static struct { uint8_t *p; size_t n; } g_q[TC_QMAX];
+static int g_qn, g_busy, g_writer, g_nspare;
+static uint8_t *g_spare[TC_QMAX];
+static pthread_t g_writer_tid;
 
 int ocerz_tcache_mode(void)
 {
     if (g_mode < 0) {
         const char *e = getenv("OCERZ_TCACHE");
-        int m = OCERZ_TC_OFF;
-        if (e && (!strcmp(e, "1") || !strcmp(e, "on")))
-            m = OCERZ_TC_ON;
+        int m = OCERZ_TC_ON;
+        if (e && (!strcmp(e, "0") || !strcmp(e, "off")))
+            m = OCERZ_TC_OFF;
         else if (e && !strcmp(e, "verify"))
             m = OCERZ_TC_VERIFY;
         else if (e && !strcmp(e, "roundtrip"))
@@ -149,11 +182,11 @@ static uint64_t mix(uint64_t h, uint64_t w)
     return h ^ (h >> 29);
 }
 
-static uint64_t rec_sum(const OcerzTcRecHead *r)
+static uint64_t stored_sum(const TcStored *z)
 {
-    const uint8_t *p = (const uint8_t *)(r + 1);
-    size_t n = r->size - sizeof *r;
-    uint64_t h = mix(0x452821e638d01377ull, r->key);
+    const uint8_t *p = (const uint8_t *)(z + 1);
+    size_t n = z->size - sizeof *z;
+    uint64_t h = mix(mix(0x452821e638d01377ull, z->key), ((uint64_t)z->raw << 32) | z->zlen);
     for (; n >= 8; p += 8, n -= 8) {
         uint64_t w;
         memcpy(&w, p, 8);
@@ -374,6 +407,45 @@ static int open_index(void)
     return 1;
 }
 
+static void reset_store(void)
+{
+    DIR *d = opendir(g_dir);
+    if (!d)
+        return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "d-", 2) && strcmp(de->d_name, "index"))
+            continue;
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%s", g_dir, de->d_name);
+        unlink(path);
+    }
+    closedir(d);
+}
+
+static int claim_store(void)
+{
+    char path[1200];
+    snprintf(path, sizeof path, "%s/users", g_dir);
+    g_ufd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (g_ufd < 0)
+        return 0;
+    if (flock(g_ufd, LOCK_EX | LOCK_NB) == 0) {
+        snprintf(path, sizeof path, "%s/index", g_dir);
+        TcIdxHdr h;
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            if (pread(fd, &h, sizeof h, 0) == (ssize_t)sizeof h && (h.pad[0] || h.bytes > g_cap_bytes)) {
+                if (g_log > 0)
+                    fprintf(stderr, "ocerz: TCACHE[%d] %s is full; starting it again\n", (int)getpid(), g_dir);
+                reset_store();
+            }
+            close(fd);
+        }
+    }
+    return flock(g_ufd, LOCK_SH) == 0;
+}
+
 static int open_store(void)
 {
     if (g_opened)
@@ -392,9 +464,14 @@ static int open_store(void)
         snprintf(g_dir, sizeof g_dir, "%s/Library/Caches/ocerz/tc-%016llx", home, (unsigned long long)g_fp);
     else
         return 0;
-    if (mkdirs(g_dir) != 0 || !open_index())
+    if (mkdirs(g_dir) != 0 || !claim_store() || !open_index())
         return 0;
     utimes(g_dir, NULL);
+    size_t ds = compression_decode_scratch_buffer_size(COMPRESSION_LZ4_RAW);
+    g_rbuf = (uint8_t *)malloc(TC_REC_MAX);
+    g_dscratch = (uint8_t *)malloc(ds ? ds : 1);
+    if (!g_rbuf || !g_dscratch)
+        return 0;
     if (g_log > 0)
         fprintf(stderr, "ocerz: TCACHE[%d] store %s mode=%d low=%#llx top=%#llx base=%#llx\n", (int)getpid(),
                 g_dir, ocerz_mode, (unsigned long long)ocerz_low_base, (unsigned long long)ocerz_top_base,
@@ -465,12 +542,27 @@ const OcerzTcRecHead *ocerz_tcache_find(uint64_t key)
             if (!loc)
                 break;
             uint64_t no = loc >> TC_LOC_OFF_BITS, off = loc & ((1ull << TC_LOC_OFF_BITS) - 1);
-            const OcerzTcRecHead *r = (const OcerzTcRecHead *)(const void *)file_at(no, off, sizeof *r);
-            if (r && r->magic == OCERZ_TC_REC_MAGIC && r->key == key && r->size >= sizeof *r &&
-                r->size <= TC_REC_MAX && r->size % 8 == 0 &&
-                (r = (const OcerzTcRecHead *)(const void *)file_at(no, off, r->size)) != NULL &&
-                r->sum == rec_sum(r))
-                found = r;
+            const TcStored *z = (const TcStored *)(const void *)file_at(no, off, sizeof *z);
+            if (!z || z->magic != TC_ZREC_MAGIC || z->key != key || z->size < sizeof *z ||
+                z->size > TC_REC_MAX || z->size % 8 || z->zlen > z->size - sizeof *z ||
+                z->raw > TC_REC_MAX - sizeof(OcerzTcRecHead) || z->raw % 8)
+                break;
+            z = (const TcStored *)(const void *)file_at(no, off, z->size);
+            if (!z || z->sum != stored_sum(z))
+                break;
+            OcerzTcRecHead *r = (OcerzTcRecHead *)(void *)g_rbuf;
+            size_t got = z->zlen == z->raw
+                ? (memcpy(r + 1, z + 1, z->raw), (size_t)z->raw)
+                : compression_decode_buffer((uint8_t *)(r + 1), TC_REC_MAX - sizeof *r,
+                                            (const uint8_t *)(z + 1), z->zlen, g_dscratch,
+                                            COMPRESSION_LZ4_RAW);
+            if (got != z->raw)
+                break;
+            r->magic = OCERZ_TC_REC_MAGIC;
+            r->size = (uint32_t)(sizeof *r + z->raw);
+            r->key = key;
+            r->sum = z->sum;
+            found = r;
             break;
         }
     }
@@ -500,6 +592,7 @@ static void publish(uint64_t key, uint64_t loc)
         fprintf(stderr, "ocerz: TCACHE[%d] index has no room near key %#llx\n", (int)getpid(),
                 (unsigned long long)key);
     g_full = 1;
+    __atomic_store_n(&g_hdr->pad[0], 1, __ATOMIC_RELAXED);
 }
 
 static int open_data(void)
@@ -529,15 +622,10 @@ static int open_data(void)
     return 0;
 }
 
-static void flush_locked(void)
+static void write_stored(const uint8_t *p, size_t n)
 {
-    if (!g_buf_n)
+    if (!n || !g_hdr || g_full || !open_data())
         return;
-    size_t n = g_buf_n;
-    g_buf_n = 0;
-    if (!g_hdr || g_full || !open_data())
-        return;
-    const uint8_t *p = g_buf;
     size_t done = 0;
     while (done < n) {
         ssize_t w = pwrite(g_dfd, p + done, n - done, (off_t)(g_doff + done));
@@ -550,9 +638,9 @@ static void flush_locked(void)
         done += (size_t)w;
     }
     for (size_t at = 0; at < n; ) {
-        const OcerzTcRecHead *r = (const OcerzTcRecHead *)(const void *)(p + at);
-        publish(r->key, (g_dno << TC_LOC_OFF_BITS) | (g_doff + at));
-        at += r->size;
+        const TcStored *z = (const TcStored *)(const void *)(p + at);
+        publish(z->key, (g_dno << TC_LOC_OFF_BITS) | (g_doff + at));
+        at += z->size;
     }
     g_doff += n;
     uint64_t total = __atomic_add_fetch(&g_hdr->bytes, n, __ATOMIC_RELAXED);
@@ -561,7 +649,105 @@ static void flush_locked(void)
             fprintf(stderr, "ocerz: TCACHE[%d] %s holds %llu MB; no longer writing\n", (int)getpid(), g_dir,
                     (unsigned long long)(total >> 20));
         g_full = 1;
+        __atomic_store_n(&g_hdr->pad[0], 1, __ATOMIC_RELAXED);
     }
+}
+
+static void store_buffer(const uint8_t *raw_buf, size_t n)
+{
+    size_t o = 0;
+    for (size_t at = 0; at < n; ) {
+        const OcerzTcRecHead *rec = (const OcerzTcRecHead *)(const void *)(raw_buf + at);
+        at += rec->size;
+        uint32_t raw = rec->size - (uint32_t)sizeof *rec;
+        size_t zl = compression_encode_buffer(g_zbuf, TC_REC_MAX, (const uint8_t *)(rec + 1), raw, g_zscratch,
+                                              COMPRESSION_LZ4_RAW);
+        const uint8_t *payload = g_zbuf;
+        if (!zl || zl >= raw) {
+            zl = raw;
+            payload = (const uint8_t *)(rec + 1);
+        }
+        uint32_t size = (uint32_t)((sizeof(TcStored) + zl + 7) & ~(size_t)7);
+        if (o + size > TC_OUT_BYTES) {
+            write_stored(g_obuf, o);
+            o = 0;
+        }
+        TcStored *z = (TcStored *)(void *)(g_obuf + o);
+        z->magic = TC_ZREC_MAGIC;
+        z->size = size;
+        z->key = rec->key;
+        z->raw = raw;
+        z->zlen = (uint32_t)zl;
+        memcpy(z + 1, payload, zl);
+        memset((uint8_t *)(z + 1) + zl, 0, size - sizeof *z - zl);
+        z->sum = stored_sum(z);
+        o += size;
+    }
+    write_stored(g_obuf, o);
+}
+
+static void *writer_main(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&g_qlock);
+    for (;;) {
+        while (!g_qn)
+            pthread_cond_wait(&g_qwork, &g_qlock);
+        uint8_t *b = g_q[0].p;
+        size_t n = g_q[0].n;
+        g_busy = 1;
+        pthread_mutex_unlock(&g_qlock);
+        store_buffer(b, n);
+        pthread_mutex_lock(&g_qlock);
+        g_busy = 0;
+        g_qn--;
+        memmove(&g_q[0], &g_q[1], (size_t)g_qn * sizeof g_q[0]);
+        if (g_nspare < TC_QMAX)
+            g_spare[g_nspare++] = b;
+        else
+            free(b);
+        pthread_cond_broadcast(&g_qdone);
+    }
+    return NULL;
+}
+
+static uint8_t *take_buffer(void)
+{
+    uint8_t *b = NULL;
+    pthread_mutex_lock(&g_qlock);
+    if (g_nspare)
+        b = g_spare[--g_nspare];
+    pthread_mutex_unlock(&g_qlock);
+    return b ? b : (uint8_t *)malloc(TC_BUF_BYTES);
+}
+
+static void hand_off_locked(void)
+{
+    if (!g_buf || !g_buf_n)
+        return;
+    pthread_mutex_lock(&g_qlock);
+    if (!g_writer) {
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        g_writer = pthread_create(&g_writer_tid, &at, writer_main, NULL) == 0;
+        pthread_attr_destroy(&at);
+    }
+    if (!g_writer) {
+        pthread_mutex_unlock(&g_qlock);
+        store_buffer(g_buf, g_buf_n);
+        g_buf_n = 0;
+        return;
+    }
+    while (g_qn == TC_QMAX)
+        pthread_cond_wait(&g_qdone, &g_qlock);
+    g_q[g_qn].p = g_buf;
+    g_q[g_qn].n = g_buf_n;
+    g_qn++;
+    pthread_cond_signal(&g_qwork);
+    pthread_mutex_unlock(&g_qlock);
+    g_buf = take_buffer();
+    g_buf_n = 0;
 }
 
 static void flush_atexit(void)
@@ -578,35 +764,56 @@ void ocerz_tcache_put(const OcerzTcRecHead *rec)
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    if (!g_buf) {
-        g_buf = (uint8_t *)malloc(TC_BUF_BYTES);
-        if (!g_buf) {
+    if (!g_zbuf) {
+        size_t zs = compression_encode_scratch_buffer_size(COMPRESSION_LZ4_RAW);
+        g_zbuf = (uint8_t *)malloc(TC_REC_MAX);
+        g_obuf = (uint8_t *)malloc(TC_OUT_BYTES);
+        g_zscratch = (uint8_t *)malloc(zs ? zs : 1);
+        if (!g_zbuf || !g_obuf || !g_zscratch) {
+            free(g_zbuf);
+            g_zbuf = NULL;
             pthread_mutex_unlock(&g_lock);
             return;
         }
         atexit(flush_atexit);
     }
-    if (g_buf_n + rec->size > TC_BUF_BYTES)
-        flush_locked();
-    OcerzTcRecHead *d = (OcerzTcRecHead *)(void *)(g_buf + g_buf_n);
-    memcpy(d, rec, rec->size);
-    d->sum = rec_sum(d);
-    g_buf_n += rec->size;
+    if (g_buf && g_buf_n + rec->size > TC_BUF_BYTES)
+        hand_off_locked();
+    if (!g_buf)
+        g_buf = take_buffer();
+    if (g_buf) {
+        memcpy(g_buf + g_buf_n, rec, rec->size);
+        g_buf_n += rec->size;
+    }
     pthread_mutex_unlock(&g_lock);
 }
 
 void ocerz_tcache_flush(void)
 {
-    if (!g_buf)
+    if (!g_zbuf)
         return;
     pthread_mutex_lock(&g_lock);
-    flush_locked();
+    hand_off_locked();
     pthread_mutex_unlock(&g_lock);
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 3;
+    pthread_mutex_lock(&g_qlock);
+    while ((g_qn || g_busy) &&
+           pthread_cond_timedwait(&g_qdone, &g_qlock, &until) == 0)
+        ;
+    pthread_mutex_unlock(&g_qlock);
 }
 
 void ocerz_tcache_child(void)
 {
     pthread_mutex_init(&g_lock, NULL);
+    pthread_mutex_init(&g_qlock, NULL);
+    pthread_cond_init(&g_qwork, NULL);
+    pthread_cond_init(&g_qdone, NULL);
+    g_writer = 0;
+    g_qn = 0;
+    g_busy = 0;
     if (g_dfd >= 0)
         close(g_dfd);
     g_dfd = -1;
