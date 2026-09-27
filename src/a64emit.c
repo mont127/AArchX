@@ -8,7 +8,11 @@
  * a straight field packing.  A logical immediate must be a rotated run of ones
  * replicated at some element size, so the encoder finds the smallest element
  * that replicates the value and checks that the run (or its complement) does
- * not wrap.  The rest is field assembly, with the aliases spelled out where the
+ * not wrap.  Such a value always changes bit a power-of-two number of times
+ * going round the register, so any other count is refused before the search:
+ * mov_imm64 offers every 64-bit address it builds to the encoder first, almost
+ * none are logical immediates, and the search was a tenth of translation time.
+ * The rest is field assembly, with the aliases spelled out where the
  * architecture defines them that way (CSETM is CSINV with XZR twice, ROR is
  * EXTR with rn == rm).
  *
@@ -76,6 +80,10 @@ static int logical_imm_fields(int sf, uint64_t imm, uint32_t *fields)
     uint64_t width_mask = low_mask(width);
     imm &= width_mask;
     if (imm == 0 || imm == width_mask)
+        return 0;
+    uint64_t rot1 = ((imm >> 1) | (imm << (width - 1))) & width_mask;
+    unsigned transitions = (unsigned)__builtin_popcountll(imm ^ rot1);
+    if (transitions & (transitions - 1))
         return 0;
 
     unsigned esize = width;
