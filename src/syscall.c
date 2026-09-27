@@ -505,6 +505,8 @@ static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     ocerz_vm_request_exit(vm, (int)(uint32_t)a[0] & 0xff);
     if (!pthread_main_np()) {
+        extern void ocerz_guestprof_final(void);
+        ocerz_guestprof_final();
         fflush(stderr);
         _exit((int)(uint32_t)a[0] & 0xff);
     }

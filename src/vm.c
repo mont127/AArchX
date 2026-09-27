@@ -123,7 +123,11 @@
  * live, retirements, branch flips and the time spent translating), the images
  * the CPU went to - an unnamed one, which is Windows code under Wine, bucketed
  * by its 16 MB region - the hottest rips with their image, the hottest host
- * symbols and the hottest interpreted forms, then starts counting again.  The forms are
+ * symbols and the hottest interpreted forms, then starts counting again.  A
+ * process that ends before a period does reports what was counted at exit - an
+ * atexit handler covers the host main thread, and the exit syscall reports
+ * first on any other thread, because it leaves with _exit - which is what shows
+ * where a Wine program's half second of startup goes.  The forms are
  * what found the Wine-only gaps: Steam's webhelper interpreted pinsrw from
  * memory for 15% of its samples because the emitter had no path for a memory
  * operand in the low shadow window.
@@ -391,6 +395,8 @@ static int gp_top(const uint64_t *keys, const uint32_t *cnts, GpTop *top, int wa
 }
 
 static OcerzVM *g_gp_vm;
+static pthread_mutex_t g_gp_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_gp_start;
 
 static void gp_report(double secs)
 {
@@ -486,7 +492,7 @@ static void gp_report(double secs)
         }
         agg[k].cnt += host[i].cnt;
     }
-    for (int i = 0; i < an && i < 12; i++) {
+    for (int i = 0; i < an && i < 30; i++) {
         int best = i;
         for (int k = i + 1; k < an; k++)
             if (agg[k].cnt > agg[best].cnt)
@@ -535,7 +541,7 @@ static void *guestprof_thread(void *arg)
     if (us < 100)
         us = 1000;
     uint64_t period = (pv ? strtoull(pv, NULL, 0) : 10) * 1000000000ull;
-    uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), next = start + period;
+    uint64_t start = g_gp_start, next = start + period;
     static struct { mach_port_t port; uint64_t cpu_us; } seen[256];
     uint64_t seed = start | 1;
     for (;;) {
@@ -553,6 +559,7 @@ static void *guestprof_thread(void *arg)
             n++;
         }
         pthread_mutex_unlock(&g_cpus_lock);
+        pthread_mutex_lock(&g_gp_lock);
         for (int i = 0; i < n; i++) {
             thread_basic_info_data_t bi;
             mach_msg_type_number_t bc = THREAD_BASIC_INFO_COUNT;
@@ -598,8 +605,24 @@ static void *guestprof_thread(void *arg)
             gp_report((double)(now - start) / 1e9);
             next = now + period;
         }
+        pthread_mutex_unlock(&g_gp_lock);
     }
     return NULL;
+}
+
+void ocerz_guestprof_final(void);
+static void guestprof_atexit(void)
+{
+    ocerz_guestprof_final();
+}
+void ocerz_guestprof_final(void)
+{
+    if (!g_gp_vm)
+        return;
+    pthread_mutex_lock(&g_gp_lock);
+    if (g_gp_samples)
+        gp_report((double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_gp_start) / 1e9);
+    pthread_mutex_unlock(&g_gp_lock);
 }
 
 static void guestprof_start(OcerzVM *vm)
@@ -609,7 +632,9 @@ static void guestprof_start(OcerzVM *vm)
         return;
     started = 1;
     g_gp_vm = vm;
+    g_gp_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     ocerz_jit_time_xlat = 1;
+    atexit(guestprof_atexit);
     pthread_t t;
     if (pthread_create(&t, NULL, guestprof_thread, vm) == 0)
         pthread_detach(t);
