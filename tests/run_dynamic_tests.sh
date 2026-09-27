@@ -289,6 +289,39 @@ run_mac_syscall_low_stack_case() {
     done
 }
 
+run_dlsym_deps_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    local lib=tests/dynamic/dlsym_deps_lib.c
+    if ! clang -arch x86_64 -dynamiclib -DLIB_C -install_name @rpath/libdc.dylib -o "$dir/libdc.dylib" "$lib" 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -DLIB_U -install_name @rpath/libdu.dylib -o "$dir/libdu.dylib" "$lib" 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -DLIB_B -install_name @rpath/libdb.dylib -o "$dir/libdb.dylib" "$lib" \
+            -L"$dir" -ldc -Wl,-rpath,@loader_path 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name @rpath/libda.dylib -o "$dir/libda.dylib" "$lib" \
+            -L"$dir" -ldb -Wl,-upward-ldu -Wl,-rpath,@loader_path 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/dlsym_deps.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name" "$dir/libda.dylib"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name" "$dir/libda.dylib"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_low_golden_case() {
     local name="$1" src="$2" golden="$3"
     local dir="$TMP/$name"
@@ -713,6 +746,7 @@ run_file_case ddlopen_objc_core tests/dynamic/dlopen_objc_core.c 'OK'
 run_caller_rpath_case ddlopen_caller_rpath 'OK'
 run_mac_syscall_low_stack_case dmac_syscall_low_stack 'OK'
 run_low_golden_case dsimd_low tests/guest/simd_pack_jit.c tests/guest/expect/simd_pack_jit.out
+run_dlsym_deps_case ddlsym_deps 'OK'
 run_dlopen_arch_case ddlopen_arch 'OK'
 run_rpath_bare_case drpath_bare 'OK'
 run_init_order_case dinit_order 'OK'
