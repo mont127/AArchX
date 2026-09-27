@@ -39,12 +39,27 @@
  * binary that links /usr/lib/libcrypto.46.dylib (LibreSSL 3.3.6) must bind
  * OpenSSL_version there even though the cache also carries libcrypto.44 (2.8.3)
  * exporting the same name, and the flat walk bound it to whichever image came
- * first, so openssl reported the wrong version.  The path-to-header lookup is
- * memoized because resolving every import of a dependency would otherwise
- * rescan all ~3600 images, and since the cache is static a negative answer is
- * cached too.  A dylib lookup follows LC_REEXPORT_DYLIB as well as re-exports
+ * first, so openssl reported the wrong version.  The path-to-header lookup goes
+ * through the index below because resolving every import of a dependency would
+ * otherwise rescan all ~3600 images.  A dylib lookup follows LC_REEXPORT_DYLIB as well as re-exports
  * in the trie, because an umbrella such as libSystem answers for its members
  * only through those load commands.
+ *
+ * All of that runs on an index built once per process: install path to image
+ * and header to image in open-addressed tables, and per image, filled on first
+ * use, its export trie and its linked images in ordinal order with their kind.
+ * The path memo it replaced was 512 direct-mapped slots, so under Wine, which
+ * resolves thousands of OpenGL and AppKit names through dlsym, colliding paths
+ * fell back to a strcmp over every image and a webhelper spent a quarter of its
+ * startup in resolve_in_dylib, strcmp and strlen; a dlsym miss on a framework
+ * handle cost 2 ms against Rosetta's 30 us.  A breadth-first search from one
+ * image walks the index with a visited bitmap and memoizes its answer per image
+ * and name.  Two searches share it: ocerz_cache_resolve_from_image follows every
+ * link, upward ones included, which is how the leaf-routine table finds
+ * _memmove from libsystem_platform (the name lives behind the upward link to
+ * libSystem and comes back into libsystem_platform's text), and
+ * ocerz_cache_dlsym_image skips upward links the way dlsym does
+ * (OCERZ_DLSYM_UPWARD follows them there too).
  *
  * A weak-coalescing bind (ordinal -3) asks whether any image already defines
  * the name, and dyld answers it only from images that define weak symbols,
@@ -719,8 +734,122 @@ uint64_t ocerz_cache_find_alias(OcerzCache *c, const char *path)
     return 0;
 }
 
+typedef struct CacheImgInfo {
+    const uint8_t *ts, *te;
+    uint32_t ndeps;
+    uint32_t *dep;
+    uint8_t *dep_kind;
+} CacheImgInfo;
+
+typedef struct CacheIndex {
+    OcerzCache *c;
+    uint32_t n, mask;
+    uint32_t *by_path;
+    uint32_t *by_mh;
+    CacheImgInfo **info;
+} CacheIndex;
+
+#define CIX_NONE 0xffffffffu
+enum { DEP_LOAD, DEP_REEXPORT, DEP_UPWARD };
+static CacheIndex *g_cix;
+
+static uint32_t cix_str_hash(const char *s)
+{
+    uint32_t h = 2166136261u;
+    for (; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    return h;
+}
+
+static uint32_t cix_mh_hash(uint64_t mh)
+{
+    return (uint32_t)((mh * 0x9E3779B97F4A7C15ull) >> 32);
+}
+
+static CacheIndex *cix_get(OcerzCache *c)
+{
+    CacheIndex *ix = __atomic_load_n(&g_cix, __ATOMIC_ACQUIRE);
+    if (ix)
+        return ix->c == c ? ix : NULL;
+    if (!c->mapped || !c->images_cnt)
+        return NULL;
+    uint32_t cap = 1024;
+    while (cap < c->images_cnt * 4)
+        cap <<= 1;
+    ix = calloc(1, sizeof *ix);
+    uint32_t *bp = ix ? calloc(cap, sizeof *bp) : NULL;
+    uint32_t *bm = bp ? calloc(cap, sizeof *bm) : NULL;
+    CacheImgInfo **info = bm ? calloc(c->images_cnt, sizeof *info) : NULL;
+    if (!info) {
+        free(bm);
+        free(bp);
+        free(ix);
+        return NULL;
+    }
+    ix->c = c;
+    ix->n = c->images_cnt;
+    ix->mask = cap - 1;
+    ix->by_path = bp;
+    ix->by_mh = bm;
+    ix->info = info;
+    for (uint32_t i = 0; i < ix->n; i++) {
+        const char *p = NULL;
+        uint64_t mh = ocerz_cache_image_addr(c, i, &p);
+        if (!mh)
+            continue;
+        if (p) {
+            uint32_t h = cix_str_hash(p) & ix->mask;
+            while (bp[h])
+                h = (h + 1) & ix->mask;
+            bp[h] = i + 1;
+        }
+        uint32_t h = cix_mh_hash(mh) & ix->mask;
+        while (bm[h])
+            h = (h + 1) & ix->mask;
+        bm[h] = i + 1;
+    }
+    CacheIndex *expected = NULL;
+    if (!__atomic_compare_exchange_n(&g_cix, &expected, ix, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        free(info);
+        free(bm);
+        free(bp);
+        free(ix);
+        return expected->c == c ? expected : NULL;
+    }
+    return ix;
+}
+
+static uint32_t cix_by_path(CacheIndex *ix, const char *path)
+{
+    for (uint32_t h = cix_str_hash(path) & ix->mask; ix->by_path[h]; h = (h + 1) & ix->mask) {
+        uint32_t i = ix->by_path[h] - 1;
+        const char *p = NULL;
+        ocerz_cache_image_addr(ix->c, i, &p);
+        if (p && strcmp(p, path) == 0)
+            return i;
+    }
+    return CIX_NONE;
+}
+
+static uint32_t cix_by_mh(CacheIndex *ix, uint64_t mh)
+{
+    for (uint32_t h = cix_mh_hash(mh) & ix->mask; ix->by_mh[h]; h = (h + 1) & ix->mask) {
+        uint32_t i = ix->by_mh[h] - 1;
+        if (ocerz_cache_image_addr(ix->c, i, NULL) == mh)
+            return i;
+    }
+    return CIX_NONE;
+}
+
 static uint64_t cache_image_by_path(OcerzCache *c, const char *path)
 {
+    CacheIndex *ix = cix_get(c);
+    if (ix) {
+        uint32_t i = cix_by_path(ix, path);
+        if (i != CIX_NONE)
+            return ocerz_cache_image_addr(c, i, NULL);
+        return ocerz_cache_find_alias(c, path);
+    }
     for (uint32_t i = 0; i < c->images_cnt; i++) {
         const char *p = NULL;
         uint64_t mh = ocerz_cache_image_addr(c, i, &p);
@@ -728,6 +857,71 @@ static uint64_t cache_image_by_path(OcerzCache *c, const char *path)
             return mh;
     }
     return ocerz_cache_find_alias(c, path);
+}
+
+static int dylib_export_region(uint64_t mh_addr, const uint8_t **trie_start,
+                               const uint8_t **trie_end);
+
+static const CacheImgInfo *cix_info(CacheIndex *ix, uint32_t i)
+{
+    CacheImgInfo *inf = __atomic_load_n(&ix->info[i], __ATOMIC_ACQUIRE);
+    if (inf)
+        return inf;
+    uint64_t mh = ocerz_cache_image_addr(ix->c, i, NULL);
+    if (!mh)
+        return NULL;
+    const uint8_t *m = (const uint8_t *)(uintptr_t)mh;
+    uint32_t ncmds = rd32(m + 16), nd = 0;
+    const uint8_t *lc = m + sizeof(struct mach_header_64);
+    for (uint32_t k = 0; k < ncmds; k++) {
+        uint32_t cmd = rd32(lc), size = rd32(lc + 4);
+        if (size < 8)
+            break;
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB)
+            nd++;
+        lc += size;
+    }
+    inf = calloc(1, sizeof *inf + nd * (sizeof(uint32_t) + 1));
+    if (!inf)
+        return NULL;
+    inf->dep = (uint32_t *)(inf + 1);
+    inf->dep_kind = (uint8_t *)(inf->dep + nd);
+    if (dylib_export_region(mh, &inf->ts, &inf->te) != 0)
+        inf->ts = inf->te = NULL;
+    lc = m + sizeof(struct mach_header_64);
+    for (uint32_t k = 0; k < ncmds && inf->ndeps < nd; k++) {
+        uint32_t cmd = rd32(lc), size = rd32(lc + 4);
+        if (size < 8)
+            break;
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+            uint32_t noff = rd32(lc + 8), di = CIX_NONE;
+            if (noff < size) {
+                const char *path = (const char *)lc + noff;
+                di = cix_by_path(ix, path);
+                if (di == CIX_NONE) {
+                    uint64_t amh = ocerz_cache_find_alias(ix->c, path);
+                    if (amh)
+                        di = cix_by_mh(ix, amh);
+                }
+            }
+            inf->dep[inf->ndeps] = di;
+            int upward = cmd == LC_LOAD_UPWARD_DYLIB ||
+                         (cmd != LC_REEXPORT_DYLIB && size >= sizeof(struct dylib_use_command) &&
+                          noff == sizeof(struct dylib_use_command) && rd32(lc + 12) == DYLIB_USE_MARKER &&
+                          (rd32(lc + 24) & DYLIB_USE_UPWARD));
+            inf->dep_kind[inf->ndeps] = cmd == LC_REEXPORT_DYLIB ? DEP_REEXPORT : upward ? DEP_UPWARD : DEP_LOAD;
+            inf->ndeps++;
+        }
+        lc += size;
+    }
+    CacheImgInfo *expected = NULL;
+    if (!__atomic_compare_exchange_n(&ix->info[i], &expected, inf, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        free(inf);
+        return expected;
+    }
+    return inf;
 }
 
 static const char *dylib_ordinal_name(uint64_t mh, uint64_t ord)
@@ -755,6 +949,45 @@ static uint64_t resolve_in_dylib(OcerzCache *c, uint64_t mh, const char *sym, in
 {
     if (depth > 16)
         return 0;
+    CacheIndex *ix = cix_get(c);
+    uint32_t ii = ix ? cix_by_mh(ix, mh) : CIX_NONE;
+    const CacheImgInfo *inf = ii != CIX_NONE ? cix_info(ix, ii) : NULL;
+    if (inf) {
+        if (!inf->ts)
+            return 0;
+        int reexp = 0, lfound = 0;
+        uint64_t ord = 0, lflags = 0;
+        const char *imp = NULL;
+        uint64_t off = trie_lookup(inf->ts, inf->te, sym, &reexp, &ord, &imp, &lfound, &lflags);
+        if (!lfound) {
+            for (uint32_t k = 0; k < inf->ndeps; k++) {
+                if (inf->dep_kind[k] != DEP_REEXPORT || inf->dep[k] == CIX_NONE)
+                    continue;
+                uint64_t tmh = ocerz_cache_image_addr(c, inf->dep[k], NULL);
+                if (!tmh || tmh == mh)
+                    continue;
+                int f = 0;
+                uint64_t v = resolve_in_dylib(c, tmh, sym, depth + 1, &f);
+                if (f) {
+                    *found = 1;
+                    return v;
+                }
+            }
+            return 0;
+        }
+        if (!reexp) {
+            *found = 1;
+            if ((lflags & EXPORT_FLAGS_KIND_MASK) == EXPORT_FLAGS_KIND_ABSOLUTE)
+                return off;
+            return mh + off;
+        }
+        if (ord == 0 || ord > inf->ndeps || inf->dep[ord - 1] == CIX_NONE)
+            return 0;
+        uint64_t tmh = ocerz_cache_image_addr(c, inf->dep[ord - 1], NULL);
+        if (!tmh)
+            return 0;
+        return resolve_in_dylib(c, tmh, (imp && imp[0]) ? imp : sym, depth + 1, found);
+    }
     const uint8_t *ts, *te;
     if (dylib_export_region(mh, &ts, &te) != 0)
         return 0;
@@ -870,30 +1103,7 @@ uint64_t ocerz_cache_resolve_ex(OcerzCache *c, const char *symbol, int *found)
 
 static uint64_t cache_image_by_path_memo(OcerzCache *c, const char *path)
 {
-    static struct { char *path; uint64_t mh; } pmemo[512];
-    static pthread_mutex_t pmemo_lock = PTHREAD_MUTEX_INITIALIZER;
-    unsigned h = 2166136261u;
-    for (const char *s = path; *s; s++)
-        h = (h ^ (unsigned char)*s) * 16777619u;
-    unsigned slot = h & 511;
-
-    pthread_mutex_lock(&pmemo_lock);
-    if (pmemo[slot].path && strcmp(pmemo[slot].path, path) == 0) {
-        uint64_t mh = pmemo[slot].mh;
-        pthread_mutex_unlock(&pmemo_lock);
-        return mh;
-    }
-    pthread_mutex_unlock(&pmemo_lock);
-    uint64_t mh = cache_image_by_path(c, path);
-    char *dup = strdup(path);
-    if (dup) {
-        pthread_mutex_lock(&pmemo_lock);
-        free(pmemo[slot].path);
-        pmemo[slot].path = dup;
-        pmemo[slot].mh = mh;
-        pthread_mutex_unlock(&pmemo_lock);
-    }
-    return mh;
+    return cache_image_by_path(c, path);
 }
 
 uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
@@ -920,10 +1130,109 @@ int ocerz_cache_has_image(OcerzCache *c, uint64_t mh)
 {
     if (!c->mapped || !mh)
         return 0;
+    CacheIndex *ix = cix_get(c);
+    if (ix)
+        return cix_by_mh(ix, mh) != CIX_NONE;
     for (uint32_t i = 0; i < c->images_cnt; i++)
         if (ocerz_cache_image_addr(c, i, NULL) == mh)
             return 1;
     return 0;
+}
+
+#define FMEMO_SLOTS (1u << 15)
+typedef struct { uint64_t mh; char *name; uint64_t val; int found; } FromMemo;
+static FromMemo g_fmemo[FMEMO_SLOTS];
+static pthread_mutex_t g_fmemo_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static FromMemo *fmemo_find(uint64_t mh, const char *symbol)
+{
+    unsigned i = (cix_str_hash(symbol) ^ cix_mh_hash(mh)) & (FMEMO_SLOTS - 1);
+    for (unsigned n = 0; n < 16; n++, i = (i + 1) & (FMEMO_SLOTS - 1)) {
+        if (!g_fmemo[i].name)
+            return &g_fmemo[i];
+        if (g_fmemo[i].mh == mh && strcmp(g_fmemo[i].name, symbol) == 0)
+            return &g_fmemo[i];
+    }
+    return NULL;
+}
+
+static uint64_t resolve_from_index(OcerzCache *c, CacheIndex *ix, uint32_t root, uint64_t mh,
+                                   const char *symbol, int *found, int skip_upward)
+{
+    uint64_t key = mh | (uint64_t)(skip_upward != 0);
+    pthread_mutex_lock(&g_fmemo_lock);
+    FromMemo *m = fmemo_find(key, symbol);
+    if (m && m->name) {
+        *found = m->found;
+        uint64_t v = m->val;
+        pthread_mutex_unlock(&g_fmemo_lock);
+        return v;
+    }
+    pthread_mutex_unlock(&g_fmemo_lock);
+
+    uint32_t order[1024], head = 0, tail = 0;
+    uint8_t seen_small[1024];
+    uint32_t nbytes = (ix->n + 7) / 8;
+    uint8_t *seen = nbytes <= sizeof seen_small ? seen_small : calloc(nbytes, 1);
+    uint64_t v = 0;
+    int f = 0;
+    if (seen) {
+        if (seen == seen_small)
+            memset(seen, 0, nbytes);
+        order[tail++] = root;
+        seen[root >> 3] |= (uint8_t)(1u << (root & 7));
+        while (head < tail) {
+            uint32_t cur = order[head++];
+            v = resolve_in_dylib(c, ocerz_cache_image_addr(c, cur, NULL), symbol, 0, &f);
+            if (f)
+                break;
+            v = 0;
+            const CacheImgInfo *inf = cix_info(ix, cur);
+            if (!inf)
+                continue;
+            for (uint32_t k = 0; k < inf->ndeps; k++) {
+                uint32_t d = inf->dep[k];
+                if (d == CIX_NONE || (seen[d >> 3] & (1u << (d & 7))) ||
+                    (skip_upward && inf->dep_kind[k] == DEP_UPWARD))
+                    continue;
+                if (tail >= sizeof order / sizeof order[0])
+                    break;
+                seen[d >> 3] |= (uint8_t)(1u << (d & 7));
+                order[tail++] = d;
+            }
+        }
+        if (seen != seen_small)
+            free(seen);
+    }
+
+    pthread_mutex_lock(&g_fmemo_lock);
+    m = fmemo_find(key, symbol);
+    if (m && !m->name) {
+        m->name = strdup(symbol);
+        if (m->name) {
+            m->mh = key;
+            m->val = v;
+            m->found = f;
+        }
+    }
+    pthread_mutex_unlock(&g_fmemo_lock);
+    *found = f;
+    return v;
+}
+
+uint64_t ocerz_cache_dlsym_image(OcerzCache *c, uint64_t mh, const char *symbol, int *found)
+{
+    int dummy = 0;
+    if (!found)
+        found = &dummy;
+    *found = 0;
+    if (!c->mapped || !mh || !symbol)
+        return 0;
+    CacheIndex *ix = cix_get(c);
+    uint32_t root = ix ? cix_by_mh(ix, mh) : CIX_NONE;
+    if (root == CIX_NONE)
+        return ocerz_cache_resolve_from_image(c, mh, symbol, found);
+    return resolve_from_index(c, ix, root, mh, symbol, found, !getenv("OCERZ_DLSYM_UPWARD"));
 }
 
 uint64_t ocerz_cache_resolve_from_image(OcerzCache *c, uint64_t mh, const char *symbol, int *found)
@@ -934,6 +1243,11 @@ uint64_t ocerz_cache_resolve_from_image(OcerzCache *c, uint64_t mh, const char *
     *found = 0;
     if (!c->mapped || !mh || !symbol)
         return 0;
+
+    CacheIndex *ix = cix_get(c);
+    uint32_t root = ix ? cix_by_mh(ix, mh) : CIX_NONE;
+    if (root != CIX_NONE)
+        return resolve_from_index(c, ix, root, mh, symbol, found, 0);
 
     uint64_t order[1024];
     uint32_t head = 0, tail = 0;

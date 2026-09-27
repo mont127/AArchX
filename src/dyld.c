@@ -18,6 +18,15 @@
  * code sitting in a writable slot is treated as possibly self-modifying, and a
  * write-trapped page costs a fault per store to its data neighbours.
  *
+ * dlsym on a handle searches the image, then everything it links breadth
+ * first, skipping upward links, which is what dyld answers: a symbol two
+ * dependencies down is found, one behind an upward link is not.  The disk-image
+ * path used to search the image alone, so dlsym(handle, "malloc") failed for
+ * any dylib, and the cache path followed upward links, so CoreFoundation's
+ * handle found OpenGL's glBegin by way of Foundation.  A cache image met on the
+ * way hands its own closure to ocerz_cache_dlsym_image.  OCERZ_NO_DLSYM_DEPS
+ * restores the image-only search for disk images.
+ *
  * ---- the initial stack ----
  * Every argument and environment entry goes onto the guest stack, counted first
  * and sized to the real need.  The arrays were once fixed at 64 with the
@@ -3874,6 +3883,51 @@ static uint64_t main_image_resolve_ex(const char *sym, int *found)
     return value;
 }
 
+static uint64_t dlsym_dependents(uint64_t root, const char *sym)
+{
+    uint64_t q[1024];
+    int head = 0, tail = 0;
+    q[tail++] = root;
+    while (head < tail) {
+        uint64_t mh = q[head++];
+        if (mh != root) {
+            if (g_run_cache && ocerz_cache_has_image(g_run_cache, mh)) {
+                int f = 0;
+                uint64_t v = ocerz_cache_dlsym_image(g_run_cache, mh, sym, &f);
+                if (f)
+                    return v;
+                continue;
+            }
+            for (int i = 0; i < g_dimgs_n; i++)
+                if (g_dimgs[i].load_base == mh) {
+                    int f = 0;
+                    uint64_t v = ocerz_image_self_resolve_ex(&g_dimgs[i], sym, &f);
+                    if (f)
+                        return v;
+                    break;
+                }
+        }
+        const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+        if (rd32(h) != MH_MAGIC_64)
+            continue;
+        uint32_t ncmds = rd32(h + 16);
+        const uint8_t *lc = h + sizeof(struct mach_header_64);
+        for (uint32_t j = 0; j < ncmds; j++) {
+            uint32_t noff = rd32(lc + 8);
+            if (dylib_lc_is_init_dep(lc) && noff < rd32(lc + 4)) {
+                uint64_t dep = dep_mh(g_run_cache, (const char *)(lc + noff));
+                int k = 0;
+                while (k < tail && q[k] != dep)
+                    k++;
+                if (dep && k == tail && tail < (int)(sizeof q / sizeof q[0]))
+                    q[tail++] = dep;
+            }
+            lc += rd32(lc + 4);
+        }
+    }
+    return 0;
+}
+
 uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
 {
     if (!sym || !sym[0])
@@ -3912,11 +3966,13 @@ uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
             uint64_t v = ocerz_image_self_resolve(&g_dimgs[i], buf);
             if (!v)
                 v = image_symtab_resolve(&g_dimgs[i], buf);
+            if (!v && !getenv("OCERZ_NO_DLSYM_DEPS"))
+                v = dlsym_dependents(handle, buf);
             return v;
         }
     }
     if (g_run_cache && ocerz_cache_has_image(g_run_cache, handle))
-        return ocerz_cache_resolve_from_image(g_run_cache, handle, buf, NULL);
+        return ocerz_cache_dlsym_image(g_run_cache, handle, buf, NULL);
     if (g_run_cache) {
         uint64_t v = ocerz_cache_resolve(g_run_cache, buf);
         if (v)
