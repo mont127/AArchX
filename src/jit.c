@@ -177,7 +177,14 @@
  * real one.  Where a frame is pure register work the push's slot is provably
  * never read, so the push becomes a bare rsp -= 8 and matched push/pop pairs
  * become register renames - the loop-carried store-to-load chain of call-dense
- * code.
+ * code.  The renames borrow x16, x17 and x30 when no memory base is hoisted
+ * into them, and every C call-out clobbers all three, so a renamed pop whose
+ * push was followed by a call-out reads the slot the push still wrote instead.
+ * That happens whenever an instruction between them falls back to C, and in the
+ * low shadow window it happened to every spliced call nested inside another,
+ * because the inline call and ret need identity addressing there and go
+ * through the slow path: a leaf-call loop built at 0x200000000 summed garbage
+ * that changed with every run.
  *
  * ---- bridged calls ----
  * In native mode a guest call into a system library lands on a synthesized
@@ -14629,6 +14636,8 @@ static uint8_t  g_ic_pushelide[JIT_MAX_BLOCK_INSNS];
 static int32_t  g_ic_pair_rj[JIT_MAX_BLOCK_INSNS];
 static uint8_t  g_promo_reg[JIT_MAX_BLOCK_INSNS];
 static int32_t  g_promo_mate[JIT_MAX_BLOCK_INSNS];
+static int32_t  g_promo_push_of[JIT_MAX_BLOCK_INSNS];
+static unsigned long long g_promo_seq[JIT_MAX_BLOCK_INSNS];
 static int rsp_run_member(const X86Insn *insns, int j, int n, int fast3)
 {
     if (j >= n) return 0;
@@ -15511,6 +15520,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                     g_promo_reg[pstk[sp]] = (uint8_t)rres[sp];
                     g_promo_reg[i] = (uint8_t)rres[sp];
                     g_promo_mate[pstk[sp]] = i;
+                    g_promo_push_of[i] = pstk[sp];
                     freer[nfree++] = rres[sp];
                     npairs++;
                 }
@@ -15857,7 +15867,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             int hsp = pin_hreg(pin_slot(OCERZ_RSP));
             int pr = g_promo_reg[i];
             int gr = pin_hreg(pin_slot(insn->ops[0].reg));
+            if (insn->op == OCERZ_OP_POP && g_promo_seq[g_promo_push_of[i]] != g_callout_seq) {
+                if (g_rsp_lag) {
+                    a64_add_imm(&b, 1, hsp, hsp, g_rsp_lag);
+                    g_rsp_lag = 0;
+                }
+                goto promo_push_fallthrough;
+            }
             if (insn->op == OCERZ_OP_PUSH) {
+                g_promo_seq[i] = g_callout_seq;
                 a64_mov_reg(&b, 1, pr, gr);
                 if (g_n_promo_real < PE_MAX)
                     g_promo_real[g_n_promo_real++] = (struct JitPromo){
