@@ -14883,7 +14883,18 @@ static void emit_oolslow_arms(A64Buf *b, uint32_t **exit_sites, int *n_exits)
         for (int i = 0; sane && i < g_oolslow[k].nsites; i++)
             sane = g_oolslow[k].sites[i] >= g_push_entry && g_oolslow[k].sites[i] < b->p;
         if (!sane) {
-            fprintf(stderr, "ocerz: warning: dropping stale oolslow arm (site/back outside the current block)\n");
+            static int nwarn;
+            if (nwarn++ < 40) {
+                char tb[128] = "";
+                if (g_oolslow[k].insn) ocerz_format_insn(g_oolslow[k].insn, tb, sizeof tb);
+                fprintf(stderr, "ocerz: warning: dropping stale oolslow arm (site/back outside the current block)"
+                                " block=%#llx insn=%#llx back=%+ld site0=%+ld end=%ld nsites=%d %s\n",
+                        (unsigned long long)g_self_rip,
+                        (unsigned long long)(g_oolslow[k].insn ? g_oolslow[k].insn->rip : 0),
+                        (long)(g_oolslow[k].back - g_push_entry),
+                        g_oolslow[k].nsites ? (long)(g_oolslow[k].sites[0] - g_push_entry) : 0L,
+                        (long)(b->p - g_push_entry), g_oolslow[k].nsites, tb);
+            }
             continue;
         }
         uint32_t *lbl = a64_label(b);

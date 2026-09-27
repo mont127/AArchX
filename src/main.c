@@ -18,7 +18,9 @@
  * inherits through Wine's exec chain that singles one process out for the
  * full-visibility interpreter while the rest stay on the JIT.
  * OCERZ_STRACE_EXE turns on the syscall trace the same way, for one process of
- * Wine's tree instead of all of them.  A process whose loader is named wine is
+ * Wine's tree instead of all of them, and OCERZ_EXE_ENV sets variables the same
+ * way: "cs2.exe:OCERZ_NO_SUPERBLOCK=1,OCERZ_TSO_STRICT=1;other.exe:..." gives
+ * each listed process its own JIT knobs before any of them is read.  A process whose loader is named wine is
  * marked as one of Wine's, which fixes the base of its memory arena (see mem.c).
  *
  * The third decision is which universe the guest binds against.  -native and
@@ -333,6 +335,26 @@ int main(int argc, char **argv)
         extern char ocerz_cmdline_summary[];
         if (sx && *sx && strstr(ocerz_cmdline_summary, sx))
             vm.strace = 1;
+    }
+    {
+        const char *ev = getenv("OCERZ_EXE_ENV");
+        extern char ocerz_cmdline_summary[];
+        char spec[1024];
+        snprintf(spec, sizeof spec, "%s", ev ? ev : "");
+        for (char *rule = strtok(spec, ";"); rule; rule = strtok(NULL, ";")) {
+            char *colon = strchr(rule, ':');
+            if (!colon) continue;
+            *colon = 0;
+            if (!*rule || !strstr(ocerz_cmdline_summary, rule)) continue;
+            char *save = NULL;
+            for (char *kv = strtok_r(colon + 1, ",", &save); kv; kv = strtok_r(NULL, ",", &save)) {
+                char *eq = strchr(kv, '=');
+                if (!eq) continue;
+                *eq = 0;
+                setenv(kv, eq + 1, 1);
+                fprintf(stderr, "ocerz: EXE-ENV %s=%s for '%s'\n", kv, eq + 1, ocerz_cmdline_summary);
+            }
+        }
     }
     {
         const char *nx = getenv("OCERZ_NOJIT_EXE");
