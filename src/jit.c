@@ -71,6 +71,12 @@
  * NZCV-transparent gap instructions, value-based conditions taken straight from
  * a result register (cmp #0, or no compare at all for cbz/cbnz), and the comis
  * fusion, where a jcc/setcc/cmov re-derives its condition by redoing the fcmp.
+ * Liveness reaches past the block: an exit's flags are dead if the successor,
+ * decoded up to three blocks deep, overwrites them before reading them.  That
+ * lookahead was a fifth of translation time, because every block branching to
+ * an untranslated successor decoded it again, so answers are memoized by rip
+ * and depth, and an entry counts only while no translation has been retired
+ * since and the successor's first sixteen bytes are unchanged.
  * A static liveness pass and the emitters share the same predicates so they
  * cannot disagree about what is live.  The legality rules here are written in
  * blood: a gap may not write a register the producer read (`cmp byte
@@ -1663,11 +1669,33 @@ static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth);
 static void fpb_site_emit(A64Buf *b, int end, int va, int vb, int dbl);
 static int unsafe_nocheckbr(void);
 static int fpb_det_here(int idx);
+extern uint64_t ocerz_jit_retire_count;
+#define XLIVE_MEMO_SLOTS 8192
+static struct { uint64_t key, live, gen; uint8_t head[16]; } g_xlive_memo[XLIVE_MEMO_SLOTS];
 static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
 {
-    static int maxd = -1;
+    static int maxd = -1, memo_on = -1;
     if (maxd < 0) { const char *e = getenv("OCERZ_XLIVE_DEPTH"); maxd = e ? atoi(e) : 3; }
+    if (memo_on < 0) memo_on = getenv("OCERZ_NO_XLIVE_MEMO") ? 0 : 1;
     if (g_xlive_log < 0) g_xlive_log = getenv("OCERZ_XLIVELOG") ? 1 : 0;
+    uint64_t mkey = ((rip << 4) | ((uint64_t)depth << 1) | (uint64_t)(g_xlat_mode32 != 0)) + 1;
+    uint64_t mgen = __atomic_load_n(&ocerz_jit_retire_count, __ATOMIC_RELAXED);
+    unsigned mslot = (unsigned)((mkey * 0x9E3779B97F4A7C15ull) >> 51) & (XLIVE_MEMO_SLOTS - 1);
+    uint8_t head[16];
+    int have_head = 0;
+    if (memo_on) {
+        sigjmp_buf hb;
+        sigjmp_buf *hprev = ocerz_jit_decode_recover;
+        if (sigsetjmp(hb, 0) == 0) {
+            ocerz_jit_decode_recover = &hb;
+            memcpy(head, (const uint8_t *)ocerz_g2h(rip), sizeof head);
+            have_head = 1;
+        }
+        ocerz_jit_decode_recover = hprev;
+        if (have_head && g_xlive_memo[mslot].key == mkey && g_xlive_memo[mslot].gen == mgen &&
+            memcmp(g_xlive_memo[mslot].head, head, sizeof head) == 0)
+            return g_xlive_memo[mslot].live;
+    }
     X86Insn insns[JIT_MAX_BLOCK_INSNS];
     volatile int n = 0;
     volatile uint64_t pc = rip;
@@ -1707,6 +1735,12 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
         live = (live & ~def) | use;
     }
     if (g_xlive_log) fprintf(stderr, "ocerz: XLIVE rip=%#llx depth=%d n=%d term=%d live=%#llx\n", (unsigned long long)rip, depth, n, (int)insns[n-1].op, (unsigned long long)live);
+    if (have_head) {
+        g_xlive_memo[mslot].key = mkey;
+        g_xlive_memo[mslot].live = live;
+        g_xlive_memo[mslot].gen = mgen;
+        memcpy(g_xlive_memo[mslot].head, head, sizeof head);
+    }
     return live;
 }
 
