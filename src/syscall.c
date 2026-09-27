@@ -270,6 +270,7 @@
 #include "ocerz/abi.h"
 #include "ocerz/apidb.h"
 #include "ocerz/vdylib.h"
+#include "ocerz/tcache.h"
 
 #include <stddef.h>
 #include <sys/mman.h>
@@ -506,7 +507,9 @@ static int sys_exit(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     ocerz_vm_request_exit(vm, (int)(uint32_t)a[0] & 0xff);
     if (!pthread_main_np()) {
         extern void ocerz_guestprof_final(void);
+        extern void ocerz_jit_tcache_final(void);
         ocerz_guestprof_final();
+        ocerz_jit_tcache_final();
         fflush(stderr);
         _exit((int)(uint32_t)a[0] & 0xff);
     }
@@ -1478,6 +1481,7 @@ static void ocerz_fork_child(void)
     ocerz_mem_postfork();
     ocerz_jit_postfork();
     ocerz_bridge_postfork_child();
+    ocerz_tcache_child();
     ocerz_abi_postfork_child();
     ocerz_apidb_postfork_child();
     ocerz_vdylib_postfork_child();
@@ -2083,6 +2087,7 @@ static int guest_exec_apply(const char *path, char *const *argv, char *const *en
     }
     if (access(path, X_OK) != 0)
         return errno;
+    ocerz_tcache_flush();
     if (guest_child_runs_native(path)) {
         execve(path, argv, envp);
         return errno;

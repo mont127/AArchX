@@ -737,6 +737,49 @@ run_file_case dspawn_arm64_only tests/dynamic/spawn_arm64_only.c 'OK'
 run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
 run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
 run_cpp_file_case dcpp_global_ctor tests/dynamic/cpp_global_ctor.cpp 'OK'
+# tcache_work.c against one fresh translation cache directory, four runs: one
+# that records, one that must load what the first stored, one under
+# OCERZ_TCACHE=verify that must find no block differing from its record except
+# in shape, and one under OCERZ_TCACHE=roundtrip that must find no reference its
+# relocations miss.
+run_tcache_case() {
+    local name="$1" want_out="$2"
+    shift 2
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -O2 -o "$dir/$name" tests/dynamic/tcache_work.c "$@" 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local i=0 mode log got_code got_out why
+    for mode in on on verify roundtrip; do
+        i=$((i + 1))
+        log="$dir/run$i.log"
+        OCERZ_TCACHE=$mode OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG="$log" \
+            run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name"
+        got_code=$?
+        got_out=$(cat "$dir/run$i.out")
+        why=""
+        if [ "$got_out" != "$want_out" ] || [ "$got_code" != 0 ]; then
+            why="got out='$got_out' exit=$got_code"
+        elif [ $i = 2 ] && ! awk '/TCACHE.*loaded=/ { for (f = 3; f <= NF; f++) { split($f, a, "="); t[a[1]] += a[2] } }
+                                  END { exit !(t["loaded"] > 0 && t["rejected"] == 0) }' "$log"; then
+            why="nothing loaded: $(grep -h 'loaded=' "$log" | head -1)"
+        elif [ $i = 3 ] && ! awk '/TCACHE.*loaded=/ { for (f = 3; f <= NF; f++) { split($f, a, "="); t[a[1]] += a[2] } }
+                                  END { exit !(t["verify_ok"] > 0 && t["verify_bad"] == 0) }' "$log"; then
+            why="verify: $(grep -h 'VERIFY\|loaded=' "$log" | head -2 | tr '\n' ' ')"
+        elif [ $i = 4 ] && grep -q "PCREL\|SHAPE\|MISMATCH" "$log"; then
+            why="roundtrip: $(grep -h 'PCREL\|SHAPE\|MISMATCH' "$log" | head -1)"
+        fi
+        if [ -z "$why" ]; then
+            echo "PASS $name-$i-$mode"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$i-$mode ($why)"; fail=$((fail+1))
+        fi
+    done
+}
+
+run_tcache_case dtcache 'OK'
+run_tcache_case dtcache_low 'OK' -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000
 run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'

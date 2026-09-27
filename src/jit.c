@@ -380,6 +380,36 @@
  * child abandons the arena (rather than freeing it - the fork may have caught
  * the allocator mid-update) and builds a fresh one on its next step.
  *
+ * ---- kept translations ----
+ * With OCERZ_TCACHE=on a translation is written to src/tcache.c's store, and
+ * the next process to need the same key loads it instead of translating.  The
+ * code is emitted so that it can move: every value that differs between
+ * processes (an ocerz function or global, the commpage delta, the block's own
+ * JitBlock, an instruction or profile slot inside it, a RAS slot, a
+ * return-address cell, an indirect-call cache table, the leaf routines and the
+ * dispatch stub) is loaded by a fixed movz and three movk or sits in a literal
+ * cell, and translate records where (TcReloc); a leaf call and the
+ * dispatch-stub exit go through a register instead of a direct branch.  A load
+ * copies the code to the same address modulo 64, because the literal pool's
+ * padding and a loop head's alignment are absolute, and fills every site from
+ * the current process, allocating slots, cells and tables afresh.  A record
+ * also names every guest byte range the translation read through jit_decode -
+ * the block, the callees spliced into it, and the successors whose liveness it
+ * relied on, which is why a recording translation decodes successors itself
+ * rather than trusting the xlive memo or a successor's entry_live - and a hash
+ * of those bytes, which a load checks against guest memory first.  The key adds
+ * the memory model to jit_key, since a block translates differently once a
+ * second thread makes loads ordered.  A translation made because the process
+ * learned something (a flipped branch, the guard a commpage or alignment fault
+ * asked for) is never answered from the store: a key that carries a mark, or
+ * whose block was retired or invalidated, is translated again, and the new
+ * record replaces the old.  OCERZ_TCACHE=verify translates everything anyway
+ * and compares it with the record it would have loaded, counting a difference
+ * in shape as a variant and any other as a bug; OCERZ_TCACHE=roundtrip writes
+ * nothing, moves every translation to a fresh address, fills the original with
+ * BRK, and reports a PC-relative reference that leaves the block or a
+ * host-looking constant that no relocation covers.
+ *
  * ---- i386 ----
  * 32-bit blocks are compiled from a whitelist of instructions, with none of the
  * fusions, no superblocks, and 0x67/16-bit addressing left to the interpreter.
@@ -396,6 +426,7 @@
  * benchmark.
  */
 #include <execinfo.h>
+#include <dlfcn.h>
 #include "ocerz/jit.h"
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -410,6 +441,7 @@
 #include "ocerz/mode.h"
 #include "ocerz/vdylib.h"
 #include "ocerz/leaf.h"
+#include "ocerz/tcache.h"
 
 #include <sys/mman.h>
 #include <mach/thread_act.h>
@@ -701,7 +733,18 @@ static int g_plain_mem;
 static uint64_t g_chain_target;
 static uint32_t *g_chain_epi;
 static int g_chain_keeps_jgb;
-typedef struct { uint32_t *site; uint64_t retaddr; uint64_t hi; int kind; int rt; } RasLit;
+typedef struct { uint32_t *site; uint64_t retaddr; uint64_t hi; int kind; int rt; int tcr; } RasLit;
+enum { TCR_SYM = 1, TCR_COMMPAGE, TCR_BUCKETS, TCR_LEAF, TCR_DSTUB, TCR_BLK, TCR_INSN, TCR_PROF,
+       TCR_RASSLOT, TCR_PSC, TCR_RASCELL };
+enum { TCS_FLAGS_MATERIALIZE, TCS_RAS_PUSH, TCS_EXEC_ONE, TCS_EXEC_ONE_AT, TCS_JGB_TRAP,
+       TCS_RETIRE_COUNT, TCS_N };
+typedef struct { uint32_t off; uint8_t kind, form; uint64_t arg; } TcReloc;
+#define TC_RELOC_MAX 1024
+static TcReloc g_tc_rel[TC_RELOC_MAX];
+static int g_tc_nrel;
+static int g_tc_on;
+static int g_tc_bad;
+static const uint32_t *g_tc_entry;
 #define RASLIT_MAX 96
 static RasLit g_raslit[RASLIT_MAX];
 static int g_n_raslit;
@@ -712,6 +755,92 @@ static JitPscEnt *g_psc_pool;
 static size_t g_psc_used, g_psc_cap;
 static JitPscEnt **g_psc_tables;
 static size_t g_n_psc_tables, g_cap_psc_tables;
+static void tc_note(const uint32_t *at, int kind, int form, uint64_t arg)
+{
+    if (!g_tc_on || !g_tc_entry)
+        return;
+    if (g_tc_nrel >= TC_RELOC_MAX) { g_tc_bad = 1; return; }
+    g_tc_rel[g_tc_nrel].off = (uint32_t)(at - g_tc_entry);
+    g_tc_rel[g_tc_nrel].kind = (uint8_t)kind;
+    g_tc_rel[g_tc_nrel].form = (uint8_t)form;
+    g_tc_rel[g_tc_nrel].arg = arg;
+    g_tc_nrel++;
+}
+static void tc_imm64(A64Buf *b, int rd, int kind, uint64_t arg, uint64_t value)
+{
+    if (!g_tc_on) {
+        a64_mov_imm64(b, rd, value);
+        return;
+    }
+    tc_note(b->p, kind, 0, arg);
+    a64_movz(b, rd, (uint16_t)value, 0);
+    a64_movk(b, rd, (uint16_t)(value >> 16), 1);
+    a64_movk(b, rd, (uint16_t)(value >> 32), 2);
+    a64_movk(b, rd, (uint16_t)(value >> 48), 3);
+}
+#define TC_DLOG_MAX 4096
+#define TC_DBYTES_MAX (64u << 10)
+static struct { uint64_t pc; uint32_t at; uint8_t len; } g_tc_dlog[TC_DLOG_MAX];
+static uint8_t g_tc_dbytes[TC_DBYTES_MAX];
+static int g_tc_ndlog;
+static uint32_t g_tc_nbytes;
+static int g_tc_rec;
+static int g_tc_learned;
+static int jit_decode(uint64_t pc, X86Insn *out, int mode32)
+{
+    const uint8_t *code = (const uint8_t *)ocerz_g2h(pc);
+    int rc = ocerz_decode_mode(code, 15, pc, out, mode32);
+    if (rc == OCERZ_OK && g_tc_rec) {
+        if (g_tc_ndlog < TC_DLOG_MAX && g_tc_nbytes + out->len <= TC_DBYTES_MAX) {
+            g_tc_dlog[g_tc_ndlog].pc = pc;
+            g_tc_dlog[g_tc_ndlog].at = g_tc_nbytes;
+            g_tc_dlog[g_tc_ndlog].len = out->len;
+            memcpy(g_tc_dbytes + g_tc_nbytes, code, out->len);
+            g_tc_ndlog++;
+            g_tc_nbytes += out->len;
+        } else {
+            g_tc_bad = 1;
+        }
+    }
+    return rc;
+}
+static uint64_t *g_tc_noload;
+static size_t g_tc_noload_cap, g_tc_noload_n;
+static int tc_noload_has(uint64_t key)
+{
+    if (!g_tc_noload_n)
+        return 0;
+    size_t i = (size_t)((key * 0x9e3779b97f4a7c15ull) >> 20) & (g_tc_noload_cap - 1);
+    for (; g_tc_noload[i]; i = (i + 1) & (g_tc_noload_cap - 1))
+        if (g_tc_noload[i] == key)
+            return 1;
+    return 0;
+}
+static void tc_noload_add(uint64_t key)
+{
+    if (!key || ocerz_tcache_mode() != OCERZ_TC_ON || tc_noload_has(key))
+        return;
+    if (2 * (g_tc_noload_n + 1) > g_tc_noload_cap) {
+        size_t ncap = g_tc_noload_cap ? g_tc_noload_cap * 2 : 4096;
+        uint64_t *nv = (uint64_t *)calloc(ncap, sizeof *nv);
+        if (!nv)
+            return;
+        for (size_t k = 0; k < g_tc_noload_cap; k++) {
+            uint64_t v = g_tc_noload[k];
+            if (!v) continue;
+            size_t i = (size_t)((v * 0x9e3779b97f4a7c15ull) >> 20) & (ncap - 1);
+            while (nv[i]) i = (i + 1) & (ncap - 1);
+            nv[i] = v;
+        }
+        free(g_tc_noload);
+        g_tc_noload = nv;
+        g_tc_noload_cap = ncap;
+    }
+    size_t i = (size_t)((key * 0x9e3779b97f4a7c15ull) >> 20) & (g_tc_noload_cap - 1);
+    while (g_tc_noload[i]) i = (i + 1) & (g_tc_noload_cap - 1);
+    g_tc_noload[i] = key;
+    g_tc_noload_n++;
+}
 static JitPscEnt *psc_alloc(void)
 {
     if (g_psc_used + PSC_N > g_psc_cap) {
@@ -1700,7 +1829,7 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
     unsigned mslot = (unsigned)((mkey * 0x9E3779B97F4A7C15ull) >> 51) & (XLIVE_MEMO_SLOTS - 1);
     uint8_t head[16];
     int have_head = 0;
-    if (memo_on) {
+    if (memo_on && !g_tc_rec) {
         sigjmp_buf hb;
         sigjmp_buf *hprev = ocerz_jit_decode_recover;
         if (sigsetjmp(hb, 0) == 0) {
@@ -1721,8 +1850,7 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
     if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         while (n < JIT_MAX_BLOCK_INSNS) {
-            int rc = ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
-                                       &insns[n], g_xlat_mode32);
+            int rc = jit_decode(pc, &insns[n], g_xlat_mode32);
             if (rc != OCERZ_OK)
                 break;
             unsigned op = insns[n].op;
@@ -1771,8 +1899,7 @@ static int canonical_body_successor(uint64_t rip)
     if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         for (int n = 0; n < JIT_MAX_BLOCK_INSNS; n++) {
-            if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
-                                  &insn, g_xlat_mode32) != OCERZ_OK)
+            if (jit_decode(pc, &insn, g_xlat_mode32) != OCERZ_OK)
                 break;
             if (is_terminator(insn.op)) {
                 compatible = insn.op == OCERZ_OP_JCC ||
@@ -1796,8 +1923,7 @@ static unsigned decoded_terminator(uint64_t rip)
     if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         for (int n = 0; n < JIT_MAX_BLOCK_INSNS; n++) {
-            if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
-                                  &insn, g_xlat_mode32) != OCERZ_OK)
+            if (jit_decode(pc, &insn, g_xlat_mode32) != OCERZ_OK)
                 break;
             if (is_terminator(insn.op)) {
                 term = insn.op;
@@ -1827,8 +1953,7 @@ static int decoded_call_region_entry(uint64_t rip)
     if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         for (int n = 0; n < JIT_MAX_BLOCK_INSNS; n++) {
-            if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
-                                  &insn, g_xlat_mode32) != OCERZ_OK)
+            if (jit_decode(pc, &insn, g_xlat_mode32) != OCERZ_OK)
                 break;
             if (is_terminator(insn.op)) {
                 if (insn.op == OCERZ_OP_CALL || insn.op == OCERZ_OP_RET) {
@@ -1869,14 +1994,17 @@ static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth)
     JitBlock *t = jit ? cache_lookup(jit, rip, g_xlat_mode32) : NULL;
     if (g_xlive_log < 0) g_xlive_log = getenv("OCERZ_XLIVELOG") ? 1 : 0;
     if (t && t->code && g_xlive_log) fprintf(stderr, "ocerz: XLIVE cached rip=%#llx entry_live=%#x n_insns=%d\n", (unsigned long long)rip, t->entry_live, t->n_insns);
-    return (t && t->code) ? (uint64_t)t->entry_live : xlive_decode_entry_d(rip, depth);
+    return (t && t->code && !g_tc_rec) ? (uint64_t)t->entry_live : xlive_decode_entry_d(rip, depth);
 }
 static uint64_t xlive_succ_live(OcerzJit *jit, uint64_t rip) { return xlive_succ_live_d(jit, rip, 0); }
 
 static int probe_wanted(uint64_t jcc_rip, uint64_t ft_rip)
 {
-    if (flip_disabled() || g_n_probes >= PROBE_MAX) return 0;
-    if (flip_state(jcc_rip) != FLIP_NONE) return 0;
+    if (flip_disabled()) return 0;
+    if (g_n_probes >= PROBE_MAX || flip_state(jcc_rip) != FLIP_NONE) {
+        g_tc_learned = 1;
+        return 0;
+    }
     if (xlive_succ_live(g_xlat_jit, ft_rip) != 0) return 0;
     g_n_probes++;
     return 1;
@@ -2050,7 +2178,7 @@ static void emit_materialize(A64Buf *b)
         if (g_lane_used & (3u << (v - 4)))
             a64_stp_q_pre(b, v, v + 1, 31, -32);
     a64_mov_reg(b, 1, 0, 20);
-    a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_flags_materialize);
+    tc_imm64(b, 16, TCR_SYM, TCS_FLAGS_MATERIALIZE, (uint64_t)(uintptr_t)&ocerz_flags_materialize);
     a64_blr(b, 16);
     g_callout_seq++;
     for (int v = 14; v >= 4; v -= 2)
@@ -3590,7 +3718,7 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
     uint64_t ga;
     if (!ocerz_low_base && insn_const_addr(insn, &ga)) {
         if (ga >= OCERZ_COMMPAGE_LO && ga < OCERZ_COMMPAGE_HI) {
-            a64_mov_imm64(b, JTU, (uint64_t)(uintptr_t)ocerz_commpage - OCERZ_COMMPAGE_LO - ocerz_guest_base);
+            tc_imm64(b, JTU, TCR_COMMPAGE, 0, (uint64_t)(uintptr_t)ocerz_commpage - OCERZ_COMMPAGE_LO - ocerz_guest_base);
             a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
             return NULL;
         }
@@ -3617,7 +3745,7 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
         uint32_t *not_cp = a64_label(b);
         a64_bcond(b, A64_CS, 0);
-        a64_mov_imm64(b, JTU, (uint64_t)(uintptr_t)ocerz_commpage - OCERZ_COMMPAGE_LO - ocerz_guest_base);
+        tc_imm64(b, JTU, TCR_COMMPAGE, 0, (uint64_t)(uintptr_t)ocerz_commpage - OCERZ_COMMPAGE_LO - ocerz_guest_base);
         a64_add_reg(b, 1, addr_reg, addr_reg, JTU, 0);
         done_cp = a64_label(b);
         a64_b(b, 0);
@@ -4226,6 +4354,7 @@ static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand
             g_raslit[g_n_raslit].site = a64_label(b);
             g_raslit[g_n_raslit].retaddr = c;
             g_raslit[g_n_raslit].kind = 1;
+            g_raslit[g_n_raslit].tcr = 0;
             g_raslit[g_n_raslit].rt = JTA;
             g_n_raslit++;
             a64_emit32(b, 0x58000000u | (uint32_t)JTA);
@@ -11252,7 +11381,7 @@ static int g_tag_idx;
 #define A64_NOP 0xd503201fu
 static void emit_prof_count(A64Buf *b, JitProf *pf, uint32_t off)
 {
-    a64_mov_imm64(b, JT1, (uint64_t)(uintptr_t)pf);
+    tc_imm64(b, JT1, TCR_PROF, (uint64_t)((const char *)pf - (const char *)g_cur_blk->prof), (uint64_t)(uintptr_t)pf);
     a64_ldr(b, 4, JT2, JT1, off);
     a64_add_imm(b, 0, JT2, JT2, 1);
     a64_str(b, 4, JT2, JT1, off);
@@ -11260,7 +11389,7 @@ static void emit_prof_count(A64Buf *b, JitProf *pf, uint32_t off)
 static void emit_side_tag(A64Buf *b, int cpu_reg)
 {
     if (!g_tag_blk) return;
-    a64_mov_imm64(b, JT0, (uint64_t)(uintptr_t)g_tag_blk);
+    tc_imm64(b, JT0, TCR_BLK, 0, (uint64_t)(uintptr_t)g_tag_blk);
     a64_str(b, 8, JT0, cpu_reg, SIDE_BLK_OFF);
     a64_mov_imm64(b, JT0, (uint64_t)g_tag_idx);
     a64_str(b, 4, JT0, cpu_reg, SIDE_IDX_OFF);
@@ -12102,8 +12231,7 @@ static int emit_logic_jmp_incdec_jcc(A64Buf *b, const X86Insn *logic,
     if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         while (n < 2) {
-            int rc = ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
-                                       &target[n], g_xlat_mode32);
+            int rc = jit_decode(pc, &target[n], g_xlat_mode32);
             if (rc != OCERZ_OK)
                 break;
             unsigned op = target[n].op;
@@ -12203,8 +12331,7 @@ static int decode_ifconv_block(uint64_t rip, X86Insn *out, int cap)
     if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
         while (n < cap) {
-            if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc,
-                                  &out[n], g_xlat_mode32) != OCERZ_OK)
+            if (jit_decode(pc, &out[n], g_xlat_mode32) != OCERZ_OK)
                 break;
             unsigned op = out[n].op;
             pc += out[n].len;
@@ -13070,7 +13197,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                     g_n_raslit++;
                     a64_emit32(b, 0x58000000u | (uint32_t)JT0);
                 } else {
-                    a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)slot);
+                    tc_imm64(b, JTA, TCR_RASSLOT, retaddr, (uint64_t)(uintptr_t)slot);
                     a64_ldr(b, 8, JT0, JTA, 0);
                 }
                 a64_add_reg(b, 1, JTA, 20, JT2, 4);
@@ -13085,7 +13212,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 a64_mov_reg(b, 1, 0, 19);
                 a64_mov_reg(b, 1, 1, 20);
                 a64_mov_imm64(b, 2, retaddr);
-                a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_ras_push);
+                tc_imm64(b, 16, TCR_SYM, TCS_RAS_PUSH, (uint64_t)(uintptr_t)&ocerz_ras_push);
                 a64_blr(b, 16);
                 emit_fill_pinned_callersaved(b);
                 emit_reload_jgb(b);
@@ -13175,6 +13302,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             if (!hostras) a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
             if (fast3 && ras_body_only()) a64_str(b, 8, JT1, 20, RIP_OFF);
             if (ocerz_perfstat > 0) {
+                g_tc_bad = 1;
                 a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_stale);
                 a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
             }
@@ -13184,6 +13312,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             if (ras_empty) a64_patch_cbz(ras_empty, miss);
             if (fast3 && ras_body_only()) { a64_str(b, 8, JT1, 20, RIP_OFF); a64_patch_b(skip_rip, a64_label(b)); }
             if (ocerz_perfstat > 0) {
+                g_tc_bad = 1;
                 a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_miss);
                 a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
             }
@@ -13325,6 +13454,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
         g_raslit[g_n_raslit].site = a64_label(b);
         g_raslit[g_n_raslit].retaddr = (uint64_t)(uintptr_t)psc;
         g_raslit[g_n_raslit].kind = 1;
+        g_raslit[g_n_raslit].tcr = TCR_PSC;
         g_raslit[g_n_raslit].rt = JT2;
         g_n_raslit++;
         a64_emit32(b, 0x58000000u | (uint32_t)JT2);
@@ -13368,7 +13498,7 @@ static void emit_indirect_tail(A64Buf *b, JitIcSlot *slot,
     a64_eor_reg(b, 1, JTT, JTT, JTU, 0);
     a64_mov_imm64(b, JTU, JIT_HASH_MASK);
     a64_and_reg(b, 1, JTT, JTT, JTU, 0);
-    a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)g_xlat_jit->buckets);
+    tc_imm64(b, JTA, TCR_BUCKETS, 0, (uint64_t)(uintptr_t)g_xlat_jit->buckets);
     a64_ldr_regoff(b, 8, JTF, JTA, JTT, 1);
     uint32_t *loop = a64_label(b);
     uint32_t *to_nofind = a64_label(b); a64_cbz(b, 1, JTF, 0);
@@ -13501,7 +13631,7 @@ static uint32_t *emit_leaf_call_ret(A64Buf *b, const void *leaf, int writes, uin
                                     int *n_epi)
 {
     if (writes) {
-        a64_mov_imm64(b, JT0, (uint64_t)(uintptr_t)&ocerz_jit_retire_count);
+        tc_imm64(b, JT0, TCR_SYM, TCS_RETIRE_COUNT, (uint64_t)(uintptr_t)&ocerz_jit_retire_count);
         a64_ldr(b, 8, JT0, JT0, 0);
         a64_str(b, 8, JT0, 20, LEAF_EPOCH_OFF);
     }
@@ -13509,7 +13639,10 @@ static uint32_t *emit_leaf_call_ret(A64Buf *b, const void *leaf, int writes, uin
                               ? g_xlat_jit->leaf_near + ((const char *)leaf - ocerz_leaf_lo)
                               : (const char *)leaf;
     int64_t leaf_words = ((const char *)leaf_at - (const char *)b->p) / 4;
-    if (leaf_words > -(1 << 25) && leaf_words < (1 << 25)) {
+    if (g_tc_on) {
+        tc_imm64(b, 16, TCR_LEAF, (uint64_t)((const char *)leaf - ocerz_leaf_lo), (uint64_t)(uintptr_t)leaf_at);
+        a64_blr(b, 16);
+    } else if (leaf_words > -(1 << 25) && leaf_words < (1 << 25)) {
         a64_emit32(b, 0x94000000u | ((uint32_t)leaf_words & 0x03ffffffu));
     } else {
         a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)leaf_at);
@@ -13522,7 +13655,7 @@ static uint32_t *emit_leaf_call_ret(A64Buf *b, const void *leaf, int writes, uin
     uint32_t *retired = NULL;
     if (writes) {
         a64_ldr(b, 8, JT2, 20, LEAF_EPOCH_OFF);
-        a64_mov_imm64(b, JT0, (uint64_t)(uintptr_t)&ocerz_jit_retire_count);
+        tc_imm64(b, JT0, TCR_SYM, TCS_RETIRE_COUNT, (uint64_t)(uintptr_t)&ocerz_jit_retire_count);
         a64_ldr(b, 8, JT0, JT0, 0);
         a64_subs_reg(b, 1, A64_ZR, JT0, JT2, 0);
         retired = a64_label(b); a64_bcond(b, A64_NE, 0);
@@ -13638,6 +13771,7 @@ static void emit_bridge_fastcall(A64Buf *b, const X86Insn *insns, int i,
     emit_spill_pinned(b);
     a64_mov_reg(b, 1, 0, 19);
     a64_mov_reg(b, 1, 1, 20);
+    g_tc_bad = 1;
     a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_vdylib_fastcall);
     a64_blr(b, 16);
     g_callout_seq++;
@@ -13769,7 +13903,7 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
             uint32_t *full = a64_label(b);
             a64_bcond(b, A64_CS, 0);
             a64_mov_imm64(b, JTF, retaddr);
-            a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)rslot);
+            tc_imm64(b, JTA, TCR_RASSLOT, retaddr, (uint64_t)(uintptr_t)rslot);
             a64_ldr(b, 8, JT0, JTA, 0);
             a64_lsl_imm(b, 1, JTA, JT2, 4);
             a64_add_reg(b, 1, JTA, JTA, 20, 0);
@@ -13815,13 +13949,14 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         ptrdiff_t idx = (base && insn >= base && insn < base + g_cur_blk->n_insns) ? insn - base : -1;
         if (idx >= 0 && g_keep && idx < g_keep_n) {
             g_keep[idx] = 1;
-            a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_cur_blk);
+            tc_imm64(b, 2, TCR_BLK, 0, (uint64_t)(uintptr_t)g_cur_blk);
             a64_mov_imm64(b, 3, (uint64_t)idx);
-            a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_jit_exec_one_at);
+            tc_imm64(b, 16, TCR_SYM, TCS_EXEC_ONE_AT, (uint64_t)(uintptr_t)&ocerz_jit_exec_one_at);
         } else {
             g_no_compact = 1;
-            a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)insn);
-            a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&ocerz_jit_exec_one);
+            if (idx >= 0) tc_imm64(b, 2, TCR_INSN, (uint64_t)idx, (uint64_t)(uintptr_t)insn);
+            else { g_tc_bad = 1; a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)insn); }
+            tc_imm64(b, 16, TCR_SYM, TCS_EXEC_ONE, (uint64_t)(uintptr_t)&ocerz_jit_exec_one);
         }
     }
     a64_blr(b, 16);
@@ -14756,9 +14891,8 @@ static int splice_callee(uint64_t target, uint64_t ret_rip, uint64_t self_rip,
     for (int steps = 0; steps < 24; steps++) {
         if (*vn + 2 >= JIT_MAX_BLOCK_INSNS)
             goto fail;
-        const uint8_t *code = (const uint8_t *)ocerz_g2h(pc);
         X86Insn *in = &scratch[*vn];
-        if (ocerz_decode_mode(code, 15, pc, in, 0) != OCERZ_OK)
+        if (jit_decode(pc, in, 0) != OCERZ_OK)
             goto fail;
         unsigned op = in->op;
         if (op == OCERZ_OP_RET) {
@@ -14865,6 +14999,988 @@ static void compact_block(JitBlock *blk)
     g_cur_blk = NULL;
 }
 
+static uint32_t g_tc_pool_off;
+static _Atomic unsigned long long g_tc_n_ok, g_tc_n_bad, g_tc_n_pcrel, g_tc_n_mism, g_tc_n_const, g_tc_n_full;
+static int g_tc_log = -1;
+static FILE *g_tc_lf;
+
+static uint64_t tc_value(const OcerzJit *jit, const JitBlock *blk, int kind, uint64_t arg, int *ok)
+{
+    *ok = 1;
+    switch (kind) {
+    case TCR_SYM:
+        switch ((int)arg) {
+        case TCS_FLAGS_MATERIALIZE: return (uint64_t)(uintptr_t)&ocerz_flags_materialize;
+        case TCS_RAS_PUSH: return (uint64_t)(uintptr_t)&ocerz_ras_push;
+        case TCS_EXEC_ONE: return (uint64_t)(uintptr_t)&ocerz_jit_exec_one;
+        case TCS_EXEC_ONE_AT: return (uint64_t)(uintptr_t)&ocerz_jit_exec_one_at;
+        case TCS_JGB_TRAP: return (uint64_t)(uintptr_t)&ocerz_jgb_trap;
+        case TCS_RETIRE_COUNT: return (uint64_t)(uintptr_t)&ocerz_jit_retire_count;
+        default: break;
+        }
+        break;
+    case TCR_COMMPAGE:
+        if (ocerz_commpage)
+            return (uint64_t)(uintptr_t)ocerz_commpage - OCERZ_COMMPAGE_LO - ocerz_guest_base;
+        break;
+    case TCR_BUCKETS:
+        return (uint64_t)(uintptr_t)jit->buckets;
+    case TCR_LEAF:
+        return (uint64_t)(uintptr_t)(jit->leaf_near ? jit->leaf_near + arg : ocerz_leaf_lo + arg);
+    case TCR_DSTUB: {
+        const uint32_t *d = arg ? jit->dispatch_stub32 : jit->dispatch_stub;
+        if (d) return (uint64_t)(uintptr_t)d;
+        break;
+    }
+    case TCR_BLK:
+        return (uint64_t)(uintptr_t)blk;
+    case TCR_INSN:
+        if (blk->insns && arg < (uint64_t)blk->n_insns)
+            return (uint64_t)(uintptr_t)&blk->insns[arg];
+        break;
+    case TCR_PROF:
+        if (blk->prof && arg < SIDE_MAX * sizeof(JitProf))
+            return (uint64_t)(uintptr_t)((const char *)blk->prof + arg);
+        break;
+    default:
+        break;
+    }
+    *ok = 0;
+    return 0;
+}
+
+static uint64_t tc_imm_read(const uint32_t *w)
+{
+    uint64_t v = 0;
+    for (int k = 0; k < 4; k++)
+        v |= (uint64_t)((w[k] >> 5) & 0xffffu) << (16 * k);
+    return v;
+}
+
+static int tc_imm_shape(const uint32_t *w)
+{
+    if ((w[0] & 0xffe00000u) != 0xd2800000u)
+        return 0;
+    for (int k = 1; k < 4; k++)
+        if ((w[k] & 0xffe00000u) != (0xf2800000u | ((uint32_t)k << 21)) || (w[k] & 31) != (w[0] & 31))
+            return 0;
+    return 1;
+}
+
+static void tc_imm_write(uint32_t *w, uint64_t v)
+{
+    for (int k = 0; k < 4; k++)
+        w[k] = (w[k] & ~(0xffffu << 5)) | ((uint32_t)(v >> (16 * k)) & 0xffffu) << 5;
+}
+
+static void tc_ras_fill(OcerzJit *jit, void **cell, uint64_t retaddr, int mode32)
+{
+    JitBlock *rb = cache_lookup(jit, retaddr, mode32);
+    if (rb && rb->code)
+        *cell = ras_entry_for(rb);
+    else {
+        *cell = NULL;
+        pending_add_ras(jit_key(retaddr, mode32), cell);
+    }
+}
+
+static uint64_t g_tc_val[TC_RELOC_MAX];
+
+static int tc_bind(OcerzJit *jit, JitBlock *blk, uint32_t *code, const TcReloc *rel, int nrel, int fresh)
+{
+    int mode32 = blk_mode32(blk);
+    if (fresh)
+        for (int i = 0; i < nrel; i++) {
+            const TcReloc *r = &rel[i];
+            if (r->kind == TCR_RASCELL)
+                continue;
+            if (r->kind == TCR_RASSLOT) {
+                void **sl = ras_slot_alloc();
+                if (!sl) return 0;
+                g_tc_val[i] = (uint64_t)(uintptr_t)sl;
+            } else if (r->kind == TCR_PSC) {
+                JitPscEnt *t = psc_alloc();
+                if (!t) return 0;
+                g_tc_val[i] = (uint64_t)(uintptr_t)t;
+            } else {
+                int ok;
+                g_tc_val[i] = tc_value(jit, blk, r->kind, r->arg, &ok);
+                if (!ok) return 0;
+            }
+        }
+    for (int i = 0; i < nrel; i++) {
+        const TcReloc *r = &rel[i];
+        uint32_t *w = code + r->off;
+        if (r->kind == TCR_RASCELL) {
+            ras_cell_register((void **)w);
+            tc_ras_fill(jit, (void **)w, r->arg, mode32);
+            continue;
+        }
+        if (!fresh)
+            continue;
+        if (r->kind == TCR_RASSLOT)
+            tc_ras_fill(jit, (void **)(uintptr_t)g_tc_val[i], r->arg, mode32);
+        if (r->form == 1)
+            *(uint64_t *)(void *)w = g_tc_val[i];
+        else
+            tc_imm_write(w, g_tc_val[i]);
+    }
+    return 1;
+}
+
+static const uint32_t *tc_pcrel_target(const uint32_t *w)
+{
+    uint32_t v = *w;
+    int64_t off;
+    if ((v & 0x7c000000u) == 0x14000000u)
+        off = (int64_t)((int32_t)(v << 6) >> 6) * 4;
+    else if ((v & 0xff000010u) == 0x54000000u || (v & 0x7e000000u) == 0x34000000u ||
+             (v & 0x3b000000u) == 0x18000000u)
+        off = (int64_t)((int32_t)(v << 8) >> 13) * 4;
+    else if ((v & 0x7e000000u) == 0x36000000u)
+        off = (int64_t)((int32_t)(v << 13) >> 18) * 4;
+    else if ((v & 0x9f000000u) == 0x10000000u)
+        off = (int64_t)(((int32_t)(v << 8) >> 13) * 4) | ((v >> 29) & 3);
+    else if ((v & 0x9f000000u) == 0x90000000u)
+        return NULL;
+    else
+        return w;
+    return (const uint32_t *)((const uint8_t *)w + off);
+}
+
+static int tc_is_reloc_word(uint32_t w)
+{
+    for (int i = 0; i < g_tc_nrel; i++) {
+        uint32_t o = g_tc_rel[i].off, len = g_tc_rel[i].form == 1 ? 2 : 4;
+        if (w >= o && w < o + len)
+            return 1;
+    }
+    return 0;
+}
+
+static int tc_insn_at(const JitBlock *blk, uint32_t w)
+{
+    int ii = -1;
+    if (blk->insn_off)
+        for (int k = 0; k < blk->n_insns; k++)
+            if (blk->insn_off[k] <= w) ii = k;
+    return ii;
+}
+
+static void tc_report(const JitBlock *blk, const char *what, uint32_t w, uint32_t v, uint64_t x)
+{
+    static int n;
+    if (!g_tc_log || __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) >= 60)
+        return;
+    int ii = tc_insn_at(blk, w);
+    char tb[128] = "";
+    if (ii >= 0 && blk->insns)
+        ocerz_format_insn(&blk->insns[ii], tb, sizeof tb);
+    fprintf(g_tc_lf, "ocerz: TCACHE[%d] %s rip=%#llx word=%u v=%08x x=%#llx insn=%d %s\n", (int)getpid(), what,
+            (unsigned long long)blk_rip(blk), w, v, (unsigned long long)x, ii, tb);
+}
+
+static int tc_host_const(const OcerzJit *jit, const JitBlock *blk, uint64_t x)
+{
+    static const void *self_base;
+    if (!self_base) {
+        Dl_info di;
+        if (dladdr((const void *)&ocerz_jit_exec_one, &di)) self_base = di.dli_fbase;
+    }
+    const uint8_t *p = (const uint8_t *)(uintptr_t)x;
+    if (p >= (const uint8_t *)jit->code_base && p < (const uint8_t *)jit->code_end)
+        return 1;
+    if (p >= (const uint8_t *)blk && p < (const uint8_t *)(blk + 1))
+        return 1;
+    if (blk->insns && p >= (const uint8_t *)blk->insns && p < (const uint8_t *)(blk->insns + blk->n_insns))
+        return 1;
+    if (blk->prof && p >= (const uint8_t *)blk->prof && p < (const uint8_t *)(blk->prof + SIDE_MAX))
+        return 1;
+    if (ocerz_commpage && x == (uint64_t)(uintptr_t)ocerz_commpage - OCERZ_COMMPAGE_LO - ocerz_guest_base)
+        return 1;
+    if (g_ras_slots && p >= (const uint8_t *)g_ras_slots && p < (const uint8_t *)(g_ras_slots + RAS_SLOT_CAP))
+        return 1;
+    if (p >= (const uint8_t *)jit && p < (const uint8_t *)(jit + 1))
+        return 1;
+    if (x >= 0x100000000ull && x < 0x800000000000ull) {
+        Dl_info di;
+        if (self_base && dladdr(p, &di) && di.dli_fbase == self_base)
+            return 1;
+    }
+    return 0;
+}
+
+static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *code, uint32_t words)
+{
+    int bad = 0;
+    uint32_t end = g_tc_pool_off < words ? g_tc_pool_off : words;
+    for (uint32_t w = 0; w < end; w++) {
+        if (tc_is_reloc_word(w))
+            continue;
+        const uint32_t *t = tc_pcrel_target(code + w);
+        if (t == code + w)
+            continue;
+        if (!t || t < code || t >= code + words) {
+            tc_report(blk, "PCREL", w, code[w], t ? (uint64_t)(t - code) : 0);
+            g_tc_n_pcrel++;
+            bad = 1;
+        }
+    }
+    for (uint32_t w = 0; w < end; w++) {
+        uint32_t v = code[w];
+        if ((v & 0xffe00000u) != 0xd2800000u || tc_is_reloc_word(w))
+            continue;
+        int rd = (int)(v & 31);
+        uint64_t x = (uint64_t)((v >> 5) & 0xffffu);
+        uint32_t k = w + 1;
+        while (k < end && (code[k] & 0xff800000u) == 0xf2800000u && (int)(code[k] & 31) == rd) {
+            int hw = (int)((code[k] >> 21) & 3);
+            x = (x & ~(0xffffull << (16 * hw))) | ((uint64_t)((code[k] >> 5) & 0xffffu) << (16 * hw));
+            k++;
+        }
+        if (k > w + 1 && tc_host_const(jit, blk, x)) {
+            tc_report(blk, "HOSTCONST", w, v, x);
+            g_tc_n_const++;
+            bad = 1;
+        }
+    }
+    return bad;
+}
+
+static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
+
+static void tc_summary(void)
+{
+    if (ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP)
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d] roundtrip ok=%llu bad=%llu pcrel=%llu hostconst=%llu mismatch=%llu full=%llu\n",
+                (int)getpid(), (unsigned long long)g_tc_n_ok, (unsigned long long)g_tc_n_bad,
+                (unsigned long long)g_tc_n_pcrel, (unsigned long long)g_tc_n_const,
+                (unsigned long long)g_tc_n_mism, (unsigned long long)g_tc_n_full);
+    else
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
+                         " verify_variant=%llu verify_bad=%llu\n",
+                (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_put,
+                (unsigned long long)g_tc_n_stale, (unsigned long long)g_tc_n_rej,
+                (unsigned long long)g_tc_n_vok, (unsigned long long)g_tc_n_vvar, (unsigned long long)g_tc_n_vbad);
+    fflush(g_tc_lf);
+}
+
+void ocerz_jit_tcache_final(void);
+void ocerz_jit_tcache_final(void)
+{
+    ocerz_tcache_flush();
+    if (g_tc_log > 0)
+        tc_summary();
+}
+
+static uint32_t *tc_roundtrip(OcerzJit *jit, JitBlock *blk, uint32_t *entry)
+{
+    uint32_t words = blk->code_words;
+    int bad = g_tc_bad;
+    if (tc_scan(jit, blk, entry, words))
+        bad = 1;
+    for (int i = 0; i < g_tc_nrel; i++) {
+        const TcReloc *r = &g_tc_rel[i];
+        if (r->form != 0)
+            continue;
+        if (r->off + 4 > words || !tc_imm_shape(entry + r->off)) {
+            tc_report(blk, "SHAPE", r->off, r->off < words ? entry[r->off] : 0, r->kind);
+            g_tc_n_mism++;
+            bad = 1;
+            continue;
+        }
+        if (r->kind == TCR_RASSLOT)
+            continue;
+        int ok;
+        uint64_t v = tc_value(jit, blk, r->kind, r->arg, &ok);
+        if (!ok || v != tc_imm_read(entry + r->off)) {
+            tc_report(blk, "MISMATCH", r->off, entry[r->off], ((uint64_t)r->kind << 56) | r->arg);
+            g_tc_n_mism++;
+            bad = 1;
+        }
+    }
+    if (bad) {
+        g_tc_n_bad++;
+        return NULL;
+    }
+    uint8_t *p = (uint8_t *)jit->code_cur;
+    uint8_t *copy = p + (((uintptr_t)entry - (uintptr_t)p) & 63);
+    if (copy + (size_t)words * 4 > (uint8_t *)jit->code_end) {
+        g_tc_n_full++;
+        return NULL;
+    }
+    uint32_t *c = (uint32_t *)copy;
+    pthread_jit_write_protect_np(0);
+    memcpy(c, entry, (size_t)words * 4);
+    if (!tc_bind(jit, blk, c, g_tc_rel, g_tc_nrel, 1)) {
+        pthread_jit_write_protect_np(1);
+        g_tc_n_bad++;
+        return NULL;
+    }
+    for (uint32_t w = 0; w < words; w++)
+        entry[w] = 0xd4200000u | (0xc0deu << 5);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(entry, (size_t)words * 4);
+    sys_icache_invalidate(c, (size_t)words * 4);
+    jit->code_cur = c + words;
+
+    ptrdiff_t d = c - entry;
+#define TC_RB(p) ((p) ? (p) + d : NULL)
+    blk->code = (JitBlockFn)(void *)c;
+    blk->body_code = TC_RB(blk->body_code);
+    blk->body_noreload = TC_RB(blk->body_noreload);
+    blk->stop_patch = TC_RB(blk->stop_patch);
+    for (int i = 0; i < blk->n_stop_extra; i++)
+        blk->stop_extra[i].site = TC_RB(blk->stop_extra[i].site);
+    for (int i = 0; i < blk->n_edges; i++) {
+        blk->edges[i].patch_b = TC_RB(blk->edges[i].patch_b);
+        blk->edges[i].cond_site = TC_RB(blk->edges[i].cond_site);
+    }
+    if (blk->prof)
+        for (int k = 0; k < SIDE_MAX; k++) {
+            blk->prof[k].ft_site = TC_RB(blk->prof[k].ft_site);
+            blk->prof[k].tk_trip = TC_RB(blk->prof[k].tk_trip);
+        }
+#undef TC_RB
+    g_tc_n_ok++;
+    return c;
+}
+
+static void blk_chain_install(OcerzJit *jit, JitBlock *blk)
+{
+    if (g_no_chain)
+        return;
+    chain_batch_begin();
+    for (int i = 0; i < blk->n_edges; i++) {
+        uint32_t *cs = blk->edges[i].probing ? NULL : blk->edges[i].cond_site;
+        JitBlock *t = cache_lookup(jit, blk->edges[i].target_rip, blk_mode32(blk));
+        if (t && t->code) {
+            void *dst = (void *)t->code;
+            if (blk->edges[i].kind == EDGE_BODY) {
+                int compatible = blk->edges[i].pin_class
+                    ? t->pin_class == blk->edges[i].pin_class
+                    : (t->pin_class == 0 && t->n_pinned == 0);
+                if (!compatible || !t->body_code)
+                    dst = NULL;
+                else
+                    dst = body_entry_for(t, blk->hoist_sig);
+            }
+            if (dst) {
+                chain_activate(blk->edges[i].patch_b, dst);
+                chain_cond_short(cs, dst);
+                pred_add(t, blk, i);
+            }
+        } else {
+            pending_add(jit_key(blk->edges[i].target_rip, blk_mode32(blk)),
+                        blk->edges[i].patch_b, blk->edges[i].kind,
+                        blk->edges[i].pin_class, cs, blk->hoist_sig, blk, i);
+        }
+    }
+    pending_drain(blk->key, blk);
+    chain_batch_end();
+}
+
+typedef struct {
+    OcerzTcRecHead h;
+    uint64_t dep_hash, hoist_sig;
+    uint32_t code_words, entry_mod, n_insns, n_kept, n_rel, n_dep, n_oslow, n_lanerec;
+    uint32_t n_push_fix, n_pushelide, body_code, body_noreload, stop_patch, stop_insn;
+    int32_t n_inlined, n_slow;
+    uint16_t entry_live, xmm_pinned;
+    uint8_t n_edges, n_stop_extra, n_pinned, pin_class, ordered_loads, flags, pad[6];
+    uint8_t host_holds[16];
+    int8_t guest_in_host[16];
+} TcRec;
+typedef struct { uint64_t lo, hi; } TcDep;
+typedef struct { uint32_t off, insn; } TcStop;
+typedef struct {
+    uint64_t target_rip, jcc_rip;
+    uint32_t patch_b, fallback_insn, cond_site, cond_orig;
+    uint8_t kind, pin_class, side, probing, pad[4];
+} TcEdge;
+typedef struct { uint32_t ft_site, tk_trip; } TcProf;
+enum { TCF_COMPACT = 1, TCF_FAULTF = 2, TCF_PROF = 4, TCF_LEARNED = 8 };
+#define TC_NONE UINT32_MAX
+#define TC_OUT_MAX (256u << 10)
+#define TC_HASH_SEED 0x243f6a8885a308d3ull
+_Static_assert(sizeof(TcRec) % 8 == 0 && sizeof(TcEdge) % 8 == 0, "tcache record layout");
+
+typedef struct {
+    const TcRec *r;
+    const uint32_t *code;
+    const TcReloc *rel;
+    const TcDep *dep;
+    const uint32_t *insn_off;
+    const JitInsnRef *iref;
+    const X86Insn *insns;
+    const JitFaultFlagRecipe *ff;
+    const struct JitOslowMap *oslow;
+    const struct JitLaneRec *lanerec;
+    const uint32_t *push_fix;
+    const struct JitPushElide *pushelide;
+    const TcStop *stop;
+    const TcEdge *edge;
+    const TcProf *prof;
+} TcView;
+
+static uint64_t g_tc_key;
+static TcDep g_tc_mdep[TC_DLOG_MAX];
+static uint8_t g_tc_mbytes[TC_DBYTES_MAX];
+static uint8_t *g_tc_out;
+static size_t g_tc_opos;
+
+static void tc_log_init(void)
+{
+    if (g_tc_log >= 0)
+        return;
+    const char *lp = getenv("OCERZ_TCACHE_LOG");
+    g_tc_lf = lp && strcmp(lp, "1") ? fopen(lp, "a") : NULL;
+    if (g_tc_lf) setvbuf(g_tc_lf, NULL, _IOLBF, 0);
+    if (!g_tc_lf) g_tc_lf = stderr;
+    g_tc_log = lp ? 1 : 0;
+    if (g_tc_log) atexit(tc_summary);
+}
+
+static int tc_usable(const OcerzJit *jit)
+{
+    return ocerz_mode != OCERZ_MODE_NATIVE && ocerz_jitstat <= 0 && ocerz_perfstat <= 0 &&
+           !jit->stop_requested;
+}
+
+static uint64_t tc_key(uint64_t rip, int mode32)
+{
+    return rip | (mode32 ? OCERZ_TC_KEY_M32 : 0) | (g_plain_mem ? OCERZ_TC_KEY_PLAIN : 0);
+}
+
+static uint64_t tc_mix(uint64_t h, uint64_t w)
+{
+    h = (h ^ w) * 0x9e3779b97f4a7c15ull;
+    return h ^ (h >> 29);
+}
+
+static uint64_t tc_hash_range(uint64_t h, uint64_t lo, const uint8_t *p, uint64_t n)
+{
+    h = tc_mix(tc_mix(h, lo), n);
+    while (n >= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        h = tc_mix(h, w);
+        p += 8;
+        n -= 8;
+    }
+    uint64_t t = 0;
+    for (uint64_t i = 0; i < n; i++)
+        t |= (uint64_t)p[i] << (8 * i);
+    return tc_mix(h, t ^ (n << 56));
+}
+
+static int cmp_dlog(const void *a, const void *b)
+{
+    const __typeof__(g_tc_dlog[0]) *x = a, *y = b;
+    if (x->pc != y->pc)
+        return x->pc < y->pc ? -1 : 1;
+    return (int)x->len - (int)y->len;
+}
+
+static int tc_deps_build(uint32_t *ndep, uint64_t *hash)
+{
+    if (!g_tc_ndlog)
+        return 0;
+    qsort(g_tc_dlog, (size_t)g_tc_ndlog, sizeof g_tc_dlog[0], cmp_dlog);
+    uint32_t nd = 0, mb = 0, cur = 0;
+    for (int i = 0; i < g_tc_ndlog; i++) {
+        uint64_t lo = g_tc_dlog[i].pc, hi = lo + g_tc_dlog[i].len;
+        const uint8_t *src = g_tc_dbytes + g_tc_dlog[i].at;
+        if (nd && lo <= g_tc_mdep[nd - 1].hi) {
+            TcDep *d = &g_tc_mdep[nd - 1];
+            uint64_t ov = hi < d->hi ? hi : d->hi;
+            for (uint64_t a = lo; a < ov; a++)
+                if (g_tc_mbytes[cur + (a - d->lo)] != src[a - lo])
+                    return 0;
+            if (hi > d->hi) {
+                memcpy(g_tc_mbytes + mb, src + (d->hi - lo), (size_t)(hi - d->hi));
+                mb += (uint32_t)(hi - d->hi);
+                d->hi = hi;
+            }
+        } else {
+            cur = mb;
+            g_tc_mdep[nd].lo = lo;
+            g_tc_mdep[nd].hi = hi;
+            nd++;
+            memcpy(g_tc_mbytes + mb, src, (size_t)(hi - lo));
+            mb += (uint32_t)(hi - lo);
+        }
+    }
+    uint64_t h = TC_HASH_SEED;
+    uint32_t at = 0;
+    for (uint32_t i = 0; i < nd; i++) {
+        uint64_t len = g_tc_mdep[i].hi - g_tc_mdep[i].lo;
+        h = tc_hash_range(h, g_tc_mdep[i].lo, g_tc_mbytes + at, len);
+        at += (uint32_t)len;
+    }
+    *ndep = nd;
+    *hash = h;
+    return 1;
+}
+
+static int tc_deps_check(const TcDep *d, uint32_t n, uint64_t want)
+{
+    volatile uint64_t h = 0;
+    volatile int ok = 0;
+    sigjmp_buf db;
+    sigjmp_buf *prev = ocerz_jit_decode_recover;
+    if (sigsetjmp(db, 0) == 0) {
+        ocerz_jit_decode_recover = &db;
+        uint64_t hh = TC_HASH_SEED;
+        int good = 1;
+        for (uint32_t i = 0; i < n && good; i++) {
+            if (d[i].hi <= d[i].lo || d[i].hi - d[i].lo > TC_DBYTES_MAX)
+                good = 0;
+            else
+                hh = tc_hash_range(hh, d[i].lo, (const uint8_t *)ocerz_g2h(d[i].lo), d[i].hi - d[i].lo);
+        }
+        h = hh;
+        ok = good;
+    }
+    ocerz_jit_decode_recover = prev;
+    return ok && h == want;
+}
+
+static int tc_out(const void *p, size_t n)
+{
+    size_t a = (n + 7) & ~(size_t)7;
+    if (g_tc_opos + a > TC_OUT_MAX)
+        return 0;
+    if (n)
+        memcpy(g_tc_out + g_tc_opos, p, n);
+    memset(g_tc_out + g_tc_opos + n, 0, a - n);
+    g_tc_opos += a;
+    return 1;
+}
+
+static uint32_t tc_off(const JitBlock *blk, const uint32_t *p)
+{
+    return p ? (uint32_t)(p - (const uint32_t *)(const void *)blk->code) : TC_NONE;
+}
+
+static void tc_put(OcerzJit *jit, JitBlock *blk)
+{
+    (void)jit;
+    int n = blk->n_insns;
+    int compact = blk->insns == NULL;
+    if (!blk->code || !blk->insn_off || n <= 0 || (compact && !blk->iref))
+        return;
+    if (!g_tc_out && !(g_tc_out = (uint8_t *)malloc(TC_OUT_MAX)))
+        return;
+    uint32_t ndep;
+    uint64_t dh;
+    if (!tc_deps_build(&ndep, &dh))
+        return;
+    TcRec r;
+    memset(&r, 0, sizeof r);
+    r.h.magic = OCERZ_TC_REC_MAGIC;
+    r.h.key = g_tc_key;
+    r.dep_hash = dh;
+    r.hoist_sig = blk->hoist_sig;
+    r.code_words = blk->code_words;
+    r.entry_mod = (uint32_t)((uintptr_t)(void *)blk->code & 63);
+    r.n_insns = (uint32_t)n;
+    r.n_kept = compact ? blk->n_kept : 0;
+    r.n_rel = (uint32_t)g_tc_nrel;
+    r.n_dep = ndep;
+    r.n_oslow = blk->oslow ? (uint32_t)blk->n_oslow : 0;
+    r.n_lanerec = blk->lanerec ? (uint32_t)blk->n_lanerec : 0;
+    r.n_push_fix = blk->push_fix ? blk->n_push_fix : 0;
+    r.n_pushelide = blk->pushelide ? blk->n_pushelide : 0;
+    r.body_code = tc_off(blk, blk->body_code);
+    r.body_noreload = tc_off(blk, blk->body_noreload);
+    r.stop_patch = tc_off(blk, blk->stop_patch);
+    r.stop_insn = blk->stop_insn;
+    r.n_inlined = blk->n_inlined;
+    r.n_slow = blk->n_slow;
+    r.entry_live = blk->entry_live;
+    r.xmm_pinned = blk->xmm_pinned;
+    r.n_edges = blk->n_edges;
+    r.n_stop_extra = blk->n_stop_extra;
+    r.n_pinned = blk->n_pinned;
+    r.pin_class = blk->pin_class;
+    r.ordered_loads = blk->ordered_loads;
+    r.flags = (uint8_t)((compact ? TCF_COMPACT : 0) | (blk->fault_flags ? TCF_FAULTF : 0) |
+                        (blk->prof ? TCF_PROF : 0) | (g_tc_learned ? TCF_LEARNED : 0));
+    memcpy(r.host_holds, blk->host_holds, sizeof r.host_holds);
+    memcpy(r.guest_in_host, blk->guest_in_host, sizeof r.guest_in_host);
+
+    TcStop st[6];
+    for (int i = 0; i < blk->n_stop_extra && i < 6; i++) {
+        st[i].off = tc_off(blk, blk->stop_extra[i].site);
+        st[i].insn = blk->stop_extra[i].insn;
+    }
+    TcEdge ed[JIT_MAX_EDGES];
+    memset(ed, 0, sizeof ed);
+    for (int i = 0; i < blk->n_edges && i < JIT_MAX_EDGES; i++) {
+        ed[i].target_rip = blk->edges[i].target_rip;
+        ed[i].jcc_rip = blk->edges[i].jcc_rip;
+        ed[i].patch_b = tc_off(blk, blk->edges[i].patch_b);
+        ed[i].fallback_insn = blk->edges[i].fallback_insn;
+        ed[i].cond_site = tc_off(blk, blk->edges[i].cond_site);
+        ed[i].cond_orig = blk->edges[i].cond_orig;
+        ed[i].kind = blk->edges[i].kind;
+        ed[i].pin_class = blk->edges[i].pin_class;
+        ed[i].side = blk->edges[i].side;
+        ed[i].probing = blk->edges[i].probing;
+    }
+    TcProf pf[SIDE_MAX];
+    for (int k = 0; k < SIDE_MAX && blk->prof; k++) {
+        pf[k].ft_site = tc_off(blk, blk->prof[k].ft_site);
+        pf[k].tk_trip = tc_off(blk, blk->prof[k].tk_trip);
+    }
+
+    g_tc_opos = 0;
+    int ok = tc_out(&r, sizeof r) &&
+             tc_out((const void *)blk->code, (size_t)blk->code_words * 4) &&
+             tc_out(g_tc_rel, (size_t)g_tc_nrel * sizeof(TcReloc)) &&
+             tc_out(g_tc_mdep, (size_t)ndep * sizeof(TcDep)) &&
+             tc_out(blk->insn_off, (size_t)n * sizeof(uint32_t));
+    if (ok && compact)
+        ok = tc_out(blk->iref, (size_t)n * sizeof(JitInsnRef)) &&
+             tc_out(blk->kept, (size_t)r.n_kept * sizeof(X86Insn));
+    else if (ok)
+        ok = tc_out(blk->insns, (size_t)n * sizeof(X86Insn));
+    if (ok && blk->fault_flags)
+        ok = tc_out(blk->fault_flags, (size_t)n * sizeof(JitFaultFlagRecipe));
+    ok = ok && tc_out(blk->oslow, (size_t)r.n_oslow * sizeof *blk->oslow) &&
+         tc_out(blk->lanerec, (size_t)r.n_lanerec * sizeof *blk->lanerec) &&
+         tc_out(blk->push_fix, (size_t)r.n_push_fix * sizeof(uint32_t)) &&
+         tc_out(blk->pushelide, (size_t)r.n_pushelide * sizeof *blk->pushelide) &&
+         tc_out(st, (size_t)r.n_stop_extra * sizeof(TcStop)) &&
+         tc_out(ed, (size_t)r.n_edges * sizeof(TcEdge));
+    if (ok && blk->prof)
+        ok = tc_out(pf, sizeof pf);
+    if (!ok)
+        return;
+    ((TcRec *)(void *)g_tc_out)->h.size = (uint32_t)g_tc_opos;
+    ocerz_tcache_put((const OcerzTcRecHead *)(const void *)g_tc_out);
+    g_tc_n_put++;
+}
+
+#define TC_TAKE(dst, type, count) do { \
+        size_t nb_ = (size_t)(count) * sizeof(type); \
+        if (p > end || (size_t)(end - p) < nb_) return 0; \
+        (dst) = (const type *)(const void *)p; \
+        p += (nb_ + 7) & ~(size_t)7; \
+    } while (0)
+
+static int tc_parse(const OcerzTcRecHead *h, TcView *v)
+{
+    memset(v, 0, sizeof *v);
+    if (h->size < sizeof(TcRec))
+        return 0;
+    const TcRec *r = (const TcRec *)(const void *)h;
+    const uint8_t *p = (const uint8_t *)(r + 1), *end = (const uint8_t *)h + h->size;
+    uint32_t words = r->code_words, n = r->n_insns;
+    if (!words || words > (1u << 20) || !n || n > JIT_MAX_BLOCK_INSNS || r->n_kept > n ||
+        r->n_rel > TC_RELOC_MAX || !r->n_dep || r->n_dep > TC_DLOG_MAX || r->n_edges > JIT_MAX_EDGES ||
+        r->n_stop_extra > 6 || r->n_push_fix > 0xffff || r->n_pushelide > 0xffff ||
+        r->n_oslow > (1u << 16) || r->n_lanerec > (1u << 16) || r->entry_mod >= 64 || (r->entry_mod & 3))
+        return 0;
+    v->r = r;
+    TC_TAKE(v->code, uint32_t, words);
+    TC_TAKE(v->rel, TcReloc, r->n_rel);
+    TC_TAKE(v->dep, TcDep, r->n_dep);
+    TC_TAKE(v->insn_off, uint32_t, n);
+    if (r->flags & TCF_COMPACT) {
+        TC_TAKE(v->iref, JitInsnRef, n);
+        TC_TAKE(v->insns, X86Insn, r->n_kept);
+    } else {
+        TC_TAKE(v->insns, X86Insn, n);
+    }
+    if (r->flags & TCF_FAULTF)
+        TC_TAKE(v->ff, JitFaultFlagRecipe, n);
+    TC_TAKE(v->oslow, struct JitOslowMap, r->n_oslow);
+    TC_TAKE(v->lanerec, struct JitLaneRec, r->n_lanerec);
+    TC_TAKE(v->push_fix, uint32_t, r->n_push_fix);
+    TC_TAKE(v->pushelide, struct JitPushElide, r->n_pushelide);
+    TC_TAKE(v->stop, TcStop, r->n_stop_extra);
+    TC_TAKE(v->edge, TcEdge, r->n_edges);
+    if (r->flags & TCF_PROF)
+        TC_TAKE(v->prof, TcProf, SIDE_MAX);
+    for (uint32_t i = 0; i < r->n_rel; i++)
+        if (v->rel[i].off + (v->rel[i].form == 1 ? 2u : 4u) > words ||
+            (v->rel[i].form == 1 && (((uintptr_t)r->entry_mod + 4u * v->rel[i].off) & 7)) ||
+            (v->rel[i].form == 0 && !tc_imm_shape(v->code + v->rel[i].off)))
+            return 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (v->insn_off[i] >= words)
+            return 0;
+    if ((r->body_code != TC_NONE && r->body_code >= words) ||
+        (r->body_noreload != TC_NONE && r->body_noreload >= words) ||
+        (r->stop_patch != TC_NONE && r->stop_patch >= words))
+        return 0;
+    for (uint32_t i = 0; i < r->n_stop_extra; i++)
+        if (v->stop[i].off >= words)
+            return 0;
+    for (uint32_t i = 0; i < r->n_edges; i++)
+        if (v->edge[i].patch_b >= words || (v->edge[i].cond_site != TC_NONE && v->edge[i].cond_site >= words))
+            return 0;
+    for (int k = 0; v->prof && k < SIDE_MAX; k++)
+        if ((v->prof[k].ft_site != TC_NONE && v->prof[k].ft_site >= words) ||
+            (v->prof[k].tk_trip != TC_NONE && v->prof[k].tk_trip >= words))
+            return 0;
+    return 1;
+}
+#undef TC_TAKE
+
+static void tc_free_blk(JitBlock *b)
+{
+    if (!b)
+        return;
+    free(b->edges);
+    free(b->insn_off);
+    free(b->iref);
+    free(b->kept);
+    free(b->insns);
+    free(b->fault_flags);
+    free(b->oslow);
+    free(b->lanerec);
+    free(b->push_fix);
+    free(b->pushelide);
+    free(b->prof);
+    free(b);
+}
+
+static void *tc_dup(const void *p, size_t n, int *fail)
+{
+    if (!n)
+        return NULL;
+    void *d = malloc(n);
+    if (!d) { *fail = 1; return NULL; }
+    memcpy(d, p, n);
+    return d;
+}
+
+static JitBlock *tc_load(OcerzJit *jit, const OcerzTcRecHead *h, uint64_t rip, int mode32)
+{
+    TcView v;
+    if (!tc_parse(h, &v)) {
+        g_tc_n_rej++;
+        return NULL;
+    }
+    const TcRec *r = v.r;
+    if (!tc_deps_check(v.dep, r->n_dep, r->dep_hash)) {
+        g_tc_n_stale++;
+        return NULL;
+    }
+    uint32_t n = r->n_insns, words = r->code_words;
+    int fail = 0;
+    JitBlock *blk = (JitBlock *)calloc(1, sizeof *blk);
+    if (!blk)
+        return NULL;
+    blk->key = jit_key(rip, mode32);
+    blk->n_insns = (int)n;
+    blk->edges = calloc(JIT_MAX_EDGES, sizeof *blk->edges);
+    if (!blk->edges) fail = 1;
+    blk->insn_off = (uint32_t *)tc_dup(v.insn_off, n * sizeof(uint32_t), &fail);
+    if (r->flags & TCF_COMPACT) {
+        blk->iref = (JitInsnRef *)tc_dup(v.iref, n * sizeof(JitInsnRef), &fail);
+        blk->kept = (X86Insn *)tc_dup(v.insns, r->n_kept * sizeof(X86Insn), &fail);
+        blk->n_kept = (uint16_t)r->n_kept;
+    } else {
+        blk->insns = (X86Insn *)tc_dup(v.insns, n * sizeof(X86Insn), &fail);
+    }
+    if (v.ff)
+        blk->fault_flags = (JitFaultFlagRecipe *)tc_dup(v.ff, n * sizeof(JitFaultFlagRecipe), &fail);
+    blk->oslow = (struct JitOslowMap *)tc_dup(v.oslow, r->n_oslow * sizeof *blk->oslow, &fail);
+    blk->n_oslow = blk->oslow ? (int)r->n_oslow : 0;
+    blk->lanerec = (struct JitLaneRec *)tc_dup(v.lanerec, r->n_lanerec * sizeof *blk->lanerec, &fail);
+    blk->n_lanerec = blk->lanerec ? (int)r->n_lanerec : 0;
+    blk->push_fix = (uint32_t *)tc_dup(v.push_fix, r->n_push_fix * sizeof(uint32_t), &fail);
+    blk->n_push_fix = blk->push_fix ? (uint16_t)r->n_push_fix : 0;
+    blk->pushelide = (struct JitPushElide *)tc_dup(v.pushelide, r->n_pushelide * sizeof *blk->pushelide, &fail);
+    blk->n_pushelide = blk->pushelide ? (uint16_t)r->n_pushelide : 0;
+    if (v.prof) {
+        blk->prof = (JitProf *)calloc(SIDE_MAX, sizeof(JitProf));
+        if (!blk->prof) fail = 1;
+    }
+    if (fail) {
+        tc_free_blk(blk);
+        return NULL;
+    }
+
+    pthread_jit_write_protect_np(0);
+    if (!ENV_ON("OCERZ_NO_DISPATCH_STUB")) {
+        if (mode32) { if (!jit->dispatch_stub32) emit_dispatch_stub(jit, 1); }
+        else        { if (!jit->dispatch_stub)   emit_dispatch_stub(jit, 0); }
+    }
+    veneer_pool_check(jit);
+    uint8_t *pp = (uint8_t *)jit->code_cur;
+    uint32_t *c = (uint32_t *)(void *)(pp + (((uintptr_t)r->entry_mod - (uintptr_t)pp) & 63));
+    if (jit->code_full || (uint8_t *)(c + words) > (uint8_t *)jit->code_end) {
+        pthread_jit_write_protect_np(1);
+        tc_free_blk(blk);
+        return NULL;
+    }
+    memcpy(c, v.code, (size_t)words * 4);
+    if (!tc_bind(jit, blk, c, v.rel, (int)r->n_rel, 1)) {
+        pthread_jit_write_protect_np(1);
+        tc_free_blk(blk);
+        return NULL;
+    }
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(c, (size_t)words * 4);
+    jit->code_cur = c + words;
+
+#define TC_AT(o) ((o) == TC_NONE ? NULL : c + (o))
+    blk->code = (JitBlockFn)(void *)c;
+    blk->code_words = words;
+    blk->body_code = TC_AT(r->body_code);
+    blk->body_noreload = TC_AT(r->body_noreload);
+    blk->hoist_sig = r->hoist_sig;
+    blk->ordered_loads = r->ordered_loads;
+    blk->stop_patch = TC_AT(r->stop_patch);
+    blk->stop_insn = r->stop_insn;
+    blk->n_stop_extra = r->n_stop_extra;
+    for (uint32_t i = 0; i < r->n_stop_extra; i++) {
+        blk->stop_extra[i].site = c + v.stop[i].off;
+        blk->stop_extra[i].insn = v.stop[i].insn;
+    }
+    blk->n_edges = r->n_edges;
+    for (uint32_t i = 0; i < r->n_edges; i++) {
+        blk->edges[i].target_rip = v.edge[i].target_rip;
+        blk->edges[i].jcc_rip = v.edge[i].jcc_rip;
+        blk->edges[i].patch_b = c + v.edge[i].patch_b;
+        blk->edges[i].fallback_insn = v.edge[i].fallback_insn;
+        blk->edges[i].cond_site = TC_AT(v.edge[i].cond_site);
+        blk->edges[i].cond_orig = v.edge[i].cond_orig;
+        blk->edges[i].kind = v.edge[i].kind;
+        blk->edges[i].pin_class = v.edge[i].pin_class;
+        blk->edges[i].side = v.edge[i].side;
+        blk->edges[i].probing = v.edge[i].probing;
+    }
+    for (int k = 0; v.prof && k < SIDE_MAX; k++) {
+        blk->prof[k].ft_site = TC_AT(v.prof[k].ft_site);
+        blk->prof[k].tk_trip = TC_AT(v.prof[k].tk_trip);
+    }
+#undef TC_AT
+    blk->n_inlined = r->n_inlined;
+    blk->n_slow = r->n_slow;
+    blk->entry_live = r->entry_live;
+    blk->xmm_pinned = r->xmm_pinned;
+    blk->n_pinned = r->n_pinned;
+    blk->pin_class = r->pin_class;
+    memcpy(blk->host_holds, r->host_holds, sizeof blk->host_holds);
+    memcpy(blk->guest_in_host, r->guest_in_host, sizeof blk->guest_in_host);
+    if (blk->stop_patch || blk->n_stop_extra) {
+        blk->stop_next = jit->stop_blocks;
+        jit->stop_blocks = blk;
+    }
+    if (!code_index_append_locked(jit, blk)) {
+        blk->code = NULL;
+        return NULL;
+    }
+    cache_insert(jit, blk);
+    blk_chain_install(jit, blk);
+    g_tc_n_load++;
+    return blk;
+}
+
+static void tc_verify(OcerzJit *jit, JitBlock *blk, const OcerzTcRecHead *h)
+{
+    TcView v;
+    if (!tc_parse(h, &v)) {
+        g_tc_n_rej++;
+        return;
+    }
+    const TcRec *r = v.r;
+    if (!tc_deps_check(v.dep, r->n_dep, r->dep_hash)) {
+        g_tc_n_stale++;
+        tc_put(jit, blk);
+        return;
+    }
+    const uint32_t *code = (const uint32_t *)(const void *)blk->code;
+    const char *why = NULL;
+    uint32_t at = 0;
+    if (r->entry_mod != (uint32_t)((uintptr_t)code & 63))
+        why = "align";
+    else if (r->code_words != blk->code_words)
+        why = "words";
+    else if ((int)r->n_rel != g_tc_nrel)
+        why = "nrel";
+    uint32_t rel_i = 0;
+    for (uint32_t i = 0; !why && i < r->n_rel; i++)
+        if (v.rel[i].off != g_tc_rel[i].off || v.rel[i].kind != g_tc_rel[i].kind ||
+            v.rel[i].form != g_tc_rel[i].form || v.rel[i].arg != g_tc_rel[i].arg) {
+            why = "rel";
+            at = v.rel[i].off;
+            rel_i = i;
+        }
+    for (uint32_t w = 0; !why && w < r->code_words; w++)
+        if (code[w] != v.code[w] && !tc_is_reloc_word(w)) {
+            why = "code";
+            at = w;
+        }
+    if (!why && ((int)r->n_insns != blk->n_insns || r->n_edges != blk->n_edges ||
+                 r->pin_class != blk->pin_class || r->n_pinned != blk->n_pinned ||
+                 r->entry_live != blk->entry_live || r->xmm_pinned != blk->xmm_pinned ||
+                 r->hoist_sig != blk->hoist_sig || r->ordered_loads != blk->ordered_loads ||
+                 r->body_code != tc_off(blk, blk->body_code) ||
+                 r->body_noreload != tc_off(blk, blk->body_noreload) ||
+                 r->stop_patch != tc_off(blk, blk->stop_patch) || r->n_stop_extra != blk->n_stop_extra))
+        why = "meta";
+    for (uint32_t i = 0; !why && i < r->n_insns; i++)
+        if (v.insn_off[i] != blk->insn_off[i]) {
+            why = "insn_off";
+            at = i;
+        }
+    for (uint32_t i = 0; !why && i < r->n_edges; i++)
+        if (v.edge[i].target_rip != blk->edges[i].target_rip ||
+            v.edge[i].patch_b != tc_off(blk, blk->edges[i].patch_b) ||
+            v.edge[i].cond_site != tc_off(blk, blk->edges[i].cond_site) ||
+            v.edge[i].fallback_insn != blk->edges[i].fallback_insn || v.edge[i].kind != blk->edges[i].kind) {
+            why = "edge";
+            at = i;
+        }
+    if (!why) {
+        g_tc_n_vok++;
+        return;
+    }
+    if (r->code_words != blk->code_words || (int)r->n_insns != blk->n_insns ||
+        (r->flags & TCF_LEARNED) || g_tc_learned) {
+        g_tc_n_vvar++;
+        return;
+    }
+    g_tc_n_vbad++;
+    static int nrep;
+    if (!g_tc_log || __atomic_fetch_add(&nrep, 1, __ATOMIC_RELAXED) >= 60)
+        return;
+    int ii = !strcmp(why, "code") || !strcmp(why, "rel") ? tc_insn_at(blk, at) : -1;
+    uint64_t irip = ii >= 0 ? (blk->insns ? blk->insns[ii].rip : blk->iref ? blk->iref[ii].rip : 0) : 0;
+    fprintf(g_tc_lf, "ocerz: TCACHE[%d] VERIFY %s rip=%#llx at=%u insn=%d insn_rip=%#llx now=%08x rec=%08x"
+                     " words=%u/%u insns=%d/%u\n",
+            (int)getpid(), why, (unsigned long long)blk_rip(blk), at, ii, (unsigned long long)irip,
+            !strcmp(why, "code") ? code[at] : 0u, !strcmp(why, "code") ? v.code[at] : 0u,
+            blk->code_words, r->code_words, blk->n_insns, r->n_insns);
+    if (!strcmp(why, "rel"))
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d]   rel %u now off=%u kind=%u form=%u arg=%#llx"
+                         " rec off=%u kind=%u form=%u arg=%#llx\n",
+                (int)getpid(), rel_i, g_tc_rel[rel_i].off, g_tc_rel[rel_i].kind, g_tc_rel[rel_i].form,
+                (unsigned long long)g_tc_rel[rel_i].arg, v.rel[rel_i].off, v.rel[rel_i].kind,
+                v.rel[rel_i].form, (unsigned long long)v.rel[rel_i].arg);
+    if (nrep > 4)
+        return;
+    for (int side = 0; side < 2; side++) {
+        const uint32_t *cw = side ? v.code : code;
+        const uint32_t *io = side ? v.insn_off : blk->insn_off;
+        uint32_t nw = side ? r->code_words : blk->code_words;
+        int ni = side ? (int)r->n_insns : blk->n_insns;
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d]   %s insn_off:", (int)getpid(), side ? "rec" : "now");
+        for (int i = 0; i < ni; i++)
+            fprintf(g_tc_lf, " %u", io[i]);
+        for (uint32_t w = 0; w < nw; w++)
+            fprintf(g_tc_lf, "%s%08x", w % 8 ? " " : "\nocerz:     ", cw[w]);
+        fprintf(g_tc_lf, "\n");
+    }
+}
+
 static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 {
     g_xlat_mode32 = mode32;
@@ -14913,6 +16029,41 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 return NULL;
     }
 
+    const OcerzTcRecHead *tc_hit = NULL;
+    int tcm = ocerz_tcache_mode();
+    g_tc_rec = 0;
+    g_tc_bad = 0;
+    g_tc_learned = 0;
+    g_tc_nrel = 0;
+    g_tc_ndlog = 0;
+    g_tc_nbytes = 0;
+    if (tcm != OCERZ_TC_OFF)
+        tc_log_init();
+    if ((tcm == OCERZ_TC_ON || tcm == OCERZ_TC_VERIFY) && tc_usable(jit)) {
+        g_tc_rec = 1;
+        g_tc_key = tc_key(rip, mode32);
+        uint64_t jk = jit_key(rip, mode32);
+        if (!al_marked(jk) && !cp_marked(jk) && !tc_noload_has(jk))
+            tc_hit = ocerz_tcache_find(g_tc_key);
+        {
+            static int tr = -1;
+            if (tr < 0) tr = getenv("OCERZ_TCACHE_TRACE") ? 1 : 0;
+            if (tr && g_tc_log > 0)
+                fprintf(g_tc_lf, "ocerz: TCACHE[%d] %s key=%#llx\n", (int)getpid(), tc_hit ? "HIT" : "MISS",
+                        (unsigned long long)g_tc_key);
+        }
+        if (tc_hit && tcm == OCERZ_TC_ON) {
+            uint64_t t0 = ocerz_jit_time_xlat ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+            JitBlock *lb = tc_load(jit, tc_hit, rip, mode32);
+            if (ocerz_jit_time_xlat)
+                __atomic_add_fetch(&ocerz_jit_xlat_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
+            if (lb) {
+                g_tc_rec = 0;
+                return lb;
+            }
+        }
+    }
+
     static int g_jitmeasure = -1;
     if (g_jitmeasure < 0)
         g_jitmeasure = getenv("OCERZ_JITMEASURE") ? 1 : 0;
@@ -14932,8 +16083,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (sigsetjmp(db, 0) == 0) {
             ocerz_jit_decode_recover = &db;
             for (; vn < JIT_MAX_BLOCK_INSNS; ) {
-                const uint8_t *code = (const uint8_t *)ocerz_g2h(vpc);
-                int rc = ocerz_decode_mode(code, 15, vpc, &scratch[vn], mode32);
+                int rc = jit_decode(vpc, &scratch[vn], mode32);
                 if (rc != OCERZ_OK)
                     break;
                 unsigned op = scratch[vn].op;
@@ -14963,6 +16113,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                         vext++;
                         if (scratch[vn - 1].ops[0].imm > vpc + len &&
                             jcc_flip_wanted(scratch[vn - 1].rip)) {
+                            g_tc_learned = 1;
                             uint64_t tgt = scratch[vn - 1].ops[0].imm;
                             scratch[vn - 1].ops[0].imm = vpc + len;
                             scratch[vn - 1].cc ^= 1;
@@ -15033,6 +16184,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_chain_target = 0;
     g_chain_keeps_jgb = 0;
     g_n_raslit = 0;
+    g_tc_on = 0;
+    g_tc_entry = NULL;
+    g_tc_pool_off = UINT32_MAX;
     g_chain_epi = NULL;
     g_n_jcc_edges = 0;
     g_nzcv_want = 0; g_nzcv_from = -1;
@@ -15053,6 +16207,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_loop_entry = NULL;
     g_l0_fixed = 0;
     g_lane_used = 0;
+    g_l0_next = 0;
     g_n_undo_lanes = 0;
     g_l0_nlanes = L0_NLANES;
     g_zero_vreg = -1;
@@ -15078,6 +16233,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_cp_guard = ocerz_commpage && (ENV_ON("OCERZ_CP_GUARD_ALL") || cp_marked(jit_key(rip, mode32)));
     { static int all = -1; if (all < 0) all = getenv("OCERZ_AL_GUARD_ALL") ? 1 : 0; if (all) g_al_all = 1; }
     g_align_guard = !g_plain_mem && al_marked(jit_key(rip, mode32));
+    if (g_cp_guard || g_align_guard)
+        g_tc_learned = 1;
     g_blk_ordered_loads = 0;
     g_push_entry = NULL;
     g_n_side = 0;
@@ -15282,9 +16439,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         else        { if (!jit->dispatch_stub)   emit_dispatch_stub(jit, 0); }
     }
     veneer_pool_check(jit);
+    if (tc_hit && tcm == OCERZ_TC_VERIFY && tc_hit->size >= sizeof(TcRec)) {
+        uint8_t *pp = (uint8_t *)jit->code_cur;
+        size_t pad = ((uintptr_t)((const TcRec *)(const void *)tc_hit)->entry_mod - (uintptr_t)pp) & 63;
+        if (pp + pad < (uint8_t *)jit->code_end)
+            jit->code_cur = (uint32_t *)(void *)(pp + pad);
+    }
     A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
     uint32_t *entry = b.p;
     g_push_entry = entry;
+    g_tc_entry = entry;
+    g_tc_on = (g_tc_rec || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP) ? tc_usable(jit) : 0;
 
     a64_stp_pre(&b, 29, 30, 31, -16);
     a64_stp_pre(&b, 19, 20, 31, -16);
@@ -15338,7 +16503,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             uint32_t *okl = a64_label(&b); a64_bcond(&b, A64_EQ, 0);
             a64_mov_reg(&b, 1, 1, 0);
             a64_mov_imm64(&b, 0, rip);
-            a64_mov_imm64(&b, 16, (uint64_t)(uintptr_t)&ocerz_jgb_trap);
+            tc_imm64(&b, 16, TCR_SYM, TCS_JGB_TRAP, (uint64_t)(uintptr_t)&ocerz_jgb_trap);
             a64_blr(&b, 16);
             a64_patch_bcond(okl, a64_label(&b));
         }
@@ -15389,6 +16554,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             emit_xmm_pin_load_all(&b);
     }
     if (ocerz_perfstat > 0) {
+        g_tc_bad = 1;
         a64_mov_imm64(&b, JT0, (uint64_t)(uintptr_t)&blk->exec_count);
         a64_ldr(&b, 8, JT1, JT0, 0);
         a64_add_imm(&b, 1, JT1, JT1, 1);
@@ -15683,6 +16849,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         g_cur_insn_start = b.p;
         lanerec_note((uint32_t)(b.p - entry));
         if (i == 0 && fps_watch(rip)) {
+            g_tc_bad = 1;
             a64_mov_imm64(&b, JT0, (uint64_t)(uintptr_t)&g_fps_frames);
             a64_ldr(&b, 8, JT1, JT0, 0);
             a64_add_imm(&b, 1, JT1, JT1, 1);
@@ -16162,7 +17329,10 @@ promo_push_fallthrough:
         uint32_t *nonzero = a64_label(&b); a64_cbnz(&b, 1, JTT, 0);
         uint32_t *here = a64_label(&b);
         ptrdiff_t soff = dstub - here;
-        if (soff >= -(ptrdiff_t)(1 << 25) && soff <= (ptrdiff_t)((1 << 25) - 1)) {
+        if (g_tc_on) {
+            tc_imm64(&b, 16, TCR_DSTUB, (uint64_t)mode32, (uint64_t)(uintptr_t)dstub);
+            a64_br(&b, 16);
+        } else if (soff >= -(ptrdiff_t)(1 << 25) && soff <= (ptrdiff_t)((1 << 25) - 1)) {
             a64_b(&b, (int32_t)soff);
         } else {
             a64_mov_imm64(&b, 16, (uint64_t)(uintptr_t)dstub);
@@ -16356,6 +17526,7 @@ promo_push_fallthrough:
 
     if (g_n_raslit && !b.overflow) {
         if (((uintptr_t)b.p & 7) != 0) a64_emit32(&b, 0xd503201fu);
+        g_tc_pool_off = (uint32_t)(b.p - entry);
         for (int i = 0; i < g_n_raslit; i++) {
             void **cell = (void **)b.p;
             a64_emit32(&b, 0); a64_emit32(&b, 0);
@@ -16372,6 +17543,13 @@ promo_push_fallthrough:
             *g_raslit[i].site = 0x58000000u | (((uint32_t)off & 0x7ffffu) << 5) | (uint32_t)(g_raslit[i].rt & 31);
             if (g_raslit[i].kind == 1) {
                 *cell = (void *)(uintptr_t)g_raslit[i].retaddr;
+                if (g_raslit[i].tcr == TCR_PSC)
+                    tc_note((uint32_t *)cell, TCR_PSC, 1, 0);
+                continue;
+            }
+            if (g_tc_on) {
+                *cell = NULL;
+                tc_note((uint32_t *)cell, TCR_RASCELL, 1, g_raslit[i].retaddr);
                 continue;
             }
             ras_cell_register(cell);
@@ -16582,6 +17760,17 @@ promo_push_fallthrough:
         }
     }
 
+    int tc_save = 0;
+    if (g_tc_on) {
+        if (ocerz_tcache_mode() != OCERZ_TC_ROUNDTRIP || !tc_roundtrip(jit, blk, entry)) {
+            pthread_jit_write_protect_np(0);
+            tc_bind(jit, blk, entry, g_tc_rel, g_tc_nrel, 0);
+            pthread_jit_write_protect_np(1);
+        }
+        tc_save = g_tc_rec && !g_tc_bad;
+        g_tc_on = 0;
+    }
+
     if (!code_index_append_locked(jit, blk)) {
         static int warned;
         if (!warned) { warned = 1; fprintf(stderr, "ocerz: warning: JIT code index allocation failed; block %#llx runs interpreted\n", (unsigned long long)rip); }
@@ -16640,36 +17829,13 @@ promo_push_fallthrough:
     compact_block(blk);
     cache_insert(jit, blk);
 
-    if (!g_no_chain) {
-        chain_batch_begin();
-        for (int i = 0; i < blk->n_edges; i++) {
-            uint32_t *cs = blk->edges[i].probing ? NULL : blk->edges[i].cond_site;
-            JitBlock *t = cache_lookup(jit, blk->edges[i].target_rip, blk_mode32(blk));
-            if (t && t->code) {
-                void *dst = (void *)t->code;
-                if (blk->edges[i].kind == EDGE_BODY) {
-                    int compatible = blk->edges[i].pin_class
-                        ? t->pin_class == blk->edges[i].pin_class
-                        : (t->pin_class == 0 && t->n_pinned == 0);
-                    if (!compatible || !t->body_code)
-                        dst = NULL;
-                    else
-                        dst = body_entry_for(t, blk->hoist_sig);
-                }
-                if (dst) {
-                    chain_activate(blk->edges[i].patch_b, dst);
-                    chain_cond_short(cs, dst);
-                    pred_add(t, blk, i);
-                }
-            } else {
-                pending_add(jit_key(blk->edges[i].target_rip, blk_mode32(blk)),
-                            blk->edges[i].patch_b, blk->edges[i].kind,
-                            blk->edges[i].pin_class, cs, blk->hoist_sig, blk, i);
-            }
-        }
-        pending_drain(blk->key, blk);
-        chain_batch_end();
+    if (tc_save) {
+        if (tc_hit && ocerz_tcache_mode() == OCERZ_TC_VERIFY)
+            tc_verify(jit, blk, tc_hit);
+        else
+            tc_put(jit, blk);
     }
+    blk_chain_install(jit, blk);
 
     jit->blocks_translated++;
     if (ocerz_jitstat > 0)
@@ -17669,6 +18835,7 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
             if (*pp == b)
                 __atomic_store_n(pp, b->hnext, __ATOMIC_RELEASE);
             gran_block(b, -1);
+            tc_noload_add(b->key);
             b->retired_next = jit->retired;
             jit->retired = b;
         }
@@ -17749,6 +18916,7 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
         if (*pp == b)
             __atomic_store_n(pp, b->hnext, __ATOMIC_RELEASE);
         gran_block(b, -1);
+        tc_noload_add(b->key);
         b->retired_next = jit->retired;
         jit->retired = b;
     }
@@ -18158,6 +19326,7 @@ static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
     jit->live[idx]->live_idx = idx;
     jit->n_live--;
     gran_block(blk, -1);
+    tc_noload_add(blk->key);
     blk->retired_next = jit->retired;
     jit->retired = blk;
     for (unsigned i = 0; i < g_ras_slot_n; i++)
