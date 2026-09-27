@@ -1232,6 +1232,8 @@ static inline int rsp_is_ptr(void)
 }
 int g_pin_class_fwd(void) { return g_pin_class; }
 
+int ocerz_jit_time_xlat;
+uint64_t ocerz_jit_xlat_ns;
 static int g_defer;
 static int16_t g_mov_sink_at[JIT_MAX_BLOCK_INSNS];
 static uint8_t g_mov_skip[JIT_MAX_BLOCK_INSNS];
@@ -14855,7 +14857,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     static int g_jitmeasure = -1;
     if (g_jitmeasure < 0)
         g_jitmeasure = getenv("OCERZ_JITMEASURE") ? 1 : 0;
-    uint64_t xlat_t0 = g_jitmeasure ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    uint64_t xlat_t0 = (g_jitmeasure || ocerz_jit_time_xlat) ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     X86Insn scratch[JIT_MAX_BLOCK_INSNS];
     int n = 0;
     uint64_t pc = rip;
@@ -16565,6 +16567,8 @@ promo_push_fallthrough:
     jit->blocks_translated++;
     if (ocerz_jitstat > 0)
         js_xlat_ok++;
+    if (ocerz_jit_time_xlat)
+        __atomic_add_fetch(&ocerz_jit_xlat_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - xlat_t0, __ATOMIC_RELAXED);
     if (g_jitmeasure) {
 
         static unsigned long long g_xlat_ns, g_xlat_sc_ns;
@@ -17189,6 +17193,17 @@ void ocerz_jit_destroy(OcerzJit *jit)
 uint64_t ocerz_jit_blocks(const OcerzJit *jit)
 {
     return jit ? jit->blocks_translated : 0;
+}
+
+static uint64_t g_flip_n_retire;
+void ocerz_jit_prof_stats(const struct OcerzVM *vm, uint64_t *translated, uint64_t *live,
+                          uint64_t *retires, uint64_t *flips)
+{
+    const OcerzJit *jit = vm ? vm->jit : NULL;
+    *translated = jit ? jit->blocks_translated : 0;
+    *live = jit ? (uint64_t)jit->n_live : 0;
+    *retires = __atomic_load_n(&ocerz_jit_retire_count, __ATOMIC_RELAXED);
+    *flips = g_flip_n_retire;
 }
 
 

@@ -119,8 +119,11 @@
  * guest rip with the host symbol beside it and, when the thread is inside
  * ocerz_jit_exec_one, the form of the instruction being interpreted - opcode,
  * operand kinds, operand size and immediate, or the number of a syscall.  Every OCERZ_GUESTPROF_PERIOD seconds (10 by default)
- * it prints the hottest rips with their image, the hottest host symbols and
- * the hottest interpreted forms, then starts counting again.  The forms are
+ * it prints the translator's counts for the period (blocks translated, blocks
+ * live, retirements, branch flips and the time spent translating), the images
+ * the CPU went to - an unnamed one, which is Windows code under Wine, bucketed
+ * by its 16 MB region - the hottest rips with their image, the hottest host
+ * symbols and the hottest interpreted forms, then starts counting again.  The forms are
  * what found the Wine-only gaps: Steam's webhelper interpreted pinsrw from
  * memory for 15% of its samples because the emitter had no path for a memory
  * operand in the low shadow window.
@@ -387,6 +390,8 @@ static int gp_top(const uint64_t *keys, const uint32_t *cnts, GpTop *top, int wa
     return n;
 }
 
+static OcerzVM *g_gp_vm;
+
 static void gp_report(double secs)
 {
     uint64_t total = g_gp_samples ? g_gp_samples : 1;
@@ -394,6 +399,17 @@ static void gp_report(double secs)
             (int)getpid(), secs, (unsigned long long)(g_gp_samples / 1000),
             100.0 * (double)g_gp_jit / (double)total,
             100.0 * (double)(g_gp_samples - g_gp_jit) / (double)total);
+    {
+        static uint64_t last_tr, last_ret, last_flip, last_ns;
+        uint64_t tr, live, ret, flip;
+        ocerz_jit_prof_stats(g_gp_vm, &tr, &live, &ret, &flip);
+        uint64_t ns = __atomic_load_n(&ocerz_jit_xlat_ns, __ATOMIC_RELAXED);
+        fprintf(stderr, "ocerz: GUESTPROF[%d]   jit translated=%llu live=%llu retires=%llu flips=%llu xlat_ms=%llu\n",
+                (int)getpid(), (unsigned long long)(tr - last_tr), (unsigned long long)live,
+                (unsigned long long)(ret - last_ret), (unsigned long long)(flip - last_flip),
+                (unsigned long long)((ns - last_ns) / 1000000));
+        last_tr = tr; last_ret = ret; last_flip = flip; last_ns = ns;
+    }
     static GpTop top[40];
     int n = gp_top(g_gp_key, g_gp_cnt, top, 40);
     for (int i = 0; i < n; i++) {
@@ -404,6 +420,48 @@ static void gp_report(double secs)
                 100.0 * top[i].cnt / (double)total, (top[i].key >> 63) ? "rt " : "jit",
                 (unsigned long long)rip, leaf ? leaf + 1 : (img ? img : "?"),
                 (unsigned long long)(rip - base));
+    }
+    {
+        static struct { const char *img; uint64_t lo; uint32_t jit, rt; } agg_img[48];
+        int ni = 0;
+        for (uint32_t i = 0; i < GP_SLOTS; i++) {
+            if (!g_gp_key[i])
+                continue;
+            uint64_t rip = g_gp_key[i] & ~(1ull << 63), base = 0;
+            const char *img = ocerz_dyld_name_for_addr(rip, &base);
+            const char *leaf = img ? strrchr(img, '/') : NULL;
+            img = leaf ? leaf + 1 : img;
+            uint64_t lo = img ? 0 : rip >> 24;
+            int k = 0;
+            while (k < ni && !(agg_img[k].lo == lo && (img ? agg_img[k].img && strcmp(agg_img[k].img, img) == 0 : !agg_img[k].img)))
+                k++;
+            if (k == ni) {
+                if (ni == 48)
+                    continue;
+                agg_img[ni].img = img;
+                agg_img[ni].lo = lo;
+                agg_img[ni].jit = agg_img[ni].rt = 0;
+                ni++;
+            }
+            if (g_gp_key[i] >> 63) agg_img[k].rt += g_gp_cnt[i]; else agg_img[k].jit += g_gp_cnt[i];
+        }
+        for (int i = 0; i < ni && i < 12; i++) {
+            int best = i;
+            for (int k = i + 1; k < ni; k++)
+                if (agg_img[k].jit + agg_img[k].rt > agg_img[best].jit + agg_img[best].rt)
+                    best = k;
+            if (best != i) {
+                __typeof__(agg_img[0]) t = agg_img[i];
+                agg_img[i] = agg_img[best];
+                agg_img[best] = t;
+            }
+            char anon[32];
+            if (!agg_img[i].img)
+                snprintf(anon, sizeof anon, "?%#llx", (unsigned long long)(agg_img[i].lo << 24));
+            fprintf(stderr, "ocerz: GUESTPROF[%d]   image %5.1f%% jit %5.1f%% rt %s\n", (int)getpid(),
+                    100.0 * agg_img[i].jit / (double)total, 100.0 * agg_img[i].rt / (double)total,
+                    agg_img[i].img ? agg_img[i].img : anon);
+        }
     }
     static GpTop host[64];
     int hn = gp_top(g_gh_key, g_gh_cnt, host, 64);
@@ -550,6 +608,8 @@ static void guestprof_start(OcerzVM *vm)
     if (started || !vm || !getenv("OCERZ_GUESTPROF"))
         return;
     started = 1;
+    g_gp_vm = vm;
+    ocerz_jit_time_xlat = 1;
     pthread_t t;
     if (pthread_create(&t, NULL, guestprof_thread, vm) == 0)
         pthread_detach(t);
