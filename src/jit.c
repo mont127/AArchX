@@ -487,6 +487,7 @@ typedef struct JitBlock {
     uint16_t n_kept;
     struct JitBlock *hnext;
     struct JitBlock *retired_next;
+    size_t live_idx;
 
     uint64_t exec_count;
     int n_inlined;
@@ -1610,7 +1611,7 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
         JitBlock **nl = (JitBlock **)realloc(jit->live, nc * sizeof *nl);
         if (nl) { jit->live = nl; jit->cap_live = nc; }
     }
-    if (jit->n_live < jit->cap_live) jit->live[jit->n_live++] = b;
+    if (jit->n_live < jit->cap_live) { b->live_idx = jit->n_live; jit->live[jit->n_live++] = b; }
     gran_block(b, +1);
     if (b->n_insns > 0) {
         uint64_t lo = blk_insn_rip(b, 0);
@@ -17555,7 +17556,7 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
         size_t w0 = 0;
         for (size_t k = 0; k < jit->n_live; k++) {
             JitBlock *b = jit->live[k];
-            if (!b->inv_hit) { jit->live[w0++] = b; continue; }
+            if (!b->inv_hit) { b->live_idx = w0; jit->live[w0++] = b; continue; }
             unsigned h = hash_key(b->key);
             JitBlock **pp = &jit->buckets[h];
             while (*pp && *pp != b) pp = &(*pp)->hnext;
@@ -17635,7 +17636,7 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
     size_t w = 0;
     for (size_t k = 0; k < jit->n_live; k++) {
         JitBlock *b = jit->live[k];
-        if (!b->inv_hit) { jit->live[w++] = b; continue; }
+        if (!b->inv_hit) { b->live_idx = w; jit->live[w++] = b; continue; }
         unsigned h = hash_key(b->key);
         JitBlock **pp = &jit->buckets[h];
         while (*pp && *pp != b) pp = &(*pp)->hnext;
@@ -17984,9 +17985,12 @@ static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
 {
     const uint32_t *lo = (const uint32_t *)blk->code, *hi = lo + blk->code_words;
 #define IN_BLK(p) ((const uint32_t *)(p) >= lo && (const uint32_t *)(p) < hi)
-    size_t idx = jit->n_live;
-    for (size_t k = 0; k < jit->n_live; k++)
-        if (jit->live[k] == blk) { idx = k; break; }
+    size_t idx = blk->live_idx;
+    if (idx >= jit->n_live || jit->live[idx] != blk) {
+        idx = jit->n_live;
+        for (size_t k = 0; k < jit->n_live; k++)
+            if (jit->live[k] == blk) { idx = k; break; }
+    }
     if (idx == jit->n_live) return;
     pthread_jit_write_protect_np(0);
     if (blk->stop_patch && blk->stop_insn && *blk->stop_patch != blk->stop_insn) {
@@ -18044,7 +18048,8 @@ static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
     while (*pp && *pp != blk) pp = &(*pp)->hnext;
     if (*pp == blk)
         __atomic_store_n(pp, blk->hnext, __ATOMIC_RELEASE);
-    memmove(&jit->live[idx], &jit->live[idx + 1], (jit->n_live - idx - 1) * sizeof jit->live[0]);
+    jit->live[idx] = jit->live[jit->n_live - 1];
+    jit->live[idx]->live_idx = idx;
     jit->n_live--;
     gran_block(blk, -1);
     blk->retired_next = jit->retired;
