@@ -30,6 +30,7 @@
 # never reaches an ICOUNT.
 
 set -u
+export OCERZ_TCACHE="${OCERZ_TCACHE:-off}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OCERZ="$REPO_ROOT/ocerz"

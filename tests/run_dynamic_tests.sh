@@ -7,6 +7,7 @@
 
 set -u
 cd "$(dirname "$0")/.."
+export OCERZ_TCACHE="${OCERZ_TCACHE:-off}"
 OCERZ=./ocerz
 OCERZ_ABS="$(pwd)/ocerz"
 TMP="${TMPDIR:-/tmp}/ocerz_dyn.$$"

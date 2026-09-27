@@ -381,8 +381,13 @@
  * the allocator mid-update) and builds a fresh one on its next step.
  *
  * ---- kept translations ----
- * With OCERZ_TCACHE=on a translation is written to src/tcache.c's store, and
- * the next process to need the same key loads it instead of translating.  The
+ * Unless OCERZ_TCACHE=off, a translation is written to src/tcache.c's store,
+ * and the next process to need the same key loads it instead of translating.
+ * Only code whose address is the same from run to run is kept: everything in
+ * a Wine process, whose low-shadow layout and fixed image bases make it so,
+ * and otherwise only the shared cache, since a main program, a dylib or a JIT
+ * loaded at a random address would fill the store with records nobody loads,
+ * and nothing at all when the guest's own base is chosen at random.  The
  * code is emitted so that it can move: every value that differs between
  * processes (an ocerz function or global, the commpage delta, the block's own
  * JitBlock, an instruction or profile slot inside it, a RAS slot, a
@@ -395,9 +400,11 @@
  * the current process, allocating slots, cells and tables afresh.  A record
  * also names every guest byte range the translation read through jit_decode -
  * the block, the callees spliced into it, and the successors whose liveness it
- * relied on, which is why a recording translation decodes successors itself
- * rather than trusting the xlive memo or a successor's entry_live - and a hash
- * of those bytes, which a load checks against guest memory first.  The key adds
+ * relied on, which is why a recording translation decodes a successor itself
+ * rather than trusting its entry_live, and why an xlive memo entry keeps the
+ * ranges and a hash of the bytes it read, replaying them into the record when
+ * it answers - and a hash of those bytes, which a load checks against guest
+ * memory first.  The key adds
  * the memory model to jit_key, since a block translates differently once a
  * second thread makes loads ordered.  A translation made because the process
  * learned something (a flipped branch, the guard a commpage or alignment fault
@@ -780,10 +787,11 @@ static void tc_imm64(A64Buf *b, int rd, int kind, uint64_t arg, uint64_t value)
 }
 #define TC_DLOG_MAX 4096
 #define TC_DBYTES_MAX (64u << 10)
-static struct { uint64_t pc; uint32_t at; uint8_t len; } g_tc_dlog[TC_DLOG_MAX];
+static struct { uint64_t pc; uint32_t at; uint32_t len; } g_tc_dlog[TC_DLOG_MAX];
 static uint8_t g_tc_dbytes[TC_DBYTES_MAX];
 static int g_tc_ndlog;
 static uint32_t g_tc_nbytes;
+static int g_tc_dbar;
 static int g_tc_rec;
 static int g_tc_learned;
 static int jit_decode(uint64_t pc, X86Insn *out, int mode32)
@@ -791,7 +799,13 @@ static int jit_decode(uint64_t pc, X86Insn *out, int mode32)
     const uint8_t *code = (const uint8_t *)ocerz_g2h(pc);
     int rc = ocerz_decode_mode(code, 15, pc, out, mode32);
     if (rc == OCERZ_OK && g_tc_rec) {
-        if (g_tc_ndlog < TC_DLOG_MAX && g_tc_nbytes + out->len <= TC_DBYTES_MAX) {
+        int last = g_tc_ndlog - 1;
+        if (last >= g_tc_dbar && g_tc_dlog[last].pc + g_tc_dlog[last].len == pc &&
+            g_tc_dlog[last].at + g_tc_dlog[last].len == g_tc_nbytes && g_tc_nbytes + out->len <= TC_DBYTES_MAX) {
+            memcpy(g_tc_dbytes + g_tc_nbytes, code, out->len);
+            g_tc_dlog[last].len += out->len;
+            g_tc_nbytes += out->len;
+        } else if (g_tc_ndlog < TC_DLOG_MAX && g_tc_nbytes + out->len <= TC_DBYTES_MAX) {
             g_tc_dlog[g_tc_ndlog].pc = pc;
             g_tc_dlog[g_tc_ndlog].at = g_tc_nbytes;
             g_tc_dlog[g_tc_ndlog].len = out->len;
@@ -1817,7 +1831,116 @@ static int unsafe_nocheckbr(void);
 static int fpb_det_here(int idx);
 extern uint64_t ocerz_jit_retire_count;
 #define XLIVE_MEMO_SLOTS 8192
-static struct { uint64_t key, live, gen; uint8_t head[16]; } g_xlive_memo[XLIVE_MEMO_SLOTS];
+#define XLIVE_MEMO_DEPS 6
+#define XLIVE_NO_DEPS 0xff
+typedef struct { uint64_t pc; uint32_t len; } XliveDep;
+static struct {
+    uint64_t key, live, gen, dhash;
+    uint8_t head[16];
+    uint8_t nd;
+    XliveDep dep[XLIVE_MEMO_DEPS];
+} g_xlive_memo[XLIVE_MEMO_SLOTS];
+
+static uint64_t xlive_dep_mix(uint64_t h, uint64_t w)
+{
+    h = (h ^ w) * 0x9e3779b97f4a7c15ull;
+    return h ^ (h >> 29);
+}
+
+static uint64_t xlive_dep_hash(const XliveDep *d, int nd, const uint8_t *bytes)
+{
+    uint64_t h = 0x13198a2e03707344ull;
+    for (int i = 0; i < nd; i++) {
+        h = xlive_dep_mix(xlive_dep_mix(h, d[i].pc), d[i].len);
+        uint32_t k = 0;
+        for (; k + 8 <= d[i].len; k += 8) {
+            uint64_t w;
+            memcpy(&w, bytes + k, 8);
+            h = xlive_dep_mix(h, w);
+        }
+        for (; k < d[i].len; k++)
+            h = xlive_dep_mix(h, bytes[k]);
+        bytes += d[i].len;
+    }
+    return h;
+}
+
+static uint8_t g_xlive_dbuf[TC_DBYTES_MAX];
+
+static int xlive_deps_fetch(const XliveDep *d, int nd, uint8_t *dst, uint32_t room)
+{
+    volatile int ok = 0;
+    sigjmp_buf fb;
+    sigjmp_buf *prev = ocerz_jit_decode_recover;
+    if (sigsetjmp(fb, 0) == 0) {
+        ocerz_jit_decode_recover = &fb;
+        uint32_t at = 0;
+        int fits = 1;
+        for (int i = 0; i < nd && fits; i++) {
+            if (at + d[i].len > room) {
+                fits = 0;
+                break;
+            }
+            memcpy(dst + at, (const uint8_t *)ocerz_g2h(d[i].pc), d[i].len);
+            at += d[i].len;
+        }
+        ok = fits;
+    }
+    ocerz_jit_decode_recover = prev;
+    return ok;
+}
+
+static int cmp_xdep(const void *a, const void *b)
+{
+    const XliveDep *x = (const XliveDep *)a, *y = (const XliveDep *)b;
+    return x->pc < y->pc ? -1 : x->pc > y->pc;
+}
+
+static uint8_t xlive_deps_since(int start, XliveDep *out, uint64_t *hash)
+{
+    enum { MAXE = 512 };
+    XliveDep e[MAXE];
+    int n = g_tc_ndlog - start;
+    if (g_tc_bad || n <= 0 || n > MAXE)
+        return XLIVE_NO_DEPS;
+    for (int i = 0; i < n; i++) {
+        e[i].pc = g_tc_dlog[start + i].pc;
+        e[i].len = g_tc_dlog[start + i].len;
+    }
+    qsort(e, (size_t)n, sizeof e[0], cmp_xdep);
+    int nd = 0;
+    for (int i = 0; i < n; i++) {
+        if (nd && e[i].pc <= out[nd - 1].pc + out[nd - 1].len) {
+            uint64_t end = e[i].pc + e[i].len;
+            if (end > out[nd - 1].pc + out[nd - 1].len)
+                out[nd - 1].len = (uint32_t)(end - out[nd - 1].pc);
+            continue;
+        }
+        if (nd == XLIVE_MEMO_DEPS)
+            return XLIVE_NO_DEPS;
+        out[nd++] = e[i];
+    }
+    if (!xlive_deps_fetch(out, nd, g_xlive_dbuf, sizeof g_xlive_dbuf))
+        return XLIVE_NO_DEPS;
+    *hash = xlive_dep_hash(out, nd, g_xlive_dbuf);
+    return (uint8_t)nd;
+}
+
+static int xlive_deps_replay(const XliveDep *d, int nd, uint64_t want)
+{
+    if (g_tc_ndlog + nd > TC_DLOG_MAX ||
+        !xlive_deps_fetch(d, nd, g_tc_dbytes + g_tc_nbytes, TC_DBYTES_MAX - g_tc_nbytes) ||
+        xlive_dep_hash(d, nd, g_tc_dbytes + g_tc_nbytes) != want)
+        return 0;
+    for (int i = 0; i < nd; i++) {
+        g_tc_dlog[g_tc_ndlog].pc = d[i].pc;
+        g_tc_dlog[g_tc_ndlog].at = g_tc_nbytes;
+        g_tc_dlog[g_tc_ndlog].len = d[i].len;
+        g_tc_ndlog++;
+        g_tc_nbytes += d[i].len;
+    }
+    return 1;
+}
 static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
 {
     static int maxd = -1, memo_on = -1;
@@ -1829,7 +1952,10 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
     unsigned mslot = (unsigned)((mkey * 0x9E3779B97F4A7C15ull) >> 51) & (XLIVE_MEMO_SLOTS - 1);
     uint8_t head[16];
     int have_head = 0;
-    if (memo_on && !g_tc_rec) {
+    int dstart = g_tc_ndlog;
+    int dbar = g_tc_dbar;
+    g_tc_dbar = dstart;
+    if (memo_on) {
         sigjmp_buf hb;
         sigjmp_buf *hprev = ocerz_jit_decode_recover;
         if (sigsetjmp(hb, 0) == 0) {
@@ -1839,8 +1965,14 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
         }
         ocerz_jit_decode_recover = hprev;
         if (have_head && g_xlive_memo[mslot].key == mkey && g_xlive_memo[mslot].gen == mgen &&
-            memcmp(g_xlive_memo[mslot].head, head, sizeof head) == 0)
-            return g_xlive_memo[mslot].live;
+            memcmp(g_xlive_memo[mslot].head, head, sizeof head) == 0) {
+            if (!g_tc_rec || (g_xlive_memo[mslot].nd != XLIVE_NO_DEPS &&
+                              xlive_deps_replay(g_xlive_memo[mslot].dep, g_xlive_memo[mslot].nd,
+                                                g_xlive_memo[mslot].dhash))) {
+                g_tc_dbar = dbar;
+                return g_xlive_memo[mslot].live;
+            }
+        }
     }
     X86Insn insns[JIT_MAX_BLOCK_INSNS];
     volatile int n = 0;
@@ -1862,8 +1994,10 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
         }
     }
     ocerz_jit_decode_recover = prev;
-    if (n == 0)
+    if (n == 0) {
+        g_tc_dbar = dbar;
         return OCERZ_FL_ALL;
+    }
 
     uint64_t live = OCERZ_FL_ALL;
     if (depth < maxd && is_terminator(insns[n - 1].op)) {
@@ -1885,7 +2019,11 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
         g_xlive_memo[mslot].live = live;
         g_xlive_memo[mslot].gen = mgen;
         memcpy(g_xlive_memo[mslot].head, head, sizeof head);
+        g_xlive_memo[mslot].nd = g_tc_rec
+            ? xlive_deps_since(dstart, g_xlive_memo[mslot].dep, &g_xlive_memo[mslot].dhash)
+            : XLIVE_NO_DEPS;
     }
+    g_tc_dbar = dbar;
     return live;
 }
 
@@ -15447,6 +15585,13 @@ static int tc_usable(const OcerzJit *jit)
            !jit->stop_requested;
 }
 
+static int tc_keepable(uint64_t rip)
+{
+    if (ocerz_guest_base != 0)
+        return 0;
+    return ocerz_low_base != 0 || ocerz_cache_region((uintptr_t)ocerz_g2h(rip));
+}
+
 static uint64_t tc_key(uint64_t rip, int mode32)
 {
     return rip | (mode32 ? OCERZ_TC_KEY_M32 : 0) | (g_plain_mem ? OCERZ_TC_KEY_PLAIN : 0);
@@ -16037,9 +16182,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_tc_nrel = 0;
     g_tc_ndlog = 0;
     g_tc_nbytes = 0;
+    g_tc_dbar = 0;
     if (tcm != OCERZ_TC_OFF)
         tc_log_init();
-    if ((tcm == OCERZ_TC_ON || tcm == OCERZ_TC_VERIFY) && tc_usable(jit)) {
+    if ((tcm == OCERZ_TC_ON || tcm == OCERZ_TC_VERIFY) && tc_usable(jit) && tc_keepable(rip)) {
         g_tc_rec = 1;
         g_tc_key = tc_key(rip, mode32);
         uint64_t jk = jit_key(rip, mode32);

@@ -13,6 +13,11 @@
 # --jit-required so a JIT that stops translating 32-bit blocks fails the gate
 # rather than quietly degrading into a second interpreter run that passes.
 #
+# Everything here runs with OCERZ_TCACHE=off unless the environment says
+# otherwise, so no test loads a translation an earlier test or run stored, and
+# none writes to ~/Library/Caches; the dynamic tests' tcache cases turn it on
+# themselves, against a directory of their own.
+#
 # `apis` generates native mode's API databases under runtime/apis from this
 # machine's own macOS SDK, with tools/sdkgen.sh; they are derived from the SDK
 # and so are never committed.  `check` depends on it, and a stamp named for the
@@ -24,9 +29,11 @@
 # because i386 support is being built up in stages and the number is a progress
 # measure, not a pass/fail. Pass --min-coverage N to turn it into a gate.
 CC := clang
+export OCERZ_TCACHE ?= off
 ARCHFLAGS := -arch arm64
 CFLAGS := $(ARCHFLAGS) -std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Iinclude -MMD -MP
 LDFLAGS := $(ARCHFLAGS)
+LDLIBS := -lcompression
 
 SRCS := $(wildcard src/*.c)
 ASRCS := $(wildcard src/*.s)
@@ -38,7 +45,7 @@ UNIT_SRCS := $(wildcard tests/unit/*.c)
 UNIT_BINS := $(UNIT_SRCS:tests/unit/%.c=tests/unit/bin/%)
 
 ocerz: $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -48,7 +55,7 @@ src/%.o: src/%.s
 
 tests/unit/bin/%: tests/unit/%.c $(CORE_OBJS)
 	@mkdir -p tests/unit/bin
-	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS)
 
 unit: $(UNIT_BINS)
 	@for t in $(UNIT_BINS); do echo "== $$t"; OCERZ_NO_ARM_EXEC=1 $$t || exit 1; done
