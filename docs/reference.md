@@ -39,6 +39,25 @@ where they are read.
 | `OCERZ_NOJIT_EXE=<text>` | interpret only the processes whose command line matches |
 | `OCERZ_APIDB=<dir>` | in native mode, read the API databases from this directory instead of `runtime/apis` beside the binary |
 
+### Keeping translations
+
+With `OCERZ_TCACHE=on`, translated code is kept on disk and shared between
+processes: a block that one process has translated is loaded, not translated
+again, by any process that needs it later, in the same session or the next.
+It is off by default. The stores live under `~/Library/Caches/ocerz`, one
+directory for each build of ocerz and set of `OCERZ_` variables; a Steam
+session fills about 3 GB. Directories of other builds are removed after a day,
+or sooner while they add up to more than 2 GB.
+
+| Variable | Effect |
+| --- | --- |
+| `OCERZ_TCACHE=on` | load and store translations |
+| `OCERZ_TCACHE_DIR=<dir>` | keep the stores under this directory instead |
+| `OCERZ_TCACHE_MAX_MB=<n>` | stop writing once a store holds this many megabytes (4096 by default); loading goes on |
+| `OCERZ_TCACHE_LOG=1\|<file>` | print, for each process, how many blocks it loaded and stored |
+| `OCERZ_TCACHE=verify` | a check, not for use: translate everything anyway and compare each block with the stored one |
+| `OCERZ_TCACHE=roundtrip` | a check, not for use: store nothing, but move every translation to a new address and report anything in it that still pointed at the old one |
+
 ### Memory ordering
 
 x86 has a stronger memory model than arm64. A program that never creates a

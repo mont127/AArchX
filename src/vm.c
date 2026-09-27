@@ -30,10 +30,13 @@
  *
  * ---- faults ----
  * The fault handler is where most of the emulation's hard edges meet.  A first
- * touch of a lazily-slid shared-cache data page unpacks it and retries.  A raw
- * host pointer the guest was handed inline (IOSurface's per-client page,
- * mapped into the task by the kernel) is aliased at its guest address and
- * retried.  An alignment fault in translated code means an ordered access
+ * touch of a lazily-slid shared-cache data page unpacks it and retries.  Any
+ * other fault while the translator is reading guest bytes (a decode, or a
+ * stored translation's dependency check) abandons that read, before anything
+ * that would take the JIT lock the translator already holds.  A raw host
+ * pointer the guest was handed inline (IOSurface's per-client page, mapped
+ * into the task by the kernel) is aliased at its guest address and retried.
+ * An alignment fault in translated code means an ordered access
  * crossed a 16-byte boundary: the one access is hot-patched into an
  * alignment-checked arm and re-executed.  A host-stack RAS overflow means the
  * CALL's shadow push hit the stack guard before anything of the CALL ran, so
@@ -1698,6 +1701,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (!align_fault && ocerz_cache_lazy_fault((uintptr_t)si->si_addr))
             return;
     }
+    if (ocerz_jit_decode_recover)
+        siglongjmp(*ocerz_jit_decode_recover, 1);
     if ((sig == SIGSEGV || sig == SIGBUS) && !align_fault && g_vm &&
         ocerz_host_in_guest_space(si->si_addr)) {
         static __thread uint64_t last_alias_page;
@@ -1722,9 +1727,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             }
         }
     }
-
-    if (ocerz_jit_decode_recover)
-        siglongjmp(*ocerz_jit_decode_recover, 1);
 
     if ((sig == SIGSEGV || sig == SIGBUS) && depth == 0 && g_cur_cpu && g_sig_recover && ctx) {
         const ucontext_t *uc = (const ucontext_t *)ctx;

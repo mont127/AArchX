@@ -80,6 +80,11 @@ ties on the static build; the numbers above supersede it.
   `memset` and eight others are hand-written arm64 code that runs with the
   guest's registers in place. In native mode that turns a 17 ns bridged call
   into a 2 ns branch; in cache mode it replaces Apple's translated x86 routine.
+- **Translations can be kept.** With `OCERZ_TCACHE=on` a translated block is
+  stored on disk and loaded by every later process that runs the same code.
+  Windows Steam under Wine starts a dozen processes that all run the same
+  system and Wine code; measured back to back on the same machine, its window
+  came up in 36 s with a warm store against 54 s without one.
 
 ## What is still slower
 
