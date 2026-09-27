@@ -192,6 +192,20 @@
  * through the slow path: a leaf-call loop built at 0x200000000 summed garbage
  * that changed with every run.
  *
+ * In that window the stack may live below 12 GB, where guest and host
+ * addresses differ, so every stack fast path used to be off there, and every
+ * spliced call and ret went out to C: xbench's leafcall took 2.75 s against
+ * 0.16 s outside the window.  None of the return-address stack depends on the
+ * memory mode, only the two guest-stack accesses do, so with the stack pointer
+ * pinned as a pointer and a zero guest base (low_stack_fast), a call stores its
+ * return address and a ret loads it through the same translation any other
+ * low-window access takes, and the rest - the host shadow push, bl into the
+ * callee's body, the compare and the plain ret - is what it is everywhere
+ * else.  A spliced call's pushes and rets do the same, and its elided pushes
+ * and matched rets never touched memory to begin with.  leafcall went to
+ * 0.35 s and icall from 0.74 to 0.44 (0.39 outside the window).
+ * OCERZ_NO_LOW_RAS and OCERZ_NO_LOW_SPLICE turn the two halves off.
+ *
  * ---- bridged calls ----
  * In native mode a guest call into a system library lands on a synthesized
  * stub, `mov r11d, <export id>` then `jmp qword [rip + slot]`, whose slot holds
@@ -1917,6 +1931,48 @@ static void emit_push_pinned(A64Buf *b, int hs, int rv)
     a64_sub_imm(b, 1, JTA, hs, 8);
     a64_str_regoff(b, 8, rv, JGB, JTA, 0);
     a64_mov_reg(b, 1, hs, JTA);
+}
+static int low_stack_fast(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_LOW_RAS") ? 1 : 0;
+    return !off && ocerz_low_base != 0 && ocerz_guest_base == 0 && stack_plain_access_ok() && rsp_is_ptr();
+}
+static int stack_fast(void)
+{
+    return (jgb_usable() && !stack_guard_needed()) || low_stack_fast();
+}
+static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn, int addr_reg, uint32_t **exit_sites, int *n_exits);
+static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int scratch);
+static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scratch);
+static void emit_stack_push64(A64Buf *b, const X86Insn *insn, int hs, int rv)
+{
+    if (!stack_guard_needed()) {
+        emit_push_pinned(b, hs, rv);
+        return;
+    }
+    a64_sub_imm(b, 1, JTA, hs, 8);
+    uint32_t *skip = emit_commpage_guard(b, insn, JTA, NULL, NULL);
+    emit_guest_store_ordered(b, 8, rv, JTA, JTU);
+    if (skip) a64_patch_b(skip, a64_label(b));
+    a64_sub_imm(b, 1, hs, hs, 8);
+}
+static void emit_stack_pop64(A64Buf *b, const X86Insn *insn, int hs, int rd)
+{
+    if (!stack_guard_needed()) {
+        if (stack_identity() || rsp_is_ptr()) {
+            a64_ldr_post64(b, rd, hs, 8);
+        } else {
+            a64_ldr_regoff(b, 8, rd, JGB, hs, 0);
+            a64_add_imm(b, 1, hs, hs, 8);
+        }
+        return;
+    }
+    a64_mov_reg(b, 1, JTA, hs);
+    uint32_t *skip = emit_commpage_guard(b, insn, JTA, NULL, NULL);
+    emit_guest_load_ordered(b, 8, rd, JTA, JTU);
+    if (skip) a64_patch_b(skip, a64_label(b));
+    a64_add_imm(b, 1, hs, hs, 8);
 }
 static void a64_and_imm_or_mov(A64Buf *b, int sf, int rd, int rn, uint64_t imm)
 {
@@ -12613,8 +12669,8 @@ static int callret_inline_enabled(void)
 
 static int ras_body_only(void)
 {
-    return fullpin_enabled() && !g_no_regflags && stack_plain_access_ok() && jgb_usable() &&
-           !stack_guard_needed() && !g_no_chain && !g_no_ras;
+    return fullpin_enabled() && !g_no_regflags && stack_plain_access_ok() && stack_fast() &&
+           !g_no_chain && !g_no_ras;
 }
 static void *ras_entry_for(const JitBlock *blk)
 {
@@ -12918,7 +12974,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         a64_mov_imm64(b, JT1, retaddr);
 
         int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
-                    jgb_usable() && !stack_guard_needed() && !g_no_chain;
+                    stack_fast() && !g_no_chain;
         static int no_blret = -1;
         if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
         if (fast3 && ras_body_only() && !g_no_ras && !no_blret) {
@@ -12928,9 +12984,9 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 adr_site = a64_label(b);
                 a64_emit32(b, 0x10000000u | (uint32_t)JT0);
                 a64_stp_pre(b, JT1, JT0, 31, -16);
-                emit_push_pinned(b, hs, JT1);
+                emit_stack_push64(b, insn, hs, JT1);
             } else {
-                emit_push_pinned(b, hs, JT1);
+                emit_stack_push64(b, insn, hs, JT1);
                 a64_ldr(b, 4, JT2, 20, RAS_TOP_OFF);
                 adr_site = a64_label(b);
                 a64_emit32(b, 0x10000000u | (uint32_t)JT0);
@@ -12970,7 +13026,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         }
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
-            emit_push_pinned(b, hs, JT1);
+            emit_stack_push64(b, insn, hs, JT1);
         } else {
             emit_gpr_rd(b, 1, JT0, OCERZ_RSP);
             a64_sub_imm(b, 1, JTA, JT0, 8);
@@ -13041,15 +13097,10 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             return 0;
 
         int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
-                    jgb_usable() && !stack_guard_needed();
+                    stack_fast();
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
-            if (stack_identity() || rsp_is_ptr()) {
-                a64_ldr_post64(b, JT1, hs, 8);
-            } else {
-                a64_ldr_regoff(b, 8, JT1, JGB, hs, 0);
-                a64_add_imm(b, 1, hs, hs, 8);
-            }
+            emit_stack_pop64(b, insn, hs, JT1);
             if (!ras_body_only()) a64_str(b, 8, JT1, 20, RIP_OFF);
         } else {
             emit_gpr_rd(b, 1, JT0, OCERZ_RSP);
@@ -13650,7 +13701,7 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
         static int no_blret_i = -1;
         if (no_blret_i < 0) no_blret_i = getenv("OCERZ_NO_BLRET") ? 1 : 0;
         int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
-                    jgb_usable() && !stack_guard_needed() && !g_no_chain &&
+                    stack_fast() && !g_no_chain &&
                     !g_no_ras && ras_body_only() && !no_blret_i;
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
@@ -13660,9 +13711,9 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
                 adr_site = a64_label(b);
                 a64_emit32(b, 0x10000000u | (uint32_t)JT0);
                 a64_stp_pre(b, JT2, JT0, 31, -16);
-                emit_push_pinned(b, hs, JT2);
+                emit_stack_push64(b, insn, hs, JT2);
             } else {
-                emit_push_pinned(b, hs, JT2);
+                emit_stack_push64(b, insn, hs, JT2);
                 a64_ldr(b, 4, JTF, 20, RAS_TOP_OFF);
                 adr_site = a64_label(b);
                 a64_emit32(b, 0x10000000u | (uint32_t)JT0);
@@ -14675,6 +14726,13 @@ static uint8_t  g_promo_reg[JIT_MAX_BLOCK_INSNS];
 static int32_t  g_promo_mate[JIT_MAX_BLOCK_INSNS];
 static int32_t  g_promo_push_of[JIT_MAX_BLOCK_INSNS];
 static unsigned long long g_promo_seq[JIT_MAX_BLOCK_INSNS];
+static int low_splice_ok(const X86Insn *insn)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_LOW_SPLICE") ? 1 : 0;
+    return !off && !insn->mode32 && g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && rsp_is_ptr() &&
+           mem_native_store_ok();
+}
 static int rsp_run_member(const X86Insn *insns, int j, int n, int fast3)
 {
     if (j >= n) return 0;
@@ -15936,6 +15994,54 @@ promo_push_fallthrough:
         if (g_ic_kind[i] != 0) {
             int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
                         stack_plain_access_ok() && jgb_usable() && !stack_guard_needed();
+            if (!fast3 && low_splice_ok(insn)) {
+                int hs = pin_hreg(pin_slot(OCERZ_RSP));
+                if (g_ic_kind[i] == 1 && g_ic_pushelide[i] && g_n_pe_real < PE_MAX &&
+                    (stack_identity() || rsp_is_ptr())) {
+                    a64_sub_imm(&b, 1, hs, hs, 8);
+                    g_pe_real[g_n_pe_real++] = (struct JitPushElide){
+                        (int32_t)i, g_ic_pair_rj[i], insn->rip + insn->len };
+                } else if (g_ic_kind[i] == 3) {
+                    if (rsp_run_member(blk->insns, i + 1, n, 1)) {
+                        g_rsp_lag += 8;
+                    } else {
+                        a64_add_imm(&b, 1, hs, hs, 8 + g_rsp_lag);
+                        g_rsp_lag = 0;
+                    }
+                } else if (g_ic_kind[i] == 1) {
+                    emit_gpr_rd(&b, 1, JT0, OCERZ_RSP);
+                    a64_sub_imm(&b, 1, JTA, JT0, 8);
+                    emit_add_const(&b, JTA, ea_fold());
+                    uint32_t *skip = emit_commpage_guard(&b, insn, JTA, exit_sites, &n_exits);
+                    emit_add_const(&b, JTA, ocerz_guest_base - ea_fold());
+                    a64_mov_imm64(&b, JT1, insn->rip + insn->len);
+                    emit_guest_store_ordered(&b, 8, JT1, JTA, JTU);
+                    patch_guard_skip(skip, a64_label(&b));
+                    a64_sub_imm(&b, 1, hs, hs, 8);
+                } else {
+                    emit_gpr_rd(&b, 1, JT0, OCERZ_RSP);
+                    a64_mov_reg(&b, 1, JTA, JT0);
+                    emit_add_const(&b, JTA, ea_fold());
+                    uint32_t *skip = emit_commpage_guard(&b, insn, JTA, exit_sites, &n_exits);
+                    emit_add_const(&b, JTA, ocerz_guest_base - ea_fold());
+                    emit_guest_load_ordered(&b, 8, JT0, JTA, JTU);
+                    patch_guard_skip(skip, a64_label(&b));
+                    a64_mov_imm64(&b, JT1, g_ic_expect[i]);
+                    a64_subs_reg(&b, 1, 31, JT0, JT1, 0);
+                    uint32_t *ok = a64_label(&b);
+                    a64_bcond(&b, A64_EQ, 0);
+                    a64_mov_imm64(&b, JT0, insn->rip);
+                    a64_str(&b, 8, JT0, 20, RIP_OFF);
+                    a64_mov_imm64(&b, 0, OCERZ_STEP_OK);
+                    epi_sites[n_epi] = a64_label(&b);
+                    a64_b(&b, 0);
+                    n_epi++;
+                    a64_patch_bcond(ok, a64_label(&b));
+                    a64_add_imm(&b, 1, hs, hs, 8);
+                }
+                blk->n_inlined++;
+                continue;
+            }
             if (!fast3) {
                 emit_slowcall(&b, insn, exit_sites, &n_exits);
                 blk->n_slow++;
