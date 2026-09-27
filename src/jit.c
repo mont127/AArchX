@@ -1284,7 +1284,18 @@ int ocerz_jit_exec_one(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         jit_trace_one(insn);
     int prev = ocerz_jit_exec_state;
     if (!prev) ocerz_jit_exec_state = 1;
+    uint64_t prev_op = cpu->slow_op;
+    uint64_t form = (uint64_t)insn->op | (uint64_t)(insn->vex & 3) << 16 |
+                    (uint64_t)(insn->ops[0].kind & 7) << 18 | (uint64_t)(insn->ops[1].kind & 7) << 21 |
+                    (uint64_t)(insn->ops[2].kind & 7) << 24 | (uint64_t)insn->opsize << 32;
+    for (int i = 0; i < insn->nops && i < 3; i++)
+        if (insn->ops[i].kind == OCERZ_OPK_IMM)
+            form |= (uint64_t)(insn->ops[i].imm & 0xff) << 40 | 1ull << 48;
+    if (insn->op == OCERZ_OP_SYSCALL)
+        form = (uint64_t)insn->op | (uint64_t)(uint32_t)cpu->gpr[OCERZ_RAX] << 32;
+    cpu->slow_op = form;
     int r = ocerz_interp_exec(vm, cpu, insn);
+    cpu->slow_op = prev_op;
     cpu->rip &= cpu->mode32 ? 0xffffffffull : ~0ull;
     ocerz_jit_exec_state = prev;
     return r;

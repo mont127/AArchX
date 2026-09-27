@@ -108,6 +108,23 @@
  * Backtraces deliberately include the callee-saved registers: "a register the
  * ABI says survives a call did not" is a whole class of emulation bug.
  *
+ * OCERZ_GUESTPROF=<usec> starts a sampler thread with the first registered
+ * cpu.  At a jittered interval around that it suspends each guest thread the
+ * kernel reports running, reads its host pc, and attributes to that place the
+ * CPU time the thread used since the sampler last looked at it, not a count of
+ * one: a thread that sleeps a millisecond at a time wakes on the same timer
+ * ticks as the sampler, and counting samples billed winedevice's SDL poller
+ * 39% of a core while it used 4.7%.  A pc inside a translated block counts
+ * against that block's guest rip, anything else against the cpu's current
+ * guest rip with the host symbol beside it and, when the thread is inside
+ * ocerz_jit_exec_one, the form of the instruction being interpreted - opcode,
+ * operand kinds, operand size and immediate, or the number of a syscall.  Every OCERZ_GUESTPROF_PERIOD seconds (10 by default)
+ * it prints the hottest rips with their image, the hottest host symbols and
+ * the hottest interpreted forms, then starts counting again.  The forms are
+ * what found the Wine-only gaps: Steam's webhelper interpreted pinsrw from
+ * memory for 15% of its samples because the emitter had no path for a memory
+ * operand in the low shadow window.
+ *
  * ---- threads and fork ----
  * The thread that runs this loop is a guest CPU like any other - for a dynamic
  * binary it is where main() itself runs - so it registers in the cpu registry;
@@ -280,6 +297,7 @@ static OcerzCPU *g_cpus[OCERZ_MAX_CPUS];
 static pthread_t g_cpu_threads[OCERZ_MAX_CPUS];
 static int g_cpus_n;
 static pthread_mutex_t g_cpus_lock = PTHREAD_MUTEX_INITIALIZER;
+static void guestprof_start(OcerzVM *vm);
 uint64_t ocerz_exc_trap_rip;
 uint64_t ocerz_cxa_throw_rip;
 static volatile int g_btrace_req;
@@ -289,6 +307,7 @@ static int g_unstick_started;
 
 static void ocerz_cpu_register(OcerzCPU *cpu)
 {
+    cpu->slow_op = 0;
     if (g_btrace_on < 0) g_btrace_on = getenv("OCERZ_BTRACE") ? 1 : 0;
     if (!cpu->btrace && g_btrace_on > 0) {
         unsigned n = 1u << 16;
@@ -316,6 +335,224 @@ static void ocerz_cpu_register(OcerzCPU *cpu)
     }
 
     pthread_mutex_unlock(&g_cpus_lock);
+    guestprof_start(cpu->vm);
+}
+
+#define GP_SLOTS (1u << 16)
+static uint64_t g_gp_key[GP_SLOTS];
+static uint32_t g_gp_cnt[GP_SLOTS];
+static uint64_t g_gh_key[GP_SLOTS];
+static uint32_t g_gh_cnt[GP_SLOTS];
+static uint64_t g_gp_samples, g_gp_jit;
+static uint64_t g_gf_key[GP_SLOTS];
+static uint32_t g_gf_cnt[GP_SLOTS];
+
+static void gp_bump(uint64_t *keys, uint32_t *cnts, uint64_t key, uint32_t w)
+{
+    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 48) & (GP_SLOTS - 1);
+    for (uint32_t probe = 0; probe < GP_SLOTS; probe++, h = (h + 1) & (GP_SLOTS - 1)) {
+        if (keys[h] == key) {
+            cnts[h] += w;
+            return;
+        }
+        if (!keys[h]) {
+            keys[h] = key;
+            cnts[h] = w;
+            return;
+        }
+    }
+}
+
+typedef struct { uint64_t key; uint32_t cnt; } GpTop;
+
+static int gp_top(const uint64_t *keys, const uint32_t *cnts, GpTop *top, int want)
+{
+    int n = 0;
+    for (uint32_t i = 0; i < GP_SLOTS; i++) {
+        if (!keys[i])
+            continue;
+        int at = n < want ? n : want;
+        while (at > 0 && top[at - 1].cnt < cnts[i])
+            at--;
+        if (at >= want)
+            continue;
+        int last = n < want ? n : want - 1;
+        for (int k = last; k > at; k--)
+            top[k] = top[k - 1];
+        top[at].key = keys[i];
+        top[at].cnt = cnts[i];
+        if (n < want)
+            n++;
+    }
+    return n;
+}
+
+static void gp_report(double secs)
+{
+    uint64_t total = g_gp_samples ? g_gp_samples : 1;
+    fprintf(stderr, "ocerz: GUESTPROF[%d] %.0fs cpu_ms=%llu translated=%.1f%% runtime=%.1f%%\n",
+            (int)getpid(), secs, (unsigned long long)(g_gp_samples / 1000),
+            100.0 * (double)g_gp_jit / (double)total,
+            100.0 * (double)(g_gp_samples - g_gp_jit) / (double)total);
+    static GpTop top[40];
+    int n = gp_top(g_gp_key, g_gp_cnt, top, 40);
+    for (int i = 0; i < n; i++) {
+        uint64_t rip = top[i].key & ~(1ull << 63), base = 0;
+        const char *img = ocerz_dyld_name_for_addr(rip, &base);
+        const char *leaf = img ? strrchr(img, '/') : NULL;
+        fprintf(stderr, "ocerz: GUESTPROF[%d]   %5.1f%% %s rip=%#llx %s+%#llx\n", (int)getpid(),
+                100.0 * top[i].cnt / (double)total, (top[i].key >> 63) ? "rt " : "jit",
+                (unsigned long long)rip, leaf ? leaf + 1 : (img ? img : "?"),
+                (unsigned long long)(rip - base));
+    }
+    static GpTop host[64];
+    int hn = gp_top(g_gh_key, g_gh_cnt, host, 64);
+    static struct { const void *sym; const char *name; uint32_t cnt; } agg[64];
+    int an = 0;
+    for (int i = 0; i < hn; i++) {
+        Dl_info di;
+        const void *sym = NULL;
+        const char *name = "?";
+        if (dladdr((const void *)(uintptr_t)host[i].key, &di) && di.dli_sname) {
+            sym = di.dli_saddr;
+            name = di.dli_sname;
+        }
+        int k = 0;
+        while (k < an && agg[k].sym != sym)
+            k++;
+        if (k == an) {
+            agg[an].sym = sym;
+            agg[an].name = name;
+            agg[an].cnt = 0;
+            an++;
+        }
+        agg[k].cnt += host[i].cnt;
+    }
+    for (int i = 0; i < an && i < 12; i++) {
+        int best = i;
+        for (int k = i + 1; k < an; k++)
+            if (agg[k].cnt > agg[best].cnt)
+                best = k;
+        if (best != i) {
+            __typeof__(agg[0]) t = agg[i];
+            agg[i] = agg[best];
+            agg[best] = t;
+        }
+        fprintf(stderr, "ocerz: GUESTPROF[%d]   host %5.1f%% %s\n", (int)getpid(),
+                100.0 * agg[i].cnt / (double)total, agg[i].name);
+    }
+    static GpTop form[16];
+    int fn = gp_top(g_gf_key, g_gf_cnt, form, 16);
+    for (int i = 0; i < fn; i++) {
+        uint64_t f = form[i].key;
+        static const char kc[8] = { '-', 'r', 'x', 's', 'm', 'i', 'M', '?' };
+        char imm[8] = "";
+        if ((f & 0xffff) == OCERZ_OP_SYSCALL) {
+            fprintf(stderr, "ocerz: GUESTPROF[%d]   interp %5.1f%% syscall %#llx\n", (int)getpid(),
+                    100.0 * form[i].cnt / (double)total, (unsigned long long)(f >> 32));
+            continue;
+        }
+        if (f >> 48 & 1)
+            snprintf(imm, sizeof imm, " %#x", (unsigned)(f >> 40 & 0xff));
+        fprintf(stderr, "ocerz: GUESTPROF[%d]   interp %5.1f%% %s%s %c%c%c/%u%s\n", (int)getpid(),
+                100.0 * form[i].cnt / (double)total, (f >> 16 & 1) ? "v" : "",
+                ocerz_op_name((unsigned)(f & 0xffff)), kc[f >> 18 & 7], kc[f >> 21 & 7],
+                kc[f >> 24 & 7], (unsigned)(f >> 32 & 0xff), imm);
+    }
+    memset(g_gf_key, 0, sizeof g_gf_key);
+    memset(g_gf_cnt, 0, sizeof g_gf_cnt);
+    memset(g_gp_key, 0, sizeof g_gp_key);
+    memset(g_gp_cnt, 0, sizeof g_gp_cnt);
+    memset(g_gh_key, 0, sizeof g_gh_key);
+    memset(g_gh_cnt, 0, sizeof g_gh_cnt);
+    g_gp_samples = g_gp_jit = 0;
+}
+
+static void *guestprof_thread(void *arg)
+{
+    OcerzVM *vm = (OcerzVM *)arg;
+    const char *iv = getenv("OCERZ_GUESTPROF");
+    const char *pv = getenv("OCERZ_GUESTPROF_PERIOD");
+    useconds_t us = (useconds_t)(iv ? strtoul(iv, NULL, 0) : 1000);
+    if (us < 100)
+        us = 1000;
+    uint64_t period = (pv ? strtoull(pv, NULL, 0) : 10) * 1000000000ull;
+    uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), next = start + period;
+    static struct { mach_port_t port; uint64_t cpu_us; } seen[256];
+    uint64_t seed = start | 1;
+    for (;;) {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        usleep(us / 2 + (useconds_t)(seed % us));
+        mach_port_t ports[OCERZ_MAX_CPUS];
+        OcerzCPU *cpus[OCERZ_MAX_CPUS];
+        int n = 0;
+        pthread_mutex_lock(&g_cpus_lock);
+        for (int i = 0; i < g_cpus_n; i++) {
+            ports[n] = pthread_mach_thread_np(g_cpu_threads[i]);
+            cpus[n] = g_cpus[i];
+            n++;
+        }
+        pthread_mutex_unlock(&g_cpus_lock);
+        for (int i = 0; i < n; i++) {
+            thread_basic_info_data_t bi;
+            mach_msg_type_number_t bc = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(ports[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &bc) != KERN_SUCCESS)
+                continue;
+            uint64_t cpu_us = (uint64_t)(bi.user_time.seconds + bi.system_time.seconds) * 1000000u +
+                              (uint64_t)(bi.user_time.microseconds + bi.system_time.microseconds);
+            unsigned slot = (ports[i] * 2654435761u) & 255;
+            while (seen[slot].port && seen[slot].port != ports[i])
+                slot = (slot + 1) & 255;
+            uint64_t prev = seen[slot].port ? seen[slot].cpu_us : cpu_us;
+            seen[slot].port = ports[i];
+            seen[slot].cpu_us = cpu_us;
+            if (bi.run_state != TH_STATE_RUNNING || cpu_us <= prev)
+                continue;
+            uint64_t w64 = cpu_us - prev;
+            uint32_t w = (uint32_t)(w64 > 4ull * us ? 4ull * us : w64);
+            if (thread_suspend(ports[i]) != KERN_SUCCESS)
+                continue;
+            arm_thread_state64_t st;
+            mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+            kern_return_t kr = thread_get_state(ports[i], ARM_THREAD_STATE64, (thread_state_t)&st, &sc);
+            uint64_t grip = cpus[i]->rip;
+            uint64_t sop = cpus[i]->slow_op;
+            thread_resume(ports[i]);
+            if (kr != KERN_SUCCESS)
+                continue;
+            const void *pc = (const void *)(uintptr_t)arm_thread_state64_get_pc(st);
+            OcerzJitFaultInfo fi;
+            g_gp_samples += w;
+            if (ocerz_jit_pc_in_arena(vm, pc) && ocerz_jit_fault_info(vm, pc, &fi)) {
+                g_gp_jit += w;
+                gp_bump(g_gp_key, g_gp_cnt, fi.block_rip ? fi.block_rip : 1, w);
+            } else {
+                gp_bump(g_gp_key, g_gp_cnt, (grip ? grip : 1) | (1ull << 63), w);
+                gp_bump(g_gh_key, g_gh_cnt, (uint64_t)(uintptr_t)pc, w);
+                if (sop & 0xffff)
+                    gp_bump(g_gf_key, g_gf_cnt, sop, w);
+            }
+        }
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (now >= next) {
+            gp_report((double)(now - start) / 1e9);
+            next = now + period;
+        }
+    }
+    return NULL;
+}
+
+static void guestprof_start(OcerzVM *vm)
+{
+    static int started;
+    if (started || !vm || !getenv("OCERZ_GUESTPROF"))
+        return;
+    started = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, guestprof_thread, vm) == 0)
+        pthread_detach(t);
 }
 
 static void ocerz_cpu_unregister(OcerzCPU *cpu)
