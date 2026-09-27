@@ -17502,12 +17502,13 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
         return;
     }
     qsort(hits, n_hits, sizeof *hits, hit_code_cmp);
+    static int full_scan = -1;
+    if (full_scan < 0) full_scan = getenv("OCERZ_RETIRE_SCAN") ? 1 : 0;
     pthread_jit_write_protect_np(0);
     for (size_t i = 0; i < g_n_ras_cells; i++)
         __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
-    for (size_t k = 0; k < jit->n_live; k++) {
-        JitBlock *b = jit->live[k];
-        if (!b->inv_hit) continue;
+    for (size_t m = 0; m < n_hits; m++) {
+        JitBlock *b = hits[m];
         if (b->stop_patch && b->stop_insn && *b->stop_patch != b->stop_insn) {
             __atomic_store_n(b->stop_patch, b->stop_insn, __ATOMIC_RELEASE);
             sys_icache_invalidate(b->stop_patch, 4);
@@ -17528,25 +17529,41 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
             }
         }
     }
-    for (size_t k = 0; k < jit->n_live; k++) {
-        JitBlock *sblk = jit->live[k];
-        if (sblk->inv_hit) continue;
-        for (int i = 0; i < sblk->n_edges; i++) {
-            uint32_t *at = sblk->edges[i].patch_b;
-            uint32_t fallback = sblk->edges[i].fallback_insn;
-            if (at && fallback && *at != fallback &&
-                ptr_in_hits(hits, n_hits, branch_word_target(at, *at))) {
-                __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
-                sys_icache_invalidate(at, 4);
+#define UNCHAIN_EDGE(sblk, i) do { \
+        uint32_t *at = (sblk)->edges[i].patch_b; \
+        uint32_t fallback = (sblk)->edges[i].fallback_insn; \
+        if (at && fallback && *at != fallback && \
+            ptr_in_hits(hits, n_hits, branch_word_target(at, *at))) { \
+            __atomic_store_n(at, fallback, __ATOMIC_RELEASE); \
+            sys_icache_invalidate(at, 4); \
+        } \
+        uint32_t *cs = (sblk)->edges[i].cond_site; \
+        if (cs && (sblk)->edges[i].cond_orig && *cs != (sblk)->edges[i].cond_orig && \
+            ptr_in_hits(hits, n_hits, branch_word_target(cs, *cs))) { \
+            __atomic_store_n(cs, (sblk)->edges[i].cond_orig, __ATOMIC_RELEASE); \
+            sys_icache_invalidate(cs, 4); \
+        } \
+    } while (0)
+    if (full_scan) {
+        for (size_t k = 0; k < jit->n_live; k++) {
+            JitBlock *sblk = jit->live[k];
+            if (sblk->inv_hit) continue;
+            for (int i = 0; i < sblk->n_edges; i++)
+                UNCHAIN_EDGE(sblk, i);
+        }
+    } else {
+        for (size_t m = 0; m < n_hits; m++) {
+            JitBlock *t = hits[m];
+            for (uint32_t q = 0; q < t->n_preds; q++) {
+                JitBlock *sblk = t->preds[q].pb;
+                int i = t->preds[q].e;
+                if (sblk->inv_hit || i >= sblk->n_edges) continue;
+                UNCHAIN_EDGE(sblk, i);
             }
-            uint32_t *cs = sblk->edges[i].cond_site;
-            if (cs && sblk->edges[i].cond_orig && *cs != sblk->edges[i].cond_orig &&
-                ptr_in_hits(hits, n_hits, branch_word_target(cs, *cs))) {
-                __atomic_store_n(cs, sblk->edges[i].cond_orig, __ATOMIC_RELEASE);
-                sys_icache_invalidate(cs, 4);
-            }
+            t->n_preds = 0;
         }
     }
+#undef UNCHAIN_EDGE
     pthread_jit_write_protect_np(1);
     size_t w = 0;
     for (size_t k = 0; k < jit->n_live; k++) {
