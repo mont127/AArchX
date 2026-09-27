@@ -747,6 +747,13 @@ run_caller_rpath_case ddlopen_caller_rpath 'OK'
 run_mac_syscall_low_stack_case dmac_syscall_low_stack 'OK'
 run_low_golden_case dsimd_low tests/guest/simd_pack_jit.c tests/guest/expect/simd_pack_jit.out
 run_low_golden_case dpromo_callout_low tests/dynamic/promo_callout.c tests/dynamic/promo_callout.out
+run_low_golden_case dras_stress_low tests/guest/ras_stress.c tests/guest/expect/ras_stress.out
+run_low_golden_case dcallret_fault_low tests/guest/callret_fault.c tests/guest/expect/callret_fault.out
+run_low_golden_case dfault_link_low tests/guest/fault_link.c tests/guest/expect/fault_link.out
+run_low_golden_case dstack_test_low tests/guest/stack_test.c tests/guest/expect/stack_test.out
+run_low_golden_case djcc_chain_rec_low tests/guest/jcc_chain_rec.c tests/guest/expect/jcc_chain_rec.out
+run_low_golden_case drsp_ops_low tests/guest/rsp_ops.c tests/guest/expect/rsp_ops.out
+run_low_golden_case dfault_chain_low tests/guest/fault_chain.c tests/guest/expect/fault_chain.out
 run_dlsym_deps_case ddlsym_deps 'OK'
 run_dlopen_arch_case ddlopen_arch 'OK'
 run_rpath_bare_case drpath_bare 'OK'
