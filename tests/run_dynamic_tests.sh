@@ -289,6 +289,32 @@ run_mac_syscall_low_stack_case() {
     done
 }
 
+run_low_golden_case() {
+    local name="$1" src="$2" golden="$3"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -O2 -Itests/guest -o "$dir/$name" "$src" \
+            -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name"
+        fi
+        got_code=$?
+        if [ "$got_code" = 0 ] && cmp -s "$out_file" "$golden"; then
+            echo "PASS $name-$mode"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (exit=$got_code, output differs from $golden)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_dlopen_arch_case() {
     local name="$1" want_out="$2"
     local dir="$TMP/$name"
@@ -686,6 +712,7 @@ run_load_phase_case ddlopen_load_phase 'OK'
 run_file_case ddlopen_objc_core tests/dynamic/dlopen_objc_core.c 'OK'
 run_caller_rpath_case ddlopen_caller_rpath 'OK'
 run_mac_syscall_low_stack_case dmac_syscall_low_stack 'OK'
+run_low_golden_case dsimd_low tests/guest/simd_pack_jit.c tests/guest/expect/simd_pack_jit.out
 run_dlopen_arch_case ddlopen_arch 'OK'
 run_rpath_bare_case drpath_bare 'OK'
 run_init_order_case dinit_order 'OK'

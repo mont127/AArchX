@@ -230,6 +230,13 @@ void a64_fcmgt_s(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_fcmge_s(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_v_not(A64Buf *b, int vd, int vn);
 void a64_fcsel(A64Buf *b, int dbl, int vd, int vn, int vm, int cond);
+void a64_v_smull_h(A64Buf *b, int hi, int vd, int vn, int vm);
+void a64_v_umull_s(A64Buf *b, int vd, int vn, int vm);
+void a64_v_addp_4s(A64Buf *b, int vd, int vn, int vm);
+void a64_v_sqxtn_s(A64Buf *b, int hi, int vd, int vn);
+void a64_v_sqxtun_h(A64Buf *b, int hi, int vd, int vn);
+void a64_v_rshrn_s15(A64Buf *b, int hi, int vd, int vn);
+void a64_ins_h_h(A64Buf *b, int vd, int i1, int vn, int i2);
 void a64_v_xtn(A64Buf *b, int esz, int vd, int vn);
 void a64_v_xtl2(A64Buf *b, int is_signed, int from, int vd, int vn);
 void a64_v_umin(A64Buf *b, int esz, int vd, int vn, int vm);
@@ -257,5 +264,31 @@ void a64_ccmn_imm(A64Buf *b, int sf, int rn, int imm5, int nzcv, int cond);
 void a64_ccmp_imm(A64Buf *b, int sf, int rn, int imm5, int nzcv, int cond);
 void a64_subs_imm_sh12(A64Buf *b, int sf, int rd, int rn, uint32_t imm12);
 void a64_cmp_ext_sxtw(A64Buf *b, int rn, int rm);
+
+void a64_v_sshl(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_ushl(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_umull_h(A64Buf *b, int hi, int vd, int vn, int vm);
+void a64_v_smull_s(A64Buf *b, int vd, int vn, int vm);
+void a64_v_uzp(A64Buf *b, int esz, int two, int vd, int vn, int vm);
+void a64_v_trn(A64Buf *b, int esz, int two, int vd, int vn, int vm);
+void a64_v_sqxtn_h(A64Buf *b, int hi, int vd, int vn);
+void a64_v_sqxtun_s(A64Buf *b, int hi, int vd, int vn);
+void a64_v_uabd(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_uaddlp(A64Buf *b, int esz, int vd, int vn);
+void a64_v_abs(A64Buf *b, int esz, int vd, int vn);
+void a64_v_neg(A64Buf *b, int esz, int vd, int vn);
+void a64_v_cmeq0(A64Buf *b, int esz, int vd, int vn);
+void a64_v_addp(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_movi_s_lsl24(A64Buf *b, int vd, unsigned imm8);
+void a64_v_scvtf_2d(A64Buf *b, int vd, int vn);
+void a64_v_addv_4s(A64Buf *b, int vd, int vn);
+void a64_addp_d(A64Buf *b, int vd, int vn);
+void a64_crc32c(A64Buf *b, int size, int rd, int rn, int rm);
+
+void a64_aese(A64Buf *b, int vd, int vn);
+void a64_aesd(A64Buf *b, int vd, int vn);
+void a64_aesmc(A64Buf *b, int vd, int vn);
+void a64_aesimc(A64Buf *b, int vd, int vn);
+void a64_v_pmull_d(A64Buf *b, int hi, int vd, int vn, int vm);
 
 #endif
