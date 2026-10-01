@@ -22,6 +22,10 @@
  * way: "cs2.exe:OCERZ_NO_SUPERBLOCK=1,OCERZ_TSO_STRICT=1;other.exe:..." gives
  * each listed process its own JIT knobs before any of them is read.  A process whose loader is named wine is
  * marked as one of Wine's, which fixes the base of its memory arena (see mem.c).
+ * OCERZ_STDERR_FILE appends every process's standard error to one file before
+ * anything else runs: Chromium and others start their children with standard
+ * error closed or pointed at nothing, and a child that dies early under ocerz
+ * otherwise leaves no trace of why.
  *
  * The third decision is which universe the guest binds against.  -native and
  * -cache pick the mode outright and the last one on the command line wins;
@@ -78,6 +82,7 @@
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 static char **env_snapshot(char **env)
@@ -219,6 +224,14 @@ static void restore_guest_insertion(void)
 
 int main(int argc, char **argv)
 {
+    {
+        const char *ef = getenv("OCERZ_STDERR_FILE");
+        int efd = ef && ef[0] ? open(ef, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;
+        if (efd >= 0) {
+            dup2(efd, 2);
+            close(efd);
+        }
+    }
     reexec_without_host_insertion(argv);
     restore_guest_insertion();
     if (getenv("OCERZ_HOSTMASKLOG")) {

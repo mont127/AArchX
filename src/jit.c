@@ -16115,6 +16115,15 @@ static void tc_verify(OcerzJit *jit, JitBlock *blk, const OcerzTcRecHead *h)
             (int)getpid(), why, (unsigned long long)blk_rip(blk), at, ii, (unsigned long long)irip,
             !strcmp(why, "code") ? code[at] : 0u, !strcmp(why, "code") ? v.code[at] : 0u,
             blk->code_words, r->code_words, blk->n_insns, r->n_insns);
+    if (!strcmp(why, "meta"))
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d]   meta now/rec edges=%u/%u pin_class=%u/%u pinned=%u/%u live=%#x/%#x"
+                         " xmm=%#x/%#x hoist=%#llx/%#llx ordered=%u/%u body=%u/%u noreload=%u/%u stop=%u/%u extra=%u/%u\n",
+                (int)getpid(), blk->n_edges, r->n_edges, blk->pin_class, r->pin_class, blk->n_pinned,
+                r->n_pinned, blk->entry_live, r->entry_live, blk->xmm_pinned, r->xmm_pinned,
+                (unsigned long long)blk->hoist_sig, (unsigned long long)r->hoist_sig, blk->ordered_loads,
+                r->ordered_loads, tc_off(blk, blk->body_code), r->body_code, tc_off(blk, blk->body_noreload),
+                r->body_noreload, tc_off(blk, blk->stop_patch), r->stop_patch, blk->n_stop_extra,
+                r->n_stop_extra);
     if (!strcmp(why, "rel"))
         fprintf(g_tc_lf, "ocerz: TCACHE[%d]   rel %u now off=%u kind=%u form=%u arg=%#llx"
                          " rec off=%u kind=%u form=%u arg=%#llx\n",
