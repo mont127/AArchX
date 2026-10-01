@@ -52,6 +52,30 @@
  * image is linked against, and Safari died one mach_msg later when the next
  * _platform_* access faulted.
  *
+ * A mach_vm_map that is FIXED without OVERWRITE is how Wine asks whether a range
+ * is free before it maps there, and under the low-base shadow the kernel is
+ * asked about the host's numbers, which say nothing about the guest's: a range
+ * the guest already uses looked free, the reply was moved into place over it,
+ * and Wine then mapped over its own loader at 0x200000000.  So a FIXED request
+ * that comes back for guest pages already in use is answered KERN_NO_SPACE, as
+ * the kernel would have answered it, and the host pages it got are given back
+ * (OCERZ_NO_VMMAP_TAKEN=1 turns this off).  Requests aimed at another task -
+ * mach_vm_read, read_overwrite, write, protect and msync, which is how the
+ * wineserver reads and writes its clients - name that task's guest addresses,
+ * so a low address is moved by the shadow base the whole Wine tree inherits in
+ * OCERZ_LOWBASE before the kernel sees it; untranslated, Chromium's sandbox read
+ * a child's TEB from the wrong memory and every launch of its GPU process failed
+ * with sandbox error 43 (OCERZ_NO_PEER_VM=1 turns this off).
+ *
+ * A raw host pointer that a service or the kernel hands the guest is made
+ * readable by aliasing the host region behind it into the shadow window at the
+ * same number.  The alias stops at the first page that holds guest data, and a
+ * pointer whose own page holds guest data is not aliased at all: a whole host
+ * region used to be mapped over the guest, and a pointer into the host's arm64
+ * shared cache brought two gigabytes of it down on top of Wine's loader, whose
+ * header SkyLight then walked as four billion load commands until Chromium's GPU
+ * watchdog killed the process (OCERZ_NO_ALIAS_CLIP=1 restores the old reach).
+ *
  * ---- sysctl ----
  * An x86_64 process must see 4 KB pages, as it does under Rosetta, and the
  * override has to mirror the real node's width rather than assume 4: reached by
@@ -89,6 +113,14 @@
  * pthread_create can read an empty port slot, conclude the thread exited, and
  * free the stack of a live thread.
  *
+ * thread_info(THREAD_IDENTIFIER_INFO) answers with the thread's TSD base, which
+ * the kernel reports as the host's.  It is replaced by the guest TSD of the cpu
+ * whose host thread owns that base - the pthread one even while Wine has gs on
+ * the TEB - rather than recognised by its address: Wine saves this value and
+ * switches gs back to it on every syscall, and a host thread whose stack landed
+ * above 12 GB used to pass its own TSD through untouched, so that Wine thread
+ * lost its TEB and died at its first server call.
+ *
  * ---- signals ----
  * The two sigaction directions do NOT share a layout: the kernel takes a
  * `struct __sigaction` (24 bytes, sa_tramp at 8) and hands back a `struct
@@ -106,7 +138,12 @@
  * syscall, with rip rewound so the call re-executes afterwards: the host
  * handler only sets a bit and the return-edge drain would otherwise leave a
  * signal unnoticed until some later syscall returned - and if the next one
- * blocks, it parks with the wakeup still undelivered.  sigsuspend and __sigwait
+ * blocks, it parks with the wakeup still undelivered.  A signal that arrives on
+ * a thread running a guest cpu stays pending on that cpu, because Wine aims its
+ * SIGUSR1 and SIGQUIT at one thread through __pthread_kill and the handler
+ * expects to run there; only a signal that reaches a thread with no guest cpu
+ * goes to the process-wide pool, from which a thread takes just the signals its
+ * mask lets through (OCERZ_NO_THREAD_SIGNALS=1 pools them all again).  sigsuspend and __sigwait
  * are emulated against that pending mask (they waited for a signal the host
  * kernel could never deliver, so libc returned ENOSYS) and are pinned by the
  * dynamic test signal_wait.
@@ -1302,6 +1339,7 @@ static void cpu_fresh_thread_state(OcerzCPU *c)
     c->block_since_ns = 0;
     c->block_started_ns = 0;
     c->block_nokick = 0;
+    c->unix_gs_base = 0;
 }
 
 struct ocerz_worker {
@@ -2198,6 +2236,11 @@ int ocerz_guest_posix_spawn(struct OcerzVM *vm, OcerzCPU *cpu, int *pid, const c
 #define OCERZ_WQ_GUARD_SIZE 0x1000ull
 
 extern uint32_t ocerz_take_pending_async_sig(void);
+extern uint32_t ocerz_take_pending_async_sig_mask(uint32_t accept);
+static uint32_t async_accept(uint64_t guest_mask)
+{
+    return ~((uint32_t)guest_mask << 1) & ~1u;
+}
 extern uint32_t ocerz_peek_pending_async_sig(void);
 
 #define OCERZ_ENV_ON(name) (__extension__({ static int _env_c = -1; if (_env_c < 0) _env_c = getenv(name) ? 1 : 0; _env_c; }))
@@ -2830,6 +2873,47 @@ static void vmmap_pad_restore(void)
     }
 }
 
+static uint64_t peer_g2h(uint64_t ga)
+{
+    static int init;
+    static uint64_t low, top;
+    if (!init) {
+        const char *l = getenv("OCERZ_LOWBASE"), *t = getenv("OCERZ_TOPBASE");
+        low = l ? strtoull(l, NULL, 0) : 0;
+        top = t ? strtoull(t, NULL, 0) : 0;
+        init = 1;
+    }
+    if (low && ga < OCERZ_LOW_LIMIT)
+        return ga + low;
+    if (top && ga - OCERZ_TOP_LO < OCERZ_TOP_HI - OCERZ_TOP_LO)
+        return ga - OCERZ_TOP_LO + top;
+    return ga;
+}
+
+static void xlate_task_vm_request(uint64_t gmsg, uint32_t send_size, uint32_t msg_id)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_PEER_VM") ? 1 : 0;
+    if (off)
+        return;
+    uint64_t aoff = msg_id == 4806 ? 0x34 : 0x20;
+    uint32_t need = msg_id == 4806 ? 0x40 : msg_id == 4808 ? 0x38 : 0x30;
+    if (send_size && send_size < need)
+        return;
+    int self = (uint32_t)ocerz_ld(gmsg + 8, 4) == (uint32_t)mach_task_self();
+    uint64_t ga = ocerz_ld(gmsg + aoff, 8);
+    uint64_t ha = self ? (uint64_t)(uintptr_t)ocerz_g2h(ga) : peer_g2h(ga);
+    if (ha != ga)
+        ocerz_st(gmsg + aoff, 8, ha);
+    if (msg_id == 4808) {
+        uint64_t local = ocerz_ld(gmsg + 0x30, 8);
+        uint64_t hl = (uint64_t)(uintptr_t)ocerz_g2h(local);
+        if (hl != local)
+            ocerz_st(gmsg + 0x30, 8, hl);
+    }
+}
+
 static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
                                         struct ocerz_ool_save *saved, int max_saved)
 {
@@ -2873,6 +2957,8 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
             }
         }
     }
+    if (msg_id == 4802 || msg_id == 4804 || msg_id == 4806 || msg_id == 4808 || msg_id == 4809)
+        xlate_task_vm_request(gmsg, send_size, msg_id);
     if (msg_id == 4811) {
         if ((!send_size || send_size >= 0x4c) && getenv("OCERZ_VMMAPLOG"))
             fprintf(stderr, "ocerz: VMMAP-REQ addr=%#llx size=%#llx mask=%#llx flags=%#x\n",
@@ -3686,6 +3772,8 @@ void ocerz_pe_stack_dump(OcerzCPU *cpu, const char *tag)
     uint64_t tsd = cpu->gs_base;
     if (!tsd) return;
     uint64_t teb = ocerz_ld(tsd + 0x30, 8);
+    if (teb < 0x10000 || teb > 0x7fffffffffffull || (teb & 0xfff))
+        teb = cpu->wine_teb_base;
     if (teb < 0x10000 || teb > 0x7fffffffffffull || (teb & 0xfff)) return;
     if (ocerz_ld(teb + 0x30, 8) != teb) return;
     uint64_t wtid = ocerz_ld(teb + 0x48, 8);
@@ -3873,7 +3961,7 @@ static int guest_self_signal(OcerzCPU *cpu, int signo, int defer)
 {
     uint64_t bit = 1ull << (signo - 1);
     if ((cpu->sig_mask & bit) || (defer && guest_sig_catchable(signo))) {
-        cpu->sig_pending |= bit;
+        __atomic_or_fetch(&cpu->sig_pending, bit, __ATOMIC_SEQ_CST);
         return GUEST_SELFSIG_PENDING;
     }
     if (!defer && ocerz_signal_deliver(cpu, signo, 0, 0, 0))
@@ -4141,14 +4229,13 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
 
 static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
 {
-    for (int s = 1; s < 32; s++)
-        if (taken & (1u << s))
-            cpu->sig_pending |= 1ull << (s - 1);
+    if (taken >> 1)
+        __atomic_or_fetch(&cpu->sig_pending, (uint64_t)(taken >> 1), __ATOMIC_SEQ_CST);
 
     int n = 0;
-    while (cpu->sig_pending & ~cpu->sig_mask) {
-        int s = __builtin_ctzll(cpu->sig_pending & ~cpu->sig_mask) + 1;
-        cpu->sig_pending &= ~(1ull << (s - 1));
+    while (__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~cpu->sig_mask) {
+        int s = __builtin_ctzll(__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~cpu->sig_mask) + 1;
+        __atomic_and_fetch(&cpu->sig_pending, ~(1ull << (s - 1)), __ATOMIC_SEQ_CST);
         g_ocerz_deliver_src = 1;
         if (OCERZ_ENV_ON("OCERZ_ASIGLOG"))
             fprintf(stderr,
@@ -4171,7 +4258,8 @@ static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
 
 static int guest_signal_ready(OcerzCPU *cpu)
 {
-    return ocerz_peek_pending_async_sig() || (cpu->sig_pending & ~cpu->sig_mask);
+    return (ocerz_peek_pending_async_sig() & async_accept(cpu->sig_mask)) ||
+           (__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~cpu->sig_mask);
 }
 
 int ocerz_signal_before_syscall(OcerzCPU *cpu, uint64_t insn_rip)
@@ -4180,7 +4268,7 @@ int ocerz_signal_before_syscall(OcerzCPU *cpu, uint64_t insn_rip)
         return 0;
     uint64_t resume = cpu->rip;
     cpu->rip = insn_rip;
-    if (deliver_async_signals(cpu->vm, cpu, ocerz_take_pending_async_sig()))
+    if (deliver_async_signals(cpu->vm, cpu, ocerz_take_pending_async_sig_mask(async_accept(cpu->sig_mask))))
         return 1;
     cpu->rip = resume;
     return 0;
@@ -4419,7 +4507,7 @@ int ocerz_guest_deliver_pending(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     if (!guest_signal_ready(cpu))
         return 0;
-    return deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig()) > 0;
+    return deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig_mask(async_accept(cpu->sig_mask))) > 0;
 }
 
 static int sys_sigpending(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
@@ -4571,8 +4659,10 @@ static int sys_sigsuspend(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     int caught = 0;
     for (;;) {
-        cpu->sig_pending |= ocerz_take_pending_async_sig() >> 1;
-        uint64_t ready = cpu->sig_pending & ~suspend;
+        __atomic_or_fetch(&cpu->sig_pending,
+                          (uint64_t)(ocerz_take_pending_async_sig_mask(async_accept(suspend)) >> 1),
+                          __ATOMIC_SEQ_CST);
+        uint64_t ready = __atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~suspend;
         if (ready) {
             caught = __builtin_ctzll(ready) + 1;
             break;
@@ -4587,7 +4677,7 @@ static int sys_sigsuspend(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     cpu->sig_mask = saved;
     ret_err(cpu, 4);
     if (caught) {
-        cpu->sig_pending &= ~(1ull << (caught - 1));
+        __atomic_and_fetch(&cpu->sig_pending, ~(1ull << (caught - 1)), __ATOMIC_SEQ_CST);
         g_ocerz_deliver_src = 1;
         ocerz_signal_deliver(cpu, caught, 0, 0, 0);
     }
@@ -4602,11 +4692,12 @@ static int sys_sigwait(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     int got = 0;
     for (;;) {
-        cpu->sig_pending |= ocerz_take_pending_async_sig() >> 1;
-        uint32_t hit = (uint32_t)cpu->sig_pending & want;
+        __atomic_or_fetch(&cpu->sig_pending,
+                          (uint64_t)(ocerz_take_pending_async_sig_mask(want << 1) >> 1), __ATOMIC_SEQ_CST);
+        uint32_t hit = (uint32_t)__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & want;
         if (hit) {
             got = __builtin_ctz(hit) + 1;
-            cpu->sig_pending &= ~(1ull << (got - 1));
+            __atomic_and_fetch(&cpu->sig_pending, ~(1ull << (got - 1)), __ATOMIC_SEQ_CST);
             break;
         }
         if (__atomic_load_n(&vm->exited, __ATOMIC_ACQUIRE) || cpu->interrupt)
@@ -6074,6 +6165,14 @@ int ocerz_host_region_is_device(uint64_t addr, int *prot_out)
     return (shared || device) && (info.protection & VM_PROT_READ);
 }
 
+static int alias_page_taken(uint64_t hpage)
+{
+    for (uint64_t p = hpage; p < hpage + OCERZ_HOST_PAGE_SIZE; p += OCERZ_GUEST_PAGE_SIZE)
+        if (ocerz_addr_prot(p) > 0)
+            return 1;
+    return 0;
+}
+
 int ocerz_alias_raw_region(OcerzVM *vm, uint64_t pointer)
 {
     if (!pointer)
@@ -6093,14 +6192,36 @@ int ocerz_alias_raw_region(OcerzVM *vm, uint64_t pointer)
         pointer - raddr >= rsize || rsize == 0)
         return -1;
 
+    if ((uint64_t)(uintptr_t)ocerz_g2h(raddr) == raddr)
+        return 0;
+    if (raddr >= OCERZ_LOW_LIMIT || rsize > OCERZ_LOW_LIMIT - raddr)
+        return -1;
+    if (!getenv("OCERZ_NO_ALIAS_CLIP")) {
+        uint64_t lo = pointer & ~(OCERZ_HOST_PAGE_SIZE - 1), hi = lo + OCERZ_HOST_PAGE_SIZE;
+        uint64_t rlo = (uint64_t)raddr, rhi = (uint64_t)raddr + rsize;
+        uint64_t win = 0x10000000ull;
+        if (alias_page_taken(lo)) {
+            if (getenv("OCERZ_MIGTRACE"))
+                fprintf(stderr, "ocerz: ALIASCLIP[%d] pointer=%#llx page taken readable=%d\n", (int)getpid(),
+                        (unsigned long long)pointer, ocerz_addr_readable(pointer));
+            return ocerz_addr_readable(pointer) ? 0 : -1;
+        }
+        while (lo > rlo && pointer - (lo - OCERZ_HOST_PAGE_SIZE) <= win &&
+               !alias_page_taken(lo - OCERZ_HOST_PAGE_SIZE))
+            lo -= OCERZ_HOST_PAGE_SIZE;
+        while (hi < rhi && hi + OCERZ_HOST_PAGE_SIZE - pointer <= win && !alias_page_taken(hi))
+            hi += OCERZ_HOST_PAGE_SIZE;
+        if (getenv("OCERZ_MIGTRACE"))
+            fprintf(stderr, "ocerz: ALIASCLIP[%d] pointer=%#llx region=%#llx+%#llx -> %#llx..%#llx\n",
+                    (int)getpid(), (unsigned long long)pointer, (unsigned long long)rlo,
+                    (unsigned long long)(rhi - rlo), (unsigned long long)(lo > rlo ? lo : rlo),
+                    (unsigned long long)(hi < rhi ? hi : rhi));
+        raddr = lo > rlo ? lo : rlo;
+        rsize = (hi < rhi ? hi : rhi) - raddr;
+    }
     uint64_t guest = (uint64_t)raddr;
     mach_vm_address_t host_dst =
         (mach_vm_address_t)(uintptr_t)ocerz_g2h(guest);
-    if (host_dst == raddr)
-        return 0;
-    if (guest >= OCERZ_LOW_LIMIT ||
-        rsize > OCERZ_LOW_LIMIT - guest)
-        return -1;
     if (ocerz_addr_readable(guest) &&
         ocerz_addr_readable(guest + rsize - 1))
         return 0;
@@ -6168,6 +6289,24 @@ static int ocerz_alias_raw_contiguous(OcerzVM *vm, uint64_t pointer)
         pos += size;
     }
     return ocerz_addr_readable(pointer) ? 0 : -1;
+}
+
+static void mig_vm_refuse_taken(uint64_t reply_buf, uint64_t size)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_VMMAP_TAKEN") ? 1 : 0;
+    uint64_t haddr = ocerz_ld(reply_buf + 0x24, 8);
+    if (off || !ocerz_low_base || !size || haddr >= OCERZ_LOW_LIMIT ||
+        size > OCERZ_LOW_LIMIT - haddr)
+        return;
+    for (uint64_t p = haddr & ~(OCERZ_GUEST_PAGE_SIZE - 1); p < haddr + size; p += OCERZ_GUEST_PAGE_SIZE)
+        if (ocerz_addr_committed(p) == 1) {
+            mach_vm_deallocate(mach_task_self(), haddr, size);
+            ocerz_st(reply_buf + 0x20, 4, KERN_NO_SPACE);
+            ocerz_st(reply_buf + 0x24, 8, 0);
+            return;
+        }
 }
 
 static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
@@ -6874,6 +7013,8 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         else if (request_buf != 0 &&
                  (msgh_id == 4811 || msgh_id == 4813))
             vm_result_size = ocerz_ld(request_buf + 0x38, 8);
+        int vm_fixed_keep = request_buf != 0 && msgh_id == 4811 &&
+            !((uint32_t)ocerz_ld(request_buf + 0x48, 4) & (VM_FLAGS_ANYWHERE | VM_FLAGS_OVERWRITE));
         if (request_buf != 0 && msgh_id == 4811 &&
             ((uint32_t)ocerz_ld(request_buf + 0x48, 4) & VM_FLAGS_ANYWHERE)) {
             uint64_t mask = ocerz_ld(request_buf + 0x40, 8);
@@ -7302,6 +7443,9 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         }
         if (mach_reply_buf != 0) {
             uint32_t rid = (uint32_t)ocerz_ld(mach_reply_buf + 0x14, 4);
+            if (rid == 4911 && vm_fixed_keep &&
+                (uint32_t)ocerz_ld(mach_reply_buf + 0x20, 4) == OCERZ_MACH_KERN_SUCCESS)
+                mig_vm_refuse_taken(mach_reply_buf, vm_result_size);
             if ((rid == 4900 || rid == 4911 || rid == 4913) &&
                 (uint32_t)ocerz_ld(mach_reply_buf + 0x20, 4) == OCERZ_MACH_KERN_SUCCESS)
                 mig_vm_reply_relocate(vm, mach_reply_buf, 0,
@@ -7350,16 +7494,18 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                     OCERZ_MACH_KERN_SUCCESS &&
                 (uint32_t)ocerz_ld(mach_reply_buf + 0x24, 4) >= 6) {
                 uint64_t h = ocerz_ld(mach_reply_buf + 0x30, 8);
-                if (h >= 0x140000000ull && h < OCERZ_LOW_LIMIT) {
+                uint64_t g = ocerz_vm_guest_tsd_for_host(h);
+                if (!g && h >= 0x140000000ull && h < OCERZ_LOW_LIMIT)
+                    g = cpu->gs_base;
+                if (g) {
                     uint64_t qa = ocerz_ld(mach_reply_buf + 0x38, 8);
-                    ocerz_st(mach_reply_buf + 0x30, 8, cpu->gs_base);
-                    ocerz_st(mach_reply_buf + 0x38, 8, cpu->gs_base + (qa - h));
+                    ocerz_st(mach_reply_buf + 0x30, 8, g);
+                    ocerz_st(mach_reply_buf + 0x38, 8, g + (qa - h));
                     if (getenv("OCERZ_SIGTRACE"))
                         fprintf(stderr,
                                 "ocerz: K1 thread_info handle %#llx -> gs_base %#llx (comm=%d)\n",
-                                (unsigned long long)h,
-                                (unsigned long long)cpu->gs_base,
-                                ocerz_addr_committed(cpu->gs_base));
+                                (unsigned long long)h, (unsigned long long)g,
+                                ocerz_addr_committed(g));
                 }
             }
         }
@@ -7690,6 +7836,8 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
             machdep_ret(cpu, cpu->gs_base);
             return OCERZ_STEP_OK;
         }
+        if (ocerz_gs_is_teb_band(newgs) && !ocerz_gs_is_teb_band(cpu->gs_base))
+            cpu->unix_gs_base = cpu->gs_base;
         cpu->gs_base = newgs;
         if (ocerz_gs_is_teb_band(newgs))
             cpu->wine_teb_base = newgs;
@@ -7974,6 +8122,7 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
                 fprintf(stderr, "ocerz: SIGSYS gs %#llx -> TEB %#llx rip=%#llx\n",
                         (unsigned long long)cpu->gs_base,
                         (unsigned long long)cpu->wine_teb_base, (unsigned long long)cpu->rip);
+            cpu->unix_gs_base = cpu->gs_base;
             cpu->gs_base = cpu->wine_teb_base;
         }
         g_ocerz_deliver_src = 2;

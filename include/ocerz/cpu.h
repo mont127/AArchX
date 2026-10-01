@@ -125,6 +125,7 @@ typedef struct OcerzCPU {
     uint32_t sig_delivered[32];
     uint32_t in_sighandler;
     void    *host_pthread;
+    uint64_t host_tsd;
     uint32_t host_kport;
     uint32_t host_mask_last;
     uint32_t host_mask_changes;
@@ -133,6 +134,7 @@ typedef struct OcerzCPU {
     int sig_repeat;
 
     uint64_t wine_teb_base;
+    uint64_t unix_gs_base;
 
     volatile int interrupt;
     void *side_blk;

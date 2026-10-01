@@ -101,7 +101,14 @@
  * NtTib.Self pointing back at it (the old test read it from rsp&~0xffff, which
  * is only true near the start of a thread and mid-stack mistook a real Windows
  * thread for a host worker), and the PE caller's registers sit in the syscall
- * frame at TEB+0x378 because Wine runs unix-side code on a separate stack.
+ * frame at TEB+0x378 because Wine runs unix-side code on a separate stack.  A
+ * Wine that switches gs between the TSD and the TEB itself leaves slot 6 empty,
+ * so the TEB ocerz saw it install is used instead.  Each cpu also records its
+ * host thread's TSD base, which is how a host thread_info answer is mapped back
+ * to the guest thread it describes, and the asynchronous-signal handler records
+ * a signal on the cpu of the thread that received it (see syscall.c).
+ * OCERZ_WINEFAULTLOG prints the faulting thread's first TSD slots next to its
+ * TEB, which tells a missing TEB from a wrong gs.
  * OCERZ_PORTDUMP names the conversation behind a lost-wakeup wedge; the
  * OCERZ_BTRACE freeze latch stops every block-entry ring once a cpu has entered
  * no guest block for 5 s while others keep running, which is the only
@@ -661,6 +668,35 @@ static void ocerz_cpu_unregister(OcerzCPU *cpu)
 static pthread_mutex_t g_susp_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_susp_cv = PTHREAD_COND_INITIALIZER;
 
+static uint64_t host_tsd_self(void)
+{
+    uint64_t v;
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(v));
+    return v & ~7ull;
+}
+
+static uint64_t cpu_guest_tsd(const OcerzCPU *c)
+{
+    if (ocerz_gs_is_teb_band(c->gs_base))
+        return c->unix_gs_base;
+    return c->gs_base;
+}
+
+uint64_t ocerz_vm_guest_tsd_for_host(uint64_t host_tsd)
+{
+    if (!host_tsd)
+        return 0;
+    if (g_cur_cpu && g_cur_cpu->host_tsd == host_tsd)
+        return cpu_guest_tsd(g_cur_cpu);
+    uint64_t g = 0;
+    pthread_mutex_lock(&g_cpus_lock);
+    for (int i = 0; i < g_cpus_n && !g; i++)
+        if (g_cpus[i]->host_tsd == host_tsd)
+            g = cpu_guest_tsd(g_cpus[i]);
+    pthread_mutex_unlock(&g_cpus_lock);
+    return g;
+}
+
 static OcerzCPU *cpu_by_kport_locked(uint32_t port)
 {
     for (int i = 0; i < g_cpus_n; i++)
@@ -917,6 +953,17 @@ uint32_t ocerz_peek_pending_async_sig(void)
 uint32_t ocerz_take_pending_async_sig(void)
 {
     return __atomic_exchange_n(&g_pending_async_mask, 0u, __ATOMIC_SEQ_CST);
+}
+
+uint32_t ocerz_take_pending_async_sig_mask(uint32_t accept)
+{
+    uint32_t old = __atomic_load_n(&g_pending_async_mask, __ATOMIC_SEQ_CST);
+    while (old & accept) {
+        if (__atomic_compare_exchange_n(&g_pending_async_mask, &old, old & ~accept, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return old & accept;
+    }
+    return 0;
 }
 
 static __thread sigjmp_buf *g_sig_recover;
@@ -1261,13 +1308,19 @@ static void ocerz_host_sigmask_clear(const char *where)
         fprintf(stderr, "ocerz: HOSTMASK-CLEARED[%d] %s had %#x blocked\n", (int)getpid(), where, v);
 }
 
+static int g_async_shared_only;
+
 static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)si; (void)ctx;
     if (sig > 0 && sig < 32) {
-        __atomic_or_fetch(&g_pending_async_mask, 1u << sig, __ATOMIC_SEQ_CST);
-        if (g_cur_cpu)
-            __atomic_fetch_add(&g_cur_cpu->sig_host_rcvd[sig], 1u, __ATOMIC_RELAXED);
+        OcerzCPU *c = g_cur_cpu;
+        if (c && !g_async_shared_only)
+            __atomic_or_fetch(&c->sig_pending, 1ull << (sig - 1), __ATOMIC_SEQ_CST);
+        else
+            __atomic_or_fetch(&g_pending_async_mask, 1u << sig, __ATOMIC_SEQ_CST);
+        if (c)
+            __atomic_fetch_add(&c->sig_host_rcvd[sig], 1u, __ATOMIC_RELAXED);
     }
 }
 
@@ -1297,6 +1350,7 @@ void ocerz_vm_mirror_host_signal(int sig, int kind)
     }
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
+    g_async_shared_only = getenv("OCERZ_NO_THREAD_SIGNALS") ? 1 : 0;
     if (kind == 1)
         sa.sa_handler = SIG_IGN;
     else if (kind == 2) {
@@ -2129,6 +2183,29 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             w = hex_into(w, ocerz_h2g((const void *)(uintptr_t)fault_rsp));
             w = str_into(w, "\n");
             write(2, wb, (size_t)(w - wb));
+            {
+                char tb[1024];
+                char *t = tb;
+                t = str_into(t, "ocerz: WINEFAULT-TSD cpu#");
+                t = hex_into(t, (uint64_t)g_cur_cpu->cpu_number);
+                t = str_into(t, " host_tid=");
+                {
+                    uint64_t htid = 0;
+                    pthread_threadid_np(NULL, &htid);
+                    t = hex_into(t, htid);
+                }
+                for (int k = 0; k < 24; k++) {
+                    uint64_t v = 0;
+                    mach_vm_size_t got = 0;
+                    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)ocerz_g2h(gs + 8u * (unsigned)k), 8,
+                                               (mach_vm_address_t)(uintptr_t)&v, &got) != KERN_SUCCESS)
+                        break;
+                    t = str_into(t, " ");
+                    t = hex_into(t, v);
+                }
+                t = str_into(t, "\n");
+                write(2, tb, (size_t)(t - tb));
+            }
             {
                 int dreg = fault_dreg;
                 if (dreg >= 0 && dreg < 16) {
@@ -3164,6 +3241,7 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     local.susp_host = 0;
     local.susp_have_gpr = 0;
     local.host_pthread = (void *)pthread_self();
+    local.host_tsd = host_tsd_self();
     local.host_kport = pthread_mach_thread_np(pthread_self());
     local.bridge_depth = ocerz_bridge_depth_ptr();
     local.jit_lock_depth = ocerz_jit_lock_depth_ptr();
@@ -3534,6 +3612,7 @@ OcerzCPU *ocerz_thread_attach(OcerzVM *vm)
     cpu->gs_base = gs;
     cpu->gpr[OCERZ_RSP] = block & ~0xfull;
     cpu->host_pthread = (void *)pthread_self();
+    cpu->host_tsd = host_tsd_self();
     cpu->host_kport = pthread_mach_thread_np(pthread_self());
     cpu->bridge_depth = ocerz_bridge_depth_ptr();
     cpu->jit_lock_depth = ocerz_jit_lock_depth_ptr();
@@ -3811,6 +3890,7 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     }
     g_cur_cpu = cpu;
     cpu->host_pthread = (void *)pthread_self();
+    cpu->host_tsd = host_tsd_self();
     cpu->host_kport = pthread_mach_thread_np(pthread_self());
     cpu->bridge_depth = ocerz_bridge_depth_ptr();
     cpu->jit_lock_depth = ocerz_jit_lock_depth_ptr();
