@@ -23,6 +23,18 @@
  * OCERZ_PRELOAD_OBJC still moves named cache images' closures into the initial
  * batch, and "@cat" does that for every image that defines categories.
  *
+ * A callback registered for bulk image loads is kept, not just driven once: it
+ * hears every image already listed when it registers, and then each batch a
+ * dlopen adds, before that batch's initializers for a disk image and as soon as
+ * a cache image joins the list.  libxpc is the one that registers, and it is how
+ * a framework's embedded XPC services become reachable: driven only at startup,
+ * every framework a program dlopened later had services launchd answered with
+ * "No such process", so a Wine process could not reach MTLCompilerService to
+ * compile a shader or the accessibility service behind AppKit's text input, and
+ * steam.exe retried the view bridge a thousand times a second.  A disk image's
+ * path is handed over as well as a cache image's.  OCERZ_NO_BULK_NOTIFY=1
+ * leaves later batches unannounced.
+ *
  * libsystem_platform's string and memory routines get two kinds of special
  * treatment from the translator, and this file is where it learns which code
  * they are.  The image's function starts are read once, and the exported names
@@ -977,32 +989,77 @@ static void api_return(OcerzCPU *cpu, uint64_t result)
     cpu->gpr[OCERZ_RAX] = result;
 }
 
-static int api_register_for_bulk_image_loads(struct OcerzVM *vm, OcerzCPU *cpu)
+#define BULK_CB_MAX 16
+static uint64_t g_bulk_cb[BULK_CB_MAX];
+static int g_bulk_n;
+static int g_bulk_reported;
+static pthread_mutex_t g_bulk_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void bulk_call(struct OcerzVM *vm, uint64_t func, int from, int to, uint64_t stack_top)
 {
-    uint64_t func = cpu->gpr[OCERZ_RSI];
-    int n = g_closure_n;
-    if (!func || n <= 0) {
-        api_return(cpu, 0);
-        return OCERZ_STEP_OK;
-    }
-    uint64_t mhs = ocerz_map_anywhere((uint64_t)n * 8, PROT_READ | PROT_WRITE);
-    uint64_t paths = ocerz_map_anywhere((uint64_t)n * 8, PROT_READ | PROT_WRITE);
-    if (!mhs || !paths) {
-        api_return(cpu, 0);
-        return OCERZ_STEP_OK;
-    }
+    int n = to - from;
+    if (!func || n <= 0 || !stack_top || vm->exited)
+        return;
+    uint64_t bytes = (uint64_t)n * 16;
+    uint64_t mhs = ocerz_map_anywhere(bytes, PROT_READ | PROT_WRITE);
+    if (!mhs)
+        return;
+    uint64_t paths = mhs + (uint64_t)n * 8;
     for (int k = 0; k < n; k++) {
-        const char *path = cache_path_for_mh(g_cache, g_closure_mh[k]);
-        ocerz_st(mhs + (uint64_t)k * 8, 8, g_closure_mh[k]);
-        ocerz_st(paths + (uint64_t)k * 8, 8, path ? ocerz_h2g(path) : 0);
+        uint64_t mh = g_closure_mh[from + k];
+        const char *path = cache_path_for_mh(g_cache, mh);
+        ocerz_st(mhs + (uint64_t)k * 8, 8, mh);
+        ocerz_st(paths + (uint64_t)k * 8, 8, path ? ocerz_h2g(path) : disk_gpath_for_mh(mh));
     }
-    uint64_t rsp = cpu->gpr[OCERZ_RSP];
-    uint64_t caller_ret = ocerz_ld(rsp, 8);
-    uint64_t ret_rsp = rsp + 8;
     OCERZ_LOG("dyldapi: bulk_image_loads driving %d image(s) to cb=%#llx\n",
               n, (unsigned long long)func);
     uint64_t args[3] = { (uint64_t)n, mhs, paths };
-    ocerz_vm_call(vm, func, args, 3, ret_rsp);
+    ocerz_vm_call(vm, func, args, 3, stack_top);
+    ocerz_unmap(mhs, bytes);
+}
+
+static int bulk_take_new(uint64_t *cbs, int *nc, int *from, int *to)
+{
+    pthread_mutex_lock(&g_bulk_lock);
+    *nc = g_bulk_n;
+    memcpy(cbs, g_bulk_cb, sizeof g_bulk_cb);
+    *from = g_bulk_reported;
+    *to = g_closure_n;
+    if (g_bulk_reported < g_closure_n)
+        g_bulk_reported = g_closure_n;
+    pthread_mutex_unlock(&g_bulk_lock);
+    return *nc > 0 && *to > *from;
+}
+
+void ocerz_dyldapi_notify_added(struct OcerzVM *vm, uint64_t stack_top)
+{
+    uint64_t cbs[BULK_CB_MAX];
+    int nc, from, to;
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_BULK_NOTIFY") ? 1 : 0;
+    if (off || !vm || !bulk_take_new(cbs, &nc, &from, &to))
+        return;
+    for (int i = 0; i < nc && !vm->exited; i++)
+        bulk_call(vm, cbs[i], from, to, stack_top);
+}
+
+static int api_register_for_bulk_image_loads(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t func = cpu->gpr[OCERZ_RSI];
+    uint64_t rsp = cpu->gpr[OCERZ_RSP];
+    uint64_t caller_ret = ocerz_ld(rsp, 8);
+    uint64_t ret_rsp = rsp + 8;
+    ocerz_dyldapi_notify_added(vm, ret_rsp);
+    int n = 0;
+    if (func) {
+        pthread_mutex_lock(&g_bulk_lock);
+        if (g_bulk_n < BULK_CB_MAX)
+            g_bulk_cb[g_bulk_n++] = func;
+        n = g_bulk_reported;
+        pthread_mutex_unlock(&g_bulk_lock);
+    }
+    bulk_call(vm, func, 0, n, ret_rsp);
     cpu->rip = caller_ret;
     cpu->gpr[OCERZ_RSP] = ret_rsp;
     cpu->gpr[OCERZ_RAX] = 0;
