@@ -3563,9 +3563,10 @@ static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
 {
     if (g_dlerror_g)
         ((char *)ocerz_g2h(g_dlerror_g))[0] = '\0';
+    uint64_t sp = 0;
     if (g_run_init_ready && g_run_vm && !vm->exited) {
         uint64_t istk = ocerz_map_anywhere(DYN_STACK_SIZE, PROT_READ | PROT_WRITE);
-        uint64_t sp = istk ? istk + DYN_STACK_SIZE - 64 : 0;
+        sp = istk ? istk + DYN_STACK_SIZE - 64 : 0;
         ocerz_dyldapi_objc_map_one(g_run_vm, cmh);
 
         if (sp && !vm->exited) {
@@ -3583,6 +3584,8 @@ static uint64_t cache_dlopen_hit(struct OcerzVM *vm, uint64_t cmh)
         }
     }
     ocerz_dyldapi_register_cache_image(cmh);
+    if (sp && !vm->exited)
+        ocerz_dyldapi_notify_added(g_run_vm, sp);
     return cmh;
 }
 
@@ -3773,6 +3776,8 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
                 ocerz_dyldapi_objc_map_one(g_run_vm,
                                            g_dimgs[i].load_base);
             }
+            if (ocerz_mode == OCERZ_MODE_CACHE && !vm->exited)
+                ocerz_dyldapi_notify_added(g_run_vm, itop);
             init_closure(g_run_vm, g_run_cache, d->load_base, g_run_init_args, itop);
         }
     }
