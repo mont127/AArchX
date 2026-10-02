@@ -369,6 +369,7 @@ int main(int argc, char **argv)
             }
         }
     }
+    ocerz_bigring_init();
     {
         const char *nx = getenv("OCERZ_NOJIT_EXE");
         extern char ocerz_cmdline_summary[];

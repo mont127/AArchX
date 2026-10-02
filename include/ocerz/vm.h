@@ -64,6 +64,9 @@ void ocerz_vm_mirror_host_signal(int sig, int kind);
 uint32_t ocerz_peek_pending_async_sig(void);
 uint32_t ocerz_take_pending_async_sig(void);
 uint32_t ocerz_take_pending_async_sig_mask(uint32_t accept);
+void ocerz_bigring_init(void);
+void ocerz_bigring_dump(void);
+void ocerz_cpu_restore_saved(OcerzCPU *cpu, const OcerzCPU *saved);
 void ocerz_vm_install_handlers(OcerzVM *vm);
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top);
 
