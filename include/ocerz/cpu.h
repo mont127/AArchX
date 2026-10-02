@@ -123,6 +123,7 @@ typedef struct OcerzCPU {
     uint64_t sig_pending;
     uint32_t sig_host_rcvd[32];
     uint32_t sig_delivered[32];
+    uint32_t nested_sig_handback;
     uint32_t in_sighandler;
     void    *host_pthread;
     uint64_t host_tsd;
@@ -156,6 +157,8 @@ typedef struct OcerzCPU {
     const int *bridge_depth;
     const int *jit_lock_depth;
     uint64_t slow_op;
+    struct { uint64_t t, a0, a1, a2, ret, peek, peek2, peek3, peek4; int32_t num; } sysring[24];
+    uint32_t sysring_n;
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256

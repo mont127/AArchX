@@ -142,8 +142,9 @@
  * a thread running a guest cpu stays pending on that cpu, because Wine aims its
  * SIGUSR1 and SIGQUIT at one thread through __pthread_kill and the handler
  * expects to run there; only a signal that reaches a thread with no guest cpu
- * goes to the process-wide pool, from which a thread takes just the signals its
- * mask lets through (OCERZ_NO_THREAD_SIGNALS=1 pools them all again).  sigsuspend and __sigwait
+ * goes to that thread's pool, from which every take - the entry and return
+ * edges of a syscall, the bridge, sigsuspend - removes just the signals the
+ * guest mask lets through (OCERZ_NO_THREAD_SIGNALS=1 pools them all again).  sigsuspend and __sigwait
  * are emulated against that pending mask (they waited for a signal the host
  * kernel could never deliver, so libc returned ENOSYS) and are pinned by the
  * dynamic test signal_wait.
@@ -293,6 +294,17 @@
  * library unmapped under running code otherwise shows up only as a wild jump
  * much later.  A fatal guest thread names its process's pid and command line,
  * because under Wine a dozen processes share one stderr.
+ *
+ * Every cpu keeps its last 24 syscalls - number, first three arguments, result,
+ * and the first words a read, write or writev moved, which for a Wine client
+ * are its server request and reply headers - and SIGINFO prints them under the
+ * thread's Windows stack; a signal delivery goes into the same ring as a
+ * negative number.  OCERZ_SYSRING=<power of two> also keeps one ring of that
+ * many entries for the whole process, each tagged with the low bits of its
+ * host thread id, printed at the end of the dump.  Put on the wineserver with
+ * OCERZ_EXE_ENV it shows every request, reply and wakeup the server moved, and
+ * that is how a Steam hang was followed from a client's unanswered wait to a
+ * SIGUSR1 the server had sent and the client had lost (see vm.c).
  */
 #include "ocerz/syscall.h"
 #include "ocerz/cache.h"
@@ -4227,6 +4239,11 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     return 1;
 }
 
+typedef __typeof__(((OcerzCPU *)0)->sysring[0]) SysRingEntry;
+static SysRingEntry *g_bigring;
+static uint32_t g_bigring_n, g_bigring_mask;
+static void ocerz_bigring_push(OcerzCPU *cpu, const SysRingEntry *e);
+
 static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
 {
     if (taken >> 1)
@@ -4243,6 +4260,16 @@ static int deliver_async_signals(OcerzVM *vm, OcerzCPU *cpu, uint32_t taken)
                     (int)getpid(), cpu->cpu_number, s,
                     (unsigned long long)cpu->rip,
                     (unsigned long long)(vm ? vm->insn_count : 0));
+        {
+            __typeof__(cpu->sysring[0]) *e = &cpu->sysring[cpu->sysring_n++ % 24];
+            e->t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            e->num = -s;
+            e->a0 = cpu->rip;
+            e->a1 = cpu->sig_mask;
+            e->a2 = cpu->in_sighandler;
+            e->ret = e->peek = e->peek2 = e->peek3 = e->peek4 = 0;
+            ocerz_bigring_push(cpu, e);
+        }
         if (ocerz_signal_deliver(cpu, s, 0, 0, 0)) {
             n++;
             cpu->sig_delivered[s]++;
@@ -7990,11 +8017,99 @@ static void peekguard(OcerzCPU *cpu, int class, int num, const char *when)
     }
 }
 
+
+void ocerz_bigring_init(void)
+{
+    const char *e = getenv("OCERZ_SYSRING");
+    unsigned long n = e ? strtoul(e, NULL, 0) : 0;
+    if (n < 64 || (n & (n - 1)))
+        return;
+    g_bigring = calloc(n, sizeof *g_bigring);
+    if (g_bigring)
+        g_bigring_mask = (uint32_t)(n - 1);
+}
+
+void ocerz_bigring_dump(void)
+{
+    if (!g_bigring)
+        return;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint32_t n = g_bigring_n, cap = g_bigring_mask + 1;
+    for (uint32_t k = n > cap ? n - cap : 0; k < n; k++) {
+        const SysRingEntry *e = &g_bigring[k & g_bigring_mask];
+        fprintf(stderr, "ocerz: SYSRING[%d] tid=..%04x %10.1fms %d/%d a0=%#llx a1=%#llx a2=%#llx ret=%#llx peek=%#llx/%#llx/%#llx/%#llx\n",
+                (int)getpid(), (unsigned)(e->a2 >> 48), (double)((int64_t)(e->t - now)) / 1e6,
+                e->num >> 24, e->num & 0xffffff, (unsigned long long)e->a0, (unsigned long long)e->a1,
+                (unsigned long long)(e->a2 & 0xffffffffull), (unsigned long long)e->ret,
+                (unsigned long long)e->peek, (unsigned long long)e->peek2, (unsigned long long)e->peek3,
+                (unsigned long long)e->peek4);
+    }
+}
+
+static void ocerz_bigring_push(OcerzCPU *cpu, const SysRingEntry *e)
+{
+    if (!g_bigring)
+        return;
+    uint32_t k = __atomic_fetch_add(&g_bigring_n, 1, __ATOMIC_RELAXED) & g_bigring_mask;
+    g_bigring[k] = *e;
+    g_bigring[k].a2 = (g_bigring[k].a2 & 0xffffffffull) | ((cpu->host_tid & 0xffffull) << 48);
+}
+
+static uint32_t sysring_enter(OcerzCPU *cpu, int class, int num)
+{
+    uint32_t at = cpu->sysring_n++;
+    __typeof__(cpu->sysring[0]) *e = &cpu->sysring[at % 24];
+    e->t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    e->num = (int32_t)((class << 24) | num);
+    e->a0 = cpu->gpr[OCERZ_RDI];
+    e->a1 = cpu->gpr[OCERZ_RSI];
+    e->a2 = cpu->gpr[OCERZ_RDX];
+    e->ret = ~0ull;
+    e->peek = e->peek2 = e->peek3 = e->peek4 = 0;
+    return at;
+}
+
+static void sysring_exit(OcerzCPU *cpu, uint32_t at, int class, int num)
+{
+    __typeof__(cpu->sysring[0]) *e = &cpu->sysring[at % 24];
+    if (cpu->sysring_n - at > 24)
+        return;
+    e->ret = cpu->gpr[OCERZ_RAX] | ((cpu->rflags & OCERZ_CF) ? (1ull << 63) : 0);
+    uint64_t buf = 0, len = 0;
+    if (class == 2 && (num == 3 || num == 4) && !(cpu->rflags & OCERZ_CF) && cpu->gpr[OCERZ_RAX] >= 8) {
+        buf = e->a1;
+        len = cpu->gpr[OCERZ_RAX];
+    } else if (class == 2 && num == 121 && !(cpu->rflags & OCERZ_CF) && ocerz_addr_readable(e->a1 + 31)) {
+        buf = ocerz_ld(e->a1, 8);
+        len = ocerz_ld(e->a1 + 8, 8);
+        uint64_t b1 = e->a2 > 1 ? ocerz_ld(e->a1 + 16, 8) : 0;
+        if (b1 && ocerz_ld(e->a1 + 24, 8) >= 8 && ocerz_addr_readable(b1) && ocerz_addr_readable(b1 + 7))
+            e->peek3 = ocerz_ld(b1, 8);
+        uint64_t b2 = e->a2 > 2 && ocerz_addr_readable(e->a1 + 47) ? ocerz_ld(e->a1 + 32, 8) : 0;
+        if (b2 && ocerz_ld(e->a1 + 40, 8) >= 8 && ocerz_addr_readable(b2) && ocerz_addr_readable(b2 + 7))
+            e->peek4 = ocerz_ld(b2, 8);
+    }
+    if (buf && ocerz_addr_readable(buf) && ocerz_addr_readable(buf + 7))
+        e->peek = ocerz_ld(buf, 8);
+    if (class == 2 && (num == 3 || num == 4) && buf) {
+        if (len >= 16 && ocerz_addr_readable(buf + 15))
+            e->peek2 = ocerz_ld(buf + 8, 8);
+        if (len >= 40 && ocerz_addr_readable(buf + 39))
+            e->peek3 = ocerz_ld(buf + 32, 8);
+        if (len >= 48 && ocerz_addr_readable(buf + 47))
+            e->peek4 = ocerz_ld(buf + 40, 8);
+    } else if (buf && len >= 40 && ocerz_addr_readable(buf + 39)) {
+        e->peek2 = ocerz_ld(buf + 32, 8);
+    }
+    ocerz_bigring_push(cpu, e);
+}
+
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t rax = cpu->gpr[OCERZ_RAX];
     int class = (int)((rax >> 24) & 0xff);
     int num = (int)(rax & 0xffffff);
+    uint32_t ring_at = sysring_enter(cpu, class, num);
     peekguard(cpu, class, num, "entry");
 
     if (class == 2 && (num == 4 || num == 121 || num == 154 || num == 397 || num == 415))
@@ -8134,8 +8249,9 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
     }
 
     peekguard(cpu, class, num, "exit");
+    sysring_exit(cpu, ring_at, class, num);
     if (rc == OCERZ_STEP_OK)
-        deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig());
+        deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig_mask(async_accept(cpu->sig_mask)));
     ocerz_vm_suspend_point(cpu);
     return rc;
 }

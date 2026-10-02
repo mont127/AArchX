@@ -861,7 +861,7 @@ static int api_lazy_load(struct OcerzVM *vm, OcerzCPU *cpu)
     if (ocerz_ld(flag, 4) == 0) {
         OcerzCPU saved = *cpu;
         uint64_t handle = ocerz_dlopen(vm, path, 0x100);
-        *cpu = saved;
+        ocerz_cpu_restore_saved(cpu, &saved);
         if (vm->jit_ordered_required)
             cpu->ras_top = 0;
         if (vm->exited)
@@ -2351,7 +2351,7 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
                         : ocerz_addr_readable(cpu->gpr[OCERZ_RSP]) ? ocerz_ld(cpu->gpr[OCERZ_RSP], 8) : 0;
         OcerzCPU saved = *cpu;
         uint64_t h = ocerz_dlopen_from(vm, host, (int)mode, caller);
-        *cpu = saved;
+        ocerz_cpu_restore_saved(cpu, &saved);
         if (vm->jit_ordered_required)
             cpu->ras_top = 0;
         if (vm->exited)

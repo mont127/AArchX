@@ -117,6 +117,11 @@
  * fires on a constant - was this global already wrong before the guest ran.
  * Backtraces deliberately include the callee-saved registers: "a register the
  * ABI says survives a call did not" is a whole class of emulation bug.
+ * OCERZ_HOSTSIG_PROBE adds each thread's real host signal mask and pending set,
+ * read by a SIGPROF handler on that thread, and the last 512 host signals the
+ * process received with the thread and cpu each was recorded on; that is what
+ * tells a signal that was blocked or went to the wrong thread from one that
+ * arrived where it should and was lost afterwards.
  *
  * OCERZ_GUESTPROF=<usec> starts a sampler thread with the first registered
  * cpu.  At a jittered interval around that it suspends each guest thread the
@@ -168,6 +173,23 @@
  * calls nest to any depth: guest code inside a native callback can call a
  * bridged function that calls another guest callback, and each level unwinds to
  * the state the level above it left.
+ *
+ * While the copy runs it is the thread's current cpu, so a host signal that
+ * arrives meanwhile is recorded on the copy.  The copy therefore takes the
+ * outer cpu's pending signals when it starts and hands back whatever it did not
+ * deliver when it ends, with its signal counts; dropping the copy used to drop
+ * those signals with it.  Code that saves a whole cpu around host work that runs
+ * guest code - the dyld API's dlopen paths - puts it back with
+ * ocerz_cpu_restore_saved rather than a struct copy, because a copy also rolls
+ * back what the host signal handler and other threads wrote in the meantime.
+ * That lost a wineserver suspend: Chromium's stack sampler suspends Steam's CEF
+ * browser main thread every 100 ms, a SIGUSR1 that landed during a dlopen was
+ * erased, the thread never reported its context, the sampler waited in
+ * NtGetContextThread for good, and the server, which still counted the main
+ * thread as suspended, never woke it for its own finished I/O (2026-10-02).
+ * The restore keeps the live pending set and signal counts, terminate,
+ * interrupt and suspend requests and the syscall ring, with host signals
+ * blocked across the copy so none lands halfway through it.
  *
  * ocerz_vm_call_abi is the same call with the whole System V placement, for
  * native code calling a guest function, as native qsort calls a guest
@@ -1310,9 +1332,51 @@ static void ocerz_host_sigmask_clear(const char *where)
 
 static int g_async_shared_only;
 
+void ocerz_cpu_restore_saved(OcerzCPU *cpu, const OcerzCPU *saved)
+{
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
+    uint64_t pend = __atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST);
+    uint32_t rcvd[32], dlv[32];
+    memcpy(rcvd, cpu->sig_host_rcvd, sizeof rcvd);
+    memcpy(dlv, cpu->sig_delivered, sizeof dlv);
+    uint32_t handback = cpu->nested_sig_handback;
+    int terminated = cpu->terminated, interrupt = cpu->interrupt;
+    int suspend_count = cpu->suspend_count, susp_parked = cpu->susp_parked;
+    uint32_t ring_n = cpu->sysring_n;
+    __typeof__(cpu->sysring) ring;
+    memcpy(ring, cpu->sysring, sizeof ring);
+    *cpu = *saved;
+    cpu->sig_pending = pend;
+    memcpy(cpu->sig_host_rcvd, rcvd, sizeof rcvd);
+    memcpy(cpu->sig_delivered, dlv, sizeof dlv);
+    cpu->nested_sig_handback = handback;
+    cpu->terminated = terminated;
+    cpu->interrupt = interrupt;
+    cpu->suspend_count = suspend_count;
+    cpu->susp_parked = susp_parked;
+    memcpy(cpu->sysring, ring, sizeof ring);
+    cpu->sysring_n = ring_n;
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+static struct { uint64_t t, tid; OcerzCPU *cpu; int sig, pid_from; } g_hsig_ring[512];
+static uint32_t g_hsig_n;
+
 static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
 {
-    (void)si; (void)ctx;
+    (void)ctx;
+    {
+        uint32_t k = __atomic_fetch_add(&g_hsig_n, 1, __ATOMIC_RELAXED) % 512;
+        uint64_t tid = 0;
+        pthread_threadid_np(NULL, &tid);
+        g_hsig_ring[k].t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        g_hsig_ring[k].tid = tid;
+        g_hsig_ring[k].cpu = g_cur_cpu;
+        g_hsig_ring[k].sig = sig;
+        g_hsig_ring[k].pid_from = si ? si->si_pid : -1;
+    }
     if (sig > 0 && sig < 32) {
         OcerzCPU *c = g_cur_cpu;
         if (c && !g_async_shared_only)
@@ -2914,6 +2978,51 @@ int ocerz_vm_init(OcerzVM *vm)
 }
 
 void ocerz_pe_stack_dump(OcerzCPU *cpu, const char *tag);
+
+static volatile int g_hostsig_probe_state;
+static uint32_t g_hostsig_probe_mask, g_hostsig_probe_pend;
+
+static void hostsig_probe_handler(int sig, siginfo_t *si, void *uc_)
+{
+    (void)sig; (void)si;
+    ucontext_t *uc = uc_;
+    sigset_t pend;
+    uint32_t m = 0, p = 0;
+    sigpending(&pend);
+    for (int sg = 1; sg < 32; sg++) {
+        if (sigismember(&uc->uc_sigmask, sg)) m |= 1u << sg;
+        if (sigismember(&pend, sg)) p |= 1u << sg;
+    }
+    g_hostsig_probe_mask = m;
+    g_hostsig_probe_pend = p;
+    __atomic_store_n(&g_hostsig_probe_state, 2, __ATOMIC_RELEASE);
+}
+
+static void hostsig_probe(OcerzCPU *c, pthread_t th)
+{
+    if (!getenv("OCERZ_HOSTSIG_PROBE") || pthread_equal(th, pthread_self()))
+        return;
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = hostsig_probe_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPROF, &sa, &old) != 0)
+        return;
+    __atomic_store_n(&g_hostsig_probe_state, 1, __ATOMIC_RELEASE);
+    int ok = pthread_kill(th, SIGPROF) == 0;
+    for (int w = 0; ok && w < 200 && __atomic_load_n(&g_hostsig_probe_state, __ATOMIC_ACQUIRE) != 2; w++)
+        usleep(250);
+    if (__atomic_load_n(&g_hostsig_probe_state, __ATOMIC_ACQUIRE) == 2)
+        fprintf(stderr, "ocerz: THREADDUMP-HOSTSIG[%d] cpu#%u host_tid=%#llx mask=%#x pending=%#x\n", (int)getpid(),
+                c->cpu_number, (unsigned long long)c->host_tid, g_hostsig_probe_mask, g_hostsig_probe_pend);
+    else
+        fprintf(stderr, "ocerz: THREADDUMP-HOSTSIG[%d] cpu#%u host_tid=%#llx no reply (SIGPROF blocked or thread gone)\n",
+                (int)getpid(), c->cpu_number, (unsigned long long)c->host_tid);
+    __atomic_store_n(&g_hostsig_probe_state, 0, __ATOMIC_RELEASE);
+    sigaction(SIGPROF, &old, NULL);
+}
+
 static void threaddump_handler(int sig, siginfo_t *si, void *ctx)
 {
     (void)sig; (void)si; (void)ctx;
@@ -2925,13 +3034,16 @@ static void threaddump_handler(int sig, siginfo_t *si, void *ctx)
         mach_port_t tport = 0;
         for (int k = 0; k < g_cpus_n; k++)
             if (g_cpus[k] == c) { tport = pthread_mach_thread_np(g_cpu_threads[k]); break; }
-        fprintf(stderr, "ocerz: THREADDUMP[%d] cpu#%u host_tid=%#llx port=%#x rip=%#llx rsp=%#llx rax=%#llx sys=%d/%d in_sig=%u blocked=%.1fs sigpend=%#llx sigmask=%#llx hostmask=%#x quit=%u/%u usr1=%u/%u\n",
+        fprintf(stderr, "ocerz: THREADDUMP[%d] cpu#%u host_tid=%#llx port=%#x rip=%#llx rsp=%#llx rax=%#llx sys=%d/%d in_sig=%u blocked=%.1fs sigpend=%#llx sigmask=%#llx hostmask=%#x quit=%u/%u usr1=%u/%u handback=%u\n",
                 (int)getpid(), c->cpu_number, (unsigned long long)c->host_tid, (unsigned)tport,
                 (unsigned long long)c->rip, (unsigned long long)c->gpr[OCERZ_RSP],
                 (unsigned long long)c->gpr[OCERZ_RAX], c->cur_sys_class, c->cur_sys_num,
                 c->in_sighandler, c->block_since_ns ? (double)(now - c->block_since_ns) / 1e9 : 0.0,
                 (unsigned long long)c->sig_pending, (unsigned long long)c->sig_mask, c->host_mask_last,
-                c->sig_host_rcvd[SIGQUIT], c->sig_delivered[SIGQUIT], c->sig_host_rcvd[SIGUSR1], c->sig_delivered[SIGUSR1]);
+                c->sig_host_rcvd[SIGQUIT], c->sig_delivered[SIGQUIT], c->sig_host_rcvd[SIGUSR1], c->sig_delivered[SIGUSR1],
+                c->nested_sig_handback);
+        for (int k = 0; k < g_cpus_n; k++)
+            if (g_cpus[k] == c) { hostsig_probe(c, g_cpu_threads[k]); break; }
         uint64_t fp = c->gpr[OCERZ_RBP], sp = c->gpr[OCERZ_RSP];
         fprintf(stderr, "ocerz: THREADDUMP[%d] cpu#%u bt: ret=%#llx", (int)getpid(), c->cpu_number,
                 (unsigned long long)(ocerz_addr_readable(sp) ? ocerz_ld(sp, 8) : 0));
@@ -2944,7 +3056,26 @@ static void threaddump_handler(int sig, siginfo_t *si, void *ctx)
         }
         fprintf(stderr, "\n");
         ocerz_pe_stack_dump(c, "THREADDUMP-PE");
+        uint32_t rn = c->sysring_n;
+        for (uint32_t k = rn > 24 ? rn - 24 : 0; k < rn; k++) {
+            const __typeof__(c->sysring[0]) *e = &c->sysring[k % 24];
+            fprintf(stderr, "ocerz: THREADDUMP-RING[%d] cpu#%u %8.1fms %s%d/%d a0=%#llx a1=%#llx a2=%#llx ret=%#llx peek=%#llx/%#llx/%#llx/%#llx\n",
+                    (int)getpid(), c->cpu_number, (double)((int64_t)(e->t - now)) / 1e6,
+                    e->num < 0 ? "sig " : "", e->num < 0 ? 0 : (e->num >> 24), e->num < 0 ? -e->num : (e->num & 0xffffff),
+                    (unsigned long long)e->a0, (unsigned long long)e->a1, (unsigned long long)e->a2,
+                    (unsigned long long)e->ret, (unsigned long long)e->peek,
+                    (unsigned long long)e->peek2, (unsigned long long)e->peek3, (unsigned long long)e->peek4);
+        }
     }
+    if (getenv("OCERZ_HOSTSIG_PROBE")) {
+        uint32_t n = g_hsig_n;
+        for (uint32_t k = n > 512 ? n - 512 : 0; k < n; k++)
+            fprintf(stderr, "ocerz: HOSTSIGRX[%d] %10.1fms sig=%d tid=%#llx cpu=%p cpu#%d from=%d\n", (int)getpid(),
+                    (double)((int64_t)(g_hsig_ring[k % 512].t - now)) / 1e6, g_hsig_ring[k % 512].sig,
+                    (unsigned long long)g_hsig_ring[k % 512].tid, (void *)g_hsig_ring[k % 512].cpu,
+                    g_hsig_ring[k % 512].cpu ? (int)g_hsig_ring[k % 512].cpu->cpu_number : -1, g_hsig_ring[k % 512].pid_from);
+    }
+    ocerz_bigring_dump();
     fprintf(stderr, "ocerz: THREADDUMP[%d] end\n", (int)getpid());
 }
 
@@ -3235,6 +3366,9 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     const uint64_t sentinel = g_call_sentinel;
     OcerzCPU *prev_cpu = g_cur_cpu;
     OcerzCPU local = prev_cpu ? *prev_cpu : vm->cpu;
+    local.sig_pending = prev_cpu ? __atomic_exchange_n(&prev_cpu->sig_pending, 0, __ATOMIC_SEQ_CST) : 0;
+    memset(local.sig_host_rcvd, 0, sizeof local.sig_host_rcvd);
+    memset(local.sig_delivered, 0, sizeof local.sig_delivered);
     local.terminated = 0;
     local.suspend_count = 0;
     local.susp_parked = 0;
@@ -3453,6 +3587,21 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     if (prev_cpu && vm->jit_ordered_required)
         __atomic_store_n(&prev_cpu->ras_top, 0, __ATOMIC_RELEASE);
     g_cur_cpu = prev_cpu;
+    {
+        uint64_t left = __atomic_exchange_n(&local.sig_pending, 0, __ATOMIC_SEQ_CST);
+        if (prev_cpu) {
+            if (left) {
+                __atomic_or_fetch(&prev_cpu->sig_pending, left, __ATOMIC_SEQ_CST);
+                prev_cpu->nested_sig_handback++;
+            }
+            for (int s = 1; s < 32; s++) {
+                __atomic_fetch_add(&prev_cpu->sig_host_rcvd[s], local.sig_host_rcvd[s], __ATOMIC_RELAXED);
+                __atomic_fetch_add(&prev_cpu->sig_delivered[s], local.sig_delivered[s], __ATOMIC_RELAXED);
+            }
+        } else if (left) {
+            __atomic_or_fetch(&g_pending_async_mask, (uint32_t)(left << 1), __ATOMIC_SEQ_CST);
+        }
+    }
     call->rax = local.gpr[OCERZ_RAX];
     call->xmm0 = local.xmm[0].lo;
     call->rdx = local.gpr[OCERZ_RDX];
