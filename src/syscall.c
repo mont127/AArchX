@@ -261,6 +261,17 @@
  * reports every outgoing message that carries a given 64-bit value, which is
  * how this one was found.
  *
+ * host_create_mach_voucher_trap (Mach trap 70) takes the recipes and the place
+ * for the new voucher by address, and went to the kernel untranslated, as the
+ * semaphore and switch traps it shares a case with need nothing translated.
+ * From a Wine thread both live on a low-shadow stack, so the kernel answered
+ * KERN_MEMORY_ERROR and libdispatch, which creates vouchers for the work it
+ * queues, crashed on purpose: a dispatch_async from IOSurface code on such a
+ * thread was enough.  Its sibling, trap 72, already translated its pointers.
+ * OCERZ_IOKITERR=1 prints every io_connect_method call that comes back with
+ * kIOReturnVMError or kIOReturnBadArgument - selector, struct input and the
+ * out-of-line buffers - which is what names the field a translation missed.
+ *
  * ---- what a vm_region query answers with ----
  * A guest asking mach_vm_region about its own memory is asking about the guest
  * address space, not about the host arena that happens to hold it, so the reply
@@ -7026,6 +7037,12 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
     case 60:
     case 61:
     case 70: {
+        if (num == 70) {
+            if (a[1] != 0)
+                a[1] = (uint64_t)(uintptr_t)ocerz_g2h(a[1]);
+            if (a[3] != 0)
+                a[3] = (uint64_t)(uintptr_t)ocerz_g2h(a[3]);
+        }
         static int plog = -1;
         if (plog < 0) plog = getenv("OCERZ_PORTLOG") ? 1 : 0;
         if (plog && (num == 18 || num == 19))
@@ -7206,6 +7223,19 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 
         if (request_buf != 0)
             ocerz_vmmsg_trace("REQ", request_buf, (uint32_t)(a[2] >> 32));
+        static int iokiterr = -1;
+        if (iokiterr < 0)
+            iokiterr = getenv("OCERZ_IOKITERR") ? 1 : 0;
+        uint8_t ioreq[0x200 + 8];
+        uint32_t ioreq_n = 0;
+        if (iokiterr && request_buf && (a[1] & 0x1) && (uint32_t)ocerz_ld(request_buf + 0x14, 4) == 2865) {
+            uint32_t n = (uint32_t)(a[2] >> 32);
+            ioreq_n = n > 0x200 ? 0x200u : n;
+            for (uint32_t k = 0; k < ioreq_n; k += 8) {
+                uint64_t v = ocerz_addr_readable(request_buf + k + 7) ? ocerz_ld(request_buf + k, 8) : 0;
+                memcpy(ioreq + k, &v, 8);
+            }
+        }
         {
             static uint64_t needle;
             static int needle_init;
@@ -7434,6 +7464,36 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, r47);
         if (nsv47)
             ocerz_send_restore_descriptors(reply_buf, sv47, nsv47);
+        if (ioreq_n >= 0x2c && reply_buf && r47 == 0 && ocerz_addr_readable(reply_buf + 0x23)) {
+            uint32_t ret = (uint32_t)ocerz_ld(reply_buf + 0x20, 4);
+            if (ret == 0xe00002c8u || ret == 0xe00002c2u) {
+                uint32_t sel, nsc;
+                memcpy(&sel, ioreq + 0x20, 4);
+                memcpy(&nsc, ioreq + 0x24, 4);
+                fprintf(stderr, "ocerz: IOKITERR[%d] ret=%#x selector=%u scalars=%u port=%#x req:", (int)getpid(), ret, sel, nsc,
+                        (uint32_t)ocerz_ld(reply_buf + 8, 4));
+                uint32_t o = 0x28 + 8 * nsc, nib = 0;
+                if (o + 4 <= ioreq_n)
+                    memcpy(&nib, ioreq + o, 4);
+                uint32_t q = o + 4 + ((nib + 3) & ~3u);
+                uint64_t ool_in = 0, ool_in_sz = 0, ool_out = 0, ool_out_sz = 0;
+                uint32_t ib_out = 0, sc_out = 0;
+                if (q + 0x28 <= ioreq_n) {
+                    memcpy(&ool_in, ioreq + q, 8);
+                    memcpy(&ool_in_sz, ioreq + q + 8, 8);
+                    memcpy(&ib_out, ioreq + q + 16, 4);
+                    memcpy(&sc_out, ioreq + q + 20, 4);
+                    memcpy(&ool_out, ioreq + q + 24, 8);
+                    memcpy(&ool_out_sz, ioreq + q + 32, 8);
+                }
+                fprintf(stderr, " size=%#x inband_in=%u:", ioreq_n, nib);
+                for (uint32_t k = 0; k < nib && k < 64 && o + 4 + k < ioreq_n; k++)
+                    fprintf(stderr, "%02x", ioreq[o + 4 + k]);
+                fprintf(stderr, " ool_in=%#llx+%#llx inband_out=%u scalar_out=%u ool_out=%#llx+%#llx\n",
+                        (unsigned long long)ool_in, (unsigned long long)ool_in_sz, ib_out, sc_out,
+                        (unsigned long long)ool_out, (unsigned long long)ool_out_sz);
+            }
+        }
 
         if (request_buf != 0 && ocerz_mach_err_interesting(r47))
             ocerz_log_mach_send_err(47, r47, a, request_buf, cpu);
