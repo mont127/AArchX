@@ -775,6 +775,13 @@ static void compute_closure(struct OcerzCache *cache, uint64_t main_mh)
         closure_add(g_disk_mh[i]);
 }
 
+int ocerz_dyldapi_cache_image_loaded(uint64_t mh)
+{
+    if (!g_closure_mh)
+        return 1;
+    return set_has(g_closure_hash, g_closure_hash_mask, mh);
+}
+
 void ocerz_dyldapi_register_cache_image(uint64_t mh)
 {
     if (!mh || !g_cache || !g_closure_mh ||
