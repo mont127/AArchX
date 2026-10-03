@@ -47,6 +47,11 @@ an x86 Mac. The register dump is the guest's state at the faulting instruction.
 **`cannot read` or `cannot load`, exit 65.** The path is wrong, or the file has
 no x86-64 slice AArchX can use.
 
+**`cannot find the x86_64 shared cache`.** Cache mode found no
+`dyld_shared_cache_x86_64` in either cryptex, which normally means Rosetta is not
+installed: `softwareupdate --install-rosetta` installs it, or use
+[native mode](modes.md), which needs no cache.
+
 **A program that prints nothing and exits 70** failed to get its arena or its
 stack, which normally means something else on the machine has taken the address
 space it needs.

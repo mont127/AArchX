@@ -51,8 +51,7 @@ Mac's own arm64 frameworks, so they need no x86 system libraries at all.
 You need:
 
 - an Apple silicon Mac;
-- **macOS 27 for cache mode**, the default (on macOS 26 cache mode currently
-  cannot find the shared cache; see [Compatibility](docs/compatibility.md#which-macos));
+- macOS 26 or 27;
 - the Xcode Command Line Tools (`xcode-select --install`);
 - Rosetta installed, for cache mode only. It is the package that ships Apple's
   x86-64 shared cache; AArchX maps that file and never runs Rosetta itself.
@@ -161,7 +160,6 @@ each gate proves and lists the component suites.
 
 - Application compatibility is incomplete, and some system calls and framework
   behaviour are still missing.
-- Cache mode currently needs macOS 27.
 - Native mode does not run Swift yet, has no bridge for WebKit or GameKit, and
   stops with a named message on any call it cannot make.
 - x87 arithmetic uses 64-bit doubles rather than 80-bit precision, MMX always

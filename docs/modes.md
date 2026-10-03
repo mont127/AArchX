@@ -25,9 +25,8 @@ libraries are x86 code that gets translated exactly like the guest's own.
 The shared cache is shipped by the Rosetta package rather than by the base
 system, which is why cache mode needs Rosetta installed. AArchX reads and maps
 the file itself; Rosetta's translator is never invoked and never runs. On macOS
-27 the cache lives in the Rosetta cryptex rather than its historical path.
-AArchX currently looks only there, so cache mode does not start on macOS 26,
-where the cache is still at the old path; that is a known issue.
+27 the cache lives in the Rosetta cryptex; macOS 26 keeps it in the OS cryptex.
+AArchX looks in the Rosetta cryptex first and falls back to the OS one.
 
 Because everything above the kernel is translated, cache mode behaves the way an
 x86 Mac does, down to details a program can observe: the page size the guest
