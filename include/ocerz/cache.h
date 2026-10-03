@@ -9,6 +9,8 @@
  * translated.  Symbol resolution comes in a flat form and a two-level one that
  * resolves within the specific dylib a binary named, which is what keeps two
  * versions of the same library in the cache from being confused.
+ * ocerz_cache_dir names the directory the cache is mapped from: macOS 27's
+ * Rosetta cryptex when it holds one, otherwise macOS 26's OS cryptex.
  */
 #ifndef OCERZ_CACHE_H
 #define OCERZ_CACHE_H
@@ -24,6 +26,7 @@ typedef struct OcerzCache {
 } OcerzCache;
 
 int ocerz_cache_map(OcerzCache *c);
+const char *ocerz_cache_dir(void);
 int ocerz_cache_lazy_fault(uintptr_t addr);
 int ocerz_cache_lazy_region(uintptr_t addr);
 int ocerz_cache_region(uintptr_t addr);

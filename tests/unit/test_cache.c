@@ -2,11 +2,19 @@
  * Shared-cache mapper and symbol resolver against ground truth.  The raw cache
  * reads here run without the VM's lazy-fault handler installed, so they
  * exercise the mapping itself rather than the fault path.
+ *
+ * The cache is looked for in macOS 27's Rosetta cryptex first and macOS 26's OS
+ * cryptex second, and the first directory that holds one must be the one in
+ * use.  A machine that has a cache in either place must map it: this test used
+ * to skip whenever mapping failed, which is how cache mode stopped working on
+ * macOS 26 without a single failure.
  */
 #include "ocerz/cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 static int checks, fails;
 
@@ -16,11 +24,32 @@ int main(void)
 {
     setenv("OCERZ_EAGER_SLIDE", "1", 1);
 
+    static const char *const dirs[] = {
+        "/System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld/",
+        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/",
+    };
+    const char *expect = NULL;
+    for (size_t i = 0; i < sizeof dirs / sizeof dirs[0] && !expect; i++) {
+        char path[512];
+        snprintf(path, sizeof path, "%sdyld_shared_cache_x86_64", dirs[i]);
+        if (access(path, R_OK) == 0)
+            expect = dirs[i];
+    }
+    const char *dir = ocerz_cache_dir();
+    CHECK((dir == NULL) == (expect == NULL) && (!dir || strcmp(dir, expect) == 0),
+          "cache directory %s, expected %s", dir ? dir : "(none)", expect ? expect : "(none)");
+
     OcerzCache c;
     if (ocerz_cache_map(&c) != OCERZ_OK) {
-        printf("test_cache: SKIP (shared cache not mappable here)\n");
+        if (expect) {
+            printf("FAIL: a shared cache exists in %s but could not be mapped\n", expect);
+            printf("test_cache: %d/%d FAILED\n", fails + 1, checks + 1);
+            return 1;
+        }
+        printf("test_cache: SKIP (no x86_64 shared cache on this machine)\n");
         return 0;
     }
+    printf("  cache directory  -> %s\n", dir);
 
     CHECK(c.images_cnt > 1000, "expected thousands of images, got %u", c.images_cnt);
 

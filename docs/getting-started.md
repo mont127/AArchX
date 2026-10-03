@@ -4,10 +4,8 @@
 
 - **An Apple Silicon Mac.** AArchX emits arm64 code and uses arm64 features
   directly; it does not run on an Intel Mac.
-- **macOS 27 for cache mode.** AArchX is developed and tested on macOS 26 and 27,
-  but cache mode currently looks for the x86-64 shared cache only where macOS 27
-  keeps it, so on macOS 26 it stops with `cannot map shared cache`. Native mode
-  does not use the cache. Earlier releases are untried.
+- **macOS 26 or 27.** Those are the releases it is developed and tested on.
+  Earlier releases are untried rather than known-broken.
 - **The Xcode Command Line Tools**, for `clang` and `make`. `xcode-select
   --install` installs them.
 - **Rosetta installed, for cache mode only.** Cache mode binds guest programs

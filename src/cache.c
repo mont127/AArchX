@@ -1,6 +1,17 @@
 /*
  * Maps the x86_64 dyld shared cache and resolves symbols out of it.
  *
+ * ---- where the cache is ----
+ * macOS 27 keeps the x86_64 cache in the Rosetta cryptex,
+ * /System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld, and macOS 26
+ * keeps it in the OS cryptex, /System/Volumes/Preboot/Cryptexes/OS/System/
+ * Library/dyld.  The Rosetta location is tried first and the OS one only when
+ * the Rosetta one holds no cache, so a macOS 27 machine maps exactly what it
+ * did before and a macOS 26 machine runs cache mode at all; looking only in the
+ * Rosetta cryptex had made every dynamic program on macOS 26 stop with "cannot
+ * map shared cache".  The main file and its .NN subcaches always come from the
+ * same directory, and ocerz_cache_dir names the one in use.
+ *
  * ---- lazy rebasing ----
  * The v2 slide info stores every pointer as offset|delta-chain bits, so the
  * DATA and DATA_CONST regions - about 500 MB - need unpacking even at slide 0.
@@ -95,8 +106,12 @@
 
 #include "ocerz/mem.h"
 
-#define CACHE_DIR "/System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld/"
 #define CACHE_STEM "dyld_shared_cache_x86_64"
+
+static const char *const g_cache_dirs[] = {
+    "/System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld/",
+    "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/",
+};
 #define CACHE_MAX_SUBCACHES 16
 #define EXPORT_FLAGS_REEXPORT 0x08
 
@@ -544,16 +559,34 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
 
 static const OcerzCache *g_named_cache;
 
+const char *ocerz_cache_dir(void)
+{
+    for (size_t i = 0; i < sizeof g_cache_dirs / sizeof g_cache_dirs[0]; i++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s%s", g_cache_dirs[i], CACHE_STEM);
+        if (access(path, R_OK) == 0)
+            return g_cache_dirs[i];
+    }
+    return NULL;
+}
+
 int ocerz_cache_map(OcerzCache *c)
 {
     memset(c, 0, sizeof *c);
-    if (map_subcache(CACHE_DIR CACHE_STEM, 1, c) != 0) {
-        OCERZ_FATAL("cannot map shared cache %s\n", CACHE_DIR CACHE_STEM);
+    const char *dir = ocerz_cache_dir();
+    if (!dir) {
+        OCERZ_FATAL("cannot find the x86_64 shared cache in %s or %s\n",
+                    g_cache_dirs[0], g_cache_dirs[1]);
+        return OCERZ_EIO;
+    }
+    char path[512];
+    snprintf(path, sizeof path, "%s%s", dir, CACHE_STEM);
+    if (map_subcache(path, 1, c) != 0) {
+        OCERZ_FATAL("cannot map shared cache %s\n", path);
         return OCERZ_EIO;
     }
     for (int n = 1; n < CACHE_MAX_SUBCACHES; n++) {
-        char path[512];
-        snprintf(path, sizeof path, "%s%s.%02d", CACHE_DIR, CACHE_STEM, n);
+        snprintf(path, sizeof path, "%s%s.%02d", dir, CACHE_STEM, n);
         if (map_subcache(path, 0, c) != 0)
             break;
     }

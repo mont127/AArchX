@@ -9,13 +9,12 @@ prints natively, an application drew its main window and stayed up.
 
 ## Which macOS
 
-**Cache mode currently needs macOS 27.** It looks for the x86-64 shared cache
-only in the Rosetta cryptex, `/System/Volumes/Preboot/Cryptexes/Rosetta`, which
-is where macOS 27 keeps it. macOS 26 keeps the cache under `Cryptexes/OS`, so on
-macOS 26 cache mode stops at once with `cannot map shared cache`. Several results
-below were measured on macOS 26 before that change on 2026-09-19, and each row
-says where it was measured. [Native mode](modes.md) maps no cache and is not
-affected.
+**Both macOS 26 and 27 run cache mode.** macOS 27 keeps the x86-64 shared cache
+in the Rosetta cryptex, `/System/Volumes/Preboot/Cryptexes/Rosetta`, and macOS
+26 keeps it in `/System/Volumes/Preboot/Cryptexes/OS`. AArchX looks in the
+Rosetta cryptex first and falls back to the OS one. From 2026-09-19 to
+2026-10-03 it looked only in the Rosetta cryptex, so cache mode did not start on
+macOS 26 at all in that window. Each row below says where it was measured.
 
 **On macOS 27 the bundled applications are arm64 only.** Chess, Calculator,
 Dictionary, Font Book, Grapher, Digital Color Meter, Activity Monitor, Console,
@@ -51,6 +50,13 @@ missing; what never ran was Foundation's own initializer, and the first
 upward dependency is now initialized after the image that declares it, which is
 dyld's own rule. `OCERZ_NO_UPWARD_INIT=1` restores the old behaviour, and
 `tests/dynamic/upward_init.c` is the regression test.
+
+On macOS 26.7.1, `sw_vers` currently crashes under AArchX with a stack overflow
+in which `malloc` and `malloc_zone_malloc` call each other. A build from
+2026-09-18 also overflows its stack there, so the problem is older than the
+macOS 27 work; the 16-of-16
+result above was measured on macOS 26.6 and on macOS 27. The other fifteen tools
+match on macOS 26.7.1.
 
 `/usr/bin/python3` on a Mac without Xcode is a stub that asks `xcrun` to find
 the real interpreter, and `xcrun` has no x86-64 slice to load, so it fails
