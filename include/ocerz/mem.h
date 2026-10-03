@@ -93,6 +93,7 @@ int ocerz_mem_init_identity(uint64_t size);
 extern int ocerz_wine_process;
 #define OCERZ_WINE_ARENA_BASE 0x7a0000000000ull
 int ocerz_mem_init_low_shadow(void);
+void ocerz_low_fill_host_holes(void);
 int ocerz_mem_register_range(uint64_t glo, uint64_t ghi);
 int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot);
 int ocerz_map_shared_anon(uint64_t gaddr, uint64_t len, int prot);

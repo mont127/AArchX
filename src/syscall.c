@@ -6516,6 +6516,7 @@ static int alias_raw_region(OcerzVM *vm, uint64_t pointer, int refresh)
     int nprot;
     if (host_region_entry(host_dst, &ns, &ne, &nobj, &nprot) && ns <= host_dst && nobj)
         alias_reg_add(guest, guest + rsize, nobj);
+    ocerz_low_fill_host_holes();
     if (getenv("OCERZ_MIGTRACE"))
         fprintf(stderr,
                 "ocerz: SCALIAS pointer=%#llx raw=%#llx size=%#llx shadow=%#llx prot=%d/%d\n",
