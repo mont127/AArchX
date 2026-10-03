@@ -51,12 +51,14 @@ upward dependency is now initialized after the image that declares it, which is
 dyld's own rule. `OCERZ_NO_UPWARD_INIT=1` restores the old behaviour, and
 `tests/dynamic/upward_init.c` is the regression test.
 
-On macOS 26.7.1, `sw_vers` currently crashes under AArchX with a stack overflow
-in which `malloc` and `malloc_zone_malloc` call each other. A build from
-2026-09-18 also overflows its stack there, so the problem is older than the
-macOS 27 work; the 16-of-16
-result above was measured on macOS 26.6 and on macOS 27. The other fifteen tools
-match on macOS 26.7.1.
+On macOS 26.7.1 `sw_vers` crashed as well until 2026-10-03, for a related
+reason. There libobjc links libswiftCore upward and libswiftCore links Foundation
+upward, and AArchX initialized an upward dependency right after the library that
+declared it, so Foundation's subtree ran before CoreFoundation, its own
+dependency, had finished. An upward dependency now waits until the whole walk
+from the program is done, which is the order Rosetta's dyld uses
+(`tests/dynamic/upward_defer.c`), and all sixteen tools match on macOS 26.7.1
+too.
 
 `/usr/bin/python3` on a Mac without Xcode is a stub that asks `xcrun` to find
 the real interpreter, and `xcrun` has no x86-64 slice to load, so it fails

@@ -439,6 +439,45 @@ run_init_order_case() {
     done
 }
 
+run_upward_defer_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    local lib="-arch x86_64 -dynamiclib"
+    mkdir -p "$dir"
+    if ! clang $lib -install_name @rpath/libud_log.dylib -o "$dir/libud_log.dylib" \
+            tests/dynamic/upward_defer_log.c 2>/dev/null ||
+       ! clang $lib -install_name @rpath/libud_top.dylib -o "$dir/libud_top.dylib" -DUD_NAME='"top"' \
+            tests/dynamic/upward_defer_lib.c "$dir/libud_log.dylib" 2>/dev/null ||
+       ! clang $lib -install_name @rpath/libud_mid.dylib -o "$dir/libud_mid.dylib" -DUD_NAME='"mid"' \
+            tests/dynamic/upward_defer_lib.c "$dir/libud_log.dylib" \
+            -Wl,-upward_library,"$dir/libud_top.dylib" 2>/dev/null ||
+       ! clang $lib -install_name @rpath/libud_core.dylib -o "$dir/libud_core.dylib" -DUD_NAME='"core"' \
+            tests/dynamic/upward_defer_lib.c "$dir/libud_log.dylib" "$dir/libud_mid.dylib" 2>/dev/null ||
+       ! clang $lib -install_name @rpath/libud_top.dylib -o "$dir/libud_top.dylib" -DUD_NAME='"top"' \
+            tests/dynamic/upward_defer_lib.c "$dir/libud_log.dylib" "$dir/libud_core.dylib" 2>/dev/null ||
+       ! clang -arch x86_64 -Wl,-rpath,@executable_path -o "$dir/$name" tests/dynamic/upward_defer.c \
+            "$dir/libud_log.dylib" "$dir/libud_core.dylib" 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_asm_case() {
     local name="$1" c_src="$2" s_src="$3" want_out="$4"
     if ! clang -arch x86_64 -O2 -o "$TMP/$name" "$c_src" "$s_src" 2>/dev/null; then
@@ -802,6 +841,7 @@ run_dlsym_deps_case ddlsym_deps 'OK'
 run_dlopen_arch_case ddlopen_arch 'OK'
 run_rpath_bare_case drpath_bare 'OK'
 run_init_order_case dinit_order 'OK'
+run_upward_defer_case dupward_defer 'OK'
 run_file_case ddlsym_cache_image tests/dynamic/dlsym_cache_image.c 'OK'
 run_file_case dsyscalls_extra tests/dynamic/syscalls_extra.c 'OK'
 run_file_case dproc_self tests/dynamic/proc_self.c 'OK'
