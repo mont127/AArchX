@@ -79,8 +79,9 @@
  * since and the successor's first sixteen bytes are unchanged.
  * A static liveness pass and the emitters share the same predicates so they
  * cannot disagree about what is live.  The legality rules here are written in
- * blood: a gap may not write a register the producer read (`cmp byte
- * [rax+rcx-1],0xc0 ; mov rcx,rbx ; jcc` spun libSystem's UTF-8 scan forever),
+ * blood: a gap may not write a register the producer read (a byte compare
+ * through an index register the next instruction overwrites made the
+ * NZCV-forwarding fallback re-load with the new index, and a loop spun forever),
  * and a gap's emission must touch only pinned registers (`cmp byte
  * [rdi+0x210],0 ; lea r15,[rsp+0x290] ; jne` branched on rsp and made Steam's
  * CEF browser copy an unengaged optional, 2026-09-06), so a gap is emitted into
@@ -88,9 +89,9 @@
  * compare is already out.
  *
  * No ABI passes arithmetic flags across a return, but clang's outliner does:
- * vImage's `cmpq $0, init_CGInterfaces(%rip); retq` helpers hand their compare
- * back in EFLAGS, and every Wine window painted black because CoreGraphics
- * concluded libCGInterfaces had not loaded (2026-09-05).  A pure flag producer
+ * a helper that ends in a compare and a ret hands its flags to a caller that
+ * branches right after the call.  Treating every ret as killing the flags
+ * painted every Wine window black (2026-09-05).  A pure flag producer
  * reaching a ret keeps its flags live; a tail whose last flag writer is
  * arithmetic (xor eax,eax; ret) returns a value, and keeps the dead seam.
  *
@@ -165,9 +166,9 @@
  * Edges are chained block to block, and a conditional branch may be retargeted
  * straight at its successor - but only when nothing the successor needs sits
  * between the branch and the chain tail.  A stub that replays lane-0 flushes,
- * an FP-batch check or the producer's flag record must stay on the path: subsd's
- * result left in scratch and a je's side exit chained past the flush made
- * NSViewGetTransformToDescendant assert on a singular matrix, and a stale flag
+ * an FP-batch check or the producer's flag record must stay on the path: a
+ * scalar SSE result left in lane-0 scratch and a side exit chained past the
+ * flush produced a singular view transform in Cocoa, and a stale flag
  * record handed to a successor (`cmp ebp,0xb ; jbe L` with `L: ja`) failed every
  * SQLite open in libcef.
  *

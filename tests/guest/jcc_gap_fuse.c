@@ -7,9 +7,9 @@
  * navigation (2026-09-06).  Every shape below runs with the byte 0 and 1 (or
  * the register equal and not); golden from the native run.
  *
- * The other shape is libSystem's backward UTF-8 scan, where the gap writes the
- * compare's index register: the NZCV-forwarding fallback used to re-load the
- * byte with the new index and spun forever.
+ * The other shapes are loops whose gap writes a register the compare read:
+ * the index (lea, 64- and 32-bit) or the base.  The NZCV-forwarding fallback
+ * used to re-load the byte through the new value, and a loop spun forever.
  */
 #include "gsys.h"
 
@@ -50,22 +50,25 @@ static __attribute__((noinline)) g_u64 lea_value(void)
     return r - sp;
 }
 
-static unsigned char utf[64];
-static __attribute__((noinline)) g_u64 scan_back(g_u64 n)
+static unsigned char buf[4096];
+static __attribute__((noinline)) g_u64 scan_idx(g_u64 i)
 {
-    g_u64 r;
-    __asm__ __volatile__(
-        "1:\n\t"
-        "leaq -1(%%rcx), %%rbx\n\t"
-        "cmpb $0xc0, -1(%[p],%%rcx,1)\n\t"
-        "movq %%rbx, %%rcx\n\t"
-        "jb 2f\n\t"
-        "testq %%rcx, %%rcx\n\t"
-        "jne 1b\n\t"
-        "2:\n\t"
-        "movq %%rcx, %[r]\n\t"
-        : [r] "=r"(r), "+c"(n) : [p] "r"(utf) : "cc", "memory", "rbx");
-    return r;
+    __asm__ __volatile__("1:\n\tcmpb $0x80, (%[p],%%rcx,1)\n\tleaq 1(%%rcx), %%rcx\n\tjb 1b\n\t"
+                         : "+c"(i) : [p] "r"(buf) : "cc", "memory");
+    return i;
+}
+static __attribute__((noinline)) g_u64 scan_idx32(g_u64 i)
+{
+    __asm__ __volatile__("1:\n\tcmpb $0x80, (%[p],%%rcx,1)\n\tleal 1(%%ecx), %%ecx\n\tjb 1b\n\t"
+                         : "+c"(i) : [p] "r"(buf) : "cc", "memory");
+    return i;
+}
+static __attribute__((noinline)) g_u64 scan_base(g_u64 i)
+{
+    const unsigned char *q = buf + i;
+    __asm__ __volatile__("1:\n\tcmpb $0x80, (%[q])\n\tleaq 2(%[q]), %[q]\n\tjb 1b\n\t"
+                         : [q] "+r"(q) : : "cc", "memory");
+    return (g_u64)(q - buf);
 }
 
 int main(int argc, char **argv, char **envp)
@@ -82,7 +85,11 @@ int main(int argc, char **argv, char **envp)
         g_putu64_nonl(s_testreg_lea_je0()); g_puts(" "); g_putu64_nonl(s_testreg_lea_je1()); g_puts(" ");
         g_putu64(lea_value());
     }
-    for (int i = 0; i < 64; i++) utf[i] = (unsigned char)(i >= 40 ? 0xe0 : 0x41);
-    g_putu64_nonl(scan_back(64)); g_puts(" "); g_putu64_nonl(scan_back(40)); g_puts(" "); g_putu64(scan_back(64));
+    for (int i = 0; i < 4096; i++) buf[i] = (unsigned char)(i >= 4000 ? 0xe0 : 0x41);
+    for (int pass = 0; pass < 3; pass++) {
+        g_putu64_nonl(scan_idx(0)); g_puts(" "); g_putu64_nonl(scan_idx(3999)); g_puts(" "); g_putu64_nonl(scan_idx(4000)); g_puts(" ");
+        g_putu64_nonl(scan_idx32(0)); g_puts(" "); g_putu64_nonl(scan_idx32(17)); g_puts(" ");
+        g_putu64_nonl(scan_base(0)); g_puts(" "); g_putu64(scan_base(1));
+    }
     return 0;
 }

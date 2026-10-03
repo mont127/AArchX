@@ -10,8 +10,10 @@ punpcklqdq same lo 0x1111111122222222
 punpcklqdq same hi 0x1111111122222222
 punpcklqdq rm lo 0x1111111122222222
 punpcklqdq rm hi 0x5555555566666666
-rect word 0x4065600000000000
-rect word 0x40a0100000000000
-rect word 0x40ab520000000000
-rect word 0x405a000000000000
+punpckhqdq rex rr lo 0x7777777788888888
+punpckhqdq rex rr hi 0x3333333344444444
+punpckhqdq rex same lo 0x7777777788888888
+punpckhqdq rex same hi 0x7777777788888888
+punpcklqdq rex rm lo 0x5555555566666666
+punpcklqdq rex rm hi 0x1111111122222222
 done

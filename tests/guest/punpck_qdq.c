@@ -1,12 +1,7 @@
 /* punpckhqdq / punpcklqdq in every form (reg<-reg, reg<-same reg, reg<-mem),
- * plus the SkyLight shape that broke NSScreen.visibleFrame under ocerz:
- * four floats -> CGRect via cvtps2pd / punpckhqdq xmm0,xmm0 / cvtps2pd.
- * 0F 6D used to decode as punpcklqdq, so the high qword never moved down and
- * every Cocoa window was constrained to a 74-pixel-high "visible frame".
- * Golden from Rosetta.
- *
- * The SkyLight dock-rect shape is included with its real values: the floats
- * {171, 2056, 3497, 104} widened to doubles.
+ * with the low and the REX-extended registers.  0F 6D used to decode as
+ * punpcklqdq, so the high qword never moved down, and every Cocoa window was
+ * constrained to a 74-pixel-high visible frame.  Golden from Rosetta.
  */
 #include "gsys.h"
 static void put(const char *tag, g_u64 v) { g_puts(tag); g_puthex64(v); }
@@ -26,11 +21,12 @@ int main(void){
                      : "=r"(lo), "=r"(hi) : "m"(A[0]) : "xmm1"); put("punpcklqdq same lo ", lo); put("punpcklqdq same hi ", hi);
     __asm__ volatile("movdqu %2, %%xmm1\n\tpunpcklqdq %3, %%xmm1\n\tmovq %%xmm1, %0\n\tpshufd $0xee, %%xmm1, %%xmm1\n\tmovq %%xmm1, %1"
                      : "=r"(lo), "=r"(hi) : "m"(A[0]), "m"(B[0]) : "xmm1"); put("punpcklqdq rm lo ", lo); put("punpcklqdq rm hi ", hi);
-    static const float F[4] = { 171.0f, 2056.0f, 3497.0f, 104.0f };
-    volatile double D[4] = { 0, 0, 0, 0 };
-    __asm__ volatile("movdqu %2, %%xmm0\n\tcvtps2pd %%xmm0, %%xmm1\n\tmovups %%xmm1, %0\n\tpunpckhqdq %%xmm0, %%xmm0\n\tcvtps2pd %%xmm0, %%xmm0\n\tmovups %%xmm0, %1"
-                     : "=m"(D[0]), "=m"(D[2]) : "m"(F[0]) : "xmm0", "xmm1");
-    for (int i = 0; i < 4; i++) { g_u64 bits; __builtin_memcpy(&bits, (const void *)&D[i], 8); put("rect word ", bits); }
+    __asm__ volatile("movdqu %2, %%xmm9\n\tmovdqu %3, %%xmm12\n\tpunpckhqdq %%xmm12, %%xmm9\n\tmovq %%xmm9, %0\n\tpshufd $0xee, %%xmm9, %%xmm9\n\tmovq %%xmm9, %1"
+                     : "=r"(lo), "=r"(hi) : "m"(B[0]), "m"(A[0]) : "xmm9", "xmm12"); put("punpckhqdq rex rr lo ", lo); put("punpckhqdq rex rr hi ", hi);
+    __asm__ volatile("movdqu %2, %%xmm10\n\tpunpckhqdq %%xmm10, %%xmm10\n\tmovq %%xmm10, %0\n\tpshufd $0xee, %%xmm10, %%xmm10\n\tmovq %%xmm10, %1"
+                     : "=r"(lo), "=r"(hi) : "m"(B[0]) : "xmm10"); put("punpckhqdq rex same lo ", lo); put("punpckhqdq rex same hi ", hi);
+    __asm__ volatile("movdqu %2, %%xmm11\n\tpunpcklqdq %3, %%xmm11\n\tmovq %%xmm11, %0\n\tpshufd $0xee, %%xmm11, %%xmm11\n\tmovq %%xmm11, %1"
+                     : "=r"(lo), "=r"(hi) : "m"(B[0]), "m"(A[0]) : "xmm11"); put("punpcklqdq rex rm lo ", lo); put("punpcklqdq rex rm hi ", hi);
     g_puts("done\n");
     return 0;
 }
