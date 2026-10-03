@@ -78,6 +78,22 @@ On an Apple M5 running macOS 27, in September 2026:
 | Dynamic suite | 113 / 113 |
 | Native suite | 87 / 87 |
 
+The component suites inside the unit phase, as last counted in September 2026
+(passes / failures):
+
+| Suite | Result |
+| --- | --- |
+| arm64 emitter | encodings validated by execution |
+| instruction corpus | 511 instructions |
+| x86-64 decode | 246 / 246 cases |
+| i386 decode | 102 cases, 26 rejects, 122 address cases |
+| extension and SSE suites | 237 / 0, 246 / 0, SSE4.2 differential against Rosetta |
+| loader, syscall | 54 / 0, 365 / 0 |
+| memory, shared mappings | 2692 / 0, 105 / 0 |
+| native mode: API database, image, bridge, ABI, callbacks, thread attach, Objective-C, blocks | 334 / 0, 142426 / 0, 1247 / 0, 28071 / 0, 131974 / 0, 270 / 0, 125400 / 0, 107 / 0 |
+| in-place string and memory routines against the host's | 6,736,902 / 0 |
+| xbench output against native | 15 / 15 kernels bit-identical |
+
 ## Conventions
 
 The test binaries under `tests/guest/bin` and `tests/unit/bin` are committed,

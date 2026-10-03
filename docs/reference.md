@@ -39,6 +39,17 @@ where they are read.
 | `OCERZ_NOJIT_EXE=<text>` | interpret only the processes whose command line matches |
 | `OCERZ_APIDB=<dir>` | in native mode, read the API databases from this directory instead of `runtime/apis` beside the binary |
 
+### Process trees
+
+Wine and Steam start many processes, and a setting is usually wanted in one of them only. Each of these picks processes by a substring of their command line, and the setting is inherited through every exec.
+
+| Variable | Effect |
+| --- | --- |
+| `OCERZ_EXE_ENV="a.exe:K=V,K=V;b.exe:K=V"` | set variables only in the processes whose command line matches |
+| `OCERZ_STRACE_EXE=<text>` | trace system calls only in the processes whose command line matches |
+| `OCERZ_NOJIT_EXE=<text>` | interpret only the processes whose command line matches |
+| `OCERZ_STDERR_FILE=<file>` | append every process's standard error to one file |
+
 ### Keeping translations
 
 Translated code is kept on disk and shared between processes: a block that one
@@ -111,6 +122,18 @@ bug is in what that switch controls.
 | `OCERZ_JITLOCKLOG=1` | report JIT lock waits over three seconds, with the holder's state |
 | `OCERZ_SUSPLOG=1` | in native mode, log each `thread_suspend` and `thread_resume` a guest makes |
 | `OCERZ_XLATPAGES=1` | log each distinct 4 KB page the process translates |
+| `OCERZ_ALLMISS=1` | list every unresolved import rather than the first two dozen |
+| `OCERZ_DYNLOOKUPLOG=1` | name each symbol imported with `-undefined dynamic_lookup` that nothing defines, which is allowed and otherwise not reported |
+| `OCERZ_DLSYMLOG=1` | print each `dlsym` with its handle, result and caller |
+| `OCERZ_MACSYSLOG=1` | print each `__mac_syscall` with its policy, number and argument words |
+| `OCERZ_MODELOG=1` | print every far transfer with its selector, target mode and address: the WoW64 32/64-bit switches |
+| `OCERZ_FPS=1` | in cache mode, print frames per second, counted at `CGLFlushDrawable`, once a second |
+| `OCERZ_GUESTPROF=<usec>` | sample every running guest thread at about that interval, and every `OCERZ_GUESTPROF_PERIOD` seconds (10 by default) and at exit print the hottest guest code, host symbols and interpreted instruction forms |
+| `OCERZ_TRIPSTAT=1` | count exits from translated code to the dispatcher, and print their commonest destinations every ten seconds |
+| `OCERZ_BLACKLOG=1` | print the pages most often refused translation because they kept changing |
+| `OCERZ_INVSRC=1` | attribute each of those refusals to the code that invalidated the page |
+| `OCERZ_IPCLOG=1` | send the translated Steam `ipcserver`'s output to `/tmp/ocerz_ipcserver.err` |
+| `OCERZ_SELPOOLLOG=1`, `OCERZ_SELVERIFY=1` | describe the selector index built when the shared cache's own table cannot be used, and check the cache's answers against it |
 
 ### Behaviour
 
@@ -121,6 +144,14 @@ bug is in what that switch controls.
 | `OCERZ_NO_UNSTICK=1` | never interrupt a guest thread out of a long wait |
 | `OCERZ_NO_FILEMAP=1` | read every private file mapping into anonymous memory instead of mapping it from the file |
 | `OCERZ_PRELOAD_OBJC=<paths>` | put matching shared-cache Objective-C images into the startup batch; `@cat` does it for every image that defines categories |
+| `OCERZ_NO_UPWARD_INIT=1` | do not initialize a library reached only through an upward dependency, as before 2026-09-22 |
+| `OCERZ_NO_LOADMAP=1` | do not map a shared-cache image's Objective-C classes before its `+load` runs |
+| `OCERZ_NO_LATE_CATLIST=1` | do not report category lists for shared-cache images loaded after startup |
+| `OCERZ_NO_THREADACT=1` | hand `thread_suspend`, `thread_resume` and `thread_get_state` on guest threads to the kernel instead of emulating them |
+| `OCERZ_UNSTICK_ALL=1` | let the unstick monitor interrupt every blocking call, `read`, `recvmsg` and `poll` included |
+| `OCERZ_NO_VMMAP_STEER=1` | let `mach_vm_map` place mappings anywhere in host space instead of at guest-visible addresses |
+| `OCERZ_REFAULT_INVAL=1` | invalidate again on every repeated alignment or commpage fault, including faults from retired translations |
+| `OCERZ_NO_MOCK_KEYCHAIN=1` | launch Steam's `Steam Helper` without `--use-mock-keychain`, so macOS asks for the login password |
 
 ## Exit codes
 
