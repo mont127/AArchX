@@ -295,6 +295,14 @@
  * much later.  A fatal guest thread names its process's pid and command line,
  * because under Wine a dozen processes share one stderr.
  *
+ * OCERZ_SIGMASKLOG prints every change of a guest signal mask to a wide one -
+ * sixteen or more signals blocked, which Wine's own masks never reach - with
+ * the code and caller chain that set it and the Windows stack: sigprocmask,
+ * signal delivery and sigreturn all report.  It is what showed that the eight
+ * threads spinning in R.E.P.O. with every signal blocked had been through
+ * libc's abort(), called from Metal's validation layer, whose SIGABRT Wine had
+ * turned into an exception while the thread kept abort's mask.
+ *
  * Every cpu keeps its last 24 syscalls - number, first three arguments, result,
  * and the first words a read, write or writev moved, which for a Wine client
  * are its server request and reply headers - and SIGINFO prints them under the
@@ -4038,8 +4046,47 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+static void sigmask_trace_addr(uint64_t a)
+{
+    uint64_t base = 0;
+    const char *n = ocerz_dyld_name_for_addr(a, &base);
+    const char *leaf = n ? strrchr(n, '/') : NULL;
+    if (n)
+        fprintf(stderr, " %s+%#llx", leaf ? leaf + 1 : n, (unsigned long long)(a - base));
+    else
+        fprintf(stderr, " %#llx", (unsigned long long)a);
+}
+
+static void sigmask_trace(OcerzCPU *cpu, const char *how, uint64_t old, uint64_t now)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("OCERZ_SIGMASKLOG") ? 1 : 0;
+    if (!on || old == now || __builtin_popcountll(now & 0xffffffffull) < 16)
+        return;
+    fprintf(stderr, "ocerz: SIGMASK[%d] cpu#%u tid=%#llx %s %#llx -> %#llx at", (int)getpid(), cpu->cpu_number,
+            (unsigned long long)cpu->host_tid, how, (unsigned long long)old, (unsigned long long)now);
+    sigmask_trace_addr(cpu->rip);
+    uint64_t sp = cpu->gpr[OCERZ_RSP], fp = cpu->gpr[OCERZ_RBP];
+    if (ocerz_addr_readable(sp) && ocerz_addr_readable(sp + 7)) {
+        fprintf(stderr, " ret:");
+        sigmask_trace_addr(ocerz_ld(sp, 8));
+    }
+    fprintf(stderr, " chain:");
+    for (int d = 0; d < 12 && fp > 0x1000 && !(fp & 7) && ocerz_addr_readable(fp + 15); d++) {
+        sigmask_trace_addr(ocerz_ld(fp + 8, 8));
+        uint64_t nf = ocerz_ld(fp, 8);
+        if (nf <= fp)
+            break;
+        fp = nf;
+    }
+    fprintf(stderr, "\n");
+    ocerz_pe_stack_dump(cpu, "SIGMASK-PE");
+}
+
 static void guest_sigmask_apply(OcerzCPU *cpu, int how, uint64_t set, uint64_t oset)
 {
+    uint64_t before = cpu->sig_mask;
     if (oset != 0)
         ocerz_st(oset, 4, (uint32_t)cpu->sig_mask);
     if (set != 0) {
@@ -4051,6 +4098,7 @@ static void guest_sigmask_apply(OcerzCPU *cpu, int how, uint64_t set, uint64_t o
         else
             cpu->sig_mask = v;
     }
+    sigmask_trace(cpu, how == 1 ? "BLOCK" : how == 2 ? "UNBLOCK" : "SETMASK", before, cpu->sig_mask);
 }
 
 static int sys_sigprocmask(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
@@ -4236,6 +4284,7 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     cpu->sig_mask = old_mask | sa->mask;
     if (!(sa->flags & DARWIN_SA_NODEFER) && sig > 0)
         cpu->sig_mask |= 1ull << (sig - 1);
+    sigmask_trace(cpu, sig == 30 ? "DELIVER-USR1" : "DELIVER", old_mask, cpu->sig_mask);
     return 1;
 }
 
@@ -4355,7 +4404,11 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     cpu->mxcsr = (uint32_t)ocerz_ld(mc + fpoff + OCERZ_FP_MXCSR_OFF, 4);
     ocerz_apply_mxcsr_round(cpu->mxcsr);
-    cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
+    {
+        uint64_t before = cpu->sig_mask;
+        cpu->sig_mask = (uint32_t)ocerz_ld(uc + 4, 4);
+        sigmask_trace(cpu, "SIGRETURN", before, cpu->sig_mask);
+    }
 
     {
         uint32_t cs = (uint32_t)ocerz_ld(mc + 160, 8);
@@ -5692,7 +5745,10 @@ static int dispatch_bsd_at(OcerzVM *vm, OcerzCPU *cpu, int num, uint64_t stack_s
     int err = 0;
     uint64_t ret2 = 0;
 
-    if ((num == 515 || num == 516 || num == 544) && getenv("OCERZ_ULOCKLOG")) {
+    static int ulocklog = -1;
+    if (ulocklog < 0)
+        ulocklog = getenv("OCERZ_ULOCKLOG") ? 1 : 0;
+    if ((num == 515 || num == 516 || num == 544) && ulocklog) {
         uint64_t myport = cpu->gs_base ? ocerz_ld(cpu->gs_base + 0x18, 4) : 0;
         extern mach_port_t mach_thread_self(void);
         mach_port_t hs = mach_thread_self();
