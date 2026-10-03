@@ -46,6 +46,8 @@
  * structure carries a pointer of its own, the signature blobs, F_RDADVISEV's
  * ranges and SIOCGIFCONF's buffer, are right only where a guest address is a
  * host address, which is the identity map a position-independent guest runs in.
+ * F_RDADVISEV arrived with the macOS 27 SDK, so an older SDK - the one a
+ * release runner builds with - gets it defined by its number (116) instead.
  *
  * These handlers raise a bridge frame around the host call, because the host
  * dereferences guest pointers there, and a fault is reported naming the call.
@@ -199,6 +201,10 @@
 #include <wchar.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+
+#ifndef F_RDADVISEV
+#define F_RDADVISEV 116
+#endif
 
 extern char **environ;
 
