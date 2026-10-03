@@ -4,8 +4,10 @@
 
 - **An Apple Silicon Mac.** AArchX emits arm64 code and uses arm64 features
   directly; it does not run on an Intel Mac.
-- **macOS 26 or 27.** Those are the releases it is developed and tested on.
-  Earlier releases are untried rather than known-broken.
+- **macOS 27 for cache mode.** AArchX is developed and tested on macOS 26 and 27,
+  but cache mode currently looks for the x86-64 shared cache only where macOS 27
+  keeps it, so on macOS 26 it stops with `cannot map shared cache`. Native mode
+  does not use the cache. Earlier releases are untried.
 - **The Xcode Command Line Tools**, for `clang` and `make`. `xcode-select
   --install` installs them.
 - **Rosetta installed, for cache mode only.** Cache mode binds guest programs
@@ -35,10 +37,12 @@ dependencies outside the system toolchain.
 ```
 
 That is a freestanding x86-64 test binary from this repository. For a real
-program, give AArchX the executable inside the bundle rather than the bundle:
+program, give AArchX the executable, or an application bundle, in which case it
+runs the executable the bundle's `Info.plist` names:
 
 ```sh
-./ocerz /System/Applications/Chess.app/Contents/MacOS/Chess
+./ocerz /Applications/Some.app
+./ocerz /Applications/Some.app/Contents/MacOS/Some
 ./ocerz /usr/bin/perl -e 'print "hello\n"'
 ```
 

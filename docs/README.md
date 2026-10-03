@@ -14,6 +14,7 @@ These pages describe what it does, how to run it, and how it works.
 | --- | --- |
 | [Getting started](getting-started.md) | What you need, how to build it, how to run your first program |
 | [Modes](modes.md) | Cache mode and native mode: what each binds against, what each needs, which to pick |
+| [Native mode in depth](native-mode.md) | How native mode crosses into the Mac's own frameworks, what it costs, and what it cannot run yet |
 | [Reference](reference.md) | Every command-line option and every environment variable that is meant to be used |
 | [Architecture](architecture.md) | How a guest program is loaded, decoded, translated and run |
 | [Performance](performance.md) | Measured results against Rosetta, how to reproduce them, and where the remaining costs are |

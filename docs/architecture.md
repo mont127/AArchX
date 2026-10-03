@@ -18,6 +18,8 @@ the operating system is answered by AArchX.
 | Objective-C bridge | `src/objcbridge.c`, `src/objcclass.c` | message sends both ways, and the guest's own classes |
 | ABI engine | `src/abi.c`, `src/abicall.s` | System V x86-64 to Apple arm64 in both directions |
 | Blocks | `src/blocks.c` | native mode's blocks in both directions |
+| In-place routines | `src/leaf.s` | arm64 `strlen`, `memcpy` and nine others that translated code calls with the guest's registers where they are |
+| Translation cache | `src/tcache.c` | translated blocks kept on disk and shared between processes |
 | Syscalls | `src/syscall.c` | BSD, Mach, signals, threads, and Wine's WoW64 calls |
 
 ## Guest memory
@@ -29,7 +31,9 @@ guest address with a non-zero offset. A dynamically linked one gets an identity
 mapping, where guest addresses *are* host addresses and the translation drops
 the add entirely, which is the fast case and the usual one. Wine, whose main
 image insists on living at a low address the host will not hand out, gets a
-third mapping with a separate base for the low region.
+third mapping with a separate base for the low region, and reserves its arena
+at a fixed address so that `ntdll.so` lands at the same place in every process
+of a Wine session.
 
 Guest pages are 4 KB and host pages are 16 KB, so AArchX tracks protection per
 4 KB slot inside each host page and takes the union when it has to ask the
@@ -63,6 +67,12 @@ ends it. Inside a block:
   the block can continue past it with the taken side in an out-of-line stub.
   When the program turns out to take the other edge, the block is retranslated
   the other way round, decided by watching which edge runs.
+
+**The instruction set** is x86-64-v3 as Rosetta runs it on macOS 15 and later: AVX2, FMA, BMI1 and BMI2, F16C,
+LZCNT, MOVBE and XSAVE, none of which CPUID advertises under either. SSE4.2 is
+implemented and advertised, because Steam checks for it. MMX, 80-bit x87 and
+a few AVX2 forms run only in the interpreter; see
+[Compatibility](compatibility.md#known-limitations).
 
 A guest that writes over code it has already executed is handled by making the
 page fault on write and dropping the translations covering it.

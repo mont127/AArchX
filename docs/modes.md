@@ -25,8 +25,9 @@ libraries are x86 code that gets translated exactly like the guest's own.
 The shared cache is shipped by the Rosetta package rather than by the base
 system, which is why cache mode needs Rosetta installed. AArchX reads and maps
 the file itself; Rosetta's translator is never invoked and never runs. On macOS
-27 the cache lives in the Rosetta cryptex rather than its historical path, and
-AArchX looks in both.
+27 the cache lives in the Rosetta cryptex rather than its historical path.
+AArchX currently looks only there, so cache mode does not start on macOS 26,
+where the cache is still at the old path; that is a known issue.
 
 Because everything above the kernel is translated, cache mode behaves the way an
 x86 Mac does, down to details a program can observe: the page size the guest
@@ -63,6 +64,8 @@ of the signal state a callback's fault-recovery point needs. Eleven string and
 memory routines that programs call constantly, `strlen` and `memcpy` among them,
 do not cross at all: AArchX has arm64 versions that run with the guest's
 registers in place, so a short `strlen` costs 2 ns rather than 17.
+
+[Native mode in depth](native-mode.md) describes every part of it.
 
 **What it cannot do yet.** Swift, WebKit, C++ objects shared with native arm64
 C++, and exceptions crossing a bridge frame are the large gaps, and some
