@@ -1,6 +1,6 @@
 /* movhpd/movlpd/movhps/movlps load and store forms, unpckhpd/unpcklpd, shufpd, movddup,
- * movhlps/movlhps: the half-register moves AppKit's view-transform code leans on.
- * Golden from the architectural semantics (Rosetta was unavailable). */
+ * movhlps/movlhps, movsd: the half-register moves, each in its load, store and register forms.
+ * Golden from the architectural semantics; Rosetta prints the same. */
 #include "gsys.h"
 static void put(const char *tag, g_u64 v) { g_puts(tag); g_puthex64(v); }
 static void show(const char *tag, const g_u64 *r) { put(tag, r[0]); put("   hi ", r[1]); }

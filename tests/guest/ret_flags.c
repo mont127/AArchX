@@ -1,8 +1,7 @@
 /* Flags returned across a `ret`.  clang's outliner emits helpers that end in
  * a compare and return its EFLAGS to the caller, which branches right after
- * the call (vImage's init_CGInterfaces checks: `cmpq $0, ptr(%rip); retq`).
- * The JIT once assumed no flags survive a return and painted every Wine
- * window black.  Each helper below ends in a pure flag producer; the caller
+ * the call.  The JIT once assumed no flags survive a return and painted every
+ * Wine window black.  Each helper below ends in a pure flag producer; the caller
  * reads the flags with setcc/jcc without any compare of its own.  Also the
  * counter-case: a tail ending in arithmetic returns a value, not flags, and
  * the caller must not depend on them (it computes its own).  Goldens come
