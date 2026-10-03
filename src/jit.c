@@ -362,7 +362,13 @@
  * images at 32-bit addresses and shared-cache dylibs at 0x7ff8_0000_0000, so a
  * region map (one slot per 4 MB, a bitmap of the 64 KB granules in it) answers
  * in constant time; it may say "maybe" after code is gone but never "no" while
- * it is present.  Only the overlapping blocks are retired - dropping the whole
+ * it is present.  When it says "maybe", the blocks to look at come from a list
+ * per 64 KB granule kept beside the granule counts, not from a walk over every
+ * live block: Unity's Mono JIT writes code all through R.E.P.O.'s startup with
+ * about 390,000 blocks live, and that walk plus rebuilding the live array on
+ * every retirement were 30% of the game process; a retired block now leaves
+ * the live array by swapping with the last one (OCERZ_INV_SCAN=1 walks every
+ * block again).  Only the overlapping blocks are retired - dropping the whole
  * cache per flip made CEF startup a full retranslation storm.  Their code stays
  * allocated on a retired list, so a thread still inside runs to its next exit.
  * A 64 KB region whose translations keep being invalidated (a JS engine
@@ -1731,14 +1737,58 @@ static int gran_any(uint64_t lo, uint64_t hi)
     }
     return 0;
 }
+#define GBLK_SLOTS 65536
+static struct { uint64_t page; uint32_t n, cap; JitBlock **v; } g_gblk[GBLK_SLOTS];
+static int g_gblk_off = -1;
+static int gblk_slot(uint64_t page, int create)
+{
+    unsigned i = (unsigned)(page * 0x9E3779B97F4A7C15ull >> 48) & (GBLK_SLOTS - 1);
+    for (unsigned n = 0; n < 64; n++, i = (i + 1) & (GBLK_SLOTS - 1)) {
+        if (g_gblk[i].page == page + 1) return (int)i;
+        if (g_gblk[i].page == 0) {
+            if (!create) return -1;
+            g_gblk[i].page = page + 1;
+            return (int)i;
+        }
+    }
+    return create ? -2 : -1;
+}
+static void gblk_note(uint64_t page, JitBlock *b, int d)
+{
+    if (g_gblk_off) return;
+    int s = gblk_slot(page, d > 0);
+    if (s < 0) {
+        if (s == -2 || d > 0) g_gblk_off = 1;
+        return;
+    }
+    if (d > 0) {
+        if (g_gblk[s].n == g_gblk[s].cap) {
+            uint32_t nc = g_gblk[s].cap ? g_gblk[s].cap * 2 : 8;
+            JitBlock **nv = (JitBlock **)realloc(g_gblk[s].v, nc * sizeof *nv);
+            if (!nv) { g_gblk_off = 1; return; }
+            g_gblk[s].v = nv;
+            g_gblk[s].cap = nc;
+        }
+        g_gblk[s].v[g_gblk[s].n++] = b;
+        return;
+    }
+    for (uint32_t j = 0; j < g_gblk[s].n; j++)
+        if (g_gblk[s].v[j] == b) {
+            g_gblk[s].v[j] = g_gblk[s].v[--g_gblk[s].n];
+            return;
+        }
+}
 static void gran_block(JitBlock *b, int d)
 {
     if (b->n_insns <= 0) return;
+    if (g_gblk_off < 0) g_gblk_off = getenv("OCERZ_INV_SCAN") ? 1 : 0;
     uint64_t lo = blk_insn_rip(b, 0), hi = lo + blk_insn_len(b, 0);
     for (int i = 1; i <= b->n_insns; i++) {
         if (i < b->n_insns && blk_insn_rip(b, i) == hi) { hi += blk_insn_len(b, i); continue; }
-        for (uint64_t p = lo >> INVMAP_GSHIFT; p <= (hi - 1) >> INVMAP_GSHIFT; p++)
+        for (uint64_t p = lo >> INVMAP_GSHIFT; p <= (hi - 1) >> INVMAP_GSHIFT; p++) {
             gran_bump(p << INVMAP_GSHIFT, d);
+            gblk_note(p, b, d);
+        }
         if (i < b->n_insns) { lo = blk_insn_rip(b, i); hi = lo + blk_insn_len(b, i); }
     }
 }
@@ -1747,6 +1797,10 @@ static void gran_clear_all(void)
     memset(g_gran, 0, sizeof g_gran);
     memset(g_gran4, 0, sizeof g_gran4);
     g_gran_degenerate = 0;
+    for (unsigned i = 0; i < GBLK_SLOTS; i++)
+        free(g_gblk[i].v);
+    memset(g_gblk, 0, sizeof g_gblk);
+    g_gblk_off = getenv("OCERZ_INV_SCAN") ? 1 : 0;
 }
 
 static void shrink_edges(JitBlock *b)
@@ -18981,6 +19035,31 @@ static int hit_code_cmp(const void *pa, const void *pb)
     return (uintptr_t)a->code > (uintptr_t)b->code;
 }
 
+static void retire_unlink_hits(OcerzJit *jit, JitBlock **hits, size_t n_hits)
+{
+    for (size_t m = 0; m < n_hits; m++) {
+        JitBlock *b = hits[m];
+        size_t idx = b->live_idx;
+        if (idx >= jit->n_live || jit->live[idx] != b) {
+            for (idx = 0; idx < jit->n_live && jit->live[idx] != b; idx++)
+                ;
+            if (idx == jit->n_live) continue;
+        }
+        jit->live[idx] = jit->live[jit->n_live - 1];
+        jit->live[idx]->live_idx = idx;
+        jit->n_live--;
+        unsigned h = hash_key(b->key);
+        JitBlock **pp = &jit->buckets[h];
+        while (*pp && *pp != b) pp = &(*pp)->hnext;
+        if (*pp == b)
+            __atomic_store_n(pp, b->hnext, __ATOMIC_RELEASE);
+        gran_block(b, -1);
+        tc_noload_add(b->key);
+        b->retired_next = jit->retired;
+        jit->retired = b;
+    }
+}
+
 static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hits)
 {
     __atomic_add_fetch(&ocerz_jit_retire_count, 1, __ATOMIC_RELEASE);
@@ -18992,21 +19071,7 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
             churn_bump(blk_insn_rip(hits[m], 0));
         }
     if (!any_code) {
-        size_t w0 = 0;
-        for (size_t k = 0; k < jit->n_live; k++) {
-            JitBlock *b = jit->live[k];
-            if (!b->inv_hit) { b->live_idx = w0; jit->live[w0++] = b; continue; }
-            unsigned h = hash_key(b->key);
-            JitBlock **pp = &jit->buckets[h];
-            while (*pp && *pp != b) pp = &(*pp)->hnext;
-            if (*pp == b)
-                __atomic_store_n(pp, b->hnext, __ATOMIC_RELEASE);
-            gran_block(b, -1);
-            tc_noload_add(b->key);
-            b->retired_next = jit->retired;
-            jit->retired = b;
-        }
-        jit->n_live = w0;
+        retire_unlink_hits(jit, hits, n_hits);
         return;
     }
     qsort(hits, n_hits, sizeof *hits, hit_code_cmp);
@@ -19073,21 +19138,7 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
     }
 #undef UNCHAIN_EDGE
     pthread_jit_write_protect_np(1);
-    size_t w = 0;
-    for (size_t k = 0; k < jit->n_live; k++) {
-        JitBlock *b = jit->live[k];
-        if (!b->inv_hit) { b->live_idx = w; jit->live[w++] = b; continue; }
-        unsigned h = hash_key(b->key);
-        JitBlock **pp = &jit->buckets[h];
-        while (*pp && *pp != b) pp = &(*pp)->hnext;
-        if (*pp == b)
-            __atomic_store_n(pp, b->hnext, __ATOMIC_RELEASE);
-        gran_block(b, -1);
-        tc_noload_add(b->key);
-        b->retired_next = jit->retired;
-        jit->retired = b;
-    }
-    jit->n_live = w;
+    retire_unlink_hits(jit, hits, n_hits);
     for (unsigned i = 0; i < g_ras_slot_n; i++)
         __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
     psc_clear_all();
@@ -19142,11 +19193,26 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
         if (noprec < 0) noprec = getenv("OCERZ_INV_ALL") ? 1 : 0;
         size_t n_hit = 0, cap = 0;
         JitBlock **hits = NULL;
-        for (size_t k = 0; k < jit->n_live; k++) {
-            JitBlock *b = jit->live[k];
+        uint64_t g0 = addr >> INVMAP_GSHIFT, g1 = (addr + len) >> INVMAP_GSHIFT;
+        int listed = g_gblk_off == 0 && g1 - g0 <= 256;
+        size_t n_cand = listed ? 0 : jit->n_live;
+        uint64_t gp = g0;
+        uint32_t gj = 0;
+        for (size_t k = 0;; k++) {
+            JitBlock *b;
+            if (listed) {
+                int gs = -1;
+                while (gp < g1 && ((gs = gblk_slot(gp, 0)) < 0 || gj >= g_gblk[gs].n)) { gp++; gj = 0; }
+                if (gp >= g1) break;
+                b = g_gblk[gs].v[gj++];
+                if (b->inv_hit) continue;
+            } else {
+                if (k >= n_cand) break;
+                b = jit->live[k];
+                b->inv_hit = 0;
+            }
             uint64_t blo = blk_insn_rip(b, 0);
             uint64_t bhi = blk_insn_rip(b, b->n_insns - 1) + blk_insn_len(b, b->n_insns - 1);
-            b->inv_hit = 0;
             if (!ranges_overlap(addr, len, blo, bhi - blo)) continue;
             for (int i = 0; i < b->n_insns; i++)
                 if (ranges_overlap(addr, len, blk_insn_rip(b, i), blk_insn_len(b, i))) {
