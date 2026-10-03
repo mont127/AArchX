@@ -96,10 +96,20 @@
  * MLAssetIO's initializer called operator new into a libc++ that had not been
  * initialized yet.
  *
- * It is followed afterwards instead, once the image that declares it has been
- * initialized, because the target still has to be initialized at some point -
- * dyld loads and initializes an upward dependency like any other, it only
- * declines to order it first.  Leaving it out entirely is what broke sw_vers:
+ * It is followed afterwards instead, because the target still has to be
+ * initialized at some point - dyld loads and initializes an upward dependency
+ * like any other, it only declines to order it first.  "Afterwards" means once
+ * the whole walk from the root has finished, not once the declaring image has:
+ * each upward target goes on a list the root call owns, and that list is worked
+ * through after the root's own initializers, including the targets it adds.
+ * Following it right after the declaring image broke sw_vers on macOS 26.7.1,
+ * where libobjc links libswiftCore upward and libswiftCore links Foundation
+ * upward.  libobjc is a dependency of CoreFoundation, so Foundation's whole
+ * subtree, SkyLight among it, ran its initializers while CoreFoundation was
+ * still unfinished on the recursion stack, and SkyLight's first allocation
+ * through CoreFoundation's allocator recursed between malloc and
+ * malloc_zone_malloc until the stack ran out.  Leaving it out entirely is what
+ * broke sw_vers on macOS 27:
  * CoreFoundation links Foundation upward, so Foundation's code was reachable,
  * the whole cache being mapped, and its classes were registered, but its
  * initializer never ran.  NSString therefore stayed an abstract class cluster,
@@ -2920,8 +2930,32 @@ static void init_closure(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
         free(l);
 }
 
+typedef struct InitUpward {
+    uint64_t *mh;
+    int n, cap;
+} InitUpward;
+
+static void init_upward_add(InitUpward *up, uint64_t mh)
+{
+    if (!up || !mh)
+        return;
+    for (int i = 0; i < up->n; i++)
+        if (up->mh[i] == mh)
+            return;
+    if (up->n == up->cap) {
+        int cap = up->cap ? up->cap * 2 : 64;
+        uint64_t *p = (uint64_t *)realloc(up->mh, sizeof *p * (size_t)cap);
+        if (!p)
+            return;
+        up->mh = p;
+        up->cap = cap;
+    }
+    up->mh[up->n++] = mh;
+}
+
 static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
-                           const uint64_t *ia, uint64_t stack_top, uint64_t skip_mh)
+                           const uint64_t *ia, uint64_t stack_top, uint64_t skip_mh,
+                           InitUpward *up)
 {
     if (vm->exited || !mh)
         return;
@@ -2968,7 +3002,7 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
                 if (!dmh && getenv("OCERZ_INITTRACE"))
                     fprintf(stderr, "INITTRACE dep-unresolved mh=%#llx dep=\"%s\"\n",
                             (unsigned long long)mh, (const char *)(lc + noff));
-                run_init_phase(vm, cache, dmh, ia, stack_top, skip_mh);
+                run_init_phase(vm, cache, dmh, ia, stack_top, skip_mh, up);
             }
         }
         lc += rd32(lc + 4);
@@ -3002,11 +3036,21 @@ static void run_init_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
                     fprintf(stderr, "INITEDGE-UPWARD %#llx -> %#llx \"%s\"\n",
                             (unsigned long long)mh, (unsigned long long)umh,
                             (const char *)(lc + noff));
-                run_init_phase(vm, cache, umh, ia, stack_top, skip_mh);
+                init_upward_add(up, umh);
             }
         }
         lc += rd32(lc + 4);
     }
+}
+
+static void run_init_root(OcerzVM *vm, OcerzCache *cache, uint64_t mh,
+                          const uint64_t *ia, uint64_t stack_top, uint64_t skip_mh)
+{
+    InitUpward up = { 0 };
+    run_init_phase(vm, cache, mh, ia, stack_top, skip_mh, &up);
+    for (int i = 0; i < up.n && !vm->exited; i++)
+        run_init_phase(vm, cache, up.mh[i], ia, stack_top, skip_mh, &up);
+    free(up.mh);
 }
 
 static void run_load_phase(OcerzVM *vm, OcerzCache *cache, uint64_t mh, uint64_t stack_top,
@@ -5449,7 +5493,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                 return vm->exit_code;
             g_init_cur_gen++;
             OCERZ_LOG("dynamic: running dependency-ordered initializer phase\n");
-            run_init_phase(vm, &cache, img.load_base, ia, fr.stack_top, libsys);
+            run_init_root(vm, &cache, img.load_base, ia, fr.stack_top, libsys);
             if (vm->exited)
                 return vm->exit_code;
             OCERZ_LOG("dynamic: initializer phase complete\n");
@@ -5469,7 +5513,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                 return vm->exit_code;
             g_init_cur_gen++;
             OCERZ_LOG("dynamic: running dependency-ordered initializers for %d images\n", n);
-            run_init_phase(vm, &cache, img.load_base, ia, fr.stack_top, g_libsys_mh);
+            run_init_root(vm, &cache, img.load_base, ia, fr.stack_top, g_libsys_mh);
             if (vm->exited)
                 return vm->exit_code;
         }
