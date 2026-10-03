@@ -76,6 +76,19 @@
  * header SkyLight then walked as four billion load commands until Chromium's GPU
  * watchdog killed the process (OCERZ_NO_ALIAS_CLIP=1 restores the old reach).
  *
+ * The host does not keep its memory where it was: Metal frees a buffer and maps
+ * the next one at the same address, so an alias kept showing the freed buffer
+ * to the guest, and Metal's own completion state with it - a compute job read
+ * the previous job's results or never finished.  Each alias is recorded with
+ * the VM object it shows.  When a pointer comes back into a recorded alias that
+ * still shows that object, while the host has a different one there, the region
+ * is aliased again over it; an alias the guest has since mapped its own memory
+ * over shows another object and is left alone.  Memory nobody has touched yet
+ * has no object at all, so an alias of such memory is not recorded: fresh guest
+ * memory mapped over it would look the same.  The page clipping above treats
+ * such intact aliases as free, so a buffer that grew into an older neighbour's
+ * alias is shown whole (OCERZ_NO_ALIAS_REFRESH=1 turns the refresh off).
+ *
  * ---- sysctl ----
  * An x86_64 process must see 4 KB pages, as it does under Rosetta, and the
  * override has to mirror the real node's width rather than assume 4: reached by
@@ -251,13 +264,15 @@
  * the host pages at that address, and under Wine the address is a low-shadow
  * guest address, so the GPU read and wrote whatever host memory lay at the
  * guest's number.  DXMT backs D3D11 buffers this way, so R.E.P.O.'s first frame
- * died on a GPU address fault.  When those two fields hold the same page-aligned
- * low guest address, the length is whole pages and the range is mapped guest
- * memory, both are rewritten to the host address for the call and put back
- * after it, like the descriptors above.  The call is recognised by that shape
- * alone: IOKit will not name the class behind a connection port.  The host
- * address is right even for memory the guest only sees through an alias of a
- * host region, since an alias shares the pages it shows.  OCERZ_NO_GPU_NOCOPY_XLATE=1 turns it off; OCERZ_MSGNEEDLE=<value>
+ * died on a GPU address fault.  When those two fields hold the same low guest
+ * address and the range is mapped guest memory, both are rewritten to the host
+ * address for the call and put back after it, like the descriptors above.
+ * Neither the address nor the length has to be page-aligned: Metal wraps any
+ * range, and DXMT's ring allocator hands it memory from the Windows heap.  The
+ * call is recognised by that shape alone: IOKit will not name the class behind
+ * a connection port.  The host address is right even for memory the guest only
+ * sees through an alias of a host region, since an alias shares the pages it
+ * shows.  OCERZ_NO_GPU_NOCOPY_XLATE=1 turns it off; OCERZ_MSGNEEDLE=<value>
  * reports every outgoing message that carries a given 64-bit value, which is
  * how this one was found.
  *
@@ -2975,8 +2990,7 @@ static int xlate_gpu_nocopy_buffer(uint64_t gmsg, uint32_t send_size, struct oce
     if ((uint32_t)ocerz_ld(gmsg + 0x28, 4) != 104 || (send_size && 0x2c + 104 > send_size))
         return 0;
     uint64_t a0 = ocerz_ld(ib + 0x38, 8), a1 = ocerz_ld(ib + 0x40, 8), len = ocerz_ld(ib + 0x48, 8);
-    if (a0 == 0 || a0 != a1 || (a0 & 0xfff) || (len & 0xfff) || a0 >= OCERZ_LOW_LIMIT || len == 0 ||
-        len > OCERZ_LOW_LIMIT - a0)
+    if (a0 == 0 || a0 != a1 || a0 >= OCERZ_LOW_LIMIT || len == 0 || len > OCERZ_LOW_LIMIT - a0)
         return 0;
     uint64_t ha = (uint64_t)(uintptr_t)ocerz_g2h(a0);
     if (ha == a0 || !ocerz_addr_readable(a0) || !ocerz_addr_readable(a0 + len - 1))
@@ -6308,15 +6322,110 @@ int ocerz_host_region_is_device(uint64_t addr, int *prot_out)
     return (shared || device) && (info.protection & VM_PROT_READ);
 }
 
+static int host_region_entry(uint64_t a, uint64_t *start, uint64_t *end, uint32_t *obj, int *prot)
+{
+    mach_vm_address_t addr = a;
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_short_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+    if (mach_vm_region_recurse(mach_task_self(), &addr, &size, &depth, (vm_region_recurse_info_t)&info, &cnt) !=
+            KERN_SUCCESS ||
+        size == 0)
+        return 0;
+    *start = addr;
+    *end = addr + size;
+    *obj = info.object_id;
+    *prot = info.protection;
+    return 1;
+}
+
+enum { ALIAS_REG_MAX = 4096 };
+static struct { uint64_t lo, hi; uint32_t obj; } g_alias_reg[ALIAS_REG_MAX];
+static uint32_t g_alias_reg_n, g_alias_reg_next;
+static pthread_mutex_t g_alias_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void alias_reg_add(uint64_t lo, uint64_t hi, uint32_t obj)
+{
+    pthread_mutex_lock(&g_alias_reg_lock);
+    for (uint32_t i = 0; i < g_alias_reg_n;)
+        if (g_alias_reg[i].lo >= lo && g_alias_reg[i].hi <= hi)
+            g_alias_reg[i] = g_alias_reg[--g_alias_reg_n];
+        else
+            i++;
+    uint32_t k = g_alias_reg_n < ALIAS_REG_MAX ? g_alias_reg_n++ : g_alias_reg_next++ % ALIAS_REG_MAX;
+    g_alias_reg[k].lo = lo;
+    g_alias_reg[k].hi = hi;
+    g_alias_reg[k].obj = obj;
+    pthread_mutex_unlock(&g_alias_reg_lock);
+}
+
+static int alias_reg_find(uint64_t g, uint32_t obj, int any_obj)
+{
+    int hit = 0;
+    pthread_mutex_lock(&g_alias_reg_lock);
+    for (uint32_t i = 0; i < g_alias_reg_n && !hit; i++)
+        hit = g >= g_alias_reg[i].lo && g < g_alias_reg[i].hi && (any_obj || (obj && g_alias_reg[i].obj == obj));
+    pthread_mutex_unlock(&g_alias_reg_lock);
+    return hit;
+}
+
+static int alias_page_ours(uint64_t hpage)
+{
+    uint64_t start, end;
+    uint32_t obj;
+    int prot;
+    uint64_t h = (uint64_t)(uintptr_t)ocerz_g2h(hpage);
+    return alias_reg_find(hpage, 0, 1) && host_region_entry(h, &start, &end, &obj, &prot) && start <= h &&
+           alias_reg_find(hpage, obj, 0);
+}
+
 static int alias_page_taken(uint64_t hpage)
 {
     for (uint64_t p = hpage; p < hpage + OCERZ_HOST_PAGE_SIZE; p += OCERZ_GUEST_PAGE_SIZE)
         if (ocerz_addr_prot(p) > 0)
-            return 1;
+            return !alias_page_ours(hpage);
+    return 0;
+}
+
+static int alias_raw_region(OcerzVM *vm, uint64_t pointer, int refresh);
+
+static int alias_refresh_if_stale(OcerzVM *vm, uint64_t pointer)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_ALIAS_REFRESH") ? 1 : 0;
+    uint64_t delta = (uint64_t)(uintptr_t)ocerz_g2h(0);
+    if (off || !delta || !alias_reg_find(pointer, 0, 1))
+        return 0;
+    uint64_t hs, he, ss, se;
+    uint32_t hobj, sobj;
+    int hprot, sprot;
+    if (!host_region_entry(pointer, &hs, &he, &hobj, &hprot) || hs > pointer || !(hprot & VM_PROT_READ))
+        return 0;
+    uint64_t win = 0x10000000ull;
+    uint64_t a = pointer - hs > win ? pointer - win : hs;
+    uint64_t end = he - pointer > win ? pointer + win : he;
+    for (int i = 0; i < 64 && a < end; i++) {
+        if (!host_region_entry(a + delta, &ss, &se, &sobj, &sprot) || se <= delta)
+            break;
+        if (ss <= a + delta && sobj != hobj && alias_reg_find(a, sobj, 0)) {
+            if (getenv("OCERZ_MIGTRACE"))
+                fprintf(stderr, "ocerz: ALIAS-STALE[%d] pointer=%#llx at %#llx alias shows object %#x, host %#x\n",
+                        (int)getpid(), (unsigned long long)pointer, (unsigned long long)a, sobj, hobj);
+            return alias_raw_region(vm, pointer, 1);
+        }
+        a = ss > a + delta ? ss - delta : se - delta;
+    }
     return 0;
 }
 
 int ocerz_alias_raw_region(OcerzVM *vm, uint64_t pointer)
+{
+    return alias_raw_region(vm, pointer, 0);
+}
+
+static int alias_raw_region(OcerzVM *vm, uint64_t pointer, int refresh)
 {
     if (!pointer)
         return -1;
@@ -6365,7 +6474,7 @@ int ocerz_alias_raw_region(OcerzVM *vm, uint64_t pointer)
     uint64_t guest = (uint64_t)raddr;
     mach_vm_address_t host_dst =
         (mach_vm_address_t)(uintptr_t)ocerz_g2h(guest);
-    if (ocerz_addr_readable(guest) &&
+    if (!refresh && ocerz_addr_readable(guest) &&
         ocerz_addr_readable(guest + rsize - 1))
         return 0;
     invalidate_guest_mapping(vm, guest, rsize);
@@ -6384,6 +6493,11 @@ int ocerz_alias_raw_region(OcerzVM *vm, uint64_t pointer)
         ocerz_unmap(guest, rsize);
         return -1;
     }
+    uint64_t ns, ne;
+    uint32_t nobj;
+    int nprot;
+    if (host_region_entry(host_dst, &ns, &ne, &nobj, &nprot) && ns <= host_dst && nobj)
+        alias_reg_add(guest, guest + rsize, nobj);
     if (getenv("OCERZ_MIGTRACE"))
         fprintf(stderr,
                 "ocerz: SCALIAS pointer=%#llx raw=%#llx size=%#llx shadow=%#llx prot=%d/%d\n",
@@ -6690,8 +6804,10 @@ static void ocerz_reply_alias_iokit(OcerzVM *vm, uint64_t reply_buf,
                     (unsigned long long)raw_size,
                     raw_kr == KERN_SUCCESS ? raw_info.protection : -1);
         }
-        if (slot_prot >= 0 && (slot_prot & PROT_READ))
+        if (slot_prot >= 0 && (slot_prot & PROT_READ)) {
+            alias_refresh_if_stale(vm, v);
             continue;
+        }
         tries++;
         int rc = ocerz_alias_raw_region(vm, v);
         if (alog)
