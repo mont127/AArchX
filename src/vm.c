@@ -145,7 +145,9 @@
  * where a Wine program's half second of startup goes.  The forms are
  * what found the Wine-only gaps: Steam's webhelper interpreted pinsrw from
  * memory for 15% of its samples because the emitter had no path for a memory
- * operand in the low shadow window.
+ * operand in the low shadow window.  The sampler keeps the cpu registry locked
+ * while it samples: a thread that exits frees its cpu, and reading a sampled
+ * thread's rip after letting go of the registry crashed R.E.P.O.'s process.
  *
  * ---- threads and fork ----
  * The thread that runs this loop is a guest CPU like any other - for a dynamic
@@ -590,7 +592,6 @@ static void *guestprof_thread(void *arg)
             cpus[n] = g_cpus[i];
             n++;
         }
-        pthread_mutex_unlock(&g_cpus_lock);
         pthread_mutex_lock(&g_gp_lock);
         for (int i = 0; i < n; i++) {
             thread_basic_info_data_t bi;
@@ -632,6 +633,7 @@ static void *guestprof_thread(void *arg)
                     gp_bump(g_gf_key, g_gf_cnt, sop, w);
             }
         }
+        pthread_mutex_unlock(&g_cpus_lock);
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (now >= next) {
             gp_report((double)(now - start) / 1e9);
