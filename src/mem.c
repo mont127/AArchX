@@ -64,6 +64,20 @@
  * region was created a moment before.  Unmapping releases slots in runs of one
  * owner, and a fully free unshared range is made inaccessible with one mmap.
  * 1 GB reserve and release costs 0.45 ms that way.
+ *
+ * The low shadow puts the guest's first 12 GB at another host address, so a
+ * host pointer below 12 GB that a service or the kernel hands the guest names
+ * the guest's own memory at that number, and has to be aliased into the
+ * shadow before the guest can read it (see syscall.c).  The identity arena
+ * starts at 12 GB, so the kernel placed its mappings in the free host space
+ * below it, where Wine and Unity keep their memory too: IOSurface's records
+ * landed on numbers the guest already used, where they cannot be aliased,
+ * and R.E.P.O. failed to start in three launches of five, on wild pointers
+ * in Wine's fault path; with that space reserved, eight launches of ten
+ * reached the menu.  A low-shadow process therefore
+ * reserves every free host range between 4 GB and 12 GB, at startup and again
+ * after each alias, and the kernel maps above the arena instead, where guest
+ * and host addresses are the same (OCERZ_NO_LOW_HOLE_FILL=1 turns it off).
  */
 #include "ocerz/mem.h"
 
@@ -1346,6 +1360,37 @@ static uint64_t reserve_host_fixed(uint64_t base, uint64_t size)
     return (uint64_t)addr;
 }
 
+void ocerz_low_fill_host_holes(void)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_LOW_HOLE_FILL") ? 1 : 0;
+    if (off || !ocerz_low_base)
+        return;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    uint64_t a = 0x100000000ull, filled = 0;
+    while (a < OCERZ_LOW_LIMIT) {
+        mach_vm_address_t addr = a;
+        mach_vm_size_t size = 0;
+        natural_t depth = 0;
+        vm_region_submap_short_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &addr, &size, &depth,
+                                                  (vm_region_recurse_info_t)&info, &cnt);
+        uint64_t next = kr == KERN_SUCCESS && addr < OCERZ_LOW_LIMIT ? (uint64_t)addr : OCERZ_LOW_LIMIT;
+        if (next > a && reserve_host_fixed(a, next - a) == a)
+            filled += next - a;
+        if (kr != KERN_SUCCESS || addr + size <= a)
+            break;
+        a = addr + size;
+    }
+    pthread_mutex_unlock(&lock);
+    if (filled)
+        OCERZ_LOG("low shadow: reserved %#llx bytes of free host space below %#llx\n",
+                  (unsigned long long)filled, (unsigned long long)OCERZ_LOW_LIMIT);
+}
+
 int ocerz_mem_init_low_shadow(void)
 {
 
@@ -1390,6 +1435,7 @@ int ocerz_mem_init_low_shadow(void)
     ocerz_top_base = base + OCERZ_LOW_LIMIT;
     ocerz_low_base = base;
     map_lock_release();
+    ocerz_low_fill_host_holes();
     OCERZ_LOG("low shadow window guest [0, %#llx) -> host %#llx; top strip [%#llx, %#llx) -> host %#llx\n",
               (unsigned long long)OCERZ_LOW_LIMIT, (unsigned long long)base,
               (unsigned long long)OCERZ_TOP_LO, (unsigned long long)OCERZ_TOP_HI,

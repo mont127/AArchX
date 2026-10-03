@@ -1051,10 +1051,30 @@ static void test_iokit_alias_replaces_prot_none_reservation(void)
         0x140000000ull, 0x150000000ull, 0x160000000ull,
         0x170000000ull,
     };
+    ocerz_low_fill_host_holes();
+    mach_vm_address_t anywhere = 0;
+    kern_return_t kr = mach_vm_allocate(mach_task_self(), &anywhere, page_size,
+                                        VM_FLAGS_ANYWHERE);
+    CHECK(kr == KERN_SUCCESS && anywhere >= OCERZ_LOW_LIMIT);
+    if (kr == KERN_SUCCESS)
+        mach_vm_deallocate(mach_task_self(), anywhere, page_size);
+
     mach_vm_address_t raw = 0;
-    kern_return_t kr = KERN_NO_SPACE;
+    kr = KERN_NO_SPACE;
     for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
         raw = candidates[i];
+        mach_vm_address_t ra = raw;
+        mach_vm_size_t rs = 0;
+        vm_region_basic_info_data_64_t ri;
+        mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t ro = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&ri, &rc, &ro) == KERN_SUCCESS &&
+            ra <= raw && raw + page_size <= ra + rs && ri.protection == VM_PROT_NONE &&
+            ri.max_protection == VM_PROT_ALL)
+            mach_vm_deallocate(mach_task_self(), raw, page_size);
+        if (ro != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), ro);
         kr = mach_vm_allocate(mach_task_self(), &raw, page_size,
                               VM_FLAGS_FIXED);
         if (kr == KERN_SUCCESS)
