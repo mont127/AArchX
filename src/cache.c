@@ -1434,7 +1434,8 @@ static int collect_image_exports(OcerzCache *c, uint64_t mh, uint8_t *bloom, uin
     return 0;
 }
 
-uint64_t ocerz_cache_resolve_weak_ex(OcerzCache *c, const char *symbol, int *found)
+uint64_t ocerz_cache_resolve_weak_ex(OcerzCache *c, const char *symbol, int *found,
+                                     int (*loaded)(uint64_t mh))
 {
     static uint64_t *weak;
     static uint32_t nweak;
@@ -1480,6 +1481,8 @@ uint64_t ocerz_cache_resolve_weak_ex(OcerzCache *c, const char *symbol, int *fou
     if (bl && !bloom_has(bl, fnv64_extend(FNV64_BASIS, symbol, strlen(symbol))))
         return 0;
     for (uint32_t i = 0; i < nweak; i++) {
+        if (loaded && !loaded(weak[i]))
+            continue;
         int f = 0;
         uint64_t v = resolve_in_dylib(c, weak[i], symbol, 0, &f);
         if (f) {

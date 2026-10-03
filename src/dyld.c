@@ -483,7 +483,19 @@
  * classic bind opcodes, which repeat a symbol across consecutive locations,
  * reuse the last answer when the symbol, library and weakness are unchanged.
  * A weak-coalescing bind is answered only from cache images that define weak
- * symbols, as dyld does; see src/cache.c.
+ * symbols, as dyld does; see src/cache.c.  Of those, only images already loaded
+ * in the guest count, again as dyld does: it coalesces among the images loaded
+ * so far, in load order, so a weak definition in a cache image nobody has
+ * loaded never wins.  ocerz searched every cache image, and a library that
+ * carries its own copy of a C++ template bound it to Apple's copy instead.
+ * DXMT's winemetal.so statically links its own LLVM, and its 4481 weak binds
+ * include llvm::AnalysisManager<Module>::getResultImpl, which Apple's libLLVM in
+ * GPUCompiler.framework also exports; DXMT's shader compiler then ran Apple's
+ * LLVM on its own LLVM's objects, read a garbage pointer, failed every shader,
+ * and Metal aborted on the nil function it was handed (R.E.P.O., 2026-10-03).
+ * The main program and its startup dependencies are bound before the set of
+ * loaded images exists, so until then every cache image still counts, which
+ * is what it was; OCERZ_WEAK_ALL_CACHE=1 keeps that for every bind.
  *
  * Some x86_64 libraries ship only in the Rosetta cryptex, and Intel code names
  * them by their system path: Metal opens /usr/lib/libMTLHud.dylib for its
@@ -1423,8 +1435,12 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
                 value = ocerz_cache_resolve_in_image(cache, tgt, name, &found);
         }
     }
+    static int weak_all_cache = -1;
+    if (weak_all_cache < 0)
+        weak_all_cache = getenv("OCERZ_WEAK_ALL_CACHE") ? 1 : 0;
     if (!found && libord == -3)
-        value = ocerz_cache_resolve_weak_ex(cache, name, &found);
+        value = ocerz_cache_resolve_weak_ex(cache, name, &found,
+                                            weak_all_cache ? NULL : ocerz_dyldapi_cache_image_loaded);
     else if (!found)
         value = ocerz_cache_resolve_ex(cache, name, &found);
     if (!found && (libord == -3 || libord == 0 || libord == -2))
