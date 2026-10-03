@@ -244,6 +244,23 @@
  * mac_syscall_low_stack pins it; OCERZ_NO_MACSYS_XLATE=1 turns it off and
  * OCERZ_MACSYSLOG=1 prints the policy, call and first words of each argument.
  *
+ * Metal's newBufferWithBytesNoCopy hands the GPU driver memory the caller owns:
+ * the x86 framework sends the address to the GPU device user client in the
+ * struct input of io_connect_method, selector 9, a 104-byte struct carrying the
+ * address twice (at 0x38 and 0x40) and the length at 0x48.  The kernel wires
+ * the host pages at that address, and under Wine the address is a low-shadow
+ * guest address, so the GPU read and wrote whatever host memory lay at the
+ * guest's number.  DXMT backs D3D11 buffers this way, so R.E.P.O.'s first frame
+ * died on a GPU address fault.  When those two fields hold the same page-aligned
+ * low guest address, the length is whole pages and the range is mapped guest
+ * memory, both are rewritten to the host address for the call and put back
+ * after it, like the descriptors above.  The call is recognised by that shape
+ * alone: IOKit will not name the class behind a connection port.  The host
+ * address is right even for memory the guest only sees through an alias of a
+ * host region, since an alias shares the pages it shows.  OCERZ_NO_GPU_NOCOPY_XLATE=1 turns it off; OCERZ_MSGNEEDLE=<value>
+ * reports every outgoing message that carries a given 64-bit value, which is
+ * how this one was found.
+ *
  * ---- what a vm_region query answers with ----
  * A guest asking mach_vm_region about its own memory is asking about the guest
  * address space, not about the host arena that happens to hold it, so the reply
@@ -2934,6 +2951,36 @@ static void xlate_task_vm_request(uint64_t gmsg, uint32_t send_size, uint32_t ms
     }
 }
 
+static int xlate_gpu_nocopy_buffer(uint64_t gmsg, uint32_t send_size, struct ocerz_ool_save *saved)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_GPU_NOCOPY_XLATE") ? 1 : 0;
+    if (off)
+        return 0;
+    if ((uint32_t)ocerz_ld(gmsg + 0x20, 4) != 9 || (uint32_t)ocerz_ld(gmsg + 0x24, 4) != 0)
+        return 0;
+    const uint64_t ib = gmsg + 0x2c;
+    if ((uint32_t)ocerz_ld(gmsg + 0x28, 4) != 104 || (send_size && 0x2c + 104 > send_size))
+        return 0;
+    uint64_t a0 = ocerz_ld(ib + 0x38, 8), a1 = ocerz_ld(ib + 0x40, 8), len = ocerz_ld(ib + 0x48, 8);
+    if (a0 == 0 || a0 != a1 || (a0 & 0xfff) || (len & 0xfff) || a0 >= OCERZ_LOW_LIMIT || len == 0 ||
+        len > OCERZ_LOW_LIMIT - a0)
+        return 0;
+    uint64_t ha = (uint64_t)(uintptr_t)ocerz_g2h(a0);
+    if (ha == a0 || !ocerz_addr_readable(a0) || !ocerz_addr_readable(a0 + len - 1))
+        return 0;
+    for (int k = 0; k < 2; k++) {
+        saved[k].off = 0x2c + 0x38 + 8u * (unsigned)k;
+        saved[k].orig = a0;
+        ocerz_st(gmsg + saved[k].off, 8, ha);
+    }
+    if (getenv("OCERZ_MIGTRACE"))
+        fprintf(stderr, "ocerz: GPU-NOCOPY[%d] buffer %#llx+%#llx -> host %#llx\n", (int)getpid(),
+                (unsigned long long)a0, (unsigned long long)len, (unsigned long long)ha);
+    return 2;
+}
+
 static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
                                         struct ocerz_ool_save *saved, int max_saved)
 {
@@ -2977,6 +3024,8 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
             }
         }
     }
+    if (msg_id == 2865 && ocerz_low_base && !(bits & 0x80000000u) && n + 2 <= max_saved)
+        n += xlate_gpu_nocopy_buffer(gmsg, send_size, saved + n);
     if (msg_id == 4802 || msg_id == 4804 || msg_id == 4806 || msg_id == 4808 || msg_id == 4809)
         xlate_task_vm_request(gmsg, send_size, msg_id);
     if (msg_id == 4811) {
@@ -7157,6 +7206,43 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 
         if (request_buf != 0)
             ocerz_vmmsg_trace("REQ", request_buf, (uint32_t)(a[2] >> 32));
+        {
+            static uint64_t needle;
+            static int needle_init;
+            if (!needle_init) {
+                const char *e = getenv("OCERZ_MSGNEEDLE");
+                needle = e ? strtoull(e, NULL, 0) : 0;
+                needle_init = 1;
+            }
+            if (needle && request_buf && (a[1] & 0x1)) {
+                uint32_t nsize = (uint32_t)(a[2] >> 32);
+                if (nsize > 0x10000)
+                    nsize = 0x10000;
+                for (uint32_t off = 0; off + 8 <= nsize; off += 4) {
+                    if (!ocerz_addr_readable(request_buf + off) || !ocerz_addr_readable(request_buf + off + 7))
+                        break;
+                    if (ocerz_ld(request_buf + off, 8) != needle)
+                        continue;
+                    fprintf(stderr, "ocerz: MSGNEEDLE[%d] id=%u size=%#x off=%#x bits=%#x rport=%#x near:",
+                            (int)getpid(), (uint32_t)ocerz_ld(request_buf + 0x14, 4), nsize, off,
+                            (uint32_t)ocerz_ld(request_buf, 4), (uint32_t)ocerz_ld(request_buf + 8, 4));
+                    for (int k = -4; k < 6; k++) {
+                        uint64_t at = request_buf + off + (int64_t)k * 8;
+                        if (at >= request_buf && ocerz_addr_readable(at) && ocerz_addr_readable(at + 7))
+                            fprintf(stderr, " %s%#llx", k == 0 ? "*" : "", (unsigned long long)ocerz_ld(at, 8));
+                    }
+                    fprintf(stderr, "\n");
+                    if ((uint32_t)ocerz_ld(request_buf + 0x14, 4) == 2865 && !((uint32_t)ocerz_ld(request_buf, 4) & 0x80000000u)) {
+                        uint32_t sel = (uint32_t)ocerz_ld(request_buf + 0x20, 4);
+                        uint32_t nsc = (uint32_t)ocerz_ld(request_buf + 0x24, 4);
+                        uint64_t ib = request_buf + 0x28 + 8ull * nsc;
+                        uint32_t nib = (uint32_t)ocerz_ld(ib, 4);
+                        fprintf(stderr, "ocerz: MSGNEEDLE-IOKIT[%d] selector=%u scalars=%u inband=%u needle-at-inband+%#llx\n",
+                                (int)getpid(), sel, nsc, nib, (unsigned long long)(request_buf + off - (ib + 4)));
+                    }
+                }
+            }
+        }
         if (request_buf != 0 && OCERZ_ENV_ON("OCERZ_MACHMSG"))
             fprintf(stderr, "ocerz: MACHMSG-ENTER[%d] opts=%#llx voucher|id=%#llx bits=%#x rport=%#x lport=%#x id=%u xlated=%d\n",
                     (int)getpid(), (unsigned long long)a[1], (unsigned long long)a[4],

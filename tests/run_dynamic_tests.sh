@@ -323,6 +323,18 @@ run_weak_unloaded_case() {
     run_built_case "$name" "$want_out" "$dir"
 }
 
+run_metal_nocopy_low_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -fobjc-arc -framework Metal -framework Foundation -o "$dir/$name" \
+            tests/dynamic/metal_nocopy_low.m \
+            -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    run_built_case "$name" "$want_out" "$dir"
+}
+
 run_dlsym_deps_case() {
     local name="$1" want_out="$2"
     local dir="$TMP/$name"
@@ -862,6 +874,7 @@ run_file_case ddlopen_objc_core tests/dynamic/dlopen_objc_core.c 'OK'
 run_caller_rpath_case ddlopen_caller_rpath 'OK'
 run_mac_syscall_low_stack_case dmac_syscall_low_stack 'OK'
 run_weak_unloaded_case dweak_unloaded 'OK'
+run_metal_nocopy_low_case dmetal_nocopy_low 'OK'
 run_low_golden_case dsimd_low tests/guest/simd_pack_jit.c tests/guest/expect/simd_pack_jit.out
 run_low_golden_case dpromo_callout_low tests/dynamic/promo_callout.c tests/dynamic/promo_callout.out
 run_low_golden_case dras_stress_low tests/guest/ras_stress.c tests/guest/expect/ras_stress.out
