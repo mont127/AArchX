@@ -89,6 +89,20 @@
  * such intact aliases as free, so a buffer that grew into an older neighbour's
  * alias is shown whole (OCERZ_NO_ALIAS_REFRESH=1 turns the refresh off).
  *
+ * The pointers an IOKit reply hands back are not all page-aligned.  Creating
+ * an IOSurface answers with the surface's pixels and with two records inside
+ * memory the kernel shares with the process.  The reply scan took page-aligned
+ * values only, so those records were reached through whatever the shadow held
+ * at their number: a fault aliased them when nothing was there, and anything
+ * else there answered in their place.  R.E.P.O.'s CAMetalLayer then fetched
+ * a new drawable's properties into a buffer of garbage size (four gigabytes,
+ * with the right size in its low bits), the kernel refused, and the game
+ * aborted on a nil drawable in two launches of three; with the records
+ * aliased from the reply, none of five did.  An 8-byte-aligned value inside
+ * IOKit or shared host memory is now a candidate too, and it is skipped when
+ * the guest has its own memory at that number (OCERZ_NO_IOKIT_INNER_PTR=1
+ * restores page-aligned values only).
+ *
  * ---- sysctl ----
  * An x86_64 process must see 4 KB pages, as it does under Rosetta, and the
  * override has to mirror the real node's width rather than assume 4: reached by
@@ -286,6 +300,10 @@
  * OCERZ_IOKITERR=1 prints every io_connect_method call that comes back with
  * kIOReturnVMError or kIOReturnBadArgument - selector, struct input and the
  * out-of-line buffers - which is what names the field a translation missed.
+ * OCERZ_IOKITSEL=<selector> prints every call with that selector the same way,
+ * successful or not, with the scalar inputs, the first words of the reply and
+ * the guest rip; OCERZ_IOKITSEL=all prints every call.  With either knob a
+ * call whose message itself fails is printed with the mach_msg error.
  *
  * ---- what a vm_region query answers with ----
  * A guest asking mach_vm_region about its own memory is asking about the guest
@@ -6781,8 +6799,22 @@ static void ocerz_reply_alias_iokit(OcerzVM *vm, uint64_t reply_buf,
     int tries = 0;
     for (uint64_t off = 0x20; off + 8 <= sz && tries < 8; off += 4) {
         uint64_t v = ocerz_ld(reply_buf + off, 8);
-        if ((v & 0xfffull) != 0 || v < 0x1000000ull || v >= OCERZ_LOW_LIMIT)
+        if (v < 0x1000000ull || v >= OCERZ_LOW_LIMIT)
             continue;
+        if (v & 0xfffull) {
+            static int inner = -1;
+            if (inner < 0) inner = getenv("OCERZ_NO_IOKIT_INNER_PTR") ? 0 : 1;
+            int dprot;
+            if (!inner || (v & 7) || !ocerz_host_region_is_device(v, &dprot))
+                continue;
+            int sp = ocerz_addr_prot(v);
+            if (sp > 0 && !alias_page_ours(v & ~(uint64_t)(OCERZ_HOST_PAGE_SIZE - 1))) {
+                if (getenv("OCERZ_MIGTRACE"))
+                    fprintf(stderr, "ocerz: IOKIT-COLLIDE[%d] id=%u off=%#llx pointer=%#llx: the guest has its own memory there\n",
+                            (int)getpid(), reply_id, (unsigned long long)off, (unsigned long long)v);
+                continue;
+            }
+        }
         int slot_prot = ocerz_addr_prot(v);
         if (alog) {
             mach_vm_address_t raw = v;
@@ -7339,12 +7371,16 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 
         if (request_buf != 0)
             ocerz_vmmsg_trace("REQ", request_buf, (uint32_t)(a[2] >> 32));
-        static int iokiterr = -1;
+        static int iokiterr = -1, iokitsel = -2;
         if (iokiterr < 0)
             iokiterr = getenv("OCERZ_IOKITERR") ? 1 : 0;
+        if (iokitsel == -2) {
+            const char *e = getenv("OCERZ_IOKITSEL");
+            iokitsel = !e ? -1 : strcmp(e, "all") == 0 ? 0x7fffffff : atoi(e);
+        }
         uint8_t ioreq[0x200 + 8];
         uint32_t ioreq_n = 0;
-        if (iokiterr && request_buf && (a[1] & 0x1) && (uint32_t)ocerz_ld(request_buf + 0x14, 4) == 2865) {
+        if ((iokiterr || iokitsel >= 0) && request_buf && (a[1] & 0x1) && (uint32_t)ocerz_ld(request_buf + 0x14, 4) == 2865) {
             uint32_t n = (uint32_t)(a[2] >> 32);
             ioreq_n = n > 0x200 ? 0x200u : n;
             for (uint32_t k = 0; k < ioreq_n; k += 8) {
@@ -7580,14 +7616,29 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, r47);
         if (nsv47)
             ocerz_send_restore_descriptors(reply_buf, sv47, nsv47);
+        if (ioreq_n >= 0x2c && r47 != 0) {
+            uint32_t sel, rport;
+            memcpy(&sel, ioreq + 0x20, 4);
+            memcpy(&rport, ioreq + 8, 4);
+            fprintf(stderr, "ocerz: IOKITERR[%d] mach_msg=%#llx selector=%u port=%#x rip=%#llx rsp=%#llx cpu#%u\n",
+                    (int)getpid(), (unsigned long long)r47, sel, rport, (unsigned long long)cpu->rip,
+                    (unsigned long long)cpu->gpr[OCERZ_RSP], cpu->cpu_number);
+        }
         if (ioreq_n >= 0x2c && reply_buf && r47 == 0 && ocerz_addr_readable(reply_buf + 0x23)) {
             uint32_t ret = (uint32_t)ocerz_ld(reply_buf + 0x20, 4);
-            if (ret == 0xe00002c8u || ret == 0xe00002c2u) {
-                uint32_t sel, nsc;
-                memcpy(&sel, ioreq + 0x20, 4);
-                memcpy(&nsc, ioreq + 0x24, 4);
+            uint32_t sel, nsc;
+            memcpy(&sel, ioreq + 0x20, 4);
+            memcpy(&nsc, ioreq + 0x24, 4);
+            if ((iokiterr && (ret == 0xe00002c8u || ret == 0xe00002c2u)) || (iokitsel >= 0 && (sel == (uint32_t)iokitsel || iokitsel == 0x7fffffff))) {
+                uint32_t rport;
+                memcpy(&rport, ioreq + 8, 4);
                 fprintf(stderr, "ocerz: IOKITERR[%d] ret=%#x selector=%u scalars=%u port=%#x req:", (int)getpid(), ret, sel, nsc,
-                        (uint32_t)ocerz_ld(reply_buf + 8, 4));
+                        rport);
+                for (uint32_t k = 0; k < nsc && k < 8 && 0x28 + 8 * k + 8 <= ioreq_n; k++) {
+                    uint64_t sv;
+                    memcpy(&sv, ioreq + 0x28 + 8 * k, 8);
+                    fprintf(stderr, " s%u=%#llx", k, (unsigned long long)sv);
+                }
                 uint32_t o = 0x28 + 8 * nsc, nib = 0;
                 if (o + 4 <= ioreq_n)
                     memcpy(&nib, ioreq + o, 4);
@@ -7605,9 +7656,14 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                 fprintf(stderr, " size=%#x inband_in=%u:", ioreq_n, nib);
                 for (uint32_t k = 0; k < nib && k < 64 && o + 4 + k < ioreq_n; k++)
                     fprintf(stderr, "%02x", ioreq[o + 4 + k]);
-                fprintf(stderr, " ool_in=%#llx+%#llx inband_out=%u scalar_out=%u ool_out=%#llx+%#llx\n",
+                fprintf(stderr, " ool_in=%#llx+%#llx inband_out=%u scalar_out=%u ool_out=%#llx+%#llx reply:",
                         (unsigned long long)ool_in, (unsigned long long)ool_in_sz, ib_out, sc_out,
                         (unsigned long long)ool_out, (unsigned long long)ool_out_sz);
+                uint32_t rn = (uint32_t)ocerz_ld(reply_buf + 4, 4);
+                for (uint32_t k = 0x20; k + 4 <= rn && k < 0x180 && ocerz_addr_readable(reply_buf + k + 3); k += 4)
+                    fprintf(stderr, " %08x", (uint32_t)ocerz_ld(reply_buf + k, 4));
+                fprintf(stderr, " rip=%#llx rsp=%#llx cpu#%u\n", (unsigned long long)cpu->rip,
+                        (unsigned long long)cpu->gpr[OCERZ_RSP], cpu->cpu_number);
             }
         }
 
