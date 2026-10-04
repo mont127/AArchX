@@ -121,7 +121,7 @@ bug is in what that switch controls.
 | Variable | Effect |
 | --- | --- |
 | `OCERZ_DLPATH=1` | print every `dlopen` and `dlsym` failure with its reason; inherited by child processes, which `-v` is not |
-| `OCERZ_PERFSTAT=1` | at exit, print block counts, the hottest blocks and where instructions went |
+| `OCERZ_PERFSTAT=1` | every 15 seconds and at exit, print block counts, the hottest blocks, where instructions went, and return-address stack misses split by cause with the `ret` sites that miss most |
 | `OCERZ_FAULTLOG=1` | print the mapping state around every guest fault |
 | `OCERZ_EXCLOG=1` | print every Objective-C and C++ exception with its throw site |
 | `OCERZ_WILDLOG=1` | report indirect branches whose target is outside the guest address space |
