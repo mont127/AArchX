@@ -100,14 +100,18 @@
 # daemon and wordexp, which runs a shell, would start an x86 image with no
 # translator under it.  ocerz has to launch those through itself.
 #
-# Thread cancellation: pthread_cancel, pthread_testcancel and dispatch_main,
-# which parks the main thread for good, unwind a host thread through ocerz's own
-# frames.  __tlv_atexit and __tlv_exit belong to the thread-local storage ocerz
+# Thread cancellation: pthread_cancel and pthread_testcancel unwind a host
+# thread through ocerz's own frames.  dispatch_main is special instead: the real
+# one ends the main thread and hands the main queue to the thread pool, and in
+# ocerz the main thread is the one the process belongs to, so the handler runs
+# the native main run loop there for good, which drains the main queue the way
+# an application's does.  __tlv_atexit and __tlv_exit belong to the thread-local storage ocerz
 # keeps for the guest, not to host dyld's.
 #
 # Private entry points.  The compiler's out-of-line atomics, the guarded file
 # descriptor calls Chromium wraps every descriptor in, the responsibility and
-# sandbox calls and proc_get_wakemon_params are in no SDK header, so the rules
+# sandbox calls, proc_get_wakemon_params, and the voucher and recursive-lock
+# calls the Swift Concurrency runtime makes are in no SDK header, so the rules
 # can only stub them, but their signatures are fixed and public in Apple's open
 # sources, and they cross under those.  sandbox_check is variadic with at most
 # one pointer after its filter type, and abort_report_np takes a format; each
@@ -595,7 +599,7 @@ special _pthread_setspecific pthread_setspecific
 special _pthread_getspecific pthread_getspecific
 stub _pthread_cancel override
 stub _pthread_testcancel override
-stub _dispatch_main override
+special _dispatch_main dispatch_main
 fn __tlv_atexit _tlv_atexit v(c{v(p)}p)
 stub __tlv_exit override
 
@@ -753,6 +757,10 @@ fn _guarded_kqueue_np guarded_kqueue_np i(pu)
 fn _proc_get_wakemon_params proc_get_wakemon_params i(ipp)
 fn _responsibility_spawnattrs_setdisclaim responsibility_spawnattrs_setdisclaim i(pi)
 fn _responsibility_get_pid_responsible_for_pid responsibility_get_pid_responsible_for_pid i(i)
+fn _voucher_adopt voucher_adopt p(p)
+fn _voucher_copy voucher_copy p()
+fn _os_unfair_recursive_lock_lock_with_options os_unfair_recursive_lock_lock_with_options v(pu)
+fn _os_unfair_recursive_lock_unlock os_unfair_recursive_lock_unlock v(p)
 special _sandbox_init sandbox_init
 special _sandbox_init_with_parameters sandbox_init_with_parameters
 fn _sandbox_extension_consume sandbox_extension_consume l(p)

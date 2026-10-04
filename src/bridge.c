@@ -1940,6 +1940,7 @@ static const BrHandler g_br_handlers[] = {
     { "pthread_key_create",  ocerz_sys_pthread_key_create },
     { "pthread_key_delete",  ocerz_sys_pthread_key_delete },
     { "pthread_key_init_np", ocerz_sys_pthread_key_init_np },
+    { "dispatch_main",       ocerz_sys_dispatch_main },
     { "pthread_setspecific", ocerz_sys_pthread_setspecific },
     { "pthread_getspecific", ocerz_sys_pthread_getspecific },
     { "pthread_create",      ocerz_sys_pthread_create },
