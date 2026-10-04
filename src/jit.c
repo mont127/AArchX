@@ -77,7 +77,20 @@
  * arm.  Faulting sites are hot-patched, and the out-of-line store arm picks
  * dmb ish + plain store when the block also does ordered loads (the drain is
  * cheap then: memcpy 0.31s vs 1.1s for release pieces) and release pieces
- * otherwise (store-only loops: memset 0.10s vs 0.5-1.0s).
+ * otherwise (store-only loops: memset 0.10s vs 0.5-1.0s).  An ordered access
+ * carries no test by default: it is an ldapur or stlur, and the first time one
+ * crosses a granule the fault handler patches that site into a branch to a
+ * tested arm.  Only an instruction whose fault could not be patched carries
+ * the test inline, and only that instruction; a second fault there marks the
+ * whole block.  Testing every ordered access cost four instructions on each
+ * load and store the Wine layout translates, and marking a whole block for
+ * one fault put the test in front of every access of an unrolled Unity loop
+ * that had one misaligned slot (OCERZ_ALIGN_TEST_ALL=1 tests every access).
+ * A patched arm stands in for one instruction in the middle of an emitter's
+ * sequence, so it saves the two registers it borrows on the host stack and
+ * tests the granule with a bit test instead of the flags: a cmov keeps its
+ * condition in JTF across the load, and an arm that borrowed JTF made a cmov
+ * from a straddling address take the wrong side.
  *
  * ---- flags ----
  * Flags are deferred: an instruction records {kind, size, dst, src} and the
@@ -1344,7 +1357,8 @@ static int vec_plain_size(int size)
 }
 static unsigned long long ps_align_patches;
 static int g_blk_ordered_loads;
-static int g_al_all;
+static int g_al_all, g_al_n, g_align_blk, g_align_any;
+#define AL_BLK_TAG (1ull << 62)
 static int al_marked(uint64_t key)
 {
     if (g_al_all) return 1;
@@ -1364,7 +1378,7 @@ static void al_mark(uint64_t key)
     for (unsigned n = 0; n < AL_MARK_SIZE; n++, i = (i + 1) & (AL_MARK_SIZE - 1)) {
         uint64_t v = g_al_marks[i];
         if (v == key) return;
-        if (v == 0) { g_al_marks[i] = key; return; }
+        if (v == 0) { g_al_marks[i] = key; g_al_n++; return; }
     }
     g_al_all = 1;
 }
@@ -4301,6 +4315,12 @@ static int emit_hoisted_mem_access(A64Buf *b, const X86Insn *insn,
     return 1;
 }
 
+static int align_test_all(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_ALIGN_TEST_ALL") ? 1 : 0;
+    return on;
+}
 static void emit_granule_cross_test(A64Buf *b, int size, int ra, int scratch)
 {
     a64_add_imm(b, 1, scratch, ra, (uint32_t)(size - 1));
@@ -4326,6 +4346,10 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
             a64_stlr(b, size, rv, ra);
             return;
         }
+    }
+    if (!g_align_guard && !align_test_all()) {
+        a64_stlur(b, size, rv, ra, 0);
+        return;
     }
     emit_granule_cross_test(b, size, ra, scratch);
     if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
@@ -4369,6 +4393,10 @@ static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scr
             else            a64_ldapr(b, size, rd, ra);
             return;
         }
+    }
+    if (!g_align_guard && !g_no_ldapr && !align_test_all()) {
+        a64_ldapur(b, size, rd, ra, 0);
+        return;
     }
     emit_granule_cross_test(b, size, ra, scratch);
     if (!g_no_oolslow && g_n_oslow < OSLOW_MAX) {
@@ -15560,7 +15588,12 @@ static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *ent
         const OrderedSlowPend *o = &g_oslow[i];
         uint32_t *lo = a64_label(b);
         a64_patch_bcond(o->bne, lo);
+        int cand[3] = { JTF, JTT, JTU }, sc[2], nsc = 0;
+        for (int k = 0; k < 3 && nsc < 2; k++)
+            if (cand[k] != o->rv && cand[k] != o->ra) sc[nsc++] = cand[k];
+        a64_stp_pre(b, sc[0], sc[1], 31, -16);
         emit_misaligned_arm(b, o);
+        a64_ldp_post(b, sc[0], sc[1], 31, 16);
         uint32_t *here = a64_label(b);
         a64_b(b, (int32_t)(o->back - here));
         if (blk->oslow) {
@@ -16780,7 +16813,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         g_tc_rec = 1;
         g_tc_key = tc_key(rip, mode32);
         uint64_t jk = jit_key(rip, mode32);
-        if (!al_marked(jk) && !cp_marked(jk) && !tc_noload_has(jk))
+        if (!al_marked(jk) && !al_marked(jk | AL_BLK_TAG) && !cp_marked(jk) && !tc_noload_has(jk))
             tc_hit = ocerz_tcache_find(g_tc_key);
         {
             static int tr = -1;
@@ -16971,8 +17004,12 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_cp_guard = ocerz_commpage && (ENV_ON("OCERZ_CP_GUARD_ALL") || cp_marked(jit_key(rip, mode32)));
     g_low_top = ocerz_low_base && (ENV_ON("OCERZ_LOW_TOP_GUARD") || cp_marked(jit_key(rip, mode32)));
     { static int all = -1; if (all < 0) all = getenv("OCERZ_AL_GUARD_ALL") ? 1 : 0; if (all) g_al_all = 1; }
-    g_align_guard = !g_plain_mem && al_marked(jit_key(rip, mode32));
-    if (g_cp_guard || g_align_guard)
+    g_align_blk = !g_plain_mem && al_marked(jit_key(rip, mode32) | AL_BLK_TAG);
+    g_align_any = g_align_blk;
+    for (int i = 0; i < n && !g_align_any && !g_plain_mem && g_al_n; i++)
+        g_align_any = al_marked(jit_key(blk->insns[i].rip, mode32));
+    g_align_guard = g_align_blk;
+    if (g_cp_guard || g_align_any)
         g_tc_learned = 1;
     g_blk_ordered_loads = 0;
     g_push_entry = NULL;
@@ -17586,6 +17623,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         const X86Insn *insn = &blk->insns[i];
         g_cur_insn_idx = i;
         g_cur_insn_start = b.p;
+        g_align_guard = g_align_blk || (g_align_any && al_marked(jit_key(insn->rip, mode32)));
         g_ea_plain = 0;
         lanerec_note((uint32_t)(b.p - entry));
         if (i == 0 && fps_watch(rip)) {
@@ -18882,9 +18920,14 @@ int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t
     const JitBlock *b = fault_block(jit, pc);
     if (!b || jit->plain_mem) return 0;
     uint64_t block_rip = blk_rip(b);
-    int fresh = !al_marked(b->key);
-    al_mark(b->key);
-    al_mark(jit_key(fault_rip, blk_mode32(b)));
+    uint64_t ik = jit_key(fault_rip, blk_mode32(b));
+    int fresh = !al_marked(ik);
+    if (fresh) {
+        al_mark(ik);
+    } else {
+        fresh = !al_marked(b->key | AL_BLK_TAG);
+        al_mark(b->key | AL_BLK_TAG);
+    }
     if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL"))
         return 1;
     if (fresh && !ENV_ON("OCERZ_FAULT_INV_RANGE")) {
@@ -18955,17 +18998,26 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
         }
         A64Buf b = { start, start, lim, 0, 0 };
         uint32_t *arm = b.p;
+        a64_stp_pre(&b, ta, s1, 31, -16);
         if (imm9 > 0)      a64_add_imm(&b, 1, ta, rn, (uint32_t)imm9);
         else if (imm9 < 0) a64_sub_imm(&b, 1, ta, rn, (uint32_t)-imm9);
         else               a64_mov_reg(&b, 1, ta, rn);
-        if (pair) a64_try_ands_imm(&b, 1, A64_ZR, ta, 7);
-        else emit_granule_cross_test(&b, size, ta, s1);
-        uint32_t *bne = a64_label(&b); a64_bcond(&b, A64_NE, 0);
+        uint32_t *bne;
+        if (pair) {
+            (void)a64_try_and_imm(&b, 1, s1, ta, 7);
+            bne = a64_label(&b); a64_cbnz(&b, 1, s1, 0);
+        } else {
+            a64_add_imm(&b, 1, s1, ta, (uint32_t)(size - 1));
+            a64_eor_reg(&b, 1, s1, s1, ta, 0);
+            bne = a64_label(&b); a64_tbnz(&b, s1, 4, 0);
+        }
         if (is_lds) a64_ldapurs(&b, size, lds_sf, rt, ta, 0);
         else if (is_ld) a64_ldapur(&b, size, rt, ta, 0);
         else { a64_stlur(&b, size, rt, ta, 0); if (pair) a64_stlur(&b, 8, JTU, ta, 8); }
+        a64_ldp_post(&b, ta, s1, 31, 16);
         uint32_t *back1 = a64_label(&b); a64_b(&b, 0);
-        a64_patch_bcond(bne, a64_label(&b));
+        if (pair) a64_patch_cbz(bne, a64_label(&b));
+        else      a64_patch_tbz(bne, a64_label(&b));
         if (is_ld) {
             if (!is_lds)        a64_ldr(&b, size, rt, ta, 0);
             else if (size == 2) a64_ldrsh(&b, lds_sf, rt, ta, 0);
@@ -18976,18 +19028,20 @@ int ocerz_jit_hotpatch_align(struct OcerzVM *vm, const void *host_pc)
             a64_str(&b, size, rt, ta, 0);
             if (pair) a64_str(&b, 8, JTU, ta, 8);
         } else if (size == 8) {
-            a64_try_ands_imm(&b, 1, A64_ZR, ta, 3);
-            uint32_t *tob = a64_label(&b); a64_bcond(&b, A64_NE, 0);
+            uint32_t *tob0 = a64_label(&b); a64_tbnz(&b, ta, 0, 0);
+            uint32_t *tob1 = a64_label(&b); a64_tbnz(&b, ta, 1, 0);
             emit_misaligned_pieces_st(&b, 4, 2, rt, ta, 0, s1);
             if (pair) emit_misaligned_pieces_st(&b, 4, 2, JTU, ta, 8, s1);
             uint32_t *tod = a64_label(&b); a64_b(&b, 0);
-            a64_patch_bcond(tob, a64_label(&b));
+            a64_patch_tbz(tob0, a64_label(&b));
+            a64_patch_tbz(tob1, a64_label(&b));
             emit_misaligned_pieces_st(&b, 1, 8, rt, ta, 0, s1);
             if (pair) emit_misaligned_pieces_st(&b, 1, 8, JTU, ta, 8, s1);
             a64_patch_b(tod, a64_label(&b));
         } else {
             emit_misaligned_pieces_st(&b, 1, size, rt, ta, 0, s1);
         }
+        a64_ldp_post(&b, ta, s1, 31, 16);
         uint32_t *back2 = a64_label(&b); a64_b(&b, 0);
         uint32_t *back = site + (pair ? 2 : 1);
         int ok = !b.overflow && a64_try_patch_b(back1, back) && a64_try_patch_b(back2, back);

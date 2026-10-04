@@ -1972,17 +1972,24 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         }
     }
 
-    if (align_fault && depth == 0 && g_cur_cpu && g_sig_recover && ctx) {
+    if (align_fault && depth == 0 && ctx) {
         const ucontext_t *uc = (const ucontext_t *)ctx;
         const void *hpc = (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
-        struct OcerzVM *fvm = g_cur_cpu->vm;
-        if (fvm && ocerz_jit_pc_in_arena(fvm, hpc)) {
-            int hp = ocerz_jit_hotpatch_align(fvm, hpc);
+        struct OcerzVM *pvm = g_cur_cpu ? g_cur_cpu->vm : g_vm;
+        if (pvm && ocerz_jit_pc_in_arena(pvm, hpc)) {
+            int hp = ocerz_jit_hotpatch_align(pvm, hpc);
             if (hp) {
                 if (getenv("OCERZ_ALFAULTLOG"))
                     fprintf(stderr, "ocerz: ALFAULT hotpatch=%d hpc=%p addr=%p\n", hp, hpc, si->si_addr);
                 return;
             }
+        }
+    }
+    if (align_fault && depth == 0 && g_cur_cpu && g_sig_recover && ctx) {
+        const ucontext_t *uc = (const ucontext_t *)ctx;
+        const void *hpc = (const void *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+        struct OcerzVM *fvm = g_cur_cpu->vm;
+        if (fvm && ocerz_jit_pc_in_arena(fvm, hpc)) {
             depth = 1;
             ocerz_jit_fault_recover_regs(fvm, hpc, uc->uc_mcontext->__ss.__x, g_cur_cpu);
             ocerz_jit_fault_recover_xmm(fvm, hpc, uc->uc_mcontext->__ns.__v, g_cur_cpu);
