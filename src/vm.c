@@ -958,6 +958,27 @@ static void ras_clear(OcerzCPU *cpu)
     }
     __atomic_store_n(&cpu->ras_top, 0, __ATOMIC_RELEASE);
 }
+static void ras_clear_if(OcerzCPU *cpu, int (*stale)(const void *, void *), void *arg)
+{
+    for (int i = 0; i < OCERZ_RAS_SIZE; i++) {
+        void *e = __atomic_load_n(&cpu->ras[i].host_entry, __ATOMIC_RELAXED);
+        if (e && stale(e, arg))
+            __atomic_store_n(&cpu->ras[i].host_entry, (void *)NULL, __ATOMIC_RELEASE);
+    }
+}
+void ocerz_vm_purge_jit_ras_if(OcerzVM *vm, int (*stale)(const void *, void *), void *arg)
+{
+    if (!vm)
+        return;
+    ras_clear_if(&vm->cpu, stale, arg);
+    if (g_cur_cpu && g_cur_cpu->vm == vm)
+        ras_clear_if(g_cur_cpu, stale, arg);
+    pthread_mutex_lock(&g_cpus_lock);
+    for (int i = 0; i < g_cpus_n; i++)
+        if (g_cpus[i] && g_cpus[i]->vm == vm)
+            ras_clear_if(g_cpus[i], stale, arg);
+    pthread_mutex_unlock(&g_cpus_lock);
+}
 void ocerz_vm_purge_jit_refs(OcerzVM *vm)
 {
     if (!vm)

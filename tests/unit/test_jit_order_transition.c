@@ -163,15 +163,27 @@ int main(void)
           "non-code invalidation retired cache (blocks=%llu)",
           (unsigned long long)ocerz_jit_blocks(vm.jit));
 
-    vm.cpu.ras_top = 1;
+    const uint32_t *code_lo = NULL, *code_hi = NULL, *b_code = NULL;
+    CHECK(ocerz_jit_code_range(&vm, &code_lo, &code_hi), "no code range");
+    for (const uint32_t *pc = code_lo; pc && pc < code_hi; pc++) {
+        OcerzJitFaultInfo fi;
+        if (ocerz_jit_fault_info(&vm, pc, &fi) && fi.block_rip == B_RIP)
+            b_code = pc;
+    }
+    CHECK(b_code != NULL, "translated B not found in the arena");
+    vm.cpu.ras_top = 2;
     vm.cpu.ras[0].guest_rip = B_RIP;
-    vm.cpu.ras[0].host_entry = (void *)(uintptr_t)1;
+    vm.cpu.ras[0].host_entry = (void *)(uintptr_t)b_code;
+    vm.cpu.ras[1].guest_rip = A_RIP;
+    vm.cpu.ras[1].host_entry = (void *)(uintptr_t)1;
     ocerz_jit_invalidate_range(&vm, B_RIP + 1, 1);
-    CHECK(vm.cpu.ras_top == 0, "code invalidation retained ras_top=%u",
-          vm.cpu.ras_top);
+    CHECK(vm.cpu.ras[0].host_entry == NULL, "code invalidation kept a return entry into B");
+    CHECK(vm.cpu.ras[1].host_entry == (void *)(uintptr_t)1,
+          "code invalidation dropped a return entry that does not point into B");
 
     CHECK(ocerz_unmap(CODE_BASE, 0x10000) == OCERZ_OK,
           "executable mapping unmap failed");
+    ocerz_jit_invalidate_range(&vm, CODE_BASE, 0x10000);
     CHECK(ocerz_map_fixed(CODE_BASE, 0x10000,
                           PROT_READ | PROT_WRITE) == OCERZ_OK,
           "executable address reuse failed");
