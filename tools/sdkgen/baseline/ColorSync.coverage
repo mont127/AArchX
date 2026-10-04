@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync
+sdk macos 27.0
+exports 533
+fn 60
+data 248
+var 0
+special 0
+stub no-declaration 85
+omit no-declaration-missing 140
+host-missing 30
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 9
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/PCSC.framework/Versions/A/PCSC
+sdk macos 27.0
+exports 70
+fn 26
+data 3
+var 0
+special 0
+stub callback-struct 34
+stub no-declaration 7
+host-missing 0
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

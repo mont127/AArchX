@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/CoreMotion.framework/Versions/A/CoreMotion
+sdk macos 27.0
+exports 871
+fn 0
+data 650
+var 0
+special 0
+stub no-declaration 135
+omit no-declaration-missing 65
+omit objc-ivar 5
+omit swift 16
+host-missing 16
+objc-classes 159
+objc-eh-types 0
+objc-ivars 5
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

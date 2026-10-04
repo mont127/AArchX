@@ -1,0 +1,20 @@
+library /usr/lib/libxar.1.dylib
+sdk macos 27.0
+exports 210
+fn 81
+data 4
+var 0
+special 0
+stub no-declaration 120
+stub struct-layout 1
+stub variadic 1
+omit no-declaration-missing 3
+host-missing 0
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

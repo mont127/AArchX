@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/UserNotificationsUI.framework/Versions/A/UserNotificationsUI
+sdk macos 27.0
+exports 13
+fn 0
+data 11
+var 0
+special 0
+stub no-declaration 1
+omit objc-ivar 1
+host-missing 0
+objc-classes 3
+objc-eh-types 0
+objc-ivars 1
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

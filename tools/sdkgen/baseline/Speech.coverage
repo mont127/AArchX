@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/Speech.framework/Versions/A/Speech
+sdk macos 27.0
+exports 3731
+fn 0
+data 260
+var 0
+special 0
+stub no-declaration 1474
+omit no-declaration-missing 479
+omit swift 1518
+host-missing 18
+objc-classes 85
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 9
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

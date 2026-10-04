@@ -1,0 +1,16 @@
+library /System/Library/Frameworks/CallKit.framework/Versions/A/CallKit
+sdk macos 27.0
+exports 238
+fn 0
+data 238
+var 0
+special 0
+host-missing 4
+objc-classes 111
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

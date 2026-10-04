@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/iTunesLibrary.framework/Versions/A/iTunesLibrary
+sdk macos 27.0
+exports 247
+fn 0
+data 207
+var 0
+special 0
+stub no-declaration 5
+omit objc-ivar 30
+omit swift 5
+host-missing 0
+objc-classes 30
+objc-eh-types 0
+objc-ivars 30
+ld-pseudo-skipped 8
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

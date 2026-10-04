@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/Quartz.framework/Versions/A/Quartz
+sdk macos 27.0
+exports 1172
+fn 0
+data 725
+var 0
+special 0
+stub no-declaration 199
+omit objc-ivar 248
+host-missing 0
+objc-classes 163
+objc-eh-types 0
+objc-ivars 248
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

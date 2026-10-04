@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/NetworkExtension.framework/Versions/A/NetworkExtension
+sdk macos 27.0
+exports 1758
+fn 0
+data 774
+var 0
+special 0
+stub no-declaration 477
+omit no-declaration-missing 302
+omit swift 205
+host-missing 4
+objc-classes 241
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

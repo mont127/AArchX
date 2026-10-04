@@ -1,0 +1,23 @@
+library /System/Library/Frameworks/Tcl.framework/Versions/8.5/Tcl
+sdk macos 27.0
+exports 812
+fn 278
+data 6
+var 0
+special 0
+stub callback-pointer 4
+stub callback-result 16
+stub callback-struct 273
+stub nested-callback 1
+stub no-declaration 221
+stub va-list 5
+stub variadic 8
+host-missing 0
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

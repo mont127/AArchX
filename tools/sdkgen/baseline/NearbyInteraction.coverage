@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/NearbyInteraction.framework/Versions/A/NearbyInteraction
+sdk macos 27.0
+exports 180
+fn 1
+data 127
+var 0
+special 0
+stub no-declaration 25
+omit no-declaration-missing 8
+omit swift 19
+host-missing 10
+objc-classes 45
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 114
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

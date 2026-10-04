@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/MapKit.framework/Versions/A/MapKit
+sdk macos 27.0
+exports 2442
+fn 18
+data 930
+var 0
+special 0
+stub no-declaration 101
+omit no-declaration-missing 1378
+omit objc-ivar 15
+host-missing 11
+objc-classes 265
+objc-eh-types 0
+objc-ivars 15
+ld-pseudo-skipped 26
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/SharedWithYou.framework/Versions/A/SharedWithYou
+sdk macos 27.0
+exports 281
+fn 0
+data 58
+var 0
+special 0
+stub no-declaration 122
+omit no-declaration-missing 61
+omit swift 40
+host-missing 0
+objc-classes 27
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

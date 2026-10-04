@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/ShazamKit.framework/Versions/A/ShazamKit
+sdk macos 27.0
+exports 507
+fn 0
+data 193
+var 0
+special 0
+stub no-declaration 119
+omit no-declaration-missing 86
+omit swift 109
+host-missing 8
+objc-classes 61
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 327
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

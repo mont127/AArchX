@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/Automator.framework/Versions/A/Automator
+sdk macos 27.0
+exports 1323
+fn 0
+data 1244
+var 0
+special 0
+stub no-declaration 69
+omit objc-ivar 10
+host-missing 0
+objc-classes 487
+objc-eh-types 0
+objc-ivars 10
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

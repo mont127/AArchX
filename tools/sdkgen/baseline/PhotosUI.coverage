@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/PhotosUI.framework/Versions/A/PhotosUI
+sdk macos 27.0
+exports 1264
+fn 0
+data 182
+var 0
+special 0
+stub no-declaration 384
+omit no-declaration-missing 468
+omit swift 230
+host-missing 30
+objc-classes 79
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 288
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

@@ -1,0 +1,17 @@
+library /System/Library/Frameworks/MailKit.framework/Versions/A/MailKit
+sdk macos 27.0
+exports 74
+fn 0
+data 73
+var 0
+special 0
+stub no-declaration 1
+host-missing 0
+objc-classes 30
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

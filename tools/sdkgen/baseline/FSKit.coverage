@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/FSKit.framework/Versions/A/FSKit
+sdk macos 27.0
+exports 339
+fn 3
+data 271
+var 0
+special 0
+stub no-declaration 32
+omit no-declaration-missing 11
+omit swift 22
+host-missing 74
+objc-classes 111
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0
