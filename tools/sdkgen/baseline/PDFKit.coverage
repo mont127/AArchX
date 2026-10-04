@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/PDFKit.framework/Versions/A/PDFKit
+sdk macos 27.0
+exports 306
+fn 0
+data 277
+var 0
+special 0
+stub no-declaration 27
+omit no-declaration-missing 2
+host-missing 0
+objc-classes 35
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 11
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

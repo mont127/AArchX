@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/CoreData.framework/Versions/A/CoreData
+sdk macos 27.0
+exports 1412
+fn 0
+data 343
+var 0
+special 0
+stub no-declaration 308
+omit no-declaration-missing 702
+omit swift 59
+host-missing 4
+objc-classes 97
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 1053
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

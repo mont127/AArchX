@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/MetalPerformanceShaders
+sdk macos 27.0
+exports 2038
+fn 12
+data 1506
+var 0
+special 0
+stub no-declaration 348
+omit no-declaration-missing 5
+omit objc-ivar 167
+host-missing 4
+objc-classes 734
+objc-eh-types 0
+objc-ivars 167
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

@@ -408,7 +408,7 @@
 # under Blocks below.
 #
 # ---- Foundation ----
-# NSLog is a format veneer and NSLogv stays a stub.  NSFrameAddress,
+# NSLog is a format veneer and NSLogv takes the guest's va_list.  NSFrameAddress,
 # NSReturnAddress and NSCountFrames walk the calling thread's native frames,
 # which are ocerz's and not the guest's, so they name themselves the way the
 # unwinding calls in libSystem do.
@@ -524,6 +524,14 @@ special _warn warn
 special _warnx warnx
 special _vwarn vwarn
 special _vwarnx vwarnx
+special _warnc warnc
+special _vwarnc vwarnc
+special _err err
+special _errx errx
+special _errc errc
+special _verr verr
+special _verrx verrx
+special _verrc verrc
 special ___vsprintf_chk vsprintf_chk
 special ___vsnprintf_chk vsnprintf_chk
 special _sscanf sscanf
@@ -611,6 +619,9 @@ special _pthread_getspecific pthread_getspecific
 stub _pthread_cancel override
 stub _pthread_testcancel override
 special _dispatch_main dispatch_main
+special _glob glob
+special _glob$INODE64 glob
+special _globfree globfree
 fn __tlv_atexit _tlv_atexit v(c{v(p)}p)
 stub __tlv_exit override
 
@@ -851,6 +862,12 @@ fn _NSGetSizeAndAlignment NSGetSizeAndAlignment p(ppp)
 data ___CFConstantStringClassReference __CFConstantStringClassReference
 special _CFStringCreateWithFormat CFStringCreateWithFormat
 special _CFStringAppendFormat CFStringAppendFormat
+special _CFStringCreateWithFormatAndArguments CFStringCreateWithFormatAndArguments
+special _CFStringAppendFormatAndArguments CFStringAppendFormatAndArguments
+special _CFCalendarComposeAbsoluteTime cf_calendar_compose
+special _CFCalendarDecomposeAbsoluteTime cf_calendar_decompose
+special _CFCalendarAddComponents cf_calendar_add
+special _CFCalendarGetComponentDifference cf_calendar_difference
 special _CFUUIDGetConstantUUIDWithBytes cfuuid_constant
 
 shape CFArrayCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
@@ -992,6 +1009,7 @@ fn _objc_unsafeClaimAutoreleasedReturnValue objc_unsafeClaimAutoreleasedReturnVa
 library /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
 
 special _NSLog NSLog
+special _NSLogv NSLogv
 stub _NSFrameAddress override
 stub _NSReturnAddress override
 stub _NSCountFrames override

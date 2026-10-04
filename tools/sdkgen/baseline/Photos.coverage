@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/Photos.framework/Versions/A/Photos
+sdk macos 27.0
+exports 1531
+fn 0
+data 1131
+var 0
+special 0
+stub no-declaration 188
+omit no-declaration-missing 174
+omit objc-ivar 15
+omit swift 23
+host-missing 104
+objc-classes 377
+objc-eh-types 0
+objc-ivars 15
+ld-pseudo-skipped 63
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

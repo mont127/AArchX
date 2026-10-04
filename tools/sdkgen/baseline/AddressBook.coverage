@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/AddressBook.framework/Versions/A/AddressBook
+sdk macos 27.0
+exports 4841
+fn 1
+data 3265
+var 0
+special 0
+stub no-declaration 242
+omit no-declaration-missing 67
+omit objc-ivar 1252
+omit swift 14
+host-missing 6
+objc-classes 946
+objc-eh-types 0
+objc-ivars 1252
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

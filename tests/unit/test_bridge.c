@@ -160,7 +160,7 @@ static const char *const kBridged[] = {
 #define NBRIDGED (sizeof kBridged / sizeof kBridged[0])
 
 static const char *const kUnbridged[] = {
-    "_err", "_errx", "_asl_log",
+    "_asl_log",
 };
 #define NUNBRIDGED (sizeof kUnbridged / sizeof kUnbridged[0])
 
@@ -464,11 +464,11 @@ static void test_dl_specials(void)
     CHECK(e && strstr(dl_text(e), "tried: '/nonexistent/ocerz/libnope.dylib' (no such file)") != NULL,
           "dlopen of a missing path left '%s'", dl_text(e));
 
-    CHECK(dl_call("_dlopen", put_str(scratch + 256, "/usr/lib/libsqlite3.dylib"), 2, 0) == 0,
+    CHECK(dl_call("_dlopen", put_str(scratch + 256, "/usr/lib/libpcap.A.dylib"), 2, 0) == 0,
           "dlopen of a native library with no database answered a handle");
     e = dl_call("_dlerror", 0, 0, 0);
     CHECK(e && strstr(dl_text(e), "native library without an API database") != NULL,
-          "dlopen of sqlite3 left '%s'", dl_text(e));
+          "dlopen of libpcap left '%s'", dl_text(e));
 
     CHECK(dl_call("_dlclose", (uint64_t)-2, 0, 0) == 0, "dlclose(RTLD_DEFAULT) failed");
     CHECK((uint32_t)dl_call("_dlclose", 0x1234, 0, 0) == 0xffffffffu, "dlclose of a bogus handle did not fail");
@@ -491,8 +491,8 @@ static void test_dl_specials(void)
                   put_str(scratch + 256, "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"),
                   0, 0) == 1,
           "CoreFoundation reached through its framework symlink is not a library the cache contains");
-    CHECK(dl_call("__dyld_shared_cache_contains_path", put_str(scratch + 256, "/usr/lib/libsqlite3.dylib"), 0, 0) == 0,
-          "sqlite3, which no database describes, is a library the cache contains");
+    CHECK(dl_call("__dyld_shared_cache_contains_path", put_str(scratch + 256, "/usr/lib/libpcap.A.dylib"), 0, 0) == 0,
+          "libpcap, which no database describes, is a library the cache contains");
 
     uint64_t info = scratch + 512;
     Dl_info host;

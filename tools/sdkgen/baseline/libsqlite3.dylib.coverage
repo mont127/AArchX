@@ -1,0 +1,21 @@
+library /usr/lib/libsqlite3.dylib
+sdk macos 27.0
+exports 388
+fn 273
+data 3
+var 0
+special 0
+stub callback-struct 7
+stub no-declaration 82
+stub va-list 3
+stub variadic 8
+omit no-declaration-missing 12
+host-missing 6
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

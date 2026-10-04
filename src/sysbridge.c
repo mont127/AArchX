@@ -221,6 +221,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <limits.h>
 #include <paths.h>
 #include <pthread.h>
@@ -1352,6 +1353,31 @@ int ocerz_sys_pthread_exit(struct OcerzVM *vm, OcerzCPU *cpu)
     void *value = sb_ptr(sb_arg(cpu, 0));
     sb_key_destructors(vm, cpu);
     pthread_exit(value);
+}
+
+int ocerz_sys_glob(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int flags = (int)sb_arg(cpu, 1);
+    uint64_t errfunc = sb_arg(cpu, 2), slot = 0;
+    if (flags & GLOB_ALTDIRFUNC)
+        sb_refuse("_glob", "was given GLOB_ALTDIRFUNC, whose directory functions in glob_t are x86 code");
+    if (errfunc && (ocerz_abi_callback_convert(errfunc, "i(pi)", &slot) != OCERZ_OK || !slot))
+        sb_refuse("_glob", "could not bind its error function to a callback");
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_glob", "i(pic{i(pi)}p)", (const void *)glob);
+    int r = glob(sb_ptr(sb_arg(cpu, 0)), flags, slot ? (int (*)(const char *, int))ocerz_g2h(slot) : NULL,
+                 sb_ptr(sb_arg(cpu, 3)));
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+
+int ocerz_sys_globfree(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_globfree", "v(p)", (const void *)globfree);
+    globfree(sb_ptr(sb_arg(cpu, 0)));
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, 0);
 }
 
 int ocerz_sys_dispatch_main(struct OcerzVM *vm, OcerzCPU *cpu)

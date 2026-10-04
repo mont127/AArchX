@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/Intents.framework/Versions/A/Intents
+sdk macos 27.0
+exports 5626
+fn 0
+data 2988
+var 0
+special 0
+stub no-declaration 2628
+omit no-declaration-missing 8
+omit objc-ivar 2
+host-missing 0
+objc-classes 1322
+objc-eh-types 0
+objc-ivars 2
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

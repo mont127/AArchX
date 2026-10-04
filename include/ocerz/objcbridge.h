@@ -390,5 +390,16 @@ int ocerz_fmt_vscanf(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_vfscanf(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_CFStringCreateWithFormat(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_fmt_CFStringAppendFormat(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_CFStringCreateWithFormatAndArguments(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_CFStringAppendFormatAndArguments(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_NSLogv(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_warnc(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_err(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_errx(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_errc(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_vwarnc(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_verr(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_verrx(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_fmt_verrc(struct OcerzVM *vm, OcerzCPU *cpu);
 
 #endif

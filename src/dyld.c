@@ -2163,6 +2163,8 @@ static void depmap_build(OcerzCache *cache)
 }
 static uint64_t dep_find(OcerzCache *cache, const char *path)
 {
+    if (!cache)
+        return 0;
     if (!g_depmap_built) depmap_build(cache);
     uint32_t h = depmap_hash(path) & ((1u << DEPMAP_BITS) - 1);
     for (unsigned n = 0; n < (1u << DEPMAP_BITS) && g_depmap[h].path; n++) {

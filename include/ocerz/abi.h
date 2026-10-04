@@ -23,6 +23,7 @@
  *     T  a dispatch_time_t, converted between the guest's and the host's units
  *     p  pointer, converted between the guest and host views
  *     f  32-bit float          d  64-bit double
+ *     D  long double, 80 bits in memory and ST0 on the guest, a double on the host
  *     {...}  a structure by value, described below
  *
  * Reading the guest side means walking the arguments in order, handing each to
@@ -68,6 +69,14 @@
  * the guest tick values of their own, a CoreAudio host time or a display
  * link's, to compare against it, and the opaque dispatch_time_t is the one
  * place the guest's units can be put right without making those disagree.
+ *
+ * D is long double.  System V passes one in memory, in a 16-byte-aligned pair
+ * of stack slots holding the 80-bit x87 format, and returns one in ST0; Apple's
+ * arm64 long double is a double, passed and returned in a vector register.  So
+ * a D argument is read from the guest's stack at the next even slot and
+ * converted to a double, which is where its precision goes, and a D result is
+ * pushed on the guest's x87 stack, which ocerz keeps as doubles anyway.
+ * Native code calling a guest function with a D in its signature is refused.
  *
  * On the stack the two ABIs differ again.  System V gives every stacked argument
  * an eightbyte.  Apple packs a stacked argument at its own size and alignment,

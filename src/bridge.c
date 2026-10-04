@@ -1525,6 +1525,69 @@ static int br_thread_get_state(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_answer(vm, cpu, 0);
 }
 
+static int br_cf_calendar(struct OcerzVM *vm, OcerzCPU *cpu, const char *name, const char *notation, char comp)
+{
+    static void *_Atomic fns[4];
+    static const char *const names[4] = { "CFCalendarComposeAbsoluteTime", "CFCalendarDecomposeAbsoluteTime",
+                                          "CFCalendarAddComponents", "CFCalendarGetComponentDifference" };
+    int which = 0;
+    while (which < 3 && strcmp(names[which], name) != 0)
+        which++;
+    void *fn = fns[which];
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_COREFOUNDATION, name);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", name);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        fns[which] = fn;
+    }
+    OcerzAbiSig named;
+    OcerzAbiCall call;
+    OcerzAbiVaList va;
+    if (ocerz_abi_parse(notation, &named) != OCERZ_OK || ocerz_abi_read_guest(&named, cpu, &call) != OCERZ_OK ||
+        call.nx < 1 || ocerz_abi_va_start(&named, cpu, &va) != OCERZ_OK)
+        return br_answer(vm, cpu, 0);
+    const char *desc = (const char *)(uintptr_t)call.x[call.nx - 1];
+    size_t n = desc ? strlen(desc) : 0;
+    uint64_t slots[32];
+    if (n > sizeof slots / sizeof slots[0]) {
+        fprintf(stderr, "ocerz: bridge: _%s was given %zu components, more than ocerz carries\n", name, n);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    for (size_t k = 0; k < n; k++) {
+        uint64_t w = 0;
+        ocerz_abi_va_arg(&va, cpu, comp, &w);
+        slots[k] = comp == 'p' ? (uint64_t)(uintptr_t)(w ? ocerz_g2h(w) : NULL) : (uint64_t)(int64_t)(int32_t)w;
+    }
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_BRIDGE_COREFOUNDATION, name, notation, fn);
+    ocerz_abi_call_native(fn, call.x, call.v, slots, 8 * (uint64_t)n, NULL, call.rx, call.rv);
+    ocerz_bridge_lower(&outer);
+    ocerz_abi_write_result(&named, cpu, &call);
+    return br_settle(vm, cpu);
+}
+
+static int br_cf_calendar_compose(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_cf_calendar(vm, cpu, "CFCalendarComposeAbsoluteTime", "B(ppp)", 'i');
+}
+
+static int br_cf_calendar_decompose(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_cf_calendar(vm, cpu, "CFCalendarDecomposeAbsoluteTime", "B(pdp)", 'p');
+}
+
+static int br_cf_calendar_add(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_cf_calendar(vm, cpu, "CFCalendarAddComponents", "B(ppLp)", 'i');
+}
+
+static int br_cf_calendar_difference(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_cf_calendar(vm, cpu, "CFCalendarGetComponentDifference", "B(pddLp)", 'p');
+}
+
 #define BR_SECURITY "/System/Library/Frameworks/Security.framework/Versions/A/Security"
 
 static void *br_security_symbol(const char *name)
@@ -1883,6 +1946,10 @@ static const BrHandler g_br_handlers[] = {
     { "thread_resume", br_thread_resume },
     { "cfuuid_constant", br_cfuuid_constant },
     { "ssl_get_supported_ciphers", br_ssl_get_supported_ciphers },
+    { "cf_calendar_compose", br_cf_calendar_compose },
+    { "cf_calendar_decompose", br_cf_calendar_decompose },
+    { "cf_calendar_add", br_cf_calendar_add },
+    { "cf_calendar_difference", br_cf_calendar_difference },
     { "ssl_get_enabled_ciphers", br_ssl_get_enabled_ciphers },
     { "ssl_set_enabled_ciphers", br_ssl_set_enabled_ciphers },
     { "ssl_get_negotiated_cipher", br_ssl_get_negotiated_cipher },
@@ -1961,6 +2028,17 @@ static const BrHandler g_br_handlers[] = {
     { "warnx", ocerz_fmt_warnx },
     { "vwarn", ocerz_fmt_vwarn },
     { "vwarnx", ocerz_fmt_vwarnx },
+    { "warnc", ocerz_fmt_warnc },
+    { "vwarnc", ocerz_fmt_vwarnc },
+    { "err", ocerz_fmt_err },
+    { "errx", ocerz_fmt_errx },
+    { "errc", ocerz_fmt_errc },
+    { "verr", ocerz_fmt_verr },
+    { "verrx", ocerz_fmt_verrx },
+    { "verrc", ocerz_fmt_verrc },
+    { "NSLogv", ocerz_fmt_NSLogv },
+    { "CFStringCreateWithFormatAndArguments", ocerz_fmt_CFStringCreateWithFormatAndArguments },
+    { "CFStringAppendFormatAndArguments", ocerz_fmt_CFStringAppendFormatAndArguments },
     { "sprintf_chk",               ocerz_fmt_sprintf_chk },
     { "snprintf_chk",              ocerz_fmt_snprintf_chk },
     { "vprintf",                   ocerz_fmt_vprintf },
@@ -2026,6 +2104,8 @@ static const BrHandler g_br_handlers[] = {
     { "pthread_key_delete",  ocerz_sys_pthread_key_delete },
     { "pthread_key_init_np", ocerz_sys_pthread_key_init_np },
     { "dispatch_main",       ocerz_sys_dispatch_main },
+    { "glob",                ocerz_sys_glob },
+    { "globfree",            ocerz_sys_globfree },
     { "pthread_setspecific", ocerz_sys_pthread_setspecific },
     { "pthread_getspecific", ocerz_sys_pthread_getspecific },
     { "pthread_create",      ocerz_sys_pthread_create },

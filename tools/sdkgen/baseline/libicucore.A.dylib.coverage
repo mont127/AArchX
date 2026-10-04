@@ -1,0 +1,20 @@
+library /usr/lib/libicucore.A.dylib
+sdk macos 27.0
+exports 8932
+fn 240
+data 714
+var 0
+special 0
+stub callback-pointer 2
+stub callback-struct 9
+stub no-declaration 7880
+omit no-declaration-missing 87
+host-missing 0
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0
