@@ -1080,8 +1080,9 @@ static int br_zone_forward(struct OcerzVM *vm, OcerzCPU *cpu, const char *export
         return br_answer(vm, cpu, 0);
     struct OcerzBridgeFrame outer;
     ocerz_bridge_raise(&outer, OCERZ_BRIDGE_LIBSYSTEM, export_name, sig, fn);
-    uint64_t r = ((uint64_t (*)(uint64_t, uint64_t, uint64_t))fn)(
-        view ? (uint64_t)(uintptr_t)view->native : zone, cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX]);
+    uint64_t r = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t))fn)(
+        view ? (uint64_t)(uintptr_t)view->native : zone, cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX],
+        cpu->gpr[OCERZ_RCX]);
     ocerz_bridge_lower(&outer);
     return br_answer(vm, cpu, r);
 }
@@ -1114,6 +1115,38 @@ static int br_malloc_zone_realloc(struct OcerzVM *vm, OcerzCPU *cpu)
 static int br_malloc_zone_memalign(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     return br_zone_forward(vm, cpu, "_malloc_zone_memalign", "p(pLL)", BR_ZONE_MEMALIGN);
+}
+
+/* The typed calls carry a malloc_type_id_t after the untyped arguments. A view passes it on to
+   the host's typed call; a guest zone gets its untyped slot, which ignores the extra register. */
+static int br_malloc_type_zone_malloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_malloc", "p(pLL)", BR_ZONE_MALLOC);
+}
+
+static int br_malloc_type_zone_calloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_calloc", "p(pLLL)", BR_ZONE_CALLOC);
+}
+
+static int br_malloc_type_zone_valloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_valloc", "p(pLL)", BR_ZONE_VALLOC);
+}
+
+static int br_malloc_type_zone_free(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_free", "v(ppL)", BR_ZONE_FREE);
+}
+
+static int br_malloc_type_zone_realloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_realloc", "p(ppLL)", BR_ZONE_REALLOC);
+}
+
+static int br_malloc_type_zone_memalign(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_memalign", "p(pLLL)", BR_ZONE_MEMALIGN);
 }
 
 static int br_malloc_zone_pressure_relief(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -1935,6 +1968,12 @@ static const BrHandler g_br_handlers[] = {
     { "malloc_zone_realloc", br_malloc_zone_realloc },
     { "malloc_zone_memalign", br_malloc_zone_memalign },
     { "malloc_zone_pressure_relief", br_malloc_zone_pressure_relief },
+    { "malloc_type_zone_malloc", br_malloc_type_zone_malloc },
+    { "malloc_type_zone_calloc", br_malloc_type_zone_calloc },
+    { "malloc_type_zone_valloc", br_malloc_type_zone_valloc },
+    { "malloc_type_zone_free", br_malloc_type_zone_free },
+    { "malloc_type_zone_realloc", br_malloc_type_zone_realloc },
+    { "malloc_type_zone_memalign", br_malloc_type_zone_memalign },
     { "malloc_destroy_zone", br_malloc_destroy_zone },
     { "malloc_create_zone", br_malloc_create_zone },
     { "malloc_zone_from_ptr", br_malloc_zone_from_ptr },
@@ -2067,6 +2106,19 @@ static const BrHandler g_br_handlers[] = {
     { "openat_nocancel", ocerz_sys_openat_nocancel },
     { "open_dprotected_np",   ocerz_sys_open_dprotected_np },
     { "openat_dprotected_np", ocerz_sys_openat_dprotected_np },
+    { "guarded_open_np", ocerz_sys_guarded_open_np },
+    { "feclearexcept", ocerz_sys_feclearexcept },
+    { "feraiseexcept", ocerz_sys_feraiseexcept },
+    { "fetestexcept", ocerz_sys_fetestexcept },
+    { "fegetexceptflag", ocerz_sys_fegetexceptflag },
+    { "fesetexceptflag", ocerz_sys_fesetexceptflag },
+    { "fegetround", ocerz_sys_fegetround },
+    { "fesetround", ocerz_sys_fesetround },
+    { "fegetenv", ocerz_sys_fegetenv },
+    { "fesetenv", ocerz_sys_fesetenv },
+    { "feholdexcept", ocerz_sys_feholdexcept },
+    { "feupdateenv", ocerz_sys_feupdateenv },
+    { "guarded_open_dprotected_np", ocerz_sys_guarded_open_dprotected_np },
     { "fcntl",           ocerz_sys_fcntl },
     { "fcntl_nocancel",  ocerz_sys_fcntl_nocancel },
     { "ioctl",           ocerz_sys_ioctl },

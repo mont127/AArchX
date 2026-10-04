@@ -2,7 +2,9 @@
 #include <CoreMedia/CoreMedia.h>
 #include <err.h>
 #include <errno.h>
+#include <fenv.h>
 #include <glob.h>
+#include <malloc/malloc.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -168,6 +170,129 @@ static void formats(void)
     CFRelease(m);
 }
 
+static __attribute__((noinline)) double divide(volatile double *a, volatile double *b)
+{
+    return *a / *b;
+}
+
+static void fenvs(void)
+{
+    volatile double one = 1.0, three = 3.0, zero = 0.0, big = 1e308;
+    int set = fesetround(FE_UPWARD);
+    double up = divide(&one, &three);
+    int got_up = fegetround() == FE_UPWARD;
+    fesetround(FE_DOWNWARD);
+    double down = divide(&one, &three);
+    fesetround(FE_TONEAREST);
+    feclearexcept(FE_ALL_EXCEPT);
+    volatile double r = one / three;
+    int inexact = fetestexcept(FE_INEXACT) != 0, divz = fetestexcept(FE_DIVBYZERO) != 0;
+    r = one / zero;
+    int divz2 = fetestexcept(FE_DIVBYZERO) != 0;
+    fexcept_t saved = 0;
+    fegetexceptflag(&saved, FE_DIVBYZERO);
+    feclearexcept(FE_ALL_EXCEPT);
+    int cleared = fetestexcept(FE_ALL_EXCEPT) == 0;
+    fesetexceptflag(&saved, FE_DIVBYZERO);
+    int restored = fetestexcept(FE_DIVBYZERO) != 0 && fetestexcept(FE_INEXACT) == 0;
+    feraiseexcept(FE_OVERFLOW);
+    int raised = fetestexcept(FE_OVERFLOW) != 0;
+    fenv_t env, held;
+    fesetround(FE_TOWARDZERO);
+    fegetenv(&env);
+    fesetenv(FE_DFL_ENV);
+    int dfl = fegetround() == FE_TONEAREST && fetestexcept(FE_ALL_EXCEPT) == 0;
+    fesetenv(&env);
+    int back = fegetround() == FE_TOWARDZERO && fetestexcept(FE_OVERFLOW) != 0;
+    feholdexcept(&held);
+    int quiet = fetestexcept(FE_ALL_EXCEPT) == 0;
+    r = big * big;
+    feupdateenv(&held);
+    int merged = fetestexcept(FE_OVERFLOW) != 0 && fetestexcept(FE_DIVBYZERO) != 0 && fegetround() == FE_TOWARDZERO;
+    fesetenv(FE_DFL_ENV);
+    printf("fenv %d%d %a %a %d%d%d %d%d %d %d%d%d%d%d%d\n", set, got_up, up, down, inexact, divz, divz2, cleared,
+           restored, raised, dfl, back, quiet, merged, fegetround() == FE_TONEAREST, r > 0);
+}
+
+static int guest_zone_calls;
+
+static void *gz_malloc(malloc_zone_t *z, size_t n)
+{
+    (void)z;
+    guest_zone_calls++;
+    return malloc(n);
+}
+
+static void *gz_calloc(malloc_zone_t *z, size_t a, size_t b)
+{
+    (void)z;
+    guest_zone_calls += 10;
+    return calloc(a, b);
+}
+
+static void gz_free(malloc_zone_t *z, void *p)
+{
+    (void)z;
+    guest_zone_calls += 100;
+    free(p);
+}
+
+static void *gz_realloc(malloc_zone_t *z, void *p, size_t n)
+{
+    (void)z;
+    guest_zone_calls += 1000;
+    return realloc(p, n);
+}
+
+static void *gz_memalign(malloc_zone_t *z, size_t align, size_t n)
+{
+    (void)z;
+    guest_zone_calls += 10000;
+    void *p = NULL;
+    return posix_memalign(&p, align, n) ? NULL : p;
+}
+
+static void zones(void)
+{
+    malloc_zone_t *def = malloc_default_zone();
+    char *a = malloc_type_zone_malloc(def, 40, 0x1234);
+    strcpy(a, "typed");
+    a = malloc_type_zone_realloc(def, a, 4000, 0x1234);
+    int *c = malloc_type_zone_calloc(def, 16, sizeof *c, 0x55);
+    int zero = 1;
+    for (int k = 0; k < 16; k++)
+        zero &= c[k] == 0;
+    void *m = malloc_type_zone_memalign(def, 256, 100, 0x77);
+    void *v = malloc_type_zone_valloc(def, 100, 0x77);
+    printf("zone default %s %d %d %d %d", a, zero, ((uintptr_t)m & 255) == 0, ((uintptr_t)v & 4095) == 0,
+           malloc_zone_from_ptr(a) != NULL);
+    malloc_type_zone_free(def, a, 0x1234);
+    malloc_type_zone_free(def, c, 0x55);
+    malloc_type_zone_free(def, m, 0x77);
+    malloc_type_zone_free(def, v, 0x77);
+    malloc_zone_t *z = malloc_create_zone(0, 0);
+    char *b = malloc_type_zone_malloc(z, 64, 0x99);
+    strcpy(b, "own");
+    printf(" created %s %d", b, malloc_zone_from_ptr(b) == z);
+    malloc_type_zone_free(z, b, 0x99);
+    malloc_destroy_zone(z);
+    malloc_zone_t g = { 0 };
+    g.malloc = gz_malloc;
+    g.calloc = gz_calloc;
+    g.free = gz_free;
+    g.realloc = gz_realloc;
+    g.memalign = gz_memalign;
+    g.version = 6;
+    char *p = malloc_type_zone_malloc(&g, 8, 1);
+    p = malloc_type_zone_realloc(&g, p, 80, 1);
+    void *q = malloc_type_zone_calloc(&g, 2, 8, 1);
+    void *r = malloc_type_zone_memalign(&g, 64, 64, 1);
+    malloc_type_zone_free(&g, p, 1);
+    malloc_type_zone_free(&g, q, 1);
+    malloc_type_zone_free(&g, r, 1);
+    printf(" guest %d\n", guest_zone_calls);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -177,5 +302,7 @@ int main(int argc, char **argv)
     calendars();
     times();
     formats();
+    zones();
+    fenvs();
     return 0;
 }

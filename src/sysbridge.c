@@ -3,8 +3,8 @@
  * variadic file and IPC calls, memory mapping, non-local jumps and processes.
  *
  * ---- variadic calls whose optional argument is fixed ----
- * open, openat, their $NOCANCEL forms, open_dprotected_np and
- * openat_dprotected_np, fcntl and fcntl$NOCANCEL, ioctl, sem_open, shm_open,
+ * open, openat, their $NOCANCEL forms, open_dprotected_np,
+ * openat_dprotected_np, guarded_open_np and guarded_open_dprotected_np, fcntl and fcntl$NOCANCEL, ioctl, sem_open, shm_open,
  * semctl and ulimit are declared with an ellipsis, but what follows the named
  * arguments is not a list: it is one argument, or two for sem_open, whose
  * presence and type the named arguments decide.  x86-64 passes it in the next
@@ -206,6 +206,26 @@
  * way an application's main thread does; the asynchronous main of a Swift
  * program ends there, and its exit comes from a job on that queue.  A call from
  * any other thread stops the process, as libdispatch's own check does.
+ *
+ * ---- the floating-point environment ----
+ * fenv.h's functions read and change the guest's x87 control and status words
+ * and its MXCSR, which live in OcerzCPU, and x86 numbers its exception flags
+ * and rounding modes differently from arm64, so none of them can be the host's
+ * call: a bridged fesetround(FE_DOWNWARD) asked the host for an arm64 mode that
+ * does not exist and failed, and the crossing put the host's mode back after it
+ * anyway.  The handlers do what x86 libm does, as running it under Rosetta
+ * shows: fegetround reads the x87 control word, fesetround sets both rounding
+ * fields and hands an unknown mode back as its nonzero answer, feraiseexcept
+ * sets inexact along with overflow or underflow the way the arithmetic it
+ * performs does, fegetenv fills all sixteen bytes of the x86 fenv_t, and
+ * feholdexcept masks every exception after saving.  The flags the guest's
+ * arithmetic raised are where the host's arithmetic raised them, in FPSR,
+ * since translated SSE and x87 instructions are arm64 floating-point ones, so
+ * the handlers read and clear those along with the flags in OcerzCPU, which
+ * ldmxcsr and the earlier handlers left there.  Arithmetic in a native call
+ * raises them too, as x86 libm's own arithmetic would.  An exception the guest
+ * unmasked does not trap.  _FE_DFL_ENV and _FE_DFL_DISABLE_SSE_DENORMS_ENV are
+ * var records holding the x86 defaults (src/vdylib.c).
  */
 #include "ocerz/sysbridge.h"
 #include "ocerz/abi.h"
@@ -241,6 +261,7 @@
 #include <ulimit.h>
 #include <unistd.h>
 #include <wchar.h>
+#include <arm_acle.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 
@@ -253,6 +274,9 @@ extern char **environ;
 int ocerz_host_open_nocancel(const char *path, int flags, ...) __asm__("_open$NOCANCEL");
 int ocerz_host_openat_nocancel(int fd, const char *path, int flags, ...) __asm__("_openat$NOCANCEL");
 int ocerz_host_fcntl_nocancel(int fd, int cmd, ...) __asm__("_fcntl$NOCANCEL");
+extern int guarded_open_np(const char *path, const uint64_t *guard, unsigned guardflags, int flags, ...);
+extern int guarded_open_dprotected_np(const char *path, const uint64_t *guard, unsigned guardflags, int flags,
+                                      int dpclass, int dpflags, ...);
 
 #define SB_LIB OCERZ_BRIDGE_LIBSYSTEM
 #define SB_ARGV_MAX 256
@@ -404,6 +428,178 @@ int ocerz_sys_openat_dprotected_np(struct OcerzVM *vm, OcerzCPU *cpu)
     int r = openat_dprotected_np(fd, path, flags, cls, dpflags, mode);
     ocerz_bridge_lower(&outer);
     return sb_ret(vm, cpu, r);
+}
+
+int ocerz_sys_guarded_open_np(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    const char *path = sb_ptr(sb_arg(cpu, 0));
+    const uint64_t *guard = sb_ptr(sb_arg(cpu, 1));
+    unsigned guardflags = (unsigned)sb_arg(cpu, 2);
+    int flags = (int)sb_arg(cpu, 3);
+    int mode = sb_open_mode(flags, sb_arg(cpu, 4));
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_guarded_open_np", "i(ppuii)", (const void *)guarded_open_np);
+    int r = guarded_open_np(path, guard, guardflags, flags, mode);
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+
+int ocerz_sys_guarded_open_dprotected_np(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    const char *path = sb_ptr(sb_arg(cpu, 0));
+    const uint64_t *guard = sb_ptr(sb_arg(cpu, 1));
+    unsigned guardflags = (unsigned)sb_arg(cpu, 2);
+    int flags = (int)sb_arg(cpu, 3);
+    int cls = (int)sb_arg(cpu, 4);
+    int dpflags = (int)sb_arg(cpu, 5);
+    int mode = sb_open_mode(flags, sb_arg(cpu, 6));
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_guarded_open_dprotected_np", "i(ppuiiii)",
+                       (const void *)guarded_open_dprotected_np);
+    int r = guarded_open_dprotected_np(path, guard, guardflags, flags, cls, dpflags, mode);
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+
+#define SB_FE_ALL 0x3fu
+#define SB_FE_INVALID 0x01u
+#define SB_FE_OVERFLOW 0x08u
+#define SB_FE_UNDERFLOW 0x10u
+#define SB_FE_INEXACT 0x20u
+#define SB_FE_ROUND 0xc00u
+#define SB_FE_MASKS 0x1f80u
+
+static const struct {
+    uint32_t x86;
+    uint64_t fpsr;
+} g_sb_fe_flags[] = {
+    { 0x01, 1u << 0 }, { 0x04, 1u << 1 }, { 0x08, 1u << 2 },
+    { 0x10, 1u << 3 }, { 0x20, 1u << 4 }, { 0x02, 1u << 7 },
+};
+
+static uint32_t sb_fe_raised(const OcerzCPU *cpu)
+{
+    uint64_t fpsr = __arm_rsr64("fpsr");
+    uint32_t f = (cpu->mxcsr | cpu->fsw) & SB_FE_ALL;
+    for (size_t k = 0; k < sizeof g_sb_fe_flags / sizeof g_sb_fe_flags[0]; k++)
+        if (fpsr & g_sb_fe_flags[k].fpsr)
+            f |= g_sb_fe_flags[k].x86;
+    return f;
+}
+
+static void sb_fe_clear(OcerzCPU *cpu, uint32_t e)
+{
+    uint64_t fpsr = __arm_rsr64("fpsr"), keep = fpsr;
+    e &= SB_FE_ALL;
+    for (size_t k = 0; k < sizeof g_sb_fe_flags / sizeof g_sb_fe_flags[0]; k++)
+        if (e & g_sb_fe_flags[k].x86)
+            keep &= ~g_sb_fe_flags[k].fpsr;
+    if (keep != fpsr)
+        __arm_wsr64("fpsr", keep);
+    cpu->mxcsr &= ~e;
+    cpu->fsw &= (uint16_t)~e;
+}
+
+static void sb_fe_raise(OcerzCPU *cpu, uint32_t e)
+{
+    e &= SB_FE_ALL;
+    if (e & (SB_FE_OVERFLOW | SB_FE_UNDERFLOW))
+        e |= SB_FE_INEXACT;
+    cpu->mxcsr |= e;
+}
+
+static void sb_fe_store(OcerzCPU *cpu, uint64_t env)
+{
+    ocerz_st(env, 2, cpu->fcw);
+    ocerz_st(env + 2, 2, (cpu->fsw & ~(7u << 11)) | (uint32_t)(cpu->ftop & 7) << 11);
+    ocerz_st(env + 4, 4, cpu->mxcsr | sb_fe_raised(cpu));
+    ocerz_st(env + 8, 8, 0);
+}
+
+static void sb_fe_load(OcerzCPU *cpu, uint64_t env)
+{
+    sb_fe_clear(cpu, SB_FE_ALL);
+    cpu->fcw = (uint16_t)ocerz_ld(env, 2);
+    cpu->fsw = (uint16_t)(ocerz_ld(env + 2, 2) & ~(7u << 11));
+    cpu->mxcsr = (uint32_t)ocerz_ld(env + 4, 4);
+    ocerz_apply_mxcsr_round(cpu->mxcsr);
+}
+
+int ocerz_sys_feclearexcept(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_fe_clear(cpu, (uint32_t)sb_arg(cpu, 0));
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_feraiseexcept(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_fe_raise(cpu, (uint32_t)sb_arg(cpu, 0));
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_fetestexcept(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_ret(vm, cpu, sb_fe_raised(cpu) & (uint32_t)sb_arg(cpu, 0));
+}
+
+int ocerz_sys_fegetexceptflag(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    ocerz_st(sb_arg(cpu, 0), 2, sb_fe_raised(cpu) & (uint32_t)sb_arg(cpu, 1));
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_fesetexceptflag(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t e = (uint32_t)sb_arg(cpu, 1) & SB_FE_ALL;
+    uint32_t want = (uint32_t)ocerz_ld(sb_arg(cpu, 0), 2) & e;
+    sb_fe_clear(cpu, e);
+    cpu->mxcsr |= want;
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_fegetround(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_ret(vm, cpu, cpu->fcw & SB_FE_ROUND);
+}
+
+int ocerz_sys_fesetround(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int mode = (int)sb_arg(cpu, 0);
+    if ((uint32_t)mode & ~SB_FE_ROUND)
+        return sb_ret(vm, cpu, mode);
+    cpu->fcw = (uint16_t)((cpu->fcw & ~SB_FE_ROUND) | (uint32_t)mode);
+    cpu->mxcsr = (cpu->mxcsr & ~(3u << 13)) | (uint32_t)mode << 3;
+    ocerz_apply_mxcsr_round(cpu->mxcsr);
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_fegetenv(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_fe_store(cpu, sb_arg(cpu, 0));
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_fesetenv(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_fe_load(cpu, sb_arg(cpu, 0));
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_feholdexcept(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_fe_store(cpu, sb_arg(cpu, 0));
+    sb_fe_clear(cpu, SB_FE_ALL);
+    cpu->fcw |= SB_FE_ALL;
+    cpu->mxcsr |= SB_FE_MASKS;
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_feupdateenv(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t raised = sb_fe_raised(cpu);
+    sb_fe_load(cpu, sb_arg(cpu, 0));
+    cpu->mxcsr |= raised;
+    return sb_ret(vm, cpu, 0);
 }
 
 static int sb_fcntl_takes_pointer(int cmd)

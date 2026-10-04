@@ -1,10 +1,12 @@
-library /usr/lib/libbz2.1.0.dylib
+library /usr/lib/libedit.3.dylib
 sdk macos 27.0
-exports 24
-fn 24
-data 0
+exports 150
+fn 99
+data 40
 var 0
 special 0
+stub callback-struct 5
+stub variadic 6
 host-missing 0
 objc-classes 0
 objc-eh-types 0
