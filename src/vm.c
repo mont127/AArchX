@@ -4147,10 +4147,15 @@ static void vm_fatal_where(const OcerzCPU *cpu)
 
 int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
 {
-    const char *tlo = getenv("OCERZ_TRACE_LO");
-    const char *thi = getenv("OCERZ_TRACE_HI");
-    uint64_t trace_lo = tlo ? strtoull(tlo, NULL, 0) : 0;
-    uint64_t trace_hi = thi ? strtoull(thi, NULL, 0) : 0;
+    static int trace_init;
+    static uint64_t trace_lo, trace_hi;
+    if (!__atomic_load_n(&trace_init, __ATOMIC_ACQUIRE)) {
+        const char *tlo = getenv("OCERZ_TRACE_LO");
+        const char *thi = getenv("OCERZ_TRACE_HI");
+        trace_lo = tlo ? strtoull(tlo, NULL, 0) : 0;
+        trace_hi = thi ? strtoull(thi, NULL, 0) : 0;
+        __atomic_store_n(&trace_init, 1, __ATOMIC_RELEASE);
+    }
     sigjmp_buf jb;
     OcerzCPU *prev_cpu = g_cur_cpu;
     sigjmp_buf *prev_recover = g_sig_recover;
