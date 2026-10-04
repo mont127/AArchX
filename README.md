@@ -173,6 +173,7 @@ The full list is in [Compatibility](docs/compatibility.md#known-limitations) and
 
 | Page | What it covers |
 | --- | --- |
+| [How AArchX works (PDF)](docs/AArchX-Deep-Dive.pdf) | a 231-page deep dive into every part of the translator, for contributors |
 | [Getting started](docs/getting-started.md) | requirements, building, running a first program |
 | [Modes](docs/modes.md) | cache mode and native mode, and which to pick |
 | [Native mode in depth](docs/native-mode.md) | how native mode crosses into the Mac's frameworks, and its limits |

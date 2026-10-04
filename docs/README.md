@@ -13,6 +13,7 @@ These pages describe what it does, how to run it, and how it works.
 | Page | What it covers |
 | --- | --- |
 | [Getting started](getting-started.md) | What you need, how to build it, how to run your first program |
+| [How AArchX works (PDF)](AArchX-Deep-Dive.pdf) | A 231-page deep dive into the whole translator, written for contributors: every subsystem, its data structures and the history behind each rule |
 | [Modes](modes.md) | Cache mode and native mode: what each binds against, what each needs, which to pick |
 | [Native mode in depth](native-mode.md) | How native mode crosses into the Mac's own frameworks, what it costs, and what it cannot run yet |
 | [Reference](reference.md) | Every command-line option and every environment variable that is meant to be used |
