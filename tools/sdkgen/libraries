@@ -275,3 +275,108 @@ pass QuickLookUI.h
 library Accessibility /System/Library/Frameworks/Accessibility.framework/Versions/A/Accessibility System/Library/Frameworks/Accessibility.framework/Accessibility.tbd
 language objective-c
 pass Accessibility.h
+
+library ImageIO /System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO System/Library/Frameworks/ImageIO.framework/ImageIO.tbd
+pass ImageIO.h
+
+library GSS /System/Library/Frameworks/GSS.framework/Versions/A/GSS System/Library/Frameworks/GSS.framework/GSS.tbd
+pass GSS.h
+
+library WebKit /System/Library/Frameworks/WebKit.framework/Versions/A/WebKit System/Library/Frameworks/WebKit.framework/WebKit.tbd
+language objective-c
+pass WebKit.h
+
+library Contacts /System/Library/Frameworks/Contacts.framework/Versions/A/Contacts System/Library/Frameworks/Contacts.framework/Contacts.tbd
+language objective-c
+pass Contacts.h
+
+library Accounts /System/Library/Frameworks/Accounts.framework/Versions/A/Accounts System/Library/Frameworks/Accounts.framework/Accounts.tbd
+language objective-c
+pass Accounts.h
+
+library CloudKit /System/Library/Frameworks/CloudKit.framework/Versions/A/CloudKit System/Library/Frameworks/CloudKit.framework/CloudKit.tbd
+language objective-c
+pass CloudKit.h
+
+library SecurityFoundation /System/Library/Frameworks/SecurityFoundation.framework/Versions/A/SecurityFoundation System/Library/Frameworks/SecurityFoundation.framework/SecurityFoundation.tbd
+language objective-c
+pass SecurityFoundation.h
+
+library CoreData /System/Library/Frameworks/CoreData.framework/Versions/A/CoreData System/Library/Frameworks/CoreData.framework/CoreData.tbd
+language objective-c
+pass CoreData.h
+
+library CoreSpotlight /System/Library/Frameworks/CoreSpotlight.framework/Versions/A/CoreSpotlight System/Library/Frameworks/CoreSpotlight.framework/CoreSpotlight.tbd
+language objective-c
+pass CoreSpotlight.h
+
+library ContactsUI /System/Library/Frameworks/ContactsUI.framework/Versions/A/ContactsUI System/Library/Frameworks/ContactsUI.framework/ContactsUI.tbd
+language objective-c
+pass ContactsUI.h
+
+library Intents /System/Library/Frameworks/Intents.framework/Versions/A/Intents System/Library/Frameworks/Intents.framework/Intents.tbd
+language objective-c
+pass Intents.h
+
+library MetalKit /System/Library/Frameworks/MetalKit.framework/Versions/A/MetalKit System/Library/Frameworks/MetalKit.framework/MetalKit.tbd
+language objective-c
+pass MetalKit.h
+
+library Photos /System/Library/Frameworks/Photos.framework/Versions/A/Photos System/Library/Frameworks/Photos.framework/Photos.tbd
+language objective-c
+pass Photos.h
+
+library AVKit /System/Library/Frameworks/AVKit.framework/Versions/A/AVKit System/Library/Frameworks/AVKit.framework/AVKit.tbd
+language objective-c
+pass AVKit.h
+
+library PDFKit /System/Library/Frameworks/PDFKit.framework/Versions/A/PDFKit System/Library/Frameworks/PDFKit.framework/PDFKit.tbd
+language objective-c
+pass PDFKit.h
+
+library MetalPerformanceShaders /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/MetalPerformanceShaders System/Library/Frameworks/MetalPerformanceShaders.framework/MetalPerformanceShaders.tbd
+language objective-c
+pass MetalPerformanceShaders.h
+
+library FileProvider /System/Library/Frameworks/FileProvider.framework/Versions/A/FileProvider System/Library/Frameworks/FileProvider.framework/FileProvider.tbd
+language objective-c
+pass FileProvider.h
+
+library libsqlite3 /usr/lib/libsqlite3.dylib usr/lib/libsqlite3.tbd
+pass libsqlite3.h
+
+library libxml2 /usr/lib/libxml2.2.dylib usr/lib/libxml2.2.tbd
+pass libxml2.h -iwithsysroot/usr/include/libxml2
+
+library libcompression /usr/lib/libcompression.dylib usr/lib/libcompression.tbd
+pass libcompression.h
+
+library libicucore /usr/lib/libicucore.A.dylib usr/lib/libicucore.A.tbd
+pass libicucore.h
+
+library liblzma /usr/lib/liblzma.5.dylib usr/lib/liblzma.tbd
+pass liblzma.h
+
+library libxcselect /usr/lib/libxcselect.dylib usr/lib/libxcselect.tbd
+pass libxcselect.h
+
+library libMobileGestalt /usr/lib/libMobileGestalt.dylib usr/lib/libMobileGestalt.tbd
+pass libMobileGestalt.h
+
+library libDiagnosticMessagesClient /usr/lib/libDiagnosticMessagesClient.dylib usr/lib/libDiagnosticMessagesClient.tbd
+pass libDiagnosticMessagesClient.h
+
+library AddressBook /System/Library/Frameworks/AddressBook.framework/Versions/A/AddressBook System/Library/Frameworks/AddressBook.framework/AddressBook.tbd
+language objective-c
+pass AddressBook.h
+
+library AudioUnit /System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit System/Library/Frameworks/AudioUnit.framework/AudioUnit.tbd
+pass AudioUnit.h
+
+library DiscRecording /System/Library/Frameworks/DiscRecording.framework/Versions/A/DiscRecording System/Library/Frameworks/DiscRecording.framework/DiscRecording.tbd
+language objective-c
+pass DiscRecording.h
+
+library SystemExtensions /System/Library/Frameworks/SystemExtensions.framework/Versions/A/SystemExtensions System/Library/Frameworks/SystemExtensions.framework/SystemExtensions.tbd
+language objective-c
+pass SystemExtensions.h

@@ -1610,6 +1610,15 @@ static uint64_t fn_dtime8(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, ui
     return t + a0 + a1 + a2 + a3 + a4 + a5 + a6;
 }
 
+static void test_long_double_parse(void)
+{
+    static const char *const kGood[] = { "D(D)", "D(pp)", "i(DD)", "v(pDiD)", "l(D)" };
+    for (size_t k = 0; k < sizeof kGood / sizeof kGood[0]; k++) {
+        OcerzAbiSig sig;
+        CHECK(ocerz_abi_parse(kGood[k], &sig) == OCERZ_OK, "ocerz_abi_parse(\"%s\") refused a long double", kGood[k]);
+    }
+}
+
 static void test_dispatch_time(void)
 {
     const uint64_t mono = 1ull << 63, wall = 1ull << 62;
@@ -1819,8 +1828,8 @@ static void test_register_lane(void)
 static const char *const kBadSigs[] = {
     "", "v", "L", "(", ")", "()", "(pp)", "ipp", "i(pp", "ipp)", "i(",
     "i)", "i(pp))", "i(pp)x", "i()x", "i((p))",
-    "z()", "x(i)", "n(i)", "V()", "I()", "U(i)", "P(p)", "F(f)", "D(d)",
-    "i(v)", "v(v)", "d(vd)", "d(dv)", "i(V)", "i(I)", "i(U)", "i(F)", "i(D)",
+    "z()", "x(i)", "n(i)", "V()", "I()", "U(i)", "P(p)", "F(f)",
+    "i(v)", "v(v)", "d(vd)", "d(dv)", "i(V)", "i(I)", "i(U)", "i(F)",
     "s()", "s(s)", "S(i)", "i(s)", "i(S)", "{}()",
     "i(t)", "i(0)", "i(p,p)", "i(p p)", " i(p)", "i (p)",
     "L(LLLLLLLLLLLLLLLLL)",
@@ -5142,6 +5151,7 @@ int main(void)
     test_narrow_native();
     test_accept_classes();
     test_dispatch_time();
+    test_long_double_parse();
     test_rounding();
     test_register_lane();
     test_reject_parse();

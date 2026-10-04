@@ -90,7 +90,13 @@
  * one.  At every level of nesting the offset of each field, and the size and
  * alignment of the structure, are computed the way the engine will and compared
  * with clang's, and any difference is struct-layout, which is what a packed
- * structure or an explicitly aligned field becomes.  The two architectures then
+ * structure or an explicitly aligned field becomes.  The one difference let
+ * through is a structure over sixteen bytes whose every offset and whose size
+ * are the natural ones and whose alignment alone is smaller, as CoreMedia's
+ * CMTime is under pack(4): System V passes it in memory in whole eightbytes and
+ * Apple's arm64 by a pointer to a copy, so neither reads its alignment, where a
+ * smaller structure Apple's arm64 may place on the stack at that alignment.  The
+ * two architectures then
  * have to agree as they do for any notation.  A structure that cannot be
  * written at all is refused under the first reason met while walking it:
  * union-value for a union, by value or as a member; struct-bitfield;
@@ -104,7 +110,9 @@
  * length.
  *
  * The other refusals, each a stub reason: variadic; long-double, which is 80
- * bits on one side and 64 on the other; va-list, spotted as a pointer to
+ * bits on one side and 64 on the other, for a long double inside a structure,
+ * a callback or a block, where no conversion can reach it (an argument or
+ * result of the function itself is D, which the bridge converts); va-list, spotted as a pointer to
  * x86_64's __va_list_tag; block-too-long; block-result; too-many-args past
  * sixteen; nested-callback; callback-too-long; callback-result for a function pointer handed back to the
  * guest, which would be arm64 code; callback-pointer for a pointer to a
@@ -696,6 +704,7 @@ typedef struct Flat {
     Buf *out;
     int members;
     int layout_bad;
+    int align_only;
 } Flat;
 
 static long long align_up(long long n, long long align)
@@ -737,7 +746,7 @@ static const char *flat_type(Flat *f, CXType t, int depth, int level, long long 
         if (n <= 0)
             return "struct-flexible-array";
         Buf one = { 0 };
-        Flat g = { &one, 0, 0 };
+        Flat g = { &one, 0, 0, 0 };
         long long esize = 0, ealign = 1;
         const char *r = flat_type(&g, clang_getArrayElementType(c), depth, level, &esize, &ealign);
         if (!r && (n > SIG_STRUCT_MEMBERS || f->members + g.members * n > SIG_STRUCT_MEMBERS))
@@ -747,6 +756,7 @@ static const char *flat_type(Flat *f, CXType t, int depth, int level, long long 
                 buf_add(f->out, buf_str(&one));
             f->members += (int)(g.members * n);
             f->layout_bad |= g.layout_bad;
+            f->align_only |= g.align_only;
             *size = esize * n;
             *align = ealign;
         }
@@ -759,6 +769,8 @@ static const char *flat_type(Flat *f, CXType t, int depth, int level, long long 
         return "struct-callback";
     if (c.kind == TK.BlockPointer)
         return "block";
+    if (c.kind == TK.LongDouble)
+        return "long-double";
     Buf one = { 0 };
     const char *r = type_class(t, depth, 0, &one);
     if (!r) {
@@ -814,8 +826,10 @@ static const char *flat_record(Flat *f, CXType rec, int depth, int level, long l
     buf_addc(f->out, '}');
     *size = align_up(off, al);
     *align = al;
-    if (*size != real_size || *align != real_align)
+    if (*size != real_size)
         f->layout_bad = 1;
+    else if (*align != real_align)
+        f->align_only = 1;
     return NULL;
 }
 
@@ -861,8 +875,12 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
         buf_addc(out, 'd');
         return NULL;
     }
-    if (k == TK.LongDouble)
-        return "long-double";
+    if (k == TK.LongDouble) {
+        if (depth > 0)
+            return "long-double";
+        buf_addc(out, 'D');
+        return NULL;
+    }
     if (k == TK.Half || k == TK.Float16 || k == TK.Float128)
         return "float-width";
     if (k == TK.Enum) {
@@ -924,10 +942,10 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
         if (!is_result && transparent_union(c))
             return type_class(first_field_type(c), depth, is_result, out);
         Buf sb = { 0 };
-        Flat f = { &sb, 0, 0 };
+        Flat f = { &sb, 0, 0, 0 };
         long long size = 0, align = 1;
         const char *r = flat_record(&f, c, depth, 1, &size, &align);
-        if (!r && f.layout_bad)
+        if (!r && (f.layout_bad || (f.align_only && size <= 16)))
             r = "struct-layout";
         if (!r)
             buf_add(out, buf_str(&sb));
@@ -1066,7 +1084,7 @@ static int sig_class_valid(const char **sp, int allow_cb, int is_result)
         *sp = close + 1;
         return 1;
     }
-    if (!*s || !strchr(is_result ? "vbBhHiulLTpfd" : "bBhHiulLTpfd", *s))
+    if (!*s || !strchr(is_result ? "vbBhHiulLTpfdD" : "bBhHiulLTpfdD", *s))
         return 0;
     *sp = s + 1;
     return 1;

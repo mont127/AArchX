@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO
+sdk macos 27.0
+exports 12861
+fn 58
+data 6106
+var 0
+special 0
+stub no-declaration 137
+omit no-declaration-missing 6560
+host-missing 2
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 4
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

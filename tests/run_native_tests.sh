@@ -53,10 +53,11 @@
 #
 # Keeping 71 and 72 alive still matters, and both now need their own fixture.
 # 71 means nothing bound, so the loader never handed control to the guest at
-# all; native_unbound pins it with a two-line program calling sqlite3_libversion
-# from libsqlite3, a library native mode synthesizes no image for. It used to
+# all; native_unbound pins it with a two-line program calling pcap_lib_version
+# from libpcap, a library native mode synthesizes no image for. It used to call
 # getpwnam, until the generated libSystem database exported every function the
-# real libSystem does and getpwnam bound. 72 means
+# real libSystem does and getpwnam bound, and then sqlite3_libversion, until
+# libsqlite3 got a database of its own. 72 means
 # everything bound and the guest ran, and what is missing is the bridge behind
 # one export rather than the export itself; xbench_dyn no longer reaches it, so
 # bridge_unimpl pins it with a program whose only import is asl_log, which the
@@ -1207,8 +1208,9 @@
 # dl_refusals is native mode's own: every dlopen it makes must fail, and fail
 # with a message that says why, the image count unchanged afterwards and a
 # second dlerror answering nothing. An arm64-only dylib on disk, a library the
-# host's shared cache has but no API database describes, reached by path and by
-# the bare name libsqlite3.dylib, a guest dylib whose dependency has been deleted,
+# host's shared cache has but no API database describes, libpcap, reached by
+# path and by the bare name libpcap.A.dylib, a guest dylib whose dependency has
+# been deleted,
 # and one whose dependency no longer exports a symbol it imports, twice, with
 # the same message both times, which is what a load that was not rolled back
 # would change. After them a plain guest dylib still loads, libc.dylib answers
@@ -10274,8 +10276,8 @@ int main(void)
         *slash = 0;
 
     CK(refused("arm64", path_of("libdlarm.dylib", path, sizeof path), 0, 0));
-    CK(refused("hostlib", "/usr/lib/libsqlite3.dylib", 0, 0));
-    CK(refused("bare", "libsqlite3.dylib", 0, 0));
+    CK(refused("hostlib", "/usr/lib/libpcap.A.dylib", 0, 0));
+    CK(refused("bare", "libpcap.A.dylib", 0, 0));
     CK(refused("missingdep", path_of("libdlneedsgone.dylib", path, sizeof path), first, sizeof first));
     CK(refused("missingsym", path_of("libdlneedsym.dylib", path, sizeof path), second, sizeof second));
     CK(refused("missingsym", path_of("libdlneedsym.dylib", path, sizeof path), first, sizeof first) &&
@@ -10296,7 +10298,7 @@ int main(void)
     CK(cf != 0 && dlsym(cf, "CFStringGetLength") != 0 && _dyld_image_count() == before + 1);
     CK(cf != 0 && strcmp(_dyld_get_image_name(before),
                          "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation") == 0);
-    CK(dlopen_preflight("/usr/lib/libSystem.B.dylib") && !dlopen_preflight("/usr/lib/libsqlite3.dylib"));
+    CK(dlopen_preflight("/usr/lib/libSystem.B.dylib") && !dlopen_preflight("/usr/lib/libpcap.A.dylib"));
     text("preflight", dlerror());
 
     cb_begin(TAG, m);
@@ -14274,8 +14276,8 @@ case_dl_refusals() {
     elif [ -z "$reason" ]; then
         reason="$(dl_refusal_reason "$jo" \
             arm64 "$DL_REFUSED" arm64 "has no x86_64 slice" \
-            hostlib "$DL_REFUSED" hostlib "'/usr/lib/libsqlite3.dylib' is in the host's shared cache" \
-            bare "$DL_REFUSED" bare "'/usr/lib/libsqlite3.dylib'" \
+            hostlib "$DL_REFUSED" hostlib "'/usr/lib/libpcap.A.dylib' is in the host's shared cache" \
+            bare "$DL_REFUSED" bare "'/usr/lib/libpcap.A.dylib'" \
             missingdep "Library not loaded: @rpath/libdlgone.dylib" missingdep "Referenced from: $dir/libdlneedsgone.dylib" \
             missingsym "Symbol not found: _dl_vanishing" missingsym "Referenced from: $dir/libdlneedsym.dylib" \
             missingsym "Expected in: @rpath/libdlweak.dylib" \
@@ -14557,18 +14559,18 @@ case_native_unbound() {
     local name=native_unbound rc reason="" src="$TMP/unbound.c" bin="$TMP/unbound"
     local out="$TMP/native_unbound.out" err="$TMP/native_unbound.err"
     cat > "$src" <<'EOC'
-#include <sqlite3.h>
-int main(void) { return sqlite3_libversion()[0] == 0; }
+#include <pcap.h>
+int main(void) { return pcap_lib_version()[0] == 0; }
 EOC
-    if ! clang -arch x86_64 -fno-stack-protector -o "$bin" "$src" -lsqlite3 >/dev/null 2>&1; then
+    if ! clang -arch x86_64 -fno-stack-protector -o "$bin" "$src" -lpcap >/dev/null 2>&1; then
         echo "SKIP $name (no x86_64 clang toolchain)"; return
     fi
     run_bounded "$out" "$err" "$OCERZ" -v -native "$bin"
     rc=$?
     if [ "$rc" -ne 71 ]; then
         reason="exit $rc, want 71"
-    elif ! grep -Fq "${NOBIND}_sqlite3_libversion" "$out" "$err"; then
-        reason="no 'no bridge for _sqlite3_libversion' line"
+    elif ! grep -Fq "${NOBIND}_pcap_lib_version" "$out" "$err"; then
+        reason="no 'no bridge for _pcap_lib_version' line"
     elif ! grep -Fq "$M0_SUMMARY" "$out" "$err"; then
         reason="no unresolved-import summary line"
     fi
@@ -15235,7 +15237,7 @@ case_dl_basic \
     callbacks "bit 0 is the add-image callback not called once per image already loaded when it was registered, 1 not called for the main executable, 2 nor for the dlopened dylib, 3 nor for the bundle, 4 called other than once per image in the list, 5 an image in the list the callback never saw" \
     version "bit 0 is dyld_get_active_platform not macOS, 1 dyld_get_program_min_os_version not the 12.0 the fixture was linked for, 2 dyld_get_program_sdk_version below it, 3 dyld_program_sdk_at_least wrong for 10.14 or 127.0, 4 _dyld_shared_cache_contains_path not true for libSystem, 5 true for the fixture's own dylib, 6 _dyld_is_memory_immutable true for heap memory"
 case_dl_refusals \
-    "bit 0 is the arm64-only dylib, 1 sqlite3 by path, 2 sqlite3 by bare name, 3 the dylib with a deleted dependency and 4 the dylib missing a symbol not refused with an error and the image count unchanged, 5 the second attempt at the last not failing with the same message, 6 a plain dylib not loading after those failures, 7 libc.dylib not answering libSystem with the program's own strlen, 8 RTLD_NOLOAD of libSystem not the same handle, 9 CoreFoundation loaded before anything asked, 10 CoreFoundation through its framework symlink not loading as one more image, 11 that image not named for its Versions/A install name, 12 dlopen_preflight wrong for libSystem or sqlite3"
+    "bit 0 is the arm64-only dylib, 1 libpcap by path, 2 libpcap by bare name, 3 the dylib with a deleted dependency and 4 the dylib missing a symbol not refused with an error and the image count unchanged, 5 the second attempt at the last not failing with the same message, 6 a plain dylib not loading after those failures, 7 libc.dylib not answering libSystem with the program's own strlen, 8 RTLD_NOLOAD of libSystem not the same handle, 9 CoreFoundation loaded before anything asked, 10 CoreFoundation through its framework symlink not loading as one more image, 11 that image not named for its Versions/A install name, 12 dlopen_preflight wrong for libSystem or libpcap"
 case_env_native
 case_flag_beats_env
 case_last_flag_native

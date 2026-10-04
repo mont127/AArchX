@@ -270,6 +270,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <mach/mach_time.h>
+#include <math.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
@@ -298,17 +299,30 @@ static int abi_is_scalar_class(char c)
 
 static int abi_is_arg_class(char c)
 {
-    return c == 'c' || c == 'k' || c == '{' || abi_is_scalar_class(c);
+    return c == 'c' || c == 'k' || c == '{' || c == 'D' || abi_is_scalar_class(c);
 }
 
 static int abi_is_ret_class(char c)
 {
-    return c == 'v' || c == 'k' || c == '{' || abi_is_scalar_class(c);
+    return c == 'v' || c == 'k' || c == '{' || c == 'D' || abi_is_scalar_class(c);
 }
 
 static int abi_is_fp(char c)
 {
-    return c == 'f' || c == 'd';
+    return c == 'f' || c == 'd' || c == 'D';
+}
+
+static double abi_f80_to_double(uint64_t mant, uint16_t se)
+{
+    int sign = (se >> 15) & 1, exp = se & 0x7fff;
+    double v;
+    if (exp == 0 && mant == 0)
+        v = 0.0;
+    else if (exp == 0x7fff)
+        v = (mant << 1) == 0 ? INFINITY : NAN;
+    else
+        v = ldexp((double)mant / 9223372036854775808.0, exp - 16383);
+    return sign ? -v : v;
 }
 
 static int abi_class_size(char c)
@@ -973,7 +987,15 @@ static int abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiC
             continue;
         }
 
-        raw = abi_guest_next(cpu, fp, &guest_int, &guest_fp, &guest_slot);
+        if (c == 'D') {
+            guest_slot += guest_slot & 1;
+            uint64_t at = cpu->gpr[OCERZ_RSP] + 8 + 8 * (uint64_t)guest_slot;
+            double d = abi_f80_to_double(ocerz_ld(at, 8), (uint16_t)ocerz_ld(at + 8, 2));
+            guest_slot += 2;
+            memcpy(&raw, &d, sizeof raw);
+        } else {
+            raw = abi_guest_next(cpu, fp, &guest_int, &guest_fp, &guest_slot);
+        }
 
         uint64_t val;
         if (c == 'p') {
@@ -1161,6 +1183,18 @@ void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, const OcerzAb
 {
     if (!sig || !cpu || !call)
         return;
+
+    if (sig->ret == 'D') {
+        double d;
+        memcpy(&d, &call->rv[0], sizeof d);
+        cpu->ftop = (cpu->ftop - 1) & 7;
+        cpu->fpr[cpu->ftop] = d;
+        cpu->ftw = 0xff;
+        uint64_t rsp = cpu->gpr[OCERZ_RSP];
+        cpu->rip = ocerz_ld(rsp, 8);
+        cpu->gpr[OCERZ_RSP] = rsp + 8;
+        return;
+    }
 
     if (sig->ret == 'k') {
         uint64_t g = 0;
@@ -1614,6 +1648,13 @@ static void abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64
     const AbiCallback *e = &g_abi_cb[slot];
     const OcerzAbiSig *sig = &e->shape->sig;
     const char *notation = e->shape->notation;
+
+    if (strchr(notation, 'D')) {
+        fprintf(stderr, "ocerz: abi: native code called guest function %#llx (callback slot %u, %s), and a long"
+                        " double does not cross in that direction\n",
+                (unsigned long long)e->guest_fn, slot, notation);
+        return;
+    }
 
     if (sig->ret == '{' && abi_host_indirect(&sig->ret_struct) && !x8) {
         fprintf(stderr,

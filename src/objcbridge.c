@@ -173,8 +173,10 @@
  *
  * ---- formatted output ----
  * printf, fprintf, sprintf, snprintf, asprintf, dprintf, __sprintf_chk,
- * __snprintf_chk, NSLog, CFStringCreateWithFormat and CFStringAppendFormat are
- * veneers over their v forms, which every one of them has.  The named arguments
+ * __snprintf_chk, warn, err and their kin, NSLog, CFStringCreateWithFormat and
+ * CFStringAppendFormat are veneers over their v forms, which every one of them
+ * has, and the v forms themselves, NSLogv and the CoreFoundation ...AndArguments
+ * calls included, take the guest's va_list the same way.  The named arguments
  * cross as an ordinary signature; the format string, read straight from guest
  * memory for C and natively for a CFString or NSString, says what follows; the
  * variadic arguments are gathered into eight-byte slots; and the address of the
@@ -2089,6 +2091,18 @@ static ObVeneer g_ob_warn = {
 static ObVeneer g_ob_warnx = {
     "_warnx", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vwarnx"), "v(p)", "v(pp)", 0, OCERZ_OBJC_FMT_C,
 };
+static ObVeneer g_ob_warnc = {
+    "_warnc", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vwarnc"), "v(ip)", "v(ipp)", 1, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_err = {
+    "_err", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "verr"), "v(ip)", "v(ipp)", 1, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_errx = {
+    "_errx", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "verrx"), "v(ip)", "v(ipp)", 1, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_errc = {
+    "_errc", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "verrc"), "v(iip)", "v(iipp)", 2, OCERZ_OBJC_FMT_C,
+};
 static ObVeneer g_ob_swprintf = {
     "_swprintf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vswprintf"), "i(pLp)", "i(pLpp)", 2, OCERZ_OBJC_FMT_WIDE,
 };
@@ -2350,6 +2364,10 @@ int ocerz_fmt_dprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, 
 int ocerz_fmt_syslog(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_syslog); }
 int ocerz_fmt_warn(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_warn); }
 int ocerz_fmt_warnx(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_warnx); }
+int ocerz_fmt_warnc(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_warnc); }
+int ocerz_fmt_err(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_err); }
+int ocerz_fmt_errx(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_errx); }
+int ocerz_fmt_errc(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_errc); }
 int ocerz_fmt_swprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_swprintf); }
 int ocerz_fmt_wprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_wprintf); }
 int ocerz_fmt_fwprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_fwprintf); }
@@ -2371,6 +2389,11 @@ int ocerz_fmt_vdprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(
 int ocerz_fmt_vsyslog(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_syslog, "_vsyslog"); }
 int ocerz_fmt_vwarn(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_warn, "_vwarn"); }
 int ocerz_fmt_vwarnx(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_warnx, "_vwarnx"); }
+int ocerz_fmt_vwarnc(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_warnc, "_vwarnc"); }
+int ocerz_fmt_verr(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_err, "_verr"); }
+int ocerz_fmt_verrx(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_errx, "_verrx"); }
+int ocerz_fmt_verrc(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_errc, "_verrc"); }
+int ocerz_fmt_NSLogv(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_NSLog, "_NSLogv"); }
 int ocerz_fmt_vsprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_sprintf_chk, "___vsprintf_chk"); }
 int ocerz_fmt_vsnprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_snprintf_chk, "___vsnprintf_chk"); }
 int ocerz_fmt_sscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_veneer(vm, cpu, &g_ob_sscanf, "_sscanf"); }
@@ -2390,6 +2413,16 @@ int ocerz_fmt_CFStringCreateWithFormat(struct OcerzVM *vm, OcerzCPU *cpu)
 int ocerz_fmt_CFStringAppendFormat(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     return ob_veneer(vm, cpu, &g_ob_CFStringAppendFormat);
+}
+
+int ocerz_fmt_CFStringCreateWithFormatAndArguments(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_va_veneer(vm, cpu, &g_ob_CFStringCreateWithFormat, "_CFStringCreateWithFormatAndArguments");
+}
+
+int ocerz_fmt_CFStringAppendFormatAndArguments(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_va_veneer(vm, cpu, &g_ob_CFStringAppendFormat, "_CFStringAppendFormatAndArguments");
 }
 
 static void *_Atomic g_ob_native_prev;
