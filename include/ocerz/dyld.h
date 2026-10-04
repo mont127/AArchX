@@ -75,6 +75,7 @@ uint64_t ocerz_dyld_native_dlopen(struct OcerzVM *vm, const char *path, int mode
                                   uint64_t stack_top);
 int ocerz_dyld_native_dlopen_preflight(const char *path, uint64_t caller);
 uint64_t ocerz_dyld_native_dlsym(uint64_t handle, const char *name, uint64_t caller);
+uint64_t ocerz_dyld_native_image_export(const char *install_name, const char *usym);
 int ocerz_dyld_native_dladdr(uint64_t addr, uint64_t info);
 int ocerz_dyld_native_dlclose(uint64_t handle);
 uint64_t ocerz_dyld_native_dlerror(void);
@@ -85,6 +86,7 @@ int ocerz_dyld_image_containing(uint64_t addr, uint64_t *mh, uint64_t *name);
 int ocerz_dyld_unwind_sections(uint64_t addr, uint64_t sections);
 int ocerz_dyld_image_slide(uint64_t mh, uint64_t *slide);
 int ocerz_dyld_native_add_image_func(struct OcerzVM *vm, uint64_t func, uint64_t stack_top);
+int ocerz_dyld_native_objc_load_func(struct OcerzVM *vm, uint64_t func, uint64_t stack_top);
 int ocerz_dyld_native_remove_image_func(uint64_t func);
 int ocerz_dyld_is_memory_immutable(uint64_t addr, uint64_t len);
 int ocerz_dyld_native_names_library(const char *path);

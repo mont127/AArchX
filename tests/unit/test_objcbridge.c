@@ -69,13 +69,13 @@
  * answering its extended type from the guest's own string, and the references
  * rewritten to them, a second definition of the image must define nothing, and
  * the +load methods must run superclass first, then the class the non-lazy list
- * names, then the category, each with its class in rdi.  A root class and a
- * class with a null superclass are left out instead, verified by a forked
- * child that must find no class under either name.  Each remaining class refusal
- * runs in a forked child that must exit 72 naming it: a superclass that is a
- * guest class never defined, a Swift class, a loop, a
- * category on an undefined guest class, a long double method called natively,
- * and a method defined after the bank was filled, called natively.
+ * names, then the category, each with its class in rdi.  A root class is
+ * defined too, since the Swift runtime's own root is one, and a class with a
+ * null superclass is left out, each checked by a forked child that looks the
+ * name up.  Each class refusal runs in a forked child that must exit 72 naming
+ * it: a superclass that is a guest class never defined, a loop, a category on
+ * an undefined guest class, a long double method called natively, and a method
+ * defined after the bank was filled, called natively.
  *
  * The database is a directory the test writes for itself, one file per library
  * naming nothing but the library, because the bridge opens a host library only
@@ -1686,7 +1686,7 @@ static void test_class_layouts(void)
     Syn s;
     syn_init(&s);
 
-    uint64_t ro = syn_alloc(&s, 72);
+    uint64_t ro = syn_alloc(&s, 80);
     for (int i = 0; i < 72; i++)
         syn_w(ro + (uint64_t)i, 1, (uint64_t)(0x10 + i));
     OcerzObjcRo r;
@@ -1698,8 +1698,9 @@ static void test_class_layouts(void)
               r.base_properties == 0x5756555453525150ull,
           "class_ro_t is read field by field at its LP64 offsets");
     syn_w(ro, 4, 0x40);
-    CHECK(ocerz_objc_read_ro(ro, &r) == OCERZ_OBJC_SWIFT,
-          "a class_ro_t with a Swift metadata initializer is a Swift class");
+    syn_w(ro + 72, 8, 0x5f5e5d5c5b5a5958ull);
+    CHECK(ocerz_objc_read_ro(ro, &r) == OCERZ_OBJC_OK && r.swift_initializer == 0x5f5e5d5c5b5a5958ull,
+          "a class_ro_t with a Swift metadata initializer has the initializer after its 72 bytes");
     CHECK(ocerz_objc_read_ro(0, &r) == OCERZ_OBJC_NULL, "a null class_ro_t");
 
     uint64_t cl = syn_alloc(&s, 40);
@@ -1713,9 +1714,11 @@ static void test_class_layouts(void)
               c.cache == 0x3333 && c.vtable == 0x4444 && c.ro == ro && c.swift == 0,
           "class_t is isa, superclass, cache, vtable and bits");
     syn_w(cl + 32, 8, ro | 1);
-    CHECK(ocerz_objc_read_class(cl, &c) == OCERZ_OBJC_SWIFT && c.ro == ro, "bits with the legacy Swift bit");
+    CHECK(ocerz_objc_read_class(cl, &c) == OCERZ_OBJC_OK && c.ro == ro && c.swift == 1,
+          "bits with the legacy Swift bit");
     syn_w(cl + 32, 8, ro | 2);
-    CHECK(ocerz_objc_read_class(cl, &c) == OCERZ_OBJC_SWIFT && c.swift == 2, "bits with the stable Swift bit");
+    CHECK(ocerz_objc_read_class(cl, &c) == OCERZ_OBJC_OK && c.ro == ro && c.swift == 2,
+          "bits with the stable Swift bit");
     syn_w(cl + 32, 8, 0);
     CHECK(ocerz_objc_read_class(cl, &c) == OCERZ_OBJC_NULL, "a class with no class_ro_t");
 
@@ -2213,15 +2216,6 @@ static void cr_null_super(Syn *s)
     syn_section(s, "__objc_classlist", list, 1);
 }
 
-static void cr_swift(Syn *s)
-{
-    void *nsobject = cls("NSObject");
-    SynClass c = { "OcerzM11Swift", ocerz_h2g(nsobject), ocerz_h2g(object_getClass_(nsobject)), 0x80, 8, 8,
-                   0, 0, 0, 0, 0, 2 };
-    uint64_t list[1] = { syn_class(s, &c, NULL) };
-    syn_section(s, "__objc_classlist", list, 1);
-}
-
 static void cr_cycle(Syn *s)
 {
     SynClass a = { "OcerzM11CycleA", 0, 0, 0x80, 8, 8, 0, 0, 0, 0, 0, 0 };
@@ -2269,7 +2263,6 @@ static void cr_full_bank(Syn *s)
 static const ClassRefusal kClassRefusals[] = {
     { "a superclass ocerz never defined", cr_unknown_super,
       "guest class OcerzM11Orphan has the superclass OcerzM11NotListed at" },
-    { "a Swift class", cr_swift, "is a Swift class, and Swift classes do not cross" },
     { "a superclass cycle", cr_cycle, "is its own superclass, through a chain of superclasses" },
     { "a category on an undefined guest class", cr_category,
       "guest category Stray is on the class OcerzM11NotDefined at" },
@@ -2326,21 +2319,22 @@ static void test_class_refusals(void)
     }
 }
 
-typedef struct ClassLeftOut {
+typedef struct ClassFate {
     const char *what;
     void (*build)(Syn *s);
     const char *name;
-} ClassLeftOut;
+    int defined;
+} ClassFate;
 
-static const ClassLeftOut kClassLeftOut[] = {
-    { "a guest root class", cr_root, "OcerzM11Root" },
-    { "a null superclass", cr_null_super, "OcerzM11WeakSuper" },
+static const ClassFate kClassFates[] = {
+    { "a guest root class", cr_root, "OcerzM11Root", 1 },
+    { "a null superclass", cr_null_super, "OcerzM11WeakSuper", 0 },
 };
 
-static void test_class_left_out(void)
+static void test_class_fates(void)
 {
-    for (size_t i = 0; i < sizeof kClassLeftOut / sizeof kClassLeftOut[0]; i++) {
-        const ClassLeftOut *r = &kClassLeftOut[i];
+    for (size_t i = 0; i < sizeof kClassFates / sizeof kClassFates[0]; i++) {
+        const ClassFate *r = &kClassFates[i];
         int fds[2];
         if (pipe(fds) != 0) {
             CHECK(0, "%s: pipe ran", r->what);
@@ -2357,7 +2351,7 @@ static void test_class_left_out(void)
             syn_init(&s);
             r->build(&s);
             ocerz_objcbridge_define_image(syn_header(&s, "__DATA"), 0);
-            _exit(cls(r->name) == NULL ? 0 : 1);
+            _exit((cls(r->name) != NULL) == r->defined ? 0 : 1);
         }
         close(fds[1]);
         char err[4096];
@@ -2443,7 +2437,7 @@ int main(void)
     test_class_order();
     test_define_image();
     test_class_refusals();
-    test_class_left_out();
+    test_class_fates();
     test_encoding_sweep();
 
     ((void (*)(void *))need(objc, "objc_autoreleasePoolPop"))(pool);

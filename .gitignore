@@ -11,5 +11,6 @@ MacNdCheese-WineEngine-PRIVATE/
 /ocerz
 tests/__pycache__/
 tools/cxx/build/
+tools/swift/build/
 runtime/guest/
 runtime/apis/

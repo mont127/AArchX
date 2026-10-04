@@ -81,20 +81,80 @@
  * a lock.
  *
  * ---- what is refused ----
- * A class is refused by name, and the process stopped, when it is a Swift class,
- * marked in the low bits of its data word or by a Swift metadata initializer;
- * when its class_ro_t already carries the flags only a running runtime sets;
- * when its metaclass is not a guest class marked as one; and when its
- * superclass is a guest class ocerz has not defined, including one in a chain
- * of superclasses that comes back to itself. A root class, and a class whose
- * superclass is null without its class_ro_t saying it is a root, which is what
- * a weak-linked superclass the host lacks leaves, are left out with a log line
- * the way the native runtime leaves them unrealized.  Within an image the class
+ * A class is refused by name, and the process stopped, when its class_ro_t
+ * already carries the flags only a running runtime sets; when its metaclass is
+ * not a guest class marked as one; and when its superclass is a guest class
+ * ocerz has not defined, including one in a chain of superclasses that comes
+ * back to itself.  A class whose superclass is null without its class_ro_t
+ * saying it is a root, which is what a weak-linked superclass the host lacks
+ * leaves, is left out with a log line the way the native runtime leaves it
+ * unrealized.  A root class is defined: the Swift runtime's own root,
+ * Swift._SwiftObject, is one, and every Swift class descends from it.  Within an image the class
  * list is put in superclass order first: the classes are sorted by address and
  * each chain is walked to the first superclass outside the list, so a subclass
  * listed before its superclass waits for it.  A superclass in another guest
  * image is already defined, since the loader defines a dylib as it loads it and
  * loads dependencies first.
+ *
+ * ---- Swift classes ----
+ * A Swift class is an Objective-C class with Swift metadata around it.  The
+ * low bits of its data word say so, 2 for the stable ABI, and Swift's own
+ * fields follow the class_t, among them its flags, instance size, type
+ * descriptor and vtable.  The word just before the class_t is its value
+ * witness table and the one before that its destroy function.  The guest's x86
+ * libswiftCore reads and writes all of it (src/objcbridge.c says where that
+ * library comes from), and the native runtime needs only the Objective-C part.
+ * So a Swift class is defined like any other, and the data word that points at
+ * the copy keeps the Swift bits, which the guest's runtime tests to tell a
+ * Swift class from a pure Objective-C one and the native runtime to know it
+ * has one.  Three things differ.
+ *
+ * A class whose class_ro_t has a Swift metadata initializer, flag 0x40, is
+ * incomplete on disk.  The guest's runtime completes it on first use and then
+ * registers it through _objc_realizeClassFromSwift, so it waits instead of
+ * being defined at image load, and a subclass of a waiting class in the same
+ * list waits with it; ocerz_objcbridge_prepare_class installs the pair when the
+ * runtime's call arrives.  The copy of its class_ro_t has the flag cleared, so
+ * the native runtime never calls the initializer, an x86 function, itself.
+ * ocerz_objc_read_ro reads the initializer's address from the word after the
+ * 72 bytes.
+ *
+ * The native runtime knows only classes it was told about, and the Swift
+ * runtime reaches some without passing anything ocerz watches.  A generic
+ * class the compiler specialized ahead of time, _ContiguousArrayStorage of one
+ * element type for instance, is in no class list: its metadata accessor hands
+ * it straight to objc_opt_self, and the native runtime stops with "Attempt to
+ * use unknown class".  ocerz_objcbridge_ensure_object and
+ * ocerz_objcbridge_ensure_class define such a class, superclasses first, the
+ * first time a special or a send hands it, or an object of it, to the native
+ * runtime (src/objcbridge.c).
+ *
+ * The last difference is the end of an object's life.  Both runtimes keep a
+ * Swift object's reference count in the same 64-bit header word, and the
+ * native libobjc passes a Swift object's retains and releases to the native
+ * swift_retain and swift_release.  That is right until a release reaches zero,
+ * when the native runtime calls the class's destroy function, which is x86
+ * code.  An autorelease pool drained natively ends there, and so does any
+ * native holder of a guest Swift object letting go of the last reference.  The
+ * call faults, since guest code is not executable to the host, and the fault
+ * handler in src/vm.c asks ocerz_objcbridge_swift_destroy_fault whether the
+ * fault is exactly this: a pc inside the guest reservation, and an object in
+ * x20, the arm64 register Swift passes a destroy function its object in, whose
+ * isa has that pc as its destroy word.  The three words are read with
+ * mach_vm_read_overwrite, since a signal handler must not fault on a bad x20.
+ * When they match, the handler resumes the thread in
+ * ocerz_objcbridge_swift_destroy with the object and the function, as though
+ * the native runtime had called that: it runs the guest function with the
+ * object in R13, the x86-64 register for the same purpose, on the thread's
+ * guest cpu, attaching one to a native thread the way a callback does, and
+ * returns to the native runtime's return address.  Any other jump into guest
+ * memory still stops with the bridge-fault report.  A guest's own objc_release
+ * avoids the fault altogether: ocerz_objcbridge_guest_swift_object recognizes
+ * a guest Swift object by a raw isa, the stable Swift bit in its data word, the
+ * Swift-refcounting flag in its class flags, and a destroy function inside the
+ * guest reservation, which separates the guest's classes from native Swift
+ * ones a framework hands back, and src/objcbridge.c sends such a release to the
+ * guest's swift_release.
  *
  * ---- categories ----
  * __objc_catlist and then __objc_catlist2 are applied in list order.  Each
@@ -149,8 +209,8 @@
  * ---- lifetime ----
  * An image, by header address, is defined once.  Nothing here is ever freed:
  * the copies are what the runtime reads for as long as the class exists, which
- * is the life of the process.  The tables are guarded by one mutex, since only
- * the loader defines.  .cxx_construct and .cxx_destruct are ordinary methods;
+ * is the life of the process.  The tables are guarded by one mutex, which the
+ * loader and the Swift paths above both take.  .cxx_construct and .cxx_destruct are ordinary methods;
  * the runtime calls them with the object as the only argument, so the slot hands
  * the guest whatever x1 held as _cmd, which neither reads.  An image a dlopen
  * loads is defined the same way, after all of its fixups have bound, and every
@@ -170,14 +230,18 @@
 #include "ocerz/vdylib.h"
 #include "ocerz/vm.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach-o/loader.h>
 
 #define OC_RO_META 0x1u
@@ -186,6 +250,8 @@
 #define OC_RO_FUTURE 0x40000000u
 #define OC_RO_REALIZED 0x80000000u
 #define OC_FAST_SWIFT 0x3ull
+#define OC_SWIFT_STABLE 0x2ull
+#define OC_SWIFT_RC 0x2u
 #define OC_FAST_DATA 0x00007ffffffffff8ull
 #define OC_METHOD_FLAGS 0xffff0003u
 #define OC_METHOD_RELATIVE 0x80000000u
@@ -330,8 +396,6 @@ int ocerz_objc_read_class(uint64_t addr, OcerzObjcClass *out)
     uint64_t bits = oc_word(addr + 32);
     out->ro = bits & OC_FAST_DATA;
     out->swift = (uint32_t)(bits & OC_FAST_SWIFT);
-    if (out->swift)
-        return OCERZ_OBJC_SWIFT;
     if (!out->ro)
         return OCERZ_OBJC_NULL;
     return OCERZ_OBJC_OK;
@@ -354,7 +418,7 @@ int ocerz_objc_read_ro(uint64_t addr, OcerzObjcRo *out)
     out->weak_ivar_layout = oc_word(addr + 56);
     out->base_properties = oc_word(addr + 64);
     if (out->flags & OC_RO_SWIFT_INIT)
-        return OCERZ_OBJC_SWIFT;
+        out->swift_initializer = oc_word(addr + OC_RO_BYTES);
     return OCERZ_OBJC_OK;
 }
 
@@ -690,6 +754,7 @@ static OcMap g_oc_images;
 static OcMap g_oc_classes;
 static OcMap g_oc_protocols;
 static OcMap g_oc_skipped;
+static OcMap g_oc_deferred;
 static OcLoad *g_oc_loads;
 static size_t g_oc_loads_n, g_oc_loads_cap;
 static uint64_t g_oc_defining;
@@ -1014,10 +1079,50 @@ static uint8_t *oc_ro_copy(uint64_t ro, void *methods, void *protocols, const ch
 {
     uint8_t *copy = oc_alloc(OC_RO_BYTES, "class_ro_t", clsname);
     memcpy(copy, ocerz_g2h(ro), OC_RO_BYTES);
+    uint32_t flags;
+    memcpy(&flags, copy, 4);
+    flags &= ~OC_RO_SWIFT_INIT;
+    memcpy(copy, &flags, 4);
     uint64_t m = (uint64_t)(uintptr_t)methods, p = (uint64_t)(uintptr_t)protocols;
     memcpy(copy + 32, &m, 8);
     memcpy(copy + 40, &p, 8);
     return copy;
+}
+
+static void oc_install_pair(uint64_t addr, const OcerzObjcClass *c, const OcerzObjcRo *ro,
+                            const OcerzObjcClass *mc, const OcerzObjcRo *mro, const char *name, uint64_t *load)
+{
+    void *cls = ocerz_g2h(addr), *meta = ocerz_g2h(c->isa);
+    void *protos = oc_protocol_list(ro->base_protocols, name);
+    void *mprotos =
+        mro->base_protocols == ro->base_protocols ? protos : oc_protocol_list(mro->base_protocols, name);
+    void *im = oc_methods(ro->base_methods, cls, name, 0, NULL);
+    void *cm = oc_methods(mro->base_methods, meta, name, 1, load);
+    uint8_t *rocopy = oc_ro_copy(c->ro, im, protos, name);
+    uint8_t *mrocopy = oc_ro_copy(mc->ro, cm, mprotos, name);
+
+    uint64_t empty = ocerz_h2g(oc_need(&g_oc_empty_cache));
+    ocerz_st(addr + 16, 8, empty);
+    ocerz_st(addr + 24, 8, 0);
+    ocerz_st(addr + 32, 8, ocerz_h2g(rocopy) | c->swift);
+    ocerz_st(c->isa + 16, 8, empty);
+    ocerz_st(c->isa + 24, 8, 0);
+    ocerz_st(c->isa + 32, 8, ocerz_h2g(mrocopy) | mc->swift);
+}
+
+static void oc_record(uint64_t addr, uint64_t meta, uint64_t load, const char *name)
+{
+    OcDefined *d = oc_alloc(sizeof *d, "record", name);
+    d->meta = meta;
+    d->load = load;
+    oc_map_put(&g_oc_classes, addr, (uint64_t)(uintptr_t)d);
+}
+
+static int oc_read_pair(uint64_t addr, OcerzObjcClass *c, OcerzObjcRo *ro, OcerzObjcClass *mc, OcerzObjcRo *mro)
+{
+    return ocerz_objc_read_class(addr, c) == OCERZ_OBJC_OK && ocerz_objc_read_ro(c->ro, ro) == OCERZ_OBJC_OK &&
+           c->isa && ocerz_objc_read_class(c->isa, mc) == OCERZ_OBJC_OK &&
+           ocerz_objc_read_ro(mc->ro, mro) == OCERZ_OBJC_OK && (mro->flags & OC_RO_META);
 }
 
 static void oc_define_class(uint64_t addr, uint32_t image_flags)
@@ -1027,30 +1132,32 @@ static void oc_define_class(uint64_t addr, uint32_t image_flags)
     OcerzObjcClass c, mc;
     OcerzObjcRo ro, mro;
     int rc = ocerz_objc_read_class(addr, &c);
-    if (rc == OCERZ_OBJC_SWIFT)
-        oc_stop("guest class at %#llx is a Swift class, and Swift classes do not cross",
-                (unsigned long long)addr);
     if (rc != OCERZ_OBJC_OK)
         oc_stop("guest class at %#llx has no class_ro_t", (unsigned long long)addr);
-    if (ocerz_objc_read_ro(c.ro, &ro) == OCERZ_OBJC_SWIFT)
-        oc_stop("guest class %s has a Swift metadata initializer, and Swift classes do not cross",
-                oc_ro_name(c.ro));
+    ocerz_objc_read_ro(c.ro, &ro);
     const char *name = oc_ro_name(c.ro);
-    if (ro.flags & (OC_RO_FUTURE | OC_RO_REALIZED))
-        oc_stop("guest class %s carries class_ro_t flags %#x that only a running runtime sets", name, ro.flags);
-    if (ro.flags & OC_RO_ROOT) {
-        OCERZ_LOG("objc: guest class %s at %#llx is a root class, with no superclass, and is left out\n",
+    if (ro.flags & OC_RO_SWIFT_INIT) {
+        OCERZ_LOG("objc: guest class %s at %#llx is a Swift class its runtime initializes, and waits for it\n",
                   name, (unsigned long long)addr);
-        oc_map_put(&g_oc_skipped, addr, 1);
+        oc_map_put(&g_oc_deferred, addr, 1);
         return;
     }
-    if (!c.superclass) {
+    if (ro.flags & (OC_RO_FUTURE | OC_RO_REALIZED))
+        oc_stop("guest class %s carries class_ro_t flags %#x that only a running runtime sets", name, ro.flags);
+    int root = (ro.flags & OC_RO_ROOT) != 0;
+    if (!root && !c.superclass) {
         OCERZ_LOG("objc: guest class %s at %#llx has a null superclass, as a class whose weak-linked superclass the host lacks does,"
                   " and is left out\n", name, (unsigned long long)addr);
         oc_map_put(&g_oc_skipped, addr, 1);
         return;
     }
-    if (oc_is_guest(c.superclass) && !oc_defined(c.superclass)) {
+    if (!root && oc_is_guest(c.superclass) && !oc_defined(c.superclass)) {
+        if (oc_map_find(&g_oc_deferred, c.superclass)) {
+            OCERZ_LOG("objc: guest class %s at %#llx has the superclass %s, which waits for the Swift runtime,"
+                      " and waits with it\n", name, (unsigned long long)addr, oc_class_label(c.superclass));
+            oc_map_put(&g_oc_deferred, addr, 1);
+            return;
+        }
         if (oc_map_find(&g_oc_skipped, c.superclass)) {
             OCERZ_LOG("objc: guest class %s at %#llx has the superclass %s at %#llx, which was left out,"
                       " and is left out\n", name, (unsigned long long)addr,
@@ -1065,24 +1172,9 @@ static void oc_define_class(uint64_t addr, uint32_t image_flags)
         ocerz_objc_read_ro(mc.ro, &mro) != OCERZ_OBJC_OK || !(mro.flags & OC_RO_META))
         oc_stop("guest class %s has no guest metaclass at %#llx", name, (unsigned long long)c.isa);
 
-    void *cls = ocerz_g2h(addr), *meta = ocerz_g2h(c.isa);
+    void *cls = ocerz_g2h(addr);
     uint64_t load = 0;
-    void *protos = oc_protocol_list(ro.base_protocols, name);
-    void *mprotos =
-        mro.base_protocols == ro.base_protocols ? protos : oc_protocol_list(mro.base_protocols, name);
-    void *im = oc_methods(ro.base_methods, cls, name, 0, NULL);
-    void *cm = oc_methods(mro.base_methods, meta, name, 1, &load);
-    uint8_t *rocopy = oc_ro_copy(c.ro, im, protos, name);
-    uint8_t *mrocopy = oc_ro_copy(mc.ro, cm, mprotos, name);
-
-    uint64_t empty = ocerz_h2g(oc_need(&g_oc_empty_cache));
-    ocerz_st(addr + 16, 8, empty);
-    ocerz_st(addr + 24, 8, 0);
-    ocerz_st(addr + 32, 8, ocerz_h2g(rocopy));
-    ocerz_st(c.isa + 16, 8, empty);
-    ocerz_st(c.isa + 24, 8, 0);
-    ocerz_st(c.isa + 32, 8, ocerz_h2g(mrocopy));
-
+    oc_install_pair(addr, &c, &ro, &mc, &mro, name, &load);
     struct {
         uint32_t version;
         uint32_t flags;
@@ -1092,13 +1184,163 @@ static void oc_define_class(uint64_t addr, uint32_t image_flags)
         oc_stop("the native runtime would not read guest class %s at %#llx (objc_readClassPair gave %p)", name,
                 (unsigned long long)addr, got);
 
-    OcDefined *d = oc_alloc(sizeof *d, "record", name);
-    d->meta = c.isa;
-    d->load = load;
-    oc_map_put(&g_oc_classes, addr, (uint64_t)(uintptr_t)d);
+    oc_record(addr, c.isa, load, name);
     if (oc_logging())
-        fprintf(stderr, "ocerz: OBJCLOG[%d] define class %s at %#llx, superclass %s, %u bytes\n", (int)getpid(),
-                name, (unsigned long long)addr, oc_class_label(c.superclass), ro.instance_size);
+        fprintf(stderr, "ocerz: OBJCLOG[%d] define %sclass %s at %#llx, superclass %s, %u bytes\n", (int)getpid(),
+                c.swift ? "Swift " : root ? "root " : "", name, (unsigned long long)addr,
+                root ? "(none)" : oc_class_label(c.superclass), ro.instance_size);
+}
+
+static int oc_prepare_locked(uint64_t addr, int depth)
+{
+    if (oc_defined(addr))
+        return 1;
+    OcerzObjcClass c, mc;
+    OcerzObjcRo ro, mro;
+    if (depth > 64 || !oc_read_pair(addr, &c, &ro, &mc, &mro) || (ro.flags & OC_RO_REALIZED))
+        return 0;
+    if (c.superclass && oc_map_find(&g_oc_deferred, c.superclass))
+        oc_prepare_locked(c.superclass, depth + 1);
+    const char *name = oc_ro_name(c.ro);
+    uint64_t load = 0;
+    oc_install_pair(addr, &c, &ro, &mc, &mro, name, &load);
+    oc_record(addr, c.isa, 0, name);
+    uint64_t *deferred = oc_map_find(&g_oc_deferred, addr);
+    if (deferred)
+        *deferred = 0;
+    if (oc_logging())
+        fprintf(stderr, "ocerz: OBJCLOG[%d] prepare Swift-initialized class %s at %#llx, superclass %s, %u bytes\n",
+                (int)getpid(), name, (unsigned long long)addr, oc_class_label(c.superclass), ro.instance_size);
+    return 0;
+}
+
+static void oc_late_define_locked(uint64_t addr, int depth)
+{
+    OcerzObjcClass c, mc;
+    OcerzObjcRo ro, mro;
+    if (depth > 64 || oc_defined(addr) || oc_map_find(&g_oc_deferred, addr) || oc_map_find(&g_oc_skipped, addr) ||
+        !oc_read_pair(addr, &c, &ro, &mc, &mro) || (ro.flags & (OC_RO_SWIFT_INIT | OC_RO_FUTURE | OC_RO_REALIZED)))
+        return;
+    if (c.superclass && oc_is_guest(c.superclass) && !oc_defined(c.superclass))
+        oc_late_define_locked(c.superclass, depth + 1);
+    const char *name = oc_ro_name(c.ro);
+    uint64_t load = 0;
+    oc_install_pair(addr, &c, &ro, &mc, &mro, name, &load);
+    struct {
+        uint32_t version;
+        uint32_t flags;
+    } info = { 0, 0 };
+    void *cls = ocerz_g2h(addr);
+    void *got = ((void *(*)(void *, void *))oc_need(&g_oc_readClassPair))(cls, &info);
+    if (got != cls)
+        oc_stop("the native runtime would not read guest class %s at %#llx when it was first used"
+                " (objc_readClassPair gave %p)", name, (unsigned long long)addr, got);
+    oc_record(addr, c.isa, 0, name);
+    if (oc_logging())
+        fprintf(stderr, "ocerz: OBJCLOG[%d] define %sclass %s at %#llx when first used, superclass %s, %u bytes\n",
+                (int)getpid(), c.swift ? "Swift " : "", name, (unsigned long long)addr,
+                oc_class_label(c.superclass), ro.instance_size);
+}
+
+void ocerz_objcbridge_ensure_object(void *obj)
+{
+    uint64_t o = (uint64_t)(uintptr_t)obj;
+    if (!o || (o & 1) || (o >> 63))
+        return;
+    uint64_t g = ocerz_h2g(obj);
+    void *isa = oc_object_getClass(obj);
+    uint64_t c = isa ? ocerz_h2g(isa) : 0;
+    if (!oc_is_guest(c))
+        return;
+    pthread_mutex_lock(&g_oc_lock);
+    if (!(oc_is_guest(g) && oc_defined(g)) && !oc_defined(c)) {
+        OcerzObjcClass cc;
+        OcerzObjcRo r;
+        int meta = ocerz_objc_read_class(c, &cc) == OCERZ_OBJC_OK && ocerz_objc_read_ro(cc.ro, &r) == OCERZ_OBJC_OK &&
+                   (r.flags & OC_RO_META);
+        if (meta && oc_is_guest(g))
+            oc_late_define_locked(g, 0);
+        else if (!meta)
+            oc_late_define_locked(c, 0);
+    }
+    pthread_mutex_unlock(&g_oc_lock);
+}
+
+void ocerz_objcbridge_ensure_class(void *cls)
+{
+    uint64_t c = (uint64_t)(uintptr_t)cls;
+    if (!c || !oc_is_guest(ocerz_h2g(cls)))
+        return;
+    pthread_mutex_lock(&g_oc_lock);
+    oc_late_define_locked(ocerz_h2g(cls), 0);
+    pthread_mutex_unlock(&g_oc_lock);
+}
+
+int ocerz_objcbridge_prepare_class(uint64_t addr)
+{
+    if (!addr)
+        return 0;
+    pthread_mutex_lock(&g_oc_lock);
+    int known = oc_prepare_locked(addr, 0);
+    pthread_mutex_unlock(&g_oc_lock);
+    return known;
+}
+
+static int oc_peek(uint64_t haddr, uint64_t *out)
+{
+    mach_vm_size_t got = 0;
+    return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)haddr, 8,
+                                  (mach_vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS && got == 8;
+}
+
+int ocerz_objcbridge_guest_swift_object(const void *obj)
+{
+    uint64_t o = (uint64_t)(uintptr_t)obj;
+    if (!o || (o >> 63) || (o & 7))
+        return 0;
+    uint64_t isa = *(const uint64_t *)obj;
+    if (!isa || (isa & 7))
+        return 0;
+    const uint8_t *cls = ocerz_g2h(isa);
+    if (!(*(const uint64_t *)(cls + 32) & OC_SWIFT_STABLE) || !(*(const uint32_t *)(cls + 40) & OC_SWIFT_RC))
+        return 0;
+    return ocerz_host_in_guest_reservation(ocerz_g2h(*(const uint64_t *)(cls - 16)));
+}
+
+int ocerz_objcbridge_swift_destroy_fault(uint64_t pc, uint64_t context)
+{
+    uint64_t isa, destroy;
+    if (!context || !ocerz_host_in_guest_reservation((const void *)(uintptr_t)pc) || !oc_peek(context, &isa) ||
+        !isa || (isa & 7) || !oc_peek((uint64_t)(uintptr_t)ocerz_g2h(isa - 16), &destroy))
+        return 0;
+    return (uint64_t)(uintptr_t)ocerz_g2h(destroy) == pc;
+}
+
+void ocerz_objcbridge_swift_destroy(void *object, uint64_t destroy)
+{
+    int entered = errno;
+    OcerzCPU *cpu = ocerz_vm_current_cpu();
+    if (!cpu)
+        cpu = ocerz_thread_attach(ocerz_vm_process());
+    if (!cpu || !cpu->vm) {
+        fprintf(stderr, "ocerz: objc: native code released the last reference to guest Swift object %p on a thread"
+                        " no guest personality could be attached to, so its destroy function %#llx cannot run\n",
+                object, (unsigned long long)ocerz_h2g((const void *)(uintptr_t)destroy));
+        _exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    if (cpu->vm->exited)
+        return;
+    if (oc_logging())
+        fprintf(stderr, "ocerz: OBJCLOG[%d] native code destroys guest Swift object %p through %#llx\n",
+                (int)getpid(), object, (unsigned long long)ocerz_h2g((const void *)(uintptr_t)destroy));
+    uint64_t stack_top = (cpu->gpr[OCERZ_RSP] - 128) & ~0xfull;
+    struct OcerzBridgeFrame saved;
+    ocerz_bridge_guest_enter(&saved);
+    uint64_t fpcr = ocerz_abi_round_swap(ocerz_abi_round_of_mxcsr(cpu->mxcsr));
+    ocerz_vm_call_swift_context(cpu->vm, ocerz_h2g((const void *)(uintptr_t)destroy), ocerz_h2g(object), stack_top);
+    ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
+    ocerz_bridge_guest_leave(&saved);
+    errno = entered;
 }
 
 static void oc_define_classes(const OcSect *list, uint32_t image_flags)

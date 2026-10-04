@@ -39,7 +39,7 @@ The workflow the tree is built for: run the failing program with `-no-jit` first
 
 ## What to work on
 
-Compatibility is measured with x86-only software, never with programs that also ship an arm64 build. The known gaps are listed in [docs/compatibility.md](docs/compatibility.md); the largest are Swift-based programs in both modes and the frameworks native mode has no API database for yet.
+Compatibility is measured with x86-only software, never with programs that also ship an arm64 build. The known gaps are listed in [docs/compatibility.md](docs/compatibility.md); the largest are the system frameworks' Swift APIs in native mode and the frameworks native mode has no API database for yet.
 
 ## License
 

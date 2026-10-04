@@ -136,7 +136,8 @@
 # from the report alone.
 #
 # bridgelog covers OCERZ_BRIDGELOG, which prints one line per crossing naming
-# the library, the export and its signature. The case checks that the lines
+# the library, the export and its signature, then the guest's return address
+# and the first argument as raw words. The case checks that the lines
 # appear, that they name the library and an export the fixture's own import
 # table lists, and that stdout is byte-identical to the same run without the
 # variable: a diagnostic that changes what it observes is worse than no
@@ -1339,7 +1340,7 @@ GUEST_CRASH='ocerz: guest crash['
 WILD_RE='ocerz: (WILD-FAULT-AV|WILD-WORKER-TERMINATE|gs0x320 WORKER-TERMINATE)'
 FAULTLOG_MARK="FAULT-MAP addr=$BAD_GUEST_ADDR"
 SIGTRACE_MARK="deliver addr=$BAD_GUEST_ADDR"
-BRIDGELOG_RE='^ocerz: BRIDGELOG\[[0-9]+\] [^ ]+ [^ ]+ [^ ]+$'
+BRIDGELOG_RE='^ocerz: BRIDGELOG\[[0-9]+\] [^ ]+ [^ ]+ [^ ]+ from (0x[0-9a-f]+|0) rdi=(0x[0-9a-f]+|0)$'
 BRIDGELOG_KERNEL=memcpy
 BRIDGELOG_SYM=_memcpy
 BRIDGELOG_SIG='p(ppL)'
@@ -12610,7 +12611,7 @@ case_bridgelog() {
     if [ -n "$reason" ]; then
         reason="without OCERZ_BRIDGELOG: $reason"
     elif [ "$n" = "0" ]; then
-        reason="OCERZ_BRIDGELOG printed no 'ocerz: BRIDGELOG[pid] <lib> <sym> <sig>' line"
+        reason="OCERZ_BRIDGELOG printed no 'ocerz: BRIDGELOG[pid] <lib> <sym> <sig> from <return address> rdi=<first argument>' line"
     elif [ -n "$(grep -E "$BRIDGELOG_RE" "$le" | awk -v l="$LIB" '$3 != l' | head -1)" ]; then
         reason="a log line names library $(grep -E "$BRIDGELOG_RE" "$le" | awk -v l="$LIB" '$3 != l' | head -1 | awk '{print $3}'), want $LIB"
     elif [ -n "$(nm -u "$DYN" 2>/dev/null)" ] &&

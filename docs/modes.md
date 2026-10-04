@@ -66,8 +66,10 @@ registers in place, so a short `strlen` costs 2 ns rather than 17.
 
 [Native mode in depth](native-mode.md) describes every part of it.
 
-**What it cannot do yet.** Swift, WebKit, C++ objects shared with native arm64
-C++, and exceptions crossing a bridge frame are the large gaps, and some
+**What it cannot do yet.** The system frameworks' Swift APIs, WebKit, C++
+objects shared with native arm64 C++, and exceptions crossing a bridge frame are
+the large gaps; Swift programs that stay within the standard library run on a
+guest copy of the Swift runtime (`make guest-swift`). Some
 libraries still have no database. A program that needs one of those stops with a
 message naming what is missing, and exits 71 when an import cannot bind or 72
 when a bound export has no crossing. It does not run on and produce wrong

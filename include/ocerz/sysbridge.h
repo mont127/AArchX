@@ -70,6 +70,7 @@ int ocerz_sys_popen(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pclose(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_key_create(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_key_delete(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_key_init_np(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_setspecific(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_getspecific(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu);

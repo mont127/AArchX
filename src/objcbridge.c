@@ -212,6 +212,55 @@
  * guest is answered with the handler it set before, or null, never with a native
  * function it could not call.
  *
+ * ---- the Swift runtime ----
+ * A Swift guest brings its own runtime: runtime/guest supplies the x86
+ * libswiftCore of the swift.org toolchain in place of the host's, so every
+ * Swift call stays guest code and only that runtime's Objective-C calls cross.
+ * Most are ordinary crossings.  Four kinds are handled here.
+ *
+ * The runtime installs three hooks, objc_setHook_getClass,
+ * objc_setHook_getImageName and objc_setHook_lazyClassNamer, each given the new
+ * hook and an address that receives the old one so the new hook can chain to
+ * it.  A guest hook is x86 code and the hook it displaces is native, and
+ * neither side can call the other's.  So the first time the guest sets one,
+ * ocerz installs a native wrapper of its own instead, which calls the guest's
+ * hook through a callback slot and falls back to the native hook it displaced;
+ * each later set only changes which guest function the wrapper calls.  The
+ * guest's old-hook word receives the guest hook set before, or, the first time,
+ * a three-byte guest function answering zero (xor eax, eax; ret), which a
+ * getClass or getImageName hook reads as no and the namer as no name.  The
+ * chain runs through the guest's hooks, newest first, then the native ones.
+ *
+ * Classes the runtime builds while running, generic instantiations and classes
+ * whose metadata initializer has to run first, reach libobjc through
+ * objc_readClassPair and _objc_realizeClassFromSwift.  Both specials hand the
+ * class to ocerz_objcbridge_prepare_class first, which gives it the method list
+ * and class_ro_t copies an image's classes get (src/objcclass.c), and only then
+ * make the native call.  _objc_realizeClassFromSwift also takes the address the
+ * class was known at before, and that is passed on only when the class had
+ * been defined already: one prepared just now was never known to the native
+ * runtime at any address.
+ *
+ * objc_opt_self, objc_opt_class, objc_alloc, objc_alloc_init,
+ * objc_allocWithZone and every plain send make sure the receiver's class is
+ * defined before the native runtime sees it (ocerz_objcbridge_ensure_object),
+ * for the reason src/objcclass.c gives under Swift classes.
+ *
+ * objc_release is a special too.  On Darwin the Swift runtime frees an
+ * AnyObject value with a plain objc_release, and every element of an array of
+ * class instances is stored as one; libobjc hands a Swift object on to
+ * swift_release.  In native mode that is the native swift_release, which at a
+ * count of zero calls the class's destroy function, x86 code.  src/objcclass.c
+ * makes that call work through a fault, at a few microseconds each, so a
+ * guest's own objc_release of an object ocerz_objcbridge_guest_swift_object
+ * recognizes jumps to the guest libswiftCore's swift_release instead, with the
+ * guest's return address left where it is, and every other object takes the
+ * native call.  A million objects freed through arrays took 5.5 s through the
+ * fault and take 130 ms through the jump, against 52 ms under Rosetta.
+ * Retains are not routed: both runtimes keep a Swift object's count in the
+ * same 64-bit header word, so a native retain, or a release that does not
+ * reach zero, is already the right one.
+ *
  * ---- what every crossing here shares ----
  * A send raises a bridge frame before it touches the receiver, naming the export,
  * and once the method is known names the selector and the notation, so a fault
@@ -225,6 +274,7 @@
 #include "ocerz/abi.h"
 #include "ocerz/blocks.h"
 #include "ocerz/bridge.h"
+#include "ocerz/dyld.h"
 #include "ocerz/interp.h"
 #include "ocerz/mem.h"
 #include "ocerz/syscall.h"
@@ -280,6 +330,17 @@ static ObSym g_ob_method_getImplementation = OB_SYM(OCERZ_OBJC_LIBOBJC, "method_
 static ObSym g_ob_setExceptionPreprocessor = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_setExceptionPreprocessor");
 static ObSym g_ob_class_replaceMethod = OB_SYM(OCERZ_OBJC_LIBOBJC, "class_replaceMethod");
 static ObSym g_ob_class_getMethodImplementation = OB_SYM(OCERZ_OBJC_LIBOBJC, "class_getMethodImplementation");
+static ObSym g_ob_realizeClassFromSwift = OB_SYM(OCERZ_OBJC_LIBOBJC, "_objc_realizeClassFromSwift");
+static ObSym g_ob_readClassPair = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_readClassPair");
+static ObSym g_ob_setHook_getClass = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_setHook_getClass");
+static ObSym g_ob_setHook_getImageName = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_setHook_getImageName");
+static ObSym g_ob_setHook_lazyClassNamer = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_setHook_lazyClassNamer");
+static ObSym g_ob_opt_self = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_opt_self");
+static ObSym g_ob_opt_class = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_opt_class");
+static ObSym g_ob_alloc = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_alloc");
+static ObSym g_ob_alloc_init = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_alloc_init");
+static ObSym g_ob_allocWithZone = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_allocWithZone");
+static ObSym g_ob_release = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_release");
 static ObSym g_ob_CFStringGetLength = OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStringGetLength");
 static ObSym g_ob_CFStringGetMaximumSizeForEncoding =
     OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStringGetMaximumSizeForEncoding");
@@ -720,7 +781,6 @@ const char *ocerz_objc_refusal(int code)
     case OCERZ_OBJC_ENGINE:        return "a structure the ABI engine cannot lay out";
     case OCERZ_OBJC_NOT_METHOD:    return "no self and _cmd as its first two arguments";
     case OCERZ_OBJC_NULL:          return "a null address where a structure belongs";
-    case OCERZ_OBJC_SWIFT:         return "a Swift class";
     case OCERZ_OBJC_BAD_LIST:      return "a list whose entry size ocerz cannot read";
     case OCERZ_OBJC_CYCLE:         return "a class that is its own superclass";
     default:                       return "an encoding ocerz cannot parse";
@@ -1754,6 +1814,8 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
     ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, export, NULL, fn);
     if (kind == OB_PLAIN) {
         recv = first ? ocerz_g2h(first) : NULL;
+        if (recv)
+            ocerz_objcbridge_ensure_object(recv);
         cls = recv ? ob_object_getClass(recv) : NULL;
     } else {
         if (!first)
@@ -1761,6 +1823,8 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
         uint64_t r = ocerz_ld(first, 8), c = ocerz_ld(first + 8, 8);
         recv = r ? ocerz_g2h(r) : NULL;
         cls = c ? ocerz_g2h(c) : NULL;
+        if (cls)
+            ocerz_objcbridge_ensure_class(cls);
         if (kind == OB_SUPER2 && cls)
             cls = ob_class_getSuperclass(cls);
     }
@@ -2359,6 +2423,214 @@ int ocerz_objc_setUncaughtExceptionHandler(struct OcerzVM *vm, OcerzCPU *cpu)
     ocerz_bridge_lower(&outer);
 
     ob_return(cpu, atomic_exchange(&g_ob_guest_handler, guest));
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_realizeClassFromSwift(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t cls = cpu->gpr[OCERZ_RDI], previously = cpu->gpr[OCERZ_RSI];
+    void *fn = ob_need(&g_ob_realizeClassFromSwift);
+    int known = cls ? ocerz_objcbridge_prepare_class(cls) : 1;
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "__objc_realizeClassFromSwift", "p(pp)", fn);
+    void *got = ((void *(*)(void *, void *))fn)(cls ? ocerz_g2h(cls) : NULL,
+                                               known && previously ? ocerz_g2h(previously) : NULL);
+    atomic_fetch_add(&g_ob_generation, 1);
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, got ? ocerz_h2g(got) : 0);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_readClassPair(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t cls = cpu->gpr[OCERZ_RDI], info = cpu->gpr[OCERZ_RSI];
+    void *fn = ob_need(&g_ob_readClassPair);
+    if (cls)
+        ocerz_objcbridge_prepare_class(cls);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "_objc_readClassPair", "p(pp)", fn);
+    void *got = ((void *(*)(void *, void *))fn)(cls ? ocerz_g2h(cls) : NULL, info ? ocerz_g2h(info) : NULL);
+    atomic_fetch_add(&g_ob_generation, 1);
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, got ? ocerz_h2g(got) : 0);
+    return ob_settle(vm, cpu);
+}
+
+static pthread_once_t g_ob_no_once = PTHREAD_ONCE_INIT;
+static uint64_t g_ob_no;
+
+static void ob_make_no(void)
+{
+    uint64_t page = ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE);
+    if (!page)
+        return;
+    uint8_t *buf = ocerz_g2h(page);
+    memset(buf, 0xcc, OCERZ_GUEST_PAGE_SIZE);
+    static const uint8_t no[] = { 0x31, 0xc0, 0xc3 };
+    memcpy(buf, no, sizeof no);
+    if (ocerz_protect(page, OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_EXEC) == OCERZ_OK)
+        g_ob_no = page;
+}
+
+static uint64_t ob_guest_no(void)
+{
+    pthread_once(&g_ob_no_once, ob_make_no);
+    return g_ob_no;
+}
+
+typedef struct ObHook {
+    ObSym *setter;
+    const char *export;
+    const char *notation;
+    void *_Atomic guest;
+    uint64_t guest_fn;
+    void *prev;
+    int installed;
+} ObHook;
+
+static pthread_mutex_t g_ob_hook_lock = PTHREAD_MUTEX_INITIALIZER;
+static ObHook g_ob_getclass = { &g_ob_setHook_getClass, "_objc_setHook_getClass", "b(pp)", NULL, 0, NULL, 0 };
+static ObHook g_ob_imagename = { &g_ob_setHook_getImageName, "_objc_setHook_getImageName", "b(pp)", NULL, 0, NULL,
+                                 0 };
+static ObHook g_ob_namer = { &g_ob_setHook_lazyClassNamer, "_objc_setHook_lazyClassNamer", "p(p)", NULL, 0, NULL,
+                             0 };
+
+static bool ob_hook2(ObHook *h, const void *a, void *b)
+{
+    bool (*guest)(const void *, void *) = atomic_load(&h->guest);
+    if (guest && guest(a, b))
+        return true;
+    return h->prev ? ((bool (*)(const void *, void *))h->prev)(a, b) : false;
+}
+
+static bool ob_getclass_hook(const void *name, void *out)
+{
+    return ob_hook2(&g_ob_getclass, name, out);
+}
+
+static bool ob_imagename_hook(const void *cls, void *out)
+{
+    return ob_hook2(&g_ob_imagename, cls, out);
+}
+
+static const char *ob_namer_hook(void *cls)
+{
+    const char *(*guest)(void *) = atomic_load(&g_ob_namer.guest);
+    const char *name = guest ? guest(cls) : NULL;
+    if (!name && g_ob_namer.prev)
+        name = ((const char *(*)(void *))g_ob_namer.prev)(cls);
+    return name;
+}
+
+static int ob_set_hook(struct OcerzVM *vm, OcerzCPU *cpu, ObHook *h, void *native_hook)
+{
+    uint64_t guest = cpu->gpr[OCERZ_RDI], out_old = cpu->gpr[OCERZ_RSI];
+    void *set = ob_need(h->setter);
+    uint64_t slot = 0;
+    if (guest && (ocerz_abi_callback_convert(guest, h->notation, &slot) != OCERZ_OK || !slot))
+        ob_stop("%s could not bind guest hook %#llx to a callback", h->export, (unsigned long long)guest);
+    pthread_mutex_lock(&g_ob_hook_lock);
+    uint64_t chain = h->guest_fn ? h->guest_fn : ob_guest_no();
+    if (!h->installed) {
+        struct OcerzBridgeFrame outer;
+        ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, h->export, NULL, set);
+        ((void (*)(void *, void **))set)(native_hook, &h->prev);
+        ocerz_bridge_lower(&outer);
+        h->installed = 1;
+    }
+    atomic_store(&h->guest, slot ? ocerz_g2h(slot) : NULL);
+    h->guest_fn = guest;
+    pthread_mutex_unlock(&g_ob_hook_lock);
+    if (out_old)
+        ocerz_st(out_old, 8, chain);
+    ob_return(cpu, 0);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_setHook_getClass(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_set_hook(vm, cpu, &g_ob_getclass, (void *)ob_getclass_hook);
+}
+
+int ocerz_objc_setHook_getImageName(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_set_hook(vm, cpu, &g_ob_imagename, (void *)ob_imagename_hook);
+}
+
+int ocerz_objc_setHook_lazyClassNamer(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_set_hook(vm, cpu, &g_ob_namer, (void *)ob_namer_hook);
+}
+
+static int ob_object_call(struct OcerzVM *vm, OcerzCPU *cpu, ObSym *s, const char *export)
+{
+    uint64_t a = cpu->gpr[OCERZ_RDI];
+    void *fn = ob_need(s);
+    if (a)
+        ocerz_objcbridge_ensure_object(ocerz_g2h(a));
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, export, "p(p)", fn);
+    void *r = ((void *(*)(void *))fn)(a ? ocerz_g2h(a) : NULL);
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, r ? ocerz_h2g(r) : 0);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_opt_self(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_object_call(vm, cpu, &g_ob_opt_self, "_objc_opt_self");
+}
+
+int ocerz_objc_opt_class(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_object_call(vm, cpu, &g_ob_opt_class, "_objc_opt_class");
+}
+
+int ocerz_objc_alloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_object_call(vm, cpu, &g_ob_alloc, "_objc_alloc");
+}
+
+int ocerz_objc_alloc_init(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_object_call(vm, cpu, &g_ob_alloc_init, "_objc_alloc_init");
+}
+
+int ocerz_objc_allocWithZone(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_object_call(vm, cpu, &g_ob_allocWithZone, "_objc_allocWithZone");
+}
+
+static uint64_t ob_guest_swift_release(void)
+{
+    static _Atomic uint64_t at;
+    uint64_t a = atomic_load_explicit(&at, memory_order_acquire);
+    if (!a) {
+        a = ocerz_dyld_native_image_export("/usr/lib/swift/libswiftCore.dylib", "_swift_release");
+        if (a && ocerz_abi_is_guest_code(a))
+            atomic_store_explicit(&at, a, memory_order_release);
+        else
+            a = 0;
+    }
+    return a;
+}
+
+int ocerz_objc_release(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t a = cpu->gpr[OCERZ_RDI];
+    if (a && ocerz_objcbridge_guest_swift_object(ocerz_g2h(a))) {
+        uint64_t to = ob_guest_swift_release();
+        if (to) {
+            cpu->rip = to;
+            return OCERZ_STEP_OK;
+        }
+    }
+    void *fn = ob_need(&g_ob_release);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, "_objc_release", "v(p)", fn);
+    ((void (*)(void *))fn)(a ? ocerz_g2h(a) : NULL);
+    ocerz_bridge_lower(&outer);
+    ob_return(cpu, 0);
     return ob_settle(vm, cpu);
 }
 
