@@ -162,9 +162,15 @@
  * takes the general form.  In the Wine layout that took memcpy from 6.1x of
  * Rosetta's time to 3.1x, a mixed workload from 3.0x to 1.65x and an
  * interpreter loop from 1.5x to 1.0x (OCERZ_NO_FAST_LOW_GUARD=1 keeps the
- * general form everywhere).  The general form for the top strip is emitted
- * out of line at the end of the block, so a hot loop carries only the short
- * forms.  Stack accesses (push, pop, call, ret and rsp-relative operands) are
+ * general form everywhere).  The top strip is not tested at all until an
+ * access in the block faults there: arm64 cannot map anything at or above
+ * TOP_LO, so its identity address faults, and the handler marks the block the
+ * way it marks a commpage reader in identity mode, interprets the one
+ * instruction and retires the block.  The retranslation then tests the
+ * identity range with two shifts and an add and takes the general form out of
+ * line at the end of the block.  A low address costs a shift, a compare, an
+ * untaken branch and an orr, and an identity address the first three
+ * (OCERZ_LOW_TOP_GUARD=1 tests the top strip in every block).  Stack accesses (push, pop, call, ret and rsp-relative operands) are
  * plain in this mode as in every other, after the translation instead of in
  * place of it; they used to take the ordered load and store
  * (OCERZ_TSO_STRICT=1 orders them everywhere).
@@ -1096,6 +1102,7 @@ static void cp_mark(uint64_t key)
     }
 }
 static inline int mem_guard_needed(void) { return ocerz_low_base != 0 || g_cp_guard; }
+static int g_low_top;
 
 static int stack_plain_ok(void)
 {
@@ -4107,6 +4114,10 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         uint32_t *high = a64_label(b);
         a64_bcond(b, A64_CS, 0);
         (void)a64_try_orr_imm(b, 1, addr_reg, addr_reg, ocerz_low_base);
+        if (!g_low_top) {
+            a64_patch_bcond(high, a64_label(b));
+            return NULL;
+        }
         uint32_t *done_low = a64_label(b);
         a64_b(b, 0);
         a64_patch_bcond(high, a64_label(b));
@@ -16958,6 +16969,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_push_fix = 0;
     g_n_oolslow = 0;
     g_cp_guard = ocerz_commpage && (ENV_ON("OCERZ_CP_GUARD_ALL") || cp_marked(jit_key(rip, mode32)));
+    g_low_top = ocerz_low_base && (ENV_ON("OCERZ_LOW_TOP_GUARD") || cp_marked(jit_key(rip, mode32)));
     { static int all = -1; if (all < 0) all = getenv("OCERZ_AL_GUARD_ALL") ? 1 : 0; if (all) g_al_all = 1; }
     g_align_guard = !g_plain_mem && al_marked(jit_key(rip, mode32));
     if (g_cp_guard || g_align_guard)

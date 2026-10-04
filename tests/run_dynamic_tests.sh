@@ -907,6 +907,7 @@ run_low_golden_case djcc_chain_rec_low tests/guest/jcc_chain_rec.c tests/guest/e
 run_low_golden_case drsp_ops_low tests/guest/rsp_ops.c tests/guest/expect/rsp_ops.out
 run_low_golden_case drsp_rmw_low tests/dynamic/rsp_rmw.c tests/dynamic/rsp_rmw.out
 run_low_golden_case dcvt_packed_low tests/dynamic/cvt_packed.c tests/dynamic/cvt_packed.out
+run_low_golden_case dlow_top_strip tests/dynamic/low_top_strip.c tests/dynamic/low_top_strip.out
 run_low_golden_case dfault_chain_low tests/guest/fault_chain.c tests/guest/expect/fault_chain.out
 run_dlsym_deps_case ddlsym_deps 'OK'
 run_dlopen_arch_case ddlopen_arch 'OK'

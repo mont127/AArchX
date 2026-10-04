@@ -2237,8 +2237,10 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 }
             }
         }
-        if (in_jit && rip_exact && ocerz_commpage && ocerz_guest_base == 0 &&
-            gaddr >= OCERZ_COMMPAGE_LO && gaddr < OCERZ_COMMPAGE_HI &&
+        if (in_jit && rip_exact && ocerz_guest_base == 0 &&
+            ((ocerz_commpage && gaddr >= OCERZ_COMMPAGE_LO && gaddr < OCERZ_COMMPAGE_HI) ||
+             (ocerz_low_base && gaddr >= OCERZ_TOP_LO && gaddr < OCERZ_COMMPAGE_HI &&
+              (uint64_t)(uintptr_t)si->si_addr == gaddr)) &&
             ocerz_jit_note_commpage_fault(fvm, hpc, fault_rip)) {
             g_cur_cpu->rip = fault_rip;
             g_cur_cpu->sig_repeat = 0;
