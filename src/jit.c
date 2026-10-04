@@ -179,7 +179,9 @@
  * shifts, the sign for the arithmetic ones.  cvtps2dq rounds with frinti, which
  * follows the FPCR mode that tracks MXCSR.RC, and then shares cvttps2dq's
  * conversion, whose lanes that are NaN or not below 2^31 take x86's
- * 0x80000000 where arm64 would saturate or give zero.  AES rounds use aese or
+ * 0x80000000 where arm64 would saturate or give zero.  cvtps2pd and cvtpd2ps
+ * are fcvtl and fcvtn, which quiet a signalling NaN and keep its payload and
+ * round by the FPCR mode as x86 does; fcvtn also clears the upper half.  AES rounds use aese or
  * aesd against a zero key, then aesmc or aesimc, then the round key, because
  * arm64 adds the key before the substitution and x86 after it;
  * aeskeygenassist picks its words out of a zero-key aese with a table lookup.
@@ -9262,12 +9264,17 @@ static int emit_sse_cvtp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     if (insn->nops != 2) return 0;
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_XMM) return 0;
-    int vs = emit_sse_src_reg(b, insn, s, insn->op == OCERZ_OP_CVTDQ2PD ? 8 : 16, VX1, exit_sites, n_exits);
+    int half = insn->op == OCERZ_OP_CVTDQ2PD || insn->op == OCERZ_OP_CVTPS2PD;
+    int vs = emit_sse_src_reg(b, insn, s, half ? 8 : 16, VX1, exit_sites, n_exits);
     if (vs < 0) return 0;
     int vd = xmm_dst_reg(d->reg, VX0);
     if (insn->op == OCERZ_OP_CVTDQ2PD) {
         a64_v_xtl(b, 1, 4, VX2, vs);
         a64_v_scvtf_2d(b, vd, VX2);
+    } else if (insn->op == OCERZ_OP_CVTPS2PD) {
+        a64_v_fcvtl(b, vd, vs);
+    } else if (insn->op == OCERZ_OP_CVTPD2PS) {
+        a64_v_fcvtn(b, vd, vs);
     } else {
         int src = vs;
         if (insn->op == OCERZ_OP_CVTPS2DQ) { a64_v_frint(b, 0, 4, VX3, vs); src = VX3; }
@@ -10232,6 +10239,7 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_CMPPS: case OCERZ_OP_CMPPD:
         return emit_sse_cmpp(b, insn, exit_sites, n_exits);
     case OCERZ_OP_CVTTPS2DQ: case OCERZ_OP_CVTPS2DQ: case OCERZ_OP_CVTDQ2PD:
+    case OCERZ_OP_CVTPS2PD: case OCERZ_OP_CVTPD2PS:
         return emit_sse_cvtp(b, insn, exit_sites, n_exits);
     case OCERZ_OP_AESENC: case OCERZ_OP_AESENCLAST: case OCERZ_OP_AESDEC: case OCERZ_OP_AESDECLAST:
     case OCERZ_OP_AESIMC: case OCERZ_OP_AESKEYGENASSIST:
@@ -11974,6 +11982,7 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_BLENDPS: case OCERZ_OP_BLENDPD: case OCERZ_OP_MOVSHDUP: case OCERZ_OP_MOVSLDUP:
     case OCERZ_OP_MOVMSKPS: case OCERZ_OP_MOVMSKPD: case OCERZ_OP_CMPPS: case OCERZ_OP_CMPPD:
     case OCERZ_OP_CVTTPS2DQ: case OCERZ_OP_CVTPS2DQ: case OCERZ_OP_CVTDQ2PD:
+    case OCERZ_OP_CVTPS2PD: case OCERZ_OP_CVTPD2PS:
     case OCERZ_OP_AESENC: case OCERZ_OP_AESENCLAST: case OCERZ_OP_AESDEC: case OCERZ_OP_AESDECLAST:
     case OCERZ_OP_AESIMC: case OCERZ_OP_AESKEYGENASSIST: case OCERZ_OP_PCLMULQDQ:
     case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
