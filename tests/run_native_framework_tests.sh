@@ -12,8 +12,12 @@ for arch in x86_64 arm64; do
         tests/dynamic/native_frameworks.c -framework CoreFoundation -framework CFNetwork \
         -framework SystemConfiguration -framework Security -framework CoreServices \
         -o "$work/frameworks.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror -Wno-deprecated-declarations -fobjc-arc \
+        tests/dynamic/native_frameworks_more.m -framework AppKit -framework Security \
+        -framework UniformTypeIdentifiers -framework Network -o "$work/more.$arch"
 done
 /usr/bin/perl -e 'alarm 60; exec @ARGV' "$work/frameworks.arm64" "$work/cert.der" > "$work/expected" 2> "$work/arm.err"
+/usr/bin/perl -e 'alarm 60; exec @ARGV' "$work/more.arm64" > "$work/more.expected" 2> "$work/more.arm.err"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -33,6 +37,10 @@ for engine in jit interpreter slow-bridge; do
         grep -Eq 'EXECUTED insns: total=[1-9][0-9]*' "$work/$engine.err"
     fi
     echo "PASS native framework calls and callbacks $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/more.x86_64" > "$work/more.$engine.out" 2> "$work/more.$engine.err"
+    cmp "$work/more.expected" "$work/more.$engine.out"
+    echo "PASS native framework sorts, ciphers, locale formats, CF callbacks, UTType and Network $engine"
     for refusal in context launch; do
         rc=0
         env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \

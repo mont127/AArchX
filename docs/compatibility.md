@@ -283,7 +283,17 @@ the same designer name" error that Rosetta never reaches.
 
 Native mode runs a narrower set, and it is growing. Image Capture opens its main
 window and quits cleanly, Stickies opens a note, and the x86-64 Steam client
-comes up as described [above](#steam-the-macos-client). What stops the rest is
+comes up as described [above](#steam-the-macos-client). Discord, the x86-64
+slice of its Electron build, starts its browser process, network and utility
+services and two renderers, shows its splash screen and connects to Discord's
+gateway (macOS 26.7.1, 2026-10-04); its main window had not finished loading
+when that run was stopped at 90 seconds, and its five processes held about
+11 GB between them. Getting there took databases for eight more frameworks,
+records for private libSystem calls Chromium makes, a host stack of at least
+512 KB for the threads it creates, the cipher-suite calls of Secure Transport,
+a comparator for `sortSubviewsUsingFunction:context:`, and region queries
+answered from AArchX's own map, without which every renderer stopped at an
+int3. What stops the rest is
 listed in [Native mode in depth](native-mode.md#what-native-mode-cannot-run-yet).
 
 ## Known limitations

@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/Network.framework/Versions/A/Network
+sdk macos 27.0
+exports 17925
+fn 432
+data 779
+var 0
+special 0
+stub no-declaration 7860
+omit no-declaration-missing 4829
+omit swift 4025
+host-missing 2
+objc-classes 56
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 7455
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

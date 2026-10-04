@@ -1231,11 +1231,11 @@ static void r_guest_block(OcerzCPU *cpu)
 
 static void r_guest_fnptr(OcerzCPU *cpu)
 {
-    void *a = ((void *(*)(void *, void *, void *))objc_msgSend_)(cls("NSArray"), sel("arrayWithObject:"), nsstr("x"));
-    cpu->gpr[OCERZ_RDI] = ocerz_h2g(a);
-    cpu->gpr[OCERZ_RSI] = ocerz_h2g(sel("sortedArrayUsingFunction:context:"));
+    void *f = ((void *(*)(void *, void *, unsigned long))objc_msgSend_)(cls("NSPointerFunctions"),
+                                                                     sel("pointerFunctionsWithOptions:"), 0);
+    cpu->gpr[OCERZ_RDI] = ocerz_h2g(f);
+    cpu->gpr[OCERZ_RSI] = ocerz_h2g(sel("setHashFunction:"));
     cpu->gpr[OCERZ_RDX] = scratch + 0x800;
-    cpu->gpr[OCERZ_RCX] = 0;
 }
 
 static void r_bitfield(OcerzCPU *cpu)
@@ -1313,7 +1313,7 @@ static const Refusal kRefusals[] = {
     { "a guest block with no signature", r_guest_block, ocerz_objc_msgSend,
       "a guest block handed to native code was called, and it cannot be: it has no signature" },
     { "a guest function pointer", r_guest_fnptr, ocerz_objc_msgSend,
-      "sortedArrayUsingFunction:context:] cannot cross: argument 0 is an x86 function pointer" },
+      "setHashFunction:] cannot cross: argument 0 is an x86 function pointer" },
     { "a bitfield result", r_bitfield, ocerz_objc_msgSend_stret, "decimalValue] cannot cross: its method type"
       " encoding {" },
     { "printf %n", r_printf_n, ocerz_fmt_printf, "_printf refuses the format \"count %n\": it has %n" },

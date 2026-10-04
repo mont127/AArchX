@@ -69,8 +69,23 @@
  * goes to the host kernel after its translations are dropped.  msync, mlock,
  * munlock, minherit and mincore stay ordinary crossings: the syscall layer's own
  * handling of them is to translate the pointer and forward the call, which in
- * the identity map is the crossing itself.  mach_vm_map and mach_vm_remap stay
- * stubs.
+ * the identity map is the crossing itself.  mach_vm_map and mach_vm_remap, with
+ * their vm_ spellings, reach the host kernel once the translations of a fixed
+ * target range are dropped.
+ *
+ * mach_vm_region and vm_region_64 are asked about the guest's own memory, and
+ * the host kernel answers about host pages: 16 KB of them, which ocerz cannot
+ * always give the protection the guest set on one 4 KB page of four.  Electron
+ * protects a page read-only, asks mach_vm_region whether it is, and executes an
+ * int3 when the answer is anything else, which killed Discord's renderers in
+ * native mode as it once did in cache mode (src/syscall.c).  So after the host
+ * answers a basic-info query about the process's own task, the region,
+ * protection and maximum protection are taken from ocerz's own map when that
+ * map has a region holding the address asked about, or else the first region
+ * above it; the host's heap lies between ocerz's mappings in the identity map,
+ * and a region of it that comes first keeps the host's answer.  The host's
+ * region can start lower than ocerz's and still hold the address, since the
+ * kernel merges neighbours of one protection that ocerz keeps apart.
  *
  * ---- non-local jumps ----
  * setjmp and its relatives save and restore machine state, and the host's would
@@ -166,7 +181,19 @@
  * streams, each a host FILE over a pipe, or a socket pair for r+, and close
  * every other popen'd stream in the child, as Apple's do.
  *
- * ---- thread-specific data and dispatch_main ----
+ * ---- threads ----
+ * A thread the guest creates is a host thread whose start routine is a
+ * callback into the guest's, and its guest frames run on a stack ocerz makes
+ * for it when it first enters guest code.  The host stack the attributes size
+ * holds ocerz's own frames and the native frames of every bridged call
+ * instead, and the size the guest asked for was chosen for its own frames:
+ * Chromium makes one thread with a 16 KB stack, and the translator alone takes
+ * 40 KB of host stack to translate a block, so that thread overflowed its
+ * guard page the first time it ran a block nobody had translated.  A guest
+ * asking for less than 512 KB, the size a secondary thread gets by default,
+ * gets 512 KB of host stack; one that hands over stack memory of its own keeps
+ * it.
+ *
  * pthread_key_create and its siblings keep the guest's values in the guest
  * thread block, where an inlined gs-relative load finds them (the overrides
  * file explains why), and Darwin's reserved keys 10 to 255 live there too,
@@ -1285,6 +1312,8 @@ static void *sb_thread_main(void *p)
     return result;
 }
 
+#define SB_HOST_STACK_MIN (512u * 1024u)
+
 int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t out = sb_arg(cpu, 0), attr = sb_arg(cpu, 1), routine = sb_arg(cpu, 2), arg = sb_arg(cpu, 3);
@@ -1298,8 +1327,18 @@ int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu)
     start->arg = sb_ptr(arg);
     struct OcerzBridgeFrame outer;
     ocerz_bridge_raise(&outer, SB_LIB, "_pthread_create", "i(ppc{p(p)}p)", (const void *)pthread_create);
+    const pthread_attr_t *use = (const pthread_attr_t *)sb_ptr(attr);
+    pthread_attr_t own;
+    size_t want = 0;
+    void *at = NULL;
+    if (use && pthread_attr_getstacksize(use, &want) == 0 && want < SB_HOST_STACK_MIN &&
+        pthread_attr_getstackaddr(use, &at) == 0 && !at) {
+        own = *use;
+        pthread_attr_setstacksize(&own, SB_HOST_STACK_MIN);
+        use = &own;
+    }
     pthread_t made = NULL;
-    int rc = pthread_create(&made, (const pthread_attr_t *)sb_ptr(attr), sb_thread_main, start);
+    int rc = pthread_create(&made, use, sb_thread_main, start);
     ocerz_bridge_lower(&outer);
     if (rc)
         free(start);
@@ -1331,6 +1370,42 @@ int ocerz_sys_dispatch_main(struct OcerzVM *vm, OcerzCPU *cpu)
     ocerz_bridge_raise(&outer, SB_LIB, "_dispatch_main", "v()", (const void *)run);
     for (;;)
         run();
+}
+
+static int sb_vm_region(struct OcerzVM *vm, OcerzCPU *cpu, const char *export)
+{
+    mach_port_t task = (mach_port_t)sb_arg(cpu, 0);
+    uint64_t addrp = sb_arg(cpu, 1), sizep = sb_arg(cpu, 2), info = sb_arg(cpu, 4);
+    vm_region_flavor_t flavor = (vm_region_flavor_t)sb_arg(cpu, 3);
+    uint64_t query = addrp ? ocerz_ld(addrp, 8) : 0;
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, export, "i(uppippp)", (const void *)mach_vm_region);
+    kern_return_t kr = mach_vm_region(task, sb_ptr(addrp), sb_ptr(sizep), flavor, sb_ptr(info),
+                                      sb_ptr(sb_arg(cpu, 5)), sb_ptr(sb_arg(cpu, 6)));
+    ocerz_bridge_lower(&outer);
+    if (kr == KERN_SUCCESS && task == mach_task_self() && addrp && sizep && info &&
+        (flavor == VM_REGION_BASIC_INFO_64 || flavor == VM_REGION_BASIC_INFO)) {
+        uint64_t ga = query, gsz = 0;
+        unsigned prot = 0, maxprot = 0;
+        ocerz_guest_vm_region(&ga, &gsz, &prot, &maxprot);
+        if ((prot || maxprot) && ((ga <= query && query - ga < gsz) || ga <= ocerz_ld(addrp, 8))) {
+            ocerz_st(addrp, 8, ga);
+            ocerz_st(sizep, 8, gsz);
+            ocerz_st(info, 4, prot);
+            ocerz_st(info + 4, 4, maxprot);
+        }
+    }
+    return sb_ret(vm, cpu, kr);
+}
+
+int ocerz_sys_mach_vm_region(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_vm_region(vm, cpu, "_mach_vm_region");
+}
+
+int ocerz_sys_vm_region_64(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_vm_region(vm, cpu, "_vm_region_64");
 }
 
 int ocerz_sys_mach_vm_map(struct OcerzVM *vm, OcerzCPU *cpu)

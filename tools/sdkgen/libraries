@@ -244,3 +244,34 @@ pass AuthenticationServices.h
 library CoreLocation /System/Library/Frameworks/CoreLocation.framework/Versions/A/CoreLocation System/Library/Frameworks/CoreLocation.framework/CoreLocation.tbd
 language objective-c
 pass CoreLocation.h
+
+library ServiceManagement /System/Library/Frameworks/ServiceManagement.framework/Versions/A/ServiceManagement System/Library/Frameworks/ServiceManagement.framework/ServiceManagement.tbd
+language objective-c
+pass ServiceManagement.h
+
+library UniformTypeIdentifiers /System/Library/Frameworks/UniformTypeIdentifiers.framework/Versions/A/UniformTypeIdentifiers System/Library/Frameworks/UniformTypeIdentifiers.framework/UniformTypeIdentifiers.tbd
+language objective-c
+pass UniformTypeIdentifiers.h
+
+library CoreMediaIO /System/Library/Frameworks/CoreMediaIO.framework/Versions/A/CoreMediaIO System/Library/Frameworks/CoreMediaIO.framework/CoreMediaIO.tbd
+language objective-c
+pass CoreMediaIO.h
+
+library Network /System/Library/Frameworks/Network.framework/Versions/A/Network System/Library/Frameworks/Network.framework/Network.tbd
+pass Network.h
+
+library MediaPlayer /System/Library/Frameworks/MediaPlayer.framework/Versions/A/MediaPlayer System/Library/Frameworks/MediaPlayer.framework/MediaPlayer.tbd
+language objective-c
+pass MediaPlayer.h
+
+library StoreKit /System/Library/Frameworks/StoreKit.framework/Versions/A/StoreKit System/Library/Frameworks/StoreKit.framework/StoreKit.tbd
+language objective-c
+pass StoreKit.h
+
+library QuickLookUI /System/Library/Frameworks/QuickLookUI.framework/Versions/A/QuickLookUI System/Library/Frameworks/QuickLookUI.framework/QuickLookUI.tbd
+language objective-c
+pass QuickLookUI.h
+
+library Accessibility /System/Library/Frameworks/Accessibility.framework/Versions/A/Accessibility System/Library/Frameworks/Accessibility.framework/Accessibility.tbd
+language objective-c
+pass Accessibility.h

@@ -87,7 +87,11 @@
  * pointer.  A block result of a send is borrowed, as a getter's is.  A function
  * pointer, ^?, crosses as a pointer when it is null or native; a guest one is
  * x86 code with no signature an encoding could give it, so it stops the send by
- * name, since native code calling it would jump into x86 bytes.  A guest stack
+ * name, since native code calling it would jump into x86 bytes.  The exception
+ * is a selector whose documentation fixes the function's type, the comparator
+ * of sortSubviewsUsingFunction:context: and the sorted-array methods, which
+ * g_ob_fnargs lists: there the argument is written as a callback with that
+ * signature, and the guest function crosses as a trampoline.  A guest stack
  * block sent -copy, which manual reference counting does, is copied the way
  * _Block_copy copies one, guest-side, since the native method would run its
  * x86 copy helper.
@@ -1007,6 +1011,37 @@ static const OcerzObjcVariadic g_ob_variadic[] = {
     { "initWithObjectsAndKeys:",               OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0 },
 };
 
+static const char *ob_arg_at(const char *notation, int index);
+
+static const struct {
+    const char *sel;
+    int arg;
+    const char *notation;
+} g_ob_fnargs[] = {
+    { "sortSubviewsUsingFunction:context:",       2, "l(ppp)" },
+    { "sortedArrayUsingFunction:context:",        2, "l(ppp)" },
+    { "sortedArrayUsingFunction:context:hint:",   2, "l(ppp)" },
+    { "sortUsingFunction:context:",               2, "l(ppp)" },
+};
+
+static int ob_fnarg_notation(const char *sel, const char *notation, uint32_t *fnptrs, char *out, size_t outlen)
+{
+    for (size_t i = 0; sel && i < sizeof g_ob_fnargs / sizeof g_ob_fnargs[0]; i++) {
+        if (strcmp(g_ob_fnargs[i].sel, sel) != 0)
+            continue;
+        int arg = g_ob_fnargs[i].arg;
+        const char *at = ob_arg_at(notation, arg);
+        if (!at || *at != 'p' || !(*fnptrs & (1u << arg)))
+            return 0;
+        int n = snprintf(out, outlen, "%.*sc{%s}%s", (int)(at - notation), notation, g_ob_fnargs[i].notation, at + 1);
+        if (n < 0 || (size_t)n >= outlen)
+            return 0;
+        *fnptrs &= ~(1u << arg);
+        return 1;
+    }
+    return 0;
+}
+
 const OcerzObjcVariadic *ocerz_objc_variadic(const char *sel)
 {
     if (!sel)
@@ -1131,10 +1166,13 @@ static void ob_describe(void *cls, void *sel, const char *enc, const char *sourc
         ob_refuse(cls, sel, "cannot cross: its %s type encoding %s has %s", source,
                   enc ? enc : "(none)", ocerz_objc_refusal(rc));
 
-    const ObShape *shape = ob_shape(notation);
+    char withfn[OCERZ_OBJC_NOTATION_MAX];
+    const char *use = ob_fnarg_notation(ob_sel_getName(sel), notation, &fnptrs, withfn, sizeof withfn) ? withfn
+                                                                                                        : notation;
+    const ObShape *shape = ob_shape(use);
     if (!shape)
         ob_refuse(cls, sel, "cannot cross: its %s type encoding %s gives the notation %s, which the ABI"
-                  " engine refuses", source, enc, notation);
+                  " engine refuses", source, enc, use);
 
     const OcerzObjcVariadic *v = ocerz_objc_variadic(ob_sel_getName(sel));
     if (v) {
@@ -2071,6 +2109,12 @@ static ObVeneer g_ob_snprintf_chk = {
 static ObVeneer g_ob_sscanf = {
     "_sscanf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vsscanf"), "i(pp)", "i(ppp)", 1, OCERZ_OBJC_FMT_C,
 };
+static ObVeneer g_ob_sscanf_l = {
+    "_sscanf_l", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vsscanf_l"), "i(ppp)", "i(pppp)", 2, OCERZ_OBJC_FMT_C,
+};
+static ObVeneer g_ob_asprintf_l = {
+    "_asprintf_l", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vasprintf_l"), "i(ppp)", "i(pppp)", 2, OCERZ_OBJC_FMT_C,
+};
 static ObVeneer g_ob_scanf = {
     "_scanf", OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "vscanf"), "i(p)", "i(pp)", 0, OCERZ_OBJC_FMT_C,
 };
@@ -2301,6 +2345,7 @@ int ocerz_fmt_sprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, 
 int ocerz_fmt_snprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_snprintf); }
 int ocerz_fmt_snprintf_l(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_snprintf_l); }
 int ocerz_fmt_asprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_asprintf); }
+int ocerz_fmt_asprintf_l(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_asprintf_l); }
 int ocerz_fmt_dprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_dprintf); }
 int ocerz_fmt_syslog(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_syslog); }
 int ocerz_fmt_warn(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_veneer(vm, cpu, &g_ob_warn); }
@@ -2321,6 +2366,7 @@ int ocerz_fmt_vsprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(
 int ocerz_fmt_vsnprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_snprintf, "_vsnprintf"); }
 int ocerz_fmt_vsnprintf_l(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_snprintf_l, "_vsnprintf_l"); }
 int ocerz_fmt_vasprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_asprintf, "_vasprintf"); }
+int ocerz_fmt_vasprintf_l(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_asprintf_l, "_vasprintf_l"); }
 int ocerz_fmt_vdprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_dprintf, "_vdprintf"); }
 int ocerz_fmt_vsyslog(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_syslog, "_vsyslog"); }
 int ocerz_fmt_vwarn(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_warn, "_vwarn"); }
@@ -2328,9 +2374,11 @@ int ocerz_fmt_vwarnx(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm
 int ocerz_fmt_vsprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_sprintf_chk, "___vsprintf_chk"); }
 int ocerz_fmt_vsnprintf_chk(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_va_veneer(vm, cpu, &g_ob_snprintf_chk, "___vsnprintf_chk"); }
 int ocerz_fmt_sscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_veneer(vm, cpu, &g_ob_sscanf, "_sscanf"); }
+int ocerz_fmt_sscanf_l(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_veneer(vm, cpu, &g_ob_sscanf_l, "_sscanf_l"); }
 int ocerz_fmt_scanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_veneer(vm, cpu, &g_ob_scanf, "_scanf"); }
 int ocerz_fmt_fscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_veneer(vm, cpu, &g_ob_fscanf, "_fscanf"); }
 int ocerz_fmt_vsscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_va_veneer(vm, cpu, &g_ob_sscanf, "_vsscanf"); }
+int ocerz_fmt_vsscanf_l(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_va_veneer(vm, cpu, &g_ob_sscanf_l, "_vsscanf_l"); }
 int ocerz_fmt_vscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_va_veneer(vm, cpu, &g_ob_scanf, "_vscanf"); }
 int ocerz_fmt_vfscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return ob_scan_va_veneer(vm, cpu, &g_ob_fscanf, "_vfscanf"); }
 
