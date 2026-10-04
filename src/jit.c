@@ -319,6 +319,10 @@
  * sentinel pair pushes it back first, since the saved frame registers sit right
  * above it.  Brawlhalla's translated throughput rose by a third; the kernels the
  * host RAS was built for (memcpy, str, leafcall, icall) measure the same.
+ * OCERZ_PERFSTAT splits misses into an empty stack, a null entry and a
+ * mismatched address and names the ret sites that miss most.  On R.E.P.O.'s
+ * menu 183.6 of 184.1 million misses were the empty stack, which costs a cache
+ * probe rather than a trip out.
  *
  * A chain is a b patched into the exiting block, and a b reaches 128 MB.  The
  * arena is 1 GB and filled front to back, so a caller translated late chains
@@ -1543,7 +1547,18 @@ static const char *ps_shape_name[9] = { "push", "pop", "test", "movsxd", "call",
                                         "jmp", "jmpind", "jmpmem" };
 
 static _Atomic unsigned long long ps_chain_ok, ps_chain_far;
-static unsigned long long ps_ras_miss, ps_ras_stale, ps_ras_noslot;
+static unsigned long long ps_ras_miss, ps_ras_stale, ps_ras_null, ps_ras_sentinel, ps_ras_noslot;
+#define PS_RETSITE_N 65536
+static struct { uint64_t rip, n; } ps_retsite[PS_RETSITE_N];
+static uint64_t *ps_retsite_counter(uint64_t rip)
+{
+    unsigned i = (unsigned)((rip * 0x9E3779B97F4A7C15ull) >> 48) & (PS_RETSITE_N - 1);
+    for (unsigned k = 0; k < 64; k++, i = (i + 1) & (PS_RETSITE_N - 1)) {
+        if (ps_retsite[i].rip == rip) return &ps_retsite[i].n;
+        if (!ps_retsite[i].rip) { ps_retsite[i].rip = rip; return &ps_retsite[i].n; }
+    }
+    return &ps_retsite[0].n;
+}
 static unsigned long long ps_chain_veneer;
 static uint64_t ps_t0;
 
@@ -14021,6 +14036,12 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             a64_ldp_post(b, 29, 30, 31, 16);
             a64_br(b, JT0);
 
+            uint32_t *null_pop = NULL;
+            if (ocerz_perfstat > 0) {
+                null_pop = a64_label(b);
+                a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_null);
+                a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
+            }
             uint32_t *miss_pop = a64_label(b);
             if (!hostras) a64_str(b, 4, JT2, 20, RAS_TOP_OFF);
             if (fast3 && ras_body_only()) a64_str(b, 8, JT1, 20, RIP_OFF);
@@ -14028,6 +14049,12 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 g_tc_bad = 1;
                 a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_stale);
                 a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
+                a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)ps_retsite_counter(insn->rip));
+                a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
+                uint32_t *nz = a64_label(b); a64_cbnz(b, 1, JTF, 0);
+                a64_mov_imm64(b, JTA, (uint64_t)(uintptr_t)&ps_ras_sentinel);
+                a64_ldr(b, 8, JTU, JTA, 0); a64_add_imm(b, 1, JTU, JTU, 1); a64_str(b, 8, JTU, JTA, 0);
+                a64_patch_cbz(nz, a64_label(b));
             }
             uint32_t *skip_rip = NULL;
             if (fast3 && ras_body_only()) { skip_rip = a64_label(b); a64_b(b, 0); }
@@ -14046,7 +14073,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                 else if ((*ras_stale[i] & 0xff000010u) == 0x54000000u)
                     a64_patch_bcond(ras_stale[i], miss_pop);
                 else
-                    a64_patch_cbz(ras_stale[i], miss_pop);
+                    a64_patch_cbz(ras_stale[i], null_pop ? null_pop : miss_pop);
             }
             if (hostras) {
                 uint32_t *keep = a64_label(b); a64_cbnz(b, 1, JTF, 0);
@@ -20067,7 +20094,22 @@ static void ps_report(OcerzJit *jit)
                 ps_shapes[rows[i].op][0], ps_shapes[rows[i].op][1], ps_shapes[rows[i].op][2]);
     }
     {
-        fprintf(stderr, "ocerz: PERFSTAT[%d]   RAS misses=%llu (stale=%llu)  align-hotpatches=%llu  ras_slots=%u/%u call-sites-without-slot=%llu\n", (int)getpid(), ps_ras_miss, ps_ras_stale, ps_align_patches, g_ras_slot_n, (unsigned)RAS_SLOT_CAP, ps_ras_noslot);
+        fprintf(stderr, "ocerz: PERFSTAT[%d]   RAS misses=%llu (stale=%llu, null entry=%llu, empty=%llu)  align-hotpatches=%llu  ras_slots=%u/%u call-sites-without-slot=%llu\n", (int)getpid(), ps_ras_miss, ps_ras_stale, ps_ras_null, ps_ras_sentinel, ps_align_patches, g_ras_slot_n, (unsigned)RAS_SLOT_CAP, ps_ras_noslot);
+        {
+            uint64_t top_n[12] = {0}, top_r[12] = {0};
+            for (unsigned i = 0; i < PS_RETSITE_N; i++) {
+                uint64_t n = ps_retsite[i].n;
+                for (int k = 0; k < 12; k++)
+                    if (n > top_n[k]) {
+                        for (int q = 11; q > k; q--) { top_n[q] = top_n[q - 1]; top_r[q] = top_r[q - 1]; }
+                        top_n[k] = n; top_r[k] = ps_retsite[i].rip;
+                        break;
+                    }
+            }
+            for (int k = 0; k < 12 && top_n[k]; k++)
+                fprintf(stderr, "ocerz: PERFSTAT[%d]   RETMISS #%d rip=%#llx stale=%llu\n", (int)getpid(), k + 1,
+                        (unsigned long long)top_r[k], (unsigned long long)top_n[k]);
+        }
         unsigned long long cok = ps_chain_ok, cfar = ps_chain_far, ctot = cok + cfar + ps_chain_veneer;
         if (ctot)
             fprintf(stderr,
