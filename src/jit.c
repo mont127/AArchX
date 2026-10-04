@@ -158,7 +158,12 @@
  * takes the general form.  In the Wine layout that took memcpy from 6.1x of
  * Rosetta's time to 3.1x, a mixed workload from 3.0x to 1.65x and an
  * interpreter loop from 1.5x to 1.0x (OCERZ_NO_FAST_LOW_GUARD=1 keeps the
- * general form everywhere).
+ * general form everywhere).  The general form for the top strip is emitted
+ * out of line at the end of the block, so a hot loop carries only the short
+ * forms.  Stack accesses (push, pop, call, ret and rsp-relative operands) are
+ * plain in this mode as in every other, after the translation instead of in
+ * place of it; they used to take the ordered load and store
+ * (OCERZ_TSO_STRICT=1 orders them everywhere).
  *
  * The integer SSE forms map almost one to one: widening multiplies and a
  * narrowing unzip for the high halves and pmaddubsw, saturating narrows for the
@@ -753,6 +758,8 @@ static int g_no_oolslow;
 static void ea_cache_reset(void);
 static int g_const_ea_valid;
 static uint64_t g_const_ea;
+static int g_ea_plain;
+static inline int stack_plain_now(void);
 
 typedef struct {
     uint32_t *bne;
@@ -1357,6 +1364,7 @@ static inline int mem_plain_access_ok(const X86Operand *m)
 static inline int jgb_usable(void);
 static inline int mem_fast_forms_ok(void) { return jgb_usable() && !mem_guard_needed(); }
 static inline int stack_guard_needed(void) { return ocerz_low_base != 0; }
+static inline int stack_plain_now(void) { return ocerz_low_base != 0 && stack_plain_ok(); }
 static const uint32_t *g_push_entry;
 static struct { uint32_t *site; uint32_t *target; } g_stop_extra[6];
 static int g_n_stop_extra;
@@ -2418,6 +2426,7 @@ static void emit_stack_push64(A64Buf *b, const X86Insn *insn, int hs, int rv)
     }
     a64_sub_imm(b, 1, JTA, hs, 8);
     uint32_t *skip = emit_commpage_guard(b, insn, JTA, NULL, NULL);
+    g_ea_plain = stack_plain_now();
     emit_guest_store_ordered(b, 8, rv, JTA, JTU);
     if (skip) a64_patch_b(skip, a64_label(b));
     a64_sub_imm(b, 1, hs, hs, 8);
@@ -2435,6 +2444,7 @@ static void emit_stack_pop64(A64Buf *b, const X86Insn *insn, int hs, int rd)
     }
     a64_mov_reg(b, 1, JTA, hs);
     uint32_t *skip = emit_commpage_guard(b, insn, JTA, NULL, NULL);
+    g_ea_plain = stack_plain_now();
     emit_guest_load_ordered(b, 8, rd, JTA, JTU);
     if (skip) a64_patch_b(skip, a64_label(b));
     a64_add_imm(b, 1, hs, hs, 8);
@@ -3924,6 +3934,7 @@ static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, i
 static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int addr_reg)
 {
     g_const_ea_valid = 0;
+    g_ea_plain = ocerz_low_base != 0 && insn->seg == OCERZ_SEG_NONE && !insn->mode32 && mem_plain_access_ok(op);
     uint64_t fold = ea_fold();
     int seg = insn->seg;
     if (seg != OCERZ_SEG_NONE) {
@@ -4046,6 +4057,9 @@ static int insn_const_addr(const X86Insn *insn, uint64_t *ga)
 }
 
 static void emit_guard_full(A64Buf *b, int addr_reg);
+#define GUARD_ARMS_MAX 128
+static struct { uint32_t *site, *back; int reg, idx; } g_garm[GUARD_ARMS_MAX];
+static int g_n_garm;
 
 _Static_assert(OCERZ_TOP_LO == (1ull << 47) - (1ull << 25), "the fast low guard tests the top strip with shifts by 25 and 22");
 
@@ -4093,6 +4107,16 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         a64_lsr_imm(b, 1, JTT, addr_reg, 25);
         a64_add_imm(b, 1, JTT, JTT, 1);
         a64_lsr_imm(b, 1, JTT, JTT, 22);
+        if (g_n_garm < GUARD_ARMS_MAX) {
+            g_garm[g_n_garm].site = a64_label(b);
+            a64_cbnz(b, 1, JTT, 0);
+            g_garm[g_n_garm].back = a64_label(b);
+            g_garm[g_n_garm].reg = addr_reg;
+            g_garm[g_n_garm].idx = g_cur_insn_idx;
+            g_n_garm++;
+            a64_patch_b(done_low, a64_label(b));
+            return NULL;
+        }
         uint32_t *identity = a64_label(b);
         a64_cbz(b, 1, JTT, 0);
         emit_guard_full(b, addr_reg);
@@ -4269,7 +4293,7 @@ static void emit_granule_cross_test(A64Buf *b, int size, int ra, int scratch)
 
 static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int scratch)
 {
-    if (g_plain_mem) {
+    if (g_plain_mem || g_ea_plain) {
         a64_str(b, size, rv, ra, 0);
         return;
     }
@@ -4310,7 +4334,7 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
 
 static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scratch)
 {
-    if (g_plain_mem) {
+    if (g_plain_mem || g_ea_plain) {
         a64_ldr(b, size, rd, ra, 0);
         return;
     }
@@ -5168,6 +5192,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
                 a64_sub_imm(b, 1, JTA, pin_hreg(rs), 8);
                 skip = emit_commpage_guard(b, insn, JTA,
                                            exit_sites, n_exits);
+                g_ea_plain = stack_plain_now();
                 emit_guest_store_ordered(b, 8, rv, JTA, JTU);
                 a64_sub_imm(b, 1, pin_hreg(rs), pin_hreg(rs), 8);
             }
@@ -5187,6 +5212,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         emit_add_const(b, JTA, gbase - ea_fold());
 
+        g_ea_plain = stack_plain_now();
         emit_guest_store_ordered(b, 8, JT1, JTA, JTU);
         a64_sub_imm(b, 1, JT0, JT0, 8);
         emit_gpr_wr(b, JT0, OCERZ_RSP);
@@ -5220,6 +5246,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             } else {
                 skip = emit_commpage_guard(b, insn, pin_hreg(rs),
                                            exit_sites, n_exits);
+                g_ea_plain = stack_plain_now();
                 emit_guest_load_ordered(b, 8, rd, pin_hreg(rs), JTU);
                 a64_add_imm(b, 1, pin_hreg(rs), pin_hreg(rs), 8);
             }
@@ -5235,6 +5262,7 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
 
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         emit_add_const(b, JTA, gbase - ea_fold());
+        g_ea_plain = stack_plain_now();
         emit_guest_load_ordered(b, 8, JT1, JTA, JTU);
 
         a64_add_imm(b, 1, JT0, JT0, 8);
@@ -13544,6 +13572,7 @@ static int emit_call_region_call(A64Buf *b, const X86Insn *insn,
     } else {
         a64_sub_imm(b, 1, JTA, pin_hreg(rs), 8);
         skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        g_ea_plain = stack_plain_now();
         emit_guest_store_ordered(b, 8, JRET_GUEST, JTA, JTU);
         a64_sub_imm(b, 1, pin_hreg(rs), pin_hreg(rs), 8);
     }
@@ -13601,6 +13630,7 @@ static int emit_call_region_ret(A64Buf *b, const X86Insn *insn,
     } else {
         skip = emit_commpage_guard(b, insn, pin_hreg(rs),
                                    exit_sites, n_exits);
+        g_ea_plain = stack_plain_now();
         emit_guest_load_ordered(b, 8, JT1, pin_hreg(rs), JTU);
         a64_add_imm(b, 1, pin_hreg(rs), pin_hreg(rs), 8);
     }
@@ -13792,6 +13822,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
             emit_add_const(b, JTA, gbase - ea_fold());
 
+            g_ea_plain = stack_plain_now();
             emit_guest_store_ordered(b, 8, JT1, JTA, JTU);
             a64_sub_imm(b, 1, JT0, JT0, 8);
             emit_gpr_wr(b, JT0, OCERZ_RSP);
@@ -13866,6 +13897,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
             uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
             emit_add_const(b, JTA, gbase - ea_fold());
+            g_ea_plain = stack_plain_now();
             emit_guest_load_ordered(b, 8, JT1, JTA, JTU);
 
             a64_add_imm(b, 1, JT0, JT0, 8);
@@ -14514,6 +14546,7 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
     emit_add_const(b, JTA, ea_fold());
     uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
     emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+    g_ea_plain = stack_plain_now();
     emit_guest_store_ordered(b, 8, JT2, JTA, JTU);
     a64_sub_imm(b, 1, JT0, JT0, 8);
     emit_gpr_wr(b, JT0, OCERZ_RSP);
@@ -15466,6 +15499,24 @@ static void emit_misaligned_arm(A64Buf *b, const OrderedSlowPend *o)
     }
     a64_patch_b(to_done[0], a64_label(b));
     a64_patch_b(to_done[1], a64_label(b));
+}
+
+static void emit_guard_arms(A64Buf *b, const uint32_t *entry)
+{
+    for (int k = 0; k < g_n_garm; k++) {
+        uint32_t *lo = a64_label(b);
+        a64_patch_cbz(g_garm[k].site, lo);
+        emit_guard_full(b, g_garm[k].reg);
+        uint32_t *here = a64_label(b);
+        a64_b(b, (int32_t)(g_garm[k].back - here));
+        if (g_n_fpbmap < JIT_MAX_BLOCK_INSNS) {
+            g_fpbmap[g_n_fpbmap].lo = (uint32_t)(lo - entry);
+            g_fpbmap[g_n_fpbmap].hi = (uint32_t)(a64_label(b) - entry);
+            g_fpbmap[g_n_fpbmap].idx = g_garm[k].idx;
+            g_n_fpbmap++;
+        }
+    }
+    g_n_garm = 0;
 }
 
 static void emit_ordered_slow_arms(A64Buf *b, JitBlock *blk, const uint32_t *entry)
@@ -16852,6 +16903,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_nzcv_want = 0; g_nzcv_from = -1;
     g_jcc_edge[0].cond_site = NULL; g_jcc_edge[1].cond_site = NULL;
     g_n_oslow = 0;
+    g_n_garm = 0;
     g_n_nanool = 0;
     g_n_pe_real = 0;
     g_n_promo_real = 0;
@@ -17507,6 +17559,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         const X86Insn *insn = &blk->insns[i];
         g_cur_insn_idx = i;
         g_cur_insn_start = b.p;
+        g_ea_plain = 0;
         lanerec_note((uint32_t)(b.p - entry));
         if (i == 0 && fps_watch(rip)) {
             g_tc_bad = 1;
@@ -17842,6 +17895,7 @@ promo_push_fallthrough:
                     uint32_t *skip = emit_commpage_guard(&b, insn, JTA, exit_sites, &n_exits);
                     emit_add_const(&b, JTA, ocerz_guest_base - ea_fold());
                     a64_mov_imm64(&b, JT1, insn->rip + insn->len);
+                    g_ea_plain = stack_plain_now();
                     emit_guest_store_ordered(&b, 8, JT1, JTA, JTU);
                     patch_guard_skip(skip, a64_label(&b));
                     a64_sub_imm(&b, 1, hs, hs, 8);
@@ -18153,6 +18207,7 @@ promo_push_fallthrough:
         a64_b(&b, (int32_t)(st->back - here));
     }
     emit_oolslow_arms(&b, exit_sites, &n_exits);
+    emit_guard_arms(&b, entry);
     emit_ordered_slow_arms(&b, blk, entry);
     emit_nan_ool_arms(&b, blk, entry);
     if (loop_poll_exit) {
