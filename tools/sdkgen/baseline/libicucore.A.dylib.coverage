@@ -2,13 +2,13 @@ library /usr/lib/libicucore.A.dylib
 sdk macos 27.0
 exports 8932
 fn 240
-data 714
+data 718
 var 0
 special 0
 stub callback-pointer 2
 stub callback-struct 9
-stub no-declaration 7880
-omit no-declaration-missing 87
+stub no-declaration 7943
+omit no-declaration-missing 20
 host-missing 0
 objc-classes 0
 objc-eh-types 0

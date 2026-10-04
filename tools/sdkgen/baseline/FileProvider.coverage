@@ -2,14 +2,13 @@ library /System/Library/Frameworks/FileProvider.framework/Versions/A/FileProvide
 sdk macos 27.0
 exports 1025
 fn 0
-data 520
+data 521
 var 0
 special 0
-stub no-declaration 465
-omit no-declaration-missing 17
+stub no-declaration 481
 omit objc-ivar 16
 omit swift 7
-host-missing 4
+host-missing 0
 objc-classes 133
 objc-eh-types 0
 objc-ivars 16

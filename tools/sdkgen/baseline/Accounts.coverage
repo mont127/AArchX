@@ -2,12 +2,11 @@ library /System/Library/Frameworks/Accounts.framework/Versions/A/Accounts
 sdk macos 27.0
 exports 529
 fn 0
-data 502
+data 503
 var 0
 special 0
-stub no-declaration 23
-omit no-declaration-missing 4
-host-missing 2
+stub no-declaration 26
+host-missing 0
 objc-classes 35
 objc-eh-types 0
 objc-ivars 0

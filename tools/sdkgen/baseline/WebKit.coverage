@@ -2,14 +2,14 @@ library /System/Library/Frameworks/WebKit.framework/Versions/A/WebKit
 sdk macos 27.0
 exports 3491
 fn 0
-data 977
+data 985
 var 0
 special 0
-stub no-declaration 2068
-omit no-declaration-missing 166
+stub no-declaration 2171
+omit no-declaration-missing 8
 omit objc-ivar 1
-omit swift 279
-host-missing 20
+omit swift 326
+host-missing 0
 objc-classes 354
 objc-eh-types 0
 objc-ivars 1

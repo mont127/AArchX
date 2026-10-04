@@ -6,11 +6,10 @@ data 3
 var 0
 special 0
 stub callback-struct 7
-stub no-declaration 82
+stub no-declaration 94
 stub va-list 3
 stub variadic 8
-omit no-declaration-missing 12
-host-missing 6
+host-missing 0
 objc-classes 0
 objc-eh-types 0
 objc-ivars 0

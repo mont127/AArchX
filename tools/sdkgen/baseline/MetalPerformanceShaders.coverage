@@ -5,10 +5,9 @@ fn 12
 data 1506
 var 0
 special 0
-stub no-declaration 348
-omit no-declaration-missing 5
+stub no-declaration 353
 omit objc-ivar 167
-host-missing 4
+host-missing 0
 objc-classes 734
 objc-eh-types 0
 objc-ivars 167

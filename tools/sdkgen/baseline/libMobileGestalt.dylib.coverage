@@ -2,11 +2,12 @@ library /usr/lib/libMobileGestalt.dylib
 sdk macos 27.0
 exports 1395
 fn 0
-data 10
+data 20
 var 0
 special 0
-stub no-declaration 1117
-omit no-declaration-missing 268
+stub no-declaration 1235
+omit no-declaration-missing 6
+omit swift 134
 host-missing 0
 objc-classes 1
 objc-eh-types 0

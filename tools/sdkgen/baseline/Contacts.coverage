@@ -2,14 +2,14 @@ library /System/Library/Frameworks/Contacts.framework/Versions/A/Contacts
 sdk macos 27.0
 exports 2206
 fn 0
-data 1182
+data 1183
 var 0
 special 0
-stub no-declaration 475
-omit no-declaration-missing 42
+stub no-declaration 488
+omit no-declaration-missing 19
 omit objc-ivar 7
-omit swift 500
-host-missing 2
+omit swift 509
+host-missing 0
 objc-classes 294
 objc-eh-types 0
 objc-ivars 7
