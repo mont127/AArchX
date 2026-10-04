@@ -70,8 +70,8 @@ ends it. Inside a block:
 
 **The instruction set** is x86-64-v3 as Rosetta runs it on macOS 15 and later: AVX2, FMA, BMI1 and BMI2, F16C,
 LZCNT, MOVBE and XSAVE, none of which CPUID advertises under either. SSE4.2 is
-implemented and advertised, because Steam checks for it. MMX, 80-bit x87 and
-a few AVX2 forms run only in the interpreter; see
+implemented and advertised, because Steam checks for it. 80-bit x87 and a few
+AVX2 forms run only in the interpreter; see
 [Compatibility](compatibility.md#known-limitations).
 
 A guest that writes over code it has already executed is handled by making the

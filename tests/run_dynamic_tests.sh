@@ -892,6 +892,7 @@ run_weak_unloaded_case dweak_unloaded 'OK'
 run_metal_nocopy_low_case dmetal_nocopy_low 'OK'
 run_iosurface_low_stack_case diosurface_low_stack 'OK'
 run_low_golden_case dsimd_low tests/guest/simd_pack_jit.c tests/guest/expect/simd_pack_jit.out
+run_low_golden_case dmmx_low tests/guest/mmx_jit.c tests/guest/expect/mmx_jit.out
 export OCERZ_TSO_NARROW=1
 run_low_golden_case dtso_narrow_low tests/dynamic/tso_narrow.c tests/dynamic/tso_narrow.out
 unset OCERZ_TSO_NARROW

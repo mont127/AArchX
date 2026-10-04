@@ -309,9 +309,11 @@ These apply to cache mode, or to both modes. Native mode's own are in
   `bzhi` when their flags are dead. Still interpreted: 256-bit byte and integer
   shuffles, unpacks, permutes and lane inserts, `vptest`, the immediate blends,
   mask-producing compares, gathers, `bextr`, `pdep` and `pext`.
-- MMX instructions always run in the interpreter, and the MMX registers are
-  kept apart from the x87 stack, so `FXSAVE` and signal frames do not carry
-  them.
+- The MMX registers are kept apart from the x87 stack, so `FXSAVE` and signal
+  frames do not carry them. Most MMX instructions are translated; `pmaddwd`,
+  `pmovmskb`, `emms`, the SSSE3 forms on MMX registers, the conversions
+  between MMX and SSE registers and shifts by a register count still run in
+  the interpreter.
 - The approximate `RCP` and `RSQRT` results are not implemented. SSE rounding
   modes are: the guest's MXCSR rounding control drives the host's.
 - Guest protection changes are resolved on the host's 16 KB page boundaries.
