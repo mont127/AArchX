@@ -1,0 +1,1 @@
+#include <QuickLookThumbnailing/QuickLookThumbnailing.h>

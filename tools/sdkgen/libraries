@@ -401,3 +401,279 @@ pass libarchive.h
 
 library Kerberos /System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos System/Library/Frameworks/Kerberos.framework/Kerberos.tbd
 pass Kerberos.h
+
+library _LocationEssentials /System/Library/Frameworks/_LocationEssentials.framework/Versions/A/_LocationEssentials System/Library/Frameworks/_LocationEssentials.framework/_LocationEssentials.tbd
+language objective-c
+pass _LocationEssentials.h
+
+library JavaScriptCore /System/Library/Frameworks/JavaScriptCore.framework/Versions/A/JavaScriptCore System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore.tbd
+language objective-c
+pass JavaScriptCore.h
+
+library ColorSync /System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync System/Library/Frameworks/ColorSync.framework/ColorSync.tbd
+pass ColorSync.h
+
+library libsasl2 /usr/lib/libsasl2.2.dylib usr/lib/libsasl2.2.tbd
+pass libsasl2.h
+
+library libpam /usr/lib/libpam.2.dylib usr/lib/libpam.2.tbd
+pass libpam.h
+
+library ScreenCaptureKit /System/Library/Frameworks/ScreenCaptureKit.framework/Versions/A/ScreenCaptureKit System/Library/Frameworks/ScreenCaptureKit.framework/ScreenCaptureKit.tbd
+language objective-c
+pass ScreenCaptureKit.h
+
+library SharedWithYou /System/Library/Frameworks/SharedWithYou.framework/Versions/A/SharedWithYou System/Library/Frameworks/SharedWithYou.framework/SharedWithYou.tbd
+language objective-c
+pass SharedWithYou.h
+
+library SharedWithYouCore /System/Library/Frameworks/SharedWithYouCore.framework/Versions/A/SharedWithYouCore System/Library/Frameworks/SharedWithYouCore.framework/SharedWithYouCore.tbd
+language objective-c
+pass SharedWithYouCore.h
+
+library QuickLook /System/Library/Frameworks/QuickLook.framework/Versions/A/QuickLook System/Library/Frameworks/QuickLook.framework/QuickLook.tbd
+pass QuickLook.h
+
+library PhotosUI /System/Library/Frameworks/PhotosUI.framework/Versions/A/PhotosUI System/Library/Frameworks/PhotosUI.framework/PhotosUI.tbd
+language objective-c
+pass PhotosUI.h
+
+library NetFS /System/Library/Frameworks/NetFS.framework/Versions/A/NetFS System/Library/Frameworks/NetFS.framework/NetFS.tbd
+pass NetFS.h
+
+library NetworkExtension /System/Library/Frameworks/NetworkExtension.framework/Versions/A/NetworkExtension System/Library/Frameworks/NetworkExtension.framework/NetworkExtension.tbd
+language objective-c
+pass NetworkExtension.h
+
+library QuickLookThumbnailing /System/Library/Frameworks/QuickLookThumbnailing.framework/Versions/A/QuickLookThumbnailing System/Library/Frameworks/QuickLookThumbnailing.framework/QuickLookThumbnailing.tbd
+language objective-c
+pass QuickLookThumbnailing.h
+
+library ScriptingBridge /System/Library/Frameworks/ScriptingBridge.framework/Versions/A/ScriptingBridge System/Library/Frameworks/ScriptingBridge.framework/ScriptingBridge.tbd
+language objective-c
+pass ScriptingBridge.h
+
+library MediaToolbox /System/Library/Frameworks/MediaToolbox.framework/Versions/A/MediaToolbox System/Library/Frameworks/MediaToolbox.framework/MediaToolbox.tbd
+pass MediaToolbox.h
+
+library AVRouting /System/Library/Frameworks/AVRouting.framework/Versions/A/AVRouting System/Library/Frameworks/AVRouting.framework/AVRouting.tbd
+language objective-c
+pass AVRouting.h
+
+library NaturalLanguage /System/Library/Frameworks/NaturalLanguage.framework/Versions/A/NaturalLanguage System/Library/Frameworks/NaturalLanguage.framework/NaturalLanguage.tbd
+language objective-c
+pass NaturalLanguage.h
+
+library SceneKit /System/Library/Frameworks/SceneKit.framework/Versions/A/SceneKit System/Library/Frameworks/SceneKit.framework/SceneKit.tbd
+language objective-c
+pass SceneKit.h
+
+library Speech /System/Library/Frameworks/Speech.framework/Versions/A/Speech System/Library/Frameworks/Speech.framework/Speech.tbd
+language objective-c
+pass Speech.h
+
+library AudioVideoBridging /System/Library/Frameworks/AudioVideoBridging.framework/Versions/A/AudioVideoBridging System/Library/Frameworks/AudioVideoBridging.framework/AudioVideoBridging.tbd
+language objective-c
+pass AudioVideoBridging.h
+
+library Quartz /System/Library/Frameworks/Quartz.framework/Versions/A/Quartz System/Library/Frameworks/Quartz.framework/Quartz.tbd
+language objective-c
+pass Quartz.h
+
+library DirectoryService /System/Library/Frameworks/DirectoryService.framework/Versions/A/DirectoryService System/Library/Frameworks/DirectoryService.framework/DirectoryService.tbd
+pass DirectoryService.h
+
+library CallKit /System/Library/Frameworks/CallKit.framework/Versions/A/CallKit System/Library/Frameworks/CallKit.framework/CallKit.tbd
+language objective-c
+pass CallKit.h
+
+library EventKit /System/Library/Frameworks/EventKit.framework/Versions/A/EventKit System/Library/Frameworks/EventKit.framework/EventKit.tbd
+language objective-c
+pass EventKit.h
+
+library iTunesLibrary /System/Library/Frameworks/iTunesLibrary.framework/Versions/A/iTunesLibrary System/Library/Frameworks/iTunesLibrary.framework/iTunesLibrary.tbd
+language objective-c
+pass iTunesLibrary.h
+
+library LinkPresentation /System/Library/Frameworks/LinkPresentation.framework/Versions/A/LinkPresentation System/Library/Frameworks/LinkPresentation.framework/LinkPresentation.tbd
+language objective-c
+pass LinkPresentation.h
+
+library PencilKit /System/Library/Frameworks/PencilKit.framework/Versions/A/PencilKit System/Library/Frameworks/PencilKit.framework/PencilKit.tbd
+language objective-c
+pass PencilKit.h
+
+library ClassKit /System/Library/Frameworks/ClassKit.framework/Versions/A/ClassKit System/Library/Frameworks/ClassKit.framework/ClassKit.tbd
+language objective-c
+pass ClassKit.h
+
+library IOBluetoothUI /System/Library/Frameworks/IOBluetoothUI.framework/Versions/A/IOBluetoothUI System/Library/Frameworks/IOBluetoothUI.framework/IOBluetoothUI.tbd
+language objective-c
+pass IOBluetoothUI.h
+
+library MetricKit /System/Library/Frameworks/MetricKit.framework/Versions/A/MetricKit System/Library/Frameworks/MetricKit.framework/MetricKit.tbd
+language objective-c
+pass MetricKit.h
+
+library LDAP /System/Library/Frameworks/LDAP.framework/Versions/A/LDAP System/Library/Frameworks/LDAP.framework/LDAP.tbd
+pass LDAP.h
+
+library NearbyInteraction /System/Library/Frameworks/NearbyInteraction.framework/Versions/A/NearbyInteraction System/Library/Frameworks/NearbyInteraction.framework/NearbyInteraction.tbd
+language objective-c
+pass NearbyInteraction.h
+
+library SpriteKit /System/Library/Frameworks/SpriteKit.framework/Versions/A/SpriteKit System/Library/Frameworks/SpriteKit.framework/SpriteKit.tbd
+language objective-c
+pass SpriteKit.h
+
+library CoreTelephony /System/Library/Frameworks/CoreTelephony.framework/Versions/A/CoreTelephony System/Library/Frameworks/CoreTelephony.framework/CoreTelephony.tbd
+language objective-c
+pass CoreTelephony.h
+
+library CoreMotion /System/Library/Frameworks/CoreMotion.framework/Versions/A/CoreMotion System/Library/Frameworks/CoreMotion.framework/CoreMotion.tbd
+language objective-c
+pass CoreMotion.h
+
+library Automator /System/Library/Frameworks/Automator.framework/Versions/A/Automator System/Library/Frameworks/Automator.framework/Automator.tbd
+language objective-c
+pass Automator.h
+
+library ShazamKit /System/Library/Frameworks/ShazamKit.framework/Versions/A/ShazamKit System/Library/Frameworks/ShazamKit.framework/ShazamKit.tbd
+language objective-c
+pass ShazamKit.h
+
+library ScreenSaver /System/Library/Frameworks/ScreenSaver.framework/Versions/A/ScreenSaver System/Library/Frameworks/ScreenSaver.framework/ScreenSaver.tbd
+language objective-c
+pass ScreenSaver.h
+
+library PreferencePanes /System/Library/Frameworks/PreferencePanes.framework/Versions/A/PreferencePanes System/Library/Frameworks/PreferencePanes.framework/PreferencePanes.tbd
+language objective-c
+pass PreferencePanes.h
+
+library MapKit /System/Library/Frameworks/MapKit.framework/Versions/A/MapKit System/Library/Frameworks/MapKit.framework/MapKit.tbd
+language objective-c
+pass MapKit.h
+
+library FSKit /System/Library/Frameworks/FSKit.framework/Versions/A/FSKit System/Library/Frameworks/FSKit.framework/FSKit.tbd
+language objective-c
+pass FSKit.h
+
+library PCSC /System/Library/Frameworks/PCSC.framework/Versions/A/PCSC System/Library/Frameworks/PCSC.framework/PCSC.tbd
+pass PCSC.h
+
+library PushKit /System/Library/Frameworks/PushKit.framework/Versions/A/PushKit System/Library/Frameworks/PushKit.framework/PushKit.tbd
+language objective-c
+pass PushKit.h
+
+library VideoSubscriberAccount /System/Library/Frameworks/VideoSubscriberAccount.framework/Versions/A/VideoSubscriberAccount System/Library/Frameworks/VideoSubscriberAccount.framework/VideoSubscriberAccount.tbd
+language objective-c
+pass VideoSubscriberAccount.h
+
+library OSAKit /System/Library/Frameworks/OSAKit.framework/Versions/A/OSAKit System/Library/Frameworks/OSAKit.framework/OSAKit.tbd
+language objective-c
+pass OSAKit.h
+
+library Collaboration /System/Library/Frameworks/Collaboration.framework/Versions/A/Collaboration System/Library/Frameworks/Collaboration.framework/Collaboration.tbd
+language objective-c
+pass Collaboration.h
+
+library LocalAuthenticationEmbeddedUI /System/Library/Frameworks/LocalAuthenticationEmbeddedUI.framework/Versions/A/LocalAuthenticationEmbeddedUI System/Library/Frameworks/LocalAuthenticationEmbeddedUI.framework/LocalAuthenticationEmbeddedUI.tbd
+language objective-c
+pass LocalAuthenticationEmbeddedUI.h
+
+library Tcl /System/Library/Frameworks/Tcl.framework/Versions/8.5/Tcl System/Library/Frameworks/Tcl.framework/Tcl.tbd
+pass Tcl.h
+
+library GameKit /System/Library/Frameworks/GameKit.framework/Versions/A/GameKit System/Library/Frameworks/GameKit.framework/GameKit.tbd
+language objective-c
+pass GameKit.h
+
+library ModelIO /System/Library/Frameworks/ModelIO.framework/Versions/A/ModelIO System/Library/Frameworks/ModelIO.framework/ModelIO.tbd
+language objective-c
+pass ModelIO.h
+
+library OpenCL /System/Library/Frameworks/OpenCL.framework/Versions/A/OpenCL System/Library/Frameworks/OpenCL.framework/OpenCL.tbd
+pass OpenCL.h
+
+library OSLog /System/Library/Frameworks/OSLog.framework/Versions/A/OSLog System/Library/Frameworks/OSLog.framework/OSLog.tbd
+language objective-c
+pass OSLog.h
+
+library vmnet /System/Library/Frameworks/vmnet.framework/Versions/A/vmnet System/Library/Frameworks/vmnet.framework/vmnet.tbd
+pass vmnet.h
+
+library DeviceCheck /System/Library/Frameworks/DeviceCheck.framework/Versions/A/DeviceCheck System/Library/Frameworks/DeviceCheck.framework/DeviceCheck.tbd
+language objective-c
+pass DeviceCheck.h
+
+library IOUSBHost /System/Library/Frameworks/IOUSBHost.framework/Versions/A/IOUSBHost System/Library/Frameworks/IOUSBHost.framework/IOUSBHost.tbd
+language objective-c
+pass IOUSBHost.h
+
+library CoreAudioKit /System/Library/Frameworks/CoreAudioKit.framework/Versions/A/CoreAudioKit System/Library/Frameworks/CoreAudioKit.framework/CoreAudioKit.tbd
+language objective-c
+pass CoreAudioKit.h
+
+library DiscRecordingUI /System/Library/Frameworks/DiscRecordingUI.framework/Versions/A/DiscRecordingUI System/Library/Frameworks/DiscRecordingUI.framework/DiscRecordingUI.tbd
+language objective-c
+pass DiscRecordingUI.h
+
+library InstallerPlugins /System/Library/Frameworks/InstallerPlugins.framework/Versions/A/InstallerPlugins System/Library/Frameworks/InstallerPlugins.framework/InstallerPlugins.tbd
+language objective-c
+pass InstallerPlugins.h
+
+library ExtensionKit /System/Library/Frameworks/ExtensionKit.framework/Versions/A/ExtensionKit System/Library/Frameworks/ExtensionKit.framework/ExtensionKit.tbd
+language objective-c
+pass ExtensionKit.h
+
+library BackgroundTasks /System/Library/Frameworks/BackgroundTasks.framework/Versions/A/BackgroundTasks System/Library/Frameworks/BackgroundTasks.framework/BackgroundTasks.tbd
+language objective-c
+pass BackgroundTasks.h
+
+library MailKit /System/Library/Frameworks/MailKit.framework/Versions/A/MailKit System/Library/Frameworks/MailKit.framework/MailKit.tbd
+language objective-c
+pass MailKit.h
+
+library MetalFX /System/Library/Frameworks/MetalFX.framework/Versions/A/MetalFX System/Library/Frameworks/MetalFX.framework/MetalFX.tbd
+language objective-c
+pass MetalFX.h
+
+library FileProviderUI /System/Library/Frameworks/FileProviderUI.framework/Versions/A/FileProviderUI System/Library/Frameworks/FileProviderUI.framework/FileProviderUI.tbd
+language objective-c
+pass FileProviderUI.h
+
+library UserNotificationsUI /System/Library/Frameworks/UserNotificationsUI.framework/Versions/A/UserNotificationsUI System/Library/Frameworks/UserNotificationsUI.framework/UserNotificationsUI.tbd
+language objective-c
+pass UserNotificationsUI.h
+
+library AutomaticAssessmentConfiguration /System/Library/Frameworks/AutomaticAssessmentConfiguration.framework/Versions/A/AutomaticAssessmentConfiguration System/Library/Frameworks/AutomaticAssessmentConfiguration.framework/AutomaticAssessmentConfiguration.tbd
+language objective-c
+pass AutomaticAssessmentConfiguration.h
+
+library DVDPlayback /System/Library/Frameworks/DVDPlayback.framework/Versions/A/DVDPlayback System/Library/Frameworks/DVDPlayback.framework/DVDPlayback.tbd
+pass DVDPlayback.h
+
+library libsbuf /usr/lib/libsbuf.dylib usr/lib/libsbuf.tbd
+pass libsbuf.h
+
+library libipsec /usr/lib/libipsec.A.dylib usr/lib/libipsec.A.tbd
+pass libipsec.h
+
+library libxar /usr/lib/libxar.1.dylib usr/lib/libxar.1.tbd
+pass libxar.h
+
+library libxslt /usr/lib/libxslt.1.dylib usr/lib/libxslt.1.tbd
+pass libxslt.h -iwithsysroot/usr/include/libxml2
+
+library libexslt /usr/lib/libexslt.0.dylib usr/lib/libexslt.0.tbd
+pass libexslt.h -iwithsysroot/usr/include/libxml2
+
+library libtidy /usr/lib/libtidy.A.dylib usr/lib/libtidy.A.tbd
+pass libtidy.h
+
+library libAppleArchive /usr/lib/libAppleArchive.dylib usr/lib/libAppleArchive.tbd
+pass libAppleArchive.h
+
+library KernelManagement /System/Library/Frameworks/KernelManagement.framework/Versions/A/KernelManagement System/Library/Frameworks/KernelManagement.framework/KernelManagement.tbd
+language objective-c
+pass KernelManagement.h

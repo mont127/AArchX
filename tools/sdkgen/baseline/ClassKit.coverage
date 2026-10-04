@@ -1,0 +1,17 @@
+library /System/Library/Frameworks/ClassKit.framework/Versions/A/ClassKit
+sdk macos 27.0
+exports 483
+fn 0
+data 367
+var 0
+special 0
+stub no-declaration 116
+host-missing 0
+objc-classes 97
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 2
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

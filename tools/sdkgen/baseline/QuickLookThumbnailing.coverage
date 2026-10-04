@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/QuickLookThumbnailing.framework/Versions/A/QuickLookThumbnailing
+sdk macos 27.0
+exports 278
+fn 0
+data 93
+var 0
+special 0
+stub no-declaration 87
+omit no-declaration-missing 1
+omit objc-ivar 42
+omit swift 55
+host-missing 0
+objc-classes 31
+objc-eh-types 0
+objc-ivars 42
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

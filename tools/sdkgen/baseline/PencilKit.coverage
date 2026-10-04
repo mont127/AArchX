@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/PencilKit.framework/Versions/A/PencilKit
+sdk macos 27.0
+exports 1407
+fn 0
+data 251
+var 0
+special 0
+stub no-declaration 428
+omit no-declaration-missing 363
+omit swift 365
+host-missing 16
+objc-classes 89
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 276
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/InstallerPlugins.framework/Versions/A/InstallerPlugins
+sdk macos 27.0
+exports 137
+fn 0
+data 48
+var 0
+special 0
+stub no-declaration 2
+omit objc-ivar 87
+host-missing 0
+objc-classes 17
+objc-eh-types 0
+objc-ivars 87
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

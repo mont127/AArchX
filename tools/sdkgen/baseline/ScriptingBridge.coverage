@@ -1,0 +1,17 @@
+library /System/Library/Frameworks/ScriptingBridge.framework/Versions/A/ScriptingBridge
+sdk macos 27.0
+exports 34
+fn 0
+data 10
+var 0
+special 0
+omit objc-ivar 24
+host-missing 0
+objc-classes 5
+objc-eh-types 0
+objc-ivars 24
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

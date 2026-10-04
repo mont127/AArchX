@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/OSAKit.framework/Versions/A/OSAKit
+sdk macos 27.0
+exports 364
+fn 0
+data 193
+var 0
+special 0
+stub no-declaration 12
+omit objc-ivar 159
+host-missing 0
+objc-classes 87
+objc-eh-types 0
+objc-ivars 159
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

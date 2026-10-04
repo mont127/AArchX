@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/LocalAuthenticationEmbeddedUI.framework/Versions/A/LocalAuthenticationEmbeddedUI
+sdk macos 27.0
+exports 39
+fn 0
+data 18
+var 0
+special 0
+stub no-declaration 11
+omit no-declaration-missing 1
+omit swift 9
+host-missing 0
+objc-classes 5
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

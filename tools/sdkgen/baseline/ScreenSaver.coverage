@@ -1,0 +1,18 @@
+library /System/Library/Frameworks/ScreenSaver.framework/Versions/A/ScreenSaver
+sdk macos 27.0
+exports 92
+fn 0
+data 61
+var 0
+special 0
+stub no-declaration 18
+omit objc-ivar 13
+host-missing 2
+objc-classes 23
+objc-eh-types 0
+objc-ivars 13
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

@@ -1,0 +1,21 @@
+library /usr/lib/libxslt.1.dylib
+sdk macos 27.0
+exports 251
+fn 69
+data 12
+var 0
+special 0
+stub callback-result 6
+stub callback-struct 77
+stub nested-callback 1
+stub no-declaration 82
+stub variadic 4
+host-missing 0
+objc-classes 0
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0
