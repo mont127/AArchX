@@ -227,7 +227,7 @@ static uint64_t fingerprint(void)
             lc += c->cmdsize;
         }
     }
-    uint64_t v[4] = { (uint64_t)ocerz_mode, ocerz_low_base, ocerz_top_base, ocerz_guest_base };
+    uint64_t v[5] = { (uint64_t)ocerz_mode, ocerz_low_base, ocerz_top_base, ocerz_guest_base, ocerz_low_window };
     h = fnv(h, v, sizeof v);
     char model[128] = "";
     size_t ml = sizeof model - 1;
