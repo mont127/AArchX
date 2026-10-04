@@ -1237,7 +1237,13 @@
 # the first time, catches a fault on a page protected to nothing with a handler
 # that leaves by siglongjmp, and drives the Mach vm calls, including a
 # protection change on a posix_memalign page and a vm_deallocate of the thread
-# list task_threads returns, both memory ocerz never mapped. sys_jmp covers
+# list task_threads returns, both memory ocerz never mapped. Its x86 build also
+# protects one 4 KB page of a 16 KB mapping read-only and asks mach_vm_region
+# about it and its neighbour, which must come back as two 4 KB regions with
+# their own protections: the host kernel's pages are 16 KB, and Electron's
+# renderers stop at an int3 when the answer for a page they protected is the
+# host's (the arm64 build has no smaller page to test and passes the group
+# empty). sys_jmp covers
 # setjmp and longjmp in every spelling: the value, the mask each form does and
 # does not restore, jumps out of signal handlers, out of a handler running on an
 # alternate stack twice, which is only right if the jump took the thread off the
@@ -1525,7 +1531,7 @@ SYS_STRFAULT_ARM64=""
 SYS_TIMEOUT=120
 SYS_WORK="$TMP/sysw"
 SYS_FILES_NEED='_open _open$NOCANCEL _openat _openat$NOCANCEL _fcntl _fcntl$NOCANCEL _ioctl _sem_open _shm_open _semctl _ulimit'
-SYS_MMAP_NEED='_mmap _munmap _mprotect _madvise _mach_vm_allocate _mach_vm_deallocate _mach_vm_protect _vm_allocate _vm_deallocate _vm_protect _sigsetjmp _siglongjmp'
+SYS_MMAP_NEED='_mmap _munmap _mprotect _madvise _mach_vm_allocate _mach_vm_deallocate _mach_vm_protect _mach_vm_region _vm_allocate _vm_deallocate _vm_protect _sigsetjmp _siglongjmp'
 SYS_JMP_NEED='_setjmp __setjmp _sigsetjmp _longjmp __longjmp _siglongjmp'
 SYS_PROC_NEED='_fork _vfork _execv _execve _execvp _execvP _execl _execle _execlp _posix_spawn _posix_spawnp _system _popen _pclose'
 SYS_PROC_KINDS='spawn spawn-attr spawnp sys_proc_script execv execve execvp execvP execl execle execlp many system popen'
@@ -10937,6 +10943,32 @@ static unsigned t_mach(void)
     return m;
 }
 
+static unsigned t_region(void)
+{
+    unsigned m = 0, bit = 1;
+#if defined(__x86_64__)
+    unsigned char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    int ok = p != MAP_FAILED;
+    CK(ok && mprotect(p + 4096, 4096, PROT_READ) == 0);
+    unsigned char *at[2] = { p + 4096 + 0x82, p + 0x10 };
+    unsigned char *base[2] = { p + 4096, p };
+    vm_prot_t want[2] = { VM_PROT_READ, VM_PROT_READ | VM_PROT_WRITE };
+    for (int k = 0; k < 2; k++) {
+        mach_vm_address_t a = ok ? (mach_vm_address_t)(uintptr_t)at[k] : 0;
+        mach_vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = ok ? mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
+                                               (vm_region_info_t)&info, &cnt, &obj) : KERN_FAILURE;
+        CK(kr == KERN_SUCCESS && a == (mach_vm_address_t)(uintptr_t)base[k] && sz == 4096 &&
+           info.protection == want[k]);
+    }
+    CK(ok && munmap(p, PAGE) == 0);
+#endif
+    return m;
+}
+
 static unsigned t_host(void)
 {
     unsigned m = 0, bit = 1;
@@ -10978,6 +11010,9 @@ int main(int argc, char **argv)
     cb_end();
     sys_note(TAG, "mach");
     sys_begin(TAG, "mach", t_mach());
+    cb_end();
+    sys_note(TAG, "region");
+    sys_begin(TAG, "region", t_region());
     cb_end();
     sys_note(TAG, "host");
     sys_begin(TAG, "host", t_host());

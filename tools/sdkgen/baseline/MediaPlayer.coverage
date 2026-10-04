@@ -1,0 +1,20 @@
+library /System/Library/Frameworks/MediaPlayer.framework/Versions/A/MediaPlayer
+sdk macos 27.0
+exports 2110
+fn 0
+data 1972
+var 0
+special 0
+stub no-declaration 106
+omit no-declaration-missing 12
+omit objc-ivar 18
+omit swift 2
+host-missing 9
+objc-classes 368
+objc-eh-types 0
+objc-ivars 18
+ld-pseudo-skipped 15
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

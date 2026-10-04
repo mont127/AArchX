@@ -1525,6 +1525,81 @@ static int br_thread_get_state(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_answer(vm, cpu, 0);
 }
 
+#define BR_SECURITY "/System/Library/Frameworks/Security.framework/Versions/A/Security"
+
+static void *br_security_symbol(const char *name)
+{
+    void *fn = ocerz_bridge_host_symbol(BR_SECURITY, name);
+    if (!fn) {
+        fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", name);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    return fn;
+}
+
+static int br_ssl_ciphers_out(struct OcerzVM *vm, OcerzCPU *cpu, const char *name)
+{
+    int32_t (*fn)(void *, uint16_t *, size_t *) = (int32_t (*)(void *, uint16_t *, size_t *))br_security_symbol(name);
+    uint64_t ctx = cpu->gpr[OCERZ_RDI], ciphers = cpu->gpr[OCERZ_RSI], nump = cpu->gpr[OCERZ_RDX];
+    size_t cap = nump ? (size_t)ocerz_ld(nump, 8) : 0, n = cap;
+    uint16_t *buf = ciphers && cap ? calloc(cap, sizeof *buf) : NULL;
+    if (ciphers && cap && !buf)
+        return br_answer(vm, cpu, (uint64_t)(int64_t)-108);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_SECURITY, name, "i(ppp)", (const void *)fn);
+    int32_t st = fn(ctx ? ocerz_g2h(ctx) : NULL, ciphers ? buf : NULL, nump ? &n : NULL);
+    ocerz_bridge_lower(&outer);
+    for (size_t k = 0; buf && k < n && k < cap; k++)
+        ocerz_st(ciphers + 4 * (uint64_t)k, 4, buf[k]);
+    if (nump)
+        ocerz_st(nump, 8, n);
+    free(buf);
+    return br_answer(vm, cpu, (uint64_t)(int64_t)st);
+}
+
+static int br_ssl_get_supported_ciphers(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_ssl_ciphers_out(vm, cpu, "SSLGetSupportedCiphers");
+}
+
+static int br_ssl_get_enabled_ciphers(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_ssl_ciphers_out(vm, cpu, "SSLGetEnabledCiphers");
+}
+
+static int br_ssl_set_enabled_ciphers(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int32_t (*fn)(void *, const uint16_t *, size_t) =
+        (int32_t (*)(void *, const uint16_t *, size_t))br_security_symbol("SSLSetEnabledCiphers");
+    uint64_t ctx = cpu->gpr[OCERZ_RDI], ciphers = cpu->gpr[OCERZ_RSI];
+    size_t n = (size_t)cpu->gpr[OCERZ_RDX];
+    uint16_t *buf = ciphers && n ? calloc(n, sizeof *buf) : NULL;
+    if (ciphers && n && !buf)
+        return br_answer(vm, cpu, (uint64_t)(int64_t)-108);
+    for (size_t k = 0; buf && k < n; k++)
+        buf[k] = (uint16_t)ocerz_ld(ciphers + 4 * (uint64_t)k, 4);
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_SECURITY, "SSLSetEnabledCiphers", "i(ppL)", (const void *)fn);
+    int32_t st = fn(ctx ? ocerz_g2h(ctx) : NULL, ciphers ? buf : NULL, n);
+    ocerz_bridge_lower(&outer);
+    free(buf);
+    return br_answer(vm, cpu, (uint64_t)(int64_t)st);
+}
+
+static int br_ssl_get_negotiated_cipher(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int32_t (*fn)(void *, uint16_t *) = (int32_t (*)(void *, uint16_t *))br_security_symbol("SSLGetNegotiatedCipher");
+    uint64_t ctx = cpu->gpr[OCERZ_RDI], out = cpu->gpr[OCERZ_RSI];
+    uint16_t v = 0;
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_SECURITY, "SSLGetNegotiatedCipher", "i(pp)", (const void *)fn);
+    int32_t st = fn(ctx ? ocerz_g2h(ctx) : NULL, out ? &v : NULL);
+    ocerz_bridge_lower(&outer);
+    if (out)
+        ocerz_st(out, 4, v);
+    return br_answer(vm, cpu, (uint64_t)(int64_t)st);
+}
+
 typedef const void *(*BrCFUUIDFn)(const void *, unsigned, unsigned, unsigned, unsigned, unsigned,
                                   unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                                   unsigned, unsigned, unsigned, unsigned, unsigned);
@@ -1771,6 +1846,8 @@ static const BrHandler g_br_handlers[] = {
     { "swap_exception_ports",     br_swap_exception_ports },
     { "abort_report",             br_abort_report },
     { "mach_vm_map",              ocerz_sys_mach_vm_map },
+    { "mach_vm_region",           ocerz_sys_mach_vm_region },
+    { "vm_region_64",             ocerz_sys_vm_region_64 },
     { "mach_vm_remap",            ocerz_sys_mach_vm_remap },
     { "pthread_get_stackaddr_np", ocerz_sys_pthread_get_stackaddr_np },
     { "pthread_get_stacksize_np", ocerz_sys_pthread_get_stacksize_np },
@@ -1805,6 +1882,10 @@ static const BrHandler g_br_handlers[] = {
     { "thread_suspend", br_thread_suspend },
     { "thread_resume", br_thread_resume },
     { "cfuuid_constant", br_cfuuid_constant },
+    { "ssl_get_supported_ciphers", br_ssl_get_supported_ciphers },
+    { "ssl_get_enabled_ciphers", br_ssl_get_enabled_ciphers },
+    { "ssl_set_enabled_ciphers", br_ssl_set_enabled_ciphers },
+    { "ssl_get_negotiated_cipher", br_ssl_get_negotiated_cipher },
     { "availability_version_check", br_availability_version_check },
     { "dlclose",         br_dlclose },
     { "dlerror",         br_dlerror },
@@ -1866,6 +1947,7 @@ static const BrHandler g_br_handlers[] = {
     { "snprintf",                  ocerz_fmt_snprintf },
     { "snprintf_l",                ocerz_fmt_snprintf_l },
     { "asprintf",                  ocerz_fmt_asprintf },
+    { "asprintf_l",                ocerz_fmt_asprintf_l },
     { "dprintf",                   ocerz_fmt_dprintf },
     { "swprintf", ocerz_fmt_swprintf },
     { "wprintf", ocerz_fmt_wprintf },
@@ -1887,13 +1969,16 @@ static const BrHandler g_br_handlers[] = {
     { "vsnprintf",                 ocerz_fmt_vsnprintf },
     { "vsnprintf_l",               ocerz_fmt_vsnprintf_l },
     { "vasprintf",                 ocerz_fmt_vasprintf },
+    { "vasprintf_l",               ocerz_fmt_vasprintf_l },
     { "vdprintf",                  ocerz_fmt_vdprintf },
     { "vsprintf_chk",              ocerz_fmt_vsprintf_chk },
     { "vsnprintf_chk",             ocerz_fmt_vsnprintf_chk },
     { "sscanf",                    ocerz_fmt_sscanf },
+    { "sscanf_l",                  ocerz_fmt_sscanf_l },
     { "scanf",                     ocerz_fmt_scanf },
     { "fscanf",                    ocerz_fmt_fscanf },
     { "vsscanf",                   ocerz_fmt_vsscanf },
+    { "vsscanf_l",                 ocerz_fmt_vsscanf_l },
     { "vscanf",                    ocerz_fmt_vscanf },
     { "vfscanf",                   ocerz_fmt_vfscanf },
     { "CFStringCreateWithFormat",  ocerz_fmt_CFStringCreateWithFormat },

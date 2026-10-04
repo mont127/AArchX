@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/QuickLookUI.framework/Versions/A/QuickLookUI
+sdk macos 27.0
+exports 319
+fn 0
+data 171
+var 0
+special 0
+stub no-declaration 30
+omit no-declaration-missing 3
+omit objc-ivar 115
+host-missing 0
+objc-classes 64
+objc-eh-types 0
+objc-ivars 115
+ld-pseudo-skipped 1
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

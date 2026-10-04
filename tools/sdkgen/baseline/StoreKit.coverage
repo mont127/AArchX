@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/StoreKit.framework/Versions/A/StoreKit
+sdk macos 27.0
+exports 2320
+fn 1
+data 82
+var 0
+special 0
+stub no-declaration 952
+omit no-declaration-missing 132
+omit swift 1153
+host-missing 0
+objc-classes 30
+objc-eh-types 0
+objc-ivars 0
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0

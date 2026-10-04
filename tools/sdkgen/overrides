@@ -105,24 +105,28 @@
 # one ends the main thread and hands the main queue to the thread pool, and in
 # ocerz the main thread is the one the process belongs to, so the handler runs
 # the native main run loop there for good, which drains the main queue the way
-# an application's does.  __tlv_atexit and __tlv_exit belong to the thread-local storage ocerz
-# keeps for the guest, not to host dyld's.
+# an application's does.  __tlv_atexit and __tlv_exit belong to the thread-local
+# storage ocerz keeps for the guest, not to host dyld's.
 #
 # Private entry points.  The compiler's out-of-line atomics, the guarded file
 # descriptor calls Chromium wraps every descriptor in, the responsibility and
-# sandbox calls, proc_get_wakemon_params, and the voucher and recursive-lock
-# calls the Swift Concurrency runtime makes are in no SDK header, so the rules
-# can only stub them, but their signatures are fixed and public in Apple's open
-# sources, and they cross under those.  sandbox_check is variadic with at most
-# one pointer after its filter type, and abort_report_np takes a format; each
-# has a handler.  sandbox_init, sandbox_init_with_parameters, libsandbox's
+# sandbox calls, __mac_syscall, which sandbox and quarantine queries end in,
+# proc_get_wakemon_params, csr_check and csr_get_active_config, the __ulock
+# pair Chromium's locks wait in, recvmsg_x and sendmsg_x, the voucher and
+# recursive-lock calls the Swift Concurrency runtime makes, and
+# os_unfair_lock_lock_with_options, which Chromium weak-imports and calls
+# whenever it binds, are in no SDK header, so the rules can only stub
+# them, but their signatures are fixed and public in Apple's open sources, and
+# they cross under those.  sandbox_check is variadic with at most one pointer
+# after its filter type, and abort_report_np takes a format; each has a
+# handler.  sandbox_init, sandbox_init_with_parameters, libsandbox's
 # sandbox_apply and __sandbox_ms, which Chromium calls itself to apply a profile
 # its browser process compiled, confine ocerz along with the guest, and a
 # profile that denies reading outside the program's own files denies ocerz its
 # databases, so their handlers load every database before the native call is
-# made.  The exception-port calls are recorded and answered with success
-# and no previous handlers, never installed: a fault in translated code has to
-# reach ocerz's own handler, which a port set on the task would take first.
+# made.  The exception-port calls are recorded and answered with success and no
+# previous handlers, never installed: a fault in translated code has to reach
+# ocerz's own handler, which a port set on the task would take first.
 # mach_vm_map and mach_vm_remap, and their vm_ spellings, reach the host kernel:
 # native mode runs in the identity map, where an address the kernel chooses is
 # one the guest can use, and a fixed address first loses whatever translations
@@ -268,7 +272,7 @@
 # The printf and scanf families are variadic, and their v forms take a
 # va_list, so the rules already refuse nearly all of them; naming the family
 # keeps the extensible-printf domain calls and the _l, wide and _chk forms with
-# them.  The eight format veneers are named exactly, so they beat the pattern.
+# them.  The format veneers are named exactly, so they beat the pattern.
 #
 # What ocerz does instead, for the calls above that have to go through it.
 # Process creation, memory mapping and non-local jumps are no longer stubs but
@@ -321,6 +325,9 @@
 # structure the header declares, and version 1 against CFRunLoopSourceContext1.
 # The struct records name the argument each constructor takes one in.
 # CFStringCreateWithFormat and CFStringAppendFormat are format veneers.
+# NSGetSizeAndAlignment is CoreFoundation's export and Foundation's
+# declaration, which the CoreFoundation pass never reads, so its record is
+# written out.
 #
 # ---- libobjc ----
 # Message sending.  objc_msgSend and its relatives take whatever arguments the
@@ -492,6 +499,7 @@ special _sprintf sprintf
 special _snprintf snprintf
 special _snprintf_l snprintf_l
 special _asprintf asprintf
+special _asprintf_l asprintf_l
 special _dprintf dprintf
 special ___sprintf_chk sprintf_chk
 special ___snprintf_chk snprintf_chk
@@ -501,6 +509,7 @@ special _vsprintf vsprintf
 special _vsnprintf vsnprintf
 special _vsnprintf_l vsnprintf_l
 special _vasprintf vasprintf
+special _vasprintf_l vasprintf_l
 special _vdprintf vdprintf
 special _swprintf swprintf
 special _wprintf wprintf
@@ -518,9 +527,11 @@ special _vwarnx vwarnx
 special ___vsprintf_chk vsprintf_chk
 special ___vsnprintf_chk vsnprintf_chk
 special _sscanf sscanf
+special _sscanf_l sscanf_l
 special _scanf scanf
 special _fscanf fscanf
 special _vsscanf vsscanf
+special _vsscanf_l vsscanf_l
 special _vscanf vscanf
 special _vfscanf vfscanf
 var ___stack_chk_guard 8 stack_guard
@@ -691,6 +702,8 @@ stub ___mmap override
 stub ___munmap override
 stub ___mprotect override
 special _mach_vm_map mach_vm_map
+special _mach_vm_region mach_vm_region
+special _vm_region_64 vm_region_64
 special _mach_vm_remap mach_vm_remap
 stub _mach_vm_remap_new override
 special _vm_map mach_vm_map
@@ -755,12 +768,20 @@ fn _guarded_pwrite_np guarded_pwrite_np l(ippLl)
 fn _guarded_writev_np guarded_writev_np l(ippi)
 fn _guarded_kqueue_np guarded_kqueue_np i(pu)
 fn _proc_get_wakemon_params proc_get_wakemon_params i(ipp)
+fn ___mac_syscall __mac_syscall i(pip)
+fn _csr_check csr_check i(u)
+fn _csr_get_active_config csr_get_active_config i(p)
+fn ___ulock_wait __ulock_wait i(upLu)
+fn ___ulock_wake __ulock_wake i(upL)
+fn _recvmsg_x recvmsg_x l(ipui)
+fn _sendmsg_x sendmsg_x l(ipui)
 fn _responsibility_spawnattrs_setdisclaim responsibility_spawnattrs_setdisclaim i(pi)
 fn _responsibility_get_pid_responsible_for_pid responsibility_get_pid_responsible_for_pid i(i)
 fn _voucher_adopt voucher_adopt p(p)
 fn _voucher_copy voucher_copy p()
 fn _os_unfair_recursive_lock_lock_with_options os_unfair_recursive_lock_lock_with_options v(pu)
 fn _os_unfair_recursive_lock_unlock os_unfair_recursive_lock_unlock v(p)
+fn _os_unfair_lock_lock_with_options os_unfair_lock_lock_with_options v(pu)
 special _sandbox_init sandbox_init
 special _sandbox_init_with_parameters sandbox_init_with_parameters
 fn _sandbox_extension_consume sandbox_extension_consume l(p)
@@ -825,6 +846,7 @@ fn _csops csops i(iupL)
 
 library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
 fn __CFCopySupplementalVersionDictionary _CFCopySupplementalVersionDictionary p()
+fn _NSGetSizeAndAlignment NSGetSizeAndAlignment p(ppp)
 
 data ___CFConstantStringClassReference __CFConstantStringClassReference
 special _CFStringCreateWithFormat CFStringCreateWithFormat
@@ -834,6 +856,9 @@ special _CFUUIDGetConstantUUIDWithBytes cfuuid_constant
 shape CFArrayCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
 shape CFDictionaryKeyCallBacks 0 6 - p(pp) v(pp) p(p) B(pp) L(p)
 shape CFDictionaryValueCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
+shape CFSetCallBacks 0 6 - p(pp) v(pp) p(p) B(pp) L(p)
+shape CFBinaryHeapCallBacks 0 5 - p(pp) v(pp) p(p) l(ppp)
+shape CFBinaryHeapCompareContext 0 5 - - p(p) v(p) p(p)
 shape CFAllocatorContext 0 9 - - p(p) v(p) p(p) p(lLp) p(plLp) v(pp) l(lLp)
 shape CFRunLoopTimerContext 0 5 - - p(p) v(p) p(p)
 shape CFRunLoopObserverContext 0 5 - - p(p) v(p) p(p)
@@ -846,6 +871,10 @@ struct _CFDictionaryCreate 4 CFDictionaryKeyCallBacks
 struct _CFDictionaryCreate 5 CFDictionaryValueCallBacks
 struct _CFDictionaryCreateMutable 2 CFDictionaryKeyCallBacks
 struct _CFDictionaryCreateMutable 3 CFDictionaryValueCallBacks
+struct _CFSetCreate 3 CFSetCallBacks
+struct _CFSetCreateMutable 2 CFSetCallBacks
+struct _CFBinaryHeapCreate 2 CFBinaryHeapCallBacks
+struct _CFBinaryHeapCreate 3 CFBinaryHeapCompareContext
 struct _CFAllocatorCreate 1 CFAllocatorContext
 struct _CFRunLoopTimerCreate 6 CFRunLoopTimerContext
 struct _CFRunLoopObserverCreate 5 CFRunLoopObserverContext
@@ -1217,3 +1246,15 @@ inplace _BZ2_bzDecompressEnd 0 56 p(pii)
 inplace _BZ2_bzDecompressEnd 0 64 v(pp)
 inplace _BZ2_bzDecompressInit 0 56 p(pii)
 inplace _BZ2_bzDecompressInit 0 64 v(pp)
+
+# Secure Transport.  SSLCipherSuite is 32 bits wide on x86_64 and 16 on arm64,
+# so the four calls that take one, or an array of them, would hand native code
+# the wrong width; their handlers copy through a buffer of the host's width,
+# widening what native code fills in and narrowing what the guest hands over.
+
+library /System/Library/Frameworks/Security.framework/Versions/A/Security
+
+special _SSLGetSupportedCiphers ssl_get_supported_ciphers
+special _SSLGetEnabledCiphers ssl_get_enabled_ciphers
+special _SSLSetEnabledCiphers ssl_set_enabled_ciphers
+special _SSLGetNegotiatedCipher ssl_get_negotiated_cipher
