@@ -171,6 +171,7 @@ uint64_t ocerz_arena_lo;
 uint64_t ocerz_arena_hi;
 uint64_t ocerz_low_base;
 uint64_t ocerz_top_base;
+uint64_t ocerz_low_window = OCERZ_LOW_LIMIT;
 uint8_t *ocerz_commpage;
 
 static uint64_t bump_next;
@@ -1398,7 +1399,7 @@ int ocerz_mem_init_low_shadow(void)
         0x8000000000ull, 0x10000000000ull, 0x500000000ull, 0x600000000000ull,
     };
     uint64_t topsz = OCERZ_TOP_HI - OCERZ_TOP_LO;
-    uint64_t blocksz = OCERZ_LOW_LIMIT + topsz;
+    uint64_t blocksz = OCERZ_LOW_WINDOW + topsz;
     map_lock_acquire();
     if (ocerz_low_base) {
         map_lock_release();
@@ -1432,7 +1433,8 @@ int ocerz_mem_init_low_shadow(void)
         map_lock_release();
         return OCERZ_ENOMEM;
     }
-    ocerz_top_base = base + OCERZ_LOW_LIMIT;
+    ocerz_top_base = base + OCERZ_LOW_WINDOW;
+    ocerz_low_window = ocerz_arena_lo >= OCERZ_LOW_WINDOW ? OCERZ_LOW_WINDOW : OCERZ_LOW_LIMIT;
     ocerz_low_base = base;
     map_lock_release();
     ocerz_low_fill_host_holes();
@@ -1452,7 +1454,8 @@ int ocerz_mem_register_range(uint64_t glo, uint64_t ghi)
         map_lock_release();
         return OCERZ_OK;
     }
-    if (lo < OCERZ_LOW_LIMIT || reserve_host_fixed(lo, hi - lo) != lo) {
+    if (lo < OCERZ_LOW_LIMIT || (ocerz_low_base && lo < ocerz_low_window) ||
+        reserve_host_fixed(lo, hi - lo) != lo) {
         map_lock_release();
         return OCERZ_ENOMEM;
     }
