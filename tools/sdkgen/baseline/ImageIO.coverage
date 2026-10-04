@@ -2,12 +2,13 @@ library /System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO
 sdk macos 27.0
 exports 12861
 fn 58
-data 6106
+data 6111
 var 0
 special 0
-stub no-declaration 137
-omit no-declaration-missing 6560
-host-missing 2
+stub no-declaration 3968
+omit no-declaration-missing 10
+omit swift 2714
+host-missing 0
 objc-classes 0
 objc-eh-types 0
 objc-ivars 0

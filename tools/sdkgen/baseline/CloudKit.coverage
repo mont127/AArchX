@@ -2,14 +2,14 @@ library /System/Library/Frameworks/CloudKit.framework/Versions/A/CloudKit
 sdk macos 27.0
 exports 4551
 fn 0
-data 1171
+data 1186
 var 0
 special 0
-stub no-declaration 1475
-omit no-declaration-missing 1012
+stub no-declaration 2088
+omit no-declaration-missing 50
 omit objc-ivar 70
-omit swift 823
-host-missing 34
+omit swift 1157
+host-missing 0
 objc-classes 419
 objc-eh-types 1
 objc-ivars 70

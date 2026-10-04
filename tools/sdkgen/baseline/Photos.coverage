@@ -2,14 +2,13 @@ library /System/Library/Frameworks/Photos.framework/Versions/A/Photos
 sdk macos 27.0
 exports 1531
 fn 0
-data 1131
+data 1150
 var 0
 special 0
-stub no-declaration 188
-omit no-declaration-missing 174
+stub no-declaration 299
 omit objc-ivar 15
-omit swift 23
-host-missing 104
+omit swift 67
+host-missing 0
 objc-classes 377
 objc-eh-types 0
 objc-ivars 15

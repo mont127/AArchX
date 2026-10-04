@@ -2,13 +2,13 @@ library /System/Library/Frameworks/CoreData.framework/Versions/A/CoreData
 sdk macos 27.0
 exports 1412
 fn 0
-data 343
+data 346
 var 0
 special 0
-stub no-declaration 308
-omit no-declaration-missing 702
-omit swift 59
-host-missing 4
+stub no-declaration 473
+omit no-declaration-missing 455
+omit swift 138
+host-missing 2
 objc-classes 97
 objc-eh-types 0
 objc-ivars 0

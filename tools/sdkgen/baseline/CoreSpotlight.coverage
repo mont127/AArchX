@@ -2,14 +2,14 @@ library /System/Library/Frameworks/CoreSpotlight.framework/Versions/A/CoreSpotli
 sdk macos 27.0
 exports 2321
 fn 0
-data 1753
+data 1780
 var 0
 special 0
-stub no-declaration 101
-omit no-declaration-missing 398
+stub no-declaration 287
+omit no-declaration-missing 176
 omit objc-ivar 8
-omit swift 61
-host-missing 258
+omit swift 70
+host-missing 0
 objc-classes 253
 objc-eh-types 0
 objc-ivars 8

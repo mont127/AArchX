@@ -5,8 +5,7 @@ fn 0
 data 166
 var 0
 special 0
-stub no-declaration 34
-omit no-declaration-missing 12
+stub no-declaration 46
 host-missing 0
 objc-classes 60
 objc-eh-types 0
