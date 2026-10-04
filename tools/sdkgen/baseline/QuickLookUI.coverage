@@ -2,11 +2,10 @@ library /System/Library/Frameworks/QuickLookUI.framework/Versions/A/QuickLookUI
 sdk macos 27.0
 exports 319
 fn 0
-data 171
+data 173
 var 0
 special 0
-stub no-declaration 30
-omit no-declaration-missing 3
+stub no-declaration 31
 omit objc-ivar 115
 host-missing 0
 objc-classes 64

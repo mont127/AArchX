@@ -2,14 +2,14 @@ library /System/Library/Frameworks/MediaPlayer.framework/Versions/A/MediaPlayer
 sdk macos 27.0
 exports 2110
 fn 0
-data 1972
+data 1982
 var 0
 special 0
 stub no-declaration 106
-omit no-declaration-missing 12
+omit no-declaration-missing 2
 omit objc-ivar 18
 omit swift 2
-host-missing 9
+host-missing 0
 objc-classes 368
 objc-eh-types 0
 objc-ivars 18
