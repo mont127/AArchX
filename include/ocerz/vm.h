@@ -88,6 +88,8 @@ void ocerz_thread_detach(void);
 int ocerz_vm_call_abi(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, uint64_t stack_top);
 unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
 void ocerz_vm_purge_jit_ras(OcerzVM *vm);
+void ocerz_vm_purge_jit_refs(OcerzVM *vm);
+__attribute__((noreturn)) void ocerz_vm_jit_escape(int r);
 int ocerz_vm_thread_suspend(OcerzCPU *self, uint32_t port);
 int ocerz_vm_thread_resume(uint32_t port);
 int ocerz_vm_thread_suspend_native(uint32_t port);

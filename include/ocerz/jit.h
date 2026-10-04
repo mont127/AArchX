@@ -70,6 +70,9 @@ int ocerz_jit_fault_info(const struct OcerzVM *vm, const void *host_pc,
                          OcerzJitFaultInfo *out);
 
 int ocerz_jit_pc_in_arena(const struct OcerzVM *vm, const void *host_pc);
+void ocerz_jit_postfork_child(void);
+uint64_t ocerz_jit_thread_mark(void);
+void ocerz_jit_thread_restore(uint64_t mark);
 
 int ocerz_jit_guest_gprs_at(const struct OcerzVM *vm, const void *host_pc,
                             const uint64_t *host_x, const OcerzCPU *cpu, uint64_t out[16]);

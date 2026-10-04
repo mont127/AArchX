@@ -156,7 +156,12 @@
  * wedged.  Its FPCR is set from the guest's MXCSR rounding mode before any JIT
  * SSE op runs, because a worker inherits the host default.  The host mask is
  * cleared before sigsetjmp captures it, since every fault recovery siglongjmps
- * back and restores whatever was saved.  A fork child drops the inherited
+ * back and restores whatever was saved.  The same jump brings back a slow-path
+ * call that returns after the JIT arena was flushed under it
+ * (ocerz_vm_jit_escape), carrying the call's result into the loop as if the
+ * step had returned it, and both this loop and ocerz_vm_call put the thread's
+ * count of translated frames back to what it was at their recovery point,
+ * since a jump skips the decrements.  A fork child drops the inherited
  * MAP_JIT arena: its pages read fine but executing them raises SIGBUS.
  *
  * ---- calling into guest code ----
@@ -953,6 +958,19 @@ static void ras_clear(OcerzCPU *cpu)
     }
     __atomic_store_n(&cpu->ras_top, 0, __ATOMIC_RELEASE);
 }
+void ocerz_vm_purge_jit_refs(OcerzVM *vm)
+{
+    if (!vm)
+        return;
+    ocerz_vm_purge_jit_ras(vm);
+    vm->cpu.side_blk = NULL;
+    pthread_mutex_lock(&g_cpus_lock);
+    for (int i = 0; i < g_cpus_n; i++)
+        if (g_cpus[i] && g_cpus[i]->vm == vm)
+            g_cpus[i]->side_blk = NULL;
+    pthread_mutex_unlock(&g_cpus_lock);
+}
+
 void ocerz_vm_purge_jit_ras(OcerzVM *vm)
 {
     if (!vm)
@@ -991,6 +1009,15 @@ uint32_t ocerz_take_pending_async_sig_mask(uint32_t accept)
 }
 
 static __thread sigjmp_buf *g_sig_recover;
+
+static __thread int t_jit_escape_r;
+
+void ocerz_vm_jit_escape(int r)
+{
+    t_jit_escape_r = r;
+    siglongjmp(*g_sig_recover, 2);
+}
+
 
 #define OCERZ_SIG_MAX_REPEAT 16
 
@@ -3438,7 +3465,14 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     sigjmp_buf *prev_recover = g_sig_recover;
     g_sig_recover = &jb;
     ocerz_host_sigmask_clear("callback");
-    sigsetjmp(jb, 1);
+    uint64_t jmark = ocerz_jit_thread_mark();
+    int esc_r;
+    if (sigsetjmp(jb, 1) == 2)
+        esc_r = t_jit_escape_r;
+    else
+        esc_r = 0;
+    t_jit_escape_r = 0;
+    ocerz_jit_thread_restore(jmark);
     g_cur_cpu = &local;
     ocerz_apply_mxcsr_round(local.mxcsr);
     if (prev_cpu) {
@@ -3516,7 +3550,12 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
         }
         }
 
-        if (mtrace_hit || local.interp_once) {
+        if (esc_r) {
+            r = esc_r;
+            esc_r = 0;
+            if (r == OCERZ_EUNSUP)
+                r = ocerz_interp_step(vm, &local);
+        } else if (mtrace_hit || local.interp_once) {
             int was_once = local.interp_once;
             local.interp_once = 0;
             r = ocerz_interp_step(vm, &local);
@@ -4033,12 +4072,26 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     pthread_threadid_np(NULL, &cpu->host_tid);
     cpu->cur_sys_class = -1;
     ocerz_host_sigmask_clear("run_cpu");
-    if (sigsetjmp(jb, 1) != 0 && getenv("OCERZ_CPUREG_LOG")) {
-
-        static _Atomic unsigned recov;
-        fprintf(stderr, "ocerz: CPUREG recovery #%u (old code would leak a dangling entry here)\n",
-                ++recov);
+    uint64_t jmark = ocerz_jit_thread_mark();
+    int esc_r;
+    switch (sigsetjmp(jb, 1)) {
+    case 0:
+        esc_r = 0;
+        break;
+    case 2:
+        esc_r = t_jit_escape_r;
+        break;
+    default:
+        esc_r = 0;
+        if (getenv("OCERZ_CPUREG_LOG")) {
+            static _Atomic unsigned recov;
+            fprintf(stderr, "ocerz: CPUREG recovery #%u (old code would leak a dangling entry here)\n",
+                    ++recov);
+        }
+        break;
     }
+    t_jit_escape_r = 0;
+    ocerz_jit_thread_restore(jmark);
     g_cur_cpu = cpu;
     cpu->host_pthread = (void *)pthread_self();
     cpu->host_tsd = host_tsd_self();
@@ -4092,7 +4145,12 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
                 goto fatal;
             continue;
         }
-        if (cpu->interp_once) {
+        if (esc_r) {
+            r = esc_r;
+            esc_r = 0;
+            if (r == OCERZ_EUNSUP)
+                r = ocerz_interp_step(vm, cpu);
+        } else if (cpu->interp_once) {
             cpu->interp_once = 0;
             r = ocerz_interp_step(vm, cpu);
         } else if (vm->jit_enabled && (vm->jit || (vm->jit = ocerz_jit_create(vm)))) {
