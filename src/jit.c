@@ -11732,7 +11732,7 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
         ra = JTA; disp = 0;
-    } else if (!plainacc && disp != 0) {
+    } else if ((!plainacc || (ordered && atomic)) && disp != 0) {
         if (disp <= 4095) a64_add_imm(b, 1, JTA, ra, disp);
         else { a64_mov_imm64(b, JTU, disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
         ra = JTA; disp = 0;
