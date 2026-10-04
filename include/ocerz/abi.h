@@ -20,6 +20,7 @@
  *     h  16-bit signed         H  16-bit unsigned
  *     i  32-bit signed         u  32-bit unsigned
  *     l  64-bit signed         L  64-bit unsigned
+ *     T  a dispatch_time_t, converted between the guest's and the host's units
  *     p  pointer, converted between the guest and host views
  *     f  32-bit float          d  64-bit double
  *     {...}  a structure by value, described below
@@ -51,6 +52,22 @@
  * register, a native stack byte, or rax or x0 on the way back, and it is
  * extended to all 64 bits, by sign for b and h and by zero for B and H, before
  * it is written anywhere.  i and u are treated the same way at 32 bits.
+ *
+ * T is dispatch_time_t, the one integer whose unit depends on the processor.
+ * Its uptime and continuous clocks count mach_absolute_time ticks, an Intel
+ * Mac's tick is a nanosecond and Apple silicon's is 125/3 of one, and code
+ * built for x86 may count on the first: the x86 Swift Concurrency runtime
+ * makes a deadline out of nanoseconds and hands it to libdispatch as a
+ * dispatch_time_t, which the native libdispatch read as ticks, 41 times later.
+ * Rosetta and cache mode show the guest a 1/1 timebase.  So a T argument has
+ * its clock value converted from nanoseconds to host ticks and a T result has
+ * it converted back, with the clock bit kept (bit 63 alone is the continuous
+ * clock), and DISPATCH_TIME_NOW, DISPATCH_TIME_FOREVER and wall-clock times,
+ * bits 63 and 62 both set and nanoseconds on both sides, pass as they are.
+ * mach_absolute_time and the timebase stay the host's: native frameworks hand
+ * the guest tick values of their own, a CoreAudio host time or a display
+ * link's, to compare against it, and the opaque dispatch_time_t is the one
+ * place the guest's units can be put right without making those disagree.
  *
  * On the stack the two ABIs differ again.  System V gives every stacked argument
  * an eightbyte.  Apple packs a stacked argument at its own size and alignment,
@@ -441,6 +458,8 @@ void *ocerz_abi_callback_intern(uint64_t guest_fn, const char *notation);
 const OcerzAbiSig *ocerz_abi_callback_sig(const void *slot_address, uint64_t *guest_fn);
 
 int ocerz_abi_is_guest_code(uint64_t gptr);
+uint64_t ocerz_abi_dtime_to_host(uint64_t t);
+uint64_t ocerz_abi_dtime_to_guest(uint64_t t);
 
 int ocerz_abi_callback_convert(uint64_t gptr, const char *notation, uint64_t *out);
 

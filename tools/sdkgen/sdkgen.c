@@ -63,7 +63,9 @@
  * So is IMP, found by its typedef: a method implementation is a function
  * pointer, but one a program passes around, stores and compares, and making it
  * a callback would hand native code a trampoline in place of the address the
- * runtime knows.  A pointer to any other function becomes c with the pointee's
+ * runtime knows.  dispatch_time_t is found by its typedef too and becomes T,
+ * whose value the bridge converts between the guest's nanoseconds and the
+ * host's ticks (include/ocerz/abi.h).  A pointer to any other function becomes c with the pointee's
  * own notation, which may not itself contain a callback and must fit the 47
  * characters the engine keeps for one.  A union declared transparent_union is
  * passed as its first member by both ABIs, so dispatch_object_t is p, and every
@@ -711,6 +713,16 @@ static int is_imp(CXType t)
     return typedef_chain_has(t, "IMP");
 }
 
+static int is_dispatch_time(CXType t)
+{
+    return typedef_chain_has(t, "dispatch_time_t");
+}
+
+static int keeps_typedef(CXType t)
+{
+    return is_imp(t) || is_dispatch_time(t);
+}
+
 static const char *flat_type(Flat *f, CXType t, int depth, int level, long long *size,
                              long long *align)
 {
@@ -758,7 +770,7 @@ static const char *flat_type(Flat *f, CXType t, int depth, int level, long long 
             *align = *size;
             if (clang_Type_getSizeOf(c) != *size)
                 f->layout_bad = 1;
-            buf_add(f->out, buf_str(&one));
+            buf_add(f->out, k == 'T' ? "L" : buf_str(&one));
         }
     }
     free(one.s);
@@ -824,6 +836,10 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
     }
     if (k == TK.Bool) {
         buf_addc(out, 'B');
+        return NULL;
+    }
+    if (is_dispatch_time(t)) {
+        buf_addc(out, 'T');
         return NULL;
     }
     if (is_integer_kind(k, &sign)) {
@@ -944,13 +960,13 @@ static const char *fn_notation(CXType fnc, int depth, Buf *out)
     if (n > SIG_MAX_ARGS)
         return "too-many-args";
     CXType rs = clang_getResultType(fnc);
-    const char *r = type_class(is_imp(rs) ? rs : clang_getResultType(fc), depth, 1, out);
+    const char *r = type_class(keeps_typedef(rs) ? rs : clang_getResultType(fc), depth, 1, out);
     if (r)
         return r;
     buf_addc(out, '(');
     for (int i = 0; i < n; i++) {
         CXType as = fnc.kind == TK.FunctionProto ? clang_getArgType(fnc, (unsigned)i) : fc;
-        r = type_class(is_imp(as) ? as : clang_getArgType(fc, (unsigned)i), depth, 0, out);
+        r = type_class(keeps_typedef(as) ? as : clang_getArgType(fc, (unsigned)i), depth, 0, out);
         if (r)
             return r;
     }
@@ -1050,7 +1066,7 @@ static int sig_class_valid(const char **sp, int allow_cb, int is_result)
         *sp = close + 1;
         return 1;
     }
-    if (!*s || !strchr(is_result ? "vbBhHiulLpfd" : "bBhHiulLpfd", *s))
+    if (!*s || !strchr(is_result ? "vbBhHiulLTpfd" : "bBhHiulLTpfd", *s))
         return 0;
     *sp = s + 1;
     return 1;

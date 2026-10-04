@@ -65,12 +65,13 @@ call that returns plausible nonsense would pass a test that only checked the
 exit code. It also pins the refusals — the calls native mode declines to make
 rather than making wrongly — by name and by exit code.
 
-**The native Swift suite.** Two Swift fixtures, compiled for x86-64 and arm64
-from the same source, must print the same thing under native mode, with the JIT
-and interpreted, as the arm64 build does running as itself. One covers the
-language, the other the end of an object's life, including the last release
-coming from native code. It needs the guest Swift runtime (`make guest-swift`)
-and skips without it.
+**The native Swift suite.** Three Swift fixtures and one C fixture, compiled
+for x86-64 and arm64 from the same source, must print the same thing under
+native mode, with the JIT and interpreted, as the arm64 build does running as
+itself. They cover the language, the end of an object's life including the last
+release coming from native code, Swift Concurrency, and the libdispatch timing
+calls Concurrency's sleeps go through. It needs the guest Swift runtime
+(`make guest-swift`) and skips without it.
 
 ## Current state
 

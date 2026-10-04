@@ -134,6 +134,14 @@
  * a table of signatures that includes floats after integers, a spilled ninth
  * double, a structure argument and a structure result.
  *
+ * T, a dispatch_time_t, is checked against the host's own timebase rather than
+ * against a constant: an uptime and a continuous time in nanoseconds must reach
+ * a real callee as the host's ticks with the clock bit kept, through the
+ * register path and, stacked eighth, through the general one, the result must
+ * come back as nanoseconds, the largest value must never spill into the clock
+ * bits, and DISPATCH_TIME_NOW, DISPATCH_TIME_FOREVER and wall-clock times must
+ * cross unchanged.
+ *
  * The map is the identity one, as in test_bridge.c, because that is the map
  * native mode runs in; under it a guest pointer and a host pointer are the
  * same number, so a pointer argument and a pointer result can be checked for
@@ -144,6 +152,7 @@
 #include "ocerz/mem.h"
 
 #include <fenv.h>
+#include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1559,7 +1568,7 @@ static void test_narrow_native(void)
 
 static void test_accept_classes(void)
 {
-    static const char kScalar[] = "bBhHiulLpfd";
+    static const char kScalar[] = "bBhHiulLTpfd";
     char notation[8];
     size_t r, a;
 
@@ -1582,6 +1591,62 @@ static void test_accept_classes(void)
                   rc, sig.ret, sig.nargs, notation[0], notation[2]);
         }
     }
+}
+
+static uint64_t g_dtime_seen;
+
+static uint64_t fn_dtime(uint64_t t)
+{
+    enter();
+    g_dtime_seen = t;
+    return t + 1000;
+}
+
+static uint64_t fn_dtime8(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5,
+                          uint64_t a6, uint64_t t)
+{
+    enter();
+    g_dtime_seen = t;
+    return t + a0 + a1 + a2 + a3 + a4 + a5 + a6;
+}
+
+static void test_dispatch_time(void)
+{
+    const uint64_t mono = 1ull << 63, wall = 1ull << 62;
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    const uint64_t ns = 123456789000ull;
+    const uint64_t ticks = (uint64_t)((unsigned __int128)ns * tb.denom / tb.numer);
+    const uint64_t walltime = (uint64_t)-(int64_t)1700000000123456789ll;
+
+    CHECK(ocerz_abi_dtime_to_host(0) == 0 && ocerz_abi_dtime_to_guest(0) == 0,
+          "DISPATCH_TIME_NOW crosses unchanged");
+    CHECK(ocerz_abi_dtime_to_host(~0ull) == ~0ull && ocerz_abi_dtime_to_guest(~0ull) == ~0ull,
+          "DISPATCH_TIME_FOREVER crosses unchanged");
+    CHECK(ocerz_abi_dtime_to_host(~1ull) == ~1ull, "DISPATCH_WALLTIME_NOW crosses unchanged");
+    CHECK(ocerz_abi_dtime_to_host(walltime) == walltime && ocerz_abi_dtime_to_guest(walltime) == walltime,
+          "a wall-clock time, nanoseconds on both sides, crosses unchanged");
+    CHECK(ocerz_abi_dtime_to_host(ns) == ticks, "an uptime of %llu ns is %llu host ticks, got %llu",
+          (unsigned long long)ns, (unsigned long long)ticks, (unsigned long long)ocerz_abi_dtime_to_host(ns));
+    CHECK(ocerz_abi_dtime_to_host(ns | mono) == (ticks | mono), "a continuous time keeps its clock bit");
+    CHECK(ocerz_abi_dtime_to_guest(ticks) == (uint64_t)((unsigned __int128)ticks * tb.numer / tb.denom),
+          "host ticks come back as nanoseconds");
+    CHECK(!(ocerz_abi_dtime_to_host(wall - 1) & wall) && !(ocerz_abi_dtime_to_guest(wall - 1) & wall),
+          "the largest value never spills into the clock bits");
+
+    uint64_t reg[6] = { ns | mono };
+    uint64_t rax = narrow_call("T(T)", (void (*)(void))fn_dtime, reg, 1, NULL, 0);
+    CHECK(g_dtime_seen == (ticks | mono), "T(T): the host was handed %#llx, want %#llx",
+          (unsigned long long)g_dtime_seen, (unsigned long long)(ticks | mono));
+    CHECK(rax == ocerz_abi_dtime_to_guest((ticks | mono) + 1000), "T(T): the guest got %#llx back, want %#llx",
+          (unsigned long long)rax, (unsigned long long)ocerz_abi_dtime_to_guest((ticks | mono) + 1000));
+
+    uint64_t regs8[6] = { 1, 2, 3, 4, 5, 6 }, slots8[2] = { 7, ns };
+    rax = narrow_call("T(LLLLLLLT)", (void (*)(void))fn_dtime8, regs8, 6, slots8, 2);
+    CHECK(g_dtime_seen == ticks, "T(LLLLLLLT): a stacked T reached the host as %#llx, want %#llx",
+          (unsigned long long)g_dtime_seen, (unsigned long long)ticks);
+    CHECK(rax == ocerz_abi_dtime_to_guest(ticks + 28), "T(LLLLLLLT): the guest got %#llx back, want %#llx",
+          (unsigned long long)rax, (unsigned long long)ocerz_abi_dtime_to_guest(ticks + 28));
 }
 
 static void test_rounding(void)
@@ -1613,10 +1678,10 @@ static int indep_register_only(const char *cls, int n, char ret)
 {
     int ni = 0, nf = 0, i;
 
-    if (!ret || !strchr("vbBhHiulLpfd", ret))
+    if (!ret || !strchr("vbBhHiulLTpfd", ret))
         return 0;
     for (i = 0; i < n; i++) {
-        if (!strchr("bBhHiulLpfd", cls[i]))
+        if (!strchr("bBhHiulLTpfd", cls[i]))
             return 0;
         if (cls[i] == 'f' || cls[i] == 'd') {
             if (++nf > 8)
@@ -5076,6 +5141,7 @@ int main(void)
     test_host_stack();
     test_narrow_native();
     test_accept_classes();
+    test_dispatch_time();
     test_rounding();
     test_register_lane();
     test_reject_parse();

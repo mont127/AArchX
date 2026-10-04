@@ -269,6 +269,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <mach/mach_time.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
@@ -288,7 +289,7 @@ static int abi_is_scalar_class(char c)
 {
     switch (c) {
     case 'b': case 'B': case 'h': case 'H': case 'i': case 'u':
-    case 'l': case 'L': case 'p': case 'f': case 'd':
+    case 'l': case 'L': case 'T': case 'p': case 'f': case 'd':
         return 1;
     default:
         return 0;
@@ -767,6 +768,43 @@ static uint64_t abi_narrow(char c, uint64_t raw)
     }
 }
 
+#define ABI_DTIME_MONOTONIC (1ull << 63)
+#define ABI_DTIME_WALL (1ull << 62)
+
+static mach_timebase_info_data_t g_abi_timebase;
+static pthread_once_t g_abi_timebase_once = PTHREAD_ONCE_INIT;
+
+static void abi_timebase_init(void)
+{
+    mach_timebase_info(&g_abi_timebase);
+    if (!g_abi_timebase.numer || !g_abi_timebase.denom)
+        g_abi_timebase.numer = g_abi_timebase.denom = 1;
+}
+
+static uint64_t abi_dtime(uint64_t t, int to_host)
+{
+    if (!t || (t & (ABI_DTIME_MONOTONIC | ABI_DTIME_WALL)) == (ABI_DTIME_MONOTONIC | ABI_DTIME_WALL))
+        return t;
+    uint64_t clock = t & ABI_DTIME_MONOTONIC, v = t & ~ABI_DTIME_MONOTONIC;
+    if (v >= ABI_DTIME_WALL)
+        return t;
+    pthread_once(&g_abi_timebase_once, abi_timebase_init);
+    uint32_t mul = to_host ? g_abi_timebase.denom : g_abi_timebase.numer;
+    uint32_t div = to_host ? g_abi_timebase.numer : g_abi_timebase.denom;
+    unsigned __int128 s = (unsigned __int128)v * mul / div;
+    return (s >= ABI_DTIME_WALL ? ABI_DTIME_WALL - 1 : (uint64_t)s) | clock;
+}
+
+uint64_t ocerz_abi_dtime_to_host(uint64_t t)
+{
+    return abi_dtime(t, 1);
+}
+
+uint64_t ocerz_abi_dtime_to_guest(uint64_t t)
+{
+    return abi_dtime(t, 0);
+}
+
 static size_t abi_host_stack_at(size_t off, int size)
 {
     return abi_align_up(off, (size_t)size);
@@ -961,6 +999,8 @@ static int abi_read_guest(const OcerzAbiSig *sig, const OcerzCPU *cpu, OcerzAbiC
             }
             if (owned)
                 call->owned[call->nowned++] = owned;
+        } else if (c == 'T') {
+            val = abi_dtime(raw, 1);
         } else {
             val = abi_narrow(c, raw);
         }
@@ -1096,6 +1136,9 @@ static inline __attribute__((always_inline)) void abi_write_scalar_result(char r
     case 'p':
         cpu->gpr[OCERZ_RAX] = rx0 ? ocerz_h2g((const void *)(uintptr_t)rx0) : 0;
         break;
+    case 'T':
+        cpu->gpr[OCERZ_RAX] = abi_dtime(rx0, 0);
+        break;
     case 'f':
         cpu->xmm[0].lo = (uint64_t)(uint32_t)rv0;
         cpu->xmm[0].hi = 0;
@@ -1194,7 +1237,8 @@ int ocerz_abi_perform_registers(const OcerzAbiSig *sig, const void *fn, OcerzCPU
             v[nv++] = abi_narrow(c, cpu->xmm[gf++].lo);
         } else {
             uint64_t raw = cpu->gpr[abi_guest_int_reg[gi++]];
-            x[nx++] = c == 'p' ? (raw ? (uint64_t)(uintptr_t)ocerz_g2h(raw) : 0) : abi_narrow(c, raw);
+            x[nx++] = c == 'p' ? (raw ? (uint64_t)(uintptr_t)ocerz_g2h(raw) : 0)
+                    : c == 'T' ? abi_dtime(raw, 1) : abi_narrow(c, raw);
         }
     }
 
@@ -1673,6 +1717,8 @@ static void abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64
             }
             if (made)
                 owned[nowned++] = made;
+        } else if (c == 'T') {
+            val = abi_dtime(raw, 0);
         } else {
             val = abi_narrow(c, raw);
         }
@@ -1723,6 +1769,9 @@ static void abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64
         break;
     case 'd':
         out_v[0] = call.xmm0;
+        break;
+    case 'T':
+        out_x[0] = abi_dtime(call.rax, 1);
         break;
     default:
         out_x[0] = abi_narrow(sig->ret, call.rax);

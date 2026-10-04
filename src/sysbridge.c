@@ -165,6 +165,20 @@
  * shell could not be started.  popen and pclose keep their own list of open
  * streams, each a host FILE over a pipe, or a socket pair for r+, and close
  * every other popen'd stream in the child, as Apple's do.
+ *
+ * ---- thread-specific data and dispatch_main ----
+ * pthread_key_create and its siblings keep the guest's values in the guest
+ * thread block, where an inlined gs-relative load finds them (the overrides
+ * file explains why), and Darwin's reserved keys 10 to 255 live there too,
+ * usable without being created, since the Swift runtime uses one that way;
+ * pthread_key_init_np records a destructor for one, which runs with the
+ * others when the thread ends.  dispatch_main ends the main thread in the real
+ * libdispatch, which then drains the main queue from its thread pool.  Here the
+ * main thread is the one the process belongs to, so the handler runs the
+ * native CFRunLoopRun on it for good instead, which drains the main queue the
+ * way an application's main thread does; the asynchronous main of a Swift
+ * program ends there, and its exit comes from a job on that queue.  A call from
+ * any other thread stops the process, as libdispatch's own check does.
  */
 #include "ocerz/sysbridge.h"
 #include "ocerz/abi.h"
@@ -1299,6 +1313,24 @@ int ocerz_sys_pthread_exit(struct OcerzVM *vm, OcerzCPU *cpu)
     void *value = sb_ptr(sb_arg(cpu, 0));
     sb_key_destructors(vm, cpu);
     pthread_exit(value);
+}
+
+int ocerz_sys_dispatch_main(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    if (!pthread_main_np()) {
+        fprintf(stderr, "ocerz: bridge: dispatch_main() must be called on the main thread\n");
+        ocerz_vm_request_exit(vm, 134);
+        return OCERZ_STEP_EXIT;
+    }
+    void (*run)(void) = (void (*)(void))ocerz_bridge_host_symbol(OCERZ_BRIDGE_COREFOUNDATION, "CFRunLoopRun");
+    if (!run) {
+        fprintf(stderr, "ocerz: bridge: dispatch_main needs the native CFRunLoopRun, which could not be found\n");
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_dispatch_main", "v()", (const void *)run);
+    for (;;)
+        run();
 }
 
 int ocerz_sys_mach_vm_map(struct OcerzVM *vm, OcerzCPU *cpu)
