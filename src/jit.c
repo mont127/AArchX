@@ -4011,14 +4011,22 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
         else if (op->disp < 0) a64_sub_imm(b, 1, addr_reg, addr_reg, (uint32_t)-op->disp);
         return 1;
     }
-    a64_mov_imm64(b, addr_reg, initial);
-    if (op->base != OCERZ_REG_NONE) {
-        int s = pin_slot(op->base);
-        if (s >= 0)
-            a64_add_reg(b, 1, addr_reg, addr_reg, pin_hreg(s), 0);
-        else {
-            emit_gpr_rd(b, 1, JT0, op->base);
-            a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
+    if (op->base != OCERZ_REG_NONE && pin_slot(op->base) >= 0 &&
+        (int64_t)initial >= -4095 && (int64_t)initial <= 4095) {
+        int hb = pin_hreg(pin_slot(op->base));
+        if ((int64_t)initial > 0)      a64_add_imm(b, 1, addr_reg, hb, (uint32_t)initial);
+        else if ((int64_t)initial < 0) a64_sub_imm(b, 1, addr_reg, hb, (uint32_t)-(int64_t)initial);
+        else                           a64_mov_reg(b, 1, addr_reg, hb);
+    } else {
+        a64_mov_imm64(b, addr_reg, initial);
+        if (op->base != OCERZ_REG_NONE) {
+            int s = pin_slot(op->base);
+            if (s >= 0)
+                a64_add_reg(b, 1, addr_reg, addr_reg, pin_hreg(s), 0);
+            else {
+                emit_gpr_rd(b, 1, JT0, op->base);
+                a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
+            }
         }
     }
     if (op->index != OCERZ_REG_NONE) {
@@ -4946,7 +4954,6 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         if (!emit_mem_ea(b, insn, d, JTA))
             return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
-        if (v != 0) a64_mov_imm64(b, JT1, v);
         emit_add_const(b, JTA, gbase - ea_fold());
         emit_guest_store_ordered(b, size, rv, JTA, JTU);
         patch_guard_skip(skip, a64_label(b));
