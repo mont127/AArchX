@@ -7,7 +7,10 @@
  * reservation and excludes host allocations.  In identity mode a plain-form JIT
  * access to the guest commpage range faults on an unmappable host address and
  * the fault handler resolves it, so that range is deliberately not treated as
- * invalid here.
+ * invalid here.  The Wine layout does the same for the top strip and the
+ * commpage above it: a translated access there arrives at its identity
+ * address, beyond the highest address an arm64 process can map, and faults
+ * into the handler, which teaches that block the full translation.
  */
 #ifndef OCERZ_MEM_H
 #define OCERZ_MEM_H
@@ -70,6 +73,8 @@ static inline int ocerz_host_in_guest_space(const void *haddr)
         if (h - ocerz_low_base < OCERZ_LOW_LIMIT)
             return 1;
         if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
+            return 1;
+        if (h - OCERZ_TOP_LO < OCERZ_COMMPAGE_HI - OCERZ_TOP_LO)
             return 1;
     }
     return h - ocerz_guest_base < ocerz_arena_hi;
