@@ -415,6 +415,8 @@
 #include <mach-o/dyld.h>
 #include <time.h>
 
+#define ENV_SET(name) ({ static int set_ = -1; if (set_ < 0) set_ = getenv(name) != NULL; set_; })
+
 #define OCERZ_BSD_MAX 600
 
 #define OCERZ_ENOMEM_V 12
@@ -3292,7 +3294,7 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
         memcpy(ocerz_g2h(evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S),
                (const char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S,
                (size_t)OCERZ_KEVENT_QOS_S);
-    if (getenv("OCERZ_WSIG"))
+    if (ENV_SET("OCERZ_WSIG"))
         for (int i = 0; i < nev; i++) {
             const unsigned char *e = (const unsigned char *)hev + (size_t)i * OCERZ_KEVENT_QOS_S;
             uint64_t ident, udata, data, ext0, ext1; int16_t filt; uint16_t fl;
@@ -3317,7 +3319,7 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
             else if (hbuf)
                 ocerz_st(dst + 0x28, 8, 0);
 
-            if (gbuf && getenv("OCERZ_WSIG"))
+            if (gbuf && ENV_SET("OCERZ_WSIG"))
                 fprintf(stderr, "ocerz: MACHBRIDGE ev[%d] hbuf=%#llx sz=%#llx -> gbuf=%#llx%s\n",
                         i, (unsigned long long)hbuf, (unsigned long long)sz,
                         (unsigned long long)gbuf,
@@ -3327,7 +3329,7 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
                       (uint64_t)nev * OCERZ_KEVENT_QOS_S);
     mach_port_t kp = mach_thread_self();
 
-    if (g_hostwq_tl_fatal || !getenv("OCERZ_NO_DDIRESET")) {
+    if (g_hostwq_tl_fatal || !ENV_SET("OCERZ_NO_DDIRESET")) {
         ocerz_st(pth + 0x1c8, 8, 0);
         ocerz_st(pth + 0x1b8, 8, 0);
         g_hostwq_tl_fatal = 0;
@@ -3364,14 +3366,14 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
                 (unsigned long long)ocerz_ld(pth + 0xe0 + 4 * 8, 8));
     t.gpr[OCERZ_R9] = (uint64_t)nev;
     t.gs_base = pth + 0xe0;
-    if (getenv("OCERZ_GSTRACE"))
+    if (ENV_SET("OCERZ_GSTRACE"))
         fprintf(stderr, "ocerz: HOSTWQ worker enter region=%#llx pth=%#llx gs=%#llx rsp=%#llx nev=%d\n",
                 (unsigned long long)region, (unsigned long long)pth,
                 (unsigned long long)t.gs_base, (unsigned long long)t.gpr[OCERZ_RSP], nev);
     ocerz_init_gate_wait();
     int flt0 = nev > 0 ? (int)(int16_t)ocerz_ld(evbuf + 0x08, 2) : 0;
     uint64_t ident0 = nev > 0 ? ocerz_ld(evbuf + 0x00, 8) : 0;
-    if (getenv("OCERZ_ULOCKLOG"))
+    if (ENV_SET("OCERZ_ULOCKLOG"))
         fprintf(stderr, "ocerz: WQ-ENTER cpu#%u kport=%#x nev=%d flt0=%d ident0=%#llx\n",
                 t.cpu_number, (unsigned)kp, nev, flt0, (unsigned long long)ident0);
     int dqdump = getenv("OCERZ_DQDUMP") != NULL;
@@ -3398,9 +3400,9 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
                 (unsigned long long)sdq,
                 (unsigned long long)(sdq ? ocerz_ld(sdq + 0x38, 8) : 0));
     }
-    if (getenv("OCERZ_ULOCKLOG"))
+    if (ENV_SET("OCERZ_ULOCKLOG"))
         fprintf(stderr, "ocerz: WQ-EXIT  cpu#%u kport=%#x rc=%d\n", t.cpu_number, (unsigned)kp, wrc);
-    if (getenv("OCERZ_WQHIST") && wrc == 125) {
+    if (ENV_SET("OCERZ_WQHIST") && wrc == 125) {
         uint64_t rh[32]; unsigned rn = ocerz_vm_riphist(rh, 32);
         fprintf(stderr, "ocerz: WQ-HIST cpu#%u flt0=%d ident0=%#llx rip=%#llx hist:",
                 t.cpu_number, flt0, (unsigned long long)ident0,
@@ -3555,7 +3557,7 @@ static void ocerz_hostwq_kevent_cb(void **events, int *nevents)
 
 static void ocerz_hostwq_workloop_cb(uint64_t *workloop_id, void **events, int *nevents)
 {
-    if (getenv("OCERZ_ULOCKLOG") || getenv("OCERZ_KEVID"))
+    if (ENV_SET("OCERZ_ULOCKLOG") || ENV_SET("OCERZ_KEVID"))
         fprintf(stderr,
                 "ocerz: HOSTWQ-WORKLOOP wlid=%#llx\n",
                 (unsigned long long)(workloop_id ? *workloop_id : 0));
@@ -3620,7 +3622,7 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         memcpy(fa, a, sizeof fa);
         fa[6] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 8, 8);
         fa[7] = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
-        if (getenv("OCERZ_WSIG") && a[1] && (int)a[2] > 0) {
+        if (ENV_SET("OCERZ_WSIG") && a[1] && (int)a[2] > 0) {
             int nc = (int)a[2]; if (nc > 8) nc = 8;
             for (int i = 0; i < nc; i++) {
                 uint64_t k = a[1] + (uint64_t)i * OCERZ_KEVENT_QOS_S;
@@ -3644,14 +3646,14 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         uint64_t ret2 = 0;
         int err = 0;
 
-        int kid_log = getenv("OCERZ_ULOCKLOG") != NULL;
+        int kid_log = ENV_SET("OCERZ_ULOCKLOG");
         int chg0f = 0; unsigned chg0fl = 0; uint64_t chg0id = 0;
         if (kid_log && a[1] && (int)a[2] > 0) {
             chg0f  = (int)(int16_t)ocerz_ld(a[1] + 0x08, 2);
             chg0fl = (unsigned)(uint16_t)ocerz_ld(a[1] + 0x0a, 2);
             chg0id = ocerz_ld(a[1] + 0x00, 8);
         }
-        if (getenv("OCERZ_KEVLOG") && (int)a[2] == 0 && (int64_t)a[4] > 0)
+        if (ENV_SET("OCERZ_KEVLOG") && (int)a[2] == 0 && (int64_t)a[4] > 0)
             fprintf(stderr,
                     "ocerz: KEVIDWAIT-ENTER[%d] cpu#%u id=%#llx nev=%lld flags=%#llx caller=%#llx\n",
                     (int)getpid(), cpu->cpu_number, (unsigned long long)a[0],
@@ -4273,7 +4275,7 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     {
         int src = g_ocerz_deliver_src;
         g_ocerz_deliver_src = 0;
-        if (getenv("OCERZ_WSIG") && cpu->sig_altstack_sp == 0 &&
+        if (ENV_SET("OCERZ_WSIG") && cpu->sig_altstack_sp == 0 &&
             !ocerz_gs_is_teb_band(cpu->gs_base))
             fprintf(stderr,
                     "ocerz: WSIG sig=%d src=%d faddr=%#llx code=%d gs=%#llx rsp=%#llx rip=%#llx handler=%#llx wteb=%#llx\n",
@@ -4287,7 +4289,7 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     int sp_on_alt = asp && (cpu->gpr[OCERZ_RSP] - asp < asz);
     int old_on_stack = cpu->sig_on_stack;
     int use_alt = (sa->flags & DARWIN_SA_ONSTACK) && asp && !old_on_stack;
-    if (getenv("OCERZ_SIGTRACE"))
+    if (ENV_SET("OCERZ_SIGTRACE"))
         fprintf(stderr,
                 "ocerz:   altstk sig=%d flags=%#x ONSTACK=%d altsp=%#llx altsz=%#llx on_stack=%d sp_on_alt=%d -> use_alt=%d\n",
                 sig, sa->flags, (sa->flags & DARWIN_SA_ONSTACK) ? 1 : 0,
@@ -5853,7 +5855,7 @@ static int dispatch_bsd_at(OcerzVM *vm, OcerzCPU *cpu, int num, uint64_t stack_s
                 (unsigned long long)cpu->rip);
     }
 
-    if ((num == 363 || num == 369) && getenv("OCERZ_KEVLOG") &&
+    if ((num == 363 || num == 369) && ENV_SET("OCERZ_KEVLOG") &&
         orig[2] == 0 && orig[4] == 1)
         fprintf(stderr, "ocerz: KEVWAIT-ENTER[%d] num=%d kq=%lld(=fd %d) nev=%lld timeout=%#llx caller=%#llx\n",
                 (int)getpid(), num, (long long)orig[0], (int)orig[0], (long long)orig[4],
@@ -6151,7 +6153,7 @@ static int dispatch_bsd_at(OcerzVM *vm, OcerzCPU *cpu, int num, uint64_t stack_s
             }
         }
     }
-    if ((num == 362 || num == 363 || num == 369) && getenv("OCERZ_KEVLOG")) {
+    if ((num == 362 || num == 363 || num == 369) && ENV_SET("OCERZ_KEVLOG")) {
         static int kev_dumped = 0;
         if (!kev_dumped) { kev_dumped = 1; ocerz_dyld_dump_images(); }
         uint64_t rh[8]; unsigned rn = ocerz_vm_riphist(rh, 8);
@@ -7366,7 +7368,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                 }
             }
         }
-        if (getenv("OCERZ_MSGTIMEOUT"))
+        if (ENV_SET("OCERZ_MSGTIMEOUT"))
             fprintf(stderr, "ocerz: MSG2 opts=%#llx rcv_timeout_arg=%#llx a6=%#llx rsp=%#llx\n",
                     (unsigned long long)a[1], (unsigned long long)a[7],
                     (unsigned long long)a[6], (unsigned long long)cpu->gpr[OCERZ_RSP]);
