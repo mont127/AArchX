@@ -111,7 +111,7 @@ bug is in what that switch controls.
 | Variable | Effect |
 | --- | --- |
 | `OCERZ_BRIDGESTAT=1` | print how many times each bridged function was called, at exit |
-| `OCERZ_BRIDGELOG=1` | name every bridged call as it happens |
+| `OCERZ_BRIDGELOG=1` | name every bridged call as it happens, with the guest's return address and first argument |
 | `OCERZ_NO_NATIVE_CHILDREN=1` | run the system tools a guest starts under AArchX as well; by default one that has an arm64 slice and is not a shell or launcher runs as itself |
 | `OCERZ_NO_TSD_DTORS=1` | do not run the destructors of the guest's thread-specific data keys at thread exit |
 

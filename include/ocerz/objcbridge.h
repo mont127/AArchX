@@ -66,11 +66,13 @@
  * __objc_protorefs word holds a native protocol afterwards; and the image's
  * +load methods are queued.  The answer is the number of class and category
  * list entries, or 0 for an image with none of those sections or one defined
- * before.  A class or category that cannot be defined - a root class, a class
- * with a null superclass, a Swift class, a superclass or category class that is
- * a guest class not defined yet,
- * a chain of superclasses that loops, a list ocerz cannot read - stops the
- * process with OCERZ_BRIDGE_UNIMPL_EXIT and a line naming it.  The loader calls
+ * before.  A class or category that cannot be defined - a superclass or
+ * category class that is a guest class not defined yet, a chain of superclasses
+ * that loops, a list ocerz cannot read - stops the process with
+ * OCERZ_BRIDGE_UNIMPL_EXIT and a line naming it.  A class with a null
+ * superclass and no root flag is left out with a log line, and a Swift class
+ * whose metadata its runtime completes first waits until that runtime
+ * registers it (src/objcclass.c).  The loader calls
  * it in native mode for every guest dylib and the main image, right after
  * ocerz_objcbridge_fix_selrefs, dependencies before the images that load them.
  *
@@ -112,12 +114,13 @@
  * ---- guest layouts ----
  * The readers take guest addresses and read the LP64 layouts both
  * architectures share.  ocerz_objc_read_class splits a class_t into its words,
- * the data word's low bits masked off into swift, and refuses a Swift class or
- * a null data word.  ocerz_objc_read_ro reads a class_ro_t and refuses one with
- * a Swift metadata initializer.  ocerz_objc_method_list, ocerz_objc_ivar_list
- * and ocerz_objc_property_list read a list header - a null address is an empty
- * list - and refuse an entry size too small for the kind, or for a method list
- * an absolute one under 24 bytes or a relative one other than 12; the _at
+ * the data word's low bits masked off into swift, and refuses a null data word.
+ * ocerz_objc_read_ro reads a class_ro_t, and the Swift metadata initializer
+ * that follows it when its flags say one does.  ocerz_objc_method_list,
+ * ocerz_objc_ivar_list and ocerz_objc_property_list read a list header - a null
+ * address is an empty list - and refuse an entry size too small for the kind,
+ * or for a method list an absolute one under 24 bytes or a relative one other
+ * than 12; the _at
  * functions read one entry and refuse an index past the count.  A relative
  * method entry is resolved to the same three addresses an absolute one holds:
  * the selector name through the selector reference its first offset names, or
@@ -169,7 +172,6 @@ enum {
     OCERZ_OBJC_MALFORMED,
     OCERZ_OBJC_NOT_METHOD,
     OCERZ_OBJC_NULL,
-    OCERZ_OBJC_SWIFT,
     OCERZ_OBJC_BAD_LIST,
     OCERZ_OBJC_CYCLE,
 };
@@ -216,6 +218,7 @@ typedef struct OcerzObjcRo {
     uint64_t ivars;
     uint64_t weak_ivar_layout;
     uint64_t base_properties;
+    uint64_t swift_initializer;
 } OcerzObjcRo;
 
 typedef struct OcerzObjcList {
@@ -280,6 +283,12 @@ int ocerz_objcbridge_define_image(const uint8_t *mh, int64_t slide);
 int ocerz_objcbridge_run_loads(struct OcerzVM *vm, uint64_t stack_top);
 int ocerz_objcbridge_run_image_loads(struct OcerzVM *vm, const uint8_t *mh, uint64_t stack_top);
 int ocerz_objcbridge_is_defined(uint64_t cls);
+int ocerz_objcbridge_prepare_class(uint64_t cls);
+void ocerz_objcbridge_ensure_object(void *obj);
+void ocerz_objcbridge_ensure_class(void *cls);
+int ocerz_objcbridge_guest_swift_object(const void *obj);
+int ocerz_objcbridge_swift_destroy_fault(uint64_t pc, uint64_t context);
+void ocerz_objcbridge_swift_destroy(void *object, uint64_t destroy);
 void *ocerz_objcbridge_dead_imp(void);
 
 int ocerz_objc_read_class(uint64_t addr, OcerzObjcClass *out);
@@ -323,6 +332,17 @@ int ocerz_objc_method_getImplementation(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_class_getMethodImplementation(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_imp_trap(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_setExceptionPreprocessor(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_realizeClassFromSwift(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_readClassPair(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_setHook_getClass(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_setHook_getImageName(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_setHook_lazyClassNamer(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_opt_self(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_opt_class(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_alloc(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_alloc_init(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_allocWithZone(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_release(struct OcerzVM *vm, OcerzCPU *cpu);
 
 uint64_t ocerz_objc_imp_for_guest(void *native_imp, const char *types);
 void *ocerz_objc_imp_from_guest(uint64_t guest_imp);

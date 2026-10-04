@@ -68,6 +68,15 @@
  * well since nothing has to be reconstructed.  Checking for a crossing first
  * would turn every self-modifying guest in native mode into a crash report.
  *
+ * One fault inside native code is not an error at all, and is checked before
+ * everything else: the native Swift runtime calling a guest Swift class's
+ * destroy function when a native release drops an object's last reference.
+ * The jump into guest memory faults on the instruction fetch, and
+ * ocerz_objcbridge_swift_destroy_fault recognizes the destroy function from the
+ * object in x20; the handler then resumes the thread in
+ * ocerz_objcbridge_swift_destroy, which runs the guest function and returns to
+ * the native caller, as src/objcclass.c explains.
+ *
  * What is not recognised is handed to the guest as an access violation at the
  * faulting instruction rather than killing the thread: killing it leaves every
  * lock it held taken forever, and a V8 background job died that way holding a
@@ -215,6 +224,10 @@
  * are thin wrappers around one core rather than two copies of it: several of
  * the steps above are there because a real program broke without them, and a
  * second copy would be one fix behind the first the next time that happens.
+ * ocerz_vm_call_swift_context is the third wrapper, for the one Swift
+ * convention native code reaches guest code through: a heap object's destroy
+ * function takes the object in the context register, which is R13 on x86-64,
+ * and nothing else (src/objcclass.c).
  *
  * OCERZ_ICAP and OCERZ_PROFILE are read once, like the knobs beside them.  An
  * initializer enters guest code once, but a callback enters it once per
@@ -316,6 +329,7 @@
 #include "ocerz/syscall.h"
 #include "ocerz/dyldapi.h"
 #include "ocerz/bridge.h"
+#include "ocerz/objcbridge.h"
 
 #include <dlfcn.h>
 #include <signal.h>
@@ -1895,6 +1909,17 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     }
     if (ocerz_jit_decode_recover)
         siglongjmp(*ocerz_jit_decode_recover, 1);
+    if ((sig == SIGSEGV || sig == SIGBUS) && ctx && ocerz_mode == OCERZ_MODE_NATIVE) {
+        ucontext_t *suc = (ucontext_t *)ctx;
+        uint64_t spc = suc->uc_mcontext->__ss.__pc;
+        if ((uint64_t)(uintptr_t)si->si_addr == spc &&
+            ocerz_objcbridge_swift_destroy_fault(spc, suc->uc_mcontext->__ss.__x[20])) {
+            suc->uc_mcontext->__ss.__x[0] = suc->uc_mcontext->__ss.__x[20];
+            suc->uc_mcontext->__ss.__x[1] = spc;
+            suc->uc_mcontext->__ss.__pc = (uint64_t)(uintptr_t)ocerz_objcbridge_swift_destroy;
+            return;
+        }
+    }
     if ((sig == SIGSEGV || sig == SIGBUS) && !align_fault && g_vm &&
         ocerz_host_in_guest_space(si->si_addr)) {
         static __thread uint64_t last_alias_page;
@@ -3435,7 +3460,7 @@ static void call_sentinel_init(void)
 }
 
 static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ngpr, int nxmm,
-                        uint64_t stack_top)
+                        uint64_t stack_top, const uint64_t *context)
 {
     static const int ar[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
     pthread_once(&g_call_sentinel_once, call_sentinel_init);
@@ -3463,6 +3488,8 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
         local.xmm[i].lo = call->xmm[i];
         local.xmm[i].hi = 0;
     }
+    if (context)
+        local.gpr[OCERZ_R13] = *context;
     int nstack = call->nstack < 0 ? 0 : call->nstack > 16 ? 16 : call->nstack;
     uint64_t argbase = ((stack_top & ~0xfull) - 8 * (uint64_t)nstack) & ~0xfull;
     uint64_t sp = argbase - 8;
@@ -3703,13 +3730,20 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     for (int i = 0; i < nargs && i < 6; i++)
         call.gpr[i] = args[i];
     call.nstack = 0;
-    vm_call_core(vm, func, &call, nargs, 0, stack_top);
+    vm_call_core(vm, func, &call, nargs, 0, stack_top, NULL);
     return call.rax;
 }
 
 int ocerz_vm_call_abi(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, uint64_t stack_top)
 {
-    return vm_call_core(vm, func, call, 6, 8, stack_top);
+    return vm_call_core(vm, func, call, 6, 8, stack_top, NULL);
+}
+
+int ocerz_vm_call_swift_context(OcerzVM *vm, uint64_t func, uint64_t context, uint64_t stack_top)
+{
+    OcerzGuestCall call;
+    memset(&call, 0, sizeof call);
+    return vm_call_core(vm, func, &call, 0, 0, stack_top, &context);
 }
 
 #define OCERZ_ATTACH_REGION 0x200000ull

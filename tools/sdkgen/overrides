@@ -137,7 +137,15 @@
 # pthread_key_delete, pthread_setspecific and pthread_getspecific are special:
 # the keys are ocerz's own, numbered 256 to 767 as the dynamic keys of the real
 # library are, and their values live at those slots of the guest thread block
-# gs points into, where both the function and the instruction find them.
+# gs points into, where both the function and the instruction find them.  Keys
+# 10 to 255 are Darwin's reserved keys, which a library uses by number instead
+# of creating: the Swift runtime keeps its exclusivity-checking state in one and
+# reads and writes it through the two functions without ever calling
+# pthread_key_init_np, which would only have recorded a destructor.  Those keys
+# take values at the same slots without being claimed first, and
+# pthread_key_init_np, special as well, records a reserved key's destructor so
+# that it runs with the others.  Keys below 10 are libSystem's own, errno's
+# among them, and stay refused.
 # pthread_create is special so that the start routine runs inside a frame of
 # ocerz's that calls the keys' destructors, as guest code, when the routine
 # returns, and pthread_exit is special so that it runs them too before it ends
@@ -355,9 +363,19 @@
 # exists only in x86_64 libobjc and stays omitted.
 #
 # Runtime hooks.  objc_setHook_* and _objc_setHook_* install functions the
-# runtime calls from inside class lookup and method caching, and
-# objc_addLoadImageFunc and objc_addLoadImageFunc2 one it calls for every image
-# host dyld loads, none of which is a guest image.  _objc_init, _objc_map_images
+# runtime calls from inside class lookup and method caching.  The Swift runtime
+# installs three of them, objc_setHook_getClass, objc_setHook_getImageName and
+# objc_setHook_lazyClassNamer, and those are special: each guest hook is x86
+# code, so ocerz installs a native one that calls it and hands the guest a
+# guest function to chain to (src/objcbridge.c).  The rest stay stubs.
+# objc_addLoadImageFunc installs a function the runtime calls for every image
+# host dyld loads, none of which is a guest image, so it is special too: ocerz
+# calls the guest's function for every guest image instead, the ones loaded
+# already and each one a dlopen loads later (src/dyld.c).
+# objc_addLoadImageFunc2 stays a stub.  objc_readClassPair and
+# _objc_realizeClassFromSwift register a class the Swift runtime has built while
+# running, and are special so that ocerz prepares the class before the native
+# runtime reads it (src/objcbridge.c).  _objc_init, _objc_map_images
 # and _objc_load_image are dyld's own entry points into the runtime.  The SDK's
 # libobjc exports no map_images, load_images or unmap_image under those names.
 # objc_setEnumerationMutationHandler takes a function the rules can carry as a
@@ -369,6 +387,12 @@
 # objc_opt_class, objc_getProperty and the rest on a program's behalf, and no
 # public header declares any of them.  Their fn records carry objc4's own
 # signatures, with BOOL written b because it is signed char on x86_64.
+# objc_alloc, objc_allocWithZone, objc_alloc_init, objc_opt_class and
+# objc_opt_self are special instead, so that a guest class the native runtime
+# has not seen is defined before it does, and so is objc_release, so that a
+# guest Swift object is released by the guest's own swift_release
+# (src/objcbridge.c).  _objc_rootAutorelease, which the Swift runtime's
+# -autorelease calls, has a record of its own because no header declares it.
 # objc_retainBlock is _Block_copy by another name, and is answered with it
 # under Blocks below.
 #
@@ -566,6 +590,7 @@ special _pthread_exit pthread_exit
 special _pthread_create pthread_create
 special _pthread_key_create pthread_key_create
 special _pthread_key_delete pthread_key_delete
+special _pthread_key_init_np pthread_key_init_np
 special _pthread_setspecific pthread_setspecific
 special _pthread_getspecific pthread_getspecific
 stub _pthread_cancel override
@@ -861,9 +886,14 @@ data _OBJC_EHTYPE_id OBJC_EHTYPE_id
 data _objc_ehtype_vtable objc_ehtype_vtable
 data __objc_empty_cache _objc_empty_cache
 
-stub _objc_setHook_* override
 stub __objc_setHook_* override
 stub _objc_addLoadImageFunc* override
+special _objc_setHook_getClass objc_setHook_getClass
+special _objc_setHook_getImageName objc_setHook_getImageName
+special _objc_setHook_lazyClassNamer objc_setHook_lazyClassNamer
+special _objc_addLoadImageFunc objc_addLoadImageFunc
+special _objc_readClassPair objc_readClassPair
+special __objc_realizeClassFromSwift objc_realizeClassFromSwift
 stub __objc_init override
 stub __objc_map_images override
 stub __objc_load_image override
@@ -884,9 +914,10 @@ fn _objc_registerClassPair objc_registerClassPair v(p)
 fn __objc_autoreleasePoolPop _objc_autoreleasePoolPop v(p)
 fn __objc_autoreleasePoolPrint _objc_autoreleasePoolPrint v()
 fn __objc_autoreleasePoolPush _objc_autoreleasePoolPush p()
-fn _objc_alloc objc_alloc p(p)
-fn _objc_allocWithZone objc_allocWithZone p(p)
-fn _objc_alloc_init objc_alloc_init p(p)
+fn __objc_rootAutorelease _objc_rootAutorelease p(p)
+special _objc_alloc objc_alloc
+special _objc_allocWithZone objc_allocWithZone
+special _objc_alloc_init objc_alloc_init
 fn _objc_autorelease objc_autorelease p(p)
 fn _objc_autoreleasePoolPop objc_autoreleasePoolPop v(p)
 fn _objc_autoreleasePoolPush objc_autoreleasePoolPush p()
@@ -901,12 +932,12 @@ fn _objc_initWeak objc_initWeak p(pp)
 fn _objc_initWeakOrNil objc_initWeakOrNil p(pp)
 fn _objc_loadWeakRetained objc_loadWeakRetained p(p)
 fn _objc_moveWeak objc_moveWeak v(pp)
-fn _objc_opt_class objc_opt_class p(p)
+special _objc_opt_class objc_opt_class
 fn _objc_opt_isKindOfClass objc_opt_isKindOfClass b(pp)
 fn _objc_opt_new objc_opt_new p(p)
 fn _objc_opt_respondsToSelector objc_opt_respondsToSelector b(pp)
-fn _objc_opt_self objc_opt_self p(p)
-fn _objc_release objc_release v(p)
+special _objc_opt_self objc_opt_self
+special _objc_release objc_release
 fn _objc_retain objc_retain p(p)
 fn _objc_retainAutorelease objc_retainAutorelease p(p)
 fn _objc_retainAutoreleaseReturnValue objc_retainAutoreleaseReturnValue p(p)

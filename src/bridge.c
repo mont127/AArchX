@@ -162,9 +162,13 @@
  * freed and all printable from a handler exactly as they are found.
  * OCERZ_BRIDGELOG prints those same three names once per crossing, from a
  * variable read once into a static so the hot path pays a predictable branch
- * and never a getenv.  It prints no argument values: the signature already says
+ * and never a getenv, followed by the guest's return address and rdi.  The
+ * return address names the guest code that made the call, which is what tells
+ * one caller of objc_release from another, and rdi is the first argument as a
+ * raw word, most often the object or buffer the call is about.  Neither is
+ * dereferenced, and no other argument is printed: the signature already says
  * what shape they were, and most of them are pointers into guest memory that a
- * log line has no business dereferencing.
+ * log line has no business reading.
  *
  * ---- counting ----
  * Each descriptor carries its own crossing count, and every descriptor made is
@@ -1626,6 +1630,12 @@ static int br_dyld_register_add_image(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_answer(vm, cpu, 0);
 }
 
+static int br_objc_add_load_image_func(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    ocerz_dyld_native_objc_load_func(vm, cpu->gpr[OCERZ_RDI], br_stack_below(cpu));
+    return br_answer(vm, cpu, 0);
+}
+
 static int br_dyld_register_remove_image(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     ocerz_dyld_native_remove_image_func(cpu->gpr[OCERZ_RDI]);
@@ -1835,6 +1845,18 @@ static const BrHandler g_br_handlers[] = {
     { "method_setImplementation",   ocerz_objc_methodSetImplementation },
     { "class_replaceMethod",        ocerz_objc_class_replaceMethod },
     { "objc_setExceptionPreprocessor", ocerz_objc_setExceptionPreprocessor },
+    { "objc_realizeClassFromSwift", ocerz_objc_realizeClassFromSwift },
+    { "objc_opt_self",              ocerz_objc_opt_self },
+    { "objc_opt_class",             ocerz_objc_opt_class },
+    { "objc_alloc",                 ocerz_objc_alloc },
+    { "objc_alloc_init",            ocerz_objc_alloc_init },
+    { "objc_allocWithZone",         ocerz_objc_allocWithZone },
+    { "objc_release",               ocerz_objc_release },
+    { "objc_readClassPair",         ocerz_objc_readClassPair },
+    { "objc_addLoadImageFunc",      br_objc_add_load_image_func },
+    { "objc_setHook_getClass",      ocerz_objc_setHook_getClass },
+    { "objc_setHook_getImageName",  ocerz_objc_setHook_getImageName },
+    { "objc_setHook_lazyClassNamer", ocerz_objc_setHook_lazyClassNamer },
     { "method_getImplementation",   ocerz_objc_method_getImplementation },
     { "class_getMethodImplementation", ocerz_objc_class_getMethodImplementation },
     { "NSLog",                     ocerz_fmt_NSLog },
@@ -1917,6 +1939,7 @@ static const BrHandler g_br_handlers[] = {
     { "pclose",          ocerz_sys_pclose },
     { "pthread_key_create",  ocerz_sys_pthread_key_create },
     { "pthread_key_delete",  ocerz_sys_pthread_key_delete },
+    { "pthread_key_init_np", ocerz_sys_pthread_key_init_np },
     { "pthread_setspecific", ocerz_sys_pthread_setspecific },
     { "pthread_getspecific", ocerz_sys_pthread_getspecific },
     { "pthread_create",      ocerz_sys_pthread_create },
@@ -2349,8 +2372,9 @@ int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu, const struct OcerzBri
     ((struct OcerzBridgeFn *)fn)->calls++;
 
     if (br_logging())
-        fprintf(stderr, "ocerz: BRIDGELOG[%d] %s %s %s\n", (int)getpid(),
-                fn->lib, fn->sym, fn->sig ? fn->sig : "(nothing)");
+        fprintf(stderr, "ocerz: BRIDGELOG[%d] %s %s %s from %#llx rdi=%#llx\n", (int)getpid(),
+                fn->lib, fn->sym, fn->sig ? fn->sig : "(nothing)",
+                (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8), (unsigned long long)cpu->gpr[OCERZ_RDI]);
 
     if (fn->special)
         return fn->special(vm, cpu);

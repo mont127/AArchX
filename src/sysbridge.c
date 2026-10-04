@@ -1140,6 +1140,7 @@ int ocerz_sys_pclose(struct OcerzVM *vm, OcerzCPU *cpu)
 #define SB_KEY_FIRST 256u
 #define SB_KEY_END 768u
 #define SB_KEY_ROUNDS 4
+#define SB_RESERVED_FIRST 10u
 
 typedef struct SbKey {
     _Atomic int used;
@@ -1147,11 +1148,14 @@ typedef struct SbKey {
 } SbKey;
 
 static SbKey g_sb_keys[SB_KEY_END - SB_KEY_FIRST];
+static SbKey g_sb_reserved[SB_KEY_FIRST];
 static unsigned g_sb_key_next;
 static pthread_mutex_t g_sb_key_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static SbKey *sb_key(uint64_t key)
 {
+    if (key >= SB_RESERVED_FIRST && key < SB_KEY_FIRST)
+        return &g_sb_reserved[key];
     if (key < SB_KEY_FIRST || key >= SB_KEY_END)
         return NULL;
     SbKey *k = &g_sb_keys[key - SB_KEY_FIRST];
@@ -1182,9 +1186,20 @@ int ocerz_sys_pthread_key_create(struct OcerzVM *vm, OcerzCPU *cpu)
     return sb_ret(vm, cpu, 0);
 }
 
+int ocerz_sys_pthread_key_init_np(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t key = (uint64_t)(uint32_t)sb_arg(cpu, 0), destructor = sb_arg(cpu, 1);
+    if (key < SB_RESERVED_FIRST || key >= SB_KEY_FIRST)
+        return sb_ret(vm, cpu, EINVAL);
+    g_sb_reserved[key].destructor = destructor;
+    g_sb_reserved[key].used = 1;
+    return sb_ret(vm, cpu, 0);
+}
+
 int ocerz_sys_pthread_key_delete(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    SbKey *k = sb_key(sb_arg(cpu, 0));
+    uint64_t which = sb_arg(cpu, 0);
+    SbKey *k = which >= SB_KEY_FIRST ? sb_key(which) : NULL;
     if (!k)
         return sb_ret(vm, cpu, EINVAL);
     k->used = 0;
@@ -1217,9 +1232,12 @@ static void sb_key_destructors(struct OcerzVM *vm, OcerzCPU *cpu)
         return;
     for (int round = 0; round < SB_KEY_ROUNDS; round++) {
         int ran = 0;
-        for (unsigned i = 0; i < SB_KEY_END - SB_KEY_FIRST && !vm->exited; i++) {
-            uint64_t destructor = g_sb_keys[i].used ? g_sb_keys[i].destructor : 0;
-            uint64_t slot = cpu->gs_base + 8 * (uint64_t)(SB_KEY_FIRST + i);
+        for (unsigned key = SB_RESERVED_FIRST; key < SB_KEY_END && !vm->exited; key++) {
+            SbKey *k = key < SB_KEY_FIRST ? &g_sb_reserved[key] : &g_sb_keys[key - SB_KEY_FIRST];
+            if (key < SB_KEY_FIRST && !k->used)
+                continue;
+            uint64_t destructor = k->used ? k->destructor : 0;
+            uint64_t slot = cpu->gs_base + 8 * (uint64_t)key;
             uint64_t value = ocerz_ld(slot, 8);
             if (!value)
                 continue;

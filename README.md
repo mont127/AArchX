@@ -160,8 +160,10 @@ each gate proves and lists the component suites.
 
 - Application compatibility is incomplete, and some system calls and framework
   behaviour are still missing.
-- Native mode does not run Swift yet, has no bridge for WebKit or GameKit, and
-  stops with a named message on any call it cannot make.
+- Native mode runs Swift programs on a guest copy of the Swift runtime
+  (`make guest-swift`), but not yet the system frameworks' Swift APIs; it has
+  no bridge for WebKit or GameKit, and stops with a named message on any call it
+  cannot make.
 - x87 arithmetic uses 64-bit doubles rather than 80-bit precision, MMX always
   runs in the interpreter, and a few AVX2 forms do as well.
 - Large applications start several times slower than under Rosetta.
@@ -199,6 +201,6 @@ security issues as described in [SECURITY.md](SECURITY.md).
 
 AArchX is free software: you may redistribute it and modify it under the terms of the [GNU Lesser General Public License, version 2.1](LICENSE), or, at your option, any later version. Copyright (c) 2026 mont127.
 
-In one paragraph: anyone may use, build, run, study and redistribute it, and ship it beside their own software, provided the notices stay and the source of this program, including any change made to it, is offered under the same license. Running Intel software through ocerz, or launching ocerz from another program, does not make that program a derivative work; it keeps its own license. Modifying ocerz itself and distributing the result without publishing the modifications is not permitted. The name AArchX is not covered by this license: do not use it to name a modified version or to suggest endorsement. The guest C++ runtime under `runtime/guest` is LLVM's, under its own license (`LICENSE.libcxx.txt`, `LICENSE.libcxxabi.txt`, `LICENSE.libunwind.txt`). Earlier commits carry the license they were published with.
+In one paragraph: anyone may use, build, run, study and redistribute it, and ship it beside their own software, provided the notices stay and the source of this program, including any change made to it, is offered under the same license. Running Intel software through ocerz, or launching ocerz from another program, does not make that program a derivative work; it keeps its own license. Modifying ocerz itself and distributing the result without publishing the modifications is not permitted. The name AArchX is not covered by this license: do not use it to name a modified version or to suggest endorsement. The guest C++ runtime under `runtime/guest` is LLVM's, under its own license (`LICENSE.libcxx.txt`, `LICENSE.libcxxabi.txt`, `LICENSE.libunwind.txt`), and the guest Swift runtime `make guest-swift` installs there is the Swift project's, under the Apache License 2.0 with its Runtime Library Exception (`LICENSE.swift.txt`). Earlier commits carry the license they were published with.
 
 Contributions are accepted under the same license.

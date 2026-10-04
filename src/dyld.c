@@ -439,7 +439,8 @@
  * its thread-local descriptors are registered, every add-image callback is
  * called for each new image, every new image's selectors are rewritten and its
  * classes, categories and protocols defined, dependencies first by the order
- * their loads completed, and then image by image, again dependencies first,
+ * their loads completed, every objc_addLoadImageFunc function is called for
+ * each new image, and then image by image, again dependencies first,
  * that image's +load methods and its initializers run on the calling thread
  * below the caller's stack pointer.  RTLD_LOCAL marks the image it loaded, not
  * its dependencies, which hides it from RTLD_DEFAULT, RTLD_NEXT and flat lookups
@@ -476,7 +477,13 @@
  * synthesized images, so a list of guest dylibs alone would hide what the guest
  * believes it has linked, while listing the host's images would hand x86 code
  * arm64 headers.  An add-image callback registered late is called at once for
- * every image already listed, and then for each image a dlopen adds.
+ * every image already listed, and then for each image a dlopen adds.  A
+ * function the guest gives objc_addLoadImageFunc, which the Swift runtime uses
+ * to find each image's Swift sections, is kept the same way and called with
+ * each image's header: for those already listed when it is registered, and
+ * then for each new image after its classes are defined and before its +load
+ * methods run, which is where libobjc calls one.  It is never registered with
+ * the native runtime, whose images are the host's.
  *
  * Chained fixups name an import by ordinal at every location that uses it, so
  * apply_fixups resolves each ordinal once and reuses the answer, and the
@@ -4402,6 +4409,14 @@ static uint64_t ndl_search_from(uint32_t start, uint32_t own, const char *usym, 
     return 0;
 }
 
+uint64_t ocerz_dyld_native_image_export(const char *install_name, const char *usym)
+{
+    DynImage *d = dimg_find_by_install_name(install_name);
+    int found = 0;
+    uint64_t v = d ? ndl_lookup_in(d, usym, &found) : 0;
+    return found ? v : 0;
+}
+
 static void ndl_handle_text(uint64_t handle, char *out, size_t n)
 {
     if (handle == NDL_DEFAULT)
@@ -4897,6 +4912,8 @@ static uint64_t *g_ndl_add_funcs;
 static int g_ndl_add_n, g_ndl_add_cap;
 static uint64_t *g_ndl_remove_funcs;
 static int g_ndl_remove_n, g_ndl_remove_cap;
+static uint64_t *g_ndl_objc_funcs;
+static int g_ndl_objc_n, g_ndl_objc_cap;
 
 static int ndl_append_func(uint64_t **arr, int *n, int *cap, uint64_t fn)
 {
@@ -4930,6 +4947,24 @@ int ocerz_dyld_native_add_image_func(struct OcerzVM *vm, uint64_t func, uint64_t
     for (uint32_t i = 0; i < n && !vm->exited; i++)
         if (ndl_image(i, &im))
             ndl_call_add(vm, func, im.mh, im.slide, stack_top);
+    pthread_mutex_unlock(&g_load_lock);
+    return ok;
+}
+
+int ocerz_dyld_native_objc_load_func(struct OcerzVM *vm, uint64_t func, uint64_t stack_top)
+{
+    if (!func)
+        return 0;
+    pthread_mutex_lock(&g_load_lock);
+    int ok = ndl_append_func(&g_ndl_objc_funcs, &g_ndl_objc_n, &g_ndl_objc_cap, func);
+    uint32_t n = ok ? ocerz_dyld_image_count() : 0;
+    NdlImage im;
+    for (uint32_t i = 0; i < n && !vm->exited; i++) {
+        if (ndl_image(i, &im)) {
+            uint64_t args[1] = { im.mh };
+            ocerz_vm_call(vm, func, args, 1, stack_top);
+        }
+    }
     pthread_mutex_unlock(&g_load_lock);
     return ok;
 }
@@ -5057,6 +5092,12 @@ static uint64_t ndl_dlopen_locked(struct OcerzVM *vm, const char *path, int mode
     }
     if (dimg_find_by_install_name(OCERZ_OBJC_LIBOBJC))
         ocerz_objcbridge_install_uncaught();
+    for (int f = 0; f < g_ndl_objc_n && !vm->exited; f++) {
+        for (int i = before; i < after && !vm->exited; i++) {
+            uint64_t args[1] = { g_dimgs[i].load_base };
+            ocerz_vm_call(vm, g_ndl_objc_funcs[f], args, 1, stack_top);
+        }
+    }
     protect_ro_flush();
     for (int i = 0; i < n && !vm->exited; i++) {
         ocerz_objcbridge_run_image_loads(vm, (const uint8_t *)ocerz_g2h(order[i]->load_base), stack_top);
