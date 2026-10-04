@@ -50,11 +50,22 @@
  * scalar re-read of a seqlock counter observing newer data than the counter
  * covers, and two vector stores becoming visible out of order; OCERZ_TSO_VECTOR
  * =1 orders them too.  Measured 2026-09-05 on M2 Max; FEX ships the same
- * default.  An ordered vector load is a plain load followed by a one-byte
- * ACQUIRE load of the same address: same-address reads are coherent, so the
- * copy sees a value at least as new as the vector and everything after is
- * ordered behind it - TSO's load ordering with no barrier, where a dmb ishld
- * waited for every outstanding miss (40-60 ns per access on a 4 MB working set).
+ * default.  The 8- and 4-byte forms are plain as well, though compilers do move
+ * pointers and counters through xmm registers: a plain movq store after an
+ * ordered scalar store can become visible first, and a plain movq load can be
+ * satisfied after the scalar load that follows it, so a reader sees a published
+ * counter newer than the data written before it - hundreds to over a thousand
+ * times in three million handoffs in tests/dynamic/tso_narrow.c, where x86
+ * never shows it.  OCERZ_TSO_NARROW=1 orders movd and movq, two instructions and no
+ * barrier each (fmov and stlur, ldr and a one-byte ldapur), and =2 every vector
+ * access of 8 bytes or fewer.  Neither is the default: the first took R.E.P.O.'s
+ * main menu from 65 frames a second to 44, the second costs more again, and no
+ * program is known to depend on either.  An ordered vector load is a plain load
+ * followed by a one-byte ACQUIRE load of the same address: same-address reads
+ * are coherent, so the copy sees a value at least as new as the vector and
+ * everything after is ordered behind it - TSO's load ordering with no barrier,
+ * where a dmb ishld waited for every outstanding miss (40-60 ns per access on a
+ * 4 MB working set).
  *
  * Apple silicon faults an acquire/release access only when it crosses a 16-byte
  * granule, so the alignment guard tests exactly that; testing natural alignment
@@ -1280,6 +1291,14 @@ static int vec_tso_relaxed(void)
     static int v = -1;
     if (v < 0) v = getenv("OCERZ_TSO_VECTOR") == NULL;
     return v;
+}
+static int g_vec_int_move;
+static int vec_plain_size(int size)
+{
+    static int mode = -1;
+    if (mode < 0) mode = getenv("OCERZ_TSO_NARROW") ? atoi(getenv("OCERZ_TSO_NARROW")) : 0;
+    if (!vec_tso_relaxed() || size > 8 || mode == 0) return vec_tso_relaxed();
+    return mode == 1 && !g_vec_int_move;
 }
 static unsigned long long ps_align_patches;
 static int g_blk_ordered_loads;
@@ -4480,7 +4499,7 @@ static void emit_v_ld_at(A64Buf *b, int size, int vd, int ra, int32_t disp, int 
 static void emit_v_ld_at_(A64Buf *b, int size, int vd, int ra, int32_t disp, int plain)
 {
     int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
-    if (!plain && vec_tso_relaxed()) plain = 1;
+    if (!plain && vec_plain_size(size)) plain = 1;
     if (!plain) g_blk_ordered_loads = 1;
     if (plain) {
         if (scaled) a64_ldr_v(b, size, vd, ra, (uint32_t)disp);
@@ -4502,7 +4521,7 @@ static void emit_v_ld_at_(A64Buf *b, int size, int vd, int ra, int32_t disp, int
 static void emit_v_st_at(A64Buf *b, int size, int vs, int ra, int32_t disp, int plain)
 {
     int scaled = disp >= 0 && (disp % size) == 0 && disp / size <= 4095;
-    if (!plain && vec_tso_relaxed()) plain = 1;
+    if (!plain && vec_plain_size(size)) plain = 1;
     if (plain) {
         if (scaled) a64_str_v(b, size, vs, ra, (uint32_t)disp);
         else if (disp >= -256 && disp <= 255) a64_stur_v(b, size, vs, ra, disp);
@@ -4517,14 +4536,14 @@ static void emit_v_st_at(A64Buf *b, int size, int vs, int ra, int32_t disp, int 
 }
 static void emit_v_ld_regoff(A64Buf *b, int size, int vd, int ra, int ri, int scaled, int plain)
 {
-    if (plain || vec_tso_relaxed()) { a64_ldr_v_regoff(b, size, vd, ra, ri, scaled); undo_save_hook(b, size, vd); return; }
+    if (plain || vec_plain_size(size)) { a64_ldr_v_regoff(b, size, vd, ra, ri, scaled); undo_save_hook(b, size, vd); return; }
     int sh = scaled ? (size == 16 ? 4 : size == 8 ? 3 : 2) : 0;
     a64_add_reg(b, 1, JTA, ra, ri, sh);
     emit_v_ld_at(b, size, vd, JTA, 0, 0);
 }
 static void emit_v_st_regoff(A64Buf *b, int size, int vs, int ra, int ri, int scaled, int plain)
 {
-    if (plain || vec_tso_relaxed()) { a64_str_v_regoff(b, size, vs, ra, ri, scaled); return; }
+    if (plain || vec_plain_size(size)) { a64_str_v_regoff(b, size, vs, ra, ri, scaled); return; }
     int sh = scaled ? (size == 16 ? 4 : size == 8 ? 3 : 2) : 0;
     a64_add_reg(b, 1, JTA, ra, ri, sh);
     emit_v_st_at(b, size, vs, JTA, 0, 0);
@@ -9950,7 +9969,12 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
     case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTDQ2PS:
         return emit_sse_cvt(b, insn, exit_sites, n_exits);
-    case OCERZ_OP_MOVQX: return emit_sse_movq(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_MOVQX: {
+        g_vec_int_move = 1;
+        int r = emit_sse_movq(b, insn, exit_sites, n_exits);
+        g_vec_int_move = 0;
+        return r;
+    }
     case OCERZ_OP_PSHUFD: return emit_sse_pshufd(b, insn, exit_sites, n_exits);
     case OCERZ_OP_PINSRB: case OCERZ_OP_PINSRW: case OCERZ_OP_PINSRD: case OCERZ_OP_PINSRQ:
     case OCERZ_OP_PEXTRB: case OCERZ_OP_PEXTRW: case OCERZ_OP_PEXTRD: case OCERZ_OP_PEXTRQ:
@@ -9964,8 +9988,12 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_PUNPCKLBW: case OCERZ_OP_PUNPCKLWD: case OCERZ_OP_PUNPCKLDQ: case OCERZ_OP_PUNPCKLQDQ:
     case OCERZ_OP_PUNPCKHBW: case OCERZ_OP_PUNPCKHWD: case OCERZ_OP_PUNPCKHDQ: case OCERZ_OP_PUNPCKHQDQ:
         return emit_sse_punpck(b, insn, exit_sites, n_exits);
-    case OCERZ_OP_MOVD:
-        return emit_sse_movd(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_MOVD: {
+        g_vec_int_move = 1;
+        int r = emit_sse_movd(b, insn, exit_sites, n_exits);
+        g_vec_int_move = 0;
+        return r;
+    }
     case OCERZ_OP_UNPCKLPD: case OCERZ_OP_UNPCKHPD: case OCERZ_OP_MOVLHPS: case OCERZ_OP_MOVHLPS:
     case OCERZ_OP_UNPCKLPS: case OCERZ_OP_UNPCKHPS:
         return emit_sse_unpck(b, insn, exit_sites, n_exits);

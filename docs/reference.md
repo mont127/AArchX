@@ -83,6 +83,7 @@ ordered forms are used from then on.
 | `OCERZ_NO_PLAIN_MEM=1` | use ordered forms from the start |
 | `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |
 | `OCERZ_TSO_VECTOR=1` | order SSE loads and stores too, which costs a great deal |
+| `OCERZ_TSO_NARROW=1` | order `movd` and `movq` loads and stores; `=2` orders every SSE access of 8 bytes or fewer |
 
 ### Turning off what makes it fast
 
