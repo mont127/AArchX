@@ -289,8 +289,11 @@ How far native mode reaches can be counted before anything runs. On a
 macOS 26.7.1 machine with 2,913 x86-64 executables and libraries, system tools,
 system applications and 57 third-party applications with their own frameworks
 among them, every import of each was matched against the API databases
-(2026-10-04): 1,976 bind completely, and 1,238 import nothing that is only a
-stub. Of the 1,260 belonging to third-party applications, 1,073 bind. What
+(2026-10-04): 2,013 bind completely, and 1,338 import nothing that is only a
+stub. Of the 1,260 belonging to third-party applications, 1,085 bind. Of 84
+command-line tools run both ways, 71 print the same output and exit with the
+same status under native mode as their arm64 slices, sqlite3 and unzip among
+them. What
 keeps the rest from binding is mostly Swift: the Swift interface of Foundation
 and the Swift-only frameworks, SwiftUI and Combine above all, which native mode
 cannot cross, and then private frameworks the SDK describes nothing of. Among the

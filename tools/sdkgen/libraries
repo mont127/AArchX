@@ -380,3 +380,24 @@ pass DiscRecording.h
 library SystemExtensions /System/Library/Frameworks/SystemExtensions.framework/Versions/A/SystemExtensions System/Library/Frameworks/SystemExtensions.framework/SystemExtensions.tbd
 language objective-c
 pass SystemExtensions.h
+
+library libedit /usr/lib/libedit.3.dylib usr/lib/libedit.tbd
+pass libedit.h
+
+library libcurl /usr/lib/libcurl.4.dylib usr/lib/libcurl.tbd
+pass libcurl.h
+
+library libexpat /usr/lib/libexpat.1.dylib usr/lib/libexpat.tbd
+pass libexpat.h
+
+library libxo /usr/lib/libxo.dylib usr/lib/libxo.tbd
+pass libxo.h
+
+library libmd /usr/lib/libmd.dylib usr/lib/libmd.tbd
+pass libmd.h
+
+library libarchive /usr/lib/libarchive.2.dylib usr/lib/libarchive.tbd
+pass libarchive.h
+
+library Kerberos /System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos System/Library/Frameworks/Kerberos.framework/Kerberos.tbd
+pass Kerberos.h

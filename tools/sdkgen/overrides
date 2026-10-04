@@ -113,11 +113,17 @@
 # sandbox calls, __mac_syscall, which sandbox and quarantine queries end in,
 # proc_get_wakemon_params, csr_check and csr_get_active_config, the __ulock
 # pair Chromium's locks wait in, recvmsg_x and sendmsg_x, the voucher and
-# recursive-lock calls the Swift Concurrency runtime makes, and
+# recursive-lock calls the Swift Concurrency runtime makes,
 # os_unfair_lock_lock_with_options, which Chromium weak-imports and calls
-# whenever it binds, are in no SDK header, so the rules can only stub
-# them, but their signatures are fixed and public in Apple's open sources, and
-# they cross under those.  sandbox_check is variadic with at most one pointer
+# whenever it binds, rootless_restricted_environment, the os_variant queries,
+# _os_feature_enabled_impl, libdispatch's _dispatch_is_multithreaded,
+# _dispatch_is_fork_of_multithreaded_parent and dispatch_source_cancel_and_wait,
+# which sqlite3 calls, and the _qtn_file calls Apple's open-source unzip and
+# bsdtar make, are in no SDK header, so the rules can only stub them, but their
+# signatures are fixed and public in Apple's open sources, and they cross under
+# those.  So does xpc_copy_entitlement_for_self, which takes the entitlement's
+# name, as WebKit's open source declares it, and answers for ocerz's process,
+# the one the guest runs in.  sandbox_check is variadic with at most one pointer
 # after its filter type, and abort_report_np takes a format; each has a
 # handler.  sandbox_init, sandbox_init_with_parameters, libsandbox's
 # sandbox_apply and __sandbox_ms, which Chromium calls itself to apply a profile
@@ -171,6 +177,11 @@
 # _SC_PAGESIZE, host_page_size, the hw.pagesize and vm.pagesize sysctls, and
 # vm_page_size, vm_kernel_page_size and their masks and shifts, which are
 # variables of the image's own rather than the host's.
+#
+# The floating-point environment.  fenv.h's functions work on the guest's x87
+# and MXCSR state, which is ocerz's, under x86's flag and mode numbering, so all
+# eleven are special, and _FE_DFL_ENV and _FE_DFL_DISABLE_SSE_DENORMS_ENV are
+# variables holding x86's defaults, since the host's are arm64 fenv_t objects.
 #
 # Stopping a thread.  thread_suspend and thread_resume go through ocerz's own
 # suspension, as thread_get_state already does: a guest thread stopped by the
@@ -300,7 +311,8 @@
 #
 # The variadic functions whose ellipsis stands for one fixed argument are
 # special records too: open, openat and their $NOCANCEL forms,
-# open_dprotected_np and openat_dprotected_np take a mode with O_CREAT, fcntl
+# open_dprotected_np, openat_dprotected_np, guarded_open_np and
+# guarded_open_dprotected_np take a mode with O_CREAT, fcntl
 # and fcntl$NOCANCEL an int or a pointer by command, ioctl a pointer-sized word,
 # sem_open a mode and a value and shm_open a mode with O_CREAT, semctl a union
 # semun and ulimit a new limit.  Their handlers read that argument where x86-64
@@ -549,6 +561,19 @@ var _vm_page_shift 4 page_shift
 var _vm_kernel_page_size 8 page_size
 var _vm_kernel_page_mask 8 page_mask
 var _vm_kernel_page_shift 4 page_shift
+var __FE_DFL_ENV 16 fe_dfl_env
+var __FE_DFL_DISABLE_SSE_DENORMS_ENV 16 fe_dfl_daz_env
+special _feclearexcept feclearexcept
+special _feraiseexcept feraiseexcept
+special _fetestexcept fetestexcept
+special _fegetexceptflag fegetexceptflag
+special _fesetexceptflag fesetexceptflag
+special _fegetround fegetround
+special _fesetround fesetround
+special _fegetenv fegetenv
+special _fesetenv fesetenv
+special _feholdexcept feholdexcept
+special _feupdateenv feupdateenv
 special _pthread_get_stackaddr_np pthread_get_stackaddr_np
 special _pthread_get_stacksize_np pthread_get_stacksize_np
 special _thread_suspend thread_suspend
@@ -578,6 +603,12 @@ special _malloc_zone_free malloc_zone_free
 special _malloc_zone_realloc malloc_zone_realloc
 special _malloc_zone_memalign malloc_zone_memalign
 special _malloc_zone_pressure_relief malloc_zone_pressure_relief
+special _malloc_type_zone_malloc malloc_type_zone_malloc
+special _malloc_type_zone_calloc malloc_type_zone_calloc
+special _malloc_type_zone_valloc malloc_type_zone_valloc
+special _malloc_type_zone_free malloc_type_zone_free
+special _malloc_type_zone_realloc malloc_type_zone_realloc
+special _malloc_type_zone_memalign malloc_type_zone_memalign
 special _malloc_destroy_zone malloc_destroy_zone
 special _malloc_create_zone malloc_create_zone
 special _malloc_zone_from_ptr malloc_zone_from_ptr
@@ -793,6 +824,31 @@ fn _voucher_copy voucher_copy p()
 fn _os_unfair_recursive_lock_lock_with_options os_unfair_recursive_lock_lock_with_options v(pu)
 fn _os_unfair_recursive_lock_unlock os_unfair_recursive_lock_unlock v(p)
 fn _os_unfair_lock_lock_with_options os_unfair_lock_lock_with_options v(pu)
+fn _rootless_restricted_environment rootless_restricted_environment B()
+fn _os_variant_has_internal_content os_variant_has_internal_content B(p)
+fn _os_variant_has_internal_diagnostics os_variant_has_internal_diagnostics B(p)
+fn _os_variant_has_internal_ui os_variant_has_internal_ui B(p)
+fn _os_variant_has_factory_content os_variant_has_factory_content B(p)
+fn _os_variant_allows_internal_security_policies os_variant_allows_internal_security_policies B(p)
+fn _os_variant_allows_security_research os_variant_allows_security_research B(p)
+fn _os_variant_is_darwinos os_variant_is_darwinos B(p)
+fn _os_variant_is_recovery os_variant_is_recovery B(p)
+fn _os_variant_is_basesystem os_variant_is_basesystem B(p)
+fn _os_variant_uses_ephemeral_storage os_variant_uses_ephemeral_storage B(p)
+fn _os_variant_check os_variant_check B(pp)
+fn _os_variant_copy_description os_variant_copy_description p(p)
+fn _os_unfair_recursive_lock_trylock os_unfair_recursive_lock_trylock B(p)
+fn __os_feature_enabled_impl _os_feature_enabled_impl B(pp)
+fn __dispatch_is_multithreaded _dispatch_is_multithreaded B()
+fn __dispatch_is_fork_of_multithreaded_parent _dispatch_is_fork_of_multithreaded_parent B()
+fn _dispatch_source_cancel_and_wait dispatch_source_cancel_and_wait v(p)
+fn _xpc_copy_entitlement_for_self xpc_copy_entitlement_for_self p(p)
+fn __qtn_file_alloc _qtn_file_alloc p()
+fn __qtn_file_free _qtn_file_free v(p)
+fn __qtn_file_init_with_fd _qtn_file_init_with_fd i(pi)
+fn __qtn_file_init_with_path _qtn_file_init_with_path i(pp)
+fn __qtn_file_apply_to_fd _qtn_file_apply_to_fd i(pi)
+fn __qtn_file_apply_to_path _qtn_file_apply_to_path i(pp)
 special _sandbox_init sandbox_init
 special _sandbox_init_with_parameters sandbox_init_with_parameters
 fn _sandbox_extension_consume sandbox_extension_consume l(p)
@@ -846,6 +902,8 @@ special _openat openat
 special _openat$NOCANCEL openat_nocancel
 special _open_dprotected_np open_dprotected_np
 special _openat_dprotected_np openat_dprotected_np
+special _guarded_open_np guarded_open_np
+special _guarded_open_dprotected_np guarded_open_dprotected_np
 special _fcntl fcntl
 special _fcntl$NOCANCEL fcntl_nocancel
 special _ioctl ioctl
@@ -1252,6 +1310,8 @@ inplace _inflateValidate 0 72 v(pp)
 
 library /usr/lib/libbz2.1.0.dylib
 
+opaque __sFILE
+
 inplace _BZ2_bzCompress 0 56 p(pii)
 inplace _BZ2_bzCompress 0 64 v(pp)
 inplace _BZ2_bzCompressEnd 0 56 p(pii)
@@ -1276,3 +1336,15 @@ special _SSLGetSupportedCiphers ssl_get_supported_ciphers
 special _SSLGetEnabledCiphers ssl_get_enabled_ciphers
 special _SSLSetEnabledCiphers ssl_set_enabled_ciphers
 special _SSLGetNegotiatedCipher ssl_get_negotiated_cipher
+
+library /usr/lib/libedit.3.dylib
+
+opaque __sFILE
+
+# The developer tool shims in /usr/bin hand their name and arguments to
+# libxcselect, which runs the real tool through xcrun; under the host's
+# libxcselect that replaces the process with the native tool.
+
+library /usr/lib/libxcselect.dylib
+
+fn _xcselect_invoke_xcrun xcselect_invoke_xcrun v(pipi)

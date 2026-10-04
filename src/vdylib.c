@@ -128,6 +128,14 @@
  * the run without comparing anything.  The loader builds a given install name
  * once, so a running guest only ever sees one value.
  *
+ * ---- the default floating-point environments ----
+ * The fe_dfl_env and fe_dfl_daz_env fillers write the sixteen bytes of x86's
+ * _FE_DFL_ENV and _FE_DFL_DISABLE_SSE_DENORMS_ENV: control word 0x037f, status
+ * 0, and MXCSR 0x1f80, or 0x9fc0 with flush-to-zero and denormals-are-zero,
+ * the values x86 libm's own copies hold under Rosetta.  The host's are arm64
+ * fenv_t objects, a different structure, and fesetenv here is ocerz's
+ * (src/sysbridge.c), which reads the guest's copy.
+ *
  * ---- the page size ----
  * The page_size, page_mask and page_shift fillers write 4096, 4095 and 12.
  * They stand behind vm_page_size and its relatives, which on this host hold
@@ -383,11 +391,33 @@ static void vd_fill_page_shift(uint8_t *slot, uint32_t size)
     vd_fill_value(slot, size, 12);
 }
 
+static void vd_fill_fe_env(uint8_t *slot, uint32_t size, uint32_t mxcsr)
+{
+    memset(slot, 0, size);
+    if (size >= 8) {
+        slot[0] = 0x7f;
+        slot[1] = 0x03;
+        memcpy(slot + 4, &mxcsr, 4);
+    }
+}
+
+static void vd_fill_fe_dfl_env(uint8_t *slot, uint32_t size)
+{
+    vd_fill_fe_env(slot, size, 0x1f80);
+}
+
+static void vd_fill_fe_dfl_daz_env(uint8_t *slot, uint32_t size)
+{
+    vd_fill_fe_env(slot, size, 0x9fc0);
+}
+
 static const VdFiller g_vd_fillers[] = {
     { "stack_guard", vd_fill_stack_guard },
     { "page_size", vd_fill_page_size },
     { "page_mask", vd_fill_page_mask },
     { "page_shift", vd_fill_page_shift },
+    { "fe_dfl_env", vd_fill_fe_dfl_env },
+    { "fe_dfl_daz_env", vd_fill_fe_dfl_daz_env },
 };
 
 static const VdFiller *vd_filler(const char *name)
