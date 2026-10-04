@@ -145,9 +145,13 @@
  * where a Wine program's half second of startup goes.  The forms are
  * what found the Wine-only gaps: Steam's webhelper interpreted pinsrw from
  * memory for 15% of its samples because the emitter had no path for a memory
- * operand in the low shadow window.  The sampler keeps the cpu registry locked
- * while it samples: a thread that exits frees its cpu, and reading a sampled
- * thread's rip after letting go of the registry crashed R.E.P.O.'s process.
+ * operand in the low shadow window.  OCERZ_GUESTPROF_HOT=1 samples, in each
+ * period, only the thread that used the most CPU in the one before, and says
+ * which: a game's frame rate follows its main thread, and the process-wide
+ * figures mix that thread with the render thread and every worker.  The
+ * sampler keeps the cpu registry locked while it samples: a thread that exits
+ * frees its cpu, and reading a sampled thread's rip after letting go of the
+ * registry crashed R.E.P.O.'s process.
  *
  * ---- threads and fork ----
  * The thread that runs this loop is a guest CPU like any other - for a dynamic
@@ -581,7 +585,10 @@ static void *guestprof_thread(void *arg)
         us = 1000;
     uint64_t period = (pv ? strtoull(pv, NULL, 0) : 10) * 1000000000ull;
     uint64_t start = g_gp_start, next = start + period;
-    static struct { mach_port_t port; uint64_t cpu_us; } seen[256];
+    static struct { mach_port_t port; uint64_t cpu_us, period_us; } seen[256];
+    int hot_only = getenv("OCERZ_GUESTPROF_HOT") != NULL;
+    mach_port_t hot = MACH_PORT_NULL;
+    uint64_t pstart = start;
     uint64_t seed = start | 1;
     for (;;) {
         seed ^= seed << 13;
@@ -611,7 +618,11 @@ static void *guestprof_thread(void *arg)
             uint64_t prev = seen[slot].port ? seen[slot].cpu_us : cpu_us;
             seen[slot].port = ports[i];
             seen[slot].cpu_us = cpu_us;
+            if (cpu_us > prev)
+                seen[slot].period_us += cpu_us - prev;
             if (bi.run_state != TH_STATE_RUNNING || cpu_us <= prev)
+                continue;
+            if (hot_only && ports[i] != hot)
                 continue;
             uint64_t w64 = cpu_us - prev;
             uint32_t w = (uint32_t)(w64 > 4ull * us ? 4ull * us : w64);
@@ -641,8 +652,21 @@ static void *guestprof_thread(void *arg)
         pthread_mutex_unlock(&g_cpus_lock);
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (now >= next) {
+            if (hot_only) {
+                uint64_t best = 0;
+                for (int k = 0; k < 256; k++) {
+                    if (seen[k].port && seen[k].period_us > best) {
+                        best = seen[k].period_us;
+                        hot = seen[k].port;
+                    }
+                    seen[k].period_us = 0;
+                }
+                fprintf(stderr, "ocerz: GUESTPROF[%d] next period samples only thread %#x (%.0f%% of a core)\n",
+                        (int)getpid(), (unsigned)hot, 100.0 * (double)best / ((double)(now - pstart) / 1000.0 + 1));
+            }
             gp_report((double)(now - start) / 1e9);
             next = now + period;
+            pstart = now;
         }
         pthread_mutex_unlock(&g_gp_lock);
     }

@@ -134,6 +134,7 @@ bug is in what that switch controls.
 | `OCERZ_MODELOG=1` | print every far transfer with its selector, target mode and address: the WoW64 32/64-bit switches |
 | `OCERZ_FPS=1` | in cache mode, print frames per second, counted at `CGLFlushDrawable`, once a second |
 | `OCERZ_GUESTPROF=<usec>` | sample every running guest thread at about that interval, and every `OCERZ_GUESTPROF_PERIOD` seconds (10 by default) and at exit print the hottest guest code, host symbols and interpreted instruction forms |
+| `OCERZ_GUESTPROF_HOT=1` | with `OCERZ_GUESTPROF`, sample in each period only the thread that used the most CPU in the period before |
 | `OCERZ_TRIPSTAT=1` | count exits from translated code to the dispatcher, and print their commonest destinations every ten seconds |
 | `OCERZ_BLACKLOG=1` | print the pages most often refused translation because they kept changing |
 | `OCERZ_INVSRC=1` | attribute each of those refusals to the code that invalidated the page |
