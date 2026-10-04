@@ -93,6 +93,7 @@ bug is in what that switch controls.
 | Variable | Effect |
 | --- | --- |
 | `OCERZ_NO_AFP=1` | check NaN results in translated code even where the processor can produce x86's NaNs itself |
+| `OCERZ_NO_FAST_LOW_GUARD=1` | in a Wine process, map every guest address with the general three-range check instead of the short form |
 | `OCERZ_NO_LEAF_INPLACE=1` | call `strlen`, `memcpy` and the nine other string and memory routines the ordinary way instead of through AArchX's own arm64 versions |
 | `OCERZ_NO_MEMFN_PLAIN=1` | translate the system's string and memory routines with ordered accesses when the rest of the process has them |
 | `OCERZ_NO_FPB_DEFER=1` | check every floating-point result immediately instead of once per batch |

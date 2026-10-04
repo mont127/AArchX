@@ -136,6 +136,19 @@
  * Wine's gs:[0x58] redirect reading the TEB pointer at gs:[0x30] through the
  * same translation (OCERZ_NO_LOW_SEG restores the interpreter for them).
  *
+ * That translation sits in front of every guest memory access in the Wine
+ * mode, and in its general form it builds three 64-bit constants and tests
+ * three ranges - the low window, the identity middle, the top strip with the
+ * commpage in it - about twenty instructions for one load.  When the low
+ * window's host base is a single run of bits above every low address, as the
+ * usual 0x8000000000 is, an address below 12 GB becomes host with one orr
+ * after a shift and a compare, and one between 12 GB and the top strip is
+ * recognised as identity with two shifts and an add; only the top strip
+ * takes the general form.  In the Wine layout that took memcpy from 6.1x of
+ * Rosetta's time to 3.1x, a mixed workload from 3.0x to 1.65x and an
+ * interpreter loop from 1.5x to 1.0x (OCERZ_NO_FAST_LOW_GUARD=1 keeps the
+ * general form everywhere).
+ *
  * The integer SSE forms map almost one to one: widening multiplies and a
  * narrowing unzip for the high halves and pmaddubsw, saturating narrows for the
  * packs, uabd with three pairwise widening adds for psadbw, addp or an unzip
@@ -4011,6 +4024,24 @@ static int insn_const_addr(const X86Insn *insn, uint64_t *ga)
     return 0;
 }
 
+static void emit_guard_full(A64Buf *b, int addr_reg);
+
+_Static_assert(OCERZ_TOP_LO == (1ull << 47) - (1ull << 25), "the fast low guard tests the top strip with shifts by 25 and 22");
+
+static int low_guard_fast_ok(void)
+{
+    static int ok = -1;
+    if (ok < 0 && ocerz_low_base) {
+        ok = 0;
+        if (!getenv("OCERZ_NO_FAST_LOW_GUARD") && (ocerz_low_base & ((1ull << 34) - 1)) == 0) {
+            uint32_t w[2];
+            A64Buf t = { w, w, w + 2, 0, 0 };
+            ok = a64_try_orr_imm(&t, 1, 1, 1, ocerz_low_base);
+        }
+    }
+    return ok > 0;
+}
+
 static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
                                      int addr_reg, uint32_t **exit_sites, int *n_exits)
 {
@@ -4029,7 +4060,34 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         g_const_ea_valid = 1;
         return NULL;
     }
+    if (ocerz_low_base && ea_fold() == 0 && low_guard_fast_ok()) {
+        a64_lsr_imm(b, 1, JTT, addr_reg, 32);
+        a64_subs_imm(b, 1, A64_ZR, JTT, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+        uint32_t *high = a64_label(b);
+        a64_bcond(b, A64_CS, 0);
+        (void)a64_try_orr_imm(b, 1, addr_reg, addr_reg, ocerz_low_base);
+        uint32_t *done_low = a64_label(b);
+        a64_b(b, 0);
+        a64_patch_bcond(high, a64_label(b));
+        a64_lsr_imm(b, 1, JTT, addr_reg, 25);
+        a64_add_imm(b, 1, JTT, JTT, 1);
+        a64_lsr_imm(b, 1, JTT, JTT, 22);
+        uint32_t *identity = a64_label(b);
+        a64_cbz(b, 1, JTT, 0);
+        emit_guard_full(b, addr_reg);
+        uint32_t *done_full = a64_label(b);
+        a64_b(b, 0);
+        a64_patch_cbz(identity, a64_label(b));
+        a64_patch_b(done_low, a64_label(b));
+        a64_patch_b(done_full, a64_label(b));
+        return NULL;
+    }
+    emit_guard_full(b, addr_reg);
+    return NULL;
+}
 
+static void emit_guard_full(A64Buf *b, int addr_reg)
+{
     uint64_t fold = ea_fold();
     uint32_t *to_native = NULL;
     if (ocerz_low_base) {
@@ -4070,7 +4128,6 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
     }
     if (done_cp) a64_patch_b(done_cp, a64_label(b));
     if (to_native) a64_patch_bcond(to_native, a64_label(b));
-    return NULL;
 }
 
 static inline void patch_guard_skip(uint32_t *skip, uint32_t *target)
