@@ -796,6 +796,7 @@ int main(void) {
 run_file_case dfork_signal tests/dynamic/fork_signal.c 'fork signal ok'
 run_file_case dthread_signal tests/dynamic/thread_signal.c 'OK'
 run_file_case dshmem_coherence tests/dynamic/shmem_coherence.c 'OK'
+run_file_case drsp_rmw tests/dynamic/rsp_rmw.c '554ae911bb61770a' -mno-red-zone
 run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
 run_file_case dlane_fault_guard tests/dynamic/lane_fault_guard.c 'OK' -Wl,-no_pie
 run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
@@ -903,6 +904,7 @@ run_low_golden_case dfault_link_low tests/guest/fault_link.c tests/guest/expect/
 run_low_golden_case dstack_test_low tests/guest/stack_test.c tests/guest/expect/stack_test.out
 run_low_golden_case djcc_chain_rec_low tests/guest/jcc_chain_rec.c tests/guest/expect/jcc_chain_rec.out
 run_low_golden_case drsp_ops_low tests/guest/rsp_ops.c tests/guest/expect/rsp_ops.out
+run_low_golden_case drsp_rmw_low tests/dynamic/rsp_rmw.c tests/dynamic/rsp_rmw.out
 run_low_golden_case dfault_chain_low tests/guest/fault_chain.c tests/guest/expect/fault_chain.out
 run_dlsym_deps_case ddlsym_deps 'OK'
 run_dlopen_arch_case ddlopen_arch 'OK'
