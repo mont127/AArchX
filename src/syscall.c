@@ -1599,6 +1599,7 @@ static void ocerz_fork_child(void)
 {
     ocerz_mem_postfork();
     ocerz_jit_postfork();
+    ocerz_jit_postfork_child();
     ocerz_bridge_postfork_child();
     ocerz_tcache_child();
     ocerz_abi_postfork_child();

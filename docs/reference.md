@@ -100,6 +100,7 @@ bug is in what that switch controls.
 | `OCERZ_NO_MOVFUSE=1` | do not fold a `mov` into a following shift |
 | `OCERZ_NO_BRIDGE_FASTCALL=1` | in native mode, reach every bridged call through the trap and the dispatcher instead of calling it from inside the translated block |
 | `OCERZ_NO_COMPACT=1` | keep every block's decoded instructions after translation |
+| `OCERZ_NO_JIT_FLUSH=1` | when the translation arena fills, run everything translated after that in the interpreter instead of starting the arena again |
 
 ### Native mode
 

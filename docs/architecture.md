@@ -77,6 +77,11 @@ a few AVX2 forms run only in the interpreter; see
 A guest that writes over code it has already executed is handled by making the
 page fault on write and dropping the translations covering it.
 
+Translations live in a 1 GB arena that is filled front to back. A program that
+keeps generating code, such as a .NET or Mono game, can use it up; when little
+room is left, AArchX waits for every thread to leave translated code, throws
+all translations away and starts the arena again from the front.
+
 ## Memory ordering
 
 x86 guarantees more about the order of memory operations than arm64 does. A
