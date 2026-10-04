@@ -2,12 +2,11 @@ library /System/Library/Frameworks/UniformTypeIdentifiers.framework/Versions/A/U
 sdk macos 27.0
 exports 255
 fn 0
-data 240
+data 241
 var 0
 special 0
 stub no-declaration 14
-omit no-declaration-missing 1
-host-missing 3
+host-missing 0
 objc-classes 2
 objc-eh-types 0
 objc-ivars 0

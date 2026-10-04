@@ -5,10 +5,10 @@ fn 11
 data 83
 var 0
 special 0
-stub no-declaration 138
-omit no-declaration-missing 28
-omit swift 195
-host-missing 3
+stub no-declaration 146
+omit no-declaration-missing 6
+omit swift 209
+host-missing 0
 objc-classes 32
 objc-eh-types 0
 objc-ivars 0
