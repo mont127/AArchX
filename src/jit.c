@@ -176,6 +176,21 @@
  * aeskeygenassist picks its words out of a zero-key aese with a table lookup.
  * crc32 is the arm64 crc32c of the same width, pclmulqdq is pmull.
  *
+ * MMX instructions are translated too (emit_mmx): the eight registers live in
+ * the cpu's mmx array, each instruction loads what it reads into a scratch
+ * vector register with a d-sized load, which clears the upper half, runs the
+ * 128-bit form of the operation and stores the low 64 bits back, so lanewise
+ * operations need nothing more.  The others are arranged to land in the low
+ * half: a high unpack is a low zip followed by the upper half, the packs join
+ * both operands into one register before narrowing, pmulhw and pmulhuw keep
+ * the odd halves of a widening multiply, and psadbw is uabd with three
+ * pairwise widening adds as in SSE.  Each one leaves the x87 tag word full and
+ * TOP at zero, as the interpreter does.  UnityPlayer's video decoder is written
+ * in MMX, and as one slow-path call per instruction it was a few percent of
+ * R.E.P.O.'s process; a loop of its moves and multiplies runs 9.8 times faster
+ * translated (Rosetta is 2.7 times faster again, since every instruction here
+ * goes through memory).  OCERZ_NO_JIT_MMX=1 interprets them again.
+ *
  * ---- control flow ----
  * A block may run past a FORWARD conditional branch, continuing inline and
  * putting the taken side in an out-of-line chain stub (a superblock).  When the
@@ -9894,8 +9909,248 @@ static int emit_sse_insertps(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
     return 1;
 }
 
+#define MMX_OFF(r) ((uint32_t)offsetof(OcerzCPU, mmx) + 8u * (uint32_t)(r))
+static int mmx_ld(A64Buf *b, const X86Insn *insn, const X86Operand *s, int size, int vt,
+                  uint32_t **exit_sites, int *n_exits)
+{
+    if (s->kind == OCERZ_OPK_MMX) {
+        a64_ldr_v(b, 8, vt, 20, MMX_OFF(s->reg));
+        return 1;
+    }
+    if (emit_plain_mem_fast(b, insn, s, size, vt, 0, 1))
+        return 1;
+    uint32_t *skip;
+    if (!emit_sse_mem_addr(b, insn, s, size, exit_sites, n_exits, &skip))
+        return 0;
+    emit_sse_mem_ld(b, size, vt);
+    patch_guard_skip(skip, a64_label(b));
+    return 1;
+}
+static int mmx_st(A64Buf *b, const X86Insn *insn, const X86Operand *d, int size, int vs,
+                  uint32_t **exit_sites, int *n_exits)
+{
+    if (emit_plain_mem_fast(b, insn, d, size, vs, 1, 1))
+        return 1;
+    uint32_t *skip;
+    if (!emit_sse_mem_addr(b, insn, d, size, exit_sites, n_exits, &skip))
+        return 0;
+    emit_sse_mem_st(b, size, vs);
+    patch_guard_skip(skip, a64_label(b));
+    return 1;
+}
+static void mmx_enter(A64Buf *b)
+{
+    a64_movz(b, JTU, 0xff, 0);
+    a64_str(b, 2, JTU, 20, (uint32_t)offsetof(OcerzCPU, ftw));
+}
+static int mmx_mov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    int r = 0;
+    g_vec_int_move = 1;
+    if (d->kind == OCERZ_OPK_MMX && s->kind == OCERZ_OPK_MMX) {
+        a64_ldr(b, 8, JT0, 20, MMX_OFF(s->reg));
+        a64_str(b, 8, JT0, 20, MMX_OFF(d->reg));
+        r = 1;
+    } else if (d->kind == OCERZ_OPK_MMX && s->kind == OCERZ_OPK_REG && !s->high8 && (s->size == 4 || s->size == 8)) {
+        emit_gpr_rd(b, 1, JT0, s->reg);
+        if (s->size == 4) a64_mov_reg(b, 0, JT0, JT0);
+        a64_str(b, 8, JT0, 20, MMX_OFF(d->reg));
+        r = 1;
+    } else if (d->kind == OCERZ_OPK_REG && s->kind == OCERZ_OPK_MMX && !d->high8 && (d->size == 4 || d->size == 8)) {
+        a64_ldr(b, d->size, JT0, 20, MMX_OFF(s->reg));
+        emit_gpr_wr(b, JT0, d->reg);
+        r = 1;
+    } else if (d->kind == OCERZ_OPK_MMX && s->kind == OCERZ_OPK_MEM && (s->size == 4 || s->size == 8)) {
+        if (mmx_ld(b, insn, s, s->size, VX0, exit_sites, n_exits)) {
+            a64_str_v(b, 8, VX0, 20, MMX_OFF(d->reg));
+            r = 1;
+        }
+    } else if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_MMX && (d->size == 4 || d->size == 8)) {
+        a64_ldr_v(b, d->size, VX0, 20, MMX_OFF(s->reg));
+        r = mmx_st(b, insn, d, d->size, VX0, exit_sites, n_exits);
+    }
+    g_vec_int_move = 0;
+    return r;
+}
+static int emit_mmx(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_JIT_MMX") ? 1 : 0;
+    if (off || insn->seg != OCERZ_SEG_NONE || insn->nops < 2)
+        return 0;
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    int op = insn->op;
+    if (op == OCERZ_OP_MOVD || op == OCERZ_OP_MOVQX) {
+        if (insn->nops != 2 || !mmx_mov(b, insn, exit_sites, n_exits))
+            return 0;
+        mmx_enter(b);
+        return 1;
+    }
+    if (op == OCERZ_OP_PEXTRW) {
+        if (insn->nops != 3 || d->kind != OCERZ_OPK_REG || d->high8 || s->kind != OCERZ_OPK_MMX)
+            return 0;
+        a64_ldr(b, 2, JT0, 20, MMX_OFF(s->reg) + 2u * (uint32_t)(insn->ops[2].imm & 3));
+        emit_gpr_wr(b, JT0, d->reg);
+        mmx_enter(b);
+        return 1;
+    }
+    if (op == OCERZ_OP_PINSRW) {
+        if (insn->nops != 3 || d->kind != OCERZ_OPK_MMX || s->kind != OCERZ_OPK_REG || s->high8)
+            return 0;
+        emit_gpr_rd(b, 1, JT0, s->reg);
+        a64_str(b, 2, JT0, 20, MMX_OFF(d->reg) + 2u * (uint32_t)(insn->ops[2].imm & 3));
+        mmx_enter(b);
+        return 1;
+    }
+    if (d->kind != OCERZ_OPK_MMX)
+        return 0;
+    if (op == OCERZ_OP_PSHUFLW) {
+        if (insn->nops != 3 || (s->kind != OCERZ_OPK_MMX && s->kind != OCERZ_OPK_MEM))
+            return 0;
+        unsigned imm = (unsigned)insn->ops[2].imm & 0xff;
+        if (s->kind == OCERZ_OPK_MMX) {
+            a64_ldr(b, 8, JT0, 20, MMX_OFF(s->reg));
+        } else {
+            if (!mmx_ld(b, insn, s, 8, VX1, exit_sites, n_exits))
+                return 0;
+            a64_fmov_x_from_v(b, 1, JT0, VX1);
+        }
+        for (int i = 0; i < 4; i++) {
+            a64_ubfx(b, 1, JT2, JT0, 16 * (int)((imm >> (2 * i)) & 3), 16);
+            if (i == 0) a64_mov_reg(b, 1, JT1, JT2);
+            else a64_bfi(b, 1, JT1, JT2, 16 * i, 16);
+        }
+        a64_str(b, 8, JT1, 20, MMX_OFF(d->reg));
+        mmx_enter(b);
+        return 1;
+    }
+    int shift_imm = insn->nops == 2 && s->kind == OCERZ_OPK_IMM;
+    if (insn->nops != 2 || (!shift_imm && s->kind != OCERZ_OPK_MMX && s->kind != OCERZ_OPK_MEM))
+        return 0;
+    if (shift_imm) {
+        int esz, kind;
+        switch (op) {
+        case OCERZ_OP_PSLLW: esz = 1; kind = 0; break;
+        case OCERZ_OP_PSLLD: esz = 2; kind = 0; break;
+        case OCERZ_OP_PSLLQ: esz = 3; kind = 0; break;
+        case OCERZ_OP_PSRLW: esz = 1; kind = 1; break;
+        case OCERZ_OP_PSRLD: esz = 2; kind = 1; break;
+        case OCERZ_OP_PSRLQ: esz = 3; kind = 1; break;
+        case OCERZ_OP_PSRAW: esz = 1; kind = 2; break;
+        case OCERZ_OP_PSRAD: esz = 2; kind = 2; break;
+        default: return 0;
+        }
+        unsigned n = (unsigned)s->imm & 0xff, w = 8u << esz;
+        a64_ldr_v(b, 8, VX0, 20, MMX_OFF(d->reg));
+        if (n == 0) {
+        } else if (kind == 2) {
+            a64_v_sshr_imm(b, esz, VX0, VX0, (int)(n >= w ? w : n));
+        } else if (n >= w) {
+            a64_v_zero(b, VX0);
+        } else if (kind == 0) {
+            a64_v_shl_imm(b, esz, VX0, VX0, (int)n);
+        } else {
+            a64_v_ushr_imm(b, esz, VX0, VX0, (int)n);
+        }
+        a64_str_v(b, 8, VX0, 20, MMX_OFF(d->reg));
+        mmx_enter(b);
+        return 1;
+    }
+    switch (op) {
+    case OCERZ_OP_PADDB: case OCERZ_OP_PADDW: case OCERZ_OP_PADDD: case OCERZ_OP_PADDQ:
+    case OCERZ_OP_PSUBB: case OCERZ_OP_PSUBW: case OCERZ_OP_PSUBD: case OCERZ_OP_PSUBQ:
+    case OCERZ_OP_PADDSB: case OCERZ_OP_PADDSW: case OCERZ_OP_PADDUSB: case OCERZ_OP_PADDUSW:
+    case OCERZ_OP_PSUBSB: case OCERZ_OP_PSUBSW: case OCERZ_OP_PSUBUSB: case OCERZ_OP_PSUBUSW:
+    case OCERZ_OP_PMULLW: case OCERZ_OP_PMULHW: case OCERZ_OP_PMULHUW:
+    case OCERZ_OP_PAND: case OCERZ_OP_POR: case OCERZ_OP_PXOR: case OCERZ_OP_PANDN:
+    case OCERZ_OP_PCMPEQB: case OCERZ_OP_PCMPEQW: case OCERZ_OP_PCMPEQD:
+    case OCERZ_OP_PCMPGTB: case OCERZ_OP_PCMPGTW: case OCERZ_OP_PCMPGTD:
+    case OCERZ_OP_PUNPCKLBW: case OCERZ_OP_PUNPCKLWD: case OCERZ_OP_PUNPCKLDQ:
+    case OCERZ_OP_PUNPCKHBW: case OCERZ_OP_PUNPCKHWD: case OCERZ_OP_PUNPCKHDQ:
+    case OCERZ_OP_PACKUSWB: case OCERZ_OP_PACKSSWB: case OCERZ_OP_PACKSSDW:
+    case OCERZ_OP_PSADBW: case OCERZ_OP_PAVGB: case OCERZ_OP_PAVGW:
+    case OCERZ_OP_PMINUB: case OCERZ_OP_PMAXUB: case OCERZ_OP_PMINSW: case OCERZ_OP_PMAXSW:
+        break;
+    default:
+        return 0;
+    }
+    if (op == OCERZ_OP_PXOR && s->kind == OCERZ_OPK_MMX && s->reg == d->reg) {
+        a64_str(b, 8, 31, 20, MMX_OFF(d->reg));
+        mmx_enter(b);
+        return 1;
+    }
+    a64_ldr_v(b, 8, VX0, 20, MMX_OFF(d->reg));
+    if (!mmx_ld(b, insn, s, 8, VX1, exit_sites, n_exits))
+        return 0;
+    switch (op) {
+    case OCERZ_OP_PADDB: a64_v_add(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PADDW: a64_v_add(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PADDD: a64_v_add(b, 2, VX0, VX0, VX1); break;
+    case OCERZ_OP_PADDQ: a64_v_add(b, 3, VX0, VX0, VX1); break;
+    case OCERZ_OP_PSUBB: a64_v_sub(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PSUBW: a64_v_sub(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PSUBD: a64_v_sub(b, 2, VX0, VX0, VX1); break;
+    case OCERZ_OP_PSUBQ: a64_v_sub(b, 3, VX0, VX0, VX1); break;
+    case OCERZ_OP_PADDSB: a64_v_sqadd(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PADDSW: a64_v_sqadd(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PADDUSB: a64_v_uqadd(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PADDUSW: a64_v_uqadd(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PSUBSB: a64_v_sqsub(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PSUBSW: a64_v_sqsub(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PSUBUSB: a64_v_uqsub(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PSUBUSW: a64_v_uqsub(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PMULLW: a64_v_mul(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PMULHW:
+        a64_v_smull_h(b, 0, VX0, VX0, VX1);
+        a64_v_uzp(b, 1, 1, VX0, VX0, VX0);
+        break;
+    case OCERZ_OP_PMULHUW:
+        a64_v_umull_h(b, 0, VX0, VX0, VX1);
+        a64_v_uzp(b, 1, 1, VX0, VX0, VX0);
+        break;
+    case OCERZ_OP_PAND: a64_v_and(b, VX0, VX0, VX1); break;
+    case OCERZ_OP_POR: a64_v_orr(b, VX0, VX0, VX1); break;
+    case OCERZ_OP_PXOR: a64_v_eor(b, VX0, VX0, VX1); break;
+    case OCERZ_OP_PANDN: a64_v_bic(b, VX0, VX1, VX0); break;
+    case OCERZ_OP_PCMPEQB: a64_v_cmeq(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PCMPEQW: a64_v_cmeq(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PCMPEQD: a64_v_cmeq(b, 2, VX0, VX0, VX1); break;
+    case OCERZ_OP_PCMPGTB: a64_v_cmgt(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PCMPGTW: a64_v_cmgt(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PCMPGTD: a64_v_cmgt(b, 2, VX0, VX0, VX1); break;
+    case OCERZ_OP_PUNPCKLBW: a64_v_zip1(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PUNPCKLWD: a64_v_zip1(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PUNPCKLDQ: a64_v_zip1(b, 2, VX0, VX0, VX1); break;
+    case OCERZ_OP_PUNPCKHBW: a64_v_zip1(b, 0, VX0, VX0, VX1); a64_v_dup_d(b, VX0, VX0, 1); break;
+    case OCERZ_OP_PUNPCKHWD: a64_v_zip1(b, 1, VX0, VX0, VX1); a64_v_dup_d(b, VX0, VX0, 1); break;
+    case OCERZ_OP_PUNPCKHDQ: a64_v_zip1(b, 2, VX0, VX0, VX1); a64_v_dup_d(b, VX0, VX0, 1); break;
+    case OCERZ_OP_PACKUSWB: a64_v_zip1(b, 3, VX0, VX0, VX1); a64_v_sqxtun_h(b, 0, VX0, VX0); break;
+    case OCERZ_OP_PACKSSWB: a64_v_zip1(b, 3, VX0, VX0, VX1); a64_v_sqxtn_h(b, 0, VX0, VX0); break;
+    case OCERZ_OP_PACKSSDW: a64_v_zip1(b, 3, VX0, VX0, VX1); a64_v_sqxtn_s(b, 0, VX0, VX0); break;
+    case OCERZ_OP_PSADBW:
+        a64_v_uabd(b, 0, VX0, VX0, VX1);
+        a64_v_uaddlp(b, 0, VX0, VX0);
+        a64_v_uaddlp(b, 1, VX0, VX0);
+        a64_v_uaddlp(b, 2, VX0, VX0);
+        break;
+    case OCERZ_OP_PAVGB: a64_v_urhadd(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PAVGW: a64_v_urhadd(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PMINUB: a64_v_umin(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PMAXUB: a64_v_umax(b, 0, VX0, VX0, VX1); break;
+    case OCERZ_OP_PMINSW: a64_v_smin(b, 1, VX0, VX0, VX1); break;
+    case OCERZ_OP_PMAXSW: a64_v_smax(b, 1, VX0, VX0, VX1); break;
+    default: return 0;
+    }
+    a64_str_v(b, 8, VX0, 20, MMX_OFF(d->reg));
+    mmx_enter(b);
+    return 1;
+}
+
 static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
+    if (ocerz_insn_has_mmx(insn))
+        return insn->mode32 ? 0 : emit_mmx(b, insn, exit_sites, n_exits);
     if (!sse_enabled()) return 0;
     if (insn->seg != OCERZ_SEG_NONE) return 0;
     switch (insn->op) {
@@ -11514,7 +11769,7 @@ static int m32_inline_ok(const X86Insn *insn)
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
-    if (ocerz_insn_has_mmx(insn)) return 0;
+    if (ocerz_insn_has_mmx(insn)) return insn->mode32 ? 0 : emit_mmx(b, insn, exit_sites, n_exits);
     if (insn->vex) return emit_vex(b, insn, exit_sites, n_exits);
     if (insn->mode32 && !m32_inline_ok(insn))
         return 0;
