@@ -814,6 +814,9 @@ run_file_case dsysv_sem tests/dynamic/sysv_sem.c 'OK'
 run_file_case drel_acq_order tests/dynamic/rel_acq_order.c 'OK'
 run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
 run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
+export OCERZ_TSO_NARROW=1
+run_file_case dtso_narrow tests/dynamic/tso_narrow.c 'OK'
+unset OCERZ_TSO_NARROW
 run_file_case dnan_contexts tests/dynamic/nan_contexts.c 'OK'
 run_file_case dupward_init tests/dynamic/upward_init.c 'OK' -framework CoreFoundation
 run_file_case dcache_symlink_dep tests/dynamic/cache_symlink_dep.c 'OK'
@@ -889,6 +892,9 @@ run_weak_unloaded_case dweak_unloaded 'OK'
 run_metal_nocopy_low_case dmetal_nocopy_low 'OK'
 run_iosurface_low_stack_case diosurface_low_stack 'OK'
 run_low_golden_case dsimd_low tests/guest/simd_pack_jit.c tests/guest/expect/simd_pack_jit.out
+export OCERZ_TSO_NARROW=1
+run_low_golden_case dtso_narrow_low tests/dynamic/tso_narrow.c tests/dynamic/tso_narrow.out
+unset OCERZ_TSO_NARROW
 run_low_golden_case dpromo_callout_low tests/dynamic/promo_callout.c tests/dynamic/promo_callout.out
 run_low_golden_case dras_stress_low tests/guest/ras_stress.c tests/guest/expect/ras_stress.out
 run_low_golden_case dcallret_fault_low tests/guest/callret_fault.c tests/guest/expect/callret_fault.out

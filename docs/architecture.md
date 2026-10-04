@@ -92,7 +92,9 @@ scalar accesses and keeps them for the rest of the process's life.
 
 Vector loads and stores are left plain even then, which is what other
 translators do as well, because ordering them costs several times more than it
-is worth; `OCERZ_TSO_VECTOR=1` orders them for anyone who wants it.
+is worth; `OCERZ_TSO_VECTOR=1` orders them for anyone who wants it. That
+includes the 8-byte `movq` and 4-byte `movd`, which compilers sometimes use to
+move a pointer or a counter; `OCERZ_TSO_NARROW=1` orders just those two.
 
 ## Floating point
 
