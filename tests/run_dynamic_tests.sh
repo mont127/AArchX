@@ -908,6 +908,10 @@ run_low_golden_case drsp_ops_low tests/guest/rsp_ops.c tests/guest/expect/rsp_op
 run_low_golden_case drsp_rmw_low tests/dynamic/rsp_rmw.c tests/dynamic/rsp_rmw.out
 run_low_golden_case dcvt_packed_low tests/dynamic/cvt_packed.c tests/dynamic/cvt_packed.out
 run_low_golden_case dlow_top_strip tests/dynamic/low_top_strip.c tests/dynamic/low_top_strip.out
+export OCERZ_NO_PLAIN_MEM=1
+run_file_case dalign_ordered tests/dynamic/align_ordered.c '370d1a721afe9c4a'
+run_low_golden_case dalign_ordered_low tests/dynamic/align_ordered.c tests/dynamic/align_ordered.out
+unset OCERZ_NO_PLAIN_MEM
 run_low_golden_case dfault_chain_low tests/guest/fault_chain.c tests/guest/expect/fault_chain.out
 run_dlsym_deps_case ddlsym_deps 'OK'
 run_dlopen_arch_case ddlopen_arch 'OK'
