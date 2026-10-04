@@ -25,7 +25,11 @@
  * value - so push/pop are single pre/post-indexed accesses and rsp-relative
  * addresses drop the base add.  Reads and writes of the rsp VALUE convert at
  * the accessors; spill/fill and fault recovery convert at the boundaries.
- * OCERZ_RSP_VALUE restores the old value-keeping class 3.
+ * OCERZ_RSP_VALUE restores the old value-keeping class 3.  A read-modify-write
+ * on an rsp-relative operand takes its address the same way.  It used to go to
+ * the interpreter, which in MSVC-built code - locals addressed off rsp, and
+ * lock or [rsp], 0 as the memory barrier - made add, cmp and or on memory the
+ * hottest interpreted forms on R.E.P.O.'s main thread.
  *
  * ---- addressing ----
  * Guest addresses reach the host through one of three maps (plain guest_base,
@@ -11635,7 +11639,9 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     }
     int size = m->size;
     if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
-    if (rsp_is_ptr() && (m->base == OCERZ_RSP || m->index == OCERZ_RSP)) return 0;
+    if (rsp_is_ptr() && (m->index == OCERZ_RSP || (r && r->reg == OCERZ_RSP) ||
+                         (s && s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP)))
+        return 0;
     if (op == OCERZ_OP_CMPXCHG && (pin_slot(OCERZ_RAX) < 0 || !s || s->kind != OCERZ_OPK_REG || s->high8 || pin_slot(s->reg) < 0)) return 0;
     if (!mem_native_store_ok()) return 0;
     int atomic = op == OCERZ_OP_XCHG || op == OCERZ_OP_XADD || op == OCERZ_OP_CMPXCHG || insn->lock;
