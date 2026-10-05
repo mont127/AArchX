@@ -375,8 +375,8 @@ static pthread_mutex_t g_vd_tramp_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct VdFiller {
     const char *name;
     void (*fill)(uint8_t *slot, uint32_t size);
-    void (*fill_named)(uint8_t *slot, uint32_t size, const char *install_name, const char *export_name,
-                       OcerzVdylibHostSym host_sym);
+    void (*late)(uint64_t slot, uint32_t size, const char *install_name, const char *export_name,
+                 OcerzVdylibHostSym host_sym);
 } VdFiller;
 
 static void vd_fill_stack_guard(uint8_t *slot, uint32_t size)
@@ -491,35 +491,33 @@ static const void *vd_gss_host_var(const char *install_name, const char *export_
     return at;
 }
 
-static void vd_fill_gss_oid_desc(uint8_t *slot, uint32_t size, const char *install_name,
+static void vd_fill_gss_oid_desc(uint64_t slot, uint32_t size, const char *install_name,
                                  const char *export_name, OcerzVdylibHostSym host_sym)
 {
     const void *host = vd_gss_host_var(install_name, export_name, host_sym);
-    memset(slot, 0, size);
     if (host && size >= VD_GSS_OID_X86)
-        vd_gss_write_oid(slot, host);
+        vd_gss_write_oid(ocerz_g2h(slot), host);
 }
 
-static void vd_fill_gss_oid_ptr(uint8_t *slot, uint32_t size, const char *install_name,
+static void vd_fill_gss_oid_ptr(uint64_t slot, uint32_t size, const char *install_name,
                                 const char *export_name, OcerzVdylibHostSym host_sym)
 {
     const void *const *host = vd_gss_host_var(install_name, export_name, host_sym);
     uint64_t g = 0;
-    memset(slot, 0, size);
     pthread_mutex_lock(&g_vd_gss_lock);
     if (host)
         g = vd_gss_oid_locked(*host);
     pthread_mutex_unlock(&g_vd_gss_lock);
-    memcpy(slot, &g, size < sizeof g ? size : sizeof g);
+    if (size >= sizeof g)
+        ocerz_st(slot, 8, g);
 }
 
-static void vd_fill_gss_oid_set_ptr(uint8_t *slot, uint32_t size, const char *install_name,
+static void vd_fill_gss_oid_set_ptr(uint64_t slot, uint32_t size, const char *install_name,
                                     const char *export_name, OcerzVdylibHostSym host_sym)
 {
     const void *const *host = vd_gss_host_var(install_name, export_name, host_sym);
     const uint8_t *set = host ? *host : NULL;
     uint64_t g = 0;
-    memset(slot, 0, size);
     pthread_mutex_lock(&g_vd_gss_lock);
     if (set) {
         uint64_t count;
@@ -536,7 +534,8 @@ static void vd_fill_gss_oid_set_ptr(uint8_t *slot, uint32_t size, const char *in
         }
     }
     pthread_mutex_unlock(&g_vd_gss_lock);
-    memcpy(slot, &g, size < sizeof g ? size : sizeof g);
+    if (size >= sizeof g)
+        ocerz_st(slot, 8, g);
 }
 
 static const VdFiller g_vd_fillers[] = {
@@ -1144,8 +1143,8 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
         const OcerzApiEntry *e = &api->entries[k];
         if (e->kind == OCERZ_API_VAR) {
             const VdFiller *f = vd_filler(e->filler);
-            if (f->fill_named)
-                f->fill_named(buf + var_addr[k], e->bytes, name, e->export_name, host_sym);
+            if (f->late)
+                memset(buf + var_addr[k], 0, e->bytes);
             else
                 f->fill(buf + var_addr[k], e->bytes);
             continue;
@@ -1351,6 +1350,26 @@ int ocerz_vdylib_fastcall(struct OcerzVM *vm, OcerzCPU *cpu)
     if (rc == OCERZ_STEP_EXIT || rc == OCERZ_STEP_FATAL)
         return rc + 1;
     return OCERZ_STEP_OK + 1;
+}
+
+void ocerz_vdylib_late_fill(const char *install_name, uint64_t (*slot_of)(void *ctx, const char *export_name),
+                           void *ctx)
+{
+    VdLib *lib = vd_lib(install_name);
+    if (!lib)
+        return;
+    const OcerzApiLibrary *api = lib->api;
+    for (int k = 0; k < api->nentries; k++) {
+        const OcerzApiEntry *e = &api->entries[k];
+        if (e->kind != OCERZ_API_VAR)
+            continue;
+        const VdFiller *f = vd_filler(e->filler);
+        if (!f || !f->late)
+            continue;
+        uint64_t slot = slot_of(ctx, e->export_name);
+        if (slot)
+            f->late(slot, e->bytes, api->install_name, e->export_name, ocerz_bridge_host_symbol);
+    }
 }
 
 uint64_t ocerz_vdylib_trampoline(unsigned which)

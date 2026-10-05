@@ -347,10 +347,10 @@ int ocerz_objc_eh_false(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_eh_do_catch(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_eh_destroy(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_eh_terminate(struct OcerzVM *vm, OcerzCPU *cpu);
-void ocerz_objc_fill_ehtype_vtable(uint8_t *slot, uint32_t size, const char *install_name,
+void ocerz_objc_fill_ehtype_vtable(uint64_t slot, uint32_t size, const char *install_name,
                                    const char *export_name,
                                    void *(*host_sym)(const char *install_name, const char *host_sym));
-void ocerz_objc_fill_ehtype(uint8_t *slot, uint32_t size, const char *install_name, const char *export_name,
+void ocerz_objc_fill_ehtype(uint64_t slot, uint32_t size, const char *install_name, const char *export_name,
                             void *(*host_sym)(const char *install_name, const char *host_sym));
 int ocerz_objc_realizeClassFromSwift(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_readClassPair(struct OcerzVM *vm, OcerzCPU *cpu);
