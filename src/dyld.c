@@ -301,6 +301,18 @@
  * registering first cost the newly loaded image its categories, which is
  * exactly what a late-loaded framework is usually dlopened for.
  *
+ * An @rpath name is tried in each LC_RPATH directory in order, and the first
+ * candidate ocerz can supply wins, as dyld's first existing file does: a file
+ * on disk, an image of the x86 cache, or in native mode the guest runtime's
+ * copy or an image an API database builds (rpath_supplied).  An app built for
+ * systems before 10.14.4 bundles the Swift runtime and lists /usr/lib/swift
+ * ahead of its own Frameworks, so every later system loads its own
+ * libswiftCore, which exists only in the shared cache.  Counting files alone
+ * loaded the bundled one, which stops with "This copy of libswiftCore.dylib
+ * requires an OS version prior to 10.14.4" (iGlance).  In native
+ * mode the image found that way is loaded by its absolute name and remembers
+ * the @rpath name it was found for, which the binder looks images up by.
+ *
  * Native mode runs no libSystem initializer, so the initializer phase that
  * cache mode gates on it never runs either, and for a while nothing ran a guest
  * image's own initializers at all: a C constructor or a C++ static object's
@@ -660,6 +672,7 @@ typedef struct DynImage {
     char path[1024];
     char install_name[1024];
     char id_name[1024];
+    char rpath_name[256];
     uint64_t slide;
     uint64_t load_base;
     uint64_t main_entry;
@@ -724,7 +737,8 @@ static DynImage *dimg_find_by_install_name(const char *iname)
 {
     for (int i = 0; i < g_dimgs_n; i++)
         if ((g_dimgs[i].install_name[0] && strcmp(g_dimgs[i].install_name, iname) == 0) ||
-            (g_dimgs[i].id_name[0] && strcmp(g_dimgs[i].id_name, iname) == 0))
+            (g_dimgs[i].id_name[0] && strcmp(g_dimgs[i].id_name, iname) == 0) ||
+            (g_dimgs[i].rpath_name[0] && strcmp(g_dimgs[i].rpath_name, iname) == 0))
             return &g_dimgs[i];
     return NULL;
 }
@@ -3246,7 +3260,17 @@ static void collect_rpaths(DynImage *img, const RpathList *inherited, RpathList 
     }
 }
 
-static int expand_install_name(DynImage *loader, const char *name,
+static int rpath_supplied(OcerzCache *cache, const char *path)
+{
+    char guest[1024];
+    if (access(path, F_OK) == 0)
+        return 1;
+    if (ocerz_mode != OCERZ_MODE_NATIVE)
+        return cache && dep_find(cache, path) != 0;
+    return native_guest_path(path, guest, sizeof guest) || ocerz_vdylib_have(path);
+}
+
+static int expand_install_name(OcerzCache *cache, DynImage *loader, const char *name,
                                const RpathList *rpaths, char *out, size_t n)
 {
     if (!name)
@@ -3263,7 +3287,7 @@ static int expand_install_name(DynImage *loader, const char *name,
             for (int i = 0; i < rpaths->n; i++) {
                 char cand[1024];
                 snprintf(cand, sizeof cand, "%s/%s", rpaths->entry[i], stem);
-                if (access(cand, F_OK) == 0) {
+                if (rpath_supplied(cache, cand)) {
                     snprintf(out, n, "%s", cand);
                     return 1;
                 }
@@ -3428,10 +3452,16 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     if (guest_override) {
         snprintf(resolved, sizeof resolved, "%s", guest_path);
         OCERZ_LOG("dynamic: guest override %s -> %s\n", install_name, resolved);
-    } else if (!expand_install_name(loader, install_name, rpaths, resolved, sizeof resolved) ||
+    } else if (!expand_install_name(cache, loader, install_name, rpaths, resolved, sizeof resolved) ||
         resolved[0] == '@') {
         native_dl_reason("it is in no LC_RPATH directory of the images that load it", NULL);
         return NULL;
+    }
+    if (ocerz_mode == OCERZ_MODE_NATIVE && install_name[0] == '@' && access(resolved, F_OK) != 0) {
+        DynImage *d = load_disk_dylib(cache, resolved, loader, rpaths);
+        if (d && !d->rpath_name[0])
+            snprintf(d->rpath_name, sizeof d->rpath_name, "%s", install_name);
+        return d;
     }
     if (dep_find(cache, resolved) != 0)
         return NULL;
@@ -3762,7 +3792,7 @@ static const char *dlopen_expand_at(const char *p, uint64_t caller, char *out, s
         for (int i = 0; rp && i < rp->n && !hit; i++) {
             if (snprintf(out, n, "%s/%s", rp->entry[i], p + 7) >= (int)n)
                 continue;
-            if (access(out, F_OK) == 0 || dimg_find_by_path(out) || dep_find(g_run_cache, out))
+            if (rpath_supplied(g_run_cache, out) || dimg_find_by_path(out) || dep_find(g_run_cache, out))
                 hit = out;
         }
         free(rp);

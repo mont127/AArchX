@@ -30,6 +30,13 @@
 # bounds are loose enough for a loaded machine and still far tighter than the
 # factor of 41 an unconverted value is off by.
 #
+# native_swift_bundled is how an app built for systems before 10.14.4 links
+# the Swift runtime: as @rpath/libswiftCore.dylib, with /usr/lib/swift ahead of
+# the copy it bundles in its LC_RPATH list.  The bundled copy here is a stub
+# whose swift_retain says so and exits; dyld takes /usr/lib/swift's, which
+# exists only in the shared cache, and native mode must take the guest
+# runtime's in its place rather than the first file it finds.
+#
 # The guest runtime comes from tools/install_guest_swift.sh (make guest-swift),
 # and the suite skips without it or without a swiftc that targets both slices.
 set -euo pipefail
@@ -45,12 +52,18 @@ if ! command -v swiftc > /dev/null; then
     exit 0
 fi
 work=$(mktemp -d /tmp/ocerz-native-swift.XXXXXX)
-tests="native_swift native_swift_release native_swift_concurrency native_dispatch_time"
+tests="native_swift native_swift_release native_swift_concurrency native_dispatch_time native_swift_bundled"
 for test in $tests; do
     for arch in x86_64 arm64; do
         case $test in
         native_dispatch_time)
             clang -arch "$arch" -O1 "tests/dynamic/$test.c" -o "$work/$test.$arch" ;;
+        native_swift_bundled)
+            mkdir -p "$work/bundled-$arch"
+            clang -arch "$arch" -dynamiclib -install_name @rpath/libswiftCore.dylib \
+                -o "$work/bundled-$arch/libswiftCore.dylib" tests/dynamic/native_swift_bundled_lib.c
+            clang -arch "$arch" -O1 "tests/dynamic/$test.c" -L"$work/bundled-$arch" -lswiftCore \
+                -Wl,-rpath,/usr/lib/swift -Wl,-rpath,"@executable_path/bundled-$arch" -o "$work/$test.$arch" ;;
         native_swift_concurrency)
             swiftc -module-name "$test" -parse-as-library -target "$arch-apple-macos13" -O \
                 "tests/dynamic/$test.swift" -o "$work/$test.$arch" 2> "$work/$test.$arch.build" ;;

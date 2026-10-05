@@ -335,6 +335,19 @@ run_metal_nocopy_low_case() {
     run_built_case "$name" "$want_out" "$dir"
 }
 
+run_rpath_system_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir/bundled"
+    if ! clang -arch x86_64 -dynamiclib -install_name @rpath/libswiftCore.dylib \
+            -o "$dir/bundled/libswiftCore.dylib" tests/dynamic/native_swift_bundled_lib.c 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/native_swift_bundled.c -L"$dir/bundled" -lswiftCore \
+            -Wl,-rpath,/usr/lib/swift -Wl,-rpath,@executable_path/bundled 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    run_built_case "$name" "$want_out" "$dir"
+}
+
 run_iosurface_low_stack_case() {
     local name="$1" want_out="$2"
     local dir="$TMP/$name"
@@ -893,6 +906,7 @@ run_mac_syscall_low_stack_case dmac_syscall_low_stack 'OK'
 run_weak_unloaded_case dweak_unloaded 'OK'
 run_metal_nocopy_low_case dmetal_nocopy_low 'OK'
 run_iosurface_low_stack_case diosurface_low_stack 'OK'
+run_rpath_system_case drpath_system 'the system libswiftCore was loaded'
 run_low_golden_case dsimd_low tests/guest/simd_pack_jit.c tests/guest/expect/simd_pack_jit.out
 run_low_golden_case dmmx_low tests/guest/mmx_jit.c tests/guest/expect/mmx_jit.out
 export OCERZ_TSO_NARROW=1
