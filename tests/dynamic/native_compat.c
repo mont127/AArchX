@@ -1,5 +1,6 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
+#include <GSS/GSS.h>
 #include <err.h>
 #include <errno.h>
 #include <fenv.h>
@@ -214,6 +215,30 @@ static void fenvs(void)
            restored, raised, dfl, back, quiet, merged, fegetround() == FE_TONEAREST, r > 0);
 }
 
+static void show_oid(const char *tag, gss_const_OID o)
+{
+    printf("gss %s len=%u", tag, o ? o->length : 0);
+    for (OM_uint32 k = 0; o && k < o->length; k++)
+        printf(" %02x", ((const unsigned char *)o->elements)[k]);
+    printf("\n");
+}
+
+static void gss(void)
+{
+    show_oid("krb5", GSS_KRB5_MECHANISM);
+    show_oid("hostbased", GSS_C_NT_HOSTBASED_SERVICE);
+    show_oid("spnego", GSS_SPNEGO_MECHANISM);
+    OM_uint32 minor = 0;
+    gss_buffer_set_t set = GSS_C_NO_BUFFER_SET;
+    OM_uint32 major = gss_create_empty_buffer_set(&minor, &set);
+    gss_buffer_desc b = { 5, "hello" };
+    OM_uint32 major2 = gss_add_buffer_set_member(&minor, &b, &set);
+    printf("gss buffer set %u %u count=%zu first=%.*s", major, major2, set ? set->count : 0,
+           set ? (int)set->elements[0].length : 0, set ? (char *)set->elements[0].value : "");
+    gss_release_buffer_set(&minor, &set);
+    printf(" released=%d\n", set == GSS_C_NO_BUFFER_SET);
+}
+
 static int guest_zone_calls;
 
 static void *gz_malloc(malloc_zone_t *z, size_t n)
@@ -304,5 +329,6 @@ int main(int argc, char **argv)
     formats();
     zones();
     fenvs();
+    gss();
     return 0;
 }

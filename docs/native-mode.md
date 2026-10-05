@@ -196,6 +196,7 @@ Beyond the list above:
 - functions taking a `va_list` the bridge has no veneer for, or a union or bitfield structure by value, are stubs; a `long double` argument or result crosses as a double, so it loses the x87 format's extra precision, as is a function taking a guest function pointer inside a structure the bridge has no shape for;
 - a guest class whose superclass the host lacks is left out, as the native runtime leaves such a class unrealized;
 - a call from native code back into guest code costs about 430 ns, against about 17 ns for a call from guest code into native code, and 2 ns for the eleven string and memory routines that do not cross at all;
+- GSS and Kerberos lay their structures out under `pack(2)` on x86, which moves a `gss_OID_desc`'s pointer; their exported descriptors and descriptor pointers are variables holding x86 copies, and calls that only pass buffers, contexts and names cross, but a call that passes or returns a descriptor is still a stub;
 - the `fenv.h` functions work on the guest's own x87 and MXCSR state, the way x86 libm does, but an exception the guest unmasks does not trap, and `stmxcsr` does not show the flags arithmetic raised, though `fetestexcept` does;
 - a `longjmp` from inside a callback a native function made, to a `setjmp` taken before that call, is refused, since it would leave the native function's frames behind;
 - `msync`, `mlock` and `minherit` reach the host kernel with the guest's address unchanged, as they do in cache mode;

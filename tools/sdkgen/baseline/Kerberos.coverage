@@ -1,23 +1,23 @@
 library /System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos
 sdk macos 27.0
 exports 799
-fn 194
+fn 228
 data 6
-var 0
+var 21
 special 0
 stub callback-pointer 2
 stub callback-result 2
-stub layout 191
+stub layout 157
 stub no-declaration 375
 stub va-list 3
 stub variadic 4
-omit layout 22
+omit layout 1
 host-missing 0
 objc-classes 0
 objc-eh-types 0
 objc-ivars 0
 ld-pseudo-skipped 0
-overrides 0
+overrides 21
 override-shapes 0
 override-structs 0
 override-opaque 0

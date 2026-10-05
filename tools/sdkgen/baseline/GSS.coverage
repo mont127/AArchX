@@ -1,19 +1,18 @@
 library /System/Library/Frameworks/GSS.framework/Versions/A/GSS
 sdk macos 27.0
 exports 267
-fn 20
-data 42
-var 0
+fn 41
+data 43
+var 99
 special 0
-stub layout 62
+stub layout 41
 stub no-declaration 43
-omit layout 100
 host-missing 0
 objc-classes 0
 objc-eh-types 0
 objc-ivars 0
 ld-pseudo-skipped 0
-overrides 0
+overrides 99
 override-shapes 0
 override-structs 0
 override-opaque 0

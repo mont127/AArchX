@@ -128,9 +128,12 @@
  * note.
  *
  * Pointers are then walked on both architectures in step.  A pointer whose
- * target has a different layout on the two - size, alignment, any field's
- * offset, size or bit width, compared through embedded records, arrays and the
- * targets of pointer fields - is layout; an incomplete record is opaque and
+ * target has a different layout on the two - size, any field's offset, size or
+ * bit width, compared through embedded records, arrays and the targets of
+ * pointer fields - is layout; a record's own alignment is not compared, since
+ * through a pointer only its bytes are read and its size already fixes an
+ * array's stride, so GSS's records under x86's pack(2), which keep arm64's
+ * offsets, cross unless a field moved; an incomplete record is opaque and
  * fine, and two scalars of different kinds but one size and alignment, such as
  * unsigned long and unsigned long long, are the same bytes.  A pointer to a
  * record holding a function pointer or a block in its own storage is
@@ -181,7 +184,8 @@
  * so a record the guest reads through inline macros must still agree field by
  * field.  A stub override names an export exactly, and then also covers its
  * $-suffixed variants, or with a fnmatch pattern, which only reaches exports
- * the rules made fn or stub; an exact name wins over a variant and a variant
+ * the rules made fn or stub; a var override may take a pattern too, which
+ * only reaches variables.  An exact name wins over a variant and a variant
  * over a pattern.  An override scoped to a library that matches nothing there
  * is an error, as is an opaque record no pointer ever reaches, a struct record
  * whose export does not come out fn, a struct record whose argument is not a
@@ -1196,7 +1200,7 @@ static int record_same(CXType x, CXType a, CXType xsugar)
         free(akey);
     }
 
-    int same = sx == sa && clang_Type_getAlignOf(x) == clang_Type_getAlignOf(a) && fx.n == fa.n;
+    int same = sx == sa && fx.n == fa.n;
     for (int i = 0; i < fx.n && i < fa.n; i++) {
         if (clang_Cursor_getOffsetOfField(fx.v[i]) != clang_Cursor_getOffsetOfField(fa.v[i]))
             same = 0;
@@ -1836,8 +1840,8 @@ static void load_overrides(void)
                 if (strcmp(w[i], "-") != 0 && !sig_valid(w[i], 0))
                     die("%s:%d: shape word %s is not a notation", path, lineno, w[i]);
         int glob = strcmp(k, "shape") != 0 && strcmp(k, "opaque") != 0 && strpbrk(w[1], "*?[") != NULL;
-        if (glob && strcmp(k, "stub") != 0)
-            die("%s:%d: only a stub may name exports by pattern", path, lineno);
+        if (glob && strcmp(k, "stub") != 0 && strcmp(k, "var") != 0)
+            die("%s:%d: only a stub or a var may name exports by pattern", path, lineno);
         if (scope && strcmp(scope, g_lib.install) != 0)
             continue;
         g_ovr = xalloc(g_ovr, (size_t)(g_novr + 1) * sizeof *g_ovr);
@@ -2186,7 +2190,8 @@ static void overrides_for(Rec *r)
             continue;
         const char *pat = o->f[1];
         if (o->glob) {
-            if (!glob && r->functionish && fnmatch(pat, r->name, 0) == 0)
+            if (!glob && (strcmp(k, "var") == 0 ? !r->functionish : r->functionish) &&
+                fnmatch(pat, r->name, 0) == 0)
                 glob = o;
             continue;
         }

@@ -136,6 +136,20 @@
  * fenv_t objects, a different structure, and fesetenv here is ocerz's
  * (src/sysbridge.c), which reads the guest's copy.
  *
+ * ---- GSS object identifiers ----
+ * On x86 the GSS and Kerberos headers lay their structures out under
+ * pack(2), so a gss_OID_desc, a 32-bit length and a pointer to the
+ * identifier's bytes, is twelve bytes with the pointer at offset four, where
+ * arm64 has sixteen with it at eight.  A program names the descriptors GSS
+ * exports, __gss_krb5_mechanism_oid_desc and the rest, through macros such as
+ * GSS_KRB5_MECHANISM, and Kerberos also exports pointers to them and to
+ * descriptor sets.  The gss_oid_desc filler writes the x86 descriptor of the
+ * host's one, its pointer leading to the host's bytes, which have no layout;
+ * gss_oid_ptr writes a pointer to such a descriptor in guest memory, and
+ * gss_oid_set_ptr one to a gss_OID_set_desc whose elements are an array of
+ * them at x86's twelve-byte stride.  A converted copy is made once per host
+ * descriptor and never freed, as the host's are constants.
+ *
  * ---- the page size ----
  * The page_size, page_mask and page_shift fillers write 4096, 4095 and 12.
  * They stand behind vm_page_size and its relatives, which on this host hold
@@ -417,6 +431,114 @@ static void vd_fill_fe_dfl_daz_env(uint8_t *slot, uint32_t size)
     vd_fill_fe_env(slot, size, 0x9fc0);
 }
 
+#define VD_GSS_OID_X86 12u
+
+static pthread_mutex_t g_vd_gss_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_vd_gss_page, g_vd_gss_used;
+static const void *g_vd_gss_host[256];
+static uint64_t g_vd_gss_guest[256];
+static int g_vd_gss_n;
+
+static uint64_t vd_gss_alloc_locked(uint32_t size)
+{
+    size = (size + 15u) & ~15u;
+    if (!g_vd_gss_page || g_vd_gss_used + size > OCERZ_GUEST_PAGE_SIZE) {
+        g_vd_gss_page = ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE);
+        g_vd_gss_used = 0;
+        if (!g_vd_gss_page)
+            return 0;
+    }
+    uint64_t at = g_vd_gss_page + g_vd_gss_used;
+    g_vd_gss_used += size;
+    return at;
+}
+
+static void vd_gss_write_oid(uint8_t *to, const uint8_t *host)
+{
+    uint32_t length;
+    void *elements;
+    memcpy(&length, host, sizeof length);
+    memcpy(&elements, host + 8, sizeof elements);
+    uint64_t g = elements ? ocerz_h2g(elements) : 0;
+    memcpy(to, &length, sizeof length);
+    memcpy(to + 4, &g, sizeof g);
+}
+
+static uint64_t vd_gss_oid_locked(const void *host)
+{
+    if (!host)
+        return 0;
+    for (int k = 0; k < g_vd_gss_n; k++)
+        if (g_vd_gss_host[k] == host)
+            return g_vd_gss_guest[k];
+    uint64_t at = vd_gss_alloc_locked(VD_GSS_OID_X86);
+    if (!at)
+        return 0;
+    vd_gss_write_oid(ocerz_g2h(at), host);
+    if (g_vd_gss_n < (int)(sizeof g_vd_gss_host / sizeof g_vd_gss_host[0])) {
+        g_vd_gss_host[g_vd_gss_n] = host;
+        g_vd_gss_guest[g_vd_gss_n++] = at;
+    }
+    return at;
+}
+
+static const void *vd_gss_host_var(const char *install_name, const char *export_name,
+                                   OcerzVdylibHostSym host_sym)
+{
+    const void *at = host_sym ? host_sym(install_name, export_name + 1) : NULL;
+    if (!at)
+        OCERZ_LOG("vdylib: %s has no %s on this host; its x86 copy is zero\n", install_name, export_name);
+    return at;
+}
+
+static void vd_fill_gss_oid_desc(uint8_t *slot, uint32_t size, const char *install_name,
+                                 const char *export_name, OcerzVdylibHostSym host_sym)
+{
+    const void *host = vd_gss_host_var(install_name, export_name, host_sym);
+    memset(slot, 0, size);
+    if (host && size >= VD_GSS_OID_X86)
+        vd_gss_write_oid(slot, host);
+}
+
+static void vd_fill_gss_oid_ptr(uint8_t *slot, uint32_t size, const char *install_name,
+                                const char *export_name, OcerzVdylibHostSym host_sym)
+{
+    const void *const *host = vd_gss_host_var(install_name, export_name, host_sym);
+    uint64_t g = 0;
+    memset(slot, 0, size);
+    pthread_mutex_lock(&g_vd_gss_lock);
+    if (host)
+        g = vd_gss_oid_locked(*host);
+    pthread_mutex_unlock(&g_vd_gss_lock);
+    memcpy(slot, &g, size < sizeof g ? size : sizeof g);
+}
+
+static void vd_fill_gss_oid_set_ptr(uint8_t *slot, uint32_t size, const char *install_name,
+                                    const char *export_name, OcerzVdylibHostSym host_sym)
+{
+    const void *const *host = vd_gss_host_var(install_name, export_name, host_sym);
+    const uint8_t *set = host ? *host : NULL;
+    uint64_t g = 0;
+    memset(slot, 0, size);
+    pthread_mutex_lock(&g_vd_gss_lock);
+    if (set) {
+        uint64_t count;
+        const uint8_t *elements;
+        memcpy(&count, set, sizeof count);
+        memcpy(&elements, set + 8, sizeof elements);
+        uint64_t array = count && elements && count < 64 ? vd_gss_alloc_locked((uint32_t)count * VD_GSS_OID_X86) : 0;
+        for (uint64_t k = 0; array && k < count; k++)
+            vd_gss_write_oid(ocerz_g2h(array + k * VD_GSS_OID_X86), elements + k * 16);
+        g = vd_gss_alloc_locked(16);
+        if (g) {
+            ocerz_st(g, 8, array ? count : 0);
+            ocerz_st(g + 8, 8, array);
+        }
+    }
+    pthread_mutex_unlock(&g_vd_gss_lock);
+    memcpy(slot, &g, size < sizeof g ? size : sizeof g);
+}
+
 static const VdFiller g_vd_fillers[] = {
     { "stack_guard", vd_fill_stack_guard, NULL },
     { "page_size", vd_fill_page_size, NULL },
@@ -426,6 +548,9 @@ static const VdFiller g_vd_fillers[] = {
     { "fe_dfl_daz_env", vd_fill_fe_dfl_daz_env, NULL },
     { "objc_ehtype_vtable", NULL, ocerz_objc_fill_ehtype_vtable },
     { "objc_ehtype", NULL, ocerz_objc_fill_ehtype },
+    { "gss_oid_desc", NULL, vd_fill_gss_oid_desc },
+    { "gss_oid_ptr", NULL, vd_fill_gss_oid_ptr },
+    { "gss_oid_set_ptr", NULL, vd_fill_gss_oid_set_ptr },
 };
 
 static const VdFiller *vd_filler(const char *name)
