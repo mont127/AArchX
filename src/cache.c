@@ -66,11 +66,8 @@
  * handle cost 2 ms against Rosetta's 30 us.  A breadth-first search from one
  * image walks the index with a visited bitmap and memoizes its answer per image
  * and name.  Two searches share it: ocerz_cache_resolve_from_image follows every
- * link, upward ones included, which is how the leaf-routine table finds
- * _memmove from libsystem_platform (the name lives behind the upward link to
- * libSystem and comes back into libsystem_platform's text), and
- * ocerz_cache_dlsym_image skips upward links the way dlsym does
- * (OCERZ_DLSYM_UPWARD follows them there too).
+ * link, upward ones included, and ocerz_cache_dlsym_image skips upward links
+ * the way dlsym does (OCERZ_DLSYM_UPWARD follows them there too).
  *
  * A weak-coalescing bind (ordinal -3) asks whether any image already defines
  * the name, and dyld answers it only from images that define weak symbols,
