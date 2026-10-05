@@ -1621,6 +1621,65 @@ static int br_cf_calendar_difference(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_cf_calendar(vm, cpu, "CFCalendarGetComponentDifference", "B(pddLp)", 'p');
 }
 
+#define BR_COREGRAPHICS "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics"
+
+/* A constructor whose callback structure no shape can describe: a copy of the
+   guest's structure on this stack, each function word bound to a callback,
+   goes to the host in its place, which the constructor copies in turn. */
+static int br_struct_cross(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *name,
+                           const char *notation, int reg, const char *const *words, int nwords)
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(BR_COREGRAPHICS, name);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", name);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    OcerzAbiSig sig;
+    if (ocerz_abi_parse(notation, &sig) != OCERZ_OK) {
+        fprintf(stderr, "ocerz: bridge: _%s has a notation ocerz cannot parse\n", name);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    uint64_t copy[8] = { 0 };
+    uint64_t at = cpu->gpr[reg];
+    if (at) {
+        for (int w = 0; w < nwords; w++) {
+            uint64_t v = ocerz_ld(at + 8 * (uint64_t)w, 8);
+            if (words[w] && v && ocerz_abi_is_guest_code(v) && ocerz_abi_callback_convert(v, words[w], &v) != OCERZ_OK) {
+                fprintf(stderr, "ocerz: bridge: _%s could not bind guest function %#llx in word %d of its callbacks\n",
+                        name, (unsigned long long)ocerz_ld(at + 8 * (uint64_t)w, 8), w);
+                exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+            }
+            copy[w] = v;
+        }
+        cpu->gpr[reg] = ocerz_h2g(copy);
+    }
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_COREGRAPHICS, name, notation, fn);
+    int rc = ocerz_abi_perform(&sig, fn, cpu);
+    ocerz_bridge_lower(&outer);
+    if (rc != OCERZ_STEP_OK)
+        return rc;
+    return br_settle(vm, cpu);
+}
+
+static int br_cg_data_consumer_create(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    static const char *const words[2] = { "L(ppL)", "v(p)" };
+    return br_struct_cross(vm, cpu, &fn, "CGDataConsumerCreate", "p(pp)", OCERZ_RSI, words, 2);
+}
+
+static int br_cg_pattern_create(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    static const char *const words[3] = { NULL, "v(pp)", "v(p)" };
+    return br_struct_cross(vm, cpu, &fn, "CGPatternCreate", "p(p{{dd}{dd}}{dddddd}ddiBp)", OCERZ_RCX, words, 3);
+}
+
 #define BR_SECURITY "/System/Library/Frameworks/Security.framework/Versions/A/Security"
 
 static void *br_security_symbol(const char *name)
@@ -2033,6 +2092,8 @@ static const BrHandler g_br_handlers[] = {
     { "class_replaceMethod",        ocerz_objc_class_replaceMethod },
     { "objc_setExceptionPreprocessor", ocerz_objc_setExceptionPreprocessor },
     { "objc_exception_throw", ocerz_objc_exception_throw },
+    { "cg_data_consumer_create", br_cg_data_consumer_create },
+    { "cg_pattern_create", br_cg_pattern_create },
     { "dictionary_of_variable_bindings", ocerz_objc_dictionary_of_variable_bindings },
     { "objc_exception_rethrow", ocerz_objc_exception_rethrow },
     { "objc_begin_catch", ocerz_objc_begin_catch },

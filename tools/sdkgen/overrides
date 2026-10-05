@@ -332,7 +332,8 @@
 # name.  CFBundleGetMainBundle crosses by rule, because ocerz opens
 # CoreFoundation with CFProcessPath naming the guest's executable, so the main
 # bundle native CoreFoundation answers with is the guest's.  The shapes describe the callback structures the
-# collection and run loop constructors copy, word by word, with the version
+# collection and run loop constructors copy, and the client context
+# CFReadStreamSetClient and CFWriteStreamSetClient copy, word by word, with the version
 # the first word must hold; the generator checks every word against the
 # structure the header declares, and version 1 against CFRunLoopSourceContext1.
 # The struct records name the argument each constructor takes one in.
@@ -459,13 +460,14 @@
 # wrong conversion: version 0 only matches when the high half is zero, and then
 # the structure really is version 0.
 #
-# Two callback structures stay stubbed.  CGDataConsumerCallbacks is copied too,
-# but it has no version word, so its first word is the putBytes pointer and no
-# shape can describe it.  CGPatternCreate copies its CGPatternCallbacks, and the
-# shape would be simple, but the structure pointer is its eighth argument,
-# behind a CGRect and a CGAffineTransform passed by value, and the bridge only
-# converts a structure argument it can find in an integer register with no
-# structure by value before it.
+# Two callback structures no shape describes have handlers instead.
+# CGDataConsumerCallbacks is copied too, but it has no version word, so its
+# first word is the putBytes pointer.  CGPatternCreate copies its
+# CGPatternCallbacks, but the structure pointer is its eighth argument, behind
+# a CGRect and a CGAffineTransform passed by value, which System V passes in
+# memory, so it arrives in RCX, where a struct record's argument count would not
+# look.  Each handler binds the function words of a copy and crosses with the
+# copy in the guest's structure's place (src/bridge.c).
 #
 # ---- AppKit ----
 # AppKit's C functions are few, and most of them are drawing calls taking
@@ -956,6 +958,7 @@ shape CFRunLoopTimerContext 0 5 - - p(p) v(p) p(p)
 shape CFRunLoopObserverContext 0 5 - - p(p) v(p) p(p)
 shape CFRunLoopSourceContext 0 10 - - p(p) v(p) p(p) B(pp) L(p) v(ppp) v(ppp) v(p)
 shape CFRunLoopSourceContext 1 9 - - p(p) v(p) p(p) B(pp) L(p) u(p) p(plpp)
+shape CFStreamClientContext 0 5 - - p(p) v(p) p(p)
 
 struct _CFArrayCreate 3 CFArrayCallBacks
 struct _CFArrayCreateMutable 2 CFArrayCallBacks
@@ -971,6 +974,8 @@ struct _CFAllocatorCreate 1 CFAllocatorContext
 struct _CFRunLoopTimerCreate 6 CFRunLoopTimerContext
 struct _CFRunLoopObserverCreate 5 CFRunLoopObserverContext
 struct _CFRunLoopSourceCreate 2 CFRunLoopSourceContext
+struct _CFReadStreamSetClient 3 CFStreamClientContext
+struct _CFWriteStreamSetClient 3 CFStreamClientContext
 
 library /usr/lib/libobjc.A.dylib
 
@@ -1102,6 +1107,8 @@ struct _CGDataProviderCreateDirect 2 CGDataProviderDirectCallbacks
 struct _CGDataProviderCreateSequential 1 CGDataProviderSequentialCallbacks
 struct _CGFunctionCreate 5 CGFunctionCallbacks
 struct _CGPSConverterCreate 1 CGPSConverterCallbacks
+special _CGDataConsumerCreate cg_data_consumer_create
+special _CGPatternCreate cg_pattern_create
 
 library /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
 
@@ -1193,6 +1200,14 @@ fn _CFStringGetRangeOfCharacterClusterAtIndex CFStringGetRangeOfCharacterCluster
 library /System/Library/Frameworks/CoreText.framework/Versions/A/CoreText
 
 fn _CTFontDescriptorIsSystemUIFont CTFontDescriptorIsSystemUIFont B(p)
+
+# CTRunDelegateCreate copies its callbacks: tested natively, a structure
+# rewritten right after the call, and a line then laid out with the delegate,
+# asked the first set for the run's ascent.
+
+shape CTRunDelegateCallbacks 1 5 - v(p) d(p) d(p) d(p)
+
+struct _CTRunDelegateCreate 0 CTRunDelegateCallbacks
 
 library /System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices
 
