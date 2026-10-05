@@ -11,14 +11,6 @@
  * commpage above it: a translated access there arrives at its identity
  * address, beyond the highest address an arm64 process can map, and faults
  * into the handler, which teaches that block the full translation.
- *
- * The low window's host block is OCERZ_LOW_WINDOW (16 GB) long although the
- * guest can own only the first OCERZ_LOW_LIMIT (12 GB) of it, so that the JIT
- * tells a low address from the rest with one test of bits 34 and up.  When the
- * identity arena starts at or above 16 GB, ocerz_low_window is 16 GB: guest
- * addresses from 12 to 16 GB translate into the reserved, never-mapped part
- * and fault there, and fixed identity mappings below 16 GB are refused.
- * Otherwise it stays 12 GB and the JIT keeps the longer test.
  */
 #ifndef OCERZ_MEM_H
 #define OCERZ_MEM_H
@@ -30,13 +22,11 @@ extern uint64_t ocerz_arena_lo;
 extern uint64_t ocerz_arena_hi;
 extern uint64_t ocerz_low_base;
 extern uint64_t ocerz_top_base;
-extern uint64_t ocerz_low_window;
 extern uint8_t *ocerz_commpage;
 
 #define OCERZ_COMMPAGE_LO 0x00007fffffe00000ull
 #define OCERZ_COMMPAGE_HI 0x00007fffffe04000ull
 #define OCERZ_LOW_LIMIT   0x0000000300000000ull
-#define OCERZ_LOW_WINDOW  0x0000000400000000ull
 #define OCERZ_TOP_LO      0x00007ffffe000000ull
 #define OCERZ_TOP_HI      0x00007fffffe00000ull
 #define OCERZ_GUEST_PAGE_SIZE 0x1000ull
@@ -47,7 +37,7 @@ static inline void *ocerz_g2h(uint64_t gaddr)
     if (ocerz_commpage && gaddr >= OCERZ_COMMPAGE_LO && gaddr < OCERZ_COMMPAGE_HI)
         return ocerz_commpage + (gaddr - OCERZ_COMMPAGE_LO);
     if (ocerz_low_base) {
-        if (gaddr < ocerz_low_window)
+        if (gaddr < OCERZ_LOW_LIMIT)
             return (void *)(uintptr_t)(gaddr + ocerz_low_base);
         if (gaddr - OCERZ_TOP_LO < OCERZ_TOP_HI - OCERZ_TOP_LO)
             return (void *)(uintptr_t)(gaddr - OCERZ_TOP_LO + ocerz_top_base);
@@ -61,7 +51,7 @@ static inline uint64_t ocerz_h2g(const void *haddr)
 {
     uint64_t h = (uint64_t)(uintptr_t)haddr;
     if (ocerz_low_base) {
-        if (h - ocerz_low_base < OCERZ_LOW_WINDOW)
+        if (h - ocerz_low_base < OCERZ_LOW_LIMIT)
             return h - ocerz_low_base;
         if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
             return h - ocerz_top_base + OCERZ_TOP_LO;
@@ -80,7 +70,7 @@ static inline int ocerz_host_in_guest_space(const void *haddr)
             return 1;
     }
     if (ocerz_low_base) {
-        if (h - ocerz_low_base < OCERZ_LOW_WINDOW)
+        if (h - ocerz_low_base < OCERZ_LOW_LIMIT)
             return 1;
         if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
             return 1;
@@ -94,7 +84,7 @@ static inline int ocerz_host_in_guest_reservation(const void *haddr)
 {
     uint64_t h = (uint64_t)(uintptr_t)haddr;
     if (ocerz_low_base) {
-        if (h - ocerz_low_base < OCERZ_LOW_WINDOW)
+        if (h - ocerz_low_base < OCERZ_LOW_LIMIT)
             return 1;
         if (h - ocerz_top_base < OCERZ_TOP_HI - OCERZ_TOP_LO)
             return 1;
