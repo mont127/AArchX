@@ -142,7 +142,11 @@ $ ./ocerz -native ./read_number
 ocerz: bridge: /usr/lib/libSystem.B.dylib _scanf not implemented
 ```
 
+<!--{% raw %}-->
+
 A variadic function crosses only through a veneer that knows where its named arguments stop and what the rest are. Apple's arm64 passes every variadic argument on the stack in eight-byte slots and uses no floating-point register, the opposite of its packing for an ordinary call, so a fixed signature would be wrong. The printf family, `NSLog`, CoreFoundation's format functions and Foundation's variadic methods have veneers, and `open`, `fcntl`, `ioctl` and the other calls whose optional argument is fixed have handlers of their own; `scanf` and the rest do not yet. A structure passed or returned by value is written with its members in braces, `{LL}` for `NSRange` and `{{dd}{dd}}` for `CGRect`, and crosses as bytes gathered from wherever one ABI put it and scattered to wherever the other wants it: System V classifies a small structure eightbyte by eightbyte and returns anything over sixteen bytes through a pointer in RDI, while Apple's arm64 passes up to four floats or doubles in vector registers, any other structure over sixteen bytes as a pointer to a copy, and returns the largest through x8.
+
+<!--{% endraw %}-->
 
 ## What a crossing costs
 
