@@ -195,7 +195,11 @@
  * is an error, as is an opaque record no pointer ever reaches, a struct record
  * whose export does not come out fn, a struct record whose argument is not a
  * pointer to the named structure, and a shape whose words disagree with the
- * structure the header declares.
+ * structure the header declares: for version 0 the structure of the shape's
+ * name, for version N the one named with N appended, CoreFoundation's
+ * CFRunLoopSourceContext1, or the shape's own name where no such structure
+ * exists, as for CoreText's CTRunDelegateCallbacks, whose only layout is
+ * version 1.
  *
  * ---- output ----
  * The database goes to <out>/macos/<version>/<leaf>.api, records sorted by
@@ -1888,11 +1892,10 @@ static void load_overrides(void)
     free(path);
 }
 
-static const Override *find_shape(const char *name, const char *version)
+static const Override *find_shape(const char *name)
 {
     for (int i = 0; i < g_novr; i++)
-        if (strcmp(g_ovr[i].kind, "shape") == 0 && strcmp(g_ovr[i].f[1], name) == 0 &&
-            strcmp(g_ovr[i].f[2], version) == 0)
+        if (strcmp(g_ovr[i].kind, "shape") == 0 && strcmp(g_ovr[i].f[1], name) == 0)
             return &g_ovr[i];
     return NULL;
 }
@@ -1904,6 +1907,13 @@ static void verify_shapes(void)
         if (strcmp(o->kind, "shape") != 0)
             continue;
         char *tname = strcmp(o->f[2], "0") == 0 ? xstrdup(o->f[1]) : xprintf("%s%s", o->f[1], o->f[2]);
+        int declared = 0;
+        for (int pi = 0; pi < g_lib.npasses && !declared; pi++)
+            declared = map_get(&g_lib.passes[pi].tdefs, tname) >= 0;
+        if (!declared) {
+            free(tname);
+            tname = xstrdup(o->f[1]);
+        }
         int found = 0;
         for (int pi = 0; pi < g_lib.npasses && !found; pi++) {
             Pass *p = &g_lib.passes[pi];
@@ -2146,8 +2156,8 @@ static void classify(Rec *r)
                 if (w[j].shape && !typedef_chain_has(pt, w[j].shape))
                     die("overrides:%d: argument %d of %s does not point at a %s", w[j].line,
                         w[j].argpos, r->name, w[j].shape);
-                if (w[j].shape && !find_shape(w[j].shape, "0"))
-                    die("overrides:%d: no shape %s version 0", w[j].line, w[j].shape);
+                if (w[j].shape && !find_shape(w[j].shape))
+                    die("overrides:%d: no shape %s", w[j].line, w[j].shape);
             }
             const char *rc = pair_checks(tx, ta, 0, w, nw);
             if (!rc && buf_str(&sx)[0] == 'k' && !returns_retained(x))

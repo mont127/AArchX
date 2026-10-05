@@ -21,6 +21,8 @@ for arch in x86_64 arm64; do
         -framework Kerberos -o "$work/kerberos.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror -Wno-deprecated-declarations tests/dynamic/native_gl_carbon.c \
         -framework OpenGL -framework Carbon -o "$work/gl_carbon.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_callback_structs.c -framework CoreFoundation \
+        -framework CoreGraphics -framework CoreText -framework ImageIO -o "$work/callback_structs.$arch"
 done
 mkdir -p "$work/globdir"
 touch "$work/globdir/a.txt" "$work/globdir/b.txt" "$work/globdir/c.log"
@@ -31,6 +33,7 @@ touch "$work/globdir/a.txt" "$work/globdir/b.txt" "$work/globdir/c.log"
 sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.err"
 "$work/kerberos.arm64" > "$work/kerberos.expected"
 "$work/gl_carbon.arm64" > "$work/gl_carbon.expected"
+"$work/callback_structs.arm64" > "$work/callback_structs.expected"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -67,6 +70,11 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/gl_carbon.x86_64" > "$work/gl_carbon.$engine.out" 2> "$work/gl_carbon.$engine.err"
     cmp "$work/gl_carbon.expected" "$work/gl_carbon.$engine.out"
     echo "PASS native OpenGL, Carbon time and hot keys $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/callback_structs.x86_64" > "$work/callback_structs.$engine.out" \
+        2> "$work/callback_structs.$engine.err"
+    cmp "$work/callback_structs.expected" "$work/callback_structs.$engine.out"
+    echo "PASS native data consumers, patterns, stream clients and run delegates $engine"
     for refusal in context launch; do
         rc=0
         env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \
