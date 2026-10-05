@@ -1299,6 +1299,49 @@ static int br_pthread_sigmask(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_settle(vm, cpu);
 }
 
+/* sigsuspend and pause wait as the guest's own mask says, through ocerz's
+   signal state, then answer -1 with EINTR and deliver the signal that ended
+   the wait, so its handler runs before the call returns to its caller. */
+static int br_suspend(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t mask)
+{
+    int caught = ocerz_guest_sigsuspend(vm, cpu, mask);
+    errno = EINTR;
+    br_return(cpu, (uint64_t)-1);
+    if (caught)
+        ocerz_guest_deliver_now(cpu, caught);
+    return br_settle(vm, cpu);
+}
+
+static int br_sigsuspend(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t set = cpu->gpr[OCERZ_RDI];
+    return br_suspend(vm, cpu, set ? (uint32_t)ocerz_ld(set, 4) : 0);
+}
+
+static int br_pause(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_suspend(vm, cpu, UINT64_MAX);
+}
+
+static int br_sigpending(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t set = cpu->gpr[OCERZ_RDI];
+    if (set)
+        ocerz_st(set, 4, ocerz_guest_sigpending(cpu));
+    br_return(cpu, 0);
+    return br_settle(vm, cpu);
+}
+
+static int br_sigwait(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t set = cpu->gpr[OCERZ_RDI], sigp = cpu->gpr[OCERZ_RSI];
+    int got = ocerz_guest_sigwait(vm, cpu, set ? (uint32_t)ocerz_ld(set, 4) : 0);
+    if (got && sigp)
+        ocerz_st(sigp, 4, (uint32_t)got);
+    br_return(cpu, got ? 0 : EINTR);
+    return br_settle(vm, cpu);
+}
+
 static int br_sigaltstack(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     return br_posix(vm, cpu, ocerz_guest_sigaltstack(vm, cpu, cpu->gpr[OCERZ_RDI],
@@ -1314,8 +1357,11 @@ static int br_kill(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     int pid = (int)cpu->gpr[OCERZ_RDI];
     int sig = (int)cpu->gpr[OCERZ_RSI];
-    if (pid == getpid() && sig != 0)
+    if (pid == getpid() && sig != 0) {
+        if (ocerz_guest_post_to_waiter(sig))
+            return br_posix(vm, cpu, 0);
         return br_posix(vm, cpu, ocerz_guest_raise(vm, cpu, sig));
+    }
     return br_posix(vm, cpu, kill(pid, sig) == 0 ? 0 : errno);
 }
 
@@ -1985,6 +2031,10 @@ static const BrHandler g_br_handlers[] = {
     { "signal",          br_signal },
     { "sigprocmask",     br_sigprocmask },
     { "pthread_sigmask", br_pthread_sigmask },
+    { "sigsuspend", br_sigsuspend },
+    { "pause", br_pause },
+    { "sigpending", br_sigpending },
+    { "sigwait", br_sigwait },
     { "sigaltstack",     br_sigaltstack },
     { "raise",           br_raise },
     { "kill",            br_kill },

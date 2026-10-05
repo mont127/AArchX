@@ -267,11 +267,12 @@
 # Raw syscalls: syscall and __syscall would reach the host kernel with x86
 # system call numbers.
 #
-# The rest of the signal interface: sigsuspend, sigwait, sigpending, pause,
-# sigvec, sigblock, sigsetmask, the System V sigset, sighold, sigrelse,
-# sigignore, sigpause and siginterrupt, bsd_signal, and the private
-# double-underscore entries behind them all read or wait on the host's signal
-# state, which is not the guest's.
+# The rest of the signal interface: sigvec, sigblock, sigsetmask, the System
+# V sigset, sighold, sigrelse, sigignore, sigpause and siginterrupt,
+# bsd_signal, and the private double-underscore entries behind them all read
+# or wait on the host's signal state, which is not the guest's.  sigsuspend,
+# pause, sigpending and sigwait are special instead, and wait on or read the
+# guest's, the way the emulated system calls under them do in cache mode.
 #
 # Machine state and exception ports: thread_get_state, thread_set_state and
 # their act_ and task_ spellings take x86 thread-state flavors the arm64 kernel
@@ -764,14 +765,17 @@ stub _vm_remap_new override
 stub _syscall override
 stub ___syscall override
 
-stub _sigsuspend override
+special _sigsuspend sigsuspend
+special _sigsuspend$NOCANCEL sigsuspend
 stub ___sigsuspend override
 stub ___sigsuspend_nocancel override
-stub _sigwait override
+special _sigwait sigwait
+special _sigwait$NOCANCEL sigwait
 stub ___sigwait override
 stub _____sigwait_nocancel override
-stub _sigpending override
-stub _pause override
+special _sigpending sigpending
+special _pause pause
+special _pause$NOCANCEL pause
 stub _sigvec override
 stub _sigblock override
 stub _sigsetmask override

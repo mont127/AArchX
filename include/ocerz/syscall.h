@@ -81,6 +81,11 @@ int ocerz_guest_sigprocmask(struct OcerzVM *vm, OcerzCPU *cpu, int how,
                             uint64_t set, uint64_t oset);
 int ocerz_guest_sigaltstack(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t ss, uint64_t oss);
 int ocerz_guest_raise(struct OcerzVM *vm, OcerzCPU *cpu, int sig);
+int ocerz_guest_sigsuspend(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t mask);
+void ocerz_guest_deliver_now(OcerzCPU *cpu, int sig);
+uint32_t ocerz_guest_sigpending(OcerzCPU *cpu);
+int ocerz_guest_sigwait(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t want);
+int ocerz_guest_post_to_waiter(int sig);
 int ocerz_guest_pthread_kill(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t thread, int sig);
 int ocerz_guest_deliver_pending(struct OcerzVM *vm, OcerzCPU *cpu);
 uint32_t ocerz_guest_altstack_flags(const OcerzCPU *cpu);

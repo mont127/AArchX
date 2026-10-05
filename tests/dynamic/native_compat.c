@@ -7,6 +7,7 @@
 #include <glob.h>
 #include <malloc/malloc.h>
 #include <math.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -294,6 +295,63 @@ static void int128s(void)
     }
 }
 
+static volatile sig_atomic_t usr1_hits;
+
+static void on_usr1(int s)
+{
+    (void)s;
+    usr1_hits++;
+}
+
+static void *poke_usr1(void *arg)
+{
+    (void)arg;
+    usleep(100000);
+    kill(getpid(), SIGUSR1);
+    return NULL;
+}
+
+static void signal_waits(void)
+{
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        signal(SIGUSR1, on_usr1);
+        sigset_t block, old, pending;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, &old);
+        kill(getpid(), SIGUSR1);
+        sigpending(&pending);
+        int was_pending = sigismember(&pending, SIGUSR1);
+        sigset_t wait = old;
+        sigdelset(&wait, SIGUSR1);
+        errno = 0;
+        int r1 = sigsuspend(&wait);
+        int e1 = errno, h1 = usr1_hits;
+        sigpending(&pending);
+        int still = sigismember(&pending, SIGUSR1);
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        pthread_t t;
+        pthread_create(&t, NULL, poke_usr1, NULL);
+        errno = 0;
+        int r2 = pause();
+        int e2 = errno, h2 = usr1_hits;
+        pthread_join(t, NULL);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+        pthread_create(&t, NULL, poke_usr1, NULL);
+        int got = 0;
+        int r3 = sigwait(&block, &got);
+        pthread_join(t, NULL);
+        printf("signals pending=%d suspend=%d,%d,%d still=%d pause=%d,%d,%d sigwait=%d,%d hits=%d\n", was_pending, r1,
+               e1 == EINTR, h1, still, r2, e2 == EINTR, h2, r3, got == SIGUSR1, (int)usr1_hits);
+        fflush(stdout);
+        _exit(0);
+    }
+    int st = 0;
+    waitpid(child, &st, 0);
+}
+
 static int guest_zone_calls;
 
 static void *gz_malloc(malloc_zone_t *z, size_t n)
@@ -386,5 +444,6 @@ int main(int argc, char **argv)
     fenvs();
     gss();
     int128s();
+    signal_waits();
     return 0;
 }
