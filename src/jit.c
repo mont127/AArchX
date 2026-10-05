@@ -169,10 +169,10 @@
  * three ranges - the low window, the identity middle, the top strip with the
  * commpage in it - about twenty instructions for one load.  When the low
  * window's host base is a single run of bits above every low address, as the
- * usual 0x8000000000 is, a low address becomes host with one orr after a
- * single test, and one between the window and the top strip is recognised as
- * identity with two shifts and an add; only the top strip takes the general
- * form.  In the Wine layout that took memcpy from 6.1x of
+ * usual 0x8000000000 is, an address below 12 GB becomes host with one orr
+ * after a shift and a compare, and one between 12 GB and the top strip is
+ * recognised as identity with two shifts and an add; only the top strip
+ * takes the general form.  In the Wine layout that took memcpy from 6.1x of
  * Rosetta's time to 3.1x, a mixed workload from 3.0x to 1.65x and an
  * interpreter loop from 1.5x to 1.0x (OCERZ_NO_FAST_LOW_GUARD=1 keeps the
  * general form everywhere).  The top strip is not tested at all until an
@@ -181,20 +181,12 @@
  * way it marks a commpage reader in identity mode, interprets the one
  * instruction and retires the block.  The retranslation then tests the
  * identity range with two shifts and an add and takes the general form out of
- * line at the end of the block (OCERZ_LOW_TOP_GUARD=1 tests the top strip in
- * every block).  The host side of the low window is 16 GB though the guest
- * owns only the first 12: the rest is reserved and never mapped, and the top
- * strip's host block sits above it.  So one tst against bits 34 and up tells
- * a low address from the rest: a low address costs the tst, an untaken branch
- * and an orr, an identity address the tst and a taken branch.  A stray access
- * between 12 and 16 GB faults in the reserved part and reaches the guest as
- * a fault at its own address, where it used to reach whatever the host had
- * mapped at that address.  A process whose identity arena starts below 16 GB
- * keeps the 12 GB window and tests it with a shift and a compare.  Stack
- * accesses (push, pop, call, ret and rsp-relative operands) are plain in this
- * mode as in every other, after the translation instead of in place of it;
- * they used to take the ordered load and store (OCERZ_TSO_STRICT=1 orders
- * them everywhere).
+ * line at the end of the block.  A low address costs a shift, a compare, an
+ * untaken branch and an orr, and an identity address the first three
+ * (OCERZ_LOW_TOP_GUARD=1 tests the top strip in every block).  Stack accesses (push, pop, call, ret and rsp-relative operands) are
+ * plain in this mode as in every other, after the translation instead of in
+ * place of it; they used to take the ordered load and store
+ * (OCERZ_TSO_STRICT=1 orders them everywhere).
  *
  * The integer SSE forms map almost one to one: widening multiplies and a
  * narrowing unzip for the high halves and pmaddubsw, saturating narrows for the
@@ -4154,17 +4146,10 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         return NULL;
     }
     if (ocerz_low_base && ea_fold() == 0 && low_guard_fast_ok()) {
-        uint32_t *high;
-        if (ocerz_low_window == OCERZ_LOW_WINDOW) {
-            (void)a64_try_ands_imm(b, 1, A64_ZR, addr_reg, ~(OCERZ_LOW_WINDOW - 1));
-            high = a64_label(b);
-            a64_bcond(b, A64_NE, 0);
-        } else {
-            a64_lsr_imm(b, 1, JTT, addr_reg, 32);
-            a64_subs_imm(b, 1, A64_ZR, JTT, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
-            high = a64_label(b);
-            a64_bcond(b, A64_CS, 0);
-        }
+        a64_lsr_imm(b, 1, JTT, addr_reg, 32);
+        a64_subs_imm(b, 1, A64_ZR, JTT, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+        uint32_t *high = a64_label(b);
+        a64_bcond(b, A64_CS, 0);
         (void)a64_try_orr_imm(b, 1, addr_reg, addr_reg, ocerz_low_base);
         if (!g_low_top) {
             a64_patch_bcond(high, a64_label(b));
@@ -4205,9 +4190,9 @@ static void emit_guard_full(A64Buf *b, int addr_reg)
     uint64_t fold = ea_fold();
     uint32_t *to_native = NULL;
     if (ocerz_low_base) {
-        a64_mov_imm64(b, JTU, ocerz_low_window + fold);
+        a64_mov_imm64(b, JTU, OCERZ_LOW_LIMIT + fold);
         a64_sub_reg(b, 1, JTT, addr_reg, JTU, 0);
-        a64_mov_imm64(b, JTU, OCERZ_TOP_LO - ocerz_low_window);
+        a64_mov_imm64(b, JTU, OCERZ_TOP_LO - OCERZ_LOW_LIMIT);
         a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
         to_native = a64_label(b);
         a64_bcond(b, A64_CC, 0);
