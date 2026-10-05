@@ -270,6 +270,8 @@ static const CbAccept kAccept[] = {
     { "B(Hc{b(BhH)}h)", 'B', "Hch", { 1, -1 }, { "b(BhH)", NULL } },
     { "h(bc{H()}Bc{B(bhBHi)})", 'h', "bcBc", { 1, 3 }, { "H()", "B(bhBHi)" } },
     { "v(c{v({dd})})", 'v', "c", { 0, -1 }, { "v({dd})", NULL } },
+    { "c{i(pp)}(pp)", 'c', "pp", { -1, -1 }, { NULL, NULL } },
+    { "c{p(ppp)}()", 'c', "", { -1, -1 }, { NULL, NULL } },
     { "{dd}(c{{{dd}{dd}}(pp{{dd}{dd}}p)}{dd})", '{', "c{", { 0, -1 },
       { "{{dd}{dd}}(pp{{dd}{dd}}p)", NULL } },
     { "v(pc{L({LL}{LL}{LL}{LL}{dddd}{dddd}b{ff}b{dd}f{ff}f)}c{{LL}()})", 'v', "pcc",
@@ -318,7 +320,7 @@ static void check_accept(const CbAccept *c)
 }
 
 static const char *const kReject[] = {
-    "c()", "c(pp)", "c{i(pp)}(pp)", "c{i(pp)}()",
+    "c()", "c(pp)", "c{i(c{v()})}(pp)", "c{c{v()}()}()",
     "v(c)", "v(pLLc)", "v(cp)", "p(ppLLc)", "v(c())", "v(ci(pp))",
     "v(c{", "v(c{i(pp)", "v(c{i(pp))", "v(pLLc{i(pp))", "v(c{i(pp)}",
     "v(c{v(c{i(pp)})})", "v(c{i(pc{i(pp)})})", "v(c{i(c)})", "v(c{c()})",
@@ -356,6 +358,10 @@ static void test_parse(void)
 
     for (i = 0; i < NREJECT; i++)
         check_reject(kReject[i], "a callback notation that is not well formed");
+
+    memset(&sig, 0, sizeof sig);
+    CHECK(ocerz_abi_parse("c{p(ppp)}(i)", &sig) == OCERZ_OK && sig.ret == 'c' && strcmp(sig.ret_cb, "p(ppp)") == 0,
+          "a function result of class c does not keep its callback notation: \"%s\"", sig.ret_cb);
 
     CHECK(ocerz_abi_parse(kStructLong, &sig) == OCERZ_OK,
           "%s does not parse on its own, so its refusal as a nested notation proves "

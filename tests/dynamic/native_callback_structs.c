@@ -1,9 +1,12 @@
+#include <Carbon/Carbon.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreText/CoreText.h>
 #include <ImageIO/ImageIO.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 static size_t consumed;
 static int released;
@@ -127,10 +130,88 @@ static void text(void)
     CFRelease(d);
 }
 
+static OSErr on_event(const AppleEvent *e, AppleEvent *reply, SRefCon ref)
+{
+    (void)e;
+    (void)reply;
+    (void)ref;
+    return noErr;
+}
+
+static void on_invalidate(CFMachPortRef port, void *info)
+{
+    (void)port;
+    (void)info;
+}
+
+static void on_port(CFMachPortRef port, void *msg, CFIndex size, void *info)
+{
+    (void)port;
+    (void)msg;
+    (void)size;
+    (void)info;
+}
+
+static void on_socket(CFSocketRef s, CFSocketCallBackType type, CFDataRef address, const void *data, void *info)
+{
+    (void)s;
+    (void)address;
+    (void)data;
+    (*(int *)info) |= (int)type;
+    CFRunLoopStop(CFRunLoopGetCurrent());
+}
+
+static const void *port_retain(const void *info)
+{
+    retained++;
+    return info;
+}
+
+static void port_release(const void *info)
+{
+    (void)info;
+    retained--;
+}
+
+static void functions_and_ports(void)
+{
+    AEEventHandlerUPP upp = NewAEEventHandlerUPP(on_event);
+    printf("upp is the function=%d\n", upp == on_event);
+    DisposeAEEventHandlerUPP(upp);
+    int seen = 0;
+    retained = 0;
+    CFMachPortContext pctx = { 0, &seen, port_retain, port_release, NULL };
+    Boolean free_info = false;
+    CFMachPortRef port = CFMachPortCreate(NULL, on_port, &pctx, &free_info);
+    CFMachPortSetInvalidationCallBack(port, on_invalidate);
+    printf("mach port=%d invalidation callback back=%d held=%d\n", port != NULL,
+           CFMachPortGetInvalidationCallBack(port) == on_invalidate, retained > 0);
+    CFMachPortInvalidate(port);
+    CFRelease(port);
+    CFSocketContext sctx = { 0, &seen, port_retain, port_release, NULL };
+    CFSocketRef s = CFSocketCreate(NULL, PF_INET, SOCK_DGRAM, 0, kCFSocketReadCallBack, on_socket, &sctx);
+    int fds[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    CFSocketRef s2 = CFSocketCreateWithNative(NULL, fds[0], kCFSocketReadCallBack, on_socket, &sctx);
+    CFRunLoopSourceRef src = CFSocketCreateRunLoopSource(NULL, s2, 0);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopDefaultMode);
+    write(fds[1], "x", 1);
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2, false);
+    printf("socket created=%d native=%d seen=%#x\n", s != NULL, s2 != NULL, seen);
+    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), src, kCFRunLoopDefaultMode);
+    CFRelease(src);
+    CFSocketInvalidate(s2);
+    CFRelease(s2);
+    CFSocketInvalidate(s);
+    CFRelease(s);
+    close(fds[1]);
+}
+
 int main(void)
 {
     graphics();
     streams();
     text();
+    functions_and_ports();
     return 0;
 }

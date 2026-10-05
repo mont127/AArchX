@@ -119,9 +119,12 @@
  * a callback or a block, where no conversion can reach it (an argument or
  * result of the function itself is D, which the bridge converts); va-list, spotted as a pointer to
  * x86_64's __va_list_tag; block-too-long; block-result; too-many-args past
- * sixteen; nested-callback; callback-too-long; callback-result for a function pointer handed back to the
- * guest, which would be arm64 code; callback-pointer for a pointer to a
- * function pointer; no-prototype; complex, vector, int128, float-width, atomic
+ * sixteen; nested-callback; callback-too-long; callback-result for a function
+ * pointer a callback hands back, which the engine does not carry inside a
+ * callback's notation (a function's own function-pointer result is class c,
+ * which the bridge hands the guest as its own function when native code
+ * answers one of ocerz's callbacks onto it, and as a thunk otherwise);
+ * callback-pointer for a pointer to a function pointer; no-prototype; complex, vector, int128, float-width, atomic
  * and unexposed-type for the rarer kinds; and arch-mismatch when the two
  * declarations of one function give different notations.  Two notations that
  * differ only between i and u, or l and L, are not a mismatch: boolean_t is
@@ -906,10 +909,8 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
     if (k == TK.Pointer) {
         CXType pc = canon(clang_getPointeeType(c));
         if (is_fn_kind(pc.kind)) {
-            if (is_result)
-                return "callback-result";
             if (depth > 0)
-                return "nested-callback";
+                return is_result ? "callback-result" : "nested-callback";
             Buf cb = { 0 };
             const char *r = fn_notation(pc, depth + 1, &cb);
             if (!r && cb.n >= SIG_CB_MAX)
@@ -1099,7 +1100,7 @@ static int sig_class_valid(const char **sp, int allow_cb, int is_result)
         *sp = s;
         return 1;
     }
-    if (*s == 'c' && !is_result) {
+    if (*s == 'c') {
         if (!allow_cb || s[1] != '{')
             return 0;
         const char *open = s + 2, *close = open;

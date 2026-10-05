@@ -17,7 +17,8 @@
  * ocerz_bridge_lookup finds the export's record through ocerz_apidb_find and
  * returns the descriptor made from it, making it on the first lookup: the host
  * symbol resolved in the library the record belongs to, the signature parsed,
- * and each struct record bound to the integer register its argument arrives in
+ * and each struct record bound to the integer register its argument arrives in,
+ * or the guest stack slot past the sixth, as CFSocketCreate's seventh does,
  * and to every shape record of the name it gives.  A special record becomes a
  * descriptor holding the handler this file knows by the record's handler name,
  * from a table of name and function.  A stub, data or var record, or no record,
@@ -123,7 +124,8 @@
  * ---- a descriptor that does not hold up is no descriptor ----
  * A stub record, a fn whose host symbol dlsym cannot find, a special naming a
  * handler this file does not have, and a struct record whose argument the
- * signature does not place in an integer register are the same thing to the
+ * signature does not place in an integer register or a stack slot, behind a
+ * structure passed by value, are the same thing to the
  * caller: no descriptor, and the behaviour of naming the export and stopping.
  * A refusal is a bug report, while a crossing made through something nobody
  * could resolve would be a wrong answer, so the failures are not allowed to
@@ -395,6 +397,7 @@
 typedef struct BrStructBinding {
     int argpos;
     int reg;
+    int slot;
     const char *shape;
     const OcerzApiShape **versions;
     int nversions;
@@ -576,7 +579,7 @@ uint64_t ocerz_bridge_native_thunk(const void *fn, const char *name, const char 
         if (sig && ocerz_abi_parse(notation, sig) == OCERZ_OK) {
             g_br_thunks[n].fn = fn;
             g_br_thunks[n].name = name ? name : "(native function)";
-            g_br_thunks[n].notation = notation;
+            g_br_thunks[n].notation = strdup(notation);
             g_br_thunks[n].sig = sig;
             atomic_store(&g_br_thunks_n, n + 1);
         } else {
@@ -2393,6 +2396,26 @@ void *ocerz_bridge_host_symbol(const char *install_name, const char *host_sym)
     return h ? dlsym(h, host_sym) : NULL;
 }
 
+/* The guest stack slot System V passes argument argpos in, counted from the
+   first above the return address, or -1 when it has a register or a structure
+   passed by value comes before it. */
+static int br_stack_slot(const OcerzAbiSig *sig, int argpos)
+{
+    if (argpos < 0 || argpos >= sig->nargs || sig->arg[argpos] != 'p' || sig->ret == '{')
+        return -1;
+    int ints = 0, fps = 0, slot = 0;
+    for (int i = 0; i <= argpos; i++) {
+        if (sig->arg[i] == '{' || sig->arg[i] == 'D')
+            return -1;
+        int fp = sig->arg[i] == 'f' || sig->arg[i] == 'd';
+        int spilled = fp ? ++fps > 8 : ++ints > 6;
+        if (i == argpos)
+            return spilled ? slot : -1;
+        slot += spilled;
+    }
+    return -1;
+}
+
 static int br_int_register(const OcerzAbiSig *sig, int argpos)
 {
     static const int regs[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
@@ -2417,9 +2440,10 @@ static int br_bind_structs(const OcerzApiLibrary *api, const OcerzApiEntry *e,
         b->argpos = a->argpos;
         b->shape = a->shape;
         b->reg = br_int_register(&fn->parsed, a->argpos);
-        if (b->reg < 0) {
+        b->slot = b->reg < 0 ? br_stack_slot(&fn->parsed, a->argpos) : -1;
+        if (b->reg < 0 && b->slot < 0) {
             OCERZ_LOG("bridge: %s converts a %s in argument %d, which its signature %s does not place"
-                      " in a register\n", fn->sym, a->shape, a->argpos, fn->sig);
+                      " in a register or a stack slot\n", fn->sym, a->shape, a->argpos, fn->sig);
             return 0;
         }
         int n = 0;
@@ -2615,7 +2639,8 @@ static void br_convert_structs(const struct OcerzBridgeFn *fn, OcerzCPU *cpu,
 {
     for (int k = 0; k < fn->nstructs; k++) {
         const BrStructBinding *b = &fn->structs[k];
-        uint64_t gptr = cpu->gpr[b->reg];
+        uint64_t at = b->reg < 0 ? cpu->gpr[OCERZ_RSP] + 8 + 8 * (uint64_t)b->slot : 0;
+        uint64_t gptr = b->reg < 0 ? ocerz_ld(at, 8) : cpu->gpr[b->reg];
         if (!gptr || !ocerz_abi_is_guest_code(gptr))
             continue;
         uint64_t version = ocerz_ld(gptr, 8);
@@ -2640,7 +2665,10 @@ static void br_convert_structs(const struct OcerzBridgeFn *fn, OcerzCPU *cpu,
             }
             copies[k][w] = v;
         }
-        cpu->gpr[b->reg] = ocerz_h2g(copies[k]);
+        if (b->reg < 0)
+            ocerz_st(at, 8, ocerz_h2g(copies[k]));
+        else
+            cpu->gpr[b->reg] = ocerz_h2g(copies[k]);
     }
 }
 

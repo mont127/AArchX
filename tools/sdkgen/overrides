@@ -333,8 +333,9 @@
 # name.  CFBundleGetMainBundle crosses by rule, because ocerz opens
 # CoreFoundation with CFProcessPath naming the guest's executable, so the main
 # bundle native CoreFoundation answers with is the guest's.  The shapes describe the callback structures the
-# collection and run loop constructors copy, and the client context
-# CFReadStreamSetClient and CFWriteStreamSetClient copy, word by word, with the version
+# collection, run loop, Mach port, message port, socket and file descriptor
+# constructors copy, and the client context CFReadStreamSetClient and
+# CFWriteStreamSetClient copy, word by word, with the version
 # the first word must hold; the generator checks every word against the
 # structure the header declares, and version 1 against CFRunLoopSourceContext1.
 # The struct records name the argument each constructor takes one in.
@@ -966,6 +967,10 @@ shape CFRunLoopObserverContext 0 5 - - p(p) v(p) p(p)
 shape CFRunLoopSourceContext 0 10 - - p(p) v(p) p(p) B(pp) L(p) v(ppp) v(ppp) v(p)
 shape CFRunLoopSourceContext 1 9 - - p(p) v(p) p(p) B(pp) L(p) u(p) p(plpp)
 shape CFStreamClientContext 0 5 - - p(p) v(p) p(p)
+shape CFMachPortContext 0 5 - - p(p) v(p) p(p)
+shape CFMessagePortContext 0 5 - - p(p) v(p) p(p)
+shape CFSocketContext 0 5 - - p(p) v(p) p(p)
+shape CFFileDescriptorContext 0 5 - - p(p) v(p) p(p)
 
 struct _CFArrayCreate 3 CFArrayCallBacks
 struct _CFArrayCreateMutable 2 CFArrayCallBacks
@@ -983,6 +988,14 @@ struct _CFRunLoopObserverCreate 5 CFRunLoopObserverContext
 struct _CFRunLoopSourceCreate 2 CFRunLoopSourceContext
 struct _CFReadStreamSetClient 3 CFStreamClientContext
 struct _CFWriteStreamSetClient 3 CFStreamClientContext
+struct _CFMachPortCreate 2 CFMachPortContext
+struct _CFMachPortCreateWithPort 3 CFMachPortContext
+struct _CFMessagePortCreateLocal 3 CFMessagePortContext
+struct _CFSocketCreate 6 CFSocketContext
+struct _CFSocketCreateWithNative 4 CFSocketContext
+struct _CFSocketCreateWithSocketSignature 4 CFSocketContext
+struct _CFSocketCreateConnectedToSocketSignature 4 CFSocketContext
+struct _CFFileDescriptorCreate 4 CFFileDescriptorContext
 
 library /usr/lib/libobjc.A.dylib
 
