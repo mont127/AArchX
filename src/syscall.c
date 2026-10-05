@@ -3340,7 +3340,7 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
                     (unsigned long long)data, (unsigned long long)ext0, (unsigned long long)ext1);
         }
 
-    if (!getenv("OCERZ_NO_MACHBRIDGE"))
+    if (!ENV_SET("OCERZ_NO_MACHBRIDGE"))
         for (int i = 0; i < nev; i++) {
             uint64_t dst = evbuf + (uint64_t)i * OCERZ_KEVENT_QOS_S;
             if ((int16_t)ocerz_ld(dst + 0x08, 2) != -8) continue;
@@ -3390,11 +3390,11 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
     t.gpr[OCERZ_RSI] = kp;
     t.gpr[OCERZ_RDX] = region + OCERZ_WQ_GUARD_SIZE;
     t.gpr[OCERZ_RCX] = evbuf;
-    uint64_t mgr = ocerz_hostwq_is_manager() && !getenv("OCERZ_NO_MGRFLAG")
+    uint64_t mgr = ocerz_hostwq_is_manager() && !ENV_SET("OCERZ_NO_MGRFLAG")
                  ? OCERZ_WQ_FLAG_EVENT_MANAGER : 0;
     t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | extra_r8 | mgr | (mgr ? 0 : 4u)
                     | (registered ? OCERZ_WQ_FLAG_REUSE : 0);
-    if (mgr && getenv("OCERZ_ULOCKLOG"))
+    if (mgr && ENV_SET("OCERZ_ULOCKLOG"))
         fprintf(stderr, "ocerz: WQ-MANAGER delivery nev=%d guest_tsd_qos=%#llx\n", nev,
                 (unsigned long long)ocerz_ld(pth + 0xe0 + 4 * 8, 8));
     t.gpr[OCERZ_R9] = (uint64_t)nev;
@@ -3409,7 +3409,7 @@ static void ocerz_hostwq_bridge(uint64_t extra_r8, uint64_t workloop_id, const v
     if (ENV_SET("OCERZ_ULOCKLOG"))
         fprintf(stderr, "ocerz: WQ-ENTER cpu#%u kport=%#x nev=%d flt0=%d ident0=%#llx\n",
                 t.cpu_number, (unsigned)kp, nev, flt0, (unsigned long long)ident0);
-    int dqdump = getenv("OCERZ_DQDUMP") != NULL;
+    int dqdump = ENV_SET("OCERZ_DQDUMP");
     if (dqdump)
         wl_dqdump("ENTER", workloop_id, t.cpu_number, (unsigned)kp);
     int wrc = ocerz_vm_run_cpu(vm, &t);
@@ -3466,7 +3466,7 @@ static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
     }
     uint64_t pth = region + 0x1f0000;
 
-    if (g_hostwq_tl_fatal || !getenv("OCERZ_NO_DDIRESET")) {
+    if (g_hostwq_tl_fatal || !ENV_SET("OCERZ_NO_DDIRESET")) {
         ocerz_st(pth + 0x1c8, 8, 0);
         ocerz_st(pth + 0x1b8, 8, 0);
         g_hostwq_tl_fatal = 0;
@@ -3571,7 +3571,7 @@ static void ocerz_hostwq_kevent_cb(void **events, int *nevents)
         g_hostwq_tl_events = NULL;
         g_hostwq_tl_nevents = NULL;
     }
-    if (getenv("OCERZ_REARMLOG") && nevents && *nevents > 0 && events && *events) {
+    if (ENV_SET("OCERZ_REARMLOG") && nevents && *nevents > 0 && events && *events) {
         for (int i = 0; i < *nevents; i++) {
             const unsigned char *e = (const unsigned char *)*events
                                    + (size_t)i * OCERZ_KEVENT_QOS_S;
@@ -3700,7 +3700,7 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
                     (int)getpid(), cpu->cpu_number, (unsigned long long)a[0],
                     (long long)a[2], (long long)a[4], (unsigned long long)fa[7],
                     (unsigned long long)chg0id, chg0f, chg0fl, (long long)r, err);
-        if (getenv("OCERZ_DQDUMP") && chg0f == -17)
+        if (ENV_SET("OCERZ_DQDUMP") && chg0f == -17)
             wl_dqdump("ARM", a[0], cpu->cpu_number, 0);
 
         if (!err && (int64_t)r > 0 && a[3]) {
@@ -8408,14 +8408,14 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
         if (ocerz_gs_is_teb_band(newgs))
             cpu->wine_teb_base = newgs;
         machdep_ret(cpu, cpu->gs_base);
-        if (getenv("OCERZ_GSTRACE"))
+        if (ENV_SET("OCERZ_GSTRACE"))
             fprintf(stderr, "ocerz: GS machdep[%d] cpu#%u gs=%#llx teb=%#llx rip=%#llx icount=%#llx%s\n",
                     (int)getpid(), cpu->cpu_number,
                     (unsigned long long)cpu->gs_base,
                     (unsigned long long)cpu->wine_teb_base, (unsigned long long)cpu->rip,
                     (unsigned long long)vm->insn_count,
                     cpu->gs_base < 0x100000 ? "  <<< SMALL/INVALID" : "");
-        if (getenv("OCERZ_GSTRACE") && cpu->gs_base < 0x100000) {
+        if (ENV_SET("OCERZ_GSTRACE") && cpu->gs_base < 0x100000) {
             uint64_t r14 = cpu->gpr[OCERZ_R14];
             uint64_t td = ocerz_ld(r14, 8);
             fprintf(stderr, "ocerz:   GSBAD caller-ret=%#llx rdi=%#llx r14=%#llx rsp=%#llx [r14]=td=%#llx td_commit=%d [td+0x320]=%#llx [td-0]=%#llx [td+8]=%#llx\n",
@@ -8427,7 +8427,7 @@ static int dispatch_machdep(OcerzVM *vm, OcerzCPU *cpu, int num)
                     (unsigned long long)(td ? ocerz_ld(td, 8) : 0),
                     (unsigned long long)(td ? ocerz_ld(td + 8, 8) : 0));
         }
-        if (vm->strace || getenv("OCERZ_SIGTRACE"))
+        if (vm->strace || ENV_SET("OCERZ_SIGTRACE"))
             fprintf(stderr,
                     "ocerz: machdep set_cthread_self gs=%#llx comm(gs)=%d comm(gs-8)=%d icount=%#llx\n",
                     (unsigned long long)cpu->gs_base,
@@ -8461,7 +8461,7 @@ static void writetrap_check(OcerzCPU *cpu, int num)
 {
     static const char *trap = (const char *)-1;
     if (trap == (const char *)-1) trap = getenv("OCERZ_WRITETRAP");
-    if (!trap && !getenv("OCERZ_REQTRAP")) return;
+    if (!trap && !ENV_SET("OCERZ_REQTRAP")) return;
     size_t tl = trap ? strlen(trap) : 0;
     int hit = 0;
     if (!trap) { }
@@ -8772,7 +8772,7 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 
         if (!ocerz_gs_is_teb_band(cpu->gs_base) && cpu->wine_teb_base &&
             ocerz_addr_committed(cpu->wine_teb_base)) {
-            if (getenv("OCERZ_GSTRACE"))
+            if (ENV_SET("OCERZ_GSTRACE"))
                 fprintf(stderr, "ocerz: SIGSYS gs %#llx -> TEB %#llx rip=%#llx\n",
                         (unsigned long long)cpu->gs_base,
                         (unsigned long long)cpu->wine_teb_base, (unsigned long long)cpu->rip);

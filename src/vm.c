@@ -351,6 +351,7 @@
 #include <mach/mach_vm.h>
 
 #define OCERZ_CALL_SENTINEL 0x00000000deadca11ull
+#define ENV_SET(name) ({ static int set_ = -1; if (set_ < 0) set_ = getenv(name) != NULL; set_; })
 
 static OcerzVM *g_vm;
 static __thread OcerzCPU *g_cur_cpu;
@@ -1416,7 +1417,7 @@ static void ocerz_host_sigmask_clear(const char *where)
         return;
     sigemptyset(&empty);
     pthread_sigmask(SIG_SETMASK, &empty, NULL);
-    if (getenv("OCERZ_HOSTMASKLOG"))
+    if (ENV_SET("OCERZ_HOSTMASKLOG"))
         fprintf(stderr, "ocerz: HOSTMASK-CLEARED[%d] %s had %#x blocked\n", (int)getpid(), where, v);
 }
 
@@ -1963,7 +1964,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 g_cur_cpu->rip = jrip;
                 g_cur_cpu->sig_repeat = 0;
                 g_cur_cpu->interp_once = 1;
-                if (getenv("OCERZ_RASLOG"))
+                if (ENV_SET("OCERZ_RASLOG"))
                     fprintf(stderr, "ocerz: host RAS overflow[%d] at rip=%#llx sp=%#llx: CALL via interpreter\n",
                             (int)getpid(), (unsigned long long)jrip, (unsigned long long)uc->uc_mcontext->__ss.__sp);
                 ocerz_recov_note(1, jrip);
@@ -1981,7 +1982,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (pvm && ocerz_jit_pc_in_arena(pvm, hpc)) {
             int hp = ocerz_jit_hotpatch_align(pvm, hpc);
             if (hp) {
-                if (getenv("OCERZ_ALFAULTLOG"))
+                if (ENV_SET("OCERZ_ALFAULTLOG"))
                     fprintf(stderr, "ocerz: ALFAULT hotpatch=%d hpc=%p addr=%p\n", hp, hpc, si->si_addr);
                 return;
             }
@@ -2003,7 +2004,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 g_cur_cpu->rip = jrip;
                 g_cur_cpu->sig_repeat = 0;
                 g_cur_cpu->interp_once = 1;
-                if (getenv("OCERZ_ALFAULTLOG"))
+                if (ENV_SET("OCERZ_ALFAULTLOG"))
                     fprintf(stderr, "ocerz: ALFAULT[%d] rip=%#llx addr=%p\n", (int)getpid(), (unsigned long long)jrip, si->si_addr);
                 ocerz_recov_note(2, jrip);
                 depth = 0;
@@ -2043,7 +2044,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             }
             if (armed_hit != 2)
                 ocerz_jit_invalidate_range(fvm, page, OCERZ_HOST_PAGE_SIZE);
-            if (getenv("OCERZ_CACHEPATCHLOG"))
+            if (ENV_SET("OCERZ_CACHEPATCHLOG"))
                 fprintf(stderr, "ocerz: CACHEPATCH[%d] rip=%#llx addr=%p injit=%d\n",
                         (int)getpid(), (unsigned long long)jrip, si->si_addr, in_jit);
             if (in_jit) {
@@ -2303,7 +2304,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             g_cur_cpu->rip = fault_rip;
             g_cur_cpu->sig_repeat = 0;
             g_cur_cpu->interp_once = 1;
-            if (getenv("OCERZ_CPFAULTLOG")) {
+            if (ENV_SET("OCERZ_CPFAULTLOG")) {
                 fprintf(stderr, "ocerz: CPFAULT rip=%#llx gaddr=%#llx\n", (unsigned long long)fault_rip, (unsigned long long)gaddr);
                 ocerz_cpu_dump(g_cur_cpu, stderr);
             }
@@ -4178,7 +4179,7 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
         break;
     default:
         esc_r = 0;
-        if (getenv("OCERZ_CPUREG_LOG")) {
+        if (ENV_SET("OCERZ_CPUREG_LOG")) {
             static _Atomic unsigned recov;
             fprintf(stderr, "ocerz: CPUREG recovery #%u (old code would leak a dangling entry here)\n",
                     ++recov);
