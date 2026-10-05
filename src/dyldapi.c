@@ -37,8 +37,14 @@
  *
  * libsystem_platform's string and memory routines get two kinds of special
  * treatment from the translator, and this file is where it learns which code
- * they are.  The image's function starts are read once, and the exported names
- * of memmove, strlen and the rest are resolved in it.  Some of those exports
+ * they are.  The image's function starts are read once, and the names
+ * memmove, strlen and the rest are resolved from libSystem, as a program binds
+ * them, keeping the answers that land in libsystem_platform's text.  Resolving
+ * them in libsystem_platform itself only worked while it had an upward link to
+ * libSystem: macOS 26.7's has none and exports __platform_memmove and the
+ * like, which libsystem_c re-exports under the plain names, so every lookup
+ * missed, the translator answered none of them in place and none was
+ * translated with plain accesses.  Some of those exports
  * are the routine itself; others are a six-byte jump through a pointer the
  * library fills in with the variant it chose for the processor, and for those
  * the pointer is read when the question is asked, never the stub's enclosing
@@ -1778,9 +1784,10 @@ static void memfn_build(void)
     }
     g_memfn_starts = starts;
     g_memfn_nstarts = starts ? n : 0;
+    uint64_t sys = cache_find_path(g_cache, "/usr/lib/libSystem.B.dylib");
     for (size_t k = 0; g_memfn_nstarts && k < sizeof g_memfn_names / sizeof g_memfn_names[0]; k++) {
         int found = 0;
-        uint64_t a = ocerz_cache_resolve_from_image(g_cache, mh, g_memfn_names[k], &found);
+        uint64_t a = ocerz_cache_resolve_from_image(g_cache, sys ? sys : mh, g_memfn_names[k], &found);
         if (!found || a < g_memfn_text_lo || a + 6 > g_memfn_text_hi)
             continue;
         for (size_t q = 0; q < sizeof g_leaf_names / sizeof g_leaf_names[0]; q++)
