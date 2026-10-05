@@ -430,7 +430,10 @@
 # NSLog is a format veneer and NSLogv takes the guest's va_list.
 # _NSDictionaryOfVariableBindings, behind AppKit's NSDictionaryOfVariableBindings
 # macro, takes one variadic object per comma-separated key in its first
-# argument, which its handler reads before calling the host.  NSFrameAddress,
+# argument, which its handler reads before calling the host.
+# NSGetUncaughtExceptionHandler answers a function, the guest's own handler
+# when NSSetUncaughtExceptionHandler installed a callback onto it, so it is
+# special too.  NSFrameAddress,
 # NSReturnAddress and NSCountFrames walk the calling thread's native frames,
 # which are ocerz's and not the guest's, so they name themselves the way the
 # unwinding calls in libSystem do.
@@ -1045,7 +1048,9 @@ special _method_getImplementation method_getImplementation
 stub _class_replaceMethodsBulk override
 special _method_setImplementation method_setImplementation
 stub __method_setImplementationRawUnsafe override
-stub _imp_implementationWithBlock override
+special _imp_implementationWithBlock imp_implementationWithBlock
+special _imp_getBlock imp_getBlock
+special _imp_removeBlock imp_removeBlock
 fn _class_addIvar class_addIvar b(ppLBp)
 special _objc_allocateClassPair objc_allocateClassPair
 fn _objc_registerClassPair objc_registerClassPair v(p)
@@ -1096,6 +1101,7 @@ library /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
 special _NSLog NSLog
 special _NSLogv NSLogv
 special __NSDictionaryOfVariableBindings dictionary_of_variable_bindings
+special _NSGetUncaughtExceptionHandler NSGetUncaughtExceptionHandler
 stub _NSFrameAddress override
 stub _NSReturnAddress override
 stub _NSCountFrames override

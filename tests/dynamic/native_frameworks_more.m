@@ -2,6 +2,7 @@
 #import <Network/Network.h>
 #import <Security/SecureTransport.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <objc/runtime.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -153,6 +154,65 @@ static void collections(void)
     CFRelease(heap);
 }
 
+@protocol BlockMethods
+- (NSInteger)addTo:(NSInteger)x;
+- (NSRect)rectWithWidth:(CGFloat)w;
+@end
+
+@interface BlockHolder : NSObject
+@property NSInteger base;
+@end
+@implementation BlockHolder
+@end
+
+static void block_imps(void)
+{
+    Class cls = objc_allocateClassPair([BlockHolder class], "OcerzBlockMethods", 0);
+    __block int calls = 0;
+    IMP add = imp_implementationWithBlock(^NSInteger(BlockHolder *self, NSInteger x) {
+        calls++;
+        return self.base + x;
+    });
+    IMP rect = imp_implementationWithBlock(^NSRect(BlockHolder *self, CGFloat w) {
+        calls++;
+        return NSMakeRect(self.base, 2, w, w * 2);
+    });
+    class_addMethod(cls, @selector(addTo:), add, "q@:q");
+    class_addMethod(cls, @selector(rectWithWidth:), rect, "{CGRect={CGPoint=dd}{CGSize=dd}}@:d");
+    objc_registerClassPair(cls);
+    BlockHolder *h = [[cls alloc] init];
+    h.base = 40;
+    id<BlockMethods> d = (id<BlockMethods>)h;
+    NSInteger direct = [d addTo:2];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:[h methodSignatureForSelector:@selector(addTo:)]];
+    inv.selector = @selector(addTo:);
+    NSInteger arg = 5;
+    [inv setArgument:&arg atIndex:2];
+    [inv invokeWithTarget:h];
+    NSInteger invoked = 0;
+    [inv getReturnValue:&invoked];
+    NSRect r = [d rectWithWidth:3];
+    id got = imp_getBlock(add);
+    BOOL removed = imp_removeBlock(rect);
+    printf("block imps direct=%ld invoked=%ld rect=%.0f,%.0f,%.0f,%.0f calls=%d getBlock=%d removed=%d\n", (long)direct,
+           (long)invoked, r.origin.x, r.origin.y, r.size.width, r.size.height, calls, got != nil, removed);
+}
+
+static void on_uncaught(NSException *e)
+{
+    (void)e;
+}
+
+static void uncaught_handlers(void)
+{
+    NSUncaughtExceptionHandler *before = NSGetUncaughtExceptionHandler();
+    NSSetUncaughtExceptionHandler(on_uncaught);
+    NSUncaughtExceptionHandler *mine = NSGetUncaughtExceptionHandler();
+    NSSetUncaughtExceptionHandler(before);
+    printf("uncaught handler before=%d mine=%d restored=%d\n", before != NULL, mine == on_uncaught,
+           NSGetUncaughtExceptionHandler() == before);
+}
+
 static void bindings(void)
 {
     NSString *one = @"1", *two = @"2", *three = @"3";
@@ -190,6 +250,8 @@ int main(void)
         collections();
         frameworks();
         bindings();
+        block_imps();
+        uncaught_handlers();
     }
     return 0;
 }
