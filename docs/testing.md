@@ -103,6 +103,16 @@ The component suites inside the unit phase, as last counted in September 2026
 | in-place string and memory routines against the host's | 6,736,902 / 0 |
 | xbench output against native | 15 / 15 kernels bit-identical |
 
+## Continuous integration
+
+`.github/workflows/ci.yml` checks every commit pushed to any branch on GitHub's
+Apple silicon macOS 26 runners, and pull requests from forks. One job builds
+ocerz and runs the unit harnesses; a second, which starts only when the first
+passes, runs `make check`. A gate that skips because its prerequisites are
+missing exits zero, so the second job lists each `SKIP` line it saw as a
+warning and in the run's summary: a green run with skips has not exercised those
+gates. Nothing is cancelled when a newer commit arrives.
+
 ## Conventions
 
 The test binaries under `tests/guest/bin` and `tests/unit/bin` are committed,

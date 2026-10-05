@@ -1,0 +1,116 @@
+# Runs the repository's own gates on every commit pushed to any branch, and on
+# pull requests from forks, whose pushes never reach this repository's runs.
+# A pull request from a branch of this repository is not run a second time: its
+# commits were already checked by the push that created them, and the check on
+# the head commit is the same one the pull request shows.
+#
+# AArchX emits arm64 code and links the macOS SDK, so nothing here can run on
+# Linux or on an Intel Mac; both jobs use GitHub's Apple silicon runner image
+# for macOS 26, the oldest release the project is developed and tested on.
+#
+# There are two jobs. `unit` builds ocerz and runs the unit harnesses, which
+# takes a few minutes and tells a contributor at once whether the tree still
+# builds and the translator's components still agree with their own checks.
+# `check` runs `make check`, the full set of gates that CONTRIBUTING.md says
+# must be green before a change is sent: the unit harnesses again, the guest
+# suite under the interpreter and under the JIT, the x86-64 and i386
+# differential gates, the dynamic suite, and the native suites. It waits for
+# `unit` so that a broken build does not spend half an hour finding that out.
+# Each commit gets its own runs and nothing is cancelled when a newer commit
+# arrives, because the point is a verdict for every commit, not only the last.
+#
+# `make check` builds first and tests second. The build is done here with all
+# the cores, then `make check` finds everything up to date and runs the gates
+# one after another, because the dynamic suite is timing-sensitive under load
+# and must not share the machine with a build.
+#
+# Rosetta is installed on the runner because the dynamic and native gates bind
+# guest programs against the x86-64 shared cache that its package ships;
+# AArchX maps that file and never runs Rosetta's translator. A gate whose
+# prerequisites are missing prints SKIP and exits zero rather than failing, so
+# the `check` job lists every SKIP line it saw as a warning on the run and in
+# its summary; a run that is green with skips has not exercised those gates.
+# The i386 conformance report against capstone is a progress measure, not a
+# gate, and is not part of `make check`, so it is not run here.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OCERZ_TCACHE: "off"
+
+jobs:
+  unit:
+    name: build and unit harnesses
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcrun --show-sdk-version
+          clang --version
+
+      - name: Build ocerz
+        run: make -j"$(sysctl -n hw.logicalcpu)" ocerz
+
+      - name: Print the version
+        run: ./ocerz version
+
+      - name: Unit harnesses
+        run: make unit
+
+  check:
+    name: make check
+    needs: unit
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: |
+          sw_vers
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          xcrun --show-sdk-version
+          clang --version
+
+      - name: Install Rosetta
+        run: |
+          sudo softwareupdate --install-rosetta --agree-to-license || echo "::warning::Rosetta did not install; the gates that need the x86-64 shared cache will skip"
+
+      - name: Build ocerz, the guest tests and the unit harnesses
+        run: make -j"$(sysctl -n hw.logicalcpu)" ocerz guest apis
+
+      - name: make check
+        shell: bash
+        run: make check 2>&1 | tee check.log
+
+      - name: Report skipped gates
+        if: always()
+        shell: bash
+        run: |
+          [ -f check.log ] || exit 0
+          skips=$(grep -E '(^|[^A-Za-z])SKIP' check.log | sort -u || true)
+          [ -n "$skips" ] || exit 0
+          {
+            echo "### Skipped gates"
+            echo
+            echo '```'
+            echo "$skips"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$skips" | while IFS= read -r line; do echo "::warning::$line"; done
