@@ -5,26 +5,35 @@
 # the head commit is the same one the pull request shows.
 #
 # AArchX emits arm64 code and links the macOS SDK, so nothing here can run on
-# Linux or on an Intel Mac; both jobs use GitHub's Apple silicon runner image
-# for macOS 26, the oldest release the project is developed and tested on.
+# Linux or on an Intel Mac. Both jobs use `xcode-27`, GitHub's Apple silicon
+# image for macOS 27 with Xcode 27, which is in public preview. The `macos-26`
+# image carries SDK 26.5, and on that `make apis` stops at a header only SDK 27
+# has, while test_apidb reads runtime/apis/macos/27.0, a directory only a run
+# against SDK 27 writes.
 #
-# There are two jobs. `unit` builds ocerz, generates the native-mode API
-# databases from the runner's own SDK because test_apidb reads them, and runs
-# the unit harnesses, which takes a few minutes and tells a contributor at once
-# whether the tree still builds and the translator's components still agree
-# with their own checks.
-# `check` runs `make check`, the full set of gates that CONTRIBUTING.md says
-# must be green before a change is sent: the unit harnesses again, the guest
-# suite under the interpreter and under the JIT, the x86-64 and i386
-# differential gates, the dynamic suite, and the native suites. It waits for
-# `unit` so that a broken build does not spend half an hour finding that out.
-# Each commit gets its own runs and nothing is cancelled when a newer commit
-# arrives, because the point is a verdict for every commit, not only the last.
+# There are two jobs, and they run side by side. `unit` builds ocerz, generates
+# the native-mode API databases and runs the unit harnesses, which takes a few
+# minutes and tells a contributor at once whether the tree still builds and the
+# translator's components still agree with their own checks. `check` is
+# `make check`, the gate that CONTRIBUTING.md says must be green before a change
+# is sent, taken one phase per step in the order its recipe runs them. A phase
+# that fails does not stop the ones after it, so one run says which of them
+# pass; a build that fails stops them all. The `phases` step fails the job when
+# the recipe in the Makefile names a phase this file does not run, so the two
+# cannot drift apart without a run saying so.
 #
 # `make check` builds first and tests second. The build is done here with all
-# the cores, then `make check` finds everything up to date and runs the gates
-# one after another, because the dynamic suite is timing-sensitive under load
-# and must not share the machine with a build.
+# the cores, then every phase finds everything up to date, because the dynamic
+# suite is timing-sensitive under load and must not share the machine with a
+# build.
+#
+# A hosted runner is a three-core virtual machine, and a few dynamic cases rely
+# on what a virtual machine may not provide: a Metal device that computes, a
+# kernel whose ntp_gettime works. The dynamic runner builds those cases natively
+# as well and skips a case, saying so, when the machine's own run of it fails,
+# so what is skipped is what the machine cannot do and a failure that only ocerz
+# shows still fails. The slower machine also gets a longer limit for each
+# dynamic case, 120 seconds against the 30 it has by default.
 #
 # Rosetta is installed on the runner because the dynamic and native gates bind
 # guest programs against the x86-64 shared cache that its package ships;
@@ -34,6 +43,9 @@
 # its summary; a run that is green with skips has not exercised those gates.
 # The i386 conformance report against capstone is a progress measure, not a
 # gate, and is not part of `make check`, so it is not run here.
+#
+# Each commit gets its own runs and nothing is cancelled when a newer commit
+# arrives, because the point is a verdict for every commit, not only the last.
 
 name: ci
 
@@ -62,7 +74,6 @@ jobs:
           sw_vers
           uname -m
           xcode-select -p
-          ls -d /Applications/Xcode*
           xcodebuild -showsdks
           xcrun --show-sdk-version
           clang --version
@@ -80,13 +91,28 @@ jobs:
         run: make unit
 
   check:
-    name: make check
-    needs: unit
+    name: make check, phase by phase
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: xcode-27
     timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      OCERZ_DYNAMIC_TIMEOUT: "120"
     steps:
       - uses: actions/checkout@v4
+
+      - name: The phases are the ones make check runs
+        run: |
+          missing=0
+          while IFS= read -r cmd; do
+            if ! grep -qF "run: $cmd 2>&1" .github/workflows/ci.yml; then
+              echo "::error::make check runs '$cmd' and ci.yml does not"
+              missing=1
+            fi
+          done < <(awk '/^check:/ { f = 1; next } f && /^\t/ { sub(/^\t/, ""); print; next } f { exit }' Makefile | grep '^bash ')
+          exit $missing
 
       - name: Show the toolchain
         run: |
@@ -94,7 +120,6 @@ jobs:
           uname -m
           sysctl -n machdep.cpu.brand_string
           xcode-select -p
-          ls -d /Applications/Xcode*
           xcodebuild -showsdks
           xcrun --show-sdk-version
           clang --version
@@ -103,16 +128,60 @@ jobs:
         run: |
           sudo softwareupdate --install-rosetta --agree-to-license || echo "::warning::Rosetta did not install; the gates that need the x86-64 shared cache will skip"
 
-      - name: Build ocerz, the guest tests and the unit harnesses
+      - name: Build ocerz, the guest tests and the API databases
+        id: build
         run: make -j"$(sysctl -n hw.logicalcpu)" ocerz guest apis
 
-      - name: make check
-        shell: bash
-        run: make check 2>&1 | tee check.log
+      - name: Unit harnesses
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: make unit 2>&1 | tee -a check.log
+
+      - name: Guest suite, interpreted
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_guest_tests.sh --no-jit 2>&1 | tee -a check.log
+
+      - name: Guest suite, translated
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_guest_tests.sh 2>&1 | tee -a check.log
+
+      - name: x86-64 differential
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_diff_test.sh 2>&1 | tee -a check.log
+
+      - name: i386 differential
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_diff32.sh . 2>&1 | tee -a check.log
+
+      - name: Dynamic suite
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_dynamic_tests.sh 2>&1 | tee -a check.log
+
+      - name: Native suite
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_native_tests.sh 2>&1 | tee -a check.log
+
+      - name: Guest library suite
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_guest_library_tests.sh 2>&1 | tee -a check.log
+
+      - name: Native C++ suite
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_native_cxx_tests.sh 2>&1 | tee -a check.log
+
+      - name: Native framework suite
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_native_framework_tests.sh 2>&1 | tee -a check.log
+
+      - name: Native format suite
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_native_format_tests.sh 2>&1 | tee -a check.log
+
+      - name: Native Swift suite
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: bash tests/run_native_swift_tests.sh 2>&1 | tee -a check.log
 
       - name: Report skipped gates
         if: always()
-        shell: bash
         run: |
           [ -f check.log ] || exit 0
           skips=$(grep -E '(^|[^A-Za-z])SKIP' check.log | sort -u || true)
