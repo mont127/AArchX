@@ -2909,6 +2909,71 @@ int ocerz_objc_guard_landed(struct _Unwind_Exception *ue, void **caught)
     abort();
 }
 
+typedef struct ObVarBindings {
+    const void *fn;
+    OcerzAbiCall *call;
+    const uint64_t *slots;
+    int nslots;
+} ObVarBindings;
+
+static void ob_var_bindings_body(void *ctx)
+{
+    ObVarBindings *b = ctx;
+    ocerz_abi_call_native(b->fn, b->call->x, b->call->v, b->slots, 8 * (uint64_t)b->nslots, NULL, b->call->rx,
+                          b->call->rv);
+}
+
+/* _NSDictionaryOfVariableBindings(keys, first, ...), which the
+   NSDictionaryOfVariableBindings macro calls with one value per
+   comma-separated key and a nil after them.  Its variadic values go to the
+   host on arm64's stack, one per key after the first, up to and including the
+   first nil, which is as far as the host reads: it raises when a key's value is
+   nil, and that exception is thrown on into the guest. */
+int ocerz_objc_dictionary_of_variable_bindings(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static ObSym sym = OB_SYM(OCERZ_OBJC_FOUNDATION, "_NSDictionaryOfVariableBindings");
+    void *fn = ob_need(&sym);
+    OcerzAbiSig named;
+    OcerzAbiCall call;
+    OcerzAbiVaList va;
+    if (ocerz_abi_parse("p(pp)", &named) != OCERZ_OK || ocerz_abi_read_guest(&named, cpu, &call) != OCERZ_OK ||
+        ocerz_abi_va_start(&named, cpu, &va) != OCERZ_OK)
+        ob_stop("_NSDictionaryOfVariableBindings could not read its arguments");
+    ObText keys;
+    ob_text((void *)(uintptr_t)call.x[0], &keys, "_NSDictionaryOfVariableBindings");
+    int nkeys = 1;
+    for (const char *c = keys.s; *c; c++)
+        nkeys += *c == ',';
+    ob_text_free(&keys);
+    uint64_t slots[OCERZ_OBJC_VARIADIC_MAX];
+    int n = 0;
+    int ended = call.x[1] == 0;
+    while (!ended && n + 1 < nkeys) {
+        if (n == OCERZ_OBJC_VARIADIC_MAX - 1)
+            ob_stop("_NSDictionaryOfVariableBindings names more than %d keys", OCERZ_OBJC_VARIADIC_MAX - 1);
+        uint64_t w = 0;
+        ocerz_abi_va_arg(&va, cpu, 'p', &w);
+        slots[n++] = (uint64_t)(uintptr_t)(w ? ocerz_g2h(w) : NULL);
+        ended = w == 0;
+    }
+    slots[n++] = 0;
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, OCERZ_OBJC_FOUNDATION, "__NSDictionaryOfVariableBindings", "p(pp)", fn);
+    ObVarBindings b = { fn, &call, slots, n };
+    void *raised = NULL;
+    if (ob_eh()) {
+        if (ocerz_objc_guarded(ob_var_bindings_body, &b, &raised)) {
+            ocerz_bridge_lower(&outer);
+            return ob_eh_throw(vm, cpu, raised ? ocerz_h2g(raised) : 0, 1);
+        }
+    } else {
+        ob_var_bindings_body(&b);
+    }
+    ocerz_bridge_lower(&outer);
+    ocerz_abi_write_result(&named, cpu, &call);
+    return ob_settle(vm, cpu);
+}
+
 int ocerz_objc_realizeClassFromSwift(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t cls = cpu->gpr[OCERZ_RDI], previously = cpu->gpr[OCERZ_RSI];

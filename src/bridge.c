@@ -2033,6 +2033,7 @@ static const BrHandler g_br_handlers[] = {
     { "class_replaceMethod",        ocerz_objc_class_replaceMethod },
     { "objc_setExceptionPreprocessor", ocerz_objc_setExceptionPreprocessor },
     { "objc_exception_throw", ocerz_objc_exception_throw },
+    { "dictionary_of_variable_bindings", ocerz_objc_dictionary_of_variable_bindings },
     { "objc_exception_rethrow", ocerz_objc_exception_rethrow },
     { "objc_begin_catch", ocerz_objc_begin_catch },
     { "objc_end_catch", ocerz_objc_end_catch },

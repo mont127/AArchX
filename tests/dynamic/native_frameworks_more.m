@@ -153,6 +153,21 @@ static void collections(void)
     CFRelease(heap);
 }
 
+static void bindings(void)
+{
+    NSString *one = @"1", *two = @"2", *three = @"3";
+    NSArray *dicts = @[ NSDictionaryOfVariableBindings(one), NSDictionaryOfVariableBindings(one, two, three),
+                        _NSDictionaryOfVariableBindings(@"  x ,y,   z  ", one, two, three, nil),
+                        _NSDictionaryOfVariableBindings(@"p,q", one, two, three, nil) ];
+    printf("bindings");
+    for (NSDictionary *d in dicts) {
+        printf(" %lu:", (unsigned long)d.count);
+        for (NSString *k in [[d allKeys] sortedArrayUsingSelector:@selector(compare:)])
+            printf("%s=%s,", k.UTF8String, [d[k] UTF8String]);
+    }
+    printf("\n");
+}
+
 static void frameworks(void)
 {
     UTType *png = [UTType typeWithFilenameExtension:@"png"];
@@ -174,6 +189,7 @@ int main(void)
         locale_formats();
         collections();
         frameworks();
+        bindings();
     }
     return 0;
 }
