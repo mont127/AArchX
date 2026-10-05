@@ -2,13 +2,12 @@ library /System/Library/Frameworks/ScreenCaptureKit.framework/Versions/A/ScreenC
 sdk macos 27.0
 exports 209
 fn 0
-data 117
+data 120
 var 0
 special 0
-stub no-declaration 64
-omit no-declaration-missing 15
-omit swift 13
-host-missing 11
+stub no-declaration 74
+omit swift 15
+host-missing 0
 objc-classes 51
 objc-eh-types 0
 objc-ivars 0

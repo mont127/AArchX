@@ -1,12 +1,11 @@
 library /System/Library/Frameworks/CoreMediaIO.framework/Versions/A/CoreMediaIO
 sdk macos 27.0
 exports 381
-fn 20
+fn 23
 data 226
 var 0
 special 0
 stub no-declaration 132
-stub struct-layout 3
 host-missing 1
 objc-classes 13
 objc-eh-types 0

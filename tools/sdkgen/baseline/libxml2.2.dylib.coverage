@@ -1,13 +1,13 @@
 library /usr/lib/libxml2.2.dylib
 sdk macos 27.0
 exports 1683
-fn 1209
+fn 1214
 data 47
 var 0
 special 0
 stub callback-pointer 14
-stub callback-result 13
-stub callback-struct 315
+stub callback-result 1
+stub callback-struct 322
 stub no-declaration 47
 stub va-list 14
 stub variadic 24

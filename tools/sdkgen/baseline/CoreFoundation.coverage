@@ -1,23 +1,22 @@
 library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
 sdk macos 27.0
 exports 3098
-fn 786
-data 1233
-var 0
-special 3
-stub callback-result 2
-stub callback-struct 30
-stub no-declaration 1020
+fn 803
+data 1232
+var 1
+special 9
+stub callback-struct 17
+stub no-declaration 1018
 stub too-many-args 1
-stub va-list 3
-stub variadic 5
+stub va-list 1
+stub variadic 1
 omit objc-ivar 15
 host-missing 0
 objc-classes 41
 objc-eh-types 1
 objc-ivars 15
 ld-pseudo-skipped 17
-overrides 8
-override-shapes 8
-override-structs 10
+overrides 17
+override-shapes 16
+override-structs 24
 override-opaque 0

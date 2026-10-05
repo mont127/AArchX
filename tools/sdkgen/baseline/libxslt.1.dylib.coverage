@@ -1,13 +1,12 @@
 library /usr/lib/libxslt.1.dylib
 sdk macos 27.0
 exports 251
-fn 69
+fn 71
 data 12
 var 0
 special 0
-stub callback-result 6
-stub callback-struct 77
-stub nested-callback 1
+stub callback-struct 80
+stub nested-callback 2
 stub no-declaration 82
 stub variadic 4
 host-missing 0

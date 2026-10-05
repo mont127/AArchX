@@ -2,13 +2,12 @@ library /System/Library/Frameworks/AutomaticAssessmentConfiguration.framework/Ve
 sdk macos 27.0
 exports 45
 fn 0
-data 34
+data 36
 var 0
 special 0
-stub no-declaration 2
-omit no-declaration-missing 7
-omit swift 2
-host-missing 23
+stub no-declaration 6
+omit swift 3
+host-missing 0
 objc-classes 6
 objc-eh-types 0
 objc-ivars 0

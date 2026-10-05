@@ -2,13 +2,13 @@ library /System/Library/Frameworks/Speech.framework/Versions/A/Speech
 sdk macos 27.0
 exports 3731
 fn 0
-data 260
+data 262
 var 0
 special 0
-stub no-declaration 1474
-omit no-declaration-missing 479
-omit swift 1518
-host-missing 18
+stub no-declaration 1703
+omit no-declaration-missing 40
+omit swift 1726
+host-missing 0
 objc-classes 85
 objc-eh-types 0
 objc-ivars 0

@@ -2,13 +2,12 @@ library /usr/lib/libxar.1.dylib
 sdk macos 27.0
 exports 210
 fn 81
-data 4
+data 6
 var 0
 special 0
-stub no-declaration 120
+stub no-declaration 121
 stub struct-layout 1
 stub variadic 1
-omit no-declaration-missing 3
 host-missing 0
 objc-classes 0
 objc-eh-types 0

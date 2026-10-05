@@ -2,11 +2,10 @@ library /System/Library/Frameworks/LocalAuthenticationEmbeddedUI.framework/Versi
 sdk macos 27.0
 exports 39
 fn 0
-data 18
+data 19
 var 0
 special 0
 stub no-declaration 11
-omit no-declaration-missing 1
 omit swift 9
 host-missing 0
 objc-classes 5

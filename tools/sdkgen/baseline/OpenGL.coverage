@@ -1,11 +1,11 @@
 library /System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL
 sdk macos 27.0
 exports 1438
-fn 52
+fn 1296
 data 1
 var 0
 special 0
-stub no-declaration 1385
+stub no-declaration 141
 host-missing 0
 objc-classes 0
 objc-eh-types 0

@@ -2,13 +2,12 @@ library /System/Library/Frameworks/AVRouting.framework/Versions/A/AVRouting
 sdk macos 27.0
 exports 374
 fn 0
-data 288
+data 315
 var 0
 special 0
-stub no-declaration 50
-omit no-declaration-missing 32
+stub no-declaration 55
 omit objc-ivar 4
-host-missing 8
+host-missing 0
 objc-classes 52
 objc-eh-types 0
 objc-ivars 4

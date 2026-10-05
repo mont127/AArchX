@@ -2,14 +2,13 @@ library /System/Library/Frameworks/CoreTelephony.framework/Versions/A/CoreTeleph
 sdk macos 27.0
 exports 2744
 fn 0
-data 1927
+data 1957
 var 0
 special 0
-stub no-declaration 638
-omit no-declaration-missing 100
+stub no-declaration 696
 omit objc-ivar 33
-omit swift 46
-host-missing 48
+omit swift 58
+host-missing 0
 objc-classes 275
 objc-eh-types 0
 objc-ivars 33

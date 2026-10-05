@@ -7,7 +7,7 @@ var 0
 special 0
 stub callback-struct 60
 stub complex 24
-stub no-declaration 5981
+stub no-declaration 6005
 stub no-prototype 5
 stub struct-bitfield 81
 stub struct-callback 5
@@ -15,8 +15,7 @@ stub struct-too-many-members 1
 stub too-many-args 1006
 stub variadic 6
 stub vector 95
-omit no-declaration-missing 24
-host-missing 16
+host-missing 0
 objc-classes 0
 objc-eh-types 0
 objc-ivars 0

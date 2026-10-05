@@ -2,14 +2,14 @@ library /System/Library/Frameworks/GameKit.framework/Versions/A/GameKit
 sdk macos 27.0
 exports 6948
 fn 0
-data 1864
+data 1875
 var 0
 special 0
-stub no-declaration 2693
-omit no-declaration-missing 98
+stub no-declaration 2694
+omit no-declaration-missing 85
 omit objc-ivar 81
-omit swift 2212
-host-missing 2
+omit swift 2213
+host-missing 0
 objc-classes 491
 objc-eh-types 0
 objc-ivars 81
