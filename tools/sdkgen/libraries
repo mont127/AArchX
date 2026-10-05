@@ -153,6 +153,8 @@ pass IOSurface.h
 
 library Accelerate /System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate System/Library/Frameworks/Accelerate.framework/Accelerate.tbd
 pass Accelerate.h
+pass Accelerate.h -DACCELERATE_NEW_LAPACK
+pass Accelerate.h -DACCELERATE_NEW_LAPACK -DACCELERATE_LAPACK_ILP64
 
 library ApplicationServices /System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices System/Library/Frameworks/ApplicationServices.framework/ApplicationServices.tbd
 pass ApplicationServices.h

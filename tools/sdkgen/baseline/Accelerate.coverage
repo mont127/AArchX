@@ -1,21 +1,22 @@
 library /System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate
 sdk macos 27.0
 exports 14315
-fn 3023
+fn 7019
 data 8
 var 0
 special 0
 stub callback-struct 60
 stub complex 24
-stub no-declaration 10749
+stub no-declaration 5981
 stub no-prototype 5
 stub struct-bitfield 81
 stub struct-callback 5
 stub struct-too-many-members 1
-stub too-many-args 262
-stub variadic 2
+stub too-many-args 1006
+stub variadic 6
 stub vector 95
-host-missing 0
+omit no-declaration-missing 24
+host-missing 16
 objc-classes 0
 objc-eh-types 0
 objc-ivars 0
