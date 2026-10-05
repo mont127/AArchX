@@ -1284,7 +1284,10 @@
 # translator said it put a routine at the head of, which must be the nine
 # entries behind libsystem_platform's ten names, for the same reason: memcpy
 # and memmove are one routine at one address there. Counting log lines instead
-# passed only while something retranslated one of them. sys_strings_fault
+# passed only while something retranslated one of them. That run has the
+# translation cache off: case_sys's own cache run has stored those blocks by
+# then, and a block loaded from the store is never translated, so whether the
+# count was nine or zero depended on what the store held. sys_strings_fault
 # runs each routine into a page it may not touch, from a caller that first puts
 # known values in rbx and r12 to r15, with a handler that leaves by siglongjmp.
 # It has no -no-jit run, because there the call crosses and a fault inside a
@@ -14825,7 +14828,8 @@ case_sys_strings_inplace() {
     if [ -n "$missing" ]; then
         reason="the translator did not answer$missing in place, so sys_strings passed on the ordinary crossing and says nothing about the routines in src/leaf.s"
     elif [ "$CACHE_OK" -eq 1 ]; then
-        run_bounded "$TMP/$name.cache.out" "$TMP/$name.cache.err" "$OCERZ" -v -cache "$SYS_STRINGS_BIN"
+        run_bounded "$TMP/$name.cache.out" "$TMP/$name.cache.err" env OCERZ_TCACHE=off \
+            "$OCERZ" -v -cache "$SYS_STRINGS_BIN"
         entries="$(grep '^ocerz: jit: the routine at 0x[0-9a-f]* is answered in place$' "$TMP/$name.cache.err" | sort -u | wc -l | tr -d ' ')"
         if [ "$entries" -lt 9 ]; then
             reason="cache mode answered $entries of the nine entries behind libsystem_platform's ten routines in place, so its sys_strings run exercised Apple's x86 code and not src/leaf.s"
