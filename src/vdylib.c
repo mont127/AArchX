@@ -538,8 +538,14 @@ static void vd_fill_gss_oid_set_ptr(uint64_t slot, uint32_t size, const char *in
         ocerz_st(slot, 8, g);
 }
 
+static void vd_fill_zero(uint8_t *slot, uint32_t size)
+{
+    memset(slot, 0, size);
+}
+
 static const VdFiller g_vd_fillers[] = {
     { "stack_guard", vd_fill_stack_guard, NULL },
+    { "zero", vd_fill_zero, NULL },
     { "page_size", vd_fill_page_size, NULL },
     { "page_mask", vd_fill_page_mask, NULL },
     { "page_shift", vd_fill_page_shift, NULL },
