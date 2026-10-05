@@ -1672,15 +1672,16 @@ static int br_cf_calendar_difference(struct OcerzVM *vm, OcerzCPU *cpu)
 
 #define BR_COREGRAPHICS "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics"
 
-/* A constructor whose callback structure no shape can describe: a copy of the
+/* A constructor whose callback structure no shape can describe, having no
+   version word or arriving where no struct record looks: a copy of the
    guest's structure on this stack, each function word bound to a callback,
    goes to the host in its place, which the constructor copies in turn. */
-static int br_struct_cross(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *name,
-                           const char *notation, int reg, const char *const *words, int nwords)
+static int br_struct_cross(struct OcerzVM *vm, OcerzCPU *cpu, const char *lib, void *_Atomic *cache,
+                           const char *name, const char *notation, int reg, const char *const *words, int nwords)
 {
     void *fn = *cache;
     if (!fn) {
-        fn = ocerz_bridge_host_symbol(BR_COREGRAPHICS, name);
+        fn = ocerz_bridge_host_symbol(lib, name);
         if (!fn) {
             fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", name);
             exit(OCERZ_BRIDGE_UNIMPL_EXIT);
@@ -1707,7 +1708,7 @@ static int br_struct_cross(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cac
         cpu->gpr[reg] = ocerz_h2g(copy);
     }
     struct OcerzBridgeFrame outer;
-    ocerz_bridge_raise(&outer, BR_COREGRAPHICS, name, notation, fn);
+    ocerz_bridge_raise(&outer, lib, name, notation, fn);
     int rc = ocerz_abi_perform(&sig, fn, cpu);
     ocerz_bridge_lower(&outer);
     if (rc != OCERZ_STEP_OK)
@@ -1719,14 +1720,94 @@ static int br_cg_data_consumer_create(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     static void *_Atomic fn;
     static const char *const words[2] = { "L(ppL)", "v(p)" };
-    return br_struct_cross(vm, cpu, &fn, "CGDataConsumerCreate", "p(pp)", OCERZ_RSI, words, 2);
+    return br_struct_cross(vm, cpu, BR_COREGRAPHICS, &fn, "CGDataConsumerCreate", "p(pp)", OCERZ_RSI, words, 2);
 }
 
 static int br_cg_pattern_create(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     static void *_Atomic fn;
     static const char *const words[3] = { NULL, "v(pp)", "v(p)" };
-    return br_struct_cross(vm, cpu, &fn, "CGPatternCreate", "p(p{{dd}{dd}}{dddddd}ddiBp)", OCERZ_RCX, words, 3);
+    return br_struct_cross(vm, cpu, BR_COREGRAPHICS, &fn, "CGPatternCreate", "p(p{{dd}{dd}}{dddddd}ddiBp)",
+                           OCERZ_RCX, words, 3);
+}
+
+/* CoreMedia's CMBlockBufferCustomBlockSource is under pack(4) on both
+   architectures: a 32-bit version, then AllocateBlock at offset 4 and
+   FreeBlock at 12, so its function pointers are at no word boundary a shape
+   names.  The copy keeps that layout and binds the two by offset. */
+#define BR_COREMEDIA "/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia"
+#define BR_BLOCK_SOURCE_BYTES 28
+
+static int br_block_source_cross(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *name,
+                                 const char *notation, int reg)
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(BR_COREMEDIA, name);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", name);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    OcerzAbiSig sig;
+    if (ocerz_abi_parse(notation, &sig) != OCERZ_OK) {
+        fprintf(stderr, "ocerz: bridge: _%s has a notation ocerz cannot parse\n", name);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    static const struct {
+        unsigned at;
+        const char *notation;
+    } fields[2] = { { 4, "p(pL)" }, { 12, "v(ppL)" } };
+    uint8_t copy[BR_BLOCK_SOURCE_BYTES + 4];
+    uint64_t at = cpu->gpr[reg];
+    if (at) {
+        memcpy(copy, ocerz_g2h(at), BR_BLOCK_SOURCE_BYTES);
+        for (int k = 0; k < 2; k++) {
+            uint64_t v;
+            memcpy(&v, copy + fields[k].at, sizeof v);
+            if (v && ocerz_abi_is_guest_code(v) && ocerz_abi_callback_convert(v, fields[k].notation, &v) != OCERZ_OK) {
+                fprintf(stderr, "ocerz: bridge: _%s could not bind a guest function of its custom block source\n",
+                        name);
+                exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+            }
+            memcpy(copy + fields[k].at, &v, sizeof v);
+        }
+        cpu->gpr[reg] = ocerz_h2g(copy);
+    }
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_COREMEDIA, name, notation, fn);
+    int rc = ocerz_abi_perform(&sig, fn, cpu);
+    ocerz_bridge_lower(&outer);
+    if (rc != OCERZ_STEP_OK)
+        return rc;
+    return br_settle(vm, cpu);
+}
+
+static int br_cm_block_buffer_create_with_memory_block(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    return br_block_source_cross(vm, cpu, &fn, "CMBlockBufferCreateWithMemoryBlock", "i(ppLppLLup)", OCERZ_R8);
+}
+
+static int br_cm_block_buffer_append_memory_block(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    return br_block_source_cross(vm, cpu, &fn, "CMBlockBufferAppendMemoryBlock", "i(ppLppLLu)", OCERZ_R8);
+}
+
+static int br_cm_block_buffer_create_contiguous(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    return br_block_source_cross(vm, cpu, &fn, "CMBlockBufferCreateContiguous", "i(ppppLLup)", OCERZ_RCX);
+}
+
+static int br_vt_decompression_session_create(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    static const char *const words[2] = { "v(ppiup{liul}{liul})", NULL };
+    return br_struct_cross(vm, cpu, "/System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox", &fn,
+                           "VTDecompressionSessionCreate", "i(pppppp)", OCERZ_R8, words, 2);
 }
 
 #define BR_SECURITY "/System/Library/Frameworks/Security.framework/Versions/A/Security"
@@ -2151,6 +2232,10 @@ static const BrHandler g_br_handlers[] = {
     { "NSGetUncaughtExceptionHandler", ocerz_objc_NSGetUncaughtExceptionHandler },
     { "cg_data_consumer_create", br_cg_data_consumer_create },
     { "cg_pattern_create", br_cg_pattern_create },
+    { "vt_decompression_session_create", br_vt_decompression_session_create },
+    { "cm_block_buffer_create_with_memory_block", br_cm_block_buffer_create_with_memory_block },
+    { "cm_block_buffer_append_memory_block", br_cm_block_buffer_append_memory_block },
+    { "cm_block_buffer_create_contiguous", br_cm_block_buffer_create_contiguous },
     { "dictionary_of_variable_bindings", ocerz_objc_dictionary_of_variable_bindings },
     { "objc_exception_rethrow", ocerz_objc_exception_rethrow },
     { "objc_begin_catch", ocerz_objc_begin_catch },

@@ -1442,3 +1442,23 @@ library /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
 
 fn _AudioDeviceCreateIOProcID AudioDeviceCreateIOProcID i(uc{i(upppppp)}pp)
 fn _AudioDeviceCreateIOProcIDWithBlock AudioDeviceCreateIOProcIDWithBlock i(pupk{v(ppppp)})
+
+# VTDecompressionSessionCreate takes a VTDecompressionOutputCallbackRecord, a
+# callback and its refcon with no version word, so no shape describes it; its
+# handler converts a copy, which the session keeps (src/bridge.c).
+
+library /System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox
+
+special _VTDecompressionSessionCreate vt_decompression_session_create
+
+# CMBlockBufferCustomBlockSource is under pack(4), its two function pointers at
+# offsets 4 and 12, which no word-based shape can name.  CoreMedia copies it:
+# tested natively, a structure rewritten right after the constructor still had
+# the first set allocate and free the block.  Its three takers have handlers
+# that bind a copy by offset (src/bridge.c).
+
+library /System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia
+
+special _CMBlockBufferCreateWithMemoryBlock cm_block_buffer_create_with_memory_block
+special _CMBlockBufferAppendMemoryBlock cm_block_buffer_append_memory_block
+special _CMBlockBufferCreateContiguous cm_block_buffer_create_contiguous
