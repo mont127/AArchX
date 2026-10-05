@@ -170,7 +170,9 @@
  * raw word, most often the object or buffer the call is about.  Neither is
  * dereferenced, and no other argument is printed: the signature already says
  * what shape they were, and most of them are pointers into guest memory that a
- * log line has no business reading.
+ * log line has no business reading.  OCERZ_BRIDGELOG=2 also prints rax and rdx
+ * as the crossing returns, which is how a failing call is told from the calls
+ * around it when the program only reacts to the failure much later.
  *
  * ---- counting ----
  * Each descriptor carries its own crossing count, and every descriptor made is
@@ -2835,7 +2837,10 @@ const int *ocerz_bridge_depth_ptr(void)
 static int br_logging(void)
 {
     static int en = -1;
-    if (en < 0) en = getenv("OCERZ_BRIDGELOG") ? 1 : 0;
+    if (en < 0) {
+        const char *e = getenv("OCERZ_BRIDGELOG");
+        en = e ? (atoi(e) >= 2 ? 2 : 1) : 0;
+    }
     return en;
 }
 
@@ -2959,13 +2964,13 @@ int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu, const struct OcerzBri
                 fn->lib, fn->sym, fn->sig ? fn->sig : "(nothing)",
                 (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8), (unsigned long long)cpu->gpr[OCERZ_RDI]);
 
-    if (fn->special)
-        return fn->special(vm, cpu);
-
-    int rc = br_cross(fn, cpu);
-    if (rc != OCERZ_STEP_OK)
-        return rc;
-    return br_settle(vm, cpu);
+    int rc = fn->special ? fn->special(vm, cpu) : br_cross(fn, cpu);
+    if (rc == OCERZ_STEP_OK && !fn->special)
+        rc = br_settle(vm, cpu);
+    if (br_logging() == 2)
+        fprintf(stderr, "ocerz: BRIDGERET[%d] %s rax=%#llx rdx=%#llx rc=%d\n", (int)getpid(), fn->sym,
+                (unsigned long long)cpu->gpr[OCERZ_RAX], (unsigned long long)cpu->gpr[OCERZ_RDX], rc);
+    return rc;
 }
 
 static int br_row_cmp(const void *a, const void *b)
