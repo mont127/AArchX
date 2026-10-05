@@ -128,6 +128,12 @@ the runner's paravirtual GPU it passes natively and fails under ocerz, so it is
 not skipped. `OCERZ_DYNAMIC_TIMEOUT` sets the limit on each run of a dynamic
 case, 30 seconds when unset, and the workflow gives the slower machine 120.
 
+The native Swift suite compares a translated run with one native run, which
+means something only if native runs agree with each other. On the runner a wait
+on a walltime deadline asked for 25 ms took over 150 ms in about a quarter of
+native runs, and about as often under ocerz, so `native_dispatch_time` runs the
+native build twenty times first and is skipped, saying so, when they differ.
+
 ## Conventions
 
 The test binaries under `tests/guest/bin` and `tests/unit/bin` are committed,

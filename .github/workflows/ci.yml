@@ -36,8 +36,12 @@
 # ocerz alike. The dynamic runner builds the cases that depend on such things
 # natively as well and skips one, saying so, when the machine's own run of it
 # fails, so what is skipped is what the machine cannot do and a failure that
-# only ocerz shows still fails. The slower machine also gets a longer limit for
-# each dynamic case, 120 seconds against the 30 it has by default.
+# only ocerz shows still fails. The native Swift suite does the same for
+# native_dispatch_time, whose reference is one native run: a wait on a walltime
+# deadline here often takes several times as long as asked, natively too, and
+# the test is skipped when the native build's own runs disagree. The slower
+# machine also gets a longer limit for each dynamic case, 120 seconds against
+# the 30 it has by default.
 #
 # Rosetta is installed on the runner because the dynamic and native gates bind
 # guest programs against the x86-64 shared cache that its package ships;
