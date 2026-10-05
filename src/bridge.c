@@ -1670,6 +1670,124 @@ static int br_cf_calendar_difference(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_cf_calendar(vm, cpu, "CFCalendarGetComponentDifference", "B(pddLp)", 'p');
 }
 
+/* sqlite3_config and sqlite3_db_config take the arguments their op names, as
+   sqlite3.h lists them: none, integers, 64-bit integers, pointers, or a log
+   callback and its context.  Each op's classes are read from the guest in
+   order and handed to the host on arm64's stack, where its variadic
+   arguments go.  The ops that install a table of functions, the allocator,
+   mutex and page-cache methods, are refused by name. */
+#define BR_SQLITE "/usr/lib/libsqlite3.dylib"
+
+static const char *br_sqlite_config_args(int op, const char **callback)
+{
+    *callback = NULL;
+    switch (op) {
+    case 1: case 2: case 3: case 14: case 15:
+        return "";
+    case 6: case 7: case 8:
+        return "pii";
+    case 9: case 17: case 20: case 23: case 26: case 27: case 28:
+        return "i";
+    case 13:
+        return "ii";
+    case 16:
+        *callback = "v(pip)";
+        return "cp";
+    case 21:
+        *callback = "v(pppi)";
+        return "cp";
+    case 22:
+        return "ll";
+    case 24: case 30:
+        return "p";
+    case 25:
+        return "u";
+    case 29:
+        return "l";
+    case 4: case 5: case 10: case 11: case 18: case 19:
+        return NULL;
+    default:
+        return "";
+    }
+}
+
+static const char *br_sqlite_db_config_args(int op, const char **callback)
+{
+    *callback = NULL;
+    if (op == 1000)
+        return "p";
+    if (op == 1001)
+        return "pii";
+    if (op > 1001 && op <= 1023)
+        return "ip";
+    return "";
+}
+
+static int br_sqlite_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *name,
+                              const char *named_notation, int op_index,
+                              const char *(*classes_of)(int, const char **))
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(BR_SQLITE, name);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", name);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    OcerzAbiSig named;
+    OcerzAbiCall call;
+    OcerzAbiVaList va;
+    if (ocerz_abi_parse(named_notation, &named) != OCERZ_OK || ocerz_abi_read_guest(&named, cpu, &call) != OCERZ_OK ||
+        ocerz_abi_va_start(&named, cpu, &va) != OCERZ_OK)
+        return br_answer(vm, cpu, 1);
+    int op = (int)call.x[op_index];
+    const char *callback = NULL;
+    const char *classes = classes_of(op, &callback);
+    if (!classes) {
+        fprintf(stderr, "ocerz: bridge: %s _%s op %d installs a table of functions, which does not cross\n",
+                BR_SQLITE, name, op);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    uint64_t slots[4] = { 0 };
+    int n = 0;
+    for (const char *c = classes; *c; c++) {
+        uint64_t w = 0;
+        ocerz_abi_va_arg(&va, cpu, *c == 'c' ? 'p' : *c, &w);
+        if (*c == 'c' && w && ocerz_abi_callback_convert(w, callback, &w) != OCERZ_OK) {
+            fprintf(stderr, "ocerz: bridge: _%s op %d could not bind guest function %#llx\n", name, op,
+                    (unsigned long long)w);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        if (*c == 'p' || *c == 'c')
+            w = (uint64_t)(uintptr_t)(w ? ocerz_g2h(w) : NULL);
+        else if (*c == 'i')
+            w = (uint64_t)(int64_t)(int32_t)w;
+        else if (*c == 'u')
+            w = (uint32_t)w;
+        slots[n++] = w;
+    }
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_SQLITE, name, named_notation, fn);
+    ocerz_abi_call_native(fn, call.x, call.v, slots, 8 * (uint64_t)n, NULL, call.rx, call.rv);
+    ocerz_bridge_lower(&outer);
+    ocerz_abi_write_result(&named, cpu, &call);
+    return br_settle(vm, cpu);
+}
+
+static int br_sqlite3_config(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    return br_sqlite_variadic(vm, cpu, &fn, "sqlite3_config", "i(i)", 0, br_sqlite_config_args);
+}
+
+static int br_sqlite3_db_config(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    return br_sqlite_variadic(vm, cpu, &fn, "sqlite3_db_config", "i(pi)", 1, br_sqlite_db_config_args);
+}
+
 #define BR_COREGRAPHICS "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics"
 
 /* A constructor whose callback structure no shape can describe, having no
@@ -2233,6 +2351,8 @@ static const BrHandler g_br_handlers[] = {
     { "cg_data_consumer_create", br_cg_data_consumer_create },
     { "cg_pattern_create", br_cg_pattern_create },
     { "vt_decompression_session_create", br_vt_decompression_session_create },
+    { "sqlite3_config", br_sqlite3_config },
+    { "sqlite3_db_config", br_sqlite3_db_config },
     { "cm_block_buffer_create_with_memory_block", br_cm_block_buffer_create_with_memory_block },
     { "cm_block_buffer_append_memory_block", br_cm_block_buffer_append_memory_block },
     { "cm_block_buffer_create_contiguous", br_cm_block_buffer_create_contiguous },
