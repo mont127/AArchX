@@ -289,9 +289,9 @@ How far native mode reaches can be counted before anything runs. On a
 macOS 26.7.1 machine with 2,913 x86-64 executables and libraries, system tools,
 system applications and 57 third-party applications with their own frameworks
 among them, every import of each was matched against the API databases
-(2026-10-04): 2,073 bind completely, and 1,341 import nothing that is only a
-stub. Of the 1,260 belonging to third-party applications, 1,098 bind, and every
-binary of 35 of the 57 applications does. Of 84
+(2026-10-05): 2,094 bind completely, and 1,344 import nothing that is only a
+stub. Of the 1,260 belonging to third-party applications, 1,117 bind, and every
+binary of 36 of the 57 applications does, OBS among them. Of 84
 command-line tools run both ways, 71 print the same output and exit with the
 same status under native mode as their arm64 slices, sqlite3 and unzip among
 them. What

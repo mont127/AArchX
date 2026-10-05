@@ -7,6 +7,7 @@
 #include <glob.h>
 #include <malloc/malloc.h>
 #include <math.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,6 +240,60 @@ static void gss(void)
     printf(" released=%d\n", set == GSS_C_NO_BUFFER_SET);
 }
 
+typedef unsigned __int128 u128;
+typedef __int128 i128;
+
+static __attribute__((noinline)) u128 udiv128(u128 a, u128 b) { return a / b; }
+static __attribute__((noinline)) u128 umod128(u128 a, u128 b) { return a % b; }
+static __attribute__((noinline)) i128 sdiv128(i128 a, i128 b) { return a / b; }
+static __attribute__((noinline)) i128 smod128(i128 a, i128 b) { return a % b; }
+static __attribute__((noinline)) i128 fix128(double d) { return (i128)d; }
+static __attribute__((noinline)) u128 fixu128(double d) { return (u128)d; }
+
+static void put128(const char *tag, u128 v)
+{
+    printf(" %s=%016llx%016llx", tag, (unsigned long long)(v >> 64), (unsigned long long)v);
+}
+
+static void on_fpe(int sig)
+{
+    (void)sig;
+    _exit(9);
+}
+
+static void int128s(void)
+{
+    u128 a = ((u128)0x0123456789abcdefull << 64) | 0xfedcba9876543210ull, b = ((u128)3 << 64) | 7;
+    i128 lowest = (i128)((u128)1 << 127);
+    printf("int128");
+    put128("udiv", udiv128(a, b));
+    put128("umod", umod128(a, 10));
+    put128("sdiv", (u128)sdiv128(-(i128)a, (i128)b));
+    put128("smod", (u128)smod128(-(i128)a, (i128)b));
+    put128("min/-1", (u128)sdiv128(lowest, -1));
+    put128("fix", (u128)fix128(-1.5e30));
+    put128("fixbig", (u128)fix128(1e40));
+    put128("fixnan", (u128)fix128(__builtin_nan("")));
+    put128("fixu", fixu128(3.9e30));
+    put128("fixuneg", fixu128(-5.0));
+    printf("\n");
+    for (int handled = 0; handled < 2; handled++) {
+        fflush(stdout);
+        pid_t p = fork();
+        if (p == 0) {
+            if (handled)
+                signal(SIGFPE, on_fpe);
+            volatile u128 zero = 0;
+            udiv128(a, zero);
+            _exit(0);
+        }
+        int st = 0;
+        waitpid(p, &st, 0);
+        printf("int128 divide by zero handled=%d exit=%d signal=%d\n", handled, WIFEXITED(st) ? WEXITSTATUS(st) : -1,
+               WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    }
+}
+
 static int guest_zone_calls;
 
 static void *gz_malloc(malloc_zone_t *z, size_t n)
@@ -330,5 +385,6 @@ int main(int argc, char **argv)
     zones();
     fenvs();
     gss();
+    int128s();
     return 0;
 }
