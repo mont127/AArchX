@@ -8,9 +8,11 @@
 # Linux or on an Intel Mac; both jobs use GitHub's Apple silicon runner image
 # for macOS 26, the oldest release the project is developed and tested on.
 #
-# There are two jobs. `unit` builds ocerz and runs the unit harnesses, which
-# takes a few minutes and tells a contributor at once whether the tree still
-# builds and the translator's components still agree with their own checks.
+# There are two jobs. `unit` builds ocerz, generates the native-mode API
+# databases from the runner's own SDK because test_apidb reads them, and runs
+# the unit harnesses, which takes a few minutes and tells a contributor at once
+# whether the tree still builds and the translator's components still agree
+# with their own checks.
 # `check` runs `make check`, the full set of gates that CONTRIBUTING.md says
 # must be green before a change is sent: the unit harnesses again, the guest
 # suite under the interpreter and under the JIT, the x86-64 and i386
@@ -67,6 +69,9 @@ jobs:
 
       - name: Print the version
         run: ./ocerz version
+
+      - name: Generate the API databases
+        run: make apis
 
       - name: Unit harnesses
         run: make unit
