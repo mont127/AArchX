@@ -27,13 +27,13 @@
 # suite is timing-sensitive under load and must not share the machine with a
 # build.
 #
-# A hosted runner is a three-core virtual machine, and a few dynamic cases rely
-# on what a virtual machine may not provide: a Metal device that computes, a
-# kernel whose ntp_gettime works. The dynamic runner builds those cases natively
-# as well and skips a case, saying so, when the machine's own run of it fails,
-# so what is skipped is what the machine cannot do and a failure that only ocerz
-# shows still fails. The slower machine also gets a longer limit for each
-# dynamic case, 120 seconds against the 30 it has by default.
+# A hosted runner is a three-core virtual machine whose clock is never
+# synchronised, so its kernel fails ntp_gettime with EIO, natively and under
+# ocerz alike. The dynamic runner builds the cases that depend on such things
+# natively as well and skips one, saying so, when the machine's own run of it
+# fails, so what is skipped is what the machine cannot do and a failure that
+# only ocerz shows still fails. The slower machine also gets a longer limit for
+# each dynamic case, 120 seconds against the 30 it has by default.
 #
 # Rosetta is installed on the runner because the dynamic and native gates bind
 # guest programs against the x86-64 shared cache that its package ships;

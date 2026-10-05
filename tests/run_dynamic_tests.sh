@@ -7,12 +7,15 @@
 #
 # A case that needs something the host itself cannot do is skipped, not failed.
 # The Metal compute case and the ntp_gettime check in syscalls_extra are also
-# built for arm64 and run natively first, as the control: a virtual machine can
-# have a Metal device whose compute returns nothing, and a kernel whose
-# ntp_gettime fails, and no translator can pass what the machine under it
-# fails. When the native run passes, or cannot be built, the case runs as
-# usual, so a failure that only ocerz shows stays a failure. A case that is
-# skipped prints a SKIP line saying what the host did.
+# built for arm64 and run natively first, as the control, and no translator can
+# pass what the machine under it fails. A host whose clock was never
+# synchronised, a virtual machine's for one, reports TIME_ERROR from ntp_adjtime
+# with STA_UNSYNC set and fails ntp_gettime with EIO, natively and under ocerz
+# alike. When the native run passes, or cannot be built, the case runs as usual,
+# so a failure that only ocerz shows stays a failure: on a virtual machine's
+# paravirtual GPU the Metal case passes natively and fails under ocerz, and is
+# not skipped. A case that is skipped prints a SKIP line saying what the host
+# did.
 #
 # Each run of a case is stopped after 30 seconds. OCERZ_DYNAMIC_TIMEOUT sets
 # another limit, in seconds, for a machine that is slower or shared.
