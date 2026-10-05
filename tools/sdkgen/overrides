@@ -1431,3 +1431,14 @@ var _gss_mech_krb5 8 gss_oid_ptr
 var _gss_mech_krb5_old 8 gss_oid_ptr
 var _gss_nt_* 8 gss_oid_ptr
 var _gss_mech_set_krb5* 8 gss_oid_set_ptr
+
+# AudioDeviceCreateIOProcID and its block form hand back an AudioDeviceIOProcID,
+# which is typed as a function pointer and is only ever handed back to
+# AudioDeviceStart, AudioDeviceStop and AudioDeviceDestroyIOProcID, whose
+# callback arguments let a native value through unchanged.  So the pointer to
+# it crosses as a plain pointer.
+
+library /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
+
+fn _AudioDeviceCreateIOProcID AudioDeviceCreateIOProcID i(uc{i(upppppp)}pp)
+fn _AudioDeviceCreateIOProcIDWithBlock AudioDeviceCreateIOProcIDWithBlock i(pupk{v(ppppp)})

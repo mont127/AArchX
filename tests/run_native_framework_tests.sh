@@ -26,6 +26,7 @@ for arch in x86_64 arm64; do
         -o "$work/callback_structs.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror -Wno-deprecated-declarations tests/dynamic/native_lapack_asn1.c \
         -framework Accelerate -framework Security -o "$work/lapack_asn1.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_audio.c -framework CoreAudio -o "$work/audio.$arch"
 done
 mkdir -p "$work/globdir"
 touch "$work/globdir/a.txt" "$work/globdir/b.txt" "$work/globdir/c.log"
@@ -38,6 +39,7 @@ sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.er
 "$work/gl_carbon.arm64" > "$work/gl_carbon.expected"
 "$work/callback_structs.arm64" > "$work/callback_structs.expected"
 "$work/lapack_asn1.arm64" > "$work/lapack_asn1.expected"
+"$work/audio.arm64" > "$work/audio.expected"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -83,6 +85,10 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/lapack_asn1.x86_64" > "$work/lapack_asn1.$engine.out" 2> "$work/lapack_asn1.$engine.err"
     cmp "$work/lapack_asn1.expected" "$work/lapack_asn1.$engine.out"
     echo "PASS native ILP64 BLAS and LAPACK and SecAsn1 coders $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/audio.x86_64" > "$work/audio.$engine.out" 2> "$work/audio.$engine.err"
+    cmp "$work/audio.expected" "$work/audio.$engine.out"
+    echo "PASS native audio device IOProcs and IO blocks $engine"
     for refusal in context launch; do
         rc=0
         env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \
