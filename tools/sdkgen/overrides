@@ -391,7 +391,9 @@
 # _objc_empty_cache, so a program with a single class of its own fails to bind
 # unless that variable is a data export, although no header declares it.
 # _objc_empty_vtable, which older toolchains put in the vtable word beside it,
-# exists only in x86_64 libobjc and stays omitted.
+# exists only in x86_64 libobjc.  ocerz writes zero over that word before the
+# class is registered (src/objcclass.c), so the export only has to exist for
+# the image to bind: it is a variable of eight zero bytes.
 #
 # Runtime hooks.  objc_setHook_* and _objc_setHook_* install functions the
 # runtime calls from inside class lookup and method caching.  The Swift runtime
@@ -1040,6 +1042,7 @@ stub _objc_removeExceptionHandler override
 var _OBJC_EHTYPE_id 24 objc_ehtype
 var _objc_ehtype_vtable 80 objc_ehtype_vtable
 data __objc_empty_cache _objc_empty_cache
+var __objc_empty_vtable 8 zero
 
 stub __objc_setHook_* override
 stub _objc_addLoadImageFunc* override
