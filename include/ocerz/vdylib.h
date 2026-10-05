@@ -135,5 +135,7 @@ enum {
     OCERZ_VDYLIB_TRAMP_OBJC_EH_TERMINATE = 6,
 };
 uint64_t ocerz_vdylib_trampoline(unsigned which);
+void ocerz_vdylib_late_fill(const char *install_name, uint64_t (*slot_of)(void *ctx, const char *export_name),
+                           void *ctx);
 
 #endif

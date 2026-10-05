@@ -3372,6 +3372,13 @@ static int native_guest_path(const char *name, char *out, size_t n)
     return len > 0 && (size_t)len < n && lstat(out, &st) == 0;
 }
 
+static uint64_t virt_slot_of(void *ctx, const char *export_name)
+{
+    int found = 0;
+    uint64_t at = ocerz_image_self_resolve_ex((DynImage *)ctx, export_name, &found);
+    return found ? at : 0;
+}
+
 static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, DynImage *loader,
                                  const RpathList *rpaths)
 {
@@ -3410,6 +3417,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
             return NULL;
         }
         protect_ro_segments(v);
+        ocerz_vdylib_late_fill(install_name, virt_slot_of, v);
         v->seq = ++g_dimg_seq;
         OCERZ_LOG("dynamic: registered virtual dylib %s at load_base=%#llx slide=%#llx\n",
                   install_name, (unsigned long long)v->load_base,

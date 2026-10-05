@@ -2675,16 +2675,16 @@ static uint64_t ob_eh_vtable(void)
     return page;
 }
 
-void ocerz_objc_fill_ehtype_vtable(uint8_t *slot, uint32_t size, const char *install_name,
+void ocerz_objc_fill_ehtype_vtable(uint64_t slot, uint32_t size, const char *install_name,
                                    const char *export_name, OcerzVdylibHostSym host_sym)
 {
     (void)install_name;
     (void)export_name;
     (void)host_sym;
-    ob_eh_vtable_words(slot, size);
+    ob_eh_vtable_words(ocerz_g2h(slot), size);
 }
 
-void ocerz_objc_fill_ehtype(uint8_t *slot, uint32_t size, const char *install_name, const char *export_name,
+void ocerz_objc_fill_ehtype(uint64_t slot, uint32_t size, const char *install_name, const char *export_name,
                             OcerzVdylibHostSym host_sym)
 {
     uint64_t words[3] = { ob_eh_vtable() + 16, 0, 0 };
@@ -2702,8 +2702,7 @@ void ocerz_objc_fill_ehtype(uint8_t *slot, uint32_t size, const char *install_na
             words[2] = OB_EH_NO_CLASS;
         }
     }
-    memset(slot, 0, size);
-    memcpy(slot, words, size < sizeof words ? size : sizeof words);
+    memcpy(ocerz_g2h(slot), words, size < sizeof words ? size : sizeof words);
 }
 
 static _Noreturn void ob_eh_absent(const char *sym)

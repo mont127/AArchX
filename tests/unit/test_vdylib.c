@@ -1149,6 +1149,7 @@ static void check_absent(const char *what, const uint8_t *img, const char *const
 static const OcerzApiEntry **g_natives;
 static size_t g_nnatives;
 static size_t g_cf_functions;
+static size_t g_cf_var_bytes;
 
 static int load_cf_records(void)
 {
@@ -1164,6 +1165,8 @@ static int load_cf_records(void)
             g_natives[g_nnatives++] = e;
         else if (e->kind == OCERZ_API_FN || e->kind == OCERZ_API_SPECIAL || e->kind == OCERZ_API_STUB)
             g_cf_functions++;
+        else if (e->kind == OCERZ_API_VAR)
+            g_cf_var_bytes += (e->bytes + 7u) & ~7u;
     }
     return 1;
 }
@@ -1305,10 +1308,10 @@ static void check_corefoundation(void)
     CHECK(ly.text.sect_found && ly.text.sect_size == g_cf_functions * STUB_STRIDE,
           "CoreFoundation's __text is %llu bytes, want one stub for each of the %zu function "
           "records and none for its data", (unsigned long long)ly.text.sect_size, g_cf_functions);
-    CHECK(ly.data.sect_found && ly.data.sect_size == g_cf_functions * SLOT_LEN,
+    CHECK(ly.data.sect_found && ly.data.sect_size == g_cf_functions * SLOT_LEN + g_cf_var_bytes,
           "CoreFoundation's __data is %llu bytes, want one jump slot for each of the %zu "
-          "function records and nothing for its data", (unsigned long long)ly.data.sect_size,
-          g_cf_functions);
+          "function records, the %zu bytes of its var records and nothing for its data",
+          (unsigned long long)ly.data.sect_size, g_cf_functions, g_cf_var_bytes);
 
     check_function_stubs("CoreFoundation", img, len, &ly, kCF, kCFFunctions, NCFFUNCS);
     check_database_stubs("CoreFoundation", img, len, &ly, kCF);
