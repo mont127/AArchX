@@ -16,7 +16,9 @@ for arch in x86_64 arm64; do
         tests/dynamic/native_frameworks_more.m -framework AppKit -framework Security \
         -framework UniformTypeIdentifiers -framework Network -o "$work/more.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror -fno-builtin tests/dynamic/native_compat.c \
-        -framework CoreFoundation -framework CoreMedia -o "$work/compat.$arch"
+        -framework CoreFoundation -framework CoreMedia -framework GSS -o "$work/compat.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror -Wno-deprecated-declarations tests/dynamic/native_kerberos.c \
+        -framework Kerberos -o "$work/kerberos.$arch"
 done
 mkdir -p "$work/globdir"
 touch "$work/globdir/a.txt" "$work/globdir/b.txt" "$work/globdir/c.log"
@@ -25,6 +27,7 @@ touch "$work/globdir/a.txt" "$work/globdir/b.txt" "$work/globdir/c.log"
 /usr/bin/perl -e 'alarm 60; exec @ARGV' "$work/compat.arm64" "$work/globdir" > "$work/compat.expected" \
     2> "$work/compat.arm.err"
 sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.err"
+"$work/kerberos.arm64" > "$work/kerberos.expected"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -52,7 +55,11 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/compat.x86_64" "$work/globdir" > "$work/compat.$engine.out" 2> "$work/compat.$engine.err"
     cmp "$work/compat.expected" "$work/compat.$engine.out"
     grep -v '^ocerz' "$work/compat.$engine.err" | sed 's/compat\.x86_64/compat/' | cmp "$work/compat.expected.err" -
-    echo "PASS native err and warn veneers, long double, glob, CFCalendar, CMTime and CF va_list $engine"
+    echo "PASS native err and warn veneers, long double, glob, CFCalendar, CMTime, CF va_list, zones, fenv and GSS $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/kerberos.x86_64" > "$work/kerberos.$engine.out" 2> "$work/kerberos.$engine.err"
+    cmp "$work/kerberos.expected" "$work/kerberos.$engine.out"
+    echo "PASS native Kerberos object identifier variables $engine"
     for refusal in context launch; do
         rc=0
         env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \

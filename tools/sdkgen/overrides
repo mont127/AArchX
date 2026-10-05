@@ -1361,3 +1361,21 @@ var _OBJC_EHTYPE_$_NSException 24 objc_ehtype
 library /System/Library/Frameworks/CloudKit.framework/Versions/A/CloudKit
 
 var _OBJC_EHTYPE_$_CKException 24 objc_ehtype
+
+# GSS and Kerberos lay their structures out under pack(2) on x86, which moves
+# a gss_OID_desc's pointer from offset eight to four.  Their descriptors, and
+# Kerberos's pointers to descriptors and descriptor sets, are variables holding
+# x86 copies of the host's (src/vdylib.c).
+
+library /System/Library/Frameworks/GSS.framework/Versions/A/GSS
+
+var ___gss_*_oid_desc 12 gss_oid_desc
+
+library /System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos
+
+var _GSS_C_NT_* 8 gss_oid_ptr
+var _GSS_KRB5_NT_PRINCIPAL_NAME 8 gss_oid_ptr
+var _gss_mech_krb5 8 gss_oid_ptr
+var _gss_mech_krb5_old 8 gss_oid_ptr
+var _gss_nt_* 8 gss_oid_ptr
+var _gss_mech_set_krb5* 8 gss_oid_set_ptr
