@@ -196,9 +196,11 @@ int main(void)
     if (!getcwd(after, sizeof after) || strcmp(before, after) != 0)
         bad("pthread_chdir leaked to the process");
 
+#ifndef SKIP_NTP_GETTIME
     struct ntptimeval ntv;
     if (ntp_gettime(&ntv) < 0)
         bad("ntp_gettime");
+#endif
     struct timex tx;
     memset(&tx, 0, sizeof tx);
     if (ntp_adjtime(&tx) < 0)
