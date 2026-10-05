@@ -61,6 +61,9 @@ jobs:
         run: |
           sw_vers
           uname -m
+          xcode-select -p
+          ls -d /Applications/Xcode*
+          xcodebuild -showsdks
           xcrun --show-sdk-version
           clang --version
 
@@ -90,6 +93,9 @@ jobs:
           sw_vers
           uname -m
           sysctl -n machdep.cpu.brand_string
+          xcode-select -p
+          ls -d /Applications/Xcode*
+          xcodebuild -showsdks
           xcrun --show-sdk-version
           clang --version
 
