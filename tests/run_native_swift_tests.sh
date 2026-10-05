@@ -32,9 +32,10 @@
 # arm64 build, which means something only if the arm64 build prints the same
 # thing every time, so that build runs twenty times first and the test is
 # skipped, with a SKIP line carrying the difference, when a run differs from the
-# first: on a virtual machine a wait on a walltime deadline can take several
-# times as long as asked, natively too, and then the translated run has no
-# reference to match.  A host whose runs agree still has to be matched.
+# first: on a virtual machine a timed wait, one on a walltime deadline most of
+# all, can take several times as long as asked, natively too, and then the
+# translated run has no reference to match.  A host whose runs agree still has
+# to be matched.
 #
 # native_swift_bundled is how an app built for systems before 10.14.4 links
 # the Swift runtime: as @rpath/libswiftCore.dylib, with /usr/lib/swift ahead of

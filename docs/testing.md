@@ -129,10 +129,12 @@ not skipped. `OCERZ_DYNAMIC_TIMEOUT` sets the limit on each run of a dynamic
 case, 30 seconds when unset, and the workflow gives the slower machine 120.
 
 The native Swift suite compares a translated run with one native run, which
-means something only if native runs agree with each other. On the runner a wait
-on a walltime deadline asked for 25 ms took over 150 ms in about a quarter of
-native runs, and about as often under ocerz, so `native_dispatch_time` runs the
-native build twenty times first and is skipped, saying so, when they differ.
+means something only if native runs agree with each other. On the runner some
+line of `native_dispatch_time` reported a wait outside its bounds in about a
+third of the rounds of a 40-round test, native, translated and interpreted
+alike (13, 15 and 13), most often the wait on a walltime deadline, which asked
+for 25 ms and took over 150. So the test runs the native build twenty times
+first and is skipped, saying so, when they differ.
 
 ## Conventions
 
