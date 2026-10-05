@@ -14,7 +14,7 @@
   <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
-  <img alt="version" src="https://img.shields.io/badge/version-0.3--dev-green.svg">
+  <img alt="version" src="https://img.shields.io/badge/version-0.4-green.svg">
 </p>
 
 > [!WARNING]
@@ -58,7 +58,7 @@ You need:
 
 ```sh
 make -j
-./ocerz version                       # AArchX 0.3-dev
+./ocerz version                       # AArchX 0.4
 ./ocerz tests/guest/bin/hello         # a test program from this repository
 ./ocerz /Applications/Some.app       # a bundle runs the executable its Info.plist names
 ```
