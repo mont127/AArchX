@@ -6,10 +6,9 @@ data 6
 var 21
 special 0
 stub callback-pointer 2
-stub callback-result 2
 stub layout 157
 stub no-declaration 375
-stub va-list 3
+stub va-list 5
 stub variadic 4
 omit layout 1
 host-missing 0

@@ -7,7 +7,7 @@ var 0
 special 0
 stub no-declaration 63
 omit swift 42
-host-missing 8
+host-missing 0
 objc-classes 113
 objc-eh-types 0
 objc-ivars 0

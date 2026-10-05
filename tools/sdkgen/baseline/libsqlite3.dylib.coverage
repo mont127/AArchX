@@ -4,17 +4,17 @@ exports 388
 fn 273
 data 3
 var 0
-special 0
+special 2
 stub callback-struct 7
 stub no-declaration 94
 stub va-list 3
-stub variadic 8
+stub variadic 6
 host-missing 0
 objc-classes 0
 objc-eh-types 0
 objc-ivars 0
 ld-pseudo-skipped 0
-overrides 0
+overrides 2
 override-shapes 0
 override-structs 0
 override-opaque 0

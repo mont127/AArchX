@@ -2,13 +2,13 @@ library /System/Library/Frameworks/FSKit.framework/Versions/A/FSKit
 sdk macos 27.0
 exports 339
 fn 3
-data 271
+data 276
 var 0
 special 0
-stub no-declaration 32
-omit no-declaration-missing 11
+stub no-declaration 36
+omit no-declaration-missing 2
 omit swift 22
-host-missing 74
+host-missing 0
 objc-classes 111
 objc-eh-types 0
 objc-ivars 0

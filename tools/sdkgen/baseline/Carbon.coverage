@@ -1,16 +1,14 @@
 library /System/Library/Frameworks/Carbon.framework/Versions/A/Carbon
 sdk macos 27.0
 exports 1595
-fn 349
+fn 356
 data 175
 var 0
 special 0
 stub callback-pointer 4
-stub callback-result 7
-stub callback-struct 5
+stub callback-struct 6
 stub nested-callback 1
 stub no-declaration 1053
-stub struct-layout 1
 host-missing 0
 objc-classes 0
 objc-eh-types 0

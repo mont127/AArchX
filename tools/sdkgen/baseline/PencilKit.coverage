@@ -2,13 +2,13 @@ library /System/Library/Frameworks/PencilKit.framework/Versions/A/PencilKit
 sdk macos 27.0
 exports 1407
 fn 0
-data 251
+data 252
 var 0
 special 0
-stub no-declaration 428
-omit no-declaration-missing 363
-omit swift 365
-host-missing 16
+stub no-declaration 621
+omit no-declaration-missing 8
+omit swift 526
+host-missing 0
 objc-classes 89
 objc-eh-types 0
 objc-ivars 0

@@ -2,14 +2,14 @@ library /System/Library/Frameworks/MediaToolbox.framework/Versions/A/MediaToolbo
 sdk macos 27.0
 exports 7030
 fn 6
-data 4895
+data 5087
 var 0
 special 0
 stub callback-struct 2
-stub no-declaration 1724
-omit no-declaration-missing 401
+stub no-declaration 1889
 omit objc-ivar 2
-host-missing 4
+omit swift 44
+host-missing 0
 objc-classes 24
 objc-eh-types 0
 objc-ivars 2

@@ -2,12 +2,12 @@ library /System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync
 sdk macos 27.0
 exports 533
 fn 60
-data 248
+data 253
 var 0
 special 0
-stub no-declaration 85
-omit no-declaration-missing 140
-host-missing 30
+stub no-declaration 157
+omit swift 63
+host-missing 0
 objc-classes 0
 objc-eh-types 0
 objc-ivars 0

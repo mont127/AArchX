@@ -2,11 +2,11 @@ library /System/Library/Frameworks/SharedWithYouCore.framework/Versions/A/Shared
 sdk macos 27.0
 exports 90
 fn 0
-data 78
+data 79
 var 0
 special 0
 stub no-declaration 10
-omit no-declaration-missing 2
+omit no-declaration-missing 1
 host-missing 0
 objc-classes 34
 objc-eh-types 0

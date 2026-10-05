@@ -2,14 +2,14 @@ library /System/Library/Frameworks/CoreMotion.framework/Versions/A/CoreMotion
 sdk macos 27.0
 exports 871
 fn 0
-data 650
+data 656
 var 0
 special 0
-stub no-declaration 135
-omit no-declaration-missing 65
+stub no-declaration 139
+omit no-declaration-missing 55
 omit objc-ivar 5
 omit swift 16
-host-missing 16
+host-missing 0
 objc-classes 159
 objc-eh-types 0
 objc-ivars 5

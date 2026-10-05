@@ -1,11 +1,10 @@
 library /System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices
 sdk macos 27.0
 exports 2117
-fn 368
+fn 376
 data 265
 var 0
 special 0
-stub callback-result 8
 stub callback-struct 5
 stub no-declaration 1468
 omit objc-ivar 3

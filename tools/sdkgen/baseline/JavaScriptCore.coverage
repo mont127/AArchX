@@ -2,12 +2,12 @@ library /System/Library/Frameworks/JavaScriptCore.framework/Versions/A/JavaScrip
 sdk macos 27.0
 exports 5827
 fn 118
-data 674
+data 728
 var 0
 special 0
 stub callback-struct 1
-stub no-declaration 4573
-omit no-declaration-missing 461
+stub no-declaration 4940
+omit no-declaration-missing 40
 host-missing 0
 objc-classes 5
 objc-eh-types 0

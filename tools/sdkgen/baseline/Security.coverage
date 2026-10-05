@@ -2,14 +2,13 @@ library /System/Library/Frameworks/Security.framework/Versions/A/Security
 sdk macos 27.0
 exports 4700
 fn 642
-data 2201
+data 2262
 var 0
 special 4
 stub arch-mismatch 2
 stub callback-struct 37
-stub no-declaration 1716
-omit no-declaration-missing 98
-host-missing 12
+stub no-declaration 1753
+host-missing 0
 objc-classes 57
 objc-eh-types 0
 objc-ivars 0

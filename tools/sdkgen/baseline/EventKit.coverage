@@ -2,14 +2,14 @@ library /System/Library/Frameworks/EventKit.framework/Versions/A/EventKit
 sdk macos 27.0
 exports 1380
 fn 0
-data 527
+data 529
 var 0
 special 0
-stub no-declaration 133
-omit no-declaration-missing 627
+stub no-declaration 473
+omit no-declaration-missing 8
 omit objc-ivar 12
-omit swift 81
-host-missing 8
+omit swift 358
+host-missing 0
 objc-classes 181
 objc-eh-types 0
 objc-ivars 12

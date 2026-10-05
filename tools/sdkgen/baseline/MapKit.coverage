@@ -2,13 +2,14 @@ library /System/Library/Frameworks/MapKit.framework/Versions/A/MapKit
 sdk macos 27.0
 exports 2442
 fn 18
-data 930
+data 932
 var 0
 special 0
-stub no-declaration 101
-omit no-declaration-missing 1378
+stub no-declaration 647
+omit no-declaration-missing 2
 omit objc-ivar 15
-host-missing 11
+omit swift 828
+host-missing 0
 objc-classes 265
 objc-eh-types 0
 objc-ivars 15

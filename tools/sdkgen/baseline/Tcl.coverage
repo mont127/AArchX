@@ -1,13 +1,12 @@
 library /System/Library/Frameworks/Tcl.framework/Versions/8.5/Tcl
 sdk macos 27.0
 exports 812
-fn 278
+fn 279
 data 6
 var 0
 special 0
 stub callback-pointer 4
-stub callback-result 16
-stub callback-struct 273
+stub callback-struct 288
 stub nested-callback 1
 stub no-declaration 221
 stub va-list 5

@@ -2,8 +2,8 @@ library /System/Library/Frameworks/CloudKit.framework/Versions/A/CloudKit
 sdk macos 27.0
 exports 4551
 fn 0
-data 1186
-var 0
+data 1185
+var 1
 special 0
 stub no-declaration 2088
 omit no-declaration-missing 50
@@ -14,7 +14,7 @@ objc-classes 419
 objc-eh-types 1
 objc-ivars 70
 ld-pseudo-skipped 1892
-overrides 0
+overrides 1
 override-shapes 0
 override-structs 0
 override-opaque 0

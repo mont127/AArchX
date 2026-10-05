@@ -1,12 +1,11 @@
 library /System/Library/Frameworks/AVFoundation.framework/Versions/A/AVFoundation
 sdk macos 27.0
 exports 3322
-fn 7
+fn 10
 data 3096
 var 0
 special 0
 stub no-declaration 208
-stub struct-layout 3
 omit objc-ivar 4
 omit swift 4
 host-missing 0

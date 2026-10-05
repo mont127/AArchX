@@ -2,13 +2,13 @@ library /System/Library/Frameworks/NetworkExtension.framework/Versions/A/Network
 sdk macos 27.0
 exports 1758
 fn 0
-data 774
+data 946
 var 0
 special 0
-stub no-declaration 477
-omit no-declaration-missing 302
-omit swift 205
-host-missing 4
+stub no-declaration 552
+omit no-declaration-missing 5
+omit swift 255
+host-missing 0
 objc-classes 241
 objc-eh-types 0
 objc-ivars 0
