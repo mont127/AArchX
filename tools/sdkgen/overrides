@@ -782,6 +782,13 @@ stub _____sigwait_nocancel override
 special _sigpending sigpending
 special _pause pause
 special _pause$NOCANCEL pause
+
+# i386_set_ldt and i386_get_ldt exist only in x86_64 libSystem, so the SDK the
+# databases are read from has neither.  Wine's ntdll.so imports i386_set_ldt to
+# give its 32-bit code segments and would not load without it.  Both keep the
+# table cache mode's machdep calls 5 and 6 keep (src/syscall.c).
+special _i386_set_ldt i386_set_ldt
+special _i386_get_ldt i386_get_ldt
 stub _sigvec override
 stub _sigblock override
 stub _sigsetmask override

@@ -82,6 +82,7 @@ int ocerz_guest_sigprocmask(struct OcerzVM *vm, OcerzCPU *cpu, int how,
 int ocerz_guest_sigaltstack(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t ss, uint64_t oss);
 int ocerz_guest_raise(struct OcerzVM *vm, OcerzCPU *cpu, int sig);
 int ocerz_guest_sigsuspend(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t mask);
+long ocerz_ldt_call(int num, int32_t start, uint64_t descs, int32_t count);
 void ocerz_guest_deliver_now(OcerzCPU *cpu, int sig);
 uint32_t ocerz_guest_sigpending(OcerzCPU *cpu);
 int ocerz_guest_sigwait(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t want);

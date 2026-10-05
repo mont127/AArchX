@@ -8305,24 +8305,22 @@ static uint64_t ocerz_ldt_pack(const struct ocerz_ldt_entry *e)
          | (((base >> 24) & 0xffu) << 56);
 }
 
-static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
+/* i386_set_ldt (machdep 5) and i386_get_ldt (6) on the one table: the index
+   set answers, or a negated errno; get answers how many entries the table
+   holds, up to the last one set, as Rosetta does (one entry set at index 16
+   makes it answer 17), and copies only those.  Cache mode reaches them as
+   machdep calls, native mode as libSystem's exports of the same names. */
+long ocerz_ldt_call(int num, int32_t start, uint64_t descs, int32_t count)
 {
-
-    int32_t start = (int32_t)cpu->gpr[OCERZ_RDI];
-    uint64_t descs = cpu->gpr[OCERZ_RSI];
-    int32_t count = (int32_t)cpu->gpr[OCERZ_RDX];
-    if (count < 0 || count > OCERZ_LDT_MAX || descs == 0) {
-        machdep_err(cpu, EINVAL);
-        return OCERZ_STEP_OK;
-    }
+    if (count < 0 || count > OCERZ_LDT_MAX || descs == 0)
+        return -EINVAL;
     pthread_mutex_lock(&g_ldt_lock);
     if (num == 5) {
         int idx;
         if (start < 0) {
             if (g_ldt_next + (int)count > OCERZ_LDT_MAX) {
                 pthread_mutex_unlock(&g_ldt_lock);
-                machdep_err(cpu, ENOMEM);
-                return OCERZ_STEP_OK;
+                return -ENOMEM;
             }
             idx = g_ldt_next;
             g_ldt_next += (int)count;
@@ -8330,8 +8328,7 @@ static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
             idx = (int)start;
             if (idx < 0 || idx + (int)count > OCERZ_LDT_MAX) {
                 pthread_mutex_unlock(&g_ldt_lock);
-                machdep_err(cpu, EINVAL);
-                return OCERZ_STEP_OK;
+                return -EINVAL;
             }
             if (idx + (int)count > g_ldt_next)
                 g_ldt_next = idx + (int)count;
@@ -8346,20 +8343,29 @@ static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
             fprintf(stderr, "ocerz: LDT set idx=%d count=%lld base=%#llx big=%d access=%#x\n",
                     idx, (long long)count, (unsigned long long)g_ldt[idx].base,
                     g_ldt[idx].big, g_ldt[idx].access);
-        machdep_ret(cpu, (uint64_t)(uint32_t)idx);
-        return OCERZ_STEP_OK;
+        return idx;
     }
 
     int idx = (int)start;
     if (idx < 0 || idx + (int)count > OCERZ_LDT_MAX) {
         pthread_mutex_unlock(&g_ldt_lock);
-        machdep_err(cpu, EINVAL);
-        return OCERZ_STEP_OK;
+        return -EINVAL;
     }
-    for (int i = 0; i < count; i++)
+    int used = g_ldt_next;
+    for (int i = 0; i < count && idx + i < used; i++)
         ocerz_st(descs + (uint64_t)i * 8, 8, ocerz_ldt_pack(&g_ldt[idx + i]));
     pthread_mutex_unlock(&g_ldt_lock);
-    machdep_ret(cpu, (uint64_t)(uint32_t)count);
+    return used;
+}
+
+static int dispatch_machdep_ldt(OcerzCPU *cpu, int num)
+{
+    long r = ocerz_ldt_call(num, (int32_t)cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI],
+                            (int32_t)cpu->gpr[OCERZ_RDX]);
+    if (r < 0)
+        machdep_err(cpu, (uint64_t)-r);
+    else
+        machdep_ret(cpu, (uint64_t)(uint32_t)r);
     return OCERZ_STEP_OK;
 }
 
