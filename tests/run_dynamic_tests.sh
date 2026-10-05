@@ -8,7 +8,7 @@
 # A case that needs something the host itself cannot do is skipped, not failed.
 # The Metal compute case and the ntp_gettime check in syscalls_extra are also
 # built for arm64 and run natively first, as the control, and no translator can
-# pass what the machine under it fails. A host whose clock was never
+# pass what the machine under it fails. A host whose clock is not
 # synchronised, a virtual machine's for one, reports TIME_ERROR from ntp_adjtime
 # with STA_UNSYNC set and fails ntp_gettime with EIO, natively and under ocerz
 # alike. When the native run passes, or cannot be built, the case runs as usual,
