@@ -254,7 +254,9 @@
  * instructions as x86.  So every c argument goes through
  * ocerz_abi_callback_convert, which interns only what ocerz_abi_is_guest_code
  * calls guest code and hands anything else back unchanged.  That test goes by
- * address.  Inside the guest reservation is guest code.  Inside the host shared
+ * address.  The first 64 KB is nobody's code: a value there is a handle typed
+ * as a function, as CoreAudio's AudioDeviceIOProcID is, a small number handed
+ * back to AudioDeviceStart.  Inside the guest reservation is guest code.  Inside the host shared
  * cache is not.  Anywhere else is guest code exactly when host dyld does not
  * know the address, because every image the guest runs is mapped by ocerz's
  * own loader and never registered with dyld.  ocerz's own binary is a host

@@ -1511,6 +1511,8 @@ const OcerzAbiSig *ocerz_abi_callback_sig(const void *slot_address, uint64_t *gu
 
 int ocerz_abi_is_guest_code(uint64_t gptr)
 {
+    if (gptr < 0x10000)
+        return 0;
     const void *host = ocerz_g2h(gptr);
 
     if (ocerz_host_in_guest_reservation(host))
