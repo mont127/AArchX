@@ -877,6 +877,13 @@ static RasLit g_raslit[RASLIT_MAX];
 static int g_n_raslit;
 typedef struct { _Alignas(16) uint64_t rip; void *body; } JitPscEnt;
 #define PSC_N 32
+/* An entry's rip word carries its column's retire generation above the address
+   (rip ^ gen), so retiring a block bumps its column's vm->psc_gen instead of
+   searching every table: a canonical target only matches an entry filled in
+   its column's current generation.  (A non-canonical one, which would fault on
+   x86, could meet an older generation's entry.) */
+#define PSC_GEN_SHIFT 48
+_Static_assert(PSC_N == OCERZ_PSC_COLS, "a PSC column per retire generation");
 #define PSC_EMPTY_RIP UINT64_MAX
 static JitPscEnt *g_psc_pool;
 static size_t g_psc_used, g_psc_cap;
@@ -1523,6 +1530,7 @@ int g_pin_class_fwd(void) { return g_pin_class; }
 
 int ocerz_jit_time_xlat;
 uint64_t ocerz_jit_xlat_ns;
+uint64_t ocerz_jit_retire_ns;
 static int g_defer;
 static int16_t g_mov_sink_at[JIT_MAX_BLOCK_INSNS];
 static uint8_t g_mov_skip[JIT_MAX_BLOCK_INSNS];
@@ -14209,8 +14217,10 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
         a64_emit32(b, 0x58000000u | (uint32_t)JT2);
         a64_ubfx(b, 1, JTT, treg, 2, 5);
         a64_add_reg(b, 1, JT2, JT2, JTT, 4);
+        a64_ldr_regoff(b, 8, JTT, 19, JTT, 1);
         a64_ldp_off(b, JTU, JT0, JT2, 0);
-        a64_subs_reg(b, 1, A64_ZR, JTU, treg, 0);
+        a64_eor_reg(b, 1, JTT, JTT, treg, 0);
+        a64_subs_reg(b, 1, A64_ZR, JTU, JTT, 0);
         psc_miss = a64_label(b); a64_bcond(b, A64_NE, 0);
         uint32_t *intr = NULL;
         int stop_site_ok = g_n_stop_extra < 6;
@@ -14236,6 +14246,9 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
         a64_b(b, 0);
         (*n_epi)++;
         a64_patch_bcond(psc_miss, a64_label(b));
+        a64_ubfx(b, 1, JT0, treg, 2, 5);
+        a64_add_reg(b, 1, JT0, 19, JT0, 3);
+        a64_ldar(b, 8, JT0, JT0);
     }
     if (treg != JT1) a64_mov_reg(b, 1, JT1, treg);
     a64_str(b, 8, JT1, 20, RIP_OFF);
@@ -14262,9 +14275,17 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
         a64_ldr(b, 1, JTU, JTF, (uint32_t)offsetof(JitBlock, pin_class));
         a64_sub_imm(b, 0, JTU, JTU, (uint32_t)g_pin_class);
         to_full = a64_label(b); a64_cbnz(b, 0, JTU, 0);
-        a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, body_code));
-        uint32_t *nobody = a64_label(b); a64_cbz(b, 1, JT0, 0);
-        if (psc) a64_stp_off(b, JT1, JT0, JT2, 0);
+        uint32_t *nobody;
+        if (psc) {
+            a64_ldr(b, 8, JTA, JTF, (uint32_t)offsetof(JitBlock, body_code));
+            nobody = a64_label(b); a64_cbz(b, 1, JTA, 0);
+            a64_eor_reg(b, 1, JT0, JT1, JT0, 0);
+            a64_stp_off(b, JT0, JTA, JT2, 0);
+            a64_mov_reg(b, 1, JT0, JTA);
+        } else {
+            a64_ldr(b, 8, JT0, JTF, (uint32_t)offsetof(JitBlock, body_code));
+            nobody = a64_label(b); a64_cbz(b, 1, JT0, 0);
+        }
         uint32_t *intr = NULL;
         int stop_site_ok2 = g_n_stop_extra < 6;
         if (!stop_site_ok2) {
@@ -18904,7 +18925,7 @@ void ocerz_jit_fault_recover_flags(const struct OcerzVM *vm,
     cpu->cc_op = cc_op;
 }
 
-static void flip_retire_locked(OcerzJit *jit, JitBlock *blk);
+static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk);
 
 static void retire_fault_blocks(struct OcerzVM *vm, OcerzJit *jit, uint64_t block_rip,
                                 uint64_t fault_rip, int mode32)
@@ -18912,11 +18933,11 @@ static void retire_fault_blocks(struct OcerzVM *vm, OcerzJit *jit, uint64_t bloc
     jl_acquire(__LINE__);
     JitBlock *b = cache_lookup(jit, block_rip, mode32);
     if (b && b->code)
-        flip_retire_locked(jit, b);
+        flip_retire_locked(vm, jit, b);
     if (fault_rip != block_rip) {
         JitBlock *f = cache_lookup(jit, fault_rip, mode32);
         if (f && f->code)
-            flip_retire_locked(jit, f);
+            flip_retire_locked(vm, jit, f);
     }
     jl_release();
     ocerz_vm_purge_jit_ras(vm);
@@ -19683,7 +19704,31 @@ static int ras_entry_in_hits(const void *entry, void *arg)
     return b->code && p < (const uint32_t *)b->code + b->code_words;
 }
 
-static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hits)
+/* A PSC entry for a block sits in the column its own rip selects, bits 2-6,
+   because the indirect tail stores the rip it looked up beside that block's
+   body.  Retiring bumps those columns' generations after the blocks have left
+   the hash table, so a miss that refills from the table never tags a retired
+   body with a current generation.  A generation that wraps clears its column. */
+static unsigned psc_col(uint64_t key)
+{
+    return (unsigned)((key >> 2) & (PSC_N - 1));
+}
+static void psc_retire_cols(struct OcerzVM *vm, uint32_t cols)
+{
+    for (unsigned k = 0; k < PSC_N; k++) {
+        if (!(cols >> k & 1))
+            continue;
+        uint64_t g = __atomic_load_n(&vm->psc_gen[k], __ATOMIC_RELAXED) + (1ull << PSC_GEN_SHIFT);
+        if (g == 0)
+            for (size_t i = 0; i < g_n_psc_tables; i++) {
+                __atomic_store_n(&g_psc_tables[i][k].rip, PSC_EMPTY_RIP, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_psc_tables[i][k].body, (void *)NULL, __ATOMIC_RELEASE);
+            }
+        __atomic_store_n(&vm->psc_gen[k], g, __ATOMIC_RELEASE);
+    }
+}
+
+static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock **hits, size_t n_hits)
 {
     __atomic_add_fetch(&ocerz_jit_retire_count, 1, __ATOMIC_RELEASE);
     invsrc_note(0, 1);
@@ -19771,18 +19816,12 @@ static void retire_hit_blocks_locked(OcerzJit *jit, JitBlock **hits, size_t n_hi
         if (e && ras_entry_in_hits(e, &set))
             __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
     }
-    if ((++g_retire_sweep & 255) == 0) {
-        psc_clear_all();
-        return;
-    }
-    for (size_t i = 0; i < g_n_psc_tables; i++)
-        for (int k = 0; k < PSC_N; k++) {
-            void *e = __atomic_load_n(&g_psc_tables[i][k].body, __ATOMIC_RELAXED);
-            if (e && ras_entry_in_hits(e, &set)) {
-                __atomic_store_n(&g_psc_tables[i][k].rip, PSC_EMPTY_RIP, __ATOMIC_RELEASE);
-                __atomic_store_n(&g_psc_tables[i][k].body, (void *)NULL, __ATOMIC_RELEASE);
-            }
-        }
+    ++g_retire_sweep;
+    uint32_t cols = 0;
+    for (size_t m = 0; m < n_hits; m++)
+        if (hits[m]->code)
+            cols |= 1u << psc_col(hits[m]->key);
+    psc_retire_cols(vm, cols);
 }
 
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
@@ -19793,6 +19832,7 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
 
     OcerzJit *jit = vm->jit;
     int invalidated = 0;
+    uint64_t t0 = ocerz_jit_time_xlat ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     jl_acquire(__LINE__);
     if (!jit->code_hi || !ranges_overlap(addr, len, jit->code_lo,
                                          jit->code_hi - jit->code_lo)) {
@@ -19879,7 +19919,7 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
                 invalidated = 2;
                 invalidate_all_locked(jit);
             } else {
-                retire_hit_blocks_locked(jit, hits, n_hit);
+                retire_hit_blocks_locked(vm, jit, hits, n_hit);
             }
         }
         if (n_hit != (size_t)-1)
@@ -19897,6 +19937,8 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     }
     if (n_hit != (size_t)-1)
         free(hits);
+    if (invalidated && t0)
+        __atomic_add_fetch(&ocerz_jit_retire_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
 }
 
 void ocerz_jit_request_stop(struct OcerzVM *vm)
@@ -20165,7 +20207,7 @@ static void flip_report_atexit(void)
             (unsigned long long)(g_flip_atexit_jit ? g_flip_atexit_jit->blocks_translated : 0),
             g_flip_atexit_jit ? g_flip_atexit_jit->n_live : (size_t)0, g_n_probes);
 }
-static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
+static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
 {
     const uint32_t *lo = (const uint32_t *)blk->code, *hi = lo + blk->code_words;
 #define IN_BLK(p) ((const uint32_t *)(p) >= lo && (const uint32_t *)(p) < hi)
@@ -20242,12 +20284,7 @@ static void flip_retire_locked(OcerzJit *jit, JitBlock *blk)
     for (unsigned i = 0; i < g_ras_slot_n; i++)
         if (IN_BLK(g_ras_slots[i]))
             __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
-    for (size_t i = 0; i < g_n_psc_tables; i++)
-        for (int k = 0; k < PSC_N; k++)
-            if (IN_BLK(g_psc_tables[i][k].body)) {
-                __atomic_store_n(&g_psc_tables[i][k].rip, PSC_EMPTY_RIP, __ATOMIC_RELEASE);
-                __atomic_store_n(&g_psc_tables[i][k].body, (void *)NULL, __ATOMIC_RELEASE);
-            }
+    psc_retire_cols(vm, 1u << psc_col(blk->key));
 #undef IN_BLK
 }
 
@@ -20257,10 +20294,12 @@ static void flip_retire_block(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
     g_flip_n_retire++;
     jl_acquire(__LINE__);
     int live = blk->code != NULL;
-    if (live) flip_retire_locked(jit, blk);
+    if (live) flip_retire_locked(vm, jit, blk);
     jl_release();
     if (live) ocerz_vm_purge_jit_ras(vm);
     g_flip_ns_retire += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    if (live && ocerz_jit_time_xlat)
+        __atomic_add_fetch(&ocerz_jit_retire_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
 }
 
 static int flip_decide_locked(JitBlock *blk, int e, int tk, int ft, int logit)

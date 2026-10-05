@@ -39,6 +39,7 @@ void ocerz_jit_prof_stats(const struct OcerzVM *vm, uint64_t *translated, uint64
                           uint64_t *retires, uint64_t *flips);
 extern int ocerz_jit_time_xlat;
 extern uint64_t ocerz_jit_xlat_ns;
+extern uint64_t ocerz_jit_retire_ns;
 int ocerz_jit_lock_held_self(void);
 const int *ocerz_jit_lock_depth_ptr(void);
 struct OcerzCPU *ocerz_jit_lock_owner_cpu(void);

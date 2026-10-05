@@ -463,15 +463,17 @@ static void gp_report(double secs)
             100.0 * (double)g_gp_jit / (double)total,
             100.0 * (double)(g_gp_samples - g_gp_jit) / (double)total);
     {
-        static uint64_t last_tr, last_ret, last_flip, last_ns;
+        static uint64_t last_tr, last_ret, last_flip, last_ns, last_rns;
         uint64_t tr, live, ret, flip;
         ocerz_jit_prof_stats(g_gp_vm, &tr, &live, &ret, &flip);
         uint64_t ns = __atomic_load_n(&ocerz_jit_xlat_ns, __ATOMIC_RELAXED);
-        fprintf(stderr, "ocerz: GUESTPROF[%d]   jit translated=%llu live=%llu retires=%llu flips=%llu xlat_ms=%llu\n",
+        uint64_t rns = __atomic_load_n(&ocerz_jit_retire_ns, __ATOMIC_RELAXED);
+        fprintf(stderr, "ocerz: GUESTPROF[%d]   jit translated=%llu live=%llu retires=%llu flips=%llu xlat_ms=%llu retire_ms=%llu\n",
                 (int)getpid(), (unsigned long long)(tr - last_tr), (unsigned long long)live,
                 (unsigned long long)(ret - last_ret), (unsigned long long)(flip - last_flip),
-                (unsigned long long)((ns - last_ns) / 1000000));
-        last_tr = tr; last_ret = ret; last_flip = flip; last_ns = ns;
+                (unsigned long long)((ns - last_ns) / 1000000),
+                (unsigned long long)((rns - last_rns) / 1000000));
+        last_tr = tr; last_ret = ret; last_flip = flip; last_ns = ns; last_rns = rns;
     }
     static GpTop top[40];
     int n = gp_top(g_gp_key, g_gp_cnt, top, 40);
