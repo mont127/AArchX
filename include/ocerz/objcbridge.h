@@ -333,6 +333,7 @@ int ocerz_objc_class_getMethodImplementation(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_imp_trap(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_setExceptionPreprocessor(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_exception_throw(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_dictionary_of_variable_bindings(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_exception_rethrow(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_begin_catch(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_end_catch(struct OcerzVM *vm, OcerzCPU *cpu);

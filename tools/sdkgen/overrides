@@ -425,7 +425,10 @@
 # under Blocks below.
 #
 # ---- Foundation ----
-# NSLog is a format veneer and NSLogv takes the guest's va_list.  NSFrameAddress,
+# NSLog is a format veneer and NSLogv takes the guest's va_list.
+# _NSDictionaryOfVariableBindings, behind AppKit's NSDictionaryOfVariableBindings
+# macro, takes one variadic object per comma-separated key in its first
+# argument, which its handler reads before calling the host.  NSFrameAddress,
 # NSReturnAddress and NSCountFrames walk the calling thread's native frames,
 # which are ocerz's and not the guest's, so they name themselves the way the
 # unwinding calls in libSystem do.
@@ -1073,6 +1076,7 @@ library /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
 
 special _NSLog NSLog
 special _NSLogv NSLogv
+special __NSDictionaryOfVariableBindings dictionary_of_variable_bindings
 stub _NSFrameAddress override
 stub _NSReturnAddress override
 stub _NSCountFrames override

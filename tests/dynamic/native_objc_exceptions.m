@@ -5,6 +5,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+extern NSDictionary *_NSDictionaryOfVariableBindings(NSString *keys, id first, ...);
+
 @interface OcerzError : NSException
 @end
 @implementation OcerzError
@@ -42,6 +44,9 @@ static __attribute__((noinline)) void thrower(int kind)
         [[NSMutableDictionary dictionary] setObject:none forKey:@"k"];
         break;
     }
+    case 6:
+        _NSDictionaryOfVariableBindings(@"p, q, r", @"1", nil);
+        break;
     }
 }
 
@@ -57,7 +62,7 @@ static __attribute__((noinline)) void through(int kind)
 
 static void catches(void)
 {
-    for (int k = 0; k < 6; k++) {
+    for (int k = 0; k < 7; k++) {
         @try {
             thrower(k);
             printf("%d no throw\n", k);
