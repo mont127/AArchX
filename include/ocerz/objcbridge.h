@@ -187,6 +187,7 @@ enum {
 enum {
     OCERZ_OBJC_VA_FORMAT = 1,
     OCERZ_OBJC_VA_NIL_TERMINATED,
+    OCERZ_OBJC_VA_LIST,
 };
 
 typedef struct OcerzObjcVariadic {
@@ -195,6 +196,7 @@ typedef struct OcerzObjcVariadic {
     int arg;
     int dialect;
     int attributed;
+    int va;
 } OcerzObjcVariadic;
 
 typedef struct OcerzObjcClass {

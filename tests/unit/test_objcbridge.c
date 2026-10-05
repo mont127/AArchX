@@ -724,10 +724,26 @@ static void test_variadic_table(void)
     }
     static const char *const fixed[] = {
         "exceptionWithName:reason:userInfo:", "initWithObjects:count:", "arrayWithObjects:count:",
-        "stringWithString:", "initWithFormat:arguments:", "raise:format:arguments:", "length", NULL,
+        "stringWithString:", "length", NULL,
     };
     for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; i++)
         CHECK(ocerz_objc_variadic(fixed[i]) == NULL, "%s is not variadic", fixed[i] ? fixed[i] : "(null)");
+    static const struct {
+        const char *sel;
+        int arg, va;
+    } lists[] = {
+        { "initWithFormat:arguments:", 2, 3 },
+        { "initWithFormat:locale:arguments:", 2, 4 },
+        { "initWithValidatedFormat:validFormatSpecifiers:arguments:error:", 2, 4 },
+        { "raise:format:arguments:", 3, 4 },
+        { "predicateWithFormat:arguments:", 2, 3 },
+    };
+    for (size_t i = 0; i < sizeof lists / sizeof lists[0]; i++) {
+        const OcerzObjcVariadic *v = ocerz_objc_variadic(lists[i].sel);
+        CHECK(v && v->kind == OCERZ_OBJC_VA_LIST && v->arg == lists[i].arg && v->va == lists[i].va,
+              "%s takes its format at argument %d and a va_list at %d", lists[i].sel, lists[i].arg,
+              lists[i].va);
+    }
 }
 
 static void test_va_cursor(void)

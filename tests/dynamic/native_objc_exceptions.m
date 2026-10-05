@@ -24,6 +24,14 @@ static int released;
 }
 @end
 
+static void raise_list(NSString *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    [NSException raise:@"Listed" format:format arguments:ap];
+    va_end(ap);
+}
+
 static __attribute__((noinline)) void thrower(int kind)
 {
     switch (kind) {
@@ -47,6 +55,9 @@ static __attribute__((noinline)) void thrower(int kind)
     case 6:
         _NSDictionaryOfVariableBindings(@"p, q, r", @"1", nil);
         break;
+    case 7:
+        raise_list(@"%@ %d %.1f", @"list", 8, 0.5);
+        break;
     }
 }
 
@@ -62,7 +73,7 @@ static __attribute__((noinline)) void through(int kind)
 
 static void catches(void)
 {
-    for (int k = 0; k < 7; k++) {
+    for (int k = 0; k < 8; k++) {
         @try {
             thrower(k);
             printf("%d no throw\n", k);

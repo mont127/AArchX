@@ -213,6 +213,36 @@ static void uncaught_handlers(void)
            NSGetUncaughtExceptionHandler() == before);
 }
 
+static NSString *list_string(NSLocale *locale, NSString *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    NSString *s = locale ? [[NSString alloc] initWithFormat:format locale:locale arguments:ap]
+                         : [[NSString alloc] initWithFormat:format arguments:ap];
+    va_end(ap);
+    return s;
+}
+
+static NSPredicate *list_predicate(NSString *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    NSPredicate *p = [NSPredicate predicateWithFormat:format arguments:ap];
+    va_end(ap);
+    return p;
+}
+
+static void va_list_methods(void)
+{
+    NSLocale *de = [NSLocale localeWithLocaleIdentifier:@"de_DE"];
+    NSString *a = list_string(nil, @"%d %s %@ %.2f %ld %c %u %.1f %@ %x %.3f %d", 1, "two", @"three", 4.25,
+                              (long)5, '6', 7u, 8.5, @9, 10, 11.125, 12);
+    NSString *b = list_string(de, @"%.2f|%@|%d", 1234.5, @"x", -7);
+    NSPredicate *p = list_predicate(@"self.length > %d AND self BEGINSWITH %@", 2, @"ab");
+    printf("va_list [%s] [%s] %d%d\n", a.UTF8String, b.UTF8String, [p evaluateWithObject:@"abc"],
+           [p evaluateWithObject:@"xbc"]);
+}
+
 static void bindings(void)
 {
     NSString *one = @"1", *two = @"2", *three = @"3";
@@ -250,6 +280,7 @@ int main(void)
         collections();
         frameworks();
         bindings();
+        va_list_methods();
         block_imps();
         uncaught_handlers();
     }
