@@ -163,13 +163,23 @@
  * replaces the implementation of the class's own when it has one; the last
  * category in the lists wins, as natively.  Class methods go to the metaclass
  * the same way, protocols through class_addProtocol, properties through
- * class_replaceProperty, and class properties to the metaclass when the image
- * info's flag says category_t carries them.  A category may be on a native
- * class or on a guest class defined earlier.  One whose class is null, as a
- * category on a missing weak-linked class is, is left out with a log line; one
- * on a guest class ocerz has not defined is refused by name.  The static linker
- * already merges a category into its class's own method lists when both are in
- * one image, so such a category arrives as the class's own methods.
+ * class_addProperty, and class properties to the metaclass when the image
+ * info's flag says category_t carries them.  A property the class or a
+ * superclass already declares keeps that declaration.  class_replaceProperty
+ * would rewrite the declaration it finds, on whichever class in the chain it
+ * finds it, and a native class's property list lies in the shared cache,
+ * read-only: the Swift runtime an app bundles for systems before 10.14.4
+ * declares count again on classes under NSArray, NSDictionary and NSSet, and
+ * the NSObject protocol's properties again on NSNumber, NSDictionary and Core
+ * Data's classes, and iGlance stopped with a bus error while that libswiftCore
+ * loaded.  Natively the category's declaration would come first for
+ * class_getProperty; here the one already there does, which differs at most
+ * in the attribute string.  A category may be on a native class or on a
+ * guest class defined earlier.  One whose class is null, as a category on a
+ * missing weak-linked class is, is left out with a log line; one on a guest
+ * class ocerz has not defined is refused by name.  The static linker already
+ * merges a category into its class's own method lists when both are in one
+ * image, so such a category arrives as the class's own methods.
  *
  * ---- protocols ----
  * A guest image carries its own protocol_t for every protocol it names,
@@ -278,7 +288,7 @@ static OcSym g_oc_class_getSuperclass = OC_SYM("class_getSuperclass");
 static OcSym g_oc_class_isMetaClass = OC_SYM("class_isMetaClass");
 static OcSym g_oc_class_replaceMethod = OC_SYM("class_replaceMethod");
 static OcSym g_oc_class_addProtocol = OC_SYM("class_addProtocol");
-static OcSym g_oc_class_replaceProperty = OC_SYM("class_replaceProperty");
+static OcSym g_oc_class_addProperty = OC_SYM("class_addProperty");
 static OcSym g_oc_objc_getProtocol = OC_SYM("objc_getProtocol");
 static OcSym g_oc_objc_allocateProtocol = OC_SYM("objc_allocateProtocol");
 static OcSym g_oc_objc_registerProtocol = OC_SYM("objc_registerProtocol");
@@ -1418,8 +1428,8 @@ static void oc_category_properties(void *cls, uint64_t list, const char *catname
         char storage[1024];
         ocerz_objc_property_at(&l, i, &p);
         int n = oc_attrs(p.attributes, attrs, storage, sizeof storage, catname, oc_str(p.name));
-        ((void (*)(void *, const char *, const OcerzObjcAttribute *, unsigned))oc_need(
-            &g_oc_class_replaceProperty))(cls, oc_str(p.name), attrs, (unsigned)n);
+        ((bool (*)(void *, const char *, const OcerzObjcAttribute *, unsigned))oc_need(
+            &g_oc_class_addProperty))(cls, oc_str(p.name), attrs, (unsigned)n);
     }
 }
 
