@@ -304,7 +304,7 @@ static int abi_is_arg_class(char c)
 
 static int abi_is_ret_class(char c)
 {
-    return c == 'v' || c == 'k' || c == '{' || c == 'D' || abi_is_scalar_class(c);
+    return c == 'v' || c == 'k' || c == 'c' || c == '{' || c == 'D' || abi_is_scalar_class(c);
 }
 
 static int abi_is_fp(char c)
@@ -350,8 +350,6 @@ static void abi_reject(const char *notation, char c)
         OCERZ_LOG("abi: %s closes a structure it never opened\n", notation);
     else if (c == 'v')
         OCERZ_LOG("abi: %s uses v as an argument class, which is a result class only\n", notation);
-    else if (c == 'c')
-        OCERZ_LOG("abi: %s uses c as a result class, which is an argument class only\n", notation);
     else if (c)
         OCERZ_LOG("abi: %s names a class '%c' that does not exist\n", notation, c);
     else
@@ -590,6 +588,10 @@ int ocerz_abi_parse(const char *notation, OcerzAbiSig *out)
         p++;
         if (ret == 'k') {
             int rc = abi_parse_block(notation, -1, &p, sig.ret_cb);
+            if (rc != OCERZ_OK)
+                return rc;
+        } else if (ret == 'c') {
+            int rc = abi_parse_callback(notation, -1, &p, sig.ret_cb);
             if (rc != OCERZ_OK)
                 return rc;
         }
@@ -1179,6 +1181,26 @@ static inline __attribute__((always_inline)) void abi_write_scalar_result(char r
     cpu->gpr[OCERZ_RSP] = rsp + 8;
 }
 
+/* A function a native call answers: the guest's own when it is one of ocerz's
+   callbacks onto guest code, guest code itself, or else a thunk the guest can
+   call, made once per native function. */
+static uint64_t abi_function_to_guest(uint64_t native, const char *notation)
+{
+    if (!native)
+        return 0;
+    uint64_t guest = 0;
+    if (ocerz_abi_callback_sig((const void *)(uintptr_t)native, &guest) && guest)
+        return guest;
+    uint64_t as_guest = ocerz_h2g((const void *)(uintptr_t)native);
+    if (ocerz_abi_is_guest_code(as_guest))
+        return as_guest;
+    uint64_t thunk = ocerz_bridge_native_thunk((const void *)(uintptr_t)native, "(returned function)", notation);
+    if (!thunk)
+        fprintf(stderr, "ocerz: abi: native code returned function %#llx (%s), and no thunk could be made for"
+                " the guest to call it, so the guest is handed null\n", (unsigned long long)native, notation);
+    return thunk;
+}
+
 void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, const OcerzAbiCall *call)
 {
     if (!sig || !cpu || !call)
@@ -1190,6 +1212,14 @@ void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, const OcerzAb
         cpu->ftop = (cpu->ftop - 1) & 7;
         cpu->fpr[cpu->ftop] = d;
         cpu->ftw = 0xff;
+        uint64_t rsp = cpu->gpr[OCERZ_RSP];
+        cpu->rip = ocerz_ld(rsp, 8);
+        cpu->gpr[OCERZ_RSP] = rsp + 8;
+        return;
+    }
+
+    if (sig->ret == 'c') {
+        cpu->gpr[OCERZ_RAX] = abi_function_to_guest(call->rx[0], sig->ret_cb);
         uint64_t rsp = cpu->gpr[OCERZ_RSP];
         cpu->rip = ocerz_ld(rsp, 8);
         cpu->gpr[OCERZ_RSP] = rsp + 8;
@@ -1792,6 +1822,18 @@ static void abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64
     switch (sig->ret) {
     case 'v':
         break;
+    case 'c': {
+        uint64_t native = call.rax;
+        if (native && ocerz_abi_is_guest_code(native) &&
+            ocerz_abi_callback_convert(native, sig->ret_cb, &native) != OCERZ_OK) {
+            fprintf(stderr, "ocerz: abi: guest function %#llx (callback slot %u, %s) returned function %#llx,"
+                    " which could not be bound for native code, so native code is handed null\n",
+                    (unsigned long long)e->guest_fn, slot, notation, (unsigned long long)call.rax);
+            native = 0;
+        }
+        out_x[0] = native ? (uint64_t)(uintptr_t)ocerz_g2h(native) : 0;
+        break;
+    }
     case 'k':
         if (ocerz_block_result_to_native(call.rax, sig->ret_cb, &out_x[0]) != OCERZ_OK)
             fprintf(stderr,
