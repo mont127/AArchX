@@ -105,13 +105,24 @@ The component suites inside the unit phase, as last counted in September 2026
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` checks every commit pushed to any branch on GitHub's
-Apple silicon macOS 26 runners, and pull requests from forks. One job builds
-ocerz and runs the unit harnesses; a second, which starts only when the first
-passes, runs `make check`. A gate that skips because its prerequisites are
-missing exits zero, so the second job lists each `SKIP` line it saw as a
-warning and in the run's summary: a green run with skips has not exercised those
-gates. Nothing is cancelled when a newer commit arrives.
+`.github/workflows/ci.yml` checks every commit pushed to any branch, and pull
+requests from forks, on GitHub's `xcode-27` runner image: an Apple silicon
+virtual machine with macOS 27 and Xcode 27, in public preview. The `macos-26`
+image has SDK 26.5, on which `make apis` fails. One job builds ocerz and runs
+the unit harnesses. A second runs `make check` one phase per step, so a failing
+phase does not hide the ones after it, and fails if the Makefile's recipe gains
+a phase the workflow does not run. A gate that skips because its prerequisites
+are missing exits zero, so that job lists each `SKIP` line it saw as a warning
+and in the run's summary: a green run with skips has not exercised those gates.
+Nothing is cancelled when a newer commit arrives.
+
+A hosted runner is a virtual machine, and a few dynamic cases rely on what one
+may not provide: a Metal device that computes, a kernel whose `ntp_gettime`
+works. The dynamic runner builds those cases natively as well and skips one,
+saying so, when the machine's own run of it fails; a failure that only ocerz
+shows stays a failure. `OCERZ_DYNAMIC_TIMEOUT` sets the limit on each run of a
+dynamic case, 30 seconds when unset, and the workflow gives the slower machine
+120.
 
 ## Conventions
 
