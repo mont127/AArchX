@@ -2974,6 +2974,126 @@ int ocerz_objc_dictionary_of_variable_bindings(struct OcerzVM *vm, OcerzCPU *cpu
     return ob_settle(vm, cpu);
 }
 
+/* imp_implementationWithBlock's implementation is guest code, as libobjc's
+   own trampolines are: a stub that moves self over _cmd, puts the block in
+   front of it and jumps to the block's invoke, or for a block that returns a
+   structure in memory does the same one register further on.  Being guest
+   code, the stub crosses class_addMethod and every other call that takes an
+   implementation like any function the guest wrote.  The block is copied
+   first, guest-side for a guest block.  A stub is never rewritten once
+   written, since a translation of it may exist, so imp_removeBlock releases
+   the block and leaves the bytes. */
+#define OB_BLOCK_IMP_BYTES 32u
+#define OB_BLOCK_IMPS 4096
+
+static pthread_mutex_t g_ob_block_imp_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_ob_block_imp_page, g_ob_block_imp_used;
+static uint64_t g_ob_block_imp_at[OB_BLOCK_IMPS], g_ob_block_imp_block[OB_BLOCK_IMPS];
+static int g_ob_block_imps;
+
+static int ob_block_imp_find_locked(uint64_t imp)
+{
+    for (int k = 0; imp && k < g_ob_block_imps; k++)
+        if (g_ob_block_imp_at[k] == imp)
+            return k;
+    return -1;
+}
+
+int ocerz_objc_imp_implementationWithBlock(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t given = cpu->gpr[OCERZ_RDI];
+    if (!given)
+        ob_stop("imp_implementationWithBlock was given no block");
+    uint64_t block = ocerz_block_copy_guest(given);
+    uint64_t invoke = ocerz_ld(block + 16, 8);
+    if (!ocerz_abi_is_guest_code(invoke))
+        ob_stop("imp_implementationWithBlock was given a native block (%#llx), whose invoke an x86 implementation"
+                " cannot call", (unsigned long long)given);
+    int stret = (ocerz_ld(block + 8, 4) & (1u << 29)) != 0;
+    uint8_t code[OB_BLOCK_IMP_BYTES];
+    memset(code, 0xcc, sizeof code);
+    static const uint8_t plain[] = { 0x48, 0x89, 0xfe, 0x48, 0xbf }, plain_jump[] = { 0xff, 0x67, 0x10 };
+    static const uint8_t memory[] = { 0x48, 0x89, 0xf2, 0x48, 0xbe }, memory_jump[] = { 0xff, 0x66, 0x10 };
+    memcpy(code, stret ? memory : plain, 5);
+    memcpy(code + 5, &block, 8);
+    memcpy(code + 13, stret ? memory_jump : plain_jump, 3);
+    pthread_mutex_lock(&g_ob_block_imp_lock);
+    if (g_ob_block_imps == OB_BLOCK_IMPS)
+        ob_stop("imp_implementationWithBlock has made %d implementations, as many as ocerz keeps", OB_BLOCK_IMPS);
+    if (!g_ob_block_imp_page || g_ob_block_imp_used + OB_BLOCK_IMP_BYTES > OCERZ_GUEST_PAGE_SIZE) {
+        g_ob_block_imp_page = ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE);
+        if (!g_ob_block_imp_page)
+            ob_stop("no guest page could be set up for an implementation made from a block");
+        memset(ocerz_g2h(g_ob_block_imp_page), 0xcc, OCERZ_GUEST_PAGE_SIZE);
+        g_ob_block_imp_used = 0;
+    } else if (ocerz_protect(g_ob_block_imp_page, OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE) != OCERZ_OK) {
+        ob_stop("the page of implementations made from blocks could not be made writable");
+    }
+    uint64_t imp = g_ob_block_imp_page + g_ob_block_imp_used;
+    memcpy(ocerz_g2h(imp), code, sizeof code);
+    g_ob_block_imp_used += OB_BLOCK_IMP_BYTES;
+    if (ocerz_protect(g_ob_block_imp_page, OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_EXEC) != OCERZ_OK)
+        ob_stop("the page of implementations made from blocks could not be made executable");
+    g_ob_block_imp_at[g_ob_block_imps] = imp;
+    g_ob_block_imp_block[g_ob_block_imps++] = block;
+    pthread_mutex_unlock(&g_ob_block_imp_lock);
+    ob_return(cpu, imp);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_imp_getBlock(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static ObSym fn = OB_SYM(OCERZ_OBJC_LIBOBJC, "imp_getBlock");
+    uint64_t imp = cpu->gpr[OCERZ_RDI];
+    pthread_mutex_lock(&g_ob_block_imp_lock);
+    int k = ob_block_imp_find_locked(imp);
+    uint64_t block = k >= 0 ? g_ob_block_imp_block[k] : 0;
+    pthread_mutex_unlock(&g_ob_block_imp_lock);
+    if (k < 0 && imp && !ocerz_abi_is_guest_code(imp)) {
+        void *b = ((void *(*)(void *))ob_need(&fn))(ocerz_g2h(imp));
+        block = b ? ocerz_h2g(b) : 0;
+    }
+    ob_return(cpu, block);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_imp_removeBlock(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static ObSym fn = OB_SYM(OCERZ_OBJC_LIBOBJC, "imp_removeBlock");
+    static ObSym release = OB_SYM(OCERZ_BRIDGE_LIBSYSTEM, "_Block_release");
+    uint64_t imp = cpu->gpr[OCERZ_RDI];
+    pthread_mutex_lock(&g_ob_block_imp_lock);
+    int k = ob_block_imp_find_locked(imp);
+    uint64_t block = k >= 0 ? g_ob_block_imp_block[k] : 0;
+    if (k >= 0)
+        g_ob_block_imp_block[k] = 0;
+    pthread_mutex_unlock(&g_ob_block_imp_lock);
+    uint64_t removed = 0;
+    if (k >= 0) {
+        if (block)
+            ((void (*)(void *))ob_need(&release))(ocerz_g2h(block));
+        removed = block != 0;
+    } else if (imp && !ocerz_abi_is_guest_code(imp)) {
+        removed = ((bool (*)(void *))ob_need(&fn))(ocerz_g2h(imp));
+    }
+    ob_return(cpu, removed);
+    return ob_settle(vm, cpu);
+}
+
+/* NSGetUncaughtExceptionHandler answers the function NSSetUncaughtExceptionHandler
+   installed: the guest's own when the native one is ocerz's callback onto it,
+   and otherwise a thunk the guest can call. */
+int ocerz_objc_NSGetUncaughtExceptionHandler(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static ObSym fn = OB_SYM(OCERZ_OBJC_FOUNDATION, "NSGetUncaughtExceptionHandler");
+    void *handler = ((void *(*)(void))ob_need(&fn))();
+    uint64_t guest = 0;
+    if (handler && !(ocerz_abi_callback_sig(handler, &guest) && guest))
+        guest = ocerz_bridge_native_thunk(handler, "(uncaught exception handler)", "v(p)");
+    ob_return(cpu, guest);
+    return ob_settle(vm, cpu);
+}
+
 int ocerz_objc_realizeClassFromSwift(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t cls = cpu->gpr[OCERZ_RDI], previously = cpu->gpr[OCERZ_RSI];
