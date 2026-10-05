@@ -28,7 +28,13 @@
 # call of each libdispatch function that takes or returns a dispatch_time_t, so
 # a failure there points at the boundary rather than at the Swift runtime.  Its
 # bounds are loose enough for a loaded machine and still far tighter than the
-# factor of 41 an unconverted value is off by.
+# factor of 41 an unconverted value is off by.  Its reference is one run of the
+# arm64 build, which means something only if the arm64 build prints the same
+# thing every time, so that build runs twenty times first and the test is
+# skipped, with a SKIP line carrying the difference, when a run differs from the
+# first: on a virtual machine a wait on a walltime deadline can take several
+# times as long as asked, natively too, and then the translated run has no
+# reference to match.  A host whose runs agree still has to be matched.
 #
 # native_swift_bundled is how an app built for systems before 10.14.4 links
 # the Swift runtime: as @rpath/libswiftCore.dylib, with /usr/lib/swift ahead of
@@ -74,10 +80,20 @@ for test in $tests; do
     done
     "$work/$test.arm64" > "$work/$test.expected"
 done
+unsteady=""
+for i in $(seq 1 20); do
+    "$work/native_dispatch_time.arm64" > "$work/native_dispatch_time.again"
+    if ! cmp -s "$work/native_dispatch_time.expected" "$work/native_dispatch_time.again"; then
+        unsteady=native_dispatch_time
+        echo "SKIP native Swift native_dispatch_time: the host's own runs of it differ from one another, run $i: $(diff "$work/native_dispatch_time.expected" "$work/native_dispatch_time.again" | grep '^[<>]' | tr '\n' ' ' || true)"
+        break
+    fi
+done
 for engine in jit interpreter; do
     args=(-native -v)
     if [ "$engine" = interpreter ]; then args+=(-no-jit); fi
     for test in $tests; do
+        if [ "$test" = "$unsteady" ]; then continue; fi
         env OCERZ_GUEST_ROOT="$root" OCERZ_BRIDGESTAT=1 OCERZ_OBJCLOG=1 \
             /usr/bin/perl -e 'alarm 120; exec @ARGV' "$repo/ocerz" "${args[@]}" "$work/$test.x86_64" \
             > "$work/$test.$engine.out" 2> "$work/$test.$engine.err"
