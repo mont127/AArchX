@@ -67,7 +67,7 @@ for engine in jit interpreter slow-bridge; do
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/more.x86_64" > "$work/more.$engine.out" 2> "$work/more.$engine.err"
     cmp "$work/more.expected" "$work/more.$engine.out"
-    echo "PASS native framework sorts, ciphers, locale formats, CF callbacks, UTType, Network, variable bindings, va_list methods, category properties, block implementations and uncaught handlers $engine"
+    echo "PASS native framework sorts, ciphers, locale formats, CF callbacks, UTType, Network, variable bindings, va_list methods, category properties, union results, block implementations and uncaught handlers $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/compat.x86_64" "$work/globdir" > "$work/compat.$engine.out" 2> "$work/compat.$engine.err"
     cmp "$work/compat.expected" "$work/compat.$engine.out"

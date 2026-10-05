@@ -213,6 +213,33 @@ static void uncaught_handlers(void)
            NSGetUncaughtExceptionHandler() == before);
 }
 
+typedef struct {
+    union {
+        char c;
+        int v;
+    } u;
+    bool has;
+} OcerzOptional;
+
+@interface OcerzMenu : NSObject
+- (OcerzOptional)selectedIndex;
+@end
+
+@implementation OcerzMenu
+- (OcerzOptional)selectedIndex
+{
+    OcerzOptional o = { .u.v = 41, .has = true };
+    return o;
+}
+@end
+
+static void union_results(void)
+{
+    OcerzMenu *m = [OcerzMenu new];
+    OcerzOptional a = [m selectedIndex];
+    printf("union results %d %d\n", a.u.v, a.has);
+}
+
 @interface NSNumber (OcerzRedeclared)
 @property (readonly) NSUInteger hash;
 @property (readonly, copy) NSString *ocerzTag;
@@ -303,6 +330,7 @@ int main(void)
         bindings();
         va_list_methods();
         category_properties();
+        union_results();
         block_imps();
         uncaught_handlers();
     }
