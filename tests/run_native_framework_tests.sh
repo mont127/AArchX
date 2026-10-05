@@ -31,6 +31,9 @@ for arch in x86_64 arm64; do
         -framework CoreVideo -framework VideoToolbox -framework CoreFoundation -o "$work/videotoolbox.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_sqlite.c -lsqlite3 -o "$work/sqlite.$arch"
 done
+clang -arch x86_64 -O1 -Wall -Wextra -Werror tests/dynamic/native_ldt.c -o "$work/ldt.x86_64"
+# i386_set_ldt is x86_64 only, so Rosetta is the oracle: this is its line.
+echo 'ldt set=16 read=17 set=0xcffa000000ffff got=0xcffa000000ffff bad=-1 errno=EINVAL' > "$work/ldt.expected"
 mkdir -p "$work/globdir"
 touch "$work/globdir/a.txt" "$work/globdir/b.txt" "$work/globdir/c.log"
 /usr/bin/perl -e 'alarm 60; exec @ARGV' "$work/frameworks.arm64" "$work/cert.der" > "$work/expected" 2> "$work/arm.err"
@@ -102,6 +105,10 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/sqlite.x86_64" > "$work/sqlite.$engine.out" 2> "$work/sqlite.$engine.err"
     cmp "$work/sqlite.expected" "$work/sqlite.$engine.out"
     echo "PASS native sqlite3_config and sqlite3_db_config $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/ldt.x86_64" > "$work/ldt.$engine.out" 2> "$work/ldt.$engine.err"
+    cmp "$work/ldt.expected" "$work/ldt.$engine.out"
+    echo "PASS native i386_set_ldt and i386_get_ldt $engine"
     for refusal in context launch; do
         rc=0
         env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \

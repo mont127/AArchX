@@ -1317,6 +1317,28 @@ static int br_suspend(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t mask)
     return br_settle(vm, cpu);
 }
 
+/* i386_set_ldt and i386_get_ldt keep the table cache mode's machdep calls do:
+   Wine's ntdll.so sets up its 32-bit code and data segments with them. */
+static int br_ldt(struct OcerzVM *vm, OcerzCPU *cpu, int num)
+{
+    long r = ocerz_ldt_call(num, (int32_t)cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI],
+                            (int32_t)cpu->gpr[OCERZ_RDX]);
+    if (r < 0)
+        errno = (int)-r;
+    br_return(cpu, r < 0 ? (uint64_t)-1 : (uint64_t)(uint32_t)r);
+    return br_settle(vm, cpu);
+}
+
+static int br_i386_set_ldt(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_ldt(vm, cpu, 5);
+}
+
+static int br_i386_get_ldt(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_ldt(vm, cpu, 6);
+}
+
 static int br_sigsuspend(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t set = cpu->gpr[OCERZ_RDI];
@@ -2235,6 +2257,8 @@ static const BrHandler g_br_handlers[] = {
     { "signal",          br_signal },
     { "sigprocmask",     br_sigprocmask },
     { "pthread_sigmask", br_pthread_sigmask },
+    { "i386_set_ldt", br_i386_set_ldt },
+    { "i386_get_ldt", br_i386_get_ldt },
     { "sigsuspend", br_sigsuspend },
     { "pause", br_pause },
     { "sigpending", br_sigpending },
