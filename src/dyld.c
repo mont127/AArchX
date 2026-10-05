@@ -1295,6 +1295,18 @@ static uint64_t ocerz_image_self_resolve(DynImage *img, const char *sym)
     return ocerz_image_self_resolve_ex(img, sym, NULL);
 }
 
+uint64_t ocerz_dyld_guest_export(const char *install_name, const char *sym, int *found)
+{
+    *found = 0;
+    DynImage *d = dimg_find_by_install_name(install_name);
+    return d && !d->is_virtual ? ocerz_image_self_resolve_ex(d, sym, found) : 0;
+}
+
+unsigned ocerz_dyld_generation(void)
+{
+    return (unsigned)g_dimgs_n;
+}
+
 static const char *dimg_ordinal_name(DynImage *img, int ord)
 {
     if (ord <= 0)
@@ -1411,6 +1423,36 @@ static void native_miss_add(const char *lib, const char *sym, const char *from)
 }
 
 static uint64_t main_image_resolve_ex(const char *sym, int *found);
+static int native_guest_path(const char *name, char *out, size_t n);
+
+/* An import whose crossing is guest code of runtime/guest's: libSystem's
+   unwinder calls belong to libunwind, and libobjc's exception calls are made of
+   libc++abi's (src/objcbridge.c).  The library is loaded while the import binds,
+   so it is mapped, bound and initialized with the image that needs it. */
+static void native_guest_runtime_for(OcerzCache *cache, DynImage *img, const DynImage *dep, const char *name)
+{
+    static const char *const objc_eh[] = {
+        "_objc_exception_throw", "_objc_exception_rethrow", "_objc_begin_catch",
+        "_objc_end_catch", "_objc_terminate", "___objc_personality_v0",
+    };
+    const char *want = NULL;
+    if (ocerz_mode != OCERZ_MODE_NATIVE || !dep->is_virtual)
+        return;
+    if (strcmp(dep->install_name, "/usr/lib/libSystem.B.dylib") == 0 &&
+        (strncmp(name, "__Unwind_", 9) == 0 || strncmp(name, "_unw_", 5) == 0 ||
+         strcmp(name, "___register_frame") == 0 || strcmp(name, "___deregister_frame") == 0)) {
+        want = "/usr/lib/libunwind.1.dylib";
+    } else if (strcmp(dep->install_name, "/usr/lib/libobjc.A.dylib") == 0) {
+        for (size_t k = 0; !want && k < sizeof objc_eh / sizeof objc_eh[0]; k++)
+            if (strcmp(name, objc_eh[k]) == 0)
+                want = "/usr/lib/libc++abi.dylib";
+    }
+    char path[1024];
+    if (!want || dimg_find_by_install_name(want) || !native_guest_path(want, path, sizeof path))
+        return;
+    if (!load_disk_dylib(cache, want, img, NULL))
+        OCERZ_LOG("dynamic: %s wanted %s for %s and it did not load\n", img->path, want, name);
+}
 
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
                                int libord, int weak)
@@ -1435,6 +1477,7 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
                 }
             }
             if (dep) {
+                native_guest_runtime_for(cache, img, dep, name);
                 value = ocerz_image_self_resolve_ex(dep, name, &found);
                 virtual_dep = ocerz_mode == OCERZ_MODE_NATIVE && ocerz_vdylib_have(tgt);
             }

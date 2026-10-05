@@ -200,13 +200,50 @@
  * double prints as it would in a native process whatever MXCSR the guest set.
  *
  * ---- exceptions ----
- * An Objective-C exception cannot unwind through guest frames.  The unwinder
- * walks the host stack, and the guest's frames are not on it: they are x86
- * frames on the guest's own stack, while the host stack under a crossing holds
- * the native method, ocerz's handler and ocerz's run loop.  So a native
- * exception thrown under a crossing finds no handler even when the guest
- * wrapped the send in @try, and is uncaught.  The native runtime then calls its uncaught-exception handler and
- * terminates.  ocerz_objcbridge_install_uncaught puts ocerz's handler there,
+ * The frames between an Objective-C throw and its @catch are the guest's, x86
+ * frames on the guest's stack, which only an x86 unwinder can walk, so the
+ * guest's exceptions are the guest's C++ runtime's: runtime/guest's libc++abi
+ * and libunwind, which binding any of libobjc's exception calls loads
+ * (src/dyld.c).  Apple's open-source libobjc builds its exceptions on the C++
+ * runtime in the same way, and these follow it.  objc_exception_throw retains
+ * the object, allocates a 32-byte exception, the object and then a type_info
+ * naming its class, with __cxa_allocate_exception, and enters __cxa_throw with a
+ * destructor that releases the object; objc_exception_rethrow,
+ * objc_begin_catch, objc_end_catch, objc_terminate and __objc_personality_v0
+ * enter __cxa_rethrow, __cxa_begin_catch, __cxa_end_catch, std::terminate and
+ * __gxx_personality_v0 with the guest's registers as they are.  Each jumps
+ * rather than calls, so no host frame is left under the guest's unwinding.
+ *
+ * The C++ runtime matches a @catch clause by calling the can_catch entry of the
+ * clause's type_info vtable.  Every type the guest can name has a vtable of
+ * guest memory: objc_ehtype_vtable, which the compiler points the types it emits
+ * for a guest's own classes at, and _OBJC_EHTYPE_id and the _OBJC_EHTYPE_$_
+ * exports of CoreFoundation and CloudKit, which are variables of the
+ * synthesized images built around one shared vtable page, since the host's are
+ * arm64 objects with arm64 entries (src/vdylib.c).  Their entries lead to
+ * ocerz's trampolines: can_catch answers whether the thrown object's class is
+ * the clause's or a subclass of it, a class of zero meaning id, and the rest
+ * answer false.  A thrown type is recognized by that vtable, so a C++
+ * exception never matches an Objective-C clause.  Guest classes keep their
+ * addresses in the native runtime, so a clause naming one compares directly.
+ *
+ * An exception native code raises unwinds the host stack, where above the
+ * native frames lie the send handler and ocerz's own frames.  Each send runs
+ * its native call inside ocerz_objc_guarded (src/objcguard.s) whenever the
+ * guest's C++ runtime is loaded, a frame whose personality claims any
+ * exception, so the native frames' cleanups run on the way to it, and
+ * ocerz_objc_guard_landed takes an Objective-C one's object with the host
+ * C++ runtime's catch calls and retains it.  The send then throws that object
+ * into the guest from the send's own call site, as though objc_msgSend had
+ * thrown it.  Any other exception is rethrown past the guard.  An exception
+ * that reaches the edge of a callback native code made into the guest, or the
+ * end of the guest's frames, is uncaught: the guest's terminate handler, which
+ * the first throw installs, hands an Objective-C one to the uncaught-exception
+ * handler the guest set, or to ocerz's, and aborts, as the native runtime does.
+ * Without runtime/guest the exception calls name themselves, as before.
+ *
+ * The native runtime's own uncaught-exception path is still there for a native
+ * exception raised where nothing guards it.  ocerz_objcbridge_install_uncaught puts ocerz's handler there,
  * once, when a guest that links libobjc is loaded: it prints the exception's name
  * and reason and the innermost crossing, which for a send is the selector, as
  * "ocerz: bridge: uncaught Objective-C exception <name>: <reason> during <sym>",
@@ -289,6 +326,7 @@
 
 #include <Block.h>
 #include <ctype.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -297,6 +335,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <mach-o/loader.h>
+#include <stddef.h>
+#include <unwind.h>
 
 #define OB_SMALL_STRUCT 16
 #define OB_SHAPE_BUCKETS 512
@@ -347,6 +387,8 @@ static ObSym g_ob_alloc = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_alloc");
 static ObSym g_ob_alloc_init = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_alloc_init");
 static ObSym g_ob_allocWithZone = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_allocWithZone");
 static ObSym g_ob_release = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_release");
+static ObSym g_ob_retain = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_retain");
+static ObSym g_ob_ehtype_vtable = OB_SYM(OCERZ_OBJC_LIBOBJC, "objc_ehtype_vtable");
 static ObSym g_ob_CFStringGetLength = OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStringGetLength");
 static ObSym g_ob_CFStringGetMaximumSizeForEncoding =
     OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStringGetMaximumSizeForEncoding");
@@ -1837,6 +1879,26 @@ void *ocerz_objc_imp_from_guest(uint64_t guest_imp)
     return NULL;
 }
 
+typedef struct ObEh ObEh;
+static const ObEh *ob_eh(void);
+static int ob_eh_throw(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t gobj, int owned);
+extern int ocerz_objc_guarded(void (*body)(void *), void *ctx, void **caught);
+
+typedef struct ObGuarded {
+    OcerzCPU *cpu;
+    const OcerzAbiSig *sig;
+    const void *fn;
+    const uint64_t *slots;
+    int nslots;
+    const char *what;
+} ObGuarded;
+
+static void ob_guarded_body(void *ctx)
+{
+    ObGuarded *g = ctx;
+    ob_perform(g->cpu, g->sig, g->fn, g->slots, g->nslots, 0, g->what);
+}
+
 static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret, void *imp,
                        const char *imp_types)
 {
@@ -1959,7 +2021,16 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
     int answers_imp = sig->ret == 'p' && sig->nargs == 3 && ob_answers_imp(sel);
     if (answers_imp)
         asked = (void *)(uintptr_t)ob_named(sig, cpu, 2, 'p');
-    ob_perform(cpu, sig, fn, slots, nslots, 0, selname);
+    void *raised = NULL;
+    if (ob_eh()) {
+        ObGuarded g = { cpu, sig, fn, slots, nslots, selname };
+        if (ocerz_objc_guarded(ob_guarded_body, &g, &raised)) {
+            ocerz_bridge_lower(&outer);
+            return ob_eh_throw(vm, cpu, raised ? ocerz_h2g(raised) : 0, 1);
+        }
+    } else {
+        ob_perform(cpu, sig, fn, slots, nslots, 0, selname);
+    }
     if (answers_imp && cpu->gpr[OCERZ_RAX]) {
         void *of = sel == atomic_load(&g_ob_sel_instanceMethodFor) ? recv : cls;
         void *m = asked && of ? ob_class_getInstanceMethod(of, asked) : NULL;
@@ -1975,9 +2046,10 @@ static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
     return ob_send_via(vm, cpu, kind, stret, NULL, NULL);
 }
 
+static _Atomic uint64_t g_ob_guest_preprocessor;
+
 int ocerz_objc_setExceptionPreprocessor(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    static _Atomic uint64_t installed;
     uint64_t wanted = cpu->gpr[OCERZ_RDI];
     void *fn = ob_need(&g_ob_setExceptionPreprocessor);
     struct OcerzBridgeFrame outer;
@@ -1987,7 +2059,7 @@ int ocerz_objc_setExceptionPreprocessor(struct OcerzVM *vm, OcerzCPU *cpu)
         ob_stop("objc_setExceptionPreprocessor could not bind preprocessor %#llx",
                 (unsigned long long)wanted);
     ((void *(*)(void *))fn)(native ? ocerz_g2h(native) : NULL);
-    uint64_t before = atomic_exchange(&installed, wanted);
+    uint64_t before = atomic_exchange(&g_ob_guest_preprocessor, wanted);
     ocerz_bridge_lower(&outer);
     ob_return(cpu, before);
     return ob_settle(vm, cpu);
@@ -2427,6 +2499,7 @@ int ocerz_fmt_CFStringAppendFormatAndArguments(struct OcerzVM *vm, OcerzCPU *cpu
 
 static void *_Atomic g_ob_native_prev;
 static _Atomic uint64_t g_ob_guest_handler;
+static void *_Atomic g_ob_guest_handler_native;
 static pthread_once_t g_ob_uncaught_once = PTHREAD_ONCE_INIT;
 
 static void ob_exception_text(void *exc, const char *selname, char *buf, size_t len)
@@ -2503,8 +2576,337 @@ int ocerz_objc_setUncaughtExceptionHandler(struct OcerzVM *vm, OcerzCPU *cpu)
     ((void *(*)(void *))set)(guest ? ocerz_g2h(native) : (void *)ob_uncaught);
     ocerz_bridge_lower(&outer);
 
+    atomic_store(&g_ob_guest_handler_native, guest ? ocerz_g2h(native) : NULL);
     ob_return(cpu, atomic_exchange(&g_ob_guest_handler, guest));
     return ob_settle(vm, cpu);
+}
+
+#define OB_GUEST_CXXABI "/usr/lib/libc++abi.dylib"
+#define OB_EH_VTABLE_WORDS 10
+#define OB_EH_OBJECT_BYTES 32
+#define OB_EH_NO_CLASS 1ull
+
+typedef struct ObEh {
+    uint64_t alloc, throw_fn, rethrow, begin_catch, end_catch, terminate, set_terminate, personality,
+        current_type;
+} ObEh;
+
+static ObEh g_ob_eh;
+static _Atomic int g_ob_eh_ready;
+static _Atomic unsigned g_ob_eh_missed_at = ~0u;
+static pthread_mutex_t g_ob_eh_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_ob_eh_vtable_page;
+static _Atomic uint64_t g_ob_eh_prev_terminate;
+static _Atomic int g_ob_eh_terminate_set;
+
+static const ObEh *ob_eh(void)
+{
+    if (atomic_load(&g_ob_eh_ready))
+        return &g_ob_eh;
+    unsigned gen = ocerz_dyld_generation();
+    if (atomic_load(&g_ob_eh_missed_at) == gen)
+        return NULL;
+    static const struct {
+        const char *sym;
+        size_t at;
+    } want[] = {
+        { "___cxa_allocate_exception", offsetof(ObEh, alloc) },
+        { "___cxa_throw", offsetof(ObEh, throw_fn) },
+        { "___cxa_rethrow", offsetof(ObEh, rethrow) },
+        { "___cxa_begin_catch", offsetof(ObEh, begin_catch) },
+        { "___cxa_end_catch", offsetof(ObEh, end_catch) },
+        { "__ZSt9terminatev", offsetof(ObEh, terminate) },
+        { "__ZSt13set_terminatePFvvE", offsetof(ObEh, set_terminate) },
+        { "___gxx_personality_v0", offsetof(ObEh, personality) },
+        { "___cxa_current_exception_type", offsetof(ObEh, current_type) },
+    };
+    pthread_mutex_lock(&g_ob_eh_lock);
+    if (!atomic_load(&g_ob_eh_ready)) {
+        ObEh e;
+        int ok = 1;
+        for (size_t k = 0; ok && k < sizeof want / sizeof want[0]; k++) {
+            int found = 0;
+            uint64_t a = ocerz_dyld_guest_export(OB_GUEST_CXXABI, want[k].sym, &found);
+            ok = found && a;
+            memcpy((char *)&e + want[k].at, &a, sizeof a);
+        }
+        if (ok) {
+            g_ob_eh = e;
+            atomic_store(&g_ob_eh_ready, 1);
+        } else {
+            atomic_store(&g_ob_eh_missed_at, gen);
+        }
+    }
+    pthread_mutex_unlock(&g_ob_eh_lock);
+    return atomic_load(&g_ob_eh_ready) ? &g_ob_eh : NULL;
+}
+
+static void ob_eh_vtable_words(uint8_t *slot, uint32_t size)
+{
+    uint64_t no = ocerz_vdylib_trampoline(OCERZ_VDYLIB_TRAMP_OBJC_EH_FALSE);
+    uint64_t words[OB_EH_VTABLE_WORDS] = { 0, 0, no, no, no, no,
+                                           ocerz_vdylib_trampoline(OCERZ_VDYLIB_TRAMP_OBJC_EH_DO_CATCH),
+                                           no, no, no };
+    memset(slot, 0, size);
+    memcpy(slot, words, size < sizeof words ? size : sizeof words);
+}
+
+static uint64_t ob_eh_vtable(void)
+{
+    uint64_t page = atomic_load(&g_ob_eh_vtable_page);
+    if (page)
+        return page;
+    pthread_mutex_lock(&g_ob_eh_lock);
+    page = atomic_load(&g_ob_eh_vtable_page);
+    if (!page) {
+        uint64_t made = ocerz_map_anywhere(OCERZ_GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE);
+        if (made) {
+            ob_eh_vtable_words(ocerz_g2h(made), OB_EH_VTABLE_WORDS * 8);
+            if (ocerz_protect(made, OCERZ_GUEST_PAGE_SIZE, PROT_READ) == OCERZ_OK)
+                page = made;
+            else
+                ocerz_unmap(made, OCERZ_GUEST_PAGE_SIZE);
+        }
+        atomic_store(&g_ob_eh_vtable_page, page);
+    }
+    pthread_mutex_unlock(&g_ob_eh_lock);
+    if (!page)
+        ob_stop("no guest page could be set up for the Objective-C exception type table");
+    return page;
+}
+
+void ocerz_objc_fill_ehtype_vtable(uint8_t *slot, uint32_t size, const char *install_name,
+                                   const char *export_name, OcerzVdylibHostSym host_sym)
+{
+    (void)install_name;
+    (void)export_name;
+    (void)host_sym;
+    ob_eh_vtable_words(slot, size);
+}
+
+void ocerz_objc_fill_ehtype(uint8_t *slot, uint32_t size, const char *install_name, const char *export_name,
+                            OcerzVdylibHostSym host_sym)
+{
+    uint64_t words[3] = { ob_eh_vtable() + 16, 0, 0 };
+    if (strcmp(export_name, "_OBJC_EHTYPE_id") == 0) {
+        words[1] = ocerz_h2g("id");
+    } else {
+        void *const *host = host_sym ? host_sym(install_name, export_name + 1) : NULL;
+        if (host && host[2]) {
+            words[1] = host[1] ? ocerz_h2g(host[1]) : 0;
+            words[2] = ocerz_h2g(host[2]);
+        } else {
+            OCERZ_LOG("objc: %s has no %s on this host, so a @catch naming it catches nothing\n",
+                      install_name, export_name);
+            words[1] = ocerz_h2g(export_name + sizeof "_OBJC_EHTYPE_$_" - 1);
+            words[2] = OB_EH_NO_CLASS;
+        }
+    }
+    memset(slot, 0, size);
+    memcpy(slot, words, size < sizeof words ? size : sizeof words);
+}
+
+static _Noreturn void ob_eh_absent(const char *sym)
+{
+    fprintf(stderr, "ocerz: bridge: %s %s not implemented: Objective-C exceptions in native mode need the"
+            " guest C++ runtime, which %s does not hold (run make guest-cxx)\n", OCERZ_OBJC_LIBOBJC, sym,
+            "the guest root");
+    fflush(stderr);
+    exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+}
+
+static void ob_eh_install_terminate(struct OcerzVM *vm, const ObEh *eh, uint64_t stack_top)
+{
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_ob_eh_terminate_set, &expected, 1))
+        return;
+    uint64_t args[1] = { ocerz_vdylib_trampoline(OCERZ_VDYLIB_TRAMP_OBJC_EH_TERMINATE) };
+    atomic_store(&g_ob_eh_prev_terminate, ocerz_vm_call(vm, eh->set_terminate, args, 1, stack_top));
+}
+
+static int ob_eh_throw(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t gobj, int owned)
+{
+    const ObEh *eh = ob_eh();
+    if (!eh)
+        ob_eh_absent("_objc_exception_throw");
+    uint64_t stack_top = (cpu->gpr[OCERZ_RSP] - 256) & ~0xfull;
+    ob_eh_install_terminate(vm, eh, stack_top);
+    uint64_t pre = atomic_load(&g_ob_guest_preprocessor);
+    if (pre && !owned) {
+        uint64_t args[1] = { gobj };
+        gobj = ocerz_vm_call(vm, pre, args, 1, stack_top);
+    }
+    void *obj = gobj ? ocerz_g2h(gobj) : NULL;
+    if (obj && !owned)
+        ((void *(*)(void *))ob_need(&g_ob_retain))(obj);
+    uint64_t size[1] = { OB_EH_OBJECT_BYTES };
+    uint64_t exc = ocerz_vm_call(vm, eh->alloc, size, 1, stack_top);
+    void *cls = obj ? ob_object_getClass(obj) : NULL;
+    ocerz_st(exc, 8, gobj);
+    ocerz_st(exc + 8, 8, ob_eh_vtable() + 16);
+    ocerz_st(exc + 16, 8, ocerz_h2g(cls ? ob_class_getName(cls) : "nil"));
+    ocerz_st(exc + 24, 8, cls ? ocerz_h2g(cls) : 0);
+    cpu->gpr[OCERZ_RDI] = exc;
+    cpu->gpr[OCERZ_RSI] = exc + 8;
+    cpu->gpr[OCERZ_RDX] = ocerz_vdylib_trampoline(OCERZ_VDYLIB_TRAMP_OBJC_EH_DESTROY);
+    cpu->rip = eh->throw_fn;
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_exception_throw(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_eh_throw(vm, cpu, cpu->gpr[OCERZ_RDI], 0);
+}
+
+static int ob_eh_jump(struct OcerzVM *vm, OcerzCPU *cpu, size_t at, const char *sym)
+{
+    const ObEh *eh = ob_eh();
+    if (!eh)
+        ob_eh_absent(sym);
+    uint64_t target;
+    memcpy(&target, (const char *)eh + at, sizeof target);
+    cpu->rip = target;
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_exception_rethrow(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_eh_jump(vm, cpu, offsetof(ObEh, rethrow), "_objc_exception_rethrow");
+}
+
+int ocerz_objc_begin_catch(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_eh_jump(vm, cpu, offsetof(ObEh, begin_catch), "_objc_begin_catch");
+}
+
+int ocerz_objc_end_catch(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_eh_jump(vm, cpu, offsetof(ObEh, end_catch), "_objc_end_catch");
+}
+
+int ocerz_objc_terminate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_eh_jump(vm, cpu, offsetof(ObEh, terminate), "_objc_terminate");
+}
+
+int ocerz_objc_personality_v0(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_eh_jump(vm, cpu, offsetof(ObEh, personality), "___objc_personality_v0");
+}
+
+int ocerz_objc_eh_false(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    ob_return(cpu, 0);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_eh_do_catch(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t catch_ti = cpu->gpr[OCERZ_RDI], throw_ti = cpu->gpr[OCERZ_RSI], objp = cpu->gpr[OCERZ_RDX];
+    uint64_t caught = 0;
+    if (throw_ti && objp && ocerz_ld(throw_ti, 8) == ob_eh_vtable() + 16) {
+        uint64_t thrown = ocerz_ld(objp, 8);
+        uint64_t gobj = thrown ? ocerz_ld(thrown, 8) : 0;
+        uint64_t want = catch_ti ? ocerz_ld(catch_ti + 16, 8) : 0;
+        if (!want) {
+            caught = 1;
+        } else if (want != OB_EH_NO_CLASS && gobj) {
+            void *wanted = ocerz_g2h(want);
+            for (void *c = ob_object_getClass(ocerz_g2h(gobj)); c && !caught; c = ob_class_getSuperclass(c))
+                caught = c == wanted;
+        }
+        if (caught)
+            ocerz_st(objp, 8, gobj);
+    }
+    ob_return(cpu, caught);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_eh_destroy(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t thrown = cpu->gpr[OCERZ_RDI];
+    uint64_t gobj = thrown ? ocerz_ld(thrown, 8) : 0;
+    if (gobj)
+        ((void (*)(void *))ob_need(&g_ob_release))(ocerz_g2h(gobj));
+    ob_return(cpu, 0);
+    return ob_settle(vm, cpu);
+}
+
+int ocerz_objc_eh_terminate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    const ObEh *eh = ob_eh();
+    uint64_t stack_top = (cpu->gpr[OCERZ_RSP] - 256) & ~0xfull;
+    uint64_t ti = eh ? ocerz_vm_call(vm, eh->current_type, NULL, 0, stack_top) : 0;
+    if (ti && ocerz_ld(ti, 8) == ob_eh_vtable() + 16) {
+        uint64_t gobj = ocerz_ld(ti - 8, 8);
+        void *obj = gobj ? ocerz_g2h(gobj) : NULL;
+        void (*handler)(void *) = atomic_load(&g_ob_guest_handler_native);
+        if (handler)
+            handler(obj);
+        else
+            ob_uncaught(obj);
+        fprintf(stderr, "libc++abi: terminating due to uncaught exception of type %s\n",
+                obj ? ob_class_getName(ob_object_getClass(obj)) : "nil");
+        fflush(stderr);
+        abort();
+    }
+    uint64_t prev = atomic_load(&g_ob_eh_prev_terminate);
+    if (!prev)
+        abort();
+    cpu->rip = prev;
+    return ob_settle(vm, cpu);
+}
+
+extern const uintptr_t ocerz_objc_guard_pad;
+_Unwind_Reason_Code ocerz_objc_guard_personality(int version, _Unwind_Action actions, uint64_t exception_class,
+                                                 struct _Unwind_Exception *ue, struct _Unwind_Context *context);
+int ocerz_objc_guard_landed(struct _Unwind_Exception *ue, void **caught);
+
+static __thread struct _Unwind_Exception *g_ob_guard_passing;
+
+_Unwind_Reason_Code ocerz_objc_guard_personality(int version, _Unwind_Action actions, uint64_t exception_class,
+                                                 struct _Unwind_Exception *ue, struct _Unwind_Context *context)
+{
+    (void)exception_class;
+    if (version != 1 || (actions & _UA_FORCE_UNWIND) || ue == g_ob_guard_passing)
+        return _URC_CONTINUE_UNWIND;
+    if (actions & _UA_SEARCH_PHASE)
+        return _URC_HANDLER_FOUND;
+    if (!(actions & _UA_HANDLER_FRAME))
+        return _URC_CONTINUE_UNWIND;
+    _Unwind_SetGR(context, 0, (uintptr_t)ue);
+    _Unwind_SetIP(context, ocerz_objc_guard_pad);
+    return _URC_INSTALL_CONTEXT;
+}
+
+static void *ob_cxxabi(const char *name)
+{
+    void *a = dlsym(RTLD_DEFAULT, name);
+    if (!a)
+        ob_stop("the native C++ runtime has no %s, which catching a native exception needs", name);
+    return a;
+}
+
+int ocerz_objc_guard_landed(struct _Unwind_Exception *ue, void **caught)
+{
+    void *(*begin)(void *) = (void *(*)(void *))ob_cxxabi("__cxa_begin_catch");
+    void (*end)(void) = (void (*)(void))ob_cxxabi("__cxa_end_catch");
+    void *const *(*type_of)(void) = (void *const *(*)(void))ob_cxxabi("__cxa_current_exception_type");
+    void (*rethrow)(void) = (void (*)(void))ob_cxxabi("__cxa_rethrow");
+    void *const *vtable = ob_need(&g_ob_ehtype_vtable);
+    begin(ue);
+    void *const *type = type_of();
+    if (type && type[0] == (void *)(vtable + 2)) {
+        void *obj = *(void **)(ue + 1);
+        if (obj)
+            ((void *(*)(void *))ob_need(&g_ob_retain))(obj);
+        end();
+        *caught = obj;
+        return 1;
+    }
+    g_ob_guard_passing = ue;
+    rethrow();
+    abort();
 }
 
 int ocerz_objc_realizeClassFromSwift(struct OcerzVM *vm, OcerzCPU *cpu)

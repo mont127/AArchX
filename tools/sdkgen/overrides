@@ -356,19 +356,24 @@
 # stret _debug and fpret lookup entries that only x86_64 libobjc has were
 # omitted as undeclared and missing on the host, so those are named one by one.
 #
-# Exceptions.  Throwing an Objective-C exception unwinds through the frames
-# between the throw and the catch, and those are translated guest frames and
-# ocerz's own, which the native unwinder cannot walk.  So objc_exception_throw
-# and objc_exception_rethrow, objc_begin_catch and objc_end_catch,
-# objc_terminate, the __objc_personality_v0 personality routine and the legacy
-# objc_addExceptionHandler and objc_removeExceptionHandler all name themselves.
-# objc_setUncaughtExceptionHandler is special, because it hands back the
-# handler it replaces, which the rules refuse as a function pointer returned to
-# the guest.
-# _OBJC_EHTYPE_id is bound as data like every class's exception type, because a
-# guest with an @catch (id) clause references it from its type table whether or
-# not anything is ever thrown, and objc_ehtype_vtable for the same reason: the
-# compiler points the exception type it emits for a guest's own class at it.
+# Exceptions.  Throwing an Objective-C exception unwinds the frames between the
+# throw and the catch, and in native mode those are translated guest frames,
+# which only the guest's own unwinder can walk.  So objc_exception_throw,
+# objc_exception_rethrow, objc_begin_catch, objc_end_catch, objc_terminate and
+# the __objc_personality_v0 personality routine are special: each is built
+# from runtime/guest's libc++abi the way Apple's open-source libobjc builds
+# them from the C++ runtime, and binding one loads that library
+# (src/objcbridge.c).  The legacy objc_addExceptionHandler and
+# objc_removeExceptionHandler name themselves.  objc_setUncaughtExceptionHandler
+# is special, because it hands back the handler it replaces, which the rules
+# refuse as a function pointer returned to the guest.
+# An exception type is the C++ runtime's type_info for a class, and the C++
+# runtime matches a @catch clause by calling into its vtable, so objc_ehtype_vtable
+# and _OBJC_EHTYPE_id, and the _OBJC_EHTYPE_$_ exports of CoreFoundation and
+# CloudKit, are variables of guest memory whose vtable entries lead to ocerz
+# rather than the host's arm64 objects: the compiler points the exception type
+# it emits for a guest's own class at objc_ehtype_vtable, and a @catch names
+# the exported ones from its type table whether or not anything is ever thrown.
 #
 # Implementations handed to the guest.  method_getImplementation and
 # class_getMethodImplementation answer an IMP, and class_replaceMethod and
@@ -472,9 +477,8 @@
 # NSApplicationLoad crosses too.
 #
 # NSAccessibilityRaiseBadArgumentException exists to throw an Objective-C
-# exception, which cannot unwind through the guest frames between it and a
-# guest's @catch, so it names itself for the same reason objc_exception_throw
-# does.  The other NSAccessibility functions take and return objects, strings,
+# exception, and a native exception is caught for the guest only where a send
+# returns to it, not under a function call, so it names itself.  The other NSAccessibility functions take and return objects, strings,
 # points and rectangles, and cross.
 #
 # Nothing else in AppKit's C interface hands native code a function pointer:
@@ -987,15 +991,16 @@ stub _objc_msgSend_fpret_fixup override
 stub _objc_msgSend_stret_debug override
 stub _objc_msgSend_stret_fixup override
 
-stub _objc_exception_* override
-stub ___objc_personality* override
-stub _objc_begin_catch override
-stub _objc_end_catch override
-stub _objc_terminate override
+special _objc_exception_throw objc_exception_throw
+special _objc_exception_rethrow objc_exception_rethrow
+special ___objc_personality_v0 objc_personality_v0
+special _objc_begin_catch objc_begin_catch
+special _objc_end_catch objc_end_catch
+special _objc_terminate objc_terminate
 stub _objc_addExceptionHandler override
 stub _objc_removeExceptionHandler override
-data _OBJC_EHTYPE_id OBJC_EHTYPE_id
-data _objc_ehtype_vtable objc_ehtype_vtable
+var _OBJC_EHTYPE_id 24 objc_ehtype
+var _objc_ehtype_vtable 80 objc_ehtype_vtable
 data __objc_empty_cache _objc_empty_cache
 
 stub __objc_setHook_* override
@@ -1348,3 +1353,11 @@ opaque __sFILE
 library /usr/lib/libxcselect.dylib
 
 fn _xcselect_invoke_xcrun xcselect_invoke_xcrun v(pipi)
+
+library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+
+var _OBJC_EHTYPE_$_NSException 24 objc_ehtype
+
+library /System/Library/Frameworks/CloudKit.framework/Versions/A/CloudKit
+
+var _OBJC_EHTYPE_$_CKException 24 objc_ehtype
