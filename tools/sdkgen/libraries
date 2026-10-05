@@ -141,6 +141,8 @@ pass UserNotifications.h
 
 library OpenGL /System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL System/Library/Frameworks/OpenGL.framework/OpenGL.tbd
 pass OpenGL.h
+pass libGL.h
+pass libGL3.h
 
 library libGL /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.tbd
 pass libGL.h

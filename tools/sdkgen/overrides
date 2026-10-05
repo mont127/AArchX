@@ -910,6 +910,16 @@ special _openat$NOCANCEL openat_nocancel
 special _open_dprotected_np open_dprotected_np
 special _openat_dprotected_np openat_dprotected_np
 special _guarded_open_np guarded_open_np
+special ___udivti3 udivti3
+special ___umodti3 umodti3
+special ___udivmodti4 udivmodti4
+special ___divti3 divti3
+special ___modti3 modti3
+special ___clzti2 clzti2
+special ___fixdfti fixdfti
+special ___fixsfti fixsfti
+special ___fixunsdfti fixunsdfti
+special ___fixunssfti fixunssfti
 special _guarded_open_dprotected_np guarded_open_dprotected_np
 special _fcntl fcntl
 special _fcntl$NOCANCEL fcntl_nocancel

@@ -207,6 +207,18 @@
  * program ends there, and its exit comes from a job on that queue.  A call from
  * any other thread stops the process, as libdispatch's own check does.
  *
+ * ---- 128-bit arithmetic ----
+ * compiler-rt's __udivti3, __umodti3, __divti3, __modti3, __udivmodti4,
+ * __clzti2 and the __fix conversions to 128-bit integers are what a compiler
+ * calls for __int128 division and conversion, and no header declares them.
+ * System V passes a 128-bit integer in two registers, low half first, and
+ * returns one in RAX and RDX, so each is computed here from the guest's
+ * registers.  Dividing by zero raises SIGFPE with FPE_INTDIV, as the real
+ * routine's divide instruction does under Rosetta, and a guest with no handler
+ * for it dies of it.  A conversion out of range saturates, as compiler-rt's
+ * does: to the largest or smallest value by the sign, a NaN by its sign bit,
+ * and to zero for an unsigned one below zero.
+ *
  * ---- the floating-point environment ----
  * fenv.h's functions read and change the guest's x87 control and status words
  * and its MXCSR, which live in OcerzCPU, and x86 numbers its exception flags
@@ -243,6 +255,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <limits.h>
+#include <math.h>
 #include <paths.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -459,6 +472,145 @@ int ocerz_sys_guarded_open_dprotected_np(struct OcerzVM *vm, OcerzCPU *cpu)
     int r = guarded_open_dprotected_np(path, guard, guardflags, flags, cls, dpflags, mode);
     ocerz_bridge_lower(&outer);
     return sb_ret(vm, cpu, r);
+}
+
+typedef unsigned __int128 sb_u128;
+typedef __int128 sb_i128;
+
+static sb_u128 sb_arg128(const OcerzCPU *cpu, int first)
+{
+    return (sb_u128)sb_arg(cpu, first) | (sb_u128)sb_arg(cpu, first + 1) << 64;
+}
+
+static int sb_ret128(struct OcerzVM *vm, OcerzCPU *cpu, sb_u128 v)
+{
+    cpu->gpr[OCERZ_RDX] = (uint64_t)(v >> 64);
+    return sb_ret(vm, cpu, (int64_t)(uint64_t)v);
+}
+
+static int sb_div128_zero(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t at = ocerz_ld(cpu->gpr[OCERZ_RSP], 8);
+    cpu->gpr[OCERZ_RSP] += 8;
+    cpu->rip = at;
+    if (ocerz_signal_deliver(cpu, OCERZ_SIGFPE, at, OCERZ_FPE_INTDIV, 0))
+        return ocerz_bridge_settle(vm, cpu);
+    fprintf(stderr, "ocerz: guest divided a 128-bit integer by zero, near rip=%#llx\n", (unsigned long long)at);
+    fflush(stderr);
+    signal(SIGFPE, SIG_DFL);
+    raise(SIGFPE);
+    abort();
+}
+
+int ocerz_sys_udivti3(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_u128 a = sb_arg128(cpu, 0), b = sb_arg128(cpu, 2);
+    return b ? sb_ret128(vm, cpu, a / b) : sb_div128_zero(vm, cpu);
+}
+
+int ocerz_sys_umodti3(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_u128 a = sb_arg128(cpu, 0), b = sb_arg128(cpu, 2);
+    return b ? sb_ret128(vm, cpu, a % b) : sb_div128_zero(vm, cpu);
+}
+
+int ocerz_sys_udivmodti4(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_u128 a = sb_arg128(cpu, 0), b = sb_arg128(cpu, 2);
+    uint64_t rem = sb_arg(cpu, 4);
+    if (!b)
+        return sb_div128_zero(vm, cpu);
+    if (rem) {
+        sb_u128 r = a % b;
+        ocerz_st(rem, 8, (uint64_t)r);
+        ocerz_st(rem + 8, 8, (uint64_t)(r >> 64));
+    }
+    return sb_ret128(vm, cpu, a / b);
+}
+
+static sb_i128 sb_i128_min(void)
+{
+    return (sb_i128)((sb_u128)1 << 127);
+}
+
+int ocerz_sys_divti3(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_i128 a = (sb_i128)sb_arg128(cpu, 0), b = (sb_i128)sb_arg128(cpu, 2);
+    if (!b)
+        return sb_div128_zero(vm, cpu);
+    return sb_ret128(vm, cpu, (sb_u128)(b == -1 ? (sb_i128)(0 - (sb_u128)a) : a / b));
+}
+
+int ocerz_sys_modti3(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_i128 a = (sb_i128)sb_arg128(cpu, 0), b = (sb_i128)sb_arg128(cpu, 2);
+    if (!b)
+        return sb_div128_zero(vm, cpu);
+    return sb_ret128(vm, cpu, (sb_u128)(b == -1 ? 0 : a % b));
+}
+
+int ocerz_sys_clzti2(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    sb_u128 a = sb_arg128(cpu, 0);
+    uint64_t hi = (uint64_t)(a >> 64), lo = (uint64_t)a;
+    int n = hi ? __builtin_clzll(hi) : lo ? 64 + __builtin_clzll(lo) : 128;
+    return sb_ret(vm, cpu, n);
+}
+
+static double sb_xmm0(const OcerzCPU *cpu, int single)
+{
+    if (single) {
+        float f;
+        uint32_t w = (uint32_t)cpu->xmm[0].lo;
+        memcpy(&f, &w, sizeof f);
+        return f;
+    }
+    double d;
+    uint64_t w = cpu->xmm[0].lo;
+    memcpy(&d, &w, sizeof d);
+    return d;
+}
+
+static sb_u128 sb_fix_signed(double d)
+{
+    if (isnan(d))
+        return signbit(d) ? (sb_u128)sb_i128_min() : (sb_u128)sb_i128_min() - 1;
+    if (d >= 0x1p127)
+        return (sb_u128)sb_i128_min() - 1;
+    if (d < -0x1p127)
+        return (sb_u128)sb_i128_min();
+    return (sb_u128)(sb_i128)d;
+}
+
+static sb_u128 sb_fix_unsigned(double d)
+{
+    if (isnan(d))
+        return signbit(d) ? 0 : ~(sb_u128)0;
+    if (d < 0)
+        return 0;
+    if (d >= 0x1p128)
+        return ~(sb_u128)0;
+    return (sb_u128)d;
+}
+
+int ocerz_sys_fixdfti(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_ret128(vm, cpu, sb_fix_signed(sb_xmm0(cpu, 0)));
+}
+
+int ocerz_sys_fixsfti(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_ret128(vm, cpu, sb_fix_signed(sb_xmm0(cpu, 1)));
+}
+
+int ocerz_sys_fixunsdfti(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_ret128(vm, cpu, sb_fix_unsigned(sb_xmm0(cpu, 0)));
+}
+
+int ocerz_sys_fixunssfti(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_ret128(vm, cpu, sb_fix_unsigned(sb_xmm0(cpu, 1)));
 }
 
 #define SB_FE_ALL 0x3fu

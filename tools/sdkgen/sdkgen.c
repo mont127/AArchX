@@ -94,8 +94,13 @@
  * through is a structure over sixteen bytes whose every offset and whose size
  * are the natural ones and whose alignment alone is smaller, as CoreMedia's
  * CMTime is under pack(4): System V passes it in memory in whole eightbytes and
- * Apple's arm64 by a pointer to a copy, so neither reads its alignment, where a
- * smaller structure Apple's arm64 may place on the stack at that alignment.  The
+ * Apple's arm64 by a pointer to a copy, so neither reads its alignment.  A
+ * smaller one, such as Carbon's EventHotKeyID under pack(2), goes through too
+ * when every argument of the call fits arm64's registers, eight general and
+ * eight floating-point, counted the way the engine assigns them: in registers
+ * neither side reads its alignment, and only a structure Apple's arm64 places
+ * on the stack is placed at that alignment.  One whose natural alignment is
+ * over eight, which arm64 starts at an even register, never does.  The
  * two architectures then
  * have to agree as they do for any notation.  A structure that cannot be
  * written at all is refused under the first reason met while walking it:
@@ -717,6 +722,7 @@ static long long align_up(long long n, long long align)
 }
 
 static const char *type_class(CXType t, int depth, int is_result, Buf *out);
+static int g_small_align_only;
 
 static const char *flat_record(Flat *f, CXType rec, int depth, int level, long long *size,
                                long long *align);
@@ -949,8 +955,10 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
         Flat f = { &sb, 0, 0, 0 };
         long long size = 0, align = 1;
         const char *r = flat_record(&f, c, depth, 1, &size, &align);
-        if (!r && (f.layout_bad || (f.align_only && size <= 16)))
+        if (!r && (f.layout_bad || (f.align_only && size <= 16 && align > 8)))
             r = "struct-layout";
+        if (!r && f.align_only && size <= 16)
+            g_small_align_only = 1;
         if (!r)
             buf_add(out, buf_str(&sb));
         free(sb.s);
@@ -981,17 +989,40 @@ static const char *fn_notation(CXType fnc, int depth, Buf *out)
         return "no-prototype";
     if (n > SIG_MAX_ARGS)
         return "too-many-args";
+    int outer_small = g_small_align_only;
+    g_small_align_only = 0;
     CXType rs = clang_getResultType(fnc);
     const char *r = type_class(keeps_typedef(rs) ? rs : clang_getResultType(fc), depth, 1, out);
-    if (r)
-        return r;
+    int gprs = 0, fprs = 0;
     buf_addc(out, '(');
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; !r && i < n; i++) {
         CXType as = fnc.kind == TK.FunctionProto ? clang_getArgType(fnc, (unsigned)i) : fc;
+        size_t at = strlen(buf_str(out));
         r = type_class(keeps_typedef(as) ? as : clang_getArgType(fc, (unsigned)i), depth, 0, out);
         if (r)
-            return r;
+            break;
+        const char *note = buf_str(out) + at;
+        if (note[0] != '{') {
+            if (strchr("fdD", note[0]))
+                fprs++;
+            else
+                gprs++;
+            continue;
+        }
+        int same = 1, members = 0;
+        for (const char *c = note + 1; *c && *c != '}'; c++, members++)
+            same &= *c == note[1] && strchr("fd", *c) != NULL;
+        long long size = clang_Type_getSizeOf(canon(clang_getArgType(fc, (unsigned)i)));
+        if (same && members <= 4)
+            fprs += members;
+        else
+            gprs += size > 16 ? 1 : (int)((size + 7) / 8);
     }
+    if (!r && g_small_align_only && (gprs > 8 || fprs > 8))
+        r = "struct-layout";
+    g_small_align_only = outer_small || g_small_align_only;
+    if (r)
+        return r;
     buf_addc(out, ')');
     return NULL;
 }
