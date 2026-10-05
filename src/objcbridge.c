@@ -1022,37 +1022,47 @@ int ocerz_objc_format_classes(const char *fmt, int dialect, char *out, size_t ou
 }
 
 static const OcerzObjcVariadic g_ob_variadic[] = {
-    { "stringWithFormat:",                     OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0 },
-    { "localizedStringWithFormat:",            OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0 },
-    { "initWithFormat:",                       OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0 },
-    { "initWithFormat:locale:",                OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0 },
-    { "appendFormat:",                         OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0 },
-    { "stringByAppendingFormat:",              OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0 },
+    { "stringWithFormat:",                     OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0, 0 },
+    { "localizedStringWithFormat:",            OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0, 0 },
+    { "initWithFormat:",                       OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0, 0 },
+    { "initWithFormat:locale:",                OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0, 0 },
+    { "appendFormat:",                         OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0, 0 },
+    { "stringByAppendingFormat:",              OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 0, 0 },
     { "stringWithValidatedFormat:validFormatSpecifiers:error:",
-                                               OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0 },
+                                               OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0, 0 },
     { "localizedStringWithValidatedFormat:validFormatSpecifiers:error:",
-                                               OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0 },
+                                               OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0, 0 },
     { "initWithValidatedFormat:validFormatSpecifiers:error:",
-                                               OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0 },
+                                               OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0, 0 },
     { "initWithValidatedFormat:validFormatSpecifiers:locale:error:",
-                                               OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0 },
-    { "localizedAttributedStringWithFormat:",  OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 1 },
-    { "appendLocalizedFormat:",                OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 1 },
-    { "raise:format:",                         OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0 },
+                                               OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0, 0 },
+    { "localizedAttributedStringWithFormat:",  OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 1, 0 },
+    { "appendLocalizedFormat:",                OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_CF, 1, 0 },
+    { "raise:format:",                         OCERZ_OBJC_VA_FORMAT, 3, OCERZ_OBJC_FMT_CF, 0, 0 },
     { "handleFailureInMethod:object:file:lineNumber:description:",
-                                               OCERZ_OBJC_VA_FORMAT, 6, OCERZ_OBJC_FMT_CF, 0 },
+                                               OCERZ_OBJC_VA_FORMAT, 6, OCERZ_OBJC_FMT_CF, 0, 0 },
     { "handleFailureInFunction:file:lineNumber:description:",
-                                               OCERZ_OBJC_VA_FORMAT, 5, OCERZ_OBJC_FMT_CF, 0 },
-    { "predicateWithFormat:",                  OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_PREDICATE, 0 },
-    { "expressionWithFormat:",                 OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_PREDICATE, 0 },
-    { "encodeValuesOfObjCTypes:",              OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_TYPES, 0 },
-    { "decodeValuesOfObjCTypes:",              OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_TYPES, 0 },
-    { "arrayWithObjects:",                     OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0 },
-    { "initWithObjects:",                      OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0 },
-    { "setWithObjects:",                       OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0 },
-    { "orderedSetWithObjects:",                OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0 },
-    { "dictionaryWithObjectsAndKeys:",         OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0 },
-    { "initWithObjectsAndKeys:",               OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0 },
+                                               OCERZ_OBJC_VA_FORMAT, 5, OCERZ_OBJC_FMT_CF, 0, 0 },
+    { "predicateWithFormat:",                  OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_PREDICATE, 0, 0 },
+    { "expressionWithFormat:",                 OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_PREDICATE, 0, 0 },
+    { "encodeValuesOfObjCTypes:",              OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_TYPES, 0, 0 },
+    { "decodeValuesOfObjCTypes:",              OCERZ_OBJC_VA_FORMAT, 2, OCERZ_OBJC_FMT_TYPES, 0, 0 },
+    { "arrayWithObjects:",                     OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0, 0 },
+    { "initWithObjects:",                      OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0, 0 },
+    { "setWithObjects:",                       OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0, 0 },
+    { "orderedSetWithObjects:",                OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0, 0 },
+    { "dictionaryWithObjectsAndKeys:",         OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0, 0 },
+    { "initWithObjectsAndKeys:",               OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0, 0 },
+    { "initWithFormat:arguments:",             OCERZ_OBJC_VA_LIST, 2, OCERZ_OBJC_FMT_CF, 0, 3 },
+    { "initWithFormat:locale:arguments:",      OCERZ_OBJC_VA_LIST, 2, OCERZ_OBJC_FMT_CF, 0, 4 },
+    { "initWithValidatedFormat:validFormatSpecifiers:arguments:error:",
+                                               OCERZ_OBJC_VA_LIST, 2, OCERZ_OBJC_FMT_CF, 0, 4 },
+    { "initWithValidatedFormat:validFormatSpecifiers:locale:arguments:error:",
+                                               OCERZ_OBJC_VA_LIST, 2, OCERZ_OBJC_FMT_CF, 0, 5 },
+    { "initWithFormat:options:locale:arguments:", OCERZ_OBJC_VA_LIST, 2, OCERZ_OBJC_FMT_CF, 1, 5 },
+    { "raise:format:arguments:",               OCERZ_OBJC_VA_LIST, 3, OCERZ_OBJC_FMT_CF, 0, 4 },
+    { "predicateWithFormat:arguments:",        OCERZ_OBJC_VA_LIST, 2, OCERZ_OBJC_FMT_PREDICATE, 0, 3 },
+    { "expressionWithFormat:arguments:",       OCERZ_OBJC_VA_LIST, 2, OCERZ_OBJC_FMT_PREDICATE, 0, 3 },
 };
 
 static const char *ob_arg_at(const char *notation, int index);
@@ -1224,6 +1234,9 @@ static void ob_describe(void *cls, void *sel, const char *enc, const char *sourc
         int arg = v->kind == OCERZ_OBJC_VA_NIL_TERMINATED ? sig->nargs - 1 : v->arg;
         if (arg < 2 || arg >= sig->nargs || sig->arg[arg] != 'p')
             v = NULL;
+        for (int k = 0; v && v->kind == OCERZ_OBJC_VA_LIST && k <= v->va; k++)
+            if (v->va > 5 || v->va >= sig->nargs || strchr("fd{D", sig->arg[k]) || (k == v->va && sig->arg[k] != 'p'))
+                v = NULL;
     }
 
     memset(out, 0, sizeof *out);
@@ -1998,6 +2011,21 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
                 ocerz_abi_va_arg(&va, cpu, 'p', &slots[nslots]);
             } while (slots[nslots++] != 0);
         }
+    } else if (v && v->kind == OCERZ_OBJC_VA_LIST) {
+        static const int regs[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
+        uint64_t fmt = ob_named(sig, cpu, v->arg, 'p');
+        uint64_t list = ob_named(sig, cpu, v->va, 'p');
+        ObText text;
+        char what[160];
+        snprintf(what, sizeof what, "%c[%s %s]", ob_class_isMetaClass(cls) ? '+' : '-',
+                 ob_class_getName(cls), selname);
+        void *obj = (void *)(uintptr_t)fmt;
+        if (v->attributed && obj)
+            obj = ((void *(*)(void *, void *))ob_need(&g_ob_msgSend))(obj, ob_sel_registerName("string"));
+        ob_text(obj, &text, what);
+        ob_gather_va_format(what, text.s, v->dialect, list ? ocerz_h2g((void *)(uintptr_t)list) : 0, slots);
+        ob_text_free(&text);
+        cpu->gpr[regs[v->va]] = ocerz_h2g(slots);
     } else if (v) {
         uint64_t fmt = ob_named(sig, cpu, v->arg, 'p');
         ObText text;
