@@ -29,6 +29,7 @@ for arch in x86_64 arm64; do
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_audio.c -framework CoreAudio -o "$work/audio.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_videotoolbox.c -framework CoreMedia \
         -framework CoreVideo -framework VideoToolbox -framework CoreFoundation -o "$work/videotoolbox.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_sqlite.c -lsqlite3 -o "$work/sqlite.$arch"
 done
 mkdir -p "$work/globdir"
 touch "$work/globdir/a.txt" "$work/globdir/b.txt" "$work/globdir/c.log"
@@ -43,6 +44,7 @@ sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.er
 "$work/lapack_asn1.arm64" > "$work/lapack_asn1.expected"
 "$work/audio.arm64" > "$work/audio.expected"
 "$work/videotoolbox.arm64" > "$work/videotoolbox.expected"
+"$work/sqlite.arm64" > "$work/sqlite.expected"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -96,6 +98,10 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/videotoolbox.x86_64" > "$work/videotoolbox.$engine.out" 2> "$work/videotoolbox.$engine.err"
     cmp "$work/videotoolbox.expected" "$work/videotoolbox.$engine.out"
     echo "PASS native H.264 encode and decode through VideoToolbox callbacks and CoreMedia block sources $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/sqlite.x86_64" > "$work/sqlite.$engine.out" 2> "$work/sqlite.$engine.err"
+    cmp "$work/sqlite.expected" "$work/sqlite.$engine.out"
+    echo "PASS native sqlite3_config and sqlite3_db_config $engine"
     for refusal in context launch; do
         rc=0
         env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \

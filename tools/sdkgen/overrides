@@ -1462,3 +1462,13 @@ library /System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia
 special _CMBlockBufferCreateWithMemoryBlock cm_block_buffer_create_with_memory_block
 special _CMBlockBufferAppendMemoryBlock cm_block_buffer_append_memory_block
 special _CMBlockBufferCreateContiguous cm_block_buffer_create_contiguous
+
+# sqlite3_config and sqlite3_db_config are variadic, but each op names the
+# arguments that follow it, as sqlite3.h lists them, so each has a handler
+# that reads those and calls the host through its variadic convention.  The
+# ops that install a table of functions are refused by name.
+
+library /usr/lib/libsqlite3.dylib
+
+special _sqlite3_config sqlite3_config
+special _sqlite3_db_config sqlite3_db_config
