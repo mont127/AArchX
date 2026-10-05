@@ -37,7 +37,12 @@
 
 struct OcerzJit;
 
+/* One retire generation per column of the indirect-branch site caches, kept
+   first so translated code reaches a column's entry as [x19, column, lsl #3]. */
+#define OCERZ_PSC_COLS 32
+
 typedef struct OcerzVM {
+    uint64_t psc_gen[OCERZ_PSC_COLS];
     OcerzCPU cpu;
     OcerzImage image;
     struct OcerzJit *jit;

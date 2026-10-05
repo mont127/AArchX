@@ -815,6 +815,8 @@ run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
 run_file_case dlane_fault_guard tests/dynamic/lane_fault_guard.c 'OK' -Wl,-no_pie
 run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
 run_file_case dsmc_high tests/dynamic/smc_high.c 'OK'
+run_file_case dsmc_ras tests/dynamic/smc_ras.c 'OK'
+run_low_golden_case dsmc_ras_low tests/dynamic/smc_ras.c tests/dynamic/smc_ras.out
 run_file_case dbyte_atomics tests/dynamic/byte_atomics.c 'OK'
 run_file_case dspawn_pipe tests/dynamic/spawn_pipe.c 'OK'
 run_file_case dread_block tests/dynamic/read_block.c 'OK'
@@ -927,6 +929,7 @@ run_file_case dalign_ordered tests/dynamic/align_ordered.c '370d1a721afe9c4a'
 run_low_golden_case dalign_ordered_low tests/dynamic/align_ordered.c tests/dynamic/align_ordered.out
 run_file_case drsp_rmw_ordered tests/dynamic/rsp_rmw.c '554ae911bb61770a' -mno-red-zone
 run_low_golden_case drsp_rmw_low_ordered tests/dynamic/rsp_rmw.c tests/dynamic/rsp_rmw.out
+run_low_golden_case dsmc_ras_low_ordered tests/dynamic/smc_ras.c tests/dynamic/smc_ras.out
 unset OCERZ_NO_PLAIN_MEM
 run_low_golden_case dfault_chain_low tests/guest/fault_chain.c tests/guest/expect/fault_chain.out
 run_dlsym_deps_case ddlsym_deps 'OK'
