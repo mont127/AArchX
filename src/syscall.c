@@ -334,6 +334,16 @@
  * ships as arm64 only, three times a launch.  The native-mode rules for system
  * binaries that do have Intel code are unchanged.
  *
+ * The developer tools run natively in every mode too: xcrun, xcode-select and
+ * the shims in /usr/bin, git, clang, make, swift and the rest, which all link
+ * /usr/lib/libxcselect.dylib and run the real tool from the developer
+ * directory.  The Command Line Tools on Apple silicon ship libxcrun.dylib for
+ * arm64 alone, so the x86_64 slice of xcrun cannot load it under ocerz or
+ * Rosetta and stopped with "unable to load libxcrun", which is what an app
+ * that runs xcrun saw in cache mode.  A system binary, one under /usr, /bin,
+ * /sbin, /System or /Library/Apple with an arm64 slice, that names
+ * libxcselect is run as itself.
+ *
  * ---- failure policy ----
  * An unimplemented call reports once and returns ENOSYS rather than aborting:
  * aborting kills the guest thread where it stands, and under Wine that is often
@@ -1856,6 +1866,25 @@ static int file_has_x86_slice(const char *path)
     return file_has_slice(path, 0x01000007);
 }
 
+static int file_links_xcselect(const char *path)
+{
+    static const char want[] = "/usr/lib/libxcselect.dylib";
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    struct stat st;
+    int found = 0;
+    if (fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size <= (8 << 20)) {
+        void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (map != MAP_FAILED) {
+            found = memmem(map, (size_t)st.st_size, want, sizeof want - 1) != NULL;
+            munmap(map, (size_t)st.st_size);
+        }
+    }
+    close(fd);
+    return found;
+}
+
 static int guest_child_runs_native(const char *path)
 {
     static const char *const roots[] = { "/usr/", "/bin/", "/sbin/", "/System/", "/Library/Apple/" };
@@ -1873,12 +1902,16 @@ static int guest_child_runs_native(const char *path)
         return 0;
     if (!file_has_x86_slice(real) && file_has_slice(real, 0x0100000c))
         return 1;
-    if (ocerz_mode != OCERZ_MODE_NATIVE || strncmp(real, "/usr/local/", 11) == 0)
+    if (strncmp(real, "/usr/local/", 11) == 0)
         return 0;
     int system_path = 0;
     for (size_t i = 0; i < sizeof roots / sizeof roots[0] && !system_path; i++)
         system_path = strncmp(real, roots[i], strlen(roots[i])) == 0;
     if (!system_path)
+        return 0;
+    if (file_has_slice(real, 0x0100000c) && file_links_xcselect(real))
+        return 1;
+    if (ocerz_mode != OCERZ_MODE_NATIVE)
         return 0;
     const char *leaf = strrchr(real, '/');
     leaf = leaf ? leaf + 1 : real;
