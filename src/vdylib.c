@@ -347,6 +347,10 @@ static const VdInternal g_vd_internal[] = {
     { "(native block invoke)", ocerz_block_invoke_trap },
     { "(native IMP)", ocerz_objc_imp_trap },
     { "(native function)", ocerz_bridge_thunk_trap },
+    { "(Objective-C exception type false)", ocerz_objc_eh_false },
+    { "(Objective-C exception type match)", ocerz_objc_eh_do_catch },
+    { "(Objective-C exception destructor)", ocerz_objc_eh_destroy },
+    { "(Objective-C uncaught exception)", ocerz_objc_eh_terminate },
 };
 
 #define VD_NINTERNAL ((uint32_t)(sizeof g_vd_internal / sizeof g_vd_internal[0]))
@@ -357,6 +361,8 @@ static pthread_mutex_t g_vd_tramp_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct VdFiller {
     const char *name;
     void (*fill)(uint8_t *slot, uint32_t size);
+    void (*fill_named)(uint8_t *slot, uint32_t size, const char *install_name, const char *export_name,
+                       OcerzVdylibHostSym host_sym);
 } VdFiller;
 
 static void vd_fill_stack_guard(uint8_t *slot, uint32_t size)
@@ -412,12 +418,14 @@ static void vd_fill_fe_dfl_daz_env(uint8_t *slot, uint32_t size)
 }
 
 static const VdFiller g_vd_fillers[] = {
-    { "stack_guard", vd_fill_stack_guard },
-    { "page_size", vd_fill_page_size },
-    { "page_mask", vd_fill_page_mask },
-    { "page_shift", vd_fill_page_shift },
-    { "fe_dfl_env", vd_fill_fe_dfl_env },
-    { "fe_dfl_daz_env", vd_fill_fe_dfl_daz_env },
+    { "stack_guard", vd_fill_stack_guard, NULL },
+    { "page_size", vd_fill_page_size, NULL },
+    { "page_mask", vd_fill_page_mask, NULL },
+    { "page_shift", vd_fill_page_shift, NULL },
+    { "fe_dfl_env", vd_fill_fe_dfl_env, NULL },
+    { "fe_dfl_daz_env", vd_fill_fe_dfl_daz_env, NULL },
+    { "objc_ehtype_vtable", NULL, ocerz_objc_fill_ehtype_vtable },
+    { "objc_ehtype", NULL, ocerz_objc_fill_ehtype },
 };
 
 static const VdFiller *vd_filler(const char *name)
@@ -1010,7 +1018,11 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
     for (int k = 0; k < ne; k++) {
         const OcerzApiEntry *e = &api->entries[k];
         if (e->kind == OCERZ_API_VAR) {
-            vd_filler(e->filler)->fill(buf + var_addr[k], e->bytes);
+            const VdFiller *f = vd_filler(e->filler);
+            if (f->fill_named)
+                f->fill_named(buf + var_addr[k], e->bytes, name, e->export_name, host_sym);
+            else
+                f->fill(buf + var_addr[k], e->bytes);
             continue;
         }
         if (!vd_has_stub(e->kind))

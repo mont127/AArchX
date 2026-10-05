@@ -13,14 +13,17 @@ for arch in x86_64 arm64; do
     clang++ -arch "$arch" -std=c++17 -O1 -dynamiclib tests/dynamic/native_cxx_dylib.cpp -o "$work/plugin.$arch.dylib"
     clang++ -arch "$arch" -std=c++17 -O1 tests/dynamic/cpp_exceptions.cpp -o "$work/exceptions.$arch"
     clang++ -arch "$arch" -std=c++17 -O1 tests/dynamic/cpp_global_ctor.cpp -o "$work/constructors.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror -fno-objc-arc tests/dynamic/native_objc_exceptions.m \
+        -framework Foundation -o "$work/objc_exceptions.$arch"
 done
 "$work/extended.arm64" "$work/plugin.arm64.dylib" > "$work/extended.expected"
 "$work/exceptions.arm64" > "$work/exceptions.expected"
 "$work/constructors.arm64" > "$work/constructors.expected"
+"$work/objc_exceptions.arm64" > "$work/objc_exceptions.expected" 2> /dev/null
 for engine in jit interpreter; do
     args=(-native -v)
     if [ "$engine" = interpreter ]; then args+=(-no-jit); fi
-    for test in extended exceptions constructors; do
+    for test in extended exceptions constructors objc_exceptions; do
         extra=()
         if [ "$test" = extended ]; then extra=("$work/plugin.x86_64.dylib"); fi
         env OCERZ_GUEST_ROOT="$root" OCERZ_BRIDGESTAT=1 OCERZ_JITSTAT=1 \
@@ -36,6 +39,15 @@ for engine in jit interpreter; do
         fi
         echo "PASS native C++ $test $engine"
     done
+    for kind in 0 2; do
+        rc=$(exec 2> /dev/null; env OCERZ_GUEST_ROOT="$root" /usr/bin/perl -e 'alarm 60; exec @ARGV' \
+            "$repo/ocerz" "${args[@]}" "$work/objc_exceptions.x86_64" "$kind" \
+            > /dev/null 2> "$work/uncaught$kind.$engine.err"; echo $?)
+        [ "$rc" = 134 ]
+        grep -q "Terminating app due to uncaught exception '$([ "$kind" = 0 ] && echo Guest || echo NSRangeException)'" \
+            "$work/uncaught$kind.$engine.err"
+    done
+    echo "PASS native uncaught Objective-C exceptions $engine"
     rc=0
     env OCERZ_GUEST_ROOT="$root" "$repo/ocerz" "${args[@]}" "$work/extended.x86_64" unsupported-format \
         > "$work/refusal.$engine.out" 2> "$work/refusal.$engine.err" || rc=$?

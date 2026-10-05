@@ -235,7 +235,7 @@ static void test_trampoline(void)
     CHECK(imp != 0 && fn != 0 && imp != t && fn != t && imp != fn,
           "the three trampolines are not three addresses: %#llx %#llx %#llx", (unsigned long long)t,
           (unsigned long long)imp, (unsigned long long)fn);
-    CHECK(ocerz_vdylib_trampoline(OCERZ_VDYLIB_TRAMP_NATIVE_FN + 1) == 0,
+    CHECK(ocerz_vdylib_trampoline(OCERZ_VDYLIB_TRAMP_OBJC_EH_TERMINATE + 1) == 0,
           "a trampoline past the table has an address");
     const uint8_t *b = ocerz_g2h(t);
     uint32_t id, rel;
@@ -255,9 +255,9 @@ static void test_trampoline(void)
     uint16_t in = 0, out = 0;
     CHECK(ocerz_vdylib_xmm_contract(id, &in, &out) && in == 0xff && out == 0x3,
           "the reserved id's xmm contract is %#x/%#x, want a special's 0xff/0x3", in, out);
-    CHECK(ocerz_vdylib_export_name(0xfff00000u + OCERZ_VDYLIB_TRAMP_NATIVE_FN, &lib, &sym) && lib &&
+    CHECK(ocerz_vdylib_export_name(0xfff00000u + OCERZ_VDYLIB_TRAMP_OBJC_EH_TERMINATE, &lib, &sym) && lib &&
           strcmp(lib, "ocerz") == 0, "the last reserved id is not named as ocerz's own");
-    CHECK(!ocerz_vdylib_export_name(0xfff00001u + OCERZ_VDYLIB_TRAMP_NATIVE_FN, NULL, NULL),
+    CHECK(!ocerz_vdylib_export_name(0xfff00001u + OCERZ_VDYLIB_TRAMP_OBJC_EH_TERMINATE, NULL, NULL),
           "a reserved id past the table is named");
 }
 

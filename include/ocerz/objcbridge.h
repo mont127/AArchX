@@ -332,6 +332,21 @@ int ocerz_objc_method_getImplementation(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_class_getMethodImplementation(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_imp_trap(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_setExceptionPreprocessor(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_exception_throw(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_exception_rethrow(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_begin_catch(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_end_catch(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_terminate(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_personality_v0(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_eh_false(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_eh_do_catch(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_eh_destroy(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_objc_eh_terminate(struct OcerzVM *vm, OcerzCPU *cpu);
+void ocerz_objc_fill_ehtype_vtable(uint8_t *slot, uint32_t size, const char *install_name,
+                                   const char *export_name,
+                                   void *(*host_sym)(const char *install_name, const char *host_sym));
+void ocerz_objc_fill_ehtype(uint8_t *slot, uint32_t size, const char *install_name, const char *export_name,
+                            void *(*host_sym)(const char *install_name, const char *host_sym));
 int ocerz_objc_realizeClassFromSwift(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_readClassPair(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_objc_setHook_getClass(struct OcerzVM *vm, OcerzCPU *cpu);
