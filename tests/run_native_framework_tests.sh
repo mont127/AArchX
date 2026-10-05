@@ -23,6 +23,8 @@ for arch in x86_64 arm64; do
         -framework OpenGL -framework Carbon -o "$work/gl_carbon.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_callback_structs.c -framework CoreFoundation \
         -framework CoreGraphics -framework CoreText -framework ImageIO -o "$work/callback_structs.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror -Wno-deprecated-declarations tests/dynamic/native_lapack_asn1.c \
+        -framework Accelerate -framework Security -o "$work/lapack_asn1.$arch"
 done
 mkdir -p "$work/globdir"
 touch "$work/globdir/a.txt" "$work/globdir/b.txt" "$work/globdir/c.log"
@@ -34,6 +36,7 @@ sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.er
 "$work/kerberos.arm64" > "$work/kerberos.expected"
 "$work/gl_carbon.arm64" > "$work/gl_carbon.expected"
 "$work/callback_structs.arm64" > "$work/callback_structs.expected"
+"$work/lapack_asn1.arm64" > "$work/lapack_asn1.expected"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -75,6 +78,10 @@ for engine in jit interpreter slow-bridge; do
         2> "$work/callback_structs.$engine.err"
     cmp "$work/callback_structs.expected" "$work/callback_structs.$engine.out"
     echo "PASS native data consumers, patterns, stream clients and run delegates $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/lapack_asn1.x86_64" > "$work/lapack_asn1.$engine.out" 2> "$work/lapack_asn1.$engine.err"
+    cmp "$work/lapack_asn1.expected" "$work/lapack_asn1.$engine.out"
+    echo "PASS native ILP64 BLAS and LAPACK and SecAsn1 coders $engine"
     for refusal in context launch; do
         rc=0
         env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \
