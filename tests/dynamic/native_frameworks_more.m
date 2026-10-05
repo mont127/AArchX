@@ -213,6 +213,27 @@ static void uncaught_handlers(void)
            NSGetUncaughtExceptionHandler() == before);
 }
 
+@interface NSNumber (OcerzRedeclared)
+@property (readonly) NSUInteger hash;
+@property (readonly, copy) NSString *ocerzTag;
+@end
+
+@implementation NSNumber (OcerzRedeclared)
+@dynamic hash;
+- (NSString *)ocerzTag
+{
+    return [NSString stringWithFormat:@"tag%@", self];
+}
+@end
+
+static void category_properties(void)
+{
+    objc_property_t tag = class_getProperty([NSNumber class], "ocerzTag");
+    printf("category properties tag=%s hash=%d %s %lu\n", tag ? property_getName(tag) : "none",
+           class_getProperty([NSNumber class], "hash") != NULL, [@7 ocerzTag].UTF8String,
+           (unsigned long)[@7 hash]);
+}
+
 static NSString *list_string(NSLocale *locale, NSString *format, ...)
 {
     va_list ap;
@@ -281,6 +302,7 @@ int main(void)
         frameworks();
         bindings();
         va_list_methods();
+        category_properties();
         block_imps();
         uncaught_handlers();
     }
