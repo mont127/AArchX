@@ -116,13 +116,14 @@ are missing exits zero, so that job lists each `SKIP` line it saw as a warning
 and in the run's summary: a green run with skips has not exercised those gates.
 Nothing is cancelled when a newer commit arrives.
 
-A hosted runner is a virtual machine, and a few dynamic cases rely on what one
-may not provide: a Metal device that computes, a kernel whose `ntp_gettime`
-works. The dynamic runner builds those cases natively as well and skips one,
-saying so, when the machine's own run of it fails; a failure that only ocerz
-shows stays a failure. `OCERZ_DYNAMIC_TIMEOUT` sets the limit on each run of a
-dynamic case, 30 seconds when unset, and the workflow gives the slower machine
-120.
+A hosted runner is a virtual machine whose clock is never synchronised, so its
+kernel fails `ntp_gettime` with `EIO`, natively and under ocerz alike. The
+dynamic runner builds the cases that depend on such things natively as well and
+skips one, saying so, when the machine's own run of it fails; a failure that
+only ocerz shows stays a failure. The Metal case is one: on the runner's
+paravirtual GPU it passes natively and fails under ocerz, so it is not skipped.
+`OCERZ_DYNAMIC_TIMEOUT` sets the limit on each run of a dynamic case, 30
+seconds when unset, and the workflow gives the slower machine 120.
 
 ## Conventions
 
