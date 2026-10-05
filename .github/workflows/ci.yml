@@ -2,32 +2,36 @@
 # pull requests from forks, whose pushes never reach this repository's runs.
 # A pull request from a branch of this repository is not run a second time: its
 # commits were already checked by the push that created them, and the check on
-# the head commit is the same one the pull request shows.
+# the head commit is the same one the pull request shows. A push runs once, for
+# the commit at its head.
 #
 # AArchX emits arm64 code and links the macOS SDK, so nothing here can run on
-# Linux or on an Intel Mac. Both jobs use `xcode-27`, GitHub's Apple silicon
+# Linux or on an Intel Mac. The job uses `xcode-27`, GitHub's Apple silicon
 # image for macOS 27 with Xcode 27, which is in public preview. The `macos-26`
 # image carries SDK 26.5, and on that `make apis` stops at a header only SDK 27
 # has, while test_apidb reads runtime/apis/macos/27.0, a directory only a run
 # against SDK 27 writes.
 #
-# There are two jobs, and they run side by side. `unit` builds ocerz, generates
-# the native-mode API databases and runs the unit harnesses, which takes a few
-# minutes and tells a contributor at once whether the tree still builds and the
-# translator's components still agree with their own checks. `check` is
-# `make check`, the gate that CONTRIBUTING.md says must be green before a change
-# is sent, taken one phase per step in the order its recipe runs them. A phase
-# that fails does not stop the ones after it, so one run says which of them
-# pass; a build that fails stops them all. The `phases` step fails the job when
-# the recipe in the Makefile names a phase this file does not run, so the two
-# cannot drift apart without a run saying so.
+# The job is `make check` taken one phase per step, in four groups that run
+# side by side, each on a virtual machine of its own: the unit harnesses, guest
+# suite and differential gates; the dynamic suite, which is timing-sensitive
+# and so gets a machine to itself; the native suites that need the API
+# databases; and the native C++ and Swift suites with the guest runtimes they
+# run against. Each group builds for itself, because an artifact would save
+# little against the four minutes it takes and cost a copy that has to keep its
+# permissions. A phase that fails does not stop the ones after it in its group,
+# so one run says which of them pass; a build that fails stops its group. The
+# `phases` step fails the static group when the recipe in the Makefile names a
+# phase this file does not run, so the two cannot drift apart without a run
+# saying so.
 #
-# `make check` builds first and tests second. The build is done here with all
-# the cores, then every phase finds everything up to date, because the dynamic
-# suite is timing-sensitive under load and must not share the machine with a
-# build.
+# The C++ and Swift suites print SKIP and exit zero when the guest runtimes
+# under runtime/guest are missing, and those are gitignored, so the runtimes
+# group builds the C++ runtime from LLVM's sources and installs the Swift
+# runtime from the pinned package, once, and keeps them in the cache keyed by
+# the two scripts that make them.
 #
-# A hosted runner is a three-core virtual machine whose clock is never
+# A hosted runner is a three-core virtual machine whose clock is not
 # synchronised, so its kernel fails ntp_gettime with EIO, natively and under
 # ocerz alike. The dynamic runner builds the cases that depend on such things
 # natively as well and skips one, saying so, when the machine's own run of it
@@ -39,13 +43,13 @@
 # guest programs against the x86-64 shared cache that its package ships;
 # AArchX maps that file and never runs Rosetta's translator. A gate whose
 # prerequisites are missing prints SKIP and exits zero rather than failing, so
-# the `check` job lists every SKIP line it saw as a warning on the run and in
-# its summary; a run that is green with skips has not exercised those gates.
-# The i386 conformance report against capstone is a progress measure, not a
-# gate, and is not part of `make check`, so it is not run here.
+# every group lists each SKIP line it saw as a warning on the run and in its
+# summary; a run that is green with skips has not exercised those gates. The
+# i386 conformance report against capstone is a progress measure, not a gate,
+# and is not part of `make check`, so it is not run here.
 #
-# Each commit gets its own runs and nothing is cancelled when a newer commit
-# arrives, because the point is a verdict for every commit, not only the last.
+# Each push gets its own runs and nothing is cancelled when a newer one
+# arrives, because the point is a verdict for every push, not only the last.
 
 name: ci
 
@@ -59,51 +63,26 @@ permissions:
 
 env:
   OCERZ_TCACHE: "off"
+  OCERZ_DYNAMIC_TIMEOUT: "120"
 
 jobs:
-  unit:
-    name: build and unit harnesses
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: xcode-27
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Show the toolchain
-        run: |
-          sw_vers
-          uname -m
-          xcode-select -p
-          xcodebuild -showsdks
-          xcrun --show-sdk-version
-          clang --version
-
-      - name: Build ocerz
-        run: make -j"$(sysctl -n hw.logicalcpu)" ocerz
-
-      - name: Print the version
-        run: ./ocerz version
-
-      - name: Generate the API databases
-        run: make apis
-
-      - name: Unit harnesses
-        run: make unit
-
   check:
-    name: make check, phase by phase
+    name: make check (${{ matrix.group }})
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: xcode-27
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [static, dynamic, native, runtimes]
     defaults:
       run:
         shell: bash
-    env:
-      OCERZ_DYNAMIC_TIMEOUT: "120"
     steps:
       - uses: actions/checkout@v4
 
       - name: The phases are the ones make check runs
+        if: matrix.group == 'static'
         run: |
           missing=0
           while IFS= read -r cmd; do
@@ -123,6 +102,7 @@ jobs:
           xcodebuild -showsdks
           xcrun --show-sdk-version
           clang --version
+          cmake --version 2>&1 | sed -n 1p || true
 
       - name: Install Rosetta
         run: |
@@ -133,51 +113,76 @@ jobs:
         run: make -j"$(sysctl -n hw.logicalcpu)" ocerz guest apis
 
       - name: Unit harnesses
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'static' }}
         run: make unit 2>&1 | tee -a check.log
 
       - name: Guest suite, interpreted
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'static' }}
         run: bash tests/run_guest_tests.sh --no-jit 2>&1 | tee -a check.log
 
       - name: Guest suite, translated
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'static' }}
         run: bash tests/run_guest_tests.sh 2>&1 | tee -a check.log
 
       - name: x86-64 differential
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'static' }}
         run: bash tests/run_diff_test.sh 2>&1 | tee -a check.log
 
       - name: i386 differential
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'static' }}
         run: bash tests/run_diff32.sh . 2>&1 | tee -a check.log
 
       - name: Dynamic suite
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'dynamic' }}
         run: bash tests/run_dynamic_tests.sh 2>&1 | tee -a check.log
 
       - name: Native suite
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'native' }}
         run: bash tests/run_native_tests.sh 2>&1 | tee -a check.log
 
       - name: Guest library suite
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'native' }}
         run: bash tests/run_guest_library_tests.sh 2>&1 | tee -a check.log
 
-      - name: Native C++ suite
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
-        run: bash tests/run_native_cxx_tests.sh 2>&1 | tee -a check.log
-
       - name: Native framework suite
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'native' }}
         run: bash tests/run_native_framework_tests.sh 2>&1 | tee -a check.log
 
       - name: Native format suite
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'native' }}
         run: bash tests/run_native_format_tests.sh 2>&1 | tee -a check.log
 
+      - name: Restore the guest runtimes
+        id: runtimes
+        if: ${{ matrix.group == 'runtimes' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: runtime/guest
+          key: guest-runtimes-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build_guest_cxx.sh', 'tools/install_guest_swift.sh') }}
+
+      - name: Build the guest C++ runtime
+        id: cxx
+        if: ${{ steps.build.conclusion == 'success' && matrix.group == 'runtimes' && steps.runtimes.outputs.cache-hit != 'true' }}
+        run: make guest-cxx
+
+      - name: Install the guest Swift runtime
+        id: swift
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'runtimes' && steps.runtimes.outputs.cache-hit != 'true' }}
+        run: make guest-swift
+
+      - name: Keep the guest runtimes
+        if: ${{ steps.cxx.conclusion == 'success' && steps.swift.conclusion == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: runtime/guest
+          key: guest-runtimes-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build_guest_cxx.sh', 'tools/install_guest_swift.sh') }}
+
+      - name: Native C++ suite
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'runtimes' }}
+        run: bash tests/run_native_cxx_tests.sh 2>&1 | tee -a check.log
+
       - name: Native Swift suite
-        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' && matrix.group == 'runtimes' }}
         run: bash tests/run_native_swift_tests.sh 2>&1 | tee -a check.log
 
       - name: Report skipped gates

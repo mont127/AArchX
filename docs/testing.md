@@ -105,25 +105,28 @@ The component suites inside the unit phase, as last counted in September 2026
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` checks every commit pushed to any branch, and pull
-requests from forks, on GitHub's `xcode-27` runner image: an Apple silicon
-virtual machine with macOS 27 and Xcode 27, in public preview. The `macos-26`
-image has SDK 26.5, on which `make apis` fails. One job builds ocerz and runs
-the unit harnesses. A second runs `make check` one phase per step, so a failing
-phase does not hide the ones after it, and fails if the Makefile's recipe gains
-a phase the workflow does not run. A gate that skips because its prerequisites
-are missing exits zero, so that job lists each `SKIP` line it saw as a warning
-and in the run's summary: a green run with skips has not exercised those gates.
-Nothing is cancelled when a newer commit arrives.
+`.github/workflows/ci.yml` checks every push to any branch, and pull requests
+from forks, on GitHub's `xcode-27` runner image: an Apple silicon virtual
+machine with macOS 27 and Xcode 27, in public preview. The `macos-26` image has
+SDK 26.5, on which `make apis` fails. It runs `make check` one phase per step,
+in four groups that run side by side on machines of their own: the unit
+harnesses, guest suite and differential gates; the dynamic suite; the native
+suites; and the native C++ and Swift suites with the guest runtimes they run
+against, which the workflow builds once and keeps in the cache. A failing phase
+does not hide the ones after it in its group, and the job fails if the
+Makefile's recipe gains a phase the workflow does not run. A gate that skips
+because its prerequisites are missing exits zero, so each group lists the `SKIP`
+lines it saw as warnings and in the run's summary: a green run with skips has
+not exercised those gates. Nothing is cancelled when a newer push arrives.
 
-A hosted runner is a virtual machine whose clock is never synchronised, so its
+A hosted runner is a virtual machine whose clock is not synchronised, so its
 kernel fails `ntp_gettime` with `EIO`, natively and under ocerz alike. The
 dynamic runner builds the cases that depend on such things natively as well and
 skips one, saying so, when the machine's own run of it fails; a failure that
-only ocerz shows stays a failure. The Metal case is one: on the runner's
-paravirtual GPU it passes natively and fails under ocerz, so it is not skipped.
-`OCERZ_DYNAMIC_TIMEOUT` sets the limit on each run of a dynamic case, 30
-seconds when unset, and the workflow gives the slower machine 120.
+only ocerz shows stays a failure. The Metal case gets the same control, and on
+the runner's paravirtual GPU it passes natively and fails under ocerz, so it is
+not skipped. `OCERZ_DYNAMIC_TIMEOUT` sets the limit on each run of a dynamic
+case, 30 seconds when unset, and the workflow gives the slower machine 120.
 
 ## Conventions
 
