@@ -4,6 +4,18 @@
 # dyld cache mapping, the initializer ordering and the host workqueue bridge.
 # Skipped, not failed, when there is no x86_64 clang toolchain or no mappable
 # shared cache.
+#
+# A case that needs something the host itself cannot do is skipped, not failed.
+# The Metal compute case and the ntp_gettime check in syscalls_extra are also
+# built for arm64 and run natively first, as the control: a virtual machine can
+# have a Metal device whose compute returns nothing, and a kernel whose
+# ntp_gettime fails, and no translator can pass what the machine under it
+# fails. When the native run passes, or cannot be built, the case runs as
+# usual, so a failure that only ocerz shows stays a failure. A case that is
+# skipped prints a SKIP line saying what the host did.
+#
+# Each run of a case is stopped after 30 seconds. OCERZ_DYNAMIC_TIMEOUT sets
+# another limit, in seconds, for a machine that is slower or shared.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -35,7 +47,7 @@ if command -v timeout >/dev/null 2>&1; then
 elif command -v gtimeout >/dev/null 2>&1; then
     TIMEOUT_BIN="gtimeout"
 fi
-DYNAMIC_TIMEOUT=30
+DYNAMIC_TIMEOUT="${OCERZ_DYNAMIC_TIMEOUT:-30}"
 
 run_bounded() {
     local out_file="$1" err_file="$2"
@@ -326,13 +338,40 @@ run_weak_unloaded_case() {
 run_metal_nocopy_low_case() {
     local name="$1" want_out="$2"
     local dir="$TMP/$name"
+    local native_code native_out
     mkdir -p "$dir"
     if ! clang -arch x86_64 -fobjc-arc -framework Metal -framework Foundation -o "$dir/$name" \
             tests/dynamic/metal_nocopy_low.m \
             -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000 2>/dev/null; then
         echo "FAIL $name (build)"; fail=$((fail+1)); return
     fi
+    if clang -arch arm64 -fobjc-arc -framework Metal -framework Foundation -o "$dir/native" \
+            tests/dynamic/metal_nocopy_low.m 2>/dev/null; then
+        run_bounded "$dir/native.out" "$dir/native.err" "$dir/native"
+        native_code=$?
+        native_out=$(cat "$dir/native.out")
+        if [ "$native_out" != "$want_out" ] || [ "$native_code" != 0 ]; then
+            echo "SKIP $name (the host's own Metal does not pass it: out='$(echo "$native_out" | tr '\n' ' ')' exit=$native_code)"
+            return
+        fi
+    fi
     run_built_case "$name" "$want_out" "$dir"
+}
+
+run_syscalls_extra_case() {
+    local name="$1" want_out="$2"
+    local ntp_flag="" ntp_code
+    if clang -arch arm64 -x c -o "$TMP/ntp_native" - >/dev/null 2>&1 <<<'#include <errno.h>
+#include <sys/timex.h>
+int main(void){struct ntptimeval t;return ntp_gettime(&t)<0?errno:0;}'; then
+        "$TMP/ntp_native" >/dev/null 2>&1
+        ntp_code=$?
+        if [ "$ntp_code" != 0 ]; then
+            echo "SKIP $name ntp_gettime check (the host's own ntp_gettime fails with errno $ntp_code)"
+            ntp_flag="-DSKIP_NTP_GETTIME"
+        fi
+    fi
+    run_file_case "$name" tests/dynamic/syscalls_extra.c "$want_out" $ntp_flag
 }
 
 run_rpath_system_case() {
@@ -938,7 +977,7 @@ run_rpath_bare_case drpath_bare 'OK'
 run_init_order_case dinit_order 'OK'
 run_upward_defer_case dupward_defer 'OK'
 run_file_case ddlsym_cache_image tests/dynamic/dlsym_cache_image.c 'OK'
-run_file_case dsyscalls_extra tests/dynamic/syscalls_extra.c 'OK'
+run_syscalls_extra_case dsyscalls_extra 'OK'
 run_file_case dproc_self tests/dynamic/proc_self.c 'OK'
 run_file_case dmach_traps_extra tests/dynamic/mach_traps_extra.c 'OK'
 run_file_case dthread_act tests/dynamic/thread_act.c 'OK'
