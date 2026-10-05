@@ -70,7 +70,16 @@
  * the engine's braces, nested structures nested, an array member flattened into
  * that many members, field names in quotes skipped.  Type qualifiers r n N o O R
  * V and A and the frame offsets between types are skipped.  A pointer is p
- * whatever it points at, and an array argument is a pointer.  A union, a
+ * whatever it points at, and an array argument is a pointer.  A union whose
+ * members are all integers and pointers, nested structures, unions and arrays
+ * of them included, is bytes on both sides: x86_64 classes every eightbyte of
+ * it INTEGER and arm64 sees a composite with no floating-point member, so it
+ * becomes as many integers of its own alignment as fill its size, inside
+ * braces where it is an argument or a result and among the enclosing
+ * structure's members where it is one.  Chromium's -[WebMenuRunner
+ * selectedMenuItemIndex] answers a std::optional<int>, {optional<int>=(?=ci)B},
+ * which became {ib}, and an Electron app stopped as a <select> opened.  A union
+ * with a float or a double in it, a
  * bitfield, a long double, a complex number, a 128-bit integer, an unknown type,
  * a structure whose members the encoding omits, void where a value belongs, more
  * than sixteen arguments, and anything the ABI engine refuses to lay out, such as
@@ -596,6 +605,75 @@ static const char *ob_skip(const char *p)
     }
 }
 
+static const char *ob_int_layout(const char *p, unsigned long *size, unsigned long *align)
+{
+    p = ob_quals(p);
+    unsigned long s = 0, a = 0;
+    switch (*p) {
+    case 'c': case 'C': case 'B':
+        s = a = 1, p++;
+        break;
+    case 's': case 'S':
+        s = a = 2, p++;
+        break;
+    case 'i': case 'I': case 'l': case 'L':
+        s = a = 4, p++;
+        break;
+    case 'q': case 'Q': case '*': case '#': case ':': case '%':
+        s = a = 8, p++;
+        break;
+    case '@': case '^':
+        p = ob_skip(p);
+        s = a = 8;
+        break;
+    case '[': {
+        unsigned long n = 0, es = 0;
+        for (p++; isdigit((unsigned char)*p) && n <= 4096; p++)
+            n = n * 10 + (unsigned long)(*p - '0');
+        p = ob_int_layout(p, &es, &a);
+        if (!p || *p != ']' || n == 0)
+            return NULL;
+        s = n * es, p++;
+        break;
+    }
+    case '{':
+    case '(': {
+        char close = *p == '{' ? '}' : ')';
+        int is_union = *p == '(';
+        while (*p && *p != '=' && *p != close)
+            p++;
+        if (*p != '=')
+            return NULL;
+        p++;
+        unsigned long end = 0;
+        a = 1;
+        while (*p != close) {
+            if (*p == '"') {
+                const char *q = strchr(p + 1, '"');
+                if (!q)
+                    return NULL;
+                p = q + 1;
+                continue;
+            }
+            unsigned long ms = 0, ma = 0;
+            p = *p ? ob_int_layout(p, &ms, &ma) : NULL;
+            if (!p)
+                return NULL;
+            a = ma > a ? ma : a;
+            end = is_union ? (ms > end ? ms : end) : (end + ma - 1) / ma * ma + ms;
+        }
+        if (end == 0)
+            return NULL;
+        s = (end + a - 1) / a * a, p++;
+        break;
+    }
+    default:
+        return NULL;
+    }
+    *size = s, *align = a;
+    return p;
+}
+
 static const char *ob_conv(const char *p, ObOut *o, int where, int *rc, int *special)
 {
     p = ob_quals(p);
@@ -726,9 +804,26 @@ static const char *ob_conv(const char *p, ObOut *o, int where, int *rc, int *spe
         ob_put(o, '}');
         return p + 1;
     }
-    case '(':
-        *rc = OCERZ_OBJC_UNION;
-        return NULL;
+    case '(': {
+        unsigned long size = 0, align = 0;
+        const char *q = ob_int_layout(p, &size, &align);
+        if (!q) {
+            *rc = OCERZ_OBJC_UNION;
+            return NULL;
+        }
+        if (size / align > OCERZ_ABI_STRUCT_MEMBERS) {
+            *rc = OCERZ_OBJC_ENGINE;
+            return NULL;
+        }
+        char unit = align == 1 ? 'b' : align == 2 ? 'h' : align == 4 ? 'i' : 'l';
+        if (where != OB_MEMBER)
+            ob_put(o, '{');
+        for (unsigned long k = 0; k < size / align; k++)
+            ob_put(o, unit);
+        if (where != OB_MEMBER)
+            ob_put(o, '}');
+        return q;
+    }
     case 'b':
         *rc = OCERZ_OBJC_BITFIELD;
         return NULL;

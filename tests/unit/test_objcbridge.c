@@ -298,8 +298,14 @@ static const Expect kEncodings[] = {
     { "v24@0:8B16", OCERZ_OBJC_OK, "v(ppb)", 0, 0 },
     { "v@:", OCERZ_OBJC_OK, "v(pp)", 0, 0 },
     { "{?=b8b4b1b1b18[8S]}16@0:8", OCERZ_OBJC_BITFIELD, NULL, 0, 0 },
-    { "(?=iq)16@0:8", OCERZ_OBJC_UNION, NULL, 0, 0 },
+    { "(?=iq)16@0:8", OCERZ_OBJC_OK, "{l}(pp)", 0, 0 },
+    { "{optional<int>=(?=ci)B}16@0:8", OCERZ_OBJC_OK, "{ib}(pp)", 0, 0 },
+    { "v24@0:8{S=c(u=s[3c])}16", OCERZ_OBJC_OK, "v(pp{bhh})", 0, 0 },
+    { "v24@0:8(u=^f{p=ii}\"name\"[2S])16", OCERZ_OBJC_OK, "v(pp{l})", 0, 0 },
     { "v24@0:8{S=(u=id)}16", OCERZ_OBJC_UNION, NULL, 0, 0 },
+    { "(?=fi)16@0:8", OCERZ_OBJC_UNION, NULL, 0, 0 },
+    { "v24@0:8(?=b3i)16", OCERZ_OBJC_UNION, NULL, 0, 0 },
+    { "(?=[40c])16@0:8", OCERZ_OBJC_ENGINE, NULL, 0, 0 },
     { "D16@0:8", OCERZ_OBJC_LONG_DOUBLE, NULL, 0, 0 },
     { "v32@0:8jd16", OCERZ_OBJC_COMPLEX, NULL, 0, 0 },
     { "t16@0:8", OCERZ_OBJC_INT128, NULL, 0, 0 },
@@ -381,6 +387,50 @@ typedef struct Oracle {
     int deferred;
 } Oracle;
 
+static const char *oracle_type(const char *p, int member, int result, Oracle *o);
+
+static const char *oracle_intonly(const char *p, int *ok)
+{
+    p = oracle_quals(p);
+    char c = *p;
+    if (c && strchr("cCsSiIlLqQB*#:%", c))
+        return p + 1;
+    if (c == '^' || c == '@') {
+        Oracle inner = { OCERZ_OBJC_OK, 0, 0 };
+        return oracle_type(p, 1, 0, &inner);
+    }
+    if (c == '[') {
+        const char *end = oracle_close(p, '[', ']');
+        if (atoi(p + 1) == 0)
+            *ok = 0;
+        const char *q = p + 1;
+        while (*q >= '0' && *q <= '9')
+            q++;
+        oracle_intonly(q, ok);
+        return end;
+    }
+    if (c == '{' || c == '(') {
+        const char *end = oracle_close(p, c, c == '{' ? '}' : ')');
+        const char *eq = strchr(p, '=');
+        int members = 0;
+        if (!eq || eq > end)
+            *ok = 0;
+        for (const char *q = eq ? eq + 1 : end; *ok && q && q < end - 1;) {
+            if (*q == '"') {
+                q = strchr(q + 1, '"') + 1;
+                continue;
+            }
+            q = oracle_intonly(q, ok);
+            members++;
+        }
+        if (!members)
+            *ok = 0;
+        return end;
+    }
+    *ok = 0;
+    return p + 1;
+}
+
 static const char *oracle_type(const char *p, int member, int result, Oracle *o)
 {
     p = oracle_quals(p);
@@ -409,13 +459,30 @@ static const char *oracle_type(const char *p, int member, int result, Oracle *o)
             return strchr(p + 1, '"') + 1;
         return p;
     }
-    int code = c == '(' ? OCERZ_OBJC_UNION : c == 'b' ? OCERZ_OBJC_BITFIELD : c == 'D' ? OCERZ_OBJC_LONG_DOUBLE
+    if (c == '(') {
+        int ok = 1;
+        const char *end = oracle_intonly(p, &ok);
+        char type[512];
+        unsigned long size = 0, align = 0;
+        if (ok && end && (size_t)(end - p) < sizeof type) {
+            memcpy(type, p, (size_t)(end - p));
+            type[end - p] = '\0';
+            NSGetSizeAndAlignment_(type, &size, &align);
+        }
+        if (!ok || !size || !align) {
+            if (o->rc == OCERZ_OBJC_OK)
+                o->rc = OCERZ_OBJC_UNION;
+        } else if (size / align > 16 && o->rc == OCERZ_OBJC_OK) {
+            o->rc = OCERZ_OBJC_ENGINE;
+        }
+        o->leaves += ok && align ? (int)(size / align) : 0;
+        return end;
+    }
+    int code = c == 'b' ? OCERZ_OBJC_BITFIELD : c == 'D' ? OCERZ_OBJC_LONG_DOUBLE
              : c == 't' || c == 'T' ? OCERZ_OBJC_INT128 : c == '?' ? OCERZ_OBJC_UNKNOWN : 0;
     if (code) {
         if (o->rc == OCERZ_OBJC_OK)
             o->rc = code;
-        if (c == '(')
-            return oracle_close(p, '(', ')');
         p++;
         while (*p >= '0' && *p <= '9')
             p++;
@@ -1866,7 +1933,9 @@ static const GuestNotation kGuestNotations[] = {
     { "v32@0:8D16", OCERZ_OBJC_LONG_DOUBLE, NULL },
     { "i8i0i4", OCERZ_OBJC_NOT_METHOD, NULL },
     { "v8@0", OCERZ_OBJC_NOT_METHOD, NULL },
-    { "v24@0:8(?=iq)16", OCERZ_OBJC_UNION, NULL },
+    { "v24@0:8(?=iq)16", OCERZ_OBJC_OK, "v(pp{l})" },
+    { "{optional<int>=(?=ci)B}16@0:8", OCERZ_OBJC_OK, "{ib}(pp)" },
+    { "v24@0:8(?=fi)16", OCERZ_OBJC_UNION, NULL },
     { "", OCERZ_OBJC_MALFORMED, NULL },
 };
 
