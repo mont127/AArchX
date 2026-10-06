@@ -114,6 +114,12 @@ pass AudioToolbox.h
 library libbz2 /usr/lib/libbz2.1.0.dylib usr/lib/libbz2.tbd
 pass libbz2.h
 
+# CoreAnalytics is private, but the SDK carries its .tbd, and D3DMetal links
+# it; its header declares what Apple's own open-source callers call.
+library CoreAnalytics /System/Library/PrivateFrameworks/CoreAnalytics.framework/Versions/A/CoreAnalytics System/Library/PrivateFrameworks/CoreAnalytics.framework/CoreAnalytics.tbd
+language objective-c
+pass CoreAnalytics.h
+
 library CoreAudio /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio System/Library/Frameworks/CoreAudio.framework/CoreAudio.tbd
 language objective-c
 pass CoreAudio.h

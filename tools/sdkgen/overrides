@@ -711,6 +711,7 @@ special __dyld_get_image_header dyld_image_header
 special __dyld_get_image_name dyld_image_name
 special __dyld_get_image_vmaddr_slide dyld_image_vmaddr_slide
 special __dyld_get_image_slide dyld_image_slide
+special __dyld_get_image_uuid dyld_image_uuid
 special __dyld_register_func_for_add_image dyld_register_add_image
 special __dyld_register_func_for_remove_image dyld_register_remove_image
 special __dyld_get_image_header_containing_address dyld_image_header_containing
@@ -1526,6 +1527,22 @@ library /System/Library/Frameworks/Metal.framework/Versions/A/Metal
 
 fn _MTLSetShaderCachePath MTLSetShaderCachePath v(p)
 fn _MTLGetShaderCachePath MTLGetShaderCachePath p()
+
+# MTLMakeShaderCacheWritableByAllUsers is exported and declared nowhere, so its
+# arguments are unknown; D3DMetal calls it while it sets up its shader cache,
+# and what its name says it does - share that cache with other users - a
+# process can do without, so it is answered with 0 and not made.
+
+special _MTLMakeShaderCacheWritableByAllUsers nothing
+
+# MTLTextureSwizzleChannelsToKey and MTLTextureSwizzleKeyToChannels are declared
+# nowhere either; D3DMetal turns texture swizzles into keys with them.  Called
+# with the four swizzle bytes of an MTLTextureSwizzleChannels packed in one
+# register and a key back, on arm64 and under Rosetta alike, all 1296 swizzles
+# round-trip and come back as distinct keys, so they cross as scalars.
+
+fn _MTLTextureSwizzleChannelsToKey MTLTextureSwizzleChannelsToKey L(u)
+fn _MTLTextureSwizzleKeyToChannels MTLTextureSwizzleKeyToChannels u(L)
 
 # AudioUnitSetProperty's value is bytes, and kAudioUnitProperty_SetRenderCallback
 # and kAudioOutputUnitProperty_SetInputCallback put a render callback in them,

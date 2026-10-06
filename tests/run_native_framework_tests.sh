@@ -7,6 +7,21 @@ echo "native framework logs: $work"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/key.pem" -out "$work/cert.pem" \
     -subj '/CN=ocerz framework test' -days 2 > "$work/certificate.log" 2>&1
 openssl x509 -in "$work/cert.pem" -outform der -out "$work/cert.der"
+# A framework with an identifier, an Info.plist and a resource, which
+# native_bundle_id dlopens and then looks up by identifier.
+probe_framework() {
+    local arch=$1 fw="$work/fw.$1/OcerzProbe.framework"
+    mkdir -p "$fw/Versions/A/Resources"
+    printf 'int ocerz_probe(void) { return 7; }\n' > "$work/probe.c"
+    clang -arch "$arch" -dynamiclib -install_name @rpath/OcerzProbe.framework/OcerzProbe "$work/probe.c" \
+        -o "$fw/Versions/A/OcerzProbe"
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>org.ocerz.probe</string><key>CFBundleExecutable</key><string>OcerzProbe</string><key>CFBundlePackageType</key><string>FMWK</string></dict></plist>\n' \
+        > "$fw/Versions/A/Resources/Info.plist"
+    printf 'shaders' > "$fw/Versions/A/Resources/probe.txt"
+    ln -sfn A "$fw/Versions/Current"
+    ln -sfn Versions/Current/OcerzProbe "$fw/OcerzProbe"
+    ln -sfn Versions/Current/Resources "$fw/Resources"
+}
 for arch in x86_64 arm64; do
     clang -arch "$arch" -O1 -Wall -Wextra -Werror -Wno-deprecated-declarations \
         tests/dynamic/native_frameworks.c -framework CoreFoundation -framework CFNetwork \
@@ -35,6 +50,9 @@ for arch in x86_64 arm64; do
         -framework Foundation -framework Metal -o "$work/metal_events.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_wine_imports.c \
         -framework SystemConfiguration -framework CoreFoundation -lresolv -o "$work/wine_imports.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror -fno-objc-arc tests/dynamic/native_bundle_id.m \
+        -framework Foundation -o "$work/bundle_id.$arch"
+    probe_framework "$arch"
 done
 clang -arch x86_64 -O1 -Wall -Wextra -Werror tests/dynamic/native_ldt.c -o "$work/ldt.x86_64"
 # i386_set_ldt is x86_64 only, so Rosetta is the oracle: this is its line.
@@ -61,6 +79,7 @@ sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.er
 "$work/sqlite.arm64" > "$work/sqlite.expected"
 "$work/metal_events.arm64" > "$work/metal_events.expected"
 "$work/wine_imports.arm64" > "$work/wine_imports.expected"
+"$work/bundle_id.arm64" "$work/fw.arm64/OcerzProbe.framework/OcerzProbe" > "$work/bundle_id.expected"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -129,11 +148,16 @@ for engine in jit interpreter slow-bridge; do
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/metal_events.x86_64" > "$work/metal_events.$engine.out" 2> "$work/metal_events.$engine.err"
     cmp "$work/metal_events.expected" "$work/metal_events.$engine.out"
-    echo "PASS native Metal shared-event blocks and the shader cache path $engine"
+    echo "PASS native Metal shared-event blocks, the shader cache path and swizzle keys $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/wine_imports.x86_64" > "$work/wine_imports.$engine.out" 2> "$work/wine_imports.$engine.err"
     cmp "$work/wine_imports.expected" "$work/wine_imports.$engine.out"
-    echo "PASS native ulock signals, iovecs, msghdrs, resolver state, zone statistics and DHCP info $engine"
+    echo "PASS native ulock signals, iovecs, msghdrs, resolver state, zone statistics, DHCP info and image UUIDs $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/bundle_id.x86_64" "$work/fw.x86_64/OcerzProbe.framework/OcerzProbe" \
+        > "$work/bundle_id.$engine.out" 2> "$work/bundle_id.$engine.err"
+    cmp "$work/bundle_id.expected" "$work/bundle_id.$engine.out"
+    echo "PASS native bundle lookup by identifier for a dlopened framework $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/low_wine.x86_64" > "$work/low_wine.$engine.out" 2> "$work/low_wine.$engine.err"
     cmp tests/dynamic/native_low_wine.out "$work/low_wine.$engine.out"
