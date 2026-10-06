@@ -485,6 +485,14 @@ static int br_error(struct OcerzVM *vm, OcerzCPU *cpu)
 
 static int br_answer(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t rax);
 
+/* A call answered with 0 and not made: an export no header declares, whose
+   arguments ocerz cannot know, and whose effect a program can do without.  The
+   overrides name each one and say why. */
+static int br_nothing(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return br_answer(vm, cpu, 0);
+}
+
 static int br_bzero(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t dst = cpu->gpr[OCERZ_RDI];
@@ -2417,6 +2425,34 @@ static int br_dyld_image_slide(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_answer(vm, cpu, slide);
 }
 
+/* _dyld_get_image_uuid answers the LC_UUID of the image whose header it is
+   given, read from that header as dyld reads it; host dyld has never heard of
+   the images ocerz loads (D3DMetal asks for its own). */
+static int br_dyld_image_uuid(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t mh = cpu->gpr[OCERZ_RDI], out = cpu->gpr[OCERZ_RSI];
+    if (!mh || !out || !ocerz_addr_readable(mh) || !ocerz_addr_readable(mh + 31))
+        return br_answer(vm, cpu, 0);
+    uint32_t magic = (uint32_t)ocerz_ld(mh, 4);
+    uint64_t lc = mh + (magic == MH_MAGIC_64 ? 32 : magic == MH_MAGIC ? 28 : 0);
+    if (lc == mh)
+        return br_answer(vm, cpu, 0);
+    uint32_t ncmds = (uint32_t)ocerz_ld(mh + 16, 4), room = (uint32_t)ocerz_ld(mh + 20, 4);
+    for (uint32_t k = 0; k < ncmds && room >= 8 && ocerz_addr_readable(lc + 7); k++) {
+        uint32_t cmd = (uint32_t)ocerz_ld(lc, 4), size = (uint32_t)ocerz_ld(lc + 4, 4);
+        if (size < 8 || size > room)
+            break;
+        if (cmd == LC_UUID && size >= 24) {
+            for (int b = 0; b < 16; b++)
+                ocerz_st(out + (uint64_t)b, 1, ocerz_ld(lc + 8 + (uint64_t)b, 1));
+            return br_answer(vm, cpu, 1);
+        }
+        lc += size;
+        room -= size;
+    }
+    return br_answer(vm, cpu, 0);
+}
+
 static int br_dyld_register_add_image(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     ocerz_dyld_native_add_image_func(vm, cpu->gpr[OCERZ_RDI], br_stack_below(cpu));
@@ -2536,6 +2572,7 @@ typedef struct BrHandler {
 } BrHandler;
 
 static const BrHandler g_br_handlers[] = {
+    { "nothing",         br_nothing },
     { "exit",            br_exit },
     { "exit_now",        br_exit_now },
     { "abort",           br_abort },
@@ -2636,6 +2673,7 @@ static const BrHandler g_br_handlers[] = {
     { "dlclose",         br_dlclose },
     { "dlerror",         br_dlerror },
     { "dyld_image_count",            br_dyld_image_count },
+    { "dyld_image_uuid",             br_dyld_image_uuid },
     { "dyld_image_header",           br_dyld_image_header },
     { "dyld_image_name",             br_dyld_image_name },
     { "dyld_image_vmaddr_slide",     br_dyld_image_vmaddr_slide },

@@ -9,25 +9,34 @@
  * - __res_9_state, the resolver state dnsapi.so reads in place.
  * - malloc_zone_statistics, which winemetal.so's statically linked LLVM calls.
  * - SCDynamicStoreCopyDHCPInfo and DHCPInfoGetOptionData, from mountmgr.so.
+ * - _dyld_get_image_uuid, which D3DMetal asks about its own image.
+ * - CoreAnalytics, the private framework D3DMetal links, opens and binds its
+ *   two event calls (looked up, not called: they would send events).
  */
 #include <SystemConfiguration/SystemConfiguration.h>
 #include <SystemConfiguration/SCDynamicStoreCopyDHCPInfo.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <malloc/malloc.h>
 #include <pthread.h>
 #include <resolv.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <uuid/uuid.h>
 
 #define UL_COMPARE_AND_WAIT 1
 #define ULF_NO_ERRNO 0x01000000
+extern bool _dyld_get_image_uuid(const struct mach_header *mh, uuid_t uuid);
 extern int __ulock_wait2(uint32_t operation, void *addr, uint64_t value, uint64_t timeout_ns, uint64_t value2);
 
 static _Atomic int g_handled;
@@ -106,6 +115,25 @@ static void iovecs(void)
     printf("sendmsg %zd recvmsg %zd '%s' flags %d\n", sent, got, buf, r.msg_flags);
 }
 
+static void image_uuid(void)
+{
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    uuid_t got;
+    memset(got, 0, sizeof got);
+    int ok = _dyld_get_image_uuid((const struct mach_header *)mh, got);
+    const uint8_t *lc = (const uint8_t *)(mh + 1);
+    int same = 0;
+    for (uint32_t k = 0; k < mh->ncmds; k++) {
+        const struct load_command *c = (const struct load_command *)lc;
+        if (c->cmd == LC_UUID) {
+            same = memcmp(((const struct uuid_command *)c)->uuid, got, sizeof got) == 0;
+            break;
+        }
+        lc += c->cmdsize;
+    }
+    printf("main image uuid answered: %d, matches its LC_UUID: %d\n", ok, same);
+}
+
 int main(void)
 {
     ulock_signal();
@@ -128,5 +156,9 @@ int main(void)
     printf("DHCP info: %d, subnet mask option: %d\n", dhcp != NULL, mask ? (int)CFDataGetLength(mask) : -1);
     if (dhcp)
         CFRelease(dhcp);
+    image_uuid();
+    void *ca = dlopen("/System/Library/PrivateFrameworks/CoreAnalytics.framework/CoreAnalytics", RTLD_LAZY);
+    printf("CoreAnalytics opened: %d, event calls bound: %d\n", ca != NULL,
+           ca && dlsym(ca, "AnalyticsSendEvent") && dlsym(ca, "AnalyticsSendEventLazy"));
     return 0;
 }

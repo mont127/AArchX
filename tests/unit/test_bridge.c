@@ -200,7 +200,7 @@ static const char *const kCFBridged[] = {
 
 static const char *const kNoDescriptor[][2] = {
     { "/usr/lib/libSystem.B.dylib", "dyld_stub_binder" },
-    { "/usr/lib/libSystem.B.dylib", "__dyld_get_image_uuid" },
+    { "/usr/lib/libSystem.B.dylib", "__dyld_bind_fully_image_containing_address" },
     { "/usr/lib/libSystem.B.dylib", "_forkpty" },
     { "/usr/lib/libSystem.B.dylib", "___stack_chk_guard" },
     { OCERZ_BRIDGE_COREFOUNDATION, "_kCFAllocatorDefault" },
@@ -221,7 +221,7 @@ static const char *const kDlSpecials[] = {
     "_dyld_get_program_min_os_version", "_dyld_get_sdk_version", "_dyld_get_min_os_version",
     "_dyld_get_active_platform", "_dyld_program_sdk_at_least", "_dyld_program_minos_at_least",
     "_dyld_sdk_at_least", "_dyld_minos_at_least", "__dyld_is_memory_immutable",
-    "_dyld_shared_cache_some_image_overridden", "__dyld_shared_cache_contains_path",
+    "_dyld_shared_cache_some_image_overridden", "__dyld_shared_cache_contains_path", "__dyld_get_image_uuid",
 };
 #define NDLSPECIALS (sizeof kDlSpecials / sizeof kDlSpecials[0])
 

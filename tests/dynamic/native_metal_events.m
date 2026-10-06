@@ -6,7 +6,8 @@
  * CFRunLoopPerformBlock, on the run loop of a thread it keeps for that.  Both
  * blocks are the guest's, and DXMT is built without ARC, so they are stack
  * blocks when they cross; this file is too.  DXMT also reads the shader cache
- * path through MTLGetShaderCachePath, which no header declares.
+ * path through MTLGetShaderCachePath, which no header declares, and D3DMetal
+ * keys texture swizzles with two more such calls.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -15,6 +16,8 @@
 #include <stdio.h>
 
 extern NSString *MTLGetShaderCachePath(void);
+extern uint64_t MTLTextureSwizzleChannelsToKey(uint32_t packed_channels);
+extern uint64_t MTLTextureSwizzleKeyToChannels(uint64_t key);
 
 static _Atomic(CFRunLoopRef) g_loop;
 
@@ -85,6 +88,12 @@ int main(void)
         long late = dispatch_semaphore_wait(done2, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
         printf("follow-up on a thread's own run loop: %s, on that loop: %d\n", late ? "no" : "yes", ran_on_loop);
         printf("shader cache path is a string: %d\n", [MTLGetShaderCachePath() isKindOfClass:[NSString class]]);
+        int round = 0;
+        for (uint32_t c = 0; c < 6 * 6 * 6 * 6; c++) {
+            uint32_t packed = c % 6 | (c / 6 % 6) << 8 | (c / 36 % 6) << 16 | (c / 216) << 24;
+            round += (uint32_t)MTLTextureSwizzleKeyToChannels(MTLTextureSwizzleChannelsToKey(packed)) == packed;
+        }
+        printf("texture swizzle keys round-trip: %d of 1296\n", round);
     }
     return 0;
 }

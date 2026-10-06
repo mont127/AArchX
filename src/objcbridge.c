@@ -337,6 +337,7 @@
 #include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -402,6 +403,8 @@ static ObSym g_ob_CFStringGetLength = OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStr
 static ObSym g_ob_CFStringGetMaximumSizeForEncoding =
     OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStringGetMaximumSizeForEncoding");
 static ObSym g_ob_CFStringGetCString = OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStringGetCString");
+static ObSym g_ob_CFStringCreateWithCString = OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFStringCreateWithCString");
+static ObSym g_ob_CFRelease = OB_SYM(OCERZ_BRIDGE_COREFOUNDATION, "CFRelease");
 
 static void *ob_sym(ObSym *s)
 {
@@ -2015,6 +2018,48 @@ static void ob_guarded_body(void *ctx)
     ob_perform(g->cpu, g->sig, g->fn, g->slots, g->nslots, 0, g->what);
 }
 
+/* +[NSBundle bundleWithIdentifier:] knows only the bundles host dyld loaded,
+   so for a framework ocerz's loader mapped it answers nil: D3DMetal looks its
+   own bundle up that way to find the shader library it ships.  When the host
+   finds nothing, each image ocerz loaded from inside a .framework is asked,
+   through that framework's Info.plist, whether it carries the identifier. */
+static void *ob_guest_bundle(void *bundle_class, void *wanted)
+{
+    if (!bundle_class || !wanted)
+        return NULL;
+    void *send = ob_need(&g_ob_msgSend);
+    void *(*create)(void *, const char *, uint32_t) = ob_need(&g_ob_CFStringCreateWithCString);
+    void (*release)(void *) = ob_need(&g_ob_CFRelease);
+    void *with_path = ob_sel_registerName("bundleWithPath:");
+    void *identifier = ob_sel_registerName("bundleIdentifier");
+    void *equal = ob_sel_registerName("isEqualToString:");
+    uint32_t n = ocerz_dyld_image_count();
+    for (uint32_t k = 0; k < n; k++) {
+        uint64_t name = 0;
+        if (!ocerz_dyld_image_at(k, NULL, NULL, &name) || !name)
+            continue;
+        const char *path = ocerz_g2h(name);
+        const char *fw = strstr(path, ".framework/");
+        if (!fw || strncmp(path, "/System/", 8) == 0)
+            continue;
+        char root[PATH_MAX];
+        size_t len = (size_t)(fw - path) + strlen(".framework");
+        if (len >= sizeof root)
+            continue;
+        memcpy(root, path, len);
+        root[len] = 0;
+        void *str = create(NULL, root, 0x08000100);
+        if (!str)
+            continue;
+        void *bundle = ((void *(*)(void *, void *, void *))send)(bundle_class, with_path, str);
+        release(str);
+        void *bid = bundle ? ((void *(*)(void *, void *))send)(bundle, identifier) : NULL;
+        if (bid && ((signed char (*)(void *, void *, void *))send)(bid, equal, wanted))
+            return bundle;
+    }
+    return NULL;
+}
+
 static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret, void *imp,
                        const char *imp_types)
 {
@@ -2150,6 +2195,11 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
 
     void *asked = NULL;
     int answers_imp = sig->ret == 'p' && sig->nargs == 3 && ob_answers_imp(sel);
+    void *bundle_id = NULL;
+    int bundle_lookup = kind == OB_PLAIN && sig->ret == 'p' && sig->nargs == 3 && ob_class_isMetaClass(cls) &&
+                        strcmp(selname, "bundleWithIdentifier:") == 0;
+    if (bundle_lookup)
+        bundle_id = (void *)(uintptr_t)ob_named(sig, cpu, 2, 'p');
     if (answers_imp)
         asked = (void *)(uintptr_t)ob_named(sig, cpu, 2, 'p');
     void *raised = NULL;
@@ -2162,6 +2212,8 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
     } else {
         ob_perform(cpu, sig, fn, slots, nslots, 0, selname);
     }
+    if (bundle_lookup && !cpu->gpr[OCERZ_RAX] && bundle_id)
+        cpu->gpr[OCERZ_RAX] = ocerz_h2g(ob_guest_bundle(recv, ocerz_g2h((uint64_t)(uintptr_t)bundle_id)));
     if (answers_imp && cpu->gpr[OCERZ_RAX]) {
         void *of = sel == atomic_load(&g_ob_sel_instanceMethodFor) ? recv : cls;
         void *m = asked && of ? ob_class_getInstanceMethod(of, asked) : NULL;
