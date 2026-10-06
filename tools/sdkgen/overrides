@@ -1544,6 +1544,16 @@ special _MTLMakeShaderCacheWritableByAllUsers nothing
 fn _MTLTextureSwizzleChannelsToKey MTLTextureSwizzleChannelsToKey L(u)
 fn _MTLTextureSwizzleKeyToChannels MTLTextureSwizzleKeyToChannels u(L)
 
+# IsWindowVisible is exported but no header declares it any more; Apple's
+# Window Manager reference gives Boolean IsWindowVisible(WindowRef).  Wine's
+# winemac.drv calls IsWindowVisible(hwnd) from its Unix side when a window
+# takes SC_MOVE, and on macOS that binds to Carbon's, so Steam's webhelper
+# ended there whenever its window was dragged.
+
+library /System/Library/Frameworks/Carbon.framework/Versions/A/Carbon
+
+fn _IsWindowVisible IsWindowVisible B(p)
+
 # AudioUnitSetProperty's value is bytes, and kAudioUnitProperty_SetRenderCallback
 # and kAudioOutputUnitProperty_SetInputCallback put a render callback in them,
 # which the I/O thread calls; its handler converts that function and refuses
