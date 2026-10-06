@@ -93,9 +93,10 @@
  * does over the shared cache.  Ranges the guest never maps stay the host's.
  * The free host space left below 12 GB is then reserved again, as the hole
  * fill above does at startup, so a host allocation made later cannot land
- * where the guest would see the shadow instead of it.  A value below 64 KB is
- * nobody's memory and crosses unchanged (ocerz_g2h).  OCERZ_PINLOG=1 prints
- * each range as it is pinned, OCERZ_NO_LOW_PIN=1 turns pinning off.
+ * where the guest would see the shadow instead of it.  In a process that pins,
+ * a value below 64 KB is nobody's memory and crosses unchanged (ocerz_g2h).
+ * OCERZ_PINLOG=1 prints each range as it is pinned, OCERZ_NO_LOW_PIN=1 turns
+ * pinning off.
  */
 #include "ocerz/mem.h"
 #include "ocerz/mode.h"
