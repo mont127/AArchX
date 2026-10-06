@@ -102,6 +102,7 @@ typedef struct OcerzCPU {
     volatile uint64_t block_started_ns;
     volatile int block_what;
     volatile int block_nokick;
+    volatile int block_sigonly;
     uint32_t sendring_id[8], sendring_port[8], sendring_sz[8];
     int sendring_n;
     volatile uint32_t last_rcv_name;

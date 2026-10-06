@@ -1751,9 +1751,17 @@ static int ob_nil(struct OcerzVM *vm, OcerzCPU *cpu, int stret, uint64_t size)
     return ob_settle(vm, cpu);
 }
 
-static void ob_check_callables(void *cls, void *sel, const ObSend *send, const OcerzCPU *cpu)
+/* A guest function pointer may cross only to a guest method: a class the guest
+ * defined (Wine's WineEventQueue takes a C handler) runs its method through a
+ * callback slot, and that x86 code calls the pointer itself.  A native method
+ * would jump to x86 code, so the send is refused. */
+static void ob_check_callables(void *cls, void *sel, const ObSend *send, const OcerzCPU *cpu, void *imp)
 {
     const OcerzAbiSig *sig = &send->shape->sig;
+    if (!imp)
+        imp = ((void *(*)(void *, void *))ob_need(&g_ob_class_getMethodImplementation))(cls, sel);
+    if (ocerz_abi_callback_sig(imp, NULL))
+        return;
     for (int k = 0; k < sig->nargs && k < 32; k++) {
         uint32_t bit = 1u << k;
         if (!(send->fnptrs & bit))
@@ -2080,7 +2088,7 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
         ob_refuse(cls, sel, "returns a structure System V returns in memory (%s), and the guest sent it"
                   " with %s, which passes no result pointer", send->shape->notation, export + 1);
     if (send->fnptrs)
-        ob_check_callables(cls, sel, send, cpu);
+        ob_check_callables(cls, sel, send, cpu, imp);
 
     const char *selname = ob_sel_getName(sel);
     ocerz_bridge_lower(&outer);

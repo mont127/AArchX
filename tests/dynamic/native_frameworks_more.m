@@ -253,6 +253,31 @@ static void union_results(void)
 }
 @end
 
+/* A class of the guest's whose method takes a C function, the way Wine's
+   WineEventQueue takes its event handler: the send goes through the host's
+   objc_msgSend to the guest's own method, so the guest function pointer may
+   cross, unlike one handed to a native method. */
+@interface OcerzFnTaker : NSObject
+- (int)apply:(int (*)(int))fn to:(int)value;
+@end
+
+@implementation OcerzFnTaker
+- (int)apply:(int (*)(int))fn to:(int)value
+{
+    return fn(value);
+}
+@end
+
+static int plus_one(int value)
+{
+    return value + 1;
+}
+
+static void guest_function_to_guest_method(void)
+{
+    printf("guest method given a C function: %d\n", [[OcerzFnTaker new] apply:plus_one to:41]);
+}
+
 static void category_properties(void)
 {
     objc_property_t tag = class_getProperty([NSNumber class], "ocerzTag");
@@ -331,6 +356,7 @@ int main(void)
         va_list_methods();
         category_properties();
         union_results();
+        guest_function_to_guest_method();
         block_imps();
         uncaught_handlers();
     }
