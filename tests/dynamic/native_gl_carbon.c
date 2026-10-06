@@ -5,7 +5,11 @@
 #include <OpenGL/glext.h>
 #include <OpenGL/glu.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* Exported and in no header since the Window Manager headers went. */
+extern Boolean IsWindowVisible(WindowRef window);
 
 static void opengl(void)
 {
@@ -72,6 +76,10 @@ static void carbon(void)
                                       GetApplicationEventTarget(), 0, &ref);
     OSStatus un = ref ? UnregisterEventHotKey(ref) : -1;
     printf("hotkey %d %d %d\n", (int)st, ref != NULL, (int)un);
+    /* Wine's winemac.drv asks this about an HWND, which is no window to Carbon. */
+    void *notwin = calloc(1, 4096);
+    printf("window visible null=%d notwin=%d\n", (int)IsWindowVisible(NULL), (int)IsWindowVisible((WindowRef)notwin));
+    free(notwin);
 }
 
 int main(void)
