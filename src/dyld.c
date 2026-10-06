@@ -919,23 +919,32 @@ static int map_segments(DynImage *img, int is_main)
                 uint64_t vmaddr = rd64(lc + 24);
                 uint64_t vmsize = rd64(lc + 32);
                 uint32_t initprot = rd32(lc + 56);
+                int unmapped = 0;
                 if (!(vmaddr == 0 && initprot == 0) && vmsize) {
                     if (vmaddr < OCERZ_LOW_LIMIT) {
                         if (vmaddr + vmsize > OCERZ_LOW_LIMIT)
                             return OCERZ_ENOMEM;
                         if (ocerz_mem_init_low_shadow() != OCERZ_OK)
                             return OCERZ_ENOMEM;
+                        if (ocerz_mode == OCERZ_MODE_NATIVE && rd64(lc + 48) == 0 &&
+                            ocerz_host_low_readable(vmaddr, vmaddr + vmsize)) {
+                            OCERZ_LOG("dynamic: zero-fill segment %.16s [%#llx, %#llx) overlaps host memory and"
+                                      " stays unmapped\n", (const char *)(lc + 8), (unsigned long long)vmaddr,
+                                      (unsigned long long)(vmaddr + vmsize));
+                            unmapped = 1;
+                        }
                     } else if (!(vmaddr >= ocerz_arena_lo && vmaddr + vmsize <= ocerz_arena_hi)) {
                         if (ocerz_mem_register_range(vmaddr, vmaddr + vmsize) != OCERZ_OK)
                             return OCERZ_ENOMEM;
                     }
-                    if (ocerz_map_fixed(vmaddr, vmsize,
-                                        PROT_READ | PROT_WRITE) != OCERZ_OK)
+                    if (!unmapped && ocerz_map_fixed(vmaddr, vmsize,
+                                                     PROT_READ | PROT_WRITE) != OCERZ_OK)
                         return OCERZ_ENOMEM;
                 }
             }
             lc += rd32(lc + 4);
         }
+        ocerz_mem_pin_host_low();
     } else if (is_main) {
         img->load_base = ocerz_arena_lo;
         img->slide = img->load_base - text_vmaddr;
@@ -4417,9 +4426,29 @@ static DynImage *ndl_dimg_for_mh(uint64_t mh)
     return NULL;
 }
 
+/* A name a synthesized library can only stub is not there as far as dlsym is
+   concerned: a program that looks up an optional function by name takes its
+   own fallback when dlsym answers NULL, where calling the stub ends the
+   process.  msync in Wine looks up mach_msg2_trap that way, and MacNdCheese's
+   winemac.so IOAVServiceCreateWithService.  Binding at load time is unchanged,
+   so a program that links a stubbed name still loads and stops only if it
+   calls it. */
+static int ndl_stub_only(const DynImage *d, const char *usym)
+{
+    if (!d->is_virtual)
+        return 0;
+    const OcerzApiLibrary *lib = ocerz_apidb_library(d->install_name);
+    const OcerzApiEntry *e = lib ? ocerz_apidb_find(lib, usym) : NULL;
+    return e && e->kind == OCERZ_API_STUB;
+}
+
 static uint64_t ndl_lookup_in(DynImage *d, const char *usym, int *found)
 {
     uint64_t v = ocerz_image_self_resolve_ex(d, usym, found);
+    if (*found && ndl_stub_only(d, usym)) {
+        *found = 0;
+        return 0;
+    }
     if (*found)
         return v;
     v = image_symtab_resolve(d, usym);
@@ -5403,6 +5432,47 @@ static void load_inserted_libraries(struct OcerzVM *vm)
     free(copy);
 }
 
+/* Wine's loader tells ntdll.so what it reserved through the exported pointer
+   wine_main_preload_info, and on macOS that list is a constant: its low range
+   is all of [4 KB, 8 GB) whether the reservation took or not.  In native mode
+   host memory pinned below 12 GB lies inside it, where ntdll's allocator maps
+   with MAP_FIXED and asserts when refused, so the pointer is moved to a copy
+   whose ranges leave the pinned ones out, the way Wine's own preloader drops
+   a range it could not reserve. */
+static void wine_preload_skip_pinned(DynImage *img)
+{
+    int found = 0;
+    uint64_t var = ocerz_image_self_resolve_ex(img, "_wine_main_preload_info", &found);
+    uint64_t list = found && var ? ocerz_ld(var, 8) : 0;
+    if (!list)
+        return;
+    uint64_t parts[2 * 120];
+    int n = 0, cut = 0;
+    for (int i = 0; i < 16 && n < 120; i++) {
+        uint64_t addr = ocerz_ld(list + (uint64_t)i * 16, 8), size = ocerz_ld(list + (uint64_t)i * 16 + 8, 8);
+        if (!size)
+            break;
+        if (ocerz_mem_pinned(addr, size)) {
+            cut = 1;
+            n += ocerz_mem_unpinned_parts(addr, addr + size, parts + 2 * n, 120 - n);
+        } else {
+            parts[2 * n] = addr;
+            parts[2 * n + 1] = size;
+            n++;
+        }
+    }
+    uint64_t copy = cut ? ocerz_map_anywhere((uint64_t)(n + 2) * 16, PROT_READ | PROT_WRITE) : 0;
+    if (!copy)
+        return;
+    for (int i = 0; i < n; i++) {
+        ocerz_st(copy + (uint64_t)i * 16, 8, parts[2 * i]);
+        ocerz_st(copy + (uint64_t)i * 16 + 8, 8, parts[2 * i + 1]);
+    }
+    ocerz_st(var, 8, copy);
+    OCERZ_LOG("dynamic: wine_main_preload_info now lists %d ranges that leave out host memory pinned below %#llx\n", n,
+              (unsigned long long)OCERZ_LOW_LIMIT);
+}
+
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
 {
     if (ocerz_mem_init_identity(DYN_ARENA_SIZE) != OCERZ_OK)
@@ -5685,6 +5755,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     OCERZ_LOG("dynamic: load_base=%#llx slide=%#llx main=%#llx\n",
               (unsigned long long)img.load_base, (unsigned long long)img.slide,
               (unsigned long long)img.main_entry);
+    if (ocerz_mode == OCERZ_MODE_NATIVE && ocerz_low_base)
+        wine_preload_skip_pinned(&img);
 
     if (getenv("OCERZ_ZONEPROBE")) {
         uint64_t g_malloc_zones = 0x7ff8436b4758ULL;

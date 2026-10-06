@@ -14454,7 +14454,8 @@ static int leaf_layout_ok(void)
     int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
                 jgb_usable() && !stack_guard_needed();
     return fast3 && ras_body_only() && host_ras_enabled() && !no_blret && !g_xlat_mode32 &&
-           leaf_inplace_enabled() && ocerz_guest_base == 0 && pin_slot(OCERZ_RAX) >= 0 &&
+           leaf_inplace_enabled() && ocerz_guest_base == 0 &&
+           !(ocerz_low_base && ocerz_mode == OCERZ_MODE_NATIVE) && pin_slot(OCERZ_RAX) >= 0 &&
            pin_slot(OCERZ_RDI) >= 0 && pin_slot(OCERZ_RSI) >= 0 && pin_slot(OCERZ_RDX) >= 0 &&
            pin_hreg(pin_slot(OCERZ_RAX)) == 21 && pin_hreg(pin_slot(OCERZ_RDI)) == 28 &&
            pin_hreg(pin_slot(OCERZ_RSI)) == 27 && pin_hreg(pin_slot(OCERZ_RDX)) == 23;

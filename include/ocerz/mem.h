@@ -23,22 +23,36 @@ extern uint64_t ocerz_arena_hi;
 extern uint64_t ocerz_low_base;
 extern uint64_t ocerz_top_base;
 extern uint8_t *ocerz_commpage;
+extern uint8_t *ocerz_pin_map;
 
 #define OCERZ_COMMPAGE_LO 0x00007fffffe00000ull
 #define OCERZ_COMMPAGE_HI 0x00007fffffe04000ull
 #define OCERZ_LOW_LIMIT   0x0000000300000000ull
+#define OCERZ_NULL_LIMIT  0x0000000000010000ull
 #define OCERZ_TOP_LO      0x00007ffffe000000ull
 #define OCERZ_TOP_HI      0x00007fffffe00000ull
 #define OCERZ_GUEST_PAGE_SIZE 0x1000ull
 #define OCERZ_HOST_PAGE_SIZE  0x4000ull
 
+/* A host page below the low limit that native mode pinned (mem.c): the guest
+   reads it through its alias in the shadow, and its number is the host's. */
+static inline int ocerz_pinned_page(uint64_t gaddr)
+{
+    return ocerz_pin_map && gaddr < OCERZ_LOW_LIMIT && ((ocerz_pin_map[gaddr >> 17] >> ((gaddr >> 14) & 7)) & 1);
+}
+
+/* With a low shadow, a value in the first 64 KB is nobody's memory but often a
+   sentinel (objc's empty autorelease pool is token 1), so it crosses as it is. */
 static inline void *ocerz_g2h(uint64_t gaddr)
 {
     if (ocerz_commpage && gaddr >= OCERZ_COMMPAGE_LO && gaddr < OCERZ_COMMPAGE_HI)
         return ocerz_commpage + (gaddr - OCERZ_COMMPAGE_LO);
     if (ocerz_low_base) {
-        if (gaddr < OCERZ_LOW_LIMIT)
+        if (gaddr < OCERZ_LOW_LIMIT) {
+            if (gaddr < OCERZ_NULL_LIMIT || ocerz_pinned_page(gaddr))
+                return (void *)(uintptr_t)gaddr;
             return (void *)(uintptr_t)(gaddr + ocerz_low_base);
+        }
         if (gaddr - OCERZ_TOP_LO < OCERZ_TOP_HI - OCERZ_TOP_LO)
             return (void *)(uintptr_t)(gaddr - OCERZ_TOP_LO + ocerz_top_base);
     }
@@ -98,6 +112,12 @@ int ocerz_mem_init_identity(uint64_t size);
 extern int ocerz_wine_process;
 #define OCERZ_WINE_ARENA_BASE 0x7a0000000000ull
 int ocerz_mem_init_low_shadow(void);
+void ocerz_mem_pin_host_low(void);
+void ocerz_mem_pin_refresh(void);
+int ocerz_host_low_readable(uint64_t lo, uint64_t hi);
+int ocerz_mem_unpinned_parts(uint64_t lo, uint64_t hi, uint64_t *out, int max);
+int ocerz_mem_range_in_use(uint64_t gaddr, uint64_t len);
+int ocerz_mem_pinned(uint64_t gaddr, uint64_t len);
 void ocerz_low_fill_host_holes(void);
 int ocerz_mem_register_range(uint64_t glo, uint64_t ghi);
 int ocerz_map_fixed(uint64_t gaddr, uint64_t len, int prot);

@@ -78,8 +78,27 @@
  * reserves every free host range between 4 GB and 12 GB, at startup and again
  * after each alias, and the kernel maps above the arena instead, where guest
  * and host addresses are the same (OCERZ_NO_LOW_HOLE_FILL=1 turns it off).
+ *
+ * In native mode the guest calls the host's own libraries, so host pointers
+ * below 12 GB reach it all the time: an object from the first malloc region at
+ * 4 GB, a structure on the main thread's stack at 5.7 GB, a constant in the
+ * shared cache between 6 and 11 GB.  Translated code reads every address below
+ * 12 GB through the shadow, so ocerz_mem_pin_host_low remaps each readable host
+ * region there into the shadow at the same offset, where the guest reads and
+ * writes the host's own pages, and pins it: a fixed mapping, a claim or a
+ * shared overlay that touches a pinned range is refused, and an unmap or a
+ * protection change leaves the pinned part alone.  It runs once the main image
+ * is mapped, and leaves out any page the guest already holds; that is where an
+ * x86 executable's fixed segments win over the host, as Wine's loader at 8 GB
+ * does over the shared cache.  Ranges the guest never maps stay the host's.
+ * The free host space left below 12 GB is then reserved again, as the hole
+ * fill above does at startup, so a host allocation made later cannot land
+ * where the guest would see the shadow instead of it.  A value below 64 KB is
+ * nobody's memory and crosses unchanged (ocerz_g2h).  OCERZ_PINLOG=1 prints
+ * each range as it is pinned, OCERZ_NO_LOW_PIN=1 turns pinning off.
  */
 #include "ocerz/mem.h"
+#include "ocerz/mode.h"
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -421,6 +440,52 @@ static int map_refuse(int site, uint64_t lo, uint64_t hi, int rc)
                 (int)getpid(), site, (unsigned long long)lo,
                 (unsigned long long)hi, rc);
     return rc;
+}
+
+#define PIN_MAX 256
+static struct { uint64_t lo, hi; } g_pin[PIN_MAX];
+static int g_pin_n;
+uint8_t *ocerz_pin_map;
+
+static int pinned_overlap(uint64_t lo, uint64_t hi)
+{
+    for (int i = 0; i < g_pin_n; i++)
+        if (lo < g_pin[i].hi && hi > g_pin[i].lo)
+            return 1;
+    return 0;
+}
+
+int ocerz_mem_pinned(uint64_t gaddr, uint64_t len)
+{
+    return g_pin_n && len && pinned_overlap(gaddr, gaddr + len);
+}
+
+/* Calls fn on each part of [lo, hi) outside the pinned ranges, in order, and
+   answers the first failure. */
+static int for_unpinned(uint64_t lo, uint64_t hi, int (*fn)(uint64_t, uint64_t, int), int arg)
+{
+    while (lo < hi) {
+        uint64_t end = hi, skip = 0;
+        for (int i = 0; i < g_pin_n; i++) {
+            if (g_pin[i].hi <= lo || g_pin[i].lo >= hi)
+                continue;
+            if (g_pin[i].lo <= lo) {
+                if (g_pin[i].hi > skip)
+                    skip = g_pin[i].hi;
+            } else if (g_pin[i].lo < end) {
+                end = g_pin[i].lo;
+            }
+        }
+        if (skip) {
+            lo = skip;
+            continue;
+        }
+        int rc = fn(lo, end, arg);
+        if (rc != OCERZ_OK)
+            return rc;
+        lo = end;
+    }
+    return OCERZ_OK;
 }
 
 static uint32_t owner_create_locked(const MemRegion *r, uint32_t live_slots,
@@ -1391,6 +1456,175 @@ void ocerz_low_fill_host_holes(void)
                   (unsigned long long)filled, (unsigned long long)OCERZ_LOW_LIMIT);
 }
 
+static void pin_add(uint64_t lo, uint64_t hi)
+{
+    static uint8_t map[OCERZ_LOW_LIMIT >> 17];
+    for (uint64_t p = lo & ~(OCERZ_HOST_PAGE - 1); p < hi; p += OCERZ_HOST_PAGE)
+        map[p >> 17] |= (uint8_t)(1u << ((p >> 14) & 7));
+    __atomic_store_n(&ocerz_pin_map, map, __ATOMIC_RELEASE);
+    if (g_pin_n && g_pin[g_pin_n - 1].hi == lo)
+        g_pin[g_pin_n - 1].hi = hi;
+    else if (g_pin_n < PIN_MAX)
+        g_pin[g_pin_n].lo = lo, g_pin[g_pin_n].hi = hi, g_pin_n++;
+    else
+        g_pin[g_pin_n - 1].hi = hi;
+}
+
+static uint64_t pin_alias(uint64_t lo, uint64_t hi)
+{
+    mach_vm_address_t dst = ocerz_low_base + lo;
+    vm_prot_t cur = 0, max = 0;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &dst, hi - lo, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                     mach_task_self(), lo, FALSE, &cur, &max, VM_INHERIT_DEFAULT);
+    if (getenv("OCERZ_PINLOG"))
+        fprintf(stderr, "ocerz: PIN[%d] %#llx-%#llx kr=%d\n", (int)getpid(), (unsigned long long)lo,
+                (unsigned long long)hi, kr);
+    if (kr != KERN_SUCCESS || dst != ocerz_low_base + lo)
+        return 0;
+    pin_add(lo, hi);
+    return hi - lo;
+}
+
+int ocerz_mem_range_in_use(uint64_t gaddr, uint64_t len)
+{
+    if (!len || gaddr > UINT64_MAX - len)
+        return 1;
+    if (g_pin_n && pinned_overlap(gaddr, gaddr + len))
+        return 1;
+    const MemRegion *r = region_for_range(guest_round_down(gaddr), guest_round_up(gaddr + len));
+    if (!r)
+        return 0;
+    for (uint64_t p = guest_round_down(gaddr); p < gaddr + len; p += OCERZ_GUEST_PAGE)
+        if (slot_owner(slot_load(r, slot_index(r, p))))
+            return 1;
+    return 0;
+}
+
+int ocerz_mem_unpinned_parts(uint64_t lo, uint64_t hi, uint64_t *out, int max)
+{
+    const uint64_t gran = 0x10000;
+    int n = 0;
+    uint64_t at = lo;
+    while (at < hi && n < max) {
+        uint64_t next = hi, resume = 0;
+        for (int i = 0; i < g_pin_n; i++) {
+            if (g_pin[i].hi <= at || g_pin[i].lo >= hi)
+                continue;
+            if (g_pin[i].lo <= at) {
+                if (g_pin[i].hi > resume)
+                    resume = g_pin[i].hi;
+            } else if (g_pin[i].lo < next) {
+                next = g_pin[i].lo;
+            }
+        }
+        if (resume) {
+            at = (resume + gran - 1) & ~(gran - 1);
+            continue;
+        }
+        uint64_t end = next == hi ? hi : next & ~(gran - 1);
+        if (end > at + gran) {
+            out[2 * n] = at;
+            out[2 * n + 1] = end - at;
+            n++;
+        }
+        at = next == hi ? hi : next;
+    }
+    return n;
+}
+
+/* A fork gives the child its own copy-on-write copy of each pinned host range
+   and of its alias in the shadow, and the two copies no longer share pages:
+   Wine's process launcher builds argv in a forked child, through the alias, in
+   a malloc block of the first heap region, and the host's execv read the
+   other copy, all zeros.  The child aliases its own ranges again before any
+   guest code runs (ocerz_fork_child). */
+void ocerz_mem_pin_refresh(void)
+{
+    int failed = 0;
+    for (int i = 0; i < g_pin_n; i++) {
+        mach_vm_address_t dst = ocerz_low_base + g_pin[i].lo;
+        vm_prot_t cur = 0, max = 0;
+        if (mach_vm_remap(mach_task_self(), &dst, g_pin[i].hi - g_pin[i].lo, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                          mach_task_self(), g_pin[i].lo, FALSE, &cur, &max, VM_INHERIT_DEFAULT) != KERN_SUCCESS ||
+            dst != ocerz_low_base + g_pin[i].lo)
+            failed++;
+    }
+    if (failed)
+        OCERZ_LOG("native Wine: %d of %d pinned ranges could not be aliased again after fork\n", failed, g_pin_n);
+}
+
+int ocerz_host_low_readable(uint64_t lo, uint64_t hi)
+{
+    mach_vm_address_t a = lo;
+    while (a < hi) {
+        mach_vm_address_t rlo = a;
+        mach_vm_size_t size = 0;
+        natural_t depth = 999;
+        vm_region_submap_short_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+        if (mach_vm_region_recurse(mach_task_self(), &rlo, &size, &depth, (vm_region_recurse_info_t)&info, &cnt) !=
+                KERN_SUCCESS || rlo >= hi || size == 0)
+            return 0;
+        if (info.protection & VM_PROT_READ)
+            return 1;
+        a = rlo + size;
+    }
+    return 0;
+}
+
+void ocerz_mem_pin_host_low(void)
+{
+    if (ocerz_mode != OCERZ_MODE_NATIVE || !ocerz_low_base || g_pin_n || getenv("OCERZ_NO_LOW_PIN"))
+        return;
+    map_lock_acquire();
+    MemRegion *r = region_for_range(0, OCERZ_LOW_LIMIT);
+    uint64_t pinned = 0, lost = 0;
+    int failed = 0;
+    mach_vm_address_t a = 0x100000000ull;
+    while (a < OCERZ_LOW_LIMIT) {
+        mach_vm_address_t rlo = a;
+        mach_vm_size_t size = 0;
+        natural_t depth = 999;
+        vm_region_submap_short_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+        if (mach_vm_region_recurse(mach_task_self(), &rlo, &size, &depth, (vm_region_recurse_info_t)&info, &cnt) !=
+                KERN_SUCCESS || rlo >= OCERZ_LOW_LIMIT || size == 0)
+            break;
+        uint64_t rhi = rlo + size > OCERZ_LOW_LIMIT ? OCERZ_LOW_LIMIT : rlo + size;
+        a = rhi;
+        if (!(info.protection & VM_PROT_READ))
+            continue;
+        for (uint64_t p = rlo; p < rhi;) {
+            uint64_t q = p;
+            int held = 0;
+            for (uint64_t g = p; r && g < p + OCERZ_HOST_PAGE; g += OCERZ_GUEST_PAGE)
+                held |= slot_owner(slot_load(r, slot_index(r, g))) != 0;
+            while (q < rhi) {
+                int h = 0;
+                for (uint64_t g = q; r && g < q + OCERZ_HOST_PAGE; g += OCERZ_GUEST_PAGE)
+                    h |= slot_owner(slot_load(r, slot_index(r, g))) != 0;
+                if (h != held)
+                    break;
+                q += OCERZ_HOST_PAGE;
+            }
+            if (held) {
+                lost += q - p;
+            } else {
+                uint64_t got = pin_alias(p, q);
+                pinned += got;
+                failed += got == 0;
+            }
+            p = q;
+        }
+    }
+    map_lock_release();
+    ocerz_low_fill_host_holes();
+    OCERZ_LOG("native Wine: %#llx bytes of host memory below %#llx aliased into the shadow and pinned in %d ranges;"
+              " %#llx bytes left to guest segments, %d remaps refused\n",
+              (unsigned long long)pinned, (unsigned long long)OCERZ_LOW_LIMIT, g_pin_n,
+              (unsigned long long)lost, failed);
+}
+
 int ocerz_mem_init_low_shadow(void)
 {
 
@@ -1546,6 +1780,8 @@ static int map_fixed_locked(uint64_t gaddr, uint64_t len, int prot, int zero_ove
     uint64_t lo, hi;
     if (!guest_range(gaddr, len, &lo, &hi))
         return map_refuse(1, gaddr, gaddr + len, OCERZ_ENOMEM);
+    if (g_pin_n && pinned_overlap(round_down(lo), round_up(hi)))
+        return map_refuse(12, lo, hi, OCERZ_ENOMEM);
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     if (!r)
         return map_refuse(2, lo, hi, OCERZ_ENOMEM);
@@ -1575,6 +1811,8 @@ static int map_shared_overlay(uint64_t gaddr, uint64_t len, int prot,
     uint64_t lo = round_down(data_lo);
     uint64_t hi = round_up(data_hi);
     uint64_t map_off = 0;
+    if (g_pin_n && pinned_overlap(lo, hi))
+        return OCERZ_ENOMEM;
     if (fd >= 0) {
         uint64_t prefix = data_lo - lo;
         if (off < prefix)
@@ -1834,6 +2072,8 @@ int ocerz_map_claim_region(uint64_t gaddr, uint64_t len, int prot)
     uint64_t lo, hi;
     if (!guest_range(gaddr, len, &lo, &hi))
         return OCERZ_ENOMEM;
+    if (g_pin_n && pinned_overlap(round_down(lo), round_up(hi)))
+        return OCERZ_ENOMEM;
     map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     if (!r || (r->glo == ocerz_arena_lo && r->ghi == ocerz_arena_hi)) {
@@ -1846,11 +2086,18 @@ int ocerz_map_claim_region(uint64_t gaddr, uint64_t len, int prot)
     return rc;
 }
 
+static int protect_part(uint64_t lo, uint64_t hi, int prot)
+{
+    return ocerz_protect(lo, hi - lo, prot);
+}
+
 int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
 {
     uint64_t lo, hi;
     if (!guest_range(gaddr, len, &lo, &hi))
         return OCERZ_ENOMEM;
+    if (g_pin_n && pinned_overlap(round_down(lo), round_up(hi)))
+        return for_unpinned(lo, hi, protect_part, prot);
     map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     int rc = r ? OCERZ_OK : OCERZ_ENOMEM;
@@ -1878,11 +2125,19 @@ int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
     return rc;
 }
 
+static int unmap_part(uint64_t lo, uint64_t hi, int unused)
+{
+    (void)unused;
+    return ocerz_unmap(lo, hi - lo);
+}
+
 int ocerz_unmap(uint64_t gaddr, uint64_t len)
 {
     uint64_t lo, hi;
     if (!guest_range(gaddr, len, &lo, &hi))
         return OCERZ_ENOMEM;
+    if (g_pin_n && pinned_overlap(round_down(lo), round_up(hi)))
+        return for_unpinned(lo, hi, unmap_part, 0);
     map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     if (!r) {

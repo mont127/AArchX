@@ -64,7 +64,10 @@
  * still on the stack whose keep and destroy helpers are guest code, the heap
  * copy holding slots for them, and the stack variable's forwarding pointer is
  * pointed at the copy as libclosure does, so the guest frame's own accesses,
- * which go through forwarding, see the variable the blocks see.
+ * which go through forwarding, see the variable the blocks see.  Under a low
+ * shadow (native Wine) a variable on a stack below 12 GB forwards to a guest
+ * address libclosure cannot follow, so the forwarding word is rewritten to its
+ * host alias first, which the guest reads as the same memory.
  *
  * ---- calling a guest view ----
  * A guest view's invoke is a trampoline ocerz wrote into a guest page, twelve
@@ -812,8 +815,10 @@ uint64_t ocerz_block_copy_guest(uint64_t gblock)
 static uint64_t blk_byref_copy(uint64_t gsrc, int flags)
 {
     BlkByref *src = ocerz_g2h(gsrc);
-    BlkByref *fwd = src ? src->forwarding : NULL;
+    BlkByref *fwd = src && src->forwarding ? ocerz_g2h((uint64_t)(uintptr_t)src->forwarding) : NULL;
     int32_t sflags = src ? src->flags : 0;
+    if (fwd && fwd != src->forwarding)
+        src->forwarding = fwd;
     if (fwd && (fwd->flags & BLK_REFCOUNT_MASK) == 0 && (sflags & BLK_BYREF_HAS_COPY_DISPOSE) &&
         (ocerz_abi_is_guest_code(src->keep) || ocerz_abi_is_guest_code(src->destroy))) {
         if (src->size < offsetof(BlkByref, layout) || src->size > BLK_MAX_SIZE)
