@@ -19,6 +19,15 @@ if [ "$(git -C "$source_dir" rev-parse HEAD)" != "$revision" ]; then
     echo "expected LLVM revision $revision at $source_dir" >&2
     exit 2
 fi
+# Apple's libc++abi also exports operator new and delete taking a
+# std::__type_descriptor_t, which macOS 26 libraries import (D3DMetal's
+# libdxccontainer.dylib does).  LLVM defines them in vendor/apple/shims.cpp, as
+# forwards to the plain operators, but builds them only in Apple's own
+# configuration, so they are compiled into stdlib_new_delete.cpp and exported.
+shim_tu="$source_dir/libcxxabi/src/stdlib_new_delete.cpp"
+grep -q 'vendor/apple/shims.cpp' "$shim_tu" || printf '\n#include "vendor/apple/shims.cpp"\n' >> "$shim_tu"
+shim_exp="$source_dir/libcxxabi/lib/new-delete.exp"
+grep -q '__type_descriptor_t' "$shim_exp" || cat "$repo/tools/cxx/apple-shims.exp" >> "$shim_exp"
 cmake -S "$source_dir/runtimes" -B "$build/runtime" -G 'Unix Makefiles' \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
     -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
