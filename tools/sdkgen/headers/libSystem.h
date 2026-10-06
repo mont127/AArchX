@@ -23,7 +23,9 @@
  * order, dropping any that broke the growing set, and rewrites it the same way
  * for a new SDK.  sdkgen refuses to generate anything if this file produces an
  * error on either target, so a header that stops fitting is named rather than
- * silently lost.
+ * silently lost.  The two headers the macOS 27 SDK added are included only where
+ * they exist, so an older SDK still builds the databases: MacNdCheese's release
+ * runner has Xcode 26.6 (SDK 26.5) and ships them for AArchX's native mode.
  */
 #include <sys/types.h>
 #include <stdarg.h>
@@ -387,7 +389,9 @@
 #include <net/if_types.h>
 #include <net/if_utun.h>
 #include <net/if_var.h>
+#if __has_include(<net/ipsec_offload.h>) /* new in the macOS 27 SDK */
 #include <net/ipsec_offload.h>
+#endif
 #include <net/kext_net.h>
 #include <net/ndrv.h>
 #include <net/net_kev.h>
@@ -437,7 +441,9 @@
 #include <os/base.h>
 #include <os/clock.h>
 #include <os/lock.h>
+#if __has_include(<os/lockdown_mode.h>) /* new in the macOS 27 SDK */
 #include <os/lockdown_mode.h>
+#endif
 #include <os/log.h>
 #include <os/object.h>
 #include <os/os_sync_wait_on_address.h>
