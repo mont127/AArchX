@@ -2818,6 +2818,84 @@ static uint64_t ocerz_host_ticks_to_guest_ns(uint64_t ticks)
     return (uint64_t)(((__uint128_t)ticks * numer) / denom);
 }
 
+/* A time-constraint thread policy is in mach_absolute_time units.  The guest
+   sees a 1/1 timebase, so it computes them in nanoseconds; for a Rosetta
+   process the kernel converts them, for ocerz nothing did, and the kernel
+   took nanoseconds for host ticks.  CoreAudio's I/O thread then asked for 41
+   times its real computation time, was refused with KERN_INVALID_ARGUMENT,
+   and every output unit and audio queue failed to start (89).  So period,
+   computation and constraint of a thread_policy_set go out in host ticks, and
+   a thread_policy_get reply for the same flavors comes back in nanoseconds.
+   The request is put back if the send fails, because the guest's mach_msg
+   retries an interrupted send with the same buffer.  OCERZ_NO_TC_XLATE=1
+   sends the values as they are. */
+#define TC_POLICY_FLAVOR(f) ((f) == 2 || (f) == 10)
+struct tc_policy_save { uint64_t msg; uint32_t orig[3]; int n; };
+
+static int tc_policy_xlate_off(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_TC_XLATE") ? 1 : 0;
+    return off;
+}
+
+static void tc_policy_send(uint64_t gmsg, uint32_t send_size, struct tc_policy_save *ts)
+{
+    ts->n = 0;
+    if (!gmsg || tc_policy_xlate_off() || (uint32_t)ocerz_ld(gmsg + 0x14, 4) != 3617 ||
+        ((uint32_t)ocerz_ld(gmsg, 4) & 0x80000000u))
+        return;
+    uint32_t msz = (uint32_t)ocerz_ld(gmsg + 4, 4);
+    uint32_t flavor = (uint32_t)ocerz_ld(gmsg + 0x20, 4), cnt = (uint32_t)ocerz_ld(gmsg + 0x24, 4);
+    if (msz < 0x28 + 12 || (send_size && send_size < msz) || !TC_POLICY_FLAVOR(flavor) ||
+        cnt < 3 || cnt > 16 || 0x28 + cnt * 4 > msz)
+        return;
+    ts->msg = gmsg;
+    for (int i = 0; i < 3; i++) {
+        ts->orig[i] = (uint32_t)ocerz_ld(gmsg + 0x28 + 4 * i, 4);
+        uint64_t t = ocerz_guest_ns_to_host_ticks(ts->orig[i]);
+        ocerz_st(gmsg + 0x28 + 4 * i, 4, t > UINT32_MAX ? UINT32_MAX : t);
+    }
+    ts->n = 3;
+    if (ENV_SET("OCERZ_POLICYLOG"))
+        fprintf(stderr, "ocerz: TCPOLICY[%d] set flavor=%u ns %u/%u/%u -> ticks %u/%u/%u\n", (int)getpid(),
+                flavor, ts->orig[0], ts->orig[1], ts->orig[2],
+                (uint32_t)ocerz_ld(gmsg + 0x28, 4), (uint32_t)ocerz_ld(gmsg + 0x2c, 4),
+                (uint32_t)ocerz_ld(gmsg + 0x30, 4));
+}
+
+static void tc_policy_send_done(const struct tc_policy_save *ts, uint64_t kr)
+{
+    if (!ts->n || (kr & 0xfffff000ull) != 0x10000000ull)
+        return;
+    for (int i = 0; i < 3; i++)
+        ocerz_st(ts->msg + 0x28 + 4 * i, 4, ts->orig[i]);
+}
+
+static int tc_policy_get_request(uint64_t gmsg)
+{
+    return gmsg && !tc_policy_xlate_off() && (uint32_t)ocerz_ld(gmsg + 0x14, 4) == 3618 &&
+           (uint32_t)ocerz_ld(gmsg + 4, 4) >= 0x2c &&
+           TC_POLICY_FLAVOR((uint32_t)ocerz_ld(gmsg + 0x20, 4));
+}
+
+static void tc_policy_get_reply(uint64_t reply, uint32_t rcv_size)
+{
+    if (!reply || (uint32_t)ocerz_ld(reply + 0x14, 4) != 3718)
+        return;
+    uint32_t rsize = (uint32_t)ocerz_ld(reply + 4, 4);
+    if (rcv_size && rsize > rcv_size)
+        return;
+    uint32_t cnt = (uint32_t)ocerz_ld(reply + 0x24, 4);
+    if (rsize < 0x28 + 12 || ocerz_ld(reply + 0x20, 4) != 0 || cnt < 3 || cnt > 16 ||
+        0x28 + cnt * 4 > rsize)
+        return;
+    for (int i = 0; i < 3; i++) {
+        uint64_t ns = ocerz_host_ticks_to_guest_ns((uint32_t)ocerz_ld(reply + 0x28 + 4 * i, 4));
+        ocerz_st(reply + 0x28 + 4 * i, 4, ns > UINT32_MAX ? UINT32_MAX : ns);
+    }
+}
+
 static int sys_gettimeofday(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
@@ -7386,6 +7464,12 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         int nsv31 = 0;
         if (gmsg31 != 0)
             nsv31 = ocerz_send_xlate_descriptors(gmsg31, (uint32_t)ocerz_ld(gmsg31 + 4, 4), sv31, 64);
+        struct tc_policy_save tc31 = { 0 };
+        int tcget31 = 0;
+        if (gmsg31 != 0 && (a[1] & 0x1)) {
+            tcget31 = tc_policy_get_request(gmsg31);
+            tc_policy_send(gmsg31, (uint32_t)ocerz_ld(gmsg31 + 4, 4), &tc31);
+        }
         ocerz_vmmsg_trace("REQ", gmsg31,
                           gmsg31 ? (uint32_t)ocerz_ld(gmsg31 + 4, 4) : 0);
         if ((a[1] & 0x2) && gmsg31)
@@ -7403,6 +7487,9 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, r31);
         if (nsv31)
             ocerz_send_restore_descriptors(gmsg31, sv31, nsv31);
+        tc_policy_send_done(&tc31, r31);
+        if (tcget31 && (a[1] & 0x2) && r31 == 0)
+            tc_policy_get_reply(gmsg31, (uint32_t)a[3]);
         if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0)
             ocerz_vmmsg_trace("REPLY", gmsg31, (uint32_t)a[3]);
         if (gmsg31 != 0 && (a[1] & 0x2) && r31 == 0)
@@ -7506,6 +7593,12 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
                                                 (a[1] & 0x1) != 0, (a[1] & 0x2) != 0, sv47, 64);
             } else
                 nsv47 = ocerz_send_xlate_descriptors(reply_buf, (uint32_t)(a[2] >> 32), sv47, 64);
+        }
+        struct tc_policy_save tc47 = { 0 };
+        int tcget47 = 0;
+        if (!vector_mode && request_buf && (a[1] & 0x1)) {
+            tcget47 = tc_policy_get_request(request_buf);
+            tc_policy_send(request_buf, (uint32_t)(a[2] >> 32), &tc47);
         }
         if (a[0] != 0)
             a[0] = (uint64_t)(uintptr_t)ocerz_g2h(a[0]);
@@ -7775,6 +7868,7 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
         mach_ret(cpu, r47);
         if (nsv47)
             ocerz_send_restore_descriptors(reply_buf, sv47, nsv47);
+        tc_policy_send_done(&tc47, r47);
         if (ioreq_n >= 0x2c && r47 != 0) {
             uint32_t sel, rport;
             memcpy(&sel, ioreq + 0x20, 4);
@@ -7864,6 +7958,8 @@ static int dispatch_mach(OcerzVM *vm, OcerzCPU *cpu, int num)
 
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_reply_relocate_ool(mach_reply_buf, mach_reply_size, 47);
+        if (tcget47 && mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
+            tc_policy_get_reply(mach_reply_buf, mach_reply_size);
         if (mach_reply_buf != 0 && (a[1] & 0x2) && r47 == 0)
             ocerz_reply_alias_iokit(vm, mach_reply_buf, mach_reply_size);
         {
