@@ -136,6 +136,13 @@ alike (13, 15 and 13), most often the wait on a walltime deadline, which asked
 for 25 ms and took over 150. So the test runs the native build twenty times
 first and is skipped, saying so, when they differ.
 
+`tools/vm_flake_probes.sh` repeats the measurements behind these findings for
+the Metal, `ntp_gettime`, dispatch-time and `attach_apply` cases, natively and
+under ocerz, translated and interpreted. The Metal and `ntp_gettime` ones are
+expected to pass everywhere on a Mac with a real GPU and a synchronised clock,
+so they are mostly useful inside a macOS virtual machine; the header of the
+script says what each one shows.
+
 ## Conventions
 
 The test binaries under `tests/guest/bin` and `tests/unit/bin` are committed,
