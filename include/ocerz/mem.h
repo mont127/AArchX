@@ -41,15 +41,17 @@ static inline int ocerz_pinned_page(uint64_t gaddr)
     return ocerz_pin_map && gaddr < OCERZ_LOW_LIMIT && ((ocerz_pin_map[gaddr >> 17] >> ((gaddr >> 14) & 7)) & 1);
 }
 
-/* With a low shadow, a value in the first 64 KB is nobody's memory but often a
-   sentinel (objc's empty autorelease pool is token 1), so it crosses as it is. */
+/* In native mode, which pins host memory below 12 GB, a value in the first 64 KB
+   is nobody's memory but often a sentinel handed to host code (objc's empty
+   autorelease pool is token 1), so it crosses as it is.  Cache mode keeps it in
+   the shadow, where its translated code puts it too. */
 static inline void *ocerz_g2h(uint64_t gaddr)
 {
     if (ocerz_commpage && gaddr >= OCERZ_COMMPAGE_LO && gaddr < OCERZ_COMMPAGE_HI)
         return ocerz_commpage + (gaddr - OCERZ_COMMPAGE_LO);
     if (ocerz_low_base) {
         if (gaddr < OCERZ_LOW_LIMIT) {
-            if (gaddr < OCERZ_NULL_LIMIT || ocerz_pinned_page(gaddr))
+            if ((gaddr < OCERZ_NULL_LIMIT && ocerz_pin_map) || ocerz_pinned_page(gaddr))
                 return (void *)(uintptr_t)gaddr;
             return (void *)(uintptr_t)(gaddr + ocerz_low_base);
         }
