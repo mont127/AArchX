@@ -112,7 +112,12 @@
 # descriptor calls Chromium wraps every descriptor in, the responsibility and
 # sandbox calls, __mac_syscall, which sandbox and quarantine queries end in,
 # proc_get_wakemon_params, csr_check and csr_get_active_config, the __ulock
-# pair Chromium's locks wait in, recvmsg_x and sendmsg_x, the voucher and
+# pair Chromium's locks wait in and __ulock_wait2, which Wine's ntdll.so waits
+# in (the waits are specials, so a guest signal can interrupt them),
+# bootstrap_register2, which wineserver publishes its port with,
+# mach_msg2_trap and mach_msg2_internal, which msync in Wine finds with dlsym
+# and whose packed 64-bit arguments mean the same on both sides,
+# recvmsg_x and sendmsg_x, the voucher and
 # recursive-lock calls the Swift Concurrency runtime makes,
 # os_unfair_lock_lock_with_options, which Chromium weak-imports and calls
 # whenever it binds, rootless_restricted_environment, the os_variant queries,
@@ -272,11 +277,17 @@
 # bsd_signal, and the private double-underscore entries behind them all read
 # or wait on the host's signal state, which is not the guest's.  sigsuspend,
 # pause, sigpending and sigwait are special instead, and wait on or read the
-# guest's, the way the emulated system calls under them do in cache mode.
+# guest's, the way the emulated system calls under them do in cache mode.  So
+# is __pthread_kill, which names a thread by its Mach port: wineserver signals
+# its clients' threads with it.  It takes cache mode's path, where the caller's
+# own thread gets the signal through the guest's state and any other thread,
+# in this process or another, a host signal its ocerz delivers.
 #
 # Machine state and exception ports: thread_get_state, thread_set_state and
 # their act_ and task_ spellings take x86 thread-state flavors the arm64 kernel
-# refuses or answers with arm64 registers, and thread_create_running starts a
+# refuses or answers with arm64 registers (the two plain spellings are special
+# for the flavors ocerz can answer: a thread's integer registers, and the debug
+# registers, which are always zero), and thread_create_running starts a
 # host thread from x86 state.  Exception ports set by the guest would take
 # EXC_BAD_ACCESS away from the signal handlers ocerz recovers translated code
 # with.
@@ -630,6 +641,7 @@ special _malloc_create_zone malloc_create_zone
 special _malloc_zone_from_ptr malloc_zone_from_ptr
 special _malloc_get_zone_name malloc_get_zone_name
 special _malloc_set_zone_name malloc_set_zone_name
+special _malloc_zone_statistics malloc_zone_statistics
 fn ___memccpy_chk __memccpy_chk p(ppiLL)
 fn ___memcpy_chk __memcpy_chk p(ppLL)
 fn ___memmove_chk __memmove_chk p(ppLL)
@@ -803,14 +815,27 @@ stub ___sigaction override
 stub ___sigaltstack override
 stub ___sigreturn override
 stub ___kill override
-stub ___pthread_kill override
+special ___pthread_kill pthread_kill_port
+
+special _readv readv
+special _readv$NOCANCEL readv
+special _writev writev
+special _writev$NOCANCEL writev
+special _preadv preadv
+special _preadv$NOCANCEL preadv
+special _pwritev pwritev
+special _pwritev$NOCANCEL pwritev
+special _sendmsg sendmsg
+special _sendmsg$NOCANCEL sendmsg
+special _recvmsg recvmsg
+special _recvmsg$NOCANCEL recvmsg
 stub ___pthread_sigmask override
 stub __sigaction_nobind override
 stub __signal_nobind override
 stub __sigvec_nobind override
 
 special _thread_get_state thread_get_state
-stub _thread_set_state override
+special _thread_set_state thread_set_state
 stub _act_get_state override
 stub _act_set_state override
 stub _task_get_state override
@@ -839,8 +864,12 @@ fn _proc_get_wakemon_params proc_get_wakemon_params i(ipp)
 fn ___mac_syscall __mac_syscall i(pip)
 fn _csr_check csr_check i(u)
 fn _csr_get_active_config csr_get_active_config i(p)
-fn ___ulock_wait __ulock_wait i(upLu)
+special ___ulock_wait ulock_wait
+special ___ulock_wait2 ulock_wait2
 fn ___ulock_wake __ulock_wake i(upL)
+fn _bootstrap_register2 bootstrap_register2 i(upuL)
+fn _mach_msg2_trap mach_msg2_trap i(pLLLLLLL)
+fn _mach_msg2_internal mach_msg2_internal i(pLLLLLLL)
 fn _recvmsg_x recvmsg_x l(ipui)
 fn _sendmsg_x sendmsg_x l(ipui)
 fn _responsibility_spawnattrs_setdisclaim responsibility_spawnattrs_setdisclaim i(pi)
@@ -1289,8 +1318,14 @@ library /usr/lib/libobjc.A.dylib
 
 special _objc_setExceptionPreprocessor objc_setExceptionPreprocessor
 
+# __res_9_state answers the resolver state _res names.  It is a structure with
+# two hooks no shape describes, but Wine's dnsapi.so reads and sets only its
+# options, servers and search list in place, never the hooks, and its layout
+# is the same on both sides.
+
 library /usr/lib/libresolv.9.dylib
 
+fn ___res_9_state __res_9_state p()
 fn _res_9_ninit res_9_ninit i(p)
 fn _res_9_ndestroy res_9_ndestroy v(p)
 fn _res_9_nclose res_9_nclose v(p)
@@ -1482,3 +1517,25 @@ library /usr/lib/libsqlite3.dylib
 
 special _sqlite3_config sqlite3_config
 special _sqlite3_db_config sqlite3_db_config
+
+# MTLSetShaderCachePath and MTLGetShaderCachePath are exported but in no
+# header.  DXMT's winemetal.so declares them (src/winemetal/unix/cache.c) as
+# taking and answering the shader cache directory as an NSString.
+
+library /System/Library/Frameworks/Metal.framework/Versions/A/Metal
+
+fn _MTLSetShaderCachePath MTLSetShaderCachePath v(p)
+fn _MTLGetShaderCachePath MTLGetShaderCachePath p()
+
+# AudioUnitSetProperty's value is bytes, and kAudioUnitProperty_SetRenderCallback
+# and kAudioOutputUnitProperty_SetInputCallback put a render callback in them,
+# which the I/O thread calls; its handler converts that function and refuses
+# the properties that carry other callbacks (src/bridge.c).
+
+library /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox
+
+special _AudioUnitSetProperty audio_unit_set_property
+
+library /System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit
+
+special _AudioUnitSetProperty audio_unit_set_property

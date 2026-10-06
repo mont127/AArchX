@@ -75,6 +75,7 @@ pass CFNetwork.h
 
 library SystemConfiguration /System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration.tbd
 pass SystemConfiguration.h
+pass SystemConfigurationDHCP.h
 
 library Security /System/Library/Frameworks/Security.framework/Versions/A/Security System/Library/Frameworks/Security.framework/Security.tbd
 pass Security.h
@@ -144,6 +145,7 @@ library OpenGL /System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL Sys
 pass OpenGL.h
 pass libGL.h
 pass libGL3.h
+pass libGLU.h
 
 library libGL /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.tbd
 pass libGL.h

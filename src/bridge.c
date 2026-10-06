@@ -390,6 +390,8 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -441,13 +443,33 @@ static pthread_mutex_t g_br_libs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_br_fn_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_br_host_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void br_exitlog(const OcerzCPU *cpu, const char *how)
+{
+    if (!getenv("OCERZ_EXITLOG"))
+        return;
+    extern char ocerz_cmdline_summary[];
+    uint64_t rsp = cpu->gpr[OCERZ_RSP], fp = cpu->gpr[OCERZ_RBP];
+    fprintf(stderr, "ocerz: EXITLOG[%d \"%s\"] %s code=%d from=%#llx ret-chain:", (int)getpid(),
+            ocerz_cmdline_summary, how, (int)cpu->gpr[OCERZ_RDI], (unsigned long long)ocerz_ld(rsp, 8));
+    for (int d = 0; d < 8 && fp > 0x10000 && fp < OCERZ_TOP_HI; d++) {
+        fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+        uint64_t nf = ocerz_ld(fp, 8);
+        if (nf <= fp)
+            break;
+        fp = nf;
+    }
+    fprintf(stderr, "\n");
+}
+
 static int br_exit(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    br_exitlog(cpu, "exit");
     exit((int)(cpu->gpr[OCERZ_RDI] & 0xff));
 }
 
 static int br_exit_now(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    br_exitlog(cpu, "_exit");
     _exit((int)(cpu->gpr[OCERZ_RDI] & 0xff));
 }
 
@@ -1160,6 +1182,30 @@ static int br_malloc_zone_pressure_relief(struct OcerzVM *vm, OcerzCPU *cpu)
                            BR_ZONE_PRESSURE_RELIEF);
 }
 
+/* malloc_zone_statistics fills a malloc_statistics_t, a count and three sizes
+   laid out alike on both sides: a view answers its host zone's numbers, a null
+   zone every host zone's, and a zone of the guest's own nothing ocerz counts. */
+static int br_malloc_zone_statistics(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t zone = cpu->gpr[OCERZ_RDI], out = cpu->gpr[OCERZ_RSI];
+    const BrZoneView *view = br_view_find(zone);
+    malloc_statistics_t st = { 0 };
+    if (!zone || view) {
+        struct OcerzBridgeFrame outer;
+        ocerz_bridge_raise(&outer, OCERZ_BRIDGE_LIBSYSTEM, "_malloc_zone_statistics", "v(pp)",
+                           (const void *)malloc_zone_statistics);
+        malloc_zone_statistics(view ? view->native : NULL, &st);
+        ocerz_bridge_lower(&outer);
+    }
+    if (out) {
+        ocerz_st(out, 8, st.blocks_in_use);
+        ocerz_st(out + 8, 8, st.size_in_use);
+        ocerz_st(out + 16, 8, st.max_size_in_use);
+        ocerz_st(out + 24, 8, st.size_allocated);
+    }
+    return br_answer(vm, cpu, 0);
+}
+
 static int br_malloc_destroy_zone(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     br_zone_remove(cpu->gpr[OCERZ_RDI]);
@@ -1399,6 +1445,144 @@ static int br_pthread_kill(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_settle(vm, cpu);
 }
 
+/* readv, writev, preadv, pwritev, sendmsg and recvmsg take arrays of guest
+   pointers: in a Wine process a base below the low limit names memory the host
+   reaches only through the shadow, and Wine's server requests are gathered
+   from the Windows side's buffers, so the kernel failed them with EFAULT and
+   Wine reported an access violation.  The array and the msghdr are copied with
+   each pointer translated; the two layouts are the same on both sides. */
+#define BR_ULF_NO_ERRNO 0x01000000u
+#define BR_IOV_MAX 1024
+
+static int br_iov_load(uint64_t giov, int64_t cnt, struct iovec *out)
+{
+    if (cnt < 0 || cnt > BR_IOV_MAX)
+        return EINVAL;
+    for (int64_t i = 0; i < cnt; i++) {
+        uint64_t base = ocerz_ld(giov + (uint64_t)i * 16, 8);
+        out[i].iov_base = base ? ocerz_g2h(base) : NULL;
+        out[i].iov_len = (size_t)ocerz_ld(giov + (uint64_t)i * 16 + 8, 8);
+    }
+    return 0;
+}
+
+static int br_iov_call(struct OcerzVM *vm, OcerzCPU *cpu, int kind)
+{
+    int fd = (int)cpu->gpr[OCERZ_RDI];
+    int64_t cnt = (int32_t)cpu->gpr[OCERZ_RDX];
+    struct iovec *v = cnt > 0 && cnt <= BR_IOV_MAX ? malloc(sizeof(struct iovec) * (size_t)cnt) : NULL;
+    ssize_t r = -1;
+    int e = v ? br_iov_load(cpu->gpr[OCERZ_RSI], cnt, v) : EINVAL;
+    if (!e) {
+        off_t off = (off_t)cpu->gpr[OCERZ_RCX];
+        r = kind == 0 ? readv(fd, v, (int)cnt) : kind == 1 ? writev(fd, v, (int)cnt)
+          : kind == 2 ? preadv(fd, v, (int)cnt, off) : pwritev(fd, v, (int)cnt, off);
+        e = r < 0 ? errno : 0;
+    }
+    free(v);
+    if (e)
+        errno = e;
+    br_return(cpu, e ? (uint64_t)-1 : (uint64_t)r);
+    return br_settle(vm, cpu);
+}
+
+extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us);
+extern int __ulock_wait2(uint32_t operation, void *addr, uint64_t value, uint64_t timeout_ns, uint64_t value2);
+
+/* A guest signal is delivered when the guest next leaves a crossing, so one
+   that lands after Wine's msync last looked at its word and before the ulock
+   wait reaches the kernel is held until the wait ends, and an APC that would
+   have set the word never runs: a service's first RPC reply waited forever and
+   services.exe gave up on it.  The wait is marked kickable-if-signalled, the
+   unstick monitor (vm.c) interrupts it once a guest signal is pending, and the
+   EINTR it returns lets the handler run before msync waits again. */
+static int br_ulock(struct OcerzVM *vm, OcerzCPU *cpu, int two)
+{
+    uint32_t op = (uint32_t)cpu->gpr[OCERZ_RDI];
+    void *addr = cpu->gpr[OCERZ_RSI] ? ocerz_g2h(cpu->gpr[OCERZ_RSI]) : NULL;
+    uint64_t value = cpu->gpr[OCERZ_RDX], timeout = cpu->gpr[OCERZ_RCX];
+    int r, e = 0;
+    ocerz_unstick_start();
+    cpu->block_sigonly = 1;
+    __atomic_store_n(&cpu->block_since_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~cpu->sig_mask) {
+        r = op & BR_ULF_NO_ERRNO ? -EINTR : -1;
+        e = EINTR;
+    } else {
+        r = two ? __ulock_wait2(op, addr, value, timeout, cpu->gpr[OCERZ_R8])
+                : __ulock_wait(op, addr, value, (uint32_t)timeout);
+        e = r < 0 ? (op & BR_ULF_NO_ERRNO ? -r : errno) : 0;
+    }
+    __atomic_store_n(&cpu->block_since_ns, 0, __ATOMIC_SEQ_CST);
+    cpu->block_sigonly = 0;
+    if (e && !(op & BR_ULF_NO_ERRNO))
+        errno = e;
+    br_return(cpu, (uint64_t)(int64_t)r);
+    return br_settle(vm, cpu);
+}
+
+static int br_ulock_wait(struct OcerzVM *vm, OcerzCPU *cpu) { return br_ulock(vm, cpu, 0); }
+static int br_ulock_wait2(struct OcerzVM *vm, OcerzCPU *cpu) { return br_ulock(vm, cpu, 1); }
+
+static int br_readv(struct OcerzVM *vm, OcerzCPU *cpu) { return br_iov_call(vm, cpu, 0); }
+static int br_writev(struct OcerzVM *vm, OcerzCPU *cpu) { return br_iov_call(vm, cpu, 1); }
+static int br_preadv(struct OcerzVM *vm, OcerzCPU *cpu) { return br_iov_call(vm, cpu, 2); }
+static int br_pwritev(struct OcerzVM *vm, OcerzCPU *cpu) { return br_iov_call(vm, cpu, 3); }
+
+static int br_msg_call(struct OcerzVM *vm, OcerzCPU *cpu, int recv)
+{
+    int fd = (int)cpu->gpr[OCERZ_RDI], flags = (int)cpu->gpr[OCERZ_RDX];
+    uint64_t gm = cpu->gpr[OCERZ_RSI];
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    int e = gm ? 0 : EFAULT;
+    struct iovec *v = NULL;
+    ssize_t r = -1;
+    if (!e) {
+        uint64_t name = ocerz_ld(gm, 8), giov = ocerz_ld(gm + 16, 8), control = ocerz_ld(gm + 32, 8);
+        int64_t cnt = (int32_t)ocerz_ld(gm + 24, 4);
+        m.msg_name = name ? ocerz_g2h(name) : NULL;
+        m.msg_namelen = (socklen_t)ocerz_ld(gm + 8, 4);
+        m.msg_iovlen = (int)cnt;
+        m.msg_control = control ? ocerz_g2h(control) : NULL;
+        m.msg_controllen = (socklen_t)ocerz_ld(gm + 40, 4);
+        m.msg_flags = (int)ocerz_ld(gm + 44, 4);
+        v = cnt > 0 && cnt <= BR_IOV_MAX ? malloc(sizeof(struct iovec) * (size_t)cnt) : NULL;
+        e = cnt == 0 ? 0 : v ? br_iov_load(giov, cnt, v) : EINVAL;
+        m.msg_iov = v;
+    }
+    if (!e) {
+        r = recv ? recvmsg(fd, &m, flags) : sendmsg(fd, &m, flags);
+        e = r < 0 ? errno : 0;
+        if (recv && r >= 0) {
+            ocerz_st(gm + 8, 4, m.msg_namelen);
+            ocerz_st(gm + 40, 4, m.msg_controllen);
+            ocerz_st(gm + 44, 4, (uint32_t)m.msg_flags);
+        }
+    }
+    free(v);
+    if (e)
+        errno = e;
+    br_return(cpu, e ? (uint64_t)-1 : (uint64_t)r);
+    return br_settle(vm, cpu);
+}
+
+static int br_sendmsg(struct OcerzVM *vm, OcerzCPU *cpu) { return br_msg_call(vm, cpu, 0); }
+static int br_recvmsg(struct OcerzVM *vm, OcerzCPU *cpu) { return br_msg_call(vm, cpu, 1); }
+
+/* __pthread_kill names its thread by Mach port, wineserver's way of signalling
+   its clients' threads: cache mode's system call path routes the caller's own
+   thread through the guest's signal state and sends any other a host signal. */
+static int br_pthread_kill_port(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int err = 0;
+    int r = ocerz_guest_thread_port_kill(vm, cpu, cpu->gpr[OCERZ_RDI], (int)cpu->gpr[OCERZ_RSI], &err);
+    if (r)
+        errno = err;
+    br_return(cpu, r ? (uint64_t)-1 : 0);
+    return br_settle(vm, cpu);
+}
+
 static int br_nsgetexecutablepath(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     const char *path = ocerz_dyld_main_path();
@@ -1602,12 +1786,66 @@ static int br_thread_resume(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_answer(vm, cpu, (uint64_t)(uint32_t)kr);
 }
 
+/* The x86 debug-register flavors: 32-bit, 64-bit, and the one that carries a
+   {flavor, count} header ahead of either.  Translated code has no hardware
+   breakpoints, so every guest thread's debug registers are zero; Wine's
+   macOS wineserver asks for them on every context request with debug
+   registers, for threads of other processes too, and checks the header. */
+#define BR_X86_DEBUG_STATE32 10
+#define BR_X86_DEBUG_STATE64 11
+#define BR_X86_DEBUG_STATE   12
+
+static unsigned br_debug_state_count(uint32_t flavor)
+{
+    return flavor == BR_X86_DEBUG_STATE32 ? 8 : flavor == BR_X86_DEBUG_STATE64 ? 16
+         : flavor == BR_X86_DEBUG_STATE ? 18 : 0;
+}
+
+static int br_debug_state_get(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t flavor, uint64_t state, uint64_t countp)
+{
+    unsigned need = br_debug_state_count(flavor);
+    if (!state || !countp || (uint32_t)ocerz_ld(countp, 4) < need)
+        return br_answer(vm, cpu, KERN_INVALID_ARGUMENT);
+    for (unsigned k = 0; k < need; k++)
+        ocerz_st(state + 4 * (uint64_t)k, 4, 0);
+    if (flavor == BR_X86_DEBUG_STATE) {
+        ocerz_st(state, 4, BR_X86_DEBUG_STATE64);
+        ocerz_st(state + 4, 4, 16);
+    }
+    ocerz_st(countp, 4, need);
+    return br_answer(vm, cpu, KERN_SUCCESS);
+}
+
+/* Setting them is accepted while every register stays zero, which is what a
+   context restore or a debugger clearing its breakpoints writes; a breakpoint
+   ocerz cannot raise is refused rather than dropped. */
+static int br_thread_set_state(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t flavor = (uint32_t)cpu->gpr[OCERZ_RSI];
+    uint64_t state = cpu->gpr[OCERZ_RDX];
+    uint32_t count = (uint32_t)cpu->gpr[OCERZ_RCX];
+    unsigned need = br_debug_state_count(flavor);
+    if (!need) {
+        fprintf(stderr, "ocerz: bridge: _thread_set_state takes flavor %u, which has no x86 register mapping here\n",
+                flavor);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    if (!state || count < need)
+        return br_answer(vm, cpu, KERN_INVALID_ARGUMENT);
+    for (unsigned k = flavor == BR_X86_DEBUG_STATE ? 2 : 0; k < need; k++)
+        if (ocerz_ld(state + 4 * (uint64_t)k, 4))
+            return br_answer(vm, cpu, KERN_INVALID_ARGUMENT);
+    return br_answer(vm, cpu, KERN_SUCCESS);
+}
+
 static int br_thread_get_state(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t port = (uint32_t)cpu->gpr[OCERZ_RDI];
     uint32_t flavor = (uint32_t)cpu->gpr[OCERZ_RSI];
     uint64_t state = cpu->gpr[OCERZ_RDX];
     uint64_t countp = cpu->gpr[OCERZ_RCX];
+    if (br_debug_state_count(flavor))
+        return br_debug_state_get(vm, cpu, flavor, state, countp);
     if (flavor != 4) {
         fprintf(stderr, "ocerz: bridge: _thread_get_state takes flavor %u, which has no x86 register mapping here\n",
                 flavor);
@@ -1944,6 +2182,59 @@ static int br_cm_block_buffer_create_contiguous(struct OcerzVM *vm, OcerzCPU *cp
     return br_block_source_cross(vm, cpu, &fn, "CMBlockBufferCreateContiguous", "i(ppppLLup)", OCERZ_RCX);
 }
 
+#define BR_AUDIO_TOOLBOX "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox"
+#define BR_AU_SET_RENDER_CALLBACK 23
+#define BR_AU_HOST_CALLBACKS 27
+#define BR_AU_MIDI_OUTPUT_CALLBACK 48
+#define BR_AU_INPUT_SAMPLES_IN_OUTPUT 49
+#define BR_AU_SET_INPUT_CALLBACK 2005
+
+/* AudioUnitSetProperty takes its value as bytes, and for two properties the
+   bytes are an AURenderCallbackStruct, the function an output unit's I/O
+   thread calls for every buffer and its refCon.  Passed as they came,
+   CoreAudio called Wine's winecoreaudio.so render callback as arm64 code; the
+   function goes through the callback bank under the AURenderCallback
+   signature, and the unit gets a copy of the structure holding the slot.  The
+   properties whose bytes hold other callbacks are refused. */
+static int br_audio_unit_set_property(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    void *f = atomic_load(&fn);
+    if (!f) {
+        f = ocerz_bridge_host_symbol(BR_AUDIO_TOOLBOX, "AudioUnitSetProperty");
+        if (!f) {
+            fprintf(stderr, "ocerz: bridge: _AudioUnitSetProperty has no host symbol\n");
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        atomic_store(&fn, f);
+    }
+    uint64_t unit = cpu->gpr[OCERZ_RDI], data = cpu->gpr[OCERZ_R8];
+    uint32_t id = (uint32_t)cpu->gpr[OCERZ_RSI], scope = (uint32_t)cpu->gpr[OCERZ_RDX];
+    uint32_t element = (uint32_t)cpu->gpr[OCERZ_RCX], size = (uint32_t)cpu->gpr[OCERZ_R9];
+    const void *bytes = data ? ocerz_g2h(data) : NULL;
+    struct { uint64_t proc, refcon; } cb;
+    if ((id == BR_AU_SET_RENDER_CALLBACK || id == BR_AU_SET_INPUT_CALLBACK) && data && size >= sizeof cb) {
+        uint64_t proc;
+        if (ocerz_abi_callback_convert(ocerz_ld(data, 8), "i(pppuup)", &proc) != OCERZ_OK) {
+            fprintf(stderr, "ocerz: bridge: _AudioUnitSetProperty: no callback slot is left for property %u\n", id);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        cb.proc = proc ? (uint64_t)(uintptr_t)ocerz_g2h(proc) : 0;
+        cb.refcon = ocerz_ld(data + 8, 8);
+        bytes = &cb;
+    } else if (id == BR_AU_HOST_CALLBACKS || id == BR_AU_MIDI_OUTPUT_CALLBACK || id == BR_AU_INPUT_SAMPLES_IN_OUTPUT) {
+        fprintf(stderr, "ocerz: bridge: _AudioUnitSetProperty: property %u holds callbacks ocerz does not convert\n",
+                id);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_AUDIO_TOOLBOX, "_AudioUnitSetProperty", "i(puuupu)", f);
+    int32_t st = ((int32_t (*)(void *, uint32_t, uint32_t, uint32_t, const void *, uint32_t))f)(
+        unit ? ocerz_g2h(unit) : NULL, id, scope, element, bytes, size);
+    ocerz_bridge_lower(&outer);
+    return br_answer(vm, cpu, (uint64_t)(int64_t)st);
+}
+
 static int br_vt_decompression_session_create(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     static void *_Atomic fn;
@@ -2267,6 +2558,17 @@ static const BrHandler g_br_handlers[] = {
     { "raise",           br_raise },
     { "kill",            br_kill },
     { "pthread_kill",    br_pthread_kill },
+    { "pthread_kill_port", br_pthread_kill_port },
+    { "ulock_wait",      br_ulock_wait },
+    { "ulock_wait2",     br_ulock_wait2 },
+    { "malloc_zone_statistics", br_malloc_zone_statistics },
+    { "audio_unit_set_property", br_audio_unit_set_property },
+    { "readv",           br_readv },
+    { "writev",          br_writev },
+    { "preadv",          br_preadv },
+    { "pwritev",         br_pwritev },
+    { "sendmsg",         br_sendmsg },
+    { "recvmsg",         br_recvmsg },
     { "NSGetExecutablePath",    br_nsgetexecutablepath },
     { "NSGetMachExecuteHeader", br_nsgetmachexecuteheader },
     { "dlopen",          br_dlopen },
@@ -2318,6 +2620,7 @@ static const BrHandler g_br_handlers[] = {
     { "malloc_set_zone_name", br_malloc_set_zone_name },
     { "malloc_get_all_zones", br_malloc_get_all_zones_tracked },
     { "thread_get_state", br_thread_get_state },
+    { "thread_set_state", br_thread_set_state },
     { "thread_suspend", br_thread_suspend },
     { "thread_resume", br_thread_resume },
     { "cfuuid_constant", br_cfuuid_constant },

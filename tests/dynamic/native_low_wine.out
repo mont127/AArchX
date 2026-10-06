@@ -1,0 +1,4 @@
+empty autorelease pool popped, token was the placeholder: 1
+__block on a stack below 12 GB (1): 42
+anonymous mach_vm_map anywhere: kr=0, native code reads the guest's bytes: 1
+16 GB fixed reservation: kr=0, mmap over it: 1, fixed again: 3, committed page usable: 1

@@ -3,6 +3,7 @@
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl.h>
 #include <OpenGL/glext.h>
+#include <OpenGL/glu.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -42,6 +43,11 @@ static void opengl(void)
     printf("gl status=%#x err=%#x viewport=%d,%d,%d,%d px0=%u,%u,%u,%u px15=%u,%u,%u,%u version=%d\n", status,
            glGetError(), viewport[0], viewport[1], viewport[2], viewport[3], px[0], px[1], px[2], px[3], px[60],
            px[61], px[62], px[63], glGetString(GL_VERSION) != NULL);
+    /* gluCheckExtension, which Wine's opengl32.so checks extension strings with. */
+    printf("glu has=%d hasnot=%d last=%d\n",
+           gluCheckExtension((const GLubyte *)"GL_EXT_b", (const GLubyte *)"GL_EXT_a GL_EXT_b GL_EXT_c"),
+           gluCheckExtension((const GLubyte *)"GL_EXT_d", (const GLubyte *)"GL_EXT_a GL_EXT_b GL_EXT_c"),
+           gluCheckExtension((const GLubyte *)"GL_EXT_c", (const GLubyte *)"GL_EXT_a GL_EXT_b GL_EXT_c"));
     glDeleteRenderbuffersEXT(1, &rb);
     glDeleteFramebuffersEXT(1, &fbo);
     CGLSetCurrentContext(NULL);

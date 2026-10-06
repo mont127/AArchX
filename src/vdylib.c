@@ -1258,8 +1258,12 @@ static inline __attribute__((always_inline)) int vd_dispatch(struct OcerzVM *vm,
         return frc;
     }
 
-    fprintf(stderr, "ocerz: bridge: %s %s not implemented\n", lib->api->install_name,
-            e->export_name);
+    extern char ocerz_cmdline_summary[];
+    uint64_t caller = ocerz_ld(cpu->gpr[OCERZ_RSP], 8), base = 0;
+    const char *image = ocerz_dyld_name_for_addr(caller, &base);
+    fprintf(stderr, "ocerz: bridge: %s %s not implemented\n", lib->api->install_name, e->export_name);
+    fprintf(stderr, "ocerz:   called from %#llx, %s+%#llx, in '%s'\n", (unsigned long long)caller,
+            image ? image : "an unknown image", (unsigned long long)(caller - base), ocerz_cmdline_summary);
 
     exit(OCERZ_BRIDGE_UNIMPL_EXIT);
     return OCERZ_STEP_OK;

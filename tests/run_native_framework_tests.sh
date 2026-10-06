@@ -26,14 +26,25 @@ for arch in x86_64 arm64; do
         -o "$work/callback_structs.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror -Wno-deprecated-declarations tests/dynamic/native_lapack_asn1.c \
         -framework Accelerate -framework Security -o "$work/lapack_asn1.$arch"
-    clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_audio.c -framework CoreAudio -o "$work/audio.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_audio.c -framework CoreAudio \
+        -framework AudioUnit -framework AudioToolbox -o "$work/audio.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_videotoolbox.c -framework CoreMedia \
         -framework CoreVideo -framework VideoToolbox -framework CoreFoundation -o "$work/videotoolbox.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_sqlite.c -lsqlite3 -o "$work/sqlite.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror -fno-objc-arc tests/dynamic/native_metal_events.m \
+        -framework Foundation -framework Metal -o "$work/metal_events.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_wine_imports.c \
+        -framework SystemConfiguration -framework CoreFoundation -lresolv -o "$work/wine_imports.$arch"
 done
 clang -arch x86_64 -O1 -Wall -Wextra -Werror tests/dynamic/native_ldt.c -o "$work/ldt.x86_64"
 # i386_set_ldt is x86_64 only, so Rosetta is the oracle: this is its line.
 echo 'ldt set=16 read=17 set=0xcffa000000ffff got=0xcffa000000ffff bad=-1 errno=EINVAL' > "$work/ldt.expected"
+clang -arch x86_64 -O1 -Wall -Wextra -Werror tests/dynamic/native_thread_state.c -o "$work/thread_state.x86_64"
+echo 'debug64 kr=0 count=16 zero=1; debug kr=0 count=18 header=11/16; set zero kr=0' > "$work/thread_state.expected"
+# Linked the way Wine's loader is, so native mode runs it under a low shadow;
+# its output is Rosetta's.
+clang -arch x86_64 -O1 -Wall -Wextra -Werror -fno-objc-arc tests/dynamic/native_low_wine.m -framework Foundation \
+    -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000 -o "$work/low_wine.x86_64" 2> /dev/null
 mkdir -p "$work/globdir"
 touch "$work/globdir/a.txt" "$work/globdir/b.txt" "$work/globdir/c.log"
 /usr/bin/perl -e 'alarm 60; exec @ARGV' "$work/frameworks.arm64" "$work/cert.der" > "$work/expected" 2> "$work/arm.err"
@@ -48,6 +59,8 @@ sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.er
 "$work/audio.arm64" > "$work/audio.expected"
 "$work/videotoolbox.arm64" > "$work/videotoolbox.expected"
 "$work/sqlite.arm64" > "$work/sqlite.expected"
+"$work/metal_events.arm64" > "$work/metal_events.expected"
+"$work/wine_imports.arm64" > "$work/wine_imports.expected"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -83,7 +96,7 @@ for engine in jit interpreter slow-bridge; do
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/gl_carbon.x86_64" > "$work/gl_carbon.$engine.out" 2> "$work/gl_carbon.$engine.err"
     cmp "$work/gl_carbon.expected" "$work/gl_carbon.$engine.out"
-    echo "PASS native OpenGL, Carbon time and hot keys $engine"
+    echo "PASS native OpenGL, GLU, Carbon time and hot keys $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/callback_structs.x86_64" > "$work/callback_structs.$engine.out" \
         2> "$work/callback_structs.$engine.err"
@@ -96,7 +109,7 @@ for engine in jit interpreter slow-bridge; do
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/audio.x86_64" > "$work/audio.$engine.out" 2> "$work/audio.$engine.err"
     cmp "$work/audio.expected" "$work/audio.$engine.out"
-    echo "PASS native audio device IOProcs and IO blocks $engine"
+    echo "PASS native audio device IOProcs, IO blocks and output unit render callbacks $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/videotoolbox.x86_64" > "$work/videotoolbox.$engine.out" 2> "$work/videotoolbox.$engine.err"
     cmp "$work/videotoolbox.expected" "$work/videotoolbox.$engine.out"
@@ -109,6 +122,22 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/ldt.x86_64" > "$work/ldt.$engine.out" 2> "$work/ldt.$engine.err"
     cmp "$work/ldt.expected" "$work/ldt.$engine.out"
     echo "PASS native i386_set_ldt and i386_get_ldt $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/thread_state.x86_64" > "$work/thread_state.$engine.out" 2> "$work/thread_state.$engine.err"
+    cmp "$work/thread_state.expected" "$work/thread_state.$engine.out"
+    echo "PASS native debug-register thread state $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/metal_events.x86_64" > "$work/metal_events.$engine.out" 2> "$work/metal_events.$engine.err"
+    cmp "$work/metal_events.expected" "$work/metal_events.$engine.out"
+    echo "PASS native Metal shared-event blocks and the shader cache path $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/wine_imports.x86_64" > "$work/wine_imports.$engine.out" 2> "$work/wine_imports.$engine.err"
+    cmp "$work/wine_imports.expected" "$work/wine_imports.$engine.out"
+    echo "PASS native ulock signals, iovecs, msghdrs, resolver state, zone statistics and DHCP info $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/low_wine.x86_64" > "$work/low_wine.$engine.out" 2> "$work/low_wine.$engine.err"
+    cmp tests/dynamic/native_low_wine.out "$work/low_wine.$engine.out"
+    echo "PASS native Wine layout: pool token, low __block, coherent and claimed mach_vm_map $engine"
     for refusal in context launch; do
         rc=0
         env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \

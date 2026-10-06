@@ -241,7 +241,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "ocerz: HOSTMASK-START[%d] mask=%#x argv1=%s\n", (int)getpid(), hv_, argc > 1 ? argv[1] : "");
     }
     if (getenv("OCERZ_EXECLOG")) {
-        fprintf(stderr, "ocerz: EXECSTART[%d]", (int)getpid());
+        fprintf(stderr, "ocerz: EXECSTART[%d<-%d]", (int)getpid(), (int)getppid());
         for (int k = 0; k < argc; k++)
             fprintf(stderr, " %s", argv[k] ? argv[k] : "(null)");
         int envc = 0, noexec = -1, reserve = -1, socket = -1;

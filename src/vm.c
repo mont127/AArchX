@@ -98,7 +98,10 @@
  * SA_RESTART.  Only waits whose callers already loop on a spurious return are
  * kicked; a cpu in a read, recvmsg, poll or fcntl lock sets block_nokick and is
  * left alone, because those never return EINTR on their own and apps rightly do
- * not expect it.  OCERZ_UNSTICK_ALL=1 kicks those too.  The same no-op handler
+ * not expect it.  OCERZ_UNSTICK_ALL=1 kicks those too.  A native-mode ulock wait
+ * (bridge.c) sets block_sigonly instead: it is kicked only once a guest signal
+ * is pending for it, which is how a signal that landed between the guest's last
+ * check and the kernel wait still reaches its handler.  The same no-op handler
  * doubles as a context-synchronization event, so a thread spinning in JIT code
  * observes the stop-site patches made by ocerz_jit_request_stop.
  *
@@ -2262,6 +2265,12 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 f = hex_into(f, hpc ? *(const uint32_t *)hpc : 0);
                 f = str_into(f, " esr=");
                 f = hex_into(f, esr);
+                f = str_into(f, " host_addr=");
+                f = hex_into(f, (uint64_t)(uintptr_t)si->si_addr);
+                f = str_into(f, " pinned=");
+                f = hex_into(f, (uint64_t)ocerz_pinned_page(gaddr));
+                f = str_into(f, " pid=");
+                f = hex_into(f, (uint64_t)getpid());
                 f = str_into(f, "\n");
                 write(2, fb, (size_t)(f - fb));
                 if (in_jit && uc) {
@@ -2740,6 +2749,25 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         p = str_into(p, " ocerz_base=");
         p = hex_into(p, (uint64_t)(uintptr_t)_dyld_get_image_header(0));
         write(2, buf, (size_t)(p - buf)); p = buf;
+        {
+            uint64_t ibase = 0;
+            const char *iname = ocerz_dyld_name_for_addr(hpc, &ibase);
+            if (iname) {
+                p = str_into(p, "\n  host_pc is guest code: ");
+                p = str_into(p, iname);
+                p = str_into(p, "+");
+                p = hex_into(p, hpc - ibase);
+            }
+            Dl_info di;
+            uint64_t lr = uc->uc_mcontext->__ss.__lr;
+            if (dladdr((void *)(uintptr_t)lr, &di) && di.dli_fname) {
+                p = str_into(p, "\n  host_lr is in ");
+                p = str_into(p, di.dli_fname);
+                p = str_into(p, " ");
+                p = str_into(p, di.dli_sname ? di.dli_sname : "?");
+            }
+            write(2, buf, (size_t)(p - buf)); p = buf;
+        }
         p = str_into(p, "\n  host-x:");
         for (int i = 0; i < 29; i++) {
             p = str_into(p, i % 8 == 0 ? "\n    " : " ");
@@ -4024,7 +4052,10 @@ static void *ocerz_unstick_thread(void *arg)
         pthread_mutex_lock(&g_cpus_lock);
         for (int i = 0; i < g_cpus_n; i++) {
             uint64_t t0 = g_cpus[i]->block_since_ns;
-            if (t0 && now - t0 > 800ull * 1000 * 1000 && (kick_all || !g_cpus[i]->block_nokick)) {
+            int sigonly = g_cpus[i]->block_sigonly;
+            int due = sigonly ? (g_cpus[i]->sig_pending & ~g_cpus[i]->sig_mask) && now - t0 > 50ull * 1000 * 1000
+                              : now - t0 > 800ull * 1000 * 1000 && (kick_all || !g_cpus[i]->block_nokick);
+            if (t0 && due) {
                 g_cpus[i]->block_since_ns = now;
                 if (lg)
                     fprintf(stderr, "ocerz: UNSTICK[%d] kicking cpu#%u (blocked %llums) what=%d rip=%#llx\n",
