@@ -1609,6 +1609,7 @@ static void ocerz_fork_parent(void)
 
 static void ocerz_fork_child(void)
 {
+    ocerz_mem_pin_refresh();
     ocerz_mem_postfork();
     ocerz_jit_postfork();
     ocerz_jit_postfork_child();
@@ -4213,6 +4214,19 @@ static int guest_self_signal(OcerzCPU *cpu, int signo, int defer)
         _exit(128 + signo);
     }
     return GUEST_SELFSIG_HOST;
+}
+
+static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]);
+
+int ocerz_guest_thread_port_kill(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t port, int sig, int *err)
+{
+    uint64_t a[8] = { port, (uint64_t)(uint32_t)sig, 0, 0, 0, 0, 0, 0 };
+    uint64_t saved_rax = cpu->gpr[OCERZ_RAX], saved_flags = cpu->rflags;
+    sys_pthread_kill(vm, cpu, a);
+    *err = (cpu->rflags & 1) ? (int)cpu->gpr[OCERZ_RAX] : 0;
+    cpu->gpr[OCERZ_RAX] = saved_rax;
+    cpu->rflags = saved_flags;
+    return *err ? -1 : 0;
 }
 
 static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])

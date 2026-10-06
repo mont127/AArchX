@@ -1782,6 +1782,75 @@ int ocerz_sys_vm_region_64(struct OcerzVM *vm, OcerzCPU *cpu)
     return sb_vm_region(vm, cpu, "_vm_region_64");
 }
 
+/* A fixed mach_vm_map below the low limit in a Wine process names the guest's
+   shadow, not the host's address: Wine probes free space with FIXED and no
+   OVERWRITE before it maps there, which the host answered for its own memory,
+   and msync maps the wineserver's shared memory object.  The range is checked
+   and claimed in ocerz's tables, and an object is mapped over the claimed
+   shadow pages. */
+#define SB_USER_VA_END 0x0000800000000000ull
+
+/* With a low shadow, guest code reads every address below 12 GB through the
+   shadow, so a host mapping the kernel placed there would be one page to the
+   caller and another to the code that uses it: MacNdCheese's wineserver keeps
+   msync's wait words in such pages and its wakes were lost.  An anywhere map
+   the guest asks for searches from 12 GB up. */
+static mach_vm_address_t sb_anywhere_floor(mach_port_t target, int flags, mach_vm_address_t addr)
+{
+    if (ocerz_low_base && target == mach_task_self() && (flags & VM_FLAGS_ANYWHERE) && addr < OCERZ_LOW_LIMIT)
+        return OCERZ_LOW_LIMIT;
+    return addr;
+}
+
+static kern_return_t sb_vm_map_low(struct OcerzVM *vm, uint64_t addr, mach_vm_size_t size, int flags,
+                                   mach_port_t object, uint64_t offset, boolean_t copy, vm_prot_t cur,
+                                   vm_prot_t max, vm_inherit_t inherit)
+{
+    if (!size || (addr & (OCERZ_HOST_PAGE_SIZE - 1)))
+        return KERN_INVALID_ARGUMENT;
+    if (size > OCERZ_LOW_LIMIT - addr)
+        return KERN_NO_SPACE;
+    if (!(flags & VM_FLAGS_OVERWRITE) && ocerz_mem_range_in_use(addr, size))
+        return KERN_NO_SPACE;
+    if (ocerz_mem_pinned(addr, size))
+        return KERN_NO_SPACE;
+    ocerz_jit_invalidate_range(vm, addr, size);
+    int prot = (cur & VM_PROT_READ ? PROT_READ : 0) | (cur & VM_PROT_WRITE ? PROT_WRITE : 0) |
+               (cur & VM_PROT_EXECUTE ? PROT_EXEC : 0);
+    if (ocerz_map_fixed(addr, size, object == MACH_PORT_NULL ? prot : PROT_READ | PROT_WRITE) != OCERZ_OK)
+        return KERN_NO_SPACE;
+    if (object == MACH_PORT_NULL)
+        return KERN_SUCCESS;
+    mach_vm_address_t host = (mach_vm_address_t)(uintptr_t)ocerz_g2h(addr);
+    kern_return_t kr = mach_vm_map(mach_task_self(), &host, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, object,
+                                   offset, copy, cur & ~VM_PROT_EXECUTE, max, inherit);
+    if (kr != KERN_SUCCESS)
+        ocerz_unmap(addr, size);
+    return kr;
+}
+
+/* An anonymous fixed map above the low window is guest memory, as a fixed
+   mmap is: cache mode claims it in ocerz's map (syscall.c) and so does this.
+   Sent to the host instead, it was a mapping ocerz did not know, and Wine's
+   anon_mmap_tryfixed - this map, then mmap(MAP_FIXED) over it - found its own
+   reservation in the way, so Chromium's 16 GB PartitionAlloc pools failed. */
+static kern_return_t sb_vm_map_claim(struct OcerzVM *vm, uint64_t addr, mach_vm_size_t size, int flags)
+{
+    const int rw = PROT_READ | PROT_WRITE;
+    int ok;
+    if (flags & VM_FLAGS_OVERWRITE)
+        ok = ocerz_map_fixed(addr, size, rw) == OCERZ_OK ||
+             (ocerz_mem_register_range(addr, addr + size) == OCERZ_OK && ocerz_map_fixed(addr, size, rw) == OCERZ_OK);
+    else
+        ok = ocerz_map_claim_fixed(addr, size, rw) == OCERZ_OK || ocerz_map_claim_region(addr, size, rw) == OCERZ_OK ||
+             (ocerz_mem_register_range(addr, addr + size) == OCERZ_OK &&
+              ocerz_map_claim_region(addr, size, rw) == OCERZ_OK);
+    if (!ok)
+        return KERN_NO_SPACE;
+    ocerz_jit_invalidate_range(vm, addr, size);
+    return KERN_SUCCESS;
+}
+
 int ocerz_sys_mach_vm_map(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     mach_port_t target = (mach_port_t)sb_arg(cpu, 0);
@@ -1789,6 +1858,20 @@ int ocerz_sys_mach_vm_map(struct OcerzVM *vm, OcerzCPU *cpu)
     mach_vm_size_t size = sb_arg(cpu, 2);
     int flags = (int)sb_arg(cpu, 4);
     mach_vm_address_t addr = addrp ? ocerz_ld(addrp, 8) : 0;
+    /* An anywhere hint above user space cannot be met, and only an uninitialized
+       variable passes one: MacNdCheese's wineserver maps its msync pages from a
+       stack slot x86 libsystem frames would have overwritten under Rosetta and
+       that native mode leaves holding old strings, so the hint is dropped. */
+    if ((flags & VM_FLAGS_ANYWHERE) && addr >= SB_USER_VA_END)
+        addr = 0;
+    addr = sb_anywhere_floor(target, flags, addr);
+    if (target == mach_task_self() && ocerz_low_base && !(flags & VM_FLAGS_ANYWHERE) && addr < OCERZ_LOW_LIMIT)
+        return sb_ret(vm, cpu, sb_vm_map_low(vm, addr, size, flags, (mach_port_t)sb_arg(cpu, 5), sb_arg(cpu, 6),
+                                             (boolean_t)sb_arg(cpu, 7), (vm_prot_t)sb_arg(cpu, 8),
+                                             (vm_prot_t)sb_arg(cpu, 9), (vm_inherit_t)sb_arg(cpu, 10)));
+    if (target == mach_task_self() && !(flags & VM_FLAGS_ANYWHERE) && size &&
+        (mach_port_t)sb_arg(cpu, 5) == MACH_PORT_NULL && addr >= OCERZ_LOW_LIMIT)
+        return sb_ret(vm, cpu, sb_vm_map_claim(vm, addr, size, flags));
     if (target == mach_task_self() && !(flags & VM_FLAGS_ANYWHERE) && size)
         ocerz_jit_invalidate_range(vm, addr, size);
     struct OcerzBridgeFrame outer;
@@ -1811,6 +1894,7 @@ int ocerz_sys_mach_vm_remap(struct OcerzVM *vm, OcerzCPU *cpu)
     int flags = (int)sb_arg(cpu, 4);
     mach_vm_address_t addr = addrp ? ocerz_ld(addrp, 8) : 0;
     vm_prot_t cur = 0, max = 0;
+    addr = sb_anywhere_floor(target, flags, addr);
     if (target == mach_task_self() && !(flags & VM_FLAGS_ANYWHERE) && size)
         ocerz_jit_invalidate_range(vm, addr, size);
     struct OcerzBridgeFrame outer;
