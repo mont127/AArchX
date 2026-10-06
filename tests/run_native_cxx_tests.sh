@@ -13,17 +13,19 @@ for arch in x86_64 arm64; do
     clang++ -arch "$arch" -std=c++17 -O1 -dynamiclib tests/dynamic/native_cxx_dylib.cpp -o "$work/plugin.$arch.dylib"
     clang++ -arch "$arch" -std=c++17 -O1 tests/dynamic/cpp_exceptions.cpp -o "$work/exceptions.$arch"
     clang++ -arch "$arch" -std=c++17 -O1 tests/dynamic/cpp_global_ctor.cpp -o "$work/constructors.$arch"
+    clang++ -arch "$arch" -std=c++17 -O1 tests/dynamic/cxx_typed_new.cpp -o "$work/typed_new.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror -fno-objc-arc tests/dynamic/native_objc_exceptions.m \
         -framework Foundation -o "$work/objc_exceptions.$arch"
 done
 "$work/extended.arm64" "$work/plugin.arm64.dylib" > "$work/extended.expected"
 "$work/exceptions.arm64" > "$work/exceptions.expected"
 "$work/constructors.arm64" > "$work/constructors.expected"
+"$work/typed_new.arm64" > "$work/typed_new.expected"
 "$work/objc_exceptions.arm64" > "$work/objc_exceptions.expected" 2> /dev/null
 for engine in jit interpreter; do
     args=(-native -v)
     if [ "$engine" = interpreter ]; then args+=(-no-jit); fi
-    for test in extended exceptions constructors objc_exceptions; do
+    for test in extended exceptions constructors typed_new objc_exceptions; do
         extra=()
         if [ "$test" = extended ]; then extra=("$work/plugin.x86_64.dylib"); fi
         env OCERZ_GUEST_ROOT="$root" OCERZ_BRIDGESTAT=1 OCERZ_JITSTAT=1 \
