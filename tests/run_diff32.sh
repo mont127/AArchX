@@ -18,6 +18,11 @@
 #   tests/run_diff32.sh . --only bcd          # one family
 #   tests/run_diff32.sh . --selftest          # prove the comparator is not vacuous
 #   tests/run_diff32.sh . --jit-required      # required now that the JIT compiles i386
+#   tests/run_diff32.sh . --low               # only the Wine memory layout
+#
+# The corpus runs twice, once in an offset arena and once laid out as a Wine
+# process is (--low): an identity arena and the low shadow window, which is
+# where WoW64 code actually lives.
 #
 # This is a real differential: the JIT side compiles 32-bit blocks and the
 # interpreter side does not. --jit-required is passed below, so if a future
@@ -48,5 +53,9 @@ esac
 case " $* " in
     *" --selftest "*|*" --list "*|*" --help "*|*" --bug "*)
         exec "$W/diff32" "$@" ;;
+    *" --low "*)
+        exec "$W/diff32" --jit-required "$@" ;;
 esac
-exec "$W/diff32" --jit-required "$@"
+"$W/diff32" --jit-required "$@"
+echo
+exec "$W/diff32" --jit-required --low "$@"
