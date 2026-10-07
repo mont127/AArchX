@@ -111,10 +111,11 @@ typedef struct OcerzCPU {
     uint16_t fsw;
     uint8_t ftw;
     uint8_t ftop;
+    uint8_t fpr_x_ok;
     double fpr[8];
     uint64_t fpr_xm[8];
     uint16_t fpr_xe[8];
-    uint8_t fpr_x_ok;
+    uint16_t jit_x87_top0;  /* TOP as the running translated x87 run found it (src/jit.c) */
     struct OcerzVM *vm;
     int terminated;
     int interp_once;
