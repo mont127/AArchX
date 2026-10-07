@@ -186,7 +186,11 @@
  * (OCERZ_LOW_TOP_GUARD=1 tests the top strip in every block).  Stack accesses (push, pop, call, ret and rsp-relative operands) are
  * plain in this mode as in every other, after the translation instead of in
  * place of it; they used to take the ordered load and store
- * (OCERZ_TSO_STRICT=1 orders them everywhere).
+ * (OCERZ_TSO_STRICT=1 orders them everywhere).  Their translation is the stack
+ * delta kept in x0 rather than the guard (emit_stack_delta), and a rip-relative
+ * address, whose side of 12 GB is known when the block is translated, takes an
+ * orr below it and nothing above it.  On xbench in the Wine layout these took
+ * leafcall from 1.27 s to 0.65 s (Rosetta 0.62 s) and str from 0.84 s to 0.75 s.
  *
  * The integer SSE forms map almost one to one: widening multiplies and a
  * narrowing unzip for the high halves and pmaddubsw, saturating narrows for the
@@ -873,6 +877,9 @@ static int g_no_oolslow;
 static void ea_cache_reset(void);
 static int g_const_ea_valid;
 static uint64_t g_const_ea;
+/* Set by emit_mem_ea when the address it just formed is a constant, for the guard that follows. */
+static int g_ea_is_const;
+static uint64_t g_ea_const;
 static int g_ea_plain;
 static inline int stack_plain_now(void);
 
@@ -1213,6 +1220,9 @@ static void cp_mark(uint64_t key)
 }
 static inline int mem_guard_needed(void) { return ocerz_low_base != 0 || g_cp_guard; }
 static int g_low_top;
+/* The Wine layout's stack delta in x0 (emit_stack_delta), for the block being translated. */
+static int g_lowstack, g_lowstack_from, g_lowstack_check;
+static void emit_stack_delta(A64Buf *b);
 
 static int stack_plain_ok(void)
 {
@@ -1572,6 +1582,8 @@ static void emit_reload_jgb(A64Buf *b)
 {
     if (jgb_usable())
         a64_mov_imm64(b, JGB, ocerz_guest_base);
+    else if (g_lowstack)
+        emit_stack_delta(b);
 }
 static void emit_reload_mem_base(A64Buf *b);
 
@@ -2716,6 +2728,8 @@ static void emit_gpr_rd(A64Buf *b, int sf, int dst, unsigned greg)
     if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
         if (jgb_usable())
             a64_sub_reg(b, 1, dst, pin_hreg(s), JGB, 0);
+        else if (ocerz_guest_base == 0)
+            a64_mov_reg(b, 1, dst, pin_hreg(s));
         else {
             a64_mov_imm64(b, dst, ocerz_guest_base);
             a64_sub_reg(b, 1, dst, pin_hreg(s), dst, 0);
@@ -2743,6 +2757,8 @@ static void emit_gpr_wr(A64Buf *b, int src, unsigned greg)
     if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
         if (jgb_usable())
             a64_add_reg(b, 1, pin_hreg(s), src, JGB, 0);
+        else if (ocerz_guest_base == 0)
+            a64_mov_reg(b, 1, pin_hreg(s), src);
         else {
             int tmp = src == JTU ? JTA : JTU;
             a64_mov_imm64(b, tmp, ocerz_guest_base);
@@ -4077,6 +4093,7 @@ static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, i
 static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int addr_reg)
 {
     g_const_ea_valid = 0;
+    g_ea_is_const = 0;
     g_ea_plain = ocerz_low_base != 0 && insn->seg == OCERZ_SEG_NONE && !insn->mode32 && mem_plain_access_ok(op);
     uint64_t fold = ea_fold();
     int seg = insn->seg;
@@ -4093,6 +4110,8 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     }
     if (op->riprel) {
         a64_mov_imm64(b, addr_reg, (uint64_t)op->disp + fold);
+        g_ea_is_const = seg == OCERZ_SEG_NONE;
+        g_ea_const = (uint64_t)op->disp + fold;
         return 1;
     }
     if (insn->addrsize == 4) {
@@ -4132,12 +4151,17 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
         else if (op->disp < 0) a64_sub_imm(b, 1, addr_reg, addr_reg, (uint32_t)-op->disp);
         return 1;
     }
+    int index_done = 0;
     if (op->base != OCERZ_REG_NONE && pin_slot(op->base) >= 0 &&
         (int64_t)initial >= -4095 && (int64_t)initial <= 4095) {
         int hb = pin_hreg(pin_slot(op->base));
-        if ((int64_t)initial > 0)      a64_add_imm(b, 1, addr_reg, hb, (uint32_t)initial);
-        else if ((int64_t)initial < 0) a64_sub_imm(b, 1, addr_reg, hb, (uint32_t)-(int64_t)initial);
-        else                           a64_mov_reg(b, 1, addr_reg, hb);
+        int xs = op->index != OCERZ_REG_NONE ? pin_slot(op->index) : -1;
+        if ((int64_t)initial == 0 && xs >= 0 && !(rsp_is_ptr() && op->index == OCERZ_RSP)) {
+            a64_add_reg(b, 1, addr_reg, hb, pin_hreg(xs), op->scale & 3);
+            index_done = 1;
+        } else if ((int64_t)initial > 0) a64_add_imm(b, 1, addr_reg, hb, (uint32_t)initial);
+        else if ((int64_t)initial < 0)   a64_sub_imm(b, 1, addr_reg, hb, (uint32_t)-(int64_t)initial);
+        else                             a64_mov_reg(b, 1, addr_reg, hb);
     } else {
         a64_mov_imm64(b, addr_reg, initial);
         if (op->base != OCERZ_REG_NONE) {
@@ -4150,7 +4174,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
             }
         }
     }
-    if (op->index != OCERZ_REG_NONE) {
+    if (op->index != OCERZ_REG_NONE && !index_done) {
         int s = pin_slot(op->index);
         if (s >= 0 && !(rsp_is_ptr() && op->index == OCERZ_RSP))
             a64_add_reg(b, 1, addr_reg, addr_reg, pin_hreg(s), op->scale & 3);
@@ -4233,11 +4257,154 @@ static int low_guard_fast_ok(void)
     return ok > 0;
 }
 
+/*
+ * The Wine layout's stack delta.  Every guest address below 12 GB is the host's
+ * with low_base or'ed in, and every one between 12 GB and the top strip is the
+ * host's own, and a thread's stack sits wholly on one side: so while rsp is
+ * below 12 GB every stack slot is rsp + low_base, and otherwise rsp itself.  x0,
+ * the guest-base register of the other layouts, holds that delta here, and a
+ * push, a pop, a call, a ret or an rsp-relative operand adds it where the fast
+ * guard spent a shift, a compare, a branch and an orr (the push itself, its
+ * guard and its two conversions of rsp were thirteen instructions).  The delta
+ * is computed without the flags, which may be live: (rsp >> 32) - 3 is negative
+ * below 12 GB, its sign spread over the word masks low_base.  It is computed
+ * when a body is entered from the dispatcher, after every call-out (which
+ * clobbers x0) and before a chain, and before the next instruction once an
+ * instruction other than push, pop, call or ret has written rsp: those move it
+ * by eight, which no stack crosses 12 GB by.  OCERZ_NO_LOW_STACK_DELTA=1 keeps
+ * the guard on stack slots; OCERZ_LOWSTACK_CHECK=1 checks x0 before every
+ * instruction and traps on a stale one.
+ */
+static int lowstack_delta_ok(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_LOW_STACK_DELTA") ? 1 : 0;
+    return !off && ocerz_low_base != 0 && ocerz_guest_base == 0 && g_pin_class == 3 &&
+           !g_xlat_mode32 && pin_slot(OCERZ_RSP) >= 0 && rsp_is_ptr() && low_guard_fast_ok();
+}
+
+static void emit_stack_delta_into(A64Buf *b, int rd)
+{
+    int hs = pin_hreg(pin_slot(OCERZ_RSP));
+    a64_lsr_imm(b, 1, rd, hs, 32);
+    a64_sub_imm(b, 1, rd, rd, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+    a64_asr_imm(b, 1, rd, rd, 63);
+    (void)a64_try_and_imm(b, 1, rd, rd, ocerz_low_base);
+}
+
+static void emit_stack_delta(A64Buf *b)
+{
+    emit_stack_delta_into(b, JGB);
+}
+
+static void emit_stack_delta_check(A64Buf *b)
+{
+    emit_stack_delta_into(b, JTT);
+    a64_eor_reg(b, 1, JTT, JTT, JGB, 0);
+    uint32_t *ok = a64_label(b);
+    a64_cbz(b, 1, JTT, 0);
+    a64_emit32(b, 0xd4200000u | (0x5d0u << 5));
+    a64_patch_cbz(ok, a64_label(b));
+}
+
+static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
+
+/* Whether an instruction may move rsp by more than push, pop, call and ret do. */
+static int lowstack_disturbs(const X86Insn *in)
+{
+    switch (in->op) {
+    case OCERZ_OP_PUSH: case OCERZ_OP_CALL: case OCERZ_OP_RET:
+        return 0;
+    case OCERZ_OP_POP:
+        return in->nops > 0 && in->ops[0].kind == OCERZ_OPK_REG && (in->ops[0].reg & 15) == OCERZ_RSP;
+    default:
+        return insn_may_write_gpr(in, OCERZ_RSP);
+    }
+}
+
+/* Whether an instruction reaches the stack without naming it as an operand. */
+static int insn_stack_implicit(const X86Insn *in)
+{
+    switch (in->op) {
+    case OCERZ_OP_PUSH: case OCERZ_OP_POP: case OCERZ_OP_CALL: case OCERZ_OP_RET:
+    case OCERZ_OP_LEAVE: case OCERZ_OP_PUSHF: case OCERZ_OP_POPF:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Whether every guest access an instruction makes is a stack slot: the implicit
+ * ones of push, pop, call, ret and leave, and explicit operands based on rsp
+ * with no index and a displacement under a megabyte.  An index can reach memory
+ * nowhere near the stack - code on a thread with a stack below 12 GB loaded from
+ * hundreds of gigabytes past rsp that way (iosurface_low_stack) - so an indexed
+ * operand takes the guard.  The string instructions, which reach memory through
+ * other registers, are never stack-only.
+ */
+static int insn_stack_only(const X86Insn *in)
+{
+    if (in->seg != OCERZ_SEG_NONE || in->mode32 || in->addrsize != 8)
+        return 0;
+    int implicit = 0;
+    switch (in->op) {
+    case OCERZ_OP_PUSH: case OCERZ_OP_POP: case OCERZ_OP_CALL: case OCERZ_OP_RET:
+    case OCERZ_OP_LEAVE: case OCERZ_OP_PUSHF: case OCERZ_OP_POPF:
+        implicit = 1;
+        break;
+    case OCERZ_OP_MOVS: case OCERZ_OP_STOS: case OCERZ_OP_LODS: case OCERZ_OP_SCAS: case OCERZ_OP_CMPS:
+        return 0;
+    default:
+        break;
+    }
+    int mem = 0;
+    for (int k = 0; k < in->nops; k++) {
+        const X86Operand *o = &in->ops[k];
+        if (o->kind != OCERZ_OPK_MEM)
+            continue;
+        if (o->riprel || (o->base & 15) != OCERZ_RSP || o->base == OCERZ_REG_NONE ||
+            o->index != OCERZ_REG_NONE || o->disp >= (1 << 20) || o->disp <= -(1 << 20))
+            return 0;
+        mem = 1;
+    }
+    return implicit || mem;
+}
+
 static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
                                      int addr_reg, uint32_t **exit_sites, int *n_exits)
 {
     (void)exit_sites; (void)n_exits;
     g_const_ea_valid = 0;
+    if (g_lowstack && insn && insn_stack_only(insn)) {
+        g_ea_is_const = 0;
+        a64_add_reg(b, 1, addr_reg, addr_reg, JGB, 0);
+        return NULL;
+    }
+    /*
+     * A rip-relative address in the Wine layout is known when the block is
+     * translated, so is its side of 12 GB: below it the translation is one orr,
+     * between it and the top strip there is none.  Only an address emit_mem_ea
+     * has just formed counts, and never for an instruction that also reaches the
+     * stack implicitly, whose slot would take the constant's answer.
+     */
+    if (g_ea_is_const && ocerz_low_base && ea_fold() == 0 && low_guard_fast_ok() && insn &&
+        !insn_stack_implicit(insn)) {
+        uint64_t ga = g_ea_const;
+        g_ea_is_const = 0;
+        if (ga < OCERZ_LOW_LIMIT) {
+            (void)a64_try_orr_imm(b, 1, addr_reg, addr_reg, ocerz_low_base);
+            g_const_ea = ga;
+            g_const_ea_valid = 1;
+            return NULL;
+        }
+        if (ga < OCERZ_TOP_LO && !(ocerz_commpage && ga >= OCERZ_COMMPAGE_LO && ga < OCERZ_COMMPAGE_HI)) {
+            g_const_ea = ga;
+            g_const_ea_valid = 1;
+            return NULL;
+        }
+    }
+    g_ea_is_const = 0;
     if (!ocerz_commpage && !ocerz_low_base)
         return NULL;
     uint64_t ga;
@@ -5376,6 +5543,22 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             return 0;
         }
 
+        if (g_lowstack && stack_plain_access_ok()) {
+            /* The slot is rsp - 8 plus the stack delta; rsp moves only once the store is done. */
+            int hs = pin_hreg(pin_slot(OCERZ_RSP));
+            int rv = JT1;
+            if (o->kind == OCERZ_OPK_REG) {
+                int vs = pin_slot(o->reg);
+                if (vs >= 0 && o->reg != OCERZ_RSP) rv = pin_hreg(vs);
+                else emit_gpr_rd(b, 1, JT1, o->reg);
+            } else {
+                a64_mov_imm64(b, JT1, o->imm);
+            }
+            a64_sub_imm(b, 1, JTA, hs, 8);
+            a64_str_regoff(b, 8, rv, JTA, JGB, 0);
+            a64_mov_reg(b, 1, hs, JTA);
+            return 1;
+        }
         if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() && jgb_usable() &&
             !stack_guard_needed()) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
@@ -5457,6 +5640,16 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
         if (o->kind != OCERZ_OPK_REG || o->high8 || o->size != 8)
             return 0;
 
+        if (g_lowstack && stack_plain_access_ok() && o->reg != OCERZ_RSP) {
+            int hs = pin_hreg(pin_slot(OCERZ_RSP));
+            int ds = pin_slot(o->reg);
+            int rd = ds >= 0 ? pin_hreg(ds) : JT1;
+            a64_ldr_regoff(b, 8, rd, hs, JGB, 0);
+            a64_add_imm(b, 1, hs, hs, 8);
+            if (ds < 0)
+                emit_gpr_wr(b, JT1, o->reg);
+            return 1;
+        }
         if (g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() && jgb_usable() &&
             !stack_guard_needed() && o->reg != OCERZ_RSP && pin_slot(o->reg) >= 0) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
@@ -18269,6 +18462,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_pin_hold = NULL;
     g_n_pinned = 0;
     g_pin_class = 0;
+    g_lowstack = 0;
 
     g_defer = !g_no_regflags;
     blk->n_edges = 0;
@@ -18557,12 +18751,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 
     emit_pin_prologue(&b);
 
-    if (rsp_is_ptr()) {
+    if (rsp_is_ptr() && ocerz_guest_base != 0) {
         int rs = pin_slot(OCERZ_RSP);
         assert(rs >= 0);
         a64_mov_imm64(&b, JT0, ocerz_guest_base);
         a64_add_reg(&b, 1, pin_hreg(rs), pin_hreg(rs), JT0, 0);
     }
+    g_lowstack = lowstack_delta_ok();
+    g_lowstack_from = 0;
+    g_lowstack_check = g_lowstack && ENV_ON("OCERZ_LOWSTACK_CHECK");
+    if (g_lowstack)
+        emit_stack_delta(&b);
 
     if (g_pin_class == 2)
         a64_add_imm(&b, 1, 29, 31, 0);
@@ -18960,6 +19159,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             uint32_t *declined = emit_leaf_call_ret(&b, leaf_entry, leaf_entry_writes, epi_sites, &n_epi);
             a64_patch_cbz(declined, a64_label(&b));
             ea_cache_reset();
+        }
+        g_ea_is_const = 0;
+        if (g_lowstack) {
+            int moved = 0;
+            for (int k = g_lowstack_from; k < i; k++)
+                moved |= lowstack_disturbs(&blk->insns[k]);
+            g_lowstack_from = i;
+            if (moved)
+                emit_stack_delta(&b);
+            if (g_lowstack_check)
+                emit_stack_delta_check(&b);
         }
         g_cur_need = fl_need[i];
         g_cur_insns = blk->insns; g_cur_insns_n = n;
@@ -19722,6 +19932,7 @@ promo_push_fallthrough:
         blk->code = NULL;
         blk->body_code = NULL;
         g_pin = NULL; g_pin_hold = NULL; g_n_pinned = 0; g_pin_class = 0;
+        g_lowstack = 0;
         cache_insert(jit, blk);
         return blk;
     }
@@ -19742,6 +19953,7 @@ promo_push_fallthrough:
         blk->pin_class = 0;
         blk->code = NULL;
         g_pin = NULL; g_pin_hold = NULL; g_n_pinned = 0; g_pin_class = 0;
+        g_lowstack = 0;
         cache_insert(jit, blk);
         return blk;
     }
