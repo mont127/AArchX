@@ -866,6 +866,70 @@ static void t_call(Gen *g)
     memcpy(&g->c->code[at], &rel, 4);
 }
 
+/*
+ * An indirect call or jmp in a loop that alternates between two targets, so the
+ * site's cache misses, fills and hits on both: through a register, a dword, a
+ * two-entry table indexed by the register, or push/ret as a computed jump.
+ */
+static void t_icall(Gen *g)
+{
+    if (room(g) < 140 || g->depth + 8 > DEPTH_MAX) return;
+    uint8_t r = rdst(g);
+    if (r == 1) r = 0;
+    int call = (int)rndn(g, 2), form = (int)rndn(g, 4);
+    unsigned ext = call ? 2 : 4;
+    uint32_t slot = (uint32_t)(SCRATCH_MID + 4 * rndn(g, 0xf0));
+    size_t t1 = 0, t2 = 0, d_at = 0, base_at = 0, ret_at = 0, jat, p1 = 0, p2 = 0, top;
+    int save = g_avoid;
+    g_avoid = 1;
+    if (form == 3) {
+        eb(g, 0xc7); eb(g, 0x05); ed(g, slot); t1 = g->c->len; ed(g, 0);
+        eb(g, 0xc7); eb(g, 0x05); ed(g, slot + 4); t2 = g->c->len; ed(g, 0);
+    }
+    eb(g, 0xb9); ed(g, (uint32_t)rndi(g, 2, 6));
+    if (call) {
+        eb(g, 0xeb); jat = g->c->len; eb(g, 0);
+        p1 = g->c->len; blob(g, rndi(g, 1, 2)); eb(g, 0xc3);
+        p2 = g->c->len; blob(g, rndi(g, 1, 2)); eb(g, 0xc3);
+        g->c->code[jat] = (uint8_t)(g->c->len - (jat + 1));
+    }
+    top = g->c->len;
+    eb(g, 0x89); eb(g, 0xc8 | r);
+    eb(g, 0x83); eb(g, 0xe0 | r); eb(g, 1);
+    if (form != 3) {
+        eb(g, 0x6b); eb(g, 0xc0 | (r << 3) | r); d_at = g->c->len; eb(g, 0);
+        eb(g, 0x81); eb(g, 0xc0 | r); base_at = g->c->len; ed(g, 0);
+    }
+    switch (form) {
+    case 0: eb(g, 0xff); eb(g, 0xc0 | (ext << 3) | r); break;
+    case 1:
+        eb(g, 0x89); eb(g, 0x05 | (r << 3)); ed(g, slot);
+        eb(g, 0xff); eb(g, 0x05 | (ext << 3)); ed(g, slot);
+        break;
+    case 2:
+        if (call) { eb(g, 0x68); ret_at = g->c->len; ed(g, 0); }
+        eb(g, 0x50 | r); eb(g, 0xc3);
+        if (call) { uint32_t back = (uint32_t)(CODE32 + g->c->len); memcpy(&g->c->code[ret_at], &back, 4); }
+        break;
+    default: eb(g, 0xff); eb(g, 0x04 | (ext << 3)); eb(g, 0x85 | (r << 3)); ed(g, slot); break;
+    }
+    if (!call) {
+        p1 = g->c->len; blob(g, rndi(g, 1, 2)); eb(g, 0xeb); jat = g->c->len; eb(g, 0);
+        p2 = g->c->len; blob(g, rndi(g, 1, 2));
+        g->c->code[jat] = (uint8_t)(g->c->len - (jat + 1));
+    }
+    eb(g, 0xe2); eb(g, (unsigned)(uint8_t)(int8_t)((int64_t)top - (int64_t)(g->c->len + 1)));
+    g_avoid = save;
+    uint32_t a1 = (uint32_t)(CODE32 + p1), a2 = (uint32_t)(CODE32 + p2);
+    if (form == 3) {
+        memcpy(&g->c->code[t1], &a1, 4);
+        memcpy(&g->c->code[t2], &a2, 4);
+    } else {
+        g->c->code[d_at] = (uint8_t)(p2 - p1);
+        memcpy(&g->c->code[base_at], &a1, 4);
+    }
+}
+
 static void t_string(Gen *g)
 {
     if (room(g) < 48) return;
@@ -1633,7 +1697,7 @@ static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_0f,     14 }, { t_seg,    10 }, { t_cx8,    4 },
     { t_btmem,   4 }, { t_cmpjcc, 10 }, { t_cntloop, 5 },
     { t_ccuse,  10 }, { t_pairs,   5 }, { t_movshift, 3 },
-    { t_x87,     6 },
+    { t_x87,     6 }, { t_icall,   4 },
 };
 #define NTEMPLATES ((int)(sizeof TEMPLATES / sizeof TEMPLATES[0]))
 

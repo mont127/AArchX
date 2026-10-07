@@ -287,7 +287,10 @@
  * guest RET is a plain ret.  Indirect jmp/call go through a per-site
  * direct-mapped cache of 32 {rip, body} pairs (16-aligned, so the lookup's ldp
  * is single-copy atomic) before falling into an inlined hash probe and finally
- * C.  Small straight-line callees ending in a plain ret are spliced into the
+ * C.  In 32-bit code a ret, an indirect call and an indirect jmp take the same
+ * cache, their target keyed with JIT_KEY_M32 as a 32-bit block's is, where they
+ * all left for the dispatcher before; under WoW64 a vtable-call loop went from
+ * 1321 to 464 ms and qsort from 634 to 163 ms.  Small straight-line callees ending in a plain ret are spliced into the
  * caller: the call becomes a push, the ret a compare against the known return
  * address, and a mismatch leaves at the ret's rip for the dispatcher to run the
  * real one.  Where a frame is pure register work the push's slot is provably
@@ -14894,6 +14897,8 @@ static void veneer_pool_check(OcerzJit *jit);
 static uint32_t **g_ind_call_cont;
 static int g_ind_treg;
 static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi);
+static int g_ind_treg;
+static int g_ind_m32;
 static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
                                       uint32_t **epilogue_sites, int *n_epi);
 
@@ -15077,9 +15082,21 @@ static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
         }
         if (pop > 4095)
             return 0;
-        m32_stack_ld(b, JT0, hs);
+        m32_stack_ld(b, JT1, hs);
         a64_add_imm(b, 0, hs, hs, pop);
-        a64_str(b, 8, JT0, 20, RIP_OFF);
+        /*
+         * The return address goes through the same per-site cache and hash probe
+         * an indirect jump does, keyed as a 32-bit block, instead of out to the
+         * dispatcher on every return.
+         */
+        if (!g_no_chain && !ENV_ON("OCERZ_NO_M32_RET_TAIL")) {
+            (void)a64_try_orr_imm(b, 1, JT1, JT1, JIT_KEY_M32);
+            g_ind_treg = JT1;
+            g_ind_m32 = 1;
+            emit_indirect_tail(b, epi_sites, n_epi);
+            return 1;
+        }
+        a64_str(b, 8, JT1, 20, RIP_OFF);
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
         epi_sites[*n_epi] = a64_label(b);
         a64_b(b, 0);
@@ -15469,6 +15486,8 @@ static void emit_indirect_leave_br(A64Buf *b, int code_reg)
 static uint32_t **g_ind_call_cont;
 static uint32_t *g_ind_call_tocont;
 static int g_ind_treg = JT1;
+/* Set for one emit_indirect_tail whose target register holds a 32-bit block's key. */
+static int g_ind_m32;
 static uint64_t g_dbg_ind_src;
 static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
 {
@@ -15482,7 +15501,9 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
     uint32_t *to_blr = NULL;
     JitPscEnt *psc = NULL;
     int treg = g_ind_treg;
+    int m32 = g_ind_m32;
     g_ind_treg = JT1;
+    g_ind_m32 = 0;
     if (g_pin_class == 3 && g_n_raslit < RASLIT_MAX && !ENV_ON("OCERZ_NO_PSC"))
         psc = psc_alloc();
     uint32_t *psc_miss = NULL;
@@ -15519,7 +15540,12 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
         uint32_t *stop_lbl = a64_label(b);
         if (intr) a64_patch_cbz(intr, stop_lbl);
         if (stop_site_ok) stop_extra_add(br_site, stop_lbl);
-        a64_str(b, 8, treg, 20, RIP_OFF);
+        if (m32) {
+            (void)a64_try_and_imm(b, 1, JTU, treg, ~JIT_KEY_M32);
+            a64_str(b, 8, JTU, 20, RIP_OFF);
+        } else {
+            a64_str(b, 8, treg, 20, RIP_OFF);
+        }
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
         epi_sites[*n_epi] = a64_label(b);
         a64_b(b, 0);
@@ -15530,7 +15556,12 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
         a64_ldar(b, 8, JT0, JT0);
     }
     if (treg != JT1) a64_mov_reg(b, 1, JT1, treg);
-    a64_str(b, 8, JT1, 20, RIP_OFF);
+    if (m32) {
+        (void)a64_try_and_imm(b, 1, JTU, JT1, ~JIT_KEY_M32);
+        a64_str(b, 8, JTU, 20, RIP_OFF);
+    } else {
+        a64_str(b, 8, JT1, 20, RIP_OFF);
+    }
     a64_lsr_imm(b, 1, JTT, JT1, 33);
     a64_eor_reg(b, 1, JTT, JTT, JT1, 0);
     a64_mov_imm64(b, JTU, 0xff51afd7ed558ccdull);
@@ -15638,11 +15669,59 @@ static int emit_branch_target(A64Buf *b, const X86Insn *insn, const X86Operand *
     return 0;
 }
 
+/*
+ * A 32-bit indirect call or jump: the target, a register or a dword in memory,
+ * is zero-extended into JT1 and keyed as a 32-bit block, a call pushes its
+ * return address as emit_call_ret32 does, and both leave through the per-site
+ * cache and hash probe.  32-bit Windows code calls every import as call dword
+ * [IAT], so each of those went out to the dispatcher before.  The target is
+ * read before anything moves, so a fault there leaves the instruction unstarted.
+ */
+static int emit_indirect32(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
+                           int *n_exits, uint32_t **epi_sites, int *n_epi)
+{
+    const X86Operand *o = &insn->ops[0];
+    if (insn->seg != OCERZ_SEG_NONE || g_no_chain || o->size != 4 ||
+        ENV_ON("OCERZ_NO_INLINE_INDIRECT") || ENV_ON("OCERZ_NO_M32_RET_TAIL"))
+        return 0;
+    if (insn->op == OCERZ_OP_CALL && (!m32_stack_ok(insn) || !mem_native_store_ok()))
+        return 0;
+    if (o->kind == OCERZ_OPK_REG) {
+        int s = pin_slot(o->reg);
+        if (o->high8 || s < 0)
+            return 0;
+        a64_mov_reg(b, 0, JT1, pin_hreg(s));
+    } else if (o->kind == OCERZ_OPK_MEM) {
+        if (!emit_mem_ea(b, insn, o, JTA))
+            return 0;
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        emit_guest_load_ordered(b, 4, JT1, JTA, JTU);
+        patch_guard_skip(skip, a64_label(b));
+    } else {
+        return 0;
+    }
+    if (insn->op == OCERZ_OP_CALL) {
+        int hs = pin_hreg(pin_slot(OCERZ_RSP));
+        a64_mov_imm64(b, JT0, (uint32_t)(insn->rip + insn->len));
+        a64_sub_imm(b, 0, JTA, hs, 4);
+        m32_stack_st(b, JT0, JTA);
+        a64_mov_reg(b, 0, hs, JTA);
+    }
+    (void)a64_try_orr_imm(b, 1, JT1, JT1, JIT_KEY_M32);
+    g_ind_treg = JT1;
+    g_ind_m32 = 1;
+    emit_indirect_tail(b, epi_sites, n_epi);
+    return 1;
+}
+
 static int emit_indirect_jmp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                              int *n_exits, uint32_t **epi_sites, int *n_epi)
 {
     if (insn->op != OCERZ_OP_JMP || insn->ops[0].kind == OCERZ_OPK_IMM)
         return 0;
+    if (insn->mode32)
+        return emit_indirect32(b, insn, exit_sites, n_exits, epi_sites, n_epi);
     if (ENV_ON("OCERZ_NO_INLINE_INDIRECT"))
         return 0;
     if (insn->seg != OCERZ_SEG_NONE)
@@ -15872,6 +15951,8 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
     g_dbg_ind_src = insn->rip;
     if (insn->op != OCERZ_OP_CALL || insn->ops[0].kind == OCERZ_OPK_IMM)
         return 0;
+    if (insn->mode32)
+        return emit_indirect32(b, insn, exit_sites, n_exits, epi_sites, n_epi);
     if (ENV_ON("OCERZ_NO_INLINE_INDIRECT"))
         return 0;
     if (insn->seg != OCERZ_SEG_NONE || !mem_native_store_ok())
