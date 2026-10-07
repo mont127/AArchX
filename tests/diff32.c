@@ -3090,7 +3090,8 @@ static const char *diff_snaps(const Snap *a, const Snap *b)
                      (unsigned long long)x, (unsigned long long)y);
             return buf;
         }
-        if (a->fpr_xm[p] != b->fpr_xm[p] || a->fpr_xe[p] != b->fpr_xe[p]) {
+        /* An image whose bit is clear is never read, and the JIT moves its bytes only while it is valid. */
+        if (((a->fpr_x_ok >> p) & 1) && (a->fpr_xm[p] != b->fpr_xm[p] || a->fpr_xe[p] != b->fpr_xe[p])) {
             snprintf(buf, sizeof buf, "x87 image %d: interp=%04x:%016llx jit=%04x:%016llx", p,
                      a->fpr_xe[p], (unsigned long long)a->fpr_xm[p], b->fpr_xe[p], (unsigned long long)b->fpr_xm[p]);
             return buf;
@@ -3264,6 +3265,9 @@ static int selftest(uint64_t seed)
 
     bad += jit_plumbing();
 
+    /* Image bytes are compared only where the bit says valid, so make register 6's valid on both sides. */
+    a.fpr_x_ok |= 0x40;
+    b.fpr_x_ok |= 0x40;
     for (int i = 0; i < NINJECT; i++) {
         Snap m = b;
         inject(&m, i);
@@ -3407,7 +3411,59 @@ static void kb_x87(Gen *g)
     x87m(g, 0xdd, 3, OUT(0));
 }
 
-static const struct { const char *name; void (*fn)(Gen *); const char *what; } KERNELS[] = {
+/*
+ * The loop of winbench's double kernel as mingw's i686 gcc -O2 compiles it, byte
+ * for byte, with its .rdata constants at XDBL instead of 0x4050d0: three values
+ * carried on the x87 stack, two clamps on fcomi and fcomip.
+ */
+#define XDBL ((uint32_t)(SCRATCH_MID + 0x300))
+static void kb_x87dbl_pre(Gen *g)
+{
+    static const uint32_t rdata[] = {
+        0x3f000000, 0x3e800000, 0x42c80000, 0xc2c80000, 0x3fa00000, 0x00000000, 0x1ad7f29b,
+        0x3ff00000, 0xca501acb, 0x3fefffff, 0x49742400, 0xc9742400, 0x5f000000, 0x447a0000,
+    };
+    for (unsigned i = 0; i < sizeof rdata / sizeof rdata[0]; i++) {
+        eb(g, 0xc7); eb(g, 0x05); ed(g, XDBL + 4 * i); ed(g, rdata[i]);
+    }
+    eb(g, 0xd9); eb(g, 0xee);
+    eb(g, 0xd9); eb(g, 0x05); ed(g, XDBL + 0x10);
+    eb(g, 0xd9); eb(g, 0x05); ed(g, XDBL + 0x00);
+    eb(g, 0xdd); eb(g, 0x05); ed(g, XDBL + 0x18);
+    eb(g, 0xd9); eb(g, 0xca);
+}
+static void kb_x87dbl(Gen *g)
+{
+    eb(g, 0xd9); eb(g, 0xca);
+    eb(g, 0xdc); eb(g, 0xc9);
+    eb(g, 0xd9); eb(g, 0xc2);
+    eb(g, 0xd8); eb(g, 0x0d); ed(g, XDBL + 0x00);
+    eb(g, 0xde); eb(g, 0xc2);
+    eb(g, 0xd9); eb(g, 0xca);
+    eb(g, 0xdc); eb(g, 0x0d); ed(g, XDBL + 0x20);
+    eb(g, 0xd9); eb(g, 0xc1);
+    eb(g, 0xd8); eb(g, 0x0d); ed(g, XDBL + 0x04);
+    eb(g, 0xde); eb(g, 0xe9);
+    eb(g, 0xd9); eb(g, 0x05); ed(g, XDBL + 0x28);
+    eb(g, 0xd9); eb(g, 0xca);
+    eb(g, 0xdb); eb(g, 0xf2);
+    eb(g, 0xdd); eb(g, 0xda);
+    eb(g, 0x76); eb(g, 0x06);
+    eb(g, 0xdd); eb(g, 0xd9);
+    eb(g, 0xd9); eb(g, 0xe8);
+    eb(g, 0xd9); eb(g, 0xc9);
+    eb(g, 0xd9); eb(g, 0x05); ed(g, XDBL + 0x2c);
+    eb(g, 0xdf); eb(g, 0xf1);
+    eb(g, 0x76); eb(g, 0x08);
+    eb(g, 0xdd); eb(g, 0xd8);
+    eb(g, 0xd9); eb(g, 0x05); ed(g, XDBL + 0x00);
+    eb(g, 0xd9); eb(g, 0xc1);
+    eb(g, 0x83); eb(g, 0xc0); eb(g, 0x01);
+    eb(g, 0xd8); eb(g, 0xc9);
+    eb(g, 0xde); eb(g, 0xc4);
+}
+
+static const struct { const char *name; void (*fn)(Gen *); const char *what; void (*pre)(Gen *); } KERNELS[] = {
     { "base",      kb_base,    "add eax, ebx" },
     { "seh",       kb_seh,     "push handler; push fs:[0]; mov fs:[0], esp; ...; mov fs:[0], eax; add esp, 8" },
     { "teb",       kb_teb,     "mov eax, fs:[0x18]; mov edx, [eax+0x2c]; mov ebx, fs:[0x2c]; mov ebx, [ebx]" },
@@ -3419,6 +3475,8 @@ static const struct { const char *name; void (*fn)(Gen *); const char *what; } K
     { "rmw",       kb_rmw,     "add [ebp+0x50], eax; inc dword [ebp+0x54]; or dword [ebp+0x58], 1" },
     { "cc",        kb_cc,      "cmp eax, edi; setb cl; cmovl edx, ebx; add esi, ecx; inc eax; sete bl" },
     { "x87",       kb_x87,     "fld/fmul/fadd/fild/faddp, a clamp of fld/fsub/fldz/fcomip/fcmovnb/fstp, fistp, fstp" },
+    { "x87dbl",    kb_x87dbl,  "winbench's double kernel: fxch, fmul, fld st(i), m32/m64 operands, faddp, fsubrp, fcomi(p)",
+      kb_x87dbl_pre },
 };
 #define NKERNELS ((int)(sizeof KERNELS / sizeof KERNELS[0]))
 
@@ -3431,6 +3489,8 @@ static void gen_kernel(Case *c, int k, uint32_t iters)
     g.rng = 1;
     g.depth = 0;
     mov32(&g, OCERZ_RDI, iters);
+    if (KERNELS[k].pre)
+        KERNELS[k].pre(&g);
     size_t top = c->len;
     KERNELS[k].fn(&g);
     eb(&g, 0x4f);

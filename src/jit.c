@@ -226,13 +226,23 @@
  * goes through memory).  OCERZ_NO_JIT_MMX=1 interprets them again.
  *
  * ---- x87 ----
- * The x87 registers stay where src/x87.c keeps them, in the cpu struct, and a
- * translated instruction reads TOP when it runs: ST(i) is fpr[(ftop + i) & 7]
- * at x20 + 8p, and fcw, fsw, the abridged tag word and ftop are one aligned
- * 8-byte word, loaded once and stored once per instruction.  It leaves exactly
- * what the interpreter leaves - values, TOP, tags, the 80-bit images and their
- * validity bits (cleared by every write, carried by FLD ST(i), FST ST(i), FXCH
- * and FCMOVcc), the condition codes and the exception flags - and before it
+ * The x87 registers stay where src/x87.c keeps them, in the cpu struct: ST(i)
+ * is fpr[(ftop + i) & 7] at x20 + 8p.  fcw, fsw, the abridged tag word, ftop
+ * and the image bits fpr_x_ok are one aligned 8-byte word, which a run of
+ * translated instructions loads once into X87S and every instruction that
+ * changes it stores back.  TOP inside a run is the run's first TOP plus the
+ * pushes and pops the translator counted, read from a halfword the previous run
+ * left (jit_x87_top0) and checked against X87S by a predicted branch, so the
+ * addresses never wait on X87S: every tag and image bit lands there, and as one
+ * serial chain carried from run to run it set the pace of an x87 loop.  For the
+ * same reason the run tracks what it knows of each register's tag and image
+ * bit, and of C1, and emits no update that would change nothing; a register
+ * whose image is known invalid is copied and exchanged without its image.
+ * winbench's i686 double kernel went from 2160 to 1066 ms under Wine this way
+ * (Rosetta 13050, Rosetta with rosettax87_jit 483).  It leaves exactly
+ * what the interpreter leaves - values, TOP, tags, the valid 80-bit images and
+ * their validity bits (cleared by every write, carried by FLD ST(i), FST ST(i),
+ * FXCH and FCMOVcc), the condition codes and the exception flags - and before it
  * writes anything it hands the interpreter what it cannot do exactly: a NaN
  * anywhere, an infinite result, a product or quotient within 2^53 of the
  * subnormal range (an exact zero stays), an integer store out of range or from
@@ -12297,27 +12307,28 @@ static int emit_cmpxchg8b(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 #define X87_FPR_OFF ((uint32_t)offsetof(OcerzCPU, fpr))
 #define X87_XM_OFF ((uint32_t)offsetof(OcerzCPU, fpr_xm))
 #define X87_XE_OFF ((uint32_t)offsetof(OcerzCPU, fpr_xe))
-#define X87_XOK_OFF ((uint32_t)offsetof(OcerzCPU, fpr_x_ok))
 #define X87_MXCSR_OFF ((uint32_t)offsetof(OcerzCPU, mxcsr))
+#define X87_TOP0_OFF ((uint32_t)offsetof(OcerzCPU, jit_x87_top0))
 #define JIT_SCRATCH_OFF ((uint32_t)offsetof(OcerzCPU, jit_scratch))
 _Static_assert(offsetof(OcerzCPU, fcw) % 8 == 0 && offsetof(OcerzCPU, fsw) == offsetof(OcerzCPU, fcw) + 2 &&
                offsetof(OcerzCPU, ftw) == offsetof(OcerzCPU, fcw) + 4 &&
                offsetof(OcerzCPU, ftop) == offsetof(OcerzCPU, fcw) + 5 &&
+               offsetof(OcerzCPU, fpr_x_ok) == offsetof(OcerzCPU, fcw) + 6 &&
                offsetof(OcerzCPU, fpr) >= offsetof(OcerzCPU, fcw) + 8,
-               "fcw, fsw, ftw and ftop are loaded and stored as one 8-byte word");
-_Static_assert(offsetof(OcerzCPU, fpr_x_ok) % 2 == 0 && offsetof(OcerzCPU, vm) >= offsetof(OcerzCPU, fpr_x_ok) + 2,
-               "fpr_x_ok is accessed as a halfword whose upper byte is padding");
+               "fcw, fsw, ftw, ftop and fpr_x_ok are loaded and stored as one 8-byte word");
 _Static_assert(offsetof(OcerzCPU, fpr_xm) + 64 <= 8 * 4095 && offsetof(OcerzCPU, fpr_xe) + 16 <= 2 * 4095 &&
+               offsetof(OcerzCPU, jit_x87_top0) % 2 == 0 && offsetof(OcerzCPU, jit_x87_top0) <= 2 * 4095 &&
                offsetof(OcerzCPU, mxcsr) % 4 == 0, "x87 fields within scaled immediate reach");
 
-/* The x87 control word as X87S holds it: fcw, fsw << 16, ftw << 32, ftop << 40. */
+/* The x87 control word as X87S holds it: fcw, fsw << 16, ftw << 32, ftop << 40, fpr_x_ok << 48. */
+#define XS_XOK 48
 #define XS_PC (0x300ull)
 #define XS_PE (1ull << 21)
 #define XS_C1 (1ull << 25)
 #define XS_C3 (1ull << 30)
 enum { X87S = JT1, X87P = JT2, X87Q = JTF };
 enum { X87R_OK = 1, X87R_FCW = 2, X87R_MXCSR = 4, X87R_END = 8 };
-enum { XF_PE, XF_PC24, XF_ZERO, XF_ST32, XF_SETPE };
+enum { XF_PE, XF_PC24, XF_ZERO, XF_ST32, XF_SETPE, XF_TOP0 };
 enum { XK_ADD, XK_SUB, XK_MUL, XK_DIV, XK_SQRT };
 
 #define X87_RUN_MAX 64
@@ -12338,9 +12349,12 @@ static struct { uint32_t *site, *back; uint8_t kind, op; int16_t run, idx; } g_x
 static int g_n_x87_frag, g_x87_frag_open;
 static int g_slow_run_last = -1;
 static int g_x87_nzcv = -1, g_x87_nzcv_live;
+static int g_x87_live, g_x87_delta;
 
 static void x87_reset(void)
 {
+    g_x87_live = 0;
+    g_x87_delta = 0;
     g_n_x87_run = 0;
     g_x87_cur = -1;
     g_n_x87_site = 0;
@@ -12460,65 +12474,159 @@ static void x87_frag_land(A64Buf *b)
     g_x87_frag_open = g_n_x87_frag;
 }
 
-static void x87_ld(A64Buf *b) { a64_ldr(b, 8, X87S, 20, X87_CTL_OFF); }
-static void x87_st(A64Buf *b) { a64_str(b, 8, X87S, 20, X87_CTL_OFF); }
-static void x87_top(A64Buf *b, int rd) { a64_ubfx(b, 1, rd, X87S, 40, 3); }
-static void x87_phys(A64Buf *b, int rd, int i)
+static void x87_top(A64Buf *b, int rd);
+/*
+ * Inside a run X87S already holds the control word: x87_run_open loaded it and
+ * every instruction that changes it stores it back, so there is nothing to load,
+ * except after x87_reload's callers.  OCERZ_X87_CHECK=1 traps where the register
+ * and memory disagree.
+ */
+static void x87_ld(A64Buf *b)
 {
-    x87_top(b, rd);
-    if (i & 7) {
-        a64_add_imm(b, 0, rd, rd, (uint32_t)(i & 7));
+    static int check = -1;
+    if (!g_x87_live) {
+        a64_ldr(b, 8, X87S, 20, X87_CTL_OFF);
+        return;
+    }
+    if (check < 0) check = ENV_ON("OCERZ_X87_CHECK") ? 1 : 0;
+    if (check) {
+        a64_ldr(b, 8, X87P, 20, X87_CTL_OFF);
+        a64_subs_reg(b, 1, A64_ZR, X87P, X87S, 0);
+        a64_bcond(b, A64_EQ, 2);
+        a64_emit32(b, 0xd4200000u | (0x87u << 5));
+        x87_top(b, X87P);
+        a64_lsl_imm(b, 1, X87P, X87P, 40);
+        a64_eor_reg(b, 1, X87P, X87P, X87S, 0);
+        (void)a64_try_ands_imm(b, 1, A64_ZR, X87P, 7ull << 40);
+        a64_bcond(b, A64_EQ, 2);
+        a64_emit32(b, 0xd4200000u | (0x88u << 5));
+    }
+}
+static void x87_st(A64Buf *b) { a64_str(b, 8, X87S, 20, X87_CTL_OFF); }
+/* After a shared emitter that may use X87S's register as scratch (flag predicates, GPR writes). */
+static void x87_reload(A64Buf *b) { if (g_x87_live) a64_ldr(b, 8, X87S, 20, X87_CTL_OFF); }
+/*
+ * The physical number of ST(k).  Inside a run TOP is the run's first TOP plus
+ * pushes and pops counted here (g_x87_delta), so it comes from a halfword the
+ * run stored once and not from X87S: every tag and image bit an instruction
+ * sets lands in X87S, and the next instruction's addresses would wait for them.
+ */
+static void x87_top_at(A64Buf *b, int rd, int k)
+{
+    if (g_x87_live) {
+        a64_ldr(b, 2, rd, 20, X87_TOP0_OFF);
+        k += g_x87_delta;
+    } else {
+        a64_ubfx(b, 1, rd, X87S, 40, 3);
+    }
+    if (k & 7) {
+        a64_add_imm(b, 0, rd, rd, (uint32_t)(k & 7));
         (void)a64_try_and_imm(b, 0, rd, rd, 7);
     }
 }
-static void x87_newtop(A64Buf *b, int rd)
-{
-    x87_top(b, rd);
-    a64_sub_imm(b, 0, rd, rd, 1);
-    (void)a64_try_and_imm(b, 0, rd, rd, 7);
-}
+static void x87_top(A64Buf *b, int rd) { x87_top_at(b, rd, 0); }
+static void x87_phys(A64Buf *b, int rd, int i) { x87_top_at(b, rd, i); }
+static void x87_newtop(A64Buf *b, int rd) { x87_top_at(b, rd, -1); }
 static void x87_slot(A64Buf *b, int rd, int rp) { a64_add_reg(b, 1, rd, 20, rp, 3); }
 static void x87_bit(A64Buf *b, int rd, int rp) { a64_movz(b, rd, 1, 0); a64_lslv(b, 0, rd, rd, rp); }
-/* A register written: its tag set, its image bit set or cleared. */
-static void x87_tag(A64Buf *b, int rbit, int rt, int image)
+/*
+ * What a run knows of each register's tag and image bit, by its offset from
+ * the run's first TOP: 0 unknown, 1 set, 2 clear; and whether C1 is known
+ * clear.  An update that would change nothing is not emitted.  X87S is one
+ * serial chain, and its length per iteration is what an x87 loop runs at, so a
+ * register that an earlier instruction of the run already tagged and cleared
+ * costs nothing when it is written again.
+ */
+static int8_t g_x87_tagk[8], g_x87_xokk[8], g_x87_c1k;
+static int x87_rel(int i) { return (g_x87_delta + i) & 7; }
+static void x87_know_reset(void)
 {
-    a64_orr_reg(b, 1, X87S, X87S, rbit, 32);
-    a64_ldr(b, 2, rt, 20, X87_XOK_OFF);
-    if (image) a64_orr_reg(b, 0, rt, rt, rbit, 0);
-    else       a64_bic_reg(b, 0, rt, rt, rbit, 0);
-    a64_str(b, 2, rt, 20, X87_XOK_OFF);
+    memset(g_x87_tagk, 0, sizeof g_x87_tagk);
+    memset(g_x87_xokk, 0, sizeof g_x87_xokk);
+    g_x87_c1k = 0;
+}
+static void x87_clear_c1(A64Buf *b)
+{
+    if (g_x87_live && g_x87_c1k) return;
+    (void)a64_try_and_imm(b, 1, X87S, X87S, ~XS_C1);
+    g_x87_c1k = (int8_t)g_x87_live;
+}
+/* Physical register rp, ST(rel) of the run, written: tagged, its image bit set or cleared; rt a scratch. */
+static void x87_tag(A64Buf *b, int rp, int rt, int rel, int image)
+{
+    int want = image ? 1 : 2;
+    int tag = !g_x87_live || g_x87_tagk[rel] != 1;
+    int xok = !g_x87_live || g_x87_xokk[rel] != want;
+    if (tag || xok) x87_bit(b, rt, rp);
+    if (tag) a64_orr_reg(b, 1, X87S, X87S, rt, 32);
+    if (xok && image) a64_orr_reg(b, 1, X87S, X87S, rt, XS_XOK);
+    if (xok && !image) a64_bic_reg(b, 1, X87S, X87S, rt, XS_XOK);
+    if (g_x87_live) {
+        g_x87_tagk[rel] = 1;
+        g_x87_xokk[rel] = (int8_t)want;
+    }
 }
 static void x87_pop(A64Buf *b)
 {
-    x87_top(b, JT0);
-    x87_bit(b, JTT, JT0);
-    a64_bic_reg(b, 1, X87S, X87S, JTT, 32);
-    a64_add_imm(b, 0, JT0, JT0, 1);
-    (void)a64_try_and_imm(b, 0, JT0, JT0, 7);
+    int rel = x87_rel(0);
+    if (!g_x87_live || g_x87_tagk[rel] != 2) {
+        x87_top(b, JT0);
+        x87_bit(b, JTT, JT0);
+        a64_bic_reg(b, 1, X87S, X87S, JTT, 32);
+    }
+    if (g_x87_live) g_x87_tagk[rel] = 2;
+    x87_phys(b, JT0, 1);
     a64_bfi(b, 1, X87S, JT0, 40, 8);
+    g_x87_delta++;
 }
-/* copy_st: value, image and image bit of physical rs into physical rd, rd tagged. */
-static void x87_copy(A64Buf *b, int rd, int rs)
+/*
+ * copy_st: value, image and image bit of physical rs into physical rd, rd tagged.
+ * The image's bytes move only while its bit says it is valid; a register whose
+ * bit is clear never has its image read, and arithmetic clears it.
+ */
+static void x87_copy(A64Buf *b, int rd, int rs, int rdrel, int rsrel)
 {
+    int sx = g_x87_live ? g_x87_xokk[rsrel] : 0;
     x87_slot(b, X87Q, rs);
     x87_slot(b, JTT, rd);
     a64_ldr_v(b, 8, VX0, X87Q, X87_FPR_OFF);
-    a64_ldr_v(b, 8, VX1, X87Q, X87_XM_OFF);
     a64_str_v(b, 8, VX0, JTT, X87_FPR_OFF);
+    if (sx == 2) {
+        x87_tag(b, rd, JTU, rdrel, 0);
+        return;
+    }
+    if (sx == 1) {
+        a64_ldr_v(b, 8, VX1, X87Q, X87_XM_OFF);
+        a64_str_v(b, 8, VX1, JTT, X87_XM_OFF);
+        a64_add_reg(b, 1, X87Q, 20, rs, 1);
+        a64_add_reg(b, 1, JTT, 20, rd, 1);
+        a64_ldr(b, 2, JTU, X87Q, X87_XE_OFF);
+        a64_str(b, 2, JTU, JTT, X87_XE_OFF);
+        x87_tag(b, rd, JTU, rdrel, 1);
+        return;
+    }
+    a64_lsrv(b, 1, JTU, X87S, rs);
+    a64_ubfx(b, 1, JTU, JTU, XS_XOK, 1);
+    uint32_t *noimg = a64_label(b);
+    a64_cbz(b, 0, JTU, 0);
+    a64_ldr_v(b, 8, VX1, X87Q, X87_XM_OFF);
     a64_str_v(b, 8, VX1, JTT, X87_XM_OFF);
     a64_add_reg(b, 1, X87Q, 20, rs, 1);
     a64_add_reg(b, 1, JTT, 20, rd, 1);
     a64_ldr(b, 2, JTU, X87Q, X87_XE_OFF);
     a64_str(b, 2, JTU, JTT, X87_XE_OFF);
-    a64_ldr(b, 2, JTU, 20, X87_XOK_OFF);
-    a64_lsrv(b, 0, X87Q, JTU, rs);
-    (void)a64_try_and_imm(b, 0, X87Q, X87Q, 1);
+    a64_movz(b, JTU, 1, 0);
+    a64_patch_cbz(noimg, a64_label(b));
+    a64_lslv(b, 0, JTU, JTU, rd);
     x87_bit(b, JTT, rd);
-    a64_bic_reg(b, 0, JTU, JTU, JTT, 0);
-    a64_lslv(b, 0, X87Q, X87Q, rd);
-    a64_orr_reg(b, 0, JTU, JTU, X87Q, 0);
-    a64_str(b, 2, JTU, 20, X87_XOK_OFF);
-    a64_orr_reg(b, 1, X87S, X87S, JTT, 32);
+    a64_bic_reg(b, 1, X87S, X87S, JTT, XS_XOK);
+    a64_orr_reg(b, 1, X87S, X87S, JTU, XS_XOK);
+    if (!g_x87_live || g_x87_tagk[rdrel] != 1)
+        a64_orr_reg(b, 1, X87S, X87S, JTT, 32);
+    if (g_x87_live) {
+        g_x87_tagk[rdrel] = 1;
+        g_x87_xokk[rdrel] = 0;
+    }
 }
 /* A push whose value is in vv; with an image, its significand and sign/exponent are in rm and rs. */
 static void x87_push(A64Buf *b, int vv, int image, int rm, int rs)
@@ -12531,9 +12639,9 @@ static void x87_push(A64Buf *b, int vv, int image, int rm, int rs)
         a64_add_reg(b, 1, X87Q, 20, X87P, 1);
         a64_str(b, 2, rs, X87Q, X87_XE_OFF);
     }
-    x87_bit(b, JT0, X87P);
-    x87_tag(b, JT0, X87Q, image);
+    x87_tag(b, X87P, JT0, x87_rel(-1), image);
     a64_bfi(b, 1, X87S, X87P, 40, 8);
+    g_x87_delta--;
     x87_st(b);
 }
 /* int_to_f80 of the integer in rv: significand to rm, sign and exponent to rs. */
@@ -12656,8 +12764,7 @@ static int x87_arith(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int 
     }
     x87_result(b, kind);
     a64_str_v(b, 8, VX2, X87Q, X87_FPR_OFF);
-    x87_bit(b, JT0, X87P);
-    x87_tag(b, JT0, JTT, 0);
+    x87_tag(b, X87P, JT0, x87_rel(mem ? 0 : o->reg), 0);
     if (popit) x87_pop(b);
     x87_st(b);
     return 1;
@@ -12706,13 +12813,14 @@ static int x87_compare(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t *
             a64_orr_reg(b, 1, JT0, JT0, JTU, 6);
             a64_str(b, 8, JT0, 20, RF_OFF);
         }
-        (void)a64_try_and_imm(b, 1, X87S, X87S, ~XS_C1);
+        x87_clear_c1(b);
         g_x87_nzcv = g_cur_insn_idx;
     } else {
         a64_cset(b, JTT, A64_MI);
         a64_cset(b, JTU, A64_EQ);
         (void)a64_try_and_imm(b, 1, X87S, X87S, ~(7ull << 24));
         (void)a64_try_and_imm(b, 1, X87S, X87S, ~XS_C3);
+        g_x87_c1k = (int8_t)g_x87_live;
         a64_orr_reg(b, 1, X87S, X87S, JTT, 24);
         a64_orr_reg(b, 1, X87S, X87S, JTU, 30);
     }
@@ -12741,10 +12849,11 @@ static int x87_fist(A64Buf *b, const X86Insn *insn, int courier, uint32_t **exit
         (void)a64_try_ands_imm(b, 0, A64_ZR, JTU, 0x8000);
         a64_csneg(b, 1, X87Q, JTT, JTT, A64_EQ);
     } else {
-        a64_ldr(b, 2, JTT, 20, X87_XOK_OFF);
-        a64_lsrv(b, 0, JTT, JTT, X87P);
-        (void)a64_try_ands_imm(b, 0, A64_ZR, JTT, 1);
-        x87_slow_if(b, A64_NE);
+        if (!g_x87_live || g_x87_xokk[x87_rel(0)] != 2) {
+            a64_lsrv(b, 1, JTT, X87S, X87P);
+            (void)a64_try_ands_imm(b, 1, A64_ZR, JTT, 1ull << XS_XOK);
+            x87_slow_if(b, A64_NE);
+        }
         x87_slot(b, X87Q, X87P);
         a64_ldr_v(b, 8, VX0, X87Q, X87_FPR_OFF);
         a64_fcmp(b, 1, VX0, VX0);
@@ -12801,14 +12910,14 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
             x87_ld(b);
             if (o->reg == 7) {
                 x87_newtop(b, X87P);
-                x87_bit(b, JT0, X87P);
-                x87_tag(b, JT0, JTT, 0);
+                x87_tag(b, X87P, JT0, x87_rel(-1), 0);
             } else {
                 x87_phys(b, JT0, o->reg);
                 x87_newtop(b, X87P);
-                x87_copy(b, X87P, JT0);
+                x87_copy(b, X87P, JT0, x87_rel(-1), x87_rel(o->reg));
             }
             a64_bfi(b, 1, X87S, X87P, 40, 8);
+            g_x87_delta--;
             x87_st(b);
             return 1;
         }
@@ -12824,7 +12933,7 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
             if (o->reg) {
                 x87_phys(b, X87P, o->reg);
                 x87_top(b, JT0);
-                x87_copy(b, X87P, JT0);
+                x87_copy(b, X87P, JT0, x87_rel(o->reg), x87_rel(0));
             }
             if (op == OCERZ_OP_FSTP) x87_pop(b);
             if (o->reg || op == OCERZ_OP_FSTP) x87_st(b);
@@ -12906,8 +13015,7 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
             x87_frag_land(b);
         }
         a64_str_v(b, 8, VX2, X87Q, X87_FPR_OFF);
-        x87_bit(b, JT0, X87P);
-        x87_tag(b, JT0, JTT, 0);
+        x87_tag(b, X87P, JT0, x87_rel(0), 0);
         x87_st(b);
         return 1;
     case OCERZ_OP_FCHS: case OCERZ_OP_FABS:
@@ -12918,9 +13026,8 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
         if (op == OCERZ_OP_FCHS) (void)a64_try_eor_imm(b, 1, JTT, JTT, 1ull << 63);
         else                     (void)a64_try_and_imm(b, 1, JTT, JTT, ~(1ull << 63));
         a64_str(b, 8, JTT, X87Q, X87_FPR_OFF);
-        x87_bit(b, JT0, X87P);
-        x87_tag(b, JT0, JTU, 0);
-        (void)a64_try_and_imm(b, 1, X87S, X87S, ~XS_C1);
+        x87_tag(b, X87P, JT0, x87_rel(0), 0);
+        x87_clear_c1(b);
         x87_st(b);
         return 1;
     case OCERZ_OP_FXCH:
@@ -12932,34 +13039,71 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
             x87_slot(b, JTT, JT0);
             a64_ldr_v(b, 8, VX0, X87Q, X87_FPR_OFF);
             a64_ldr_v(b, 8, VX1, JTT, X87_FPR_OFF);
-            a64_ldr_v(b, 8, VX2, X87Q, X87_XM_OFF);
-            a64_ldr_v(b, 8, VX3, JTT, X87_XM_OFF);
             a64_str_v(b, 8, VX1, X87Q, X87_FPR_OFF);
             a64_str_v(b, 8, VX0, JTT, X87_FPR_OFF);
-            a64_str_v(b, 8, VX3, X87Q, X87_XM_OFF);
-            a64_str_v(b, 8, VX2, JTT, X87_XM_OFF);
-            a64_ldr(b, 2, JTU, 20, X87_XOK_OFF);
-            a64_lsrv(b, 0, X87Q, JTU, X87P);
-            a64_lsrv(b, 0, JTT, JTU, JT0);
-            a64_eor_reg(b, 0, X87Q, X87Q, JTT, 0);
-            (void)a64_try_and_imm(b, 0, X87Q, X87Q, 1);
-            a64_lslv(b, 0, JTT, X87Q, X87P);
-            a64_lslv(b, 0, X87Q, X87Q, JT0);
-            a64_orr_reg(b, 0, X87Q, X87Q, JTT, 0);
-            a64_eor_reg(b, 0, JTU, JTU, X87Q, 0);
-            a64_str(b, 2, JTU, 20, X87_XOK_OFF);
-            x87_bit(b, JTT, X87P);
-            a64_orr_reg(b, 1, X87S, X87S, JTT, 32);
-            x87_bit(b, JTT, JT0);
-            a64_orr_reg(b, 1, X87S, X87S, JTT, 32);
-            a64_add_reg(b, 1, X87Q, 20, X87P, 1);
-            a64_add_reg(b, 1, JTT, 20, JT0, 1);
-            a64_ldr(b, 2, JTU, X87Q, X87_XE_OFF);
-            a64_ldr(b, 2, X87P, JTT, X87_XE_OFF);
-            a64_str(b, 2, X87P, X87Q, X87_XE_OFF);
-            a64_str(b, 2, JTU, JTT, X87_XE_OFF);
+            /*
+             * The images' bytes swap only when one of the two is valid, and the
+             * bits flip only when they differ: decided here when the run knows
+             * both, at run time otherwise.
+             */
+            int ra = x87_rel(0), rc = x87_rel(o->reg);
+            int xa = g_x87_live ? g_x87_xokk[ra] : 0, xc = g_x87_live ? g_x87_xokk[rc] : 0;
+            int known = xa && xc, any_img = xa == 1 || xc == 1;
+            uint32_t *noimg = NULL;
+            if (!known) {
+                a64_lsrv(b, 1, X87Q, X87S, X87P);
+                a64_lsrv(b, 1, JTT, X87S, JT0);
+                a64_orr_reg(b, 1, X87Q, X87Q, JTT, 0);
+                noimg = a64_label(b);
+                a64_tbz(b, X87Q, XS_XOK, 0);
+            }
+            if (!known || any_img) {
+                x87_slot(b, X87Q, X87P);
+                x87_slot(b, JTT, JT0);
+                a64_ldr_v(b, 8, VX2, X87Q, X87_XM_OFF);
+                a64_ldr_v(b, 8, VX3, JTT, X87_XM_OFF);
+                a64_str_v(b, 8, VX3, X87Q, X87_XM_OFF);
+                a64_str_v(b, 8, VX2, JTT, X87_XM_OFF);
+                a64_add_reg(b, 1, X87Q, 20, X87P, 1);
+                a64_add_reg(b, 1, JTT, 20, JT0, 1);
+                a64_ldr(b, 2, JTU, X87Q, X87_XE_OFF);
+                a64_ldr(b, 2, X87P, JTT, X87_XE_OFF);
+                a64_str(b, 2, X87P, X87Q, X87_XE_OFF);
+                a64_str(b, 2, JTU, JTT, X87_XE_OFF);
+                x87_top(b, X87P);
+            }
+            if (noimg) a64_patch_tbz(noimg, a64_label(b));
+            if (!known) {
+                a64_lsrv(b, 1, JTU, X87S, X87P);
+                a64_lsrv(b, 1, JTT, X87S, JT0);
+                a64_eor_reg(b, 1, JTU, JTU, JTT, 0);
+                a64_ubfx(b, 1, JTU, JTU, XS_XOK, 1);
+                a64_lslv(b, 0, JTT, JTU, X87P);
+                a64_lslv(b, 0, JTU, JTU, JT0);
+                a64_orr_reg(b, 0, JTU, JTU, JTT, 0);
+                a64_eor_reg(b, 1, X87S, X87S, JTU, XS_XOK);
+            } else if (xa != xc) {
+                x87_bit(b, JTT, X87P);
+                x87_bit(b, JTU, JT0);
+                a64_orr_reg(b, 0, JTU, JTU, JTT, 0);
+                a64_eor_reg(b, 1, X87S, X87S, JTU, XS_XOK);
+            }
+            int ta = !g_x87_live || g_x87_tagk[ra] != 1, tc = !g_x87_live || g_x87_tagk[rc] != 1;
+            if (ta) {
+                x87_bit(b, JTT, X87P);
+                a64_orr_reg(b, 1, X87S, X87S, JTT, 32);
+            }
+            if (tc) {
+                x87_bit(b, JTU, JT0);
+                a64_orr_reg(b, 1, X87S, X87S, JTU, 32);
+            }
+            if (g_x87_live) {
+                g_x87_xokk[ra] = (int8_t)xc;
+                g_x87_xokk[rc] = (int8_t)xa;
+                g_x87_tagk[ra] = g_x87_tagk[rc] = 1;
+            }
         }
-        (void)a64_try_and_imm(b, 1, X87S, X87S, ~XS_C1);
+        x87_clear_c1(b);
         x87_st(b);
         return 1;
     case OCERZ_OP_FCOM: case OCERZ_OP_FCOMP: case OCERZ_OP_FCOMPP:
@@ -12981,13 +13125,23 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
         } else {
             emit_cc_predicate(b, insn->cc);
             a64_cset(b, X87Q, A64_NE);
+            x87_reload(b);
             skip = a64_label(b);
             a64_cbz(b, 0, X87Q, 0);
         }
         x87_ld(b);
         x87_top(b, X87P);
         x87_phys(b, JT0, i);
-        x87_copy(b, X87P, JT0);
+        int8_t tk[8], xk[8];
+        memcpy(tk, g_x87_tagk, sizeof tk);
+        memcpy(xk, g_x87_xokk, sizeof xk);
+        x87_copy(b, X87P, JT0, x87_rel(0), x87_rel(i));
+        if (skip) {
+            for (int k = 0; k < 8; k++) {
+                if (tk[k] != g_x87_tagk[k]) g_x87_tagk[k] = 0;
+                if (xk[k] != g_x87_xokk[k]) g_x87_xokk[k] = 0;
+            }
+        }
         x87_st(b);
         if (skip && g_x87_nzcv_live) a64_patch_bcond(skip, a64_label(b));
         else if (skip)               a64_patch_cbz(skip, a64_label(b));
@@ -13007,6 +13161,7 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
             emit_gpr_rd(b, 1, JT0, OCERZ_RAX);
             a64_bfi(b, 1, JT0, X87Q, 0, 16);
             emit_gpr_wr(b, JT0, OCERZ_RAX);
+            x87_reload(b);
         }
         return 1;
     }
@@ -13038,8 +13193,11 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
     case OCERZ_OP_FFREE: case OCERZ_OP_FFREEP:
         x87_ld(b);
         x87_phys(b, X87P, o->reg);
-        x87_bit(b, JT0, X87P);
-        a64_bic_reg(b, 1, X87S, X87S, JT0, 32);
+        if (!g_x87_live || g_x87_tagk[x87_rel(o->reg)] != 2) {
+            x87_bit(b, JT0, X87P);
+            a64_bic_reg(b, 1, X87S, X87S, JT0, 32);
+        }
+        if (g_x87_live) g_x87_tagk[x87_rel(o->reg)] = 2;
         if (op == OCERZ_OP_FFREEP) x87_pop(b);
         x87_st(b);
         return 1;
@@ -13048,7 +13206,8 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
         if (op == OCERZ_OP_FINCSTP) x87_phys(b, X87P, 1);
         else                        x87_newtop(b, X87P);
         a64_bfi(b, 1, X87S, X87P, 40, 8);
-        (void)a64_try_and_imm(b, 1, X87S, X87S, ~XS_C1);
+        g_x87_delta += op == OCERZ_OP_FINCSTP ? 1 : -1;
+        x87_clear_c1(b);
         x87_st(b);
         return 1;
     default:
@@ -13059,7 +13218,7 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
 /* Opens the run that starts at the current instruction: its extent, its guard. */
 static int x87_run_open(A64Buf *b, int idx)
 {
-    if (g_n_x87_run >= X87_RUN_MAX || g_n_x87_site + 2 > X87_SITE_MAX)
+    if (g_n_x87_run >= X87_RUN_MAX || g_n_x87_site + 2 > X87_SITE_MAX || g_n_x87_frag + 1 > X87_FRAG_MAX)
         return 0;
     if (!g_cur_blk || g_cur_blk->insns != g_cur_insns || !g_keep || idx >= g_keep_n)
         return 0;
@@ -13086,9 +13245,23 @@ static int x87_run_open(A64Buf *b, int idx)
         (void)a64_try_ands_imm(b, 0, A64_ZR, JT0, 0x6000);
         x87_slow_if(b, A64_NE);
     }
+    static int nolive = -1;
+    if (nolive < 0) nolive = ENV_ON("OCERZ_NO_X87_LIVE") ? 1 : 0;
+    g_x87_live = 0;
+    g_x87_delta = 0;
+    x87_know_reset();
+    if (!nolive) {
+        a64_ldr(b, 8, X87S, 20, X87_CTL_OFF);
+        a64_ubfx(b, 1, JT0, X87S, 40, 3);
+        a64_ldr(b, 2, JTT, 20, X87_TOP0_OFF);
+        a64_subs_reg(b, 0, A64_ZR, JT0, JTT, 0);
+        x87_frag_if(b, A64_NE, XF_TOP0, 0);
+        x87_frag_land(b);
+        g_x87_live = 1;
+    }
     if (need & X87R_FCW) {
-        a64_ldr(b, 2, JT0, 20, X87_CTL_OFF);
-        (void)a64_try_ands_imm(b, 0, A64_ZR, JT0, 0xc00);
+        if (!g_x87_live) a64_ldr(b, 2, JT0, 20, X87_CTL_OFF);
+        (void)a64_try_ands_imm(b, 0, A64_ZR, g_x87_live ? X87S : JT0, 0xc00);
         x87_slow_if(b, A64_NE);
     }
     return 1;
@@ -13101,6 +13274,7 @@ static int emit_x87(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **ex
         return 0;
     if (g_x87_cur < 0 || idx < g_x87_run[g_x87_cur].first || idx > g_x87_run[g_x87_cur].last) {
         g_x87_cur = -1;
+        g_x87_live = 0;
         if (!x87_run_open(b, idx))
             return 0;
     }
@@ -13115,8 +13289,15 @@ static int emit_x87(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **ex
         r->last = (int16_t)idx;
     }
     if (idx == r->last) {
+        if (g_x87_live && (g_x87_delta & 7)) {
+            a64_ldr(b, 2, JT0, 20, X87_TOP0_OFF);
+            a64_add_imm(b, 0, JT0, JT0, (uint32_t)(g_x87_delta & 7));
+            (void)a64_try_and_imm(b, 0, JT0, JT0, 7);
+            a64_str(b, 2, JT0, 20, X87_TOP0_OFF);
+        }
         r->back = a64_label(b);
         g_x87_cur = -1;
+        g_x87_live = 0;
     }
     return 1;
 }
@@ -17016,6 +17197,9 @@ static void x87_emit_frag(A64Buf *b, int f)
             a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
         }
         x87_slow_at(b, A64_NE, run, idx);
+        break;
+    case XF_TOP0:
+        a64_str(b, 2, JT0, 20, X87_TOP0_OFF);
         break;
     case XF_ST32:
         a64_fcmp(b, 1, VX0, VX0);
