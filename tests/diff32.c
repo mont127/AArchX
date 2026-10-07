@@ -48,13 +48,33 @@
  * different engines, and run_diff32.sh passes --jit-required: "the JIT
  * translated 0 blocks" is a FAILURE, because a future change that silently
  * went back to declining 32-bit blocks would otherwise turn this gate into a
- * second interpreter run that passes 100%.  --selftest injects a deliberate
+ * second interpreter run that passes 100%.  It also fails when fewer blocks
+ * were translated than sequences were run.  A translated block arms the page
+ * it came from (src/mem.c), so rewriting the code region for the next case
+ * faulted into the self-modifying-code path, which retires the blocks and
+ * counts the region toward the churn limit, and three cases later the region
+ * ran interpreted: from 2026-09-07 the 20000-case gate translated 516 blocks
+ * where it had translated 50970, and still passed.  load_case therefore
+ * retires every block and disarms before it writes.  The code arena is 2 MB,
+ * because retiring everything synchronises the instruction cache over all the
+ * code emitted since the last flush, which made a run quadratic in its length
+ * (117 s for the default gate in a 1 GB arena, 15 s in this one).
+ * --selftest injects a deliberate
  * one-field corruption into the JIT-side result for each class of compared
  * state and requires the comparator to catch every one, so a green run cannot
  * be a comparator that compares nothing.  --bug N answers the other half by
  * making the JIT side deliberately wrong in one realistic way.  The RNG is
  * splitmix64 so that a seed plus a case index reproduces a failing sequence
  * exactly, which is the whole point of seeding it.
+ *
+ * ---- memory layouts ----
+ * By default guest memory is an offset arena: a guest address plus
+ * ocerz_guest_base is the host address.  A WoW64 process is not laid out that
+ * way.  Wine runs with an identity arena and the low shadow window, so every
+ * 32-bit address lies below 12 GB and reaches the host through the window's
+ * translation, the guarded path in src/jit.c rather than the base add.  --low
+ * lays memory out the way Wine does, and run_diff32.sh runs the corpus in both
+ * layouts.
  *
  * ---- what it found ----
  * Pointed at a real 32-bit JIT for the first time, this gate caught: emit_lea()
@@ -1709,6 +1729,10 @@ static void load_case(const Case *c)
     uint8_t term[6] = { 0xff, 0x2d, 0, 0, 0, 0 };
     memcpy(term + 2, &fp, 4);
 
+    ocerz_jit_invalidate_all(&g_vm);
+    uint64_t pages[64];
+    while (ocerz_mem_disarm_all(pages, 64) == 64)
+        ;
     memset(code, 0xf4, (size_t)CODE32_LEN);
     memset(ocerz_g2h(LOW_CODE), 0xf4, (size_t)LOW_CODE_LEN);
     memcpy(code, c->code, c->len);
@@ -2028,9 +2052,12 @@ static int selftest(uint64_t seed)
     return bad;
 }
 
+static int g_low;
+
 static int setup_memory(void)
 {
-    if (ocerz_mem_init(ARENA_LO, ARENA_HI) != OCERZ_OK) {
+    if (g_low ? (ocerz_mem_init_identity(1ull << 30) != OCERZ_OK || ocerz_mem_init_low_shadow() != OCERZ_OK)
+              : ocerz_mem_init(ARENA_LO, ARENA_HI) != OCERZ_OK) {
         fprintf(stderr, "diff32: mem_init failed\n");
         return 0;
     }
@@ -2068,6 +2095,8 @@ static void usage(void)
            "  --jit-required    fail if the JIT translated no 32-bit blocks (the gate passes this)\n"
            "  --bug N           sensitivity probe: make the JIT side deliberately wrong\n"
            "                    (1 no-zeroext, 2 stale-zf, 3 cf-flip) and report the catch rate\n"
+           "  --low             lay guest memory out as a Wine process does: an identity\n"
+           "                    arena and the low shadow window the 32-bit code lives in\n"
            "  --verbose         print a line per random case as well\n");
 }
 
@@ -2086,6 +2115,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--selftest")) do_selftest = 1;
         else if (!strcmp(argv[i], "--jit-required")) jit_required = 1;
         else if (!strcmp(argv[i], "--verbose")) verbose = 1;
+        else if (!strcmp(argv[i], "--low")) g_low = 1;
         else if (!strcmp(argv[i], "--bug") && i + 1 < argc) g_bug = (int)strtol(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--list")) {
             for (int k = 0; k < NHANDS; k++) printf("hand/%s\n", HANDS[k].name);
@@ -2094,6 +2124,7 @@ int main(int argc, char **argv)
     }
 
     setenv("OCERZ_NO_UNSTICK", "1", 1);
+    setenv("OCERZ_JIT_CODE_MB", "2", 0);
 
     if (!setup_memory())
         return 2;
@@ -2192,6 +2223,11 @@ int main(int argc, char **argv)
                (unsigned long long)translated);
     if (jit_required && translated == 0) {
         printf("differential32: --jit-required and 0 blocks translated: FAIL\n");
+        return 1;
+    }
+    if (jit_required && translated < (uint64_t)(pass + fail)) {
+        printf("differential32: --jit-required and fewer blocks translated than sequences run:\n"
+               "                FAIL, the JIT side ran most sequences in the interpreter\n");
         return 1;
     }
     return fail ? 1 : 0;
