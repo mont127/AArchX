@@ -3472,23 +3472,67 @@ static int x87_mem(DecState *s, ModRM *m, int op, int size)
     return OCERZ_OK;
 }
 
+/* FLDENV, FNSTENV, FNSAVE and FRSTOR take the 16-bit image under a 66 prefix. */
+static int x87_env(DecState *s, ModRM *m, int op, int size16, int size32)
+{
+    return x87_mem(s, m, op, s->has_66 ? size16 : size32);
+}
+
+/* One register operand: the compares, loads, stores and exchanges with ST(i). */
+static int x87_st1(DecState *s, int op, int i)
+{
+    set_op(s, op);
+    s->out->opsize = 10;
+    s->out->nops = 1;
+    set_st(&s->out->ops[0], i);
+    return OCERZ_OK;
+}
+
+/* Destination first: arithmetic, FCMOVcc and FCOMI read ops[1] into ops[0]. */
+static int x87_st2(DecState *s, int op, int dst, int src)
+{
+    set_op(s, op);
+    s->out->opsize = 10;
+    s->out->nops = 2;
+    set_st(&s->out->ops[0], dst);
+    set_st(&s->out->ops[1], src);
+    return OCERZ_OK;
+}
+
+static int x87_bare(DecState *s, int op)
+{
+    set_op(s, op);
+    s->out->nops = 0;
+    return OCERZ_OK;
+}
+
+static const uint16_t x87_real_ops[8] = {
+    OCERZ_OP_FADD, OCERZ_OP_FMUL, OCERZ_OP_FCOM, OCERZ_OP_FCOMP,
+    OCERZ_OP_FSUB, OCERZ_OP_FSUBR, OCERZ_OP_FDIV, OCERZ_OP_FDIVR,
+};
+static const uint16_t x87_int_ops[8] = {
+    OCERZ_OP_FIADD, OCERZ_OP_FIMUL, OCERZ_OP_FICOM, OCERZ_OP_FICOMP,
+    OCERZ_OP_FISUB, OCERZ_OP_FISUBR, OCERZ_OP_FIDIV, OCERZ_OP_FIDIVR,
+};
+
+static int x87_fcmov(DecState *s, int idx, int i, int negate)
+{
+    static const uint8_t cc[4] = { OCERZ_CC_B, OCERZ_CC_E, OCERZ_CC_BE, OCERZ_CC_P };
+    static const uint8_t ncc[4] = { OCERZ_CC_AE, OCERZ_CC_NE, OCERZ_CC_A, OCERZ_CC_NP };
+    x87_st2(s, OCERZ_OP_FCMOVCC, 0, i);
+    s->out->cc = negate ? ncc[idx] : cc[idx];
+    return OCERZ_OK;
+}
+
 static int x87_d8(DecState *s, ModRM *m)
 {
     int idx = m->reg & 7;
-    if (!rm_is_reg(m)) {
-        int ops[8] = { OCERZ_OP_FADD, OCERZ_OP_FMUL, OCERZ_OP_FCOM, OCERZ_OP_FCOMP,
-                       OCERZ_OP_FSUB, OCERZ_OP_FSUBR, OCERZ_OP_FDIV, OCERZ_OP_FDIVR };
-        return x87_mem(s, m, ops[idx], 4);
-    }
+    if (!rm_is_reg(m))
+        return x87_mem(s, m, x87_real_ops[idx], 4);
     int i = m->rm & 7;
-    int ops[8] = { OCERZ_OP_FADD, OCERZ_OP_FMUL, OCERZ_OP_FCOM, OCERZ_OP_FCOMP,
-                   OCERZ_OP_FSUB, OCERZ_OP_FSUBR, OCERZ_OP_FDIV, OCERZ_OP_FDIVR };
-    set_op(s, ops[idx]);
-    s->out->opsize = 10;
-    s->out->nops = 2;
-    set_st(&s->out->ops[0], 0);
-    set_st(&s->out->ops[1], i);
-    return OCERZ_OK;
+    if (idx == 2 || idx == 3)
+        return x87_st1(s, x87_real_ops[idx], i);
+    return x87_st2(s, x87_real_ops[idx], 0, i);
 }
 
 static int x87_d9(DecState *s, ModRM *m)
@@ -3499,60 +3543,50 @@ static int x87_d9(DecState *s, ModRM *m)
         case 0: return x87_mem(s, m, OCERZ_OP_FLD, 4);
         case 2: return x87_mem(s, m, OCERZ_OP_FST, 4);
         case 3: return x87_mem(s, m, OCERZ_OP_FSTP, 4);
-        case 4: return x87_mem(s, m, OCERZ_OP_FLDENV, 0);
+        case 4: return x87_env(s, m, OCERZ_OP_FLDENV, 14, 28);
         case 5: return x87_mem(s, m, OCERZ_OP_FLDCW, 2);
-        case 6: return x87_mem(s, m, OCERZ_OP_FNSTENV, 0);
+        case 6: return x87_env(s, m, OCERZ_OP_FNSTENV, 14, 28);
         case 7: return x87_mem(s, m, OCERZ_OP_FNSTCW, 2);
         default: return OCERZ_EUNDEF;
         }
     }
     int i = m->rm & 7;
     uint8_t modrm = (uint8_t)(0xc0 | ((m->reg & 7) << 3) | (m->rm & 7));
-    if (idx == 0) {
-        set_op(s, OCERZ_OP_FLD);
-        s->out->opsize = 10;
-        s->out->nops = 1;
-        set_st(&s->out->ops[0], i);
-        return OCERZ_OK;
-    }
-    if (idx == 1) {
-        set_op(s, OCERZ_OP_FXCH);
-        s->out->opsize = 10;
-        s->out->nops = 1;
-        set_st(&s->out->ops[0], i);
-        return OCERZ_OK;
+    switch (idx) {
+    case 0: return x87_st1(s, OCERZ_OP_FLD, i);
+    case 1: return x87_st1(s, OCERZ_OP_FXCH, i);
+    case 3: return x87_st1(s, OCERZ_OP_FSTP, i);
+    default: break;
     }
     switch (modrm) {
-    case 0xd0:
-        set_op(s, OCERZ_OP_NOP);
-        s->out->nops = 0;
-        return OCERZ_OK;
-    case 0xe0: set_op(s, OCERZ_OP_FCHS); s->out->nops = 0; return OCERZ_OK;
-    case 0xe1: set_op(s, OCERZ_OP_FABS); s->out->nops = 0; return OCERZ_OK;
-    case 0xe4: set_op(s, OCERZ_OP_FTST); s->out->nops = 0; return OCERZ_OK;
-    case 0xe5: set_op(s, OCERZ_OP_FXCH); s->out->nops = 0; return OCERZ_OK;
-    case 0xe8: set_op(s, OCERZ_OP_FLD1); s->out->nops = 0; return OCERZ_OK;
-    case 0xe9: set_op(s, OCERZ_OP_FLDL2T); s->out->nops = 0; return OCERZ_OK;
-    case 0xea: set_op(s, OCERZ_OP_FLDL2E); s->out->nops = 0; return OCERZ_OK;
-    case 0xeb: set_op(s, OCERZ_OP_FLDPI); s->out->nops = 0; return OCERZ_OK;
-    case 0xec: set_op(s, OCERZ_OP_FLDLG2); s->out->nops = 0; return OCERZ_OK;
-    case 0xed: set_op(s, OCERZ_OP_FLDLN2); s->out->nops = 0; return OCERZ_OK;
-    case 0xee: set_op(s, OCERZ_OP_FLDZ); s->out->nops = 0; return OCERZ_OK;
-    case 0xf0: set_op(s, OCERZ_OP_F2XM1); s->out->nops = 0; return OCERZ_OK;
-    case 0xf1: set_op(s, OCERZ_OP_FYL2X); s->out->nops = 0; return OCERZ_OK;
-    case 0xf2: set_op(s, OCERZ_OP_FPTAN); s->out->nops = 0; return OCERZ_OK;
-    case 0xf3: set_op(s, OCERZ_OP_FPATAN); s->out->nops = 0; return OCERZ_OK;
-    case 0xf5: set_op(s, OCERZ_OP_FPREM1); s->out->nops = 0; return OCERZ_OK;
-    case 0xf6: set_op(s, OCERZ_OP_FDECSTP); s->out->nops = 0; return OCERZ_OK;
-    case 0xf7: set_op(s, OCERZ_OP_FINCSTP); s->out->nops = 0; return OCERZ_OK;
-    case 0xf8: set_op(s, OCERZ_OP_FPREM); s->out->nops = 0; return OCERZ_OK;
-    case 0xf9: set_op(s, OCERZ_OP_FYL2X); s->out->nops = 0; return OCERZ_OK;
-    case 0xfa: set_op(s, OCERZ_OP_FSQRT); s->out->nops = 0; return OCERZ_OK;
-    case 0xfb: set_op(s, OCERZ_OP_FSINCOS); s->out->nops = 0; return OCERZ_OK;
-    case 0xfc: set_op(s, OCERZ_OP_FRNDINT); s->out->nops = 0; return OCERZ_OK;
-    case 0xfd: set_op(s, OCERZ_OP_FSCALE); s->out->nops = 0; return OCERZ_OK;
-    case 0xfe: set_op(s, OCERZ_OP_FSIN); s->out->nops = 0; return OCERZ_OK;
-    case 0xff: set_op(s, OCERZ_OP_FCOS); s->out->nops = 0; return OCERZ_OK;
+    case 0xd0: return x87_bare(s, OCERZ_OP_NOP);
+    case 0xe0: return x87_bare(s, OCERZ_OP_FCHS);
+    case 0xe1: return x87_bare(s, OCERZ_OP_FABS);
+    case 0xe4: return x87_bare(s, OCERZ_OP_FTST);
+    case 0xe5: return x87_bare(s, OCERZ_OP_FXAM);
+    case 0xe8: return x87_bare(s, OCERZ_OP_FLD1);
+    case 0xe9: return x87_bare(s, OCERZ_OP_FLDL2T);
+    case 0xea: return x87_bare(s, OCERZ_OP_FLDL2E);
+    case 0xeb: return x87_bare(s, OCERZ_OP_FLDPI);
+    case 0xec: return x87_bare(s, OCERZ_OP_FLDLG2);
+    case 0xed: return x87_bare(s, OCERZ_OP_FLDLN2);
+    case 0xee: return x87_bare(s, OCERZ_OP_FLDZ);
+    case 0xf0: return x87_bare(s, OCERZ_OP_F2XM1);
+    case 0xf1: return x87_bare(s, OCERZ_OP_FYL2X);
+    case 0xf2: return x87_bare(s, OCERZ_OP_FPTAN);
+    case 0xf3: return x87_bare(s, OCERZ_OP_FPATAN);
+    case 0xf4: return x87_bare(s, OCERZ_OP_FXTRACT);
+    case 0xf5: return x87_bare(s, OCERZ_OP_FPREM1);
+    case 0xf6: return x87_bare(s, OCERZ_OP_FDECSTP);
+    case 0xf7: return x87_bare(s, OCERZ_OP_FINCSTP);
+    case 0xf8: return x87_bare(s, OCERZ_OP_FPREM);
+    case 0xf9: return x87_bare(s, OCERZ_OP_FYL2XP1);
+    case 0xfa: return x87_bare(s, OCERZ_OP_FSQRT);
+    case 0xfb: return x87_bare(s, OCERZ_OP_FSINCOS);
+    case 0xfc: return x87_bare(s, OCERZ_OP_FRNDINT);
+    case 0xfd: return x87_bare(s, OCERZ_OP_FSCALE);
+    case 0xfe: return x87_bare(s, OCERZ_OP_FSIN);
+    case 0xff: return x87_bare(s, OCERZ_OP_FCOS);
     default: return OCERZ_EUNDEF;
     }
 }
@@ -3560,33 +3594,15 @@ static int x87_d9(DecState *s, ModRM *m)
 static int x87_da(DecState *s, ModRM *m)
 {
     int idx = m->reg & 7;
-    if (!rm_is_reg(m)) {
-        int ops[8] = { OCERZ_OP_FIADD, OCERZ_OP_FIMUL, OCERZ_OP_FCOM, OCERZ_OP_FCOMP,
-                       OCERZ_OP_FISUB, OCERZ_OP_FISUBR, OCERZ_OP_FIDIV, OCERZ_OP_FIDIVR };
-        return x87_mem(s, m, ops[idx], 4);
-    }
+    if (!rm_is_reg(m))
+        return x87_mem(s, m, x87_int_ops[idx], 4);
     int i = m->rm & 7;
     uint8_t modrm = (uint8_t)(0xc0 | ((m->reg & 7) << 3) | (m->rm & 7));
-    if (modrm == 0xe9) {
-        set_op(s, OCERZ_OP_FUCOMPP);
-        s->out->nops = 0;
-        return OCERZ_OK;
-    }
-    int cc;
-    switch (idx) {
-    case 0: cc = OCERZ_CC_B; break;
-    case 1: cc = OCERZ_CC_E; break;
-    case 2: cc = OCERZ_CC_BE; break;
-    case 3: cc = OCERZ_CC_P; break;
-    default: return OCERZ_EUNDEF;
-    }
-    set_op(s, OCERZ_OP_FCMOVCC);
-    s->out->opsize = 10;
-    s->out->cc = (uint8_t)cc;
-    s->out->nops = 2;
-    set_st(&s->out->ops[0], 0);
-    set_st(&s->out->ops[1], i);
-    return OCERZ_OK;
+    if (modrm == 0xe9)
+        return x87_bare(s, OCERZ_OP_FUCOMPP);
+    if (idx < 4)
+        return x87_fcmov(s, idx, i, 0);
+    return OCERZ_EUNDEF;
 }
 
 static int x87_db(DecState *s, ModRM *m)
@@ -3595,6 +3611,7 @@ static int x87_db(DecState *s, ModRM *m)
     if (!rm_is_reg(m)) {
         switch (idx) {
         case 0: return x87_mem(s, m, OCERZ_OP_FILD, 4);
+        case 1: return x87_mem(s, m, OCERZ_OP_FISTTP, 4);
         case 2: return x87_mem(s, m, OCERZ_OP_FIST, 4);
         case 3: return x87_mem(s, m, OCERZ_OP_FISTP, 4);
         case 5: return x87_mem(s, m, OCERZ_OP_FLD, 10);
@@ -3604,54 +3621,36 @@ static int x87_db(DecState *s, ModRM *m)
     }
     int i = m->rm & 7;
     uint8_t modrm = (uint8_t)(0xc0 | ((m->reg & 7) << 3) | (m->rm & 7));
-    if (modrm == 0xe2) {
-        set_op(s, OCERZ_OP_FNCLEX);
-        s->out->nops = 0;
-        return OCERZ_OK;
+    switch (modrm) {
+    case 0xe0: case 0xe1: case 0xe4:
+        /* FNENI, FNDISI and FNSETPM: 8087 and 287 controls a 387 ignores. */
+        return x87_bare(s, OCERZ_OP_NOP);
+    case 0xe2: return x87_bare(s, OCERZ_OP_FNCLEX);
+    case 0xe3: return x87_bare(s, OCERZ_OP_FNINIT);
+    default: break;
     }
-    if (modrm == 0xe3) {
-        set_op(s, OCERZ_OP_FNINIT);
-        s->out->nops = 0;
-        return OCERZ_OK;
-    }
-    int cc = -1;
-    int op = OCERZ_OP_INVALID;
-    switch (idx) {
-    case 0: op = OCERZ_OP_FCMOVCC; cc = OCERZ_CC_AE; break;
-    case 1: op = OCERZ_OP_FCMOVCC; cc = OCERZ_CC_NE; break;
-    case 2: op = OCERZ_OP_FCMOVCC; cc = OCERZ_CC_A; break;
-    case 3: op = OCERZ_OP_FCMOVCC; cc = OCERZ_CC_NP; break;
-    case 5: op = OCERZ_OP_FUCOMI; break;
-    case 6: op = OCERZ_OP_FCOMI; break;
-    default: return OCERZ_EUNDEF;
-    }
-    set_op(s, op);
-    s->out->opsize = 10;
-    s->out->nops = 2;
-    if (cc >= 0)
-        s->out->cc = (uint8_t)cc;
-    set_st(&s->out->ops[0], 0);
-    set_st(&s->out->ops[1], i);
-    return OCERZ_OK;
+    if (idx < 4)
+        return x87_fcmov(s, idx, i, 1);
+    if (idx == 5)
+        return x87_st2(s, OCERZ_OP_FUCOMI, 0, i);
+    if (idx == 6)
+        return x87_st2(s, OCERZ_OP_FCOMI, 0, i);
+    return OCERZ_EUNDEF;
 }
 
 static int x87_dc(DecState *s, ModRM *m)
 {
+    static const uint16_t reg_ops[8] = {
+        OCERZ_OP_FADD, OCERZ_OP_FMUL, OCERZ_OP_FCOM, OCERZ_OP_FCOMP,
+        OCERZ_OP_FSUBR, OCERZ_OP_FSUB, OCERZ_OP_FDIVR, OCERZ_OP_FDIV,
+    };
     int idx = m->reg & 7;
-    if (!rm_is_reg(m)) {
-        int ops[8] = { OCERZ_OP_FADD, OCERZ_OP_FMUL, OCERZ_OP_FCOM, OCERZ_OP_FCOMP,
-                       OCERZ_OP_FSUB, OCERZ_OP_FSUBR, OCERZ_OP_FDIV, OCERZ_OP_FDIVR };
-        return x87_mem(s, m, ops[idx], 8);
-    }
+    if (!rm_is_reg(m))
+        return x87_mem(s, m, x87_real_ops[idx], 8);
     int i = m->rm & 7;
-    int ops[8] = { OCERZ_OP_FADD, OCERZ_OP_FMUL, OCERZ_OP_FCOM, OCERZ_OP_FCOMP,
-                   OCERZ_OP_FSUBR, OCERZ_OP_FSUB, OCERZ_OP_FDIVR, OCERZ_OP_FDIV };
-    set_op(s, ops[idx]);
-    s->out->opsize = 10;
-    s->out->nops = 2;
-    set_st(&s->out->ops[0], i);
-    set_st(&s->out->ops[1], 0);
-    return OCERZ_OK;
+    if (idx == 2 || idx == 3)
+        return x87_st1(s, reg_ops[idx], i);
+    return x87_st2(s, reg_ops[idx], i, 0);
 }
 
 static int x87_dd(DecState *s, ModRM *m)
@@ -3660,52 +3659,43 @@ static int x87_dd(DecState *s, ModRM *m)
     if (!rm_is_reg(m)) {
         switch (idx) {
         case 0: return x87_mem(s, m, OCERZ_OP_FLD, 8);
+        case 1: return x87_mem(s, m, OCERZ_OP_FISTTP, 8);
         case 2: return x87_mem(s, m, OCERZ_OP_FST, 8);
         case 3: return x87_mem(s, m, OCERZ_OP_FSTP, 8);
-        case 4: return x87_mem(s, m, OCERZ_OP_FNSTENV, 0);
-        case 6: return x87_mem(s, m, OCERZ_OP_FNSTENV, 0);
+        case 4: return x87_env(s, m, OCERZ_OP_FRSTOR, 94, 108);
+        case 6: return x87_env(s, m, OCERZ_OP_FNSAVE, 94, 108);
         case 7: return x87_mem(s, m, OCERZ_OP_FNSTSW, 2);
         default: return OCERZ_EUNDEF;
         }
     }
     int i = m->rm & 7;
     switch (idx) {
-    case 0: set_op(s, OCERZ_OP_FFREE); break;
-    case 2: set_op(s, OCERZ_OP_FST); break;
-    case 3: set_op(s, OCERZ_OP_FSTP); break;
-    case 4: set_op(s, OCERZ_OP_FUCOM); break;
-    case 5: set_op(s, OCERZ_OP_FUCOMP); break;
+    case 0: return x87_st1(s, OCERZ_OP_FFREE, i);
+    case 1: return x87_st1(s, OCERZ_OP_FXCH, i);
+    case 2: return x87_st1(s, OCERZ_OP_FST, i);
+    case 3: return x87_st1(s, OCERZ_OP_FSTP, i);
+    case 4: return x87_st1(s, OCERZ_OP_FUCOM, i);
+    case 5: return x87_st1(s, OCERZ_OP_FUCOMP, i);
     default: return OCERZ_EUNDEF;
     }
-    s->out->opsize = 10;
-    s->out->nops = 1;
-    set_st(&s->out->ops[0], i);
-    return OCERZ_OK;
 }
 
 static int x87_de(DecState *s, ModRM *m)
 {
+    static const uint16_t reg_ops[8] = {
+        OCERZ_OP_FADDP, OCERZ_OP_FMULP, OCERZ_OP_FCOMP, OCERZ_OP_FCOMP,
+        OCERZ_OP_FSUBRP, OCERZ_OP_FSUBP, OCERZ_OP_FDIVRP, OCERZ_OP_FDIVP,
+    };
     int idx = m->reg & 7;
-    if (!rm_is_reg(m)) {
-        int ops[8] = { OCERZ_OP_FIADD, OCERZ_OP_FIMUL, OCERZ_OP_FCOM, OCERZ_OP_FCOMP,
-                       OCERZ_OP_FISUB, OCERZ_OP_FISUBR, OCERZ_OP_FIDIV, OCERZ_OP_FIDIVR };
-        return x87_mem(s, m, ops[idx], 2);
-    }
+    if (!rm_is_reg(m))
+        return x87_mem(s, m, x87_int_ops[idx], 2);
     int i = m->rm & 7;
     uint8_t modrm = (uint8_t)(0xc0 | ((m->reg & 7) << 3) | (m->rm & 7));
-    if (modrm == 0xd9) {
-        set_op(s, OCERZ_OP_FCOMPP);
-        s->out->nops = 0;
-        return OCERZ_OK;
-    }
-    int ops[8] = { OCERZ_OP_FADDP, OCERZ_OP_FMULP, OCERZ_OP_FCOMP, OCERZ_OP_FCOMP,
-                   OCERZ_OP_FSUBRP, OCERZ_OP_FSUBP, OCERZ_OP_FDIVRP, OCERZ_OP_FDIVP };
-    set_op(s, ops[idx]);
-    s->out->opsize = 10;
-    s->out->nops = 2;
-    set_st(&s->out->ops[0], i);
-    set_st(&s->out->ops[1], 0);
-    return OCERZ_OK;
+    if (modrm == 0xd9)
+        return x87_bare(s, OCERZ_OP_FCOMPP);
+    if (idx == 2 || idx == 3)
+        return x87_st1(s, OCERZ_OP_FCOMP, i);
+    return x87_st2(s, reg_ops[idx], i, 0);
 }
 
 static int x87_df(DecState *s, ModRM *m)
@@ -3714,9 +3704,12 @@ static int x87_df(DecState *s, ModRM *m)
     if (!rm_is_reg(m)) {
         switch (idx) {
         case 0: return x87_mem(s, m, OCERZ_OP_FILD, 2);
+        case 1: return x87_mem(s, m, OCERZ_OP_FISTTP, 2);
         case 2: return x87_mem(s, m, OCERZ_OP_FIST, 2);
         case 3: return x87_mem(s, m, OCERZ_OP_FISTP, 2);
+        case 4: return x87_mem(s, m, OCERZ_OP_FBLD, 10);
         case 5: return x87_mem(s, m, OCERZ_OP_FILD, 8);
+        case 6: return x87_mem(s, m, OCERZ_OP_FBSTP, 10);
         case 7: return x87_mem(s, m, OCERZ_OP_FISTP, 8);
         default: return OCERZ_EUNDEF;
         }
@@ -3730,23 +3723,14 @@ static int x87_df(DecState *s, ModRM *m)
         set_reg(&s->out->ops[0], OCERZ_RAX, 2);
         return OCERZ_OK;
     }
-    if (idx == 5) {
-        set_op(s, OCERZ_OP_FUCOMIP);
-        s->out->opsize = 10;
-        s->out->nops = 2;
-        set_st(&s->out->ops[0], 0);
-        set_st(&s->out->ops[1], i);
-        return OCERZ_OK;
+    switch (idx) {
+    case 0: return x87_st1(s, OCERZ_OP_FFREEP, i);
+    case 1: return x87_st1(s, OCERZ_OP_FXCH, i);
+    case 2: case 3: return x87_st1(s, OCERZ_OP_FSTP, i);
+    case 5: return x87_st2(s, OCERZ_OP_FUCOMIP, 0, i);
+    case 6: return x87_st2(s, OCERZ_OP_FCOMIP, 0, i);
+    default: return OCERZ_EUNDEF;
     }
-    if (idx == 6) {
-        set_op(s, OCERZ_OP_FCOMIP);
-        s->out->opsize = 10;
-        s->out->nops = 2;
-        set_st(&s->out->ops[0], 0);
-        set_st(&s->out->ops[1], i);
-        return OCERZ_OK;
-    }
-    return OCERZ_EUNDEF;
 }
 
 static int decode_x87(DecState *s, uint8_t op)
@@ -3950,6 +3934,17 @@ static void init_op_names(void)
     op_names[OCERZ_OP_FINCSTP] = "fincstp";
     op_names[OCERZ_OP_FDECSTP] = "fdecstp";
     op_names[OCERZ_OP_FWAIT] = "fwait";
+    op_names[OCERZ_OP_FICOM] = "ficom";
+    op_names[OCERZ_OP_FICOMP] = "ficomp";
+    op_names[OCERZ_OP_FISTTP] = "fisttp";
+    op_names[OCERZ_OP_FBLD] = "fbld";
+    op_names[OCERZ_OP_FBSTP] = "fbstp";
+    op_names[OCERZ_OP_FXAM] = "fxam";
+    op_names[OCERZ_OP_FXTRACT] = "fxtract";
+    op_names[OCERZ_OP_FYL2XP1] = "fyl2xp1";
+    op_names[OCERZ_OP_FNSAVE] = "fnsave";
+    op_names[OCERZ_OP_FRSTOR] = "frstor";
+    op_names[OCERZ_OP_FFREEP] = "ffreep";
     op_names[OCERZ_OP_MOVUPS] = "movups";
     op_names[OCERZ_OP_MOVAPS] = "movaps";
     op_names[OCERZ_OP_MOVDQA] = "movdqa";

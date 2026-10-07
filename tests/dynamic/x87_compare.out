@@ -1,0 +1,678 @@
+fcom i=1 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=2 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=3 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=4 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=5 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=6 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=7 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcomp i=1 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=2 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=3 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=4 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=5 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=6 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=7 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucom i=1 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=2 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=3 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=4 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=5 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=6 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=7 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucomp i=1 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=2 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=3 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=4 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=5 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=6 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=7 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcompp i=1 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=2
+fucompp i=1 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=2
+fcom-noarg i=1 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=1 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=2 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=3 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=4 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=5 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=6 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=7 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcomp i=1 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=2 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=3 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=4 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=5 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=6 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=7 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucom i=1 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=2 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=3 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=4 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=5 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=6 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=7 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucomp i=1 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=2 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=3 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=4 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=5 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=6 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=7 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcompp i=1 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=2
+fucompp i=1 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=2
+fcom-noarg i=1 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=1 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=2 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=3 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=4 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=5 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=6 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=7 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcomp i=1 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=2 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=3 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=4 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=5 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=6 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=7 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucom i=1 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=2 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=3 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=4 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=5 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=6 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=7 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucomp i=1 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=2 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=3 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=4 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=5 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=6 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=7 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcompp i=1 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=2
+fucompp i=1 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=2
+fcom-noarg i=1 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=1 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=2 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=3 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=4 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=5 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=6 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=7 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcomp i=1 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=2 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=3 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=4 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=5 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=6 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=7 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fucom i=1 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=2 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=3 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=4 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=5 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=6 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=7 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucomp i=1 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=2 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=3 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=4 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=5 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=6 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=7 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fcompp i=1 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=2
+fucompp i=1 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=0 top=2
+fcom-noarg i=1 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=1 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=2 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=3 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=4 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=5 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=6 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=7 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcomp i=1 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=2 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=3 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=4 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=5 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=6 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fcomp i=7 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=1
+fucom i=1 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=2 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=3 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=4 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=5 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=6 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucom i=7 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=0
+fucomp i=1 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=2 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=3 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=4 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=5 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=6 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fucomp i=7 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=1
+fcompp i=1 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=2
+fucompp i=1 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=0 top=2
+fcom-noarg i=1 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcom i=1 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=2 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=3 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=4 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=5 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=6 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=7 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcomp i=1 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=2 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=3 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=4 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=5 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=6 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=7 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucom i=1 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=2 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=3 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=4 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=5 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=6 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=7 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fucomp i=1 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=2 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=3 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=4 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=5 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=6 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=7 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=1
+fcompp i=1 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=2
+fucompp i=1 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=2
+fcom-noarg i=1 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=1 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=2 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=3 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=4 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=5 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=6 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=7 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcomp i=1 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=2 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=3 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=4 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=5 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=6 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcomp i=7 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucom i=1 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=2 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=3 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=4 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=5 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=6 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucom i=7 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fucomp i=1 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=2 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=3 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=4 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=5 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=6 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fucomp i=7 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=1
+fcompp i=1 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=2
+fucompp i=1 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=2
+fcom-noarg i=1 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcom i=1 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=2 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=3 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=4 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=5 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=6 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcom i=7 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcomp i=1 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=2 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=3 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=4 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=5 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=6 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcomp i=7 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucom i=1 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=2 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=3 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=4 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=5 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=6 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucom i=7 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fucomp i=1 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=2 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=3 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=4 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=5 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=6 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fucomp i=7 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=1
+fcompp i=1 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=2
+fucompp i=1 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=2
+fcom-noarg i=1 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+group reg-compares end top=0
+fcoms i=0 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+fcomps i=0 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcoml i=0 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+fcompl i=0 less: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcoms i=0 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=7
+fcomps i=0 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcoml i=0 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=7
+fcompl i=0 equal: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcoms i=0 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+fcomps i=0 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcoml i=0 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+fcompl i=0 greater: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcoms i=0 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=7
+fcomps i=0 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcoml i=0 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=7
+fcompl i=0 unord-st0: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcoms i=0 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=7
+fcomps i=0 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcoml i=0 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=7
+fcompl i=0 unord-sti: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+fcoms i=0 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=7
+fcomps i=0 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcoml i=0 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=7
+fcompl i=0 zeros: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+fcoms i=0 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+fcomps i=0 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcoml i=0 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+fcompl i=0 -inf<inf: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+fcoms i=0 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+fcomps i=0 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+fcoml i=0 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+fcompl i=0 neg: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=1.5 b=2
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+a=1.5 b=-2
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=1.5 b=0
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=2 b=2
+ficoms i=0 int: C3=1 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=1 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=1 C2=0 C1=0 C0=0 ie=0 top=0
+a=2 b=-2
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=2 b=0
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=3 b=2
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=3 b=-2
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=3 b=0
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=2.5 b=2
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=2.5 b=-2
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=2.5 b=0
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=0 ie=0 top=0
+a=-3 b=2
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+a=-3 b=-2
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+a=-3 b=0
+ficoms i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+ficomps i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+ficoml i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+ficompl i=0 int: C3=0 C2=0 C1=0 C0=1 ie=0 top=0
+ficoms i=0 nan: C3=1 C2=1 C1=0 C0=1 ie=1 top=7
+ficompl i=0 nan: C3=1 C2=1 C1=0 C0=1 ie=1 top=0
+group mem-compares end top=0
+in=bff0000000000000 ftst i=0 ftst: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+in=0000000000000000 ftst i=0 ftst: C3=1 C2=0 C1=0 C0=0 ie=0 top=7
+in=8000000000000000 ftst i=0 ftst: C3=1 C2=0 C1=0 C0=0 ie=0 top=7
+in=3ff0000000000000 ftst i=0 ftst: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+in=7ff8000000000001 ftst i=0 ftst: C3=1 C2=1 C1=0 C0=1 ie=1 top=7
+in=7ff0000000000000 ftst i=0 ftst: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+in=fff0000000000000 ftst i=0 ftst: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+in=0000000000000001 ftst i=0 ftst: C3=0 C2=0 C1=0 C0=0 ie=0 top=7
+in=8000000000000001 ftst i=0 ftst: C3=0 C2=0 C1=0 C0=1 ie=0 top=7
+group ftst end top=0
+fcomi i=1 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=2 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=3 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=4 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=5 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=6 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=7 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomip i=1 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=2 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=3 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=4 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=5 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=6 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=7 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomi i=1 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=2 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=3 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=4 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=5 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=6 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=7 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomip i=1 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=2 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=3 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=4 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=5 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=6 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=7 less: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomi i=1 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=2 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=3 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=4 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=5 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=6 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=7 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomip i=1 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=2 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=3 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=4 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=5 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=6 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=7 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomi i=1 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=2 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=3 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=4 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=5 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=6 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=7 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomip i=1 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=2 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=3 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=4 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=5 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=6 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=7 equal: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomi i=1 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=2 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=3 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=4 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=5 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=6 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=7 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomip i=1 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=2 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=3 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=4 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=5 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=6 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=7 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomi i=1 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=2 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=3 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=4 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=5 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=6 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=7 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomip i=1 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=2 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=3 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=4 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=5 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=6 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=7 greater: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomi i=1 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=2 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=3 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=4 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=5 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=6 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=7 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomip i=1 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=2 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=3 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=4 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=5 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=6 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=7 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fucomi i=1 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=2 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=3 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=4 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=5 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=6 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=7 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomip i=1 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=2 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=3 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=4 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=5 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=6 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=7 unord-st0: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomi i=1 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=2 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=3 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=4 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=5 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=6 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomi i=7 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=1,1
+fcomip i=1 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=2 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=3 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=4 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=5 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=6 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fcomip i=7 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=1,1
+fucomi i=1 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=2 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=3 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=4 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=5 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=6 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=7 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomip i=1 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=2 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=3 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=4 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=5 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=6 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=7 unord-sti: from-set ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=1 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomi i=1 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=2 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=3 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=4 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=5 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=6 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=7 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomip i=1 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=2 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=3 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=4 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=5 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=6 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=7 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomi i=1 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=2 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=3 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=4 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=5 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=6 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=7 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomip i=1 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=2 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=3 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=4 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=5 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=6 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=7 zeros: from-set ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=1 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomi i=1 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=2 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=3 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=4 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=5 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=6 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=7 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomip i=1 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=2 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=3 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=4 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=5 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=6 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=7 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomi i=1 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=2 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=3 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=4 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=5 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=6 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=7 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomip i=1 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=2 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=3 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=4 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=5 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=6 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=7 -inf<inf: from-set ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=1 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomi i=1 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=2 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=3 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=4 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=5 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=6 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomi i=7 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fcomip i=1 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=2 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=3 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=4 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=5 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=6 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fcomip i=7 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomi i=1 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=2 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=3 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=4 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=5 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=6 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomi i=7 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=0,0 ie=0,0
+fucomip i=1 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=2 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=3 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=4 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=5 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=6 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+fucomip i=7 neg: from-set ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | from-clear ZF=0 PF=0 CF=0 OF=0 SF=0 AF=0 | top=1,1 ie=0,0
+group comi end top=0
+fcmovb st(1) [none CF PF ZF all]: .T..T
+fcmovb st(2) [none CF PF ZF all]: .T..T
+fcmovb st(3) [none CF PF ZF all]: .T..T
+fcmovb st(4) [none CF PF ZF all]: .T..T
+fcmovb st(5) [none CF PF ZF all]: .T..T
+fcmovb st(6) [none CF PF ZF all]: .T..T
+fcmovb st(7) [none CF PF ZF all]: .T..T
+fcmove st(1) [none CF PF ZF all]: ...TT
+fcmove st(2) [none CF PF ZF all]: ...TT
+fcmove st(3) [none CF PF ZF all]: ...TT
+fcmove st(4) [none CF PF ZF all]: ...TT
+fcmove st(5) [none CF PF ZF all]: ...TT
+fcmove st(6) [none CF PF ZF all]: ...TT
+fcmove st(7) [none CF PF ZF all]: ...TT
+fcmovbe st(1) [none CF PF ZF all]: .T.TT
+fcmovbe st(2) [none CF PF ZF all]: .T.TT
+fcmovbe st(3) [none CF PF ZF all]: .T.TT
+fcmovbe st(4) [none CF PF ZF all]: .T.TT
+fcmovbe st(5) [none CF PF ZF all]: .T.TT
+fcmovbe st(6) [none CF PF ZF all]: .T.TT
+fcmovbe st(7) [none CF PF ZF all]: .T.TT
+fcmovu st(1) [none CF PF ZF all]: ..T.T
+fcmovu st(2) [none CF PF ZF all]: ..T.T
+fcmovu st(3) [none CF PF ZF all]: ..T.T
+fcmovu st(4) [none CF PF ZF all]: ..T.T
+fcmovu st(5) [none CF PF ZF all]: ..T.T
+fcmovu st(6) [none CF PF ZF all]: ..T.T
+fcmovu st(7) [none CF PF ZF all]: ..T.T
+fcmovnb st(1) [none CF PF ZF all]: T.TT.
+fcmovnb st(2) [none CF PF ZF all]: T.TT.
+fcmovnb st(3) [none CF PF ZF all]: T.TT.
+fcmovnb st(4) [none CF PF ZF all]: T.TT.
+fcmovnb st(5) [none CF PF ZF all]: T.TT.
+fcmovnb st(6) [none CF PF ZF all]: T.TT.
+fcmovnb st(7) [none CF PF ZF all]: T.TT.
+fcmovne st(1) [none CF PF ZF all]: TTT..
+fcmovne st(2) [none CF PF ZF all]: TTT..
+fcmovne st(3) [none CF PF ZF all]: TTT..
+fcmovne st(4) [none CF PF ZF all]: TTT..
+fcmovne st(5) [none CF PF ZF all]: TTT..
+fcmovne st(6) [none CF PF ZF all]: TTT..
+fcmovne st(7) [none CF PF ZF all]: TTT..
+fcmovnbe st(1) [none CF PF ZF all]: T.T..
+fcmovnbe st(2) [none CF PF ZF all]: T.T..
+fcmovnbe st(3) [none CF PF ZF all]: T.T..
+fcmovnbe st(4) [none CF PF ZF all]: T.T..
+fcmovnbe st(5) [none CF PF ZF all]: T.T..
+fcmovnbe st(6) [none CF PF ZF all]: T.T..
+fcmovnbe st(7) [none CF PF ZF all]: T.T..
+fcmovnu st(1) [none CF PF ZF all]: TT.T.
+fcmovnu st(2) [none CF PF ZF all]: TT.T.
+fcmovnu st(3) [none CF PF ZF all]: TT.T.
+fcmovnu st(4) [none CF PF ZF all]: TT.T.
+fcmovnu st(5) [none CF PF ZF all]: TT.T.
+fcmovnu st(6) [none CF PF ZF all]: TT.T.
+fcmovnu st(7) [none CF PF ZF all]: TT.T.
+group cmov end top=0
+fxam +normal 1.5                        C3=0 C2=1 C1=0 C0=0 top=7
+fxam -normal -1.5                       C3=0 C2=1 C1=1 C0=0 top=7
+fxam +zero                              C3=1 C2=0 C1=0 C0=0 top=7
+fxam -zero                              C3=1 C2=0 C1=1 C0=0 top=7
+fxam +inf                               C3=0 C2=1 C1=0 C0=1 top=7
+fxam -inf                               C3=0 C2=1 C1=1 C0=1 top=7
+fxam +qnan                              C3=0 C2=0 C1=0 C0=1 top=7
+fxam -qnan                              C3=0 C2=0 C1=1 C0=1 top=7
+fxam +double-denormal (loads as normal) C3=0 C2=1 C1=0 C0=0 top=7
+fxam -double-denormal (loads as normal) C3=0 C2=1 C1=1 C0=0 top=7
+fxam +largest double                    C3=0 C2=1 C1=0 C0=0 top=7
+fxam +snan (m80)                        C3=0 C2=0 C1=0 C0=1 top=7
+fxam -snan (m80)                        C3=0 C2=0 C1=1 C0=1 top=7
+fxam +80-bit denormal exp=0 m=1         C3=1 C2=1 C1=0 C0=0 top=7
+fxam -80-bit denormal exp=0 m=1         C3=1 C2=1 C1=1 C0=0 top=7
+fxam +80-bit denormal exp=0 m=2^62      C3=1 C2=1 C1=0 C0=0 top=7
+fxam +80-bit normal exp=1 (smallest)    C3=0 C2=1 C1=0 C0=0 top=7
+fxam +80-bit normal exp=7ffe (largest)  C3=0 C2=1 C1=0 C0=0 top=7
+fxam +80-bit infinity                   C3=0 C2=1 C1=0 C0=1 top=7
+fxam +80-bit zero                       C3=1 C2=0 C1=0 C0=0 top=7
+fxam -80-bit zero                       C3=1 C2=0 C1=1 C0=0 top=7
+fxam empty after fninit                 C3=1 C2=0 C1=1 C0=1 top=0
+fxam empty after ffree (was +1.5)       C3=1 C2=0 C1=0 C0=1 top=7
+fxam empty after ffree (was -1.5)       C3=1 C2=0 C1=1 C0=1 top=7
+fxam empty after fld+fstp               C3=1 C2=0 C1=1 C0=1 top=0
+fxam keeps stack: st0=1.5 top=0
+group fxam end top=0

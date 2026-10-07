@@ -164,7 +164,8 @@ each gate proves and lists the component suites.
   (`make guest-swift`), but not yet the system frameworks' Swift APIs; it has
   no bridge for WebKit or GameKit, and stops with a named message on any call it
   cannot make.
-- x87 arithmetic uses 64-bit doubles rather than 80-bit precision, MMX always
+- x87 arithmetic computes in 64-bit doubles rather than 80-bit precision
+  (loads and stores stay exact), MMX always
   runs in the interpreter, and a few AVX2 forms do as well.
 - Large applications start several times slower than under Rosetta.
 

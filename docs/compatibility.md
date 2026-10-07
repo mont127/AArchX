@@ -328,7 +328,11 @@ These apply to cache mode, or to both modes. Native mode's own are in
   all of these the way dyld does.
 - `proc_pidpath` and `proc_name` name the guest executable only when a process
   asks about itself in cache mode; other AArchX processes appear as `ocerz`.
-- x87 uses 64-bit doubles rather than 80-bit extended precision.
+- x87 arithmetic computes in 64-bit doubles rather than 80-bit extended
+  precision, as rosettax87_jit does. A value loaded from memory keeps its exact
+  80-bit image until it is changed, so 64-bit integers (`fild`/`fistp qword`),
+  `long double` copies, denormals and NaN payloads pass through loads, stores,
+  `FNSAVE` and `FXSAVE` bit for bit. Unmasked x87 exceptions do not trap.
 - The JIT translates most VEX code: AVX2 integer, move and broadcast
   instructions, FMA, 256-bit packed arithmetic, the variable blends, `rorx`,
   `shlx`, `shrx`, `sarx`, `mulx`, `andn`, and `blsr`, `blsmsk`, `blsi` and

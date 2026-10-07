@@ -1,0 +1,160 @@
+top after fninit: 0
+top after push 1: 7 fsw=3800
+top after push 2: 6 fsw=3000
+top after push 3: 5 fsw=2800
+top after push 4: 4 fsw=2000
+top after push 5: 3 fsw=1800
+top after push 6: 2 fsw=1000
+top after push 7: 1 fsw=0800
+top after push 8: 0 fsw=0000
+top after pop 1: 1 fsw=0800
+top after pop 2: 2 fsw=1000
+top after pop 3: 3 fsw=1800
+top after pop 4: 4 fsw=2000
+top after pop 5: 5 fsw=2800
+top after pop 6: 6 fsw=3000
+top after pop 7: 7 fsw=3800
+top after pop 8: 0 fsw=0000
+group top end top=0
+fldcw 037f -> fnstcw 037f
+fldcw 027f -> fnstcw 027f
+fldcw 0c7f -> fnstcw 0c7f
+fldcw 0f7f -> fnstcw 0f7f
+fldcw 0000 -> fnstcw 0040
+fldcw 003f -> fnstcw 007f
+fldcw 0340 -> fnstcw 0340
+fldcw 0b3f -> fnstcw 0b7f
+fldcw 077f -> fnstcw 077f
+fldcw 1f7f -> fnstcw 1f7f
+after fninit cw=037f
+group cw end top=0
+env after fninit: fcw=037f fsw=0000 ftw=ffff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+env, 3 pushed (top=5): fcw=037f fsw=2800 ftw=03ff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+env, 1 pushed (top=7): fcw=037f fsw=3800 ftw=3fff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+env, 8 pushed (top=0): fcw=037f fsw=0000 ftw=0000 fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+env, normal/zero/inf/nan/denormal (top=3): fcw=037f fsw=1800 ftw=1abf fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+env after sqrt(-1): fcw=037f fsw=3801 ftw=bfff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+env after 1/0: fcw=037f fsw=3804 ftw=bfff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+env after 1/3: fcw=037f fsw=3820 ftw=3fff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+env after fcompp (st0 < st1, C0 set): fcw=037f fsw=0100 ftw=ffff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+fcw=0300: image fcw=0340, fcw after fnstenv=0340
+fcw=0000: image fcw=0040, fcw after fnstenv=0040
+fcw=0c00: image fcw=0c40, fcw after fnstenv=0c40
+fcw=0340: image fcw=0340, fcw after fnstenv=0340
+fcw=037f: image fcw=037f, fcw after fnstenv=037f
+saved : fcw=037f fsw=1800 ftw=1abf fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+reload: fcw=037f fsw=1800 ftw=1abf fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+fldenv round trip: images equal, fsw=1800 top=3 fcw=037f
+custom fldenv fcw=0c7f fsw=1800 ftw=ffff -> fnstsw=1800 fnstcw=0c7f env fcw=0c7f fsw=1800
+custom fldenv fcw=037f fsw=4700 ftw=ffff -> fnstsw=4700 fnstcw=037f env fcw=037f fsw=4700
+custom fldenv fcw=027f fsw=3800 ftw=ffff -> fnstsw=3800 fnstcw=027f env fcw=027f fsw=3800
+custom fldenv fcw=037f fsw=0000 ftw=fffc -> fnstsw=0000 fnstcw=037f env fcw=037f fsw=0000
+custom fldenv fcw=0f7f fsw=2000 ftw=03ff -> fnstsw=2000 fnstcw=0f7f env fcw=0f7f fsw=2000
+push after fldenv(top=3): top=2
+group env end top=0
+fnsave top=5 env: 7f030000 00280000 ff030000 00000000 00000000 00000000 00000000
+fnsave top=5 st(0): 00000000 00000088 0140
+fnsave top=5 st(1): 00000000 00000080 00c0
+fnsave top=5 st(2): 00000000 000000c0 ff3f
+fnsave top=5 st(3): (empty)
+fnsave top=5 st(4): (empty)
+fnsave top=5 st(5): (empty)
+fnsave top=5 st(6): (empty)
+fnsave top=5 st(7): (empty)
+after fnsave: fsw=0000 fcw=037f
+env after fnsave: fcw=037f fsw=0000 ftw=ffff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+frstor: fsw=2800 top=5 fcw=037f st0=4.25 st1=-2 st2=1.5 fsw after pops=0000
+env after frstor+3 pops: fcw=037f fsw=0000 ftw=ffff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+fnsave mixed env: 7f030000 00180000 bf1a0000 00000000 00000000 00000000 00000000
+fnsave mixed st(0): 01000000 00000000 0000
+fnsave mixed st(1): 00080000 000000c0 ff7f
+fnsave mixed st(2): 00000000 00000080 ff7f
+fnsave mixed st(3): 00000000 00000000 0000
+fnsave mixed st(4): 00000000 000000c0 ff3f
+fnsave mixed st(5): (empty)
+fnsave mixed st(6): (empty)
+fnsave mixed st(7): (empty)
+fnsave full env: 7f030000 00000000 00000000 00000000 00000000 00000000 00000000
+fnsave full st(0): 00000000 00000080 0240
+fnsave full st(1): 00000000 000000e0 0140
+fnsave full st(2): 00000000 000000c0 0140
+fnsave full st(3): 00000000 000000a0 0140
+fnsave full st(4): 00000000 00000080 0140
+fnsave full st(5): 00000000 000000c0 0040
+fnsave full st(6): 00000000 00000080 0040
+fnsave full st(7): 00000000 00000080 ff3f
+fnsave empty env: 7f030000 00000000 ffff0000 00000000 00000000 00000000 00000000
+fnsave empty st(0): (empty)
+fnsave empty st(1): (empty)
+fnsave empty st(2): (empty)
+fnsave empty st(3): (empty)
+fnsave empty st(4): (empty)
+fnsave empty st(5): (empty)
+fnsave empty st(6): (empty)
+fnsave empty st(7): (empty)
+frstor full: 8 7 6 5 4 3 2 1
+group save end top=0
+fxsave top=5: fcw=037f fsw=2800 ftw8=e0 rsv=00 fop=0000 ptrs=masked mxcsr=00001f80(sticky bits masked) mxcsr_mask=0000ffff
+fxsave top=5 st(0): 00000000 00000088 0140
+fxsave top=5 st(1): 00000000 00000080 00c0
+fxsave top=5 st(2): 00000000 000000c0 ff3f
+fxsave top=5 st(3): (empty)
+fxsave top=5 st(4): (empty)
+fxsave top=5 st(5): (empty)
+fxsave top=5 st(6): (empty)
+fxsave top=5 st(7): (empty)
+fxrstor: fsw=2800 top=5 st0=4.25 st1=-2 st2=1.5
+fxsave after fxrstor: fcw/fsw/ftw/ST images equal
+fxsave mixed: fcw=037f fsw=1800 ftw8=f8 rsv=00 fop=0000 ptrs=masked mxcsr=00001f80(sticky bits masked) mxcsr_mask=0000ffff
+fxsave mixed st(0): 01000000 00000000 0000
+fxsave mixed st(1): 00080000 000000c0 ff7f
+fxsave mixed st(2): 00000000 00000080 ff7f
+fxsave mixed st(3): 00000000 00000000 0000
+fxsave mixed st(4): 00000000 000000c0 ff3f
+fxsave mixed st(5): (empty)
+fxsave mixed st(6): (empty)
+fxsave mixed st(7): (empty)
+fxsave empty: fcw=037f fsw=0000 ftw8=00 rsv=00 fop=0000 ptrs=masked mxcsr=00001f80(sticky bits masked) mxcsr_mask=0000ffff
+fxsave empty st(0): (empty)
+fxsave empty st(1): (empty)
+fxsave empty st(2): (empty)
+fxsave empty st(3): (empty)
+fxsave empty st(4): (empty)
+fxsave empty st(5): (empty)
+fxsave empty st(6): (empty)
+fxsave empty st(7): (empty)
+fxsave full: fcw=037f fsw=0000 ftw8=ff rsv=00 fop=0000 ptrs=masked mxcsr=00001f80(sticky bits masked) mxcsr_mask=0000ffff
+fxsave full st(0): 00000000 00000080 0240
+fxsave full st(1): 00000000 000000e0 0140
+fxsave full st(2): 00000000 000000c0 0140
+fxsave full st(3): 00000000 000000a0 0140
+fxsave full st(4): 00000000 00000080 0140
+fxsave full st(5): 00000000 000000c0 0040
+fxsave full st(6): 00000000 00000080 0040
+fxsave full st(7): 00000000 00000080 ff3f
+fxrstor custom fcw=077f: fsw=2800 fcw=077f st0=4.25 st1=-2
+env: fcw=077f fsw=2800 ftw=0000 fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+group fxsave end top=0
+3 pushed     fsw=2800 top=5 ftw=03ff
+ffree st(1)  fsw=2800 top=5 ftw=33ff
+ffree st(0)  fsw=2800 top=5 ftw=3fff
+fincstp      fsw=3000 top=6 ftw=3fff
+fincstp      fsw=3800 top=7 ftw=3fff
+fdecstp      fsw=3000 top=6 ftw=3fff
+fdecstp      fsw=2800 top=5 ftw=3fff
+fdecstp      fsw=2000 top=4 ftw=3fff
+ffree st(2)      fsw=2800 top=5 ftw=c3ff
+ffree st(1)      fsw=2800 top=5 ftw=f3ff
+ffree st(0)      fsw=2800 top=5 ftw=ffff
+push again       fsw=2000 top=4 ftw=fcff
+8x fincstp       fsw=3800 top=7 ftw=3fff
+2x fdecstp       fsw=2800 top=5 ftw=3fff
+fdecstp (empty)  fsw=3800 top=7 ftw=ffff
+push+fincstp     fsw=3800 top=7 ftw=cfff
+group stack-ops end top=0
+dirty before fninit: fsw=7505 fcw=0c7f; after fninit: fsw=0000 fcw=037f
+env after dirty fninit: fcw=037f fsw=0000 ftw=ffff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+push after fninit: top=7
+fnclex: before fsw=7505 after fsw=7500 again fsw=7500; 1/3 sets fsw=6d20
+env after sqrt(-1)+fnclex: fcw=037f fsw=3800 ftw=bfff fip=00000000 fcs/op=00000000 fdp=00000000 fds=00000000 (pads 0000 0000 0000)
+group init-clex end top=0

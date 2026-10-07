@@ -112,6 +112,9 @@ typedef struct OcerzCPU {
     uint8_t ftw;
     uint8_t ftop;
     double fpr[8];
+    uint64_t fpr_xm[8];
+    uint16_t fpr_xe[8];
+    uint8_t fpr_x_ok;
     struct OcerzVM *vm;
     int terminated;
     int interp_once;
