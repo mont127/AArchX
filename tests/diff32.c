@@ -76,6 +76,12 @@
  * lays memory out the way Wine does, and run_diff32.sh runs the corpus in both
  * layouts.
  *
+ * --bench is not part of the gate.  It times a few loops of the shapes 32-bit
+ * Windows code is made of - an SEH frame pushed and popped through fs:[0],
+ * TEB and TLS reads, the interlocked operations, bit tests, arithmetic on
+ * memory - under the JIT in either layout, which is how a slow call is
+ * measured against the inlined form that replaces it.
+ *
  * ---- what it found ----
  * Pointed at a real 32-bit JIT for the first time, this gate caught: emit_lea()
  * truncating an effective address at 4 GB with no case for 16-bit addressing;
@@ -107,6 +113,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 
 #define ARENA_LO     0x00000000ull
 #define ARENA_HI     0x00000000c0000000ull
@@ -166,6 +173,7 @@ typedef struct {
     uint64_t gpr[16];
     uint64_t rflags;
     uint64_t memseed;
+    uint64_t fs_base, gs_base;
     struct { uint64_t addr; uint8_t bytes[40]; size_t len; } plant[NPLANT];
     int      nplant;
 } Case;
@@ -1756,6 +1764,8 @@ static void run_side(const Case *c, int use_jit, Snap *s)
     for (int i = 0; i < 16; i++)
         cpu->gpr[i] = c->gpr[i];
     cpu->rflags = c->rflags;
+    cpu->fs_base = c->fs_base;
+    cpu->gs_base = c->gs_base;
     cpu->mode32 = 1;
     cpu->cs_sel = (uint16_t)CS32;
     cpu->seg_sel[OCERZ_SREG_CS] = (uint16_t)CS32;
@@ -2083,6 +2093,156 @@ static int setup_memory(void)
     return 1;
 }
 
+
+#define TEB         (SCRATCH_MID + 0x600)
+
+static void kb_base(Gen *g)
+{
+    eb(g, 0x01); eb(g, 0xd8);
+}
+
+static void kb_seh(Gen *g)
+{
+    eb(g, 0x68); ed(g, 0x00401000u);
+    eb(g, 0x64); eb(g, 0xff); eb(g, 0x35); ed(g, 0);
+    eb(g, 0x64); eb(g, 0x89); eb(g, 0x25); ed(g, 0);
+    eb(g, 0x8b); eb(g, 0x04); eb(g, 0x24);
+    eb(g, 0x64); eb(g, 0xa3); ed(g, 0);
+    eb(g, 0x83); eb(g, 0xc4); eb(g, 0x08);
+}
+
+static void kb_teb(Gen *g)
+{
+    eb(g, 0x64); eb(g, 0xa1); ed(g, 0x18);
+    eb(g, 0x8b); eb(g, 0x50); eb(g, 0x2c);
+    eb(g, 0x64); eb(g, 0x8b); eb(g, 0x1d); ed(g, 0x2c);
+    eb(g, 0x8b); eb(g, 0x1b);
+}
+
+static void kb_xadd(Gen *g)
+{
+    eb(g, 0xb8); ed(g, 1);
+    eb(g, 0xf0); eb(g, 0x0f); eb(g, 0xc1); eb(g, 0x45); eb(g, 0x10);
+}
+
+static void kb_cmpxchg(Gen *g)
+{
+    eb(g, 0x31); eb(g, 0xc0);
+    eb(g, 0xba); ed(g, 1);
+    eb(g, 0xf0); eb(g, 0x0f); eb(g, 0xb1); eb(g, 0x55); eb(g, 0x20);
+    eb(g, 0xc7); eb(g, 0x45); eb(g, 0x20); ed(g, 0);
+}
+
+static void kb_xchg(Gen *g)
+{
+    eb(g, 0x89); eb(g, 0xf8);
+    eb(g, 0x87); eb(g, 0x45); eb(g, 0x30);
+}
+
+static void kb_cx8(Gen *g)
+{
+    eb(g, 0x8b); eb(g, 0x45); eb(g, 0x40);
+    eb(g, 0x8b); eb(g, 0x55); eb(g, 0x44);
+    eb(g, 0x8d); eb(g, 0x58); eb(g, 0x01);
+    eb(g, 0x89); eb(g, 0xd1);
+    eb(g, 0xf0); eb(g, 0x0f); eb(g, 0xc7); eb(g, 0x4d); eb(g, 0x40);
+}
+
+static void kb_bt(Gen *g)
+{
+    eb(g, 0x0f); eb(g, 0xba); eb(g, 0xe0); eb(g, 0x03);
+    eb(g, 0x0f); eb(g, 0xab); eb(g, 0xfa);
+    eb(g, 0x0f); eb(g, 0xba); eb(g, 0xf2); eb(g, 0x05);
+}
+
+static void kb_rmw(Gen *g)
+{
+    eb(g, 0x01); eb(g, 0x45); eb(g, 0x50);
+    eb(g, 0xff); eb(g, 0x45); eb(g, 0x54);
+    eb(g, 0x83); eb(g, 0x4d); eb(g, 0x58); eb(g, 0x01);
+}
+
+static const struct { const char *name; void (*fn)(Gen *); const char *what; } KERNELS[] = {
+    { "base",      kb_base,    "add eax, ebx" },
+    { "seh",       kb_seh,     "push handler; push fs:[0]; mov fs:[0], esp; ...; mov fs:[0], eax; add esp, 8" },
+    { "teb",       kb_teb,     "mov eax, fs:[0x18]; mov edx, [eax+0x2c]; mov ebx, fs:[0x2c]; mov ebx, [ebx]" },
+    { "xadd",      kb_xadd,    "mov eax, 1; lock xadd [ebp+0x10], eax" },
+    { "cmpxchg",   kb_cmpxchg, "xor eax, eax; mov edx, 1; lock cmpxchg [ebp+0x20], edx; mov dword [ebp+0x20], 0" },
+    { "xchg",      kb_xchg,    "mov eax, edi; xchg [ebp+0x30], eax" },
+    { "cmpxchg8b", kb_cx8,     "mov eax/edx, [ebp+0x40/0x44]; lea ebx, [eax+1]; mov ecx, edx; lock cmpxchg8b [ebp+0x40]" },
+    { "bt",        kb_bt,      "bt eax, 3; bts edx, edi; btr edx, 5" },
+    { "rmw",       kb_rmw,     "add [ebp+0x50], eax; inc dword [ebp+0x54]; or dword [ebp+0x58], 1" },
+};
+#define NKERNELS ((int)(sizeof KERNELS / sizeof KERNELS[0]))
+
+static void gen_kernel(Case *c, int k, uint32_t iters)
+{
+    Gen g;
+    memset(c, 0, sizeof *c);
+    snprintf(c->name, sizeof c->name, "bench/%s", KERNELS[k].name);
+    g.c = c;
+    g.rng = 1;
+    g.depth = 0;
+    mov32(&g, OCERZ_RDI, iters);
+    size_t top = c->len;
+    KERNELS[k].fn(&g);
+    eb(&g, 0x4f);
+    eb(&g, 0x0f); eb(&g, 0x85);
+    ed(&g, (uint32_t)((int64_t)top - (int64_t)(c->len + 4)));
+    c->gpr[OCERZ_RSP] = ESP0;
+    c->gpr[OCERZ_RBP] = SCRATCH_MID;
+    c->rflags = OCERZ_FLAG_FIXED1 | OCERZ_IF;
+    c->fs_base = TEB;
+    c->memseed = 1;
+}
+
+static int bench(uint32_t iters)
+{
+    Case c;
+    OcerzCPU *cpu = &g_vm.cpu;
+    printf("diff32 --bench: %u iterations per kernel, best of 3 timed runs under the JIT (%s layout)\n",
+           iters, g_low ? "Wine low-shadow" : "offset arena");
+    for (int k = 0; k < NKERNELS; k++) {
+        gen_kernel(&c, k, iters);
+        load_case(&c);
+        uint64_t best = ~0ull;
+        for (int r = 0; r < 4; r++) {
+            restore_memory();
+            ocerz_st(TEB, 4, 0);
+            ocerz_st(TEB + 0x18, 4, TEB);
+            ocerz_st(TEB + 0x2c, 4, TEB + 0x100);
+            ocerz_st(SCRATCH_MID + 0x20, 4, 0);
+            ocerz_cpu_reset(cpu);
+            memcpy(cpu->gpr, c.gpr, sizeof c.gpr);
+            cpu->rflags = c.rflags;
+            cpu->fs_base = c.fs_base;
+            cpu->mode32 = 1;
+            cpu->cs_sel = (uint16_t)CS32;
+            cpu->seg_sel[OCERZ_SREG_CS] = (uint16_t)CS32;
+            cpu->rip = CODE32;
+            g_vm.jit_enabled = 1;
+            g_vm.exited = 0;
+            int rc = OCERZ_STEP_OK;
+            uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            while (cpu->mode32 && rc != OCERZ_STEP_FATAL && rc != OCERZ_STEP_EXIT) {
+                rc = ocerz_jit_step(&g_vm, cpu);
+                if (rc == OCERZ_EUNSUP)
+                    rc = ocerz_interp_step(&g_vm, cpu);
+            }
+            uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+            if (rc != OCERZ_STEP_OK || cpu->rip != HALT64) {
+                fprintf(stderr, "bench/%s: stopped with rc=%d at %#llx\n", KERNELS[k].name, rc,
+                        (unsigned long long)cpu->rip);
+                return 1;
+            }
+            if (r > 0 && t < best)
+                best = t;
+        }
+        printf("  %-10s %8.2f ns/iter   %s\n", KERNELS[k].name, (double)best / iters, KERNELS[k].what);
+    }
+    return 0;
+}
+
 static void usage(void)
 {
     printf("usage: diff32 [options]\n"
@@ -2095,6 +2255,7 @@ static void usage(void)
            "  --jit-required    fail if the JIT translated no 32-bit blocks (the gate passes this)\n"
            "  --bug N           sensitivity probe: make the JIT side deliberately wrong\n"
            "                    (1 no-zeroext, 2 stale-zf, 3 cf-flip) and report the catch rate\n"
+           "  --bench [N]       time each 32-bit kernel in KERNELS under the JIT, N iterations\n"
            "  --low             lay guest memory out as a Wine process does: an identity\n"
            "                    arena and the low shadow window the 32-bit code lives in\n"
            "  --verbose         print a line per random case as well\n");
@@ -2105,6 +2266,7 @@ int main(int argc, char **argv)
     uint64_t seed = 1;
     long ncases = 20000;
     int do_selftest = 0, jit_required = 0, verbose = 0;
+    uint32_t do_bench = 0;
     const char *only = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -2116,6 +2278,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--jit-required")) jit_required = 1;
         else if (!strcmp(argv[i], "--verbose")) verbose = 1;
         else if (!strcmp(argv[i], "--low")) g_low = 1;
+        else if (!strcmp(argv[i], "--bench")) {
+            do_bench = 1000000;
+            if (i + 1 < argc && argv[i + 1][0] != '-') do_bench = (uint32_t)strtoul(argv[++i], NULL, 0);
+        }
         else if (!strcmp(argv[i], "--bug") && i + 1 < argc) g_bug = (int)strtol(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--list")) {
             for (int k = 0; k < NHANDS; k++) printf("hand/%s\n", HANDS[k].name);
@@ -2135,6 +2301,9 @@ int main(int argc, char **argv)
         return 2;
     }
     uint64_t blocks0 = ocerz_jit_blocks(g_vm.jit);
+
+    if (do_bench)
+        return bench(do_bench);
 
     if (do_selftest) {
         int bad = selftest(seed);
