@@ -546,6 +546,19 @@
  * branch wrote a flag record for the jcc to read back: `add eax, ebx ; dec
  * edi ; jnz` ran at 7.1 ns an iteration and runs at 0.4.
  *
+ * The condition forwarding is on as well - NZCV from an adjacent producer, E,
+ * NE, S and NS from a result register, a comis redone by fcmp - and so are the
+ * mov+logic and add+inc pairs and mov sinking into a shift.  Forwarding is
+ * only sound when the consumer is translated, since the producer then leaves
+ * its flags in NZCV alone, so cc_consumer_inline_ok asks m32_inline_ok about a
+ * 32-bit consumer: a cmov through 16-bit addressing is interpreted, and read a
+ * stale record.  (So did a 64-bit cmov whose memory operand has a 0x67
+ * prefix.)  After a fused pair the translate loop takes the pair's second
+ * instruction as the latest flag producer; it went on naming the first, so
+ * after `add ; inc` a jb or setb read the inc's record as an add's, in both
+ * modes.  The FP batch and lane-0 machinery stays off in 32-bit blocks: the
+ * differential has no SSE arithmetic corpus to hold it to.
+ *
  * An fs- or gs-relative operand adds the segment base to the wrapped address
  * without wrapping the sum, as ocerz_ea does, and then takes the same guard and
  * translation as any other operand.  32-bit Windows code reads fs:[0] for every
@@ -3425,8 +3438,6 @@ static int emit_mov_logic_pair(A64Buf *b, const X86Insn *mov,
                                const X86Insn *logic, uint64_t logic_need,
                                uint32_t **logic_label)
 {
-    if (g_xlat_mode32)
-        return 0;
     if (mov->lock || logic->lock || logic_need != 0 ||
         mov->op != OCERZ_OP_MOV ||
         (logic->op != OCERZ_OP_AND && logic->op != OCERZ_OP_OR &&
@@ -3506,8 +3517,6 @@ static int emit_add_inc_pair(A64Buf *b, const X86Insn *add,
                              const X86Insn *inc, uint64_t add_need,
                              uint64_t inc_need, uint32_t **inc_label)
 {
-    if (g_xlat_mode32)
-        return 0;
     if (!g_defer || g_no_addincfuse || g_no_lazyflags || add->lock || inc->lock)
         return 0;
     if (add->op != OCERZ_OP_ADD || inc->op != OCERZ_OP_INC ||
@@ -5786,9 +5795,12 @@ static unsigned producer_record_kind(const X86Insn *p, int *size)
 }
 static uint64_t g_cur_need;
 static int sse_enabled(void);
+static int m32_inline_ok(const X86Insn *insn);
 static int cc_consumer_inline_ok(const X86Insn *c)
 {
     const X86Operand *d = &c->ops[0];
+    if (c->mode32 && c->op != OCERZ_OP_JCC && !m32_inline_ok(c))
+        return 0;
     switch (c->op) {
     case OCERZ_OP_JCC:
         return 1;
@@ -5805,7 +5817,7 @@ static int cc_consumer_inline_ok(const X86Insn *c)
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
         if (rsp_is_ptr() && (d->reg == OCERZ_RSP || (sr->kind == OCERZ_OPK_REG && sr->reg == OCERZ_RSP))) return 0;
         if (sr->kind == OCERZ_OPK_REG) return !sr->high8 && sr->size == d->size;
-        return sr->kind == OCERZ_OPK_MEM;
+        return sr->kind == OCERZ_OPK_MEM && (c->addrsize == 8 || c->mode32);
     }
     case OCERZ_OP_ADC: case OCERZ_OP_SBB: {
         const X86Operand *sr = &c->ops[1];
@@ -5821,7 +5833,6 @@ static int cc_consumer_inline_ok(const X86Insn *c)
 }
 static int comis_fuse_producer(const X86Insn *insns, int ci)
 {
-    if (g_xlat_mode32) return -1;
     if (!cc_consumer_inline_ok(&insns[ci])) return -1;
     unsigned cc = insns[ci].cc;
     if (!(cc == OCERZ_CC_A || cc == OCERZ_CC_AE || cc == OCERZ_CC_B || cc == OCERZ_CC_BE ||
@@ -5855,7 +5866,6 @@ static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
 static int value_cond_fuse_producer(const X86Insn *insns, int ci)
 {
     static int dis = -1;
-    if (g_xlat_mode32) return -1;
     if (dis < 0) dis = getenv("OCERZ_NO_VALCC") ? 1 : 0;
     if (dis) return -1;
     if (!cc_consumer_inline_ok(&insns[ci])) return -1;
@@ -5966,7 +5976,6 @@ static int nzcv_gap_ok(const X86Insn *insns, int m, int k)
 static int nzcv_fuse_producer(const X86Insn *insns, int ci)
 {
     static int dis = -1;
-    if (g_xlat_mode32) return -1;
     if (dis < 0) dis = getenv("OCERZ_NO_NZCVFWD") ? 1 : 0;
     if (dis || ci < 1 || !g_defer || g_no_regflags) return -1;
     const X86Insn *c = &insns[ci];
@@ -7397,7 +7406,7 @@ static void mov_sink_scan(const X86Insn *insns, int n, const uint64_t *fl_need)
 {
     for (int i = 0; i < n; i++) { g_mov_sink_at[i] = -1; g_mov_skip[i] = 0; }
     static int dis = -1; if (dis < 0) dis = (getenv("OCERZ_NO_MOVFUSE") || getenv("OCERZ_NO_MOVSINK")) ? 1 : 0;
-    if (dis || !g_defer || g_xlat_mode32) return;
+    if (dis || !g_defer) return;
     for (int i = 0; i + 1 < n; i++) {
         const X86Insn *m = &insns[i];
         if (m->op != OCERZ_OP_MOV || m->nops != 2) continue;
@@ -18045,6 +18054,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                     blk->insn_off[i + 1] =
                         (uint32_t)(logic_label - entry);
                 blk->n_inlined += 2;
+                last_flag_def = i + 1;
                 i++;
                 continue;
             }
@@ -18056,6 +18066,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 if (blk->insn_off)
                     blk->insn_off[i + 1] = (uint32_t)(inc_label - entry);
                 blk->n_inlined += 2;
+                last_flag_def = i + 1;
                 i++;
                 continue;
             }
