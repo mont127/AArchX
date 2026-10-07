@@ -966,6 +966,26 @@ static void t_0f(Gen *g)
 }
 
 
+static void t_cx8(Gen *g)
+{
+    MF m;
+    if (rndn(g, 3) == 0) {
+        uint32_t a = (uint32_t)(SCRATCH_MID + rndn(g, 0x80) * 8 + (rndn(g, 4) == 0 ? rndn(g, 8) : 0));
+        eb(g, 0xa1); ed(g, a);
+        eb(g, 0x8b); eb(g, 0x15); ed(g, a + 4);
+        if (rndn(g, 3) == 0) eb(g, 0x40 | (rndn(g, 2) ? 0 : 2));
+        mf_abs32(&m, a);
+    } else if (rndn(g, 2)) {
+        pick_mem_aligned(g, &m, 8);
+    } else {
+        pick_mem(g, &m, 0);
+    }
+    if (rndn(g, 4)) eb(g, 0xf0);
+    emit_prefixes(g, 0, &m, 1);
+    eb(g, 0x0f); eb(g, 0xc7);
+    emit_modrm(g, 1, &m);
+}
+
 static void t_seg(Gen *g)
 {
     static const uint8_t alu[8] = { 0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38 };
@@ -1053,7 +1073,7 @@ static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_grp3,    8 }, { t_imul,   5 }, { t_misc1,   7 }, { t_stack, 14 },
     { t_pusha,   3 }, { t_enter,  2 }, { t_jcc,     8 }, { t_jmp,    3 },
     { t_loop,    4 }, { t_jecxz,  2 }, { t_call,    4 }, { t_string, 5 },
-    { t_0f,     14 }, { t_seg,    10 },
+    { t_0f,     14 }, { t_seg,    10 }, { t_cx8,    4 },
 };
 #define NTEMPLATES ((int)(sizeof TEMPLATES / sizeof TEMPLATES[0]))
 
@@ -1727,6 +1747,90 @@ static void h_seh_teb(Gen *g)
     eb(g, 0x58);
 }
 
+static void bp8(Gen *g, const uint8_t *op, int n, unsigned reg, int8_t d)
+{
+    for (int i = 0; i < n; i++) eb(g, op[i]);
+    eb(g, 0x45 | (reg << 3)); eb(g, (uint8_t)d);
+}
+
+static void h_atomics32(Gen *g)
+{
+    static const uint8_t XADD[] = { 0xf0, 0x0f, 0xc1 }, XADDW[] = { 0xf0, 0x66, 0x0f, 0xc1 },
+                         XADDB[] = { 0xf0, 0x0f, 0xc0 }, XADDN[] = { 0x0f, 0xc1 },
+                         CX[] = { 0xf0, 0x0f, 0xb1 }, CXB[] = { 0xf0, 0x0f, 0xb0 }, CXW[] = { 0xf0, 0x66, 0x0f, 0xb1 },
+                         XCHG[] = { 0x87 }, XCHGB[] = { 0x86 }, MOVL[] = { 0x8b }, MOVW[] = { 0x66, 0x8b },
+                         LSUB[] = { 0xf0, 0x29 }, LAND[] = { 0xf0, 0x21 }, LINC[] = { 0xf0, 0xff },
+                         LDECW[] = { 0xf0, 0x66, 0xff }, LNOT[] = { 0xf0, 0xf7 }, ADD[] = { 0x01 },
+                         TEST[] = { 0x85 }, INCB[] = { 0xfe }, NOTW[] = { 0x66, 0xf7 }, CX8[] = { 0xf0, 0x0f, 0xc7 },
+                         CX8N[] = { 0x0f, 0xc7 };
+    mov32(g, OCERZ_RAX, 0x11223344u);
+    mov32(g, OCERZ_RCX, 0x55667788u);
+    eb(g, 0x87); eb(g, 0xc1);
+    eb(g, 0x87); eb(g, 0xc9);
+    eb(g, 0x66); eb(g, 0x87); eb(g, 0xd3);
+    eb(g, 0x86); eb(g, 0xe0);
+    eb(g, 0x86); eb(g, 0xf7);
+    eb(g, 0x86); eb(g, 0xc3);
+    eb(g, 0x86); eb(g, 0xe4);
+    eb(g, 0x93);
+    eb(g, 0x66); eb(g, 0x96);
+    mov32(g, OCERZ_RAX, 5);
+    bp8(g, XADD, 3, 0, 0x10);
+    bp8(g, XADDW, 4, 0, 0x14);
+    bp8(g, XADDB, 3, 5, 0x17);
+    bp8(g, XADDN, 2, 2, 0x18);
+    bp8(g, MOVL, 1, 0, 0x20);
+    bp8(g, CX, 3, 3, 0x20);
+    bp8(g, CX, 3, 1, 0x20);
+    bp8(g, CXB, 3, 2, 0x24);
+    bp8(g, MOVW, 2, 0, 0x26);
+    bp8(g, CXW, 4, 6, 0x26);
+    bp8(g, XCHG, 1, 6, 0x28);
+    bp8(g, XCHGB, 1, 1, 0x2c);
+    eb(g, 0xf0); eb(g, 0x83); eb(g, 0x45); eb(g, 0x30); eb(g, 0x07);
+    bp8(g, LSUB, 2, 0, 0x30);
+    bp8(g, LAND, 2, 1, 0x34);
+    eb(g, 0xf0); eb(g, 0x66); eb(g, 0x81); eb(g, 0x4d); eb(g, 0x38); ew(g, 0x0101);
+    eb(g, 0xf0); eb(g, 0x80); eb(g, 0x75); eb(g, 0x3a); eb(g, 0x5a);
+    bp8(g, LINC, 2, 0, 0x3c);
+    bp8(g, LDECW, 3, 1, 0x40);
+    bp8(g, LNOT, 2, 2, 0x44);
+    bp8(g, LNOT, 2, 3, 0x48);
+    bp8(g, ADD, 1, 7, 0x4c);
+    eb(g, 0x83); eb(g, 0x7d); eb(g, 0x4c); eb(g, 0x03);
+    bp8(g, TEST, 1, 0, 0x4c);
+    bp8(g, INCB, 1, 0, 0x50);
+    bp8(g, NOTW, 2, 2, 0x52);
+    bp8(g, XADD, 3, 0, 0x59);
+    bp8(g, CX, 3, 3, 0x5e);
+    bp8(g, XCHG, 1, 2, 0x63);
+    bp8(g, LINC, 2, 0, 0x67);
+    bp8(g, MOVL, 1, 0, -0x10);
+    bp8(g, MOVL, 1, 2, -0x0c);
+    mov32(g, OCERZ_RBX, 0x12345678u);
+    mov32(g, OCERZ_RCX, 0x9abcdef0u);
+    bp8(g, CX8, 3, 1, -0x10);
+    eb(g, 0x9c); eb(g, 0x5f);
+    bp8(g, CX8, 3, 1, -0x10);
+    eb(g, 0x9c); eb(g, 0x5e);
+    bp8(g, CX8N, 2, 1, -0x10);
+    bp8(g, CX8, 3, 1, -0x1d);
+    eb(g, 0x64); eb(g, 0xf0); eb(g, 0x0f); eb(g, 0xc7); eb(g, 0x0d); ed(g, (uint32_t)(SCRATCH_MID + 0x58));
+}
+
+static void h_lock_many(Gen *g)
+{
+    static const uint8_t XADD[] = { 0xf0, 0x0f, 0xc1 }, CX8[] = { 0xf0, 0x0f, 0xc7 };
+    mov32(g, OCERZ_RAX, 3);
+    for (int k = 0; k < 40; k++) {
+        eb(g, 0xf0); eb(g, 0x83); eb(g, 0x45); eb(g, (uint8_t)(-0x80 + 4 * k)); eb(g, 0x01);
+    }
+    bp8(g, XADD, 3, 0, 0x31);
+    bp8(g, XADD, 3, 0, 0x40);
+    bp8(g, CX8, 3, 1, 0x48);
+    bp8(g, CX8, 3, 1, 0x53);
+}
+
 static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "highbyte",      h_highbyte },
     { "highbyte-mem",  h_highbyte_mem },
@@ -1762,6 +1866,8 @@ static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "esp-sib",       h_esp_sib },
     { "call-ret",      h_callret },
     { "seh-teb",       h_seh_teb },
+    { "atomics32",     h_atomics32 },
+    { "lock-many",     h_lock_many },
 };
 #define NHANDS ((int)(sizeof HANDS / sizeof HANDS[0]))
 
