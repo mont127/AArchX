@@ -38,7 +38,7 @@ body:
     id: env
     attributes:
       label: ocerz version, macOS version and Mac
-      placeholder: "AArchX 0.5 c0b60c3, macOS 27.0, MacBook Air M5"
+      placeholder: "AArchX 0.6 7beca91, macOS 27.0, MacBook Air M5"
     validations:
       required: true
   - type: textarea

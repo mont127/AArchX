@@ -12,7 +12,7 @@ body:
     attributes:
       label: ocerz version and commit
       description: The output of `./ocerz version`, and `git rev-parse --short HEAD` if you built it.
-      placeholder: "AArchX 0.5, c0b60c3"
+      placeholder: "AArchX 0.6, 7beca91"
     validations:
       required: true
   - type: input
