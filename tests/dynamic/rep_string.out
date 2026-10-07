@@ -1,0 +1,16 @@
+movsb 4000             di=+1004 cx=0 si=+fa7 mem=c3adc763fa437c63
+movsw 3000             di=+3a98 cx=0 si=+1772 mem=167859af0ab91d23
+movsd 2000             di=+6d61 cx=0 si=+1f43 mem=a398b8763b5b9423
+movsq 1500             di=+aee0 cx=0 si=+2f20 mem=934b9cfce1998883
+movsb backward         di=+c094 cx=0 si=+14b4 mem=bcbba2cf4931b0ff
+movsq backward         di=+e100 cx=0 si=+15e0 mem=93d911efce2ba19f
+movsb 20               di=+40 cx=0 si=+15 mem=0b12c5e458bdf47b
+movsb pattern          di=+c82 cx=0 mem=189708110b91ad46
+movsq pattern          di=+1c28 cx=0 mem=92d9d0ac33877f7a
+movsb overlap down     di=+13ec cx=0 mem=699bb8eb89536912
+stosb 5000             di=+138b cx=0 mem=1f29d50b70f72d38
+stosw 4000             di=+4651 cx=0 mem=ac0a52ae4334d03d
+stosd 3000             di=+a410 cx=0 mem=937f838c14eec3bd
+stosq 2000             di=+ee48 cx=0 mem=cc7c4a2fe7cfe0f1
+stosd backward         di=+dac0 cx=0 mem=80593e72b70c8c81
+stosb across fault     di=+7000 cx=0 mem=0e4602f66a806383

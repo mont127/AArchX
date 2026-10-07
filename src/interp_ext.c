@@ -8,6 +8,18 @@
  * 16-bit step writes back only the low half of the register, which is why it
  * goes through the register accessor rather than a direct store.
  *
+ * rep movs and rep stos run forward at the host's own memmove and fill when
+ * the range is one piece of host memory: wholly on one side of the low window's
+ * edge and clear of the top strip and the commpage.  Wine's msvcrt memcpy is rep
+ * movsb above a few hundred bytes, and an element at a time made it twenty times
+ * Rosetta's time.  A movs whose destination starts inside its source copies a
+ * pattern forward, which only the loop reproduces, and a backward one, a segment
+ * override or a short count keeps the loop too.  Pages holding translated code
+ * are disarmed and their translations dropped first, as a syscall does before
+ * the kernel writes.  rsi, rdi and rcx move only once the whole range is done,
+ * so a fault inside it - a guard page Wine commits on demand - reaches the guest
+ * with the instruction not yet started, and running it again does the same work.
+ *
  * CRC-32C is done bitwise: correctness over speed, since the JIT does not
  * translate it and hashing loops run interpreted anyway.  CPUID reports SSE3,
  * SSSE3, CX16, SSE4.1, SSE4.2 and POPCNT, all of which are implemented in full
@@ -17,6 +29,7 @@
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/vm.h"
+#include "ocerz/jit.h"
 #include "ocerz/x87.h"
 
 #include <fenv.h>
@@ -62,6 +75,81 @@ static void ext_ptr_write(OcerzCPU *cpu, const X86Insn *insn, unsigned reg, uint
         cpu->gpr[reg] = v;
 }
 
+/* The host bytes behind [g, g + len) when they are one span, else NULL. */
+static uint8_t *ext_host_span(uint64_t g, uint64_t len)
+{
+    uint64_t end = g + len;
+    if (len == 0 || end < g || ocerz_pin_map)
+        return NULL;
+    if (ocerz_low_base && !(end <= OCERZ_LOW_LIMIT || (g >= OCERZ_LOW_LIMIT && end <= OCERZ_TOP_LO)))
+        return NULL;
+    if (ocerz_commpage && g < OCERZ_COMMPAGE_HI && end > OCERZ_COMMPAGE_LO)
+        return NULL;
+    uint8_t *h0 = ocerz_g2h(g), *h1 = ocerz_g2h(end - 1);
+    return h1 - h0 == (ptrdiff_t)(len - 1) ? h0 : NULL;
+}
+
+static void ext_disarm(OcerzCPU *cpu, uint64_t g, uint64_t len)
+{
+    if (!ocerz_mem_armed_any())
+        return;
+    uint64_t pages[64];
+    int n;
+    while ((n = ocerz_mem_disarm_range(g, g + len, pages, 64)) > 0) {
+        for (int i = 0; i < n; i++)
+            ocerz_jit_invalidate_range(cpu->vm, pages[i], OCERZ_HOST_PAGE_SIZE);
+        if (n < 64)
+            break;
+    }
+}
+
+static int ext_string_bulk(OcerzCPU *cpu, const X86Insn *insn)
+{
+    int op = insn->op, size = insn->opsize;
+    if (insn->rep != OCERZ_REP_REP || (cpu->rflags & OCERZ_DF) || insn->seg != OCERZ_SEG_NONE ||
+        (op != OCERZ_OP_MOVS && op != OCERZ_OP_STOS))
+        return 0;
+    uint64_t n = ext_rcx_read(cpu, insn);
+    if (n < 32 || n > ((uint64_t)1 << 36))
+        return 0;
+    uint64_t len = n * (uint64_t)size;
+    uint64_t lim = insn->addrsize == 8 ? 0 : (uint64_t)1 << (insn->addrsize * 8);
+    uint64_t d = ext_ptr_read(cpu, insn, OCERZ_RDI), s = 0;
+    if (lim && d + len > lim)
+        return 0;
+    uint8_t *hd = ext_host_span(d, len), *hs = NULL;
+    if (!hd)
+        return 0;
+    if (op == OCERZ_OP_MOVS) {
+        s = ext_ptr_read(cpu, insn, OCERZ_RSI);
+        if ((lim && s + len > lim) || (d > s && d < s + len))
+            return 0;
+        if (!(hs = ext_host_span(s, len)))
+            return 0;
+    }
+    ext_disarm(cpu, d, len);
+    if (op == OCERZ_OP_MOVS) {
+        memmove(hd, hs, len);
+        ext_ptr_write(cpu, insn, OCERZ_RSI, s + len);
+    } else {
+        uint64_t v = cpu->gpr[OCERZ_RAX];
+        if (size == 1) {
+            memset(hd, (int)(v & 0xff), len);
+        } else if (size == 2) {
+            uint32_t p = (uint32_t)(v & 0xffff) * 0x10001u;
+            memset_pattern4(hd, &p, len);
+        } else if (size == 4) {
+            uint32_t p = (uint32_t)v;
+            memset_pattern4(hd, &p, len);
+        } else {
+            memset_pattern8(hd, &v, len);
+        }
+    }
+    ext_ptr_write(cpu, insn, OCERZ_RDI, d + len);
+    ext_rcx_write(cpu, insn, 0);
+    return 1;
+}
+
 static int ext_string(OcerzCPU *cpu, const X86Insn *insn)
 {
     int size = insn->opsize;
@@ -70,6 +158,8 @@ static int ext_string(OcerzCPU *cpu, const X86Insn *insn)
     int op = insn->op;
 
     if (rep != OCERZ_REP_NONE && ext_rcx_read(cpu, insn) == 0)
+        return OCERZ_STEP_OK;
+    if (rep != OCERZ_REP_NONE && ext_string_bulk(cpu, insn))
         return OCERZ_STEP_OK;
 
     for (;;) {
