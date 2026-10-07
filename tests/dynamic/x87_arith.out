@@ -1,0 +1,390 @@
+d8  fadd i=1: 6 2 8 16 32 0.5 64 0.25 ok
+d8  fadd i=2: 12 2 8 16 32 0.5 64 0.25 ok
+d8  fadd i=3: 20 2 8 16 32 0.5 64 0.25 ok
+d8  fadd i=4: 36 2 8 16 32 0.5 64 0.25 ok
+d8  fadd i=5: 4.5 2 8 16 32 0.5 64 0.25 ok
+d8  fadd i=6: 68 2 8 16 32 0.5 64 0.25 ok
+d8  fadd i=7: 4.25 2 8 16 32 0.5 64 0.25 ok
+d8  fmul i=1: 8 2 8 16 32 0.5 64 0.25 ok
+d8  fmul i=2: 32 2 8 16 32 0.5 64 0.25 ok
+d8  fmul i=3: 64 2 8 16 32 0.5 64 0.25 ok
+d8  fmul i=4: 128 2 8 16 32 0.5 64 0.25 ok
+d8  fmul i=5: 2 2 8 16 32 0.5 64 0.25 ok
+d8  fmul i=6: 256 2 8 16 32 0.5 64 0.25 ok
+d8  fmul i=7: 1 2 8 16 32 0.5 64 0.25 ok
+d8  fsub i=1: 2 2 8 16 32 0.5 64 0.25 ok
+d8  fsub i=2: -4 2 8 16 32 0.5 64 0.25 ok
+d8  fsub i=3: -12 2 8 16 32 0.5 64 0.25 ok
+d8  fsub i=4: -28 2 8 16 32 0.5 64 0.25 ok
+d8  fsub i=5: 3.5 2 8 16 32 0.5 64 0.25 ok
+d8  fsub i=6: -60 2 8 16 32 0.5 64 0.25 ok
+d8  fsub i=7: 3.75 2 8 16 32 0.5 64 0.25 ok
+d8  fsubr i=1: -2 2 8 16 32 0.5 64 0.25 ok
+d8  fsubr i=2: 4 2 8 16 32 0.5 64 0.25 ok
+d8  fsubr i=3: 12 2 8 16 32 0.5 64 0.25 ok
+d8  fsubr i=4: 28 2 8 16 32 0.5 64 0.25 ok
+d8  fsubr i=5: -3.5 2 8 16 32 0.5 64 0.25 ok
+d8  fsubr i=6: 60 2 8 16 32 0.5 64 0.25 ok
+d8  fsubr i=7: -3.75 2 8 16 32 0.5 64 0.25 ok
+dc  fadd i=1: 4 6 8 16 32 0.5 64 0.25 ok
+dc  fadd i=2: 4 2 12 16 32 0.5 64 0.25 ok
+dc  fadd i=3: 4 2 8 20 32 0.5 64 0.25 ok
+dc  fadd i=4: 4 2 8 16 36 0.5 64 0.25 ok
+dc  fadd i=5: 4 2 8 16 32 4.5 64 0.25 ok
+dc  fadd i=6: 4 2 8 16 32 0.5 68 0.25 ok
+dc  fadd i=7: 4 2 8 16 32 0.5 64 4.25 ok
+dc  fmul i=1: 4 8 8 16 32 0.5 64 0.25 ok
+dc  fmul i=2: 4 2 32 16 32 0.5 64 0.25 ok
+dc  fmul i=3: 4 2 8 64 32 0.5 64 0.25 ok
+dc  fmul i=4: 4 2 8 16 128 0.5 64 0.25 ok
+dc  fmul i=5: 4 2 8 16 32 2 64 0.25 ok
+dc  fmul i=6: 4 2 8 16 32 0.5 256 0.25 ok
+dc  fmul i=7: 4 2 8 16 32 0.5 64 1 ok
+dc  fsub i=1: 4 -2 8 16 32 0.5 64 0.25 ok
+dc  fsub i=2: 4 2 4 16 32 0.5 64 0.25 ok
+dc  fsub i=3: 4 2 8 12 32 0.5 64 0.25 ok
+dc  fsub i=4: 4 2 8 16 28 0.5 64 0.25 ok
+dc  fsub i=5: 4 2 8 16 32 -3.5 64 0.25 ok
+dc  fsub i=6: 4 2 8 16 32 0.5 60 0.25 ok
+dc  fsub i=7: 4 2 8 16 32 0.5 64 -3.75 ok
+dc  fsubr i=1: 4 2 8 16 32 0.5 64 0.25 ok
+dc  fsubr i=2: 4 2 -4 16 32 0.5 64 0.25 ok
+dc  fsubr i=3: 4 2 8 -12 32 0.5 64 0.25 ok
+dc  fsubr i=4: 4 2 8 16 -28 0.5 64 0.25 ok
+dc  fsubr i=5: 4 2 8 16 32 3.5 64 0.25 ok
+dc  fsubr i=6: 4 2 8 16 32 0.5 -60 0.25 ok
+dc  fsubr i=7: 4 2 8 16 32 0.5 64 3.75 ok
+de  fadd i=1: 6 8 16 32 0.5 64 0.25 ok
+de  fadd i=2: 2 12 16 32 0.5 64 0.25 ok
+de  fadd i=3: 2 8 20 32 0.5 64 0.25 ok
+de  fadd i=4: 2 8 16 36 0.5 64 0.25 ok
+de  fadd i=5: 2 8 16 32 4.5 64 0.25 ok
+de  fadd i=6: 2 8 16 32 0.5 68 0.25 ok
+de  fadd i=7: 2 8 16 32 0.5 64 4.25 ok
+de  fmul i=1: 8 8 16 32 0.5 64 0.25 ok
+de  fmul i=2: 2 32 16 32 0.5 64 0.25 ok
+de  fmul i=3: 2 8 64 32 0.5 64 0.25 ok
+de  fmul i=4: 2 8 16 128 0.5 64 0.25 ok
+de  fmul i=5: 2 8 16 32 2 64 0.25 ok
+de  fmul i=6: 2 8 16 32 0.5 256 0.25 ok
+de  fmul i=7: 2 8 16 32 0.5 64 1 ok
+de  fsub i=1: -2 8 16 32 0.5 64 0.25 ok
+de  fsub i=2: 2 4 16 32 0.5 64 0.25 ok
+de  fsub i=3: 2 8 12 32 0.5 64 0.25 ok
+de  fsub i=4: 2 8 16 28 0.5 64 0.25 ok
+de  fsub i=5: 2 8 16 32 -3.5 64 0.25 ok
+de  fsub i=6: 2 8 16 32 0.5 60 0.25 ok
+de  fsub i=7: 2 8 16 32 0.5 64 -3.75 ok
+de  fsubr i=1: 2 8 16 32 0.5 64 0.25 ok
+de  fsubr i=2: 2 -4 16 32 0.5 64 0.25 ok
+de  fsubr i=3: 2 8 -12 32 0.5 64 0.25 ok
+de  fsubr i=4: 2 8 16 -28 0.5 64 0.25 ok
+de  fsubr i=5: 2 8 16 32 3.5 64 0.25 ok
+de  fsubr i=6: 2 8 16 32 0.5 -60 0.25 ok
+de  fsubr i=7: 2 8 16 32 0.5 64 3.75 ok
+d8  fdiv i=1: 2 2 8 16 32 0.5 64 0.25 ok
+d8  fdiv i=2: 0.5 2 8 16 32 0.5 64 0.25 ok
+d8  fdiv i=3: 0.25 2 8 16 32 0.5 64 0.25 ok
+d8  fdiv i=4: 0.125 2 8 16 32 0.5 64 0.25 ok
+d8  fdiv i=5: 8 2 8 16 32 0.5 64 0.25 ok
+d8  fdiv i=6: 0.0625 2 8 16 32 0.5 64 0.25 ok
+d8  fdiv i=7: 16 2 8 16 32 0.5 64 0.25 ok
+d8  fdivr i=1: 0.5 2 8 16 32 0.5 64 0.25 ok
+d8  fdivr i=2: 2 2 8 16 32 0.5 64 0.25 ok
+d8  fdivr i=3: 4 2 8 16 32 0.5 64 0.25 ok
+d8  fdivr i=4: 8 2 8 16 32 0.5 64 0.25 ok
+d8  fdivr i=5: 0.125 2 8 16 32 0.5 64 0.25 ok
+d8  fdivr i=6: 16 2 8 16 32 0.5 64 0.25 ok
+d8  fdivr i=7: 0.0625 2 8 16 32 0.5 64 0.25 ok
+dc  fdiv i=1: 4 0.5 8 16 32 0.5 64 0.25 ok
+dc  fdiv i=2: 4 2 2 16 32 0.5 64 0.25 ok
+dc  fdiv i=3: 4 2 8 4 32 0.5 64 0.25 ok
+dc  fdiv i=4: 4 2 8 16 8 0.5 64 0.25 ok
+dc  fdiv i=5: 4 2 8 16 32 0.125 64 0.25 ok
+dc  fdiv i=6: 4 2 8 16 32 0.5 16 0.25 ok
+dc  fdiv i=7: 4 2 8 16 32 0.5 64 0.0625 ok
+dc  fdivr i=1: 4 2 8 16 32 0.5 64 0.25 ok
+dc  fdivr i=2: 4 2 0.5 16 32 0.5 64 0.25 ok
+dc  fdivr i=3: 4 2 8 0.25 32 0.5 64 0.25 ok
+dc  fdivr i=4: 4 2 8 16 0.125 0.5 64 0.25 ok
+dc  fdivr i=5: 4 2 8 16 32 8 64 0.25 ok
+dc  fdivr i=6: 4 2 8 16 32 0.5 0.0625 0.25 ok
+dc  fdivr i=7: 4 2 8 16 32 0.5 64 16 ok
+de  fdiv i=1: 0.5 8 16 32 0.5 64 0.25 ok
+de  fdiv i=2: 2 2 16 32 0.5 64 0.25 ok
+de  fdiv i=3: 2 8 4 32 0.5 64 0.25 ok
+de  fdiv i=4: 2 8 16 8 0.5 64 0.25 ok
+de  fdiv i=5: 2 8 16 32 0.125 64 0.25 ok
+de  fdiv i=6: 2 8 16 32 0.5 16 0.25 ok
+de  fdiv i=7: 2 8 16 32 0.5 64 0.0625 ok
+de  fdivr i=1: 2 8 16 32 0.5 64 0.25 ok
+de  fdivr i=2: 2 0.5 16 32 0.5 64 0.25 ok
+de  fdivr i=3: 2 8 0.25 32 0.5 64 0.25 ok
+de  fdivr i=4: 2 8 16 0.125 0.5 64 0.25 ok
+de  fdivr i=5: 2 8 16 32 8 64 0.25 ok
+de  fdivr i=6: 2 8 16 32 0.5 0.0625 0.25 ok
+de  fdivr i=7: 2 8 16 32 0.5 64 16 ok
+group reg-forms-pow2 end top=0
+d8  fadd i=1: 2 5 -7 9 11 -13 15 17 ok
+d8  fadd i=2: -10 5 -7 9 11 -13 15 17 ok
+d8  fadd i=3: 6 5 -7 9 11 -13 15 17 ok
+d8  fadd i=4: 8 5 -7 9 11 -13 15 17 ok
+d8  fadd i=5: -16 5 -7 9 11 -13 15 17 ok
+d8  fadd i=6: 12 5 -7 9 11 -13 15 17 ok
+d8  fadd i=7: 14 5 -7 9 11 -13 15 17 ok
+d8  fmul i=1: -15 5 -7 9 11 -13 15 17 ok
+d8  fmul i=2: 21 5 -7 9 11 -13 15 17 ok
+d8  fmul i=3: -27 5 -7 9 11 -13 15 17 ok
+d8  fmul i=4: -33 5 -7 9 11 -13 15 17 ok
+d8  fmul i=5: 39 5 -7 9 11 -13 15 17 ok
+d8  fmul i=6: -45 5 -7 9 11 -13 15 17 ok
+d8  fmul i=7: -51 5 -7 9 11 -13 15 17 ok
+d8  fsub i=1: -8 5 -7 9 11 -13 15 17 ok
+d8  fsub i=2: 4 5 -7 9 11 -13 15 17 ok
+d8  fsub i=3: -12 5 -7 9 11 -13 15 17 ok
+d8  fsub i=4: -14 5 -7 9 11 -13 15 17 ok
+d8  fsub i=5: 10 5 -7 9 11 -13 15 17 ok
+d8  fsub i=6: -18 5 -7 9 11 -13 15 17 ok
+d8  fsub i=7: -20 5 -7 9 11 -13 15 17 ok
+d8  fsubr i=1: 8 5 -7 9 11 -13 15 17 ok
+d8  fsubr i=2: -4 5 -7 9 11 -13 15 17 ok
+d8  fsubr i=3: 12 5 -7 9 11 -13 15 17 ok
+d8  fsubr i=4: 14 5 -7 9 11 -13 15 17 ok
+d8  fsubr i=5: -10 5 -7 9 11 -13 15 17 ok
+d8  fsubr i=6: 18 5 -7 9 11 -13 15 17 ok
+d8  fsubr i=7: 20 5 -7 9 11 -13 15 17 ok
+dc  fadd i=1: -3 2 -7 9 11 -13 15 17 ok
+dc  fadd i=2: -3 5 -10 9 11 -13 15 17 ok
+dc  fadd i=3: -3 5 -7 6 11 -13 15 17 ok
+dc  fadd i=4: -3 5 -7 9 8 -13 15 17 ok
+dc  fadd i=5: -3 5 -7 9 11 -16 15 17 ok
+dc  fadd i=6: -3 5 -7 9 11 -13 12 17 ok
+dc  fadd i=7: -3 5 -7 9 11 -13 15 14 ok
+dc  fmul i=1: -3 -15 -7 9 11 -13 15 17 ok
+dc  fmul i=2: -3 5 21 9 11 -13 15 17 ok
+dc  fmul i=3: -3 5 -7 -27 11 -13 15 17 ok
+dc  fmul i=4: -3 5 -7 9 -33 -13 15 17 ok
+dc  fmul i=5: -3 5 -7 9 11 39 15 17 ok
+dc  fmul i=6: -3 5 -7 9 11 -13 -45 17 ok
+dc  fmul i=7: -3 5 -7 9 11 -13 15 -51 ok
+dc  fsub i=1: -3 8 -7 9 11 -13 15 17 ok
+dc  fsub i=2: -3 5 -4 9 11 -13 15 17 ok
+dc  fsub i=3: -3 5 -7 12 11 -13 15 17 ok
+dc  fsub i=4: -3 5 -7 9 14 -13 15 17 ok
+dc  fsub i=5: -3 5 -7 9 11 -10 15 17 ok
+dc  fsub i=6: -3 5 -7 9 11 -13 18 17 ok
+dc  fsub i=7: -3 5 -7 9 11 -13 15 20 ok
+dc  fsubr i=1: -3 -8 -7 9 11 -13 15 17 ok
+dc  fsubr i=2: -3 5 4 9 11 -13 15 17 ok
+dc  fsubr i=3: -3 5 -7 -12 11 -13 15 17 ok
+dc  fsubr i=4: -3 5 -7 9 -14 -13 15 17 ok
+dc  fsubr i=5: -3 5 -7 9 11 10 15 17 ok
+dc  fsubr i=6: -3 5 -7 9 11 -13 -18 17 ok
+dc  fsubr i=7: -3 5 -7 9 11 -13 15 -20 ok
+de  fadd i=1: 2 -7 9 11 -13 15 17 ok
+de  fadd i=2: 5 -10 9 11 -13 15 17 ok
+de  fadd i=3: 5 -7 6 11 -13 15 17 ok
+de  fadd i=4: 5 -7 9 8 -13 15 17 ok
+de  fadd i=5: 5 -7 9 11 -16 15 17 ok
+de  fadd i=6: 5 -7 9 11 -13 12 17 ok
+de  fadd i=7: 5 -7 9 11 -13 15 14 ok
+de  fmul i=1: -15 -7 9 11 -13 15 17 ok
+de  fmul i=2: 5 21 9 11 -13 15 17 ok
+de  fmul i=3: 5 -7 -27 11 -13 15 17 ok
+de  fmul i=4: 5 -7 9 -33 -13 15 17 ok
+de  fmul i=5: 5 -7 9 11 39 15 17 ok
+de  fmul i=6: 5 -7 9 11 -13 -45 17 ok
+de  fmul i=7: 5 -7 9 11 -13 15 -51 ok
+de  fsub i=1: 8 -7 9 11 -13 15 17 ok
+de  fsub i=2: 5 -4 9 11 -13 15 17 ok
+de  fsub i=3: 5 -7 12 11 -13 15 17 ok
+de  fsub i=4: 5 -7 9 14 -13 15 17 ok
+de  fsub i=5: 5 -7 9 11 -10 15 17 ok
+de  fsub i=6: 5 -7 9 11 -13 18 17 ok
+de  fsub i=7: 5 -7 9 11 -13 15 20 ok
+de  fsubr i=1: -8 -7 9 11 -13 15 17 ok
+de  fsubr i=2: 5 4 9 11 -13 15 17 ok
+de  fsubr i=3: 5 -7 -12 11 -13 15 17 ok
+de  fsubr i=4: 5 -7 9 -14 -13 15 17 ok
+de  fsubr i=5: 5 -7 9 11 10 15 17 ok
+de  fsubr i=6: 5 -7 9 11 -13 -18 17 ok
+de  fsubr i=7: 5 -7 9 11 -13 15 -20 ok
+group reg-forms-odd end top=0
+fadds st0=-16 mem=4 -> -12 ok
+fmuls st0=-16 mem=4 -> -64 ok
+fsubs st0=-16 mem=4 -> -20 ok
+fsubrs st0=-16 mem=4 -> 20 ok
+fdivs st0=-16 mem=4 -> -4 ok
+fdivrs st0=-16 mem=4 -> -0.25 ok
+faddl st0=-16 mem=0.5 -> -15.5 ok
+fmull st0=-16 mem=0.5 -> -8 ok
+fsubl st0=-16 mem=0.5 -> -16.5 ok
+fsubrl st0=-16 mem=0.5 -> 16.5 ok
+fdivl st0=-16 mem=0.5 -> -32 ok
+fdivrl st0=-16 mem=0.5 -> -0.03125 ok
+fiadds st0=-16 mem=-4 -> -20 ok
+fimuls st0=-16 mem=-4 -> 64 ok
+fisubs st0=-16 mem=-4 -> -12 ok
+fisubrs st0=-16 mem=-4 -> 12 ok
+fidivs st0=-16 mem=-4 -> 4 ok
+fidivrs st0=-16 mem=-4 -> 0.25 ok
+fiaddl st0=-16 mem=100000 -> 99984 ok
+fimull st0=-16 mem=100000 -> -1600000 ok
+fisubl st0=-16 mem=100000 -> -100016 ok
+fisubrl st0=-16 mem=100000 -> 100016 ok
+fidivl st0=-16 mem=8 -> -2 ok
+fidivrl st0=-16 mem=8 -> -0.5 ok
+fidivs2 st0=7.5 mem=-3 -> -2.5 ok
+fidivrs2 st0=0.25 mem=12 -> 48 ok
+fiaddl2 st0=0.5 mem=-2147483648 -> -2147483647.5 ok
+fimuls2 st0=1.5 mem=32767 -> 49150.5 ok
+group mem-forms end top=0
+fchs/fabs 0000000000000000 -> chs 8000000000000000 abs 0000000000000000
+fchs/fabs 8000000000000000 -> chs 0000000000000000 abs 0000000000000000
+fchs/fabs 4004000000000000 -> chs c004000000000000 abs 4004000000000000
+fchs/fabs c004000000000000 -> chs 4004000000000000 abs 4004000000000000
+fchs/fabs 7e37e43c8800759c -> chs fe37e43c8800759c abs 7e37e43c8800759c
+fchs/fabs fe37e43c8800759c -> chs 7e37e43c8800759c abs 7e37e43c8800759c
+fchs/fabs 0000000000000001 -> chs 8000000000000001 abs 0000000000000001
+fchs/fabs 7ff0000000000000 -> chs fff0000000000000 abs 7ff0000000000000
+fchs/fabs fff0000000000000 -> chs 7ff0000000000000 abs 7ff0000000000000
+fsqrt 16 -> 4010000000000000 4
+fsqrt 2 -> 3ff6a09e667f3bcd 1.41421356
+fsqrt 0.25 -> 3fe0000000000000 0.5
+fsqrt 0 -> 0000000000000000 0
+fsqrt -0 -> 8000000000000000 -0
+fsqrt inf -> 7ff0000000000000 inf
+fsqrt -1 -> fff8000000000000 nan
+fsqrt -inf -> fff8000000000000 nan
+fsqrt 1e+300 -> 5f138d352e5096af 1e+150
+fld1 = 1
+fldl2t = 3.3219280948873622
+fldl2e = 1.4426950408889634
+fldpi = 3.1415926535897931
+fldlg2 = 0.3010299956639812
+fldln2 = 0.69314718055994529
+fldz = 0
+group unary end top=0
+fxch st(1): 2 4 8 16 32 0.5 64 0.25 ok
+fxch st(2): 8 2 4 16 32 0.5 64 0.25 ok
+fxch st(3): 16 2 8 4 32 0.5 64 0.25 ok
+fxch st(4): 32 2 8 16 4 0.5 64 0.25 ok
+fxch st(5): 0.5 2 8 16 32 4 64 0.25 ok
+fxch st(6): 64 2 8 16 32 0.5 4 0.25 ok
+fxch st(7): 0.25 2 8 16 32 0.5 64 4 ok
+fld st(0): 4 4 2 8 16 32 0.5 64 ok
+fld st(1): 2 4 2 8 16 32 0.5 64 ok
+fld st(2): 8 4 2 8 16 32 0.5 64 ok
+fld st(3): 16 4 2 8 16 32 0.5 64 ok
+fld st(4): 32 4 2 8 16 32 0.5 64 ok
+fld st(5): 0.5 4 2 8 16 32 0.5 64 ok
+fld st(6): 64 4 2 8 16 32 0.5 64 ok
+fst st(1): 4 4 8 16 32 0.5 64 0.25 ok
+fst st(2): 4 2 4 16 32 0.5 64 0.25 ok
+fst st(3): 4 2 8 4 32 0.5 64 0.25 ok
+fst st(4): 4 2 8 16 4 0.5 64 0.25 ok
+fst st(5): 4 2 8 16 32 4 64 0.25 ok
+fst st(6): 4 2 8 16 32 0.5 4 0.25 ok
+fst st(7): 4 2 8 16 32 0.5 64 4 ok
+fstp st(1): 4 8 16 32 0.5 64 0.25 ok
+fstp st(2): 2 4 16 32 0.5 64 0.25 ok
+fstp st(3): 2 8 4 32 0.5 64 0.25 ok
+fstp st(4): 2 8 16 4 0.5 64 0.25 ok
+fstp st(5): 2 8 16 32 4 64 0.25 ok
+fstp st(6): 2 8 16 32 0.5 4 0.25 ok
+fstp st(7): 2 8 16 32 0.5 64 4 ok
+fsts/fstpl 5 5
+fstps 1e40 -> 7f800000
+group moves end top=0
+frndint rc=nearest in=3fe0000000000000 -> 0000000000000000
+frndint rc=nearest in=bfe0000000000000 -> 8000000000000000
+frndint rc=nearest in=3ff8000000000000 -> 4000000000000000
+frndint rc=nearest in=bff8000000000000 -> c000000000000000
+frndint rc=nearest in=4004000000000000 -> 4000000000000000
+frndint rc=nearest in=c004000000000000 -> c000000000000000
+frndint rc=nearest in=8000000000000000 -> 8000000000000000
+frndint rc=nearest in=3fd3333333333333 -> 0000000000000000
+frndint rc=nearest in=bfd3333333333333 -> 8000000000000000
+frndint rc=nearest in=400c000000000000 -> 4010000000000000
+frndint rc=nearest in=c00c000000000000 -> c010000000000000
+frndint rc=nearest in=401c000000000000 -> 401c000000000000
+frndint rc=nearest in=7e37e43c8800759c -> 7e37e43c8800759c
+frndint rc=down in=3fe0000000000000 -> 0000000000000000
+frndint rc=down in=bfe0000000000000 -> bff0000000000000
+frndint rc=down in=3ff8000000000000 -> 3ff0000000000000
+frndint rc=down in=bff8000000000000 -> c000000000000000
+frndint rc=down in=4004000000000000 -> 4000000000000000
+frndint rc=down in=c004000000000000 -> c008000000000000
+frndint rc=down in=8000000000000000 -> 8000000000000000
+frndint rc=down in=3fd3333333333333 -> 0000000000000000
+frndint rc=down in=bfd3333333333333 -> bff0000000000000
+frndint rc=down in=400c000000000000 -> 4008000000000000
+frndint rc=down in=c00c000000000000 -> c010000000000000
+frndint rc=down in=401c000000000000 -> 401c000000000000
+frndint rc=down in=7e37e43c8800759c -> 7e37e43c8800759c
+frndint rc=up in=3fe0000000000000 -> 3ff0000000000000
+frndint rc=up in=bfe0000000000000 -> 8000000000000000
+frndint rc=up in=3ff8000000000000 -> 4000000000000000
+frndint rc=up in=bff8000000000000 -> bff0000000000000
+frndint rc=up in=4004000000000000 -> 4008000000000000
+frndint rc=up in=c004000000000000 -> c000000000000000
+frndint rc=up in=8000000000000000 -> 8000000000000000
+frndint rc=up in=3fd3333333333333 -> 3ff0000000000000
+frndint rc=up in=bfd3333333333333 -> 8000000000000000
+frndint rc=up in=400c000000000000 -> 4010000000000000
+frndint rc=up in=c00c000000000000 -> c008000000000000
+frndint rc=up in=401c000000000000 -> 401c000000000000
+frndint rc=up in=7e37e43c8800759c -> 7e37e43c8800759c
+frndint rc=trunc in=3fe0000000000000 -> 0000000000000000
+frndint rc=trunc in=bfe0000000000000 -> 8000000000000000
+frndint rc=trunc in=3ff8000000000000 -> 3ff0000000000000
+frndint rc=trunc in=bff8000000000000 -> bff0000000000000
+frndint rc=trunc in=4004000000000000 -> 4000000000000000
+frndint rc=trunc in=c004000000000000 -> c000000000000000
+frndint rc=trunc in=8000000000000000 -> 8000000000000000
+frndint rc=trunc in=3fd3333333333333 -> 0000000000000000
+frndint rc=trunc in=bfd3333333333333 -> 8000000000000000
+frndint rc=trunc in=400c000000000000 -> 4008000000000000
+frndint rc=trunc in=c00c000000000000 -> c008000000000000
+frndint rc=trunc in=401c000000000000 -> 401c000000000000
+frndint rc=trunc in=7e37e43c8800759c -> 7e37e43c8800759c
+group frndint end top=0
+0/0                            fff8000000000000
+inf-inf                        fff8000000000000
+inf*0                          fff8000000000000
+inf/inf                        fff8000000000000
+sqrt(-1)                       fff8000000000000
+qnan+1 (mem)                   7ff8000000000111
+1+qnan (mem)                   7ff8000000000111
+-qnan+1 (mem)                  fff8000000000001
+1+(-qnan) (mem)                fff8000000000001
+qa+qb (mem)                    7ff8000000000222
+qb+qa (mem)                    7ff8000000000222
+qa+qc(neg) (mem)               7ff8000000000111
+qc(neg)+qa (mem)               7ff8000000000111
+qc+qd both neg (mem)           fff8000000000333
+qd+qc both neg (mem)           fff8000000000333
+qa+qb d8                       7ff8000000000222
+qb+qa d8                       7ff8000000000222
+qa+qc d8                       7ff8000000000111
+qc+qa d8                       7ff8000000000111
+qa+qb dc                       7ff8000000000222
+qb+qa dc                       7ff8000000000222
+qc+qd dc                       fff8000000000333
+qd+qc dc                       fff8000000000333
+qnan*0 d8                      7ff8000000000111
+snan1 fld80 -> fstp64          7ff8000000000001
+-snan fld80 -> fstp64          fff8000000000001
+snan1+1 d8                     7ff8000000000001
+1+snan1 d8                     7ff8000000000001
+snan1+qa d8                    7ff8000000000111
+qa+snan1 d8                    7ff8000000000111
+snan1+qb d8                    7ff8000000000222
+qb+snan1 d8                    7ff8000000000222
+snan1+qc d8                    fff8000000000001
+qc+snan1 d8                    fff8000000000001
+snan1+snan2 d8                 7ff8000000000002
+snan2+snan1 d8                 7ff8000000000002
+snan1+(-snan) d8               7ff8000000000001
+(-snan)+snan1 d8               7ff8000000000001
+group nans end top=0

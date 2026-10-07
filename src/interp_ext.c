@@ -17,6 +17,7 @@
 #include "ocerz/interp.h"
 #include "ocerz/interp_common.h"
 #include "ocerz/vm.h"
+#include "ocerz/x87.h"
 
 #include <fenv.h>
 #include <math.h>
@@ -484,18 +485,9 @@ static int ext_xgetbv(OcerzCPU *cpu)
 static int ext_fxsave(OcerzCPU *cpu, const X86Insn *insn)
 {
     uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
-    ocerz_st(ea + 0, 2, cpu->fcw);
-    ocerz_st(ea + 2, 2, cpu->fsw);
-    ocerz_st(ea + 4, 1, cpu->ftw);
+    ocerz_x87_fxsave(cpu, ea);
     ocerz_st(ea + 24, 4, cpu->mxcsr);
-
     ocerz_st(ea + 28, 4, 0x0000ffffu);
-    for (int i = 0; i < 8; i++) {
-        uint64_t bits;
-        memcpy(&bits, &cpu->fpr[i], 8);
-        ocerz_st(ea + 32 + i * 16 + 0, 8, bits);
-        ocerz_st(ea + 32 + i * 16 + 8, 8, 0);
-    }
 
     for (int i = 0; i < 16; i++)
         ocerz_st128(ea + 160 + (uint64_t)i * 16, cpu->xmm[i]);
@@ -505,15 +497,9 @@ static int ext_fxsave(OcerzCPU *cpu, const X86Insn *insn)
 static int ext_fxrstor(OcerzCPU *cpu, const X86Insn *insn)
 {
     uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
-    cpu->fcw = (uint16_t)ocerz_ld(ea + 0, 2);
-    cpu->fsw = (uint16_t)ocerz_ld(ea + 2, 2);
-    cpu->ftw = (uint8_t)ocerz_ld(ea + 4, 1);
+    ocerz_x87_fxrstor(cpu, ea);
     cpu->mxcsr = (uint32_t)ocerz_ld(ea + 24, 4);
     ocerz_apply_mxcsr_round(cpu->mxcsr);
-    for (int i = 0; i < 8; i++) {
-        uint64_t bits = ocerz_ld(ea + 32 + i * 16 + 0, 8);
-        memcpy(&cpu->fpr[i], &bits, 8);
-    }
     for (int i = 0; i < 16; i++)
         cpu->xmm[i] = ocerz_ld128(ea + 160 + (uint64_t)i * 16);
     return OCERZ_STEP_OK;
@@ -523,17 +509,8 @@ static int ext_xsave(OcerzCPU *cpu, const X86Insn *insn)
 {
     uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
     uint64_t rfbm = (uint32_t)cpu->gpr[OCERZ_RAX] & 7u;
-    if (rfbm & 1) {
-        ocerz_st(ea + 0, 2, cpu->fcw);
-        ocerz_st(ea + 2, 2, cpu->fsw);
-        ocerz_st(ea + 4, 1, cpu->ftw);
-        for (int i = 0; i < 8; i++) {
-            uint64_t bits;
-            memcpy(&bits, &cpu->fpr[i], 8);
-            ocerz_st(ea + 32 + i * 16 + 0, 8, bits);
-            ocerz_st(ea + 32 + i * 16 + 8, 8, 0);
-        }
-    }
+    if (rfbm & 1)
+        ocerz_x87_fxsave(cpu, ea);
     if (rfbm & 6) {
         ocerz_st(ea + 24, 4, cpu->mxcsr);
         ocerz_st(ea + 28, 4, 0x0000ffffu);
@@ -555,19 +532,11 @@ static int ext_xrstor(OcerzCPU *cpu, const X86Insn *insn)
     uint64_t bv = ocerz_ld(ea + 512, 8);
     if (rfbm & 1) {
         if (bv & 1) {
-            cpu->fcw = (uint16_t)ocerz_ld(ea + 0, 2);
-            cpu->fsw = (uint16_t)ocerz_ld(ea + 2, 2);
-            cpu->ftw = (uint8_t)ocerz_ld(ea + 4, 1);
-            for (int i = 0; i < 8; i++) {
-                uint64_t bits = ocerz_ld(ea + 32 + i * 16, 8);
-                memcpy(&cpu->fpr[i], &bits, 8);
-            }
+            ocerz_x87_fxrstor(cpu, ea);
         } else {
-            cpu->fcw = 0x037f;
-            cpu->fsw = 0;
-            cpu->ftw = 0;
-            cpu->ftop = 0;
+            ocerz_x87_reset(cpu);
             memset(cpu->fpr, 0, sizeof cpu->fpr);
+            cpu->fpr_x_ok = 0;
         }
     }
     if (rfbm & 6) {
@@ -634,506 +603,13 @@ static int ext_misc(OcerzCPU *cpu, const X86Insn *insn)
     }
 }
 
-static double x87_st(const OcerzCPU *cpu, int i)
-{
-    return cpu->fpr[(cpu->ftop + i) & 7];
-}
-
-static void x87_set_st(OcerzCPU *cpu, int i, double v)
-{
-    cpu->fpr[(cpu->ftop + i) & 7] = v;
-}
-
-static void x87_push(OcerzCPU *cpu, double v)
-{
-    cpu->ftop = (cpu->ftop - 1) & 7;
-    cpu->fpr[cpu->ftop] = v;
-    cpu->ftw = 0xff;
-}
-
-static double x87_pop(OcerzCPU *cpu)
-{
-    double v = cpu->fpr[cpu->ftop];
-    cpu->ftop = (cpu->ftop + 1) & 7;
-    return v;
-}
-
-static int x87_round_mode(const OcerzCPU *cpu)
-{
-    switch ((cpu->fcw >> 10) & 3) {
-    case 0: return FE_TONEAREST;
-    case 1: return FE_DOWNWARD;
-    case 2: return FE_UPWARD;
-    default: return FE_TOWARDZERO;
-    }
-}
-
-static double x87_rint_rc(const OcerzCPU *cpu, double v)
-{
-    int saved = fegetround();
-    fesetround(x87_round_mode(cpu));
-    double r = rint(v);
-    fesetround(saved);
-    return r;
-}
-
-static double x87_read_f80(const uint8_t *b)
-{
-    uint64_t mant = 0;
-    memcpy(&mant, b, 8);
-    uint16_t se = (uint16_t)(b[8] | (b[9] << 8));
-    int sign = (se >> 15) & 1;
-    int exp = se & 0x7fff;
-
-    if (exp == 0 && mant == 0)
-        return sign ? -0.0 : 0.0;
-    if (exp == 0x7fff) {
-        if (mant << 1 == 0)
-            return sign ? -INFINITY : INFINITY;
-        return sign ? -NAN : NAN;
-    }
-    double m = (double)mant / 9223372036854775808.0;
-    double v = ldexp(m, exp - 16383);
-    return sign ? -v : v;
-}
-
-static void x87_write_f80(uint8_t *b, double v)
-{
-    uint64_t mant;
-    uint16_t se;
-
-    if (v == 0.0) {
-        mant = 0;
-        se = signbit(v) ? 0x8000 : 0;
-    } else if (isinf(v)) {
-        mant = (uint64_t)1 << 63;
-        se = (uint16_t)(0x7fff | (v < 0 ? 0x8000 : 0));
-    } else if (isnan(v)) {
-        mant = ((uint64_t)1 << 63) | ((uint64_t)1 << 62);
-        se = 0x7fff;
-    } else {
-        int sign = signbit(v);
-        double a = fabs(v);
-        int exp;
-        double frac = frexp(a, &exp);
-        int e80 = exp - 1 + 16383;
-        double m = frac * 2.0;
-        mant = (uint64_t)ldexp(m, 63);
-        se = (uint16_t)((e80 & 0x7fff) | (sign ? 0x8000 : 0));
-    }
-    memcpy(b, &mant, 8);
-    b[8] = (uint8_t)(se & 0xff);
-    b[9] = (uint8_t)(se >> 8);
-}
-
-static double x87_load_real(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op)
-{
-    uint64_t ea = ocerz_ea(cpu, insn, op);
-    if (op->size == 4) {
-        uint32_t bits = (uint32_t)ocerz_ld(ea, 4);
-        float f;
-        memcpy(&f, &bits, 4);
-        return (double)f;
-    }
-    if (op->size == 8) {
-        uint64_t bits = ocerz_ld(ea, 8);
-        double d;
-        memcpy(&d, &bits, 8);
-        return d;
-    }
-    uint8_t buf[10];
-    memcpy(buf, ocerz_g2h(ea), 10);
-    return x87_read_f80(buf);
-}
-
-static void x87_store_real(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, double v)
-{
-    uint64_t ea = ocerz_ea(cpu, insn, op);
-    if (op->size == 4) {
-        float f = (float)v;
-        uint32_t bits;
-        memcpy(&bits, &f, 4);
-        ocerz_st(ea, 4, bits);
-    } else if (op->size == 8) {
-        uint64_t bits;
-        memcpy(&bits, &v, 8);
-        ocerz_st(ea, 8, bits);
-    } else {
-        uint8_t buf[10];
-        x87_write_f80(buf, v);
-        memcpy(ocerz_g2h(ea), buf, 10);
-    }
-}
-
-static double x87_load_int(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op)
-{
-    uint64_t ea = ocerz_ea(cpu, insn, op);
-    return (double)ocerz_sext(ocerz_ld(ea, op->size), op->size);
-}
-
-static void x87_store_int(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, double v, int round)
-{
-    uint64_t ea = ocerz_ea(cpu, insn, op);
-    double r = round ? x87_rint_rc(cpu, v) : v;
-    int64_t iv = (int64_t)r;
-    ocerz_st(ea, op->size, (uint64_t)iv);
-}
-
-static void x87_set_status_cc(OcerzCPU *cpu, int c0, int c2, int c3)
-{
-    cpu->fsw &= ~(uint16_t)((1u << 8) | (1u << 9) | (1u << 10) | (1u << 14));
-    if (c0)
-        cpu->fsw |= (uint16_t)(1u << 8);
-    if (c2)
-        cpu->fsw |= (uint16_t)(1u << 10);
-    if (c3)
-        cpu->fsw |= (uint16_t)(1u << 14);
-}
-
-static void x87_compare_fsw(OcerzCPU *cpu, double a, double b)
-{
-    if (isnan(a) || isnan(b))
-        x87_set_status_cc(cpu, 1, 1, 1);
-    else if (a < b)
-        x87_set_status_cc(cpu, 1, 0, 0);
-    else if (a > b)
-        x87_set_status_cc(cpu, 0, 0, 0);
-    else
-        x87_set_status_cc(cpu, 0, 0, 1);
-}
-
-static void x87_compare_rflags(OcerzCPU *cpu, double a, double b)
-{
-    cpu->rflags &= ~(uint64_t)(OCERZ_OF | OCERZ_AF | OCERZ_SF | OCERZ_ZF | OCERZ_PF | OCERZ_CF);
-    if (isnan(a) || isnan(b))
-        cpu->rflags |= OCERZ_ZF | OCERZ_PF | OCERZ_CF;
-    else if (a < b)
-        cpu->rflags |= OCERZ_CF;
-    else if (a == b)
-        cpu->rflags |= OCERZ_ZF;
-}
-
-static uint16_t x87_synth_fsw(const OcerzCPU *cpu)
-{
-    uint16_t s = cpu->fsw & ~(uint16_t)(7u << 11);
-    s |= (uint16_t)((cpu->ftop & 7) << 11);
-    return s;
-}
-
-static int x87_is_int_form(int op)
-{
-    return op == OCERZ_OP_FIADD || op == OCERZ_OP_FISUB ||
-           op == OCERZ_OP_FISUBR || op == OCERZ_OP_FIMUL ||
-           op == OCERZ_OP_FIDIV || op == OCERZ_OP_FIDIVR;
-}
-
-static int x87_is_pop_form(int op)
-{
-    return op == OCERZ_OP_FADDP || op == OCERZ_OP_FSUBP ||
-           op == OCERZ_OP_FSUBRP || op == OCERZ_OP_FMULP ||
-           op == OCERZ_OP_FDIVP || op == OCERZ_OP_FDIVRP;
-}
-
-static int ext_x87_arith(OcerzCPU *cpu, const X86Insn *insn)
-{
-    int op = insn->op;
-    int pop = x87_is_pop_form(op);
-    int has_mem = (insn->nops > 0 && insn->ops[0].kind != OCERZ_OPK_ST);
-
-    int dst, src_is_mem = 0;
-    double other = 0.0;
-
-    if (has_mem) {
-        dst = 0;
-        src_is_mem = 1;
-        other = x87_is_int_form(op)
-                    ? x87_load_int(cpu, insn, &insn->ops[0])
-                    : x87_load_real(cpu, insn, &insn->ops[0]);
-    } else if (pop) {
-        dst = (insn->nops > 0 && insn->ops[0].kind == OCERZ_OPK_ST)
-                  ? insn->ops[0].reg : 1;
-        other = x87_st(cpu, 0);
-    } else {
-        dst = 0;
-        int sti = (insn->nops > 0 && insn->ops[0].kind == OCERZ_OPK_ST)
-                      ? insn->ops[0].reg : 1;
-        other = x87_st(cpu, sti);
-    }
-    (void)src_is_mem;
-
-    double a = x87_st(cpu, dst);
-    double r;
-    switch (op) {
-    case OCERZ_OP_FADD: case OCERZ_OP_FADDP: case OCERZ_OP_FIADD:
-        r = a + other; break;
-    case OCERZ_OP_FSUB: case OCERZ_OP_FSUBP: case OCERZ_OP_FISUB:
-        r = a - other; break;
-    case OCERZ_OP_FSUBR: case OCERZ_OP_FSUBRP: case OCERZ_OP_FISUBR:
-        r = other - a; break;
-    case OCERZ_OP_FMUL: case OCERZ_OP_FMULP: case OCERZ_OP_FIMUL:
-        r = a * other; break;
-    case OCERZ_OP_FDIV: case OCERZ_OP_FDIVP: case OCERZ_OP_FIDIV:
-        r = a / other; break;
-    case OCERZ_OP_FDIVR: case OCERZ_OP_FDIVRP: case OCERZ_OP_FIDIVR:
-        r = other / a; break;
-    default:
-        return OCERZ_EUNSUP;
-    }
-
-    x87_set_st(cpu, dst, r);
-    if (pop)
-        x87_pop(cpu);
-    return OCERZ_STEP_OK;
-}
-
-static int ext_x87_compare(OcerzCPU *cpu, const X86Insn *insn)
-{
-    int op = insn->op;
-    double a = x87_st(cpu, 0);
-    double b;
-    int pops = 0;
-
-    switch (op) {
-    case OCERZ_OP_FCOM: case OCERZ_OP_FUCOM:
-        b = (insn->nops > 0 && insn->ops[0].kind == OCERZ_OPK_ST)
-            ? x87_st(cpu, insn->ops[0].reg)
-            : (insn->nops > 0 ? x87_load_real(cpu, insn, &insn->ops[0]) : x87_st(cpu, 1));
-        x87_compare_fsw(cpu, a, b);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FCOMP: case OCERZ_OP_FUCOMP:
-        b = (insn->nops > 0 && insn->ops[0].kind == OCERZ_OPK_ST)
-            ? x87_st(cpu, insn->ops[0].reg)
-            : (insn->nops > 0 ? x87_load_real(cpu, insn, &insn->ops[0]) : x87_st(cpu, 1));
-        x87_compare_fsw(cpu, a, b);
-        x87_pop(cpu);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FCOMPP: case OCERZ_OP_FUCOMPP:
-        b = x87_st(cpu, 1);
-        x87_compare_fsw(cpu, a, b);
-        x87_pop(cpu);
-        x87_pop(cpu);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FTST:
-        x87_compare_fsw(cpu, a, 0.0);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FCOMI: case OCERZ_OP_FUCOMI:
-        b = x87_st(cpu, insn->ops[0].kind == OCERZ_OPK_ST ? insn->ops[0].reg : 1);
-        x87_compare_rflags(cpu, a, b);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FCOMIP: case OCERZ_OP_FUCOMIP:
-        b = x87_st(cpu, insn->ops[0].kind == OCERZ_OPK_ST ? insn->ops[0].reg : 1);
-        x87_compare_rflags(cpu, a, b);
-        x87_pop(cpu);
-        return OCERZ_STEP_OK;
-    default:
-        (void)pops;
-        return OCERZ_EUNSUP;
-    }
-}
-
-static int ext_x87(OcerzCPU *cpu, const X86Insn *insn)
-{
-    int op = insn->op;
-
-    switch (op) {
-    case OCERZ_OP_FLD:
-        x87_push(cpu, (insn->ops[0].kind == OCERZ_OPK_ST)
-                          ? x87_st(cpu, insn->ops[0].reg)
-                          : x87_load_real(cpu, insn, &insn->ops[0]));
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FILD:
-        x87_push(cpu, x87_load_int(cpu, insn, &insn->ops[0]));
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FST:
-        if (insn->ops[0].kind == OCERZ_OPK_ST)
-            x87_set_st(cpu, insn->ops[0].reg, x87_st(cpu, 0));
-        else
-            x87_store_real(cpu, insn, &insn->ops[0], x87_st(cpu, 0));
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FSTP:
-        if (insn->ops[0].kind == OCERZ_OPK_ST)
-            x87_set_st(cpu, insn->ops[0].reg, x87_st(cpu, 0));
-        else
-            x87_store_real(cpu, insn, &insn->ops[0], x87_st(cpu, 0));
-        x87_pop(cpu);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FIST:
-        x87_store_int(cpu, insn, &insn->ops[0], x87_st(cpu, 0), 1);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FISTP:
-        x87_store_int(cpu, insn, &insn->ops[0], x87_st(cpu, 0), 1);
-        x87_pop(cpu);
-        return OCERZ_STEP_OK;
-
-    case OCERZ_OP_FLDCW:
-        cpu->fcw = (uint16_t)ocerz_ld(ocerz_ea(cpu, insn, &insn->ops[0]), 2);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FNSTCW:
-        ocerz_st(ocerz_ea(cpu, insn, &insn->ops[0]), 2, cpu->fcw);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FNSTSW:
-        if (insn->nops > 0 && insn->ops[0].kind == OCERZ_OPK_REG)
-            ocerz_write_gpr(cpu, insn->ops[0].reg, 2, 0, x87_synth_fsw(cpu));
-        else
-            ocerz_st(ocerz_ea(cpu, insn, &insn->ops[0]), 2, x87_synth_fsw(cpu));
-        return OCERZ_STEP_OK;
-
-    case OCERZ_OP_FNSTENV: {
-        uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
-        ocerz_st(ea + 0, 4, cpu->fcw);
-        ocerz_st(ea + 4, 4, x87_synth_fsw(cpu));
-        ocerz_st(ea + 8, 4, cpu->ftw);
-        for (int i = 12; i < 28; i += 4)
-            ocerz_st(ea + i, 4, 0);
-        return OCERZ_STEP_OK;
-    }
-    case OCERZ_OP_FLDENV: {
-        uint64_t ea = ocerz_ea(cpu, insn, &insn->ops[0]);
-        cpu->fcw = (uint16_t)ocerz_ld(ea + 0, 4);
-        cpu->fsw = (uint16_t)ocerz_ld(ea + 4, 4);
-        cpu->ftw = (uint8_t)ocerz_ld(ea + 8, 4);
-        cpu->ftop = (uint8_t)((cpu->fsw >> 11) & 7);
-        return OCERZ_STEP_OK;
-    }
-
-    case OCERZ_OP_FXCH: {
-        int i = (insn->nops > 0 && insn->ops[0].kind == OCERZ_OPK_ST) ? insn->ops[0].reg : 1;
-        double t = x87_st(cpu, 0);
-        x87_set_st(cpu, 0, x87_st(cpu, i));
-        x87_set_st(cpu, i, t);
-        return OCERZ_STEP_OK;
-    }
-    case OCERZ_OP_FCHS:
-        x87_set_st(cpu, 0, -x87_st(cpu, 0));
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FABS:
-        x87_set_st(cpu, 0, fabs(x87_st(cpu, 0)));
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FSQRT:
-        x87_set_st(cpu, 0, __builtin_sqrt(x87_st(cpu, 0)));
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FRNDINT:
-        x87_set_st(cpu, 0, x87_rint_rc(cpu, x87_st(cpu, 0)));
-        return OCERZ_STEP_OK;
-
-    case OCERZ_OP_FLDZ: x87_push(cpu, 0.0); return OCERZ_STEP_OK;
-    case OCERZ_OP_FLD1: x87_push(cpu, 1.0); return OCERZ_STEP_OK;
-    case OCERZ_OP_FLDPI: x87_push(cpu, 3.14159265358979311600); return OCERZ_STEP_OK;
-    case OCERZ_OP_FLDL2E: x87_push(cpu, 1.44269504088896340736); return OCERZ_STEP_OK;
-    case OCERZ_OP_FLDL2T: x87_push(cpu, 3.32192809488736234781); return OCERZ_STEP_OK;
-    case OCERZ_OP_FLDLG2: x87_push(cpu, 0.30102999566398119521); return OCERZ_STEP_OK;
-    case OCERZ_OP_FLDLN2: x87_push(cpu, 0.69314718055994530942); return OCERZ_STEP_OK;
-
-    case OCERZ_OP_F2XM1:
-        x87_set_st(cpu, 0, exp2(x87_st(cpu, 0)) - 1.0);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FYL2X: {
-        double r = x87_st(cpu, 1) * log2(x87_st(cpu, 0));
-        x87_pop(cpu);
-        x87_set_st(cpu, 0, r);
-        return OCERZ_STEP_OK;
-    }
-    case OCERZ_OP_FPTAN: {
-        double r = tan(x87_st(cpu, 0));
-        x87_set_st(cpu, 0, r);
-        x87_push(cpu, 1.0);
-        x87_set_status_cc(cpu, 0, 0, 0);
-        return OCERZ_STEP_OK;
-    }
-    case OCERZ_OP_FPATAN: {
-        double r = atan2(x87_st(cpu, 1), x87_st(cpu, 0));
-        x87_pop(cpu);
-        x87_set_st(cpu, 0, r);
-        return OCERZ_STEP_OK;
-    }
-    case OCERZ_OP_FPREM: {
-        double r = fmod(x87_st(cpu, 0), x87_st(cpu, 1));
-        x87_set_st(cpu, 0, r);
-        x87_set_status_cc(cpu, 0, 0, 0);
-        return OCERZ_STEP_OK;
-    }
-    case OCERZ_OP_FPREM1: {
-        double r = remainder(x87_st(cpu, 0), x87_st(cpu, 1));
-        x87_set_st(cpu, 0, r);
-        x87_set_status_cc(cpu, 0, 0, 0);
-        return OCERZ_STEP_OK;
-    }
-    case OCERZ_OP_FSCALE: {
-        double r = ldexp(x87_st(cpu, 0), (int)trunc(x87_st(cpu, 1)));
-        x87_set_st(cpu, 0, r);
-        return OCERZ_STEP_OK;
-    }
-    case OCERZ_OP_FSIN:
-        x87_set_st(cpu, 0, sin(x87_st(cpu, 0)));
-        x87_set_status_cc(cpu, 0, 0, 0);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FCOS:
-        x87_set_st(cpu, 0, cos(x87_st(cpu, 0)));
-        x87_set_status_cc(cpu, 0, 0, 0);
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FSINCOS: {
-        double s = sin(x87_st(cpu, 0));
-        double c = cos(x87_st(cpu, 0));
-        x87_set_st(cpu, 0, s);
-        x87_push(cpu, c);
-        x87_set_status_cc(cpu, 0, 0, 0);
-        return OCERZ_STEP_OK;
-    }
-
-    case OCERZ_OP_FCMOVCC:
-        if (ocerz_cc_eval(cpu, insn->cc)) {
-            int i = (insn->ops[0].kind == OCERZ_OPK_ST) ? insn->ops[0].reg : 1;
-            x87_set_st(cpu, 0, x87_st(cpu, i));
-        }
-        return OCERZ_STEP_OK;
-
-    case OCERZ_OP_FNINIT:
-        cpu->fcw = 0x037f;
-        cpu->fsw = 0;
-        cpu->ftw = 0;
-        cpu->ftop = 0;
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FNCLEX:
-        cpu->fsw &= ~(uint16_t)0x80ff;
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FFREE:
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FINCSTP:
-        cpu->ftop = (cpu->ftop + 1) & 7;
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FDECSTP:
-        cpu->ftop = (cpu->ftop - 1) & 7;
-        return OCERZ_STEP_OK;
-    case OCERZ_OP_FWAIT:
-        return OCERZ_STEP_OK;
-
-    case OCERZ_OP_FADD: case OCERZ_OP_FADDP: case OCERZ_OP_FIADD:
-    case OCERZ_OP_FSUB: case OCERZ_OP_FSUBP: case OCERZ_OP_FISUB:
-    case OCERZ_OP_FSUBR: case OCERZ_OP_FSUBRP: case OCERZ_OP_FISUBR:
-    case OCERZ_OP_FMUL: case OCERZ_OP_FMULP: case OCERZ_OP_FIMUL:
-    case OCERZ_OP_FDIV: case OCERZ_OP_FDIVP: case OCERZ_OP_FIDIV:
-    case OCERZ_OP_FDIVR: case OCERZ_OP_FDIVRP: case OCERZ_OP_FIDIVR:
-        return ext_x87_arith(cpu, insn);
-
-    case OCERZ_OP_FCOM: case OCERZ_OP_FCOMP: case OCERZ_OP_FCOMPP:
-    case OCERZ_OP_FUCOM: case OCERZ_OP_FUCOMP: case OCERZ_OP_FUCOMPP:
-    case OCERZ_OP_FTST:
-    case OCERZ_OP_FCOMI: case OCERZ_OP_FCOMIP:
-    case OCERZ_OP_FUCOMI: case OCERZ_OP_FUCOMIP:
-        return ext_x87_compare(cpu, insn);
-
-    default:
-        return OCERZ_EUNSUP;
-    }
-}
-
 int ocerz_interp_ext(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
     (void)vm;
     int op = insn->op;
 
     if (op > OCERZ_OP_X87_FIRST && op < OCERZ_OP_SSE_FIRST)
-        return ext_x87(cpu, insn);
+        return ocerz_x87_exec(cpu, insn);
 
     switch (op) {
     case OCERZ_OP_MOVS:

@@ -393,6 +393,32 @@ run_dlsym_deps_case() {
     done
 }
 
+# A test whose expected output is a golden file, Rosetta's stdout, too long to
+# echo into every PASS line; a failure names the first differing line.
+run_golden_case() {
+    local name="$1" src="$2" golden="$3"
+    if ! clang -arch x86_64 -O1 -o "$TMP/$name" "$src" 2>/dev/null; then
+        echo "FAIL $name (compile)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$TMP/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$TMP/$name"
+        fi
+        got_code=$?
+        if [ "$got_code" = 0 ] && cmp -s "$out_file" "$golden"; then
+            echo "PASS $name-$mode"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (exit=$got_code; first difference: $(diff "$golden" "$out_file" | sed -n 2p))"
+            fail=$((fail+1))
+        fi
+    done
+}
+
 run_low_golden_case() {
     local name="$1" src="$2" golden="$3"
     local dir="$TMP/$name"
@@ -811,6 +837,11 @@ run_file_case dthread_signal tests/dynamic/thread_signal.c 'OK'
 run_file_case dshmem_coherence tests/dynamic/shmem_coherence.c 'OK'
 run_file_case drsp_rmw tests/dynamic/rsp_rmw.c '554ae911bb61770a' -mno-red-zone
 run_file_case dcvt_packed tests/dynamic/cvt_packed.c '144 25523f4977e3d6c4'
+run_golden_case dx87_arith tests/dynamic/x87_arith.c tests/dynamic/x87_arith.out
+run_golden_case dx87_compare tests/dynamic/x87_compare.c tests/dynamic/x87_compare.out
+run_golden_case dx87_int tests/dynamic/x87_int.c tests/dynamic/x87_int.out
+run_golden_case dx87_trans tests/dynamic/x87_trans.c tests/dynamic/x87_trans.out
+run_golden_case dx87_state tests/dynamic/x87_state.c tests/dynamic/x87_state.out
 run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
 run_file_case dlane_fault_guard tests/dynamic/lane_fault_guard.c 'OK' -Wl,-no_pie
 run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
@@ -925,6 +956,11 @@ run_low_golden_case djcc_chain_rec_low tests/guest/jcc_chain_rec.c tests/guest/e
 run_low_golden_case drsp_ops_low tests/guest/rsp_ops.c tests/guest/expect/rsp_ops.out
 run_low_golden_case drsp_rmw_low tests/dynamic/rsp_rmw.c tests/dynamic/rsp_rmw.out
 run_low_golden_case dcvt_packed_low tests/dynamic/cvt_packed.c tests/dynamic/cvt_packed.out
+run_low_golden_case dx87_arith_low tests/dynamic/x87_arith.c tests/dynamic/x87_arith.out
+run_low_golden_case dx87_compare_low tests/dynamic/x87_compare.c tests/dynamic/x87_compare.out
+run_low_golden_case dx87_int_low tests/dynamic/x87_int.c tests/dynamic/x87_int.out
+run_low_golden_case dx87_trans_low tests/dynamic/x87_trans.c tests/dynamic/x87_trans.out
+run_low_golden_case dx87_state_low tests/dynamic/x87_state.c tests/dynamic/x87_state.out
 run_low_golden_case dlow_top_strip tests/dynamic/low_top_strip.c tests/dynamic/low_top_strip.out
 export OCERZ_NO_PLAIN_MEM=1
 run_file_case dalign_ordered tests/dynamic/align_ordered.c '370d1a721afe9c4a'

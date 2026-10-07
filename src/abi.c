@@ -264,6 +264,7 @@
 #include "ocerz/mem.h"
 #include "ocerz/interp.h"
 #include "ocerz/vm.h"
+#include "ocerz/x87.h"
 
 #include <errno.h>
 #include <dlfcn.h>
@@ -1209,9 +1210,7 @@ void ocerz_abi_write_result(const OcerzAbiSig *sig, OcerzCPU *cpu, const OcerzAb
     if (sig->ret == 'D') {
         double d;
         memcpy(&d, &call->rv[0], sizeof d);
-        cpu->ftop = (cpu->ftop - 1) & 7;
-        cpu->fpr[cpu->ftop] = d;
-        cpu->ftw = 0xff;
+        ocerz_x87_push(cpu, d);
         uint64_t rsp = cpu->gpr[OCERZ_RSP];
         cpu->rip = ocerz_ld(rsp, 8);
         cpu->gpr[OCERZ_RSP] = rsp + 8;
