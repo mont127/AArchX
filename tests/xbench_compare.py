@@ -20,7 +20,8 @@ REPS = int(os.environ.get("REPS", "3"))
 TARGET = float(os.environ.get("TARGET", "0.6"))
 DFLT = dict(icall=50000000, jtab=50000000, depchain=100000000, brmiss=50000000,
             memcpy=2000000, str=20000000, hash=20000, idiv=10000000, fpsse=30000000,
-            fpvec=5000, chase=30000000, qsort=30, leafcall=50000000, mixed=20000, vm=500000)
+            fpvec=5000, chase=30000000, qsort=30, leafcall=50000000, mixed=20000, vm=500000,
+            x87=20000, x87pc24=20000)
 KERNELS = os.environ.get("KERNELS", ",".join(DFLT)).split(",")
 
 LAST_ERR = {}

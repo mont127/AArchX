@@ -59,6 +59,16 @@
  * SDM part, Rosetta wins, since it is what these programs ran on: FNSTENV
  * leaves the exception masks alone, and the pad words of the environment
  * images are zero.
+ *
+ * ---- the translated forms ----
+ * src/jit.c translates the common forms with this file as their
+ * specification.  A translated instruction leaves every value, image, image
+ * bit, tag, TOP and fsw bit that this file would, exception flags included -
+ * it computes them rather than reading FPSR - and comes here for whatever it
+ * cannot reproduce: NaNs, infinite results, tiny products and quotients,
+ * rounding other than to nearest, integer stores out of range or from a valid
+ * image.  tests/diff32.c compares the two bit for bit, so a change to the
+ * semantics here is a change there.
  */
 #include "ocerz/x87.h"
 #include "ocerz/interp.h"
@@ -473,6 +483,11 @@ void ocerz_x87_from_f80(OcerzCPU *cpu, int p, const uint8_t in[10])
     uint64_t mant;
     memcpy(&mant, in, 8);
     set_phys_image(cpu, p, mant, (uint16_t)(in[8] | (in[9] << 8)));
+}
+
+uint64_t ocerz_x87_f80_dbits(uint64_t mant, unsigned se)
+{
+    return f80_to_dbits(mant, se);
 }
 
 /* ---- memory operands ---- */

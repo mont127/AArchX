@@ -455,6 +455,11 @@ void a64_csel(A64Buf *b, int sf, int rd, int rn, int rm, int cond)
     a64_emit32(b, 0x1a800000u | ((uint32_t)sf << 31) | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
 }
 
+void a64_csneg(A64Buf *b, int sf, int rd, int rn, int rm, int cond)
+{
+    a64_emit32(b, 0x5a800400u | ((uint32_t)sf << 31) | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
+}
+
 void a64_mul(A64Buf *b, int sf, int rd, int rn, int rm)
 {
     a64_emit32(b, 0x1b007c00u | ((uint32_t)sf << 31) | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
@@ -681,6 +686,14 @@ void a64_fcvt_s2d(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x1e22c000u | ((uin
 void a64_fcvtzs(A64Buf *b, int sf, int dbl, int rd, int vn)
 {
     a64_emit32(b, 0x1e380000u | ((uint32_t)sf << 31) | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31));
+}
+void a64_fcvtns(A64Buf *b, int sf, int dbl, int rd, int vn)
+{
+    a64_emit32(b, 0x1e200000u | ((uint32_t)sf << 31) | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31));
+}
+void a64_fcmp_zero(A64Buf *b, int dbl, int vn)
+{
+    a64_emit32(b, 0x1e202008u | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5));
 }
 void a64_scvtf(A64Buf *b, int sf, int dbl, int vd, int rn)
 {

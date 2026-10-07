@@ -108,6 +108,7 @@ void a64_sxtw(A64Buf *b, int rd, int rn);
 void a64_cset(A64Buf *b, int rd, int cond);
 void a64_csetm(A64Buf *b, int rd, int cond);
 void a64_csel(A64Buf *b, int sf, int rd, int rn, int rm, int cond);
+void a64_csneg(A64Buf *b, int sf, int rd, int rn, int rm, int cond);
 
 void a64_mul(A64Buf *b, int sf, int rd, int rn, int rm);
 void a64_umulh(A64Buf *b, int rd, int rn, int rm);
@@ -161,6 +162,8 @@ void a64_fcmp(A64Buf *b, int dbl, int vn, int vm);
 void a64_fcvt_d2s(A64Buf *b, int vd, int vn);
 void a64_fcvt_s2d(A64Buf *b, int vd, int vn);
 void a64_fcvtzs(A64Buf *b, int sf, int dbl, int rd, int vn);
+void a64_fcvtns(A64Buf *b, int sf, int dbl, int rd, int vn);
+void a64_fcmp_zero(A64Buf *b, int dbl, int vn);
 void a64_scvtf(A64Buf *b, int sf, int dbl, int vd, int rn);
 void a64_fmov_x_from_v(A64Buf *b, int sf, int rd, int vn);
 void a64_fmov_v_from_x(A64Buf *b, int sf, int vd, int rn);
