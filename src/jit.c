@@ -250,12 +250,12 @@
  * (ocerz_jit_exec_run_at).  An fcmovcc right after fcomi(p) branches on that
  * compare's own flags.  FILD qword followed by FISTP qword, Delphi's
  * eight-byte Move(), stores the integer rebuilt from the image FILD just made,
- * so the copy is exact.  On xbench's x87 kernel, twenty-two x87 instructions
- * an element, 10,000 rounds took 1.15 s through the interpreter and take
- * 0.16 s, where Rosetta takes 0.73 s.  Keeping ST(i) in V registers across a
- * run instead, written through so that every exit stays exact, measured 6%
- * slower, so the values stay in memory.  OCERZ_NO_JIT_X87=1 interprets x87
- * again.
+ * so the copy is exact.  32-bit blocks take the same forms through
+ * x87_inline_ok.  On xbench's x87 kernel, twenty-two x87 instructions an
+ * element, 10,000 rounds took 1.15 s through the interpreter and take 0.16 s,
+ * where Rosetta takes 0.73 s.  Keeping ST(i) in V registers across a run
+ * instead, written through so that every exit stays exact, measured 6% slower,
+ * so the values stay in memory.  OCERZ_NO_JIT_X87=1 interprets x87 again.
  *
  * ---- control flow ----
  * A block may run past a FORWARD conditional branch, continuing inline and
@@ -12929,6 +12929,7 @@ static int m32_inline_ok(const X86Insn *insn)
 {
     if (insn->addrsize != 4)
         return 0;
+    if (x87_inline_ok(insn)) return 1;
     switch (insn->op) {
     case OCERZ_OP_NOP: case OCERZ_OP_PAUSE:
     case OCERZ_OP_PREFETCH: case OCERZ_OP_CLFLUSH:
