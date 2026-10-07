@@ -79,7 +79,7 @@
  * --bench is not part of the gate.  It times a few loops of the shapes 32-bit
  * Windows code is made of - an SEH frame pushed and popped through fs:[0],
  * TEB and TLS reads, the interlocked operations, bit tests, arithmetic on
- * memory - under the JIT in either layout, which is how a slow call is
+ * memory, x87 - under the JIT in either layout, which is how a slow call is
  * measured against the inlined form that replaces it.
  *
  * ---- what it found ----
@@ -95,6 +95,19 @@
  * liveness pass predicting a fusion the emitter would not make; and
  * fuse_prev_mov() miscompiling `mov A,B` + `op A,A` - in 64-bit blocks too.
  *
+ * ---- x87 ----
+ * The x87 families start from a register file the case chooses rather than
+ * from reset: a random TOP, one to eight values, exact, stale and
+ * contradicting 80-bit images, a status word with and without PE, control
+ * words with precision 24 and directed rounding, and MXCSR values that move
+ * the host's rounding.  Their operands come from a table of values chosen to
+ * leave the translated fast path (NaNs, infinities, denormals, range edges,
+ * integers above 2^53, float ties), and the comparison covers every fpr bit
+ * for bit, the images and their validity bits, the tag word, TOP, fsw, fcw and
+ * MXCSR.  Sequences mix every translated form with untranslated ones, integer
+ * filler, fnstsw/sahf and fcomi/fcmov/setcc/jcc consumers, so translated runs
+ * start, end and fall back to the interpreter at every point.
+ *
  * If a new 32-bit instruction becomes JIT-able, add it to the template table,
  * and give it its own template if its encoding means something different in
  * 32-bit mode than in 64-bit.
@@ -108,6 +121,7 @@
 #include "ocerz/syscall.h"
 #include "ocerz/types.h"
 #include "ocerz/vm.h"
+#include "ocerz/x87.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,6 +191,12 @@ typedef struct {
     uint64_t fs_base, gs_base;
     struct { uint64_t addr; uint8_t bytes[40]; size_t len; } plant[NPLANT];
     int      nplant;
+    int      x87;
+    uint16_t fcw, fsw;
+    uint8_t  ftw, ftop, x_ok;
+    uint64_t fpr[8], xm[8];
+    uint16_t xe[8];
+    uint32_t mxcsr;
 } Case;
 
 typedef struct {
@@ -1312,6 +1332,297 @@ static void t_seg(Gen *g)
     }
 }
 
+/*
+ * ---- x87 ----
+ * A table of operands sits at X87TAB in every case's scratch image: doubles
+ * that hit each fast-path exit (NaNs quiet and signalling, infinities, zeros
+ * of both signs, denormals, values at the integer and float range edges),
+ * floats in the low dword of the next twelve, integers up to 64 bits (eight
+ * of them above 2^53, which only an exact FILD keeps), control words and
+ * MXCSR values, then four doubles that fall halfway between two floats, which
+ * precision control 24 must round to even.  Stores go to X87OUT, the save
+ * images to X87ENV.  Every address is reached through a form the rest of the
+ * harness uses: absolute, EBP plus a displacement, a base register loaded just
+ * before, or EBP plus a loaded index.
+ */
+#define X87TAB      (SCRATCH_MID + 0x400)
+#define X87TAB_N    64
+#define X87MXCSR    (X87TAB + 8 * X87TAB_N)
+#define X87OUT      (SCRATCH_MID + 0x640)
+#define X87ENV      (X87OUT + 0x100)
+enum { X87_R64, X87_R32, X87_I16, X87_I32, X87_I64 };
+
+static uint64_t g_x87tab[X87TAB_N + 6];
+
+static void x87tab_init(void)
+{
+    static const uint64_t t[X87TAB_N + 6] = {
+        0x0000000000000000ull, 0x8000000000000000ull, 0x3ff0000000000000ull, 0xbff0000000000000ull,
+        0x4000000000000000ull, 0x3fe0000000000000ull, 0x3fb999999999999aull, 0x400921fb54442d18ull,
+        0x7ff0000000000000ull, 0xfff0000000000000ull, 0x7ff8000000000000ull, 0xfff8000000000000ull,
+        0x7ff4000000000001ull, 0x7ff800000000beefull, 0x0000000000000001ull, 0x800fffffffffffffull,
+        0x0010000000000000ull, 0x7fefffffffffffffull, 0x4340000000000001ull, 0x4330000000000000ull,
+        0x43e0000000000000ull, 0xc3e0000000000000ull, 0x41dfffffffc00000ull, 0xc1e0000000000000ull,
+        0x40dfffc000000000ull, 0xc0e0000000000000ull, 0x4004000000000000ull, 0xc00c000000000000ull,
+        0x7e37e43c8800759cull, 0x01a56e1fc2f8f359ull, 0x3ff0000000000001ull, 0x3810000000000000ull,
+        0x9e3779b97fc00000ull, 0x5bd1e9957fa00000ull, 0x000000007f800000ull, 0xffffffffff800000ull,
+        0x1234567800000000ull, 0x8765432180000000ull, 0x0000000000000001ull, 0x00000000007fffffull,
+        0x0000000000800000ull, 0x000000007f7fffffull, 0x000000003fc00000ull, 0x00000000bdcccccdull,
+        0x0000000000000000ull, 0x0000000000000001ull, 0xffffffffffffffffull, 0x0020000000000001ull,
+        0x0123456789abcdefull, 0x7fffffffffffffffull, 0x8000000000000000ull, 0x4142434445464748ull,
+        0x00ff00ff00ff00ffull, 0xffdfffffffffffffull, 0xffffffff80000000ull, 0x0000000000007fffull,
+        0x0000000000007fffull, 0x0000000000008000ull, 0x000000007fffffffull, 0x0000000080000000ull,
+        0x00000000ffffffffull, 0x000000003b9aca00ull,
+        0x0f7f007f027f037full, 0x0c7f13320b7f077full,
+        0x00003f8000001f80ull, 0x00007f8000005f80ull,
+        0x3ff0000010000000ull, 0xbff0000030000000ull, 0x4000000010000000ull, 0x3810000008000000ull,
+    };
+    memcpy(g_x87tab, t, sizeof t);
+}
+
+/* int_to_f80, for the images the initial state hands the engines. */
+static void x87_int_image(int64_t x, uint64_t *mant, uint16_t *se)
+{
+    if (x == 0) { *mant = 0; *se = 0; return; }
+    uint64_t m = x < 0 ? (uint64_t)0 - (uint64_t)x : (uint64_t)x;
+    int lz = __builtin_clzll(m);
+    *mant = m << lz;
+    *se = (uint16_t)((x < 0 ? 0x8000u : 0) | (unsigned)(16383 + 63 - lz));
+}
+
+static uint32_t x87_src(Gen *g, int kind)
+{
+    unsigned k;
+    if (rndn(g, 4) == 0) {
+        k = rndn(g, X87TAB_N - 2);
+    } else {
+        switch (kind) {
+        case X87_R64: k = rndn(g, 36); if (k >= 32) k += X87TAB_N + 2 - 32; break;
+        case X87_R32: k = 32 + rndn(g, 12); break;
+        case X87_I64: k = 44 + rndn(g, 12); break;
+        default:      k = rndn(g, 2) ? 56 + rndn(g, 6) : 44 + rndn(g, 12); break;
+        }
+    }
+    return (uint32_t)(X87TAB + 8 * k + (rndn(g, 16) == 0 ? 4 : 0));
+}
+static uint32_t x87_dst(Gen *g) { return (uint32_t)(X87OUT + 8 * rndn(g, 30)); }
+
+static void x87_mf(Gen *g, MF *m, uint32_t addr)
+{
+    memset(m, 0, sizeof *m);
+    switch (rndn(g, 4)) {
+    case 0:
+        mf_abs32(m, addr);
+        return;
+    case 1:
+        m->mod = 2; m->rm = 5; m->dispn = 4;
+        m->disp = addr - (uint32_t)SCRATCH_MID;
+        return;
+    case 2: {
+        uint8_t base = rdst_avoid(g);
+        int8_t d = (int8_t)rndi(g, -64, 64);
+        eb(g, 0xb8 | base); ed(g, addr - (uint32_t)(int32_t)d);
+        m->mod = 1; m->rm = base; m->disp = (uint32_t)(int32_t)d; m->dispn = 1;
+        return;
+    }
+    default: {
+        uint8_t idx = rdst_avoid(g);
+        unsigned sc = rndn(g, 4), k = rndn(g, 8);
+        eb(g, 0xb8 | idx); ed(g, k);
+        m->mod = 2; m->rm = 4; m->has_sib = 1;
+        m->sib = (uint8_t)((sc << 6) | (idx << 3) | 5);
+        m->disp = addr - (uint32_t)SCRATCH_MID - (k << sc); m->dispn = 4;
+        return;
+    }
+    }
+}
+
+static void x87_op(Gen *g, int depth);
+
+/* A short forward branch on cc over one or two x87 instructions. */
+static void x87_skip(Gen *g, unsigned cc, int depth)
+{
+    eb(g, 0x70 | cc);
+    size_t at = g->c->len;
+    eb(g, 0);
+    size_t after = g->c->len;
+    int n = rndi(g, 1, 2);
+    for (int k = 0; k < n && room(g) > 48; k++)
+        x87_op(g, depth + 1);
+    g->c->code[at] = (uint8_t)(g->c->len - after);
+}
+
+static void x87_op(Gen *g, int depth)
+{
+    static const uint8_t arith_sub[6] = { 0, 1, 4, 5, 6, 7 };
+    static const uint8_t fcc[8] = { 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0xa, 0xb };
+    MF m;
+    unsigned i = rndn(g, 8), r = rndn(g, 2);
+    if (room(g) < 64) return;
+    switch (rndn(g, 32)) {
+    case 0: case 1:
+        x87_mf(g, &m, x87_src(g, r ? X87_R64 : X87_R32));
+        eb(g, r ? 0xdd : 0xd9); emit_modrm(g, 0, &m);
+        return;
+    case 2:
+        eb(g, 0xd9); eb(g, 0xc0 | i);
+        return;
+    case 3: case 4:
+        x87_mf(g, &m, x87_dst(g));
+        eb(g, r ? 0xdd : 0xd9); emit_modrm(g, 2 + rndn(g, 2), &m);
+        return;
+    case 5:
+        eb(g, 0xdd); eb(g, (rndn(g, 2) ? 0xd0 : 0xd8) | i);
+        return;
+    case 6: {
+        unsigned w = rndn(g, 3);
+        x87_mf(g, &m, x87_src(g, w == 0 ? X87_I16 : w == 1 ? X87_I32 : X87_I64));
+        eb(g, w == 1 ? 0xdb : 0xdf); emit_modrm(g, w == 2 ? 5 : 0, &m);
+        return;
+    }
+    case 7: {
+        unsigned w = rndn(g, 3);
+        x87_mf(g, &m, x87_dst(g));
+        if (w == 2) {
+            if (rndn(g, 2)) { eb(g, 0xdf); emit_modrm(g, 7, &m); }
+            else            { eb(g, 0xdd); emit_modrm(g, 1, &m); }
+        } else {
+            eb(g, w == 0 ? 0xdf : 0xdb); emit_modrm(g, 1 + rndn(g, 3), &m);
+        }
+        return;
+    }
+    case 8:
+        eb(g, 0xd9); eb(g, 0xe8 + rndn(g, 7));
+        return;
+    case 9: case 10: case 11: case 12: {
+        unsigned o = rndn(g, 3);
+        eb(g, o == 0 ? 0xd8 : o == 1 ? 0xdc : 0xde);
+        eb(g, 0xc0 | (arith_sub[rndn(g, 6)] << 3) | i);
+        return;
+    }
+    case 13: case 14: case 15:
+        x87_mf(g, &m, x87_src(g, r ? X87_R64 : X87_R32));
+        eb(g, r ? 0xdc : 0xd8); emit_modrm(g, arith_sub[rndn(g, 6)], &m);
+        return;
+    case 16:
+        x87_mf(g, &m, x87_src(g, r ? X87_I16 : X87_I32));
+        eb(g, r ? 0xde : 0xda); emit_modrm(g, arith_sub[rndn(g, 6)], &m);
+        return;
+    case 17: {
+        static const uint8_t u[4] = { 0xe0, 0xe1, 0xfa, 0xfc };
+        eb(g, 0xd9); eb(g, u[rndn(g, 4)]);
+        return;
+    }
+    case 18:
+        eb(g, 0xd9); eb(g, 0xc8 | i);
+        return;
+    case 19: case 20:
+        switch (rndn(g, 6)) {
+        case 0: eb(g, 0xd8); eb(g, (r ? 0xd0 : 0xd8) | i); return;
+        case 1: eb(g, 0xdd); eb(g, (r ? 0xe0 : 0xe8) | i); return;
+        case 2: if (r) { eb(g, 0xde); eb(g, 0xd9); } else { eb(g, 0xda); eb(g, 0xe9); } return;
+        case 3: eb(g, 0xd9); eb(g, 0xe4); return;
+        case 4:
+            x87_mf(g, &m, x87_src(g, r ? X87_R64 : X87_R32));
+            eb(g, r ? 0xdc : 0xd8); emit_modrm(g, 2 + rndn(g, 2), &m);
+            return;
+        default:
+            x87_mf(g, &m, x87_src(g, r ? X87_I16 : X87_I32));
+            eb(g, r ? 0xde : 0xda); emit_modrm(g, 2 + rndn(g, 2), &m);
+            return;
+        }
+    case 21: case 22: {
+        eb(g, rndn(g, 2) ? 0xdb : 0xdf); eb(g, (rndn(g, 2) ? 0xe8 : 0xf0) | i);
+        unsigned cc = fcc[rndn(g, 8)];
+        switch (depth > 1 ? 3 : rndn(g, 4)) {
+        case 0: eb(g, rndn(g, 2) ? 0xda : 0xdb); eb(g, 0xc0 | (rndn(g, 4) << 3) | rndn(g, 8)); return;
+        case 1: eb(g, 0x0f); eb(g, 0x90 | cc); eb(g, 0xc0 | rbyte_avoid(g)); return;
+        case 2: x87_skip(g, cc, depth); return;
+        default: return;
+        }
+    }
+    case 23: {
+        static const uint8_t mask[6] = { 0x01, 0x40, 0x41, 0x45, 0x05, 0x44 };
+        eb(g, 0xdf); eb(g, 0xe0);
+        switch (depth > 1 ? 2 : rndn(g, 3)) {
+        case 0: eb(g, 0x9e); x87_skip(g, fcc[rndn(g, 8)], depth); return;
+        case 1: eb(g, 0xf6); eb(g, 0xc4); eb(g, mask[rndn(g, 6)]); x87_skip(g, 4 + rndn(g, 2), depth); return;
+        default: return;
+        }
+    }
+    case 24:
+        eb(g, rndn(g, 2) ? 0xda : 0xdb); eb(g, 0xc0 | (rndn(g, 4) << 3) | i);
+        return;
+    case 25:
+        x87_mf(g, &m, x87_dst(g));
+        eb(g, r ? 0xdd : 0xd9); emit_modrm(g, 7, &m);
+        return;
+    case 26:
+        x87_mf(g, &m, (uint32_t)(X87TAB + 8 * 62 + 2 * rndn(g, 8)));
+        eb(g, 0xd9); emit_modrm(g, 5, &m);
+        return;
+    case 27:
+        switch (rndn(g, 7)) {
+        case 0: eb(g, 0xdb); eb(g, rndn(g, 4) ? 0xe2 : 0xe3); return;
+        case 1: eb(g, 0x9b); return;
+        case 2: eb(g, 0xdd); eb(g, 0xc0 | i); return;
+        case 3: eb(g, 0xdf); eb(g, 0xc0 | i); return;
+        case 4: eb(g, 0xd9); eb(g, 0xf6); return;
+        default: eb(g, 0xd9); eb(g, 0xf7); return;
+        }
+    case 28:
+        x87_mf(g, &m, x87_src(g, X87_I64));
+        eb(g, 0xdf); emit_modrm(g, 5, &m);
+        x87_mf(g, &m, x87_dst(g));
+        eb(g, 0xdf); emit_modrm(g, 7, &m);
+        return;
+    case 29: {
+        static const uint8_t u[6] = { 0xe5, 0xf8, 0xfd, 0xf0, 0xf5, 0xf4 };
+        switch (rndn(g, 4)) {
+        case 0: eb(g, 0xd9); eb(g, u[rndn(g, 6)]); return;
+        case 1:
+            x87_mf(g, &m, r ? x87_src(g, X87_R64) : x87_dst(g));
+            eb(g, 0xdb); emit_modrm(g, r ? 5 : 7, &m);
+            return;
+        case 2:
+            x87_mf(g, &m, (uint32_t)X87ENV);
+            eb(g, 0xd9); emit_modrm(g, 6, &m);
+            if (r) { x87_mf(g, &m, (uint32_t)X87ENV); eb(g, 0xd9); emit_modrm(g, 4, &m); }
+            return;
+        default:
+            x87_mf(g, &m, (uint32_t)X87ENV);
+            eb(g, 0xdd); emit_modrm(g, 6, &m);
+            if (r) { x87_mf(g, &m, (uint32_t)X87ENV); eb(g, 0xdd); emit_modrm(g, 4, &m); }
+            return;
+        }
+    }
+    case 30:
+        x87_mf(g, &m, (uint32_t)(X87MXCSR + 4 * rndn(g, 4)));
+        eb(g, 0x0f); eb(g, 0xae); emit_modrm(g, 2, &m);
+        return;
+    default:
+        blob(g, 1);
+        return;
+    }
+}
+
+/* x87 in the integer soup, from the reset state and over random scratch bytes. */
+static void t_x87(Gen *g)
+{
+    if (room(g) < 96) return;
+    MF m;
+    int n = rndi(g, 1, 4);
+    for (int k = 0; k < n; k++) {
+        if (rndn(g, 3) == 0) {
+            pick_mem(g, &m, 0);
+            emit_prefixes(g, 0, &m, 0);
+            eb(g, rndn(g, 2) ? 0xdd : 0xd9); emit_modrm(g, 0, &m);
+        } else {
+            x87_op(g, 1);
+        }
+    }
+}
+
 typedef void (*Tmpl)(Gen *);
 static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_alu,    22 }, { t_grp1,  12 }, { t_incdec,  8 }, { t_mov,   18 },
@@ -1322,6 +1633,7 @@ static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_0f,     14 }, { t_seg,    10 }, { t_cx8,    4 },
     { t_btmem,   4 }, { t_cmpjcc, 10 }, { t_cntloop, 5 },
     { t_ccuse,  10 }, { t_pairs,   5 }, { t_movshift, 3 },
+    { t_x87,     6 },
 };
 #define NTEMPLATES ((int)(sizeof TEMPLATES / sizeof TEMPLATES[0]))
 
@@ -1356,6 +1668,62 @@ static void gen_random(Case *c, uint64_t seed, int index)
     c->memseed = sm64(&g.rng);
     c->fs_base = (uint64_t)rndn(&g, 0x40) * 16;
     c->gs_base = (uint64_t)rndn(&g, 0x40) * 16;
+}
+
+/* The register file an x87 case starts from (the header's x87 section says what varies). */
+static void x87_state(Gen *g, Case *c)
+{
+    static const uint16_t cws[12] = { 0x037f, 0x037f, 0x037f, 0x027f, 0x007f, 0x007f,
+                                      0x1332, 0x0f7f, 0x077f, 0x0b7f, 0x0c7f, 0x027f };
+    c->x87 = 1;
+    c->fcw = cws[rndn(g, 12)];
+    c->mxcsr = rndn(g, 10) ? 0x1f80u : 0x1f80u | ((uint32_t)rndi(g, 1, 3) << 13);
+    c->fsw = rndn(g, 2) ? 0 : (uint16_t)(rnd(g) & (rndn(g, 4) ? 0x473fu : 0x7f3fu));
+    c->ftop = (uint8_t)rndn(g, 8);
+    int depth = rndi(g, 1, 9);
+    if (depth > 8) depth = rndn(g, 2) ? 8 : 0;
+    for (int k = 0; k < 8; k++) {
+        int p = (c->ftop + k) & 7;
+        unsigned t = rndn(g, 36);
+        uint64_t v = rndn(g, 4) ? g_x87tab[t < 32 ? t : t + X87TAB_N + 2 - 32] : sm64(&g->rng);
+        c->fpr[p] = (k < depth || rndn(g, 3) == 0) ? v : 0;
+        if (k < depth) c->ftw |= (uint8_t)(1u << p);
+        c->xm[p] = sm64(&g->rng);
+        c->xe[p] = (uint16_t)rnd(g);
+        if (rndn(g, 4) == 0) {
+            c->x_ok |= (uint8_t)(1u << p);
+            if (rndn(g, 3)) {
+                x87_int_image((int64_t)g_x87tab[44 + rndn(g, 18)], &c->xm[p], &c->xe[p]);
+                c->fpr[p] = ocerz_x87_f80_dbits(c->xm[p], c->xe[p]);
+            }
+        }
+    }
+}
+
+static void gen_x87(Case *c, uint64_t seed, int index)
+{
+    Gen g;
+    memset(c, 0, sizeof *c);
+    snprintf(c->name, sizeof c->name, "x87#%d", index);
+    g.c = c;
+    g.rng = seed ^ ((uint64_t)index * 0x2545f4914f6cdd1dull) ^ 0x87;
+    g.depth = 0;
+    g_avoid = 0xff;
+    x87_state(&g, c);
+    int n = rndi(&g, 4, 28);
+    for (int i = 0; i < n && room(&g) > 96; i++)
+        x87_op(&g, 0);
+    for (int i = rndi(&g, 0, 3); i > 0 && room(&g) > 32; i--) {
+        MF m;
+        x87_mf(&g, &m, x87_dst(&g));
+        eb(&g, 0xdd); emit_modrm(&g, 3, &m);
+    }
+    for (int i = 0; i < 16; i++)
+        c->gpr[i] = sm64(&g.rng);
+    c->gpr[OCERZ_RSP] = ESP0;
+    c->gpr[OCERZ_RBP] = SCRATCH_MID;
+    c->rflags = OCERZ_FLAG_FIXED1 | OCERZ_IF | (sm64(&g.rng) & 0x8d5ull);
+    c->memseed = sm64(&g.rng);
 }
 
 static void plant_bytes(Case *c, uint64_t addr, const uint8_t *b, size_t n)
@@ -2142,6 +2510,170 @@ static void h_comis_cc(Gen *g)
     }
 }
 
+#define TAB(k) ((uint32_t)(X87TAB + 8 * (k)))
+#define OUT(k) ((uint32_t)(X87OUT + 8 * (k)))
+static void x87m(Gen *g, unsigned opc, unsigned digit, uint32_t addr)
+{
+    eb(g, opc); eb(g, (digit << 3) | 5); ed(g, addr);
+}
+static void x87_hand_state(Gen *g, uint16_t fcw, uint16_t fsw)
+{
+    Case *c = g->c;
+    c->x87 = 1;
+    c->fcw = fcw;
+    c->fsw = fsw;
+    c->mxcsr = 0x1f80;
+}
+
+/* Delphi's Move(): fild qword / fistp qword must copy all eight bytes. */
+static void h_x87_courier(Gen *g)
+{
+    x87_hand_state(g, 0x037f, 0);
+    for (int k = 0; k < 12; k++) {
+        x87m(g, 0xdf, 5, TAB(44 + k));
+        x87m(g, 0xdf, 7, OUT(k));
+    }
+    eb(g, 0xbe); ed(g, TAB(48));
+    eb(g, 0xbf); ed(g, OUT(20));
+    eb(g, 0xdf); eb(g, 0x2e);
+    eb(g, 0xdf); eb(g, 0x3f);
+    eb(g, 0xdf); eb(g, 0x6e); eb(g, 8);
+    eb(g, 0xdf); eb(g, 0x7f); eb(g, 8);
+    x87m(g, 0xdf, 5, TAB(49));
+    x87m(g, 0xdf, 5, TAB(53));
+    x87m(g, 0xdf, 7, OUT(24));
+    x87m(g, 0xdf, 7, OUT(25));
+}
+
+/* Delphi's Trunc(): chop through a control word saved and restored around fistp. */
+static void h_x87_trunc(Gen *g)
+{
+    static const int vals[5] = { 26, 27, 6, 22, 21 };
+    x87_hand_state(g, 0x1332, 0);
+    for (int k = 0; k < 5; k++) {
+        x87m(g, 0xdd, 0, TAB(vals[k]));
+        eb(g, 0x83); eb(g, 0xec); eb(g, 12);
+        eb(g, 0xd9); eb(g, 0x3c); eb(g, 0x24);
+        eb(g, 0xd9); eb(g, 0x7c); eb(g, 0x24); eb(g, 2);
+        eb(g, 0x66); eb(g, 0x81); eb(g, 0x4c); eb(g, 0x24); eb(g, 2); ew(g, 0x0f00);
+        eb(g, 0xd9); eb(g, 0x6c); eb(g, 0x24); eb(g, 2);
+        eb(g, 0xdf); eb(g, 0x7c); eb(g, 0x24); eb(g, 4);
+        eb(g, 0xd9); eb(g, 0x2c); eb(g, 0x24);
+        eb(g, 0x59); eb(g, 0x58); eb(g, 0x5a);
+    }
+}
+
+/* Direct3D 9's precision control 24 and back, through results that leave the fast path. */
+static void h_x87_pc24(Gen *g)
+{
+    x87_hand_state(g, 0x037f, 0);
+    for (int pass = 0; pass < 2; pass++) {
+        x87m(g, 0xd9, 5, (uint32_t)(TAB(62) + (pass ? 0 : 4)));
+        x87m(g, 0xdd, 0, TAB(6));
+        x87m(g, 0xdc, 1, TAB(7));
+        x87m(g, 0xdc, 0, TAB(2));
+        x87m(g, 0xdc, 6, TAB(4));
+        eb(g, 0xd9); eb(g, 0xfa);
+        x87m(g, 0xdd, 3, OUT(pass * 8 + 0));
+        x87m(g, 0xdd, 0, TAB(28));
+        eb(g, 0xd8); eb(g, 0xc8);
+        x87m(g, 0xdd, 3, OUT(pass * 8 + 1));
+        x87m(g, 0xdd, 0, TAB(29));
+        eb(g, 0xd9); eb(g, 0xc0);
+        eb(g, 0xde); eb(g, 0xc9);
+        x87m(g, 0xdd, 3, OUT(pass * 8 + 2));
+        eb(g, 0xd9); eb(g, 0xe8);
+        x87m(g, 0xdd, 0, TAB(30));
+        eb(g, 0xd8); eb(g, 0xe1);
+        x87m(g, 0xdd, 3, OUT(pass * 8 + 3));
+        x87m(g, 0xdd, 0, TAB(17));
+        x87m(g, 0xdc, 0, TAB(17));
+        x87m(g, 0xdd, 3, OUT(pass * 8 + 4));
+        x87m(g, 0xdd, 0, TAB(16));
+        x87m(g, 0xdc, 4, TAB(14));
+        x87m(g, 0xdd, 3, OUT(pass * 8 + 5));
+        eb(g, 0xdd); eb(g, 0xd8);
+    }
+}
+
+/* fcom + fnstsw + sahf, fcomi + fcmovcc, over ordered, equal and unordered pairs. */
+static void h_x87_compare(Gen *g)
+{
+    static const int pairs[7][2] = { { 2, 3 }, { 3, 2 }, { 2, 2 }, { 1, 0 }, { 10, 2 }, { 8, 17 }, { 14, 0 } };
+    x87_hand_state(g, 0x037f, 0);
+    for (int k = 0; k < 7; k++) {
+        x87m(g, 0xdd, 0, TAB(pairs[k][1]));
+        x87m(g, 0xdd, 0, TAB(pairs[k][0]));
+        eb(g, 0xd8); eb(g, 0xd1);
+        eb(g, 0xdf); eb(g, 0xe0);
+        eb(g, 0x9e);
+        eb(g, 0x0f); eb(g, 0x92); eb(g, 0xc1);
+        eb(g, 0x0f); eb(g, 0x9a); eb(g, 0xc2);
+        eb(g, 0xdb); eb(g, 0xf1);
+        eb(g, 0x0f); eb(g, 0x97); eb(g, 0xc3);
+        eb(g, 0xda); eb(g, 0xc1 | ((unsigned)(k & 3) << 3));
+        eb(g, 0xdb); eb(g, 0xe9);
+        eb(g, 0xdb); eb(g, 0xc1 | ((unsigned)((k + 1) & 3) << 3));
+        eb(g, 0xdf); eb(g, 0xe9);
+        eb(g, 0xdd); eb(g, 0xd8);
+    }
+}
+
+/* More than eight pushes, exchanges and stores across the wrap, and the status word. */
+static void h_x87_wrap(Gen *g)
+{
+    x87_hand_state(g, 0x027f, 0x0020);
+    for (int k = 0; k < 10; k++)
+        x87m(g, 0xdd, 0, TAB(k * 3));
+    eb(g, 0xd9); eb(g, 0xcf);
+    eb(g, 0xdd); eb(g, 0xd5);
+    eb(g, 0xd9); eb(g, 0xc7);
+    eb(g, 0xd9); eb(g, 0xf6);
+    eb(g, 0xd9); eb(g, 0xf7);
+    eb(g, 0xdd); eb(g, 0xc3);
+    eb(g, 0xdf); eb(g, 0xe0);
+    for (int k = 0; k < 9; k++) { eb(g, 0xdd); eb(g, 0xd8); }
+    x87m(g, 0xdd, 7, OUT(1));
+}
+
+/* PE from clear: exact and inexact arithmetic, conversions and fnclex between them. */
+static void h_x87_inexact(Gen *g)
+{
+    x87_hand_state(g, 0x037f, 0);
+    eb(g, 0xd9); eb(g, 0xe8);
+    x87m(g, 0xdc, 0, TAB(2));
+    x87m(g, 0xdd, 7, OUT(0));
+    x87m(g, 0xdc, 0, TAB(6));
+    x87m(g, 0xdd, 7, OUT(1));
+    eb(g, 0xdb); eb(g, 0xe2);
+    x87m(g, 0xdc, 1, TAB(4));
+    x87m(g, 0xdd, 7, OUT(2));
+    x87m(g, 0xdc, 6, TAB(26));
+    x87m(g, 0xdd, 7, OUT(3));
+    eb(g, 0xdb); eb(g, 0xe2);
+    x87m(g, 0xdd, 0, TAB(26));
+    x87m(g, 0xdb, 2, OUT(4));
+    x87m(g, 0xdd, 7, OUT(5));
+    eb(g, 0xdb); eb(g, 0xe2);
+    x87m(g, 0xd9, 2, OUT(6));
+    x87m(g, 0xdd, 7, OUT(7));
+    x87m(g, 0xdd, 0, TAB(6));
+    x87m(g, 0xd9, 3, OUT(8));
+    x87m(g, 0xdd, 7, OUT(9));
+    eb(g, 0xdb); eb(g, 0xe2);
+    x87m(g, 0xdd, 0, TAB(4));
+    eb(g, 0xd9); eb(g, 0xfa);
+    x87m(g, 0xdd, 7, OUT(10));
+    eb(g, 0xd9); eb(g, 0xfa);
+    x87m(g, 0xdd, 7, OUT(11));
+    eb(g, 0xdb); eb(g, 0xe2);
+    eb(g, 0xd9); eb(g, 0xfc);
+    x87m(g, 0xdd, 7, OUT(12));
+    x87m(g, 0xdd, 0, TAB(6));
+    eb(g, 0xd9); eb(g, 0xfc);
+    x87m(g, 0xdd, 7, OUT(13));
+}
+
 static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "highbyte",      h_highbyte },
     { "highbyte-mem",  h_highbyte_mem },
@@ -2181,6 +2713,12 @@ static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "lock-many",     h_lock_many },
     { "bt32",          h_bt32 },
     { "comis-cc",      h_comis_cc },
+    { "x87-courier",   h_x87_courier },
+    { "x87-trunc",     h_x87_trunc },
+    { "x87-pc24",      h_x87_pc24 },
+    { "x87-compare",   h_x87_compare },
+    { "x87-wrap",      h_x87_wrap },
+    { "x87-inexact",   h_x87_inexact },
 };
 #define NHANDS ((int)(sizeof HANDS / sizeof HANDS[0]))
 
@@ -2212,6 +2750,9 @@ typedef struct {
     int      rc;
     Ocerz128 xmm[16];
     double   fpr[8];
+    uint64_t fpr_xm[8];
+    uint16_t fpr_xe[8];
+    uint8_t  fpr_x_ok;
     uint32_t mxcsr;
     uint16_t fcw, fsw;
     uint8_t  ftw, ftop;
@@ -2248,6 +2789,7 @@ static void build_golden(const Case *c)
         uint64_t v = sm64(&s);
         memcpy(g_golden + i, &v, 8);
     }
+    memcpy(g_golden + (X87TAB - SCRATCH), g_x87tab, sizeof g_x87tab);
 }
 
 static void restore_memory(void)
@@ -2321,6 +2863,18 @@ static void run_side(const Case *c, int use_jit, Snap *s)
     cpu->cs_sel = (uint16_t)CS32;
     cpu->seg_sel[OCERZ_SREG_CS] = (uint16_t)CS32;
     cpu->rip = CODE32;
+    if (c->x87) {
+        cpu->fcw = c->fcw;
+        cpu->fsw = c->fsw;
+        cpu->ftw = c->ftw;
+        cpu->ftop = c->ftop;
+        cpu->fpr_x_ok = c->x_ok;
+        memcpy(cpu->fpr, c->fpr, sizeof cpu->fpr);
+        memcpy(cpu->fpr_xm, c->xm, sizeof cpu->fpr_xm);
+        memcpy(cpu->fpr_xe, c->xe, sizeof cpu->fpr_xe);
+        cpu->mxcsr = c->mxcsr;
+    }
+    ocerz_apply_mxcsr_round(cpu->mxcsr);
     g_vm.jit_enabled = use_jit;
     g_vm.exited = 0;
 
@@ -2377,6 +2931,9 @@ static void run_side(const Case *c, int use_jit, Snap *s)
     s->rc = rc;
     memcpy(s->xmm, cpu->xmm, sizeof s->xmm);
     memcpy(s->fpr, cpu->fpr, sizeof s->fpr);
+    memcpy(s->fpr_xm, cpu->fpr_xm, sizeof s->fpr_xm);
+    memcpy(s->fpr_xe, cpu->fpr_xe, sizeof s->fpr_xe);
+    s->fpr_x_ok = cpu->fpr_x_ok;
     s->mxcsr = cpu->mxcsr;
     s->fcw = cpu->fcw;
     s->fsw = cpu->fsw;
@@ -2460,10 +3017,32 @@ static const char *diff_snaps(const Snap *a, const Snap *b)
             snprintf(buf, sizeof buf, "xmm%d differs", i);
             return buf;
         }
-    if (memcmp(a->fpr, b->fpr, sizeof a->fpr) != 0 ||
-        a->mxcsr != b->mxcsr || a->fcw != b->fcw || a->fsw != b->fsw ||
-        a->ftw != b->ftw || a->ftop != b->ftop) {
-        snprintf(buf, sizeof buf, "x87/SSE control or stack state differs");
+    for (int p = 0; p < 8; p++) {
+        uint64_t x, y;
+        memcpy(&x, &a->fpr[p], 8);
+        memcpy(&y, &b->fpr[p], 8);
+        if (x != y) {
+            snprintf(buf, sizeof buf, "fpr[%d]: interp=%016llx jit=%016llx", p,
+                     (unsigned long long)x, (unsigned long long)y);
+            return buf;
+        }
+        if (a->fpr_xm[p] != b->fpr_xm[p] || a->fpr_xe[p] != b->fpr_xe[p]) {
+            snprintf(buf, sizeof buf, "x87 image %d: interp=%04x:%016llx jit=%04x:%016llx", p,
+                     a->fpr_xe[p], (unsigned long long)a->fpr_xm[p], b->fpr_xe[p], (unsigned long long)b->fpr_xm[p]);
+            return buf;
+        }
+    }
+    if (a->fpr_x_ok != b->fpr_x_ok || a->ftw != b->ftw || a->ftop != b->ftop) {
+        snprintf(buf, sizeof buf, "x87 image bits/tags/top: interp=%02x/%02x/%u jit=%02x/%02x/%u",
+                 a->fpr_x_ok, a->ftw, a->ftop, b->fpr_x_ok, b->ftw, b->ftop);
+        return buf;
+    }
+    if (a->fcw != b->fcw || a->fsw != b->fsw) {
+        snprintf(buf, sizeof buf, "x87 fcw/fsw: interp=%04x/%04x jit=%04x/%04x", a->fcw, a->fsw, b->fcw, b->fsw);
+        return buf;
+    }
+    if (a->mxcsr != b->mxcsr) {
+        snprintf(buf, sizeof buf, "mxcsr: interp=%08x jit=%08x", a->mxcsr, b->mxcsr);
         return buf;
     }
     for (size_t i = 0; i < SNAPLEN; i++)
@@ -2487,6 +3066,13 @@ static void dump_case(const Case *c, const char *why, uint64_t seed)
         fprintf(stderr, " %s=%016llx", REGNAME[i], (unsigned long long)c->gpr[i]);
     fprintf(stderr, "\n  eflags=%#llx  memseed=%#llx\n",
             (unsigned long long)c->rflags, (unsigned long long)c->memseed);
+    if (c->x87) {
+        fprintf(stderr, "  x87: fcw=%04x fsw=%04x top=%u ftw=%02x x_ok=%02x mxcsr=%08x\n",
+                c->fcw, c->fsw, c->ftop, c->ftw, c->x_ok, c->mxcsr);
+        for (int p = 0; p < 8; p++)
+            fprintf(stderr, "    fpr[%d]=%016llx image=%04x:%016llx\n", p, (unsigned long long)c->fpr[p],
+                    c->xe[p], (unsigned long long)c->xm[p]);
+    }
     fprintf(stderr, "  bytes:");
     for (size_t i = 0; i < c->len && i < 96; i++)
         fprintf(stderr, " %02x", c->code[i]);
@@ -2511,7 +3097,9 @@ static void dump_case(const Case *c, const char *why, uint64_t seed)
 
 static const char *INJECT[] = {
     "gpr-low32", "gpr-high32", "eflags", "eip", "mode32", "cs",
-    "xmm", "scratch-byte", "stack-byte", "low16-byte", "step-result",
+    "xmm", "scratch-byte", "stack-byte", "low16-byte",
+    "x87-fpr-lsb", "x87-fpr-sign", "x87-ftop", "x87-ftw", "x87-image-bit", "x87-image",
+    "x87-fsw-c1", "x87-fsw-pe", "x87-fcw", "mxcsr", "step-result",
 };
 #define NINJECT ((int)(sizeof INJECT / sizeof INJECT[0]))
 
@@ -2520,6 +3108,20 @@ static void inject(Snap *s, int which)
     size_t off_scratch = 0;
     size_t off_stack = (size_t)SCRATCH_LEN;
     size_t off_low16 = (size_t)(SCRATCH_LEN + STACK_CMP_LEN);
+    uint64_t u;
+    switch (which) {
+    case 10: memcpy(&u, &s->fpr[5], 8); u ^= 1; memcpy(&s->fpr[5], &u, 8); return;
+    case 11: memcpy(&u, &s->fpr[0], 8); u ^= 1ull << 63; memcpy(&s->fpr[0], &u, 8); return;
+    case 12: s->ftop = (uint8_t)((s->ftop + 1) & 7); return;
+    case 13: s->ftw ^= 0x10; return;
+    case 14: s->fpr_x_ok ^= 0x04; return;
+    case 15: s->fpr_xm[6] ^= 1ull << 20; return;
+    case 16: s->fsw ^= 0x0200; return;
+    case 17: s->fsw ^= 0x0020; return;
+    case 18: s->fcw ^= 0x0c00; return;
+    case 19: s->mxcsr ^= 0x6000; return;
+    default: break;
+    }
     switch (which) {
     case 0:  s->gpr[OCERZ_RAX] ^= 1; break;
     case 1:  s->gpr[OCERZ_RSI] ^= 0x100000000ull; break;
@@ -2722,6 +3324,25 @@ static void kb_rmw(Gen *g)
     eb(g, 0x83); eb(g, 0x4d); eb(g, 0x58); eb(g, 0x01);
 }
 
+static void kb_x87(Gen *g)
+{
+    x87m(g, 0xdd, 0, TAB(5));
+    x87m(g, 0xdc, 1, TAB(4));
+    x87m(g, 0xdc, 0, OUT(0));
+    x87m(g, 0xdb, 0, TAB(45));
+    x87m(g, 0xdc, 1, TAB(5));
+    eb(g, 0xde); eb(g, 0xc1);
+    eb(g, 0xd9); eb(g, 0xc0);
+    x87m(g, 0xdc, 4, TAB(24));
+    eb(g, 0xd9); eb(g, 0xee);
+    eb(g, 0xdf); eb(g, 0xf1);
+    eb(g, 0xdb); eb(g, 0xc1);
+    eb(g, 0xdd); eb(g, 0xd9);
+    eb(g, 0xd9); eb(g, 0xc0);
+    x87m(g, 0xdb, 3, OUT(1));
+    x87m(g, 0xdd, 3, OUT(0));
+}
+
 static const struct { const char *name; void (*fn)(Gen *); const char *what; } KERNELS[] = {
     { "base",      kb_base,    "add eax, ebx" },
     { "seh",       kb_seh,     "push handler; push fs:[0]; mov fs:[0], esp; ...; mov fs:[0], eax; add esp, 8" },
@@ -2733,6 +3354,7 @@ static const struct { const char *name; void (*fn)(Gen *); const char *what; } K
     { "bt",        kb_bt,      "bt eax, 3; bts edx, edi; btr edx, 5" },
     { "rmw",       kb_rmw,     "add [ebp+0x50], eax; inc dword [ebp+0x54]; or dword [ebp+0x58], 1" },
     { "cc",        kb_cc,      "cmp eax, edi; setb cl; cmovl edx, ebx; add esi, ecx; inc eax; sete bl" },
+    { "x87",       kb_x87,     "fld/fmul/fadd/fild/faddp, a clamp of fld/fsub/fldz/fcomip/fcmovnb/fstp, fistp, fstp" },
 };
 #define NKERNELS ((int)(sizeof KERNELS / sizeof KERNELS[0]))
 
@@ -2773,6 +3395,7 @@ static int bench(uint32_t iters)
             ocerz_st(TEB + 0x18, 4, TEB);
             ocerz_st(TEB + 0x2c, 4, TEB + 0x100);
             ocerz_st(SCRATCH_MID + 0x20, 4, 0);
+            ocerz_st(X87OUT, 8, 0);
             ocerz_cpu_reset(cpu);
             memcpy(cpu->gpr, c.gpr, sizeof c.gpr);
             cpu->rflags = c.rflags;
@@ -2809,6 +3432,7 @@ static void usage(void)
     printf("usage: diff32 [options]\n"
            "  --seed N          RNG seed (default 1); a failure prints the seed that reproduces it\n"
            "  --cases N         random sequences to generate (default 20000)\n"
+           "  --x87-cases N     x87 sequences, from generated register files (default: as --cases)\n"
            "  --budget N        instruction/block budget per run (default 200000)\n"
            "  --only SUBSTR     run only cases whose name contains SUBSTR\n"
            "  --list            list the hand-written cases and exit\n"
@@ -2825,7 +3449,7 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     uint64_t seed = 1;
-    long ncases = 20000;
+    long ncases = 20000, nx87 = -1;
     int do_selftest = 0, jit_required = 0, verbose = 0;
     uint32_t do_bench = 0;
     const char *only = NULL;
@@ -2833,6 +3457,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--cases") && i + 1 < argc) ncases = strtol(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--x87-cases") && i + 1 < argc) nx87 = strtol(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--budget") && i + 1 < argc) g_budget = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--only") && i + 1 < argc) only = argv[++i];
         else if (!strcmp(argv[i], "--selftest")) do_selftest = 1;
@@ -2849,6 +3474,9 @@ int main(int argc, char **argv)
             return 0;
         } else { usage(); return !strcmp(argv[i], "--help") ? 0 : 2; }
     }
+    if (nx87 < 0)
+        nx87 = ncases;
+    x87tab_init();
 
     setenv("OCERZ_NO_UNSTICK", "1", 1);
     setenv("OCERZ_JIT_CODE_MB", "2", 0);
@@ -2901,8 +3529,9 @@ int main(int argc, char **argv)
         }
     }
 
-    for (long i = 0; i < ncases; i++) {
-        gen_random(&c, seed, (int)i);
+    for (long i = 0; i < ncases + nx87; i++) {
+        if (i < ncases) gen_random(&c, seed, (int)i);
+        else            gen_x87(&c, seed, (int)(i - ncases));
         if (only && !strstr(c.name, only)) continue;
         load_case(&c);
         tally(&c);
@@ -2931,8 +3560,8 @@ int main(int argc, char **argv)
         nops += g_opseen[i];
     uint64_t translated = ocerz_jit_blocks(g_vm.jit) - blocks0;
     printf("----------------------------------------\n");
-    printf("differential32: %ld passed, %ld failed (%d hand-written + %ld random, seed %#llx)\n",
-           pass, fail, NHANDS, ncases, (unsigned long long)seed);
+    printf("differential32: %ld passed, %ld failed (%d hand-written + %ld random + %ld x87, seed %#llx)\n",
+           pass, fail, NHANDS, ncases, nx87, (unsigned long long)seed);
     printf("differential32: corpus %llu instructions in %ld sequences, %d distinct opcodes;\n"
            "                %llu guest steps executed per side\n",
            g_insns_emitted, pass + fail, nops, g_insns_executed);
