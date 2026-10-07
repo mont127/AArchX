@@ -136,6 +136,7 @@
 #define SCRATCH      0x00210000ull
 #define SCRATCH_LEN  0x00002000ull
 #define SCRATCH_MID  (SCRATCH + 0x1000)
+#define TEB          (SCRATCH_MID + 0x600)
 
 #define STACK_LO     0x00220000ull
 #define STACK_LEN    0x00020000ull
@@ -327,8 +328,8 @@ static void emit_modrm(Gen *g, unsigned reg, const MF *m)
 static void emit_prefixes(Gen *g, int opsize16, const MF *m, int allow_seg)
 {
     if (allow_seg && rndn(g, 16) == 0) {
-        static const uint8_t seg[4] = { 0x2e, 0x36, 0x3e, 0x26 };
-        eb(g, seg[rndn(g, 4)]);
+        static const uint8_t seg[6] = { 0x2e, 0x36, 0x3e, 0x26, 0x64, 0x65 };
+        eb(g, seg[rndn(g, 6)]);
     }
     if (opsize16)
         eb(g, 0x66);
@@ -708,7 +709,7 @@ static void t_stack(Gen *g)
             return;
         MF m;
         pick_mem(g, &m, 0);
-        emit_prefixes(g, op16, &m, 0);
+        emit_prefixes(g, op16, &m, 1);
         eb(g, pop ? 0x8f : 0xff);
         emit_modrm(g, pop ? 0 : 6, &m);
         g->depth += pop ? -slot : slot;
@@ -964,6 +965,87 @@ static void t_0f(Gen *g)
     }
 }
 
+
+static void t_seg(Gen *g)
+{
+    static const uint8_t alu[8] = { 0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38 };
+    unsigned seg = rndn(g, 3) ? 0x64 : 0x65;
+    int sz8 = rndn(g, 4) == 0;
+    int op16 = !sz8 && rndn(g, 4) == 0;
+    int asz = sz8 ? 1 : (op16 ? 2 : 4);
+    MF m;
+    switch (rndn(g, 9)) {
+    case 0: case 1: {
+        int dir = rndn(g, 2);
+        pick_mem(g, &m, 0);
+        eb(g, seg); emit_prefixes(g, op16, &m, 0);
+        eb(g, 0x88 + (dir ? 2 : 0) + (sz8 ? 0 : 1));
+        emit_modrm(g, (sz8 || !dir) ? rany(g) : rdst(g), &m);
+        return;
+    }
+    case 2:
+        eb(g, seg); if (op16) eb(g, 0x66);
+        eb(g, 0xa0 + rndn(g, 4)); ed(g, (uint32_t)(SCRATCH_MID + rndn(g, 0x400)));
+        return;
+    case 3: {
+        unsigned a = alu[rndn(g, 8)];
+        int dir = rndn(g, 2);
+        int lock = !dir && a != 0x38 && rndn(g, 4) == 0;
+        if (lock) pick_mem_aligned(g, &m, asz); else pick_mem(g, &m, 0);
+        if (lock) eb(g, 0xf0);
+        eb(g, seg); emit_prefixes(g, op16, &m, 0);
+        eb(g, a + (dir ? 2 : 0) + (sz8 ? 0 : 1));
+        emit_modrm(g, (sz8 || !dir) ? rany(g) : rdst(g), &m);
+        return;
+    }
+    case 4: {
+        int pop = rndn(g, 2);
+        if (pop ? (g->depth - 4 < -DEPTH_MAX) : (g->depth + 4 > DEPTH_MAX))
+            return;
+        pick_mem(g, &m, 0);
+        eb(g, seg);
+        eb(g, pop ? 0x8f : 0xff);
+        emit_modrm(g, pop ? 0 : 6, &m);
+        g->depth += pop ? -4 : 4;
+        return;
+    }
+    case 5: {
+        static const uint8_t mx[4] = { 0xb6, 0xb7, 0xbe, 0xbf };
+        pick_mem(g, &m, 0);
+        eb(g, seg); emit_prefixes(g, op16, &m, 0);
+        eb(g, 0x0f); eb(g, mx[rndn(g, 4)]);
+        emit_modrm(g, rdst(g), &m);
+        return;
+    }
+    case 6: {
+        unsigned n = rndn(g, 2) ? 7 : 0;
+        pick_mem(g, &m, 0);
+        eb(g, seg); emit_prefixes(g, op16, &m, 0);
+        if (n == 7) {
+            unsigned k = sz8 ? 0x80 : (rndn(g, 2) ? 0x81 : 0x83);
+            eb(g, k); emit_modrm(g, 7, &m);
+            if (k == 0x81) { if (op16) ew(g, rnd(g)); else ed(g, rnd(g)); } else eb(g, rnd(g));
+        } else {
+            eb(g, sz8 ? 0xf6 : 0xf7); emit_modrm(g, 0, &m);
+            if (sz8) eb(g, rnd(g)); else if (op16) ew(g, rnd(g)); else ed(g, rnd(g));
+        }
+        return;
+    }
+    case 7:
+        pick_mem(g, &m, 0);
+        eb(g, seg); emit_prefixes(g, op16, &m, 0);
+        eb(g, sz8 ? 0xc6 : 0xc7); emit_modrm(g, 0, &m);
+        if (sz8) eb(g, rnd(g)); else if (op16) ew(g, rnd(g)); else ed(g, rnd(g));
+        return;
+    default:
+        pick_mem(g, &m, 0);
+        eb(g, seg); emit_prefixes(g, rndn(g, 4) == 0, &m, 0);
+        eb(g, 0x0f); eb(g, 0xaf);
+        emit_modrm(g, rdst(g), &m);
+        return;
+    }
+}
+
 typedef void (*Tmpl)(Gen *);
 static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_alu,    22 }, { t_grp1,  12 }, { t_incdec,  8 }, { t_mov,   18 },
@@ -971,7 +1053,7 @@ static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_grp3,    8 }, { t_imul,   5 }, { t_misc1,   7 }, { t_stack, 14 },
     { t_pusha,   3 }, { t_enter,  2 }, { t_jcc,     8 }, { t_jmp,    3 },
     { t_loop,    4 }, { t_jecxz,  2 }, { t_call,    4 }, { t_string, 5 },
-    { t_0f,     14 },
+    { t_0f,     14 }, { t_seg,    10 },
 };
 #define NTEMPLATES ((int)(sizeof TEMPLATES / sizeof TEMPLATES[0]))
 
@@ -1004,6 +1086,8 @@ static void gen_random(Case *c, uint64_t seed, int index)
     c->gpr[OCERZ_RBP] = SCRATCH_MID;
     c->rflags = OCERZ_FLAG_FIXED1 | OCERZ_IF | (sm64(&g.rng) & 0x8d5ull);
     c->memseed = sm64(&g.rng);
+    c->fs_base = (uint64_t)rndn(&g, 0x40) * 16;
+    c->gs_base = (uint64_t)rndn(&g, 0x40) * 16;
 }
 
 static void plant_bytes(Case *c, uint64_t addr, const uint8_t *b, size_t n)
@@ -1596,6 +1680,53 @@ static void h_callret(Gen *g)
     { uint32_t term = (uint32_t)(CODE32 + g->c->len); memcpy(&g->c->code[at], &term, 4); }
 }
 
+
+static void fs_op(Gen *g, unsigned seg, unsigned op, unsigned reg, uint32_t off)
+{
+    eb(g, seg); eb(g, op); eb(g, (reg << 3) | 5); ed(g, off);
+}
+
+static void h_seh_teb(Gen *g)
+{
+    g->c->fs_base = TEB;
+    g->c->gs_base = TEB + 0x200;
+    eb(g, 0x64); eb(g, 0xc7); eb(g, 0x05); ed(g, 0x18); ed(g, (uint32_t)TEB);
+    eb(g, 0x64); eb(g, 0xc7); eb(g, 0x05); ed(g, 0x2c); ed(g, (uint32_t)(TEB + 0x100));
+    eb(g, 0x64); eb(g, 0xc7); eb(g, 0x05); ed(g, 0x00); ed(g, 0xffffffffu);
+    for (int f = 0; f < 2; f++) {
+        eb(g, 0x68); ed(g, 0x00401000u + 0x1000u * (unsigned)f);
+        fs_op(g, 0x64, 0xff, 6, 0);
+        fs_op(g, 0x64, 0x89, 4, 0);
+    }
+    eb(g, 0x64); eb(g, 0xa1); ed(g, 0x18);
+    eb(g, 0x8b); eb(g, 0x50); eb(g, 0x2c);
+    fs_op(g, 0x64, 0x8b, 1, 0x2c);
+    eb(g, 0x8b); eb(g, 0x59); eb(g, 0x04);
+    mov32(g, OCERZ_RSI, 0x10);
+    eb(g, 0x64); eb(g, 0x8b); eb(g, 0x7e); eb(g, 0x20);
+    eb(g, 0x64); eb(g, 0x01); eb(g, 0x3c); eb(g, 0x75); ed(g, 0x08);
+    fs_op(g, 0x64, 0x39, 0, 0x18);
+    fs_op(g, 0x64, 0xff, 0, 0x40);
+    eb(g, 0x64); eb(g, 0xf0); eb(g, 0x0f); eb(g, 0xc1); eb(g, 0x05); ed(g, 0x48);
+    eb(g, 0xf0); eb(g, 0x64); eb(g, 0x0f); eb(g, 0xb1); eb(g, 0x0d); ed(g, 0x4c);
+    fs_op(g, 0x64, 0x87, 2, 0x50);
+    eb(g, 0x65); eb(g, 0xa1); ed(g, 0x10);
+    eb(g, 0x65); eb(g, 0xa3); ed(g, 0x14);
+    fs_op(g, 0x65, 0x89, 3, 0x18);
+    eb(g, 0x65); eb(g, 0x66); eb(g, 0x89); eb(g, 0x0d); ed(g, 0x1c);
+    eb(g, 0x65); eb(g, 0x88); eb(g, 0x2d); ed(g, 0x1f);
+    eb(g, 0x8b); eb(g, 0x04); eb(g, 0x24);
+    eb(g, 0x64); eb(g, 0xa3); ed(g, 0);
+    eb(g, 0x83); eb(g, 0xc4); eb(g, 0x08);
+    fs_op(g, 0x64, 0x8f, 0, 0);
+    eb(g, 0x83); eb(g, 0xc4); eb(g, 0x04);
+    eb(g, 0x64); eb(g, 0x0f); eb(g, 0xb6); eb(g, 0x05); ed(g, 0x2c);
+    eb(g, 0x64); eb(g, 0x0f); eb(g, 0xbf); eb(g, 0x0d); ed(g, 0x18);
+    eb(g, 0x64); eb(g, 0x0f); eb(g, 0xaf); eb(g, 0x15); ed(g, 0x18);
+    fs_op(g, 0x64, 0xff, 6, 0x18);
+    eb(g, 0x58);
+}
+
 static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "highbyte",      h_highbyte },
     { "highbyte-mem",  h_highbyte_mem },
@@ -1630,6 +1761,7 @@ static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "conv-flags",    h_conv_flags },
     { "esp-sib",       h_esp_sib },
     { "call-ret",      h_callret },
+    { "seh-teb",       h_seh_teb },
 };
 #define NHANDS ((int)(sizeof HANDS / sizeof HANDS[0]))
 
@@ -2094,7 +2226,6 @@ static int setup_memory(void)
 }
 
 
-#define TEB         (SCRATCH_MID + 0x600)
 
 static void kb_base(Gen *g)
 {

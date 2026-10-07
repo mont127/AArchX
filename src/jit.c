@@ -540,6 +540,13 @@
  * Effective addresses wrap at 2^32 before the host mapping is applied, and pin
  * class 2 (the 64-bit CALL/RET protocol) is never selected for them.
  *
+ * An fs- or gs-relative operand adds the segment base to the wrapped address
+ * without wrapping the sum, as ocerz_ea does, and then takes the same guard and
+ * translation as any other operand.  32-bit Windows code reads fs:[0] for every
+ * SEH frame it pushes and pops and fs:[0x18] and fs:[0x2c] for the TEB and its
+ * TLS slots, and each of those was a slow call.  push and pop with a memory
+ * operand are translated too, since `push dword fs:[0]` opens every frame.
+ *
  * ---- bisection ----
  * OCERZ_INTERP_LO/HI and OCERZ_INTERP_RIP keep chosen ranges or addresses in
  * the interpreter, which is how a JIT miscompile is narrowed down;
@@ -3995,7 +4002,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
         static int no_low_seg = -1;
         if (no_low_seg < 0)
             no_low_seg = getenv("OCERZ_NO_LOW_SEG") ? 1 : 0;
-        if (no_seg || op->riprel || insn->addrsize == 4 || (ocerz_low_base != 0 && no_low_seg))
+        if (no_seg || op->riprel || (insn->addrsize == 4 && !insn->mode32) || (ocerz_low_base != 0 && no_low_seg))
             return 0;
     }
     if (op->riprel) {
@@ -4003,9 +4010,14 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
         return 1;
     }
     if (insn->addrsize == 4) {
-        if (!insn->mode32)
+        if (!insn->mode32 || !emit_mem_ea32(b, insn, op, addr_reg))
             return 0;
-        return emit_mem_ea32(b, insn, op, addr_reg);
+        if (seg == OCERZ_SEG_FS || seg == OCERZ_SEG_GS) {
+            a64_ldr(b, 8, JT0, 20, (uint32_t)(seg == OCERZ_SEG_FS ? offsetof(OcerzCPU, fs_base)
+                                                                  : offsetof(OcerzCPU, gs_base)));
+            a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
+        }
+        return 1;
     }
     if (insn->addrsize != 8)
         return 0;
@@ -5120,12 +5132,17 @@ static int stack_inline_enabled(void)
     return en;
 }
 
-static int m32_stack_ok(const X86Insn *insn)
+static int m32_stack_base_ok(void)
 {
-    return stack_inline_enabled() && insn->seg == OCERZ_SEG_NONE &&
+    return stack_inline_enabled() &&
            g_pin_class != 2 && pin_slot(OCERZ_RSP) >= 0 &&
            jgb_usable() && !mem_guard_needed() &&
            stack_plain_access_ok() && !stack_guard_needed();
+}
+
+static int m32_stack_ok(const X86Insn *insn)
+{
+    return insn->seg == OCERZ_SEG_NONE && m32_stack_base_ok();
 }
 
 static int emit_push_pop32(A64Buf *b, const X86Insn *insn)
@@ -5177,6 +5194,33 @@ static int emit_push_pop32(A64Buf *b, const X86Insn *insn)
         return 1;
     }
     return 0;
+}
+
+static int emit_push_pop_mem32(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *m = &insn->ops[0];
+    if ((insn->opsize ? insn->opsize : 4) != 4 || m->size != 4)
+        return 0;
+    if (!m32_stack_base_ok() || !mem_native_store_ok())
+        return 0;
+    if (insn->op == OCERZ_OP_POP && (m->base == OCERZ_RSP || m->index == OCERZ_RSP))
+        return 0;
+    int hs = pin_hreg(pin_slot(OCERZ_RSP));
+    if (!emit_mem_ea(b, insn, m, JTA))
+        return 0;
+    (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+    if (insn->op == OCERZ_OP_PUSH) {
+        emit_guest_load_ordered(b, 4, JT1, JTA, JTU);
+        a64_sub_imm(b, 0, JTA, hs, 4);
+        a64_str_regoff_uxtw(b, 4, JT1, JGB, JTA);
+        a64_mov_reg(b, 0, hs, JTA);
+    } else {
+        a64_ldr_regoff_uxtw(b, 4, JT1, JGB, hs);
+        emit_guest_store_ordered(b, 4, JT1, JTA, JTU);
+        a64_add_imm(b, 0, hs, hs, 4);
+    }
+    return 1;
 }
 
 static int emit_leave32(A64Buf *b, const X86Insn *insn)
@@ -10511,6 +10555,8 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
 
 static int emit_push_pop_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
+    if (insn->mode32)
+        return emit_push_pop_mem32(b, insn, exit_sites, n_exits);
     if (g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || !stack_plain_access_ok() || !jgb_usable() || stack_guard_needed()) return 0;
     if (insn->nops != 1 || insn->ops[0].kind != OCERZ_OPK_MEM || insn->ops[0].size != 8) return 0;
     if (insn->addrsize != 8 || (insn->seg != OCERZ_SEG_NONE && insn->seg != OCERZ_SEG_GS && insn->seg != OCERZ_SEG_FS)) return 0;
