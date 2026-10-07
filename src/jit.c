@@ -558,6 +558,11 @@
  * the slow call emitted in its place performed an aligned access a second
  * time, and a misaligned one spun on the alignment branch, never patched.
  *
+ * bt, bts, btr and btc on a register and bt on memory are emit_bt's, whose
+ * 32-bit operand forms are those of 64-bit code; a register offset into memory
+ * is sign-extended from its own size and added after the address wraps, as in
+ * the interpreter.  bts, btr and btc on memory stay interpreted, in both modes.
+ *
  * ---- bisection ----
  * OCERZ_INTERP_LO/HI and OCERZ_INTERP_RIP keep chosen ranges or addresses in
  * the interpreter, which is how a JIT miscompile is narrowed down;
@@ -10470,7 +10475,8 @@ static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
 #define RFLAGS_OFF ((uint32_t)offsetof(OcerzCPU, rflags))
 static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exit_sites, int *n_exits)
 {
-    if (!g_defer || insn->nops != 2 || insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
+    if (!g_defer || insn->nops != 2 || insn->seg != OCERZ_SEG_NONE) return 0;
+    if (insn->addrsize != 8 && !(insn->addrsize == 4 && insn->mode32)) return 0;
     const X86Operand *d = &insn->ops[0], *o = &insn->ops[1];
     int size = d->size;
     if (size != 2 && size != 4 && size != 8) return 0;
@@ -12018,6 +12024,7 @@ static int m32_inline_ok(const X86Insn *insn)
     case OCERZ_OP_PUSH: case OCERZ_OP_POP: case OCERZ_OP_LEAVE:
     case OCERZ_OP_PMOVMSKB:
     case OCERZ_OP_XCHG: case OCERZ_OP_XADD: case OCERZ_OP_CMPXCHG: case OCERZ_OP_CMPXCHGXB:
+    case OCERZ_OP_BT: case OCERZ_OP_BTS: case OCERZ_OP_BTR: case OCERZ_OP_BTC:
         return 1;
     default:
         return insn->op >= OCERZ_OP_MOVUPS && insn->op <= OCERZ_OP_PBLENDVB;
