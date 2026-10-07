@@ -966,6 +966,23 @@ static void t_0f(Gen *g)
 }
 
 
+static void t_btmem(Gen *g)
+{
+    static const uint8_t bt[4] = { 0xa3, 0xab, 0xb3, 0xbb };
+    MF m;
+    uint8_t r = rdst(g);
+    int op16 = rndn(g, 4) == 0;
+    unsigned k = rndn(g, 4);
+    eb(g, 0xb8 | r); ed(g, rndn(g, 0x400));
+    eb(g, 0x81); eb(g, 0xe8 | r); ed(g, 0x200);
+    if (rndn(g, 2)) mf_abs32(&m, (uint32_t)(SCRATCH_MID + rndn(g, 0x400)));
+    else mf_ebp8(&m, (int8_t)rndi(g, -120, 120));
+    if (k && rndn(g, 4) == 0) eb(g, 0xf0);
+    emit_prefixes(g, op16, &m, 1);
+    eb(g, 0x0f); eb(g, bt[k]);
+    emit_modrm(g, r, &m);
+}
+
 static void t_cx8(Gen *g)
 {
     MF m;
@@ -1074,6 +1091,7 @@ static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_pusha,   3 }, { t_enter,  2 }, { t_jcc,     8 }, { t_jmp,    3 },
     { t_loop,    4 }, { t_jecxz,  2 }, { t_call,    4 }, { t_string, 5 },
     { t_0f,     14 }, { t_seg,    10 }, { t_cx8,    4 },
+    { t_btmem,   4 },
 };
 #define NTEMPLATES ((int)(sizeof TEMPLATES / sizeof TEMPLATES[0]))
 
@@ -1831,6 +1849,32 @@ static void h_lock_many(Gen *g)
     bp8(g, CX8, 3, 1, 0x53);
 }
 
+static void h_bt32(Gen *g)
+{
+    static const uint8_t bt[4] = { 0xa3, 0xab, 0xb3, 0xbb };
+    g->c->gpr[OCERZ_RDX] = 0xa5a5a5a5f0f0f0f0ull;
+    g->c->gpr[OCERZ_RBX] = 0x5a5a5a5a0f0f0f0full;
+    for (int i = 0; i < 4; i++) {
+        mov32(g, OCERZ_RCX, 0x40u + 9u * (unsigned)i);
+        eb(g, 0x0f); eb(g, bt[i]); eb(g, 0xca);
+        eb(g, 0x9c); eb(g, 0x5e);
+        eb(g, 0x66); eb(g, 0x0f); eb(g, bt[i]); eb(g, 0xcb);
+        eb(g, 0x0f); eb(g, 0xba); eb(g, 0xc0 | ((4 + i) << 3) | 2); eb(g, 0x3f - 5 * i);
+        eb(g, 0x66); eb(g, 0x0f); eb(g, 0xba); eb(g, 0xc0 | ((4 + i) << 3) | 3); eb(g, 0x1d);
+    }
+    static const int32_t offs[6] = { 0, 7, 8, 0x1ff, -1, -0x200 };
+    for (int i = 0; i < 6; i++) {
+        mov32(g, OCERZ_RCX, (uint32_t)offs[i]);
+        eb(g, 0x0f); eb(g, 0xa3); eb(g, 0x4d); eb(g, 0x40);
+        eb(g, 0x9c); eb(g, 0x5f);
+        eb(g, 0x66); eb(g, 0x0f); eb(g, 0xa3); eb(g, 0x0d); ed(g, (uint32_t)(SCRATCH_MID + 0x100));
+        eb(g, 0x0f); eb(g, 0xba); eb(g, 0x65); eb(g, 0x44); eb(g, (uint8_t)(3 + 11 * i));
+    }
+    eb(g, 0x0f); eb(g, 0xa3); eb(g, 0xc8);
+    eb(g, 0x0f); eb(g, 0x92); eb(g, 0xc0);
+    eb(g, 0x0f); eb(g, 0xab); eb(g, 0xcb);
+}
+
 static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "highbyte",      h_highbyte },
     { "highbyte-mem",  h_highbyte_mem },
@@ -1868,6 +1912,7 @@ static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "seh-teb",       h_seh_teb },
     { "atomics32",     h_atomics32 },
     { "lock-many",     h_lock_many },
+    { "bt32",          h_bt32 },
 };
 #define NHANDS ((int)(sizeof HANDS / sizeof HANDS[0]))
 
