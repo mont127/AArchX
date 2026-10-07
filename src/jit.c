@@ -566,6 +566,13 @@
  * TLS slots, and each of those was a slow call.  push and pop with a memory
  * operand are translated too, since `push dword fs:[0]` opens every frame.
  *
+ * In the Wine layout a 32-bit stack slot always lies in the low window, so
+ * push, pop, call, ret and leave reach it with low_base or'ed into the
+ * zero-extended esp, with no range test (low_guard_fast_ok has checked that
+ * orr can encode low_base).  They used to want guest_base in JGB, which that
+ * layout does not keep, so in the one layout 32-bit code runs in every one of
+ * them was a slow call: an SEH frame of two pushes cost 37 ns, now 9.
+ *
  * Arithmetic on memory, xchg, xadd and cmpxchg go through emit_rmw_mem as in
  * 64-bit blocks: in ordered mode the locked and exchanging forms are LSE
  * atomics, and an access that is not naturally aligned leaves for the
@@ -5163,12 +5170,40 @@ static int stack_inline_enabled(void)
     return en;
 }
 
+static int m32_stack_low(void)
+{
+    return ocerz_low_base != 0 && low_guard_fast_ok();
+}
+
 static int m32_stack_base_ok(void)
 {
-    return stack_inline_enabled() &&
-           g_pin_class != 2 && pin_slot(OCERZ_RSP) >= 0 &&
-           jgb_usable() && !mem_guard_needed() &&
-           stack_plain_access_ok() && !stack_guard_needed();
+    if (!stack_inline_enabled() || g_pin_class == 2 || pin_slot(OCERZ_RSP) < 0 || !stack_plain_access_ok())
+        return 0;
+    if (m32_stack_low())
+        return 1;
+    return jgb_usable() && !mem_guard_needed() && !stack_guard_needed();
+}
+
+static void m32_stack_st(A64Buf *b, int rv, int wa)
+{
+    if (!m32_stack_low()) {
+        a64_str_regoff_uxtw(b, 4, rv, JGB, wa);
+        return;
+    }
+    a64_mov_reg(b, 0, JTU, wa);
+    (void)a64_try_orr_imm(b, 1, JTU, JTU, ocerz_low_base);
+    a64_str(b, 4, rv, JTU, 0);
+}
+
+static void m32_stack_ld(A64Buf *b, int rd, int wa)
+{
+    if (!m32_stack_low()) {
+        a64_ldr_regoff_uxtw(b, 4, rd, JGB, wa);
+        return;
+    }
+    a64_mov_reg(b, 0, JTU, wa);
+    (void)a64_try_orr_imm(b, 1, JTU, JTU, ocerz_low_base);
+    a64_ldr(b, 4, rd, JTU, 0);
 }
 
 static int m32_stack_ok(const X86Insn *insn)
@@ -5204,7 +5239,7 @@ static int emit_push_pop32(A64Buf *b, const X86Insn *insn)
             return 0;
         }
         a64_sub_imm(b, 0, JTA, hs, 4);
-        a64_str_regoff_uxtw(b, 4, rv, JGB, JTA);
+        m32_stack_st(b, rv, JTA);
         a64_mov_reg(b, 0, hs, JTA);
         return 1;
     }
@@ -5213,12 +5248,12 @@ static int emit_push_pop32(A64Buf *b, const X86Insn *insn)
         if (o->kind != OCERZ_OPK_REG || o->high8 || o->size != 4)
             return 0;
         if (o->reg == OCERZ_RSP) {
-            a64_ldr_regoff_uxtw(b, 4, hs, JGB, hs);
+            m32_stack_ld(b, hs, hs);
             return 1;
         }
         int ds = pin_slot(o->reg);
         int rd = ds >= 0 ? pin_hreg(ds) : JT1;
-        a64_ldr_regoff_uxtw(b, 4, rd, JGB, hs);
+        m32_stack_ld(b, rd, hs);
         a64_add_imm(b, 0, hs, hs, 4);
         if (ds < 0)
             emit_gpr_wr(b, JT1, o->reg);
@@ -5244,10 +5279,10 @@ static int emit_push_pop_mem32(A64Buf *b, const X86Insn *insn, uint32_t **exit_s
     if (insn->op == OCERZ_OP_PUSH) {
         emit_guest_load_ordered(b, 4, JT1, JTA, JTU);
         a64_sub_imm(b, 0, JTA, hs, 4);
-        a64_str_regoff_uxtw(b, 4, JT1, JGB, JTA);
+        m32_stack_st(b, JT1, JTA);
         a64_mov_reg(b, 0, hs, JTA);
     } else {
-        a64_ldr_regoff_uxtw(b, 4, JT1, JGB, hs);
+        m32_stack_ld(b, JT1, hs);
         emit_guest_store_ordered(b, 4, JT1, JTA, JTU);
         a64_add_imm(b, 0, hs, hs, 4);
     }
@@ -5262,7 +5297,7 @@ static int emit_leave32(A64Buf *b, const X86Insn *insn)
         return 0;
     int hs = pin_hreg(pin_slot(OCERZ_RSP)), hb = pin_hreg(pin_slot(OCERZ_RBP));
     a64_mov_reg(b, 0, hs, hb);
-    a64_ldr_regoff_uxtw(b, 4, hb, JGB, hs);
+    m32_stack_ld(b, hb, hs);
     a64_add_imm(b, 0, hs, hs, 4);
     return 1;
 }
@@ -13936,7 +13971,7 @@ static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
 
         a64_mov_imm64(b, JT1, retaddr);
         a64_sub_imm(b, 0, JTA, hs, 4);
-        a64_str_regoff_uxtw(b, 4, JT1, JGB, JTA);
+        m32_stack_st(b, JT1, JTA);
         a64_mov_reg(b, 0, hs, JTA);
 
         if (g_no_chain) {
@@ -13970,7 +14005,7 @@ static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
         }
         if (pop > 4095)
             return 0;
-        a64_ldr_regoff_uxtw(b, 4, JT0, JGB, hs);
+        m32_stack_ld(b, JT0, hs);
         a64_add_imm(b, 0, hs, hs, pop);
         a64_str(b, 8, JT0, 20, RIP_OFF);
         a64_mov_imm64(b, 0, OCERZ_STEP_OK);
