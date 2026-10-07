@@ -547,6 +547,17 @@
  * TLS slots, and each of those was a slow call.  push and pop with a memory
  * operand are translated too, since `push dword fs:[0]` opens every frame.
  *
+ * Arithmetic on memory, xchg, xadd and cmpxchg go through emit_rmw_mem as in
+ * 64-bit blocks: in ordered mode the locked and exchanging forms are LSE
+ * atomics, and an access that is not naturally aligned leaves for the
+ * interpreter out of line.  cmpxchg8b is a casal of EDX:EAX against ECX:EBX
+ * that writes ZF into the materialized flags and EDX:EAX only on a mismatch,
+ * and xchg between two registers goes through a scratch register.  A block
+ * has room for 32 out-of-line arms; past that the slow call goes inline behind
+ * a branch.  emit_rmw_mem used to give up there after emitting its atomic, so
+ * the slow call emitted in its place performed an aligned access a second
+ * time, and a misaligned one spun on the alignment branch, never patched.
+ *
  * ---- bisection ----
  * OCERZ_INTERP_LO/HI and OCERZ_INTERP_RIP keep chosen ranges or addresses in
  * the interpreter, which is how a JIT miscompile is narrowed down;
@@ -11740,7 +11751,7 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
                         uint32_t **exit_sites, int *n_exits)
 {
     static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_INLINE_RMW") ? 1 : 0;
-    if (dis || !g_defer || insn->addrsize != 8) return 0;
+    if (dis || !g_defer || (insn->addrsize != 8 && !(insn->addrsize == 4 && insn->mode32))) return 0;
     if (insn->seg != OCERZ_SEG_NONE && insn->seg != OCERZ_SEG_GS && insn->seg != OCERZ_SEG_FS) return 0;
     unsigned op = insn->op;
     const X86Operand *m, *s = NULL, *r = NULL;
@@ -11888,7 +11899,96 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     (void)have_new;
     if (align_bne) {
         uint32_t *sites[1] = { align_bne };
-        if (!oolslow_add(insn, sites, 1, a64_label(b))) return 0;
+        if (!oolslow_add(insn, sites, 1, a64_label(b))) {
+            uint32_t *done = a64_label(b);
+            a64_b(b, 0);
+            patch_any_branch(align_bne, a64_label(b));
+            emit_slowcall(b, insn, exit_sites, n_exits);
+            a64_patch_b(done, a64_label(b));
+        }
+    }
+    return 1;
+}
+
+static int emit_xchg_reg32(A64Buf *b, const X86Insn *insn)
+{
+    const X86Operand *x = &insn->ops[0], *y = &insn->ops[1];
+    int size = x->size;
+    if (insn->nops != 2 || y->kind != OCERZ_OPK_REG || y->size != size || pin_slot(x->reg) < 0 || pin_slot(y->reg) < 0)
+        return 0;
+    int rx = pin_hreg(pin_slot(x->reg)), ry = pin_hreg(pin_slot(y->reg));
+    if (size == 4) {
+        if (rx == ry) {
+            a64_mov_reg(b, 0, rx, rx);
+            return 1;
+        }
+        a64_mov_reg(b, 0, JT0, rx);
+        a64_mov_reg(b, 0, rx, ry);
+        a64_mov_reg(b, 0, ry, JT0);
+        return 1;
+    }
+    if (size != 1 && size != 2)
+        return 0;
+    int lx = x->high8 ? 8 : 0, ly = y->high8 ? 8 : 0, w = size * 8;
+    a64_ubfx(b, 1, JT0, rx, lx, w);
+    a64_ubfx(b, 1, JT1, ry, ly, w);
+    a64_bfi(b, 1, rx, JT1, lx, w);
+    a64_bfi(b, 1, ry, JT0, ly, w);
+    return 1;
+}
+
+static int emit_cmpxchg8b(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *m = &insn->ops[0];
+    if (!insn->mode32 || insn->opsize != 8 || insn->nops != 1 || m->kind != OCERZ_OPK_MEM || insn->addrsize != 4)
+        return 0;
+    if (!g_defer || !mem_native_store_ok())
+        return 0;
+    if (pin_slot(OCERZ_RAX) < 0 || pin_slot(OCERZ_RDX) < 0 || pin_slot(OCERZ_RBX) < 0 || pin_slot(OCERZ_RCX) < 0)
+        return 0;
+    int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
+    int hbx = pin_hreg(pin_slot(OCERZ_RBX)), hcx = pin_hreg(pin_slot(OCERZ_RCX));
+    emit_materialize(b);
+    if (!emit_mem_ea(b, insn, m, JTA))
+        return 0;
+    (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+    a64_mov_reg(b, 0, JT2, hax);
+    a64_bfi(b, 1, JT2, hdx, 32, 32);
+    a64_mov_reg(b, 0, JT1, hbx);
+    a64_bfi(b, 1, JT1, hcx, 32, 32);
+    uint32_t *align_bne = NULL;
+    if (!g_plain_mem) {
+        a64_try_ands_imm(b, 1, A64_ZR, JTA, 7);
+        align_bne = a64_label(b);
+        a64_bcond(b, A64_NE, 0);
+        a64_mov_reg(b, 1, JT0, JT2);
+        a64_casal(b, 8, JT0, JT1, JTA);
+    } else {
+        int plainacc = mem_plain_access_ok(m);
+        emit_gpr_ld_at(b, 8, JT0, JTA, 0, plainacc);
+        a64_subs_reg(b, 1, A64_ZR, JT0, JT2, 0);
+        a64_csel(b, 1, JT1, JT1, JT0, A64_EQ);
+        emit_gpr_st_at(b, 8, JT1, JTA, 0, plainacc);
+    }
+    a64_subs_reg(b, 1, A64_ZR, JT0, JT2, 0);
+    a64_mov_reg(b, 0, JTT, JT0);
+    a64_csel(b, 1, hax, hax, JTT, A64_EQ);
+    a64_lsr_imm(b, 1, JTT, JT0, 32);
+    a64_csel(b, 1, hdx, hdx, JTT, A64_EQ);
+    a64_cset(b, JTT, A64_EQ);
+    a64_ldr(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, rflags));
+    a64_bfi(b, 1, JTU, JTT, 6, 1);
+    a64_str(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, rflags));
+    if (align_bne) {
+        uint32_t *sites[1] = { align_bne };
+        if (!oolslow_add(insn, sites, 1, a64_label(b))) {
+            uint32_t *done = a64_label(b);
+            a64_b(b, 0);
+            patch_any_branch(align_bne, a64_label(b));
+            emit_slowcall(b, insn, exit_sites, n_exits);
+            a64_patch_b(done, a64_label(b));
+        }
     }
     return 1;
 }
@@ -11917,6 +12017,7 @@ static int m32_inline_ok(const X86Insn *insn)
     case OCERZ_OP_LEA:
     case OCERZ_OP_PUSH: case OCERZ_OP_POP: case OCERZ_OP_LEAVE:
     case OCERZ_OP_PMOVMSKB:
+    case OCERZ_OP_XCHG: case OCERZ_OP_XADD: case OCERZ_OP_CMPXCHG: case OCERZ_OP_CMPXCHGXB:
         return 1;
     default:
         return insn->op >= OCERZ_OP_MOVUPS && insn->op <= OCERZ_OP_PBLENDVB;
@@ -12032,9 +12133,14 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
             return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
         return emit_incdec(b, insn, need);
     case OCERZ_OP_XCHG:
+        if (insn->mode32 && insn->ops[0].kind == OCERZ_OPK_REG && insn->ops[1].kind == OCERZ_OPK_REG)
+            return emit_xchg_reg32(b, insn);
+        return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
     case OCERZ_OP_XADD:
     case OCERZ_OP_CMPXCHG:
         return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
+    case OCERZ_OP_CMPXCHGXB:
+        return emit_cmpxchg8b(b, insn, exit_sites, n_exits);
     case OCERZ_OP_SHL:
     case OCERZ_OP_SHR:
     case OCERZ_OP_SAR:
