@@ -961,6 +961,7 @@ run_low_golden_case dx87_compare_low tests/dynamic/x87_compare.c tests/dynamic/x
 run_low_golden_case dx87_int_low tests/dynamic/x87_int.c tests/dynamic/x87_int.out
 run_low_golden_case dx87_trans_low tests/dynamic/x87_trans.c tests/dynamic/x87_trans.out
 run_low_golden_case dx87_state_low tests/dynamic/x87_state.c tests/dynamic/x87_state.out
+run_low_golden_case dlow_stack_switch tests/dynamic/low_stack_switch.c tests/dynamic/low_stack_switch.out
 run_low_golden_case dlow_top_strip tests/dynamic/low_top_strip.c tests/dynamic/low_top_strip.out
 export OCERZ_NO_PLAIN_MEM=1
 run_file_case dalign_ordered tests/dynamic/align_ordered.c '370d1a721afe9c4a'
