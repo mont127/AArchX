@@ -248,11 +248,14 @@
  * Every exit from a run, the guard's or an instruction's, enters one call that
  * interprets from that instruction to the end of the run
  * (ocerz_jit_exec_run_at).  An fcmovcc right after fcomi(p) branches on that
- * compare's own flags.  On xbench's x87 kernel, twenty-two x87 instructions an
- * element, 10,000 rounds took 1.15 s through the interpreter and take 0.16 s,
- * where Rosetta takes 0.73 s.  Keeping ST(i) in V registers across a run
- * instead, written through so that every exit stays exact, measured 6% slower,
- * so the values stay in memory.  OCERZ_NO_JIT_X87=1 interprets x87 again.
+ * compare's own flags.  FILD qword followed by FISTP qword, Delphi's
+ * eight-byte Move(), stores the integer rebuilt from the image FILD just made,
+ * so the copy is exact.  On xbench's x87 kernel, twenty-two x87 instructions
+ * an element, 10,000 rounds took 1.15 s through the interpreter and take
+ * 0.16 s, where Rosetta takes 0.73 s.  Keeping ST(i) in V registers across a
+ * run instead, written through so that every exit stays exact, measured 6%
+ * slower, so the values stay in memory.  OCERZ_NO_JIT_X87=1 interprets x87
+ * again.
  *
  * ---- control flow ----
  * A block may run past a FORWARD conditional branch, continuing inline and
@@ -12523,38 +12526,51 @@ static int x87_compare(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t *
     return 1;
 }
 
-/* FIST, FISTP and FISTTP. */
-static int x87_fist(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+/* FIST, FISTP and FISTTP; a courier FISTP stores the integer the preceding FILD qword imaged. */
+static int x87_fist(A64Buf *b, const X86Insn *insn, int courier, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *o = &insn->ops[0];
     int popit = insn->op != OCERZ_OP_FIST;
     x87_ld(b);
     x87_top(b, X87P);
-    a64_ldr(b, 2, JTT, 20, X87_XOK_OFF);
-    a64_lsrv(b, 0, JTT, JTT, X87P);
-    (void)a64_try_ands_imm(b, 0, A64_ZR, JTT, 1);
-    x87_slow_if(b, A64_NE);
-    x87_slot(b, X87Q, X87P);
-    a64_ldr_v(b, 8, VX0, X87Q, X87_FPR_OFF);
-    a64_fcmp(b, 1, VX0, VX0);
-    x87_slow_if(b, A64_VS);
-    if (insn->op == OCERZ_OP_FISTTP) a64_fcvtzs(b, 1, 1, X87Q, VX0);
-    else                             a64_fcvtns(b, 1, 1, X87Q, VX0);
-    if (o->size == 8) {
-        a64_adds_imm(b, 1, A64_ZR, X87Q, 1);
-        x87_slow_if(b, A64_VS);
-        a64_subs_imm(b, 1, A64_ZR, X87Q, 1);
-        x87_slow_if(b, A64_VS);
+    if (courier) {
+        x87_slot(b, X87Q, X87P);
+        a64_ldr(b, 8, JTT, X87Q, X87_XM_OFF);
+        a64_add_reg(b, 1, X87Q, 20, X87P, 1);
+        a64_ldr(b, 2, JTU, X87Q, X87_XE_OFF);
+        (void)a64_try_and_imm(b, 0, JT0, JTU, 0x7fff);
+        a64_movz(b, X87Q, 16383 + 63, 0);
+        a64_sub_reg(b, 0, JT0, X87Q, JT0, 0);
+        a64_lsrv(b, 1, JTT, JTT, JT0);
+        (void)a64_try_ands_imm(b, 0, A64_ZR, JTU, 0x8000);
+        a64_csneg(b, 1, X87Q, JTT, JTT, A64_EQ);
     } else {
-        if (o->size == 2) a64_sxth(b, 1, JTT, X87Q);
-        else              a64_sxtw(b, JTT, X87Q);
-        a64_subs_reg(b, 1, A64_ZR, JTT, X87Q, 0);
+        a64_ldr(b, 2, JTT, 20, X87_XOK_OFF);
+        a64_lsrv(b, 0, JTT, JTT, X87P);
+        (void)a64_try_ands_imm(b, 0, A64_ZR, JTT, 1);
         x87_slow_if(b, A64_NE);
+        x87_slot(b, X87Q, X87P);
+        a64_ldr_v(b, 8, VX0, X87Q, X87_FPR_OFF);
+        a64_fcmp(b, 1, VX0, VX0);
+        x87_slow_if(b, A64_VS);
+        if (insn->op == OCERZ_OP_FISTTP) a64_fcvtzs(b, 1, 1, X87Q, VX0);
+        else                             a64_fcvtns(b, 1, 1, X87Q, VX0);
+        if (o->size == 8) {
+            a64_adds_imm(b, 1, A64_ZR, X87Q, 1);
+            x87_slow_if(b, A64_VS);
+            a64_subs_imm(b, 1, A64_ZR, X87Q, 1);
+            x87_slow_if(b, A64_VS);
+        } else {
+            if (o->size == 2) a64_sxth(b, 1, JTT, X87Q);
+            else              a64_sxtw(b, JTT, X87Q);
+            a64_subs_reg(b, 1, A64_ZR, JTT, X87Q, 0);
+            x87_slow_if(b, A64_NE);
+        }
+        a64_scvtf(b, 1, 1, VX1, X87Q);
+        a64_fcmp(b, 1, VX1, VX0);
+        x87_frag_if(b, A64_NE, XF_SETPE, 0);
+        x87_frag_land(b);
     }
-    a64_scvtf(b, 1, 1, VX1, X87Q);
-    a64_fcmp(b, 1, VX1, VX0);
-    x87_frag_if(b, A64_NE, XF_SETPE, 0);
-    x87_frag_land(b);
     if (!x87_st_mem(b, insn, 0, X87Q, exit_sites, n_exits)) return 0;
     if (popit) {
         x87_pop(b);
@@ -12645,8 +12661,12 @@ static int emit_x87_one(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t 
         x87_ld(b);
         x87_push(b, VX0, 1, JTT, JTU);
         return 1;
-    case OCERZ_OP_FIST: case OCERZ_OP_FISTP: case OCERZ_OP_FISTTP:
-        return x87_fist(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_FIST: case OCERZ_OP_FISTP: case OCERZ_OP_FISTTP: {
+        int i = g_cur_insn_idx;
+        int courier = op == OCERZ_OP_FISTP && o->size == 8 && i > g_x87_run[g_x87_cur].first &&
+                      g_cur_insns[i - 1].op == OCERZ_OP_FILD && g_cur_insns[i - 1].ops[0].size == 8;
+        return x87_fist(b, insn, courier, exit_sites, n_exits);
+    }
     case OCERZ_OP_FLDZ: case OCERZ_OP_FLD1: case OCERZ_OP_FLDPI: case OCERZ_OP_FLDL2E:
     case OCERZ_OP_FLDL2T: case OCERZ_OP_FLDLG2: case OCERZ_OP_FLDLN2: {
         uint64_t mant; unsigned se;
