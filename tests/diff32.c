@@ -1047,6 +1047,118 @@ static void t_cmpjcc(Gen *g)
     jcc_over_blob(g, rndn(g, 16));
 }
 
+static void t_ccuse(Gen *g)
+{
+    if (room(g) < 80) return;
+    static const uint8_t alu[7] = { 0x38, 0x84, 0x00, 0x28, 0x20, 0x08, 0x30 };
+    uint8_t d = rdst(g);
+    unsigned sz = rndn(g, 5);
+    int sz8 = sz == 0, op16 = sz == 1;
+    switch (rndn(g, 5)) {
+    case 0: case 1: {
+        unsigned a = alu[rndn(g, 7)];
+        if (op16) eb(g, 0x66);
+        eb(g, a + (sz8 ? 0 : 1));
+        eb(g, 0xc0 | (rany(g) << 3) | (sz8 ? rany(g) : (a == 0x38 || a == 0x84 ? rany(g) : d)));
+        break;
+    }
+    case 2:
+        if (op16) eb(g, 0x66);
+        if (sz8) { eb(g, 0x80); eb(g, 0xc0 | (rndn(g, 8) << 3) | rany(g)); eb(g, rnd(g)); }
+        else { eb(g, 0x83); eb(g, 0xc0 | (rndn(g, 8) << 3) | d); eb(g, rndn(g, 3) ? rnd(g) : 0); }
+        break;
+    case 3:
+        if (op16) eb(g, 0x66);
+        switch (rndn(g, 4)) {
+        case 0: eb(g, 0x40 | d); break;
+        case 1: eb(g, 0x48 | d); break;
+        case 2: eb(g, 0xf7); eb(g, 0xd8 | d); break;
+        default: eb(g, 0xc1); eb(g, 0xc0 | ((4 + rndn(g, 2) * (rndn(g, 2) ? 1 : 3)) << 3) | d); eb(g, rndn(g, 40)); break;
+        }
+        break;
+    default: {
+        static const uint8_t pick[4] = { 0x2e, 0x2f, 0x2e, 0x2f };
+        unsigned x = rndn(g, 8), y = rndn(g, 8);
+        uint32_t a = (uint32_t)(SCRATCH_MID + rndn(g, 0x100) * 8);
+        if (rndn(g, 2)) eb(g, 0x66);
+        eb(g, 0x0f); eb(g, 0x10); eb(g, (x << 3) | 5); ed(g, a);
+        if (rndn(g, 2)) { eb(g, 0x0f); eb(g, 0x10); eb(g, (y << 3) | 5); ed(g, a + 8); }
+        if (rndn(g, 2)) eb(g, 0x66);
+        eb(g, 0x0f); eb(g, pick[rndn(g, 4)]); eb(g, 0xc0 | (x << 3) | y);
+        break;
+    }
+    }
+    int gaps = (int)rndn(g, 3);
+    for (int i = 0; i < gaps; i++) {
+        uint8_t r = rdst(g);
+        switch (rndn(g, 4)) {
+        case 0: eb(g, 0xb8 | r); ed(g, rnd(g)); break;
+        case 1: eb(g, 0x89); eb(g, 0xc0 | (rany(g) << 3) | r); break;
+        case 2: eb(g, 0x0f); eb(g, 0x90 | rndn(g, 16)); eb(g, 0xc0 | rbyte_avoid(g)); break;
+        default: eb(g, 0x0f); eb(g, 0x40 | rndn(g, 16)); eb(g, 0xc0 | (r << 3) | rany(g)); break;
+        }
+    }
+    uint8_t r = rdst(g);
+    switch (rndn(g, 5)) {
+    case 0: eb(g, 0x0f); eb(g, 0x90 | rndn(g, 16)); eb(g, 0xc0 | rbyte_avoid(g)); break;
+    case 1: eb(g, 0x0f); eb(g, 0x40 | rndn(g, 16)); eb(g, 0xc0 | (r << 3) | rany(g)); break;
+    case 2: {
+        MF m;
+        pick_mem(g, &m, 0);
+        emit_prefixes(g, 0, &m, 1);
+        eb(g, 0x0f); eb(g, 0x40 | rndn(g, 16)); emit_modrm(g, rdst(g), &m);
+        break;
+    }
+    case 3:
+        if (rndn(g, 2)) { eb(g, rndn(g, 2) ? 0x11 : 0x19); eb(g, 0xc0 | (rany(g) << 3) | r); }
+        else { eb(g, 0x83); eb(g, 0xc0 | ((rndn(g, 2) ? 2 : 3) << 3) | r); eb(g, rnd(g)); }
+        break;
+    default:
+        jcc_over_blob(g, rndn(g, 16));
+        break;
+    }
+}
+
+static void t_pairs(Gen *g)
+{
+    if (room(g) < 40) return;
+    uint8_t d = rdst(g);
+    if (rndn(g, 2)) {
+        static const uint8_t lg[3] = { 0x21, 0x09, 0x31 };
+        eb(g, 0x89); eb(g, 0xc0 | (rany(g) << 3) | d);
+        if (rndn(g, 2)) { eb(g, lg[rndn(g, 3)]); eb(g, 0xc0 | (rany(g) << 3) | d); }
+        else { eb(g, 0x81); eb(g, 0xc0 | ((rndn(g, 3) == 0 ? 4 : rndn(g, 2) ? 1 : 6) << 3) | d); ed(g, rnd(g)); }
+        eb(g, rndn(g, 2) ? 0x39 : 0x85); eb(g, 0xc0 | (rany(g) << 3) | rany(g));
+    } else {
+        if (rndn(g, 2)) { eb(g, 0x01); eb(g, 0xc0 | (rany(g) << 3) | d); }
+        else { eb(g, 0x83); eb(g, 0xc0 | d); eb(g, rnd(g)); }
+        eb(g, 0x40 | d);
+        uint8_t r = rdst(g);
+        switch (rndn(g, 3)) {
+        case 0: eb(g, 0x11); eb(g, 0xc0 | (rany(g) << 3) | r); break;
+        case 1: eb(g, 0x0f); eb(g, 0x92); eb(g, 0xc0 | rbyte_avoid(g)); break;
+        default: jcc_over_blob(g, 2 + rndn(g, 2)); break;
+        }
+    }
+}
+
+static void t_movshift(Gen *g)
+{
+    if (room(g) < 40) return;
+    uint8_t d = rdst(g), sr = rdst(g), r = rdst(g);
+    while (sr == d) sr = rdst(g);
+    while (r == d || r == sr) r = rdst(g);
+    eb(g, 0x89); eb(g, 0xc0 | (sr << 3) | d);
+    int gaps = rndi(g, 1, 2);
+    for (int i = 0; i < gaps; i++) {
+        if (rndn(g, 2)) { eb(g, 0xb8 | r); ed(g, rnd(g)); }
+        else { eb(g, rndn(g, 2) ? 0x01 : 0x31); eb(g, 0xc0 | ((rndn(g, 2) ? sr : r) << 3) | r); }
+    }
+    static const uint8_t sh[3] = { 4, 5, 7 };
+    eb(g, 0xc1); eb(g, 0xc0 | (sh[rndn(g, 3)] << 3) | d); eb(g, (uint8_t)rndi(g, 1, 31));
+    if (rndn(g, 4)) { eb(g, rndn(g, 2) ? 0x39 : 0x85); eb(g, 0xc0 | (rany(g) << 3) | rany(g)); }
+}
+
 static void t_cntloop(Gen *g)
 {
     if (room(g) < 72) return;
@@ -1209,6 +1321,7 @@ static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_loop,    4 }, { t_jecxz,  2 }, { t_call,    4 }, { t_string, 5 },
     { t_0f,     14 }, { t_seg,    10 }, { t_cx8,    4 },
     { t_btmem,   4 }, { t_cmpjcc, 10 }, { t_cntloop, 5 },
+    { t_ccuse,  10 }, { t_pairs,   5 }, { t_movshift, 3 },
 };
 #define NTEMPLATES ((int)(sizeof TEMPLATES / sizeof TEMPLATES[0]))
 
@@ -1992,6 +2105,43 @@ static void h_bt32(Gen *g)
     eb(g, 0x0f); eb(g, 0xab); eb(g, 0xcb);
 }
 
+static void h_comis_cc(Gen *g)
+{
+    static const uint32_t pairs[5][2] = {
+        { 0x3f800000u, 0x3f800000u }, { 0x3f800000u, 0x40000000u }, { 0x40000000u, 0x3f800000u },
+        { 0x7fc00000u, 0x3f800000u }, { 0x80000000u, 0x00000000u },
+    };
+    static const uint8_t ccs[8] = { 0x7, 0x3, 0x2, 0x6, 0x4, 0x5, 0xa, 0xb };
+    for (int p = 0; p < 10; p++) {
+        int dbl = p >= 5;
+        const uint32_t *v = pairs[p % 5];
+        if (!dbl) {
+            mov32(g, OCERZ_RAX, v[0]); eb(g, 0x66); eb(g, 0x0f); eb(g, 0x6e); eb(g, 0xc0);
+            mov32(g, OCERZ_RAX, v[1]); eb(g, 0x66); eb(g, 0x0f); eb(g, 0x6e); eb(g, 0xc8);
+        } else if (p % 5 == 3) {
+            eb(g, 0x66); eb(g, 0x0f); eb(g, 0x76); eb(g, 0xc0);
+            mov32(g, OCERZ_RAX, 1); eb(g, 0xf2); eb(g, 0x0f); eb(g, 0x2a); eb(g, 0xc8);
+        } else {
+            static const uint32_t iv[5][2] = { { 1, 1 }, { 1, 2 }, { 2, 1 }, { 0, 0 }, { 0, 0 } };
+            mov32(g, OCERZ_RAX, iv[p % 5][0]); eb(g, 0xf2); eb(g, 0x0f); eb(g, 0x2a); eb(g, 0xc0);
+            mov32(g, OCERZ_RAX, iv[p % 5][1]); eb(g, 0xf2); eb(g, 0x0f); eb(g, 0x2a); eb(g, 0xc8);
+        }
+        if (dbl) eb(g, 0x66);
+        eb(g, 0x0f); eb(g, (p & 1) ? 0x2f : 0x2e); eb(g, 0xc1);
+        for (int half = 0; half < 2; half++) {
+            for (int k = 0; k < 4; k++) {
+                eb(g, 0x0f); eb(g, 0x90 | ccs[4 * half + k]); eb(g, 0xc0 | (unsigned)k);
+            }
+            for (unsigned r = 0; r < 4; r++) {
+                eb(g, 0x89); eb(g, 0x05 | (r << 3));
+                ed(g, (uint32_t)(SCRATCH_MID + 0x300 + 32 * (unsigned)p + 16 * (unsigned)half + 4 * r));
+            }
+        }
+        eb(g, 0x0f); eb(g, 0x47); eb(g, 0xf3);
+        eb(g, 0x0f); eb(g, 0x42); eb(g, 0xfa);
+    }
+}
+
 static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "highbyte",      h_highbyte },
     { "highbyte-mem",  h_highbyte_mem },
@@ -2030,6 +2180,7 @@ static const struct { const char *name; void (*fn)(Gen *); } HANDS[] = {
     { "atomics32",     h_atomics32 },
     { "lock-many",     h_lock_many },
     { "bt32",          h_bt32 },
+    { "comis-cc",      h_comis_cc },
 };
 #define NHANDS ((int)(sizeof HANDS / sizeof HANDS[0]))
 
@@ -2554,6 +2705,16 @@ static void kb_bt(Gen *g)
     eb(g, 0x0f); eb(g, 0xba); eb(g, 0xf2); eb(g, 0x05);
 }
 
+static void kb_cc(Gen *g)
+{
+    eb(g, 0x39); eb(g, 0xf8);
+    eb(g, 0x0f); eb(g, 0x92); eb(g, 0xc1);
+    eb(g, 0x0f); eb(g, 0x4c); eb(g, 0xd3);
+    eb(g, 0x01); eb(g, 0xce);
+    eb(g, 0x40);
+    eb(g, 0x0f); eb(g, 0x94); eb(g, 0xc3);
+}
+
 static void kb_rmw(Gen *g)
 {
     eb(g, 0x01); eb(g, 0x45); eb(g, 0x50);
@@ -2571,6 +2732,7 @@ static const struct { const char *name; void (*fn)(Gen *); const char *what; } K
     { "cmpxchg8b", kb_cx8,     "mov eax/edx, [ebp+0x40/0x44]; lea ebx, [eax+1]; mov ecx, edx; lock cmpxchg8b [ebp+0x40]" },
     { "bt",        kb_bt,      "bt eax, 3; bts edx, edi; btr edx, 5" },
     { "rmw",       kb_rmw,     "add [ebp+0x50], eax; inc dword [ebp+0x54]; or dword [ebp+0x58], 1" },
+    { "cc",        kb_cc,      "cmp eax, edi; setb cl; cmovl edx, ebx; add esi, ecx; inc eax; sete bl" },
 };
 #define NKERNELS ((int)(sizeof KERNELS / sizeof KERNELS[0]))
 
