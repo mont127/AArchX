@@ -46,6 +46,15 @@
  * and the store full removes it and starts it again, so a full store costs one
  * cold start rather than every translation from then on.
  *
+ * The disk comes first.  The cache never writes while its volume has less than
+ * OCERZ_TCACHE_MIN_FREE_MB free (10240 by default), checked before every
+ * append, and a process takes at most half of what was free above that floor
+ * when it opened the store.  A lone process that finds the volume already
+ * under the floor removes the store, and the prune then removes every other
+ * store that is more than an hour old.  A tester's Mac with a few GB free
+ * filled up under a Steam session, stopped being able to swap, and panicked
+ * on the watchdog; with the floor the cache gives up its speed instead.
+ *
  * ---- in a process ----
  * A record put is copied into a 256 KB buffer and nothing more, so storing
  * costs the translator almost nothing; a full buffer goes to a writer thread,
@@ -77,6 +86,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -132,7 +142,7 @@ static TcSlot *g_slot;
 static uint64_t g_mask;
 static TcFile *g_file;
 static uint64_t g_nfile;
-static uint64_t g_cap_bytes;
+static uint64_t g_cap_bytes, g_floor_bytes, g_room_end;
 static int g_full;
 static uint64_t g_dno;
 static int g_dfd = -1;
@@ -199,7 +209,7 @@ static int env_ignored(const char *kv)
 {
     static const char *const skip[] = {
         "OCERZ_TCACHE=", "OCERZ_TCACHE_LOG=", "OCERZ_TCACHE_DIR=", "OCERZ_TCACHE_TRACE=",
-        "OCERZ_TCACHE_MAX_MB=", "OCERZ_GUESTPROF=", "OCERZ_GUESTPROF_PERIOD=", "OCERZ_LOWBASE=",
+        "OCERZ_TCACHE_MAX_MB=", "OCERZ_TCACHE_MIN_FREE_MB=", "OCERZ_GUESTPROF=", "OCERZ_GUESTPROF_PERIOD=", "OCERZ_LOWBASE=",
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
@@ -262,6 +272,13 @@ static int mkdirs(const char *path)
             *p = '/';
         }
     return mkdir(tmp, 0755) == 0 || errno == EEXIST ? 0 : -1;
+}
+
+/* Bytes free to this user on the volume that holds the store. */
+static uint64_t free_bytes(void)
+{
+    struct statfs s;
+    return statfs(g_dir, &s) == 0 ? (uint64_t)s.f_bavail * s.f_bsize : UINT64_MAX;
 }
 
 static void remove_dir(const char *dir)
@@ -341,7 +358,8 @@ static void *prune_other_dirs(void *arg)
         nk++;
     }
     closedir(d);
-    while (nk > 0 && total > (2ull << 30)) {
+    uint64_t budget = free_bytes() < g_floor_bytes ? 0 : 2ull << 30;
+    while (nk > 0 && total > budget) {
         int oldest = 0;
         for (int i = 1; i < nk; i++)
             if (keep[i].mt < keep[oldest].mt) oldest = i;
@@ -439,6 +457,11 @@ static int claim_store(void)
                 if (g_log > 0)
                     fprintf(stderr, "ocerz: TCACHE[%d] %s is full; starting it again\n", (int)getpid(), g_dir);
                 reset_store();
+            } else if (free_bytes() < g_floor_bytes) {
+                if (g_log > 0)
+                    fprintf(stderr, "ocerz: TCACHE[%d] %s: the disk is under the floor; removing the store\n",
+                            (int)getpid(), g_dir);
+                reset_store();
             }
             close(fd);
         }
@@ -455,6 +478,8 @@ static int open_store(void)
         g_log = getenv("OCERZ_TCACHE_LOG") ? 1 : 0;
     const char *mx = getenv("OCERZ_TCACHE_MAX_MB");
     g_cap_bytes = (uint64_t)(mx && atoi(mx) > 0 ? atoi(mx) : 4096) << 20;
+    const char *mf = getenv("OCERZ_TCACHE_MIN_FREE_MB");
+    g_floor_bytes = (mf && *mf ? strtoull(mf, NULL, 10) : 10240) << 20;
     g_fp = fingerprint();
     const char *dir = getenv("OCERZ_TCACHE_DIR");
     const char *home = getenv("HOME");
@@ -467,6 +492,14 @@ static int open_store(void)
     if (mkdirs(g_dir) != 0 || !claim_store() || !open_index())
         return 0;
     utimes(g_dir, NULL);
+    uint64_t fr = free_bytes();
+    g_room_end = __atomic_load_n(&g_hdr->bytes, __ATOMIC_RELAXED) + (fr > g_floor_bytes ? (fr - g_floor_bytes) / 2 : 0);
+    if (fr < g_floor_bytes) {
+        g_full = 1;
+        if (g_log > 0)
+            fprintf(stderr, "ocerz: TCACHE[%d] %s: %llu MB free, under the %llu MB floor; not writing\n", (int)getpid(),
+                    g_dir, (unsigned long long)(fr >> 20), (unsigned long long)(g_floor_bytes >> 20));
+    }
     size_t ds = compression_decode_scratch_buffer_size(COMPRESSION_LZ4_RAW);
     g_rbuf = (uint8_t *)malloc(TC_REC_MAX);
     g_dscratch = (uint8_t *)malloc(ds ? ds : 1);
@@ -624,7 +657,16 @@ static int open_data(void)
 
 static void write_stored(const uint8_t *p, size_t n)
 {
-    if (!n || !g_hdr || g_full || !open_data())
+    if (!n || !g_hdr || g_full)
+        return;
+    if (__atomic_load_n(&g_hdr->bytes, __ATOMIC_RELAXED) + n > g_room_end || free_bytes() < g_floor_bytes + n) {
+        if (g_log > 0)
+            fprintf(stderr, "ocerz: TCACHE[%d] %s: out of disk room (%llu MB free); no longer writing\n",
+                    (int)getpid(), g_dir, (unsigned long long)(free_bytes() >> 20));
+        g_full = 1;
+        return;
+    }
+    if (!open_data())
         return;
     size_t done = 0;
     while (done < n) {
