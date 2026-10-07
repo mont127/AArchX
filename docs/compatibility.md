@@ -333,6 +333,11 @@ These apply to cache mode, or to both modes. Native mode's own are in
   80-bit image until it is changed, so 64-bit integers (`fild`/`fistp qword`),
   `long double` copies, denormals and NaN payloads pass through loads, stores,
   `FNSAVE` and `FXSAVE` bit for bit. Unmasked x87 exceptions do not trap.
+- The JIT translates the x87 loads, stores, arithmetic, square root, compares,
+  `fcmov`, `fxch` and integer conversions, at any precision control. The
+  transcendental, BCD, 80-bit memory and environment forms, and any operation
+  that meets a NaN, gives an infinity or a tiny product or quotient, or rounds
+  other than to nearest, run in the interpreter, with the same results.
 - The JIT translates most VEX code: AVX2 integer, move and broadcast
   instructions, FMA, 256-bit packed arithmetic, the variable blends, `rorx`,
   `shlx`, `shrx`, `sarx`, `mulx`, `andn`, and `blsr`, `blsmsk`, `blsi` and

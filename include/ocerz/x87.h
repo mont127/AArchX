@@ -23,4 +23,7 @@ void ocerz_x87_fxrstor(OcerzCPU *cpu, uint64_t ea);
 void ocerz_x87_to_f80(const OcerzCPU *cpu, int p, uint8_t out[10]);
 void ocerz_x87_from_f80(OcerzCPU *cpu, int p, const uint8_t in[10]);
 
+/* The double an image rounds to, as the register file keeps it; the JIT's constant loads use it. */
+uint64_t ocerz_x87_f80_dbits(uint64_t mant, unsigned se);
+
 #endif

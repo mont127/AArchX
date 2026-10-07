@@ -7,8 +7,10 @@
  * depchain (a long serial ALU dependency chain), brmiss (data-dependent
  * unpredictable branches), memcpyk (memcpy of mixed sizes), hash (FNV/xxhash
  * style mixing), chase (pointer chasing through a shuffled list, cache-latency
- * bound), qsort (recursive quicksort), leafcall (many small non-recursive calls)
- * and mixed (a "real program" blend of struct updates, branches and small loops).
+ * bound), qsort (recursive quicksort), leafcall (many small non-recursive calls),
+ * mixed (a "real program" blend of struct updates, branches and small loops) and
+ * x87 and x87pc24 (the stack FPU's loads, multiply-adds, compares and
+ * conversions, the second at the precision Direct3D 9 sets).
  */
 #include "gsys.h"
 
@@ -241,6 +243,67 @@ static g_u64 k_mixed(g_u64 n)
     return acc;
 }
 
+/*
+ * x87 as 32-bit programs use it, in inline asm so no compiler turns it into
+ * SSE: per element a load, a multiply-add, an integer load and scale, two
+ * clamps made of fcomip and fcmovcc, an integer store and a store.  Every
+ * value is a multiple of 1/4 below 2^13, exact at any precision, so engines
+ * that keep 53 or 64 bits print the same checksum.  x87pc24 runs it under
+ * precision control 24, which Direct3D 9 leaves on its thread.
+ */
+static double x87a[256], x87b[256], x87c[256];
+static int x87i[256], x87o[256];
+static g_u64 x87_kernel(g_u64 n, unsigned short cw)
+{
+    static const double lim = 4096.0, quarter = 0.25;
+    unsigned short cw0 = 0x037f;
+    __asm__ volatile("fldcw %0" ::"m"(cw));
+    for (int i = 0; i < 256; i++) {
+        x87a[i] = (double)(i & 15) * 0.25;
+        x87b[i] = (double)((i * 7) & 31) - 8.0;
+        x87c[i] = 0.0;
+        x87i[i] = (i * 37) % 1001 - 500;
+    }
+    g_u64 acc = 0;
+    for (g_u64 r = 0; r < n; r++) {
+        for (int i = 0; i < 256; i++) {
+            __asm__ volatile(
+                "fldl %[a]\n\t"
+                "fmull %[b]\n\t"
+                "faddl %[c]\n\t"
+                "fildl %[iv]\n\t"
+                "fmull %[q]\n\t"
+                "faddp\n\t"
+                "fld %%st(0)\n\t"
+                "fsubl %[lim]\n\t"
+                "fldz\n\t"
+                "fcomip %%st(1), %%st\n\t"
+                "fcmovnb %%st(1), %%st\n\t"
+                "fstp %%st(1)\n\t"
+                "fld %%st(0)\n\t"
+                "faddl %[lim]\n\t"
+                "fldz\n\t"
+                "fcomip %%st(1), %%st\n\t"
+                "fcmovb %%st(1), %%st\n\t"
+                "fstp %%st(1)\n\t"
+                "fld %%st(0)\n\t"
+                "fchs\n\t"
+                "fistpl %[out]\n\t"
+                "fstpl %[c]\n\t"
+                : [c] "+m"(x87c[i]), [out] "=m"(x87o[i])
+                : [a] "m"(x87a[i]), [b] "m"(x87b[i]), [iv] "m"(x87i[i]), [q] "m"(quarter), [lim] "m"(lim)
+                : "st", "st(1)", "st(2)", "cc");
+            acc += (g_u64)(g_u32)x87o[i];
+        }
+    }
+    __asm__ volatile("fldcw %0" ::"m"(cw0));
+    for (int i = 0; i < 256; i++)
+        acc = acc * 31 + (g_u64)(g_i64)(x87c[i] * 4.0);
+    return acc;
+}
+static g_u64 k_x87(g_u64 n) { return x87_kernel(n, 0x037f); }
+static g_u64 k_x87pc24(g_u64 n) { return x87_kernel(n, 0x007f); }
+
 static g_u64 k_vm(g_u64 n)
 {
     static unsigned char code[256];
@@ -277,7 +340,8 @@ int main(int argc, char **argv)
     K(icall, 50000000)  K(jtab, 50000000)  K(depchain, 100000000) K(brmiss, 50000000)
     K(memcpy, 2000000)  K(str, 20000000)   K(hash, 20000)          K(idiv, 10000000)
     K(fpsse, 30000000)  K(fpvec, 5000)     K(chase, 30000000)      K(qsort, 30)
-    K(leafcall, 50000000) K(mixed, 20000)  K(vm, 500000)
+    K(leafcall, 50000000) K(mixed, 20000)  K(vm, 500000)          K(x87, 20000)
+    K(x87pc24, 20000)
     g_puts("unknown kernel\n");
     return 2;
 out:
