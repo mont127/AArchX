@@ -966,6 +966,123 @@ static void t_0f(Gen *g)
 }
 
 
+static void jcc_over_blob(Gen *g, unsigned cc)
+{
+    int rel32 = rndn(g, 2);
+    size_t at;
+    if (rel32) { eb(g, 0x0f); eb(g, 0x80 | cc); at = g->c->len; ed(g, 0); }
+    else       { eb(g, 0x70 | cc);              at = g->c->len; eb(g, 0); }
+    size_t after = g->c->len;
+    blob(g, rndi(g, 1, 4));
+    g->c->code[at] = (uint8_t)(g->c->len - after);
+}
+
+static void imm_for(Gen *g, int sz8, int op16, int wide, int is_test)
+{
+    uint32_t v = rnd(g);
+    switch (rndn(g, 4)) {
+    case 0: v = 0; break;
+    case 1: if (is_test) v = 1u << rndn(g, sz8 ? 8 : op16 ? 16 : 32); else v &= 0xff; break;
+    default: break;
+    }
+    if (!wide) eb(g, v);
+    else if (op16) ew(g, v);
+    else ed(g, v);
+}
+
+static void t_cmpjcc(Gen *g)
+{
+    if (room(g) < 72) return;
+    MF m;
+    unsigned sz = rndn(g, 4);
+    int sz8 = sz == 0, op16 = sz == 1;
+    int cmp = rndn(g, 2);
+    switch (rndn(g, 5)) {
+    case 0:
+        if (op16) eb(g, 0x66);
+        eb(g, (cmp ? 0x38 : 0x84) + (sz8 ? 0 : 1));
+        eb(g, 0xc0 | (rany(g) << 3) | rany(g));
+        break;
+    case 1:
+        if (op16) eb(g, 0x66);
+        if (cmp) {
+            unsigned k = sz8 ? 0x80 : (rndn(g, 2) ? 0x81 : 0x83);
+            eb(g, k); eb(g, 0xc0 | (7 << 3) | rany(g));
+            imm_for(g, sz8, op16, k == 0x81, 0);
+        } else {
+            eb(g, sz8 ? 0xf6 : 0xf7); eb(g, 0xc0 | rany(g));
+            imm_for(g, sz8, op16, !sz8, 1);
+        }
+        break;
+    case 2:
+        pick_mem(g, &m, 0);
+        emit_prefixes(g, op16, &m, 1);
+        eb(g, cmp ? (sz8 ? 0x3a : 0x3b) : (sz8 ? 0x84 : 0x85));
+        emit_modrm(g, rany(g), &m);
+        break;
+    case 3:
+        pick_mem(g, &m, 0);
+        emit_prefixes(g, op16, &m, 1);
+        eb(g, (cmp ? 0x38 : 0x84) + (sz8 ? 0 : 1));
+        emit_modrm(g, rany(g), &m);
+        break;
+    default:
+        pick_mem(g, &m, 0);
+        emit_prefixes(g, op16, &m, 1);
+        if (cmp) {
+            unsigned k = sz8 ? 0x80 : (rndn(g, 2) ? 0x81 : 0x83);
+            eb(g, k); emit_modrm(g, 7, &m);
+            imm_for(g, sz8, op16, k == 0x81, 0);
+        } else {
+            eb(g, sz8 ? 0xf6 : 0xf7); emit_modrm(g, 0, &m);
+            imm_for(g, sz8, op16, !sz8, 1);
+        }
+        break;
+    }
+    if (rndn(g, 4) == 0) {
+        uint8_t d = rdst(g);
+        if (rndn(g, 2)) { eb(g, 0xb8 | d); ed(g, rnd(g)); }
+        else { eb(g, 0x89); eb(g, 0xc0 | (rany(g) << 3) | d); }
+    }
+    jcc_over_blob(g, rndn(g, 16));
+}
+
+static void t_cntloop(Gen *g)
+{
+    if (room(g) < 72) return;
+    uint8_t r = rdst(g);
+    unsigned n = (unsigned)rndi(g, 1, 5);
+    int save = g_avoid;
+    unsigned kind = rndn(g, 4);
+    int r16 = kind < 2 && rndn(g, 6) == 0;
+    eb(g, 0xb8 | r); ed(g, kind == 1 ? (uint32_t)-(int32_t)n : (kind == 2 ? 0 : n));
+    size_t top = g->c->len;
+    g_avoid = r;
+    if (kind == 3) {
+        eb(g, 0x48 | r);
+        eb(g, 0x74); size_t at = g->c->len; eb(g, 0);
+        blob(g, rndi(g, 1, 3));
+        eb(g, 0xeb); eb(g, (uint8_t)(int8_t)((int64_t)top - (int64_t)(g->c->len + 1)));
+        g->c->code[at] = (uint8_t)(g->c->len - (at + 1));
+        g_avoid = save;
+        return;
+    }
+    blob(g, rndi(g, 1, 3));
+    g_avoid = save;
+    if (r16) eb(g, 0x66);
+    if (kind == 0) eb(g, 0x48 | r);
+    else eb(g, 0x40 | r);
+    if (kind == 2) { eb(g, 0x83); eb(g, 0xf8 | r); eb(g, n); }
+    unsigned cc = kind == 2 ? (rndn(g, 2) ? 0x5 : 0x2) : 0x5;
+    if (rndn(g, 2)) {
+        eb(g, 0x70 | cc);
+        eb(g, (uint8_t)(int8_t)((int64_t)top - (int64_t)(g->c->len + 1)));
+    } else {
+        eb(g, 0x0f); eb(g, 0x80 | cc);
+        ed(g, (uint32_t)((int64_t)top - (int64_t)(g->c->len + 4)));
+    }
+}
+
 static void t_btmem(Gen *g)
 {
     static const uint8_t bt[4] = { 0xa3, 0xab, 0xb3, 0xbb };
@@ -1091,7 +1208,7 @@ static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_pusha,   3 }, { t_enter,  2 }, { t_jcc,     8 }, { t_jmp,    3 },
     { t_loop,    4 }, { t_jecxz,  2 }, { t_call,    4 }, { t_string, 5 },
     { t_0f,     14 }, { t_seg,    10 }, { t_cx8,    4 },
-    { t_btmem,   4 },
+    { t_btmem,   4 }, { t_cmpjcc, 10 }, { t_cntloop, 5 },
 };
 #define NTEMPLATES ((int)(sizeof TEMPLATES / sizeof TEMPLATES[0]))
 
