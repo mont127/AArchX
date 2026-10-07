@@ -67,6 +67,7 @@ builds are removed after a day, or sooner while they add up to more than 2 GB.
 | `OCERZ_TCACHE=off` | translate everything afresh and keep nothing |
 | `OCERZ_TCACHE_DIR=<dir>` | keep the stores under this directory instead |
 | `OCERZ_TCACHE_MAX_MB=<n>` | the size at which a store stops growing (4096 by default) |
+| `OCERZ_TCACHE_MIN_FREE_MB=<n>` | free space the cache leaves on its disk: it stops writing below this, takes at most half of what is free above it, and clears its stores when the disk is already under it (10240 by default) |
 | `OCERZ_TCACHE_LOG=1\|<file>` | print, for each process, how many blocks it loaded and stored |
 | `OCERZ_TCACHE=verify` | a check, not for use: translate everything anyway and compare each block with the stored one |
 | `OCERZ_TCACHE=roundtrip` | a check, not for use: store nothing, but move every translation to a new address and report anything in it that still pointed at the old one |

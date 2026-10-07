@@ -888,7 +888,8 @@ run_file_case dspawn_arm64_only tests/dynamic/spawn_arm64_only.c 'OK'
 run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
 run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
 run_cpp_file_case dcpp_global_ctor tests/dynamic/cpp_global_ctor.cpp 'OK'
-# tcache_work.c against one fresh translation cache directory, four runs: one
+# tcache_work.c against one fresh translation cache directory, four runs (with
+# no free-space floor, so a full disk on the test machine is not a failure): one
 # that records, one that must load what the first stored, one under
 # OCERZ_TCACHE=verify that must find no block differing from its record except
 # in shape, and one under OCERZ_TCACHE=roundtrip that must find no reference its
@@ -905,7 +906,7 @@ run_tcache_case() {
     for mode in on on verify roundtrip; do
         i=$((i + 1))
         log="$dir/run$i.log"
-        OCERZ_TCACHE=$mode OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG="$log" \
+        OCERZ_TCACHE=$mode OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG="$log" OCERZ_TCACHE_MIN_FREE_MB=0 \
             run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name"
         got_code=$?
         got_out=$(cat "$dir/run$i.out")
@@ -931,6 +932,25 @@ run_tcache_case() {
 
 run_tcache_case dtcache 'OK'
 run_tcache_case dtcache_low 'OK' -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000
+# With a free-space floor no disk can meet, the cache must not write a byte and
+# the program must still run; the floor is what kept the cache from filling a
+# nearly full disk.
+tcache_floor_dir="$TMP/dtcache_floor"
+mkdir -p "$tcache_floor_dir"
+if ! clang -arch x86_64 -O2 -o "$tcache_floor_dir/work" tests/dynamic/tcache_work.c 2>/dev/null; then
+    echo "FAIL dtcache_floor (build)"; fail=$((fail+1))
+else
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$tcache_floor_dir/store" OCERZ_TCACHE_MIN_FREE_MB=1000000000 \
+        run_bounded "$tcache_floor_dir/out" "$tcache_floor_dir/err" "$OCERZ" "$tcache_floor_dir/work"
+    tcache_floor_code=$?
+    tcache_floor_data=$(find "$tcache_floor_dir/store" -name 'd-*.td' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$(cat "$tcache_floor_dir/out")" = OK ] && [ "$tcache_floor_code" = 0 ] && [ "$tcache_floor_data" = 0 ]; then
+        echo "PASS dtcache_floor"; pass=$((pass+1))
+    else
+        echo "FAIL dtcache_floor (out='$(cat "$tcache_floor_dir/out")' exit=$tcache_floor_code data files=$tcache_floor_data)"
+        fail=$((fail+1))
+    fi
+fi
 run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'
