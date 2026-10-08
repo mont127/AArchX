@@ -691,6 +691,14 @@ void a64_fcvtns(A64Buf *b, int sf, int dbl, int rd, int vn)
 {
     a64_emit32(b, 0x1e200000u | ((uint32_t)sf << 31) | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31));
 }
+void a64_fcvtps(A64Buf *b, int sf, int dbl, int rd, int vn)
+{
+    a64_emit32(b, 0x1e280000u | ((uint32_t)sf << 31) | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31));
+}
+void a64_fcvtms(A64Buf *b, int sf, int dbl, int rd, int vn)
+{
+    a64_emit32(b, 0x1e300000u | ((uint32_t)sf << 31) | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(rd & 31));
+}
 void a64_fcmp_zero(A64Buf *b, int dbl, int vn)
 {
     a64_emit32(b, 0x1e202008u | ((uint32_t)dbl << 22) | ((uint32_t)(vn & 31) << 5));

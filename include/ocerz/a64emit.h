@@ -163,6 +163,8 @@ void a64_fcvt_d2s(A64Buf *b, int vd, int vn);
 void a64_fcvt_s2d(A64Buf *b, int vd, int vn);
 void a64_fcvtzs(A64Buf *b, int sf, int dbl, int rd, int vn);
 void a64_fcvtns(A64Buf *b, int sf, int dbl, int rd, int vn);
+void a64_fcvtps(A64Buf *b, int sf, int dbl, int rd, int vn);
+void a64_fcvtms(A64Buf *b, int sf, int dbl, int rd, int vn);
 void a64_fcmp_zero(A64Buf *b, int dbl, int vn);
 void a64_scvtf(A64Buf *b, int sf, int dbl, int vd, int rn);
 void a64_fmov_x_from_v(A64Buf *b, int sf, int rd, int vn);
