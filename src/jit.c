@@ -6545,7 +6545,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
         return k;
     }
     if (d->kind == OCERZ_OPK_MEM && (p->op == OCERZ_OP_CMP || p->op == OCERZ_OP_TEST) &&
-        (c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC) &&
+        (c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC || c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) &&
         (d->size == 4 || d->size == 8) && sr->size == d->size) {
         if (!rmw_nzcv_ok(p, d)) return -1;
         if (sr->kind == OCERZ_OPK_REG) {
