@@ -2558,6 +2558,7 @@ static void yc_reload_all(A64Buf *b);
 #define CC_OP_OFF ((uint32_t)offsetof(OcerzCPU, cc_op))
 
 #define RAS_TOP_OFF ((uint32_t)offsetof(OcerzCPU, ras_top))
+#define FCMP_MEM_OFF ((uint32_t)offsetof(OcerzCPU, jit_fcmp_mem))
 #define RAS_OFF ((uint32_t)offsetof(OcerzCPU, ras))
 #define JIT_FP_OFF ((uint32_t)offsetof(OcerzCPU, jit_fp))
 static int host_ras_enabled(void)
@@ -6206,11 +6207,12 @@ static int comis_fuse_producer(const X86Insn *insns, int ci)
     if (!(p->op == OCERZ_OP_UCOMISD || p->op == OCERZ_OP_UCOMISS ||
           p->op == OCERZ_OP_COMISD || p->op == OCERZ_OP_COMISS)) return -1;
     if (p->ops[0].kind != OCERZ_OPK_XMM || !xmm_is_pinned(p->ops[0].reg)) return -1;
-    if (p->ops[1].kind != OCERZ_OPK_XMM || !xmm_is_pinned(p->ops[1].reg)) return -1;
+    int smem = p->ops[1].kind == OCERZ_OPK_MEM && !ENV_ON("OCERZ_NO_COMIS_MEM_FUSE");
+    if (!smem && (p->ops[1].kind != OCERZ_OPK_XMM || !xmm_is_pinned(p->ops[1].reg))) return -1;
     for (int k = pi + 1; k < ci; k++) {
         const X86Insn *m = &insns[k];
         if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_XMM &&
-            (m->ops[0].reg == p->ops[0].reg || m->ops[0].reg == p->ops[1].reg))
+            (m->ops[0].reg == p->ops[0].reg || (!smem && m->ops[0].reg == p->ops[1].reg)))
             return -1;
         uint64_t mdef, muse;
         ocerz_flags_defuse_nofault(m, &mdef, &muse);
@@ -6546,7 +6548,13 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         g_flag_producer = &g_cur_insns[comis_fuse_producer(g_cur_insns, g_cur_insn_idx)];
         int dbl = g_flag_producer->op == OCERZ_OP_UCOMISD || g_flag_producer->op == OCERZ_OP_COMISD;
         {
-            int va = l0_src(g_flag_producer->ops[0].reg, dbl), vb = l0_src(g_flag_producer->ops[1].reg, dbl);
+            int va = l0_src(g_flag_producer->ops[0].reg, dbl), vb;
+            if (g_flag_producer->ops[1].kind == OCERZ_OPK_MEM) {
+                a64_ldr_v(b, dbl ? 8 : 4, 3, 20, FCMP_MEM_OFF);
+                vb = 3;
+            } else {
+                vb = l0_src(g_flag_producer->ops[1].reg, dbl);
+            }
             a64_fcmp(b, dbl, va, vb);
             int pidx = (int)(g_flag_producer - g_cur_insns);
             if (fpb_det_here(pidx)) fpb_site_emit(b, pidx, va, vb, dbl);
@@ -9911,11 +9919,24 @@ static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
         }
         return 1;
     }
+    /*
+     * A memory operand is loaded here whatever the flags' fate, so a fault stays
+     * this instruction's, and kept in jit_fcmp_mem: a jcc, setcc or cmovcc that
+     * comis_fuse_producer pairs with it compares the pinned register against
+     * that copy instead of reading the flags back out of RFLAGS.
+     */
+    if (g_cur_need == 0 && s->kind == OCERZ_OPK_MEM && !ENV_ON("OCERZ_NO_COMIS_MEM_FUSE")) {
+        int vb = emit_sse_src_reg(b, insn, s, esz, VX1, exit_sites, n_exits);
+        if (vb < 0) return 0;
+        a64_str_v(b, esz, vb, 20, FCMP_MEM_OFF);
+        return 1;
+    }
     if (g_defer)
         a64_str(b, 4, A64_ZR, 20, CC_OP_OFF);
     int vb = (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) ? l0_src(s->reg, dbl)
            : emit_sse_src_reg(b, insn, s, esz, VX1, exit_sites, n_exits);
     if (vb < 0) return 0;
+    if (s->kind == OCERZ_OPK_MEM) a64_str_v(b, esz, vb, 20, FCMP_MEM_OFF);
     int va = xmm_is_pinned(d->reg) ? l0_src(d->reg, dbl) : VX0;
     if (va == VX0) emit_xmm_ld_lo(b, esz, VX0, d->reg);
     a64_fcmp(b, dbl, va, vb);
@@ -12391,6 +12412,8 @@ _Static_assert(offsetof(OcerzCPU, fcw) % 8 == 0 && offsetof(OcerzCPU, fsw) == of
                offsetof(OcerzCPU, fpr_x_ok) == offsetof(OcerzCPU, fcw) + 6 &&
                offsetof(OcerzCPU, fpr) >= offsetof(OcerzCPU, fcw) + 8,
                "fcw, fsw, ftw, ftop and fpr_x_ok are loaded and stored as one 8-byte word");
+_Static_assert(offsetof(OcerzCPU, jit_fcmp_mem) % 8 == 0 && offsetof(OcerzCPU, jit_fcmp_mem) <= 4 * 4095,
+               "jit_fcmp_mem is reached by an 8- and a 4-byte scaled access");
 _Static_assert(offsetof(OcerzCPU, fpr_xm) + 64 <= 8 * 4095 && offsetof(OcerzCPU, fpr_xe) + 16 <= 2 * 4095 &&
                offsetof(OcerzCPU, jit_x87_top0) % 2 == 0 && offsetof(OcerzCPU, jit_x87_top0) <= 2 * 4095 &&
                offsetof(OcerzCPU, mxcsr) % 4 == 0, "x87 fields within scaled immediate reach");

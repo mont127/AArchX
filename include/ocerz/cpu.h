@@ -116,6 +116,7 @@ typedef struct OcerzCPU {
     uint64_t fpr_xm[8];
     uint16_t fpr_xe[8];
     uint16_t jit_x87_top0;  /* TOP as the running translated x87 run found it (src/jit.c) */
+    uint64_t jit_fcmp_mem;  /* the operand a translated comiss/ucomiss loaded from memory (src/jit.c) */
     struct OcerzVM *vm;
     int terminated;
     int interp_once;
