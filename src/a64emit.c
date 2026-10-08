@@ -742,6 +742,8 @@ void a64_v_dup_d(A64Buf *b, int vd, int vn, int idx) { a64_emit32(b, 0x4e080400u
 void a64_v_dup_s(A64Buf *b, int vd, int vn, int idx) { a64_emit32(b, 0x4e040400u | ((uint32_t)(idx & 3) << 19) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_zip1(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e003800u | ((uint32_t)esz << 22), vd, vn, vm); }
 void a64_v_zip2(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e007800u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_uzp1(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e001800u | ((uint32_t)esz << 22), vd, vn, vm); }
+void a64_v_uzp2(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e005800u | ((uint32_t)esz << 22), vd, vn, vm); }
 void a64_v_bsl(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6e601c00u, vd, vn, vm); }
 void a64_v_sshr_2d(A64Buf *b, int vd, int vn, int sh) { a64_emit32(b, 0x4f400400u | ((uint32_t)(128 - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_sshr_4s(A64Buf *b, int vd, int vn, int sh) { a64_emit32(b, 0x4f200400u | ((uint32_t)(64 - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }

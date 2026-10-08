@@ -10491,6 +10491,19 @@ static int emit_sse_shufp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     }
     int vb = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
     if (vb < 0) return 0;
+    /* The two-source selections a transpose is made of, each one instruction into the destination. */
+    if (insn->op == OCERZ_OP_SHUFPS && vb != xmm_vreg(d->reg)) {
+        int vd = xmm_vreg(d->reg);
+        switch ((unsigned)insn->ops[2].imm & 0xff) {
+        case 0x44: a64_v_zip1(b, 3, vd, vd, vb); return 1;
+        case 0xee: a64_v_zip2(b, 3, vd, vd, vb); return 1;
+        case 0x88: a64_v_uzp1(b, 2, vd, vd, vb); return 1;
+        case 0xdd: a64_v_uzp2(b, 2, vd, vd, vb); return 1;
+        case 0xe4: a64_ins_d_d(b, vd, 1, vb, 1); return 1;
+        case 0x4e: a64_v_ext(b, vd, vd, vb, 8); return 1;
+        default: break;
+        }
+    }
     emit_shufp_lane(b, insn->op == OCERZ_OP_SHUFPD, (unsigned)insn->ops[2].imm, VX2, xmm_vreg(d->reg), vb);
     a64_v_mov(b, xmm_vreg(d->reg), VX2);
     return 1;
