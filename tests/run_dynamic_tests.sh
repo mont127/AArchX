@@ -851,6 +851,7 @@ run_golden_case dlowstack_disp tests/dynamic/lowstack_disp.c tests/dynamic/lowst
 run_golden_case dtest_jcc_gap tests/dynamic/test_jcc_gap.c tests/dynamic/test_jcc_gap.out
 run_golden_case dsetcc_zx tests/dynamic/setcc_zx.c tests/dynamic/setcc_zx.out
 run_golden_case dhoist_forms tests/dynamic/hoist_forms.c tests/dynamic/hoist_forms.out
+run_golden_case dfist_rc tests/dynamic/fist_rc.c tests/dynamic/fist_rc.out
 run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
 run_file_case dlane_fault_guard tests/dynamic/lane_fault_guard.c 'OK' -Wl,-no_pie
 run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
@@ -1001,6 +1002,7 @@ run_low_golden_case dlowstack_disp_low tests/dynamic/lowstack_disp.c tests/dynam
 run_low_golden_case dtest_jcc_gap_low tests/dynamic/test_jcc_gap.c tests/dynamic/test_jcc_gap.out
 run_low_golden_case dsetcc_zx_low tests/dynamic/setcc_zx.c tests/dynamic/setcc_zx.out
 run_low_golden_case dhoist_forms_low tests/dynamic/hoist_forms.c tests/dynamic/hoist_forms.out
+run_low_golden_case dfist_rc_low tests/dynamic/fist_rc.c tests/dynamic/fist_rc.out
 run_low_golden_case dlow_top_strip tests/dynamic/low_top_strip.c tests/dynamic/low_top_strip.out
 export OCERZ_NO_PLAIN_MEM=1
 run_file_case dalign_ordered tests/dynamic/align_ordered.c '370d1a721afe9c4a'

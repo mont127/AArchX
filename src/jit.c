@@ -13143,8 +13143,13 @@ static int x87_fist(A64Buf *b, const X86Insn *insn, int courier, uint32_t **exit
 {
     const X86Operand *o = &insn->ops[0];
     int popit = insn->op != OCERZ_OP_FIST;
+    int c1_set = 0;
     x87_ld(b);
     x87_top(b, X87P);
+    if (courier || insn->op == OCERZ_OP_FISTTP) {
+        c1_set = !(g_x87_live && g_x87_c1k);
+        x87_clear_c1(b);
+    }
     if (courier) {
         x87_slot(b, X87Q, X87P);
         a64_ldr(b, 8, JTT, X87Q, X87_XM_OFF);
@@ -13179,6 +13184,15 @@ static int x87_fist(A64Buf *b, const X86Insn *insn, int courier, uint32_t **exit
             a64_subs_reg(b, 1, A64_ZR, JTT, X87Q, 0);
             x87_slow_if(b, A64_NE);
         }
+        /* C1: the result differs from the truncated value, so it rounded away from zero */
+        if (insn->op != OCERZ_OP_FISTTP) {
+            a64_fcvtzs(b, 1, 1, JTT, VX0);
+            a64_subs_reg(b, 1, A64_ZR, X87Q, JTT, 0);
+            a64_cset(b, JTU, A64_NE);
+            a64_bfi(b, 1, X87S, JTU, 25, 1);
+            g_x87_c1k = 0;
+            c1_set = 1;
+        }
         a64_scvtf(b, 1, 1, VX1, X87Q);
         a64_fcmp(b, 1, VX1, VX0);
         x87_frag_if(b, A64_NE, XF_SETPE, 0);
@@ -13187,6 +13201,8 @@ static int x87_fist(A64Buf *b, const X86Insn *insn, int courier, uint32_t **exit
     if (!x87_st_mem(b, insn, 0, X87Q, exit_sites, n_exits)) return 0;
     if (popit) {
         x87_pop(b);
+        x87_st(b);
+    } else if (c1_set) {
         x87_st(b);
     }
     return 1;
