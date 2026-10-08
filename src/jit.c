@@ -10453,6 +10453,24 @@ static int emit_sse_shufp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (insn->nops != 3 || d->kind != OCERZ_OPK_XMM || insn->ops[2].kind != OCERZ_OPK_IMM || !xmm_is_pinned(d->reg)) return 0;
+    /* shufps of a register with itself: a broadcast is one dup, a change to one lane one ins. */
+    if (insn->op == OCERZ_OP_SHUFPS && s->kind == OCERZ_OPK_XMM && s->reg == d->reg) {
+        int v = xmm_vreg(d->reg);
+        unsigned imm = (unsigned)insn->ops[2].imm;
+        int sel[4] = { (int)(imm & 3), (int)((imm >> 2) & 3), (int)((imm >> 4) & 3), (int)((imm >> 6) & 3) };
+        int changed = 0, k1 = -1;
+        for (int k = 0; k < 4; k++)
+            if (sel[k] != k) { changed++; k1 = k; }
+        if (sel[0] == sel[1] && sel[1] == sel[2] && sel[2] == sel[3]) {
+            a64_v_dup_s(b, v, v, sel[0]);
+            return 1;
+        }
+        if (changed == 0) return 1;
+        if (changed == 1) {
+            a64_ins_s_s(b, v, k1, v, sel[k1]);
+            return 1;
+        }
+    }
     int vb = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
     if (vb < 0) return 0;
     emit_shufp_lane(b, insn->op == OCERZ_OP_SHUFPD, (unsigned)insn->ops[2].imm, VX2, xmm_vreg(d->reg), vb);
