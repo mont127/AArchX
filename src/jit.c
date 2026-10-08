@@ -4358,11 +4358,35 @@ static void emit_stack_delta_check(A64Buf *b)
 static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
 
 /* Whether an instruction may move rsp by more than push, pop, call and ret do. */
+/*
+ * Whether an instruction can move rsp to the other side of 12 GB, so that the
+ * stack delta must be recomputed after it.  A frame's add or sub rsp, imm (and
+ * lea rsp, [rsp + disp]) under 64 KB cannot carry a valid stack across: no
+ * guest mapping straddles 12 GB, and in the Wine layout nothing can be mapped
+ * from 12 GB up to hundreds of gigabytes, so a stack below 12 GB ends at or
+ * under it and one above starts far over it.  Every prologue and epilogue paid
+ * four instructions for that before.
+ */
+static int rsp_small_adjust(const X86Insn *in)
+{
+    const X86Operand *d = &in->ops[0], *s = &in->ops[1];
+    if (in->nops != 2 || d->kind != OCERZ_OPK_REG || (d->reg & 15) != OCERZ_RSP || d->size != 8)
+        return 0;
+    if (in->op == OCERZ_OP_ADD || in->op == OCERZ_OP_SUB)
+        return s->kind == OCERZ_OPK_IMM && (int64_t)s->imm > -65536 && (int64_t)s->imm < 65536;
+    if (in->op == OCERZ_OP_LEA)
+        return s->kind == OCERZ_OPK_MEM && !s->riprel && s->base == OCERZ_RSP && s->index == OCERZ_REG_NONE &&
+               s->disp > -65536 && s->disp < 65536;
+    return 0;
+}
 static int lowstack_disturbs(const X86Insn *in)
 {
     switch (in->op) {
     case OCERZ_OP_PUSH: case OCERZ_OP_CALL: case OCERZ_OP_RET:
         return 0;
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_LEA:
+        if (rsp_small_adjust(in) && !ENV_ON("OCERZ_LOWSTACK_ADJ_RECOMPUTE")) return 0;
+        return insn_may_write_gpr(in, OCERZ_RSP);
     case OCERZ_OP_POP:
         return in->nops > 0 && in->ops[0].kind == OCERZ_OPK_REG && (in->ops[0].reg & 15) == OCERZ_RSP;
     default:
