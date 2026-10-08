@@ -12635,7 +12635,7 @@ _Static_assert(offsetof(OcerzCPU, fpr_xm) + 64 <= 8 * 4095 && offsetof(OcerzCPU,
 #define XS_C1 (1ull << 25)
 #define XS_C3 (1ull << 30)
 enum { X87S = JT1, X87P = JT2, X87Q = JTF };
-enum { X87R_OK = 1, X87R_FCW = 2, X87R_MXCSR = 4, X87R_END = 8 };
+enum { X87R_OK = 1, X87R_FCW = 2, X87R_MXCSR = 4, X87R_END = 8, X87R_RC = 16 };
 enum { XF_PE, XF_PC24, XF_ZERO, XF_ST32, XF_SETPE, XF_TOP0 };
 enum { XK_ADD, XK_SUB, XK_MUL, XK_DIV, XK_SQRT };
 
@@ -12658,6 +12658,7 @@ static int g_n_x87_frag, g_x87_frag_open;
 static int g_slow_run_last = -1;
 static int g_x87_nzcv = -1, g_x87_nzcv_live;
 static int g_x87_live, g_x87_delta;
+static int g_x87_rc_near;   /* the open run's guard has checked RC is round to nearest */
 
 static void x87_reset(void)
 {
@@ -12698,8 +12699,9 @@ static int x87_run_flags(const X86Insn *in)
     case OCERZ_OP_FILD:
         if (m1 && x87_mem_ok(in, o, 2, 4, 0)) return X87R_OK;
         return m1 && x87_mem_ok(in, o, 8, 0, 0) ? X87R_OK | X87R_MXCSR : 0;
+    /* fist(p) reads RC as it converts, so a run of them needs no round-to-nearest guard */
     case OCERZ_OP_FIST: case OCERZ_OP_FISTP:
-        return m1 && x87_mem_ok(in, o, 2, 4, 8) ? X87R_OK | X87R_FCW : 0;
+        return m1 && x87_mem_ok(in, o, 2, 4, 8) ? X87R_OK | (ENV_ON("OCERZ_NO_FIST_RC") ? X87R_FCW : X87R_RC) : 0;
     case OCERZ_OP_FISTTP:
         return m1 && x87_mem_ok(in, o, 2, 4, 8) ? X87R_OK : 0;
     case OCERZ_OP_FLDZ: case OCERZ_OP_FLD1: case OCERZ_OP_FLDPI: case OCERZ_OP_FLDL2E:
@@ -13172,7 +13174,26 @@ static int x87_fist(A64Buf *b, const X86Insn *insn, int courier, uint32_t **exit
         a64_fcmp(b, 1, VX0, VX0);
         x87_slow_if(b, A64_VS);
         if (insn->op == OCERZ_OP_FISTTP) a64_fcvtzs(b, 1, 1, X87Q, VX0);
-        else                             a64_fcvtns(b, 1, 1, X87Q, VX0);
+        else if (g_x87_rc_near)          a64_fcvtns(b, 1, 1, X87Q, VX0);
+        else {
+            /* RC, bits 10-11 of the control word in X87S: nearest, down, up, chop */
+            uint32_t *hi = a64_label(b); a64_tbnz(b, X87S, 11, 0);
+            uint32_t *dn = a64_label(b); a64_tbnz(b, X87S, 10, 0);
+            a64_fcvtns(b, 1, 1, X87Q, VX0);
+            uint32_t *j1 = a64_label(b); a64_b(b, 0);
+            a64_patch_tbz(dn, a64_label(b));
+            a64_fcvtms(b, 1, 1, X87Q, VX0);
+            uint32_t *j2 = a64_label(b); a64_b(b, 0);
+            a64_patch_tbz(hi, a64_label(b));
+            uint32_t *ch = a64_label(b); a64_tbnz(b, X87S, 10, 0);
+            a64_fcvtps(b, 1, 1, X87Q, VX0);
+            uint32_t *j3 = a64_label(b); a64_b(b, 0);
+            a64_patch_tbz(ch, a64_label(b));
+            a64_fcvtzs(b, 1, 1, X87Q, VX0);
+            a64_patch_b(j1, a64_label(b));
+            a64_patch_b(j2, a64_label(b));
+            a64_patch_b(j3, a64_label(b));
+        }
         if (o->size == 8) {
             a64_adds_imm(b, 1, A64_ZR, X87Q, 1);
             x87_slow_if(b, A64_VS);
@@ -13583,6 +13604,7 @@ static int x87_run_open(A64Buf *b, int idx)
         x87_frag_land(b);
         g_x87_live = 1;
     }
+    g_x87_rc_near = (need & X87R_FCW) != 0;
     if (need & X87R_FCW) {
         if (!g_x87_live) a64_ldr(b, 2, JT0, 20, X87_CTL_OFF);
         (void)a64_try_ands_imm(b, 0, A64_ZR, g_x87_live ? X87S : JT0, 0xc00);
