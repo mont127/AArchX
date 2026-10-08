@@ -834,6 +834,7 @@ int main(void) {
 
 run_file_case dfork_signal tests/dynamic/fork_signal.c 'fork signal ok'
 run_file_case dthread_signal tests/dynamic/thread_signal.c 'OK'
+run_file_case dx87_top_entry tests/dynamic/x87_top_entry.c 'OK'
 run_file_case dshmem_coherence tests/dynamic/shmem_coherence.c 'OK'
 run_file_case drsp_rmw tests/dynamic/rsp_rmw.c '554ae911bb61770a' -mno-red-zone
 run_file_case dcvt_packed tests/dynamic/cvt_packed.c '144 25523f4977e3d6c4'
