@@ -1,0 +1,21 @@
+e 32eb07b0b0fd329d sample 1400 1e61 3fff
+ne 05f1f70b54d6cc03 sample 2bff 219e 0000
+be caec6faa2304fe9d sample 1000 1a61 39ff
+a 6df08f11e2cf0003 sample 2fff 259e 0600
+s 41f8c8c4b93df51e sample 3fff 379e 39ef
+ns f6e435f74c960982 sample 0000 0861 0610
+l 6cac3c386a29c51e sample 3fff 379e 39ef
+ge cc30c2839baa3982 sample 0000 0861 0610
+le 66ba452d1552f91b sample 1400 1600 39ef
+g d222b98ef0810585 sample 2bff 29ff 0610
+fault e 17
+fault ne 28
+fault be 17
+fault a 28
+fault s 3b
+fault ns 04
+fault l 3b
+fault ge 04
+fault le 13
+fault g 2c
+faults 60
