@@ -1241,7 +1241,7 @@ static void cp_mark(uint64_t key)
 static inline int mem_guard_needed(void) { return ocerz_low_base != 0 || g_cp_guard; }
 static int g_low_top;
 /* The Wine layout's stack delta in x0 (emit_stack_delta), for the block being translated. */
-static int g_lowstack, g_lowstack_from, g_lowstack_check;
+static int g_lowstack, g_lowstack_from, g_lowstack_check, g_m32low;
 static void emit_stack_delta(A64Buf *b);
 
 static int stack_plain_ok(void)
@@ -1543,6 +1543,11 @@ static uint32_t stop_retarget(uint32_t insn, const uint32_t *site,
     return 0x14000000u | ((uint32_t)off & 0x03ffffffu);
 }
 static int g_mem_hoist_greg = -1;
+/* The Wine layout's base hoist (select_low_hoist): its guest register, the instruction it holds until, and the displacement span. */
+static int g_low_hoist_greg = -1, g_low_hoist_until;
+static int32_t g_low_hoist_lo, g_low_hoist_hi;
+static uint32_t *g_low_hoist_bail[3];
+static int g_n_low_hoist_bail, g_ea_lowhoisted, g_ea_lowhoisted_reg;
 static int g_mem_hoist_aux_disp;
 static int g_mem_hoist_aux_index = -1;
 static int g_mem_hoist_aux_scale;
@@ -1604,6 +1609,8 @@ static void emit_reload_jgb(A64Buf *b)
         a64_mov_imm64(b, JGB, ocerz_guest_base);
     else if (g_lowstack)
         emit_stack_delta(b);
+    else if (g_m32low)
+        a64_mov_imm64(b, JGB, ocerz_low_base);
 }
 static void emit_reload_mem_base(A64Buf *b);
 
@@ -4115,6 +4122,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     g_const_ea_valid = 0;
     g_ea_is_const = 0;
     g_ea_w32 = 0;
+    g_ea_lowhoisted = 0;
     /* esp-relative operands of 32-bit code are stack accesses too, plain as their push and pop already are. */
     g_ea_plain = ocerz_low_base != 0 && insn->seg == OCERZ_SEG_NONE && mem_plain_access_ok(op) &&
                  (!insn->mode32 || !ENV_ON("OCERZ_NO_M32_STACK_PLAIN"));
@@ -4155,6 +4163,16 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     }
     if (insn->addrsize != 8)
         return 0;
+    if (g_low_hoist_greg >= 0 && seg == OCERZ_SEG_NONE && op->base == (unsigned)g_low_hoist_greg &&
+        op->index == OCERZ_REG_NONE && g_cur_insn_idx < g_low_hoist_until &&
+        op->disp >= g_low_hoist_lo && op->disp < g_low_hoist_hi) {
+        if (op->disp > 0)      a64_add_imm(b, 1, addr_reg, JMEMBASE, (uint32_t)op->disp);
+        else if (op->disp < 0) a64_sub_imm(b, 1, addr_reg, JMEMBASE, (uint32_t)-op->disp);
+        else                   a64_mov_reg(b, 1, addr_reg, JMEMBASE);
+        g_ea_lowhoisted = 1;
+        g_ea_lowhoisted_reg = addr_reg;
+        return 1;
+    }
     uint64_t initial = (uint64_t)op->disp + fold;
     if (rsp_is_ptr() && op->base == OCERZ_RSP &&
         pin_slot(OCERZ_RSP) >= 0)
@@ -4405,6 +4423,11 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
 {
     (void)exit_sites; (void)n_exits;
     g_const_ea_valid = 0;
+    if (g_ea_lowhoisted && addr_reg == g_ea_lowhoisted_reg) {
+        g_ea_lowhoisted = 0;
+        g_ea_is_const = 0;
+        return NULL;
+    }
     if (g_lowstack && insn && insn_stack_only(insn)) {
         g_ea_is_const = 0;
         a64_add_reg(b, 1, addr_reg, addr_reg, JGB, 0);
@@ -4553,6 +4576,8 @@ static inline void patch_guard_skip(uint32_t *skip, uint32_t *target)
 
 static void emit_reload_mem_base(A64Buf *b)
 {
+    if (g_low_hoist_greg >= 0)
+        (void)a64_try_orr_imm(b, 1, JMEMBASE, pin_hreg(pin_slot(g_low_hoist_greg)), ocerz_low_base);
     if (g_mem_hoist_greg < 0)
         return;
     int bs = pin_slot(g_mem_hoist_greg);
@@ -5433,6 +5458,19 @@ static int m32_stack_low(void)
     return ocerz_low_base != 0 && low_guard_fast_ok();
 }
 
+/*
+ * In the Wine layout x0 carries nothing a 32-bit block needs (no guest base,
+ * and the stack delta is for 64-bit stacks), so a 32-bit block keeps low_base
+ * there, reloaded wherever the stack delta would be, and a 32-bit stack slot is
+ * one register-offset access, [x0, w, uxtw], instead of a mov, an orr and the
+ * access.  OCERZ_NO_M32_LOWREG=1 goes back to the orr.
+ */
+static int m32_lowreg_ok(void)
+{
+    return g_xlat_mode32 && ocerz_low_base != 0 && ocerz_guest_base == 0 && !jgb_usable() &&
+           low_guard_fast_ok() && !ENV_ON("OCERZ_NO_M32_LOWREG");
+}
+
 static int m32_stack_base_ok(void)
 {
     if (!stack_inline_enabled() || g_pin_class == 2 || pin_slot(OCERZ_RSP) < 0 || !stack_plain_access_ok())
@@ -5444,7 +5482,7 @@ static int m32_stack_base_ok(void)
 
 static void m32_stack_st(A64Buf *b, int rv, int wa)
 {
-    if (!m32_stack_low()) {
+    if (!m32_stack_low() || g_m32low) {
         a64_str_regoff_uxtw(b, 4, rv, JGB, wa);
         return;
     }
@@ -5455,7 +5493,7 @@ static void m32_stack_st(A64Buf *b, int rv, int wa)
 
 static void m32_stack_ld(A64Buf *b, int rd, int wa)
 {
-    if (!m32_stack_low()) {
+    if (!m32_stack_low() || g_m32low) {
         a64_ldr_regoff_uxtw(b, 4, rd, JGB, wa);
         return;
     }
@@ -16931,6 +16969,133 @@ static int insn_may_write_gpr(const X86Insn *in, unsigned reg)
     return 0;
 }
 
+/*
+ * The Wine layout's base hoist.  Every access a 64-bit block makes through a
+ * register pays the low-window test - lsr, cmp, b.hs, orr - before it, because
+ * the register may point on either side of 12 GB.  For the base register with
+ * the most accesses before the block first writes it, the test runs once, at
+ * the loop head, on the whole span the block reaches from it: when the base
+ * plus its smallest and largest displacement (and size) are all below 12 GB,
+ * JMEMBASE (x17) holds base | low_base and those accesses are JMEMBASE plus
+ * their displacement, with no test.  When they are not, the block has met a
+ * pointer of the other kind: it leaves before running anything, and C retires
+ * it and remembers its key, so its translation takes the test per access from
+ * then on.  The test is flag-free, since a block may be entered with the guest's
+ * flags live in NZCV.  It pays for itself from three accesses.  winbench64's
+ * struct-of-floats loop went from 35.5 to 33.1 ms (Rosetta 12), against 28 with
+ * no test at all.  OCERZ_NO_LOW_HOIST=1 turns it off.
+ */
+#define LOWHOIST_N 4096
+static uint64_t g_lowhoist_off[LOWHOIST_N];
+static int g_lowhoist_full;
+static int lowhoist_marked(uint64_t key)
+{
+    if (g_lowhoist_full) return 1;
+    unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 52) & (LOWHOIST_N - 1);
+    for (unsigned k = 0; k < LOWHOIST_N; k++, i = (i + 1) & (LOWHOIST_N - 1)) {
+        uint64_t v = __atomic_load_n(&g_lowhoist_off[i], __ATOMIC_RELAXED);
+        if (v == key) return 1;
+        if (v == 0) return 0;
+    }
+    return 0;
+}
+static void lowhoist_mark(uint64_t key)
+{
+    unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 52) & (LOWHOIST_N - 1);
+    for (unsigned k = 0; k < LOWHOIST_N; k++, i = (i + 1) & (LOWHOIST_N - 1)) {
+        uint64_t v = __atomic_load_n(&g_lowhoist_off[i], __ATOMIC_RELAXED);
+        if (v == key) return;
+        if (v == 0 && __atomic_compare_exchange_n(&g_lowhoist_off[i], &v, key, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return;
+    }
+    g_lowhoist_full = 1;
+}
+static int select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
+{
+    if (!ocerz_low_base || ocerz_guest_base != 0 || g_xlat_mode32 || g_pin_class != 3 || g_no_chain ||
+        !low_guard_fast_ok() || g_mem_hoist_greg >= 0 || n < 2 || ENV_ON("OCERZ_NO_LOW_HOIST") ||
+        lowhoist_marked(jit_key(rip, 0)))
+        return -1;
+    int cnt[16] = {0}, until[16], shut[16] = {0};
+    int32_t lo[16] = {0}, hi[16] = {0};
+    for (int r = 0; r < 16; r++) until[r] = n;
+    for (int i = 0; i < n; i++) {
+        const X86Insn *in = &insns[i];
+        for (int k = 0; k < in->nops; k++) {
+            const X86Operand *m = &in->ops[k];
+            if (m->kind != OCERZ_OPK_MEM || m->riprel || m->base == OCERZ_REG_NONE || m->index != OCERZ_REG_NONE)
+                continue;
+            unsigned r = m->base & 15;
+            if (shut[r] || until[r] < n) continue;
+            int sz = m->size ? m->size : 64;
+            if (in->seg != OCERZ_SEG_NONE || in->addrsize != 8 || m->disp < -4095 || m->disp + sz > 4095 || sz > 64) {
+                cnt[r] = -1000;
+                continue;
+            }
+            cnt[r]++;
+            if (m->disp < lo[r]) lo[r] = (int32_t)m->disp;
+            if (m->disp + sz > hi[r]) hi[r] = (int32_t)(m->disp + sz);
+        }
+        for (unsigned r = 0; r < 16; r++)
+            if (!shut[r] && until[r] == n && insn_may_write_gpr(in, r)) until[r] = i + 1;
+    }
+    int best = -1;
+    for (int r = 0; r < 16; r++) {
+        if (r == OCERZ_RSP || pin_slot((unsigned)r) < 0 || cnt[r] < 3) continue;
+        if (best < 0 || cnt[r] > cnt[best]) best = r;
+    }
+    if (best < 0) return -1;
+    g_low_hoist_until = until[best];
+    g_low_hoist_lo = lo[best];
+    g_low_hoist_hi = hi[best] > 0 ? hi[best] : 1;
+    return best;
+}
+/*
+ * At the loop head: the span below 12 GB, then JMEMBASE = base | low_base; the
+ * branches go to the bail stub.  Without touching the flags, which a block may
+ * be entered with live in NZCV: (base | (base + hi)) >> 32 must be below 3,
+ * which also catches base + hi wrapping, and base + lo must not go below zero.
+ * A span that crosses 8 GB fails the or for no reason, which costs that block
+ * its hoist and nothing else.
+ */
+static void emit_low_hoist_check(A64Buf *b)
+{
+    int hb = pin_hreg(pin_slot(g_low_hoist_greg));
+    g_n_low_hoist_bail = 0;
+    a64_add_imm(b, 1, JTT, hb, (uint32_t)g_low_hoist_hi);
+    a64_orr_reg(b, 1, JTT, JTT, hb, 0);
+    a64_lsr_imm(b, 1, JTT, JTT, 32);
+    a64_sub_imm(b, 1, JTT, JTT, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+    g_low_hoist_bail[g_n_low_hoist_bail++] = a64_label(b);
+    a64_tbz(b, JTT, 63, 0);
+    if (g_low_hoist_lo < 0) {
+        a64_sub_imm(b, 1, JTT, hb, (uint32_t)-g_low_hoist_lo);
+        g_low_hoist_bail[g_n_low_hoist_bail++] = a64_label(b);
+        a64_tbnz(b, JTT, 63, 0);
+    }
+    (void)a64_try_orr_imm(b, 1, JMEMBASE, hb, ocerz_low_base);
+}
+/*
+ * Out of line: leave before the block's first instruction, with side_idx -2 asking C to retire it.  It
+ * returns OCERZ_STEP_PROFILE, as a probe's side exit does: STEP_OK goes to the in-arena dispatcher,
+ * which would enter the same block again without C ever seeing side_blk.
+ */
+static void emit_low_hoist_bail(A64Buf *b, uint64_t rip, uint32_t **epi_sites, int *n_epi)
+{
+    if (!g_n_low_hoist_bail) return;
+    for (int k = 0; k < g_n_low_hoist_bail; k++) a64_patch_tbz(g_low_hoist_bail[k], a64_label(b));
+    g_n_low_hoist_bail = 0;
+    tc_imm64(b, JT0, TCR_BLK, 0, (uint64_t)(uintptr_t)g_cur_blk);
+    a64_str(b, 8, JT0, 20, SIDE_BLK_OFF);
+    a64_movn(b, JT0, 1, 0);
+    a64_str(b, 4, JT0, 20, SIDE_IDX_OFF);
+    a64_mov_imm64(b, JT0, rip);
+    a64_str(b, 8, JT0, 20, RIP_OFF);
+    a64_mov_imm64(b, 0, OCERZ_STEP_PROFILE);
+    epi_sites[(*n_epi)++] = a64_label(b);
+    a64_b(b, 0);
+}
+
 static int select_mem_base_hoist(const X86Insn *insns, int n, uint64_t rip)
 {
     g_mem_hoist_aux_disp = 0;
@@ -18859,6 +19024,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_pinned = 0;
     g_pin_class = 0;
     g_lowstack = 0;
+    g_m32low = 0;
 
     g_defer = !g_no_regflags;
     blk->n_edges = 0;
@@ -18928,6 +19094,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_side = 0;
     g_stop_target = NULL;
     g_mem_hoist_greg = -1;
+    g_low_hoist_greg = -1;
+    g_n_low_hoist_bail = 0;
     g_mem_hoist_greg2 = -1;
     g_mem_hoist_greg3 = -1;
     g_mem_hoist_aux_index = -1;
@@ -19094,6 +19262,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     }
 
     g_mem_hoist_greg = select_mem_base_hoist(blk->insns, n, rip);
+    g_low_hoist_greg = select_low_hoist(blk->insns, n, rip);
+    g_n_low_hoist_bail = 0;
 
     g_xmm_pinned = 0;
     if (xmm_pinning_enabled() && sse_enabled() && xmm_global_enabled() && !g_no_regflags) {
@@ -19158,6 +19328,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_lowstack_check = g_lowstack && ENV_ON("OCERZ_LOWSTACK_CHECK");
     if (g_lowstack)
         emit_stack_delta(&b);
+    g_m32low = !g_lowstack && m32_lowreg_ok();
+    if (g_m32low)
+        a64_mov_imm64(&b, JGB, ocerz_low_base);
 
     if (g_pin_class == 2)
         a64_add_imm(&b, 1, 29, 31, 0);
@@ -19233,6 +19406,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
               yc_setup(&b, blk->insns, n);
         }
         g_loop_entry = a64_label(&b);
+        if (g_low_hoist_greg >= 0)
+            emit_low_hoist_check(&b);
         if (g_mem_hoist_greg >= 0 && g_mem_hoist_aux_index >= 0)
             a64_add_reg(&b, 1, JMEMAUX, JMEMBASE, pin_hreg(pin_slot(g_mem_hoist_aux_index)), g_mem_hoist_aux_scale);
         static int loop_poll = -1;
@@ -19245,6 +19420,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     } else {
         if (!xmm_global_enabled())
             emit_xmm_pin_load_all(&b);
+        g_low_hoist_greg = -1;
     }
     if (ocerz_perfstat > 0) {
         g_tc_bad = 1;
@@ -19444,7 +19620,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         (stack_identity() || rsp_is_ptr())) {
         int freer[3]; int nfree = 0;
         if (g_mem_hoist_greg2 < 0) freer[nfree++] = JMEMBASE2;
-        if (g_mem_hoist_greg  < 0) freer[nfree++] = JMEMBASE;
+        if (g_mem_hoist_greg  < 0 && g_low_hoist_greg < 0) freer[nfree++] = JMEMBASE;
         if (g_mem_hoist_greg3 < 0) freer[nfree++] = JMEMBASE3;
         int npairs = 0;
         int sp = 0, dead = 0; int pstk[64]; int8_t rres[64];
@@ -19542,6 +19718,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         g_cur_insn_start = b.p;
         g_align_guard = g_align_blk || (g_align_any && al_marked(jit_key(insn->rip, mode32)));
         g_ea_plain = 0;
+        g_ea_lowhoisted = 0;
         lanerec_note((uint32_t)(b.p - entry));
         if (i == 0 && fps_watch(rip)) {
             g_tc_bad = 1;
@@ -20203,6 +20380,7 @@ promo_push_fallthrough:
     }
     emit_oolslow_arms(&b, exit_sites, &n_exits);
     emit_x87_arms(&b, exit_sites, &n_exits, epi_sites, &n_epi);
+    emit_low_hoist_bail(&b, rip, epi_sites, &n_epi);
     emit_guard_arms(&b, entry);
     emit_ordered_slow_arms(&b, blk, entry);
     emit_nan_ool_arms(&b, blk, entry);
@@ -20329,6 +20507,7 @@ promo_push_fallthrough:
         blk->body_code = NULL;
         g_pin = NULL; g_pin_hold = NULL; g_n_pinned = 0; g_pin_class = 0;
         g_lowstack = 0;
+        g_m32low = 0;
         cache_insert(jit, blk);
         return blk;
     }
@@ -20350,6 +20529,7 @@ promo_push_fallthrough:
         blk->code = NULL;
         g_pin = NULL; g_pin_hold = NULL; g_n_pinned = 0; g_pin_class = 0;
         g_lowstack = 0;
+        g_m32low = 0;
         cache_insert(jit, blk);
         return blk;
     }
@@ -22209,6 +22389,11 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     JitBlock *blk = (JitBlock *)cpu->side_blk;
     int k = cpu->side_idx;
     cpu->side_blk = NULL;
+    if (k == -2 && blk) {
+        lowhoist_mark(blk->key);
+        flip_retire_block(vm, jit, blk);
+        return;
+    }
     if (!blk || !blk->prof || k < 0 || k >= SIDE_MAX) return;
     int e = -1;
     for (int i = 0; i < blk->n_edges; i++)

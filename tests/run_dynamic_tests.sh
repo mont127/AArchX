@@ -983,6 +983,7 @@ run_low_golden_case dx87_int_low tests/dynamic/x87_int.c tests/dynamic/x87_int.o
 run_low_golden_case dx87_trans_low tests/dynamic/x87_trans.c tests/dynamic/x87_trans.out
 run_low_golden_case dx87_state_low tests/dynamic/x87_state.c tests/dynamic/x87_state.out
 run_low_golden_case dlow_stack_switch tests/dynamic/low_stack_switch.c tests/dynamic/low_stack_switch.out
+run_low_golden_case dlow_hoist tests/dynamic/low_hoist.c tests/dynamic/low_hoist.out
 run_low_golden_case drep_string_low tests/dynamic/rep_string.c tests/dynamic/rep_string.out
 run_low_golden_case dlow_top_strip tests/dynamic/low_top_strip.c tests/dynamic/low_top_strip.out
 export OCERZ_NO_PLAIN_MEM=1
