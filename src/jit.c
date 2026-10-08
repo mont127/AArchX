@@ -22058,7 +22058,8 @@ static int churn_blacklisted(uint64_t rip)
 static uint32_t *branch_word_target(uint32_t *site, uint32_t w)
 {
     int64_t off;
-    if ((w & 0xFC000000u) == 0x14000000u) {
+    /* b, and bl: a chained direct call is a bl into its callee */
+    if ((w & 0x7C000000u) == 0x14000000u) {
         off = ((int64_t)(int32_t)(w << 6) >> 6) * 4;
         return (uint32_t *)((uint8_t *)site + off);
     }
