@@ -1546,6 +1546,13 @@ static int g_mem_hoist_greg = -1;
 /* The Wine layout's base hoist (select_low_hoist): its guest register, the instruction it holds until, and the displacement span. */
 static int g_low_hoist_greg = -1, g_low_hoist_until;
 static int32_t g_low_hoist_lo, g_low_hoist_hi;
+/* An operand the block's low hoist covers: its host address is JMEMBASE plus its displacement. */
+static int low_hoist_covers(const X86Insn *insn, const X86Operand *op)
+{
+    return g_low_hoist_greg >= 0 && insn->seg == OCERZ_SEG_NONE && insn->addrsize == 8 &&
+           op->base == (unsigned)g_low_hoist_greg && op->index == OCERZ_REG_NONE && !op->riprel &&
+           g_cur_insn_idx < g_low_hoist_until && op->disp >= g_low_hoist_lo && op->disp < g_low_hoist_hi;
+}
 static uint32_t *g_low_hoist_bail[3];
 static int g_n_low_hoist_bail, g_ea_lowhoisted, g_ea_lowhoisted_reg;
 static int g_mem_hoist_aux_disp;
@@ -4190,9 +4197,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     }
     if (insn->addrsize != 8)
         return 0;
-    if (g_low_hoist_greg >= 0 && seg == OCERZ_SEG_NONE && op->base == (unsigned)g_low_hoist_greg &&
-        op->index == OCERZ_REG_NONE && g_cur_insn_idx < g_low_hoist_until &&
-        op->disp >= g_low_hoist_lo && op->disp < g_low_hoist_hi) {
+    if (low_hoist_covers(insn, op)) {
         if (op->disp > 0)      a64_add_imm(b, 1, addr_reg, JMEMBASE, (uint32_t)op->disp);
         else if (op->disp < 0) a64_sub_imm(b, 1, addr_reg, JMEMBASE, (uint32_t)-op->disp);
         else                   a64_mov_reg(b, 1, addr_reg, JMEMBASE);
@@ -5069,6 +5074,12 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
 {
     static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_PLAINFAST") ? 1 : 0;
     if (dis) return 0;
+    if (low_hoist_covers(insn, m) && !ENV_ON("OCERZ_NO_HOIST_DISP")) {
+        int plain = mem_plain_access_ok(m);
+        if (vec) { if (store) emit_v_st_at(b, size, reg, JMEMBASE, (int32_t)m->disp, plain); else emit_v_ld_at(b, size, reg, JMEMBASE, (int32_t)m->disp, plain); }
+        else     { if (store) emit_gpr_st_at(b, size, reg, JMEMBASE, (int32_t)m->disp, plain); else emit_gpr_ld_at(b, size, reg, JMEMBASE, (int32_t)m->disp, plain); }
+        return 1;
+    }
     if (lowstack_disp_ea(b, insn, m, size, 1)) {
         int plain = mem_plain_access_ok(m);
         if (vec) { if (store) emit_v_st_at(b, size, reg, JTA, (int32_t)m->disp, plain); else emit_v_ld_at(b, size, reg, JTA, (int32_t)m->disp, plain); }
@@ -5233,6 +5244,13 @@ static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand
                                 int size, int *ra_out, uint32_t *disp_out, int unscaled_ok)
 {
     if (lowstack_disp_ea(b, insn, op, size, unscaled_ok)) { *ra_out = JTA; *disp_out = (uint32_t)op->disp; return 1; }
+    if (low_hoist_covers(insn, op) && !ENV_ON("OCERZ_NO_HOIST_DISP")) {
+        int64_t d = op->disp;
+        if ((d >= 0 && (d % size) == 0 && d / size <= 4095) || (unscaled_ok && d >= -256 && d <= 255)) {
+            *ra_out = JMEMBASE; *disp_out = (uint32_t)d;
+            return 1;
+        }
+    }
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
     if (rsp_is_ptr() && op->index == OCERZ_RSP) return 0;
