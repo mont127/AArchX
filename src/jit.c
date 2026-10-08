@@ -5032,11 +5032,33 @@ static int ea_cache_has_base(const A64Buf *b, const X86Operand *op);
 static void ea_cache_set(const A64Buf *b, const X86Operand *op);
 static void ea_cache_set_full(const A64Buf *b, unsigned base, unsigned index, int scale);
 static void ea_cache_reset(void);
+/*
+ * An [rsp + disp] operand in the Wine layout, whose host address is rsp plus
+ * the stack delta in x0: JTA takes rsp + x0 once, and the access carries the
+ * displacement, so the stack slots a block touches between two moves of rsp
+ * share one add (the address cache's base form, JTA = JGB + base).
+ */
+static int lowstack_disp_ea(A64Buf *b, const X86Insn *insn, const X86Operand *m, int size, int unscaled_ok)
+{
+    if (!g_lowstack || m->base != OCERZ_RSP || m->index != OCERZ_REG_NONE || m->riprel) return 0;
+    if (!insn_stack_only(insn) || ENV_ON("OCERZ_NO_LOWSTACK_EA")) return 0;
+    int64_t d = m->disp;
+    if (!((d >= 0 && (d % size) == 0 && d / size <= 4095) || (unscaled_ok && d >= -256 && d <= 255))) return 0;
+    if (!ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, pin_hreg(pin_slot(OCERZ_RSP)), JGB, 0);
+    ea_cache_set_full(b, OCERZ_RSP, OCERZ_REG_NONE, 0);
+    return 1;
+}
 static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand *m,
                                int size, int reg, int store, int vec)
 {
     static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_PLAINFAST") ? 1 : 0;
     if (dis) return 0;
+    if (lowstack_disp_ea(b, insn, m, size, 1)) {
+        int plain = mem_plain_access_ok(m);
+        if (vec) { if (store) emit_v_st_at(b, size, reg, JTA, (int32_t)m->disp, plain); else emit_v_ld_at(b, size, reg, JTA, (int32_t)m->disp, plain); }
+        else     { if (store) emit_gpr_st_at(b, size, reg, JTA, (int32_t)m->disp, plain); else emit_gpr_ld_at(b, size, reg, JTA, (int32_t)m->disp, plain); }
+        return 1;
+    }
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || m->riprel) return 0;
     if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
@@ -5194,6 +5216,7 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
 static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand *op,
                                 int size, int *ra_out, uint32_t *disp_out, int unscaled_ok)
 {
+    if (lowstack_disp_ea(b, insn, op, size, unscaled_ok)) { *ra_out = JTA; *disp_out = (uint32_t)op->disp; return 1; }
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
     if (rsp_is_ptr() && op->index == OCERZ_RSP) return 0;
