@@ -5038,12 +5038,16 @@ static void ea_cache_reset(void);
  * displacement, so the stack slots a block touches between two moves of rsp
  * share one add (the address cache's base form, JTA = JGB + base).
  */
-static int lowstack_disp_ea(A64Buf *b, const X86Insn *insn, const X86Operand *m, int size, int unscaled_ok)
+static int lowstack_disp_ok(const X86Insn *insn, const X86Operand *m, int size, int unscaled_ok)
 {
     if (!g_lowstack || m->base != OCERZ_RSP || m->index != OCERZ_REG_NONE || m->riprel) return 0;
     if (!insn_stack_only(insn) || ENV_ON("OCERZ_NO_LOWSTACK_EA")) return 0;
     int64_t d = m->disp;
-    if (!((d >= 0 && (d % size) == 0 && d / size <= 4095) || (unscaled_ok && d >= -256 && d <= 255))) return 0;
+    return (d >= 0 && (d % size) == 0 && d / size <= 4095) || (unscaled_ok && d >= -256 && d <= 255);
+}
+static int lowstack_disp_ea(A64Buf *b, const X86Insn *insn, const X86Operand *m, int size, int unscaled_ok)
+{
+    if (!lowstack_disp_ok(insn, m, size, unscaled_ok)) return 0;
     if (!ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, pin_hreg(pin_slot(OCERZ_RSP)), JGB, 0);
     ea_cache_set_full(b, OCERZ_RSP, OCERZ_REG_NONE, 0);
     return 1;
@@ -13838,10 +13842,16 @@ static uint32_t *emit_static_chain_tail(A64Buf *b, uint64_t target_rip,
 
 static int fused_jcc_cond(const X86Insn *producer, const X86Insn *jcc)
 {
+    /* after ands, as after test, C and V are clear: be/a are e/ne, l/ge/le/g read N and Z alone */
     if (producer->op == OCERZ_OP_TEST) {
-        if (jcc->cc == OCERZ_CC_E)  return A64_EQ;
-        if (jcc->cc == OCERZ_CC_NE) return A64_NE;
-        return -1;
+        static const int test_cond[16] = {
+            -1,     -1,     -1,     -1,
+            A64_EQ, A64_NE, A64_EQ, A64_NE,
+            A64_MI, A64_PL, -1,     -1,
+            A64_LT, A64_GE, A64_LE, A64_GT,
+        };
+        if (jcc->cc != OCERZ_CC_E && jcc->cc != OCERZ_CC_NE && ENV_ON("OCERZ_NO_TEST_CC")) return -1;
+        return jcc->cc < 16 ? test_cond[jcc->cc] : -1;
     }
 
     static const int cmp_cond[16] = {
@@ -13900,6 +13910,7 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
 }
 
 static int flag_neutral_ok(const X86Insn *in);
+static int jcc_gap_ok(const X86Insn *in);
 static int insn_writes_reg(const X86Insn *in, unsigned reg);
 static int side_gap_fuse_ok(const X86Insn *insns, int i, int n)
 {
@@ -13913,7 +13924,7 @@ static int side_gap_fuse_ok(const X86Insn *insns, int i, int n)
     if (!g_defer || g_no_jccfuse || j->ops[0].kind != OCERZ_OPK_IMM || j->ops[0].imm == g_self_rip) return 0;
     if (!can_fuse_cmp_test_jcc(p, j, g_self_rip)) return 0;
     if (p->addrsize != 8) return 0;
-    if (!flag_neutral_ok(&insns[i + 1])) return 0;
+    if (!jcc_gap_ok(&insns[i + 1])) return 0;
     if (p->ops[0].kind == OCERZ_OPK_REG && insn_writes_reg(&insns[i + 1], p->ops[0].reg)) return 0;
     if (p->ops[1].kind == OCERZ_OPK_REG && insn_writes_reg(&insns[i + 1], p->ops[1].reg)) return 0;
     return 1;
@@ -13963,6 +13974,22 @@ static int flag_neutral_ok(const X86Insn *in)
     }
     return 0;
 }
+/*
+ * A load of a stack slot into a pinned register, which the Wine layout emits as
+ * a plain load off rsp + x0 (lowstack_disp_ea): flag-free and touching only JTA,
+ * so it may sit between a compare and its fused jcc.  It can fault, so
+ * emit_cmp_test_jcc writes the compare's flags out before it.
+ */
+static int stack_gap_load_ok(const X86Insn *in)
+{
+    if (in->op != OCERZ_OP_MOV || in->nops != 2 || ENV_ON("OCERZ_NO_STACK_GAP")) return 0;
+    const X86Operand *d = &in->ops[0], *s = &in->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+    if (pin_slot(d->reg) < 0 || d->reg == OCERZ_RSP) return 0;
+    if (s->kind != OCERZ_OPK_MEM || s->size != d->size || !mem_plain_access_ok(s)) return 0;
+    return lowstack_disp_ok(in, s, d->size, 1);
+}
+static int jcc_gap_ok(const X86Insn *in) { return flag_neutral_ok(in) || stack_gap_load_ok(in); }
 static int emit_flag_neutral(A64Buf *b, const X86Insn *in)
 {
     switch (in->op) {
@@ -13970,6 +13997,11 @@ static int emit_flag_neutral(A64Buf *b, const X86Insn *in)
         return emit_lea(b, in);
     case OCERZ_OP_MOV: {
         const X86Operand *d = &in->ops[0], *s = &in->ops[1];
+        if (stack_gap_load_ok(in)) {
+            if (!lowstack_disp_ea(b, in, s, d->size, 1)) return 0;
+            emit_gpr_ld_at(b, d->size, pin_hreg(pin_slot(d->reg)), JTA, (int32_t)s->disp, 1);
+            return 1;
+        }
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
         if (s->kind == OCERZ_OPK_REG) {
             if (s->high8 || s->size != d->size) return 0;
@@ -14005,13 +14037,18 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         const X86Operand *pd = &producer->ops[0], *ps = &producer->ops[1];
         if (pd->kind == OCERZ_OPK_REG && insn_writes_reg(gap, pd->reg)) return 0;
         if (ps->kind == OCERZ_OPK_REG && insn_writes_reg(gap, ps->reg)) return 0;
-        if (!flag_neutral_ok(gap)) return 0;
+        if (!jcc_gap_ok(gap)) return 0;
         {
             uint32_t tmpw[128];
             A64Buf tb = { tmpw, tmpw, tmpw + 128, 0, 0 };
-            if (!emit_flag_neutral(&tb, gap) || tb.overflow) return 0;
+            __typeof__(g_ea_cache) saved = g_ea_cache;
+            ea_cache_reset();
+            int ok = emit_flag_neutral(&tb, gap) && !tb.overflow;
+            g_ea_cache = saved;
+            if (!ok) return 0;
         }
     }
+    int pre_rec = gap && stack_gap_load_ok(gap);
 
     const X86Operand *d = &producer->ops[0];
     const X86Operand *s = &producer->ops[1];
@@ -14181,7 +14218,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             uint64_t v = s->imm;
             if (!sf)
                 v &= 0xffffffffull;
-            if (v != 0 && (v & (v - 1)) == 0) {
+            if (v != 0 && (v & (v - 1)) == 0 && cc_is_zero_test) {
                 test_bit = __builtin_ctzll(v);
                 test_rn = rn;
                 test_mask = v;
@@ -14207,6 +14244,18 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             return 0;
         ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, d->size, 0);
     }
+    if (pre_rec) {
+        if (producer->op == OCERZ_OP_CMP) {
+            if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
+            emit_defer_flags(b, ccop, record_src, record_dst);
+        } else {
+            if (test_bit >= 0) {
+                a64_mov_imm64(b, JT2, test_mask);
+                a64_and_reg(b, 1, JT2, test_rn, JT2, 0);
+            }
+            emit_defer_flags(b, ccop, JT2, JT2);
+        }
+    }
     if (gap) {
         uint32_t *gl = a64_label(b);
         int ok = emit_flag_neutral(b, gap);
@@ -14219,7 +14268,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
 
     if (g_jcc_side_mode && !self_loop) {
         int taken_live = g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0;
-        int need_rec = g_jcc_side_need != 0 || taken_live;
+        int need_rec = !pre_rec && (g_jcc_side_need != 0 || taken_live);
         int rec_after = need_rec && !taken_live;
         static int nostub = -1; if (nostub < 0) nostub = getenv("OCERZ_NO_RECSTUB") ? 1 : 0;
         int rec_stub = !nostub && need_rec && taken_live && g_jcc_side_fall_need == 0 && producer->op == OCERZ_OP_CMP &&
@@ -14303,7 +14352,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             a64_bcond(b, taken_cond, 0);
         }
 
-        if (g_no_xlive || xlive_succ_live(g_xlat_jit, fall) != 0) {
+        if (!pre_rec && (g_no_xlive || xlive_succ_live(g_xlat_jit, fall) != 0)) {
             if (producer->op == OCERZ_OP_CMP) {
                 if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
                 emit_defer_flags(b, ccop, record_src, record_dst);
@@ -14325,7 +14374,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             a64_patch_cbz(to_taken, taken_label);
         else
             a64_patch_bcond(to_taken, taken_label);
-        int taken_rec = g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0;
+        int taken_rec = !pre_rec && (g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0);
         if (taken_rec) {
             if (producer->op == OCERZ_OP_CMP) {
                 if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
@@ -14380,7 +14429,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     l0_fixed_fallthrough(b);
     fpb_emit_exit_check(b);
 
-    if (g_no_xlive || xlive_succ_live(g_xlat_jit, fall) != 0) {
+    if (!pre_rec && (g_no_xlive || xlive_succ_live(g_xlat_jit, fall) != 0)) {
         if (producer->op == OCERZ_OP_CMP) {
             if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
             emit_defer_flags(b, ccop, record_src, record_dst);
@@ -14403,7 +14452,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
     }
 
     g_stop_target = a64_label(b);
-    if (g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0) {
+    if (!pre_rec && (g_no_xlive || xlive_succ_live(g_xlat_jit, taken) != 0)) {
         if (producer->op == OCERZ_OP_CMP) {
             if (rec_imm_pending) a64_mov_imm64(b, JT1, rec_imm);
             emit_defer_flags(b, ccop, record_src, record_dst);
