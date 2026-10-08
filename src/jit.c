@@ -17746,6 +17746,47 @@ static uint8_t  g_promo_reg[JIT_MAX_BLOCK_INSNS];
 static int32_t  g_promo_mate[JIT_MAX_BLOCK_INSNS];
 static int32_t  g_promo_push_of[JIT_MAX_BLOCK_INSNS];
 static unsigned long long g_promo_seq[JIT_MAX_BLOCK_INSNS];
+
+/*
+ * Two pushes, or two pops, of 64-bit registers in a row, where the stack
+ * delta is in use: one address, one stp or ldp, and rsp moved once afterwards.
+ * rsp moves only after the access, so a fault restarts the pair at its first
+ * instruction with nothing yet done; a pop pair never loads one register twice
+ * (an ldp with equal destinations is unpredictable).  Prologues and epilogues
+ * are these runs: fib's four pushes went from 12 instructions to 6.  The
+ * call-frame forms and the push/pop renames own their instructions and are
+ * left alone.  OCERZ_NO_STACK_PAIR=1 turns it off.
+ */
+static int stack_pair_reg(const X86Insn *in, int op)
+{
+    const X86Operand *o = &in->ops[0];
+    if (in->op != op || in->mode32 || in->opsize != 8 || in->seg != OCERZ_SEG_NONE || in->nops != 1) return -1;
+    if (o->kind != OCERZ_OPK_REG || o->high8 || o->size != 8 || (o->reg & 15) == OCERZ_RSP) return -1;
+    int s = pin_slot(o->reg);
+    return s < 0 ? -1 : pin_hreg(s);
+}
+static int emit_stack_pair(A64Buf *b, const X86Insn *a, const X86Insn *c, int i)
+{
+    if (!g_lowstack || !stack_plain_access_ok() || ENV_ON("OCERZ_NO_STACK_PAIR")) return 0;
+    if (g_ic_kind[i] || g_ic_kind[i + 1] || g_promo_reg[i] || g_promo_reg[i + 1]) return 0;
+    int hs = pin_hreg(pin_slot(OCERZ_RSP));
+    int ra, rc;
+    if ((ra = stack_pair_reg(a, OCERZ_OP_PUSH)) >= 0 && (rc = stack_pair_reg(c, OCERZ_OP_PUSH)) >= 0) {
+        if (!mem_native_store_ok()) return 0;
+        a64_add_reg(b, 1, JTA, hs, JGB, 0);
+        a64_stp_off(b, rc, ra, JTA, -16);
+        a64_sub_imm(b, 1, hs, hs, 16);
+    } else if ((ra = stack_pair_reg(a, OCERZ_OP_POP)) >= 0 && (rc = stack_pair_reg(c, OCERZ_OP_POP)) >= 0) {
+        if (ra == rc) return 0;
+        a64_add_reg(b, 1, JTA, hs, JGB, 0);
+        a64_ldp_off(b, ra, rc, JTA, 0);
+        a64_add_imm(b, 1, hs, hs, 16);
+    } else {
+        return 0;
+    }
+    g_mov_skip[i + 1] = 1;
+    return 1;
+}
 static int low_splice_ok(const X86Insn *insn)
 {
     static int off = -1;
@@ -20215,6 +20256,10 @@ promo_push_fallthrough:
         if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_undo[i] && !g_fpb_undo_done[i]) fpb_emit_undo_save(&b, insn, i, exit_sites, &n_exits);
         g_undo_want_slot = -1; g_undo_saved = 0;
         if (i + 1 < n && !g_mov_skip[i + 1] && emit_mov128_pair(&b, insn, &blk->insns[i + 1], i)) {
+            blk->n_inlined++;
+            continue;
+        }
+        if (i + 1 < n && !g_mov_skip[i + 1] && emit_stack_pair(&b, insn, &blk->insns[i + 1], i)) {
             blk->n_inlined++;
             continue;
         }

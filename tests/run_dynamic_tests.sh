@@ -844,6 +844,7 @@ run_golden_case dx87_trans tests/dynamic/x87_trans.c tests/dynamic/x87_trans.out
 run_golden_case dx87_state tests/dynamic/x87_state.c tests/dynamic/x87_state.out
 run_golden_case drep_string tests/dynamic/rep_string.c tests/dynamic/rep_string.out
 run_golden_case dcomis_mem tests/dynamic/comis_mem.c tests/dynamic/comis_mem.out
+run_golden_case dstack_pair tests/dynamic/stack_pair.c tests/dynamic/stack_pair.out
 run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
 run_file_case dlane_fault_guard tests/dynamic/lane_fault_guard.c 'OK' -Wl,-no_pie
 run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
@@ -987,6 +988,7 @@ run_low_golden_case dlow_stack_switch tests/dynamic/low_stack_switch.c tests/dyn
 run_low_golden_case dlow_hoist tests/dynamic/low_hoist.c tests/dynamic/low_hoist.out
 run_low_golden_case drep_string_low tests/dynamic/rep_string.c tests/dynamic/rep_string.out
 run_low_golden_case dcomis_mem_low tests/dynamic/comis_mem.c tests/dynamic/comis_mem.out
+run_low_golden_case dstack_pair_low tests/dynamic/stack_pair.c tests/dynamic/stack_pair.out
 run_low_golden_case dlow_top_strip tests/dynamic/low_top_strip.c tests/dynamic/low_top_strip.out
 export OCERZ_NO_PLAIN_MEM=1
 run_file_case dalign_ordered tests/dynamic/align_ordered.c '370d1a721afe9c4a'
