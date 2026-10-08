@@ -6319,6 +6319,14 @@ static int mem_plain_ok(const X86Insn *insn, const X86Operand *op)
     if (op->index != OCERZ_REG_NONE && pin_slot(op->index) < 0) return 0;
     return 1;
 }
+/* A cmp/test whose first operand is memory, as emit_rmw_mem emits it inline with NZCV set. */
+static int rmw_nzcv_ok(const X86Insn *p, const X86Operand *m)
+{
+    if (ENV_ON("OCERZ_NO_INLINE_RMW") || ENV_ON("OCERZ_NO_NZCV_MEMDST")) return 0;
+    if (p->seg != OCERZ_SEG_NONE || p->addrsize != 8 || p->lock || !mem_native_store_ok()) return 0;
+    if (rsp_is_ptr() && m->index == OCERZ_RSP) return 0;
+    return 1;
+}
 static int nzcv_fuse_producer(const X86Insn *insns, int ci);
 static int insn_writes_reg(const X86Insn *in, unsigned reg);
 static int flag_neutral_ok(const X86Insn *in);
@@ -6393,6 +6401,15 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     for (int m = k + 1; m < ci; m++) {
         if (!nzcv_gap_ok(insns, m, k)) return -1;
         const X86Insn *p = &insns[k];
+        /*
+         * A setcc or cmovcc reads the forwarded NZCV, never the producer's
+         * registers, so a sibling consumer in the gap may write one of them
+         * (cmp [rcx],eax ; setg al ; setl dl).  A jcc can re-derive its
+         * condition from them, so it keeps the rule.
+         */
+        if ((c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC) &&
+            (insns[m].op == OCERZ_OP_SETCC || insns[m].op == OCERZ_OP_CMOVCC) && !ENV_ON("OCERZ_NO_NZCV_SIBLING"))
+            continue;
         for (int o = 0; o < p->nops; o++) {
             const X86Operand *po = &p->ops[o];
             if (po->kind == OCERZ_OPK_REG && insn_writes_reg(&insns[m], po->reg)) return -1;
@@ -6453,6 +6470,15 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
             if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE && cc != OCERZ_CC_B && cc != OCERZ_CC_AE &&
                 cc != OCERZ_CC_A && cc != OCERZ_CC_BE) return -1;
         } else return -1;
+        return k;
+    }
+    if (d->kind == OCERZ_OPK_MEM && (p->op == OCERZ_OP_CMP || p->op == OCERZ_OP_TEST) &&
+        (c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC) &&
+        (d->size == 4 || d->size == 8) && sr->size == d->size) {
+        if (!rmw_nzcv_ok(p, d)) return -1;
+        if (sr->kind == OCERZ_OPK_REG) {
+            if (sr->high8 || pin_slot(sr->reg) < 0 || (rsp_is_ptr() && sr->reg == OCERZ_RSP)) return -1;
+        } else if (sr->kind != OCERZ_OPK_IMM) return -1;
         return k;
     }
     if (d->kind != OCERZ_OPK_REG || d->high8) return -1;
@@ -12320,7 +12346,8 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     switch (op) {
     case OCERZ_OP_ADD: case OCERZ_OP_XADD: a64_add_reg(b, sf, JT2, JT0, rs, 0); break;
     case OCERZ_OP_SUB: a64_sub_reg(b, sf, JT2, JT0, rs, 0); break;
-    case OCERZ_OP_AND: case OCERZ_OP_TEST: a64_and_reg(b, sf, JT2, JT0, rs, 0); break;
+    case OCERZ_OP_AND: a64_and_reg(b, sf, JT2, JT0, rs, 0); break;
+    case OCERZ_OP_TEST: if (need) a64_and_reg(b, sf, JT2, JT0, rs, 0); have_new = 0; break;
     case OCERZ_OP_OR:  a64_orr_reg(b, sf, JT2, JT0, rs, 0); break;
     case OCERZ_OP_XOR: a64_eor_reg(b, sf, JT2, JT0, rs, 0); break;
     case OCERZ_OP_INC: a64_add_imm(b, sf, JT2, JT0, 1); break;
@@ -12339,12 +12366,14 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         else { a64_csel(b, 1, JT1, acc, JT0, A64_EQ); a64_bfi(b, 1, hax, JT1, 0, size * 8); }
         break;
     }
-    case OCERZ_OP_CMP: a64_sub_reg(b, sf, JT2, JT0, rs, 0); have_new = 0; break;
+    case OCERZ_OP_CMP: have_new = 0; break;
     default: return 0;
     }
-    if (size == 1) a64_uxtb(b, JT2, JT2); else if (size == 2) a64_uxth(b, JT2, JT2);
-    else if (size == 4 && (op == OCERZ_OP_NEG || op == OCERZ_OP_NOT || op == OCERZ_OP_SUB || op == OCERZ_OP_ADD || op == OCERZ_OP_XADD || op == OCERZ_OP_INC || op == OCERZ_OP_DEC || op == OCERZ_OP_CMP))
-        a64_mov_reg(b, 0, JT2, JT2);
+    if (op != OCERZ_OP_CMP && (op != OCERZ_OP_TEST || need)) {
+        if (size == 1) a64_uxtb(b, JT2, JT2); else if (size == 2) a64_uxth(b, JT2, JT2);
+        else if (size == 4 && (op == OCERZ_OP_NEG || op == OCERZ_OP_NOT || op == OCERZ_OP_SUB || op == OCERZ_OP_ADD || op == OCERZ_OP_XADD || op == OCERZ_OP_INC || op == OCERZ_OP_DEC))
+            a64_mov_reg(b, 0, JT2, JT2);
+    }
 
     if (!is_cmp && !(ordered && atomic))
         emit_gpr_st_at(b, size, JT2, ra, (int32_t)disp, plainacc);
@@ -12375,6 +12404,12 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         }
     }
     if (op == OCERZ_OP_XCHG || op == OCERZ_OP_XADD) rmw_write_reg(b, r, size, JT0);
+    if (g_nzcv_want && is_cmp && size >= 4) {
+        if (op == OCERZ_OP_CMP) a64_subs_reg(b, sf, A64_ZR, JT0, rs, 0);
+        else                    a64_ands_reg(b, sf, A64_ZR, JT0, rs, 0);
+        g_nzcv_kind = op == OCERZ_OP_CMP ? OCERZ_CC_SUB : OCERZ_CC_LOGIC;
+        g_nzcv_from = g_cur_insn_idx;
+    }
     (void)have_new;
     if (align_bne) {
         uint32_t *sites[1] = { align_bne };
