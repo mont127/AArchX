@@ -7313,6 +7313,30 @@ static int emit_cmov(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int 
     return 1;
 }
 
+static int mov_sink_gap_ok(const X86Insn *in, unsigned dreg, unsigned sreg);
+/*
+ * setcc r8 whose register a movzx of the same register widens a few
+ * instructions on (setg al ; setl dl ; movzx edx, dl ; movzx eax, al): with
+ * nothing between that reads or writes the register, touches memory or can
+ * leave the block, the setcc writes the whole register (cset zero-extends)
+ * and the movzx is skipped.  Returns the movzx's index, or -1.
+ */
+static int setcc_zx_partner(const X86Insn *insn)
+{
+    if (!g_cur_insns || g_cur_insn_idx < 0 || ENV_ON("OCERZ_NO_SETCC_ZX")) return -1;
+    unsigned r = insn->ops[0].reg & 15;
+    for (int k = g_cur_insn_idx + 1; k < g_cur_insns_n && k <= g_cur_insn_idx + 4; k++) {
+        const X86Insn *t = &g_cur_insns[k];
+        if (t->op == OCERZ_OP_MOVZX && t->nops == 2 && t->ops[0].kind == OCERZ_OPK_REG && t->ops[1].kind == OCERZ_OPK_REG &&
+            (t->ops[0].size == 4 || t->ops[0].size == 8) && t->ops[1].size == 1 && !t->ops[1].high8 &&
+            (t->ops[0].reg & 15) == r && (t->ops[1].reg & 15) == r)
+            return g_mov_skip[k] ? -1 : k;
+        if (t->op == OCERZ_OP_SETCC && t->ops[0].kind == OCERZ_OPK_REG && !t->ops[0].high8 && (t->ops[0].reg & 15) != r)
+            continue;
+        if (!mov_sink_gap_ok(t, r, r)) return -1;
+    }
+    return -1;
+}
 static int emit_setcc(A64Buf *b, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
@@ -7332,6 +7356,12 @@ static int emit_setcc(A64Buf *b, const X86Insn *insn)
     if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
     emit_cc_predicate_ex(b, insn->cc, 1);
+    int zx = pin_slot(d->reg) >= 0 ? setcc_zx_partner(insn) : -1;
+    if (zx >= 0) {
+        a64_cset(b, pin_hreg(pin_slot(d->reg)), g_cc_direct >= 0 ? g_cc_direct : A64_NE);
+        g_mov_skip[zx] = 1;
+        return 1;
+    }
     a64_cset(b, JT2, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
     if (pin_slot(d->reg) >= 0) {
         a64_bfi(b, 1, pin_hreg(pin_slot(d->reg)), JT2, 0, 8);
