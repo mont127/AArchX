@@ -191,6 +191,11 @@
  * address, whose side of 12 GB is known when the block is translated, takes an
  * orr below it and nothing above it.  On xbench in the Wine layout these took
  * leafcall from 1.27 s to 0.65 s (Rosetta 0.62 s) and str from 0.84 s to 0.75 s.
+ * A 32-bit address is below 4 GB, so in 32-bit code every translation is the
+ * orr alone, and esp-relative operands there are stack accesses as well: a
+ * WoW64 loop of virtual calls into small frames spent most of its time in the
+ * acquire loads and release stores of its stack slots, and went from 459 to
+ * 163 ms (Rosetta 158).
  *
  * The integer SSE forms map almost one to one: widening multiplies and a
  * narrowing unzip for the high halves and pmaddubsw, saturating narrows for the
@@ -294,7 +299,8 @@
  * A guest CALL pushes its return address and also pushes {retaddr, host
  * continuation} onto a host-stack shadow and a return-address stack, then `bl`s
  * into the callee body, so the hardware return predictor matches the RAS and a
- * guest RET is a plain ret.  Indirect jmp/call go through a per-site
+ * guest RET is a plain ret.  32-bit calls and rets do the same, their shadow
+ * entries tagged JIT_KEY_M32 (m32_ras_ok).  Indirect jmp/call go through a per-site
  * direct-mapped cache of 32 {rip, body} pairs (16-aligned, so the lookup's ldp
  * is single-copy atomic) before falling into an inlined hash probe and finally
  * C.  In 32-bit code a ret, an indirect call and an indirect jmp take the same
@@ -893,6 +899,7 @@ static uint64_t g_const_ea;
 /* Set by emit_mem_ea when the address it just formed is a constant, for the guard that follows. */
 static int g_ea_is_const;
 static uint64_t g_ea_const;
+static int g_ea_w32;
 static int g_ea_plain;
 static inline int stack_plain_now(void);
 
@@ -4107,7 +4114,10 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
 {
     g_const_ea_valid = 0;
     g_ea_is_const = 0;
-    g_ea_plain = ocerz_low_base != 0 && insn->seg == OCERZ_SEG_NONE && !insn->mode32 && mem_plain_access_ok(op);
+    g_ea_w32 = 0;
+    /* esp-relative operands of 32-bit code are stack accesses too, plain as their push and pop already are. */
+    g_ea_plain = ocerz_low_base != 0 && insn->seg == OCERZ_SEG_NONE && mem_plain_access_ok(op) &&
+                 (!insn->mode32 || !ENV_ON("OCERZ_NO_M32_STACK_PLAIN"));
     uint64_t fold = ea_fold();
     int seg = insn->seg;
     if (seg != OCERZ_SEG_NONE) {
@@ -4134,6 +4144,12 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
             a64_ldr(b, 8, JT0, 20, (uint32_t)(seg == OCERZ_SEG_FS ? offsetof(OcerzCPU, fs_base)
                                                                   : offsetof(OcerzCPU, gs_base)));
             a64_add_reg(b, 1, addr_reg, addr_reg, JT0, 0);
+        } else if (seg == OCERZ_SEG_NONE && fold == 0) {
+            g_ea_w32 = 1;
+            if (op->base == OCERZ_REG_NONE && op->index == OCERZ_REG_NONE) {
+                g_ea_is_const = 1;
+                g_ea_const = (uint32_t)op->disp;
+            }
         }
         return 1;
     }
@@ -4418,6 +4434,20 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         }
     }
     g_ea_is_const = 0;
+    /*
+     * A 32-bit address is below 4 GB, so in the Wine layout it is in the low
+     * window whatever it is, and its translation is the orr alone, as the 32-bit
+     * stack's is.  An address emit_mem_ea built is already zero-extended; any
+     * other is zero-extended first, which is the 32-bit wrap besides.
+     */
+    if (insn && insn->mode32 && insn->addrsize == 4 && insn->seg == OCERZ_SEG_NONE && ocerz_low_base &&
+        ea_fold() == 0 && low_guard_fast_ok() && !ENV_ON("OCERZ_NO_M32_ORR")) {
+        if (!g_ea_w32) a64_mov_reg(b, 0, addr_reg, addr_reg);
+        g_ea_w32 = 0;
+        (void)a64_try_orr_imm(b, 1, addr_reg, addr_reg, ocerz_low_base);
+        return NULL;
+    }
+    g_ea_w32 = 0;
     if (!ocerz_commpage && !ocerz_low_base)
         return NULL;
     uint64_t ga;
@@ -15209,6 +15239,32 @@ static int emit_call_region_ret(A64Buf *b, const X86Insn *insn,
     return 1;
 }
 
+/*
+ * A 32-bit call and its ret through the host shadow stack, as 64-bit ones go:
+ * the call pushes {return address tagged JIT_KEY_M32, host continuation} and
+ * bl's (or, indirect, blr's) into the callee's body, and the ret compares the
+ * address it popped with the shadow's and returns with a real ret, which the
+ * return predictor has seen coming.  The tag keeps a 64-bit ret from taking a
+ * 32-bit entry and the reverse.  A mismatch, a stale entry or an empty shadow
+ * takes the per-site cache as before.  OCERZ_NO_M32_RAS=1 turns it off.
+ */
+static int m32_ras_ok(const X86Insn *insn)
+{
+    static int no_blret = -1;
+    if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
+    return g_pin_class == 3 && fullpin_enabled() && !g_no_regflags && !g_no_chain && !g_no_ras &&
+           host_ras_enabled() && !no_blret && !ENV_ON("OCERZ_NO_M32_RAS") && m32_stack_ok(insn);
+}
+/* Pushes the shadow pair for a 32-bit call returning to retaddr; the adr is patched to the continuation. */
+static uint32_t *m32_ras_push(A64Buf *b, uint64_t retaddr)
+{
+    a64_mov_imm64(b, JT2, retaddr | JIT_KEY_M32);
+    uint32_t *adr_site = a64_label(b);
+    a64_emit32(b, 0x10000000u | (uint32_t)JT0);
+    a64_stp_pre(b, JT2, JT0, 31, -16);
+    return adr_site;
+}
+
 static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
                            uint32_t **epi_sites, int *n_epi)
 {
@@ -15226,6 +15282,40 @@ static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
             return 0;
         uint64_t retaddr = (uint32_t)(insn->rip + insn->len);
         uint64_t target = insn->ops[0].imm;
+
+        /* call $+5 is how 32-bit code reads eip; its pop never meets a ret. */
+        if (target != retaddr && m32_ras_ok(insn)) {
+            uint32_t *adr_site = m32_ras_push(b, retaddr);
+            a64_mov_imm64(b, JT1, retaddr);
+            a64_sub_imm(b, 0, JTA, hs, 4);
+            m32_stack_st(b, JT1, JTA);
+            a64_mov_reg(b, 0, hs, JTA);
+            uint32_t *pb_callee = a64_label(b);
+            a64_emit32(b, 0x94000000u);
+            uint32_t *cont = a64_label(b);
+            patch_local_adr(adr_site, cont, JT0);
+            uint32_t *pb_ret = emit_body_chain_tail(b, retaddr, 0, epi_sites, n_epi);
+            uint32_t *callee_fb = a64_label(b);
+            *pb_callee = 0x94000000u | ((uint32_t)(callee_fb - pb_callee) & 0x03ffffffu);
+            a64_mov_imm64(b, JT0, target);
+            a64_str(b, 8, JT0, 20, RIP_OFF);
+            a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+            epi_sites[*n_epi] = a64_label(b);
+            a64_b(b, 0);
+            (*n_epi)++;
+            g_jcc_edge[0].target_rip = target;
+            g_jcc_edge[0].patch_b = pb_callee;
+            g_jcc_edge[0].cond_site = NULL;
+            g_jcc_edge[0].kind = EDGE_BODY;
+            g_jcc_edge[0].pin_class = 3;
+            g_jcc_edge[1].target_rip = retaddr;
+            g_jcc_edge[1].patch_b = pb_ret;
+            g_jcc_edge[1].cond_site = NULL;
+            g_jcc_edge[1].kind = EDGE_BODY;
+            g_jcc_edge[1].pin_class = 3;
+            g_n_jcc_edges = 2;
+            return 1;
+        }
 
         a64_mov_imm64(b, JT1, retaddr);
         a64_sub_imm(b, 0, JTA, hs, 4);
@@ -15268,10 +15358,29 @@ static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
         /*
          * The return address goes through the same per-site cache and hash probe
          * an indirect jump does, keyed as a 32-bit block, instead of out to the
-         * dispatcher on every return.
+         * dispatcher on every return; first the host shadow, when the call that
+         * pushed it went through m32_ras_push.
          */
         if (!g_no_chain && !ENV_ON("OCERZ_NO_M32_RET_TAIL")) {
             (void)a64_try_orr_imm(b, 1, JT1, JT1, JIT_KEY_M32);
+            if (m32_ras_ok(insn)) {
+                a64_ldp_post(b, JTF, 30, 31, 16);
+                a64_subs_reg(b, 1, A64_ZR, JTF, JT1, 0);
+                uint32_t *stale = a64_label(b);
+                a64_bcond(b, A64_NE, 0);
+                uint32_t *null = a64_label(b);
+                a64_cbz(b, 1, 30, 0);
+                if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
+                a64_ret(b);
+                a64_patch_bcond(stale, a64_label(b));
+                a64_patch_cbz(null, a64_label(b));
+                /* The sentinel pair sits on the frame's saved registers: put it back. */
+                uint32_t *keep = a64_label(b);
+                a64_cbnz(b, 1, JTF, 0);
+                a64_sub_imm(b, 1, 31, 31, 16);
+                a64_patch_cbz(keep, a64_label(b));
+                if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
+            }
             g_ind_treg = JT1;
             g_ind_m32 = 1;
             emit_indirect_tail(b, epi_sites, n_epi);
@@ -15882,9 +15991,12 @@ static int emit_indirect32(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     } else {
         return 0;
     }
+    uint64_t retaddr = (uint32_t)(insn->rip + insn->len);
+    uint32_t *adr_site = NULL;
     if (insn->op == OCERZ_OP_CALL) {
         int hs = pin_hreg(pin_slot(OCERZ_RSP));
-        a64_mov_imm64(b, JT0, (uint32_t)(insn->rip + insn->len));
+        if (m32_ras_ok(insn)) adr_site = m32_ras_push(b, retaddr);
+        a64_mov_imm64(b, JT0, retaddr);
         a64_sub_imm(b, 0, JTA, hs, 4);
         m32_stack_st(b, JT0, JTA);
         a64_mov_reg(b, 0, hs, JTA);
@@ -15892,7 +16004,26 @@ static int emit_indirect32(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     (void)a64_try_orr_imm(b, 1, JT1, JT1, JIT_KEY_M32);
     g_ind_treg = JT1;
     g_ind_m32 = 1;
+    if (!adr_site) {
+        emit_indirect_tail(b, epi_sites, n_epi);
+        return 1;
+    }
+    uint32_t *cont = NULL;
+    g_ind_call_cont = &cont;
+    g_ind_call_tocont = NULL;
     emit_indirect_tail(b, epi_sites, n_epi);
+    uint32_t *to_cont = g_ind_call_tocont;
+    g_ind_call_cont = NULL;
+    assert(cont && to_cont && "32-bit indirect call: no continuation site");
+    patch_local_adr(adr_site, cont, JT0);
+    a64_patch_b(to_cont, a64_label(b));
+    uint32_t *pb_ret = emit_body_chain_tail(b, retaddr, 0, epi_sites, n_epi);
+    g_jcc_edge[0].target_rip = retaddr;
+    g_jcc_edge[0].patch_b = pb_ret;
+    g_jcc_edge[0].cond_site = NULL;
+    g_jcc_edge[0].kind = EDGE_BODY;
+    g_jcc_edge[0].pin_class = 3;
+    g_n_jcc_edges = 1;
     return 1;
 }
 
