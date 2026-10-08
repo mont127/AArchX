@@ -1,0 +1,32 @@
+o sample 1 1 0 deadbeefcafef001 deadbeefcafef001 1
+o acc 3b213acb8d5ce5d8
+no sample 0 0 0 deadbeefcafef000 deadbeefcafef000 0
+no acc 8df2683a2d6b5630
+b sample 1 1 0 deadbeefcafef001 deadbeefcafef001 1
+b acc 4a0391fd30d83190
+ae sample 0 0 0 deadbeefcafef000 deadbeefcafef000 0
+ae acc 7f10110889f00a78
+e sample 0 0 0 deadbeefcafef000 deadbeefcafef000 0
+e acc 946daabbb1ce4e8c
+ne sample 1 1 0 deadbeefcafef001 deadbeefcafef001 1
+ne acc 34a5f84a08f9ed7c
+be sample 1 1 0 deadbeefcafef001 deadbeefcafef001 1
+be acc 275c3d339573a6b8
+a sample 0 0 0 deadbeefcafef000 deadbeefcafef000 0
+a acc a1b765d225549550
+s sample 1 1 0 deadbeefcafef001 deadbeefcafef001 1
+s acc 6b7d8cea23237b7a
+ns sample 0 0 0 deadbeefcafef000 deadbeefcafef000 0
+ns acc 5d96161b97a4c08e
+p sample 0 0 0 deadbeefcafef000 deadbeefcafef000 0
+p acc 41f5841190d61f7d
+np sample 1 1 0 deadbeefcafef001 deadbeefcafef001 1
+np acc 871e1ef429f21c8b
+l sample 0 0 0 deadbeefcafef000 deadbeefcafef000 0
+l acc 134d9146cb7e4690
+ge sample 1 1 0 deadbeefcafef001 deadbeefcafef001 1
+ge acc b5c611beef49f578
+le sample 0 0 0 deadbeefcafef000 deadbeefcafef000 0
+le acc f0a63c7d3019bbb8
+g sample 1 1 0 deadbeefcafef001 deadbeefcafef001 1
+g acc d86d66888aae8050
