@@ -196,6 +196,8 @@ void a64_v_dup_d(A64Buf *b, int vd, int vn, int idx);
 void a64_v_dup_s(A64Buf *b, int vd, int vn, int idx);
 void a64_v_zip1(A64Buf *b, int esz, int vd, int vn, int vm);
 void a64_v_zip2(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_uzp1(A64Buf *b, int esz, int vd, int vn, int vm);
+void a64_v_uzp2(A64Buf *b, int esz, int vd, int vn, int vm);
 void a64_v_bsl(A64Buf *b, int vd, int vn, int vm);
 void a64_v_sshr_2d(A64Buf *b, int vd, int vn, int sh);
 void a64_ins_gpr(A64Buf *b, int esize, int vd, int idx, int rn);
