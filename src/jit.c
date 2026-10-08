@@ -9164,11 +9164,18 @@ static void l0_fixed_restore(A64Buf *b)
     }
     while (pend) {
         int r = -1;
+        /*
+         * Moving c into its fixed lane writes that lane, so c waits while another
+         * pending register still lives there: movaps xmm3, xmm2 leaves xmm3 in
+         * xmm2's lane, and when xmm2 is then zeroed and a back edge restores it,
+         * writing xmm2's lane first fed xmm3 the zero.  A float loop of compares
+         * and branches lost its running sum that way.
+         */
         for (int c = 0; c < 16 && r < 0; c++) {
             if (!(pend & (1u << c))) continue;
-            int u = g_l0[c], blocked = 0;
-            for (int o = 0; u >= 0 && o < 16; o++)
-                if (o != c && (pend & (1u << o)) && g_l0_fixed_lane[o] == u) blocked = 1;
+            int t = g_l0_fixed_lane[c], blocked = 0;
+            for (int o = 0; t >= 0 && o < 16; o++)
+                if (o != c && (pend & (1u << o)) && g_l0[o] == t) blocked = 1;
             if (!blocked) r = c;
         }
         if (r < 0) {
