@@ -17020,9 +17020,13 @@ static void lowhoist_mark(uint64_t key)
 static int select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
 {
     if (!ocerz_low_base || ocerz_guest_base != 0 || g_xlat_mode32 || g_pin_class != 3 || g_no_chain ||
-        !low_guard_fast_ok() || g_mem_hoist_greg >= 0 || n < 2 || ENV_ON("OCERZ_NO_LOW_HOIST") ||
-        lowhoist_marked(jit_key(rip, 0)))
+        !low_guard_fast_ok() || g_mem_hoist_greg >= 0 || n < 2 || ENV_ON("OCERZ_NO_LOW_HOIST"))
         return -1;
+    /* A block that bailed translates without the hoist: a learned variant, as the alignment marks make. */
+    if (lowhoist_marked(jit_key(rip, 0))) {
+        g_tc_learned = 1;
+        return -1;
+    }
     int cnt[16] = {0}, until[16], shut[16] = {0};
     int32_t lo[16] = {0}, hi[16] = {0};
     for (int r = 0; r < 16; r++) until[r] = n;
