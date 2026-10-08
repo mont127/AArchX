@@ -988,6 +988,21 @@ static const uint32_t *g_tc_entry;
 #define RASLIT_MAX 96
 static RasLit g_raslit[RASLIT_MAX];
 static int g_n_raslit;
+/* A 64-bit constant that takes three or four instructions to build is one load from the block's literal pool. */
+static void emit_const_lit(A64Buf *b, int rd, uint64_t v)
+{
+    int parts = 0;
+    for (int k = 0; k < 4; k++) parts += ((v >> (16 * k)) & 0xffff) != 0;
+    static int off = -1; if (off < 0) off = getenv("OCERZ_NO_CONST_LIT") ? 1 : 0;
+    if (parts < 3 || g_n_raslit >= RASLIT_MAX || off) { a64_mov_imm64(b, rd, v); return; }
+    g_raslit[g_n_raslit].site = a64_label(b);
+    g_raslit[g_n_raslit].retaddr = v;
+    g_raslit[g_n_raslit].kind = 1;
+    g_raslit[g_n_raslit].tcr = 0;
+    g_raslit[g_n_raslit].rt = rd;
+    g_n_raslit++;
+    a64_emit32(b, 0x58000000u | (uint32_t)(rd & 31));
+}
 typedef struct { _Alignas(16) uint64_t rip; void *body; } JitPscEnt;
 #define PSC_N 32
 /* An entry's rip word carries its column's retire generation above the address
@@ -4171,7 +4186,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
          */
         if (g_ea_is_const && ocerz_low_base && fold == 0 && ga < OCERZ_LOW_LIMIT && low_guard_fast_ok() &&
             !insn_stack_implicit(insn) && !ENV_ON("OCERZ_NO_RIP_LOWFOLD")) {
-            a64_mov_imm64(b, addr_reg, ga | ocerz_low_base);
+            emit_const_lit(b, addr_reg, ga | ocerz_low_base);
             g_ea_lowhoisted = 1;
             g_ea_lowhoisted_reg = addr_reg;
             return 1;
@@ -14102,9 +14117,11 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             uint32_t tmpw[128];
             A64Buf tb = { tmpw, tmpw, tmpw + 128, 0, 0 };
             __typeof__(g_ea_cache) saved = g_ea_cache;
+            int saved_lits = g_n_raslit;
             ea_cache_reset();
             int ok = emit_flag_neutral(&tb, gap) && !tb.overflow;
             g_ea_cache = saved;
+            g_n_raslit = saved_lits;
             if (!ok) return 0;
         }
     }
@@ -15736,7 +15753,7 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
 
         g_chain_target = target;
 
-        a64_mov_imm64(b, JT1, retaddr);
+        emit_const_lit(b, JT1, retaddr);
 
         int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
                     stack_fast() && !g_no_chain;
@@ -16589,7 +16606,7 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
                     !g_no_ras && ras_body_only() && !no_blret_i;
         if (fast3) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
-            a64_mov_imm64(b, JT2, retaddr);
+            emit_const_lit(b, JT2, retaddr);
             uint32_t *adr_site;
             if (host_ras_enabled()) {
                 adr_site = a64_label(b);
