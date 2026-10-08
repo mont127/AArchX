@@ -582,11 +582,17 @@ static void store_int(OcerzCPU *cpu, const X86Insn *insn, const X86Operand *op, 
         int64_t lim = (int64_t)1 << (size * 8 - 1);
         ok = x >= -lim && x < lim;
     }
+    /* C1 says whether an inexact store rounded away from zero */
+    cpu->fsw &= (uint16_t)~X87_C1;
     if (!ok) {
         x = (int64_t)(1ull << (size * 8 - 1));
         cpu->fsw |= X87_IE;
     } else if (inexact) {
         cpu->fsw |= X87_PE;
+        int64_t t = 0;
+        int ti = 0;
+        if (!truncate && st0_to_int(cpu, 3, &t, &ti) && t != x)
+            cpu->fsw |= X87_C1;
     }
     ocerz_st(ea, size, (uint64_t)x);
 }
