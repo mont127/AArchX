@@ -2611,6 +2611,13 @@ static void emit_stack_push64(A64Buf *b, const X86Insn *insn, int hs, int rv)
         emit_push_pinned(b, hs, rv);
         return;
     }
+    /* The Wine layout's slot is rsp - 8 plus the stack delta in x0, as push's; rsp moves once the store is done. */
+    if (g_lowstack && stack_plain_access_ok() && rv != JTA && !ENV_ON("OCERZ_NO_LOWSTACK_CALLRET")) {
+        a64_sub_imm(b, 1, JTA, hs, 8);
+        a64_str_regoff(b, 8, rv, JTA, JGB, 0);
+        a64_mov_reg(b, 1, hs, JTA);
+        return;
+    }
     a64_sub_imm(b, 1, JTA, hs, 8);
     uint32_t *skip = emit_commpage_guard(b, insn, JTA, NULL, NULL);
     g_ea_plain = stack_plain_now();
@@ -2627,6 +2634,11 @@ static void emit_stack_pop64(A64Buf *b, const X86Insn *insn, int hs, int rd)
             a64_ldr_regoff(b, 8, rd, JGB, hs, 0);
             a64_add_imm(b, 1, hs, hs, 8);
         }
+        return;
+    }
+    if (g_lowstack && stack_plain_access_ok() && rd != hs && !ENV_ON("OCERZ_NO_LOWSTACK_CALLRET")) {
+        a64_ldr_regoff(b, 8, rd, hs, JGB, 0);
+        a64_add_imm(b, 1, hs, hs, 8);
         return;
     }
     a64_mov_reg(b, 1, JTA, hs);
