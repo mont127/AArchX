@@ -4118,6 +4118,8 @@ static int emit_mem_ea32(A64Buf *b, const X86Insn *insn, const X86Operand *op, i
     return 1;
 }
 
+static int low_guard_fast_ok(void);
+static int insn_stack_implicit(const X86Insn *in);
 static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int addr_reg)
 {
     g_const_ea_valid = 0;
@@ -4141,9 +4143,21 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
             return 0;
     }
     if (op->riprel) {
-        a64_mov_imm64(b, addr_reg, (uint64_t)op->disp + fold);
+        uint64_t ga = (uint64_t)op->disp + fold;
         g_ea_is_const = seg == OCERZ_SEG_NONE;
-        g_ea_const = (uint64_t)op->disp + fold;
+        g_ea_const = ga;
+        /*
+         * Below 12 GB in the Wine layout the host address is a constant too: the
+         * guard's orr is folded into the mov, and the guard takes it as translated.
+         */
+        if (g_ea_is_const && ocerz_low_base && fold == 0 && ga < OCERZ_LOW_LIMIT && low_guard_fast_ok() &&
+            !insn_stack_implicit(insn) && !ENV_ON("OCERZ_NO_RIP_LOWFOLD")) {
+            a64_mov_imm64(b, addr_reg, ga | ocerz_low_base);
+            g_ea_lowhoisted = 1;
+            g_ea_lowhoisted_reg = addr_reg;
+            return 1;
+        }
+        a64_mov_imm64(b, addr_reg, ga);
         return 1;
     }
     if (insn->addrsize == 4) {
@@ -4450,6 +4464,10 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
     g_const_ea_valid = 0;
     if (g_ea_lowhoisted && addr_reg == g_ea_lowhoisted_reg) {
         g_ea_lowhoisted = 0;
+        if (g_ea_is_const) {
+            g_const_ea = g_ea_const;
+            g_const_ea_valid = 1;
+        }
         g_ea_is_const = 0;
         return NULL;
     }
