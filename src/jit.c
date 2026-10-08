@@ -738,7 +738,8 @@ typedef struct JitProf {
     uint32_t taken, ft;
     uint32_t *ft_site;
     uint32_t *tk_trip;
-    uint8_t windows, prev;
+    uint8_t windows, prev, rearms;
+    uint32_t ft_word, tk_word;  /* the probe's two branches, kept while it only watches the taken side */
 } JitProf;
 
 #define JIT_MAX_EDGES 8
@@ -1165,6 +1166,8 @@ static int g_n_side;
 
 #define FLIP_N 4096
 #define PROBE_BIT 10
+#define WATCH_BIT 16
+#define FLIP_REARMS 3
 #define PROBE_MAX 65536
 enum { FLIP_NONE = 0, FLIP_DECIDED_ORIG, FLIP_DECIDED_INV };
 static struct { uint64_t rip; uint8_t state; } g_flip[FLIP_N];
@@ -22747,10 +22750,22 @@ static int flip_decide_locked(JitBlock *blk, int e, int tk, int ft, int logit)
                 (unsigned long long)blk_rip(blk), (unsigned long long)jcc_rip, tk, ft, flip ? "invert" : "keep");
     blk->edges[e].probing = 0;
     if (!flip) {
+        /*
+         * A loop's first phase can differ from the rest (an array initialised
+         * one way, then settled), and every window can fall in it.  So a kept
+         * branch goes on counting its taken side, tripping at 2^WATCH_BIT, when
+         * flip_side_hit probes it again from scratch, FLIP_REARMS times at most.
+         */
         JitProf *pf = &blk->prof[blk->edges[e].side - 1];
+        static int norearm = -1; if (norearm < 0) norearm = getenv("OCERZ_NO_FLIP_REARM") ? 1 : 0;
+        int watch = !norearm && pf->rearms < FLIP_REARMS;
+        pf->ft_word = *pf->ft_site;
+        pf->tk_word = *pf->tk_trip;
+        uint32_t tk = watch ? (pf->tk_word & ~((1u << 31) | (0x1fu << 19))) | ((uint32_t)WATCH_BIT << 19) : A64_NOP;
+        if (watch) { pf->taken = 0; blk->edges[e].probing = 2; }
         pthread_jit_write_protect_np(0);
         __atomic_store_n(pf->ft_site, A64_NOP, __ATOMIC_RELEASE);
-        __atomic_store_n(pf->tk_trip, A64_NOP, __ATOMIC_RELEASE);
+        __atomic_store_n(pf->tk_trip, tk, __ATOMIC_RELEASE);
         pthread_jit_write_protect_np(1);
         sys_icache_invalidate(pf->ft_site, 4);
         sys_icache_invalidate(pf->tk_trip, 4);
@@ -22777,6 +22792,31 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     if (fliplog < 0) {
         fliplog = getenv("OCERZ_FLIPLOG") ? 1 : 0;
         if (fliplog) { g_flip_atexit_jit = jit; atexit(flip_report_atexit); }
+    }
+    if (blk->edges[e].probing == 2) {
+        JitProf *wp = &blk->prof[k];
+        jl_acquire(__LINE__);
+        if (blk->live_idx >= jit->n_live || jit->live[blk->live_idx] != blk || blk->edges[e].probing != 2) {
+            jl_release();
+            return;
+        }
+        int fi = flip_find(blk->edges[e].jcc_rip, 0);
+        if (fi >= 0) g_flip[fi].state = FLIP_NONE;
+        wp->taken = wp->ft = 0;
+        wp->windows = 0;
+        wp->rearms++;
+        pthread_jit_write_protect_np(0);
+        __atomic_store_n(wp->ft_site, wp->ft_word, __ATOMIC_RELEASE);
+        __atomic_store_n(wp->tk_trip, wp->tk_word, __ATOMIC_RELEASE);
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(wp->ft_site, 4);
+        sys_icache_invalidate(wp->tk_trip, 4);
+        blk->edges[e].probing = 1;
+        jl_release();
+        if (fliplog)
+            fprintf(stderr, "ocerz: FLIP[%d] blk=%#llx jcc=%#llx kept side hot again -> probe (%d)\n", (int)getpid(),
+                    (unsigned long long)blk_rip(blk), (unsigned long long)blk->edges[e].jcc_rip, wp->rearms);
+        return;
     }
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     g_flip_n_hit++;
