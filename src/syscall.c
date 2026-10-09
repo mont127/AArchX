@@ -6835,6 +6835,63 @@ static void mig_vm_refuse_taken(uint64_t reply_buf, uint64_t size)
         }
 }
 
+/*
+ * Whether a host range about to be moved into the guest can be seen by anyone
+ * else.  Moving it used to switch the whole process to ordered memory, on the
+ * grounds that a mach VM reply may hand over memory shared with another
+ * process.  Most do not: libsystem_trace maps a private 256 KB buffer (tag
+ * VM_MEMORY_GENEALOGY) and a read-only copy-on-write table that way, in nearly
+ * every program that logs, so a single-threaded SQLite run went ordered for
+ * them and took 0.62 s where plain takes 0.45 (Rosetta 0.30).  A region that
+ * is private (or aliased only within this task), empty, or copy-on-write
+ * without write permission has no other observer, nor has a hole; anything
+ * else still asks for ordered memory, as does a range that cannot be
+ * inspected.
+ * OCERZ_NO_REMAP_PLAIN=1 asks for it on every relocation again.
+ */
+static int host_range_shared(uint64_t addr, uint64_t size)
+{
+    static int always = -1;
+    if (always < 0)
+        always = getenv("OCERZ_NO_REMAP_PLAIN") ? 1 : 0;
+    if (always)
+        return 1;
+    uint64_t end = addr + size;
+    while (addr < end) {
+        mach_vm_address_t a = addr;
+        mach_vm_size_t sz = 0;
+        vm_region_extended_info_data_t ei;
+        mach_msg_type_number_t c = VM_REGION_EXTENDED_INFO_COUNT;
+        mach_port_t obj = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&ei, &c,
+                           &obj) != KERN_SUCCESS)
+            return 1;
+        if (obj != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), obj);
+        if (sz == 0)
+            return 1;
+        if (a >= end)
+            break;
+        int priv = ei.share_mode == SM_PRIVATE || ei.share_mode == SM_PRIVATE_ALIASED || ei.share_mode == SM_EMPTY;
+        if (!priv && ei.share_mode == SM_COW) {
+            mach_vm_address_t b = a;
+            mach_vm_size_t bs = 0;
+            vm_region_basic_info_data_64_t bi;
+            mach_msg_type_number_t bc = VM_REGION_BASIC_INFO_COUNT_64;
+            if (mach_vm_region(mach_task_self(), &b, &bs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &bc,
+                               &obj) != KERN_SUCCESS)
+                return 1;
+            if (obj != MACH_PORT_NULL)
+                mach_port_deallocate(mach_task_self(), obj);
+            priv = b == a && !(bi.max_protection & VM_PROT_WRITE);
+        }
+        if (!priv)
+            return 1;
+        addr = a + sz;
+    }
+    return 0;
+}
+
 static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
                                   int preserve_address,
                                   uint64_t requested_size,
@@ -6920,7 +6977,8 @@ static void mig_vm_reply_relocate(OcerzVM *vm, uint64_t reply_buf,
         (mach_vm_address_t)(uintptr_t)ocerz_g2h(gaddr);
     mach_vm_address_t dst = host_dst;
     vm_prot_t curp = 0, maxp = 0;
-    ocerz_jit_require_ordered(vm);
+    if (host_range_shared(haddr, size))
+        ocerz_jit_require_ordered(vm);
     kern_return_t kr = mach_vm_remap(mach_task_self(), &dst, size, 0,
                                      VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
                                      mach_task_self(), haddr, FALSE,
