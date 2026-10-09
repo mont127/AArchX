@@ -2535,6 +2535,8 @@ struct seg_ent { uint64_t lo, hi, mh; };
 #define SEG_MAX 32768
 static struct seg_ent g_segs[SEG_MAX];
 static int g_segs_n;
+static OcerzCache *g_segs_cache;
+static int g_segs_built;
 static int seg_cmp(const void *a, const void *b)
 {
     const struct seg_ent *x = a, *y = b;
@@ -2567,15 +2569,19 @@ static void build_segs(OcerzCache *cache)
     }
     qsort(g_segs, g_segs_n, sizeof(struct seg_ent), seg_cmp);
 }
-static int seg_index(uint64_t addr)
+static int seg_search(const struct seg_ent *segs, int n, uint64_t addr)
 {
-    int lo = 0, hi = g_segs_n - 1, best = -1;
+    int lo = 0, hi = n - 1, best = -1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
-        if (g_segs[mid].lo <= addr) { best = mid; lo = mid + 1; }
+        if (segs[mid].lo <= addr) { best = mid; lo = mid + 1; }
         else hi = mid - 1;
     }
-    return best >= 0 && addr < g_segs[best].hi ? best : -1;
+    return best >= 0 && addr < segs[best].hi ? best : -1;
+}
+static int seg_index(uint64_t addr)
+{
+    return seg_search(g_segs, g_segs_n, addr);
 }
 
 
@@ -2627,6 +2633,43 @@ static unsigned delayed_slot(uint64_t mh)
     return at;
 }
 
+/*
+ * The segments of the eager images alone, which is where nearly every pointer
+ * scan_uses reads leads; it searches them first, and g_segs - every segment of
+ * all 3,900 cache images, whose headers it takes 4 ms to read - only for a
+ * pointer that leads elsewhere.  Rebuilt when the set has grown since.
+ */
+static struct seg_ent g_esegs[SEG_MAX];
+static int g_esegs_n, g_esegs_of = -1;
+
+static int eseg_index(uint64_t addr)
+{
+    if (g_esegs_of != g_eager_n) {
+        g_esegs_n = 0;
+        for (int i = 0; i < g_eager_n; i++) {
+            const uint8_t *h = (const uint8_t *)ocerz_g2h(g_eager[i]);
+            if (rd32(h) != MH_MAGIC_64)
+                continue;
+            int64_t slide = image_slide_d(g_eager[i]);
+            uint32_t ncmds = rd32(h + 16);
+            const uint8_t *lc = h + sizeof(struct mach_header_64);
+            for (uint32_t n = 0; n < ncmds; n++, lc += rd32(lc + 4)) {
+                const struct segment_command_64 *sg = (const void *)lc;
+                if (sg->cmd != LC_SEGMENT_64 || !sg->vmsize || g_esegs_n >= SEG_MAX ||
+                    strncmp(sg->segname, "__LINKEDIT", 16) == 0)
+                    continue;
+                g_esegs[g_esegs_n].lo = sg->vmaddr + slide;
+                g_esegs[g_esegs_n].hi = sg->vmaddr + slide + sg->vmsize;
+                g_esegs[g_esegs_n].mh = g_eager[i];
+                g_esegs_n++;
+            }
+        }
+        qsort(g_esegs, g_esegs_n, sizeof(struct seg_ent), seg_cmp);
+        g_esegs_of = g_eager_n;
+    }
+    return seg_search(g_esegs, g_esegs_n, addr);
+}
+
 static void scan_uses(uint64_t mh)
 {
     int64_t slide = image_slide_d(mh);
@@ -2658,6 +2701,16 @@ static void scan_uses(uint64_t mh)
                         uint64_t v = rd64((const uint8_t *)ocerz_g2h(pp));
                         if (v >= last_lo && v < last_hi)
                             continue;
+                        int ea = eseg_index(v);
+                        if (ea >= 0) {
+                            last_lo = g_esegs[ea].lo;
+                            last_hi = g_esegs[ea].hi;
+                            continue;
+                        }
+                        if (!g_segs_built) {
+                            build_segs(g_segs_cache);
+                            g_segs_built = 1;
+                        }
                         int at = seg_index(v);
                         if (at < 0)
                             continue;
@@ -2672,6 +2725,43 @@ static void scan_uses(uint64_t mh)
         lc += l->cmdsize;
     }
 }
+/*
+ * Cache images with a link eager_add_direct_deps could not resolve.  The
+ * pointer scan is for links the walk did not follow: a cache image whose links
+ * all resolved was bound by the cache builder to those images and no others,
+ * so its pointers lead nowhere the walk has not been (but into delayed-init
+ * images, which stay out).  Scanning every cache image read 830,000 pointers
+ * for a program that links only CoreFoundation, 22 ms of each launch, and in
+ * CoreFoundation, Foundation, AppKit and Swift programs found nothing.  Weak
+ * links to images the system does not have (libobjc-env, for one) do not
+ * count.  OCERZ_SCAN_ALL_USES=1 scans every image again.
+ */
+#define UNRES_MAX 256
+static uint64_t g_unres[UNRES_MAX];
+static int g_unres_n;
+
+static int dylib_lc_is_weak(const uint8_t *lc)
+{
+    if (rd32(lc) == LC_LOAD_WEAK_DYLIB)
+        return 1;
+    return rd32(lc) == LC_LOAD_DYLIB && rd32(lc + 4) >= sizeof(struct dylib_use_command) &&
+           rd32(lc + 8) == sizeof(struct dylib_use_command) && rd32(lc + 12) == DYLIB_USE_MARKER &&
+           (rd32(lc + 24) & DYLIB_USE_WEAK_LINK);
+}
+
+static int scan_needed(OcerzCache *cache, uint64_t mh)
+{
+    static int all = -1;
+    if (all < 0)
+        all = getenv("OCERZ_SCAN_ALL_USES") ? 1 : 0;
+    if (all || !ocerz_cache_has_image(cache, mh))
+        return 1;
+    for (int i = 0; i < g_unres_n; i++)
+        if (g_unres[i] == mh)
+            return 1;
+    return 0;
+}
+
 static void eager_add_direct_deps(OcerzCache *cache, uint64_t mh)
 {
     const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
@@ -2686,6 +2776,9 @@ static void eager_add_direct_deps(OcerzCache *cache, uint64_t mh)
             uint32_t noff = rd32(lc + 8);
             if (noff < rd32(lc + 4)) {
                 uint64_t dmh = dep_mh(cache, (const char *)(lc + noff));
+                if (!dmh && !dylib_lc_is_weak(lc) && !ocerz_dylib_dep_delayed(lc) &&
+                    g_unres_n < UNRES_MAX && (!g_unres_n || g_unres[g_unres_n - 1] != mh))
+                    g_unres[g_unres_n++] = mh;
                 if (!ocerz_dylib_dep_delayed(lc))
                     eager_add(dmh);
                 else if (dmh)
@@ -2745,7 +2838,10 @@ static int closure_links_cf(OcerzCache *cache, uint64_t main_mh)
 
 static void compute_eager_set(OcerzCache *cache, uint64_t main_mh)
 {
-    build_segs(cache);
+    g_segs_cache = cache;
+    g_segs_built = 0;
+    g_esegs_of = -1;
+    g_unres_n = 0;
     g_eager_n = 0;
     eager_add(main_mh);
     eager_add_direct_deps(cache, main_mh);
@@ -2762,7 +2858,8 @@ static void compute_eager_set(OcerzCache *cache, uint64_t main_mh)
     for (int i = 0, s = 0; s < g_eager_n; s++) {
         for (; i < g_eager_n; i++)
             eager_add_direct_deps(cache, g_eager[i]);
-        scan_uses(g_eager[s]);
+        if (scan_needed(cache, g_eager[s]))
+            scan_uses(g_eager[s]);
     }
     if (getenv("OCERZ_INITLOG"))
         fprintf(stderr, "dynamic: eager init set: root=%d eager=%d (of closure)\n", root_n, g_eager_n);
