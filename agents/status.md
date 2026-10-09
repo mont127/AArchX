@@ -18,7 +18,15 @@
 | interp.c | 1913 | - | C |
 | interp_ext.c | 763 | - | C |
 | interp_sse.c | 2542 | - | C |
-| jit.c | 23531 | - | C |
+| jit.c | 2844 | - | C, split core; see jit-split.md |
+| jit_cache.c | 3185 | - | C, split cache/lifecycle/fault recovery |
+| jit_control.c | 2070 | - | C, split control/callouts |
+| jit_flags.c | 2778 | - | C, split flags/liveness/branches |
+| jit_fp.c | 3203 | - | C, split FP batches/x87 |
+| jit_integer.c | 2678 | - | C, split integer emitters |
+| jit_memory.c | 2184 | - | C, split addressing/guards |
+| jit_simd.c | 3121 | - | C, split SIMD emitters |
+| jit_tcache.c | 1063 | - | C, split translation-cache serialization |
 | loader.c | 378 | - | C |
 | main.c | 419 | - | C |
 | mem.c | 2342 | - | C |
