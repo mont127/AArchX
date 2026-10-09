@@ -29,7 +29,7 @@
 | jit_tcache.c | 1063 | jit-tcache-agent | in progress |
 | loader.c | 378 | - | C |
 | main.c | 419 | - | C |
-| mem.c | 2342 | - | C |
+| mem.c | 2342 | memvm | ported |
 | objcbridge.c | 3543 | native2 | in progress |
 | objcclass.c | 1609 | native2 | in progress |
 | stack.c | 137 | - | C |
@@ -37,7 +37,7 @@
 | syscall.c | 8906 | devin-9aa5caef | in progress |
 | tcache.c | 863 | - | C |
 | vdylib.c | 1424 | native1 | in progress |
-| vm.c | 4376 | - | C |
+| vm.c | 4376 | memvm | in progress |
 | x87.c | 1277 | - | C |
 | abicall.s | 237 | native1 | in progress |
 | leaf.s | 598 | native1 | in progress |
