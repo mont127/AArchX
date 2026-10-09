@@ -883,6 +883,7 @@ run_file_case dnan_contexts tests/dynamic/nan_contexts.c 'OK'
 run_file_case dupward_init tests/dynamic/upward_init.c 'OK' -framework CoreFoundation
 run_file_case dcache_symlink_dep tests/dynamic/cache_symlink_dep.c 'OK'
 run_file_case dsysv_shm tests/dynamic/sysv_shm.c 'OK'
+run_golden_case dsysv_shm_fork tests/dynamic/sysv_shm_fork.c tests/dynamic/sysv_shm_fork.out
 run_file_case ddlopen_image_list tests/dynamic/dlopen_image_list.c 'OK'
 run_file_case ddlopen_cryptex tests/dynamic/dlopen_cryptex.c 'OK'
 run_file_case ddlopen_cache_alias tests/dynamic/dlopen_cache_alias.c 'OK'
