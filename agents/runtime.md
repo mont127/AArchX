@@ -96,6 +96,35 @@ expected `dtest_jcc_gap_low` failures no longer reproduced. `dyn.new` was
 empty. The native framework and native format phases passed; no i386 phase
 log was produced.
 
+## Mach VM extern follow-up
+
+The pre-edit release build reported clashing declarations for
+`mach_vm_remap` and `mach_vm_region`. Bindgen exposes only the
+`ocerz_sys_mach_vm_remap` / `ocerz_sys_mach_vm_region` shims, and libc has no
+raw declarations for either function, so the declarations follow the active
+SDK prototypes in `mach/mach_vm.h`. The SDK defines `vm_inherit_t` as unsigned
+int and `vm_region_info_t` as `int *`; `boolean_t` and `vm_prot_t` are `int`.
+
+| Symbol | Declaration sites and prior varying argument | Aligned signature |
+|---|---|---|
+| `mach_vm_remap` | `cache/map.rs` (`c_int`), `mem.rs` (`c_int`), `sysbridge/mem.rs` (`libc::vm_inherit_t`), `syscall/bsd.rs` (`i32`), `syscall/mach.rs` (`c_int`) | The task/address/size/mask/flags/copy/protection/return types otherwise match; `inheritance` is `libc::vm_inherit_t` (`u32`) at all five sites. |
+| `mach_vm_region` | `mem.rs` (`*mut c_void`), `sysbridge/mem.rs` (`*mut c_void`), `syscall/mach.rs` (`*mut c_void`), `vm/mod.rs` (`vm_region_info_t`) | The task/address/size/flavor/info-count/object-name/return types otherwise match; `info` is `*mut c_int` / `vm_region_info_t` at all four sites. |
+
+The initially reported mismatches were `cache/map.rs` versus
+`sysbridge/mem.rs` for `mach_vm_remap`, and `mem.rs` versus `vm/mod.rs` for
+`mach_vm_region`; source audit found the additional duplicate declarations
+listed above before the final build. Argument and constant types were updated
+without changing their numeric values. The SDK prototypes for
+`clock_gettime_nsec_np(clockid_t) -> uint64_t` and
+`sys_icache_invalidate(void *, size_t)` were also checked; neither had a
+clashing declaration on this tip and neither needed editing.
+
+After alignment, `cargo build --release` reported zero
+`clashing_extern_declarations`. The executable text hash remained
+`a5732e0c7f5fc3d0a0e40ce14b62de9f981b78dd` before and after. The fast gate
+passed (`100` differential passes, `0` failures; `GATE: PASS`). Logs are in
+`~/clash_before.log`, `~/clash_after.log`, and `~/clash_fast_gate.log`.
+
 ## tcache
 
 Ported `src/tcache.c` to `rust/src/ported/tcache/`, split into `store`, `io`,
@@ -192,6 +221,65 @@ passed with no new failures. The full-gate diff32 log recorded 40,044 passed /
 0 failed and 107,410 translated blocks; no i386 phase log was produced.
 The native framework phase passed. Dynamic tests reported 280 passed and
 7 expected failures; `dyn.new` was empty.
+
+### Put-path disassembly and profiler follow-up
+
+I compared `otool -tV` output from the C and Rust benchmark drivers for
+`ocerz_tcache_put`, handoff, the writer loop, and stored writes. Both put
+paths perform the same null/size/alignment validation, lock with pthread
+mutexes, and call libc `memcpy` to copy records into the 256 KiB buffer. The
+handoff paths use the same detached `pthread_create`, condition wait/signal,
+and queue pattern. The writer paths both use raw-LZ4 compression with the
+same scratch and 512 KiB output sizing, copy stored payloads with `memcpy`,
+zero padding with `bzero`, and write with the same `pwrite` flow. Rust's
+`store_buffer` body is inlined into its writer entry; its queue shift calls
+`memmove`, while the C compiler emits `___memmove_chk`. The Rust path adds no
+panic/bounds-check branch or stronger atomic operation in these paths; the
+mapped-index atomics are not on the put-copy path. No implementation
+difference explaining a put slowdown was found.
+
+`sample` profiled alternating 500,000-record puts into fresh directories.
+One initial C capture ended before the workload and had no samples; the
+second C capture and both Rust captures showed the same split. On the C
+translator thread, 140 of 171 samples were in
+`ocerz_tcache_put -> hand_off_locked -> pthread_cond_wait`; on the Rust
+translator thread, 141–142 of 166–173 samples were in the corresponding
+handoff wait. The C writer's top path was `writer_main -> store_buffer ->
+compression_encode_buffer` (152 compressor samples), with eight `pwrite`
+samples. The Rust writer's top path was `writer_main_entry ->
+compression_encode_buffer` (146–148 compressor samples), with seven to
+eight `pwrite` samples. Both profiles therefore show the translator waiting
+for the writer and the writer spending its time in the same compression/I/O
+work, rather than a Rust-only put-copy cost. Evidence is in
+`~/tcache_profile_c2.sample`, `~/tcache_profile_rust1.sample`,
+`~/tcache_profile_rust2.sample`, `~/tcache_asm_c.s`, and
+`~/tcache_asm_rust.s`.
+
+I reran five alternating benchmark pairs. The no-handoff sample used the
+existing 2,000-call short-record loop; the 50,000-record columns include
+handoff/backpressure, and the total column includes final flush:
+
+| Pair | Order | Fast put C / Rust | Put loop C / Rust | Loop + flush C / Rust |
+|---|---|---:|---:|---:|
+| 1 | C then Rust | 10.00 / 13.00 | 488.14 / 438.58 | 521.38 / 478.26 |
+| 2 | Rust then C | 15.50 / 9.50 | 467.98 / 459.88 | 506.74 / 493.38 |
+| 3 | C then Rust | 32.50 / 44.00 | 518.28 / 525.96 | 557.38 / 572.76 |
+| 4 | Rust then C | 28.50 / 23.00 | 544.60 / 526.74 | 581.44 / 571.96 |
+| 5 | C then Rust | 32.50 / 32.00 | 533.04 / 530.36 | 570.66 / 566.32 |
+| Median | — | 28.50 / 23.00 | 518.28 / 525.96 | 557.38 / 566.32 |
+
+Values are ns/call or ns/record as applicable. The loop medians differ by
+1.5% and loop-plus-flush medians by 1.6%; the no-handoff median is lower for
+Rust, with substantial run-to-run variation in both trees. The paired
+total-minus-loop estimate of flush/queued work is 37.62 ns/record C and
+39.68 Rust. This is not a precise writer-only split, but it does not support
+the earlier 8.7% put delta as a stable regression. No tcache implementation
+change was made.
+
+The repeat cross-tree format run again reported `HASH MATCH` in both
+directions (`8a8582ad476c0930`); both fingerprints were
+`tc-1f7a1d02e4d5c59e`, and the fresh index and `d-1.td` files were
+byte-identical. Timing and format output is in `~/tcache_followup_5runs.log`.
 
 ## main
 
