@@ -914,6 +914,7 @@ void a64_stlur(A64Buf *b, int size, int rt, int rn, int32_t simm9)
 }
 
 void a64_dmb_ishld(A64Buf *b) { a64_emit32(b, 0xd50339bfu); }
+void a64_dmb_ishst(A64Buf *b) { a64_emit32(b, 0xd5033abfu); }
 void a64_v_sshl(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e204400u | ((uint32_t)esz << 22), vd, vn, vm); }
 void a64_v_ushl(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e204400u | ((uint32_t)esz << 22), vd, vn, vm); }
 void a64_v_umull_h(A64Buf *b, int hi, int vd, int vn, int vm) { v3(b, hi ? 0x6e60c000u : 0x2e60c000u, vd, vn, vm); }

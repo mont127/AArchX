@@ -13966,6 +13966,41 @@ static int m32_inline_ok(const X86Insn *insn)
  * gets.  Where the commpage says userspace cannot read the timer, or under
  * OCERZ_NO_INLINE_RDTSC=1, it stays a call-out.
  */
+/*
+ * mfence is a full barrier, for the one order translated code does not keep
+ * otherwise: a store, then a load.  lfence orders earlier loads before
+ * everything after it and sfence earlier stores before later stores, which are
+ * dmb ishld and dmb ishst.  An lfence beside rdtsc or rdtscp is there to keep
+ * the counter read from moving past the instructions around it, which the
+ * translation's read does not do anyway (the commpage's timer is the
+ * non-speculative one, or isb goes first), so it is dropped.  The x86
+ * mach_absolute_time is lfence, rdtsc, lfence, and SQLite calls it around
+ * every statement: 15.7 ns a call with two dmb ish, 12.4 without (Rosetta
+ * 8.1).  OCERZ_NO_LIGHT_FENCE=1 makes every fence a dmb ish again.
+ */
+static int emit_fence(A64Buf *b, const X86Insn *insn)
+{
+    static int light = -1;
+    if (light < 0)
+        light = getenv("OCERZ_NO_LIGHT_FENCE") ? 0 : 1;
+    if (!light || insn->op == OCERZ_OP_MFENCE) {
+        a64_dmb_ish(b);
+        return 1;
+    }
+    if (insn->op == OCERZ_OP_SFENCE) {
+        a64_dmb_ishst(b);
+        return 1;
+    }
+    if (g_cur_insns && insn == &g_cur_insns[g_cur_insn_idx]) {
+        for (int k = g_cur_insn_idx - 1; k <= g_cur_insn_idx + 1; k += 2)
+            if (k >= 0 && k < g_cur_insns_n &&
+                (g_cur_insns[k].op == OCERZ_OP_RDTSC || g_cur_insns[k].op == OCERZ_OP_RDTSCP))
+                return 1;
+    }
+    a64_dmb_ishld(b);
+    return 1;
+}
+
 #define RDTSC_COMMPAGE_OFFSET 0x0000000FFFFFC088ull
 #define RDTSC_COMMPAGE_KIND   0x0000000FFFFFC090ull
 static int emit_rdtsc(A64Buf *b, const X86Insn *insn)
@@ -14056,10 +14091,8 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         return 1;
     if (insn->op == OCERZ_OP_RDTSC || insn->op == OCERZ_OP_RDTSCP)
         return emit_rdtsc(b, insn);
-    if (insn->op == OCERZ_OP_MFENCE || insn->op == OCERZ_OP_LFENCE || insn->op == OCERZ_OP_SFENCE) {
-        a64_dmb_ish(b);
-        return 1;
-    }
+    if (insn->op == OCERZ_OP_MFENCE || insn->op == OCERZ_OP_LFENCE || insn->op == OCERZ_OP_SFENCE)
+        return emit_fence(b, insn);
     if (insn->op == OCERZ_OP_SIDT || insn->op == OCERZ_OP_SGDT)
         return emit_sidt(b, insn);
     if ((insn->op == OCERZ_OP_XOR || insn->op == OCERZ_OP_CWD) && g_cur_insns && insn == &g_cur_insns[g_cur_insn_idx] &&

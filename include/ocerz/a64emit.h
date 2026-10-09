@@ -57,6 +57,7 @@ void a64_ldapurs(A64Buf *b, int size, int sf, int rt, int rn, int32_t simm9);
 void a64_stlur(A64Buf *b, int size, int rt, int rn, int32_t simm9);
 void a64_dmb_ish(A64Buf *b);
 void a64_dmb_ishld(A64Buf *b);
+void a64_dmb_ishst(A64Buf *b);
 void a64_ldrsb(A64Buf *b, int sf, int rt, int rn, uint32_t off);
 void a64_ldrsh(A64Buf *b, int sf, int rt, int rn, uint32_t off);
 void a64_ldrsw(A64Buf *b, int rt, int rn, uint32_t off);
