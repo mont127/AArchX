@@ -709,6 +709,8 @@ static DynImage g_dimgs[DYN_DIMG_MAX];
 static int g_dimgs_n;
 static DynImage g_main_dimg;
 static int g_main_dimg_valid;
+/* the main executable while it and its disk dylibs are bound, before g_main_dimg holds it */
+static DynImage *g_main_loading;
 static char g_main_hostpath[1024];
 static uint64_t g_main_dev, g_main_ino;
 
@@ -1647,6 +1649,21 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
     static int weak_all_cache = -1;
     if (weak_all_cache < 0)
         weak_all_cache = getenv("OCERZ_WEAK_ALL_CACHE") ? 1 : 0;
+    /*
+     * A weak-def lookup takes the first image in load order that has weak
+     * definitions and exports the symbol, and the main executable comes first
+     * (dyld-1378, Loader::resolveSymbol).  A program's own operator new, or
+     * its own copy of a template, is the one its weak binds get, not the
+     * shared cache's.  OCERZ_NO_WEAK_MAIN_FIRST=1 asks the cache first again.
+     */
+    static int weak_main_first = -1;
+    if (weak_main_first < 0)
+        weak_main_first = getenv("OCERZ_NO_WEAK_MAIN_FIRST") ? 0 : 1;
+    if (!found && libord == BIND_SPECIAL_DYLIB_WEAK_LOOKUP && weak_main_first) {
+        DynImage *first = g_main_dimg_valid ? &g_main_dimg : g_main_loading;
+        if (first && (rd32(first->slice + 24) & MH_WEAK_DEFINES))
+            value = ocerz_image_self_resolve_ex(first, name, &found);
+    }
     /* A main-executable ordinal means the main executable first, as dyld does:
        a bundle's import of Sleep is its launcher's (Feral's), not the legacy
        CoreServices Sleep the flat search below would find. */
@@ -2092,14 +2109,21 @@ static void flat_flush(OcerzCache *cache)
     g_flat_pending_n = g_flat_pending_cap = 0;
 }
 
+/*
+ * The weak-bind stream (weak_stream) names no library: each of its binds is a
+ * weak-def lookup, which is how dyld runs it.  ocerz took it as ordinal 0, the
+ * image itself, but asked the whole cache first, so every template copy a C++
+ * program binds to itself was a search of 3,900 images that found nothing:
+ * 1,743 of them, 621 ms, in ffmpeg -version.
+ */
 static void classic_bind_stream(DynImage *img, OcerzCache *cache,
-                                const uint8_t *p, const uint8_t *end, int is_lazy)
+                                const uint8_t *p, const uint8_t *end, int is_lazy, int weak_stream)
 {
     ClassicMemo memo = { 0 };
     uint64_t addr = 0;
     const char *name = "";
     int64_t addend = 0;
-    int libord = 0;
+    int libord = weak_stream ? BIND_SPECIAL_DYLIB_WEAK_LOOKUP : 0;
     int weak = 0;
     int done = 0;
     while (p < end && !done) {
@@ -2298,6 +2322,14 @@ static int apply_legacy_relocations(DynImage *img, OcerzCache *cache)
     return OCERZ_OK;
 }
 
+static int weak_stream_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("OCERZ_NO_WEAK_STREAM") ? 0 : 1;
+    return on;
+}
+
 static int apply_classic_fixups(DynImage *img, OcerzCache *cache)
 {
     if (!img->has_dyld_info)
@@ -2305,13 +2337,14 @@ static int apply_classic_fixups(DynImage *img, OcerzCache *cache)
     classic_rebase(img);
     if (img->bind_size)
         classic_bind_stream(img, cache, img->slice + img->bind_off,
-                            img->slice + img->bind_off + img->bind_size, 0);
+                            img->slice + img->bind_off + img->bind_size, 0, 0);
     if (img->weak_bind_size)
         classic_bind_stream(img, cache, img->slice + img->weak_bind_off,
-                            img->slice + img->weak_bind_off + img->weak_bind_size, 0);
+                            img->slice + img->weak_bind_off + img->weak_bind_size, 0,
+                            weak_stream_enabled());
     if (img->lazy_bind_size)
         classic_bind_stream(img, cache, img->slice + img->lazy_bind_off,
-                            img->slice + img->lazy_bind_off + img->lazy_bind_size, 1);
+                            img->slice + img->lazy_bind_off + img->lazy_bind_size, 1, 0);
     return OCERZ_OK;
 }
 
@@ -6043,6 +6076,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     RpathList main_rpaths;
     collect_rpaths(&img, NULL, &main_rpaths);
     g_flat_defer = ocerz_mode == OCERZ_MODE_NATIVE;
+    g_main_loading = &img;
     load_disk_deps(&cache, &img, &main_rpaths);
     flat_flush(&cache);
 
@@ -6116,6 +6150,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     g_main_dimg = img;
     g_main_dimg.owned_buf = buf;
     g_main_dimg_valid = 1;
+    g_main_loading = NULL;
     buf = NULL;
     free(buf);
 
