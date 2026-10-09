@@ -7,7 +7,7 @@
 //! needed, handed to the real arm64 function in the host library, and the result
 //! is put back where x86 code expects to find it.
 
-mod common;
+pub(crate) mod common;
 mod host;
 mod lookup;
 mod specials;
