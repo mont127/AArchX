@@ -14,3 +14,9 @@ Run `bash tools/bench/a64emit_bench.sh` to compare against `~/AArchX-c`. Both ru
 | 2 | `a64_mov_imm64` | 6.852 | 7.164 |
 | 2 | four `a64_try_*_imm` | 3.992 | 3.791 |
 | 2 | random mix | 9.147 | 8.709 |
+
+## stack
+
+Ported initial guest stack construction to `rust/src/ported/stack.rs`, preserving the C layout, allocation failures, log format, and guest-memory stores. Re-exported the existing sysbridge guest-memory helpers crate-wide rather than duplicating address translation and store logic; no stack-layout deviations. Stack setup runs once per process and is not a hot path, so no benchmark was needed.
+
+Verification: `make -j12 ocerz` passed with a single `T _ocerz_setup_stack` and no `src/stack.o`; `OCERZ_NO_ARM_EXEC=1 tests/unit/bin/test_loader` passed (54 checks, 0 failures). The `-v` args guest log matched C (`argc=4 envc=39 unixthread`, 16-byte-aligned RSP, `stack_hi-rsp=0x900`). `bash tools/rust_gate.sh --fast` passed; `diff32` ran 40,044 sequences with 0 failures and translated 107,410 JIT blocks.
