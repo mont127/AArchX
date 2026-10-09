@@ -1,0 +1,3 @@
+FAIL tests/unit/test_apidb.c:359: cannot read runtime/apis/macos/27.0/CoreFoundation.api (run from the repository root)
+FAIL tests/unit/test_apidb.c:359: cannot read runtime/apis/macos/27.0/libSystem.B.dylib.api (run from the repository root)
+unit:test_apidb rc=1
