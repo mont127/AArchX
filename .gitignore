@@ -14,3 +14,4 @@ tools/cxx/build/
 tools/swift/build/
 runtime/guest/
 runtime/apis/
+rust/target/
