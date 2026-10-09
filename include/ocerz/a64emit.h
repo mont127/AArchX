@@ -227,6 +227,7 @@ void a64_addv_b_8b(A64Buf *b, int vd, int vn);
 void a64_v_sshr_4s(A64Buf *b, int vd, int vn, int sh);
 void a64_v_fcmeq(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_v_uminv_4s(A64Buf *b, int vd, int vn);
+void a64_v_umaxv_4s(A64Buf *b, int vd, int vn);
 void a64_v_bit(A64Buf *b, int vd, int vn, int vm);
 void a64_v_bif(A64Buf *b, int vd, int vn, int vm);
 void a64_fmaxv_4s(A64Buf *b, int vd, int vn);

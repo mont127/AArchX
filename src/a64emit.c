@@ -757,6 +757,7 @@ void a64_v_sshr_2d(A64Buf *b, int vd, int vn, int sh) { a64_emit32(b, 0x4f400400
 void a64_v_sshr_4s(A64Buf *b, int vd, int vn, int sh) { a64_emit32(b, 0x4f200400u | ((uint32_t)(64 - sh) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_fcmeq(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x4e60e400u : 0x4e20e400u, vd, vn, vm); }
 void a64_v_uminv_4s(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x6eb1a800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
+void a64_v_umaxv_4s(A64Buf *b, int vd, int vn) { a64_emit32(b, 0x6eb0a800u | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
 void a64_v_bit(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6ea01c00u, vd, vn, vm); }
 void a64_v_bif(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x6ee01c00u, vd, vn, vm); }
 void a64_fcmeq_s(A64Buf *b, int dbl, int vd, int vn, int vm) { a64_emit32(b, (dbl ? 0x5e60e400u : 0x5e20e400u) | ((uint32_t)(vm & 31) << 16) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
