@@ -23,10 +23,11 @@ use super::objc::{
     api_register_for_bulk_image_loads, selpool_canonical,
 };
 use super::{
-    DYLDAPI_NOOP_OFF, DYLDAPI_VTABLE_SIZE, g_apis_global, g_block_scratch, g_cache, g_cache_size,
-    g_cache_start, g_closure_cap, g_closure_hash, g_closure_hash_mask, g_closure_mh, g_closure_n,
-    g_clsopt, g_headeropt_ro, g_headeropt_rw, g_main_bv_minos, g_main_bv_platform, g_main_bv_sdk,
-    g_main_path, g_objc_dlopen_mapped, g_objc_make_mutable, g_protoopt, g_sel_pool, g_selopt,
+    cstr_ptr, DYLDAPI_NOOP_OFF, DYLDAPI_VTABLE_SIZE, g_apis_global, g_block_scratch, g_cache,
+    g_cache_size, g_cache_start, g_closure_cap, g_closure_hash, g_closure_hash_mask,
+    g_closure_mh, g_closure_n, g_clsopt, g_headeropt_ro, g_headeropt_rw, g_main_bv_minos,
+    g_main_bv_platform, g_main_bv_sdk, g_main_path, g_objc_dlopen_mapped, g_objc_make_mutable,
+    g_protoopt, g_sel_pool, g_selopt,
 };
 
 const CACHE_HDR_OBJC_OPTS: usize = 0x1d0;
@@ -64,7 +65,7 @@ unsafe fn lazy_load_path(mh: u64, flag: u64, weak: *mut c_int) -> *const c_char 
             let l = lc.cast::<LoadCommand>();
             if (*l).cmd == LC_SEGMENT_64 {
                 let s = lc.cast::<SegmentCommand64>();
-                if libc::strcmp((*s).segname.as_ptr(), c"__LINKEDIT".as_ptr()) == 0 {
+                if libc::strcmp((*s).segname.as_ptr(), cstr_ptr(c"__LINKEDIT")) == 0 {
                     le_addr = (*s).vmaddr.wrapping_add(slide);
                     le_fileoff = (*s).fileoff;
                     le_size = (*s).filesize;
@@ -105,10 +106,10 @@ unsafe fn lazy_load_path(mh: u64, flag: u64, weak: *mut c_int) -> *const c_char 
                         if !libc::memchr(path.cast::<c_void>(), 0, (datasize - pathoff) as usize)
                             .is_null()
                         {
-                            if !libc::getenv(c"OCERZ_LAZYLOADLOG".as_ptr()).is_null() {
+                            if !libc::getenv(cstr_ptr(c"OCERZ_LAZYLOADLOG")).is_null() {
                                 libc::fprintf(
                                     crate::log::stderr(),
-                                    c"ocerz: LAZYLOAD path=%s flag=%#llx fmt=%u chain=%#x symbols=%u\n".as_ptr(),
+                                    cstr_ptr(c"ocerz: LAZYLOAD path=%s flag=%#llx fmt=%u chain=%#x symbols=%u\n"),
                                     path,
                                     flag as libc::c_ulonglong,
                                     ptrfmt as u32,
@@ -169,7 +170,7 @@ unsafe fn api_lazy_load(vm: *mut OcerzVM, cpu: *mut OcerzCPU) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ocerz_dyldapi_setup(cache: *mut crate::ffi::OcerzCache) -> c_int {
     unsafe {
-        let fnptr = ocerz_cache_resolve(cache, c"_dyld_get_active_platform".as_ptr());
+        let fnptr = ocerz_cache_resolve(cache, cstr_ptr(c"_dyld_get_active_platform"));
         if fnptr == 0 {
             return OCERZ_EUNSUP as c_int;
         }
@@ -221,14 +222,14 @@ pub unsafe extern "C" fn ocerz_dyldapi_setup(cache: *mut crate::ffi::OcerzCache)
             let mh = crate::ffi::ocerz_cache_image_addr(cache, i, &mut path);
             if mh != 0
                 && !path.is_null()
-                && libc::strcmp(path, c"/usr/lib/libobjc.A.dylib".as_ptr()) == 0
+                && libc::strcmp(path, cstr_ptr(c"/usr/lib/libobjc.A.dylib")) == 0
             {
                 objc_mh = mh;
                 break;
             }
         }
         let opt = if objc_mh != 0 {
-            find_section_any(objc_mh, c"__objc_opt_ro".as_ptr())
+            find_section_any(objc_mh, cstr_ptr(c"__objc_opt_ro"))
         } else {
             0
         };
@@ -290,9 +291,9 @@ pub unsafe extern "C" fn ocerz_dyldapi_setup(cache: *mut crate::ffi::OcerzCache)
             crate::ocerz_log!(
                 "dyldapi: selector table %s the cache header's objc optimizations\n",
                 if g_selopt != 0 {
-                    c"taken from".as_ptr()
+                    cstr_ptr(c"taken from")
                 } else {
-                    c"not found in".as_ptr()
+                    cstr_ptr(c"not found in")
                 }
             );
         }
@@ -364,7 +365,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
         }
         static mut trace: c_int = -1;
         if trace < 0 {
-            trace = (!libc::getenv(c"OCERZ_DYLDAPI_TRACE".as_ptr()).is_null()) as c_int;
+            trace = (!libc::getenv(cstr_ptr(c"OCERZ_DYLDAPI_TRACE")).is_null()) as c_int;
         }
         if trace != 0 {
             let a1 = (*cpu).gpr[OCERZ_RSI as usize];
@@ -391,7 +392,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
             let sp = (*cpu).gpr[OCERZ_RSP as usize];
             libc::fprintf(
                 crate::log::stderr(),
-                c"ocerz: DYLDAPI +%#llx a1=%#llx a2=%#llx caller=%#llx%s%s\n".as_ptr(),
+                cstr_ptr(c"ocerz: DYLDAPI +%#llx a1=%#llx a2=%#llx caller=%#llx%s%s\n"),
                 off as libc::c_ulonglong,
                 a1 as libc::c_ulonglong,
                 (*cpu).gpr[OCERZ_RDX as usize] as libc::c_ulonglong,
@@ -401,9 +402,9 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                     0
                 },
                 if text[0] != 0 {
-                    c" a1-string=".as_ptr()
+                    cstr_ptr(c" a1-string=")
                 } else {
-                    c"".as_ptr()
+                    cstr_ptr(c"")
                 },
                 text.as_ptr(),
             );
@@ -591,11 +592,11 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                 } else {
                     ptr::null()
                 };
-                let dlbt = libc::getenv(c"OCERZ_DLBT".as_ptr());
+                let dlbt = libc::getenv(cstr_ptr(c"OCERZ_DLBT"));
                 if !host.is_null() && !dlbt.is_null() && !libc::strstr(host, dlbt).is_null() {
                     libc::fprintf(
                         crate::log::stderr(),
-                        c"ocerz: DLBT dlopen(\"%s\") caller-chain:".as_ptr(),
+                        cstr_ptr(c"ocerz: DLBT dlopen(\"%s\") caller-chain:"),
                         host,
                     );
                     let mut fp = (*cpu).gpr[OCERZ_RBP as usize];
@@ -605,7 +606,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                         }
                         libc::fprintf(
                             crate::log::stderr(),
-                            c" %#llx".as_ptr(),
+                            cstr_ptr(c" %#llx"),
                             ocerz_ld(fp + 8, 8) as libc::c_ulonglong,
                         );
                         let nf = ocerz_ld(fp, 8);
@@ -614,7 +615,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                         }
                         fp = nf;
                     }
-                    libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+                    libc::fprintf(crate::log::stderr(), cstr_ptr(c"\n"));
                 }
                 let caller = if off == 0x2e0 {
                     (*cpu).gpr[OCERZ_RCX as usize]
@@ -645,10 +646,10 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                     let host = ocerz_g2h(pathg).cast::<c_char>();
                     ok = (cache_find_canonical(host, ptr::null_mut()) != 0
                         || libc::access(host, libc::R_OK) == 0) as u64;
-                    if !libc::getenv(c"OCERZ_DLPATH".as_ptr()).is_null() {
+                    if !libc::getenv(cstr_ptr(c"OCERZ_DLPATH")).is_null() {
                         libc::fprintf(
                             crate::log::stderr(),
-                            c"ocerz: dlopen_preflight(\"%s\") -> %llu\n".as_ptr(),
+                            cstr_ptr(c"ocerz: dlopen_preflight(\"%s\") -> %llu\n"),
                             host,
                             ok as libc::c_ulonglong,
                         );
@@ -665,17 +666,17 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                 } else {
                     0
                 };
-                if !libc::getenv(c"OCERZ_DLSYMLOG".as_ptr()).is_null() {
+                if !libc::getenv(cstr_ptr(c"OCERZ_DLSYMLOG")).is_null() {
                     let rsp = (*cpu).gpr[OCERZ_RSP as usize];
                     libc::fprintf(
                         crate::log::stderr(),
-                        c"ocerz: DLSYM[%d] handle=%#llx \"%s\" -> %#llx caller=%#llx\n".as_ptr(),
+                        cstr_ptr(c"ocerz: DLSYM[%d] handle=%#llx \"%s\" -> %#llx caller=%#llx\n"),
                         libc::getpid(),
                         handle as libc::c_ulonglong,
                         if symg != 0 {
                             ocerz_g2h(symg).cast()
                         } else {
-                            c"(null)".as_ptr()
+                            cstr_ptr(c"(null)")
                         },
                         addr as libc::c_ulonglong,
                         if ocerz_addr_readable(rsp) != 0 {
@@ -827,17 +828,17 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                 if mh != 0 && info != 0 {
                     let mut eh_sz = 0;
                     let mut cu_sz = 0;
-                    let eh = find_section_sz(mh, c"__eh_frame".as_ptr(), &mut eh_sz);
-                    let cu = find_section_sz(mh, c"__unwind_info".as_ptr(), &mut cu_sz);
+                    let eh = find_section_sz(mh, cstr_ptr(c"__eh_frame"), &mut eh_sz);
+                    let cu = find_section_sz(mh, cstr_ptr(c"__unwind_info"), &mut cu_sz);
                     ocerz_st(info, 8, mh);
                     ocerz_st(info + 8, 8, eh);
                     ocerz_st(info + 16, 8, if eh != 0 { eh_sz } else { 0 });
                     ocerz_st(info + 24, 8, cu);
                     ocerz_st(info + 32, 8, if cu != 0 { cu_sz } else { 0 });
-                    if !libc::getenv(c"OCERZ_UNWLOG".as_ptr()).is_null() {
+                    if !libc::getenv(cstr_ptr(c"OCERZ_UNWLOG")).is_null() {
                         libc::fprintf(
                             crate::log::stderr(),
-                            c"ocerz: UNWLOG pc=%#llx mh=%#llx eh=%#llx eh_sz=%#llx cu=%#llx cu_sz=%#llx\n".as_ptr(),
+                            cstr_ptr(c"ocerz: UNWLOG pc=%#llx mh=%#llx eh=%#llx eh_sz=%#llx cu=%#llx cu_sz=%#llx\n"),
                             pc as libc::c_ulonglong,
                             mh as libc::c_ulonglong,
                             eh as libc::c_ulonglong,
@@ -846,10 +847,10 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                             cu_sz as libc::c_ulonglong,
                         );
                     }
-                } else if !libc::getenv(c"OCERZ_UNWLOG".as_ptr()).is_null() {
+                } else if !libc::getenv(cstr_ptr(c"OCERZ_UNWLOG")).is_null() {
                     libc::fprintf(
                         crate::log::stderr(),
-                        c"ocerz: UNWLOG pc=%#llx mh=0 (no image)\n".as_ptr(),
+                        cstr_ptr(c"ocerz: UNWLOG pc=%#llx mh=0 (no image)\n"),
                         pc as libc::c_ulonglong,
                     );
                 }
@@ -899,27 +900,27 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
             0x358 => api_objc_register_callbacks(vm, cpu),
             0x378 => {
                 let kindsect: [*const c_char; 21] = [
-                    c"__swift5_protos".as_ptr(),
-                    c"__swift5_proto".as_ptr(),
-                    c"__swift5_types".as_ptr(),
-                    c"__swift5_replace".as_ptr(),
-                    c"__swift5_replac2".as_ptr(),
-                    c"__swift5_acfuncs".as_ptr(),
-                    c"__objc_imageinfo".as_ptr(),
-                    c"__objc_selrefs".as_ptr(),
-                    c"__objc_msgrefs".as_ptr(),
-                    c"__objc_classrefs".as_ptr(),
-                    c"__objc_superrefs".as_ptr(),
-                    c"__objc_protorefs".as_ptr(),
-                    c"__objc_classlist".as_ptr(),
-                    c"__objc_nlclslist".as_ptr(),
-                    c"__objc_stublist".as_ptr(),
-                    c"__objc_catlist".as_ptr(),
-                    c"__objc_catlist2".as_ptr(),
-                    c"__objc_nlcatlist".as_ptr(),
-                    c"__objc_protolist".as_ptr(),
-                    c"__objc_fork_ok".as_ptr(),
-                    c"__objc_rawisa".as_ptr(),
+                    cstr_ptr(c"__swift5_protos"),
+                    cstr_ptr(c"__swift5_proto"),
+                    cstr_ptr(c"__swift5_types"),
+                    cstr_ptr(c"__swift5_replace"),
+                    cstr_ptr(c"__swift5_replac2"),
+                    cstr_ptr(c"__swift5_acfuncs"),
+                    cstr_ptr(c"__objc_imageinfo"),
+                    cstr_ptr(c"__objc_selrefs"),
+                    cstr_ptr(c"__objc_msgrefs"),
+                    cstr_ptr(c"__objc_classrefs"),
+                    cstr_ptr(c"__objc_superrefs"),
+                    cstr_ptr(c"__objc_protorefs"),
+                    cstr_ptr(c"__objc_classlist"),
+                    cstr_ptr(c"__objc_nlclslist"),
+                    cstr_ptr(c"__objc_stublist"),
+                    cstr_ptr(c"__objc_catlist"),
+                    cstr_ptr(c"__objc_catlist2"),
+                    cstr_ptr(c"__objc_nlcatlist"),
+                    cstr_ptr(c"__objc_protolist"),
+                    cstr_ptr(c"__objc_fork_ok"),
+                    cstr_ptr(c"__objc_rawisa"),
                 ];
                 let mh = (*cpu).gpr[OCERZ_RSI as usize];
                 let kind = (*cpu).gpr[OCERZ_RCX as usize];
@@ -931,14 +932,14 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                     && mh >= g_cache_start
                     && !g_closure_hash.is_null()
                     && !set_has(g_closure_hash, g_closure_hash_mask, mh)
-                    && libc::getenv(c"OCERZ_NO_LATE_CATLIST".as_ptr()).is_null();
+                    && libc::getenv(cstr_ptr(c"OCERZ_NO_LATE_CATLIST")).is_null();
                 if mh != 0
                     && (swift || loadmark || latecat || mh < g_cache_start)
                     && (kind as usize) < kindsect.len()
                 {
                     addr = find_section_sz(mh, kindsect[kind as usize], &mut size);
                 }
-                if !libc::getenv(c"OCERZ_SECLOG".as_ptr()).is_null() {
+                if !libc::getenv(cstr_ptr(c"OCERZ_SECLOG")).is_null() {
                     libc::fprintf(
                         crate::log::stderr(),
                         c"ocerz: SECINFO mh=%#llx kind=%llu (%s) -> addr=%#llx size=%#llx\n"
@@ -948,7 +949,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                         if (kind as usize) < kindsect.len() {
                             kindsect[kind as usize]
                         } else {
-                            c"?".as_ptr()
+                            cstr_ptr(c"?")
                         },
                         addr as libc::c_ulonglong,
                         size as libc::c_ulonglong,
@@ -981,10 +982,10 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                 } else {
                     0
                 };
-                if result == 0 && name != 0 && !libc::getenv(c"OCERZ_SELLOG".as_ptr()).is_null() {
+                if result == 0 && name != 0 && !libc::getenv(cstr_ptr(c"OCERZ_SELLOG")).is_null() {
                     libc::fprintf(
                         crate::log::stderr(),
-                        c"ocerz: SELMISS \"%s\"\n".as_ptr(),
+                        cstr_ptr(c"ocerz: SELMISS \"%s\"\n"),
                         ocerz_g2h(name).cast::<c_char>(),
                     );
                 }
