@@ -74,6 +74,7 @@
 #include "ocerz/mode.h"
 #include "ocerz/types.h"
 
+#include <arm_acle.h>
 #include <compression.h>
 #include <dirent.h>
 #include <errno.h>
@@ -192,17 +193,34 @@ static uint64_t mix(uint64_t h, uint64_t w)
     return h ^ (h >> 29);
 }
 
+/*
+ * Every record loaded is summed before it is trusted.  A mix per word is a
+ * chain of dependent multiplies, about 2 ms of a CoreFoundation program's
+ * launch for the 9 MB it loads; the sum is CRC32C instead, in three lanes so
+ * the instructions overlap, the lanes and the header then mixed together.  It
+ * only has to catch a torn or damaged record, and each build of ocerz keeps
+ * its own store, so no record written with the old sum is ever read with this.
+ */
 static uint64_t stored_sum(const TcStored *z)
 {
     const uint8_t *p = (const uint8_t *)(z + 1);
     size_t n = z->size - sizeof *z;
-    uint64_t h = mix(mix(0x452821e638d01377ull, z->key), ((uint64_t)z->raw << 32) | z->zlen);
-    for (; n >= 8; p += 8, n -= 8) {
-        uint64_t w;
-        memcpy(&w, p, 8);
-        h = mix(h, w);
+    uint32_t c0 = 0x452821e6u, c1 = 0x38d01377u, c2 = 0xbe5466cfu;
+    uint64_t w0, w1, w2;
+    for (; n >= 24; p += 24, n -= 24) {
+        memcpy(&w0, p, 8);
+        memcpy(&w1, p + 8, 8);
+        memcpy(&w2, p + 16, 8);
+        c0 = __crc32cd(c0, w0);
+        c1 = __crc32cd(c1, w1);
+        c2 = __crc32cd(c2, w2);
     }
-    return h;
+    for (; n >= 8; p += 8, n -= 8) {
+        memcpy(&w0, p, 8);
+        c0 = __crc32cd(c0, w0);
+    }
+    uint64_t h = mix(mix(0x452821e638d01377ull, z->key), ((uint64_t)z->raw << 32) | z->zlen);
+    return mix(mix(h, ((uint64_t)c0 << 32) | c1), c2);
 }
 
 static int env_ignored(const char *kv)
