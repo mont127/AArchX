@@ -10,7 +10,7 @@ use core::ptr;
 use crate::ffi::{
     OCERZ_ENOMEM, OCERZ_OK, OCERZ_RBP, OCERZ_RSP, OcerzImage, OcerzVM, ocerz_map_anywhere,
 };
-use crate::ported::sysbridge::{ocerz_g2h, ocerz_st};
+use crate::inline::{ocerz_g2h, ocerz_st};
 
 const GUEST_STACK_SIZE: u64 = 8 << 20;
 const STACK_TOP_PAD: u64 = 16;
