@@ -18263,6 +18263,9 @@ static unsigned long long g_promo_seq[JIT_MAX_BLOCK_INSNS];
  * - a push run is at most 16 deep, so its stores stay inside the 128-byte red
  *   zone below rsp until rsp covers them;
  * - the call-frame forms and the push/pop renames keep their instructions.
+ * A push run may take one mov of rsp into a register, the push rbp / mov
+ * rbp, rsp / push prologue; the register is written after the stores, from
+ * rsp less the pushes before the mov, and the run ends before a push of it.
  * In the Wine layout the accesses go through rsp plus the stack delta.
  * OCERZ_NO_STACK_RUN=1 goes back to pairs in the Wine layout only, and
  * OCERZ_NO_STACK_PAIR=1 turns both off.
@@ -18275,6 +18278,15 @@ static int stack_pair_reg(const X86Insn *in, int op)
     if (o->kind != OCERZ_OPK_REG || o->high8 || o->size != 8 || (o->reg & 15) == OCERZ_RSP) return -1;
     int s = pin_slot(o->reg);
     return s < 0 ? -1 : pin_hreg(s);
+}
+static int stack_run_rsp_mov(const X86Insn *in)
+{
+    const X86Operand *d = &in->ops[0], *s = &in->ops[1];
+    if (in->op != OCERZ_OP_MOV || in->mode32 || in->opsize != 8 || in->seg != OCERZ_SEG_NONE || in->nops != 2) return -1;
+    if (d->kind != OCERZ_OPK_REG || d->high8 || d->size != 8 || (d->reg & 15) == OCERZ_RSP) return -1;
+    if (s->kind != OCERZ_OPK_REG || s->high8 || s->size != 8 || (s->reg & 15) != OCERZ_RSP) return -1;
+    int ds = pin_slot(d->reg);
+    return ds < 0 ? -1 : pin_hreg(ds);
 }
 static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
 {
@@ -18292,17 +18304,26 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
     if (op == OCERZ_OP_PUSH && !mem_native_store_ok()) return 0;
     int max = runs ? STACK_RUN_MAX : 2;
     int regs[STACK_RUN_MAX];
-    int k = 0;
+    int k = 0, last = i, mov_at = -1, mov_hd = -1, mov_idx = -1;
     for (int j = i; j < n && k < max; j++) {
         if (j > i && g_mov_skip[j]) break;
         if (g_ic_kind[j] || g_promo_reg[j]) break;
+        int hd;
+        if (op == OCERZ_OP_PUSH && runs && k > 0 && mov_at < 0 && (hd = stack_run_rsp_mov(&insns[j])) >= 0) {
+            mov_at = k;
+            mov_hd = hd;
+            mov_idx = j;
+            continue;
+        }
         int r = stack_pair_reg(&insns[j], op);
-        if (r < 0) break;
+        if (r < 0 || r == mov_hd) break;
         int dup = 0;
         for (int m = 0; m < k && op == OCERZ_OP_POP; m++) dup |= regs[m] == r;
         if (dup) break;
         regs[k++] = r;
+        last = j;
     }
+    if (mov_idx > last) mov_at = -1;
     if (k < 2) return 0;
     int hs = pin_hreg(pin_slot(OCERZ_RSP));
     int base = hs;
@@ -18316,6 +18337,11 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
             a64_stp_off(b, regs[j + 1], regs[j], base, -8 * (j + 2));
         if (j < k)
             a64_stur(b, 8, regs[j], base, -8 * (j + 1));
+        if (mov_at >= 0) {
+            a64_sub_imm(b, 1, mov_hd, hs, 8 * mov_at);
+            if (direct)
+                a64_sub_reg(b, 1, mov_hd, mov_hd, JGB, 0);
+        }
         a64_sub_imm(b, 1, hs, hs, 8 * k);
     } else {
         for (; j + 1 < k; j += 2)
@@ -18324,7 +18350,7 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
             a64_ldr(b, 8, regs[j], base, (uint32_t)(8 * j));
         a64_add_imm(b, 1, hs, hs, 8 * k);
     }
-    for (int m = i + 1; m < i + k; m++)
+    for (int m = i + 1; m <= last; m++)
         g_mov_skip[m] = 1;
     return k;
 }
