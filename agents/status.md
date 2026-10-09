@@ -20,7 +20,7 @@
 | interp_sse.c | 2542 | interp-agent | ported |
 | jit.c | 2844 | jit-integer-agent | ported: rust/src/ported/jit.rs + src/jit_core_shim.c (sigsetjmp decode loop), emit audit MATCH (agents/jit-core.md) |
 | jit_cache.c | 3185 | devin-4a0e3105 | ported |
-| jit_control.c | 2070 | jit-control-agent | in progress |
+| jit_control.c | 2070 | jit-control-agent | ported (shim: exec_one/exec_one_at) |
 | jit_flags.c | 2778 | jit-flags-agent | ported (shim: jit_flags_shim.c) |
 | jit_fp.c | 3203 | jit-fp-agent | ported |
 | jit_integer.c | 2678 | jit-integer-agent | ported: rust/src/ported/jit_integer.rs, emit audit MATCH, no C shim (agents/jit-integer.md) |
