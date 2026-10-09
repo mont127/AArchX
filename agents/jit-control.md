@@ -44,7 +44,7 @@ succeeded and the emission audit against `~/AArchX-jitc` returned:
 MATCH: 215295 blocks, 145523525 arm64 words (offset + low, seed=1; relocation payloads masked)
 ```
 
-- Full x64/all-corpus audit at candidate tip `473c3753e9ebf8300482489e1b4fab5804e668fc`: `MATCH: 427956 blocks, 199367280 arm64 words (corpus=all; relocation payloads masked)`.
+- Full x64/all-corpus audit at candidate tip `f6e579e611beb793a12de134f7ec011268fef158`: `MATCH: 427961 blocks, 199368518 arm64 words (corpus=all; relocation payloads masked)`.
 
 All eight requested unit binaries passed with `OCERZ_NO_ARM_EXEC=1`. After the
 perfstat atomic-order fix, the build, audit, all eight binaries, and fast gate
