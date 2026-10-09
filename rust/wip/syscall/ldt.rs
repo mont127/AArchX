@@ -313,16 +313,8 @@ pub(super) unsafe fn dispatch_machdep(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num:
                 c"ocerz: machdep set_cthread_self gs=%#llx comm(gs)=%d comm(gs-8)=%d icount=%#llx\n"
                     .as_ptr(),
                 (*cpu).gs_base as libc::c_ulonglong,
-                if (*cpu).gs_base != 0 {
-                    ocerz_ld((*cpu).gs_base, 4) as c_int
-                } else {
-                    0
-                },
-                if (*cpu).gs_base >= 8 {
-                    ocerz_ld((*cpu).gs_base - 8, 4) as c_int
-                } else {
-                    0
-                },
+                crate::ffi::ocerz_addr_committed((*cpu).gs_base),
+                crate::ffi::ocerz_addr_committed((*cpu).gs_base.wrapping_sub(8)),
                 (*vm).insn_count as libc::c_ulonglong,
             );
         }

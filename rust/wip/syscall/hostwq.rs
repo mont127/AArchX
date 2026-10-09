@@ -498,15 +498,20 @@ unsafe fn ocerz_hostwq_bridge(extra_r8: u64, workloop_id: u64, hev: *const c_voi
             };
             libc::fprintf(
                 crate::log::stderr(),
-                c"ocerz: WQ-FATAL cpu#%u kport=%#x wlid=%#llx rsp_base=%#llx ddi(gs:0xe8)=%#llx sdq=%#llx flt0=%d ident0=%#llx\n".as_ptr(),
+                c"ocerz: WQ-FATAL cpu#%u kport=%#x wlid=%#llx rsp_base=%#llx | wlh(gs:0xd8)=%#llx ddi(gs:0xe8)=%#llx tid(gs:0x18)=%#llx stashed_dq=%#llx dq_state=%#llx\n".as_ptr(),
                 t.cpu_number,
                 kp,
                 workloop_id as libc::c_ulonglong,
-                pth as libc::c_ulonglong,
+                pth.wrapping_sub(0x100) as libc::c_ulonglong,
+                ocerz_ld(gs.wrapping_add(0xd8), 8) as libc::c_ulonglong,
                 ddi as libc::c_ulonglong,
+                ocerz_ld(gs.wrapping_add(0x18), 8) as libc::c_ulonglong,
                 sdq as libc::c_ulonglong,
-                flt0 as c_int,
-                ident0 as libc::c_ulonglong,
+                if sdq != 0 {
+                    ocerz_ld(sdq.wrapping_add(0x38), 8)
+                } else {
+                    0
+                } as libc::c_ulonglong,
             );
         }
         if env_set!("OCERZ_WQHIST") && wrc == 125 {
