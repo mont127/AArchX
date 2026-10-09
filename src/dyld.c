@@ -2612,6 +2612,21 @@ static void eager_add(uint64_t mh)
         g_eager_set_n = g_eager_n;
     }
 }
+/*
+ * Images a delayed-init link reaches from the eager set.  A pointer into one
+ * of them - a prebound GOT slot, say - does not make it eager: dyld would not
+ * have initialized it either, and the client dlopens it before using it.
+ */
+static uint64_t g_delayed_set[EAGER_SET];
+
+static unsigned delayed_slot(uint64_t mh)
+{
+    unsigned at = (unsigned)((mh * 0x9e3779b97f4a7c15ull) >> 40) & (EAGER_SET - 1);
+    while (g_delayed_set[at] && g_delayed_set[at] != mh)
+        at = (at + 1) & (EAGER_SET - 1);
+    return at;
+}
+
 static void scan_uses(uint64_t mh)
 {
     int64_t slide = image_slide_d(mh);
@@ -2648,7 +2663,8 @@ static void scan_uses(uint64_t mh)
                             continue;
                         last_lo = g_segs[at].lo;
                         last_hi = g_segs[at].hi;
-                        if (g_segs[at].mh != mh) eager_add(g_segs[at].mh);
+                        if (g_segs[at].mh != mh && g_delayed_set[delayed_slot(g_segs[at].mh)] != g_segs[at].mh)
+                            eager_add(g_segs[at].mh);
                     }
                 }
             }
@@ -2668,8 +2684,13 @@ static void eager_add_direct_deps(OcerzCache *cache, uint64_t mh)
         if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
             cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
             uint32_t noff = rd32(lc + 8);
-            if (noff < rd32(lc + 4))
-                eager_add(dep_mh(cache, (const char *)(lc + noff)));
+            if (noff < rd32(lc + 4)) {
+                uint64_t dmh = dep_mh(cache, (const char *)(lc + noff));
+                if (!ocerz_dylib_dep_delayed(lc))
+                    eager_add(dmh);
+                else if (dmh)
+                    g_delayed_set[delayed_slot(dmh)] = dmh;
+            }
         }
         lc += rd32(lc + 4);
     }
@@ -2736,9 +2757,12 @@ static void compute_eager_set(OcerzCache *cache, uint64_t main_mh)
             eager_add(mh);
     }
     int root_n = g_eager_n;
-    for (int i = 0; i < g_eager_n; i++) {
-        eager_add_direct_deps(cache, g_eager[i]);
-        scan_uses(g_eager[i]);
+    memset(g_delayed_set, 0, sizeof g_delayed_set);
+    /* every image's links before any pointer scan, so the delayed set is known when it runs */
+    for (int i = 0, s = 0; s < g_eager_n; s++) {
+        for (; i < g_eager_n; i++)
+            eager_add_direct_deps(cache, g_eager[i]);
+        scan_uses(g_eager[s]);
     }
     if (getenv("OCERZ_INITLOG"))
         fprintf(stderr, "dynamic: eager init set: root=%d eager=%d (of closure)\n", root_n, g_eager_n);
@@ -3175,6 +3199,8 @@ static int dylib_lc_is_init_dep(const uint8_t *lc)
     uint32_t cmd = rd32(lc);
     if (cmd != LC_LOAD_DYLIB && cmd != LC_LOAD_WEAK_DYLIB && cmd != LC_REEXPORT_DYLIB)
         return 0;
+    if (ocerz_dylib_dep_delayed(lc))
+        return 0;
     if (cmd != LC_REEXPORT_DYLIB && rd32(lc + 4) >= sizeof(struct dylib_use_command) &&
         rd32(lc + 8) == sizeof(struct dylib_use_command) && rd32(lc + 12) == DYLIB_USE_MARKER)
         return (rd32(lc + 24) & DYLIB_USE_UPWARD) == 0;
@@ -3186,6 +3212,8 @@ static int dylib_lc_is_upward_dep(const uint8_t *lc)
     uint32_t cmd = rd32(lc);
     if (cmd == LC_LOAD_UPWARD_DYLIB)
         return 1;
+    if (ocerz_dylib_dep_delayed(lc))
+        return 0;
     if ((cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB) &&
         rd32(lc + 4) >= sizeof(struct dylib_use_command) &&
         rd32(lc + 8) == sizeof(struct dylib_use_command) && rd32(lc + 12) == DYLIB_USE_MARKER)
