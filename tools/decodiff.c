@@ -28,6 +28,10 @@
 #include <stdint.h>
 #include "ocerz/decode.h"
 
+uint64_t ocerz_low_base;
+uint64_t ocerz_top_base;
+uint64_t ocerz_guest_base;
+
 #define SWEEP_BITS 24
 #define SWEEP_N    (1u << SWEEP_BITS)
 #define RIP        0x0000000140001000ull

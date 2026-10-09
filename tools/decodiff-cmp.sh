@@ -9,18 +9,61 @@
 set -e
 A="$1"; B="$2"; W="${TMPDIR:-/tmp}/decodiff.$$"
 mkdir -p "$W"
-# Link exactly the objects the Makefile would for a core consumer: a ported
-# decode.rs is what the tree actually decodes with, not a stale src/decode.o.
-# Older trees without print-core-objs fall back to the glob.
+ported_modules()
+{
+    T="$1"
+    for module in "$T"/rust/src/ported/*.rs; do
+        [ -f "$module" ] || continue
+        basename "${module%.rs}"
+    done
+    for module in "$T"/rust/src/ported/*/mod.rs; do
+        [ -f "$module" ] || continue
+        basename "$(dirname "$module")"
+    done
+}
+is_decode_ported()
+{
+    case " $(ported_modules "$1") " in
+        *" decode "*) return 0 ;;
+    esac
+    return 1
+}
+core_objects()
+{
+    T="$1"
+    modules=" $(ported_modules "$T" | tr '\n' ' ') "
+    for obj in "$T"/src/*.o; do
+        [ -f "$obj" ] || continue
+        name=${obj##*/}
+        module=${name%.o}
+        [ "$module" = main ] && continue
+        case "$modules" in
+            *" $module "*) continue ;;
+        esac
+        printf '%s ' "$obj"
+    done
+}
 for T in "$A" "$B"; do
-    (cd "$T" && make -s ocerz)
-    OBJS=$(cd "$T" && make -s print-core-objs 2>/dev/null) || \
-        OBJS=$(ls "$T"/src/*.o | grep -v '/main\.o$')
-    OBJS=$(cd "$T" && for o in $OBJS; do echo "$T/$o"; done)
-    [ "$T" = "$A" ] && A_OBJS=$OBJS || B_OBJS=$OBJS
+    if is_decode_ported "$T"; then
+        (cd "$T" && make -s ocerz)
+    else
+        (cd "$T" && touch src/decode.c && make -s src/decode.o)
+    fi
 done
-clang -arch arm64 -O2 -I"$A/include" -o "$W/da" "$(dirname "$0")/decodiff.c" $A_OBJS -lcompression
-clang -arch arm64 -O2 -I"$B/include" -o "$W/db" "$(dirname "$0")/decodiff.c" $B_OBJS -lcompression
+if is_decode_ported "$A"; then
+    AOBJS=$(core_objects "$A")
+    clang -arch arm64 -O2 -I"$A/include" -o "$W/da" "$(dirname "$0")/decodiff.c" \
+        $AOBJS "$A/rust/target/release/libocerz_rs.a" -lcompression -lc -lm
+else
+    clang -arch arm64 -O2 -I"$A/include" -o "$W/da" "$(dirname "$0")/decodiff.c" "$A/src/decode.o"
+fi
+if is_decode_ported "$B"; then
+    BOBJS=$(core_objects "$B")
+    clang -arch arm64 -O2 -I"$B/include" -o "$W/db" "$(dirname "$0")/decodiff.c" \
+        $BOBJS "$B/rust/target/release/libocerz_rs.a" -lcompression -lc -lm
+else
+    clang -arch arm64 -O2 -I"$B/include" -o "$W/db" "$(dirname "$0")/decodiff.c" "$B/src/decode.o"
+fi
 "$W/da" digest "$W/a.bin"
 "$W/db" digest "$W/b.bin"
 if cmp -s "$W/a.bin" "$W/b.bin"; then
