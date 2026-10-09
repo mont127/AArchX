@@ -46,21 +46,21 @@ use crate::jit_internal::{
     blk_mode32, blk_rip, jit_key, ocerz_g2h, ras_cell_register, ras_entry_for, tc_noload_has,
 };
 
-const TC_RELOC_MAX: usize = 1024;
-const TC_DLOG_MAX: usize = 4096;
-const TC_DBYTES_MAX: usize = 64 << 10;
-const TC_OUT_MAX: usize = 256 << 10;
-const JIT_MAX_BLOCK_INSNS: u32 = 256;
-const JIT_MAX_EDGES: usize = 8;
-const SIDE_MAX: usize = 6;
-const RAS_SLOT_CAP: usize = 1 << 18;
-const TC_NONE: u32 = u32::MAX;
-const TC_HASH_SEED: u64 = 0x243f6a8885a308d3;
-const TCF_COMPACT: u8 = 1;
-const TCF_FAULTF: u8 = 2;
-const TCF_PROF: u8 = 4;
-const TCF_LEARNED: u8 = 8;
-const OCERZ_COMMPAGE_LO: u64 = 0x0000_7fff_ffe0_0000;
+const TC_RELOC_MAX: usize = ffi::TC_RELOC_MAX as usize;
+const TC_DLOG_MAX: usize = ffi::TC_DLOG_MAX as usize;
+const TC_DBYTES_MAX: usize = ffi::TC_DBYTES_MAX as usize;
+const TC_OUT_MAX: usize = ffi::TC_OUT_MAX as usize;
+const JIT_MAX_BLOCK_INSNS: u32 = ffi::JIT_MAX_BLOCK_INSNS;
+const JIT_MAX_EDGES: usize = ffi::JIT_MAX_EDGES as usize;
+const SIDE_MAX: usize = ffi::SIDE_MAX as usize;
+const RAS_SLOT_CAP: usize = ffi::RAS_SLOT_CAP as usize;
+const TC_NONE: u32 = ffi::TC_NONE;
+const TC_HASH_SEED: u64 = ffi::TC_HASH_SEED;
+const TCF_COMPACT: u8 = ffi::TCF_COMPACT as u8;
+const TCF_FAULTF: u8 = ffi::TCF_FAULTF as u8;
+const TCF_PROF: u8 = ffi::TCF_PROF as u8;
+const TCF_LEARNED: u8 = ffi::TCF_LEARNED as u8;
+const OCERZ_COMMPAGE_LO: u64 = ffi::OCERZ_COMMPAGE_LO;
 
 #[unsafe(no_mangle)]
 pub static mut g_tc_rel: [ffi::TcReloc; TC_RELOC_MAX] = [ffi::TcReloc {
@@ -170,17 +170,8 @@ struct TcDepsCheckState {
     good: c_int,
 }
 
-#[repr(C)]
-struct DlInfo {
-    dli_fname: *const libc::c_char,
-    dli_fbase: *mut c_void,
-    dli_sname: *const libc::c_char,
-    dli_saddr: *mut c_void,
-}
-
 unsafe extern "C" {
     fn ocerz_tc_guard(fn_: unsafe extern "C" fn(*mut c_void), arg: *mut c_void) -> c_int;
-    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
     fn pthread_jit_write_protect_np(enabled: c_int);
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
 }
@@ -590,8 +581,8 @@ unsafe fn tc_report(blk: *const ffi::JitBlock, what: *const libc::c_char, w: u32
 unsafe fn tc_host_const(jit: *const ffi::OcerzJit, blk: *const ffi::JitBlock, x: u64) -> c_int {
     unsafe {
         if TC_SELF_BASE.is_null() {
-            let mut di: DlInfo = zeroed();
-            if dladdr(
+            let mut di: libc::Dl_info = zeroed();
+            if libc::dladdr(
                 ffi::ocerz_jit_exec_one as *const () as usize as *const c_void,
                 &mut di,
             ) != 0
@@ -637,9 +628,9 @@ unsafe fn tc_host_const(jit: *const ffi::OcerzJit, blk: *const ffi::JitBlock, x:
             return 1;
         }
         if (0x1_0000_0000..0x8000_0000_0000).contains(&x) {
-            let mut di: DlInfo = zeroed();
+            let mut di: libc::Dl_info = zeroed();
             if !TC_SELF_BASE.is_null()
-                && dladdr(p as *const c_void, &mut di) != 0
+                && libc::dladdr(p as *const c_void, &mut di) != 0
                 && di.dli_fbase == TC_SELF_BASE as *mut c_void
             {
                 return 1;
