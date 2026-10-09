@@ -765,14 +765,14 @@ pub unsafe extern "C" fn br_task_set_exception_ports(
         );
         let mut slot: i32 = -1;
         for k in 0..8 {
-            if G_BR_EXC_PORTS[k].valid != 0 && G_BR_EXC_PORTS[k].task == task {
+            if (*(&raw const G_BR_EXC_PORTS).cast::<BrExcPort>().add(k)).valid != 0 && (*(&raw const G_BR_EXC_PORTS).cast::<BrExcPort>().add(k)).task == task {
                 slot = k as i32;
             }
         }
         if slot < 0 {
             let mut k = 0;
             while k < 8 && slot < 0 {
-                if G_BR_EXC_PORTS[k].valid == 0 {
+                if (*(&raw const G_BR_EXC_PORTS).cast::<BrExcPort>().add(k)).valid == 0 {
                     slot = k as i32;
                 }
                 k += 1;
@@ -781,7 +781,7 @@ pub unsafe extern "C" fn br_task_set_exception_ports(
         if slot < 0 {
             slot = 0;
         }
-        let s = &raw mut G_BR_EXC_PORTS[slot as usize];
+        let s = (&raw mut G_BR_EXC_PORTS).cast::<BrExcPort>().add(slot as usize);
         (*s).task = task;
         (*s).mask = mask;
         (*s).port = port;
@@ -1011,7 +1011,7 @@ unsafe fn br_cf_calendar(
         while which < 3 && libc::strcmp(NAMES[which], name) != 0 {
             which += 1;
         }
-        let mut f = G_BR_CF_CAL_FNS[which].load(Ordering::SeqCst);
+        let mut f = (*(&raw const G_BR_CF_CAL_FNS).cast::<AtomicPtr<c_void>>().add(which)).load(Ordering::SeqCst);
         if f.is_null() {
             f = ocerz_bridge_host_symbol(
                 OCERZ_BRIDGE_COREFOUNDATION.as_ptr() as *const c_char,
@@ -1025,7 +1025,7 @@ unsafe fn br_cf_calendar(
                 );
                 libc::exit(OCERZ_BRIDGE_UNIMPL_EXIT as c_int);
             }
-            G_BR_CF_CAL_FNS[which].store(f, Ordering::SeqCst);
+            (*(&raw const G_BR_CF_CAL_FNS).cast::<AtomicPtr<c_void>>().add(which)).store(f, Ordering::SeqCst);
         }
         let mut named: OcerzAbiSig = core::mem::zeroed();
         let mut call: OcerzAbiCall = core::mem::zeroed();

@@ -100,20 +100,20 @@ pub unsafe extern "C" fn ocerz_bridge_native_thunk(
         libc::pthread_mutex_lock(&raw mut G_BR_THUNK_LOCK);
         let n = G_BR_THUNKS_N.load(Ordering::SeqCst) as usize;
         let mut k = 0;
-        while k < n && G_BR_THUNKS[k].f != f {
+        while k < n && (*(&raw const G_BR_THUNKS).cast::<BrThunk>().add(k)).f != f {
             k += 1;
         }
         if k == n && n < BR_THUNK_MAX {
             let sig = libc::calloc(1, size_of::<OcerzAbiSig>()) as *mut OcerzAbiSig;
             if !sig.is_null() && ocerz_abi_parse(notation, sig) == OCERZ_OK as c_int {
-                G_BR_THUNKS[n].f = f;
-                G_BR_THUNKS[n].name = if name.is_null() {
+                (*(&raw mut G_BR_THUNKS).cast::<BrThunk>().add(n)).f = f;
+                (*(&raw mut G_BR_THUNKS).cast::<BrThunk>().add(n)).name = if name.is_null() {
                     c"(native function)".as_ptr()
                 } else {
                     name
                 };
-                G_BR_THUNKS[n].notation = libc::strdup(notation);
-                G_BR_THUNKS[n].sig = sig;
+                (*(&raw mut G_BR_THUNKS).cast::<BrThunk>().add(n)).notation = libc::strdup(notation);
+                (*(&raw mut G_BR_THUNKS).cast::<BrThunk>().add(n)).sig = sig;
                 G_BR_THUNKS_N.store(n as u32 + 1, Ordering::SeqCst);
             } else {
                 libc::free(sig as *mut c_void);
@@ -142,7 +142,7 @@ pub unsafe extern "C" fn ocerz_bridge_thunk_trap(vm: *mut OcerzVM, cpu: *mut Oce
             );
             return OCERZ_STEP_FATAL as c_int;
         }
-        let t = &raw const G_BR_THUNKS[k as usize];
+        let t = (&raw const G_BR_THUNKS).cast::<BrThunk>().add(k as usize);
         let mut outer: OcerzBridgeFrame = core::mem::zeroed();
         ocerz_bridge_raise(
             &mut outer,

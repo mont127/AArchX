@@ -193,8 +193,108 @@ crossing frame, the native-callback thunk page, and the malloc-zone views.
 
 | guest (clang -arch x86_64 -O2) | C min/median | Rust min/median |
 | calls (10M getpid+strlen crossings) | 0.22 / 0.22 | 0.22 / 0.23 |
-| zone (1M malloc/free pairs) | 0.07 / 0.07 | 0.08 / 0.08 |
+| zone (20M malloc/free pairs, `/usr/bin/time -p`, /tmp/brperf/zone20) | 1.01 / 1.09 | 1.05 / 1.10 |
+
+(The original 1M-pair run, 0.07 vs 0.08, was under timer resolution; the 20M
+rerun shows parity.)
 | qsort_g (1M ints, guest comparator) | 11.75 / 12.25 | 11.86 / 11.97 |
 | nfw (native_frameworks.c, through CF callbacks) | 0.07 / 0.07 | 0.07 / 0.08 |
 
 Parity within noise on the hot path.
+
+## Static audit (lead's rule)
+
+C decl → Rust decl for the statics of sysbridge/objcclass/bridge:
+
+| C decl | Rust decl |
+|---|---|
+| static int en (oc_logging) | AtomicI32::new(-1) |
+| static struct sigaction before[NSIG] (host.rs) | static mut G_BR_SIGNALS_BEFORE |
+| pthread_mutex_t locks (G_SB_KEY_LOCK, G_SB_SYSTEM_LOCK, G_SB_POPEN_LOCK, G_OB_LOCK, G_OB_IMP_LOCK, G_OB_BLOCK_IMP_LOCK, G_OB_HOOK_LOCK, G_OB_EH_LOCK, G_BR_*_LOCK) | static mut libc::pthread_mutex_t = PTHREAD_MUTEX_INITIALIZER via &raw mut |
+| _Atomic pointers/counters | AtomicPtr/AtomicU32/AtomicU64, SeqCst |
+| static const tables | immutable repr(C) arrays with c"" names + unsafe impl Sync |
+| _Thread_local / __thread | #[thread_local] static mut |
+| function-local static caches | module-level atomics |
+
+Fixes applied in this audit commit: oc_logging now i32/-1; host signal
+snapshot moved to a real static under the lock; bounds-checked indexing of
+G_SB_KEYS/G_SB_RESERVED, G_BR_THUNKS, G_BR_VIEWS, G_BR_ZONE_FNS,
+G_BR_INTROSPECT_FNS, G_BR_EXC_PORTS, G_BR_CF_CAL_FNS, G_SB_FE_FLAGS converted
+to raw-pointer access keeping C's range checks.
+
+## src/objcbridge.c → rust/src/ported/objcbridge/ (3543 lines)
+
+Layout: `common.rs` (ObSym table + ob_sym/ob_need, the ob_stop!/ob_refuse!
+macros, settle/return re-exports); `encode.rs` (ob_quals/offset/group_end/
+skip/int_layout/ob_conv, ob_notation, ocerz_objc_notation/refusal/
+format_classes, the variadic + fnargs tables); `send.rs` (ObShape/ObSend
+buckets + generation, ob_describe/ob_method, class_addMethod & friends,
+ob_forwarded, ob_named/ob_text/gather, ob_perform(_general), ob_send_via and
+all msgSend exports, imp_trap, fpret/fp2ret); `imp.rs` (ObImp thunk pages,
+imp_for_guest/from_guest, block IMPs); `veneer.rs` (ObVeneer table +
+ob_veneer_call/ob_scan_* and every ocerz_fmt_* export); `eh.rs` (uncaught
+handler, ObEh + ehtype page, throw/catch/terminate exports,
+ocerz_objc_guard_personality + ocerz_objc_guard_landed,
+_NSDictionaryOfVariableBindings, NSGetUncaughtExceptionHandler);
+`hooks.rs` (getClass/getImageName/lazyClassNamer hooks, opt_*/alloc*/release,
+realizeClassFromSwift/readClassPair, fix_selrefs).
+
+Deviations:
+- va_list is a guest `char*`-style pointer: the host v-functions are called
+  through `ob_perform(..., as_va_list=1)`, which appends the slot array to the
+  call's registers — never Rust VaList.
+- `ob_perform_general` stays `#[inline(never)]` with `call`/`stack`
+  uninitialised (MaybeUninit), same as C.
+- `_Unwind_*` types/functions and `dlsym(RTLD_DEFAULT)` declared privately;
+  `g_ob_guard_passing` is `#[thread_local] static mut`.
+- Machine-code pages (IMP thunks, block IMPs, the no-object stub, the EH
+  vtable page) are byte-for-byte identical to C.
+- Stray `static const` tables with pointer fields get `unsafe impl Sync`;
+  all writable statics are `static mut`/atomics (verified: nothing writable
+  in __TEXT,__const; G_OB_EXPORT lives in __DATA_CONST as C's does).
+
+Unwind finding: with panic=abort every Rust fn on the guarded path
+(ob_guarded_body, ob_var_bindings_body, ob_send_via, ob_perform/
+ob_perform_general) compiles to an FDE with no personality and no LSDA —
+dwarfdump --eh-frame shows 0 personality CIEs and the only 84 LSDA-carrying
+FDEs are std/backtrace library code, none in ported::objcbridge. Same as the
+C build (0 personalities). No C-unwind ABI needed; a Rust panic would abort,
+which is unreachable anyway (no panics on these paths). Guest-side EH
+(ocerz_objc_exception_throw & friends) switches cpu->rip to the guest's
+__cxa_* and returns — it does not longjmp across Rust frames.
+
+Oracle: test_objcbridge exercises the whole send path including the guarded
+throw (its @try/@throw/@catch and rethrow cases); the full gate's native
+framework suite covers @catch of native throws plus the uncaught handler.
+
+Perf (./ocerz -native, 5x, min/median s; ~/AArchX-c/ocerz vs tip)
+
+| guest (clang -arch x86_64 -O2 -framework Foundation) | C | Rust |
+| sends (10M [NSObject hash]) | 0.42 / 0.43 | 0.40 / 0.42 |
+| guestsend (1M guest-class sends) | 0.57 / 0.59 | 0.58 / 0.60 |
+| fmt (1M snprintf %d/%s) | 0.17 / 0.19 | 0.18 / 0.18 |
+| exc (100k @try/@throw/@catch NSException) | 0.01 / 0.01 | 0.01 / 0.01 |
+
+Early Rust draft was 30-50% slower on sends/fmt because hot locals were
+zero-initialised where C leaves them uninitialised; MaybeUninit restored
+parity.
+
+## Static audit (lead's rule)
+
+C decl → Rust decl for the statics of sysbridge/objcclass/bridge:
+
+| C decl | Rust decl |
+|---|---|
+| static int en (oc_logging) | AtomicI32::new(-1) |
+| static struct sigaction before[NSIG] (host.rs) | static mut G_BR_SIGNALS_BEFORE |
+| pthread_mutex_t locks (G_SB_KEY_LOCK, G_SB_SYSTEM_LOCK, G_SB_POPEN_LOCK, G_OB_LOCK, G_OB_IMP_LOCK, G_OB_BLOCK_IMP_LOCK, G_OB_HOOK_LOCK, G_OB_EH_LOCK, G_BR_*_LOCK) | static mut libc::pthread_mutex_t = PTHREAD_MUTEX_INITIALIZER via &raw mut |
+| _Atomic pointers/counters | AtomicPtr/AtomicU32/AtomicU64, SeqCst |
+| static const tables | immutable repr(C) arrays with c"" names + unsafe impl Sync |
+| _Thread_local / __thread | #[thread_local] static mut |
+| function-local static caches | module-level atomics |
+
+Fixes applied in this audit commit: oc_logging now i32/-1; host signal
+snapshot moved to a real static under the lock; bounds-checked indexing of
+G_SB_KEYS/G_SB_RESERVED, G_BR_THUNKS, G_BR_VIEWS, G_BR_ZONE_FNS,
+G_BR_INTROSPECT_FNS, G_BR_EXC_PORTS, G_BR_CF_CAL_FNS, G_SB_FE_FLAGS converted
+to raw-pointer access keeping C's range checks.
