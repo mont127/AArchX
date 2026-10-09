@@ -1181,24 +1181,7 @@ pub unsafe fn scalar_pend_flush(b: *mut A64Buf) {
 }
 
 #[inline(always)]
-pub unsafe fn emit_pk_consts_load(b: *mut A64Buf) {
-    if unsafe { g_pk_consts_needed } == 0 {
-        return;
-    }
-    unsafe {
-        a64_mov_imm64(b, JT0 as c_int, 0x0008000000000000);
-        a64_fmov_v_from_x(b, 1, 4, JT0 as c_int);
-        a64_v_dup_d(b, 4, 4, 0);
-        a64_mov_imm64(b, JT0 as c_int, 0xfff8000000000000);
-        a64_fmov_v_from_x(b, 1, 5, JT0 as c_int);
-        a64_v_dup_d(b, 5, 5, 0);
-        a64_mov_imm64(b, JT0 as c_int, 0x00400000);
-        a64_fmov_v_from_x(b, 0, 6, JT0 as c_int);
-        a64_v_dup_s(b, 6, 6, 0);
-        a64_mov_imm64(b, JT0 as c_int, 0xffc00000);
-        a64_fmov_v_from_x(b, 0, 7, JT0 as c_int);
-        a64_v_dup_s(b, 7, 7, 0);
-    }
+pub unsafe fn emit_pk_consts_load(_b: *mut A64Buf) {
 }
 
 #[inline(always)]
