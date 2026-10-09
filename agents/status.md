@@ -2,12 +2,12 @@
 
 | file | lines | owner | status |
 |---|---|---|---|
-| a64emit.c | 947 | - | C |
+| a64emit.c | 947 | runtime (ee47e957) | ported |
 | abi.c | 1877 | native1 | in progress |
 | apidb.c | 1108 | native1 | in progress |
 | blocks.c | 914 | native1 | in progress |
 | bridge.c | 3379 | native2 | in progress |
-| cache.c | 1496 | - | C |
+| cache.c | 1496 | runtime (ee47e957) | in progress |
 | cpu.c | 163 | decode-agent | ported |
 | decode.c | 4435 | decode-agent | in progress |
 | dyld.c | 5840 | - | C |
@@ -27,15 +27,15 @@
 | jit_memory.c | 2184 | jit-memory-agent | in progress |
 | jit_simd.c | 3121 | jit-simd-agent | in progress |
 | jit_tcache.c | 1063 | jit-tcache-agent | in progress |
-| loader.c | 378 | - | C |
-| main.c | 419 | - | C |
+| loader.c | 378 | runtime (ee47e957) | in progress |
+| main.c | 419 | runtime (ee47e957) | in progress |
 | mem.c | 2342 | memvm | ported |
 | objcbridge.c | 3543 | native2 | in progress |
 | objcclass.c | 1609 | native2 | in progress |
-| stack.c | 137 | - | C |
+| stack.c | 137 | runtime (ee47e957) | in progress |
 | sysbridge.c | 2077 | native2 | ported |
 | syscall.c | 8906 | devin-9aa5caef | in progress |
-| tcache.c | 863 | - | C |
+| tcache.c | 863 | runtime (ee47e957) | in progress |
 | vdylib.c | 1424 | native1 | in progress |
 | vm.c | 4376 | memvm | in progress |
 | x87.c | 1277 | - | C |
