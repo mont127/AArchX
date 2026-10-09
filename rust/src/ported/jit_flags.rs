@@ -383,7 +383,7 @@ unsafe extern "C" {
     fn atexit(f: unsafe extern "C" fn()) -> c_int;
     fn clock_gettime_nsec_np(clock_id: c_int) -> u64;
     fn pthread_jit_write_protect_np(enabled: c_int);
-    fn sys_icache_invalidate(start: *const c_void, len: usize);
+    fn sys_icache_invalidate(start: *mut c_void, len: usize);
     fn ocerz_vm_purge_jit_ras(vm: *mut ffi::OcerzVM);
 }
 
