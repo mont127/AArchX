@@ -983,6 +983,48 @@ else
         fail=$((fail+1))
     fi
 fi
+# The weak-def name filter kept beside the translation store (src/cache.c),
+# three runs against one fresh store: the first must build and keep it, the
+# second must read it, and after its bytes are corrupted the third must reject
+# it and keep a good one again.  Every run must bind the library's 200
+# weak definitions right.
+run_weak_bloom_case() {
+    local name="$1" dir="$TMP/$1"
+    mkdir -p "$dir"
+    if ! clang++ -arch x86_64 -O1 -dynamiclib -install_name @rpath/libweak_bloom.dylib \
+            -o "$dir/libweak_bloom.dylib" tests/dynamic/weak_bloom_lib.cpp 2>/dev/null ||
+       ! clang -arch x86_64 -O1 -o "$dir/$name" tests/dynamic/weak_bloom.c -L"$dir" -lweak_bloom \
+            -Wl,-rpath,@executable_path 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local i want why kept
+    for i in 1 2 3; do
+        case $i in
+            1) want='weak filter kept' ;;
+            2) want='weak filter read' ;;
+            3) want='weak filter rejected'
+               kept=$(find "$dir/store" -name 'weakbloom-*.bin' | head -1)
+               printf 'corrupt' | dd of="$kept" bs=1 seek=500000 conv=notrunc 2>/dev/null ;;
+        esac
+        OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_MIN_FREE_MB=0 \
+            run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name"
+        why=""
+        if [ "$(cat "$dir/run$i.out")" != OK ]; then
+            why="got out='$(cat "$dir/run$i.out")'"
+        elif ! grep -q "$want" "$dir/run$i.err"; then
+            why="no '$want' in: $(grep -h 'weak filter' "$dir/run$i.err" | head -2 | tr '\n' ' ')"
+        elif [ $i = 3 ] && ! grep -q 'weak filter kept' "$dir/run$i.err"; then
+            why="the rejected filter was not kept again"
+        fi
+        if [ -z "$why" ]; then
+            echo "PASS $name-$i"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$i ($why)"; fail=$((fail+1))
+        fi
+    done
+}
+
+run_weak_bloom_case dweak_bloom
 run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'

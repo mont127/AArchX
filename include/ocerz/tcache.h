@@ -45,5 +45,6 @@ const OcerzTcRecHead *ocerz_tcache_find(uint64_t key);
 void ocerz_tcache_put(const OcerzTcRecHead *rec);
 void ocerz_tcache_flush(void);
 void ocerz_tcache_child(void);
+const char *ocerz_tcache_dir(int for_write);
 
 #endif
