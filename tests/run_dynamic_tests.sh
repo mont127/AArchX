@@ -847,6 +847,8 @@ run_golden_case drep_string tests/dynamic/rep_string.c tests/dynamic/rep_string.
 run_golden_case dcomis_mem tests/dynamic/comis_mem.c tests/dynamic/comis_mem.out
 run_golden_case dstack_pair tests/dynamic/stack_pair.c tests/dynamic/stack_pair.out
 run_golden_case dstack_run tests/dynamic/stack_run.c tests/dynamic/stack_run.out
+run_golden_case drot_flags tests/dynamic/rot_flags.c tests/dynamic/rot_flags.out
+run_golden_case dincdec_flags tests/dynamic/incdec_flags.c tests/dynamic/incdec_flags.out
 run_golden_case dshufps_self tests/dynamic/shufps_self.c tests/dynamic/shufps_self.out
 run_golden_case dcmp_mem_setcc tests/dynamic/cmp_mem_setcc.c tests/dynamic/cmp_mem_setcc.out
 run_golden_case dlowstack_disp tests/dynamic/lowstack_disp.c tests/dynamic/lowstack_disp.out
@@ -1012,6 +1014,8 @@ run_low_golden_case drep_string_low tests/dynamic/rep_string.c tests/dynamic/rep
 run_low_golden_case dcomis_mem_low tests/dynamic/comis_mem.c tests/dynamic/comis_mem.out
 run_low_golden_case dstack_pair_low tests/dynamic/stack_pair.c tests/dynamic/stack_pair.out
 run_low_golden_case dstack_run_low tests/dynamic/stack_run.c tests/dynamic/stack_run.out
+run_low_golden_case drot_flags_low tests/dynamic/rot_flags.c tests/dynamic/rot_flags.out
+run_low_golden_case dincdec_flags_low tests/dynamic/incdec_flags.c tests/dynamic/incdec_flags.out
 run_low_golden_case dshufps_self_low tests/dynamic/shufps_self.c tests/dynamic/shufps_self.out
 run_low_golden_case dcmp_mem_setcc_low tests/dynamic/cmp_mem_setcc.c tests/dynamic/cmp_mem_setcc.out
 run_low_golden_case dlowstack_disp_low tests/dynamic/lowstack_disp.c tests/dynamic/lowstack_disp.out

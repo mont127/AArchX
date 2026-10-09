@@ -6,10 +6,15 @@
  * direction is always "defines less, uses more".  DIV/IDIV leave the flags
  * architecturally UNDEFINED, but undefined is not killed: ocerz's interpreter
  * produces specific values there and the differential gate compares them, so
- * they are treated as defined.  Variable shifts by %cl, the rotates and
- * SHLD/SHRD are MAY-define, because a count that masks to zero preserves the
- * flags while any other count writes them - a distinction that cannot be made
- * statically.  SSE compares define everything (they write ZF/PF/CF and clear
+ * they are treated as defined.  Variable shifts and rotates by %cl, RCL/RCR
+ * and variable SHLD/SHRD are MAY-define, because a count that masks to zero
+ * preserves the flags while any other count writes them - a distinction that
+ * cannot be made statically.  With an immediate count it can: ROL and ROR by a
+ * nonzero count write CF and OF (OF with the count-1 formula for every count,
+ * as x86 hardware and Rosetta do) and pass the rest through, as the
+ * interpreter and emit_rot do.  Modelling them as using every
+ * flag kept the flags of the add before SHA-256's rotates alive through each
+ * round, which then called out to materialize them.  SSE compares define everything (they write ZF/PF/CF and clear
  * OF/SF/AF), bsf/bsr write only ZF and leave the rest, tzcnt/lzcnt write CF and
  * ZF, popcnt writes all.  Outside the compare-into-RFLAGS forms, FCMOVcc and
  * PTEST, the x87 and SSE regions are flag-neutral.
@@ -174,6 +179,16 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
 
     case OCERZ_OP_ROL:
     case OCERZ_OP_ROR:
+        if (insn->nops >= 2 && insn->ops[1].kind == OCERZ_OPK_IMM) {
+            unsigned rcnt = (unsigned)(insn->ops[1].imm &
+                                       (insn->ops[0].size == 8 ? 63u : 31u));
+            d = rcnt == 0 ? 0 : OCERZ_CF | OCERZ_OF;
+            u = 0;
+        } else {
+            d = OCERZ_FL_ALL;
+            u = OCERZ_FL_ALL;
+        }
+        break;
     case OCERZ_OP_RCL:
     case OCERZ_OP_RCR:
         d = OCERZ_FL_ALL;
