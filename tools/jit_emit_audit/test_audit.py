@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from audit import AuditError, Block, HEADER, HERE, INSN, MAGIC, RELOC, compare, diagnostics, instrument_rust, main, normalized, records
+from audit import AuditError, Block, HEADER, HERE, INSN, MAGIC, RELOC, build, compare, diagnostics, instrument_rust, main, normalized, records
 from x64 import block_sets, cache_coverage, compare_sets
 
 
@@ -37,6 +37,33 @@ def encode(value):
 
 
 class AuditTests(unittest.TestCase):
+    def test_build_uses_make_link_inputs_and_each_trees_entry_point(self):
+        for c_main in (True, False):
+            with self.subTest(c_main=c_main), tempfile.TemporaryDirectory() as tmp:
+                tree = Path(tmp)
+                (tree / "src").mkdir()
+                (tree / "src/main.o").write_bytes(b"stale when main is Rust")
+                (tree / "src/jit.c").write_text(
+                    "ocerz_jit_emit_audit_begin(); ocerz_jit_emit_audit();\n")
+                (tree / "Makefile").write_text(
+                    "CORE_OBJS := src/jit.o src/cache.o\n"
+                    "OBJS := $(CORE_OBJS)" + (" src/main.o" if c_main else "") + "\n"
+                    "RUSTLIB := rust/target/release/libocerz_rs.a\n"
+                    "RUST_SYSLIBS := -lc -lm\n"
+                    "LDLIBS := -lcompression\n"
+                    "print-core-objs:\n"
+                    "\t@echo $(CORE_OBJS) $(RUSTLIB) $(RUST_SYSLIBS) -lfrom-target\n")
+                work = tree / "audit"
+                with patch("audit.run") as commands:
+                    build(tree, work, tree / "diff32.c")
+                links = {command.args[0][command.args[0].index("-o") + 1]: command.args[0]
+                         for command in commands.call_args_list if "-o" in command.args[0]}
+                for binary in (work / "diff32", work / "ocerz"):
+                    self.assertEqual("src/main.o" in links[binary], c_main and binary.name == "ocerz")
+                    self.assertIn("-lfrom-target", links[binary])
+                    self.assertIn("-lcompression", links[binary])
+                    self.assertIn("rust/target/release/libocerz_rs.a", links[binary])
+
     def test_rust_core_instrumentation_is_guarded_and_idempotent(self):
         source = ("    let mut b: A64Buf = core::mem::zeroed();\n"
                   "    g_tc_on = if g_tc_rec != 0 || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP as c_int { tc_usable(jit) } else { 0 };\n"

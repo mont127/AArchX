@@ -2,7 +2,8 @@
 """Build and compare isolated C/Rust JIT emission oracles on arm64 macOS.
 
 The reference supplies the exact same diff32 corpus source to both builds.
-Normal objects come from Makefile's CORE_OBJS, not a stale-object glob. Only
+Normal objects come from Makefile's print-core-objs, not a stale-object glob.
+Non-core OBJS supply each tree's entry point (none for a weak Rust main). Only
 the core is instrumented: a temporary C copy, or a separate cfg-enabled Rust
 archive. Neither tree's sources nor normal objects are replaced. Sequential
 offset/low runs force fresh roundtrip translations and discard ambient OCERZ
@@ -229,19 +230,25 @@ def instrument_rust(source):
                           "    if audit_x64 != 0 { g_tc_on = 1; }")
 
 
+def make_output(tree, *args):
+    result = subprocess.run(["make", "-s", *args], cwd=tree, capture_output=True, text=True)
+    if result.returncode:
+        raise AuditError(f"cannot read {tree}'s Makefile inputs: {result.stderr}")
+    return result.stdout
+
+
 def build(tree, work, corpus):
     work.mkdir()
     log = work / "build.log"
     run(["make", "-j8", "ocerz"], tree, log)
+    objects = shlex.split(make_output(tree, "print-core-objs"))
     manifest = work / "inputs.mk"
     manifest.write_text(".PHONY: jit_emit_audit_inputs\n"
                         "jit_emit_audit_inputs:\n"
-                        "\t@printf '%s\\n' $(CORE_OBJS) $(RUSTLIB) $(LDLIBS) $(RUST_SYSLIBS)\n")
-    result = subprocess.run(["make", "-s", "-f", "Makefile", "-f", str(manifest),
-                             "jit_emit_audit_inputs"], cwd=tree, capture_output=True, text=True)
-    if result.returncode:
-        raise AuditError(f"cannot read {tree}'s Makefile inputs: {result.stderr}")
-    objects = result.stdout.splitlines()
+                        "\t@printf '%s\\n' '$(filter-out $(CORE_OBJS),$(OBJS))' '$(LDLIBS)'\n")
+    entry, libraries = [shlex.split(line) for line in make_output(
+        tree, "-f", "Makefile", "-f", str(manifest), "jit_emit_audit_inputs").splitlines()]
+    objects += libraries
     flags = ["clang", "-arch", "arm64", "-std=c11", "-O2", "-g", "-Wall", "-Wextra",
              "-Wno-unused-parameter", "-Iinclude"]
     if "src/jit.o" in objects:
@@ -278,7 +285,7 @@ def build(tree, work, corpus):
     run(flags + ["-Werror", "-c", HERE / "writer.c", "-o", writer], tree, log)
     binary = work / "diff32"
     run(flags + ["-o", binary, corpus] + objects + [writer], tree, log)
-    run(flags + ["-o", work / "ocerz", "src/main.o"] + objects + [writer], tree, log)
+    run(flags + ["-o", work / "ocerz"] + entry + objects + [writer], tree, log)
     return binary
 
 
