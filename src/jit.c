@@ -21148,11 +21148,35 @@ promo_push_fallthrough:
 
     l0_flush_all(&b);
     if (!is_terminator(blk->insns[n - 1].op)) {
-
-        emit_materialize(&b);
-        a64_mov_imm64(&b, JT0, mode32 ? (uint64_t)(uint32_t)pc : pc);
-        a64_str(&b, 8, JT0, 20, RIP_OFF);
-        a64_mov_imm64(&b, 0, OCERZ_STEP_OK);
+        /*
+         * A block that stops at the length cap goes on at the next instruction, as
+         * if it ended in a jmp there: a chained edge, and the flags left lazy for
+         * the next block, which reads them as any block does.  It used to
+         * materialize them and return to the dispatcher, which in SHA-256's
+         * unrolled rounds was a call-out and a hash lookup every 256 instructions.
+         * Blocks that stop for other reasons keep that exit; so does every block
+         * under OCERZ_NO_CAP_CHAIN=1.
+         */
+        static int capchain = -1;
+        if (capchain < 0) capchain = getenv("OCERZ_NO_CAP_CHAIN") ? 0 : 1;
+        uint64_t next = mode32 ? (uint64_t)(uint32_t)pc : pc;
+        if (capchain && !g_no_chain && n >= JIT_MAX_BLOCK_INSNS && !g_chain_target &&
+            g_n_jcc_edges == 0 && g_n_call_edges == 0) {
+            int edge_class = body_edge_pin_class();
+            int body_edge = edge_class >= 0;
+            uint32_t *pb = emit_static_chain_tail(&b, next, 0, body_edge, epi_sites, &n_epi);
+            g_jcc_edge[0].target_rip = next;
+            g_jcc_edge[0].patch_b = pb;
+            g_jcc_edge[0].cond_site = NULL;
+            g_jcc_edge[0].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
+            g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
+            g_n_jcc_edges = 1;
+        } else {
+            emit_materialize(&b);
+            a64_mov_imm64(&b, JT0, next);
+            a64_str(&b, 8, JT0, 20, RIP_OFF);
+            a64_mov_imm64(&b, 0, OCERZ_STEP_OK);
+        }
     }
 
     uint32_t *exit_label = a64_label(&b);
