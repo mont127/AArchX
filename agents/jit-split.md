@@ -184,6 +184,10 @@ with that one early return removed leaves **zero differences across 52,084
 variants in all 38 affected fixtures**. Thus the newly ported core exposes
 more calls of an existing shared-helper mismatch, not a second discrepancy.
 Per-case JSON contains the complete RIP/digest inventory for this run.
+The final re-audit on `52e8818` (including the shared-cache and objcbridge
+ports) reports **256/427,713**, of which x64 has 212,418 variants. Its complete
+normalized mismatch inventory is identical to `92b63de`; i386 and all native
+cases still match. Only sampled system-cache coverage changed.
 
 The runner recognizes the landed Rust core's original sink-only contract and
 adds the x64 begin/relocation guards in its temporary crate copy; this does not
