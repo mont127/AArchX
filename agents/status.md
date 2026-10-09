@@ -40,7 +40,7 @@
 | vm.c | 4376 | memvm | in progress |
 | x87.c | 1277 | - | C |
 | abicall.s | 237 | native1 | in progress |
-| leaf.s | 598 | native1 | in progress |
+| leaf.s | 598 | native1 | ported |
 | objcguard.s | 60 | native2 | ported |
 
 ## Tip breakages
