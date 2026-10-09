@@ -197,7 +197,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 unsafe extern "C" {
     fn __assert_rtn(function: *const ::core::ffi::c_char, file: *const ::core::ffi::c_char, line: ::core::ffi::c_int, expression: *const ::core::ffi::c_char) -> !;
     fn clock_gettime_nsec_np(clock_id: clockid_t) -> uint64_t;
-    fn sys_icache_invalidate(start: *const ::core::ffi::c_void, len: size_t);
+    fn sys_icache_invalidate(start: *mut ::core::ffi::c_void, len: size_t);
 }
 
 
