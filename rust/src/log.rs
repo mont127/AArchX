@@ -19,7 +19,7 @@ macro_rules! ocerz_log {
         unsafe {
             if $crate::ffi::ocerz_verbose >= 1 {
                 ::libc::fprintf($crate::log::stderr(),
-                    concat!("ocerz: ", $fmt).as_ptr() as *const _ $(, $arg)*);
+                    concat!("ocerz: ", $fmt, "\0").as_ptr() as *const _ $(, $arg)*);
             }
         }
     };
@@ -31,7 +31,7 @@ macro_rules! ocerz_trace {
         unsafe {
             if $crate::ffi::ocerz_verbose >= 2 {
                 ::libc::fprintf($crate::log::stderr(),
-                    concat!("ocerz: ", $fmt).as_ptr() as *const _ $(, $arg)*);
+                    concat!("ocerz: ", $fmt, "\0").as_ptr() as *const _ $(, $arg)*);
             }
         }
     };
@@ -42,7 +42,7 @@ macro_rules! ocerz_fatal {
     ($fmt:literal $(, $arg:expr)*) => {
         unsafe {
             ::libc::fprintf($crate::log::stderr(),
-                concat!("ocerz: fatal: ", $fmt).as_ptr() as *const _ $(, $arg)*);
+                concat!("ocerz: fatal: ", $fmt, "\0").as_ptr() as *const _ $(, $arg)*);
         }
     };
 }
