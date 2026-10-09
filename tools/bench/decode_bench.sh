@@ -18,7 +18,8 @@ for tree in $TREES; do
     i=$((i + 1))
     name=$(basename "$tree")_$i
     ( cd "$tree" && make -s ocerz ) || { echo "build failed in $tree"; exit 1; }
-    objs=$( cd "$tree" && make -s print-core-objs )
+    objs=$( cd "$tree" && make -s print-core-objs 2>/dev/null ) || \
+        objs=$(ls "$tree"/src/*.o | grep -v '/main\.o$' | tr '\n' ' ')
     ( cd "$tree" && clang -arch arm64 -std=c11 -O2 -g -Iinclude -o "$tmp/bench_$name" \
         "$SELF/tools/bench/decode_bench.c" $objs -lcompression ) \
         || { echo "bench build failed in $tree"; exit 1; }
