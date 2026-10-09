@@ -42,8 +42,8 @@
 | abicall.s | 237 | native1 | in progress |
 | leaf.s | 598 | native1 | in progress |
 | objcguard.s | 60 | native2 | ported |
- 
+
 ## Tip breakages
 
 - At detached tip commit `ff3e398`, `datomic_counter-no-jit` timed out (exit 124; expected `OK`) in the full gate. The current dynamic failure list is identical.
-- `3283d71` (`tests: JIT emission is compared across C and Rust trees`): a clean checkout builds, but `bash tests/run_native_framework_tests.sh` exits 71 with `ocerz: native: no bridge for _ferror in /usr/lib/libSystem.B.dylib` and 70 unresolved imports (`/tmp/ocerz-native-frameworks.lPNMWU`). The a64emit branch also fails this phase later, at `compat.expected.err stdin differ: char 1, line 1`; its `compat.jit.err` has an extra `:/:\capacity overflow` line (`/tmp/ocerz-native-frameworks.Ul7MNV`). The relationship between that later mismatch and a64emit is unverified, so do not push until resolved.
+- `3283d71`: `tests/run_native_framework_tests.sh` fails at the compat check because `compat.jit.err` gains a stray `:/:\capacity overflow` line before the identity-arena log; reproduced on a clean tip checkout after `make apis`. Rust modules on that tip: `cpu`, `flags`, `flags_live`, `globals`, `objcguard`.
