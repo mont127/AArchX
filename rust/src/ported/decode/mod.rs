@@ -472,7 +472,7 @@ unsafe fn decode_modrm(s: &mut DecState, m: &mut ModRM, mem_size: c_int) -> c_in
 #[inline]
 unsafe fn fixup_riprel(s: &mut DecState) {
     for i in 0..(*s.out).nops as usize {
-        let op = &mut (*s.out).ops[i];
+        let op = (*s.out).ops.get_unchecked_mut(i);
         if op.kind == OCERZ_OPK_MEM as u8 && op.riprel != 0 {
             op.disp = (s.rip + cur_len(s) as u64).wrapping_add(op.disp as u64) as i64;
         }
