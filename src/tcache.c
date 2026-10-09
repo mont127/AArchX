@@ -559,6 +559,22 @@ static const uint8_t *file_at(uint64_t no, uint64_t off, uint64_t need)
     return f->p + off;
 }
 
+/*
+ * The store's directory, for other per-build caches kept beside it: NULL when
+ * the store is off or did not open, and for writing when it is under the
+ * free-space floor too.
+ */
+const char *ocerz_tcache_dir(int for_write)
+{
+    int m = ocerz_tcache_mode();
+    if (m != OCERZ_TC_ON && m != OCERZ_TC_VERIFY)
+        return NULL;
+    pthread_mutex_lock(&g_lock);
+    int ok = open_store();
+    pthread_mutex_unlock(&g_lock);
+    return ok && !(for_write && g_full) ? g_dir : NULL;
+}
+
 const OcerzTcRecHead *ocerz_tcache_find(uint64_t key)
 {
     const OcerzTcRecHead *found = NULL;

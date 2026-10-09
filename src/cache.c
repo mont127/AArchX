@@ -102,6 +102,7 @@
 #include <pthread.h>
 
 #include "ocerz/mem.h"
+#include "ocerz/tcache.h"
 
 #define CACHE_STEM "dyld_shared_cache_x86_64"
 
@@ -1431,6 +1432,91 @@ static int collect_image_exports(OcerzCache *c, uint64_t mh, uint8_t *bloom, uin
     return 0;
 }
 
+/*
+ * The weak-def name filter depends on nothing but the shared cache, yet every
+ * process that made 128 weak lookups built it again: 990,000 names from the
+ * 308 weak-defining images and those they re-export, 37 ms.  A C++ library's
+ * own binds make that many; ollama --version dlopens an x86 libmlx whose do.
+ * So the filter is kept in the translation store's directory (one per ocerz
+ * build), named for the cache's UUID, with a sum over its bytes, written to a
+ * temporary name and renamed into place.  It is read at the first weak
+ * lookup, which also spares the 128 lookups made without it.  With the store
+ * off (OCERZ_TCACHE=off) nothing is read or kept, and under its free-space
+ * floor nothing is written.
+ */
+#define WEAKBLOOM_MAGIC 0x4d4c4257u
+typedef struct WeakBloomHead {
+    uint32_t magic, bits;
+    uint8_t uuid[16];
+    uint64_t count, sum;
+} WeakBloomHead;
+
+static uint64_t weakbloom_sum(const uint8_t *bloom)
+{
+    uint64_t h = 0x6a09e667f3bcc909ull, w;
+    for (size_t i = 0; i < NAMEBLOOM_BITS / 8; i += 8) {
+        memcpy(&w, bloom + i, 8);
+        h = (h ^ w) * 0x9e3779b97f4a7c15ull;
+        h ^= h >> 29;
+    }
+    return h;
+}
+
+static int weakbloom_path(const OcerzCache *c, char *path, size_t n, int for_write)
+{
+    const char *dir = ocerz_tcache_dir(for_write);
+    if (!dir || !c->hdr)
+        return 0;
+    const uint8_t *u = c->hdr + 0x58;
+    snprintf(path, n, "%s/weakbloom-%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x.bin", dir,
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+    return 1;
+}
+
+static uint8_t *weakbloom_load(const OcerzCache *c)
+{
+    char path[1400];
+    if (!weakbloom_path(c, path, sizeof path, 0))
+        return NULL;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return NULL;
+    WeakBloomHead hd;
+    uint8_t *bloom = calloc(NAMEBLOOM_BITS / 8, 1);
+    int ok = bloom && read(fd, &hd, sizeof hd) == (ssize_t)sizeof hd && hd.magic == WEAKBLOOM_MAGIC &&
+             hd.bits == NAMEBLOOM_BITS && memcmp(hd.uuid, c->hdr + 0x58, 16) == 0 &&
+             read(fd, bloom, NAMEBLOOM_BITS / 8) == (ssize_t)(NAMEBLOOM_BITS / 8) &&
+             weakbloom_sum(bloom) == hd.sum;
+    close(fd);
+    if (getenv("OCERZ_TCACHE_LOG"))
+        fprintf(stderr, "ocerz: TCACHE[%d] weak filter %s %s\n", (int)getpid(), ok ? "read from" : "rejected,", path);
+    if (!ok) {
+        free(bloom);
+        return NULL;
+    }
+    return bloom;
+}
+
+static void weakbloom_save(const OcerzCache *c, const uint8_t *bloom, uint64_t count)
+{
+    char path[1400], tmp[1500];
+    if (!weakbloom_path(c, path, sizeof path, 1))
+        return;
+    snprintf(tmp, sizeof tmp, "%s.%d", path, (int)getpid());
+    WeakBloomHead hd = { WEAKBLOOM_MAGIC, NAMEBLOOM_BITS, { 0 }, count, weakbloom_sum(bloom) };
+    memcpy(hd.uuid, c->hdr + 0x58, 16);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return;
+    int ok = write(fd, &hd, sizeof hd) == (ssize_t)sizeof hd &&
+             write(fd, bloom, NAMEBLOOM_BITS / 8) == (ssize_t)(NAMEBLOOM_BITS / 8);
+    close(fd);
+    if (!ok || rename(tmp, path) != 0)
+        unlink(tmp);
+    else if (getenv("OCERZ_TCACHE_LOG"))
+        fprintf(stderr, "ocerz: TCACHE[%d] weak filter kept in %s\n", (int)getpid(), path);
+}
+
 uint64_t ocerz_cache_resolve_weak_ex(OcerzCache *c, const char *symbol, int *found,
                                      int (*loaded)(uint64_t mh))
 {
@@ -1457,6 +1543,11 @@ uint64_t ocerz_cache_resolve_weak_ex(OcerzCache *c, const char *symbol, int *fou
                 weak[nweak++] = mh;
         }
         built = 1;
+        uint8_t *kept = weakbloom_load(c);
+        if (kept) {
+            __atomic_store_n(&bloom, kept, __ATOMIC_RELEASE);
+            bloom_built = 1;
+        }
     }
     if (!bloom_built && ++lookups > WEAK_FILTER_AFTER) {
         uint64_t *seen = calloc(cap, sizeof *seen);
@@ -1472,6 +1563,8 @@ uint64_t ocerz_cache_resolve_weak_ex(OcerzCache *c, const char *symbol, int *fou
         free(seen);
         __atomic_store_n(&bloom, fresh, __ATOMIC_RELEASE);
         bloom_built = 1;
+        if (fresh)
+            weakbloom_save(c, fresh, count);
     }
     pthread_mutex_unlock(&lock);
     const uint8_t *bl = __atomic_load_n(&bloom, __ATOMIC_ACQUIRE);
