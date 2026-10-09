@@ -7,7 +7,7 @@
 | apidb.c | 1108 | native1 | ported |
 | blocks.c | 914 | native1 | ported |
 | bridge.c | 3379 | native2 | ported |
-| cache.c | 1496 | runtime (ee47e957) | in progress |
+| cache.c | 1496 | runtime (ee47e957) | ported |
 | cpu.c | 163 | decode-agent | ported |
 | decode.c | 4435 | decode-agent | ported |
 | dyld.c | 5840 | dyld-agent | ported |
