@@ -44,6 +44,7 @@ zeroing rules, plus the SSE memory-operand front end `emit_sse_mem_addr`.
   `src/jit_simd.c` line by line; tidy it only with the emission audit in the
   loop.
 - `jit_internal` predicates return `c_int`, not `bool`; compare with `!= 0`.
+- Runtime-indexed arrays (`g_raslit`, `g_yc`, `g_fpb_det`, shuffle selectors, `ops[k]`) use raw-pointer or `get_unchecked` access, matching C's unchecked indexing; every static's type, signedness and initializer was checked against the C declarations.
 
 ## Verification
 

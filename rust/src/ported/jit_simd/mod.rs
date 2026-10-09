@@ -2120,19 +2120,34 @@ unsafe fn emit_sse_movmskp(mut b: *mut A64Buf, mut insn: *const X86Insn) -> ::co
     let mut dbl: ::core::ffi::c_int = ((*insn).op as ::core::ffi::c_int
         == OCERZ_OP_MOVMSKPD as ::core::ffi::c_int)
         as ::core::ffi::c_int;
-    g_raslit[g_n_raslit as usize].site = a64_label(b);
-    g_raslit[g_n_raslit as usize].retaddr = (if dbl != 0 {
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .site = a64_label(b);
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .retaddr = (if dbl != 0 {
         1 as ::core::ffi::c_ulonglong
     } else {
         0x200000001 as ::core::ffi::c_ulonglong
     }) as u64;
-    g_raslit[g_n_raslit as usize].hi = (if dbl != 0 {
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .hi = (if dbl != 0 {
         2 as ::core::ffi::c_ulonglong
     } else {
         0x800000004 as ::core::ffi::c_ulonglong
     }) as u64;
-    g_raslit[g_n_raslit as usize].kind = 2 as ::core::ffi::c_int;
-    g_raslit[g_n_raslit as usize].rt = VX1 as ::core::ffi::c_int;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .kind = 2 as ::core::ffi::c_int;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .rt = VX1 as ::core::ffi::c_int;
     g_n_raslit += 1;
     a64_emit32(b, 0x9c000000 as u32 | VX1 as ::core::ffi::c_int as u32);
     if dbl != 0 {
@@ -2352,11 +2367,26 @@ unsafe fn emit_sse_cvtp(
     return 1 as ::core::ffi::c_int;
 }
 unsafe fn emit_v_literal(mut b: *mut A64Buf, mut vt: ::core::ffi::c_int, mut lo: u64, mut hi: u64) {
-    g_raslit[g_n_raslit as usize].site = a64_label(b);
-    g_raslit[g_n_raslit as usize].retaddr = lo;
-    g_raslit[g_n_raslit as usize].hi = hi;
-    g_raslit[g_n_raslit as usize].kind = 2 as ::core::ffi::c_int;
-    g_raslit[g_n_raslit as usize].rt = vt;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .site = a64_label(b);
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .retaddr = lo;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .hi = hi;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .kind = 2 as ::core::ffi::c_int;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .rt = vt;
     g_n_raslit += 1;
     a64_emit32(b, 0x9c000000 as u32 | vt as u32);
 }
@@ -2631,7 +2661,10 @@ unsafe fn emit_sse_comis(
         && (*s).kind as ::core::ffi::c_int == OCERZ_OPK_XMM as ::core::ffi::c_int
     {
         if fpb_det_here(g_cur_insn_idx) != 0
-            && g_fpb_det[g_cur_insn_idx as usize] as ::core::ffi::c_int == 2 as ::core::ffi::c_int
+            && *(&raw const g_fpb_det)
+                .cast::<u8>()
+                .add(g_cur_insn_idx as usize) as ::core::ffi::c_int
+                == 2 as ::core::ffi::c_int
         {
             let mut vb: ::core::ffi::c_int = l0_src2(b, (*s).reg as ::core::ffi::c_uint, dbl);
             let mut va: ::core::ffi::c_int = l0_src2(b, (*d).reg as ::core::ffi::c_uint, dbl);
@@ -3540,7 +3573,7 @@ unsafe fn emit_sse_pshufd(
     while i < 4 as ::core::ffi::c_int {
         let mut k: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
         while k < 4 as ::core::ffi::c_int {
-            let mut byte: u64 = sel[i as usize]
+            let mut byte: u64 = (*sel.get_unchecked(i as usize))
                 .wrapping_mul(4 as ::core::ffi::c_uint)
                 .wrapping_add(k as ::core::ffi::c_uint) as u64;
             let mut pos: ::core::ffi::c_int = i * 4 as ::core::ffi::c_int + k;
@@ -3553,11 +3586,26 @@ unsafe fn emit_sse_pshufd(
         }
         i += 1;
     }
-    g_raslit[g_n_raslit as usize].site = a64_label(b);
-    g_raslit[g_n_raslit as usize].retaddr = lo;
-    g_raslit[g_n_raslit as usize].hi = hi;
-    g_raslit[g_n_raslit as usize].kind = 2 as ::core::ffi::c_int;
-    g_raslit[g_n_raslit as usize].rt = VX0 as ::core::ffi::c_int;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .site = a64_label(b);
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .retaddr = lo;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .hi = hi;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .kind = 2 as ::core::ffi::c_int;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .rt = VX0 as ::core::ffi::c_int;
     g_n_raslit += 1;
     a64_emit32(b, 0x9c000000 as u32 | VX0 as ::core::ffi::c_int as u32);
     a64_v_tbl1(b, vd, vs, VX0 as ::core::ffi::c_int);
@@ -4301,7 +4349,7 @@ unsafe fn emit_sse_shufp(
         let mut k1: ::core::ffi::c_int = -(1 as ::core::ffi::c_int);
         let mut k: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
         while k < 4 as ::core::ffi::c_int {
-            if sel[k as usize] != k {
+            if *sel.get_unchecked(k as usize) != k {
                 changed += 1;
                 k1 = k;
             }
@@ -4318,7 +4366,7 @@ unsafe fn emit_sse_shufp(
             return 1 as ::core::ffi::c_int;
         }
         if changed == 1 as ::core::ffi::c_int {
-            a64_ins_s_s(b, v, k1, v, sel[k1 as usize]);
+            a64_ins_s_s(b, v, k1, v, *sel.get_unchecked(k1 as usize));
             return 1 as ::core::ffi::c_int;
         }
     }
@@ -6026,11 +6074,26 @@ unsafe fn emit_sse_round(
     return 1 as ::core::ffi::c_int;
 }
 unsafe fn emit_mskb_bits(mut b: *mut A64Buf, mut vt: ::core::ffi::c_int) {
-    g_raslit[g_n_raslit as usize].site = a64_label(b);
-    g_raslit[g_n_raslit as usize].retaddr = 0x8040201008040201 as ::core::ffi::c_ulonglong as u64;
-    g_raslit[g_n_raslit as usize].hi = 0x8040201008040201 as ::core::ffi::c_ulonglong as u64;
-    g_raslit[g_n_raslit as usize].kind = 2 as ::core::ffi::c_int;
-    g_raslit[g_n_raslit as usize].rt = vt;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .site = a64_label(b);
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .retaddr = 0x8040201008040201 as ::core::ffi::c_ulonglong as u64;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .hi = 0x8040201008040201 as ::core::ffi::c_ulonglong as u64;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .kind = 2 as ::core::ffi::c_int;
+    (*(&raw mut g_raslit)
+        .cast::<RasLit>()
+        .add(g_n_raslit as usize))
+    .rt = vt;
     g_n_raslit += 1;
     a64_emit32(b, 0x9c000000 as u32 | vt as u32);
 }
@@ -6126,8 +6189,10 @@ unsafe fn ymmh_src(
     mut xr: ::core::ffi::c_uint,
     mut vtmp: ::core::ffi::c_int,
 ) -> ::core::ffi::c_int {
-    if g_yc[xr as usize] as ::core::ffi::c_int >= 0 as ::core::ffi::c_int {
-        return g_yc[xr as usize] as ::core::ffi::c_int;
+    if *(&raw const g_yc).cast::<i8>().add(xr as usize) as ::core::ffi::c_int
+        >= 0 as ::core::ffi::c_int
+    {
+        return *(&raw const g_yc).cast::<i8>().add(xr as usize) as ::core::ffi::c_int;
     }
     if g_ymmh_zero as ::core::ffi::c_uint & (1 as ::core::ffi::c_uint) << xr != 0 {
         a64_v_zero(b, vtmp);
@@ -6147,8 +6212,10 @@ unsafe fn ymmh_dst(
     mut xr: ::core::ffi::c_uint,
     mut vtmp: ::core::ffi::c_int,
 ) -> ::core::ffi::c_int {
-    return if g_yc[xr as usize] as ::core::ffi::c_int >= 0 as ::core::ffi::c_int {
-        g_yc[xr as usize] as ::core::ffi::c_int
+    return if *(&raw const g_yc).cast::<i8>().add(xr as usize) as ::core::ffi::c_int
+        >= 0 as ::core::ffi::c_int
+    {
+        *(&raw const g_yc).cast::<i8>().add(xr as usize) as ::core::ffi::c_int
     } else {
         vtmp
     };
@@ -6171,9 +6238,15 @@ unsafe fn emit_ymmh_st(
     g_ymmh_zero = (g_ymmh_zero as ::core::ffi::c_int
         & !((1 as ::core::ffi::c_uint) << xr) as u16 as ::core::ffi::c_int)
         as u16;
-    if g_yc[xr as usize] as ::core::ffi::c_int >= 0 as ::core::ffi::c_int {
-        if vs != g_yc[xr as usize] as ::core::ffi::c_int {
-            a64_v_mov(b, g_yc[xr as usize] as ::core::ffi::c_int, vs);
+    if *(&raw const g_yc).cast::<i8>().add(xr as usize) as ::core::ffi::c_int
+        >= 0 as ::core::ffi::c_int
+    {
+        if vs != *(&raw const g_yc).cast::<i8>().add(xr as usize) as ::core::ffi::c_int {
+            a64_v_mov(
+                b,
+                *(&raw const g_yc).cast::<i8>().add(xr as usize) as ::core::ffi::c_int,
+                vs,
+            );
         }
         g_yc_dirty = (g_yc_dirty as ::core::ffi::c_int
             | ((1 as ::core::ffi::c_uint) << xr) as u16 as ::core::ffi::c_int)
@@ -6193,8 +6266,13 @@ pub unsafe extern "C" fn emit_ymmh_clear(mut b: *mut A64Buf, mut xr: ::core::ffi
     if g_ymmh_zero as ::core::ffi::c_uint & (1 as ::core::ffi::c_uint) << xr != 0 {
         return;
     }
-    if g_yc[xr as usize] as ::core::ffi::c_int >= 0 as ::core::ffi::c_int {
-        a64_v_zero(b, g_yc[xr as usize] as ::core::ffi::c_int);
+    if *(&raw const g_yc).cast::<i8>().add(xr as usize) as ::core::ffi::c_int
+        >= 0 as ::core::ffi::c_int
+    {
+        a64_v_zero(
+            b,
+            *(&raw const g_yc).cast::<i8>().add(xr as usize) as ::core::ffi::c_int,
+        );
         g_yc_dirty = (g_yc_dirty as ::core::ffi::c_int
             | ((1 as ::core::ffi::c_uint) << xr) as u16 as ::core::ffi::c_int)
             as u16;
@@ -8665,9 +8743,9 @@ unsafe fn emit_vex_sse128(
         if (*insn).vvvv as ::core::ffi::c_int != (*d).reg as ::core::ffi::c_int {
             let mut k: ::core::ffi::c_int = 1 as ::core::ffi::c_int;
             while k < (*insn).nops as ::core::ffi::c_int {
-                if (*insn).ops[k as usize].kind as ::core::ffi::c_int
+                if (*insn).ops.get_unchecked(k as usize).kind as ::core::ffi::c_int
                     == OCERZ_OPK_XMM as ::core::ffi::c_int
-                    && (*insn).ops[k as usize].reg as ::core::ffi::c_int
+                    && (*insn).ops.get_unchecked(k as usize).reg as ::core::ffi::c_int
                         == (*d).reg as ::core::ffi::c_int
                 {
                     return if (*insn).op as ::core::ffi::c_int
@@ -8828,8 +8906,13 @@ pub unsafe extern "C" fn emit_vex(
             }
             let mut r: ::core::ffi::c_uint = 0 as ::core::ffi::c_uint;
             while r < 16 as ::core::ffi::c_uint {
-                if g_yc[r as usize] as ::core::ffi::c_int >= 0 as ::core::ffi::c_int {
-                    a64_v_zero(b, g_yc[r as usize] as ::core::ffi::c_int);
+                if *(&raw const g_yc).cast::<i8>().add(r as usize) as ::core::ffi::c_int
+                    >= 0 as ::core::ffi::c_int
+                {
+                    a64_v_zero(
+                        b,
+                        *(&raw const g_yc).cast::<i8>().add(r as usize) as ::core::ffi::c_int,
+                    );
                     g_yc_dirty = (g_yc_dirty as ::core::ffi::c_int
                         | ((1 as ::core::ffi::c_uint) << r) as u16 as ::core::ffi::c_int)
                         as u16;
