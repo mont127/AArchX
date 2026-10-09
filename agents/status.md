@@ -21,7 +21,7 @@
 | jit.c | 2844 | - | C, split core; see jit-split.md |
 | jit_cache.c | 3185 | devin-4a0e3105 | in progress |
 | jit_control.c | 2070 | jit-control-agent | in progress |
-| jit_flags.c | 2778 | jit-flags-agent | in progress |
+| jit_flags.c | 2778 | jit-flags-agent | ported (shim: jit_flags_shim.c) |
 | jit_fp.c | 3203 | jit-fp-agent | ported |
 | jit_integer.c | 2678 | jit-integer-agent | ported: rust/src/ported/jit_integer.rs, emit audit MATCH, no C shim (agents/jit-integer.md) |
 | jit_memory.c | 2184 | jit-memory-agent | ported: rust/src/ported/jit_memory.rs, emit audit MATCH, no C shim (agents/jit-memory.md) |
