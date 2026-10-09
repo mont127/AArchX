@@ -69,3 +69,10 @@ C 24.373 s, Rust 24.253 s median (-0.5%; run-to-run spread is about 3 s, so
 this is no measurable change). A first four-run pass showed +5.0% inside the
 same spread; the longer pass does not reproduce it. Translation-time work in
 this piece is a small share of `translate`, so no regression is expected.
+
+After rebasing onto f9753d8 (the log-format NUL fix) the native framework
+failure is gone; the full gate's only new failure was `datomic_counter-no-jit`
+hitting the 30 s dynamic timeout. That case runs in the interpreter (no
+translation, so none of this module runs) and takes 30-31 s in isolation on
+this VM (27-29 s for the 16a7c2d reference), so it is a borderline timeout,
+not a JIT difference. The audit still reports MATCH after the rebase.
