@@ -381,13 +381,13 @@ unsafe extern "C" {
     fn strtoull(s: *const c_char, end: *mut *mut c_char, base: c_int) -> u64;
     fn getpid() -> c_int;
     fn atexit(f: unsafe extern "C" fn()) -> c_int;
-    fn clock_gettime_nsec_np(clock_id: c_int) -> u64;
+    fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
     fn pthread_jit_write_protect_np(enabled: c_int);
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
     fn ocerz_vm_purge_jit_ras(vm: *mut ffi::OcerzVM);
 }
 
-const CLOCK_UPTIME_RAW: c_int = 8;
+const CLOCK_UPTIME_RAW: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
 const A64_NOP_WORD: u32 = 0xd503_201f;
 const PROBE_BIT: u32 = 10;
 const WATCH_BIT: u32 = 16;
