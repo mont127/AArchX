@@ -6362,6 +6362,45 @@ static int comis_fuse_producer(const X86Insn *insns, int ci)
     }
     return pi;
 }
+/*
+ * A jcc, setcc or cmovcc on ZF or CF after a ptest of two pinned registers,
+ * neither written in between: the consumer tests the registers itself, so the
+ * ptest's flags are dead and it emits nothing.  Going through RFLAGS was most
+ * of deno's hottest loop, a 16-byte compare slid a byte at a time.
+ * OCERZ_NO_PTEST_FUSE=1 keeps the two apart.
+ */
+static int ptest_fuse_producer(const X86Insn *insns, int ci)
+{
+    if (ENV_ON("OCERZ_NO_PTEST_FUSE") || ENV_ON("OCERZ_NO_INLINE_PTEST")) return -1;
+    if (!cc_consumer_inline_ok(&insns[ci])) return -1;
+    unsigned cc = insns[ci].cc;
+    if (!(cc == OCERZ_CC_E || cc == OCERZ_CC_NE || cc == OCERZ_CC_B || cc == OCERZ_CC_AE ||
+          cc == OCERZ_CC_BE || cc == OCERZ_CC_A))
+        return -1;
+    int pi = -1;
+    for (int k = ci - 1; k >= 0; k--) {
+        uint64_t def, use;
+        ocerz_flags_defuse(&insns[k], &def, &use);
+        if (def & JIT_ARITH_FLAGS) { pi = k; break; }
+    }
+    if (pi < 0) return -1;
+    const X86Insn *p = &insns[pi];
+    if (p->op != OCERZ_OP_PTEST || p->nops != 2 || (p->vex & OCERZ_VEX_L) ||
+        p->ops[0].kind != OCERZ_OPK_XMM || p->ops[1].kind != OCERZ_OPK_XMM ||
+        !xmm_is_pinned(p->ops[0].reg) || !xmm_is_pinned(p->ops[1].reg))
+        return -1;
+    for (int k = pi + 1; k < ci; k++) {
+        const X86Insn *m = &insns[k];
+        if (m->nops > 0 && m->ops[0].kind == OCERZ_OPK_XMM &&
+            (m->ops[0].reg == p->ops[0].reg || m->ops[0].reg == p->ops[1].reg))
+            return -1;
+        uint64_t mdef, muse;
+        ocerz_flags_defuse_nofault(m, &mdef, &muse);
+        if (!(mdef & JIT_ARITH_FLAGS) && (muse & JIT_ARITH_FLAGS) == JIT_ARITH_FLAGS)
+            return -1;
+    }
+    return pi;
+}
 static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
 static int value_cond_fuse_producer(const X86Insn *insns, int ci)
 {
@@ -6771,10 +6810,44 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
     }
+    if (g_cur_insns && g_cur_insn_idx >= 0 && sse_enabled() &&
+        (g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_JCC || g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_SETCC ||
+         g_cur_insns[g_cur_insn_idx].op == OCERZ_OP_CMOVCC) &&
+        g_cur_insns[g_cur_insn_idx].cc == cc && ptest_fuse_producer(g_cur_insns, g_cur_insn_idx) >= 0) {
+        const X86Insn *p = &g_cur_insns[ptest_fuse_producer(g_cur_insns, g_cur_insn_idx)];
+        unsigned rd = p->ops[0].reg, rs = p->ops[1].reg;
+        l0_flush_reg(b, rd);
+        l0_flush_reg(b, rs);
+        int zf = cc != OCERZ_CC_B && cc != OCERZ_CC_AE, cf = cc != OCERZ_CC_E && cc != OCERZ_CC_NE;
+        if (zf) {
+            a64_v_and(b, 2, xmm_vreg(rd), xmm_vreg(rs));
+            a64_v_umaxv_4s(b, 2, 2);
+            a64_fmov_x_from_v(b, 0, JT0, 2);
+        }
+        if (cf) {
+            a64_v_bic(b, 3, xmm_vreg(rs), xmm_vreg(rd));
+            a64_v_umaxv_4s(b, 3, 3);
+            a64_fmov_x_from_v(b, 0, JT1, 3);
+        }
+        /* Z ends up set when the x86 flag (ZF, CF, or either) is */
+        if (zf && cf) {
+            a64_subs_imm(b, 0, A64_ZR, JT0, 0);
+            a64_ccmp_imm(b, 0, JT1, 0, 4, A64_NE);
+        } else {
+            a64_subs_imm(b, 0, A64_ZR, zf ? JT0 : JT1, 0);
+        }
+        int set = cc == OCERZ_CC_E || cc == OCERZ_CC_B || cc == OCERZ_CC_BE;
+        int dc = set ? A64_EQ : A64_NE;
+        if (want_direct) { g_cc_direct = dc; return; }
+        a64_cset(b, JTF, dc);
+        a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+        return;
+    }
     if (g_flag_producer && (g_flag_producer->op == OCERZ_OP_UCOMISD ||
                             g_flag_producer->op == OCERZ_OP_UCOMISS ||
                             g_flag_producer->op == OCERZ_OP_COMISD ||
-                            g_flag_producer->op == OCERZ_OP_COMISS)) {
+                            g_flag_producer->op == OCERZ_OP_COMISS ||
+                            g_flag_producer->op == OCERZ_OP_PTEST)) {
         emit_cc_predicate_rflags(b, cc);
         a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
@@ -10206,6 +10279,44 @@ static int emit_sse_comis(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     return 1;
 }
 
+/*
+ * ptest sets ZF when dst AND src is zero and CF when src AND NOT dst is, and
+ * clears the other four.  It is how SSE4.1 code asks whether a vector is zero
+ * (_mm_testz_si128), and it went to the interpreter, which spills every
+ * register for it.  deno --version spent 98% of its 3.3 s in one loop of them
+ * (Rosetta takes 0.19 s for the whole run).  The flags go to RFLAGS as
+ * comis's do.  A 256-bit vptest stays a call-out.
+ */
+static int emit_sse_ptest(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (insn->nops != 2 || d->kind != OCERZ_OPK_XMM || (insn->vex & OCERZ_VEX_L)) return 0;
+    int vb = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
+    if (vb < 0) return 0;
+    if (g_cur_need == 0) return 1;
+    int va = emit_sse_src_reg(b, insn, d, 16, VX0, exit_sites, n_exits);
+    if (va < 0) return 0;
+    if (g_defer)
+        a64_str(b, 4, A64_ZR, 20, CC_OP_OFF);
+    a64_v_and(b, VX2, va, vb);
+    a64_v_bic(b, VX3, vb, va);
+    a64_v_umaxv_4s(b, VX2, VX2);
+    a64_v_umaxv_4s(b, VX3, VX3);
+    a64_fmov_x_from_v(b, 0, JT0, VX2);
+    a64_fmov_x_from_v(b, 0, JT1, VX3);
+    a64_ldr(b, 8, JTT, 20, RF_OFF);
+    a64_subs_imm(b, 0, A64_ZR, JT0, 0);
+    a64_cset(b, JT0, A64_EQ);
+    a64_subs_imm(b, 0, A64_ZR, JT1, 0);
+    a64_cset(b, JT1, A64_EQ);
+    a64_bfi(b, 1, JTT, JT1, 0, 1);
+    a64_bfi(b, 1, JTT, JT0, 6, 1);
+    a64_mov_imm64(b, JTU, ~(uint64_t)(OCERZ_SF | OCERZ_OF | OCERZ_AF | OCERZ_PF));
+    a64_and_reg(b, 1, JTT, JTT, JTU, 0);
+    a64_str(b, 8, JTT, 20, RF_OFF);
+    return 1;
+}
+
 static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -11059,6 +11170,8 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         return emit_sse_pclmul(b, insn, exit_sites, n_exits);
     case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
         return emit_sse_comis(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_PTEST:
+        return ENV_ON("OCERZ_NO_INLINE_PTEST") ? 0 : emit_sse_ptest(b, insn, exit_sites, n_exits);
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
     case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTDQ2PS:
         return emit_sse_cvt(b, insn, exit_sites, n_exits);
@@ -14268,6 +14381,7 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_AESENC: case OCERZ_OP_AESENCLAST: case OCERZ_OP_AESDEC: case OCERZ_OP_AESDECLAST:
     case OCERZ_OP_AESIMC: case OCERZ_OP_AESKEYGENASSIST: case OCERZ_OP_PCLMULQDQ:
     case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
+    case OCERZ_OP_PTEST:
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
     case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTDQ2PS:
     case OCERZ_OP_MOVD: case OCERZ_OP_MOVQX: case OCERZ_OP_PSHUFD:
@@ -20469,6 +20583,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             if ((blk->insns[i].op == OCERZ_OP_JCC || blk->insns[i].op == OCERZ_OP_SETCC ||
                  blk->insns[i].op == OCERZ_OP_CMOVCC) &&
                 ((sse_enabled() && comis_fuse_producer(blk->insns, i) >= 0) ||
+                 (sse_enabled() && ptest_fuse_producer(blk->insns, i) >= 0) ||
                  (g_defer && !g_no_regflags && value_cond_fuse_producer(blk->insns, i) >= 0)))
                 use = 0;
             if ((blk->insns[i].op == OCERZ_OP_SETCC || blk->insns[i].op == OCERZ_OP_CMOVCC ||
