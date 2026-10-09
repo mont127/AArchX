@@ -145,3 +145,56 @@ define_image, run_loads; its `//!` is the remaining prose blocks).
   | frameworks.x86_64 | 0.05 / 0.05 | 0.05 / 0.06 |
 
   Parity — definition work is dominated by the host runtime, not the reader.
+
+## bridge.c -> rust/src/ported/bridge/ (7a01af1-successor, ~3000 lines)
+
+The native crossing: lookup/dispatch of every `-native` guest->host call, the
+crossing frame, the native-callback thunk page, and the malloc-zone views.
+
+- `common.rs` — mem.h inlines verbatim (g2h/h2g/ld/st/pinned-page),
+  `#[thread_local] static mut G_BR_FRAME` (C `__thread OcerzBridgeFrame`),
+  raise/lower/enter/leave/settle/return/postfork/level/depth_ptr/callback_frame,
+  br_answer/br_posix/br_guest_path/br_logging/br_susp_logging.
+- `lookup.rs` — OcerzBridgeFn/BrLib descriptors, br_lib/br_make, struct &
+  in-place callback bindings, br_cross(_structs), invoke, report. `table.rs`
+  (include!d) holds the ~250-entry dispatch table as an immutable &[BrHandler]
+  of `*const c_char` names + `unsafe extern "C" fn` pointers; ffi-exported
+  ocerz_sys_*/ocerz_objc_*/ocerz_fmt_* names coerce to the same fn-ptr type.
+- `thunk.rs` — thunk page byte-for-byte (0x41 0xba imm32, 0xff 0x25 rel32,
+  tramp at BR_THUNK_SLOT, 0xcc fill, RX).
+- `zones.rs` — private repr(C) BrMallocZone/BrMallocIntrospect (libc's
+  malloc_zone_t is opaque); brz_* view thunks, br_zone_view, tracked zone list.
+- `host.rs` — host_library/host_symbol (dlopen + stolen-signal diff),
+  br_identify_corefoundation (CFProcessPath swap), set_process_args.
+- `specials.rs` — every br_* handler (signals, iov/msg, ulock, dlopen/dyld,
+  exception ports, debug-register flavors, CF calendar, sqlite variadics,
+  struct-cross constructors, AudioUnit/VT/Security, cfuuid).
+
+### Findings
+
+- `ocerz_bridge_depth_ptr` is stored in `cpu->bridge_depth` by vm.c
+  (vm.c:3519/3926/4226) and dereferenced at vm.c:953 (`*t->bridge_depth > 0`)
+  to know whether a suspended thread is inside a crossing. Nothing reads the
+  frame by fixed offset; all access is through depth_ptr and the
+  OcerzBridgeFrame fields (`around`, `sym`) shared via the ffi layout.
+- `ocerz_bridge_callback_frame` feeds sysbridge's sb_jmp_check (C
+  sysbridge.c:948/1058), which reads cb->sym for diagnostics — same ffi layout.
+- `OcerzAbiCall` in ffi uses arrays (call.x[8]) and va_arg takes `c_char`;
+  call_native wants `.as_ptr()`/`.as_mut_ptr()` on the arrays.
+- libc's `malloc_zone_t` is opaque — the port declares the real layout.
+- `libc::NSIG`, `bzero`, `clock_gettime_nsec_np`, `malloc_destroy_zone`,
+  `malloc_set_zone_name`, `__ulock_wait(2)`, `malloc_statistics` are not in
+  the libc crate → private externs/consts.
+- Every cached-function `static _Atomic` became a module-level AtomicPtr
+  (SeqCst); all mutexes `static mut` + `&raw mut`; everything mutable verified
+  in `__DATA`/`__thread_vars` via `nm -m`.
+
+### Perf (./ocerz -native, 5x, min/median s; ~/AArchX-c/ocerz vs tip)
+
+| guest (clang -arch x86_64 -O2) | C min/median | Rust min/median |
+| calls (10M getpid+strlen crossings) | 0.22 / 0.22 | 0.22 / 0.23 |
+| zone (1M malloc/free pairs) | 0.07 / 0.07 | 0.08 / 0.08 |
+| qsort_g (1M ints, guest comparator) | 11.75 / 12.25 | 11.86 / 11.97 |
+| nfw (native_frameworks.c, through CF callbacks) | 0.07 / 0.07 | 0.07 / 0.08 |
+
+Parity within noise on the hot path.
