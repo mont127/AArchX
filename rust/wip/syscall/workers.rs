@@ -425,7 +425,7 @@ unsafe fn guest_fork_apply(vm: *mut OcerzVM, out: *mut libc::pid_t) -> c_int {
     }
 }
 
-unsafe fn sys_fork(vm: *mut OcerzVM, cpu: *mut OcerzCPU, _a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_fork(vm: *mut OcerzVM, cpu: *mut OcerzCPU, _a: *mut [u64; 8]) -> c_int {
     unsafe {
         let mut pid = 0;
         let err = guest_fork_apply(vm, &mut pid);

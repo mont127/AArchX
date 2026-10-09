@@ -1,0 +1,1744 @@
+//! Mach trap routing, guest VM operations, region aliasing, and relocation of
+//! host VM objects returned through MIG replies.
+
+use super::util::*;
+use super::*;
+
+use core::ffi::{c_char, c_int, c_void};
+use core::ptr;
+
+const VM_REGION_BASIC_INFO_64: c_int = 9;
+const VM_REGION_SUBMAP_INFO_64: c_int = 18;
+const VM_REGION_SUBMAP_SHORT_INFO_64: c_int = 19;
+const VM_FLAGS_FIXED: u32 = 0;
+const VM_PROT_READ: c_int = 1;
+const VM_PROT_WRITE: c_int = 2;
+const VM_PROT_EXECUTE: c_int = 4;
+const VM_FLAGS_ANYWHERE: u32 = 1;
+const VM_FLAGS_OVERWRITE: u32 = 0x4000;
+const VM_INHERIT_DEFAULT: c_int = 2;
+const VM_MEMORY_IOKIT: u32 = 21;
+const CLOCK_UPTIME_RAW: libc::clockid_t = 8;
+const OCERZ_SC_UNIVERSE_MAX: usize = 16;
+const OCERZ_ALIAS_REG_MAX: usize = 4096;
+
+#[repr(C, packed(4))]
+struct VmRegionBasicInfo64 {
+    protection: c_int,
+    max_protection: c_int,
+    inheritance: c_int,
+    shared: c_int,
+    reserved: c_int,
+    offset: u64,
+    behavior: c_int,
+    user_wired_count: u16,
+}
+
+#[repr(C, packed(4))]
+struct VmRegionSubmapInfo64 {
+    protection: c_int,
+    max_protection: c_int,
+    inheritance: c_int,
+    offset: u64,
+    user_tag: u32,
+    pages_resident: u32,
+    pages_shared_now_private: u32,
+    pages_swapped_out: u32,
+    pages_dirtied: u32,
+    ref_count: u32,
+    shadow_depth: u16,
+    external_pager: u8,
+    share_mode: u8,
+    is_submap: c_int,
+    behavior: c_int,
+    object_id: u32,
+    user_wired_count: u16,
+    flags: u16,
+    pages_reusable: u32,
+    object_id_full: u64,
+}
+
+#[repr(C, packed(4))]
+struct VmRegionSubmapShortInfo64 {
+    protection: c_int,
+    max_protection: c_int,
+    inheritance: c_int,
+    offset: u64,
+    user_tag: u32,
+    ref_count: u32,
+    shadow_depth: u16,
+    external_pager: u8,
+    share_mode: u8,
+    is_submap: c_int,
+    behavior: c_int,
+    object_id: u32,
+    user_wired_count: u16,
+    flags: u16,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<VmRegionBasicInfo64>() == 36);
+    assert!(core::mem::offset_of!(VmRegionBasicInfo64, protection) == 0);
+    assert!(core::mem::offset_of!(VmRegionBasicInfo64, offset) == 20);
+    assert!(core::mem::offset_of!(VmRegionBasicInfo64, behavior) == 28);
+    assert!(core::mem::offset_of!(VmRegionBasicInfo64, user_wired_count) == 32);
+    assert!(core::mem::size_of::<VmRegionSubmapInfo64>() == 76);
+    assert!(core::mem::offset_of!(VmRegionSubmapInfo64, offset) == 12);
+    assert!(core::mem::offset_of!(VmRegionSubmapInfo64, user_tag) == 20);
+    assert!(core::mem::offset_of!(VmRegionSubmapInfo64, share_mode) == 47);
+    assert!(core::mem::offset_of!(VmRegionSubmapInfo64, object_id) == 56);
+    assert!(core::mem::offset_of!(VmRegionSubmapInfo64, object_id_full) == 68);
+    assert!(core::mem::size_of::<VmRegionSubmapShortInfo64>() == 48);
+    assert!(core::mem::offset_of!(VmRegionSubmapShortInfo64, offset) == 12);
+    assert!(core::mem::offset_of!(VmRegionSubmapShortInfo64, object_id) == 40);
+    assert!(core::mem::offset_of!(VmRegionSubmapShortInfo64, flags) == 46);
+};
+
+#[derive(Clone, Copy)]
+struct ScUniverse {
+    uid_key: u64,
+    address: u64,
+}
+
+#[derive(Clone, Copy)]
+struct AliasRegion {
+    lo: u64,
+    hi: u64,
+    object: u32,
+}
+
+static mut G_SC_UNIVERSES: [ScUniverse; OCERZ_SC_UNIVERSE_MAX] = [ScUniverse {
+    uid_key: 0,
+    address: 0,
+}; OCERZ_SC_UNIVERSE_MAX];
+static mut G_ALIAS_REG: [AliasRegion; OCERZ_ALIAS_REG_MAX] = [AliasRegion {
+    lo: 0,
+    hi: 0,
+    object: 0,
+}; OCERZ_ALIAS_REG_MAX];
+static mut G_ALIAS_REG_N: u32 = 0;
+static mut G_ALIAS_REG_NEXT: u32 = 0;
+static mut G_SC_UNIVERSES_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
+static mut G_ALIAS_REG_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
+
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
+    fn mach_vm_region(
+        task: u32,
+        address: *mut u64,
+        size: *mut u64,
+        flavor: c_int,
+        info: *mut c_int,
+        count: *mut u32,
+        object_name: *mut u32,
+    ) -> c_int;
+    fn mach_vm_region_recurse(
+        task: u32,
+        address: *mut u64,
+        size: *mut u64,
+        depth: *mut u32,
+        info: *mut c_int,
+        count: *mut u32,
+    ) -> c_int;
+    fn mach_vm_remap(
+        target_task: u32,
+        target_address: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: c_int,
+        source_task: u32,
+        source_address: u64,
+        copy: c_int,
+        cur_protection: *mut c_int,
+        max_protection: *mut c_int,
+        inheritance: c_int,
+    ) -> c_int;
+    fn mach_vm_deallocate(task: u32, address: u64, size: u64) -> c_int;
+    fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: c_int) -> c_int;
+    fn mach_vm_protect(
+        task: u32,
+        address: u64,
+        size: u64,
+        set_maximum: c_int,
+        protection: c_int,
+    ) -> c_int;
+    fn mach_port_deallocate(task: u32, name: u32) -> c_int;
+    fn mach_port_type(task: u32, name: u32, port_type: *mut u32) -> c_int;
+}
+
+#[inline(always)]
+unsafe fn mach_task_self() -> u32 {
+    mach_task_self_
+}
+
+unsafe fn mach_trap_name(num: c_int) -> *const c_char {
+    match num {
+        10 => c"_kernelrpc_mach_vm_allocate_trap".as_ptr(),
+        11 => c"_kernelrpc_mach_vm_purgable_control_trap".as_ptr(),
+        12 => c"_kernelrpc_mach_vm_deallocate_trap".as_ptr(),
+        14 => c"_kernelrpc_mach_vm_protect_trap".as_ptr(),
+        15 => c"_kernelrpc_mach_vm_map_trap".as_ptr(),
+        16 => c"_kernelrpc_mach_port_allocate_trap".as_ptr(),
+        18 => c"_kernelrpc_mach_port_deallocate_trap".as_ptr(),
+        19 => c"_kernelrpc_mach_port_mod_refs_trap".as_ptr(),
+        26 => c"mach_reply_port".as_ptr(),
+        40 => c"_kernelrpc_mach_port_get_attributes_trap".as_ptr(),
+        27 => c"thread_self_trap".as_ptr(),
+        28 => c"task_self_trap".as_ptr(),
+        29 => c"host_self_trap".as_ptr(),
+        31 => c"mach_msg_trap".as_ptr(),
+        33 => c"semaphore_signal_trap".as_ptr(),
+        34 => c"semaphore_signal_all_trap".as_ptr(),
+        36 => c"semaphore_wait_trap".as_ptr(),
+        37 => c"semaphore_wait_signal_trap".as_ptr(),
+        38 => c"semaphore_timedwait_trap".as_ptr(),
+        43 => c"mach_generate_activity_id".as_ptr(),
+        44 => c"task_name_for_pid".as_ptr(),
+        45 => c"task_for_pid".as_ptr(),
+        46 => c"pid_for_task".as_ptr(),
+        47 => c"mach_msg2_trap".as_ptr(),
+        50 => c"thread_get_special_reply_port".as_ptr(),
+        76 => c"_kernelrpc_mach_port_type_trap".as_ptr(),
+        77 => c"_kernelrpc_mach_port_request_notification_trap".as_ptr(),
+        59 => c"swtch_pri".as_ptr(),
+        60 => c"swtch".as_ptr(),
+        61 => c"thread_switch".as_ptr(),
+        89 => c"mach_timebase_info_trap".as_ptr(),
+        90 => c"mach_wait_until_trap".as_ptr(),
+        91 => c"mk_timer_create_trap".as_ptr(),
+        92 => c"mk_timer_destroy_trap".as_ptr(),
+        93 => c"mk_timer_arm_trap".as_ptr(),
+        94 => c"mk_timer_cancel_trap".as_ptr(),
+        95 => c"mk_timer_arm_leeway_trap".as_ptr(),
+        _ => ptr::null(),
+    }
+}
+
+unsafe fn ocerz_sc_remember_universe(uid: u32, address: u64) {
+    let key = uid as u64 + 1;
+    libc::pthread_mutex_lock(ptr::addr_of_mut!(G_SC_UNIVERSES_LOCK));
+    let slots = ptr::addr_of_mut!(G_SC_UNIVERSES).cast::<ScUniverse>();
+    for i in 0..OCERZ_SC_UNIVERSE_MAX {
+        let slot = &mut *slots.add(i);
+        if slot.uid_key == key {
+            slot.address = address;
+            libc::pthread_mutex_unlock(ptr::addr_of_mut!(G_SC_UNIVERSES_LOCK));
+            return;
+        }
+    }
+    for i in 0..OCERZ_SC_UNIVERSE_MAX {
+        let slot = &mut *slots.add(i);
+        if slot.uid_key == 0 {
+            slot.address = address;
+            slot.uid_key = key;
+            libc::pthread_mutex_unlock(ptr::addr_of_mut!(G_SC_UNIVERSES_LOCK));
+            return;
+        }
+    }
+    let slot = &mut *slots.add(uid as usize % OCERZ_SC_UNIVERSE_MAX);
+    slot.uid_key = 0;
+    slot.address = address;
+    slot.uid_key = key;
+    libc::pthread_mutex_unlock(ptr::addr_of_mut!(G_SC_UNIVERSES_LOCK));
+}
+
+unsafe fn ocerz_sc_find_universe(uid: u32) -> u64 {
+    let key = uid as u64 + 1;
+    let mut address = 0;
+    libc::pthread_mutex_lock(ptr::addr_of_mut!(G_SC_UNIVERSES_LOCK));
+    let slots = ptr::addr_of!(G_SC_UNIVERSES).cast::<ScUniverse>();
+    for i in 0..OCERZ_SC_UNIVERSE_MAX {
+        let slot = &*slots.add(i);
+        if slot.uid_key == key {
+            address = slot.address;
+            break;
+        }
+    }
+    libc::pthread_mutex_unlock(ptr::addr_of_mut!(G_SC_UNIVERSES_LOCK));
+    address
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocerz_host_region_is_device(addr: u64, prot_out: *mut c_int) -> c_int {
+    let mut address = addr;
+    let mut size = 0;
+    let mut depth = 0;
+    let mut info: VmRegionSubmapInfo64 = core::mem::zeroed();
+    let mut count = (core::mem::size_of::<VmRegionSubmapInfo64>() / 4) as u32;
+    if mach_vm_region_recurse(
+        mach_task_self(),
+        &mut address,
+        &mut size,
+        &mut depth,
+        (&mut info as *mut VmRegionSubmapInfo64).cast(),
+        &mut count,
+    ) != 0
+        || address > addr
+        || addr - address >= size
+    {
+        return 0;
+    }
+    let protection = ptr::read_unaligned(ptr::addr_of!(info.protection));
+    let share_mode = ptr::read_unaligned(ptr::addr_of!(info.share_mode));
+    let user_tag = ptr::read_unaligned(ptr::addr_of!(info.user_tag));
+    if !prot_out.is_null() {
+        *prot_out = protection;
+    }
+    let shared = share_mode == 4 || share_mode == 5 || share_mode == 7;
+    let device = user_tag == VM_MEMORY_IOKIT || user_tag == 81 || user_tag == 70;
+    (shared || device) as c_int * ((protection & VM_PROT_READ != 0) as c_int)
+}
+
+unsafe fn host_region_entry(
+    address: u64,
+    start: *mut u64,
+    end: *mut u64,
+    object: *mut u32,
+    protection: *mut c_int,
+) -> bool {
+    let mut region = address;
+    let mut size = 0;
+    let mut depth = 0;
+    let mut info: VmRegionSubmapShortInfo64 = core::mem::zeroed();
+    let mut count = (core::mem::size_of::<VmRegionSubmapShortInfo64>() / 4) as u32;
+    if mach_vm_region_recurse(
+        mach_task_self(),
+        &mut region,
+        &mut size,
+        &mut depth,
+        (&mut info as *mut VmRegionSubmapShortInfo64).cast(),
+        &mut count,
+    ) != 0
+        || size == 0
+    {
+        return false;
+    }
+    *start = region;
+    *end = region.wrapping_add(size);
+    *object = ptr::read_unaligned(ptr::addr_of!(info.object_id));
+    *protection = ptr::read_unaligned(ptr::addr_of!(info.protection));
+    true
+}
+
+unsafe fn alias_reg_add(lo: u64, hi: u64, object: u32) {
+    libc::pthread_mutex_lock(ptr::addr_of_mut!(G_ALIAS_REG_LOCK));
+    let mut n = G_ALIAS_REG_N;
+    let entries = ptr::addr_of_mut!(G_ALIAS_REG).cast::<AliasRegion>();
+    let mut i = 0;
+    while i < n {
+        let entry = &mut *entries.add(i as usize);
+        if entry.lo >= lo && entry.hi <= hi {
+            n -= 1;
+            *entry = *entries.add(n as usize);
+        } else {
+            i += 1;
+        }
+    }
+    G_ALIAS_REG_N = n;
+    let index = if n < OCERZ_ALIAS_REG_MAX as u32 {
+        G_ALIAS_REG_N += 1;
+        n
+    } else {
+        let next = G_ALIAS_REG_NEXT;
+        G_ALIAS_REG_NEXT = next.wrapping_add(1);
+        next % OCERZ_ALIAS_REG_MAX as u32
+    };
+    *entries.add(index as usize) = AliasRegion { lo, hi, object };
+    libc::pthread_mutex_unlock(ptr::addr_of_mut!(G_ALIAS_REG_LOCK));
+}
+
+unsafe fn alias_reg_find(address: u64, object: u32, any_object: bool) -> bool {
+    let mut hit = false;
+    libc::pthread_mutex_lock(ptr::addr_of_mut!(G_ALIAS_REG_LOCK));
+    let entries = ptr::addr_of!(G_ALIAS_REG).cast::<AliasRegion>();
+    for i in 0..G_ALIAS_REG_N {
+        let entry = &*entries.add(i as usize);
+        hit = address >= entry.lo
+            && address < entry.hi
+            && (any_object || (object != 0 && entry.object == object));
+        if hit {
+            break;
+        }
+    }
+    libc::pthread_mutex_unlock(ptr::addr_of_mut!(G_ALIAS_REG_LOCK));
+    hit
+}
+
+unsafe fn alias_page_ours(page: u64) -> bool {
+    let mut start = 0;
+    let mut end = 0;
+    let mut object = 0;
+    let mut protection = 0;
+    let host = ocerz_g2h(page) as u64;
+    alias_reg_find(page, 0, true)
+        && host_region_entry(host, &mut start, &mut end, &mut object, &mut protection)
+        && start <= host
+        && alias_reg_find(page, object, false)
+}
+
+unsafe fn alias_page_taken(page: u64) -> bool {
+    let mut at = page;
+    while at < page + 0x4000 {
+        if crate::ffi::ocerz_addr_prot(at) > 0 {
+            return !alias_page_ours(page);
+        }
+        at = at.wrapping_add(crate::ffi::OCERZ_GUEST_PAGE_SIZE as u64);
+    }
+    false
+}
+
+unsafe fn alias_raw_region(vm: *mut OcerzVM, pointer: u64, refresh: bool) -> c_int {
+    if pointer == 0 {
+        return -1;
+    }
+    let mut region = pointer;
+    let mut size = 0;
+    let mut info: VmRegionBasicInfo64 = core::mem::zeroed();
+    let mut count = (core::mem::size_of::<VmRegionBasicInfo64>() / 4) as u32;
+    let mut object_name = 0;
+    let kr = mach_vm_region(
+        mach_task_self(),
+        &mut region,
+        &mut size,
+        VM_REGION_BASIC_INFO_64,
+        (&mut info as *mut VmRegionBasicInfo64).cast(),
+        &mut count,
+        &mut object_name,
+    );
+    if object_name != 0 {
+        mach_port_deallocate(mach_task_self(), object_name);
+    }
+    if kr != 0 || region > pointer || pointer - region >= size || size == 0 {
+        return -1;
+    }
+    if ocerz_g2h(region) as u64 == region {
+        return 0;
+    }
+    if region >= crate::ffi::OCERZ_LOW_LIMIT || size > crate::ffi::OCERZ_LOW_LIMIT - region {
+        return -1;
+    }
+    static mut NO_ALIAS_CLIP: c_int = -1;
+    if NO_ALIAS_CLIP < 0 {
+        NO_ALIAS_CLIP = (!libc::getenv(c"OCERZ_NO_ALIAS_CLIP".as_ptr()).is_null()) as c_int;
+    }
+    if NO_ALIAS_CLIP == 0 {
+        let mut lo = pointer & !0x3fff;
+        let mut hi = lo + 0x4000;
+        let rlo = region;
+        let rhi = region.wrapping_add(size);
+        let win = 0x1000_0000u64;
+        if alias_page_taken(lo) {
+            return if crate::ffi::ocerz_addr_readable(pointer) != 0 {
+                0
+            } else {
+                -1
+            };
+        }
+        while lo > rlo && pointer - (lo - 0x4000) <= win && !alias_page_taken(lo - 0x4000) {
+            lo -= 0x4000;
+        }
+        while hi < rhi && hi + 0x4000 - pointer <= win && !alias_page_taken(hi) {
+            hi += 0x4000;
+        }
+        region = if lo > rlo { lo } else { rlo };
+        size = (if hi < rhi { hi } else { rhi }).wrapping_sub(region);
+    }
+    let guest = region;
+    let host_dst = ocerz_g2h(guest) as u64;
+    if !refresh
+        && crate::ffi::ocerz_addr_readable(guest) != 0
+        && crate::ffi::ocerz_addr_readable(guest.wrapping_add(size - 1)) != 0
+    {
+        return 0;
+    }
+    super::mem::invalidate_guest_mapping(vm, guest, size);
+    let protection = ptr::read_unaligned(ptr::addr_of!(info.protection))
+        & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if crate::ffi::ocerz_map_fixed(guest, size, protection) != crate::ffi::OCERZ_OK as c_int {
+        return -1;
+    }
+    let mut dst = host_dst;
+    let mut current = 0;
+    let mut maximum = 0;
+    crate::ffi::ocerz_jit_require_ordered(vm);
+    let kr = mach_vm_remap(
+        mach_task_self(),
+        &mut dst,
+        size,
+        0,
+        (VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) as c_int,
+        mach_task_self(),
+        region,
+        0,
+        &mut current,
+        &mut maximum,
+        VM_INHERIT_DEFAULT,
+    );
+    if kr != 0 || dst != host_dst {
+        crate::ffi::ocerz_unmap(guest, size);
+        return -1;
+    }
+    let mut start = 0;
+    let mut end = 0;
+    let mut object = 0;
+    let mut prot = 0;
+    if host_region_entry(host_dst, &mut start, &mut end, &mut object, &mut prot)
+        && start <= host_dst
+        && object != 0
+    {
+        alias_reg_add(guest, guest.wrapping_add(size), object);
+    }
+    crate::ffi::ocerz_low_fill_host_holes();
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocerz_alias_raw_region(vm: *mut OcerzVM, pointer: u64) -> c_int {
+    alias_raw_region(vm, pointer, false)
+}
+
+unsafe fn alias_raw_contiguous(vm: *mut OcerzVM, pointer: u64) -> c_int {
+    let mut first = pointer;
+    let mut first_size = 0;
+    let mut first_info: VmRegionBasicInfo64 = core::mem::zeroed();
+    let mut first_count = (core::mem::size_of::<VmRegionBasicInfo64>() / 4) as u32;
+    let mut first_object = 0;
+    let kr = mach_vm_region(
+        mach_task_self(),
+        &mut first,
+        &mut first_size,
+        VM_REGION_BASIC_INFO_64,
+        (&mut first_info as *mut VmRegionBasicInfo64).cast(),
+        &mut first_count,
+        &mut first_object,
+    );
+    if first_object != 0 {
+        mach_port_deallocate(mach_task_self(), first_object);
+    }
+    if kr != 0 || first > pointer || pointer - first >= first_size {
+        return -1;
+    }
+    let mut pos = first;
+    let limit = pos.wrapping_add(0x0400_0000);
+    for _ in 0..4096 {
+        if pos >= limit {
+            break;
+        }
+        let mut region = pos;
+        let mut size = 0;
+        let mut info: VmRegionBasicInfo64 = core::mem::zeroed();
+        let mut count = (core::mem::size_of::<VmRegionBasicInfo64>() / 4) as u32;
+        let mut object = 0;
+        let kr = mach_vm_region(
+            mach_task_self(),
+            &mut region,
+            &mut size,
+            VM_REGION_BASIC_INFO_64,
+            (&mut info as *mut VmRegionBasicInfo64).cast(),
+            &mut count,
+            &mut object,
+        );
+        if object != 0 {
+            mach_port_deallocate(mach_task_self(), object);
+        }
+        if kr != 0 || region != pos || size == 0 || size > limit - pos {
+            break;
+        }
+        if alias_raw_region(vm, pos, false) != 0 {
+            return -1;
+        }
+        pos = pos.wrapping_add(size);
+    }
+    if crate::ffi::ocerz_addr_readable(pointer) != 0 {
+        0
+    } else {
+        -1
+    }
+}
+
+unsafe fn guest_vm_allocate_apply(vm: *mut OcerzVM, addrp: u64, size: u64, flags: u64) -> c_int {
+    if flags & 1 == 0 {
+        let want = if addrp != 0 { ocerz_ld(addrp, 8) } else { 0 };
+        super::mem::memtrace(c"vm_alloc".as_ptr(), want, size, 0, flags as c_int);
+        super::mem::invalidate_guest_mapping(vm, want, size);
+        if want == 0
+            || (crate::ffi::ocerz_map_claim_fixed(want, size, libc::PROT_READ | libc::PROT_WRITE)
+                != crate::ffi::OCERZ_OK as c_int
+                && crate::ffi::ocerz_map_claim_region(
+                    want,
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                ) != crate::ffi::OCERZ_OK as c_int
+                && (crate::ffi::ocerz_mem_register_range(want, want + size)
+                    != crate::ffi::OCERZ_OK as c_int
+                    || crate::ffi::ocerz_map_claim_region(
+                        want,
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    ) != crate::ffi::OCERZ_OK as c_int))
+        {
+            return OCERZ_MACH_KERN_NO_SPACE;
+        }
+        return OCERZ_MACH_KERN_SUCCESS;
+    }
+    let gaddr = crate::ffi::ocerz_map_anywhere(size, libc::PROT_READ | libc::PROT_WRITE);
+    if gaddr == 0 {
+        return OCERZ_MACH_KERN_NO_SPACE;
+    }
+    super::mem::invalidate_guest_mapping(vm, gaddr, size);
+    if addrp != 0 {
+        ocerz_st(addrp, 8, gaddr);
+    }
+    OCERZ_MACH_KERN_SUCCESS
+}
+
+unsafe fn guest_vm_deallocate_apply(vm: *mut OcerzVM, addr: u64, size: u64) -> c_int {
+    super::mem::memtrace(c"vm_dealloc".as_ptr(), addr, size, 0, 0);
+    super::mem::invalidate_guest_mapping(vm, addr, size);
+    crate::ffi::ocerz_unmap(addr, size);
+    OCERZ_MACH_KERN_SUCCESS
+}
+
+unsafe fn guest_vm_protect_apply(
+    vm: *mut OcerzVM,
+    addr: u64,
+    size: u64,
+    protection: c_int,
+) -> c_int {
+    super::mem::memtrace(c"vm_protect".as_ptr(), addr, size, protection, 0);
+    super::mem::invalidate_guest_mapping(vm, addr, size);
+    crate::ffi::ocerz_protect(addr, size, protection);
+    OCERZ_MACH_KERN_SUCCESS
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocerz_guest_vm_allocate(
+    vm: *mut OcerzVM,
+    _cpu: *mut OcerzCPU,
+    task: u64,
+    addrp: u64,
+    size: u64,
+    flags: c_int,
+) -> c_int {
+    if task != mach_task_self() as u64 {
+        return mach_vm_allocate(task as u32, ocerz_g2h(addrp).cast(), size, flags);
+    }
+    guest_vm_allocate_apply(vm, addrp, size, flags as u32 as u64)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocerz_guest_vm_deallocate(
+    vm: *mut OcerzVM,
+    _cpu: *mut OcerzCPU,
+    task: u64,
+    addr: u64,
+    size: u64,
+) -> c_int {
+    if task != mach_task_self() as u64 {
+        return mach_vm_deallocate(task as u32, addr, size);
+    }
+    if crate::ffi::ocerz_mem_overlaps(addr, size) == 0 {
+        super::mem::invalidate_guest_mapping(vm, addr, size);
+        return mach_vm_deallocate(mach_task_self(), ocerz_g2h(addr) as u64, size);
+    }
+    guest_vm_deallocate_apply(vm, addr, size)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocerz_guest_vm_protect(
+    vm: *mut OcerzVM,
+    _cpu: *mut OcerzCPU,
+    task: u64,
+    addr: u64,
+    size: u64,
+    set_maximum: c_int,
+    protection: c_int,
+) -> c_int {
+    if task != mach_task_self() as u64 {
+        return mach_vm_protect(task as u32, addr, size, set_maximum, protection);
+    }
+    if crate::ffi::ocerz_mem_overlaps(addr, size) == 0 {
+        super::mem::invalidate_guest_mapping(vm, addr, size);
+        return mach_vm_protect(
+            mach_task_self(),
+            ocerz_g2h(addr) as u64,
+            size,
+            set_maximum,
+            protection,
+        );
+    }
+    guest_vm_protect_apply(vm, addr, size, protection)
+}
+
+unsafe fn mig_vm_refuse_taken(reply: u64, size: u64) {
+    static mut OFF: c_int = -1;
+    if OFF < 0 {
+        OFF = (!libc::getenv(c"OCERZ_NO_VMMAP_TAKEN".as_ptr()).is_null()) as c_int;
+    }
+    let host = ocerz_ld(reply + 0x24, 8);
+    if OFF != 0
+        || crate::ffi::ocerz_low_base == 0
+        || size == 0
+        || host >= crate::ffi::OCERZ_LOW_LIMIT
+        || size > crate::ffi::OCERZ_LOW_LIMIT - host
+    {
+        return;
+    }
+    let mut page = host & !((crate::ffi::OCERZ_GUEST_PAGE_SIZE as u64) - 1);
+    while page < host + size {
+        if crate::ffi::ocerz_addr_committed(page) == 1 {
+            mach_vm_deallocate(mach_task_self(), host, size);
+            ocerz_st(reply + 0x20, 4, OCERZ_MACH_KERN_NO_SPACE as u32 as u64);
+            ocerz_st(reply + 0x24, 8, 0);
+            return;
+        }
+        page += crate::ffi::OCERZ_GUEST_PAGE_SIZE as u64;
+    }
+}
+
+unsafe fn mig_vm_reply_relocate(
+    vm: *mut OcerzVM,
+    reply: u64,
+    preserve_address: bool,
+    requested_size: u64,
+    alignment: u64,
+) {
+    let host = ocerz_ld(reply + 0x24, 8);
+    if host == 0
+        || (host >= crate::ffi::ocerz_arena_lo && host < crate::ffi::ocerz_arena_hi)
+        || crate::ffi::ocerz_cache_region(host as usize) != 0
+        || (crate::ffi::ocerz_low_base != 0
+            && host >= crate::ffi::OCERZ_LOW_LIMIT
+            && host < crate::ffi::OCERZ_TOP_LO
+            && ocerz_g2h(host) as u64 == host
+            && crate::ffi::ocerz_addr_committed(host) == 1)
+        || (preserve_address && ocerz_g2h(host) as u64 == host)
+    {
+        return;
+    }
+    let mut region = host;
+    let mut region_size = 0;
+    let mut info: VmRegionBasicInfo64 = core::mem::zeroed();
+    let mut count = (core::mem::size_of::<VmRegionBasicInfo64>() / 4) as u32;
+    let mut object = 0;
+    if mach_vm_region(
+        mach_task_self(),
+        &mut region,
+        &mut region_size,
+        VM_REGION_BASIC_INFO_64,
+        (&mut info as *mut VmRegionBasicInfo64).cast(),
+        &mut count,
+        &mut object,
+    ) != 0
+    {
+        return;
+    }
+    if object != 0 {
+        mach_port_deallocate(mach_task_self(), object);
+    }
+    if region > host {
+        return;
+    }
+    let mut region_end = region.wrapping_add(region_size);
+    if requested_size == 0 {
+        for _ in 0..4096 {
+            let mut next = region_end;
+            let mut next_size = 0;
+            let mut next_info: VmRegionBasicInfo64 = core::mem::zeroed();
+            let mut next_count = (core::mem::size_of::<VmRegionBasicInfo64>() / 4) as u32;
+            let mut next_object = 0;
+            if mach_vm_region(
+                mach_task_self(),
+                &mut next,
+                &mut next_size,
+                VM_REGION_BASIC_INFO_64,
+                (&mut next_info as *mut VmRegionBasicInfo64).cast(),
+                &mut next_count,
+                &mut next_object,
+            ) != 0
+                || next != region_end
+            {
+                if next_object != 0 {
+                    mach_port_deallocate(mach_task_self(), next_object);
+                }
+                break;
+            }
+            if next_object != 0 {
+                mach_port_deallocate(mach_task_self(), next_object);
+            }
+            region_end = region_end.wrapping_add(next_size);
+        }
+    }
+    let size = if requested_size != 0 {
+        requested_size.wrapping_add(0x3fff) & !0x3fff
+    } else {
+        region_end.wrapping_sub(host)
+    };
+    if size == 0 || size > u64::MAX - host {
+        return;
+    }
+    let mut keep = preserve_address
+        || (crate::ffi::ocerz_low_base != 0
+            && host < crate::ffi::OCERZ_LOW_LIMIT
+            && size <= crate::ffi::OCERZ_LOW_LIMIT - host);
+    let guest;
+    if keep {
+        guest = host;
+        super::mem::invalidate_guest_mapping(vm, guest, size);
+        if crate::ffi::ocerz_map_claim_region(guest, size, libc::PROT_READ | libc::PROT_WRITE)
+            != crate::ffi::OCERZ_OK as c_int
+        {
+            if preserve_address {
+                return;
+            }
+            keep = false;
+        }
+    } else {
+        guest = 0;
+    }
+    let guest = if keep {
+        guest
+    } else {
+        let new_address = if alignment != 0 {
+            crate::ffi::ocerz_map_anywhere_aligned(
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                alignment,
+            )
+        } else {
+            crate::ffi::ocerz_map_donate(size)
+        };
+        if new_address == 0 {
+            return;
+        }
+        super::mem::invalidate_guest_mapping(vm, new_address, size);
+        new_address
+    };
+    let host_dst = ocerz_g2h(guest) as u64;
+    let mut dst = host_dst;
+    let mut current = 0;
+    let mut maximum = 0;
+    crate::ffi::ocerz_jit_require_ordered(vm);
+    let kr = mach_vm_remap(
+        mach_task_self(),
+        &mut dst,
+        size,
+        0,
+        (VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) as c_int,
+        mach_task_self(),
+        host,
+        0,
+        &mut current,
+        &mut maximum,
+        VM_INHERIT_DEFAULT,
+    );
+    if kr != 0 || dst != host_dst {
+        crate::ffi::ocerz_unmap(guest, size);
+        return;
+    }
+    if !keep {
+        mach_vm_deallocate(mach_task_self(), host, size);
+    }
+    ocerz_st(reply + 0x24, 8, guest);
+}
+
+unsafe fn ocerz_reply_relocate_ool(reply: u64, recv_size: u32, trap: c_int) {
+    let bits = ocerz_ld(reply, 4) as u32;
+    if bits & 0x8000_0000 == 0 {
+        return;
+    }
+    let mut size = ocerz_ld(reply + 4, 4) as u32;
+    if recv_size != 0 && recv_size < size {
+        size = recv_size;
+    }
+    let count = ocerz_ld(reply + 0x18, 4) as u32;
+    if count == 0 || count > 4096 {
+        return;
+    }
+    let mut off = 0x1c;
+    for _ in 0..count {
+        if off + 12 > size as u64 {
+            break;
+        }
+        let ty = ocerz_ld(reply + off + 11, 1) as u8;
+        if ty == 0 {
+            off += 12;
+            continue;
+        }
+        if ty == 4 {
+            off += 16;
+            continue;
+        }
+        if (1..=3).contains(&ty) {
+            if off + 16 > size as u64 {
+                break;
+            }
+            let address = ocerz_ld(reply + off, 8);
+            let count = ocerz_ld(reply + off + 12, 4) as u32;
+            let bytes = if ty == 2 {
+                count as u64 * 4
+            } else {
+                count as u64
+            };
+            let host_owned = address != 0
+                && !ocerz_host_in_guest_reservation(address as *const c_void)
+                && crate::ffi::ocerz_cache_region(address as usize) == 0;
+            if host_owned && bytes != 0 {
+                let alloc = if bytes <= 64 * 1024 * 1024 {
+                    crate::ffi::ocerz_map_anywhere(
+                        bytes.wrapping_add(0x3fff) & !0x3fff,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    )
+                } else {
+                    0
+                };
+                if alloc != 0 {
+                    ptr::copy_nonoverlapping(
+                        address as *const u8,
+                        ocerz_g2h(alloc).cast::<u8>(),
+                        bytes as usize,
+                    );
+                    ocerz_st(reply + off, 8, alloc);
+                } else {
+                    ocerz_st(reply + off, 8, 0);
+                    ocerz_st(reply + off + 12, 4, 0);
+                }
+                let mut descriptor: MachMsgDescriptor = core::mem::zeroed();
+                ptr::copy_nonoverlapping(
+                    ocerz_g2h(reply + off).cast::<u8>(),
+                    (&mut descriptor as *mut MachMsgDescriptor).cast::<u8>(),
+                    core::mem::size_of::<MachMsgDescriptor>(),
+                );
+                super::machmsg::ocerz_release_received_ool(
+                    &descriptor,
+                    ty,
+                    address,
+                    bytes,
+                    (alloc != 0) as c_int,
+                );
+            }
+            off += 16;
+            continue;
+        }
+        let _ = trap;
+        break;
+    }
+}
+
+unsafe fn ocerz_reply_alias_iokit(vm: *mut OcerzVM, reply: u64, recv_size: u32) {
+    if crate::ffi::ocerz_low_base == 0 || reply == 0 {
+        return;
+    }
+    let id = ocerz_ld(reply + 0x14, 4) as u32;
+    if !(2900..=2999).contains(&id) {
+        return;
+    }
+    let mut size = ocerz_ld(reply + 4, 4) as u32;
+    if recv_size != 0 && size > recv_size {
+        size = recv_size;
+    }
+    size = size.min(0x200);
+    let mut tries = 0;
+    static mut INNER: c_int = -1;
+    if INNER < 0 {
+        INNER = libc::getenv(c"OCERZ_NO_IOKIT_INNER_PTR".as_ptr()).is_null() as c_int;
+    }
+    let mut off = 0x20;
+    while off + 8 <= size as u64 && tries < 8 {
+        let pointer = ocerz_ld(reply + off, 8);
+        if pointer < 0x1000000 || pointer >= crate::ffi::OCERZ_LOW_LIMIT {
+            off += 4;
+            continue;
+        }
+        if pointer & 0xfff != 0 {
+            let mut device_protection = 0;
+            let guest_page = pointer & !((crate::ffi::OCERZ_GUEST_PAGE_SIZE as u64) - 1);
+            let guest_protection = crate::ffi::ocerz_addr_prot(pointer);
+            if INNER == 0
+                || pointer & 7 != 0
+                || ocerz_host_region_is_device(pointer, &mut device_protection) == 0
+            {
+                off += 4;
+                continue;
+            }
+            if guest_protection > 0 && !alias_page_ours(guest_page) {
+                off += 4;
+                continue;
+            }
+        }
+        let slot_prot = crate::ffi::ocerz_addr_prot(pointer);
+        if slot_prot >= 0 && slot_prot & libc::PROT_READ != 0 {
+            alias_refresh_if_stale(vm, pointer);
+            off += 4;
+            continue;
+        }
+        tries += 1;
+        alias_raw_region(vm, pointer, false);
+        off += 4;
+    }
+}
+
+unsafe fn alias_refresh_if_stale(vm: *mut OcerzVM, pointer: u64) -> c_int {
+    static mut OFF: c_int = -1;
+    if OFF < 0 {
+        OFF = (!libc::getenv(c"OCERZ_NO_ALIAS_REFRESH".as_ptr()).is_null()) as c_int;
+    }
+    let delta = ocerz_g2h(0) as u64;
+    if OFF != 0 || delta == 0 || !alias_reg_find(pointer, 0, true) {
+        return 0;
+    }
+    let mut hs = 0;
+    let mut he = 0;
+    let mut hobj = 0;
+    let mut hprot = 0;
+    if !host_region_entry(pointer, &mut hs, &mut he, &mut hobj, &mut hprot)
+        || hs > pointer
+        || hprot & VM_PROT_READ == 0
+    {
+        return 0;
+    }
+    let win = 0x1000_0000u64;
+    let mut at = if pointer - hs > win {
+        pointer - win
+    } else {
+        hs
+    };
+    let end = if he - pointer > win {
+        pointer + win
+    } else {
+        he
+    };
+    for _ in 0..64 {
+        if at >= end {
+            break;
+        }
+        let mut ss = 0;
+        let mut se = 0;
+        let mut sobj = 0;
+        let mut sprot = 0;
+        if !host_region_entry(at + delta, &mut ss, &mut se, &mut sobj, &mut sprot) || se <= delta {
+            break;
+        }
+        if ss <= at + delta && sobj != hobj && alias_reg_find(at, sobj, false) {
+            return alias_raw_region(vm, pointer, true);
+        }
+        at = if ss > at + delta {
+            ss - delta
+        } else {
+            se - delta
+        };
+    }
+    0
+}
+
+unsafe fn ocerz_vmmsg_trace(phase: *const c_char, msg: u64, size_limit: u32) {
+    static mut ENABLED: c_int = -1;
+    if ENABLED < 0 {
+        ENABLED = (!libc::getenv(c"OCERZ_VMMSG".as_ptr()).is_null()) as c_int;
+    }
+    if ENABLED == 0 || msg == 0 {
+        return;
+    }
+    let id = ocerz_ld(msg + 0x14, 4) as u32;
+    if !(((4800..=4826).contains(&id) || (4900..=4926).contains(&id))
+        && !matches!(id, 4815 | 4816 | 4915 | 4916))
+        && !(10050..=10054).contains(&id)
+        && !(10150..=10154).contains(&id)
+    {
+        return;
+    }
+    let mut size = ocerz_ld(msg + 4, 4) as u32;
+    if size == 0 && (10050..=10054).contains(&id) {
+        size = 0x90;
+    }
+    if size_limit != 0 && size > size_limit {
+        size = size_limit;
+    }
+    size = size.min(0x90);
+    libc::fprintf(
+        crate::log::stderr(),
+        c"ocerz: VMMSG-%s[%d] id=%u bits=%#x size=%#x".as_ptr(),
+        phase,
+        libc::getpid(),
+        id,
+        ocerz_ld(msg, 4) as u32,
+        size,
+    );
+    let mut off = 0x18;
+    while off + 8 <= size as u64 {
+        libc::fprintf(
+            crate::log::stderr(),
+            c" +%#llx=%#llx".as_ptr(),
+            off as libc::c_ulonglong,
+            ocerz_ld(msg + off, 8) as libc::c_ulonglong,
+        );
+        off += 8;
+    }
+    libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+}
+
+unsafe fn thread_act_emulate(cpu: *mut OcerzCPU, buf: u64, id: u32, recv_size: u32) -> bool {
+    static mut OFF: c_int = -1;
+    if OFF < 0 {
+        OFF = (!libc::getenv(c"OCERZ_NO_THREADACT".as_ptr()).is_null()) as c_int;
+    }
+    let need = if id == 3603 { 40 + 44 * 4 + 8 } else { 36 + 8 };
+    if OFF != 0 || recv_size < need {
+        return false;
+    }
+    let port = ocerz_ld(buf + 8, 4) as u32;
+    let reply_port = ocerz_ld(buf + 12, 4) as u32;
+    let mut state = [0u32; 44];
+    let mut count = 0u32;
+    let kr;
+    if id == 3605 {
+        kr = crate::ffi::ocerz_vm_thread_suspend(cpu, port);
+    } else if id == 3606 {
+        kr = crate::ffi::ocerz_vm_thread_resume(port);
+    } else {
+        let flavor = ocerz_ld(buf + 32, 4) as u32;
+        let want = ocerz_ld(buf + 36, 4) as u32;
+        let mut g = [0u64; 16];
+        let mut rip = 0;
+        let mut flags = 0;
+        if (flavor != 4 && flavor != 7)
+            || crate::ffi::ocerz_vm_thread_regs(port, g.as_mut_ptr(), &mut rip, &mut flags) < 0
+        {
+            return false;
+        }
+        let values = [
+            g[crate::ffi::OCERZ_RAX as usize],
+            g[crate::ffi::OCERZ_RBX as usize],
+            g[crate::ffi::OCERZ_RCX as usize],
+            g[crate::ffi::OCERZ_RDX as usize],
+            g[crate::ffi::OCERZ_RDI as usize],
+            g[crate::ffi::OCERZ_RSI as usize],
+            g[crate::ffi::OCERZ_RBP as usize],
+            g[crate::ffi::OCERZ_RSP as usize],
+            g[8],
+            g[9],
+            g[10],
+            g[11],
+            g[12],
+            g[13],
+            g[14],
+            g[15],
+            rip,
+            flags | crate::inline::OCERZ_FLAG_FIXED1,
+            0x2b,
+            0,
+            0,
+        ];
+        let mut at = 0;
+        if flavor == 7 {
+            state[0] = 4;
+            state[1] = 42;
+            at = 2;
+        }
+        for (i, value) in values.iter().enumerate() {
+            state[at + i * 2] = *value as u32;
+            state[at + i * 2 + 1] = (*value >> 32) as u32;
+        }
+        count = (at + 42) as u32;
+        kr = if want < count {
+            OCERZ_MACH_KERN_INVALID_ARGUMENT
+        } else {
+            OCERZ_MACH_KERN_SUCCESS
+        };
+    }
+    if kr < 0 {
+        return false;
+    }
+    let size = if id == 3603 && kr == 0 {
+        40 + count * 4
+    } else {
+        36
+    };
+    ocerz_st(buf, 4, 0x1200);
+    ocerz_st(buf + 4, 4, size as u64);
+    ocerz_st(buf + 8, 4, 0);
+    ocerz_st(buf + 12, 4, reply_port as u64);
+    ocerz_st(buf + 16, 4, 0);
+    ocerz_st(buf + 20, 4, (id + 100) as u64);
+    ocerz_st(buf + 24, 8, 0x0000000100000000);
+    ocerz_st(buf + 32, 4, kr as u32 as u64);
+    if size > 36 {
+        ocerz_st(buf + 36, 4, count as u64);
+        for i in 0..count {
+            ocerz_st(buf + 40 + 4 * i as u64, 4, state[i as usize] as u64);
+        }
+    }
+    ocerz_st(buf + size as u64, 4, 0);
+    ocerz_st(buf + size as u64 + 4, 4, 8);
+    mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS as u64);
+    true
+}
+
+unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64; 8]) -> u64 {
+    let gmsg = a[0];
+    let vm_region_req = if gmsg != 0
+        && a[1] & 1 != 0
+        && ocerz_ld(gmsg + 4, 4) as u32 >= 0x28
+        && matches!(ocerz_ld(gmsg + 0x14, 4) as u32, 4815 | 4816)
+    {
+        ocerz_ld(gmsg + 0x20, 8)
+    } else {
+        u64::MAX
+    };
+    let mut saves = [super::machmsg::OcerzOolSave::default(); 64];
+    let mut nsaves = 0;
+    if gmsg != 0 {
+        nsaves = super::machmsg::ocerz_send_xlate_descriptors(
+            gmsg,
+            ocerz_ld(gmsg + 4, 4) as u32,
+            saves.as_mut_ptr(),
+            saves.len() as c_int,
+        );
+    }
+    let mut tc: super::machmsg::TcPolicySave = core::mem::zeroed();
+    let get_tc = if gmsg != 0 && a[1] & 1 != 0 {
+        let get = super::machmsg::tc_policy_get_request(gmsg);
+        super::machmsg::tc_policy_send(gmsg, ocerz_ld(gmsg + 4, 4) as u32, &mut tc);
+        get
+    } else {
+        0
+    };
+    if gmsg != 0 {
+        ocerz_vmmsg_trace(c"REQ".as_ptr(), gmsg, ocerz_ld(gmsg + 4, 4) as u32);
+    }
+    if gmsg != 0 && a[1] & 2 != 0 {
+        super::bsd::disarm_guest_buffer(cpu, gmsg, a[3] as u32 as u64);
+    }
+    if a[0] != 0 {
+        a[0] = ocerz_g2h(a[0]) as u64;
+    }
+    (*cpu).last_rcv_name = if a[1] & 2 != 0 { a[4] as u32 } else { 0 };
+    (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    let result = super::raw::ocerz_host_mach_trap(31, a);
+    (*cpu).block_since_ns = 0;
+    if nsaves != 0 {
+        super::machmsg::ocerz_send_restore_descriptors(gmsg, saves.as_ptr(), nsaves);
+    }
+    super::machmsg::tc_policy_send_done(&tc, result);
+    if gmsg != 0 && a[1] & 2 != 0 && result == 0 {
+        let recv_size = a[3] as u32;
+        ocerz_vmmsg_trace(c"REPLY".as_ptr(), gmsg, recv_size);
+        super::machmsg::ocerz_reply_xlate_vm_region(gmsg, recv_size, vm_region_req);
+        ocerz_reply_relocate_ool(gmsg, recv_size, 31);
+        ocerz_reply_alias_iokit(vm, gmsg, recv_size);
+        if get_tc != 0 {
+            super::machmsg::tc_policy_get_reply(gmsg, recv_size);
+        }
+    }
+    if gmsg != 0 && super::machmsg::ocerz_mach_err_interesting(result) != 0 {
+        super::machmsg::ocerz_log_mach_send_err(31, result, a, gmsg, cpu);
+    }
+    result
+}
+
+unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64; 8]) -> u64 {
+    const THREAD_IDENTIFIER_INFO: u32 = 4;
+    let msgh_id = (a[4] >> 32) as u32;
+    a[6] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 8, 8);
+    a[7] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 16, 8);
+    let reply_buf = a[0];
+    let vector_mode = a[1] & 0x1_0000_0000 != 0;
+    let request_buf = if vector_mode && reply_buf != 0 {
+        ocerz_ld(reply_buf, 8)
+    } else {
+        reply_buf
+    };
+    let thread_info_flavor =
+        if request_buf != 0 && msgh_id == 3612 && ocerz_ld(request_buf + 4, 4) as u32 >= 0x24 {
+            ocerz_ld(request_buf + 0x20, 4) as u32
+        } else {
+            0
+        };
+    let sc_map_request = msgh_id == 10052;
+    let mut sc_uid = 0u32;
+    let mut sc_segment = 0u32;
+    let mut vm_result_size = 0u64;
+    let mut vm_result_alignment = 0u64;
+    if request_buf != 0 && msgh_id == 10054 {
+        sc_uid = ocerz_ld(request_buf + 0x30, 4) as u32;
+    } else if request_buf != 0 && sc_map_request {
+        sc_uid = ocerz_ld(request_buf + 0x20, 4) as u32;
+        sc_segment = ocerz_ld(request_buf + 0x24, 4) as u32;
+    }
+    if request_buf != 0 && msgh_id == 4800 {
+        vm_result_size = ocerz_ld(request_buf + 0x28, 8);
+    } else if request_buf != 0 && matches!(msgh_id, 4811 | 4813) {
+        vm_result_size = ocerz_ld(request_buf + 0x38, 8);
+    }
+    let vm_fixed_keep = request_buf != 0
+        && msgh_id == 4811
+        && (ocerz_ld(request_buf + 0x48, 4) as u32) & (VM_FLAGS_ANYWHERE | VM_FLAGS_OVERWRITE) == 0;
+    if request_buf != 0
+        && msgh_id == 4811
+        && (ocerz_ld(request_buf + 0x48, 4) as u32) & VM_FLAGS_ANYWHERE != 0
+    {
+        let mask = ocerz_ld(request_buf + 0x40, 8);
+        if mask != 0 && mask < 1u64 << 37 && mask & mask.wrapping_add(1) == 0 {
+            vm_result_alignment = mask + 1;
+        }
+    }
+    let vm_region_req = if request_buf != 0
+        && matches!(msgh_id, 4815 | 4816)
+        && ocerz_ld(request_buf + 4, 4) as u32 >= 0x28
+    {
+        ocerz_ld(request_buf + 0x20, 8)
+    } else {
+        u64::MAX
+    };
+    if reply_buf != 0 && a[1] & 2 != 0 {
+        if vector_mode {
+            super::bsd::disarm_guest_buffer(
+                cpu,
+                ocerz_ld(reply_buf + 8, 8),
+                ocerz_ld(reply_buf + 20, 4) as u32 as u64,
+            );
+        } else {
+            super::bsd::disarm_guest_buffer(cpu, reply_buf, a[6] as u32 as u64);
+        }
+    }
+    let mut saves = [super::machmsg::OcerzOolSave::default(); 64];
+    let mut nsaves = 0;
+    if reply_buf != 0 {
+        if vector_mode {
+            let send_count = if a[1] & 1 != 0 {
+                (a[2] >> 32) as u32
+            } else {
+                0
+            };
+            let recv_count = if a[1] & 2 != 0 { a[6] as u32 } else { 0 };
+            nsaves = super::machmsg::ocerz_send_xlate_vector(
+                reply_buf,
+                send_count.max(recv_count),
+                (a[1] & 1 != 0) as c_int,
+                (a[1] & 2 != 0) as c_int,
+                saves.as_mut_ptr(),
+                saves.len() as c_int,
+            );
+        } else {
+            nsaves = super::machmsg::ocerz_send_xlate_descriptors(
+                reply_buf,
+                (a[2] >> 32) as u32,
+                saves.as_mut_ptr(),
+                saves.len() as c_int,
+            );
+        }
+    }
+    let mut tc: super::machmsg::TcPolicySave = core::mem::zeroed();
+    let get_tc = if !vector_mode && request_buf != 0 && a[1] & 1 != 0 {
+        let get = super::machmsg::tc_policy_get_request(request_buf);
+        super::machmsg::tc_policy_send(request_buf, (a[2] >> 32) as u32, &mut tc);
+        get
+    } else {
+        0
+    };
+    if request_buf != 0 {
+        ocerz_vmmsg_trace(c"REQ".as_ptr(), request_buf, (a[2] >> 32) as u32);
+    }
+    if reply_buf != 0 && !vector_mode && a[1] & 3 == 3 {
+        if thread_act_emulate(cpu, request_buf, msgh_id, a[6] as u32) {
+            return 0;
+        }
+    }
+    if a[0] != 0 {
+        a[0] = ocerz_g2h(a[0]) as u64;
+    }
+    (*cpu).last_rcv_name = if a[1] & 2 != 0 { a[5] as u32 } else { 0 };
+    (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    let result = super::raw::ocerz_host_mach_trap(47, a);
+    (*cpu).block_since_ns = 0;
+    let mut reply = reply_buf;
+    let mut reply_size = a[6] as u32;
+    if vector_mode && reply_buf != 0 {
+        reply = ocerz_ld(reply_buf + 8, 8);
+        if reply == 0 {
+            reply = ocerz_ld(reply_buf, 8);
+        }
+        reply_size = ocerz_ld(reply_buf + 0x14, 4) as u32;
+    }
+    super::machmsg::vmmap_pad_restore();
+    if nsaves != 0 {
+        super::machmsg::ocerz_send_restore_descriptors(reply_buf, saves.as_ptr(), nsaves);
+    }
+    super::machmsg::tc_policy_send_done(&tc, result);
+    if request_buf != 0 && super::machmsg::ocerz_mach_err_interesting(result) != 0 {
+        super::machmsg::ocerz_log_mach_send_err(47, result, a, request_buf, cpu);
+    }
+    if reply != 0 && a[1] & 2 != 0 && result == 0 {
+        ocerz_vmmsg_trace(c"REPLY".as_ptr(), reply, reply_size);
+        super::machmsg::ocerz_reply_xlate_vm_region(reply, reply_size, vm_region_req);
+        ocerz_reply_relocate_ool(reply, reply_size, 47);
+        if get_tc != 0 {
+            super::machmsg::tc_policy_get_reply(reply, reply_size);
+        }
+        ocerz_reply_alias_iokit(vm, reply, reply_size);
+        let reply_id = ocerz_ld(reply + 0x14, 4) as u32;
+        let status = ocerz_ld(reply + 0x20, 4) as u32 as c_int;
+        if reply_id == 4911 && vm_fixed_keep && status == OCERZ_MACH_KERN_SUCCESS {
+            mig_vm_refuse_taken(reply, vm_result_size);
+        }
+        if matches!(reply_id, 4900 | 4911 | 4913) && status == OCERZ_MACH_KERN_SUCCESS {
+            mig_vm_reply_relocate(vm, reply, false, vm_result_size, vm_result_alignment);
+        }
+        let reply_size_actual = ocerz_ld(reply + 4, 4) as u32;
+        let reply_bits = ocerz_ld(reply, 4) as u32;
+        if reply_id == 10154
+            && msgh_id == 10054
+            && reply_bits & 0x8000_0000 == 0
+            && reply_size_actual >= 0x30
+            && status == OCERZ_MACH_KERN_SUCCESS
+        {
+            let universe = ocerz_ld(reply + 0x24, 8);
+            if universe != 0 && alias_raw_contiguous(vm, universe) == 0 {
+                let table = ocerz_ld(universe, 8);
+                let entries = ocerz_ld(universe + 0x18, 8);
+                if alias_raw_region(vm, table, false) == 0
+                    && (entries == 0 || alias_raw_region(vm, entries, false) == 0)
+                {
+                    ocerz_sc_remember_universe(sc_uid, universe);
+                }
+            }
+        } else if reply_id == 10152
+            && sc_map_request
+            && reply_bits & 0x8000_0000 == 0
+            && reply_size_actual >= 0x28
+            && status == OCERZ_MACH_KERN_SUCCESS
+            && ocerz_ld(reply + 0x24, 1) as u8 != 0
+        {
+            let universe = ocerz_sc_find_universe(sc_uid);
+            if universe != 0 {
+                let table = ocerz_ld(universe, 8);
+                let kind = (sc_segment >> 29) & 3;
+                let slot = (sc_segment >> 23) & 0x3f;
+                let slot_ptr = table + kind as u64 * 0x200 + slot as u64 * 8;
+                if crate::ffi::ocerz_addr_committed(slot_ptr) == 1
+                    || ocerz_g2h(slot_ptr) as u64 == slot_ptr
+                {
+                    alias_raw_region(vm, ocerz_ld(slot_ptr, 8), false);
+                }
+            }
+        }
+        if reply_id == 3712
+            && msgh_id == 3612
+            && thread_info_flavor == THREAD_IDENTIFIER_INFO
+            && a[1] & 2 != 0
+            && result == 0
+            && reply_size_actual >= 0x40
+            && status == OCERZ_MACH_KERN_SUCCESS
+            && ocerz_ld(reply + 0x24, 4) as u32 >= 6
+        {
+            let host = ocerz_ld(reply + 0x30, 8);
+            let mut guest = crate::ffi::ocerz_vm_guest_tsd_for_host(host);
+            if guest == 0 && host >= 0x1400_0000 && host < crate::ffi::OCERZ_LOW_LIMIT {
+                guest = (*cpu).gs_base;
+            }
+            if guest != 0 {
+                let qualifier = ocerz_ld(reply + 0x38, 8);
+                ocerz_st(reply + 0x30, 8, guest);
+                ocerz_st(reply + 0x38, 8, guest + qualifier.wrapping_sub(host));
+            }
+        }
+        if msgh_id == 8000
+            && ocerz_ld(reply + 4, 4) == 0x24
+            && status == OCERZ_MACH_KERN_NOT_SUPPORTED
+        {
+            ocerz_st(reply + 0x20, 4, OCERZ_MACH_KERN_SUCCESS as u32 as u64);
+        }
+    }
+    result
+}
+
+pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_int) -> c_int {
+    let mut a = [0u64; 8];
+    a[0] = (*cpu).gpr[crate::ffi::OCERZ_RDI as usize];
+    a[1] = (*cpu).gpr[crate::ffi::OCERZ_RSI as usize];
+    a[2] = (*cpu).gpr[crate::ffi::OCERZ_RDX as usize];
+    a[3] = (*cpu).gpr[crate::ffi::OCERZ_R10 as usize];
+    a[4] = (*cpu).gpr[crate::ffi::OCERZ_R8 as usize];
+    a[5] = (*cpu).gpr[crate::ffi::OCERZ_R9 as usize];
+    let known = matches!(
+        num,
+        10 | 11
+            | 12
+            | 13
+            | 14
+            | 15
+            | 16
+            | 18
+            | 19
+            | 20
+            | 21
+            | 22
+            | 23
+            | 24
+            | 25
+            | 26
+            | 27
+            | 28
+            | 29
+            | 31
+            | 33
+            | 34
+            | 35
+            | 36
+            | 37
+            | 38
+            | 39
+            | 40
+            | 41
+            | 42
+            | 43
+            | 44
+            | 45
+            | 46
+            | 47
+            | 50
+            | 59
+            | 60
+            | 61
+            | 62
+            | 70
+            | 72
+            | 76
+            | 77
+            | 89
+            | 90
+            | 91
+            | 92
+            | 93
+            | 94
+            | 95
+            | 96
+            | 100
+    );
+    if !known {
+        let name = mach_trap_name(num);
+        if !libc::getenv(c"OCERZ_STRICT_SYSCALL".as_ptr()).is_null() {
+            crate::ocerz_fatal!(
+                "unknown Mach trap: class=1 num=%d name=%s rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx ret=%#llx\n",
+                num,
+                if name.is_null() { c"?".as_ptr() } else { name },
+                (*cpu).rip as libc::c_ulonglong,
+                a[0] as libc::c_ulonglong,
+                a[1] as libc::c_ulonglong,
+                a[2] as libc::c_ulonglong,
+                a[3] as libc::c_ulonglong,
+                ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize], 8) as libc::c_ulonglong
+            );
+            return crate::ffi::OCERZ_STEP_FATAL as c_int;
+        }
+        static mut PROBED: [u8; 256] = [0; 256];
+        if (0..256).contains(&num) {
+            let flag = ptr::addr_of_mut!(PROBED).cast::<u8>().add(num as usize);
+            if *flag == 0 {
+                *flag = 1;
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: unimplemented Mach trap num=%d name=%s -> KERN_INVALID_ARGUMENT rip=%#llx\n".as_ptr(),
+                    num,
+                    if name.is_null() { c"?".as_ptr() } else { name },
+                    (*cpu).rip as libc::c_ulonglong,
+                );
+            }
+        }
+        mach_ret(cpu, OCERZ_MACH_KERN_INVALID_ARGUMENT as u64);
+    } else {
+        let result = match num {
+            10 => guest_vm_allocate_apply(vm, a[1], a[2], a[3]),
+            11 => {
+                if a[3] != 0 {
+                    ocerz_st(a[3], 4, 0);
+                }
+                OCERZ_MACH_KERN_SUCCESS
+            }
+            12 => guest_vm_deallocate_apply(vm, a[1], a[2]),
+            14 => guest_vm_protect_apply(vm, a[1], a[2], a[4] as c_int),
+            15 => {
+                let size = a[2];
+                let mask = a[3];
+                let flags = a[4] as u32;
+                if flags & VM_FLAGS_ANYWHERE == 0 {
+                    let want = if a[1] != 0 { ocerz_ld(a[1], 8) } else { 0 };
+                    super::mem::invalidate_guest_mapping(vm, want, size);
+                    if want == 0
+                        || (crate::ffi::ocerz_map_claim_fixed(
+                            want,
+                            size,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                        ) != crate::ffi::OCERZ_OK as c_int
+                            && crate::ffi::ocerz_map_claim_region(
+                                want,
+                                size,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                            ) != crate::ffi::OCERZ_OK as c_int
+                            && (crate::ffi::ocerz_mem_register_range(want, want + size)
+                                != crate::ffi::OCERZ_OK as c_int
+                                || crate::ffi::ocerz_map_claim_region(
+                                    want,
+                                    size,
+                                    libc::PROT_READ | libc::PROT_WRITE,
+                                ) != crate::ffi::OCERZ_OK as c_int))
+                    {
+                        OCERZ_MACH_KERN_NO_SPACE
+                    } else {
+                        OCERZ_MACH_KERN_SUCCESS
+                    }
+                } else {
+                    let guest = if mask != 0 {
+                        crate::ffi::ocerz_map_anywhere_aligned(
+                            size,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            mask + 1,
+                        )
+                    } else {
+                        crate::ffi::ocerz_map_anywhere(size, libc::PROT_READ | libc::PROT_WRITE)
+                    };
+                    if guest == 0 {
+                        OCERZ_MACH_KERN_NO_SPACE
+                    } else {
+                        super::mem::invalidate_guest_mapping(vm, guest, size);
+                        if a[1] != 0 {
+                            ocerz_st(a[1], 8, guest);
+                        }
+                        OCERZ_MACH_KERN_SUCCESS
+                    }
+                }
+            }
+            16 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 33 | 34 | 35 | 36
+            | 37 | 38 | 39 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 50 | 59 | 60 | 61 | 62 | 70
+            | 72 | 76 | 77 | 90 | 91 | 92 | 93 | 94 | 95 | 96 | 100 => {
+                match num {
+                    16 => {
+                        if a[2] != 0 {
+                            a[2] = ocerz_g2h(a[2]) as u64;
+                        }
+                    }
+                    24 => {
+                        if a[1] != 0 {
+                            a[1] = ocerz_g2h(a[1]) as u64;
+                        }
+                        if a[3] != 0 {
+                            a[3] = ocerz_g2h(a[3]) as u64;
+                        }
+                    }
+                    40 => {
+                        if a[3] != 0 {
+                            a[3] = ocerz_g2h(a[3]) as u64;
+                        }
+                        if a[4] != 0 {
+                            a[4] = ocerz_g2h(a[4]) as u64;
+                        }
+                    }
+                    70 => {
+                        if a[1] != 0 {
+                            a[1] = ocerz_g2h(a[1]) as u64;
+                        }
+                        if a[3] != 0 {
+                            a[3] = ocerz_g2h(a[3]) as u64;
+                        }
+                    }
+                    43 | 44 | 45 => {
+                        if a[2] != 0 {
+                            a[2] = ocerz_g2h(a[2]) as u64;
+                        }
+                    }
+                    46 | 94 => {
+                        if a[1] != 0 {
+                            a[1] = ocerz_g2h(a[1]) as u64;
+                        }
+                    }
+                    76 => {
+                        if a[2] != 0 {
+                            a[2] = ocerz_g2h(a[2]) as u64;
+                        }
+                    }
+                    77 => {
+                        a[6] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 8, 8);
+                        if a[6] != 0 {
+                            a[6] = ocerz_g2h(a[6]) as u64;
+                        }
+                    }
+                    41 | 42 => {
+                        if a[2] != 0 {
+                            a[2] = ocerz_g2h(a[2]) as u64;
+                        }
+                    }
+                    62 => {
+                        if a[4] != 0 {
+                            a[4] = ocerz_g2h(a[4]) as u64;
+                        }
+                        (*cpu).block_nokick = 1;
+                    }
+                    72 => {
+                        if a[2] != 0 {
+                            a[2] = ocerz_g2h(a[2]) as u64;
+                        }
+                        if a[3] != 0 {
+                            a[3] = ocerz_g2h(a[3]) as u64;
+                        }
+                    }
+                    96 => {
+                        if a[2] != 0 {
+                            a[2] = ocerz_g2h(a[2]) as u64;
+                        }
+                    }
+                    90 => a[0] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[0]),
+                    93 => a[1] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[1]),
+                    95 => {
+                        a[2] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[2]);
+                        a[3] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[3]);
+                    }
+                    100 => {
+                        a[6] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 8, 8);
+                        a[7] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 16, 8);
+                    }
+                    _ => {}
+                }
+                if matches!(num, 36 | 37 | 38 | 39) {
+                    (*cpu).block_nokick = 1;
+                }
+                (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                let result = super::raw::ocerz_host_mach_trap(num as i64, &mut a);
+                (*cpu).block_since_ns = 0;
+                (*cpu).block_nokick = 0;
+                result as c_int
+            }
+            13 => {
+                if a[0] != 0 {
+                    a[0] = ocerz_g2h(a[0]) as u64;
+                }
+                if a[1] != 0 {
+                    a[1] = ocerz_g2h(a[1]) as u64;
+                }
+                super::raw::ocerz_host_mach_trap(num as i64, &mut a) as c_int
+            }
+            31 => dispatch_mach_msg31(vm, cpu, &mut a) as c_int,
+            47 => dispatch_mach_msg47(vm, cpu, &mut a) as c_int,
+            89 => {
+                if a[0] != 0 {
+                    ocerz_st(a[0], 4, 1);
+                    ocerz_st(a[0] + 4, 4, 1);
+                }
+                OCERZ_MACH_KERN_SUCCESS
+            }
+            _ => super::raw::ocerz_host_mach_trap(num as i64, &mut a) as c_int,
+        };
+        mach_ret(cpu, result as u32 as u64);
+    }
+    if (*vm).strace != 0 {
+        let name = mach_trap_name(num);
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: mach_trap %s(num=%d) = %#llx\n".as_ptr(),
+            if name.is_null() { c"?".as_ptr() } else { name },
+            num,
+            (*cpu).gpr[crate::ffi::OCERZ_RAX as usize] as libc::c_ulonglong,
+        );
+    }
+    crate::ffi::OCERZ_STEP_OK as c_int
+}

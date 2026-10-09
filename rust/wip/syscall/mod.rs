@@ -440,6 +440,7 @@
     non_snake_case,
     non_upper_case_globals
 )]
+#![allow(unsafe_op_in_unsafe_fn, unused_unsafe)]
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 
@@ -450,9 +451,14 @@ pub(super) mod raw;
 pub(super) mod util;
 use machabi::*;
 use util::env_set;
+pub(super) mod bsd;
+pub(super) mod entry;
 pub(super) mod hostwq;
+pub(super) mod ldt;
+pub(super) mod mach;
 pub(super) mod machmsg;
 pub(super) mod mem;
+pub(super) mod signals;
 pub(super) mod spawn;
 pub(super) mod sysctl;
 pub(super) mod threads;
@@ -494,15 +500,16 @@ pub(super) const SYSRET_ARITH_FLAGS: u64 = crate::inline::OCERZ_CF
     | crate::inline::OCERZ_OF;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct ocerz_iovec {
     pub(super) iov_base: u64,
     pub(super) iov_len: u64,
 }
 
-pub(super) type ocerz_bsd_fn =
-    unsafe extern "C" fn(*mut OcerzVM, *mut OcerzCPU, *mut [u64; 8]) -> c_int;
+pub(super) type ocerz_bsd_fn = unsafe fn(*mut OcerzVM, *mut OcerzCPU, *mut [u64; 8]) -> c_int;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct ocerz_bsd_entry {
     pub(super) name: *const c_char,
     pub(super) nargs: u8,
@@ -510,6 +517,8 @@ pub(super) struct ocerz_bsd_entry {
     pub(super) dual_ret: u8,
     pub(super) intercept: Option<ocerz_bsd_fn>,
 }
+
+unsafe impl Sync for ocerz_bsd_entry {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

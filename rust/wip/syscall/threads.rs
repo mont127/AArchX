@@ -169,6 +169,7 @@ pub(super) unsafe fn ocerz_bsdthread_sema_is_port(value: u64) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+#[allow(unused_assignments)]
 pub unsafe extern "C" fn ocerz_pe_stack_dump(cpu: *mut OcerzCPU, tag: *const c_char) {
     unsafe {
         let tsd = (*cpu).gs_base;
@@ -190,15 +191,17 @@ pub unsafe extern "C" fn ocerz_pe_stack_dump(cpu: *mut OcerzCPU, tag: *const c_c
         let sf = ocerz_ld(teb.wrapping_add(0x378), 8);
         let mut line = [0i8; 4096];
         let mut pos = 0i32;
-        pos = libc::snprintf(
-            line.as_mut_ptr(),
-            line.len(),
-            c"ocerz: %s[%d] cpu#%u wtid=%#llx".as_ptr(),
-            tag,
-            libc::getpid(),
-            (*cpu).cpu_number,
-            wtid as libc::c_ulonglong,
-        );
+        if pos < line.len() as i32 - 1 {
+            pos += libc::snprintf(
+                line.as_mut_ptr(),
+                line.len(),
+                c"ocerz: %s[%d] cpu#%u wtid=%#llx".as_ptr(),
+                tag,
+                libc::getpid(),
+                (*cpu).cpu_number,
+                wtid as libc::c_ulonglong,
+            );
+        }
         if sf == 0 {
             if pos < line.len() as i32 - 1 {
                 pos += libc::snprintf(
@@ -377,7 +380,7 @@ pub(super) unsafe fn sys_bsdthread_terminate(
             semaphore_signal(sema_or_ulock as u32);
         } else if sema_or_ulock != 0 {
             ocerz_st(sema_or_ulock, 4, (a[2] as u32 & !3) as u64);
-            let mut wa = [
+            let wa = [
                 OCERZ_UL_UNFAIR_LOCK | OCERZ_ULF_WAKE_ALL | OCERZ_ULF_WAKE_ALLOW_NON_OWNER,
                 ocerz_g2h(sema_or_ulock) as usize as u64,
                 0,
