@@ -51,7 +51,11 @@ UNIT_SRCS := $(wildcard tests/unit/*.c)
 UNIT_BINS := $(UNIT_SRCS:tests/unit/%.c=tests/unit/bin/%)
 
 rustlib:
+	@for n in $(PORTED); do rm -f src/$$n.o src/$$n.d; done
 	cd rust && cargo build --release
+
+print-core-objs:
+	@echo $(CORE_OBJS) $(RUSTLIB) $(RUST_SYSLIBS)
 
 $(RUSTLIB): rustlib
 	@true
@@ -132,7 +136,7 @@ clean:
 	cd rust && cargo clean || true
 	$(MAKE) -C tests/guest clean
 
-.PHONY: rustlib
+.PHONY: rustlib print-core-objs
 
 -include $(DEPS)
 

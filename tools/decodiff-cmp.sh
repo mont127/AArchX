@@ -9,9 +9,18 @@
 set -e
 A="$1"; B="$2"; W="${TMPDIR:-/tmp}/decodiff.$$"
 mkdir -p "$W"
-for T in "$A" "$B"; do (cd "$T" && touch src/decode.c && make -s src/decode.o); done
-clang -arch arm64 -O2 -I"$A/include" -o "$W/da" "$(dirname "$0")/decodiff.c" "$A/src/decode.o"
-clang -arch arm64 -O2 -I"$B/include" -o "$W/db" "$(dirname "$0")/decodiff.c" "$B/src/decode.o"
+# Link exactly the objects the Makefile would for a core consumer: a ported
+# decode.rs is what the tree actually decodes with, not a stale src/decode.o.
+# Older trees without print-core-objs fall back to the glob.
+for T in "$A" "$B"; do
+    (cd "$T" && make -s ocerz)
+    OBJS=$(cd "$T" && make -s print-core-objs 2>/dev/null) || \
+        OBJS=$(ls "$T"/src/*.o | grep -v '/main\.o$')
+    OBJS=$(cd "$T" && for o in $OBJS; do echo "$T/$o"; done)
+    [ "$T" = "$A" ] && A_OBJS=$OBJS || B_OBJS=$OBJS
+done
+clang -arch arm64 -O2 -I"$A/include" -o "$W/da" "$(dirname "$0")/decodiff.c" $A_OBJS -lcompression
+clang -arch arm64 -O2 -I"$B/include" -o "$W/db" "$(dirname "$0")/decodiff.c" $B_OBJS -lcompression
 "$W/da" digest "$W/a.bin"
 "$W/db" digest "$W/b.bin"
 if cmp -s "$W/a.bin" "$W/b.bin"; then
