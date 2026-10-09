@@ -47,3 +47,4 @@
 
 - At detached tip commit `ff3e398`, `datomic_counter-no-jit` timed out (exit 124; expected `OK`) in the full gate. The current dynamic failure list is identical.
 - Fixed by `f6b9e36` (present at tip `f9753d8`): the `3283d71` native-framework compat check no longer emits the stray `:/:\capacity overflow` line; confirmed by the full gate, where `run_native_framework_tests` passed.
+- dthread_signal-jit is intermittent on 360ad00 without the cache port (1/3 direct runs, `rounds=120 hits=120 misses=1`).
