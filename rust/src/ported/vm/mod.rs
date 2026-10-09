@@ -553,6 +553,31 @@ pub(super) static mut G_HSIG_RING: [HsigEnt; 512] = [const {
 }; 512];
 pub(super) static G_HSIG_N: AtomicU32 = AtomicU32::new(0);
 
+#[inline(always)]
+pub(super) unsafe fn gcpus() -> *mut *mut OcerzCPU {
+    &raw mut G_CPUS as *mut *mut OcerzCPU
+}
+
+#[inline(always)]
+pub(super) unsafe fn cputhreads() -> *mut libc::pthread_t {
+    &raw mut G_CPU_THREADS as *mut libc::pthread_t
+}
+
+#[inline(always)]
+pub(super) unsafe fn hsig() -> *mut HsigEnt {
+    &raw mut G_HSIG_RING as *mut HsigEnt
+}
+
+#[inline(always)]
+pub(super) unsafe fn recov_e() -> *mut RecovEnt {
+    &raw mut G_RECOV_RING.e as *mut RecovEnt
+}
+
+#[inline(always)]
+pub(super) unsafe fn recov_names() -> *const *const c_char {
+    &raw const G_RECOV_NAMES as *const *const c_char
+}
+
 use ffi::{
     ocerz_addr_committed, ocerz_addr_prot, ocerz_addr_readable, ocerz_arena_hi, ocerz_arena_lo,
     ocerz_commpage, ocerz_dyld_name_for_addr, ocerz_guest_base, ocerz_jit_lock_held_self,
@@ -805,7 +830,7 @@ pub(super) unsafe fn ocerz_cpu_register(cpu: *mut OcerzCPU) {
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         let mut i = 0;
         while i < G_CPUS_N {
-            if G_CPUS[i as usize] == cpu {
+            if *gcpus().add(i as usize) == cpu {
                 static DUPS: AtomicU32 = AtomicU32::new(0);
                 if !libc::getenv(c"OCERZ_CPUREG_LOG".as_ptr()).is_null() {
                     libc::fprintf(
@@ -821,8 +846,8 @@ pub(super) unsafe fn ocerz_cpu_register(cpu: *mut OcerzCPU) {
             i += 1;
         }
         if G_CPUS_N < OCERZ_MAX_CPUS as c_int {
-            G_CPUS[G_CPUS_N as usize] = cpu;
-            G_CPU_THREADS[G_CPUS_N as usize] = pthread_self();
+            *gcpus().add(G_CPUS_N as usize) = cpu;
+            *cputhreads().add(G_CPUS_N as usize) = pthread_self();
             G_CPUS_N += 1;
         }
         libc::pthread_mutex_unlock(&raw mut G_CPUS_LOCK);
@@ -835,12 +860,12 @@ pub(super) unsafe fn ocerz_cpu_unregister(cpu: *mut OcerzCPU) {
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         let mut i = 0;
         while i < G_CPUS_N {
-            if G_CPUS[i as usize] == cpu {
+            if *gcpus().add(i as usize) == cpu {
                 G_CPUS_N -= 1;
                 let last = G_CPUS_N;
-                G_CPUS[i as usize] = G_CPUS[last as usize];
-                G_CPU_THREADS[i as usize] = G_CPU_THREADS[last as usize];
-                G_CPUS[last as usize] = ptr::null_mut();
+                *gcpus().add(i as usize) = *gcpus().add(last as usize);
+                *cputhreads().add(i as usize) = *cputhreads().add(last as usize);
+                *gcpus().add(last as usize) = ptr::null_mut();
                 i -= 1;
             }
             i += 1;
@@ -882,8 +907,8 @@ pub unsafe extern "C" fn ocerz_vm_guest_tsd_for_host(host_tsd: u64) -> u64 {
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         let mut i = 0;
         while i < G_CPUS_N && g == 0 {
-            if (*G_CPUS[i as usize]).host_tsd == host_tsd {
-                g = cpu_guest_tsd(G_CPUS[i as usize]);
+            if (**gcpus().add(i as usize)).host_tsd == host_tsd {
+                g = cpu_guest_tsd(*gcpus().add(i as usize));
             }
             i += 1;
         }
@@ -896,8 +921,8 @@ pub(super) unsafe fn cpu_by_kport_locked(port: u32) -> *mut OcerzCPU {
     unsafe {
         let mut i = 0;
         while i < G_CPUS_N {
-            if (*G_CPUS[i as usize]).host_kport == port {
-                return G_CPUS[i as usize];
+            if (**gcpus().add(i as usize)).host_kport == port {
+                return *gcpus().add(i as usize);
             }
             i += 1;
         }
@@ -1083,9 +1108,9 @@ pub(super) unsafe fn susp_in_allocator(port: u32) -> c_int {
         }
         let mut pcs = [0u64; SUSP_FRAMES + 2];
         let mut np = 0usize;
-        pcs[np] = hs.pc;
+        *pcs.as_mut_ptr().add(np) = hs.pc;
         np += 1;
-        pcs[np] = hs.lr;
+        *pcs.as_mut_ptr().add(np) = hs.lr;
         np += 1;
         let mut fp = hs.fp;
         let sp = hs.sp;
@@ -1093,7 +1118,7 @@ pub(super) unsafe fn susp_in_allocator(port: u32) -> c_int {
         while k < SUSP_FRAMES && fp >= sp && fp - sp < (64 << 20) && (fp & 7) == 0 {
             let next = ptr::read_unaligned(fp as *const u64);
             let ret = ptr::read_unaligned((fp + 8) as *const u64);
-            pcs[np] = ret;
+            *pcs.as_mut_ptr().add(np) = ret;
             np += 1;
             if next <= fp {
                 break;
@@ -1102,7 +1127,7 @@ pub(super) unsafe fn susp_in_allocator(port: u32) -> c_int {
             k += 1;
         }
         for k in 0..np {
-            let a = pcs[k] & 0x0000ffffffffffff;
+            let a = *pcs.as_mut_ptr().add(k) & 0x0000ffffffffffff;
             if a >= G_MALLOC_LO && a < G_MALLOC_HI {
                 return 1;
             }
@@ -1258,7 +1283,7 @@ pub unsafe extern "C" fn ocerz_vm_purge_jit_ras_if(
         }
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         for i in 0..G_CPUS_N {
-            let c = G_CPUS[i as usize];
+            let c = *gcpus().add(i as usize);
             if !c.is_null() && (*c).vm == vm {
                 ras_clear_if(c, stale, arg);
             }
@@ -1277,7 +1302,7 @@ pub unsafe extern "C" fn ocerz_vm_purge_jit_refs(vm: *mut OcerzVM) {
         (*vm).cpu.side_blk = ptr::null_mut();
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         for i in 0..G_CPUS_N {
-            let c = G_CPUS[i as usize];
+            let c = *gcpus().add(i as usize);
             if !c.is_null() && (*c).vm == vm {
                 (*c).side_blk = ptr::null_mut();
             }
@@ -1298,7 +1323,7 @@ pub unsafe extern "C" fn ocerz_vm_purge_jit_ras(vm: *mut OcerzVM) {
         }
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         for i in 0..G_CPUS_N {
-            let c = G_CPUS[i as usize];
+            let c = *gcpus().add(i as usize);
             if !c.is_null() && (*c).vm == vm {
                 ras_clear(c);
             }
@@ -1345,9 +1370,9 @@ pub unsafe extern "C" fn ocerz_recov_note(kind: c_int, rip: u64) {
     unsafe {
         let i = (G_RECOV_RING.n & 15) as usize;
         G_RECOV_RING.n = G_RECOV_RING.n.wrapping_add(1);
-        G_RECOV_RING.e[i].kind = kind as u8;
-        G_RECOV_RING.e[i].rip = rip;
-        G_RECOV_RING.e[i].icount = if !G_VM.is_null() {
+        (*recov_e().add(i)).kind = kind as u8;
+        (*recov_e().add(i)).rip = rip;
+        (*recov_e().add(i)).icount = if !G_VM.is_null() {
             (*G_VM).insn_count
         } else {
             0
@@ -1374,9 +1399,9 @@ pub unsafe extern "C" fn ocerz_recov_dump(f: *mut libc::FILE) {
             libc::fprintf(
                 f,
                 c" %s@%#llx/ic=%#llx".as_ptr(),
-                G_RECOV_NAMES[G_RECOV_RING.e[j].kind as usize],
-                G_RECOV_RING.e[j].rip as c_ulonglong,
-                G_RECOV_RING.e[j].icount as c_ulonglong,
+                *recov_names().add((*recov_e().add(j)).kind as usize),
+                (*recov_e().add(j)).rip as c_ulonglong,
+                (*recov_e().add(j)).icount as c_ulonglong,
             );
         }
         libc::fprintf(f, c"\n".as_ptr());
@@ -1393,8 +1418,8 @@ pub unsafe extern "C" fn ocerz_vm_atfork_prepare() {
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         G_FORK_SURVIVING_CPU = ptr::null_mut();
         for i in 0..G_CPUS_N {
-            if pthread_equal(G_CPU_THREADS[i as usize], self_) != 0 {
-                G_FORK_SURVIVING_CPU = G_CPUS[i as usize];
+            if pthread_equal(*cputhreads().add(i as usize), self_) != 0 {
+                G_FORK_SURVIVING_CPU = *gcpus().add(i as usize);
                 break;
             }
         }
@@ -1414,12 +1439,12 @@ pub unsafe extern "C" fn ocerz_vm_atfork_child() {
     unsafe {
         let survivor = G_FORK_SURVIVING_CPU;
         for i in 0..G_CPUS_N {
-            G_CPUS[i as usize] = ptr::null_mut();
+            *gcpus().add(i as usize) = ptr::null_mut();
         }
         G_CPUS_N = 0;
         if !survivor.is_null() {
-            G_CPUS[0] = survivor;
-            G_CPU_THREADS[0] = pthread_self();
+            *gcpus().add(0) = survivor;
+            *cputhreads().add(0) = pthread_self();
             G_CPUS_N = 1;
         }
         G_FORK_SURVIVING_CPU = ptr::null_mut();
@@ -1595,7 +1620,11 @@ pub(super) unsafe fn arg_trap_report(c: *const OcerzCPU) {
             let rn = ocerz_vm_riphist(rh.as_mut_ptr(), 32);
             libc::fprintf(stderr(), c" hist:".as_ptr());
             for i in 0..rn.min(16) {
-                libc::fprintf(stderr(), c" %#llx".as_ptr(), rh[i as usize] as c_ulonglong);
+                libc::fprintf(
+                    stderr(),
+                    c" %#llx".as_ptr(),
+                    *rh.as_ptr().add(i as usize) as c_ulonglong,
+                );
             }
         }
         if ocerz_addr_readable((*c).gpr[OCERZ_RSP]) != 0 {
@@ -1627,8 +1656,13 @@ pub(super) unsafe fn arg_trap_report(c: *const OcerzCPU) {
             }
         }
         for i in 0..6usize {
-            let v = (*c).gpr[A[i].1];
-            libc::fprintf(stderr(), c" %s=%#llx".as_ptr(), A[i].0, v as c_ulonglong);
+            let v = (*c).gpr[(*((&raw const A) as *const (*const c_char, usize)).add(i)).1];
+            libc::fprintf(
+                stderr(),
+                c" %s=%#llx".as_ptr(),
+                (*((&raw const A) as *const (*const c_char, usize)).add(i)).0,
+                v as c_ulonglong,
+            );
             if v != 0 && ocerz_addr_readable(v) != 0 && ocerz_addr_readable(v + 8) != 0 {
                 libc::fprintf(
                     stderr(),
@@ -1657,13 +1691,13 @@ pub(super) unsafe fn sel_trap_report(c: *const OcerzCPU) {
         let mut i = 0usize;
         while i < 79 && sel != 0 {
             let b = ocerz_ld(sel + i as u64, 1) as u8;
-            nm[i] = b;
+            *nm.as_mut_ptr().add(i) = b;
             if b == 0 {
                 break;
             }
             i += 1;
         }
-        nm[i] = 0;
+        *nm.as_mut_ptr().add(i) = 0;
         libc::fprintf(
             stderr(),
             c"ocerz: SELTRAP rip=%#llx recv=%#llx isa=%#llx sel=%#llx \"%s\" gs=%#llx icount=%llu\n"
@@ -1718,7 +1752,7 @@ pub unsafe extern "C" fn ocerz_current_guest_rsp() -> u64 {
 pub unsafe extern "C" fn ocerz_current_guest_gpr(i: c_int) -> u64 {
     unsafe {
         if !G_CUR_CPU.is_null() && i >= 0 && i < 16 {
-            (*G_CUR_CPU).gpr[i as usize]
+            *(*G_CUR_CPU).gpr.get_unchecked(i as usize)
         } else {
             0
         }
