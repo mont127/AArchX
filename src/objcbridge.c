@@ -2113,6 +2113,29 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
         }
     }
 
+    /*
+     * A method the guest implemented itself needs no crossing.  Jump
+     * to its x86 implementation with every register as the guest set it, the
+     * return address still on the stack, as native objc_msgSend jumps to an
+     * IMP.  Arguments native code could not take, x86 function pointers above
+     * all (Unity's PLCrashSignalHandler), then reach guest code unchanged.
+     */
+    if (!imp) {
+        void *nimp = ((void *(*)(void *, void *))ob_need(&g_ob_class_getMethodImplementation))(cls, sel);
+        uint64_t gimp = 0;
+        if (nimp && !(ocerz_abi_callback_sig(nimp, &gimp) && gimp)) {
+            uint64_t g = ocerz_h2g(nimp);
+            gimp = ocerz_abi_is_guest_code(g) ? g : 0;
+        }
+        if (gimp) {
+            if (kind != OB_PLAIN)
+                cpu->gpr[stret ? OCERZ_RSI : OCERZ_RDI] = ocerz_h2g(recv);
+            ocerz_bridge_lower(&outer);
+            cpu->rip = gimp;
+            return ob_settle(vm, cpu);
+        }
+    }
+
     send = ob_method(cls, sel, &scratch);
     if (!send && imp && imp_types) {
         ob_describe(cls, sel, imp_types, "implementation", &scratch);
@@ -2224,8 +2247,30 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
     return ob_settle(vm, cpu);
 }
 
+/*
+ * Under OCERZ_FPS, native mode also counts -[NSOpenGLContext flushBuffer].
+ * The context is a native object there, so its swap never reaches the guest's
+ * CGLFlushDrawable stub that jit.c watches.
+ */
+extern uint64_t g_fps_frames;
+
+static void ob_fps_note(void *sel)
+{
+    static int on = -1;
+    static void *flush;
+    if (on < 0) {
+        on = getenv("OCERZ_FPS") != NULL;
+        if (on)
+            flush = ob_sel_registerName("flushBuffer");
+    }
+    if (on && sel == flush)
+        __atomic_fetch_add(&g_fps_frames, 1, __ATOMIC_RELAXED);
+}
+
 static int ob_send(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret)
 {
+    if (!stret)
+        ob_fps_note((void *)(uintptr_t)cpu->gpr[OCERZ_RSI]);
     return ob_send_via(vm, cpu, kind, stret, NULL, NULL);
 }
 
@@ -2285,6 +2330,39 @@ int ocerz_objc_msgSendSuper_stret(struct OcerzVM *vm, OcerzCPU *cpu)
 int ocerz_objc_msgSendSuper2_stret(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     return ob_send(vm, cpu, OB_SUPER2, 1);
+}
+
+/*
+ * The legacy fixup-message ABI (pre-10.7 SDKs; Akane's Unity build)
+ * passes a pointer to its __objc_msgrefs pair { imp, sel } where the selector
+ * belongs.  fix_selrefs already made the pair's sel native, so a fixup send is
+ * the plain send with the selector loaded from the pair.
+ */
+static int ob_send_msgref(struct OcerzVM *vm, OcerzCPU *cpu, int kind, int stret)
+{
+    int reg = stret ? OCERZ_RDX : OCERZ_RSI;
+    cpu->gpr[reg] = ocerz_ld(cpu->gpr[reg] + 8, 8);
+    return ob_send(vm, cpu, kind, stret);
+}
+
+int ocerz_objc_msgSend_fixup(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_send_msgref(vm, cpu, OB_PLAIN, 0);
+}
+
+int ocerz_objc_msgSend_stret_fixup(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_send_msgref(vm, cpu, OB_PLAIN, 1);
+}
+
+int ocerz_objc_msgSendSuper2_fixup(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_send_msgref(vm, cpu, OB_SUPER2, 0);
+}
+
+int ocerz_objc_msgSendSuper2_stret_fixup(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return ob_send_msgref(vm, cpu, OB_SUPER2, 1);
 }
 
 static _Noreturn void ob_long_double_send(OcerzCPU *cpu, const char *export, const char *what)

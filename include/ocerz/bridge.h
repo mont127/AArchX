@@ -157,6 +157,8 @@ void ocerz_bridge_postfork_child(void);
 
 void *ocerz_bridge_host_library(const char *install_name);
 void *ocerz_bridge_host_symbol(const char *install_name, const char *host_sym);
+void ocerz_bridge_set_host_open(void *(*open)(const char *install_name));
+void ocerz_bridge_set_host_symbol(void *(*sym)(const char *host_sym));
 uint64_t ocerz_bridge_native_thunk(const void *fn, const char *name, const char *notation);
 int ocerz_bridge_thunk_trap(struct OcerzVM *vm, OcerzCPU *cpu);
 void ocerz_bridge_set_process_args(int argc, char **argv);

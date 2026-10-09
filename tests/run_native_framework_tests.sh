@@ -53,7 +53,23 @@ for arch in x86_64 arm64; do
     clang -arch "$arch" -O1 -Wall -Wextra -Werror -fno-objc-arc tests/dynamic/native_bundle_id.m \
         -framework Foundation -o "$work/bundle_id.$arch"
     probe_framework "$arch"
+    # A library found only through the executable's LC_RPATH, by its leaf name.
+    mkdir -p "$work/leaf.$arch"
+    printf 'int ocerz_leaf(void) { return 7; }\n' > "$work/leaf.c"
+    clang -arch "$arch" -dynamiclib -install_name @rpath/libocerzleaf.dylib "$work/leaf.c" \
+        -o "$work/leaf.$arch/libocerzleaf.dylib"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_game_imports.c -framework CoreFoundation \
+        -framework IOKit -Wl,-rpath,"$work/leaf.$arch" -o "$work/game_imports.$arch"
 done
+# The complex-arithmetic line only proves anything if the builtins are calls.
+for builtin in ___divdc3 ___divsc3 ___muldc3 ___mulsc3 ___powidf2 ___powisf2; do
+    nm -u "$work/game_imports.x86_64" | grep -qx "$builtin"
+done
+# -no_pie is x86_64 only, so Rosetta is the oracle again.
+clang -arch x86_64 -mmacosx-version-min=10.9 -O1 -Wall -Wextra -Werror -fno-objc-arc tests/dynamic/native_nopie.m \
+    -framework Foundation -Wl,-no_pie -o "$work/nopie.x86_64" 2> "$work/nopie.link"
+if otool -hv "$work/nopie.x86_64" | grep -qw PIE; then exit 1; fi
+echo 'nopie table=3 message=h string=1 method=7' > "$work/nopie.expected"
 clang -arch x86_64 -O1 -Wall -Wextra -Werror tests/dynamic/native_ldt.c -o "$work/ldt.x86_64"
 # i386_set_ldt is x86_64 only, so Rosetta is the oracle: this is its line.
 echo 'ldt set=16 read=17 set=0xcffa000000ffff got=0xcffa000000ffff bad=-1 errno=EINVAL' > "$work/ldt.expected"
@@ -80,6 +96,7 @@ sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.er
 "$work/metal_events.arm64" > "$work/metal_events.expected"
 "$work/wine_imports.arm64" > "$work/wine_imports.expected"
 "$work/bundle_id.arm64" "$work/fw.arm64/OcerzProbe.framework/OcerzProbe" > "$work/bundle_id.expected"
+"$work/game_imports.arm64" > "$work/game_imports.expected"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -158,6 +175,15 @@ for engine in jit interpreter slow-bridge; do
         > "$work/bundle_id.$engine.out" 2> "$work/bundle_id.$engine.err"
     cmp "$work/bundle_id.expected" "$work/bundle_id.$engine.out"
     echo "PASS native bundle lookup by identifier for a dlopened framework $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/game_imports.x86_64" > "$work/game_imports.$engine.out" 2> "$work/game_imports.$engine.err"
+    cmp "$work/game_imports.expected" "$work/game_imports.$engine.out"
+    echo "PASS native complex division, CFUUID stack bytes, refused plug-ins, cleanup handlers, dlsym through dependencies and rpath leaf names $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/nopie.x86_64" > "$work/nopie.$engine.out" 2> "$work/nopie.$engine.err"
+    cmp "$work/nopie.expected" "$work/nopie.$engine.out"
+    grep -q 'non-PIE .* pointers rebased by scan' "$work/nopie.$engine.err"
+    echo "PASS native non-PIE executable slid into the arena and rebased by scan $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/low_wine.x86_64" > "$work/low_wine.$engine.out" 2> "$work/low_wine.$engine.err"
     cmp tests/dynamic/native_low_wine.out "$work/low_wine.$engine.out"

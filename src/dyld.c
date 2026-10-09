@@ -691,6 +691,7 @@ typedef struct DynImage {
     uint64_t seg_vmaddr[DYN_SEG_MAX];
     int seg_count;
     int is_pie;
+    uint64_t scan_lo, scan_hi;   /* unslid range of a slid non-PIE executable (scan_rebase) */
     int links_dylib;
     int links_cf;
     int is_virtual;
@@ -715,9 +716,17 @@ uint64_t ocerz_main_mh;
 
 static OcerzCache *g_run_cache;
 
+static uint64_t virt_flat_resolve_ex(const char *name, const char *want, int *found, const char **hit);
+
 uint64_t ocerz_dyld_resolve_guest_sym(const char *name)
 {
-    if (!g_run_cache || !name) return 0;
+    if (!name) return 0;
+    if (ocerz_mode == OCERZ_MODE_NATIVE) {   /* the virtual library's stub */
+        int found = 0;
+        const char *hit = NULL;
+        return virt_flat_resolve_ex(name, NULL, &found, &hit);
+    }
+    if (!g_run_cache) return 0;
     return ocerz_cache_resolve(g_run_cache, name);
 }
 static struct OcerzVM *g_run_vm;
@@ -889,7 +898,7 @@ static int map_segments(DynImage *img, int is_main)
     if (!have_text)
         return OCERZ_EFORMAT;
 
-    uint64_t vmlo = ~0ull, vmhi = 0;
+    uint64_t vmlo = ~0ull, vmhi = 0, pagezero = 0;
     lc = mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < ncmds; i++) {
         uint32_t cmd = rd32(lc);
@@ -897,7 +906,9 @@ static int map_segments(DynImage *img, int is_main)
             uint64_t vmaddr = rd64(lc + 24);
             uint64_t vmsize = rd64(lc + 32);
             uint32_t initprot = rd32(lc + 56);
-            if (!(vmaddr == 0 && initprot == 0)) {
+            if (vmaddr == 0 && initprot == 0)
+                pagezero = vmsize;
+            else {
                 if (vmaddr < vmlo)
                     vmlo = vmaddr;
                 if (vmaddr + vmsize > vmhi)
@@ -909,7 +920,22 @@ static int map_segments(DynImage *img, int is_main)
     if (vmhi <= vmlo)
         return OCERZ_EFORMAT;
 
-    if (is_main && !img->is_pie) {
+    /* A non-PIE executable below the low limit would need the low shadow, and
+       native mode shares the address space with a host whose heap and
+       shared-cache pointers it hands the guest directly: an ordinary one,
+       Objective-C classes and all, crashed there.  So it is slid into the
+       arena like a PIE, and scan_rebase fixes the absolute pointers such an
+       image carries no rebase information for.  Wine's loader keeps the low
+       shadow: it gives itself a page zero smaller than the default 4 GB to
+       reserve the low addresses Windows programs expect, and that layout is
+       what the shadow exists for.  OCERZ_NOPIE_LOW=1 keeps any other where it
+       asked to be too. */
+    if (is_main && !img->is_pie && ocerz_mode == OCERZ_MODE_NATIVE && vmlo < OCERZ_LOW_LIMIT &&
+        pagezero >= (1ull << 32) && !ocerz_wine_process && !getenv("OCERZ_NOPIE_LOW")) {
+        img->scan_lo = vmlo;
+        img->scan_hi = vmhi;
+    }
+    if (is_main && !img->is_pie && !img->scan_hi) {
         img->load_base = text_vmaddr;
         img->slide = 0;
         lc = mh + sizeof(struct mach_header_64);
@@ -1365,6 +1391,19 @@ static uint64_t disk_flat_resolve_ex(const char *name, int *found)
     return 0;
 }
 
+/* An image from the guest root (runtime/guest: the x86 libc++, libc++abi,
+   libunwind and libstdc++ that stand in for the system's).  The real ones live
+   in the shared cache, whose weak references dyld answers from the cache and
+   the main executable's overrides only, never from another dylib: Unity 2019's
+   UnityPlayer exports its own operator new, and libc++ bound to it allocated
+   strings that a game's libsteam_api then freed with free(). */
+static int dimg_is_guest_system(const DynImage *d)
+{
+    const char *root = getenv("OCERZ_GUEST_ROOT");
+    size_t n = root ? strlen(root) : 0;
+    return d && (n ? strncmp(d->path, root, n) == 0 && d->path[n] == '/' : strstr(d->path, "/runtime/guest/") != NULL);
+}
+
 static uint64_t disk_flat_resolve(const char *name)
 {
     int f = 0;
@@ -1477,6 +1516,103 @@ static void native_guest_runtime_for(OcerzCache *cache, DynImage *img, const Dyn
         OCERZ_LOG("dynamic: %s wanted %s for %s and it did not load\n", img->path, want, name);
 }
 
+/*
+ * OCERZ_STUB_MISSING=1 binds an import that no virtual library exports to a
+ * placeholder instead of refusing the load, which in native mode fails the
+ * whole image, or a dlopen of a game's own bundle, on the first one.  A game
+ * usually reaches few of the symbols it imports.  A class becomes an empty
+ * Objective-C class that answers every message with nil, a constant (k... or
+ * NS...Name, ...Key, ...Notification) a CFString of its own name, anything
+ * else a function returning 0, or -1 for OpenCL's status-returning calls.
+ * Each is logged once, at bind time.  Names decide the kind, and a function
+ * that returns 0 can hide that it ran, so a stub the log shows a game calling
+ * wants a real bridge.
+ */
+static int stub_missing_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("OCERZ_STUB_MISSING") ? 1 : 0;
+    return on;
+}
+
+static void *missing_nil_imp(void *self, void *sel)
+{
+    (void)self; (void)sel;
+    return NULL;
+}
+
+static signed char missing_resolve_instance(void *cls, void *sel, void *want)
+{
+    (void)sel;
+    ((int (*)(void *, void *, void *, const char *))dlsym(RTLD_DEFAULT, "class_addMethod"))(cls, want, (void *)missing_nil_imp, "@@:");
+    return 1;
+}
+
+static signed char missing_resolve_class(void *cls, void *sel, void *want)
+{
+    (void)sel;
+    void *meta = ((void *(*)(void *))dlsym(RTLD_DEFAULT, "object_getClass"))(cls);
+    ((int (*)(void *, void *, void *, const char *))dlsym(RTLD_DEFAULT, "class_addMethod"))(meta, want, (void *)missing_nil_imp, "@@:");
+    return 1;
+}
+
+static uint64_t missing_null_class(const char *cname, int meta)
+{
+    void *(*get)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    void *(*meta_of)(void *) = dlsym(RTLD_DEFAULT, "object_getClass");
+    char n[300];
+    snprintf(n, sizeof n, "OcerzMissing_%s", cname);
+    void *cls = get(n);
+    if (!cls) {
+        void *(*alloc)(void *, const char *, size_t) = dlsym(RTLD_DEFAULT, "objc_allocateClassPair");
+        void (*reg)(void *) = dlsym(RTLD_DEFAULT, "objc_registerClassPair");
+        void *(*sel)(const char *) = dlsym(RTLD_DEFAULT, "sel_registerName");
+        int (*add)(void *, void *, void *, const char *) = dlsym(RTLD_DEFAULT, "class_addMethod");
+        cls = alloc(get("NSObject"), n, 0);
+        void *m = meta_of(cls);
+        add(m, sel("resolveInstanceMethod:"), (void *)missing_resolve_instance, "c@::");
+        add(m, sel("resolveClassMethod:"), (void *)missing_resolve_class, "c@::");
+        reg(cls);
+    }
+    return (uint64_t)(uintptr_t)(meta ? meta_of(cls) : cls);
+}
+
+static uint64_t native_missing_stub(const char *name, const char *lib)
+{
+    static uint64_t ret0;
+    uint64_t v;
+    const char *kind;
+    if (!strncmp(name, "_OBJC_CLASS_$_", 14) || !strncmp(name, "_OBJC_METACLASS_$_", 18)) {
+        int meta = name[6] == 'M';
+        v = missing_null_class(name + (meta ? 18 : 14), meta);
+        kind = "class";
+    } else if ((name[1] == 'k' && name[2] >= 'A' && name[2] <= 'Z') ||
+               (!strncmp(name, "_NS", 3) && (strstr(name, "Name") || strstr(name, "Key") || strstr(name, "Notification")))) {
+        const void *(*cfstr)(const void *, const char *, uint32_t) = dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+        const void **slot = malloc(sizeof *slot);
+        *slot = cfstr(NULL, name + 1, 0x08000100);
+        v = (uint64_t)(uintptr_t)slot;
+        kind = "constant";
+    } else {
+        /* Two shared stubs: `xor eax, eax; ret`, and `mov eax, -1; ret` for OpenCL's cl_int-returning calls (-1 is
+         * CL_DEVICE_NOT_FOUND: no platform, so a game skips its compute path; 0 would say "succeeded" and leave every
+         * output uninitialized). The handle-returning clCreate* keep 0, a NULL handle. */
+        static uint64_t retm1;
+        int cl_status = !strncmp(name, "_cl", 3) && name[3] >= 'A' && name[3] <= 'Z' && strncmp(name, "_clCreate", 9) != 0;
+        if (!ret0 && (ret0 = ocerz_map_anywhere(0x1000, PROT_READ | PROT_WRITE))) {
+            uint8_t *p = (uint8_t *)ocerz_g2h(ret0);
+            p[0] = 0x31; p[1] = 0xC0; p[2] = 0xC3;   /* xor eax, eax; ret */
+            p[16] = 0xB8; p[17] = p[18] = p[19] = p[20] = 0xFF; p[21] = 0xC3;   /* mov eax, -1; ret */
+            retm1 = ret0 + 16;
+        }
+        v = cl_status ? retm1 : ret0;
+        kind = "function";
+    }
+    fprintf(stderr, "ocerz: native: stubbed %s %s (missing in %s)\n", kind, name, lib ? lib : "(flat)");
+    return v;
+}
+
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
                                int libord, int weak)
 {
@@ -1511,6 +1647,11 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
     static int weak_all_cache = -1;
     if (weak_all_cache < 0)
         weak_all_cache = getenv("OCERZ_WEAK_ALL_CACHE") ? 1 : 0;
+    /* A main-executable ordinal means the main executable first, as dyld does:
+       a bundle's import of Sleep is its launcher's (Feral's), not the legacy
+       CoreServices Sleep the flat search below would find. */
+    if (!found && libord == -1)
+        value = main_image_resolve_ex(name, &found);
     if (!found && libord == -3)
         value = ocerz_cache_resolve_weak_ex(cache, name, &found,
                                             weak_all_cache ? NULL : ocerz_dyldapi_cache_image_loaded);
@@ -1525,6 +1666,12 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
             OCERZ_LOG("dynamic: %s in %s bound in %s instead\n", name, tgt ? tgt : "(flat)",
                       hit ? hit : "?");
     }
+    if (!found && libord == -3 && ocerz_mode == OCERZ_MODE_NATIVE && dimg_is_guest_system(img)) {
+        value = main_image_resolve_ex(name, &found);
+        for (int i = 0; !found && i < g_dimgs_n; i++)
+            if (dimg_is_guest_system(&g_dimgs[i]))
+                value = ocerz_image_self_resolve_ex(&g_dimgs[i], name, &found);
+    }
     if (!found && !virtual_dep)
         value = disk_flat_resolve_ex(name, &found);
     if (!found && (libord == -1 || libord == -2 || libord == -3))
@@ -1535,6 +1682,15 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
         if (found)
             OCERZ_LOG("dynamic: %s in %s bound in %s instead\n", name, tgt ? tgt : "(flat)",
                       hit ? hit : "?");
+    }
+    /* A weak import is stubbed too, except a weak class, which stays NULL as
+       it would on a macOS without it: the game tests [NSTouchBar class] and
+       skips the feature, where a placeholder would send it into it. */
+    if (!found && weak && !strncmp(name, "_OBJC_", 6) && ocerz_mode == OCERZ_MODE_NATIVE && stub_missing_enabled())
+        fprintf(stderr, "ocerz: native: weak class %s left NULL (missing in %s)\n", name, tgt ? tgt : "(flat)");
+    else if (!found && ocerz_mode == OCERZ_MODE_NATIVE && stub_missing_enabled()) {
+        value = native_missing_stub(name, libord == -1 ? "(main executable)" : tgt);
+        found = 1;
     }
     if (!found && !weak) {
         if (ocerz_mode == OCERZ_MODE_NATIVE) {
@@ -1770,8 +1926,71 @@ static uint64_t classic_resolve(DynImage *img, OcerzCache *cache, const char *na
     return v;
 }
 
+/*
+ * Rebases a slid non-PIE executable (see map_segments).  x86_64 Darwin code
+ * is always position-independent, and -no_pie only drops the rebase
+ * information, so its absolute pointers are in the file-backed sections of its
+ * __DATA segments: Objective-C metadata, CFStrings, initializers, vtables, lazy
+ * pointers.  An aligned word there that points into one of the image's
+ * sections is taken to be one.  Requiring a section rejects the pairs of
+ * 32-bit fields whose second is 1 (a method list's entsize and a count of 1
+ * read as the image base plus 24), which land in the header: 183 such words in
+ * Aragami, against 50,800 pointers.  Pointers into the middle of strings
+ * ("kPrimitive" + 10) and of functions are real, so nothing finer is asked.  A
+ * non-pointer whose halves are 1 and an offset inside a section would be slid
+ * too; none has been seen.
+ */
+static void scan_rebase(DynImage *img)
+{
+    const uint8_t *mh = img->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    struct { uint64_t lo, hi; } sects[256];
+    int nsect = 0;
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++, lc += rd32(lc + 4)) {
+        if (rd32(lc) != LC_SEGMENT_64)
+            continue;
+        const uint8_t *sect = lc + 72;
+        for (uint32_t k = 0; k < rd32(lc + 64) && nsect < 256; k++, sect += 80, nsect++) {
+            sects[nsect].lo = rd64(sect + 32);
+            sects[nsect].hi = sects[nsect].lo + rd64(sect + 40);
+        }
+    }
+    unsigned long n = 0, skipped = 0;
+    lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++, lc += rd32(lc + 4)) {
+        if (rd32(lc) != LC_SEGMENT_64 || strncmp((const char *)lc + 8, "__DATA", 6) != 0)
+            continue;
+        const uint8_t *sect = lc + 72;
+        for (uint32_t k = 0; k < rd32(lc + 64); k++, sect += 80) {
+            uint32_t type = rd32(sect + 64) & 0xff;
+            if (type == 0x1 || type == 0xc || type == 0x12)   /* zerofill: nothing from the file */
+                continue;
+            uint64_t a = (rd64(sect + 32) + 7) & ~7ull, e = rd64(sect + 32) + rd64(sect + 40);
+            for (; a + 8 <= e; a += 8) {
+                uint64_t v = ocerz_ld(a + img->slide, 8);
+                if (v < img->scan_lo || v >= img->scan_hi)
+                    continue;
+                int in = 0;
+                for (int j = 0; j < nsect && !in; j++)
+                    in = v >= sects[j].lo && v < sects[j].hi;
+                if (!in) {
+                    skipped++;
+                    continue;
+                }
+                ocerz_st(a + img->slide, 8, v + img->slide);
+                n++;
+            }
+        }
+    }
+    OCERZ_LOG("non-PIE %s slid by %#llx: %lu pointers rebased by scan, %lu look-alikes left\n", img->path,
+              (unsigned long long)img->slide, n, skipped);
+}
+
 static void classic_rebase(DynImage *img)
 {
+    if (img->scan_hi)
+        scan_rebase(img);
     if (img->rebase_size == 0)
         return;
     const uint8_t *p = img->slice + img->rebase_off;
@@ -1834,6 +2053,45 @@ static void classic_rebase(DynImage *img)
     }
 }
 
+/*
+ * A lazy flat-namespace bind is resolved on first call under dyld,
+ * so after every image the program links has loaded.  ocerz binds eagerly as
+ * each image loads, and LÖVE's love.framework imports Lua's API flat while the
+ * executable loads Lua.framework after it.  While the main executable's
+ * dependencies load, such binds wait here and are resolved once all are in.
+ */
+typedef struct { DynImage *img; uint64_t addr; const char *name; int64_t addend; } FlatPending;
+static FlatPending *g_flat_pending;
+static size_t g_flat_pending_n, g_flat_pending_cap;
+static int g_flat_defer;
+
+static int flat_defer(DynImage *img, uint64_t addr, const char *name, int64_t addend)
+{
+    if (g_flat_pending_n == g_flat_pending_cap) {
+        size_t cap = g_flat_pending_cap ? g_flat_pending_cap * 2 : 256;
+        FlatPending *p = realloc(g_flat_pending, cap * sizeof *p);
+        if (!p)
+            return 0;
+        g_flat_pending = p;
+        g_flat_pending_cap = cap;
+    }
+    g_flat_pending[g_flat_pending_n++] = (FlatPending){ img, addr, name, addend };
+    return 1;
+}
+
+static void flat_flush(OcerzCache *cache)
+{
+    g_flat_defer = 0;
+    for (size_t i = 0; i < g_flat_pending_n; i++) {
+        FlatPending *f = &g_flat_pending[i];
+        uint64_t v = resolve_import(cache, f->img, f->name, BIND_SPECIAL_DYLIB_FLAT_LOOKUP, 0);
+        ocerz_st(f->addr, 8, v ? v + (uint64_t)f->addend : 0);
+    }
+    free(g_flat_pending);
+    g_flat_pending = NULL;
+    g_flat_pending_n = g_flat_pending_cap = 0;
+}
+
 static void classic_bind_stream(DynImage *img, OcerzCache *cache,
                                 const uint8_t *p, const uint8_t *end, int is_lazy)
 {
@@ -1887,6 +2145,11 @@ static void classic_bind_stream(DynImage *img, OcerzCache *cache,
             addr += self_uleb(&p, end);
             break;
         case 0x90: {
+            if (is_lazy && g_flat_defer && libord == BIND_SPECIAL_DYLIB_FLAT_LOOKUP &&
+                flat_defer(img, addr, name, addend)) {
+                addr += 8;
+                break;
+            }
             uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
             ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
             addr += 8;
@@ -3676,6 +3939,67 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     return d;
 }
 
+/*
+ * A system framework path with no file behind it, such as
+ * OpenGL.framework/Libraries/libGL.dylib (SDL's GL load) or
+ * CoreFoundation.framework/CoreFoundation (Cuphead's Rewired), is matched
+ * against the API databases' install names with any ".framework/Versions/<x>/"
+ * segment taken out of both, so it does not depend on the symlinks that make
+ * those names the Versions/A library being there to follow.
+ */
+static void strip_framework_versions(const char *in, char *out, size_t n)
+{
+    size_t o = 0;
+    while (*in && o + 1 < n) {
+        const char *v = strstr(in, ".framework/Versions/");
+        if (!v) {
+            o += (size_t)snprintf(out + o, n - o, "%s", in);
+            break;
+        }
+        size_t keep = (size_t)(v - in) + sizeof ".framework/" - 1;
+        o += (size_t)snprintf(out + o, n - o, "%.*s", (int)keep, in);
+        const char *seg = v + sizeof ".framework/Versions/" - 1;
+        const char *after = strchr(seg, '/');
+        in = after ? after + 1 : seg + strlen(seg);
+    }
+    out[o < n ? o : n - 1] = 0;
+}
+
+static int canon_framework_textual(const char *path, char *out, size_t outsz)
+{
+    if (!strstr(path, ".framework/") || access(path, F_OK) == 0 || ocerz_vdylib_have(path))
+        return 0;
+    char want[PATH_MAX], have[PATH_MAX];
+    strip_framework_versions(path, want, sizeof want);
+    /* macOS keeps the sub-frameworks it moved out of an umbrella as symlinks
+       to the top-level ones (ApplicationServices.framework/Frameworks/
+       CoreText.framework -> ../../../../CoreText.framework), so a
+       "<dir>/<Umbrella>.framework/Frameworks/<Sub>.framework/<Sub>" with no
+       install name of its own is "<dir>/<Sub>.framework/<Sub>" (Cuphead's
+       Rewired imports CoreText by the old path). */
+    char top[PATH_MAX] = "";
+    const char *nest = NULL;
+    for (const char *p = strstr(want, ".framework/Frameworks/"); p; p = strstr(p + 1, ".framework/Frameworks/"))
+        nest = p;
+    if (nest) {
+        const char *umbrella = nest;
+        while (umbrella > want && umbrella[-1] != '/')
+            umbrella--;
+        snprintf(top, sizeof top, "%.*s%s", (int)(umbrella - want), want, nest + sizeof ".framework/Frameworks/" - 1);
+    }
+    const char *moved = NULL;
+    int n = 0;
+    const char **names = ocerz_apidb_install_names(&n);
+    for (int i = 0; i < n; i++) {
+        strip_framework_versions(names[i], have, sizeof have);
+        if (strcmp(have, want) == 0)
+            return snprintf(out, outsz, "%s", names[i]) < (int)outsz;
+        if (!moved && top[0] && strcmp(have, top) == 0)
+            moved = names[i];
+    }
+    return moved && snprintf(out, outsz, "%s", moved) < (int)outsz;
+}
+
 int ocerz_canon_dylib_path(const char *path, char *out, size_t outsz)
 {
     char cur[PATH_MAX];
@@ -3699,6 +4023,8 @@ int ocerz_canon_dylib_path(const char *path, char *out, size_t outsz)
         }
         memcpy(cur, next, sizeof cur);
     }
+    if (canon_framework_textual(cur, out, outsz))
+        return 1;
     const char *slash = strrchr(cur, '/');
     if (slash) {
         char dir[PATH_MAX], rdir[PATH_MAX];
@@ -4543,7 +4869,23 @@ static void ndl_handle_text(uint64_t handle, char *out, size_t n)
         snprintf(out, n, "%#llx", (unsigned long long)handle);
 }
 
+static uint64_t native_dlsym_inner(uint64_t handle, const char *name, uint64_t caller);
+
+/* OCERZ_DLOPENLOG also names each dlsym and its answer: what a game looks up
+   at run time. */
 uint64_t ocerz_dyld_native_dlsym(uint64_t handle, const char *name, uint64_t caller)
+{
+    uint64_t v = native_dlsym_inner(handle, name, caller);
+    static int log = -1;
+    if (log < 0)
+        log = getenv("OCERZ_DLOPENLOG") != NULL;
+    if (log)
+        fprintf(stderr, "ocerz: DLSYM %#llx \"%s\" -> %#llx\n", (unsigned long long)handle, name ? name : "(null)",
+                (unsigned long long)v);
+    return v;
+}
+
+static uint64_t native_dlsym_inner(uint64_t handle, const char *name, uint64_t caller)
 {
     char htext[32];
     char usym[1024];
@@ -4558,6 +4900,15 @@ uint64_t ocerz_dyld_native_dlsym(uint64_t handle, const char *name, uint64_t cal
     }
     if (handle == NDL_DEFAULT) {
         v = ndl_search_from(0, UINT32_MAX, usym, &found);
+        /* RTLD_DEFAULT reaches frameworks the program never linked, because
+           AppKit and the rest loaded them already (Unity 2018 finds
+           MTLCopyAllDevices so).  Such a library's virtual image is loaded on
+           demand, as for an import no linked library exports. */
+        if (!found && ocerz_mode == OCERZ_MODE_NATIVE && g_run_cache && g_main_dimg_valid) {
+            pthread_mutex_lock(&g_load_lock);
+            v = virt_ondemand_resolve_ex(g_run_cache, &g_main_dimg, usym, &found, NULL);
+            pthread_mutex_unlock(&g_load_lock);
+        }
     } else if (handle == NDL_MAIN_ONLY) {
         if (g_main_dimg_valid)
             v = ndl_lookup_in(&g_main_dimg, usym, &found);
@@ -4576,6 +4927,20 @@ uint64_t ocerz_dyld_native_dlsym(uint64_t handle, const char *name, uint64_t cal
             return 0;
         }
         v = (handle & 1) ? ndl_lookup_in(d, usym, &found) : ndl_search_deps(d, usym, &found);
+        /* A virtual system library records no dependents, yet a real one's
+           handle also reaches the libraries it depends on (dlsym(3)), all of
+           them system libraries, so those are searched, loaded or not (Rewired
+           asks CoreText for CoreFoundation's CFStringGetTypeID). */
+        if (!found && !(handle & 1) && ocerz_mode == OCERZ_MODE_NATIVE && ocerz_apidb_library(d->install_name)) {
+            for (int i = 0, pub = ndl_pub(); i < pub && !found; i++)
+                if (&g_dimgs[i] != d && ocerz_apidb_library(g_dimgs[i].install_name))
+                    v = ndl_lookup_in(&g_dimgs[i], usym, &found);
+            if (!found && g_run_cache && g_main_dimg_valid) {
+                pthread_mutex_lock(&g_load_lock);
+                v = virt_ondemand_resolve_ex(g_run_cache, &g_main_dimg, usym, &found, NULL);
+                pthread_mutex_unlock(&g_load_lock);
+            }
+        }
     }
     if (!found) {
         ndl_err("dlsym(%s, %s): symbol not found", htext, name);
@@ -4951,7 +5316,19 @@ static int ndl_resolve(const char *p, DynImage *caller, NdlTarget *t)
     }
     if (strchr(p, '/'))
         return ndl_try(p, t);
-    if (ndl_try_dirs(getenv("DYLD_LIBRARY_PATH"), p, t) || ndl_try(p, t))
+    if (ndl_try_dirs(getenv("DYLD_LIBRARY_PATH"), p, t))
+        return 1;
+    /* dyld also tries a leaf name in the LC_RPATHs of the caller and the main
+       executable before the working directory (dlopen(3)); MonoKickstart games
+       find their native libraries that way (Celeste's
+       @executable_path/osx/libSDL2-2.0.0.dylib). */
+    RpathList *rp = ndl_rpaths(caller);
+    int ok = 0;
+    for (int i = 0; rp && i < rp->n && !ok; i++)
+        if (snprintf(cand, sizeof cand, "%s/%s", rp->entry[i], p) < (int)sizeof cand)
+            ok = ndl_try(cand, t);
+    free(rp);
+    if (ok || ndl_try(p, t))
         return 1;
     const char *fb = getenv("DYLD_FALLBACK_LIBRARY_PATH");
     return ndl_try_dirs(fb && fb[0] ? fb : "/usr/local/lib:/usr/lib", p, t);
@@ -5540,7 +5917,9 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
 
     RpathList main_rpaths;
     collect_rpaths(&img, NULL, &main_rpaths);
+    g_flat_defer = ocerz_mode == OCERZ_MODE_NATIVE;
     load_disk_deps(&cache, &img, &main_rpaths);
+    flat_flush(&cache);
 
     r = apply_fixups(&img, &cache);
     if (r != OCERZ_OK) {

@@ -1661,8 +1661,6 @@ static void *sb_thread_main(void *p)
     return result;
 }
 
-#define SB_HOST_STACK_MIN (512u * 1024u)
-
 int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t out = sb_arg(cpu, 0), attr = sb_arg(cpu, 1), routine = sb_arg(cpu, 2), arg = sb_arg(cpu, 3);
@@ -1674,21 +1672,33 @@ int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu)
     }
     start->entry = (void *(*)(void *))entry;
     start->arg = sb_ptr(arg);
+    /*
+     * The thread runs ocerz's translator and the guest on one stack, and
+     * translation alone can outgrow a small guest-sized one (a Unity worker
+     * overflowed its guard page mid-translation).  Unless the guest brought
+     * its own stack memory, the host thread gets at least SB_MIN_STACK, which
+     * costs address space only.
+     */
+    enum { SB_MIN_STACK = 4 << 20 };
+    pthread_attr_t a;
+    const pthread_attr_t *given = (const pthread_attr_t *)sb_ptr(attr);
+    void *own_stack = NULL;
+    size_t size = 0;
+    if (given)
+        memcpy(&a, given, sizeof a);
+    else
+        pthread_attr_init(&a);
+    pthread_attr_getstackaddr(&a, &own_stack);
+    pthread_attr_getstacksize(&a, &size);
+    if (!own_stack && size < SB_MIN_STACK)
+        pthread_attr_setstacksize(&a, SB_MIN_STACK);
     struct OcerzBridgeFrame outer;
     ocerz_bridge_raise(&outer, SB_LIB, "_pthread_create", "i(ppc{p(p)}p)", (const void *)pthread_create);
-    const pthread_attr_t *use = (const pthread_attr_t *)sb_ptr(attr);
-    pthread_attr_t own;
-    size_t want = 0;
-    void *at = NULL;
-    if (use && pthread_attr_getstacksize(use, &want) == 0 && want < SB_HOST_STACK_MIN &&
-        pthread_attr_getstackaddr(use, &at) == 0 && !at) {
-        own = *use;
-        pthread_attr_setstacksize(&own, SB_HOST_STACK_MIN);
-        use = &own;
-    }
     pthread_t made = NULL;
-    int rc = pthread_create(&made, use, sb_thread_main, start);
+    int rc = pthread_create(&made, &a, sb_thread_main, start);
     ocerz_bridge_lower(&outer);
+    if (!given)
+        pthread_attr_destroy(&a);
     if (rc)
         free(start);
     else if (out)
@@ -1699,6 +1709,22 @@ int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu)
 int ocerz_sys_pthread_exit(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     void *value = sb_ptr(sb_arg(cpu, 0));
+    /* The guest's pthread_cleanup_push is a macro that links its handler onto
+       pthread_self()->__cleanup_stack, and pthread_self is the host's, so the
+       host's pthread_exit would call those x86 routines as arm64 code (Mono's
+       Boehm GC_thread_exit_proc when a Unity game quits).  They run as guest
+       code first, innermost first, as Darwin runs them before the key
+       destructors. */
+    struct __darwin_pthread_handler_rec **stack = &pthread_self()->__cleanup_stack;
+    while (*stack && !vm->exited) {
+        uint64_t rec = (uint64_t)(uintptr_t)*stack;
+        uint64_t routine = ocerz_ld(rec, 8), arg = ocerz_ld(rec + 8, 8);
+        if (!ocerz_abi_is_guest_code(routine))
+            break;
+        *stack = (struct __darwin_pthread_handler_rec *)(uintptr_t)ocerz_ld(rec + 16, 8);
+        uint64_t args[1] = { arg };
+        ocerz_vm_call(vm, routine, args, 1, (cpu->gpr[OCERZ_RSP] - 256) & ~0xfull);
+    }
     sb_key_destructors(vm, cpu);
     pthread_exit(value);
 }
