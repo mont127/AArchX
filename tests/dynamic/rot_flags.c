@@ -1,12 +1,13 @@
 /*
  * The flags around ROL and ROR by an immediate count, which src/flags_live.c
- * models as writing CF, and OF only for a count of 1, and passing the other
- * flags through, so the instruction before a rotate keeps its ZF, SF, PF and
- * AF.  Each case is an add or sub that sets known flags, rotates by 0, 1 and
- * larger counts in both directions and sizes, then reads the flags with pushf,
- * a jcc and a setcc, the three ways translated code consumes them.  Also SHA-256's
- * shape, a chain of rotates and xors after an add, whose flags nothing reads.
- * Against Rosetta.
+ * models as writing CF and OF (OF with the count-1 formula for every count, as
+ * x86 hardware does) and passing the other flags through, so the instruction
+ * before a rotate keeps its ZF, SF, PF and AF.  Each case is an add, sub or xor
+ * that sets known flags, rotates by 0, 1 and larger counts in both directions
+ * and in 8, 16, 32 and 64 bits (rol ax, 8 is a byte swap), then reads the flags
+ * with pushf, a jcc and a setcc, the three ways translated code consumes them.
+ * Also SHA-256's shape, a chain of rotates and xors after an add, whose flags
+ * nothing reads.  Against Rosetta.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -45,6 +46,11 @@ ROT_CASE(c_ror64_sub64, "sub %5, %%rax", "ror $64, %%rax")
 ROT_CASE(c_rol8_add8, "add %b5, %%al", "rol $8, %%al")
 ROT_CASE(c_ror3_add16, "add %w5, %%ax", "ror $3, %%ax")
 ROT_CASE(c_two_rots, "add %k5, %%eax", "ror $14, %%eax\n\tror $1, %%eax")
+ROT_CASE(c_rol8_add16, "add %w5, %%ax", "rol $8, %%ax")
+ROT_CASE(c_ror1_sub16, "sub %w5, %%ax", "ror $1, %%ax")
+ROT_CASE(c_rol16_add16, "add %w5, %%ax", "rol $16, %%ax")
+ROT_CASE(c_ror17_add16, "add %w5, %%ax", "ror $17, %%ax")
+ROT_CASE(c_rol5_xor16, "xor %w5, %%ax", "rol $5, %%ax")
 
 typedef void (*case_fn)(uint64_t, uint64_t, uint64_t *);
 
@@ -68,6 +74,8 @@ int main(void)
         {"rol17_sub64", c_rol17_sub64}, {"ror0_add32", c_ror0_add32}, {"ror32_add32", c_ror32_add32},
         {"ror64_sub64", c_ror64_sub64}, {"rol8_add8", c_rol8_add8}, {"ror3_add16", c_ror3_add16},
         {"two_rots", c_two_rots},
+        {"rol8_add16", c_rol8_add16}, {"ror1_sub16", c_ror1_sub16}, {"rol16_add16", c_rol16_add16},
+        {"ror17_add16", c_ror17_add16}, {"rol5_xor16", c_rol5_xor16},
     };
     static const uint64_t in[][2] = {
         {0, 0}, {1, 0xffffffff}, {0x7fffffff, 1}, {0x80000000, 0x80000000}, {0x0f, 0x01},

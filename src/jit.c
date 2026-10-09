@@ -680,6 +680,7 @@
 #include "ocerz/x87.h"
 
 #include <sys/mman.h>
+#include <mach/mach_time.h>
 #include <mach/thread_act.h>
 #include <pthread.h>
 #include <sched.h>
@@ -6883,16 +6884,26 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
     if (rsp_is_ptr() && d->reg == OCERZ_RSP) return 0;
     if (s->kind == OCERZ_OPK_REG) { if (s->high8 || s->size != d->size) return 0; }
+    else if (s->kind == OCERZ_OPK_MEM) { if (s->size != d->size || insn->seg != OCERZ_SEG_NONE) return 0; }
     else if (s->kind != OCERZ_OPK_IMM) return 0;
     int sf = d->size == 8;
     int is_sbb = insn->op == OCERZ_OP_SBB;
+    /* A memory source is loaded first, so a fault leaves nothing done, and kept in
+       jit_scratch across the CF computation, which may call out. */
+    int s_mem = s->kind == OCERZ_OPK_MEM;
+    if (s_mem) {
+        if (!emit_mem_load_plain(b, insn, s, d->size, JT1)) return 0;
+        a64_str(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
+    }
     if (!need && pin_slot(d->reg) >= 0 &&
-        (s->kind == OCERZ_OPK_IMM || (pin_slot(s->reg) >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)))) {
+        (s->kind == OCERZ_OPK_IMM || s_mem || (pin_slot(s->reg) >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)))) {
         int rd = pin_hreg(pin_slot(d->reg));
         emit_cc_predicate_ex(b, OCERZ_CC_B, 1);
         a64_cset(b, JTT, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
-        if (s->kind == OCERZ_OPK_REG) {
-            int rs = pin_hreg(pin_slot(s->reg));
+        if (s->kind == OCERZ_OPK_REG || s_mem) {
+            int rs = JT1;
+            if (s_mem) a64_ldr(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
+            else rs = pin_hreg(pin_slot(s->reg));
             if (is_sbb) a64_sub_reg(b, sf, rd, rd, rs, 0); else a64_add_reg(b, sf, rd, rd, rs, 0);
         } else {
             uint64_t v = sf ? (uint64_t)ocerz_sext(s->imm, s->size) : ((uint64_t)ocerz_sext(s->imm, s->size) & 0xffffffffull);
@@ -6906,6 +6917,7 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
     a64_cset(b, JTT, A64_NE);
     emit_gpr_rd(b, sf, JT0, d->reg);
     if (s->kind == OCERZ_OPK_REG) emit_gpr_rd(b, sf, JT1, s->reg);
+    else if (s_mem) a64_ldr(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
     else a64_mov_imm64(b, JT1, sf ? (uint64_t)ocerz_sext(s->imm, s->size) : ((uint64_t)ocerz_sext(s->imm, s->size) & 0xffffffffull));
     if (is_sbb) { a64_sub_reg(b, sf, JT2, JT0, JT1, 0); a64_sub_reg(b, sf, JT2, JT2, JTT, 0); }
     else        { a64_add_reg(b, sf, JT2, JT0, JT1, 0); a64_add_reg(b, sf, JT2, JT2, JTT, 0); }
@@ -7267,14 +7279,16 @@ static int emit_shift_count(A64Buf *b, const X86Insn *insn, int sf, int dst,
 static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
-    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8))
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 2 && d->size != 4 && d->size != 8))
         return 0;
     if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
     if (insn->mode32 && insn->ops[1].kind != OCERZ_OPK_IMM)
         return 0;
+    if (d->size == 2 && insn->ops[1].kind != OCERZ_OPK_IMM)
+        return 0;
     int sf = d->size == 8;
-    int bits = sf ? 64 : 32;
+    int bits = d->size * 8;
     int is_rol = insn->op == OCERZ_OP_ROL;
     unsigned cnt;
     if (!emit_shift_count(b, insn, sf, JT1, &cnt))
@@ -7286,6 +7300,22 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
         return 0;
     int ds = pin_slot(d->reg);
     int rd = ds >= 0 ? pin_hreg(ds) : JT2;
+    if (bits == 16) {
+        /* rol ax, 8 is how compilers swap a 16-bit value's bytes.  The low half
+           is doubled into 32 bits, shifted right, and its low 16 bits put back,
+           leaving the register above them alone as x86 does. */
+        unsigned r = is_rol ? (16u - cnt % 16u) % 16u : cnt % 16u;
+        if (ds < 0)
+            emit_gpr_rd(b, 1, JT2, d->reg);
+        a64_uxth(b, JTU, rd);
+        a64_orr_reg(b, 0, JTU, JTU, JTU, 16);
+        if (r)
+            a64_lsr_imm(b, 0, JTU, JTU, (int)r);
+        a64_bfi(b, 1, rd, JTU, 0, 16);
+        if (ds < 0)
+            emit_gpr_wr(b, rd, d->reg);
+        goto flags;
+    }
     if (ds < 0)
         emit_gpr_rd(b, sf, JT0, d->reg);
     int rn = ds >= 0 ? rd : JT0;
@@ -7305,6 +7335,7 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
     }
     if (ds < 0)
         emit_gpr_wr(b, rd, d->reg);
+flags:
     if (!need)
         return 1;
     emit_materialize(b);
@@ -13923,6 +13954,94 @@ static int m32_inline_ok(const X86Insn *insn)
     }
 }
 
+/*
+ * rdtsc and rdtscp give nanoseconds, as ext_rdtsc in interp_ext.c does: host
+ * mach_absolute_time scaled by its timebase.  Calling out for it spilled every
+ * register; a library that reads the time around each operation (SQLite's
+ * did, through the x86 mach_absolute_time) spent a sixth of its time there.
+ * So the translation reads the time the way libsyscall's mach_absolute_time
+ * does (xnu, libsyscall/wrappers/mach_absolute_time.s): the timer register the
+ * commpage's user timebase byte names, plus the commpage's timebase offset,
+ * read again until it holds still, which gives the same value the interpreter
+ * gets.  Where the commpage says userspace cannot read the timer, or under
+ * OCERZ_NO_INLINE_RDTSC=1, it stays a call-out.
+ */
+#define RDTSC_COMMPAGE_OFFSET 0x0000000FFFFFC088ull
+#define RDTSC_COMMPAGE_KIND   0x0000000FFFFFC090ull
+static int emit_rdtsc(A64Buf *b, const X86Insn *insn)
+{
+    static int kind = -1;
+    static uint32_t numer, denom;
+    if (kind < 0) {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        numer = tb.numer;
+        denom = tb.denom;
+        kind = getenv("OCERZ_NO_INLINE_RDTSC") ? 0 : *(volatile uint8_t *)(uintptr_t)RDTSC_COMMPAGE_KIND;
+    }
+    uint32_t mrs;
+    switch (kind) {
+    case 1: mrs = 0xd53be040u; break;
+    case 2: mrs = 0xd53be0c0u; break;
+    case 3: mrs = 0xd53cfac0u; break;
+    default: return 0;
+    }
+    if (!numer || !denom) return 0;
+    a64_mov_imm64(b, JTA, RDTSC_COMMPAGE_OFFSET);
+    uint32_t *again = a64_label(b);
+    a64_ldr(b, 8, JT0, JTA, 0);
+    if (kind == 1) a64_emit32(b, 0xd5033fdfu);
+    a64_emit32(b, mrs | JT1);
+    a64_ldr(b, 8, JT2, JTA, 0);
+    a64_subs_reg(b, 1, A64_ZR, JT0, JT2, 0);
+    a64_bcond(b, A64_NE, (int32_t)(again - a64_label(b)));
+    a64_add_reg(b, 1, JT1, JT1, JT0, 0);
+    if (numer != denom) {
+        a64_mov_imm64(b, JT2, numer);
+        a64_mul(b, 1, JT1, JT1, JT2);
+        a64_mov_imm64(b, JT2, denom);
+        a64_udiv(b, 1, JT1, JT1, JT2);
+    }
+    a64_mov_reg(b, 0, JT2, JT1);
+    emit_gpr_wr(b, JT2, OCERZ_RAX);
+    a64_lsr_imm(b, 1, JT2, JT1, 32);
+    emit_gpr_wr(b, JT2, OCERZ_RDX);
+    if (insn->op == OCERZ_OP_RDTSCP) {
+        a64_mov_imm64(b, JT2, 0);
+        emit_gpr_wr(b, JT2, OCERZ_RCX);
+    }
+    return 1;
+}
+
+/*
+ * sidt and sgdt store what ext_misc in interp_ext.c does: a limit holding the
+ * cpu number and a base of 0.  x86 malloc reads the cpu number that way to pick
+ * a magazine, once per allocation, and interpreting it was 4% of a
+ * CoreFoundation workload.
+ */
+static int emit_sidt(A64Buf *b, const X86Insn *insn)
+{
+    const X86Operand *m = &insn->ops[0];
+    if (insn->mode32 || insn->nops < 1 || m->kind != OCERZ_OPK_MEM || insn->seg != OCERZ_SEG_NONE)
+        return 0;
+    if (!mem_native_store_ok())
+        return 0;
+    int ra;
+    uint32_t disp;
+    if (!emit_mem_ea_plain_ex(b, insn, m, 8, &ra, &disp, 1))
+        return 0;
+    int plain = mem_plain_access_ok(m);
+    int32_t d = (int32_t)disp;
+    if (d >= 0 && d <= 4095) a64_add_imm(b, 1, JT2, ra, (uint32_t)d);
+    else if (d < 0 && -d <= 4095) a64_sub_imm(b, 1, JT2, ra, (uint32_t)-d);
+    else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)d); a64_add_reg(b, 1, JT2, ra, JTU, 0); }
+    a64_ldr(b, 4, JT1, 20, (uint32_t)offsetof(OcerzCPU, cpu_number));
+    if (!a64_try_and_imm(b, 0, JT1, JT1, 0xfff)) { a64_mov_imm64(b, JTU, 0xfff); a64_and_reg(b, 0, JT1, JT1, JTU, 0); }
+    emit_gpr_st_at(b, 2, JT1, JT2, 0, plain);
+    emit_gpr_st_at(b, 8, A64_ZR, JT2, 2, plain);
+    return 1;
+}
+
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
@@ -13935,6 +14054,14 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     if (insn->op == OCERZ_OP_NOP || insn->op == OCERZ_OP_PAUSE ||
         insn->op == OCERZ_OP_PREFETCH || insn->op == OCERZ_OP_CLFLUSH)
         return 1;
+    if (insn->op == OCERZ_OP_RDTSC || insn->op == OCERZ_OP_RDTSCP)
+        return emit_rdtsc(b, insn);
+    if (insn->op == OCERZ_OP_MFENCE || insn->op == OCERZ_OP_LFENCE || insn->op == OCERZ_OP_SFENCE) {
+        a64_dmb_ish(b);
+        return 1;
+    }
+    if (insn->op == OCERZ_OP_SIDT || insn->op == OCERZ_OP_SGDT)
+        return emit_sidt(b, insn);
     if ((insn->op == OCERZ_OP_XOR || insn->op == OCERZ_OP_CWD) && g_cur_insns && insn == &g_cur_insns[g_cur_insn_idx] &&
         rdx_prep_skippable(g_cur_insns, g_cur_insn_idx, g_cur_insns_n, need)) {
         g_div_prev_skipped = 1;
