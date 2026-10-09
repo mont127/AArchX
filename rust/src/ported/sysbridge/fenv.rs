@@ -62,8 +62,8 @@ unsafe fn sb_fe_raised(cpu: *const OcerzCPU) -> u32 {
         let fpsr = sb_fpsr();
         let mut f = ((*cpu).mxcsr | (*cpu).fsw as u32) & SB_FE_ALL;
         for k in 0..G_SB_FE_FLAGS.len() {
-            if fpsr & G_SB_FE_FLAGS[k].1 != 0 {
-                f |= G_SB_FE_FLAGS[k].0;
+            if fpsr & G_SB_FE_FLAGS.get_unchecked(k).1 != 0 {
+                f |= G_SB_FE_FLAGS.get_unchecked(k).0;
             }
         }
         f
@@ -76,8 +76,8 @@ unsafe fn sb_fe_clear(cpu: *mut OcerzCPU, e: u32) {
         let mut keep = fpsr;
         let e = e & SB_FE_ALL;
         for k in 0..G_SB_FE_FLAGS.len() {
-            if e & G_SB_FE_FLAGS[k].0 != 0 {
-                keep &= !G_SB_FE_FLAGS[k].1;
+            if e & G_SB_FE_FLAGS.get_unchecked(k).0 != 0 {
+                keep &= !G_SB_FE_FLAGS.get_unchecked(k).1;
             }
         }
         if keep != fpsr {

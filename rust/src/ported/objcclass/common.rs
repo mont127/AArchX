@@ -194,10 +194,10 @@ pub unsafe fn oc_is_guest(addr: u64) -> bool {
 }
 
 pub fn oc_logging() -> bool {
-    static EN: AtomicU64 = AtomicU64::new(u64::MAX);
+    static EN: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
     let mut en = EN.load(Ordering::Relaxed);
-    if en == u64::MAX {
-        en = unsafe { !libc::getenv(c"OCERZ_OBJCLOG".as_ptr()).is_null() } as u64;
+    if en < 0 {
+        en = unsafe { !libc::getenv(c"OCERZ_OBJCLOG".as_ptr()).is_null() } as i32;
         EN.store(en, Ordering::Relaxed);
     }
     en != 0

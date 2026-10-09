@@ -25,6 +25,10 @@ use crate::ffi::*;
 use crate::ported::bridge::common::br_guest_path;
 use crate::ported::bridge::lookup::{BrLib, G_BR_HOST_LOCK, br_lib};
 
+static mut G_BR_SIGNALS_BEFORE: [libc::sigaction; NSIG as usize] = unsafe {
+    core::mem::zeroed()
+};
+
 static mut G_BR_CF_IDENTIFIED: c_int = 0;
 
 pub unsafe fn br_identify_corefoundation() {
@@ -133,12 +137,12 @@ pub unsafe extern "C" fn ocerz_bridge_host_library(install_name: *const c_char) 
             {
                 h = libc::RTLD_DEFAULT;
             } else {
-                let mut before: [libc::sigaction; NSIG as usize] = core::mem::zeroed();
+                let before = &raw mut G_BR_SIGNALS_BEFORE;
                 for sig in 1..NSIG {
                     libc::sigaction(
                         sig,
                         core::ptr::null(),
-                        before.as_mut_ptr().add(sig as usize),
+                        before.cast::<libc::sigaction>().add(sig as usize),
                     );
                 }
                 if !libc::strstr(install_name, c".framework/".as_ptr()).is_null() {
@@ -152,7 +156,7 @@ pub unsafe extern "C" fn ocerz_bridge_host_library(install_name: *const c_char) 
                     h = libc::dlopen(install_name, libc::RTLD_LAZY | libc::RTLD_LOCAL);
                 }
                 if !h.is_null() {
-                    br_note_stolen_signals(before.as_ptr(), install_name);
+                    br_note_stolen_signals(before as *const libc::sigaction, install_name);
                 } else {
                     crate::ocerz_log!(
                         "bridge: host library %s will not open: %s\n",

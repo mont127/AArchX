@@ -51,12 +51,12 @@ static mut G_SB_KEY_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZE
 unsafe fn sb_key(key: u64) -> *const SbKey {
     unsafe {
         if key >= SB_RESERVED_FIRST && key < SB_KEY_FIRST {
-            return &raw const G_SB_RESERVED[key as usize];
+            return &raw const *(&raw const G_SB_RESERVED).cast::<SbKey>().add(key as usize);
         }
         if key < SB_KEY_FIRST || key >= SB_KEY_END {
             return core::ptr::null();
         }
-        let k = &raw const G_SB_KEYS[(key - SB_KEY_FIRST) as usize];
+        let k = &raw const *(&raw const G_SB_KEYS).cast::<SbKey>().add((key - SB_KEY_FIRST) as usize);
         if (*k).used.load(Ordering::SeqCst) != 0 { k } else { core::ptr::null() }
     }
 }
@@ -72,14 +72,15 @@ pub unsafe extern "C" fn ocerz_sys_pthread_key_create(vm: *mut OcerzVM, cpu: *mu
         let mut i = 0;
         while i < n && got == n {
             let at = (G_SB_KEY_NEXT + i) % n;
-            if G_SB_KEYS[at as usize].used.load(Ordering::SeqCst) == 0 {
+            if (*(&raw const G_SB_KEYS).cast::<SbKey>().add(at as usize)).used.load(Ordering::SeqCst) == 0 {
                 got = at;
             }
             i += 1;
         }
         if got != n {
-            G_SB_KEYS[got as usize].destructor.store(destructor, Ordering::SeqCst);
-            G_SB_KEYS[got as usize].used.store(1, Ordering::SeqCst);
+            let k = (&raw const G_SB_KEYS).cast::<SbKey>().add(got as usize);
+            (*k).destructor.store(destructor, Ordering::SeqCst);
+            (*k).used.store(1, Ordering::SeqCst);
             G_SB_KEY_NEXT = got + 1;
         }
         libc::pthread_mutex_unlock(&raw mut G_SB_KEY_LOCK);
@@ -102,8 +103,9 @@ pub unsafe extern "C" fn ocerz_sys_pthread_key_init_np(vm: *mut OcerzVM, cpu: *m
         if key < SB_RESERVED_FIRST || key >= SB_KEY_FIRST {
             return sb_ret(vm, cpu, libc::EINVAL as i64);
         }
-        G_SB_RESERVED[key as usize].destructor.store(destructor, Ordering::SeqCst);
-        G_SB_RESERVED[key as usize].used.store(1, Ordering::SeqCst);
+        let k = (&raw const G_SB_RESERVED).cast::<SbKey>().add(key as usize);
+        (*k).destructor.store(destructor, Ordering::SeqCst);
+        (*k).used.store(1, Ordering::SeqCst);
         sb_ret(vm, cpu, 0)
     }
 }
@@ -163,9 +165,9 @@ unsafe fn sb_key_destructors(vm: *mut OcerzVM, cpu: *mut OcerzCPU) {
             let mut key = SB_RESERVED_FIRST;
             while key < SB_KEY_END && (*vm).exited == 0 {
                 let k = if key < SB_KEY_FIRST {
-                    &raw const G_SB_RESERVED[key as usize]
+                    &raw const *(&raw const G_SB_RESERVED).cast::<SbKey>().add(key as usize)
                 } else {
-                    &raw const G_SB_KEYS[(key - SB_KEY_FIRST) as usize]
+                    &raw const *(&raw const G_SB_KEYS).cast::<SbKey>().add((key - SB_KEY_FIRST) as usize)
                 };
                 if key < SB_KEY_FIRST && (*k).used.load(Ordering::SeqCst) == 0 {
                     key += 1;

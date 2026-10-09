@@ -98,8 +98,8 @@ unsafe fn br_view_find(view: u64) -> *const BrZoneView {
         let n = G_BR_VIEWS_N.load(Ordering::SeqCst);
         let mut k = 0;
         while view != 0 && k < n as usize {
-            if G_BR_VIEWS[k].view == view {
-                return &raw const G_BR_VIEWS[k];
+            if (*(&raw const G_BR_VIEWS).cast::<BrZoneView>().add(k)).view == view {
+                return (&raw const G_BR_VIEWS).cast::<BrZoneView>().add(k);
             }
             k += 1;
         }
@@ -400,37 +400,37 @@ pub unsafe extern "C" fn br_zone_view(native_zone: *mut c_void) -> u64 {
         libc::pthread_mutex_lock(&raw mut G_BR_VIEWS_LOCK);
         let n = G_BR_VIEWS_N.load(Ordering::SeqCst) as usize;
         let mut k = 0;
-        while k < n && G_BR_VIEWS[k].native != z {
+        while k < n && (*(&raw const G_BR_VIEWS).cast::<BrZoneView>().add(k)).native != z {
             k += 1;
         }
-        let mut answer = if k < n { G_BR_VIEWS[k].view } else { 0 };
+        let mut answer = if k < n { (*(&raw const G_BR_VIEWS).cast::<BrZoneView>().add(k)).view } else { 0 };
         if answer == 0 && n < BR_ZONE_VIEWS {
             let page = ocerz_map_anywhere(
                 OCERZ_GUEST_PAGE_SIZE as u64,
                 libc::PROT_READ | libc::PROT_WRITE,
             );
-            let v = &raw mut G_BR_VIEWS[n];
+            let v = (&raw mut G_BR_VIEWS).cast::<BrZoneView>().add(n);
             let mut ok = page != 0;
             core::ptr::write_bytes((*v).made.as_mut_ptr(), 0, BR_ZONE_WORDS);
             let mut f = 0;
             while ok && f < G_BR_ZONE_FNS.len() {
-                (*v).made[G_BR_ZONE_FNS[f].word as usize] = ocerz_bridge_native_thunk(
-                    G_BR_ZONE_FNS[f].f,
-                    G_BR_ZONE_FNS[f].name,
-                    G_BR_ZONE_FNS[f].notation,
+                (*v).made[(*G_BR_ZONE_FNS.get_unchecked(f)).word as usize] = ocerz_bridge_native_thunk(
+                    (*G_BR_ZONE_FNS.get_unchecked(f)).f,
+                    (*G_BR_ZONE_FNS.get_unchecked(f)).name,
+                    (*G_BR_ZONE_FNS.get_unchecked(f)).notation,
                 );
-                ok = (*v).made[G_BR_ZONE_FNS[f].word as usize] != 0;
+                ok = (*v).made[(*G_BR_ZONE_FNS.get_unchecked(f)).word as usize] != 0;
                 f += 1;
             }
             let mut introspect = [0u64; BR_ZONE_INTROSPECT_WORDS];
             let mut f = 0;
             while ok && f < G_BR_INTROSPECT_FNS.len() {
-                introspect[G_BR_INTROSPECT_FNS[f].word as usize] = ocerz_bridge_native_thunk(
-                    G_BR_INTROSPECT_FNS[f].f,
-                    G_BR_INTROSPECT_FNS[f].name,
-                    G_BR_INTROSPECT_FNS[f].notation,
+                introspect[(*G_BR_INTROSPECT_FNS.get_unchecked(f)).word as usize] = ocerz_bridge_native_thunk(
+                    (*G_BR_INTROSPECT_FNS.get_unchecked(f)).f,
+                    (*G_BR_INTROSPECT_FNS.get_unchecked(f)).name,
+                    (*G_BR_INTROSPECT_FNS.get_unchecked(f)).notation,
                 );
-                ok = introspect[G_BR_INTROSPECT_FNS[f].word as usize] != 0;
+                ok = introspect[(*G_BR_INTROSPECT_FNS.get_unchecked(f)).word as usize] != 0;
                 f += 1;
             }
             if ok {
@@ -510,7 +510,7 @@ unsafe fn br_zone_seed_locked() {
         while k < count && (G_BR_EFF_N as usize) < BR_ZONE_SLOTS {
             let view = br_zone_view(*list.add(k as usize) as *mut c_void);
             if view != 0 {
-                G_BR_EFF[G_BR_EFF_N as usize] = view;
+                *(&raw mut G_BR_EFF).cast::<u64>().add(G_BR_EFF_N as usize) = view;
                 G_BR_EFF_N += 1;
             }
             k += 1;
@@ -526,7 +526,7 @@ unsafe fn br_zone_add(zone: u64) {
         libc::pthread_mutex_lock(&raw mut G_BR_ZONES_LOCK);
         br_zone_seed_locked();
         if (G_BR_EFF_N as usize) < BR_ZONE_SLOTS {
-            G_BR_EFF[G_BR_EFF_N as usize] = zone;
+            *(&raw mut G_BR_EFF).cast::<u64>().add(G_BR_EFF_N as usize) = zone;
             G_BR_EFF_N += 1;
         }
         libc::pthread_mutex_unlock(&raw mut G_BR_ZONES_LOCK);
@@ -541,9 +541,9 @@ unsafe fn br_zone_remove(zone: u64) {
         libc::pthread_mutex_lock(&raw mut G_BR_ZONES_LOCK);
         br_zone_seed_locked();
         for k in 0..G_BR_EFF_N as usize {
-            if G_BR_EFF[k] == zone {
+            if *(&raw const G_BR_EFF).cast::<u64>().add(k) == zone {
                 G_BR_EFF_N -= 1;
-                G_BR_EFF[k] = G_BR_EFF[G_BR_EFF_N as usize];
+                *(&raw mut G_BR_EFF).cast::<u64>().add(k) = *(&raw const G_BR_EFF).cast::<u64>().add(G_BR_EFF_N as usize);
                 break;
             }
         }
@@ -590,7 +590,7 @@ pub unsafe extern "C" fn br_malloc_default_zone_tracked(
         libc::pthread_mutex_lock(&raw mut G_BR_ZONES_LOCK);
         br_zone_seed_locked();
         if G_BR_EFF_N > 0 {
-            first = G_BR_EFF[0];
+            first = *(&raw const G_BR_EFF).cast::<u64>().add(0);
         }
         libc::pthread_mutex_unlock(&raw mut G_BR_ZONES_LOCK);
         if first != 0 {
@@ -641,7 +641,7 @@ pub unsafe extern "C" fn br_malloc_default_purgeable_zone(
         libc::pthread_mutex_lock(&raw mut G_BR_ZONES_LOCK);
         br_zone_seed_locked();
         for k in 0..G_BR_EFF_N as usize {
-            known |= G_BR_EFF[k] == view;
+            known |= *(&raw const G_BR_EFF).cast::<u64>().add(k) == view;
         }
         libc::pthread_mutex_unlock(&raw mut G_BR_ZONES_LOCK);
         if !known {
@@ -692,7 +692,7 @@ pub unsafe extern "C" fn br_malloc_get_all_zones_tracked(
         br_zone_seed_locked();
         let mut k = 0;
         while k < G_BR_EFF_N as usize && neff < BR_ZONE_SLOTS {
-            eff[neff] = G_BR_EFF[k];
+            eff[neff] = *(&raw const G_BR_EFF).cast::<u64>().add(k);
             neff += 1;
             k += 1;
         }
@@ -997,7 +997,7 @@ pub unsafe extern "C" fn br_malloc_zone_from_ptr(vm: *mut OcerzVM, cpu: *mut Oce
         libc::pthread_mutex_lock(&raw mut G_BR_ZONES_LOCK);
         br_zone_seed_locked();
         for k in 0..G_BR_EFF_N as usize {
-            eff[neff] = G_BR_EFF[k];
+            eff[neff] = *(&raw const G_BR_EFF).cast::<u64>().add(k);
             neff += 1;
         }
         libc::pthread_mutex_unlock(&raw mut G_BR_ZONES_LOCK);
