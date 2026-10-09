@@ -64,7 +64,7 @@ unsafe extern "C" {
     fn mach_vm_deallocate(task: mach_port_t, addr: u64, size: u64) -> c_int;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
     fn mach_port_type(task: mach_port_t, name: mach_port_t, ptype: *mut u32) -> c_int;
-    static mach_task_self_: mach_port_t;
+    static mut mach_task_self_: mach_port_t;
     fn semaphore_signal(semaphore: semaphore_t) -> c_int;
 }
 
@@ -326,9 +326,10 @@ pub(super) unsafe fn tc_policy_send(gmsg: u64, send_size: u32, ts: *mut TcPolicy
             return;
         }
         (*ts).msg = gmsg;
+        let orig = ptr::addr_of_mut!((*ts).orig).cast::<u32>();
         for i in 0..3 {
-            (*ts).orig[i] = ocerz_ld(gmsg.wrapping_add(0x28 + i as u64 * 4), 4) as u32;
-            let ticks = ocerz_guest_ns_to_host_ticks((*ts).orig[i] as u64);
+            *orig.add(i) = ocerz_ld(gmsg.wrapping_add(0x28 + i as u64 * 4), 4) as u32;
+            let ticks = ocerz_guest_ns_to_host_ticks(*orig.add(i) as u64);
             ocerz_st(
                 gmsg.wrapping_add(0x28 + i as u64 * 4),
                 4,
@@ -342,9 +343,9 @@ pub(super) unsafe fn tc_policy_send(gmsg: u64, send_size: u32, ts: *mut TcPolicy
                 c"ocerz: TCPOLICY[%d] set flavor=%u ns %u/%u/%u -> ticks %u/%u/%u\n".as_ptr(),
                 libc::getpid(),
                 flavor,
-                (*ts).orig[0],
-                (*ts).orig[1],
-                (*ts).orig[2],
+                *orig,
+                *orig.add(1),
+                *orig.add(2),
                 ocerz_ld(gmsg.wrapping_add(0x28), 4) as u32,
                 ocerz_ld(gmsg.wrapping_add(0x2c), 4) as u32,
                 ocerz_ld(gmsg.wrapping_add(0x30), 4) as u32,
@@ -358,11 +359,12 @@ pub(super) unsafe fn tc_policy_send_done(ts: *const TcPolicySave, kr: u64) {
         if (*ts).n == 0 || kr & 0xfffff000 != 0x10000000 {
             return;
         }
+        let orig = ptr::addr_of!((*ts).orig).cast::<u32>();
         for i in 0..3 {
             ocerz_st(
                 (*ts).msg.wrapping_add(0x28 + i as u64 * 4),
                 4,
-                (*ts).orig[i] as u64,
+                *orig.add(i) as u64,
             );
         }
     }
@@ -420,8 +422,9 @@ pub(super) unsafe fn sys_gettimeofday(
         let args = &*a;
         let mut fa = *args;
         for i in 0..3 {
-            if fa[i] != 0 {
-                fa[i] = ocerz_g2h(fa[i]) as usize as u64;
+            let arg = fa.as_mut_ptr().add(i);
+            if *arg != 0 {
+                *arg = ocerz_g2h(*arg) as usize as u64;
             }
         }
         let mut ret2 = 0u64;
@@ -626,7 +629,7 @@ unsafe fn vmmap_pad_save(gmsg: u64, send_size: u32) {
             return;
         }
         G_VMMAP_PAD.head_lo = lo;
-        G_VMMAP_PAD.head_n = addr - lo;
+        G_VMMAP_PAD.head_n = addr.wrapping_sub(lo);
         G_VMMAP_PAD.tail_lo = addr.wrapping_add(size);
         G_VMMAP_PAD.tail_n = hi.wrapping_sub(addr.wrapping_add(size));
         G_VMMAP_PAD.head = vmmap_pad_take(G_VMMAP_PAD.head_lo, G_VMMAP_PAD.head_n);
@@ -1125,13 +1128,15 @@ pub(super) unsafe fn ocerz_send_xlate_vector(
         if sending != 0 && seg0 != 0 && crate::ffi::ocerz_addr_committed(seg0) == 1 {
             let mut segsv = [OcerzOolSave::default(); 32];
             let segn = ocerz_send_xlate_descriptors(seg0, seg0_size, segsv.as_mut_ptr(), 32);
+            let segsv = segsv.as_ptr();
             for j in 0..segn {
                 if n >= max_saved {
                     break;
                 }
-                (*saved.add(n as usize)).off =
-                    seg0.wrapping_add(segsv[j as usize].off).wrapping_sub(gvec);
-                (*saved.add(n as usize)).orig = segsv[j as usize].orig;
+                (*saved.add(n as usize)).off = seg0
+                    .wrapping_add((*segsv.add(j as usize)).off)
+                    .wrapping_sub(gvec);
+                (*saved.add(n as usize)).orig = (*segsv.add(j as usize)).orig;
                 n += 1;
             }
         }

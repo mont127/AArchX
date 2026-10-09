@@ -55,7 +55,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn mach_thread_self() -> libc::mach_port_t;
     fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> c_int;
-    static mach_task_self_: libc::mach_port_t;
+    static mut mach_task_self_: libc::mach_port_t;
     fn ocerz_peek_pending_async_sig() -> u32;
     fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
 }
@@ -301,6 +301,24 @@ unsafe fn ocerz_hostwq_bridge(extra_r8: u64, workloop_id: u64, hev: *const c_voi
         let evbuf = pth.wrapping_add(0x8000);
         ocerz_st(evbuf.wrapping_sub(8), 8, workloop_id);
         let stride = workers::ocerz_kev_stride();
+        if nev > 1 && env_set!("OCERZ_NEVLOG") {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: HOSTWQ-NEV nev=%d filters=".as_ptr(),
+                nev,
+            );
+            for i in 0..nev as usize {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"%s%d".as_ptr(),
+                    if i == 0 { c"".as_ptr() } else { c",".as_ptr() },
+                    ocerz_ld(evbuf.wrapping_add(i as u64 * stride).wrapping_add(8), 2) as u16
+                        as i16
+                        as c_int,
+                );
+            }
+            libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+        }
         for i in 0..nev as usize {
             ptr::copy_nonoverlapping(
                 hev.cast::<u8>().add(i * stride as usize),
@@ -346,6 +364,22 @@ unsafe fn ocerz_hostwq_bridge(extra_r8: u64, workloop_id: u64, hev: *const c_voi
                 } else if hbuf != 0 {
                     ocerz_st(dst.wrapping_add(0x28), 8, 0);
                 }
+                if gbuf != 0 && env_set!("OCERZ_WSIG") {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: MACHBRIDGE ev[%d] hbuf=%#llx sz=%#llx -> gbuf=%#llx%s\n"
+                            .as_ptr(),
+                        i as c_int,
+                        hbuf as libc::c_ulonglong,
+                        sz as libc::c_ulonglong,
+                        gbuf as libc::c_ulonglong,
+                        if ptr::read_volatile(hbuf as *const u32) & 0x8000_0000 != 0 {
+                            c" COMPLEX".as_ptr()
+                        } else {
+                            c"".as_ptr()
+                        },
+                    );
+                }
             }
         }
         ocerz_shadow_scan(c"wqev".as_ptr(), nev as u64, evbuf, nev as u64 * stride);
@@ -387,8 +421,28 @@ unsafe fn ocerz_hostwq_bridge(extra_r8: u64, workloop_id: u64, hev: *const c_voi
             | mgr_flag
             | if mgr { 0 } else { 4 }
             | if registered { OCERZ_WQ_FLAG_REUSE } else { 0 };
+        if mgr && env_set!("OCERZ_ULOCKLOG") {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: WQ-MANAGER delivery nev=%d guest_tsd_qos=%#llx\n".as_ptr(),
+                nev,
+                ocerz_ld(pth.wrapping_add(0xe0 + 4 * 8), 8) as libc::c_ulonglong,
+            );
+        }
         t.gpr[crate::ffi::OCERZ_R9 as usize] = nev as u64;
         t.gs_base = pth.wrapping_add(0xe0);
+        if env_set!("OCERZ_GSTRACE") {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: HOSTWQ worker enter region=%#llx pth=%#llx gs=%#llx rsp=%#llx nev=%d\n"
+                    .as_ptr(),
+                region as libc::c_ulonglong,
+                pth as libc::c_ulonglong,
+                t.gs_base as libc::c_ulonglong,
+                t.gpr[crate::ffi::OCERZ_RSP as usize] as libc::c_ulonglong,
+                nev,
+            );
+        }
         crate::ffi::ocerz_init_gate_wait();
         let flt0 = if nev > 0 {
             ocerz_ld(evbuf.wrapping_add(8), 2) as u16 as i16
@@ -396,11 +450,32 @@ unsafe fn ocerz_hostwq_bridge(extra_r8: u64, workloop_id: u64, hev: *const c_voi
             0
         };
         let ident0 = if nev > 0 { ocerz_ld(evbuf, 8) } else { 0 };
-        if env_set!("OCERZ_DQDUMP") {
+        if env_set!("OCERZ_ULOCKLOG") {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: WQ-ENTER cpu#%u kport=%#x nev=%d flt0=%d ident0=%#llx\n".as_ptr(),
+                t.cpu_number,
+                kp as u32,
+                nev,
+                flt0 as c_int,
+                ident0 as libc::c_ulonglong,
+            );
+        }
+        let dqdump = env_set!("OCERZ_DQDUMP");
+        if dqdump {
             workers::wl_dqdump(c"ENTER".as_ptr(), workloop_id, t.cpu_number as u32, kp);
         }
         let wrc = crate::ffi::ocerz_vm_run_cpu(vm, &mut t);
-        if env_set!("OCERZ_DQDUMP") {
+        if env_set!("OCERZ_ULOCKLOG") {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: WQ-EXIT  cpu#%u kport=%#x rc=%d\n".as_ptr(),
+                t.cpu_number,
+                kp as u32,
+                wrc,
+            );
+        }
+        if dqdump {
             workers::wl_dqdump(
                 if wrc == 125 {
                     c"FATAL".as_ptr()
@@ -433,6 +508,26 @@ unsafe fn ocerz_hostwq_bridge(extra_r8: u64, workloop_id: u64, hev: *const c_voi
                 flt0 as c_int,
                 ident0 as libc::c_ulonglong,
             );
+        }
+        if env_set!("OCERZ_WQHIST") && wrc == 125 {
+            let mut history = [0u64; 32];
+            let count = crate::ffi::ocerz_vm_riphist(history.as_mut_ptr(), history.len() as u32);
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: WQ-HIST cpu#%u flt0=%d ident0=%#llx rip=%#llx hist:".as_ptr(),
+                t.cpu_number,
+                flt0 as c_int,
+                ident0 as libc::c_ulonglong,
+                t.rip as libc::c_ulonglong,
+            );
+            for value in history.iter().take(count as usize) {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c" %#llx".as_ptr(),
+                    *value as libc::c_ulonglong,
+                );
+            }
+            libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
         }
         mach_port_deallocate(mach_task_self_, kp);
     }
@@ -624,7 +719,7 @@ pub(super) unsafe fn sys_workq_kernreturn(
                 t.sig_last_fault = 0;
                 t.sig_repeat = 0;
                 if workers::ocerz_spawn_worker(vm, &t) != 0 {
-                    workers::g_wq_running_add(-1);
+                    workers::g_wq_running_sub(1);
                     break;
                 }
             }
@@ -705,7 +800,7 @@ unsafe fn ocerz_spawn_workloop_worker(
         t.cpu_number = workers::ocerz_next_cpu_number();
         t.rip = wqthread_start;
         for r in 0..16 {
-            t.gpr[r] = 0;
+            *t.gpr.as_mut_ptr().add(r) = 0;
         }
         let qosbits = ((prio >> 8) & 0x3fff) as u32;
         let mut qos_idx = if qosbits != 0 {
@@ -732,7 +827,7 @@ unsafe fn ocerz_spawn_workloop_worker(
         t.sig_last_fault = 0;
         t.sig_repeat = 0;
         if workers::ocerz_spawn_worker(vm, &t) != 0 {
-            workers::g_wq_running_add(-1);
+            workers::g_wq_running_sub(1);
             return -1;
         }
         0
@@ -820,7 +915,9 @@ unsafe extern "C" fn ocerz_hostwq_workloop_cb(
             );
         }
         if env_set!("OCERZ_SPINLOG") {
-            let d = G_SPIN_DISPATCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            let d = G_SPIN_DISPATCH
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(1);
             if d % 5000 == 0 {
                 let ne = if nevents.is_null() { 0 } else { *nevents };
                 let ev = if events.is_null() {
@@ -942,8 +1039,9 @@ pub(super) unsafe fn sys_kevent_id(
                 }
             }
             for i in [1usize, 3, 5, 6] {
-                if fa[i] != 0 {
-                    fa[i] = ocerz_g2h(fa[i]) as usize as u64;
+                let arg = fa.as_mut_ptr().add(i);
+                if *arg != 0 {
+                    *arg = ocerz_g2h(*arg) as usize as u64;
                 }
             }
             let mut ret2 = 0u64;
@@ -1110,8 +1208,9 @@ pub(super) unsafe fn sys_kevent_qos(
             );
             fa[7] = kq_flags;
             for i in [1usize, 3, 5, 6] {
-                if fa[i] != 0 {
-                    fa[i] = ocerz_g2h(fa[i]) as usize as u64;
+                let arg = fa.as_mut_ptr().add(i);
+                if *arg != 0 {
+                    *arg = ocerz_g2h(*arg) as usize as u64;
                 }
             }
             let mut ret2 = 0;

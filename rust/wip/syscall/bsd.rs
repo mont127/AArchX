@@ -60,7 +60,7 @@ unsafe extern "C" {
         maximum_protection: *mut i32,
         inheritance: i32,
     ) -> i32;
-    static mach_task_self_: u32;
+    static mut mach_task_self_: u32;
 }
 
 #[inline(always)]
@@ -235,8 +235,9 @@ unsafe fn sys_iov(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8], num: 
     for i in 0..cnt {
         let addr = args[1].wrapping_add(i.wrapping_mul(16));
         let base = ocerz_ld(addr, 8);
-        scratch[i as usize].iov_base = if base != 0 { ocerz_g2h(base) as u64 } else { 0 };
-        scratch[i as usize].iov_len = ocerz_ld(addr.wrapping_add(8), 8);
+        let entry = scratch.as_mut_ptr().add(i as usize);
+        (*entry).iov_base = if base != 0 { ocerz_g2h(base) as u64 } else { 0 };
+        (*entry).iov_len = ocerz_ld(addr.wrapping_add(8), 8);
     }
     let mut fa = [args[0], scratch.as_mut_ptr() as u64, args[2], 0, 0, 0, 0, 0];
     forward_with_scratch(cpu, num, &mut fa, 0);
@@ -343,7 +344,7 @@ unsafe fn strace_bsd(
             } else {
                 c", %#llx".as_ptr()
             },
-            args[i as usize] as libc::c_ulonglong,
+            *args.as_ptr().add(i as usize) as libc::c_ulonglong,
         );
     }
     if (*cpu).rflags & crate::inline::OCERZ_CF != 0 {
@@ -373,11 +374,12 @@ unsafe fn strace_bsd(
     {
         let mut path = [0i8; 128];
         for i in 0..127usize {
-            path[i] = ocerz_ld(args[0].wrapping_add(i as u64), 1) as i8;
-            if path[i] == 0 {
+            let ch = path.as_mut_ptr().add(i);
+            *ch = ocerz_ld(args[0].wrapping_add(i as u64), 1) as i8;
+            if *ch == 0 {
                 break;
             }
-            path[i + 1] = 0;
+            *path.as_mut_ptr().add(i + 1) = 0;
         }
         libc::fprintf(
             crate::log::stderr(),
@@ -512,7 +514,7 @@ pub(super) unsafe fn dispatch_bsd_at(
     if (*entry).nargs > 6 {
         let rsp = *regs.add(crate::ffi::OCERZ_RSP as usize);
         for i in 6..((*entry).nargs as usize).min(8) {
-            a[i] = ocerz_ld(
+            *a.as_mut_ptr().add(i) = ocerz_ld(
                 rsp.wrapping_add(stack_skip)
                     .wrapping_add(8u64.wrapping_mul((i - 5) as u64)),
                 8,
@@ -521,17 +523,23 @@ pub(super) unsafe fn dispatch_bsd_at(
     }
     let orig = a;
 
-    if env_set!("OCERZ_FDOPLOG") {
-        let selected = matches!(num, 6 | 442 | 90 | 41 | 135 | 399);
+    static mut FDOPLOG: c_int = -2;
+    if FDOPLOG == -2 {
+        FDOPLOG = c_int::from(!libc::getenv(c"OCERZ_FDOPLOG".as_ptr()).is_null());
         let filter = libc::getenv(c"OCERZ_FDOPLOG_EXE".as_ptr());
-        let enabled = if filter.is_null() || *filter == 0 {
-            true
-        } else {
+        if FDOPLOG != 0 && !filter.is_null() && *filter != 0 {
             let summary =
                 ptr::addr_of!(crate::ported::globals::ocerz_cmdline_summary).cast::<c_char>();
-            !(*summary == 0) && !libc::strstr(summary, filter).is_null()
-        };
-        if selected && enabled {
+            FDOPLOG = if *summary == 0 {
+                -1
+            } else {
+                c_int::from(!libc::strstr(summary, filter).is_null())
+            };
+        }
+    }
+    if FDOPLOG != 0 {
+        let selected = matches!(num, 6 | 442 | 90 | 41 | 135 | 399);
+        if selected {
             let name = match num {
                 6 => c"close".as_ptr(),
                 442 => c"guarded_close".as_ptr(),
@@ -597,7 +605,17 @@ pub(super) unsafe fn dispatch_bsd_at(
         );
     }
 
-    if env_set!("OCERZ_MSGLOG") && matches!(num, 3 | 4 | 396 | 397) && a[2] == 64 && a[1] != 0 {
+    static mut WRLOG: c_int = -1;
+    if WRLOG < 0 {
+        WRLOG = c_int::from(!libc::getenv(c"OCERZ_MSGLOG".as_ptr()).is_null());
+        let filter = libc::getenv(c"OCERZ_MSGLOG_EXE".as_ptr());
+        if WRLOG != 0 && !filter.is_null() && *filter != 0 {
+            let summary =
+                ptr::addr_of!(crate::ported::globals::ocerz_cmdline_summary).cast::<c_char>();
+            WRLOG = c_int::from(!libc::strstr(summary, filter).is_null());
+        }
+    }
+    if WRLOG != 0 && matches!(num, 3 | 4 | 396 | 397) && a[2] == 64 && a[1] != 0 {
         let rq = ocerz_ld(a[1], 4) as u32;
         libc::fprintf(
             crate::log::stderr(),
@@ -649,8 +667,9 @@ pub(super) unsafe fn dispatch_bsd_at(
     }
 
     for i in 0..8 {
-        if (*entry).ptr_mask & (1 << i) != 0 && a[i] != 0 {
-            a[i] = ocerz_g2h(a[i]) as u64;
+        let arg = a.as_mut_ptr().add(i);
+        if (*entry).ptr_mask & (1 << i) != 0 && *arg != 0 {
+            *arg = ocerz_g2h(*arg) as u64;
         }
     }
 
@@ -710,7 +729,9 @@ pub(super) unsafe fn dispatch_bsd_at(
         );
     let mut bseq = 0;
     if btrack {
-        bseq = BLOCKSEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        bseq = BLOCKSEQ
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
         libc::fprintf(
             crate::log::stderr(),
             c"ocerz: BLK-IN[%d] seq=%llu cpu#%u num=%d a0=%#llx a1=%#llx a2=%#llx rip=%#llx ret0=%#llx bt:".as_ptr(),
@@ -743,6 +764,92 @@ pub(super) unsafe fn dispatch_bsd_at(
         libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
     }
 
+    static mut SOCKLOG_PRE: c_int = -1;
+    if SOCKLOG_PRE < 0 {
+        SOCKLOG_PRE = c_int::from(!libc::getenv(c"OCERZ_SOCKLOG".as_ptr()).is_null());
+        let filter = libc::getenv(c"OCERZ_SOCKLOG_EXE".as_ptr());
+        if SOCKLOG_PRE != 0 && !filter.is_null() && *filter != 0 {
+            let summary =
+                ptr::addr_of!(crate::ported::globals::ocerz_cmdline_summary).cast::<c_char>();
+            SOCKLOG_PRE = c_int::from(!libc::strstr(summary, filter).is_null());
+        }
+    }
+    if SOCKLOG_PRE != 0 && matches!(num, 97 | 98 | 104 | 105 | 30 | 106) {
+        let mut address = [0i8; 160];
+        if matches!(num, 98 | 104)
+            && a[1] != 0
+            && crate::ffi::ocerz_addr_readable(a[1].wrapping_add(1)) != 0
+        {
+            let family = ocerz_ld(a[1].wrapping_add(1), 1) as u8;
+            if family == 2 && crate::ffi::ocerz_addr_readable(a[1].wrapping_add(7)) != 0 {
+                let port =
+                    (ocerz_ld(a[1].wrapping_add(2), 1) << 8) | ocerz_ld(a[1].wrapping_add(3), 1);
+                let ip = ocerz_ld(a[1].wrapping_add(4), 4);
+                libc::snprintf(
+                    address.as_mut_ptr(),
+                    address.len(),
+                    c" AF_INET %llu.%llu.%llu.%llu:%llu".as_ptr(),
+                    (ip & 0xff) as libc::c_ulonglong,
+                    ((ip >> 8) & 0xff) as libc::c_ulonglong,
+                    ((ip >> 16) & 0xff) as libc::c_ulonglong,
+                    ((ip >> 24) & 0xff) as libc::c_ulonglong,
+                    port as libc::c_ulonglong,
+                );
+            } else if family == 30 && crate::ffi::ocerz_addr_readable(a[1].wrapping_add(7)) != 0 {
+                let port =
+                    (ocerz_ld(a[1].wrapping_add(2), 1) << 8) | ocerz_ld(a[1].wrapping_add(3), 1);
+                libc::snprintf(
+                    address.as_mut_ptr(),
+                    address.len(),
+                    c" AF_INET6 [..]:%llu".as_ptr(),
+                    port as libc::c_ulonglong,
+                );
+            } else if family == 1 {
+                libc::snprintf(address.as_mut_ptr(), address.len(), c" AF_UNIX".as_ptr());
+            } else {
+                libc::snprintf(
+                    address.as_mut_ptr(),
+                    address.len(),
+                    c" fam=%u".as_ptr(),
+                    family as c_uint,
+                );
+            }
+        }
+        let name = match num {
+            97 => c"socket".as_ptr(),
+            98 => c"connect".as_ptr(),
+            104 => c"bind".as_ptr(),
+            105 => c"setsockopt".as_ptr(),
+            30 => c"accept".as_ptr(),
+            _ => c"listen".as_ptr(),
+        };
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: SOCK[%d] %s fd=%d a1=%#llx a2=%#llx%s len=%#llx\n".as_ptr(),
+            libc::getpid(),
+            name,
+            a[0] as c_int,
+            a[1] as libc::c_ulonglong,
+            a[2] as libc::c_ulonglong,
+            address.as_ptr(),
+            a[2] as libc::c_ulonglong,
+        );
+    }
+
+    if matches!(num, 363 | 369) && env_set!("OCERZ_KEVLOG") && orig[2] == 0 && orig[4] == 1 {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: KEVWAIT-ENTER[%d] num=%d kq=%lld(=fd %d) nev=%lld timeout=%#llx caller=%#llx\n".as_ptr(),
+            libc::getpid(),
+            num,
+            orig[0] as i64,
+            orig[0] as c_int,
+            orig[4] as i64,
+            orig[5] as libc::c_ulonglong,
+            (*cpu).rip as libc::c_ulonglong,
+        );
+    }
+
     let blocklog_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     (*cpu).block_nokick = if unstick_kickable(num) { 0 } else { 1 };
     (*cpu).block_since_ns = blocklog_start;
@@ -759,7 +866,347 @@ pub(super) unsafe fn dispatch_bsd_at(
     }
     (*cpu).block_since_ns = 0;
     (*cpu).block_nokick = 0;
+    super::entry::pagetrap_post_mmap(cpu, num, &orig, r, err);
 
+    static mut SOCKLOG: c_int = -1;
+    if SOCKLOG < 0 {
+        SOCKLOG = c_int::from(!libc::getenv(c"OCERZ_SOCKLOG".as_ptr()).is_null());
+        let filter = libc::getenv(c"OCERZ_SOCKLOG_EXE".as_ptr());
+        if SOCKLOG != 0 && !filter.is_null() && *filter != 0 {
+            let summary =
+                ptr::addr_of!(crate::ported::globals::ocerz_cmdline_summary).cast::<c_char>();
+            SOCKLOG = c_int::from(!libc::strstr(summary, filter).is_null());
+        }
+    }
+    if SOCKLOG != 0 && matches!(num, 97 | 98 | 104 | 105 | 30 | 106) {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: SOCK[%d]  -> %s ret=%#llx err=%d\n".as_ptr(),
+            libc::getpid(),
+            match num {
+                97 => c"socket".as_ptr(),
+                98 => c"connect".as_ptr(),
+                104 => c"bind".as_ptr(),
+                105 => c"setsockopt".as_ptr(),
+                30 => c"accept".as_ptr(),
+                _ => c"listen".as_ptr(),
+            },
+            r as libc::c_ulonglong,
+            if err != 0 { r as c_int } else { 0 },
+        );
+    }
+    static mut FDOPLOG2: c_int = -2;
+    if FDOPLOG2 == -2 {
+        FDOPLOG2 = c_int::from(!libc::getenv(c"OCERZ_FDOPLOG".as_ptr()).is_null());
+        let filter = libc::getenv(c"OCERZ_FDOPLOG_EXE".as_ptr());
+        if FDOPLOG2 != 0 && !filter.is_null() && *filter != 0 {
+            let summary =
+                ptr::addr_of!(crate::ported::globals::ocerz_cmdline_summary).cast::<c_char>();
+            FDOPLOG2 = if *summary == 0 {
+                -1
+            } else {
+                c_int::from(!libc::strstr(summary, filter).is_null())
+            };
+        }
+    }
+    if FDOPLOG2 > 0
+        && err == 0
+        && num == 135
+        && orig[3] != 0
+        && crate::ffi::ocerz_addr_readable(orig[3].wrapping_add(7)) != 0
+    {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: FD[%d] cpu#%u socketpair -> %d %d rip=%#llx\n".as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            ocerz_ld(orig[3], 4) as c_int,
+            ocerz_ld(orig[3].wrapping_add(4), 4) as c_int,
+            (*cpu).rip as libc::c_ulonglong,
+        );
+    }
+    if FDOPLOG2 > 0
+        && err == 0
+        && num == 3
+        && orig[2] == 16
+        && r == 16
+        && crate::ffi::ocerz_addr_readable(orig[1].wrapping_add(15)) != 0
+        && ocerz_ld(orig[1], 8) == 0
+    {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: FD[%d] cpu#%u WAKEUP0 fd=%d signaled=%#llx rip=%#llx\n".as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            orig[0] as c_int,
+            ocerz_ld(orig[1].wrapping_add(8), 8) as libc::c_ulonglong,
+            (*cpu).rip as libc::c_ulonglong,
+        );
+    }
+    if FDOPLOG2 > 0 && err == 0 && matches!(num, 41 | 90 | 42) {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: FD[%d] cpu#%u %s -> %d rip=%#llx\n".as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            match num {
+                41 => c"dup".as_ptr(),
+                90 => c"dup2".as_ptr(),
+                _ => c"pipe".as_ptr(),
+            },
+            r as c_int,
+            (*cpu).rip as libc::c_ulonglong,
+        );
+    }
+    static mut ULOCKWAITLOG: c_int = -1;
+    if ULOCKWAITLOG < 0 {
+        ULOCKWAITLOG = c_int::from(!libc::getenv(c"OCERZ_ULOCKLOG".as_ptr()).is_null());
+    }
+    if ULOCKWAITLOG != 0 && matches!(num, 515 | 544) {
+        let signed_result = r as i64;
+        if err != 0 || (signed_result < 0 && signed_result > -4096) {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: ULOCKW[%d] num=%d op=%#llx addr=%#llx owner=%#llx r=%lld err=%d hostself=%#x rip=%#llx\n"
+                    .as_ptr(),
+                libc::getpid(),
+                num,
+                orig[0] as libc::c_ulonglong,
+                orig[1] as libc::c_ulonglong,
+                orig[2] as libc::c_ulonglong,
+                signed_result,
+                err,
+                mach_thread_self(),
+                (*cpu).rip as libc::c_ulonglong,
+            );
+        }
+    }
+    static mut REQLOG: c_int = -1;
+    if REQLOG < 0 {
+        REQLOG = c_int::from(!libc::getenv(c"OCERZ_REQLOG".as_ptr()).is_null());
+    }
+    if REQLOG != 0
+        && ((matches!(num, 4 | 121) && matches!(orig[2], 8 | 16 | 64 | 80)) || num == 121)
+    {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: REQW[%d] num=%d fd=%lld len=%lld first=%#x -> r=%lld err=%d rip=%#llx\n"
+                .as_ptr(),
+            libc::getpid(),
+            num,
+            orig[0] as i64,
+            orig[2] as libc::c_ulonglong,
+            if num == 4 && orig[1] != 0 {
+                ocerz_ld(orig[1], 4) as u32
+            } else {
+                0
+            },
+            r as i64,
+            err,
+            (*cpu).rip as libc::c_ulonglong,
+        );
+    }
+    static mut MSGREADLOG: c_int = -1;
+    static mut MSGREADLOG_COUNT: c_int = 0;
+    if MSGREADLOG < 0 {
+        MSGREADLOG = c_int::from(!libc::getenv(c"OCERZ_MSGLOG".as_ptr()).is_null());
+    }
+    if MSGREADLOG != 0 && num == 3 && orig[2] == 1 && MSGREADLOG_COUNT < 60 {
+        MSGREADLOG_COUNT += 1;
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: RD1[%d] cpu#%u fd=%d -> r=%lld err=%d\n".as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            orig[0] as c_int,
+            r as i64,
+            if err != 0 { r as c_int } else { 0 },
+        );
+    }
+    if MSGREADLOG != 0 && num == 3 && orig[2] == 64 && orig[1] != 0 && r == 64 {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: RPLY[%d] cpu#%u fd=%d err=%#x sz=%u w2=%#x w3=%#x\n".as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            orig[0] as c_int,
+            ocerz_ld(orig[1], 4) as u32,
+            ocerz_ld(orig[1].wrapping_add(4), 4) as u32,
+            ocerz_ld(orig[1].wrapping_add(8), 4) as u32,
+            ocerz_ld(orig[1].wrapping_add(12), 4) as u32,
+        );
+    }
+    static mut NETLOG: c_int = -1;
+    if NETLOG < 0 {
+        NETLOG = c_int::from(!libc::getenv(c"OCERZ_NETLOG".as_ptr()).is_null());
+    }
+    if NETLOG != 0 && num == 363 && a[1] != 0 && a[2] as i64 > 0 {
+        for index in 0..(a[2] as usize).min(8) {
+            let event = (a[1] as *const u8).add(index * 32);
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: KEVCH[%d] ident=%llu filter=%d flags=%#x\n".as_ptr(),
+                libc::getpid(),
+                ptr::read_unaligned(event.cast::<u64>()) as libc::c_ulonglong,
+                ptr::read_unaligned(event.add(8).cast::<i16>()) as c_int,
+                ptr::read_unaligned(event.add(10).cast::<u16>()) as c_uint,
+            );
+        }
+    }
+    if NETLOG != 0 && num == 363 && r as i64 > 0 && a[3] != 0 {
+        let event = a[3] as *const u8;
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: KEV[%d] n=%llu ident=%llu filter=%d flags=%#x fflags=%#x data=%lld\n".as_ptr(),
+            libc::getpid(),
+            r as libc::c_ulonglong,
+            ptr::read_unaligned(event.cast::<u64>()) as libc::c_ulonglong,
+            ptr::read_unaligned(event.add(8).cast::<i16>()) as c_int,
+            ptr::read_unaligned(event.add(10).cast::<u16>()) as c_uint,
+            ptr::read_unaligned(event.add(12).cast::<u32>()),
+            ptr::read_unaligned(event.add(16).cast::<i64>()),
+        );
+    }
+    if NETLOG != 0
+        && matches!(
+            num,
+            97 | 98 | 104 | 106 | 30 | 133 | 29 | 361 | 362 | 363 | 403 | 404 | 413
+        )
+    {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: NET[%d] num=%d(%s) a0=%#llx a1=%#llx a2=%#llx -> r=%llu err=%d\n".as_ptr(),
+            libc::getpid(),
+            num,
+            (*entry).name,
+            a[0] as libc::c_ulonglong,
+            a[1] as libc::c_ulonglong,
+            a[2] as libc::c_ulonglong,
+            r as libc::c_ulonglong,
+            err,
+        );
+    }
+    if matches!(num, 362 | 363 | 369) && env_set!("OCERZ_KEVLOG") {
+        static mut KEV_DUMPED: c_int = 0;
+        if KEV_DUMPED == 0 {
+            KEV_DUMPED = 1;
+            crate::ffi::ocerz_dyld_dump_images();
+        }
+        let mut history = [0u64; 8];
+        let count = crate::ffi::ocerz_vm_riphist(history.as_mut_ptr(), history.len() as u32);
+        let mut cbase = 0;
+        let mut cmod = ptr::null();
+        for rip in history.iter().take(count as usize) {
+            cmod = crate::ffi::ocerz_dyld_name_for_addr(*rip, &mut cbase);
+            if !cmod.is_null() {
+                break;
+            }
+        }
+        let _ = (cmod, cbase);
+        let mut ts0 = -1i64;
+        let mut ts1 = -1i64;
+        if num != 362 && orig[5] != 0 {
+            ts0 = ocerz_ld(orig[5], 8) as i64;
+            ts1 = ocerz_ld(orig[5].wrapping_add(8), 8) as i64;
+        }
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: KEV[%d] %s kq=%lld nchanges=%lld nevents=%lld timeout=%lld.%09lld ret=%lld err=%d caller=%#llx\n"
+                .as_ptr(),
+            libc::getpid(),
+            (*entry).name,
+            orig[0] as i64,
+            orig[2] as i64,
+            orig[4] as i64,
+            ts0,
+            ts1,
+            r as i64,
+            err,
+            if count == 0 {
+                0
+            } else {
+                history[0] as libc::c_ulonglong
+            },
+        );
+        static mut KEV_POLL_SEEN: c_int = 0;
+        if num != 362 && orig[2] == 0 && orig[4] > 0 {
+            KEV_POLL_SEEN += 1;
+        }
+        if KEV_POLL_SEEN == 400 && num != 362 {
+            let mut late_history = [0u64; 32];
+            let late_count =
+                crate::ffi::ocerz_vm_riphist(late_history.as_mut_ptr(), late_history.len() as u32);
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: KEVSTACK[%d] kq=%lld late-poll frames:".as_ptr(),
+                libc::getpid(),
+                orig[0] as i64,
+            );
+            for rip in late_history.iter().take(late_count as usize) {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c" %#llx".as_ptr(),
+                    *rip as libc::c_ulonglong,
+                );
+            }
+            libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+        }
+        if num != 362 && orig[1] != 0 && orig[2] != 0 {
+            for index in 0..(orig[2] as usize).min(4) {
+                let event = orig[1].wrapping_add(index as u64 * 32);
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz:   change ident=%#llx filter=%d flags=%#x fflags=%#x\n".as_ptr(),
+                    ocerz_ld(event, 8) as libc::c_ulonglong,
+                    ocerz_ld(event + 8, 2) as u16 as i16 as c_int,
+                    ocerz_ld(event + 10, 2) as u16 as c_uint,
+                    ocerz_ld(event + 12, 4) as u32,
+                );
+            }
+        }
+        if num != 362 && orig[3] != 0 && err == 0 && r as i64 > 0 {
+            for index in 0..(r as usize).min(2) {
+                let event = orig[3].wrapping_add(index as u64 * 32);
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz:   EVENT ident=%#llx filter=%d flags=%#x fflags=%#x data=%#llx udata=%#llx\n"
+                        .as_ptr(),
+                    ocerz_ld(event, 8) as libc::c_ulonglong,
+                    ocerz_ld(event + 8, 2) as u16 as i16 as c_int,
+                    ocerz_ld(event + 10, 2) as u16 as c_uint,
+                    ocerz_ld(event + 12, 4) as u32,
+                    ocerz_ld(event + 16, 8) as libc::c_ulonglong,
+                    ocerz_ld(event + 24, 8) as libc::c_ulonglong,
+                );
+            }
+            for index in 0..r as usize {
+                let event = orig[3].wrapping_add(index as u64 * 32);
+                let flags = ocerz_ld(event + 10, 2) as u16;
+                let filter = ocerz_ld(event + 8, 2) as u16 as i16;
+                if flags & 0x8000 == 0 || filter != -1 {
+                    continue;
+                }
+                let fd = ocerz_ld(event, 8) as c_int;
+                let status = libc::fcntl(fd, libc::F_GETFL);
+                let mut queued = -1;
+                libc::ioctl(fd, libc::FIONREAD, &mut queued);
+                let mut stat: libc::stat = mem::zeroed();
+                let stat_ok = libc::fstat(fd, &mut stat);
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: KEVGUARD[%d] EOF ident=%d udata=%#llx data=%#llx getfl=%#x qread=%d mode=%#x ino=%llu\n".as_ptr(),
+                    libc::getpid(),
+                    fd,
+                    ocerz_ld(event + 24, 8) as libc::c_ulonglong,
+                    ocerz_ld(event + 16, 8) as libc::c_ulonglong,
+                    status,
+                    queued,
+                    if stat_ok == 0 { stat.st_mode as c_uint } else { 0 },
+                    if stat_ok == 0 { stat.st_ino as libc::c_ulonglong } else { 0 },
+                );
+            }
+        }
+    }
     ocerz_sysfail_note(cpu, num, if err != 0 { r as c_int } else { 0 }, &orig);
     if err == 0 && matches!(num, 336 | 545) {
         proc_info_self_fixup(num, &orig);
@@ -817,6 +1264,147 @@ pub(super) unsafe fn dispatch_bsd_at(
             );
         }
     }
+    static mut PREADLOG: libc::c_long = -2;
+    if PREADLOG == -2 {
+        let value = libc::getenv(c"OCERZ_PREADLOG".as_ptr());
+        PREADLOG = if value.is_null() {
+            -1
+        } else {
+            libc::strtol(value, ptr::null_mut(), 0)
+        };
+    }
+    if PREADLOG >= 0 && matches!(num, 153 | 3) && orig[2] == PREADLOG as u64 {
+        let bytes = if crate::ffi::ocerz_addr_readable(orig[1]) != 0 {
+            ocerz_g2h(orig[1]).cast::<u8>()
+        } else {
+            ptr::null()
+        };
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: PREAD[%d] cpu#%u num=%d fd=%d off=%#llx len=%llu -> r=%lld err=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x %.16s\n"
+                .as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            num,
+            orig[0] as c_int,
+            orig[3] as libc::c_ulonglong,
+            orig[2] as libc::c_ulonglong,
+            r as i64,
+            if err != 0 { r as c_int } else { 0 },
+            if bytes.is_null() { 0 } else { *bytes.add(0) as c_int },
+            if bytes.is_null() { 0 } else { *bytes.add(1) as c_int },
+            if bytes.is_null() { 0 } else { *bytes.add(2) as c_int },
+            if bytes.is_null() { 0 } else { *bytes.add(3) as c_int },
+            if bytes.is_null() { 0 } else { *bytes.add(4) as c_int },
+            if bytes.is_null() { 0 } else { *bytes.add(5) as c_int },
+            if bytes.is_null() { 0 } else { *bytes.add(6) as c_int },
+            if bytes.is_null() { 0 } else { *bytes.add(7) as c_int },
+            if bytes.is_null() {
+                c"".as_ptr()
+            } else {
+                bytes.cast::<c_char>()
+            },
+        );
+    }
+    static mut FDLOG: libc::c_long = -2;
+    if FDLOG == -2 {
+        let value = libc::getenv(c"OCERZ_FDLOG".as_ptr());
+        FDLOG = if value.is_null() {
+            -1
+        } else {
+            libc::strtol(value, ptr::null_mut(), 0)
+        };
+    }
+    if FDLOG >= 0
+        && matches!(num, 3 | 4 | 153 | 154 | 189 | 339 | 199 | 95 | 6)
+        && orig[0] as i64 >= FDLOG as i64
+        && (orig[0] as i64) < 4096
+    {
+        let size = if matches!(num, 189 | 339)
+            && err == 0
+            && crate::ffi::ocerz_addr_readable(orig[1].wrapping_add(104)) != 0
+        {
+            ocerz_ld(orig[1].wrapping_add(96), 8) as i64
+        } else {
+            -1
+        };
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: FDLOG[%d] cpu#%u %s fd=%d a1=%#llx a2=%#llx a3=%#llx -> r=%lld err=%d%s%lld\n"
+                .as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            match num {
+                3 => c"read".as_ptr(),
+                4 => c"write".as_ptr(),
+                153 => c"pread".as_ptr(),
+                154 => c"pwrite".as_ptr(),
+                189 => c"fstat".as_ptr(),
+                339 => c"fstat64".as_ptr(),
+                199 => c"lseek".as_ptr(),
+                95 => c"fsync".as_ptr(),
+                _ => c"close".as_ptr(),
+            },
+            orig[0] as c_int,
+            orig[1] as libc::c_ulonglong,
+            orig[2] as libc::c_ulonglong,
+            orig[3] as libc::c_ulonglong,
+            r as i64,
+            if err != 0 { r as c_int } else { 0 },
+            if size >= 0 {
+                c" st_size=".as_ptr()
+            } else {
+                c"".as_ptr()
+            },
+            if size >= 0 { size } else { 0 },
+        );
+    }
+    static mut KICKLOG: c_int = -1;
+    if KICKLOG < 0 {
+        KICKLOG = c_int::from(!libc::getenv(c"OCERZ_KICKLOG".as_ptr()).is_null());
+    }
+    if KICKLOG != 0 && err != 0 && r == 4 {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: KICKRET[%d] cpu#%u bsd %d -> EINTR rip=%#llx\n".as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            num,
+            (*cpu).rip as libc::c_ulonglong,
+        );
+    }
+    static mut PIPELOG: c_int = -1;
+    if PIPELOG < 0 {
+        PIPELOG = c_int::from(!libc::getenv(c"OCERZ_PIPELOG".as_ptr()).is_null());
+    }
+    if PIPELOG != 0 && matches!(num, 3 | 4 | 396 | 397) {
+        let is_write = matches!(num, 4 | 397) && orig[2] <= 8;
+        let is_read = matches!(num, 3 | 396) && orig[2] <= 512;
+        if is_write || is_read {
+            let mut stat: libc::stat = mem::zeroed();
+            if libc::fstat(orig[0] as c_int, &mut stat) == 0
+                && stat.st_mode & libc::S_IFMT == libc::S_IFIFO
+            {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: PIPE%s[%d] cpu#%u fd=%lld len=%lld -> r=%lld err=%d ic=%#llx\n"
+                        .as_ptr(),
+                    if is_write {
+                        c"WR".as_ptr()
+                    } else {
+                        c"RD".as_ptr()
+                    },
+                    libc::getpid(),
+                    (*cpu).cpu_number,
+                    orig[0] as libc::c_longlong,
+                    orig[2] as libc::c_longlong,
+                    r as libc::c_longlong,
+                    err,
+                    (*vm).insn_count as libc::c_ulonglong,
+                );
+            }
+        }
+    }
     if env_set!("OCERZ_SLOWBSD") {
         let elapsed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW).wrapping_sub(blocklog_start);
         if elapsed > 1_500_000_000 {
@@ -832,6 +1420,18 @@ pub(super) unsafe fn dispatch_bsd_at(
                 err,
             );
         }
+    }
+    if PIPELOG != 0 && num == 363 && r as i64 != 0 {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: PIPEKEV[%d] cpu#%u kq=%lld -> r=%lld err=%d ic=%#llx\n".as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            orig[0] as i64,
+            r as i64,
+            err,
+            (*vm).insn_count as libc::c_ulonglong,
+        );
     }
     if btrack {
         libc::fprintf(
@@ -873,8 +1473,9 @@ unsafe fn sys_preadv_pwritev(
     for i in 0..cnt {
         let addr = args[1].wrapping_add(i.wrapping_mul(16));
         let base = ocerz_ld(addr, 8);
-        scratch[i as usize].iov_base = if base != 0 { ocerz_g2h(base) as u64 } else { 0 };
-        scratch[i as usize].iov_len = ocerz_ld(addr.wrapping_add(8), 8);
+        let entry = scratch.as_mut_ptr().add(i as usize);
+        (*entry).iov_base = if base != 0 { ocerz_g2h(base) as u64 } else { 0 };
+        (*entry).iov_len = ocerz_ld(addr.wrapping_add(8), 8);
     }
     let mut fa = [
         args[0],
@@ -1642,12 +2243,13 @@ unsafe fn sys_msg(cpu: *mut OcerzCPU, a: *mut [u64; 8], num: c_int, is_send: boo
                 .wrapping_add(8),
             8,
         );
-        iovs[i].iov_base = if base != 0 {
+        let iov = iovs.as_mut_ptr().add(i);
+        (*iov).iov_base = if base != 0 {
             ocerz_g2h(base)
         } else {
             ptr::null_mut()
         };
-        iovs[i].iov_len = len as usize;
+        (*iov).iov_len = len as usize;
     }
     let gname = ocerz_ld(gmsg, 8);
     let gctrl = ocerz_ld(gmsg.wrapping_add(32), 8);
@@ -1769,8 +2371,9 @@ unsafe fn sys_identity_only(
     }
     let mut fa = *a;
     for i in 0..8 {
-        if mask & (1 << i) != 0 && fa[i] != 0 {
-            fa[i] = ocerz_g2h(fa[i]) as u64;
+        let arg = fa.as_mut_ptr().add(i);
+        if mask & (1 << i) != 0 && *arg != 0 {
+            *arg = ocerz_g2h(*arg) as u64;
         }
     }
     forward_with_scratch(cpu, num, &mut fa, 0);

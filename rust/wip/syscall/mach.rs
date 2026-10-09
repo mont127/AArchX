@@ -4,7 +4,7 @@
 use super::util::*;
 use super::*;
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::ptr;
 
 const VM_REGION_BASIC_INFO_64: c_int = 9;
@@ -21,6 +21,12 @@ const VM_MEMORY_IOKIT: u32 = 21;
 const CLOCK_UPTIME_RAW: libc::clockid_t = 8;
 const OCERZ_SC_UNIVERSE_MAX: usize = 16;
 const OCERZ_ALIAS_REG_MAX: usize = 4096;
+type MachPort = c_uint;
+type MachVmAddress = u64;
+type MachVmSize = u64;
+type KernReturn = c_int;
+type Natural = c_uint;
+type MachMsgTypeNumber = c_uint;
 
 #[repr(C, packed(4))]
 struct VmRegionBasicInfo64 {
@@ -122,53 +128,58 @@ static mut G_SC_UNIVERSES_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INIT
 static mut G_ALIAS_REG_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
 
 unsafe extern "C" {
-    static mach_task_self_: u32;
+    static mut mach_task_self_: MachPort;
     fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
     fn mach_vm_region(
-        task: u32,
-        address: *mut u64,
-        size: *mut u64,
+        target: MachPort,
+        address: *mut MachVmAddress,
+        size: *mut MachVmSize,
         flavor: c_int,
-        info: *mut c_int,
-        count: *mut u32,
-        object_name: *mut u32,
-    ) -> c_int;
+        info: *mut c_void,
+        info_cnt: *mut MachMsgTypeNumber,
+        object_name: *mut MachPort,
+    ) -> KernReturn;
     fn mach_vm_region_recurse(
-        task: u32,
-        address: *mut u64,
-        size: *mut u64,
-        depth: *mut u32,
-        info: *mut c_int,
-        count: *mut u32,
-    ) -> c_int;
+        target: MachPort,
+        address: *mut MachVmAddress,
+        size: *mut MachVmSize,
+        nesting_depth: *mut Natural,
+        info: *mut c_void,
+        info_cnt: *mut MachMsgTypeNumber,
+    ) -> KernReturn;
+    fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
     fn mach_vm_remap(
-        target_task: u32,
-        target_address: *mut u64,
-        size: u64,
-        mask: u64,
+        target_task: MachPort,
+        target_address: *mut MachVmAddress,
+        size: MachVmSize,
+        mask: MachVmAddress,
         flags: c_int,
-        source_task: u32,
-        source_address: u64,
+        source_task: MachPort,
+        source_address: MachVmAddress,
         copy: c_int,
         cur_protection: *mut c_int,
         max_protection: *mut c_int,
         inheritance: c_int,
-    ) -> c_int;
-    fn mach_vm_deallocate(task: u32, address: u64, size: u64) -> c_int;
-    fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: c_int) -> c_int;
+    ) -> KernReturn;
+    fn mach_vm_deallocate(task: MachPort, address: MachVmAddress, size: MachVmSize) -> KernReturn;
+    fn mach_vm_allocate(
+        task: MachPort,
+        address: *mut MachVmAddress,
+        size: MachVmSize,
+        flags: c_int,
+    ) -> KernReturn;
     fn mach_vm_protect(
-        task: u32,
-        address: u64,
-        size: u64,
+        task: MachPort,
+        address: MachVmAddress,
+        size: MachVmSize,
         set_maximum: c_int,
         protection: c_int,
-    ) -> c_int;
-    fn mach_port_deallocate(task: u32, name: u32) -> c_int;
-    fn mach_port_type(task: u32, name: u32, port_type: *mut u32) -> c_int;
+    ) -> KernReturn;
+    fn mach_port_type(task: MachPort, name: MachPort, port_type: *mut MachPort) -> KernReturn;
 }
 
 #[inline(always)]
-unsafe fn mach_task_self() -> u32 {
+unsafe fn mach_task_self() -> MachPort {
     mach_task_self_
 }
 
@@ -379,7 +390,7 @@ unsafe fn alias_page_ours(page: u64) -> bool {
 
 unsafe fn alias_page_taken(page: u64) -> bool {
     let mut at = page;
-    while at < page + 0x4000 {
+    while at < page.wrapping_add(0x4000) {
         if crate::ffi::ocerz_addr_prot(at) > 0 {
             return !alias_page_ours(page);
         }
@@ -424,22 +435,49 @@ unsafe fn alias_raw_region(vm: *mut OcerzVM, pointer: u64, refresh: bool) -> c_i
     }
     if NO_ALIAS_CLIP == 0 {
         let mut lo = pointer & !0x3fff;
-        let mut hi = lo + 0x4000;
+        let mut hi = lo.wrapping_add(0x4000);
         let rlo = region;
         let rhi = region.wrapping_add(size);
         let win = 0x1000_0000u64;
         if alias_page_taken(lo) {
+            if env_set!("OCERZ_MIGTRACE") {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: ALIASCLIP[%d] pointer=%#llx page taken readable=%d\n".as_ptr(),
+                    libc::getpid(),
+                    pointer as libc::c_ulonglong,
+                    crate::ffi::ocerz_addr_readable(pointer),
+                );
+            }
             return if crate::ffi::ocerz_addr_readable(pointer) != 0 {
                 0
             } else {
                 -1
             };
         }
-        while lo > rlo && pointer - (lo - 0x4000) <= win && !alias_page_taken(lo - 0x4000) {
-            lo -= 0x4000;
+        while lo > rlo
+            && pointer.wrapping_sub(lo.wrapping_sub(0x4000)) <= win
+            && !alias_page_taken(lo.wrapping_sub(0x4000))
+        {
+            lo = lo.wrapping_sub(0x4000);
         }
-        while hi < rhi && hi + 0x4000 - pointer <= win && !alias_page_taken(hi) {
-            hi += 0x4000;
+        while hi < rhi
+            && hi.wrapping_add(0x4000).wrapping_sub(pointer) <= win
+            && !alias_page_taken(hi)
+        {
+            hi = hi.wrapping_add(0x4000);
+        }
+        if env_set!("OCERZ_MIGTRACE") {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: ALIASCLIP[%d] pointer=%#llx region=%#llx+%#llx -> %#llx..%#llx\n".as_ptr(),
+                libc::getpid(),
+                pointer as libc::c_ulonglong,
+                rlo as libc::c_ulonglong,
+                rhi.wrapping_sub(rlo) as libc::c_ulonglong,
+                lo as libc::c_ulonglong,
+                hi as libc::c_ulonglong,
+            );
         }
         region = if lo > rlo { lo } else { rlo };
         size = (if hi < rhi { hi } else { rhi }).wrapping_sub(region);
@@ -490,6 +528,18 @@ unsafe fn alias_raw_region(vm: *mut OcerzVM, pointer: u64, refresh: bool) -> c_i
         alias_reg_add(guest, guest.wrapping_add(size), object);
     }
     crate::ffi::ocerz_low_fill_host_holes();
+    if env_set!("OCERZ_MIGTRACE") {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: SCALIAS pointer=%#llx raw=%#llx size=%#llx shadow=%#llx prot=%d/%d\n".as_ptr(),
+            pointer as libc::c_ulonglong,
+            region as libc::c_ulonglong,
+            size as libc::c_ulonglong,
+            host_dst as libc::c_ulonglong,
+            current,
+            maximum,
+        );
+    }
     0
 }
 
@@ -578,6 +628,16 @@ unsafe fn guest_vm_allocate_apply(vm: *mut OcerzVM, addrp: u64, size: u64, flags
                         libc::PROT_READ | libc::PROT_WRITE,
                     ) != crate::ffi::OCERZ_OK as c_int))
         {
+            if !vm.is_null() && (*vm).strace != 0 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: mach_vm_allocate FIXED denied want=%#llx size=%#llx flags=%#llx\n"
+                        .as_ptr(),
+                    want as libc::c_ulonglong,
+                    size as libc::c_ulonglong,
+                    flags as libc::c_ulonglong,
+                );
+            }
             return OCERZ_MACH_KERN_NO_SPACE;
         }
         return OCERZ_MACH_KERN_SUCCESS;
@@ -676,7 +736,7 @@ unsafe fn mig_vm_refuse_taken(reply: u64, size: u64) {
     if OFF < 0 {
         OFF = (!libc::getenv(c"OCERZ_NO_VMMAP_TAKEN".as_ptr()).is_null()) as c_int;
     }
-    let host = ocerz_ld(reply + 0x24, 8);
+    let host = ocerz_ld(reply.wrapping_add(0x24), 8);
     if OFF != 0
         || crate::ffi::ocerz_low_base == 0
         || size == 0
@@ -686,14 +746,18 @@ unsafe fn mig_vm_refuse_taken(reply: u64, size: u64) {
         return;
     }
     let mut page = host & !((crate::ffi::OCERZ_GUEST_PAGE_SIZE as u64) - 1);
-    while page < host + size {
+    while page < host.wrapping_add(size) {
         if crate::ffi::ocerz_addr_committed(page) == 1 {
             mach_vm_deallocate(mach_task_self(), host, size);
-            ocerz_st(reply + 0x20, 4, OCERZ_MACH_KERN_NO_SPACE as u32 as u64);
-            ocerz_st(reply + 0x24, 8, 0);
+            ocerz_st(
+                reply.wrapping_add(0x20),
+                4,
+                OCERZ_MACH_KERN_NO_SPACE as u32 as u64,
+            );
+            ocerz_st(reply.wrapping_add(0x24), 8, 0);
             return;
         }
-        page += crate::ffi::OCERZ_GUEST_PAGE_SIZE as u64;
+        page = page.wrapping_add(crate::ffi::OCERZ_GUEST_PAGE_SIZE as u64);
     }
 }
 
@@ -704,7 +768,7 @@ unsafe fn mig_vm_reply_relocate(
     requested_size: u64,
     alignment: u64,
 ) {
-    let host = ocerz_ld(reply + 0x24, 8);
+    let host = ocerz_ld(reply.wrapping_add(0x24), 8);
     if host == 0
         || (host >= crate::ffi::ocerz_arena_lo && host < crate::ffi::ocerz_arena_hi)
         || crate::ffi::ocerz_cache_region(host as usize) != 0
@@ -741,6 +805,7 @@ unsafe fn mig_vm_reply_relocate(
         return;
     }
     let mut region_end = region.wrapping_add(region_size);
+    let mut regions = 1;
     if requested_size == 0 {
         for _ in 0..4096 {
             let mut next = region_end;
@@ -768,6 +833,7 @@ unsafe fn mig_vm_reply_relocate(
                 mach_port_deallocate(mach_task_self(), next_object);
             }
             region_end = region_end.wrapping_add(next_size);
+            regions += 1;
         }
     }
     let size = if requested_size != 0 {
@@ -840,7 +906,62 @@ unsafe fn mig_vm_reply_relocate(
     if !keep {
         mach_vm_deallocate(mach_task_self(), host, size);
     }
-    ocerz_st(reply + 0x24, 8, guest);
+    ocerz_st(reply.wrapping_add(0x24), 8, guest);
+    if env_set!("OCERZ_MIGTRACE") {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: MIGMOVE id=%u host=%#llx size=%#llx guest=%#llx host_dst=%#llx prot=%d/%d\n"
+                .as_ptr(),
+            ocerz_ld(reply.wrapping_add(0x14), 4) as u32,
+            host as libc::c_ulonglong,
+            size as libc::c_ulonglong,
+            guest as libc::c_ulonglong,
+            host_dst as libc::c_ulonglong,
+            current,
+            maximum,
+        );
+        let scan_size = size.min(0x20_0000);
+        let mut found = 0;
+        let mut offset = 0u64;
+        while offset.wrapping_add(8) <= scan_size && found < 32 {
+            let value = ocerz_ld(guest.wrapping_add(offset), 8);
+            if value >= host && value < host.wrapping_add(size) {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: MIGSELF id=%u off=%#llx value=%#llx delta=%#llx\n".as_ptr(),
+                    ocerz_ld(reply.wrapping_add(0x14), 4) as u32,
+                    offset as libc::c_ulonglong,
+                    value as libc::c_ulonglong,
+                    value.wrapping_sub(host) as libc::c_ulonglong,
+                );
+                found += 1;
+            }
+            offset += 8;
+        }
+    }
+    if env_set!("OCERZ_MACHMSG") {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: MIGRELOC id=%u haddr=%#llx raddr=%#llx first_rsize=%#llx coalesced_size=%#llx nregions=%d prot=%d\n"
+                .as_ptr(),
+            ocerz_ld(reply.wrapping_add(0x14), 4) as u32,
+            host as libc::c_ulonglong,
+            guest as libc::c_ulonglong,
+            region_size as libc::c_ulonglong,
+            size as libc::c_ulonglong,
+            regions,
+            info.protection,
+        );
+    }
+    if (*vm).strace != 0 {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: mig_vm relocate host=%#llx size=%#llx -> guest=%#llx\n".as_ptr(),
+            host as libc::c_ulonglong,
+            size as libc::c_ulonglong,
+            guest as libc::c_ulonglong,
+        );
+    }
 }
 
 unsafe fn ocerz_reply_relocate_ool(reply: u64, recv_size: u32, trap: c_int) {
@@ -848,20 +969,29 @@ unsafe fn ocerz_reply_relocate_ool(reply: u64, recv_size: u32, trap: c_int) {
     if bits & 0x8000_0000 == 0 {
         return;
     }
-    let mut size = ocerz_ld(reply + 4, 4) as u32;
+    let mut size = ocerz_ld(reply.wrapping_add(4), 4) as u32;
     if recv_size != 0 && recv_size < size {
         size = recv_size;
     }
-    let count = ocerz_ld(reply + 0x18, 4) as u32;
+    let count = ocerz_ld(reply.wrapping_add(0x18), 4) as u32;
     if count == 0 || count > 4096 {
         return;
     }
+    static mut MACHMSG_LOG: c_int = -1;
+    static mut OOLTRACE: c_int = -1;
+    if MACHMSG_LOG < 0 {
+        MACHMSG_LOG = c_int::from(!libc::getenv(c"OCERZ_MACHMSG".as_ptr()).is_null());
+    }
+    if OOLTRACE < 0 {
+        OOLTRACE = c_int::from(!libc::getenv(c"OCERZ_OOLTRACE".as_ptr()).is_null());
+    }
+    let reply_id = ocerz_ld(reply.wrapping_add(0x14), 4) as u32;
     let mut off = 0x1c;
     for _ in 0..count {
         if off + 12 > size as u64 {
             break;
         }
-        let ty = ocerz_ld(reply + off + 11, 1) as u8;
+        let ty = ocerz_ld(reply.wrapping_add(off).wrapping_add(11), 1) as u8;
         if ty == 0 {
             off += 12;
             continue;
@@ -874,8 +1004,14 @@ unsafe fn ocerz_reply_relocate_ool(reply: u64, recv_size: u32, trap: c_int) {
             if off + 16 > size as u64 {
                 break;
             }
-            let address = ocerz_ld(reply + off, 8);
-            let count = ocerz_ld(reply + off + 12, 4) as u32;
+            let address = ocerz_ld(reply.wrapping_add(off), 8);
+            let count = ocerz_ld(reply.wrapping_add(off).wrapping_add(12), 4) as u32;
+            let mut descriptor: MachMsgDescriptor = core::mem::zeroed();
+            ptr::copy_nonoverlapping(
+                ocerz_g2h(reply.wrapping_add(off)).cast::<u8>(),
+                (&mut descriptor as *mut MachMsgDescriptor).cast::<u8>(),
+                core::mem::size_of::<MachMsgDescriptor>(),
+            );
             let bytes = if ty == 2 {
                 count as u64 * 4
             } else {
@@ -884,6 +1020,19 @@ unsafe fn ocerz_reply_relocate_ool(reply: u64, recv_size: u32, trap: c_int) {
             let host_owned = address != 0
                 && !ocerz_host_in_guest_reservation(address as *const c_void)
                 && crate::ffi::ocerz_cache_region(address as usize) == 0;
+            if MACHMSG_LOG != 0 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: REPLY-OOL(t%d)[%d] type=%u ool_addr=%#llx bytes=%#llx host=%d\n"
+                        .as_ptr(),
+                    trap,
+                    libc::getpid(),
+                    ty as c_uint,
+                    address as libc::c_ulonglong,
+                    bytes as libc::c_ulonglong,
+                    host_owned as c_int,
+                );
+            }
             if host_owned && bytes != 0 {
                 let alloc = if bytes <= 64 * 1024 * 1024 {
                     crate::ffi::ocerz_map_anywhere(
@@ -899,17 +1048,25 @@ unsafe fn ocerz_reply_relocate_ool(reply: u64, recv_size: u32, trap: c_int) {
                         ocerz_g2h(alloc).cast::<u8>(),
                         bytes as usize,
                     );
-                    ocerz_st(reply + off, 8, alloc);
+                    ocerz_st(reply.wrapping_add(off), 8, alloc);
+                    if OOLTRACE != 0 {
+                        libc::fprintf(
+                            crate::log::stderr(),
+                            c"ocerz: OOLTRACE-COPY(t%d)[%d] id=%u type=%u gb=%#llx..%#llx bytes=%#llx\n"
+                                .as_ptr(),
+                            trap,
+                            libc::getpid(),
+                            reply_id,
+                            ty as c_uint,
+                            alloc as libc::c_ulonglong,
+                            alloc.wrapping_add(bytes) as libc::c_ulonglong,
+                            bytes as libc::c_ulonglong,
+                        );
+                    }
                 } else {
-                    ocerz_st(reply + off, 8, 0);
-                    ocerz_st(reply + off + 12, 4, 0);
+                    ocerz_st(reply.wrapping_add(off), 8, 0);
+                    ocerz_st(reply.wrapping_add(off).wrapping_add(12), 4, 0);
                 }
-                let mut descriptor: MachMsgDescriptor = core::mem::zeroed();
-                ptr::copy_nonoverlapping(
-                    ocerz_g2h(reply + off).cast::<u8>(),
-                    (&mut descriptor as *mut MachMsgDescriptor).cast::<u8>(),
-                    core::mem::size_of::<MachMsgDescriptor>(),
-                );
                 super::machmsg::ocerz_release_received_ool(
                     &descriptor,
                     ty,
@@ -921,6 +1078,18 @@ unsafe fn ocerz_reply_relocate_ool(reply: u64, recv_size: u32, trap: c_int) {
             off += 16;
             continue;
         }
+        if OOLTRACE != 0 {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: OOLTRACE-BREAK(t%d)[%d] id=%u off=%#llx type=%u (remaining desc left raw)\n"
+                    .as_ptr(),
+                trap,
+                libc::getpid(),
+                reply_id,
+                off as libc::c_ulonglong,
+                ocerz_ld(reply.wrapping_add(off).wrapping_add(11), 1) as u8 as c_uint,
+            );
+        }
         let _ = trap;
         break;
     }
@@ -930,23 +1099,27 @@ unsafe fn ocerz_reply_alias_iokit(vm: *mut OcerzVM, reply: u64, recv_size: u32) 
     if crate::ffi::ocerz_low_base == 0 || reply == 0 {
         return;
     }
-    let id = ocerz_ld(reply + 0x14, 4) as u32;
+    let id = ocerz_ld(reply.wrapping_add(0x14), 4) as u32;
     if !(2900..=2999).contains(&id) {
         return;
     }
-    let mut size = ocerz_ld(reply + 4, 4) as u32;
+    let mut size = ocerz_ld(reply.wrapping_add(4), 4) as u32;
     if recv_size != 0 && size > recv_size {
         size = recv_size;
     }
     size = size.min(0x200);
     let mut tries = 0;
     static mut INNER: c_int = -1;
+    static mut MACHLEAK: c_int = -1;
+    if MACHLEAK < 0 {
+        MACHLEAK = c_int::from(!libc::getenv(c"OCERZ_MACHLEAK".as_ptr()).is_null());
+    }
     if INNER < 0 {
         INNER = libc::getenv(c"OCERZ_NO_IOKIT_INNER_PTR".as_ptr()).is_null() as c_int;
     }
     let mut off = 0x20;
     while off + 8 <= size as u64 && tries < 8 {
-        let pointer = ocerz_ld(reply + off, 8);
+        let pointer = ocerz_ld(reply.wrapping_add(off), 8);
         if pointer < 0x1000000 || pointer >= crate::ffi::OCERZ_LOW_LIMIT {
             off += 4;
             continue;
@@ -963,18 +1136,73 @@ unsafe fn ocerz_reply_alias_iokit(vm: *mut OcerzVM, reply: u64, recv_size: u32) 
                 continue;
             }
             if guest_protection > 0 && !alias_page_ours(guest_page) {
+                if env_set!("OCERZ_MIGTRACE") {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: IOKIT-COLLIDE[%d] id=%u off=%#llx pointer=%#llx: the guest has its own memory there\n"
+                            .as_ptr(),
+                        libc::getpid(),
+                        id,
+                        off as libc::c_ulonglong,
+                        pointer as libc::c_ulonglong,
+                    );
+                }
                 off += 4;
                 continue;
             }
         }
         let slot_prot = crate::ffi::ocerz_addr_prot(pointer);
+        if MACHLEAK != 0 {
+            let mut raw = pointer;
+            let mut raw_size = 0u64;
+            let mut raw_info: VmRegionBasicInfo64 = core::mem::zeroed();
+            let mut raw_count = (core::mem::size_of::<VmRegionBasicInfo64>() / 4) as u32;
+            let mut raw_object = 0u32;
+            let raw_kr = mach_vm_region(
+                mach_task_self_,
+                &mut raw,
+                &mut raw_size,
+                VM_REGION_BASIC_INFO_64,
+                (&mut raw_info as *mut VmRegionBasicInfo64).cast(),
+                &mut raw_count,
+                &mut raw_object,
+            );
+            if raw_object != 0 {
+                mach_port_deallocate(mach_task_self_, raw_object);
+            }
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: IOKIT-CANDIDATE[%d] id=%u off=%#llx addr=%#llx slot_prot=%d raw_kr=%d raw=%#llx+%#llx raw_prot=%d\n"
+                    .as_ptr(),
+                libc::getpid(),
+                id,
+                off as libc::c_ulonglong,
+                pointer as libc::c_ulonglong,
+                slot_prot,
+                raw_kr,
+                raw as libc::c_ulonglong,
+                raw_size as libc::c_ulonglong,
+                if raw_kr == 0 { raw_info.protection } else { -1 },
+            );
+        }
         if slot_prot >= 0 && slot_prot & libc::PROT_READ != 0 {
             alias_refresh_if_stale(vm, pointer);
             off += 4;
             continue;
         }
         tries += 1;
-        alias_raw_region(vm, pointer, false);
+        let rc = alias_raw_region(vm, pointer, false);
+        if MACHLEAK != 0 {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: IOKIT-ALIAS[%d] id=%u off=%#llx addr=%#llx rc=%d\n".as_ptr(),
+                libc::getpid(),
+                id,
+                off as libc::c_ulonglong,
+                pointer as libc::c_ulonglong,
+                rc,
+            );
+        }
         off += 4;
     }
 }
@@ -1005,7 +1233,7 @@ unsafe fn alias_refresh_if_stale(vm: *mut OcerzVM, pointer: u64) -> c_int {
         hs
     };
     let end = if he - pointer > win {
-        pointer + win
+        pointer.wrapping_add(win)
     } else {
         he
     };
@@ -1017,13 +1245,27 @@ unsafe fn alias_refresh_if_stale(vm: *mut OcerzVM, pointer: u64) -> c_int {
         let mut se = 0;
         let mut sobj = 0;
         let mut sprot = 0;
-        if !host_region_entry(at + delta, &mut ss, &mut se, &mut sobj, &mut sprot) || se <= delta {
+        let translated_at = at.wrapping_add(delta);
+        if !host_region_entry(translated_at, &mut ss, &mut se, &mut sobj, &mut sprot) || se <= delta
+        {
             break;
         }
-        if ss <= at + delta && sobj != hobj && alias_reg_find(at, sobj, false) {
+        if ss <= translated_at && sobj != hobj && alias_reg_find(at, sobj, false) {
+            if env_set!("OCERZ_MIGTRACE") {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: ALIAS-STALE[%d] pointer=%#llx at %#llx alias shows object %#x, host %#x\n"
+                        .as_ptr(),
+                    libc::getpid(),
+                    pointer as libc::c_ulonglong,
+                    at as libc::c_ulonglong,
+                    sobj,
+                    hobj,
+                );
+            }
             return alias_raw_region(vm, pointer, true);
         }
-        at = if ss > at + delta {
+        at = if ss > translated_at {
             ss - delta
         } else {
             se - delta
@@ -1090,6 +1332,7 @@ unsafe fn thread_act_emulate(cpu: *mut OcerzCPU, buf: u64, id: u32, recv_size: u
     let port = ocerz_ld(buf + 8, 4) as u32;
     let reply_port = ocerz_ld(buf + 12, 4) as u32;
     let mut state = [0u32; 44];
+    let state_ptr = state.as_mut_ptr();
     let mut count = 0u32;
     let kr;
     if id == 3605 {
@@ -1132,13 +1375,13 @@ unsafe fn thread_act_emulate(cpu: *mut OcerzCPU, buf: u64, id: u32, recv_size: u
         ];
         let mut at = 0;
         if flavor == 7 {
-            state[0] = 4;
-            state[1] = 42;
+            *state_ptr = 4;
+            *state_ptr.add(1) = 42;
             at = 2;
         }
         for (i, value) in values.iter().enumerate() {
-            state[at + i * 2] = *value as u32;
-            state[at + i * 2 + 1] = (*value >> 32) as u32;
+            *state_ptr.add(at + i * 2) = *value as u32;
+            *state_ptr.add(at + i * 2 + 1) = (*value >> 32) as u32;
         }
         count = (at + 42) as u32;
         kr = if want < count {
@@ -1166,7 +1409,11 @@ unsafe fn thread_act_emulate(cpu: *mut OcerzCPU, buf: u64, id: u32, recv_size: u
     if size > 36 {
         ocerz_st(buf + 36, 4, count as u64);
         for i in 0..count {
-            ocerz_st(buf + 40 + 4 * i as u64, 4, state[i as usize] as u64);
+            ocerz_st(
+                buf + 40 + 4 * i as u64,
+                4,
+                *state_ptr.add(i as usize) as u64,
+            );
         }
     }
     ocerz_st(buf + size as u64, 4, 0);
@@ -1179,10 +1426,10 @@ unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     let gmsg = a[0];
     let vm_region_req = if gmsg != 0
         && a[1] & 1 != 0
-        && ocerz_ld(gmsg + 4, 4) as u32 >= 0x28
-        && matches!(ocerz_ld(gmsg + 0x14, 4) as u32, 4815 | 4816)
+        && ocerz_ld(gmsg.wrapping_add(4), 4) as u32 >= 0x28
+        && matches!(ocerz_ld(gmsg.wrapping_add(0x14), 4) as u32, 4815 | 4816)
     {
-        ocerz_ld(gmsg + 0x20, 8)
+        ocerz_ld(gmsg.wrapping_add(0x20), 8)
     } else {
         u64::MAX
     };
@@ -1191,7 +1438,7 @@ unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     if gmsg != 0 {
         nsaves = super::machmsg::ocerz_send_xlate_descriptors(
             gmsg,
-            ocerz_ld(gmsg + 4, 4) as u32,
+            ocerz_ld(gmsg.wrapping_add(4), 4) as u32,
             saves.as_mut_ptr(),
             saves.len() as c_int,
         );
@@ -1199,13 +1446,17 @@ unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     let mut tc: super::machmsg::TcPolicySave = core::mem::zeroed();
     let get_tc = if gmsg != 0 && a[1] & 1 != 0 {
         let get = super::machmsg::tc_policy_get_request(gmsg);
-        super::machmsg::tc_policy_send(gmsg, ocerz_ld(gmsg + 4, 4) as u32, &mut tc);
+        super::machmsg::tc_policy_send(gmsg, ocerz_ld(gmsg.wrapping_add(4), 4) as u32, &mut tc);
         get
     } else {
         0
     };
     if gmsg != 0 {
-        ocerz_vmmsg_trace(c"REQ".as_ptr(), gmsg, ocerz_ld(gmsg + 4, 4) as u32);
+        ocerz_vmmsg_trace(
+            c"REQ".as_ptr(),
+            gmsg,
+            ocerz_ld(gmsg.wrapping_add(4), 4) as u32,
+        );
     }
     if gmsg != 0 && a[1] & 2 != 0 {
         super::bsd::disarm_guest_buffer(cpu, gmsg, a[3] as u32 as u64);
@@ -1217,6 +1468,11 @@ unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     let result = super::raw::ocerz_host_mach_trap(31, a);
     (*cpu).block_since_ns = 0;
+    static mut NO_RCV_TIMEOUT_KICK_31: c_int = -1;
+    if NO_RCV_TIMEOUT_KICK_31 < 0 {
+        NO_RCV_TIMEOUT_KICK_31 =
+            c_int::from(!libc::getenv(c"OCERZ_NO_RCV_TIMEOUT_KICK".as_ptr()).is_null());
+    }
     if nsaves != 0 {
         super::machmsg::ocerz_send_restore_descriptors(gmsg, saves.as_ptr(), nsaves);
     }
@@ -1230,6 +1486,16 @@ unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
         if get_tc != 0 {
             super::machmsg::tc_policy_get_reply(gmsg, recv_size);
         }
+        let mut scan_size = ocerz_ld(gmsg.wrapping_add(4), 4) as u32 as u64;
+        if a[3] != 0 && scan_size > a[3] as u32 as u64 {
+            scan_size = a[3] as u32 as u64;
+        }
+        super::hostwq::ocerz_shadow_scan(
+            c"msg31".as_ptr(),
+            ocerz_ld(gmsg.wrapping_add(0x14), 4) as u32 as u64,
+            gmsg,
+            scan_size,
+        );
     }
     if gmsg != 0 && super::machmsg::ocerz_mach_err_interesting(result) != 0 {
         super::machmsg::ocerz_log_mach_send_err(31, result, a, gmsg, cpu);
@@ -1249,45 +1515,49 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     } else {
         reply_buf
     };
-    let thread_info_flavor =
-        if request_buf != 0 && msgh_id == 3612 && ocerz_ld(request_buf + 4, 4) as u32 >= 0x24 {
-            ocerz_ld(request_buf + 0x20, 4) as u32
-        } else {
-            0
-        };
+    let thread_info_flavor = if request_buf != 0
+        && msgh_id == 3612
+        && ocerz_ld(request_buf.wrapping_add(4), 4) as u32 >= 0x24
+    {
+        ocerz_ld(request_buf.wrapping_add(0x20), 4) as u32
+    } else {
+        0
+    };
     let sc_map_request = msgh_id == 10052;
     let mut sc_uid = 0u32;
     let mut sc_segment = 0u32;
     let mut vm_result_size = 0u64;
     let mut vm_result_alignment = 0u64;
     if request_buf != 0 && msgh_id == 10054 {
-        sc_uid = ocerz_ld(request_buf + 0x30, 4) as u32;
+        sc_uid = ocerz_ld(request_buf.wrapping_add(0x30), 4) as u32;
     } else if request_buf != 0 && sc_map_request {
-        sc_uid = ocerz_ld(request_buf + 0x20, 4) as u32;
-        sc_segment = ocerz_ld(request_buf + 0x24, 4) as u32;
+        sc_uid = ocerz_ld(request_buf.wrapping_add(0x20), 4) as u32;
+        sc_segment = ocerz_ld(request_buf.wrapping_add(0x24), 4) as u32;
     }
     if request_buf != 0 && msgh_id == 4800 {
-        vm_result_size = ocerz_ld(request_buf + 0x28, 8);
+        vm_result_size = ocerz_ld(request_buf.wrapping_add(0x28), 8);
     } else if request_buf != 0 && matches!(msgh_id, 4811 | 4813) {
-        vm_result_size = ocerz_ld(request_buf + 0x38, 8);
+        vm_result_size = ocerz_ld(request_buf.wrapping_add(0x38), 8);
     }
     let vm_fixed_keep = request_buf != 0
         && msgh_id == 4811
-        && (ocerz_ld(request_buf + 0x48, 4) as u32) & (VM_FLAGS_ANYWHERE | VM_FLAGS_OVERWRITE) == 0;
+        && (ocerz_ld(request_buf.wrapping_add(0x48), 4) as u32)
+            & (VM_FLAGS_ANYWHERE | VM_FLAGS_OVERWRITE)
+            == 0;
     if request_buf != 0
         && msgh_id == 4811
-        && (ocerz_ld(request_buf + 0x48, 4) as u32) & VM_FLAGS_ANYWHERE != 0
+        && (ocerz_ld(request_buf.wrapping_add(0x48), 4) as u32) & VM_FLAGS_ANYWHERE != 0
     {
-        let mask = ocerz_ld(request_buf + 0x40, 8);
+        let mask = ocerz_ld(request_buf.wrapping_add(0x40), 8);
         if mask != 0 && mask < 1u64 << 37 && mask & mask.wrapping_add(1) == 0 {
-            vm_result_alignment = mask + 1;
+            vm_result_alignment = mask.wrapping_add(1);
         }
     }
     let vm_region_req = if request_buf != 0
         && matches!(msgh_id, 4815 | 4816)
-        && ocerz_ld(request_buf + 4, 4) as u32 >= 0x28
+        && ocerz_ld(request_buf.wrapping_add(4), 4) as u32 >= 0x28
     {
-        ocerz_ld(request_buf + 0x20, 8)
+        ocerz_ld(request_buf.wrapping_add(0x20), 8)
     } else {
         u64::MAX
     };
@@ -1295,8 +1565,8 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
         if vector_mode {
             super::bsd::disarm_guest_buffer(
                 cpu,
-                ocerz_ld(reply_buf + 8, 8),
-                ocerz_ld(reply_buf + 20, 4) as u32 as u64,
+                ocerz_ld(reply_buf.wrapping_add(8), 8),
+                ocerz_ld(reply_buf.wrapping_add(20), 4) as u32 as u64,
             );
         } else {
             super::bsd::disarm_guest_buffer(cpu, reply_buf, a[6] as u32 as u64);
@@ -1340,6 +1610,222 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     if request_buf != 0 {
         ocerz_vmmsg_trace(c"REQ".as_ptr(), request_buf, (a[2] >> 32) as u32);
     }
+    static mut IOKITERR: c_int = -1;
+    static mut IOKITSEL: c_int = -2;
+    if IOKITERR < 0 {
+        IOKITERR = c_int::from(!libc::getenv(c"OCERZ_IOKITERR".as_ptr()).is_null());
+    }
+    if IOKITSEL == -2 {
+        let selector = libc::getenv(c"OCERZ_IOKITSEL".as_ptr());
+        IOKITSEL = if selector.is_null() {
+            -1
+        } else if libc::strcmp(selector, c"all".as_ptr()) == 0 {
+            c_int::MAX
+        } else {
+            libc::atoi(selector)
+        };
+    }
+    let mut ioreq = [0u8; 0x208];
+    let mut ioreq_n = 0u32;
+    if (IOKITERR != 0 || IOKITSEL >= 0)
+        && request_buf != 0
+        && a[1] & 1 != 0
+        && ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32 == 2865
+    {
+        ioreq_n = ((a[2] >> 32) as u32).min(0x200);
+        for offset in (0..ioreq_n as usize).step_by(8) {
+            let value = if crate::ffi::ocerz_addr_readable(
+                request_buf.wrapping_add(offset as u64).wrapping_add(7),
+            ) != 0
+            {
+                ocerz_ld(request_buf.wrapping_add(offset as u64), 8)
+            } else {
+                0
+            };
+            ptr::copy_nonoverlapping(
+                (&value as *const u64).cast::<u8>(),
+                ioreq.as_mut_ptr().add(offset),
+                (ioreq_n as usize - offset).min(8),
+            );
+        }
+    }
+    static mut MSGNEEDLE: u64 = 0;
+    static mut MSGNEEDLE_INIT: c_int = 0;
+    if MSGNEEDLE_INIT == 0 {
+        let needle = libc::getenv(c"OCERZ_MSGNEEDLE".as_ptr());
+        MSGNEEDLE = if needle.is_null() {
+            0
+        } else {
+            libc::strtoull(needle, ptr::null_mut(), 0)
+        };
+        MSGNEEDLE_INIT = 1;
+    }
+    if MSGNEEDLE != 0 && request_buf != 0 && a[1] & 1 != 0 {
+        let size = ((a[2] >> 32) as u32).min(0x10000);
+        for offset in (0..size.saturating_sub(7)).step_by(4) {
+            if crate::ffi::ocerz_addr_readable(request_buf.wrapping_add(offset as u64)) == 0
+                || crate::ffi::ocerz_addr_readable(
+                    request_buf.wrapping_add(offset as u64).wrapping_add(7),
+                ) == 0
+            {
+                break;
+            }
+            if ocerz_ld(request_buf.wrapping_add(offset as u64), 8) != MSGNEEDLE {
+                continue;
+            }
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: MSGNEEDLE[%d] id=%u size=%#x off=%#x bits=%#x rport=%#x near:".as_ptr(),
+                libc::getpid(),
+                ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32,
+                size,
+                offset,
+                ocerz_ld(request_buf, 4) as u32,
+                ocerz_ld(request_buf.wrapping_add(8), 4) as u32,
+            );
+            for neighbor in -4i64..6 {
+                let at = if neighbor < 0 {
+                    request_buf
+                        .wrapping_add(offset as u64)
+                        .wrapping_sub(neighbor.unsigned_abs() * 8)
+                } else {
+                    request_buf
+                        .wrapping_add(offset as u64)
+                        .wrapping_add(neighbor as u64 * 8)
+                };
+                if at >= request_buf
+                    && crate::ffi::ocerz_addr_readable(at) != 0
+                    && crate::ffi::ocerz_addr_readable(at.wrapping_add(7)) != 0
+                {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c" %s%#llx".as_ptr(),
+                        if neighbor == 0 {
+                            c"*".as_ptr()
+                        } else {
+                            c"".as_ptr()
+                        },
+                        ocerz_ld(at, 8) as libc::c_ulonglong,
+                    );
+                }
+            }
+            libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+            if ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32 == 2865
+                && ocerz_ld(request_buf, 4) as u32 & 0x8000_0000 == 0
+            {
+                let selector = ocerz_ld(request_buf.wrapping_add(0x20), 4) as u32;
+                let scalars = ocerz_ld(request_buf.wrapping_add(0x24), 4) as u32;
+                let inband = request_buf
+                    .wrapping_add(0x28)
+                    .wrapping_add(8u64.wrapping_mul(scalars as u64));
+                let inband_size = ocerz_ld(inband, 4) as u32;
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: MSGNEEDLE-IOKIT[%d] selector=%u scalars=%u inband=%u needle-at-inband+%#llx\n"
+                        .as_ptr(),
+                    libc::getpid(),
+                    selector,
+                    scalars,
+                    inband_size,
+                    request_buf
+                        .wrapping_add(offset as u64)
+                        .wrapping_sub(inband.wrapping_add(4))
+                        as libc::c_ulonglong,
+                );
+            }
+        }
+    }
+    static mut IOKITMIGQ: c_int = -1;
+    if IOKITMIGQ < 0 {
+        let value = libc::getenv(c"OCERZ_IOKITMIG".as_ptr());
+        IOKITMIGQ = if value.is_null() {
+            0
+        } else {
+            libc::atoi(value)
+        };
+    }
+    if IOKITMIGQ >= 2 && request_buf != 0 {
+        let qid = ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32;
+        if (2800..2900).contains(&qid) {
+            let bits = ocerz_ld(request_buf, 4) as u32;
+            let size = ocerz_ld(request_buf.wrapping_add(4), 4) as u32;
+            let descriptors = if bits & 0x8000_0000 != 0 {
+                ocerz_ld(request_buf.wrapping_add(0x18), 4) as u32
+            } else {
+                0
+            };
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: IOKITREQ[%d] id=%u dest=%#x bits=%#x size=%#x dcnt=%u opts=%#llx\n"
+                    .as_ptr(),
+                libc::getpid(),
+                qid,
+                a[3] as u32,
+                bits,
+                size,
+                descriptors,
+                a[1] as libc::c_ulonglong,
+            );
+            let mut offset = 0x1cu64;
+            for index in 0..descriptors.min(8) {
+                let kind = ocerz_ld(request_buf.wrapping_add(offset).wrapping_add(11), 1) as u8;
+                if (1..=3).contains(&kind) {
+                    let address = ocerz_ld(request_buf.wrapping_add(offset), 8);
+                    let readable = address != 0 && crate::ffi::ocerz_addr_readable(address) != 0;
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: IOKITREQ[%d]   desc[%u] type=%u ool ga=%#llx sz=%#x g2h=%#llx readable=%d head=%08x\n"
+                            .as_ptr(),
+                        libc::getpid(),
+                        index,
+                        kind as c_uint,
+                        address as libc::c_ulonglong,
+                        ocerz_ld(request_buf.wrapping_add(offset).wrapping_add(12), 4) as u32,
+                        if address != 0 {
+                            ocerz_g2h(address) as u64 as libc::c_ulonglong
+                        } else {
+                            0
+                        },
+                        readable as c_int,
+                        if readable {
+                            ocerz_ld(address, 4) as u32
+                        } else {
+                            0
+                        },
+                    );
+                    offset += 16;
+                } else if kind == 0 {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: IOKITREQ[%d] desc[%u] port=%#x disp=%u\n".as_ptr(),
+                        libc::getpid(),
+                        index,
+                        ocerz_ld(request_buf.wrapping_add(offset), 4) as u32,
+                        ocerz_ld(request_buf.wrapping_add(offset).wrapping_add(10), 1) as u8
+                            as c_uint,
+                    );
+                    offset += 12;
+                } else {
+                    offset += 16;
+                }
+            }
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: IOKITREQ[%d]   body:".as_ptr(),
+                libc::getpid(),
+            );
+            let mut offset = 0x18u64;
+            while offset < 0x98 && offset + 4 <= size as u64 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c" %08x".as_ptr(),
+                    ocerz_ld(request_buf.wrapping_add(offset), 4) as u32,
+                );
+                offset += 4;
+            }
+            libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+        }
+    }
     if reply_buf != 0 && !vector_mode && a[1] & 3 == 3 {
         if thread_act_emulate(cpu, request_buf, msgh_id, a[6] as u32) {
             return 0;
@@ -1348,22 +1834,393 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     if a[0] != 0 {
         a[0] = ocerz_g2h(a[0]) as u64;
     }
+    if env_set!("OCERZ_MACHMSG") {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: MACHMSG-ENTER[%d] opts=%#llx sent_id=%u send_size=%#x rcvname=%#llx rcvsz=%#x timeout=%llu\n"
+                .as_ptr(),
+            libc::getpid(),
+            a[1] as libc::c_ulonglong,
+            msgh_id,
+            (a[2] >> 32) as u32,
+            a[5] as libc::c_ulonglong,
+            a[6] as u32,
+            a[7] as libc::c_ulonglong,
+        );
+    }
+    static mut LSTIMEOUT: c_int = -1;
+    if LSTIMEOUT < 0 {
+        LSTIMEOUT = c_int::from(!libc::getenv(c"OCERZ_LSTIMEOUT".as_ptr()).is_null());
+    }
+    if LSTIMEOUT != 0 && reply_buf != 0 && a[1] & 1 != 0 && a[1] & 2 != 0 && a[1] & 0x100 == 0 {
+        let message_id = (a[4] >> 32) as u32;
+        if (10000..10100).contains(&message_id) {
+            a[1] |= 0x100;
+            a[7] = 1500;
+            if env_set!("OCERZ_MACHMSG") {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: LSTIMEOUT forcing 1500ms RCV timeout on id=%u\n".as_ptr(),
+                    message_id,
+                );
+            }
+        }
+    }
+    if env_set!("OCERZ_MSGTIMEOUT") {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: MSG2 opts=%#llx rcv_timeout_arg=%#llx a6=%#llx rsp=%#llx\n".as_ptr(),
+            a[1] as libc::c_ulonglong,
+            a[7] as libc::c_ulonglong,
+            a[6] as libc::c_ulonglong,
+            (*cpu).gpr[crate::ffi::OCERZ_RSP as usize] as libc::c_ulonglong,
+        );
+    }
+    if request_buf != 0
+        && env_set!("OCERZ_VMMAPPROBE")
+        && ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32 == 4811
+    {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: VMMAPREQ id=4811 dcnt=%u portname=%#x raw18:".as_ptr(),
+            ocerz_ld(request_buf.wrapping_add(0x18), 4) as u32,
+            ocerz_ld(request_buf.wrapping_add(0x1c), 4) as u32,
+        );
+        for offset in (0x18..0x60).step_by(4) {
+            libc::fprintf(
+                crate::log::stderr(),
+                c" %08x".as_ptr(),
+                ocerz_ld(request_buf.wrapping_add(offset), 4) as u32,
+            );
+        }
+        libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+    }
+    if request_buf != 0 && env_set!("OCERZ_MSGDUMP") {
+        let mut ascii = [0i8; 321];
+        for offset in 0..320u64 {
+            let byte = ocerz_ld(request_buf.wrapping_add(0x18).wrapping_add(offset), 1) as u8;
+            *ascii.as_mut_ptr().add(offset as usize) = if (0x20..0x7f).contains(&byte) {
+                byte as c_char
+            } else {
+                b'.' as c_char
+            };
+        }
+        let message_id = (a[4] >> 32) as u32;
+        if !libc::strstr(ascii.as_ptr(), c"com.apple".as_ptr()).is_null()
+            || !libc::strstr(ascii.as_ptr(), c"apple.".as_ptr()).is_null()
+            || !libc::strstr(ascii.as_ptr(), c"Server".as_ptr()).is_null()
+            || !libc::strstr(ascii.as_ptr(), c"font".as_ptr()).is_null()
+            || !libc::strstr(ascii.as_ptr(), c"WindowServer".as_ptr()).is_null()
+            || (10000..10100).contains(&message_id)
+            || message_id >= 0x4000_0000
+        {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: MSGDUMP[%d] id=%u rport=%#x: %s\n".as_ptr(),
+                libc::getpid(),
+                message_id,
+                ocerz_ld(request_buf.wrapping_add(8), 4) as u32,
+                ascii.as_ptr(),
+            );
+        }
+    }
+    static mut SENDRINGLOG: c_int = -1;
+    if SENDRINGLOG < 0 {
+        SENDRINGLOG = c_int::from(
+            !libc::getenv(c"OCERZ_MACHSLOW".as_ptr()).is_null()
+                || !libc::getenv(c"OCERZ_PORTDUMP".as_ptr()).is_null(),
+        );
+    }
+    if SENDRINGLOG != 0 && a[1] & 1 != 0 && request_buf != 0 {
+        let index = (*cpu).sendring_n as usize % 8;
+        *ptr::addr_of_mut!((*cpu).sendring_id)
+            .cast::<u32>()
+            .add(index) = (a[4] >> 32) as u32;
+        *ptr::addr_of_mut!((*cpu).sendring_port)
+            .cast::<u32>()
+            .add(index) = ocerz_ld(request_buf.wrapping_add(8), 4) as u32;
+        *ptr::addr_of_mut!((*cpu).sendring_sz)
+            .cast::<u32>()
+            .add(index) = (a[2] >> 32) as u32;
+        (*cpu).sendring_n = (*cpu).sendring_n.wrapping_add(1);
+    }
     (*cpu).last_rcv_name = if a[1] & 2 != 0 { a[5] as u32 } else { 0 };
     (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     let result = super::raw::ocerz_host_mach_trap(47, a);
     (*cpu).block_since_ns = 0;
+    if env_set!("OCERZ_MACHMSG") {
+        let rb = if vector_mode && reply_buf != 0 {
+            ocerz_ld(reply_buf.wrapping_add(8), 8)
+        } else {
+            reply_buf
+        };
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: MACHMSG-EXIT[%d] opts=%#llx kr=%#llx sent_id=%u rcv_id=%u rcv_size=%#x\n"
+                .as_ptr(),
+            libc::getpid(),
+            a[1] as libc::c_ulonglong,
+            result as libc::c_ulonglong,
+            msgh_id,
+            if a[1] & 2 != 0 && result == 0 && rb != 0 {
+                ocerz_ld(rb + 0x14, 4) as u32
+            } else {
+                0
+            },
+            if a[1] & 2 != 0 && result == 0 && rb != 0 {
+                ocerz_ld(rb + 4, 4) as u32
+            } else {
+                0
+            },
+        );
+    }
     let mut reply = reply_buf;
     let mut reply_size = a[6] as u32;
     if vector_mode && reply_buf != 0 {
-        reply = ocerz_ld(reply_buf + 8, 8);
+        reply = ocerz_ld(reply_buf.wrapping_add(8), 8);
         if reply == 0 {
             reply = ocerz_ld(reply_buf, 8);
         }
-        reply_size = ocerz_ld(reply_buf + 0x14, 4) as u32;
+        reply_size = ocerz_ld(reply_buf.wrapping_add(0x14), 4) as u32;
+    }
+    static mut MACHLEAK: c_int = -1;
+    if MACHLEAK < 0 {
+        MACHLEAK = c_int::from(!libc::getenv(c"OCERZ_MACHLEAK".as_ptr()).is_null());
+    }
+    if reply != 0 && a[1] & 2 != 0 && result == 0 && MACHLEAK != 0 {
+        let mut message_size = ocerz_ld(reply.wrapping_add(4), 4);
+        if reply_size != 0 && message_size > reply_size as u64 {
+            message_size = reply_size as u64;
+        }
+        message_size = message_size.min(0x160);
+        let mut offset = 0x20;
+        while offset + 8 <= message_size {
+            let value = ocerz_ld(reply.wrapping_add(offset), 8);
+            if value >= 0x1000_1000
+                && value < crate::ffi::OCERZ_LOW_LIMIT as u64
+                && value & 0xfff == 0
+                && crate::ffi::ocerz_addr_readable(value) == 0
+            {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: MACHLEAK reply_id=%u off=%#llx host_val=%#llx icount=%#llx\n".as_ptr(),
+                    ocerz_ld(reply.wrapping_add(0x14), 4) as u32,
+                    offset as libc::c_ulonglong,
+                    value as libc::c_ulonglong,
+                    (*vm).insn_count as libc::c_ulonglong,
+                );
+            }
+            offset += 4;
+        }
+    }
+    static mut MSGSPIN: c_int = -1;
+    if MSGSPIN < 0 {
+        MSGSPIN = c_int::from(!libc::getenv(c"OCERZ_MSGSPIN".as_ptr()).is_null());
+    }
+    static MSGSPIN_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if MSGSPIN != 0 {
+        let spin_count = MSGSPIN_COUNT
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        if spin_count & 0x3ff == 0 {
+            let sent_id = if a[1] & 1 != 0 && request_buf != 0 {
+                (a[4] >> 32) as u32
+            } else {
+                0
+            };
+            let sent_dest = if a[1] & 1 != 0 && request_buf != 0 {
+                ocerz_ld(request_buf.wrapping_add(8), 4) as u32
+            } else {
+                0
+            };
+            let reply_id = if a[1] & 2 != 0 && result == 0 && reply != 0 {
+                ocerz_ld(reply.wrapping_add(0x14), 4) as u32
+            } else {
+                0
+            };
+            libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: MSGSPIN[%d] n=%llu cpu#%u opt=%#llx kr=%#llx rcvname=%#llx rcvsz=%#llx timeout=%llu sid=%u sdst=%#x rid=%u\n"
+                .as_ptr(),
+            libc::getpid(),
+            spin_count as libc::c_ulonglong,
+            (*cpu).cpu_number,
+            a[1] as libc::c_ulonglong,
+            result as libc::c_ulonglong,
+            a[5] as libc::c_ulonglong,
+            a[6] as libc::c_ulonglong,
+            a[7] as libc::c_ulonglong,
+            sent_id,
+            sent_dest,
+            reply_id,
+        );
+        }
+    }
+    static mut WAKELOG: c_int = -1;
+    if WAKELOG < 0 {
+        WAKELOG = c_int::from(!libc::getenv(c"OCERZ_WAKELOG".as_ptr()).is_null());
+    }
+    if WAKELOG != 0 {
+        if a[1] & 1 != 0 && request_buf != 0 {
+            let send_size = (a[2] >> 32) as u32;
+            let send_id = (a[4] >> 32) as u32;
+            if send_size <= 0x30 && send_id == 0 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: WAKESEND[%d] cpu#%u dest=%#x sz=%#x -> r=%#llx ic=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    (*cpu).cpu_number,
+                    a[3] as u32,
+                    send_size,
+                    result as libc::c_ulonglong,
+                    (*vm).insn_count as libc::c_ulonglong,
+                );
+            }
+        }
+        if a[1] & 2 != 0 && result == 0 && reply != 0 {
+            let reply_size_actual = ocerz_ld(reply.wrapping_add(4), 4) as u32;
+            let reply_id = ocerz_ld(reply.wrapping_add(0x14), 4) as u32;
+            if reply_size_actual <= 0x30 && reply_id == 0 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: WAKERECV[%d] cpu#%u on=%#x set=%#x sz=%#x ic=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    (*cpu).cpu_number,
+                    ocerz_ld(reply.wrapping_add(0xc), 4) as u32,
+                    (a[5] >> 32) as u32,
+                    reply_size_actual,
+                    (*vm).insn_count as libc::c_ulonglong,
+                );
+            }
+        }
+    }
+    static mut NO_RCV_TIMEOUT_KICK: c_int = -1;
+    if NO_RCV_TIMEOUT_KICK < 0 {
+        NO_RCV_TIMEOUT_KICK =
+            c_int::from(!libc::getenv(c"OCERZ_NO_RCV_TIMEOUT_KICK".as_ptr()).is_null());
+    }
+    static mut MACHSLOW: c_int = -1;
+    if MACHSLOW < 0 {
+        MACHSLOW = c_int::from(!libc::getenv(c"OCERZ_MACHSLOW".as_ptr()).is_null());
+    }
+    static mut MACHSLOW_COUNT: c_int = 0;
+    if MACHSLOW != 0 && MACHSLOW_COUNT < 12 && matches!(result, 0x10004003 | 0x10004005) {
+        MACHSLOW_COUNT += 1;
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: RCVKICK[%d] cpu#%u rcv=%#llx set=%#llx opts=%#llx lastsends:\n".as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            a[5] as u32 as libc::c_ulonglong,
+            (a[5] >> 32) as libc::c_ulonglong,
+            a[1] as libc::c_ulonglong,
+        );
+        let sendring_id = ptr::addr_of!((*cpu).sendring_id).cast::<u32>();
+        let sendring_port = ptr::addr_of!((*cpu).sendring_port).cast::<u32>();
+        let sendring_sz = ptr::addr_of!((*cpu).sendring_sz).cast::<u32>();
+        for i in 0..8usize {
+            let j = ((*cpu).sendring_n as usize + i) % 8;
+            let id = *sendring_id.add(j);
+            let port = *sendring_port.add(j);
+            if id != 0 || port != 0 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c" id=%u port=%#x sz=%#x;".as_ptr(),
+                    id,
+                    port,
+                    *sendring_sz.add(j),
+                );
+            }
+        }
+        libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+    }
+    static mut KICKLOG: c_int = -1;
+    if KICKLOG < 0 {
+        KICKLOG = c_int::from(!libc::getenv(c"OCERZ_KICKLOG".as_ptr()).is_null());
+    }
+    if KICKLOG != 0 && matches!(result, 0x10004005 | 14 | 0x10004003) {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: KICKRET[%d] cpu#%u mach47 -> %#llx rip=%#llx\n".as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            result as libc::c_ulonglong,
+            (*cpu).rip as libc::c_ulonglong,
+        );
+    }
+    static mut MSGHEX: c_int = -2;
+    if MSGHEX == -2 {
+        let value = libc::getenv(c"OCERZ_MSGHEX".as_ptr());
+        MSGHEX = if value.is_null() {
+            0
+        } else if libc::strcmp(value, c"all".as_ptr()) == 0 {
+            -1
+        } else {
+            libc::atoi(value)
+        };
+    }
+    if MSGHEX != 0 && request_buf != 0 {
+        let request_id = ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32;
+        if MSGHEX == -1 || MSGHEX == request_id as c_int {
+            let request_size = ocerz_ld(request_buf.wrapping_add(4), 4) as u32;
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: MSGHEX[%d] req id=%u bits=%#x size=%#x dst=%#x opts=%#llx kr=%#llx:"
+                    .as_ptr(),
+                libc::getpid(),
+                request_id,
+                ocerz_ld(request_buf, 4) as u32,
+                request_size,
+                a[3] as u32,
+                a[1] as libc::c_ulonglong,
+                result as libc::c_ulonglong,
+            );
+            let mut offset = 0x18u64;
+            while offset < 0x78 && offset + 4 <= request_size as u64 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c" %08x".as_ptr(),
+                    ocerz_ld(request_buf.wrapping_add(offset), 4) as u32,
+                );
+                offset += 4;
+            }
+            libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+            if reply != 0 {
+                let actual_size = ocerz_ld(reply.wrapping_add(4), 4) as u32;
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: MSGHEX[%d]   reply@%#llx id=%u bits=%#x size=%#x (rcvsz=%#llx):"
+                        .as_ptr(),
+                    libc::getpid(),
+                    reply as libc::c_ulonglong,
+                    ocerz_ld(reply.wrapping_add(0x14), 4) as u32,
+                    ocerz_ld(reply, 4) as u32,
+                    actual_size,
+                    reply_size as libc::c_ulonglong,
+                );
+                let mut offset = 0x18u64;
+                while offset < 0x98 && offset + 4 <= actual_size as u64 {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c" %08x".as_ptr(),
+                        ocerz_ld(reply.wrapping_add(offset), 4) as u32,
+                    );
+                    offset += 4;
+                }
+                libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+            }
+        }
     }
     super::machmsg::vmmap_pad_restore();
     if nsaves != 0 {
         super::machmsg::ocerz_send_restore_descriptors(reply_buf, saves.as_ptr(), nsaves);
+    }
+    if vector_mode && reply_buf != 0 {
+        reply = ocerz_ld(reply_buf.wrapping_add(8), 8);
+        if reply == 0 {
+            reply = ocerz_ld(reply_buf, 8);
+        }
+        reply_size = ocerz_ld(reply_buf.wrapping_add(0x14), 4) as u32;
     }
     super::machmsg::tc_policy_send_done(&tc, result);
     if request_buf != 0 && super::machmsg::ocerz_mach_err_interesting(result) != 0 {
@@ -1377,15 +2234,15 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             super::machmsg::tc_policy_get_reply(reply, reply_size);
         }
         ocerz_reply_alias_iokit(vm, reply, reply_size);
-        let reply_id = ocerz_ld(reply + 0x14, 4) as u32;
-        let status = ocerz_ld(reply + 0x20, 4) as u32 as c_int;
+        let reply_id = ocerz_ld(reply.wrapping_add(0x14), 4) as u32;
+        let status = ocerz_ld(reply.wrapping_add(0x20), 4) as u32 as c_int;
         if reply_id == 4911 && vm_fixed_keep && status == OCERZ_MACH_KERN_SUCCESS {
             mig_vm_refuse_taken(reply, vm_result_size);
         }
         if matches!(reply_id, 4900 | 4911 | 4913) && status == OCERZ_MACH_KERN_SUCCESS {
             mig_vm_reply_relocate(vm, reply, false, vm_result_size, vm_result_alignment);
         }
-        let reply_size_actual = ocerz_ld(reply + 4, 4) as u32;
+        let reply_size_actual = ocerz_ld(reply.wrapping_add(4), 4) as u32;
         let reply_bits = ocerz_ld(reply, 4) as u32;
         if reply_id == 10154
             && msgh_id == 10054
@@ -1393,7 +2250,7 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             && reply_size_actual >= 0x30
             && status == OCERZ_MACH_KERN_SUCCESS
         {
-            let universe = ocerz_ld(reply + 0x24, 8);
+            let universe = ocerz_ld(reply.wrapping_add(0x24), 8);
             if universe != 0 && alias_raw_contiguous(vm, universe) == 0 {
                 let table = ocerz_ld(universe, 8);
                 let entries = ocerz_ld(universe + 0x18, 8);
@@ -1408,7 +2265,7 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             && reply_bits & 0x8000_0000 == 0
             && reply_size_actual >= 0x28
             && status == OCERZ_MACH_KERN_SUCCESS
-            && ocerz_ld(reply + 0x24, 1) as u8 != 0
+            && ocerz_ld(reply.wrapping_add(0x24), 1) as u8 != 0
         {
             let universe = ocerz_sc_find_universe(sc_uid);
             if universe != 0 {
@@ -1430,30 +2287,333 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             && result == 0
             && reply_size_actual >= 0x40
             && status == OCERZ_MACH_KERN_SUCCESS
-            && ocerz_ld(reply + 0x24, 4) as u32 >= 6
+            && ocerz_ld(reply.wrapping_add(0x24), 4) as u32 >= 6
         {
-            let host = ocerz_ld(reply + 0x30, 8);
+            let host = ocerz_ld(reply.wrapping_add(0x30), 8);
             let mut guest = crate::ffi::ocerz_vm_guest_tsd_for_host(host);
             if guest == 0 && host >= 0x1400_0000 && host < crate::ffi::OCERZ_LOW_LIMIT {
                 guest = (*cpu).gs_base;
             }
             if guest != 0 {
-                let qualifier = ocerz_ld(reply + 0x38, 8);
-                ocerz_st(reply + 0x30, 8, guest);
-                ocerz_st(reply + 0x38, 8, guest + qualifier.wrapping_sub(host));
+                let qualifier = ocerz_ld(reply.wrapping_add(0x38), 8);
+                ocerz_st(reply.wrapping_add(0x30), 8, guest);
+                ocerz_st(
+                    reply.wrapping_add(0x38),
+                    8,
+                    guest.wrapping_add(qualifier.wrapping_sub(host)),
+                );
+                if env_set!("OCERZ_SIGTRACE") {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: K1 thread_info handle %#llx -> gs_base %#llx (comm=%d)\n".as_ptr(),
+                        host as libc::c_ulonglong,
+                        guest as libc::c_ulonglong,
+                        crate::ffi::ocerz_addr_committed(guest),
+                    );
+                }
             }
         }
+        let mut shadow_size = ocerz_ld(reply.wrapping_add(4), 4) as u32 as u64;
+        if reply_size != 0 && shadow_size > reply_size as u64 {
+            shadow_size = reply_size as u64;
+        }
+        super::hostwq::ocerz_shadow_scan(
+            c"msg2".as_ptr(),
+            ocerz_ld(reply.wrapping_add(0x14), 4) as u32 as u64,
+            reply,
+            shadow_size,
+        );
         if msgh_id == 8000
-            && ocerz_ld(reply + 4, 4) == 0x24
+            && ocerz_ld(reply.wrapping_add(4), 4) == 0x24
             && status == OCERZ_MACH_KERN_NOT_SUPPORTED
         {
-            ocerz_st(reply + 0x20, 4, OCERZ_MACH_KERN_SUCCESS as u32 as u64);
+            ocerz_st(
+                reply.wrapping_add(0x20),
+                4,
+                OCERZ_MACH_KERN_SUCCESS as u32 as u64,
+            );
+        }
+    }
+    static mut IOKITMIG: c_int = -1;
+    if IOKITMIG < 0 {
+        let value = libc::getenv(c"OCERZ_IOKITMIG".as_ptr());
+        IOKITMIG = if value.is_null() {
+            0
+        } else {
+            libc::atoi(value)
+        };
+        if !value.is_null() && IOKITMIG == 0 {
+            IOKITMIG = 1;
+        }
+    }
+    if IOKITMIG != 0 && request_buf != 0 {
+        let request_id = ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32;
+        if (2800..3000).contains(&request_id) {
+            let destination = if a[3] != 0 {
+                a[3] as u32
+            } else {
+                ocerz_ld(request_buf.wrapping_add(8), 4) as u32
+            };
+            let reply_id = if reply != 0 {
+                ocerz_ld(reply.wrapping_add(0x14), 4) as u32
+            } else {
+                0
+            };
+            let reply_bits = if reply != 0 {
+                ocerz_ld(reply, 4) as u32
+            } else {
+                0
+            };
+            let word0 = if reply != 0 {
+                ocerz_ld(reply.wrapping_add(0x20), 4) as u32
+            } else {
+                0
+            };
+            let word1 = if reply != 0 {
+                ocerz_ld(reply.wrapping_add(0x24), 4) as u32
+            } else {
+                0
+            };
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: IOKITMIG[%d] req=%u rport=%#x -> kr=%#llx reply_id=%u bits=%#x w0=%#x w1=%#x\n"
+                    .as_ptr(),
+                libc::getpid(),
+                request_id,
+                destination,
+                result as libc::c_ulonglong,
+                reply_id,
+                reply_bits,
+                word0,
+                word1,
+            );
+            if result as u64 == 0x1000_0003 {
+                let mut port_type = 0;
+                let type_result = mach_port_type(mach_task_self(), destination, &mut port_type);
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: IOKITMIG[%d]   dest %#x host mach_port_type kr=%d type=%#x\n".as_ptr(),
+                    libc::getpid(),
+                    destination,
+                    type_result,
+                    port_type,
+                );
+            }
+            if IOKITMIG >= 2 && matches!(request_id, 2989 | 2984 | 2988)
+                || (IOKITMIG >= 2 && result != 0)
+            {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: IOKITMIG[%d] req=%u qbits=%#x qsize=%#x dcnt=%u opts=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    request_id,
+                    ocerz_ld(request_buf, 4) as u32,
+                    ocerz_ld(request_buf.wrapping_add(4), 4) as u32,
+                    if ocerz_ld(request_buf, 4) as u32 & 0x8000_0000 != 0 {
+                        ocerz_ld(request_buf.wrapping_add(0x18), 4) as u32
+                    } else {
+                        0
+                    },
+                    a[1] as libc::c_ulonglong,
+                );
+                let request_bits = ocerz_ld(request_buf, 4) as u32;
+                let request_size = ocerz_ld(request_buf.wrapping_add(4), 4) as u32;
+                let descriptor_count = if request_bits & 0x8000_0000 != 0 {
+                    ocerz_ld(request_buf.wrapping_add(0x18), 4) as u32
+                } else {
+                    0
+                };
+                let mut descriptor_offset = 0x1c;
+                for descriptor in 0..descriptor_count.min(8) {
+                    let descriptor_type = ocerz_ld(
+                        request_buf.wrapping_add(descriptor_offset).wrapping_add(11),
+                        1,
+                    ) as u8;
+                    if (1..=3).contains(&descriptor_type) {
+                        let guest_address =
+                            ocerz_ld(request_buf.wrapping_add(descriptor_offset), 8);
+                        let bytes = ocerz_ld(
+                            request_buf.wrapping_add(descriptor_offset).wrapping_add(12),
+                            4,
+                        ) as u32;
+                        let host_address = if guest_address != 0 {
+                            ocerz_g2h(guest_address) as u64
+                        } else {
+                            0
+                        };
+                        let readable = guest_address != 0
+                            && crate::ffi::ocerz_addr_readable(guest_address) != 0;
+                        let first_word = if readable {
+                            ocerz_ld(guest_address, 4) as u32
+                        } else {
+                            0
+                        };
+                        libc::fprintf(
+                            crate::log::stderr(),
+                            c"ocerz: IOKITMIG[%d]     desc[%u] type=%u ool ga=%#llx sz=%#x g2h=%#llx readable=%d bytes0=%08x\n"
+                                .as_ptr(),
+                            libc::getpid(),
+                            descriptor,
+                            descriptor_type as c_uint,
+                            guest_address as libc::c_ulonglong,
+                            bytes,
+                            host_address as libc::c_ulonglong,
+                            readable as c_int,
+                            first_word,
+                        );
+                        descriptor_offset += 16;
+                    } else if descriptor_type == 0 {
+                        libc::fprintf(
+                            crate::log::stderr(),
+                            c"ocerz: IOKITMIG[%d]     desc[%u] port=%#x disp=%u\n".as_ptr(),
+                            libc::getpid(),
+                            descriptor,
+                            ocerz_ld(request_buf.wrapping_add(descriptor_offset), 4) as u32,
+                            ocerz_ld(
+                                request_buf.wrapping_add(descriptor_offset).wrapping_add(10),
+                                1,
+                            ) as u8 as c_uint,
+                        );
+                        descriptor_offset += 12;
+                    } else {
+                        descriptor_offset += 16;
+                    }
+                }
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: IOKITMIG[%d]     body:".as_ptr(),
+                    libc::getpid(),
+                );
+                let mut offset = 0x18u64;
+                while offset < 0x58 && offset + 4 <= request_size as u64 {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c" %08x".as_ptr(),
+                        ocerz_ld(request_buf.wrapping_add(offset), 4) as u32,
+                    );
+                    offset += 4;
+                }
+                libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+            }
+            if IOKITMIG >= 2 && reply != 0 && reply_bits & 0x8000_0000 != 0 {
+                let descriptor_count = ocerz_ld(reply.wrapping_add(0x18), 4) as u32;
+                let mut descriptor_offset = 0x1c;
+                for descriptor in 0..descriptor_count.min(16) {
+                    let descriptor_type =
+                        ocerz_ld(reply.wrapping_add(descriptor_offset).wrapping_add(11), 1) as u8;
+                    if descriptor_type == 0 {
+                        libc::fprintf(
+                            crate::log::stderr(),
+                            c"ocerz: IOKITMIG[%d]   reply_id=%u port-desc[%u]=%#x disp=%u\n"
+                                .as_ptr(),
+                            libc::getpid(),
+                            reply_id,
+                            descriptor,
+                            ocerz_ld(reply.wrapping_add(descriptor_offset), 4) as u32,
+                            ocerz_ld(reply.wrapping_add(descriptor_offset).wrapping_add(10), 1)
+                                as u8 as c_uint,
+                        );
+                        descriptor_offset += 12;
+                    } else if (1..=4).contains(&descriptor_type) {
+                        descriptor_offset += 16;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if reply != 0 && a[1] & 2 != 0 && result == 0 && env_set!("OCERZ_PORTRECV") {
+        let bits = ocerz_ld(reply, 4) as u32;
+        let mut size = ocerz_ld(reply.wrapping_add(4), 4) as u32;
+        if reply_size != 0 && size > reply_size {
+            size = reply_size;
+        }
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: PORTRECV[%d] id=%u size=%u bits=%#x remote=%#x local=%#x\n".as_ptr(),
+            libc::getpid(),
+            ocerz_ld(reply.wrapping_add(0x14), 4) as u32,
+            size,
+            bits,
+            ocerz_ld(reply.wrapping_add(8), 4) as u32,
+            ocerz_ld(reply.wrapping_add(0xc), 4) as u32,
+        );
+    }
+    if request_buf != 0
+        && ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32 == 2865
+        && (IOKITERR != 0 || IOKITSEL >= 0)
+    {
+        let selector = ocerz_ld(request_buf.wrapping_add(0x20), 4) as u32;
+        if IOKITSEL == c_int::MAX || IOKITSEL == selector as c_int || (IOKITERR != 0 && result != 0)
+        {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: IOKIT[%d] selector=%u result=%#llx scalars=%u in_bytes=%u rip=%#llx\n"
+                    .as_ptr(),
+                libc::getpid(),
+                selector,
+                result as libc::c_ulonglong,
+                ocerz_ld(request_buf.wrapping_add(0x24), 4) as u32,
+                ioreq_n,
+                (*cpu).rip as libc::c_ulonglong,
+            );
+            for offset in (0..ioreq_n as usize).step_by(4).take(8) {
+                let word = ptr::read_unaligned(ioreq.as_ptr().add(offset).cast::<u32>());
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c" input[%u]=%#x".as_ptr(),
+                    (offset / 4) as c_uint,
+                    word,
+                );
+            }
+            if reply != 0 {
+                for offset in (0..32u64).step_by(4) {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c" out[%u]=%#x".as_ptr(),
+                        (offset / 4) as c_uint,
+                        ocerz_ld(reply.wrapping_add(0x20).wrapping_add(offset), 4) as u32,
+                    );
+                }
+            }
+            libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
         }
     }
     result
 }
 
 pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_int) -> c_int {
+    static mut STRACE_CPU: c_int = -2;
+    if STRACE_CPU == -2 {
+        let value = libc::getenv(c"OCERZ_STRACE_CPU".as_ptr());
+        STRACE_CPU = if value.is_null() {
+            -1
+        } else {
+            libc::atoi(value)
+        };
+    }
+    if (*cpu).cpu_number as c_int == STRACE_CPU {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: SC[%d] cpu#%u mach %d rdi=%#llx rsi=%#llx rdx=%#llx rip=%#llx gs=%#llx gs18=%#llx ic=%#llx\n"
+                .as_ptr(),
+            libc::getpid(),
+            (*cpu).cpu_number,
+            num,
+            (*cpu).gpr[crate::ffi::OCERZ_RDI as usize] as libc::c_ulonglong,
+            (*cpu).gpr[crate::ffi::OCERZ_RSI as usize] as libc::c_ulonglong,
+            (*cpu).gpr[crate::ffi::OCERZ_RDX as usize] as libc::c_ulonglong,
+            (*cpu).rip as libc::c_ulonglong,
+            (*cpu).gs_base as libc::c_ulonglong,
+            if crate::ffi::ocerz_addr_readable((*cpu).gs_base + 0x18) != 0 {
+                ocerz_ld((*cpu).gs_base + 0x18, 8)
+            } else {
+                0
+            } as libc::c_ulonglong,
+            (*vm).insn_count as libc::c_ulonglong,
+        );
+    }
     let mut a = [0u64; 8];
     a[0] = (*cpu).gpr[crate::ffi::OCERZ_RDI as usize];
     a[1] = (*cpu).gpr[crate::ffi::OCERZ_RSI as usize];
@@ -1461,6 +2621,27 @@ pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_
     a[3] = (*cpu).gpr[crate::ffi::OCERZ_R10 as usize];
     a[4] = (*cpu).gpr[crate::ffi::OCERZ_R8 as usize];
     a[5] = (*cpu).gpr[crate::ffi::OCERZ_R9 as usize];
+    let port_name = match num {
+        16 => a[2],
+        24 => a[3],
+        _ => 0,
+    };
+    static mut PORTLOG: c_int = -1;
+    if PORTLOG < 0 {
+        PORTLOG = c_int::from(!libc::getenv(c"OCERZ_PORTLOG".as_ptr()).is_null());
+    }
+    if PORTLOG != 0 && matches!(num, 17 | 18 | 19 | 25) {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: PORT-DROP[%d] trap=%d name=%#llx a2=%#llx a3=%#llx rip=%#llx\n".as_ptr(),
+            libc::getpid(),
+            num,
+            a[1] as libc::c_ulonglong,
+            a[2] as libc::c_ulonglong,
+            a[3] as libc::c_ulonglong,
+            (*cpu).rip as libc::c_ulonglong,
+        );
+    }
     let known = matches!(
         num,
         10 | 11
@@ -1562,9 +2743,33 @@ pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_
                 let size = a[2];
                 let mask = a[3];
                 let flags = a[4] as u32;
+                static mut VMLOG: c_int = -1;
+                static mut VMLOG_COUNT: c_int = 0;
+                if VMLOG < 0 {
+                    VMLOG = c_int::from(!libc::getenv(c"OCERZ_MACHSLOW".as_ptr()).is_null());
+                }
+                if VMLOG != 0 && VMLOG_COUNT < 60 {
+                    VMLOG_COUNT += 1;
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: VMMAP[%d] cpu#%u want=%#llx size=%#llx mask=%#llx flags=%#llx rip=%#llx\n"
+                            .as_ptr(),
+                        libc::getpid(),
+                        (*cpu).cpu_number,
+                        if a[1] != 0 && flags & VM_FLAGS_ANYWHERE == 0 {
+                            ocerz_ld(a[1], 8)
+                        } else {
+                            0
+                        } as libc::c_ulonglong,
+                        size as libc::c_ulonglong,
+                        mask as libc::c_ulonglong,
+                        flags as libc::c_ulonglong,
+                        (*cpu).rip as libc::c_ulonglong,
+                    );
+                }
                 if flags & VM_FLAGS_ANYWHERE == 0 {
                     let want = if a[1] != 0 { ocerz_ld(a[1], 8) } else { 0 };
-                    super::mem::invalidate_guest_mapping(vm, want, size);
+                    super::mem::memtrace(c"vm_map".as_ptr(), want, size, 0, flags as c_int);
                     if want == 0
                         || (crate::ffi::ocerz_map_claim_fixed(
                             want,
@@ -1584,8 +2789,34 @@ pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_
                                     libc::PROT_READ | libc::PROT_WRITE,
                                 ) != crate::ffi::OCERZ_OK as c_int))
                     {
+                        static mut DENYLOG: c_int = -1;
+                        static DENIED: core::sync::atomic::AtomicU64 =
+                            core::sync::atomic::AtomicU64::new(0);
+                        if DENYLOG < 0 {
+                            DENYLOG =
+                                c_int::from(!libc::getenv(c"OCERZ_DENYLOG".as_ptr()).is_null());
+                        }
+                        let denied = DENIED
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                            .wrapping_add(1);
+                        if (*vm).strace != 0
+                            || (DENYLOG != 0 && (denied & 0x3ff == 0 || denied < 8))
+                        {
+                            libc::fprintf(
+                                crate::log::stderr(),
+                                c"ocerz: mach_vm_map FIXED denied n=%llu want=%#llx size=%#llx mask=%#llx flags=%#llx rip=%#llx\n"
+                                    .as_ptr(),
+                                denied as libc::c_ulonglong,
+                                want as libc::c_ulonglong,
+                                size as libc::c_ulonglong,
+                                mask as libc::c_ulonglong,
+                                flags as libc::c_ulonglong,
+                                (*cpu).rip as libc::c_ulonglong,
+                            );
+                        }
                         OCERZ_MACH_KERN_NO_SPACE
                     } else {
+                        super::mem::invalidate_guest_mapping(vm, want, size);
                         OCERZ_MACH_KERN_SUCCESS
                     }
                 } else {
@@ -1699,6 +2930,22 @@ pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_
                     }
                     _ => {}
                 }
+                static mut PORTLOG_DETAIL: c_int = -1;
+                if PORTLOG_DETAIL < 0 {
+                    PORTLOG_DETAIL =
+                        c_int::from(!libc::getenv(c"OCERZ_PORTLOG".as_ptr()).is_null());
+                }
+                if PORTLOG_DETAIL != 0 && matches!(num, 18 | 19) {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: PORTLOG[%d] %s name=%#llx right=%#llx delta=%#llx\n".as_ptr(),
+                        libc::getpid(),
+                        mach_trap_name(num),
+                        a[1] as libc::c_ulonglong,
+                        a[2] as libc::c_ulonglong,
+                        a[3] as libc::c_ulonglong,
+                    );
+                }
                 if matches!(num, 36 | 37 | 38 | 39) {
                     (*cpu).block_nokick = 1;
                 }
@@ -1706,6 +2953,42 @@ pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_
                 let result = super::raw::ocerz_host_mach_trap(num as i64, &mut a);
                 (*cpu).block_since_ns = 0;
                 (*cpu).block_nokick = 0;
+                static mut KICKLOG: c_int = -1;
+                if KICKLOG < 0 {
+                    KICKLOG = c_int::from(!libc::getenv(c"OCERZ_KICKLOG".as_ptr()).is_null());
+                }
+                if KICKLOG != 0 && result == 14 {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: KICKRET[%d] cpu#%u %s -> ABORTED rip=%#llx\n".as_ptr(),
+                        libc::getpid(),
+                        (*cpu).cpu_number,
+                        mach_trap_name(num),
+                        (*cpu).rip as libc::c_ulonglong,
+                    );
+                }
+                if num == 100 {
+                    static mut IOKITLOG: c_int = -1;
+                    if IOKITLOG < 0 {
+                        IOKITLOG = c_int::from(!libc::getenv(c"OCERZ_IOKITLOG".as_ptr()).is_null());
+                    }
+                    if IOKITLOG != 0 {
+                        libc::fprintf(
+                            crate::log::stderr(),
+                            c"ocerz: IOKIT-TRAP conn=%#llx index=%llu a=%#llx,%#llx,%#llx,%#llx,%#llx,%#llx -> ret=%#llx\n"
+                                .as_ptr(),
+                            a[0] as libc::c_ulonglong,
+                            a[1] as libc::c_ulonglong,
+                            a[2] as libc::c_ulonglong,
+                            a[3] as libc::c_ulonglong,
+                            a[4] as libc::c_ulonglong,
+                            a[5] as libc::c_ulonglong,
+                            a[6] as libc::c_ulonglong,
+                            a[7] as libc::c_ulonglong,
+                            result as libc::c_ulonglong,
+                        );
+                    }
+                }
                 result as c_int
             }
             13 => {
@@ -1722,12 +3005,32 @@ pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_
             89 => {
                 if a[0] != 0 {
                     ocerz_st(a[0], 4, 1);
-                    ocerz_st(a[0] + 4, 4, 1);
+                    ocerz_st(a[0].wrapping_add(4), 4, 1);
                 }
                 OCERZ_MACH_KERN_SUCCESS
             }
             _ => super::raw::ocerz_host_mach_trap(num as i64, &mut a) as c_int,
         };
+        if PORTLOG != 0 && result == 0 {
+            if num == 16 && port_name != 0 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: PORT-NEW[%d] alloc right=%llu name=%#llx rip=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    a[1] as libc::c_ulonglong,
+                    ocerz_ld(port_name, 4) as libc::c_ulonglong,
+                    (*cpu).rip as libc::c_ulonglong,
+                );
+            } else if num == 24 && port_name != 0 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: PORT-NEW[%d] construct name=%#llx rip=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    ocerz_ld(port_name, 4) as libc::c_ulonglong,
+                    (*cpu).rip as libc::c_ulonglong,
+                );
+            }
+        }
         mach_ret(cpu, result as u32 as u64);
     }
     if (*vm).strace != 0 {

@@ -355,9 +355,10 @@ pub(super) unsafe fn sys_sysctl(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [
         {
             let mut name = [0 as c_char; 160];
             for i in 0..a[5] {
-                name[i as usize] = ocerz_ld(a[4].wrapping_add(i), 1) as u8 as c_char;
+                *name.as_mut_ptr().add(i as usize) =
+                    ocerz_ld(a[4].wrapping_add(i), 1) as u8 as c_char;
             }
-            name[a[5] as usize] = 0;
+            *name.as_mut_ptr().add(a[5] as usize) = 0;
             let idx = x86_sysctl_find(name.as_ptr());
             if idx >= 0 {
                 let cap = if a[3] != 0 { ocerz_ld(a[3], 8) } else { 0 };
@@ -381,7 +382,8 @@ pub(super) unsafe fn sys_sysctl(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [
         if a[4] == 0 && (2..=8).contains(&nlen) {
             let mut mib = [0 as c_int; 8];
             for i in 0..nlen as usize {
-                mib[i] = ocerz_ld(a[0].wrapping_add(i as u64 * 4), 4) as u32 as i32;
+                *mib.as_mut_ptr().add(i) =
+                    ocerz_ld(a[0].wrapping_add(i as u64 * 4), 4) as u32 as i32;
             }
             ocerz_sysctl_ovr_resolve();
             if log != 0 {
@@ -426,8 +428,9 @@ pub(super) unsafe fn sys_sysctl(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [
         }
         let mut fa = *a;
         for i in 0..8 {
-            if (0x1d & (1 << i)) != 0 && fa[i] != 0 {
-                fa[i] = ocerz_g2h(fa[i]) as usize as u64;
+            let arg = fa.as_mut_ptr().add(i);
+            if (0x1d & (1 << i)) != 0 && *arg != 0 {
+                *arg = ocerz_g2h(*arg) as usize as u64;
             }
         }
         let mut err = 0;
@@ -449,8 +452,9 @@ unsafe fn sys_mac_syscall_log(cpu: *mut OcerzCPU, a: *mut [u64; 8]) {
         let mut pol = [0 as c_char; 32];
         let mut i = 0;
         while a[0] != 0 && i < 31 {
-            pol[i] = ocerz_ld(a[0].wrapping_add(i as u64), 1) as u8 as c_char;
-            if pol[i] == 0 {
+            let ch = pol.as_mut_ptr().add(i);
+            *ch = ocerz_ld(a[0].wrapping_add(i as u64), 1) as u8 as c_char;
+            if *ch == 0 {
                 break;
             }
             i += 1;
@@ -500,6 +504,8 @@ pub(super) unsafe fn sys_mac_syscall(
         }
         let mut slots = [0u64; 12];
         let mut orig = [0u64; 12];
+        let slots_ptr = slots.as_mut_ptr();
+        let orig_ptr = orig.as_mut_ptr();
         let mut ns = 0;
         if a[2] != 0 {
             let sp = (*cpu).gpr[crate::ffi::OCERZ_RSP as usize];
@@ -524,8 +530,8 @@ pub(super) unsafe fn sys_mac_syscall(
                     w
                 };
                 if hw != w {
-                    slots[ns] = at;
-                    orig[ns] = w;
+                    *slots_ptr.add(ns) = at;
+                    *orig_ptr.add(ns) = w;
                     ns += 1;
                     ocerz_st(at, 8, hw);
                 }
@@ -538,7 +544,7 @@ pub(super) unsafe fn sys_mac_syscall(
         let result = raw::ocerz_host_syscall(381, &fa, &mut ret2, &mut err);
         while ns > 0 {
             ns -= 1;
-            ocerz_st(slots[ns], 8, orig[ns]);
+            ocerz_st(*slots_ptr.add(ns), 8, *orig_ptr.add(ns));
         }
         if err != 0 {
             ret_err(cpu, result);
@@ -560,9 +566,10 @@ pub(super) unsafe fn sys_sysctlbyname(
         let mut name = [0 as c_char; 160];
         let nl = a[1].min(159);
         for i in 0..nl {
-            name[i as usize] = ocerz_ld(a[0].wrapping_add(i), 1) as u8 as c_char;
+            *name.as_mut_ptr().add(i as usize) =
+                ocerz_ld(a[0].wrapping_add(i), 1) as u8 as c_char;
         }
-        name[nl as usize] = 0;
+        *name.as_mut_ptr().add(nl as usize) = 0;
         static LOG: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
         let mut log = LOG.load(core::sync::atomic::Ordering::Relaxed);
         if log < 0 {
@@ -594,8 +601,9 @@ pub(super) unsafe fn sys_sysctlbyname(
         }
         let mut fa = *a;
         for i in 0..8 {
-            if (0x1d & (1 << i)) != 0 && fa[i] != 0 {
-                fa[i] = ocerz_g2h(fa[i]) as usize as u64;
+            let arg = fa.as_mut_ptr().add(i);
+            if (0x1d & (1 << i)) != 0 && *arg != 0 {
+                *arg = ocerz_g2h(*arg) as usize as u64;
             }
         }
         let mut err = 0;

@@ -218,7 +218,45 @@ pub(super) unsafe fn dispatch_machdep(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num:
     }
     if num == 3 {
         let newgs = (*cpu).gpr[crate::ffi::OCERZ_RDI as usize];
+        static mut GSSETLOG: c_int = -1;
+        if GSSETLOG < 0 {
+            GSSETLOG = c_int::from(!libc::getenv(c"OCERZ_GSSETLOG".as_ptr()).is_null());
+        }
+        if GSSETLOG != 0 {
+            static mut SEEN: [u64; 64] = [0; 64];
+            static mut N_SEEN: c_int = 0;
+            let key = newgs & !0xfff;
+            let mut found = false;
+            for i in 0..N_SEEN as usize {
+                if *ptr::addr_of!(SEEN).cast::<u64>().add(i) == key {
+                    found = true;
+                    break;
+                }
+            }
+            if !found && N_SEEN < 64 {
+                *ptr::addr_of_mut!(SEEN).cast::<u64>().add(N_SEEN as usize) = key;
+                N_SEEN += 1;
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: GSSET[%d] cpu#%u newgs=%#llx oldgs=%#llx rip=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    (*cpu).cpu_number,
+                    newgs as libc::c_ulonglong,
+                    (*cpu).gs_base as libc::c_ulonglong,
+                    (*cpu).rip as libc::c_ulonglong,
+                );
+            }
+        }
         if newgs < 0x100000 && (*cpu).gs_base >= 0x100000 {
+            if env_set!("OCERZ_GSTRACE") {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: GS machdep KEEP gs=%#llx (rejected junk %#llx) rip=%#llx\n".as_ptr(),
+                    (*cpu).gs_base as libc::c_ulonglong,
+                    newgs as libc::c_ulonglong,
+                    (*cpu).rip as libc::c_ulonglong,
+                );
+            }
             machdep_ret(cpu, (*cpu).gs_base);
             return crate::ffi::OCERZ_STEP_OK as c_int;
         }
@@ -230,7 +268,7 @@ pub(super) unsafe fn dispatch_machdep(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num:
             (*cpu).wine_teb_base = newgs;
         }
         machdep_ret(cpu, (*cpu).gs_base);
-        if (*vm).strace != 0 && env_set!("OCERZ_GSTRACE") {
+        if env_set!("OCERZ_GSTRACE") {
             libc::fprintf(
                 crate::log::stderr(),
                 c"ocerz: GS machdep[%d] cpu#%u gs=%#llx teb=%#llx rip=%#llx icount=%#llx\n"
@@ -240,6 +278,51 @@ pub(super) unsafe fn dispatch_machdep(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num:
                 (*cpu).gs_base as libc::c_ulonglong,
                 (*cpu).wine_teb_base as libc::c_ulonglong,
                 (*cpu).rip as libc::c_ulonglong,
+                (*vm).insn_count as libc::c_ulonglong,
+            );
+        }
+        if env_set!("OCERZ_GSTRACE") && (*cpu).gs_base < 0x100000 {
+            let r14 = (*cpu).gpr[crate::ffi::OCERZ_R14 as usize];
+            let td = ocerz_ld(r14, 8);
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz:   GSBAD caller-ret=%#llx rdi=%#llx r14=%#llx rsp=%#llx [r14]=td=%#llx td_commit=%d [td+0x320]=%#llx [td-0]=%#llx [td+8]=%#llx\n".as_ptr(),
+                ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize], 8)
+                    as libc::c_ulonglong,
+                (*cpu).gpr[crate::ffi::OCERZ_RDI as usize] as libc::c_ulonglong,
+                r14 as libc::c_ulonglong,
+                (*cpu).gpr[crate::ffi::OCERZ_RSP as usize] as libc::c_ulonglong,
+                td as libc::c_ulonglong,
+                crate::ffi::ocerz_addr_committed(td),
+                if td != 0 {
+                    ocerz_ld(td.wrapping_add(0x320), 8)
+                } else {
+                    0
+                } as libc::c_ulonglong,
+                if td != 0 { ocerz_ld(td, 8) } else { 0 } as libc::c_ulonglong,
+                if td != 0 {
+                    ocerz_ld(td.wrapping_add(8), 8)
+                } else {
+                    0
+                } as libc::c_ulonglong,
+            );
+        }
+        if (*vm).strace != 0 || env_set!("OCERZ_SIGTRACE") {
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: machdep set_cthread_self gs=%#llx comm(gs)=%d comm(gs-8)=%d icount=%#llx\n"
+                    .as_ptr(),
+                (*cpu).gs_base as libc::c_ulonglong,
+                if (*cpu).gs_base != 0 {
+                    ocerz_ld((*cpu).gs_base, 4) as c_int
+                } else {
+                    0
+                },
+                if (*cpu).gs_base >= 8 {
+                    ocerz_ld((*cpu).gs_base - 8, 4) as c_int
+                } else {
+                    0
+                },
                 (*vm).insn_count as libc::c_ulonglong,
             );
         }

@@ -49,7 +49,7 @@ unsafe fn ocerz_self_path() -> *const c_char {
 unsafe fn env_inject_lowbase(henv: *mut *mut c_char, mut m: c_int, cap: c_int) -> c_int {
     static mut LOWBASE_KV: [c_char; 40] = [0; 40];
     static mut TOPBASE_KV: [c_char; 40] = [0; 40];
-    static MODE_KV: &[u8] = b"OCERZ_MODE=native\0";
+    static mut MODE_KV: [u8; 18] = *b"OCERZ_MODE=native\0";
     unsafe {
         let mut have_low = false;
         let mut have_top = false;
@@ -70,7 +70,7 @@ unsafe fn env_inject_lowbase(henv: *mut *mut c_char, mut m: c_int, cap: c_int) -
             && !have_mode
             && m < cap
         {
-            *henv.offset(m as isize) = MODE_KV.as_ptr().cast_mut().cast();
+            *henv.offset(m as isize) = ptr::addr_of_mut!(MODE_KV).cast::<c_char>();
             m += 1;
         }
         if crate::ffi::ocerz_low_base == 0 {
@@ -284,25 +284,48 @@ unsafe fn file_has_slice(path: *const c_char, cputype: u32) -> c_int {
         if n < 8 {
             return 0;
         }
-        let m = u32::from_be_bytes(h[0..4].try_into().unwrap());
+        let hp = h.as_ptr();
+        let m = u32::from_be_bytes([
+            *hp,
+            *hp.add(1),
+            *hp.add(2),
+            *hp.add(3),
+        ]);
         if m == 0xcafebabe || m == 0xcafebabf {
-            let nf = u32::from_be_bytes(h[4..8].try_into().unwrap());
+            let nf = u32::from_be_bytes([
+                *hp.add(4),
+                *hp.add(5),
+                *hp.add(6),
+                *hp.add(7),
+            ]);
             let is64 = m == 0xcafebabf;
             let esz = if is64 { 32usize } else { 20usize };
             let mut off = 8usize;
             for _ in 0..nf {
-                if off + esz > n as usize {
+                if off > n as usize || esz > n as usize - off {
                     break;
                 }
-                let ct = u32::from_be_bytes(h[off..off + 4].try_into().unwrap());
+                let ct = u32::from_be_bytes([
+                    *hp.add(off),
+                    *hp.add(off + 1),
+                    *hp.add(off + 2),
+                    *hp.add(off + 3),
+                ]);
                 if ct == cputype {
                     return 1;
                 }
-                off += esz;
+                off = off.wrapping_add(esz);
             }
             return 0;
         }
-        if m == 0xcffaedfe && u32::from_le_bytes(h[4..8].try_into().unwrap()) == cputype {
+        if m == 0xcffaedfe
+            && u32::from_le_bytes([
+                *hp.add(4),
+                *hp.add(5),
+                *hp.add(6),
+                *hp.add(7),
+            ]) == cputype
+        {
             return 1;
         }
         0
@@ -395,8 +418,7 @@ unsafe fn guest_child_runs_native(path: *const c_char) -> c_int {
             return 0;
         }
         let x86 = file_has_x86_slice(real.as_ptr()) != 0;
-        let arm = file_has_slice(real.as_ptr(), OCERZ_CPU_TYPE_ARM64) != 0;
-        if !x86 && arm {
+        if !x86 && file_has_slice(real.as_ptr(), OCERZ_CPU_TYPE_ARM64) != 0 {
             return 1;
         }
         if libc::strncmp(real.as_ptr(), c"/usr/local/".as_ptr(), 11) == 0 {
@@ -412,7 +434,9 @@ unsafe fn guest_child_runs_native(path: *const c_char) -> c_int {
         if !system_path {
             return 0;
         }
-        if arm && file_links_xcselect(real.as_ptr()) != 0 {
+        if file_has_slice(real.as_ptr(), OCERZ_CPU_TYPE_ARM64) != 0
+            && file_links_xcselect(real.as_ptr()) != 0
+        {
             return 1;
         }
         if crate::ffi::ocerz_mode != (crate::ffi::OCERZ_MODE_NATIVE as c_int) {
@@ -429,7 +453,7 @@ unsafe fn guest_child_runs_native(path: *const c_char) -> c_int {
                 return 0;
             }
         }
-        c_int::from(arm)
+        file_has_slice(real.as_ptr(), OCERZ_CPU_TYPE_ARM64)
     }
 }
 
@@ -1077,7 +1101,7 @@ unsafe fn guest_exec_apply(
         if !libc::getenv(c"OCERZ_EXECLOG".as_ptr()).is_null() {
             libc::fprintf(crate::log::stderr(), c"ocerz: EXECLOG ->".as_ptr());
             for k in 0..n {
-                let arg = hargv[k as usize];
+                let arg = *hargv.as_ptr().add(k as usize);
                 libc::fprintf(
                     crate::log::stderr(),
                     c" %s".as_ptr(),
