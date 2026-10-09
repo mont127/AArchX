@@ -39,7 +39,7 @@
 | vdylib.c | 1424 | native1 | in progress |
 | vm.c | 4376 | memvm | in progress |
 | x87.c | 1277 | - | C |
-| abicall.s | 237 | native1 | in progress |
+| abicall.s | 237 | native1 | ported |
 | leaf.s | 598 | native1 | ported |
 | objcguard.s | 60 | native2 | ported |
 
