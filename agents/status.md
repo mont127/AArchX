@@ -10,7 +10,7 @@
 | cache.c | 1496 | runtime (ee47e957) | in progress |
 | cpu.c | 163 | decode-agent | ported |
 | decode.c | 4435 | decode-agent | in progress |
-| dyld.c | 5840 | dyld-agent | in progress |
+| dyld.c | 5840 | dyld-agent | ported |
 | dyldapi.c | 2636 | dyld-agent | ported |
 | flags.c | 230 | - | ported |
 | flags_live.c | 283 | interp-agent | ported |
@@ -22,9 +22,9 @@
 | jit_cache.c | 3185 | devin-4a0e3105 | in progress |
 | jit_control.c | 2070 | jit-control-agent | in progress |
 | jit_flags.c | 2778 | jit-flags-agent | in progress |
-| jit_fp.c | 3203 | jit-fp-agent | in progress |
-| jit_integer.c | 2678 | jit-integer-agent | in progress |
-| jit_memory.c | 2184 | jit-memory-agent | in progress |
+| jit_fp.c | 3203 | jit-fp-agent | ported |
+| jit_integer.c | 2678 | jit-integer-agent | ported: rust/src/ported/jit_integer.rs, emit audit MATCH, no C shim (agents/jit-integer.md) |
+| jit_memory.c | 2184 | jit-memory-agent | ported: rust/src/ported/jit_memory.rs, emit audit MATCH, no C shim (agents/jit-memory.md) |
 | jit_simd.c | 3121 | jit-simd-agent | in progress |
 | jit_tcache.c | 1063 | jit-tcache-agent | ported |
 | loader.c | 378 | runtime (ee47e957) | in progress |
