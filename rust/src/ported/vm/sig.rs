@@ -1243,9 +1243,15 @@ pub(super) unsafe extern "C" fn crash_handler(
                                     j = str_into(j, c" x".as_ptr());
                                     j = hex_into(j, (21 + i) as u64);
                                     j = str_into(j, c"/g".as_ptr());
-                                    j = hex_into(j, ji.host_holds[i as usize] as u64);
+                                    j = hex_into(
+                                        j,
+                                        *ji.host_holds.get_unchecked(i as usize) as u64,
+                                    );
                                     j = str_into(j, c"=".as_ptr());
-                                    j = hex_into(j, (*(*uc).uc_mcontext).ss.x[21 + i as usize]);
+                                    j = hex_into(
+                                        j,
+                                        *(*(*uc).uc_mcontext).ss.x.get_unchecked(21 + i as usize),
+                                    );
                                 }
                                 j = str_into(j, c"\n".as_ptr());
                                 write(
@@ -1450,7 +1456,7 @@ pub(super) unsafe extern "C" fn crash_handler(
                     let mut t = tb.as_mut_ptr() as *mut c_char;
                     t = str_into(
                         t,
-                        if delivered != 0 {
+                if delivered != 0 {
                             c"ocerz: SIG[".as_ptr()
                         } else {
                             c"ocerz: SIGNH[".as_ptr()
@@ -1613,6 +1619,7 @@ pub(super) unsafe extern "C" fn crash_handler(
                     }
                 }
                 CRASH_DEPTH = 0;
+                write(2, c"P3 post dlv\n".as_ptr() as *const c_void, 11);
                 if delivered != 0 {
                     ocerz_recov_note(5, fault_rip);
                     siglongjmp(G_SIG_RECOVER, 1);

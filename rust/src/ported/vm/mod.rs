@@ -281,7 +281,7 @@ pub(super) type Dl_info = dl_info;
 
 unsafe extern "C" {
     pub fn siglongjmp(env: *mut sigjmp_buf, val: c_int) -> !;
-    pub(super) fn mach_task_self_() -> mach_port_t;
+    pub(super) static mach_task_self_: mach_port_t;
     pub(super) fn thread_suspend(target_act: thread_act_t) -> kern_return_t;
     pub(super) fn thread_resume(target_act: thread_act_t) -> kern_return_t;
     pub(super) fn thread_get_state(
@@ -386,7 +386,7 @@ pub(super) type vm_map_t = mach_port_t;
 
 #[inline(always)]
 pub(super) unsafe fn mach_task_self() -> mach_port_t {
-    unsafe { mach_task_self_() }
+    unsafe { mach_task_self_ }
 }
 
 #[inline(always)]
