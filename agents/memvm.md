@@ -46,11 +46,16 @@ No semantic deviations intended.
 
 | measurement | C (~/AArchX-c) | Rust port |
 |---|---|---|
-| guest suite, jit (`tests/run_guest_tests.sh`) | 1.76-1.78 s | 1.95 s |
-| guest suite, no-jit | 4.75-4.96 s | 5.72 s |
-| dynamic suite | 131.7-136.4 s | 145.4 s |
+| guest suite, no-jit (`bash tests/run_guest_tests.sh --no-jit`, x3) | 5.87 / 5.35 / 5.34 s | 5.37 / 5.16 / 5.16 s |
+| guest suite, jit (`bash tests/run_guest_tests.sh`, x3) | 1.88 / 1.91 / 2.42 s | 1.87 / 1.88 / 1.84 s |
+| dynamic suite | see vm section (145.05/136.90 Rust vs 143.23/145.00 C, both modules ported) | |
 | microbench: 200x map_anywhere(1 GB)+unmap, best of 5 | 0.0925 s | 0.0953 s |
 | microbench: 1e6 ocerz_addr_prot, best of 5 | 0.0019 s | 0.0019 s |
+
+Suite commands run from each tree root, alternating ~/AArchX-c and ~/AArchX,
+nothing else running; each number is wall clock of the whole runner. The
+earlier table's "Rust slower" rows were measured while concurrent builds
+were running and are discarded as contaminated.
 
 Bench program: ~/memvm-bench/membench.c (binaries membench-c / membench-rust,
 linked like the unit tests: CORE_OBJS + libocerz_rs.a for the rust tree,
@@ -138,3 +143,9 @@ guest no-jit x3: 6.03 6.67 6.29 (Rust) vs 6.60 6.51 6.17 (C)
 guest jit    x3: 1.99 2.38 2.42 (Rust) vs 2.05 2.61 2.14 (C)
 dynamic      x2: 145.05 136.90  (Rust) vs 143.23 145.00 (C)
 Parity within noise on all three suites.
+
+mem static audit: ~/memvm/mem-static-audit.md (lead) — all widths, signedness
+and initializers match C. Follow-up: all static-array indexing on fault and
+map paths (REGIONS, G_PIN, MAP, CANDIDATES) is raw/get_unchecked; C indexes
+these unchecked and a bounds panic in the fault path would kill the handler.
+vm.rs got the same treatment across its signal/dump/run-loop paths.
