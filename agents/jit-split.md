@@ -7,6 +7,93 @@ opening prose is distributed by topic, and existing inline explanations have
 been moved to the corresponding opening blocks. The Makefile wildcard discovers
 the new files without a build-system edit.
 
+## Emission oracle for Rust ports
+
+Run on arm64 macOS with Clang, Python 3.9+ and the repository's Cargo/toolchain
+on PATH. The reference is the C JIT split at `cac4b33` (its unrelated
+flags/globals modules already use the Rust scaffold):
+
+```sh
+git worktree add --detach ../AArchX-jit-reference cac4b33
+tools/jit_emit_audit.sh ../AArchX-jit-reference
+tools/jit_emit_audit.sh ../AArchX-jit-reference /path/to/candidate
+```
+
+The omitted candidate defaults to the checkout containing the tool, not the
+current directory. Both trees are built normally, then separate instrumented
+executables are linked in a temporary directory. Sources, normal JIT objects
+and normal Rust archives are not replaced. Linking uses Makefile's filtered
+`CORE_OBJS`, avoiding stale objects for already-ported C modules. Both binaries
+use the **reference's** `tests/diff32.c`, seed 1, 20,000 random cases, all hand
+cases, and both offset/low-shadow layouts with `--jit-required`. Ambient
+`OCERZ_*` tuning variables are removed from corpus processes;
+`OCERZ_TCACHE=roundtrip` and `OCERZ_NO_ARM_EXEC=1` are set explicitly. Do not
+run this alongside another gate or mutate either tree during the comparison.
+
+Stdout starts with one `MATCH` or `MISMATCH` summary, followed on mismatch by
+the first three differing blocks: ordinal/layout, guest RIP, x86 disassembly,
+relocation descriptors and both complete raw little-endian arm64 byte streams.
+Build/run progress goes to stderr. Exit status is 0 for MATCH, 1 for MISMATCH,
+2 for a failed/incomplete oracle (build failure, absent hook, malformed stream,
+failed corpus, timeout, etc.). A failed guest run never produces MATCH. Build
+logs, corpus logs, raw audit streams and instrumented binaries are retained
+on failure at the printed artifact path. To retain successful runs too, set
+`OCERZ_JIT_AUDIT_DIR=/path/to/artifact-parent`; each invocation gets a unique
+subdirectory. Normal successful runs remove their temporary artifacts.
+
+The comparison masks only form-1 two-word address literals and form-0
+MOVZ/MOVK imm16 fields. MOVZ/MOVK shape/register consistency, bounds and
+non-overlapping relocation ranges are validated before masking. All opcode,
+register and non-relocated bits remain significant. Relocation offset, kind,
+form **and semantic argument** must match, as must record order, block count,
+guest RIP and x86 instruction boundaries. Disassembly formatting is diagnostic
+only. Missing/empty/truncated streams cannot pass. The versioned `AXJITA01`
+format is documented in `tools/jit_emit_audit/writer.c` and keeps raw bytes
+unmodified for diagnostics. The legacy hashes below use the earlier normalized
+format, not these richer raw stream files.
+
+### Hook contract: preserve this in the Rust core
+
+`translate` calls the C ABI symbol `ocerz_jit_emit_audit` after finalizing every
+arm64 word and relocation, immediately before `int tc_save = 0` / `tc_bind`,
+while the existing translation lock is held. Its bindgen-visible signature is:
+
+```c
+void ocerz_jit_emit_audit(uint64_t rip, const uint32_t *code, uint32_t nwords,
+                          const X86Insn *insns, uint32_t ninsns,
+                          const TcReloc *rel, uint32_t nrel);
+```
+
+Arguments are `rip`, `entry`, `blk->code_words`, `blk->insns`, `n`, `g_tc_rel`,
+and `g_tc_nrel`, in that order. The sink copies synchronously and retains no
+caller pointers. It lives only in `tools/jit_emit_audit/writer.c`; do not
+provide a competing implementation in the Rust staticlib. Keep `TcReloc`
+semantics and numbering intact in the tcache port.
+
+C uses `#ifdef OCERZ_JIT_EMIT_AUDIT`; the runner defines it only for its
+temporary core object. The old `cac4b33` core has no hook, so the runner inserts
+the same call into a temporary source copy at the unique pre-tcache marker.
+When `jit` itself is ported, preserve this call behind
+`#[cfg(ocerz_jit_emit_audit)]` using `ffi::ocerz_jit_emit_audit` and the same raw
+pointer/integer arguments. The runner builds a separate Rust archive with
+`cargo rustc --release --lib --target-dir ... -- --cfg ocerz_jit_emit_audit`.
+It does not enable this cfg in normal builds. The runtime environment variable
+`OCERZ_JIT_EMIT_AUDIT` names the output stream; unset/empty disables recording
+even in instrumented executables. Normal C/Rust builds contain **no audit
+call or branch**, no environment lookup, and no linked writer.
+
+Tool checks: `python3 -B -m unittest discover -s tools/jit_emit_audit` and
+`bash -n tools/jit_emit_audit.sh`. Integration against `cac4b33` reproduces
+**215,295 blocks / 145,523,525 arm64 words**. This is the original i386 corpus,
+not exhaustive x86-64 instruction coverage; ports must still run the normal
+guest/differential/full gates.
+
+The integration self-check changed padding NOPs to YIELD in a disposable C
+candidate. Both architectural differentials still passed, but the oracle
+reported **14,601 differing blocks**, exited 1, and printed the requested RIP,
+disassembly and byte-stream diagnostics. Re-encoding the matching run in the
+legacy format also reproduced both SHA-256 hashes recorded below exactly.
+
 ## Ownership map
 
 Line counts include opening prose and declarations. The exact exported symbols
@@ -20,7 +107,7 @@ means `jit.c`; the other labels correspond to `jit_<label>.c`.
 
 | Piece | Lines | Responsibility | Calls other pieces | State (shared / private definitions) |
 | --- | ---: | --- | --- | ---: |
-| `src/jit.c` | 2844 | Translation orchestration, decoding a block, pin/hoist selection, emission dispatch, block fallback and perf reporting | cache, control, flags, fp, integer, memory, simd, tcache | 11 / 18 |
+| `src/jit.c` | 2848 | Translation orchestration, decoding a block, pin/hoist selection, emission dispatch, block fallback and perf reporting | cache, control, flags, fp, integer, memory, simd, tcache | 11 / 18 |
 | `src/jit_cache.c` | 3185 | Block/hash/arena lifecycle, invalidation indices, retire/flush barriers, signal-safe lookups, chaining and stop-site patching | control, core, flags, tcache | 27 / 51 |
 | `src/jit_control.c` | 2070 | Calls/returns, indirect dispatch, RAS, bridge/leaf transitions, interpreter slow calls and tracing helpers | cache, flags, integer, memory, simd | 33 / 7 |
 | `src/jit_flags.c` | 2778 | Flag/GPR/XMM liveness, deferred NZCV recipes, cmp/test/Jcc fusion, superblocks, if-conversion and branch-flip feedback | cache, core, integer, memory, simd, tcache | 31 / 6 |
@@ -32,14 +119,15 @@ means `jit.c`; the other labels correspond to `jit_<label>.c`.
 
 ## Shared header and non-negotiable contracts
 
-The 2,188-line `include/ocerz/jit_internal.h` defines `OcerzJit`, `JitBlock`, edge/profiling,
+The 2,192-line `include/ocerz/jit_internal.h` defines `OcerzJit`, `JitBlock`, edge/profiling,
 fault/lane-recovery, cache-index, translation-cache and scratch-state layouts,
 register constants, macros and cross-piece prototypes/externs. It contains 129
 small `static inline` helpers, including the transitive tiny helpers they call.
 They need private inline Rust equivalents; bindgen deliberately does not bind
 static inline definitions. Do not create extra instances of their shared state.
 
-- All 698 original function bodies retain the same C tokens. Only placement and
+- All 698 original function bodies retain the same C tokens in normal builds
+  (the later audit call is preprocessed out). Only placement and
   linkage change. Functions whose addresses are used by emitted code/tcache
   remain real definitions, not header-local inline copies.
 - Each shared mutable variable is defined in exactly one C piece. Newly exported
@@ -606,8 +694,9 @@ payloads are normalized: form-1 two-word pointer literals are zeroed; for form-0
 four-instruction MOVZ/MOVK sites only the imm16 bits (`0x1fffe0`) are masked.
 Opcode and destination-register bits, all other words, instruction counts and
 relocation descriptions are compared exactly. Literal address bytes cannot be
-identical across independently linked/ASLR-loaded binaries. No instrumentation
-is included in production sources.
+identical across independently linked/ASLR-loaded binaries. This initial audit
+used temporary source copies. The reusable oracle above adds a compile-time
+disabled hook; no instrumentation is included in production binaries.
 
 The recorded offset corpus has 107,635 blocks and 72,747,100 arm64 words; the
 low-shadow corpus has 107,660 blocks and 72,776,425 words. Both files compare
