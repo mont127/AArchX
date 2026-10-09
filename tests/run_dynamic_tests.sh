@@ -109,7 +109,8 @@ run_file_case() {
 # exercised; skips cleanly if no x86_64 C++ toolchain is present.
 run_cpp_file_case() {
     local name="$1" src="$2" want_out="$3"
-    if ! clang++ -arch x86_64 -std=c++17 -pthread -o "$TMP/$name" "$src" 2>/dev/null; then
+    shift 3
+    if ! clang++ -arch x86_64 -std=c++17 -pthread -o "$TMP/$name" "$src" "$@" 2>/dev/null; then
         echo "SKIP $name (no x86_64 c++ toolchain)"; return
     fi
 
@@ -916,6 +917,8 @@ run_file_case dspawn_arm64_only tests/dynamic/spawn_arm64_only.c 'OK'
 run_file_case dsocket_echo tests/dynamic/socket_echo.c 'OK'
 run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
 run_cpp_file_case dcpp_global_ctor tests/dynamic/cpp_global_ctor.cpp 'OK'
+run_cpp_file_case dweak_main_first tests/dynamic/weak_main_first.cpp 'OK'
+run_cpp_file_case dweak_main_first_classic tests/dynamic/weak_main_first.cpp 'OK' -Wl,-no_fixup_chains
 # tcache_work.c against one fresh translation cache directory, four runs (with
 # no free-space floor, so a full disk on the test machine is not a failure): one
 # that records, one that must load what the first stored, one under
