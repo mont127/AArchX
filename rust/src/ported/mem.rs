@@ -537,7 +537,7 @@ unsafe fn region_for_range(lo: u64, hi: u64) -> *mut MemRegion {
         }
         let n = REGION_N.load(Ordering::Acquire);
         for k in 0..n {
-            let r = &raw mut REGIONS[k as usize];
+            let r = ((&raw mut REGIONS) as *mut MemRegion).add(k as usize);
             if lo >= (*r).glo && hi <= (*r).ghi {
                 return r;
             }
@@ -667,14 +667,14 @@ unsafe fn region_add(glo: u64, ghi: u64) -> *mut MemRegion {
             libc::free(slots as *mut c_void);
             return ptr::null_mut();
         }
-        let idx = region_n as usize;
-        REGIONS[idx].glo = glo;
-        REGIONS[idx].ghi = ghi;
-        REGIONS[idx].bm = bm;
-        REGIONS[idx].shared = shared;
-        REGIONS[idx].armed = armed;
-        REGIONS[idx].slots = slots;
-        let result = &raw mut REGIONS[idx];
+        let rp = ((&raw mut REGIONS) as *mut MemRegion).add(region_n as usize);
+        (*rp).glo = glo;
+        (*rp).ghi = ghi;
+        (*rp).bm = bm;
+        (*rp).shared = shared;
+        (*rp).armed = armed;
+        (*rp).slots = slots;
+        let result = rp;
         REGION_N.store(region_n + 1, Ordering::Release);
         result
     }
@@ -753,7 +753,8 @@ struct PinRange {
 unsafe fn pinned_overlap(lo: u64, hi: u64) -> c_int {
     unsafe {
         for i in 0..G_PIN_N {
-            if lo < G_PIN[i as usize].hi && hi > G_PIN[i as usize].lo {
+            let p = ((&raw const G_PIN) as *const PinRange).add(i as usize);
+            if lo < (*p).hi && hi > (*p).lo {
                 return 1;
             }
         }
@@ -766,8 +767,8 @@ pub unsafe extern "C" fn ocerz_mem_pinned(gaddr: u64, len: u64) -> c_int {
     unsafe { (G_PIN_N != 0 && len != 0 && pinned_overlap(gaddr, gaddr + len) != 0) as c_int }
 }
 
-/* Calls fn on each part of [lo, hi) outside the pinned ranges, in order, and
-answers the first failure. */
+/// Calls fn on each part of [lo, hi) outside the pinned ranges, in order, and
+/// answers the first failure.
 unsafe fn for_unpinned(
     mut lo: u64,
     hi: u64,
@@ -779,7 +780,7 @@ unsafe fn for_unpinned(
             let mut end = hi;
             let mut skip = 0u64;
             for i in 0..G_PIN_N {
-                let p = &G_PIN[i as usize];
+                let p = &*((&raw const G_PIN) as *const PinRange).add(i as usize);
                 if p.hi <= lo || p.lo >= hi {
                     continue;
                 }
@@ -849,8 +850,7 @@ unsafe fn owner_create_locked(
         owner.guard_hi = guard_hi;
         owner.live_slots = live_slots;
         owner.next_free = 0;
-        owner.region =
-            ((r as usize - (&raw mut REGIONS[0]) as usize) / size_of::<MemRegion>()) as u16;
+        owner.region = ((r as usize - (&raw mut REGIONS) as usize) / size_of::<MemRegion>()) as u16;
         owner.active = 1;
         id
     }
@@ -890,7 +890,7 @@ unsafe fn owner_retire_locked(id: u32, affected_lo: *mut u64, affected_hi: *mut 
         if owner.active == 0 {
             return;
         }
-        let r = &raw mut REGIONS[owner.region as usize];
+        let r = ((&raw mut REGIONS) as *mut MemRegion).add(owner.region as usize);
         let mut p = owner.guard_lo;
         while p < owner.guard_hi {
             let i = slot_index(r, p);
@@ -2278,19 +2278,20 @@ unsafe fn pin_add(lo: u64, hi: u64) {
             [0; (OCERZ_LOW_LIMIT >> 17) as usize];
         let mut p = lo & !(OCERZ_HOST_PAGE - 1);
         while p < hi {
-            MAP[(p >> 17) as usize] |= 1u8 << ((p >> 14) & 7);
+            *((&raw mut MAP) as *mut u8).add((p >> 17) as usize) |= 1u8 << ((p >> 14) & 7);
             p += OCERZ_HOST_PAGE;
         }
         AtomicPtr::from_ptr(&raw mut ocerz_pin_map)
             .store((&raw mut MAP) as *mut u8, Ordering::Release);
-        if G_PIN_N != 0 && G_PIN[(G_PIN_N - 1) as usize].hi == lo {
-            G_PIN[(G_PIN_N - 1) as usize].hi = hi;
+        let gp = (&raw mut G_PIN) as *mut PinRange;
+        if G_PIN_N != 0 && (*gp.add((G_PIN_N - 1) as usize)).hi == lo {
+            (*gp.add((G_PIN_N - 1) as usize)).hi = hi;
         } else if (G_PIN_N as usize) < PIN_MAX {
-            G_PIN[G_PIN_N as usize].lo = lo;
-            G_PIN[G_PIN_N as usize].hi = hi;
+            (*gp.add(G_PIN_N as usize)).lo = lo;
+            (*gp.add(G_PIN_N as usize)).hi = hi;
             G_PIN_N += 1;
         } else {
-            G_PIN[(G_PIN_N - 1) as usize].hi = hi;
+            (*gp.add((G_PIN_N - 1) as usize)).hi = hi;
         }
     }
 }
@@ -2370,7 +2371,7 @@ pub unsafe extern "C" fn ocerz_mem_unpinned_parts(
             let mut next = hi;
             let mut resume = 0u64;
             for i in 0..G_PIN_N {
-                let p = &G_PIN[i as usize];
+                let p = &*((&raw const G_PIN) as *const PinRange).add(i as usize);
                 if p.hi <= at || p.lo >= hi {
                     continue;
                 }
@@ -2409,7 +2410,7 @@ pub unsafe extern "C" fn ocerz_mem_pin_refresh() {
     unsafe {
         let mut failed = 0;
         for i in 0..G_PIN_N {
-            let pin = &G_PIN[i as usize];
+            let pin = &*((&raw const G_PIN) as *const PinRange).add(i as usize);
             let mut dst: MachVmAddress = ocerz_low_base + pin.lo;
             let mut cur: VmProt = 0;
             let mut max: VmProt = 0;
@@ -2620,7 +2621,7 @@ pub unsafe extern "C" fn ocerz_mem_init_low_shadow() -> c_int {
         } else {
             let mut k = 0;
             while k < CANDIDATES.len() && base == 0 {
-                base = reserve_host_fixed(CANDIDATES[k], blocksz);
+                base = reserve_host_fixed(*CANDIDATES.get_unchecked(k), blocksz);
                 k += 1;
             }
             if base == 0 {
@@ -2708,7 +2709,7 @@ pub unsafe extern "C" fn ocerz_guest_vm_region(
             let mut next: *const MemRegion = ptr::null();
             let n = REGION_N.load(Ordering::Relaxed);
             for k in 0..n {
-                let rk = &raw const REGIONS[k as usize];
+                let rk = ((&raw const REGIONS) as *const MemRegion).add(k as usize);
                 if cls.is_null() && query >= (*rk).glo && query < (*rk).ghi {
                     cls = rk;
                 } else if (*rk).glo > query && (next.is_null() || (*rk).glo < (*next).glo) {
@@ -3482,7 +3483,7 @@ pub unsafe extern "C" fn ocerz_mem_disarm_all(pages: *mut u64, max: c_int) -> c_
         let rn = REGION_N.load(Ordering::Relaxed);
         let mut ri = 0;
         while ri < rn && n < max {
-            let r = &raw mut REGIONS[ri as usize];
+            let r = ((&raw mut REGIONS) as *mut MemRegion).add(ri as usize);
             if !(*r).armed.is_null() {
                 let np = (((*r).ghi - (*r).glo) / OCERZ_HOST_PAGE) as usize;
                 let mut i = 0;
@@ -3603,7 +3604,8 @@ pub unsafe extern "C" fn ocerz_mem_overlaps(gaddr: u64, len: u64) -> c_int {
         let hi = gaddr + len;
         let n = REGION_N.load(Ordering::Acquire);
         for k in 0..n {
-            if lo < REGIONS[k as usize].ghi && hi > REGIONS[k as usize].glo {
+            let rk = ((&raw const REGIONS) as *const MemRegion).add(k as usize);
+            if lo < (*rk).ghi && hi > (*rk).glo {
                 return 1;
             }
         }
