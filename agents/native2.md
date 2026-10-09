@@ -87,3 +87,61 @@ sysctl, sandbox).
   | mmap  | 50k mmap+munmap | 0.16 / 0.17 | 0.16 / 0.17 |
 
   Parity within timer noise, as expected — sysbridge is not a hot loop.
+
+## objcclass.c -> rust/src/ported/objcclass/
+
+Layout: `mod.rs` carries the C file's opening prose as `//!`; `common.rs` has
+the mem.h inlines (copied from sysbridge's private copies), the oc_* word
+readers, the OC_* flag constants, the lazy `OCERZ_OBJCLOG` check (an
+`AtomicU64` instead of C's racy `static int`) and the `oc_stop!` macro_rules!
+replacement for the variadic `_Noreturn` function (fputs prefix + variadic
+fprintf + newline + fflush + `exit(OCERZ_BRIDGE_UNIMPL_EXIT)`; the format is
+`concat!($fmt, "\n\0")` — a `&str` pointer is NOT NUL-terminated and fprintf
+overreads it into a SIGSEGV, which the unit gate caught). `read.rs` holds the
+guest-metadata readers (its `//!` is the "class stays where the guest put it"
++ "methods" prose) and `define.rs` the host-runtime definer (OcSym table,
+maps, dead IMPs, protocol/class/category definition, ensure/prepare/swift,
+define_image, run_loads; its `//!` is the remaining prose blocks).
+
+- All 15 `ocerz_objc_*` readers and 11 `ocerz_objcbridge_*` definer exports
+  verified `T` in libocerz_rs.a and exported in `ocerz`.
+- OcSym is `#[repr(C)] { name: *const c_char, addr: AtomicPtr<c_void> }` +
+  `unsafe impl Sync`, names via `concat!($name, "\0")`, SeqCst load/store
+  through `ocerz_bridge_host_symbol(OCERZ_OBJC_LIBOBJC, ...)`, and each runtime
+  call transmutes the address to an `unsafe extern "C" fn` of the exact
+  signature (bool where C passes _Bool).
+- `g_oc_lock` is `static mut pthread_mutex_t = PTHREAD_MUTEX_INITIALIZER`
+  (`&raw mut`); the five OcMaps, `g_oc_loads`/`_n`/`_cap`, `g_oc_defining` are
+  `static mut`; `g_oc_dead` is `AtomicPtr<OcDead>` SeqCst. `nm -m ocerz` shows
+  every writable object in `__DATA,__bss`/`__data` — nothing in `__TEXT,__const`.
+- `oc_dead_imp` is a private `extern "C" fn` (handed to the runtime as an IMP);
+  `oc_order_cmp` is `extern "C"` for qsort (libc crate wants `Some(cmp)`).
+  OcDead's flexible `why[]` is `[c_char; 0]` with `malloc(size_of + len + 1)`.
+- `ocerz_abi_round_swap`/`_of_mxcsr` are `static inline` in abi.h — private
+  copies (`mrs/msr fpcr`, `nomem, nostack, preserves_flags`). `mach_vm_read_
+  overwrite` and the mach-o loader structs are private decls/repr(C) structs
+  (libc lacks them).
+- longjmp finding: +load runs through `ocerz_vm_call` -> `vm_call_core`, whose
+  `sigsetjmp`/`siglongjmp` recovery point lives *inside* the C callee
+  (src/vm.c:3582), so a guest fault never unwinds a Rust frame — Rust frames
+  sit strictly above the jump target. Drop-free observed anyway.
+- Gotcha (new): every `&str`/`String` pointer handed to C must be a `c"..."`
+  literal or explicitly `\0`-terminated as `*const c_char`; `"...".as_ptr()`
+  on a Rust string has no NUL and fprintf reads past it (upstream fix
+  f9753d8 hit this in the shared log macros too — a stray `:/:` line broke
+  the compat framework check on the tip, fixed by the rebase).
+- Verification: `OCERZ_NO_ARM_EXEC=1 test_objcbridge` 123753 checks 0 failed
+  (this exercises define_image incl. the lock); test_bridge 1245/0,
+  test_callback 132015/0, test_attach 270/0; fast gate pass; full gate pass
+  including native framework tests (all jit/interpreter/slow-bridge suites).
+- Perf: class definition runs at image load. Guests (clang -arch x86_64):
+  `many` = 2000 classes (~2-3 methods + a property each, 200 protocols, 200
+  categories) touching a handful at exit; `frameworks.x86_64` = the native
+  framework suite's own binary. `./ocerz -native <bin>` x5, wall seconds:
+
+  | guest | C reference min/median | Rust tip min/median |
+  |-------|----------------------|---------------------|
+  | many (2000 classes) | 0.02 / 0.02 | 0.02 / 0.02 |
+  | frameworks.x86_64 | 0.05 / 0.05 | 0.05 / 0.06 |
+
+  Parity — definition work is dominated by the host runtime, not the reader.
