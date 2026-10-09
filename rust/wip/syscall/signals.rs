@@ -43,10 +43,6 @@ static mut GUEST_WAITERS_LIST: [GuestWaiter; GUEST_WAITERS] = [GuestWaiter {
     accept: 0,
 }; GUEST_WAITERS];
 static mut GUEST_WAITERS_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
-pub(super) static mut G_BIGRING: *mut SysRingEntry = ptr::null_mut();
-pub(super) static mut G_BIGRING_N: u32 = 0;
-pub(super) static mut G_BIGRING_MASK: u32 = 0;
-
 #[unsafe(no_mangle)]
 #[thread_local]
 pub static mut g_ocerz_deliver_src: c_int = 0;
@@ -61,7 +57,7 @@ unsafe extern "C" {
     fn mach_port_deallocate(task: mach_port_t, name: mach_port_t) -> c_int;
     fn pthread_mach_thread_np(thread: libc::pthread_t) -> mach_port_t;
     fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
-    static mach_task_self_: mach_port_t;
+    static mut mach_task_self_: mach_port_t;
 }
 
 #[inline(always)]
@@ -434,14 +430,13 @@ unsafe fn guest_sigaltstack_apply(cpu: *mut OcerzCPU, ss: u64, oss: u64) -> c_in
                 (*cpu).sig_altstack_sp = 0;
                 (*cpu).sig_altstack_size = 0;
             } else {
-                let size = ocerz_ld(ss.wrapping_add(8), 8);
-                if size < DARWIN_MINSIGSTKSZ as u64 {
+                if ocerz_ld(ss.wrapping_add(8), 8) < DARWIN_MINSIGSTKSZ as u64 {
                     return libc::ENOMEM;
                 }
                 (*cpu).sig_altstack_sp = ocerz_ld(ss, 8);
-                (*cpu).sig_altstack_size = size;
-                if (*cpu).sig_altstack_sp != 0 && size != 0 {
-                    crate::ffi::ocerz_protect((*cpu).sig_altstack_sp, size, 3);
+                (*cpu).sig_altstack_size = ocerz_ld(ss.wrapping_add(8), 8);
+                if (*cpu).sig_altstack_sp != 0 && (*cpu).sig_altstack_size != 0 {
+                    crate::ffi::ocerz_protect((*cpu).sig_altstack_sp, (*cpu).sig_altstack_size, 3);
                 }
             }
         }
@@ -668,13 +663,17 @@ pub unsafe extern "C" fn ocerz_signal_deliver(
         for i in 0..16usize {
             ocerz_st128(
                 mc.wrapping_add(fpoff + OCERZ_FP_XMM_OFF + i as u64 * 16),
-                (*cpu).xmm[i],
+                *ptr::addr_of!((*cpu).xmm)
+                    .cast::<crate::ffi::Ocerz128>()
+                    .add(i),
             );
         }
         for i in 0..16usize {
             ocerz_st128(
                 mc.wrapping_add(fpoff + OCERZ_FP_YMMH_OFF + i as u64 * 16),
-                (*cpu).ymmh[i],
+                *ptr::addr_of!((*cpu).ymmh)
+                    .cast::<crate::ffi::Ocerz128>()
+                    .add(i),
             );
         }
         let old_mask = (*cpu).sig_mask;
@@ -733,9 +732,12 @@ pub(super) unsafe fn deliver_async_signals(
         }
         let mut n = 0;
         loop {
+            if sig_pending_atomic(cpu).load(Ordering::SeqCst) & !(*cpu).sig_mask == 0 {
+                break;
+            }
             let ready = sig_pending_atomic(cpu).load(Ordering::SeqCst) & !(*cpu).sig_mask;
             if ready == 0 {
-                break;
+                continue;
             }
             let s = ready.trailing_zeros() as c_int + 1;
             sig_pending_atomic(cpu).fetch_and(!(1u64 << (s - 1)), Ordering::SeqCst);
@@ -890,11 +892,15 @@ pub(super) unsafe fn sys_sigreturn(
         (*cpu).rip = ocerz_ld(mc.wrapping_add(144), 8);
         (*cpu).rflags = ocerz_ld(mc.wrapping_add(152), 8) | 2;
         for i in 0..16usize {
-            (*cpu).xmm[i] = ocerz_ld128(mc.wrapping_add(fpoff + OCERZ_FP_XMM_OFF + i as u64 * 16));
+            *ptr::addr_of_mut!((*cpu).xmm)
+                .cast::<crate::ffi::Ocerz128>()
+                .add(i) = ocerz_ld128(mc.wrapping_add(fpoff + OCERZ_FP_XMM_OFF + i as u64 * 16));
         }
         if mcsize >= OCERZ_MCTX_SIZE as u64 {
             for i in 0..16usize {
-                (*cpu).ymmh[i] =
+                *ptr::addr_of_mut!((*cpu).ymmh)
+                    .cast::<crate::ffi::Ocerz128>()
+                    .add(i) =
                     ocerz_ld128(mc.wrapping_add(fpoff + OCERZ_FP_YMMH_OFF + i as u64 * 16));
             }
             (*cpu).ymmh_all_zero = 0;

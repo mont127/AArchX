@@ -234,21 +234,22 @@ pub unsafe extern "C" fn ocerz_pe_stack_dump(cpu: *mut OcerzCPU, tag: *const c_c
             let head = ldr.wrapping_add(0x10);
             let mut e = ocerz_ld(head, 8);
             while e != 0 && e != head && nmods < mods.len() {
-                mods[nmods].base = ocerz_ld(e.wrapping_add(0x30), 8);
-                mods[nmods].size = ocerz_ld(e.wrapping_add(0x40), 8) & 0xffffffff;
+                let module = mods.as_mut_ptr().add(nmods);
+                (*module).base = ocerz_ld(e.wrapping_add(0x30), 8);
+                (*module).size = ocerz_ld(e.wrapping_add(0x40), 8) & 0xffffffff;
                 let len = (ocerz_ld(e.wrapping_add(0x58), 2) as u16 as usize) / 2;
                 let buf = ocerz_ld(e.wrapping_add(0x60), 8);
                 let mut k = 0usize;
                 while k < len && k < 23 && buf != 0 {
                     let ch = ocerz_ld(buf.wrapping_add(2 * k as u64), 2) as u16 as u32;
-                    mods[nmods].name[k] = if (0x20..0x7f).contains(&ch) {
+                    *(*module).name.as_mut_ptr().add(k) = if (0x20..0x7f).contains(&ch) {
                         ch as c_char
                     } else {
                         b'?' as c_char
                     };
                     k += 1;
                 }
-                mods[nmods].name[k] = 0;
+                *(*module).name.as_mut_ptr().add(k) = 0;
                 nmods += 1;
                 e = ocerz_ld(e, 8);
             }
@@ -278,7 +279,8 @@ pub unsafe extern "C" fn ocerz_pe_stack_dump(cpu: *mut OcerzCPU, tag: *const c_c
                 w = ocerz_ld(at, 8);
             }
             for m in 0..nmods {
-                if w >= mods[m].base && w < mods[m].base.wrapping_add(mods[m].size) {
+                let module = &*mods.as_ptr().add(m);
+                if w >= module.base && w < module.base.wrapping_add(module.size) {
                     if pos < line.len() as i32 - 1 {
                         pos += libc::snprintf(
                             line.as_mut_ptr().add(pos as usize),
@@ -289,8 +291,8 @@ pub unsafe extern "C" fn ocerz_pe_stack_dump(cpu: *mut OcerzCPU, tag: *const c_c
                             } else {
                                 c"".as_ptr()
                             },
-                            mods[m].name.as_ptr(),
-                            w.wrapping_sub(mods[m].base) as libc::c_ulonglong,
+                            module.name.as_ptr(),
+                            w.wrapping_sub(module.base) as libc::c_ulonglong,
                         );
                     }
                     hits += 1;

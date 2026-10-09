@@ -42,7 +42,7 @@ static G_FORK_ATFORK_ERROR: core::sync::atomic::AtomicI32 = core::sync::atomic::
 unsafe extern "C" {
     fn mach_thread_self() -> libc::mach_port_t;
     fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> c_int;
-    static mach_task_self_: libc::mach_port_t;
+    static mut mach_task_self_: libc::mach_port_t;
     fn ocerz_vm_atfork_prepare();
     fn ocerz_vm_atfork_parent();
     fn ocerz_vm_atfork_child();
@@ -66,6 +66,10 @@ pub(super) unsafe fn g_wq_running_load() -> c_int {
 
 pub(super) unsafe fn g_wq_running_add(delta: c_int) -> c_int {
     G_WQ_RUNNING.fetch_add(delta, core::sync::atomic::Ordering::SeqCst)
+}
+
+pub(super) unsafe fn g_wq_running_sub(delta: c_int) -> c_int {
+    G_WQ_RUNNING.fetch_sub(delta, core::sync::atomic::Ordering::SeqCst)
 }
 
 pub(super) unsafe fn ocerz_kev_stride() -> u64 {

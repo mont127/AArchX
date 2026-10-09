@@ -7,7 +7,7 @@ use super::*;
 
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 unsafe extern "C" {
     fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
@@ -200,6 +200,42 @@ unsafe fn pagetrap_init() {
     } else {
         addr.wrapping_add(len)
     };
+}
+
+pub(super) unsafe fn pagetrap_post_mmap(
+    cpu: *mut OcerzCPU,
+    num: c_int,
+    orig: &[u64; 8],
+    result: u64,
+    err: c_int,
+) {
+    unsafe {
+        pagetrap_init();
+        let hi = *ptr::addr_of!(super::mem::g_pagetrap_hi);
+        let lo = *ptr::addr_of!(super::mem::g_pagetrap_lo);
+        if hi == 0
+            || num != 197
+            || err != 0
+            || orig[3] & libc::MAP_FIXED as u64 != 0
+            || result >= hi
+            || lo >= result.wrapping_add(orig[1])
+        {
+            return;
+        }
+        let mut detail = [0 as c_char; 160];
+        libc::snprintf(
+            detail.as_mut_ptr(),
+            detail.len(),
+            c" mmap-placed addr=%#llx len=%#llx prot=%#llx flags=%#llx fd=%lld -> %#llx".as_ptr(),
+            orig[0] as libc::c_ulonglong,
+            orig[1] as libc::c_ulonglong,
+            orig[2] as libc::c_ulonglong,
+            orig[3] as libc::c_ulonglong,
+            orig[4] as libc::c_longlong,
+            result as libc::c_ulonglong,
+        );
+        pe_scan_print(cpu, c"PAGETRAP".as_ptr(), detail.as_ptr());
+    }
 }
 
 unsafe fn pagetrap_check(cpu: *mut OcerzCPU, num: c_int) {
@@ -492,24 +528,25 @@ pub unsafe extern "C" fn ocerz_handle_syscall(vm: *mut OcerzVM, cpu: *mut OcerzC
             (*cpu).gpr[crate::ffi::OCERZ_RDX as usize] as libc::c_ulonglong,
         );
     }
-    static SCCOUNT_ON: AtomicU32 = AtomicU32::new(u32::MAX);
+    static SCCOUNT_ON: AtomicI32 = AtomicI32::new(-1);
     let mut count_enabled = SCCOUNT_ON.load(Ordering::Relaxed);
-    if count_enabled == u32::MAX {
-        let value = (!libc::getenv(c"OCERZ_SCCOUNT".as_ptr()).is_null()) as u32;
-        let _ = SCCOUNT_ON.compare_exchange(u32::MAX, value, Ordering::Relaxed, Ordering::Relaxed);
+    if count_enabled < 0 {
+        let value = c_int::from(!libc::getenv(c"OCERZ_SCCOUNT".as_ptr()).is_null());
+        let _ = SCCOUNT_ON.compare_exchange(-1, value, Ordering::Relaxed, Ordering::Relaxed);
         count_enabled = SCCOUNT_ON.load(Ordering::Relaxed);
     }
     if count_enabled != 0 && class == 2 {
         static HIST: [AtomicU64; 640] = [const { AtomicU64::new(0) }; 640];
         static TOTAL: AtomicU64 = AtomicU64::new(0);
+        let hist = HIST.as_ptr();
         if (0..640).contains(&num) {
-            HIST[num as usize].fetch_add(1, Ordering::Relaxed);
+            (*hist.add(num as usize)).fetch_add(1, Ordering::Relaxed);
         }
         let total = TOTAL.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         if total & ((1 << 16) - 1) == 0 {
             let mut snapshot = [0u64; 640];
             for i in 0..640 {
-                snapshot[i] = HIST[i].load(Ordering::Relaxed);
+                *snapshot.as_mut_ptr().add(i) = (*hist.add(i)).load(Ordering::Relaxed);
             }
             libc::fprintf(
                 crate::log::stderr(),
@@ -525,8 +562,9 @@ pub unsafe extern "C" fn ocerz_handle_syscall(vm: *mut OcerzVM, cpu: *mut OcerzC
             for _ in 0..6 {
                 let mut best = None;
                 for i in 0..640 {
-                    if best.map_or(true, |(_, value)| snapshot[i] > value) {
-                        best = Some((i, snapshot[i]));
+                    let value = *snapshot.as_ptr().add(i);
+                    if best.map_or(true, |(_, prior)| value > prior) {
+                        best = Some((i, value));
                     }
                 }
                 let Some((index, value)) = best else { break };
@@ -539,7 +577,7 @@ pub unsafe extern "C" fn ocerz_handle_syscall(vm: *mut OcerzVM, cpu: *mut OcerzC
                     index as c_int,
                     value >> 20,
                 );
-                snapshot[index] = 0;
+                *snapshot.as_mut_ptr().add(index) = 0;
             }
             libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
         }
@@ -589,11 +627,42 @@ pub unsafe extern "C" fn ocerz_handle_syscall(vm: *mut OcerzVM, cpu: *mut OcerzC
             }
         }
         2 => {
-            (*cpu).cur_sys_class = class;
-            (*cpu).cur_sys_num = num;
-            let rc = super::bsd::dispatch_bsd(vm, cpu, num);
-            (*cpu).cur_sys_class = -1;
-            rc
+            if count_enabled != 0 {
+                let a0 = (*cpu).gpr[crate::ffi::OCERZ_RDI as usize];
+                let a1 = (*cpu).gpr[crate::ffi::OCERZ_RSI as usize];
+                let a2 = (*cpu).gpr[crate::ffi::OCERZ_RDX as usize];
+                let ret = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize], 8);
+                let ic0 = (*vm).insn_count;
+                let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                (*cpu).block_started_ns = t0;
+                (*cpu).block_what = num;
+                (*cpu).cur_sys_class = class;
+                (*cpu).cur_sys_num = num;
+                let rc = super::bsd::dispatch_bsd(vm, cpu, num);
+                (*cpu).cur_sys_class = -1;
+                (*cpu).block_started_ns = 0;
+                let elapsed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW).wrapping_sub(t0);
+                if elapsed > 20_000_000 {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: SCSLOW num=%d dt=%llums addr=%#llx len=%#llx a2=%#llx ret=%#llx dicount=%#llx\n".as_ptr(),
+                        num,
+                        (elapsed / 1_000_000) as libc::c_ulonglong,
+                        a0 as libc::c_ulonglong,
+                        a1 as libc::c_ulonglong,
+                        a2 as libc::c_ulonglong,
+                        ret as libc::c_ulonglong,
+                        ((*vm).insn_count.wrapping_sub(ic0)) as libc::c_ulonglong,
+                    );
+                }
+                rc
+            } else {
+                (*cpu).cur_sys_class = class;
+                (*cpu).cur_sys_num = num;
+                let rc = super::bsd::dispatch_bsd(vm, cpu, num);
+                (*cpu).cur_sys_class = -1;
+                rc
+            }
         }
         3 => {
             (*cpu).cur_sys_class = class;
@@ -607,6 +676,15 @@ pub unsafe extern "C" fn ocerz_handle_syscall(vm: *mut OcerzVM, cpu: *mut OcerzC
                 && (*cpu).wine_teb_base != 0
                 && crate::ffi::ocerz_addr_committed((*cpu).wine_teb_base) != 0
             {
+                if env_set!("OCERZ_GSTRACE") {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: SIGSYS gs %#llx -> TEB %#llx rip=%#llx\n".as_ptr(),
+                        (*cpu).gs_base as libc::c_ulonglong,
+                        (*cpu).wine_teb_base as libc::c_ulonglong,
+                        (*cpu).rip as libc::c_ulonglong,
+                    );
+                }
                 (*cpu).unix_gs_base = (*cpu).gs_base;
                 (*cpu).gs_base = (*cpu).wine_teb_base;
             }
