@@ -434,13 +434,15 @@ pub unsafe extern "C" fn jcc_flip_wanted(rip: u64) -> c_int {
                 if end == e {
                     break;
                 }
-                ENV_FLIP_JCC_RIPS[ENV_FLIP_JCC_N as usize] = value;
+                let rips = ptr::addr_of_mut!(ENV_FLIP_JCC_RIPS).cast::<u64>();
+                ptr::write(rips.add(ENV_FLIP_JCC_N as usize), value);
                 ENV_FLIP_JCC_N += 1;
                 e = if *end == b',' as c_char { end.add(1) } else { end };
             }
         }
+        let rips = ptr::addr_of!(ENV_FLIP_JCC_RIPS).cast::<u64>();
         for i in 0..ENV_FLIP_JCC_N as usize {
-            if ENV_FLIP_JCC_RIPS[i] == rip {
+            if *rips.add(i) == rip {
                 return 1;
             }
         }
@@ -767,7 +769,7 @@ unsafe extern "C" fn decode_scan_cb(arg: *mut c_void) {
             }
             if (*s).purpose == 2 {
                 for k in 0..(*insn).nops as usize {
-                    let o = ptr::addr_of!((*insn).ops[k]);
+                    let o = ptr::addr_of!((*insn).ops).cast::<ffi::X86Operand>().add(k);
                     let kind = (*o).kind;
                     let reg = (*o).reg;
                     let base = (*o).base;
@@ -1076,7 +1078,11 @@ fn cc_after_subs(cc: c_uint) -> c_int {
         ffi::A64_LE as c_int,
         ffi::A64_GT as c_int,
     ];
-    if cc < 16 { T[cc as usize] } else { -1 }
+    if cc < 16 {
+        unsafe { *T.get_unchecked(cc as usize) }
+    } else {
+        -1
+    }
 }
 
 fn cc_after_ands(cc: c_uint) -> c_int {
@@ -1570,7 +1576,11 @@ unsafe fn cc_after_adds(cc: c_uint) -> c_int {
         ffi::A64_LE as c_int,
         ffi::A64_GT as c_int,
     ];
-    if cc < 16 { T[cc as usize] } else { -1 }
+    if cc < 16 {
+        unsafe { *T.get_unchecked(cc as usize) }
+    } else {
+        -1
+    }
 }
 
 unsafe fn nzcv_dc_for(kind: c_uint, cc: c_uint) -> c_int {
@@ -1638,7 +1648,7 @@ pub unsafe extern "C" fn nzcv_fuse_producer(insns: *const ffi::X86Insn, ci: c_in
                 continue;
             }
             for o in 0..(*p).nops as usize {
-                let po = ptr::addr_of!((*p).ops[o]);
+                let po = ptr::addr_of!((*p).ops).cast::<ffi::X86Operand>().add(o);
                 if (*po).kind == ffi::OCERZ_OPK_REG
                     && insn_writes_reg(gap, (*po).reg) != 0
                 {
@@ -2127,7 +2137,7 @@ pub unsafe extern "C" fn emit_cc_predicate_ex(
             && cc != ffi::OCERZ_CC_P && cc != ffi::OCERZ_CC_NP
         {
             ffi::a64_ldr(b, 4, ffi::JT0, 20, ffi::CC_OP_OFF);
-            generic[ngen] = ffi::a64_label(b);
+            *generic.get_unchecked_mut(ngen) = ffi::a64_label(b);
             ngen += 1;
             ffi::a64_cbz(b, 0, ffi::JT0, 0);
             ffi::a64_ldr(b, 8, ffi::JT1, 20, ffi::CC_SRC_OFF);
@@ -2135,7 +2145,7 @@ pub unsafe extern "C" fn emit_cc_predicate_ex(
             ffi::a64_ubfx(b, 0, ffi::JTT, ffi::JT0, 8, 8);
             ffi::a64_ubfx(b, 0, ffi::JTU, ffi::JT0, 0, 8);
             ffi::a64_ubfx(b, 0, ffi::JTF, ffi::JT0, 16, 1);
-            generic[ngen] = ffi::a64_label(b);
+            *generic.get_unchecked_mut(ngen) = ffi::a64_label(b);
             ngen += 1;
             ffi::a64_cbnz(b, 0, ffi::JTF, 0);
             ffi::a64_subs_imm(b, 0, ffi::A64_ZR, ffi::JTU, ffi::OCERZ_CC_SUB);
@@ -2153,22 +2163,22 @@ pub unsafe extern "C" fn emit_cc_predicate_ex(
             ffi::a64_lslv(b, 0, ffi::JT1, ffi::JT1, ffi::JTF);
             ffi::a64_lslv(b, 0, ffi::JTA, ffi::JTA, ffi::JTF);
             ffi::a64_subs_reg(b, 0, ffi::A64_ZR, ffi::JT1, ffi::JTA, 0);
-            done[ndone] = ffi::a64_label(b);
+            *done.get_unchecked_mut(ndone) = ffi::a64_label(b);
             ndone += 1;
             ffi::a64_b(b, 0);
             ffi::a64_patch_bcond(size4, ffi::a64_label(b));
             ffi::a64_subs_reg(b, 0, ffi::A64_ZR, ffi::JT1, ffi::JTA, 0);
-            done[ndone] = ffi::a64_label(b);
+            *done.get_unchecked_mut(ndone) = ffi::a64_label(b);
             ndone += 1;
             ffi::a64_b(b, 0);
             ffi::a64_patch_bcond(size8, ffi::a64_label(b));
             ffi::a64_subs_reg(b, 1, ffi::A64_ZR, ffi::JT1, ffi::JTA, 0);
-            done[ndone] = ffi::a64_label(b);
+            *done.get_unchecked_mut(ndone) = ffi::a64_label(b);
             ndone += 1;
             ffi::a64_b(b, 0);
             ffi::a64_patch_bcond(not_sub, ffi::a64_label(b));
             ffi::a64_subs_imm(b, 0, ffi::A64_ZR, ffi::JTU, ffi::OCERZ_CC_LOGIC);
-            generic[ngen] = ffi::a64_label(b);
+            *generic.get_unchecked_mut(ngen) = ffi::a64_label(b);
             ngen += 1;
             ffi::a64_bcond(b, ffi::A64_NE, 0);
             ffi::a64_subs_imm(b, 0, ffi::A64_ZR, ffi::JTT, 8);
@@ -2201,17 +2211,18 @@ pub unsafe extern "C" fn emit_cc_predicate_ex(
             let lg_pred = ffi::a64_label(b);
             ffi::a64_b(b, 0);
             for i in 0..ndone {
-                ffi::a64_patch_b(done[i], ffi::a64_label(b));
+                ffi::a64_patch_b(*done.get_unchecked(i), ffi::a64_label(b));
             }
             ffi::a64_cset(b, ffi::JTF, c_sub as c_int);
             let sub_pred = ffi::a64_label(b);
             ffi::a64_b(b, 0);
             for i in 0..ngen {
-                let word = *generic[i];
+                let generic_i = *generic.get_unchecked(i);
+                let word = *generic_i;
                 if word & 0xff00_0010 == 0x5400_0000 {
-                    ffi::a64_patch_bcond(generic[i], ffi::a64_label(b));
+                    ffi::a64_patch_bcond(generic_i, ffi::a64_label(b));
                 } else {
-                    ffi::a64_patch_cbz(generic[i], ffi::a64_label(b));
+                    ffi::a64_patch_cbz(generic_i, ffi::a64_label(b));
                 }
             }
             emit_materialize(b);
@@ -2241,7 +2252,11 @@ unsafe fn fused_jcc_cond(producer: *const ffi::X86Insn, jcc: *const ffi::X86Insn
             {
                 return -1;
             }
-            return if ((*jcc).cc as c_uint) < 16 { TEST[(*jcc).cc as usize] } else { -1 };
+            return if ((*jcc).cc as c_uint) < 16 {
+                *TEST.get_unchecked((*jcc).cc as usize)
+            } else {
+                -1
+            };
         }
         const CMP: [c_int; 16] = [
             ffi::A64_VS as c_int, ffi::A64_VC as c_int, ffi::A64_CC as c_int,
@@ -2250,7 +2265,11 @@ unsafe fn fused_jcc_cond(producer: *const ffi::X86Insn, jcc: *const ffi::X86Insn
             ffi::A64_PL as c_int, -1, -1, ffi::A64_LT as c_int,
             ffi::A64_GE as c_int, ffi::A64_LE as c_int, ffi::A64_GT as c_int,
         ];
-        if ((*jcc).cc as c_uint) < 16 { CMP[(*jcc).cc as usize] } else { -1 }
+        if ((*jcc).cc as c_uint) < 16 {
+            *CMP.get_unchecked((*jcc).cc as usize)
+        } else {
+            -1
+        }
     }
 }
 
@@ -2670,8 +2689,8 @@ unsafe fn match_ifconv_diamond(
             (*jcc).ops[0].imm,
         ];
         for direct_taken in 0..=1 {
-            let direct_rip = first_succ[direct_taken];
-            let nested_rip = first_succ[1 - direct_taken];
+            let direct_rip = *first_succ.get_unchecked(direct_taken);
+            let nested_rip = *first_succ.get_unchecked(1 - direct_taken);
             let mut latch_rip = 0u64;
             let mut exit_rip = 0u64;
             if decode_ifconv_block(direct_rip, ptr::addr_of_mut!((*m).direct[0]), 3) != 3
@@ -2698,8 +2717,8 @@ unsafe fn match_ifconv_diamond(
                 (*m).nested[1].ops[0].imm,
             ];
             for simple_taken in 0..=1 {
-                let simple_rip = nested_succ[simple_taken];
-                let complex_rip = nested_succ[1 - simple_taken];
+                let simple_rip = *nested_succ.get_unchecked(simple_taken);
+                let complex_rip = *nested_succ.get_unchecked(1 - simple_taken);
                 if decode_ifconv_block(simple_rip, ptr::addr_of_mut!((*m).simple[0]), 2) != 2
                     || ifconv_simple_path(
                         ptr::addr_of!((*m).simple[0]),
@@ -3685,34 +3704,39 @@ pub unsafe extern "C" fn emit_cmp_test_jcc(
                 return 0;
             }
             let si = g_n_side as usize;
-            g_side[si].site = ffi::a64_label(b);
-            g_side[si].taken = taken;
-            g_side[si].idx = -1;
-            g_side[si].stub = ptr::null_mut();
-            g_side[si].patch_b = ptr::null_mut();
-            g_side[si].rec = rec_stub as c_int;
-            g_side[si].fpb = -1;
-            g_side[si].fpb_chk = 0;
-            g_side[si].l0_dirty = ffi::g_l0_dirty;
-            g_side[si].yc_dirty = ffi::g_yc_dirty;
+            let side = ptr::addr_of_mut!(g_side).cast::<ffi::JitState_g_side>().add(si);
+            (*side).site = ffi::a64_label(b);
+            (*side).taken = taken;
+            (*side).idx = -1;
+            (*side).stub = ptr::null_mut();
+            (*side).patch_b = ptr::null_mut();
+            (*side).rec = rec_stub as c_int;
+            (*side).fpb = -1;
+            (*side).fpb_chk = 0;
+            (*side).l0_dirty = ffi::g_l0_dirty;
+            (*side).yc_dirty = ffi::g_yc_dirty;
+            let l0 = ptr::addr_of_mut!((*side).l0).cast::<i8>();
+            let l0_dbl = ptr::addr_of_mut!((*side).l0_dbl).cast::<u8>();
+            let src_l0 = ptr::addr_of!(ffi::g_l0).cast::<i8>();
+            let src_l0_dbl = ptr::addr_of!(ffi::g_l0_dbl).cast::<u8>();
             for r in 0..16 {
-                g_side[si].l0[r] = ffi::g_l0[r];
-                g_side[si].l0_dbl[r] = ffi::g_l0_dbl[r];
+                *l0.add(r) = *src_l0.add(r);
+                *l0_dbl.add(r) = *src_l0_dbl.add(r);
             }
-            g_side[si].jcc_rip = (*jcc).rip;
-            g_side[si].ft_rip = (*jcc).rip.wrapping_add((*jcc).len as u64);
-            g_side[si].ft_site = ptr::null_mut();
-            g_side[si].probe = (!need_rec
+            (*side).jcc_rip = (*jcc).rip;
+            (*side).ft_rip = (*jcc).rip.wrapping_add((*jcc).len as u64);
+            (*side).ft_site = ptr::null_mut();
+            (*side).probe = (!need_rec
                 && jit_internal::probe_wanted(
                     (*jcc).rip,
                     (*jcc).rip.wrapping_add((*jcc).len as u64),
                 ) != 0) as c_int;
             if rec_stub {
-                g_side[si].rec_ccop = ccop;
-                g_side[si].rec_src = record_src;
-                g_side[si].rec_dst = record_dst;
-                g_side[si].rec_imm_pending = rec_imm_pending;
-                g_side[si].rec_imm = rec_imm;
+                (*side).rec_ccop = ccop;
+                (*side).rec_src = record_src;
+                (*side).rec_dst = record_dst;
+                (*side).rec_imm_pending = rec_imm_pending;
+                (*side).rec_imm = rec_imm;
             }
             g_n_side += 1;
             if test_bit >= 0 {
@@ -3730,8 +3754,11 @@ pub unsafe extern "C" fn emit_cmp_test_jcc(
             } else {
                 ffi::a64_bcond(b, taken_cond, 0);
             }
-            if g_side[(g_n_side - 1) as usize].probe != 0 {
-                g_side[(g_n_side - 1) as usize].ft_site = ffi::a64_label(b);
+            let side = ptr::addr_of_mut!(g_side)
+                .cast::<ffi::JitState_g_side>()
+                .add((g_n_side - 1) as usize);
+            if (*side).probe != 0 {
+                (*side).ft_site = ffi::a64_label(b);
                 ffi::a64_b(b, 0);
             }
             if rec_after {
@@ -4056,7 +4083,9 @@ pub unsafe extern "C" fn flip_retire_locked(
             sys_icache_invalidate((*blk).stop_patch.cast(), 4);
         }
         for i in 0..(*blk).n_stop_extra as usize {
-            let extra = ptr::addr_of_mut!((*blk).stop_extra[i]);
+            let extra = ptr::addr_of_mut!((*blk).stop_extra)
+                .cast::<ffi::JitBlock__bindgen_ty_1>()
+                .add(i);
             if *(*extra).site != (*extra).insn {
                 store_code_release((*extra).site, (*extra).insn);
                 sys_icache_invalidate((*extra).site.cast(), 4);
@@ -4068,7 +4097,10 @@ pub unsafe extern "C" fn flip_retire_locked(
             let mut is_stop = (*edge).patch_b == (*blk).stop_patch;
             for q in 0..(*blk).n_stop_extra as usize {
                 if !is_stop {
-                    is_stop = (*edge).patch_b == (*blk).stop_extra[q].site;
+                    let extra = ptr::addr_of!((*blk).stop_extra)
+                        .cast::<ffi::JitBlock__bindgen_ty_1>()
+                        .add(q);
+                    is_stop = (*edge).patch_b == (*extra).site;
                 }
             }
             if !cs.is_null() && (*edge).cond_orig != 0
@@ -4127,7 +4159,9 @@ pub unsafe extern "C" fn flip_retire_locked(
         }
         pthread_jit_write_protect_np(1);
         let h = jit_internal::hash_key((*blk).key);
-        let mut pp = ptr::addr_of_mut!((*jit).buckets[h as usize]);
+        let mut pp = ptr::addr_of_mut!((*jit).buckets)
+            .cast::<*mut ffi::JitBlock>()
+            .add(h as usize);
         while !(*pp).is_null() && *pp != blk {
             pp = ptr::addr_of_mut!((**pp).hnext);
         }
@@ -4180,10 +4214,23 @@ unsafe fn flip_decide_locked(blk: *mut ffi::JitBlock, e: c_int, tk: c_int, ft: c
         let i = jit_internal::flip_find(jcc_rip, 1);
         if i < 0 {
             flip = 0;
-        } else if g_flip[i as usize].state != ffi::FLIP_NONE {
-            flip = (g_flip[i as usize].state == ffi::FLIP_DECIDED_INV) as c_int;
         } else {
-            g_flip[i as usize].state = if flip != 0 { ffi::FLIP_DECIDED_INV as u8 } else { ffi::FLIP_DECIDED_ORIG as u8 };
+            let flip_entry = ptr::addr_of_mut!(g_flip)
+                .cast::<ffi::JitState_g_flip>()
+                .add(i as usize);
+            let state = ptr::addr_of!((*flip_entry).state);
+            if *state != ffi::FLIP_NONE {
+                flip = (*state == ffi::FLIP_DECIDED_INV) as c_int;
+            } else {
+                ptr::write(
+                    ptr::addr_of_mut!((*flip_entry).state),
+                    if flip != 0 {
+                        ffi::FLIP_DECIDED_INV as u8
+                    } else {
+                        ffi::FLIP_DECIDED_ORIG as u8
+                    },
+                );
+            }
         }
         if logit != 0 {
             ffi::fprintf(
@@ -4287,7 +4334,10 @@ pub unsafe extern "C" fn flip_side_hit(
             }
             let fi = jit_internal::flip_find((*(*blk).edges.add(e as usize)).jcc_rip, 0);
             if fi >= 0 {
-                g_flip[fi as usize].state = ffi::FLIP_NONE as u8;
+                let flip_entry = ptr::addr_of_mut!(g_flip)
+                    .cast::<ffi::JitState_g_flip>()
+                    .add(fi as usize);
+                ptr::write(ptr::addr_of_mut!((*flip_entry).state), ffi::FLIP_NONE as u8);
             }
             (*wp).taken = 0;
             (*wp).ft = 0;
