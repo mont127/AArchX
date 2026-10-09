@@ -446,8 +446,11 @@ static mut G_VD_GSS_GUEST: [u64; 256] = [0; 256];
 static mut G_VD_GSS_N: c_int = 0;
 
 unsafe fn vd_gss_alloc_locked(size: u32) -> u64 {
-    let size = ((size as u64 + 15) & !15) as u64;
-    if unsafe { G_VD_GSS_PAGE == 0 || G_VD_GSS_USED + size > ffi::OCERZ_GUEST_PAGE_SIZE as u64 } {
+    let size = size.wrapping_add(15) & !15;
+    if unsafe {
+        G_VD_GSS_PAGE == 0
+            || G_VD_GSS_USED.wrapping_add(size as u64) > ffi::OCERZ_GUEST_PAGE_SIZE as u64
+    } {
         unsafe {
             G_VD_GSS_PAGE = ffi::ocerz_map_anywhere(
                 ffi::OCERZ_GUEST_PAGE_SIZE as u64,
@@ -459,8 +462,8 @@ unsafe fn vd_gss_alloc_locked(size: u32) -> u64 {
             return 0;
         }
     }
-    let at = unsafe { G_VD_GSS_PAGE + G_VD_GSS_USED };
-    unsafe { G_VD_GSS_USED += size };
+    let at = unsafe { G_VD_GSS_PAGE.wrapping_add(G_VD_GSS_USED) };
+    unsafe { G_VD_GSS_USED = G_VD_GSS_USED.wrapping_add(size as u64) };
     at
 }
 
@@ -493,8 +496,8 @@ unsafe fn vd_gss_oid_locked(host: *const c_void) -> u64 {
         return 0;
     }
     for k in 0..unsafe { G_VD_GSS_N as usize } {
-        if unsafe { G_VD_GSS_HOST[k] == host } {
-            return unsafe { G_VD_GSS_GUEST[k] };
+        if unsafe { *ptr::addr_of!(G_VD_GSS_HOST).cast::<*const c_void>().add(k) == host } {
+            return unsafe { *ptr::addr_of!(G_VD_GSS_GUEST).cast::<u64>().add(k) };
         }
     }
     let at = unsafe { vd_gss_alloc_locked(VD_GSS_OID_X86) };
@@ -505,8 +508,8 @@ unsafe fn vd_gss_oid_locked(host: *const c_void) -> u64 {
     if unsafe { G_VD_GSS_N < 256 } {
         let n = unsafe { G_VD_GSS_N as usize };
         unsafe {
-            G_VD_GSS_HOST[n] = host;
-            G_VD_GSS_GUEST[n] = at;
+            *ptr::addr_of_mut!(G_VD_GSS_HOST).cast::<*const c_void>().add(n) = host;
+            *ptr::addr_of_mut!(G_VD_GSS_GUEST).cast::<u64>().add(n) = at;
             G_VD_GSS_N += 1;
         }
     }
@@ -814,11 +817,11 @@ unsafe fn vd_list_files_locked() {
             }
             let count = unsafe { G_VD_NFILES };
             if count == cap {
-                let nc = if cap != 0 { cap * 2 } else { 64 };
+                let nc = if cap != 0 { cap.wrapping_mul(2) } else { 64 };
                 let nf = unsafe {
                     libc::realloc(
                         G_VD_FILES.cast(),
-                        nc as usize * mem::size_of::<*mut c_char>(),
+                        (nc as usize).wrapping_mul(mem::size_of::<*mut c_char>()),
                     ) as *mut *mut c_char
                 };
                 if nf.is_null() {
@@ -918,13 +921,14 @@ unsafe fn vd_lib(install_name: *const c_char) -> *mut VdLib {
         );
         return ptr::null_mut();
     }
-    let mut lib = G_VD_LIBS[ord as usize].load(Ordering::SeqCst);
+    let slot = unsafe { G_VD_LIBS.as_ptr().add(ord as usize) };
+    let mut lib = unsafe { (*slot).load(Ordering::SeqCst) };
     if !lib.is_null() {
         return lib;
     }
 
     unsafe { libc::pthread_mutex_lock(ptr::addr_of_mut!(G_VD_LOCK)) };
-    lib = G_VD_LIBS[ord as usize].load(Ordering::SeqCst);
+    lib = unsafe { (*slot).load(Ordering::SeqCst) };
     if lib.is_null() {
         let n = if unsafe { (*api).nentries > 0 } {
             unsafe { (*api).nentries as usize }
@@ -952,7 +956,7 @@ unsafe fn vd_lib(install_name: *const c_char) -> *mut VdLib {
                     native_missed: missed,
                 });
             }
-            G_VD_LIBS[ord as usize].store(nl, Ordering::SeqCst);
+            unsafe { (*slot).store(nl, Ordering::SeqCst) };
             lib = nl;
         } else {
             unsafe {
@@ -978,7 +982,9 @@ unsafe fn vd_lib_of_id(id: u64, entry_out: *mut *const ffi::OcerzApiEntry) -> *m
     let id = id as u32;
     let ord = id >> VD_INDEX_BITS;
     let idx = id & VD_INDEX_MASK;
-    let lib = G_VD_LIBS[ord as usize].load(Ordering::SeqCst);
+    let lib = unsafe {
+        (*G_VD_LIBS.as_ptr().add(ord as usize)).load(Ordering::SeqCst)
+    };
     if lib.is_null() {
         return ptr::null_mut();
     }
@@ -1063,7 +1069,8 @@ unsafe fn wr64(p: *mut u8, v: u64) {
 
 #[inline(always)]
 fn vd_round_up(v: u64, align: u64) -> u64 {
-    (v + align - 1) & !(align - 1)
+    let mask = align.wrapping_sub(1);
+    v.wrapping_add(mask) & !mask
 }
 
 unsafe fn vd_uleb_fixed(p: *mut u8, v: u64, width: u32) {
@@ -1199,13 +1206,13 @@ unsafe fn vd_trie_layout(t: *mut VdTrie) -> u64 {
         let mut sz = 1u64;
         let mut kids = 0;
         if unsafe { (*node).terminal != 0 } {
-            sz += 1 + vd_term_width(unsafe { (*node).absolute != 0 }) as u64;
+            sz = sz.wrapping_add(1 + vd_term_width(unsafe { (*node).absolute != 0 }) as u64);
         }
-        sz += 1;
+        sz = sz.wrapping_add(1);
         let mut child = unsafe { (*node).first_child };
         while child >= 0 {
             let c = unsafe { (*t).node.add(child as usize) };
-            sz += unsafe { (*c).elen as u64 + 1 + VD_ULEB_WIDTH as u64 };
+            sz = sz.wrapping_add(unsafe { (*c).elen as u64 + 1 + VD_ULEB_WIDTH as u64 });
             kids += 1;
             child = unsafe { (*c).next_sibling };
         }
@@ -1220,7 +1227,7 @@ unsafe fn vd_trie_layout(t: *mut VdTrie) -> u64 {
         let node = unsafe { (*t).node.add(i as usize) };
         unsafe {
             (*node).off = off;
-            off += (*node).size;
+            off = off.wrapping_add((*node).size);
         }
     }
     off
@@ -1354,23 +1361,33 @@ pub unsafe extern "C" fn ocerz_vdylib_image_with(
         n += unsafe { vd_has_stub(kind) } as c_int;
         nv += (kind == ffi::OCERZ_API_VAR) as c_int;
     }
-    let name_len = unsafe { libc::strlen(name) as u32 + 1 };
-    let id_cmdsize = vd_round_up(24 + name_len as u64, 8) as u32;
+    let name_len = unsafe { (libc::strlen(name) as u32).wrapping_add(1) };
+    let id_cmdsize = vd_round_up(24u64.wrapping_add(name_len as u64), 8) as u32;
     let seg_cmdsize = (72 + 80) as u32;
     let trie_cmdsize = 16u32;
-    let sizeofcmds = 2 * seg_cmdsize + id_cmdsize + trie_cmdsize;
+    let sizeofcmds = 2u32
+        .wrapping_mul(seg_cmdsize)
+        .wrapping_add(id_cmdsize)
+        .wrapping_add(trie_cmdsize);
     let hdr_size = 32u32;
-    let stubs_off = vd_round_up(hdr_size as u64 + sizeofcmds as u64, VD_STUB_STRIDE);
-    let stubs_size = n as u64 * VD_STUB_STRIDE;
-    let text_size = vd_round_up(stubs_off + stubs_size, VD_PAGE);
+    let stubs_off = vd_round_up(
+        (hdr_size as u64).wrapping_add(sizeofcmds as u64),
+        VD_STUB_STRIDE,
+    );
+    let stubs_size = (n as u64).wrapping_mul(VD_STUB_STRIDE);
+    let text_size = vd_round_up(stubs_off.wrapping_add(stubs_size), VD_PAGE);
     let slots_off = text_size;
-    let slots_size = n as u64 * VD_SLOT_BYTES;
-    let vars_off = vd_round_up(slots_off + slots_size, VD_SLOT_BYTES);
+    let slots_size = (n as u64).wrapping_mul(VD_SLOT_BYTES);
+    let vars_off = vd_round_up(slots_off.wrapping_add(slots_size), VD_SLOT_BYTES);
     let ne_alloc = if ne > 0 { ne as usize } else { 0 };
-    let var_addr = unsafe { libc::calloc(ne_alloc + 1, mem::size_of::<u64>()) as *mut u64 };
-    let sym_cap = ne_alloc + 1 + VD_LEGACY_MAX;
+    let var_addr = unsafe {
+        libc::calloc(ne_alloc.wrapping_add(1), mem::size_of::<u64>()) as *mut u64
+    };
+    let sym_cap = ne_alloc.wrapping_add(1).wrapping_add(VD_LEGACY_MAX);
     let syms = unsafe { libc::calloc(sym_cap, mem::size_of::<VdSym>()) as *mut VdSym };
-    let node_cap = 2 * (ne_alloc + VD_LEGACY_MAX) + 2;
+    let node_cap = 2usize
+        .wrapping_mul(ne_alloc.wrapping_add(VD_LEGACY_MAX))
+        .wrapping_add(2);
     let nodes = unsafe { libc::calloc(node_cap, mem::size_of::<VdNode>()) as *mut VdNode };
     let mut buf: *mut u8 = ptr::null_mut();
 
@@ -1401,7 +1418,8 @@ pub unsafe extern "C" fn ocerz_vdylib_image_with(
         if unsafe { vd_has_stub(kind) } {
             unsafe {
                 (*syms.add(m as usize)).name = (*e).export_name;
-                (*syms.add(m as usize)).addr = stubs_off + stub_index as u64 * VD_STUB_STRIDE;
+                (*syms.add(m as usize)).addr = stubs_off
+                    .wrapping_add((stub_index as u64).wrapping_mul(VD_STUB_STRIDE));
                 (*syms.add(m as usize)).absolute = 0;
             }
             stub_index += 1;
@@ -1426,7 +1444,10 @@ pub unsafe extern "C" fn ocerz_vdylib_image_with(
                 image_fail!();
             }
             unsafe { *var_addr.add(k as usize) = vars_end };
-            vars_end += vd_round_up(unsafe { (*e).bytes as u64 }, VD_SLOT_BYTES);
+            vars_end = vars_end.wrapping_add(vd_round_up(
+                unsafe { (*e).bytes as u64 },
+                VD_SLOT_BYTES,
+            ));
             unsafe {
                 (*syms.add(m as usize)).name = (*e).export_name;
                 (*syms.add(m as usize)).addr = *var_addr.add(k as usize);
@@ -1480,9 +1501,9 @@ pub unsafe extern "C" fn ocerz_vdylib_image_with(
         m += 1;
     }
 
-    let data_used = vars_end - slots_off;
+    let data_used = vars_end.wrapping_sub(slots_off);
     let data_size = vd_round_up(if data_used != 0 { data_used } else { 1 }, VD_PAGE);
-    let trie_off = slots_off + data_size;
+    let trie_off = slots_off.wrapping_add(data_size);
     unsafe {
         libc::qsort(
             syms.cast(),
@@ -1524,7 +1545,7 @@ pub unsafe extern "C" fn ocerz_vdylib_image_with(
         );
         image_fail!();
     }
-    let total = trie_off + trie_size;
+    let total = trie_off.wrapping_add(trie_size);
     if total > u32::MAX as u64 {
         crate::ocerz_fatal!(
             "virtual %s would be %llu bytes, past what 32-bit file offsets reach\n",
@@ -1633,8 +1654,10 @@ pub unsafe extern "C" fn ocerz_vdylib_image_with(
         if !unsafe { vd_has_stub((*e).kind) } {
             continue;
         }
-        let stub_addr = stubs_off + stub_index as u64 * VD_STUB_STRIDE;
-        let slot_addr = slots_off + stub_index as u64 * VD_SLOT_BYTES;
+        let stub_addr = stubs_off
+            .wrapping_add((stub_index as u64).wrapping_mul(VD_STUB_STRIDE));
+        let slot_addr = slots_off
+            .wrapping_add((stub_index as u64).wrapping_mul(VD_SLOT_BYTES));
         stub_index += 1;
         let s = unsafe { buf.add(stub_addr as usize) };
         let mut at = 0usize;
@@ -1704,10 +1727,18 @@ pub unsafe extern "C" fn ocerz_vdylib_image(
 }
 
 #[inline(always)]
+unsafe fn vd_gpr(cpu: *const ffi::OcerzCPU, reg: usize) -> u64 {
+    unsafe { *(*cpu).gpr.as_ptr().add(reg) }
+}
+
+#[inline(always)]
 unsafe fn vd_errno_enter(cpu: *const ffi::OcerzCPU) {
     if unsafe { (*cpu).gs_base } != 0 {
         unsafe {
-            *libc::__error() = ocerz_ld((*cpu).gs_base + ffi::OCERZ_ERRNO_SLOT as u64, 4) as c_int;
+            *libc::__error() = ocerz_ld(
+                (*cpu).gs_base.wrapping_add(ffi::OCERZ_ERRNO_SLOT as u64),
+                4,
+            ) as c_int;
         }
     }
 }
@@ -1717,7 +1748,7 @@ unsafe fn vd_errno_leave(cpu: *const ffi::OcerzCPU) {
     if unsafe { (*cpu).gs_base } != 0 {
         unsafe {
             ocerz_st(
-                (*cpu).gs_base + ffi::OCERZ_ERRNO_SLOT as u64,
+                (*cpu).gs_base.wrapping_add(ffi::OCERZ_ERRNO_SLOT as u64),
                 4,
                 *libc::__error() as u32 as u64,
             );
@@ -1735,7 +1766,7 @@ unsafe fn vd_dispatch(vm: *mut ffi::OcerzVM, cpu: *mut ffi::OcerzCPU) -> c_int {
             }
         }
     }
-    let id = unsafe { (*cpu).gpr[ffi::OCERZ_R11 as usize] & 0xffff_ffff };
+    let id = unsafe { vd_gpr(cpu, ffi::OCERZ_R11 as usize) & 0xffff_ffff };
     let internal = unsafe { vd_internal_of_id(id) };
     if !internal.is_null() {
         unsafe { vd_errno_enter(cpu) };
@@ -1778,7 +1809,7 @@ unsafe fn vd_dispatch(vm: *mut ffi::OcerzVM, cpu: *mut ffi::OcerzCPU) -> c_int {
     unsafe extern "C" {
         static mut ocerz_cmdline_summary: c_char;
     }
-    let caller = unsafe { ocerz_ld((*cpu).gpr[ffi::OCERZ_RSP as usize], 8) };
+    let caller = unsafe { ocerz_ld(vd_gpr(cpu, ffi::OCERZ_RSP as usize), 8) };
     let mut base = 0u64;
     let image = unsafe { ffi::ocerz_dyld_name_for_addr(caller, &mut base) };
     unsafe {
@@ -2011,7 +2042,7 @@ pub unsafe extern "C" fn ocerz_vdylib_fastcall(
     cpu: *mut ffi::OcerzCPU,
 ) -> c_int {
     let epoch = unsafe { ocerz_jit_retire_epoch() };
-    let rsp0 = unsafe { (*cpu).gpr[ffi::OCERZ_RSP as usize] };
+    let rsp0 = unsafe { vd_gpr(cpu, ffi::OCERZ_RSP as usize) };
     unsafe {
         (*cpu).rip = ffi::OCERZ_DYLDAPI_LO as u64 + ffi::OCERZ_BRIDGE_OFF as u64;
         if (*cpu).cc_op != ffi::OCERZ_CC_NONE {
@@ -2019,7 +2050,7 @@ pub unsafe extern "C" fn ocerz_vdylib_fastcall(
         }
     }
     let rc = unsafe { vd_dispatch(vm, cpu) };
-    let rsp = unsafe { (*cpu).gpr[ffi::OCERZ_RSP as usize] };
+    let rsp = unsafe { vd_gpr(cpu, ffi::OCERZ_RSP as usize) };
     if rc == ffi::OCERZ_STEP_OK as c_int
         && rsp.wrapping_sub(rsp0).wrapping_sub(8) <= 8
         && unsafe { (*cpu).rip == ocerz_ld(rsp.wrapping_sub(8), 8) }
@@ -2084,7 +2115,7 @@ pub unsafe extern "C" fn ocerz_vdylib_trampoline(which: u32) -> u64 {
     }
     let mut page = G_VD_TRAMP_PAGE.load(Ordering::SeqCst);
     if page != 0 {
-        return page + which as u64 * VD_STUB_STRIDE;
+        return page.wrapping_add((which as u64).wrapping_mul(VD_STUB_STRIDE));
     }
     unsafe { libc::pthread_mutex_lock(ptr::addr_of_mut!(G_VD_TRAMP_LOCK)) };
     page = G_VD_TRAMP_PAGE.load(Ordering::SeqCst);
@@ -2100,7 +2131,7 @@ pub unsafe extern "C" fn ocerz_vdylib_trampoline(which: u32) -> u64 {
             unsafe { libc::memset(buf.cast(), 0xcc, ffi::OCERZ_GUEST_PAGE_SIZE as usize) };
             for k in 0..VD_NINTERNAL as u32 {
                 let s = unsafe { buf.add(k as usize * VD_STUB_STRIDE as usize) };
-                let slot = VD_TRAMP_SLOTS + k as u64 * VD_SLOT_BYTES;
+                let slot = VD_TRAMP_SLOTS.wrapping_add((k as u64).wrapping_mul(VD_SLOT_BYTES));
                 unsafe {
                     *s = 0x41;
                     *s.add(1) = 0xbb;
@@ -2109,7 +2140,9 @@ pub unsafe extern "C" fn ocerz_vdylib_trampoline(which: u32) -> u64 {
                     *s.add(7) = 0x25;
                     wr32(
                         s.add(8),
-                        (slot as i64 - (k as u64 * VD_STUB_STRIDE + 12) as i64) as i32 as u32,
+                        (slot as i64
+                            - ((k as u64).wrapping_mul(VD_STUB_STRIDE).wrapping_add(12)) as i64)
+                            as i32 as u32,
                     );
                     wr64(
                         buf.add(slot as usize),
@@ -2143,7 +2176,7 @@ pub unsafe extern "C" fn ocerz_vdylib_trampoline(which: u32) -> u64 {
     }
     unsafe { libc::pthread_mutex_unlock(ptr::addr_of_mut!(G_VD_TRAMP_LOCK)) };
     if page != 0 {
-        page + which as u64 * VD_STUB_STRIDE
+        page.wrapping_add((which as u64).wrapping_mul(VD_STUB_STRIDE))
     } else {
         0
     }

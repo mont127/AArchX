@@ -175,7 +175,7 @@ unsafe fn ad_hash_find(
         if unsafe { libc::strcmp(e.export_name, name) } == 0 {
             return (slot - 1) as c_int;
         }
-        i = (i + 1) & mask;
+        i = i.wrapping_add(1) & mask;
     }
 }
 
@@ -183,7 +183,7 @@ unsafe fn ad_hash_grow(lib: *mut AdLibrary, entries: *const ffi::OcerzApiEntry, 
     let old = unsafe { (*lib).hcap };
     let mut cap = if old != 0 { old } else { 64 };
     while ((n + 1) as u64) * 2 > cap as u64 {
-        cap *= 2;
+        cap = cap.wrapping_mul(2);
     }
     if cap == old {
         return true;
@@ -195,9 +195,9 @@ unsafe fn ad_hash_grow(lib: *mut AdLibrary, entries: *const ffi::OcerzApiEntry, 
     for k in 0..n as usize {
         let mut i = unsafe { ad_hash_name((*entries.add(k)).export_name) } & (cap - 1);
         while unsafe { *h.add(i as usize) } != 0 {
-            i = (i + 1) & (cap - 1);
+            i = i.wrapping_add(1) & (cap - 1);
         }
-        unsafe { *h.add(i as usize) = k as u32 + 1 };
+        unsafe { *h.add(i as usize) = (k as u32).wrapping_add(1) };
     }
     unsafe {
         libc::free((*lib).hash.cast());
@@ -211,9 +211,9 @@ unsafe fn ad_hash_put(lib: *mut AdLibrary, entries: *const ffi::OcerzApiEntry, k
     let mask = unsafe { (*lib).hcap } - 1;
     let mut i = unsafe { ad_hash_name((*entries.add(k as usize)).export_name) } & mask;
     while unsafe { *(*lib).hash.add(i as usize) } != 0 {
-        i = (i + 1) & mask;
+        i = i.wrapping_add(1) & mask;
     }
-    unsafe { *(*lib).hash.add(i as usize) = k as u32 + 1 };
+    unsafe { *(*lib).hash.add(i as usize) = (k as u32).wrapping_add(1) };
 }
 
 unsafe fn ad_grow(arr: *mut *mut u8, cap: *mut c_int, want: c_int, elem: usize) -> bool {
@@ -253,7 +253,7 @@ unsafe fn ad_decimal(mut s: *const c_char, max: u64, out: *mut u64) -> bool {
         if v > (u64::MAX - d) / 10 {
             return false;
         }
-        v = v * 10 + d;
+        v = v.wrapping_mul(10).wrapping_add(d);
         s = unsafe { s.add(1) };
     }
     if v > max {
@@ -281,12 +281,12 @@ unsafe fn ad_version(s: *const c_char, packed: *mut u32) -> bool {
             v = v
                 .wrapping_mul(10)
                 .wrapping_add((unsafe { *c } as u8 - b'0') as u32);
-            if v > limit[n] {
+            if v > *limit.as_ptr().add(n) {
                 return false;
             }
             c = unsafe { c.add(1) };
         }
-        part[n] = v;
+        *part.as_mut_ptr().add(n) = v;
         n += 1;
         if unsafe { *c } == 0 {
             break;
@@ -296,7 +296,11 @@ unsafe fn ad_version(s: *const c_char, packed: *mut u32) -> bool {
         }
         c = unsafe { c.add(1) };
     }
-    unsafe { *packed = part[0] << 16 | part[1] << 8 | part[2] };
+    unsafe {
+        *packed = *part.as_ptr() << 16
+            | *part.as_ptr().add(1) << 8
+            | *part.as_ptr().add(2);
+    }
     true
 }
 
@@ -321,7 +325,7 @@ unsafe fn ad_callback_sig(s: *const c_char) -> bool {
     }
     let sig = unsafe { sig.assume_init() };
     for i in 0..sig.nargs as usize {
-        if sig.arg[i] == b'c' as c_char {
+        if *sig.arg.as_ptr().add(i) == b'c' as c_char {
             return false;
         }
     }
@@ -592,7 +596,7 @@ unsafe fn ad_record(p: *mut AdParse, line: c_int, f: &[*mut c_char], nf: c_int) 
             sh.version = version;
             sh.words = num as c_int;
             for w in 0..num as usize {
-                sh.word[w] = if libc::strcmp(f[4 + w], b"-\0".as_ptr().cast()) == 0 {
+                *sh.word.as_mut_ptr().add(w) = if libc::strcmp(f[4 + w], b"-\0".as_ptr().cast()) == 0 {
                     ptr::null()
                 } else {
                     f[4 + w]
@@ -758,12 +762,14 @@ unsafe fn ad_resolve_inplace(p: *mut AdParse) -> bool {
             return false;
         }
         let sig = unsafe { sig.assume_init() };
-        if r.argpos >= sig.nargs || sig.arg[r.argpos as usize] != b'p' as c_char {
+        if r.argpos >= sig.nargs
+            || *sig.arg.as_ptr().add(r.argpos as usize) != b'p' as c_char
+        {
             ad_refuse!(unsafe{&*p},r.line,"inplace binds argument %d of %s, which its signature %s does not declare as a pointer",r.argpos,r.export_name,e.sig);
             return false;
         }
         for j in 0..e.ninplace {
-            let x = &e.inplace[j as usize];
+            let x = &*e.inplace.as_ptr().add(j as usize);
             if x.argpos == r.argpos && x.offset == r.offset {
                 ad_refuse!(
                     unsafe { &*p },
@@ -777,7 +783,7 @@ unsafe fn ad_resolve_inplace(p: *mut AdParse) -> bool {
             }
         }
         for j in 0..e.nstructs {
-            if e.structs[j as usize].argpos == r.argpos {
+            if (*e).structs.as_ptr().add(j as usize).read().argpos == r.argpos {
                 ad_refuse!(unsafe{&*p},r.line,"argument %d of %s is bound to a shape, which copies it, and cannot also be converted in place",r.argpos,r.export_name);
                 return false;
             }
@@ -792,7 +798,7 @@ unsafe fn ad_resolve_inplace(p: *mut AdParse) -> bool {
             );
             return false;
         }
-        e.inplace[e.ninplace as usize] = ffi::OcerzApiInplace {
+        *e.inplace.as_mut_ptr().add(e.ninplace as usize) = ffi::OcerzApiInplace {
             argpos: r.argpos,
             offset: r.offset,
             sig: r.sig,
@@ -848,7 +854,9 @@ unsafe fn ad_resolve_structs(p: *mut AdParse) -> bool {
             return false;
         }
         let sig = sig.assume_init();
-        if r.argpos >= sig.nargs || sig.arg[r.argpos as usize] != b'p' as c_char {
+        if r.argpos >= sig.nargs
+            || *sig.arg.as_ptr().add(r.argpos as usize) != b'p' as c_char
+        {
             ad_refuse!(unsafe{&*p},r.line,"struct binds argument %d of %s, which its signature %s does not declare as a pointer",r.argpos,r.export_name,e.sig);
             return false;
         }
@@ -876,7 +884,7 @@ unsafe fn ad_resolve_structs(p: *mut AdParse) -> bool {
             );
             return false;
         }
-        e.structs[e.nstructs as usize] = ffi::OcerzApiStructArg {
+        *e.structs.as_mut_ptr().add(e.nstructs as usize) = ffi::OcerzApiStructArg {
             argpos: r.argpos,
             shape: r.shape,
         };
@@ -937,7 +945,7 @@ pub unsafe extern "C" fn ocerz_apidb_parse(
         *err = 0;
     }
     p.lib = libc::calloc(1, mem::size_of::<AdLibrary>()) as *mut AdLibrary;
-    let buf = libc::malloc(len + 1) as *mut c_char;
+    let buf = libc::malloc(len.wrapping_add(1)) as *mut c_char;
     let pathcopy = libc::strdup(p.path);
     if p.lib.is_null() || buf.is_null() || pathcopy.is_null() || text.is_null() && len != 0 {
         libc::free(buf.cast());
@@ -973,7 +981,7 @@ pub unsafe extern "C" fn ocerz_apidb_parse(
         } else {
             nl.offset_from(s) as usize
         };
-        pos += ll + if nl.is_null() { 0 } else { 1 };
+        pos = pos.wrapping_add(ll).wrapping_add(if nl.is_null() { 0 } else { 1 });
         if !libc::memchr(s.cast(), 0, ll).is_null() {
             ad_refuse!(&p, line, "the line contains a NUL byte");
             ad_free_parse(&mut p);
@@ -1411,19 +1419,19 @@ unsafe fn ad_read_file(
         libc::close(fd);
         return ptr::null_mut();
     }
-    let mut cap = st.st_size as usize + 1;
+    let mut cap = (st.st_size as usize).wrapping_add(1);
     let mut len = 0;
     let mut buf = libc::malloc(cap) as *mut c_char;
     while !buf.is_null() {
         if len == cap {
-            let nb = libc::realloc(buf.cast(), cap * 2) as *mut c_char;
+            let nb = libc::realloc(buf.cast(), cap.wrapping_mul(2)) as *mut c_char;
             if nb.is_null() {
                 libc::free(buf.cast());
                 buf = ptr::null_mut();
                 break;
             }
             buf = nb;
-            cap *= 2;
+            cap = cap.wrapping_mul(2);
         }
         let r = libc::read(fd, buf.add(len).cast(), cap - len);
         if r < 0 && *libc::__error() == libc::EINTR {
@@ -1437,7 +1445,7 @@ unsafe fn ad_read_file(
         if r == 0 {
             break;
         }
-        len += r as usize;
+        len = len.wrapping_add(r as usize);
     }
     libc::close(fd);
     *len_out = len;
@@ -1592,7 +1600,7 @@ pub unsafe extern "C" fn ocerz_apidb_install_names(count: *mut c_int) -> *const 
         let d = libc::opendir(ptr::addr_of!(G_AD_DIR) as *const c_char);
         if !d.is_null() {
             let mut names: *mut *mut c_char = ptr::null_mut();
-            let mut cap = 0;
+            let mut cap: c_int = 0;
             let mut n = 0;
             loop {
                 let de = libc::readdir(d);
@@ -1662,15 +1670,15 @@ pub unsafe extern "C" fn ocerz_apidb_install_names(count: *mut c_int) -> *const 
                     continue;
                 }
                 let ilen = send.offset_from(second) as usize - 8;
-                let name = libc::malloc(ilen + 1) as *mut c_char;
+                let name = libc::malloc(ilen.wrapping_add(1)) as *mut c_char;
                 if !name.is_null() {
                     ptr::copy_nonoverlapping(second.add(8), name, ilen);
                     *name.add(ilen) = 0;
                     if n >= cap {
-                        let nc = if cap != 0 { cap * 2 } else { 32 };
+                        let nc = if cap != 0 { cap.wrapping_mul(2) } else { 32 };
                         let nn = libc::realloc(
                             names.cast(),
-                            nc as usize * mem::size_of::<*mut c_char>(),
+                            (nc as usize).wrapping_mul(mem::size_of::<*mut c_char>()),
                         ) as *mut *mut c_char;
                         if nn.is_null() {
                             libc::free(name.cast());

@@ -82,7 +82,7 @@
 use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::mem::{offset_of, size_of};
 use core::ptr;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
 use crate::ffi;
 use crate::inline::{ocerz_g2h, ocerz_h2g, ocerz_ld, ocerz_st};
@@ -203,7 +203,7 @@ static mut G_BLK_SHADOW: BlkMap = BlkMap {
 static mut G_BLK_NATIVE_DESC_NAMED: *mut BlkNode = ptr::null_mut();
 static mut G_BLK_VIEW_DESC_NAMED: *mut BlkNode = ptr::null_mut();
 static G_BLK_THUNK: AtomicU64 = AtomicU64::new(0);
-static G_AUTORELEASE: AtomicU64 = AtomicU64::new(0);
+static G_AUTORELEASE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static G_AUTORELEASE_LOOKED: AtomicI32 = AtomicI32::new(0);
 
 #[inline]
@@ -228,7 +228,7 @@ unsafe fn blk_hash(key: u64) -> usize {
 }
 
 unsafe fn blk_map_get(map: *const BlkMap, key: u64) -> *mut c_void {
-    let mut n = (*map).bucket[blk_hash(key)];
+    let mut n = *(*map).bucket.as_ptr().add(blk_hash(key));
     while !n.is_null() {
         if (*n).key == key {
             return (*n).val;
@@ -240,7 +240,8 @@ unsafe fn blk_map_get(map: *const BlkMap, key: u64) -> *mut c_void {
 
 unsafe fn blk_map_put(map: *mut BlkMap, key: u64, val: *mut c_void) -> bool {
     let b = blk_hash(key);
-    let mut n = (*map).bucket[b];
+    let bucket = (*map).bucket.as_mut_ptr().add(b);
+    let mut n = *bucket;
     while !n.is_null() {
         if (*n).key == key {
             (*n).val = val;
@@ -254,13 +255,13 @@ unsafe fn blk_map_put(map: *mut BlkMap, key: u64, val: *mut c_void) -> bool {
     }
     (*n).key = key;
     (*n).val = val;
-    (*n).next = (*map).bucket[b];
-    (*map).bucket[b] = n;
+    (*n).next = *bucket;
+    *bucket = n;
     true
 }
 
 unsafe fn blk_map_drop(map: *mut BlkMap, key: u64, val: *const c_void) {
-    let mut at = &mut (*map).bucket[blk_hash(key)] as *mut *mut BlkNode;
+    let mut at = (*map).bucket.as_mut_ptr().add(blk_hash(key));
     while !(*at).is_null() {
         let n = *at;
         if (*n).key == key {
@@ -416,13 +417,17 @@ unsafe fn blk_insert_self(declared: *const c_char, out: *mut c_char, outlen: usi
         }
         p = p.add(1);
     }
-    if open.is_null() || len + 4 > outlen {
+    if open.is_null() || len.wrapping_add(4) > outlen {
         return ffi::OCERZ_EFORMAT as c_int;
     }
     let head = open.offset_from(declared) as usize + 1;
     ptr::copy_nonoverlapping(declared, out, head);
     ptr::copy_nonoverlapping(c"k{}".as_ptr().cast::<c_char>(), out.add(head), 3);
-    ptr::copy_nonoverlapping(open.add(1), out.add(head + 3), len - head + 1);
+    ptr::copy_nonoverlapping(
+        open.add(1),
+        out.add(head.wrapping_add(3)),
+        len.wrapping_sub(head).wrapping_add(1),
+    );
     ffi::OCERZ_OK as c_int
 }
 
@@ -464,11 +469,11 @@ pub unsafe extern "C" fn ocerz_block_invoke_notation(
             return ffi::OCERZ_EUNSUP as c_int;
         }
         let sig = sig.assume_init();
-        if sig.nargs < 1 || sig.arg[0] != b'k' as c_char {
+        if sig.nargs < 1 || *sig.arg.as_ptr() != b'k' as c_char {
             return ffi::OCERZ_EFORMAT as c_int;
         }
         for i in 0..sig.nargs as usize {
-            if sig.arg[i] == b'c' as c_char {
+            if *sig.arg.as_ptr().add(i) == b'c' as c_char {
                 return ffi::OCERZ_EUNSUP as c_int;
             }
         }
@@ -561,7 +566,12 @@ unsafe fn blk_desc_locked(
         return d;
     }
     let len = libc::strlen(name);
-    let n = libc::malloc(size_of::<BlkNode>() + len + 1).cast::<BlkNode>();
+    let n = libc::malloc(
+        size_of::<BlkNode>()
+            .wrapping_add(len)
+            .wrapping_add(1),
+    )
+    .cast::<BlkNode>();
     if n.is_null() {
         libc::free(d.cast());
         return ptr::null_mut();
@@ -569,7 +579,7 @@ unsafe fn blk_desc_locked(
     ptr::copy_nonoverlapping(
         name,
         (n as *mut u8).add(size_of::<BlkNode>()).cast(),
-        len + 1,
+        len.wrapping_add(1),
     );
     (*n).key = key;
     (*n).val = d.cast();
@@ -921,12 +931,15 @@ pub unsafe extern "C" fn ocerz_block_release(block: u64) {
 unsafe fn blk_autorelease(block: u64) {
     if G_AUTORELEASE_LOOKED.load(Ordering::SeqCst) == 0 {
         let p = libc::dlsym(libc::RTLD_DEFAULT, c"objc_autorelease".as_ptr());
-        G_AUTORELEASE.store(p as u64, Ordering::SeqCst);
+        G_AUTORELEASE.store(p, Ordering::SeqCst);
         G_AUTORELEASE_LOOKED.store(1, Ordering::SeqCst);
     }
     let p = G_AUTORELEASE.load(Ordering::SeqCst);
-    if p != 0 {
-        core::mem::transmute::<u64, unsafe extern "C" fn(*mut c_void) -> *mut c_void>(p)(
+    if !p.is_null() {
+        core::mem::transmute::<
+            *mut c_void,
+            unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        >(p)(
             block as *mut c_void,
         );
     }
@@ -1095,7 +1108,7 @@ pub unsafe extern "C" fn ocerz_block_copy_guest(gblock: u64) -> u64 {
         }
         let gdesc = (*b).desc as u64;
         let size = if gdesc != 0 {
-            ocerz_ld(gdesc + 8, 8) as usize
+            ocerz_ld(gdesc.wrapping_add(8), 8) as usize
         } else {
             0
         };
@@ -1197,10 +1210,10 @@ unsafe fn blk_byref_copy(gsrc: u64, flags: i32) -> u64 {
 }
 
 unsafe fn blk_return(cpu: *mut ffi::OcerzCPU, rax: u64) {
-    let rsp = (*cpu).gpr[ffi::OCERZ_RSP as usize];
+    let rsp = *(*cpu).gpr.as_ptr().add(ffi::OCERZ_RSP as usize);
     (*cpu).rip = ocerz_ld(rsp, 8);
-    (*cpu).gpr[ffi::OCERZ_RSP as usize] = rsp + 8;
-    (*cpu).gpr[ffi::OCERZ_RAX as usize] = rax;
+    *(*cpu).gpr.as_mut_ptr().add(ffi::OCERZ_RSP as usize) = rsp.wrapping_add(8);
+    *(*cpu).gpr.as_mut_ptr().add(ffi::OCERZ_RAX as usize) = rax;
 }
 
 unsafe fn blk_settle(vm: *mut ffi::OcerzVM, cpu: *mut ffi::OcerzCPU) -> c_int {
@@ -1218,7 +1231,7 @@ pub unsafe extern "C" fn ocerz_block_special_copy(
     unsafe {
         blk_return(
             cpu,
-            ocerz_block_copy_guest((*cpu).gpr[ffi::OCERZ_RDI as usize]),
+            ocerz_block_copy_guest(*(*cpu).gpr.as_ptr().add(ffi::OCERZ_RDI as usize)),
         );
         blk_settle(vm, cpu)
     }
@@ -1230,9 +1243,9 @@ pub unsafe extern "C" fn ocerz_block_special_object_assign(
     cpu: *mut ffi::OcerzCPU,
 ) -> c_int {
     unsafe {
-        let dst = (*cpu).gpr[ffi::OCERZ_RDI as usize];
-        let src = (*cpu).gpr[ffi::OCERZ_RSI as usize];
-        let flags = (*cpu).gpr[ffi::OCERZ_RDX as usize] as i32;
+        let dst = *(*cpu).gpr.as_ptr().add(ffi::OCERZ_RDI as usize);
+        let src = *(*cpu).gpr.as_ptr().add(ffi::OCERZ_RSI as usize);
+        let flags = *(*cpu).gpr.as_ptr().add(ffi::OCERZ_RDX as usize) as i32;
         match flags & BLK_ALL_COPY_DISPOSE_FLAGS {
             BLK_FIELD_IS_BLOCK => ocerz_st(dst, 8, ocerz_block_copy_guest(src)),
             x if x == BLK_FIELD_IS_BYREF || x == (BLK_FIELD_IS_BYREF | BLK_FIELD_IS_WEAK) => {
@@ -1259,11 +1272,14 @@ pub unsafe extern "C" fn ocerz_block_invoke_trap(
     cpu: *mut ffi::OcerzCPU,
 ) -> c_int {
     unsafe {
-        let mut view = (*cpu).gpr[ffi::OCERZ_RDI as usize];
+        let mut view = *(*cpu).gpr.as_ptr().add(ffi::OCERZ_RDI as usize);
         if ocerz_block_guest_view(view, ptr::null_mut()) == 0 {
-            view = (*cpu).gpr[ffi::OCERZ_RSI as usize];
+            view = *(*cpu).gpr.as_ptr().add(ffi::OCERZ_RSI as usize);
             if ocerz_block_guest_view(view, ptr::null_mut()) == 0 {
-                blk_stop(c"the trampoline for native blocks was entered with no native block's guest view in rdi or rsi (rdi %#llx)".as_ptr(), (*cpu).gpr[ffi::OCERZ_RDI as usize]);
+                blk_stop(
+                    c"the trampoline for native blocks was entered with no native block's guest view in rdi or rsi (rdi %#llx)".as_ptr(),
+                    *(*cpu).gpr.as_ptr().add(ffi::OCERZ_RDI as usize),
+                );
             }
         }
         let v = blk_host(view);
