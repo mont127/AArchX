@@ -121,6 +121,7 @@ fn ocerz_sext(v: u64, size: c_int) -> i64 {
     ((v << shift) as i64) >> shift
 }
 
+#[inline(always)]
 unsafe fn fetch8(s: &mut DecState, v: *mut u8) -> c_int {
     if s.p >= s.end {
         return OCERZ_ETRUNC as c_int;
@@ -130,40 +131,38 @@ unsafe fn fetch8(s: &mut DecState, v: *mut u8) -> c_int {
     OCERZ_OK as c_int
 }
 
+#[inline(always)]
 unsafe fn fetch16(s: &mut DecState, v: *mut u16) -> c_int {
     if s.end.offset_from(s.p) < 2 {
         return OCERZ_ETRUNC as c_int;
     }
-    *v = (*s.p as u16) | ((*s.p.add(1) as u16) << 8);
+    *v = u16::from_le(ptr::read_unaligned(s.p.cast::<u16>()));
     s.p = s.p.add(2);
     OCERZ_OK as c_int
 }
 
+#[inline(always)]
 unsafe fn fetch32(s: &mut DecState, v: *mut u32) -> c_int {
     if s.end.offset_from(s.p) < 4 {
         return OCERZ_ETRUNC as c_int;
     }
-    *v = (*s.p as u32)
-        | ((*s.p.add(1) as u32) << 8)
-        | ((*s.p.add(2) as u32) << 16)
-        | ((*s.p.add(3) as u32) << 24);
+    *v = u32::from_le(ptr::read_unaligned(s.p.cast::<u32>()));
     s.p = s.p.add(4);
     OCERZ_OK as c_int
 }
 
+#[inline(always)]
 unsafe fn fetch64(s: &mut DecState, v: *mut u64) -> c_int {
     if s.end.offset_from(s.p) < 8 {
         return OCERZ_ETRUNC as c_int;
     }
-    let mut r = 0u64;
-    for i in 0..8 {
-        r |= ((*s.p.add(i)) as u64) << (8 * i);
-    }
+    let r = u64::from_le(ptr::read_unaligned(s.p.cast::<u64>()));
     s.p = s.p.add(8);
     *v = r;
     OCERZ_OK as c_int
 }
 
+#[inline(always)]
 unsafe fn set_reg(op: *mut X86Operand, reg: c_int, size: c_int) {
     (*op).kind = OCERZ_OPK_REG as u8;
     (*op).reg = reg as u8;
@@ -177,6 +176,7 @@ unsafe fn set_reg(op: *mut X86Operand, reg: c_int, size: c_int) {
     (*op).imm = 0;
 }
 
+#[inline(always)]
 unsafe fn set_reg8(s: &DecState, op: *mut X86Operand, enc: c_int) {
     (*op).kind = OCERZ_OPK_REG as u8;
     (*op).size = 1;
@@ -195,6 +195,7 @@ unsafe fn set_reg8(s: &DecState, op: *mut X86Operand, enc: c_int) {
     }
 }
 
+#[inline(always)]
 unsafe fn set_xmm(op: *mut X86Operand, reg: c_int, size: c_int) {
     (*op).kind = OCERZ_OPK_XMM as u8;
     (*op).reg = reg as u8;
@@ -208,11 +209,13 @@ unsafe fn set_xmm(op: *mut X86Operand, reg: c_int, size: c_int) {
     (*op).imm = 0;
 }
 
+#[inline(always)]
 unsafe fn set_mmx(op: *mut X86Operand, reg: c_int) {
     set_xmm(op, reg & 7, 8);
     (*op).kind = OCERZ_OPK_MMX as u8;
 }
 
+#[inline(always)]
 unsafe fn set_st(op: *mut X86Operand, i: c_int) {
     (*op).kind = OCERZ_OPK_ST as u8;
     (*op).reg = i as u8;
@@ -226,6 +229,7 @@ unsafe fn set_st(op: *mut X86Operand, i: c_int) {
     (*op).imm = 0;
 }
 
+#[inline(always)]
 unsafe fn set_imm(op: *mut X86Operand, imm: u64, size: c_int) {
     (*op).kind = OCERZ_OPK_IMM as u8;
     (*op).reg = 0;
@@ -239,6 +243,7 @@ unsafe fn set_imm(op: *mut X86Operand, imm: u64, size: c_int) {
     (*op).imm = imm;
 }
 
+#[inline(always)]
 unsafe fn read_imm8s(s: &mut DecState, op: *mut X86Operand, size: c_int) -> c_int {
     let mut b = 0u8;
     let e = fetch8(s, &mut b);
@@ -249,6 +254,7 @@ unsafe fn read_imm8s(s: &mut DecState, op: *mut X86Operand, size: c_int) -> c_in
     OCERZ_OK as c_int
 }
 
+#[inline(always)]
 unsafe fn read_imm16(s: &mut DecState, op: *mut X86Operand) -> c_int {
     let mut w = 0u16;
     let e = fetch16(s, &mut w);
@@ -259,6 +265,7 @@ unsafe fn read_imm16(s: &mut DecState, op: *mut X86Operand) -> c_int {
     OCERZ_OK as c_int
 }
 
+#[inline(always)]
 unsafe fn read_imm32s(s: &mut DecState, op: *mut X86Operand, size: c_int) -> c_int {
     let mut d = 0u32;
     let e = fetch32(s, &mut d);
@@ -269,6 +276,7 @@ unsafe fn read_imm32s(s: &mut DecState, op: *mut X86Operand, size: c_int) -> c_i
     OCERZ_OK as c_int
 }
 
+#[inline(always)]
 unsafe fn read_imm_sized(s: &mut DecState, op: *mut X86Operand, opsize: c_int) -> c_int {
     if opsize == 2 {
         read_imm16(s, op)
@@ -277,6 +285,7 @@ unsafe fn read_imm_sized(s: &mut DecState, op: *mut X86Operand, opsize: c_int) -
     }
 }
 
+#[inline(always)]
 unsafe fn read_imm64(s: &mut DecState, op: *mut X86Operand) -> c_int {
     let mut q = 0u64;
     let e = fetch64(s, &mut q);
@@ -287,6 +296,7 @@ unsafe fn read_imm64(s: &mut DecState, op: *mut X86Operand) -> c_int {
     OCERZ_OK as c_int
 }
 
+#[inline(always)]
 unsafe fn cur_len(s: &DecState) -> c_int {
     s.p.offset_from(s.base) as c_int
 }
@@ -342,6 +352,7 @@ unsafe fn decode_modrm16(s: &mut DecState, m: &mut ModRM, rm: c_int) -> c_int {
     OCERZ_OK as c_int
 }
 
+#[inline]
 unsafe fn decode_modrm(s: &mut DecState, m: &mut ModRM, mem_size: c_int) -> c_int {
     let mut b = 0u8;
     let e = fetch8(s, &mut b);
@@ -435,6 +446,7 @@ unsafe fn decode_modrm(s: &mut DecState, m: &mut ModRM, mem_size: c_int) -> c_in
     OCERZ_OK as c_int
 }
 
+#[inline]
 unsafe fn fixup_riprel(s: &mut DecState) {
     for i in 0..(*s.out).nops as usize {
         let op = &mut (*s.out).ops[i];
@@ -444,18 +456,22 @@ unsafe fn fixup_riprel(s: &mut DecState) {
     }
 }
 
+#[inline(always)]
 unsafe fn modrm_to_reg(m: &ModRM, op: *mut X86Operand, size: c_int) {
     set_reg(op, m.rm, size);
 }
 
+#[inline(always)]
 unsafe fn modrm_to_xmm(m: &ModRM, op: *mut X86Operand, size: c_int) {
     set_xmm(op, m.rm, size);
 }
 
+#[inline(always)]
 fn rm_is_reg(m: &ModRM) -> bool {
     m.mod_ == 3
 }
 
+#[inline(always)]
 unsafe fn place_rm(m: &ModRM, op: *mut X86Operand, size: c_int, gpr: bool) {
     if rm_is_reg(m) {
         if gpr {
@@ -469,6 +485,7 @@ unsafe fn place_rm(m: &ModRM, op: *mut X86Operand, size: c_int, gpr: bool) {
     }
 }
 
+#[inline(always)]
 unsafe fn place_rm8(s: &DecState, m: &ModRM, op: *mut X86Operand) {
     if rm_is_reg(m) {
         set_reg8(s, op, m.rm);
@@ -478,6 +495,7 @@ unsafe fn place_rm8(s: &DecState, m: &ModRM, op: *mut X86Operand) {
     }
 }
 
+#[inline(always)]
 fn opsize_default(s: &DecState) -> c_int {
     if s.rex_w != 0 {
         8
@@ -488,6 +506,7 @@ fn opsize_default(s: &DecState) -> c_int {
     }
 }
 
+#[inline(always)]
 fn opsize_stack(s: &DecState) -> c_int {
     if s.has_66 != 0 {
         2
@@ -498,6 +517,7 @@ fn opsize_stack(s: &DecState) -> c_int {
     }
 }
 
+#[inline(always)]
 fn opsize_stack_implicit(s: &DecState) -> c_int {
     if s.mode32 == 0 {
         8
@@ -508,6 +528,7 @@ fn opsize_stack_implicit(s: &DecState) -> c_int {
     }
 }
 
+#[inline(always)]
 fn opsize_nearbranch(s: &DecState) -> c_int {
     if s.mode32 == 0 {
         8
@@ -518,10 +539,12 @@ fn opsize_nearbranch(s: &DecState) -> c_int {
     }
 }
 
+#[inline(always)]
 unsafe fn set_op(s: &mut DecState, op: c_int) {
     (*s.out).op = op as u16;
 }
 
+#[inline(always)]
 fn alu_op_for(idx: c_int) -> c_int {
     match idx {
         0 => OCERZ_OP_ADD as c_int,
@@ -535,6 +558,7 @@ fn alu_op_for(idx: c_int) -> c_int {
     }
 }
 
+#[inline(always)]
 fn shift_op_for(idx: c_int) -> c_int {
     match idx {
         0 => OCERZ_OP_ROL as c_int,
@@ -548,6 +572,7 @@ fn shift_op_for(idx: c_int) -> c_int {
     }
 }
 
+#[inline]
 unsafe fn alu_rm_r(s: &mut DecState, idx: c_int, byte_form: bool, reg_is_dst: bool) -> c_int {
     let mut m: ModRM = mem::zeroed();
     let size = if byte_form { 1 } else { opsize_default(s) };
