@@ -60,21 +60,30 @@ pointers.
   Release builds have `overflow-checks = false`, so plain integer arithmetic
   wraps as C's unsigned arithmetic does.
 
-## Verification (rebased onto 5212e30)
+## Verification (rebased onto b849b33)
 
+- Line-by-line re-audit of jit.rs against jit.c (all of it, incl. ps_report):
+  branch and check order, which g_* toggle / env cache each branch reads, log
+  strings and their conditions, finalize order (audit hook, tc_bind,
+  code_index_append_locked, EMITCHECK, lanerec, tc_put/tc_verify, chain
+  install, stats). No semantic difference. It found 16 bounds-checked reads of
+  the shared per-insn arrays (g_mov_skip, g_fpb_*, g_jcc_edge, g_call_edge);
+  they now go through the unchecked `ga!` accessor like the C.
 - `tools/jit_emit_audit.sh ~/AArchX-jitc ~/AArchX` (reference 16a7c2d):
   MATCH, 215,295 blocks, 145,523,525 arm64 words, offset + low, seed 1. The
-  runner's existing Rust-core build path was used unchanged.
+  runner's existing Rust-core build path was used unchanged. The corpus is
+  i386 only; the x64 corpus (`--corpus all`) had not landed, so the full
+  gate's native phases are the x86-64 evidence.
 - Unit bins test_a64emit, test_jit32, test_jit_exit, test_jit_order_transition,
   test_jit_psc_invalidate, test_chain_concurrency, test_sse, test_interp: pass.
-- `tools/rust_gate.sh --fast`: PASS.
-- `tools/rust_gate.sh` (full): one new failure, `dthread_signal-jit`
-  ("SIGUSR1 not delivered within 2s" in one of 120 rounds). It is a flake on
-  this tip, not from the core: 90 isolated runs gave 7 failures with the Rust
-  core and 4 with the C core built from the same tip (a second 60/60 batch
-  was 3 vs 3), and the reference 16a7c2d failed 0/20. The core does not touch
-  signal delivery. A rerun of `tests/run_dynamic_tests.sh` passed it with only
-  the baseline failures left. Everything else matched agents/baseline.md.
+- `tools/rust_gate.sh` (full) on 6d3fdcf and again on b849b33: PASS, no new
+  failures. dyn 278 pass / 9 known; run_native_tests 86 pass / 1 known;
+  guest library, framework and format suites pass.
+- An earlier full gate (on 5212e30) hit `dthread_signal-jit` ("SIGUSR1 not
+  delivered within 2s" in one of 120 rounds). It is a flake, not from the
+  core: 90 isolated runs gave 7 failures with the Rust core and 4 with the C
+  core built from the same tip (a second 60/60 batch was 3 vs 3), and it
+  passed in both later full gates.
 - `datomic_counter-no-jit` (known interpreter-mode slowdown, the lead is
   bisecting it) passed in the full gate and the dynamic rerun. It is not worse
   with the Rust core: five alternating runs, median 30.25 s with the Rust core
