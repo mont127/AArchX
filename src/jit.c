@@ -5479,6 +5479,32 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         patch_guard_skip(skip, a64_label(b));
         return 1;
     }
+    /*
+     * A store of ah, ch, dh or bh takes bits 8-15 of the register into a
+     * scratch one after the address is formed and checked, as an unpinned
+     * source's value is, then stores the byte.  zlib's deflate stores the high
+     * byte of a 16-bit code that way, 3 million times a run, and each went to
+     * the interpreter.  OCERZ_NO_HIGH8_STORE=1 sends them there again.
+     */
+    if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_REG && s->high8 && s->size == 1 &&
+        !ENV_ON("OCERZ_NO_HIGH8_STORE")) {
+        if (!mem_native_store_ok())
+            return 0;
+        if (!emit_mem_ea(b, insn, d, JTA))
+            return 0;
+        uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+        int ss = pin_slot(s->reg);
+        if (ss >= 0) {
+            a64_ubfx(b, 0, JT1, pin_hreg(ss), 8, 8);
+        } else {
+            emit_gpr_rd(b, 0, JT1, s->reg);
+            a64_ubfx(b, 0, JT1, JT1, 8, 8);
+        }
+        emit_add_const(b, JTA, gbase - ea_fold());
+        emit_guest_store_ordered(b, 1, JT1, JTA, JTU);
+        patch_guard_skip(skip, a64_label(b));
+        return 1;
+    }
     if (d->kind == OCERZ_OPK_MEM && s->kind == OCERZ_OPK_REG) {
         if (s->high8 || (s->size != 1 && s->size != 2 && s->size != 4 && s->size != 8))
             return 0;
@@ -7470,7 +7496,17 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
         return 0;
     if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
-    if (need)
+    /*
+     * With its flags read, a shift by cl leaves them as they were when the
+     * masked count is 0 and otherwise sets them as a shift by an immediate
+     * does.  flags_live has it read every flag as well as write it, so the
+     * producer before it has left its record, and a count of 0 skips writing
+     * a new one; producer_record_kind gives no kind for it, so whatever reads
+     * the flags next evaluates the record that is there.  zlib's inflate and
+     * deflate shift their bit buffers by cl 6 million times a run, and went to
+     * the interpreter for each.  OCERZ_NO_SHIFT_CL_FLAGS=1 interprets them again.
+     */
+    if (need && (!g_defer || ENV_ON("OCERZ_NO_SHIFT_CL_FLAGS")))
         return 0;
     if (insn->mode32)
         return 0;
@@ -7482,15 +7518,24 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
     int rd = ds >= 0 ? pin_hreg(ds) : JT2;
     if (ds < 0)
         emit_gpr_rd(b, sf, JT0, d->reg);
+    else if (need)
+        a64_mov_reg(b, sf, JT0, rd);
     int rn = ds >= 0 ? rd : JT0;
+    unsigned kind;
     switch (insn->op) {
-    case OCERZ_OP_SHL: a64_lslv(b, sf, rd, rn, JT1); break;
-    case OCERZ_OP_SHR: a64_lsrv(b, sf, rd, rn, JT1); break;
-    case OCERZ_OP_SAR: a64_asrv(b, sf, rd, rn, JT1); break;
+    case OCERZ_OP_SHL: a64_lslv(b, sf, rd, rn, JT1); kind = OCERZ_CC_SHL; break;
+    case OCERZ_OP_SHR: a64_lsrv(b, sf, rd, rn, JT1); kind = OCERZ_CC_SHR; break;
+    case OCERZ_OP_SAR: a64_asrv(b, sf, rd, rn, JT1); kind = OCERZ_CC_SAR; break;
     default: return 0;
     }
     if (ds < 0)
         emit_gpr_wr(b, rd, d->reg);
+    if (need) {
+        uint32_t *zero = a64_label(b);
+        a64_cbz(b, 0, JT1, 0);
+        emit_defer_flags(b, ocerz_cc_pack(kind, d->size, 0), JT0, JT1);
+        a64_patch_cbz(zero, a64_label(b));
+    }
     return 1;
 }
 
