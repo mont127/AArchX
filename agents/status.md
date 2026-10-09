@@ -10,7 +10,7 @@
 | cache.c | 1496 | runtime (ee47e957) | in progress |
 | cpu.c | 163 | decode-agent | ported |
 | decode.c | 4435 | decode-agent | in progress |
-| dyld.c | 5840 | - | C |
+| dyld.c | 5840 | dyld-agent | in progress |
 | dyldapi.c | 2636 | dyld-agent | ported |
 | flags.c | 230 | - | ported |
 | flags_live.c | 283 | - | C |
