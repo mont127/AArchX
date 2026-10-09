@@ -4,7 +4,7 @@
 use super::util::*;
 use super::*;
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_int, c_void};
 use core::ptr;
 
 const OCERZ_OOL_COPY_MAX: u64 = 64 * 1024 * 1024;
@@ -106,7 +106,7 @@ pub(super) unsafe fn ocerz_bridge_mach_msg(hbuf: u64, sz: u64) -> u64 {
         if libc::getenv(c"OCERZ_NO_AUXTAIL".as_ptr()).is_null() {
             let mut aux = [0u32; 2];
             ptr::copy_nonoverlapping(
-                (hbuf.wrapping_add(sz) as usize as *const u32),
+                hbuf.wrapping_add(sz) as usize as *const u32,
                 aux.as_mut_ptr(),
                 2,
             );

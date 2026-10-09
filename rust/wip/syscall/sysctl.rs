@@ -152,7 +152,11 @@ unsafe extern "C" {
     fn sysctlnametomib(name: *const c_char, mib: *mut c_int, size: *mut usize) -> c_int;
 }
 
-unsafe fn sys_bsdthread_register(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_bsdthread_register(
+    _vm: *mut OcerzVM,
+    cpu: *mut OcerzCPU,
+    a: *mut [u64; 8],
+) -> c_int {
     unsafe {
         let args = &*a;
         core::sync::atomic::AtomicU64::from_ptr(core::ptr::addr_of_mut!(g_pthread_start))
@@ -184,7 +188,11 @@ unsafe fn sys_bsdthread_register(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut 
     }
 }
 
-unsafe fn sys_workq_stub(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, _a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_workq_stub(
+    _vm: *mut OcerzVM,
+    cpu: *mut OcerzCPU,
+    _a: *mut [u64; 8],
+) -> c_int {
     ret_ok(cpu, 0);
     crate::ffi::OCERZ_STEP_OK as c_int
 }
@@ -328,7 +336,7 @@ unsafe fn x86_sysctl_emit(cpu: *mut OcerzCPU, idx: c_int, oldp: u64, oldlenp: u6
     }
 }
 
-unsafe fn sys_sysctl(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_sysctl(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
     unsafe {
         let a = &*a;
         static LOG: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
@@ -470,7 +478,11 @@ unsafe fn sys_mac_syscall_log(cpu: *mut OcerzCPU, a: *mut [u64; 8]) {
     }
 }
 
-unsafe fn sys_mac_syscall(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_mac_syscall(
+    vm: *mut OcerzVM,
+    cpu: *mut OcerzCPU,
+    a: *mut [u64; 8],
+) -> c_int {
     unsafe {
         let a = &*a;
         static LOG: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
@@ -538,11 +550,15 @@ unsafe fn sys_mac_syscall(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]
     }
 }
 
-unsafe fn sys_sysctlbyname(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_sysctlbyname(
+    _vm: *mut OcerzVM,
+    cpu: *mut OcerzCPU,
+    a: *mut [u64; 8],
+) -> c_int {
     unsafe {
         let a = &*a;
         let mut name = [0 as c_char; 160];
-        let mut nl = a[1].min(159);
+        let nl = a[1].min(159);
         for i in 0..nl {
             name[i as usize] = ocerz_ld(a[0].wrapping_add(i), 1) as u8 as c_char;
         }

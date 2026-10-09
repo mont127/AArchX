@@ -29,7 +29,7 @@ unsafe extern "C" {
 }
 
 #[inline(always)]
-unsafe fn sys_exit(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_exit(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
     unsafe {
         let args = &*a;
         if !libc::getenv(c"OCERZ_EXITLOG".as_ptr()).is_null() {
@@ -131,11 +131,19 @@ unsafe fn sys_exit(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_
     }
 }
 
-unsafe fn sys_unsupported(_vm: *mut OcerzVM, _cpu: *mut OcerzCPU, _a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_unsupported(
+    _vm: *mut OcerzVM,
+    _cpu: *mut OcerzCPU,
+    _a: *mut [u64; 8],
+) -> c_int {
     crate::ffi::OCERZ_STEP_FATAL as c_int
 }
 
-unsafe fn sys_abort_payload(vm: *mut OcerzVM, _cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_abort_payload(
+    vm: *mut OcerzVM,
+    _cpu: *mut OcerzCPU,
+    a: *mut [u64; 8],
+) -> c_int {
     unsafe {
         let args = &*a;
         crate::ocerz_log!(
@@ -152,7 +160,7 @@ unsafe fn sys_abort_payload(vm: *mut OcerzVM, _cpu: *mut OcerzCPU, a: *mut [u64;
     }
 }
 
-unsafe fn memtrace(op: *const c_char, addr: u64, len: u64, prot: c_int, flags: c_int) {
+pub(super) unsafe fn memtrace(op: *const c_char, addr: u64, len: u64, prot: c_int, flags: c_int) {
     static ON: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
     static ALL: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
     unsafe {
@@ -602,7 +610,7 @@ unsafe fn guest_mmap_apply(
     }
 }
 
-unsafe fn sys_mmap(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_mmap(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
     unsafe {
         let args = &*a;
         let mut gaddr = 0;
@@ -626,7 +634,7 @@ unsafe fn sys_mmap(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_
     }
 }
 
-unsafe fn sys_munmap(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_munmap(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
     unsafe {
         let args = &*a;
         image_clobber_check(c"munmap".as_ptr(), cpu, args[0], args[1], 0);
@@ -696,7 +704,7 @@ unsafe fn guest_mprotect_apply(
     }
 }
 
-unsafe fn sys_mprotect(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_mprotect(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
     unsafe {
         let args = &*a;
         let err = guest_mprotect_apply(vm, cpu, args[0], args[1], args[2] as c_int);
@@ -709,7 +717,11 @@ unsafe fn sys_mprotect(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -
     }
 }
 
-unsafe fn sys_madvise(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, _a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_madvise(
+    _vm: *mut OcerzVM,
+    cpu: *mut OcerzCPU,
+    _a: *mut [u64; 8],
+) -> c_int {
     ret_ok(cpu, 0);
     crate::ffi::OCERZ_STEP_OK as c_int
 }
@@ -791,7 +803,7 @@ pub unsafe extern "C" fn ocerz_guest_madvise(
     }
 }
 
-unsafe fn sys_shared_region_check_np(
+pub(super) unsafe fn sys_shared_region_check_np(
     _vm: *mut OcerzVM,
     cpu: *mut OcerzCPU,
     _a: *mut [u64; 8],

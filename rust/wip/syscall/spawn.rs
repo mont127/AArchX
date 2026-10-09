@@ -4,7 +4,7 @@
 use super::util::*;
 use super::*;
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int};
 use core::ptr;
 
 const PSFA_STRIDE: u64 = 1040;
@@ -139,6 +139,7 @@ unsafe fn spawn_attr_sanitized(
     }
 }
 
+#[allow(unused_assignments)]
 unsafe fn spawn_guest_args(
     adesc: u64,
     at: *mut libc::posix_spawnattr_t,
@@ -1109,7 +1110,11 @@ unsafe fn guest_exec_apply(
     }
 }
 
-unsafe fn sys_posix_spawn(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_posix_spawn(
+    vm: *mut OcerzVM,
+    cpu: *mut OcerzCPU,
+    a: *mut [u64; 8],
+) -> c_int {
     unsafe {
         let a = &*a;
         if a[1] == 0 {
@@ -1177,7 +1182,7 @@ unsafe fn sys_posix_spawn(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]
     }
 }
 
-unsafe fn sys_execve(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
+pub(super) unsafe fn sys_execve(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8]) -> c_int {
     unsafe {
         let a = &*a;
         if a[0] == 0 || a[1] == 0 {
