@@ -207,9 +207,10 @@ unsafe fn guest_self_signal(cpu: *mut OcerzCPU, signo: c_int, defer: c_int) -> c
                 }
                 fp = nf;
             }
+            libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
             libc::fprintf(
                 crate::log::stderr(),
-                c"\nocerz: guest self-signal %llu, no handler; exiting %d\n".as_ptr(),
+                c"ocerz: guest self-signal %llu, no handler; exiting %d\n".as_ptr(),
                 signo as libc::c_ulonglong,
                 128 + signo,
             );

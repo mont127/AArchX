@@ -548,7 +548,7 @@ pub unsafe extern "C" fn ocerz_alias_raw_region(vm: *mut OcerzVM, pointer: u64) 
     alias_raw_region(vm, pointer, false)
 }
 
-unsafe fn alias_raw_contiguous(vm: *mut OcerzVM, pointer: u64) -> c_int {
+unsafe fn ocerz_alias_raw_contiguous(vm: *mut OcerzVM, pointer: u64) -> c_int {
     let mut first = pointer;
     let mut first_size = 0;
     let mut first_info: VmRegionBasicInfo64 = core::mem::zeroed();
@@ -595,7 +595,7 @@ unsafe fn alias_raw_contiguous(vm: *mut OcerzVM, pointer: u64) -> c_int {
         if kr != 0 || region != pos || size == 0 || size > limit - pos {
             break;
         }
-        if alias_raw_region(vm, pos, false) != 0 {
+        if ocerz_alias_raw_region(vm, pos) != 0 {
             return -1;
         }
         pos = pos.wrapping_add(size);
@@ -1191,7 +1191,7 @@ unsafe fn ocerz_reply_alias_iokit(vm: *mut OcerzVM, reply: u64, recv_size: u32) 
             continue;
         }
         tries += 1;
-        let rc = alias_raw_region(vm, pointer, false);
+        let rc = ocerz_alias_raw_region(vm, pointer);
         if MACHLEAK != 0 {
             libc::fprintf(
                 crate::log::stderr(),
@@ -1422,7 +1422,7 @@ unsafe fn thread_act_emulate(cpu: *mut OcerzCPU, buf: u64, id: u32, recv_size: u
     true
 }
 
-unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64; 8]) -> u64 {
+unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64; 8]) -> c_int {
     let gmsg = a[0];
     let vm_region_req = if gmsg != 0
         && a[1] & 1 != 0
@@ -1451,13 +1451,15 @@ unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     } else {
         0
     };
-    if gmsg != 0 {
-        ocerz_vmmsg_trace(
-            c"REQ".as_ptr(),
-            gmsg,
-            ocerz_ld(gmsg.wrapping_add(4), 4) as u32,
-        );
-    }
+    ocerz_vmmsg_trace(
+        c"REQ".as_ptr(),
+        gmsg,
+        if gmsg != 0 {
+            ocerz_ld(gmsg.wrapping_add(4), 4) as u32
+        } else {
+            0
+        },
+    );
     if gmsg != 0 && a[1] & 2 != 0 {
         super::bsd::disarm_guest_buffer(cpu, gmsg, a[3] as u32 as u64);
     }
@@ -1473,19 +1475,20 @@ unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
         NO_RCV_TIMEOUT_KICK_31 =
             c_int::from(!libc::getenv(c"OCERZ_NO_RCV_TIMEOUT_KICK".as_ptr()).is_null());
     }
+    mach_ret(cpu, result);
     if nsaves != 0 {
         super::machmsg::ocerz_send_restore_descriptors(gmsg, saves.as_ptr(), nsaves);
     }
     super::machmsg::tc_policy_send_done(&tc, result);
     if gmsg != 0 && a[1] & 2 != 0 && result == 0 {
         let recv_size = a[3] as u32;
+        if get_tc != 0 {
+            super::machmsg::tc_policy_get_reply(gmsg, recv_size);
+        }
         ocerz_vmmsg_trace(c"REPLY".as_ptr(), gmsg, recv_size);
         super::machmsg::ocerz_reply_xlate_vm_region(gmsg, recv_size, vm_region_req);
         ocerz_reply_relocate_ool(gmsg, recv_size, 31);
         ocerz_reply_alias_iokit(vm, gmsg, recv_size);
-        if get_tc != 0 {
-            super::machmsg::tc_policy_get_reply(gmsg, recv_size);
-        }
         let mut scan_size = ocerz_ld(gmsg.wrapping_add(4), 4) as u32 as u64;
         if a[3] != 0 && scan_size > a[3] as u32 as u64 {
             scan_size = a[3] as u32 as u64;
@@ -1500,14 +1503,12 @@ unsafe fn dispatch_mach_msg31(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     if gmsg != 0 && super::machmsg::ocerz_mach_err_interesting(result) != 0 {
         super::machmsg::ocerz_log_mach_send_err(31, result, a, gmsg, cpu);
     }
-    result
+    crate::ffi::OCERZ_STEP_OK as c_int
 }
 
-unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64; 8]) -> u64 {
+unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64; 8]) -> c_int {
     const THREAD_IDENTIFIER_INFO: u32 = 4;
     let msgh_id = (a[4] >> 32) as u32;
-    a[6] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 8, 8);
-    a[7] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 16, 8);
     let reply_buf = a[0];
     let vector_mode = a[1] & 0x1_0000_0000 != 0;
     let request_buf = if vector_mode && reply_buf != 0 {
@@ -1561,6 +1562,14 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     } else {
         u64::MAX
     };
+    a[6] = ocerz_ld(
+        (*cpu).gpr[crate::ffi::OCERZ_RSP as usize].wrapping_add(8),
+        8,
+    );
+    a[7] = ocerz_ld(
+        (*cpu).gpr[crate::ffi::OCERZ_RSP as usize].wrapping_add(16),
+        8,
+    );
     if reply_buf != 0 && a[1] & 2 != 0 {
         if vector_mode {
             super::bsd::disarm_guest_buffer(
@@ -1570,6 +1579,11 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             );
         } else {
             super::bsd::disarm_guest_buffer(cpu, reply_buf, a[6] as u32 as u64);
+        }
+    }
+    if reply_buf != 0 && !vector_mode && a[1] & 3 == 3 {
+        if thread_act_emulate(cpu, request_buf, msgh_id, a[6] as u32) {
+            return 0;
         }
     }
     let mut saves = [super::machmsg::OcerzOolSave::default(); 64];
@@ -1607,6 +1621,37 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
     } else {
         0
     };
+    if a[0] != 0 {
+        a[0] = ocerz_g2h(a[0]) as u64;
+    }
+    static mut LSTIMEOUT: c_int = -1;
+    if LSTIMEOUT < 0 {
+        LSTIMEOUT = c_int::from(!libc::getenv(c"OCERZ_LSTIMEOUT".as_ptr()).is_null());
+    }
+    if LSTIMEOUT != 0 && reply_buf != 0 && a[1] & 1 != 0 && a[1] & 2 != 0 && a[1] & 0x100 == 0 {
+        let message_id = (a[4] >> 32) as u32;
+        if (10000..10100).contains(&message_id) {
+            a[1] |= 0x100;
+            a[7] = 1500;
+            if env_set!("OCERZ_MACHMSG") {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: LSTIMEOUT forcing 1500ms RCV timeout on id=%u\n".as_ptr(),
+                    message_id,
+                );
+            }
+        }
+    }
+    if env_set!("OCERZ_MSGTIMEOUT") {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: MSG2 opts=%#llx rcv_timeout_arg=%#llx a6=%#llx rsp=%#llx\n".as_ptr(),
+            a[1] as libc::c_ulonglong,
+            a[7] as libc::c_ulonglong,
+            a[6] as libc::c_ulonglong,
+            (*cpu).gpr[crate::ffi::OCERZ_RSP as usize] as libc::c_ulonglong,
+        );
+    }
     if request_buf != 0 {
         ocerz_vmmsg_trace(c"REQ".as_ptr(), request_buf, (a[2] >> 32) as u32);
     }
@@ -1645,7 +1690,7 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             ptr::copy_nonoverlapping(
                 (&value as *const u64).cast::<u8>(),
                 ioreq.as_mut_ptr().add(offset),
-                (ioreq_n as usize - offset).min(8),
+                8,
             );
         }
     }
@@ -1735,6 +1780,21 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             }
         }
     }
+    if request_buf != 0 && env_set!("OCERZ_MACHMSG") {
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: MACHMSG-ENTER[%d] opts=%#llx voucher|id=%#llx bits=%#x rport=%#x lport=%#x id=%u xlated=%d\n"
+                .as_ptr(),
+            libc::getpid(),
+            a[1] as libc::c_ulonglong,
+            a[4] as libc::c_ulonglong,
+            ocerz_ld(request_buf, 4) as u32,
+            ocerz_ld(request_buf.wrapping_add(8), 4) as u32,
+            ocerz_ld(request_buf.wrapping_add(0xc), 4) as u32,
+            ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32,
+            nsaves,
+        );
+    }
     static mut IOKITMIGQ: c_int = -1;
     if IOKITMIGQ < 0 {
         let value = libc::getenv(c"OCERZ_IOKITMIG".as_ptr());
@@ -1797,7 +1857,7 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
                 } else if kind == 0 {
                     libc::fprintf(
                         crate::log::stderr(),
-                        c"ocerz: IOKITREQ[%d] desc[%u] port=%#x disp=%u\n".as_ptr(),
+                        c"ocerz: IOKITREQ[%d]   desc[%u] port=%#x disp=%u\n".as_ptr(),
                         libc::getpid(),
                         index,
                         ocerz_ld(request_buf.wrapping_add(offset), 4) as u32,
@@ -1825,56 +1885,6 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             }
             libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
         }
-    }
-    if reply_buf != 0 && !vector_mode && a[1] & 3 == 3 {
-        if thread_act_emulate(cpu, request_buf, msgh_id, a[6] as u32) {
-            return 0;
-        }
-    }
-    if a[0] != 0 {
-        a[0] = ocerz_g2h(a[0]) as u64;
-    }
-    if env_set!("OCERZ_MACHMSG") {
-        libc::fprintf(
-            crate::log::stderr(),
-            c"ocerz: MACHMSG-ENTER[%d] opts=%#llx sent_id=%u send_size=%#x rcvname=%#llx rcvsz=%#x timeout=%llu\n"
-                .as_ptr(),
-            libc::getpid(),
-            a[1] as libc::c_ulonglong,
-            msgh_id,
-            (a[2] >> 32) as u32,
-            a[5] as libc::c_ulonglong,
-            a[6] as u32,
-            a[7] as libc::c_ulonglong,
-        );
-    }
-    static mut LSTIMEOUT: c_int = -1;
-    if LSTIMEOUT < 0 {
-        LSTIMEOUT = c_int::from(!libc::getenv(c"OCERZ_LSTIMEOUT".as_ptr()).is_null());
-    }
-    if LSTIMEOUT != 0 && reply_buf != 0 && a[1] & 1 != 0 && a[1] & 2 != 0 && a[1] & 0x100 == 0 {
-        let message_id = (a[4] >> 32) as u32;
-        if (10000..10100).contains(&message_id) {
-            a[1] |= 0x100;
-            a[7] = 1500;
-            if env_set!("OCERZ_MACHMSG") {
-                libc::fprintf(
-                    crate::log::stderr(),
-                    c"ocerz: LSTIMEOUT forcing 1500ms RCV timeout on id=%u\n".as_ptr(),
-                    message_id,
-                );
-            }
-        }
-    }
-    if env_set!("OCERZ_MSGTIMEOUT") {
-        libc::fprintf(
-            crate::log::stderr(),
-            c"ocerz: MSG2 opts=%#llx rcv_timeout_arg=%#llx a6=%#llx rsp=%#llx\n".as_ptr(),
-            a[1] as libc::c_ulonglong,
-            a[7] as libc::c_ulonglong,
-            a[6] as libc::c_ulonglong,
-            (*cpu).gpr[crate::ffi::OCERZ_RSP as usize] as libc::c_ulonglong,
-        );
     }
     if request_buf != 0
         && env_set!("OCERZ_VMMAPPROBE")
@@ -1974,45 +1984,6 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             },
         );
     }
-    let mut reply = reply_buf;
-    let mut reply_size = a[6] as u32;
-    if vector_mode && reply_buf != 0 {
-        reply = ocerz_ld(reply_buf.wrapping_add(8), 8);
-        if reply == 0 {
-            reply = ocerz_ld(reply_buf, 8);
-        }
-        reply_size = ocerz_ld(reply_buf.wrapping_add(0x14), 4) as u32;
-    }
-    static mut MACHLEAK: c_int = -1;
-    if MACHLEAK < 0 {
-        MACHLEAK = c_int::from(!libc::getenv(c"OCERZ_MACHLEAK".as_ptr()).is_null());
-    }
-    if reply != 0 && a[1] & 2 != 0 && result == 0 && MACHLEAK != 0 {
-        let mut message_size = ocerz_ld(reply.wrapping_add(4), 4);
-        if reply_size != 0 && message_size > reply_size as u64 {
-            message_size = reply_size as u64;
-        }
-        message_size = message_size.min(0x160);
-        let mut offset = 0x20;
-        while offset + 8 <= message_size {
-            let value = ocerz_ld(reply.wrapping_add(offset), 8);
-            if value >= 0x1000_1000
-                && value < crate::ffi::OCERZ_LOW_LIMIT as u64
-                && value & 0xfff == 0
-                && crate::ffi::ocerz_addr_readable(value) == 0
-            {
-                libc::fprintf(
-                    crate::log::stderr(),
-                    c"ocerz: MACHLEAK reply_id=%u off=%#llx host_val=%#llx icount=%#llx\n".as_ptr(),
-                    ocerz_ld(reply.wrapping_add(0x14), 4) as u32,
-                    offset as libc::c_ulonglong,
-                    value as libc::c_ulonglong,
-                    (*vm).insn_count as libc::c_ulonglong,
-                );
-            }
-            offset += 4;
-        }
-    }
     static mut MSGSPIN: c_int = -1;
     if MSGSPIN < 0 {
         MSGSPIN = c_int::from(!libc::getenv(c"OCERZ_MSGSPIN".as_ptr()).is_null());
@@ -2028,20 +1999,29 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             } else {
                 0
             };
-            let sent_dest = if a[1] & 1 != 0 && request_buf != 0 {
+            let mut sent_dest = if a[1] & 1 != 0 && request_buf != 0 {
                 ocerz_ld(request_buf.wrapping_add(8), 4) as u32
             } else {
                 0
             };
-            let reply_id = if a[1] & 2 != 0 && result == 0 && reply != 0 {
-                ocerz_ld(reply.wrapping_add(0x14), 4) as u32
-            } else {
-                0
-            };
+            if sent_dest == 0 {
+                sent_dest = a[3] as u32;
+            }
+            let mut reply_id = 0;
+            if a[1] & 2 != 0 && result == 0 && reply_buf != 0 {
+                let rb = if vector_mode {
+                    ocerz_ld(reply_buf.wrapping_add(8), 8)
+                } else {
+                    reply_buf
+                };
+                if rb != 0 && crate::ffi::ocerz_addr_readable(rb.wrapping_add(0x14)) != 0 {
+                    reply_id = ocerz_ld(rb.wrapping_add(0x14), 4) as u32;
+                }
+            }
             libc::fprintf(
-            crate::log::stderr(),
-            c"ocerz: MSGSPIN[%d] n=%llu cpu#%u opt=%#llx kr=%#llx rcvname=%#llx rcvsz=%#llx timeout=%llu sid=%u sdst=%#x rid=%u\n"
-                .as_ptr(),
+                crate::log::stderr(),
+                c"ocerz: MSGSPIN[%d] n=%llu cpu#%u opt=%#llx kr=%#llx rcvname=%#llx rcvsz=%#llx timeout=%llu sid=%u sdst=%#x rid=%u"
+                    .as_ptr(),
             libc::getpid(),
             spin_count as libc::c_ulonglong,
             (*cpu).cpu_number,
@@ -2051,9 +2031,33 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             a[6] as libc::c_ulonglong,
             a[7] as libc::c_ulonglong,
             sent_id,
-            sent_dest,
-            reply_id,
-        );
+                sent_dest,
+                reply_id,
+            );
+            let mut sp = (*cpu).gpr[crate::ffi::OCERZ_RSP as usize];
+            let mut fp = (*cpu).gpr[5];
+            if sp != 0 && crate::ffi::ocerz_addr_committed(sp) == 1 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c" bt=%#llx".as_ptr(),
+                    ocerz_ld(sp, 8) as libc::c_ulonglong,
+                );
+            }
+            for _ in 0..5 {
+                if fp == 0
+                    || crate::ffi::ocerz_addr_committed(fp) != 1
+                    || crate::ffi::ocerz_addr_committed(fp.wrapping_add(8)) != 1
+                {
+                    break;
+                }
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c",%#llx".as_ptr(),
+                    ocerz_ld(fp.wrapping_add(8), 8) as libc::c_ulonglong,
+                );
+                fp = ocerz_ld(fp, 8);
+            }
+            libc::fputc(b'\n' as c_int, crate::log::stderr());
         }
     }
     static mut WAKELOG: c_int = -1;
@@ -2077,16 +2081,35 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
                 );
             }
         }
-        if a[1] & 2 != 0 && result == 0 && reply != 0 {
-            let reply_size_actual = ocerz_ld(reply.wrapping_add(4), 4) as u32;
-            let reply_id = ocerz_ld(reply.wrapping_add(0x14), 4) as u32;
+        if a[1] & 2 != 0 && result == 0 && reply_buf != 0 {
+            let mut wake_reply = reply_buf;
+            if vector_mode {
+                wake_reply = ocerz_ld(reply_buf.wrapping_add(8), 8);
+                if wake_reply == 0 {
+                    wake_reply = ocerz_ld(reply_buf, 8);
+                }
+            }
+            let reply_size_actual = if wake_reply != 0 {
+                ocerz_ld(wake_reply.wrapping_add(4), 4) as u32
+            } else {
+                0
+            };
+            let reply_id = if wake_reply != 0 {
+                ocerz_ld(wake_reply.wrapping_add(0x14), 4) as u32
+            } else {
+                1
+            };
             if reply_size_actual <= 0x30 && reply_id == 0 {
                 libc::fprintf(
                     crate::log::stderr(),
                     c"ocerz: WAKERECV[%d] cpu#%u on=%#x set=%#x sz=%#x ic=%#llx\n".as_ptr(),
                     libc::getpid(),
                     (*cpu).cpu_number,
-                    ocerz_ld(reply.wrapping_add(0xc), 4) as u32,
+                    if wake_reply != 0 {
+                        ocerz_ld(wake_reply.wrapping_add(0xc), 4) as u32
+                    } else {
+                        0
+                    },
                     (a[5] >> 32) as u32,
                     reply_size_actual,
                     (*vm).insn_count as libc::c_ulonglong,
@@ -2148,6 +2171,193 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             (*cpu).rip as libc::c_ulonglong,
         );
     }
+    super::machmsg::vmmap_pad_restore();
+    mach_ret(cpu, result);
+    if nsaves != 0 {
+        super::machmsg::ocerz_send_restore_descriptors(reply_buf, saves.as_ptr(), nsaves);
+    }
+    super::machmsg::tc_policy_send_done(&tc, result);
+    if ioreq_n >= 0x2c && result != 0 {
+        let selector = ptr::read_unaligned(ioreq.as_ptr().add(0x20).cast::<u32>());
+        let port = ptr::read_unaligned(ioreq.as_ptr().add(8).cast::<u32>());
+        libc::fprintf(
+            crate::log::stderr(),
+            c"ocerz: IOKITERR[%d] mach_msg=%#llx selector=%u port=%#x rip=%#llx rsp=%#llx cpu#%u\n"
+                .as_ptr(),
+            libc::getpid(),
+            result as libc::c_ulonglong,
+            selector,
+            port,
+            (*cpu).rip as libc::c_ulonglong,
+            (*cpu).gpr[crate::ffi::OCERZ_RSP as usize] as libc::c_ulonglong,
+            (*cpu).cpu_number,
+        );
+    }
+    if ioreq_n >= 0x2c
+        && reply_buf != 0
+        && result == 0
+        && crate::ffi::ocerz_addr_readable(reply_buf.wrapping_add(0x23)) != 0
+    {
+        let return_value = ocerz_ld(reply_buf.wrapping_add(0x20), 4) as u32;
+        let selector = ptr::read_unaligned(ioreq.as_ptr().add(0x20).cast::<u32>());
+        let scalar_count = ptr::read_unaligned(ioreq.as_ptr().add(0x24).cast::<u32>());
+        if (IOKITERR != 0 && matches!(return_value, 0xe000_02c8 | 0xe000_02c2))
+            || (IOKITSEL >= 0 && (selector == IOKITSEL as u32 || IOKITSEL == c_int::MAX))
+        {
+            let port = ptr::read_unaligned(ioreq.as_ptr().add(8).cast::<u32>());
+            libc::fprintf(
+                crate::log::stderr(),
+                c"ocerz: IOKITERR[%d] ret=%#x selector=%u scalars=%u port=%#x req:".as_ptr(),
+                libc::getpid(),
+                return_value,
+                selector,
+                scalar_count,
+                port,
+            );
+            for index in 0..scalar_count.min(8) {
+                let offset = 0x28u32.wrapping_add(8u32.wrapping_mul(index));
+                if offset.wrapping_add(8) > ioreq_n {
+                    break;
+                }
+                let scalar = ptr::read_unaligned(ioreq.as_ptr().add(offset as usize).cast::<u64>());
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c" s%u=%#llx".as_ptr(),
+                    index,
+                    scalar as libc::c_ulonglong,
+                );
+            }
+            let input_offset = 0x28u32.wrapping_add(8u32.wrapping_mul(scalar_count));
+            let mut input_size = 0u32;
+            if input_offset.wrapping_add(4) <= ioreq_n {
+                input_size =
+                    ptr::read_unaligned(ioreq.as_ptr().add(input_offset as usize).cast::<u32>());
+            }
+            let output_offset = input_offset
+                .wrapping_add(4)
+                .wrapping_add(input_size.wrapping_add(3) & !3);
+            let mut out_of_line_input = 0u64;
+            let mut out_of_line_input_size = 0u64;
+            let mut output_input_size = 0u32;
+            let mut output_scalar_count = 0u32;
+            let mut out_of_line_output = 0u64;
+            let mut out_of_line_output_size = 0u64;
+            if output_offset.wrapping_add(0x28) <= ioreq_n {
+                let output = ioreq.as_ptr().add(output_offset as usize);
+                out_of_line_input = ptr::read_unaligned(output.cast::<u64>());
+                out_of_line_input_size = ptr::read_unaligned(output.add(8).cast::<u64>());
+                output_input_size = ptr::read_unaligned(output.add(16).cast::<u32>());
+                output_scalar_count = ptr::read_unaligned(output.add(20).cast::<u32>());
+                out_of_line_output = ptr::read_unaligned(output.add(24).cast::<u64>());
+                out_of_line_output_size = ptr::read_unaligned(output.add(32).cast::<u64>());
+            }
+            libc::fprintf(
+                crate::log::stderr(),
+                c" size=%#x inband_in=%u:".as_ptr(),
+                ioreq_n,
+                input_size,
+            );
+            for index in 0..input_size.min(64) {
+                let byte_offset = input_offset.wrapping_add(4).wrapping_add(index);
+                if byte_offset >= ioreq_n {
+                    break;
+                }
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"%02x".as_ptr(),
+                    *ioreq.as_ptr().add(byte_offset as usize) as c_uint,
+                );
+            }
+            libc::fprintf(
+                crate::log::stderr(),
+                c" ool_in=%#llx+%#llx inband_out=%u scalar_out=%u ool_out=%#llx+%#llx reply:"
+                    .as_ptr(),
+                out_of_line_input as libc::c_ulonglong,
+                out_of_line_input_size as libc::c_ulonglong,
+                output_input_size,
+                output_scalar_count,
+                out_of_line_output as libc::c_ulonglong,
+                out_of_line_output_size as libc::c_ulonglong,
+            );
+            let reply_size = ocerz_ld(reply_buf.wrapping_add(4), 4) as u32;
+            let mut offset = 0x20u32;
+            while offset.wrapping_add(4) <= reply_size
+                && offset < 0x180
+                && crate::ffi::ocerz_addr_readable(
+                    reply_buf.wrapping_add(offset as u64).wrapping_add(3),
+                ) != 0
+            {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c" %08x".as_ptr(),
+                    ocerz_ld(reply_buf.wrapping_add(offset as u64), 4) as u32,
+                );
+                offset = offset.wrapping_add(4);
+            }
+            libc::fprintf(
+                crate::log::stderr(),
+                c" rip=%#llx rsp=%#llx cpu#%u\n".as_ptr(),
+                (*cpu).rip as libc::c_ulonglong,
+                (*cpu).gpr[crate::ffi::OCERZ_RSP as usize] as libc::c_ulonglong,
+                (*cpu).cpu_number,
+            );
+        }
+    }
+    if request_buf != 0 && super::machmsg::ocerz_mach_err_interesting(result) != 0 {
+        super::machmsg::ocerz_log_mach_send_err(47, result, a, request_buf, cpu);
+    }
+    let mut mach_reply_buf = reply_buf;
+    let mut mach_reply_size = a[6] as u32;
+    if reply_buf != 0 && vector_mode {
+        mach_reply_buf = ocerz_ld(reply_buf.wrapping_add(8), 8);
+        if mach_reply_buf == 0 {
+            mach_reply_buf = ocerz_ld(reply_buf, 8);
+        }
+        mach_reply_size = ocerz_ld(reply_buf.wrapping_add(0x14), 4) as u32;
+    }
+    if mach_reply_buf != 0 && a[1] & 2 != 0 && result == 0 {
+        ocerz_vmmsg_trace(c"REPLY".as_ptr(), mach_reply_buf, mach_reply_size);
+        super::machmsg::ocerz_reply_xlate_vm_region(mach_reply_buf, mach_reply_size, vm_region_req);
+    }
+    static mut MACHLEAK: c_int = -1;
+    if MACHLEAK < 0 {
+        MACHLEAK = c_int::from(!libc::getenv(c"OCERZ_MACHLEAK".as_ptr()).is_null());
+    }
+    if mach_reply_buf != 0 && MACHLEAK != 0 {
+        let mut message_size = ocerz_ld(mach_reply_buf.wrapping_add(4), 4);
+        if mach_reply_size != 0 && message_size > mach_reply_size as u64 {
+            message_size = mach_reply_size as u64;
+        }
+        if message_size > 0x160 {
+            message_size = 0x160;
+        }
+        let mut offset = 0x20u64;
+        while offset.wrapping_add(8) <= message_size {
+            let value = ocerz_ld(mach_reply_buf.wrapping_add(offset), 8);
+            if value >= 0x1000_1000
+                && value < crate::ffi::OCERZ_LOW_LIMIT as u64
+                && value & 0xfff == 0
+                && crate::ffi::ocerz_addr_readable(value) == 0
+            {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: MACHLEAK reply_id=%u off=%#llx host_val=%#llx icount=%#llx\n".as_ptr(),
+                    ocerz_ld(mach_reply_buf.wrapping_add(0x14), 4) as u32,
+                    offset as libc::c_ulonglong,
+                    value as libc::c_ulonglong,
+                    (*vm).insn_count as libc::c_ulonglong,
+                );
+            }
+            offset = offset.wrapping_add(4);
+        }
+    }
+    if mach_reply_buf != 0 && a[1] & 2 != 0 && result == 0 {
+        ocerz_reply_relocate_ool(mach_reply_buf, mach_reply_size, 47);
+        if get_tc != 0 {
+            super::machmsg::tc_policy_get_reply(mach_reply_buf, mach_reply_size);
+        }
+        ocerz_reply_alias_iokit(vm, mach_reply_buf, mach_reply_size);
+    }
     static mut MSGHEX: c_int = -2;
     if MSGHEX == -2 {
         let value = libc::getenv(c"OCERZ_MSGHEX".as_ptr());
@@ -2176,162 +2386,39 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
                 result as libc::c_ulonglong,
             );
             let mut offset = 0x18u64;
-            while offset < 0x78 && offset + 4 <= request_size as u64 {
+            while offset < 0x78 && offset.wrapping_add(4) <= request_size as u64 {
                 libc::fprintf(
                     crate::log::stderr(),
                     c" %08x".as_ptr(),
                     ocerz_ld(request_buf.wrapping_add(offset), 4) as u32,
                 );
-                offset += 4;
+                offset = offset.wrapping_add(4);
             }
             libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
-            if reply != 0 {
-                let actual_size = ocerz_ld(reply.wrapping_add(4), 4) as u32;
+            if mach_reply_buf != 0 {
+                let actual_size = ocerz_ld(mach_reply_buf.wrapping_add(4), 4) as u32;
                 libc::fprintf(
                     crate::log::stderr(),
                     c"ocerz: MSGHEX[%d]   reply@%#llx id=%u bits=%#x size=%#x (rcvsz=%#llx):"
                         .as_ptr(),
                     libc::getpid(),
-                    reply as libc::c_ulonglong,
-                    ocerz_ld(reply.wrapping_add(0x14), 4) as u32,
-                    ocerz_ld(reply, 4) as u32,
+                    mach_reply_buf as libc::c_ulonglong,
+                    ocerz_ld(mach_reply_buf.wrapping_add(0x14), 4) as u32,
+                    ocerz_ld(mach_reply_buf, 4) as u32,
                     actual_size,
-                    reply_size as libc::c_ulonglong,
+                    mach_reply_size as libc::c_ulonglong,
                 );
                 let mut offset = 0x18u64;
-                while offset < 0x98 && offset + 4 <= actual_size as u64 {
+                while offset < 0x98 && offset.wrapping_add(4) <= actual_size as u64 {
                     libc::fprintf(
                         crate::log::stderr(),
                         c" %08x".as_ptr(),
-                        ocerz_ld(reply.wrapping_add(offset), 4) as u32,
+                        ocerz_ld(mach_reply_buf.wrapping_add(offset), 4) as u32,
                     );
-                    offset += 4;
+                    offset = offset.wrapping_add(4);
                 }
                 libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
             }
-        }
-    }
-    super::machmsg::vmmap_pad_restore();
-    if nsaves != 0 {
-        super::machmsg::ocerz_send_restore_descriptors(reply_buf, saves.as_ptr(), nsaves);
-    }
-    if vector_mode && reply_buf != 0 {
-        reply = ocerz_ld(reply_buf.wrapping_add(8), 8);
-        if reply == 0 {
-            reply = ocerz_ld(reply_buf, 8);
-        }
-        reply_size = ocerz_ld(reply_buf.wrapping_add(0x14), 4) as u32;
-    }
-    super::machmsg::tc_policy_send_done(&tc, result);
-    if request_buf != 0 && super::machmsg::ocerz_mach_err_interesting(result) != 0 {
-        super::machmsg::ocerz_log_mach_send_err(47, result, a, request_buf, cpu);
-    }
-    if reply != 0 && a[1] & 2 != 0 && result == 0 {
-        ocerz_vmmsg_trace(c"REPLY".as_ptr(), reply, reply_size);
-        super::machmsg::ocerz_reply_xlate_vm_region(reply, reply_size, vm_region_req);
-        ocerz_reply_relocate_ool(reply, reply_size, 47);
-        if get_tc != 0 {
-            super::machmsg::tc_policy_get_reply(reply, reply_size);
-        }
-        ocerz_reply_alias_iokit(vm, reply, reply_size);
-        let reply_id = ocerz_ld(reply.wrapping_add(0x14), 4) as u32;
-        let status = ocerz_ld(reply.wrapping_add(0x20), 4) as u32 as c_int;
-        if reply_id == 4911 && vm_fixed_keep && status == OCERZ_MACH_KERN_SUCCESS {
-            mig_vm_refuse_taken(reply, vm_result_size);
-        }
-        if matches!(reply_id, 4900 | 4911 | 4913) && status == OCERZ_MACH_KERN_SUCCESS {
-            mig_vm_reply_relocate(vm, reply, false, vm_result_size, vm_result_alignment);
-        }
-        let reply_size_actual = ocerz_ld(reply.wrapping_add(4), 4) as u32;
-        let reply_bits = ocerz_ld(reply, 4) as u32;
-        if reply_id == 10154
-            && msgh_id == 10054
-            && reply_bits & 0x8000_0000 == 0
-            && reply_size_actual >= 0x30
-            && status == OCERZ_MACH_KERN_SUCCESS
-        {
-            let universe = ocerz_ld(reply.wrapping_add(0x24), 8);
-            if universe != 0 && alias_raw_contiguous(vm, universe) == 0 {
-                let table = ocerz_ld(universe, 8);
-                let entries = ocerz_ld(universe + 0x18, 8);
-                if alias_raw_region(vm, table, false) == 0
-                    && (entries == 0 || alias_raw_region(vm, entries, false) == 0)
-                {
-                    ocerz_sc_remember_universe(sc_uid, universe);
-                }
-            }
-        } else if reply_id == 10152
-            && sc_map_request
-            && reply_bits & 0x8000_0000 == 0
-            && reply_size_actual >= 0x28
-            && status == OCERZ_MACH_KERN_SUCCESS
-            && ocerz_ld(reply.wrapping_add(0x24), 1) as u8 != 0
-        {
-            let universe = ocerz_sc_find_universe(sc_uid);
-            if universe != 0 {
-                let table = ocerz_ld(universe, 8);
-                let kind = (sc_segment >> 29) & 3;
-                let slot = (sc_segment >> 23) & 0x3f;
-                let slot_ptr = table + kind as u64 * 0x200 + slot as u64 * 8;
-                if crate::ffi::ocerz_addr_committed(slot_ptr) == 1
-                    || ocerz_g2h(slot_ptr) as u64 == slot_ptr
-                {
-                    alias_raw_region(vm, ocerz_ld(slot_ptr, 8), false);
-                }
-            }
-        }
-        if reply_id == 3712
-            && msgh_id == 3612
-            && thread_info_flavor == THREAD_IDENTIFIER_INFO
-            && a[1] & 2 != 0
-            && result == 0
-            && reply_size_actual >= 0x40
-            && status == OCERZ_MACH_KERN_SUCCESS
-            && ocerz_ld(reply.wrapping_add(0x24), 4) as u32 >= 6
-        {
-            let host = ocerz_ld(reply.wrapping_add(0x30), 8);
-            let mut guest = crate::ffi::ocerz_vm_guest_tsd_for_host(host);
-            if guest == 0 && host >= 0x1400_0000 && host < crate::ffi::OCERZ_LOW_LIMIT {
-                guest = (*cpu).gs_base;
-            }
-            if guest != 0 {
-                let qualifier = ocerz_ld(reply.wrapping_add(0x38), 8);
-                ocerz_st(reply.wrapping_add(0x30), 8, guest);
-                ocerz_st(
-                    reply.wrapping_add(0x38),
-                    8,
-                    guest.wrapping_add(qualifier.wrapping_sub(host)),
-                );
-                if env_set!("OCERZ_SIGTRACE") {
-                    libc::fprintf(
-                        crate::log::stderr(),
-                        c"ocerz: K1 thread_info handle %#llx -> gs_base %#llx (comm=%d)\n".as_ptr(),
-                        host as libc::c_ulonglong,
-                        guest as libc::c_ulonglong,
-                        crate::ffi::ocerz_addr_committed(guest),
-                    );
-                }
-            }
-        }
-        let mut shadow_size = ocerz_ld(reply.wrapping_add(4), 4) as u32 as u64;
-        if reply_size != 0 && shadow_size > reply_size as u64 {
-            shadow_size = reply_size as u64;
-        }
-        super::hostwq::ocerz_shadow_scan(
-            c"msg2".as_ptr(),
-            ocerz_ld(reply.wrapping_add(0x14), 4) as u32 as u64,
-            reply,
-            shadow_size,
-        );
-        if msgh_id == 8000
-            && ocerz_ld(reply.wrapping_add(4), 4) == 0x24
-            && status == OCERZ_MACH_KERN_NOT_SUPPORTED
-        {
-            ocerz_st(
-                reply.wrapping_add(0x20),
-                4,
-                OCERZ_MACH_KERN_SUCCESS as u32 as u64,
-            );
         }
     }
     static mut IOKITMIG: c_int = -1;
@@ -2354,23 +2441,23 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             } else {
                 ocerz_ld(request_buf.wrapping_add(8), 4) as u32
             };
-            let reply_id = if reply != 0 {
-                ocerz_ld(reply.wrapping_add(0x14), 4) as u32
+            let reply_id = if mach_reply_buf != 0 {
+                ocerz_ld(mach_reply_buf.wrapping_add(0x14), 4) as u32
             } else {
                 0
             };
-            let reply_bits = if reply != 0 {
-                ocerz_ld(reply, 4) as u32
+            let reply_bits = if mach_reply_buf != 0 {
+                ocerz_ld(mach_reply_buf, 4) as u32
             } else {
                 0
             };
-            let word0 = if reply != 0 {
-                ocerz_ld(reply.wrapping_add(0x20), 4) as u32
+            let word0 = if mach_reply_buf != 0 {
+                ocerz_ld(mach_reply_buf.wrapping_add(0x20), 4) as u32
             } else {
                 0
             };
-            let word1 = if reply != 0 {
-                ocerz_ld(reply.wrapping_add(0x24), 4) as u32
+            let word1 = if mach_reply_buf != 0 {
+                ocerz_ld(mach_reply_buf.wrapping_add(0x24), 4) as u32
             } else {
                 0
             };
@@ -2495,12 +2582,16 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
                 }
                 libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
             }
-            if IOKITMIG >= 2 && reply != 0 && reply_bits & 0x8000_0000 != 0 {
-                let descriptor_count = ocerz_ld(reply.wrapping_add(0x18), 4) as u32;
+            if IOKITMIG >= 2 && mach_reply_buf != 0 && reply_bits & 0x8000_0000 != 0 {
+                let descriptor_count = ocerz_ld(mach_reply_buf.wrapping_add(0x18), 4) as u32;
                 let mut descriptor_offset = 0x1c;
                 for descriptor in 0..descriptor_count.min(16) {
-                    let descriptor_type =
-                        ocerz_ld(reply.wrapping_add(descriptor_offset).wrapping_add(11), 1) as u8;
+                    let descriptor_type = ocerz_ld(
+                        mach_reply_buf
+                            .wrapping_add(descriptor_offset)
+                            .wrapping_add(11),
+                        1,
+                    ) as u8;
                     if descriptor_type == 0 {
                         libc::fprintf(
                             crate::log::stderr(),
@@ -2509,9 +2600,13 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
                             libc::getpid(),
                             reply_id,
                             descriptor,
-                            ocerz_ld(reply.wrapping_add(descriptor_offset), 4) as u32,
-                            ocerz_ld(reply.wrapping_add(descriptor_offset).wrapping_add(10), 1)
-                                as u8 as c_uint,
+                            ocerz_ld(mach_reply_buf.wrapping_add(descriptor_offset), 4) as u32,
+                            ocerz_ld(
+                                mach_reply_buf
+                                    .wrapping_add(descriptor_offset)
+                                    .wrapping_add(10),
+                                1,
+                            ) as u8 as c_uint,
                         );
                         descriptor_offset += 12;
                     } else if (1..=4).contains(&descriptor_type) {
@@ -2523,64 +2618,196 @@ unsafe fn dispatch_mach_msg47(vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: &mut [u64
             }
         }
     }
-    if reply != 0 && a[1] & 2 != 0 && result == 0 && env_set!("OCERZ_PORTRECV") {
-        let bits = ocerz_ld(reply, 4) as u32;
-        let mut size = ocerz_ld(reply.wrapping_add(4), 4) as u32;
-        if reply_size != 0 && size > reply_size {
-            size = reply_size;
+    if mach_reply_buf != 0 && a[1] & 2 != 0 && result == 0 && env_set!("OCERZ_PORTRECV") {
+        let bits = ocerz_ld(mach_reply_buf, 4) as u32;
+        let mut size = ocerz_ld(mach_reply_buf.wrapping_add(4), 4) as u32;
+        if mach_reply_size != 0 && size > mach_reply_size {
+            size = mach_reply_size;
         }
         libc::fprintf(
             crate::log::stderr(),
-            c"ocerz: PORTRECV[%d] id=%u size=%u bits=%#x remote=%#x local=%#x\n".as_ptr(),
+            c"ocerz: PORTRECV[%d] id=%u size=%u bits=%#x remote=%#x local=%#x".as_ptr(),
             libc::getpid(),
-            ocerz_ld(reply.wrapping_add(0x14), 4) as u32,
+            ocerz_ld(mach_reply_buf.wrapping_add(0x14), 4) as u32,
             size,
             bits,
-            ocerz_ld(reply.wrapping_add(8), 4) as u32,
-            ocerz_ld(reply.wrapping_add(0xc), 4) as u32,
+            ocerz_ld(mach_reply_buf.wrapping_add(8), 4) as u32,
+            ocerz_ld(mach_reply_buf.wrapping_add(0xc), 4) as u32,
         );
-    }
-    if request_buf != 0
-        && ocerz_ld(request_buf.wrapping_add(0x14), 4) as u32 == 2865
-        && (IOKITERR != 0 || IOKITSEL >= 0)
-    {
-        let selector = ocerz_ld(request_buf.wrapping_add(0x20), 4) as u32;
-        if IOKITSEL == c_int::MAX || IOKITSEL == selector as c_int || (IOKITERR != 0 && result != 0)
-        {
-            libc::fprintf(
-                crate::log::stderr(),
-                c"ocerz: IOKIT[%d] selector=%u result=%#llx scalars=%u in_bytes=%u rip=%#llx\n"
-                    .as_ptr(),
-                libc::getpid(),
-                selector,
-                result as libc::c_ulonglong,
-                ocerz_ld(request_buf.wrapping_add(0x24), 4) as u32,
-                ioreq_n,
-                (*cpu).rip as libc::c_ulonglong,
-            );
-            for offset in (0..ioreq_n as usize).step_by(4).take(8) {
-                let word = ptr::read_unaligned(ioreq.as_ptr().add(offset).cast::<u32>());
-                libc::fprintf(
-                    crate::log::stderr(),
-                    c" input[%u]=%#x".as_ptr(),
-                    (offset / 4) as c_uint,
-                    word,
-                );
-            }
-            if reply != 0 {
-                for offset in (0..32u64).step_by(4) {
+        if bits & 0x8000_0000 != 0 {
+            let descriptor_count = ocerz_ld(mach_reply_buf.wrapping_add(0x18), 4) as u32;
+            let mut offset = 0x1cu64;
+            for descriptor in 0..descriptor_count.min(8) {
+                if offset.wrapping_add(12) > size as u64 {
+                    break;
+                }
+                let descriptor_type =
+                    ocerz_ld(mach_reply_buf.wrapping_add(offset).wrapping_add(11), 1) as u8;
+                if descriptor_type == 0 {
                     libc::fprintf(
                         crate::log::stderr(),
-                        c" out[%u]=%#x".as_ptr(),
-                        (offset / 4) as c_uint,
-                        ocerz_ld(reply.wrapping_add(0x20).wrapping_add(offset), 4) as u32,
+                        c" port[%u]{name=%#x disp=%u}".as_ptr(),
+                        descriptor,
+                        ocerz_ld(mach_reply_buf.wrapping_add(offset), 4) as u32,
+                        ocerz_ld(mach_reply_buf.wrapping_add(offset).wrapping_add(10), 1) as u8
+                            as c_uint,
+                    );
+                    offset = offset.wrapping_add(12);
+                } else if (1..=3).contains(&descriptor_type) {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c" ool[%u]{addr=%#llx sz=%u ty=%u}".as_ptr(),
+                        descriptor,
+                        ocerz_ld(mach_reply_buf.wrapping_add(offset), 8) as libc::c_ulonglong,
+                        ocerz_ld(mach_reply_buf.wrapping_add(offset).wrapping_add(12), 4) as u32,
+                        descriptor_type as c_uint,
+                    );
+                    offset = offset.wrapping_add(16);
+                } else if descriptor_type == 4 {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c" gport[%u]{name=%#x}".as_ptr(),
+                        descriptor,
+                        ocerz_ld(mach_reply_buf.wrapping_add(offset).wrapping_add(12), 4) as u32,
+                    );
+                    offset = offset.wrapping_add(16);
+                } else {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c" ?ty=%u".as_ptr(),
+                        descriptor_type as c_uint,
+                    );
+                    break;
+                }
+            }
+        }
+        libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
+    }
+    if mach_reply_buf != 0 {
+        let reply_id = ocerz_ld(mach_reply_buf.wrapping_add(0x14), 4) as u32;
+        if reply_id == 4911
+            && vm_fixed_keep
+            && ocerz_ld(mach_reply_buf.wrapping_add(0x20), 4) as u32
+                == OCERZ_MACH_KERN_SUCCESS as u32
+        {
+            mig_vm_refuse_taken(mach_reply_buf, vm_result_size);
+        }
+        if matches!(reply_id, 4900 | 4911 | 4913)
+            && ocerz_ld(mach_reply_buf.wrapping_add(0x20), 4) as u32
+                == OCERZ_MACH_KERN_SUCCESS as u32
+        {
+            mig_vm_reply_relocate(
+                vm,
+                mach_reply_buf,
+                false,
+                vm_result_size,
+                vm_result_alignment,
+            );
+        }
+        let reply_size_actual = ocerz_ld(mach_reply_buf.wrapping_add(4), 4) as u32;
+        let reply_bits = ocerz_ld(mach_reply_buf, 4) as u32;
+        if reply_id == 10154
+            && msgh_id == 10054
+            && reply_bits & 0x8000_0000 == 0
+            && reply_size_actual >= 0x30
+            && ocerz_ld(mach_reply_buf.wrapping_add(0x20), 4) as u32
+                == OCERZ_MACH_KERN_SUCCESS as u32
+        {
+            let universe = ocerz_ld(mach_reply_buf.wrapping_add(0x24), 8);
+            if universe != 0 && ocerz_alias_raw_contiguous(vm, universe) == 0 {
+                let table = ocerz_ld(universe, 8);
+                let entries = ocerz_ld(universe.wrapping_add(0x18), 8);
+                if ocerz_alias_raw_region(vm, table) == 0
+                    && (entries == 0 || ocerz_alias_raw_region(vm, entries) == 0)
+                {
+                    ocerz_sc_remember_universe(sc_uid, universe);
+                }
+            }
+        } else if reply_id == 10152
+            && sc_map_request
+            && reply_bits & 0x8000_0000 == 0
+            && reply_size_actual >= 0x28
+            && ocerz_ld(mach_reply_buf.wrapping_add(0x20), 4) as u32
+                == OCERZ_MACH_KERN_SUCCESS as u32
+            && ocerz_ld(mach_reply_buf.wrapping_add(0x24), 1) as u8 != 0
+        {
+            let universe = ocerz_sc_find_universe(sc_uid);
+            if universe != 0 {
+                let table = ocerz_ld(universe, 8);
+                let kind = (sc_segment >> 29) & 3;
+                let slot = (sc_segment >> 23) & 0x3f;
+                let slot_ptr = table
+                    .wrapping_add(kind as u64 * 0x200)
+                    .wrapping_add(slot as u64 * 8);
+                if crate::ffi::ocerz_addr_committed(slot_ptr) == 1
+                    || ocerz_g2h(slot_ptr) as u64 == slot_ptr
+                {
+                    ocerz_alias_raw_region(vm, ocerz_ld(slot_ptr, 8));
+                }
+            }
+        }
+        if reply_id == 3712
+            && msgh_id == 3612
+            && thread_info_flavor == THREAD_IDENTIFIER_INFO
+            && a[1] & 2 != 0
+            && result == 0
+            && reply_size_actual >= 0x40
+            && ocerz_ld(mach_reply_buf.wrapping_add(0x20), 4) as u32
+                == OCERZ_MACH_KERN_SUCCESS as u32
+            && ocerz_ld(mach_reply_buf.wrapping_add(0x24), 4) as u32 >= 6
+        {
+            let host = ocerz_ld(mach_reply_buf.wrapping_add(0x30), 8);
+            let mut guest = crate::ffi::ocerz_vm_guest_tsd_for_host(host);
+            if guest == 0 && host >= 0x1400_0000 && host < crate::ffi::OCERZ_LOW_LIMIT {
+                guest = (*cpu).gs_base;
+            }
+            if guest != 0 {
+                let qualifier = ocerz_ld(mach_reply_buf.wrapping_add(0x38), 8);
+                ocerz_st(mach_reply_buf.wrapping_add(0x30), 8, guest);
+                ocerz_st(
+                    mach_reply_buf.wrapping_add(0x38),
+                    8,
+                    guest.wrapping_add(qualifier.wrapping_sub(host)),
+                );
+                if env_set!("OCERZ_SIGTRACE") {
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: K1 thread_info handle %#llx -> gs_base %#llx (comm=%d)\n".as_ptr(),
+                        host as libc::c_ulonglong,
+                        guest as libc::c_ulonglong,
+                        crate::ffi::ocerz_addr_committed(guest),
                     );
                 }
             }
-            libc::fprintf(crate::log::stderr(), c"\n".as_ptr());
         }
     }
-    result
+    if mach_reply_buf != 0 && a[1] & 2 != 0 && result == 0 {
+        let mut shadow_size = ocerz_ld(mach_reply_buf.wrapping_add(4), 4) as u32;
+        if mach_reply_size != 0 && shadow_size > mach_reply_size {
+            shadow_size = mach_reply_size;
+        }
+        super::hostwq::ocerz_shadow_scan(
+            c"msg2".as_ptr(),
+            ocerz_ld(mach_reply_buf.wrapping_add(0x14), 4) as u32 as u64,
+            mach_reply_buf,
+            shadow_size as u64,
+        );
+    }
+    if msgh_id == 8000
+        && mach_reply_buf != 0
+        && a[1] & 2 != 0
+        && result == 0
+        && ocerz_ld(mach_reply_buf.wrapping_add(4), 4) as u32 == 0x24
+        && ocerz_ld(mach_reply_buf.wrapping_add(0x20), 4) as u32
+            == OCERZ_MACH_KERN_NOT_SUPPORTED as u32
+    {
+        ocerz_st(
+            mach_reply_buf.wrapping_add(0x20),
+            4,
+            OCERZ_MACH_KERN_SUCCESS as u32 as u64,
+        );
+    }
+    crate::ffi::OCERZ_STEP_OK as c_int
 }
 
 pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_int) -> c_int {
@@ -2606,8 +2833,8 @@ pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_
             (*cpu).gpr[crate::ffi::OCERZ_RDX as usize] as libc::c_ulonglong,
             (*cpu).rip as libc::c_ulonglong,
             (*cpu).gs_base as libc::c_ulonglong,
-            if crate::ffi::ocerz_addr_readable((*cpu).gs_base + 0x18) != 0 {
-                ocerz_ld((*cpu).gs_base + 0x18, 8)
+            if crate::ffi::ocerz_addr_readable((*cpu).gs_base.wrapping_add(0x18)) != 0 {
+                ocerz_ld((*cpu).gs_base.wrapping_add(0x18), 8)
             } else {
                 0
             } as libc::c_ulonglong,
@@ -2621,11 +2848,6 @@ pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_
     a[3] = (*cpu).gpr[crate::ffi::OCERZ_R10 as usize];
     a[4] = (*cpu).gpr[crate::ffi::OCERZ_R8 as usize];
     a[5] = (*cpu).gpr[crate::ffi::OCERZ_R9 as usize];
-    let port_name = match num {
-        16 => a[2],
-        24 => a[3],
-        _ => 0,
-    };
     static mut PORTLOG: c_int = -1;
     if PORTLOG < 0 {
         PORTLOG = c_int::from(!libc::getenv(c"OCERZ_PORTLOG".as_ptr()).is_null());
@@ -2642,396 +2864,382 @@ pub(super) unsafe fn dispatch_mach(vm: *mut OcerzVM, cpu: *mut OcerzCPU, num: c_
             (*cpu).rip as libc::c_ulonglong,
         );
     }
-    let known = matches!(
-        num,
-        10 | 11
-            | 12
-            | 13
-            | 14
-            | 15
-            | 16
-            | 18
-            | 19
-            | 20
-            | 21
-            | 22
-            | 23
-            | 24
-            | 25
-            | 26
-            | 27
-            | 28
-            | 29
-            | 31
-            | 33
-            | 34
-            | 35
-            | 36
-            | 37
-            | 38
-            | 39
-            | 40
-            | 41
-            | 42
-            | 43
-            | 44
-            | 45
-            | 46
-            | 47
-            | 50
-            | 59
-            | 60
-            | 61
-            | 62
-            | 70
-            | 72
-            | 76
-            | 77
-            | 89
-            | 90
-            | 91
-            | 92
-            | 93
-            | 94
-            | 95
-            | 96
-            | 100
-    );
-    if !known {
-        let name = mach_trap_name(num);
-        if !libc::getenv(c"OCERZ_STRICT_SYSCALL".as_ptr()).is_null() {
-            crate::ocerz_fatal!(
-                "unknown Mach trap: class=1 num=%d name=%s rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx ret=%#llx\n",
-                num,
-                if name.is_null() { c"?".as_ptr() } else { name },
-                (*cpu).rip as libc::c_ulonglong,
-                a[0] as libc::c_ulonglong,
-                a[1] as libc::c_ulonglong,
-                a[2] as libc::c_ulonglong,
-                a[3] as libc::c_ulonglong,
-                ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize], 8) as libc::c_ulonglong
-            );
-            return crate::ffi::OCERZ_STEP_FATAL as c_int;
+    match num {
+        10 => mach_ret(cpu, guest_vm_allocate_apply(vm, a[1], a[2], a[3]) as u64),
+        11 => {
+            if a[3] != 0 {
+                ocerz_st(a[3], 4, 0);
+            }
+            mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS as u64);
         }
-        static mut PROBED: [u8; 256] = [0; 256];
-        if (0..256).contains(&num) {
-            let flag = ptr::addr_of_mut!(PROBED).cast::<u8>().add(num as usize);
-            if *flag == 0 {
-                *flag = 1;
+        12 => mach_ret(cpu, guest_vm_deallocate_apply(vm, a[1], a[2]) as u64),
+        14 => mach_ret(
+            cpu,
+            guest_vm_protect_apply(vm, a[1], a[2], a[4] as c_int) as u64,
+        ),
+        15 => {
+            let size = a[2];
+            let mask = a[3];
+            let flags = a[4];
+            static mut VMLOG: c_int = -1;
+            static mut VMLOG_COUNT: c_int = 0;
+            if VMLOG < 0 {
+                VMLOG = c_int::from(!libc::getenv(c"OCERZ_MACHSLOW".as_ptr()).is_null());
+            }
+            if VMLOG != 0 && VMLOG_COUNT < 60 {
+                VMLOG_COUNT += 1;
                 libc::fprintf(
                     crate::log::stderr(),
-                    c"ocerz: unimplemented Mach trap num=%d name=%s -> KERN_INVALID_ARGUMENT rip=%#llx\n".as_ptr(),
-                    num,
-                    if name.is_null() { c"?".as_ptr() } else { name },
+                    c"ocerz: VMMAP[%d] cpu#%u want=%#llx size=%#llx mask=%#llx flags=%#llx rip=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    (*cpu).cpu_number,
+                    if a[1] != 0 && flags & VM_FLAGS_ANYWHERE as u64 == 0 {
+                        ocerz_ld(a[1], 8)
+                    } else {
+                        0
+                    } as libc::c_ulonglong,
+                    size as libc::c_ulonglong,
+                    mask as libc::c_ulonglong,
+                    flags as libc::c_ulonglong,
                     (*cpu).rip as libc::c_ulonglong,
                 );
             }
-        }
-        mach_ret(cpu, OCERZ_MACH_KERN_INVALID_ARGUMENT as u64);
-    } else {
-        let result = match num {
-            10 => guest_vm_allocate_apply(vm, a[1], a[2], a[3]),
-            11 => {
-                if a[3] != 0 {
-                    ocerz_st(a[3], 4, 0);
-                }
-                OCERZ_MACH_KERN_SUCCESS
-            }
-            12 => guest_vm_deallocate_apply(vm, a[1], a[2]),
-            14 => guest_vm_protect_apply(vm, a[1], a[2], a[4] as c_int),
-            15 => {
-                let size = a[2];
-                let mask = a[3];
-                let flags = a[4] as u32;
-                static mut VMLOG: c_int = -1;
-                static mut VMLOG_COUNT: c_int = 0;
-                if VMLOG < 0 {
-                    VMLOG = c_int::from(!libc::getenv(c"OCERZ_MACHSLOW".as_ptr()).is_null());
-                }
-                if VMLOG != 0 && VMLOG_COUNT < 60 {
-                    VMLOG_COUNT += 1;
-                    libc::fprintf(
-                        crate::log::stderr(),
-                        c"ocerz: VMMAP[%d] cpu#%u want=%#llx size=%#llx mask=%#llx flags=%#llx rip=%#llx\n"
-                            .as_ptr(),
-                        libc::getpid(),
-                        (*cpu).cpu_number,
-                        if a[1] != 0 && flags & VM_FLAGS_ANYWHERE == 0 {
-                            ocerz_ld(a[1], 8)
-                        } else {
-                            0
-                        } as libc::c_ulonglong,
-                        size as libc::c_ulonglong,
-                        mask as libc::c_ulonglong,
-                        flags as libc::c_ulonglong,
-                        (*cpu).rip as libc::c_ulonglong,
-                    );
-                }
-                if flags & VM_FLAGS_ANYWHERE == 0 {
-                    let want = if a[1] != 0 { ocerz_ld(a[1], 8) } else { 0 };
-                    super::mem::memtrace(c"vm_map".as_ptr(), want, size, 0, flags as c_int);
-                    if want == 0
-                        || (crate::ffi::ocerz_map_claim_fixed(
+            if flags & VM_FLAGS_ANYWHERE as u64 == 0 {
+                let want = if a[1] != 0 { ocerz_ld(a[1], 8) } else { 0 };
+                super::mem::memtrace(c"vm_map".as_ptr(), want, size, 0, flags as c_int);
+                if want == 0
+                    || (crate::ffi::ocerz_map_claim_fixed(
+                        want,
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    ) != crate::ffi::OCERZ_OK as c_int
+                        && crate::ffi::ocerz_map_claim_region(
                             want,
                             size,
                             libc::PROT_READ | libc::PROT_WRITE,
                         ) != crate::ffi::OCERZ_OK as c_int
-                            && crate::ffi::ocerz_map_claim_region(
+                        && (crate::ffi::ocerz_mem_register_range(want, want.wrapping_add(size))
+                            != crate::ffi::OCERZ_OK as c_int
+                            || crate::ffi::ocerz_map_claim_region(
                                 want,
                                 size,
                                 libc::PROT_READ | libc::PROT_WRITE,
-                            ) != crate::ffi::OCERZ_OK as c_int
-                            && (crate::ffi::ocerz_mem_register_range(want, want + size)
-                                != crate::ffi::OCERZ_OK as c_int
-                                || crate::ffi::ocerz_map_claim_region(
-                                    want,
-                                    size,
-                                    libc::PROT_READ | libc::PROT_WRITE,
-                                ) != crate::ffi::OCERZ_OK as c_int))
-                    {
-                        static mut DENYLOG: c_int = -1;
-                        static DENIED: core::sync::atomic::AtomicU64 =
-                            core::sync::atomic::AtomicU64::new(0);
-                        if DENYLOG < 0 {
-                            DENYLOG =
-                                c_int::from(!libc::getenv(c"OCERZ_DENYLOG".as_ptr()).is_null());
-                        }
-                        let denied = DENIED
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-                            .wrapping_add(1);
-                        if (*vm).strace != 0
-                            || (DENYLOG != 0 && (denied & 0x3ff == 0 || denied < 8))
-                        {
-                            libc::fprintf(
-                                crate::log::stderr(),
-                                c"ocerz: mach_vm_map FIXED denied n=%llu want=%#llx size=%#llx mask=%#llx flags=%#llx rip=%#llx\n"
-                                    .as_ptr(),
-                                denied as libc::c_ulonglong,
-                                want as libc::c_ulonglong,
-                                size as libc::c_ulonglong,
-                                mask as libc::c_ulonglong,
-                                flags as libc::c_ulonglong,
-                                (*cpu).rip as libc::c_ulonglong,
-                            );
-                        }
-                        OCERZ_MACH_KERN_NO_SPACE
-                    } else {
-                        super::mem::invalidate_guest_mapping(vm, want, size);
-                        OCERZ_MACH_KERN_SUCCESS
+                            ) != crate::ffi::OCERZ_OK as c_int))
+                {
+                    static mut DENYLOG: c_int = -1;
+                    static DENIED: core::sync::atomic::AtomicU64 =
+                        core::sync::atomic::AtomicU64::new(0);
+                    if DENYLOG < 0 {
+                        DENYLOG = c_int::from(!libc::getenv(c"OCERZ_DENYLOG".as_ptr()).is_null());
                     }
-                } else {
-                    let guest = if mask != 0 {
-                        crate::ffi::ocerz_map_anywhere_aligned(
-                            size,
-                            libc::PROT_READ | libc::PROT_WRITE,
-                            mask + 1,
-                        )
-                    } else {
-                        crate::ffi::ocerz_map_anywhere(size, libc::PROT_READ | libc::PROT_WRITE)
-                    };
-                    if guest == 0 {
-                        OCERZ_MACH_KERN_NO_SPACE
-                    } else {
-                        super::mem::invalidate_guest_mapping(vm, guest, size);
-                        if a[1] != 0 {
-                            ocerz_st(a[1], 8, guest);
-                        }
-                        OCERZ_MACH_KERN_SUCCESS
-                    }
-                }
-            }
-            16 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 33 | 34 | 35 | 36
-            | 37 | 38 | 39 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 50 | 59 | 60 | 61 | 62 | 70
-            | 72 | 76 | 77 | 90 | 91 | 92 | 93 | 94 | 95 | 96 | 100 => {
-                match num {
-                    16 => {
-                        if a[2] != 0 {
-                            a[2] = ocerz_g2h(a[2]) as u64;
-                        }
-                    }
-                    24 => {
-                        if a[1] != 0 {
-                            a[1] = ocerz_g2h(a[1]) as u64;
-                        }
-                        if a[3] != 0 {
-                            a[3] = ocerz_g2h(a[3]) as u64;
-                        }
-                    }
-                    40 => {
-                        if a[3] != 0 {
-                            a[3] = ocerz_g2h(a[3]) as u64;
-                        }
-                        if a[4] != 0 {
-                            a[4] = ocerz_g2h(a[4]) as u64;
-                        }
-                    }
-                    70 => {
-                        if a[1] != 0 {
-                            a[1] = ocerz_g2h(a[1]) as u64;
-                        }
-                        if a[3] != 0 {
-                            a[3] = ocerz_g2h(a[3]) as u64;
-                        }
-                    }
-                    43 | 44 | 45 => {
-                        if a[2] != 0 {
-                            a[2] = ocerz_g2h(a[2]) as u64;
-                        }
-                    }
-                    46 | 94 => {
-                        if a[1] != 0 {
-                            a[1] = ocerz_g2h(a[1]) as u64;
-                        }
-                    }
-                    76 => {
-                        if a[2] != 0 {
-                            a[2] = ocerz_g2h(a[2]) as u64;
-                        }
-                    }
-                    77 => {
-                        a[6] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 8, 8);
-                        if a[6] != 0 {
-                            a[6] = ocerz_g2h(a[6]) as u64;
-                        }
-                    }
-                    41 | 42 => {
-                        if a[2] != 0 {
-                            a[2] = ocerz_g2h(a[2]) as u64;
-                        }
-                    }
-                    62 => {
-                        if a[4] != 0 {
-                            a[4] = ocerz_g2h(a[4]) as u64;
-                        }
-                        (*cpu).block_nokick = 1;
-                    }
-                    72 => {
-                        if a[2] != 0 {
-                            a[2] = ocerz_g2h(a[2]) as u64;
-                        }
-                        if a[3] != 0 {
-                            a[3] = ocerz_g2h(a[3]) as u64;
-                        }
-                    }
-                    96 => {
-                        if a[2] != 0 {
-                            a[2] = ocerz_g2h(a[2]) as u64;
-                        }
-                    }
-                    90 => a[0] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[0]),
-                    93 => a[1] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[1]),
-                    95 => {
-                        a[2] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[2]);
-                        a[3] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[3]);
-                    }
-                    100 => {
-                        a[6] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 8, 8);
-                        a[7] = ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize] + 16, 8);
-                    }
-                    _ => {}
-                }
-                static mut PORTLOG_DETAIL: c_int = -1;
-                if PORTLOG_DETAIL < 0 {
-                    PORTLOG_DETAIL =
-                        c_int::from(!libc::getenv(c"OCERZ_PORTLOG".as_ptr()).is_null());
-                }
-                if PORTLOG_DETAIL != 0 && matches!(num, 18 | 19) {
-                    libc::fprintf(
-                        crate::log::stderr(),
-                        c"ocerz: PORTLOG[%d] %s name=%#llx right=%#llx delta=%#llx\n".as_ptr(),
-                        libc::getpid(),
-                        mach_trap_name(num),
-                        a[1] as libc::c_ulonglong,
-                        a[2] as libc::c_ulonglong,
-                        a[3] as libc::c_ulonglong,
-                    );
-                }
-                if matches!(num, 36 | 37 | 38 | 39) {
-                    (*cpu).block_nokick = 1;
-                }
-                (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-                let result = super::raw::ocerz_host_mach_trap(num as i64, &mut a);
-                (*cpu).block_since_ns = 0;
-                (*cpu).block_nokick = 0;
-                static mut KICKLOG: c_int = -1;
-                if KICKLOG < 0 {
-                    KICKLOG = c_int::from(!libc::getenv(c"OCERZ_KICKLOG".as_ptr()).is_null());
-                }
-                if KICKLOG != 0 && result == 14 {
-                    libc::fprintf(
-                        crate::log::stderr(),
-                        c"ocerz: KICKRET[%d] cpu#%u %s -> ABORTED rip=%#llx\n".as_ptr(),
-                        libc::getpid(),
-                        (*cpu).cpu_number,
-                        mach_trap_name(num),
-                        (*cpu).rip as libc::c_ulonglong,
-                    );
-                }
-                if num == 100 {
-                    static mut IOKITLOG: c_int = -1;
-                    if IOKITLOG < 0 {
-                        IOKITLOG = c_int::from(!libc::getenv(c"OCERZ_IOKITLOG".as_ptr()).is_null());
-                    }
-                    if IOKITLOG != 0 {
+                    let denied = DENIED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                        .wrapping_add(1);
+                    if (*vm).strace != 0 || (DENYLOG != 0 && (denied & 0x3ff == 0 || denied < 8)) {
                         libc::fprintf(
                             crate::log::stderr(),
-                            c"ocerz: IOKIT-TRAP conn=%#llx index=%llu a=%#llx,%#llx,%#llx,%#llx,%#llx,%#llx -> ret=%#llx\n"
-                                .as_ptr(),
-                            a[0] as libc::c_ulonglong,
-                            a[1] as libc::c_ulonglong,
-                            a[2] as libc::c_ulonglong,
-                            a[3] as libc::c_ulonglong,
-                            a[4] as libc::c_ulonglong,
-                            a[5] as libc::c_ulonglong,
-                            a[6] as libc::c_ulonglong,
-                            a[7] as libc::c_ulonglong,
-                            result as libc::c_ulonglong,
+                            c"ocerz: mach_vm_map FIXED denied n=%llu want=%#llx size=%#llx mask=%#llx flags=%#llx rip=%#llx\n".as_ptr(),
+                            denied as libc::c_ulonglong,
+                            want as libc::c_ulonglong,
+                            size as libc::c_ulonglong,
+                            mask as libc::c_ulonglong,
+                            flags as libc::c_ulonglong,
+                            (*cpu).rip as libc::c_ulonglong,
                         );
                     }
+                    mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE as u64);
+                } else {
+                    super::mem::invalidate_guest_mapping(vm, want, size);
+                    mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS as u64);
                 }
-                result as c_int
+            } else {
+                let guest = if mask != 0 {
+                    crate::ffi::ocerz_map_anywhere_aligned(
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        mask.wrapping_add(1),
+                    )
+                } else {
+                    crate::ffi::ocerz_map_anywhere(size, libc::PROT_READ | libc::PROT_WRITE)
+                };
+                if guest == 0 {
+                    mach_ret(cpu, OCERZ_MACH_KERN_NO_SPACE as u64);
+                } else {
+                    super::mem::invalidate_guest_mapping(vm, guest, size);
+                    if a[1] != 0 {
+                        ocerz_st(a[1], 8, guest);
+                    }
+                    mach_ret(cpu, OCERZ_MACH_KERN_SUCCESS as u64);
+                }
             }
-            13 => {
-                if a[0] != 0 {
-                    a[0] = ocerz_g2h(a[0]) as u64;
-                }
-                if a[1] != 0 {
-                    a[1] = ocerz_g2h(a[1]) as u64;
-                }
-                super::raw::ocerz_host_mach_trap(num as i64, &mut a) as c_int
+        }
+        16 => {
+            let guest_name = a[2];
+            if a[2] != 0 {
+                a[2] = ocerz_g2h(a[2]) as u64;
             }
-            31 => dispatch_mach_msg31(vm, cpu, &mut a) as c_int,
-            47 => dispatch_mach_msg47(vm, cpu, &mut a) as c_int,
-            89 => {
-                if a[0] != 0 {
-                    ocerz_st(a[0], 4, 1);
-                    ocerz_st(a[0].wrapping_add(4), 4, 1);
-                }
-                OCERZ_MACH_KERN_SUCCESS
-            }
-            _ => super::raw::ocerz_host_mach_trap(num as i64, &mut a) as c_int,
-        };
-        if PORTLOG != 0 && result == 0 {
-            if num == 16 && port_name != 0 {
+            let result = super::raw::ocerz_host_mach_trap(num as i64, &mut a);
+            mach_ret(cpu, result);
+            if PORTLOG != 0 && result == 0 && guest_name != 0 {
                 libc::fprintf(
                     crate::log::stderr(),
                     c"ocerz: PORT-NEW[%d] alloc right=%llu name=%#llx rip=%#llx\n".as_ptr(),
                     libc::getpid(),
                     a[1] as libc::c_ulonglong,
-                    ocerz_ld(port_name, 4) as libc::c_ulonglong,
-                    (*cpu).rip as libc::c_ulonglong,
-                );
-            } else if num == 24 && port_name != 0 {
-                libc::fprintf(
-                    crate::log::stderr(),
-                    c"ocerz: PORT-NEW[%d] construct name=%#llx rip=%#llx\n".as_ptr(),
-                    libc::getpid(),
-                    ocerz_ld(port_name, 4) as libc::c_ulonglong,
+                    ocerz_ld(guest_name, 4) as libc::c_ulonglong,
                     (*cpu).rip as libc::c_ulonglong,
                 );
             }
         }
-        mach_ret(cpu, result as u32 as u64);
+        24 => {
+            let guest_name = a[3];
+            if a[1] != 0 {
+                a[1] = ocerz_g2h(a[1]) as u64;
+            }
+            if a[3] != 0 {
+                a[3] = ocerz_g2h(a[3]) as u64;
+            }
+            let result = super::raw::ocerz_host_mach_trap(num as i64, &mut a);
+            mach_ret(cpu, result);
+            if PORTLOG != 0 && result == 0 && guest_name != 0 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: PORT-NEW[%d] construct name=%#llx rip=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    ocerz_ld(guest_name, 4) as libc::c_ulonglong,
+                    (*cpu).rip as libc::c_ulonglong,
+                );
+            }
+        }
+        40 => {
+            if a[3] != 0 {
+                a[3] = ocerz_g2h(a[3]) as u64;
+            }
+            if a[4] != 0 {
+                a[4] = ocerz_g2h(a[4]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        18 | 19 | 20 | 21 | 22 | 23 | 25 | 26 | 27 | 28 | 29 | 33 | 34 | 35 | 36 | 37 | 38 | 39
+        | 50 | 59 | 60 | 61 | 70 => {
+            if num == 70 {
+                if a[1] != 0 {
+                    a[1] = ocerz_g2h(a[1]) as u64;
+                }
+                if a[3] != 0 {
+                    a[3] = ocerz_g2h(a[3]) as u64;
+                }
+            }
+            static mut PORTLOG_DETAIL: c_int = -1;
+            if PORTLOG_DETAIL < 0 {
+                PORTLOG_DETAIL = c_int::from(!libc::getenv(c"OCERZ_PORTLOG".as_ptr()).is_null());
+            }
+            if PORTLOG_DETAIL != 0 && (num == 18 || num == 19) {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: PORTLOG[%d] %s name=%#llx right=%#llx delta=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    mach_trap_name(num),
+                    a[1] as libc::c_ulonglong,
+                    a[2] as libc::c_ulonglong,
+                    a[3] as libc::c_ulonglong,
+                );
+            }
+            (*cpu).block_nokick = c_int::from(matches!(num, 36 | 37 | 38 | 39));
+            (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            let result = super::raw::ocerz_host_mach_trap(num as i64, &mut a);
+            (*cpu).block_since_ns = 0;
+            (*cpu).block_nokick = 0;
+            static mut KICKLOG: c_int = -1;
+            if KICKLOG < 0 {
+                KICKLOG = c_int::from(!libc::getenv(c"OCERZ_KICKLOG".as_ptr()).is_null());
+            }
+            if KICKLOG != 0 && result == 14 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: KICKRET[%d] cpu#%u %s -> ABORTED rip=%#llx\n".as_ptr(),
+                    libc::getpid(),
+                    (*cpu).cpu_number,
+                    mach_trap_name(num),
+                    (*cpu).rip as libc::c_ulonglong,
+                );
+            }
+            mach_ret(cpu, result);
+        }
+        31 => {
+            let step = dispatch_mach_msg31(vm, cpu, &mut a);
+            if step != crate::ffi::OCERZ_STEP_OK as c_int {
+                return step;
+            }
+        }
+        43 => {
+            if a[2] != 0 {
+                a[2] = ocerz_g2h(a[2]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        44 | 45 => {
+            if a[2] != 0 {
+                a[2] = ocerz_g2h(a[2]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        46 => {
+            if a[1] != 0 {
+                a[1] = ocerz_g2h(a[1]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        47 => {
+            let step = dispatch_mach_msg47(vm, cpu, &mut a);
+            if step != crate::ffi::OCERZ_STEP_OK as c_int {
+                return step;
+            }
+        }
+        76 => {
+            if a[2] != 0 {
+                a[2] = ocerz_g2h(a[2]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        77 => {
+            a[6] = ocerz_ld(
+                (*cpu).gpr[crate::ffi::OCERZ_RSP as usize].wrapping_add(8),
+                8,
+            );
+            if a[6] != 0 {
+                a[6] = ocerz_g2h(a[6]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        89 => {
+            if a[0] != 0 {
+                ocerz_st(a[0], 4, 1);
+                ocerz_st(a[0].wrapping_add(4), 4, 1);
+            }
+            mach_ret(cpu, 0);
+        }
+        90 | 91 | 92 | 93 | 95 => {
+            if num == 90 {
+                a[0] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[0]);
+            } else if num == 93 {
+                a[1] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[1]);
+            } else if num == 95 {
+                a[2] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[2]);
+                a[3] = super::machmsg::ocerz_guest_ns_to_host_ticks(a[3]);
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        94 => {
+            if a[1] != 0 {
+                a[1] = ocerz_g2h(a[1]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        41 | 42 => {
+            if a[2] != 0 {
+                a[2] = ocerz_g2h(a[2]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        100 => {
+            a[6] = ocerz_ld(
+                (*cpu).gpr[crate::ffi::OCERZ_RSP as usize].wrapping_add(8),
+                8,
+            );
+            a[7] = ocerz_ld(
+                (*cpu).gpr[crate::ffi::OCERZ_RSP as usize].wrapping_add(16),
+                8,
+            );
+            let result = super::raw::ocerz_host_mach_trap(num as i64, &mut a);
+            static mut IOKITLOG: c_int = -1;
+            if IOKITLOG < 0 {
+                IOKITLOG = c_int::from(!libc::getenv(c"OCERZ_IOKITLOG".as_ptr()).is_null());
+            }
+            if IOKITLOG != 0 {
+                libc::fprintf(
+                    crate::log::stderr(),
+                    c"ocerz: IOKIT-TRAP conn=%#llx index=%llu a=%#llx,%#llx,%#llx,%#llx,%#llx,%#llx -> ret=%#llx\n".as_ptr(),
+                    a[0] as libc::c_ulonglong,
+                    a[1] as libc::c_ulonglong,
+                    a[2] as libc::c_ulonglong,
+                    a[3] as libc::c_ulonglong,
+                    a[4] as libc::c_ulonglong,
+                    a[5] as libc::c_ulonglong,
+                    a[6] as libc::c_ulonglong,
+                    a[7] as libc::c_ulonglong,
+                    result as libc::c_ulonglong,
+                );
+            }
+            mach_ret(cpu, result);
+        }
+        13 => {
+            if a[0] != 0 {
+                a[0] = ocerz_g2h(a[0]) as u64;
+            }
+            if a[1] != 0 {
+                a[1] = ocerz_g2h(a[1]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        62 => {
+            if a[4] != 0 {
+                a[4] = ocerz_g2h(a[4]) as u64;
+            }
+            (*cpu).block_nokick = 1;
+            (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            let result = super::raw::ocerz_host_mach_trap(num as i64, &mut a);
+            (*cpu).block_since_ns = 0;
+            (*cpu).block_nokick = 0;
+            mach_ret(cpu, result);
+        }
+        72 => {
+            if a[2] != 0 {
+                a[2] = ocerz_g2h(a[2]) as u64;
+            }
+            if a[3] != 0 {
+                a[3] = ocerz_g2h(a[3]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        96 => {
+            if a[2] != 0 {
+                a[2] = ocerz_g2h(a[2]) as u64;
+            }
+            mach_ret(cpu, super::raw::ocerz_host_mach_trap(num as i64, &mut a));
+        }
+        _ => {
+            let name = mach_trap_name(num);
+            if !libc::getenv(c"OCERZ_STRICT_SYSCALL".as_ptr()).is_null() {
+                crate::ocerz_fatal!(
+                    "unknown Mach trap: class=1 num=%d name=%s rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx ret=%#llx\n",
+                    num,
+                    if name.is_null() { c"?".as_ptr() } else { name },
+                    (*cpu).rip as libc::c_ulonglong,
+                    a[0] as libc::c_ulonglong,
+                    a[1] as libc::c_ulonglong,
+                    a[2] as libc::c_ulonglong,
+                    a[3] as libc::c_ulonglong,
+                    ocerz_ld((*cpu).gpr[crate::ffi::OCERZ_RSP as usize], 8) as libc::c_ulonglong
+                );
+                return crate::ffi::OCERZ_STEP_FATAL as c_int;
+            }
+            static mut PROBED: [u8; 256] = [0; 256];
+            if (0..256).contains(&num) {
+                let flag = ptr::addr_of_mut!(PROBED).cast::<u8>().add(num as usize);
+                if *flag == 0 {
+                    *flag = 1;
+                    libc::fprintf(
+                        crate::log::stderr(),
+                        c"ocerz: unimplemented Mach trap num=%d name=%s -> KERN_INVALID_ARGUMENT rip=%#llx\n".as_ptr(),
+                        num,
+                        if name.is_null() { c"?".as_ptr() } else { name },
+                        (*cpu).rip as libc::c_ulonglong,
+                    );
+                }
+            }
+            mach_ret(cpu, OCERZ_MACH_KERN_INVALID_ARGUMENT as u64);
+        }
     }
     if (*vm).strace != 0 {
         let name = mach_trap_name(num);
