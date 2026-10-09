@@ -13,11 +13,11 @@
 | dyld.c | 5840 | dyld-agent | in progress |
 | dyldapi.c | 2636 | dyld-agent | ported |
 | flags.c | 230 | - | ported |
-| flags_live.c | 283 | - | C |
+| flags_live.c | 283 | interp-agent | ported |
 | globals.c | 16 | - | ported |
-| interp.c | 1913 | - | C |
-| interp_ext.c | 763 | - | C |
-| interp_sse.c | 2542 | - | C |
+| interp.c | 1913 | interp-agent | in progress |
+| interp_ext.c | 763 | interp-agent | ported |
+| interp_sse.c | 2542 | interp-agent | in progress |
 | jit.c | 2844 | - | C, split core; see jit-split.md |
 | jit_cache.c | 3185 | devin-4a0e3105 | in progress |
 | jit_control.c | 2070 | jit-control-agent | in progress |
@@ -38,7 +38,7 @@
 | tcache.c | 863 | runtime (ee47e957) | in progress |
 | vdylib.c | 1424 | native1 | in progress |
 | vm.c | 4376 | memvm | in progress |
-| x87.c | 1277 | - | C |
+| x87.c | 1277 | interp-agent | ported |
 | abicall.s | 237 | native1 | ported |
 | leaf.s | 598 | native1 | ported |
 | objcguard.s | 60 | native2 | ported |
