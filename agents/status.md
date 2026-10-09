@@ -23,7 +23,7 @@
 | jit_control.c | 2070 | - | C, split control/callouts |
 | jit_flags.c | 2778 | - | C, split flags/liveness/branches |
 | jit_fp.c | 3203 | - | C, split FP batches/x87 |
-| jit_integer.c | 2678 | - | C, split integer emitters |
+| jit_integer.c | 2678 | jit-integer-agent | in progress |
 | jit_memory.c | 2184 | - | C, split addressing/guards |
 | jit_simd.c | 3121 | - | C, split SIMD emitters |
 | jit_tcache.c | 1063 | - | C, split translation-cache serialization |
