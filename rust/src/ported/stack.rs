@@ -13,7 +13,7 @@ use crate::ffi::{
 use crate::inline::{ocerz_g2h, ocerz_st};
 
 const GUEST_STACK_SIZE: u64 = 8 << 20;
-const STACK_TOP_PAD: u64 = 16;
+const STACK_TOP_PAD: c_int = 16;
 const APPLE_PREFIX: &CStr = c"executable_path=";
 
 #[inline(always)]
@@ -55,7 +55,7 @@ pub unsafe extern "C" fn ocerz_setup_stack(
         }
 
         let mut top = (*vm).stack_hi;
-        top = top.wrapping_sub(STACK_TOP_PAD);
+        top = top.wrapping_sub(STACK_TOP_PAD as u64);
         libc::memset(ocerz_g2h(top), 0, STACK_TOP_PAD as usize);
 
         let path = (*img).path.as_ptr();
