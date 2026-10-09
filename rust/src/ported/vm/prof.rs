@@ -118,17 +118,27 @@ unsafe fn gp_report(secs: f64) {
             LAST_RNS = rns;
         }
         static mut TOP: [GpTop; 40] = [const { GpTop { key: 0, cnt: 0 } }; 40];
-        let n = gp_top((&raw mut G_GP_KEY) as *mut u64, (&raw mut G_GP_CNT) as *mut u32, (&raw mut TOP) as *mut GpTop, 40);
+        let n = gp_top(
+            (&raw mut G_GP_KEY) as *mut u64,
+            (&raw mut G_GP_CNT) as *mut u32,
+            (&raw mut TOP) as *mut GpTop,
+            40,
+        );
         for i in 0..n {
             let rip = (*((&raw const TOP) as *const GpTop).add(i as usize)).key & !(1u64 << 63);
             let mut base: u64 = 0;
             let img = ocerz_dyld_name_for_addr(rip, &mut base);
-            let leaf = if !img.is_null() { libc::strrchr(img, '/' as c_int) } else { ptr::null() };
+            let leaf = if !img.is_null() {
+                libc::strrchr(img, '/' as c_int)
+            } else {
+                ptr::null()
+            };
             libc::fprintf(
                 stderr(),
                 c"ocerz: GUESTPROF[%d]   %5.1f%% %s rip=%#llx %s+%#llx\n".as_ptr(),
                 libc::getpid(),
-                100.0 * (*((&raw const TOP) as *const GpTop).add(i as usize)).cnt as f64 / total as f64,
+                100.0 * (*((&raw const TOP) as *const GpTop).add(i as usize)).cnt as f64
+                    / total as f64,
                 if (*((&raw const TOP) as *const GpTop).add(i as usize)).key >> 63 != 0 {
                     c"rt ".as_ptr()
                 } else {
@@ -154,7 +164,12 @@ unsafe fn gp_report(secs: f64) {
                 rt: u32,
             }
             static mut AGG_IMG: [AggImg; 48] = [const {
-                AggImg { img: ptr::null(), lo: 0, jit: 0, rt: 0 }
+                AggImg {
+                    img: ptr::null(),
+                    lo: 0,
+                    jit: 0,
+                    rt: 0,
+                }
             }; 48];
             let mut ni = 0i32;
             for i in 0..GP_SLOTS {
@@ -164,8 +179,11 @@ unsafe fn gp_report(secs: f64) {
                 let rip = G_GP_KEY[i] & !(1u64 << 63);
                 let mut base: u64 = 0;
                 let mut img = ocerz_dyld_name_for_addr(rip, &mut base);
-                let leaf =
-                    if !img.is_null() { libc::strrchr(img, '/' as c_int) } else { ptr::null() };
+                let leaf = if !img.is_null() {
+                    libc::strrchr(img, '/' as c_int)
+                } else {
+                    ptr::null()
+                };
                 if !leaf.is_null() {
                     img = leaf.add(1);
                 }
@@ -241,7 +259,12 @@ unsafe fn gp_report(secs: f64) {
             }
         }
         static mut HOST: [GpTop; 64] = [const { GpTop { key: 0, cnt: 0 } }; 64];
-        let hn = gp_top((&raw mut G_GH_KEY) as *mut u64, (&raw mut G_GH_CNT) as *mut u32, (&raw mut HOST) as *mut GpTop, 64);
+        let hn = gp_top(
+            (&raw mut G_GH_KEY) as *mut u64,
+            (&raw mut G_GH_CNT) as *mut u32,
+            (&raw mut HOST) as *mut GpTop,
+            64,
+        );
         #[repr(C)]
         struct Agg {
             sym: *const c_void,
@@ -249,14 +272,21 @@ unsafe fn gp_report(secs: f64) {
             cnt: u32,
         }
         static mut AGG: [Agg; 64] = [const {
-            Agg { sym: ptr::null(), name: ptr::null(), cnt: 0 }
+            Agg {
+                sym: ptr::null(),
+                name: ptr::null(),
+                cnt: 0,
+            }
         }; 64];
         let mut an = 0i32;
         for i in 0..hn {
             let mut di: Dl_info = core::mem::zeroed();
             let mut sym: *const c_void = ptr::null();
             let mut name: *const c_char = c"?".as_ptr();
-            if dladdr((*((&raw const HOST) as *const GpTop).add(i as usize)).key as *const c_void, &mut di) != 0
+            if dladdr(
+                (*((&raw const HOST) as *const GpTop).add(i as usize)).key as *const c_void,
+                &mut di,
+            ) != 0
                 && !di.dli_sname.is_null()
             {
                 sym = di.dli_saddr;
@@ -300,7 +330,12 @@ unsafe fn gp_report(secs: f64) {
             i += 1;
         }
         static mut FORM: [GpTop; 16] = [const { GpTop { key: 0, cnt: 0 } }; 16];
-        let fn_ = gp_top((&raw mut G_GF_KEY) as *mut u64, (&raw mut G_GF_CNT) as *mut u32, (&raw mut FORM) as *mut GpTop, 16);
+        let fn_ = gp_top(
+            (&raw mut G_GF_KEY) as *mut u64,
+            (&raw mut G_GF_CNT) as *mut u32,
+            (&raw mut FORM) as *mut GpTop,
+            16,
+        );
         for i in 0..fn_ {
             let f = (*((&raw const FORM) as *const GpTop).add(i as usize)).key;
             static KC: [u8; 8] = *b"-rxsmiM?";
@@ -310,7 +345,8 @@ unsafe fn gp_report(secs: f64) {
                     stderr(),
                     c"ocerz: GUESTPROF[%d]   interp %5.1f%% syscall %#llx\n".as_ptr(),
                     libc::getpid(),
-                    100.0 * (*((&raw const FORM) as *const GpTop).add(i as usize)).cnt as f64 / total as f64,
+                    100.0 * (*((&raw const FORM) as *const GpTop).add(i as usize)).cnt as f64
+                        / total as f64,
                     (f >> 32) as c_ulonglong,
                 );
                 continue;
@@ -327,8 +363,13 @@ unsafe fn gp_report(secs: f64) {
                 stderr(),
                 c"ocerz: GUESTPROF[%d]   interp %5.1f%% %s%s %c%c%c/%u%s\n".as_ptr(),
                 libc::getpid(),
-                100.0 * (*((&raw const FORM) as *const GpTop).add(i as usize)).cnt as f64 / total as f64,
-                if (f >> 16) & 1 != 0 { c"v".as_ptr() } else { c"".as_ptr() },
+                100.0 * (*((&raw const FORM) as *const GpTop).add(i as usize)).cnt as f64
+                    / total as f64,
+                if (f >> 16) & 1 != 0 {
+                    c"v".as_ptr()
+                } else {
+                    c"".as_ptr()
+                },
                 ffi::ocerz_op_name((f & 0xffff) as u32),
                 KC[((f >> 18) & 7) as usize] as c_int,
                 KC[((f >> 21) & 7) as usize] as c_int,
@@ -375,8 +416,13 @@ extern "C" fn guestprof_thread(arg: *mut c_void) -> *mut c_void {
         }) * 1000000000;
         let start = G_GP_START;
         let mut next = start + period;
-        static mut SEEN: [GpSeen; 256] =
-            [const { GpSeen { port: 0, cpu_us: 0, period_us: 0 } }; 256];
+        static mut SEEN: [GpSeen; 256] = [const {
+            GpSeen {
+                port: 0,
+                cpu_us: 0,
+                period_us: 0,
+            }
+        }; 256];
         let hot_only = !libc::getenv(c"OCERZ_GUESTPROF_HOT".as_ptr()).is_null();
         let mut hot: mach_port_t = MACH_PORT_NULL;
         let mut pstart = start;
@@ -414,8 +460,11 @@ extern "C" fn guestprof_thread(arg: *mut c_void) -> *mut c_void {
                 while SEEN[slot as usize].port != 0 && SEEN[slot as usize].port != ports[i] {
                     slot = (slot + 1) & 255;
                 }
-                let prev =
-                    if SEEN[slot as usize].port != 0 { SEEN[slot as usize].cpu_us } else { cpu_us };
+                let prev = if SEEN[slot as usize].port != 0 {
+                    SEEN[slot as usize].cpu_us
+                } else {
+                    cpu_us
+                };
                 SEEN[slot as usize].port = ports[i];
                 SEEN[slot as usize].cpu_us = cpu_us;
                 if cpu_us > prev {
@@ -428,7 +477,11 @@ extern "C" fn guestprof_thread(arg: *mut c_void) -> *mut c_void {
                     continue;
                 }
                 let w64 = cpu_us - prev;
-                let w = (if w64 > 4 * us as u64 { 4 * us as u64 } else { w64 }) as u32;
+                let w = (if w64 > 4 * us as u64 {
+                    4 * us as u64
+                } else {
+                    w64
+                }) as u32;
                 if thread_suspend(ports[i]) != KERN_SUCCESS {
                     continue;
                 }
@@ -466,9 +519,19 @@ extern "C" fn guestprof_thread(arg: *mut c_void) -> *mut c_void {
                         (if grip != 0 { grip } else { 1 }) | (1u64 << 63),
                         w,
                     );
-                    gp_bump((&raw mut G_GH_KEY) as *mut u64, (&raw mut G_GH_CNT) as *mut u32, pc as u64, w);
+                    gp_bump(
+                        (&raw mut G_GH_KEY) as *mut u64,
+                        (&raw mut G_GH_CNT) as *mut u32,
+                        pc as u64,
+                        w,
+                    );
                     if sop & 0xffff != 0 {
-                        gp_bump((&raw mut G_GF_KEY) as *mut u64, (&raw mut G_GF_CNT) as *mut u32, sop, w);
+                        gp_bump(
+                            (&raw mut G_GF_KEY) as *mut u64,
+                            (&raw mut G_GF_CNT) as *mut u32,
+                            sop,
+                            w,
+                        );
                     }
                 }
             }
@@ -510,9 +573,7 @@ pub unsafe extern "C" fn ocerz_guestprof_final() {
         }
         libc::pthread_mutex_lock(&raw mut G_GP_LOCK);
         if G_GP_SAMPLES != 0 {
-            gp_report(
-                (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - G_GP_START) as f64 / 1e9,
-            );
+            gp_report((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - G_GP_START) as f64 / 1e9);
         }
         libc::pthread_mutex_unlock(&raw mut G_GP_LOCK);
     }

@@ -118,3 +118,23 @@ test_jit_order_transition/test_jit_psc_invalidate/test_wow64/test_loader/
 test_bridge/test_objcbridge/test_chain_concurrency/test_blocks all pass.
 Known non-regression still observed: dtest_jcc_gap_low -jit/-no-jit prints
 `faults 59` vs golden 60, identical on the pristine C tree (5/5 runs).
+
+vm post-landing fixes (found by the full gate's native fault-report tests):
+- `mach_task_self_` is a global `mach_port_t`, not a function — declaring it
+  `fn` made every mach call jump into data (nested fault mid-report).
+- `ocerz_jit_decode_recover` is `__thread`; the extern must be
+  `#[thread_local]` or the crash handler siglongjmps to garbage (host SIGILL).
+- Bounds checks must not exist in the crash handler: `ji.host_holds[i]` and
+  `ss.x[21+i]` with `n_pinned` up to 16 panicked mid-report and swallowed the
+  `SIGNH deliver` line. Use `get_unchecked` wherever C indexes raw arrays in
+  signal/fault paths.
+- The `global_asm` setjmp trampoline needs `.section __TEXT,__text` first or
+  it lands in `__DATA_CONST` and every setjmp site SIGBUSes.
+- Static audit: `~/memvm/vm-static-audit.md`. One width fix (`long peek` ->
+  c_long, non-atomic); every other static matches C exactly.
+
+Perf (alternating trees, quiet machine, vs ~/AArchX-c):
+guest no-jit x3: 6.03 6.67 6.29 (Rust) vs 6.60 6.51 6.17 (C)
+guest jit    x3: 1.99 2.38 2.42 (Rust) vs 2.05 2.61 2.14 (C)
+dynamic      x2: 145.05 136.90  (Rust) vs 143.23 145.00 (C)
+Parity within noise on all three suites.

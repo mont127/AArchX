@@ -73,8 +73,7 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                                 q = str_into(q, c" ".as_ptr());
                                 q = hex_into(q, *mem.add(j as usize) as u64);
                                 let mut pst: mach_port_status = core::mem::zeroed();
-                                let mut pn: mach_msg_type_number_t =
-                                    MACH_PORT_RECEIVE_STATUS_COUNT;
+                                let mut pn: mach_msg_type_number_t = MACH_PORT_RECEIVE_STATUS_COUNT;
                                 if mach_port_get_attributes(
                                     mach_task_self(),
                                     *mem.add(j as usize),
@@ -99,7 +98,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                             }
                         }
                         q = str_into(q, c"\n".as_ptr());
-                        write(2, rb.as_ptr() as *const c_void, q as usize - rb.as_ptr() as usize);
+                        write(
+                            2,
+                            rb.as_ptr() as *const c_void,
+                            q as usize - rb.as_ptr() as usize,
+                        );
                     }
                     mach_vm_deallocate(
                         mach_task_self(),
@@ -132,7 +135,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                     fq = str_into(fq, c" nread=".as_ptr());
                     fq = hex_into(fq, nread as u64);
                     fq = str_into(fq, c"\n".as_ptr());
-                    write(2, fb.as_ptr() as *const c_void, fq as usize - fb.as_ptr() as usize);
+                    write(
+                        2,
+                        fb.as_ptr() as *const c_void,
+                        fq as usize - fb.as_ptr() as usize,
+                    );
                 }
                 ONCE.store(0, Ordering::Relaxed);
             }
@@ -170,7 +177,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                 q = str_into(q, c" (not-a-set)".as_ptr());
             }
             q = str_into(q, c"\n".as_ptr());
-            write(2, rb.as_ptr() as *const c_void, q as usize - rb.as_ptr() as usize);
+            write(
+                2,
+                rb.as_ptr() as *const c_void,
+                q as usize - rb.as_ptr() as usize,
+            );
         }
         p = str_into(p, c"ocerz: RIPDUMP cpu#".as_ptr());
         p = hex_into(p, (*G_CUR_CPU).cpu_number as u64);
@@ -203,13 +214,29 @@ pub(super) unsafe extern "C" fn ripdump_handler(
         }
         *p = '\n' as c_char;
         p = p.add(1);
-        write(2, b.as_ptr() as *const c_void, p as usize - b.as_ptr() as usize);
+        write(
+            2,
+            b.as_ptr() as *const c_void,
+            p as usize - b.as_ptr() as usize,
+        );
         p = b.as_mut_ptr() as *mut c_char;
         static mut RN: [*const c_char; 16] = [
-            c"rax".as_ptr(), c"rcx".as_ptr(), c"rdx".as_ptr(), c"rbx".as_ptr(),
-            c"rsp".as_ptr(), c"rbp".as_ptr(), c"rsi".as_ptr(), c"rdi".as_ptr(),
-            c"r8".as_ptr(), c"r9".as_ptr(), c"r10".as_ptr(), c"r11".as_ptr(),
-            c"r12".as_ptr(), c"r13".as_ptr(), c"r14".as_ptr(), c"r15".as_ptr(),
+            c"rax".as_ptr(),
+            c"rcx".as_ptr(),
+            c"rdx".as_ptr(),
+            c"rbx".as_ptr(),
+            c"rsp".as_ptr(),
+            c"rbp".as_ptr(),
+            c"rsi".as_ptr(),
+            c"rdi".as_ptr(),
+            c"r8".as_ptr(),
+            c"r9".as_ptr(),
+            c"r10".as_ptr(),
+            c"r11".as_ptr(),
+            c"r12".as_ptr(),
+            c"r13".as_ptr(),
+            c"r14".as_ptr(),
+            c"r15".as_ptr(),
         ];
         p = str_into(p, c"ocerz:   regs".as_ptr());
         for i in 0..16 {
@@ -220,7 +247,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
         }
         *p = '\n' as c_char;
         p = p.add(1);
-        write(2, b.as_ptr() as *const c_void, p as usize - b.as_ptr() as usize);
+        write(
+            2,
+            b.as_ptr() as *const c_void,
+            p as usize - b.as_ptr() as usize,
+        );
         {
             static mut MBASE: u64 = 0;
             static mut MINIT: c_int = 0;
@@ -343,7 +374,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                     }
                 }
                 mq = str_into(mq, c"\n".as_ptr());
-                write(2, mb.as_ptr() as *const c_void, mq as usize - mb.as_ptr() as usize);
+                write(
+                    2,
+                    mb.as_ptr() as *const c_void,
+                    mq as usize - mb.as_ptr() as usize,
+                );
                 if !libc::getenv(c"OCERZ_UNFREEZE".as_ptr()).is_null()
                     && ctrl != 0
                     && ocerz_addr_readable(ctrl + 8) != 0
@@ -361,8 +396,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                     let mut ctrl_isa = 0u64;
                     {
                         let sl = MBASE + 0x560f0;
-                        let c0 =
-                            if ocerz_addr_readable(sl) != 0 { ocerz_ld(sl, 8) } else { 0 };
+                        let c0 = if ocerz_addr_readable(sl) != 0 {
+                            ocerz_ld(sl, 8)
+                        } else {
+                            0
+                        };
                         if c0 != 0 && ocerz_addr_readable(c0) != 0 {
                             ctrl_isa = ocerz_ld(c0, 8);
                         }
@@ -414,8 +452,7 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                                             hq = str_into(hq, c" ".as_ptr());
                                             hq = hex_into(
                                                 hq,
-                                                if ocerz_addr_readable(blk + 0x20 + 8 * k) != 0
-                                                {
+                                                if ocerz_addr_readable(blk + 0x20 + 8 * k) != 0 {
                                                     ocerz_ld(blk + 0x20 + 8 * k, 8)
                                                 } else {
                                                     0
@@ -524,7 +561,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                         fq = str_into(fq, c" stackval=".as_ptr());
                         fq = hex_into(fq, ocerz_ld(fp - 0x48 + 0x18, 1));
                         fq = str_into(fq, c"\n".as_ptr());
-                        write(2, fb.as_ptr() as *const c_void, fq as usize - fb.as_ptr() as usize);
+                        write(
+                            2,
+                            fb.as_ptr() as *const c_void,
+                            fq as usize - fb.as_ptr() as usize,
+                        );
                     }
                 }
                 p = str_into(p, c" ".as_ptr());
@@ -539,7 +580,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
             }
             *p = '\n' as c_char;
             p = p.add(1);
-            write(2, b.as_ptr() as *const c_void, p as usize - b.as_ptr() as usize);
+            write(
+                2,
+                b.as_ptr() as *const c_void,
+                p as usize - b.as_ptr() as usize,
+            );
         }
         for i in 0..24u32 {
             let r = G_RIPHIST[(G_RIPHIST_N.wrapping_sub(1).wrapping_sub(i) & 31) as usize];
@@ -562,7 +607,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
             q = hex_into(q, r);
             if ocerz_addr_readable(r) == 0 || ocerz_addr_readable(r + 15) == 0 {
                 q = str_into(q, c" (uncommitted)\n".as_ptr());
-                write(2, x.as_ptr() as *const c_void, q as usize - x.as_ptr() as usize);
+                write(
+                    2,
+                    x.as_ptr() as *const c_void,
+                    q as usize - x.as_ptr() as usize,
+                );
                 continue;
             }
             q = str_into(q, c" =".as_ptr());
@@ -577,7 +626,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
             }
             *q = '\n' as c_char;
             q = q.add(1);
-            write(2, x.as_ptr() as *const c_void, q as usize - x.as_ptr() as usize);
+            write(
+                2,
+                x.as_ptr() as *const c_void,
+                q as usize - x.as_ptr() as usize,
+            );
         }
     }
 }
@@ -630,11 +683,7 @@ static mut FAULT_SB: [u8; 2048] = [0; 2048];
 static WILD_LOGS: AtomicU32 = AtomicU32::new(0);
 static CPUREG_RECOV: AtomicU32 = AtomicU32::new(0);
 
-pub(super) unsafe extern "C" fn crash_handler(
-    sig: c_int,
-    si: *mut siginfo_t,
-    ctx: *mut c_void,
-) {
+pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ctx: *mut c_void) {
     unsafe {
         let mut align_fault = false;
         if sig == SIGSEGV || sig == SIGBUS {
@@ -687,7 +736,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                             w = str_into(w, c"ocerz: RAWALIAS-ON-FAULT gaddr=".as_ptr());
                             w = hex_into(w, ga);
                             w = str_into(w, c"\n".as_ptr());
-                            write(2, ab.as_ptr() as *const c_void, w as usize - ab.as_ptr() as usize);
+                            write(
+                                2,
+                                ab.as_ptr() as *const c_void,
+                                w as usize - ab.as_ptr() as usize,
+                            );
                         }
                         return;
                     }
@@ -750,7 +803,11 @@ pub(super) unsafe extern "C" fn crash_handler(
         if align_fault && CRASH_DEPTH == 0 && !ctx.is_null() {
             let uc = ctx as *const ucontext_t;
             let hpc = (*(*uc).uc_mcontext).ss.pc as *const c_void;
-            let pvm = if !G_CUR_CPU.is_null() { (*G_CUR_CPU).vm } else { G_VM };
+            let pvm = if !G_CUR_CPU.is_null() {
+                (*G_CUR_CPU).vm
+            } else {
+                G_VM
+            };
             if !pvm.is_null() && ffi::ocerz_jit_pc_in_arena(pvm, hpc) != 0 {
                 let hp = ffi::ocerz_jit_hotpatch_align(pvm, hpc);
                 if hp != 0 {
@@ -833,8 +890,7 @@ pub(super) unsafe extern "C" fn crash_handler(
                 && (ffi::ocerz_cache_write_fault((*si).si_addr as usize) != 0
                     || (host_addr_is_guest_page((*si).si_addr) != 0
                         && {
-                            armed_hit =
-                                ffi::ocerz_mem_exec_write_fault(ocerz_h2g((*si).si_addr));
+                            armed_hit = ffi::ocerz_mem_exec_write_fault(ocerz_h2g((*si).si_addr));
                             armed_hit != 0
                         }
                         && (armed_hit != 2
@@ -852,8 +908,7 @@ pub(super) unsafe extern "C" fn crash_handler(
                 }
                 let fvm = (*G_CUR_CPU).vm;
                 let hpc = (*(*uc).uc_mcontext).ss.pc as *const c_void;
-                let page =
-                    ocerz_h2g((*si).si_addr) & !(ffi::OCERZ_HOST_PAGE_SIZE as u64 - 1);
+                let page = ocerz_h2g((*si).si_addr) & !(ffi::OCERZ_HOST_PAGE_SIZE as u64 - 1);
                 let mut jrip: u64 = 0;
                 let in_jit = !fvm.is_null()
                     && ffi::ocerz_jit_pc_in_arena(fvm, hpc) != 0
@@ -949,14 +1004,31 @@ pub(super) unsafe extern "C" fn crash_handler(
                 } else {
                     0
                 };
-                let blib = if !(*bf).lib.is_null() { (*bf).lib } else { c"?".as_ptr() };
-                let bsym = if !(*bf).sym.is_null() { (*bf).sym } else { c"?".as_ptr() };
-                let bsig = if !(*bf).sig.is_null() { (*bf).sig } else { c"?".as_ptr() };
+                let blib = if !(*bf).lib.is_null() {
+                    (*bf).lib
+                } else {
+                    c"?".as_ptr()
+                };
+                let bsym = if !(*bf).sym.is_null() {
+                    (*bf).sym
+                } else {
+                    c"?".as_ptr()
+                };
+                let bsig = if !(*bf).sig.is_null() {
+                    (*bf).sig
+                } else {
+                    c"?".as_ptr()
+                };
                 libc::fprintf(
                     stderr(),
-                    c"ocerz: BRIDGE-FAULT[%d] %s inside a bridged call, not in guest code\n".as_ptr(),
+                    c"ocerz: BRIDGE-FAULT[%d] %s inside a bridged call, not in guest code\n"
+                        .as_ptr(),
                     libc::getpid(),
-                    if sig == SIGBUS { c"SIGBUS".as_ptr() } else { c"SIGSEGV".as_ptr() },
+                    if sig == SIGBUS {
+                        c"SIGBUS".as_ptr()
+                    } else {
+                        c"SIGSEGV".as_ptr()
+                    },
                 );
                 libc::fprintf(
                     stderr(),
@@ -972,10 +1044,18 @@ pub(super) unsafe extern "C" fn crash_handler(
                     c"ocerz:   fault_addr=%p host_pc=%#llx guest_rip=%#llx\n".as_ptr(),
                     (*si).si_addr,
                     bpc as c_ulonglong,
-                    (if !G_CUR_CPU.is_null() { (*G_CUR_CPU).cur_rip } else { 0 }) as c_ulonglong,
+                    (if !G_CUR_CPU.is_null() {
+                        (*G_CUR_CPU).cur_rip
+                    } else {
+                        0
+                    }) as c_ulonglong,
                 );
                 {
-                    let rip = if !G_CUR_CPU.is_null() { (*G_CUR_CPU).cur_rip } else { 0 };
+                    let rip = if !G_CUR_CPU.is_null() {
+                        (*G_CUR_CPU).cur_rip
+                    } else {
+                        0
+                    };
                     let mut rbase: u64 = 0;
                     let mut fbase: u64 = 0;
                     let rname = if rip != 0 {
@@ -1018,7 +1098,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                                 c"ocerz:   host_lr=%#llx %s in %s\n".as_ptr(),
                                 lr as c_ulonglong,
                                 di.dli_sname,
-                                if !di.dli_fname.is_null() { di.dli_fname } else { c"?".as_ptr() },
+                                if !di.dli_fname.is_null() {
+                                    di.dli_fname
+                                } else {
+                                    c"?".as_ptr()
+                                },
                             );
                         } else {
                             libc::fprintf(
@@ -1073,10 +1157,8 @@ pub(super) unsafe extern "C" fn crash_handler(
                 CRASH_DEPTH = 1;
                 let uc = ctx as *const ucontext_t;
                 let hpc = if !uc.is_null() {
-                    ocerz_leaf_site(
-                        (*(*uc).uc_mcontext).ss.pc,
-                        (*(*uc).uc_mcontext).ss.lr,
-                    ) as *const c_void
+                    ocerz_leaf_site((*(*uc).uc_mcontext).ss.pc, (*(*uc).uc_mcontext).ss.lr)
+                        as *const c_void
                 } else {
                     ptr::null()
                 };
@@ -1111,7 +1193,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 }
                 let gs = (*G_CUR_CPU).gs_base;
                 let gaddr = ocerz_h2g((*si).si_addr);
-                let code = if ocerz_addr_committed(gaddr) == 1 { 2 } else { 1 };
+                let code = if ocerz_addr_committed(gaddr) == 1 {
+                    2
+                } else {
+                    1
+                };
 
                 let esr = if !ctx.is_null() {
                     (*(*(ctx as *const ucontext_t)).uc_mcontext).es.esr as u64
@@ -1157,9 +1243,20 @@ pub(super) unsafe extern "C" fn crash_handler(
                         w = str_into(w, c" gs=".as_ptr());
                         w = hex_into(w, gs);
                         w = str_into(w, c" icount=".as_ptr());
-                        w = hex_into(w, if !G_VM.is_null() { (*G_VM).insn_count } else { 0 });
+                        w = hex_into(
+                            w,
+                            if !G_VM.is_null() {
+                                (*G_VM).insn_count
+                            } else {
+                                0
+                            },
+                        );
                         w = str_into(w, c"\n".as_ptr());
-                        write(2, wb.as_ptr() as *const c_void, w as usize - wb.as_ptr() as usize);
+                        write(
+                            2,
+                            wb.as_ptr() as *const c_void,
+                            w as usize - wb.as_ptr() as usize,
+                        );
                     }
                     (*G_CUR_CPU).terminated = 1;
                     ocerz_recov_note(3, (*G_CUR_CPU).rip);
@@ -1210,7 +1307,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                         f = str_into(f, c" hinsn=".as_ptr());
                         f = hex_into(
                             f,
-                            if !hpc.is_null() { *(hpc as *const u32) as u64 } else { 0 },
+                            if !hpc.is_null() {
+                                *(hpc as *const u32) as u64
+                            } else {
+                                0
+                            },
                         );
                         f = str_into(f, c" esr=".as_ptr());
                         f = hex_into(f, esr);
@@ -1221,7 +1322,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                         f = str_into(f, c" pid=".as_ptr());
                         f = hex_into(f, libc::getpid() as u64);
                         f = str_into(f, c"\n".as_ptr());
-                        write(2, fb.as_ptr() as *const c_void, f as usize - fb.as_ptr() as usize);
+                        write(
+                            2,
+                            fb.as_ptr() as *const c_void,
+                            f as usize - fb.as_ptr() as usize,
+                        );
                         if in_jit && !uc.is_null() {
                             let mut ji: OcerzJitFaultInfo = core::mem::zeroed();
                             if ffi::ocerz_jit_fault_info(fvm, hpc, &mut ji) != 0 {
@@ -1322,8 +1427,16 @@ pub(super) unsafe extern "C" fn crash_handler(
                     let teb_committed = gs <= u64::MAX - 16
                         && ocerz_addr_readable(gs + 8) != 0
                         && ocerz_addr_readable(gs + 16) != 0;
-                    let stack_base = if teb_committed { ocerz_ld(gs + 8, 8) } else { 0 };
-                    let stack_limit = if teb_committed { ocerz_ld(gs + 16, 8) } else { 0 };
+                    let stack_base = if teb_committed {
+                        ocerz_ld(gs + 8, 8)
+                    } else {
+                        0
+                    };
+                    let stack_limit = if teb_committed {
+                        ocerz_ld(gs + 16, 8)
+                    } else {
+                        0
+                    };
                     let mut wb = [0u8; 512];
                     let mut w = wb.as_mut_ptr() as *mut c_char;
                     w = str_into(w, c"ocerz: WINEFAULT[".as_ptr());
@@ -1349,7 +1462,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                     w = str_into(w, c" h2g(rsp)=".as_ptr());
                     w = hex_into(w, ocerz_h2g(fault_rsp as *const c_void));
                     w = str_into(w, c"\n".as_ptr());
-                    write(2, wb.as_ptr() as *const c_void, w as usize - wb.as_ptr() as usize);
+                    write(
+                        2,
+                        wb.as_ptr() as *const c_void,
+                        w as usize - wb.as_ptr() as usize,
+                    );
                     {
                         let mut tb = [0u8; 1024];
                         let mut t = tb.as_mut_ptr() as *mut c_char;
@@ -1378,7 +1495,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                             t = hex_into(t, v);
                         }
                         t = str_into(t, c"\n".as_ptr());
-                        write(2, tb.as_ptr() as *const c_void, t as usize - tb.as_ptr() as usize);
+                        write(
+                            2,
+                            tb.as_ptr() as *const c_void,
+                            t as usize - tb.as_ptr() as usize,
+                        );
                     }
                     {
                         let dreg = fault_dreg_v;
@@ -1456,7 +1577,7 @@ pub(super) unsafe extern "C" fn crash_handler(
                     let mut t = tb.as_mut_ptr() as *mut c_char;
                     t = str_into(
                         t,
-                if delivered != 0 {
+                        if delivered != 0 {
                             c"ocerz: SIG[".as_ptr()
                         } else {
                             c"ocerz: SIGNH[".as_ptr()
@@ -1484,16 +1605,34 @@ pub(super) unsafe extern "C" fn crash_handler(
                     t = str_into(t, c" ->tramp=".as_ptr());
                     t = hex_into(t, if delivered != 0 { (*G_CUR_CPU).rip } else { 0 });
                     t = str_into(t, c" icount=".as_ptr());
-                    t = hex_into(t, if !G_VM.is_null() { (*G_VM).insn_count } else { 0 });
+                    t = hex_into(
+                        t,
+                        if !G_VM.is_null() {
+                            (*G_VM).insn_count
+                        } else {
+                            0
+                        },
+                    );
                     t = str_into(t, c"\n".as_ptr());
-                    write(2, tb.as_ptr() as *const c_void, t as usize - tb.as_ptr() as usize);
+                    write(
+                        2,
+                        tb.as_ptr() as *const c_void,
+                        t as usize - tb.as_ptr() as usize,
+                    );
                     {
                         let mut bb = [0u8; 640];
                         let mut w = bb.as_mut_ptr() as *mut c_char;
                         let mut ib: u64 = 0;
                         let in_ = ocerz_dyld_name_for_addr(gaddr, &mut ib);
                         w = str_into(w, c"ocerz:   addr-image=".as_ptr());
-                        w = str_into(w, if !in_.is_null() { in_ } else { c"<none>".as_ptr() });
+                        w = str_into(
+                            w,
+                            if !in_.is_null() {
+                                in_
+                            } else {
+                                c"<none>".as_ptr()
+                            },
+                        );
                         w = str_into(w, c" bt:".as_ptr());
                         let mut fp = (*G_CUR_CPU).gpr[OCERZ_RBP];
                         let mut d = 0;
@@ -1504,7 +1643,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                         {
                             w = str_into(w, c" ".as_ptr());
                             w = hex_into(w, ocerz_ld(fp + 8, 8));
-                            let nf = if ocerz_addr_readable(fp) != 0 { ocerz_ld(fp, 8) } else { 0 };
+                            let nf = if ocerz_addr_readable(fp) != 0 {
+                                ocerz_ld(fp, 8)
+                            } else {
+                                0
+                            };
                             if nf <= fp {
                                 break;
                             }
@@ -1512,7 +1655,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                             d += 1;
                         }
                         w = str_into(w, c"\n".as_ptr());
-                        write(2, bb.as_ptr() as *const c_void, w as usize - bb.as_ptr() as usize);
+                        write(
+                            2,
+                            bb.as_ptr() as *const c_void,
+                            w as usize - bb.as_ptr() as usize,
+                        );
                     }
                     if fault_rip != 0 {
                         let mut xb = [0u8; 200];
@@ -1530,29 +1677,46 @@ pub(super) unsafe extern "C" fn crash_handler(
                             x = x.add(1);
                         }
                         x = str_into(x, c"\n".as_ptr());
-                        write(2, xb.as_ptr() as *const c_void, x as usize - xb.as_ptr() as usize);
+                        write(
+                            2,
+                            xb.as_ptr() as *const c_void,
+                            x as usize - xb.as_ptr() as usize,
+                        );
                     } else {
                         let mut xb = [0u8; 512];
                         let mut x = xb.as_mut_ptr() as *mut c_char;
                         x = str_into(x, c"ocerz:   rip0 hist:".as_ptr());
                         for i in 2..=24u32 {
                             x = str_into(x, c" ".as_ptr());
-                            x = hex_into(
-                                x,
-                                G_RIPHIST[(G_RIPHIST_N.wrapping_sub(i) & 31) as usize],
-                            );
+                            x = hex_into(x, G_RIPHIST[(G_RIPHIST_N.wrapping_sub(i) & 31) as usize]);
                         }
                         x = str_into(x, c"\n".as_ptr());
-                        write(2, xb.as_ptr() as *const c_void, x as usize - xb.as_ptr() as usize);
+                        write(
+                            2,
+                            xb.as_ptr() as *const c_void,
+                            x as usize - xb.as_ptr() as usize,
+                        );
                     }
                     {
                         let mut gb = [0u8; 256];
                         let mut g = gb.as_mut_ptr() as *mut c_char;
                         static mut NM: [*const c_char; 16] = [
-                            c"rax".as_ptr(), c"rcx".as_ptr(), c"rdx".as_ptr(), c"rbx".as_ptr(),
-                            c"rsp".as_ptr(), c"rbp".as_ptr(), c"rsi".as_ptr(), c"rdi".as_ptr(),
-                            c"r8".as_ptr(), c"r9".as_ptr(), c"r10".as_ptr(), c"r11".as_ptr(),
-                            c"r12".as_ptr(), c"r13".as_ptr(), c"r14".as_ptr(), c"r15".as_ptr(),
+                            c"rax".as_ptr(),
+                            c"rcx".as_ptr(),
+                            c"rdx".as_ptr(),
+                            c"rbx".as_ptr(),
+                            c"rsp".as_ptr(),
+                            c"rbp".as_ptr(),
+                            c"rsi".as_ptr(),
+                            c"rdi".as_ptr(),
+                            c"r8".as_ptr(),
+                            c"r9".as_ptr(),
+                            c"r10".as_ptr(),
+                            c"r11".as_ptr(),
+                            c"r12".as_ptr(),
+                            c"r13".as_ptr(),
+                            c"r14".as_ptr(),
+                            c"r15".as_ptr(),
                         ];
                         g = str_into(g, c"ocerz:   gpr".as_ptr());
                         for i in 0..16 {
@@ -1562,7 +1726,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                             g = hex_into(g, (*G_CUR_CPU).gpr[i]);
                         }
                         g = str_into(g, c"\n".as_ptr());
-                        write(2, gb.as_ptr() as *const c_void, g as usize - gb.as_ptr() as usize);
+                        write(
+                            2,
+                            gb.as_ptr() as *const c_void,
+                            g as usize - gb.as_ptr() as usize,
+                        );
                     }
                     {
                         static REGS: [usize; 3] = [OCERZ_RSI, OCERZ_R12, OCERZ_R11];
@@ -1587,7 +1755,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                                 }
                             }
                             m = str_into(m, c"\n".as_ptr());
-                            write(2, mb.as_ptr() as *const c_void, m as usize - mb.as_ptr() as usize);
+                            write(
+                                2,
+                                mb.as_ptr() as *const c_void,
+                                m as usize - mb.as_ptr() as usize,
+                            );
                         }
                     }
                     if code == 1 {
@@ -1601,7 +1773,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                         for i in 0..36u64 {
                             let a = scanlo + i * 0x1000;
                             let cm = ocerz_addr_committed(a);
-                            *c_ = if a == pg { '[' as c_char } else { ' ' as c_char };
+                            *c_ = if a == pg {
+                                '[' as c_char
+                            } else {
+                                ' ' as c_char
+                            };
                             c_ = c_.add(1);
                             *c_ = if cm == 1 {
                                 'C' as c_char
@@ -1611,11 +1787,19 @@ pub(super) unsafe extern "C" fn crash_handler(
                                 '?' as c_char
                             };
                             c_ = c_.add(1);
-                            *c_ = if a == pg { ']' as c_char } else { ' ' as c_char };
+                            *c_ = if a == pg {
+                                ']' as c_char
+                            } else {
+                                ' ' as c_char
+                            };
                             c_ = c_.add(1);
                         }
                         c_ = str_into(c_, c"\n".as_ptr());
-                        write(2, cb.as_ptr() as *const c_void, c_ as usize - cb.as_ptr() as usize);
+                        write(
+                            2,
+                            cb.as_ptr() as *const c_void,
+                            c_ as usize - cb.as_ptr() as usize,
+                        );
                     }
                 }
                 CRASH_DEPTH = 0;
@@ -1638,10 +1822,7 @@ pub(super) unsafe extern "C" fn crash_handler(
                 let gs = (*G_CUR_CPU).gs_base;
                 if gs != 0 && ocerz_addr_readable(gs + 0x30) != 0 {
                     let t = ocerz_ld(gs + 0x30, 8);
-                    if t != 0
-                        && ocerz_addr_readable(t + 0x30) != 0
-                        && ocerz_ld(t + 0x30, 8) == t
-                    {
+                    if t != 0 && ocerz_addr_readable(t + 0x30) != 0 && ocerz_ld(t + 0x30, 8) == t {
                         wine_teb = t;
                     }
                 }
@@ -1736,7 +1917,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                         }
                     }
                     a = str_into(a, c"\n".as_ptr());
-                    write(2, ab.as_ptr() as *const c_void, a as usize - ab.as_ptr() as usize);
+                    write(
+                        2,
+                        ab.as_ptr() as *const c_void,
+                        a as usize - ab.as_ptr() as usize,
+                    );
                 }
                 if !libc::getenv(c"OCERZ_WILDDUMP".as_ptr()).is_null() {
                     wild_dump();
@@ -1783,7 +1968,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                         t = str_into(t, c" host_pc=".as_ptr());
                         t = hex_into(
                             t,
-                            if !uc.is_null() { (*(*uc).uc_mcontext).ss.pc } else { 0 },
+                            if !uc.is_null() {
+                                (*(*uc).uc_mcontext).ss.pc
+                            } else {
+                                0
+                            },
                         );
                         t = str_into(t, c" rip=".as_ptr());
                         t = hex_into(t, (*G_CUR_CPU).rip);
@@ -1813,15 +2002,16 @@ pub(super) unsafe extern "C" fn crash_handler(
                             t = str_into(t, c" hoff=".as_ptr());
                             t = hex_into(t, wji.host_word as u64);
                             t = str_into(t, c" hinsn=".as_ptr());
-                            t = hex_into(
-                                t,
-                                *((*(*uc).uc_mcontext).ss.pc as *const u32) as u64,
-                            );
+                            t = hex_into(t, *((*(*uc).uc_mcontext).ss.pc as *const u32) as u64);
                             t = str_into(t, c" esr=".as_ptr());
                             t = hex_into(t, (*(*uc).uc_mcontext).es.esr as u64);
                         }
                         t = str_into(t, c"\n".as_ptr());
-                        write(2, tb.as_ptr() as *const c_void, t as usize - tb.as_ptr() as usize);
+                        write(
+                            2,
+                            tb.as_ptr() as *const c_void,
+                            t as usize - tb.as_ptr() as usize,
+                        );
                     }
                 }
                 if !libc::getenv(c"OCERZ_WILDDUMP".as_ptr()).is_null() {
@@ -1883,7 +2073,11 @@ pub(super) unsafe extern "C" fn crash_handler(
             p = str_into(p, c" slide=".as_ptr());
             p = hex_into(p, G_IMAGE_SLIDE);
             p = str_into(p, c"\n".as_ptr());
-            write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+            write(
+                2,
+                buf.as_ptr() as *const c_void,
+                p as usize - buf.as_ptr() as usize,
+            );
             libc::_exit(139);
         }
         p = str_into(p, c"ocerz: guest crash[".as_ptr());
@@ -1891,7 +2085,11 @@ pub(super) unsafe extern "C" fn crash_handler(
         p = str_into(p, c"] cpu#".as_ptr());
         p = hex_into(
             p,
-            if !G_CUR_CPU.is_null() { (*G_CUR_CPU).cpu_number as u64 } else { 0xffff },
+            if !G_CUR_CPU.is_null() {
+                (*G_CUR_CPU).cpu_number as u64
+            } else {
+                0xffff
+            },
         );
         p = str_into(p, c" ".as_ptr());
         p = str_into(
@@ -1923,7 +2121,11 @@ pub(super) unsafe extern "C" fn crash_handler(
             p = hex_into(p, G_IMAGE_SLIDE);
             p = str_into(p, c" ocerz_base=".as_ptr());
             p = hex_into(p, _dyld_get_image_header(0) as u64);
-            write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+            write(
+                2,
+                buf.as_ptr() as *const c_void,
+                p as usize - buf.as_ptr() as usize,
+            );
             p = buf.as_mut_ptr() as *mut c_char;
             {
                 let mut ibase: u64 = 0;
@@ -1942,17 +2144,29 @@ pub(super) unsafe extern "C" fn crash_handler(
                     p = str_into(p, c" ".as_ptr());
                     p = str_into(
                         p,
-                        if !di.dli_sname.is_null() { di.dli_sname } else { c"?".as_ptr() },
+                        if !di.dli_sname.is_null() {
+                            di.dli_sname
+                        } else {
+                            c"?".as_ptr()
+                        },
                     );
                 }
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
                 p = buf.as_mut_ptr() as *mut c_char;
             }
             p = str_into(p, c"\n  host-x:".as_ptr());
             for i in 0..29 {
                 p = str_into(
                     p,
-                    if i % 8 == 0 { c"\n    ".as_ptr() } else { c" ".as_ptr() },
+                    if i % 8 == 0 {
+                        c"\n    ".as_ptr()
+                    } else {
+                        c" ".as_ptr()
+                    },
                 );
                 p = hex_into(p, (*(*uc).uc_mcontext).ss.x[i]);
             }
@@ -1962,7 +2176,11 @@ pub(super) unsafe extern "C" fn crash_handler(
             p = hex_into(p, (*(*uc).uc_mcontext).ss.lr);
             p = str_into(p, c" sp=".as_ptr());
             p = hex_into(p, (*(*uc).uc_mcontext).ss.sp);
-            write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+            write(
+                2,
+                buf.as_ptr() as *const c_void,
+                p as usize - buf.as_ptr() as usize,
+            );
             p = buf.as_mut_ptr() as *mut c_char;
             if sig == SIGILL {
                 let pc0 = (*(*uc).uc_mcontext).ss.pc;
@@ -1989,8 +2207,7 @@ pub(super) unsafe extern "C" fn crash_handler(
                         if (v & 0x7c000000) == 0x14000000 {
                             off = ((((v << 6) as i32) >> 6) as i64) * 4;
                             is_ = true;
-                        } else if (v & 0xff000010) == 0x54000000 || (v & 0x7e000000) == 0x34000000
-                        {
+                        } else if (v & 0xff000010) == 0x54000000 || (v & 0x7e000000) == 0x34000000 {
                             off = ((((v >> 5) << 13) as i32) >> 13) as i64 * 4;
                             is_ = true;
                         }
@@ -2007,7 +2224,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                         p = str_into(p, c" none".as_ptr());
                     }
                     p = str_into(p, c"\n".as_ptr());
-                    write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                    write(
+                        2,
+                        buf.as_ptr() as *const c_void,
+                        p as usize - buf.as_ptr() as usize,
+                    );
                     p = buf.as_mut_ptr() as *mut c_char;
                     {
                         let mut fi: OcerzJitFaultInfo = core::mem::zeroed();
@@ -2024,7 +2245,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                         } else {
                             p = str_into(p, c"  owner-block: none\n".as_ptr());
                         }
-                        write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                        write(
+                            2,
+                            buf.as_ptr() as *const c_void,
+                            p as usize - buf.as_ptr() as usize,
+                        );
                         p = buf.as_mut_ptr() as *mut c_char;
                     }
                     {
@@ -2043,7 +2268,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                             for i in 0..64 {
                                 p = str_into(
                                     p,
-                                    if i == 32 { c" |".as_ptr() } else { c" ".as_ptr() },
+                                    if i == 32 {
+                                        c" |".as_ptr()
+                                    } else {
+                                        c" ".as_ptr()
+                                    },
                                 );
                                 p = hex_into(p, w[i] as u64);
                                 if i == 47 {
@@ -2089,7 +2318,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 }
             }
             p = str_into(p, c"\n".as_ptr());
-            write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+            write(
+                2,
+                buf.as_ptr() as *const c_void,
+                p as usize - buf.as_ptr() as usize,
+            );
             p = buf.as_mut_ptr() as *mut c_char;
             p = str_into(p, c" host_bt=".as_ptr());
             let mut fp = (*(*uc).uc_mcontext).ss.fp;
@@ -2123,7 +2356,14 @@ pub(super) unsafe extern "C" fn crash_handler(
             p = str_into(p, c" guest_addr=".as_ptr());
             p = hex_into(p, ocerz_h2g((*si).si_addr));
             p = str_into(p, c" icount=".as_ptr());
-            p = hex_into(p, if !G_VM.is_null() { (*G_VM).insn_count } else { 0 });
+            p = hex_into(
+                p,
+                if !G_VM.is_null() {
+                    (*G_VM).insn_count
+                } else {
+                    0
+                },
+            );
             p = str_into(p, c" cur_rip=".as_ptr());
             p = hex_into(p, (*c).cur_rip);
             p = str_into(p, c" interp_once=".as_ptr());
@@ -2132,11 +2372,21 @@ pub(super) unsafe extern "C" fn crash_handler(
             p = hex_into(p, ocerz_jit_exec_state as u64);
         }
         p = str_into(p, c"\n".as_ptr());
-        write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+        write(
+            2,
+            buf.as_ptr() as *const c_void,
+            p as usize - buf.as_ptr() as usize,
+        );
         if !c.is_null() {
             static mut RNM: [*const c_char; 8] = [
-                c"rax".as_ptr(), c"rcx".as_ptr(), c"rdx".as_ptr(), c"rbx".as_ptr(),
-                c"rsi".as_ptr(), c"rdi".as_ptr(), c"rbp".as_ptr(), c"r8".as_ptr(),
+                c"rax".as_ptr(),
+                c"rcx".as_ptr(),
+                c"rdx".as_ptr(),
+                c"rbx".as_ptr(),
+                c"rsi".as_ptr(),
+                c"rdi".as_ptr(),
+                c"rbp".as_ptr(),
+                c"r8".as_ptr(),
             ];
             static RI: [usize; 8] = [
                 OCERZ_RAX, OCERZ_RCX, OCERZ_RDX, OCERZ_RBX, OCERZ_RSI, OCERZ_RDI, OCERZ_RBP,
@@ -2151,7 +2401,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 p = hex_into(p, (*c).gpr[RI[i]]);
             }
             p = str_into(p, c"\n".as_ptr());
-            write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+            write(
+                2,
+                buf.as_ptr() as *const c_void,
+                p as usize - buf.as_ptr() as usize,
+            );
             {
                 p = buf.as_mut_ptr() as *mut c_char;
                 p = str_into(p, c"  gs_base=".as_ptr());
@@ -2174,7 +2428,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 }
                 *p = '\n' as c_char;
                 p = p.add(1);
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
                 p = buf.as_mut_ptr() as *mut c_char;
                 p = str_into(p, c"  r12=".as_ptr());
                 p = hex_into(p, (*c).gpr[OCERZ_R12]);
@@ -2195,7 +2453,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 );
                 *p = '\n' as c_char;
                 p = p.add(1);
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
                 p = buf.as_mut_ptr() as *mut c_char;
                 p = str_into(p, c"  blockhist:".as_ptr());
                 for i in 1..=16u32 {
@@ -2204,7 +2466,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 }
                 *p = '\n' as c_char;
                 p = p.add(1);
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
             }
             {
                 let comm = ocerz_addr_committed(ocerz_h2g((*si).si_addr));
@@ -2243,7 +2509,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 p = str_into(p, c",".as_ptr());
                 p = hex_into(p, rbase + rsize);
                 p = str_into(p, c")\n".as_ptr());
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
                 let mut ripbase: u64 = 0;
                 let mut ripsize: u64 = 0;
                 let riphp = ocerz_host_region_prot((*c).rip, &mut ripbase, &mut ripsize);
@@ -2255,7 +2525,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 p = str_into(p, c") prot=".as_ptr());
                 p = hex_into(p, riphp as u64);
                 p = str_into(p, c"\n".as_ptr());
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
             }
             let mut fp = (*c).gpr[OCERZ_RBP];
             p = buf.as_mut_ptr() as *mut c_char;
@@ -2275,7 +2549,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 d += 1;
             }
             p = str_into(p, c"\n".as_ptr());
-            write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+            write(
+                2,
+                buf.as_ptr() as *const c_void,
+                p as usize - buf.as_ptr() as usize,
+            );
             let pk = libc::getenv(c"OCERZ_PEEK".as_ptr());
             if !pk.is_null() {
                 let mut pk = pk;
@@ -2296,7 +2574,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                     }
                 }
                 p = str_into(p, c"\n".as_ptr());
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
             }
             let sd = libc::getenv(c"OCERZ_STRDUMP".as_ptr());
             if !sd.is_null() {
@@ -2308,13 +2590,21 @@ pub(super) unsafe extern "C" fn crash_handler(
                 let mut i = 0;
                 while i < 200 && (p as usize) < buf.as_ptr() as usize + 250 {
                     let b_ = ocerz_ld(a + i, 1);
-                    *p = if b_ >= 32 && b_ < 127 { b_ as c_char } else { '.' as c_char };
+                    *p = if b_ >= 32 && b_ < 127 {
+                        b_ as c_char
+                    } else {
+                        '.' as c_char
+                    };
                     p = p.add(1);
                     i += 1;
                 }
                 *p = '\n' as c_char;
                 p = p.add(1);
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
             }
             let sp = (*c).gpr[OCERZ_RSP];
             let mut shown = 0usize;
@@ -2336,7 +2626,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                 a += 8;
             }
             p = str_into(p, c"\n".as_ptr());
-            write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+            write(
+                2,
+                buf.as_ptr() as *const c_void,
+                p as usize - buf.as_ptr() as usize,
+            );
             for k in 0..shown {
                 let mut fb: u64 = 0;
                 let fn_ = ocerz_dyld_name_for_addr(frames[k], &mut fb);
@@ -2351,12 +2645,22 @@ pub(super) unsafe extern "C" fn crash_handler(
                 p = str_into(p, c"+".as_ptr());
                 p = hex_into(p, frames[k] - fb);
                 p = str_into(p, c"\n".as_ptr());
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
             }
             if G_CRASH_STACK != 0 {
                 static mut AN: [*const c_char; 8] = [
-                    c"r9".as_ptr(), c"r10".as_ptr(), c"r11".as_ptr(), c"r12".as_ptr(),
-                    c"r13".as_ptr(), c"r14".as_ptr(), c"r15".as_ptr(), c"rsp".as_ptr(),
+                    c"r9".as_ptr(),
+                    c"r10".as_ptr(),
+                    c"r11".as_ptr(),
+                    c"r12".as_ptr(),
+                    c"r13".as_ptr(),
+                    c"r14".as_ptr(),
+                    c"r15".as_ptr(),
+                    c"rsp".as_ptr(),
                 ];
                 static AI: [usize; 8] = [
                     OCERZ_R9, OCERZ_R10, OCERZ_R11, OCERZ_R12, OCERZ_R13, OCERZ_R14, OCERZ_R15,
@@ -2371,7 +2675,11 @@ pub(super) unsafe extern "C" fn crash_handler(
                     p = hex_into(p, (*c).gpr[AI[i]]);
                 }
                 p = str_into(p, c"\n".as_ptr());
-                write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                write(
+                    2,
+                    buf.as_ptr() as *const c_void,
+                    p as usize - buf.as_ptr() as usize,
+                );
                 let rbp = (*c).gpr[OCERZ_RBP];
                 for row in 0..14u64 {
                     let base = rbp.wrapping_sub(0x80).wrapping_add(row * 0x10);
@@ -2379,19 +2687,24 @@ pub(super) unsafe extern "C" fn crash_handler(
                     p = str_into(p, c"  [rbp".as_ptr());
                     p = str_into(
                         p,
-                        if base >= rbp { c"+".as_ptr() } else { c"-".as_ptr() },
+                        if base >= rbp {
+                            c"+".as_ptr()
+                        } else {
+                            c"-".as_ptr()
+                        },
                     );
-                    p = hex_into(
-                        p,
-                        if base >= rbp { base - rbp } else { rbp - base },
-                    );
+                    p = hex_into(p, if base >= rbp { base - rbp } else { rbp - base });
                     p = str_into(p, c"]:".as_ptr());
                     for col in 0..2u64 {
                         p = str_into(p, c" ".as_ptr());
                         p = hex_into(p, ocerz_ld(base + col * 8, 8));
                     }
                     p = str_into(p, c"\n".as_ptr());
-                    write(2, buf.as_ptr() as *const c_void, p as usize - buf.as_ptr() as usize);
+                    write(
+                        2,
+                        buf.as_ptr() as *const c_void,
+                        p as usize - buf.as_ptr() as usize,
+                    );
                 }
                 {
                     let a = (*c).gpr[OCERZ_R14];
@@ -2566,8 +2879,11 @@ pub(super) unsafe extern "C" fn threaddump_handler(
                 c"ocerz: THREADDUMP[%d] cpu#%u bt: ret=%#llx".as_ptr(),
                 libc::getpid(),
                 (*c).cpu_number,
-                (if ocerz_addr_readable(sp) != 0 { ocerz_ld(sp, 8) } else { 0 })
-                    as c_ulonglong,
+                (if ocerz_addr_readable(sp) != 0 {
+                    ocerz_ld(sp, 8)
+                } else {
+                    0
+                }) as c_ulonglong,
             );
             let mut d = 0;
             while d < 24 && fp > 0x1000 && (fp & 7) == 0 && ocerz_addr_readable(fp + 8) != 0 {
@@ -2625,7 +2941,11 @@ pub(super) unsafe extern "C" fn threaddump_handler(
                     e.sig,
                     e.tid as c_ulonglong,
                     e.cpu as *const c_void,
-                    if !e.cpu.is_null() { (*e.cpu).cpu_number } else { -1 },
+                    if !e.cpu.is_null() {
+                        (*e.cpu).cpu_number
+                    } else {
+                        -1
+                    },
                     e.pid_from,
                 );
                 k += 1;
@@ -2656,7 +2976,13 @@ pub(super) unsafe extern "C" fn portdump_handler(
             libc::getpid(),
             G_CPUS_N,
         );
-        let pkr = mach_port_names(mach_task_self(), &mut names, &mut ncnt, &mut types, &mut tcnt);
+        let pkr = mach_port_names(
+            mach_task_self(),
+            &mut names,
+            &mut ncnt,
+            &mut types,
+            &mut tcnt,
+        );
         if pkr != KERN_SUCCESS {
             libc::fprintf(
                 stderr(),
@@ -2727,8 +3053,7 @@ pub(super) unsafe extern "C" fn portdump_handler(
                     fp as c_ulonglong,
                 );
                 let mut d = 0;
-                while d < 12 && ocerz_addr_readable(fp) != 0 && ocerz_addr_readable(fp + 8) != 0
-                {
+                while d < 12 && ocerz_addr_readable(fp) != 0 && ocerz_addr_readable(fp + 8) != 0 {
                     libc::fprintf(
                         stderr(),
                         c" %#llx".as_ptr(),
@@ -2906,10 +3231,7 @@ pub(super) unsafe extern "C" fn portdump_handler(
                     (*c).sig_delivered[30],
                     if (*c).sig_host_rcvd[30] == before[i as usize]
                         && !(*c).host_pthread.is_null()
-                        && pthread_equal(
-                            (*c).host_pthread as libc::pthread_t,
-                            pthread_self(),
-                        ) != 0
+                        && pthread_equal((*c).host_pthread as libc::pthread_t, pthread_self()) != 0
                     {
                         c"   <== NOT RECEIVED".as_ptr()
                     } else {

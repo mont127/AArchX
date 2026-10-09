@@ -1,10 +1,9 @@
-use core::ffi::{c_char, c_int, c_ulonglong, c_void};
+use core::ffi::{c_char, c_int, c_long, c_ulonglong, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use super::*;
-use crate::ffi::{sigjmp_buf, OcerzCPU, OcerzGuestCall, OcerzVM};
-
+use crate::ffi::{OcerzCPU, OcerzGuestCall, OcerzVM, sigjmp_buf};
 
 core::arch::global_asm!(
     ".section __TEXT,__text",
@@ -72,8 +71,7 @@ pub unsafe extern "C" fn ocerz_vm_install_handlers(vm: *mut OcerzVM) {
         if !wv.is_null() {
             ocerz_watch_val = libc::strtoull(wv, ptr::null_mut(), 0);
         }
-        ocerz_watch_shadow =
-            (!libc::getenv(c"OCERZ_SHADOWST".as_ptr()).is_null()) as u64;
+        ocerz_watch_shadow = (!libc::getenv(c"OCERZ_SHADOWST".as_ptr()).is_null()) as u64;
         let et = libc::getenv(c"OCERZ_EXCTRAP".as_ptr());
         if !et.is_null() {
             ocerz_exc_trap = libc::strtoull(et, ptr::null_mut(), 0);
@@ -102,7 +100,11 @@ pub unsafe extern "C" fn ocerz_vm_install_handlers(vm: *mut OcerzVM) {
             ss_flags: 0,
         };
         if ALTSS.ss_sp.is_null() {
-            ALTSS.ss_size = if SIGSTKSZ < 0x10000 { 0x10000 } else { SIGSTKSZ as usize };
+            ALTSS.ss_size = if SIGSTKSZ < 0x10000 {
+                0x10000
+            } else {
+                SIGSTKSZ as usize
+            };
             ALTSS.ss_sp = libc::mmap(
                 ptr::null_mut(),
                 ALTSS.ss_size,
@@ -120,7 +122,11 @@ pub unsafe extern "C" fn ocerz_vm_install_handlers(vm: *mut OcerzVM) {
         let mut sa: libc::sigaction = core::mem::zeroed();
         sa.sa_sigaction = sig::crash_handler as libc::sighandler_t;
         sa.sa_flags = (SA_SIGINFO | SA_NODEFER) as c_int
-            | if !ALTSS.ss_sp.is_null() { SA_ONSTACK as c_int } else { 0 };
+            | if !ALTSS.ss_sp.is_null() {
+                SA_ONSTACK as c_int
+            } else {
+                0
+            };
         libc::sigaction(SIGSEGV, &sa, ptr::null_mut());
         libc::sigaction(SIGBUS, &sa, ptr::null_mut());
         libc::sigaction(SIGILL, &sa, ptr::null_mut());
@@ -183,11 +189,7 @@ pub unsafe extern "C" fn ocerz_peek_dump(tag: *const c_char) {
             }
             libc::fprintf(stderr(), c" [%#llx]=".as_ptr(), a as c_ulonglong);
             if ocerz_addr_readable(a) != 0 || ffi::ocerz_cache_region(a as usize) != 0 {
-                libc::fprintf(
-                    stderr(),
-                    c"%#llx".as_ptr(),
-                    ocerz_ld(a, 8) as c_ulonglong,
-                );
+                libc::fprintf(stderr(), c"%#llx".as_ptr(), ocerz_ld(a, 8) as c_ulonglong);
             } else {
                 libc::fprintf(stderr(), c"uncommitted".as_ptr());
             }
@@ -214,9 +216,21 @@ pub unsafe extern "C" fn ocerz_peek_dump(tag: *const c_char) {
                     c"{region %#llx+%#llx %c%c%c}".as_ptr(),
                     ra as c_ulonglong,
                     rs as c_ulonglong,
-                    if bi.protection & VM_PROT_READ != 0 { 'r' as c_int } else { '-' as c_int },
-                    if bi.protection & VM_PROT_WRITE != 0 { 'w' as c_int } else { '-' as c_int },
-                    if bi.protection & VM_PROT_EXECUTE != 0 { 'x' as c_int } else { '-' as c_int },
+                    if bi.protection & VM_PROT_READ != 0 {
+                        'r' as c_int
+                    } else {
+                        '-' as c_int
+                    },
+                    if bi.protection & VM_PROT_WRITE != 0 {
+                        'w' as c_int
+                    } else {
+                        '-' as c_int
+                    },
+                    if bi.protection & VM_PROT_EXECUTE != 0 {
+                        'x' as c_int
+                    } else {
+                        '-' as c_int
+                    },
                 );
             }
         }
@@ -248,7 +262,10 @@ unsafe extern "C" fn call_sentinel_init() {
             }
             G_CALL_SENTINEL = OCERZ_CALL_SENTINEL;
         }
-        ocerz_log!("vm: call sentinel page at %#llx\n", G_CALL_SENTINEL as c_ulonglong);
+        ocerz_log!(
+            "vm: call sentinel page at %#llx\n",
+            G_CALL_SENTINEL as c_ulonglong
+        );
     }
 }
 
@@ -329,9 +346,7 @@ unsafe extern "C" fn vm_call_body(ctx_: *mut c_void, rc: c_int) -> c_int {
                     );
                 }
                 for t in 0..RIPTRAP_N {
-                    if (*local).rip == RIPTRAP[t as usize]
-                        && RIPTRAP_HIT[t as usize] < 40
-                    {
+                    if (*local).rip == RIPTRAP[t as usize] && RIPTRAP_HIT[t as usize] < 40 {
                         RIPTRAP_HIT[t as usize] += 1;
                         libc::fprintf(
                             stderr(),
@@ -468,7 +483,11 @@ unsafe extern "C" fn vm_call_body(ctx_: *mut c_void, rc: c_int) -> c_int {
                         libc::fprintf(stderr(), c" %#llx".as_ptr(), ra as c_ulonglong);
                         frames[nframes] = ra;
                         nframes += 1;
-                        let nf = if ocerz_addr_readable(fp) != 0 { ocerz_ld(fp, 8) } else { 0 };
+                        let nf = if ocerz_addr_readable(fp) != 0 {
+                            ocerz_ld(fp, 8)
+                        } else {
+                            0
+                        };
                         if nf <= fp {
                             break;
                         }
@@ -523,8 +542,7 @@ unsafe extern "C" fn vm_call_body(ctx_: *mut c_void, rc: c_int) -> c_int {
         }
         G_CUR_CPU = c.prev_cpu;
         {
-            let left = AtomicU64::from_ptr(&raw mut (*local).sig_pending)
-                .swap(0, Ordering::SeqCst);
+            let left = AtomicU64::from_ptr(&raw mut (*local).sig_pending).swap(0, Ordering::SeqCst);
             if !c.prev_cpu.is_null() {
                 if left != 0 {
                     AtomicU64::from_ptr(&raw mut (*c.prev_cpu).sig_pending)
@@ -561,8 +579,9 @@ unsafe fn vm_call_core(
     context: *const u64,
 ) -> c_int {
     unsafe {
-        static AR: [usize; 6] =
-            [OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9];
+        static AR: [usize; 6] = [
+            OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9,
+        ];
         libc::pthread_once(&raw mut G_CALL_SENTINEL_ONCE, Some(call_sentinel_init));
         let sentinel = G_CALL_SENTINEL;
         let prev_cpu = G_CUR_CPU;
@@ -589,7 +608,11 @@ unsafe fn vm_call_core(
         local.bridge_depth = ffi::ocerz_bridge_depth_ptr();
         local.jit_lock_depth = ffi::ocerz_jit_lock_depth_ptr();
         pthread_threadid_np(0, &mut local.host_tid);
-        let prev_kport = if !prev_cpu.is_null() { (*prev_cpu).host_kport } else { 0 };
+        let prev_kport = if !prev_cpu.is_null() {
+            (*prev_cpu).host_kport
+        } else {
+            0
+        };
         let mut i = 0;
         while i < ngpr && i < 6 {
             local.gpr[AR[i as usize]] = (*call).gpr[i as usize];
@@ -648,7 +671,11 @@ unsafe fn vm_call_core(
                 }
             }
         }
-        let prof_next = if PROF != 0 { (*vm).insn_count + PROF } else { 0 };
+        let prof_next = if PROF != 0 {
+            (*vm).insn_count + PROF
+        } else {
+            0
+        };
 
         if MTRACE_INIT == 0 {
             MTRACE_INIT = 1;
@@ -689,7 +716,12 @@ unsafe fn vm_call_core(
         G_SIG_RECOVER = &mut c.jb;
         ocerz_host_sigmask_clear(c"callback".as_ptr());
         c.jmark = ffi::ocerz_jit_thread_mark();
-        ocerz_vm_setjmp_run(&mut c.jb, 1, vm_call_body, &mut c as *mut CallCtx as *mut c_void)
+        ocerz_vm_setjmp_run(
+            &mut c.jb,
+            1,
+            vm_call_body,
+            &mut c as *mut CallCtx as *mut c_void,
+        )
     }
 }
 
@@ -758,7 +790,10 @@ struct AttachStack {
     region: u64,
 }
 static mut G_ATTACH_STACKS: [AttachStack; OCERZ_ATTACH_MAX] = [const {
-    AttachStack { thread: 0, region: 0 }
+    AttachStack {
+        thread: 0,
+        region: 0,
+    }
 }; OCERZ_ATTACH_MAX];
 static mut G_ATTACH_STACKS_N: c_int = 0;
 static mut G_ATTACH_KEY: libc::pthread_key_t = 0;
@@ -1057,16 +1092,20 @@ extern "C" fn ocerz_unstick_thread(_arg: *mut c_void) -> *mut c_void {
             let w = libc::getenv(c"OCERZ_WATCH".as_ptr());
             let b = libc::getenv(c"OCERZ_MACDRVDUMP".as_ptr());
             UNSTICK_WAUTO.store(
-                (!w.is_null()
-                    && libc::strcmp(w, c"auto".as_ptr()) == 0
-                    && !b.is_null()) as i32,
+                (!w.is_null() && libc::strcmp(w, c"auto".as_ptr()) == 0 && !b.is_null()) as i32,
                 Ordering::Relaxed,
             );
-            UNSTICK_WBASE =
-                if !b.is_null() { libc::strtoull(b, ptr::null_mut(), 0) } else { 0 };
+            UNSTICK_WBASE = if !b.is_null() {
+                libc::strtoull(b, ptr::null_mut(), 0)
+            } else {
+                0
+            };
         }
         loop {
-            let ts = libc::timespec { tv_sec: 0, tv_nsec: 250 * 1000 * 1000 };
+            let ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 250 * 1000 * 1000,
+            };
             libc::nanosleep(&ts, ptr::null_mut());
             if UNSTICK_WAUTO.load(Ordering::Relaxed) == 1 {
                 let slot = UNSTICK_WBASE + 0x560f0;
@@ -1118,10 +1157,7 @@ extern "C" fn ocerz_unstick_thread(_arg: *mut c_void) -> *mut c_void {
                     libc::pthread_kill(G_CPU_THREADS[i as usize], SIGEMT);
                 }
                 let bs = (*G_CPUS[i as usize]).block_started_ns;
-                if bs != 0
-                    && now > bs
-                    && now - bs > 5000000000
-                    && UNSTICK_WARNED[i as usize] != bs
+                if bs != 0 && now > bs && now - bs > 5000000000 && UNSTICK_WARNED[i as usize] != bs
                 {
                     UNSTICK_WARNED[i as usize] = bs;
                     libc::fprintf(
@@ -1209,8 +1245,7 @@ extern "C" fn ocerz_unstick_thread(_arg: *mut c_void) -> *mut c_void {
                                 stderr(),
                                 c"  %u %#llx\n".as_ptr(),
                                 k,
-                                *(*c).btrace.add((bn.wrapping_sub(k) & m) as usize)
-                                    as c_ulonglong,
+                                *(*c).btrace.add((bn.wrapping_sub(k) & m) as usize) as c_ulonglong,
                             );
                             k += 1;
                         }
@@ -1236,9 +1271,7 @@ pub unsafe extern "C" fn ocerz_unstick_start() {
             return;
         }
         let mut t: libc::pthread_t = 0;
-        if libc::pthread_create(&mut t, ptr::null(), ocerz_unstick_thread, ptr::null_mut())
-            == 0
-        {
+        if libc::pthread_create(&mut t, ptr::null(), ocerz_unstick_thread, ptr::null_mut()) == 0 {
             libc::pthread_detach(t);
         } else {
             G_UNSTICK_STARTED.store(0, Ordering::Release);
@@ -1287,7 +1320,11 @@ unsafe fn vm_fatal_where(cpu: *const OcerzCPU) {
         for k in 0..n {
             let mut base: u64 = 0;
             let name = ocerz_dyld_name_for_addr(at[k], &mut base);
-            let leaf = if !name.is_null() { libc::strrchr(name, '/' as c_int) } else { ptr::null() };
+            let leaf = if !name.is_null() {
+                libc::strrchr(name, '/' as c_int)
+            } else {
+                ptr::null()
+            };
             if !name.is_null() {
                 libc::fprintf(
                     stderr(),
@@ -1306,7 +1343,7 @@ unsafe fn vm_fatal_where(cpu: *const OcerzCPU) {
 static mut TRACE_INIT: c_int = 0;
 static mut TRACE_LO: u64 = 0;
 static mut TRACE_HI: u64 = 0;
-static TRACE_PEEK: AtomicI32 = AtomicI32::new(-2);
+static mut TRACE_PEEK: c_long = -2;
 
 #[repr(C)]
 struct RunCtx {
@@ -1373,14 +1410,15 @@ unsafe extern "C" fn run_cpu_body(ctx_: *mut c_void, rc: c_int) -> c_int {
             }
             if TRACE_LO != 0 && (*cpu).rip >= TRACE_LO && (*cpu).rip < TRACE_HI {
                 {
-                    if TRACE_PEEK.load(Ordering::Relaxed) == -2 {
+                    if TRACE_PEEK == -2 {
                         let e = libc::getenv(c"OCERZ_TRACE_PEEK".as_ptr());
-                        TRACE_PEEK.store(
-                            if !e.is_null() { libc::strtol(e, ptr::null_mut(), 0) as i32 } else { -1 },
-                            Ordering::Relaxed,
-                        );
+                        TRACE_PEEK = if !e.is_null() {
+                            libc::strtol(e, ptr::null_mut(), 0)
+                        } else {
+                            -1
+                        };
                     }
-                    let peek = TRACE_PEEK.load(Ordering::Relaxed) as i64;
+                    let peek = TRACE_PEEK;
                     if peek >= 0 {
                         let r13 = (*cpu).gpr[OCERZ_R13];
                         let rbp = (*cpu).gpr[OCERZ_RBP];
@@ -1527,10 +1565,16 @@ pub unsafe extern "C" fn ocerz_vm_run_cpu(vm: *mut OcerzVM, cpu: *mut OcerzCPU) 
         if AtomicI32::from_ptr(&raw mut TRACE_INIT).load(Ordering::Acquire) == 0 {
             let tlo = libc::getenv(c"OCERZ_TRACE_LO".as_ptr());
             let thi = libc::getenv(c"OCERZ_TRACE_HI".as_ptr());
-            TRACE_LO =
-                if !tlo.is_null() { libc::strtoull(tlo, ptr::null_mut(), 0) } else { 0 };
-            TRACE_HI =
-                if !thi.is_null() { libc::strtoull(thi, ptr::null_mut(), 0) } else { 0 };
+            TRACE_LO = if !tlo.is_null() {
+                libc::strtoull(tlo, ptr::null_mut(), 0)
+            } else {
+                0
+            };
+            TRACE_HI = if !thi.is_null() {
+                libc::strtoull(thi, ptr::null_mut(), 0)
+            } else {
+                0
+            };
             AtomicI32::from_ptr(&raw mut TRACE_INIT).store(1, Ordering::Release);
         }
         let mut c = RunCtx {
