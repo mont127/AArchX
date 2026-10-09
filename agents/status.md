@@ -32,7 +32,7 @@
 | mem.c | 2342 | memvm | ported |
 | objcbridge.c | 3543 | native2 | ported |
 | objcclass.c | 1609 | native2 | ported |
- | stack.c | 137 | runtime (ee47e957) | ported |
+| stack.c | 137 | runtime (ee47e957) | ported |
 | sysbridge.c | 2077 | native2 | ported |
 | syscall.c | 8906 | devin-9aa5caef | ported |
 | tcache.c | 863 | runtime (ee47e957) | ported: rust/src/ported/tcache/ |
