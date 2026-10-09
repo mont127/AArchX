@@ -25,7 +25,7 @@
 | jit_fp.c | 3203 | jit-fp-agent | in progress |
 | jit_integer.c | 2678 | jit-integer-agent | in progress |
 | jit_memory.c | 2184 | jit-memory-agent | in progress |
-| jit_simd.c | 3121 | - | C, split SIMD emitters |
+| jit_simd.c | 3121 | jit-simd-agent | in progress |
 | jit_tcache.c | 1063 | - | C, split translation-cache serialization |
 | loader.c | 378 | - | C |
 | main.c | 419 | - | C |
