@@ -133,7 +133,10 @@ guarded call sites in a Rust core; the sink alone cannot capture native relocs.
 
 C uses `#ifdef OCERZ_JIT_EMIT_AUDIT`; the runner defines it only for its
 temporary core object. Older reference cores are instrumented in a temporary
-source copy at unique markers; reference sources are never edited.
+source copy at unique markers; reference sources are never edited. A Rust core
+with the original sink but without the begin hook is similarly instrumented
+in an isolated crate copy, with repository-relative build inputs symlinked
+read-only in use; normal sources and archives remain untouched.
 When `jit` itself is ported, preserve both calls behind
 `#[cfg(ocerz_jit_emit_audit)]` using `ffi::ocerz_jit_emit_audit` and the same raw
 pointer/integer arguments. The runner builds a separate Rust archive with
@@ -169,7 +172,24 @@ unique block variants / 53,776,852 arm64 words**. Reintroducing the known
 produced **27 differing/missing block variants**. The native coverage catches
 this bug even with ordered memory forced; the ordinary C control exits 0.
 
-### Rust-tip audit, 2026-10-09
+### Rust-tip audits, 2026-10-09
+
+After the Rust core landed, re-running both corpora against engine `92b63de`
+reports **MISMATCH: 256/427,595 blocks**: i386 still matches all 215,295;
+x64 has 256 differing variants among 212,300 across the same 186 cases.
+All native cases still match. The additional differences have the **same
+`emit_pk_consts_load` cause** described below: the core now also calls the
+Rust shared helper. Extending the disposable C probe to recompile the core
+with that one early return removed leaves **zero differences across 52,084
+variants in all 38 affected fixtures**. Thus the newly ported core exposes
+more calls of an existing shared-helper mismatch, not a second discrepancy.
+Per-case JSON contains the complete RIP/digest inventory for this run.
+
+The runner recognizes the landed Rust core's original sink-only contract and
+adds the x64 begin/relocation guards in its temporary crate copy; this does not
+modify `rust/src/ported/jit.rs` or any other porter's tracked sources.
+
+The following is the historical pre-Rust-core inventory:
 
 Against `16a7c2d`, the Rust engine at `360ad00` plus the audit hooks reports
 **MISMATCH: 76/427,594 blocks** with default `--corpus all`. I386 matches all

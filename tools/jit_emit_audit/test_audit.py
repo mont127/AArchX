@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from audit import AuditError, Block, HEADER, HERE, INSN, MAGIC, RELOC, compare, diagnostics, main, normalized, records
+from audit import AuditError, Block, HEADER, HERE, INSN, MAGIC, RELOC, compare, diagnostics, instrument_rust, main, normalized, records
 from x64 import block_sets, cache_coverage, compare_sets
 
 
@@ -37,6 +37,16 @@ def encode(value):
 
 
 class AuditTests(unittest.TestCase):
+    def test_rust_core_instrumentation_is_guarded_and_idempotent(self):
+        source = ("    let mut b: A64Buf = core::mem::zeroed();\n"
+                  "    g_tc_on = if g_tc_rec != 0 || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP as c_int { tc_usable(jit) } else { 0 };\n"
+                  "    ocerz_jit_emit_audit(rip, entry);\n")
+        patched = instrument_rust(source)
+        self.assertEqual(instrument_rust(patched), patched)
+        self.assertEqual(patched.count("#[cfg(ocerz_jit_emit_audit)]"), 2)
+        with self.assertRaises(AuditError):
+            instrument_rust("missing hook")
+
     def compare_blocks(self, left, right):
         with tempfile.TemporaryDirectory() as tmp:
             reference, candidate = Path(tmp) / "reference", Path(tmp) / "candidate"
