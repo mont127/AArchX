@@ -1,5 +1,6 @@
 #![feature(thread_local)]
 #![feature(core_intrinsics)]
+#![feature(linkage)]
 #![allow(internal_features)]
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
