@@ -11,7 +11,7 @@
 | cpu.c | 163 | decode-agent | in progress |
 | decode.c | 4435 | decode-agent | in progress |
 | dyld.c | 5840 | - | C |
-| dyldapi.c | 2636 | - | C |
+| dyldapi.c | 2636 | dyld-agent | in progress |
 | flags.c | 230 | - | ported |
 | flags_live.c | 283 | - | C |
 | globals.c | 16 | - | ported |
