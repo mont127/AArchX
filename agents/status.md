@@ -46,4 +46,4 @@
 ## Tip breakages
 
 - At detached tip commit `ff3e398`, `datomic_counter-no-jit` timed out (exit 124; expected `OK`) in the full gate. The current dynamic failure list is identical.
-- `3283d71`: `tests/run_native_framework_tests.sh` fails at the compat check because `compat.jit.err` gains a stray `:/:\capacity overflow` line before the identity-arena log; reproduced on a clean tip checkout after `make apis`. Rust modules on that tip: `cpu`, `flags`, `flags_live`, `globals`, `objcguard`.
+- Fixed by `f6b9e36` (present at tip `f9753d8`): the `3283d71` native-framework compat check no longer emits the stray `:/:\capacity overflow` line; confirmed by the full gate, where `run_native_framework_tests` passed.
