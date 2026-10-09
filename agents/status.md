@@ -27,7 +27,7 @@
 | jit_memory.c | 2184 | jit-memory-agent | ported: rust/src/ported/jit_memory.rs, emit audit MATCH, no C shim (agents/jit-memory.md) |
 | jit_simd.c | 3121 | jit-simd-agent | in progress |
 | jit_tcache.c | 1063 | jit-tcache-agent | ported |
-| loader.c | 378 | runtime (ee47e957) | in progress |
+| loader.c | 378 | runtime (ee47e957) | ported |
 | main.c | 419 | runtime (ee47e957) | in progress |
 | mem.c | 2342 | memvm | ported |
 | objcbridge.c | 3543 | native2 | in progress |
