@@ -41,6 +41,8 @@ trap 'rm -rf "$W"' EXIT
 (cd "$TREE" && make -s ocerz)
 
 OBJS=$(ls "$TREE"/src/*.o | grep -v '/main\.o$')
+[ -f "$TREE/rust/target/release/libocerz_rs.a" ] && \
+    OBJS="$OBJS $TREE/rust/target/release/libocerz_rs.a -lc -lm"
 
 clang -arch arm64 -std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter \
       -I"$TREE/include" -o "$W/diff32" "$HERE/diff32.c" $OBJS -lcompression
