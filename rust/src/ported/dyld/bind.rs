@@ -679,7 +679,7 @@ unsafe fn legacy_symbol(
     index: u32,
 ) -> u64 {
     const N_ABS: u8 = 0x02;
-    const N_WEAK_REF: u16 = 0x0080;
+    const N_WEAK_REF: u16 = 0x0040;
     if index >= nsyms {
         return 0;
     }
