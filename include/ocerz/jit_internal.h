@@ -332,6 +332,7 @@ enum { TCS_FLAGS_MATERIALIZE, TCS_RAS_PUSH, TCS_EXEC_ONE, TCS_EXEC_ONE_AT, TCS_J
 
 typedef struct { uint32_t off; uint8_t kind, form; uint64_t arg; } TcReloc;
 
+int ocerz_jit_emit_audit_begin(OcerzJit *jit);
 void ocerz_jit_emit_audit(uint64_t rip, const uint32_t *code, uint32_t nwords,
                           const X86Insn *insns, uint32_t ninsns,
                           const TcReloc *rel, uint32_t nrel);

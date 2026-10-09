@@ -1224,11 +1224,17 @@ JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (pp + pad < (uint8_t *)jit->code_end)
             jit->code_cur = (uint32_t *)(void *)(pp + pad);
     }
+#ifdef OCERZ_JIT_EMIT_AUDIT
+    int audit_x64 = ocerz_jit_emit_audit_begin(jit);
+#endif
     A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };
     uint32_t *entry = b.p;
     g_push_entry = entry;
     g_tc_entry = entry;
     g_tc_on = (g_tc_rec || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP) ? tc_usable(jit) : 0;
+#ifdef OCERZ_JIT_EMIT_AUDIT
+    if (audit_x64) g_tc_on = 1;
+#endif
 
     a64_stp_pre(&b, 29, 30, 31, -16);
     a64_stp_pre(&b, 19, 20, 31, -16);
