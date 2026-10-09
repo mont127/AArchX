@@ -1,0 +1,8 @@
+1 2: cmp/jmp 2 cmp/jne 2 bt cf 0
+2 1: cmp/jmp 0 cmp/jne 0 bt cf 1
+5 5: cmp/jmp 1 cmp/jne 1 bt cf 0
+0 ffffffffffffffff: cmp/jmp 2 cmp/jne 2 bt cf 0
+8000000000000000 1: cmp/jmp 0 cmp/jne 0 bt cf 0
+6 1: cmp/jmp 0 cmp/jne 0 bt cf 1
+6 2: cmp/jmp 0 cmp/jne 0 bt cf 1
+sum 1460000

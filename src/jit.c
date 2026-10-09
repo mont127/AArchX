@@ -2248,7 +2248,22 @@ static void jit_table_full(const char *what)
     }
 }
 static uint64_t xlive_decode_entry_d(uint64_t rip, int depth);
+static uint64_t xlive_resolve(uint64_t live, const X86Insn *insns, int upto);
+static int ret_flags_live_at(uint64_t rip);
 static int g_xlive_log = -1;
+/*
+ * Flags reaching a ret are dead unless the last instruction to write them was
+ * a cmp, test, bt or cmpxchg, which hand-written code may return its answer in
+ * (ret_seam_live).  A block that ends in ret without writing flags does not
+ * know which instruction that was, so its entry liveness is this mark rather
+ * than every flag, and the block before it, which does know, settles it
+ * (xlive_resolve).  An epilogue - a store, the pops and the ret - made every
+ * block jumping to it keep its flags: in libmalloc's free path a shld's CF
+ * stayed live across an inc to the jmp, so the shld went to the interpreter
+ * 635,000 times in a CoreFoundation dictionary build and the inc rebuilt CF.
+ * OCERZ_NO_RET_RESOLVE=1 gives such a block every flag live again.
+ */
+#define XLIVE_RETDEP 0x8000u
 
 static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth);
 static void fpb_site_emit(A64Buf *b, int end, int va, int vb, int dbl);
@@ -2433,6 +2448,10 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
             live = xlive_succ_live_d(g_xlat_jit, t->ops[0].imm, depth + 1) |
                    xlive_succ_live_d(g_xlat_jit, t->rip + t->len, depth + 1);
     }
+    if (is_terminator(insns[n - 1].op) && insns[n - 1].op == OCERZ_OP_RET && !g_xlat_mode32 &&
+        !ret_flags_live_at(insns[n - 1].rip) && !ENV_ON("OCERZ_NO_RET_RESOLVE"))
+        live = getenv("OCERZ_RET_FLAGS_DEAD") ? 0 : XLIVE_RETDEP;
+    live = xlive_resolve(live, insns, n - 1);
     for (int i = n - 1; i >= 0; i--) {
         uint64_t def, use;
         ocerz_flags_defuse(&insns[i], &def, &use);
@@ -18896,6 +18915,37 @@ static int ret_flags_live_at(uint64_t rip)
     return ret_flags_live();
 }
 
+/* Whether an instruction that writes the flags may be returning an answer in them (ret_seam_live). */
+static int ret_flag_producer(unsigned op)
+{
+    switch (op) {
+    case OCERZ_OP_CMP: case OCERZ_OP_TEST:
+    case OCERZ_OP_BT: case OCERZ_OP_BTS: case OCERZ_OP_BTR: case OCERZ_OP_BTC:
+    case OCERZ_OP_CMPXCHG:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Settles XLIVE_RETDEP in liveness reaching the instruction at upto: the last
+ * flag writer before it decides, as at a ret.  With no writer before it the
+ * mark stays, for the block before to settle.
+ */
+static uint64_t xlive_resolve(uint64_t live, const X86Insn *insns, int upto)
+{
+    if (!(live & XLIVE_RETDEP))
+        return live;
+    for (int k = upto - 1; k >= 0; k--) {
+        uint64_t def, use;
+        ocerz_flags_defuse(&insns[k], &def, &use);
+        if (def & JIT_ARITH_FLAGS)
+            return (live & ~(uint64_t)XLIVE_RETDEP) | (ret_flag_producer(insns[k].op) ? OCERZ_FL_ALL : 0);
+    }
+    return live;
+}
+
 static uint64_t ret_seam_live(const X86Insn *insns, int n)
 {
     for (int i = n - 2; i >= 0; i--) {
@@ -20620,13 +20670,15 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             if (!ret_flags_live_at(term->rip) && !mode32) {
                 static int dead = -1;
                 if (dead < 0) dead = getenv("OCERZ_RET_FLAGS_DEAD") != NULL;
-                seam_seed = dead ? 0 : ret_seam_live(blk->insns, n);
+                seam_seed = dead ? 0 : ENV_ON("OCERZ_NO_RET_RESOLVE") ? ret_seam_live(blk->insns, n)
+                                                                    : XLIVE_RETDEP;
             }
             break;
         default:
 
             break;
         }
+        seam_seed = xlive_resolve(seam_seed, blk->insns, n - 1);
     }
 
     uint64_t fl_need[JIT_MAX_BLOCK_INSNS];
@@ -20641,7 +20693,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             jcc_fall_live[i] = 0;
             if (i < n - 1 && blk->insns[i].op == OCERZ_OP_JCC) {
                 uint64_t tl = (g_no_xlive || blk->insns[i].ops[0].kind != OCERZ_OPK_IMM)
-                              ? OCERZ_FL_ALL : xlive_succ_live(jit, blk->insns[i].ops[0].imm);
+                              ? OCERZ_FL_ALL : xlive_resolve(xlive_succ_live(jit, blk->insns[i].ops[0].imm),
+                                                             blk->insns, i);
                 jcc_fall_live[i] = live_seam;
                 live_seam |= tl;
                 live_all |= tl;
