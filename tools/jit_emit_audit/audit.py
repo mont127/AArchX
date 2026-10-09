@@ -212,6 +212,23 @@ def instrument(source):
     return DECL + "extern int ocerz_jit_emit_audit_begin(OcerzJit *);\n" + source
 
 
+def instrument_rust(source):
+    if "ocerz_jit_emit_audit(" not in source:
+        raise AuditError("Rust jit core must preserve the pre-tc_bind audit sink")
+    if "ocerz_jit_emit_audit_begin(" in source:
+        return source
+    needle = "    let mut b: A64Buf = core::mem::zeroed();"
+    if source.count(needle) != 1:
+        raise AuditError("cannot find the Rust audit alignment point")
+    source = source.replace(needle, "    #[cfg(ocerz_jit_emit_audit)]\n"
+                            "    let audit_x64 = ocerz_jit_emit_audit_begin(jit);\n" + needle)
+    needle = "    g_tc_on = if g_tc_rec != 0 || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP as c_int { tc_usable(jit) } else { 0 };"
+    if source.count(needle) != 1:
+        raise AuditError("cannot find the Rust audit relocation point")
+    return source.replace(needle, needle + "\n    #[cfg(ocerz_jit_emit_audit)]\n"
+                          "    if audit_x64 != 0 { g_tc_on = 1; }")
+
+
 def build(tree, work, corpus):
     work.mkdir()
     log = work / "build.log"
@@ -238,8 +255,21 @@ def build(tree, work, corpus):
                 or (tree / "rust/src/ported/jit/mod.rs").exists()):
             raise AuditError(f"{tree}: neither C nor Rust jit core found")
         target = work / "rust-target"
+        project = tree / "rust"
+        core = next(p for p in (project / "src/ported/jit.rs", project / "src/ported/jit/mod.rs") if p.exists())
+        source = core.read_text()
+        patched = instrument_rust(source)
+        if patched != source:
+            isolated = work / "rust-tree"
+            isolated.mkdir()
+            for item in tree.iterdir():
+                if item.name not in (".git", "rust"):
+                    (isolated / item.name).symlink_to(item, target_is_directory=item.is_dir())
+            project = isolated / "rust"
+            shutil.copytree(tree / "rust", project, ignore=shutil.ignore_patterns("target"))
+            (project / core.relative_to(tree / "rust")).write_text(patched)
         run(["cargo", "rustc", "--release", "--lib", "--target-dir", target,
-             "--", "--cfg", "ocerz_jit_emit_audit"], tree / "rust", log)
+             "--", "--cfg", "ocerz_jit_emit_audit"], project, log)
         archives = [i for i, obj in enumerate(objects) if obj.endswith("libocerz_rs.a")]
         if len(archives) != 1:
             raise AuditError(f"{tree}: expected one Rust staticlib in Makefile inputs")
