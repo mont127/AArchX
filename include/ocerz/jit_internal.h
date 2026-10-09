@@ -332,6 +332,10 @@ enum { TCS_FLAGS_MATERIALIZE, TCS_RAS_PUSH, TCS_EXEC_ONE, TCS_EXEC_ONE_AT, TCS_J
 
 typedef struct { uint32_t off; uint8_t kind, form; uint64_t arg; } TcReloc;
 
+void ocerz_jit_emit_audit(uint64_t rip, const uint32_t *code, uint32_t nwords,
+                          const X86Insn *insns, uint32_t ninsns,
+                          const TcReloc *rel, uint32_t nrel);
+
 typedef struct { _Alignas(16) uint64_t rip; void *body; } JitPscEnt;
 
 _Static_assert(PSC_N == OCERZ_PSC_COLS, "a PSC column per retire generation");

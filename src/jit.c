@@ -2588,6 +2588,10 @@ promo_push_fallthrough:
         }
     }
 
+#ifdef OCERZ_JIT_EMIT_AUDIT
+    ocerz_jit_emit_audit(rip, entry, blk->code_words, blk->insns, (uint32_t)n,
+                         g_tc_rel, (uint32_t)g_tc_nrel);
+#endif
     int tc_save = 0;
     if (g_tc_on) {
         if (ocerz_tcache_mode() != OCERZ_TC_ROUNDTRIP || !tc_roundtrip(jit, blk, entry)) {
