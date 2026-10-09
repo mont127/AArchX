@@ -190,3 +190,8 @@ pub unsafe fn ocerz_st(gaddr: u64, size: i32, v: u64) {
         }
     }
 }
+
+pub const VM_INHERIT_SHARE: libc::vm_inherit_t =
+    libc::VM_INHERIT_SHARE as libc::vm_inherit_t;
+pub const VM_INHERIT_DEFAULT: libc::vm_inherit_t =
+    libc::VM_INHERIT_COPY as libc::vm_inherit_t;

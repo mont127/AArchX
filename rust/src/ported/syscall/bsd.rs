@@ -4,6 +4,7 @@
 
 use super::util::*;
 use super::*;
+use crate::inline::VM_INHERIT_SHARE;
 
 use core::ffi::{c_char, c_int, c_void};
 use core::mem;
@@ -14,7 +15,6 @@ const OCERZ_SHM_ATTACH_MAX: usize = 64;
 const CLOCK_UPTIME_RAW: libc::clockid_t = 8;
 const VM_FLAGS_FIXED: i32 = 0x0000;
 const VM_FLAGS_OVERWRITE: i32 = 0x4000;
-const VM_INHERIT_SHARE: libc::vm_inherit_t = 1;
 
 unsafe extern "C" {
     fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
