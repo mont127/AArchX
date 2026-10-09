@@ -8,7 +8,7 @@
 | blocks.c | 914 | native1 | in progress |
 | bridge.c | 3379 | native2 | in progress |
 | cache.c | 1496 | - | C |
-| cpu.c | 163 | decode-agent | in progress |
+| cpu.c | 163 | decode-agent | ported |
 | decode.c | 4435 | decode-agent | in progress |
 | dyld.c | 5840 | - | C |
 | dyldapi.c | 2636 | dyld-agent | in progress |
