@@ -29,50 +29,59 @@ equivalent call site.
   used by fault and park handling.
 - The shared `ocerz_ld` uses acquire atomic loads for naturally aligned 1/2/4/8
   byte accesses and a byte-copy plus acquire fence for other cases.
+- Fixed-size static, struct-field, and local arrays use unchecked indexing to
+  retain C's unchecked semantics on hot paths. The index expressions and their
+  casts/masks are preserved; `ps_shapes` is sized from `OCERZ_OP_COUNT`.
 
 ## Verification
 
-At candidate commit `9595b42`, `make -j12 ocerz` succeeded and the emission
-audit against `~/AArchX-jitc` returned:
+On the latest unchecked-index candidate, `make -j12 ocerz` succeeded and the
+emission audit against `~/AArchX-jitc` returned:
 
 ```text
 MATCH: 215295 blocks, 145523525 arm64 words (offset + low, seed=1; relocation payloads masked)
 ```
 
-The eight requested unit binaries passed with `OCERZ_NO_ARM_EXEC=1`. The fast
+All eight requested unit binaries passed with `OCERZ_NO_ARM_EXEC=1`. The fast
 gate passed with no new failures: 3 known unit failures, 134/134 guest tests in
 both modes, 100/100 differential cases, and 107,410 translated diff32 blocks.
 
-The full gate at `9595b42` is accepted as passing for this port. The raw runner
-reported `GATE: FAIL` only because `datomic_counter-no-jit` timed out (exit 124,
-expected `OK`) in the interpreter-only run. This is a known tip flake, not a
-port regression; the same timeout is recorded in `agents/status.md:48`,
-`agents/dyld.md`, and `agents/native2.md`. The dynamic phase reported 279
-passed/8 failed, with that timeout as its only new failure. Native tests
-reported 86 passed/1 known failure; guest-library tests passed, and native
-framework and format tests passed. Native C++ and Swift phases were skipped.
+The latest full gate returned `GATE: FAIL (new failures vs baseline)` because
+`dthread_signal-jit` failed once (`out='FAIL'`, exit 1). The task owner
+identified this as a known flaky case; it had previously passed isolated
+reruns on both the Rust candidate and C reference. It is not currently in the
+gate's expected failure list, so the raw gate result remains a failure. The
+dynamic phase had 279 passes and 8 failures total (7 baseline failures plus
+this case). Native tests had 86 passes and the known `sys_proc`
+host-compatibility failure.
+Guest-library, native framework, and native format tests passed; native C++
+and Swift tests were skipped because their guest fixtures were not built.
+The earlier `datomic_counter-no-jit` timeout (exit 124) at `9595b42` was also
+accepted as a known tip flake; it did not recur in this full gate.
 
-Full-gate output and phase logs are preserved at
-`~/notes/gate-full/full-9595b42/gate.stdout.log` and
-`~/notes/gate-full/full-9595b42/logs/`. Fast-gate phase logs are at
-`~/notes/gate-full/fast-9595b42/`.
+Full-gate phase logs are preserved at
+`/Users/devin/notes/gate-full/full-final-mut-access/`; fast-gate phase logs are
+at `/Users/devin/notes/gate-full/fast-final-mut-access/`.
 
 ## Performance
 
 Paired alternating runs used `~/AArchX-jitc` at `16a7c2d` as the C reference
-and the candidate at `9595b42`. The i386 harness uses the default offset corpus
-and `--jit-required`; the translation counter was enabled by a temporary
-constructor, without changing either production tree. There were five pairs.
-Each dynamic result is the median per-process time from six alternating pairs
-of 30 fresh processes per tree and fixture, with `OCERZ_TCACHE=off`.
+and the latest unchecked-index candidate. The i386 harness uses the default
+offset corpus and `--jit-required`; the translation counter was enabled by a
+temporary constructor, without changing either production tree. There were
+five alternating pairs. Each dynamic result is the median per-process time
+from six alternating pairs of 30 fresh processes per tree and fixture, with
+`OCERZ_TCACHE=off`.
 
 | Measurement | C reference | Rust candidate | Change |
 | --- | ---: | ---: | ---: |
-| i386 `--jit-required` harness wall | 24.052 s | 24.791 s | +3.1% |
-| Time inside `translate` | 958.100 ms | 987.461 ms | +3.1% |
-| `tcache_work` | 40.501 ms | 40.412 ms | -0.2% |
-| `avx_fp` | 38.459 ms | 38.871 ms | +1.1% |
-| `low_hoist` | 38.083 ms | 37.788 ms | -0.8% |
+| i386 `--jit-required` harness wall | 22.642 s | 23.564 s | +4.1% |
+| Time inside `translate` | 857.519 ms | 882.472 ms | +2.9% |
+| `tcache_work` | 38.712 ms | 38.558 ms | -0.4% |
+| `avx_fp` | 38.486 ms | 38.221 ms | -0.7% |
+| `low_hoist` | 38.182 ms | 37.419 ms | -2.0% |
 
 Temporary probe, runner, and raw samples are in
-`~/notes/jit-control-bench/`; none are part of the repository.
+`~/notes/jit-control-bench/`; the final raw samples are in
+`results.json` and the previous samples were snapshotted as
+`results-before-final-mut-access.json`. None are part of the repository.
