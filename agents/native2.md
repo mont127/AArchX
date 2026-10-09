@@ -64,17 +64,26 @@ sysctl, sandbox).
   fast gate pass (diff32 log inspected: 40044 passed, 107410 blocks, no link
   errors); full gate pass except the known `datomic_counter-no-jit` flake
   (30s timeout under load, passes standalone in 28.8s).
-- Perf vs the C-sysbridge binary (built by moving `ported/sysbridge` aside
-  and rebuilding; `~/AArchX-c/ocerz` cannot run `-native` at all — its commit
-  predates the bridge, and `runtime/apis` is resolved relative to the
-  executable so a copied binary needs a `runtime/` symlink). Guests built
-  with `clang -arch x86_64 -O2`, run as `./ocerz -native <bin>` 5 times each,
-  `/usr/bin/time -p` wall seconds:
+- Gotcha: a mutable C file-scope static must be `static mut` in Rust, and
+  locks must be passed `&raw mut`. An immutable `static` of a C struct type
+  (e.g. `libc::pthread_mutex_t = PTHREAD_MUTEX_INITIALIZER`) is placed in
+  `__TEXT,__const`, so the first `pthread_mutex_lock` write faults (SIGBUS in
+  `_pthread_mutex_lock_init_slow`). Check with `nm -m ocerz | grep <module>` —
+  every writable object must be in `__DATA` (`__data`/`__bss`/`__common`),
+  nothing mutable in `__TEXT,__const`. Statics of atomic types are fine as
+  `static` because the compiler gives them interior-mutable placement.
+  `G_SB_KEY_LOCK`, `G_SB_SYSTEM_LOCK`, `G_SB_POPEN_LOCK` hit exactly this;
+  a guest calling `pthread_key_create` or `system()` crashed pre-fix.
+- Perf vs the pure-C reference `~/AArchX-c/ocerz` (which needs `make apis`
+  run there first — `runtime/apis` is resolved relative to the executable,
+  so a copied binary needs a `runtime/` beside it or a symlink). Guests
+  built with `clang -arch x86_64 -O2`, run as `./ocerz -native <bin>` 5
+  times each, `/usr/bin/time -p` wall seconds:
 
-  | guest | work | C sysbridge min/median | Rust sysbridge min/median |
-  |-------|------|------------------------|---------------------------|
-  | jmp   | 2M setjmp/longjmp | 0.10 / 0.10 | 0.10 / 0.10 |
+  | guest | work | C reference min/median | Rust tip min/median |
+  |-------|------|----------------------|---------------------|
+  | jmp   | 2M setjmp/longjmp | 0.09 / 0.10 | 0.09 / 0.09 |
   | div128 | 2M unsigned __int128 div+mod | 0.06 / 0.06 | 0.06 / 0.06 |
-  | mmap  | 50k mmap+munmap | 0.17 / 0.18 | 0.17 / 0.18 |
+  | mmap  | 50k mmap+munmap | 0.16 / 0.17 | 0.16 / 0.17 |
 
   Parity within timer noise, as expected — sysbridge is not a hot loop.
