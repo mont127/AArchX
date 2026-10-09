@@ -346,14 +346,16 @@ unsafe extern "C" fn vm_call_body(ctx_: *mut c_void, rc: c_int) -> c_int {
                     );
                 }
                 for t in 0..RIPTRAP_N {
-                    if (*local).rip == RIPTRAP[t as usize] && RIPTRAP_HIT[t as usize] < 40 {
-                        RIPTRAP_HIT[t as usize] += 1;
+                    if (*local).rip == *((&raw const RIPTRAP) as *const u64).add(t as usize)
+                        && *((&raw mut RIPTRAP_HIT) as *mut u8).add(t as usize) < 40
+                    {
+                        *((&raw mut RIPTRAP_HIT) as *mut u8).add(t as usize) += 1;
                         libc::fprintf(
                             stderr(),
                             c"ocerz: RIPLOG hit %#llx (#%d) icount=%llu rdi=%#llx rsi=%#llx rdx=%#llx rbx=%#llx r14=%#llx\n"
                                 .as_ptr(),
-                            RIPTRAP[t as usize] as c_ulonglong,
-                            RIPTRAP_HIT[t as usize] as c_int,
+                            *((&raw const RIPTRAP) as *const u64).add(t as usize) as c_ulonglong,
+                            *((&raw mut RIPTRAP_HIT) as *mut u8).add(t as usize) as c_int,
                             (*vm).insn_count as c_ulonglong,
                             (*local).gpr[OCERZ_RDI] as c_ulonglong,
                             (*local).gpr[OCERZ_RSI] as c_ulonglong,
@@ -481,7 +483,7 @@ unsafe extern "C" fn vm_call_body(ctx_: *mut c_void, rc: c_int) -> c_int {
                             0
                         };
                         libc::fprintf(stderr(), c" %#llx".as_ptr(), ra as c_ulonglong);
-                        frames[nframes] = ra;
+                        *frames.as_mut_ptr().add(nframes) = ra;
                         nframes += 1;
                         let nf = if ocerz_addr_readable(fp) != 0 {
                             ocerz_ld(fp, 8)
@@ -508,14 +510,14 @@ unsafe extern "C" fn vm_call_body(ctx_: *mut c_void, rc: c_int) -> c_int {
                     }
                     for d in 0..nframes {
                         let mut b_: u64 = 0;
-                        let n = ocerz_dyld_name_for_addr(frames[d], &mut b_);
+                        let n = ocerz_dyld_name_for_addr(*frames.as_mut_ptr().add(d), &mut b_);
                         if !n.is_null() {
                             libc::fprintf(
                                 stderr(),
                                 c"    frame %#llx %s+%#llx\n".as_ptr(),
-                                frames[d] as c_ulonglong,
+                                *frames.as_mut_ptr().add(d) as c_ulonglong,
                                 n,
-                                (frames[d] - b_) as c_ulonglong,
+                                (*frames.as_mut_ptr().add(d) - b_) as c_ulonglong,
                             );
                         }
                     }
@@ -551,10 +553,14 @@ unsafe extern "C" fn vm_call_body(ctx_: *mut c_void, rc: c_int) -> c_int {
                         (*c.prev_cpu).nested_sig_handback.wrapping_add(1);
                 }
                 for s in 1..32usize {
-                    AtomicU32::from_ptr(&raw mut (*c.prev_cpu).sig_host_rcvd[s])
-                        .fetch_add((*local).sig_host_rcvd[s], Ordering::Relaxed);
-                    AtomicU32::from_ptr(&raw mut (*c.prev_cpu).sig_delivered[s])
-                        .fetch_add((*local).sig_delivered[s], Ordering::Relaxed);
+                    AtomicU32::from_ptr(
+                        ((&raw mut (*c.prev_cpu).sig_host_rcvd) as *mut u32).add(s),
+                    )
+                    .fetch_add(*(*local).sig_host_rcvd.get_unchecked(s), Ordering::Relaxed);
+                    AtomicU32::from_ptr(
+                        ((&raw mut (*c.prev_cpu).sig_delivered) as *mut u32).add(s),
+                    )
+                    .fetch_add(*(*local).sig_delivered.get_unchecked(s), Ordering::Relaxed);
                 }
             } else if left != 0 {
                 AtomicU32::from_ptr(&raw mut G_PENDING_ASYNC_MASK_TLS)
@@ -615,12 +621,13 @@ unsafe fn vm_call_core(
         };
         let mut i = 0;
         while i < ngpr && i < 6 {
-            local.gpr[AR[i as usize]] = (*call).gpr[i as usize];
+            *local.gpr.get_unchecked_mut(*AR.get_unchecked(i as usize)) =
+                *(*call).gpr.get_unchecked(i as usize);
             i += 1;
         }
         let mut i = 0;
         while i < nxmm && i < 8 {
-            (*local.xmm.as_mut_ptr().add(i as usize)).lo = (*call).xmm[i as usize];
+            (*local.xmm.as_mut_ptr().add(i as usize)).lo = *(*call).xmm.get_unchecked(i as usize);
             (*local.xmm.as_mut_ptr().add(i as usize)).hi = 0;
             i += 1;
         }
@@ -639,7 +646,11 @@ unsafe fn vm_call_core(
         ocerz_st(sp, 8, sentinel);
         let mut i = 0;
         while i < nstack {
-            ocerz_st(argbase + 8 * i as u64, 8, (*call).stack[i as usize]);
+            ocerz_st(
+                argbase + 8 * i as u64,
+                8,
+                *(*call).stack.get_unchecked(i as usize),
+            );
             i += 1;
         }
         local.gpr[OCERZ_RSP] = sp;
@@ -664,7 +675,8 @@ unsafe fn vm_call_core(
             RIPTRAP_N = 0;
             let mut rs = libc::getenv(c"OCERZ_RIPLOG".as_ptr());
             while !rs.is_null() && *rs != 0 && RIPTRAP_N < 16 {
-                RIPTRAP[RIPTRAP_N as usize] = libc::strtoull(rs, &mut rs, 0);
+                *((&raw mut RIPTRAP) as *mut u64).add(RIPTRAP_N as usize) =
+                    libc::strtoull(rs, &mut rs, 0);
                 RIPTRAP_N += 1;
                 while *rs == ',' as c_char || *rs == ' ' as c_char {
                     rs = rs.add(1);
@@ -737,7 +749,7 @@ pub unsafe extern "C" fn ocerz_vm_call(
         let mut call: OcerzGuestCall = core::mem::zeroed();
         let mut i = 0;
         while i < nargs && i < 6 {
-            call.gpr[i as usize] = *args.add(i as usize);
+            *call.gpr.get_unchecked_mut(i as usize) = *args.add(i as usize);
             i += 1;
         }
         call.nstack = 0;
@@ -800,29 +812,35 @@ static mut G_ATTACH_KEY: libc::pthread_key_t = 0;
 static G_ATTACH_KEY_OK: AtomicI32 = AtomicI32::new(0);
 static mut G_ATTACH_ONCE: libc::pthread_once_t = libc::PTHREAD_ONCE_INIT;
 
+#[inline(always)]
+unsafe fn attach_stacks() -> *mut AttachStack {
+    &raw mut G_ATTACH_STACKS as *mut AttachStack
+}
+
 unsafe fn attach_release(at: *mut AttachedThread) {
     unsafe {
         let self_ = pthread_self();
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         let mut i = 0;
         while i < G_CPUS_N {
-            if G_CPUS[i as usize] == &mut (*at).cpu
-                || pthread_equal(G_CPU_THREADS[i as usize], self_) != 0
+            if *gcpus().add(i as usize) == &mut (*at).cpu
+                || pthread_equal(*cputhreads().add(i as usize), self_) != 0
             {
                 G_CPUS_N -= 1;
                 let last = G_CPUS_N;
-                G_CPUS[i as usize] = G_CPUS[last as usize];
-                G_CPU_THREADS[i as usize] = G_CPU_THREADS[last as usize];
-                G_CPUS[last as usize] = ptr::null_mut();
+                *gcpus().add(i as usize) = *gcpus().add(last as usize);
+                *cputhreads().add(i as usize) = *cputhreads().add(last as usize);
+                *gcpus().add(last as usize) = ptr::null_mut();
                 i -= 1;
             }
             i += 1;
         }
         let mut i = 0;
         while i < G_ATTACH_STACKS_N {
-            if G_ATTACH_STACKS[i as usize].region == (*at).region {
+            if (*attach_stacks().add(i as usize)).region == (*at).region {
                 G_ATTACH_STACKS_N -= 1;
-                G_ATTACH_STACKS[i as usize] = G_ATTACH_STACKS[G_ATTACH_STACKS_N as usize];
+                (*attach_stacks().add(i as usize)) =
+                    (*attach_stacks().add(G_ATTACH_STACKS_N as usize));
                 break;
             }
             i += 1;
@@ -972,8 +990,8 @@ pub unsafe extern "C" fn ocerz_thread_attach(vm: *mut OcerzVM) -> *mut OcerzCPU 
         ocerz_cpu_register(cpu);
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         if G_ATTACH_STACKS_N < OCERZ_ATTACH_MAX as c_int {
-            G_ATTACH_STACKS[G_ATTACH_STACKS_N as usize].thread = pthread_self();
-            G_ATTACH_STACKS[G_ATTACH_STACKS_N as usize].region = region;
+            (*attach_stacks().add(G_ATTACH_STACKS_N as usize)).thread = pthread_self();
+            (*attach_stacks().add(G_ATTACH_STACKS_N as usize)).region = region;
             G_ATTACH_STACKS_N += 1;
         }
         libc::pthread_mutex_unlock(&raw mut G_CPUS_LOCK);
@@ -1007,9 +1025,9 @@ pub unsafe extern "C" fn ocerz_vm_guest_stack(
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         let mut i = 0;
         while i < G_ATTACH_STACKS_N && found == 0 {
-            if pthread_equal(G_ATTACH_STACKS[i as usize].thread, thread) != 0 {
-                *lo = G_ATTACH_STACKS[i as usize].region;
-                *hi = G_ATTACH_STACKS[i as usize].region + OCERZ_ATTACH_BLOCK;
+            if pthread_equal((*attach_stacks().add(i as usize)).thread, thread) != 0 {
+                *lo = (*attach_stacks().add(i as usize)).region;
+                *hi = (*attach_stacks().add(i as usize)).region + OCERZ_ATTACH_BLOCK;
                 found = 1;
             }
             i += 1;
@@ -1023,9 +1041,9 @@ pub unsafe extern "C" fn ocerz_vm_guest_stack(
             } else {
                 0
             };
-            if !G_CPUS[i as usize].is_null()
+            if !(*gcpus().add(i as usize)).is_null()
                 && main_hi != 0
-                && pthread_equal(G_CPU_THREADS[i as usize], thread) != 0
+                && pthread_equal(*cputhreads().add(i as usize), thread) != 0
             {
                 *lo = if G_MAIN_STACK_HI != 0 {
                     G_MAIN_STACK_LO
@@ -1130,52 +1148,57 @@ extern "C" fn ocerz_unstick_thread(_arg: *mut c_void) -> *mut c_void {
             let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
             for i in 0..G_CPUS_N {
-                let t0 = (*G_CPUS[i as usize]).block_since_ns;
-                let sigonly = (*G_CPUS[i as usize]).block_sigonly;
+                let t0 = (**gcpus().add(i as usize)).block_since_ns;
+                let sigonly = (**gcpus().add(i as usize)).block_sigonly;
                 let due = if sigonly != 0 {
-                    ((*G_CPUS[i as usize]).sig_pending & !(*G_CPUS[i as usize]).sig_mask) != 0
+                    ((**gcpus().add(i as usize)).sig_pending
+                        & !(**gcpus().add(i as usize)).sig_mask)
+                        != 0
                         && now.wrapping_sub(t0) > 50 * 1000 * 1000
                 } else {
                     now.wrapping_sub(t0) > 800 * 1000 * 1000
                         && (UNSTICK_KICK_ALL.load(Ordering::Relaxed) != 0
-                            || (*G_CPUS[i as usize]).block_nokick == 0)
+                            || (**gcpus().add(i as usize)).block_nokick == 0)
                 };
                 if t0 != 0 && due {
-                    (*G_CPUS[i as usize]).block_since_ns = now;
+                    (**gcpus().add(i as usize)).block_since_ns = now;
                     if UNSTICK_LG.load(Ordering::Relaxed) != 0 {
                         libc::fprintf(
                             stderr(),
                             c"ocerz: UNSTICK[%d] kicking cpu#%u (blocked %llums) what=%d rip=%#llx\n"
                                 .as_ptr(),
                             libc::getpid(),
-                            (*G_CPUS[i as usize]).cpu_number,
+                            (**gcpus().add(i as usize)).cpu_number,
                             ((now - t0) / 1000000) as c_ulonglong,
-                            (*G_CPUS[i as usize]).block_what,
-                            (*G_CPUS[i as usize]).rip as c_ulonglong,
+                            (**gcpus().add(i as usize)).block_what,
+                            (**gcpus().add(i as usize)).rip as c_ulonglong,
                         );
                     }
-                    libc::pthread_kill(G_CPU_THREADS[i as usize], SIGEMT);
+                    libc::pthread_kill(*cputhreads().add(i as usize), SIGEMT);
                 }
-                let bs = (*G_CPUS[i as usize]).block_started_ns;
-                if bs != 0 && now > bs && now - bs > 5000000000 && UNSTICK_WARNED[i as usize] != bs
+                let bs = (**gcpus().add(i as usize)).block_started_ns;
+                if bs != 0
+                    && now > bs
+                    && now - bs > 5000000000
+                    && *((&raw mut UNSTICK_WARNED) as *mut u64).add(i as usize) != bs
                 {
-                    UNSTICK_WARNED[i as usize] = bs;
+                    *((&raw mut UNSTICK_WARNED) as *mut u64).add(i as usize) = bs;
                     libc::fprintf(
                         stderr(),
                         c"ocerz: BLOCKED[%d] cpu#%u trap=%d for %llus rip=%#llx a0=%#llx a1=%#llx a2=%#llx"
                             .as_ptr(),
                         libc::getpid(),
-                        (*G_CPUS[i as usize]).cpu_number,
-                        (*G_CPUS[i as usize]).block_what,
+                        (**gcpus().add(i as usize)).cpu_number,
+                        (**gcpus().add(i as usize)).block_what,
                         ((now - bs) / 1000000000) as c_ulonglong,
-                        (*G_CPUS[i as usize]).rip as c_ulonglong,
-                        (*G_CPUS[i as usize]).gpr[OCERZ_RDI] as c_ulonglong,
-                        (*G_CPUS[i as usize]).gpr[OCERZ_RSI] as c_ulonglong,
-                        (*G_CPUS[i as usize]).gpr[OCERZ_RDX] as c_ulonglong,
+                        (**gcpus().add(i as usize)).rip as c_ulonglong,
+                        (**gcpus().add(i as usize)).gpr[OCERZ_RDI] as c_ulonglong,
+                        (**gcpus().add(i as usize)).gpr[OCERZ_RSI] as c_ulonglong,
+                        (**gcpus().add(i as usize)).gpr[OCERZ_RDX] as c_ulonglong,
                     );
                     if !libc::getenv(c"OCERZ_BLOCKBT".as_ptr()).is_null() {
-                        let sp = (*G_CPUS[i as usize]).gpr[OCERZ_RSP];
-                        let mut fp = (*G_CPUS[i as usize]).gpr[5];
+                        let sp = (**gcpus().add(i as usize)).gpr[OCERZ_RSP];
+                        let mut fp = (**gcpus().add(i as usize)).gpr[5];
                         if sp != 0 && (sp & 7) == 0 && ocerz_addr_readable(sp) != 0 {
                             libc::fprintf(
                                 stderr(),
@@ -1205,12 +1228,12 @@ extern "C" fn ocerz_unstick_thread(_arg: *mut c_void) -> *mut c_void {
             {
                 if UNSTICK_BT_LATCHED == 0
                     && G_CPUS_N > 0
-                    && !(*G_CPUS[0]).btrace.is_null()
+                    && !(**gcpus().add(0)).btrace.is_null()
                     && AtomicI32::from_ptr(&raw mut G_BTRACE_REQ).load(Ordering::Acquire) != 0
                 {
                     UNSTICK_BT_LATCHED = 1;
                     for i in 0..G_CPUS_N {
-                        AtomicU32::from_ptr(&raw mut (*G_CPUS[i as usize]).btrace_mask)
+                        AtomicU32::from_ptr(&raw mut (**gcpus().add(i as usize)).btrace_mask)
                             .store(0, Ordering::Release);
                     }
                     let e = libc::getenv(c"OCERZ_BTRACE_DEPTH".as_ptr());
@@ -1220,7 +1243,7 @@ extern "C" fn ocerz_unstick_thread(_arg: *mut c_void) -> *mut c_void {
                         400
                     };
                     for i in 0..G_CPUS_N {
-                        let c = G_CPUS[i as usize];
+                        let c = *gcpus().add(i as usize);
                         if (*c).btrace.is_null() {
                             continue;
                         }
@@ -1236,7 +1259,7 @@ extern "C" fn ocerz_unstick_thread(_arg: *mut c_void) -> *mut c_void {
                             } else {
                                 0
                             }) as c_ulonglong,
-                            UNSTICK_BT_QUIET[i as usize],
+                            *((&raw mut UNSTICK_BT_QUIET) as *mut u32).add(i as usize),
                             bn,
                         );
                         let mut k = 1u32;
@@ -1288,12 +1311,12 @@ pub unsafe extern "C" fn ocerz_vm_request_exit(vm: *mut OcerzVM, code: c_int) {
         let self_ = pthread_self();
         libc::pthread_mutex_lock(&raw mut G_CPUS_LOCK);
         for i in 0..G_CPUS_N {
-            AtomicI32::from_ptr(&raw mut (*G_CPUS[i as usize]).interrupt)
+            AtomicI32::from_ptr(&raw mut (**gcpus().add(i as usize)).interrupt)
                 .store(1, Ordering::SeqCst);
         }
         for i in 0..G_CPUS_N {
-            if pthread_equal(G_CPU_THREADS[i as usize], self_) == 0 {
-                libc::pthread_kill(G_CPU_THREADS[i as usize], SIGEMT);
+            if pthread_equal(*cputhreads().add(i as usize), self_) == 0 {
+                libc::pthread_kill(*cputhreads().add(i as usize), SIGEMT);
             }
         }
         libc::pthread_mutex_unlock(&raw mut G_CPUS_LOCK);
@@ -1304,11 +1327,11 @@ unsafe fn vm_fatal_where(cpu: *const OcerzCPU) {
     unsafe {
         let mut at = [0u64; 13];
         let mut n = 0usize;
-        at[n] = (*cpu).rip;
+        *at.as_mut_ptr().add(n) = (*cpu).rip;
         n += 1;
         let mut fp = (*cpu).gpr[OCERZ_RBP];
         while n < 13 && fp >= 0x300000000 {
-            at[n] = ocerz_ld(fp + 8, 8);
+            *at.as_mut_ptr().add(n) = ocerz_ld(fp + 8, 8);
             n += 1;
             let nf = ocerz_ld(fp, 8);
             if nf <= fp {
@@ -1319,7 +1342,7 @@ unsafe fn vm_fatal_where(cpu: *const OcerzCPU) {
         libc::fprintf(stderr(), c"ocerz: where:".as_ptr());
         for k in 0..n {
             let mut base: u64 = 0;
-            let name = ocerz_dyld_name_for_addr(at[k], &mut base);
+            let name = ocerz_dyld_name_for_addr(*at.as_mut_ptr().add(k), &mut base);
             let leaf = if !name.is_null() {
                 libc::strrchr(name, '/' as c_int)
             } else {
@@ -1330,7 +1353,7 @@ unsafe fn vm_fatal_where(cpu: *const OcerzCPU) {
                     stderr(),
                     c" %s+%#llx".as_ptr(),
                     if !leaf.is_null() { leaf.add(1) } else { name },
-                    (at[k] - base) as c_ulonglong,
+                    (*at.as_mut_ptr().add(k) - base) as c_ulonglong,
                 );
             } else {
                 libc::fprintf(stderr(), c" ?".as_ptr());

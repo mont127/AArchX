@@ -26,8 +26,8 @@ pub(super) unsafe extern "C" fn ripdump_handler(
             {
                 let self_ = pthread_self();
                 for i in 0..G_CPUS_N {
-                    if pthread_equal(G_CPU_THREADS[i as usize], self_) == 0 {
-                        libc::pthread_kill(G_CPU_THREADS[i as usize], SIGUSR1);
+                    if pthread_equal(*cputhreads().add(i as usize), self_) == 0 {
+                        libc::pthread_kill(*cputhreads().add(i as usize), SIGUSR1);
                     }
                 }
             }
@@ -241,7 +241,7 @@ pub(super) unsafe extern "C" fn ripdump_handler(
         p = str_into(p, c"ocerz:   regs".as_ptr());
         for i in 0..16 {
             p = str_into(p, c" ".as_ptr());
-            p = str_into(p, RN[i]);
+            p = str_into(p, *(&raw const RN as *const *const c_char).add(i));
             p = str_into(p, c"=".as_ptr());
             p = hex_into(p, (*G_CUR_CPU).gpr[i]);
         }
@@ -408,8 +408,8 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                     static RANGES: [[u64; 2]; 2] =
                         [[0x100000000, 0x140000000], [0x7040000000, 0x7070000000]];
                     for ri in 0..2 {
-                        let mut page = RANGES[ri][0];
-                        while page < RANGES[ri][1] {
+                        let mut page = *RANGES.get_unchecked(ri).get_unchecked(0);
+                        while page < *RANGES.get_unchecked(ri).get_unchecked(1) {
                             if ocerz_addr_readable(page) != 0 {
                                 let mut off = 0u64;
                                 while off < 0x1000 {
@@ -467,8 +467,11 @@ pub(super) unsafe extern "C" fn ripdump_handler(
                                         );
                                         if w == inv1 && fl as u32 == 0xc3000002 {
                                             for rj in 0..2 {
-                                                let mut p2 = RANGES[rj][0];
-                                                while p2 < RANGES[rj][1] {
+                                                let mut p2 =
+                                                    *RANGES.get_unchecked(rj).get_unchecked(0);
+                                                while p2
+                                                    < *RANGES.get_unchecked(rj).get_unchecked(1)
+                                                {
                                                     if ocerz_addr_readable(p2) != 0 {
                                                         let mut o2 = 0u64;
                                                         while o2 < 0x1000 {
@@ -1414,7 +1417,7 @@ pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ct
                 }
                 let fault_dreg_v = FAULT_DREG.load(Ordering::Relaxed);
                 let fault_dumpval = if fault_dreg_v >= 0 && fault_dreg_v < 16 {
-                    (*G_CUR_CPU).gpr[fault_dreg_v as usize]
+                    *(*G_CUR_CPU).gpr.get_unchecked(fault_dreg_v as usize)
                 } else {
                     0
                 };
@@ -1721,7 +1724,7 @@ pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ct
                         g = str_into(g, c"ocerz:   gpr".as_ptr());
                         for i in 0..16 {
                             g = str_into(g, c" ".as_ptr());
-                            g = str_into(g, NM[i]);
+                            g = str_into(g, *(&raw const NM as *const *const c_char).add(i));
                             g = str_into(g, c"=".as_ptr());
                             g = hex_into(g, (*G_CUR_CPU).gpr[i]);
                         }
@@ -1737,11 +1740,11 @@ pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ct
                         static mut RN2: [*const c_char; 3] =
                             [c"rsi".as_ptr(), c"r12".as_ptr(), c"r11".as_ptr()];
                         for k in 0..3 {
-                            let b_ = (*G_CUR_CPU).gpr[REGS[k]];
+                            let b_ = *(*G_CUR_CPU).gpr.get_unchecked(*REGS.get_unchecked(k));
                             let mut mb = [0u8; 256];
                             let mut m = mb.as_mut_ptr() as *mut c_char;
                             m = str_into(m, c"ocerz:   mem[".as_ptr());
-                            m = str_into(m, RN2[k]);
+                            m = str_into(m, *(&raw const RN2 as *const *const c_char).add(k));
                             m = str_into(m, c"=".as_ptr());
                             m = hex_into(m, b_);
                             m = str_into(m, c"]:".as_ptr());
@@ -2274,7 +2277,7 @@ pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ct
                                         c" ".as_ptr()
                                     },
                                 );
-                                p = hex_into(p, w[i] as u64);
+                                p = hex_into(p, *w.as_ptr().add(i) as u64);
                                 if i == 47 {
                                     p = str_into(p, c"\n   ".as_ptr());
                                     write(
@@ -2312,7 +2315,7 @@ pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ct
                     let mut i = 0u64;
                     while i * 8 < got as u64 && i < 12 {
                         p = str_into(p, c" ".as_ptr());
-                        p = hex_into(p, w[i as usize]);
+                        p = hex_into(p, *w.as_ptr().add(i as usize));
                         i += 1;
                     }
                 }
@@ -2396,9 +2399,9 @@ pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ct
             p = str_into(p, c"  regs:".as_ptr());
             for i in 0..8 {
                 p = str_into(p, c" ".as_ptr());
-                p = str_into(p, RNM[i]);
+                p = str_into(p, *(&raw const RNM as *const *const c_char).add(i));
                 p = str_into(p, c"=".as_ptr());
-                p = hex_into(p, (*c).gpr[RI[i]]);
+                p = hex_into(p, *(*c).gpr.get_unchecked(*RI.get_unchecked(i)));
             }
             p = str_into(p, c"\n".as_ptr());
             write(
@@ -2620,7 +2623,7 @@ pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ct
                 if v >= 0x7ff802000000 && v < 0x7ff818000000 {
                     p = str_into(p, c" ".as_ptr());
                     p = hex_into(p, v);
-                    frames[shown] = v;
+                    *frames.as_mut_ptr().add(shown) = v;
                     shown += 1;
                 }
                 a += 8;
@@ -2633,17 +2636,17 @@ pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ct
             );
             for k in 0..shown {
                 let mut fb: u64 = 0;
-                let fn_ = ocerz_dyld_name_for_addr(frames[k], &mut fb);
+                let fn_ = ocerz_dyld_name_for_addr(*frames.as_mut_ptr().add(k), &mut fb);
                 if fn_.is_null() {
                     continue;
                 }
                 p = buf.as_mut_ptr() as *mut c_char;
                 p = str_into(p, c"    frame ".as_ptr());
-                p = hex_into(p, frames[k]);
+                p = hex_into(p, *frames.as_mut_ptr().add(k));
                 p = str_into(p, c" ".as_ptr());
                 p = str_into(p, fn_);
                 p = str_into(p, c"+".as_ptr());
-                p = hex_into(p, frames[k] - fb);
+                p = hex_into(p, *frames.as_mut_ptr().add(k) - fb);
                 p = str_into(p, c"\n".as_ptr());
                 write(
                     2,
@@ -2670,9 +2673,9 @@ pub(super) unsafe extern "C" fn crash_handler(sig: c_int, si: *mut siginfo_t, ct
                 p = str_into(p, c"  regs2:".as_ptr());
                 for i in 0..8 {
                     p = str_into(p, c" ".as_ptr());
-                    p = str_into(p, AN[i]);
+                    p = str_into(p, *(&raw const AN as *const *const c_char).add(i));
                     p = str_into(p, c"=".as_ptr());
-                    p = hex_into(p, (*c).gpr[AI[i]]);
+                    p = hex_into(p, *(*c).gpr.get_unchecked(*AI.get_unchecked(i)));
                 }
                 p = str_into(p, c"\n".as_ptr());
                 write(
@@ -2827,14 +2830,14 @@ pub(super) unsafe extern "C" fn threaddump_handler(
             G_CPUS_N,
         );
         for i in 0..G_CPUS_N {
-            let c = G_CPUS[i as usize];
+            let c = *gcpus().add(i as usize);
             if c.is_null() {
                 continue;
             }
             let mut tport: mach_port_t = 0;
             for k in 0..G_CPUS_N {
-                if G_CPUS[k as usize] == c {
-                    tport = pthread_mach_thread_np(G_CPU_THREADS[k as usize]);
+                if *gcpus().add(k as usize) == c {
+                    tport = pthread_mach_thread_np(*cputhreads().add(k as usize));
                     break;
                 }
             }
@@ -2867,8 +2870,8 @@ pub(super) unsafe extern "C" fn threaddump_handler(
                 (*c).nested_sig_handback,
             );
             for k in 0..G_CPUS_N {
-                if G_CPUS[k as usize] == c {
-                    hostsig_probe(c, G_CPU_THREADS[k as usize]);
+                if *gcpus().add(k as usize) == c {
+                    hostsig_probe(c, *cputhreads().add(k as usize));
                     break;
                 }
             }
@@ -2931,7 +2934,7 @@ pub(super) unsafe extern "C" fn threaddump_handler(
             let n = G_HSIG_N.load(Ordering::Relaxed);
             let mut k = if n > 512 { n - 512 } else { 0 };
             while k < n {
-                let e = &G_HSIG_RING[(k % 512) as usize];
+                let e = &(*hsig().add((k % 512) as usize));
                 libc::fprintf(
                     stderr(),
                     c"ocerz: HOSTSIGRX[%d] %10.1fms sig=%d tid=%#llx cpu=%p cpu#%d from=%d\n"
@@ -3003,7 +3006,7 @@ pub(super) unsafe extern "C" fn portdump_handler(
         {
             let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             for i in 0..G_CPUS_N {
-                let c = G_CPUS[i as usize];
+                let c = *gcpus().add(i as usize);
                 if c.is_null() {
                     continue;
                 }
@@ -3035,9 +3038,9 @@ pub(super) unsafe extern "C" fn portdump_handler(
                     libc::fprintf(
                         stderr(),
                         c" [id=%u port=%#x sz=%u]".as_ptr(),
-                        (*c).sendring_id[j as usize],
-                        (*c).sendring_port[j as usize],
-                        (*c).sendring_sz[j as usize],
+                        *(*c).sendring_id.get_unchecked(j as usize),
+                        *(*c).sendring_port.get_unchecked(j as usize),
+                        *(*c).sendring_sz.get_unchecked(j as usize),
                     );
                     k += 1;
                 }
@@ -3190,12 +3193,13 @@ pub(super) unsafe extern "C" fn portdump_handler(
             let mut before = [0u32; 64];
             let nb = if G_CPUS_N < 64 { G_CPUS_N } else { 64 };
             for i in 0..nb {
-                if !G_CPUS[i as usize].is_null() {
-                    before[i as usize] = (*G_CPUS[i as usize]).sig_host_rcvd[30];
+                if !(*gcpus().add(i as usize)).is_null() {
+                    *before.as_mut_ptr().add(i as usize) =
+                        (**gcpus().add(i as usize)).sig_host_rcvd[30];
                 }
             }
             for i in 0..nb {
-                let c = G_CPUS[i as usize];
+                let c = *gcpus().add(i as usize);
                 if c.is_null()
                     || (*c).host_pthread.is_null()
                     || pthread_equal((*c).host_pthread as libc::pthread_t, pthread_self()) != 0
@@ -3215,7 +3219,7 @@ pub(super) unsafe extern "C" fn portdump_handler(
             }
             libc::usleep(400000);
             for i in 0..nb {
-                let c = G_CPUS[i as usize];
+                let c = *gcpus().add(i as usize);
                 if c.is_null() {
                     continue;
                 }
@@ -3226,10 +3230,10 @@ pub(super) unsafe extern "C" fn portdump_handler(
                     libc::getpid(),
                     (*c).cpu_number,
                     (*c).host_kport,
-                    before[i as usize],
+                    *before.as_mut_ptr().add(i as usize),
                     (*c).sig_host_rcvd[30],
                     (*c).sig_delivered[30],
-                    if (*c).sig_host_rcvd[30] == before[i as usize]
+                    if (*c).sig_host_rcvd[30] == *before.as_mut_ptr().add(i as usize)
                         && !(*c).host_pthread.is_null()
                         && pthread_equal((*c).host_pthread as libc::pthread_t, pthread_self()) != 0
                     {
@@ -3312,11 +3316,11 @@ pub(super) unsafe extern "C" fn async_sig_handler(
             let k = (G_HSIG_N.fetch_add(1, Ordering::Relaxed) % 512) as usize;
             let mut tid: u64 = 0;
             pthread_threadid_np(0, &mut tid);
-            G_HSIG_RING[k].t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            G_HSIG_RING[k].tid = tid;
-            G_HSIG_RING[k].cpu = G_CUR_CPU;
-            G_HSIG_RING[k].sig = sig;
-            G_HSIG_RING[k].pid_from = if !si.is_null() { (*si).si_pid } else { -1 };
+            (*hsig().add(k)).t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            (*hsig().add(k)).tid = tid;
+            (*hsig().add(k)).cpu = G_CUR_CPU;
+            (*hsig().add(k)).sig = sig;
+            (*hsig().add(k)).pid_from = if !si.is_null() { (*si).si_pid } else { -1 };
         }
         if sig > 0 && sig < 32 {
             let c = G_CUR_CPU;
