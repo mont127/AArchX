@@ -13,7 +13,7 @@ as `//!` doc comments.
 `g_cur_insns_fwd`, `emit_v_ld_at_`, `stack_plain_ok`, `vec_tso_relaxed`,
 `insn_may_write_gpr`, `ea_cache_usable`, `emit_cmpxchg8b`,
 `emit_commpage_guard`, `emit_gpr_ld_at`, `emit_gpr_lds_at`, `emit_gpr_st_at`,
-`emit_guard_arms`, `emit_guest_load_ordered`, `emit_guest_load_ordered`,
+`emit_guard_arms`, `emit_guest_load_ordered`, `emit_guest_store_ordered`,
 `emit_low_hoist_bail`, `emit_low_hoist_check`, `emit_mem_ea`,
 `emit_mem_ea_plain_ex`, `emit_mem_load_plain`, `emit_mov_mem`, `emit_movx`,
 `emit_ordered_slow_arms`, `emit_plain_mem_fast`, `emit_reload_mem_base`,
@@ -22,25 +22,30 @@ as `//!` doc comments.
 `select_low_hoist`, `stack_identity`.
 
 Shared state (`#[unsafe(no_mangle)] pub static mut`, exact bindgen types and C
-initializers): `g_mem_hoist_greg`, `g_low_hoist_greg`,
-`g_mem_hoist_aux_index`, `g_mem_hoist_greg2`, `g_mem_hoist_greg3`,
-`g_mem_hoist_scale`, `g_mem_hoist_base`, `g_mem_hoist_aux`,
-`g_mem_hoist_greg_map`, `g_undo_want_slot`, `g_undo_*`, `g_ea_cache`
-(`JitState_g_ea_cache`), `g_lowhoist_marks` (`MarkSet`), `g_fpbmap[256]` +
-`g_n_fpbmap`, `g_al_marks`/`g_cp_marks[262144]`, `g_no_ldapr`, plus the
-`-1`-initialized hoisting registers.
+initializers, `-1` where C had it): `g_al_all`, `g_al_marks`, `g_al_n`,
+`g_align_guard`, `g_blk_ordered_loads`, `g_cp_guard`, `g_cp_marks`,
+`g_ea_cache` (`JitState_g_ea_cache`), `g_ea_is_const`, `g_ea_lowhoisted`,
+`g_fpbmap` + `g_n_fpbmap`, `g_low_hoist_greg`, `g_low_top`,
+`g_lowhoist_marks` (`MarkSet`), `g_lowstack`, `g_mem_hoist_aux_disp`,
+`g_mem_hoist_aux_index`, `g_mem_hoist_aux_scale`, `g_mem_hoist_greg`,
+`g_mem_hoist_greg2`, `g_mem_hoist_greg3`, `g_n_garm`, `g_n_low_hoist_bail`,
+`g_n_oslow`, `g_no_ldapr`, `g_no_oolslow`, `g_plain_mem`, `g_undo_saved`,
+`g_undo_want_size`, `g_undo_want_slot`.
 
-Private file-scope state (`static mut`): `g_const_ea*`, `g_ea_const`,
-`g_ea_w32`, `g_oslow[OSLOW_MAX]` + `g_n_oslow`, `g_garm[GUARD_ARMS_MAX]` +
-`g_n_garm`, `g_ea_lowhoisted_reg`, `g_low_hoist_*` fields. `g_garm`'s
-anonymous C struct became a private `#[repr(C)] struct Garm`. `g_oslow`,
-`g_fpbmap`, `g_garm` are filled by this module but read by core `jit.c`/`jit_*`
-through the C ABI — ownership per jit-split.md is export-for-use, not private.
+Private file-scope state (`static mut`, not exported): `g_const_ea`,
+`g_const_ea_valid`, `g_ea_const`, `g_ea_lowhoisted_reg`, `g_ea_w32`,
+`g_garm`, `g_low_hoist_bail`, `g_low_hoist_hi`, `g_low_hoist_lo`,
+`g_low_hoist_until`, `g_oslow`. `g_garm`'s anonymous C struct became a
+private `#[repr(C)] struct Garm`. Other pieces only see the counters
+(`g_n_oslow`, `g_n_garm`, `g_n_low_hoist_bail`); the tables themselves are
+drained here by `emit_ordered_slow_arms`, `emit_guard_arms` and
+`emit_low_hoist_bail`.
 
 ## No C shim
 
 Nothing in the file needed `src/jit_memory_shim.c`: no setjmp/longjmp, no
-thread-local storage, no special calling conventions, no compound literal
+thread-local storage of its own (the header's JIT TLS comes via
+`crate::jit_internal`), no special calling conventions, no compound literal
 that couldn't be expressed field-by-field, no `static` globals shared across
 TUs. `goto fold_disp` and `goto generic` restructured to flags/guards
 (`fold_now`, `aux_disp_ok == 0`) preserving emission order.
@@ -72,9 +77,10 @@ TUs. `goto fold_disp` and `goto generic` restructured to flags/guards
   c_char`) — never `"...".as_ptr()`.
 - The emission-audit reference worktree must be at `16a7c2d` or later (the
   audit hook landed there); `cac4b33` is too old.
-- `g_oslow`/`g_fpbmap`/`g_garm`/`g_ea_cache` are owned here but consumed by
-  core `jit.c` — keep them `#[no_mangle]` (or private only when the C was
-  private) with exact bindgen layouts.
+- Shared state here is read and reset by core `jit.c` and the other pieces
+  (`g_ea_cache`, `g_fpbmap`, the `g_n_*` counters, the hoist registers): keep
+  it `#[no_mangle]` with exact bindgen layouts. Only what C had file-`static`
+  (`g_oslow`, `g_garm`, ...) is private.
 - Calls into not-yet-ported pieces (`emit_const_lit`, `emit_slowcall`,
   `emit_materialize`, `emit_cc_predicate_ex`, `oolslow_add`, `a64_*` etc.)
   go through `crate::ffi`, not direct Rust calls — modules switch over one at
