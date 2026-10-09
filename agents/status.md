@@ -28,7 +28,7 @@
 | jit_simd.c | 3121 | jit-simd-agent | in progress |
 | jit_tcache.c | 1063 | jit-tcache-agent | ported |
 | loader.c | 378 | runtime (ee47e957) | ported |
-| main.c | 419 | runtime (ee47e957) | in progress |
+| main.c | 419 | runtime (ee47e957) | ported |
 | mem.c | 2342 | memvm | ported |
 | objcbridge.c | 3543 | native2 | ported |
 | objcclass.c | 1609 | native2 | ported |
