@@ -1557,16 +1557,16 @@ unsafe fn emit_x87_one(
                 let mut tk = [0i8; 8];
                 let mut xk = [0i8; 8];
                 for k in 0..8 {
-                    tk[k] = *tagk(k);
-                    xk[k] = *xokk(k);
+                    *tk.get_unchecked_mut(k) = *tagk(k);
+                    *xk.get_unchecked_mut(k) = *xokk(k);
                 }
                 x87_copy(b, X87P, JT0, x87_rel(0), x87_rel(i));
                 if !skip.is_null() {
                     for k in 0..8 {
-                        if tk[k] != *tagk(k) {
+                        if *tk.get_unchecked_mut(k) != *tagk(k) {
                             *tagk(k) = 0;
                         }
-                        if xk[k] != *xokk(k) {
+                        if *xk.get_unchecked_mut(k) != *xokk(k) {
                             *xokk(k) = 0;
                         }
                     }
@@ -1712,8 +1712,8 @@ unsafe fn x87_run_open(b: *mut ffi::A64Buf, idx: c_int) -> c_int {
         (*r).last = last as i16;
         (*r).back = core::ptr::null_mut();
         for k in 0..16usize {
-            (*r).l0[k] = *(&raw const g_l0).cast::<i8>().add(k);
-            (*r).l0_dbl[k] = *(&raw const g_l0_dbl).cast::<u8>().add(k);
+            *(*r).l0.get_unchecked_mut(k) = *(&raw const g_l0).cast::<i8>().add(k);
+            *(*r).l0_dbl.get_unchecked_mut(k) = *(&raw const g_l0_dbl).cast::<u8>().add(k);
         }
         (*r).l0_dirty = g_l0_dirty;
         (*r).yc_dirty = g_yc_dirty;
@@ -1827,7 +1827,7 @@ pub unsafe extern "C" fn emit_x87(
             g_x87_spec_cut = 0;
             (*r).lv_end = g_x87_lv;
             for p in 0..8 {
-                (*r).lmap[p] = *lane(p);
+                *(*r).lmap.get_unchecked_mut(p) = *lane(p);
             }
             if g_x87_live != 0 && g_x87_spec >= 0 {
                 g_x87_btop = (g_x87_spec + g_x87_delta) & 7;
@@ -1940,11 +1940,11 @@ unsafe fn x87_emit_frag(b: *mut ffi::A64Buf, f: c_int) {
                     &mut nok,
                 );
                 for k in 0..nok {
-                    ffi::a64_patch_bcond(ok[k as usize], ffi::a64_label(b));
+                    ffi::a64_patch_bcond(*ok.get_unchecked_mut(k as usize), ffi::a64_label(b));
                 }
                 ffi::a64_b(b, back.offset_from(ffi::a64_label(b)) as i32);
                 for k in 0..np {
-                    ffi::a64_patch_bcond(pe[k as usize], ffi::a64_label(b));
+                    ffi::a64_patch_bcond(*pe.get_unchecked_mut(k as usize), ffi::a64_label(b));
                 }
                 ffi::a64_try_orr_imm(b, 1, X87S, X87S, XS_PE);
                 ffi::a64_str(b, 8, X87S, 20, X87_CTL_OFF);
@@ -1982,14 +1982,14 @@ unsafe fn x87_emit_frag(b: *mut ffi::A64Buf, f: c_int) {
                 ffi::a64_b(b, 0);
                 ffi::a64_patch_cbz(cut, ffi::a64_label(b));
                 for k in 0..np {
-                    ffi::a64_patch_bcond(pe[k as usize], ffi::a64_label(b));
+                    ffi::a64_patch_bcond(*pe.get_unchecked_mut(k as usize), ffi::a64_label(b));
                 }
                 ffi::a64_try_orr_imm(b, 1, X87S, X87S, XS_PE);
                 ffi::a64_str(b, 8, X87S, 20, X87_CTL_OFF);
                 ffi::a64_patch_bcond(known, ffi::a64_label(b));
                 ffi::a64_patch_b(exact, ffi::a64_label(b));
                 for k in 0..nok {
-                    ffi::a64_patch_bcond(ok[k as usize], ffi::a64_label(b));
+                    ffi::a64_patch_bcond(*ok.get_unchecked_mut(k as usize), ffi::a64_label(b));
                 }
                 ffi::a64_ubfx(b, 1, JTT, JT0, 29, 1);
                 ffi::a64_add_reg(b, 1, JT0, JT0, JTT, 0);
@@ -2069,7 +2069,7 @@ pub unsafe extern "C" fn emit_x87_arms(
                         entry = ffi::a64_label(b);
                         ffi::a64_movz(b, JT0, k as u16, 0);
                         ffi::a64_str(b, 8, JT0, 20, JIT_SCRATCH_OFF);
-                        to_common[nc as usize] = ffi::a64_label(b);
+                        *to_common.get_unchecked_mut(nc as usize) = ffi::a64_label(b);
                         nc += 1;
                         ffi::a64_b(b, 0);
                     }
@@ -2080,7 +2080,7 @@ pub unsafe extern "C" fn emit_x87_arms(
                 continue;
             }
             for c in 0..nc {
-                ffi::a64_patch_b(to_common[c], ffi::a64_label(b));
+                ffi::a64_patch_b(*to_common.get_unchecked_mut(c), ffi::a64_label(b));
             }
             g_cur_insn_idx = (*run_).first as c_int;
             emit_l0_flush_from(
@@ -2123,12 +2123,14 @@ pub unsafe extern "C" fn emit_x87_arms(
             }
             emit_l0_reload_from(b, (*run_).l0.as_ptr(), (*run_).l0_dbl.as_ptr());
             for p in 0..8usize {
-                if !(*run_).back.is_null() && ((*run_).lv_end >> p & 1) != 0 && (*run_).lmap[p] >= 0
+                if !(*run_).back.is_null()
+                    && ((*run_).lv_end >> p & 1) != 0
+                    && *(*run_).lmap.get_unchecked_mut(p) >= 0
                 {
                     ffi::a64_ldr_v(
                         b,
                         8,
-                        (*run_).lmap[p] as c_int,
+                        *(*run_).lmap.get_unchecked_mut(p) as c_int,
                         20,
                         X87_FPR_OFF + 8 * p as u32,
                     );

@@ -46,8 +46,6 @@ The `OCERZ_FPB_DBGPRINT` fprintf goes through `libc::fprintf` on
 
 - The two anonymous-struct state tables (`g_x87_site`, `g_x87_frag`) are named
   private structs — same fields, same order, same element size.
-- `l0_alloc2`'s `g_l0_next++ % g_l0_nlanes` uses wrapping i32 remainder (C's
-  signed `%` semantics on nonnegatives).
 - The `OCERZ_FPB_DBGRIP` debug block keeps its lazy-init semantics; `getenv`d
   values are cached in per-site `static mut`s.
 
