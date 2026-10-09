@@ -98,7 +98,6 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::ffi::*;
 use crate::jit_internal::*;
-use core::ffi::CStr;
 use core::mem::offset_of;
 
 const JT0: c_int = crate::ffi::JT0 as c_int;
@@ -1149,8 +1148,8 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
     g_n_jcc_edges = 0;
     g_nzcv_want = 0;
     g_nzcv_from = -1;
-    (*(&raw mut g_jcc_edge))[0].cond_site = null_mut();
-    (*(&raw mut g_jcc_edge))[1].cond_site = null_mut();
+    ga!(g_jcc_edge, 0).cond_site = null_mut();
+    ga!(g_jcc_edge, 1).cond_site = null_mut();
     g_n_oslow = 0;
     g_n_garm = 0;
     g_n_nanool = 0;
@@ -2118,7 +2117,7 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
             scalar_pend_flush(bp);
         }
         g_fpb_open = fpb_open;
-        g_fpb_fast = (fpb_open >= 0 && (*(&raw const g_fpb_member))[iu] != 0) as c_int;
+        g_fpb_fast = (fpb_open >= 0 && ga!(g_fpb_member, iu) != 0) as c_int;
         ea_cache_step(insn, if i > 0 { ins.add(iu - 1) } else { null() });
         g_nzcv_want = 0;
         let mut j = i + 1;
@@ -2275,7 +2274,7 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
             let cond = if g_cc_direct >= 0 { g_cc_direct } else { A64_NE as c_int };
             if g_n_side < SIDE_MAX as c_int {
                 let sd = (&raw mut g_side).cast::<JitState_g_side>().add(g_n_side as usize);
-                let sidechk = (*(&raw const g_fpb_sidechk))[iu];
+                let sidechk = ga!(g_fpb_sidechk, iu);
                 (*sd).site = a64_label(bp);
                 (*sd).taken = ir.ops[0].imm;
                 (*sd).idx = i as _;
@@ -2586,7 +2585,7 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
                 break 'body;
             }
         }
-        if (*(&raw const g_mov_skip))[iu] != 0 {
+        if ga!(g_mov_skip, iu) != 0 {
             if !(*blk).insn_off.is_null() {
                 *(*blk).insn_off.add(iu) = (*bp).p.offset_from(entry) as u32;
             }
@@ -2594,25 +2593,25 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
             break 'body;
         }
         let in_fpb = fpb_open >= 0 && *fpb_of.add(iu) as c_int == fpb_open;
-        if in_fpb && (*(&raw const g_fpb_stchk))[iu] != 0 {
+        if in_fpb && ga!(g_fpb_stchk, iu) != 0 {
             fpb_emit_store_check(bp, i, fpb_open);
         }
-        if in_fpb && (*(&raw const g_fpb_undo))[iu] != 0 && (*(&raw const g_fpb_undo_done))[iu] == 0 {
+        if in_fpb && ga!(g_fpb_undo, iu) != 0 && ga!(g_fpb_undo_done, iu) == 0 {
             fpb_emit_undo_save(bp, insn, i, exit_sites, &mut n_exits);
         }
         g_undo_want_slot = -1;
         g_undo_saved = 0;
-        if i + 1 < n && (*(&raw const g_mov_skip))[iu + 1] == 0 && emit_mov128_pair(bp, insn, ins.add(iu + 1), i) != 0 {
+        if i + 1 < n && ga!(g_mov_skip, iu + 1) == 0 && emit_mov128_pair(bp, insn, ins.add(iu + 1), i) != 0 {
             (*blk).n_inlined += 1;
             break 'body;
         }
-        if i + 1 < n && (*(&raw const g_mov_skip))[iu + 1] == 0 && emit_stack_pair(bp, ir, &*ins.add(iu + 1), i) != 0 {
+        if i + 1 < n && ga!(g_mov_skip, iu + 1) == 0 && emit_stack_pair(bp, ir, &*ins.add(iu + 1), i) != 0 {
             (*blk).n_inlined += 1;
             break 'body;
         }
-        if in_fpb && (*(&raw const g_fpb_undo_ld))[iu] != 0 {
-            g_undo_want_slot = (*(&raw const g_fpb_undo_ld))[iu] as c_int - 1;
-            g_undo_want_size = (*(&raw const g_fpb_undo_ldsz))[iu] as _;
+        if in_fpb && ga!(g_fpb_undo_ld, iu) != 0 {
+            g_undo_want_slot = ga!(g_fpb_undo_ld, iu) as c_int - 1;
+            g_undo_want_size = ga!(g_fpb_undo_ldsz, iu) as _;
         }
         if try_inline(bp, insn, *fl_need.add(iu), exit_sites, &mut n_exits) == 0 {
             emit_slowcall(bp, insn, exit_sites, &mut n_exits);
@@ -2620,8 +2619,8 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
         } else {
             (*blk).n_inlined += 1;
         }
-        if g_undo_saved != 0 && (*(&raw const g_fpb_undo_ldst))[iu] >= 0 {
-            (*(&raw mut g_fpb_undo_done))[(*(&raw const g_fpb_undo_ldst))[iu] as usize] = 1;
+        if g_undo_saved != 0 && ga!(g_fpb_undo_ldst, iu) >= 0 {
+            ga!(g_fpb_undo_done, ga!(g_fpb_undo_ldst, iu) as usize) = 1;
         }
         g_undo_want_slot = -1;
         g_undo_saved = 0;
@@ -3110,7 +3109,7 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
     let edges = (*blk).edges;
     if g_n_call_edges != 0 {
         for i in 0..g_n_call_edges as usize {
-            let ce = &(*(&raw const g_call_edge))[i];
+            let ce = &ga!(g_call_edge, i);
             (*edges.add(i)).target_rip = ce.target_rip;
             (*edges.add(i)).patch_b = ce.patch_b;
             (*edges.add(i)).cond_site = null_mut();
@@ -3127,7 +3126,7 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
         (*blk).n_edges = 1;
     } else if g_n_jcc_edges != 0 {
         for i in 0..g_n_jcc_edges as usize {
-            let je = &(*(&raw const g_jcc_edge))[i];
+            let je = &ga!(g_jcc_edge, i);
             (*edges.add(i)).target_rip = je.target_rip;
             (*edges.add(i)).patch_b = je.patch_b;
             (*edges.add(i)).cond_site = je.cond_site;
