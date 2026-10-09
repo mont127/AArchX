@@ -104,6 +104,7 @@ use core::sync::atomic::{
 };
 
 use crate::ffi;
+use crate::inline::VM_INHERIT_DEFAULT;
 use crate::ported::globals::{ocerz_critical_depth, ocerz_mode};
 use crate::{ocerz_fatal, ocerz_log};
 
@@ -124,7 +125,6 @@ const KERN_SUCCESS: KernReturn = 0;
 const VM_PROT_READ: VmProt = 1;
 const VM_FLAGS_FIXED: c_int = 0;
 const VM_FLAGS_OVERWRITE: c_int = 0x4000;
-const VM_INHERIT_DEFAULT: libc::vm_inherit_t = 1;
 const VM_REGION_BASIC_INFO_64: c_int = 9;
 const MACH_PORT_NULL: MachPort = 0;
 const VM_REGION_SUBMAP_SHORT_INFO_COUNT_64: MachMsgTypeNumber = 12;
