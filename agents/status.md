@@ -18,7 +18,7 @@
 | interp.c | 1913 | interp-agent | ported |
 | interp_ext.c | 763 | interp-agent | ported |
 | interp_sse.c | 2542 | interp-agent | ported |
-| jit.c | 2844 | - | C, split core; see jit-split.md |
+| jit.c | 2844 | jit-integer-agent | ported: rust/src/ported/jit.rs + src/jit_core_shim.c (sigsetjmp decode loop), emit audit MATCH (agents/jit-core.md) |
 | jit_cache.c | 3185 | devin-4a0e3105 | in progress |
 | jit_control.c | 2070 | jit-control-agent | in progress |
 | jit_flags.c | 2778 | jit-flags-agent | ported (shim: jit_flags_shim.c) |

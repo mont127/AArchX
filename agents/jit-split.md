@@ -82,6 +82,12 @@ It does not enable this cfg in normal builds. The runtime environment variable
 even in instrumented executables. Normal C/Rust builds contain **no audit
 call or branch**, no environment lookup, and no linked writer.
 
+The Rust core (`rust/src/ported/jit.rs`) keeps the call in this position
+behind `#[cfg(ocerz_jit_emit_audit)]`. The runner's existing Rust-core branch
+(it checks for `rust/src/ported/jit.rs` or `jit/mod.rs` and builds the cfg'd
+archive) builds and audits it unchanged, so the tool needed no edit; a normal
+`ocerz` has no `ocerz_jit_emit_audit` reference (`nm ocerz`).
+
 Tool checks: `python3 -B -m unittest discover -s tools/jit_emit_audit` and
 `bash -n tools/jit_emit_audit.sh`. Integration against `cac4b33` reproduces
 **215,295 blocks / 145,523,525 arm64 words**. This is the original i386 corpus,
