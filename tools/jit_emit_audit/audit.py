@@ -8,8 +8,9 @@ archive. Neither tree's sources nor normal objects are replaced. Sequential
 offset/low runs force fresh roundtrip translations and discard ambient OCERZ
 tuning knobs. Files are streamed, never loaded wholesale into memory.
 
-Only validated relocation payloads are masked. Ordering, guest addresses,
-instruction boundaries, relocation descriptors/arguments and all other code
+Only validated relocation payloads are masked. The i386 streams compare in
+order; x64 compares per-RIP variant sets through the companion x64 module.
+Instruction boundaries, relocation descriptors/arguments and all other code
 bits must agree. Disassembly text is diagnostic, not an equality criterion.
 Exit 0 means MATCH, 1 means MISMATCH, 2 means an incomplete/invalid oracle run.
 """
@@ -98,10 +99,11 @@ def records(path):
 def normalized(block):
     code = bytearray(block.code)
     occupied = set()
-    for off, kind, form, _arg in block.relocs:
-        if form not in (0, 1) or not 1 <= kind <= 11:
+    for off, kind, form, arg in block.relocs:
+        native = kind == 128 and form == 2 and arg & 0xffffffff == 1 and 1 <= arg >> 32 <= 4
+        if not native and (form not in (0, 1) or not 1 <= kind <= 11):
             raise AuditError(f"{block.rip:#x}: unsupported relocation {kind}/{form}")
-        width = 2 if form == 1 else 4
+        width = arg >> 32 if native else (2 if form == 1 else 4)
         if (off + width) * 4 > len(code):
             raise AuditError(f"{block.rip:#x}: relocation outside code at word {off}")
         span = set(range(off, off + width))
@@ -111,12 +113,19 @@ def normalized(block):
         if form == 1:
             code[off * 4:(off + 2) * 4] = bytes(8)
         else:
-            words = struct.unpack_from("<4I", code, off * 4)
+            words = struct.unpack_from(f"<{width}I", code, off * 4)
+            prev_shift = 0
             for i, word in enumerate(words):
-                shape = 0xD2800000 if i == 0 else 0xF2800000 | (i << 21)
+                shift = (word >> 21) & 3 if native else i
+                if native and ((i == 0 and shift != 0) or (i and shift <= prev_shift)):
+                    raise AuditError(f"{block.rip:#x}: malformed native relocation at {off}")
+                prev_shift = shift
+                shape = 0xD2800000 if i == 0 else 0xF2800000 | (shift << 21)
                 if word & 0xFFE00000 != shape or word & 31 != words[0] & 31:
                     raise AuditError(f"{block.rip:#x}: malformed MOVZ/MOVK relocation at {off}")
                 struct.pack_into("<I", code, (off + i) * 4, word & ~0x1FFFE0)
+            if native and (words[0] & 31 != 16 or code[(off + width) * 4:(off + width + 1) * 4] != b"\x00\x02\x3f\xd6"):
+                raise AuditError(f"{block.rip:#x}: malformed native call at {off}")
     return bytes(code)
 
 
@@ -182,6 +191,27 @@ def run(command, tree, log, env=None, timeout=600):
         raise AuditError(f"command exited {result.returncode}; see {log}")
 
 
+def instrument(source):
+    if "ocerz_jit_emit_audit(" not in source:
+        needle = "    int tc_save = 0;"
+        if source.count(needle) != 1:
+            raise AuditError("cannot find the pre-tc_bind audit point in src/jit.c")
+        source = source.replace(needle, HOOK + needle)
+    if "ocerz_jit_emit_audit_begin(" not in source:
+        needle = "    A64Buf b = { jit->code_cur, jit->code_cur, jit->code_end, 0, 0 };"
+        if source.count(needle) != 1:
+            raise AuditError("cannot find the audit alignment point in src/jit.c")
+        source = source.replace(needle, "#ifdef OCERZ_JIT_EMIT_AUDIT\n"
+                                "    int audit_x64 = ocerz_jit_emit_audit_begin(jit);\n"
+                                "#endif\n" + needle)
+        needle = "    g_tc_on = (g_tc_rec || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP) ? tc_usable(jit) : 0;"
+        if source.count(needle) != 1:
+            raise AuditError("cannot find the audit relocation point in src/jit.c")
+        source = source.replace(needle, needle + "\n#ifdef OCERZ_JIT_EMIT_AUDIT\n"
+                                "    if (audit_x64) g_tc_on = 1;\n#endif")
+    return DECL + "extern int ocerz_jit_emit_audit_begin(OcerzJit *);\n" + source
+
+
 def build(tree, work, corpus):
     work.mkdir()
     log = work / "build.log"
@@ -198,14 +228,8 @@ def build(tree, work, corpus):
     flags = ["clang", "-arch", "arm64", "-std=c11", "-O2", "-g", "-Wall", "-Wextra",
              "-Wno-unused-parameter", "-Iinclude"]
     if "src/jit.o" in objects:
-        source = (tree / "src/jit.c").read_text()
-        if "ocerz_jit_emit_audit(" not in source:
-            needle = "    int tc_save = 0;"
-            if source.count(needle) != 1:
-                raise AuditError(f"{tree}: cannot find the pre-tc_bind audit point in src/jit.c")
-            source = source.replace(needle, HOOK + needle)
         instrumented = work / "jit.c"
-        instrumented.write_text(DECL + source)
+        instrumented.write_text(instrument((tree / "src/jit.c").read_text()))
         obj = work / "jit.o"
         run(flags + ["-DOCERZ_JIT_EMIT_AUDIT=1", "-c", instrumented, "-o", obj], tree, log)
         objects[objects.index("src/jit.o")] = str(obj)
@@ -224,6 +248,7 @@ def build(tree, work, corpus):
     run(flags + ["-Werror", "-c", HERE / "writer.c", "-o", writer], tree, log)
     binary = work / "diff32"
     run(flags + ["-o", binary, corpus] + objects + [writer], tree, log)
+    run(flags + ["-o", work / "ocerz", "src/main.o"] + objects + [writer], tree, log)
     return binary
 
 
@@ -252,6 +277,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reference_tree", type=Path)
     parser.add_argument("candidate_tree", type=Path, nargs="?", default=HERE.parent.parent)
+    parser.add_argument("--corpus", choices=("i386", "x64", "all"), default="all")
     args = parser.parse_args(argv)
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         parser.error("the emission audit requires arm64 macOS")
@@ -277,7 +303,7 @@ def main(argv=None):
             binaries.append(build(tree, work / name, corpus))
         examples, errors = [], []
         count = mismatches = words = 0
-        for layout in ("offset", "low"):
+        for layout in (("offset", "low") if args.corpus != "x64" else ()):
             paths = []
             for (name, tree), binary in zip((("reference", reference), ("candidate", candidate)), binaries):
                 print(f"Running {name} {layout}", file=sys.stderr)
@@ -289,14 +315,21 @@ def main(argv=None):
             count += n
             mismatches += bad
             words += nw
+        if args.corpus != "i386":
+            from x64 import audit_x64
+            n, bad, nw, xerrors = audit_x64(reference, candidate, work, examples)
+            count += n
+            mismatches += bad
+            words += nw
+            errors.extend(xerrors)
         if mismatches:
-            print(f"MISMATCH: {mismatches}/{count} blocks differ (offset + low, seed=1)")
+            print(f"MISMATCH: {mismatches}/{count} blocks differ (corpus={args.corpus})")
             diagnostics(examples)
-            result = 1
+            result = 2 if errors else 1
         elif errors:
             raise AuditError("; ".join(errors))
         else:
-            print(f"MATCH: {count} blocks, {words} arm64 words (offset + low, seed=1; relocation payloads masked)")
+            print(f"MATCH: {count} blocks, {words} arm64 words (corpus={args.corpus}; relocation payloads masked)")
             result = 0
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
@@ -312,4 +345,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    sys.modules["audit"] = sys.modules[__name__]
     sys.exit(main())

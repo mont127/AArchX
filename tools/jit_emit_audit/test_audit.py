@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from audit import AuditError, Block, HEADER, HERE, INSN, MAGIC, RELOC, compare, diagnostics, main, normalized, records
+from x64 import block_sets, cache_coverage, compare_sets
 
 
 def block(address=0x1122334455667788, register=3):
@@ -132,7 +133,7 @@ class AuditTests(unittest.TestCase):
                     patch("audit.corpus_run", return_value=(record, "corpus failed")), \
                     patch.dict(os.environ, {"OCERZ_JIT_AUDIT_DIR": tmp}), \
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                result = main([str(HERE.parent.parent)])
+                result = main([str(HERE.parent.parent), "--corpus", "i386"])
             self.assertEqual(result, 2)
             self.assertNotIn("MATCH", out.getvalue())
             self.assertIn("corpus failed", err.getvalue())
@@ -146,6 +147,63 @@ class AuditTests(unittest.TestCase):
                     contextlib.redirect_stderr(out):
                 self.assertEqual(main([str(HERE.parent.parent)]), 2)
             self.assertIn("cannot create audit directory", out.getvalue())
+
+    def compare_sets(self, left, right):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = [Path(tmp) / "reference", Path(tmp) / "candidate"]
+            for path, blocks in zip(paths, (left, right)):
+                path.write_bytes(MAGIC + b"".join(map(encode, blocks)))
+            examples = []
+            return compare_sets(*(block_sets([p]) for p in paths), examples, "x64"), examples
+
+    def test_x64_ignores_order_multiplicity_and_relocation_payloads(self):
+        other = block(register=7)
+        result, examples = self.compare_sets([block(), other, block()], [other, block(address=123)])
+        self.assertEqual(result, (2, 0, 14))
+        self.assertEqual(examples, [])
+
+    def test_x64_does_not_ignore_extra_or_missing_variants(self):
+        for left, right in (([block(), block(register=7)], [block()]),
+                            ([block()], [block(), block(register=7)])):
+            self.assertEqual(self.compare_sets(left, right)[0][:2], (2, 1))
+
+    def test_x64_instruction_and_metadata_changes_are_not_masked(self):
+        for attr, value in (("code", block().code[:-4] + struct.pack("<I", 0xD503203F)),
+                            ("insns", ((0x204000, 2, "nop"),)),
+                            ("relocs", ((0, 1, 0, 3), (4, 11, 1, 0x204040)))):
+            right = block()
+            setattr(right, attr, value)
+            result, examples = self.compare_sets([block()], [right])
+            self.assertEqual(result[:2], (1, 1))
+            self.assertIsNotNone(examples[0][3])
+            self.assertIsNotNone(examples[0][4])
+
+    def test_x64_missing_stream_is_an_error(self):
+        with self.assertRaises(AuditError):
+            block_sets([])
+
+    def test_only_one_sided_shared_cache_rips_can_be_coverage_noise(self):
+        common = {0x7ff802001000: {b"variant": block()}}
+        left = {**common, 0x7ff802001010: {b"variant": block()}, 0x100000010: {b"guest": block()}}
+        right = {**common, 0x7ff802001020: {b"variant": block()}}
+        (a, b), coverage = cache_coverage(left, right)
+        self.assertEqual(coverage, [[0x7ff802001010], [0x7ff802001020]])
+        self.assertIn(0x100000010, a)
+        self.assertIn(0x7ff802001000, a)
+        self.assertIn(0x7ff802001000, b)
+        self.assertEqual(compare_sets(a, b, [], "x64")[1], 1)
+
+    def test_native_fastcall_only_masks_validated_pointer_payload(self):
+        a = Block(0x204000, struct.pack("<4I", 0xd2800010, 0xf2a00010, 0xf2c00030, 0xd63f0200),
+                  ((0, 128, 2, (3 << 32) | 1),), block().insns)
+        b = Block(a.rip, struct.pack("<4I", 0xd2855550, 0xf2a66670, 0xf2c00030, 0xd63f0200), a.relocs, a.insns)
+        self.assertEqual(normalized(a), normalized(b))
+        for code, relocs in ((a.code[:-4] + bytes(4), a.relocs),
+                             (a.code, ((0, 128, 2, (3 << 32) | 2),)),
+                             (a.code, ((0, 128, 2, (5 << 32) | 1),)),
+                             (a.code, ((0, 128, 2, (3 << 32) | 1), (0, 1, 0, 0)))):
+            with self.assertRaises(AuditError):
+                normalized(Block(a.rip, code, relocs, a.insns))
 
 
 if __name__ == "__main__":

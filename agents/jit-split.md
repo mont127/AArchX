@@ -11,24 +11,51 @@ the new files without a build-system edit.
 
 Run on arm64 macOS with Clang, Python 3.9+ and the repository's Cargo/toolchain
 on PATH. The reference is the C JIT split at `cac4b33` (its unrelated
-flags/globals modules already use the Rust scaffold):
+flags/globals modules already use the Rust scaffold). `16a7c2d` is the same
+C JIT with the original audit hook, and is the preferred reference:
 
 ```sh
-git worktree add --detach ../AArchX-jit-reference cac4b33
+git worktree add --detach ../AArchX-jit-reference 16a7c2d
 tools/jit_emit_audit.sh ../AArchX-jit-reference
 tools/jit_emit_audit.sh ../AArchX-jit-reference /path/to/candidate
+tools/jit_emit_audit.sh --corpus x64 ../AArchX-jit-reference
+tools/jit_emit_audit.sh --corpus i386 ../AArchX-jit-reference
 ```
 
 The omitted candidate defaults to the checkout containing the tool, not the
-current directory. Both trees are built normally, then separate instrumented
+current directory. `--corpus i386|x64|all` defaults to **all**. Both trees are
+built normally, then separate instrumented
 executables are linked in a temporary directory. Sources, normal JIT objects
 and normal Rust archives are not replaced. Linking uses Makefile's filtered
-`CORE_OBJS`, avoiding stale objects for already-ported C modules. Both binaries
+`CORE_OBJS`, avoiding stale objects for already-ported C modules. The i386 runs
 use the **reference's** `tests/diff32.c`, seed 1, 20,000 random cases, all hand
 cases, and both offset/low-shadow layouts with `--jit-required`. Ambient
 `OCERZ_*` tuning variables are removed from corpus processes;
 `OCERZ_TCACHE=roundtrip` and `OCERZ_NO_ARM_EXEC=1` are set explicitly. Do not
 run this alongside another gate or mutate either tree during the comparison.
+
+The x64 corpus executes translated arm64, using the same guest binaries for
+both engines, built exclusively from the reference tree. On the reference at
+`16a7c2d` there are 186 cases:
+
+- All executable `tests/guest/bin` fixtures (including bench targets), expected
+  exit codes and available output goldens; guest NaN/replay and ordered-memory
+  variants mirror the suite. Async-stop fixtures run for 200 ms.
+- `-cache` runs of `ls`, `echo`, `sort`, `sw_vers`, `plutil`, every
+  `run_low_golden_case` in the dynamic suite (including the `dtest_*` cases),
+  plus `test_jcc_gap`, `tcache_work`, `avx_fp` and in-place `sys_strings`.
+- `-native` runs of `sys_strings`, `sys_strings_fault`, `sys_mmap`, `sys_jmp`,
+  `objc_classes`, `objc_foundation`, `objc_view_render`, `block_runtime`,
+  `block_dispatch`, `block_foundation` and `app_bundle`. The native suite's
+  builders are reused without executing its test driver. API databases are
+  built with `make apis`; an absent fixture/hook is an error, not a skip.
+
+X64 sets `OCERZ_TCACHE=roundtrip`, `OCERZ_JIT_AUDIT_X64=1`, the reference API
+path, `LC_ALL=C` and `TZ=UTC`. It enables arm64 execution, aligns each block
+entry to 64 bytes and enables relocation recording even in native mode.
+Native fixtures, `sw_vers` and `plutil` use `OCERZ_NO_PLAIN_MEM=1` to eliminate
+the timing-dependent plain-to-ordered epoch transition. The narrow-TSO case
+uses `OCERZ_TSO_NARROW=1`; other ordinary dynamic cases retain plain memory.
 
 Stdout starts with one `MATCH` or `MISMATCH` summary, followed on mismatch by
 the first three differing blocks: ordinal/layout, guest RIP, x86 disassembly,
@@ -40,13 +67,40 @@ logs, corpus logs, raw audit streams and instrumented binaries are retained
 on failure at the printed artifact path. To retain successful runs too, set
 `OCERZ_JIT_AUDIT_DIR=/path/to/artifact-parent`; each invocation gets a unique
 subdirectory. Normal successful runs remove their temporary artifacts.
+X64 also writes `x64-results.json`: per-case totals, every mismatching RIP and
+normalized variant digest/word count, and one-sided system-cache coverage.
+Each failing fixture gets a `.diff` with its first three complete diagnostics;
+each process run records its exact command, non-secret tuning env and status.
 
 The comparison masks only form-1 two-word address literals and form-0
 MOVZ/MOVK imm16 fields. MOVZ/MOVK shape/register consistency, bounds and
 non-overlapping relocation ranges are validated before masking. All opcode,
 register and non-relocated bits remain significant. Relocation offset, kind,
-form **and semantic argument** must match, as must record order, block count,
-guest RIP and x86 instruction boundaries. Disassembly formatting is diagnostic
+form **and semantic argument** must match, as must guest RIP and x86 instruction
+boundaries. I386 additionally requires record order and multiplicity. X64
+compares sets keyed by guest RIP and a digest of normalized bytes, relocation
+descriptors and x86 instruction boundaries; duplicates/order are irrelevant,
+but extra/missing variants at a shared RIP remain mismatches. Each PID writes
+its own stream, appended across exec, so forked processes cannot corrupt or
+truncate each other's records.
+
+Cache-mode allocator and thread timing can visit different system-cache paths
+even in C-vs-C runs. One-sided RIPs in the system-cache address window
+`[0x7ff000000000, 0x800000000000)` are therefore **coverage-only**, reported
+separately and retained in raw streams/JSON, not called codegen mismatches.
+Application/low-image RIPs remain strict, as do **all variants at every shared
+RIP**, including shared-cache code. Guest and native cases do not use this
+exception. MATCH is an emission comparison of observed common cache coverage,
+not proof of identical execution coverage; gates remain required. Counts can
+vary with system-cache coverage without changing the comparison verdict.
+
+The native fastcall's unannotated host pointer gets a synthetic audit-only
+relocation after validating a contiguous MOVZ/MOVK x16 sequence, the following
+BLR x16 and its exact target `ocerz_vdylib_fastcall`. Kind 128/form 2 carries
+the instruction count and symbolic target ID 1; only imm16 payloads are masked.
+These descriptors never reach production `tc_bind` or disk caches. Arbitrary
+MOV immediates, guest addresses and descriptor arguments are never masked.
+Disassembly formatting is diagnostic
 only. Missing/empty/truncated streams cannot pass. The versioned `AXJITA01`
 format is documented in `tools/jit_emit_audit/writer.c` and keeps raw bytes
 unmodified for diagnostics. The legacy hashes below use the earlier normalized
@@ -59,6 +113,7 @@ arm64 word and relocation, immediately before `int tc_save = 0` / `tc_bind`,
 while the existing translation lock is held. Its bindgen-visible signature is:
 
 ```c
+int ocerz_jit_emit_audit_begin(OcerzJit *jit);
 void ocerz_jit_emit_audit(uint64_t rip, const uint32_t *code, uint32_t nwords,
                           const X86Insn *insns, uint32_t ninsns,
                           const TcReloc *rel, uint32_t nrel);
@@ -70,15 +125,22 @@ caller pointers. It lives only in `tools/jit_emit_audit/writer.c`; do not
 provide a competing implementation in the Rust staticlib. Keep `TcReloc`
 semantics and numbering intact in the tcache port.
 
+The guarded `ocerz_jit_emit_audit_begin(jit)` call precedes construction of
+`A64Buf`. It only aligns `jit->code_cur` when `OCERZ_JIT_AUDIT_X64` is set,
+returning whether this is an x64 capture. After the normal `g_tc_on`
+initialization, force it to 1 when that return value is nonzero. Preserve both
+guarded call sites in a Rust core; the sink alone cannot capture native relocs.
+
 C uses `#ifdef OCERZ_JIT_EMIT_AUDIT`; the runner defines it only for its
-temporary core object. The old `cac4b33` core has no hook, so the runner inserts
-the same call into a temporary source copy at the unique pre-tcache marker.
-When `jit` itself is ported, preserve this call behind
+temporary core object. Older reference cores are instrumented in a temporary
+source copy at unique markers; reference sources are never edited.
+When `jit` itself is ported, preserve both calls behind
 `#[cfg(ocerz_jit_emit_audit)]` using `ffi::ocerz_jit_emit_audit` and the same raw
 pointer/integer arguments. The runner builds a separate Rust archive with
 `cargo rustc --release --lib --target-dir ... -- --cfg ocerz_jit_emit_audit`.
 It does not enable this cfg in normal builds. The runtime environment variable
-`OCERZ_JIT_EMIT_AUDIT` names the output stream; unset/empty disables recording
+`OCERZ_JIT_EMIT_AUDIT` names the output stream (a `.PID` suffix is added for
+x64); unset/empty disables recording
 even in instrumented executables. Normal C/Rust builds contain **no audit
 call or branch**, no environment lookup, and no linked writer.
 
@@ -90,8 +152,8 @@ archive) builds and audits it unchanged, so the tool needed no edit; a normal
 
 Tool checks: `python3 -B -m unittest discover -s tools/jit_emit_audit` and
 `bash -n tools/jit_emit_audit.sh`. Integration against `cac4b33` reproduces
-**215,295 blocks / 145,523,525 arm64 words**. This is the original i386 corpus,
-not exhaustive x86-64 instruction coverage; ports must still run the normal
+**215,295 blocks / 145,523,525 arm64 words**. This is the original i386 corpus;
+neither corpus is exhaustive instruction coverage. Ports must still run the normal
 guest/differential/full gates.
 
 The integration self-check changed padding NOPs to YIELD in a disposable C
@@ -99,6 +161,13 @@ candidate. Both architectural differentials still passed, but the oracle
 reported **14,601 differing blocks**, exited 1, and printed the requested RIP,
 disassembly and byte-stream diagnostics. Re-encoding the matching run in the
 legacy format also reproduced both SHA-256 hashes recorded below exactly.
+
+The x64 C-vs-C control at `16a7c2d` passed all 186 fixtures with **212,345
+unique block variants / 53,776,852 arm64 words**. Reintroducing the known
+`emit_jcc` self-loop defect in a disposable C flags object (setting
+`g_cc_want_cbz = two_way || self_loop`) made native `sys_strings` exit 1 and
+produced **27 differing/missing block variants**. The native coverage catches
+this bug even with ordered memory forced; the ordinary C control exits 0.
 
 ## Ownership map
 
