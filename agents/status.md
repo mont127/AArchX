@@ -34,7 +34,7 @@
 | objcclass.c | 1609 | native2 | ported |
  | stack.c | 137 | runtime (ee47e957) | ported |
 | sysbridge.c | 2077 | native2 | ported |
-| syscall.c | 8906 | devin-9aa5caef | in progress |
+| syscall.c | 8906 | devin-9aa5caef | ported |
 | tcache.c | 863 | runtime (ee47e957) | in progress |
 | vdylib.c | 1424 | native1 | ported |
 | vm.c | 4376 | memvm | ported |
