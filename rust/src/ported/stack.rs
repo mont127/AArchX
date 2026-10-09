@@ -4,7 +4,7 @@
 //! read this layout positionally, so the order and the alignment are the
 //! contract, not an implementation detail.
 
-use core::ffi::{c_char, c_int, c_ulonglong};
+use core::ffi::{CStr, c_char, c_int, c_ulonglong};
 use core::ptr;
 
 use crate::ffi::{
@@ -14,7 +14,7 @@ use crate::ported::sysbridge::{ocerz_g2h, ocerz_st};
 
 const GUEST_STACK_SIZE: u64 = 8 << 20;
 const STACK_TOP_PAD: u64 = 16;
-const APPLE_PREFIX: &[u8] = b"executable_path=";
+const APPLE_PREFIX: &CStr = c"executable_path=";
 
 #[inline(always)]
 fn align_down16(v: u64) -> u64 {
@@ -60,18 +60,15 @@ pub unsafe extern "C" fn ocerz_setup_stack(
 
         let path = (*img).path.as_ptr();
         let pathlen = libc::strlen(path);
-        let applestr = libc::malloc(pathlen.wrapping_add(APPLE_PREFIX.len() + 1)).cast::<c_char>();
+        let prefix_len = APPLE_PREFIX.to_bytes().len();
+        let applestr = libc::malloc(pathlen.wrapping_add(prefix_len + 1)).cast::<c_char>();
         if applestr.is_null() {
             crate::ocerz_fatal!("out of memory building apple[0]\n");
             return OCERZ_ENOMEM;
         }
+        libc::memcpy(applestr.cast(), APPLE_PREFIX.as_ptr().cast(), prefix_len);
         libc::memcpy(
-            applestr.cast(),
-            APPLE_PREFIX.as_ptr().cast(),
-            APPLE_PREFIX.len(),
-        );
-        libc::memcpy(
-            applestr.add(APPLE_PREFIX.len()).cast(),
+            applestr.add(prefix_len).cast(),
             path.cast(),
             pathlen.wrapping_add(1),
         );
