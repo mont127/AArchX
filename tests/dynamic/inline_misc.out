@@ -1,0 +1,4 @@
+tsc backwards=0 rate=1GHz
+sidt guard bytes intact=22 of 22
+add256 00000000000009c5 80000000000001e8 97bff809da49ae20 fd100758f797e10b
+sub256 fffffffffffffff9 c93dfb1762eac834 6eeb95eed6742583 97525d81adcf1ce3 lo cfe6afd7
