@@ -12,7 +12,7 @@ plus all unit binaries and `make apis`). macOS 26.6 arm64, SDK 26.5.
 | guest jit | 134/134 pass |
 | diff | 100/100 pass |
 | diff32 | pass (40044 checks, 0 failed) |
-| dynamic | 280 passed, 7 failed |
+| dynamic | 278 passed, 9 failed |
 | native (run_native_tests.sh) | 86 passed, 1 failed |
 | guest library | pass |
 | native cxx | SKIP (needs tools/build_guest_cxx.sh) |
@@ -29,10 +29,12 @@ plus all unit binaries and `make apis`). macOS 26.6 arm64, SDK 26.5.
   generated yet (bridge descriptors / vdylib database come from `make apis`).
   With apis generated both pass; `test_bridge` segfaulted at exit when run
   without apis — still environment, not code.
-- dynamic, 7 failures: `ddlopen_image_list` (jit+no-jit, libxml2 already
+- dynamic, 9 failures: `ddlopen_image_list` (jit+no-jit, libxml2 already
   listed), `ddlopen_cryptex` (jit+no-jit, no cryptex-only library on this
   machine), `dyldslots` (slot 0x450 unanswered), `dmetal_nocopy_low`
   (jit+no-jit, 16384/16384 wrong). Marked KNOWN-PENDING in the suite output.
+- `dtest_jcc_gap_low` (jit+no-jit, `faults 59` instead of `faults 60` on
+  this VM); pristine C at 97a9247 showed the same result in all three runs.
 - native, 1 failure: `sys_proc` — the arm64 fixture fails its own checks on
   this host, so the native run can prove nothing either way.
 

@@ -4,4 +4,6 @@ FAIL ddlopen_image_list-jit (got out='dlopen_image_list bad: libxml2 was already
 FAIL ddlopen_image_list-no-jit (got out='dlopen_image_list bad: libxml2 was already listed
 FAIL dmetal_nocopy_low-jit (got out='extra 0: 16384 of 16384 wrong
 FAIL dmetal_nocopy_low-no-jit (got out='extra 0: 16384 of 16384 wrong
+FAIL dtest_jcc_gap_low-jit (exit=0, output differs from tests/dynamic/test_jcc_gap.out)
+FAIL dtest_jcc_gap_low-no-jit (exit=0, output differs from tests/dynamic/test_jcc_gap.out)
 FAIL dyldslots (slot 0x450 is answered but nothing witnesses it)
