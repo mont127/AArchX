@@ -1257,8 +1257,8 @@ unsafe extern "C" fn jit_perfstat_one(insn: *const X86Insn) {
     ps_slow_insns.fetch_add(1, Ordering::SeqCst);
     let op = (*insn).op as u32;
     if (op as usize) < OCERZ_OP_COUNT as usize {
-        let n = ps_ops.get_unchecked(op as usize).fetch_add(1, Ordering::SeqCst) + 1;
-        if n & 0xff == 1 {
+        ps_ops.get_unchecked(op as usize).fetch_add(1, Ordering::SeqCst);
+        if ps_ops.get_unchecked(op as usize).load(Ordering::SeqCst) & 0xff == 1 {
             ps_note_shape(insn);
         }
     }
