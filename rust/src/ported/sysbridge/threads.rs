@@ -46,7 +46,7 @@ static G_SB_KEYS: [SbKey; (SB_KEY_END - SB_KEY_FIRST) as usize] =
     [SB_KEY_INIT; (SB_KEY_END - SB_KEY_FIRST) as usize];
 static G_SB_RESERVED: [SbKey; SB_KEY_FIRST as usize] = [SB_KEY_INIT; SB_KEY_FIRST as usize];
 static mut G_SB_KEY_NEXT: u32 = 0;
-static G_SB_KEY_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
+static mut G_SB_KEY_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
 
 unsafe fn sb_key(key: u64) -> *const SbKey {
     unsafe {
@@ -68,7 +68,7 @@ pub unsafe extern "C" fn ocerz_sys_pthread_key_create(vm: *mut OcerzVM, cpu: *mu
         let destructor = sb_arg(cpu, 1);
         let n = (SB_KEY_END - SB_KEY_FIRST) as u32;
         let mut got = n;
-        libc::pthread_mutex_lock(&raw const G_SB_KEY_LOCK as *mut _);
+        libc::pthread_mutex_lock(&raw mut G_SB_KEY_LOCK);
         let mut i = 0;
         while i < n && got == n {
             let at = (G_SB_KEY_NEXT + i) % n;
@@ -82,7 +82,7 @@ pub unsafe extern "C" fn ocerz_sys_pthread_key_create(vm: *mut OcerzVM, cpu: *mu
             G_SB_KEYS[got as usize].used.store(1, Ordering::SeqCst);
             G_SB_KEY_NEXT = got + 1;
         }
-        libc::pthread_mutex_unlock(&raw const G_SB_KEY_LOCK as *mut _);
+        libc::pthread_mutex_unlock(&raw mut G_SB_KEY_LOCK);
         if got == n {
             return sb_ret(vm, cpu, libc::EAGAIN as i64);
         }

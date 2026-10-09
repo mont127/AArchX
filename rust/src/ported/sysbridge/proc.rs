@@ -497,7 +497,7 @@ pub unsafe extern "C" fn ocerz_sys_posix_spawnp(vm: *mut OcerzVM, cpu: *mut Ocer
     unsafe { sb_spawn(vm, cpu, 1) }
 }
 
-static G_SB_SYSTEM_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
+static mut G_SB_SYSTEM_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
 static mut G_SB_SYSTEM_COUNT: c_int = 0;
 static mut G_SB_INTACT: [u8; 16] = [0; 16];
 static mut G_SB_QUITACT: [u8; 16] = [0; 16];
@@ -551,12 +551,12 @@ pub unsafe extern "C" fn ocerz_sys_system(vm: *mut OcerzVM, cpu: *mut OcerzCPU) 
         libc::sigemptyset(&mut defaults);
         let mut flags: c_short = libc::POSIX_SPAWN_SETSIGMASK as c_short;
 
-        libc::pthread_mutex_lock(&raw const G_SB_SYSTEM_LOCK as *mut _);
+        libc::pthread_mutex_lock(&raw mut G_SB_SYSTEM_LOCK);
         if { let c = &raw mut G_SB_SYSTEM_COUNT; let n = *c; *c = n + 1; n } == 0 {
             sb_ignore(vm, cpu, libc::SIGINT, scratch, &raw mut G_SB_INTACT as *mut u8, &mut defaults, &mut flags);
             sb_ignore(vm, cpu, libc::SIGQUIT, scratch, &raw mut G_SB_QUITACT as *mut u8, &mut defaults, &mut flags);
         }
-        libc::pthread_mutex_unlock(&raw const G_SB_SYSTEM_LOCK as *mut _);
+        libc::pthread_mutex_unlock(&raw mut G_SB_SYSTEM_LOCK);
         ocerz_st(set, 4, 1u64 << (libc::SIGCHLD - 1));
         ocerz_guest_sigprocmask(vm, cpu, libc::SIG_BLOCK, set, oset);
         let old = ocerz_ld(oset, 4) as libc::sigset_t;
@@ -605,13 +605,13 @@ pub unsafe extern "C" fn ocerz_sys_system(vm: *mut OcerzVM, cpu: *mut OcerzCPU) 
         }
         let saved_errno = *errno();
 
-        libc::pthread_mutex_lock(&raw const G_SB_SYSTEM_LOCK as *mut _);
+        libc::pthread_mutex_lock(&raw mut G_SB_SYSTEM_LOCK);
         let now = { let c = &raw mut G_SB_SYSTEM_COUNT; *c -= 1; *c };
         if now == 0 {
             sb_restore(vm, cpu, libc::SIGINT, scratch, &raw const G_SB_INTACT as *const u8);
             sb_restore(vm, cpu, libc::SIGQUIT, scratch, &raw const G_SB_QUITACT as *const u8);
         }
-        libc::pthread_mutex_unlock(&raw const G_SB_SYSTEM_LOCK as *mut _);
+        libc::pthread_mutex_unlock(&raw mut G_SB_SYSTEM_LOCK);
         ocerz_guest_sigprocmask(vm, cpu, libc::SIG_SETMASK, oset, 0);
         *errno() = saved_errno;
         sb_ret(vm, cpu, pstat as i64)
@@ -626,7 +626,7 @@ struct SbPopen {
 }
 
 static mut G_SB_POPEN: *mut SbPopen = core::ptr::null_mut();
-static G_SB_POPEN_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
+static mut G_SB_POPEN_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
 
 unsafe fn sb_popen(
     vm: *mut OcerzVM,
@@ -705,13 +705,13 @@ unsafe fn sb_popen(
             }
             libc::posix_spawn_file_actions_addclose(&mut fa, pdes[1]);
         }
-        libc::pthread_mutex_lock(&raw const G_SB_POPEN_LOCK as *mut _);
+        libc::pthread_mutex_lock(&raw mut G_SB_POPEN_LOCK);
         let mut p = G_SB_POPEN;
         while !p.is_null() {
             libc::posix_spawn_file_actions_addclose(&mut fa, libc::fileno((*p).fp));
             p = (*p).next;
         }
-        libc::pthread_mutex_unlock(&raw const G_SB_POPEN_LOCK as *mut _);
+        libc::pthread_mutex_unlock(&raw mut G_SB_POPEN_LOCK);
 
         let mut argv: [*mut c_char; 4] = [
             c"sh".as_ptr() as *mut c_char,
@@ -747,10 +747,10 @@ unsafe fn sb_popen(
         }
         (*cur).fp = iop;
         (*cur).pid = pid;
-        libc::pthread_mutex_lock(&raw const G_SB_POPEN_LOCK as *mut _);
+        libc::pthread_mutex_lock(&raw mut G_SB_POPEN_LOCK);
         (*cur).next = G_SB_POPEN;
         G_SB_POPEN = cur;
-        libc::pthread_mutex_unlock(&raw const G_SB_POPEN_LOCK as *mut _);
+        libc::pthread_mutex_unlock(&raw mut G_SB_POPEN_LOCK);
         fwide(iop, -1);
         iop
     }
@@ -775,7 +775,7 @@ pub unsafe extern "C" fn ocerz_sys_pclose(vm: *mut OcerzVM, cpu: *mut OcerzCPU) 
         let iop = sb_ptr(sb_arg(cpu, 0)) as *mut libc::FILE;
         let mut link: *mut *mut SbPopen = &raw mut G_SB_POPEN;
         let mut cur;
-        libc::pthread_mutex_lock(&raw const G_SB_POPEN_LOCK as *mut _);
+        libc::pthread_mutex_lock(&raw mut G_SB_POPEN_LOCK);
         loop {
             cur = *link;
             if cur.is_null() || (*cur).fp == iop {
@@ -786,7 +786,7 @@ pub unsafe extern "C" fn ocerz_sys_pclose(vm: *mut OcerzVM, cpu: *mut OcerzCPU) 
         if !cur.is_null() {
             *link = (*cur).next;
         }
-        libc::pthread_mutex_unlock(&raw const G_SB_POPEN_LOCK as *mut _);
+        libc::pthread_mutex_unlock(&raw mut G_SB_POPEN_LOCK);
         if cur.is_null() {
             return sb_ret(vm, cpu, -1);
         }
