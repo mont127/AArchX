@@ -124,7 +124,7 @@ const KERN_SUCCESS: KernReturn = 0;
 const VM_PROT_READ: VmProt = 1;
 const VM_FLAGS_FIXED: c_int = 0;
 const VM_FLAGS_OVERWRITE: c_int = 0x4000;
-const VM_INHERIT_DEFAULT: c_int = 1;
+const VM_INHERIT_DEFAULT: libc::vm_inherit_t = 1;
 const VM_REGION_BASIC_INFO_64: c_int = 9;
 const MACH_PORT_NULL: MachPort = 0;
 const VM_REGION_SUBMAP_SHORT_INFO_COUNT_64: MachMsgTypeNumber = 12;
@@ -203,14 +203,14 @@ unsafe extern "C" {
         copy: c_int,
         cur_protection: *mut VmProt,
         max_protection: *mut VmProt,
-        inheritance: c_int,
+        inheritance: libc::vm_inherit_t,
     ) -> KernReturn;
     fn mach_vm_region(
         target: MachPort,
         address: *mut MachVmAddress,
         size: *mut MachVmSize,
         flavor: c_int,
-        info: *mut c_void,
+        info: *mut c_int,
         infoCnt: *mut MachMsgTypeNumber,
         object_name: *mut MachPort,
     ) -> KernReturn;
@@ -3641,7 +3641,7 @@ pub unsafe extern "C" fn ocerz_host_region_prot(
             &mut a,
             &mut sz,
             VM_REGION_BASIC_INFO_64,
-            &mut info as *mut _ as *mut c_void,
+            &mut info as *mut _ as *mut c_int,
             &mut cnt,
             &mut obj,
         );

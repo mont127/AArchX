@@ -19,7 +19,7 @@ const VM_PROT_WRITE: c_int = 2;
 const VM_PROT_EXECUTE: c_int = 4;
 const VM_FLAGS_FIXED: c_int = 0x0000_0000;
 const VM_FLAGS_OVERWRITE: c_int = 0x0000_4000;
-const VM_INHERIT_DEFAULT: c_int = 1;
+const VM_INHERIT_DEFAULT: libc::vm_inherit_t = 1;
 const KERN_SUCCESS: c_int = 0;
 
 #[repr(C)]
@@ -96,7 +96,7 @@ unsafe extern "C" {
         copy: c_int,
         cur_protection: *mut VmProt,
         max_protection: *mut VmProt,
-        inheritance: c_int,
+        inheritance: libc::vm_inherit_t,
     ) -> KernReturn;
 }
 
