@@ -95,3 +95,84 @@ with 107,409 translated blocks. The full gate's diff32 run had 40,044 passed /
 expected `dtest_jcc_gap_low` failures no longer reproduced. `dyn.new` was
 empty. The native framework and native format phases passed; no i386 phase
 log was produced.
+
+## tcache
+
+Ported `src/tcache.c` to `rust/src/ported/tcache/`, split into `store`, `io`,
+and `writer`. The port retains the original index/slot and data-file layouts,
+40-bit data offsets, record framing and checksum, raw LZ4 compression,
+fingerprint inputs and C `qsort`/`strcmp` ordering, directory claim/prune
+protocol, shared mmap publication order, and fork-child reset. It uses C
+allocators and pthread mutex/condition/thread APIs; no Rust collection,
+mutex, or condition variable is used.
+
+Static-state audit (C declaration → Rust representation):
+
+| State | C declaration | Rust representation |
+|---|---|---|
+| main lock and mode | `pthread_mutex_t` initializer; `int g_mode = -1` | `libc::pthread_mutex_t` initializer; `AtomicI32(-1)` (same signed 32-bit storage) |
+| fingerprint/path/open state | `uint64_t g_fp`; `char g_dir[1024]`; `int g_opened`; header/slot/file pointers; mask and file count | `u64`; `[c_char; 1024]`; `c_int`; matching raw pointers and integer widths |
+| limits/full state | `uint64_t` capacity, floor, room, data number/offset; `int g_full = 0` | `u64`; `AtomicI32(0)` (same signed 32-bit storage) |
+| descriptors/logging | `int g_dfd = -1`, `g_log = -1`, `g_ufd = -1` | `c_int` with the same `-1` initializers |
+| buffers | `uint8_t*` buffers and `size_t g_buf_n` | `*mut u8` and `usize`, null/zero initialized |
+| writer state | pthread lock/conditions with static initializers; queue/spares of four; `int` counters; `pthread_t` | libc pthread statics; four `QueueItem`s and spare pointers; `c_int` counters; `pthread_t` |
+| mapped index | `uint64_t` keys/locations, acquire loads, AcqRel/Acquire key CAS, release location store | `AtomicU64::from_ptr` with the same orderings |
+
+The C fingerprint skips the UUID input when the main executable lacks
+`LC_UUID`; that branch was reviewed in the C source, but not executed because
+dyld aborts before `main` for no-UUID executables on this host. The benchmark
+therefore links each driver normally, patches both UUIDs to
+`00112233-4455-6677-8899-aabbccddeeff`, then ad-hoc signs them. It prints and
+checks both UUIDs and both cache fingerprints.
+
+Run `PERF_RUNS=5 tools/bench/tcache_bench.sh` to exercise 50,000 deterministic
+records in both C→Rust and Rust→C directions and compare fresh deterministic
+writes. Both drivers reported the same UUID and fingerprint
+`tc-1f7a1d02e4d5c59e`; both directions returned hash
+`8a8582ad476c0930`. Fresh index and `d-1.td` contents were byte-identical;
+no PID/timestamp fields needed masking.
+
+The final five alternating timing runs (C / Rust median, ns/call) split put
+into a 2,000-call no-handoff sample (88-byte records; 176,088 bytes total),
+the 50,000-call put loop, and that loop plus the final flush:
+
+| Measurement | C | Rust | Rust delta |
+|---|---:|---:|---:|
+| Find hit | 103.25 | 206.27 | noisy; run order strongly affected samples |
+| Find miss | 5.09 | 4.39 | -13.8% |
+| Put, no handoff | 12.50 | 16.00 | +3.5 ns; ranges overlap |
+| Put loop, excluding final flush | 442.18 | 476.66 | +7.8% |
+| Put loop plus final flush | 474.96 | 519.44 | +9.4% |
+
+The no-handoff sample stayed below the 256 KiB buffer threshold; its observed
+ranges were 10.5–33.5 ns (C) and 9.5–34.5 ns (Rust), so the 3.5 ns median
+difference is within the run-to-run variation. The total-minus-loop flush
+time was 32.78 ns/record (C) and 42.78 ns/record (Rust). The larger delta
+therefore appears in buffer handoff/backpressure and queued writer work, not
+the steady-state copy into an unfilled buffer; the exact contribution of
+handoff versus background compression/I/O is not isolated by this benchmark.
+
+I compared the writer paths: both use libc `memcpy` for record and stored
+payload copies; the Rust queue shift uses overlapping `ptr::copy`, equivalent
+to C `memmove`. Both use the same four-entry queue, condition wait/signal/
+broadcast pattern, detached writer, 256 KiB input/compression buffers, 512 KiB
+output buffer, raw-LZ4 scratch sizing, and `pwrite` chunking. Neither path
+calls `fsync`. No behavioral or buffer-size divergence was found to fix. The
+initial out-of-line `stored_sum` call in Rust's find path was inlined to match
+the C compiler; no Rust implementation change was needed in this isolation
+pass. Find-hit timings in this run were highly order-sensitive and should not
+be treated as a stable comparison.
+
+With `OCERZ_TCACHE_TRACE=1`, cold dynamic `xbench_dyn depchain 1` runs on both
+trees saved 3,167 records; warm runs logged 3,142 hits/loads and identical
+stdout. Verify mode reported `verify_ok=3150`, `verify_variant=10`,
+`verify_bad=0`; roundtrip reported `ok=3179 bad=0`. Twenty alternating warm
+starts averaged 17.10 ms C / 16.54 ms Rust.
+
+`make -j12 ocerz` passed after removing `src/tcache.o` and `src/tcache.d`;
+`nm -gU ocerz` showed one definition of each of the five exports.
+`tests/unit/bin/test_cache` passed 15 checks. Both the fast and full gates
+passed with no new failures. The full-gate diff32 log recorded 40,044 passed /
+0 failed and 107,410 translated blocks; no i386 phase log was produced.
+The native framework phase passed. Dynamic tests reported 280 passed and
+7 expected failures; `dyn.new` was empty.
