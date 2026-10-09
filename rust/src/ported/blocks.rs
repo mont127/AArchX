@@ -343,7 +343,8 @@ pub unsafe extern "C" fn ocerz_block_native_wrapper(block: u64, inner: *mut u64)
             return 0;
         }
         let d = (*b).desc.cast::<BlkDesc>();
-        if (*d).dispose != Some(blk_native_dispose_helper) {
+        if !matches!((*d).dispose, Some(dispose) if ptr::fn_addr_eq(dispose, blk_native_dispose_helper as DisposeFn))
+        {
             return 0;
         }
         if !inner.is_null() {
