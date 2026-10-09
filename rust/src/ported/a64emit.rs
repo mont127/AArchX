@@ -4107,11 +4107,7 @@ pub unsafe extern "C" fn a64_frint_s(
 ) -> () {
     unsafe {
         const OPC: [u32; 5] = [0x1e244000, 0x1e254000, 0x1e24c000, 0x1e25c000, 0x1e27c000];
-        let opcode = if (0..5).contains(&mode) {
-            *OPC.get_unchecked(mode as usize)
-        } else {
-            0
-        };
+        let opcode = *OPC.get_unchecked(mode as usize);
         let base = opcode | if dbl != 0 { 0x00400000 } else { 0 };
         emit32(b, base | (((vn & 31) as u32) << 5) | (vd & 31) as u32);
     }
@@ -4128,11 +4124,7 @@ pub unsafe extern "C" fn a64_v_frint(
 ) -> () {
     unsafe {
         const OPC: [u32; 5] = [0x4e218800, 0x4e219800, 0x4ea18800, 0x4ea19800, 0x6ea19800];
-        let opcode = if (0..5).contains(&mode) {
-            *OPC.get_unchecked(mode as usize)
-        } else {
-            0
-        };
+        let opcode = *OPC.get_unchecked(mode as usize);
         let base = opcode | if dbl != 0 { 0x00400000 } else { 0 };
         emit32(b, base | (((vn & 31) as u32) << 5) | (vd & 31) as u32);
     }
