@@ -4,7 +4,7 @@
 //! check/replay emission helpers.  `mov_sink_scan` finds the mov/shift pairs
 //! the integer piece sinks.
 
-use core::ffi::{c_int, c_uint, c_ulong, c_ulonglong};
+use core::ffi::{c_int, c_long, c_uint, c_ulong, c_ulonglong};
 
 use super::l0::{g_l0, g_l0_dbl, g_n_undo_lanes, g_undo_vreg};
 use super::*;
@@ -137,7 +137,7 @@ pub unsafe extern "C" fn mov_sink_gap_ok(
             return 0;
         }
         for k in 0..in_.nops as usize {
-            let o = &in_.ops[k];
+            let o = &in_.ops.get_unchecked(k);
             if o.kind as u32 == ffi::OCERZ_OPK_MEM {
                 if in_.op as u32 != ffi::OCERZ_OP_LEA {
                     return 0;
@@ -588,9 +588,9 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                     if !is_minmax_c {
                         if packed != 0
                             && (full as u32 & sb) != 0
-                            && taint_dbl[sr.reg as usize] == dbl as u8
+                            && *taint_dbl.get_unchecked_mut(sr.reg as usize) == dbl as u8
                         {
-                            edges[n_edges] = FpbEdge {
+                            *edges.get_unchecked_mut(n_edges) = FpbEdge {
                                 s: sr.reg,
                                 d: dr as u8,
                                 cls: 0,
@@ -599,7 +599,7 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                             n_edges += 1;
                         }
                         if dbl == 0 && (s0 as u32 & sb) != 0 && n_edges < 64 {
-                            edges[n_edges] = FpbEdge {
+                            *edges.get_unchecked_mut(n_edges) = FpbEdge {
                                 s: sr.reg,
                                 d: dr as u8,
                                 cls: 1,
@@ -608,7 +608,7 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                             n_edges += 1;
                         }
                         if dbl != 0 && (d0 as u32 & sb) != 0 && n_edges < 64 {
-                            edges[n_edges] = FpbEdge {
+                            *edges.get_unchecked_mut(n_edges) = FpbEdge {
                                 s: sr.reg,
                                 d: dr as u8,
                                 cls: 2,
@@ -619,9 +619,9 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                     }
                 }
                 if c == 1 {
-                    taint_dbl[dr as usize] = dbl as u8;
+                    *taint_dbl.get_unchecked_mut(dr as usize) = dbl as u8;
                 }
-                lastw[dr as usize] = j;
+                *lastw.get_unchecked_mut(dr as usize) = j;
                 {
                     let is_mm = ij.op as u32 == ffi::OCERZ_OP_MAXSS
                         || ij.op as u32 == ffi::OCERZ_OP_MINSS
@@ -636,7 +636,7 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                         || (sq != 0
                             && !(sr.kind as u32 == ffi::OCERZ_OPK_XMM && sr.reg as u32 == dr))
                     {
-                        lastbreak[dr as usize] = j;
+                        *lastbreak.get_unchecked_mut(dr as usize) = j;
                     }
                 }
                 let mut reads = sbit as u16;
@@ -735,21 +735,21 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                 }
                 if S_NO_FPB_ABSORB == 0 {
                     for e in 0..n_edges {
-                        let s = edges[e].s as usize;
-                        let dd = edges[e].d as usize;
-                        let t = edges[e].t;
+                        let s = edges.get_unchecked_mut(e).s as usize;
+                        let dd = edges.get_unchecked_mut(e).d as usize;
+                        let t = edges.get_unchecked_mut(e).t;
                         if t > last {
                             continue;
                         }
-                        if lastbreak[dd] > t {
+                        if *lastbreak.get_unchecked_mut(dd) > t {
                             continue;
                         }
-                        if lastw[s] > t {
+                        if *lastw.get_unchecked_mut(s) > t {
                             continue;
                         }
-                        if edges[e].cls == 0 {
+                        if edges.get_unchecked_mut(e).cls == 0 {
                             full &= !(1u16 << s);
-                        } else if edges[e].cls == 1 {
+                        } else if edges.get_unchecked_mut(e).cls == 1 {
                             s0 &= !(1u16 << s);
                         } else {
                             d0 &= !(1u16 << s);
@@ -789,7 +789,7 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                     if dbl_only == 0 {
                         break;
                     }
-                    if (full & (1u16 << r)) != 0 && taint_dbl[r] == 0 {
+                    if (full & (1u16 << r)) != 0 && *taint_dbl.get_unchecked_mut(r) == 0 {
                         dbl_only = 0;
                     }
                 }
@@ -800,10 +800,10 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                     let mut vid = [[0u8; 2]; 16];
                     for r in 0..16 {
                         if (full & (1u16 << r)) != 0 {
-                            vid[r][0] = (1 + 2 * r) as u8;
-                            vid[r][1] = (2 + 2 * r) as u8;
+                            vid.get_unchecked_mut(r)[0] = (1 + 2 * r) as u8;
+                            vid.get_unchecked_mut(r)[1] = (2 + 2 * r) as u8;
                         } else if (d0 & (1u16 << r)) != 0 {
-                            vid[r][0] = (1 + 2 * r) as u8;
+                            vid.get_unchecked_mut(r)[0] = (1 + 2 * r) as u8;
                         }
                     }
                     let mut rck = ckpt_raw;
@@ -821,7 +821,9 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                                 break;
                             }
                             for r in 0..16 {
-                                if vid[r][0] != 0 || vid[r][1] != 0 {
+                                if vid.get_unchecked_mut(r)[0] != 0
+                                    || vid.get_unchecked_mut(r)[1] != 0
+                                {
                                     m |= 1u16 << r;
                                 }
                             }
@@ -904,12 +906,16 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                                 && ik.ops[0].imm > ik.rip
                                 && ik.ops[0].imm != i0.rip
                                 && ffi::comis_fuse_producer(insns, k) == jj;
-                            let ida = vid[dr as usize][0];
-                            let idb = vid[sr2 as usize][0];
+                            let ida = vid.get_unchecked_mut(dr as usize)[0];
+                            let idb = vid.get_unchecked_mut(sr2 as usize)[0];
                             for r in 0..16 {
                                 for l in 0..2 {
-                                    if vid[r][l] != 0 && (vid[r][l] == ida || vid[r][l] == idb) {
-                                        vid[r][l] = 0;
+                                    if *vid.get_unchecked_mut(r).get_unchecked_mut(l) != 0
+                                        && (*vid.get_unchecked_mut(r).get_unchecked_mut(l) == ida
+                                            || *vid.get_unchecked_mut(r).get_unchecked_mut(l)
+                                                == idb)
+                                    {
+                                        *vid.get_unchecked_mut(r).get_unchecked_mut(l) = 0;
                                     }
                                 }
                             }
@@ -923,29 +929,34 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                                 RK_STORE => reads = (1u32 << sr2) as u16,
                                 RK_LOAD => {
                                     writes = (1u32 << dr) as u16;
-                                    vid[dr as usize][0] = 0;
-                                    vid[dr as usize][1] = 0;
+                                    vid.get_unchecked_mut(dr as usize)[0] = 0;
+                                    vid.get_unchecked_mut(dr as usize)[1] = 0;
                                 }
                                 RK_MOVE => {
                                     reads = (1u32 << sr2) as u16;
                                     writes = (1u32 << dr) as u16;
-                                    vid[dr as usize][0] = vid[sr2 as usize][0];
-                                    vid[dr as usize][1] = vid[sr2 as usize][1];
+                                    vid.get_unchecked_mut(dr as usize)[0] =
+                                        vid.get_unchecked_mut(sr2 as usize)[0];
+                                    vid.get_unchecked_mut(dr as usize)[1] =
+                                        vid.get_unchecked_mut(sr2 as usize)[1];
                                 }
                                 RK_LMOVE => {
                                     reads = ((1u32 << sr2) | (1u32 << dr)) as u16;
                                     writes = (1u32 << dr) as u16;
-                                    vid[dr as usize][0] = vid[sr2 as usize][0];
+                                    vid.get_unchecked_mut(dr as usize)[0] =
+                                        vid.get_unchecked_mut(sr2 as usize)[0];
                                 }
                                 RK_UNPCKH => {
                                     reads = 1u16 << dr;
                                     writes = 1u16 << dr;
-                                    vid[dr as usize][0] = vid[dr as usize][1];
+                                    vid.get_unchecked_mut(dr as usize)[0] =
+                                        vid.get_unchecked_mut(dr as usize)[1];
                                 }
                                 RK_UNPCKL => {
                                     reads = 1u16 << dr;
                                     writes = 1u16 << dr;
-                                    vid[dr as usize][1] = vid[dr as usize][0];
+                                    vid.get_unchecked_mut(dr as usize)[1] =
+                                        vid.get_unchecked_mut(dr as usize)[0];
                                 }
                                 _ => {}
                             }
@@ -957,7 +968,8 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                         jj += 1;
                         cnt += 1;
                         for r in 0..16 {
-                            if vid[r][0] != 0 || vid[r][1] != 0 {
+                            if vid.get_unchecked_mut(r)[0] != 0 || vid.get_unchecked_mut(r)[1] != 0
+                            {
                                 m |= 1u16 << r;
                             }
                         }
@@ -976,7 +988,8 @@ pub unsafe extern "C" fn fpb_scan_v1(insns: *const ffi::X86Insn, n: c_int, bat: 
                         (*fb).written = rwr;
                         let mut m: u16 = 0;
                         for r in 0..16 {
-                            if vid[r][0] != 0 || vid[r][1] != 0 {
+                            if vid.get_unchecked_mut(r)[0] != 0 || vid.get_unchecked_mut(r)[1] != 0
+                            {
                                 m |= 1u16 << r;
                             }
                         }
@@ -1179,8 +1192,10 @@ pub(crate) unsafe fn fpb2_usedef(in_: *const ffi::X86Insn, use_: *mut u16, kill:
         let mut u: u16 = 0;
         let mut k: u16 = 0;
         for q in 0..in_.nops as usize {
-            if in_.ops[q].kind as u32 == ffi::OCERZ_OPK_XMM && in_.ops[q].reg < 16 {
-                u |= 1u16 << in_.ops[q].reg;
+            if in_.ops.get_unchecked(q).kind as u32 == ffi::OCERZ_OPK_XMM
+                && in_.ops.get_unchecked(q).reg < 16
+            {
+                u |= 1u16 << in_.ops.get_unchecked(q).reg;
             }
         }
         let d = &in_.ops[0];
@@ -1468,11 +1483,10 @@ unsafe fn fpb2_undo_ok(in_: *const ffi::X86Insn, m: *const ffi::X86Operand, size
     }
 }
 
-static mut S_DBG_RIP: c_ulong = -1i64 as c_ulong;
-static mut S_DBG_MAX: c_ulong = -1i64 as c_ulong;
-static mut S_DBG_LO: c_ulong = 0;
-static mut S_DBG_HI: c_ulong = 0;
-static mut S_DBG_INIT: c_int = 0;
+static mut S_DBG_RIP: c_long = -1;
+static mut S_DBG_MAX: c_long = -1;
+static mut S_DBG_LO: c_long = 0;
+static mut S_DBG_HI: c_long = 0;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: *mut i8) {
@@ -1606,40 +1620,39 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                     &mut lane_only,
                 );
                 {
-                    if S_DBG_INIT == 0 {
-                        S_DBG_INIT = 1;
+                    if S_DBG_RIP < 0 {
                         let e = libc::getenv(c"OCERZ_FPB_DBGRIP".as_ptr());
                         S_DBG_RIP = if !e.is_null() {
-                            libc::strtoull(e, core::ptr::null_mut(), 0)
+                            libc::strtoull(e, core::ptr::null_mut(), 0) as c_long
                         } else {
                             0
                         };
                         let e = libc::getenv(c"OCERZ_FPB_DBGMAX".as_ptr());
                         S_DBG_MAX = if !e.is_null() {
-                            libc::strtol(e, core::ptr::null_mut(), 0) as c_ulong
+                            libc::strtol(e, core::ptr::null_mut(), 0)
                         } else {
                             100000
                         };
                         let e = libc::getenv(c"OCERZ_FPB_DBGLO".as_ptr());
                         S_DBG_LO = if !e.is_null() {
-                            libc::strtoull(e, core::ptr::null_mut(), 0)
+                            libc::strtoull(e, core::ptr::null_mut(), 0) as c_long
                         } else {
                             0
                         };
                         let e = libc::getenv(c"OCERZ_FPB_DBGHI".as_ptr());
                         S_DBG_HI = if !e.is_null() {
-                            libc::strtoull(e, core::ptr::null_mut(), 0)
+                            libc::strtoull(e, core::ptr::null_mut(), 0) as c_long
                         } else {
                             0
                         };
                     }
-                    if S_DBG_HI != 0 && i0.rip >= S_DBG_LO && i0.rip <= S_DBG_HI {
-                        let lim: i64 = if S_DBG_RIP != 0 && S_DBG_RIP == i0.rip {
-                            S_DBG_MAX as i64
+                    if S_DBG_HI != 0 && i0.rip >= S_DBG_LO as u64 && i0.rip <= S_DBG_HI as u64 {
+                        let lim: c_long = if S_DBG_RIP != 0 && S_DBG_RIP as u64 == i0.rip {
+                            S_DBG_MAX
                         } else {
                             -1
                         };
-                        if (j as i64) > lim {
+                        if (j as c_long) > lim {
                             break;
                         }
                     }
@@ -1691,7 +1704,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                 if k == K2_STORE {
                     let mut conflict = 0;
                     for q in 0..nload {
-                        let lq = loads[q];
+                        let lq = *loads.get_unchecked_mut(q);
                         if mem_may_alias(
                             insns.add(lq as usize),
                             &(*insns.add(lq as usize)).ops[1],
@@ -1723,9 +1736,9 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         let mut reuse = -1;
                         let mut q = nload as i32 - 1;
                         while q >= 0 && reuse < 0 {
-                            let l = loads[q as usize];
+                            let l = *loads.get_unchecked_mut(q as usize);
                             let il = &*insns.add(l as usize);
-                            if loadsz[q as usize] < usz
+                            if *loadsz.get_unchecked_mut(q as usize) < usz
                                 || il.seg as u32 != ffi::OCERZ_SEG_NONE
                                 || il.addrsize != 8
                                 || *undo_ld(l as usize) != 0
@@ -1739,7 +1752,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                             }
                             let mut ok = 1;
                             for t in 0..nstore {
-                                let st = stores[t];
+                                let st = *stores.get_unchecked_mut(t);
                                 if ok != 0
                                     && st > l
                                     && mem_may_alias(
@@ -1758,9 +1771,10 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                             q -= 1;
                         }
                         if reuse >= 0 {
-                            let l = loads[reuse as usize];
+                            let l = *loads.get_unchecked_mut(reuse as usize);
                             *undo_ld(l as usize) = nundo as u8;
-                            *undo_ldsz(l as usize) = loadsz[reuse as usize] as u8;
+                            *undo_ldsz(l as usize) =
+                                *loadsz.get_unchecked_mut(reuse as usize) as u8;
                             *undo_ldst(l as usize) = j as i16;
                             *undo_from(j as usize) = l as i16;
                             cost_extra += 1;
@@ -1769,7 +1783,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         }
                     }
                     if nstore < 64 {
-                        stores[nstore] = j;
+                        *stores.get_unchecked_mut(nstore) = j;
                         nstore += 1;
                     }
                     gprs |= fpb2_membits(d);
@@ -1777,8 +1791,8 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                     let t = (full | s0 | d0) & sbit;
                     if t != 0 {
                         if nst < 16 {
-                            st_at[nst] = j;
-                            st_cls[nst] = if lane_only != 0 {
+                            *st_at.get_unchecked_mut(nst) = j;
+                            *st_cls.get_unchecked_mut(nst) = if lane_only != 0 {
                                 if dbl != 0 { 3 } else { 2 }
                             } else if (full & sbit) != 0 {
                                 1
@@ -1813,7 +1827,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         if nload >= 64 {
                             break;
                         }
-                        loadsz[nload] = if k == K2_MOVE || k == K2_SHUF {
+                        *loadsz.get_unchecked_mut(nload) = if k == K2_MOVE || k == K2_SHUF {
                             16
                         } else if k == K2_LMOVE {
                             if dbl != 0 { 8 } else { 4 }
@@ -1830,7 +1844,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         } else {
                             0
                         };
-                        loads[nload] = j;
+                        *loads.get_unchecked_mut(nload) = j;
                         nload += 1;
                         gprs |= fpb2_membits(sr);
                         is_mem = 1;
@@ -1864,16 +1878,16 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                                 },
                             ];
                             for q in 0..2 {
-                                let sx = srcs[q];
+                                let sx = *srcs.get_unchecked(q);
                                 if sx >= 16 || sx == dr || is_mm || n_edges >= 64 {
                                     continue;
                                 }
                                 let xb = 1u16 << sx;
                                 if packed != 0
                                     && (full & xb) != 0
-                                    && taint_dbl[sx as usize] == dbl as u8
+                                    && *taint_dbl.get_unchecked_mut(sx as usize) == dbl as u8
                                 {
-                                    edges[n_edges] = FpbEdge {
+                                    *edges.get_unchecked_mut(n_edges) = FpbEdge {
                                         s: sx as u8,
                                         d: dr as u8,
                                         cls: 0,
@@ -1882,7 +1896,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                                     n_edges += 1;
                                 }
                                 if dbl == 0 && (s0 & xb) != 0 && n_edges < 64 {
-                                    edges[n_edges] = FpbEdge {
+                                    *edges.get_unchecked_mut(n_edges) = FpbEdge {
                                         s: sx as u8,
                                         d: dr as u8,
                                         cls: 1,
@@ -1891,7 +1905,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                                     n_edges += 1;
                                 }
                                 if dbl != 0 && (d0 & xb) != 0 && n_edges < 64 {
-                                    edges[n_edges] = FpbEdge {
+                                    *edges.get_unchecked_mut(n_edges) = FpbEdge {
                                         s: sx as u8,
                                         d: dr as u8,
                                         cls: 2,
@@ -1900,14 +1914,14 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                                     n_edges += 1;
                                 }
                             }
-                            taint_dbl[dr as usize] = dbl as u8;
+                            *taint_dbl.get_unchecked_mut(dr as usize) = dbl as u8;
                             if dbl == 0 {
                                 everf |= dbit;
                             } else {
                                 everf &= !dbit;
                             }
                             if is_mm || (sq != 0 && srr != dr) {
-                                lastbreak[dr as usize] = j;
+                                *lastbreak.get_unchecked_mut(dr as usize) = j;
                             }
                             reads = sbit | vbit | if fma { dbit } else { 0 };
                             writes = dbit;
@@ -1939,7 +1953,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         K2_MOVE => {
                             reads = sbit;
                             writes = dbit;
-                            lastbreak[dr as usize] = j;
+                            *lastbreak.get_unchecked_mut(dr as usize) = j;
                             if from_mem != 0 {
                                 full &= !dbit;
                                 s0 &= !dbit;
@@ -1951,13 +1965,14 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                                 full = (full & !dbit) | if (full & sbit) != 0 { dbit } else { 0 };
                                 s0 = (s0 & !dbit) | if (s0 & sbit) != 0 { dbit } else { 0 };
                                 d0 = (d0 & !dbit) | if (d0 & sbit) != 0 { dbit } else { 0 };
-                                taint_dbl[dr as usize] = taint_dbl[srr as usize];
+                                *taint_dbl.get_unchecked_mut(dr as usize) =
+                                    *taint_dbl.get_unchecked_mut(srr as usize);
                             }
                         }
                         K2_LMOVE => {
                             reads = sbit | if from_mem != 0 { 0 } else { dbit };
                             writes = dbit;
-                            lastbreak[dr as usize] = j;
+                            *lastbreak.get_unchecked_mut(dr as usize) = j;
                             if dbl == 0 || (everf & sbit) != 0 {
                                 everf |= dbit;
                             }
@@ -1987,12 +2002,12 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                                     }
                                     d0 &= !dbit;
                                 }
-                                taint_dbl[dr as usize] = dbl as u8;
+                                *taint_dbl.get_unchecked_mut(dr as usize) = dbl as u8;
                             }
                         }
                         K2_ZERO => {
                             writes = dbit;
-                            lastbreak[dr as usize] = j;
+                            *lastbreak.get_unchecked_mut(dr as usize) = j;
                             full &= !dbit;
                             s0 &= !dbit;
                             d0 &= !dbit;
@@ -2001,7 +2016,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         K2_UNPCKH => {
                             reads = sbit | dbit;
                             writes = dbit;
-                            lastbreak[dr as usize] = j;
+                            *lastbreak.get_unchecked_mut(dr as usize) = j;
                             if (full & sbit) != 0 || (full & dbit) != 0 {
                                 full |= dbit;
                                 d0 &= !dbit;
@@ -2015,7 +2030,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         K2_UNPCKL => {
                             reads = sbit | dbit;
                             writes = dbit;
-                            lastbreak[dr as usize] = j;
+                            *lastbreak.get_unchecked_mut(dr as usize) = j;
                             if ((full | d0 | s0) & sbit) != 0 {
                                 full |= dbit;
                                 d0 &= !dbit;
@@ -2025,7 +2040,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         K2_DUP => {
                             reads = sbit;
                             writes = dbit;
-                            lastbreak[dr as usize] = j;
+                            *lastbreak.get_unchecked_mut(dr as usize) = j;
                             everf = (everf & !dbit)
                                 | if from_mem == 0 && (everf & sbit) != 0 {
                                     dbit
@@ -2050,7 +2065,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                             };
                             reads = sbit | vb2;
                             writes = dbit;
-                            lastbreak[dr as usize] = j;
+                            *lastbreak.get_unchecked_mut(dr as usize) = j;
                             let srcs2 = sbit | vb2;
                             everf = (everf & !dbit) | if (everf & srcs2) != 0 { dbit } else { 0 };
                             if ((full | d0 | s0) & srcs2) != 0 {
@@ -2066,7 +2081,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         _ => {}
                     }
                     if dr < 16 {
-                        lastw[dr as usize] = j;
+                        *lastw.get_unchecked_mut(dr as usize) = j;
                     }
                 }
                 ckpt |= reads & !written;
@@ -2098,10 +2113,10 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                     *stchk(end as usize) = 0;
                     *stlane(end as usize) = 0;
                     for q in 0..nst {
-                        if st_at[q] == end {
-                            if st_cls[q] == 1 {
+                        if *st_at.get_unchecked_mut(q) == end {
+                            if *st_cls.get_unchecked_mut(q) == 1 {
                                 full |= sb;
-                            } else if st_cls[q] == 3 {
+                            } else if *st_cls.get_unchecked_mut(q) == 3 {
                                 d0 |= sb;
                             } else {
                                 s0 |= sb;
@@ -2156,10 +2171,10 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
             let mut ts = s0 & t;
             let mut td = d0 & t;
             for q in 0..nst {
-                if q >= nst || st_at[q] > end {
+                if q >= nst || *st_at.get_unchecked_mut(q) > end {
                     break;
                 }
-                let sj = st_at[q];
+                let sj = *st_at.get_unchecked_mut(q);
                 let sb = *stchk(sj as usize);
                 let mut later = 0;
                 for m in sj + 1..=end {
@@ -2186,9 +2201,9 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                 sites -= 1;
                 *stchk(sj as usize) = 0;
                 *stlane(sj as usize) = 0;
-                if st_cls[q] == 1 {
+                if *st_cls.get_unchecked_mut(q) == 1 {
                     tf |= sb;
-                } else if st_cls[q] == 3 {
+                } else if *st_cls.get_unchecked_mut(q) == 3 {
                     td |= sb;
                 } else {
                     ts |= sb;
@@ -2218,24 +2233,24 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
             while changed != 0 {
                 changed = 0;
                 for e in 0..n_edges {
-                    let s = edges[e].s as usize;
-                    let dd = edges[e].d as usize;
-                    let tt = edges[e].t;
+                    let s = edges.get_unchecked_mut(e).s as usize;
+                    let dd = edges.get_unchecked_mut(e).d as usize;
+                    let tt = edges.get_unchecked_mut(e).t;
                     if s == dd || tt > end {
                         continue;
                     }
-                    if lastbreak[dd] > tt || lastw[s] > tt {
+                    if *lastbreak.get_unchecked_mut(dd) > tt || *lastw.get_unchecked_mut(s) > tt {
                         continue;
                     }
                     if (u & (1u16 << dd)) == 0 {
                         continue;
                     }
-                    if edges[e].cls == 0 {
+                    if edges.get_unchecked_mut(e).cls == 0 {
                         if (tf & (1u16 << s)) != 0 {
                             tf &= !(1u16 << s);
                             changed = 1;
                         }
-                    } else if edges[e].cls == 1 {
+                    } else if edges.get_unchecked_mut(e).cls == 1 {
                         if (ts & (1u16 << s)) != 0 && (tf & (1u16 << s)) == 0 {
                             ts &= !(1u16 << s);
                             changed = 1;
@@ -2247,7 +2262,7 @@ pub unsafe extern "C" fn fpb_scan_v2(insns: *const ffi::X86Insn, n: c_int, bat: 
                         }
                     }
                     if (exitchk & (1u16 << s)) != 0 {
-                        if edges[e].cls == 0 || (full & (1u16 << s)) == 0 {
+                        if edges.get_unchecked_mut(e).cls == 0 || (full & (1u16 << s)) == 0 {
                             exitchk &= !(1u16 << s);
                             changed = 1;
                         }
@@ -2560,8 +2575,8 @@ pub unsafe extern "C" fn fpb_emit_regs_check(
         ffi::a64_bcond(b, A64_VS, 0);
         (*st).back = ffi::a64_label(b);
         for r in 0..16 {
-            (*st).l0[r] = *l0.add(r);
-            (*st).l0_dbl[r] = *l0_dbl.add(r);
+            *(*st).l0.get_unchecked_mut(r) = *l0.add(r);
+            *(*st).l0_dbl.get_unchecked_mut(r) = *l0_dbl.add(r);
         }
         (*st).fcmp_a = -1;
         (*st).fcmp_b = -1;

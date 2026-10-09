@@ -19,7 +19,7 @@ pub unsafe extern "C" fn l0_enabled() -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub static mut g_l0: [i8; 16] = [-1; 16];
+pub static mut g_l0: [i8; 16] = [0; 16];
 
 #[unsafe(no_mangle)]
 pub static mut g_l0_dbl: [u8; 16] = [0; 16];
@@ -28,7 +28,7 @@ pub static mut g_l0_dbl: [u8; 16] = [0; 16];
 pub static mut g_l0_owners: [u16; 12] = [0; 12];
 
 #[unsafe(no_mangle)]
-pub static mut g_l0_next: c_int = 0;
+pub static mut g_l0_next: c_uint = 0;
 
 #[unsafe(no_mangle)]
 pub static mut g_l0_nlanes: c_int = 12;
@@ -93,12 +93,12 @@ pub unsafe extern "C" fn lanerec_note(off: u32) {
             yc: [0; 16],
         };
         for i in 0..16usize {
-            r.l0[i] = if *l0v(i) < 0 {
+            *r.l0.get_unchecked_mut(i) = if *l0v(i) < 0 {
                 0xff
             } else {
                 ((*l0v(i) - 4) | if *l0d(i) != 0 { 0x10 } else { 0 }) as u8
             };
-            r.yc[i] = if *ycv(i) < 0 {
+            *r.yc.get_unchecked_mut(i) = if *ycv(i) < 0 {
                 0xff
             } else {
                 (*ycv(i) - 4) as u8
@@ -186,8 +186,8 @@ pub unsafe extern "C" fn l0_alloc2(b: *mut ffi::A64Buf, r: c_uint, dbl: c_int) -
             return t;
         }
         l0_inval(r);
-        let t = 4 + g_l0_next.wrapping_rem(g_l0_nlanes);
-        g_l0_next += 1;
+        let t = 4 + (g_l0_next % g_l0_nlanes as c_uint) as c_int;
+        g_l0_next = g_l0_next.wrapping_add(1);
         g_lane_used |= 1u16 << (t - 4);
         let own = *owners((t - 4) as usize);
         for i in 0..16usize {
@@ -332,7 +332,7 @@ pub unsafe extern "C" fn emit_mov128_pair(
                 ffi::a64_ldp_q_off(b, va, vc, ra, d);
             } else {
                 ffi::a64_ldr_v(b, 16, va, ra, disp);
-                ffi::a64_ldr_v(b, 16, vc, ra, disp + 16);
+                ffi::a64_ldr_v(b, 16, vc, ra, disp.wrapping_add(16));
             }
             if a_.vex != 0 {
                 ffi::emit_ymmh_clear(b, ar as c_uint);
@@ -343,7 +343,7 @@ pub unsafe extern "C" fn emit_mov128_pair(
                 ffi::a64_stp_q_off(b, va, vc, ra, d);
             } else {
                 ffi::a64_str_v(b, 16, va, ra, disp);
-                ffi::a64_str_v(b, 16, vc, ra, disp + 16);
+                ffi::a64_str_v(b, 16, vc, ra, disp.wrapping_add(16));
             }
         }
         *(&raw mut ffi::g_mov_skip).cast::<u8>().add(i as usize + 1) = 1;
@@ -430,21 +430,21 @@ pub unsafe extern "C" fn l0_fixed_setup(
             let c = fpb_class(in_, &mut packed, &mut dbl, &mut from_mem, &mut sq);
             if in_.nops >= 1 && in_.ops[0].kind as u32 == ffi::OCERZ_OPK_XMM {
                 let dr = in_.ops[0].reg as usize;
-                if wfirst[dr] == 0 {
+                if *wfirst.get_unchecked_mut(dr) == 0 {
                     let selfzero = in_.vex == 0
                         && (in_.op as u32 == ffi::OCERZ_OP_XORPS
                             || in_.op as u32 == ffi::OCERZ_OP_PXOR)
                         && in_.nops >= 2
                         && in_.ops[1].kind as u32 == ffi::OCERZ_OPK_XMM
                         && in_.ops[1].reg as usize == dr;
-                    wfirst[dr] = if c == 2 || selfzero { 2 } else { 1 };
+                    *wfirst.get_unchecked_mut(dr) = if c == 2 || selfzero { 2 } else { 1 };
                 }
             }
             if in_.nops >= 2
                 && in_.ops[1].kind as u32 == ffi::OCERZ_OPK_XMM
-                && wfirst[in_.ops[1].reg as usize] == 0
+                && *wfirst.get_unchecked_mut(in_.ops[1].reg as usize) == 0
             {
-                wfirst[in_.ops[1].reg as usize] = 1;
+                *wfirst.get_unchecked_mut(in_.ops[1].reg as usize) = 1;
             }
             let mut use_ = ((c == 1 || c == 3) && packed == 0) as c_int;
             if use_ == 0
@@ -468,9 +468,9 @@ pub unsafe extern "C" fn l0_fixed_setup(
                     (*insns.add(i + 1)).ops[1].reg as usize,
                 ];
                 for q in 0..5 {
-                    cnt[regs[q]] += 1;
-                    if firstdbl[regs[q]] < 0 {
-                        firstdbl[regs[q]] = pd;
+                    *cnt.get_unchecked_mut(regs[q]) += 1;
+                    if *firstdbl.get_unchecked_mut(regs[q]) < 0 {
+                        *firstdbl.get_unchecked_mut(regs[q]) = pd;
                     }
                 }
                 continue;
@@ -479,11 +479,11 @@ pub unsafe extern "C" fn l0_fixed_setup(
                 continue;
             }
             for q in 0..in_.nops.min(2) as usize {
-                let o = &in_.ops[q];
+                let o = &in_.ops.get_unchecked(q);
                 if o.kind as u32 == ffi::OCERZ_OPK_XMM && xmm_is_pinned(o.reg as c_uint) != 0 {
-                    cnt[o.reg as usize] += 1;
-                    if firstdbl[o.reg as usize] < 0 {
-                        firstdbl[o.reg as usize] = dbl as i8;
+                    *cnt.get_unchecked_mut(o.reg as usize) += 1;
+                    if *firstdbl.get_unchecked_mut(o.reg as usize) < 0 {
+                        *firstdbl.get_unchecked_mut(o.reg as usize) = dbl as i8;
                     }
                 }
             }
@@ -491,16 +491,21 @@ pub unsafe extern "C" fn l0_fixed_setup(
                 && xmm_is_pinned((in_.vvvv & 15) as c_uint) != 0
             {
                 let v = (in_.vvvv & 15) as usize;
-                cnt[v] += 1;
-                if firstdbl[v] < 0 {
-                    firstdbl[v] = dbl as i8;
+                *cnt.get_unchecked_mut(v) += 1;
+                if *firstdbl.get_unchecked_mut(v) < 0 {
+                    *firstdbl.get_unchecked_mut(v) = dbl as i8;
                 }
             }
         }
         let mut key = [0i32; 16];
         for r in 0..16 {
-            key[r] = if cnt[r] >= 2 {
-                cnt[r] + if wfirst[r] == 2 { 0 } else { 1000 }
+            *key.get_unchecked_mut(r) = if *cnt.get_unchecked_mut(r) >= 2 {
+                *cnt.get_unchecked_mut(r)
+                    + if *wfirst.get_unchecked_mut(r) == 2 {
+                        0
+                    } else {
+                        1000
+                    }
             } else {
                 0
             };
@@ -509,7 +514,11 @@ pub unsafe extern "C" fn l0_fixed_setup(
         for _k in 0..g_l0_nlanes {
             let mut best = -1i32;
             for r in 0..16usize {
-                if *fl(r) < 0 && key[r] > 0 && (best < 0 || key[r] > key[best as usize]) {
+                if *fl(r) < 0
+                    && *key.get_unchecked_mut(r) > 0
+                    && (best < 0
+                        || *key.get_unchecked_mut(r) > *key.get_unchecked_mut(best as usize))
+                {
                     best = r as i32;
                 }
             }
@@ -517,7 +526,7 @@ pub unsafe extern "C" fn l0_fixed_setup(
                 break;
             }
             *fl(best as usize) = (4 + lanes) as i8;
-            *fd(best as usize) = (firstdbl[best as usize] > 0) as u8;
+            *fd(best as usize) = (*firstdbl.get_unchecked_mut(best as usize) > 0) as u8;
             lanes += 1;
         }
         if lanes == 0 {
@@ -559,12 +568,14 @@ pub unsafe extern "C" fn yc_setup(
                 continue;
             }
             for k in 0..in_.nops as usize {
-                if in_.ops[k].kind as u32 == ffi::OCERZ_OPK_XMM && in_.ops[k].reg < 16 {
-                    cnt[in_.ops[k].reg as usize] += 1;
+                if in_.ops.get_unchecked(k).kind as u32 == ffi::OCERZ_OPK_XMM
+                    && in_.ops.get_unchecked(k).reg < 16
+                {
+                    *cnt.get_unchecked_mut(in_.ops.get_unchecked(k).reg as usize) += 1;
                 }
             }
             if (in_.vex & ffi::OCERZ_VEX_NDS as u8) != 0 {
-                cnt[(in_.vvvv & 15) as usize] += 1;
+                *cnt.get_unchecked_mut((in_.vvvv & 15) as usize) += 1;
             }
         }
         let mut used = g_lane_used;
@@ -577,7 +588,11 @@ pub unsafe extern "C" fn yc_setup(
         loop {
             let mut best = -1i32;
             for r in 0..16usize {
-                if *ycv(r) < 0 && cnt[r] > 0 && (best < 0 || cnt[r] > cnt[best as usize]) {
+                if *ycv(r) < 0
+                    && *cnt.get_unchecked_mut(r) > 0
+                    && (best < 0
+                        || *cnt.get_unchecked_mut(r) > *cnt.get_unchecked_mut(best as usize))
+                {
                     best = r as i32;
                 }
             }
@@ -787,11 +802,11 @@ pub unsafe extern "C" fn l0_pre_insn(b: *mut ffi::A64Buf, insn: *const ffi::X86I
         let mut kill: u16 = 0;
         fpb2_usedef(insn, &mut use_, &mut kill);
         for k in 0..in_.nops as usize {
-            if in_.ops[k].kind as u32 == ffi::OCERZ_OPK_XMM
-                && in_.ops[k].reg < 16
-                && (use_ & (1u16 << in_.ops[k].reg)) != 0
+            if in_.ops.get_unchecked(k).kind as u32 == ffi::OCERZ_OPK_XMM
+                && in_.ops.get_unchecked(k).reg < 16
+                && (use_ & (1u16 << in_.ops.get_unchecked(k).reg)) != 0
             {
-                l0_flush_reg(b, in_.ops[k].reg as c_uint);
+                l0_flush_reg(b, in_.ops.get_unchecked(k).reg as c_uint);
             }
         }
         if (in_.vex & ffi::OCERZ_VEX_NDS as u8) != 0 {
@@ -804,13 +819,13 @@ pub unsafe extern "C" fn l0_pre_insn(b: *mut ffi::A64Buf, insn: *const ffi::X86I
             l0_flush_reg(b, 0);
         }
         for k in 0..in_.nops as usize {
-            if in_.ops[k].kind as u32 == ffi::OCERZ_OPK_XMM
+            if in_.ops.get_unchecked(k).kind as u32 == ffi::OCERZ_OPK_XMM
                 && (k == 0
                     || in_.op as u32 == ffi::OCERZ_OP_BLENDVPD
                     || in_.op as u32 == ffi::OCERZ_OP_BLENDVPS
                     || in_.op as u32 == ffi::OCERZ_OP_PBLENDVB)
             {
-                l0_inval(in_.ops[k].reg as c_uint);
+                l0_inval(in_.ops.get_unchecked(k).reg as c_uint);
             }
         }
         if in_.op as u32 == ffi::OCERZ_OP_FXRSTOR || in_.op as u32 == ffi::OCERZ_OP_SYSCALL {
