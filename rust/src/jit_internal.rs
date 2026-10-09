@@ -16,7 +16,7 @@
     clippy::collapsible_if, clippy::needless_range_loop)]
 
 use core::ffi::{c_int, c_uint, c_void};
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::ffi::*;
 use crate::inline::{OCERZ_AF, OCERZ_CF, OCERZ_OF, OCERZ_PF, OCERZ_SF, OCERZ_ZF};
@@ -148,6 +148,35 @@ pub unsafe fn ocerz_h2g(haddr: *const c_void) -> u64 {
             }
         }
         h - ocerz_guest_base
+    }
+}
+
+#[inline(always)]
+pub unsafe fn ocerz_ld(gaddr: u64, size: c_int) -> u64 {
+    unsafe {
+        let p = ocerz_g2h(gaddr) as *mut u8;
+        match size {
+            1 => AtomicU8::from_ptr(p).load(Ordering::Acquire) as u64,
+            2 if (p as usize) & 1 == 0 => {
+                AtomicU16::from_ptr(p.cast()).load(Ordering::Acquire) as u64
+            }
+            4 if (p as usize) & 3 == 0 => {
+                AtomicU32::from_ptr(p.cast()).load(Ordering::Acquire) as u64
+            }
+            8 if (p as usize) & 7 == 0 => {
+                AtomicU64::from_ptr(p.cast()).load(Ordering::Acquire)
+            }
+            _ => {
+                let mut value = 0u64;
+                core::ptr::copy_nonoverlapping(
+                    p,
+                    &mut value as *mut u64 as *mut u8,
+                    size as usize,
+                );
+                fence(Ordering::Acquire);
+                value
+            }
+        }
     }
 }
 
