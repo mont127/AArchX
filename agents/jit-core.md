@@ -115,3 +115,16 @@ of 30 fresh processes:
 
 The candidate includes every piece ported since 16a7c2d (integer, fp, memory,
 tcache, ...), so these compare whole translators, not the core alone.
+
+### Direct calls into ported pieces (after the Rust decoder landed, ae45b15+)
+
+Switching the core's calls into jit_integer (31 functions), jit_memory (18)
+and jit_flags (16) from the `crate::ffi` extern declarations to explicit
+`use crate::ported::<piece>::{...}` imports gives a byte-identical `__text`
+section (`otool -t` hash equal; only debug info and the UUID differ). The ffi
+externs name the same symbols the Rust pieces define, and fat LTO over the
+single crate already resolves and inlines them, so a direct-call commit buys
+nothing and was not landed. The emission audit stayed MATCH with it. Same-tip
+timing, eight alternating runs, inside `translate`: ffi calls 657.2 ms,
+direct imports 663.6 ms (+1.0%, noise; 566-711 ms spread), C reference
+701.1 ms (Rust core -6.3%). Whole harness: 21.80 s / 21.79 s / 21.67 s.
