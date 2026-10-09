@@ -1281,7 +1281,7 @@ unsafe fn ad_choose_locked() {
     }
     if d.is_null() {
         crate::ocerz_log!(
-            "apidb: no API database at %s/macos\n\0",
+            "apidb: no API database at %s/macos\n",
             if have {
                 root.as_ptr()
             } else {
@@ -1357,14 +1357,14 @@ unsafe fn ad_choose_locked() {
     let gd = ptr::addr_of!(G_AD_DIR) as *const c_char;
     if *gd != 0 {
         crate::ocerz_log!(
-            "apidb: using %s for a guest declaring macOS %u.%u.%u\n\0",
+            "apidb: using %s for a guest declaring macOS %u.%u.%u\n",
             gd,
             minos >> 16,
             (minos >> 8) & 0xff,
             minos & 0xff
         );
     } else {
-        crate::ocerz_log!("apidb: %s holds no version directory\n\0", mac.as_ptr());
+        crate::ocerz_log!("apidb: %s holds no version directory\n", mac.as_ptr());
     }
     G_AD_CHOSEN.store(1, Ordering::SeqCst);
 }
@@ -1389,7 +1389,7 @@ pub unsafe extern "C" fn ocerz_apidb_set_minos(minos: u32) {
     if G_AD_CHOSEN.load(Ordering::SeqCst) == 0 {
         *ptr::addr_of_mut!(G_AD_MINOS) = minos;
     } else if minos != *ptr::addr_of!(G_AD_MINOS) {
-        crate::ocerz_log!("apidb: minimum macOS %#x arrived after the version directory was chosen, which stands\n\0",minos);
+        crate::ocerz_log!("apidb: minimum macOS %#x arrived after the version directory was chosen, which stands\n",minos);
     }
     ad_unlock();
 }
@@ -1527,7 +1527,7 @@ unsafe fn ad_load_locked(name: *const c_char) -> *const ffi::OcerzApiLibrary {
     }
     if libc::strcmp((*lib).install_name, name) != 0 {
         crate::ocerz_log!(
-            "apidb: %s describes %s, not %s\n\0",
+            "apidb: %s describes %s, not %s\n",
             path.as_ptr(),
             (*lib).install_name,
             name
@@ -1536,7 +1536,7 @@ unsafe fn ad_load_locked(name: *const c_char) -> *const ffi::OcerzApiLibrary {
         return ptr::null();
     }
     crate::ocerz_log!(
-        "apidb: loaded %s, %d exports and %d shapes\n\0",
+        "apidb: loaded %s, %d exports and %d shapes\n",
         path.as_ptr(),
         (*lib).nentries,
         (*lib).nshapes
