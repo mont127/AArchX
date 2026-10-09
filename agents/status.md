@@ -24,7 +24,7 @@
 | jit_flags.c | 2778 | jit-flags-agent | in progress |
 | jit_fp.c | 3203 | jit-fp-agent | in progress |
 | jit_integer.c | 2678 | jit-integer-agent | ported: rust/src/ported/jit_integer.rs, emit audit MATCH, no C shim (agents/jit-integer.md) |
-| jit_memory.c | 2184 | jit-memory-agent | in progress |
+| jit_memory.c | 2184 | jit-memory-agent | ported: rust/src/ported/jit_memory.rs, emit audit MATCH, no C shim (agents/jit-memory.md) |
 | jit_simd.c | 3121 | jit-simd-agent | in progress |
 | jit_tcache.c | 1063 | jit-tcache-agent | in progress |
 | loader.c | 378 | runtime (ee47e957) | in progress |
