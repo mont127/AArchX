@@ -453,11 +453,11 @@ pub unsafe extern "C" fn emit_const_lit(
         a64_mov_imm64(b, rd, v);
         return;
     }
-    g_raslit[g_n_raslit as usize].site = a64_label(b);
-    g_raslit[g_n_raslit as usize].retaddr = v;
-    g_raslit[g_n_raslit as usize].kind = 1 as ::core::ffi::c_int;
-    g_raslit[g_n_raslit as usize].tcr = 0 as ::core::ffi::c_int;
-    g_raslit[g_n_raslit as usize].rt = rd;
+    (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).site = a64_label(b);
+    (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).retaddr = v;
+    (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).kind = 1 as ::core::ffi::c_int;
+    (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).tcr = 0 as ::core::ffi::c_int;
+    (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).rt = rd;
     g_n_raslit += 1;
     a64_emit32(b, 0x58000000 as uint32_t | (rd & 31 as ::core::ffi::c_int) as uint32_t);
 }
@@ -479,8 +479,8 @@ pub static mut g_stop_extra: [JitState_g_stop_extra; 6] = [JitState_g_stop_extra
 pub static mut g_n_stop_extra: ::core::ffi::c_int = 0;
 unsafe extern "C" fn stop_extra_add(mut site: *mut uint32_t, mut target: *mut uint32_t) {
     if g_n_stop_extra < 6 as ::core::ffi::c_int {
-        g_stop_extra[g_n_stop_extra as usize].site = site;
-        g_stop_extra[g_n_stop_extra as usize].target = target;
+        (*(&raw mut g_stop_extra)).get_unchecked_mut(g_n_stop_extra as usize).site = site;
+        (*(&raw mut g_stop_extra)).get_unchecked_mut(g_n_stop_extra as usize).target = target;
         g_n_stop_extra += 1;
     }
 }
@@ -518,7 +518,7 @@ pub static mut g_call_edge: [JitState_g_call_edge; 2] = [JitState_g_call_edge {
 #[unsafe(no_mangle)]
 pub static mut g_n_call_edges: ::core::ffi::c_int = 0;
 #[unsafe(no_mangle)]
-pub static mut ps_shapes: [[[::core::ffi::c_char; 96]; 3]; 559] = [
+pub static mut ps_shapes: [[[::core::ffi::c_char; 96]; 3]; OCERZ_OP_COUNT as usize] = [
     [
         [
             0 as ::core::ffi::c_int as ::core::ffi::c_char,
@@ -1193,7 +1193,7 @@ unsafe extern "C" fn ps_note_shape(mut insn: *const X86Insn) {
     );
     let mut i: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
     while i < 3 as ::core::ffi::c_int {
-        if ps_shapes[o as usize][i as usize][0 as ::core::ffi::c_int as usize]
+        if *(*(&raw mut ps_shapes)).get_unchecked_mut(o as usize).get_unchecked_mut(i as usize).get_unchecked_mut(0 as ::core::ffi::c_int as usize)
             as ::core::ffi::c_int == 0 as ::core::ffi::c_int
         {
             snprintf(
@@ -1257,43 +1257,43 @@ unsafe extern "C" fn jit_perfstat_one(insn: *const X86Insn) {
     ps_slow_insns.fetch_add(1, Ordering::SeqCst);
     let op = (*insn).op as u32;
     if (op as usize) < OCERZ_OP_COUNT as usize {
-        let n = ps_ops[op as usize].fetch_add(1, Ordering::SeqCst) + 1;
+        let n = ps_ops.get_unchecked(op as usize).fetch_add(1, Ordering::SeqCst) + 1;
         if n & 0xff == 1 {
             ps_note_shape(insn);
         }
     }
     if op == OCERZ_OP_PUSH as u32 || op == OCERZ_OP_POP as u32 {
-        let operand = (*insn).ops[0];
+        let operand = *(*insn).ops.get_unchecked(0);
         let simple = (*insn).opsize == 8
             && (*insn).seg as u32 == OCERZ_SEG_NONE
             && ((operand.kind as u32 == OCERZ_OPK_REG && operand.high8 == 0)
                 || operand.kind as u32 == OCERZ_OPK_IMM);
         let shape = if op == OCERZ_OP_PUSH as u32 { 0 } else { 1 };
-        ps_shape[shape][if simple { 0 } else { 1 }].fetch_add(1, Ordering::SeqCst);
+        ps_shape.get_unchecked(shape).get_unchecked(if simple { 0 } else { 1 }).fetch_add(1, Ordering::SeqCst);
     } else if op == OCERZ_OP_TEST as u32 || op == OCERZ_OP_MOVSXD as u32 {
-        let operand = (*insn).ops[0];
+        let operand = *(*insn).ops.get_unchecked(0);
         let simple = (operand.size == 4 || operand.size == 8)
             && operand.kind as u32 == OCERZ_OPK_REG
             && operand.high8 == 0;
         let shape = if op == OCERZ_OP_TEST as u32 { 2 } else { 3 };
-        ps_shape[shape][if simple { 0 } else { 1 }].fetch_add(1, Ordering::SeqCst);
+        ps_shape.get_unchecked(shape).get_unchecked(if simple { 0 } else { 1 }).fetch_add(1, Ordering::SeqCst);
     } else if op == OCERZ_OP_CALL as u32 || op == OCERZ_OP_RET as u32 {
         if op == OCERZ_OP_CALL as u32 {
-            ps_shape[4][if (*insn).ops[0].kind as u32 == OCERZ_OPK_IMM { 0 } else { 1 }]
+            ps_shape.get_unchecked(4).get_unchecked(if (*insn).ops.get_unchecked(0).kind as u32 == OCERZ_OPK_IMM { 0 } else { 1 })
                 .fetch_add(1, Ordering::SeqCst);
         } else {
-            ps_shape[5][if (*insn).nops == 0 { 0 } else { 1 }]
+            ps_shape.get_unchecked(5).get_unchecked(if (*insn).nops == 0 { 0 } else { 1 })
                 .fetch_add(1, Ordering::SeqCst);
         }
     } else if op == OCERZ_OP_JMP as u32 {
-        let direct = (*insn).ops[0].kind as u32 == OCERZ_OPK_IMM;
-        ps_shape[6][if direct { 0 } else { 1 }].fetch_add(1, Ordering::SeqCst);
+        let direct = (*insn).ops.get_unchecked(0).kind as u32 == OCERZ_OPK_IMM;
+        ps_shape.get_unchecked(6).get_unchecked(if direct { 0 } else { 1 }).fetch_add(1, Ordering::SeqCst);
         if !direct {
-            let is_reg = (*insn).ops[0].kind as u32 == OCERZ_OPK_REG;
-            ps_shape[7][if is_reg { 0 } else { 1 }].fetch_add(1, Ordering::SeqCst);
+            let is_reg = (*insn).ops.get_unchecked(0).kind as u32 == OCERZ_OPK_REG;
+            ps_shape.get_unchecked(7).get_unchecked(if is_reg { 0 } else { 1 }).fetch_add(1, Ordering::SeqCst);
             if !is_reg {
                 let plain = (*insn).seg as u32 == OCERZ_SEG_NONE && (*insn).addrsize != 4;
-                ps_shape[8][if plain { 0 } else { 1 }].fetch_add(1, Ordering::SeqCst);
+                ps_shape.get_unchecked(8).get_unchecked(if plain { 0 } else { 1 }).fetch_add(1, Ordering::SeqCst);
             }
         }
     }
@@ -1309,7 +1309,7 @@ pub unsafe extern "C" fn jit_exec_one(
 ) -> ::core::ffi::c_int {
     if ((*insn).op as ::core::ffi::c_int == OCERZ_OP_SYSCALL as ::core::ffi::c_int
         && (*insn).mode32 == 0
-        && (*cpu).gpr[OCERZ_RAX as ::core::ffi::c_int as usize]
+        && *(*cpu).gpr.get_unchecked(OCERZ_RAX as ::core::ffi::c_int as usize)
             == (2 as uint64_t) << 24 as ::core::ffi::c_int | 2 as uint64_t)
         as ::core::ffi::c_int as ::core::ffi::c_long != 0
     {
@@ -1344,20 +1344,20 @@ pub unsafe extern "C" fn jit_exec_one(
     let mut form: uint64_t = (*insn).op as uint64_t
         | (((*insn).vex as ::core::ffi::c_int & 3 as ::core::ffi::c_int) as uint64_t)
             << 16 as ::core::ffi::c_int
-        | (((*insn).ops[0 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        | (((*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             & 7 as ::core::ffi::c_int) as uint64_t) << 18 as ::core::ffi::c_int
-        | (((*insn).ops[1 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        | (((*insn).ops.get_unchecked(1 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             & 7 as ::core::ffi::c_int) as uint64_t) << 21 as ::core::ffi::c_int
-        | (((*insn).ops[2 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        | (((*insn).ops.get_unchecked(2 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             & 7 as ::core::ffi::c_int) as uint64_t) << 24 as ::core::ffi::c_int
         | ((*insn).opsize as uint64_t) << 32 as ::core::ffi::c_int;
     let mut i: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
     while i < (*insn).nops as ::core::ffi::c_int && i < 3 as ::core::ffi::c_int {
-        if (*insn).ops[i as usize].kind as ::core::ffi::c_int
+        if (*insn).ops.get_unchecked(i as usize).kind as ::core::ffi::c_int
             == OCERZ_OPK_IMM as ::core::ffi::c_int
         {
             form = (form as ::core::ffi::c_ulonglong
-                | (((*insn).ops[i as usize].imm & 0xff as uint64_t)
+                | (((*insn).ops.get_unchecked(i as usize).imm & 0xff as uint64_t)
                     << 40 as ::core::ffi::c_int
                     | (1 as uint64_t) << 48 as ::core::ffi::c_int)
                     as ::core::ffi::c_ulonglong) as uint64_t;
@@ -1366,7 +1366,7 @@ pub unsafe extern "C" fn jit_exec_one(
     }
     if (*insn).op as ::core::ffi::c_int == OCERZ_OP_SYSCALL as ::core::ffi::c_int {
         form = (*insn).op as uint64_t
-            | ((*cpu).gpr[OCERZ_RAX as ::core::ffi::c_int as usize] as uint32_t
+            | (*(*cpu).gpr.get_unchecked(OCERZ_RAX as ::core::ffi::c_int as usize) as uint32_t
                 as uint64_t) << 32 as ::core::ffi::c_int;
     }
     (*cpu).slow_op = form;
@@ -1434,7 +1434,7 @@ pub unsafe extern "C" fn emit_push_pinned(
         a64_sub_imm(b, 1 as ::core::ffi::c_int, hs, hs, 8 as uint32_t);
         let fresh0 = g_n_push_fix;
         g_n_push_fix = g_n_push_fix + 1;
-        g_push_fix[fresh0 as usize] = a64_label(b).offset_from(g_push_entry)
+        *(*(&raw mut g_push_fix)).get_unchecked_mut(fresh0 as usize) = a64_label(b).offset_from(g_push_entry)
             as ::core::ffi::c_long as uint32_t;
         a64_str_regoff(b, 8 as ::core::ffi::c_int, rv, JGB, hs, 0 as ::core::ffi::c_int);
         return;
@@ -1641,12 +1641,12 @@ pub unsafe extern "C" fn emit_jmp(
     {
         return 0 as ::core::ffi::c_int;
     }
-    if (*insn).ops[0 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+    if (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
         != OCERZ_OPK_IMM as ::core::ffi::c_int
     {
         return 0 as ::core::ffi::c_int;
     }
-    let mut target: uint64_t = (*insn).ops[0 as ::core::ffi::c_int as usize].imm;
+    let mut target: uint64_t = (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).imm;
     if g_no_chain == 0 && !g_loop_entry.is_null() && target == g_self_rip {
         l0_fixed_backedge(b);
         g_stop_patch = a64_label(b);
@@ -1689,14 +1689,14 @@ pub unsafe extern "C" fn emit_jmp(
             epilogue_sites,
             n_epi,
         );
-        g_jcc_edge[0 as ::core::ffi::c_int as usize].target_rip = target;
-        g_jcc_edge[0 as ::core::ffi::c_int as usize].patch_b = pb;
-        g_jcc_edge[0 as ::core::ffi::c_int as usize].kind = (if body_edge != 0 {
+        (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).target_rip = target;
+        (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).patch_b = pb;
+        (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).kind = (if body_edge != 0 {
             EDGE_BODY as ::core::ffi::c_int
         } else {
             EDGE_XBLOCK as ::core::ffi::c_int
         }) as uint8_t;
-        g_jcc_edge[0 as ::core::ffi::c_int as usize].pin_class = (if body_edge != 0 {
+        (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).pin_class = (if body_edge != 0 {
             edge_class as uint8_t as ::core::ffi::c_int
         } else {
             0 as ::core::ffi::c_int
@@ -1752,10 +1752,14 @@ pub unsafe extern "C" fn ocerz_ras_push(
             (*cpu).mode32 as ::core::ffi::c_int,
         );
         (*cpu)
-            .ras[(t & (OCERZ_RAS_SIZE - 1 as ::core::ffi::c_int) as uint32_t) as usize]
+            .ras.get_unchecked_mut(
+                (t & (OCERZ_RAS_SIZE - 1 as ::core::ffi::c_int) as uint32_t) as usize,
+            )
             .guest_rip = retaddr;
         (*cpu)
-            .ras[(t & (OCERZ_RAS_SIZE - 1 as ::core::ffi::c_int) as uint32_t) as usize]
+            .ras.get_unchecked_mut(
+                (t & (OCERZ_RAS_SIZE - 1 as ::core::ffi::c_int) as uint32_t) as usize,
+            )
             .host_entry = ras_entry_for(blk);
         (*cpu).ras_top = t.wrapping_add(1 as uint32_t);
         return;
@@ -1768,8 +1772,8 @@ pub unsafe extern "C" fn ocerz_ras_push(
         retaddr,
         (*cpu).mode32 as ::core::ffi::c_int,
     );
-    (*cpu).ras[t as usize].guest_rip = retaddr;
-    (*cpu).ras[t as usize].host_entry = ras_entry_for(blk_0);
+    (*cpu).ras.get_unchecked_mut(t as usize).guest_rip = retaddr;
+    (*cpu).ras.get_unchecked_mut(t as usize).host_entry = ras_entry_for(blk_0);
     (*cpu).ras_top = t.wrapping_add(1 as uint32_t);
 }
 #[unsafe(no_mangle)]
@@ -1874,13 +1878,13 @@ unsafe extern "C" fn emit_call_region_call(
 ) -> ::core::ffi::c_int {
     if g_pin_class != 2 as ::core::ffi::c_int || g_no_chain != 0
         || g_body_entry.is_null()
-        || (*insn).ops[0 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        || (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             != OCERZ_OPK_IMM as ::core::ffi::c_int || mem_native_store_ok() == 0
     {
         return 0 as ::core::ffi::c_int;
     }
     let mut retaddr: uint64_t = (*insn).rip.wrapping_add((*insn).len as uint64_t);
-    let mut target: uint64_t = (*insn).ops[0 as ::core::ffi::c_int as usize].imm;
+    let mut target: uint64_t = (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).imm;
     let mut rs: ::core::ffi::c_int = pin_slot(
         OCERZ_RSP as ::core::ffi::c_int as ::core::ffi::c_uint,
     );
@@ -1974,16 +1978,16 @@ unsafe extern "C" fn emit_call_region_call(
         RIP_OFF,
     );
     emit_step_epilogue_branch(b, epi_sites, n_epi);
-    g_call_edge[0 as ::core::ffi::c_int as usize].target_rip = target;
-    g_call_edge[0 as ::core::ffi::c_int as usize].patch_b = callee_patch;
-    g_call_edge[0 as ::core::ffi::c_int as usize].kind = EDGE_BODY as ::core::ffi::c_int
+    (*(&raw mut g_call_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).target_rip = target;
+    (*(&raw mut g_call_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).patch_b = callee_patch;
+    (*(&raw mut g_call_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).kind = EDGE_BODY as ::core::ffi::c_int
         as uint8_t;
-    g_call_edge[0 as ::core::ffi::c_int as usize].pin_class = 2 as uint8_t;
-    g_call_edge[1 as ::core::ffi::c_int as usize].target_rip = retaddr;
-    g_call_edge[1 as ::core::ffi::c_int as usize].patch_b = return_patch;
-    g_call_edge[1 as ::core::ffi::c_int as usize].kind = EDGE_BODY as ::core::ffi::c_int
+    (*(&raw mut g_call_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).pin_class = 2 as uint8_t;
+    (*(&raw mut g_call_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).target_rip = retaddr;
+    (*(&raw mut g_call_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).patch_b = return_patch;
+    (*(&raw mut g_call_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).kind = EDGE_BODY as ::core::ffi::c_int
         as uint8_t;
-    g_call_edge[1 as ::core::ffi::c_int as usize].pin_class = 2 as uint8_t;
+    (*(&raw mut g_call_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).pin_class = 2 as uint8_t;
     g_n_call_edges = 2 as ::core::ffi::c_int;
     return 1 as ::core::ffi::c_int;
 }
@@ -2149,7 +2153,7 @@ unsafe extern "C" fn emit_call_ret32(
         pin_slot(OCERZ_RSP as ::core::ffi::c_int as ::core::ffi::c_uint),
     );
     if (*insn).op as ::core::ffi::c_int == OCERZ_OP_CALL as ::core::ffi::c_int {
-        if (*insn).ops[0 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        if (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             != OCERZ_OPK_IMM as ::core::ffi::c_int
         {
             return 0 as ::core::ffi::c_int;
@@ -2159,7 +2163,7 @@ unsafe extern "C" fn emit_call_ret32(
         }
         let mut retaddr: uint64_t = (*insn).rip.wrapping_add((*insn).len as uint64_t)
             as uint32_t as uint64_t;
-        let mut target: uint64_t = (*insn).ops[0 as ::core::ffi::c_int as usize].imm;
+        let mut target: uint64_t = (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).imm;
         if target != retaddr && m32_ras_ok(insn) != 0 {
             let mut adr_site: *mut uint32_t = m32_ras_push(b, retaddr);
             a64_mov_imm64(b, JT1 as ::core::ffi::c_int, retaddr);
@@ -2204,22 +2208,22 @@ unsafe extern "C" fn emit_call_ret32(
             *fresh9 = a64_label(b);
             a64_b(b, 0 as int32_t);
             *n_epi += 1;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].target_rip = target;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].patch_b = pb_callee;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].cond_site = ::core::ptr::null_mut::<
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).target_rip = target;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).patch_b = pb_callee;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).cond_site = ::core::ptr::null_mut::<
                 uint32_t,
             >();
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].kind = EDGE_BODY
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).kind = EDGE_BODY
                 as ::core::ffi::c_int as uint8_t;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].pin_class = 3 as uint8_t;
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].target_rip = retaddr;
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].patch_b = pb_ret;
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].cond_site = ::core::ptr::null_mut::<
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).pin_class = 3 as uint8_t;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).target_rip = retaddr;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).patch_b = pb_ret;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).cond_site = ::core::ptr::null_mut::<
                 uint32_t,
             >();
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].kind = EDGE_BODY
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).kind = EDGE_BODY
                 as ::core::ffi::c_int as uint8_t;
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].pin_class = 3 as uint8_t;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).pin_class = 3 as uint8_t;
             g_n_jcc_edges = 2 as ::core::ffi::c_int;
             return 1 as ::core::ffi::c_int;
         }
@@ -2264,17 +2268,17 @@ unsafe extern "C" fn emit_call_ret32(
             epi_sites,
             n_epi,
         );
-        g_jcc_edge[0 as ::core::ffi::c_int as usize].target_rip = target;
-        g_jcc_edge[0 as ::core::ffi::c_int as usize].patch_b = pb;
-        g_jcc_edge[0 as ::core::ffi::c_int as usize].cond_site = ::core::ptr::null_mut::<
+        (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).target_rip = target;
+        (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).patch_b = pb;
+        (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).cond_site = ::core::ptr::null_mut::<
             uint32_t,
         >();
-        g_jcc_edge[0 as ::core::ffi::c_int as usize].kind = (if body_edge != 0 {
+        (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).kind = (if body_edge != 0 {
             EDGE_BODY as ::core::ffi::c_int
         } else {
             EDGE_XBLOCK as ::core::ffi::c_int
         }) as uint8_t;
-        g_jcc_edge[0 as ::core::ffi::c_int as usize].pin_class = (if body_edge != 0 {
+        (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).pin_class = (if body_edge != 0 {
             edge_class as uint8_t as ::core::ffi::c_int
         } else {
             0 as ::core::ffi::c_int
@@ -2285,14 +2289,14 @@ unsafe extern "C" fn emit_call_ret32(
     if (*insn).op as ::core::ffi::c_int == OCERZ_OP_RET as ::core::ffi::c_int {
         let mut pop: uint32_t = 4 as uint32_t;
         if (*insn).nops as ::core::ffi::c_int == 1 as ::core::ffi::c_int {
-            if (*insn).ops[0 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+            if (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
                 != OCERZ_OPK_IMM as ::core::ffi::c_int
             {
                 return 0 as ::core::ffi::c_int;
             }
             pop = pop
                 .wrapping_add(
-                    ((*insn).ops[0 as ::core::ffi::c_int as usize].imm
+                    ((*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).imm
                         & 0xffff as uint64_t) as uint32_t,
                 );
         }
@@ -2425,7 +2429,7 @@ pub unsafe extern "C" fn emit_call_ret(
         return 1 as ::core::ffi::c_int;
     }
     if (*insn).op as ::core::ffi::c_int == OCERZ_OP_CALL as ::core::ffi::c_int {
-        if (*insn).ops[0 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        if (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             != OCERZ_OPK_IMM as ::core::ffi::c_int
         {
             return 0 as ::core::ffi::c_int;
@@ -2434,7 +2438,7 @@ pub unsafe extern "C" fn emit_call_ret(
             return 0 as ::core::ffi::c_int;
         }
         let mut retaddr: uint64_t = (*insn).rip.wrapping_add((*insn).len as uint64_t);
-        let mut target: uint64_t = (*insn).ops[0 as ::core::ffi::c_int as usize].imm;
+        let mut target: uint64_t = (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).imm;
         g_chain_target = target;
         emit_const_lit(b, JT1 as ::core::ffi::c_int, retaddr);
         let mut fast3: ::core::ffi::c_int = (g_pin_class == 3 as ::core::ffi::c_int
@@ -2573,22 +2577,22 @@ pub unsafe extern "C" fn emit_call_ret(
             a64_b(b, 0 as int32_t);
             *n_epi += 1;
             g_chain_target = 0 as uint64_t;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].target_rip = target;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].patch_b = pb_callee;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].cond_site = ::core::ptr::null_mut::<
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).target_rip = target;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).patch_b = pb_callee;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).cond_site = ::core::ptr::null_mut::<
                 uint32_t,
             >();
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].kind = EDGE_BODY
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).kind = EDGE_BODY
                 as ::core::ffi::c_int as uint8_t;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].pin_class = 3 as uint8_t;
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].target_rip = retaddr;
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].patch_b = pb_ret;
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].cond_site = ::core::ptr::null_mut::<
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).pin_class = 3 as uint8_t;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).target_rip = retaddr;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).patch_b = pb_ret;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).cond_site = ::core::ptr::null_mut::<
                 uint32_t,
             >();
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].kind = EDGE_BODY
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).kind = EDGE_BODY
                 as ::core::ffi::c_int as uint8_t;
-            g_jcc_edge[1 as ::core::ffi::c_int as usize].pin_class = 3 as uint8_t;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(1 as ::core::ffi::c_int as usize).pin_class = 3 as uint8_t;
             g_n_jcc_edges = 2 as ::core::ffi::c_int;
             return 1 as ::core::ffi::c_int;
         }
@@ -2692,10 +2696,10 @@ pub unsafe extern "C" fn emit_call_ret(
                     a64_mov_imm64(b, JT1 as ::core::ffi::c_int, retaddr);
                 }
                 if lit != 0 {
-                    g_raslit[g_n_raslit as usize].site = a64_label(b);
-                    g_raslit[g_n_raslit as usize].retaddr = retaddr;
-                    g_raslit[g_n_raslit as usize].kind = 0 as ::core::ffi::c_int;
-                    g_raslit[g_n_raslit as usize].rt = JT0 as ::core::ffi::c_int;
+                    (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).site = a64_label(b);
+                    (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).retaddr = retaddr;
+                    (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).kind = 0 as ::core::ffi::c_int;
+                    (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).rt = JT0 as ::core::ffi::c_int;
                     g_n_raslit += 1;
                     a64_emit32(
                         b,
@@ -3000,10 +3004,10 @@ pub unsafe extern "C" fn emit_call_ret(
                 JT1 as ::core::ffi::c_int,
                 0 as ::core::ffi::c_int,
             );
-            ras_stale[nst as usize] = a64_label(b);
+            *ras_stale.get_unchecked_mut(nst as usize) = a64_label(b);
             a64_bcond(b, A64_NE as ::core::ffi::c_int, 0 as int32_t);
             nst += 1;
-            ras_stale[nst as usize] = a64_label(b);
+            *ras_stale.get_unchecked_mut(nst as usize) = a64_label(b);
             a64_cbz(b, 1 as ::core::ffi::c_int, host_reg, 0 as int32_t);
             nst += 1;
             if hostras == 0 {
@@ -3078,7 +3082,7 @@ pub unsafe extern "C" fn emit_call_ret(
                     );
                 }
             } else {
-                ras_stale[nst as usize] = a64_label(b);
+                *ras_stale.get_unchecked_mut(nst as usize) = a64_label(b);
                 a64_tbnz(
                     b,
                     JT0 as ::core::ffi::c_int,
@@ -3306,19 +3310,19 @@ pub unsafe extern "C" fn emit_call_ret(
             }
             let mut i: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
             while i < nst {
-                if *ras_stale[i as usize] & 0x7f000000 as uint32_t
+                if **ras_stale.get_unchecked(i as usize) & 0x7f000000 as uint32_t
                     == 0x36000000 as uint32_t
-                    || *ras_stale[i as usize] & 0x7f000000 as uint32_t
+                    || **ras_stale.get_unchecked(i as usize) & 0x7f000000 as uint32_t
                         == 0x37000000 as uint32_t
                 {
-                    a64_patch_tbz(ras_stale[i as usize], miss_pop);
-                } else if *ras_stale[i as usize] & 0xff000010 as uint32_t
+                    a64_patch_tbz(*ras_stale.get_unchecked(i as usize), miss_pop);
+                } else if **ras_stale.get_unchecked(i as usize) & 0xff000010 as uint32_t
                     == 0x54000000 as uint32_t
                 {
-                    a64_patch_bcond(ras_stale[i as usize], miss_pop);
+                    a64_patch_bcond(*ras_stale.get_unchecked(i as usize), miss_pop);
                 } else {
                     a64_patch_cbz(
-                        ras_stale[i as usize],
+                        *ras_stale.get_unchecked(i as usize),
                         if !null_pop.is_null() { null_pop } else { miss_pop },
                     );
                 }
@@ -3398,7 +3402,7 @@ pub unsafe extern "C" fn emit_dispatch_stub(
     );
     let fresh12 = nr;
     nr = nr + 1;
-    to_ret[fresh12 as usize] = a64_label(&raw mut b);
+    *to_ret.get_unchecked_mut(fresh12 as usize) = a64_label(&raw mut b);
     a64_cbnz(
         &raw mut b,
         0 as ::core::ffi::c_int,
@@ -3414,7 +3418,7 @@ pub unsafe extern "C" fn emit_dispatch_stub(
     );
     let fresh13 = nr;
     nr = nr + 1;
-    to_ret[fresh13 as usize] = a64_label(&raw mut b);
+    *to_ret.get_unchecked_mut(fresh13 as usize) = a64_label(&raw mut b);
     a64_cbnz(
         &raw mut b,
         0 as ::core::ffi::c_int,
@@ -3430,7 +3434,7 @@ pub unsafe extern "C" fn emit_dispatch_stub(
     );
     let fresh14 = nr;
     nr = nr + 1;
-    to_ret[fresh14 as usize] = a64_label(&raw mut b);
+    *to_ret.get_unchecked_mut(fresh14 as usize) = a64_label(&raw mut b);
     a64_cbnz(
         &raw mut b,
         0 as ::core::ffi::c_int,
@@ -3468,7 +3472,7 @@ pub unsafe extern "C" fn emit_dispatch_stub(
     );
     let fresh15 = nr;
     nr = nr + 1;
-    to_ret[fresh15 as usize] = a64_label(&raw mut b);
+    *to_ret.get_unchecked_mut(fresh15 as usize) = a64_label(&raw mut b);
     a64_bcond(&raw mut b, A64_CC as ::core::ffi::c_int, 0 as int32_t);
     if mode32 != 0 {
         let mut ok: ::core::ffi::c_int = a64_try_orr_imm(
@@ -3553,7 +3557,7 @@ pub unsafe extern "C" fn emit_dispatch_stub(
     while k < 6 as ::core::ffi::c_int {
         let fresh16 = nr;
         nr = nr + 1;
-        to_ret[fresh16 as usize] = a64_label(&raw mut b);
+        *to_ret.get_unchecked_mut(fresh16 as usize) = a64_label(&raw mut b);
         a64_cbz(
             &raw mut b,
             1 as ::core::ffi::c_int,
@@ -3612,11 +3616,11 @@ pub unsafe extern "C" fn emit_dispatch_stub(
     let mut retl: *mut uint32_t = a64_label(&raw mut b);
     let mut i: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
     while i < nr {
-        let mut w: uint32_t = *to_ret[i as usize];
+        let mut w: uint32_t = **to_ret.get_unchecked(i as usize);
         if w & 0xff000010 as uint32_t == 0x54000000 as uint32_t {
-            a64_patch_bcond(to_ret[i as usize], retl);
+            a64_patch_bcond(*to_ret.get_unchecked(i as usize), retl);
         } else {
-            a64_patch_cbz(to_ret[i as usize], retl);
+            a64_patch_cbz(*to_ret.get_unchecked(i as usize), retl);
         }
         i += 1;
     }
@@ -3728,11 +3732,11 @@ unsafe extern "C" fn emit_indirect_tail(
     }
     let mut psc_miss: *mut uint32_t = ::core::ptr::null_mut::<uint32_t>();
     if !psc.is_null() {
-        g_raslit[g_n_raslit as usize].site = a64_label(b);
-        g_raslit[g_n_raslit as usize].retaddr = psc as uintptr_t as uint64_t;
-        g_raslit[g_n_raslit as usize].kind = 1 as ::core::ffi::c_int;
-        g_raslit[g_n_raslit as usize].tcr = TCR_PSC as ::core::ffi::c_int;
-        g_raslit[g_n_raslit as usize].rt = JT2 as ::core::ffi::c_int;
+        (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).site = a64_label(b);
+        (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).retaddr = psc as uintptr_t as uint64_t;
+        (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).kind = 1 as ::core::ffi::c_int;
+        (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).tcr = TCR_PSC as ::core::ffi::c_int;
+        (*(&raw mut g_raslit)).get_unchecked_mut(g_n_raslit as usize).rt = JT2 as ::core::ffi::c_int;
         g_n_raslit += 1;
         a64_emit32(b, 0x58000000 as uint32_t | JT2 as ::core::ffi::c_int as uint32_t);
         a64_ubfx(
@@ -4351,14 +4355,14 @@ unsafe extern "C" fn emit_indirect32(
         epi_sites,
         n_epi,
     );
-    g_jcc_edge[0 as ::core::ffi::c_int as usize].target_rip = retaddr;
-    g_jcc_edge[0 as ::core::ffi::c_int as usize].patch_b = pb_ret;
-    g_jcc_edge[0 as ::core::ffi::c_int as usize].cond_site = ::core::ptr::null_mut::<
+    (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).target_rip = retaddr;
+    (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).patch_b = pb_ret;
+    (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).cond_site = ::core::ptr::null_mut::<
         uint32_t,
     >();
-    g_jcc_edge[0 as ::core::ffi::c_int as usize].kind = EDGE_BODY as ::core::ffi::c_int
+    (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).kind = EDGE_BODY as ::core::ffi::c_int
         as uint8_t;
-    g_jcc_edge[0 as ::core::ffi::c_int as usize].pin_class = 3 as uint8_t;
+    (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).pin_class = 3 as uint8_t;
     g_n_jcc_edges = 1 as ::core::ffi::c_int;
     return 1 as ::core::ffi::c_int;
 }
@@ -4372,7 +4376,7 @@ pub unsafe extern "C" fn emit_indirect_jmp(
     mut n_epi: *mut ::core::ffi::c_int,
 ) -> ::core::ffi::c_int {
     if (*insn).op as ::core::ffi::c_int != OCERZ_OP_JMP as ::core::ffi::c_int
-        || (*insn).ops[0 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        || (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             == OCERZ_OPK_IMM as ::core::ffi::c_int
     {
         return 0 as ::core::ffi::c_int;
@@ -4681,14 +4685,14 @@ pub unsafe extern "C" fn emit_bridge_fastcall(
     if (*mv).op as ::core::ffi::c_int != OCERZ_OP_MOV as ::core::ffi::c_int
         || (*mv).nops as ::core::ffi::c_int != 2 as ::core::ffi::c_int
         || (*mv).seg as ::core::ffi::c_int != OCERZ_SEG_NONE as ::core::ffi::c_int
-        || (*mv).ops[0 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        || (*mv).ops.get_unchecked(0 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             != OCERZ_OPK_REG as ::core::ffi::c_int
-        || (*mv).ops[0 as ::core::ffi::c_int as usize].reg as ::core::ffi::c_int
+        || (*mv).ops.get_unchecked(0 as ::core::ffi::c_int as usize).reg as ::core::ffi::c_int
             != OCERZ_R11 as ::core::ffi::c_int
-        || (*mv).ops[0 as ::core::ffi::c_int as usize].size as ::core::ffi::c_int
+        || (*mv).ops.get_unchecked(0 as ::core::ffi::c_int as usize).size as ::core::ffi::c_int
             != 4 as ::core::ffi::c_int
-        || (*mv).ops[0 as ::core::ffi::c_int as usize].high8 as ::core::ffi::c_int != 0
-        || (*mv).ops[1 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        || (*mv).ops.get_unchecked(0 as ::core::ffi::c_int as usize).high8 as ::core::ffi::c_int != 0
+        || (*mv).ops.get_unchecked(1 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             != OCERZ_OPK_IMM as ::core::ffi::c_int
     {
         return;
@@ -4702,7 +4706,7 @@ pub unsafe extern "C" fn emit_bridge_fastcall(
     {
         return;
     }
-    let mut id: uint64_t = (*mv).ops[1 as ::core::ffi::c_int as usize].imm as uint32_t
+    let mut id: uint64_t = (*mv).ops.get_unchecked(1 as ::core::ffi::c_int as usize).imm as uint32_t
         as uint64_t;
     if ocerz_vdylib_export_name(
         id,
@@ -4795,7 +4799,7 @@ pub unsafe extern "C" fn emit_bridge_fastcall(
         );
         let fresh18 = n_leaf_out;
         n_leaf_out = n_leaf_out + 1;
-        leaf_out[fresh18 as usize] = a64_label(b);
+        *leaf_out.get_unchecked_mut(fresh18 as usize) = a64_label(b);
         a64_bcond(b, A64_NE as ::core::ffi::c_int, 0 as int32_t);
         if leaf_limit != 0 {
             a64_mov_imm64(b, JT0 as ::core::ffi::c_int, leaf_limit);
@@ -4809,13 +4813,13 @@ pub unsafe extern "C" fn emit_bridge_fastcall(
             );
             let fresh19 = n_leaf_out;
             n_leaf_out = n_leaf_out + 1;
-            leaf_out[fresh19 as usize] = a64_label(b);
+            *leaf_out.get_unchecked_mut(fresh19 as usize) = a64_label(b);
             a64_bcond(b, A64_HI as ::core::ffi::c_int, 0 as int32_t);
         }
-        leaf_out_cb[n_leaf_out as usize] = 1 as uint8_t;
+        *leaf_out_cb.get_unchecked_mut(n_leaf_out as usize) = 1 as uint8_t;
         let fresh20 = n_leaf_out;
         n_leaf_out = n_leaf_out + 1;
-        leaf_out[fresh20 as usize] = emit_leaf_call_ret(
+        *leaf_out.get_unchecked_mut(fresh20 as usize) = emit_leaf_call_ret(
             b,
             leaf,
             (leaf_limit != 0 as uint64_t) as ::core::ffi::c_int,
@@ -4824,10 +4828,10 @@ pub unsafe extern "C" fn emit_bridge_fastcall(
         );
         let mut k: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
         while k < n_leaf_out {
-            if leaf_out_cb[k as usize] != 0 {
-                a64_patch_cbz(leaf_out[k as usize], a64_label(b));
+            if *leaf_out_cb.get_unchecked(k as usize) != 0 {
+                a64_patch_cbz(*leaf_out.get_unchecked(k as usize), a64_label(b));
             } else {
-                a64_patch_bcond(leaf_out[k as usize], a64_label(b));
+                a64_patch_bcond(*leaf_out.get_unchecked(k as usize), a64_label(b));
             }
             k += 1;
         }
@@ -5033,7 +5037,7 @@ pub unsafe extern "C" fn emit_indirect_call(
 ) -> ::core::ffi::c_int {
     g_dbg_ind_src = (*insn).rip;
     if (*insn).op as ::core::ffi::c_int != OCERZ_OP_CALL as ::core::ffi::c_int
-        || (*insn).ops[0 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
+        || (*insn).ops.get_unchecked(0 as ::core::ffi::c_int as usize).kind as ::core::ffi::c_int
             == OCERZ_OPK_IMM as ::core::ffi::c_int
     {
         return 0 as ::core::ffi::c_int;
@@ -5203,14 +5207,14 @@ pub unsafe extern "C" fn emit_indirect_call(
                 epi_sites,
                 n_epi,
             );
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].target_rip = retaddr;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].patch_b = pb_ret;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].cond_site = ::core::ptr::null_mut::<
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).target_rip = retaddr;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).patch_b = pb_ret;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).cond_site = ::core::ptr::null_mut::<
                 uint32_t,
             >();
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].kind = EDGE_BODY
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).kind = EDGE_BODY
                 as ::core::ffi::c_int as uint8_t;
-            g_jcc_edge[0 as ::core::ffi::c_int as usize].pin_class = 3 as uint8_t;
+            (*(&raw mut g_jcc_edge)).get_unchecked_mut(0 as ::core::ffi::c_int as usize).pin_class = 3 as uint8_t;
             g_n_jcc_edges = 1 as ::core::ffi::c_int;
         } else {
 
@@ -5795,21 +5799,21 @@ pub unsafe extern "C" fn oolslow_add(
     ea_cache_reset();
     let mut i: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
     while i < nsites {
-        g_oolslow[g_n_oolslow as usize].sites[i as usize] = *sites.offset(i as isize);
+        *(*(&raw mut g_oolslow)).get_unchecked_mut(g_n_oolslow as usize).sites.get_unchecked_mut(i as usize) = *sites.offset(i as isize);
         i += 1;
     }
-    g_oolslow[g_n_oolslow as usize].nsites = nsites;
-    g_oolslow[g_n_oolslow as usize].insn = insn;
-    g_oolslow[g_n_oolslow as usize].back = back;
-    g_oolslow[g_n_oolslow as usize].pre = g_oolslow_pre;
+    (*(&raw mut g_oolslow)).get_unchecked_mut(g_n_oolslow as usize).nsites = nsites;
+    (*(&raw mut g_oolslow)).get_unchecked_mut(g_n_oolslow as usize).insn = insn;
+    (*(&raw mut g_oolslow)).get_unchecked_mut(g_n_oolslow as usize).back = back;
+    (*(&raw mut g_oolslow)).get_unchecked_mut(g_n_oolslow as usize).pre = g_oolslow_pre;
     let mut r: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
     while r < 16 as ::core::ffi::c_int {
-        g_oolslow[g_n_oolslow as usize].l0[r as usize] = g_l0[r as usize];
-        g_oolslow[g_n_oolslow as usize].l0_dbl[r as usize] = g_l0_dbl[r as usize];
+        *(*(&raw mut g_oolslow)).get_unchecked_mut(g_n_oolslow as usize).l0.get_unchecked_mut(r as usize) = *(*(&raw mut g_l0)).get_unchecked_mut(r as usize);
+        *(*(&raw mut g_oolslow)).get_unchecked_mut(g_n_oolslow as usize).l0_dbl.get_unchecked_mut(r as usize) = *(*(&raw mut g_l0_dbl)).get_unchecked_mut(r as usize);
         r += 1;
     }
-    g_oolslow[g_n_oolslow as usize].l0_dirty = g_l0_dirty;
-    g_oolslow[g_n_oolslow as usize].yc_dirty = g_yc_dirty;
+    (*(&raw mut g_oolslow)).get_unchecked_mut(g_n_oolslow as usize).l0_dirty = g_l0_dirty;
+    (*(&raw mut g_oolslow)).get_unchecked_mut(g_n_oolslow as usize).yc_dirty = g_yc_dirty;
     g_oolslow_pre = 0 as uint32_t;
     g_n_oolslow += 1;
     return 1 as ::core::ffi::c_int;
@@ -5822,14 +5826,14 @@ pub unsafe extern "C" fn emit_oolslow_arms(
 ) {
     let mut k: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
     while k < g_n_oolslow {
-        let mut sane: ::core::ffi::c_int = (g_oolslow[k as usize].back
-            >= g_push_entry as *mut uint32_t && g_oolslow[k as usize].back < (*b).p)
+        let mut sane: ::core::ffi::c_int = ((*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).back
+            >= g_push_entry as *mut uint32_t && (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).back < (*b).p)
             as ::core::ffi::c_int;
         let mut i: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
-        while sane != 0 && i < g_oolslow[k as usize].nsites {
-            sane = (g_oolslow[k as usize].sites[i as usize]
+        while sane != 0 && i < (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).nsites {
+            sane = (*(*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).sites.get_unchecked_mut(i as usize)
                 >= g_push_entry as *mut uint32_t
-                && g_oolslow[k as usize].sites[i as usize] < (*b).p)
+                && *(*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).sites.get_unchecked_mut(i as usize) < (*b).p)
                 as ::core::ffi::c_int;
             i += 1;
         }
@@ -5844,9 +5848,9 @@ pub unsafe extern "C" fn emit_oolslow_arms(
                 >(
                     *b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
                 );
-                if !g_oolslow[k as usize].insn.is_null() {
+                if !(*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).insn.is_null() {
                     ocerz_format_insn(
-                        g_oolslow[k as usize].insn,
+                        (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).insn,
                         &raw mut tb as *mut ::core::ffi::c_char,
                         ::core::mem::size_of::<[::core::ffi::c_char; 128]>() as size_t,
                     );
@@ -5856,34 +5860,34 @@ pub unsafe extern "C" fn emit_oolslow_arms(
                     b"ocerz: warning: dropping stale oolslow arm (site/back outside the current block) block=%#llx insn=%#llx back=%+ld site0=%+ld end=%ld nsites=%d %s\n\0"
                         as *const u8 as *const ::core::ffi::c_char,
                     g_self_rip as ::core::ffi::c_ulonglong,
-                    (if !g_oolslow[k as usize].insn.is_null() {
-                        (*g_oolslow[k as usize].insn).rip
+                    (if !(*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).insn.is_null() {
+                        (*(*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).insn).rip
                     } else {
                         0 as uint64_t
                     }) as ::core::ffi::c_ulonglong,
-                    g_oolslow[k as usize].back.offset_from(g_push_entry)
+                    (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).back.offset_from(g_push_entry)
                         as ::core::ffi::c_long,
-                    if g_oolslow[k as usize].nsites != 0 {
-                        g_oolslow[k as usize]
-                            .sites[0 as ::core::ffi::c_int as usize]
+                    if (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).nsites != 0 {
+                        (*(*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).sites
+                            .get_unchecked_mut(0 as ::core::ffi::c_int as usize))
                             .offset_from(g_push_entry) as ::core::ffi::c_long
                     } else {
                         0 as ::core::ffi::c_long
                     },
                     (*b).p.offset_from(g_push_entry) as ::core::ffi::c_long,
-                    g_oolslow[k as usize].nsites,
+                    (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).nsites,
                     &raw mut tb as *mut ::core::ffi::c_char,
                 );
             }
         } else {
             let mut lbl: *mut uint32_t = a64_label(b);
             let mut i_0: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
-            while i_0 < g_oolslow[k as usize].nsites {
-                patch_any_branch(g_oolslow[k as usize].sites[i_0 as usize], lbl);
+            while i_0 < (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).nsites {
+                patch_any_branch(*(*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).sites.get_unchecked_mut(i_0 as usize), lbl);
                 i_0 += 1;
             }
-            if g_oolslow[k as usize].pre != 0 {
-                a64_emit32(b, g_oolslow[k as usize].pre);
+            if (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).pre != 0 {
+                a64_emit32(b, (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).pre);
             }
             emit_l0_flush_from(
                 b,
@@ -5893,10 +5897,10 @@ pub unsafe extern "C" fn emit_oolslow_arms(
                 &raw mut (*(&raw mut g_oolslow as *mut C2RustUnnamed_13)
                     .offset(k as isize))
                     .l0_dbl as *mut uint8_t,
-                g_oolslow[k as usize].l0_dirty,
+                (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).l0_dirty,
             );
-            yc_flush_from(b, g_oolslow[k as usize].yc_dirty);
-            emit_slowcall(b, g_oolslow[k as usize].insn, exit_sites, n_exits);
+            yc_flush_from(b, (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).yc_dirty);
+            emit_slowcall(b, (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).insn, exit_sites, n_exits);
             emit_l0_reload_from(
                 b,
                 &raw mut (*(&raw mut g_oolslow as *mut C2RustUnnamed_13)
@@ -5909,7 +5913,7 @@ pub unsafe extern "C" fn emit_oolslow_arms(
             let mut here: *mut uint32_t = a64_label(b);
             a64_b(
                 b,
-                g_oolslow[k as usize].back.offset_from(here) as ::core::ffi::c_long
+                (*(&raw mut g_oolslow)).get_unchecked_mut(k as usize).back.offset_from(here) as ::core::ffi::c_long
                     as int32_t,
             );
         }
