@@ -19,7 +19,7 @@
 | interp_ext.c | 763 | - | C |
 | interp_sse.c | 2542 | - | C |
 | jit.c | 2844 | - | C, split core; see jit-split.md |
-| jit_cache.c | 3185 | - | C, split cache/lifecycle/fault recovery |
+| jit_cache.c | 3185 | devin-4a0e3105 | in progress |
 | jit_control.c | 2070 | - | C, split control/callouts |
 | jit_flags.c | 2778 | - | C, split flags/liveness/branches |
 | jit_fp.c | 3203 | jit-fp-agent | in progress |
