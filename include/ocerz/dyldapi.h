@@ -20,6 +20,7 @@ void ocerz_dyldapi_run_image_loads(struct OcerzVM *vm, uint64_t mh, uint64_t sta
 void ocerz_dyldapi_register_image(uint64_t mh, const char *path);
 void ocerz_dyldapi_register_cache_image(uint64_t mh);
 int ocerz_dyldapi_cache_image_loaded(uint64_t mh);
+int ocerz_dylib_dep_delayed(const uint8_t *lc);
 void ocerz_dyldapi_notify_added(struct OcerzVM *vm, uint64_t stack_top);
 void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh);
 uint64_t ocerz_dyldapi_canonical_selector(const char *name);

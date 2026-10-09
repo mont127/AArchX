@@ -744,6 +744,35 @@ static void closure_add(uint64_t mh)
                           g_closure_hash, g_closure_hash_mask, mh);
 }
 
+/*
+ * A dependency marked delayed-init (DYLIB_USE_DELAYED_INIT, macOS 15) is no
+ * part of the launch.  dyld maps and binds it, which for a cache image is
+ * free, but keeps it off the image list, runs none of its initializers and
+ * does not tell libobjc about it, unless an ordinary link reaches it as well.
+ * A client that needs it dlopens it first, which follows only the ordinary
+ * links from there (dyld-1378, RuntimeState::recursiveMarkNonDelayed).  A
+ * re-export is never delayed.  Under Rosetta, a program that links only
+ * CoreFoundation has 346 images; ocerz followed the delayed links too and
+ * loaded and initialized 505, CoreGraphics' delayed link to TextRecognition
+ * bringing CoreML and Vision with it, which took 120 ms of every launch.
+ * OCERZ_NO_DELAY_INIT=1 follows them again.
+ */
+int ocerz_dylib_dep_delayed(const uint8_t *lc)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("OCERZ_NO_DELAY_INIT") ? 0 : 1;
+    uint32_t w[7];
+    memcpy(w, lc, 8);
+    if (!on || (w[0] != LC_LOAD_DYLIB && w[0] != LC_LOAD_WEAK_DYLIB) ||
+        w[1] < sizeof(struct dylib_use_command))
+        return 0;
+    memcpy(w, lc, sizeof w);
+    if (w[2] != sizeof(struct dylib_use_command) || w[3] != DYLIB_USE_MARKER)
+        return 0;
+    return (w[6] & DYLIB_USE_DELAYED_INIT) && !(w[6] & DYLIB_USE_REEXPORT);
+}
+
 static int image_closure_walk(struct OcerzCache *cache, uint64_t root,
                               uint64_t *out, int n, int cap,
                               uint64_t *seen, unsigned mask)
@@ -756,8 +785,9 @@ static int image_closure_walk(struct OcerzCache *cache, uint64_t root,
         const uint8_t *lc = (const uint8_t *)(h + 1);
         for (uint32_t j = 0; j < h->ncmds; j++) {
             const struct load_command *l = (const void *)lc;
-            if (l->cmd == LC_LOAD_DYLIB || l->cmd == LC_LOAD_WEAK_DYLIB ||
-                l->cmd == LC_REEXPORT_DYLIB || l->cmd == LC_LOAD_UPWARD_DYLIB) {
+            if ((l->cmd == LC_LOAD_DYLIB || l->cmd == LC_LOAD_WEAK_DYLIB ||
+                 l->cmd == LC_REEXPORT_DYLIB || l->cmd == LC_LOAD_UPWARD_DYLIB) &&
+                !ocerz_dylib_dep_delayed(lc)) {
                 uint32_t noff;
                 memcpy(&noff, lc + 8, 4);
                 if (noff < l->cmdsize)

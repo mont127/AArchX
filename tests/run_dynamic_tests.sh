@@ -1052,6 +1052,7 @@ run_file_case dwq_overcommit tests/dynamic/wq_overcommit.c 'OK' -fblocks
 run_file_case dsleep_after_dispatch tests/dynamic/sleep_after_dispatch.c 'OK'
 run_file_case jsc tests/dynamic/jsc_context.m 'OK' -fobjc-arc -framework JavaScriptCore -framework Foundation
 run_file_case dobjc_late_category tests/dynamic/objc_late_category.c 'OK' -framework Foundation
+run_file_case ddelay_init tests/dynamic/delay_init.m 'OK' -fobjc-arc -framework Foundation
 run_asm_case dcef_partition tests/dynamic/cef_partition.c tests/dynamic/cef_partition.s 'OK'
 run_asm_case dmmx_ops tests/dynamic/mmx_ops.c tests/dynamic/mmx_ops.s 'OK'
 run_spawn_argv_case dspawn_mock_keychain
