@@ -17,9 +17,15 @@ T="${1:-.}"
 [ $# -gt 0 ] && shift
 W="${TMPDIR:-/tmp}/dec32.$$"
 mkdir -p "$W"
-(cd "$T" && touch src/decode.c && make -s src/decode.o)
+# Link exactly the objects the Makefile would for a core consumer, so a
+# ported decode.rs is measured instead of a stale src/decode.o. Older trees
+# without print-core-objs fall back to the glob.
+(cd "$T" && make -s ocerz)
+OBJS=$(cd "$T" && make -s print-core-objs 2>/dev/null) || \
+    OBJS=$(ls "$T"/src/*.o | grep -v '/main\.o$')
+OBJS=$(cd "$T" && for o in $OBJS; do echo "$T/$o"; done)
 clang -arch arm64 -O2 -I"$T/include" -o "$W/dec32probe" \
-    "$(dirname "$0")/dec32probe.c" "$T/src/decode.o"
+    "$(dirname "$0")/dec32probe.c" $OBJS -lcompression
 python3 "$(dirname "$0")/dec32-oracle.py" "$W/dec32probe" "$@"
 rc=$?
 rm -rf "$W"

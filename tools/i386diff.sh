@@ -30,9 +30,16 @@ W="${TMPDIR:-/tmp}/i386diff.$$"
 mkdir -p "$W"
 trap 'rm -rf "$W"' EXIT
 
-(cd "$TREE" && touch src/decode.c && make -s src/decode.o)
+# Link exactly the objects the Makefile would for a core consumer, so a
+# ported decode.rs is measured instead of a stale src/decode.o. Older trees
+# without print-core-objs fall back to the glob (decode cannot be ported
+# there anyway).
+(cd "$TREE" && make -s ocerz)
+OBJS=$(cd "$TREE" && make -s print-core-objs 2>/dev/null) || \
+    OBJS=$(ls "$TREE"/src/*.o | grep -v '/main\.o$' | tr '\n' ' ')
+OBJS=$(cd "$TREE" && for o in $OBJS; do echo "$TREE/$o"; done)
 
-SYMS=$(nm -gU "$TREE/src/decode.o" 2>/dev/null || nm -g "$TREE/src/decode.o")
+SYMS=$(nm -gU $OBJS 2>/dev/null || nm -g $OBJS)
 ENTRY=0
 case "$SYMS" in
     *_ocerz_decode_mode*) ENTRY=1 ;;
@@ -44,7 +51,7 @@ case "$ENTRY" in
         "int ocerz_decode_mode(const uint8_t *, size_t, uint64_t, X86Insn *, int mode32)" ;;
 2) echo "i386diff: entry ocerz_decode32 -- assumed:" \
         "int ocerz_decode32(const uint8_t *, size_t, uint64_t, X86Insn *)" ;;
-*) echo "i386diff: no 32-bit entry point exported by $TREE/src/decode.o;" \
+*) echo "i386diff: no 32-bit entry point exported by $TREE core objects;" \
         "measuring the 64-bit decoder against 32-bit input (stage-3 baseline)" ;;
 esac
 if [ "$ENTRY" != 0 ]; then
@@ -54,7 +61,7 @@ if [ "$ENTRY" != 0 ]; then
 fi
 
 clang -arch arm64 -O2 -Wall -Wextra -DI386DIFF_ENTRY=$ENTRY \
-      -I"$TREE/include" -o "$W/i386diff" "$HERE/i386diff.c" "$TREE/src/decode.o"
+      -I"$TREE/include" -o "$W/i386diff" "$HERE/i386diff.c" $OBJS -lcompression
 
 QUICK=""
 MODE=32
